@@ -1,0 +1,48 @@
+[package]
+name = "ferrox-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "ferrox-server"
+path = "src/main.rs"
+
+[dependencies]
+ferrox-core = { path = "../ferrox-core" }
+ferrox-models = { path = "../ferrox-models" }
+ferrox-gguf = { path = "../ferrox-gguf" }
+ferrox-safetensors = { path = "../ferrox-safetensors" }
+axum = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+clap = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+ferrox-cuda = { path = "../ferrox-cuda" }
+ferrox-metal = { path = "../ferrox-metal" }
+futures-util = "0.3"
+axum-server = { version = "0.8.0", features = ["tls-rustls"] }
+tower-http = { version = "0.7.0", features = ["cors"] }
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
+ferrox-moe = { path = "../ferrox-moe" }
+base64 = "0.23.0"
+
+[features]
+default = []
+# Real NVRTC-compiled CUDA kernel dispatch for GPU-placed routed
+# experts, propagated down through
+# ferrox-models/ferrox-moe/ferrox-core. Builds cleanly without a CUDA
+# toolkit/GPU present (see ferrox-cuda's Cargo.toml comment); without
+# this feature, FERROX_GPU_VRAM_BUDGET_BYTES still works but every
+# expert always runs on CPU regardless of placement.
+cuda = ["ferrox-models/cuda"]
+# Apple Silicon Metal kernels through the same WeightMatrix::apply_gpu /
+# ExpertPlacement::GpuDevice path. macOS only.
+metal = ["ferrox-models/metal"]

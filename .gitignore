@@ -1,0 +1,28 @@
+/target
+Cargo.lock.bak
+*.gguf
+!tests/fixtures/*.gguf
+!crates/*/tests/fixtures/*.gguf
+.DS_Store
+__pycache__/
+*.pyc
+/vast-receipts/
+ferrox-journal.log*
+/.scratch-logitcheck/
+/.scratch/
+
+# Local-only git hooks that scrub machine usernames (never push these).
+.githooks/
+
+# Local tooling not distributed with the repository.
+/.local-scripts/
+
+# Local agent configuration and installed skills.
+/.agents/skills/
+/.claude/
+
+# Transient benchmark logs (often embed absolute home paths).
+benchmarks/receipts/_tmp_*.log
+benchmarks/receipts/_suite_*.log
+models/
+.env

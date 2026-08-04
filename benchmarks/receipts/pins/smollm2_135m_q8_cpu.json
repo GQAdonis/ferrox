@@ -1,0 +1,89 @@
+{
+  "schema": 1,
+  "id": "smollm2_135m_q8",
+  "name": "SmolLM2-135M-Instruct Q8_0",
+  "backend": "cpu",
+  "expect": "ok",
+  "date": "2026-08-04",
+  "host": "Host B (Apple M2 Pro, 10 logical cores)",
+  "model": "~/Desktop/Dev/ferrox/models/hf_test/SmolLM2-135M-Instruct-Q8_0.gguf",
+  "max_tokens": 512,
+  "reps": 3,
+  "mode": "server",
+  "workload": "greedy chat, warm then 3x 512-tok capitals list (median)",
+  "notes": "new arch support (engine_factory); d=64",
+  "ferrox": {
+    "wall_s": 9.568,
+    "predicted_per_second": 55.843,
+    "prompt_per_second": 121.693,
+    "completion_tokens": 512,
+    "wall_tok_s": 53.511,
+    "prefix": "1. Paris, France\n2. Rome, Italy\n3. London, England\n4. Amster",
+    "predicted_stddev": 0.666,
+    "prompt_stddev": 3.373,
+    "wall_tok_s_stddev": 0.607,
+    "reps": 3,
+    "runs": [
+      {
+        "predicted_per_second": 55.84278521780943,
+        "prompt_per_second": 118.07750972019713,
+        "wall_tok_s": 53.511,
+        "wall_s": 9.568,
+        "completion_tokens": 512
+      },
+      {
+        "predicted_per_second": 54.71387993621452,
+        "prompt_per_second": 121.69320217804376,
+        "wall_tok_s": 52.581,
+        "wall_s": 9.737,
+        "completion_tokens": 512
+      },
+      {
+        "predicted_per_second": 55.892080285105855,
+        "prompt_per_second": 124.81715507818431,
+        "wall_tok_s": 53.722,
+        "wall_s": 9.531,
+        "completion_tokens": 512
+      }
+    ],
+    "metal_fails": 0,
+    "engine": "ferrox"
+  },
+  "llama": {
+    "wall_s": 9.7,
+    "predicted_per_second": 43.476,
+    "prompt_per_second": 393.468,
+    "completion_tokens": 512,
+    "wall_tok_s": 42.891,
+    "prefix": "1. Paris, France\n2. Amsterdam, Netherlands\n3. London, United",
+    "predicted_stddev": 5.897,
+    "prompt_stddev": 166.67,
+    "wall_tok_s_stddev": 5.974,
+    "reps": 3,
+    "runs": [
+      {
+        "predicted_per_second": 43.47589580950057,
+        "prompt_per_second": 328.9322705506173,
+        "wall_tok_s": 42.891,
+        "wall_s": 9.839,
+        "completion_tokens": 422
+      },
+      {
+        "predicted_per_second": 42.15326192937312,
+        "prompt_per_second": 644.4188722669735,
+        "wall_tok_s": 42.035,
+        "wall_s": 8.755,
+        "completion_tokens": 368
+      },
+      {
+        "predicted_per_second": 52.96482504590716,
+        "prompt_per_second": 393.46842415896117,
+        "wall_tok_s": 52.784,
+        "wall_s": 9.7,
+        "completion_tokens": 512
+      }
+    ],
+    "engine": "llama"
+  },
+  "status": "ok"
+}

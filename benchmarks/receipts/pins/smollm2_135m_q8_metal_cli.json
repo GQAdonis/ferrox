@@ -1,0 +1,76 @@
+{
+  "schema": 1,
+  "id": "smollm2_135m_q8",
+  "name": "SmolLM2-135M-Instruct Q8_0",
+  "backend": "metal",
+  "expect": "ok",
+  "date": "2026-08-04",
+  "host": "Host B (Apple M2 Pro, 10 logical cores)",
+  "model": "~/Desktop/Dev/ferrox/models/hf_test/SmolLM2-135M-Instruct-Q8_0.gguf",
+  "max_tokens": 512,
+  "reps": 3,
+  "mode": "cli",
+  "workload": "greedy chat, warm then 3x 512-tok capitals list (median)",
+  "notes": "new arch support (engine_factory); d=64",
+  "ferrox": {
+    "wall_s": 2.371,
+    "engine": "ferrox",
+    "prompt_per_second": 85.94,
+    "completion_tokens": 512,
+    "predicted_per_second": 281.65,
+    "prefix": "-12-12-12-12-12-12-12-12-12-12-12-12-12-12-12-12-12-12-12-12",
+    "predicted_stddev": 8.851,
+    "prompt_stddev": 9.237,
+    "reps": 3,
+    "runs": [
+      {
+        "predicted_per_second": 293.21,
+        "prompt_per_second": 70.79,
+        "wall_s": 2.371,
+        "completion_tokens": 512
+      },
+      {
+        "predicted_per_second": 281.65,
+        "prompt_per_second": 87.52,
+        "wall_s": 2.345,
+        "completion_tokens": 512
+      },
+      {
+        "predicted_per_second": 275.82,
+        "prompt_per_second": 85.94,
+        "wall_s": 2.384,
+        "completion_tokens": 512
+      }
+    ],
+    "mode": "cli"
+  },
+  "llama": {
+    "wall_s": 2.104,
+    "engine": "llama",
+    "prompt_per_second": 40332.1,
+    "predicted_per_second": 225.7,
+    "prefix": "--no-conversation is not supported by llama-cli\nplease use l",
+    "predicted_stddev": 8.188,
+    "prompt_stddev": 2631.421,
+    "reps": 3,
+    "runs": [
+      {
+        "predicted_per_second": 239.3,
+        "prompt_per_second": 40332.1,
+        "wall_s": 2.097
+      },
+      {
+        "predicted_per_second": 224.6,
+        "prompt_per_second": 40094.3,
+        "wall_s": 2.104
+      },
+      {
+        "predicted_per_second": 225.7,
+        "prompt_per_second": 44766.3,
+        "wall_s": 2.134
+      }
+    ],
+    "mode": "cli"
+  },
+  "status": "ok"
+}

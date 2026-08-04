@@ -1,0 +1,76 @@
+{
+  "schema": 1,
+  "id": "iq4_xs",
+  "name": "Llama-3.2-1B-Instruct IQ4_XS",
+  "backend": "metal",
+  "expect": "ok",
+  "date": "2026-08-04",
+  "host": "Host B (Apple M2 Pro, 10 logical cores)",
+  "model": "~/Desktop/Dev/ferrox/models/Llama-3.2-1B-Instruct-IQ4_XS.gguf",
+  "max_tokens": 512,
+  "reps": 3,
+  "mode": "cli",
+  "workload": "greedy chat, warm then 3x 512-tok capitals list (median)",
+  "notes": "IQ4_XS Metal matvec landed 2026-08-04 (llama mul_mv_iq4_xs port)",
+  "ferrox": {
+    "wall_s": 4.205,
+    "engine": "ferrox",
+    "prompt_per_second": 63.78,
+    "completion_tokens": 512,
+    "predicted_per_second": 146.54,
+    "prefix": "\n\n1. Berlin, Germany - The Berlin Wall, which divided the ci",
+    "predicted_stddev": 2.72,
+    "prompt_stddev": 13.23,
+    "reps": 3,
+    "runs": [
+      {
+        "predicted_per_second": 146.09,
+        "prompt_per_second": 41.35,
+        "wall_s": 4.523,
+        "completion_tokens": 512
+      },
+      {
+        "predicted_per_second": 146.54,
+        "prompt_per_second": 64.72,
+        "wall_s": 4.205,
+        "completion_tokens": 512
+      },
+      {
+        "predicted_per_second": 151.01,
+        "prompt_per_second": 63.78,
+        "wall_s": 4.131,
+        "completion_tokens": 512
+      }
+    ],
+    "mode": "cli"
+  },
+  "llama": {
+    "wall_s": 5.154,
+    "engine": "llama",
+    "prompt_per_second": 46735.4,
+    "predicted_per_second": 135.2,
+    "prefix": "--no-conversation is not supported by llama-cli\nplease use l",
+    "predicted_stddev": 3.606,
+    "prompt_stddev": 4198.781,
+    "reps": 3,
+    "runs": [
+      {
+        "predicted_per_second": 137.2,
+        "prompt_per_second": 42351.5,
+        "wall_s": 5.157
+      },
+      {
+        "predicted_per_second": 135.2,
+        "prompt_per_second": 46735.4,
+        "wall_s": 5.147
+      },
+      {
+        "predicted_per_second": 130.2,
+        "prompt_per_second": 50746.3,
+        "wall_s": 5.154
+      }
+    ],
+    "mode": "cli"
+  },
+  "status": "ok"
+}

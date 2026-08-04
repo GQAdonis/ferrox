@@ -1,0 +1,79 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fmt:
+    name: cargo fmt --check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  test:
+    name: build + test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --workspace --verbose
+      - run: cargo test --workspace --verbose
+
+  cuda-scaffolding:
+    name: build --features cuda (compile only, no GPU on CI)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build -p ferrox-cuda --features cuda --verbose
+
+  # CONTRIBUTING.md: the cuda feature must keep compiling without a GPU
+  # or CUDA toolkit present through the full CLI/server dependency chain.
+  cuda-feature-chain:
+    name: clippy/build --features cuda (cli + server chain)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build -p ferrox-cli -p ferrox-server --features cuda --verbose
+      - run: cargo clippy -p ferrox-cli -p ferrox-server --features cuda -- -D warnings
+
+  # Metal kernels are Apple-only; compile the feature chain on macOS.
+  # Hardware-only tests remain #[ignore]d (run locally with --ignored).
+  metal-feature-chain:
+    name: clippy/build --features metal (macos compile only)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build -p ferrox-metal -p ferrox-cli -p ferrox-server --features metal --verbose
+      - run: cargo clippy -p ferrox-metal -p ferrox-cli -p ferrox-server --features metal -- -D warnings
+
+  clippy:
+    name: cargo clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --workspace --all-targets -- -D warnings

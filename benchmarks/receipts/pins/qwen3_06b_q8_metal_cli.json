@@ -1,0 +1,76 @@
+{
+  "schema": 1,
+  "id": "qwen3_06b_q8",
+  "name": "Qwen3-0.6B Q8_0",
+  "backend": "metal",
+  "expect": "ok",
+  "date": "2026-08-04",
+  "host": "Host B (Apple M2 Pro, 10 logical cores)",
+  "model": "~/Desktop/Dev/ferrox/models/hf_test/Qwen3-0.6B-Q8_0.gguf",
+  "max_tokens": 512,
+  "reps": 3,
+  "mode": "cli",
+  "workload": "greedy chat, warm then 3x 512-tok capitals list (median)",
+  "notes": "new arch support (engine_factory); d=128",
+  "ferrox": {
+    "wall_s": 4.774,
+    "engine": "ferrox",
+    "prompt_per_second": 47.94,
+    "completion_tokens": 512,
+    "predicted_per_second": 134.21,
+    "prefix": "\n\nOkay, so I need to create a numbered list of 80 European c",
+    "predicted_stddev": 0.93,
+    "prompt_stddev": 13.213,
+    "reps": 3,
+    "runs": [
+      {
+        "predicted_per_second": 134.36,
+        "prompt_per_second": 42.13,
+        "wall_s": 4.892,
+        "completion_tokens": 512
+      },
+      {
+        "predicted_per_second": 134.21,
+        "prompt_per_second": 47.94,
+        "wall_s": 4.774,
+        "completion_tokens": 512
+      },
+      {
+        "predicted_per_second": 132.68,
+        "prompt_per_second": 67.36,
+        "wall_s": 4.585,
+        "completion_tokens": 512
+      }
+    ],
+    "mode": "cli"
+  },
+  "llama": {
+    "wall_s": 5.65,
+    "engine": "llama",
+    "prompt_per_second": 29107.4,
+    "predicted_per_second": 115.4,
+    "prefix": "--no-conversation is not supported by llama-cli\nplease use l",
+    "predicted_stddev": 4.041,
+    "prompt_stddev": 4126.029,
+    "reps": 3,
+    "runs": [
+      {
+        "predicted_per_second": 122.4,
+        "prompt_per_second": 32440.1,
+        "wall_s": 5.628
+      },
+      {
+        "predicted_per_second": 115.4,
+        "prompt_per_second": 24236.0,
+        "wall_s": 5.665
+      },
+      {
+        "predicted_per_second": 115.4,
+        "prompt_per_second": 29107.4,
+        "wall_s": 5.65
+      }
+    ],
+    "mode": "cli"
+  },
+  "status": "ok"
+}

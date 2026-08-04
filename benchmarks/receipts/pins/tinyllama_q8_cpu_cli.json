@@ -1,0 +1,76 @@
+{
+  "schema": 1,
+  "id": "tinyllama_q8",
+  "name": "TinyLlama-1.1B-Chat-v1.0 Q8_0",
+  "backend": "cpu",
+  "expect": "ok",
+  "date": "2026-08-04",
+  "host": "Host B (Apple M2 Pro, 10 logical cores)",
+  "model": "~/Desktop/Dev/ferrox/models/tinyllama-1.1b-chat-v1.0.Q8_0.gguf",
+  "max_tokens": 512,
+  "reps": 3,
+  "mode": "cli",
+  "workload": "greedy chat, warm then 3x 512-tok capitals list (median)",
+  "notes": "Verified smoke",
+  "ferrox": {
+    "wall_s": 15.976,
+    "engine": "ferrox",
+    "prompt_per_second": 46.62,
+    "completion_tokens": 512,
+    "predicted_per_second": 33.87,
+    "prefix": "-5555-4343-8888-e7e7e7e7e7e7</s> \n<|assistant|>\n1. Paris, Fr",
+    "predicted_stddev": 1.819,
+    "prompt_stddev": 5.657,
+    "reps": 3,
+    "runs": [
+      {
+        "predicted_per_second": 30.83,
+        "prompt_per_second": 46.62,
+        "wall_s": 17.575,
+        "completion_tokens": 512
+      },
+      {
+        "predicted_per_second": 34.08,
+        "prompt_per_second": 44.63,
+        "wall_s": 15.976,
+        "completion_tokens": 512
+      },
+      {
+        "predicted_per_second": 33.87,
+        "prompt_per_second": 55.27,
+        "wall_s": 15.917,
+        "completion_tokens": 512
+      }
+    ],
+    "mode": "cli"
+  },
+  "llama": {
+    "wall_s": 28.864,
+    "engine": "llama",
+    "prompt_per_second": 198.5,
+    "predicted_per_second": 19.6,
+    "prefix": "--no-conversation is not supported by llama-cli\nplease use l",
+    "predicted_stddev": 4.124,
+    "prompt_stddev": 20.653,
+    "reps": 3,
+    "runs": [
+      {
+        "predicted_per_second": 19.6,
+        "prompt_per_second": 198.5,
+        "wall_s": 28.864
+      },
+      {
+        "predicted_per_second": 21.5,
+        "prompt_per_second": 177.2,
+        "wall_s": 25.868
+      },
+      {
+        "predicted_per_second": 13.6,
+        "prompt_per_second": 218.5,
+        "wall_s": 39.454
+      }
+    ],
+    "mode": "cli"
+  },
+  "status": "ok"
+}

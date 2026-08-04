@@ -1,0 +1,76 @@
+{
+  "schema": 1,
+  "id": "smollm2_135m_q8",
+  "name": "SmolLM2-135M-Instruct Q8_0",
+  "backend": "cpu",
+  "expect": "ok",
+  "date": "2026-08-04",
+  "host": "Host B (Apple M2 Pro, 10 logical cores)",
+  "model": "~/Desktop/Dev/ferrox/models/hf_test/SmolLM2-135M-Instruct-Q8_0.gguf",
+  "max_tokens": 512,
+  "reps": 3,
+  "mode": "cli",
+  "workload": "greedy chat, warm then 3x 512-tok capitals list (median)",
+  "notes": "new arch support (engine_factory); d=64",
+  "ferrox": {
+    "wall_s": 9.457,
+    "engine": "ferrox",
+    "prompt_per_second": 126.05,
+    "completion_tokens": 512,
+    "predicted_per_second": 56.5,
+    "prefix": "-10000000000000000000000000000000000000000000000000000000000",
+    "predicted_stddev": 0.142,
+    "prompt_stddev": 11.977,
+    "reps": 3,
+    "runs": [
+      {
+        "predicted_per_second": 56.47,
+        "prompt_per_second": 126.05,
+        "wall_s": 9.465,
+        "completion_tokens": 512
+      },
+      {
+        "predicted_per_second": 56.73,
+        "prompt_per_second": 145.59,
+        "wall_s": 9.385,
+        "completion_tokens": 512
+      },
+      {
+        "predicted_per_second": 56.5,
+        "prompt_per_second": 123.82,
+        "wall_s": 9.457,
+        "completion_tokens": 512
+      }
+    ],
+    "mode": "cli"
+  },
+  "llama": {
+    "wall_s": 9.206,
+    "engine": "llama",
+    "prompt_per_second": 622.5,
+    "predicted_per_second": 61.9,
+    "prefix": "--no-conversation is not supported by llama-cli\nplease use l",
+    "predicted_stddev": 11.927,
+    "prompt_stddev": 59.454,
+    "reps": 3,
+    "runs": [
+      {
+        "predicted_per_second": 52.4,
+        "prompt_per_second": 590.8,
+        "wall_s": 10.706
+      },
+      {
+        "predicted_per_second": 61.9,
+        "prompt_per_second": 622.5,
+        "wall_s": 9.206
+      },
+      {
+        "predicted_per_second": 76.1,
+        "prompt_per_second": 705.9,
+        "wall_s": 7.688
+      }
+    ],
+    "mode": "cli"
+  },
+  "status": "ok"
+}

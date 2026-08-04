@@ -1,0 +1,33 @@
+{
+  "schema": 1,
+  "id": "tinyllama_q8",
+  "name": "TinyLlama-1.1B-Chat-v1.0 Q8_0",
+  "backend": "cpu",
+  "expect": "ok",
+  "date": "2026-08-04",
+  "host": "Host B (Apple M2 Pro, 10 logical cores)",
+  "model": "~/Desktop/Dev/ferrox/models/tinyllama-1.1b-chat-v1.0.Q8_0.gguf",
+  "max_tokens": 256,
+  "workload": "greedy chat, warm then 256-tok capitals list",
+  "notes": "Verified smoke",
+  "ferrox": {
+    "wall_s": 6.62,
+    "predicted_per_second": 44.5554055823311,
+    "prompt_per_second": 64.11648749396291,
+    "completion_tokens": 256,
+    "wall_tok_s": 38.668,
+    "prefix": "1. Paris, France - The city of love was founded in 5th centu",
+    "metal_fails": 0,
+    "engine": "ferrox"
+  },
+  "llama": {
+    "wall_s": 6.878,
+    "predicted_per_second": 38.15797161762374,
+    "prompt_per_second": 293.4166876250015,
+    "completion_tokens": 256,
+    "wall_tok_s": 37.222,
+    "prefix": "1. Paris, France - The city of love was founded in 5th centu",
+    "engine": "llama"
+  },
+  "status": "ok"
+}

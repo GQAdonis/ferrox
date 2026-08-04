@@ -1,0 +1,76 @@
+{
+  "schema": 1,
+  "id": "qwen25_05b_q8",
+  "name": "Qwen2.5-0.5B-Instruct Q8_0",
+  "backend": "cpu",
+  "expect": "ok",
+  "date": "2026-08-04",
+  "host": "Host B (Apple M2 Pro, 10 logical cores)",
+  "model": "~/Desktop/Dev/ferrox/models/hf_test/qwen2.5-0.5b-instruct-q8_0.gguf",
+  "max_tokens": 512,
+  "reps": 3,
+  "mode": "cli",
+  "workload": "greedy chat, warm then 3x 512-tok capitals list (median)",
+  "notes": "new arch support (engine_factory); d=64",
+  "ferrox": {
+    "wall_s": 10.625,
+    "engine": "ferrox",
+    "prompt_per_second": 81.75,
+    "completion_tokens": 512,
+    "predicted_per_second": 51.42,
+    "prefix": "-8a4c-4a4c-8a4c-4a4a4a4a4c-8a4c-4a4a4a4a4c-4a4a4a4a4c-4a4a4a",
+    "predicted_stddev": 0.379,
+    "prompt_stddev": 5.637,
+    "reps": 3,
+    "runs": [
+      {
+        "predicted_per_second": 51.14,
+        "prompt_per_second": 81.43,
+        "wall_s": 10.69,
+        "completion_tokens": 512
+      },
+      {
+        "predicted_per_second": 51.42,
+        "prompt_per_second": 81.75,
+        "wall_s": 10.625,
+        "completion_tokens": 512
+      },
+      {
+        "predicted_per_second": 51.89,
+        "prompt_per_second": 91.35,
+        "wall_s": 10.484,
+        "completion_tokens": 512
+      }
+    ],
+    "mode": "cli"
+  },
+  "llama": {
+    "wall_s": 14.254,
+    "engine": "llama",
+    "prompt_per_second": 373.3,
+    "predicted_per_second": 41.7,
+    "prefix": "--no-conversation is not supported by llama-cli\nplease use l",
+    "predicted_stddev": 4.423,
+    "prompt_stddev": 96.614,
+    "reps": 3,
+    "runs": [
+      {
+        "predicted_per_second": 41.7,
+        "prompt_per_second": 387.3,
+        "wall_s": 14.254
+      },
+      {
+        "predicted_per_second": 39.9,
+        "prompt_per_second": 213.4,
+        "wall_s": 14.772
+      },
+      {
+        "predicted_per_second": 48.3,
+        "prompt_per_second": 373.3,
+        "wall_s": 12.208
+      }
+    ],
+    "mode": "cli"
+  },
+  "status": "ok"
+}

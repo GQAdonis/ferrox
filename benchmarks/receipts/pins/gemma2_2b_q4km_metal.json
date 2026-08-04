@@ -1,0 +1,17 @@
+{
+  "schema": 1,
+  "id": "gemma2_2b_q4km",
+  "name": "Gemma-2-2B-IT Q4_K_M",
+  "backend": "metal",
+  "expect": "refuse",
+  "date": "2026-08-04",
+  "host": "Host B (Apple M2 Pro, 10 logical cores)",
+  "model": "models/gemma-2-2b-it-Q4_K_M.gguf",
+  "max_tokens": 512,
+  "reps": 3,
+  "workload": "greedy chat, warm then 3x 512-tok capitals list (median)",
+  "notes": "Fail-closed: final logit soft-cap / SWA",
+  "ferrox": null,
+  "llama": null,
+  "status": "missing"
+}

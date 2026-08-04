@@ -1,0 +1,30 @@
+[package]
+name = "ferrox-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "ferrox"
+path = "src/main.rs"
+
+[dependencies]
+ferrox-gguf = { path = "../ferrox-gguf" }
+ferrox-quant = { path = "../ferrox-quant" }
+ferrox-cuda = { path = "../ferrox-cuda" }
+ferrox-metal = { path = "../ferrox-metal" }
+half = { workspace = true }
+ferrox-core = { path = "../ferrox-core" }
+ferrox-models = { path = "../ferrox-models" }
+ferrox-safetensors = { path = "../ferrox-safetensors" }
+clap = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+rayon = { workspace = true }
+
+[features]
+default = []
+cuda = ["ferrox-cuda/cuda"]
+# Caps detection + Metal apply_gpu dispatch through ferrox-models.
+metal = ["ferrox-metal/metal", "ferrox-models/metal"]

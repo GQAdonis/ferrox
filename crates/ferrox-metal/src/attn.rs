@@ -1,0 +1,3219 @@
+//! Metal attention path: Norm/NeoX RoPE, KV append, and online-softmax GQA.
+//!
+//! Device K/V caches are **f16** (llama.cpp default `-ctk f16 -ctv f16`);
+//! Q/activations stay f32. Append converts f32→half on GPU.
+//!
+//! **Decode (B=1):** Q/K/V/O matvecs fused with RoPE→KV→GQA in one command
+//! buffer ([`launch_decode_attn_block`]); dense layers can continue through
+//! residual → FFN in the same CB ([`launch_decode_dense_layer`] /
+//! [`launch_decode_dense_stack`]).
+//!
+//! **Prefill (T≥1):** host (or future batched) Q/K/V projections feed
+//! [`launch_prefill_attn_block`] — multi-pos RoPE, batch KV append into
+//! [`MetalKvBuffers`], and causal multi-query GQA — so decode can skip
+//! [`MetalKvBuffers::upload_from_host`] when seq_lens already match.
+//!
+//! Scope:
+//! - `LLAMA_ROPE_TYPE_NORM` (interleaved) or `NEOX` ± Llama-3 freq factors
+//! - Full-causal GQA (no sliding window); online-softmax kernels
+//! - Caller must not need QKV bias / QK-norm on this path (fall back to CPU)
+//!
+//! Enable with `FERROX_METAL_ATTN=1` (also requires dense Metal / `FERROX_METAL`).
+//! Optional `FERROX_METAL_LOGITS=1` folds final_norm + lm_head into the dense
+//! stack CB (downloads vocab logits). Default off: host lm_head after
+//! downloading hidden — measured ~2× faster on Llama-3.1-8B Q4_K_M.
+//!
+//! Greedy decode (`temperature<=0`, hooked from `ferrox-server::generate`)
+//! can fold final_norm + lm_head + **argmax** into the same CB and download
+//! only the top-1 token id — **default on** for greedy (`temperature<=0`);
+//! opt out with `FERROX_METAL_GREEDY_GPU=0`. Embedding gather can also run
+//! on-GPU (`get_rows`) so the stack needs no host `dequant_row` upload.
+//!
+//! `FERROX_METAL_FA_VEC=0` disables llama-style FA-vec decode (default **on**
+//! for `head_dim==128`). Other head dims keep legacy online-softmax GQA.
+use crate::elem::{
+    encode_add_rms_norm, encode_argmax, encode_gelu_mul, encode_rms_norm, encode_rms_norm_per_head,
+    encode_silu_mul, encode_vec_add,
+};
+use crate::embd::{encode_get_rows, EmbdKind};
+use crate::gpu::{
+    encode_matvec, ensure_pipeline, resident_f32_buffer, resident_weight_buffer, shared_metal,
+    MatvecLaunch, MetalError,
+};
+use objc2::rc::Retained;
+use objc2::runtime::ProtocolObject;
+use objc2_metal::{
+    MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder,
+    MTLDevice, MTLResourceOptions, MTLSize,
+};
+use std::cell::Cell;
+use std::ptr::NonNull;
+use std::sync::{Mutex, OnceLock};
+
+/// RoPE pairing convention for Metal kernels. Mirrors
+/// `ferrox_models::config::RopeLayout` / llama.cpp `llama_rope_type`
+/// without pulling models into this crate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MetalRopeLayout {
+    /// Adjacent pairs `(2*i, 2*i+1)` — `LLAMA_ROPE_TYPE_NORM`.
+    Norm,
+    /// Split-half pairs `(i, i+half)` — `LLAMA_ROPE_TYPE_NEOX`.
+    Neox,
+}
+
+/// Whether the fused Metal attention block should run (in addition to
+/// dense Metal matvecs). Default off until measured; `1|true|on` enables.
+pub fn metal_attn_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        matches!(
+            std::env::var("FERROX_METAL_ATTN").ok().as_deref(),
+            Some("1") | Some("true") | Some("on") | Some("attn")
+        )
+    })
+}
+
+/// Fold final RMSNorm + lm_head into the Metal dense stack (return vocab
+/// logits). Default **off** — host lm_head after hidden download recovered
+/// ~20 predicted tok/s vs ~10 with logits-in-stack on Llama-3.1-8B Q4_K_M.
+pub fn metal_logits_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        matches!(
+            std::env::var("FERROX_METAL_LOGITS").ok().as_deref(),
+            Some("1") | Some("true") | Some("on") | Some("logits")
+        )
+    })
+}
+
+/// Whether greedy GPU argmax-in-stack is allowed. Default **on** when
+/// Metal attn is in use for `temperature<=0` (parallel TG argmax ≈ host
+/// lm_head on Host B). Opt out with `FERROX_METAL_GREEDY_GPU=0|false|off`.
+pub fn metal_greedy_gpu_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        match std::env::var("FERROX_METAL_GREEDY_GPU").ok().as_deref() {
+            Some("0") | Some("false") | Some("off") | Some("no") => false,
+            Some("1") | Some("true") | Some("on") | Some("greedy") => true,
+            // Unset: default on (was opt-in while sequential argmax regressed).
+            None => true,
+            Some(_) => true,
+        }
+    })
+}
+
+thread_local! {
+    /// Per-request flag set by `ferrox-server::generate` when
+    /// `temperature<=0`. Thread-local so concurrent requests sharing one
+    /// `Arc<Decoder>` do not race.
+    static GREEDY_ARGMAX: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Enable/disable greedy GPU argmax for the current thread's decode steps.
+pub fn set_metal_greedy_argmax(on: bool) {
+    GREEDY_ARGMAX.with(|c| c.set(on));
+}
+
+/// True when this thread should fold final_norm+lm_head+argmax into the
+/// dense stack and return a 1-element `[token_id as f32]` instead of
+/// hidden or full vocab logits.
+pub fn metal_greedy_argmax_active() -> bool {
+    metal_greedy_gpu_enabled() && GREEDY_ARGMAX.with(|c| c.get())
+}
+
+// Norm (interleaved) and NeoX (split-half) kernels share the same buffer
+// layout so `encode_rope` only swaps the entry point. Math mirrors
+// `ferrox_core::attention::{apply_rope_interleaved, apply_rope}` —
+// no Candle / third-party RoPE dependency.
+const ROPE_NORM_KERNEL_SRC: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+kernel void rope_interleaved_heads(
+    device float* vecs [[buffer(0)]],
+    constant uint& n_heads [[buffer(1)]],
+    constant uint& head_dim [[buffer(2)]],
+    constant float& theta [[buffer(3)]],
+    constant uint& pos [[buffer(4)]],
+    device const float* freq_factors [[buffer(5)]],
+    constant uint& use_freq_factors [[buffer(6)]],
+    uint h [[thread_position_in_grid]]
+) {
+    if (h >= n_heads) return;
+    device float* vec = vecs + h * head_dim;
+    uint half_dim = head_dim / 2u;
+    for (uint i = 0; i < half_dim; i++) {
+        float freq = 1.0f / pow(theta, (2.0f * float(i)) / float(head_dim));
+        float angle = float(pos) * freq;
+        if (use_freq_factors != 0u) {
+            angle /= freq_factors[i];
+        }
+        float s = sin(angle);
+        float c = cos(angle);
+        float a = vec[2u * i];
+        float b = vec[2u * i + 1u];
+        vec[2u * i] = a * c - b * s;
+        vec[2u * i + 1u] = a * s + b * c;
+    }
+}
+"#;
+
+const ROPE_NEOX_KERNEL_SRC: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+kernel void rope_neox_heads(
+    device float* vecs [[buffer(0)]],
+    constant uint& n_heads [[buffer(1)]],
+    constant uint& head_dim [[buffer(2)]],
+    constant float& theta [[buffer(3)]],
+    constant uint& pos [[buffer(4)]],
+    device const float* freq_factors [[buffer(5)]],
+    constant uint& use_freq_factors [[buffer(6)]],
+    uint h [[thread_position_in_grid]]
+) {
+    if (h >= n_heads) return;
+    device float* vec = vecs + h * head_dim;
+    uint half_dim = head_dim / 2u;
+    for (uint i = 0; i < half_dim; i++) {
+        float freq = 1.0f / pow(theta, (2.0f * float(i)) / float(head_dim));
+        float angle = float(pos) * freq;
+        if (use_freq_factors != 0u) {
+            angle /= freq_factors[i];
+        }
+        float s = sin(angle);
+        float c = cos(angle);
+        float a = vec[i];
+        float b = vec[i + half_dim];
+        vec[i] = a * c - b * s;
+        vec[i + half_dim] = a * s + b * c;
+    }
+}
+"#;
+
+const KV_APPEND_KERNEL_SRC: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+// Append f32 K/V token into an f16-resident cache (llama.cpp default).
+kernel void kv_append(
+    device const float* src [[buffer(0)]],
+    device half* dst [[buffer(1)]],
+    constant uint& offset_elems [[buffer(2)]],
+    constant uint& n_elems [[buffer(3)]],
+    uint i [[thread_position_in_grid]]
+) {
+    if (i < n_elems) {
+        dst[offset_elems + i] = half(src[i]);
+    }
+}
+"#;
+
+/// Whether FA-vec GQA decode is enabled.
+///
+/// Default: **on** for `head_dim == 128` (Llama-3.x) and `head_dim == 64`
+/// (TinyLlama, Llama-3.2-1B) via [`encode_gqa`].
+/// `FERROX_METAL_FA_VEC=0|false|off` forces the legacy online-softmax kernel.
+/// `=1|true|on|vec` keeps FA on (still only dispatched for supported dims).
+pub fn metal_fa_vec_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        match std::env::var("FERROX_METAL_FA_VEC").ok().as_deref() {
+            Some("0") | Some("false") | Some("off") => false,
+            Some("1") | Some("true") | Some("on") | Some("vec") => true,
+            // Default on: llama-parity FA for d=128 is required to close the
+            // ~1.15× decode gap (legacy GQA ≈ llama `-ctk f32`).
+            _ => true,
+        }
+    })
+}
+
+/// llama.cpp-style FA-vec decode for **head_dim=128**, f16 KV, NE=1, C=32.
+/// One TG per head; NSG simdgroups each own every NSG-th KV tile, then
+/// online-softmax merge. Replaces the old FA_VEC that recomputed V ×32.
+const GQA_DECODE_FA_VEC_KERNEL_SRC: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+kernel void gqa_decode_fa_vec(
+    device const float* q [[buffer(0)]],
+    device const half* k_cache [[buffer(1)]],
+    device const half* v_cache [[buffer(2)]],
+    device float* out [[buffer(3)]],
+    constant uint& n_heads [[buffer(4)]],
+    constant uint& n_kv_heads [[buffer(5)]],
+    constant uint& head_dim [[buffer(6)]],
+    constant uint& seq_len [[buffer(7)]],
+    uint h [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint tg [[threads_per_threadgroup]],
+    threadgroup float* shared [[threadgroup(0)]]
+) {
+    // Specialized for D=128 (host only dispatches when head_dim==128).
+    constexpr uint D = 128u;
+    constexpr uint D4 = 32u;
+    constexpr uint C = 32u;
+    constexpr uint NW = 32u;
+    // Per-SG floats: C scores + D output.
+    constexpr uint SG_F = C + D;
+
+    if (h >= n_heads || seq_len == 0u || head_dim != D) return;
+
+    const uint tiisg = tid % NW;
+    const uint sgitg = tid / NW;
+    const uint nsg = tg / NW;
+
+    threadgroup float4* sq4 = (threadgroup float4*)shared;
+    threadgroup float* ss = shared + D + sgitg * SG_F;
+    threadgroup float4* so4 = (threadgroup float4*)(ss + C);
+
+    uint group_size = n_heads / max(n_kv_heads, 1u);
+    uint kv_h = h / max(group_size, 1u);
+    float scale = 1.0f / sqrt(float(D));
+
+    device const float4* q4 = (device const float4*)(q + h * D);
+    for (uint i = tid; i < D4; i += tg) {
+        sq4[i] = q4[i];
+    }
+    so4[tiisg] = float4(0.0f);
+    ss[tiisg] = 0.0f;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float S = 0.0f;
+    float M = -INFINITY;
+
+    // Each SG walks KV tiles: ic0 = sgitg, sgitg+nsg, ...
+    for (uint ic0 = sgitg; ic0 * C < seq_len; ic0 += nsg) {
+        uint ic = ic0 * C;
+        uint chunk = min(C, seq_len - ic);
+
+        // Q·K for all C positions: lane `ii` owns float4-slice `ii` of the head;
+        // after simd_sum, every lane holds the full score for each cc.
+        float scores[C];
+        for (uint cc = 0; cc < C; cc++) {
+            scores[cc] = -INFINITY;
+        }
+        for (uint cc = 0; cc < chunk; cc++) {
+            device const half4* k4 =
+                (device const half4*)(k_cache + ((ic + cc) * n_kv_heads + kv_h) * D);
+            float partial = dot(sq4[tiisg], float4(k4[tiisg]));
+            scores[cc] = simd_sum(partial) * scale;
+        }
+
+        // Online softmax over this tile (one score per lane).
+        float s_lane = (tiisg < chunk) ? scores[tiisg] : -INFINITY;
+        float M2 = simd_max(max(M, s_lane));
+        float ms = (M == -INFINITY) ? 0.0f : exp(M - M2);
+        float vs = (s_lane == -INFINITY) ? 0.0f : exp(s_lane - M2);
+        S = S * ms + simd_sum(vs);
+        ss[tiisg] = vs;
+        so4[tiisg] *= ms;
+        M = M2;
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+
+        // O += P · V  (lane owns float4-slice tiisg of the output)
+        float4 lo = float4(0.0f);
+        for (uint cc = 0; cc < chunk; cc++) {
+            device const half4* v4 =
+                (device const half4*)(v_cache + ((ic + cc) * n_kv_heads + kv_h) * D);
+            lo += float4(v4[tiisg]) * ss[cc];
+        }
+        so4[tiisg] += lo;
+    }
+
+    // Publish S,M for cross-SG reduce (reuse ss[0], ss[1]).
+    if (tiisg == 0u) {
+        ss[0] = S;
+        ss[1] = M;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Cross-SG online-softmax merge.
+    for (uint r = nsg >> 1; r > 0u; r >>= 1) {
+        if (sgitg < r) {
+            threadgroup float* ss0 = shared + D + sgitg * SG_F;
+            threadgroup float* ss1 = shared + D + (sgitg + r) * SG_F;
+            threadgroup float4* so0 = (threadgroup float4*)(ss0 + C);
+            threadgroup float4* so1 = (threadgroup float4*)(ss1 + C);
+            float S0 = ss0[0];
+            float S1 = ss1[0];
+            float M0 = ss0[1];
+            float M1 = ss1[1];
+            float Mn = max(M0, M1);
+            float a0 = (M0 == -INFINITY) ? 0.0f : exp(M0 - Mn);
+            float a1 = (M1 == -INFINITY) ? 0.0f : exp(M1 - Mn);
+            if (tiisg == 0u) {
+                ss0[0] = S0 * a0 + S1 * a1;
+                ss0[1] = Mn;
+            }
+            so0[tiisg] = so0[tiisg] * a0 + so1[tiisg] * a1;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (sgitg == 0u) {
+        threadgroup float* ss0 = shared + D;
+        threadgroup float4* so0 = (threadgroup float4*)(ss0 + C);
+        float inv = (ss0[0] == 0.0f) ? 0.0f : (1.0f / ss0[0]);
+        device float4* out4 = (device float4*)(out + h * D);
+        out4[tiisg] = so0[tiisg] * inv;
+    }
+}
+"#;
+
+/// llama.cpp-style FA-vec decode for **head_dim=64**, f16 KV, NE=2, C=32.
+/// Same tile/merge structure as the d=128 kernel, but D4=16 float4
+/// slices only cover half a simdgroup — so each warp processes **two**
+/// KV positions per pass (half-warp `ty=0` gets even `cc`, `ty=1` odd),
+/// with a 16-lane shuffle-xor dot reduce and a cross-half xor-16 merge
+/// of the V accumulators. This keeps all 32 lanes busy where a naive
+/// D4=16 port would idle half the warp (TinyLlama / Llama-3.2-1B are
+/// d=64).
+const GQA_DECODE_FA_VEC_D64_KERNEL_SRC: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+kernel void gqa_decode_fa_vec_d64(
+    device const float* q [[buffer(0)]],
+    device const half* k_cache [[buffer(1)]],
+    device const half* v_cache [[buffer(2)]],
+    device float* out [[buffer(3)]],
+    constant uint& n_heads [[buffer(4)]],
+    constant uint& n_kv_heads [[buffer(5)]],
+    constant uint& head_dim [[buffer(6)]],
+    constant uint& seq_len [[buffer(7)]],
+    uint h [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint tg [[threads_per_threadgroup]],
+    threadgroup float* shared [[threadgroup(0)]]
+) {
+    // Specialized for D=64 (host only dispatches when head_dim==64).
+    constexpr uint D = 64u;
+    constexpr uint D4 = 16u;
+    constexpr uint C = 32u;
+    constexpr uint NW = 32u;
+    // Per-SG floats: C scores + D output.
+    constexpr uint SG_F = C + D;
+
+    if (h >= n_heads || seq_len == 0u || head_dim != D) return;
+
+    const uint tiisg = tid % NW;
+    const uint sgitg = tid / NW;
+    const uint nsg = tg / NW;
+    const uint tx = tiisg % D4; // float4 slice of the head
+    const uint ty = tiisg / D4; // 0/1: token parity within a warp pass
+
+    threadgroup float4* sq4 = (threadgroup float4*)shared;
+    threadgroup float* ss = shared + D + sgitg * SG_F;
+    threadgroup float4* so4 = (threadgroup float4*)(ss + C);
+
+    uint group_size = n_heads / max(n_kv_heads, 1u);
+    uint kv_h = h / max(group_size, 1u);
+    float scale = 1.0f / sqrt(float(D));
+
+    device const float4* q4 = (device const float4*)(q + h * D);
+    for (uint i = tid; i < D4; i += tg) {
+        sq4[i] = q4[i];
+    }
+    if (tiisg < D4) {
+        so4[tiisg] = float4(0.0f);
+    }
+    ss[tiisg] = 0.0f;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float S = 0.0f;
+    float M = -INFINITY;
+
+    // Each SG walks KV tiles: ic0 = sgitg, sgitg+nsg, ...
+    for (uint ic0 = sgitg; ic0 * C < seq_len; ic0 += nsg) {
+        uint ic = ic0 * C;
+        uint chunk = min(C, seq_len - ic);
+
+        // Q·K, two positions per warp pass: half-warp `ty` owns token
+        // ic+cc; 16-lane xor reduce leaves the full dot in every lane
+        // of that half; lane tx==0 publishes it.
+        for (uint cc = ty; cc < chunk; cc += 2u) {
+            device const half4* k4 =
+                (device const half4*)(k_cache + ((ic + cc) * n_kv_heads + kv_h) * D);
+            float p = dot(sq4[tx], float4(k4[tx]));
+            p += simd_shuffle_xor(p, 8u);
+            p += simd_shuffle_xor(p, 4u);
+            p += simd_shuffle_xor(p, 2u);
+            p += simd_shuffle_xor(p, 1u);
+            if (tx == 0u) {
+                ss[cc] = p * scale;
+            }
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Online softmax over this tile (one score per lane).
+        float s_lane = (tiisg < chunk) ? ss[tiisg] : -INFINITY;
+        float M2 = simd_max(max(M, s_lane));
+        float ms = (M == -INFINITY) ? 0.0f : exp(M - M2);
+        float vs = (s_lane == -INFINITY) ? 0.0f : exp(s_lane - M2);
+        S = S * ms + simd_sum(vs);
+        ss[tiisg] = vs;
+        if (tiisg < D4) {
+            so4[tiisg] *= ms;
+        }
+        M = M2;
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+
+        // O += P · V, two positions per warp pass; merge the two token
+        // halves with an xor-16 shuffle before accumulating.
+        float4 lo = float4(0.0f);
+        for (uint cc = ty; cc < chunk; cc += 2u) {
+            device const half4* v4 =
+                (device const half4*)(v_cache + ((ic + cc) * n_kv_heads + kv_h) * D);
+            lo += float4(v4[tx]) * ss[cc];
+        }
+        lo += simd_shuffle_xor(lo, 16u);
+        if (ty == 0u) {
+            so4[tx] += lo;
+        }
+    }
+
+    // Publish S,M for cross-SG reduce (reuse ss[0], ss[1]).
+    if (tiisg == 0u) {
+        ss[0] = S;
+        ss[1] = M;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Cross-SG online-softmax merge.
+    for (uint r = nsg >> 1; r > 0u; r >>= 1) {
+        if (sgitg < r) {
+            threadgroup float* ss0 = shared + D + sgitg * SG_F;
+            threadgroup float* ss1 = shared + D + (sgitg + r) * SG_F;
+            threadgroup float4* so0 = (threadgroup float4*)(ss0 + C);
+            threadgroup float4* so1 = (threadgroup float4*)(ss1 + C);
+            float S0 = ss0[0];
+            float S1 = ss1[0];
+            float M0 = ss0[1];
+            float M1 = ss1[1];
+            float Mn = max(M0, M1);
+            float a0 = (M0 == -INFINITY) ? 0.0f : exp(M0 - Mn);
+            float a1 = (M1 == -INFINITY) ? 0.0f : exp(M1 - Mn);
+            if (tiisg == 0u) {
+                ss0[0] = S0 * a0 + S1 * a1;
+                ss0[1] = Mn;
+            }
+            if (tiisg < D4) {
+                so0[tiisg] = so0[tiisg] * a0 + so1[tiisg] * a1;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (sgitg == 0u && tiisg < D4) {
+        threadgroup float* ss0 = shared + D;
+        threadgroup float4* so0 = (threadgroup float4*)(ss0 + C);
+        float inv = (ss0[0] == 0.0f) ? 0.0f : (1.0f / ss0[0]);
+        device float4* out4 = (device float4*)(out + h * D);
+        out4[tiisg] = so0[tiisg] * inv;
+    }
+}
+"#;
+
+const GQA_DECODE_KERNEL_SRC: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+// Online-softmax GQA decode (B=1, full causal).
+// One threadgroup per query head. V accumulators stay register-local
+// through the seq scan (float4 dots/axpy when head_dim % 4 == 0); each
+// simdgroup reduces via simd_shuffle_xor, then N_SG partials merge in a
+// compact TG footprint O(nsg * head_dim) instead of O(tg * head_dim).
+// `tg` must be a multiple of 32 (host enforces). head_dim <= 256.
+
+inline float online_rescale(float m_old, float m_new) {
+    // exp(m_old - m_new); 0 when m_old is -inf (empty / inactive partial).
+    return (m_old == -INFINITY) ? 0.0f : exp(m_old - m_new);
+}
+
+kernel void gqa_decode(
+    device const float* q [[buffer(0)]],
+    device const half* k_cache [[buffer(1)]],
+    device const half* v_cache [[buffer(2)]],
+    device float* out [[buffer(3)]],
+    constant uint& n_heads [[buffer(4)]],
+    constant uint& n_kv_heads [[buffer(5)]],
+    constant uint& head_dim [[buffer(6)]],
+    constant uint& seq_len [[buffer(7)]],
+    constant uint& kv_start [[buffer(8)]],
+    uint h [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint tg [[threads_per_threadgroup]],
+    threadgroup float* shared [[threadgroup(0)]]
+) {
+    if (h >= n_heads || seq_len == 0u) return;
+
+    constexpr uint MAX_D = 256u;
+    constexpr uint NW = 32u;
+    const uint nsg = tg / NW;
+    const uint tiisg = tid % NW;
+    const uint sgitg = tid / NW;
+
+    // Compact layout after per-SG reduce: m[nsg] | s[nsg] | acc[nsg * head_dim]
+    threadgroup float* m_sh = shared;
+    threadgroup float* s_sh = shared + nsg;
+    threadgroup float* acc_base = shared + 2u * nsg;
+
+    uint group_size = n_heads / max(n_kv_heads, 1u);
+    uint kv_h = h / max(group_size, 1u);
+    float scale = 1.0f / sqrt(float(head_dim));
+    device const float* q_h = q + h * head_dim;
+
+    float m = -INFINITY;
+    float s = 0.0f;
+    float my_acc[MAX_D];
+    for (uint d = 0; d < head_dim; d++) {
+        my_acc[d] = 0.0f;
+    }
+
+    const bool vec4 = (head_dim & 3u) == 0u;
+    // kv_start > 0 = sliding-window attention: only positions
+    // [kv_start, seq_len) are visible (Gemma-style SWA).
+    for (uint t = kv_start + tid; t < seq_len; t += tg) {
+        device const half* k_t =
+            k_cache + (t * n_kv_heads + kv_h) * head_dim;
+        float dot = 0.0f;
+        if (vec4) {
+            float4 acc4 = float4(0.0f);
+            for (uint d = 0; d < head_dim; d += 4u) {
+                acc4 += float4(
+                    q_h[d], q_h[d + 1u], q_h[d + 2u], q_h[d + 3u])
+                    * float4(
+                        float(k_t[d]), float(k_t[d + 1u]), float(k_t[d + 2u]), float(k_t[d + 3u]));
+            }
+            dot = acc4[0] + acc4[1] + acc4[2] + acc4[3];
+        } else {
+            for (uint d = 0; d < head_dim; d++) {
+                dot += q_h[d] * float(k_t[d]);
+            }
+        }
+        float score = dot * scale;
+        float m2 = max(m, score);
+        float a = online_rescale(m, m2);
+        float b = exp(score - m2);
+        s = s * a + b;
+        device const half* v_t =
+            v_cache + (t * n_kv_heads + kv_h) * head_dim;
+        if (vec4) {
+            for (uint d = 0; d < head_dim; d += 4u) {
+                my_acc[d] = my_acc[d] * a + b * float(v_t[d]);
+                my_acc[d + 1u] = my_acc[d + 1u] * a + b * float(v_t[d + 1u]);
+                my_acc[d + 2u] = my_acc[d + 2u] * a + b * float(v_t[d + 2u]);
+                my_acc[d + 3u] = my_acc[d + 3u] * a + b * float(v_t[d + 3u]);
+            }
+        } else {
+            for (uint d = 0; d < head_dim; d++) {
+                my_acc[d] = my_acc[d] * a + b * float(v_t[d]);
+            }
+        }
+        m = m2;
+    }
+
+    // Intra-simdgroup butterfly reduce (no TG traffic).
+    for (ushort offset = ushort(NW >> 1); offset > 0u; offset >>= 1) {
+        float m_o = simd_shuffle_xor(m, offset);
+        float s_o = simd_shuffle_xor(s, offset);
+        float m_new = max(m, m_o);
+        float a = online_rescale(m, m_new);
+        float a_o = online_rescale(m_o, m_new);
+        s = s * a + s_o * a_o;
+        for (uint d = 0; d < head_dim; d++) {
+            float ao = simd_shuffle_xor(my_acc[d], offset);
+            my_acc[d] = my_acc[d] * a + ao * a_o;
+        }
+        m = m_new;
+    }
+
+    if (tiisg == 0u) {
+        m_sh[sgitg] = m;
+        s_sh[sgitg] = s;
+        threadgroup float* slot = acc_base + sgitg * head_dim;
+        for (uint d = 0; d < head_dim; d++) {
+            slot[d] = my_acc[d];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Cross-SG tree reduce over nsg << tg partials.
+    for (uint stride = nsg >> 1; stride > 0u; stride >>= 1) {
+        if (tid < stride) {
+            uint other = tid + stride;
+            float m1 = m_sh[tid];
+            float m2 = m_sh[other];
+            float s1 = s_sh[tid];
+            float s2 = s_sh[other];
+            float m_new = max(m1, m2);
+            float a1 = online_rescale(m1, m_new);
+            float a2 = online_rescale(m2, m_new);
+            m_sh[tid] = m_new;
+            s_sh[tid] = s1 * a1 + s2 * a2;
+            threadgroup float* acc1 = acc_base + tid * head_dim;
+            threadgroup float* acc2 = acc_base + other * head_dim;
+            for (uint d = 0; d < head_dim; d++) {
+                acc1[d] = acc1[d] * a1 + acc2[d] * a2;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    float inv_s = 1.0f / s_sh[0];
+    threadgroup float* acc0 = acc_base;
+    for (uint d = tid; d < head_dim; d += tg) {
+        out[h * head_dim + d] = acc0[d] * inv_s;
+    }
+}
+"#;
+
+// Multi-token causal GQA prefill: one threadgroup per (query token, head).
+// Query `qi` at absolute cache index `kv_prefix_len + qi` attends over
+// K/V[0 ..= kv_prefix_len + qi] (inclusive), matching host
+// `causal_gqa_attention` per position after the batch KV append.
+const GQA_PREFILL_KERNEL_SRC: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+inline float online_rescale_prefill(float m_old, float m_new) {
+    return (m_old == -INFINITY) ? 0.0f : exp(m_old - m_new);
+}
+
+kernel void gqa_prefill(
+    device const float* q [[buffer(0)]],
+    device const half* k_cache [[buffer(1)]],
+    device const half* v_cache [[buffer(2)]],
+    device float* out [[buffer(3)]],
+    constant uint& n_heads [[buffer(4)]],
+    constant uint& n_kv_heads [[buffer(5)]],
+    constant uint& head_dim [[buffer(6)]],
+    constant uint& n_q [[buffer(7)]],
+    constant uint& kv_prefix_len [[buffer(8)]],
+    uint2 tgpig [[threadgroup_position_in_grid]],
+    uint2 tid_tg [[thread_position_in_threadgroup]],
+    uint2 tg_size [[threads_per_threadgroup]],
+    threadgroup float* shared [[threadgroup(0)]]
+) {
+    uint h = tgpig.x;
+    uint qi = tgpig.y;
+    if (h >= n_heads || qi >= n_q) return;
+
+    // Metal requires all thread-index attrs to share scalar vs vector shape.
+    uint tid = tid_tg.x;
+    uint tg = tg_size.x;
+    uint causal_len = kv_prefix_len + qi + 1u;
+    if (causal_len == 0u) return;
+
+    threadgroup float* m_sh = shared;
+    threadgroup float* s_sh = shared + tg;
+    threadgroup float* acc_base = shared + 2u * tg;
+    threadgroup float* my_acc = acc_base + tid * head_dim;
+
+    uint group_size = n_heads / max(n_kv_heads, 1u);
+    uint kv_h = h / max(group_size, 1u);
+    float scale = 1.0f / sqrt(float(head_dim));
+    device const float* q_h = q + (qi * n_heads + h) * head_dim;
+
+    float m = -INFINITY;
+    float s = 0.0f;
+    for (uint d = 0; d < head_dim; d++) {
+        my_acc[d] = 0.0f;
+    }
+
+    for (uint t = tid; t < causal_len; t += tg) {
+        device const half* k_t =
+            k_cache + (t * n_kv_heads + kv_h) * head_dim;
+        float dot = 0.0f;
+        for (uint d = 0; d < head_dim; d++) {
+            dot += q_h[d] * float(k_t[d]);
+        }
+        float score = dot * scale;
+        float m2 = max(m, score);
+        float a = online_rescale_prefill(m, m2);
+        float b = exp(score - m2);
+        s = s * a + b;
+        device const half* v_t =
+            v_cache + (t * n_kv_heads + kv_h) * head_dim;
+        for (uint d = 0; d < head_dim; d++) {
+            my_acc[d] = my_acc[d] * a + b * float(v_t[d]);
+        }
+        m = m2;
+    }
+
+    m_sh[tid] = m;
+    s_sh[tid] = s;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint stride = tg >> 1; stride > 0u; stride >>= 1) {
+        if (tid < stride) {
+            uint other = tid + stride;
+            float m1 = m_sh[tid];
+            float m2 = m_sh[other];
+            float s1 = s_sh[tid];
+            float s2 = s_sh[other];
+            float m_new = max(m1, m2);
+            float a1 = online_rescale_prefill(m1, m_new);
+            float a2 = online_rescale_prefill(m2, m_new);
+            m_sh[tid] = m_new;
+            s_sh[tid] = s1 * a1 + s2 * a2;
+            threadgroup float* acc1 = acc_base + tid * head_dim;
+            threadgroup float* acc2 = acc_base + other * head_dim;
+            for (uint d = 0; d < head_dim; d++) {
+                acc1[d] = acc1[d] * a1 + acc2[d] * a2;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    float inv_s = 1.0f / s_sh[0];
+    threadgroup float* acc0 = acc_base;
+    device float* out_h = out + (qi * n_heads + h) * head_dim;
+    for (uint d = tid; d < head_dim; d += tg) {
+        out_h[d] = acc0[d] * inv_s;
+    }
+}
+"#;
+
+const ROPE_NORM_BATCH_KERNEL_SRC: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+kernel void rope_interleaved_heads_batch(
+    device float* vecs [[buffer(0)]],
+    constant uint& n_heads [[buffer(1)]],
+    constant uint& head_dim [[buffer(2)]],
+    constant float& theta [[buffer(3)]],
+    constant uint& base_pos [[buffer(4)]],
+    device const float* freq_factors [[buffer(5)]],
+    constant uint& use_freq_factors [[buffer(6)]],
+    constant uint& n_tokens [[buffer(7)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    uint h = gid.x;
+    uint t = gid.y;
+    if (h >= n_heads || t >= n_tokens) return;
+    uint pos = base_pos + t;
+    device float* vec = vecs + (t * n_heads + h) * head_dim;
+    uint half_dim = head_dim / 2u;
+    for (uint i = 0; i < half_dim; i++) {
+        float freq = 1.0f / pow(theta, (2.0f * float(i)) / float(head_dim));
+        float angle = float(pos) * freq;
+        if (use_freq_factors != 0u) {
+            angle /= freq_factors[i];
+        }
+        float s = sin(angle);
+        float c = cos(angle);
+        float a = vec[2u * i];
+        float b = vec[2u * i + 1u];
+        vec[2u * i] = a * c - b * s;
+        vec[2u * i + 1u] = a * s + b * c;
+    }
+}
+"#;
+
+const ROPE_NEOX_BATCH_KERNEL_SRC: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+kernel void rope_neox_heads_batch(
+    device float* vecs [[buffer(0)]],
+    constant uint& n_heads [[buffer(1)]],
+    constant uint& head_dim [[buffer(2)]],
+    constant float& theta [[buffer(3)]],
+    constant uint& base_pos [[buffer(4)]],
+    device const float* freq_factors [[buffer(5)]],
+    constant uint& use_freq_factors [[buffer(6)]],
+    constant uint& n_tokens [[buffer(7)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    uint h = gid.x;
+    uint t = gid.y;
+    if (h >= n_heads || t >= n_tokens) return;
+    uint pos = base_pos + t;
+    device float* vec = vecs + (t * n_heads + h) * head_dim;
+    uint half_dim = head_dim / 2u;
+    for (uint i = 0; i < half_dim; i++) {
+        float freq = 1.0f / pow(theta, (2.0f * float(i)) / float(head_dim));
+        float angle = float(pos) * freq;
+        if (use_freq_factors != 0u) {
+            angle /= freq_factors[i];
+        }
+        float s = sin(angle);
+        float c = cos(angle);
+        float a = vec[i];
+        float b = vec[i + half_dim];
+        vec[i] = a * c - b * s;
+        vec[i + half_dim] = a * s + b * c;
+    }
+}
+"#;
+
+/// Growable Metal-resident KV for one layer (`[seq, n_kv, head_dim]`),
+/// stored as **f16** to match llama.cpp's default `-ctk f16 -ctv f16`
+/// (halves attention bandwidth vs f32).
+pub struct MetalKvBuffers {
+    k: Retained<ProtocolObject<dyn MTLBuffer>>,
+    v: Retained<ProtocolObject<dyn MTLBuffer>>,
+    pub n_kv_heads: usize,
+    pub head_dim: usize,
+    pub seq_len: usize,
+    capacity: usize,
+}
+
+// SAFETY: shared-mode MTLBuffers created once and mutated only from the
+// decode thread that owns this cache (same justification as ResidentWeightBuffer).
+unsafe impl Send for MetalKvBuffers {}
+unsafe impl Sync for MetalKvBuffers {}
+
+impl MetalKvBuffers {
+    pub fn with_capacity(
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq_len: usize,
+    ) -> Result<Self, MetalError> {
+        let shared = shared_metal()?;
+        let elems = max_seq_len.max(1) * n_kv_heads * head_dim;
+        let nbytes = elems * 2; // f16
+        let k = shared
+            .device
+            .newBufferWithLength_options(nbytes, MTLResourceOptions::StorageModeShared)
+            .ok_or(MetalError::BufferAllocFailed)?;
+        let v = shared
+            .device
+            .newBufferWithLength_options(nbytes, MTLResourceOptions::StorageModeShared)
+            .ok_or(MetalError::BufferAllocFailed)?;
+        Ok(Self {
+            k,
+            v,
+            n_kv_heads,
+            head_dim,
+            seq_len: 0,
+            capacity: max_seq_len.max(1),
+        })
+    }
+
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    fn elems_per_token(&self) -> usize {
+        self.n_kv_heads * self.head_dim
+    }
+
+    /// Overwrites device K/V from host f32 caches (e.g. after CPU prefill),
+    /// converting to f16 on the host.
+    pub fn upload_from_host(
+        &mut self,
+        k: &[f32],
+        v: &[f32],
+        seq_len: usize,
+    ) -> Result<(), MetalError> {
+        assert_eq!(k.len(), seq_len * self.elems_per_token());
+        assert_eq!(v.len(), seq_len * self.elems_per_token());
+        if seq_len > self.capacity {
+            return Err(MetalError::CommandFailed);
+        }
+        let n = seq_len * self.elems_per_token();
+        let k_f16: Vec<u16> = k
+            .iter()
+            .map(|&x| half::f16::from_f32(x).to_bits())
+            .collect();
+        let v_f16: Vec<u16> = v
+            .iter()
+            .map(|&x| half::f16::from_f32(x).to_bits())
+            .collect();
+        let nbytes = n * 2;
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                k_f16.as_ptr() as *const u8,
+                self.k.contents().as_ptr() as *mut u8,
+                nbytes,
+            );
+            std::ptr::copy_nonoverlapping(
+                v_f16.as_ptr() as *const u8,
+                self.v.contents().as_ptr() as *mut u8,
+                nbytes,
+            );
+        }
+        self.seq_len = seq_len;
+        Ok(())
+    }
+
+    /// Copies the last appended token's K/V to host f32 (after a completed CB).
+    pub fn last_token_host(&self) -> (Vec<f32>, Vec<f32>) {
+        assert!(self.seq_len > 0);
+        let n = self.elems_per_token();
+        let off = (self.seq_len - 1) * n;
+        let k_ptr = self.k.contents();
+        let v_ptr = self.v.contents();
+        let k = unsafe { std::slice::from_raw_parts(k_ptr.as_ptr() as *const u16, off + n) };
+        let v = unsafe { std::slice::from_raw_parts(v_ptr.as_ptr() as *const u16, off + n) };
+        (
+            k[off..]
+                .iter()
+                .map(|&b| half::f16::from_bits(b).to_f32())
+                .collect(),
+            v[off..]
+                .iter()
+                .map(|&b| half::f16::from_bits(b).to_f32())
+                .collect(),
+        )
+    }
+
+    /// Downloads `n` tokens starting at `start` as f32 (after a completed CB).
+    pub fn tokens_host(&self, start: usize, n: usize) -> (Vec<f32>, Vec<f32>) {
+        assert!(start + n <= self.seq_len);
+        let per = self.elems_per_token();
+        let off = start * per;
+        let elems = n * per;
+        let k_ptr = self.k.contents();
+        let v_ptr = self.v.contents();
+        let k = unsafe { std::slice::from_raw_parts(k_ptr.as_ptr() as *const u16, off + elems) };
+        let v = unsafe { std::slice::from_raw_parts(v_ptr.as_ptr() as *const u16, off + elems) };
+        (
+            k[off..off + elems]
+                .iter()
+                .map(|&b| half::f16::from_bits(b).to_f32())
+                .collect(),
+            v[off..off + elems]
+                .iter()
+                .map(|&b| half::f16::from_bits(b).to_f32())
+                .collect(),
+        )
+    }
+}
+
+fn alloc_f32_buffer(
+    device: &Retained<ProtocolObject<dyn MTLDevice>>,
+    n: usize,
+) -> Result<Retained<ProtocolObject<dyn MTLBuffer>>, MetalError> {
+    device
+        .newBufferWithLength_options(n * 4, MTLResourceOptions::StorageModeShared)
+        .ok_or(MetalError::BufferAllocFailed)
+}
+
+fn alloc_u32_buffer(
+    device: &Retained<ProtocolObject<dyn MTLDevice>>,
+    n: usize,
+) -> Result<Retained<ProtocolObject<dyn MTLBuffer>>, MetalError> {
+    device
+        .newBufferWithLength_options(n * 4, MTLResourceOptions::StorageModeShared)
+        .ok_or(MetalError::BufferAllocFailed)
+}
+
+fn upload_f32(
+    device: &Retained<ProtocolObject<dyn MTLDevice>>,
+    data: &[f32],
+) -> Result<Retained<ProtocolObject<dyn MTLBuffer>>, MetalError> {
+    let mut owned = data.to_vec();
+    unsafe {
+        device.newBufferWithBytes_length_options(
+            NonNull::new(owned.as_mut_ptr() as *mut _).unwrap(),
+            owned.len() * 4,
+            MTLResourceOptions::StorageModeShared,
+        )
+    }
+    .ok_or(MetalError::BufferAllocFailed)
+}
+
+/// Upload host f32 as packed f16 (Metal KV / host-probe GQA).
+fn upload_f16_from_f32(
+    device: &Retained<ProtocolObject<dyn MTLDevice>>,
+    data: &[f32],
+) -> Result<Retained<ProtocolObject<dyn MTLBuffer>>, MetalError> {
+    let mut bits: Vec<u16> = data
+        .iter()
+        .map(|&x| half::f16::from_f32(x).to_bits())
+        .collect();
+    unsafe {
+        device.newBufferWithBytes_length_options(
+            NonNull::new(bits.as_mut_ptr() as *mut _).unwrap(),
+            bits.len() * 2,
+            MTLResourceOptions::StorageModeShared,
+        )
+    }
+    .ok_or(MetalError::BufferAllocFailed)
+}
+
+fn copy_f32_into(buf: &ProtocolObject<dyn MTLBuffer>, data: &[f32]) {
+    let nbytes = data.len() * 4;
+    debug_assert!(buf.length() >= nbytes);
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            data.as_ptr() as *const u8,
+            buf.contents().as_ptr() as *mut u8,
+            nbytes,
+        );
+    }
+}
+
+/// Process-wide activation scratch for [`launch_decode_dense_stack`].
+/// Avoids allocating ~10 MTLBuffers every decode token.
+struct DecodeScratch {
+    h: Retained<ProtocolObject<dyn MTLBuffer>>,
+    x: Retained<ProtocolObject<dyn MTLBuffer>>,
+    x2: Retained<ProtocolObject<dyn MTLBuffer>>,
+    q: Retained<ProtocolObject<dyn MTLBuffer>>,
+    k: Retained<ProtocolObject<dyn MTLBuffer>>,
+    v: Retained<ProtocolObject<dyn MTLBuffer>>,
+    attn: Retained<ProtocolObject<dyn MTLBuffer>>,
+    o: Retained<ProtocolObject<dyn MTLBuffer>>,
+    gate: Retained<ProtocolObject<dyn MTLBuffer>>,
+    up: Retained<ProtocolObject<dyn MTLBuffer>>,
+    act: Retained<ProtocolObject<dyn MTLBuffer>>,
+    down: Retained<ProtocolObject<dyn MTLBuffer>>,
+    logits: Option<Retained<ProtocolObject<dyn MTLBuffer>>>,
+    /// Single u32 slot for greedy argmax-in-stack (always resident; 4 bytes).
+    argmax_idx: Retained<ProtocolObject<dyn MTLBuffer>>,
+    hidden_cap: usize,
+    max_q_cap: usize,
+    max_kv_cap: usize,
+    attn_cap: usize,
+    max_gate_cap: usize,
+    logits_cap: usize,
+}
+
+// SAFETY: scratch is gated by DECODE_SCRATCH mutex; only one encode at a time.
+unsafe impl Send for DecodeScratch {}
+
+static DECODE_SCRATCH: Mutex<Option<DecodeScratch>> = Mutex::new(None);
+
+struct ScratchCaps {
+    hidden: usize,
+    max_q: usize,
+    max_kv: usize,
+    attn: usize,
+    max_gate: usize,
+    logits: usize,
+}
+
+fn borrow_decode_scratch(
+    device: &Retained<ProtocolObject<dyn MTLDevice>>,
+    caps: ScratchCaps,
+) -> Result<std::sync::MutexGuard<'static, Option<DecodeScratch>>, MetalError> {
+    let mut guard = DECODE_SCRATCH.lock().unwrap();
+    let fits = match guard.as_ref() {
+        Some(s) => {
+            s.hidden_cap >= caps.hidden
+                && s.max_q_cap >= caps.max_q
+                && s.max_kv_cap >= caps.max_kv
+                && s.attn_cap >= caps.attn
+                && s.max_gate_cap >= caps.max_gate
+                && s.logits_cap >= caps.logits
+        }
+        None => false,
+    };
+    if !fits {
+        let logits = if caps.logits > 0 {
+            Some(alloc_f32_buffer(device, caps.logits)?)
+        } else {
+            None
+        };
+        *guard = Some(DecodeScratch {
+            h: alloc_f32_buffer(device, caps.hidden)?,
+            x: alloc_f32_buffer(device, caps.hidden)?,
+            x2: alloc_f32_buffer(device, caps.hidden)?,
+            q: alloc_f32_buffer(device, caps.max_q)?,
+            k: alloc_f32_buffer(device, caps.max_kv)?,
+            v: alloc_f32_buffer(device, caps.max_kv)?,
+            attn: alloc_f32_buffer(device, caps.attn)?,
+            o: alloc_f32_buffer(device, caps.hidden)?,
+            gate: alloc_f32_buffer(device, caps.max_gate)?,
+            up: alloc_f32_buffer(device, caps.max_gate)?,
+            act: alloc_f32_buffer(device, caps.max_gate)?,
+            down: alloc_f32_buffer(device, caps.hidden)?,
+            logits,
+            argmax_idx: alloc_u32_buffer(device, 1)?,
+            hidden_cap: caps.hidden,
+            max_q_cap: caps.max_q,
+            max_kv_cap: caps.max_kv,
+            attn_cap: caps.attn,
+            max_gate_cap: caps.max_gate,
+            logits_cap: caps.logits,
+        });
+    }
+    Ok(guard)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn encode_rope(
+    encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+    device: &Retained<ProtocolObject<dyn MTLDevice>>,
+    layout: MetalRopeLayout,
+    vecs: &ProtocolObject<dyn MTLBuffer>,
+    n_heads: u32,
+    head_dim: u32,
+    theta: f32,
+    pos: u32,
+    freq_factors: Option<&ProtocolObject<dyn MTLBuffer>>,
+) -> Result<(), MetalError> {
+    let (src, name) = match layout {
+        MetalRopeLayout::Norm => (ROPE_NORM_KERNEL_SRC, "rope_interleaved_heads"),
+        MetalRopeLayout::Neox => (ROPE_NEOX_KERNEL_SRC, "rope_neox_heads"),
+    };
+    let pipe = ensure_pipeline(device, src, name)?;
+    encoder.setComputePipelineState(&pipe.0);
+    unsafe {
+        encoder.setBuffer_offset_atIndex(Some(vecs), 0, 0);
+        let mut n_heads_u = n_heads;
+        encoder.setBytes_length_atIndex(
+            NonNull::new(&mut n_heads_u as *mut u32 as *mut _).unwrap(),
+            4,
+            1,
+        );
+        let mut head_dim_u = head_dim;
+        encoder.setBytes_length_atIndex(
+            NonNull::new(&mut head_dim_u as *mut u32 as *mut _).unwrap(),
+            4,
+            2,
+        );
+        let mut theta_f = theta;
+        encoder.setBytes_length_atIndex(
+            NonNull::new(&mut theta_f as *mut f32 as *mut _).unwrap(),
+            4,
+            3,
+        );
+        let mut pos_u = pos;
+        encoder.setBytes_length_atIndex(
+            NonNull::new(&mut pos_u as *mut u32 as *mut _).unwrap(),
+            4,
+            4,
+        );
+        if let Some(ff) = freq_factors {
+            encoder.setBuffer_offset_atIndex(Some(ff), 0, 5);
+            let mut use_ff = 1u32;
+            encoder.setBytes_length_atIndex(
+                NonNull::new(&mut use_ff as *mut u32 as *mut _).unwrap(),
+                4,
+                6,
+            );
+        } else {
+            // Unused device buffer slot — bind a 4-byte scratch so index 5 is valid.
+            let mut scratch = [0u8; 4];
+            encoder.setBytes_length_atIndex(
+                NonNull::new(scratch.as_mut_ptr() as *mut _).unwrap(),
+                4,
+                5,
+            );
+            let mut use_ff = 0u32;
+            encoder.setBytes_length_atIndex(
+                NonNull::new(&mut use_ff as *mut u32 as *mut _).unwrap(),
+                4,
+                6,
+            );
+        }
+    }
+    encoder.dispatchThreadgroups_threadsPerThreadgroup(
+        MTLSize {
+            width: n_heads as usize,
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width: 1,
+            height: 1,
+            depth: 1,
+        },
+    );
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn encode_rope_batch(
+    encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+    device: &Retained<ProtocolObject<dyn MTLDevice>>,
+    layout: MetalRopeLayout,
+    vecs: &ProtocolObject<dyn MTLBuffer>,
+    n_heads: u32,
+    head_dim: u32,
+    theta: f32,
+    base_pos: u32,
+    n_tokens: u32,
+    freq_factors: Option<&ProtocolObject<dyn MTLBuffer>>,
+) -> Result<(), MetalError> {
+    if n_tokens == 0 {
+        return Ok(());
+    }
+    let (src, name) = match layout {
+        MetalRopeLayout::Norm => (ROPE_NORM_BATCH_KERNEL_SRC, "rope_interleaved_heads_batch"),
+        MetalRopeLayout::Neox => (ROPE_NEOX_BATCH_KERNEL_SRC, "rope_neox_heads_batch"),
+    };
+    let pipe = ensure_pipeline(device, src, name)?;
+    encoder.setComputePipelineState(&pipe.0);
+    unsafe {
+        encoder.setBuffer_offset_atIndex(Some(vecs), 0, 0);
+        let mut n_heads_u = n_heads;
+        encoder.setBytes_length_atIndex(
+            NonNull::new(&mut n_heads_u as *mut u32 as *mut _).unwrap(),
+            4,
+            1,
+        );
+        let mut head_dim_u = head_dim;
+        encoder.setBytes_length_atIndex(
+            NonNull::new(&mut head_dim_u as *mut u32 as *mut _).unwrap(),
+            4,
+            2,
+        );
+        let mut theta_f = theta;
+        encoder.setBytes_length_atIndex(
+            NonNull::new(&mut theta_f as *mut f32 as *mut _).unwrap(),
+            4,
+            3,
+        );
+        let mut base_pos_u = base_pos;
+        encoder.setBytes_length_atIndex(
+            NonNull::new(&mut base_pos_u as *mut u32 as *mut _).unwrap(),
+            4,
+            4,
+        );
+        if let Some(ff) = freq_factors {
+            encoder.setBuffer_offset_atIndex(Some(ff), 0, 5);
+            let mut use_ff = 1u32;
+            encoder.setBytes_length_atIndex(
+                NonNull::new(&mut use_ff as *mut u32 as *mut _).unwrap(),
+                4,
+                6,
+            );
+        } else {
+            let mut scratch = [0u8; 4];
+            encoder.setBytes_length_atIndex(
+                NonNull::new(scratch.as_mut_ptr() as *mut _).unwrap(),
+                4,
+                5,
+            );
+            let mut use_ff = 0u32;
+            encoder.setBytes_length_atIndex(
+                NonNull::new(&mut use_ff as *mut u32 as *mut _).unwrap(),
+                4,
+                6,
+            );
+        }
+        let mut n_tok = n_tokens;
+        encoder.setBytes_length_atIndex(
+            NonNull::new(&mut n_tok as *mut u32 as *mut _).unwrap(),
+            4,
+            7,
+        );
+    }
+    encoder.dispatchThreadgroups_threadsPerThreadgroup(
+        MTLSize {
+            width: n_heads as usize,
+            height: n_tokens as usize,
+            depth: 1,
+        },
+        MTLSize {
+            width: 1,
+            height: 1,
+            depth: 1,
+        },
+    );
+    Ok(())
+}
+
+fn encode_kv_append(
+    encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+    device: &Retained<ProtocolObject<dyn MTLDevice>>,
+    src: &ProtocolObject<dyn MTLBuffer>,
+    dst: &ProtocolObject<dyn MTLBuffer>,
+    offset_elems: u32,
+    n_elems: u32,
+) -> Result<(), MetalError> {
+    let pipe = ensure_pipeline(device, KV_APPEND_KERNEL_SRC, "kv_append")?;
+    encoder.setComputePipelineState(&pipe.0);
+    unsafe {
+        encoder.setBuffer_offset_atIndex(Some(src), 0, 0);
+        encoder.setBuffer_offset_atIndex(Some(dst), 0, 1);
+        let mut off = offset_elems;
+        encoder.setBytes_length_atIndex(
+            NonNull::new(&mut off as *mut u32 as *mut _).unwrap(),
+            4,
+            2,
+        );
+        let mut n = n_elems;
+        encoder.setBytes_length_atIndex(NonNull::new(&mut n as *mut u32 as *mut _).unwrap(), 4, 3);
+    }
+    let tg = 256usize.min(n_elems as usize).max(1);
+    let n_tg = (n_elems as usize).div_ceil(tg);
+    encoder.dispatchThreadgroups_threadsPerThreadgroup(
+        MTLSize {
+            width: n_tg,
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width: tg,
+            height: 1,
+            depth: 1,
+        },
+    );
+    Ok(())
+}
+
+/// TG size for decode GQA: multiple of 32 with **power-of-two** N_SG
+/// (cross-SG tree reduce). Compact TG mem after per-SG register reduce:
+/// `(2 * nsg + nsg * head_dim) * 4`.
+fn gqa_decode_threadgroup_size(seq_len: u32, head_dim: u32) -> u32 {
+    const TG_BUDGET_BYTES: u32 = 28 * 1024;
+    const NW: u32 = 32;
+    let per_sg = head_dim.saturating_add(2).saturating_mul(4).max(1);
+    let max_nsg = (TG_BUDGET_BYTES / per_sg).clamp(1, 8);
+    let raw = seq_len.div_ceil(NW).clamp(1, 4).min(max_nsg);
+    // Power-of-two N_SG only (1/2/4) so the cross-SG tree reduce is complete.
+    let nsg = if raw >= 4 && max_nsg >= 4 {
+        4
+    } else if raw >= 2 && max_nsg >= 2 {
+        2
+    } else {
+        1
+    };
+    nsg * NW
+}
+
+/// TG size for FA-vec decode (d=128 and d=64): NSG=8 × NW=32.
+fn gqa_fa_vec_threadgroup_size(_head_dim: u32) -> u32 {
+    256
+}
+
+/// Head dims the FA-vec decode kernels cover (dedicated specializations).
+fn gqa_fa_vec_supported(head_dim: u32) -> bool {
+    head_dim == 128 || head_dim == 64
+}
+
+/// Prefill GQA keeps the legacy per-thread TG-acc layout; TG must be a
+/// power of two for its tree reduce. Separate from decode so NeoX/prefill
+/// agents can evolve this without fighting decode occupancy tweaks.
+fn gqa_prefill_threadgroup_size(seq_len: u32, head_dim: u32) -> u32 {
+    const TG_BUDGET_BYTES: u32 = 28 * 1024;
+    let per_thread = head_dim.saturating_add(2).saturating_mul(4).max(1);
+    let max_by_mem = (TG_BUDGET_BYTES / per_thread).max(1);
+    let want = seq_len.clamp(32, 128).min(max_by_mem).max(1);
+    let mut tg = 1u32 << (31 - want.leading_zeros());
+    while tg > max_by_mem && tg > 1 {
+        tg >>= 1;
+    }
+    tg.max(1)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn encode_gqa_fa_vec(
+    encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+    device: &Retained<ProtocolObject<dyn MTLDevice>>,
+    q: &ProtocolObject<dyn MTLBuffer>,
+    k: &ProtocolObject<dyn MTLBuffer>,
+    v: &ProtocolObject<dyn MTLBuffer>,
+    out: &ProtocolObject<dyn MTLBuffer>,
+    n_heads: u32,
+    n_kv_heads: u32,
+    head_dim: u32,
+    seq_len: u32,
+) -> Result<(), MetalError> {
+    let pipe = match head_dim {
+        128 => ensure_pipeline(device, GQA_DECODE_FA_VEC_KERNEL_SRC, "gqa_decode_fa_vec")?,
+        64 => ensure_pipeline(
+            device,
+            GQA_DECODE_FA_VEC_D64_KERNEL_SRC,
+            "gqa_decode_fa_vec_d64",
+        )?,
+        _ => return Err(MetalError::CommandFailed),
+    };
+    encoder.setComputePipelineState(&pipe.0);
+    let tg = gqa_fa_vec_threadgroup_size(head_dim);
+    let nsg = tg / 32;
+    // Q[D] + NSG * (C=32 scores + D output)
+    let tg_mem = ((head_dim + nsg * (32 + head_dim)) * 4) as usize;
+    unsafe {
+        encoder.setBuffer_offset_atIndex(Some(q), 0, 0);
+        encoder.setBuffer_offset_atIndex(Some(k), 0, 1);
+        encoder.setBuffer_offset_atIndex(Some(v), 0, 2);
+        encoder.setBuffer_offset_atIndex(Some(out), 0, 3);
+        let mut nh = n_heads;
+        encoder.setBytes_length_atIndex(NonNull::new(&mut nh as *mut u32 as *mut _).unwrap(), 4, 4);
+        let mut nkv = n_kv_heads;
+        encoder.setBytes_length_atIndex(
+            NonNull::new(&mut nkv as *mut u32 as *mut _).unwrap(),
+            4,
+            5,
+        );
+        let mut hd = head_dim;
+        encoder.setBytes_length_atIndex(NonNull::new(&mut hd as *mut u32 as *mut _).unwrap(), 4, 6);
+        let mut sl = seq_len;
+        encoder.setBytes_length_atIndex(NonNull::new(&mut sl as *mut u32 as *mut _).unwrap(), 4, 7);
+        encoder.setThreadgroupMemoryLength_atIndex(tg_mem, 0);
+    }
+    encoder.dispatchThreadgroups_threadsPerThreadgroup(
+        MTLSize {
+            width: n_heads as usize,
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width: tg as usize,
+            height: 1,
+            depth: 1,
+        },
+    );
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn encode_gqa(
+    encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+    device: &Retained<ProtocolObject<dyn MTLDevice>>,
+    q: &ProtocolObject<dyn MTLBuffer>,
+    k: &ProtocolObject<dyn MTLBuffer>,
+    v: &ProtocolObject<dyn MTLBuffer>,
+    out: &ProtocolObject<dyn MTLBuffer>,
+    n_heads: u32,
+    n_kv_heads: u32,
+    head_dim: u32,
+    seq_len: u32,
+    kv_start: u32,
+) -> Result<(), MetalError> {
+    // FA-vec kernels scan the full prefix; SWA (kv_start > 0) uses the
+    // legacy online-softmax kernel which honours the window start.
+    if kv_start == 0 && metal_fa_vec_enabled() && gqa_fa_vec_supported(head_dim) {
+        return encode_gqa_fa_vec(
+            encoder, device, q, k, v, out, n_heads, n_kv_heads, head_dim, seq_len,
+        );
+    }
+    if head_dim > 256 {
+        return Err(MetalError::CommandFailed);
+    }
+    let pipe = ensure_pipeline(device, GQA_DECODE_KERNEL_SRC, "gqa_decode")?;
+    encoder.setComputePipelineState(&pipe.0);
+    let tg = gqa_decode_threadgroup_size(seq_len, head_dim);
+    let nsg = tg / 32;
+    // m[nsg] + s[nsg] + acc[nsg * head_dim]
+    let tg_mem = ((2 * nsg + nsg * head_dim) * 4) as usize;
+    unsafe {
+        encoder.setBuffer_offset_atIndex(Some(q), 0, 0);
+        encoder.setBuffer_offset_atIndex(Some(k), 0, 1);
+        encoder.setBuffer_offset_atIndex(Some(v), 0, 2);
+        encoder.setBuffer_offset_atIndex(Some(out), 0, 3);
+        let mut nh = n_heads;
+        encoder.setBytes_length_atIndex(NonNull::new(&mut nh as *mut u32 as *mut _).unwrap(), 4, 4);
+        let mut nkv = n_kv_heads;
+        encoder.setBytes_length_atIndex(
+            NonNull::new(&mut nkv as *mut u32 as *mut _).unwrap(),
+            4,
+            5,
+        );
+        let mut hd = head_dim;
+        encoder.setBytes_length_atIndex(NonNull::new(&mut hd as *mut u32 as *mut _).unwrap(), 4, 6);
+        let mut sl = seq_len;
+        encoder.setBytes_length_atIndex(NonNull::new(&mut sl as *mut u32 as *mut _).unwrap(), 4, 7);
+        let mut ks = kv_start;
+        encoder.setBytes_length_atIndex(NonNull::new(&mut ks as *mut u32 as *mut _).unwrap(), 4, 8);
+        encoder.setThreadgroupMemoryLength_atIndex(tg_mem, 0);
+    }
+    encoder.dispatchThreadgroups_threadsPerThreadgroup(
+        MTLSize {
+            width: n_heads as usize,
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width: tg as usize,
+            height: 1,
+            depth: 1,
+        },
+    );
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn encode_gqa_prefill(
+    encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+    device: &Retained<ProtocolObject<dyn MTLDevice>>,
+    q: &ProtocolObject<dyn MTLBuffer>,
+    k: &ProtocolObject<dyn MTLBuffer>,
+    v: &ProtocolObject<dyn MTLBuffer>,
+    out: &ProtocolObject<dyn MTLBuffer>,
+    n_heads: u32,
+    n_kv_heads: u32,
+    head_dim: u32,
+    n_q: u32,
+    kv_prefix_len: u32,
+) -> Result<(), MetalError> {
+    let pipe = ensure_pipeline(device, GQA_PREFILL_KERNEL_SRC, "gqa_prefill")?;
+    encoder.setComputePipelineState(&pipe.0);
+    let max_causal = kv_prefix_len + n_q;
+    let tg = gqa_prefill_threadgroup_size(max_causal.max(1), head_dim);
+    // Prefill kernel: per-thread TG acc — m[tg]|s[tg]|acc[tg*head_dim].
+    let tg_mem = ((2 * tg + tg * head_dim) * 4) as usize;
+    unsafe {
+        encoder.setBuffer_offset_atIndex(Some(q), 0, 0);
+        encoder.setBuffer_offset_atIndex(Some(k), 0, 1);
+        encoder.setBuffer_offset_atIndex(Some(v), 0, 2);
+        encoder.setBuffer_offset_atIndex(Some(out), 0, 3);
+        let mut nh = n_heads;
+        encoder.setBytes_length_atIndex(NonNull::new(&mut nh as *mut u32 as *mut _).unwrap(), 4, 4);
+        let mut nkv = n_kv_heads;
+        encoder.setBytes_length_atIndex(
+            NonNull::new(&mut nkv as *mut u32 as *mut _).unwrap(),
+            4,
+            5,
+        );
+        let mut hd = head_dim;
+        encoder.setBytes_length_atIndex(NonNull::new(&mut hd as *mut u32 as *mut _).unwrap(), 4, 6);
+        let mut nq = n_q;
+        encoder.setBytes_length_atIndex(NonNull::new(&mut nq as *mut u32 as *mut _).unwrap(), 4, 7);
+        let mut prefix = kv_prefix_len;
+        encoder.setBytes_length_atIndex(
+            NonNull::new(&mut prefix as *mut u32 as *mut _).unwrap(),
+            4,
+            8,
+        );
+        encoder.setThreadgroupMemoryLength_atIndex(tg_mem, 0);
+    }
+    encoder.dispatchThreadgroups_threadsPerThreadgroup(
+        MTLSize {
+            width: n_heads as usize,
+            height: n_q as usize,
+            depth: 1,
+        },
+        MTLSize {
+            width: tg as usize,
+            height: 1,
+            depth: 1,
+        },
+    );
+    Ok(())
+}
+
+/// Encode the optional QKV bias adds + per-head QK-RMSNorms (CPU-path
+/// order: bias → norm → RoPE). No-ops when `extras` is empty.
+#[allow(clippy::too_many_arguments)]
+fn encode_attn_extras(
+    encoder: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputeCommandEncoder>,
+    device: &objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLDevice>>,
+    extras: &AttnExtras<'_>,
+    q_buf: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>,
+    k_buf: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>,
+    v_buf: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>,
+    q_rows: usize,
+    k_rows: usize,
+    v_rows: usize,
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    rms_eps: f32,
+) -> Result<(), MetalError> {
+    if let Some(b) = extras.q_bias {
+        debug_assert_eq!(b.len(), q_rows);
+        let bb = resident_f32_buffer(device, b)?;
+        encode_vec_add(encoder, device, q_buf, &bb.buffer, q_rows as u32)?;
+    }
+    if let Some(b) = extras.k_bias {
+        debug_assert_eq!(b.len(), k_rows);
+        let bb = resident_f32_buffer(device, b)?;
+        encode_vec_add(encoder, device, k_buf, &bb.buffer, k_rows as u32)?;
+    }
+    if let Some(b) = extras.v_bias {
+        debug_assert_eq!(b.len(), v_rows);
+        let bb = resident_f32_buffer(device, b)?;
+        encode_vec_add(encoder, device, v_buf, &bb.buffer, v_rows as u32)?;
+    }
+    if let Some(w) = extras.q_norm {
+        debug_assert_eq!(w.len(), head_dim);
+        let wb = resident_f32_buffer(device, w)?;
+        encode_rms_norm_per_head(
+            encoder,
+            device,
+            q_buf,
+            &wb.buffer,
+            n_heads as u32,
+            head_dim as u32,
+            rms_eps,
+        )?;
+    }
+    if let Some(w) = extras.k_norm {
+        debug_assert_eq!(w.len(), head_dim);
+        let wb = resident_f32_buffer(device, w)?;
+        encode_rms_norm_per_head(
+            encoder,
+            device,
+            k_buf,
+            &wb.buffer,
+            n_kv_heads as u32,
+            head_dim as u32,
+            rms_eps,
+        )?;
+    }
+    Ok(())
+}
+
+/// Fused Q/K/V matvec → RoPE → KV append → GQA → O matvec.
+/// Returns the O-projection output on the host. Updates `kv.seq_len`.
+#[allow(clippy::too_many_arguments)]
+pub fn launch_decode_attn_block(
+    x: &[f32],
+    q_launch: &MatvecLaunch<'_>,
+    k_launch: &MatvecLaunch<'_>,
+    v_launch: &MatvecLaunch<'_>,
+    o_launch: &MatvecLaunch<'_>,
+    kv: &mut MetalKvBuffers,
+    n_heads: usize,
+    rope_layout: MetalRopeLayout,
+    rope_theta: f32,
+    freq_factors: Option<&[f32]>,
+    pos: usize,
+    extras: &AttnExtras<'_>,
+    rms_eps: f32,
+) -> Result<Vec<f32>, MetalError> {
+    let head_dim = kv.head_dim;
+    let n_kv_heads = kv.n_kv_heads;
+    assert_eq!(q_launch.rows, n_heads * head_dim);
+    assert_eq!(k_launch.rows, n_kv_heads * head_dim);
+    assert_eq!(v_launch.rows, n_kv_heads * head_dim);
+    assert_eq!(o_launch.rows, n_heads * head_dim);
+    assert_eq!(
+        pos, kv.seq_len,
+        "decode pos must equal current Metal KV length"
+    );
+    if kv.seq_len >= kv.capacity {
+        return Err(MetalError::CommandFailed);
+    }
+    if let Some(ff) = freq_factors {
+        assert_eq!(ff.len(), head_dim / 2);
+    }
+
+    let shared = shared_metal()?;
+    let device = &shared.device;
+    let queue = &shared.queue;
+
+    let x_buf = upload_f32(device, x)?;
+    let q_w = resident_weight_buffer(device, q_launch.weights)?;
+    let k_w = resident_weight_buffer(device, k_launch.weights)?;
+    let v_w = resident_weight_buffer(device, v_launch.weights)?;
+    let o_w = resident_weight_buffer(device, o_launch.weights)?;
+
+    let q_buf = alloc_f32_buffer(device, q_launch.rows)?;
+    let k_buf = alloc_f32_buffer(device, k_launch.rows)?;
+    let v_buf = alloc_f32_buffer(device, v_launch.rows)?;
+    let attn_buf = alloc_f32_buffer(device, n_heads * head_dim)?;
+    let o_buf = alloc_f32_buffer(device, o_launch.rows)?;
+    let ff_buf = match freq_factors {
+        Some(ff) => Some(upload_f32(device, ff)?),
+        None => None,
+    };
+
+    let cmd_buf = queue.commandBuffer().ok_or(MetalError::CommandFailed)?;
+    let encoder = cmd_buf
+        .computeCommandEncoder()
+        .ok_or(MetalError::CommandFailed)?;
+
+    encode_matvec(&encoder, device, q_launch, &q_w, &x_buf, &q_buf)?;
+    encode_matvec(&encoder, device, k_launch, &k_w, &x_buf, &k_buf)?;
+    encode_matvec(&encoder, device, v_launch, &v_w, &x_buf, &v_buf)?;
+    encode_attn_extras(
+        &encoder,
+        device,
+        extras,
+        &q_buf,
+        &k_buf,
+        &v_buf,
+        q_launch.rows,
+        k_launch.rows,
+        v_launch.rows,
+        n_heads,
+        n_kv_heads,
+        head_dim,
+        rms_eps,
+    )?;
+
+    encode_rope(
+        &encoder,
+        device,
+        rope_layout,
+        &q_buf,
+        n_heads as u32,
+        head_dim as u32,
+        rope_theta,
+        pos as u32,
+        ff_buf.as_deref(),
+    )?;
+    encode_rope(
+        &encoder,
+        device,
+        rope_layout,
+        &k_buf,
+        n_kv_heads as u32,
+        head_dim as u32,
+        rope_theta,
+        pos as u32,
+        ff_buf.as_deref(),
+    )?;
+
+    let token_elems = (n_kv_heads * head_dim) as u32;
+    let offset = (kv.seq_len * n_kv_heads * head_dim) as u32;
+    encode_kv_append(&encoder, device, &k_buf, &kv.k, offset, token_elems)?;
+    encode_kv_append(&encoder, device, &v_buf, &kv.v, offset, token_elems)?;
+
+    let new_seq = (kv.seq_len + 1) as u32;
+    encode_gqa(
+        &encoder,
+        device,
+        &q_buf,
+        &kv.k,
+        &kv.v,
+        &attn_buf,
+        n_heads as u32,
+        n_kv_heads as u32,
+        head_dim as u32,
+        new_seq,
+        0,
+    )?;
+
+    // O matvec reads attn_buf as activation `x`.
+    encode_matvec(&encoder, device, o_launch, &o_w, &attn_buf, &o_buf)?;
+
+    encoder.endEncoding();
+    cmd_buf.commit();
+    cmd_buf.waitUntilCompleted();
+
+    kv.seq_len += 1;
+
+    let out_ptr = o_buf.contents();
+    let out = unsafe {
+        std::slice::from_raw_parts(out_ptr.as_ptr() as *const f32, o_launch.rows).to_vec()
+    };
+    Ok(out)
+}
+
+/// Full dense decode layer on one CB: RMSNorm → QKV→RoPE→KV→GQA→O →
+/// residual → RMSNorm → gate/up → SiLU×up → down → residual.
+/// Returns the updated residual `hidden` on the host. Updates `kv.seq_len`.
+#[allow(clippy::too_many_arguments)]
+pub fn launch_decode_dense_layer(
+    hidden: &[f32],
+    attn_norm_w: &[f32],
+    q_launch: &MatvecLaunch<'_>,
+    k_launch: &MatvecLaunch<'_>,
+    v_launch: &MatvecLaunch<'_>,
+    o_launch: &MatvecLaunch<'_>,
+    kv: &mut MetalKvBuffers,
+    ffn_norm_w: &[f32],
+    gate_launch: &MatvecLaunch<'_>,
+    up_launch: &MatvecLaunch<'_>,
+    down_launch: &MatvecLaunch<'_>,
+    n_heads: usize,
+    rope_layout: MetalRopeLayout,
+    rope_theta: f32,
+    freq_factors: Option<&[f32]>,
+    pos: usize,
+    rms_eps: f32,
+    extras: &AttnExtras<'_>,
+) -> Result<Vec<f32>, MetalError> {
+    let head_dim = kv.head_dim;
+    let n_kv_heads = kv.n_kv_heads;
+    let hidden_dim = hidden.len();
+    assert_eq!(attn_norm_w.len(), hidden_dim);
+    assert_eq!(ffn_norm_w.len(), hidden_dim);
+    assert_eq!(q_launch.rows, n_heads * head_dim);
+    assert_eq!(k_launch.rows, n_kv_heads * head_dim);
+    assert_eq!(v_launch.rows, n_kv_heads * head_dim);
+    assert_eq!(o_launch.rows, hidden_dim);
+    assert_eq!(down_launch.rows, hidden_dim);
+    assert_eq!(gate_launch.rows, up_launch.rows);
+    assert_eq!(
+        pos, kv.seq_len,
+        "decode pos must equal current Metal KV length"
+    );
+    if kv.seq_len >= kv.capacity {
+        return Err(MetalError::CommandFailed);
+    }
+    if let Some(ff) = freq_factors {
+        assert_eq!(ff.len(), head_dim / 2);
+    }
+
+    let shared = shared_metal()?;
+    let device = &shared.device;
+    let queue = &shared.queue;
+
+    let h_buf = upload_f32(device, hidden)?;
+    let attn_nw = resident_f32_buffer(device, attn_norm_w)?;
+    let ffn_nw = resident_f32_buffer(device, ffn_norm_w)?;
+    let x_buf = alloc_f32_buffer(device, hidden_dim)?;
+    let x2_buf = alloc_f32_buffer(device, hidden_dim)?;
+
+    let q_w = resident_weight_buffer(device, q_launch.weights)?;
+    let k_w = resident_weight_buffer(device, k_launch.weights)?;
+    let v_w = resident_weight_buffer(device, v_launch.weights)?;
+    let o_w = resident_weight_buffer(device, o_launch.weights)?;
+    let gate_w = resident_weight_buffer(device, gate_launch.weights)?;
+    let up_w = resident_weight_buffer(device, up_launch.weights)?;
+    let down_w = resident_weight_buffer(device, down_launch.weights)?;
+
+    let q_buf = alloc_f32_buffer(device, q_launch.rows)?;
+    let k_buf = alloc_f32_buffer(device, k_launch.rows)?;
+    let v_buf = alloc_f32_buffer(device, v_launch.rows)?;
+    let attn_buf = alloc_f32_buffer(device, n_heads * head_dim)?;
+    let o_buf = alloc_f32_buffer(device, o_launch.rows)?;
+    let gate_buf = alloc_f32_buffer(device, gate_launch.rows)?;
+    let up_buf = alloc_f32_buffer(device, up_launch.rows)?;
+    let act_buf = alloc_f32_buffer(device, gate_launch.rows)?;
+    let down_buf = alloc_f32_buffer(device, down_launch.rows)?;
+    let ff_buf = match freq_factors {
+        Some(ff) => Some(upload_f32(device, ff)?),
+        None => None,
+    };
+
+    let cmd_buf = queue.commandBuffer().ok_or(MetalError::CommandFailed)?;
+    let encoder = cmd_buf
+        .computeCommandEncoder()
+        .ok_or(MetalError::CommandFailed)?;
+
+    encode_rms_norm(
+        &encoder,
+        device,
+        &h_buf,
+        &attn_nw.buffer,
+        &x_buf,
+        hidden_dim as u32,
+        rms_eps,
+    )?;
+    encode_matvec(&encoder, device, q_launch, &q_w, &x_buf, &q_buf)?;
+    encode_matvec(&encoder, device, k_launch, &k_w, &x_buf, &k_buf)?;
+    encode_matvec(&encoder, device, v_launch, &v_w, &x_buf, &v_buf)?;
+    encode_attn_extras(
+        &encoder,
+        device,
+        extras,
+        &q_buf,
+        &k_buf,
+        &v_buf,
+        q_launch.rows,
+        k_launch.rows,
+        v_launch.rows,
+        n_heads,
+        n_kv_heads,
+        head_dim,
+        rms_eps,
+    )?;
+
+    encode_rope(
+        &encoder,
+        device,
+        rope_layout,
+        &q_buf,
+        n_heads as u32,
+        head_dim as u32,
+        rope_theta,
+        pos as u32,
+        ff_buf.as_deref(),
+    )?;
+    encode_rope(
+        &encoder,
+        device,
+        rope_layout,
+        &k_buf,
+        n_kv_heads as u32,
+        head_dim as u32,
+        rope_theta,
+        pos as u32,
+        ff_buf.as_deref(),
+    )?;
+
+    let token_elems = (n_kv_heads * head_dim) as u32;
+    let offset = (kv.seq_len * n_kv_heads * head_dim) as u32;
+    encode_kv_append(&encoder, device, &k_buf, &kv.k, offset, token_elems)?;
+    encode_kv_append(&encoder, device, &v_buf, &kv.v, offset, token_elems)?;
+
+    let new_seq = (kv.seq_len + 1) as u32;
+    encode_gqa(
+        &encoder,
+        device,
+        &q_buf,
+        &kv.k,
+        &kv.v,
+        &attn_buf,
+        n_heads as u32,
+        n_kv_heads as u32,
+        head_dim as u32,
+        new_seq,
+        0,
+    )?;
+    encode_matvec(&encoder, device, o_launch, &o_w, &attn_buf, &o_buf)?;
+    encode_add_rms_norm(
+        &encoder,
+        device,
+        &h_buf,
+        &o_buf,
+        &ffn_nw.buffer,
+        &x2_buf,
+        hidden_dim as u32,
+        rms_eps,
+    )?;
+    encode_matvec(&encoder, device, gate_launch, &gate_w, &x2_buf, &gate_buf)?;
+    encode_matvec(&encoder, device, up_launch, &up_w, &x2_buf, &up_buf)?;
+    encode_silu_mul(
+        &encoder,
+        device,
+        &gate_buf,
+        &up_buf,
+        &act_buf,
+        gate_launch.rows as u32,
+    )?;
+    encode_matvec(&encoder, device, down_launch, &down_w, &act_buf, &down_buf)?;
+    encode_vec_add(&encoder, device, &h_buf, &down_buf, hidden_dim as u32)?;
+
+    encoder.endEncoding();
+    cmd_buf.commit();
+    cmd_buf.waitUntilCompleted();
+
+    kv.seq_len += 1;
+
+    let out_ptr = h_buf.contents();
+    Ok(unsafe { std::slice::from_raw_parts(out_ptr.as_ptr() as *const f32, hidden_dim).to_vec() })
+}
+
+/// Optional attention epilogue ops applied between the QKV matvecs and
+/// RoPE, in CPU-path order: bias add (Qwen2-family `qkv_bias`), then
+/// per-head QK-RMSNorm (Qwen3 / Gemma-3, weight length = head_dim).
+#[derive(Default)]
+pub struct AttnExtras<'a> {
+    pub q_bias: Option<&'a [f32]>,
+    pub k_bias: Option<&'a [f32]>,
+    pub v_bias: Option<&'a [f32]>,
+    pub q_norm: Option<&'a [f32]>,
+    pub k_norm: Option<&'a [f32]>,
+}
+
+impl AttnExtras<'_> {
+    pub fn is_empty(&self) -> bool {
+        self.q_bias.is_none()
+            && self.k_bias.is_none()
+            && self.v_bias.is_none()
+            && self.q_norm.is_none()
+            && self.k_norm.is_none()
+    }
+}
+
+/// Per-layer launches + norms for [`launch_decode_dense_stack`].
+pub struct DenseLayerMetal<'a> {
+    pub attn_norm_w: &'a [f32],
+    pub ffn_norm_w: &'a [f32],
+    pub q: MatvecLaunch<'a>,
+    pub k: MatvecLaunch<'a>,
+    pub v: MatvecLaunch<'a>,
+    pub o: MatvecLaunch<'a>,
+    pub gate: MatvecLaunch<'a>,
+    pub up: MatvecLaunch<'a>,
+    pub down: MatvecLaunch<'a>,
+    pub extras: AttnExtras<'a>,
+    /// Per-layer RoPE base override (Gemma-3 SWA layers use
+    /// `rope_theta_swa`); `None` = the stack-wide theta.
+    pub rope_theta: Option<f32>,
+    /// Sliding-window size for this layer (`None` = full causal).
+    pub window: Option<usize>,
+    /// Gemma post-attention / post-FFN sandwich norms, applied to the
+    /// block output *before* the residual add.
+    pub post_attn_norm: Option<&'a [f32]>,
+    pub post_ffn_norm: Option<&'a [f32]>,
+}
+
+/// Optional on-GPU embedding gather at the start of
+/// [`launch_decode_dense_stack`] (skips host `dequant_row` + upload).
+pub struct EmbdGatherMetal<'a> {
+    pub kind: EmbdKind,
+    pub weights: &'a [u8],
+    pub rows: usize,
+    pub row_bytes: usize,
+    pub n_cols: usize,
+    pub token_id: usize,
+}
+
+/// All dense layers in **one** command buffer (one wait). Hidden stays on
+/// GPU across layers — Crane-style residency for B=1 decode.
+/// When `embd` is `Some`, gathers that token row into scratch `h` on-GPU
+/// instead of copying a host-provided `hidden` slice.
+/// When `final_norm_w` + `output` are provided, also runs final RMSNorm +
+/// lm_head on-GPU. With `argmax_only`, runs argmax and returns a
+/// **1-element** `vec![token_id as f32]`; otherwise downloads vocab logits.
+///
+/// Chunked multi-CB early-commit (llama `n_main` style) was tried on Host B
+/// and regressed decode tok/s — see `…_multicb*` receipts; kept single CB.
+#[allow(clippy::too_many_arguments)]
+pub fn launch_decode_dense_stack(
+    hidden: &[f32],
+    layers: &[DenseLayerMetal<'_>],
+    kvs: &mut [MetalKvBuffers],
+    n_heads: usize,
+    rope_layout: MetalRopeLayout,
+    rope_theta: f32,
+    freq_factors: Option<&[f32]>,
+    pos: usize,
+    rms_eps: f32,
+    final_norm_w: Option<&[f32]>,
+    output: Option<&MatvecLaunch<'_>>,
+    argmax_only: bool,
+    embd: Option<&EmbdGatherMetal<'_>>,
+    gelu_ffn: bool,
+) -> Result<Vec<f32>, MetalError> {
+    assert_eq!(layers.len(), kvs.len());
+    assert!(!layers.is_empty());
+    let hidden_dim = match embd {
+        Some(e) => e.n_cols,
+        None => hidden.len(),
+    };
+    assert!(hidden_dim > 0);
+    let head_dim = kvs[0].head_dim;
+    let n_kv_heads = kvs[0].n_kv_heads;
+    for kv in kvs.iter() {
+        assert_eq!(kv.head_dim, head_dim);
+        assert_eq!(kv.n_kv_heads, n_kv_heads);
+        assert_eq!(pos, kv.seq_len);
+        if kv.seq_len >= kv.capacity {
+            return Err(MetalError::CommandFailed);
+        }
+    }
+    if let Some(ff) = freq_factors {
+        assert_eq!(ff.len(), head_dim / 2);
+    }
+
+    let max_q = layers.iter().map(|l| l.q.rows).max().unwrap();
+    let max_kv = layers.iter().map(|l| l.k.rows).max().unwrap();
+    let max_gate = layers.iter().map(|l| l.gate.rows).max().unwrap();
+    let attn_elems = n_heads * head_dim;
+    let logits_rows = output.map(|o| o.rows);
+
+    let shared = shared_metal()?;
+    let device = &shared.device;
+    let queue = &shared.queue;
+
+    let scratch_guard = borrow_decode_scratch(
+        device,
+        ScratchCaps {
+            hidden: hidden_dim,
+            max_q,
+            max_kv,
+            attn: attn_elems,
+            max_gate,
+            logits: logits_rows.unwrap_or(0),
+        },
+    )?;
+    let scratch = scratch_guard.as_ref().expect("scratch just ensured");
+    let h_buf = &scratch.h;
+    if let Some(e) = embd {
+        assert_eq!(e.n_cols, hidden_dim);
+        assert!(e.token_id < e.rows);
+        assert_eq!(e.weights.len(), e.rows * e.row_bytes);
+        // Gather runs in the same CB below (after encoder create).
+    } else {
+        assert_eq!(hidden.len(), hidden_dim);
+        copy_f32_into(h_buf, hidden);
+    }
+    let x_buf = &scratch.x;
+    let x2_buf = &scratch.x2;
+    let q_buf = &scratch.q;
+    let k_buf = &scratch.k;
+    let v_buf = &scratch.v;
+    let attn_buf = &scratch.attn;
+    let o_buf = &scratch.o;
+    let gate_buf = &scratch.gate;
+    let up_buf = &scratch.up;
+    let act_buf = &scratch.act;
+    let down_buf = &scratch.down;
+    let logits_buf = scratch.logits.as_ref();
+    let argmax_idx_buf = &scratch.argmax_idx;
+
+    let ff_resident = match freq_factors {
+        Some(ff) => Some(resident_f32_buffer(device, ff)?),
+        None => None,
+    };
+    let ff_buf = ff_resident.as_ref().map(|b| b.buffer.as_ref());
+
+    let cmd_buf = queue.commandBuffer().ok_or(MetalError::CommandFailed)?;
+    let encoder = cmd_buf
+        .computeCommandEncoder()
+        .ok_or(MetalError::CommandFailed)?;
+
+    let embd_resident = if let Some(e) = embd {
+        let w = resident_weight_buffer(device, e.weights)?;
+        encode_get_rows(
+            &encoder,
+            device,
+            e.kind,
+            &w,
+            h_buf,
+            e.row_bytes as u32,
+            e.n_cols as u32,
+            e.token_id as u32,
+        )?;
+        Some(w)
+    } else {
+        None
+    };
+    let _embd_resident = embd_resident;
+
+    for (layer_idx, (layer, kv)) in layers.iter().zip(kvs.iter_mut()).enumerate() {
+        assert_eq!(layer.attn_norm_w.len(), hidden_dim);
+        assert_eq!(layer.ffn_norm_w.len(), hidden_dim);
+        assert_eq!(layer.o.rows, hidden_dim);
+        assert_eq!(layer.down.rows, hidden_dim);
+        assert_eq!(layer.gate.rows, layer.up.rows);
+
+        let attn_nw = resident_f32_buffer(device, layer.attn_norm_w)?;
+        let ffn_nw = resident_f32_buffer(device, layer.ffn_norm_w)?;
+        let q_w = resident_weight_buffer(device, layer.q.weights)?;
+        let k_w = resident_weight_buffer(device, layer.k.weights)?;
+        let v_w = resident_weight_buffer(device, layer.v.weights)?;
+        let o_w = resident_weight_buffer(device, layer.o.weights)?;
+        let gate_w = resident_weight_buffer(device, layer.gate.weights)?;
+        let up_w = resident_weight_buffer(device, layer.up.weights)?;
+        let down_w = resident_weight_buffer(device, layer.down.weights)?;
+
+        // Pre-LN: layer 0 norms raw hidden; later layers fuse the previous
+        // FFN residual (`down_buf` still holds prior down) into attn_norm.
+        if layer_idx == 0 {
+            encode_rms_norm(
+                &encoder,
+                device,
+                h_buf,
+                &attn_nw.buffer,
+                x_buf,
+                hidden_dim as u32,
+                rms_eps,
+            )?;
+        } else {
+            encode_add_rms_norm(
+                &encoder,
+                device,
+                h_buf,
+                down_buf,
+                &attn_nw.buffer,
+                x_buf,
+                hidden_dim as u32,
+                rms_eps,
+            )?;
+        }
+        encode_matvec(&encoder, device, &layer.q, &q_w, x_buf, q_buf)?;
+        encode_matvec(&encoder, device, &layer.k, &k_w, x_buf, k_buf)?;
+        encode_matvec(&encoder, device, &layer.v, &v_w, x_buf, v_buf)?;
+        encode_attn_extras(
+            &encoder,
+            device,
+            &layer.extras,
+            q_buf,
+            k_buf,
+            v_buf,
+            layer.q.rows,
+            layer.k.rows,
+            layer.v.rows,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            rms_eps,
+        )?;
+        let layer_theta = layer.rope_theta.unwrap_or(rope_theta);
+        encode_rope(
+            &encoder,
+            device,
+            rope_layout,
+            q_buf,
+            n_heads as u32,
+            head_dim as u32,
+            layer_theta,
+            pos as u32,
+            ff_buf,
+        )?;
+        encode_rope(
+            &encoder,
+            device,
+            rope_layout,
+            k_buf,
+            n_kv_heads as u32,
+            head_dim as u32,
+            layer_theta,
+            pos as u32,
+            ff_buf,
+        )?;
+        let token_elems = (n_kv_heads * head_dim) as u32;
+        let offset = (pos * n_kv_heads * head_dim) as u32;
+        encode_kv_append(&encoder, device, k_buf, &kv.k, offset, token_elems)?;
+        encode_kv_append(&encoder, device, v_buf, &kv.v, offset, token_elems)?;
+        let new_seq = (pos + 1) as u32;
+        // Sliding window: only the last `window` positions (incl. current)
+        // are visible, matching `causal_gqa_attention_windowed`.
+        let kv_start = match layer.window {
+            Some(w) => (pos + 1).saturating_sub(w) as u32,
+            None => 0,
+        };
+        encode_gqa(
+            &encoder,
+            device,
+            q_buf,
+            &kv.k,
+            &kv.v,
+            attn_buf,
+            n_heads as u32,
+            n_kv_heads as u32,
+            head_dim as u32,
+            new_seq,
+            kv_start,
+        )?;
+        encode_matvec(&encoder, device, &layer.o, &o_w, attn_buf, o_buf)?;
+        // Gemma sandwich norm: normalize the attn block output *before*
+        // the residual add (in-place: each thread reads x[i] only after
+        // the barriered reduction, so out == x is safe).
+        if let Some(post) = layer.post_attn_norm {
+            assert_eq!(post.len(), hidden_dim);
+            let pw = resident_f32_buffer(device, post)?;
+            encode_rms_norm(
+                &encoder,
+                device,
+                o_buf,
+                &pw.buffer,
+                o_buf,
+                hidden_dim as u32,
+                rms_eps,
+            )?;
+        }
+        // Fuse attn residual + ffn_norm into one dispatch.
+        encode_add_rms_norm(
+            &encoder,
+            device,
+            h_buf,
+            o_buf,
+            &ffn_nw.buffer,
+            x2_buf,
+            hidden_dim as u32,
+            rms_eps,
+        )?;
+        encode_matvec(&encoder, device, &layer.gate, &gate_w, x2_buf, gate_buf)?;
+        encode_matvec(&encoder, device, &layer.up, &up_w, x2_buf, up_buf)?;
+        if gelu_ffn {
+            encode_gelu_mul(
+                &encoder,
+                device,
+                gate_buf,
+                up_buf,
+                act_buf,
+                layer.gate.rows as u32,
+            )?;
+        } else {
+            encode_silu_mul(
+                &encoder,
+                device,
+                gate_buf,
+                up_buf,
+                act_buf,
+                layer.gate.rows as u32,
+            )?;
+        }
+        encode_matvec(&encoder, device, &layer.down, &down_w, act_buf, down_buf)?;
+        if let Some(post) = layer.post_ffn_norm {
+            assert_eq!(post.len(), hidden_dim);
+            let pw = resident_f32_buffer(device, post)?;
+            encode_rms_norm(
+                &encoder,
+                device,
+                down_buf,
+                &pw.buffer,
+                down_buf,
+                hidden_dim as u32,
+                rms_eps,
+            )?;
+        }
+        // Defer `h += down` until the next layer's attn_norm (or final_norm)
+        // so it fuses with that RMSNorm. Last layer handled below.
+    }
+
+    // Apply the last layer's deferred FFN residual, fused with final_norm
+    // when present; otherwise a plain vec_add.
+    let last_down = down_buf;
+    let (download_n, norm_resident) = if let Some(fnw) = final_norm_w {
+        assert_eq!(fnw.len(), hidden_dim);
+        let fn_buf = resident_f32_buffer(device, fnw)?;
+        encode_add_rms_norm(
+            &encoder,
+            device,
+            h_buf,
+            last_down,
+            &fn_buf.buffer,
+            x_buf,
+            hidden_dim as u32,
+            rms_eps,
+        )?;
+        if let (Some(out_l), Some(logits)) = (output, logits_buf) {
+            assert_eq!(out_l.rows, logits_rows.unwrap());
+            let out_w = resident_weight_buffer(device, out_l.weights)?;
+            encode_matvec(&encoder, device, out_l, &out_w, x_buf, logits)?;
+            if argmax_only {
+                encode_argmax(&encoder, device, logits, argmax_idx_buf, out_l.rows as u32)?;
+                (1, false)
+            } else {
+                (out_l.rows, false)
+            }
+        } else {
+            // final_norm ran but no lm_head — download normalized hidden
+            // and mark x_buf resident for the next apply_gpu.
+            (hidden_dim, true)
+        }
+    } else {
+        // No final_norm: still apply the deferred last-layer FFN residual.
+        encode_vec_add(&encoder, device, h_buf, last_down, hidden_dim as u32)?;
+        (hidden_dim, false)
+    };
+
+    encoder.endEncoding();
+    cmd_buf.commit();
+    cmd_buf.waitUntilCompleted();
+
+    for kv in kvs.iter_mut() {
+        kv.seq_len = pos + 1;
+    }
+
+    // If final_norm ran but no lm_head, mark normalized hidden (x_buf)
+    // as resident so the next apply_gpu can skip re-upload.
+    if norm_resident {
+        crate::gpu::set_resident_activation(x_buf, hidden_dim);
+    }
+
+    if argmax_only && download_n == 1 && output.is_some() {
+        let ptr = argmax_idx_buf.contents();
+        let idx = unsafe { *(ptr.as_ptr() as *const u32) as usize };
+        return Ok(vec![idx as f32]);
+    }
+
+    let src: &ProtocolObject<dyn MTLBuffer> = if norm_resident {
+        x_buf
+    } else if download_n == hidden_dim {
+        h_buf
+    } else {
+        logits_buf.expect("logits buffer when downloading logits")
+    };
+    let out_ptr = src.contents();
+    Ok(unsafe { std::slice::from_raw_parts(out_ptr.as_ptr() as *const f32, download_n).to_vec() })
+}
+
+/// Host-upload RoPE only (parity testing). Applies `layout` RoPE in-place
+/// across `n_heads` packed heads in `vecs` (`n_heads * head_dim`).
+pub fn launch_rope_heads_host(
+    vecs: &mut [f32],
+    n_heads: usize,
+    head_dim: usize,
+    layout: MetalRopeLayout,
+    theta: f32,
+    pos: usize,
+    freq_factors: Option<&[f32]>,
+) -> Result<(), MetalError> {
+    assert_eq!(vecs.len(), n_heads * head_dim);
+    if let Some(ff) = freq_factors {
+        assert_eq!(ff.len(), head_dim / 2);
+    }
+    let shared = shared_metal()?;
+    let device = &shared.device;
+    let buf = upload_f32(device, vecs)?;
+    let ff_buf = match freq_factors {
+        Some(ff) => Some(upload_f32(device, ff)?),
+        None => None,
+    };
+    let cmd_buf = shared
+        .queue
+        .commandBuffer()
+        .ok_or(MetalError::CommandFailed)?;
+    let encoder = cmd_buf
+        .computeCommandEncoder()
+        .ok_or(MetalError::CommandFailed)?;
+    encode_rope(
+        &encoder,
+        device,
+        layout,
+        &buf,
+        n_heads as u32,
+        head_dim as u32,
+        theta,
+        pos as u32,
+        ff_buf.as_deref(),
+    )?;
+    encoder.endEncoding();
+    cmd_buf.commit();
+    cmd_buf.waitUntilCompleted();
+    let ptr = buf.contents();
+    let out = unsafe { std::slice::from_raw_parts(ptr.as_ptr() as *const f32, vecs.len()) };
+    vecs.copy_from_slice(out);
+    Ok(())
+}
+
+/// Host-upload GQA only (parity testing / fallback probe).
+pub fn launch_gqa_decode_host(
+    q: &[f32],
+    k_cache: &[f32],
+    v_cache: &[f32],
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    seq_len: usize,
+) -> Result<Vec<f32>, MetalError> {
+    assert_eq!(q.len(), n_heads * head_dim);
+    assert_eq!(k_cache.len(), seq_len * n_kv_heads * head_dim);
+    assert_eq!(v_cache.len(), seq_len * n_kv_heads * head_dim);
+
+    let shared = shared_metal()?;
+    let device = &shared.device;
+    let q_buf = upload_f32(device, q)?;
+    let k_buf = upload_f16_from_f32(device, k_cache)?;
+    let v_buf = upload_f16_from_f32(device, v_cache)?;
+    let out_buf = alloc_f32_buffer(device, n_heads * head_dim)?;
+
+    let cmd_buf = shared
+        .queue
+        .commandBuffer()
+        .ok_or(MetalError::CommandFailed)?;
+    let encoder = cmd_buf
+        .computeCommandEncoder()
+        .ok_or(MetalError::CommandFailed)?;
+    encode_gqa(
+        &encoder,
+        device,
+        &q_buf,
+        &k_buf,
+        &v_buf,
+        &out_buf,
+        n_heads as u32,
+        n_kv_heads as u32,
+        head_dim as u32,
+        seq_len as u32,
+        0,
+    )?;
+    encoder.endEncoding();
+    cmd_buf.commit();
+    cmd_buf.waitUntilCompleted();
+
+    let ptr = out_buf.contents();
+    Ok(unsafe {
+        std::slice::from_raw_parts(ptr.as_ptr() as *const f32, n_heads * head_dim).to_vec()
+    })
+}
+
+/// Multi-token RoPE → batch KV append → causal GQA prefill.
+///
+/// `q`/`k`/`v` are **pre-RoPE**, packed `[n_q, n_heads|n_kv_heads, head_dim]`.
+/// `start_pos` must equal `kv.seq_len` (prefix already resident on Metal, or
+/// empty). Returns attention output `[n_q, n_heads, head_dim]` and RoPE'd
+/// K/V for host [`KvCache`] sync. Updates `kv.seq_len` by `n_q`.
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+pub fn launch_prefill_attn_block(
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    kv: &mut MetalKvBuffers,
+    n_heads: usize,
+    n_q: usize,
+    rope_layout: MetalRopeLayout,
+    rope_theta: f32,
+    freq_factors: Option<&[f32]>,
+    start_pos: usize,
+) -> Result<(Vec<f32>, Vec<f32>, Vec<f32>), MetalError> {
+    let head_dim = kv.head_dim;
+    let n_kv_heads = kv.n_kv_heads;
+    let q_width = n_heads * head_dim;
+    let kv_width = n_kv_heads * head_dim;
+    assert_eq!(q.len(), n_q * q_width);
+    assert_eq!(k.len(), n_q * kv_width);
+    assert_eq!(v.len(), n_q * kv_width);
+    assert_eq!(
+        start_pos, kv.seq_len,
+        "prefill start_pos must equal current Metal KV length"
+    );
+    if kv.seq_len + n_q > kv.capacity {
+        return Err(MetalError::CommandFailed);
+    }
+    if let Some(ff) = freq_factors {
+        assert_eq!(ff.len(), head_dim / 2);
+    }
+    if n_q == 0 {
+        return Ok((Vec::new(), Vec::new(), Vec::new()));
+    }
+
+    let shared = shared_metal()?;
+    let device = &shared.device;
+    let queue = &shared.queue;
+
+    let q_buf = upload_f32(device, q)?;
+    let k_buf = upload_f32(device, k)?;
+    let v_buf = upload_f32(device, v)?;
+    let attn_buf = alloc_f32_buffer(device, n_q * q_width)?;
+    let ff_buf = match freq_factors {
+        Some(ff) => Some(upload_f32(device, ff)?),
+        None => None,
+    };
+
+    let cmd_buf = queue.commandBuffer().ok_or(MetalError::CommandFailed)?;
+    let encoder = cmd_buf
+        .computeCommandEncoder()
+        .ok_or(MetalError::CommandFailed)?;
+
+    encode_rope_batch(
+        &encoder,
+        device,
+        rope_layout,
+        &q_buf,
+        n_heads as u32,
+        head_dim as u32,
+        rope_theta,
+        start_pos as u32,
+        n_q as u32,
+        ff_buf.as_deref(),
+    )?;
+    encode_rope_batch(
+        &encoder,
+        device,
+        rope_layout,
+        &k_buf,
+        n_kv_heads as u32,
+        head_dim as u32,
+        rope_theta,
+        start_pos as u32,
+        n_q as u32,
+        ff_buf.as_deref(),
+    )?;
+
+    let token_elems = (n_q * kv_width) as u32;
+    let offset = (kv.seq_len * kv_width) as u32;
+    encode_kv_append(&encoder, device, &k_buf, &kv.k, offset, token_elems)?;
+    encode_kv_append(&encoder, device, &v_buf, &kv.v, offset, token_elems)?;
+
+    let prefill_result = encode_gqa_prefill(
+        &encoder,
+        device,
+        &q_buf,
+        &kv.k,
+        &kv.v,
+        &attn_buf,
+        n_heads as u32,
+        n_kv_heads as u32,
+        head_dim as u32,
+        n_q as u32,
+        start_pos as u32,
+    );
+    encoder.endEncoding();
+    prefill_result?;
+    cmd_buf.commit();
+    cmd_buf.waitUntilCompleted();
+
+    kv.seq_len += n_q;
+
+    let attn_ptr = attn_buf.contents();
+    let attn = unsafe {
+        std::slice::from_raw_parts(attn_ptr.as_ptr() as *const f32, n_q * q_width).to_vec()
+    };
+    let k_ptr = k_buf.contents();
+    let v_ptr = v_buf.contents();
+    let k_roped = unsafe {
+        std::slice::from_raw_parts(k_ptr.as_ptr() as *const f32, n_q * kv_width).to_vec()
+    };
+    let v_roped = unsafe {
+        std::slice::from_raw_parts(v_ptr.as_ptr() as *const f32, n_q * kv_width).to_vec()
+    };
+    Ok((attn, k_roped, v_roped))
+}
+
+/// Host-upload multi-pos RoPE (parity testing). Layout `[n_tokens, n_heads, head_dim]`.
+#[allow(clippy::too_many_arguments)]
+pub fn launch_rope_heads_batch_host(
+    vecs: &mut [f32],
+    n_heads: usize,
+    head_dim: usize,
+    n_tokens: usize,
+    layout: MetalRopeLayout,
+    theta: f32,
+    base_pos: usize,
+    freq_factors: Option<&[f32]>,
+) -> Result<(), MetalError> {
+    assert_eq!(vecs.len(), n_tokens * n_heads * head_dim);
+    if let Some(ff) = freq_factors {
+        assert_eq!(ff.len(), head_dim / 2);
+    }
+    if n_tokens == 0 {
+        return Ok(());
+    }
+    let shared = shared_metal()?;
+    let device = &shared.device;
+    let buf = upload_f32(device, vecs)?;
+    let ff_buf = match freq_factors {
+        Some(ff) => Some(upload_f32(device, ff)?),
+        None => None,
+    };
+    let cmd_buf = shared
+        .queue
+        .commandBuffer()
+        .ok_or(MetalError::CommandFailed)?;
+    let encoder = cmd_buf
+        .computeCommandEncoder()
+        .ok_or(MetalError::CommandFailed)?;
+    encode_rope_batch(
+        &encoder,
+        device,
+        layout,
+        &buf,
+        n_heads as u32,
+        head_dim as u32,
+        theta,
+        base_pos as u32,
+        n_tokens as u32,
+        ff_buf.as_deref(),
+    )?;
+    encoder.endEncoding();
+    cmd_buf.commit();
+    cmd_buf.waitUntilCompleted();
+    let ptr = buf.contents();
+    let out = unsafe { std::slice::from_raw_parts(ptr.as_ptr() as *const f32, vecs.len()) };
+    vecs.copy_from_slice(out);
+    Ok(())
+}
+
+/// Host-upload multi-query causal GQA (parity testing).
+/// `q` is `[n_q, n_heads, head_dim]`; K/V are full caches of length
+/// `kv_prefix_len + n_q` (already including the new tokens).
+#[allow(clippy::too_many_arguments)]
+pub fn launch_gqa_prefill_host(
+    q: &[f32],
+    k_cache: &[f32],
+    v_cache: &[f32],
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    n_q: usize,
+    kv_prefix_len: usize,
+) -> Result<Vec<f32>, MetalError> {
+    let total_seq = kv_prefix_len + n_q;
+    assert_eq!(q.len(), n_q * n_heads * head_dim);
+    assert_eq!(k_cache.len(), total_seq * n_kv_heads * head_dim);
+    assert_eq!(v_cache.len(), total_seq * n_kv_heads * head_dim);
+    if n_q == 0 {
+        return Ok(Vec::new());
+    }
+
+    let shared = shared_metal()?;
+    let device = &shared.device;
+    let q_buf = upload_f32(device, q)?;
+    let k_buf = upload_f16_from_f32(device, k_cache)?;
+    let v_buf = upload_f16_from_f32(device, v_cache)?;
+    let out_buf = alloc_f32_buffer(device, n_q * n_heads * head_dim)?;
+
+    let cmd_buf = shared
+        .queue
+        .commandBuffer()
+        .ok_or(MetalError::CommandFailed)?;
+    let encoder = cmd_buf
+        .computeCommandEncoder()
+        .ok_or(MetalError::CommandFailed)?;
+    let enc_result = encode_gqa_prefill(
+        &encoder,
+        device,
+        &q_buf,
+        &k_buf,
+        &v_buf,
+        &out_buf,
+        n_heads as u32,
+        n_kv_heads as u32,
+        head_dim as u32,
+        n_q as u32,
+        kv_prefix_len as u32,
+    );
+    encoder.endEncoding();
+    enc_result?;
+    cmd_buf.commit();
+    cmd_buf.waitUntilCompleted();
+
+    let ptr = out_buf.contents();
+    Ok(unsafe {
+        std::slice::from_raw_parts(ptr.as_ptr() as *const f32, n_q * n_heads * head_dim).to_vec()
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cpu_gqa(
+        q: &[f32],
+        k_cache: &[f32],
+        v_cache: &[f32],
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        seq_len: usize,
+    ) -> Vec<f32> {
+        let group_size = n_heads / n_kv_heads.max(1);
+        let scale = 1.0 / (head_dim as f32).sqrt();
+        let mut out = vec![0f32; n_heads * head_dim];
+        for h in 0..n_heads {
+            let kv_h = h / group_size.max(1);
+            let q_h = &q[h * head_dim..(h + 1) * head_dim];
+            let mut scores = vec![0f32; seq_len];
+            for t in 0..seq_len {
+                let k_t = &k_cache
+                    [(t * n_kv_heads + kv_h) * head_dim..(t * n_kv_heads + kv_h + 1) * head_dim];
+                let mut dot = 0f32;
+                for d in 0..head_dim {
+                    dot += q_h[d] * k_t[d];
+                }
+                scores[t] = dot * scale;
+            }
+            let max = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let mut sum = 0f32;
+            for s in scores.iter_mut() {
+                *s = (*s - max).exp();
+                sum += *s;
+            }
+            for s in scores.iter_mut() {
+                *s /= sum;
+            }
+            let out_h = &mut out[h * head_dim..(h + 1) * head_dim];
+            for t in 0..seq_len {
+                let v_t = &v_cache
+                    [(t * n_kv_heads + kv_h) * head_dim..(t * n_kv_heads + kv_h + 1) * head_dim];
+                let w = scores[t];
+                for d in 0..head_dim {
+                    out_h[d] += w * v_t[d];
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    #[ignore = "needs a real Metal GPU"]
+    fn gqa_decode_matches_cpu() {
+        let n_heads = 4;
+        let n_kv_heads = 2;
+        let head_dim = 8;
+        let seq_len = 5;
+        let q: Vec<f32> = (0..n_heads * head_dim)
+            .map(|i| (i as f32 * 0.07).sin())
+            .collect();
+        let k: Vec<f32> = (0..seq_len * n_kv_heads * head_dim)
+            .map(|i| (i as f32 * 0.03).cos())
+            .collect();
+        let v: Vec<f32> = (0..seq_len * n_kv_heads * head_dim)
+            .map(|i| (i as f32 * 0.05).sin())
+            .collect();
+        let cpu = cpu_gqa(&q, &k, &v, n_heads, n_kv_heads, head_dim, seq_len);
+        let gpu = launch_gqa_decode_host(&q, &k, &v, n_heads, n_kv_heads, head_dim, seq_len)
+            .expect("metal gqa");
+        assert_eq!(cpu.len(), gpu.len());
+        for (i, (a, b)) in cpu.iter().zip(gpu.iter()).enumerate() {
+            // Device KV is f16; allow round-trip vs f32 CPU reference.
+            let tol = 2e-3 * a.abs().max(1.0);
+            assert!((a - b).abs() <= tol, "elem {i}: cpu={a} gpu={b} tol={tol}");
+        }
+    }
+
+    #[test]
+    #[ignore = "needs a real Metal GPU"]
+    fn gqa_fa_vec_matches_cpu() {
+        // FA-vec has dedicated kernels for head_dim=128 (Llama-3.x) and
+        // head_dim=64 (TinyLlama / Llama-3.2-1B).
+        let test_cases = vec![
+            (4, 2, 128, 17),
+            (8, 2, 128, 33),
+            (8, 4, 128, 65),
+            (8, 4, 128, 128),
+            (4, 2, 64, 17),
+            (8, 2, 64, 33),
+            (8, 4, 64, 65),
+            (32, 4, 64, 128),
+            (8, 4, 64, 1),
+        ];
+        for (n_heads, n_kv_heads, head_dim, seq_len) in test_cases {
+            let q: Vec<f32> = (0..n_heads * head_dim)
+                .map(|i| (i as f32 * 0.07).sin())
+                .collect();
+            let k: Vec<f32> = (0..seq_len * n_kv_heads * head_dim)
+                .map(|i| (i as f32 * 0.03).cos())
+                .collect();
+            let v: Vec<f32> = (0..seq_len * n_kv_heads * head_dim)
+                .map(|i| (i as f32 * 0.05).sin())
+                .collect();
+            let cpu = cpu_gqa(&q, &k, &v, n_heads, n_kv_heads, head_dim, seq_len);
+
+            // FA is default-on for d=128; force-on for clarity.
+            std::env::set_var("FERROX_METAL_FA_VEC", "1");
+            let gpu = launch_gqa_decode_host(&q, &k, &v, n_heads, n_kv_heads, head_dim, seq_len)
+                .expect("metal gqa fa-vec");
+
+            assert_eq!(
+                cpu.len(),
+                gpu.len(),
+                "nh={n_heads} nkv={n_kv_heads} hd={head_dim} seq={seq_len}"
+            );
+            for (i, (a, b)) in cpu.iter().zip(gpu.iter()).enumerate() {
+                let tol = 2e-3 * a.abs().max(1.0);
+                assert!(
+                    (a - b).abs() <= tol,
+                    "nh={n_heads} nkv={n_kv_heads} hd={head_dim} seq={seq_len} elem {i}: cpu={a} gpu={b} tol={tol}"
+                );
+            }
+        }
+    }
+
+    fn cpu_rope_norm(vec: &mut [f32], pos: usize, theta: f32, freq_factors: Option<&[f32]>) {
+        let dim = vec.len();
+        let half = dim / 2;
+        for i in 0..half {
+            let freq = 1.0 / theta.powf((2 * i) as f32 / dim as f32);
+            let angle = match freq_factors {
+                Some(ff) => pos as f32 * freq / ff[i],
+                None => pos as f32 * freq,
+            };
+            let (sin, cos) = angle.sin_cos();
+            let a = vec[2 * i];
+            let b = vec[2 * i + 1];
+            vec[2 * i] = a * cos - b * sin;
+            vec[2 * i + 1] = a * sin + b * cos;
+        }
+    }
+
+    fn cpu_rope_neox(vec: &mut [f32], pos: usize, theta: f32, freq_factors: Option<&[f32]>) {
+        let dim = vec.len();
+        let half = dim / 2;
+        for i in 0..half {
+            let freq = 1.0 / theta.powf((2 * i) as f32 / dim as f32);
+            let angle = match freq_factors {
+                Some(ff) => pos as f32 * freq / ff[i],
+                None => pos as f32 * freq,
+            };
+            let (sin, cos) = angle.sin_cos();
+            let a = vec[i];
+            let b = vec[i + half];
+            vec[i] = a * cos - b * sin;
+            vec[i + half] = a * sin + b * cos;
+        }
+    }
+
+    fn assert_rope_parity(layout: MetalRopeLayout, with_ff: bool) {
+        let n_heads = 3;
+        let head_dim = 8;
+        let pos = 5usize;
+        let theta = 10000.0f32;
+        let ff: Option<Vec<f32>> = if with_ff {
+            Some((0..head_dim / 2).map(|i| 0.8 + i as f32 * 0.15).collect())
+        } else {
+            None
+        };
+        let mut cpu: Vec<f32> = (0..n_heads * head_dim)
+            .map(|i| (i as f32 * 0.11).sin())
+            .collect();
+        let mut gpu = cpu.clone();
+        for h in 0..n_heads {
+            let slice = &mut cpu[h * head_dim..(h + 1) * head_dim];
+            match layout {
+                MetalRopeLayout::Norm => cpu_rope_norm(slice, pos, theta, ff.as_deref()),
+                MetalRopeLayout::Neox => cpu_rope_neox(slice, pos, theta, ff.as_deref()),
+            }
+        }
+        launch_rope_heads_host(
+            &mut gpu,
+            n_heads,
+            head_dim,
+            layout,
+            theta,
+            pos,
+            ff.as_deref(),
+        )
+        .expect("metal rope");
+        for (i, (a, b)) in cpu.iter().zip(gpu.iter()).enumerate() {
+            let tol = 1e-4 * a.abs().max(1.0);
+            assert!(
+                (a - b).abs() <= tol,
+                "{layout:?} ff={with_ff} elem {i}: cpu={a} gpu={b} tol={tol}"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "needs a real Metal GPU"]
+    fn rope_norm_matches_cpu() {
+        assert_rope_parity(MetalRopeLayout::Norm, false);
+        assert_rope_parity(MetalRopeLayout::Norm, true);
+    }
+
+    #[test]
+    #[ignore = "needs a real Metal GPU"]
+    fn rope_neox_matches_cpu() {
+        assert_rope_parity(MetalRopeLayout::Neox, false);
+        assert_rope_parity(MetalRopeLayout::Neox, true);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn cpu_gqa_prefill(
+        q: &[f32],
+        k_cache: &[f32],
+        v_cache: &[f32],
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        n_q: usize,
+        kv_prefix_len: usize,
+    ) -> Vec<f32> {
+        let q_width = n_heads * head_dim;
+        let mut out = vec![0f32; n_q * q_width];
+        for qi in 0..n_q {
+            let causal_len = kv_prefix_len + qi + 1;
+            let kv_elems = causal_len * n_kv_heads * head_dim;
+            let row = cpu_gqa(
+                &q[qi * q_width..(qi + 1) * q_width],
+                &k_cache[..kv_elems],
+                &v_cache[..kv_elems],
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                causal_len,
+            );
+            out[qi * q_width..(qi + 1) * q_width].copy_from_slice(&row);
+        }
+        out
+    }
+
+    #[test]
+    fn gqa_threadgroup_sizes_are_well_formed() {
+        for seq in [1u32, 7, 32, 100, 512, 2048] {
+            for hd in [8u32, 64, 128] {
+                let pre = gqa_prefill_threadgroup_size(seq, hd);
+                assert!(pre.is_power_of_two(), "prefill tg={pre} seq={seq} hd={hd}");
+                assert!(pre >= 1);
+                let dec = gqa_decode_threadgroup_size(seq, hd);
+                assert_eq!(dec % 32, 0, "decode tg={dec} seq={seq} hd={hd}");
+                assert!((dec / 32).is_power_of_two(), "decode nsg not pot: {dec}");
+                assert!(dec >= 32);
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "needs a real Metal GPU"]
+    fn gqa_prefill_matches_cpu() {
+        let n_heads = 4;
+        let n_kv_heads = 2;
+        let head_dim = 8;
+        let n_q = 4;
+        let kv_prefix_len = 2;
+        let total = kv_prefix_len + n_q;
+        let q: Vec<f32> = (0..n_q * n_heads * head_dim)
+            .map(|i| (i as f32 * 0.07).sin())
+            .collect();
+        let k: Vec<f32> = (0..total * n_kv_heads * head_dim)
+            .map(|i| (i as f32 * 0.03).cos())
+            .collect();
+        let v: Vec<f32> = (0..total * n_kv_heads * head_dim)
+            .map(|i| (i as f32 * 0.05).sin())
+            .collect();
+        let cpu = cpu_gqa_prefill(
+            &q,
+            &k,
+            &v,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            n_q,
+            kv_prefix_len,
+        );
+        let gpu = launch_gqa_prefill_host(
+            &q,
+            &k,
+            &v,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            n_q,
+            kv_prefix_len,
+        )
+        .expect("metal gqa prefill");
+        assert_eq!(cpu.len(), gpu.len());
+        for (i, (a, b)) in cpu.iter().zip(gpu.iter()).enumerate() {
+            let tol = 2e-3 * a.abs().max(1.0);
+            assert!((a - b).abs() <= tol, "elem {i}: cpu={a} gpu={b} tol={tol}");
+        }
+    }
+
+    #[test]
+    #[ignore = "needs a real Metal GPU"]
+    fn gqa_prefill_empty_prefix_matches_per_token_decode() {
+        // n_q positions with no prior KV must match running decode GQA
+        // at each causal length (same math as forward_batch).
+        let n_heads = 4;
+        let n_kv_heads = 2;
+        let head_dim = 8;
+        let n_q = 3;
+        let q: Vec<f32> = (0..n_q * n_heads * head_dim)
+            .map(|i| (i as f32 * 0.09).sin())
+            .collect();
+        let k: Vec<f32> = (0..n_q * n_kv_heads * head_dim)
+            .map(|i| (i as f32 * 0.04).cos())
+            .collect();
+        let v: Vec<f32> = (0..n_q * n_kv_heads * head_dim)
+            .map(|i| (i as f32 * 0.06).sin())
+            .collect();
+        let gpu = launch_gqa_prefill_host(&q, &k, &v, n_heads, n_kv_heads, head_dim, n_q, 0)
+            .expect("metal gqa prefill");
+        let q_width = n_heads * head_dim;
+        for qi in 0..n_q {
+            let causal = qi + 1;
+            let kv_elems = causal * n_kv_heads * head_dim;
+            let decode = launch_gqa_decode_host(
+                &q[qi * q_width..(qi + 1) * q_width],
+                &k[..kv_elems],
+                &v[..kv_elems],
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                causal,
+            )
+            .expect("metal gqa decode");
+            for (i, (a, b)) in gpu[qi * q_width..(qi + 1) * q_width]
+                .iter()
+                .zip(decode.iter())
+                .enumerate()
+            {
+                let tol = 1e-4 * a.abs().max(1.0);
+                assert!(
+                    (a - b).abs() <= tol,
+                    "qi={qi} elem {i}: prefill={a} decode={b}"
+                );
+            }
+        }
+    }
+
+    fn assert_rope_batch_parity(layout: MetalRopeLayout, with_ff: bool) {
+        let n_heads = 3;
+        let head_dim = 8;
+        let n_tokens = 4;
+        let base_pos = 2usize;
+        let theta = 10000.0f32;
+        let ff: Option<Vec<f32>> = if with_ff {
+            Some((0..head_dim / 2).map(|i| 0.8 + i as f32 * 0.15).collect())
+        } else {
+            None
+        };
+        let mut cpu: Vec<f32> = (0..n_tokens * n_heads * head_dim)
+            .map(|i| (i as f32 * 0.11).sin())
+            .collect();
+        let mut gpu = cpu.clone();
+        for t in 0..n_tokens {
+            let pos = base_pos + t;
+            for h in 0..n_heads {
+                let off = (t * n_heads + h) * head_dim;
+                let slice = &mut cpu[off..off + head_dim];
+                match layout {
+                    MetalRopeLayout::Norm => cpu_rope_norm(slice, pos, theta, ff.as_deref()),
+                    MetalRopeLayout::Neox => cpu_rope_neox(slice, pos, theta, ff.as_deref()),
+                }
+            }
+        }
+        launch_rope_heads_batch_host(
+            &mut gpu,
+            n_heads,
+            head_dim,
+            n_tokens,
+            layout,
+            theta,
+            base_pos,
+            ff.as_deref(),
+        )
+        .expect("metal rope batch");
+        for (i, (a, b)) in cpu.iter().zip(gpu.iter()).enumerate() {
+            let tol = 1e-4 * a.abs().max(1.0);
+            assert!(
+                (a - b).abs() <= tol,
+                "{layout:?} batch ff={with_ff} elem {i}: cpu={a} gpu={b} tol={tol}"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "needs a real Metal GPU"]
+    fn rope_batch_norm_matches_cpu() {
+        assert_rope_batch_parity(MetalRopeLayout::Norm, false);
+        assert_rope_batch_parity(MetalRopeLayout::Norm, true);
+    }
+
+    #[test]
+    #[ignore = "needs a real Metal GPU"]
+    fn rope_batch_neox_matches_cpu() {
+        assert_rope_batch_parity(MetalRopeLayout::Neox, false);
+        assert_rope_batch_parity(MetalRopeLayout::Neox, true);
+    }
+
+    #[test]
+    #[ignore = "needs a real Metal GPU"]
+    fn prefill_attn_block_matches_cpu_and_updates_kv() {
+        let n_heads = 4;
+        let n_kv_heads = 2;
+        let head_dim = 8;
+        let n_q = 3;
+        let start_pos = 0usize;
+        let q: Vec<f32> = (0..n_q * n_heads * head_dim)
+            .map(|i| (i as f32 * 0.08).sin())
+            .collect();
+        let k: Vec<f32> = (0..n_q * n_kv_heads * head_dim)
+            .map(|i| (i as f32 * 0.05).cos())
+            .collect();
+        let v: Vec<f32> = (0..n_q * n_kv_heads * head_dim)
+            .map(|i| (i as f32 * 0.04).sin())
+            .collect();
+        let mut kv =
+            MetalKvBuffers::with_capacity(n_kv_heads, head_dim, 16).expect("alloc metal kv");
+        let (attn, k_roped, v_roped) = launch_prefill_attn_block(
+            &q,
+            &k,
+            &v,
+            &mut kv,
+            n_heads,
+            n_q,
+            MetalRopeLayout::Norm,
+            10000.0,
+            None,
+            start_pos,
+        )
+        .expect("prefill attn");
+        assert_eq!(kv.seq_len, n_q);
+        assert_eq!(attn.len(), n_q * n_heads * head_dim);
+        assert_eq!(k_roped.len(), n_q * n_kv_heads * head_dim);
+
+        // CPU reference: per-token RoPE + causal GQA over growing cache.
+        let mut k_cpu = k.clone();
+        let v_cpu = v.clone();
+        let mut q_cpu = q.clone();
+        for t in 0..n_q {
+            let pos = start_pos + t;
+            for h in 0..n_heads {
+                let off = (t * n_heads + h) * head_dim;
+                cpu_rope_norm(&mut q_cpu[off..off + head_dim], pos, 10000.0, None);
+            }
+            for h in 0..n_kv_heads {
+                let off = (t * n_kv_heads + h) * head_dim;
+                cpu_rope_norm(&mut k_cpu[off..off + head_dim], pos, 10000.0, None);
+            }
+        }
+        for (a, b) in k_cpu.iter().zip(k_roped.iter()) {
+            let tol = 1e-4 * a.abs().max(1.0);
+            assert!((a - b).abs() <= tol);
+        }
+        for (a, b) in v_cpu.iter().zip(v_roped.iter()) {
+            let tol = 1e-4 * a.abs().max(1.0);
+            assert!((a - b).abs() <= tol);
+        }
+        let cpu_attn = cpu_gqa_prefill(
+            &q_cpu, &k_cpu, &v_cpu, n_heads, n_kv_heads, head_dim, n_q, 0,
+        );
+        for (i, (a, b)) in cpu_attn.iter().zip(attn.iter()).enumerate() {
+            let tol = 2e-3 * a.abs().max(1.0);
+            assert!((a - b).abs() <= tol, "attn elem {i}: cpu={a} gpu={b}");
+        }
+        let (k_dl, v_dl) = kv.tokens_host(0, n_q);
+        for (i, (a, b)) in k_roped.iter().zip(k_dl.iter()).enumerate() {
+            let tol = 2e-3 * a.abs().max(1.0);
+            assert!((a - b).abs() <= tol, "k dl elem {i}: host={a} metal={b}");
+        }
+        for (i, (a, b)) in v_roped.iter().zip(v_dl.iter()).enumerate() {
+            let tol = 2e-3 * a.abs().max(1.0);
+            assert!((a - b).abs() <= tol, "v dl elem {i}: host={a} metal={b}");
+        }
+    }
+}

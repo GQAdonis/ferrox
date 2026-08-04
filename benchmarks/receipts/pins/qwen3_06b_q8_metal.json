@@ -1,0 +1,89 @@
+{
+  "schema": 1,
+  "id": "qwen3_06b_q8",
+  "name": "Qwen3-0.6B Q8_0",
+  "backend": "metal",
+  "expect": "ok",
+  "date": "2026-08-04",
+  "host": "Host B (Apple M2 Pro, 10 logical cores)",
+  "model": "~/Desktop/Dev/ferrox/models/hf_test/Qwen3-0.6B-Q8_0.gguf",
+  "max_tokens": 512,
+  "reps": 3,
+  "mode": "server",
+  "workload": "greedy chat, warm then 3x 512-tok capitals list (median)",
+  "notes": "new arch support (engine_factory); d=128",
+  "ferrox": {
+    "wall_s": 4.897,
+    "predicted_per_second": 126.409,
+    "prompt_per_second": 54.134,
+    "completion_tokens": 512,
+    "wall_tok_s": 104.55,
+    "prefix": "<think>\nOkay, the user wants me to create a numbered list of",
+    "predicted_stddev": 5.395,
+    "prompt_stddev": 7.095,
+    "wall_tok_s_stddev": 5.563,
+    "reps": 3,
+    "runs": [
+      {
+        "predicted_per_second": 126.4088925649758,
+        "prompt_per_second": 44.06865446482138,
+        "wall_tok_s": 100.468,
+        "wall_s": 5.096,
+        "completion_tokens": 512
+      },
+      {
+        "predicted_per_second": 125.9735952966845,
+        "prompt_per_second": 54.13360984749164,
+        "wall_tok_s": 104.55,
+        "wall_s": 4.897,
+        "completion_tokens": 512
+      },
+      {
+        "predicted_per_second": 135.5288477255308,
+        "prompt_per_second": 57.76445713009278,
+        "wall_tok_s": 111.473,
+        "wall_s": 4.593,
+        "completion_tokens": 512
+      }
+    ],
+    "metal_fails": 0,
+    "engine": "ferrox"
+  },
+  "llama": {
+    "wall_s": 4.49,
+    "predicted_per_second": 114.479,
+    "prompt_per_second": 9556.314,
+    "completion_tokens": 512,
+    "wall_tok_s": 114.025,
+    "prefix": "1. **Paris** \u2013 The birthplace of the French Revolution, with",
+    "predicted_stddev": 1.171,
+    "prompt_stddev": 7958.625,
+    "wall_tok_s_stddev": 1.284,
+    "reps": 3,
+    "runs": [
+      {
+        "predicted_per_second": 114.68514112880194,
+        "prompt_per_second": 22222.222222222223,
+        "wall_tok_s": 114.387,
+        "wall_s": 4.476,
+        "completion_tokens": 512
+      },
+      {
+        "predicted_per_second": 112.56094394662853,
+        "prompt_per_second": 7540.60324825986,
+        "wall_tok_s": 112.005,
+        "wall_s": 4.571,
+        "completion_tokens": 512
+      },
+      {
+        "predicted_per_second": 114.47879503913296,
+        "prompt_per_second": 9556.31399317406,
+        "wall_tok_s": 114.025,
+        "wall_s": 4.49,
+        "completion_tokens": 512
+      }
+    ],
+    "engine": "llama"
+  },
+  "status": "ok"
+}

@@ -1,0 +1,19 @@
+[package]
+name = "ferrox-moe"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ferrox-core = { path = "../ferrox-core" }
+rayon = { workspace = true }
+anyhow = { workspace = true }
+
+[dev-dependencies]
+ferrox-quant = { path = "../ferrox-quant" }
+
+[features]
+default = []
+cuda = ["ferrox-core/cuda"]
+metal = ["ferrox-core/metal"]
+

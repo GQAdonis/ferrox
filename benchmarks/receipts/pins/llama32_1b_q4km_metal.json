@@ -1,0 +1,88 @@
+{
+  "schema": 1,
+  "id": "llama32_1b_q4km",
+  "name": "Llama-3.2-1B-Instruct Q4_K_M",
+  "backend": "metal",
+  "expect": "ok",
+  "date": "2026-08-04",
+  "host": "Host B (Apple M2 Pro, 10 logical cores)",
+  "model": "~/Desktop/Dev/ferrox/models/Llama-3.2-1B-Instruct-Q4_K_M.gguf",
+  "max_tokens": 512,
+  "reps": 3,
+  "workload": "greedy chat, warm then 3x 512-tok capitals list (median)",
+  "notes": "head_dim=64; FA-vec N/A",
+  "ferrox": {
+    "wall_s": 4.417,
+    "predicted_per_second": 141.415,
+    "prompt_per_second": 53.905,
+    "completion_tokens": 512,
+    "wall_tok_s": 115.921,
+    "prefix": "Here is a detailed numbered list of 80 European capital citi",
+    "predicted_stddev": 3.185,
+    "prompt_stddev": 1.779,
+    "wall_tok_s_stddev": 2.301,
+    "reps": 3,
+    "runs": [
+      {
+        "predicted_per_second": 143.11235123181092,
+        "prompt_per_second": 51.865581311540836,
+        "wall_tok_s": 116.643,
+        "wall_s": 4.389,
+        "completion_tokens": 512
+      },
+      {
+        "predicted_per_second": 136.94674817672924,
+        "prompt_per_second": 53.90506185376139,
+        "wall_tok_s": 112.346,
+        "wall_s": 4.557,
+        "completion_tokens": 512
+      },
+      {
+        "predicted_per_second": 141.4147993801976,
+        "prompt_per_second": 55.41043548509475,
+        "wall_tok_s": 115.921,
+        "wall_s": 4.417,
+        "completion_tokens": 512
+      }
+    ],
+    "metal_fails": 0,
+    "engine": "ferrox"
+  },
+  "llama": {
+    "wall_s": 3.768,
+    "predicted_per_second": 136.228,
+    "prompt_per_second": 15325.67,
+    "completion_tokens": 512,
+    "wall_tok_s": 135.876,
+    "prefix": "1. Athens, Greece - The Acropolis, a citadel in the heart of",
+    "predicted_stddev": 2.096,
+    "prompt_stddev": 20095.439,
+    "wall_tok_s_stddev": 2.093,
+    "reps": 3,
+    "runs": [
+      {
+        "predicted_per_second": 136.22839968348183,
+        "prompt_per_second": 48593.35038363171,
+        "wall_tok_s": 135.876,
+        "wall_s": 3.768,
+        "completion_tokens": 512
+      },
+      {
+        "predicted_per_second": 134.98485902255143,
+        "prompt_per_second": 12429.378531073447,
+        "wall_tok_s": 134.586,
+        "wall_s": 3.804,
+        "completion_tokens": 512
+      },
+      {
+        "predicted_per_second": 139.0742382086369,
+        "prompt_per_second": 15325.67049808429,
+        "wall_tok_s": 138.679,
+        "wall_s": 3.692,
+        "completion_tokens": 512
+      }
+    ],
+    "engine": "llama"
+  },
+  "status": "ok"
+}

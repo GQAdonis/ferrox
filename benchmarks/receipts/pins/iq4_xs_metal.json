@@ -1,0 +1,88 @@
+{
+  "schema": 1,
+  "id": "iq4_xs",
+  "name": "Llama-3.2-1B-Instruct IQ4_XS",
+  "backend": "metal",
+  "expect": "ok",
+  "date": "2026-08-04",
+  "host": "Host B (Apple M2 Pro, 10 logical cores)",
+  "model": "~/Desktop/Dev/ferrox/models/Llama-3.2-1B-Instruct-IQ4_XS.gguf",
+  "max_tokens": 512,
+  "reps": 3,
+  "workload": "greedy chat, warm then 3x 512-tok capitals list (median)",
+  "notes": "IQ4_XS Metal matvec landed 2026-08-04 (llama mul_mv_iq4_xs port)",
+  "ferrox": {
+    "wall_s": 4.133,
+    "predicted_per_second": 148.426,
+    "prompt_per_second": 63.089,
+    "completion_tokens": 512,
+    "wall_tok_s": 123.874,
+    "prefix": "Here is a detailed numbered list of 80 European capital citi",
+    "predicted_stddev": 0.307,
+    "prompt_stddev": 1.648,
+    "wall_tok_s_stddev": 0.571,
+    "reps": 3,
+    "runs": [
+      {
+        "predicted_per_second": 148.11412852710885,
+        "prompt_per_second": 64.79864435311566,
+        "wall_tok_s": 124.663,
+        "wall_s": 4.107,
+        "completion_tokens": 512
+      },
+      {
+        "predicted_per_second": 148.42561407202373,
+        "prompt_per_second": 63.08863623275746,
+        "wall_tok_s": 123.874,
+        "wall_s": 4.133,
+        "completion_tokens": 512
+      },
+      {
+        "predicted_per_second": 148.72907090251368,
+        "prompt_per_second": 61.502942455954745,
+        "wall_tok_s": 123.554,
+        "wall_s": 4.144,
+        "completion_tokens": 512
+      }
+    ],
+    "metal_fails": 0,
+    "engine": "ferrox"
+  },
+  "llama": {
+    "wall_s": 3.717,
+    "predicted_per_second": 138.249,
+    "prompt_per_second": 13924.051,
+    "completion_tokens": 512,
+    "wall_tok_s": 137.742,
+    "prefix": "1. Athens, Greece - The ancient city of Athens was the site ",
+    "predicted_stddev": 0.761,
+    "prompt_stddev": 20303.017,
+    "wall_tok_s_stddev": 0.806,
+    "reps": 3,
+    "runs": [
+      {
+        "predicted_per_second": 139.47328133231852,
+        "prompt_per_second": 48114.43433029909,
+        "wall_tok_s": 139.103,
+        "wall_s": 3.681,
+        "completion_tokens": 512
+      },
+      {
+        "predicted_per_second": 138.24891014225867,
+        "prompt_per_second": 13924.05063291139,
+        "wall_tok_s": 137.742,
+        "wall_s": 3.717,
+        "completion_tokens": 512
+      },
+      {
+        "predicted_per_second": 138.07945501765096,
+        "prompt_per_second": 12048.19277108434,
+        "wall_tok_s": 137.674,
+        "wall_s": 3.719,
+        "completion_tokens": 512
+      }
+    ],
+    "engine": "llama"
+  },
+  "status": "ok"
+}

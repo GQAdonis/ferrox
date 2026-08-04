@@ -1,0 +1,159 @@
+//! Kimi K3's cross-layer "block residual" mixing mechanism
+//! (`_apply_attn_res` in the real `modeling_kimi_linear.py`), a real
+//! architectural feature discovered by reading `KimiDecoderLayer.forward`
+//! in full rather than assuming a standard pre-norm residual: every
+//! layer blends its running residual stream with a growing set of
+//! saved checkpoints from earlier layers in the same block, using a
+//! learned RMSNorm-projected softmax score to weight the blend --
+//! structurally a tiny self-attention over `{checkpoints..., current}`.
+//!
+//! Confirmed real and active (not a dead/optional code path) via
+//! `config.json`'s `attn_res_block_size`=12: every layer calls this
+//! twice (once before self-attention using `self_attention_res_norm`/
+//! `self_attention_res_proj`, once before the FFN using
+//! `mlp_res_norm`/`mlp_res_proj`), every 12th layer (0-indexed
+//! `layer_idx % 12 == 0`) additionally commits the layer's pre-blend
+//! input as a new checkpoint into the block's growing residual set, and
+//! the whole model applies one final blend
+//! (`output_attn_res_norm`/`output_attn_res_proj`) before the final
+//! norm. Real per-layer tensor names (`self_attention_res_norm.weight`,
+//! `self_attention_res_proj.weight`, `mlp_res_norm.weight`,
+//! `mlp_res_proj.weight`) confirmed directly against a real Kimi K3
+//! shard header fetched earlier this session -- this isn't a rarely-used
+//! feature, every layer has these weights.
+
+/// One `_apply_attn_res` call: blends `prefix_sum` (`[hidden_dim]`, the
+/// layer's current running residual) with `block_residual` (`[n_blocks,
+/// hidden_dim]` flattened, the checkpoints saved so far in this block --
+/// may be empty). `norm_weight`/`proj_weight` are both `[hidden_dim]`
+/// (the real `proj` is `Linear(hidden_dim, 1, bias=false)`, so its
+/// weight is a single `[hidden_dim]` row, not a matrix).
+///
+/// Real math: normalize each candidate (`prefix_sum` and every saved
+/// checkpoint) by its own RMS scale factor only (no elementwise weight
+/// yet), score it by dotting with `norm_weight * proj_weight`
+/// (mathematically identical to `proj(rms_norm(candidate))` since `proj`
+/// has no bias), softmax the scores across candidates, then return the
+/// softmax-weighted sum of the *raw* (non-normalized) candidates.
+pub fn apply_attn_res(
+    prefix_sum: &[f32],
+    block_residual: &[f32],
+    norm_weight: &[f32],
+    proj_weight: &[f32],
+    eps: f32,
+) -> Vec<f32> {
+    let score_weight: Vec<f32> = norm_weight
+        .iter()
+        .zip(proj_weight.iter())
+        .map(|(n, p)| n * p)
+        .collect();
+    apply_attn_res_prescored(prefix_sum, block_residual, &score_weight, eps)
+}
+
+/// Same computation as `apply_attn_res`, but takes the already-fused
+/// `norm_weight * proj_weight` product directly instead of the two
+/// separate factors -- what a real Kimi K3 GGUF checkpoint actually
+/// stores (`blk.{bid}.attn_res_score`/`ffn_res_score`/
+/// `output_res_score`, real names confirmed against
+/// `ggml-org/llama.cpp#26185`'s `conversion/kimi_k3.py`, whose
+/// `_try_fuse_res` fuses this exact product at GGUF-conversion time
+/// since `_apply_attn_res` in the real `modeling_kimi_linear.py` never
+/// uses the two factors separately -- see docs/MODELS.md). The
+/// safetensors checkpoint stores the two factors separately instead, so
+/// `apply_attn_res` fuses them itself and delegates here.
+pub fn apply_attn_res_prescored(
+    prefix_sum: &[f32],
+    block_residual: &[f32],
+    score_weight: &[f32],
+    eps: f32,
+) -> Vec<f32> {
+    let hidden_dim = prefix_sum.len();
+    assert_eq!(score_weight.len(), hidden_dim);
+    assert!(block_residual.len().is_multiple_of(hidden_dim));
+    let n_blocks = block_residual.len() / hidden_dim;
+    let n_candidates = n_blocks + 1;
+
+    let candidate = |c: usize| -> &[f32] {
+        if c < n_blocks {
+            &block_residual[c * hidden_dim..(c + 1) * hidden_dim]
+        } else {
+            prefix_sum
+        }
+    };
+
+    let mut scores = vec![0f32; n_candidates];
+    for (c, score) in scores.iter_mut().enumerate() {
+        let v = candidate(c);
+        let mean_sq: f32 = v.iter().map(|x| x * x).sum::<f32>() / hidden_dim as f32;
+        let rstd = 1.0 / (mean_sq + eps).sqrt();
+        *score = v
+            .iter()
+            .zip(score_weight.iter())
+            .map(|(x, w)| (x * rstd) * w)
+            .sum();
+    }
+
+    let max = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+    let mut probs = vec![0f32; n_candidates];
+    let mut sum = 0f32;
+    for (c, p) in probs.iter_mut().enumerate() {
+        *p = (scores[c] - max).exp();
+        sum += *p;
+    }
+    for p in probs.iter_mut() {
+        *p /= sum;
+    }
+
+    let mut out = vec![0f32; hidden_dim];
+    for (c, &w) in probs.iter().enumerate() {
+        let v = candidate(c);
+        for (o, x) in out.iter_mut().zip(v.iter()) {
+            *o += w * x;
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Generated by an independent Python reference -- do not hand-edit.
+    // Golden values computed from the same formula
+    // transcribed from the real `_apply_attn_res` source.
+    const PREFIX_SUM: [f32; 4] = [0.00123015, 0.298746, -0.274138, -0.890592];
+    const BLOCK_RESIDUAL: [f32; 8] = [
+        -0.454671, -0.991647, 0.0601436, 1.34022, -0.492207, -0.620475, 0.489842, 0.356887,
+    ];
+    const NORM_WEIGHT: [f32; 4] = [1.01054, 0.906953, 0.997075, 1.06953];
+    const PROJ_WEIGHT: [f32; 4] = [-1.34421, -0.457616, -1.90122, -1.28954];
+    const EXPECTED: [f32; 4] = [-0.0107297, 0.271161, -0.26009, -0.847388];
+
+    #[test]
+    fn matches_independent_python_reference() {
+        let got = apply_attn_res(
+            &PREFIX_SUM,
+            &BLOCK_RESIDUAL,
+            &NORM_WEIGHT,
+            &PROJ_WEIGHT,
+            1e-5,
+        );
+        for (i, (a, b)) in got.iter().zip(EXPECTED.iter()).enumerate() {
+            assert!((a - b).abs() < 1e-4, "element {i}: rust={a} python={b}");
+        }
+    }
+
+    #[test]
+    fn with_no_saved_checkpoints_softmax_over_one_candidate_is_the_identity() {
+        // n_blocks=0 -> exactly one candidate (prefix_sum itself) ->
+        // softmax over a single score is always 1.0 -> output must equal
+        // prefix_sum unchanged, regardless of norm/proj weights.
+        let prefix_sum = [1.0f32, -2.0, 3.5];
+        let norm_weight = [0.7f32, 1.3, -0.2];
+        let proj_weight = [2.0f32, -1.0, 0.5];
+        let got = apply_attn_res(&prefix_sum, &[], &norm_weight, &proj_weight, 1e-5);
+        for (a, b) in got.iter().zip(prefix_sum.iter()) {
+            assert!((a - b).abs() < 1e-5);
+        }
+    }
+}

@@ -1,0 +1,76 @@
+{
+  "schema": 1,
+  "id": "gemma3_1b_q8",
+  "name": "Gemma-3-1B-IT Q8_0",
+  "backend": "metal",
+  "expect": "ok",
+  "date": "2026-08-04",
+  "host": "Host B (Apple M2 Pro, 10 logical cores)",
+  "model": "~/Desktop/Dev/ferrox/models/hf_test/gemma-3-1b-it-Q8_0.gguf",
+  "max_tokens": 512,
+  "reps": 3,
+  "mode": "cli",
+  "workload": "greedy chat, warm then 3x 512-tok capitals list (median)",
+  "notes": "full Metal stack (embd scale on host, GeGLU, sandwich norms, SWA kv_start, per-layer theta); d=256 still legacy attn kernel (no FA-vec)",
+  "ferrox": {
+    "wall_s": 11.269,
+    "engine": "ferrox",
+    "prompt_per_second": 42.71,
+    "completion_tokens": 512,
+    "predicted_per_second": 49.79,
+    "prefix": "998799011111111111111111111111111111111111111111111111111111",
+    "predicted_stddev": 0.728,
+    "prompt_stddev": 4.854,
+    "reps": 3,
+    "runs": [
+      {
+        "predicted_per_second": 49.4,
+        "prompt_per_second": 35.16,
+        "wall_s": 11.636,
+        "completion_tokens": 512
+      },
+      {
+        "predicted_per_second": 49.79,
+        "prompt_per_second": 42.71,
+        "wall_s": 11.269,
+        "completion_tokens": 512
+      },
+      {
+        "predicted_per_second": 50.81,
+        "prompt_per_second": 44.22,
+        "wall_s": 11.051,
+        "completion_tokens": 512
+      }
+    ],
+    "mode": "cli"
+  },
+  "llama": {
+    "wall_s": 7.635,
+    "engine": "llama",
+    "prompt_per_second": 27777.8,
+    "predicted_per_second": 78.3,
+    "prefix": "--no-conversation is not supported by llama-cli\nplease use l",
+    "predicted_stddev": 1.25,
+    "prompt_stddev": 1801.081,
+    "reps": 3,
+    "runs": [
+      {
+        "predicted_per_second": 78.3,
+        "prompt_per_second": 26117.2,
+        "wall_s": 7.635
+      },
+      {
+        "predicted_per_second": 79.5,
+        "prompt_per_second": 27777.8,
+        "wall_s": 7.155
+      },
+      {
+        "predicted_per_second": 77.0,
+        "prompt_per_second": 29715.8,
+        "wall_s": 7.666
+      }
+    ],
+    "mode": "cli"
+  },
+  "status": "ok"
+}

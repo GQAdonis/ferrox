@@ -1,0 +1,76 @@
+{
+  "schema": 1,
+  "id": "phi3_mini_q4",
+  "name": "Phi-3-mini-4k-Instruct Q4",
+  "backend": "metal",
+  "expect": "ok",
+  "date": "2026-08-04",
+  "host": "Host B (Apple M2 Pro, 10 logical cores)",
+  "model": "~/Desktop/Dev/ferrox/models/hf_test/Phi-3-mini-4k-instruct-q4.gguf",
+  "max_tokens": 512,
+  "reps": 3,
+  "mode": "cli",
+  "workload": "greedy chat, warm then 3x 512-tok capitals list (median)",
+  "notes": "fused QKV/gate+up now split as quantized row slices (Metal-capable); d=96 -> legacy Metal attn kernel (no FA-vec)",
+  "ferrox": {
+    "wall_s": 14.185,
+    "engine": "ferrox",
+    "prompt_per_second": 27.27,
+    "completion_tokens": 512,
+    "predicted_per_second": 40.52,
+    "prefix": "b9a0b9f3a0f5e8a2b9f3a0f5e8a2b9f3a0f5e8a2b9f3a0f5e8a2b9f3a0f5",
+    "predicted_stddev": 0.3,
+    "prompt_stddev": 0.241,
+    "reps": 3,
+    "runs": [
+      {
+        "predicted_per_second": 40.83,
+        "prompt_per_second": 27.27,
+        "wall_s": 14.09,
+        "completion_tokens": 512
+      },
+      {
+        "predicted_per_second": 40.52,
+        "prompt_per_second": 27.06,
+        "wall_s": 14.185,
+        "completion_tokens": 512
+      },
+      {
+        "predicted_per_second": 40.23,
+        "prompt_per_second": 27.54,
+        "wall_s": 14.25,
+        "completion_tokens": 512
+      }
+    ],
+    "mode": "cli"
+  },
+  "llama": {
+    "wall_s": 10.178,
+    "engine": "llama",
+    "prompt_per_second": 26203.5,
+    "predicted_per_second": 53.0,
+    "prefix": "--no-conversation is not supported by llama-cli\nplease use l",
+    "predicted_stddev": 0.058,
+    "prompt_stddev": 7388.246,
+    "reps": 3,
+    "runs": [
+      {
+        "predicted_per_second": 53.1,
+        "prompt_per_second": 13597.0,
+        "wall_s": 11.181
+      },
+      {
+        "predicted_per_second": 53.0,
+        "prompt_per_second": 26576.0,
+        "wall_s": 10.178
+      },
+      {
+        "predicted_per_second": 53.0,
+        "prompt_per_second": 26203.5,
+        "wall_s": 10.178
+      }
+    ],
+    "mode": "cli"
+  },
+  "status": "ok"
+}

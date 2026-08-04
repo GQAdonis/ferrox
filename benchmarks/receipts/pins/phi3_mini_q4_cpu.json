@@ -1,0 +1,89 @@
+{
+  "schema": 1,
+  "id": "phi3_mini_q4",
+  "name": "Phi-3-mini-4k-Instruct Q4",
+  "backend": "cpu",
+  "expect": "ok",
+  "date": "2026-08-04",
+  "host": "Host B (Apple M2 Pro, 10 logical cores)",
+  "model": "~/Desktop/Dev/ferrox/models/hf_test/Phi-3-mini-4k-instruct-q4.gguf",
+  "max_tokens": 512,
+  "reps": 3,
+  "mode": "server",
+  "workload": "greedy chat, warm then 3x 512-tok capitals list (median)",
+  "notes": "fused QKV/gate+up now split as quantized row slices (Metal-capable); d=96 -> legacy Metal attn kernel (no FA-vec)",
+  "ferrox": {
+    "wall_s": 109.086,
+    "predicted_per_second": 5.098,
+    "prompt_per_second": 7.639,
+    "completion_tokens": 512,
+    "wall_tok_s": 4.694,
+    "prefix": "1. **Tallinn**, Estonia - Founded in the 13th century, Talli",
+    "predicted_stddev": 0.681,
+    "prompt_stddev": 1.164,
+    "wall_tok_s_stddev": 0.595,
+    "reps": 3,
+    "runs": [
+      {
+        "predicted_per_second": 5.097656252600904,
+        "prompt_per_second": 5.785433097359098,
+        "wall_tok_s": 4.694,
+        "wall_s": 109.086,
+        "completion_tokens": 512
+      },
+      {
+        "predicted_per_second": 5.575972892507889,
+        "prompt_per_second": 7.639142796196751,
+        "wall_tok_s": 5.212,
+        "wall_s": 98.243,
+        "completion_tokens": 512
+      },
+      {
+        "predicted_per_second": 4.232240627985948,
+        "prompt_per_second": 7.93316374306984,
+        "wall_tok_s": 4.026,
+        "wall_s": 127.158,
+        "completion_tokens": 512
+      }
+    ],
+    "metal_fails": 0,
+    "engine": "ferrox"
+  },
+  "llama": {
+    "wall_s": 58.857,
+    "predicted_per_second": 8.801,
+    "prompt_per_second": 23.464,
+    "completion_tokens": 512,
+    "wall_tok_s": 8.699,
+    "prefix": " 1. **Tallinn**, Estonia - Founded in the 13th century, Tall",
+    "predicted_stddev": 4.437,
+    "prompt_stddev": 16.777,
+    "wall_tok_s_stddev": 4.385,
+    "reps": 3,
+    "runs": [
+      {
+        "predicted_per_second": 3.161567198740313,
+        "prompt_per_second": 47.70981779287725,
+        "wall_tok_s": 3.144,
+        "wall_s": 162.851,
+        "completion_tokens": 512
+      },
+      {
+        "predicted_per_second": 11.914093614152863,
+        "prompt_per_second": 23.46395805687142,
+        "wall_tok_s": 11.798,
+        "wall_s": 43.396,
+        "completion_tokens": 512
+      },
+      {
+        "predicted_per_second": 8.801245747575837,
+        "prompt_per_second": 15.499838801676463,
+        "wall_tok_s": 8.699,
+        "wall_s": 58.857,
+        "completion_tokens": 512
+      }
+    ],
+    "engine": "llama"
+  },
+  "status": "ok"
+}

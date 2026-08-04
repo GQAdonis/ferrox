@@ -1,0 +1,76 @@
+{
+  "schema": 1,
+  "id": "llama31_8b_q4km",
+  "name": "Llama-3.1-8B-Instruct Q4_K_M",
+  "backend": "metal",
+  "expect": "ok",
+  "date": "2026-08-04",
+  "host": "Host B (Apple M2 Pro, 10 logical cores)",
+  "model": "~/Desktop/Dev/ferrox/models/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf",
+  "max_tokens": 512,
+  "reps": 3,
+  "mode": "cli",
+  "workload": "greedy chat, warm then 3x 512-tok capitals list (median)",
+  "notes": "Host B Metal pin (f16 KV + FA-vec d=128)",
+  "ferrox": {
+    "wall_s": 20.536,
+    "engine": "ferrox",
+    "prompt_per_second": 14.37,
+    "completion_tokens": 512,
+    "predicted_per_second": 28.64,
+    "prefix": "b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3",
+    "predicted_stddev": 0.248,
+    "prompt_stddev": 0.613,
+    "reps": 3,
+    "runs": [
+      {
+        "predicted_per_second": 29.06,
+        "prompt_per_second": 15.08,
+        "wall_s": 20.116,
+        "completion_tokens": 512
+      },
+      {
+        "predicted_per_second": 28.64,
+        "prompt_per_second": 14.37,
+        "wall_s": 20.536,
+        "completion_tokens": 512
+      },
+      {
+        "predicted_per_second": 28.62,
+        "prompt_per_second": 13.86,
+        "wall_s": 20.555,
+        "completion_tokens": 512
+      }
+    ],
+    "mode": "cli"
+  },
+  "llama": {
+    "wall_s": 20.873,
+    "engine": "llama",
+    "prompt_per_second": 15592.3,
+    "predicted_per_second": 28.6,
+    "prefix": "--no-conversation is not supported by llama-cli\nplease use l",
+    "predicted_stddev": 0.643,
+    "prompt_stddev": 11373.694,
+    "reps": 3,
+    "runs": [
+      {
+        "predicted_per_second": 27.6,
+        "prompt_per_second": 4565.3,
+        "wall_s": 28.973
+      },
+      {
+        "predicted_per_second": 28.8,
+        "prompt_per_second": 15592.3,
+        "wall_s": 20.873
+      },
+      {
+        "predicted_per_second": 28.6,
+        "prompt_per_second": 27309.2,
+        "wall_s": 20.766
+      }
+    ],
+    "mode": "cli"
+  },
+  "status": "ok"
+}

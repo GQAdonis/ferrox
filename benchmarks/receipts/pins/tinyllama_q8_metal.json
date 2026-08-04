@@ -1,0 +1,88 @@
+{
+  "schema": 1,
+  "id": "tinyllama_q8",
+  "name": "TinyLlama-1.1B-Chat-v1.0 Q8_0",
+  "backend": "metal",
+  "expect": "ok",
+  "date": "2026-08-04",
+  "host": "Host B (Apple M2 Pro, 10 logical cores)",
+  "model": "~/Desktop/Dev/ferrox/models/tinyllama-1.1b-chat-v1.0.Q8_0.gguf",
+  "max_tokens": 512,
+  "reps": 3,
+  "workload": "greedy chat, warm then 3x 512-tok capitals list (median)",
+  "notes": "Verified smoke",
+  "ferrox": {
+    "wall_s": 5.574,
+    "predicted_per_second": 116.688,
+    "prompt_per_second": 47.37,
+    "completion_tokens": 512,
+    "wall_tok_s": 91.853,
+    "prefix": "1. Athens, Greece - The ancient city of Athens was the birth",
+    "predicted_stddev": 1.431,
+    "prompt_stddev": 1.413,
+    "wall_tok_s_stddev": 1.357,
+    "reps": 3,
+    "runs": [
+      {
+        "predicted_per_second": 116.68814210883617,
+        "prompt_per_second": 47.37029484163086,
+        "wall_tok_s": 91.894,
+        "wall_s": 5.572,
+        "completion_tokens": 512
+      },
+      {
+        "predicted_per_second": 116.7540282141313,
+        "prompt_per_second": 48.01636434088088,
+        "wall_tok_s": 91.853,
+        "wall_s": 5.574,
+        "completion_tokens": 512
+      },
+      {
+        "predicted_per_second": 114.24247279574564,
+        "prompt_per_second": 45.30990560714394,
+        "wall_tok_s": 89.524,
+        "wall_s": 5.719,
+        "completion_tokens": 512
+      }
+    ],
+    "metal_fails": 0,
+    "engine": "ferrox"
+  },
+  "llama": {
+    "wall_s": 4.673,
+    "predicted_per_second": 109.852,
+    "prompt_per_second": 8895.866,
+    "completion_tokens": 512,
+    "wall_tok_s": 109.572,
+    "prefix": "1. Paris, France - The city of love was founded in 5th centu",
+    "predicted_stddev": 2.993,
+    "prompt_stddev": 12666.802,
+    "wall_tok_s_stddev": 2.963,
+    "reps": 3,
+    "runs": [
+      {
+        "predicted_per_second": 109.85174948565994,
+        "prompt_per_second": 29733.009708737864,
+        "wall_tok_s": 109.572,
+        "wall_s": 4.673,
+        "completion_tokens": 512
+      },
+      {
+        "predicted_per_second": 112.84236472635837,
+        "prompt_per_second": 6836.308393467527,
+        "wall_tok_s": 112.463,
+        "wall_s": 4.553,
+        "completion_tokens": 512
+      },
+      {
+        "predicted_per_second": 106.85555612368947,
+        "prompt_per_second": 8895.866038723181,
+        "wall_tok_s": 106.537,
+        "wall_s": 4.806,
+        "completion_tokens": 512
+      }
+    ],
+    "engine": "llama"
+  },
+  "status": "ok"
+}

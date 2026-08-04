@@ -1,0 +1,33 @@
+{
+  "schema": 1,
+  "id": "olmoe_q4",
+  "name": "OLMoE-1B-7B-0924 Q4_0",
+  "backend": "cpu",
+  "expect": "ok",
+  "date": "2026-08-04",
+  "host": "Host B (Apple M2 Pro, 10 logical cores)",
+  "model": "~/Desktop/Dev/ferrox/models/olmoe-1b-7b-0924-q4_0.gguf",
+  "max_tokens": 256,
+  "workload": "greedy chat, warm then 256-tok capitals list",
+  "notes": "Verified MoE; CPU fair-chat",
+  "ferrox": {
+    "wall_s": 18.296,
+    "predicted_per_second": 17.892669788926455,
+    "prompt_per_second": 8.528835816923676,
+    "completion_tokens": 256,
+    "wall_tok_s": 13.992,
+    "prefix": "-a9a6-4e4d-a9a6-a9a6-a9a6-a9a6-a9a6-a9a6-a9a6-a9a6-a9a6-a9a6",
+    "metal_fails": 0,
+    "engine": "ferrox"
+  },
+  "llama": {
+    "wall_s": 13.679,
+    "predicted_per_second": 19.741613130393663,
+    "prompt_per_second": 67.67283006365476,
+    "completion_tokens": 256,
+    "wall_tok_s": 18.715,
+    "prefix": "Write a detailed numbered list of 80 European capital cities",
+    "engine": "llama"
+  },
+  "status": "ok"
+}

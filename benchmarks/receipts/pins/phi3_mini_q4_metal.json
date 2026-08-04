@@ -1,0 +1,89 @@
+{
+  "schema": 1,
+  "id": "phi3_mini_q4",
+  "name": "Phi-3-mini-4k-Instruct Q4",
+  "backend": "metal",
+  "expect": "ok",
+  "date": "2026-08-04",
+  "host": "Host B (Apple M2 Pro, 10 logical cores)",
+  "model": "~/Desktop/Dev/ferrox/models/hf_test/Phi-3-mini-4k-instruct-q4.gguf",
+  "max_tokens": 512,
+  "reps": 3,
+  "mode": "server",
+  "workload": "greedy chat, warm then 3x 512-tok capitals list (median)",
+  "notes": "fused QKV/gate+up now split as quantized row slices (Metal-capable); d=96 -> legacy Metal attn kernel (no FA-vec)",
+  "ferrox": {
+    "wall_s": 14.823,
+    "predicted_per_second": 39.804,
+    "prompt_per_second": 25.102,
+    "completion_tokens": 512,
+    "wall_tok_s": 34.542,
+    "prefix": "1. **Tallinn**, Estonia - Tallinn is believed to be the birt",
+    "predicted_stddev": 0.187,
+    "prompt_stddev": 1.158,
+    "wall_tok_s_stddev": 0.319,
+    "reps": 3,
+    "runs": [
+      {
+        "predicted_per_second": 39.80409066549588,
+        "prompt_per_second": 25.101681558676397,
+        "wall_tok_s": 34.542,
+        "wall_s": 14.823,
+        "completion_tokens": 512
+      },
+      {
+        "predicted_per_second": 39.8966111550897,
+        "prompt_per_second": 25.801797301596434,
+        "wall_tok_s": 34.63,
+        "wall_s": 14.785,
+        "completion_tokens": 512
+      },
+      {
+        "predicted_per_second": 39.535640900284214,
+        "prompt_per_second": 23.540200784134463,
+        "wall_tok_s": 34.038,
+        "wall_s": 15.042,
+        "completion_tokens": 512
+      }
+    ],
+    "metal_fails": 0,
+    "engine": "ferrox"
+  },
+  "llama": {
+    "wall_s": 10.117,
+    "predicted_per_second": 50.861,
+    "prompt_per_second": 5743.459,
+    "completion_tokens": 512,
+    "wall_tok_s": 50.608,
+    "prefix": " 1. **Aarhus, Denmark** - Founded in the 6th century, Aarhus",
+    "predicted_stddev": 0.191,
+    "prompt_stddev": 3264.366,
+    "wall_tok_s_stddev": 0.301,
+    "reps": 3,
+    "runs": [
+      {
+        "predicted_per_second": 50.707654033164985,
+        "prompt_per_second": 501.8706086321745,
+        "wall_tok_s": 50.166,
+        "wall_s": 10.206,
+        "completion_tokens": 512
+      },
+      {
+        "predicted_per_second": 51.08819360896754,
+        "prompt_per_second": 6493.506493506494,
+        "wall_tok_s": 50.742,
+        "wall_s": 10.011,
+        "completion_tokens": 508
+      },
+      {
+        "predicted_per_second": 50.861455976727704,
+        "prompt_per_second": 5743.4588385449915,
+        "wall_tok_s": 50.608,
+        "wall_s": 10.117,
+        "completion_tokens": 512
+      }
+    ],
+    "engine": "llama"
+  },
+  "status": "ok"
+}

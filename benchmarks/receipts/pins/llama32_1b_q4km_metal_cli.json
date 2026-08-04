@@ -1,0 +1,76 @@
+{
+  "schema": 1,
+  "id": "llama32_1b_q4km",
+  "name": "Llama-3.2-1B-Instruct Q4_K_M",
+  "backend": "metal",
+  "expect": "ok",
+  "date": "2026-08-04",
+  "host": "Host B (Apple M2 Pro, 10 logical cores)",
+  "model": "~/Desktop/Dev/ferrox/models/Llama-3.2-1B-Instruct-Q4_K_M.gguf",
+  "max_tokens": 512,
+  "reps": 3,
+  "mode": "cli",
+  "workload": "greedy chat, warm then 3x 512-tok capitals list (median)",
+  "notes": "head_dim=64; FA-vec N/A",
+  "ferrox": {
+    "wall_s": 4.382,
+    "engine": "ferrox",
+    "prompt_per_second": 59.25,
+    "completion_tokens": 512,
+    "predicted_per_second": 143.96,
+    "prefix": "\n\n1. Berlin, Germany - Founded in 1237 as a free city, it wa",
+    "predicted_stddev": 1.805,
+    "prompt_stddev": 2.026,
+    "reps": 3,
+    "runs": [
+      {
+        "predicted_per_second": 142.18,
+        "prompt_per_second": 60.08,
+        "wall_s": 4.424,
+        "completion_tokens": 512
+      },
+      {
+        "predicted_per_second": 143.96,
+        "prompt_per_second": 56.23,
+        "wall_s": 4.382,
+        "completion_tokens": 512
+      },
+      {
+        "predicted_per_second": 145.79,
+        "prompt_per_second": 59.25,
+        "wall_s": 4.311,
+        "completion_tokens": 512
+      }
+    ],
+    "mode": "cli"
+  },
+  "llama": {
+    "wall_s": 5.147,
+    "engine": "llama",
+    "prompt_per_second": 42740.4,
+    "predicted_per_second": 140.2,
+    "prefix": "--no-conversation is not supported by llama-cli\nplease use l",
+    "predicted_stddev": 1.212,
+    "prompt_stddev": 12259.875,
+    "reps": 3,
+    "runs": [
+      {
+        "predicted_per_second": 142.3,
+        "prompt_per_second": 23926.8,
+        "wall_s": 6.135
+      },
+      {
+        "predicted_per_second": 140.2,
+        "prompt_per_second": 42740.4,
+        "wall_s": 5.143
+      },
+      {
+        "predicted_per_second": 140.2,
+        "prompt_per_second": 46951.6,
+        "wall_s": 5.147
+      }
+    ],
+    "mode": "cli"
+  },
+  "status": "ok"
+}

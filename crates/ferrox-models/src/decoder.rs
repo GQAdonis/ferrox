@@ -1,0 +1,3085 @@
+//! Generic decoder-only transformer forward pass, assembled from a
+//! ModelConfig. Each layer is: RMSNorm -> GQA attention (+RoPE) ->
+//! residual -> RMSNorm -> MoE FFN (router + routed experts + shared
+//! experts) -> residual. This is the standard decoder block shape
+//! shared by the LLaMA/DeepSeek/GLM/Kimi family of open-weight models.
+//!
+//! Weight loading from a real GGUF checkpoint lives in `loader`
+//! (`Decoder::from_gguf`); `Decoder::new_random` builds
+//! correctly-shaped, randomly initialized weights so the full pipeline
+//! -- embedding lookup, N decoder layers, output head -- can be
+//! exercised end to end with real assertions about shapes, finiteness,
+//! and determinism, without requiring a multi-hundred-gigabyte
+//! checkpoint to be present.
+
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use ferrox_core::attention::{
+    apply_rope, apply_rope_interleaved, apply_rope_interleaved_with_freq_factors,
+    apply_rope_with_freq_factors, causal_gqa_attention, causal_gqa_attention_paged,
+    causal_gqa_attention_windowed,
+};
+use ferrox_core::cache::{KvCache, PagedKvCache, PagedKvStore, PagedStoreExhausted};
+use ferrox_core::matmul::{geglu, rms_norm, rms_norm_per_head, softcap_inplace};
+
+/// Whether the CUDA `gqa_decode` kernel should serve the per-token GQA
+/// reduction (`FERROX_CUDA_GQA=1`). Off by default and only compiled with
+/// `--features cuda`; the host path is byte-identical when unset.
+#[cfg(feature = "cuda")]
+fn cuda_gqa_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        matches!(
+            std::env::var("FERROX_CUDA_GQA").ok().as_deref(),
+            Some("1") | Some("true") | Some("on")
+        )
+    })
+}
+use ferrox_core::tensor::Tensor;
+use ferrox_core::weight_matrix::WeightMatrix;
+use ferrox_moe::{
+    combine_expert_outputs, route_top_k, run_expert, run_expert_placed, ExpertPlacement,
+    ExpertWeights, PlacementPlan,
+};
+
+use crate::config::ModelConfig;
+
+pub struct AttnWeights {
+    pub q_proj: WeightMatrix, // [n_heads*head_dim, hidden_dim]
+    pub k_proj: WeightMatrix, // [n_kv_heads*head_dim, hidden_dim]
+    pub v_proj: WeightMatrix, // [n_kv_heads*head_dim, hidden_dim]
+    pub o_proj: WeightMatrix, // [hidden_dim, n_heads*head_dim]
+    pub norm_weight: Vec<f32>,
+    /// OLMoE-style QK-RMSNorm (`attn_q_norm`/`attn_k_norm` GGUF tensors),
+    /// applied to the *whole* q_proj/k_proj output (width `n_heads*head_dim`
+    /// / `n_kv_heads*head_dim`) before RoPE -- confirmed against
+    /// `OlmoeAttention.forward` in `transformers/models/olmoe/modeling_olmoe.py`
+    /// (`q_norm(q_proj(x))`, `k_norm(k_proj(x))`, both plain whole-vector
+    /// RMSNorm, not per-head). `None` for every model that doesn't ship
+    /// these tensors -- absent, not zero/identity-weighted, so existing
+    /// presets/fixtures are byte-for-byte unaffected.
+    ///
+    /// Qwen3 / Gemma3 ship the same tensor names with length `head_dim`
+    /// (per-head). Which style is used is selected by
+    /// [`ModelConfig::qk_norm_style`] (refined at load from weight length).
+    pub q_norm: Option<Vec<f32>>,
+    pub k_norm: Option<Vec<f32>>,
+    /// Qwen2/Qwen2-MoE-family QKV attention bias (`attn_{q,k,v}.bias`
+    /// GGUF tensors, real `config.qkv_bias`), added elementwise to the
+    /// corresponding projection's output before QK-norm/RoPE -- confirmed
+    /// against the real `transformers` source
+    /// (`Qwen2MoeAttention.__init__`: `q_proj = nn.Linear(..., bias=
+    /// config.qkv_bias)`, same for `k_proj`/`v_proj`; `o_proj` has no
+    /// bias). Found as a real, previously-unhandled architecture gap:
+    /// ferrox's generic GGUF loader silently ignored these real tensors
+    /// entirely, producing fluent-but-wrong output on a real downloaded
+    /// Qwen1.5-MoE checkpoint (same failure class as OLMoE's missing
+    /// QK-norm). `None` for every model that doesn't ship these tensors.
+    pub q_bias: Option<Vec<f32>>,
+    pub k_bias: Option<Vec<f32>>,
+    pub v_bias: Option<Vec<f32>>,
+    /// Gemma 2+/3 post-attention RMSNorm (`blk.N.post_attention_norm.weight`
+    /// / llama.cpp `attn_post_norm`). Applied to attention output before
+    /// the residual add. `None` for Llama/Qwen/OLMoE.
+    pub post_attn_norm: Option<Vec<f32>>,
+    /// Gemma 2+/3 post-FFN RMSNorm (`blk.N.post_ffw_norm.weight`).
+    pub post_ffn_norm: Option<Vec<f32>>,
+}
+
+/// How a layer's routed experts are held. `Resident` is the original
+/// always-in-memory form (owned f32 or zero-copy mmap views).
+/// `Stored` holds only byte-range layouts; each use acquires the
+/// expert's bytes from a bounded, lease-protected
+/// `ferrox_core::expert_store::ExpertStore` shared by every layer
+/// (one global byte budget), builds temporary `WeightMatrix` views
+/// over the leased buffer (`WeightBytes::Shared`, which pins the
+/// cache entry for the views' lifetime), and drops them after the
+/// expert runs. Dequantized math over identical bytes is identical,
+/// so the two backings are bit-equivalent by construction -- pinned
+/// by an integration test against the MoE fixture.
+pub enum ExpertBacking {
+    Resident(Vec<ExpertWeights>),
+    Stored {
+        store:
+            std::sync::Arc<ferrox_core::expert_store::ExpertStore<crate::loader::GgufExpertSource>>,
+        layouts: Vec<crate::loader::StoredExpertLayout>,
+        layer: u32,
+    },
+}
+
+impl ExpertBacking {
+    pub fn n_experts(&self) -> usize {
+        match self {
+            ExpertBacking::Resident(v) => v.len(),
+            ExpertBacking::Stored { layouts, .. } => layouts.len(),
+        }
+    }
+}
+
+pub struct MoeWeights {
+    pub router: WeightMatrix, // [n_experts, hidden_dim]
+    pub experts: ExpertBacking,
+    pub shared_experts: Vec<ExpertWeights>,
+    /// Qwen2-MoE-specific: when present, the shared experts' combined
+    /// output is scaled by `sigmoid(shared_expert_gate . x)` before
+    /// being added to the routed output, instead of added unconditionally
+    /// -- confirmed against the real `transformers` source
+    /// (`Qwen2MoeSparseMoeBlock.forward`: `shared_expert_output =
+    /// F.sigmoid(self.shared_expert_gate(hidden_states)) *
+    /// shared_expert_output`) and llama.cpp's real `qwen2moe.cpp`
+    /// (`ffn_gate_inp_shexp` dotted against the hidden state, sigmoid,
+    /// multiplied into the shared-expert branch before the final add).
+    /// Real on-disk shape is `[hidden_dim]` (a `Linear(hidden_dim, 1,
+    /// bias=false)`'s weight, flattened -- ggml's real `create_tensor`
+    /// call declares it as `{n_embd}`, not a 2D matrix), so this is a
+    /// plain owned vector dotted with the normed hidden state directly,
+    /// not a `WeightMatrix`. `None` for every other architecture
+    /// (DeepSeek-V3's shared experts, for one real confirmed contrast,
+    /// add unconditionally with no gate at all).
+    pub shared_expert_gate: Option<Vec<f32>>,
+    pub norm_weight: Vec<f32>,
+    /// How many times each routed expert (index into `experts`) has been
+    /// selected by `route_top_k` across every `forward_token`/
+    /// `forward_batch` call so far. Real observed hotness, not a
+    /// placeholder -- feeds `placement_plan` below, which is what
+    /// `PlacementPlan::from_budget` needs to prioritize actually-hot
+    /// experts for GPU residency instead of guessing by index.
+    pub activation_counts: Vec<AtomicU64>,
+}
+
+impl MoeWeights {
+    pub fn n_experts(&self) -> usize {
+        self.experts.n_experts()
+    }
+
+    /// This routed expert's weight byte footprint, from resident
+    /// matrices or the stored layout -- identical numbers either way,
+    /// so residency planning is backing-independent.
+    pub fn expert_bytes(&self, e: usize) -> usize {
+        match &self.experts {
+            ExpertBacking::Resident(v) => {
+                let ex = &v[e];
+                ex.gate.resident_bytes() + ex.up.resident_bytes() + ex.down.resident_bytes()
+            }
+            ExpertBacking::Stored { layouts, .. } => layouts[e].total_bytes(),
+        }
+    }
+
+    /// Runs `f` against expert `e`'s weights, materializing them from
+    /// the store first when this layer is store-backed. The lease (and
+    /// therefore the cache entry's pin) lives exactly as long as `f`'s
+    /// borrow.
+    pub fn with_expert<R>(&self, e: usize, f: impl FnOnce(&ExpertWeights) -> R) -> R {
+        match &self.experts {
+            ExpertBacking::Resident(v) => f(&v[e]),
+            ExpertBacking::Stored {
+                store,
+                layouts,
+                layer,
+            } => {
+                let lease = store
+                    .acquire(ferrox_core::expert_store::ExpertKey {
+                        layer: *layer,
+                        expert: e as u32,
+                    })
+                    .unwrap_or_else(|err| {
+                        panic!(
+                            "expert store read failed for layer {layer} expert {e}: {err} \
+                             (checkpoint file unreadable mid-decode)"
+                        )
+                    });
+                let tmp = layouts[e].materialize(&lease);
+                f(&tmp)
+            }
+        }
+    }
+
+    fn record_activations(&self, expert_ids: &[usize]) {
+        for &eid in expert_ids {
+            if let Some(counter) = self.activation_counts.get(eid) {
+                counter.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// A real VRAM-budget-and-hotness-driven placement plan for this
+    /// layer's routed experts, built from each expert's actual resident
+    /// byte size (`WeightMatrix::resident_bytes()` summed across its
+    /// gate/up/down matrices, so it reflects the real quantization
+    /// format in use, not an estimate) and the activation counts
+    /// observed so far. See `ferrox_moe::PlacementPlan::from_budget`.
+    pub fn placement_plan(&self, vram_budget_bytes: u64) -> PlacementPlan {
+        let sizes: Vec<usize> = (0..self.n_experts())
+            .map(|e| self.expert_bytes(e))
+            .collect();
+        let counts: Vec<u64> = self
+            .activation_counts
+            .iter()
+            .map(|c| c.load(Ordering::Relaxed))
+            .collect();
+        let has_observations = counts.iter().any(|&c| c > 0);
+        PlacementPlan::from_budget(
+            &sizes,
+            has_observations.then_some(counts.as_slice()),
+            vram_budget_bytes,
+        )
+    }
+}
+
+pub struct LayerWeights {
+    pub attn: AttnWeights,
+    pub moe: MoeWeights,
+}
+
+pub struct Decoder {
+    pub config: ModelConfig,
+    /// `[vocab_size, hidden_dim]`. A `WeightMatrix` rather than an
+    /// eagerly-widened f32 `Tensor`, so a quantized `token_embd.weight`
+    /// stays quantized on disk/mmap and token lookup dequantizes one
+    /// row at a time (`WeightMatrix::dequant_row`) -- a large-vocab
+    /// model's embedding table is multi-GB in f32 and only ever read
+    /// row-wise.
+    pub embedding: WeightMatrix,
+    pub layers: Vec<LayerWeights>,
+    pub final_norm: Vec<f32>,
+    pub output_head: WeightMatrix, // [vocab_size, hidden_dim]
+    /// Real VRAM budget for GPU-resident routed experts.
+    /// `None` (both constructors below
+    /// set it) means every expert always runs on CPU -- the exact
+    /// behavior this field's absence had before it existed. `Some(bytes)`
+    /// makes each forward call build ONE global `ResidencyPlan`
+    /// (`Decoder::residency_plan`) across every layer's actual
+    /// resident expert sizes and observed activation counts against
+    /// this single budget -- the budget is never re-spent per layer --
+    /// dispatching device-placed routed experts through
+    /// `ferrox_moe::run_expert_placed` (a real CUDA kernel when the
+    /// `cuda` feature is compiled in and the expert's quant kind has
+    /// one; a correct CPU fallback otherwise, so setting this on a
+    /// non-`cuda` build is harmless, just never GPU-accelerated).
+    /// Shared experts and a dense layer's sole expert always run on
+    /// CPU regardless -- every token activates them, so there's no
+    /// routing decision to offload the way routed-expert placement is.
+    /// Rebuilding the plan on every forward call is real but not yet
+    /// performance-tuned; a real, disclosed limit, not a correctness
+    /// gap.
+    pub gpu_vram_budget_bytes: Option<u64>,
+    /// Per-layer Metal-resident KV for fused decode/prefill attention
+    /// (`FERROX_METAL_ATTN`). Lazily allocated. After
+    /// [`ferrox_metal::attn::launch_decode_dense_stack`], Metal KV is
+    /// authoritative for the next decode step; host [`KvCache`] may lag
+    /// until [`Self::sync_metal_attn_kv_to_host`] or a CPU fallback.
+    /// Prefill / prefix restore still upload host → Metal when lengths
+    /// diverge for other reasons.
+    #[cfg(feature = "metal")]
+    pub(crate) metal_attn_kv: std::sync::Mutex<Option<Vec<ferrox_metal::attn::MetalKvBuffers>>>,
+    /// Load-time execution plan (family, fused-op caps, SWA/RoPE
+    /// policy). Built once; hot path must not re-resolve architecture
+    /// strings. See [`crate::execution_plan`].
+    pub execution_plan: crate::execution_plan::ExecutionPlan,
+    /// Cache key hit → fused caps last used for that geometry (enables
+    /// decode/prefill plan reuse without rebuilding residency).
+    pub plan_cache: std::sync::Mutex<
+        std::collections::HashMap<
+            crate::execution_plan::PlanGeometry,
+            crate::execution_plan::FusedOpCaps,
+        >,
+    >,
+}
+
+/// Simple deterministic pseudo-random generator so tests are
+/// reproducible without pulling in an external `rand` dependency.
+struct Lcg(u64);
+impl Lcg {
+    fn new(seed: u64) -> Self {
+        Lcg(seed)
+    }
+    fn next_f32(&mut self) -> f32 {
+        // xorshift64*
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        ((self.0 >> 40) as f32 / (1u64 << 24) as f32) - 0.5
+    }
+    fn vec(&mut self, n: usize) -> Vec<f32> {
+        (0..n).map(|_| self.next_f32() * 0.1).collect()
+    }
+}
+
+impl Decoder {
+    /// Builds a decoder with correctly-shaped, randomly initialized
+    /// weights for `config`, but overrides `n_layers` and `vocab_size`
+    /// with small test-scale numbers so it can actually be allocated and
+    /// run inside a CI sandbox. Use this to validate the forward-pass
+    /// plumbing only, never to draw conclusions about real model
+    /// quality.
+    pub fn new_random_small(config: ModelConfig, n_layers: usize, vocab_size: usize) -> Self {
+        let mut rng = Lcg::new(42);
+        let hidden = config.hidden_dim;
+        let head_dim = config.head_dim;
+        let n_heads = config.n_heads;
+        let n_kv_heads = config.n_kv_heads;
+
+        let embedding = WeightMatrix::F32(Tensor::new(
+            rng.vec(vocab_size * hidden),
+            vec![vocab_size, hidden],
+        ));
+
+        let wm = |data: Vec<f32>, shape: Vec<usize>| WeightMatrix::F32(Tensor::new(data, shape));
+
+        let mut layers = Vec::with_capacity(n_layers);
+        for layer_idx in 0..n_layers {
+            let attn = AttnWeights {
+                q_proj: wm(
+                    rng.vec(n_heads * head_dim * hidden),
+                    vec![n_heads * head_dim, hidden],
+                ),
+                k_proj: wm(
+                    rng.vec(n_kv_heads * head_dim * hidden),
+                    vec![n_kv_heads * head_dim, hidden],
+                ),
+                v_proj: wm(
+                    rng.vec(n_kv_heads * head_dim * hidden),
+                    vec![n_kv_heads * head_dim, hidden],
+                ),
+                o_proj: wm(
+                    rng.vec(hidden * n_heads * head_dim),
+                    vec![hidden, n_heads * head_dim],
+                ),
+                norm_weight: vec![1.0; hidden],
+                q_norm: None,
+                k_norm: None,
+                q_bias: None,
+                k_bias: None,
+                v_bias: None,
+                post_attn_norm: None,
+                post_ffn_norm: None,
+            };
+
+            // Leading dense layers (see ModelConfig::layer_is_dense's
+            // doc comment) get a single-expert, no-shared-expert
+            // dense-equivalent FFN regardless of this model's global
+            // MoE topology, matching the DeepSeek-2/3-family
+            // convention found in ik_llama.cpp's source.
+            let is_dense_layer = config.layer_is_dense(layer_idx);
+            let n_experts = if is_dense_layer {
+                1
+            } else {
+                config.moe.n_experts
+            };
+            let n_shared = if is_dense_layer {
+                0
+            } else {
+                config.moe.n_shared_experts
+            };
+            let ffn_dim = config.moe.expert_ffn_dim;
+            let make_expert = |rng: &mut Lcg| ExpertWeights {
+                gate: WeightMatrix::F32(Tensor::new(
+                    rng.vec(ffn_dim * hidden),
+                    vec![ffn_dim, hidden],
+                )),
+                up: WeightMatrix::F32(Tensor::new(
+                    rng.vec(ffn_dim * hidden),
+                    vec![ffn_dim, hidden],
+                )),
+                down: WeightMatrix::F32(Tensor::new(
+                    rng.vec(hidden * ffn_dim),
+                    vec![hidden, ffn_dim],
+                )),
+            };
+            let experts: Vec<ExpertWeights> =
+                (0..n_experts).map(|_| make_expert(&mut rng)).collect();
+            let shared_experts = (0..n_shared).map(|_| make_expert(&mut rng)).collect();
+            let activation_counts = (0..experts.len()).map(|_| AtomicU64::new(0)).collect();
+
+            let moe = MoeWeights {
+                router: wm(rng.vec(n_experts * hidden), vec![n_experts, hidden]),
+                experts: ExpertBacking::Resident(experts),
+                shared_experts,
+                shared_expert_gate: None,
+                norm_weight: vec![1.0; hidden],
+                activation_counts,
+            };
+
+            layers.push(LayerWeights { attn, moe });
+        }
+
+        let final_norm = vec![1.0; hidden];
+        let output_head = wm(rng.vec(vocab_size * hidden), vec![vocab_size, hidden]);
+
+        Decoder {
+            config: config.clone(),
+            embedding,
+            layers,
+            final_norm,
+            output_head,
+            gpu_vram_budget_bytes: None,
+            #[cfg(feature = "metal")]
+            metal_attn_kv: std::sync::Mutex::new(None),
+            execution_plan: crate::execution_plan::ExecutionPlan::from_config(
+                &config,
+                crate::capability::DecoderFamily::StandardGqa,
+                crate::capability::MemoryKind::KvGqa,
+                crate::execution_plan::ExecutionPlan::probe_metal_caps(),
+            ),
+            plan_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+
+    /// Applies RoPE to one head's Q or K slice. Dispatches on both
+    /// `rope_layout` (Norm = adjacent-pair / NeoX = split-half -- see
+    /// `RopeLayout`) and whether this checkpoint carries a real
+    /// `rope_freqs.weight` tensor (Llama 3/3.1/3.2's per-band frequency
+    /// correction). Getting the layout wrong for `llama` was the real
+    /// root cause of the Llama-3.1-8B early-stop bug: ferrox applied
+    /// NeoX pairing to an architecture that needs Norm.
+    fn apply_rope_head_theta(&self, slice: &mut [f32], pos: usize, theta: f32) {
+        use crate::config::RopeLayout;
+        match (self.config.rope_layout, &self.config.rope_freqs) {
+            (RopeLayout::Norm, Some(freq_factors)) => {
+                apply_rope_interleaved_with_freq_factors(slice, pos, theta, freq_factors)
+            }
+            (RopeLayout::Norm, None) => apply_rope_interleaved(slice, pos, theta),
+            (RopeLayout::Neox, Some(freq_factors)) => {
+                apply_rope_with_freq_factors(slice, pos, theta, freq_factors)
+            }
+            (RopeLayout::Neox, None) => apply_rope(slice, pos, theta),
+        }
+    }
+
+    fn apply_rope_head_layer(&self, slice: &mut [f32], pos: usize, layer_idx: usize) {
+        self.apply_rope_head_theta(slice, pos, self.config.layer_rope_theta(layer_idx))
+    }
+
+    /// Applies Q/K RMSNorm according to [`ModelConfig::qk_norm_style`].
+    fn apply_qk_norm(&self, x: &[f32], weight: &[f32]) -> Vec<f32> {
+        use crate::capability::QkNormStyle;
+        match self.config.qk_norm_style {
+            QkNormStyle::WholeVector => rms_norm(x, weight, self.config.rms_norm_eps),
+            QkNormStyle::PerHead => {
+                rms_norm_per_head(x, weight, self.config.head_dim, self.config.rms_norm_eps)
+            }
+        }
+    }
+
+    /// Builds a Metal [`MatvecLaunch`] for a quantized matrix, or `None`
+    /// if the storage/kind cannot run on Metal.
+    #[cfg(feature = "metal")]
+    fn metal_matvec_launch<'a>(m: &'a WeightMatrix) -> Option<ferrox_metal::gpu::MatvecLaunch<'a>> {
+        let WeightMatrix::Quantized {
+            data,
+            rows,
+            cols: _,
+            kind,
+        } = m
+        else {
+            return None;
+        };
+        let kind_name = match kind {
+            ferrox_core::QuantKind::Q8_0 => "Q8_0",
+            ferrox_core::QuantKind::Q4_0 => "Q4_0",
+            ferrox_core::QuantKind::Q4K => "Q4_K",
+            ferrox_core::QuantKind::Q5K => "Q5_K",
+            ferrox_core::QuantKind::Q6K => "Q6_K",
+            ferrox_core::QuantKind::IQ4XS => "IQ4_XS",
+            _ => return None,
+        };
+        let (src, fn_name, block_bytes, block_elems, rows_per_tg) =
+            ferrox_metal::gpu::matvec_launch_meta(kind_name)?;
+        let row_bytes = if *rows == 0 {
+            0
+        } else {
+            data.as_slice().len() / *rows
+        };
+        Some(ferrox_metal::gpu::MatvecLaunch {
+            kernel_src: src,
+            fn_name,
+            block_bytes,
+            block_elems,
+            weights: data.as_slice(),
+            rows: *rows,
+            row_bytes,
+            rows_per_tg,
+        })
+    }
+
+    /// True when this layer can use the fused Metal attention block
+    /// (Norm or NeoX RoPE, no bias/QK-norm/window, quantized projections).
+    #[cfg(feature = "metal")]
+    fn layer_supports_metal_attn(&self, layer: &LayerWeights) -> bool {
+        use crate::config::RopeLayout;
+        if !matches!(self.config.rope_layout, RopeLayout::Norm | RopeLayout::Neox) {
+            return false;
+        }
+        // QKV bias (Qwen2-family) and *per-head* QK-norm (Qwen3) run on
+        // Metal via AttnExtras. Whole-vector QK-norm (OLMoE) stays CPU.
+        if (layer.attn.q_norm.is_some() || layer.attn.k_norm.is_some())
+            && !matches!(
+                self.config.qk_norm_style,
+                crate::capability::QkNormStyle::PerHead
+            )
+        {
+            return false;
+        }
+        if layer
+            .attn
+            .q_norm
+            .as_ref()
+            .is_some_and(|w| w.len() != self.config.head_dim)
+            || layer
+                .attn
+                .k_norm
+                .as_ref()
+                .is_some_and(|w| w.len() != self.config.head_dim)
+        {
+            return false;
+        }
+        // Softcaps (Gemma-2) have no Metal ops yet. Gemma-3 features
+        // (SWA, sandwich norms, GeGLU, embedding scale, per-layer theta)
+        // run via the dense stack. SwigluFused (Phi-3) is plain SwiGLU
+        // once the loader splits the fused gate+up rows.
+        if self.config.attn_logit_softcap.is_some()
+            || self.config.final_logit_softcap.is_some()
+            || self.config.attention_scale.is_some()
+        {
+            return false;
+        }
+        // Metal GQA kernels (FA-vec d=128/64, legacy <= 256) cap head_dim.
+        if self.config.head_dim > 256 {
+            return false;
+        }
+        Self::metal_matvec_launch(&layer.attn.q_proj).is_some()
+            && Self::metal_matvec_launch(&layer.attn.k_proj).is_some()
+            && Self::metal_matvec_launch(&layer.attn.v_proj).is_some()
+            && Self::metal_matvec_launch(&layer.attn.o_proj).is_some()
+    }
+
+    /// Layer features only the fused dense stack implements — the
+    /// per-layer Metal launches would silently skip them (wrong output).
+    #[cfg(feature = "metal")]
+    fn layer_needs_metal_stack(&self, layer: &LayerWeights, layer_idx: usize) -> bool {
+        layer.attn.post_attn_norm.is_some()
+            || layer.attn.post_ffn_norm.is_some()
+            || self.config.layer_sliding_window(layer_idx).is_some()
+            || matches!(
+                self.config.ffn_activation,
+                crate::config::FfnActivation::Gelu
+            )
+            || self.config.layer_rope_theta(layer_idx) != self.config.rope_theta
+    }
+
+    /// Optional QKV bias / per-head QK-norm ops for the Metal attn paths.
+    #[cfg(feature = "metal")]
+    fn metal_attn_extras<'a>(layer: &'a LayerWeights) -> ferrox_metal::attn::AttnExtras<'a> {
+        ferrox_metal::attn::AttnExtras {
+            q_bias: layer.attn.q_bias.as_deref(),
+            k_bias: layer.attn.k_bias.as_deref(),
+            v_bias: layer.attn.v_bias.as_deref(),
+            q_norm: layer.attn.q_norm.as_deref(),
+            k_norm: layer.attn.k_norm.as_deref(),
+        }
+    }
+
+    /// Map config RoPE layout onto the Metal kernel selector.
+    #[cfg(feature = "metal")]
+    fn metal_rope_layout(&self) -> ferrox_metal::attn::MetalRopeLayout {
+        use crate::config::RopeLayout;
+        match self.config.rope_layout {
+            RopeLayout::Norm => ferrox_metal::attn::MetalRopeLayout::Norm,
+            RopeLayout::Neox => ferrox_metal::attn::MetalRopeLayout::Neox,
+        }
+    }
+
+    /// Dense FFN (single expert) with Metal-capable gate/up/down.
+    #[cfg(feature = "metal")]
+    fn layer_supports_metal_dense_ffn(layer: &LayerWeights) -> bool {
+        Self::is_dense_layer(layer)
+            && layer.moe.with_expert(0, |ex| {
+                Self::metal_matvec_launch(&ex.gate).is_some()
+                    && Self::metal_matvec_launch(&ex.up).is_some()
+                    && Self::metal_matvec_launch(&ex.down).is_some()
+            })
+    }
+
+    /// Append host [`KvCache`] positions that Metal already holds but host
+    /// skipped (dense-stack fast path). No-op when `cache.seq_len` is caught up.
+    #[cfg(feature = "metal")]
+    fn catch_up_host_kv_from_metal(mkv: &ferrox_metal::attn::MetalKvBuffers, cache: &mut KvCache) {
+        if cache.seq_len >= mkv.seq_len {
+            return;
+        }
+        let start = cache.seq_len;
+        let n = mkv.seq_len - start;
+        let (k, v) = mkv.tokens_host(start, n);
+        let per = cache.n_kv_heads * cache.head_dim;
+        for i in 0..n {
+            let off = i * per;
+            cache
+                .push(&k[off..off + per], &v[off..off + per])
+                .expect("unbounded/planned KvCache growth is infallible");
+        }
+    }
+
+    /// Pull every layer's Metal-ahead suffix into `kv_caches` (prefix-cache
+    /// store, continuous-batch / CPU readers). Safe no-op without Metal KV.
+    #[cfg(feature = "metal")]
+    pub fn sync_metal_attn_kv_to_host(&self, kv_caches: &mut [KvCache]) {
+        assert_eq!(kv_caches.len(), self.layers.len());
+        let Ok(guard) = self.metal_attn_kv.lock() else {
+            return;
+        };
+        let Some(metal_kvs) = guard.as_ref() else {
+            return;
+        };
+        if metal_kvs.len() != kv_caches.len() {
+            return;
+        }
+        for (mkv, cache) in metal_kvs.iter().zip(kv_caches.iter_mut()) {
+            Self::catch_up_host_kv_from_metal(mkv, cache);
+        }
+    }
+
+    /// GQA decode reduction for one token. Uses the CUDA `gqa_decode`
+    /// kernel when built with `--features cuda` and `FERROX_CUDA_GQA=1`
+    /// (falling back to the host path on any launch error), else the
+    /// portable [`causal_gqa_attention`]. With residency enabled the
+    /// K/V append stays in [`ferrox_cuda::attn::CudaKvBuffers`] so only
+    /// Q crosses the bus per call (plus a prefix refresh on append).
+    #[allow(clippy::too_many_arguments)]
+    fn gqa_attention(
+        layer: usize,
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        seq_len: usize,
+    ) -> Vec<f32> {
+        #[cfg(feature = "cuda")]
+        {
+            if cuda_gqa_enabled() {
+                match ferrox_cuda::attn::launch_gqa_decode_resident(
+                    layer, q, k, v, n_heads, n_kv_heads, head_dim, seq_len,
+                ) {
+                    Ok(out) => return out,
+                    Err(e) => {
+                        eprintln!(
+                            "ferrox: CUDA GQA resident decode failed, trying full upload: {e}"
+                        );
+                    }
+                }
+                match ferrox_cuda::attn::launch_gqa_decode(
+                    q, k, v, n_heads, n_kv_heads, head_dim, seq_len,
+                ) {
+                    Ok(out) => return out,
+                    Err(e) => {
+                        eprintln!("ferrox: CUDA GQA decode failed, host fallback: {e}");
+                    }
+                }
+            }
+        }
+        let _ = layer;
+        causal_gqa_attention(q, k, v, n_heads, n_kv_heads, head_dim, seq_len)
+    }
+
+    /// Runs one decode step for `token_id` at position `pos`, updating
+    /// `kv_caches` (one per layer) in place, and returns the logits over
+    /// the (test-scale) vocabulary.
+    pub fn forward_token(
+        &self,
+        token_id: usize,
+        pos: usize,
+        kv_caches: &mut [KvCache],
+    ) -> Vec<f32> {
+        // Clear any stale Metal resident buffer TLS from a prior decode.
+        #[cfg(feature = "metal")]
+        ferrox_metal::gpu::clear_resident_activation();
+
+        assert_eq!(kv_caches.len(), self.layers.len());
+        let hidden_dim = self.config.hidden_dim;
+        let head_dim = self.config.head_dim;
+        let n_heads = self.config.n_heads;
+        let n_kv_heads = self.config.n_kv_heads;
+
+        #[cfg(feature = "metal")]
+        let metal_embd_kind = {
+            let metal_path = ferrox_core::metal_dense_enabled()
+                && ferrox_metal::attn::metal_attn_enabled()
+                && self
+                    .layers
+                    .iter()
+                    .all(|l| self.layer_supports_metal_attn(l))
+                && self.layers.iter().all(Self::layer_supports_metal_dense_ffn);
+            // Gemma scales the embedding row (`embedding_scale`) — the GPU
+            // gather has no scale op, so dequant + scale on the host.
+            if metal_path && self.config.embedding_scale.is_none() {
+                Self::metal_matvec_launch(&self.embedding)
+                    .and_then(|l| ferrox_metal::embd::EmbdKind::from_fn_name(l.fn_name))
+            } else {
+                None
+            }
+        };
+        #[cfg(feature = "metal")]
+        let mut hidden = if metal_embd_kind.is_some() {
+            Vec::new()
+        } else {
+            self.embedding.dequant_row(token_id)
+        };
+        #[cfg(not(feature = "metal"))]
+        let mut hidden = self.embedding.dequant_row(token_id);
+        if let Some(scale) = self.config.embedding_scale {
+            for v in hidden.iter_mut() {
+                *v *= scale;
+            }
+        }
+        let residency = self.gpu_vram_budget_bytes.map(|b| self.residency_plan(b));
+
+        #[cfg(feature = "cuda")]
+        if cuda_gqa_enabled() {
+            // Fixed capacity so ensure_layer_kv does not recreate (and
+            // wipe) mid-sequence as pos grows.
+            const CUDA_KV_CAP: usize = 4096;
+            if let Err(e) = ferrox_cuda::attn::ensure_layer_kv(
+                self.layers.len(),
+                self.config.n_kv_heads,
+                self.config.head_dim,
+                CUDA_KV_CAP,
+            ) {
+                eprintln!("ferrox: CUDA KV residency init failed: {e}");
+            }
+            if pos == 0 {
+                ferrox_cuda::attn::clear_layer_kv();
+            }
+        }
+
+        #[cfg(feature = "metal")]
+        let use_metal_attn = ferrox_core::metal_dense_enabled()
+            && ferrox_metal::attn::metal_attn_enabled()
+            && self
+                .layers
+                .iter()
+                .all(|l| self.layer_supports_metal_attn(l));
+
+        #[cfg(feature = "metal")]
+        let mut metal_kv_guard: Option<
+            std::sync::MutexGuard<'_, Option<Vec<ferrox_metal::attn::MetalKvBuffers>>>,
+        > = if use_metal_attn {
+            Some(self.metal_attn_kv.lock().unwrap())
+        } else {
+            None
+        };
+
+        #[cfg(feature = "metal")]
+        if let Some(guard) = metal_kv_guard.as_mut() {
+            let need = self.layers.len();
+            let cap = kv_caches
+                .iter()
+                .map(|c| c.seq_len.max(pos + 1).saturating_add(256))
+                .max()
+                .unwrap_or(512)
+                .max(512)
+                .max(pos + 1);
+            let reset = match guard.as_ref() {
+                None => true,
+                Some(v) => {
+                    if v.len() != need || v.iter().any(|m| m.capacity() < pos + 1) {
+                        // Growing / reshaping: preserve Metal-ahead tokens on host first.
+                        if v.len() == need {
+                            for (m, c) in v.iter().zip(kv_caches.iter_mut()) {
+                                Self::catch_up_host_kv_from_metal(m, c);
+                            }
+                        }
+                        true
+                    } else if v.iter().all(|m| m.seq_len == pos) {
+                        // Metal already holds tokens [0, pos). Host may lag
+                        // after dense-stack decode — do not re-upload from host.
+                        false
+                    } else {
+                        // Stale Metal (new request / prefix restore): rebuild from host.
+                        true
+                    }
+                }
+            };
+            if reset {
+                let mut bufs = Vec::with_capacity(need);
+                for _ in 0..need {
+                    match ferrox_metal::attn::MetalKvBuffers::with_capacity(
+                        n_kv_heads, head_dim, cap,
+                    ) {
+                        Ok(b) => bufs.push(b),
+                        Err(_) => {
+                            **guard = None;
+                            break;
+                        }
+                    }
+                }
+                if bufs.len() == need {
+                    // Sync from host after CPU prefill / prefix restore / capacity grow.
+                    let mut ok = true;
+                    for (m, c) in bufs.iter_mut().zip(kv_caches.iter()) {
+                        if c.seq_len > 0 && m.upload_from_host(&c.k, &c.v, c.seq_len).is_err() {
+                            ok = false;
+                            break;
+                        }
+                    }
+                    if ok {
+                        **guard = Some(bufs);
+                    } else {
+                        **guard = None;
+                    }
+                } else {
+                    **guard = None;
+                }
+            }
+        }
+
+        #[cfg(feature = "metal")]
+        let mut metal_stack_done = false;
+        #[cfg(feature = "metal")]
+        let mut final_norm_done_in_stack = false;
+        #[cfg(feature = "metal")]
+        if use_metal_attn && self.layers.iter().all(Self::layer_supports_metal_dense_ffn) {
+            if let Some(guard) = metal_kv_guard.as_mut() {
+                let mut clear_metal_after_stack = false;
+                if let Some(metal_kvs) = guard.as_mut() {
+                    let seq_ok = metal_kvs.iter().all(|m| m.seq_len == pos);
+                    if seq_ok {
+                        // Build launches only for resident dense experts (Llama path).
+                        let mut dense_layers = Vec::with_capacity(self.layers.len());
+                        let mut ok = true;
+                        for (li, layer) in self.layers.iter().enumerate() {
+                            let ExpertBacking::Resident(experts) = &layer.moe.experts else {
+                                ok = false;
+                                break;
+                            };
+                            let ex = &experts[0];
+                            let (Some(q), Some(k), Some(v), Some(o), Some(g), Some(u), Some(d)) = (
+                                Self::metal_matvec_launch(&layer.attn.q_proj),
+                                Self::metal_matvec_launch(&layer.attn.k_proj),
+                                Self::metal_matvec_launch(&layer.attn.v_proj),
+                                Self::metal_matvec_launch(&layer.attn.o_proj),
+                                Self::metal_matvec_launch(&ex.gate),
+                                Self::metal_matvec_launch(&ex.up),
+                                Self::metal_matvec_launch(&ex.down),
+                            ) else {
+                                ok = false;
+                                break;
+                            };
+                            dense_layers.push(ferrox_metal::attn::DenseLayerMetal {
+                                attn_norm_w: &layer.attn.norm_weight,
+                                ffn_norm_w: &layer.moe.norm_weight,
+                                q,
+                                k,
+                                v,
+                                o,
+                                gate: g,
+                                up: u,
+                                down: d,
+                                extras: Self::metal_attn_extras(layer),
+                                rope_theta: {
+                                    let t = self.config.layer_rope_theta(li);
+                                    (t != self.config.rope_theta).then_some(t)
+                                },
+                                window: self.config.layer_sliding_window(li),
+                                post_attn_norm: layer.attn.post_attn_norm.as_deref(),
+                                post_ffn_norm: layer.attn.post_ffn_norm.as_deref(),
+                            });
+                        }
+                        if ok {
+                            // Prefer greedy GPU argmax-in-stack (1×u32 download)
+                            // when generate marked this thread for temperature<=0.
+                            // Else opt-in FERROX_METAL_LOGITS downloads full vocab
+                            // (often slower). Default: host lm_head after hidden.
+                            let greedy_gpu = ferrox_metal::attn::metal_greedy_argmax_active();
+                            let out_launch =
+                                if greedy_gpu || ferrox_metal::attn::metal_logits_enabled() {
+                                    Self::metal_matvec_launch(&self.output_head)
+                                } else {
+                                    None
+                                };
+                            let lm_head_gpu_launch = Self::metal_matvec_launch(&self.output_head);
+                            // Pass final_norm_w when: (1) lm_head runs in stack (out_launch),
+                            // OR (2) lm_head will route to GPU after stack (lm_head_gpu_launch
+                            // but no out_launch) so we can skip download→reupload via TLS.
+                            let final_norm_w =
+                                if out_launch.is_some() || lm_head_gpu_launch.is_some() {
+                                    Some(self.final_norm.as_slice())
+                                } else {
+                                    None
+                                };
+                            let embd_launch = Self::metal_matvec_launch(&self.embedding);
+                            // Gemma scales the embedding row on the host
+                            // (`hidden` already carries sqrt(hidden_dim));
+                            // the GPU gather has no scale op — skip it.
+                            let embd_gather = if self.config.embedding_scale.is_some() {
+                                None
+                            } else {
+                                match (metal_embd_kind, embd_launch.as_ref()) {
+                                    (Some(kind), Some(launch)) => {
+                                        Some(ferrox_metal::attn::EmbdGatherMetal {
+                                            kind,
+                                            weights: launch.weights,
+                                            rows: launch.rows,
+                                            row_bytes: launch.row_bytes,
+                                            n_cols: hidden_dim,
+                                            token_id,
+                                        })
+                                    }
+                                    _ => None,
+                                }
+                            };
+                            let hidden_ref: &[f32] =
+                                if embd_gather.is_some() { &[] } else { &hidden };
+                            match ferrox_metal::attn::launch_decode_dense_stack(
+                                hidden_ref,
+                                &dense_layers,
+                                metal_kvs,
+                                n_heads,
+                                self.metal_rope_layout(),
+                                self.config.rope_theta,
+                                self.config.rope_freqs.as_deref(),
+                                pos,
+                                self.config.rms_norm_eps,
+                                final_norm_w,
+                                out_launch.as_ref(),
+                                greedy_gpu && out_launch.is_some(),
+                                embd_gather.as_ref(),
+                                matches!(
+                                    self.config.ffn_activation,
+                                    crate::config::FfnActivation::Gelu
+                                ),
+                            ) {
+                                Ok(out) => {
+                                    // Metal KV advanced in-place. Skip host
+                                    // last_token_host+push — host may lag until
+                                    // sync_metal_attn_kv_to_host / CPU fallback.
+                                    for layer in &self.layers {
+                                        layer.moe.record_activations(&[0]);
+                                    }
+                                    if out_launch.is_some() {
+                                        // Stack returned logits or [argmax id] —
+                                        // skip host final_norm/lm_head. Clear TLS.
+                                        #[cfg(feature = "metal")]
+                                        ferrox_metal::gpu::clear_resident_activation();
+                                        return out;
+                                    }
+                                    // Stack downloaded hidden (possibly normalized if
+                                    // final_norm_w was Some). Track whether host should
+                                    // skip final_norm.
+                                    final_norm_done_in_stack = final_norm_w.is_some();
+                                    hidden = out;
+                                    metal_stack_done = true;
+                                }
+                                Err(e) => {
+                                    eprintln!(
+                                        "ferrox: Metal dense stack failed, per-layer fallback: {e}"
+                                    );
+                                    if hidden.is_empty() {
+                                        hidden = self.embedding.dequant_row(token_id);
+                                        if let Some(scale) = self.config.embedding_scale {
+                                            for v in hidden.iter_mut() {
+                                                *v *= scale;
+                                            }
+                                        }
+                                    }
+                                    // Preserve any prior Metal-ahead tokens on host
+                                    // before dropping the device buffers.
+                                    for (m, c) in metal_kvs.iter().zip(kv_caches.iter_mut()) {
+                                        Self::catch_up_host_kv_from_metal(m, c);
+                                    }
+                                    clear_metal_after_stack = true;
+                                }
+                            }
+                        }
+                    }
+                }
+                if clear_metal_after_stack {
+                    **guard = None;
+                }
+            }
+        }
+
+        #[cfg(feature = "metal")]
+        let run_cpu_layers = !metal_stack_done;
+        #[cfg(not(feature = "metal"))]
+        let run_cpu_layers = true;
+
+        if run_cpu_layers {
+            for (l, (layer, cache)) in self.layers.iter().zip(kv_caches.iter_mut()).enumerate() {
+                // --- attention block ---
+                let normed = rms_norm(&hidden, &layer.attn.norm_weight, self.config.rms_norm_eps);
+
+                #[cfg(feature = "metal")]
+                {
+                    let mut did_metal_attn = false;
+                    let mut did_metal_dense = false;
+                    let mut clear_metal_kv = false;
+                    if let Some(guard) = metal_kv_guard.as_mut() {
+                        if let Some(metal_kvs) = guard.as_mut() {
+                            // Metal-authoritative: host may lag after dense-stack skip.
+                            // Stack-only features (SWA / sandwich norms / GeGLU /
+                            // per-layer theta) are NOT encoded by the per-layer
+                            // launches — those layers must go to CPU here.
+                            if metal_kvs[l].seq_len == pos
+                                && !self.layer_needs_metal_stack(layer, l)
+                            {
+                                if let (Some(q_l), Some(k_l), Some(v_l), Some(o_l)) = (
+                                    Self::metal_matvec_launch(&layer.attn.q_proj),
+                                    Self::metal_matvec_launch(&layer.attn.k_proj),
+                                    Self::metal_matvec_launch(&layer.attn.v_proj),
+                                    Self::metal_matvec_launch(&layer.attn.o_proj),
+                                ) {
+                                    // Full dense layer on one CB when FFN is Metal-capable.
+                                    if Self::layer_supports_metal_dense_ffn(layer) {
+                                        let dense_ok = layer.moe.with_expert(0, |ex| {
+                                        let (Some(g_l), Some(u_l), Some(d_l)) = (
+                                            Self::metal_matvec_launch(&ex.gate),
+                                            Self::metal_matvec_launch(&ex.up),
+                                            Self::metal_matvec_launch(&ex.down),
+                                        ) else {
+                                            return false;
+                                        };
+                                        match ferrox_metal::attn::launch_decode_dense_layer(
+                                            &hidden,
+                                            &layer.attn.norm_weight,
+                                            &q_l,
+                                            &k_l,
+                                            &v_l,
+                                            &o_l,
+                                            &mut metal_kvs[l],
+                                            &layer.moe.norm_weight,
+                                            &g_l,
+                                            &u_l,
+                                            &d_l,
+                                            n_heads,
+                                            self.metal_rope_layout(),
+                                            self.config.rope_theta,
+                                            self.config.rope_freqs.as_deref(),
+                                            pos,
+                                            self.config.rms_norm_eps,
+                                            &Self::metal_attn_extras(layer),
+                                        ) {
+                                            Ok(new_h) => {
+                                                // Catch up any dense-stack lag + this token.
+                                                Self::catch_up_host_kv_from_metal(
+                                                    &metal_kvs[l],
+                                                    cache,
+                                                );
+                                                layer.moe.record_activations(&[0]);
+                                                hidden = new_h;
+                                                true
+                                            }
+                                            Err(e) => {
+                                                eprintln!(
+                                                    "ferrox: Metal dense layer failed, CPU fallback: {e}"
+                                                );
+                                                false
+                                            }
+                                        }
+                                    });
+                                        if dense_ok {
+                                            did_metal_dense = true;
+                                            did_metal_attn = true;
+                                        } else if metal_kvs[l].seq_len != cache.seq_len {
+                                            // Dense path may have advanced Metal KV before failing.
+                                            Self::catch_up_host_kv_from_metal(&metal_kvs[l], cache);
+                                            clear_metal_kv = true;
+                                        }
+                                    }
+
+                                    if !did_metal_dense && !clear_metal_kv {
+                                        match ferrox_metal::attn::launch_decode_attn_block(
+                                            &normed,
+                                            &q_l,
+                                            &k_l,
+                                            &v_l,
+                                            &o_l,
+                                            &mut metal_kvs[l],
+                                            n_heads,
+                                            self.metal_rope_layout(),
+                                            self.config.rope_theta,
+                                            self.config.rope_freqs.as_deref(),
+                                            pos,
+                                            &Self::metal_attn_extras(layer),
+                                            self.config.rms_norm_eps,
+                                        ) {
+                                            Ok(projected) => {
+                                                Self::catch_up_host_kv_from_metal(
+                                                    &metal_kvs[l],
+                                                    cache,
+                                                );
+                                                for (h, p) in
+                                                    hidden.iter_mut().zip(projected.iter())
+                                                {
+                                                    *h += p;
+                                                }
+                                                did_metal_attn = true;
+                                            }
+                                            Err(e) => {
+                                                eprintln!(
+                                                "ferrox: Metal attn block failed, CPU fallback: {e}"
+                                            );
+                                                Self::catch_up_host_kv_from_metal(
+                                                    &metal_kvs[l],
+                                                    cache,
+                                                );
+                                                clear_metal_kv = true;
+                                            }
+                                        }
+                                    }
+                                }
+                            } else if metal_kvs[l].seq_len > cache.seq_len {
+                                // Leaving Metal path: host must see full KV for CPU attn.
+                                Self::catch_up_host_kv_from_metal(&metal_kvs[l], cache);
+                            }
+                        }
+                        if clear_metal_kv {
+                            **guard = None;
+                        }
+                    }
+                    if did_metal_attn {
+                        if !did_metal_dense {
+                            let normed2 =
+                                rms_norm(&hidden, &layer.moe.norm_weight, self.config.rms_norm_eps);
+                            let ffn_out = Self::run_ffn_block(
+                                layer,
+                                &normed2,
+                                &self.config,
+                                hidden_dim,
+                                residency.as_ref().map(|p| p.layer_plan(l)),
+                            );
+                            for (h, f) in hidden.iter_mut().zip(ffn_out.iter()) {
+                                *h += f;
+                            }
+                        }
+                        continue;
+                    }
+                }
+
+                let (mut q, mut k, mut v) = {
+                    #[cfg(any(feature = "cuda", feature = "metal"))]
+                    {
+                        if let Some(mut outs) = ferrox_core::WeightMatrix::apply_gpu_multi(
+                            &[&layer.attn.q_proj, &layer.attn.k_proj, &layer.attn.v_proj],
+                            &normed,
+                        ) {
+                            let v = outs.pop().unwrap();
+                            let k = outs.pop().unwrap();
+                            let q = outs.pop().unwrap();
+                            (q, k, v)
+                        } else {
+                            (
+                                layer.attn.q_proj.apply(&normed),
+                                layer.attn.k_proj.apply(&normed),
+                                layer.attn.v_proj.apply(&normed),
+                            )
+                        }
+                    }
+                    #[cfg(not(any(feature = "cuda", feature = "metal")))]
+                    {
+                        (
+                            layer.attn.q_proj.apply(&normed),
+                            layer.attn.k_proj.apply(&normed),
+                            layer.attn.v_proj.apply(&normed),
+                        )
+                    }
+                };
+
+                if let Some(bias) = &layer.attn.q_bias {
+                    for (x, b) in q.iter_mut().zip(bias.iter()) {
+                        *x += b;
+                    }
+                }
+                if let Some(bias) = &layer.attn.k_bias {
+                    for (x, b) in k.iter_mut().zip(bias.iter()) {
+                        *x += b;
+                    }
+                }
+                if let Some(bias) = &layer.attn.v_bias {
+                    for (x, b) in v.iter_mut().zip(bias.iter()) {
+                        *x += b;
+                    }
+                }
+
+                if let Some(q_norm) = &layer.attn.q_norm {
+                    q = self.apply_qk_norm(&q, q_norm);
+                }
+                if let Some(k_norm) = &layer.attn.k_norm {
+                    k = self.apply_qk_norm(&k, k_norm);
+                }
+
+                for h in 0..n_heads {
+                    self.apply_rope_head_layer(&mut q[h * head_dim..(h + 1) * head_dim], pos, l);
+                }
+                for h in 0..n_kv_heads {
+                    self.apply_rope_head_layer(&mut k[h * head_dim..(h + 1) * head_dim], pos, l);
+                }
+                // When an architecture overrides the score scale (llama.cpp
+                // Gemma scales Q then calls build_attn with 1.0), compensate
+                // for the kernel's built-in 1/sqrt(head_dim) so the net
+                // score scale equals `attention_scale`.
+                if let Some(scale) = self.config.attention_scale {
+                    let compensate = scale * (head_dim as f32).sqrt();
+                    for v in q.iter_mut() {
+                        *v *= compensate;
+                    }
+                }
+
+                cache
+                    .push(&k, &v)
+                    .expect("unbounded/planned KvCache growth is infallible");
+
+                let attn_out = match self.config.layer_sliding_window(l) {
+                    Some(window) => causal_gqa_attention_windowed(
+                        &q,
+                        &cache.k,
+                        &cache.v,
+                        n_heads,
+                        n_kv_heads,
+                        head_dim,
+                        cache.seq_len,
+                        window,
+                    ),
+                    None => Self::gqa_attention(
+                        l,
+                        &q,
+                        &cache.k,
+                        &cache.v,
+                        n_heads,
+                        n_kv_heads,
+                        head_dim,
+                        cache.seq_len,
+                    ),
+                };
+                let mut projected = layer.attn.o_proj.apply(&attn_out);
+                if let Some(post) = &layer.attn.post_attn_norm {
+                    projected = rms_norm(&projected, post, self.config.rms_norm_eps);
+                }
+
+                for (h, p) in hidden.iter_mut().zip(projected.iter()) {
+                    *h += p;
+                }
+
+                // --- MoE FFN block ---
+                let normed2 = rms_norm(&hidden, &layer.moe.norm_weight, self.config.rms_norm_eps);
+                let mut ffn_out = Self::run_ffn_block(
+                    layer,
+                    &normed2,
+                    &self.config,
+                    hidden_dim,
+                    residency.as_ref().map(|p| p.layer_plan(l)),
+                );
+                if let Some(post) = &layer.attn.post_ffn_norm {
+                    ffn_out = rms_norm(&ffn_out, post, self.config.rms_norm_eps);
+                }
+                for (h, f) in hidden.iter_mut().zip(ffn_out.iter()) {
+                    *h += f;
+                }
+            }
+        } // run_cpu_layers
+
+        // If Metal stack already ran final_norm, hidden is normalized; else
+        // normalize here.
+        #[cfg(feature = "metal")]
+        let final_normed = if final_norm_done_in_stack {
+            hidden.clone()
+        } else {
+            rms_norm(&hidden, &self.final_norm, self.config.rms_norm_eps)
+        };
+        #[cfg(not(feature = "metal"))]
+        let final_normed = rms_norm(&hidden, &self.final_norm, self.config.rms_norm_eps);
+
+        let mut logits = self.output_head.apply(&final_normed);
+        if let Some(sc) = self.config.final_logit_softcap {
+            softcap_inplace(&mut logits, sc);
+        }
+        // Clear Metal resident buffer TLS after lm_head (may have consumed it).
+        #[cfg(feature = "metal")]
+        ferrox_metal::gpu::clear_resident_activation();
+        logits
+    }
+
+    /// Same computation as `forward_token`, but each layer's K/V cache
+    /// is a `PagedKvCache` (block-table-indexed into a per-layer
+    /// `PagedKvStore`) instead of a `KvCache`'s contiguous buffer --
+    /// exercises `causal_gqa_attention_paged` in a real decode loop
+    /// instead of only in isolation. `kv_caches`/`stores` are parallel
+    /// per-layer arrays, mirroring `forward_token`'s `kv_caches: &mut
+    /// [KvCache]`. Must produce bit-identical output to `forward_token`
+    /// given stores sized so no layer ever exhausts its blocks --
+    /// pinned by
+    /// `forward_token_paged_matches_forward_token_bit_identical`.
+    pub fn forward_token_paged(
+        &self,
+        token_id: usize,
+        pos: usize,
+        kv_caches: &mut [PagedKvCache],
+        stores: &mut [PagedKvStore],
+    ) -> Result<Vec<f32>, PagedStoreExhausted> {
+        assert_eq!(kv_caches.len(), self.layers.len());
+        assert_eq!(stores.len(), self.layers.len());
+        let hidden_dim = self.config.hidden_dim;
+        let head_dim = self.config.head_dim;
+        let n_heads = self.config.n_heads;
+        let n_kv_heads = self.config.n_kv_heads;
+
+        let mut hidden = self.embedding.dequant_row(token_id);
+        let residency = self.gpu_vram_budget_bytes.map(|b| self.residency_plan(b));
+
+        for (l, ((layer, cache), store)) in self
+            .layers
+            .iter()
+            .zip(kv_caches.iter_mut())
+            .zip(stores.iter_mut())
+            .enumerate()
+        {
+            // --- attention block ---
+            let normed = rms_norm(&hidden, &layer.attn.norm_weight, self.config.rms_norm_eps);
+
+            let (mut q, mut k, mut v) = {
+                #[cfg(any(feature = "cuda", feature = "metal"))]
+                {
+                    if let Some(mut outs) = ferrox_core::WeightMatrix::apply_gpu_multi(
+                        &[&layer.attn.q_proj, &layer.attn.k_proj, &layer.attn.v_proj],
+                        &normed,
+                    ) {
+                        let v = outs.pop().unwrap();
+                        let k = outs.pop().unwrap();
+                        let q = outs.pop().unwrap();
+                        (q, k, v)
+                    } else {
+                        (
+                            layer.attn.q_proj.apply(&normed),
+                            layer.attn.k_proj.apply(&normed),
+                            layer.attn.v_proj.apply(&normed),
+                        )
+                    }
+                }
+                #[cfg(not(any(feature = "cuda", feature = "metal")))]
+                {
+                    (
+                        layer.attn.q_proj.apply(&normed),
+                        layer.attn.k_proj.apply(&normed),
+                        layer.attn.v_proj.apply(&normed),
+                    )
+                }
+            };
+
+            if let Some(bias) = &layer.attn.q_bias {
+                for (x, b) in q.iter_mut().zip(bias.iter()) {
+                    *x += b;
+                }
+            }
+            if let Some(bias) = &layer.attn.k_bias {
+                for (x, b) in k.iter_mut().zip(bias.iter()) {
+                    *x += b;
+                }
+            }
+            if let Some(bias) = &layer.attn.v_bias {
+                for (x, b) in v.iter_mut().zip(bias.iter()) {
+                    *x += b;
+                }
+            }
+
+            if let Some(q_norm) = &layer.attn.q_norm {
+                q = self.apply_qk_norm(&q, q_norm);
+            }
+            if let Some(k_norm) = &layer.attn.k_norm {
+                k = self.apply_qk_norm(&k, k_norm);
+            }
+
+            for h in 0..n_heads {
+                self.apply_rope_head_layer(&mut q[h * head_dim..(h + 1) * head_dim], pos, l);
+            }
+            for h in 0..n_kv_heads {
+                self.apply_rope_head_layer(&mut k[h * head_dim..(h + 1) * head_dim], pos, l);
+            }
+
+            cache.push(store, &k, &v)?;
+
+            let attn_out = causal_gqa_attention_paged(
+                &q,
+                store,
+                cache.block_table(),
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                cache.seq_len(),
+            );
+            let projected = layer.attn.o_proj.apply(&attn_out);
+
+            for (h, p) in hidden.iter_mut().zip(projected.iter()) {
+                *h += p;
+            }
+
+            // --- MoE FFN block ---
+            let normed2 = rms_norm(&hidden, &layer.moe.norm_weight, self.config.rms_norm_eps);
+            let ffn_out = Self::run_ffn_block(
+                layer,
+                &normed2,
+                &self.config,
+                hidden_dim,
+                residency.as_ref().map(|p| p.layer_plan(l)),
+            );
+            for (h, f) in hidden.iter_mut().zip(ffn_out.iter()) {
+                *h += f;
+            }
+        }
+
+        let final_normed = rms_norm(&hidden, &self.final_norm, self.config.rms_norm_eps);
+        Ok(self.output_head.apply(&final_normed))
+    }
+
+    /// The shared expert store's live counters, when this model runs
+    /// with store-backed (streamed) routed experts -- `None` for fully
+    /// resident models. Every store-backed layer shares one store, so
+    /// the first one found speaks for the whole model.
+    pub fn expert_store_stats(&self) -> Option<ferrox_core::expert_store::ExpertStoreStats> {
+        self.layers.iter().find_map(|l| match &l.moe.experts {
+            ExpertBacking::Stored { store, .. } => Some(store.stats()),
+            ExpertBacking::Resident(_) => None,
+        })
+    }
+
+    /// Builds one global device-residency plan across ALL layers'
+    /// routed experts against the single configured VRAM budget --
+    /// every `(layer, expert)` candidate competes in one hotness-
+    /// ordered pass and the running byte total is shared, so the
+    /// budget cannot be re-spent per layer (the accounting bug the
+    /// earlier per-layer `placement_plan` calls had: N layers would
+    /// plan N x the configured bytes). Dense layers contribute no
+    /// candidates (their sole expert always runs on CPU). Rebuilt per
+    /// forward call so it tracks observed hotness; not yet
+    /// performance-tuned, a disclosed limit.
+    fn residency_plan(&self, vram_budget_bytes: u64) -> ferrox_moe::ResidencyPlan {
+        let mut sizes_per_layer: Vec<Vec<usize>> = Vec::with_capacity(self.layers.len());
+        let mut counts_per_layer: Vec<Vec<u64>> = Vec::with_capacity(self.layers.len());
+        let mut any_observed = false;
+        for layer in &self.layers {
+            if Self::is_dense_layer(layer) {
+                sizes_per_layer.push(Vec::new());
+                counts_per_layer.push(Vec::new());
+                continue;
+            }
+            sizes_per_layer.push(
+                (0..layer.moe.n_experts())
+                    .map(|e| layer.moe.expert_bytes(e))
+                    .collect(),
+            );
+            let counts: Vec<u64> = layer
+                .moe
+                .activation_counts
+                .iter()
+                .map(|c| c.load(Ordering::Relaxed))
+                .collect();
+            any_observed |= counts.iter().any(|&c| c > 0);
+            counts_per_layer.push(counts);
+        }
+        PlacementPlan::plan_layers_against_global_budget(
+            &sizes_per_layer,
+            any_observed.then_some(counts_per_layer.as_slice()),
+            vram_budget_bytes,
+        )
+    }
+
+    /// True if this layer has nothing to route: exactly one expert and
+    /// no shared experts, the shape every non-MoE model (and every
+    /// DeepSeek-style "leading dense layer") loads as. Top-1 selection
+    /// out of one expert always picks it, and its weight is always
+    /// exactly 1.0 regardless of gating function (softmax over one
+    /// logit is trivially 1.0; sigmoid-then-renormalize divides the
+    /// selected score by itself) -- so skipping the router matmul,
+    /// `route_top_k`'s sort/exp/renormalize work, and
+    /// `combine_expert_outputs`'s Vec-wrapping for this case is not an
+    /// approximation, it produces the exact same result.
+    fn is_dense_layer(layer: &LayerWeights) -> bool {
+        layer.moe.n_experts() == 1 && layer.moe.shared_experts.is_empty()
+    }
+
+    /// Runs one position's normalized hidden state through this
+    /// layer's MoE FFN block, given already-computed router logits for
+    /// that position, returning the combined output to add back into
+    /// the residual stream. Shared by `forward_token` (router computed
+    /// via a single `apply` call, since there's only one position) and
+    /// `forward_batch`'s per-position loop (router computed via one
+    /// batched `apply_batch` call up front, sliced per position here --
+    /// see `forward_batch`'s doc comment for why that batching matters
+    /// and must not be lost by calling this per position instead).
+    /// `gpu_vram_budget_bytes`: see `Decoder::gpu_vram_budget_bytes`'s
+    /// doc comment -- `None` dispatches every routed expert through
+    /// `run_expert_placed` with `ExpertPlacement::Cpu`, which is
+    /// exactly `run_expert`'s own behavior, so this is a real
+    /// zero-behavior-change default, not just "probably fine."
+    fn combine_ffn_outputs_for_position(
+        layer: &LayerWeights,
+        normed2: &[f32],
+        router_logits: &[f32],
+        config: &ModelConfig,
+        hidden_dim: usize,
+        plan: Option<&PlacementPlan>,
+    ) -> Vec<f32> {
+        let decision = match (
+            config.moe.expert_group_count,
+            config.moe.expert_group_used_count,
+        ) {
+            (Some(n_groups), Some(k_per_group)) if n_groups > 1 && k_per_group > 0 => {
+                ferrox_moe::route_top_k_grouped(
+                    router_logits,
+                    n_groups,
+                    k_per_group,
+                    config.moe.n_experts_active,
+                    config.moe.gating,
+                    config.moe.norm_topk_prob,
+                )
+            }
+            _ => route_top_k(
+                router_logits,
+                config.moe.n_experts_active,
+                config.moe.gating,
+                config.moe.norm_topk_prob,
+            ),
+        };
+        layer.moe.record_activations(&decision.expert_ids);
+        // Best-effort warm of the routed experts for this layer into
+        // the store cache (SSD streaming overlap). Resident-backed
+        // layers skip this entirely.
+        if let ExpertBacking::Stored {
+            store,
+            layer: layer_id,
+            ..
+        } = &layer.moe.experts
+        {
+            let keys: Vec<ferrox_core::expert_store::ExpertKey> = decision
+                .expert_ids
+                .iter()
+                .map(|&eid| ferrox_core::expert_store::ExpertKey {
+                    layer: *layer_id,
+                    expert: eid as u32,
+                })
+                .collect();
+            store.prefetch(&keys);
+        }
+        let routed_outputs: Vec<(Vec<f32>, f32)> = decision
+            .expert_ids
+            .iter()
+            .zip(decision.weights.iter())
+            .map(|(&eid, &w)| {
+                let placement = plan
+                    .map(|p| p.placement_for(eid))
+                    .unwrap_or(ExpertPlacement::Cpu);
+                (
+                    layer
+                        .moe
+                        .with_expert(eid, |ex| run_expert_placed(normed2, ex, placement)),
+                    w,
+                )
+            })
+            .collect();
+        // Shared experts fire on every token regardless of routing, so
+        // there's no offload decision to make for them the way there
+        // is for routed experts -- always CPU, matching `run_expert`.
+        let mut shared_outputs: Vec<Vec<f32>> = layer
+            .moe
+            .shared_experts
+            .iter()
+            .map(|e| run_expert(normed2, e))
+            .collect();
+        // Qwen2-MoE-specific: see `MoeWeights::shared_expert_gate`'s doc
+        // comment. Scaling here (before `combine_expert_outputs`, which
+        // is architecture-agnostic and knows nothing about this gate)
+        // keeps the gate a decoder-level detail, not a ferrox-moe API
+        // change.
+        if let Some(gate) = &layer.moe.shared_expert_gate {
+            let gate_logit: f32 = gate.iter().zip(normed2.iter()).map(|(g, x)| g * x).sum();
+            let gate_value = 1.0 / (1.0 + (-gate_logit).exp());
+            for out in shared_outputs.iter_mut() {
+                for x in out.iter_mut() {
+                    *x *= gate_value;
+                }
+            }
+        }
+
+        combine_expert_outputs(&routed_outputs, &shared_outputs, hidden_dim)
+    }
+
+    /// `forward_token`'s MoE FFN block for one position: the dense
+    /// fast path (see `is_dense_layer`) or the full router+combine path
+    /// with the router computed inline via a single-position `apply`.
+    fn run_ffn_block(
+        layer: &LayerWeights,
+        normed2: &[f32],
+        config: &ModelConfig,
+        hidden_dim: usize,
+        plan: Option<&PlacementPlan>,
+    ) -> Vec<f32> {
+        if Self::is_dense_layer(layer) {
+            layer.moe.record_activations(&[0]);
+            return layer.moe.with_expert(0, |ex| match config.ffn_activation {
+                crate::config::FfnActivation::Swiglu
+                | crate::config::FfnActivation::SwigluFused => run_expert(normed2, ex),
+                crate::config::FfnActivation::Gelu => {
+                    let gate = ex.gate.apply(normed2);
+                    let up = ex.up.apply(normed2);
+                    let activated = geglu(&gate, &up);
+                    ex.down.apply(&activated)
+                }
+            });
+        }
+        let router_logits = layer.moe.router.apply(normed2);
+        Self::combine_ffn_outputs_for_position(
+            layer,
+            normed2,
+            &router_logits,
+            config,
+            hidden_dim,
+            plan,
+        )
+    }
+
+    /// Processes multiple new positions in one call instead of calling
+    /// `forward_token` once per position. `tokens[i]` is the token at
+    /// absolute position `start_pos + i`; all positions attend
+    /// causally (position `i` sees positions `0..=i` of this batch
+    /// plus everything already in `kv_caches`, nothing later).
+    ///
+    /// The attention block's Q/K/V/O projections and the MoE router
+    /// are computed as batched matmuls (`WeightMatrix::apply_batch`),
+    /// which for quantized weights means each weight row is read from
+    /// memory once and dotted against every position in the batch,
+    /// not once per position -- see `apply_batch`'s doc comment for
+    /// why that's a real memory-bandwidth saving, not just fewer
+    /// function calls. The expert FFN stage is *not* batched: which
+    /// expert(s) a position routes to is data-dependent per position,
+    /// so positions routed to different experts can't share a single
+    /// matmul the way the shared Q/K/V/router projections can. RoPE
+    /// and attention itself (causal masking, softmax) are also
+    /// per-position, since they're cheap relative to the matmuls and
+    /// batching them would add complexity for little benefit.
+    ///
+    /// This is what makes prompt-lookup speculative decoding
+    /// (`speculative` module) actually save work rather than just
+    /// reshuffle it: verifying `k` draft tokens costs one batched call
+    /// here, not `k` calls to `forward_token`.
+    pub fn forward_batch(
+        &self,
+        tokens: &[usize],
+        start_pos: usize,
+        kv_caches: &mut [KvCache],
+    ) -> Vec<Vec<f32>> {
+        assert_eq!(kv_caches.len(), self.layers.len());
+        let batch_size = tokens.len();
+        if batch_size == 0 {
+            return Vec::new();
+        }
+
+        let hidden_dim = self.config.hidden_dim;
+        let head_dim = self.config.head_dim;
+        let n_heads = self.config.n_heads;
+        let n_kv_heads = self.config.n_kv_heads;
+
+        // [batch, hidden], flattened row-major.
+        let mut hidden_batch: Vec<f32> = tokens
+            .iter()
+            .flat_map(|&t| self.embedding.dequant_row(t))
+            .collect();
+        if let Some(scale) = self.config.embedding_scale {
+            for v in hidden_batch.iter_mut() {
+                *v *= scale;
+            }
+        }
+
+        let residency = self.gpu_vram_budget_bytes.map(|b| self.residency_plan(b));
+
+        #[cfg(feature = "metal")]
+        let use_metal_attn = ferrox_core::metal_dense_enabled()
+            && ferrox_metal::attn::metal_attn_enabled()
+            && self
+                .layers
+                .iter()
+                .all(|l| self.layer_supports_metal_attn(l));
+
+        #[cfg(feature = "metal")]
+        let mut metal_kv_guard: Option<
+            std::sync::MutexGuard<'_, Option<Vec<ferrox_metal::attn::MetalKvBuffers>>>,
+        > = if use_metal_attn {
+            Some(self.metal_attn_kv.lock().unwrap())
+        } else {
+            None
+        };
+
+        #[cfg(feature = "metal")]
+        if let Some(guard) = metal_kv_guard.as_mut() {
+            let need = self.layers.len();
+            let need_cap = start_pos
+                .saturating_add(batch_size)
+                .saturating_add(256)
+                .max(512);
+            let reset = match guard.as_ref() {
+                None => true,
+                Some(v) => {
+                    v.len() != need
+                        || v.iter().any(|m| m.capacity() < need_cap)
+                        || v.iter()
+                            .zip(kv_caches.iter())
+                            .any(|(m, c)| m.seq_len != c.seq_len)
+                }
+            };
+            if reset {
+                let mut bufs = Vec::with_capacity(need);
+                for _ in 0..need {
+                    match ferrox_metal::attn::MetalKvBuffers::with_capacity(
+                        n_kv_heads, head_dim, need_cap,
+                    ) {
+                        Ok(b) => bufs.push(b),
+                        Err(_) => {
+                            **guard = None;
+                            break;
+                        }
+                    }
+                }
+                if bufs.len() == need {
+                    let mut ok = true;
+                    for (m, c) in bufs.iter_mut().zip(kv_caches.iter()) {
+                        if c.seq_len > 0 && m.upload_from_host(&c.k, &c.v, c.seq_len).is_err() {
+                            ok = false;
+                            break;
+                        }
+                    }
+                    if ok {
+                        **guard = Some(bufs);
+                    } else {
+                        **guard = None;
+                    }
+                } else {
+                    **guard = None;
+                }
+            }
+        }
+
+        for (l, (layer, cache)) in self.layers.iter().zip(kv_caches.iter_mut()).enumerate() {
+            // --- attention block ---
+            let normed_batch: Vec<f32> = hidden_batch
+                .chunks(hidden_dim)
+                .flat_map(|h| rms_norm(h, &layer.attn.norm_weight, self.config.rms_norm_eps))
+                .collect();
+
+            let mut q_batch = layer.attn.q_proj.apply_batch(&normed_batch, batch_size);
+            let mut k_batch = layer.attn.k_proj.apply_batch(&normed_batch, batch_size);
+            let mut v_batch = layer.attn.v_proj.apply_batch(&normed_batch, batch_size);
+
+            let q_width = n_heads * head_dim;
+            let kv_width = n_kv_heads * head_dim;
+
+            if let Some(bias) = &layer.attn.q_bias {
+                for row in q_batch.chunks_mut(q_width) {
+                    for (x, b) in row.iter_mut().zip(bias.iter()) {
+                        *x += b;
+                    }
+                }
+            }
+            if let Some(bias) = &layer.attn.k_bias {
+                for row in k_batch.chunks_mut(kv_width) {
+                    for (x, b) in row.iter_mut().zip(bias.iter()) {
+                        *x += b;
+                    }
+                }
+            }
+            if let Some(bias) = &layer.attn.v_bias {
+                for row in v_batch.chunks_mut(kv_width) {
+                    for (x, b) in row.iter_mut().zip(bias.iter()) {
+                        *x += b;
+                    }
+                }
+            }
+
+            if let Some(q_norm) = &layer.attn.q_norm {
+                for row in q_batch.chunks_mut(q_width) {
+                    let normed = self.apply_qk_norm(row, q_norm);
+                    row.copy_from_slice(&normed);
+                }
+            }
+            if let Some(k_norm) = &layer.attn.k_norm {
+                for row in k_batch.chunks_mut(kv_width) {
+                    let normed = self.apply_qk_norm(row, k_norm);
+                    row.copy_from_slice(&normed);
+                }
+            }
+
+            #[cfg(feature = "metal")]
+            {
+                let mut did_metal_prefill = false;
+                // The Metal prefill kernel is full-causal: only safe on a
+                // SWA layer while every causal position is still inside
+                // the window. Longer prompts fall back to CPU attention.
+                let swa_fits = match self.config.layer_sliding_window(l) {
+                    Some(window) => start_pos + batch_size <= window,
+                    None => true,
+                };
+                if let Some(guard) = metal_kv_guard.as_mut() {
+                    if let Some(metal_kvs) = guard.as_mut() {
+                        if metal_kvs[l].seq_len == cache.seq_len
+                            && start_pos == cache.seq_len
+                            && swa_fits
+                        {
+                            match ferrox_metal::attn::launch_prefill_attn_block(
+                                &q_batch,
+                                &k_batch,
+                                &v_batch,
+                                &mut metal_kvs[l],
+                                n_heads,
+                                batch_size,
+                                self.metal_rope_layout(),
+                                self.config.layer_rope_theta(l),
+                                self.config.rope_freqs.as_deref(),
+                                start_pos,
+                            ) {
+                                Ok((attn_out_batch, k_roped, v_roped)) => {
+                                    for b in 0..batch_size {
+                                        cache
+                                            .push(
+                                                &k_roped[b * kv_width..(b + 1) * kv_width],
+                                                &v_roped[b * kv_width..(b + 1) * kv_width],
+                                            )
+                                            .expect(
+                                                "unbounded/planned KvCache growth is infallible",
+                                            );
+                                    }
+                                    let projected_batch =
+                                        layer.attn.o_proj.apply_batch(&attn_out_batch, batch_size);
+                                    let projected_batch =
+                                        if let Some(post) = &layer.attn.post_attn_norm {
+                                            projected_batch
+                                                .chunks(hidden_dim)
+                                                .flat_map(|row| {
+                                                    rms_norm(row, post, self.config.rms_norm_eps)
+                                                })
+                                                .collect::<Vec<_>>()
+                                        } else {
+                                            projected_batch
+                                        };
+                                    for (h, p) in
+                                        hidden_batch.iter_mut().zip(projected_batch.iter())
+                                    {
+                                        *h += p;
+                                    }
+                                    did_metal_prefill = true;
+                                }
+                                Err(e) => {
+                                    eprintln!(
+                                        "ferrox: Metal prefill attn failed, CPU fallback: {e}"
+                                    );
+                                    **guard = None;
+                                }
+                            }
+                        }
+                    }
+                }
+                if did_metal_prefill {
+                    // --- MoE FFN block (same as CPU path below) ---
+                    let normed2_batch: Vec<f32> = hidden_batch
+                        .chunks(hidden_dim)
+                        .flat_map(|h| rms_norm(h, &layer.moe.norm_weight, self.config.rms_norm_eps))
+                        .collect();
+                    let dense = Self::is_dense_layer(layer);
+                    let router_logits_batch = if dense {
+                        Vec::new()
+                    } else {
+                        layer.moe.router.apply_batch(&normed2_batch, batch_size)
+                    };
+                    let n_experts = layer.moe.n_experts().max(1);
+
+                    for b in 0..batch_size {
+                        let normed2 = &normed2_batch[b * hidden_dim..(b + 1) * hidden_dim];
+                        let mut ffn_out = if dense {
+                            Self::run_ffn_block(
+                                layer,
+                                normed2,
+                                &self.config,
+                                hidden_dim,
+                                residency.as_ref().map(|p| p.layer_plan(l)),
+                            )
+                        } else {
+                            let router_logits =
+                                &router_logits_batch[b * n_experts..(b + 1) * n_experts];
+                            Self::combine_ffn_outputs_for_position(
+                                layer,
+                                normed2,
+                                router_logits,
+                                &self.config,
+                                hidden_dim,
+                                residency.as_ref().map(|p| p.layer_plan(l)),
+                            )
+                        };
+                        if let Some(post) = &layer.attn.post_ffn_norm {
+                            ffn_out = rms_norm(&ffn_out, post, self.config.rms_norm_eps);
+                        }
+                        let hidden_row = &mut hidden_batch[b * hidden_dim..(b + 1) * hidden_dim];
+                        for (h, f) in hidden_row.iter_mut().zip(ffn_out.iter()) {
+                            *h += f;
+                        }
+                    }
+                    continue;
+                }
+            }
+
+            for b in 0..batch_size {
+                let pos = start_pos + b;
+                let q_row = &mut q_batch[b * q_width..(b + 1) * q_width];
+                for h in 0..n_heads {
+                    self.apply_rope_head_layer(
+                        &mut q_row[h * head_dim..(h + 1) * head_dim],
+                        pos,
+                        l,
+                    );
+                }
+                let k_row = &mut k_batch[b * kv_width..(b + 1) * kv_width];
+                for h in 0..n_kv_heads {
+                    self.apply_rope_head_layer(
+                        &mut k_row[h * head_dim..(h + 1) * head_dim],
+                        pos,
+                        l,
+                    );
+                }
+            }
+
+            let base_seq_len = cache.seq_len;
+            for b in 0..batch_size {
+                cache
+                    .push(
+                        &k_batch[b * kv_width..(b + 1) * kv_width],
+                        &v_batch[b * kv_width..(b + 1) * kv_width],
+                    )
+                    .expect("unbounded/planned KvCache growth is infallible");
+            }
+
+            let mut attn_out_batch = vec![0f32; batch_size * q_width];
+            for b in 0..batch_size {
+                let seq_len_b = base_seq_len + b + 1;
+                let cache_elems = seq_len_b * kv_width;
+                let attn_out = match self.config.layer_sliding_window(l) {
+                    Some(window) => causal_gqa_attention_windowed(
+                        &q_batch[b * q_width..(b + 1) * q_width],
+                        &cache.k[..cache_elems],
+                        &cache.v[..cache_elems],
+                        n_heads,
+                        n_kv_heads,
+                        head_dim,
+                        seq_len_b,
+                        window,
+                    ),
+                    None => causal_gqa_attention(
+                        &q_batch[b * q_width..(b + 1) * q_width],
+                        &cache.k[..cache_elems],
+                        &cache.v[..cache_elems],
+                        n_heads,
+                        n_kv_heads,
+                        head_dim,
+                        seq_len_b,
+                    ),
+                };
+                attn_out_batch[b * q_width..(b + 1) * q_width].copy_from_slice(&attn_out);
+            }
+
+            let projected_batch = layer.attn.o_proj.apply_batch(&attn_out_batch, batch_size);
+            let projected_batch = if let Some(post) = &layer.attn.post_attn_norm {
+                projected_batch
+                    .chunks(hidden_dim)
+                    .flat_map(|row| rms_norm(row, post, self.config.rms_norm_eps))
+                    .collect::<Vec<_>>()
+            } else {
+                projected_batch
+            };
+            for (h, p) in hidden_batch.iter_mut().zip(projected_batch.iter()) {
+                *h += p;
+            }
+
+            // --- MoE FFN block ---
+            let normed2_batch: Vec<f32> = hidden_batch
+                .chunks(hidden_dim)
+                .flat_map(|h| rms_norm(h, &layer.moe.norm_weight, self.config.rms_norm_eps))
+                .collect();
+            let dense = Self::is_dense_layer(layer);
+            // Skip the batched router matmul entirely for a dense
+            // layer -- there's nothing to route (see
+            // `is_dense_layer`'s doc comment), so computing it here
+            // just to ignore it below would waste the one matmul this
+            // fast path exists to avoid.
+            let router_logits_batch = if dense {
+                Vec::new()
+            } else {
+                layer.moe.router.apply_batch(&normed2_batch, batch_size)
+            };
+            let n_experts = layer.moe.n_experts().max(1);
+
+            for b in 0..batch_size {
+                let normed2 = &normed2_batch[b * hidden_dim..(b + 1) * hidden_dim];
+                let mut ffn_out = if dense {
+                    Self::run_ffn_block(
+                        layer,
+                        normed2,
+                        &self.config,
+                        hidden_dim,
+                        residency.as_ref().map(|p| p.layer_plan(l)),
+                    )
+                } else {
+                    let router_logits = &router_logits_batch[b * n_experts..(b + 1) * n_experts];
+                    Self::combine_ffn_outputs_for_position(
+                        layer,
+                        normed2,
+                        router_logits,
+                        &self.config,
+                        hidden_dim,
+                        residency.as_ref().map(|p| p.layer_plan(l)),
+                    )
+                };
+                if let Some(post) = &layer.attn.post_ffn_norm {
+                    ffn_out = rms_norm(&ffn_out, post, self.config.rms_norm_eps);
+                }
+                let hidden_row = &mut hidden_batch[b * hidden_dim..(b + 1) * hidden_dim];
+                for (h, f) in hidden_row.iter_mut().zip(ffn_out.iter()) {
+                    *h += f;
+                }
+            }
+        }
+
+        let vocab_size = self.output_head.rows();
+        let final_normed_batch: Vec<f32> = hidden_batch
+            .chunks(hidden_dim)
+            .flat_map(|h| rms_norm(h, &self.final_norm, self.config.rms_norm_eps))
+            .collect();
+        let mut logits_batch = self
+            .output_head
+            .apply_batch(&final_normed_batch, batch_size);
+        if let Some(sc) = self.config.final_logit_softcap {
+            softcap_inplace(&mut logits_batch, sc);
+        }
+
+        logits_batch
+            .chunks(vocab_size)
+            .map(|c| c.to_vec())
+            .collect()
+    }
+
+    /// Continuous-batching primitive: one decode step across N
+    /// independent *sequences*, each contributing exactly one new
+    /// token at its own current position, sharing every layer's
+    /// projection/router matmuls the same way `forward_batch` shares
+    /// them across positions of a single sequence -- but each
+    /// sequence keeps its own `KvCache`, independent `seq_len`, and
+    /// independent position, so sequences admitted/evicted at
+    /// different times can still share one batched matmul per step
+    /// (this is what "continuous" batching means: the batch
+    /// membership can change every step, unlike `forward_batch`'s
+    /// fixed-size prompt-processing batch). `kv_caches[s][l]` is
+    /// sequence `s`'s layer-`l` cache; `tokens[s]`/`positions[s]` is
+    /// that sequence's next token and its position within its own
+    /// history. Returns one logits vector per sequence, same order as
+    /// `tokens`.
+    ///
+    /// Must produce bit-identical output to calling `forward_token`
+    /// once per sequence with that sequence's own cache/position --
+    /// batching independent sequences together is a scheduling detail,
+    /// not a math change (no sequence's attention ever reads another
+    /// sequence's cache).
+    pub fn forward_multi_seq(
+        &self,
+        tokens: &[usize],
+        positions: &[usize],
+        kv_caches: &mut [Vec<KvCache>],
+    ) -> Vec<Vec<f32>> {
+        assert_eq!(tokens.len(), positions.len());
+        assert_eq!(tokens.len(), kv_caches.len());
+        let batch_size = tokens.len();
+        if batch_size == 0 {
+            return Vec::new();
+        }
+        for seq in kv_caches.iter() {
+            assert_eq!(seq.len(), self.layers.len());
+        }
+
+        let hidden_dim = self.config.hidden_dim;
+        let head_dim = self.config.head_dim;
+        let n_heads = self.config.n_heads;
+        let n_kv_heads = self.config.n_kv_heads;
+
+        // [batch, hidden], flattened row-major.
+        let mut hidden_batch: Vec<f32> = tokens
+            .iter()
+            .flat_map(|&t| self.embedding.dequant_row(t))
+            .collect();
+        if let Some(scale) = self.config.embedding_scale {
+            for v in hidden_batch.iter_mut() {
+                *v *= scale;
+            }
+        }
+
+        let residency = self.gpu_vram_budget_bytes.map(|b| self.residency_plan(b));
+
+        for (l, layer) in self.layers.iter().enumerate() {
+            // --- attention block ---
+            let normed_batch: Vec<f32> = hidden_batch
+                .chunks(hidden_dim)
+                .flat_map(|h| rms_norm(h, &layer.attn.norm_weight, self.config.rms_norm_eps))
+                .collect();
+
+            let mut q_batch = layer.attn.q_proj.apply_batch(&normed_batch, batch_size);
+            let mut k_batch = layer.attn.k_proj.apply_batch(&normed_batch, batch_size);
+            let mut v_batch = layer.attn.v_proj.apply_batch(&normed_batch, batch_size);
+
+            let q_width = n_heads * head_dim;
+            let kv_width = n_kv_heads * head_dim;
+
+            if let Some(bias) = &layer.attn.q_bias {
+                for row in q_batch.chunks_mut(q_width) {
+                    for (x, b) in row.iter_mut().zip(bias.iter()) {
+                        *x += b;
+                    }
+                }
+            }
+            if let Some(bias) = &layer.attn.k_bias {
+                for row in k_batch.chunks_mut(kv_width) {
+                    for (x, b) in row.iter_mut().zip(bias.iter()) {
+                        *x += b;
+                    }
+                }
+            }
+            if let Some(bias) = &layer.attn.v_bias {
+                for row in v_batch.chunks_mut(kv_width) {
+                    for (x, b) in row.iter_mut().zip(bias.iter()) {
+                        *x += b;
+                    }
+                }
+            }
+
+            if let Some(q_norm) = &layer.attn.q_norm {
+                for row in q_batch.chunks_mut(q_width) {
+                    let normed = self.apply_qk_norm(row, q_norm);
+                    row.copy_from_slice(&normed);
+                }
+            }
+            if let Some(k_norm) = &layer.attn.k_norm {
+                for row in k_batch.chunks_mut(kv_width) {
+                    let normed = self.apply_qk_norm(row, k_norm);
+                    row.copy_from_slice(&normed);
+                }
+            }
+
+            for b in 0..batch_size {
+                let pos = positions[b];
+                let q_row = &mut q_batch[b * q_width..(b + 1) * q_width];
+                for h in 0..n_heads {
+                    self.apply_rope_head_layer(
+                        &mut q_row[h * head_dim..(h + 1) * head_dim],
+                        pos,
+                        l,
+                    );
+                }
+                let k_row = &mut k_batch[b * kv_width..(b + 1) * kv_width];
+                for h in 0..n_kv_heads {
+                    self.apply_rope_head_layer(
+                        &mut k_row[h * head_dim..(h + 1) * head_dim],
+                        pos,
+                        l,
+                    );
+                }
+            }
+
+            let mut attn_out_batch = vec![0f32; batch_size * q_width];
+            for b in 0..batch_size {
+                let cache = &mut kv_caches[b][l];
+                cache
+                    .push(
+                        &k_batch[b * kv_width..(b + 1) * kv_width],
+                        &v_batch[b * kv_width..(b + 1) * kv_width],
+                    )
+                    .expect("unbounded/planned KvCache growth is infallible");
+                let attn_out = match self.config.layer_sliding_window(l) {
+                    Some(window) => causal_gqa_attention_windowed(
+                        &q_batch[b * q_width..(b + 1) * q_width],
+                        &cache.k,
+                        &cache.v,
+                        n_heads,
+                        n_kv_heads,
+                        head_dim,
+                        cache.seq_len,
+                        window,
+                    ),
+                    None => causal_gqa_attention(
+                        &q_batch[b * q_width..(b + 1) * q_width],
+                        &cache.k,
+                        &cache.v,
+                        n_heads,
+                        n_kv_heads,
+                        head_dim,
+                        cache.seq_len,
+                    ),
+                };
+                attn_out_batch[b * q_width..(b + 1) * q_width].copy_from_slice(&attn_out);
+            }
+
+            let projected_batch = layer.attn.o_proj.apply_batch(&attn_out_batch, batch_size);
+            let projected_batch = if let Some(post) = &layer.attn.post_attn_norm {
+                projected_batch
+                    .chunks(hidden_dim)
+                    .flat_map(|row| rms_norm(row, post, self.config.rms_norm_eps))
+                    .collect::<Vec<_>>()
+            } else {
+                projected_batch
+            };
+            for (h, p) in hidden_batch.iter_mut().zip(projected_batch.iter()) {
+                *h += p;
+            }
+
+            // --- MoE FFN block ---
+            let normed2_batch: Vec<f32> = hidden_batch
+                .chunks(hidden_dim)
+                .flat_map(|h| rms_norm(h, &layer.moe.norm_weight, self.config.rms_norm_eps))
+                .collect();
+            let dense = Self::is_dense_layer(layer);
+            let router_logits_batch = if dense {
+                Vec::new()
+            } else {
+                layer.moe.router.apply_batch(&normed2_batch, batch_size)
+            };
+            let n_experts = layer.moe.n_experts().max(1);
+
+            for b in 0..batch_size {
+                let normed2 = &normed2_batch[b * hidden_dim..(b + 1) * hidden_dim];
+                let mut ffn_out = if dense {
+                    Self::run_ffn_block(
+                        layer,
+                        normed2,
+                        &self.config,
+                        hidden_dim,
+                        residency.as_ref().map(|p| p.layer_plan(l)),
+                    )
+                } else {
+                    let router_logits = &router_logits_batch[b * n_experts..(b + 1) * n_experts];
+                    Self::combine_ffn_outputs_for_position(
+                        layer,
+                        normed2,
+                        router_logits,
+                        &self.config,
+                        hidden_dim,
+                        residency.as_ref().map(|p| p.layer_plan(l)),
+                    )
+                };
+                if let Some(post) = &layer.attn.post_ffn_norm {
+                    ffn_out = rms_norm(&ffn_out, post, self.config.rms_norm_eps);
+                }
+                let hidden_row = &mut hidden_batch[b * hidden_dim..(b + 1) * hidden_dim];
+                for (h, f) in hidden_row.iter_mut().zip(ffn_out.iter()) {
+                    *h += f;
+                }
+            }
+        }
+
+        let vocab_size = self.output_head.rows();
+        let final_normed_batch: Vec<f32> = hidden_batch
+            .chunks(hidden_dim)
+            .flat_map(|h| rms_norm(h, &self.final_norm, self.config.rms_norm_eps))
+            .collect();
+        let mut logits_batch = self
+            .output_head
+            .apply_batch(&final_normed_batch, batch_size);
+        if let Some(sc) = self.config.final_logit_softcap {
+            softcap_inplace(&mut logits_batch, sc);
+        }
+
+        logits_batch
+            .chunks(vocab_size)
+            .map(|c| c.to_vec())
+            .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::glm_5_2;
+
+    /// Small config used purely to keep the test fast: same
+    /// architecture *shape* (GQA ratio, MoE topology) as GLM-5.2, but
+    /// with tiny dims so the whole thing runs in milliseconds.
+    fn tiny_test_config() -> ModelConfig {
+        let mut cfg = glm_5_2();
+        cfg.hidden_dim = 16;
+        cfg.n_heads = 4;
+        cfg.n_kv_heads = 2;
+        cfg.head_dim = 4;
+        cfg.moe.hidden_dim = 16;
+        cfg.moe.n_experts = 6;
+        cfg.moe.n_experts_active = 2;
+        cfg.moe.n_shared_experts = 1;
+        cfg.moe.expert_ffn_dim = 8;
+        cfg
+    }
+
+    #[test]
+    fn forward_pass_produces_finite_logits_of_correct_shape() {
+        let vocab = 10;
+        let decoder = Decoder::new_random_small(tiny_test_config(), 2, vocab);
+        let mut caches: Vec<KvCache> = (0..2)
+            .map(|_| KvCache::new(decoder.config.n_kv_heads, decoder.config.head_dim))
+            .collect();
+
+        let logits = decoder.forward_token(3, 0, &mut caches);
+        assert_eq!(logits.len(), vocab);
+        assert!(
+            logits.iter().all(|v| v.is_finite()),
+            "logits must not contain NaN/Inf"
+        );
+    }
+
+    /// `gpu_vram_budget_bytes` must be a real zero-behavior-change
+    /// default at `None`, and a *real placement plan that places
+    /// nothing* (a zero VRAM budget, so `PlacementPlan::from_budget`
+    /// fits no expert at all) must produce byte-identical output to
+    /// `None` too -- proving the new plumbing (building a plan,
+    /// looking up each routed expert's placement, dispatching through
+    /// `run_expert_placed`) doesn't change results when nothing is
+    /// actually GPU-placed, without needing real CUDA hardware to
+    /// check (that hardware-dependent half is
+    /// `ferrox-moe`'s/`ferrox-core`'s own `#[ignore]`d tests).
+    #[test]
+    fn gpu_vram_budget_bytes_with_nothing_placed_matches_the_default() {
+        let mut decoder = Decoder::new_random_small(tiny_test_config(), 2, 10);
+        let mut caches_default: Vec<KvCache> = (0..2)
+            .map(|_| KvCache::new(decoder.config.n_kv_heads, decoder.config.head_dim))
+            .collect();
+        let default_logits = decoder.forward_token(3, 0, &mut caches_default);
+
+        decoder.gpu_vram_budget_bytes = Some(0);
+        let mut caches_zero_budget: Vec<KvCache> = (0..2)
+            .map(|_| KvCache::new(decoder.config.n_kv_heads, decoder.config.head_dim))
+            .collect();
+        let zero_budget_logits = decoder.forward_token(3, 0, &mut caches_zero_budget);
+
+        assert_eq!(
+            default_logits, zero_budget_logits,
+            "a placement plan that places nothing on GPU must match the None default exactly"
+        );
+    }
+
+    /// Qwen2-MoE's real shared-expert sigmoid gate
+    /// (`MoeWeights::shared_expert_gate`): exact math check by mutating
+    /// `layer.moe.shared_expert_gate` in place on an already-built
+    /// decoder (no need to reconstruct a `LayerWeights`/`MoeWeights`
+    /// from scratch) and comparing against a hand-derived expectation:
+    /// the *only* thing the gate changes is the shared experts' own
+    /// contribution, scaled by `sigmoid(gate . x)` -- so
+    /// `gated_shared_output == ungated_shared_output * sigmoid_value`
+    /// exactly, computed independently here via `run_expert` on the
+    /// same layer's shared expert.
+    #[test]
+    fn shared_expert_gate_scales_shared_output_by_sigmoid_of_the_gate_logit() {
+        let cfg = tiny_test_config();
+        let mut decoder = Decoder::new_random_small(cfg, 2, 8);
+        let hidden_dim = decoder.config.hidden_dim;
+        assert_eq!(
+            decoder.layers[1].moe.shared_experts.len(),
+            1,
+            "test assumes tiny_test_config's real MoE layer has exactly one shared expert"
+        );
+
+        let normed2: Vec<f32> = (0..hidden_dim).map(|i| (i as f32 * 0.37).sin()).collect();
+        let gate_vec: Vec<f32> = (0..hidden_dim).map(|i| i as f32 * 0.13 - 0.5).collect();
+
+        // Independently compute what the shared expert alone produces,
+        // and what sigmoid(gate . x) should scale it by -- this is the
+        // ground truth the gated code path must reproduce exactly.
+        let shared_out_raw = run_expert(&normed2, &decoder.layers[1].moe.shared_experts[0]);
+        let gate_logit: f32 = gate_vec
+            .iter()
+            .zip(normed2.iter())
+            .map(|(g, x)| g * x)
+            .sum();
+        let gate_value = 1.0 / (1.0 + (-gate_logit).exp());
+        let expected_gated_shared: Vec<f32> =
+            shared_out_raw.iter().map(|x| x * gate_value).collect();
+
+        // Run the real FFN combine path twice (gate absent, then
+        // present) and recover each run's shared-only contribution by
+        // subtracting the routed contribution, which the gate never
+        // touches and is identical between the two runs (same router,
+        // same experts, same input).
+        let router_logits = decoder.layers[1].moe.router.apply(&normed2);
+        let ungated_total = Decoder::combine_ffn_outputs_for_position(
+            &decoder.layers[1],
+            &normed2,
+            &router_logits,
+            &decoder.config,
+            hidden_dim,
+            None,
+        );
+        decoder.layers[1].moe.shared_expert_gate = Some(gate_vec);
+        let gated_total = Decoder::combine_ffn_outputs_for_position(
+            &decoder.layers[1],
+            &normed2,
+            &router_logits,
+            &decoder.config,
+            hidden_dim,
+            None,
+        );
+
+        for (i, ((u, g), expected_shared)) in ungated_total
+            .iter()
+            .zip(gated_total.iter())
+            .zip(expected_gated_shared.iter())
+            .enumerate()
+        {
+            let routed_contribution = u - shared_out_raw[i];
+            let gated_shared_recovered = g - routed_contribution;
+            assert!(
+                (gated_shared_recovered - expected_shared).abs() < 1e-4,
+                "index {i}: recovered gated shared output {gated_shared_recovered} != expected {expected_shared} (sigmoid({gate_logit})={gate_value})"
+            );
+        }
+    }
+
+    #[test]
+    fn kv_cache_grows_by_one_position_per_layer_per_step() {
+        let decoder = Decoder::new_random_small(tiny_test_config(), 3, 5);
+        let mut caches: Vec<KvCache> = (0..3)
+            .map(|_| KvCache::new(decoder.config.n_kv_heads, decoder.config.head_dim))
+            .collect();
+
+        decoder.forward_token(0, 0, &mut caches);
+        decoder.forward_token(1, 1, &mut caches);
+        decoder.forward_token(2, 2, &mut caches);
+
+        for cache in &caches {
+            assert_eq!(cache.seq_len, 3);
+        }
+    }
+
+    #[test]
+    fn same_token_same_position_is_deterministic() {
+        let decoder = Decoder::new_random_small(tiny_test_config(), 2, 8);
+        let mut caches_a: Vec<KvCache> = (0..2)
+            .map(|_| KvCache::new(decoder.config.n_kv_heads, decoder.config.head_dim))
+            .collect();
+        let mut caches_b: Vec<KvCache> = (0..2)
+            .map(|_| KvCache::new(decoder.config.n_kv_heads, decoder.config.head_dim))
+            .collect();
+
+        let out_a = decoder.forward_token(4, 0, &mut caches_a);
+        let out_b = decoder.forward_token(4, 0, &mut caches_b);
+        assert_eq!(out_a, out_b, "identical input state must yield identical output (no hidden randomness in the forward pass)");
+    }
+
+    #[test]
+    fn multi_step_decode_stays_finite_across_positions() {
+        let decoder = Decoder::new_random_small(tiny_test_config(), 2, 8);
+        let mut caches: Vec<KvCache> = (0..2)
+            .map(|_| KvCache::new(decoder.config.n_kv_heads, decoder.config.head_dim))
+            .collect();
+
+        for pos in 0..16 {
+            let logits = decoder.forward_token(pos % 8, pos, &mut caches);
+            assert!(
+                logits.iter().all(|v| v.is_finite()),
+                "position {pos}: logits must stay finite across an extended decode run"
+            );
+        }
+    }
+
+    /// `forward_token_paged` must produce bit-identical output to
+    /// `forward_token` across a multi-step decode (each layer's paged
+    /// store sized generously so no layer ever exhausts its blocks) --
+    /// the block-table indirection is a storage-layout detail, not a
+    /// math change.
+    #[test]
+    fn forward_token_paged_matches_forward_token_bit_identical() {
+        let n_layers = 2;
+        let decoder = Decoder::new_random_small(tiny_test_config(), n_layers, 10);
+
+        let mut caches: Vec<KvCache> = (0..n_layers)
+            .map(|_| KvCache::new(decoder.config.n_kv_heads, decoder.config.head_dim))
+            .collect();
+        let mut plain_logits = Vec::new();
+        for (pos, &tok) in [3usize, 5, 7].iter().enumerate() {
+            plain_logits.push(decoder.forward_token(tok, pos, &mut caches));
+        }
+
+        let block_size = 2;
+        let mut paged_caches: Vec<PagedKvCache> =
+            (0..n_layers).map(|_| PagedKvCache::new()).collect();
+        let mut stores: Vec<PagedKvStore> = (0..n_layers)
+            .map(|_| {
+                PagedKvStore::new(
+                    block_size,
+                    /* total_blocks = */ 16,
+                    decoder.config.n_kv_heads,
+                    decoder.config.head_dim,
+                )
+            })
+            .collect();
+        let mut paged_logits = Vec::new();
+        for (pos, &tok) in [3usize, 5, 7].iter().enumerate() {
+            paged_logits.push(
+                decoder
+                    .forward_token_paged(tok, pos, &mut paged_caches, &mut stores)
+                    .expect("store sized generously, must not exhaust"),
+            );
+        }
+
+        assert_eq!(plain_logits.len(), paged_logits.len());
+        for (a, b) in plain_logits.iter().zip(paged_logits.iter()) {
+            assert_eq!(a.len(), b.len());
+            for (x, y) in a.iter().zip(b.iter()) {
+                assert_eq!(
+                    x.to_bits(),
+                    y.to_bits(),
+                    "paged decode must be bit-identical to contiguous decode"
+                );
+            }
+        }
+    }
+
+    /// The single most important correctness property of
+    /// `forward_batch`: batching positions together for shared matmuls
+    /// must produce EXACTLY the same result as processing them one at
+    /// a time with `forward_token`, since causal masking guarantees
+    /// position `i` only ever sees positions `<= i`. If this test
+    /// fails, `forward_batch` is not a safe drop-in replacement for
+    /// sequential decode, which would make speculative decoding built
+    /// on top of it produce silently wrong output.
+    #[test]
+    fn forward_batch_matches_sequential_forward_token_exactly() {
+        let cfg = tiny_test_config();
+        let vocab = 8;
+        let tokens = [1usize, 3, 5, 2, 7];
+
+        let decoder_a = Decoder::new_random_small(cfg.clone(), 2, vocab);
+        let mut caches_a: Vec<KvCache> = (0..2)
+            .map(|_| KvCache::new(decoder_a.config.n_kv_heads, decoder_a.config.head_dim))
+            .collect();
+        let sequential: Vec<Vec<f32>> = tokens
+            .iter()
+            .enumerate()
+            .map(|(pos, &t)| decoder_a.forward_token(t, pos, &mut caches_a))
+            .collect();
+
+        // A second decoder built with the same seed produces identical
+        // weights (Decoder::new_random_small is deterministic), so
+        // this is a fair like-for-like comparison against a fresh
+        // cache rather than reusing decoder_a's now-mutated cache.
+        let decoder_b = Decoder::new_random_small(cfg, 2, vocab);
+        let mut caches_b: Vec<KvCache> = (0..2)
+            .map(|_| KvCache::new(decoder_b.config.n_kv_heads, decoder_b.config.head_dim))
+            .collect();
+        let batched = decoder_b.forward_batch(&tokens, 0, &mut caches_b);
+
+        assert_eq!(batched.len(), sequential.len());
+        for (pos, (seq_logits, batch_logits)) in sequential.iter().zip(batched.iter()).enumerate() {
+            assert_eq!(seq_logits.len(), batch_logits.len());
+            for (i, (s, b)) in seq_logits.iter().zip(batch_logits.iter()).enumerate() {
+                assert!(
+                    (s - b).abs() < 1e-3,
+                    "position {pos}, logit {i}: sequential={s} batched={b}"
+                );
+            }
+        }
+    }
+
+    /// `forward_multi_seq`'s core correctness property: batching N
+    /// independent sequences (different token histories, different
+    /// current positions, different KV caches) together must produce
+    /// EXACTLY the same per-sequence output as running each sequence
+    /// through `forward_token` alone, one step at a time. This is what
+    /// makes continuous batching safe -- no sequence's attention may
+    /// ever be perturbed by another sequence sharing its batched
+    /// matmul step.
+    #[test]
+    fn forward_multi_seq_matches_independent_forward_token_per_sequence() {
+        let cfg = tiny_test_config();
+        let vocab = 8;
+        // 3 independent sequences, deliberately different lengths/
+        // histories/current tokens, so no two sequences are at the
+        // same position when batched together.
+        let seq_histories: [&[usize]; 3] = [&[1, 3, 5], &[2, 7], &[4, 4, 4, 6]];
+
+        let decoder_a = Decoder::new_random_small(cfg.clone(), 2, vocab);
+        let mut independent_logits: Vec<Vec<f32>> = Vec::new();
+        for history in seq_histories.iter() {
+            let mut caches: Vec<KvCache> = (0..2)
+                .map(|_| KvCache::new(decoder_a.config.n_kv_heads, decoder_a.config.head_dim))
+                .collect();
+            let mut logits = Vec::new();
+            for (pos, &tok) in history.iter().enumerate() {
+                logits = decoder_a.forward_token(tok, pos, &mut caches);
+            }
+            independent_logits.push(logits);
+        }
+
+        // Same seed -> identical weights, fresh caches for a fair
+        // comparison (mirrors forward_batch_matches_sequential_forward_token_exactly).
+        let decoder_b = Decoder::new_random_small(cfg, 2, vocab);
+        let mut per_seq_caches: Vec<Vec<KvCache>> = seq_histories
+            .iter()
+            .map(|_| {
+                (0..2)
+                    .map(|_| KvCache::new(decoder_b.config.n_kv_heads, decoder_b.config.head_dim))
+                    .collect()
+            })
+            .collect();
+
+        // Feed every sequence's prefix (all but its last token)
+        // through forward_multi_seq one shared step at a time, then
+        // do a final batched step for the last token of every
+        // sequence so all three arrive at their final position in
+        // the same batched call -- exercising genuinely different
+        // per-sequence positions/histories within one batch, not just
+        // parallel identical-length sequences.
+        let max_len = seq_histories.iter().map(|h| h.len()).max().unwrap();
+        let mut batched_logits: Vec<Vec<f32>> = vec![Vec::new(); seq_histories.len()];
+        for step in 0..max_len {
+            let mut tokens = Vec::new();
+            let mut positions = Vec::new();
+            let mut active: Vec<usize> = Vec::new();
+            for (s, history) in seq_histories.iter().enumerate() {
+                if step < history.len() {
+                    tokens.push(history[step]);
+                    positions.push(step);
+                    active.push(s);
+                }
+            }
+            if tokens.is_empty() {
+                continue;
+            }
+            let mut active_caches: Vec<Vec<KvCache>> = active
+                .iter()
+                .map(|&s| std::mem::take(&mut per_seq_caches[s]))
+                .collect();
+            let step_logits = decoder_b.forward_multi_seq(&tokens, &positions, &mut active_caches);
+            for ((&s, caches), logits) in active
+                .iter()
+                .zip(active_caches.into_iter())
+                .zip(step_logits.into_iter())
+            {
+                per_seq_caches[s] = caches;
+                batched_logits[s] = logits;
+            }
+        }
+
+        assert_eq!(batched_logits.len(), independent_logits.len());
+        for (s, (seq_logits, batch_logits)) in independent_logits
+            .iter()
+            .zip(batched_logits.iter())
+            .enumerate()
+        {
+            assert_eq!(seq_logits.len(), batch_logits.len());
+            for (i, (a, b)) in seq_logits.iter().zip(batch_logits.iter()).enumerate() {
+                assert!(
+                    (a - b).abs() < 1e-3,
+                    "sequence {s}, logit {i}: independent={a} batched={b}"
+                );
+            }
+        }
+    }
+
+    /// OLMoE-style QK-norm (`attn_q_norm`/`attn_k_norm`, see `AttnWeights`'
+    /// doc comment): with both set, `forward_batch` must still match
+    /// sequential `forward_token` calls exactly -- the same consistency
+    /// property `forward_batch_matches_sequential_forward_token_exactly`
+    /// checks for the no-QK-norm path, now exercising the norm-applied
+    /// per-row slicing (`q_batch.chunks_mut(q_width)`,
+    /// `k_batch.chunks_mut(kv_width)`) instead of trusting it by
+    /// inspection.
+    #[test]
+    fn forward_batch_matches_forward_token_with_qk_norm_present() {
+        let cfg = tiny_test_config();
+        let vocab = 8;
+        let tokens = [1usize, 3, 5, 2, 7];
+        let q_width = cfg.n_heads * cfg.head_dim;
+        let kv_width = cfg.n_kv_heads * cfg.head_dim;
+
+        let mut decoder_a = Decoder::new_random_small(cfg.clone(), 2, vocab);
+        for layer in &mut decoder_a.layers {
+            layer.attn.q_norm = Some((0..q_width).map(|i| 1.0 + i as f32 * 0.1).collect());
+            layer.attn.k_norm = Some((0..kv_width).map(|i| 0.5 + i as f32 * 0.05).collect());
+        }
+        let mut caches_a: Vec<KvCache> = (0..2)
+            .map(|_| KvCache::new(decoder_a.config.n_kv_heads, decoder_a.config.head_dim))
+            .collect();
+        let sequential: Vec<Vec<f32>> = tokens
+            .iter()
+            .enumerate()
+            .map(|(pos, &t)| decoder_a.forward_token(t, pos, &mut caches_a))
+            .collect();
+
+        let mut decoder_b = Decoder::new_random_small(cfg, 2, vocab);
+        for layer in &mut decoder_b.layers {
+            layer.attn.q_norm = Some((0..q_width).map(|i| 1.0 + i as f32 * 0.1).collect());
+            layer.attn.k_norm = Some((0..kv_width).map(|i| 0.5 + i as f32 * 0.05).collect());
+        }
+        let mut caches_b: Vec<KvCache> = (0..2)
+            .map(|_| KvCache::new(decoder_b.config.n_kv_heads, decoder_b.config.head_dim))
+            .collect();
+        let batched = decoder_b.forward_batch(&tokens, 0, &mut caches_b);
+
+        assert_eq!(batched.len(), sequential.len());
+        for (pos, (seq_logits, batch_logits)) in sequential.iter().zip(batched.iter()).enumerate() {
+            for (i, (s, b)) in seq_logits.iter().zip(batch_logits.iter()).enumerate() {
+                assert!(
+                    (s - b).abs() < 1e-3,
+                    "position {pos}, logit {i}: sequential={s} batched={b}"
+                );
+            }
+        }
+    }
+
+    /// QK-norm being present must actually change the output -- otherwise
+    /// the `Some(...)` branches in `forward_token`/`forward_batch` could
+    /// silently be dead code and this feature would ship unverified. Must
+    /// decode at least 2 positions: at position 0 with a fresh cache,
+    /// causal softmax has exactly one candidate (the token attending to
+    /// itself) and always evaluates to weight 1.0 regardless of the Q*K
+    /// dot product -- so the attention output there is Q/K-invariant by
+    /// construction, and a single-position version of this test would
+    /// pass even with `q_norm`/`k_norm` silently never applied.
+    #[test]
+    fn qk_norm_present_changes_output_versus_absent() {
+        let cfg = tiny_test_config();
+        let vocab = 8;
+        let q_width = cfg.n_heads * cfg.head_dim;
+        let kv_width = cfg.n_kv_heads * cfg.head_dim;
+        let tokens = [3usize, 5];
+
+        let without_norm = Decoder::new_random_small(cfg.clone(), 1, vocab);
+        let mut with_norm = Decoder::new_random_small(cfg, 1, vocab);
+        for layer in &mut with_norm.layers {
+            layer.attn.q_norm = Some(vec![2.0; q_width]);
+            layer.attn.k_norm = Some(vec![2.0; kv_width]);
+        }
+
+        let mut caches_a: Vec<KvCache> = (0..1)
+            .map(|_| KvCache::new(without_norm.config.n_kv_heads, without_norm.config.head_dim))
+            .collect();
+        let mut caches_b: Vec<KvCache> = (0..1)
+            .map(|_| KvCache::new(with_norm.config.n_kv_heads, with_norm.config.head_dim))
+            .collect();
+
+        let mut out_a = Vec::new();
+        let mut out_b = Vec::new();
+        for (pos, &t) in tokens.iter().enumerate() {
+            out_a = without_norm.forward_token(t, pos, &mut caches_a);
+            out_b = with_norm.forward_token(t, pos, &mut caches_b);
+        }
+
+        let differs = out_a
+            .iter()
+            .zip(out_b.iter())
+            .any(|(a, b)| (a - b).abs() > 1e-4);
+        assert!(
+            differs,
+            "QK-norm weights changed nothing -- forward_token likely isn't applying q_norm/k_norm"
+        );
+    }
+
+    /// Qwen2/Qwen2-MoE-family QKV attention bias (`AttnWeights::q_bias`/
+    /// `k_bias`/`v_bias`): a real, previously-unhandled gap found by
+    /// running ferrox's generic GGUF loader against a real downloaded
+    /// Qwen1.5-MoE-A2.7B-Chat checkpoint, which produced fluent-but-wrong
+    /// output because these real `attn_{q,k,v}.bias` tensors were
+    /// silently never added anywhere. Same two real properties checked
+    /// as the QK-norm tests above: (1) `forward_batch` must match
+    /// sequential `forward_token` exactly with bias present (batched
+    /// per-row broadcast must be correct, not just the single-token
+    /// path), and (2) bias must actually change the output at position
+    /// 0 or later (not silently dead code) -- checked at position 1
+    /// specifically, since position 0's causal softmax has exactly one
+    /// candidate and is Q/K-invariant regardless of any additive bias
+    /// shifting Q/K, for the same reason the QK-norm test above needs
+    /// >=2 positions.
+    #[test]
+    fn forward_batch_matches_forward_token_with_qkv_bias_present() {
+        let cfg = tiny_test_config();
+        let vocab = 8;
+        let tokens = [1usize, 3, 5, 2, 7];
+        let q_width = cfg.n_heads * cfg.head_dim;
+        let kv_width = cfg.n_kv_heads * cfg.head_dim;
+
+        let mut decoder_a = Decoder::new_random_small(cfg.clone(), 2, vocab);
+        for layer in &mut decoder_a.layers {
+            layer.attn.q_bias = Some((0..q_width).map(|i| 0.3 + i as f32 * 0.02).collect());
+            layer.attn.k_bias = Some((0..kv_width).map(|i| -0.2 + i as f32 * 0.03).collect());
+            layer.attn.v_bias = Some((0..kv_width).map(|i| 0.1 - i as f32 * 0.01).collect());
+        }
+        let mut caches_a: Vec<KvCache> = (0..2)
+            .map(|_| KvCache::new(decoder_a.config.n_kv_heads, decoder_a.config.head_dim))
+            .collect();
+        let sequential: Vec<Vec<f32>> = tokens
+            .iter()
+            .enumerate()
+            .map(|(pos, &t)| decoder_a.forward_token(t, pos, &mut caches_a))
+            .collect();
+
+        let mut decoder_b = Decoder::new_random_small(cfg, 2, vocab);
+        for layer in &mut decoder_b.layers {
+            layer.attn.q_bias = Some((0..q_width).map(|i| 0.3 + i as f32 * 0.02).collect());
+            layer.attn.k_bias = Some((0..kv_width).map(|i| -0.2 + i as f32 * 0.03).collect());
+            layer.attn.v_bias = Some((0..kv_width).map(|i| 0.1 - i as f32 * 0.01).collect());
+        }
+        let mut caches_b: Vec<KvCache> = (0..2)
+            .map(|_| KvCache::new(decoder_b.config.n_kv_heads, decoder_b.config.head_dim))
+            .collect();
+        let batched = decoder_b.forward_batch(&tokens, 0, &mut caches_b);
+
+        assert_eq!(batched.len(), sequential.len());
+        for (pos, (seq_logits, batch_logits)) in sequential.iter().zip(batched.iter()).enumerate() {
+            for (i, (s, b)) in seq_logits.iter().zip(batch_logits.iter()).enumerate() {
+                assert!(
+                    (s - b).abs() < 1e-3,
+                    "position {pos}, logit {i}: sequential={s} batched={b}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn qkv_bias_present_changes_output_versus_absent() {
+        let cfg = tiny_test_config();
+        let vocab = 8;
+        let q_width = cfg.n_heads * cfg.head_dim;
+        let kv_width = cfg.n_kv_heads * cfg.head_dim;
+        let tokens = [3usize, 5];
+
+        let without_bias = Decoder::new_random_small(cfg.clone(), 1, vocab);
+        let mut with_bias = Decoder::new_random_small(cfg, 1, vocab);
+        for layer in &mut with_bias.layers {
+            layer.attn.q_bias = Some(vec![0.5; q_width]);
+            layer.attn.k_bias = Some(vec![0.5; kv_width]);
+            layer.attn.v_bias = Some(vec![0.5; kv_width]);
+        }
+
+        let mut caches_a: Vec<KvCache> = (0..1)
+            .map(|_| KvCache::new(without_bias.config.n_kv_heads, without_bias.config.head_dim))
+            .collect();
+        let mut caches_b: Vec<KvCache> = (0..1)
+            .map(|_| KvCache::new(with_bias.config.n_kv_heads, with_bias.config.head_dim))
+            .collect();
+
+        let mut out_a = Vec::new();
+        let mut out_b = Vec::new();
+        for (pos, &t) in tokens.iter().enumerate() {
+            out_a = without_bias.forward_token(t, pos, &mut caches_a);
+            out_b = with_bias.forward_token(t, pos, &mut caches_b);
+        }
+
+        let differs = out_a
+            .iter()
+            .zip(out_b.iter())
+            .any(|(a, b)| (a - b).abs() > 1e-4);
+        assert!(
+            differs,
+            "QKV bias changed nothing -- forward_token likely isn't applying q_bias/k_bias/v_bias"
+        );
+    }
+
+    #[test]
+    fn forward_batch_and_forward_token_leave_kv_caches_in_the_same_state() {
+        let cfg = tiny_test_config();
+        let tokens = [2usize, 4, 6];
+
+        let decoder_a = Decoder::new_random_small(cfg.clone(), 2, 8);
+        let mut caches_a: Vec<KvCache> = (0..2)
+            .map(|_| KvCache::new(decoder_a.config.n_kv_heads, decoder_a.config.head_dim))
+            .collect();
+        for (pos, &t) in tokens.iter().enumerate() {
+            decoder_a.forward_token(t, pos, &mut caches_a);
+        }
+
+        let decoder_b = Decoder::new_random_small(cfg, 2, 8);
+        let mut caches_b: Vec<KvCache> = (0..2)
+            .map(|_| KvCache::new(decoder_b.config.n_kv_heads, decoder_b.config.head_dim))
+            .collect();
+        decoder_b.forward_batch(&tokens, 0, &mut caches_b);
+
+        for (ca, cb) in caches_a.iter().zip(caches_b.iter()) {
+            assert_eq!(ca.seq_len, cb.seq_len);
+            assert_eq!(ca.k.len(), cb.k.len());
+            for (a, b) in ca.k.iter().zip(cb.k.iter()) {
+                assert!((a - b).abs() < 1e-4);
+            }
+        }
+    }
+
+    /// Same architecture shape as `tiny_test_config` but genuinely
+    /// dense (one expert, no shared experts) -- the shape every non-MoE
+    /// model, and every DeepSeek-style leading dense layer, loads as.
+    /// Exercises `Decoder::is_dense_layer`'s fast path.
+    fn tiny_dense_test_config() -> ModelConfig {
+        let mut cfg = tiny_test_config();
+        cfg.moe.n_experts = 1;
+        cfg.moe.n_experts_active = 1;
+        cfg.moe.n_shared_experts = 0;
+        cfg
+    }
+
+    #[test]
+    fn dense_layer_forward_pass_produces_finite_logits_of_correct_shape() {
+        let vocab = 10;
+        let decoder = Decoder::new_random_small(tiny_dense_test_config(), 2, vocab);
+        let mut caches: Vec<KvCache> = (0..2)
+            .map(|_| KvCache::new(decoder.config.n_kv_heads, decoder.config.head_dim))
+            .collect();
+
+        let logits = decoder.forward_token(3, 0, &mut caches);
+        assert_eq!(logits.len(), vocab);
+        assert!(
+            logits.iter().all(|v| v.is_finite()),
+            "logits must not contain NaN/Inf"
+        );
+    }
+
+    #[test]
+    fn dense_layer_forward_batch_matches_sequential_forward_token_exactly() {
+        let cfg = tiny_dense_test_config();
+        let vocab = 8;
+        let tokens = [1usize, 3, 5, 2, 7];
+
+        let decoder_a = Decoder::new_random_small(cfg.clone(), 2, vocab);
+        let mut caches_a: Vec<KvCache> = (0..2)
+            .map(|_| KvCache::new(decoder_a.config.n_kv_heads, decoder_a.config.head_dim))
+            .collect();
+        let sequential: Vec<Vec<f32>> = tokens
+            .iter()
+            .enumerate()
+            .map(|(pos, &t)| decoder_a.forward_token(t, pos, &mut caches_a))
+            .collect();
+
+        let decoder_b = Decoder::new_random_small(cfg, 2, vocab);
+        let mut caches_b: Vec<KvCache> = (0..2)
+            .map(|_| KvCache::new(decoder_b.config.n_kv_heads, decoder_b.config.head_dim))
+            .collect();
+        let batched = decoder_b.forward_batch(&tokens, 0, &mut caches_b);
+
+        assert_eq!(batched.len(), sequential.len());
+        for (pos, (seq_logits, batch_logits)) in sequential.iter().zip(batched.iter()).enumerate() {
+            for (i, (s, b)) in seq_logits.iter().zip(batch_logits.iter()).enumerate() {
+                assert!(
+                    (s - b).abs() < 1e-3,
+                    "position {pos}, logit {i}: sequential={s} batched={b}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn dense_layer_fast_path_still_records_expert_zero_activations() {
+        // The dense fast path bypasses `route_top_k` entirely, but
+        // must still record an activation for expert 0 every step --
+        // `MoeWeights::placement_plan` and hotness-based GPU placement
+        // depend on this being real for every model shape, not just
+        // genuinely-MoE ones.
+        let decoder = Decoder::new_random_small(tiny_dense_test_config(), 1, 8);
+        let mut caches: Vec<KvCache> = (0..1)
+            .map(|_| KvCache::new(decoder.config.n_kv_heads, decoder.config.head_dim))
+            .collect();
+
+        decoder.forward_token(0, 0, &mut caches);
+        decoder.forward_token(1, 1, &mut caches);
+        decoder.forward_token(2, 2, &mut caches);
+
+        let count =
+            decoder.layers[0].moe.activation_counts[0].load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(count, 3);
+    }
+
+    #[test]
+    fn forward_batch_with_empty_tokens_returns_empty() {
+        let decoder = Decoder::new_random_small(tiny_test_config(), 2, 8);
+        let mut caches: Vec<KvCache> = (0..2)
+            .map(|_| KvCache::new(decoder.config.n_kv_heads, decoder.config.head_dim))
+            .collect();
+        let out = decoder.forward_batch(&[], 0, &mut caches);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn forward_batch_continues_correctly_after_prior_forward_token_calls() {
+        // Realistic usage pattern: some tokens processed one at a time
+        // (e.g. the first generated token), then a batch verifying
+        // several draft tokens at once, continuing from the same
+        // cache. The batch's positions must be numbered starting from
+        // wherever the cache left off, not from zero.
+        let cfg = tiny_test_config();
+
+        let decoder_a = Decoder::new_random_small(cfg.clone(), 2, 8);
+        let mut caches_a: Vec<KvCache> = (0..2)
+            .map(|_| KvCache::new(decoder_a.config.n_kv_heads, decoder_a.config.head_dim))
+            .collect();
+        decoder_a.forward_token(1, 0, &mut caches_a);
+        decoder_a.forward_token(3, 1, &mut caches_a);
+        let seq_next = decoder_a.forward_token(5, 2, &mut caches_a);
+
+        let decoder_b = Decoder::new_random_small(cfg, 2, 8);
+        let mut caches_b: Vec<KvCache> = (0..2)
+            .map(|_| KvCache::new(decoder_b.config.n_kv_heads, decoder_b.config.head_dim))
+            .collect();
+        decoder_b.forward_token(1, 0, &mut caches_b);
+        let batch_next = decoder_b.forward_batch(&[3, 5], 1, &mut caches_b);
+
+        for (s, b) in seq_next.iter().zip(batch_next[1].iter()) {
+            assert!((s - b).abs() < 1e-3, "sequential={s} batched={b}");
+        }
+    }
+
+    /// `PlacementPlan::from_budget` is
+    /// real and tested in isolation, but only meaningful once it's fed
+    /// genuinely observed per-expert activation counts rather than
+    /// zeros. This proves the full loop: run real forward passes,
+    /// confirm `MoeWeights::activation_counts` actually reflects what
+    /// `route_top_k` selected, and confirm `placement_plan` prioritizes
+    /// the expert that was genuinely hottest -- not just that the
+    /// budget/size arithmetic works on synthetic inputs.
+    #[test]
+    fn placement_plan_reflects_real_observed_expert_activations() {
+        let cfg = tiny_test_config(); // 6 experts, top-2 active/token
+        let decoder = Decoder::new_random_small(cfg, 2, 16);
+        let mut caches: Vec<KvCache> = (0..2)
+            .map(|_| KvCache::new(decoder.config.n_kv_heads, decoder.config.head_dim))
+            .collect();
+
+        let n_calls = 20;
+        for pos in 0..n_calls {
+            decoder.forward_token(pos % 16, pos, &mut caches);
+        }
+
+        let layer0 = &decoder.layers[0].moe;
+        let counts: Vec<u64> = layer0
+            .activation_counts
+            .iter()
+            .map(|c| c.load(std::sync::atomic::Ordering::Relaxed))
+            .collect();
+        let total: u64 = counts.iter().sum();
+        assert_eq!(
+            total,
+            (n_calls as u64) * (decoder.config.moe.n_experts_active as u64),
+            "total recorded activations must equal calls * experts_active_per_call"
+        );
+
+        // Ties are realistic at this small a sample size; break them the
+        // same way `PlacementPlan::from_budget` does (lowest index
+        // wins), so this assertion can't spuriously fail on a tie that
+        // `from_budget` resolves differently than a naive `max_by_key`
+        // (which returns the *last* max element) would.
+        let hottest_count = *counts.iter().max().unwrap();
+        let hottest_idx = counts.iter().position(|&c| c == hottest_count).unwrap();
+        assert!(hottest_count > 0);
+
+        // A per-expert resident size big enough for exactly one expert.
+        let per_expert_bytes = layer0.expert_bytes(0);
+        let plan = layer0.placement_plan(per_expert_bytes as u64);
+
+        assert_eq!(
+            plan.placement_for(hottest_idx),
+            ferrox_moe::ExpertPlacement::GpuDevice(0),
+            "the genuinely hottest expert (index {hottest_idx}, {hottest_count} activations) \
+             must be the one the plan places on GPU when only one expert fits the budget"
+        );
+    }
+}

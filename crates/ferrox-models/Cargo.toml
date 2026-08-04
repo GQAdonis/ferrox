@@ -3,15 +3,19 @@ name = "ferrox-models"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Model loaders and decoder stacks for the Ferrox inference engine"
+readme = "../../README.md"
 
 [dependencies]
-ferrox-core = { path = "../ferrox-core" }
-ferrox-moe = { path = "../ferrox-moe" }
-ferrox-gguf = { path = "../ferrox-gguf" }
-ferrox-quant = { path = "../ferrox-quant" }
-ferrox-safetensors = { path = "../ferrox-safetensors" }
-ferrox-metal = { path = "../ferrox-metal", optional = true }
-ferrox-cuda = { path = "../ferrox-cuda", optional = true }
+ferrox-core = { workspace = true }
+ferrox-moe = { workspace = true }
+ferrox-gguf = { workspace = true }
+ferrox-quant = { workspace = true }
+ferrox-safetensors = { workspace = true }
+ferrox-metal = { workspace = true, optional = true }
+ferrox-cuda = { workspace = true, optional = true }
 serde = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }

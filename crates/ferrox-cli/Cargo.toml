@@ -3,20 +3,24 @@ name = "ferrox-cli"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "llama.cpp-style CLI for the Ferrox inference engine"
+readme = "../../README.md"
 
 [[bin]]
 name = "ferrox"
 path = "src/main.rs"
 
 [dependencies]
-ferrox-gguf = { path = "../ferrox-gguf" }
-ferrox-quant = { path = "../ferrox-quant" }
-ferrox-cuda = { path = "../ferrox-cuda" }
-ferrox-metal = { path = "../ferrox-metal" }
+ferrox-gguf = { workspace = true }
+ferrox-quant = { workspace = true }
+ferrox-cuda = { workspace = true }
+ferrox-metal = { workspace = true }
 half = { workspace = true }
-ferrox-core = { path = "../ferrox-core" }
-ferrox-models = { path = "../ferrox-models" }
-ferrox-safetensors = { path = "../ferrox-safetensors" }
+ferrox-core = { workspace = true }
+ferrox-models = { workspace = true }
+ferrox-safetensors = { workspace = true }
 clap = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }

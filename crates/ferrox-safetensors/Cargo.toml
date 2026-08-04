@@ -3,6 +3,10 @@ name = "ferrox-safetensors"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "SafeTensors mmap loader for the Ferrox inference engine"
+readme = "../../README.md"
 
 [dependencies]
 thiserror = { workspace = true }

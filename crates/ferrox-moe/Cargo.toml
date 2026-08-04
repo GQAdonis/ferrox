@@ -3,17 +3,20 @@ name = "ferrox-moe"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Mixture-of-Experts routing and expert dispatch for Ferrox"
+readme = "../../README.md"
 
 [dependencies]
-ferrox-core = { path = "../ferrox-core" }
+ferrox-core = { workspace = true }
 rayon = { workspace = true }
 anyhow = { workspace = true }
 
 [dev-dependencies]
-ferrox-quant = { path = "../ferrox-quant" }
+ferrox-quant = { workspace = true }
 
 [features]
 default = []
 cuda = ["ferrox-core/cuda"]
 metal = ["ferrox-core/metal"]
-

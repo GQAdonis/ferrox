@@ -18,6 +18,7 @@ version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/antonellof/ferrox"
+homepage = "https://github.com/antonellof/ferrox"
 
 [workspace.dependencies]
 anyhow = "1"
@@ -33,3 +34,13 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal
 axum = "0.7"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+# Internal crates — path for local builds, version for crates.io.
+ferrox-gguf = { version = "0.1.0", path = "crates/ferrox-gguf" }
+ferrox-quant = { version = "0.1.0", path = "crates/ferrox-quant" }
+ferrox-safetensors = { version = "0.1.0", path = "crates/ferrox-safetensors" }
+ferrox-cuda = { version = "0.1.0", path = "crates/ferrox-cuda" }
+ferrox-metal = { version = "0.1.0", path = "crates/ferrox-metal" }
+ferrox-core = { version = "0.1.0", path = "crates/ferrox-core" }
+ferrox-moe = { version = "0.1.0", path = "crates/ferrox-moe" }
+ferrox-models = { version = "0.1.0", path = "crates/ferrox-models" }

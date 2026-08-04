@@ -3,6 +3,10 @@ name = "ferrox-metal"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Apple Metal kernels for the Ferrox inference engine"
+readme = "../../README.md"
 
 [dependencies]
 thiserror = { workspace = true }
@@ -25,7 +29,7 @@ objc2-foundation = { version = "0.3.2", optional = true }
 objc2-metal = { version = "0.3.2", optional = true, features = ["block2"] }
 
 [dev-dependencies]
-ferrox-quant = { path = "../ferrox-quant" }
+ferrox-quant = { workspace = true }
 half = { workspace = true }
 
 [features]

@@ -3,16 +3,20 @@ name = "ferrox-server"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "OpenAI-compatible HTTP server for the Ferrox inference engine"
+readme = "../../README.md"
 
 [[bin]]
 name = "ferrox-server"
 path = "src/main.rs"
 
 [dependencies]
-ferrox-core = { path = "../ferrox-core" }
-ferrox-models = { path = "../ferrox-models" }
-ferrox-gguf = { path = "../ferrox-gguf" }
-ferrox-safetensors = { path = "../ferrox-safetensors" }
+ferrox-core = { workspace = true }
+ferrox-models = { workspace = true }
+ferrox-gguf = { workspace = true }
+ferrox-safetensors = { workspace = true }
 axum = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
@@ -22,8 +26,8 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
-ferrox-cuda = { path = "../ferrox-cuda" }
-ferrox-metal = { path = "../ferrox-metal" }
+ferrox-cuda = { workspace = true }
+ferrox-metal = { workspace = true }
 futures-util = "0.3"
 axum-server = { version = "0.8.0", features = ["tls-rustls"] }
 tower-http = { version = "0.7.0", features = ["cors"] }
@@ -31,7 +35,7 @@ tower-http = { version = "0.7.0", features = ["cors"] }
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
-ferrox-moe = { path = "../ferrox-moe" }
+ferrox-moe = { workspace = true }
 base64 = "0.23.0"
 
 [features]

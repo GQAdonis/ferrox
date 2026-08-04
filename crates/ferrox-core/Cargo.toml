@@ -3,12 +3,16 @@ name = "ferrox-core"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Core tensor ops, RoPE, GQA, and KV cache for Ferrox"
+readme = "../../README.md"
 
 [dependencies]
-ferrox-gguf = { path = "../ferrox-gguf" }
-ferrox-quant = { path = "../ferrox-quant" }
-ferrox-cuda = { path = "../ferrox-cuda", optional = true }
-ferrox-metal = { path = "../ferrox-metal", optional = true }
+ferrox-gguf = { workspace = true }
+ferrox-quant = { workspace = true }
+ferrox-cuda = { workspace = true, optional = true }
+ferrox-metal = { workspace = true, optional = true }
 memmap2 = { workspace = true }
 rayon = { workspace = true }
 anyhow = { workspace = true }

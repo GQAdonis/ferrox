@@ -3,6 +3,10 @@ name = "ferrox-quant"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Quantized weight formats and fused dequant kernels for Ferrox"
+readme = "../../README.md"
 
 [dependencies]
 half = { workspace = true }

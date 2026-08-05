@@ -45,7 +45,7 @@ Keep off (regressions): legacy GQA NSG=4, sequential GREEDY argmax, float4 elem,
 | Gemma-3-1B-IT Q8_0 | metal | **94.11** ±0.3 | **81.70** ±4.2 | 🟢 **~0.87×** | 🟢 **ferrox** | ok | [`gemma3_1b_q8_metal`](receipts/pins/gemma3_1b_q8_metal.json) |
 | Gemma-3-1B-IT Q8_0 | cpu | **31.67** ±3.7 | **19.72** ±1.9 (−ngl 0) | 🟢 **~0.62×** | 🟢 **ferrox** | ok | [`gemma3_1b_q8_cpu`](receipts/pins/gemma3_1b_q8_cpu.json) |
 | Phi-3-mini-4k-Instruct Q4 | metal | **49.11** ±0.1 | **53.42** ±0.3 | 🔴 **~1.09×** | 🔴 **llama** | ok | [`phi3_mini_q4_metal`](receipts/pins/phi3_mini_q4_metal.json) |
-| Phi-3-mini-4k-Instruct Q4 | cpu | **5.78** ±0.1 | **9.48** ±1.0 (−ngl 0) | 🔴 **~1.64×** | 🔴 **llama** | ok | [`phi3_mini_q4_cpu`](receipts/pins/phi3_mini_q4_cpu.json) |
+| Phi-3-mini-4k-Instruct Q4 | cpu | **7.91** ±0.1 | **7.68** ±4.8 (−ngl 0) | ⚪ **~0.97×** | ⚪ parity | ok | [`phi3_mini_q4_cpu`](receipts/pins/phi3_mini_q4_cpu.json) |
 | Gemma-4-E2B-IT Q4_K_M | metal | refused | — | — | — | refuse | [`gemma4_e2b_q4km_metal`](receipts/pins/gemma4_e2b_q4km_metal.json) |
 | Gemma-4-E2B-IT Q4_K_M | cpu | — | — | — | — | no pin | — |
 | Phi-4-mini-Instruct Q4_K_M | metal | **50.04** ±0.3 | **53.12** ±0.3 | 🔴 **~1.06×** | 🔴 **llama** | ok | [`phi4_mini_q4km_metal`](receipts/pins/phi4_mini_q4km_metal.json) |

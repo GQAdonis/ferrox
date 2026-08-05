@@ -15,7 +15,10 @@ and an OpenAI-compatible HTTP server.
 - **Fast where it counts** — benchmarked against llama.cpp on the same
   host, backend, and GGUF. CPU decode meets or beats llama.cpp on most
   tested models; Metal is at parity for the Llama family and ahead for
-  Qwen. Every claim has a pinned receipt in
+  Qwen. **CLI model load/startup is consistently faster** (mmap path;
+  e.g. Llama-8B Metal load Gap ~0.03×, Mistral ~0.07× — Load gap =
+  `ferrox_load / llama_load`, same &lt;1 = ferrox better rule as decode).
+  Every claim has a pinned receipt in
   [benchmarks/RESULTS.md](benchmarks/RESULTS.md).
 - **Broad architecture support** — Llama 3.x, TinyLlama, SmolLM2,
   Qwen2.5/Qwen3 (QKV bias, per-head QK-norm), Gemma-3 (GeGLU, sliding-window
@@ -96,8 +99,8 @@ curl -s -X POST http://127.0.0.1:8383/v1/chat/completions \
 | Kimi / GLM / DeepSeek | Partial — primitives and synthetic stacks, no frontier checkpoint end-to-end |
 | CUDA performance | Deferred — compiles and runs; fair-chat tuning paused |
 
-Benchmark methodology and receipts: [benchmarks/RESULTS.md](benchmarks/RESULTS.md)
-(`python3 benchmarks/run_suite.py`).
+Benchmark methodology and receipts (decode + CLI load): [benchmarks/RESULTS.md](benchmarks/RESULTS.md)
+(`python3 benchmarks/run_suite.py`, including `--mode cli`).
 
 ## Documentation
 
@@ -107,7 +110,7 @@ Benchmark methodology and receipts: [benchmarks/RESULTS.md](benchmarks/RESULTS.m
 | [docs/MODELS.md](docs/MODELS.md) | Supported models and verification status |
 | [docs/API.md](docs/API.md) | OpenAI-compatible API matrix |
 | [docs/CONFIG.md](docs/CONFIG.md) | Environment variables and tuning |
-| [benchmarks/RESULTS.md](benchmarks/RESULTS.md) | Pinned tok/s vs llama.cpp |
+| [benchmarks/RESULTS.md](benchmarks/RESULTS.md) | Pinned tok/s + CLI load/startup vs llama.cpp |
 | [docs/ROADMAP.md](docs/ROADMAP.md) | Planned work |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | How to contribute |
 

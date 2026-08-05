@@ -1,0 +1,90 @@
+{
+  "schema": 1,
+  "id": "gemma2_2b_q4km",
+  "name": "Gemma-2-2B-IT Q4_K_M",
+  "backend": "cpu",
+  "expect": "ok",
+  "date": "2026-08-05",
+  "host": "Host B (Apple M2 Pro, 10 logical cores)",
+  "model": "~/Desktop/Dev/ferrox/models/gemma-2-2b-it-Q4_K_M.gguf",
+  "max_tokens": 512,
+  "reps": 3,
+  "mode": "cli",
+  "workload": "greedy chat, warm then 3x 512-tok capitals list (median)",
+  "notes": "Attn + final logit softcap + SWA; FA-vec skipped when softcap set",
+  "ferrox": {
+    "wall_s": 62.467,
+    "engine": "ferrox",
+    "load_s": 0.06,
+    "prompt_per_second": 11.25,
+    "completion_tokens": 512,
+    "predicted_per_second": 8.86,
+    "prefix": "-7777-4777-8777-777777777777\n\n**1. Berlin, Germany:**  Berli",
+    "predicted_stddev": 0.24,
+    "prompt_stddev": 1.071,
+    "load_stddev": 0.0,
+    "reps": 3,
+    "runs": [
+      {
+        "predicted_per_second": 8.86,
+        "prompt_per_second": 9.52,
+        "wall_s": 62.467,
+        "load_s": 0.06,
+        "completion_tokens": 512
+      },
+      {
+        "predicted_per_second": 9.1,
+        "prompt_per_second": 11.48,
+        "wall_s": 59.66,
+        "load_s": 0.06,
+        "completion_tokens": 512
+      },
+      {
+        "predicted_per_second": 8.62,
+        "prompt_per_second": 11.25,
+        "wall_s": 62.767,
+        "load_s": 0.06,
+        "completion_tokens": 512
+      }
+    ],
+    "mode": "cli"
+  },
+  "llama": {
+    "wall_s": 49.987,
+    "engine": "llama",
+    "load_s": 0.929,
+    "prompt_per_second": 67.22,
+    "predicted_per_second": 10.95,
+    "completion_tokens": 511,
+    "prefix": "-770c-470d-900e-770000000000\n\n**Please note:** This list is ",
+    "predicted_stddev": 3.905,
+    "prompt_stddev": 19.909,
+    "load_stddev": 0.562,
+    "reps": 3,
+    "runs": [
+      {
+        "predicted_per_second": 10.95,
+        "prompt_per_second": 49.02,
+        "wall_s": 49.987,
+        "load_s": 1.728,
+        "completion_tokens": 511
+      },
+      {
+        "predicted_per_second": 16.51,
+        "prompt_per_second": 67.22,
+        "wall_s": 33.339,
+        "load_s": 0.929,
+        "completion_tokens": 511
+      },
+      {
+        "predicted_per_second": 8.98,
+        "prompt_per_second": 88.79,
+        "wall_s": 58.595,
+        "load_s": 0.644,
+        "completion_tokens": 511
+      }
+    ],
+    "mode": "cli"
+  },
+  "status": "ok"
+}

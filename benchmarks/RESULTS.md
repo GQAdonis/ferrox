@@ -64,6 +64,7 @@ One-shot `-p … -n N --no-cnv --ignore-eos`, fresh process per rep, strictly se
 | Mistral-7B-Instruct-v0.2 Q4_K_M | metal | **26.78** ±0.1 | **29.90** ±1.3 | 🔴 **~1.12×** | **0.080** ±0.038 | **1.115** ±1.242 | 🟢 **~0.07×** | [`mistral_7b_q4km_metal_cli`](receipts/pins/mistral_7b_q4km_metal_cli.json) |
 | Llama-3.2-1B-Instruct IQ4_XS | metal | **146.54** ±2.7 | **135.20** ±3.6 | 🟢 **~0.92×** | — | — | — | [`iq4_xs_metal_cli`](receipts/pins/iq4_xs_metal_cli.json) |
 | Gemma-2-2B-IT Q4_K_M | metal | **35.71** ±0.1 | **57.86** ±0.5 | 🔴 **~1.62×** | **0.100** ±0.010 | **0.661** ±0.617 | 🟢 **~0.15×** | [`gemma2_2b_q4km_metal_cli`](receipts/pins/gemma2_2b_q4km_metal_cli.json) |
+| Gemma-2-2B-IT Q4_K_M | cpu | **8.86** ±0.2 | **10.95** ±3.9 | 🔴 **~1.24×** | **0.060** ±0.000 | **0.929** ±0.562 | 🟢 **~0.06×** | [`gemma2_2b_q4km_cpu_cli`](receipts/pins/gemma2_2b_q4km_cpu_cli.json) |
 | SmolLM2-135M-Instruct Q8_0 | metal | **281.65** ±8.9 | **225.70** ±8.2 | 🟢 **~0.80×** | — | — | — | [`smollm2_135m_q8_metal_cli`](receipts/pins/smollm2_135m_q8_metal_cli.json) |
 | SmolLM2-135M-Instruct Q8_0 | cpu | **56.50** ±0.1 | **61.90** ±11.9 | 🔴 **~1.10×** | — | — | — | [`smollm2_135m_q8_cpu_cli`](receipts/pins/smollm2_135m_q8_cpu_cli.json) |
 | Qwen2.5-0.5B-Instruct Q8_0 | metal | **200.61** ±4.1 | **129.40** ±0.6 | 🟢 **~0.65×** | — | — | — | [`qwen25_05b_q8_metal_cli`](receipts/pins/qwen25_05b_q8_metal_cli.json) |

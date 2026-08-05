@@ -52,6 +52,18 @@ def gap_str(fp, lp) -> str:
     return "—"
 
 
+def winner_str(fp, lp) -> str:
+    """Who is faster on predicted tok/s (same 1.5% tie band as gap_str)."""
+    if fp and lp and fp > 0:
+        g = lp / fp
+        if abs(g - 1.0) < 0.015:
+            return "tie"
+        if g < 1.0:
+            return "ferrox"
+        return "llama"
+    return "—"
+
+
 def status_cell(pin: dict | None, expect: str) -> str:
     if pin is None:
         return "no pin"
@@ -116,7 +128,8 @@ def main() -> None:
         "**This file is generated** by [`render_results.py`](render_results.py) — "
         "do not hand-edit headlines.\n",
         "\n",
-        "**Gap** = `llama_pred / ferrox_pred` (&lt;1 ferrox faster; &gt;1 ferrox slower).\n",
+        "**Gap** = `llama_pred / ferrox_pred` (&lt;1 ferrox faster; &gt;1 ferrox slower). "
+        "**Winner** = faster engine on predicted tok/s (tie within ~1.5%).\n",
         "\n",
         "**North star:** ≥ llama.cpp same host/GGUF/backend.\n",
         north,
@@ -129,8 +142,8 @@ def main() -> None:
         "\n",
         "## Headlines\n",
         "\n",
-        "| Model | Backend | ferrox pred | llama pred | Gap | Status | Pin |\n",
-        "|---|---|---|---|---|---|---|\n",
+        "| Model | Backend | ferrox pred (tok/s) | llama pred (tok/s) | Gap | Winner | Status | Pin |\n",
+        "|---|---|---|---|---|---|---|---|\n",
     ]
 
     for entry in suite["models"]:
@@ -166,7 +179,7 @@ def main() -> None:
             star = "\\*" if expect == "weak" else ""
             lines.append(
                 f"| {name}{star} | {backend} | {fcell} | {lcell} | "
-                f"{gap_str(fp, lp)} | {st} | {link} |\n"
+                f"{gap_str(fp, lp)} | {winner_str(fp, lp)} | {st} | {link} |\n"
             )
 
     lines.append("\n")
@@ -193,8 +206,8 @@ def main() -> None:
             "One-shot `-p … -n N --no-cnv --ignore-eos`, fresh process per rep, "
             "strictly sequential (llama exits before ferrox starts). Engines' own "
             "stderr timings; decode excludes model load.\n\n"
-            "| Model | Backend | ferrox pred | llama pred | Gap | Pin |\n"
-            "|---|---|---|---|---|---|\n"
+            "| Model | Backend | ferrox pred (tok/s) | llama pred (tok/s) | Gap | Winner | Pin |\n"
+            "|---|---|---|---|---|---|---|\n"
         )
         for entry in suite["models"]:
             mid = entry["id"]
@@ -211,7 +224,7 @@ def main() -> None:
                 lcell = fmt_num(lp, lsd) if lp is not None else "—"
                 lines.append(
                     f"| {entry['name']} | {backend} | {fcell} | {lcell} | "
-                    f"{gap_str(fp, lp)} | "
+                    f"{gap_str(fp, lp)} | {winner_str(fp, lp)} | "
                     f"[`{mid}_{backend}_cli`](receipts/pins/{mid}_{backend}_cli.json) |\n"
                 )
 

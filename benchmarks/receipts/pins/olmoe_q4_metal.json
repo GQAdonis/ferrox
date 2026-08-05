@@ -1,0 +1,89 @@
+{
+  "schema": 1,
+  "id": "olmoe_q4",
+  "name": "OLMoE-1B-7B-0924 Q4_0",
+  "backend": "metal",
+  "expect": "ok",
+  "date": "2026-08-05",
+  "host": "Host B (Apple M2 Pro, 10 logical cores)",
+  "model": "~/Desktop/Dev/ferrox/models/olmoe-1b-7b-0924-q4_0.gguf",
+  "max_tokens": 512,
+  "reps": 3,
+  "mode": "server",
+  "workload": "greedy chat, warm then 3x 512-tok capitals list (median)",
+  "notes": "Verified MoE; Metal/CUDA expert placement when budget set",
+  "ferrox": {
+    "wall_s": 52.531,
+    "predicted_per_second": 10.261,
+    "prompt_per_second": 12.725,
+    "completion_tokens": 512,
+    "wall_tok_s": 9.747,
+    "prefix": "-a9a9-4e4d-a9a9-a9a9a9a9a9a\n\nThe first step is to create a l",
+    "predicted_stddev": 0.348,
+    "prompt_stddev": 1.542,
+    "wall_tok_s_stddev": 0.277,
+    "reps": 3,
+    "runs": [
+      {
+        "predicted_per_second": 9.894476526959384,
+        "prompt_per_second": 15.301372409024868,
+        "wall_tok_s": 9.498,
+        "wall_s": 53.906,
+        "completion_tokens": 512
+      },
+      {
+        "predicted_per_second": 10.260960003074274,
+        "prompt_per_second": 12.545647466615037,
+        "wall_tok_s": 9.747,
+        "wall_s": 52.531,
+        "completion_tokens": 512
+      },
+      {
+        "predicted_per_second": 10.590320029155027,
+        "prompt_per_second": 12.724625181464482,
+        "wall_tok_s": 10.051,
+        "wall_s": 50.941,
+        "completion_tokens": 512
+      }
+    ],
+    "metal_fails": 0,
+    "engine": "ferrox"
+  },
+  "llama": {
+    "wall_s": 3.394,
+    "predicted_per_second": 152.789,
+    "prompt_per_second": 17474.186,
+    "completion_tokens": 512,
+    "wall_tok_s": 150.865,
+    "prefix": "Write a detailed numbered list of 80 European capital cities",
+    "predicted_stddev": 1.174,
+    "prompt_stddev": 15038.604,
+    "wall_tok_s_stddev": 0.937,
+    "reps": 3,
+    "runs": [
+      {
+        "predicted_per_second": 151.32532314015415,
+        "prompt_per_second": 39062.50000000001,
+        "wall_tok_s": 150.865,
+        "wall_s": 3.394,
+        "completion_tokens": 512
+      },
+      {
+        "predicted_per_second": 153.6473541145381,
+        "prompt_per_second": 17474.185861795075,
+        "wall_tok_s": 152.391,
+        "wall_s": 3.36,
+        "completion_tokens": 512
+      },
+      {
+        "predicted_per_second": 152.7890720003581,
+        "prompt_per_second": 10131.712259371834,
+        "wall_tok_s": 150.686,
+        "wall_s": 3.398,
+        "completion_tokens": 512
+      }
+    ],
+    "engine": "llama"
+  },
+  "status": "ok"
+}

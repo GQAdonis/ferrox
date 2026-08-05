@@ -15,6 +15,8 @@ thiserror = { workspace = true }
 memmap2 = { workspace = true }
 # f16 Metal KV (matches llama.cpp default -ctk/-ctv f16).
 half = { workspace = true }
+# Host-side Q8_0 pack/unpack for `FERROX_CTK=q8_0` upload/download.
+ferrox-quant = { workspace = true }
 
 # Metal bindings are Apple-platform-only; kept as a target-specific
 # optional dependency so `cargo build -p ferrox-metal` (no features)

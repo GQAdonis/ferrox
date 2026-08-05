@@ -36,6 +36,7 @@ mod generate;
 mod journal;
 mod limits;
 mod model;
+mod anthropic;
 mod openai_extra;
 mod security;
 mod session;
@@ -330,7 +331,7 @@ pub(crate) struct MlaModel {
 }
 
 impl Model {
-    fn chat_template(&self) -> chat_template::ChatTemplate {
+    pub(crate) fn chat_template(&self) -> chat_template::ChatTemplate {
         match self {
             Model::Gguf(m) => m.chat_template,
             Model::Kimi(m) => m.chat_template,
@@ -483,25 +484,25 @@ fn lock_cache(cache: &Mutex<ResponseCache>) -> MutexGuard<'_, ResponseCache> {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-struct ChatMessage {
-    role: String,
+pub(crate) struct ChatMessage {
+    pub(crate) role: String,
     /// `None` for an assistant message that made tool calls instead of
     /// replying with text (the real OpenAI convention: `content` and
     /// `tool_calls` are mutually exclusive on an assistant message).
     #[serde(default)]
-    content: Option<String>,
+    pub(crate) content: Option<String>,
     /// Present on a replayed assistant message that previously made
     /// one or more tool calls (conversation history a client sends
     /// back on a follow-up request).
     #[serde(default)]
-    tool_calls: Option<Vec<ToolCallIn>>,
+    pub(crate) tool_calls: Option<Vec<ToolCallIn>>,
     /// Present on a `"tool"`-role message carrying a call's result
     /// (unused by rendering today -- `role` alone already
     /// distinguishes it -- but accepted so real OpenAI-shaped tool-
     /// result messages deserialize without error).
     #[serde(default)]
     #[allow(dead_code)]
-    tool_call_id: Option<String>,
+    pub(crate) tool_call_id: Option<String>,
 }
 
 impl ChatMessage {
@@ -526,7 +527,7 @@ impl ChatMessage {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-struct ToolCallIn {
+pub(crate) struct ToolCallIn {
     #[serde(default)]
     #[allow(dead_code)]
     id: String,
@@ -1132,7 +1133,7 @@ pub(crate) fn run_generation(
     ))
 }
 
-fn prompt_from_messages(
+pub(crate) fn prompt_from_messages(
     messages: &[ChatMessage],
     template: chat_template::ChatTemplate,
     tools: &[ToolDef],
@@ -1998,6 +1999,7 @@ async fn run() -> anyhow::Result<()> {
     let mut protected = Router::new()
         .route("/v1/models", get(list_models))
         .route("/v1/chat/completions", post(chat_completions))
+        .route("/v1/messages", post(anthropic::messages))
         .route("/v1/completions", post(openai_extra::completions))
         .route("/v1/tokenize", post(openai_extra::tokenize))
         .route("/v1/detokenize", post(openai_extra::detokenize))

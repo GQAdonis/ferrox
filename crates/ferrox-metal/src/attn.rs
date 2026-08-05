@@ -1,7 +1,9 @@
 //! Metal attention path: Norm/NeoX RoPE, KV append, and online-softmax GQA.
 //!
-//! Device K/V caches are **f16** (llama.cpp default `-ctk f16 -ctv f16`);
-//! Q/activations stay f32. Append converts f32→half on GPU.
+//! Device K/V caches default to **f16** (llama.cpp `-ctk f16 -ctv f16`);
+//! `FERROX_CTK=q8_0` stores ggml Q8_0 blocks and dequants to a process-wide
+//! f16 scratch before FA/GQA (shared across layers → real resident savings).
+//! Q/activations stay f32. Append converts f32→half or f32→Q8_0 on GPU.
 //!
 //! **Decode (B=1):** Q/K/V/O matvecs fused with RoPE→KV→GQA in one command
 //! buffer ([`launch_decode_attn_block`]); dense layers can continue through
@@ -227,6 +229,67 @@ kernel void kv_append(
 }
 "#;
 
+/// ggml Q8_0: 32 int8 values + one f16 scale (34 bytes). One thread / block.
+const KV_APPEND_Q8_0_KERNEL_SRC: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+kernel void kv_append_q8_0(
+    device const float* src [[buffer(0)]],
+    device uchar* dst [[buffer(1)]],
+    constant uint& offset_elems [[buffer(2)]],
+    constant uint& n_elems [[buffer(3)]],
+    uint b [[thread_position_in_grid]]
+) {
+    const uint BLOCK = 32u;
+    const uint BLOCK_BYTES = 34u;
+    uint n_blocks = n_elems / BLOCK;
+    if (b >= n_blocks) return;
+    uint src_base = b * BLOCK;
+    float amax = 0.0f;
+    for (uint i = 0u; i < BLOCK; i++) {
+        amax = fmax(amax, fabs(src[src_base + i]));
+    }
+    float d = amax / 127.0f;
+    float id = (d != 0.0f) ? (1.0f / d) : 0.0f;
+    uint dst_block = (offset_elems / BLOCK) + b;
+    uint dst_base = dst_block * BLOCK_BYTES;
+    half d_h = half(d);
+    dst[dst_base + 0] = uchar(as_type<ushort>(d_h) & 0xFFu);
+    dst[dst_base + 1] = uchar(as_type<ushort>(d_h) >> 8u);
+    for (uint i = 0u; i < BLOCK; i++) {
+        int q = int(round(src[src_base + i] * id));
+        q = clamp(q, -127, 127);
+        dst[dst_base + 2u + i] = uchar(char(q));
+    }
+}
+"#;
+
+const DEQUANT_Q8_0_TO_F16_KERNEL_SRC: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+kernel void dequant_q8_0_to_f16(
+    device const uchar* src [[buffer(0)]],
+    device half* dst [[buffer(1)]],
+    constant uint& n_elems [[buffer(2)]],
+    uint b [[thread_position_in_grid]]
+) {
+    const uint BLOCK = 32u;
+    const uint BLOCK_BYTES = 34u;
+    uint n_blocks = n_elems / BLOCK;
+    if (b >= n_blocks) return;
+    uint src_base = b * BLOCK_BYTES;
+    ushort d_bits = ushort(src[src_base]) | (ushort(src[src_base + 1u]) << 8u);
+    float d = float(as_type<half>(d_bits));
+    uint dst_base = b * BLOCK;
+    for (uint i = 0u; i < BLOCK; i++) {
+        char q = char(src[src_base + 2u + i]);
+        dst[dst_base + i] = half(float(q) * d);
+    }
+}
+"#;
+
 /// Whether FA-vec GQA decode is enabled.
 ///
 /// Default: **on** for supported head dims (64 / 96 / 128 / 256) via
@@ -248,8 +311,9 @@ pub fn metal_fa_vec_enabled() -> bool {
 
 /// Device KV cache element type (llama.cpp `-ctk` / `--kvcache-dtype` analogue).
 ///
-/// Selected via `FERROX_CTK` ([`metal_kv_dtype`]). **Today only F16 buffers
-/// are allocated** — other variants are parsed and warn once until kernels land.
+/// Selected via `FERROX_CTK` ([`metal_kv_dtype`]). [`MetalKvDtype::F16`] and
+/// [`MetalKvDtype::Q8_0`] allocate matching buffers; other variants warn once
+/// and fall back to F16 until kernels land.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MetalKvDtype {
     F16,
@@ -277,8 +341,33 @@ impl MetalKvDtype {
     }
 
     pub fn is_implemented(self) -> bool {
-        matches!(self, Self::F16)
+        matches!(self, Self::F16 | Self::Q8_0)
     }
+}
+
+/// True when `n_kv_heads * head_dim` is a multiple of ggml Q8_0 block size (32).
+pub fn metal_kv_q8_0_viable(n_kv_heads: usize, head_dim: usize) -> bool {
+    (n_kv_heads * head_dim).is_multiple_of(ferrox_quant::Q8_0_BLOCK_ELEMS)
+}
+
+/// Dtype actually used for new [`MetalKvBuffers`] (unimplemented / non-viable → F16).
+pub fn effective_metal_kv_dtype(n_kv_heads: usize, head_dim: usize) -> MetalKvDtype {
+    let requested = metal_kv_dtype();
+    if !requested.is_implemented() {
+        return MetalKvDtype::F16;
+    }
+    if requested == MetalKvDtype::Q8_0 && !metal_kv_q8_0_viable(n_kv_heads, head_dim) {
+        static WARNED: OnceLock<()> = OnceLock::new();
+        let _ = WARNED.get_or_init(|| {
+            eprintln!(
+                "FERROX_CTK=q8_0: n_kv_heads*head_dim={} not divisible by {}; using f16",
+                n_kv_heads * head_dim,
+                ferrox_quant::Q8_0_BLOCK_ELEMS
+            );
+        });
+        return MetalKvDtype::F16;
+    }
+    requested
 }
 
 /// Parse `FERROX_CTK` / `-ctk`-style strings. Unknown → [`MetalKvDtype::F16`].
@@ -1370,10 +1459,13 @@ kernel void rope_neox_heads_batch(
 }
 "#;
 
-/// Growable Metal-resident KV for one layer (`[seq, n_kv, head_dim]`),
-/// stored as **f16** to match llama.cpp's default `-ctk f16 -ctv f16`
-/// (halves attention bandwidth vs f32).
+/// Growable Metal-resident KV for one layer (`[seq, n_kv, head_dim]`).
+///
+/// Default **f16** matches llama.cpp `-ctk f16`. With `FERROX_CTK=q8_0` and a
+/// viable head layout, stores ggml Q8_0 (~½ the bytes); attention kernels still
+/// read f16 via a process-wide dequant scratch shared across layers.
 pub struct MetalKvBuffers {
+    dtype: MetalKvDtype,
     k: Retained<ProtocolObject<dyn MTLBuffer>>,
     v: Retained<ProtocolObject<dyn MTLBuffer>>,
     pub n_kv_heads: usize,
@@ -1387,15 +1479,48 @@ pub struct MetalKvBuffers {
 unsafe impl Send for MetalKvBuffers {}
 unsafe impl Sync for MetalKvBuffers {}
 
+fn kv_store_nbytes(dtype: MetalKvDtype, elems: usize) -> Result<usize, MetalError> {
+    match dtype {
+        MetalKvDtype::F16 => Ok(elems * 2),
+        MetalKvDtype::Q8_0 => {
+            if !elems.is_multiple_of(ferrox_quant::Q8_0_BLOCK_ELEMS) {
+                return Err(MetalError::CommandFailed);
+            }
+            Ok((elems / ferrox_quant::Q8_0_BLOCK_ELEMS) * ferrox_quant::Q8_0_BLOCK_BYTES)
+        }
+        _ => Ok(elems * 2),
+    }
+}
+
 impl MetalKvBuffers {
     pub fn with_capacity(
         n_kv_heads: usize,
         head_dim: usize,
         max_seq_len: usize,
     ) -> Result<Self, MetalError> {
+        let dtype = effective_metal_kv_dtype(n_kv_heads, head_dim);
+        Self::with_capacity_dtype(n_kv_heads, head_dim, max_seq_len, dtype)
+    }
+
+    /// Allocate KV buffers with an explicit store dtype (tests / callers that
+    /// bypass `FERROX_CTK`).
+    pub fn with_capacity_dtype(
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq_len: usize,
+        dtype: MetalKvDtype,
+    ) -> Result<Self, MetalError> {
         let shared = shared_metal()?;
-        let elems = max_seq_len.max(1) * n_kv_heads * head_dim;
-        let nbytes = elems * 2; // f16
+        let dtype = match dtype {
+            MetalKvDtype::Q8_0 if !metal_kv_q8_0_viable(n_kv_heads, head_dim) => {
+                return Err(MetalError::CommandFailed);
+            }
+            d if d.is_implemented() => d,
+            _ => MetalKvDtype::F16,
+        };
+        let capacity = max_seq_len.max(1);
+        let elems = capacity * n_kv_heads * head_dim;
+        let nbytes = kv_store_nbytes(dtype, elems)?;
         let k = shared
             .device
             .newBufferWithLength_options(nbytes, MTLResourceOptions::StorageModeShared)
@@ -1405,13 +1530,18 @@ impl MetalKvBuffers {
             .newBufferWithLength_options(nbytes, MTLResourceOptions::StorageModeShared)
             .ok_or(MetalError::BufferAllocFailed)?;
         Ok(Self {
+            dtype,
             k,
             v,
             n_kv_heads,
             head_dim,
             seq_len: 0,
-            capacity: max_seq_len.max(1),
+            capacity,
         })
+    }
+
+    pub fn dtype(&self) -> MetalKvDtype {
+        self.dtype
     }
 
     pub fn capacity(&self) -> usize {
@@ -1423,7 +1553,7 @@ impl MetalKvBuffers {
     }
 
     /// Overwrites device K/V from host f32 caches (e.g. after CPU prefill),
-    /// converting to f16 on the host.
+    /// converting to the store dtype on the host.
     pub fn upload_from_host(
         &mut self,
         k: &[f32],
@@ -1436,26 +1566,46 @@ impl MetalKvBuffers {
             return Err(MetalError::CommandFailed);
         }
         let n = seq_len * self.elems_per_token();
-        let k_f16: Vec<u16> = k
-            .iter()
-            .map(|&x| half::f16::from_f32(x).to_bits())
-            .collect();
-        let v_f16: Vec<u16> = v
-            .iter()
-            .map(|&x| half::f16::from_f32(x).to_bits())
-            .collect();
-        let nbytes = n * 2;
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                k_f16.as_ptr() as *const u8,
-                self.k.contents().as_ptr() as *mut u8,
-                nbytes,
-            );
-            std::ptr::copy_nonoverlapping(
-                v_f16.as_ptr() as *const u8,
-                self.v.contents().as_ptr() as *mut u8,
-                nbytes,
-            );
+        match self.dtype {
+            MetalKvDtype::Q8_0 => {
+                let k_q = ferrox_quant::quantize_q8_0(&k[..n]);
+                let v_q = ferrox_quant::quantize_q8_0(&v[..n]);
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        k_q.as_ptr(),
+                        self.k.contents().as_ptr() as *mut u8,
+                        k_q.len(),
+                    );
+                    std::ptr::copy_nonoverlapping(
+                        v_q.as_ptr(),
+                        self.v.contents().as_ptr() as *mut u8,
+                        v_q.len(),
+                    );
+                }
+            }
+            _ => {
+                let k_f16: Vec<u16> = k[..n]
+                    .iter()
+                    .map(|&x| half::f16::from_f32(x).to_bits())
+                    .collect();
+                let v_f16: Vec<u16> = v[..n]
+                    .iter()
+                    .map(|&x| half::f16::from_f32(x).to_bits())
+                    .collect();
+                let nbytes = n * 2;
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        k_f16.as_ptr() as *const u8,
+                        self.k.contents().as_ptr() as *mut u8,
+                        nbytes,
+                    );
+                    std::ptr::copy_nonoverlapping(
+                        v_f16.as_ptr() as *const u8,
+                        self.v.contents().as_ptr() as *mut u8,
+                        nbytes,
+                    );
+                }
+            }
         }
         self.seq_len = seq_len;
         Ok(())
@@ -1464,22 +1614,8 @@ impl MetalKvBuffers {
     /// Copies the last appended token's K/V to host f32 (after a completed CB).
     pub fn last_token_host(&self) -> (Vec<f32>, Vec<f32>) {
         assert!(self.seq_len > 0);
-        let n = self.elems_per_token();
-        let off = (self.seq_len - 1) * n;
-        let k_ptr = self.k.contents();
-        let v_ptr = self.v.contents();
-        let k = unsafe { std::slice::from_raw_parts(k_ptr.as_ptr() as *const u16, off + n) };
-        let v = unsafe { std::slice::from_raw_parts(v_ptr.as_ptr() as *const u16, off + n) };
-        (
-            k[off..]
-                .iter()
-                .map(|&b| half::f16::from_bits(b).to_f32())
-                .collect(),
-            v[off..]
-                .iter()
-                .map(|&b| half::f16::from_bits(b).to_f32())
-                .collect(),
-        )
+        let (k, v) = self.tokens_host(self.seq_len - 1, 1);
+        (k, v)
     }
 
     /// Downloads `n` tokens starting at `start` as f32 (after a completed CB).
@@ -1488,21 +1624,85 @@ impl MetalKvBuffers {
         let per = self.elems_per_token();
         let off = start * per;
         let elems = n * per;
-        let k_ptr = self.k.contents();
-        let v_ptr = self.v.contents();
-        let k = unsafe { std::slice::from_raw_parts(k_ptr.as_ptr() as *const u16, off + elems) };
-        let v = unsafe { std::slice::from_raw_parts(v_ptr.as_ptr() as *const u16, off + elems) };
-        (
-            k[off..off + elems]
-                .iter()
-                .map(|&b| half::f16::from_bits(b).to_f32())
-                .collect(),
-            v[off..off + elems]
-                .iter()
-                .map(|&b| half::f16::from_bits(b).to_f32())
-                .collect(),
-        )
+        match self.dtype {
+            MetalKvDtype::Q8_0 => {
+                let nbytes =
+                    (elems / ferrox_quant::Q8_0_BLOCK_ELEMS) * ferrox_quant::Q8_0_BLOCK_BYTES;
+                let byte_off =
+                    (off / ferrox_quant::Q8_0_BLOCK_ELEMS) * ferrox_quant::Q8_0_BLOCK_BYTES;
+                let k_ptr = self.k.contents();
+                let v_ptr = self.v.contents();
+                let k_bytes = unsafe {
+                    std::slice::from_raw_parts(k_ptr.as_ptr().add(byte_off) as *const u8, nbytes)
+                };
+                let v_bytes = unsafe {
+                    std::slice::from_raw_parts(v_ptr.as_ptr().add(byte_off) as *const u8, nbytes)
+                };
+                (
+                    ferrox_quant::dequant_q8_0(k_bytes).expect("q8 k aligned"),
+                    ferrox_quant::dequant_q8_0(v_bytes).expect("q8 v aligned"),
+                )
+            }
+            _ => {
+                let k_ptr = self.k.contents();
+                let v_ptr = self.v.contents();
+                let k =
+                    unsafe { std::slice::from_raw_parts(k_ptr.as_ptr() as *const u16, off + elems) };
+                let v =
+                    unsafe { std::slice::from_raw_parts(v_ptr.as_ptr() as *const u16, off + elems) };
+                (
+                    k[off..off + elems]
+                        .iter()
+                        .map(|&b| half::f16::from_bits(b).to_f32())
+                        .collect(),
+                    v[off..off + elems]
+                        .iter()
+                        .map(|&b| half::f16::from_bits(b).to_f32())
+                        .collect(),
+                )
+            }
+        }
     }
+}
+
+/// K or V plane when appending into [`MetalKvBuffers`].
+#[derive(Clone, Copy)]
+enum KvPlane {
+    K,
+    V,
+}
+
+/// Process-wide f16 view of Q8_0 KV for FA/GQA (one pair shared across layers).
+struct Q8AttnScratch {
+    k: Retained<ProtocolObject<dyn MTLBuffer>>,
+    v: Retained<ProtocolObject<dyn MTLBuffer>>,
+    elems_cap: usize,
+}
+
+// SAFETY: gated by Q8_ATTN_SCRATCH mutex; encode holds the lock for the CB encode.
+unsafe impl Send for Q8AttnScratch {}
+
+static Q8_ATTN_SCRATCH: Mutex<Option<Q8AttnScratch>> = Mutex::new(None);
+
+fn borrow_q8_attn_scratch(
+    device: &Retained<ProtocolObject<dyn MTLDevice>>,
+    elems: usize,
+) -> Result<std::sync::MutexGuard<'static, Option<Q8AttnScratch>>, MetalError> {
+    let mut guard = Q8_ATTN_SCRATCH.lock().unwrap();
+    let fits = guard.as_ref().is_some_and(|s| s.elems_cap >= elems);
+    if !fits {
+        let nbytes = elems.max(1) * 2;
+        *guard = Some(Q8AttnScratch {
+            k: device
+                .newBufferWithLength_options(nbytes, MTLResourceOptions::StorageModeShared)
+                .ok_or(MetalError::BufferAllocFailed)?,
+            v: device
+                .newBufferWithLength_options(nbytes, MTLResourceOptions::StorageModeShared)
+                .ok_or(MetalError::BufferAllocFailed)?,
+            elems_cap: elems.max(1),
+        });
+    }
+    Ok(guard)
 }
 
 fn alloc_f32_buffer(
@@ -1869,6 +2069,212 @@ fn encode_kv_append(
         },
     );
     Ok(())
+}
+
+fn encode_kv_append_q8_0(
+    encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+    device: &Retained<ProtocolObject<dyn MTLDevice>>,
+    src: &ProtocolObject<dyn MTLBuffer>,
+    dst: &ProtocolObject<dyn MTLBuffer>,
+    offset_elems: u32,
+    n_elems: u32,
+) -> Result<(), MetalError> {
+    if !offset_elems.is_multiple_of(ferrox_quant::Q8_0_BLOCK_ELEMS as u32)
+        || !n_elems.is_multiple_of(ferrox_quant::Q8_0_BLOCK_ELEMS as u32)
+    {
+        return Err(MetalError::CommandFailed);
+    }
+    let pipe = ensure_pipeline(device, KV_APPEND_Q8_0_KERNEL_SRC, "kv_append_q8_0")?;
+    encoder.setComputePipelineState(&pipe.0);
+    unsafe {
+        encoder.setBuffer_offset_atIndex(Some(src), 0, 0);
+        encoder.setBuffer_offset_atIndex(Some(dst), 0, 1);
+        let mut off = offset_elems;
+        encoder.setBytes_length_atIndex(
+            NonNull::new(&mut off as *mut u32 as *mut _).unwrap(),
+            4,
+            2,
+        );
+        let mut n = n_elems;
+        encoder.setBytes_length_atIndex(NonNull::new(&mut n as *mut u32 as *mut _).unwrap(), 4, 3);
+    }
+    let n_blocks = (n_elems as usize) / ferrox_quant::Q8_0_BLOCK_ELEMS;
+    let tg = 256usize.min(n_blocks).max(1);
+    let n_tg = n_blocks.div_ceil(tg);
+    encoder.dispatchThreadgroups_threadsPerThreadgroup(
+        MTLSize {
+            width: n_tg,
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width: tg,
+            height: 1,
+            depth: 1,
+        },
+    );
+    Ok(())
+}
+
+fn encode_dequant_q8_0_to_f16(
+    encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+    device: &Retained<ProtocolObject<dyn MTLDevice>>,
+    src: &ProtocolObject<dyn MTLBuffer>,
+    dst: &ProtocolObject<dyn MTLBuffer>,
+    n_elems: u32,
+) -> Result<(), MetalError> {
+    if !n_elems.is_multiple_of(ferrox_quant::Q8_0_BLOCK_ELEMS as u32) {
+        return Err(MetalError::CommandFailed);
+    }
+    let pipe = ensure_pipeline(device, DEQUANT_Q8_0_TO_F16_KERNEL_SRC, "dequant_q8_0_to_f16")?;
+    encoder.setComputePipelineState(&pipe.0);
+    unsafe {
+        encoder.setBuffer_offset_atIndex(Some(src), 0, 0);
+        encoder.setBuffer_offset_atIndex(Some(dst), 0, 1);
+        let mut n = n_elems;
+        encoder.setBytes_length_atIndex(NonNull::new(&mut n as *mut u32 as *mut _).unwrap(), 4, 2);
+    }
+    let n_blocks = (n_elems as usize) / ferrox_quant::Q8_0_BLOCK_ELEMS;
+    let tg = 256usize.min(n_blocks).max(1);
+    let n_tg = n_blocks.div_ceil(tg);
+    encoder.dispatchThreadgroups_threadsPerThreadgroup(
+        MTLSize {
+            width: n_tg,
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width: tg,
+            height: 1,
+            depth: 1,
+        },
+    );
+    Ok(())
+}
+
+fn encode_kv_store_append(
+    encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+    device: &Retained<ProtocolObject<dyn MTLDevice>>,
+    src: &ProtocolObject<dyn MTLBuffer>,
+    kv: &MetalKvBuffers,
+    plane: KvPlane,
+    offset_elems: u32,
+    n_elems: u32,
+) -> Result<(), MetalError> {
+    let dst: &ProtocolObject<dyn MTLBuffer> = match plane {
+        KvPlane::K => &kv.k,
+        KvPlane::V => &kv.v,
+    };
+    match kv.dtype {
+        MetalKvDtype::Q8_0 => {
+            encode_kv_append_q8_0(encoder, device, src, dst, offset_elems, n_elems)
+        }
+        _ => encode_kv_append(encoder, device, src, dst, offset_elems, n_elems),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn encode_gqa_with_kv(
+    encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+    device: &Retained<ProtocolObject<dyn MTLDevice>>,
+    q: &ProtocolObject<dyn MTLBuffer>,
+    kv: &MetalKvBuffers,
+    out: &ProtocolObject<dyn MTLBuffer>,
+    n_heads: u32,
+    n_kv_heads: u32,
+    head_dim: u32,
+    seq_len: u32,
+    kv_start: u32,
+    softcap: Option<f32>,
+) -> Result<(), MetalError> {
+    match kv.dtype {
+        MetalKvDtype::Q8_0 => {
+            let elems = (seq_len as usize) * kv.elems_per_token();
+            let mut guard = borrow_q8_attn_scratch(device, elems)?;
+            let scratch = guard.as_mut().unwrap();
+            encode_dequant_q8_0_to_f16(encoder, device, &kv.k, &scratch.k, elems as u32)?;
+            encode_dequant_q8_0_to_f16(encoder, device, &kv.v, &scratch.v, elems as u32)?;
+            encode_gqa(
+                encoder,
+                device,
+                q,
+                &scratch.k,
+                &scratch.v,
+                out,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                seq_len,
+                kv_start,
+                softcap,
+            )
+        }
+        _ => encode_gqa(
+            encoder,
+            device,
+            q,
+            &kv.k,
+            &kv.v,
+            out,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            seq_len,
+            kv_start,
+            softcap,
+        ),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn encode_gqa_prefill_with_kv(
+    encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+    device: &Retained<ProtocolObject<dyn MTLDevice>>,
+    q: &ProtocolObject<dyn MTLBuffer>,
+    kv: &MetalKvBuffers,
+    out: &ProtocolObject<dyn MTLBuffer>,
+    n_heads: u32,
+    n_kv_heads: u32,
+    head_dim: u32,
+    n_q: u32,
+    kv_prefix_len: u32,
+) -> Result<(), MetalError> {
+    let total_seq = kv_prefix_len + n_q;
+    match kv.dtype {
+        MetalKvDtype::Q8_0 => {
+            let elems = (total_seq as usize) * kv.elems_per_token();
+            let mut guard = borrow_q8_attn_scratch(device, elems)?;
+            let scratch = guard.as_mut().unwrap();
+            encode_dequant_q8_0_to_f16(encoder, device, &kv.k, &scratch.k, elems as u32)?;
+            encode_dequant_q8_0_to_f16(encoder, device, &kv.v, &scratch.v, elems as u32)?;
+            encode_gqa_prefill(
+                encoder,
+                device,
+                q,
+                &scratch.k,
+                &scratch.v,
+                out,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                n_q,
+                kv_prefix_len,
+            )
+        }
+        _ => encode_gqa_prefill(
+            encoder,
+            device,
+            q,
+            &kv.k,
+            &kv.v,
+            out,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            n_q,
+            kv_prefix_len,
+        ),
+    }
 }
 
 /// TG size for decode GQA: multiple of 32 with **power-of-two** N_SG
@@ -2402,16 +2808,15 @@ pub fn launch_decode_attn_block(
 
     let token_elems = (n_kv_heads * head_dim) as u32;
     let offset = (kv.seq_len * n_kv_heads * head_dim) as u32;
-    encode_kv_append(&encoder, device, &k_buf, &kv.k, offset, token_elems)?;
-    encode_kv_append(&encoder, device, &v_buf, &kv.v, offset, token_elems)?;
+    encode_kv_store_append(&encoder, device, &k_buf, kv, KvPlane::K, offset, token_elems)?;
+    encode_kv_store_append(&encoder, device, &v_buf, kv, KvPlane::V, offset, token_elems)?;
 
     let new_seq = (kv.seq_len + 1) as u32;
-    encode_gqa(
+    encode_gqa_with_kv(
         &encoder,
         device,
         &q_buf,
-        &kv.k,
-        &kv.v,
+        kv,
         &attn_buf,
         n_heads as u32,
         n_kv_heads as u32,
@@ -2557,15 +2962,14 @@ pub fn launch_decode_moe_attn_ffn_pre(
     )?;
     let token_elems = (n_kv_heads * head_dim) as u32;
     let offset = (kv.seq_len * n_kv_heads * head_dim) as u32;
-    encode_kv_append(&encoder, device, &k_buf, &kv.k, offset, token_elems)?;
-    encode_kv_append(&encoder, device, &v_buf, &kv.v, offset, token_elems)?;
+    encode_kv_store_append(&encoder, device, &k_buf, kv, KvPlane::K, offset, token_elems)?;
+    encode_kv_store_append(&encoder, device, &v_buf, kv, KvPlane::V, offset, token_elems)?;
     let new_seq = (kv.seq_len + 1) as u32;
-    encode_gqa(
+    encode_gqa_with_kv(
         &encoder,
         device,
         &q_buf,
-        &kv.k,
-        &kv.v,
+        kv,
         &attn_buf,
         n_heads as u32,
         n_kv_heads as u32,
@@ -2917,15 +3321,14 @@ pub fn launch_moe_decode_pre(
         )?;
         let token_elems = (n_kv_heads * head_dim) as u32;
         let offset = (kv.seq_len * n_kv_heads * head_dim) as u32;
-        encode_kv_append(&encoder, device, &scratch.k, &kv.k, offset, token_elems)?;
-        encode_kv_append(&encoder, device, &scratch.v, &kv.v, offset, token_elems)?;
+        encode_kv_store_append(&encoder, device, &scratch.k, kv, KvPlane::K, offset, token_elems)?;
+        encode_kv_store_append(&encoder, device, &scratch.v, kv, KvPlane::V, offset, token_elems)?;
         let new_seq = (kv.seq_len + 1) as u32;
-        encode_gqa(
+        encode_gqa_with_kv(
             &encoder,
             device,
             &scratch.q,
-            &kv.k,
-            &kv.v,
+            kv,
             &scratch.attn,
             n_heads as u32,
             n_kv_heads as u32,
@@ -3155,14 +3558,13 @@ fn encode_moe_layer_fused(
     )?;
     let token_elems = (n_kv_heads * head_dim) as u32;
     let offset = (pos * n_kv_heads * head_dim) as u32;
-    encode_kv_append(encoder, device, &scratch.k, &kv.k, offset, token_elems)?;
-    encode_kv_append(encoder, device, &scratch.v, &kv.v, offset, token_elems)?;
-    encode_gqa(
+    encode_kv_store_append(encoder, device, &scratch.k, kv, KvPlane::K, offset, token_elems)?;
+    encode_kv_store_append(encoder, device, &scratch.v, kv, KvPlane::V, offset, token_elems)?;
+    encode_gqa_with_kv(
         encoder,
         device,
         &scratch.q,
-        &kv.k,
-        &kv.v,
+        kv,
         &scratch.attn,
         n_heads as u32,
         n_kv_heads as u32,
@@ -3678,16 +4080,15 @@ pub fn launch_decode_dense_layer(
 
     let token_elems = (n_kv_heads * head_dim) as u32;
     let offset = (kv.seq_len * n_kv_heads * head_dim) as u32;
-    encode_kv_append(&encoder, device, &k_buf, &kv.k, offset, token_elems)?;
-    encode_kv_append(&encoder, device, &v_buf, &kv.v, offset, token_elems)?;
+    encode_kv_store_append(&encoder, device, &k_buf, kv, KvPlane::K, offset, token_elems)?;
+    encode_kv_store_append(&encoder, device, &v_buf, kv, KvPlane::V, offset, token_elems)?;
 
     let new_seq = (kv.seq_len + 1) as u32;
-    encode_gqa(
+    encode_gqa_with_kv(
         &encoder,
         device,
         &q_buf,
-        &kv.k,
-        &kv.v,
+        kv,
         &attn_buf,
         n_heads as u32,
         n_kv_heads as u32,
@@ -3999,8 +4400,8 @@ pub fn launch_decode_dense_stack(
         )?;
         let token_elems = (n_kv_heads * head_dim) as u32;
         let offset = (pos * n_kv_heads * head_dim) as u32;
-        encode_kv_append(&encoder, device, k_buf, &kv.k, offset, token_elems)?;
-        encode_kv_append(&encoder, device, v_buf, &kv.v, offset, token_elems)?;
+        encode_kv_store_append(&encoder, device, k_buf, kv, KvPlane::K, offset, token_elems)?;
+        encode_kv_store_append(&encoder, device, v_buf, kv, KvPlane::V, offset, token_elems)?;
         let new_seq = (pos + 1) as u32;
         // Sliding window: only the last `window` positions (incl. current)
         // are visible, matching `causal_gqa_attention_windowed`.
@@ -4008,12 +4409,11 @@ pub fn launch_decode_dense_stack(
             Some(w) => (pos + 1).saturating_sub(w) as u32,
             None => 0,
         };
-        encode_gqa(
+        encode_gqa_with_kv(
             &encoder,
             device,
             q_buf,
-            &kv.k,
-            &kv.v,
+            kv,
             attn_buf,
             n_heads as u32,
             n_kv_heads as u32,
@@ -4363,15 +4763,14 @@ pub fn launch_prefill_attn_block(
 
     let token_elems = (n_q * kv_width) as u32;
     let offset = (kv.seq_len * kv_width) as u32;
-    encode_kv_append(&encoder, device, &k_buf, &kv.k, offset, token_elems)?;
-    encode_kv_append(&encoder, device, &v_buf, &kv.v, offset, token_elems)?;
+    encode_kv_store_append(&encoder, device, &k_buf, kv, KvPlane::K, offset, token_elems)?;
+    encode_kv_store_append(&encoder, device, &v_buf, kv, KvPlane::V, offset, token_elems)?;
 
-    let prefill_result = encode_gqa_prefill(
+    let prefill_result = encode_gqa_prefill_with_kv(
         &encoder,
         device,
         &q_buf,
-        &kv.k,
-        &kv.v,
+        kv,
         &attn_buf,
         n_heads as u32,
         n_kv_heads as u32,
@@ -4544,6 +4943,9 @@ mod tests {
         assert_eq!(parse_metal_kv_dtype(Some("turbo3")), MetalKvDtype::Turbo3);
         assert!(!MetalKvDtype::Turbo4.is_implemented());
         assert!(MetalKvDtype::F16.is_implemented());
+        assert!(MetalKvDtype::Q8_0.is_implemented());
+        assert!(metal_kv_q8_0_viable(4, 64));
+        assert!(!metal_kv_q8_0_viable(2, 8));
     }
 
     fn cpu_gqa(
@@ -5149,5 +5551,76 @@ mod tests {
             let tol = 2e-3 * a.abs().max(1.0);
             assert!((a - b).abs() <= tol, "v dl elem {i}: host={a} metal={b}");
         }
+    }
+
+    #[test]
+    #[ignore = "needs a real Metal GPU"]
+    fn q8_0_kv_prefill_matches_f16_path() {
+        // elems/token = 2*64 = 128 (Q8_0 block-aligned).
+        let n_heads = 4;
+        let n_kv_heads = 2;
+        let head_dim = 64;
+        let n_q = 2;
+        let q: Vec<f32> = (0..n_q * n_heads * head_dim)
+            .map(|i| (i as f32 * 0.07).sin())
+            .collect();
+        let k: Vec<f32> = (0..n_q * n_kv_heads * head_dim)
+            .map(|i| (i as f32 * 0.05).cos())
+            .collect();
+        let v: Vec<f32> = (0..n_q * n_kv_heads * head_dim)
+            .map(|i| (i as f32 * 0.04).sin())
+            .collect();
+        let mut kv_f16 = MetalKvBuffers::with_capacity_dtype(
+            n_kv_heads,
+            head_dim,
+            16,
+            MetalKvDtype::F16,
+        )
+        .expect("f16 kv");
+        let mut kv_q8 = MetalKvBuffers::with_capacity_dtype(
+            n_kv_heads,
+            head_dim,
+            16,
+            MetalKvDtype::Q8_0,
+        )
+        .expect("q8 kv");
+        assert_eq!(kv_q8.dtype(), MetalKvDtype::Q8_0);
+        let (attn_f16, _, _) = launch_prefill_attn_block(
+            &q,
+            &k,
+            &v,
+            &mut kv_f16,
+            n_heads,
+            n_q,
+            MetalRopeLayout::Norm,
+            10000.0,
+            None,
+            0,
+        )
+        .expect("f16 prefill");
+        let (attn_q8, _, _) = launch_prefill_attn_block(
+            &q,
+            &k,
+            &v,
+            &mut kv_q8,
+            n_heads,
+            n_q,
+            MetalRopeLayout::Norm,
+            10000.0,
+            None,
+            0,
+        )
+        .expect("q8 prefill");
+        assert_eq!(attn_f16.len(), attn_q8.len());
+        for (i, (a, b)) in attn_f16.iter().zip(attn_q8.iter()).enumerate() {
+            // Q8_0 KV is lossy; keep a loose absolute+relative bound.
+            let tol = 5e-2 * a.abs().max(1.0);
+            assert!(
+                (a - b).abs() <= tol,
+                "attn elem {i}: f16={a} q8={b} tol={tol}"
+            );
+        }
+        let (k_dl, _) = kv_q8.tokens_host(0, n_q);
+        assert_eq!(k_dl.len(), n_q * n_kv_heads * head_dim);
     }
 }

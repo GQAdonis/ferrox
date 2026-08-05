@@ -16,7 +16,7 @@ ds4 deps — rewrite in-tree.
 | **P2** | MLA GGUF → `MlaEngine` | CLI + **ferrox-server** dense-lead deepseek2/mistral4; MoE-after-dense fail-closed; GLM-4.7 / DS V3 MoE still open |
 | **P3** | Hybrid GDN | `gdn.rs` + loader scaffold; `HybridEngine` assemble + Qwen3.5 smoke still open |
 | **P4** | Gemma-4 text | E2B fail-closed (**DedicatedOnly**: per-layer emb + shared KV + SWA/full head-dim); suite refuse pin; MoE-A4B / VL → P7 |
-| **P5** | KV quant | `FERROX_CTK` / `--ctk` parse + CPU turbo4 sketch; Metal still F16 until kernels |
+| **P5** | KV quant | Metal `q8_0` store + shared f16 dequant scratch landed; `fp8`/`turbo*` still warn→F16; CPU turbo4 sketch |
 
 Also on this horizon (unchanged intent):
 
@@ -39,7 +39,7 @@ Also: recurrent / hybrid / T5 stubs already exist — implement after receipts, 
 
 | Phase | Focus | Notes |
 |---|---|---|
-| **P9** | Server API | Tokenize / detokenize / completions / decoder embeddings shipped; Anthropic Messages, guided decode, MCP, web UI still Planned in [`API.md`](API.md) |
+| **P9** | Server API | Tokenize / detokenize / completions / decoder embeddings + **Anthropic `/v1/messages`** (non-stream text); guided decode, MCP, web UI still Planned in [`API.md`](API.md) |
 | **P10** | Runtime scale | CB opt-in exists (`FERROX_CONTINUOUS_BATCHING`); throughput pin + TP/PD/HF hub still open |
 | **P11** | Polish | Agent cookbook ([`AGENTS_COOKBOOK.md`](AGENTS_COOKBOOK.md)); Metal/CUDA fair-chat pins + optional ISQ still open |
 

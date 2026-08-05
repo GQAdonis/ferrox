@@ -16,6 +16,7 @@ effect (documented here so clients are not surprised).
 | `POST /v1/tokenize` | Supported (`prompt` → `tokens` + `count`) |
 | `POST /v1/detokenize` | Supported (`tokens` → `text`) |
 | `POST /v1/embeddings` | Supported for GGUF `Decoder` only — mean/last pool of final-normed hidden states (pre-`lm_head`). Not a dedicated embedding model; Kimi / other engines return 501 |
+| `POST /v1/messages` | Supported (Anthropic-shaped; non-stream text only) |
 | `GET /cache/stats`, `GET /metrics` | Ferrox extensions |
 | Audio / images / multimodal | Not implemented |
 
@@ -49,7 +50,7 @@ land. Do not treat this section as Supported.
 
 | Item | Phase | Notes |
 |---|---|---|
-| Anthropic Messages API | P9 | Rewrite in-tree |
+| Anthropic Messages streaming / tools / images | P9 | Non-stream text `/v1/messages` shipped |
 | Guided decode / JSON schema / grammar | P9 | Unlocks `response_format` + `tool_choice=required` |
 | MCP tool servers (`--mcp-config`) | P9 | External tool attach |
 | Built-in web UI (`--ui-server`) | P9 | Static chat UI; `ferrox chat` remains first-class |

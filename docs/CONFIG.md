@@ -21,7 +21,7 @@ running without those flags (e.g. embedding ferrox as a library).
 |---|---|
 | `FERROX_METAL` | `1`/`0`/`auto` — Metal matvec/dense offload |
 | `FERROX_METAL_ATTN` | `1`/`0` — fused Metal attention + resident KV cache |
-| `FERROX_CTK` | KV cache dtype: `f16` (default), `q8_0`, `fp8`, `turbo8`, `turbo4`, `turbo3`. Non-f16 warns and falls back until Metal kernels land. Same as CLI `--ctk`. |
+| `FERROX_CTK` | KV cache dtype: `f16` (default), `q8_0` (Metal: ggml Q8_0 store + shared f16 dequant for FA), `fp8`/`turbo*` (parsed; warn + F16 until kernels). Same as CLI `--ctk`. |
 | `FERROX_CUDA` | `1`/`0`/`auto` — CUDA offload (build with `--features cuda`) |
 | `FERROX_CPU_THREADS` | CPU worker threads; same as `-t/--threads` |
 

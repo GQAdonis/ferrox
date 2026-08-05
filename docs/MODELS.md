@@ -76,7 +76,7 @@ always prefer the pin / RESULTS Gap for comparisons.
 | VL / MTP | `vl_engine` stub; `mmproj::find_mmproj_beside`; no multimodal serve |
 | Mamba / T5 | Fail-closed stubs |
 | CUDA speed | Suite `--backend cuda`; need GPU host pins |
-| Metal KV quant | `FERROX_CTK` / `--ctk` parse (`q8_0`/`fp8`/`turbo*`); buffers still F16 |
+| Metal KV quant | `FERROX_CTK=q8_0` / `--ctk q8_0`: ggml Q8_0 resident store + process-wide f16 dequant for FA (needs `n_kv*head_dim` % 32 == 0); `fp8`/`turbo*` still F16 |
 
 ## Backends
 

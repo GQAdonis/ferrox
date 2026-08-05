@@ -617,6 +617,46 @@ pub fn dot_q8_0_q8_scalar(row_bytes: &[u8], act: &Q8Activations) -> f32 {
     acc
 }
 
+/// Integer `vec_dot` of a Q4_0 weight row against pre-quantized Q8
+/// activations (llama.cpp `ggml_vec_dot_q4_0_q8_0`). Opt-in via
+/// `FERROX_CPU_INT_DOT` for Q4_0 matvecs.
+pub fn dot_q4_0_q8(row_bytes: &[u8], act: &Q8Activations) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") {
+            return unsafe { simd_x86::dot_q4_0_q8_avx2(row_bytes, act) };
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        if std::arch::is_aarch64_feature_detected!("neon") {
+            return unsafe { simd_aarch64::dot_q4_0_q8_neon(row_bytes, act) };
+        }
+    }
+    dot_q4_0_q8_scalar(row_bytes, act)
+}
+
+pub fn dot_q4_0_q8_scalar(row_bytes: &[u8], act: &Q8Activations) -> f32 {
+    debug_assert_eq!(row_bytes.len() % Q4_0_BLOCK_BYTES, 0);
+    let n_blocks = row_bytes.len() / Q4_0_BLOCK_BYTES;
+    debug_assert_eq!(n_blocks, act.n_blocks());
+    let mut acc = 0f32;
+    for (b, block) in row_bytes.chunks_exact(Q4_0_BLOCK_BYTES).enumerate() {
+        let dw = f16::from_le_bytes([block[0], block[1]]).to_f32();
+        let base = b * Q4_0_BLOCK_ELEMS;
+        let mut isum = 0i32;
+        for i in 0..16 {
+            let qs = block[2 + i];
+            let q0 = (qs & 0x0F) as i32 - 8;
+            let q1 = (qs >> 4) as i32 - 8;
+            isum += q0 * act.q[base + i] as i32;
+            isum += q1 * act.q[base + 16 + i] as i32;
+        }
+        acc += dw * act.d[b] * isum as f32;
+    }
+    acc
+}
+
 #[cfg(target_arch = "x86_64")]
 mod simd_x86 {
     use super::{
@@ -688,6 +728,42 @@ mod simd_x86 {
             let prod =
                 _mm256_add_epi32(_mm256_madd_epi16(w_lo, a_lo), _mm256_madd_epi16(w_hi, a_hi));
             // horizontal sum of 8 i32 lanes
+            let hi128 = _mm256_extracti128_si256(prod, 1);
+            let lo128 = _mm256_castsi256_si128(prod);
+            let mut sum128 = _mm_add_epi32(lo128, hi128);
+            sum128 = _mm_add_epi32(sum128, _mm_shuffle_epi32(sum128, 0b01_00_11_10));
+            sum128 = _mm_add_epi32(sum128, _mm_shuffle_epi32(sum128, 0b00_00_00_01));
+            let isum = _mm_cvtsi128_si32(sum128);
+            acc += dw * act.d[b] * isum as f32;
+        }
+        acc
+    }
+
+    /// AVX2 Q4_0 × Q8 int-dot. Nibble unpack + signed bias, then
+    /// `_mm256_madd_epi16` against activation i16. Safety: caller
+    /// checked `avx2`.
+    #[target_feature(enable = "avx2")]
+    pub unsafe fn dot_q4_0_q8_avx2(row_bytes: &[u8], act: &Q8Activations) -> f32 {
+        debug_assert_eq!(row_bytes.len() % Q4_0_BLOCK_BYTES, 0);
+        debug_assert_eq!(row_bytes.len() / Q4_0_BLOCK_BYTES, act.n_blocks());
+        let low_mask = _mm_set1_epi8(0x0F);
+        let bias = _mm_set1_epi8(8);
+        let mut acc = 0f32;
+        for (b, block) in row_bytes.chunks_exact(Q4_0_BLOCK_BYTES).enumerate() {
+            let dw = f16::from_le_bytes([block[0], block[1]]).to_f32();
+            let base = b * Q4_0_BLOCK_ELEMS;
+            let qs = _mm_loadu_si128(block.as_ptr().add(2) as *const __m128i);
+            let lo = _mm_sub_epi8(_mm_and_si128(qs, low_mask), bias);
+            let hi = _mm_sub_epi8(_mm_and_si128(_mm_srli_epi16(qs, 4), low_mask), bias);
+            // Interleave lo (0..15) then hi (16..31) into 32 i8 → widen to i16.
+            let w = _mm256_set_m128i(hi, lo);
+            let a = _mm256_loadu_si256(act.q.as_ptr().add(base) as *const __m256i);
+            let w_lo = _mm256_cvtepi8_epi16(_mm256_castsi256_si128(w));
+            let w_hi = _mm256_cvtepi8_epi16(_mm256_extracti128_si256(w, 1));
+            let a_lo = _mm256_cvtepi8_epi16(_mm256_castsi256_si128(a));
+            let a_hi = _mm256_cvtepi8_epi16(_mm256_extracti128_si256(a, 1));
+            let prod =
+                _mm256_add_epi32(_mm256_madd_epi16(w_lo, a_lo), _mm256_madd_epi16(w_hi, a_hi));
             let hi128 = _mm256_extracti128_si256(prod, 1);
             let lo128 = _mm256_castsi256_si128(prod);
             let mut sum128 = _mm_add_epi32(lo128, hi128);
@@ -1788,6 +1864,39 @@ mod simd_aarch64 {
                 isum = vpadalq_s16(isum, prod_lo);
                 isum = vpadalq_s16(isum, prod_hi);
             }
+            acc += dw * act.d[b] * vaddvq_s32(isum) as f32;
+        }
+        acc
+    }
+
+    /// NEON Q4_0 × Q8 int-dot. Unpack nibbles → signed i8, then same
+    /// `vmull_s8`/`vpadalq_s16` reduction as Q8×Q8. Safety: caller
+    /// checked neon.
+    #[target_feature(enable = "neon")]
+    pub unsafe fn dot_q4_0_q8_neon(row_bytes: &[u8], act: &Q8Activations) -> f32 {
+        debug_assert_eq!(row_bytes.len() % Q4_0_BLOCK_BYTES, 0);
+        debug_assert_eq!(row_bytes.len() / Q4_0_BLOCK_BYTES, act.n_blocks());
+        let bias = vdupq_n_s8(8);
+        let low_mask = vdupq_n_u8(0x0F);
+        let mut acc = 0f32;
+        for (b, block) in row_bytes.chunks_exact(Q4_0_BLOCK_BYTES).enumerate() {
+            let dw = f16::from_le_bytes([block[0], block[1]]).to_f32();
+            let base = b * Q4_0_BLOCK_ELEMS;
+            let nibbles = vld1q_u8(block.as_ptr().add(2));
+            let lo = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(nibbles, low_mask)), bias);
+            let hi = vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8(nibbles, 4)), bias);
+            let mut isum = vdupq_n_s32(0);
+            // lo = elems 0..15, hi = elems 16..31 — matches act layout.
+            let a0 = vld1q_s8(act.q.as_ptr().add(base));
+            let a1 = vld1q_s8(act.q.as_ptr().add(base + 16));
+            let p0_lo = vmull_s8(vget_low_s8(lo), vget_low_s8(a0));
+            let p0_hi = vmull_s8(vget_high_s8(lo), vget_high_s8(a0));
+            let p1_lo = vmull_s8(vget_low_s8(hi), vget_low_s8(a1));
+            let p1_hi = vmull_s8(vget_high_s8(hi), vget_high_s8(a1));
+            isum = vpadalq_s16(isum, p0_lo);
+            isum = vpadalq_s16(isum, p0_hi);
+            isum = vpadalq_s16(isum, p1_lo);
+            isum = vpadalq_s16(isum, p1_hi);
             acc += dw * act.d[b] * vaddvq_s32(isum) as f32;
         }
         acc
@@ -3920,6 +4029,39 @@ mod tests {
         assert!(
             rel < 0.02,
             "int dot {dispatched} vs float {float_dot} rel={rel}"
+        );
+    }
+
+    #[test]
+    fn dot_q4_0_q8_dispatch_matches_scalar_and_float_dot() {
+        let n_blocks = 5;
+        let cols = n_blocks * Q4_0_BLOCK_ELEMS;
+        let x: Vec<f32> = (0..cols)
+            .map(|i| ((i as f32) * 0.019 - 1.3).cos() * 2.7)
+            .collect();
+
+        let mut weights = Vec::with_capacity(n_blocks * Q4_0_BLOCK_BYTES);
+        for b in 0..n_blocks {
+            weights.extend_from_slice(&f16::from_f32(0.021 + b as f32 * 0.004).to_le_bytes());
+            for i in 0..16 {
+                weights.push(((i as u32 * 13 + b as u32 * 7) % 256) as u8);
+            }
+        }
+
+        let act = quantize_activations_q8(&x);
+        let dispatched = dot_q4_0_q8(&weights, &act);
+        let scalar = dot_q4_0_q8_scalar(&weights, &act);
+        assert_eq!(
+            dispatched.to_bits(),
+            scalar.to_bits(),
+            "SIMD Q4_0 int dot must match scalar bit-for-bit"
+        );
+
+        let float_dot = dot_q4_0_f32(&weights, &x);
+        let rel = (dispatched - float_dot).abs() / float_dot.abs().max(1e-6);
+        assert!(
+            rel < 0.03,
+            "Q4_0 int dot {dispatched} vs float {float_dot} rel={rel}"
         );
     }
 

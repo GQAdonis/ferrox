@@ -5,7 +5,7 @@
   "backend": "metal",
   "expect": "ok",
   "date": "2026-08-05",
-  "host": "Host B (Apple M2 Pro, 10 logical cores)",
+  "host": "Apple M2 Pro (10 cores)",
   "model": "~/Desktop/Dev/ferrox/models/gemma-2-2b-it-Q4_K_M.gguf",
   "max_tokens": 512,
   "reps": 3,
@@ -13,74 +13,74 @@
   "workload": "greedy chat, warm then 3x 512-tok capitals list (median)",
   "notes": "Attn + final logit softcap + SWA; FA-vec skipped when softcap set",
   "ferrox": {
-    "wall_s": 15.808,
-    "predicted_per_second": 36.721,
-    "prompt_per_second": 24.192,
-    "completion_tokens": 512,
-    "wall_tok_s": 31.098,
+    "wall_s": 9.913,
+    "predicted_per_second": 58.081,
+    "prompt_per_second": 23.109,
+    "completion_tokens": 482,
+    "wall_tok_s": 46.505,
     "prefix": "I can't provide a list of 80 European capital cities with a ",
-    "predicted_stddev": 1.251,
-    "prompt_stddev": 0.848,
-    "wall_tok_s_stddev": 0.867,
+    "predicted_stddev": 0.584,
+    "prompt_stddev": 0.355,
+    "wall_tok_s_stddev": 1.205,
     "reps": 3,
     "runs": [
       {
-        "predicted_per_second": 34.6039969073851,
-        "prompt_per_second": 24.19217294500595,
-        "wall_tok_s": 30.739,
-        "wall_s": 16.656,
-        "completion_tokens": 512
+        "predicted_per_second": 58.08124900467061,
+        "prompt_per_second": 23.100324912115294,
+        "wall_tok_s": 44.851,
+        "wall_s": 8.941,
+        "completion_tokens": 401
       },
       {
-        "predicted_per_second": 36.818611476733984,
-        "prompt_per_second": 23.026954005281777,
-        "wall_tok_s": 31.098,
-        "wall_s": 12.863,
-        "completion_tokens": 400
+        "predicted_per_second": 57.82909272552472,
+        "prompt_per_second": 23.720019202263092,
+        "wall_tok_s": 46.505,
+        "wall_s": 9.913,
+        "completion_tokens": 461
       },
       {
-        "predicted_per_second": 36.72126356808185,
-        "prompt_per_second": 24.677107650695024,
-        "wall_tok_s": 32.388,
-        "wall_s": 15.808,
-        "completion_tokens": 512
+        "predicted_per_second": 58.942741177730696,
+        "prompt_per_second": 23.108647361749206,
+        "wall_tok_s": 47.195,
+        "wall_s": 10.213,
+        "completion_tokens": 482
       }
     ],
     "metal_fails": 0,
     "engine": "ferrox"
   },
   "llama": {
-    "wall_s": 9.417,
-    "predicted_per_second": 53.37,
-    "prompt_per_second": 10961.214,
-    "completion_tokens": 501,
-    "wall_tok_s": 53.199,
+    "wall_s": 8.757,
+    "predicted_per_second": 58.849,
+    "prompt_per_second": 3907.424,
+    "completion_tokens": 512,
+    "wall_tok_s": 58.47,
     "prefix": "I can't provide a list of 80 European capital cities with a ",
-    "predicted_stddev": 4.383,
-    "prompt_stddev": 12905.129,
-    "wall_tok_s_stddev": 4.429,
+    "predicted_stddev": 4.393,
+    "prompt_stddev": 18196.532,
+    "wall_tok_s_stddev": 4.417,
     "reps": 3,
     "runs": [
       {
-        "predicted_per_second": 58.40140081234979,
-        "prompt_per_second": 28641.07251675807,
-        "wall_tok_s": 58.256,
-        "wall_s": 8.789,
+        "predicted_per_second": 64.33327046599025,
+        "prompt_per_second": 34711.96454948301,
+        "wall_tok_s": 64.15,
+        "wall_s": 7.981,
         "completion_tokens": 512
       },
       {
-        "predicted_per_second": 49.66904120900655,
-        "prompt_per_second": 3516.364619962131,
-        "wall_tok_s": 49.43,
-        "wall_s": 10.358,
+        "predicted_per_second": 58.84947889476081,
+        "prompt_per_second": 2527.2161741835143,
+        "wall_tok_s": 58.47,
+        "wall_s": 8.757,
         "completion_tokens": 512
       },
       {
-        "predicted_per_second": 53.3699501614148,
-        "prompt_per_second": 10961.214165261383,
-        "wall_tok_s": 53.199,
-        "wall_s": 9.417,
-        "completion_tokens": 501
+        "predicted_per_second": 55.64608913416642,
+        "prompt_per_second": 3907.4241058010216,
+        "wall_tok_s": 55.45,
+        "wall_s": 9.234,
+        "completion_tokens": 512
       }
     ],
     "engine": "llama"

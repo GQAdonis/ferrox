@@ -244,6 +244,8 @@ kernel void gqa_decode_fa_vec(
     constant uint& n_kv_heads [[buffer(5)]],
     constant uint& head_dim [[buffer(6)]],
     constant uint& seq_len [[buffer(7)]],
+    constant uint& kv_start [[buffer(8)]],
+    constant float& softcap [[buffer(9)]],
     uint h [[threadgroup_position_in_grid]],
     uint tid [[thread_position_in_threadgroup]],
     uint tg [[threads_per_threadgroup]],
@@ -283,8 +285,9 @@ kernel void gqa_decode_fa_vec(
     float M = -INFINITY;
 
     // Each SG walks KV tiles: ic0 = sgitg, sgitg+nsg, ...
-    for (uint ic0 = sgitg; ic0 * C < seq_len; ic0 += nsg) {
-        uint ic = ic0 * C;
+    for (uint ic0 = sgitg; ; ic0 += nsg) {
+        uint ic = kv_start + ic0 * C;
+        if (ic >= seq_len) break;
         uint chunk = min(C, seq_len - ic);
 
         // Q·K for all C positions: lane `ii` owns float4-slice `ii` of the head;
@@ -297,7 +300,11 @@ kernel void gqa_decode_fa_vec(
             device const half4* k4 =
                 (device const half4*)(k_cache + ((ic + cc) * n_kv_heads + kv_h) * D);
             float partial = dot(sq4[tiisg], float4(k4[tiisg]));
-            scores[cc] = simd_sum(partial) * scale;
+            float sc = simd_sum(partial) * scale;
+            if (softcap > 0.0f) {
+                sc = softcap * tanh(sc / softcap);
+            }
+            scores[cc] = sc;
         }
 
         // Online softmax over this tile (one score per lane).
@@ -382,6 +389,8 @@ kernel void gqa_decode_fa_vec_d64(
     constant uint& n_kv_heads [[buffer(5)]],
     constant uint& head_dim [[buffer(6)]],
     constant uint& seq_len [[buffer(7)]],
+    constant uint& kv_start [[buffer(8)]],
+    constant float& softcap [[buffer(9)]],
     uint h [[threadgroup_position_in_grid]],
     uint tid [[thread_position_in_threadgroup]],
     uint tg [[threads_per_threadgroup]],
@@ -425,8 +434,9 @@ kernel void gqa_decode_fa_vec_d64(
     float M = -INFINITY;
 
     // Each SG walks KV tiles: ic0 = sgitg, sgitg+nsg, ...
-    for (uint ic0 = sgitg; ic0 * C < seq_len; ic0 += nsg) {
-        uint ic = ic0 * C;
+    for (uint ic0 = sgitg; ; ic0 += nsg) {
+        uint ic = kv_start + ic0 * C;
+        if (ic >= seq_len) break;
         uint chunk = min(C, seq_len - ic);
 
         // Q·K, two positions per warp pass: half-warp `ty` owns token
@@ -441,7 +451,11 @@ kernel void gqa_decode_fa_vec_d64(
             p += simd_shuffle_xor(p, 2u);
             p += simd_shuffle_xor(p, 1u);
             if (tx == 0u) {
-                ss[cc] = p * scale;
+                float sc = p * scale;
+                if (softcap > 0.0f) {
+                    sc = softcap * tanh(sc / softcap);
+                }
+                ss[cc] = sc;
             }
         }
         simdgroup_barrier(mem_flags::mem_threadgroup);
@@ -532,6 +546,8 @@ kernel void gqa_decode_fa_vec_d96(
     constant uint& n_kv_heads [[buffer(5)]],
     constant uint& head_dim [[buffer(6)]],
     constant uint& seq_len [[buffer(7)]],
+    constant uint& kv_start [[buffer(8)]],
+    constant float& softcap [[buffer(9)]],
     uint h [[threadgroup_position_in_grid]],
     uint tid [[thread_position_in_threadgroup]],
     uint tg [[threads_per_threadgroup]],
@@ -570,8 +586,9 @@ kernel void gqa_decode_fa_vec_d96(
     float S = 0.0f;
     float M = -INFINITY;
 
-    for (uint ic0 = sgitg; ic0 * C < seq_len; ic0 += nsg) {
-        uint ic = ic0 * C;
+    for (uint ic0 = sgitg; ; ic0 += nsg) {
+        uint ic = kv_start + ic0 * C;
+        if (ic >= seq_len) break;
         uint chunk = min(C, seq_len - ic);
 
         float scores[C];
@@ -582,7 +599,11 @@ kernel void gqa_decode_fa_vec_d96(
             device const half4* k4 =
                 (device const half4*)(k_cache + ((ic + cc) * n_kv_heads + kv_h) * D);
             float partial = (tiisg < D4) ? dot(sq4[tiisg], float4(k4[tiisg])) : 0.0f;
-            scores[cc] = simd_sum(partial) * scale;
+            float sc = simd_sum(partial) * scale;
+            if (softcap > 0.0f) {
+                sc = softcap * tanh(sc / softcap);
+            }
+            scores[cc] = sc;
         }
 
         float s_lane = (tiisg < chunk) ? scores[tiisg] : -INFINITY;
@@ -664,6 +685,8 @@ kernel void gqa_decode_fa_vec_d256(
     constant uint& n_kv_heads [[buffer(5)]],
     constant uint& head_dim [[buffer(6)]],
     constant uint& seq_len [[buffer(7)]],
+    constant uint& kv_start [[buffer(8)]],
+    constant float& softcap [[buffer(9)]],
     uint h [[threadgroup_position_in_grid]],
     uint tid [[thread_position_in_threadgroup]],
     uint tg [[threads_per_threadgroup]],
@@ -701,8 +724,9 @@ kernel void gqa_decode_fa_vec_d256(
     float S = 0.0f;
     float M = -INFINITY;
 
-    for (uint ic0 = sgitg; ic0 * C < seq_len; ic0 += nsg) {
-        uint ic = ic0 * C;
+    for (uint ic0 = sgitg; ; ic0 += nsg) {
+        uint ic = kv_start + ic0 * C;
+        if (ic >= seq_len) break;
         uint chunk = min(C, seq_len - ic);
 
         float scores[C];
@@ -716,7 +740,11 @@ kernel void gqa_decode_fa_vec_d256(
             for (uint i = tiisg; i < D4; i += NW) {
                 partial += dot(sq4[i], float4(k4[i]));
             }
-            scores[cc] = simd_sum(partial) * scale;
+            float sc = simd_sum(partial) * scale;
+            if (softcap > 0.0f) {
+                sc = softcap * tanh(sc / softcap);
+            }
+            scores[cc] = sc;
         }
 
         float s_lane = (tiisg < chunk) ? scores[tiisg] : -INFINITY;
@@ -1679,6 +1707,8 @@ fn encode_gqa_fa_vec(
     n_kv_heads: u32,
     head_dim: u32,
     seq_len: u32,
+    kv_start: u32,
+    softcap: f32,
 ) -> Result<(), MetalError> {
     let pipe = match head_dim {
         256 => ensure_pipeline(
@@ -1721,6 +1751,10 @@ fn encode_gqa_fa_vec(
         encoder.setBytes_length_atIndex(NonNull::new(&mut hd as *mut u32 as *mut _).unwrap(), 4, 6);
         let mut sl = seq_len;
         encoder.setBytes_length_atIndex(NonNull::new(&mut sl as *mut u32 as *mut _).unwrap(), 4, 7);
+        let mut ks = kv_start;
+        encoder.setBytes_length_atIndex(NonNull::new(&mut ks as *mut u32 as *mut _).unwrap(), 4, 8);
+        let mut sc = softcap;
+        encoder.setBytes_length_atIndex(NonNull::new(&mut sc as *mut f32 as *mut _).unwrap(), 4, 9);
         encoder.setThreadgroupMemoryLength_atIndex(tg_mem, 0);
     }
     encoder.dispatchThreadgroups_threadsPerThreadgroup(
@@ -1754,11 +1788,12 @@ fn encode_gqa(
     attn_softcap: Option<f32>,
 ) -> Result<(), MetalError> {
     let softcap = attn_softcap.filter(|&c| c > 0.0).unwrap_or(0.0);
-    // FA-vec kernels scan the full prefix and have no softcap path; SWA
-    // (kv_start > 0) and softcap use the legacy online-softmax kernel.
-    if softcap == 0.0 && kv_start == 0 && metal_fa_vec_enabled() && gqa_fa_vec_supported(head_dim) {
+    // FA-vec supports SWA (`kv_start`) and softcap; use it whenever
+    // head_dim has a specialized kernel.
+    if metal_fa_vec_enabled() && gqa_fa_vec_supported(head_dim) {
         return encode_gqa_fa_vec(
-            encoder, device, q, k, v, out, n_heads, n_kv_heads, head_dim, seq_len,
+            encoder, device, q, k, v, out, n_heads, n_kv_heads, head_dim, seq_len, kv_start,
+            softcap,
         );
     }
     if head_dim > 256 {
@@ -1868,8 +1903,10 @@ fn encode_gqa_prefill(
     Ok(())
 }
 
-/// Encode the optional QKV bias adds + per-head QK-RMSNorms (CPU-path
-/// order: bias → norm → RoPE). No-ops when `extras` is empty.
+/// Encode the optional QKV bias adds + QK-RMSNorms (CPU-path order:
+/// bias → norm → RoPE). Per-head (`weight.len() == head_dim`) or
+/// whole-vector (`weight.len() == q_rows` / `k_rows`, OLMoE). No-ops
+/// when `extras` is empty.
 #[allow(clippy::too_many_arguments)]
 fn encode_attn_extras(
     encoder: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputeCommandEncoder>,
@@ -1902,30 +1939,55 @@ fn encode_attn_extras(
         encode_vec_add(encoder, device, v_buf, &bb.buffer, v_rows as u32)?;
     }
     if let Some(w) = extras.q_norm {
-        debug_assert_eq!(w.len(), head_dim);
         let wb = resident_f32_buffer(device, w)?;
-        encode_rms_norm_per_head(
-            encoder,
-            device,
-            q_buf,
-            &wb.buffer,
-            n_heads as u32,
-            head_dim as u32,
-            rms_eps,
-        )?;
+        if w.len() == head_dim {
+            encode_rms_norm_per_head(
+                encoder,
+                device,
+                q_buf,
+                &wb.buffer,
+                n_heads as u32,
+                head_dim as u32,
+                rms_eps,
+            )?;
+        } else {
+            debug_assert_eq!(w.len(), q_rows, "Q norm weight must be head_dim or q_rows");
+            // Two-pass kernel: same buffer for x and out is safe.
+            encode_rms_norm(
+                encoder,
+                device,
+                q_buf,
+                &wb.buffer,
+                q_buf,
+                q_rows as u32,
+                rms_eps,
+            )?;
+        }
     }
     if let Some(w) = extras.k_norm {
-        debug_assert_eq!(w.len(), head_dim);
         let wb = resident_f32_buffer(device, w)?;
-        encode_rms_norm_per_head(
-            encoder,
-            device,
-            k_buf,
-            &wb.buffer,
-            n_kv_heads as u32,
-            head_dim as u32,
-            rms_eps,
-        )?;
+        if w.len() == head_dim {
+            encode_rms_norm_per_head(
+                encoder,
+                device,
+                k_buf,
+                &wb.buffer,
+                n_kv_heads as u32,
+                head_dim as u32,
+                rms_eps,
+            )?;
+        } else {
+            debug_assert_eq!(w.len(), k_rows, "K norm weight must be head_dim or k_rows");
+            encode_rms_norm(
+                encoder,
+                device,
+                k_buf,
+                &wb.buffer,
+                k_buf,
+                k_rows as u32,
+                rms_eps,
+            )?;
+        }
     }
     Ok(())
 }
@@ -2259,9 +2321,11 @@ pub fn launch_decode_dense_layer(
 
 /// Optional attention epilogue ops applied between the QKV matvecs and
 /// RoPE, in CPU-path order: bias add (Qwen2-family `qkv_bias`), then
-/// per-head QK-RMSNorm (Qwen3 / Gemma-3, weight length = head_dim).
+/// QK-RMSNorm — per-head (Qwen3 / Gemma-3, `weight.len() == head_dim`)
+/// or whole-vector (OLMoE, `weight.len() == n_heads|n_kv_heads * head_dim`).
 /// `attn_logit_softcap` is applied inside GQA after score scaling
-/// (Gemma-2); when set, FA-vec is skipped in favour of the legacy kernel.
+/// (Gemma-2); when set, FA-vec is skipped in favour of the legacy kernel
+/// unless the FA-vec softcap path is enabled.
 #[derive(Default)]
 pub struct AttnExtras<'a> {
     pub q_bias: Option<&'a [f32]>,
@@ -2732,6 +2796,7 @@ pub fn launch_rope_heads_host(
 }
 
 /// Host-upload GQA only (parity testing / fallback probe).
+#[allow(clippy::too_many_arguments)]
 pub fn launch_gqa_decode_host(
     q: &[f32],
     k_cache: &[f32],
@@ -2741,9 +2806,28 @@ pub fn launch_gqa_decode_host(
     head_dim: usize,
     seq_len: usize,
 ) -> Result<Vec<f32>, MetalError> {
+    launch_gqa_decode_host_ex(
+        q, k_cache, v_cache, n_heads, n_kv_heads, head_dim, seq_len, 0, None,
+    )
+}
+
+/// Host-upload GQA with optional sliding-window start and logit softcap.
+#[allow(clippy::too_many_arguments)]
+pub fn launch_gqa_decode_host_ex(
+    q: &[f32],
+    k_cache: &[f32],
+    v_cache: &[f32],
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    seq_len: usize,
+    kv_start: usize,
+    attn_softcap: Option<f32>,
+) -> Result<Vec<f32>, MetalError> {
     assert_eq!(q.len(), n_heads * head_dim);
     assert_eq!(k_cache.len(), seq_len * n_kv_heads * head_dim);
     assert_eq!(v_cache.len(), seq_len * n_kv_heads * head_dim);
+    assert!(kv_start <= seq_len);
 
     let shared = shared_metal()?;
     let device = &shared.device;
@@ -2770,8 +2854,8 @@ pub fn launch_gqa_decode_host(
         n_kv_heads as u32,
         head_dim as u32,
         seq_len as u32,
-        0,
-        None,
+        kv_start as u32,
+        attn_softcap,
     )?;
     encoder.endEncoding();
     cmd_buf.commit();
@@ -3033,33 +3117,57 @@ mod tests {
         head_dim: usize,
         seq_len: usize,
     ) -> Vec<f32> {
+        cpu_gqa_ex(
+            q, k_cache, v_cache, n_heads, n_kv_heads, head_dim, seq_len, 0, None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn cpu_gqa_ex(
+        q: &[f32],
+        k_cache: &[f32],
+        v_cache: &[f32],
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        seq_len: usize,
+        kv_start: usize,
+        softcap: Option<f32>,
+    ) -> Vec<f32> {
         let group_size = n_heads / n_kv_heads.max(1);
         let scale = 1.0 / (head_dim as f32).sqrt();
         let mut out = vec![0f32; n_heads * head_dim];
         for h in 0..n_heads {
             let kv_h = h / group_size.max(1);
             let q_h = &q[h * head_dim..(h + 1) * head_dim];
-            let mut scores = vec![0f32; seq_len];
-            for t in 0..seq_len {
+            let mut scores = vec![f32::NEG_INFINITY; seq_len];
+            for t in kv_start..seq_len {
                 let k_t = &k_cache
                     [(t * n_kv_heads + kv_h) * head_dim..(t * n_kv_heads + kv_h + 1) * head_dim];
                 let mut dot = 0f32;
                 for d in 0..head_dim {
                     dot += q_h[d] * k_t[d];
                 }
-                scores[t] = dot * scale;
+                let mut score = dot * scale;
+                if let Some(c) = softcap.filter(|&c| c > 0.0) {
+                    score = c * (score / c).tanh();
+                }
+                scores[t] = score;
             }
-            let max = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let max = scores[kv_start..]
+                .iter()
+                .cloned()
+                .fold(f32::NEG_INFINITY, f32::max);
             let mut sum = 0f32;
-            for s in scores.iter_mut() {
+            for s in scores[kv_start..].iter_mut() {
                 *s = (*s - max).exp();
                 sum += *s;
             }
-            for s in scores.iter_mut() {
-                *s /= sum;
+            for s in scores[kv_start..].iter_mut() {
+                *s /= sum.max(f32::MIN_POSITIVE);
             }
             let out_h = &mut out[h * head_dim..(h + 1) * head_dim];
-            for t in 0..seq_len {
+            for t in kv_start..seq_len {
                 let v_t = &v_cache
                     [(t * n_kv_heads + kv_h) * head_dim..(t * n_kv_heads + kv_h + 1) * head_dim];
                 let w = scores[t];
@@ -3147,6 +3255,49 @@ mod tests {
                 assert!(
                     (a - b).abs() <= tol,
                     "nh={n_heads} nkv={n_kv_heads} hd={head_dim} seq={seq_len} elem {i}: cpu={a} gpu={b} tol={tol}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "needs a real Metal GPU"]
+    fn gqa_fa_vec_window_softcap_matches_cpu() {
+        // Windowed (kv_start>0) + softcap paths through FA-vec kernels.
+        let cases = [
+            // (n_heads, n_kv, head_dim, seq, kv_start, softcap)
+            (4, 2, 128, 65, 17, None),
+            (8, 4, 128, 65, 33, Some(50.0f32)),
+            (4, 2, 64, 48, 16, None),
+            (8, 4, 64, 48, 8, Some(30.0)),
+            (4, 4, 96, 40, 8, Some(50.0)),
+            (4, 1, 256, 40, 12, Some(50.0)),
+            (8, 4, 128, 33, 0, Some(50.0)), // softcap only
+        ];
+        std::env::set_var("FERROX_METAL_FA_VEC", "1");
+        for (n_heads, n_kv_heads, head_dim, seq_len, kv_start, softcap) in cases {
+            let q: Vec<f32> = (0..n_heads * head_dim)
+                .map(|i| (i as f32 * 0.07).sin())
+                .collect();
+            let k: Vec<f32> = (0..seq_len * n_kv_heads * head_dim)
+                .map(|i| (i as f32 * 0.03).cos())
+                .collect();
+            let v: Vec<f32> = (0..seq_len * n_kv_heads * head_dim)
+                .map(|i| (i as f32 * 0.05).sin())
+                .collect();
+            let cpu = cpu_gqa_ex(
+                &q, &k, &v, n_heads, n_kv_heads, head_dim, seq_len, kv_start, softcap,
+            );
+            let gpu = launch_gqa_decode_host_ex(
+                &q, &k, &v, n_heads, n_kv_heads, head_dim, seq_len, kv_start, softcap,
+            )
+            .expect("metal fa-vec window/softcap");
+            assert_eq!(cpu.len(), gpu.len());
+            for (i, (a, b)) in cpu.iter().zip(gpu.iter()).enumerate() {
+                let tol = 3e-3 * a.abs().max(1.0);
+                assert!(
+                    (a - b).abs() <= tol,
+                    "hd={head_dim} seq={seq_len} ks={kv_start} sc={softcap:?} elem {i}: cpu={a} gpu={b}"
                 );
             }
         }

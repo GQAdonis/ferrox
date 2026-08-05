@@ -617,9 +617,9 @@ pub struct ExpertWeights {
 
 /// Runs one token's hidden state through a single expert's SwiGLU FFN.
 pub fn run_expert(hidden: &[f32], expert: &ExpertWeights) -> Vec<f32> {
-    #[cfg(feature = "cuda")]
+    #[cfg(any(feature = "cuda", feature = "metal"))]
     {
-        // Full SwiGLU on-device (1× HtoD + 1× DtoH) when CUDA dense is on.
+        // Full SwiGLU on-device (1× upload + 1× download) when dense GPU is on.
         if let Some(out) = ferrox_core::WeightMatrix::apply_gpu_dense_ffn_swiglu(
             &expert.gate,
             &expert.up,
@@ -674,7 +674,7 @@ pub fn run_expert_placed(
     placement: ExpertPlacement,
 ) -> Vec<f32> {
     if matches!(placement, ExpertPlacement::GpuDevice(_)) {
-        #[cfg(feature = "cuda")]
+        #[cfg(any(feature = "cuda", feature = "metal"))]
         {
             if let Some(out) = ferrox_core::WeightMatrix::apply_gpu_dense_ffn_swiglu(
                 &expert.gate,

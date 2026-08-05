@@ -145,7 +145,7 @@ pub fn probe() -> Option<String> {
 /// same two rows, each thread owning `NQ=8` contiguous int8 quants of a
 /// block per pass. Same dequant identity as
 /// `ferrox_quant::dot_q8_0_f32_scalar` (34-byte block: 2-byte f16 scale
-/// + 32 int8 values). Replaces the legacy one-TG-per-row scalar kernel,
+/// plus 32 int8 values). Replaces the legacy one-TG-per-row scalar kernel,
 /// which left most of the memory system idle on Q8_0-heavy models
 /// (TinyLlama Q8_0 decode was ~1.5x behind llama.cpp).
 ///
@@ -2110,6 +2110,7 @@ pub(crate) fn resident_f32_buffer(
 
 /// One quantized matvec to encode into a fused Metal command buffer
 /// (shared activation `x`, one `waitUntilCompleted` for the batch).
+#[derive(Clone, Copy)]
 pub struct MatvecLaunch<'a> {
     pub kernel_src: &'static str,
     pub fn_name: &'static str,
@@ -2210,6 +2211,94 @@ pub fn launch_matvec_fused(
         outs.push(out_slice.to_vec());
     }
     Ok(outs)
+}
+
+/// Dense SwiGLU FFN on Metal with device-resident activations:
+/// one upload of `x`, gate+up matvecs → SiLU×up → down, one download.
+/// Matches CUDA [`ferrox_cuda::gpu::launch_dense_ffn_swiglu`] for MoE
+/// experts; weights stay in the resident cache across calls.
+pub fn launch_dense_ffn_swiglu(
+    gate: &MatvecLaunch<'_>,
+    up: &MatvecLaunch<'_>,
+    down: &MatvecLaunch<'_>,
+    x: &[f32],
+) -> Result<Vec<f32>, MetalError> {
+    assert_eq!(gate.rows, up.rows, "gate/up row counts must match");
+    assert!(down.rows > 0);
+    let n_blocks_gate = gate.row_bytes / gate.block_bytes;
+    assert_eq!(
+        x.len(),
+        n_blocks_gate * gate.block_elems,
+        "x length must match gate cols"
+    );
+    assert_eq!(
+        up.row_bytes / up.block_bytes * up.block_elems,
+        x.len(),
+        "up cols must match x"
+    );
+    let n_blocks_down = down.row_bytes / down.block_bytes;
+    assert_eq!(
+        n_blocks_down * down.block_elems,
+        gate.rows,
+        "down cols must equal gate rows (SwiGLU width)"
+    );
+
+    let shared = shared_metal()?;
+    let device = &shared.device;
+    let queue = &shared.queue;
+
+    let x_buf = if let Some(resident) = take_resident_activation_if_matches(x) {
+        resident
+    } else {
+        clear_resident_activation();
+        let mut x_owned = x.to_vec();
+        unsafe {
+            device.newBufferWithBytes_length_options(
+                NonNull::new(x_owned.as_mut_ptr() as *mut _).unwrap(),
+                x_owned.len() * 4,
+                MTLResourceOptions::StorageModeShared,
+            )
+        }
+        .ok_or(MetalError::BufferAllocFailed)?
+    };
+
+    let gate_w = resident_weight_buffer(device, gate.weights)?;
+    let up_w = resident_weight_buffer(device, up.weights)?;
+    let down_w = resident_weight_buffer(device, down.weights)?;
+    let gate_buf = device
+        .newBufferWithLength_options(gate.rows * 4, MTLResourceOptions::StorageModeShared)
+        .ok_or(MetalError::BufferAllocFailed)?;
+    let up_buf = device
+        .newBufferWithLength_options(up.rows * 4, MTLResourceOptions::StorageModeShared)
+        .ok_or(MetalError::BufferAllocFailed)?;
+    let act_buf = device
+        .newBufferWithLength_options(gate.rows * 4, MTLResourceOptions::StorageModeShared)
+        .ok_or(MetalError::BufferAllocFailed)?;
+    let out_buf = device
+        .newBufferWithLength_options(down.rows * 4, MTLResourceOptions::StorageModeShared)
+        .ok_or(MetalError::BufferAllocFailed)?;
+
+    let cmd_buf = queue.commandBuffer().ok_or(MetalError::CommandFailed)?;
+    let encoder = cmd_buf
+        .computeCommandEncoder()
+        .ok_or(MetalError::CommandFailed)?;
+    encode_matvec(&encoder, device, gate, &gate_w, &x_buf, &gate_buf)?;
+    encode_matvec(&encoder, device, up, &up_w, &x_buf, &up_buf)?;
+    crate::elem::encode_silu_mul(
+        &encoder,
+        device,
+        &gate_buf,
+        &up_buf,
+        &act_buf,
+        gate.rows as u32,
+    )?;
+    encode_matvec(&encoder, device, down, &down_w, &act_buf, &out_buf)?;
+    encoder.endEncoding();
+    cmd_buf.commit();
+    cmd_buf.waitUntilCompleted();
+
+    let out_ptr = out_buf.contents();
+    Ok(unsafe { std::slice::from_raw_parts(out_ptr.as_ptr() as *const f32, down.rows).to_vec() })
 }
 
 /// Encodes one quantized matvec into an existing compute encoder (no

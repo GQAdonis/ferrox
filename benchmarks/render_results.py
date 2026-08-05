@@ -44,17 +44,41 @@ def pred(row: dict | None):
 
 
 def load_s(row: dict | None):
+    """Prefer comparable `startup_s` (wall − decode); fall back to engine load."""
     if not row or row.get("error"):
         return None
-    v = row.get("load_s")
-    return v if isinstance(v, (int, float)) else None
+    for key in ("startup_s", "load_s"):
+        v = row.get(key)
+        if isinstance(v, (int, float)):
+            return v
+    return None
 
 
 def load_sd(row: dict | None):
     if not row or row.get("error"):
         return None
-    v = row.get("load_stddev")
-    return v if isinstance(v, (int, float)) else None
+    for key in ("startup_stddev", "load_stddev"):
+        v = row.get(key)
+        if isinstance(v, (int, float)):
+            return v
+    return None
+
+
+def cli_pin_trustworthy(pin: dict) -> bool:
+    """Reject CLI pins known to have used llama-cli or mismatched templates."""
+    llama = pin.get("llama") or {}
+    if llama.get("error"):
+        return False
+    prefix = str(llama.get("prefix") or "")
+    log = str(llama.get("log_tail") or "")
+    if "not supported by llama-cli" in prefix or "not supported by llama-cli" in log:
+        return False
+    if "please use llama-completion" in prefix or "please use llama-completion" in log:
+        return False
+    # Stale 256-tok / 1-rep server-shaped CLI leftovers
+    if pin.get("max_tokens") not in (None, 512) and pin.get("max_tokens", 512) < 512:
+        return False
+    return True
 
 
 def fmt_load(x, sd=None) -> str:
@@ -245,16 +269,16 @@ def main() -> None:
 
     if cli_pins:
         lines.append(
-            "\n## CLI completion (llama-cli / `llama-completion` vs `ferrox run`)\n\n"
-            "One-shot `-p … -n N --no-cnv --ignore-eos`, fresh process per rep, "
-            "strictly sequential (llama exits before ferrox starts). Engines' own "
-            "stderr timings; **pred** tok/s excludes model load. "
-            "**load** = engine-reported startup (`ferrox: loaded in …s` vs "
-            "`common_perf_print: load time = … ms`). "
-            "**Load gap** = `ferrox_load / llama_load` (same as pred Gap: "
-            "&lt;1 ferrox better; &gt;1 ferrox slower).\n\n"
+            "\n## CLI completion (`llama-completion` vs `ferrox run`)\n\n"
+            "One-shot `-p … -n N --ignore-eos -c 4096`, fresh process per rep, "
+            "interleaved (llama then ferrox each rep). Requires `llama-completion` "
+            "(not `llama-cli`). Engines' own stderr timings; **pred** tok/s excludes "
+            "model load. **startup** = wall − decode (comparable process overhead); "
+            "falls back to engine-reported load if startup missing. "
+            "**Startup gap** = `ferrox / llama` (&lt;1 ferrox better).\n"
+            "Pins that used `llama-cli` or rejected options are omitted.\n\n"
             "| Model | Backend | ferrox pred | llama pred | Gap | "
-            "ferrox load (s) | llama load (s) | Load gap | Pin |\n"
+            "ferrox startup (s) | llama startup (s) | Startup gap | Pin |\n"
             "|---|---|---|---|---|---|---|---|---|\n"
         )
         for entry in suite["models"]:
@@ -262,6 +286,8 @@ def main() -> None:
             for backend in entry["backends"]:
                 pin = cli_pins.get((mid, backend))
                 if not pin or pin.get("status") == "missing":
+                    continue
+                if not cli_pin_trustworthy(pin):
                     continue
                 fp = pred(pin.get("ferrox"))
                 lp = pred(pin.get("llama"))
@@ -274,9 +300,6 @@ def main() -> None:
                 ferr = (pin.get("ferrox") or {}).get("error")
                 fcell = "error" if ferr else fmt_num(fp, fsd)
                 lcell = fmt_num(lp, lsd) if lp is not None else "—"
-                # Same convention as pred Gap: ratio with ferrox in the
-                # denominator of "advantage" inverted for lower-is-better —
-                # Gap = ferrox_load / llama_load (<1 ferrox faster to load).
                 load_gap = "—"
                 if fl and ll and ll > 0:
                     load_gap = color_gap(fl / ll)

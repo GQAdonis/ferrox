@@ -8,6 +8,7 @@ Regenerates RESULTS.md after each pin write.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -140,6 +141,7 @@ def aggregate(runs: list[dict], reps: int) -> dict:
         "prompt_per_second": "prompt_stddev",
         "wall_tok_s": "wall_tok_s_stddev",
         "load_s": "load_stddev",
+        "startup_s": "startup_stddev",
     }
     for key in (
         "predicted_per_second",
@@ -147,6 +149,7 @@ def aggregate(runs: list[dict], reps: int) -> dict:
         "wall_tok_s",
         "wall_s",
         "load_s",
+        "startup_s",
     ):
         vals = series(key)
         if vals:
@@ -163,6 +166,7 @@ def aggregate(runs: list[dict], reps: int) -> dict:
                 "wall_tok_s",
                 "wall_s",
                 "load_s",
+                "startup_s",
                 "completion_tokens",
                 "error",
             )
@@ -343,12 +347,51 @@ LLAMA_LOAD_RE = re.compile(
 )
 
 
+def file_sha256(path: str) -> str | None:
+    try:
+        h = hashlib.sha256()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(1 << 20), b""):
+                h.update(chunk)
+        return h.hexdigest()[:16]
+    except OSError:
+        return None
+
+
+def bin_version(path: str) -> str | None:
+    try:
+        out = subprocess.check_output(
+            [path, "--version"], text=True, stderr=subprocess.STDOUT, timeout=10
+        )
+        return out.strip().splitlines()[0][:120]
+    except Exception:
+        return None
+
+
+def git_rev() -> str | None:
+    try:
+        return subprocess.check_output(
+            ["git", "-C", str(ROOT), "rev-parse", "--short", "HEAD"],
+            text=True,
+            timeout=5,
+        ).strip()
+    except Exception:
+        return None
+
+
 def run_cli_once(
     cmd: list[str], engine: str, env: dict | None = None, timeout: float = 1800.0
 ) -> dict:
     """One CLI completion run (fresh process — llama.cpp-style `-p ... -n N`).
     Parses the tool's own stderr timings; decode t/s excludes model load.
-    Also records engine-reported `load_s` (model load / startup)."""
+
+    `startup_s` is process-wall until the process exits after the measured
+    run's first useful timing is available conceptually as wall_s minus
+    decode-only time when both are known; we also keep engine-reported
+    `load_s` when present but RESULTS treats startup_s as the comparable
+    cold-start metric (same definition for both engines: full process wall
+    minus predicted-token decode time when token count and pred t/s known).
+    """
     t0 = time.time()
     try:
         proc = subprocess.run(
@@ -359,7 +402,21 @@ def run_cli_once(
     wall = time.time() - t0
     err = proc.stderr or ""
     out = proc.stdout or ""
+    combined = err + "\n" + out
     row: dict = {"wall_s": round(wall, 3), "engine": engine}
+
+    # Fail closed on wrong llama binary / rejected flags.
+    if "not supported by llama-cli" in combined or "please use llama-completion" in combined:
+        row["error"] = "llama-cli rejected flags (need llama-completion)"
+        row["log_tail"] = combined[-1500:]
+        return row
+    if proc.returncode not in (0, None) and engine == "llama":
+        # Some builds exit 0 even with warnings; non-zero is hard fail.
+        if proc.returncode != 0 and "eval time" not in combined and "Generation:" not in combined:
+            row["error"] = f"llama exit {proc.returncode}"
+            row["log_tail"] = combined[-1500:]
+            return row
+
     if engine == "ferrox":
         ml = FERROX_LOAD_RE.search(err)
         if ml:
@@ -373,7 +430,6 @@ def run_cli_once(
         row["completion_tokens"] = int(m.group(3))
         row["predicted_per_second"] = float(m.group(4))
     else:
-        # Prefer common_perf_print load time (ms → s).
         ml = LLAMA_LOAD_RE.search(err) or LLAMA_LOAD_RE.search(out)
         if ml:
             row["load_s"] = round(float(ml.group(1)) / 1000.0, 3)
@@ -390,8 +446,16 @@ def run_cli_once(
             row["predicted_per_second"] = float(ms.group(2))
         else:
             row["error"] = f"no llama perf line (exit {proc.returncode})"
-            row["log_tail"] = (err + out)[-1500:]
+            row["log_tail"] = combined[-1500:]
             return row
+
+    # Comparable startup: full process wall minus decode-only time.
+    pred = row.get("predicted_per_second")
+    ct = row.get("completion_tokens")
+    if isinstance(pred, (int, float)) and pred > 0 and isinstance(ct, (int, float)) and ct > 0:
+        decode_s = float(ct) / float(pred)
+        row["startup_s"] = round(max(wall - decode_s, 0.0), 3)
+
     row["prefix"] = out[:60]
     return row
 
@@ -404,13 +468,11 @@ def run_cli_engine(
     backend: str,
     threads: int,
     reps: int,
+    *,
+    ctx: int = 4096,
 ) -> dict:
-    """Reps × one-shot CLI completion for one engine. Strictly serial:
-    the process must exit before the next rep (and before the other
-    engine runs at all — never two engines resident at once)."""
+    """Reps × one-shot CLI completion for one engine."""
     if engine == "ferrox" and backend == "metal":
-        # Same guard as the server path: a binary built without
-        # --features metal silently decodes on CPU.
         if b"FERROX_METAL_FA_VEC" not in Path(bin_path).read_bytes():
             return {
                 "error": "ferrox binary lacks metal feature "
@@ -418,9 +480,16 @@ def run_cli_engine(
                 "engine": engine,
                 "mode": "cli",
             }
+    if engine == "llama":
+        # Require llama-completion (Homebrew ≥b76xx).
+        name = Path(bin_path).name
+        if name == "llama-cli":
+            return {
+                "error": "llama-cli is not valid for CLI pins; use llama-completion",
+                "engine": engine,
+                "mode": "cli",
+            }
     ngl = "0" if backend == "cpu" else "99"
-    # Explicit env: a stray `export FERROX_METAL=1` in the calling shell
-    # must not silently turn a "cpu" pin into a Metal run.
     env = {k: v for k, v in os.environ.items() if not k.startswith("FERROX_")}
     if backend == "metal":
         env["FERROX_METAL"] = "1"
@@ -440,20 +509,40 @@ def run_cli_engine(
         if engine == "ferrox":
             cmd = [
                 bin_path, "-m", model, "-p", prompt,
-                "-n", str(n), "-t", str(threads), "--ngl", ngl,
+                "-n", str(n), "-t", str(threads), "-c", str(ctx),
+                "--ngl", ngl,
                 "--temp", "0", "--no-cnv", "--ignore-eos",
             ]
         else:
             cmd = [
                 bin_path, "-m", model, "-p", prompt,
-                "-n", str(n), "-t", str(threads), "-ngl", ngl,
+                "-n", str(n), "-t", str(threads), "-c", str(ctx),
+                "-ngl", ngl,
                 "--temp", "0", "-no-cnv", "-st", "--ignore-eos",
                 "--no-display-prompt",
             ]
         runs.append(run_cli_once(cmd, engine, env=env))
+    # Token-count gate under --ignore-eos: allow llama's off-by-one (n-1).
+    for r in runs:
+        if r.get("error"):
+            continue
+        ct = r.get("completion_tokens")
+        if isinstance(ct, int) and ct not in (n, n - 1, None):
+            # Soft warn into the row; don't fail the whole pin for early-EOS
+            # models that ignore --ignore-eos inconsistently.
+            r["token_count_note"] = f"got {ct}, expected {n} or {n-1}"
     row = aggregate(runs, max(reps, 1))
+    # Aggregate startup_s if present.
+    startups = [r.get("startup_s") for r in runs if isinstance(r.get("startup_s"), (int, float))]
+    if startups:
+        row["startup_s"] = round(statistics.median(startups), 3)
+        if len(startups) >= 2:
+            row["startup_stddev"] = round(statistics.stdev(startups), 3)
     row["engine"] = engine
     row["mode"] = "cli"
+    row["bin"] = bin_path
+    row["bin_sha256_16"] = file_sha256(bin_path)
+    row["bin_version"] = bin_version(bin_path)
     return row
 
 
@@ -533,19 +622,98 @@ def run_one(
 
     print(f"=== {entry['id']} / {backend} / {mode} ===", flush=True)
     if mode == "cli":
-        # Strictly serial: llama-cli runs to completion and exits before
-        # ferrox starts — never two engines resident at once.
+        # Interleaved reps: llama r_i → ferrox r_i so page-cache effects
+        # are shared. Engines never overlap (serial within each pair).
+        pin["workload"] = (
+            "CLI one-shot -p … -n N --no-cnv --ignore-eos -c 4096, "
+            f"interleaved {reps}× cold process (median ± stddev)"
+        )
+        pin["git_rev"] = git_rev()
+        pin["ferrox_bin"] = ferrox_bin
+        pin["llama_bin"] = llama_bin
+        print("--- cli interleaved (llama then ferrox each rep) ---", flush=True)
+        # Collect per-rep then aggregate via run_cli_engine by calling
+        # once each — still llama-all then ferrox-all would bias cache;
+        # instead manually interleave below.
+        llama_runs = []
+        ferrox_runs = []
+        ngl = "0" if backend == "cpu" else "99"
+        env_base = {k: v for k, v in os.environ.items() if not k.startswith("FERROX_")}
+        for i in range(max(reps, 1)):
+            prompt = PROMPT.format(uid=uuid.uuid4().hex[:8])
+            if not skip_llama:
+                env = dict(env_base)
+                cmd = [
+                    llama_bin, "-m", str(model_path), "-p", prompt,
+                    "-n", str(max_tokens), "-t", str(threads), "-c", "4096",
+                    "-ngl", ngl, "--temp", "0", "-no-cnv", "-st",
+                    "--ignore-eos", "--no-display-prompt",
+                ]
+                print(f"--- llama (cli) rep {i+1}/{reps} ---", flush=True)
+                llama_runs.append(run_cli_once(cmd, "llama", env=env))
+            if not skip_ferrox:
+                env = dict(env_base)
+                if backend == "metal":
+                    env["FERROX_METAL"] = "1"
+                    env["FERROX_METAL_ATTN"] = "1"
+                    env["FERROX_CUDA"] = "0"
+                elif backend == "cuda":
+                    env["FERROX_METAL"] = "0"
+                    env["FERROX_CUDA"] = "1"
+                    env.setdefault("FERROX_CUDA_GQA", "1")
+                else:
+                    env["FERROX_METAL"] = "0"
+                    env["FERROX_CUDA"] = "0"
+                    env["FERROX_CPU_INT_DOT"] = os.environ.get("FERROX_CPU_INT_DOT", "1")
+                if backend == "metal" and b"FERROX_METAL_FA_VEC" not in Path(ferrox_bin).read_bytes():
+                    ferrox_runs.append({
+                        "error": "ferrox binary lacks metal feature",
+                        "engine": "ferrox",
+                    })
+                else:
+                    cmd = [
+                        ferrox_bin, "-m", str(model_path), "-p", prompt,
+                        "-n", str(max_tokens), "-t", str(threads), "-c", "4096",
+                        "--ngl", ngl, "--temp", "0", "--no-cnv", "--ignore-eos",
+                    ]
+                    print(f"--- ferrox (cli) rep {i+1}/{reps} ---", flush=True)
+                    ferrox_runs.append(run_cli_once(cmd, "ferrox", env=env))
         if not skip_llama:
-            print("--- llama (cli) ---", flush=True)
-            pin["llama"] = run_cli_engine(
-                "llama", llama_bin, str(model_path), max_tokens, backend, threads, reps
-            )
+            if Path(llama_bin).name == "llama-cli":
+                pin["llama"] = {
+                    "error": "llama-cli is not valid for CLI pins; use llama-completion",
+                    "engine": "llama",
+                    "mode": "cli",
+                }
+            else:
+                pin["llama"] = aggregate(llama_runs, max(reps, 1))
+                pin["llama"]["engine"] = "llama"
+                pin["llama"]["mode"] = "cli"
+                pin["llama"]["bin"] = llama_bin
+                pin["llama"]["bin_sha256_16"] = file_sha256(llama_bin)
+                pin["llama"]["bin_version"] = bin_version(llama_bin)
+                startups = [
+                    r.get("startup_s")
+                    for r in llama_runs
+                    if isinstance(r.get("startup_s"), (int, float))
+                ]
+                if startups:
+                    pin["llama"]["startup_s"] = round(statistics.median(startups), 3)
             print(json.dumps(pin["llama"], indent=2), flush=True)
         if not skip_ferrox:
-            print("--- ferrox (cli) ---", flush=True)
-            pin["ferrox"] = run_cli_engine(
-                "ferrox", ferrox_bin, str(model_path), max_tokens, backend, threads, reps
-            )
+            pin["ferrox"] = aggregate(ferrox_runs, max(reps, 1))
+            pin["ferrox"]["engine"] = "ferrox"
+            pin["ferrox"]["mode"] = "cli"
+            pin["ferrox"]["bin"] = ferrox_bin
+            pin["ferrox"]["bin_sha256_16"] = file_sha256(ferrox_bin)
+            pin["ferrox"]["bin_version"] = bin_version(ferrox_bin)
+            startups = [
+                r.get("startup_s")
+                for r in ferrox_runs
+                if isinstance(r.get("startup_s"), (int, float))
+            ]
+            if startups:
+                pin["ferrox"]["startup_s"] = round(statistics.median(startups), 3)
             print(json.dumps(pin["ferrox"], indent=2), flush=True)
     else:
         if not skip_ferrox:
@@ -585,13 +753,19 @@ def run_one(
             f"summary predicted tok/s (median of {reps}): "
             f"ferrox={fp:.3f}{fs_str} llama={lp:.3f}{ls_str} gap={lp/fp:.2f}x"
         )
-        fl = (pin.get("ferrox") or {}).get("load_s")
-        ll = (pin.get("llama") or {}).get("load_s")
+        fl = (pin.get("ferrox") or {}).get("startup_s")
+        ll = (pin.get("llama") or {}).get("startup_s")
+        if not (isinstance(fl, (int, float)) and isinstance(ll, (int, float))):
+            fl = (pin.get("ferrox") or {}).get("load_s")
+            ll = (pin.get("llama") or {}).get("load_s")
+            label = "engine-load (incomparable defs)"
+        else:
+            label = "startup (wall - decode)"
         if isinstance(fl, (int, float)) and isinstance(ll, (int, float)) and ll > 0:
             print(
-                f"summary load/startup (s, median): "
+                f"summary {label} (s, median): "
                 f"ferrox={fl:.3f} llama={ll:.3f} gap={fl/ll:.2f}x "
-                f"(same as pred: <1 ferrox better)"
+                f"(<1 ferrox better)"
             )
     return pin
 
@@ -683,7 +857,13 @@ def main() -> None:
             # llama-cli). Prefer llama-completion when on PATH.
             from shutil import which
 
-            args.llama_bin = which("llama-completion") or which("llama-cli") or "llama-completion"
+            comp = which("llama-completion")
+            if not comp:
+                raise SystemExit(
+                    "CLI mode requires llama-completion on PATH "
+                    "(Homebrew llama.cpp ≥b76xx; llama-cli rejects -no-cnv)"
+                )
+            args.llama_bin = comp
         else:
             args.llama_bin = "llama-server"
 

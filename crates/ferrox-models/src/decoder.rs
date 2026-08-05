@@ -504,33 +504,28 @@ impl Decoder {
     }
 
     /// True when this layer can use the fused Metal attention block
-    /// (Norm or NeoX RoPE, no bias/QK-norm/window, quantized projections).
+    /// (Norm or NeoX RoPE, quantized projections; QKV bias + QK-norm
+    /// via [`ferrox_metal::attn::AttnExtras`]).
     #[cfg(feature = "metal")]
     fn layer_supports_metal_attn(&self, layer: &LayerWeights) -> bool {
         use crate::config::RopeLayout;
         if !matches!(self.config.rope_layout, RopeLayout::Norm | RopeLayout::Neox) {
             return false;
         }
-        // QKV bias (Qwen2-family) and *per-head* QK-norm (Qwen3) run on
-        // Metal via AttnExtras. Whole-vector QK-norm (OLMoE) stays CPU.
-        if (layer.attn.q_norm.is_some() || layer.attn.k_norm.is_some())
-            && !matches!(
-                self.config.qk_norm_style,
-                crate::capability::QkNormStyle::PerHead
-            )
-        {
-            return false;
-        }
-        if layer
-            .attn
-            .q_norm
-            .as_ref()
-            .is_some_and(|w| w.len() != self.config.head_dim)
-            || layer
-                .attn
-                .k_norm
-                .as_ref()
-                .is_some_and(|w| w.len() != self.config.head_dim)
+        // QKV bias (Qwen2) and QK-norm — per-head (Qwen3/Gemma-3) or
+        // whole-vector (OLMoE) — run on Metal via AttnExtras.
+        let q_len = self.config.n_heads * self.config.head_dim;
+        let k_len = self.config.n_kv_heads * self.config.head_dim;
+        let qk_norm_ok = |w: Option<&Vec<f32>>, vec_len: usize| -> bool {
+            match w {
+                None => true,
+                Some(w) if w.len() == self.config.head_dim => true,
+                Some(w) if w.len() == vec_len => true,
+                _ => false,
+            }
+        };
+        if !qk_norm_ok(layer.attn.q_norm.as_ref(), q_len)
+            || !qk_norm_ok(layer.attn.k_norm.as_ref(), k_len)
         {
             return false;
         }
@@ -563,7 +558,7 @@ impl Decoder {
             || self.config.layer_rope_theta(layer_idx) != self.config.rope_theta
     }
 
-    /// Optional QKV bias / per-head QK-norm ops for the Metal attn paths.
+    /// Optional QKV bias / QK-norm ops for the Metal attn paths.
     #[cfg(feature = "metal")]
     fn metal_attn_extras<'a>(&self, layer: &'a LayerWeights) -> ferrox_metal::attn::AttnExtras<'a> {
         ferrox_metal::attn::AttnExtras {
@@ -574,6 +569,25 @@ impl Decoder {
             k_norm: layer.attn.k_norm.as_deref(),
             attn_logit_softcap: self.config.attn_logit_softcap,
         }
+    }
+
+    /// GPU expert residency only when Metal attention stays on-device
+    /// (when the Metal dense+attn path is active). Avoids CPU-attention
+    /// ↔ GPU-expert activation ping-pong on Metal MoE.
+    #[cfg(feature = "metal")]
+    fn expert_residency_plan(&self, use_metal_attn: bool) -> Option<ferrox_moe::ResidencyPlan> {
+        if ferrox_core::metal_dense_enabled()
+            && ferrox_metal::attn::metal_attn_enabled()
+            && !use_metal_attn
+        {
+            return None;
+        }
+        self.gpu_vram_budget_bytes.map(|b| self.residency_plan(b))
+    }
+
+    #[cfg(not(feature = "metal"))]
+    fn expert_residency_plan(&self, _use_metal_attn: bool) -> Option<ferrox_moe::ResidencyPlan> {
+        self.gpu_vram_budget_bytes.map(|b| self.residency_plan(b))
     }
 
     /// Map config RoPE layout onto the Metal kernel selector.
@@ -739,8 +753,6 @@ impl Decoder {
                 *v *= scale;
             }
         }
-        let residency = self.gpu_vram_budget_bytes.map(|b| self.residency_plan(b));
-
         #[cfg(feature = "cuda")]
         if cuda_gqa_enabled() {
             // Fixed capacity so ensure_layer_kv does not recreate (and
@@ -766,6 +778,11 @@ impl Decoder {
                 .layers
                 .iter()
                 .all(|l| self.layer_supports_metal_attn(l));
+
+        #[cfg(not(feature = "metal"))]
+        let use_metal_attn = false;
+
+        let residency = self.expert_residency_plan(use_metal_attn);
 
         #[cfg(feature = "metal")]
         let mut metal_kv_guard: Option<
@@ -898,13 +915,17 @@ impl Decoder {
                             // Else opt-in FERROX_METAL_LOGITS downloads full vocab
                             // (often slower). Default: host lm_head after hidden.
                             let greedy_gpu = ferrox_metal::attn::metal_greedy_argmax_active();
+                            let lm_head_gpu_launch = Self::metal_matvec_launch(&self.output_head);
+                            // Prefer greedy GPU argmax-in-stack (1×u32 download)
+                            // when generate marked this thread for temperature<=0.
+                            // Else opt-in FERROX_METAL_LOGITS downloads full vocab
+                            // (often slower). Default: host lm_head after hidden.
                             let out_launch =
                                 if greedy_gpu || ferrox_metal::attn::metal_logits_enabled() {
-                                    Self::metal_matvec_launch(&self.output_head)
+                                    lm_head_gpu_launch
                                 } else {
                                     None
                                 };
-                            let lm_head_gpu_launch = Self::metal_matvec_launch(&self.output_head);
                             // Pass final_norm_w when: (1) lm_head runs in stack (out_launch),
                             // OR (2) lm_head will route to GPU after stack (lm_head_gpu_launch
                             // but no out_launch) so we can skip download→reupload via TLS.
@@ -960,9 +981,8 @@ impl Decoder {
                                     // Metal KV advanced in-place. Skip host
                                     // last_token_host+push — host may lag until
                                     // sync_metal_attn_kv_to_host / CPU fallback.
-                                    for layer in &self.layers {
-                                        layer.moe.record_activations(&[0]);
-                                    }
+                                    // Dense stack has no MoE routing; skip
+                                    // per-layer hotness atomics on the hot path.
                                     if out_launch.is_some() {
                                         // Stack returned logits or [argmax id] —
                                         // skip host final_norm/lm_head. Clear TLS.
@@ -1111,10 +1131,9 @@ impl Decoder {
                                             self.config.rms_norm_eps,
                                         ) {
                                             Ok(projected) => {
-                                                Self::catch_up_host_kv_from_metal(
-                                                    &metal_kvs[l],
-                                                    cache,
-                                                );
+                                                // Keep Metal KV authoritative — skip per-layer
+                                                // host catch-up (dense-stack style). Host is
+                                                // flushed on CPU fallback / prefix sync.
                                                 for (h, p) in
                                                     hidden.iter_mut().zip(projected.iter())
                                                 {
@@ -1696,8 +1715,6 @@ impl Decoder {
             }
         }
 
-        let residency = self.gpu_vram_budget_bytes.map(|b| self.residency_plan(b));
-
         #[cfg(feature = "metal")]
         let use_metal_attn = ferrox_core::metal_dense_enabled()
             && ferrox_metal::attn::metal_attn_enabled()
@@ -1705,6 +1722,11 @@ impl Decoder {
                 .layers
                 .iter()
                 .all(|l| self.layer_supports_metal_attn(l));
+
+        #[cfg(not(feature = "metal"))]
+        let use_metal_attn = false;
+
+        let residency = self.expert_residency_plan(use_metal_attn);
 
         #[cfg(feature = "metal")]
         let mut metal_kv_guard: Option<

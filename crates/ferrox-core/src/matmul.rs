@@ -61,12 +61,11 @@ pub fn matmul_f32(a: &Tensor, b_t: &Tensor) -> Tensor {
 /// x_normalized = x / sqrt(mean(x^2) + eps) * weight
 pub fn rms_norm(x: &[f32], weight: &[f32], eps: f32) -> Vec<f32> {
     assert_eq!(x.len(), weight.len());
-    let mean_sq = x.iter().map(|v| v * v).sum::<f32>() / x.len() as f32;
+    let mean_sq = sum_sq(x) / x.len() as f32;
     let scale = 1.0 / (mean_sq + eps).sqrt();
-    x.iter()
-        .zip(weight.iter())
-        .map(|(v, w)| v * scale * w)
-        .collect()
+    let mut out = vec![0f32; x.len()];
+    mul3_scale(x, weight, scale, &mut out);
+    out
 }
 
 /// Per-head RMSNorm (Qwen3 / Gemma3 `attn_q_norm` / `attn_k_norm`):
@@ -75,15 +74,139 @@ pub fn rms_norm(x: &[f32], weight: &[f32], eps: f32) -> Vec<f32> {
 pub fn rms_norm_per_head(x: &[f32], weight: &[f32], head_dim: usize, eps: f32) -> Vec<f32> {
     assert_eq!(weight.len(), head_dim);
     assert_eq!(x.len() % head_dim, 0);
-    let mut out = Vec::with_capacity(x.len());
-    for head in x.chunks_exact(head_dim) {
-        let mean_sq = head.iter().map(|v| v * v).sum::<f32>() / head_dim as f32;
+    let mut out = vec![0f32; x.len()];
+    for (head, out_h) in x.chunks_exact(head_dim).zip(out.chunks_exact_mut(head_dim)) {
+        let mean_sq = sum_sq(head) / head_dim as f32;
         let scale = 1.0 / (mean_sq + eps).sqrt();
-        for (v, w) in head.iter().zip(weight.iter()) {
-            out.push(v * scale * w);
-        }
+        mul3_scale(head, weight, scale, out_h);
     }
     out
+}
+
+#[inline]
+fn sum_sq(x: &[f32]) -> f32 {
+    #[cfg(target_arch = "aarch64")]
+    {
+        if std::arch::is_aarch64_feature_detected!("neon") {
+            return unsafe { sum_sq_neon(x) };
+        }
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {
+            return unsafe { sum_sq_avx2(x) };
+        }
+    }
+    x.iter().map(|v| v * v).sum()
+}
+
+#[inline]
+fn mul3_scale(x: &[f32], w: &[f32], scale: f32, out: &mut [f32]) {
+    debug_assert_eq!(x.len(), w.len());
+    debug_assert_eq!(x.len(), out.len());
+    #[cfg(target_arch = "aarch64")]
+    {
+        if std::arch::is_aarch64_feature_detected!("neon") {
+            unsafe { mul3_scale_neon(x, w, scale, out) };
+            return;
+        }
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {
+            unsafe { mul3_scale_avx2(x, w, scale, out) };
+            return;
+        }
+    }
+    for ((o, &xv), &wv) in out.iter_mut().zip(x).zip(w) {
+        *o = xv * scale * wv;
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn sum_sq_neon(x: &[f32]) -> f32 {
+    use std::arch::aarch64::*;
+    let n = x.len();
+    let mut acc = vdupq_n_f32(0.0);
+    let mut i = 0;
+    while i + 4 <= n {
+        let v = vld1q_f32(x.as_ptr().add(i));
+        acc = vfmaq_f32(acc, v, v);
+        i += 4;
+    }
+    let mut sum = vaddvq_f32(acc);
+    while i < n {
+        sum += x[i] * x[i];
+        i += 1;
+    }
+    sum
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn mul3_scale_neon(x: &[f32], w: &[f32], scale: f32, out: &mut [f32]) {
+    use std::arch::aarch64::*;
+    let n = x.len();
+    let vs = vdupq_n_f32(scale);
+    let mut i = 0;
+    while i + 4 <= n {
+        let xv = vld1q_f32(x.as_ptr().add(i));
+        let wv = vld1q_f32(w.as_ptr().add(i));
+        vst1q_f32(out.as_mut_ptr().add(i), vmulq_f32(vmulq_f32(xv, vs), wv));
+        i += 4;
+    }
+    while i < n {
+        out[i] = x[i] * scale * w[i];
+        i += 1;
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn sum_sq_avx2(x: &[f32]) -> f32 {
+    use std::arch::x86_64::*;
+    let n = x.len();
+    let mut acc = _mm256_setzero_ps();
+    let mut i = 0;
+    while i + 8 <= n {
+        let v = _mm256_loadu_ps(x.as_ptr().add(i));
+        acc = _mm256_fmadd_ps(v, v, acc);
+        i += 8;
+    }
+    let lo = _mm256_castps256_ps128(acc);
+    let hi = _mm256_extractf128_ps(acc, 1);
+    let mut s128 = _mm_add_ps(lo, hi);
+    s128 = _mm_add_ps(s128, _mm_movehl_ps(s128, s128));
+    s128 = _mm_add_ss(s128, _mm_shuffle_ps(s128, s128, 1));
+    let mut sum = _mm_cvtss_f32(s128);
+    while i < n {
+        sum += x[i] * x[i];
+        i += 1;
+    }
+    sum
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn mul3_scale_avx2(x: &[f32], w: &[f32], scale: f32, out: &mut [f32]) {
+    use std::arch::x86_64::*;
+    let n = x.len();
+    let vs = _mm256_set1_ps(scale);
+    let mut i = 0;
+    while i + 8 <= n {
+        let xv = _mm256_loadu_ps(x.as_ptr().add(i));
+        let wv = _mm256_loadu_ps(w.as_ptr().add(i));
+        _mm256_storeu_ps(
+            out.as_mut_ptr().add(i),
+            _mm256_mul_ps(_mm256_mul_ps(xv, vs), wv),
+        );
+        i += 8;
+    }
+    while i < n {
+        out[i] = x[i] * scale * w[i];
+        i += 1;
+    }
 }
 
 /// Soft-cap used by Gemma 2+ attention / final logits:

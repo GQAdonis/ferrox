@@ -165,16 +165,134 @@ fn online_attn_accumulate(
         let alpha = (m - m_new).exp();
         let p = (s - m_new).exp();
         l = l * alpha + p;
-        for d in 0..head_dim {
-            out_h[d] = out_h[d] * alpha + p * v_t[d];
-        }
+        axpy_scale(out_h, alpha, v_t, p);
         m = m_new;
     });
     if l > 0.0 {
         let inv = 1.0 / l;
-        for x in out_h.iter_mut() {
-            *x *= inv;
+        scale_inplace(out_h, inv);
+    }
+}
+
+/// `out[i] = out[i] * alpha + p * v[i]` (online-softmax V accumulate).
+#[inline]
+fn axpy_scale(out: &mut [f32], alpha: f32, v: &[f32], p: f32) {
+    debug_assert_eq!(out.len(), v.len());
+    #[cfg(target_arch = "aarch64")]
+    {
+        if std::arch::is_aarch64_feature_detected!("neon") {
+            unsafe { axpy_scale_neon(out, alpha, v, p) };
+            return;
         }
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {
+            unsafe { axpy_scale_avx2(out, alpha, v, p) };
+            return;
+        }
+    }
+    for (o, &vv) in out.iter_mut().zip(v) {
+        *o = *o * alpha + p * vv;
+    }
+}
+
+#[inline]
+fn scale_inplace(x: &mut [f32], s: f32) {
+    #[cfg(target_arch = "aarch64")]
+    {
+        if std::arch::is_aarch64_feature_detected!("neon") {
+            unsafe { scale_inplace_neon(x, s) };
+            return;
+        }
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::is_x86_feature_detected!("avx2") {
+            unsafe { scale_inplace_avx2(x, s) };
+            return;
+        }
+    }
+    for v in x.iter_mut() {
+        *v *= s;
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn axpy_scale_neon(out: &mut [f32], alpha: f32, v: &[f32], p: f32) {
+    use std::arch::aarch64::*;
+    let n = out.len();
+    let va = vdupq_n_f32(alpha);
+    let vp = vdupq_n_f32(p);
+    let mut i = 0;
+    while i + 4 <= n {
+        let o = vld1q_f32(out.as_ptr().add(i));
+        let vv = vld1q_f32(v.as_ptr().add(i));
+        let r = vfmaq_f32(vmulq_f32(o, va), vv, vp);
+        vst1q_f32(out.as_mut_ptr().add(i), r);
+        i += 4;
+    }
+    while i < n {
+        out[i] = out[i] * alpha + p * v[i];
+        i += 1;
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn scale_inplace_neon(x: &mut [f32], s: f32) {
+    use std::arch::aarch64::*;
+    let n = x.len();
+    let vs = vdupq_n_f32(s);
+    let mut i = 0;
+    while i + 4 <= n {
+        let v = vld1q_f32(x.as_ptr().add(i));
+        vst1q_f32(x.as_mut_ptr().add(i), vmulq_f32(v, vs));
+        i += 4;
+    }
+    while i < n {
+        x[i] *= s;
+        i += 1;
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn axpy_scale_avx2(out: &mut [f32], alpha: f32, v: &[f32], p: f32) {
+    use std::arch::x86_64::*;
+    let n = out.len();
+    let va = _mm256_set1_ps(alpha);
+    let vp = _mm256_set1_ps(p);
+    let mut i = 0;
+    while i + 8 <= n {
+        let o = _mm256_loadu_ps(out.as_ptr().add(i));
+        let vv = _mm256_loadu_ps(v.as_ptr().add(i));
+        let r = _mm256_fmadd_ps(vv, vp, _mm256_mul_ps(o, va));
+        _mm256_storeu_ps(out.as_mut_ptr().add(i), r);
+        i += 8;
+    }
+    while i < n {
+        out[i] = out[i] * alpha + p * v[i];
+        i += 1;
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn scale_inplace_avx2(x: &mut [f32], s: f32) {
+    use std::arch::x86_64::*;
+    let n = x.len();
+    let vs = _mm256_set1_ps(s);
+    let mut i = 0;
+    while i + 8 <= n {
+        let v = _mm256_loadu_ps(x.as_ptr().add(i));
+        _mm256_storeu_ps(x.as_mut_ptr().add(i), _mm256_mul_ps(v, vs));
+        i += 8;
+    }
+    while i < n {
+        x[i] *= s;
+        i += 1;
     }
 }
 

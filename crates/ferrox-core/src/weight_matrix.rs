@@ -160,8 +160,8 @@ pub fn cuda_dense_enabled() -> bool {
     })
 }
 
-/// Whether CPU Q8_0 matvec should quantize the activation to int8 and
-/// use the integer `vec_dot` path (`FERROX_CPU_INT_DOT=1`). Off by
+/// Whether CPU Q8_0 / Q4_0 matvec should quantize the activation to int8
+/// and use the integer `vec_dot` path (`FERROX_CPU_INT_DOT=1`). Off by
 /// default: it trades a small activation-quant error for integer-SIMD
 /// throughput, so callers opt in explicitly.
 pub fn cpu_int_dot_enabled() -> bool {
@@ -438,17 +438,21 @@ impl WeightMatrix {
                 let row_bytes = self.block_bytes_per_row(*kind, *cols);
                 let mut out = vec![0f32; *rows];
                 // FERROX_CPU_INT_DOT=1: quantize the shared activation to
-                // int8 once, then every Q8_0 row dot becomes an int8×int8
-                // → i32 SIMD reduction (llama.cpp's CPU matmul strategy).
+                // int8 once, then every Q8_0 / Q4_0 row dot becomes an
+                // int8×int8 → i32 SIMD reduction (llama.cpp's CPU matmul).
                 // Small activation-quant error vs the f32 dot, so opt-in.
-                if *kind == QuantKind::Q8_0 && cpu_int_dot_enabled() {
+                if matches!(*kind, QuantKind::Q8_0 | QuantKind::Q4_0) && cpu_int_dot_enabled() {
                     let act = ferrox_quant::quantize_activations_q8(x);
                     out.par_iter_mut()
                         .with_min_len(Self::min_rows_per_task(*rows))
                         .enumerate()
                         .for_each(|(r, o)| {
                             let row = &data.as_slice()[r * row_bytes..(r + 1) * row_bytes];
-                            *o = ferrox_quant::dot_q8_0_q8(row, &act);
+                            *o = match *kind {
+                                QuantKind::Q8_0 => ferrox_quant::dot_q8_0_q8(row, &act),
+                                QuantKind::Q4_0 => ferrox_quant::dot_q4_0_q8(row, &act),
+                                _ => unreachable!(),
+                            };
                         });
                     return out;
                 }
@@ -842,83 +846,142 @@ impl WeightMatrix {
         None
     }
 
-    /// Dense SwiGLU FFN on CUDA with device-resident activations:
-    /// one HtoD of `x`, gate+up+silu×up+down on GPU, one DtoH.
-    /// Returns `None` if CUDA dense is off or any matrix lacks a CUDA
-    /// kernel — caller falls back to [`Self::apply`] / multi-matvec.
-    #[cfg(feature = "cuda")]
+    /// Dense SwiGLU FFN on GPU with device-resident activations:
+    /// one upload of `x`, gate+up+silu×up+down on device, one download.
+    /// Tries CUDA first when enabled, then Metal. Returns `None` if
+    /// no GPU path applies — caller falls back to [`Self::apply`] /
+    /// multi-matvec.
+    #[cfg(any(feature = "cuda", feature = "metal"))]
     pub fn apply_gpu_dense_ffn_swiglu(
         gate: &WeightMatrix,
         up: &WeightMatrix,
         down: &WeightMatrix,
         x: &[f32],
     ) -> Option<Vec<f32>> {
-        if !cuda_dense_enabled() {
-            return None;
-        }
-        fn cuda_launch(m: &WeightMatrix) -> Option<ferrox_cuda::gpu::MatvecLaunch<'_>> {
-            let WeightMatrix::Quantized {
-                data,
-                rows,
-                cols,
-                kind,
-            } = m
-            else {
-                return None;
-            };
-            let (kernel_src, module_name, fn_name) = match kind {
-                QuantKind::Q8_0 => (
-                    ferrox_cuda::gpu::Q8_0_MATVEC_KERNEL_SRC,
-                    "ferrox_q8_0",
-                    "q8_0_matvec",
-                ),
-                QuantKind::Q4_0 => (
-                    ferrox_cuda::gpu::Q4_0_MATVEC_KERNEL_SRC,
-                    "ferrox_q4_0",
-                    "q4_0_matvec",
-                ),
-                QuantKind::Q4K => (
-                    ferrox_cuda::gpu::Q4_K_MATVEC_KERNEL_SRC,
-                    "ferrox_q4_k",
-                    "q4_k_matvec",
-                ),
-                QuantKind::Q5K => (
-                    ferrox_cuda::gpu::Q5_K_MATVEC_KERNEL_SRC,
-                    "ferrox_q5_k",
-                    "q5_k_matvec",
-                ),
-                QuantKind::Q6K => (
-                    ferrox_cuda::gpu::Q6_K_MATVEC_KERNEL_SRC,
-                    "ferrox_q6_k",
-                    "q6_k_matvec",
-                ),
-                _ => return None,
-            };
-            let row_bytes = m.block_bytes_per_row(*kind, *cols);
-            let n_blocks_per_row = row_bytes / WeightMatrix::block_bytes_for_kind(*kind);
-            Some(ferrox_cuda::gpu::MatvecLaunch {
-                kernel_src,
-                module_name,
-                fn_name,
-                weights: data.as_slice(),
-                rows: *rows,
-                row_bytes,
-                n_blocks_per_row,
-            })
-        }
-        let g = cuda_launch(gate)?;
-        let u = cuda_launch(up)?;
-        let d = cuda_launch(down)?;
-        assert_eq!(gate.cols(), x.len());
-        assert_eq!(up.cols(), x.len());
-        assert_eq!(down.cols(), gate.rows());
-        match ferrox_cuda::gpu::launch_dense_ffn_swiglu(&g, &u, &d, x) {
-            Ok(out) => Some(out),
-            Err(e) => {
-                eprintln!("ferrox: CUDA dense FFN fuse failed, falling back: {e}");
-                None
+        #[cfg(feature = "cuda")]
+        {
+            if cuda_dense_enabled() {
+                fn cuda_launch(m: &WeightMatrix) -> Option<ferrox_cuda::gpu::MatvecLaunch<'_>> {
+                    let WeightMatrix::Quantized {
+                        data,
+                        rows,
+                        cols,
+                        kind,
+                    } = m
+                    else {
+                        return None;
+                    };
+                    let (kernel_src, module_name, fn_name) = match kind {
+                        QuantKind::Q8_0 => (
+                            ferrox_cuda::gpu::Q8_0_MATVEC_KERNEL_SRC,
+                            "ferrox_q8_0",
+                            "q8_0_matvec",
+                        ),
+                        QuantKind::Q4_0 => (
+                            ferrox_cuda::gpu::Q4_0_MATVEC_KERNEL_SRC,
+                            "ferrox_q4_0",
+                            "q4_0_matvec",
+                        ),
+                        QuantKind::Q4K => (
+                            ferrox_cuda::gpu::Q4_K_MATVEC_KERNEL_SRC,
+                            "ferrox_q4_k",
+                            "q4_k_matvec",
+                        ),
+                        QuantKind::Q5K => (
+                            ferrox_cuda::gpu::Q5_K_MATVEC_KERNEL_SRC,
+                            "ferrox_q5_k",
+                            "q5_k_matvec",
+                        ),
+                        QuantKind::Q6K => (
+                            ferrox_cuda::gpu::Q6_K_MATVEC_KERNEL_SRC,
+                            "ferrox_q6_k",
+                            "q6_k_matvec",
+                        ),
+                        _ => return None,
+                    };
+                    let row_bytes = m.block_bytes_per_row(*kind, *cols);
+                    let n_blocks_per_row = row_bytes / WeightMatrix::block_bytes_for_kind(*kind);
+                    Some(ferrox_cuda::gpu::MatvecLaunch {
+                        kernel_src,
+                        module_name,
+                        fn_name,
+                        weights: data.as_slice(),
+                        rows: *rows,
+                        row_bytes,
+                        n_blocks_per_row,
+                    })
+                }
+                if let (Some(g), Some(u), Some(d)) =
+                    (cuda_launch(gate), cuda_launch(up), cuda_launch(down))
+                {
+                    assert_eq!(gate.cols(), x.len());
+                    assert_eq!(up.cols(), x.len());
+                    assert_eq!(down.cols(), gate.rows());
+                    match ferrox_cuda::gpu::launch_dense_ffn_swiglu(&g, &u, &d, x) {
+                        Ok(out) => return Some(out),
+                        Err(e) => {
+                            eprintln!("ferrox: CUDA dense FFN fuse failed, trying next: {e}");
+                        }
+                    }
+                }
             }
         }
+        #[cfg(feature = "metal")]
+        {
+            if metal_dense_enabled() {
+                fn metal_launch(m: &WeightMatrix) -> Option<ferrox_metal::gpu::MatvecLaunch<'_>> {
+                    let WeightMatrix::Quantized {
+                        data,
+                        rows,
+                        cols: _,
+                        kind,
+                    } = m
+                    else {
+                        return None;
+                    };
+                    let kind_name = match kind {
+                        QuantKind::Q8_0 => "Q8_0",
+                        QuantKind::Q4_0 => "Q4_0",
+                        QuantKind::Q4K => "Q4_K",
+                        QuantKind::Q5K => "Q5_K",
+                        QuantKind::Q6K => "Q6_K",
+                        QuantKind::IQ4XS => "IQ4_XS",
+                        _ => return None,
+                    };
+                    let (src, fn_name, block_bytes, block_elems, rows_per_tg) =
+                        ferrox_metal::gpu::matvec_launch_meta(kind_name)?;
+                    let row_bytes = if *rows == 0 {
+                        0
+                    } else {
+                        data.as_slice().len() / *rows
+                    };
+                    Some(ferrox_metal::gpu::MatvecLaunch {
+                        kernel_src: src,
+                        fn_name,
+                        block_bytes,
+                        block_elems,
+                        weights: data.as_slice(),
+                        rows: *rows,
+                        row_bytes,
+                        rows_per_tg,
+                    })
+                }
+                if let (Some(g), Some(u), Some(d)) =
+                    (metal_launch(gate), metal_launch(up), metal_launch(down))
+                {
+                    assert_eq!(gate.cols(), x.len());
+                    assert_eq!(up.cols(), x.len());
+                    assert_eq!(down.cols(), gate.rows());
+                    match ferrox_metal::gpu::launch_dense_ffn_swiglu(&g, &u, &d, x) {
+                        Ok(out) => return Some(out),
+                        Err(e) => {
+                            eprintln!("ferrox: Metal dense FFN fuse failed, falling back: {e}");
+                        }
+                    }
+                }
+            }
+        }
+        None
     }
 
     /// Runs one weight matrix against `batch_size` activations in a

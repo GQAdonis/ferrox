@@ -73,31 +73,19 @@ def gap_ratio(fp, lp) -> float | None:
 
 
 def color_gap(g: float | None, *, lower_is_better: bool = False) -> str:
-    """HTML-colored gap cell. Convention: gap < 1 → ferrox better → green.
+    """Gap cell for GitHub markdown (no inline CSS — GH strips it).
 
-    For tok/s, gap = llama/ferrox. For load, gap = ferrox/llama (already
-    flipped so <1 means ferrox better). `lower_is_better` is unused when
-    callers pass the already-normalized ratio.
+    Convention: gap < 1 → ferrox better. Uses emoji + bold text so the
+    signal survives GitHub Flavored Markdown.
     """
     del lower_is_better  # ratios are pre-normalized to "<1 = ferrox better"
     if g is None:
         return "—"
     if abs(g - 1.0) < 0.015:
-        return (
-            '<span style="color:#656d76;font-weight:600">= **1.00×**</span>'
-        )
-    label = f"**~{g:.2f}×**"
+        return "⚪ **1.00×**"
     if g < 1.0:
-        # ferrox better — green
-        return (
-            f'<span style="color:#1a7f37;font-weight:700;background:#dafbe1;'
-            f'padding:1px 6px;border-radius:4px">▲ {label}</span>'
-        )
-    # ferrox slower — red
-    return (
-        f'<span style="color:#cf222e;font-weight:700;background:#ffebe9;'
-        f'padding:1px 6px;border-radius:4px">▼ {label}</span>'
-    )
+        return f"🟢 **~{g:.2f}×**"
+    return f"🔴 **~{g:.2f}×**"
 
 
 def gap_str(fp, lp) -> str:
@@ -110,16 +98,10 @@ def winner_str(fp, lp) -> str:
     if g is None:
         return "—"
     if abs(g - 1.0) < 0.015:
-        return '<span style="color:#656d76">tie</span>'
+        return "⚪ tie"
     if g < 1.0:
-        return (
-            '<span style="color:#1a7f37;font-weight:700;background:#dafbe1;'
-            'padding:1px 6px;border-radius:4px">ferrox</span>'
-        )
-    return (
-        '<span style="color:#cf222e;font-weight:700;background:#ffebe9;'
-        'padding:1px 6px;border-radius:4px">llama</span>'
-    )
+        return "🟢 **ferrox**"
+    return "🔴 **llama**"
 
 
 def status_cell(pin: dict | None, expect: str) -> str:
@@ -195,13 +177,8 @@ def main() -> None:
         "One pin per `(model_id, backend)`. Re-run overwrites the pin. "
         "Gap only when both engines succeed.\n",
         "\n",
-        "**Gap colors:** "
-        '<span style="color:#1a7f37;font-weight:700;background:#dafbe1;'
-        'padding:1px 6px;border-radius:4px">▲ green</span> = ferrox better '
-        "(&lt;1.00×); "
-        '<span style="color:#cf222e;font-weight:700;background:#ffebe9;'
-        'padding:1px 6px;border-radius:4px">▼ red</span> = ferrox slower '
-        "(&gt;1.00×); gray = tie.\n",
+        "**Gap colors (GitHub-safe):** 🟢 ferrox better (&lt;1.00×); "
+        "🔴 ferrox slower (&gt;1.00×); ⚪ tie.\n",
         "\n",
         "Keep off (regressions): legacy GQA NSG=4, sequential GREEDY argmax, "
         "float4 elem, early Multi-CB. `FERROX_METAL_FA_VEC=0` → ~25.5 pred.\n",

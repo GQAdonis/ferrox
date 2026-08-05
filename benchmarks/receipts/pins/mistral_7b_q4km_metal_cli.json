@@ -1,0 +1,90 @@
+{
+  "schema": 1,
+  "id": "mistral_7b_q4km",
+  "name": "Mistral-7B-Instruct-v0.2 Q4_K_M",
+  "backend": "metal",
+  "expect": "ok",
+  "date": "2026-08-05",
+  "host": "Host B (Apple M2 Pro, 10 logical cores)",
+  "model": "~/Desktop/Dev/ferrox/models/Mistral-7B-Instruct-v0.2-Q4_K_M.gguf",
+  "max_tokens": 512,
+  "reps": 3,
+  "mode": "cli",
+  "workload": "greedy chat, warm then 3x 512-tok capitals list (median)",
+  "notes": "SWA dense; token-parity receipt pending real GGUF",
+  "ferrox": {
+    "wall_s": 23.478,
+    "engine": "ferrox",
+    "load_s": 0.08,
+    "prompt_per_second": 9.47,
+    "completion_tokens": 512,
+    "predicted_per_second": 26.78,
+    "prefix": "1\n\n1. Amsterdam, Netherlands: The city was originally built ",
+    "predicted_stddev": 0.15,
+    "prompt_stddev": 0.621,
+    "load_stddev": 0.038,
+    "reps": 3,
+    "runs": [
+      {
+        "predicted_per_second": 26.78,
+        "prompt_per_second": 9.47,
+        "wall_s": 23.478,
+        "load_s": 0.07,
+        "completion_tokens": 512
+      },
+      {
+        "predicted_per_second": 26.53,
+        "prompt_per_second": 8.8,
+        "wall_s": 24.073,
+        "load_s": 0.08,
+        "completion_tokens": 512
+      },
+      {
+        "predicted_per_second": 26.8,
+        "prompt_per_second": 10.04,
+        "wall_s": 23.433,
+        "load_s": 0.14,
+        "completion_tokens": 512
+      }
+    ],
+    "mode": "cli"
+  },
+  "llama": {
+    "wall_s": 20.309,
+    "engine": "llama",
+    "load_s": 1.115,
+    "prompt_per_second": 166.25,
+    "predicted_per_second": 29.9,
+    "completion_tokens": 511,
+    "prefix": "-2e1d-442e-8c2c-2b1d33e6d6e7 1. Amsterdam, Netherlands: The ",
+    "predicted_stddev": 1.341,
+    "prompt_stddev": 5.523,
+    "load_stddev": 1.242,
+    "reps": 3,
+    "runs": [
+      {
+        "predicted_per_second": 30.28,
+        "prompt_per_second": 156.76,
+        "wall_s": 21.359,
+        "load_s": 3.191,
+        "completion_tokens": 511
+      },
+      {
+        "predicted_per_second": 29.9,
+        "prompt_per_second": 166.4,
+        "wall_s": 19.275,
+        "load_s": 1.115,
+        "completion_tokens": 511
+      },
+      {
+        "predicted_per_second": 27.79,
+        "prompt_per_second": 166.25,
+        "wall_s": 20.309,
+        "load_s": 0.972,
+        "completion_tokens": 511
+      }
+    ],
+    "mode": "cli"
+  },
+  "status": "ok"
+}

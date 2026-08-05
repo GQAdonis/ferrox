@@ -58,7 +58,11 @@ CPU path sets `FERROX_METAL=0`, `FERROX_CPU_INT_DOT=1`,
 
 ## CLI completion (+ load / startup)
 
-One-shot `llama-completion` vs `ferrox run` (fresh process per rep):
+One-shot `llama-completion` vs `ferrox run` (fresh process per rep).
+Uses the **same capitals user prompt + chat template** as fair-chat
+server (ferrox wraps via GGUF template; llama `-cnv --jinja`). Do **not**
+pass `--no-cnv` in the suite — that was the old raw-prompt path and is
+not comparable to `/v1/chat/completions`.
 
 ```bash
 cargo build -p ferrox-cli --release --features metal

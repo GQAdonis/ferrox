@@ -816,6 +816,74 @@ impl Decoder {
         })
     }
 
+    /// Prefill MoE FFN on Metal: host route over T, then one packed-id CB
+    /// (`launch_moe_prefill_q4_0`). Returns FFN outs `[T, H]` or `None`.
+    #[cfg(feature = "metal")]
+    fn try_metal_moe_prefill_batch(
+        layer: &LayerWeights,
+        normed2_batch: &[f32],
+        router_logits_batch: &[f32],
+        batch_size: usize,
+        hidden_dim: usize,
+        config: &ModelConfig,
+    ) -> Option<Vec<f32>> {
+        if batch_size == 0
+            || !ferrox_core::metal_dense_enabled()
+            || !ferrox_metal::attn::metal_moe_resident_enabled()
+            || !matches!(
+                config.ffn_activation,
+                crate::config::FfnActivation::Swiglu | crate::config::FfnActivation::SwigluFused
+            )
+            || !matches!(config.moe.gating, ferrox_moe::GatingFunction::Softmax)
+            || !layer.moe.shared_experts.is_empty()
+            || config.moe.expert_group_count.is_some()
+        {
+            return None;
+        }
+        let ExpertBacking::Resident(experts) = &layer.moe.experts else {
+            return None;
+        };
+        let packed = Self::packed_q4_moe_experts(experts)?;
+        let top_k = config.moe.n_experts_active;
+        if top_k == 0 || top_k > 8 || packed.hidden_rows != hidden_dim {
+            return None;
+        }
+        let n_experts = layer.moe.n_experts().max(1);
+        let mut ids = Vec::with_capacity(batch_size * top_k);
+        let mut route = Vec::with_capacity(batch_size * top_k);
+        for b in 0..batch_size {
+            let logits = &router_logits_batch[b * n_experts..(b + 1) * n_experts];
+            let decision = route_top_k(
+                logits,
+                top_k,
+                config.moe.gating,
+                config.moe.norm_topk_prob,
+            );
+            layer.moe.record_activations(&decision.expert_ids);
+            if decision.expert_ids.len() != top_k {
+                return None;
+            }
+            for (&eid, &w) in decision.expert_ids.iter().zip(decision.weights.iter()) {
+                ids.push(eid as i32);
+                route.push(w);
+            }
+        }
+        match ferrox_metal::gpu::launch_moe_prefill_q4_0(
+            normed2_batch,
+            batch_size,
+            &packed,
+            &ids,
+            &route,
+            top_k,
+        ) {
+            Ok(out) => Some(out),
+            Err(e) => {
+                eprintln!("ferrox: Metal MoE prefill failed, CPU fallback: {e}");
+                None
+            }
+        }
+    }
+
     /// Phase-2 of resident MoE decode: experts on GPU `x2`, add into GPU `h`.
     #[cfg(feature = "metal")]
     fn try_metal_moe_experts_resident(
@@ -1165,8 +1233,39 @@ impl Decoder {
                             });
                         }
                         if ok {
-                            if hidden.is_empty() {
-                                // GPU embd path left empty host hidden — seed from embd row.
+                            // Greedy / FERROX_METAL_LOGITS: fold lm_head(+argmax)
+                            // like dense stack — download 1×u32 or vocab, skip host.
+                            let greedy_gpu =
+                                ferrox_metal::attn::metal_greedy_argmax_active();
+                            let lm_head_gpu_launch =
+                                Self::metal_matvec_launch(&self.output_head);
+                            let out_launch = if greedy_gpu
+                                || ferrox_metal::attn::metal_logits_enabled()
+                            {
+                                lm_head_gpu_launch
+                            } else {
+                                None
+                            };
+                            let embd_launch = Self::metal_matvec_launch(&self.embedding);
+                            // Gemma scales embd on host; GPU gather has no scale.
+                            let embd_gather = if self.config.embedding_scale.is_some() {
+                                None
+                            } else {
+                                match (metal_embd_kind, embd_launch.as_ref()) {
+                                    (Some(kind), Some(launch)) => {
+                                        Some(ferrox_metal::attn::EmbdGatherMetal {
+                                            kind,
+                                            weights: launch.weights,
+                                            rows: launch.rows,
+                                            row_bytes: launch.row_bytes,
+                                            n_cols: hidden_dim,
+                                            token_id,
+                                        })
+                                    }
+                                    _ => None,
+                                }
+                            };
+                            if embd_gather.is_none() && hidden.is_empty() {
                                 hidden = self.embedding.dequant_row(token_id);
                                 if let Some(scale) = self.config.embedding_scale {
                                     for v in hidden.iter_mut() {
@@ -1174,24 +1273,33 @@ impl Decoder {
                                     }
                                 }
                             }
-                            match ferrox_metal::attn::moe_decode_seed(&hidden)
-                                .and_then(|_| {
-                                    ferrox_metal::attn::launch_moe_decode_stack(
-                                        &hidden,
-                                        &moe_layers,
-                                        metal_kvs,
-                                        self.config.moe.n_experts_active,
-                                        self.config.moe.norm_topk_prob,
-                                        n_heads,
-                                        self.metal_rope_layout(),
-                                        self.config.rope_theta,
-                                        self.config.rope_freqs.as_deref(),
-                                        pos,
-                                        self.config.rms_norm_eps,
-                                        Some(&self.final_norm),
-                                        true,
-                                    )
-                                }) {
+                            let seed = if embd_gather.is_some() {
+                                ferrox_metal::attn::moe_decode_ensure(hidden_dim)
+                            } else {
+                                ferrox_metal::attn::moe_decode_seed(&hidden)
+                            };
+                            let hidden_ref: &[f32] =
+                                if embd_gather.is_some() { &[] } else { &hidden };
+                            match seed.and_then(|_| {
+                                ferrox_metal::attn::launch_moe_decode_stack(
+                                    hidden_ref,
+                                    &moe_layers,
+                                    metal_kvs,
+                                    self.config.moe.n_experts_active,
+                                    self.config.moe.norm_topk_prob,
+                                    n_heads,
+                                    self.metal_rope_layout(),
+                                    self.config.rope_theta,
+                                    self.config.rope_freqs.as_deref(),
+                                    pos,
+                                    self.config.rms_norm_eps,
+                                    Some(&self.final_norm),
+                                    out_launch.as_ref(),
+                                    greedy_gpu && out_launch.is_some(),
+                                    true,
+                                    embd_gather.as_ref(),
+                                )
+                            }) {
                                 Ok((out, per_layer_ids)) => {
                                     for (layer, ids) in
                                         self.layers.iter().zip(per_layer_ids.iter())
@@ -1199,6 +1307,11 @@ impl Decoder {
                                         if !ids.is_empty() {
                                             layer.moe.record_activations(ids);
                                         }
+                                    }
+                                    if out_launch.is_some() {
+                                        #[cfg(feature = "metal")]
+                                        ferrox_metal::gpu::clear_resident_activation();
+                                        return out;
                                     }
                                     hidden = out;
                                     final_norm_done_in_stack = true;
@@ -1208,6 +1321,14 @@ impl Decoder {
                                     eprintln!(
                                         "ferrox: Metal MoE stack failed, per-layer fallback: {e}"
                                     );
+                                    if hidden.is_empty() {
+                                        hidden = self.embedding.dequant_row(token_id);
+                                        if let Some(scale) = self.config.embedding_scale {
+                                            for v in hidden.iter_mut() {
+                                                *v *= scale;
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -2481,7 +2602,7 @@ impl Decoder {
                     }
                 }
                 if did_metal_prefill {
-                    // --- MoE FFN block (same as CPU path below) ---
+                    // --- MoE FFN block (batched Metal when packed Q4) ---
                     let normed2_batch: Vec<f32> = hidden_batch
                         .chunks(hidden_dim)
                         .flat_map(|h| rms_norm(h, &layer.moe.norm_weight, self.config.rms_norm_eps))
@@ -2492,36 +2613,62 @@ impl Decoder {
                     } else {
                         layer.moe.router.apply_batch(&normed2_batch, batch_size)
                     };
-                    let n_experts = layer.moe.n_experts().max(1);
-
-                    for b in 0..batch_size {
-                        let normed2 = &normed2_batch[b * hidden_dim..(b + 1) * hidden_dim];
-                        let mut ffn_out = if dense {
-                            Self::run_ffn_block(
-                                layer,
-                                normed2,
-                                &self.config,
-                                hidden_dim,
-                                residency.as_ref().map(|p| p.layer_plan(l)),
-                            )
-                        } else {
-                            let router_logits =
-                                &router_logits_batch[b * n_experts..(b + 1) * n_experts];
-                            Self::combine_ffn_outputs_for_position(
-                                layer,
-                                normed2,
-                                router_logits,
-                                &self.config,
-                                hidden_dim,
-                                residency.as_ref().map(|p| p.layer_plan(l)),
-                            )
-                        };
+                    let metal_ffn = if !dense {
+                        Self::try_metal_moe_prefill_batch(
+                            layer,
+                            &normed2_batch,
+                            &router_logits_batch,
+                            batch_size,
+                            hidden_dim,
+                            &self.config,
+                        )
+                    } else {
+                        None
+                    };
+                    if let Some(mut ffn_batch) = metal_ffn {
                         if let Some(post) = &layer.attn.post_ffn_norm {
-                            ffn_out = rms_norm(&ffn_out, post, self.config.rms_norm_eps);
+                            ffn_batch = ffn_batch
+                                .chunks(hidden_dim)
+                                .flat_map(|row| {
+                                    rms_norm(row, post, self.config.rms_norm_eps)
+                                })
+                                .collect();
                         }
-                        let hidden_row = &mut hidden_batch[b * hidden_dim..(b + 1) * hidden_dim];
-                        for (h, f) in hidden_row.iter_mut().zip(ffn_out.iter()) {
+                        for (h, f) in hidden_batch.iter_mut().zip(ffn_batch.iter()) {
                             *h += f;
+                        }
+                    } else {
+                        let n_experts = layer.moe.n_experts().max(1);
+                        for b in 0..batch_size {
+                            let normed2 = &normed2_batch[b * hidden_dim..(b + 1) * hidden_dim];
+                            let mut ffn_out = if dense {
+                                Self::run_ffn_block(
+                                    layer,
+                                    normed2,
+                                    &self.config,
+                                    hidden_dim,
+                                    residency.as_ref().map(|p| p.layer_plan(l)),
+                                )
+                            } else {
+                                let router_logits =
+                                    &router_logits_batch[b * n_experts..(b + 1) * n_experts];
+                                Self::combine_ffn_outputs_for_position(
+                                    layer,
+                                    normed2,
+                                    router_logits,
+                                    &self.config,
+                                    hidden_dim,
+                                    residency.as_ref().map(|p| p.layer_plan(l)),
+                                )
+                            };
+                            if let Some(post) = &layer.attn.post_ffn_norm {
+                                ffn_out = rms_norm(&ffn_out, post, self.config.rms_norm_eps);
+                            }
+                            let hidden_row =
+                                &mut hidden_batch[b * hidden_dim..(b + 1) * hidden_dim];
+                            for (h, f) in hidden_row.iter_mut().zip(ffn_out.iter()) {
+                                *h += f;
+                            }
                         }
                     }
                     continue;
@@ -2617,35 +2764,62 @@ impl Decoder {
             } else {
                 layer.moe.router.apply_batch(&normed2_batch, batch_size)
             };
-            let n_experts = layer.moe.n_experts().max(1);
-
-            for b in 0..batch_size {
-                let normed2 = &normed2_batch[b * hidden_dim..(b + 1) * hidden_dim];
-                let mut ffn_out = if dense {
-                    Self::run_ffn_block(
-                        layer,
-                        normed2,
-                        &self.config,
-                        hidden_dim,
-                        residency.as_ref().map(|p| p.layer_plan(l)),
-                    )
-                } else {
-                    let router_logits = &router_logits_batch[b * n_experts..(b + 1) * n_experts];
-                    Self::combine_ffn_outputs_for_position(
-                        layer,
-                        normed2,
-                        router_logits,
-                        &self.config,
-                        hidden_dim,
-                        residency.as_ref().map(|p| p.layer_plan(l)),
-                    )
-                };
+            #[cfg(feature = "metal")]
+            let metal_ffn = if !dense {
+                Self::try_metal_moe_prefill_batch(
+                    layer,
+                    &normed2_batch,
+                    &router_logits_batch,
+                    batch_size,
+                    hidden_dim,
+                    &self.config,
+                )
+            } else {
+                None
+            };
+            #[cfg(not(feature = "metal"))]
+            let metal_ffn: Option<Vec<f32>> = None;
+            if let Some(mut ffn_batch) = metal_ffn {
                 if let Some(post) = &layer.attn.post_ffn_norm {
-                    ffn_out = rms_norm(&ffn_out, post, self.config.rms_norm_eps);
+                    ffn_batch = ffn_batch
+                        .chunks(hidden_dim)
+                        .flat_map(|row| rms_norm(row, post, self.config.rms_norm_eps))
+                        .collect();
                 }
-                let hidden_row = &mut hidden_batch[b * hidden_dim..(b + 1) * hidden_dim];
-                for (h, f) in hidden_row.iter_mut().zip(ffn_out.iter()) {
+                for (h, f) in hidden_batch.iter_mut().zip(ffn_batch.iter()) {
                     *h += f;
+                }
+            } else {
+                let n_experts = layer.moe.n_experts().max(1);
+                for b in 0..batch_size {
+                    let normed2 = &normed2_batch[b * hidden_dim..(b + 1) * hidden_dim];
+                    let mut ffn_out = if dense {
+                        Self::run_ffn_block(
+                            layer,
+                            normed2,
+                            &self.config,
+                            hidden_dim,
+                            residency.as_ref().map(|p| p.layer_plan(l)),
+                        )
+                    } else {
+                        let router_logits =
+                            &router_logits_batch[b * n_experts..(b + 1) * n_experts];
+                        Self::combine_ffn_outputs_for_position(
+                            layer,
+                            normed2,
+                            router_logits,
+                            &self.config,
+                            hidden_dim,
+                            residency.as_ref().map(|p| p.layer_plan(l)),
+                        )
+                    };
+                    if let Some(post) = &layer.attn.post_ffn_norm {
+                        ffn_out = rms_norm(&ffn_out, post, self.config.rms_norm_eps);
+                    }
+                    let hidden_row = &mut hidden_batch[b * hidden_dim..(b + 1) * hidden_dim];
+                    for (h, f) in hidden_row.iter_mut().zip(ffn_out.iter()) {
+                        *h += f;
+                    }
                 }
             }
         }

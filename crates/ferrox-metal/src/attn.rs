@@ -20,14 +20,15 @@
 //!
 //! Enable with `FERROX_METAL_ATTN=1` (also requires dense Metal / `FERROX_METAL`).
 //! Optional `FERROX_METAL_LOGITS=1` folds final_norm + lm_head into the dense
-//! stack CB (downloads vocab logits). Default off: host lm_head after
+//! or MoE stack CB (downloads vocab logits). Default off: host lm_head after
 //! downloading hidden — measured ~2× faster on Llama-3.1-8B Q4_K_M.
 //!
-//! Greedy decode (`temperature<=0`, hooked from `ferrox-server::generate`)
-//! can fold final_norm + lm_head + **argmax** into the same CB and download
-//! only the top-1 token id — **default on** for greedy (`temperature<=0`);
+//! Greedy decode (`temperature<=0`, hooked from `ferrox-server::generate` /
+//! `ferrox-cli`) can fold final_norm + lm_head + **argmax** into the same CB
+//! (dense [`launch_decode_dense_stack`] or MoE [`launch_moe_decode_stack`])
+//! and download only the top-1 token id — **default on** for greedy;
 //! opt out with `FERROX_METAL_GREEDY_GPU=0`. Embedding gather can also run
-//! on-GPU (`get_rows`) so the stack needs no host `dequant_row` upload.
+//! on-GPU (`get_rows`) so the dense stack needs no host `dequant_row` upload.
 //!
 //! `FERROX_METAL_FA_VEC=0` disables llama-style FA-vec decode (default **on**
 //! for `head_dim==128`). Other head dims keep legacy online-softmax GQA.
@@ -128,7 +129,7 @@ pub fn set_metal_greedy_argmax(on: bool) {
 }
 
 /// True when this thread should fold final_norm+lm_head+argmax into the
-/// dense stack and return a 1-element `[token_id as f32]` instead of
+/// dense/MoE stack and return a 1-element `[token_id as f32]` instead of
 /// hidden or full vocab logits.
 pub fn metal_greedy_argmax_active() -> bool {
     metal_greedy_gpu_enabled() && GREEDY_ARGMAX.with(|c| c.get())
@@ -2326,12 +2327,15 @@ struct MoeDecodeScratch {
     act: Retained<ProtocolObject<dyn MTLBuffer>>,
     expert_out: Retained<ProtocolObject<dyn MTLBuffer>>,
     moe_out: Retained<ProtocolObject<dyn MTLBuffer>>,
+    logits: Option<Retained<ProtocolObject<dyn MTLBuffer>>>,
+    argmax_idx: Retained<ProtocolObject<dyn MTLBuffer>>,
     hidden_dim: usize,
     q_rows: usize,
     k_rows: usize,
     ffn_rows: usize,
     top_k_cap: usize,
     n_router: usize,
+    logits_cap: usize,
 }
 
 thread_local! {
@@ -2345,11 +2349,10 @@ pub fn moe_decode_clear() {
     });
 }
 
-/// Seed residual `h` from host hidden (call once before the MoE layer loop).
-pub fn moe_decode_seed(hidden: &[f32]) -> Result<(), MetalError> {
+/// Ensure MoE decode scratch exists for `hidden_dim` (no host upload).
+pub fn moe_decode_ensure(hidden_dim: usize) -> Result<(), MetalError> {
     let shared = shared_metal()?;
     let device = &shared.device;
-    let hidden_dim = hidden.len();
     MOE_SCRATCH.with(|cell| {
         let mut slot = cell.borrow_mut();
         let need_new = match slot.as_ref() {
@@ -2379,15 +2382,28 @@ pub fn moe_decode_seed(hidden: &[f32]) -> Result<(), MetalError> {
                 act: alloc_f32_buffer(device, top_k_cap * ffn_rows)?,
                 expert_out: alloc_f32_buffer(device, top_k_cap * hidden_dim)?,
                 moe_out: alloc_f32_buffer(device, hidden_dim)?,
+                logits: None,
+                argmax_idx: alloc_u32_buffer(device, 1)?,
                 hidden_dim,
                 q_rows,
                 k_rows,
                 ffn_rows,
                 top_k_cap,
                 n_router,
+                logits_cap: 0,
             });
         }
-        let scratch = slot.as_mut().unwrap();
+        Ok(())
+    })
+}
+
+/// Seed residual `h` from host hidden (call once before the MoE layer loop).
+pub fn moe_decode_seed(hidden: &[f32]) -> Result<(), MetalError> {
+    moe_decode_ensure(hidden.len())?;
+    MOE_SCRATCH.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        let scratch = slot.as_mut().ok_or(MetalError::CommandFailed)?;
+        let hidden_dim = scratch.hidden_dim;
         let dst = scratch.h.contents();
         unsafe {
             std::ptr::copy_nonoverlapping(
@@ -2445,6 +2461,18 @@ fn moe_scratch_ensure_caps(
         scratch.route = alloc_f32_buffer(device, tk)?;
         scratch.ffn_rows = fk;
         scratch.top_k_cap = tk;
+    }
+    Ok(())
+}
+
+fn moe_scratch_ensure_logits(
+    device: &Retained<ProtocolObject<dyn MTLDevice>>,
+    scratch: &mut MoeDecodeScratch,
+    vocab: usize,
+) -> Result<(), MetalError> {
+    if vocab > scratch.logits_cap {
+        scratch.logits = Some(alloc_f32_buffer(device, vocab)?);
+        scratch.logits_cap = vocab;
     }
     Ok(())
 }
@@ -2891,6 +2919,7 @@ fn encode_moe_layer_fused(
         &scratch.expert_out,
         &scratch.moe_out,
         top_k as u32,
+        1,
     )?;
     encode_vec_add(encoder, device, &scratch.h, &scratch.moe_out, hidden_dim as u32)?;
     Ok(())
@@ -3008,15 +3037,22 @@ pub fn launch_moe_decode_layer_fused(
         pos,
         rms_eps,
         None,
+        None,
+        false,
         true, // reuse existing scratch.h
+        None,
     )?;
     Ok(out.1.into_iter().next().unwrap_or_default())
 }
 
 /// All MoE layers in **one** command buffer (one wait) — dense-stack
-/// equivalent for OLMoE. Returns `(hidden, per_layer_expert_ids)`.
+/// equivalent for OLMoE. Returns `(hidden_or_logits_or_argmax, per_layer_expert_ids)`.
 /// When `reuse_scratch_h` is true, `hidden` is ignored and scratch `h`
-/// from a prior [`moe_decode_seed`] is used.
+/// from a prior [`moe_decode_seed`] is used. When `embd` is `Some`,
+/// gathers the token row into `h` on-GPU (no host seed upload).
+///
+/// With `final_norm_w` + `output`, folds lm_head on-GPU. `argmax_only`
+/// downloads a 1-element `vec![token_id as f32]` (same contract as dense).
 #[allow(clippy::too_many_arguments)]
 pub fn launch_moe_decode_stack(
     hidden: &[f32],
@@ -3031,7 +3067,10 @@ pub fn launch_moe_decode_stack(
     pos: usize,
     rms_eps: f32,
     final_norm_w: Option<&[f32]>,
+    output: Option<&MatvecLaunch<'_>>,
+    argmax_only: bool,
     reuse_scratch_h: bool,
+    embd: Option<&EmbdGatherMetal<'_>>,
 ) -> Result<(Vec<f32>, Vec<Vec<usize>>), MetalError> {
     assert!(!layers.is_empty());
     assert_eq!(layers.len(), kvs.len());
@@ -3048,8 +3087,14 @@ pub fn launch_moe_decode_stack(
         }
     }
 
-    if !reuse_scratch_h {
+    if let Some(e) = embd {
+        assert_eq!(e.n_cols, hidden_dim);
+        assert!(e.token_id < e.rows);
+        moe_decode_ensure(hidden_dim)?;
+    } else if !reuse_scratch_h {
         moe_decode_seed(hidden)?;
+    } else {
+        moe_decode_ensure(hidden_dim)?;
     }
 
     let shared = shared_metal()?;
@@ -3071,11 +3116,31 @@ pub fn launch_moe_decode_stack(
         let max_ffn = layers.iter().map(|l| l.packed.ffn_rows).max().unwrap();
         let max_router = layers.iter().map(|l| l.router.rows).max().unwrap();
         moe_scratch_ensure_caps(device, scratch, max_q, max_k, max_ffn, top_k, max_router)?;
+        if let Some(out_l) = output {
+            moe_scratch_ensure_logits(device, scratch, out_l.rows)?;
+        }
 
         let cmd_buf = queue.commandBuffer().ok_or(MetalError::CommandFailed)?;
         let encoder = cmd_buf
             .computeCommandEncoder()
             .ok_or(MetalError::CommandFailed)?;
+
+        let _embd_w = if let Some(e) = embd {
+            let w = resident_weight_buffer(device, e.weights)?;
+            encode_get_rows(
+                &encoder,
+                device,
+                e.kind,
+                &w,
+                &scratch.h,
+                e.row_bytes as u32,
+                e.n_cols as u32,
+                e.token_id as u32,
+            )?;
+            Some(w)
+        } else {
+            None
+        };
 
         for (layer, kv) in layers.iter().zip(kvs.iter()) {
             encode_moe_layer_fused(
@@ -3098,19 +3163,51 @@ pub fn launch_moe_decode_stack(
             )?;
         }
 
-        if let Some(fnw) = final_norm_w {
-            assert_eq!(fnw.len(), hidden_dim);
-            let fn_buf = resident_f32_buffer(device, fnw)?;
-            encode_rms_norm(
-                &encoder,
-                device,
-                &scratch.h,
-                &fn_buf.buffer,
-                &scratch.x_attn,
-                hidden_dim as u32,
-                rms_eps,
-            )?;
-        }
+        // final_norm → optional lm_head → optional argmax (dense-stack parity).
+        let (download_n, download_logits, download_argmax) =
+            if let Some(fnw) = final_norm_w {
+                assert_eq!(fnw.len(), hidden_dim);
+                let fn_buf = resident_f32_buffer(device, fnw)?;
+                encode_rms_norm(
+                    &encoder,
+                    device,
+                    &scratch.h,
+                    &fn_buf.buffer,
+                    &scratch.x_attn,
+                    hidden_dim as u32,
+                    rms_eps,
+                )?;
+                if let Some(out_l) = output {
+                    let logits = scratch.logits.as_ref().ok_or(MetalError::CommandFailed)?;
+                    assert_eq!(out_l.rows, scratch.logits_cap);
+                    let out_w = resident_weight_buffer(device, out_l.weights)?;
+                    encode_matvec(
+                        &encoder,
+                        device,
+                        out_l,
+                        &out_w,
+                        &scratch.x_attn,
+                        logits,
+                    )?;
+                    if argmax_only {
+                        encode_argmax(
+                            &encoder,
+                            device,
+                            logits,
+                            &scratch.argmax_idx,
+                            out_l.rows as u32,
+                        )?;
+                        (1, false, true)
+                    } else {
+                        (out_l.rows, true, false)
+                    }
+                } else {
+                    (hidden_dim, false, false)
+                }
+            } else {
+                assert!(output.is_none(), "MoE stack lm_head requires final_norm");
+                (hidden_dim, false, false)
+            };
 
         encoder.endEncoding();
         cmd_buf.commit();
@@ -3120,26 +3217,34 @@ pub fn launch_moe_decode_stack(
             kv.seq_len = pos + 1;
         }
 
-        // Hotness: last layer's ids only (stack overwrites the same buffer).
-        let id_ptr = scratch.ids.contents();
-        let last_ids: Vec<usize> = unsafe {
-            std::slice::from_raw_parts(id_ptr.as_ptr() as *const i32, top_k)
-                .iter()
-                .map(|&i| i as usize)
-                .collect()
-        };
-        let mut all_ids = vec![Vec::new(); layers.len()];
-        if let Some(last) = all_ids.last_mut() {
-            *last = last_ids;
+        // Skip expert-id host download on the hot path (sync tax). Hotness
+        // tracking can be re-enabled later via a side channel if needed.
+        let all_ids = vec![Vec::new(); layers.len()];
+
+        if download_argmax {
+            let ptr = scratch.argmax_idx.contents();
+            let idx = unsafe { *(ptr.as_ptr() as *const u32) as usize };
+            return Ok((vec![idx as f32], all_ids));
         }
 
-        let src = if final_norm_w.is_some() {
-            &scratch.x_attn
+        let src: &ProtocolObject<dyn MTLBuffer> = if download_logits {
+            scratch
+                .logits
+                .as_ref()
+                .ok_or(MetalError::CommandFailed)?
+                .as_ref()
+        } else if final_norm_w.is_some() {
+            scratch.x_attn.as_ref()
         } else {
-            &scratch.h
+            scratch.h.as_ref()
+        };
+        let n = if download_logits {
+            download_n
+        } else {
+            hidden_dim
         };
         let out = unsafe {
-            std::slice::from_raw_parts(src.contents().as_ptr() as *const f32, hidden_dim).to_vec()
+            std::slice::from_raw_parts(src.contents().as_ptr() as *const f32, n).to_vec()
         };
         Ok((out, all_ids))
     })

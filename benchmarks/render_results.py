@@ -280,9 +280,11 @@ def main() -> None:
     if cli_pins:
         lines.append(
             "\n## CLI completion (`llama-completion` vs `ferrox run`)\n\n"
-            "One-shot `-p … -n N --ignore-eos -c 4096`, fresh process per rep, "
-            "interleaved (llama then ferrox each rep). Requires `llama-completion` "
-            "(not `llama-cli`). Engines' own stderr timings; **pred** tok/s excludes "
+            "One-shot `-p … -n N --ignore-eos -c 4096` with the **same capitals "
+            "prompt + chat template** as fair-chat server (ferrox wraps via GGUF "
+            "template; llama `-cnv --jinja`). Fresh process per rep, interleaved "
+            "(llama then ferrox each rep). Requires `llama-completion` (not "
+            "`llama-cli`). Engines' own stderr timings; **pred** tok/s excludes "
             "model load. **startup** = wall − decode (comparable process overhead); "
             "falls back to engine-reported load if startup missing. "
             "**Startup gap** = `ferrox / llama` (&lt;1 ferrox better).\n"

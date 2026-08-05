@@ -275,11 +275,14 @@ impl ChatKind {
                 }
                 out
             }
+            // Match `ferrox-server::chat_template::ChatTemplate::Plain`
+            // (`role: content` lines) so CLI and `/v1/chat/completions`
+            // share the same prompt framing when GGUF has no template.
             ChatKind::Plain => {
                 if let Some(sys) = system {
-                    format!("system: {sys}\nuser: {user}\nassistant:")
+                    format!("system: {sys}\nuser: {user}")
                 } else {
-                    user.to_string()
+                    format!("user: {user}")
                 }
             }
         }

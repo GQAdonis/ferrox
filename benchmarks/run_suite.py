@@ -507,18 +507,21 @@ def run_cli_engine(
     for _ in range(max(reps, 1)):
         prompt = PROMPT.format(uid=uuid.uuid4().hex[:8])
         if engine == "ferrox":
+            # Chat-template wrap (same as ferrox-server /v1/chat/completions).
             cmd = [
                 bin_path, "-m", model, "-p", prompt,
                 "-n", str(n), "-t", str(threads), "-c", str(ctx),
                 "--ngl", ngl,
-                "--temp", "0", "--no-cnv", "--ignore-eos",
+                "--temp", "0", "--ignore-eos",
             ]
         else:
+            # Match llama-server: conversation + jinja template from GGUF.
+            # `-cnv` with `-p` is non-interactive (first turn predefined).
             cmd = [
                 bin_path, "-m", model, "-p", prompt,
                 "-n", str(n), "-t", str(threads), "-c", str(ctx),
                 "-ngl", ngl,
-                "--temp", "0", "-no-cnv", "-st", "--ignore-eos",
+                "--temp", "0", "-cnv", "--jinja", "-st", "--ignore-eos",
                 "--no-display-prompt",
             ]
         runs.append(run_cli_once(cmd, engine, env=env))
@@ -625,8 +628,9 @@ def run_one(
         # Interleaved reps: llama r_i → ferrox r_i so page-cache effects
         # are shared. Engines never overlap (serial within each pair).
         pin["workload"] = (
-            "CLI one-shot -p … -n N --no-cnv --ignore-eos -c 4096, "
-            f"interleaved {reps}× cold process (median ± stddev)"
+            "CLI one-shot same capitals prompt + chat template as fair-chat "
+            "(ferrox default wrap / llama -cnv --jinja), -n N --ignore-eos "
+            f"-c 4096, interleaved {reps}× cold process (median ± stddev)"
         )
         pin["git_rev"] = git_rev()
         pin["ferrox_bin"] = ferrox_bin
@@ -646,7 +650,7 @@ def run_one(
                 cmd = [
                     llama_bin, "-m", str(model_path), "-p", prompt,
                     "-n", str(max_tokens), "-t", str(threads), "-c", "4096",
-                    "-ngl", ngl, "--temp", "0", "-no-cnv", "-st",
+                    "-ngl", ngl, "--temp", "0", "-cnv", "--jinja", "-st",
                     "--ignore-eos", "--no-display-prompt",
                 ]
                 print(f"--- llama (cli) rep {i+1}/{reps} ---", flush=True)
@@ -674,7 +678,7 @@ def run_one(
                     cmd = [
                         ferrox_bin, "-m", str(model_path), "-p", prompt,
                         "-n", str(max_tokens), "-t", str(threads), "-c", "4096",
-                        "--ngl", ngl, "--temp", "0", "--no-cnv", "--ignore-eos",
+                        "--ngl", ngl, "--temp", "0", "--ignore-eos",
                     ]
                     print(f"--- ferrox (cli) rep {i+1}/{reps} ---", flush=True)
                     ferrox_runs.append(run_cli_once(cmd, "ferrox", env=env))
@@ -852,16 +856,16 @@ def main() -> None:
             )
     if args.llama_bin is None:
         if args.mode == "cli":
-            # Homebrew llama.cpp ≥b76xx split one-shot completion out of
-            # llama-cli into llama-completion (`-no-cnv` no longer works on
-            # llama-cli). Prefer llama-completion when on PATH.
+            # Homebrew llama.cpp ≥b76xx: one-shot completion lives in
+            # llama-completion (llama-cli is interactive-oriented). Prefer
+            # llama-completion when on PATH.
             from shutil import which
 
             comp = which("llama-completion")
             if not comp:
                 raise SystemExit(
                     "CLI mode requires llama-completion on PATH "
-                    "(Homebrew llama.cpp ≥b76xx; llama-cli rejects -no-cnv)"
+                    "(Homebrew llama.cpp ≥b76xx)"
                 )
             args.llama_bin = comp
         else:

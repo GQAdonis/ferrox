@@ -221,8 +221,12 @@ fn load_real_gguf_checkpoint(path: &str) -> anyhow::Result<GgufLoaded> {
         .metadata_u64("tokenizer.ggml.bos_token_id")
         .map(|v| v as usize);
 
-    let chat_template =
-        crate::chat_template::ChatTemplate::detect(file.metadata_str("tokenizer.chat_template"));
+    let byte_tokenizer = matches!(tokenizer, ServerTokenizer::Byte);
+    let chat_template = crate::chat_template::ChatTemplate::detect_for_gguf(
+        file.metadata_str("tokenizer.chat_template"),
+        file.metadata_str("general.architecture"),
+        byte_tokenizer,
+    );
     tracing::info!("detected chat template: {chat_template:?}");
 
     // Opt-in expert streaming: with FERROX_EXPERT_CACHE_BYTES set (or

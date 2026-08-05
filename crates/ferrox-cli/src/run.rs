@@ -221,6 +221,15 @@ impl ChatKind {
         }
     }
 
+    /// Match `ferrox-server::chat_template::ChatTemplate::detect_for_gguf`.
+    fn detect_for_gguf(template: Option<&str>, arch: Option<&str>, byte_tokenizer: bool) -> Self {
+        match template.filter(|t| !t.is_empty()) {
+            Some(t) => Self::detect(Some(t)),
+            None if byte_tokenizer || arch.is_none() => Self::Plain,
+            None => Self::ChatMl,
+        }
+    }
+
     fn wrap_user(&self, system: Option<&str>, user: &str) -> String {
         match self {
             ChatKind::ChatMl => {
@@ -495,7 +504,11 @@ pub fn run_infer(args: InferArgs) -> anyhow::Result<()> {
         gguf_ctx
     };
 
-    let chat = ChatKind::detect(file.metadata_str("tokenizer.chat_template"));
+    let chat = ChatKind::detect_for_gguf(
+        file.metadata_str("tokenizer.chat_template"),
+        file.metadata_str("general.architecture"),
+        matches!(tokenizer, CliTokenizer::Byte),
+    );
     let user_prompt = resolve_prompt(&args)?;
     let prompt = if args.no_cnv {
         user_prompt

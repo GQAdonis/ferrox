@@ -10,8 +10,10 @@
 //! oversight): instead, this recognizes the
 //! template string's real, distinctive markers and renders using a
 //! small set of hand-written templates for the conventions those
-//! markers actually correspond to, falling back to a plain role-labeled
-//! format when the template is absent or unrecognized.
+//! markers actually correspond to, falling back to ChatML for real GGUF
+//! checkpoints whose `tokenizer.chat_template` metadata is missing or
+//! empty (matching llama.cpp `--jinja`), or plain role-labeled format for
+//! byte/synthetic tokenizers and unrecognized custom templates.
 //!
 //! This directly closes a real, verified root cause of degenerate
 //! chat-model output (found serving TinyLlama-1.1B-Chat end to end):
@@ -72,8 +74,7 @@ pub enum ChatTemplate {
 impl ChatTemplate {
     /// Sniffs a GGUF's real `tokenizer.chat_template` Jinja2 string for
     /// distinctive literal markers, rather than evaluating it as Jinja2.
-    /// `None` (no template metadata present at all) always yields
-    /// `Plain`.
+    /// Unrecognized non-empty templates yield `Plain`.
     pub fn detect(chat_template: Option<&str>) -> Self {
         match chat_template {
             Some(t) if t.contains("<|im_start|>") => ChatTemplate::ChatMl,
@@ -83,6 +84,22 @@ impl ChatTemplate {
             }
             Some(t) if t.contains("<start_of_turn>") => ChatTemplate::Gemma,
             _ => ChatTemplate::Plain,
+        }
+    }
+
+    /// Like [`Self::detect`], but when `tokenizer.chat_template` is missing
+    /// or empty, match llama.cpp `--jinja` / `common/chat.cpp`: real GGUF
+    /// checkpoints default to ChatML (`CHATML_TEMPLATE_SRC`). Keep
+    /// [`Plain`] for byte tokenizers and synthetic server fallbacks.
+    pub fn detect_for_gguf(
+        chat_template: Option<&str>,
+        arch: Option<&str>,
+        byte_tokenizer: bool,
+    ) -> Self {
+        match chat_template.filter(|t| !t.is_empty()) {
+            Some(t) => Self::detect(Some(t)),
+            None if byte_tokenizer || arch.is_none() => Self::Plain,
+            None => Self::ChatMl,
         }
     }
 
@@ -275,6 +292,30 @@ mod tests {
         assert_eq!(ChatTemplate::detect(None), ChatTemplate::Plain);
         assert_eq!(
             ChatTemplate::detect(Some("some unrecognized custom format")),
+            ChatTemplate::Plain
+        );
+    }
+
+    #[test]
+    fn gguf_without_template_defaults_to_chatml_for_real_architectures() {
+        assert_eq!(
+            ChatTemplate::detect_for_gguf(None, Some("olmoe"), false),
+            ChatTemplate::ChatMl
+        );
+        assert_eq!(
+            ChatTemplate::detect_for_gguf(Some(""), Some("olmoe"), false),
+            ChatTemplate::ChatMl
+        );
+        assert_eq!(
+            ChatTemplate::detect_for_gguf(None, Some("olmoe"), true),
+            ChatTemplate::Plain
+        );
+        assert_eq!(
+            ChatTemplate::detect_for_gguf(
+                Some("some unrecognized custom format"),
+                Some("olmoe"),
+                false
+            ),
             ChatTemplate::Plain
         );
     }

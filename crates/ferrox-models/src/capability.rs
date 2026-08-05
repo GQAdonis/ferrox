@@ -245,8 +245,6 @@ pub fn architecture_catalog() -> &'static [ArchProfile] {
             "plamo",
             "plamo3",
             "minicpm3",
-            "minimax-m2",
-            "minimax-m3",
             "starcoder2",
             "plm",
         ] {
@@ -304,6 +302,19 @@ pub fn architecture_catalog() -> &'static [ArchProfile] {
             ArchPath::GenericGqa { rope: Neox },
             PerHead,
         ));
+        // gemma4 text path reuses Gemma-3 GeGLU/SWA/sandwich; MoE-A4B and VL
+        // still fail if tensors absent / later phases.
+        for n in ["gemma4", "gemma4-assistant"] {
+            v.push(prof(
+                n,
+                TextGeneration,
+                GemmaFamily,
+                KvIswa,
+                Neox,
+                ArchPath::GenericGqa { rope: Neox },
+                PerHead,
+            ));
+        }
         for (n, fam) in [("phi2", PhiFamily), ("phi3", PhiFamily), ("phimoe", PhiFamily)] {
             v.push(prof(
                 n,
@@ -312,6 +323,33 @@ pub fn architecture_catalog() -> &'static [ArchProfile] {
                 KvGqa,
                 Neox,
                 ArchPath::GenericGqa { rope: Neox },
+                WholeVector,
+            ));
+        }
+        // Phi-4 GGUFs share the phi3 fused-QKV / fused gate+up graph
+        // (PhiFamily). Many community checkpoints still tag `phi3`; admit
+        // `phi4` the same way so either string can load. Receipts / head-dim
+        // FA-vec coverage remain P6 evidence work — not a speed claim.
+        v.push(prof(
+            "phi4",
+            TextGeneration,
+            PhiFamily,
+            KvGqa,
+            Neox,
+            ArchPath::GenericGqa { rope: Neox },
+            WholeVector,
+        ));
+        // MiniMax M2/M3: 256-expert sigmoid MoE + MTP — not generic GQA.
+        for n in ["minimax-m2", "minimax-m3"] {
+            v.push(prof(
+                n,
+                TextGeneration,
+                Dedicated,
+                KvGqa,
+                Norm,
+                ArchPath::DedicatedOnly {
+                    reason: "MiniMax 256-expert sigmoid MoE + MTP not yet implemented",
+                },
                 WholeVector,
             ));
         }
@@ -518,27 +556,17 @@ pub fn architecture_catalog() -> &'static [ArchProfile] {
         ] {
             v.push(deferred_scope(n, scope, reason));
         }
-        for (n, reason) in [
-            (
-                "gemma3n",
-                "gemma3n AltUp/Laurel tensors not implemented in the generic decoder",
-            ),
-            ("gemma4", "gemma4 graph not yet implemented"),
-            (
-                "gemma4-assistant",
-                "gemma4-assistant graph not yet implemented",
-            ),
-        ] {
-            v.push(prof(
-                n,
-                TextGeneration,
-                GemmaFamily,
-                KvIswa,
-                Neox,
-                ArchPath::DedicatedOnly { reason },
-                PerHead,
-            ));
-        }
+        v.push(prof(
+            "gemma3n",
+            TextGeneration,
+            GemmaFamily,
+            KvIswa,
+            Neox,
+            ArchPath::DedicatedOnly {
+                reason: "gemma3n AltUp/Laurel tensors not implemented in the generic decoder",
+            },
+            PerHead,
+        ));
         for n in ["ferroxtest", "ferroxtestmoe", "ferroxtestmixed"] {
             v.push(prof(
                 n,
@@ -656,11 +684,38 @@ mod tests {
             })
         );
         assert_eq!(
+            resolve_architecture("phi4"),
+            Some(ArchPath::GenericGqa {
+                rope: RopeLayout::Neox
+            })
+        );
+        assert_eq!(
+            resolve_profile("phi4").map(|p| p.family),
+            Some(DecoderFamily::PhiFamily)
+        );
+        assert_eq!(
             resolve_architecture("gemma3"),
             Some(ArchPath::GenericGqa {
                 rope: RopeLayout::Neox
             })
         );
+        for arch in ["gemma4", "gemma4-assistant"] {
+            assert_eq!(
+                resolve_architecture(arch),
+                Some(ArchPath::GenericGqa {
+                    rope: RopeLayout::Neox
+                }),
+                "{arch}"
+            );
+            assert_eq!(
+                resolve_profile(arch).map(|p| p.family),
+                Some(DecoderFamily::GemmaFamily)
+            );
+        }
+        assert!(matches!(
+            resolve_architecture("gemma3n"),
+            Some(ArchPath::DedicatedOnly { .. })
+        ));
         assert_eq!(
             resolve_architecture("deepseek"),
             Some(ArchPath::GenericGqa {
@@ -701,6 +756,17 @@ mod tests {
             resolve_architecture("deepseek4"),
             Some(ArchPath::DedicatedOnly { .. })
         ));
+        for arch in ["minimax-m2", "minimax-m3"] {
+            assert!(
+                matches!(
+                    resolve_architecture(arch),
+                    Some(ArchPath::DedicatedOnly {
+                        reason: "MiniMax 256-expert sigmoid MoE + MTP not yet implemented"
+                    })
+                ),
+                "{arch} must fail closed, not silent generic GQA"
+            );
+        }
     }
 
     #[test]

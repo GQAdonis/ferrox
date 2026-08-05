@@ -7,7 +7,7 @@ Suite: [`suite.json`](suite.json). Runner: [`run_suite.py`](run_suite.py). Pins:
 **Gap** = `llama_pred / ferrox_pred` (&lt;1 ferrox faster; &gt;1 ferrox slower). **Winner** = faster engine on predicted tok/s (near-parity within ~5%).
 
 **North star:** ≥ llama.cpp same host/GGUF/backend.
-**8B Metal pin:** **27.88** vs llama **28.92** pred (⚪ **~1.04×**) — [`pins/llama31_8b_q4km_metal.json`](receipts/pins/llama31_8b_q4km_metal.json).
+**8B Metal pin:** **17.28** vs llama **24.00** pred (🔴 **~1.39×**) — [`pins/llama31_8b_q4km_metal.json`](receipts/pins/llama31_8b_q4km_metal.json).
 
 One pin per `(model_id, backend)`. Re-run overwrites the pin. Gap only when both engines succeed.
 
@@ -25,7 +25,7 @@ Keep off (regressions): legacy GQA NSG=4, sequential GREEDY argmax, float4 elem,
 | OLMoE-1B-7B-0924 Q4_0 | cpu | **20.52** ±0.6 | **13.20** ±4.2 (−ngl 0) | 🟢 **~0.64×** | 🟢 **ferrox** | ok | [`olmoe_q4_cpu`](receipts/pins/olmoe_q4_cpu.json) |
 | OLMoE-1B-7B-0924 Q4_0 | metal | **37.08** ±1.0 | **161.33** ±1.4 | 🔴 **~4.35×** | 🔴 **llama** | ok | [`olmoe_q4_metal`](receipts/pins/olmoe_q4_metal.json) |
 | OLMoE-1B-7B-0924 Q4_0 | cuda | — | — | — | — | no pin | — |
-| Llama-3.1-8B-Instruct Q4_K_M | metal | **27.88** ±0.3 | **28.92** ±0.7 | ⚪ **~1.04×** | ⚪ parity | ok | [`llama31_8b_q4km_metal`](receipts/pins/llama31_8b_q4km_metal.json) |
+| Llama-3.1-8B-Instruct Q4_K_M | metal | **17.28** ±0.6 | **24.00** ±2.9 | 🔴 **~1.39×** | 🔴 **llama** | ok | [`llama31_8b_q4km_metal`](receipts/pins/llama31_8b_q4km_metal.json) |
 | Llama-3.1-8B-Instruct Q4_K_M | cuda | — | — | — | — | no pin | — |
 | Llama-3.2-3B-Instruct Q4_K_M | metal | **56.32** ±0.7 | **62.21** ±0.6 | 🔴 **~1.10×** | 🔴 **llama** | ok | [`llama32_3b_q4km_metal`](receipts/pins/llama32_3b_q4km_metal.json) |
 | Qwen1.5-MoE-A2.7B Q4_K_M | cpu | — | — | — | — | no pin | — |
@@ -55,16 +55,24 @@ Pins that used `llama-cli` or rejected options are omitted.
 
 | Model | Backend | ferrox pred | llama pred | Gap | ferrox startup (s) | llama startup (s) | Startup gap | Pin |
 |---|---|---|---|---|---|---|---|---|
-| TinyLlama-1.1B-Chat-v1.0 Q8_0 | metal | **112.78** ±3.5 | **113.36** ±4.3 | ⚪ **1.00×** | **0.050** ±0.006 | **0.142** ±0.289 | 🟢 **~0.35×** | [`tinyllama_q8_metal_cli`](receipts/pins/tinyllama_q8_metal_cli.json) |
-| OLMoE-1B-7B-0924 Q4_0 | metal | **84.97** ±0.4 | **150.82** ±5.6 | 🔴 **~1.77×** | **0.496** ±0.358 | **1.291** ±0.654 | 🟢 **~0.38×** | [`olmoe_q4_metal_cli`](receipts/pins/olmoe_q4_metal_cli.json) |
-| Llama-3.1-8B-Instruct Q4_K_M | metal | **24.99** ±0.1 | **24.69** ±0.5 | ⚪ **1.00×** | **0.120** ±0.040 | **4.718** ±5.418 | 🟢 **~0.03×** | [`llama31_8b_q4km_metal_cli`](receipts/pins/llama31_8b_q4km_metal_cli.json) |
-| Mistral-7B-Instruct-v0.2 Q4_K_M | metal | **26.78** ±0.1 | **29.90** ±1.3 | 🔴 **~1.12×** | **0.080** ±0.038 | **1.115** ±1.242 | 🟢 **~0.07×** | [`mistral_7b_q4km_metal_cli`](receipts/pins/mistral_7b_q4km_metal_cli.json) |
-| Gemma-2-2B-IT Q4_K_M | metal | **35.71** ±0.1 | **57.86** ±0.5 | 🔴 **~1.62×** | **0.100** ±0.010 | **0.661** ±0.617 | 🟢 **~0.15×** | [`gemma2_2b_q4km_metal_cli`](receipts/pins/gemma2_2b_q4km_metal_cli.json) |
+| TinyLlama-1.1B-Chat-v1.0 Q8_0 | metal | **118.35** ±1.1 | **105.08** ±4.7 | 🟢 **~0.89×** | **1.041** ±0.151 | **0.759** ±0.208 | 🔴 **~1.37×** | [`tinyllama_q8_metal_cli`](receipts/pins/tinyllama_q8_metal_cli.json) |
+| Llama-3.2-1B-Instruct Q4_K_M | metal | **142.16** ±2.0 | **122.83** ±5.8 | 🟢 **~0.86×** | **0.980** ±0.112 | **1.361** ±0.127 | 🟢 **~0.72×** | [`llama32_1b_q4km_metal_cli`](receipts/pins/llama32_1b_q4km_metal_cli.json) |
+| OLMoE-1B-7B-0924 Q4_0 | metal | **88.45** ±0.5 | **153.40** ±8.3 | 🔴 **~1.73×** | **0.623** ±0.008 | **0.965** ±0.998 | 🟢 **~0.65×** | [`olmoe_q4_metal_cli`](receipts/pins/olmoe_q4_metal_cli.json) |
+| Llama-3.1-8B-Instruct Q4_K_M | metal | **28.85** ±0.1 | **28.64** ±0.4 | ⚪ **1.00×** | **2.849** ±0.105 | **1.892** ±1.421 | 🔴 **~1.51×** | [`llama31_8b_q4km_metal_cli`](receipts/pins/llama31_8b_q4km_metal_cli.json) |
+| Llama-3.2-3B-Instruct Q4_K_M | metal | **58.82** ±0.8 | **59.08** ±2.9 | ⚪ **1.00×** | **1.544** ±0.102 | **1.354** ±0.467 | 🔴 **~1.14×** | [`llama32_3b_q4km_metal_cli`](receipts/pins/llama32_3b_q4km_metal_cli.json) |
+| Mistral-7B-Instruct-v0.2 Q4_K_M | metal | **29.92** ±0.7 | **29.01** ±0.7 | ⚪ **~0.97×** | **2.546** ±0.067 | **1.131** ±1.254 | 🔴 **~2.25×** | [`mistral_7b_q4km_metal_cli`](receipts/pins/mistral_7b_q4km_metal_cli.json) |
+| Llama-3.2-1B-Instruct IQ4_XS | metal | **149.75** ±42.1 | **142.42** ±4.2 | ⚪ **~0.95×** | **1.078** ±0.015 | **1.098** ±0.189 | ⚪ **~0.98×** | [`iq4_xs_metal_cli`](receipts/pins/iq4_xs_metal_cli.json) |
+| Gemma-2-2B-IT Q4_K_M | metal | **30.55** ±0.3 | **31.39** ±1.7 | ⚪ **~1.03×** | **2.814** ±0.605 | **1.814** ±0.593 | 🔴 **~1.55×** | [`gemma2_2b_q4km_metal_cli`](receipts/pins/gemma2_2b_q4km_metal_cli.json) |
 | Gemma-2-2B-IT Q4_K_M | cpu | **8.86** ±0.2 | **10.95** ±3.9 | 🔴 **~1.24×** | **0.060** ±0.000 | **0.929** ±0.562 | 🟢 **~0.06×** | [`gemma2_2b_q4km_cpu_cli`](receipts/pins/gemma2_2b_q4km_cpu_cli.json) |
+| SmolLM2-135M-Instruct Q8_0 | metal | **80.71** ±1.3 | **103.96** ±5.6 | 🔴 **~1.29×** | **0.748** ±0.022 | **0.505** ±0.130 | 🔴 **~1.48×** | [`smollm2_135m_q8_metal_cli`](receipts/pins/smollm2_135m_q8_metal_cli.json) |
+| Qwen2.5-0.5B-Instruct Q8_0 | metal | **184.21** ±1.1 | **117.42** ±35.1 | 🟢 **~0.64×** | **0.909** ±0.036 | **0.796** ±0.228 | 🔴 **~1.14×** | [`qwen25_05b_q8_metal_cli`](receipts/pins/qwen25_05b_q8_metal_cli.json) |
+| Qwen3-0.6B Q8_0 | metal | **131.50** ±0.3 | **107.37** ±2.0 | 🟢 **~0.82×** | **0.948** ±0.090 | **1.029** ±0.273 | 🟢 **~0.92×** | [`qwen3_06b_q8_metal_cli`](receipts/pins/qwen3_06b_q8_metal_cli.json) |
+| Gemma-3-1B-IT Q8_0 | metal | **89.14** ±0.3 | **72.35** ±0.4 | 🟢 **~0.81×** | **1.828** ±0.064 | **1.125** ±0.263 | 🔴 **~1.62×** | [`gemma3_1b_q8_metal_cli`](receipts/pins/gemma3_1b_q8_metal_cli.json) |
+| Phi-3-mini-4k-Instruct Q4 | metal | **47.91** ±0.2 | **46.27** ±1.0 | ⚪ **~0.97×** | **1.740** ±0.052 | **0.933** ±0.437 | 🔴 **~1.86×** | [`phi3_mini_q4_metal_cli`](receipts/pins/phi3_mini_q4_metal_cli.json) |
 
 ## Open
 
-1. Metal prefill ≪ llama on large models; FA-vec covers d=64/96/128/256 (Phi-3 / Gemma-3 decode path).
+1. Metal prefill FA-vec d=128 landed (parity test); re-pin `prompt_per_second` on Llama-3.1-8B; FA-vec decode covers d=64/96/128/256.
 2. CUDA — re-measure on comparable CUDA hardware (no in-tree CUDA pin).
 3. Gemma-2 arch support (attn softcap + pin; suite currently refuse).
 4. CB multi-request tok/s receipt.

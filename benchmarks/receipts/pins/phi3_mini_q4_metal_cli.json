@@ -4,73 +4,106 @@
   "name": "Phi-3-mini-4k-Instruct Q4",
   "backend": "metal",
   "expect": "ok",
-  "date": "2026-08-04",
+  "date": "2026-08-05",
   "host": "Host B (Apple M2 Pro, 10 logical cores)",
   "model": "~/Desktop/Dev/ferrox/models/hf_test/Phi-3-mini-4k-instruct-q4.gguf",
   "max_tokens": 512,
   "reps": 3,
   "mode": "cli",
-  "workload": "greedy chat, warm then 3x 512-tok capitals list (median)",
-  "notes": "fused QKV/gate+up now split as quantized row slices (Metal-capable); d=96 -> legacy Metal attn kernel (no FA-vec)",
+  "workload": "CLI one-shot same capitals prompt + chat template as fair-chat (ferrox default wrap / llama -cnv --jinja), -n N --ignore-eos -c 4096, interleaved 3\u00d7 cold process (median \u00b1 stddev)",
+  "notes": "fused QKV/gate+up split as quantized row slices; FA-vec d=96",
   "ferrox": {
-    "wall_s": 14.185,
+    "wall_s": 12.396,
     "engine": "ferrox",
-    "prompt_per_second": 27.27,
+    "load_s": 0.04,
+    "prompt_per_second": 30.14,
     "completion_tokens": 512,
-    "predicted_per_second": 40.52,
-    "prefix": "b9a0b9f3a0f5e8a2b9f3a0f5e8a2b9f3a0f5e8a2b9f3a0f5e8a2b9f3a0f5",
-    "predicted_stddev": 0.3,
-    "prompt_stddev": 0.241,
+    "predicted_per_second": 47.91,
+    "startup_s": 1.74,
+    "prefix": "1. **Tallinn**, Estonia - Founded in the 13th century, Talli",
+    "predicted_stddev": 0.188,
+    "prompt_stddev": 0.329,
+    "load_stddev": 0.029,
+    "startup_stddev": 0.052,
     "reps": 3,
     "runs": [
       {
-        "predicted_per_second": 40.83,
-        "prompt_per_second": 27.27,
-        "wall_s": 14.09,
+        "predicted_per_second": 48.15,
+        "prompt_per_second": 30.12,
+        "wall_s": 12.396,
+        "load_s": 0.09,
+        "startup_s": 1.763,
         "completion_tokens": 512
       },
       {
-        "predicted_per_second": 40.52,
-        "prompt_per_second": 27.06,
-        "wall_s": 14.185,
+        "predicted_per_second": 47.78,
+        "prompt_per_second": 30.14,
+        "wall_s": 12.456,
+        "load_s": 0.04,
+        "startup_s": 1.74,
         "completion_tokens": 512
       },
       {
-        "predicted_per_second": 40.23,
-        "prompt_per_second": 27.54,
-        "wall_s": 14.25,
+        "predicted_per_second": 47.91,
+        "prompt_per_second": 30.7,
+        "wall_s": 12.35,
+        "load_s": 0.04,
+        "startup_s": 1.663,
         "completion_tokens": 512
       }
     ],
-    "mode": "cli"
+    "mode": "cli",
+    "bin": "/Users/d695663/Desktop/Dev/ferrox/target/bench/ferrox-cli-metal",
+    "bin_sha256_16": "e6e3e36f4c424078",
+    "bin_version": "ferrox 0.1.0"
   },
   "llama": {
-    "wall_s": 10.178,
+    "wall_s": 12.186,
     "engine": "llama",
-    "prompt_per_second": 26203.5,
-    "predicted_per_second": 53.0,
-    "prefix": "--no-conversation is not supported by llama-cli\nplease use l",
-    "predicted_stddev": 0.058,
-    "prompt_stddev": 7388.246,
+    "load_s": 0.327,
+    "prompt_per_second": 324.44,
+    "predicted_per_second": 46.27,
+    "completion_tokens": 511,
+    "startup_s": 0.933,
+    "prefix": " 1. **Tallinn**, Estonia - Founded in the 13th century, Tall",
+    "predicted_stddev": 1.003,
+    "prompt_stddev": 2.831,
+    "load_stddev": 0.527,
+    "startup_stddev": 0.437,
     "reps": 3,
     "runs": [
       {
-        "predicted_per_second": 53.1,
-        "prompt_per_second": 13597.0,
-        "wall_s": 11.181
+        "predicted_per_second": 46.27,
+        "prompt_per_second": 323.37,
+        "wall_s": 12.712,
+        "load_s": 1.235,
+        "startup_s": 1.668,
+        "completion_tokens": 511
       },
       {
-        "predicted_per_second": 53.0,
-        "prompt_per_second": 26576.0,
-        "wall_s": 10.178
+        "predicted_per_second": 45.41,
+        "prompt_per_second": 328.72,
+        "wall_s": 12.186,
+        "load_s": 0.327,
+        "startup_s": 0.933,
+        "completion_tokens": 511
       },
       {
-        "predicted_per_second": 53.0,
-        "prompt_per_second": 26203.5,
-        "wall_s": 10.178
+        "predicted_per_second": 47.41,
+        "prompt_per_second": 324.44,
+        "wall_s": 11.668,
+        "load_s": 0.319,
+        "startup_s": 0.89,
+        "completion_tokens": 511
       }
     ],
-    "mode": "cli"
+    "mode": "cli",
+    "bin": "/opt/homebrew/bin/llama-completion",
+    "bin_sha256_16": "aa827166534818ec",
+    "bin_version": "ggml_metal_device_init: tensor API disabled for pre-M5 and pre-A19 devices"
   },
+  "git_rev": "e25eac3",
+  "ferrox_bin": "/Users/d695663/Desktop/Dev/ferrox/target/bench/ferrox-cli-metal",
+  "llama_bin": "/opt/homebrew/bin/llama-completion",
   "status": "ok"
 }

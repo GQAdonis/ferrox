@@ -204,8 +204,6 @@ of their source code appears in this repository:
   tensor/model execution patterns, GGUF-in-Rust precedent (see also the
   section above for the one case where candle's real source was read
   directly to close a confirmed capability gap).
-- **Atlas** (atlasinference.io) -- pure Rust + CUDA, evidence-first
-  release posture on real hardware (DGX Spark / GB10).
 - **antonellof/cognitora-inference** -- the author's own orchestration
   layer above vLLM/SGLang/llama.cpp; ferrox is designed to be pluggable
   into cognitora's `cgn-agent` as an additional engine backend.

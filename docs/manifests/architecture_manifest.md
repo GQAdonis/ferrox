@@ -55,8 +55,6 @@ Source of truth for names: pinned llama.cpp `LLM_ARCH_NAMES`.
 | `plamo` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
 | `plamo3` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
 | `minicpm3` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
-| `minimax-m2` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
-| `minimax-m3` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
 | `starcoder2` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
 | `plm` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
 | `olmoe` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
@@ -84,9 +82,14 @@ Source of truth for names: pinned llama.cpp `LLM_ARCH_NAMES`.
 | `gemma` | TextGeneration | GemmaFamily | KvGqa | generic-gqa |
 | `gemma2` | TextGeneration | GemmaFamily | KvIswa | generic-gqa |
 | `gemma3` | TextGeneration | GemmaFamily | KvIswa | generic-gqa |
+| `gemma4` | TextGeneration | GemmaFamily | KvIswa | generic-gqa |
+| `gemma4-assistant` | TextGeneration | GemmaFamily | KvIswa | generic-gqa |
 | `phi2` | TextGeneration | PhiFamily | KvGqa | generic-gqa |
 | `phi3` | TextGeneration | PhiFamily | KvGqa | generic-gqa |
 | `phimoe` | TextGeneration | PhiFamily | KvGqa | generic-gqa |
+| `phi4` | TextGeneration | PhiFamily | KvGqa | generic-gqa |
+| `minimax-m2` | TextGeneration | Dedicated | KvGqa | dedicated |
+| `minimax-m3` | TextGeneration | Dedicated | KvGqa | dedicated |
 | `deepseek2` | TextGeneration | Mla | KvMla | dedicated |
 | `deepseek32` | TextGeneration | Mla | KvDsa | dedicated |
 | `mistral4` | TextGeneration | Mla | KvMla | dedicated |
@@ -147,8 +150,6 @@ Source of truth for names: pinned llama.cpp `LLM_ARCH_NAMES`.
 | `gptj` | EnumOnly | StandardGqa | None | deferred |
 | `(unknown)` | EnumOnly | StandardGqa | None | deferred |
 | `gemma3n` | TextGeneration | GemmaFamily | KvIswa | dedicated |
-| `gemma4` | TextGeneration | GemmaFamily | KvIswa | dedicated |
-| `gemma4-assistant` | TextGeneration | GemmaFamily | KvIswa | dedicated |
 | `ferroxtest` | TextGeneration | TestFixture | KvGqa | test-fixture |
 | `ferroxtestmoe` | TextGeneration | TestFixture | KvGqa | test-fixture |
 | `ferroxtestmixed` | TextGeneration | TestFixture | KvGqa | test-fixture |

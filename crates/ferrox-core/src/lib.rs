@@ -13,6 +13,7 @@ pub mod deepseek_v4_attention;
 pub mod expert_store;
 pub mod matmul;
 pub mod tensor;
+pub mod turboquant;
 pub mod weight_matrix;
 
 pub use attention::{

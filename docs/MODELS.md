@@ -65,9 +65,15 @@ Llama-3.2-1B IQ4_XS.
 | Qwen2-MoE | Loads (QKV bias + shared_expert_gate); suite entry added; oracle receipt needs real GGUF |
 | Mistral / Mixtral | Profile + SWA / grouped MoE wired; suite entries added; need receipt |
 | Gemma-2 | Attn softcap + SWA wired (CPU + Metal legacy GQA); needs real GGUF pin |
+| Gemma-4 | Admitted to GemmaFamily (`gemma4` / `gemma4-assistant` GenericGqa NeoX); Works pending receipt — MoE-A4B / VL later |
+| Phi-4 | Arch `phi4` admitted as PhiFamily (same fused path as phi3); no suite pin yet (**P6**) |
+| MiniMax M2/M3 | DedicatedOnly — 256-expert sigmoid MoE + MTP not implemented (was wrongly generic) |
+| MLA | `mla_gguf_loader` + `load_mla_engine_from_path` + CLI `ferrox run` for dense-lead deepseek2/mistral4; MoE fail-closed; server path still Decoder-only |
+| Hybrid GDN | `gdn.rs` primitive + `HybridEngine` stub (**P3**); hybrid arches remain DedicatedOnly until GGUF load lands |
 | Kimi K3 | Real slice loaders + `kimi_validate` index check; full ~1.56 TB e2e gated on storage |
-| GLM-5.2 / DeepSeek V4 | Dedicated engines (`Glm52Engine`, `DeepseekV4Engine`) + synthetic stacks — no real GGUF e2e |
-| MLA / Mamba / T5 / VL | Fail-closed; engine stubs (`mla` / `recurrent_engine` / `hybrid_engine` / `t5_engine` / `vl_engine`) |
+| GLM-5.2 / DeepSeek V4 | Dedicated engines (`Glm52Engine`, `DeepseekV4Engine`) + synthetic stacks — no real GGUF e2e (**P8**) |
+| VL / MTP | Deferred (**P7** / **P8**); `vl_engine` stub; no multimodal or MTP serve path |
+| Mamba / T5 | Fail-closed; engine stubs (`recurrent_engine` / `t5_engine`) |
 | CUDA speed | Suite supports `--backend cuda`; need GPU host pins (staged ≥0.5× then parity) |
 
 ## Backends
@@ -75,7 +81,7 @@ Llama-3.2-1B IQ4_XS.
 | Backend | Today |
 |---|---|
 | CPU | Primary correctness path |
-| Metal | Dense + attn + MoE expert placement (default VRAM budget); FA-vec d=64/96/128/256; softcap via legacy GQA |
+| Metal | Dense + attn + MoE expert placement (default VRAM budget); FA-vec decode d=64/96/128/256; FA-vec prefill d=128; softcap via legacy GQA; `FERROX_CTK` q8_0 scaffolded (f16 default) |
 | CUDA | Compiles; `run_suite.py --backend cuda --host-label …` for pins; explicit `FERROX_GPU_VRAM_BUDGET_BYTES` for MoE |
 
 Unknown `general.architecture` values fail closed with a clear error (`ferrox archs` for the list).

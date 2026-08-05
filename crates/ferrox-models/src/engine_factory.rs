@@ -8,6 +8,8 @@
 use crate::capability::{resolve_profile, ArchPath, DecoderFamily};
 use crate::decoder::Decoder;
 use crate::engine::{Engine, Glm52Engine, KimiEngine, MlaEngine};
+use crate::loader::LoadError;
+use crate::mla_gguf_loader;
 use thiserror::Error;
 
 /// Why a GGUF cannot be served by the currently compiled engine set.
@@ -73,8 +75,7 @@ pub fn ensure_generic_decoder(arch: &str) -> Result<(), EngineSelectError> {
         )),
         SelectedEngineKind::Mla => Err(EngineSelectError::DedicatedUnavailable(
             arch.to_string(),
-            "MLA engine exists (ferrox_models::MlaEngine) but DeepSeek-2/Mistral-4 GGUF \
-             weight loading is not wired yet — fail-closed until a real checkpoint receipt",
+            "use load_mla_engine_from_path / ServedEngine::Mla — not generic Decoder",
         )),
         SelectedEngineKind::RecurrentHybrid => {
             let _ = crate::recurrent_engine::RecurrentEngine::reject(arch);
@@ -112,6 +113,39 @@ impl ServedEngine {
             Self::Mla(m) => Engine::vocab_size(m),
         }
     }
+}
+
+/// Open a DeepSeek-2 / Mistral-4 GGUF and build [`ServedEngine::Mla`].
+pub fn load_mla_engine_from_path(path: &std::path::Path) -> Result<ServedEngine, LoadError> {
+    let file = ferrox_gguf::ShardedGguf::open(path)?;
+    let arch = file
+        .metadata_str("general.architecture")
+        .unwrap_or("unknown");
+    match select_engine_kind(arch) {
+        Ok(SelectedEngineKind::Mla) => {}
+        Ok(other) => {
+            return Err(LoadError::DedicatedArchitectureRequired(
+                arch.to_string(),
+                match other {
+                    SelectedEngineKind::GenericDecoder => "generic decoder arch, not MLA",
+                    SelectedEngineKind::DedicatedStack => "dedicated non-MLA stack",
+                    SelectedEngineKind::RecurrentHybrid => "hybrid/recurrent, not MLA",
+                    SelectedEngineKind::EncoderDecoder => "encoder-decoder, not MLA",
+                    SelectedEngineKind::Mla => unreachable!(),
+                },
+            ));
+        }
+        Err(EngineSelectError::Unknown(a)) => {
+            return Err(LoadError::UnsupportedArchitecture(a));
+        }
+        Err(EngineSelectError::OutOfScope(a, r)) => {
+            return Err(LoadError::UnsupportedFeature(a, r.to_string()));
+        }
+        Err(EngineSelectError::DedicatedUnavailable(a, r)) => {
+            return Err(LoadError::DedicatedArchitectureRequired(a, r));
+        }
+    }
+    Ok(ServedEngine::Mla(mla_gguf_loader::load_mla_engine(&file)?))
 }
 
 #[cfg(test)]

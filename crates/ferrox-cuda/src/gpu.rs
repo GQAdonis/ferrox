@@ -1,9 +1,8 @@
 //! CUDA execution path via `cudarc` 0.11.9 (pinned to this version
 //! because newer `cudarc`/`libloading` releases require a rustc newer
 //! than the 1.75 available in an earlier development environment for
-//! this project -- see Cargo.toml's comment),
-//! following the same dynamic-loading approach Atlas uses
-//! so this compiles without a CUDA toolkit installed.
+//! this project -- see Cargo.toml's comment). Uses dynamic loading so
+//! this compiles without a CUDA toolkit installed.
 //!
 //! # Verified on real GPU hardware
 //!

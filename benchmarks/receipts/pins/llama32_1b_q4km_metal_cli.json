@@ -4,73 +4,106 @@
   "name": "Llama-3.2-1B-Instruct Q4_K_M",
   "backend": "metal",
   "expect": "ok",
-  "date": "2026-08-04",
+  "date": "2026-08-05",
   "host": "Host B (Apple M2 Pro, 10 logical cores)",
   "model": "~/Desktop/Dev/ferrox/models/Llama-3.2-1B-Instruct-Q4_K_M.gguf",
   "max_tokens": 512,
   "reps": 3,
   "mode": "cli",
-  "workload": "greedy chat, warm then 3x 512-tok capitals list (median)",
+  "workload": "CLI one-shot same capitals prompt + chat template as fair-chat (ferrox default wrap / llama -cnv --jinja), -n N --ignore-eos -c 4096, interleaved 3\u00d7 cold process (median \u00b1 stddev)",
   "notes": "head_dim=64; FA-vec N/A",
   "ferrox": {
-    "wall_s": 4.382,
+    "wall_s": 4.55,
     "engine": "ferrox",
-    "prompt_per_second": 59.25,
+    "load_s": 0.08,
+    "prompt_per_second": 65.68,
     "completion_tokens": 512,
-    "predicted_per_second": 143.96,
-    "prefix": "\n\n1. Berlin, Germany - Founded in 1237 as a free city, it wa",
-    "predicted_stddev": 1.805,
-    "prompt_stddev": 2.026,
+    "predicted_per_second": 142.16,
+    "startup_s": 0.98,
+    "prefix": "Here is a detailed numbered list of 80 European capital citi",
+    "predicted_stddev": 1.971,
+    "prompt_stddev": 3.876,
+    "load_stddev": 0.01,
+    "startup_stddev": 0.112,
     "reps": 3,
     "runs": [
       {
-        "predicted_per_second": 142.18,
-        "prompt_per_second": 60.08,
-        "wall_s": 4.424,
+        "predicted_per_second": 139.54,
+        "prompt_per_second": 62.61,
+        "wall_s": 4.748,
+        "load_s": 0.09,
+        "startup_s": 1.079,
         "completion_tokens": 512
       },
       {
-        "predicted_per_second": 143.96,
-        "prompt_per_second": 56.23,
-        "wall_s": 4.382,
+        "predicted_per_second": 143.4,
+        "prompt_per_second": 65.68,
+        "wall_s": 4.55,
+        "load_s": 0.08,
+        "startup_s": 0.98,
         "completion_tokens": 512
       },
       {
-        "predicted_per_second": 145.79,
-        "prompt_per_second": 59.25,
-        "wall_s": 4.311,
+        "predicted_per_second": 142.16,
+        "prompt_per_second": 70.31,
+        "wall_s": 4.457,
+        "load_s": 0.07,
+        "startup_s": 0.856,
         "completion_tokens": 512
       }
     ],
-    "mode": "cli"
+    "mode": "cli",
+    "bin": "/Users/d695663/Desktop/Dev/ferrox/target/bench/ferrox-cli-metal",
+    "bin_sha256_16": "e6e3e36f4c424078",
+    "bin_version": "ferrox 0.1.0"
   },
   "llama": {
-    "wall_s": 5.147,
+    "wall_s": 5.626,
     "engine": "llama",
-    "prompt_per_second": 42740.4,
-    "predicted_per_second": 140.2,
-    "prefix": "--no-conversation is not supported by llama-cli\nplease use l",
-    "predicted_stddev": 1.212,
-    "prompt_stddev": 12259.875,
+    "load_s": 0.306,
+    "prompt_per_second": 1166.3,
+    "predicted_per_second": 122.83,
+    "completion_tokens": 511,
+    "startup_s": 1.361,
+    "prefix": "I can provide you with a detailed numbered list of 80 Europe",
+    "predicted_stddev": 5.785,
+    "prompt_stddev": 52.147,
+    "load_stddev": 0.195,
+    "startup_stddev": 0.127,
     "reps": 3,
     "runs": [
       {
-        "predicted_per_second": 142.3,
-        "prompt_per_second": 23926.8,
-        "wall_s": 6.135
+        "predicted_per_second": 122.83,
+        "prompt_per_second": 1166.3,
+        "wall_s": 5.626,
+        "load_s": 0.634,
+        "startup_s": 1.466,
+        "completion_tokens": 511
       },
       {
-        "predicted_per_second": 140.2,
-        "prompt_per_second": 42740.4,
-        "wall_s": 5.143
+        "predicted_per_second": 130.97,
+        "prompt_per_second": 1123.45,
+        "wall_s": 5.114,
+        "load_s": 0.286,
+        "startup_s": 1.213,
+        "completion_tokens": 511
       },
       {
-        "predicted_per_second": 140.2,
-        "prompt_per_second": 46951.6,
-        "wall_s": 5.147
+        "predicted_per_second": 119.78,
+        "prompt_per_second": 1227.22,
+        "wall_s": 5.627,
+        "load_s": 0.306,
+        "startup_s": 1.361,
+        "completion_tokens": 511
       }
     ],
-    "mode": "cli"
+    "mode": "cli",
+    "bin": "/opt/homebrew/bin/llama-completion",
+    "bin_sha256_16": "aa827166534818ec",
+    "bin_version": "ggml_metal_device_init: tensor API disabled for pre-M5 and pre-A19 devices"
   },
+  "git_rev": "ec8fa80",
+  "ferrox_bin": "/Users/d695663/Desktop/Dev/ferrox/target/bench/ferrox-cli-metal",
+  "llama_bin": "/opt/homebrew/bin/llama-completion",
   "status": "ok"
 }

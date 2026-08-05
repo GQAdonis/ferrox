@@ -30,8 +30,12 @@
 //! opt out with `FERROX_METAL_GREEDY_GPU=0`. Embedding gather can also run
 //! on-GPU (`get_rows`) so the dense stack needs no host `dequant_row` upload.
 //!
-//! `FERROX_METAL_FA_VEC=0` disables llama-style FA-vec decode (default **on**
-//! for `head_dim==128`). Other head dims keep legacy online-softmax GQA.
+//! `FERROX_METAL_FA_VEC=0` disables llama-style FA-vec decode **and** prefill
+//! (default **on** for `head_dim` in {64,96,128,256}). Other head dims keep
+//! legacy online-softmax GQA.
+//!
+//! `FERROX_CTK=f16|q8_0` selects the requested KV dtype ([`MetalKvDtype`]);
+//! only F16 buffers are implemented today — `q8_0` warns once and keeps F16.
 use crate::elem::{
     encode_add_rms_norm, encode_argmax, encode_gelu_mul, encode_rms_norm, encode_rms_norm_per_head,
     encode_silu_mul, encode_vec_add,
@@ -239,6 +243,75 @@ pub fn metal_fa_vec_enabled() -> bool {
             // ~1.15× decode gap (legacy GQA ≈ llama `-ctk f32`).
             _ => true,
         }
+    })
+}
+
+/// Device KV cache element type (llama.cpp `-ctk` / `--kvcache-dtype` analogue).
+///
+/// Selected via `FERROX_CTK` ([`metal_kv_dtype`]). **Today only F16 buffers
+/// are allocated** — other variants are parsed and warn once until kernels land.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MetalKvDtype {
+    F16,
+    Q8_0,
+    /// FP8 E4M3-style KV (8-bit).
+    Fp8,
+    /// TurboQuant-style 8-bit (WHT + codebook; P5b).
+    Turbo8,
+    /// TurboQuant-style 4-bit (WHT + Lloyd-Max; P5b).
+    Turbo4,
+    /// TurboQuant-style 3-bit (experimental; P5b).
+    Turbo3,
+}
+
+impl MetalKvDtype {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::F16 => "f16",
+            Self::Q8_0 => "q8_0",
+            Self::Fp8 => "fp8",
+            Self::Turbo8 => "turbo8",
+            Self::Turbo4 => "turbo4",
+            Self::Turbo3 => "turbo3",
+        }
+    }
+
+    pub fn is_implemented(self) -> bool {
+        matches!(self, Self::F16)
+    }
+}
+
+/// Parse `FERROX_CTK` / `-ctk`-style strings. Unknown → [`MetalKvDtype::F16`].
+pub fn parse_metal_kv_dtype(raw: Option<&str>) -> MetalKvDtype {
+    match raw.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
+        Some("q8_0") | Some("q8") => MetalKvDtype::Q8_0,
+        Some("fp8") | Some("e4m3") => MetalKvDtype::Fp8,
+        Some("turbo8") => MetalKvDtype::Turbo8,
+        Some("turbo4") => MetalKvDtype::Turbo4,
+        Some("turbo3") => MetalKvDtype::Turbo3,
+        Some("f16") | Some("fp16") | Some("half") | Some("bf16") => MetalKvDtype::F16,
+        _ => MetalKvDtype::F16,
+    }
+}
+
+/// KV dtype requested by `FERROX_CTK` (default F16).
+///
+/// Unimplemented dtypes emit a one-time stderr warning; callers keep F16 buffers.
+pub fn metal_kv_dtype() -> MetalKvDtype {
+    static DTYPE: OnceLock<MetalKvDtype> = OnceLock::new();
+    *DTYPE.get_or_init(|| {
+        let dt = parse_metal_kv_dtype(std::env::var("FERROX_CTK").ok().as_deref());
+        if !dt.is_implemented() {
+            static WARNED: OnceLock<()> = OnceLock::new();
+            let _ = WARNED.get_or_init(|| {
+                eprintln!(
+                    "FERROX_CTK={}: Metal {} KV cache not implemented yet; using f16 buffers",
+                    dt.as_str(),
+                    dt.as_str()
+                );
+            });
+        }
+        dt
     })
 }
 
@@ -982,10 +1055,144 @@ kernel void gqa_decode(
 }
 "#;
 
+/// FA-vec multi-query causal prefill for **head_dim=128**, f16 KV, C=32.
+/// One TG per `(head, query_token)`; same tile/merge as decode FA-vec, but
+/// each query `qi` attends only over `[0 ..= kv_prefix_len + qi]`.
+const GQA_PREFILL_FA_VEC_KERNEL_SRC: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+kernel void gqa_prefill_fa_vec(
+    device const float* q [[buffer(0)]],
+    device const half* k_cache [[buffer(1)]],
+    device const half* v_cache [[buffer(2)]],
+    device float* out [[buffer(3)]],
+    constant uint& n_heads [[buffer(4)]],
+    constant uint& n_kv_heads [[buffer(5)]],
+    constant uint& head_dim [[buffer(6)]],
+    constant uint& n_q [[buffer(7)]],
+    constant uint& kv_prefix_len [[buffer(8)]],
+    uint2 tgpig [[threadgroup_position_in_grid]],
+    uint2 tid_tg [[thread_position_in_threadgroup]],
+    uint2 tg_size [[threads_per_threadgroup]],
+    threadgroup float* shared [[threadgroup(0)]]
+) {
+    constexpr uint D = 128u;
+    constexpr uint D4 = 32u;
+    constexpr uint C = 32u;
+    constexpr uint NW = 32u;
+    constexpr uint SG_F = C + D;
+
+    uint h = tgpig.x;
+    uint qi = tgpig.y;
+    if (h >= n_heads || qi >= n_q || head_dim != D) return;
+
+    uint causal_len = kv_prefix_len + qi + 1u;
+    if (causal_len == 0u) return;
+
+    uint tid = tid_tg.x;
+    uint tg = tg_size.x;
+    const uint tiisg = tid % NW;
+    const uint sgitg = tid / NW;
+    const uint nsg = tg / NW;
+
+    threadgroup float4* sq4 = (threadgroup float4*)shared;
+    threadgroup float* ss = shared + D + sgitg * SG_F;
+    threadgroup float4* so4 = (threadgroup float4*)(ss + C);
+
+    uint group_size = n_heads / max(n_kv_heads, 1u);
+    uint kv_h = h / max(group_size, 1u);
+    float scale = 1.0f / sqrt(float(D));
+
+    device const float4* q4 = (device const float4*)(q + (qi * n_heads + h) * D);
+    for (uint i = tid; i < D4; i += tg) {
+        sq4[i] = q4[i];
+    }
+    so4[tiisg] = float4(0.0f);
+    ss[tiisg] = 0.0f;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float S = 0.0f;
+    float M = -INFINITY;
+
+    for (uint ic0 = sgitg; ; ic0 += nsg) {
+        uint ic = ic0 * C;
+        if (ic >= causal_len) break;
+        uint chunk = min(C, causal_len - ic);
+
+        float scores[C];
+        for (uint cc = 0; cc < C; cc++) {
+            scores[cc] = -INFINITY;
+        }
+        for (uint cc = 0; cc < chunk; cc++) {
+            device const half4* k4 =
+                (device const half4*)(k_cache + ((ic + cc) * n_kv_heads + kv_h) * D);
+            float partial = dot(sq4[tiisg], float4(k4[tiisg]));
+            scores[cc] = simd_sum(partial) * scale;
+        }
+
+        float s_lane = (tiisg < chunk) ? scores[tiisg] : -INFINITY;
+        float M2 = simd_max(max(M, s_lane));
+        float ms = (M == -INFINITY) ? 0.0f : exp(M - M2);
+        float vs = (s_lane == -INFINITY) ? 0.0f : exp(s_lane - M2);
+        S = S * ms + simd_sum(vs);
+        ss[tiisg] = vs;
+        so4[tiisg] *= ms;
+        M = M2;
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+
+        float4 lo = float4(0.0f);
+        for (uint cc = 0; cc < chunk; cc++) {
+            device const half4* v4 =
+                (device const half4*)(v_cache + ((ic + cc) * n_kv_heads + kv_h) * D);
+            lo += float4(v4[tiisg]) * ss[cc];
+        }
+        so4[tiisg] += lo;
+    }
+
+    if (tiisg == 0u) {
+        ss[0] = S;
+        ss[1] = M;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint r = nsg >> 1; r > 0u; r >>= 1) {
+        if (sgitg < r) {
+            threadgroup float* ss0 = shared + D + sgitg * SG_F;
+            threadgroup float* ss1 = shared + D + (sgitg + r) * SG_F;
+            threadgroup float4* so0 = (threadgroup float4*)(ss0 + C);
+            threadgroup float4* so1 = (threadgroup float4*)(ss1 + C);
+            float S0 = ss0[0];
+            float S1 = ss1[0];
+            float M0 = ss0[1];
+            float M1 = ss1[1];
+            float Mn = max(M0, M1);
+            float a0 = (M0 == -INFINITY) ? 0.0f : exp(M0 - Mn);
+            float a1 = (M1 == -INFINITY) ? 0.0f : exp(M1 - Mn);
+            if (tiisg == 0u) {
+                ss0[0] = S0 * a0 + S1 * a1;
+                ss0[1] = Mn;
+            }
+            so0[tiisg] = so0[tiisg] * a0 + so1[tiisg] * a1;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (sgitg == 0u) {
+        threadgroup float* ss0 = shared + D;
+        threadgroup float4* so0 = (threadgroup float4*)(ss0 + C);
+        float inv = (ss0[0] == 0.0f) ? 0.0f : (1.0f / ss0[0]);
+        device float4* out4 = (device float4*)(out + (qi * n_heads + h) * D);
+        out4[tiisg] = so0[tiisg] * inv;
+    }
+}
+"#;
+
 // Multi-token causal GQA prefill: one threadgroup per (query token, head).
 // Query `qi` at absolute cache index `kv_prefix_len + qi` attends over
 // K/V[0 ..= kv_prefix_len + qi] (inclusive), matching host
 // `causal_gqa_attention` per position after the batch KV append.
+// Used when FA-vec is off or head_dim lacks a specialized prefill kernel.
 const GQA_PREFILL_KERNEL_SRC: &str = r#"
 #include <metal_stdlib>
 using namespace metal;
@@ -1694,9 +1901,10 @@ fn gqa_fa_vec_supported(head_dim: u32) -> bool {
     matches!(head_dim, 64 | 96 | 128 | 256)
 }
 
-/// Prefill GQA keeps the legacy per-thread TG-acc layout; TG must be a
-/// power of two for its tree reduce. Separate from decode so NeoX/prefill
-/// agents can evolve this without fighting decode occupancy tweaks.
+/// Prefill GQA keeps the legacy per-thread TG-acc layout when FA-vec is
+/// off or head_dim is unsupported; TG must be a power of two for its tree
+/// reduce. Separate from decode so NeoX/prefill agents can evolve this
+/// without fighting decode occupancy tweaks.
 fn gqa_prefill_threadgroup_size(seq_len: u32, head_dim: u32) -> u32 {
     const TG_BUDGET_BYTES: u32 = 28 * 1024;
     let per_thread = head_dim.saturating_add(2).saturating_mul(4).max(1);
@@ -1707,6 +1915,75 @@ fn gqa_prefill_threadgroup_size(seq_len: u32, head_dim: u32) -> u32 {
         tg >>= 1;
     }
     tg.max(1)
+}
+
+/// FA-vec prefill currently ships a dedicated kernel for head_dim=128
+/// (Llama-3.1-8B fair-chat). Other FA-vec dims fall back to legacy prefill.
+fn gqa_prefill_fa_vec_supported(head_dim: u32) -> bool {
+    head_dim == 128
+}
+
+#[allow(clippy::too_many_arguments)]
+fn encode_gqa_prefill_fa_vec(
+    encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+    device: &Retained<ProtocolObject<dyn MTLDevice>>,
+    q: &ProtocolObject<dyn MTLBuffer>,
+    k: &ProtocolObject<dyn MTLBuffer>,
+    v: &ProtocolObject<dyn MTLBuffer>,
+    out: &ProtocolObject<dyn MTLBuffer>,
+    n_heads: u32,
+    n_kv_heads: u32,
+    head_dim: u32,
+    n_q: u32,
+    kv_prefix_len: u32,
+) -> Result<(), MetalError> {
+    if head_dim != 128 {
+        return Err(MetalError::CommandFailed);
+    }
+    let pipe = ensure_pipeline(device, GQA_PREFILL_FA_VEC_KERNEL_SRC, "gqa_prefill_fa_vec")?;
+    encoder.setComputePipelineState(&pipe.0);
+    let tg = gqa_fa_vec_threadgroup_size(head_dim);
+    let nsg = tg / 32;
+    // Q[D] + NSG * (C=32 scores + D output)
+    let tg_mem = ((head_dim + nsg * (32 + head_dim)) * 4) as usize;
+    unsafe {
+        encoder.setBuffer_offset_atIndex(Some(q), 0, 0);
+        encoder.setBuffer_offset_atIndex(Some(k), 0, 1);
+        encoder.setBuffer_offset_atIndex(Some(v), 0, 2);
+        encoder.setBuffer_offset_atIndex(Some(out), 0, 3);
+        let mut nh = n_heads;
+        encoder.setBytes_length_atIndex(NonNull::new(&mut nh as *mut u32 as *mut _).unwrap(), 4, 4);
+        let mut nkv = n_kv_heads;
+        encoder.setBytes_length_atIndex(
+            NonNull::new(&mut nkv as *mut u32 as *mut _).unwrap(),
+            4,
+            5,
+        );
+        let mut hd = head_dim;
+        encoder.setBytes_length_atIndex(NonNull::new(&mut hd as *mut u32 as *mut _).unwrap(), 4, 6);
+        let mut nq = n_q;
+        encoder.setBytes_length_atIndex(NonNull::new(&mut nq as *mut u32 as *mut _).unwrap(), 4, 7);
+        let mut prefix = kv_prefix_len;
+        encoder.setBytes_length_atIndex(
+            NonNull::new(&mut prefix as *mut u32 as *mut _).unwrap(),
+            4,
+            8,
+        );
+        encoder.setThreadgroupMemoryLength_atIndex(tg_mem, 0);
+    }
+    encoder.dispatchThreadgroups_threadsPerThreadgroup(
+        MTLSize {
+            width: n_heads as usize,
+            height: n_q as usize,
+            depth: 1,
+        },
+        MTLSize {
+            width: tg as usize,
+            height: 1,
+            depth: 1,
+        },
+    );
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1871,6 +2148,21 @@ fn encode_gqa_prefill(
     n_q: u32,
     kv_prefix_len: u32,
 ) -> Result<(), MetalError> {
+    if metal_fa_vec_enabled() && gqa_prefill_fa_vec_supported(head_dim) {
+        return encode_gqa_prefill_fa_vec(
+            encoder,
+            device,
+            q,
+            k,
+            v,
+            out,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            n_q,
+            kv_prefix_len,
+        );
+    }
     let pipe = ensure_pipeline(device, GQA_PREFILL_KERNEL_SRC, "gqa_prefill")?;
     encoder.setComputePipelineState(&pipe.0);
     let max_causal = kv_prefix_len + n_q;
@@ -4227,6 +4519,33 @@ pub fn launch_gqa_prefill_host(
 mod tests {
     use super::*;
 
+    #[test]
+    fn parse_metal_kv_dtype_f16_default_and_aliases() {
+        assert_eq!(parse_metal_kv_dtype(None), MetalKvDtype::F16);
+        assert_eq!(parse_metal_kv_dtype(Some("")), MetalKvDtype::F16);
+        assert_eq!(parse_metal_kv_dtype(Some("f16")), MetalKvDtype::F16);
+        assert_eq!(parse_metal_kv_dtype(Some("FP16")), MetalKvDtype::F16);
+        assert_eq!(parse_metal_kv_dtype(Some("half")), MetalKvDtype::F16);
+        assert_eq!(parse_metal_kv_dtype(Some("bogus")), MetalKvDtype::F16);
+    }
+
+    #[test]
+    fn parse_metal_kv_dtype_q8_0() {
+        assert_eq!(parse_metal_kv_dtype(Some("q8_0")), MetalKvDtype::Q8_0);
+        assert_eq!(parse_metal_kv_dtype(Some("Q8_0")), MetalKvDtype::Q8_0);
+        assert_eq!(parse_metal_kv_dtype(Some("q8")), MetalKvDtype::Q8_0);
+    }
+
+    #[test]
+    fn parse_metal_kv_dtype_turbo_family() {
+        assert_eq!(parse_metal_kv_dtype(Some("fp8")), MetalKvDtype::Fp8);
+        assert_eq!(parse_metal_kv_dtype(Some("turbo8")), MetalKvDtype::Turbo8);
+        assert_eq!(parse_metal_kv_dtype(Some("turbo4")), MetalKvDtype::Turbo4);
+        assert_eq!(parse_metal_kv_dtype(Some("turbo3")), MetalKvDtype::Turbo3);
+        assert!(!MetalKvDtype::Turbo4.is_implemented());
+        assert!(MetalKvDtype::F16.is_implemented());
+    }
+
     fn cpu_gqa(
         q: &[f32],
         k_cache: &[f32],
@@ -4597,6 +4916,52 @@ mod tests {
         assert_eq!(cpu.len(), gpu.len());
         for (i, (a, b)) in cpu.iter().zip(gpu.iter()).enumerate() {
             let tol = 2e-3 * a.abs().max(1.0);
+            assert!((a - b).abs() <= tol, "elem {i}: cpu={a} gpu={b} tol={tol}");
+        }
+    }
+
+    #[test]
+    #[ignore = "needs a real Metal GPU"]
+    fn gqa_prefill_fa_vec_d128_matches_cpu() {
+        let n_heads = 4;
+        let n_kv_heads = 2;
+        let head_dim = 128;
+        let n_q = 3;
+        let kv_prefix_len = 5;
+        let total = kv_prefix_len + n_q;
+        let q: Vec<f32> = (0..n_q * n_heads * head_dim)
+            .map(|i| (i as f32 * 0.07).sin())
+            .collect();
+        let k: Vec<f32> = (0..total * n_kv_heads * head_dim)
+            .map(|i| (i as f32 * 0.03).cos())
+            .collect();
+        let v: Vec<f32> = (0..total * n_kv_heads * head_dim)
+            .map(|i| (i as f32 * 0.05).sin())
+            .collect();
+        let cpu = cpu_gqa_prefill(
+            &q,
+            &k,
+            &v,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            n_q,
+            kv_prefix_len,
+        );
+        let gpu = launch_gqa_prefill_host(
+            &q,
+            &k,
+            &v,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            n_q,
+            kv_prefix_len,
+        )
+        .expect("metal gqa prefill fa-vec");
+        assert_eq!(cpu.len(), gpu.len());
+        for (i, (a, b)) in cpu.iter().zip(gpu.iter()).enumerate() {
+            let tol = 5e-3 * a.abs().max(1.0);
             assert!((a - b).abs() <= tol, "elem {i}: cpu={a} gpu={b} tol={tol}");
         }
     }

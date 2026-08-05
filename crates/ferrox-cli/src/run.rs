@@ -10,8 +10,9 @@ use clap::{Args, ValueEnum};
 use ferrox_core::cache::KvCache;
 use ferrox_gguf::ShardedGguf;
 use ferrox_models::{
-    ensure_generic_decoder, ByteTokenizer, Decoder, GgufBpeTokenizer, GgufSpmTokenizer,
-    GgufUnigramTokenizer, ModelConfig, Sampler, SamplingParams,
+    ensure_generic_decoder, load_mla_engine_from_path, select_engine_kind, ByteTokenizer, Decoder,
+    Engine, GgufBpeTokenizer, GgufSpmTokenizer, GgufUnigramTokenizer, ModelConfig, Sampler,
+    SamplingParams, SelectedEngineKind, ServedEngine,
 };
 
 /// llama.cpp-compatible completion flags.
@@ -451,14 +452,25 @@ pub fn run_infer(args: InferArgs) -> anyhow::Result<()> {
 
     let model = args
         .model
-        .as_deref()
+        .clone()
         .ok_or_else(|| anyhow::anyhow!("--model is required"))?;
-    let path = Path::new(model);
+    let path = Path::new(&model);
     if !path.exists() {
         anyhow::bail!("model not found: {model}");
     }
 
     let file = ShardedGguf::open(path)?;
+    let arch_early = file
+        .metadata_str("general.architecture")
+        .unwrap_or("unknown")
+        .to_string();
+    if matches!(
+        select_engine_kind(&arch_early),
+        Ok(SelectedEngineKind::Mla)
+    ) {
+        return run_mla_infer(args, path, &file);
+    }
+
     let config = ModelConfig::from_gguf(&file)?;
     if let Some(arch) = file.metadata_str("general.architecture") {
         ensure_generic_decoder(arch).map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -636,6 +648,152 @@ pub fn run_infer(args: InferArgs) -> anyhow::Result<()> {
          predict {gen_n} tokens, {pred_tps:.2} t/s"
     );
 
+    Ok(())
+}
+
+/// Dense-lead DeepSeek-2 / Mistral-4 path via [`MlaEngine`].
+fn run_mla_infer(
+    args: InferArgs,
+    path: &Path,
+    file: &ShardedGguf,
+) -> anyhow::Result<()> {
+    let tokenizer = match file.metadata_str("tokenizer.ggml.model") {
+        Some("gpt2") => CliTokenizer::Bpe(Box::new(GgufBpeTokenizer::from_gguf(file)?)),
+        Some("llama") => CliTokenizer::Spm(GgufSpmTokenizer::from_gguf(file)?),
+        Some("t5") => CliTokenizer::Unigram(GgufUnigramTokenizer::from_gguf(file)?),
+        other => {
+            eprintln!(
+                "ferrox: unrecognized tokenizer.ggml.model ({other:?}); using byte tokenizer"
+            );
+            CliTokenizer::Byte
+        }
+    };
+    let eos_id = file
+        .metadata_u64("tokenizer.ggml.eos_token_id")
+        .map(|v| v as usize);
+    let bos_id = file
+        .metadata_u64("tokenizer.ggml.bos_token_id")
+        .map(|v| v as usize);
+    let arch = file
+        .metadata_str("general.architecture")
+        .unwrap_or("unknown");
+    let gguf_ctx = file
+        .metadata_u64(&format!("{arch}.context_length"))
+        .map(|v| v as usize)
+        .unwrap_or(4096);
+    let ctx_size = if args.ctx_size > 0 {
+        args.ctx_size
+    } else {
+        gguf_ctx
+    };
+
+    let chat = ChatKind::detect_for_gguf(
+        file.metadata_str("tokenizer.chat_template"),
+        file.metadata_str("general.architecture"),
+        matches!(tokenizer, CliTokenizer::Byte),
+    );
+    let user_prompt = resolve_prompt(&args)?;
+    let prompt = if args.no_cnv {
+        user_prompt
+    } else {
+        chat.wrap_user(args.system.as_deref(), &user_prompt)
+    };
+
+    eprintln!(
+        "ferrox: loading {} as MLA engine (tokenizer={}, ctx={ctx_size})",
+        args.model.as_deref().unwrap_or("?"),
+        tokenizer.kind()
+    );
+    let load_t = Instant::now();
+    let served = load_mla_engine_from_path(path).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let ServedEngine::Mla(engine) = served else {
+        anyhow::bail!("expected ServedEngine::Mla");
+    };
+    eprintln!("ferrox: loaded in {:.2}s", load_t.elapsed().as_secs_f64());
+
+    let mut tokens = tokenizer.encode(&prompt);
+    if let Some(bos) = bos_id {
+        if tokens.first() != Some(&bos) {
+            tokens.insert(0, bos);
+        }
+    }
+    let vocab_size = Engine::vocab_size(&engine);
+    if let Some(&bad) = tokens.iter().find(|&&t| t >= vocab_size) {
+        anyhow::bail!("prompt token {bad} outside vocab_size {vocab_size}");
+    }
+    if tokens.len() >= ctx_size {
+        anyhow::bail!(
+            "prompt length {} >= context size {ctx_size}; raise -c or shorten prompt",
+            tokens.len()
+        );
+    }
+
+    let room = ctx_size - tokens.len();
+    let max_new = if args.n_predict < 0 {
+        room
+    } else {
+        (args.n_predict as usize).min(room)
+    };
+
+    let sampling = SamplingParams {
+        temperature: args.temperature,
+        top_p: args.top_p,
+        top_k: args.top_k,
+        repetition_penalty: args.repeat_penalty,
+    };
+    let mut sampler = Sampler::new(seed_from_args(args.seed));
+    let mut state = Engine::new_state(&engine);
+
+    let prefill_t = Instant::now();
+    let mut pos = 0usize;
+    let mut logits = if tokens.is_empty() {
+        let l = engine.forward_token(0, 0, &mut state);
+        pos = 1;
+        l
+    } else {
+        let mut last = Vec::new();
+        for &tok in &tokens {
+            last = engine.forward_token(tok, pos, &mut state);
+            pos += 1;
+        }
+        last
+    };
+    let prefill_secs = prefill_t.elapsed().as_secs_f64();
+
+    let mut generated: Vec<usize> = Vec::with_capacity(max_new);
+    let mut stdout = io::stdout().lock();
+    let decode_t = Instant::now();
+    for _ in 0..max_new {
+        let next = sampler.sample(&logits, &sampling, &generated);
+        if !args.ignore_eos && Some(next) == eos_id {
+            break;
+        }
+        generated.push(next);
+        let piece = tokenizer.decode(&[next]);
+        stdout.write_all(piece.as_bytes())?;
+        stdout.flush()?;
+        logits = engine.forward_token(next, pos, &mut state);
+        pos += 1;
+    }
+    let decode_secs = decode_t.elapsed().as_secs_f64();
+    writeln!(stdout)?;
+
+    let prompt_n = tokens.len();
+    let gen_n = generated.len();
+    let prompt_tps = if prefill_secs > 0.0 {
+        prompt_n as f64 / prefill_secs
+    } else {
+        0.0
+    };
+    let pred_tps = if decode_secs > 0.0 {
+        gen_n as f64 / decode_secs
+    } else {
+        0.0
+    };
+    eprintln!(
+        "ferrox: prompt {prompt_n} tokens, {prompt_tps:.2} t/s; \
+         predict {gen_n} tokens, {pred_tps:.2} t/s"
+    );
     Ok(())
 }
 

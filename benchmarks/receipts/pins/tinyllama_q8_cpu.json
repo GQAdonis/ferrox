@@ -4,29 +4,85 @@
   "name": "TinyLlama-1.1B-Chat-v1.0 Q8_0",
   "backend": "cpu",
   "expect": "ok",
-  "date": "2026-08-04",
+  "date": "2026-08-05",
   "host": "Host B (Apple M2 Pro, 10 logical cores)",
   "model": "~/Desktop/Dev/ferrox/models/tinyllama-1.1b-chat-v1.0.Q8_0.gguf",
-  "max_tokens": 256,
-  "workload": "greedy chat, warm then 256-tok capitals list",
+  "max_tokens": 512,
+  "reps": 3,
+  "mode": "server",
+  "workload": "greedy chat, warm then 3x 512-tok capitals list (median)",
   "notes": "Verified smoke",
   "ferrox": {
-    "wall_s": 6.62,
-    "predicted_per_second": 44.5554055823311,
-    "prompt_per_second": 64.11648749396291,
-    "completion_tokens": 256,
-    "wall_tok_s": 38.668,
+    "wall_s": 15.797,
+    "predicted_per_second": 34.315,
+    "prompt_per_second": 63.382,
+    "completion_tokens": 512,
+    "wall_tok_s": 32.411,
     "prefix": "1. Paris, France - The city of love was founded in 5th centu",
+    "predicted_stddev": 1.396,
+    "prompt_stddev": 0.31,
+    "wall_tok_s_stddev": 1.221,
+    "reps": 3,
+    "runs": [
+      {
+        "predicted_per_second": 33.53974606891207,
+        "prompt_per_second": 63.38246464694482,
+        "wall_tok_s": 31.702,
+        "wall_s": 16.15,
+        "completion_tokens": 512
+      },
+      {
+        "predicted_per_second": 36.25088070001257,
+        "prompt_per_second": 63.44083622697376,
+        "wall_tok_s": 34.08,
+        "wall_s": 15.024,
+        "completion_tokens": 512
+      },
+      {
+        "predicted_per_second": 34.31470398721362,
+        "prompt_per_second": 62.87791951826368,
+        "wall_tok_s": 32.411,
+        "wall_s": 15.797,
+        "completion_tokens": 512
+      }
+    ],
     "metal_fails": 0,
     "engine": "ferrox"
   },
   "llama": {
-    "wall_s": 6.878,
-    "predicted_per_second": 38.15797161762374,
-    "prompt_per_second": 293.4166876250015,
-    "completion_tokens": 256,
-    "wall_tok_s": 37.222,
+    "wall_s": 17.698,
+    "predicted_per_second": 29.149,
+    "prompt_per_second": 207.243,
+    "completion_tokens": 512,
+    "wall_tok_s": 28.931,
     "prefix": "1. Paris, France - The city of love was founded in 5th centu",
+    "predicted_stddev": 8.012,
+    "prompt_stddev": 136.8,
+    "wall_tok_s_stddev": 8.067,
+    "reps": 3,
+    "runs": [
+      {
+        "predicted_per_second": 23.00994946619614,
+        "prompt_per_second": 207.24336715488693,
+        "wall_tok_s": 22.766,
+        "wall_s": 22.489,
+        "completion_tokens": 512
+      },
+      {
+        "predicted_per_second": 38.89725965007205,
+        "prompt_per_second": 390.7057985337041,
+        "wall_tok_s": 38.761,
+        "wall_s": 13.209,
+        "completion_tokens": 512
+      },
+      {
+        "predicted_per_second": 29.148878923868935,
+        "prompt_per_second": 123.19443161169114,
+        "wall_tok_s": 28.931,
+        "wall_s": 17.698,
+        "completion_tokens": 512
+      }
+    ],
     "engine": "llama"
   },
   "status": "ok"

@@ -29,7 +29,7 @@ Keep off (regressions): legacy GQA NSG=4, sequential GREEDY argmax, float4 elem,
 | Qwen1.5-MoE-A2.7B Q4_K_M | cpu | — | — | — | — | no pin | — |
 | Qwen1.5-MoE-A2.7B Q4_K_M | metal | — | — | — | — | no pin | — |
 | Mistral-7B-Instruct-v0.2 Q4_K_M | cpu | — | — | — | — | no pin | — |
-| Mistral-7B-Instruct-v0.2 Q4_K_M | metal | — | — | — | — | no pin | — |
+| Mistral-7B-Instruct-v0.2 Q4_K_M | metal | **30.72** ±0.2 | **32.05** ±0.2 | ~1.04× | llama | ok | [`mistral_7b_q4km_metal`](receipts/pins/mistral_7b_q4km_metal.json) |
 | Mixtral-8x7B-Instruct Q4_K_M | cpu | — | — | — | — | no pin | — |
 | Llama-3.2-1B-Instruct IQ4_XS | metal | **148.43** ±0.3 | **138.25** ±0.8 | ~0.93× | ferrox | ok | [`iq4_xs_metal`](receipts/pins/iq4_xs_metal.json) |
 | Gemma-2-2B-IT Q4_K_M | metal | **36.72** ±1.3 | **53.37** ±4.4 | ~1.45× | llama | ok | [`gemma2_2b_q4km_metal`](receipts/pins/gemma2_2b_q4km_metal.json) |

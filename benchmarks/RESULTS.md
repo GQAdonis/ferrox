@@ -30,7 +30,7 @@ Keep off (regressions): legacy GQA NSG=4, sequential GREEDY argmax, float4 elem,
 | Llama-3.2-3B-Instruct Q4_K_M | metal | **55.58** ±2.3 | **57.65** ±2.0 | ⚪ **~1.04×** | ⚪ parity | ok | [`llama32_3b_q4km_metal`](receipts/pins/llama32_3b_q4km_metal.json) |
 | Qwen1.5-MoE-A2.7B Q4_K_M | cpu | — | — | — | — | no pin | — |
 | Qwen1.5-MoE-A2.7B Q4_K_M | metal | — | — | — | — | no pin | — |
-| Mistral-7B-Instruct-v0.2 Q4_K_M | cpu | **3.29** ±0.2 | **4.40** ±0.6 (−ngl 0) | 🔴 **~1.34×** | 🔴 **llama** | ok | [`mistral_7b_q4km_cpu`](receipts/pins/mistral_7b_q4km_cpu.json) |
+| Mistral-7B-Instruct-v0.2 Q4_K_M | cpu | **8.58** ±0.0 | **7.24** ±0.9 (−ngl 0) | 🟢 **~0.84×** | 🟢 **ferrox** | ok | [`mistral_7b_q4km_cpu`](receipts/pins/mistral_7b_q4km_cpu.json) |
 | Mistral-7B-Instruct-v0.2 Q4_K_M | metal | **31.36** ±0.1 | **33.26** ±0.2 | 🔴 **~1.06×** | 🔴 **llama** | ok | [`mistral_7b_q4km_metal`](receipts/pins/mistral_7b_q4km_metal.json) |
 | Mixtral-8x7B-Instruct Q4_K_M | cpu | — | — | — | — | no pin | — |
 | Llama-3.2-1B-Instruct IQ4_XS | metal | **154.36** ±0.2 | **152.26** ±0.4 | ⚪ **1.00×** | ⚪ parity | ok | [`iq4_xs_metal`](receipts/pins/iq4_xs_metal.json) |

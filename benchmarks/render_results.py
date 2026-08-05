@@ -96,17 +96,25 @@ def gap_ratio(fp, lp) -> float | None:
     return None
 
 
+# Near-parity band: tok/s jitter of a few percent is not a meaningful win/loss.
+# ~1.03–1.04× is treated as parity (⚪), not 🔴 llama.
+PARITY_BAND = 0.05
+
+
 def color_gap(g: float | None, *, lower_is_better: bool = False) -> str:
     """Gap cell for GitHub markdown (no inline CSS — GH strips it).
 
     Convention: gap < 1 → ferrox better. Uses emoji + bold text so the
-    signal survives GitHub Flavored Markdown.
+    signal survives GitHub Flavored Markdown. Within ``PARITY_BAND`` of
+    1.0 → ⚪ near-parity (not a loss).
     """
     del lower_is_better  # ratios are pre-normalized to "<1 = ferrox better"
     if g is None:
         return "—"
-    if abs(g - 1.0) < 0.015:
-        return "⚪ **1.00×**"
+    if abs(g - 1.0) < PARITY_BAND:
+        if abs(g - 1.0) < 0.015:
+            return "⚪ **1.00×**"
+        return f"⚪ **~{g:.2f}×**"
     if g < 1.0:
         return f"🟢 **~{g:.2f}×**"
     return f"🔴 **~{g:.2f}×**"
@@ -117,12 +125,12 @@ def gap_str(fp, lp) -> str:
 
 
 def winner_str(fp, lp) -> str:
-    """Who is faster on predicted tok/s (same 1.5% tie band as gap_str)."""
+    """Who is faster on predicted tok/s (same near-parity band as gap_str)."""
     g = gap_ratio(fp, lp)
     if g is None:
         return "—"
-    if abs(g - 1.0) < 0.015:
-        return "⚪ tie"
+    if abs(g - 1.0) < PARITY_BAND:
+        return "⚪ parity"
     if g < 1.0:
         return "🟢 **ferrox**"
     return "🔴 **llama**"
@@ -193,7 +201,8 @@ def main() -> None:
         "do not hand-edit headlines.\n",
         "\n",
         "**Gap** = `llama_pred / ferrox_pred` (&lt;1 ferrox faster; &gt;1 ferrox slower). "
-        "**Winner** = faster engine on predicted tok/s (tie within ~1.5%).\n",
+        "**Winner** = faster engine on predicted tok/s "
+        f"(near-parity within ~{PARITY_BAND * 100:.0f}%).\n",
         "\n",
         "**North star:** ≥ llama.cpp same host/GGUF/backend.\n",
         north,
@@ -201,8 +210,9 @@ def main() -> None:
         "One pin per `(model_id, backend)`. Re-run overwrites the pin. "
         "Gap only when both engines succeed.\n",
         "\n",
-        "**Gap colors (GitHub-safe):** 🟢 ferrox better (&lt;1.00×); "
-        "🔴 ferrox slower (&gt;1.00×); ⚪ tie.\n",
+        "**Gap colors (GitHub-safe):** 🟢 ferrox better; "
+        f"⚪ near-parity (within ~{PARITY_BAND * 100:.0f}%); "
+        "🔴 ferrox meaningfully slower.\n",
         "\n",
         "Keep off (regressions): legacy GQA NSG=4, sequential GREEDY argmax, "
         "float4 elem, early Multi-CB. `FERROX_METAL_FA_VEC=0` → ~25.5 pred.\n",

@@ -723,6 +723,99 @@ impl Decoder {
         }
     }
 
+    /// Contiguous Q4_0 expert planes for llama-style `mul_mv_id` MoE.
+    #[cfg(feature = "metal")]
+    fn packed_q4_moe_experts(
+        experts: &[ExpertWeights],
+    ) -> Option<ferrox_metal::gpu::MoePackedQ4<'_>> {
+        if experts.is_empty() {
+            return None;
+        }
+        let gate0 = match &experts[0].gate {
+            WeightMatrix::Quantized {
+                data,
+                rows,
+                kind: ferrox_core::QuantKind::Q4_0,
+                ..
+            } => (data.as_slice(), *rows),
+            _ => return None,
+        };
+        let up0 = match &experts[0].up {
+            WeightMatrix::Quantized {
+                data,
+                kind: ferrox_core::QuantKind::Q4_0,
+                ..
+            } => data.as_slice(),
+            _ => return None,
+        };
+        let down0 = match &experts[0].down {
+            WeightMatrix::Quantized {
+                data,
+                rows,
+                kind: ferrox_core::QuantKind::Q4_0,
+                ..
+            } => (data.as_slice(), *rows),
+            _ => return None,
+        };
+        let gate_stride = gate0.0.len();
+        let up_stride = up0.len();
+        let down_stride = down0.0.len();
+        if gate_stride == 0 || up_stride != gate_stride || down_stride == 0 {
+            return None;
+        }
+        for (i, ex) in experts.iter().enumerate() {
+            let (WeightMatrix::Quantized {
+                data: gd,
+                kind: ferrox_core::QuantKind::Q4_0,
+                ..
+            },
+            WeightMatrix::Quantized {
+                data: ud,
+                kind: ferrox_core::QuantKind::Q4_0,
+                ..
+            },
+            WeightMatrix::Quantized {
+                data: dd,
+                kind: ferrox_core::QuantKind::Q4_0,
+                ..
+            }) = (&ex.gate, &ex.up, &ex.down)
+            else {
+                return None;
+            };
+            let g = gd.as_slice();
+            let u = ud.as_slice();
+            let d = dd.as_slice();
+            if g.len() != gate_stride
+                || u.len() != up_stride
+                || d.len() != down_stride
+                || g.as_ptr() != unsafe { gate0.0.as_ptr().add(i * gate_stride) }
+                || u.as_ptr() != unsafe { up0.as_ptr().add(i * up_stride) }
+                || d.as_ptr() != unsafe { down0.0.as_ptr().add(i * down_stride) }
+            {
+                return None;
+            }
+        }
+        let n = experts.len();
+        let gate = unsafe { std::slice::from_raw_parts(gate0.0.as_ptr(), n * gate_stride) };
+        let up = unsafe { std::slice::from_raw_parts(up0.as_ptr(), n * up_stride) };
+        let down = unsafe { std::slice::from_raw_parts(down0.0.as_ptr(), n * down_stride) };
+        let gate_row_bytes = gate_stride / gate0.1;
+        let down_row_bytes = down_stride / down0.1;
+        Some(ferrox_metal::gpu::MoePackedQ4 {
+            gate,
+            up,
+            down,
+            gate_stride,
+            up_stride,
+            down_stride,
+            n_experts: n,
+            ffn_rows: gate0.1,
+            hidden_rows: down0.1,
+            gate_row_bytes,
+            down_row_bytes,
+        })
+    }
+
     /// Phase-2 of resident MoE decode: experts on GPU `x2`, add into GPU `h`.
     #[cfg(feature = "metal")]
     fn try_metal_moe_experts_resident(
@@ -1021,8 +1114,112 @@ impl Decoder {
         let mut metal_stack_done = false;
         #[cfg(feature = "metal")]
         let mut final_norm_done_in_stack = false;
+        // OLMoE: all MoE layers in one CB (llama graph style).
         #[cfg(feature = "metal")]
-        if use_metal_attn && self.layers.iter().all(Self::layer_supports_metal_dense_ffn) {
+        if use_metal_attn
+            && ferrox_metal::attn::metal_moe_resident_enabled()
+            && matches!(
+                self.config.moe.gating,
+                ferrox_moe::GatingFunction::Softmax
+            )
+            && self
+                .layers
+                .iter()
+                .all(|l| Self::layer_supports_metal_moe_resident(l, &self.config))
+            && !self.layers.iter().all(Self::layer_supports_metal_dense_ffn)
+        {
+            if let Some(guard) = metal_kv_guard.as_mut() {
+                if let Some(metal_kvs) = guard.as_mut() {
+                    if metal_kvs.iter().all(|m| m.seq_len == pos) {
+                        let mut moe_layers = Vec::with_capacity(self.layers.len());
+                        let mut ok = true;
+                        for layer in &self.layers {
+                            let ExpertBacking::Resident(experts) = &layer.moe.experts else {
+                                ok = false;
+                                break;
+                            };
+                            let Some(packed) = Self::packed_q4_moe_experts(experts) else {
+                                ok = false;
+                                break;
+                            };
+                            let (Some(q), Some(k), Some(v), Some(o), Some(r)) = (
+                                Self::metal_matvec_launch(&layer.attn.q_proj),
+                                Self::metal_matvec_launch(&layer.attn.k_proj),
+                                Self::metal_matvec_launch(&layer.attn.v_proj),
+                                Self::metal_matvec_launch(&layer.attn.o_proj),
+                                Self::metal_matvec_launch(&layer.moe.router),
+                            ) else {
+                                ok = false;
+                                break;
+                            };
+                            moe_layers.push(ferrox_metal::attn::MoeLayerMetal {
+                                attn_norm_w: &layer.attn.norm_weight,
+                                ffn_norm_w: &layer.moe.norm_weight,
+                                q,
+                                k,
+                                v,
+                                o,
+                                router: r,
+                                packed,
+                                extras: self.metal_attn_extras(layer),
+                            });
+                        }
+                        if ok {
+                            if hidden.is_empty() {
+                                // GPU embd path left empty host hidden — seed from embd row.
+                                hidden = self.embedding.dequant_row(token_id);
+                                if let Some(scale) = self.config.embedding_scale {
+                                    for v in hidden.iter_mut() {
+                                        *v *= scale;
+                                    }
+                                }
+                            }
+                            match ferrox_metal::attn::moe_decode_seed(&hidden)
+                                .and_then(|_| {
+                                    ferrox_metal::attn::launch_moe_decode_stack(
+                                        &hidden,
+                                        &moe_layers,
+                                        metal_kvs,
+                                        self.config.moe.n_experts_active,
+                                        self.config.moe.norm_topk_prob,
+                                        n_heads,
+                                        self.metal_rope_layout(),
+                                        self.config.rope_theta,
+                                        self.config.rope_freqs.as_deref(),
+                                        pos,
+                                        self.config.rms_norm_eps,
+                                        Some(&self.final_norm),
+                                        true,
+                                    )
+                                }) {
+                                Ok((out, per_layer_ids)) => {
+                                    for (layer, ids) in
+                                        self.layers.iter().zip(per_layer_ids.iter())
+                                    {
+                                        if !ids.is_empty() {
+                                            layer.moe.record_activations(ids);
+                                        }
+                                    }
+                                    hidden = out;
+                                    final_norm_done_in_stack = true;
+                                    metal_stack_done = true;
+                                }
+                                Err(e) => {
+                                    eprintln!(
+                                        "ferrox: Metal MoE stack failed, per-layer fallback: {e}"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        #[cfg(feature = "metal")]
+        if !metal_stack_done
+            && use_metal_attn
+            && self.layers.iter().all(Self::layer_supports_metal_dense_ffn)
+        {
             if let Some(guard) = metal_kv_guard.as_mut() {
                 let mut clear_metal_after_stack = false;
                 if let Some(metal_kvs) = guard.as_mut() {
@@ -1328,6 +1525,56 @@ impl Decoder {
                                                 }
                                             };
                                             if seed_ok {
+                                                // Prefer one-CB fused path (GPU top-k + packed experts).
+                                                let fused_ok = matches!(
+                                                    self.config.moe.gating,
+                                                    ferrox_moe::GatingFunction::Softmax
+                                                ) && match &layer.moe.experts {
+                                                    ExpertBacking::Resident(experts) => {
+                                                        if let Some(packed) =
+                                                            Self::packed_q4_moe_experts(experts)
+                                                        {
+                                                            match ferrox_metal::attn::launch_moe_decode_layer_fused(
+                                                                &layer.attn.norm_weight,
+                                                                &q_l,
+                                                                &k_l,
+                                                                &v_l,
+                                                                &o_l,
+                                                                &mut metal_kvs[l],
+                                                                &layer.moe.norm_weight,
+                                                                &router_l,
+                                                                &packed,
+                                                                self.config.moe.n_experts_active,
+                                                                self.config.moe.norm_topk_prob,
+                                                                n_heads,
+                                                                self.metal_rope_layout(),
+                                                                self.config.rope_theta,
+                                                                self.config.rope_freqs.as_deref(),
+                                                                pos,
+                                                                self.config.rms_norm_eps,
+                                                                &self.metal_attn_extras(layer),
+                                                            ) {
+                                                                Ok(ids) => {
+                                                                    layer.moe.record_activations(&ids);
+                                                                    did_metal_moe = true;
+                                                                    did_metal_attn = true;
+                                                                    true
+                                                                }
+                                                                Err(e) => {
+                                                                    eprintln!(
+                                                                        "ferrox: Metal MoE fused layer failed: {e}"
+                                                                    );
+                                                                    false
+                                                                }
+                                                            }
+                                                        } else {
+                                                            false
+                                                        }
+                                                    }
+                                                    _ => false,
+                                                };
+
+                                                if !fused_ok {
                                                 match ferrox_metal::attn::launch_moe_decode_pre(
                                                     &layer.attn.norm_weight,
                                                     &q_l,
@@ -1407,6 +1654,7 @@ impl Decoder {
                                                             clear_metal_kv = true;
                                                         }
                                                     }
+                                                }
                                                 }
                                             }
                                         }

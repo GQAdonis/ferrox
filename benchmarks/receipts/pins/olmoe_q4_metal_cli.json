@@ -1,0 +1,90 @@
+{
+  "schema": 1,
+  "id": "olmoe_q4",
+  "name": "OLMoE-1B-7B-0924 Q4_0",
+  "backend": "metal",
+  "expect": "ok",
+  "date": "2026-08-05",
+  "host": "Host B (Apple M2 Pro, 10 logical cores)",
+  "model": "~/Desktop/Dev/ferrox/models/olmoe-1b-7b-0924-q4_0.gguf",
+  "max_tokens": 512,
+  "reps": 3,
+  "mode": "cli",
+  "workload": "greedy chat, warm then 3x 512-tok capitals list (median)",
+  "notes": "Verified MoE; Metal/CUDA expert placement when budget set",
+  "ferrox": {
+    "wall_s": 137.431,
+    "engine": "ferrox",
+    "load_s": 0.14,
+    "prompt_per_second": 5.74,
+    "completion_tokens": 512,
+    "predicted_per_second": 3.86,
+    "prefix": "-c9a6-4e4d-a9a6-f0e9c9a6f0e9\n\nThe first thing that comes to ",
+    "predicted_stddev": 0.278,
+    "prompt_stddev": 0.678,
+    "load_stddev": 0.038,
+    "reps": 3,
+    "runs": [
+      {
+        "predicted_per_second": 4.32,
+        "prompt_per_second": 5.39,
+        "wall_s": 124.151,
+        "load_s": 0.08,
+        "completion_tokens": 512
+      },
+      {
+        "predicted_per_second": 3.86,
+        "prompt_per_second": 6.7,
+        "wall_s": 137.431,
+        "load_s": 0.14,
+        "completion_tokens": 512
+      },
+      {
+        "predicted_per_second": 3.82,
+        "prompt_per_second": 5.74,
+        "wall_s": 139.924,
+        "load_s": 0.15,
+        "completion_tokens": 512
+      }
+    ],
+    "mode": "cli"
+  },
+  "llama": {
+    "wall_s": 5.164,
+    "engine": "llama",
+    "load_s": 0.499,
+    "prompt_per_second": 270.75,
+    "predicted_per_second": 126.33,
+    "completion_tokens": 511,
+    "prefix": "-a9c0-4e9a-a9a6-c9c9c9c9c9c\n\nThe first thing that comes to m",
+    "predicted_stddev": 5.688,
+    "prompt_stddev": 169.58,
+    "load_stddev": 1.229,
+    "reps": 3,
+    "runs": [
+      {
+        "predicted_per_second": 126.33,
+        "prompt_per_second": 270.75,
+        "wall_s": 7.267,
+        "load_s": 2.61,
+        "completion_tokens": 511
+      },
+      {
+        "predicted_per_second": 134.67,
+        "prompt_per_second": 75.48,
+        "wall_s": 5.164,
+        "load_s": 0.499,
+        "completion_tokens": 511
+      },
+      {
+        "predicted_per_second": 123.8,
+        "prompt_per_second": 413.27,
+        "wall_s": 5.144,
+        "load_s": 0.464,
+        "completion_tokens": 511
+      }
+    ],
+    "mode": "cli"
+  },
+  "status": "ok"
+}

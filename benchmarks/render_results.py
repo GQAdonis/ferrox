@@ -230,7 +230,9 @@ def main() -> None:
             "strictly sequential (llama exits before ferrox starts). Engines' own "
             "stderr timings; **pred** tok/s excludes model load. "
             "**load** = engine-reported startup (`ferrox: loaded in …s` vs "
-            "`common_perf_print: load time = … ms`).\n\n"
+            "`common_perf_print: load time = … ms`). "
+            "**Load gap** = `ferrox_load / llama_load` (same as pred Gap: "
+            "&lt;1 ferrox better; &gt;1 ferrox slower).\n\n"
             "| Model | Backend | ferrox pred | llama pred | Gap | "
             "ferrox load (s) | llama load (s) | Load gap | Pin |\n"
             "|---|---|---|---|---|---|---|---|---|\n"
@@ -252,10 +254,12 @@ def main() -> None:
                 ferr = (pin.get("ferrox") or {}).get("error")
                 fcell = "error" if ferr else fmt_num(fp, fsd)
                 lcell = fmt_num(lp, lsd) if lp is not None else "—"
-                # Load gap = llama_load / ferrox_load (<1 ferrox faster to load).
+                # Same convention as pred Gap: ratio with ferrox in the
+                # denominator of "advantage" inverted for lower-is-better —
+                # Gap = ferrox_load / llama_load (<1 ferrox faster to load).
                 load_gap = "—"
-                if fl and ll and fl > 0:
-                    lg = ll / fl
+                if fl and ll and ll > 0:
+                    lg = fl / ll
                     load_gap = f"~{lg:.2f}×" if abs(lg - 1.0) >= 0.015 else "**1.00×**"
                 lines.append(
                     f"| {entry['name']} | {backend} | {fcell} | {lcell} | "

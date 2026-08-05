@@ -48,18 +48,19 @@ Keep off (regressions): legacy GQA NSG=4, sequential GREEDY argmax, float4 elem,
 
 ## CLI completion (llama-cli / `llama-completion` vs `ferrox run`)
 
-One-shot `-p … -n N --no-cnv --ignore-eos`, fresh process per rep, strictly sequential (llama exits before ferrox starts). Engines' own stderr timings; **pred** tok/s excludes model load. **load** = engine-reported startup (`ferrox: loaded in …s` vs `common_perf_print: load time = … ms`).
+One-shot `-p … -n N --no-cnv --ignore-eos`, fresh process per rep, strictly sequential (llama exits before ferrox starts). Engines' own stderr timings; **pred** tok/s excludes model load. **load** = engine-reported startup (`ferrox: loaded in …s` vs `common_perf_print: load time = … ms`). **Load gap** = `ferrox_load / llama_load` (same as pred Gap: &lt;1 ferrox better; &gt;1 ferrox slower).
 
 | Model | Backend | ferrox pred | llama pred | Gap | ferrox load (s) | llama load (s) | Load gap | Pin |
 |---|---|---|---|---|---|---|---|---|
-| TinyLlama-1.1B-Chat-v1.0 Q8_0 | metal | **100.67** | **90.44** | ~0.90× | **0.060** | **0.921** | ~15.35× | [`tinyllama_q8_metal_cli`](receipts/pins/tinyllama_q8_metal_cli.json) |
+| TinyLlama-1.1B-Chat-v1.0 Q8_0 | metal | **100.67** | **90.44** | ~0.90× | **0.060** | **0.921** | ~0.07× | [`tinyllama_q8_metal_cli`](receipts/pins/tinyllama_q8_metal_cli.json) |
 | TinyLlama-1.1B-Chat-v1.0 Q8_0 | cpu | **33.87** ±1.8 | **19.60** ±4.1 | ~0.58× | — | — | — | [`tinyllama_q8_cpu_cli`](receipts/pins/tinyllama_q8_cpu_cli.json) |
 | Llama-3.2-1B-Instruct Q4_K_M | metal | **143.96** ±1.8 | **140.20** ±1.2 | ~0.97× | — | — | — | [`llama32_1b_q4km_metal_cli`](receipts/pins/llama32_1b_q4km_metal_cli.json) |
 | OLMoE-1B-7B-0924 Q4_0 | cpu | **13.99** ±0.3 | **15.30** ±7.8 | ~1.09× | — | — | — | [`olmoe_q4_cpu_cli`](receipts/pins/olmoe_q4_cpu_cli.json) |
+| OLMoE-1B-7B-0924 Q4_0 | metal | **3.86** ±0.3 | **126.33** ±5.7 | ~32.73× | **0.140** ±0.038 | **0.499** ±1.229 | ~0.28× | [`olmoe_q4_metal_cli`](receipts/pins/olmoe_q4_metal_cli.json) |
 | Llama-3.1-8B-Instruct Q4_K_M | metal | **28.64** ±0.2 | **28.60** ±0.6 | **1.00×** | — | — | — | [`llama31_8b_q4km_metal_cli`](receipts/pins/llama31_8b_q4km_metal_cli.json) |
 | Llama-3.2-3B-Instruct Q4_K_M | metal | **57.97** ±0.2 | **61.90** ±0.8 | ~1.07× | — | — | — | [`llama32_3b_q4km_metal_cli`](receipts/pins/llama32_3b_q4km_metal_cli.json) |
 | Llama-3.2-1B-Instruct IQ4_XS | metal | **146.54** ±2.7 | **135.20** ±3.6 | ~0.92× | — | — | — | [`iq4_xs_metal_cli`](receipts/pins/iq4_xs_metal_cli.json) |
-| Gemma-2-2B-IT Q4_K_M | metal | **35.71** ±0.1 | **57.86** ±0.5 | ~1.62× | **0.100** ±0.010 | **0.661** ±0.617 | ~6.61× | [`gemma2_2b_q4km_metal_cli`](receipts/pins/gemma2_2b_q4km_metal_cli.json) |
+| Gemma-2-2B-IT Q4_K_M | metal | **35.71** ±0.1 | **57.86** ±0.5 | ~1.62× | **0.100** ±0.010 | **0.661** ±0.617 | ~0.15× | [`gemma2_2b_q4km_metal_cli`](receipts/pins/gemma2_2b_q4km_metal_cli.json) |
 | SmolLM2-135M-Instruct Q8_0 | metal | **281.65** ±8.9 | **225.70** ±8.2 | ~0.80× | — | — | — | [`smollm2_135m_q8_metal_cli`](receipts/pins/smollm2_135m_q8_metal_cli.json) |
 | SmolLM2-135M-Instruct Q8_0 | cpu | **56.50** ±0.1 | **61.90** ±11.9 | ~1.10× | — | — | — | [`smollm2_135m_q8_cpu_cli`](receipts/pins/smollm2_135m_q8_cpu_cli.json) |
 | Qwen2.5-0.5B-Instruct Q8_0 | metal | **200.61** ±4.1 | **129.40** ±0.6 | ~0.65× | — | — | — | [`qwen25_05b_q8_metal_cli`](receipts/pins/qwen25_05b_q8_metal_cli.json) |

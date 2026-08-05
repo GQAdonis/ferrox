@@ -70,7 +70,8 @@ python3 benchmarks/run_suite.py --id tinyllama_q8 --backend metal --mode cli
 Pins record **predicted** tok/s (decode, excludes load) and **load_s**
 (engine-reported: `ferrox: loaded in …s` vs llama
 `common_perf_print: load time = … ms`). Load gap in RESULTS =
-`llama_load / ferrox_load`. Default llama binary is `llama-completion`
+`ferrox_load / llama_load` (same convention as pred Gap: &lt;1 ferrox better).
+Default llama binary is `llama-completion`
 when on `PATH` (Homebrew llama.cpp ≥b76xx).
 
 ## Regenerate ledger only

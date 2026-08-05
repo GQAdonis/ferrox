@@ -587,11 +587,11 @@ def run_one(
         )
         fl = (pin.get("ferrox") or {}).get("load_s")
         ll = (pin.get("llama") or {}).get("load_s")
-        if isinstance(fl, (int, float)) and isinstance(ll, (int, float)) and fl > 0:
+        if isinstance(fl, (int, float)) and isinstance(ll, (int, float)) and ll > 0:
             print(
                 f"summary load/startup (s, median): "
-                f"ferrox={fl:.3f} llama={ll:.3f} gap={ll/fl:.2f}x "
-                f"(<1 = ferrox loads faster)"
+                f"ferrox={fl:.3f} llama={ll:.3f} gap={fl/ll:.2f}x "
+                f"(same as pred: <1 ferrox better)"
             )
     return pin
 

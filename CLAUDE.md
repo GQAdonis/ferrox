@@ -10,14 +10,16 @@ Metal + CUDA kernels, OpenAI-compatible `ferrox-server`.
 **Works today (evidence in docs):**
 
 - Dense GQA: TinyLlama, Llama-3.1-8B Q4_K_M (Metal fair-chat Gap
-  ~1.03×; CLI pin **1.00×** — see `benchmarks/RESULTS.md`).
-- MoE GQA: OLMoE-1B-7B-0924 matches llama.cpp on CPU (+ CUDA historically).
-- Metal dense stack (`FERROX_METAL` / `FERROX_METAL_ATTN`); CUDA matvec
-  + resident weights + FFN fuse (fair-chat still ≪ llama).
+  **~0.97×**; CLI pin **~1.00×** — see `benchmarks/RESULTS.md`).
+- Phi-4-mini Q4_K_M Metal pin (~1.06×); Gemma-4-E2B fail-closed until
+  dedicated engine (per-layer emb / shared KV / SWA split).
+- MoE GQA: OLMoE-1B-7B-0924 (CPU + Metal expert placement).
+- Metal dense stack (`FERROX_METAL` / `FERROX_METAL_ATTN`); FA-vec
+  decode d=64/96/128/256 + prefill d=128; CUDA matvec + resident weights
+  + FFN fuse (CUDA fair-chat pins need a GPU host).
 
-**Not e2e yet:** real GLM-5.2 / DeepSeek V4 checkpoints; full Kimi K3
-(~1.56 TB). Dedicated primitives / synthetic decoders exist — see
-`docs/MODELS.md`.
+**Not e2e yet:** Gemma-4-E2B, real GLM-5.2 / DeepSeek V4 checkpoints;
+full Kimi K3 (~1.56 TB). See `docs/MODELS.md`.
 
 **Discipline:** evidence-first. Presets list `best_effort_fields`.
 Authoritative docs:
@@ -27,6 +29,8 @@ Authoritative docs:
 | `docs/CLI.md` | `ferrox` llama.cpp-style flags + `ferrox chat` |
 | `docs/MODELS.md` | what runs / what doesn’t |
 | `docs/API.md` | OpenAI compatibility matrix |
+| `docs/AGENTS_COOKBOOK.md` | point IDEs at `ferrox-server` |
+| `docs/CONFIG.md` | env vars (`FERROX_CTK`, Metal, CB, …) |
 | `benchmarks/RESULTS.md` | tok/s vs llama.cpp (Gap = llama/ferrox) |
 | `docs/ROADMAP.md` | future work only |
 

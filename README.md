@@ -21,9 +21,9 @@ and an OpenAI-compatible HTTP server.
   Every claim has a pinned receipt in
   [benchmarks/RESULTS.md](benchmarks/RESULTS.md).
 - **Broad architecture support** — Llama 3.x, TinyLlama, SmolLM2,
-  Qwen2.5/Qwen3 (QKV bias, per-head QK-norm), Gemma-3 (GeGLU, sliding-window
-  attention, sandwich norms), Phi-3 (fused QKV/FFN), OLMoE (MoE). See
-  [docs/MODELS.md](docs/MODELS.md).
+  Qwen2.5/Qwen3 (QKV bias, per-head QK-norm), Gemma-2/3 (softcap / GeGLU /
+  SWA), Phi-3/Phi-4 (fused QKV/FFN), OLMoE (MoE). Gemma-4-E2B is fail-closed
+  until a dedicated engine. See [docs/MODELS.md](docs/MODELS.md).
 
 ## Quick start
 
@@ -92,15 +92,16 @@ curl -s -X POST http://127.0.0.1:8383/v1/chat/completions \
 
 | Area | State |
 |---|---|
-| Dense GQA (CPU / Metal) | Verified — TinyLlama, Llama 3.1/3.2; Llama-8B Metal fair-chat Gap ~1.03× (CLI 1.00×) |
-| Qwen2.5 / Qwen3 / SmolLM2 | Verified — CPU strong; Metal ahead of llama.cpp |
-| Gemma-3 / Phi-3-mini | Verified — full Metal stack; ~0.7–0.8× llama.cpp decode (legacy attn dims) |
-| MoE (CPU) | Verified — OLMoE matches llama.cpp; CUDA historically, no current pin |
-| Kimi / GLM / DeepSeek | Partial — primitives and synthetic stacks, no frontier checkpoint end-to-end |
-| CUDA performance | Deferred — compiles and runs; fair-chat tuning paused |
+| Dense GQA (CPU / Metal) | Verified — TinyLlama, Llama 3.1/3.2; Llama-8B Metal fair-chat Gap **~0.97×** (CLI **~1.00×**) |
+| Qwen2.5 / Qwen3 / SmolLM2 | Verified — Metal ahead of llama.cpp on Host B pins |
+| Gemma-2 / Gemma-3 / Phi-3 / Phi-4 | Verified Metal pins; Gemma-4-E2B **refuse** (dedicated engine needed) |
+| MoE (CPU / Metal) | Verified — OLMoE; Metal expert placement (still trails llama on Metal MoE) |
+| MLA / hybrid GDN | Partial — dense-lead MLA on CLI+server; hybrid loader scaffold only |
+| Kimi / GLM / DeepSeek | Partial — primitives and synthetic stacks, no frontier checkpoint e2e |
+| CUDA performance | Deferred — suite supports `--backend cuda`; needs GPU host pins |
 
 Benchmark methodology and receipts (decode + CLI load): [benchmarks/RESULTS.md](benchmarks/RESULTS.md)
-(`python3 benchmarks/run_suite.py`, including `--mode cli`).
+(`python3 benchmarks/run_suite.py --skip-missing --fit-host`, including `--mode cli`).
 
 ## Documentation
 
@@ -110,6 +111,7 @@ Benchmark methodology and receipts (decode + CLI load): [benchmarks/RESULTS.md](
 | [docs/MODELS.md](docs/MODELS.md) | Supported models and verification status |
 | [docs/API.md](docs/API.md) | OpenAI-compatible API matrix |
 | [docs/CONFIG.md](docs/CONFIG.md) | Environment variables and tuning |
+| [docs/AGENTS_COOKBOOK.md](docs/AGENTS_COOKBOOK.md) | Point IDEs / agents at `ferrox-server` |
 | [benchmarks/RESULTS.md](benchmarks/RESULTS.md) | Pinned tok/s + CLI load/startup vs llama.cpp |
 | [docs/ROADMAP.md](docs/ROADMAP.md) | Planned work |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | How to contribute |

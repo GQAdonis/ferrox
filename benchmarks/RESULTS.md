@@ -19,10 +19,10 @@ Keep off (regressions): legacy GQA NSG=4, sequential GREEDY argmax, float4 elem,
 
 | Model | Backend | ferrox pred (tok/s) | llama pred (tok/s) | Gap | Winner | Status | Pin |
 |---|---|---|---|---|---|---|---|
-| TinyLlama-1.1B-Chat-v1.0 Q8_0 | metal | **87.53** ±1.8 | **112.11** ±2.4 | 🔴 **~1.28×** | 🔴 **llama** | ok | [`tinyllama_q8_metal`](receipts/pins/tinyllama_q8_metal.json) |
-| TinyLlama-1.1B-Chat-v1.0 Q8_0 | cpu | **34.31** ±1.4 | **29.15** ±8.0 (−ngl 0) | 🟢 **~0.85×** | 🟢 **ferrox** | ok | [`tinyllama_q8_cpu`](receipts/pins/tinyllama_q8_cpu.json) |
+| TinyLlama-1.1B-Chat-v1.0 Q8_0 | metal | **117.90** ±0.8 | **113.68** ±0.9 | ⚪ **~0.96×** | ⚪ parity | ok | [`tinyllama_q8_metal`](receipts/pins/tinyllama_q8_metal.json) |
+| TinyLlama-1.1B-Chat-v1.0 Q8_0 | cpu | **38.60** ±2.3 | **41.99** ±0.9 (−ngl 0) | 🔴 **~1.09×** | 🔴 **llama** | ok | [`tinyllama_q8_cpu`](receipts/pins/tinyllama_q8_cpu.json) |
 | Llama-3.2-1B-Instruct Q4_K_M | metal | **140.79** ±1.9 | **140.84** ±5.2 | ⚪ **1.00×** | ⚪ parity | ok | [`llama32_1b_q4km_metal`](receipts/pins/llama32_1b_q4km_metal.json) |
-| OLMoE-1B-7B-0924 Q4_0 | cpu | **21.48** ±1.3 | **13.88** ±5.3 (−ngl 0) | 🟢 **~0.65×** | 🟢 **ferrox** | ok | [`olmoe_q4_cpu`](receipts/pins/olmoe_q4_cpu.json) |
+| OLMoE-1B-7B-0924 Q4_0 | cpu | **22.20** ±0.7 | **44.34** ±11.0 (−ngl 0) | 🔴 **~2.00×** | 🔴 **llama** | ok | [`olmoe_q4_cpu`](receipts/pins/olmoe_q4_cpu.json) |
 | OLMoE-1B-7B-0924 Q4_0 | metal | **88.39** ±0.6 | **156.75** ±0.8 | 🔴 **~1.77×** | 🔴 **llama** | ok | [`olmoe_q4_metal`](receipts/pins/olmoe_q4_metal.json) |
 | OLMoE-1B-7B-0924 Q4_0 | cuda | — | — | — | — | no pin | — |
 | Llama-3.1-8B-Instruct Q4_K_M | metal | **28.27** ±0.7 | **27.55** ±1.2 | ⚪ **~0.97×** | ⚪ parity | ok | [`llama31_8b_q4km_metal`](receipts/pins/llama31_8b_q4km_metal.json) |
@@ -59,7 +59,7 @@ Pins that used `llama-cli` or rejected options are omitted.
 
 | Model | Backend | ferrox pred | llama pred | Gap | ferrox startup (s) | llama startup (s) | Startup gap | Pin |
 |---|---|---|---|---|---|---|---|---|
-| TinyLlama-1.1B-Chat-v1.0 Q8_0 | metal | **118.35** ±1.1 | **105.08** ±4.7 | 🟢 **~0.89×** | **1.041** ±0.151 | **0.759** ±0.208 | 🔴 **~1.37×** | [`tinyllama_q8_metal_cli`](receipts/pins/tinyllama_q8_metal_cli.json) |
+| TinyLlama-1.1B-Chat-v1.0 Q8_0 | metal | **117.91** ±1.7 | **109.39** ±0.8 | 🟢 **~0.93×** | **0.827** ±0.020 | **0.448** ±0.048 | 🔴 **~1.85×** | [`tinyllama_q8_metal_cli`](receipts/pins/tinyllama_q8_metal_cli.json) |
 | Llama-3.2-1B-Instruct Q4_K_M | metal | **142.16** ±2.0 | **122.83** ±5.8 | 🟢 **~0.86×** | **0.980** ±0.112 | **1.361** ±0.127 | 🟢 **~0.72×** | [`llama32_1b_q4km_metal_cli`](receipts/pins/llama32_1b_q4km_metal_cli.json) |
 | OLMoE-1B-7B-0924 Q4_0 | metal | **88.45** ±0.5 | **153.40** ±8.3 | 🔴 **~1.73×** | **0.623** ±0.008 | **0.965** ±0.998 | 🟢 **~0.65×** | [`olmoe_q4_metal_cli`](receipts/pins/olmoe_q4_metal_cli.json) |
 | Llama-3.1-8B-Instruct Q4_K_M | metal | **28.85** ±0.1 | **28.64** ±0.4 | ⚪ **1.00×** | **2.849** ±0.105 | **1.892** ±1.421 | 🔴 **~1.51×** | [`llama31_8b_q4km_metal_cli`](receipts/pins/llama31_8b_q4km_metal_cli.json) |
@@ -77,11 +77,12 @@ Pins that used `llama-cli` or rejected options are omitted.
 
 ## Open
 
-1. Metal fair-chat 8B pred still trails llama on some pins; FA-vec covers d=64/96/128/256; re-check `prompt_per_second` after FA-vec prefill.
+1. Metal fair-chat 8B is ~parity (~0.97× quiet pin); keep watching `prompt_per_second` vs llama after FA-vec prefill.
 2. CUDA — re-measure on comparable CUDA hardware (no in-tree CUDA pin; skipped on darwin via `--fit-host`).
-3. Gemma-4 / Phi-4 suite entries added — pins land when GGUFs are present.
+3. Gemma-4-E2B: both ferrox and Homebrew llama refuse (`gemma4` arch / per-layer+shared-KV+SWA split); suite `expect=refuse`. Phi-4-mini metal pin landed.
 4. CB multi-request tok/s receipt.
-5. DS4 / GLM / MLA real-checkpoint e2e when feasible.
+5. DS4 / GLM / MLA MoE real-checkpoint e2e when feasible.
 6. Qwen2-MoE / Mixtral: missing GGUF or `--fit-host` RAM skip on Host B.
+7. Suite contention: re-pin outliers alone if full-suite medians disagree with CLI.
 
 Do not invent numbers without a pin.

@@ -45,6 +45,11 @@ physical RAM (e.g. Mixtral on a 32 GiB Host B) and skips `cuda` on
 darwin. `--skip-missing` skips GGUFs not present under `models/`
 instead of writing `status=missing` pins.
 
+**Quiet host:** re-pin outliers alone if a full-suite run looks noisy.
+TinyLlama Metal dropped ~25% under concurrent CPU suite load, then
+recovered to ~118 tok/s on a quiet re-pin — treat contended suite
+medians as suspect when they disagree with CLI pins.
+
 Place GGUFs in `models/` at the paths configured by each suite `gguf` field.
 Each run overwrites `receipts/pins/{id}_{backend}.json` and regenerates
 [`RESULTS.md`](RESULTS.md).

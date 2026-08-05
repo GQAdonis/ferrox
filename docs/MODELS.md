@@ -15,10 +15,10 @@ always prefer the pin / RESULTS Gap for comparisons.
 
 | Model | Why |
 |---|---|
-| SmolLM2-135M-Instruct Q8_0 | Tiny; CPU ~1.3× |
-| TinyLlama-1.1B-Chat Q8_0 | Smallest verified smoke; CPU ~1.2× |
-| OLMoE-1B-7B-0924 Q4_0 | MoE; CPU parity (+ CUDA historically) |
-| Llama-3.1-8B-Instruct Q4_K_M | Mainstream dense model; Metal ~1× decode |
+| SmolLM2-135M-Instruct Q8_0 | Tiny; Metal ~1.2× faster |
+| TinyLlama-1.1B-Chat Q8_0 | Smallest verified smoke; Metal ~parity |
+| Phi-4-mini-Instruct Q4_K_M | New PhiFamily pin; Metal ~1.06× |
+| Llama-3.1-8B-Instruct Q4_K_M | Mainstream dense; Metal fair-chat ~parity |
 
 ```bash
 # CLI (see docs/CLI.md)
@@ -44,47 +44,44 @@ always prefer the pin / RESULTS Gap for comparisons.
 
 ### Verified
 
-| Model | Backend |
+| Model | Backend (Gap = llama/ferrox; Host B pins) |
 |---|---|
-| TinyLlama-1.1B-Chat-v1.0 Q8_0 | CPU (~1.2×), Metal |
-| OLMoE-1B-7B-0924 Q4_0 | CPU (~parity); CUDA historically (no current Host B pin) |
-| Llama-3.1-8B-Instruct Q4_K_M | CPU; Metal fair-chat Gap ~1.03× (CLI pin **1.00×**) |
-| SmolLM2-135M-Instruct Q8_0 | CPU (~1.3×), Metal |
-| Qwen2.5-0.5B-Instruct Q8_0 | CPU (~1.1×); Metal ~1.56× **faster** (bias on GPU) |
-| Qwen3-0.6B Q8_0 | CPU ~0.7×; Metal ~1.1× (per-head QK-norm on GPU) |
-| Gemma-3-1B-IT Q8_0 | CPU (~1.6×); Metal — full Metal stack (GeGLU, SWA, sandwich norms); FA-vec covers d=256 |
-| Phi-3-mini-4k-Instruct Q4 | CPU ~0.6×; Metal — fused QKV/FFN split as quantized slices; FA-vec covers d=96 |
-
-Also Metal-pinned (see RESULTS): Llama-3.2-1B / 3B Q4_K_M,
-Llama-3.2-1B IQ4_XS.
+| TinyLlama-1.1B-Chat-v1.0 Q8_0 | Metal ~0.96× (quiet re-pin); CPU pin exists |
+| Llama-3.2-1B / 3B Q4_K_M | Metal ~1.00× / ~1.14× |
+| Llama-3.2-1B IQ4_XS | Metal ~1.00× |
+| Llama-3.1-8B-Instruct Q4_K_M | Metal fair-chat **~0.97×**; CLI **~1.00×** |
+| Mistral-7B-Instruct-v0.2 Q4_K_M | Metal ~1.06×; CPU pin exists |
+| OLMoE-1B-7B-0924 Q4_0 | Metal ~1.77× (experts); CPU pin exists |
+| SmolLM2-135M / Qwen2.5-0.5B / Qwen3-0.6B | Metal faster than llama on these small Q8 pins |
+| Gemma-2-2B-IT Q4_K_M | Metal ~1.17× (softcap → legacy GQA) |
+| Gemma-3-1B-IT Q8_0 | Metal ~0.87×; GeGLU + SWA + sandwich; FA-vec d=256 |
+| Phi-3-mini-4k-Instruct Q4 | Metal ~1.09×; fused QKV; FA-vec d=96 |
+| Phi-4-mini-Instruct Q4_K_M | Metal ~1.06×; CLI ~1.04× — [`phi4_mini_q4km_metal`](../benchmarks/receipts/pins/phi4_mini_q4km_metal.json) |
 
 ### Partial / not yet
 
 | | |
 |---|---|
-| Qwen2-MoE | Loads (QKV bias + shared_expert_gate); suite entry added; oracle receipt needs real GGUF |
-| Mistral / Mixtral | Profile + SWA / grouped MoE wired; suite entries added; need receipt |
-| Gemma-2 | Attn softcap + SWA wired (CPU + Metal legacy GQA); needs real GGUF pin |
-| Gemma-4 | `gemma4` / `gemma4-assistant` **DedicatedOnly** (E2B: per-layer emb + shared KV + SWA/full head-dim split); suite `expect=refuse` until dedicated engine |
-| Phi-4 | Arch `phi4` PhiFamily; Host B metal pin [`phi4_mini_q4km_metal`](../benchmarks/receipts/pins/phi4_mini_q4km_metal.json) (~1.06× llama) |
-| Llama 4 | DedicatedOnly — MoE / non-generic graph not implemented (was wrongly GenericGqa) (**P6**) |
-| GLM4 / glm4moe | DedicatedOnly — route via `glm52_*` loaders, not generic GQA; no real-checkpoint receipt yet (**P6**) |
-| MiroThinker | No distinct GGUF arch string in the pinned inventory; published GGUFs use `qwen3moe` (already GenericGqa) (**P6**) |
-| MiniMax M2/M3 | DedicatedOnly — 256-expert sigmoid MoE + MTP not implemented (was wrongly generic) |
-| MLA | `mla_gguf_loader` + `load_mla_engine_from_path`; CLI `ferrox run` and **ferrox-server** (`LoadedModel::Mla` / `generate_engine`) for dense-lead deepseek2/mistral4; MoE-after-dense-lead fail-closed |
-| Hybrid GDN | `gdn.rs` + `hybrid_gguf_loader` (hparams / layer detect / GDN weight→`gdn_forward_token`); `try_load` fail-closed until `HybridEngine` assemble; hybrid arches DedicatedOnly (**P3**) |
-| Kimi K3 | Real slice loaders + `kimi_validate` index check; full ~1.56 TB e2e gated on storage |
-| GLM-5.2 / DeepSeek V4 | Dedicated engines (`Glm52Engine`, `DeepseekV4Engine`) + synthetic stacks — no real GGUF e2e (**P8**) |
-| VL / MTP | Deferred (**P7** / **P8**); `vl_engine` stub; `mmproj::find_mmproj_beside` discovers companion projectors; no multimodal or MTP serve path yet |
-| Mamba / T5 | Fail-closed; engine stubs (`recurrent_engine` / `t5_engine`) |
-| CUDA speed | Suite supports `--backend cuda`; need GPU host pins (staged ≥0.5× then parity) |
+| Qwen2-MoE | Loads (QKV bias + shared_expert_gate); suite entry; GGUF not on Host B |
+| Mixtral | Suite entry; `estimated_ram_gb=48` → skipped on 32 GiB Host B (`--fit-host`) |
+| Gemma-4-E2B | **DedicatedOnly** — per-layer emb + shared KV + SWA/full head-dim split; suite `expect=refuse` (ferrox + current Homebrew llama both refuse `gemma4`) |
+| Llama 4 | DedicatedOnly — MoE / non-generic graph |
+| GLM4 / glm4moe | DedicatedOnly — route via `glm52_*` loaders |
+| MiroThinker | Published GGUFs use `qwen3moe` (already GenericGqa) |
+| MiniMax M2/M3 | DedicatedOnly — sigmoid MoE + MTP |
+| MLA | CLI + **ferrox-server** dense-lead deepseek2/mistral4; MoE-after-dense fail-closed |
+| Hybrid GDN | Primitive + `hybrid_gguf_loader` scaffold; assemble / serve fail-closed |
+| Kimi K3 | Slice loaders + validate; full ~1.56 TB e2e gated on storage |
+| GLM-5.2 / DeepSeek V4 | Dedicated engines + synthetic stacks — no real GGUF e2e |
+| VL / MTP | `vl_engine` stub; `mmproj::find_mmproj_beside`; no multimodal serve |
+| Mamba / T5 | Fail-closed stubs |
+| CUDA speed | Suite `--backend cuda`; need GPU host pins |
+| Metal KV quant | `FERROX_CTK` / `--ctk` parse (`q8_0`/`fp8`/`turbo*`); buffers still F16 |
 
 ## Backends
 
-| Backend | Today |
+| Backend | Status |
 |---|---|
-| CPU | Primary correctness path |
-| Metal | Dense + attn + MoE expert placement (default VRAM budget); FA-vec decode d=64/96/128/256; FA-vec prefill d=128; softcap via legacy GQA; `FERROX_CTK` q8_0 scaffolded (f16 default) |
-| CUDA | Compiles; `run_suite.py --backend cuda --host-label …` for pins; explicit `FERROX_GPU_VRAM_BUDGET_BYTES` for MoE |
-
-Unknown `general.architecture` values fail closed with a clear error (`ferrox archs` for the list).
+| CPU | Dense + MoE; `FERROX_CPU_INT_DOT=1` on suite runs |
+| Metal | Dense + attn + MoE expert placement; FA-vec decode d=64/96/128/256; FA-vec prefill d=128; softcap → legacy GQA |
+| CUDA | Matvec + resident weights + FFN fuse; fair-chat pins need a CUDA host |

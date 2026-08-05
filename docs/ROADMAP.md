@@ -12,11 +12,11 @@ ds4 deps — rewrite in-tree.
 
 | Phase | Focus | Notes |
 |---|---|---|
-| **P1** | Metal prefill | FA-vec prefill; pin `prompt_per_second` on Llama-3.1-8B Metal |
+| **P1** | Metal prefill | FA-vec prefill d=128 landed; Llama-3.1-8B Metal fair-chat ~parity (~0.97×) — re-check `prompt_per_second` under quiet host |
 | **P2** | MLA GGUF → `MlaEngine` | CLI + **ferrox-server** dense-lead deepseek2/mistral4; MoE-after-dense fail-closed; GLM-4.7 / DS V3 MoE still open |
-| **P3** | Hybrid GDN | `HybridEngine` + GDN; smoke Qwen3.5 GGUF, then qwen3next / 35moe |
-| **P4** | Gemma-4 text | Admit graph (+ MoE-A4B); VL deferred to P7 |
-| **P5** | KV quant | P5a `FERROX_CTK` / `--ctk` parse (`f16|q8_0|fp8|turbo{8,4,3}`); CPU FWHT+turbo4 sketch in `ferrox_core::turboquant`; Metal still F16 until kernels |
+| **P3** | Hybrid GDN | `gdn.rs` + loader scaffold; `HybridEngine` assemble + Qwen3.5 smoke still open |
+| **P4** | Gemma-4 text | E2B fail-closed (**DedicatedOnly**: per-layer emb + shared KV + SWA/full head-dim); suite refuse pin; MoE-A4B / VL → P7 |
+| **P5** | KV quant | `FERROX_CTK` / `--ctk` parse + CPU turbo4 sketch; Metal still F16 until kernels |
 
 Also on this horizon (unchanged intent):
 
@@ -29,7 +29,7 @@ Also on this horizon (unchanged intent):
 
 | Phase | Focus | Notes |
 |---|---|---|
-| **P6** | Text / MoE matrix | Qwen3-MoE, Phi-4, GLM4/4.7, Llama4, MiniMax (fail-closed until sigmoid MoE+MTP), MiroThinker; multi-shard GGUF clarity |
+| **P6** | Text / MoE matrix | Phi-4-mini Metal pin landed; Qwen3-MoE / GLM4 / Llama4 / MiniMax / MiroThinker still open |
 | **P7** | VL | Qwen3-VL, Gemma4-VL, Mistral3-VL + mmproj GGUF; server `image_url` later |
 | **P8** | MTP / embed / GLM-5.2 | Speculative MTP heads, embeddings engine, GLM-5.2 / DSA e2e on real GGUF |
 

@@ -1,28 +1,30 @@
 # Roadmap
 
 What works today: [`MODELS.md`](MODELS.md) · CLI: [`CLI.md`](CLI.md) ·
-speed: [`benchmarks/RESULTS.md`](../benchmarks/RESULTS.md).
+speed: [`benchmarks/RESULTS.md`](../benchmarks/RESULTS.md) ·
+API: [`API.md`](API.md).
 
 **Goal:** ≥ [llama.cpp](https://github.com/ggerganov/llama.cpp) tok/s on the same host / backend / GGUF.
 
-## Now
+## Now (evidence gates)
 
-1. **Metal** — keep Llama-3.1-8B decode ≥1×; close prefill gap; don’t regress TinyLlama / 1B / 3B pins by >2%.
-2. **Receipts** — promote Qwen3 / Gemma-3 / Phi-3 / Mistral from “works” → verified (token parity + Metal pin where relevant).
-3. **Qwen2-MoE** — re-run oracle after QKV-bias fix.
+1. **Receipts** — real GGUF oracles for Gemma-2, Qwen2-MoE, Mistral, Mixtral (suite entries exist; pins pending checkpoints).
+2. **Metal MoE** — keep OLMoE expert placement; fuse only if profiling proves it.
+3. **Frontier** — Kimi multi-layer → full e2e; GLM-5.2 / DeepSeek V4 real quants (engines exist; fail-closed until receipts).
+4. **CUDA** — fair-chat pins via `run_suite.py --backend cuda --host-label …`; staged ≥0.5× then parity (no invented numbers).
 
 ## Next
 
-1. **MLA / DSA** — DeepSeek-2-style and GLM DSA serve paths (fail-closed until then).
-2. **Recurrent / hybrid / T5** — dedicated engines when needed.
-3. **Kimi / DeepSeek V4** — real-checkpoint e2e when storage / shapes allow.
-4. **CUDA** — reopen after Metal program; fair-chat still far behind.
+1. **MLA GGUF load** — wire DeepSeek-2 / Mistral-4 weights into `MlaEngine`.
+2. **Recurrent / hybrid / T5 / VL** — stubs in `ferrox-models`; implement after receipts.
+3. Continuous-batching throughput pin (`benchmarks/cb_throughput.py` against a live server).
 
-## Later
+## Shipped (do not re-list as open)
 
-- Continuous-batching throughput receipt
-- Interactive `ferrox chat` TUI / optional UI apps
-  (`ferrox -m/-p` completion already ships — see [`CLI.md`](CLI.md))
+- Evidence baseline + RESULTS validation (`render_results.py`)
+- Metal FA-vec d=96/256; softcap CPU + Metal legacy GQA
+- Overlapped SSE; API compatibility matrix; `ferrox chat` REPL
+- CUDA suite backend + host-label pins workflow
 
 ## Rules
 

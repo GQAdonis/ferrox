@@ -7,9 +7,23 @@ Stable pins: [`receipts/pins/`](receipts/pins/).
 ## Workload
 
 - Host B: Apple M2 Pro, 10 logical cores
-- Greedy chat (`temperature: 0`), warm request, then `max_tokens=256`
+- Greedy chat (`temperature: 0`), warm request, then `max_tokens=512` (suite default; older pins may still record 256)
 - Prompt: numbered list of 80 European capitals + unique suffix
 - Prefer **predicted** tok/s; gap only when both ferrox and llama succeed
+
+## Gap ratio convention
+
+`RESULTS.md` **Gap** = `llama_predicted / ferrox_predicted` (from
+[`render_results.py`](render_results.py)).
+
+| Gap | Meaning |
+|---|---|
+| &lt; 1.0 | ferrox faster than llama.cpp |
+| **1.00×** | within 1.5% of parity |
+| &gt; 1.0 | ferrox slower than llama.cpp |
+
+Human prose in docs (e.g. “1.56× faster”) is the inverse when ferrox wins.
+Never invent ratios without a pin under [`receipts/pins/`](receipts/pins/).
 
 ## Run suite (Metal)
 
@@ -61,8 +75,8 @@ the suite CLI above.
 | `FERROX_METAL_ATTN` | `1` |
 | `FERROX_METAL_LOGITS` | unset (host lm_head; `1` = slower vocab-in-stack) |
 | `FERROX_METAL_GREEDY_GPU` | default **on** for `temperature<=0`; `0` = host lm_head |
-| `FERROX_METAL_FA_VEC` | default **on** for `head_dim==128`; `0` = legacy GQA |
-| `FERROX_METAL_MUL_MM` | default **on** for prefill batch ≥ 8; `0` = N× matvec |
+| `FERROX_METAL_FA_VEC` | default **on** for `head_dim` in {64,96,128,256}; `0` = legacy GQA |
+| `FERROX_METAL_MUL_MM` | default **on** for prefill batch ≥ 4; `0` = N× matvec |
 | `FERROX_METAL_WEIGHT_COPY` | unset (`BytesNoCopy`); `1` forces copy upload |
 | `FERROX_CPU_INT_DOT` | `1` on CPU suite runs |
 | `FERROX_CUDA_GQA` / `FERROX_CUDA_GRAPH` | CUDA path (Vast study, not Host B suite) |
@@ -70,5 +84,16 @@ the suite CLI above.
 
 ## CUDA
 
-Host B suite does not run CUDA. The prior Vast study is preserved in
-[`receipts/pins/cuda_vast_llama31_8b_q4km.json`](receipts/pins/cuda_vast_llama31_8b_q4km.json).
+Host B suite is Metal/CPU. CUDA fair-chat is available via:
+
+```bash
+cargo build -p ferrox-server --release --features cuda
+python3 benchmarks/run_suite.py --id llama31_8b_q4km --backend cuda \
+  --host-label "Vast RTX4090 / driver XXX" \
+  --ferrox-bin ./target/release/ferrox-server
+```
+
+Staged goals: first ≥0.5× llama.cpp predicted tok/s on Llama-8B Q4_K_M,
+then parity. Always record GPU/driver in `--host-label`. Env:
+`FERROX_CUDA=1`, `FERROX_CUDA_GQA=1`, optional `FERROX_CUDA_GRAPH=1`.
+See [`docs/ROADMAP.md`](../docs/ROADMAP.md).

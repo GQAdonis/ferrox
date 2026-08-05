@@ -4,6 +4,8 @@ Host B = Apple M2 Pro (10 cores). Greedy chat, warm, then `max_tokens=512` × 3 
 
 Suite: [`suite.json`](suite.json). Runner: [`run_suite.py`](run_suite.py). Pins: [`receipts/pins/`](receipts/pins/). **This file is generated** by [`render_results.py`](render_results.py) — do not hand-edit headlines.
 
+**Gap** = `llama_pred / ferrox_pred` (&lt;1 ferrox faster; &gt;1 ferrox slower).
+
 **North star:** ≥ llama.cpp same host/GGUF/backend.
 **8B Metal pin:** **26.91** vs llama **27.83** pred (~1.03×) — [`pins/llama31_8b_q4km_metal.json`](receipts/pins/llama31_8b_q4km_metal.json).
 
@@ -18,11 +20,20 @@ Keep off (regressions): legacy GQA NSG=4, sequential GREEDY argmax, float4 elem,
 | TinyLlama-1.1B-Chat-v1.0 Q8_0 | metal | **116.69** ±1.4 | **109.85** ±3.0 | ~0.94× | ok | [`tinyllama_q8_metal`](receipts/pins/tinyllama_q8_metal.json) |
 | TinyLlama-1.1B-Chat-v1.0 Q8_0 | cpu | **44.56** | **38.16** (−ngl 0) | ~0.86× | ok | [`tinyllama_q8_cpu`](receipts/pins/tinyllama_q8_cpu.json) |
 | Llama-3.2-1B-Instruct Q4_K_M | metal | **141.41** ±3.2 | **136.23** ±2.1 | ~0.96× | ok | [`llama32_1b_q4km_metal`](receipts/pins/llama32_1b_q4km_metal.json) |
-| Llama-3.1-8B-Instruct Q4_K_M | metal | **26.91** ±0.8 | **27.83** ±1.0 | ~1.03× | ok | [`llama31_8b_q4km_metal`](receipts/pins/llama31_8b_q4km_metal.json) |
-| Llama-3.2-3B-Instruct Q4_K_M | metal | **57.02** ±0.2 | **59.43** ±1.5 | ~1.04× | ok | [`llama32_3b_q4km_metal`](receipts/pins/llama32_3b_q4km_metal.json) |
 | OLMoE-1B-7B-0924 Q4_0 | cpu | **17.89** | **19.74** (−ngl 0) | ~1.10× | ok | [`olmoe_q4_cpu`](receipts/pins/olmoe_q4_cpu.json) |
+| OLMoE-1B-7B-0924 Q4_0 | metal | — | — | — | no pin | — |
+| OLMoE-1B-7B-0924 Q4_0 | cuda | — | — | — | no pin | — |
+| Llama-3.1-8B-Instruct Q4_K_M | metal | **26.91** ±0.8 | **27.83** ±1.0 | ~1.03× | ok | [`llama31_8b_q4km_metal`](receipts/pins/llama31_8b_q4km_metal.json) |
+| Llama-3.1-8B-Instruct Q4_K_M | cuda | — | — | — | no pin | — |
+| Llama-3.2-3B-Instruct Q4_K_M | metal | **57.02** ±0.2 | **59.43** ±1.5 | ~1.04× | ok | [`llama32_3b_q4km_metal`](receipts/pins/llama32_3b_q4km_metal.json) |
+| Qwen1.5-MoE-A2.7B Q4_K_M | cpu | — | — | — | no pin | — |
+| Qwen1.5-MoE-A2.7B Q4_K_M | metal | — | — | — | no pin | — |
+| Mistral-7B-Instruct-v0.2 Q4_K_M | cpu | — | — | — | no pin | — |
+| Mistral-7B-Instruct-v0.2 Q4_K_M | metal | — | — | — | no pin | — |
+| Mixtral-8x7B-Instruct Q4_K_M | cpu | — | — | — | no pin | — |
 | Llama-3.2-1B-Instruct IQ4_XS | metal | **148.43** ±0.3 | **138.25** ±0.8 | ~0.93× | ok | [`iq4_xs_metal`](receipts/pins/iq4_xs_metal.json) |
 | Gemma-2-2B-IT Q4_K_M | metal | — | — | — | missing | [`gemma2_2b_q4km_metal`](receipts/pins/gemma2_2b_q4km_metal.json) |
+| Gemma-2-2B-IT Q4_K_M | cpu | — | — | — | no pin | — |
 | SmolLM2-135M-Instruct Q8_0 | metal | **283.66** ±9.7 | **193.48** ±4.9 | ~0.68× | ok | [`smollm2_135m_q8_metal`](receipts/pins/smollm2_135m_q8_metal.json) |
 | SmolLM2-135M-Instruct Q8_0 | cpu | **55.84** ±0.7 | **43.48** ±5.9 (−ngl 0) | ~0.78× | ok | [`smollm2_135m_q8_cpu`](receipts/pins/smollm2_135m_q8_cpu.json) |
 | Qwen2.5-0.5B-Instruct Q8_0 | metal | **192.09** ±7.0 | **123.00** ±5.6 | ~0.64× | ok | [`qwen25_05b_q8_metal`](receipts/pins/qwen25_05b_q8_metal.json) |
@@ -45,9 +56,9 @@ One-shot `-p … -n N --no-cnv --ignore-eos`, fresh process per rep, strictly se
 | TinyLlama-1.1B-Chat-v1.0 Q8_0 | metal | **116.84** ±1.2 | **111.10** ±3.8 | ~0.95× | [`tinyllama_q8_metal_cli`](receipts/pins/tinyllama_q8_metal_cli.json) |
 | TinyLlama-1.1B-Chat-v1.0 Q8_0 | cpu | **33.87** ±1.8 | **19.60** ±4.1 | ~0.58× | [`tinyllama_q8_cpu_cli`](receipts/pins/tinyllama_q8_cpu_cli.json) |
 | Llama-3.2-1B-Instruct Q4_K_M | metal | **143.96** ±1.8 | **140.20** ±1.2 | ~0.97× | [`llama32_1b_q4km_metal_cli`](receipts/pins/llama32_1b_q4km_metal_cli.json) |
+| OLMoE-1B-7B-0924 Q4_0 | cpu | **13.99** ±0.3 | **15.30** ±7.8 | ~1.09× | [`olmoe_q4_cpu_cli`](receipts/pins/olmoe_q4_cpu_cli.json) |
 | Llama-3.1-8B-Instruct Q4_K_M | metal | **28.64** ±0.2 | **28.60** ±0.6 | **1.00×** | [`llama31_8b_q4km_metal_cli`](receipts/pins/llama31_8b_q4km_metal_cli.json) |
 | Llama-3.2-3B-Instruct Q4_K_M | metal | **57.97** ±0.2 | **61.90** ±0.8 | ~1.07× | [`llama32_3b_q4km_metal_cli`](receipts/pins/llama32_3b_q4km_metal_cli.json) |
-| OLMoE-1B-7B-0924 Q4_0 | cpu | **13.99** ±0.3 | **15.30** ±7.8 | ~1.09× | [`olmoe_q4_cpu_cli`](receipts/pins/olmoe_q4_cpu_cli.json) |
 | Llama-3.2-1B-Instruct IQ4_XS | metal | **146.54** ±2.7 | **135.20** ±3.6 | ~0.92× | [`iq4_xs_metal_cli`](receipts/pins/iq4_xs_metal_cli.json) |
 | SmolLM2-135M-Instruct Q8_0 | metal | **281.65** ±8.9 | **225.70** ±8.2 | ~0.80× | [`smollm2_135m_q8_metal_cli`](receipts/pins/smollm2_135m_q8_metal_cli.json) |
 | SmolLM2-135M-Instruct Q8_0 | cpu | **56.50** ±0.1 | **61.90** ±11.9 | ~1.10× | [`smollm2_135m_q8_cpu_cli`](receipts/pins/smollm2_135m_q8_cpu_cli.json) |
@@ -61,10 +72,11 @@ One-shot `-p … -n N --no-cnv --ignore-eos`, fresh process per rep, strictly se
 
 ## Open
 
-1. Metal prefill ≪ llama on large models; FA-vec covers d=128/64 (other dims → legacy GQA).
-2. CUDA — re-measure on comparable CUDA hardware.
-3. Gemma-2 arch support (pin refuses).
+1. Metal prefill ≪ llama on large models; FA-vec covers d=64/96/128/256 (Phi-3 / Gemma-3 decode path).
+2. CUDA — re-measure on comparable CUDA hardware (no in-tree CUDA pin).
+3. Gemma-2 arch support (attn softcap + pin; suite currently refuse).
 4. CB multi-request tok/s receipt.
 5. DS4 / GLM real e2e when feasible.
+6. Qwen2-MoE / Mistral / Mixtral oracle receipts.
 
 Do not invent numbers without a pin.

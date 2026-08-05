@@ -7,7 +7,7 @@
 
 use crate::capability::{resolve_profile, ArchPath, DecoderFamily};
 use crate::decoder::Decoder;
-use crate::engine::{Engine, Glm52Engine, KimiEngine};
+use crate::engine::{Engine, Glm52Engine, KimiEngine, MlaEngine};
 use thiserror::Error;
 
 /// Why a GGUF cannot be served by the currently compiled engine set.
@@ -73,25 +73,34 @@ pub fn ensure_generic_decoder(arch: &str) -> Result<(), EngineSelectError> {
         )),
         SelectedEngineKind::Mla => Err(EngineSelectError::DedicatedUnavailable(
             arch.to_string(),
-            "MLA/DSA sparse memory engine not yet served from generic GGUF load",
+            "MLA engine exists (ferrox_models::MlaEngine) but DeepSeek-2/Mistral-4 GGUF \
+             weight loading is not wired yet — fail-closed until a real checkpoint receipt",
         )),
-        SelectedEngineKind::RecurrentHybrid => Err(EngineSelectError::DedicatedUnavailable(
-            arch.to_string(),
-            "recurrent/hybrid SSM engine not yet implemented",
-        )),
-        SelectedEngineKind::EncoderDecoder => Err(EngineSelectError::DedicatedUnavailable(
-            arch.to_string(),
-            "T5 encoder-decoder engine not yet implemented",
-        )),
+        SelectedEngineKind::RecurrentHybrid => {
+            let _ = crate::recurrent_engine::RecurrentEngine::reject(arch);
+            let _ = crate::hybrid_engine::HybridEngine::reject(arch);
+            Err(EngineSelectError::DedicatedUnavailable(
+                arch.to_string(),
+                "recurrent/hybrid SSM engine stub present — not yet on the serve path",
+            ))
+        }
+        SelectedEngineKind::EncoderDecoder => {
+            let _ = crate::t5_engine::T5Engine::reject(arch);
+            Err(EngineSelectError::DedicatedUnavailable(
+                arch.to_string(),
+                "T5 encoder-decoder engine stub present — not yet on the serve path",
+            ))
+        }
     }
 }
 
-/// Type-erased serve handle: today only [`Decoder`] is constructed from
-/// ordinary GGUFs; Kimi/GLM stay on their dedicated loaders.
+/// Type-erased serve handle: today ordinary GGUFs use [`Decoder`];
+/// Kimi/GLM/MLA use dedicated engines once loaders succeed.
 pub enum ServedEngine {
     Decoder(Box<Decoder>),
     Kimi(KimiEngine),
     Glm52(Glm52Engine),
+    Mla(MlaEngine),
 }
 
 impl ServedEngine {
@@ -100,6 +109,7 @@ impl ServedEngine {
             Self::Decoder(d) => Engine::vocab_size(d.as_ref()),
             Self::Kimi(k) => Engine::vocab_size(k),
             Self::Glm52(g) => Engine::vocab_size(g),
+            Self::Mla(m) => Engine::vocab_size(m),
         }
     }
 }

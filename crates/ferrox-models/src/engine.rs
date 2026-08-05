@@ -25,6 +25,10 @@
 
 use crate::config::{KdaConfig, MlaConfig};
 use crate::decoder::Decoder;
+use crate::deepseek_v4_decoder::{
+    deepseek_v4_forward_token, DeepseekV4DecodeState, DeepseekV4DecoderConfig,
+    DeepseekV4DecoderWeights,
+};
 use crate::glm52_decoder::{
     glm52_forward_token, Glm52DecodeState, Glm52DecoderConfig, Glm52DecoderWeights,
 };
@@ -33,6 +37,7 @@ use crate::kimi_decoder::{
 };
 use crate::kimi_tokenizer::KimiTokenizer;
 use ferrox_core::cache::KvCache;
+use ferrox_core::weight_matrix::WeightMatrix;
 
 /// A decoder that can run one incremental forward step given a token id
 /// and position, updating its own per-layer state in place.
@@ -122,6 +127,109 @@ impl Engine for Glm52Engine {
 
     fn forward_token(&self, token_id: usize, _pos: usize, state: &mut Self::State) -> Vec<f32> {
         glm52_forward_token(&self.weights, &self.cfg, token_id, state)
+    }
+}
+
+/// Multi-layer MLA stack for DeepSeek-2 / Mistral-4-style GGUF serve.
+///
+/// Uses [`crate::mla::mla_forward_token`] with asymmetric K/V caches
+/// (plain `Vec<f32>`, not [`KvCache`]). Fail-closed at GGUF load until a
+/// real DeepSeek-2 weight loader lands — this engine is the serve wire
+/// for synthetic / fixture weights and for future loader integration.
+pub struct MlaEngine {
+    pub embedding: WeightMatrix,
+    pub layers: Vec<MlaLayerWeights>,
+    pub final_norm: Vec<f32>,
+    pub output_head: WeightMatrix,
+    pub mla_cfg: MlaConfig,
+    pub rms_norm_eps: f32,
+    pub hidden_dim: usize,
+}
+
+pub struct MlaLayerWeights {
+    pub attn_norm: Vec<f32>,
+    pub attn: crate::mla::MlaAttnWeights,
+    pub ffn_norm: Vec<f32>,
+    pub ffn_gate: WeightMatrix,
+    pub ffn_up: WeightMatrix,
+    pub ffn_down: WeightMatrix,
+}
+
+pub struct MlaDecodeState {
+    pub layers: Vec<(Vec<f32>, Vec<f32>)>,
+}
+
+impl MlaEngine {
+    pub fn new_state(&self) -> MlaDecodeState {
+        MlaDecodeState {
+            layers: (0..self.layers.len())
+                .map(|_| (Vec::new(), Vec::new()))
+                .collect(),
+        }
+    }
+}
+
+impl Engine for MlaEngine {
+    type State = MlaDecodeState;
+
+    fn new_state(&self) -> MlaDecodeState {
+        MlaEngine::new_state(self)
+    }
+
+    fn vocab_size(&self) -> usize {
+        self.output_head.rows()
+    }
+
+    fn forward_token(&self, token_id: usize, _pos: usize, state: &mut Self::State) -> Vec<f32> {
+        use ferrox_core::matmul::{rms_norm, swiglu};
+        let mut hidden = self.embedding.dequant_row(token_id);
+        for (layer, (k_cache, v_cache)) in self.layers.iter().zip(state.layers.iter_mut()) {
+            let normed = rms_norm(&hidden, &layer.attn_norm, self.rms_norm_eps);
+            let attn_out = crate::mla::mla_forward_token(
+                &layer.attn,
+                &self.mla_cfg,
+                &normed,
+                self.rms_norm_eps,
+                k_cache,
+                v_cache,
+            );
+            for (h, a) in hidden.iter_mut().zip(attn_out.iter()) {
+                *h += a;
+            }
+            let ffn_in = rms_norm(&hidden, &layer.ffn_norm, self.rms_norm_eps);
+            let gate = layer.ffn_gate.apply(&ffn_in);
+            let up = layer.ffn_up.apply(&ffn_in);
+            let activated = swiglu(&gate, &up);
+            let down = layer.ffn_down.apply(&activated);
+            for (h, d) in hidden.iter_mut().zip(down.iter()) {
+                *h += d;
+            }
+        }
+        let final_normed = rms_norm(&hidden, &self.final_norm, self.rms_norm_eps);
+        self.output_head.apply(&final_normed)
+    }
+}
+
+/// DeepSeek V4 synthetic stack behind [`Engine`]. Preset `deepseek_v4_pro`
+/// remains a sketch until a real GGUF loader + incremental DSV4 KV land.
+pub struct DeepseekV4Engine {
+    pub weights: DeepseekV4DecoderWeights,
+    pub cfg: DeepseekV4DecoderConfig,
+}
+
+impl Engine for DeepseekV4Engine {
+    type State = DeepseekV4DecodeState;
+
+    fn new_state(&self) -> DeepseekV4DecodeState {
+        DeepseekV4DecodeState::new(self.weights.embedding.shape[1])
+    }
+
+    fn vocab_size(&self) -> usize {
+        self.weights.output_head.rows()
+    }
+
+    fn forward_token(&self, token_id: usize, _pos: usize, state: &mut Self::State) -> Vec<f32> {
+        deepseek_v4_forward_token(&self.weights, &self.cfg, token_id, state)
     }
 }
 

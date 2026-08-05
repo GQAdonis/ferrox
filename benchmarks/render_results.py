@@ -67,10 +67,12 @@ def main() -> None:
     suite = json.loads(SUITE_PATH.read_text())
     pins: dict[tuple[str, str], dict] = {}
     cli_pins: dict[tuple[str, str], dict] = {}
+    orphan_pin_files: list[str] = []
     if PINS.is_dir():
         for path in PINS.glob("*.json"):
             data = load_json(path)
             if not data:
+                orphan_pin_files.append(path.name)
                 continue
             key = (data.get("id"), data.get("backend"))
             if key[0] and key[1]:
@@ -78,6 +80,17 @@ def main() -> None:
                     cli_pins[key] = data
                 else:
                     pins[key] = data
+            else:
+                orphan_pin_files.append(path.name)
+
+    # Fail closed on unreadable / schema-invalid pin JSON. Suite entries may
+    # lack pin files (shown as "no pin"); never emit markdown links to missing
+    # files. Extra on-disk pins (e.g. future CUDA) are fine if they parse.
+    if orphan_pin_files:
+        raise SystemExit(
+            "render_results.py validation failed — unreadable or schema-invalid "
+            f"pins: {', '.join(orphan_pin_files)}"
+        )
 
     metal8 = pins.get(("llama31_8b_q4km", "metal"))
     if metal8 and pred(metal8.get("ferrox")) and pred(metal8.get("llama")):
@@ -102,6 +115,8 @@ def main() -> None:
         "Pins: [`receipts/pins/`](receipts/pins/). "
         "**This file is generated** by [`render_results.py`](render_results.py) — "
         "do not hand-edit headlines.\n",
+        "\n",
+        "**Gap** = `llama_pred / ferrox_pred` (&lt;1 ferrox faster; &gt;1 ferrox slower).\n",
         "\n",
         "**North star:** ≥ llama.cpp same host/GGUF/backend.\n",
         north,
@@ -141,9 +156,11 @@ def main() -> None:
             lcell = fmt_num(lp, lsd) if lp is not None else "—"
             if backend == "cpu" and lp is not None:
                 lcell = f"{lcell} (−ngl 0)"
+            # Only link pins that exist on disk — never invent broken markdown links.
+            pin_name = f"{mid}_{backend}.json"
             link = (
-                f"[`{mid}_{backend}`](receipts/pins/{mid}_{backend}.json)"
-                if pin
+                f"[`{mid}_{backend}`](receipts/pins/{pin_name})"
+                if pin and (PINS / pin_name).is_file()
                 else "—"
             )
             star = "\\*" if expect == "weak" else ""
@@ -200,11 +217,13 @@ def main() -> None:
 
     lines.append("\n## Open\n\n")
     lines.append(
-        "1. Metal prefill ≪ llama on large models; FA-vec covers d=128/64 (other dims → legacy GQA).\n"
-        "2. CUDA — re-measure on comparable CUDA hardware.\n"
-        "3. Gemma-2 arch support (pin refuses).\n"
+        "1. Metal prefill ≪ llama on large models; FA-vec covers d=64/96/128/256 "
+        "(Phi-3 / Gemma-3 decode path).\n"
+        "2. CUDA — re-measure on comparable CUDA hardware (no in-tree CUDA pin).\n"
+        "3. Gemma-2 arch support (attn softcap + pin; suite currently refuse).\n"
         "4. CB multi-request tok/s receipt.\n"
         "5. DS4 / GLM real e2e when feasible.\n"
+        "6. Qwen2-MoE / Mistral / Mixtral oracle receipts.\n"
     )
     lines.append("\nDo not invent numbers without a pin.\n")
 

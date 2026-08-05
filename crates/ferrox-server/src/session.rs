@@ -8,13 +8,13 @@
 //! orthogonal, not merged into one.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use crate::ChatMessage;
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct SessionStore {
-    sessions: Mutex<HashMap<String, Vec<ChatMessage>>>,
+    sessions: Arc<Mutex<HashMap<String, Vec<ChatMessage>>>>,
 }
 
 impl SessionStore {

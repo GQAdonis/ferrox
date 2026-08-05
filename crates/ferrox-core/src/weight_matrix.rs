@@ -966,9 +966,11 @@ impl WeightMatrix {
                 std::env::var("FERROX_METAL_MATMUL").ok().as_deref(),
                 Some("1") | Some("true") | Some("on")
             );
-        // Weight-reuse mul_mm for prefill batch ≥ 8 (Q4_0 / Q4_K / Q6_K).
+        // Weight-reuse mul_mm for prefill batch ≥ 4 (Q4_0 / Q4_K / Q6_K).
         // Default **on**; `FERROX_METAL_MUL_MM=0` forces N× matvec batch.
-        let use_mul_mm = batch_size >= 8
+        // Threshold 4 (was 8) covers shorter prompts without changing the
+        // decode path (batch_size == 1 still uses matvec).
+        let use_mul_mm = batch_size >= 4
             && !matches!(
                 std::env::var("FERROX_METAL_MUL_MM").ok().as_deref(),
                 Some("0") | Some("false") | Some("off")

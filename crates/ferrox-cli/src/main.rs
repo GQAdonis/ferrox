@@ -1,6 +1,7 @@
 //! ferrox CLI — llama.cpp-style GGUF completion (`-m`/`-p`/`-n`/…) plus
 //! inspect / presets / smoke / Kimi helpers. See `docs/CLI.md`.
 
+mod chat;
 mod run;
 
 use clap::{Parser, Subcommand};
@@ -24,6 +25,11 @@ enum Commands {
     ///
     /// Also accepts top-level flags: `ferrox -m model.gguf -p "Hi" -n 64`.
     Run(run::InferArgs),
+    /// Multi-turn chat REPL against a running `ferrox-server` (HTTP).
+    ///
+    /// Reuses the server's chat-template + streaming path — start the
+    /// server first (`FERROX_MODEL_PATH=… ferrox-server`).
+    Chat(chat::ChatArgs),
     /// Print GGUF header metadata and tensor list for a model file.
     Inspect { path: String },
     /// Dry-run residency plan for a GGUF checkpoint: what it would
@@ -200,6 +206,7 @@ fn rewrite_llama_style_argv(args: Vec<String>) -> Vec<String> {
     }
     const SUBCOMMANDS: &[&str] = &[
         "run",
+        "chat",
         "inspect",
         "inspect-plan",
         "presets",
@@ -235,6 +242,7 @@ fn main() -> anyhow::Result<()> {
 
     match cli.command {
         Commands::Run(args) => run::run_infer(args)?,
+        Commands::Chat(args) => chat::run_chat(args)?,
         Commands::Inspect { path } => {
             let file = ShardedGguf::open(&path)?;
             if file.shard_count() > 1 {

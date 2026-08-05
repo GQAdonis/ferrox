@@ -20,15 +20,13 @@
 //! state, and it's locked only for the brief get/put around it, never
 //! across a decode.
 //!
-//! Streaming scope note: chunks are still computed synchronously inside
-//! the blocking task, then flushed to the client as separate SSE frames
-//! once generation finishes -- this gives correct multi-chunk SSE
-//! framing and lets clients render incrementally, but per-request it is
-//! not yet *overlapped* with network delivery (the whole response for
-//! that request is generated before its first byte is sent). That would
-//! need `generate::generate`'s `emit` callback to push directly into an
-//! SSE channel from inside the blocking task -- a reasonable next step,
-//! not attempted here.
+//! Streaming scope: when `stream: true` and tools are inactive, each
+//! decoded chunk is pushed through a bounded `mpsc` channel from the
+//! blocking generate task into the SSE writer so time-to-first-byte
+//! overlaps with ongoing decode. Tool-call requests still buffer the
+//! full response first (detection needs the stop-bounded text).
+//! Continuous-batching streaming also buffers (batcher returns one
+//! string).
 
 mod batch_scheduler;
 mod cache;
@@ -555,6 +553,19 @@ struct ChatCompletionRequest {
     /// history, not the whole conversation.
     #[serde(default)]
     session_id: Option<String>,
+    /// OpenAI fields we explicitly reject rather than silently ignore.
+    #[serde(default)]
+    logprobs: Option<bool>,
+    #[serde(default)]
+    top_logprobs: Option<u32>,
+    #[serde(default)]
+    n: Option<u32>,
+    #[serde(default)]
+    presence_penalty: Option<f32>,
+    #[serde(default)]
+    frequency_penalty: Option<f32>,
+    #[serde(default)]
+    response_format: Option<serde_json::Value>,
 }
 
 fn default_max_tokens() -> usize {
@@ -588,6 +599,45 @@ impl ChatCompletionRequest {
     fn tools_active(&self) -> bool {
         !self.tools.is_empty()
             && !matches!(&self.tool_choice, Some(ToolChoice::Mode(m)) if m == "none")
+    }
+
+    /// Reject OpenAI fields we do not implement, and `tool_choice`
+    /// values that would silently lie (required / named function).
+    fn validate_supported_fields(&self) -> Result<(), ApiError> {
+        if self.logprobs == Some(true) || self.top_logprobs.is_some() {
+            return Err(unsupported_feature(
+                "logprobs / top_logprobs are not implemented yet (see docs/API.md)",
+            ));
+        }
+        if self.n.is_some_and(|n| n > 1) {
+            return Err(unsupported_feature(
+                "n > 1 is not implemented (single completion only)",
+            ));
+        }
+        if self.presence_penalty.is_some() || self.frequency_penalty.is_some() {
+            return Err(unsupported_feature(
+                "presence_penalty / frequency_penalty are not implemented; use repetition_penalty",
+            ));
+        }
+        if self.response_format.is_some() {
+            return Err(unsupported_feature(
+                "response_format / JSON mode is not implemented",
+            ));
+        }
+        match &self.tool_choice {
+            Some(ToolChoice::Mode(m)) if m == "required" => {
+                return Err(unsupported_feature(
+                    "tool_choice=required needs constrained decoding (not implemented)",
+                ));
+            }
+            Some(ToolChoice::Specific(_)) => {
+                return Err(unsupported_feature(
+                    "named tool_choice is not implemented (use auto/none)",
+                ));
+            }
+            _ => {}
+        }
+        Ok(())
     }
 
     /// `stop_sequences()` plus `</tool_call>` when tool-calling is
@@ -861,6 +911,13 @@ async fn metrics(State(state): State<Arc<AppState>>) -> Response {
 
 type ApiError = (StatusCode, Json<serde_json::Value>);
 
+fn unsupported_feature(message: &str) -> ApiError {
+    (
+        StatusCode::NOT_IMPLEMENTED,
+        Json(serde_json::json!({"error": {"message": message, "type": "unsupported"}})),
+    )
+}
+
 fn decode_error_response(e: generate::DecodeError) -> ApiError {
     let status = match e {
         generate::DecodeError::TokenOutOfVocab { .. } => StatusCode::BAD_REQUEST,
@@ -883,25 +940,25 @@ fn join_error_response(e: tokio::task::JoinError) -> ApiError {
     )
 }
 
-/// Runs generation for `params` against `model`, collecting every
-/// emitted chunk into a `Vec<String>` (used by the non-streaming path
-/// directly, and by the streaming path to build its SSE frames -- see
-/// the module doc comment for why streaming doesn't yet overlap compute
-/// with delivery). Pure CPU-bound work with no I/O and no shared lock:
-/// safe to run on `spawn_blocking`.
-fn run_generation(
+/// Runs generation for `params` against `model`, calling `emit` for each
+/// decoded text chunk. Returns finish reason, usage, and the concatenated
+/// text (for sessions / tool-call detection). Pure CPU-bound work with
+/// no I/O and no shared lock: safe to run on `spawn_blocking`.
+fn run_generation_emit(
     model: &Model,
     prompt: &str,
     params: &GenerationParams,
     kv_pool: Option<&generate::KvPoolConfig>,
     prefix_cache: Option<&Mutex<PrefixCache>>,
     continuous_batcher: Option<&batch_scheduler::ContinuousBatcher>,
-) -> Result<(Vec<String>, FinishReason, generate::Usage), generate::DecodeError> {
+    mut emit: impl FnMut(&str),
+) -> Result<(FinishReason, generate::Usage, String), generate::DecodeError> {
+    let synthetic = model.is_synthetic();
     let mut chunks = Vec::new();
+    let used_batcher = matches!((model, continuous_batcher), (Model::Gguf(_), Some(_)));
     let (finish, usage) = match model {
         Model::Gguf(m) => {
-            let use_batcher = continuous_batcher.is_some();
-            if let (Some(batcher), true) = (continuous_batcher, use_batcher) {
+            if let Some(batcher) = continuous_batcher {
                 let mut tokens = m.tokenizer.encode(prompt);
                 if let Some(bos) = m.bos_id {
                     if tokens.first() != Some(&bos) {
@@ -924,16 +981,15 @@ fn run_generation(
                     params,
                     kv_pool,
                     prefix_cache,
-                    |chunk| chunks.push(chunk.to_string()),
+                    |chunk| {
+                        chunks.push(chunk.to_string());
+                        if !synthetic {
+                            emit(chunk);
+                        }
+                    },
                 )?
             }
         }
-        // No KV pool / prefix cache for Kimi: its recurrent KDA state
-        // can't support the truncate/restore operations those need
-        // (see `ferrox_models::engine`'s module docs) -- every Kimi request
-        // processes its full prompt from scratch regardless of how the
-        // server is configured, by construction of `generate_engine`'s
-        // signature (it has no such parameters to ignore).
         Model::Kimi(m) => generate::generate_engine(
             &m.engine,
             &m.tokenizer,
@@ -941,19 +997,57 @@ fn run_generation(
             None,
             prompt,
             params,
-            |chunk| chunks.push(chunk.to_string()),
+            |chunk| {
+                chunks.push(chunk.to_string());
+                if !synthetic {
+                    emit(chunk);
+                }
+            },
         )?,
     };
 
-    if model.is_synthetic() {
-        let joined: String = chunks.concat();
-        chunks = vec![format!(
+    let mut full = chunks.concat();
+    if synthetic {
+        full = format!(
             "[ferrox synthetic-weight demo: no real checkpoint loaded -- set FERROX_MODEL_PATH \
-             to serve a real model. Decoded ids -> {joined:?}]"
-        )];
+             to serve a real model. Decoded ids -> {full:?}]"
+        );
+        emit(&full);
+    } else if used_batcher && !full.is_empty() {
+        emit(&full);
     }
 
-    Ok((chunks, finish, usage))
+    Ok((finish, usage, full))
+}
+
+/// Collecting wrapper around [`run_generation_emit`] for non-streaming
+/// paths and tests.
+fn run_generation(
+    model: &Model,
+    prompt: &str,
+    params: &GenerationParams,
+    kv_pool: Option<&generate::KvPoolConfig>,
+    prefix_cache: Option<&Mutex<PrefixCache>>,
+    continuous_batcher: Option<&batch_scheduler::ContinuousBatcher>,
+) -> Result<(Vec<String>, FinishReason, generate::Usage), generate::DecodeError> {
+    let (finish, usage, full) = run_generation_emit(
+        model,
+        prompt,
+        params,
+        kv_pool,
+        prefix_cache,
+        continuous_batcher,
+        |_| {},
+    )?;
+    Ok((
+        if full.is_empty() {
+            Vec::new()
+        } else {
+            vec![full]
+        },
+        finish,
+        usage,
+    ))
 }
 
 fn prompt_from_messages(
@@ -1087,6 +1181,13 @@ async fn chat_completions(
         .requests_total
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
+    if let Err(err) = req.validate_supported_fields() {
+        state
+            .request_errors_total
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        return err.into_response();
+    }
+
     let response = if req.stream.unwrap_or(false) {
         chat_completions_stream(Arc::clone(&state), req)
             .await
@@ -1194,140 +1295,177 @@ async fn chat_completions_stream(
     state: Arc<AppState>,
     req: ChatCompletionRequest,
 ) -> Result<Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>>, ApiError> {
+    // Streaming requests are never served from or written to the response cache.
     let tools_active = req.tools_active();
     let history = resolve_history(&state, &req);
     let prompt = prompt_from_messages(&history, state.model.chat_template(), &req.tools);
     let model_name = req.model.clone();
+    let session_id = req.session_id.clone();
+    let sessions = state.sessions.clone();
 
-    // Streaming requests are never served from or written to the
-    // response cache (see ChatCompletionRequest::is_cacheable's doc
-    // comment on why unseeded sampling can't be cached at all; even a
-    // cacheable streamed request is kept simple here by not caching,
-    // to avoid needing a second, chunk-shaped cache entry format).
     let model = Arc::clone(&state.model);
     let kv_pool = state.kv_pool.clone();
     let prefix_cache = state.prefix_cache.clone();
     let batcher = state.continuous_batcher.clone();
     let params = req.generation_params_for_template(state.model.chat_template());
-    let (chunks, finish, usage) = tokio::task::spawn_blocking(move || {
-        run_generation(
+
+    // Tool-call detection needs the full stop-bounded text; continuous
+    // batching returns one string. Both stay buffered. Otherwise each
+    // decoded chunk is pushed on a channel for overlapped SSE delivery.
+    let overlap = !tools_active && batcher.is_none();
+
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Event, Infallible>>(64);
+
+    tokio::task::spawn_blocking(move || {
+        let tx_chunks = tx.clone();
+        let mut first = true;
+        let result = run_generation_emit(
             &model,
             &prompt,
             &params,
             kv_pool.as_ref(),
             prefix_cache.as_deref(),
             batcher.as_ref(),
-        )
-    })
-    .await
-    .map_err(join_error_response)?
-    .unwrap_or_else(|e| {
-        tracing::warn!("decode error on streamed request: {e}");
-        (
-            vec![format!("[error: {e}]")],
-            FinishReason::Stop,
-            generate::Usage::new(0, 0),
-        )
-    });
-
-    let full_text = chunks.concat();
-    if let Some(id) = &req.session_id {
-        state.sessions.store_reply(
-            id,
-            ChatMessage {
-                role: "assistant".to_string(),
-                content: Some(full_text.clone()),
-                tool_calls: None,
-                tool_call_id: None,
+            |chunk| {
+                if !overlap || chunk.is_empty() {
+                    return;
+                }
+                let role = if first { Some("assistant") } else { None };
+                first = false;
+                let payload = ChatCompletionChunk {
+                    id: "ferrox-demo-0".to_string(),
+                    object: "chat.completion.chunk",
+                    model: model_name.clone(),
+                    choices: vec![ChatCompletionChunkChoice {
+                        index: 0,
+                        delta: ChatCompletionChunkDelta {
+                            role,
+                            content: Some(chunk.to_string()),
+                            tool_calls: None,
+                        },
+                        finish_reason: None,
+                    }],
+                    usage: None,
+                };
+                let _ = tx_chunks.blocking_send(Ok(Event::default().json_data(payload).unwrap()));
             },
         );
-    }
 
-    // Real, disclosed simplification (see `tool_preamble`'s doc
-    // comment): a detected tool call is emitted as ONE delta carrying
-    // the whole `tool_calls` entry, not incrementally streamed
-    // argument-by-argument the way real OpenAI streaming tool-calls
-    // work -- this server has no notion of "partial JSON" to stream
-    // before generation finishes anyway, since detection only happens
-    // once the full stop-bounded text is in hand.
-    let tool_call = if tools_active {
-        extract_tool_call(&full_text)
-    } else {
-        None
-    };
-
-    let mut events: Vec<Result<Event, Infallible>> = Vec::with_capacity(chunks.len() + 2);
-    if let Some((name, arguments)) = &tool_call {
-        let delta = ChatCompletionChunkDelta {
-            role: Some("assistant"),
-            content: None,
-            tool_calls: Some(vec![ToolCallOut {
-                id: "call_0".to_string(),
-                kind: "function",
-                function: ToolCallFunctionOut {
-                    name: name.clone(),
-                    arguments: arguments.clone(),
-                },
-            }]),
-        };
-        let payload = ChatCompletionChunk {
-            id: "ferrox-demo-0".to_string(),
-            object: "chat.completion.chunk",
-            model: model_name.clone(),
-            choices: vec![ChatCompletionChunkChoice {
-                index: 0,
-                delta,
-                finish_reason: None,
-            }],
-            usage: None,
-        };
-        events.push(Ok(Event::default().json_data(payload).unwrap()));
-    } else {
-        for (i, chunk) in chunks.iter().enumerate() {
-            let delta = ChatCompletionChunkDelta {
-                role: if i == 0 { Some("assistant") } else { None },
-                content: Some(chunk.clone()),
-                tool_calls: None,
-            };
-            let payload = ChatCompletionChunk {
-                id: "ferrox-demo-0".to_string(),
-                object: "chat.completion.chunk",
-                model: model_name.clone(),
-                choices: vec![ChatCompletionChunkChoice {
-                    index: 0,
-                    delta,
-                    finish_reason: None,
-                }],
-                usage: None,
-            };
-            events.push(Ok(Event::default().json_data(payload).unwrap()));
+        match result {
+            Ok((finish, usage, full_text)) => {
+                if let Some(id) = &session_id {
+                    sessions.store_reply(
+                        id,
+                        ChatMessage {
+                            role: "assistant".to_string(),
+                            content: Some(full_text.clone()),
+                            tool_calls: None,
+                            tool_call_id: None,
+                        },
+                    );
+                }
+                let tool_call = if tools_active {
+                    extract_tool_call(&full_text)
+                } else {
+                    None
+                };
+                if !overlap {
+                    if let Some((name, arguments)) = &tool_call {
+                        let payload = ChatCompletionChunk {
+                            id: "ferrox-demo-0".to_string(),
+                            object: "chat.completion.chunk",
+                            model: model_name.clone(),
+                            choices: vec![ChatCompletionChunkChoice {
+                                index: 0,
+                                delta: ChatCompletionChunkDelta {
+                                    role: Some("assistant"),
+                                    content: None,
+                                    tool_calls: Some(vec![ToolCallOut {
+                                        id: "call_0".to_string(),
+                                        kind: "function",
+                                        function: ToolCallFunctionOut {
+                                            name: name.clone(),
+                                            arguments: arguments.clone(),
+                                        },
+                                    }]),
+                                },
+                                finish_reason: None,
+                            }],
+                            usage: None,
+                        };
+                        let _ = tx.blocking_send(Ok(Event::default().json_data(payload).unwrap()));
+                    } else if !full_text.is_empty() {
+                        let payload = ChatCompletionChunk {
+                            id: "ferrox-demo-0".to_string(),
+                            object: "chat.completion.chunk",
+                            model: model_name.clone(),
+                            choices: vec![ChatCompletionChunkChoice {
+                                index: 0,
+                                delta: ChatCompletionChunkDelta {
+                                    role: Some("assistant"),
+                                    content: Some(full_text),
+                                    tool_calls: None,
+                                },
+                                finish_reason: None,
+                            }],
+                            usage: None,
+                        };
+                        let _ = tx.blocking_send(Ok(Event::default().json_data(payload).unwrap()));
+                    }
+                }
+                let final_finish_reason = if tool_call.is_some() {
+                    "tool_calls"
+                } else {
+                    finish.as_str()
+                };
+                let final_payload = ChatCompletionChunk {
+                    id: "ferrox-demo-0".to_string(),
+                    object: "chat.completion.chunk",
+                    model: model_name,
+                    choices: vec![ChatCompletionChunkChoice {
+                        index: 0,
+                        delta: ChatCompletionChunkDelta {
+                            role: None,
+                            content: None,
+                            tool_calls: None,
+                        },
+                        finish_reason: Some(final_finish_reason),
+                    }],
+                    usage: Some(usage),
+                };
+                let _ = tx.blocking_send(Ok(Event::default().json_data(final_payload).unwrap()));
+                let _ = tx.blocking_send(Ok(Event::default().data("[DONE]")));
+            }
+            Err(e) => {
+                tracing::warn!("decode error on streamed request: {e}");
+                let payload = ChatCompletionChunk {
+                    id: "ferrox-demo-0".to_string(),
+                    object: "chat.completion.chunk",
+                    model: model_name,
+                    choices: vec![ChatCompletionChunkChoice {
+                        index: 0,
+                        delta: ChatCompletionChunkDelta {
+                            role: Some("assistant"),
+                            content: Some(format!("[error: {e}]")),
+                            tool_calls: None,
+                        },
+                        finish_reason: Some("stop"),
+                    }],
+                    usage: None,
+                };
+                let _ = tx.blocking_send(Ok(Event::default().json_data(payload).unwrap()));
+                let _ = tx.blocking_send(Ok(Event::default().data("[DONE]")));
+            }
         }
-    }
+    });
 
-    let final_finish_reason = if tool_call.is_some() {
-        "tool_calls"
-    } else {
-        finish.as_str()
-    };
-    let final_payload = ChatCompletionChunk {
-        id: "ferrox-demo-0".to_string(),
-        object: "chat.completion.chunk",
-        model: model_name,
-        choices: vec![ChatCompletionChunkChoice {
-            index: 0,
-            delta: ChatCompletionChunkDelta {
-                role: None,
-                content: None,
-                tool_calls: None,
-            },
-            finish_reason: Some(final_finish_reason),
-        }],
-        usage: Some(usage),
-    };
-    events.push(Ok(Event::default().json_data(final_payload).unwrap()));
-    events.push(Ok(Event::default().data("[DONE]")));
-
-    Ok(Sse::new(futures_util::stream::iter(events)).keep_alive(KeepAlive::default()))
+    let stream = futures_util::stream::unfold(rx, |mut rx| async move {
+        match rx.recv().await {
+            Some(ev) => Some((ev, rx)),
+            None => None,
+        }
+    });
+    Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
 }
 
 fn build_app_state(
@@ -1490,17 +1628,24 @@ async fn run() -> anyhow::Result<()> {
             k.tokenizer.vocab_size()
         ),
     }
-    // Opt-in, off by default: a real
-    // VRAM budget makes each GGUF-path forward call build one global
-    // `ResidencyPlan` across all layers (the budget is never re-spent
-    // per layer) and dispatch device-placed routed experts
-    // through real CUDA kernels (Q8_0/Q4_0/Q4_K/Q5_K/Q6_K) when this
-    // binary is built with `--features cuda`; without that feature,
-    // this still works but every expert runs on CPU regardless (see
-    // `Decoder::gpu_vram_budget_bytes`'s doc comment). Not yet
-    // supported for the Kimi K3 path -- its separate MoE stack
-    // (`ferrox_models::latent_moe`) isn't wired to `PlacementPlan` at
-    // all, a real, disclosed gap, not silently ignored.
+    // Opt-in VRAM budget for GPU-resident MoE experts. When unset but
+    // Metal is active, default to a large budget so routed experts that
+    // have Metal-capable quants run via `run_expert_placed` (Metal
+    // matvec) instead of staying on CPU after Metal attention. Explicit
+    // `FERROX_GPU_VRAM_BUDGET_BYTES=0` keeps the historical all-CPU MoE
+    // placement. CUDA builds still require an explicit budget (Vast /
+    // multi-GPU hosts vary too much for a safe default).
+    let metal_default_moe_budget = {
+        #[cfg(feature = "metal")]
+        {
+            ferrox_core::metal_dense_enabled()
+                && std::env::var("FERROX_GPU_VRAM_BUDGET_BYTES").is_err()
+        }
+        #[cfg(not(feature = "metal"))]
+        {
+            false
+        }
+    };
     if let Ok(budget_str) = std::env::var("FERROX_GPU_VRAM_BUDGET_BYTES") {
         let budget: u64 = budget_str
             .parse()
@@ -1509,8 +1654,7 @@ async fn run() -> anyhow::Result<()> {
             model::LoadedModel::Gguf(g) => {
                 tracing::info!(
                     "GPU expert placement enabled: {budget} byte VRAM budget for routed experts \
-                     (requires this binary to be built with --features cuda for real GPU \
-                     dispatch; otherwise every expert still runs on CPU)"
+                     (CUDA and/or Metal matvecs when built with the matching feature)"
                 );
                 g.decoder.gpu_vram_budget_bytes = Some(budget);
             }
@@ -1520,6 +1664,18 @@ async fn run() -> anyhow::Result<()> {
                      supported yet (its MoE stack isn't wired to PlacementPlan), ignoring"
                 );
             }
+        }
+    } else if metal_default_moe_budget {
+        // ~64 GiB sentinel: place as many experts as the planner allows;
+        // Metal unified memory makes a hard VRAM split less meaningful
+        // than on discrete CUDA cards.
+        const METAL_DEFAULT_MOE_BUDGET: u64 = 64 * 1024 * 1024 * 1024;
+        if let model::LoadedModel::Gguf(g) = &mut loaded {
+            tracing::info!(
+                "Metal MoE expert placement default-on ({METAL_DEFAULT_MOE_BUDGET} byte budget); \
+                 set FERROX_GPU_VRAM_BUDGET_BYTES=0 to force CPU experts"
+            );
+            g.decoder.gpu_vram_budget_bytes = Some(METAL_DEFAULT_MOE_BUDGET);
         }
     }
     #[cfg(feature = "cuda")]

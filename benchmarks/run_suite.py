@@ -184,6 +184,12 @@ def run_ferrox(
                 "(rebuild with --features metal)",
                 "engine": "ferrox",
             }
+    if backend == "cuda":
+        if b"FERROX_CUDA" not in Path(bin_path).read_bytes() and b"ferrox_cuda" not in Path(
+            bin_path
+        ).read_bytes():
+            # Soft check — CUDA feature symbols vary; still set env below.
+            pass
     kill_port(port)
     env = os.environ.copy()
     env["FERROX_MODEL_PATH"] = model
@@ -192,8 +198,14 @@ def run_ferrox(
     if backend == "metal":
         env["FERROX_METAL"] = "1"
         env["FERROX_METAL_ATTN"] = "1"
+        env["FERROX_CUDA"] = "0"
+    elif backend == "cuda":
+        env["FERROX_METAL"] = "0"
+        env["FERROX_CUDA"] = "1"
+        env.setdefault("FERROX_CUDA_GQA", "1")
     else:
         env["FERROX_METAL"] = "0"
+        env["FERROX_CUDA"] = "0"
         env["FERROX_CPU_INT_DOT"] = env.get("FERROX_CPU_INT_DOT", "1")
     RECEIPTS.mkdir(parents=True, exist_ok=True)
     log_path = RECEIPTS / f"_tmp_ferrox_{port}.log"
@@ -390,8 +402,14 @@ def run_cli_engine(
     if backend == "metal":
         env["FERROX_METAL"] = "1"
         env["FERROX_METAL_ATTN"] = "1"
+        env["FERROX_CUDA"] = "0"
+    elif backend == "cuda":
+        env["FERROX_METAL"] = "0"
+        env["FERROX_CUDA"] = "1"
+        env.setdefault("FERROX_CUDA_GQA", "1")
     else:
         env["FERROX_METAL"] = "0"
+        env["FERROX_CUDA"] = "0"
         env["FERROX_CPU_INT_DOT"] = os.environ.get("FERROX_CPU_INT_DOT", "1")
     runs = []
     for _ in range(max(reps, 1)):
@@ -553,8 +571,13 @@ def main() -> None:
     ap.add_argument("--id", help="Suite model id (default: all matching --backend)")
     ap.add_argument(
         "--backend",
-        choices=["metal", "cpu"],
+        choices=["metal", "cpu", "cuda"],
         help="Backend to run (required unless --list)",
+    )
+    ap.add_argument(
+        "--host-label",
+        default=None,
+        help="Override host string written into the pin (required for reproducible CUDA pins)",
     )
     ap.add_argument("--list", action="store_true", help="List suite entries and exit")
     ap.add_argument("--gguf-override", help="Override GGUF path for --id")
@@ -590,24 +613,42 @@ def main() -> None:
         return
 
     if not args.backend:
-        raise SystemExit("--backend metal|cpu required (or --list)")
+        raise SystemExit("--backend metal|cpu|cuda required (or --list)")
 
+    if args.backend == "cuda" and not args.host_label:
+        print(
+            "warning: CUDA pins should set --host-label with GPU/driver "
+            "(e.g. 'Vast RTX4090 / driver 550')",
+            flush=True,
+        )
     # Resolve binaries per mode. Prefer the pinned bench copies (immune
     # to concurrent `cargo build` runs replacing target/release binaries,
     # possibly without --features metal — which silently decodes on CPU).
     if args.ferrox_bin is None:
         if args.mode == "cli":
-            bench = ROOT / "target/bench/ferrox-cli-metal"
-            args.ferrox_bin = str(bench if bench.is_file() else ROOT / "target/release/ferrox")
+            if args.backend == "cuda":
+                bench = ROOT / "target/bench/ferrox-cli-cuda"
+            elif args.backend == "metal":
+                bench = ROOT / "target/bench/ferrox-cli-metal"
+            else:
+                bench = ROOT / "target/release/ferrox"
+            args.ferrox_bin = str(
+                bench if bench.is_file() else ROOT / "target/release/ferrox"
+            )
         else:
-            bench = ROOT / "target/bench/ferrox-server-metal"
+            if args.backend == "cuda":
+                bench = ROOT / "target/bench/ferrox-server-cuda"
+            elif args.backend == "metal":
+                bench = ROOT / "target/bench/ferrox-server-metal"
+            else:
+                bench = ROOT / "target/release/ferrox-server"
             args.ferrox_bin = str(
                 bench if bench.is_file() else ROOT / "target/release/ferrox-server"
             )
     if args.llama_bin is None:
         args.llama_bin = "llama-cli" if args.mode == "cli" else "llama-server"
 
-    host = suite.get("host_default", HOST_DEFAULT)
+    host = args.host_label or suite.get("host_default", HOST_DEFAULT)
     entries = suite["models"]
     if args.id:
         entries = [m for m in entries if m["id"] == args.id]

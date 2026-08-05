@@ -19,6 +19,7 @@ pub mod execution_plan;
 pub mod glm52_decoder;
 pub mod glm52_gguf_loader;
 pub mod glm_dsa;
+pub mod hybrid_engine;
 pub mod hyper_connections;
 pub mod kda;
 pub mod kimi_decoder;
@@ -26,17 +27,21 @@ pub mod kimi_generate;
 pub mod kimi_gguf_loader;
 pub mod kimi_loader;
 pub mod kimi_tokenizer;
+pub mod kimi_validate;
 pub mod latent_moe;
 pub mod loader;
 pub mod mla;
 pub mod output_projection;
 pub mod prefix_cache;
+pub mod recurrent_engine;
 pub mod residency_report;
 pub mod sampling;
 pub mod speculative;
+pub mod t5_engine;
 pub mod tensor_role;
 pub mod tokenizer;
 pub mod vision;
+pub mod vl_engine;
 
 pub use capability::{
     architecture_catalog, coverage_report_markdown, resolve_architecture, resolve_profile,
@@ -44,7 +49,9 @@ pub use capability::{
 };
 pub use config::{deepseek_v4_pro, glm_5_2, kimi_k3, FfnActivation, ModelConfig, RopeLayout};
 pub use decoder::Decoder;
-pub use engine::{Engine, Glm52Engine, KimiEngine, TextTokenizer};
+pub use engine::{
+    DeepseekV4Engine, Engine, Glm52Engine, KimiEngine, MlaEngine, MlaLayerWeights, TextTokenizer,
+};
 pub use engine_factory::{
     ensure_generic_decoder, select_engine_kind, EngineSelectError, SelectedEngineKind, ServedEngine,
 };

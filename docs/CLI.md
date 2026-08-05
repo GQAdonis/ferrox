@@ -103,6 +103,23 @@ enables all supported operations on the selected backend.
 ./target/release/ferrox run-kimi /path/to/kimi --prompt "Hi" --max-new-tokens 32
 ```
 
+## Interactive chat (`chat`)
+
+Multi-turn REPL against a running `ferrox-server` (reuses chat-template + SSE):
+
+```bash
+FERROX_MODEL_PATH=model.gguf FERROX_ADDR=127.0.0.1:8383 ./target/release/ferrox-server
+./target/release/ferrox chat --url http://127.0.0.1:8383 --system "Be brief."
+# Commands: /quit  /clear
+```
+
+| Flag | Notes |
+|---|---|
+| `--url` | Server base URL (default `http://127.0.0.1:8383`) |
+| `--system` | Optional system message |
+| `--max-tokens` / `--temperature` / `--top-p` | Sampling |
+| `--no-stream` | Wait for full JSON instead of SSE |
+
 ## Server
 
 OpenAI-compatible HTTP API:

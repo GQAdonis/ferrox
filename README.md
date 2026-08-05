@@ -61,10 +61,10 @@ Good first models: TinyLlama Q8_0, SmolLM2-135M Q8_0, Llama-3.1-8B Q4_K_M.
 
 | Area | State |
 |---|---|
-| Dense GQA (CPU / Metal) | Verified — TinyLlama, Llama 3.1/3.2 at ~1× llama.cpp on Metal |
+| Dense GQA (CPU / Metal) | Verified — TinyLlama, Llama 3.1/3.2; Llama-8B Metal fair-chat Gap ~1.03× (CLI 1.00×) |
 | Qwen2.5 / Qwen3 / SmolLM2 | Verified — CPU strong; Metal ahead of llama.cpp |
-| Gemma-3 / Phi-3-mini | Verified — full Metal stack; ~0.7–0.8× llama.cpp decode |
-| MoE (CPU / CUDA) | Verified — OLMoE matches llama.cpp |
+| Gemma-3 / Phi-3-mini | Verified — full Metal stack; ~0.7–0.8× llama.cpp decode (legacy attn dims) |
+| MoE (CPU) | Verified — OLMoE matches llama.cpp; CUDA historically, no current pin |
 | Kimi / GLM / DeepSeek | Partial — primitives and synthetic stacks, no frontier checkpoint end-to-end |
 | CUDA performance | Deferred — compiles and runs; fair-chat tuning paused |
 
@@ -77,6 +77,7 @@ Benchmark methodology and receipts: [benchmarks/RESULTS.md](benchmarks/RESULTS.m
 |---|---|
 | [docs/CLI.md](docs/CLI.md) | CLI flags and examples |
 | [docs/MODELS.md](docs/MODELS.md) | Supported models and verification status |
+| [docs/API.md](docs/API.md) | OpenAI-compatible API matrix |
 | [docs/CONFIG.md](docs/CONFIG.md) | Environment variables and tuning |
 | [benchmarks/RESULTS.md](benchmarks/RESULTS.md) | Pinned tok/s vs llama.cpp |
 | [docs/ROADMAP.md](docs/ROADMAP.md) | Planned work |

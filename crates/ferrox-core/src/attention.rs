@@ -139,11 +139,16 @@ unsafe fn dot_f32_avx2(a: &[f32], b: &[f32]) -> f32 {
 /// Online (flash-style) softmax·V accumulate for one head: one pass over
 /// K/V, no `seq_len` score buffer. Numerically matches classic
 /// max-subtract softmax within float noise (see unit tests).
+///
+/// When `attn_softcap` is `Some(sc)` with `sc > 0`, each score is remapped
+/// with Gemma-2-style `sc * tanh(score / sc)` before the online softmax
+/// (llama.cpp `attention.logit_softcapping`).
 fn online_attn_accumulate(
     q_h: &[f32],
     scale: f32,
     head_dim: usize,
     out_h: &mut [f32],
+    attn_softcap: Option<f32>,
     mut for_each_kv: impl FnMut(&mut dyn FnMut(&[f32], &[f32])),
 ) {
     debug_assert_eq!(q_h.len(), head_dim);
@@ -152,7 +157,10 @@ fn online_attn_accumulate(
     let mut l = 0f32;
     out_h.fill(0.0);
     for_each_kv(&mut |k_t, v_t| {
-        let s = dot_f32(q_h, k_t) * scale;
+        let mut s = dot_f32(q_h, k_t) * scale;
+        if let Some(sc) = attn_softcap.filter(|&c| c > 0.0) {
+            s = sc * (s / sc).tanh();
+        }
         let m_new = m.max(s);
         let alpha = (m - m_new).exp();
         let p = (s - m_new).exp();
@@ -282,6 +290,23 @@ pub fn causal_gqa_attention(
     head_dim: usize,
     seq_len: usize,
 ) -> Vec<f32> {
+    causal_gqa_attention_softcap(
+        q, k_cache, v_cache, n_heads, n_kv_heads, head_dim, seq_len, None,
+    )
+}
+
+/// [`causal_gqa_attention`] with optional Gemma-2 attention logit softcap.
+#[allow(clippy::too_many_arguments)]
+pub fn causal_gqa_attention_softcap(
+    q: &[f32],
+    k_cache: &[f32],
+    v_cache: &[f32],
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    seq_len: usize,
+    attn_softcap: Option<f32>,
+) -> Vec<f32> {
     assert_eq!(q.len(), n_heads * head_dim);
     assert_eq!(k_cache.len(), seq_len * n_kv_heads * head_dim);
     assert_eq!(v_cache.len(), seq_len * n_kv_heads * head_dim);
@@ -294,7 +319,7 @@ pub fn causal_gqa_attention(
         let kv_h = h / group_size.max(1);
         let q_h = &q[h * head_dim..(h + 1) * head_dim];
         let out_h = &mut out[h * head_dim..(h + 1) * head_dim];
-        online_attn_accumulate(q_h, scale, head_dim, out_h, |visit| {
+        online_attn_accumulate(q_h, scale, head_dim, out_h, attn_softcap, |visit| {
             for t in 0..seq_len {
                 let k_t = &k_cache
                     [(t * n_kv_heads + kv_h) * head_dim..(t * n_kv_heads + kv_h + 1) * head_dim];
@@ -331,6 +356,24 @@ pub fn causal_gqa_attention_windowed(
     seq_len: usize,
     window: usize,
 ) -> Vec<f32> {
+    causal_gqa_attention_windowed_softcap(
+        q, k_cache, v_cache, n_heads, n_kv_heads, head_dim, seq_len, window, None,
+    )
+}
+
+/// [`causal_gqa_attention_windowed`] with optional attention logit softcap.
+#[allow(clippy::too_many_arguments)]
+pub fn causal_gqa_attention_windowed_softcap(
+    q: &[f32],
+    k_cache: &[f32],
+    v_cache: &[f32],
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    seq_len: usize,
+    window: usize,
+    attn_softcap: Option<f32>,
+) -> Vec<f32> {
     assert_eq!(q.len(), n_heads * head_dim);
     assert_eq!(k_cache.len(), seq_len * n_kv_heads * head_dim);
     assert_eq!(v_cache.len(), seq_len * n_kv_heads * head_dim);
@@ -348,7 +391,7 @@ pub fn causal_gqa_attention_windowed(
         let kv_h = h / group_size.max(1);
         let q_h = &q[h * head_dim..(h + 1) * head_dim];
         let out_h = &mut out[h * head_dim..(h + 1) * head_dim];
-        online_attn_accumulate(q_h, scale, head_dim, out_h, |visit| {
+        online_attn_accumulate(q_h, scale, head_dim, out_h, attn_softcap, |visit| {
             for t in window_start..seq_len {
                 let k_t = &k_cache
                     [(t * n_kv_heads + kv_h) * head_dim..(t * n_kv_heads + kv_h + 1) * head_dim];
@@ -432,7 +475,7 @@ pub fn causal_gqa_attention_paged(
         let kv_h = h / group_size.max(1);
         let q_h = &q[h * head_dim..(h + 1) * head_dim];
         let out_h = &mut out[h * head_dim..(h + 1) * head_dim];
-        online_attn_accumulate(q_h, scale, head_dim, out_h, |visit| {
+        online_attn_accumulate(q_h, scale, head_dim, out_h, None, |visit| {
             for t in 0..seq_len {
                 let block_id = block_table[t / block_size];
                 let offset = t % block_size;
@@ -1100,5 +1143,47 @@ mod tests {
         );
         assert_eq!(out.len(), 1);
         assert!((out[0] - 5.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn attn_logit_softcap_changes_output_vs_uncapped() {
+        // Softcap must change the attended output relative to the uncapped
+        // path (and must not be a no-op identity for large scores).
+        let n_heads = 2;
+        let n_kv_heads = 1;
+        let head_dim = 4;
+        let seq_len = 3;
+        let q: Vec<f32> = (0..n_heads * head_dim)
+            .map(|i| (i as f32 + 1.0) * 2.5)
+            .collect();
+        let k: Vec<f32> = (0..seq_len * n_kv_heads * head_dim)
+            .map(|i| (i as f32 * 0.7).sin() * 3.0)
+            .collect();
+        let v: Vec<f32> = (0..seq_len * n_kv_heads * head_dim)
+            .map(|i| (i as f32 * 0.3).cos())
+            .collect();
+        let plain = causal_gqa_attention(&q, &k, &v, n_heads, n_kv_heads, head_dim, seq_len);
+        let capped = causal_gqa_attention_softcap(
+            &q,
+            &k,
+            &v,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            seq_len,
+            Some(30.0),
+        );
+        assert_eq!(plain.len(), capped.len());
+        let differs = plain
+            .iter()
+            .zip(capped.iter())
+            .any(|(a, b)| (a - b).abs() > 1e-5);
+        assert!(differs, "softcap must change attention output");
+        // Softcap None / <=0 must match the uncapped path.
+        let none =
+            causal_gqa_attention_softcap(&q, &k, &v, n_heads, n_kv_heads, head_dim, seq_len, None);
+        for (a, b) in plain.iter().zip(none.iter()) {
+            assert!((a - b).abs() < 1e-6);
+        }
     }
 }

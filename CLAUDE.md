@@ -9,9 +9,9 @@ Metal + CUDA kernels, OpenAI-compatible `ferrox-server`.
 
 **Works today (evidence in docs):**
 
-- Dense GQA: TinyLlama, Llama-3.1-8B Q4_K_M (Metal fair-chat ~1.00×
-  llama.cpp @256-tok).
-- MoE GQA: OLMoE-1B-7B-0924 matches llama.cpp on CPU + CUDA.
+- Dense GQA: TinyLlama, Llama-3.1-8B Q4_K_M (Metal fair-chat Gap
+  ~1.03×; CLI pin **1.00×** — see `benchmarks/RESULTS.md`).
+- MoE GQA: OLMoE-1B-7B-0924 matches llama.cpp on CPU (+ CUDA historically).
 - Metal dense stack (`FERROX_METAL` / `FERROX_METAL_ATTN`); CUDA matvec
   + resident weights + FFN fuse (fair-chat still ≪ llama).
 
@@ -24,9 +24,10 @@ Authoritative docs:
 
 | Doc | Role |
 |---|---|
-| `docs/CLI.md` | `ferrox` llama.cpp-style flags + examples |
+| `docs/CLI.md` | `ferrox` llama.cpp-style flags + `ferrox chat` |
 | `docs/MODELS.md` | what runs / what doesn’t |
-| `benchmarks/RESULTS.md` | tok/s vs llama.cpp (from pins) |
+| `docs/API.md` | OpenAI compatibility matrix |
+| `benchmarks/RESULTS.md` | tok/s vs llama.cpp (Gap = llama/ferrox) |
 | `docs/ROADMAP.md` | future work only |
 
 ## Commands
@@ -49,12 +50,16 @@ cargo test -p ferrox-metal --features metal -- --ignored   # needs Metal
 
 ./target/debug/ferrox presets | archs | caps | inspect <gguf> | inspect-plan <gguf>
 ./target/debug/ferrox smoke <preset> | run-kimi <dir>
+./target/debug/ferrox chat --url http://127.0.0.1:8383   # needs ferrox-server
 
 FERROX_MODEL_PATH=model.gguf FERROX_ADDR=127.0.0.1:8383 ./target/debug/ferrox-server
 
 # Fair-chat vs llama.cpp (Host B): see benchmarks/README.md
 python3 benchmarks/run_suite.py --list
 python3 benchmarks/run_suite.py --id llama31_8b_q4km --backend metal
+# CUDA host (requires --features cuda binary + GPU):
+python3 benchmarks/run_suite.py --id llama31_8b_q4km --backend cuda \
+  --host-label "host / GPU / driver"
 ```
 
 Fixtures and golden values were generated and cross-validated with

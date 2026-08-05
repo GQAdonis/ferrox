@@ -451,9 +451,9 @@ pub fn run_infer(args: InferArgs) -> anyhow::Result<()> {
     if let Some(arch) = file.metadata_str("general.architecture") {
         ensure_generic_decoder(arch).map_err(|e| anyhow::anyhow!("{e}"))?;
     }
-    if !config.best_effort_fields.is_empty()
-        && !(config.best_effort_fields.len() == 1
-            && config.best_effort_fields[0].starts_with("none --"))
+    if !(config.best_effort_fields.is_empty()
+        || (config.best_effort_fields.len() == 1
+            && config.best_effort_fields[0].starts_with("none --")))
     {
         eprintln!(
             "ferrox: inferred config fields: {:?}",

@@ -27,14 +27,27 @@
       "notes": "head_dim=64; FA-vec N/A"
     },
     {
+      "id": "olmoe_q4",
+      "name": "OLMoE-1B-7B-0924 Q4_0",
+      "gguf": "models/olmoe-1b-7b-0924-q4_0.gguf",
+      "backends": [
+        "cpu",
+        "metal",
+        "cuda"
+      ],
+      "expect": "ok",
+      "notes": "Verified MoE; Metal/CUDA expert placement when budget set"
+    },
+    {
       "id": "llama31_8b_q4km",
       "name": "Llama-3.1-8B-Instruct Q4_K_M",
       "gguf": "models/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf",
       "backends": [
-        "metal"
+        "metal",
+        "cuda"
       ],
       "expect": "ok",
-      "notes": "Host B Metal pin (f16 KV + FA-vec d=128)"
+      "notes": "Host B Metal pin; CUDA fair-chat when --backend cuda + --host-label"
     },
     {
       "id": "llama32_3b_q4km",
@@ -47,14 +60,36 @@
       "notes": "head_dim=128; FA applies when present"
     },
     {
-      "id": "olmoe_q4",
-      "name": "OLMoE-1B-7B-0924 Q4_0",
-      "gguf": "models/olmoe-1b-7b-0924-q4_0.gguf",
+      "id": "qwen2moe_05b_q4km",
+      "name": "Qwen1.5-MoE-A2.7B Q4_K_M",
+      "gguf": "models/Qwen1.5-MoE-A2.7B-Chat-Q4_K_M.gguf",
+      "backends": [
+        "cpu",
+        "metal"
+      ],
+      "expect": "ok",
+      "notes": "Qwen2-MoE: QKV bias + shared_expert_gate; oracle receipt pending real GGUF"
+    },
+    {
+      "id": "mistral_7b_q4km",
+      "name": "Mistral-7B-Instruct-v0.2 Q4_K_M",
+      "gguf": "models/Mistral-7B-Instruct-v0.2-Q4_K_M.gguf",
+      "backends": [
+        "cpu",
+        "metal"
+      ],
+      "expect": "ok",
+      "notes": "SWA dense; token-parity receipt pending real GGUF"
+    },
+    {
+      "id": "mixtral_8x7b_q4km",
+      "name": "Mixtral-8x7B-Instruct Q4_K_M",
+      "gguf": "models/Mixtral-8x7B-Instruct-v0.1-Q4_K_M.gguf",
       "backends": [
         "cpu"
       ],
       "expect": "ok",
-      "notes": "Verified MoE; CPU fair-chat"
+      "notes": "Grouped MoE + SWA; CPU receipt first (Metal MoE after pin)"
     },
     {
       "id": "iq4_xs",
@@ -71,10 +106,11 @@
       "name": "Gemma-2-2B-IT Q4_K_M",
       "gguf": "models/gemma-2-2b-it-Q4_K_M.gguf",
       "backends": [
-        "metal"
+        "metal",
+        "cpu"
       ],
-      "expect": "refuse",
-      "notes": "Fail-closed: final logit soft-cap / SWA"
+      "expect": "ok",
+      "notes": "Attn + final logit softcap + SWA; FA-vec skipped when softcap set"
     },
     {
       "id": "smollm2_135m_q8",
@@ -118,7 +154,7 @@
         "cpu"
       ],
       "expect": "ok",
-      "notes": "full Metal stack (embd scale on host, GeGLU, sandwich norms, SWA kv_start, per-layer theta); d=256 still legacy attn kernel (no FA-vec)"
+      "notes": "full Metal stack; FA-vec d=256"
     },
     {
       "id": "phi3_mini_q4",
@@ -129,7 +165,7 @@
         "cpu"
       ],
       "expect": "ok",
-      "notes": "fused QKV/gate+up now split as quantized row slices (Metal-capable); d=96 -> legacy Metal attn kernel (no FA-vec)"
+      "notes": "fused QKV/gate+up split as quantized row slices; FA-vec d=96"
     }
   ]
 }

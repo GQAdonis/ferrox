@@ -211,10 +211,10 @@ kernel void kv_append(
 
 /// Whether FA-vec GQA decode is enabled.
 ///
-/// Default: **on** for `head_dim == 128` (Llama-3.x) and `head_dim == 64`
-/// (TinyLlama, Llama-3.2-1B) via [`encode_gqa`].
-/// `FERROX_METAL_FA_VEC=0|false|off` forces the legacy online-softmax kernel.
-/// `=1|true|on|vec` keeps FA on (still only dispatched for supported dims).
+/// Default: **on** for supported head dims (64 / 96 / 128 / 256) via
+/// [`encode_gqa`]. `FERROX_METAL_FA_VEC=0|false|off` forces the legacy
+/// online-softmax kernel. `=1|true|on|vec` keeps FA on (still only
+/// dispatched for supported dims).
 pub fn metal_fa_vec_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
@@ -515,6 +515,273 @@ kernel void gqa_decode_fa_vec_d64(
 }
 "#;
 
+/// FA-vec decode for **head_dim=96** (Phi-3-mini). D4=24 float4 slices —
+/// lanes `tiisg < 24` own Q/K/V float4 work; remaining warp lanes contribute
+/// zeros to the simd_sum score reduce so the tile/merge structure stays
+/// identical to the d=128 kernel.
+const GQA_DECODE_FA_VEC_D96_KERNEL_SRC: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+kernel void gqa_decode_fa_vec_d96(
+    device const float* q [[buffer(0)]],
+    device const half* k_cache [[buffer(1)]],
+    device const half* v_cache [[buffer(2)]],
+    device float* out [[buffer(3)]],
+    constant uint& n_heads [[buffer(4)]],
+    constant uint& n_kv_heads [[buffer(5)]],
+    constant uint& head_dim [[buffer(6)]],
+    constant uint& seq_len [[buffer(7)]],
+    uint h [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint tg [[threads_per_threadgroup]],
+    threadgroup float* shared [[threadgroup(0)]]
+) {
+    constexpr uint D = 96u;
+    constexpr uint D4 = 24u;
+    constexpr uint C = 32u;
+    constexpr uint NW = 32u;
+    constexpr uint SG_F = C + D;
+
+    if (h >= n_heads || seq_len == 0u || head_dim != D) return;
+
+    const uint tiisg = tid % NW;
+    const uint sgitg = tid / NW;
+    const uint nsg = tg / NW;
+
+    threadgroup float4* sq4 = (threadgroup float4*)shared;
+    threadgroup float* ss = shared + D + sgitg * SG_F;
+    threadgroup float4* so4 = (threadgroup float4*)(ss + C);
+
+    uint group_size = n_heads / max(n_kv_heads, 1u);
+    uint kv_h = h / max(group_size, 1u);
+    float scale = 1.0f / sqrt(float(D));
+
+    device const float4* q4 = (device const float4*)(q + h * D);
+    for (uint i = tid; i < D4; i += tg) {
+        sq4[i] = q4[i];
+    }
+    if (tiisg < D4) {
+        so4[tiisg] = float4(0.0f);
+    }
+    ss[tiisg] = 0.0f;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float S = 0.0f;
+    float M = -INFINITY;
+
+    for (uint ic0 = sgitg; ic0 * C < seq_len; ic0 += nsg) {
+        uint ic = ic0 * C;
+        uint chunk = min(C, seq_len - ic);
+
+        float scores[C];
+        for (uint cc = 0; cc < C; cc++) {
+            scores[cc] = -INFINITY;
+        }
+        for (uint cc = 0; cc < chunk; cc++) {
+            device const half4* k4 =
+                (device const half4*)(k_cache + ((ic + cc) * n_kv_heads + kv_h) * D);
+            float partial = (tiisg < D4) ? dot(sq4[tiisg], float4(k4[tiisg])) : 0.0f;
+            scores[cc] = simd_sum(partial) * scale;
+        }
+
+        float s_lane = (tiisg < chunk) ? scores[tiisg] : -INFINITY;
+        float M2 = simd_max(max(M, s_lane));
+        float ms = (M == -INFINITY) ? 0.0f : exp(M - M2);
+        float vs = (s_lane == -INFINITY) ? 0.0f : exp(s_lane - M2);
+        S = S * ms + simd_sum(vs);
+        ss[tiisg] = vs;
+        if (tiisg < D4) {
+            so4[tiisg] *= ms;
+        }
+        M = M2;
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+
+        float4 lo = float4(0.0f);
+        if (tiisg < D4) {
+            for (uint cc = 0; cc < chunk; cc++) {
+                device const half4* v4 =
+                    (device const half4*)(v_cache + ((ic + cc) * n_kv_heads + kv_h) * D);
+                lo += float4(v4[tiisg]) * ss[cc];
+            }
+            so4[tiisg] += lo;
+        }
+    }
+
+    if (tiisg == 0u) {
+        ss[0] = S;
+        ss[1] = M;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint r = nsg >> 1; r > 0u; r >>= 1) {
+        if (sgitg < r) {
+            threadgroup float* ss0 = shared + D + sgitg * SG_F;
+            threadgroup float* ss1 = shared + D + (sgitg + r) * SG_F;
+            threadgroup float4* so0 = (threadgroup float4*)(ss0 + C);
+            threadgroup float4* so1 = (threadgroup float4*)(ss1 + C);
+            float S0 = ss0[0];
+            float S1 = ss1[0];
+            float M0 = ss0[1];
+            float M1 = ss1[1];
+            float Mn = max(M0, M1);
+            float a0 = (M0 == -INFINITY) ? 0.0f : exp(M0 - Mn);
+            float a1 = (M1 == -INFINITY) ? 0.0f : exp(M1 - Mn);
+            if (tiisg == 0u) {
+                ss0[0] = S0 * a0 + S1 * a1;
+                ss0[1] = Mn;
+            }
+            if (tiisg < D4) {
+                so0[tiisg] = so0[tiisg] * a0 + so1[tiisg] * a1;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (sgitg == 0u && tiisg < D4) {
+        threadgroup float* ss0 = shared + D;
+        threadgroup float4* so0 = (threadgroup float4*)(ss0 + C);
+        float inv = (ss0[0] == 0.0f) ? 0.0f : (1.0f / ss0[0]);
+        device float4* out4 = (device float4*)(out + h * D);
+        out4[tiisg] = so0[tiisg] * inv;
+    }
+}
+"#;
+
+/// FA-vec decode for **head_dim=256** (Gemma-3). D4=64 float4 slices —
+/// each warp lane owns two slices (`tiisg` and `tiisg+32`) so the simd
+/// reduce still covers the full head.
+const GQA_DECODE_FA_VEC_D256_KERNEL_SRC: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+kernel void gqa_decode_fa_vec_d256(
+    device const float* q [[buffer(0)]],
+    device const half* k_cache [[buffer(1)]],
+    device const half* v_cache [[buffer(2)]],
+    device float* out [[buffer(3)]],
+    constant uint& n_heads [[buffer(4)]],
+    constant uint& n_kv_heads [[buffer(5)]],
+    constant uint& head_dim [[buffer(6)]],
+    constant uint& seq_len [[buffer(7)]],
+    uint h [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint tg [[threads_per_threadgroup]],
+    threadgroup float* shared [[threadgroup(0)]]
+) {
+    constexpr uint D = 256u;
+    constexpr uint D4 = 64u;
+    constexpr uint C = 32u;
+    constexpr uint NW = 32u;
+    constexpr uint SG_F = C + D;
+
+    if (h >= n_heads || seq_len == 0u || head_dim != D) return;
+
+    const uint tiisg = tid % NW;
+    const uint sgitg = tid / NW;
+    const uint nsg = tg / NW;
+
+    threadgroup float4* sq4 = (threadgroup float4*)shared;
+    threadgroup float* ss = shared + D + sgitg * SG_F;
+    threadgroup float4* so4 = (threadgroup float4*)(ss + C);
+
+    uint group_size = n_heads / max(n_kv_heads, 1u);
+    uint kv_h = h / max(group_size, 1u);
+    float scale = 1.0f / sqrt(float(D));
+
+    device const float4* q4 = (device const float4*)(q + h * D);
+    for (uint i = tid; i < D4; i += tg) {
+        sq4[i] = q4[i];
+    }
+    so4[tiisg] = float4(0.0f);
+    so4[tiisg + NW] = float4(0.0f);
+    ss[tiisg] = 0.0f;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float S = 0.0f;
+    float M = -INFINITY;
+
+    for (uint ic0 = sgitg; ic0 * C < seq_len; ic0 += nsg) {
+        uint ic = ic0 * C;
+        uint chunk = min(C, seq_len - ic);
+
+        float scores[C];
+        for (uint cc = 0; cc < C; cc++) {
+            scores[cc] = -INFINITY;
+        }
+        for (uint cc = 0; cc < chunk; cc++) {
+            device const half4* k4 =
+                (device const half4*)(k_cache + ((ic + cc) * n_kv_heads + kv_h) * D);
+            float partial = 0.0f;
+            for (uint i = tiisg; i < D4; i += NW) {
+                partial += dot(sq4[i], float4(k4[i]));
+            }
+            scores[cc] = simd_sum(partial) * scale;
+        }
+
+        float s_lane = (tiisg < chunk) ? scores[tiisg] : -INFINITY;
+        float M2 = simd_max(max(M, s_lane));
+        float ms = (M == -INFINITY) ? 0.0f : exp(M - M2);
+        float vs = (s_lane == -INFINITY) ? 0.0f : exp(s_lane - M2);
+        S = S * ms + simd_sum(vs);
+        ss[tiisg] = vs;
+        so4[tiisg] *= ms;
+        so4[tiisg + NW] *= ms;
+        M = M2;
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+
+        float4 lo0 = float4(0.0f);
+        float4 lo1 = float4(0.0f);
+        for (uint cc = 0; cc < chunk; cc++) {
+            device const half4* v4 =
+                (device const half4*)(v_cache + ((ic + cc) * n_kv_heads + kv_h) * D);
+            lo0 += float4(v4[tiisg]) * ss[cc];
+            lo1 += float4(v4[tiisg + NW]) * ss[cc];
+        }
+        so4[tiisg] += lo0;
+        so4[tiisg + NW] += lo1;
+    }
+
+    if (tiisg == 0u) {
+        ss[0] = S;
+        ss[1] = M;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint r = nsg >> 1; r > 0u; r >>= 1) {
+        if (sgitg < r) {
+            threadgroup float* ss0 = shared + D + sgitg * SG_F;
+            threadgroup float* ss1 = shared + D + (sgitg + r) * SG_F;
+            threadgroup float4* so0 = (threadgroup float4*)(ss0 + C);
+            threadgroup float4* so1 = (threadgroup float4*)(ss1 + C);
+            float S0 = ss0[0];
+            float S1 = ss1[0];
+            float M0 = ss0[1];
+            float M1 = ss1[1];
+            float Mn = max(M0, M1);
+            float a0 = (M0 == -INFINITY) ? 0.0f : exp(M0 - Mn);
+            float a1 = (M1 == -INFINITY) ? 0.0f : exp(M1 - Mn);
+            if (tiisg == 0u) {
+                ss0[0] = S0 * a0 + S1 * a1;
+                ss0[1] = Mn;
+            }
+            so0[tiisg] = so0[tiisg] * a0 + so1[tiisg] * a1;
+            so0[tiisg + NW] = so0[tiisg + NW] * a0 + so1[tiisg + NW] * a1;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (sgitg == 0u) {
+        threadgroup float* ss0 = shared + D;
+        threadgroup float4* so0 = (threadgroup float4*)(ss0 + C);
+        float inv = (ss0[0] == 0.0f) ? 0.0f : (1.0f / ss0[0]);
+        device float4* out4 = (device float4*)(out + h * D);
+        out4[tiisg] = so0[tiisg] * inv;
+        out4[tiisg + NW] = so0[tiisg + NW] * inv;
+    }
+}
+"#;
+
 const GQA_DECODE_KERNEL_SRC: &str = r#"
 #include <metal_stdlib>
 using namespace metal;
@@ -541,6 +808,7 @@ kernel void gqa_decode(
     constant uint& head_dim [[buffer(6)]],
     constant uint& seq_len [[buffer(7)]],
     constant uint& kv_start [[buffer(8)]],
+    constant float& softcap [[buffer(9)]],
     uint h [[threadgroup_position_in_grid]],
     uint tid [[thread_position_in_threadgroup]],
     uint tg [[threads_per_threadgroup]],
@@ -593,6 +861,9 @@ kernel void gqa_decode(
             }
         }
         float score = dot * scale;
+        if (softcap > 0.0f) {
+            score = softcap * tanh(score / softcap);
+        }
         float m2 = max(m, score);
         float a = online_rescale(m, m2);
         float b = exp(score - m2);
@@ -1371,14 +1642,14 @@ fn gqa_decode_threadgroup_size(seq_len: u32, head_dim: u32) -> u32 {
     nsg * NW
 }
 
-/// TG size for FA-vec decode (d=128 and d=64): NSG=8 × NW=32.
+/// TG size for FA-vec decode (d=64/96/128/256): NSG=8 × NW=32.
 fn gqa_fa_vec_threadgroup_size(_head_dim: u32) -> u32 {
     256
 }
 
 /// Head dims the FA-vec decode kernels cover (dedicated specializations).
 fn gqa_fa_vec_supported(head_dim: u32) -> bool {
-    head_dim == 128 || head_dim == 64
+    matches!(head_dim, 64 | 96 | 128 | 256)
 }
 
 /// Prefill GQA keeps the legacy per-thread TG-acc layout; TG must be a
@@ -1410,7 +1681,17 @@ fn encode_gqa_fa_vec(
     seq_len: u32,
 ) -> Result<(), MetalError> {
     let pipe = match head_dim {
+        256 => ensure_pipeline(
+            device,
+            GQA_DECODE_FA_VEC_D256_KERNEL_SRC,
+            "gqa_decode_fa_vec_d256",
+        )?,
         128 => ensure_pipeline(device, GQA_DECODE_FA_VEC_KERNEL_SRC, "gqa_decode_fa_vec")?,
+        96 => ensure_pipeline(
+            device,
+            GQA_DECODE_FA_VEC_D96_KERNEL_SRC,
+            "gqa_decode_fa_vec_d96",
+        )?,
         64 => ensure_pipeline(
             device,
             GQA_DECODE_FA_VEC_D64_KERNEL_SRC,
@@ -1470,10 +1751,12 @@ fn encode_gqa(
     head_dim: u32,
     seq_len: u32,
     kv_start: u32,
+    attn_softcap: Option<f32>,
 ) -> Result<(), MetalError> {
-    // FA-vec kernels scan the full prefix; SWA (kv_start > 0) uses the
-    // legacy online-softmax kernel which honours the window start.
-    if kv_start == 0 && metal_fa_vec_enabled() && gqa_fa_vec_supported(head_dim) {
+    let softcap = attn_softcap.filter(|&c| c > 0.0).unwrap_or(0.0);
+    // FA-vec kernels scan the full prefix and have no softcap path; SWA
+    // (kv_start > 0) and softcap use the legacy online-softmax kernel.
+    if softcap == 0.0 && kv_start == 0 && metal_fa_vec_enabled() && gqa_fa_vec_supported(head_dim) {
         return encode_gqa_fa_vec(
             encoder, device, q, k, v, out, n_heads, n_kv_heads, head_dim, seq_len,
         );
@@ -1506,6 +1789,8 @@ fn encode_gqa(
         encoder.setBytes_length_atIndex(NonNull::new(&mut sl as *mut u32 as *mut _).unwrap(), 4, 7);
         let mut ks = kv_start;
         encoder.setBytes_length_atIndex(NonNull::new(&mut ks as *mut u32 as *mut _).unwrap(), 4, 8);
+        let mut sc = softcap;
+        encoder.setBytes_length_atIndex(NonNull::new(&mut sc as *mut f32 as *mut _).unwrap(), 4, 9);
         encoder.setThreadgroupMemoryLength_atIndex(tg_mem, 0);
     }
     encoder.dispatchThreadgroups_threadsPerThreadgroup(
@@ -1765,6 +2050,7 @@ pub fn launch_decode_attn_block(
         head_dim as u32,
         new_seq,
         0,
+        extras.attn_logit_softcap,
     )?;
 
     // O matvec reads attn_buf as activation `x`.
@@ -1935,6 +2221,7 @@ pub fn launch_decode_dense_layer(
         head_dim as u32,
         new_seq,
         0,
+        extras.attn_logit_softcap,
     )?;
     encode_matvec(&encoder, device, o_launch, &o_w, &attn_buf, &o_buf)?;
     encode_add_rms_norm(
@@ -1973,6 +2260,8 @@ pub fn launch_decode_dense_layer(
 /// Optional attention epilogue ops applied between the QKV matvecs and
 /// RoPE, in CPU-path order: bias add (Qwen2-family `qkv_bias`), then
 /// per-head QK-RMSNorm (Qwen3 / Gemma-3, weight length = head_dim).
+/// `attn_logit_softcap` is applied inside GQA after score scaling
+/// (Gemma-2); when set, FA-vec is skipped in favour of the legacy kernel.
 #[derive(Default)]
 pub struct AttnExtras<'a> {
     pub q_bias: Option<&'a [f32]>,
@@ -1980,6 +2269,7 @@ pub struct AttnExtras<'a> {
     pub v_bias: Option<&'a [f32]>,
     pub q_norm: Option<&'a [f32]>,
     pub k_norm: Option<&'a [f32]>,
+    pub attn_logit_softcap: Option<f32>,
 }
 
 impl AttnExtras<'_> {
@@ -1989,6 +2279,7 @@ impl AttnExtras<'_> {
             && self.v_bias.is_none()
             && self.q_norm.is_none()
             && self.k_norm.is_none()
+            && self.attn_logit_softcap.is_none()
     }
 }
 
@@ -2254,6 +2545,7 @@ pub fn launch_decode_dense_stack(
             head_dim as u32,
             new_seq,
             kv_start,
+            layer.extras.attn_logit_softcap,
         )?;
         encode_matvec(&encoder, device, &layer.o, &o_w, attn_buf, o_buf)?;
         // Gemma sandwich norm: normalize the attn block output *before*
@@ -2479,6 +2771,7 @@ pub fn launch_gqa_decode_host(
         head_dim as u32,
         seq_len as u32,
         0,
+        None,
     )?;
     encoder.endEncoding();
     cmd_buf.commit();
@@ -2808,8 +3101,8 @@ mod tests {
     #[test]
     #[ignore = "needs a real Metal GPU"]
     fn gqa_fa_vec_matches_cpu() {
-        // FA-vec has dedicated kernels for head_dim=128 (Llama-3.x) and
-        // head_dim=64 (TinyLlama / Llama-3.2-1B).
+        // FA-vec dedicated kernels: d=128 (Llama-3.x), d=64 (TinyLlama /
+        // Llama-3.2-1B), d=96 (Phi-3), d=256 (Gemma-3).
         let test_cases = vec![
             (4, 2, 128, 17),
             (8, 2, 128, 33),
@@ -2820,6 +3113,12 @@ mod tests {
             (8, 4, 64, 65),
             (32, 4, 64, 128),
             (8, 4, 64, 1),
+            (4, 4, 96, 17),
+            (8, 8, 96, 33),
+            (32, 32, 96, 65),
+            (4, 1, 256, 17),
+            (8, 4, 256, 33),
+            (4, 1, 256, 65),
         ];
         for (n_heads, n_kv_heads, head_dim, seq_len) in test_cases {
             let q: Vec<f32> = (0..n_heads * head_dim)

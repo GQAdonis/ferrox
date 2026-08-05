@@ -6,6 +6,11 @@ Architecture registry: `ferrox archs` → [`manifests/architecture_manifest.md`]
 
 **Rule:** “Works” means a real GGUF loaded and answered correctly. “Fast” needs a pin in RESULTS. No pin → no speed claim.
 
+**Ratio convention:** `benchmarks/RESULTS.md` Gap = `llama_pred / ferrox_pred`.
+Gap &lt; 1.0 means ferrox is faster; gap &gt; 1.0 means ferrox is slower.
+Human prose below (e.g. “~1.56× faster”) is the inverse when ferrox wins —
+always prefer the pin / RESULTS Gap for comparisons.
+
 ## Try these
 
 | Model | Why |
@@ -23,6 +28,9 @@ Architecture registry: `ferrox archs` → [`manifests/architecture_manifest.md`]
 # HTTP server
 ./target/release/ferrox-server -m /path/to/model.gguf \
   --host 127.0.0.1 --port 8383
+
+# Interactive chat (server must already be running)
+./target/release/ferrox chat --url http://127.0.0.1:8383
 ```
 
 ## Status
@@ -39,40 +47,35 @@ Architecture registry: `ferrox archs` → [`manifests/architecture_manifest.md`]
 | Model | Backend |
 |---|---|
 | TinyLlama-1.1B-Chat-v1.0 Q8_0 | CPU (~1.2×), Metal |
-| OLMoE-1B-7B-0924 Q4_0 | CPU (~parity), CUDA |
-| Llama-3.1-8B-Instruct Q4_K_M | CPU, Metal (~1× decode) |
+| OLMoE-1B-7B-0924 Q4_0 | CPU (~parity); CUDA historically (no current Host B pin) |
+| Llama-3.1-8B-Instruct Q4_K_M | CPU; Metal fair-chat Gap ~1.03× (CLI pin **1.00×**) |
 | SmolLM2-135M-Instruct Q8_0 | CPU (~1.3×), Metal |
 | Qwen2.5-0.5B-Instruct Q8_0 | CPU (~1.1×); Metal ~1.56× **faster** (bias on GPU) |
 | Qwen3-0.6B Q8_0 | CPU ~0.7×; Metal ~1.1× (per-head QK-norm on GPU) |
-| Gemma-3-1B-IT Q8_0 | CPU (~1.6×); Metal ~0.67× — full Metal stack (GeGLU, SWA, sandwich norms); d=256 legacy attn is the gap |
-| Phi-3-mini-4k-Instruct Q4 | CPU ~0.6×; Metal ~0.78× — fused QKV/FFN split as quantized slices; d=96 legacy attn |
+| Gemma-3-1B-IT Q8_0 | CPU (~1.6×); Metal — full Metal stack (GeGLU, SWA, sandwich norms); FA-vec covers d=256 |
+| Phi-3-mini-4k-Instruct Q4 | CPU ~0.6×; Metal — fused QKV/FFN split as quantized slices; FA-vec covers d=96 |
 
 Also Metal-pinned (see RESULTS): Llama-3.2-1B / 3B Q4_K_M,
 Llama-3.2-1B IQ4_XS.
-
-### Works (no pin yet)
-
-| Model | Notes |
-|---|---|
-| — | (everything smoked so far is pinned) |
 
 ### Partial / not yet
 
 | | |
 |---|---|
-| Qwen2-MoE | Loads; oracle re-verify pending |
-| Mistral / Mixtral | Profile + SWA / grouped MoE wired; need receipt |
-| Kimi K3 | Real slices only (~1.56 TB full run not done) |
-| GLM-5.2 / DeepSeek V4 | Synthetic / dedicated stacks — no real GGUF e2e |
-| MLA / Mamba / T5 / VL | Fail-closed at load |
-| CUDA speed | Deferred (compile OK; fair-chat remains far behind) |
+| Qwen2-MoE | Loads (QKV bias + shared_expert_gate); suite entry added; oracle receipt needs real GGUF |
+| Mistral / Mixtral | Profile + SWA / grouped MoE wired; suite entries added; need receipt |
+| Gemma-2 | Attn softcap + SWA wired (CPU + Metal legacy GQA); needs real GGUF pin |
+| Kimi K3 | Real slice loaders + `kimi_validate` index check; full ~1.56 TB e2e gated on storage |
+| GLM-5.2 / DeepSeek V4 | Dedicated engines (`Glm52Engine`, `DeepseekV4Engine`) + synthetic stacks — no real GGUF e2e |
+| MLA / Mamba / T5 / VL | Fail-closed; engine stubs (`mla` / `recurrent_engine` / `hybrid_engine` / `t5_engine` / `vl_engine`) |
+| CUDA speed | Suite supports `--backend cuda`; need GPU host pins (staged ≥0.5× then parity) |
 
 ## Backends
 
 | Backend | Today |
 |---|---|
 | CPU | Primary correctness path |
-| Metal | Dense + attn incl. QKV bias, per-head QK-norm, GeGLU, SWA, sandwich norms; protect Llama 8B pin in RESULTS |
-| CUDA | Compiles; speed work paused until Metal parity program settles |
+| Metal | Dense + attn + MoE expert placement (default VRAM budget); FA-vec d=64/96/128/256; softcap via legacy GQA |
+| CUDA | Compiles; `run_suite.py --backend cuda --host-label …` for pins; explicit `FERROX_GPU_VRAM_BUDGET_BYTES` for MoE |
 
 Unknown `general.architecture` values fail closed with a clear error (`ferrox archs` for the list).

@@ -34,7 +34,7 @@ Defaults are sensible; measure before changing these.
 | `FERROX_KV_POOL_BLOCKS` | Paged-KV pool size (blocks) for the server |
 | `FERROX_EXPERT_CACHE_BYTES` | MoE expert-streaming cache budget (bytes) |
 | `FERROX_SSD_STREAMING` | `1` — stream MoE experts from disk (defaults cache to 2 GiB) |
-| `FERROX_GPU_VRAM_BUDGET_BYTES` | Cap for GPU-resident weights |
+| `FERROX_GPU_VRAM_BUDGET_BYTES` | Cap for GPU-resident MoE experts. On Metal, unset defaults to a large budget (Metal matvec experts); set `0` to force CPU experts. CUDA still requires an explicit value. |
 
 Debug/experiment switches (`FERROX_METAL_FA_VEC`, `FERROX_METAL_LOGITS`,
 `FERROX_CPU_INT_DOT`, …) are documented next to their code and may change

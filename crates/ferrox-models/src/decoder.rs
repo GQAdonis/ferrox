@@ -16,8 +16,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use ferrox_core::attention::{
     apply_rope, apply_rope_interleaved, apply_rope_interleaved_with_freq_factors,
-    apply_rope_with_freq_factors, causal_gqa_attention, causal_gqa_attention_paged,
-    causal_gqa_attention_windowed,
+    apply_rope_with_freq_factors, causal_gqa_attention_paged, causal_gqa_attention_softcap,
+    causal_gqa_attention_windowed_softcap,
 };
 use ferrox_core::cache::{KvCache, PagedKvCache, PagedKvStore, PagedStoreExhausted};
 use ferrox_core::matmul::{geglu, rms_norm, rms_norm_per_head, softcap_inplace};
@@ -534,17 +534,12 @@ impl Decoder {
         {
             return false;
         }
-        // Softcaps (Gemma-2) have no Metal ops yet. Gemma-3 features
-        // (SWA, sandwich norms, GeGLU, embedding scale, per-layer theta)
-        // run via the dense stack. SwigluFused (Phi-3) is plain SwiGLU
-        // once the loader splits the fused gate+up rows.
-        if self.config.attn_logit_softcap.is_some()
-            || self.config.final_logit_softcap.is_some()
-            || self.config.attention_scale.is_some()
-        {
-            return false;
-        }
-        // Metal GQA kernels (FA-vec d=128/64, legacy <= 256) cap head_dim.
+        // Softcaps: final logit softcap is applied on the host after
+        // lm_head (Metal-safe). Attention softcap runs on Metal via the
+        // legacy GQA path (FA-vec skipped when softcap > 0). attention_scale
+        // is compensated by scaling Q on the host/Metal extras path.
+        // Softcaps (Gemma-2) used to disable the entire Metal stack;
+        // that gate is gone now that attn softcap is wired.
         if self.config.head_dim > 256 {
             return false;
         }
@@ -570,13 +565,14 @@ impl Decoder {
 
     /// Optional QKV bias / per-head QK-norm ops for the Metal attn paths.
     #[cfg(feature = "metal")]
-    fn metal_attn_extras<'a>(layer: &'a LayerWeights) -> ferrox_metal::attn::AttnExtras<'a> {
+    fn metal_attn_extras<'a>(&self, layer: &'a LayerWeights) -> ferrox_metal::attn::AttnExtras<'a> {
         ferrox_metal::attn::AttnExtras {
             q_bias: layer.attn.q_bias.as_deref(),
             k_bias: layer.attn.k_bias.as_deref(),
             v_bias: layer.attn.v_bias.as_deref(),
             q_norm: layer.attn.q_norm.as_deref(),
             k_norm: layer.attn.k_norm.as_deref(),
+            attn_logit_softcap: self.config.attn_logit_softcap,
         }
     }
 
@@ -647,6 +643,7 @@ impl Decoder {
     /// Q crosses the bus per call (plus a prefix refresh on append).
     #[allow(clippy::too_many_arguments)]
     fn gqa_attention(
+        &self,
         layer: usize,
         q: &[f32],
         k: &[f32],
@@ -680,7 +677,16 @@ impl Decoder {
             }
         }
         let _ = layer;
-        causal_gqa_attention(q, k, v, n_heads, n_kv_heads, head_dim, seq_len)
+        causal_gqa_attention_softcap(
+            q,
+            k,
+            v,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            seq_len,
+            self.config.attn_logit_softcap,
+        )
     }
 
     /// Runs one decode step for `token_id` at position `pos`, updating
@@ -876,7 +882,7 @@ impl Decoder {
                                 gate: g,
                                 up: u,
                                 down: d,
-                                extras: Self::metal_attn_extras(layer),
+                                extras: self.metal_attn_extras(layer),
                                 rope_theta: {
                                     let t = self.config.layer_rope_theta(li);
                                     (t != self.config.rope_theta).then_some(t)
@@ -1058,7 +1064,7 @@ impl Decoder {
                                             self.config.rope_freqs.as_deref(),
                                             pos,
                                             self.config.rms_norm_eps,
-                                            &Self::metal_attn_extras(layer),
+                                            &self.metal_attn_extras(layer),
                                         ) {
                                             Ok(new_h) => {
                                                 // Catch up any dense-stack lag + this token.
@@ -1101,7 +1107,7 @@ impl Decoder {
                                             self.config.rope_theta,
                                             self.config.rope_freqs.as_deref(),
                                             pos,
-                                            &Self::metal_attn_extras(layer),
+                                            &self.metal_attn_extras(layer),
                                             self.config.rms_norm_eps,
                                         ) {
                                             Ok(projected) => {
@@ -1231,7 +1237,7 @@ impl Decoder {
                     .expect("unbounded/planned KvCache growth is infallible");
 
                 let attn_out = match self.config.layer_sliding_window(l) {
-                    Some(window) => causal_gqa_attention_windowed(
+                    Some(window) => causal_gqa_attention_windowed_softcap(
                         &q,
                         &cache.k,
                         &cache.v,
@@ -1240,8 +1246,9 @@ impl Decoder {
                         head_dim,
                         cache.seq_len,
                         window,
+                        self.config.attn_logit_softcap,
                     ),
-                    None => Self::gqa_attention(
+                    None => self.gqa_attention(
                         l,
                         &q,
                         &cache.k,
@@ -1816,11 +1823,15 @@ impl Decoder {
                     Some(window) => start_pos + batch_size <= window,
                     None => true,
                 };
+                // Metal prefill kernel has no attn softcap yet — fall back
+                // to CPU attention (which applies softcap) when set.
+                let softcap_ok = self.config.attn_logit_softcap.is_none();
                 if let Some(guard) = metal_kv_guard.as_mut() {
                     if let Some(metal_kvs) = guard.as_mut() {
                         if metal_kvs[l].seq_len == cache.seq_len
                             && start_pos == cache.seq_len
                             && swa_fits
+                            && softcap_ok
                         {
                             match ferrox_metal::attn::launch_prefill_attn_block(
                                 &q_batch,
@@ -1958,7 +1969,7 @@ impl Decoder {
                 let seq_len_b = base_seq_len + b + 1;
                 let cache_elems = seq_len_b * kv_width;
                 let attn_out = match self.config.layer_sliding_window(l) {
-                    Some(window) => causal_gqa_attention_windowed(
+                    Some(window) => causal_gqa_attention_windowed_softcap(
                         &q_batch[b * q_width..(b + 1) * q_width],
                         &cache.k[..cache_elems],
                         &cache.v[..cache_elems],
@@ -1967,8 +1978,9 @@ impl Decoder {
                         head_dim,
                         seq_len_b,
                         window,
+                        self.config.attn_logit_softcap,
                     ),
-                    None => causal_gqa_attention(
+                    None => causal_gqa_attention_softcap(
                         &q_batch[b * q_width..(b + 1) * q_width],
                         &cache.k[..cache_elems],
                         &cache.v[..cache_elems],
@@ -1976,6 +1988,7 @@ impl Decoder {
                         n_kv_heads,
                         head_dim,
                         seq_len_b,
+                        self.config.attn_logit_softcap,
                     ),
                 };
                 attn_out_batch[b * q_width..(b + 1) * q_width].copy_from_slice(&attn_out);
@@ -2195,7 +2208,7 @@ impl Decoder {
                     )
                     .expect("unbounded/planned KvCache growth is infallible");
                 let attn_out = match self.config.layer_sliding_window(l) {
-                    Some(window) => causal_gqa_attention_windowed(
+                    Some(window) => causal_gqa_attention_windowed_softcap(
                         &q_batch[b * q_width..(b + 1) * q_width],
                         &cache.k,
                         &cache.v,
@@ -2204,8 +2217,9 @@ impl Decoder {
                         head_dim,
                         cache.seq_len,
                         window,
+                        self.config.attn_logit_softcap,
                     ),
-                    None => causal_gqa_attention(
+                    None => causal_gqa_attention_softcap(
                         &q_batch[b * q_width..(b + 1) * q_width],
                         &cache.k,
                         &cache.v,
@@ -2213,6 +2227,7 @@ impl Decoder {
                         n_kv_heads,
                         head_dim,
                         cache.seq_len,
+                        self.config.attn_logit_softcap,
                     ),
                 };
                 attn_out_batch[b * q_width..(b + 1) * q_width].copy_from_slice(&attn_out);

@@ -43,6 +43,29 @@ def pred(row: dict | None):
     return v if isinstance(v, (int, float)) else None
 
 
+def load_s(row: dict | None):
+    if not row or row.get("error"):
+        return None
+    v = row.get("load_s")
+    return v if isinstance(v, (int, float)) else None
+
+
+def load_sd(row: dict | None):
+    if not row or row.get("error"):
+        return None
+    v = row.get("load_stddev")
+    return v if isinstance(v, (int, float)) else None
+
+
+def fmt_load(x, sd=None) -> str:
+    """Format load/startup seconds (keep ms precision for sub-second loads)."""
+    if x is None:
+        return "—"
+    if isinstance(sd, (int, float)):
+        return f"**{x:.3f}** ±{sd:.3f}"
+    return f"**{x:.3f}**"
+
+
 def gap_str(fp, lp) -> str:
     if fp and lp and fp > 0:
         g = lp / fp
@@ -202,12 +225,15 @@ def main() -> None:
 
     if cli_pins:
         lines.append(
-            "\n## CLI completion (llama-cli vs `ferrox run`)\n\n"
+            "\n## CLI completion (llama-cli / `llama-completion` vs `ferrox run`)\n\n"
             "One-shot `-p … -n N --no-cnv --ignore-eos`, fresh process per rep, "
             "strictly sequential (llama exits before ferrox starts). Engines' own "
-            "stderr timings; decode excludes model load.\n\n"
-            "| Model | Backend | ferrox pred (tok/s) | llama pred (tok/s) | Gap | Winner | Pin |\n"
-            "|---|---|---|---|---|---|---|\n"
+            "stderr timings; **pred** tok/s excludes model load. "
+            "**load** = engine-reported startup (`ferrox: loaded in …s` vs "
+            "`common_perf_print: load time = … ms`).\n\n"
+            "| Model | Backend | ferrox pred | llama pred | Gap | "
+            "ferrox load (s) | llama load (s) | Load gap | Pin |\n"
+            "|---|---|---|---|---|---|---|---|---|\n"
         )
         for entry in suite["models"]:
             mid = entry["id"]
@@ -219,12 +245,22 @@ def main() -> None:
                 lp = pred(pin.get("llama"))
                 fsd = stddev(pin.get("ferrox"))
                 lsd = stddev(pin.get("llama"))
+                fl = load_s(pin.get("ferrox"))
+                ll = load_s(pin.get("llama"))
+                flsd = load_sd(pin.get("ferrox"))
+                llsd = load_sd(pin.get("llama"))
                 ferr = (pin.get("ferrox") or {}).get("error")
                 fcell = "error" if ferr else fmt_num(fp, fsd)
                 lcell = fmt_num(lp, lsd) if lp is not None else "—"
+                # Load gap = llama_load / ferrox_load (<1 ferrox faster to load).
+                load_gap = "—"
+                if fl and ll and fl > 0:
+                    lg = ll / fl
+                    load_gap = f"~{lg:.2f}×" if abs(lg - 1.0) >= 0.015 else "**1.00×**"
                 lines.append(
                     f"| {entry['name']} | {backend} | {fcell} | {lcell} | "
-                    f"{gap_str(fp, lp)} | {winner_str(fp, lp)} | "
+                    f"{gap_str(fp, lp)} | {fmt_load(fl, flsd)} | {fmt_load(ll, llsd)} | "
+                    f"{load_gap} | "
                     f"[`{mid}_{backend}_cli`](receipts/pins/{mid}_{backend}_cli.json) |\n"
                 )
 

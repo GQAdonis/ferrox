@@ -56,6 +56,23 @@ python3 benchmarks/run_suite.py --id tinyllama_q8 --backend cpu
 CPU path sets `FERROX_METAL=0`, `FERROX_CPU_INT_DOT=1`,
 `RAYON_NUM_THREADS=10`; llama uses `-ngl 0 -t 10`.
 
+## CLI completion (+ load / startup)
+
+One-shot `llama-completion` vs `ferrox run` (fresh process per rep):
+
+```bash
+cargo build -p ferrox-cli --release --features metal
+cp target/release/ferrox target/bench/ferrox-cli-metal
+
+python3 benchmarks/run_suite.py --id tinyllama_q8 --backend metal --mode cli
+```
+
+Pins record **predicted** tok/s (decode, excludes load) and **load_s**
+(engine-reported: `ferrox: loaded in …s` vs llama
+`common_perf_print: load time = … ms`). Load gap in RESULTS =
+`llama_load / ferrox_load`. Default llama binary is `llama-completion`
+when on `PATH` (Homebrew llama.cpp ≥b76xx).
+
 ## Regenerate ledger only
 
 ```bash

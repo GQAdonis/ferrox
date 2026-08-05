@@ -139,8 +139,15 @@ def aggregate(runs: list[dict], reps: int) -> dict:
         "predicted_per_second": "predicted_stddev",
         "prompt_per_second": "prompt_stddev",
         "wall_tok_s": "wall_tok_s_stddev",
+        "load_s": "load_stddev",
     }
-    for key in ("predicted_per_second", "prompt_per_second", "wall_tok_s", "wall_s"):
+    for key in (
+        "predicted_per_second",
+        "prompt_per_second",
+        "wall_tok_s",
+        "wall_s",
+        "load_s",
+    ):
         vals = series(key)
         if vals:
             agg[key] = round(statistics.median(vals), 3)
@@ -155,6 +162,7 @@ def aggregate(runs: list[dict], reps: int) -> dict:
                 "prompt_per_second",
                 "wall_tok_s",
                 "wall_s",
+                "load_s",
                 "completion_tokens",
                 "error",
             )
@@ -326,13 +334,21 @@ LLAMA_SUMMARY_RE = re.compile(
 FERROX_CLI_RE = re.compile(
     r"ferrox: prompt (\d+) tokens, ([\d.]+) t/s;\s*predict (\d+) tokens, ([\d.]+) t/s"
 )
+# Engine-reported model load / startup (mmap + GPU weight upload / context init).
+FERROX_LOAD_RE = re.compile(r"ferrox: loaded in ([\d.]+)s")
+# llama.cpp common_perf_print (llama-completion / recent llama-cli):
+#   common_perf_print:        load time =     261.39 ms
+LLAMA_LOAD_RE = re.compile(
+    r"(?:common_perf_print:\s*)?load time\s*=\s*([\d.]+)\s*ms", re.IGNORECASE
+)
 
 
 def run_cli_once(
     cmd: list[str], engine: str, env: dict | None = None, timeout: float = 1800.0
 ) -> dict:
     """One CLI completion run (fresh process — llama.cpp-style `-p ... -n N`).
-    Parses the tool's own stderr timings; decode t/s excludes model load."""
+    Parses the tool's own stderr timings; decode t/s excludes model load.
+    Also records engine-reported `load_s` (model load / startup)."""
     t0 = time.time()
     try:
         proc = subprocess.run(
@@ -342,8 +358,12 @@ def run_cli_once(
         return {"error": "cli timeout", "engine": engine}
     wall = time.time() - t0
     err = proc.stderr or ""
+    out = proc.stdout or ""
     row: dict = {"wall_s": round(wall, 3), "engine": engine}
     if engine == "ferrox":
+        ml = FERROX_LOAD_RE.search(err)
+        if ml:
+            row["load_s"] = round(float(ml.group(1)), 3)
         m = FERROX_CLI_RE.search(err)
         if not m:
             row["error"] = f"no ferrox timing line (exit {proc.returncode})"
@@ -353,10 +373,13 @@ def run_cli_once(
         row["completion_tokens"] = int(m.group(3))
         row["predicted_per_second"] = float(m.group(4))
     else:
-        out = proc.stdout or ""
-        mp = LLAMA_PROMPT_RE.search(err)
-        me = LLAMA_EVAL_RE.search(err)
-        mn = LLAMA_EVAL_N_RE.search(err)
+        # Prefer common_perf_print load time (ms → s).
+        ml = LLAMA_LOAD_RE.search(err) or LLAMA_LOAD_RE.search(out)
+        if ml:
+            row["load_s"] = round(float(ml.group(1)) / 1000.0, 3)
+        mp = LLAMA_PROMPT_RE.search(err) or LLAMA_PROMPT_RE.search(out)
+        me = LLAMA_EVAL_RE.search(err) or LLAMA_EVAL_RE.search(out)
+        mn = LLAMA_EVAL_N_RE.search(err) or LLAMA_EVAL_N_RE.search(out)
         ms = LLAMA_SUMMARY_RE.search(out) or LLAMA_SUMMARY_RE.search(err)
         if me:
             row["prompt_per_second"] = float(mp.group(1)) if mp else None
@@ -369,7 +392,7 @@ def run_cli_once(
             row["error"] = f"no llama perf line (exit {proc.returncode})"
             row["log_tail"] = (err + out)[-1500:]
             return row
-    row["prefix"] = (proc.stdout or "")[:60]
+    row["prefix"] = out[:60]
     return row
 
 
@@ -562,6 +585,14 @@ def run_one(
             f"summary predicted tok/s (median of {reps}): "
             f"ferrox={fp:.3f}{fs_str} llama={lp:.3f}{ls_str} gap={lp/fp:.2f}x"
         )
+        fl = (pin.get("ferrox") or {}).get("load_s")
+        ll = (pin.get("llama") or {}).get("load_s")
+        if isinstance(fl, (int, float)) and isinstance(ll, (int, float)) and fl > 0:
+            print(
+                f"summary load/startup (s, median): "
+                f"ferrox={fl:.3f} llama={ll:.3f} gap={ll/fl:.2f}x "
+                f"(<1 = ferrox loads faster)"
+            )
     return pin
 
 
@@ -646,7 +677,15 @@ def main() -> None:
                 bench if bench.is_file() else ROOT / "target/release/ferrox-server"
             )
     if args.llama_bin is None:
-        args.llama_bin = "llama-cli" if args.mode == "cli" else "llama-server"
+        if args.mode == "cli":
+            # Homebrew llama.cpp ≥b76xx split one-shot completion out of
+            # llama-cli into llama-completion (`-no-cnv` no longer works on
+            # llama-cli). Prefer llama-completion when on PATH.
+            from shutil import which
+
+            args.llama_bin = which("llama-completion") or which("llama-cli") or "llama-completion"
+        else:
+            args.llama_bin = "llama-server"
 
     host = args.host_label or suite.get("host_default", HOST_DEFAULT)
     entries = suite["models"]

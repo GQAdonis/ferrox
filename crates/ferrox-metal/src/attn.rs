@@ -37,8 +37,8 @@ use crate::elem::{
 };
 use crate::embd::{encode_get_rows, EmbdKind};
 use crate::gpu::{
-    encode_matvec, ensure_pipeline, resident_f32_buffer, resident_weight_buffer, shared_metal,
-    MatvecLaunch, MetalError,
+    encode_matvec, encode_q4_0_moe_topk, ensure_pipeline, resident_f32_buffer,
+    resident_weight_buffer, shared_metal, MatvecLaunch, MetalError, MoeExpertLaunch,
 };
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
@@ -46,7 +46,7 @@ use objc2_metal::{
     MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder,
     MTLDevice, MTLResourceOptions, MTLSize,
 };
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::ptr::NonNull;
 use std::sync::{Mutex, OnceLock};
 
@@ -69,6 +69,20 @@ pub fn metal_attn_enabled() -> bool {
         matches!(
             std::env::var("FERROX_METAL_ATTN").ok().as_deref(),
             Some("1") | Some("true") | Some("on") | Some("attn")
+        )
+    })
+}
+
+/// Keep MoE residual on Metal across attn→router→experts.
+/// Default **off**: helps short CLI decode, but fair-chat server pins
+/// (long context) still prefer attn CB + batched MoE CB. Opt in with
+/// `FERROX_METAL_MOE_RESIDENT=1`.
+pub fn metal_moe_resident_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        matches!(
+            std::env::var("FERROX_METAL_MOE_RESIDENT").ok().as_deref(),
+            Some("1") | Some("true") | Some("on")
         )
     })
 }
@@ -2294,6 +2308,436 @@ pub fn launch_decode_moe_attn_ffn_pre(
     let ffn_normed =
         unsafe { std::slice::from_raw_parts(x2_ptr.as_ptr() as *const f32, hidden_dim).to_vec() };
     Ok((new_h, ffn_normed))
+}
+
+/// Retained Metal buffers for MoE decode so residual / FFN-normed stay on
+/// GPU across layers (llama.cpp graph style). Host only sees router logits
+/// between phase-1 and phase-2 — not 2×hidden downloads per layer.
+struct MoeDecodeScratch {
+    h: Retained<ProtocolObject<dyn MTLBuffer>>,
+    x_attn: Retained<ProtocolObject<dyn MTLBuffer>>,
+    x2: Retained<ProtocolObject<dyn MTLBuffer>>,
+    q: Retained<ProtocolObject<dyn MTLBuffer>>,
+    k: Retained<ProtocolObject<dyn MTLBuffer>>,
+    v: Retained<ProtocolObject<dyn MTLBuffer>>,
+    attn: Retained<ProtocolObject<dyn MTLBuffer>>,
+    o: Retained<ProtocolObject<dyn MTLBuffer>>,
+    router: Retained<ProtocolObject<dyn MTLBuffer>>,
+    act: Retained<ProtocolObject<dyn MTLBuffer>>,
+    expert_out: Retained<ProtocolObject<dyn MTLBuffer>>,
+    moe_out: Retained<ProtocolObject<dyn MTLBuffer>>,
+    hidden_dim: usize,
+    q_rows: usize,
+    k_rows: usize,
+    ffn_rows: usize,
+    top_k_cap: usize,
+    n_router: usize,
+}
+
+thread_local! {
+    static MOE_SCRATCH: RefCell<Option<MoeDecodeScratch>> = const { RefCell::new(None) };
+}
+
+/// Drop resident MoE decode buffers (CPU fallback / end of generate).
+pub fn moe_decode_clear() {
+    MOE_SCRATCH.with(|s| {
+        *s.borrow_mut() = None;
+    });
+}
+
+/// Seed residual `h` from host hidden (call once before the MoE layer loop).
+pub fn moe_decode_seed(hidden: &[f32]) -> Result<(), MetalError> {
+    let shared = shared_metal()?;
+    let device = &shared.device;
+    let hidden_dim = hidden.len();
+    MOE_SCRATCH.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        let need_new = match slot.as_ref() {
+            None => true,
+            Some(s) => s.hidden_dim != hidden_dim,
+        };
+        if need_new {
+            // Caps match OLMoE-class decode (top-k≤8, ffn≤8×hidden, ≤256 experts).
+            // Grown on demand in phase-1/2 if a layer exceeds them.
+            let q_rows = hidden_dim * 2;
+            let k_rows = hidden_dim;
+            let ffn_rows = hidden_dim * 8;
+            let top_k_cap = 8;
+            let n_router = 256;
+            *slot = Some(MoeDecodeScratch {
+                h: alloc_f32_buffer(device, hidden_dim)?,
+                x_attn: alloc_f32_buffer(device, hidden_dim)?,
+                x2: alloc_f32_buffer(device, hidden_dim)?,
+                q: alloc_f32_buffer(device, q_rows)?,
+                k: alloc_f32_buffer(device, k_rows)?,
+                v: alloc_f32_buffer(device, k_rows)?,
+                attn: alloc_f32_buffer(device, q_rows)?,
+                o: alloc_f32_buffer(device, hidden_dim)?,
+                router: alloc_f32_buffer(device, n_router)?,
+                act: alloc_f32_buffer(device, top_k_cap * ffn_rows)?,
+                expert_out: alloc_f32_buffer(device, top_k_cap * hidden_dim)?,
+                moe_out: alloc_f32_buffer(device, hidden_dim)?,
+                hidden_dim,
+                q_rows,
+                k_rows,
+                ffn_rows,
+                top_k_cap,
+                n_router,
+            });
+        }
+        let scratch = slot.as_mut().unwrap();
+        let dst = scratch.h.contents();
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                hidden.as_ptr(),
+                dst.as_ptr() as *mut f32,
+                hidden_dim,
+            );
+        }
+        Ok(())
+    })
+}
+
+/// Download residual hidden. Keeps scratch buffers for the next token
+/// (`moe_decode_seed` overwrites `h`). `None` if never seeded.
+pub fn moe_decode_take_hidden() -> Option<Vec<f32>> {
+    MOE_SCRATCH.with(|cell| {
+        let slot = cell.borrow();
+        let scratch = slot.as_ref()?;
+        let ptr = scratch.h.contents();
+        Some(unsafe {
+            std::slice::from_raw_parts(ptr.as_ptr() as *const f32, scratch.hidden_dim).to_vec()
+        })
+    })
+}
+
+fn moe_scratch_ensure_caps(
+    device: &Retained<ProtocolObject<dyn MTLDevice>>,
+    scratch: &mut MoeDecodeScratch,
+    q_rows: usize,
+    k_rows: usize,
+    ffn_rows: usize,
+    top_k: usize,
+    n_router: usize,
+) -> Result<(), MetalError> {
+    if q_rows > scratch.q_rows {
+        scratch.q = alloc_f32_buffer(device, q_rows)?;
+        scratch.attn = alloc_f32_buffer(device, q_rows)?;
+        scratch.q_rows = q_rows;
+    }
+    if k_rows > scratch.k_rows {
+        scratch.k = alloc_f32_buffer(device, k_rows)?;
+        scratch.v = alloc_f32_buffer(device, k_rows)?;
+        scratch.k_rows = k_rows;
+    }
+    if n_router > scratch.n_router {
+        scratch.router = alloc_f32_buffer(device, n_router)?;
+        scratch.n_router = n_router;
+    }
+    if ffn_rows > scratch.ffn_rows || top_k > scratch.top_k_cap {
+        let fk = ffn_rows.max(scratch.ffn_rows);
+        let tk = top_k.max(scratch.top_k_cap);
+        scratch.act = alloc_f32_buffer(device, tk * fk)?;
+        scratch.expert_out = alloc_f32_buffer(device, tk * scratch.hidden_dim)?;
+        scratch.ffn_rows = fk;
+        scratch.top_k_cap = tk;
+    }
+    Ok(())
+}
+
+/// Phase 1 (llama mul_mat_id graph style): on-device
+/// `rms_attn → QKV→RoPE→KV→GQA→O → h+=o → rms_ffn → router`.
+/// Downloads **only** router logits. Residual + FFN-normed stay resident.
+#[allow(clippy::too_many_arguments)]
+pub fn launch_moe_decode_pre(
+    attn_norm_w: &[f32],
+    q_launch: &MatvecLaunch<'_>,
+    k_launch: &MatvecLaunch<'_>,
+    v_launch: &MatvecLaunch<'_>,
+    o_launch: &MatvecLaunch<'_>,
+    kv: &mut MetalKvBuffers,
+    ffn_norm_w: &[f32],
+    router_launch: &MatvecLaunch<'_>,
+    n_heads: usize,
+    rope_layout: MetalRopeLayout,
+    rope_theta: f32,
+    freq_factors: Option<&[f32]>,
+    pos: usize,
+    rms_eps: f32,
+    extras: &AttnExtras<'_>,
+) -> Result<Vec<f32>, MetalError> {
+    let head_dim = kv.head_dim;
+    let n_kv_heads = kv.n_kv_heads;
+    let hidden_dim = attn_norm_w.len();
+    assert_eq!(ffn_norm_w.len(), hidden_dim);
+    assert_eq!(q_launch.rows, n_heads * head_dim);
+    assert_eq!(k_launch.rows, n_kv_heads * head_dim);
+    assert_eq!(v_launch.rows, n_kv_heads * head_dim);
+    assert_eq!(o_launch.rows, hidden_dim);
+    assert_eq!(pos, kv.seq_len);
+    if kv.seq_len >= kv.capacity {
+        return Err(MetalError::CommandFailed);
+    }
+    if let Some(ff) = freq_factors {
+        assert_eq!(ff.len(), head_dim / 2);
+    }
+
+    let shared = shared_metal()?;
+    let device = &shared.device;
+    let queue = &shared.queue;
+
+    MOE_SCRATCH.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        let scratch = slot
+            .as_mut()
+            .ok_or(MetalError::CommandFailed)?;
+        if scratch.hidden_dim != hidden_dim {
+            return Err(MetalError::CommandFailed);
+        }
+        moe_scratch_ensure_caps(
+            device,
+            scratch,
+            q_launch.rows,
+            k_launch.rows,
+            1, // ffn sized in experts phase
+            1,
+            router_launch.rows,
+        )?;
+
+        let attn_nw = resident_f32_buffer(device, attn_norm_w)?;
+        let ffn_nw = resident_f32_buffer(device, ffn_norm_w)?;
+        let q_w = resident_weight_buffer(device, q_launch.weights)?;
+        let k_w = resident_weight_buffer(device, k_launch.weights)?;
+        let v_w = resident_weight_buffer(device, v_launch.weights)?;
+        let o_w = resident_weight_buffer(device, o_launch.weights)?;
+        let r_w = resident_weight_buffer(device, router_launch.weights)?;
+        let ff_buf = match freq_factors {
+            Some(ff) => Some(upload_f32(device, ff)?),
+            None => None,
+        };
+
+        let cmd_buf = queue.commandBuffer().ok_or(MetalError::CommandFailed)?;
+        let encoder = cmd_buf
+            .computeCommandEncoder()
+            .ok_or(MetalError::CommandFailed)?;
+
+        encode_rms_norm(
+            &encoder,
+            device,
+            &scratch.h,
+            &attn_nw.buffer,
+            &scratch.x_attn,
+            hidden_dim as u32,
+            rms_eps,
+        )?;
+        encode_matvec(
+            &encoder,
+            device,
+            q_launch,
+            &q_w,
+            &scratch.x_attn,
+            &scratch.q,
+        )?;
+        encode_matvec(
+            &encoder,
+            device,
+            k_launch,
+            &k_w,
+            &scratch.x_attn,
+            &scratch.k,
+        )?;
+        encode_matvec(
+            &encoder,
+            device,
+            v_launch,
+            &v_w,
+            &scratch.x_attn,
+            &scratch.v,
+        )?;
+        encode_attn_extras(
+            &encoder,
+            device,
+            extras,
+            &scratch.q,
+            &scratch.k,
+            &scratch.v,
+            q_launch.rows,
+            k_launch.rows,
+            v_launch.rows,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            rms_eps,
+        )?;
+        encode_rope(
+            &encoder,
+            device,
+            rope_layout,
+            &scratch.q,
+            n_heads as u32,
+            head_dim as u32,
+            rope_theta,
+            pos as u32,
+            ff_buf.as_deref(),
+        )?;
+        encode_rope(
+            &encoder,
+            device,
+            rope_layout,
+            &scratch.k,
+            n_kv_heads as u32,
+            head_dim as u32,
+            rope_theta,
+            pos as u32,
+            ff_buf.as_deref(),
+        )?;
+        let token_elems = (n_kv_heads * head_dim) as u32;
+        let offset = (kv.seq_len * n_kv_heads * head_dim) as u32;
+        encode_kv_append(&encoder, device, &scratch.k, &kv.k, offset, token_elems)?;
+        encode_kv_append(&encoder, device, &scratch.v, &kv.v, offset, token_elems)?;
+        let new_seq = (kv.seq_len + 1) as u32;
+        encode_gqa(
+            &encoder,
+            device,
+            &scratch.q,
+            &kv.k,
+            &kv.v,
+            &scratch.attn,
+            n_heads as u32,
+            n_kv_heads as u32,
+            head_dim as u32,
+            new_seq,
+            0,
+            extras.attn_logit_softcap,
+        )?;
+        encode_matvec(
+            &encoder,
+            device,
+            o_launch,
+            &o_w,
+            &scratch.attn,
+            &scratch.o,
+        )?;
+        encode_add_rms_norm(
+            &encoder,
+            device,
+            &scratch.h,
+            &scratch.o,
+            &ffn_nw.buffer,
+            &scratch.x2,
+            hidden_dim as u32,
+            rms_eps,
+        )?;
+        encode_matvec(
+            &encoder,
+            device,
+            router_launch,
+            &r_w,
+            &scratch.x2,
+            &scratch.router,
+        )?;
+
+        encoder.endEncoding();
+        cmd_buf.commit();
+        cmd_buf.waitUntilCompleted();
+        kv.seq_len += 1;
+
+        let ptr = scratch.router.contents();
+        let logits = unsafe {
+            std::slice::from_raw_parts(ptr.as_ptr() as *const f32, router_launch.rows).to_vec()
+        };
+        Ok(logits)
+    })
+}
+
+/// Phase 2: batched MoE SwiGLU on resident FFN-normed `x2`, then `h += moe`.
+/// Prefers the Q4_0 top-k kernels (≤8 experts); otherwise falls back to
+/// host [`crate::gpu::launch_moe_topk_swiglu`] + upload/add (slower).
+pub fn launch_moe_decode_experts(experts: &[MoeExpertLaunch<'_>]) -> Result<(), MetalError> {
+    if experts.is_empty() {
+        return Ok(());
+    }
+    let hidden = experts[0].down.rows;
+    let ffn = experts[0].gate.rows;
+    let q4_0_batched = experts.len() <= 8
+        && experts.iter().all(|ex| {
+            ex.gate.fn_name == "q4_0_matvec"
+                && ex.up.fn_name == "q4_0_matvec"
+                && ex.down.fn_name == "q4_0_matvec"
+                && ex.gate.block_bytes == 18
+                && ex.up.block_bytes == 18
+                && ex.down.block_bytes == 18
+        });
+
+    let shared = shared_metal()?;
+    let device = &shared.device;
+    let queue = &shared.queue;
+
+    MOE_SCRATCH.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        let scratch = slot.as_mut().ok_or(MetalError::CommandFailed)?;
+        if scratch.hidden_dim != hidden {
+            return Err(MetalError::CommandFailed);
+        }
+
+        if q4_0_batched {
+            moe_scratch_ensure_caps(
+                device,
+                scratch,
+                scratch.q_rows,
+                scratch.k_rows,
+                ffn,
+                experts.len(),
+                scratch.n_router,
+            )?;
+            let cmd_buf = queue.commandBuffer().ok_or(MetalError::CommandFailed)?;
+            let encoder = cmd_buf
+                .computeCommandEncoder()
+                .ok_or(MetalError::CommandFailed)?;
+            encode_q4_0_moe_topk(
+                &encoder,
+                device,
+                &scratch.x2,
+                experts,
+                &scratch.act,
+                &scratch.expert_out,
+                &scratch.moe_out,
+            )?;
+            encode_vec_add(
+                &encoder,
+                device,
+                &scratch.h,
+                &scratch.moe_out,
+                hidden as u32,
+            )?;
+            encoder.endEncoding();
+            cmd_buf.commit();
+            cmd_buf.waitUntilCompleted();
+            return Ok(());
+        }
+
+        // Generic path: download x2, run existing fuse, upload + add.
+        let x2 = unsafe {
+            std::slice::from_raw_parts(scratch.x2.contents().as_ptr() as *const f32, hidden)
+                .to_vec()
+        };
+        drop(slot);
+        let moe = crate::gpu::launch_moe_topk_swiglu(&x2, experts)?;
+        MOE_SCRATCH.with(|cell| {
+            let slot = cell.borrow();
+            let scratch = slot.as_ref().ok_or(MetalError::CommandFailed)?;
+            let moe_buf = upload_f32(device, &moe)?;
+            let cmd_buf = queue.commandBuffer().ok_or(MetalError::CommandFailed)?;
+            let encoder = cmd_buf
+                .computeCommandEncoder()
+                .ok_or(MetalError::CommandFailed)?;
+            encode_vec_add(&encoder, device, &scratch.h, &moe_buf, hidden as u32)?;
+            encoder.endEncoding();
+            cmd_buf.commit();
+            cmd_buf.waitUntilCompleted();
+            Ok(())
+        })
+    })
 }
 
 /// Full dense decode layer on one CB: RMSNorm → QKV→RoPE→KV→GQA→O →

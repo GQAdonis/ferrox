@@ -466,41 +466,62 @@ impl Decoder {
     /// if the storage/kind cannot run on Metal.
     #[cfg(feature = "metal")]
     fn metal_matvec_launch<'a>(m: &'a WeightMatrix) -> Option<ferrox_metal::gpu::MatvecLaunch<'a>> {
-        let WeightMatrix::Quantized {
-            data,
-            rows,
-            cols: _,
-            kind,
-        } = m
-        else {
-            return None;
-        };
-        let kind_name = match kind {
-            ferrox_core::QuantKind::Q8_0 => "Q8_0",
-            ferrox_core::QuantKind::Q4_0 => "Q4_0",
-            ferrox_core::QuantKind::Q4K => "Q4_K",
-            ferrox_core::QuantKind::Q5K => "Q5_K",
-            ferrox_core::QuantKind::Q6K => "Q6_K",
-            ferrox_core::QuantKind::IQ4XS => "IQ4_XS",
-            _ => return None,
-        };
-        let (src, fn_name, block_bytes, block_elems, rows_per_tg) =
-            ferrox_metal::gpu::matvec_launch_meta(kind_name)?;
-        let row_bytes = if *rows == 0 {
-            0
-        } else {
-            data.as_slice().len() / *rows
-        };
-        Some(ferrox_metal::gpu::MatvecLaunch {
-            kernel_src: src,
-            fn_name,
-            block_bytes,
-            block_elems,
-            weights: data.as_slice(),
-            rows: *rows,
-            row_bytes,
-            rows_per_tg,
-        })
+        match m {
+            WeightMatrix::F32(t) => {
+                let rows = t.shape[0];
+                let cols = t.shape[1];
+                let (src, fn_name, block_bytes, block_elems, rows_per_tg) =
+                    ferrox_metal::gpu::matvec_launch_meta("F32")?;
+                // SAFETY: f32 ↔ little-endian byte view for Metal upload/alias.
+                let bytes = unsafe {
+                    std::slice::from_raw_parts(t.data.as_ptr() as *const u8, t.data.len() * 4)
+                };
+                Some(ferrox_metal::gpu::MatvecLaunch {
+                    kernel_src: src,
+                    fn_name,
+                    block_bytes,
+                    block_elems,
+                    weights: bytes,
+                    rows,
+                    row_bytes: cols * 4,
+                    rows_per_tg,
+                })
+            }
+            WeightMatrix::Quantized {
+                data,
+                rows,
+                cols: _,
+                kind,
+            } => {
+                let kind_name = match kind {
+                    ferrox_core::QuantKind::Q8_0 => "Q8_0",
+                    ferrox_core::QuantKind::Q4_0 => "Q4_0",
+                    ferrox_core::QuantKind::Q4K => "Q4_K",
+                    ferrox_core::QuantKind::Q5K => "Q5_K",
+                    ferrox_core::QuantKind::Q6K => "Q6_K",
+                    ferrox_core::QuantKind::IQ4XS => "IQ4_XS",
+                    _ => return None,
+                };
+                let (src, fn_name, block_bytes, block_elems, rows_per_tg) =
+                    ferrox_metal::gpu::matvec_launch_meta(kind_name)?;
+                let row_bytes = if *rows == 0 {
+                    0
+                } else {
+                    data.as_slice().len() / *rows
+                };
+                Some(ferrox_metal::gpu::MatvecLaunch {
+                    kernel_src: src,
+                    fn_name,
+                    block_bytes,
+                    block_elems,
+                    weights: data.as_slice(),
+                    rows: *rows,
+                    row_bytes,
+                    rows_per_tg,
+                })
+            }
+            _ => None,
+        }
     }
 
     /// True when this layer can use the fused Metal attention block
@@ -611,6 +632,25 @@ impl Decoder {
             })
     }
 
+    /// MoE layer eligible for resident Metal decode (attn+router+experts
+    /// without host residual ping-pong). Requires SwiGLU, no shared
+    /// experts, Resident expert backing, and Metal router/QKV/O.
+    #[cfg(feature = "metal")]
+    fn layer_supports_metal_moe_resident(layer: &LayerWeights, config: &ModelConfig) -> bool {
+        !Self::is_dense_layer(layer)
+            && layer.moe.shared_experts.is_empty()
+            && matches!(
+                config.ffn_activation,
+                crate::config::FfnActivation::Swiglu | crate::config::FfnActivation::SwigluFused
+            )
+            && matches!(layer.moe.experts, ExpertBacking::Resident(_))
+            && Self::metal_matvec_launch(&layer.moe.router).is_some()
+            && Self::metal_matvec_launch(&layer.attn.q_proj).is_some()
+            && Self::metal_matvec_launch(&layer.attn.k_proj).is_some()
+            && Self::metal_matvec_launch(&layer.attn.v_proj).is_some()
+            && Self::metal_matvec_launch(&layer.attn.o_proj).is_some()
+    }
+
     /// One Metal CB for all top-k routed experts (weighted sum). Returns
     /// `None` if any expert lacks a Metal launch (caller falls back).
     #[cfg(feature = "metal")]
@@ -678,6 +718,53 @@ impl Decoder {
             Ok(out) => Some(out),
             Err(e) => {
                 eprintln!("ferrox: Metal MoE top-k fuse failed, falling back: {e}");
+                None
+            }
+        }
+    }
+
+    /// Phase-2 of resident MoE decode: experts on GPU `x2`, add into GPU `h`.
+    #[cfg(feature = "metal")]
+    fn try_metal_moe_experts_resident(
+        layer: &LayerWeights,
+        decision: &ferrox_moe::RoutingDecision,
+    ) -> Option<()> {
+        if decision.expert_ids.is_empty() {
+            return Some(());
+        }
+        let pending: Vec<(usize, f32)> = decision
+            .expert_ids
+            .iter()
+            .zip(decision.weights.iter())
+            .map(|(&eid, &w)| (eid, w))
+            .collect();
+        for &(eid, _) in &pending {
+            let ok = layer.moe.with_expert(eid, |ex| {
+                Self::metal_matvec_launch(&ex.gate).is_some()
+                    && Self::metal_matvec_launch(&ex.up).is_some()
+                    && Self::metal_matvec_launch(&ex.down).is_some()
+            });
+            if !ok {
+                return None;
+            }
+        }
+        let ExpertBacking::Resident(experts) = &layer.moe.experts else {
+            return None;
+        };
+        let mut launches = Vec::with_capacity(pending.len());
+        for &(eid, weight) in &pending {
+            let ex = &experts[eid];
+            launches.push(ferrox_metal::gpu::MoeExpertLaunch {
+                gate: Self::metal_matvec_launch(&ex.gate)?,
+                up: Self::metal_matvec_launch(&ex.up)?,
+                down: Self::metal_matvec_launch(&ex.down)?,
+                weight,
+            });
+        }
+        match ferrox_metal::attn::launch_moe_decode_experts(&launches) {
+            Ok(()) => Some(()),
+            Err(e) => {
+                eprintln!("ferrox: Metal MoE experts failed, falling back: {e}");
                 None
             }
         }
@@ -784,7 +871,8 @@ impl Decoder {
         pos: usize,
         kv_caches: &mut [KvCache],
     ) -> Vec<f32> {
-        // Clear any stale Metal resident buffer TLS from a prior decode.
+        // Clear stale dense-stack activation TLS. MoE scratch buffers are
+        // reused across tokens (re-seeded); cleared after lm_head below.
         #[cfg(feature = "metal")]
         ferrox_metal::gpu::clear_resident_activation();
 
@@ -1103,15 +1191,39 @@ impl Decoder {
         #[cfg(not(feature = "metal"))]
         let run_cpu_layers = true;
 
+        // When true, residual lives in Metal MoE scratch — host `hidden` is stale.
+        #[cfg(feature = "metal")]
+        let mut metal_moe_resident = false;
+
         if run_cpu_layers {
             for (l, (layer, cache)) in self.layers.iter().zip(kv_caches.iter_mut()).enumerate() {
                 // --- attention block ---
+                #[cfg(feature = "metal")]
+                if metal_moe_resident
+                    && (!Self::layer_supports_metal_moe_resident(layer, &self.config)
+                        || self.layer_needs_metal_stack(layer, l))
+                {
+                    if let Some(h) = ferrox_metal::attn::moe_decode_take_hidden() {
+                        hidden = h;
+                    }
+                    metal_moe_resident = false;
+                }
+
+                #[cfg(feature = "metal")]
+                let normed = if metal_moe_resident {
+                    // Residual is on-device; host rms_norm would use stale hidden.
+                    Vec::new()
+                } else {
+                    rms_norm(&hidden, &layer.attn.norm_weight, self.config.rms_norm_eps)
+                };
+                #[cfg(not(feature = "metal"))]
                 let normed = rms_norm(&hidden, &layer.attn.norm_weight, self.config.rms_norm_eps);
 
                 #[cfg(feature = "metal")]
                 {
                     let mut did_metal_attn = false;
                     let mut did_metal_dense = false;
+                    let mut did_metal_moe = false;
                     let mut clear_metal_kv = false;
                     if let Some(guard) = metal_kv_guard.as_mut() {
                         if let Some(metal_kvs) = guard.as_mut() {
@@ -1186,7 +1298,121 @@ impl Decoder {
                                         }
                                     }
 
-                                    if !did_metal_dense && !clear_metal_kv {
+                                    // Resident MoE: attn+router on GPU, host top-k only,
+                                    // then batched experts — no hidden download/upload.
+                                    if !did_metal_dense
+                                        && !clear_metal_kv
+                                        && ferrox_metal::attn::metal_moe_resident_enabled()
+                                        && Self::layer_supports_metal_moe_resident(
+                                            layer,
+                                            &self.config,
+                                        )
+                                    {
+                                        if let Some(router_l) =
+                                            Self::metal_matvec_launch(&layer.moe.router)
+                                        {
+                                            let seed_ok = if metal_moe_resident {
+                                                true
+                                            } else {
+                                                match ferrox_metal::attn::moe_decode_seed(&hidden) {
+                                                    Ok(()) => {
+                                                        metal_moe_resident = true;
+                                                        true
+                                                    }
+                                                    Err(e) => {
+                                                        eprintln!(
+                                                            "ferrox: Metal MoE seed failed: {e}"
+                                                        );
+                                                        false
+                                                    }
+                                                }
+                                            };
+                                            if seed_ok {
+                                                match ferrox_metal::attn::launch_moe_decode_pre(
+                                                    &layer.attn.norm_weight,
+                                                    &q_l,
+                                                    &k_l,
+                                                    &v_l,
+                                                    &o_l,
+                                                    &mut metal_kvs[l],
+                                                    &layer.moe.norm_weight,
+                                                    &router_l,
+                                                    n_heads,
+                                                    self.metal_rope_layout(),
+                                                    self.config.rope_theta,
+                                                    self.config.rope_freqs.as_deref(),
+                                                    pos,
+                                                    self.config.rms_norm_eps,
+                                                    &self.metal_attn_extras(layer),
+                                                ) {
+                                                    Ok(logits) => {
+                                                        let decision = route_top_k(
+                                                            &logits,
+                                                            self.config.moe.n_experts_active,
+                                                            self.config.moe.gating,
+                                                            self.config.moe.norm_topk_prob,
+                                                        );
+                                                        layer
+                                                            .moe
+                                                            .record_activations(&decision.expert_ids);
+                                                        if let Some(()) = Self::try_metal_moe_experts_resident(
+                                                            layer,
+                                                            &decision,
+                                                        ) {
+                                                            did_metal_moe = true;
+                                                            did_metal_attn = true;
+                                                        } else if let Some(h) =
+                                                            ferrox_metal::attn::moe_decode_take_hidden()
+                                                        {
+                                                            hidden = h;
+                                                            metal_moe_resident = false;
+                                                            // KV already advanced; finish FFN on host.
+                                                            let normed2 = rms_norm(
+                                                                &hidden,
+                                                                &layer.moe.norm_weight,
+                                                                self.config.rms_norm_eps,
+                                                            );
+                                                            let ffn_out = Self::combine_ffn_outputs_for_position(
+                                                                layer,
+                                                                &normed2,
+                                                                &logits,
+                                                                &self.config,
+                                                                hidden_dim,
+                                                                residency.as_ref().map(|p| p.layer_plan(l)),
+                                                            );
+                                                            for (h, f) in
+                                                                hidden.iter_mut().zip(ffn_out.iter())
+                                                            {
+                                                                *h += f;
+                                                            }
+                                                            did_metal_attn = true;
+                                                            did_metal_moe = true; // skip second FFN
+                                                        }
+                                                    }
+                                                    Err(e) => {
+                                                        eprintln!(
+                                                            "ferrox: Metal MoE pre failed, fallback: {e}"
+                                                        );
+                                                        if let Some(h) =
+                                                            ferrox_metal::attn::moe_decode_take_hidden()
+                                                        {
+                                                            hidden = h;
+                                                        }
+                                                        metal_moe_resident = false;
+                                                        if metal_kvs[l].seq_len != cache.seq_len {
+                                                            Self::catch_up_host_kv_from_metal(
+                                                                &metal_kvs[l],
+                                                                cache,
+                                                            );
+                                                            clear_metal_kv = true;
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    if !did_metal_dense && !did_metal_moe && !clear_metal_kv {
                                         match ferrox_metal::attn::launch_decode_attn_block(
                                             &normed,
                                             &q_l,
@@ -1236,7 +1462,7 @@ impl Decoder {
                         }
                     }
                     if did_metal_attn {
-                        if !did_metal_dense {
+                        if !did_metal_dense && !did_metal_moe {
                             let normed2 =
                                 rms_norm(&hidden, &layer.moe.norm_weight, self.config.rms_norm_eps);
                             let ffn_out = Self::run_ffn_block(
@@ -1377,6 +1603,13 @@ impl Decoder {
             }
         } // run_cpu_layers
 
+        #[cfg(feature = "metal")]
+        if metal_moe_resident {
+            if let Some(h) = ferrox_metal::attn::moe_decode_take_hidden() {
+                hidden = h;
+            }
+        }
+
         // If Metal stack already ran final_norm, hidden is normalized; else
         // normalize here.
         #[cfg(feature = "metal")]
@@ -1392,7 +1625,9 @@ impl Decoder {
         if let Some(sc) = self.config.final_logit_softcap {
             softcap_inplace(&mut logits, sc);
         }
-        // Clear Metal resident buffer TLS after lm_head (may have consumed it).
+        // Clear dense-stack activation TLS after lm_head (may have consumed it).
+        // Keep MoE scratch buffers alive across tokens — `moe_decode_seed`
+        // overwrites `h` each token; clearing here forced full realloc.
         #[cfg(feature = "metal")]
         ferrox_metal::gpu::clear_resident_activation();
         logits

@@ -267,6 +267,30 @@ pub fn launch_q8_0_matvec(
 /// blocks (2-byte `half` scale + 16 bytes of packed 4-bit nibbles, low
 /// nibble = element `i`, high nibble = element `i+16`, both biased by
 /// -8) to mirror `ferrox_quant::dot_q4_0_f32_scalar`'s exact math and
+/// Dense f32 matvec (OLMoE router `ffn_gate_inp` is F32 in GGUF).
+/// One thread per output row; fine for small `rows` (≤256).
+pub const F32_MATVEC_KERNEL_SRC: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+kernel void f32_matvec(
+    device const float* weights [[buffer(0)]],
+    device const float* x [[buffer(1)]],
+    device float* out [[buffer(2)]],
+    constant uint& cols [[buffer(3)]],
+    constant uint& rows [[buffer(4)]],
+    uint row [[thread_position_in_grid]]
+) {
+    if (row >= rows) return;
+    device const float* w = weights + (size_t)row * cols;
+    float sum = 0.0f;
+    for (uint i = 0u; i < cols; ++i) {
+        sum += w[i] * x[i];
+    }
+    out[row] = sum;
+}
+"#;
+
 /// `ferrox_cuda::gpu::Q4_0_MATVEC_KERNEL_SRC`'s structure (using MSL's
 /// native `half` instead of the CUDA kernel's manual f16 bit decode).
 ///
@@ -319,6 +343,212 @@ kernel void q4_0_matvec(
             total += partial[i];
         }
         out[row] = total;
+    }
+}
+"#;
+
+/// OLMoE decode specialization: all selected Q4_0 experts share one
+/// activation. Gate+up and SiLU are computed for every `(expert,row)` in
+/// one dispatch; weighted down projections are reduced in a second dispatch.
+/// Metal exposes 31 buffer slots, enough for 8 gate + 8 up tensors plus
+/// activation/output/shape arguments (OLMoE top-k is 8).
+const Q4_0_MOE_TOPK_KERNEL_SRC: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+inline float q4_0_half_dot(
+    device const uchar* block,
+    float sumy,
+    thread const float* yl,
+    uint il
+) {
+    const float d = float(*(device const half*)block);
+    device const ushort* qs = (device const ushort*)block + 1u + il / 2u;
+    float4 acc = float4(0.0f);
+    for (uint i = 0u; i < 8u; i += 2u) {
+        const ushort q = qs[i / 2u];
+        acc[0] += yl[i] * float(q & 0x000Fu);
+        acc[1] += yl[i + 1u] * float(q & 0x0F00u);
+        acc[2] += yl[i + 8u] * float(q & 0x00F0u);
+        acc[3] += yl[i + 9u] * float(q & 0xF000u);
+    }
+    return d * (sumy * -8.0f + acc[0] + acc[1] + acc[2] + acc[3]);
+}
+
+inline float q4_0_load_y(
+    device const float* yb,
+    thread float* yl
+) {
+    float sumy = 0.0f;
+    for (uint i = 0u; i < 8u; i += 2u) {
+        sumy += yb[i] + yb[i + 1u] + yb[i + 16u] + yb[i + 17u];
+        yl[i] = yb[i];
+        yl[i + 1u] = yb[i + 1u] / 256.0f;
+        yl[i + 8u] = yb[i + 16u] / 16.0f;
+        yl[i + 9u] = yb[i + 17u] / 4096.0f;
+    }
+    return sumy;
+}
+
+kernel void q4_0_moe_gate_up(
+    device const uchar* wg0 [[buffer(0)]],
+    device const uchar* wg1 [[buffer(1)]],
+    device const uchar* wg2 [[buffer(2)]],
+    device const uchar* wg3 [[buffer(3)]],
+    device const uchar* wg4 [[buffer(4)]],
+    device const uchar* wg5 [[buffer(5)]],
+    device const uchar* wg6 [[buffer(6)]],
+    device const uchar* wg7 [[buffer(7)]],
+    device const uchar* wu0 [[buffer(8)]],
+    device const uchar* wu1 [[buffer(9)]],
+    device const uchar* wu2 [[buffer(10)]],
+    device const uchar* wu3 [[buffer(11)]],
+    device const uchar* wu4 [[buffer(12)]],
+    device const uchar* wu5 [[buffer(13)]],
+    device const uchar* wu6 [[buffer(14)]],
+    device const uchar* wu7 [[buffer(15)]],
+    device const float* x [[buffer(16)]],
+    device float* act [[buffer(17)]],
+    constant uint& row_bytes [[buffer(18)]],
+    constant uint& n_blocks [[buffer(19)]],
+    constant uint& ffn_rows [[buffer(20)]],
+    constant uint& n_experts [[buffer(21)]],
+    uint tgpig [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]]
+) {
+    constexpr uint NR = 4u;
+    constexpr uint NSG = 2u;
+    constexpr uint ROWS_PER_TG = NR * NSG;
+    const uint row_groups = (ffn_rows + ROWS_PER_TG - 1u) / ROWS_PER_TG;
+    const uint expert = tgpig / row_groups;
+    const uint group = tgpig - expert * row_groups;
+    const uint first_row = (group * NSG + sg) * NR;
+    if (expert >= n_experts) return;
+
+    device const uchar* wg = wg0;
+    device const uchar* wu = wu0;
+    switch (expert) {
+        case 1: wg = wg1; wu = wu1; break;
+        case 2: wg = wg2; wu = wu2; break;
+        case 3: wg = wg3; wu = wu3; break;
+        case 4: wg = wg4; wu = wu4; break;
+        case 5: wg = wg5; wu = wu5; break;
+        case 6: wg = wg6; wu = wu6; break;
+        case 7: wg = wg7; wu = wu7; break;
+        default: break;
+    }
+    float ga[NR] = { 0.0f };
+    float ua[NR] = { 0.0f };
+    const uint ix = lane / 2u;
+    const uint il = (lane % 2u) * 8u;
+    device const float* yb = x + ix * 32u + il;
+    for (uint b = ix; b < n_blocks; b += 16u) {
+        float yl[16];
+        const float sumy = q4_0_load_y(yb, yl);
+        for (uint rr = 0u; rr < NR; ++rr) {
+            const uint row = first_row + rr;
+            if (row >= ffn_rows) continue;
+            device const uchar* gb = wg + (size_t)row * row_bytes + (size_t)b * 18u;
+            device const uchar* ub = wu + (size_t)row * row_bytes + (size_t)b * 18u;
+            ga[rr] += q4_0_half_dot(gb, sumy, yl, il);
+            ua[rr] += q4_0_half_dot(ub, sumy, yl, il);
+        }
+        yb += 16u * 32u;
+    }
+
+    for (uint rr = 0u; rr < NR; ++rr) {
+        const uint row = first_row + rr;
+        const float g = simd_sum(ga[rr]);
+        const float u = simd_sum(ua[rr]);
+        if (lane == 0u && row < ffn_rows) {
+            act[(size_t)expert * ffn_rows + row] =
+                (g / (1.0f + exp(-g))) * u;
+        }
+    }
+}
+
+kernel void q4_0_moe_down(
+    device const uchar* wd0 [[buffer(0)]],
+    device const uchar* wd1 [[buffer(1)]],
+    device const uchar* wd2 [[buffer(2)]],
+    device const uchar* wd3 [[buffer(3)]],
+    device const uchar* wd4 [[buffer(4)]],
+    device const uchar* wd5 [[buffer(5)]],
+    device const uchar* wd6 [[buffer(6)]],
+    device const uchar* wd7 [[buffer(7)]],
+    device const float* act [[buffer(8)]],
+    device float* expert_out [[buffer(9)]],
+    constant uint& row_bytes [[buffer(10)]],
+    constant uint& n_blocks [[buffer(11)]],
+    constant uint& hidden_rows [[buffer(12)]],
+    constant uint& ffn_rows [[buffer(13)]],
+    constant uint& n_experts [[buffer(14)]],
+    uint tgpig [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]]
+) {
+    constexpr uint NR = 4u;
+    constexpr uint NSG = 2u;
+    constexpr uint ROWS_PER_TG = NR * NSG;
+    const uint row_groups = (hidden_rows + ROWS_PER_TG - 1u) / ROWS_PER_TG;
+    const uint expert = tgpig / row_groups;
+    const uint group = tgpig - expert * row_groups;
+    const uint first_row = (group * NSG + sg) * NR;
+    if (expert >= n_experts) return;
+
+    device const uchar* wd = wd0;
+    switch (expert) {
+        case 1: wd = wd1; break;
+        case 2: wd = wd2; break;
+        case 3: wd = wd3; break;
+        case 4: wd = wd4; break;
+        case 5: wd = wd5; break;
+        case 6: wd = wd6; break;
+        case 7: wd = wd7; break;
+        default: break;
+    }
+    device const float* xa = act + (size_t)expert * ffn_rows;
+    float acc[NR] = { 0.0f };
+    const uint ix = lane / 2u;
+    const uint il = (lane % 2u) * 8u;
+    device const float* yb = xa + ix * 32u + il;
+    for (uint b = ix; b < n_blocks; b += 16u) {
+        float yl[16];
+        const float sumy = q4_0_load_y(yb, yl);
+        for (uint rr = 0u; rr < NR; ++rr) {
+            const uint row = first_row + rr;
+            if (row >= hidden_rows) continue;
+            device const uchar* block =
+                wd + (size_t)row * row_bytes + (size_t)b * 18u;
+            acc[rr] += q4_0_half_dot(block, sumy, yl, il);
+        }
+        yb += 16u * 32u;
+    }
+
+    for (uint rr = 0u; rr < NR; ++rr) {
+        const uint row = first_row + rr;
+        const float sum = simd_sum(acc[rr]);
+        if (lane == 0u && row < hidden_rows) {
+            expert_out[(size_t)expert * hidden_rows + row] = sum;
+        }
+    }
+}
+
+kernel void moe_weighted_sum(
+    device const float* expert_out [[buffer(0)]],
+    device const float* route [[buffer(1)]],
+    device float* out [[buffer(2)]],
+    constant uint& hidden_rows [[buffer(3)]],
+    constant uint& n_experts [[buffer(4)]],
+    uint i [[thread_position_in_grid]]
+) {
+    if (i < hidden_rows) {
+        float sum = 0.0f;
+        for (uint e = 0u; e < n_experts; ++e) {
+            sum += route[e] * expert_out[(size_t)e * hidden_rows + i];
+        }
+        out[i] = sum;
     }
 }
 "#;
@@ -1729,6 +1959,7 @@ pub fn launch_iq4_xs_matvec(
 /// kernels; `2` for Q5_K NSG=2/N_R0=1; `4` for Q4_K/Q6_K).
 pub fn matvec_launch_meta(kind: &str) -> Option<(&'static str, &'static str, usize, usize, usize)> {
     match kind {
+        "F32" => Some((F32_MATVEC_KERNEL_SRC, "f32_matvec", 4, 1, 1)),
         "Q8_0" => Some((Q8_0_MATVEC_KERNEL_SRC, "q8_0_matvec", 34, 32, 2)),
         "Q4_0" => Some((Q4_0_MATVEC_KERNEL_SRC, "q4_0_matvec", 18, 32, 1)),
         "Q4_K" => Some((Q4_K_MATVEC_KERNEL_SRC, "q4_k_matvec", 144, 256, 4)),
@@ -2309,6 +2540,243 @@ pub struct MoeExpertLaunch<'a> {
     pub weight: f32,
 }
 
+/// Encode llama-style batched Q4_0 MoE (gate+up+SiLU, down, weighted sum)
+/// into an existing compute encoder. `experts.len()` must be in `1..=8`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_q4_0_moe_topk(
+    encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+    device: &Retained<ProtocolObject<dyn MTLDevice>>,
+    x_buf: &ProtocolObject<dyn MTLBuffer>,
+    experts: &[MoeExpertLaunch<'_>],
+    act_buf: &ProtocolObject<dyn MTLBuffer>,
+    expert_out_buf: &ProtocolObject<dyn MTLBuffer>,
+    out_buf: &ProtocolObject<dyn MTLBuffer>,
+) -> Result<(), MetalError> {
+    debug_assert!(!experts.is_empty() && experts.len() <= 8);
+    let hidden = experts[0].down.rows;
+    let ffn = experts[0].gate.rows;
+    let input_blocks = experts[0].gate.row_bytes / 18;
+    let down_blocks = experts[0].down.row_bytes / 18;
+    // llama.cpp Q4_0 tuning: N_SG=2, N_R0=4 → 8 rows/TG.
+    let tg = 64usize;
+    const ROWS_PER_TG: usize = 8;
+
+    let mut gate_w = Vec::with_capacity(experts.len());
+    let mut up_w = Vec::with_capacity(experts.len());
+    let mut down_w = Vec::with_capacity(experts.len());
+    for ex in experts {
+        gate_w.push(resident_weight_buffer(device, ex.gate.weights)?);
+        up_w.push(resident_weight_buffer(device, ex.up.weights)?);
+        down_w.push(resident_weight_buffer(device, ex.down.weights)?);
+    }
+
+    let mut route: Vec<f32> = experts.iter().map(|e| e.weight).collect();
+    let route_buf = unsafe {
+        device.newBufferWithBytes_length_options(
+            NonNull::new(route.as_mut_ptr() as *mut _).unwrap(),
+            route.len() * 4,
+            MTLResourceOptions::StorageModeShared,
+        )
+    }
+    .ok_or(MetalError::BufferAllocFailed)?;
+
+    let gate_up = ensure_pipeline(device, Q4_0_MOE_TOPK_KERNEL_SRC, "q4_0_moe_gate_up")?;
+    let down = ensure_pipeline(device, Q4_0_MOE_TOPK_KERNEL_SRC, "q4_0_moe_down")?;
+    let weighted_sum = ensure_pipeline(device, Q4_0_MOE_TOPK_KERNEL_SRC, "moe_weighted_sum")?;
+
+    encoder.setComputePipelineState(&gate_up.0);
+    unsafe {
+        // Unused slots bind expert 0; `n_experts` prevents reads.
+        for slot in 0..8usize {
+            let i = slot.min(experts.len() - 1);
+            encoder.setBuffer_offset_atIndex(
+                Some(&gate_w[i].buffer),
+                gate_w[i].weight_offset,
+                slot,
+            );
+            encoder.setBuffer_offset_atIndex(
+                Some(&up_w[i].buffer),
+                up_w[i].weight_offset,
+                slot + 8,
+            );
+        }
+        encoder.setBuffer_offset_atIndex(Some(x_buf), 0, 16);
+        encoder.setBuffer_offset_atIndex(Some(act_buf), 0, 17);
+        let mut row_bytes = experts[0].gate.row_bytes as u32;
+        encoder.setBytes_length_atIndex(
+            NonNull::new(&mut row_bytes as *mut u32 as *mut _).unwrap(),
+            4,
+            18,
+        );
+        let mut blocks = input_blocks as u32;
+        encoder.setBytes_length_atIndex(
+            NonNull::new(&mut blocks as *mut u32 as *mut _).unwrap(),
+            4,
+            19,
+        );
+        let mut ffn_rows = ffn as u32;
+        encoder.setBytes_length_atIndex(
+            NonNull::new(&mut ffn_rows as *mut u32 as *mut _).unwrap(),
+            4,
+            20,
+        );
+        let mut n_experts = experts.len() as u32;
+        encoder.setBytes_length_atIndex(
+            NonNull::new(&mut n_experts as *mut u32 as *mut _).unwrap(),
+            4,
+            21,
+        );
+    }
+    encoder.dispatchThreadgroups_threadsPerThreadgroup(
+        MTLSize {
+            width: experts.len() * ffn.div_ceil(ROWS_PER_TG),
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width: tg,
+            height: 1,
+            depth: 1,
+        },
+    );
+
+    encoder.setComputePipelineState(&down.0);
+    unsafe {
+        for slot in 0..8usize {
+            let i = slot.min(experts.len() - 1);
+            encoder.setBuffer_offset_atIndex(
+                Some(&down_w[i].buffer),
+                down_w[i].weight_offset,
+                slot,
+            );
+        }
+        encoder.setBuffer_offset_atIndex(Some(act_buf), 0, 8);
+        encoder.setBuffer_offset_atIndex(Some(expert_out_buf), 0, 9);
+        let mut row_bytes = experts[0].down.row_bytes as u32;
+        encoder.setBytes_length_atIndex(
+            NonNull::new(&mut row_bytes as *mut u32 as *mut _).unwrap(),
+            4,
+            10,
+        );
+        let mut blocks = down_blocks as u32;
+        encoder.setBytes_length_atIndex(
+            NonNull::new(&mut blocks as *mut u32 as *mut _).unwrap(),
+            4,
+            11,
+        );
+        let mut hidden_rows = hidden as u32;
+        encoder.setBytes_length_atIndex(
+            NonNull::new(&mut hidden_rows as *mut u32 as *mut _).unwrap(),
+            4,
+            12,
+        );
+        let mut ffn_rows = ffn as u32;
+        encoder.setBytes_length_atIndex(
+            NonNull::new(&mut ffn_rows as *mut u32 as *mut _).unwrap(),
+            4,
+            13,
+        );
+        let mut n_experts = experts.len() as u32;
+        encoder.setBytes_length_atIndex(
+            NonNull::new(&mut n_experts as *mut u32 as *mut _).unwrap(),
+            4,
+            14,
+        );
+    }
+    encoder.dispatchThreadgroups_threadsPerThreadgroup(
+        MTLSize {
+            width: experts.len() * hidden.div_ceil(ROWS_PER_TG),
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width: tg,
+            height: 1,
+            depth: 1,
+        },
+    );
+
+    encoder.setComputePipelineState(&weighted_sum.0);
+    unsafe {
+        encoder.setBuffer_offset_atIndex(Some(expert_out_buf), 0, 0);
+        encoder.setBuffer_offset_atIndex(Some(&route_buf), 0, 1);
+        encoder.setBuffer_offset_atIndex(Some(out_buf), 0, 2);
+        let mut hidden_rows = hidden as u32;
+        encoder.setBytes_length_atIndex(
+            NonNull::new(&mut hidden_rows as *mut u32 as *mut _).unwrap(),
+            4,
+            3,
+        );
+        let mut n_experts = experts.len() as u32;
+        encoder.setBytes_length_atIndex(
+            NonNull::new(&mut n_experts as *mut u32 as *mut _).unwrap(),
+            4,
+            4,
+        );
+    }
+    const SUM_TG: usize = 256;
+    encoder.dispatchThreadgroups_threadsPerThreadgroup(
+        MTLSize {
+            width: hidden.div_ceil(SUM_TG),
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width: SUM_TG,
+            height: 1,
+            depth: 1,
+        },
+    );
+    Ok(())
+}
+
+fn launch_q4_0_moe_topk_batched(
+    device: &Retained<ProtocolObject<dyn MTLDevice>>,
+    queue: &Retained<ProtocolObject<dyn MTLCommandQueue>>,
+    x_buf: &ProtocolObject<dyn MTLBuffer>,
+    experts: &[MoeExpertLaunch<'_>],
+) -> Result<Vec<f32>, MetalError> {
+    debug_assert!(!experts.is_empty() && experts.len() <= 8);
+    let hidden = experts[0].down.rows;
+    let ffn = experts[0].gate.rows;
+
+    let act_buf = device
+        .newBufferWithLength_options(
+            experts.len() * ffn * 4,
+            MTLResourceOptions::StorageModeShared,
+        )
+        .ok_or(MetalError::BufferAllocFailed)?;
+    let expert_out_buf = device
+        .newBufferWithLength_options(
+            experts.len() * hidden * 4,
+            MTLResourceOptions::StorageModeShared,
+        )
+        .ok_or(MetalError::BufferAllocFailed)?;
+    let out_buf = device
+        .newBufferWithLength_options(hidden * 4, MTLResourceOptions::StorageModeShared)
+        .ok_or(MetalError::BufferAllocFailed)?;
+
+    let cmd_buf = queue.commandBuffer().ok_or(MetalError::CommandFailed)?;
+    let encoder = cmd_buf
+        .computeCommandEncoder()
+        .ok_or(MetalError::CommandFailed)?;
+    encode_q4_0_moe_topk(
+        &encoder,
+        device,
+        x_buf,
+        experts,
+        &act_buf,
+        &expert_out_buf,
+        &out_buf,
+    )?;
+    encoder.endEncoding();
+    cmd_buf.commit();
+    cmd_buf.waitUntilCompleted();
+
+    let out_ptr = out_buf.contents();
+    Ok(unsafe { std::slice::from_raw_parts(out_ptr.as_ptr() as *const f32, hidden).to_vec() })
+}
+
 /// Top-k MoE SwiGLU on Metal in **one** command buffer: upload `x` once,
 /// run gate+up+SiLU×+down for every routed expert, weighted-accumulate
 /// into a single output, one download. Cuts the ~8 serial CB waits/layer
@@ -2352,6 +2820,25 @@ pub fn launch_moe_topk_swiglu(
         }
         .ok_or(MetalError::BufferAllocFailed)?
     };
+
+    let q4_0_batched = experts.len() <= 8
+        && experts.iter().all(|ex| {
+            ex.gate.fn_name == "q4_0_matvec"
+                && ex.up.fn_name == "q4_0_matvec"
+                && ex.down.fn_name == "q4_0_matvec"
+                && ex.gate.block_bytes == 18
+                && ex.up.block_bytes == 18
+                && ex.down.block_bytes == 18
+                && ex.gate.block_elems == 32
+                && ex.up.block_elems == 32
+                && ex.down.block_elems == 32
+                && ex.gate.row_bytes == experts[0].gate.row_bytes
+                && ex.up.row_bytes == experts[0].up.row_bytes
+                && ex.down.row_bytes == experts[0].down.row_bytes
+        });
+    if q4_0_batched {
+        return launch_q4_0_moe_topk_batched(device, queue, &x_buf, experts);
+    }
 
     // Per-expert scratch so dispatches do not false-share one gate/up/act
     // buffer (experts are independent — serial reuse forced full barriers).
@@ -2537,6 +3024,43 @@ pub(crate) fn encode_matvec_with_offsets(
 ) -> Result<(), MetalError> {
     let cached_pipeline = ensure_pipeline(device, launch.kernel_src, launch.fn_name)?;
     let pipeline = &cached_pipeline.0;
+
+    if launch.fn_name == "f32_matvec" {
+        let cols = launch.row_bytes / 4;
+        encoder.setComputePipelineState(pipeline);
+        unsafe {
+            encoder.setBuffer_offset_atIndex(Some(&weight.buffer), weight.weight_offset, 0);
+            encoder.setBuffer_offset_atIndex(Some(x_buf), x_byte_offset, 1);
+            encoder.setBuffer_offset_atIndex(Some(out_buf), out_byte_offset, 2);
+            let mut cols_u = cols as u32;
+            encoder.setBytes_length_atIndex(
+                NonNull::new(&mut cols_u as *mut u32 as *mut _).unwrap(),
+                4,
+                3,
+            );
+            let mut rows_u = launch.rows as u32;
+            encoder.setBytes_length_atIndex(
+                NonNull::new(&mut rows_u as *mut u32 as *mut _).unwrap(),
+                4,
+                4,
+            );
+        }
+        let tg = 64usize;
+        encoder.dispatchThreadgroups_threadsPerThreadgroup(
+            MTLSize {
+                width: launch.rows.div_ceil(tg),
+                height: 1,
+                depth: 1,
+            },
+            MTLSize {
+                width: tg,
+                height: 1,
+                depth: 1,
+            },
+        );
+        return Ok(());
+    }
+
     let n_blocks_per_row = launch.row_bytes / launch.block_bytes;
     let rows_per_tg = launch.rows_per_tg.max(1);
     let (tg_threads, tg_mem_bytes) = match launch.fn_name {
@@ -2815,6 +3339,115 @@ mod tests {
                 "row {i}: GPU={got} CPU reference={want}"
             );
         }
+    }
+
+    #[test]
+    #[ignore = "needs a real Metal-capable GPU; run manually with --ignored on Apple Silicon"]
+    fn launch_q4_0_moe_topk_batched_matches_cpu_reference() {
+        fn q4_matrix(rows: usize, cols: usize, seed: u8) -> Vec<u8> {
+            let blocks = cols / ferrox_quant::Q4_0_BLOCK_ELEMS;
+            let mut out = Vec::with_capacity(rows * blocks * ferrox_quant::Q4_0_BLOCK_BYTES);
+            for r in 0..rows {
+                for b in 0..blocks {
+                    out.extend_from_slice(
+                        &half::f16::from_f32(
+                            0.01 + ((r * blocks + b + seed as usize) % 17) as f32 * 0.003,
+                        )
+                        .to_le_bytes(),
+                    );
+                    for i in 0..16u8 {
+                        let lo = i.wrapping_add(r as u8).wrapping_add(seed) & 15;
+                        let hi = (15u8.wrapping_sub(i))
+                            .wrapping_add(b as u8)
+                            .wrapping_add(seed)
+                            & 15;
+                        out.push(lo | (hi << 4));
+                    }
+                }
+            }
+            out
+        }
+
+        let hidden = 64;
+        let ffn = 96;
+        let top_k = 3;
+        let x: Vec<f32> = (0..hidden).map(|i| (i as f32 * 0.071).sin()).collect();
+        let route = [0.5f32, 0.3, 0.2];
+        let mut gates = Vec::new();
+        let mut ups = Vec::new();
+        let mut downs = Vec::new();
+        for e in 0..top_k {
+            gates.push(q4_matrix(ffn, hidden, (e * 3 + 1) as u8));
+            ups.push(q4_matrix(ffn, hidden, (e * 3 + 2) as u8));
+            downs.push(q4_matrix(hidden, ffn, (e * 3 + 3) as u8));
+        }
+
+        let gu_row_bytes =
+            (hidden / ferrox_quant::Q4_0_BLOCK_ELEMS) * ferrox_quant::Q4_0_BLOCK_BYTES;
+        let down_row_bytes =
+            (ffn / ferrox_quant::Q4_0_BLOCK_ELEMS) * ferrox_quant::Q4_0_BLOCK_BYTES;
+        let mut expected = vec![0f32; hidden];
+        for e in 0..top_k {
+            let mut act = vec![0f32; ffn];
+            for r in 0..ffn {
+                let range = r * gu_row_bytes..(r + 1) * gu_row_bytes;
+                let g = ferrox_quant::dot_q4_0_f32_scalar(&gates[e][range.clone()], &x);
+                let u = ferrox_quant::dot_q4_0_f32_scalar(&ups[e][range], &x);
+                act[r] = ferrox_core_silu(g) * u;
+            }
+            for r in 0..hidden {
+                let range = r * down_row_bytes..(r + 1) * down_row_bytes;
+                expected[r] += route[e] * ferrox_quant::dot_q4_0_f32_scalar(&downs[e][range], &act);
+            }
+        }
+
+        let (src, fn_name, block_bytes, block_elems, rows_per_tg) =
+            matvec_launch_meta("Q4_0").unwrap();
+        let launches: Vec<MoeExpertLaunch<'_>> = (0..top_k)
+            .map(|e| MoeExpertLaunch {
+                gate: MatvecLaunch {
+                    kernel_src: src,
+                    fn_name,
+                    block_bytes,
+                    block_elems,
+                    weights: &gates[e],
+                    rows: ffn,
+                    row_bytes: gu_row_bytes,
+                    rows_per_tg,
+                },
+                up: MatvecLaunch {
+                    kernel_src: src,
+                    fn_name,
+                    block_bytes,
+                    block_elems,
+                    weights: &ups[e],
+                    rows: ffn,
+                    row_bytes: gu_row_bytes,
+                    rows_per_tg,
+                },
+                down: MatvecLaunch {
+                    kernel_src: src,
+                    fn_name,
+                    block_bytes,
+                    block_elems,
+                    weights: &downs[e],
+                    rows: hidden,
+                    row_bytes: down_row_bytes,
+                    rows_per_tg,
+                },
+                weight: route[e],
+            })
+            .collect();
+
+        let got = launch_moe_topk_swiglu(&x, &launches).expect("batched Q4_0 MoE");
+        for (i, (&g, &w)) in got.iter().zip(&expected).enumerate() {
+            let tol = 5e-3 * w.abs().max(1.0);
+            assert!((g - w).abs() <= tol, "elem {i}: gpu={g} cpu={w} tol={tol}");
+        }
+    }
+
+    fn ferrox_core_silu(x: f32) -> f32 {
+        x / (1.0 + (-x).exp())
     }
 
     /// Deterministic pseudo-random byte generator for building real,

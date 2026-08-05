@@ -652,6 +652,10 @@ impl WeightMatrix {
             self.cols(),
             "activation length must match matrix column count"
         );
+
+        // F32 stays on CPU in apply_gpu: a lone small router matvec is
+        // faster as host GEMV than a Metal sync. F32 Metal launches are
+        // used when fused into MoE resident decode (encode_matvec).
         let WeightMatrix::Quantized {
             data,
             rows,

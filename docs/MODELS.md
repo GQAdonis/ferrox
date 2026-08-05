@@ -65,8 +65,8 @@ Llama-3.2-1B IQ4_XS.
 | Qwen2-MoE | Loads (QKV bias + shared_expert_gate); suite entry added; oracle receipt needs real GGUF |
 | Mistral / Mixtral | Profile + SWA / grouped MoE wired; suite entries added; need receipt |
 | Gemma-2 | Attn softcap + SWA wired (CPU + Metal legacy GQA); needs real GGUF pin |
-| Gemma-4 | Admitted to GemmaFamily (`gemma4` / `gemma4-assistant` GenericGqa NeoX); Works pending receipt — MoE-A4B / VL later |
-| Phi-4 | Arch `phi4` admitted as PhiFamily (same fused path as phi3); no suite pin yet (**P6**) |
+| Gemma-4 | `gemma4` / `gemma4-assistant` **DedicatedOnly** (E2B: per-layer emb + shared KV + SWA/full head-dim split); suite `expect=refuse` until dedicated engine |
+| Phi-4 | Arch `phi4` PhiFamily; Host B metal pin [`phi4_mini_q4km_metal`](../benchmarks/receipts/pins/phi4_mini_q4km_metal.json) (~1.06× llama) |
 | Llama 4 | DedicatedOnly — MoE / non-generic graph not implemented (was wrongly GenericGqa) (**P6**) |
 | GLM4 / glm4moe | DedicatedOnly — route via `glm52_*` loaders, not generic GQA; no real-checkpoint receipt yet (**P6**) |
 | MiroThinker | No distinct GGUF arch string in the pinned inventory; published GGUFs use `qwen3moe` (already GenericGqa) (**P6**) |

@@ -301,8 +301,10 @@ pub fn architecture_catalog() -> &'static [ArchProfile] {
             ArchPath::GenericGqa { rope: Neox },
             PerHead,
         ));
-        // gemma4 text path reuses Gemma-3 GeGLU/SWA/sandwich; MoE-A4B and VL
-        // still fail if tensors absent / later phases.
+        // Gemma-4 text GGUFs (E2B) currently ship per-layer embeddings,
+        // shared-KV layers, and split SWA/full head dims
+        // (`attention.key_length` vs `key_length_swa`). Fail closed like
+        // gemma3n until a dedicated path lands — do not pretend GenericGqa.
         for n in ["gemma4", "gemma4-assistant"] {
             v.push(prof(
                 n,
@@ -310,7 +312,9 @@ pub fn architecture_catalog() -> &'static [ArchProfile] {
                 GemmaFamily,
                 KvIswa,
                 Neox,
-                ArchPath::GenericGqa { rope: Neox },
+                ArchPath::DedicatedOnly {
+                    reason: "gemma4 E2B needs per-layer emb + shared KV + SWA/full head-dim split",
+                },
                 PerHead,
             ));
         }
@@ -712,12 +716,12 @@ mod tests {
             })
         );
         for arch in ["gemma4", "gemma4-assistant"] {
-            assert_eq!(
-                resolve_architecture(arch),
-                Some(ArchPath::GenericGqa {
-                    rope: RopeLayout::Neox
-                }),
-                "{arch}"
+            assert!(
+                matches!(
+                    resolve_architecture(arch),
+                    Some(ArchPath::DedicatedOnly { .. })
+                ),
+                "{arch} E2B needs dedicated engine (per-layer emb / shared KV / SWA split)"
             );
             assert_eq!(
                 resolve_profile(arch).map(|p| p.family),

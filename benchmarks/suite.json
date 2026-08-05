@@ -147,8 +147,8 @@
       "gguf": "models/gemma-4-E2B-it-Q4_K_M.gguf",
       "backends": ["metal", "cpu"],
       "estimated_ram_gb": 6,
-      "expect": "ok",
-      "notes": "P4 GemmaFamily admit (gemma4 / gemma4-assistant); first Host B receipt"
+      "expect": "refuse",
+      "notes": "E2B: per-layer emb + shared_kv_layers + SWA/full head-dim split — DedicatedOnly until engine lands; llama may still pin"
     },
     {
       "id": "phi4_mini_q4km",
@@ -157,7 +157,7 @@
       "backends": ["metal", "cpu"],
       "estimated_ram_gb": 5,
       "expect": "ok",
-      "notes": "P6 PhiFamily admit (phi4); fused path shared with phi3"
+      "notes": "P6 PhiFamily (phi4 fused QKV); Host B receipt"
     }
   ]
 }

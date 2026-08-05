@@ -5,7 +5,7 @@
   "backend": "metal",
   "expect": "ok",
   "date": "2026-08-05",
-  "host": "Host B (Apple M2 Pro, 10 logical cores)",
+  "host": "Host B (Apple M2 Pro, 10 logical cores, 32 GiB unified)",
   "model": "~/Desktop/Dev/ferrox/models/gemma-2-2b-it-Q4_K_M.gguf",
   "max_tokens": 512,
   "reps": 3,
@@ -13,36 +13,36 @@
   "workload": "greedy chat, warm then 3x 512-tok capitals list (median)",
   "notes": "Attn + final logit softcap + SWA; FA-vec skipped when softcap set",
   "ferrox": {
-    "wall_s": 10.305,
-    "predicted_per_second": 58.949,
-    "prompt_per_second": 27.826,
+    "wall_s": 10.343,
+    "predicted_per_second": 59.077,
+    "prompt_per_second": 27.317,
     "completion_tokens": 512,
-    "wall_tok_s": 49.112,
+    "wall_tok_s": 49.501,
     "prefix": "I can't provide a list of 80 European capital cities with a ",
-    "predicted_stddev": 1.032,
-    "prompt_stddev": 0.474,
-    "wall_tok_s_stddev": 0.978,
+    "predicted_stddev": 0.102,
+    "prompt_stddev": 0.177,
+    "wall_tok_s_stddev": 0.188,
     "reps": 3,
     "runs": [
       {
-        "predicted_per_second": 60.39988291994782,
-        "prompt_per_second": 28.62107917518694,
-        "wall_tok_s": 47.779,
-        "wall_s": 7.702,
-        "completion_tokens": 368
-      },
-      {
-        "predicted_per_second": 58.94856767439768,
-        "prompt_per_second": 27.82566755515569,
-        "wall_tok_s": 49.685,
-        "wall_s": 10.305,
+        "predicted_per_second": 59.07708639325622,
+        "prompt_per_second": 27.477317886244673,
+        "wall_tok_s": 49.501,
+        "wall_s": 10.343,
         "completion_tokens": 512
       },
       {
-        "predicted_per_second": 58.404207413185176,
-        "prompt_per_second": 27.777226342804337,
-        "wall_tok_s": 49.112,
-        "wall_s": 10.425,
+        "predicted_per_second": 59.18014035697945,
+        "prompt_per_second": 27.31714730517574,
+        "wall_tok_s": 49.704,
+        "wall_s": 10.301,
+        "completion_tokens": 512
+      },
+      {
+        "predicted_per_second": 58.97556364475854,
+        "prompt_per_second": 27.123989584510646,
+        "wall_tok_s": 49.329,
+        "wall_s": 10.379,
         "completion_tokens": 512
       }
     ],
@@ -50,36 +50,36 @@
     "engine": "ferrox"
   },
   "llama": {
-    "wall_s": 8.182,
-    "predicted_per_second": 62.816,
-    "prompt_per_second": 8146.64,
+    "wall_s": 7.451,
+    "predicted_per_second": 68.916,
+    "prompt_per_second": 8964.955,
     "completion_tokens": 512,
-    "wall_tok_s": 62.577,
+    "wall_tok_s": 68.693,
     "prefix": "I can't provide a list of 80 European capital cities with a ",
-    "predicted_stddev": 0.672,
-    "prompt_stddev": 2031.922,
-    "wall_tok_s_stddev": 0.615,
+    "predicted_stddev": 0.204,
+    "prompt_stddev": 12883.195,
+    "wall_tok_s_stddev": 0.177,
     "reps": 3,
     "runs": [
       {
-        "predicted_per_second": 61.7340590782888,
-        "prompt_per_second": 10049.176822749627,
-        "wall_tok_s": 61.563,
-        "wall_s": 8.317,
+        "predicted_per_second": 68.57864775489865,
+        "prompt_per_second": 31081.081081081084,
+        "wall_tok_s": 68.396,
+        "wall_s": 6.375,
+        "completion_tokens": 436
+      },
+      {
+        "predicted_per_second": 68.94459426577576,
+        "prompt_per_second": 8573.65549493375,
+        "wall_tok_s": 68.712,
+        "wall_s": 7.451,
         "completion_tokens": 512
       },
       {
-        "predicted_per_second": 62.96492742861689,
-        "prompt_per_second": 5988.023952095809,
-        "wall_tok_s": 62.672,
-        "wall_s": 8.169,
-        "completion_tokens": 512
-      },
-      {
-        "predicted_per_second": 62.815765775713366,
-        "prompt_per_second": 8146.639511201629,
-        "wall_tok_s": 62.577,
-        "wall_s": 8.182,
+        "predicted_per_second": 68.9162992701064,
+        "prompt_per_second": 8964.955175224122,
+        "wall_tok_s": 68.693,
+        "wall_s": 7.453,
         "completion_tokens": 512
       }
     ],

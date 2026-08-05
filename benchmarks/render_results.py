@@ -66,25 +66,60 @@ def fmt_load(x, sd=None) -> str:
     return f"**{x:.3f}**"
 
 
-def gap_str(fp, lp) -> str:
+def gap_ratio(fp, lp) -> float | None:
     if fp and lp and fp > 0:
-        g = lp / fp
-        if abs(g - 1.0) < 0.015:
-            return "**1.00×**"
-        return f"~{g:.2f}×"
-    return "—"
+        return lp / fp
+    return None
+
+
+def color_gap(g: float | None, *, lower_is_better: bool = False) -> str:
+    """HTML-colored gap cell. Convention: gap < 1 → ferrox better → green.
+
+    For tok/s, gap = llama/ferrox. For load, gap = ferrox/llama (already
+    flipped so <1 means ferrox better). `lower_is_better` is unused when
+    callers pass the already-normalized ratio.
+    """
+    del lower_is_better  # ratios are pre-normalized to "<1 = ferrox better"
+    if g is None:
+        return "—"
+    if abs(g - 1.0) < 0.015:
+        return (
+            '<span style="color:#656d76;font-weight:600">= **1.00×**</span>'
+        )
+    label = f"**~{g:.2f}×**"
+    if g < 1.0:
+        # ferrox better — green
+        return (
+            f'<span style="color:#1a7f37;font-weight:700;background:#dafbe1;'
+            f'padding:1px 6px;border-radius:4px">▲ {label}</span>'
+        )
+    # ferrox slower — red
+    return (
+        f'<span style="color:#cf222e;font-weight:700;background:#ffebe9;'
+        f'padding:1px 6px;border-radius:4px">▼ {label}</span>'
+    )
+
+
+def gap_str(fp, lp) -> str:
+    return color_gap(gap_ratio(fp, lp))
 
 
 def winner_str(fp, lp) -> str:
     """Who is faster on predicted tok/s (same 1.5% tie band as gap_str)."""
-    if fp and lp and fp > 0:
-        g = lp / fp
-        if abs(g - 1.0) < 0.015:
-            return "tie"
-        if g < 1.0:
-            return "ferrox"
-        return "llama"
-    return "—"
+    g = gap_ratio(fp, lp)
+    if g is None:
+        return "—"
+    if abs(g - 1.0) < 0.015:
+        return '<span style="color:#656d76">tie</span>'
+    if g < 1.0:
+        return (
+            '<span style="color:#1a7f37;font-weight:700;background:#dafbe1;'
+            'padding:1px 6px;border-radius:4px">ferrox</span>'
+        )
+    return (
+        '<span style="color:#cf222e;font-weight:700;background:#ffebe9;'
+        'padding:1px 6px;border-radius:4px">llama</span>'
+    )
 
 
 def status_cell(pin: dict | None, expect: str) -> str:
@@ -159,6 +194,14 @@ def main() -> None:
         "\n",
         "One pin per `(model_id, backend)`. Re-run overwrites the pin. "
         "Gap only when both engines succeed.\n",
+        "\n",
+        "**Gap colors:** "
+        '<span style="color:#1a7f37;font-weight:700;background:#dafbe1;'
+        'padding:1px 6px;border-radius:4px">▲ green</span> = ferrox better '
+        "(&lt;1.00×); "
+        '<span style="color:#cf222e;font-weight:700;background:#ffebe9;'
+        'padding:1px 6px;border-radius:4px">▼ red</span> = ferrox slower '
+        "(&gt;1.00×); gray = tie.\n",
         "\n",
         "Keep off (regressions): legacy GQA NSG=4, sequential GREEDY argmax, "
         "float4 elem, early Multi-CB. `FERROX_METAL_FA_VEC=0` → ~25.5 pred.\n",
@@ -259,8 +302,7 @@ def main() -> None:
                 # Gap = ferrox_load / llama_load (<1 ferrox faster to load).
                 load_gap = "—"
                 if fl and ll and ll > 0:
-                    lg = fl / ll
-                    load_gap = f"~{lg:.2f}×" if abs(lg - 1.0) >= 0.015 else "**1.00×**"
+                    load_gap = color_gap(fl / ll)
                 lines.append(
                     f"| {entry['name']} | {backend} | {fcell} | {lcell} | "
                     f"{gap_str(fp, lp)} | {fmt_load(fl, flsd)} | {fmt_load(ll, llsd)} | "

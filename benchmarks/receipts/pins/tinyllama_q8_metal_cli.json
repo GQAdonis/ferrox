@@ -8,24 +8,41 @@
   "host": "Host B (Apple M2 Pro, 10 logical cores)",
   "model": "~/Desktop/Dev/ferrox/models/tinyllama-1.1b-chat-v1.0.Q8_0.gguf",
   "max_tokens": 512,
-  "reps": 1,
+  "reps": 3,
   "mode": "cli",
   "workload": "greedy chat, warm then 3x 512-tok capitals list (median)",
   "notes": "Verified smoke",
   "ferrox": {
-    "wall_s": 6.979,
+    "wall_s": 5.397,
     "engine": "ferrox",
-    "load_s": 0.06,
-    "prompt_per_second": 22.88,
+    "load_s": 0.05,
+    "prompt_per_second": 51.87,
     "completion_tokens": 512,
-    "predicted_per_second": 100.67,
-    "prefix": "-5555-4343-8888-a1a1a1a1a1a1</s> \n<|assistant|>\n1. Paris, Fr",
-    "reps": 1,
+    "predicted_per_second": 112.78,
+    "prefix": "-835a-435a-835a-435a42835a42</s> \n<|assistant|>\n1. Paris, Fr",
+    "predicted_stddev": 3.475,
+    "prompt_stddev": 15.96,
+    "load_stddev": 0.006,
+    "reps": 3,
     "runs": [
       {
-        "predicted_per_second": 100.67,
-        "prompt_per_second": 22.88,
-        "wall_s": 6.979,
+        "predicted_per_second": 108.1,
+        "prompt_per_second": 24.75,
+        "wall_s": 6.438,
+        "load_s": 0.05,
+        "completion_tokens": 512
+      },
+      {
+        "predicted_per_second": 112.78,
+        "prompt_per_second": 51.87,
+        "wall_s": 5.397,
+        "load_s": 0.05,
+        "completion_tokens": 512
+      },
+      {
+        "predicted_per_second": 114.89,
+        "prompt_per_second": 52.89,
+        "wall_s": 5.296,
         "load_s": 0.06,
         "completion_tokens": 512
       }
@@ -33,20 +50,37 @@
     "mode": "cli"
   },
   "llama": {
-    "wall_s": 7.219,
+    "wall_s": 5.63,
     "engine": "llama",
-    "load_s": 0.921,
-    "prompt_per_second": 959.67,
-    "predicted_per_second": 90.44,
+    "load_s": 0.142,
+    "prompt_per_second": 1024.69,
+    "predicted_per_second": 113.36,
     "completion_tokens": 511,
-    "prefix": "-3453-4453-3453-345334533453\n\n# 1. Paris, France\n- The Eiffe",
-    "reps": 1,
+    "prefix": "-335a-435a-855a-855a855a855a\n\n# 1. Paris, France\n- The Eiffe",
+    "predicted_stddev": 4.323,
+    "prompt_stddev": 80.788,
+    "load_stddev": 0.289,
+    "reps": 3,
     "runs": [
       {
-        "predicted_per_second": 90.44,
-        "prompt_per_second": 959.67,
-        "wall_s": 7.219,
-        "load_s": 0.921,
+        "predicted_per_second": 113.36,
+        "prompt_per_second": 1024.69,
+        "wall_s": 5.765,
+        "load_s": 0.629,
+        "completion_tokens": 511
+      },
+      {
+        "predicted_per_second": 113.76,
+        "prompt_per_second": 1028.99,
+        "wall_s": 5.179,
+        "load_s": 0.142,
+        "completion_tokens": 511
+      },
+      {
+        "predicted_per_second": 106.08,
+        "prompt_per_second": 886.96,
+        "wall_s": 5.63,
+        "load_s": 0.116,
         "completion_tokens": 511
       }
     ],

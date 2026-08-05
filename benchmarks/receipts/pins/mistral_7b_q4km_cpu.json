@@ -1,0 +1,89 @@
+{
+  "schema": 1,
+  "id": "mistral_7b_q4km",
+  "name": "Mistral-7B-Instruct-v0.2 Q4_K_M",
+  "backend": "cpu",
+  "expect": "ok",
+  "date": "2026-08-05",
+  "host": "Host B (Apple M2 Pro, 10 logical cores)",
+  "model": "~/Desktop/Dev/ferrox/models/Mistral-7B-Instruct-v0.2-Q4_K_M.gguf",
+  "max_tokens": 512,
+  "reps": 3,
+  "mode": "server",
+  "workload": "greedy chat, warm then 3x 512-tok capitals list (median)",
+  "notes": "SWA dense; token-parity receipt pending real GGUF",
+  "ferrox": {
+    "wall_s": 174.877,
+    "predicted_per_second": 3.103,
+    "prompt_per_second": 3.918,
+    "completion_tokens": 512,
+    "wall_tok_s": 2.928,
+    "prefix": "-2e2e-4c2e-8c2c-933c83b1b25a 1. Amsterdam, Netherlands: The ",
+    "predicted_stddev": 0.471,
+    "prompt_stddev": 0.68,
+    "wall_tok_s_stddev": 0.434,
+    "reps": 3,
+    "runs": [
+      {
+        "predicted_per_second": 3.739355706239579,
+        "prompt_per_second": 3.9182116387161363,
+        "wall_tok_s": 3.468,
+        "wall_s": 147.643,
+        "completion_tokens": 512
+      },
+      {
+        "predicted_per_second": 3.1032284057780166,
+        "prompt_per_second": 4.248888919619371,
+        "wall_tok_s": 2.928,
+        "wall_s": 174.877,
+        "completion_tokens": 512
+      },
+      {
+        "predicted_per_second": 2.819204083533455,
+        "prompt_per_second": 2.9411387423363875,
+        "wall_tok_s": 2.609,
+        "wall_s": 196.244,
+        "completion_tokens": 512
+      }
+    ],
+    "metal_fails": 0,
+    "engine": "ferrox"
+  },
+  "llama": {
+    "wall_s": 161.028,
+    "predicted_per_second": 3.193,
+    "prompt_per_second": 18.798,
+    "completion_tokens": 512,
+    "wall_tok_s": 3.18,
+    "prefix": " 1. Amsterdam, Netherlands: The city was originally built be",
+    "predicted_stddev": 1.226,
+    "prompt_stddev": 3.522,
+    "wall_tok_s_stddev": 1.201,
+    "reps": 3,
+    "runs": [
+      {
+        "predicted_per_second": 3.9361339813265652,
+        "prompt_per_second": 24.47705785764551,
+        "wall_tok_s": 3.878,
+        "wall_s": 132.041,
+        "completion_tokens": 512
+      },
+      {
+        "predicted_per_second": 3.1931460716145827,
+        "prompt_per_second": 18.029035762094853,
+        "wall_tok_s": 3.18,
+        "wall_s": 161.028,
+        "completion_tokens": 512
+      },
+      {
+        "predicted_per_second": 1.5406524731229037,
+        "prompt_per_second": 18.797758054056086,
+        "wall_tok_s": 1.538,
+        "wall_s": 332.994,
+        "completion_tokens": 512
+      }
+    ],
+    "engine": "llama"
+  },
+  "status": "ok"
+}

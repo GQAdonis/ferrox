@@ -4,70 +4,84 @@
   "name": "Llama-3.1-8B-Instruct Q4_K_M",
   "backend": "metal",
   "expect": "ok",
-  "date": "2026-08-04",
+  "date": "2026-08-05",
   "host": "Host B (Apple M2 Pro, 10 logical cores)",
   "model": "~/Desktop/Dev/ferrox/models/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf",
   "max_tokens": 512,
   "reps": 3,
   "mode": "cli",
   "workload": "greedy chat, warm then 3x 512-tok capitals list (median)",
-  "notes": "Host B Metal pin (f16 KV + FA-vec d=128)",
+  "notes": "Host B Metal pin; CUDA fair-chat when --backend cuda + --host-label",
   "ferrox": {
-    "wall_s": 20.536,
+    "wall_s": 24.981,
     "engine": "ferrox",
-    "prompt_per_second": 14.37,
+    "load_s": 0.12,
+    "prompt_per_second": 7.8,
     "completion_tokens": 512,
-    "predicted_per_second": 28.64,
-    "prefix": "b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3",
-    "predicted_stddev": 0.248,
-    "prompt_stddev": 0.613,
+    "predicted_per_second": 24.99,
+    "prefix": "b8\n1. Amsterdam, Netherlands - The city's canals were origin",
+    "predicted_stddev": 0.136,
+    "prompt_stddev": 1.564,
+    "load_stddev": 0.04,
     "reps": 3,
     "runs": [
       {
-        "predicted_per_second": 29.06,
-        "prompt_per_second": 15.08,
-        "wall_s": 20.116,
+        "predicted_per_second": 24.88,
+        "prompt_per_second": 10.43,
+        "wall_s": 24.249,
+        "load_s": 0.19,
         "completion_tokens": 512
       },
       {
-        "predicted_per_second": 28.64,
-        "prompt_per_second": 14.37,
-        "wall_s": 20.536,
+        "predicted_per_second": 24.99,
+        "prompt_per_second": 7.65,
+        "wall_s": 25.56,
+        "load_s": 0.12,
         "completion_tokens": 512
       },
       {
-        "predicted_per_second": 28.62,
-        "prompt_per_second": 13.86,
-        "wall_s": 20.555,
+        "predicted_per_second": 25.15,
+        "prompt_per_second": 7.8,
+        "wall_s": 24.981,
+        "load_s": 0.12,
         "completion_tokens": 512
       }
     ],
     "mode": "cli"
   },
   "llama": {
-    "wall_s": 20.873,
+    "wall_s": 27.714,
     "engine": "llama",
-    "prompt_per_second": 15592.3,
-    "predicted_per_second": 28.6,
-    "prefix": "--no-conversation is not supported by llama-cli\nplease use l",
-    "predicted_stddev": 0.643,
-    "prompt_stddev": 11373.694,
+    "load_s": 4.718,
+    "prompt_per_second": 127.14,
+    "predicted_per_second": 24.69,
+    "completion_tokens": 511,
+    "prefix": "\n1. Amsterdam, Netherlands - The city's canals were original",
+    "predicted_stddev": 0.471,
+    "prompt_stddev": 55.216,
+    "load_stddev": 5.418,
     "reps": 3,
     "runs": [
       {
-        "predicted_per_second": 27.6,
-        "prompt_per_second": 4565.3,
-        "wall_s": 28.973
+        "predicted_per_second": 25.5,
+        "prompt_per_second": 122.05,
+        "wall_s": 36.197,
+        "load_s": 13.398,
+        "completion_tokens": 511
       },
       {
-        "predicted_per_second": 28.8,
-        "prompt_per_second": 15592.3,
-        "wall_s": 20.873
+        "predicted_per_second": 24.68,
+        "prompt_per_second": 127.14,
+        "wall_s": 26.696,
+        "load_s": 3.439,
+        "completion_tokens": 511
       },
       {
-        "predicted_per_second": 28.6,
-        "prompt_per_second": 27309.2,
-        "wall_s": 20.766
+        "predicted_per_second": 24.69,
+        "prompt_per_second": 220.13,
+        "wall_s": 27.714,
+        "load_s": 4.718,
+        "completion_tokens": 511
       }
     ],
     "mode": "cli"

@@ -28,6 +28,36 @@ and an OpenAI-compatible HTTP server.
 cargo build --release -p ferrox-cli -p ferrox-server --features metal
 ```
 
+### Download a GGUF
+
+Ferrox loads local `.gguf` files (same format as llama.cpp). Install the
+[Hugging Face CLI](https://huggingface.co/docs/huggingface_hub/guides/cli)
+(`pip install -U huggingface_hub`), then:
+
+```bash
+mkdir -p models
+
+# ~1.2 GB smoke test — filename matches the CLI examples below
+hf download TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF \
+  tinyllama-1.1b-chat-v1.0.Q8_0.gguf --local-dir models
+
+# Optional: small instruct chat model (~0.8 GB)
+hf download bartowski/Llama-3.2-1B-Instruct-GGUF \
+  Llama-3.2-1B-Instruct-Q4_K_M.gguf --local-dir models
+```
+
+| Model | Repo | File |
+|---|---|---|
+| TinyLlama 1.1B Chat Q8_0 | [TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF](https://huggingface.co/TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF) | `tinyllama-1.1b-chat-v1.0.Q8_0.gguf` |
+| Llama 3.2 1B Instruct Q4_K_M | [bartowski/Llama-3.2-1B-Instruct-GGUF](https://huggingface.co/bartowski/Llama-3.2-1B-Instruct-GGUF) | `Llama-3.2-1B-Instruct-Q4_K_M.gguf` |
+| Llama 3.1 8B Instruct Q4_K_M | [bartowski/Meta-Llama-3.1-8B-Instruct-GGUF](https://huggingface.co/bartowski/Meta-Llama-3.1-8B-Instruct-GGUF) | `Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf` |
+| SmolLM2 135M Instruct Q8_0 | [bartowski/SmolLM2-135M-Instruct-GGUF](https://huggingface.co/bartowski/SmolLM2-135M-Instruct-GGUF) | `SmolLM2-135M-Instruct-Q8_0.gguf` |
+
+Browse more GGUFs:
+[llama.cpp-compatible models](https://huggingface.co/models?apps=llama.cpp&sort=trending)
+on Hugging Face. Prefer `Q4_K_M` for everyday use, `Q8_0` for tiny smokes.
+What Ferrox verifies today: [docs/MODELS.md](docs/MODELS.md).
+
 ### CLI
 
 ```bash
@@ -54,8 +84,6 @@ curl -s -X POST http://127.0.0.1:8383/v1/chat/completions \
   -H 'content-type: application/json' \
   -d '{"model":"m","messages":[{"role":"user","content":"Hi"}],"max_tokens":32,"temperature":0}'
 ```
-
-Good first models: TinyLlama Q8_0, SmolLM2-135M Q8_0, Llama-3.1-8B Q4_K_M.
 
 ## Status
 

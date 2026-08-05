@@ -1187,62 +1187,6 @@ impl Decoder {
                                     }
 
                                     if !did_metal_dense && !clear_metal_kv {
-                                        // MoE: fused attn+residual+ffn_norm → host
-                                        // route → one-CB top-k experts.
-                                        let moe_fused = !Self::is_dense_layer(layer)
-                                            && matches!(
-                                                self.config.ffn_activation,
-                                                crate::config::FfnActivation::Swiglu
-                                                    | crate::config::FfnActivation::SwigluFused
-                                            )
-                                            && layer.moe.shared_experts.is_empty();
-                                        if moe_fused {
-                                            match ferrox_metal::attn::launch_decode_moe_attn_ffn_pre(
-                                                &hidden,
-                                                &layer.attn.norm_weight,
-                                                &q_l,
-                                                &k_l,
-                                                &v_l,
-                                                &o_l,
-                                                &mut metal_kvs[l],
-                                                &layer.moe.norm_weight,
-                                                n_heads,
-                                                self.metal_rope_layout(),
-                                                self.config.rope_theta,
-                                                self.config.rope_freqs.as_deref(),
-                                                pos,
-                                                self.config.rms_norm_eps,
-                                                &self.metal_attn_extras(layer),
-                                            ) {
-                                                Ok((new_h, ffn_normed)) => {
-                                                    let ffn_out = Self::run_ffn_block(
-                                                        layer,
-                                                        &ffn_normed,
-                                                        &self.config,
-                                                        hidden_dim,
-                                                        residency.as_ref().map(|p| p.layer_plan(l)),
-                                                    );
-                                                    hidden = new_h;
-                                                    for (h, f) in
-                                                        hidden.iter_mut().zip(ffn_out.iter())
-                                                    {
-                                                        *h += f;
-                                                    }
-                                                    did_metal_attn = true;
-                                                    did_metal_dense = true; // skip second FFN below
-                                                }
-                                                Err(e) => {
-                                                    eprintln!(
-                                                        "ferrox: Metal MoE attn+ffn_pre failed, fallback: {e}"
-                                                    );
-                                                    Self::catch_up_host_kv_from_metal(
-                                                        &metal_kvs[l],
-                                                        cache,
-                                                    );
-                                                    clear_metal_kv = true;
-                                                }
-                                            }
-                                        } else {
                                         match ferrox_metal::attn::launch_decode_attn_block(
                                             &normed,
                                             &q_l,
@@ -1279,7 +1223,6 @@ impl Decoder {
                                                 );
                                                 clear_metal_kv = true;
                                             }
-                                        }
                                         }
                                     }
                                 }

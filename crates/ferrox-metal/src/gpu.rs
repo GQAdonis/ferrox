@@ -2353,19 +2353,34 @@ pub fn launch_moe_topk_swiglu(
         .ok_or(MetalError::BufferAllocFailed)?
     };
 
-    // Scratch reused across experts (serial encodes in one CB).
-    let gate_buf = device
-        .newBufferWithLength_options(ffn * 4, MTLResourceOptions::StorageModeShared)
-        .ok_or(MetalError::BufferAllocFailed)?;
-    let up_buf = device
-        .newBufferWithLength_options(ffn * 4, MTLResourceOptions::StorageModeShared)
-        .ok_or(MetalError::BufferAllocFailed)?;
-    let act_buf = device
-        .newBufferWithLength_options(ffn * 4, MTLResourceOptions::StorageModeShared)
-        .ok_or(MetalError::BufferAllocFailed)?;
-    let down_buf = device
-        .newBufferWithLength_options(hidden * 4, MTLResourceOptions::StorageModeShared)
-        .ok_or(MetalError::BufferAllocFailed)?;
+    // Per-expert scratch so dispatches do not false-share one gate/up/act
+    // buffer (experts are independent — serial reuse forced full barriers).
+    let mut gate_bufs = Vec::with_capacity(experts.len());
+    let mut up_bufs = Vec::with_capacity(experts.len());
+    let mut act_bufs = Vec::with_capacity(experts.len());
+    let mut down_bufs = Vec::with_capacity(experts.len());
+    for _ in experts {
+        gate_bufs.push(
+            device
+                .newBufferWithLength_options(ffn * 4, MTLResourceOptions::StorageModeShared)
+                .ok_or(MetalError::BufferAllocFailed)?,
+        );
+        up_bufs.push(
+            device
+                .newBufferWithLength_options(ffn * 4, MTLResourceOptions::StorageModeShared)
+                .ok_or(MetalError::BufferAllocFailed)?,
+        );
+        act_bufs.push(
+            device
+                .newBufferWithLength_options(ffn * 4, MTLResourceOptions::StorageModeShared)
+                .ok_or(MetalError::BufferAllocFailed)?,
+        );
+        down_bufs.push(
+            device
+                .newBufferWithLength_options(hidden * 4, MTLResourceOptions::StorageModeShared)
+                .ok_or(MetalError::BufferAllocFailed)?,
+        );
+    }
     // Accumulator must start at zero (newBuffer contents are undefined).
     let mut zeros = vec![0f32; hidden];
     let out_buf = unsafe {
@@ -2388,26 +2403,55 @@ pub fn launch_moe_topk_swiglu(
     let encoder = cmd_buf
         .computeCommandEncoder()
         .ok_or(MetalError::CommandFailed)?;
+    // Phase all gates, then ups, then silu, then downs, then axpy — same
+    // dependency order as sequential, but no buffer reuse hazards between
+    // experts so the GPU can overlap independent dispatches.
     for (i, ex) in experts.iter().enumerate() {
-        let g_w = &weight_bufs[i * 3];
-        let u_w = &weight_bufs[i * 3 + 1];
-        let d_w = &weight_bufs[i * 3 + 2];
-        encode_matvec(&encoder, device, &ex.gate, g_w, &x_buf, &gate_buf)?;
-        encode_matvec(&encoder, device, &ex.up, u_w, &x_buf, &up_buf)?;
+        encode_matvec(
+            &encoder,
+            device,
+            &ex.gate,
+            &weight_bufs[i * 3],
+            &x_buf,
+            &gate_bufs[i],
+        )?;
+    }
+    for (i, ex) in experts.iter().enumerate() {
+        encode_matvec(
+            &encoder,
+            device,
+            &ex.up,
+            &weight_bufs[i * 3 + 1],
+            &x_buf,
+            &up_bufs[i],
+        )?;
+    }
+    for (i, _) in experts.iter().enumerate() {
         crate::elem::encode_silu_mul(
             &encoder,
             device,
-            &gate_buf,
-            &up_buf,
-            &act_buf,
+            &gate_bufs[i],
+            &up_bufs[i],
+            &act_bufs[i],
             ffn as u32,
         )?;
-        encode_matvec(&encoder, device, &ex.down, d_w, &act_buf, &down_buf)?;
+    }
+    for (i, ex) in experts.iter().enumerate() {
+        encode_matvec(
+            &encoder,
+            device,
+            &ex.down,
+            &weight_bufs[i * 3 + 2],
+            &act_bufs[i],
+            &down_bufs[i],
+        )?;
+    }
+    for (i, ex) in experts.iter().enumerate() {
         crate::elem::encode_axpy(
             &encoder,
             device,
             &out_buf,
-            &down_buf,
+            &down_bufs[i],
             ex.weight,
             hidden as u32,
         )?;

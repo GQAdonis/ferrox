@@ -68,6 +68,7 @@ Same via explicit subcommand: `ferrox run -m …`.
 | `-dev` / `--device` | `auto`, `none`, `cpu`, `metal`, or `cuda` |
 | `--list-devices` | Print compiled, detected devices and exit |
 | `-ngl` / `--gpu-layers` / `--n-gpu-layers` | `0`, a number, `auto`, or `all` |
+| `--ctk` | KV dtype: `f16` (default), `q8_0` (Metal), … — sets `FERROX_CTK` |
 | `--system` | Chat mode only |
 | `--no-cnv` | Skip chat-template wrap |
 | `-e` / `--escape` | `\n` `\t` `\r` `\\` in `-p` |

@@ -22,8 +22,8 @@ Keep off (regressions): legacy GQA NSG=4, sequential GREEDY argmax, float4 elem,
 | TinyLlama-1.1B-Chat-v1.0 Q8_0 | metal | **116.69** ±1.4 | **109.85** ±3.0 | 🟢 **~0.94×** | 🟢 **ferrox** | ok | [`tinyllama_q8_metal`](receipts/pins/tinyllama_q8_metal.json) |
 | TinyLlama-1.1B-Chat-v1.0 Q8_0 | cpu | **44.56** | **38.16** (−ngl 0) | 🟢 **~0.86×** | 🟢 **ferrox** | ok | [`tinyllama_q8_cpu`](receipts/pins/tinyllama_q8_cpu.json) |
 | Llama-3.2-1B-Instruct Q4_K_M | metal | **139.39** ±1.6 | **139.94** ±1.5 | ⚪ **1.00×** | ⚪ parity | ok | [`llama32_1b_q4km_metal`](receipts/pins/llama32_1b_q4km_metal.json) |
-| OLMoE-1B-7B-0924 Q4_0 | cpu | **17.89** | **19.74** (−ngl 0) | 🔴 **~1.10×** | 🔴 **llama** | ok | [`olmoe_q4_cpu`](receipts/pins/olmoe_q4_cpu.json) |
-| OLMoE-1B-7B-0924 Q4_0 | metal | **14.46** ±0.6 | **149.50** ±1.8 | 🔴 **~10.34×** | 🔴 **llama** | ok | [`olmoe_q4_metal`](receipts/pins/olmoe_q4_metal.json) |
+| OLMoE-1B-7B-0924 Q4_0 | cpu | **20.52** ±0.6 | **13.20** ±4.2 (−ngl 0) | 🟢 **~0.64×** | 🟢 **ferrox** | ok | [`olmoe_q4_cpu`](receipts/pins/olmoe_q4_cpu.json) |
+| OLMoE-1B-7B-0924 Q4_0 | metal | **27.89** ±0.4 | **149.64** ±1.3 | 🔴 **~5.37×** | 🔴 **llama** | ok | [`olmoe_q4_metal`](receipts/pins/olmoe_q4_metal.json) |
 | OLMoE-1B-7B-0924 Q4_0 | cuda | — | — | — | — | no pin | — |
 | Llama-3.1-8B-Instruct Q4_K_M | metal | **27.98** ±1.0 | **28.73** ±1.0 | ⚪ **~1.03×** | ⚪ parity | ok | [`llama31_8b_q4km_metal`](receipts/pins/llama31_8b_q4km_metal.json) |
 | Llama-3.1-8B-Instruct Q4_K_M | cuda | — | — | — | — | no pin | — |

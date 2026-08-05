@@ -4,29 +4,85 @@
   "name": "OLMoE-1B-7B-0924 Q4_0",
   "backend": "cpu",
   "expect": "ok",
-  "date": "2026-08-04",
-  "host": "Host B (Apple M2 Pro, 10 logical cores)",
+  "date": "2026-08-05",
+  "host": "Apple M2 Pro (10 cores)",
   "model": "~/Desktop/Dev/ferrox/models/olmoe-1b-7b-0924-q4_0.gguf",
-  "max_tokens": 256,
-  "workload": "greedy chat, warm then 256-tok capitals list",
-  "notes": "Verified MoE; CPU fair-chat",
+  "max_tokens": 512,
+  "reps": 3,
+  "mode": "server",
+  "workload": "greedy chat, warm then 3x 512-tok capitals list (median)",
+  "notes": "Verified MoE; Metal/CUDA expert placement when budget set",
   "ferrox": {
-    "wall_s": 18.296,
-    "predicted_per_second": 17.892669788926455,
-    "prompt_per_second": 8.528835816923676,
-    "completion_tokens": 256,
-    "wall_tok_s": 13.992,
-    "prefix": "-a9a6-4e4d-a9a6-a9a6-a9a6-a9a6-a9a6-a9a6-a9a6-a9a6-a9a6-a9a6",
+    "wall_s": 27.006,
+    "predicted_per_second": 20.524,
+    "prompt_per_second": 27.71,
+    "completion_tokens": 512,
+    "wall_tok_s": 18.959,
+    "prefix": "-a9c0-4e4e-a9a6-a9a6a9a9a9a\n\nThe first thing you should do i",
+    "predicted_stddev": 0.642,
+    "prompt_stddev": 12.014,
+    "wall_tok_s_stddev": 0.979,
+    "reps": 3,
+    "runs": [
+      {
+        "predicted_per_second": 20.52407065305126,
+        "prompt_per_second": 9.740370657893486,
+        "wall_tok_s": 18.003,
+        "wall_s": 28.439,
+        "completion_tokens": 512
+      },
+      {
+        "predicted_per_second": 20.96431805988579,
+        "prompt_per_second": 27.71035454595041,
+        "wall_tok_s": 19.96,
+        "wall_s": 25.651,
+        "completion_tokens": 512
+      },
+      {
+        "predicted_per_second": 19.699518347922968,
+        "prompt_per_second": 32.53990205489482,
+        "wall_tok_s": 18.959,
+        "wall_s": 27.006,
+        "completion_tokens": 512
+      }
+    ],
     "metal_fails": 0,
     "engine": "ferrox"
   },
   "llama": {
-    "wall_s": 13.679,
-    "predicted_per_second": 19.741613130393663,
-    "prompt_per_second": 67.67283006365476,
-    "completion_tokens": 256,
-    "wall_tok_s": 18.715,
+    "wall_s": 39.315,
+    "predicted_per_second": 13.201,
+    "prompt_per_second": 102.056,
+    "completion_tokens": 512,
+    "wall_tok_s": 13.023,
     "prefix": "Write a detailed numbered list of 80 European capital cities",
+    "predicted_stddev": 4.241,
+    "prompt_stddev": 51.157,
+    "wall_tok_s_stddev": 4.107,
+    "reps": 3,
+    "runs": [
+      {
+        "predicted_per_second": 18.563256853802788,
+        "prompt_per_second": 102.0563264065316,
+        "wall_tok_s": 18.256,
+        "wall_s": 28.045,
+        "completion_tokens": 512
+      },
+      {
+        "predicted_per_second": 13.201402504625776,
+        "prompt_per_second": 39.095716086909775,
+        "wall_tok_s": 13.023,
+        "wall_s": 39.315,
+        "completion_tokens": 512
+      },
+      {
+        "predicted_per_second": 10.189996464548884,
+        "prompt_per_second": 140.42032483901815,
+        "wall_tok_s": 10.156,
+        "wall_s": 50.413,
+        "completion_tokens": 512
+      }
+    ],
     "engine": "llama"
   },
   "status": "ok"

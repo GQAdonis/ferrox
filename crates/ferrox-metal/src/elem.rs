@@ -156,6 +156,24 @@ kernel void silu_mul_f32(
 }
 "#;
 
+/// `y[i] += a * x[i]` — MoE weighted expert accumulate.
+const AXPY_KERNEL_SRC: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+kernel void axpy_f32(
+    device float* y [[buffer(0)]],
+    device const float* x [[buffer(1)]],
+    constant float& a [[buffer(2)]],
+    constant uint& n [[buffer(3)]],
+    uint i [[thread_position_in_grid]]
+) {
+    if (i < n) {
+        y[i] += a * x[i];
+    }
+}
+"#;
+
 /// Gemma GeGLU pair: `gelu(gate) * up`, tanh approximation matching
 /// `ferrox_core::matmul::gelu` (HF / llama.cpp convention).
 const GELU_MUL_KERNEL_SRC: &str = r#"
@@ -419,6 +437,50 @@ pub(crate) fn encode_silu_mul(
         encoder.setBuffer_offset_atIndex(Some(gate), 0, 0);
         encoder.setBuffer_offset_atIndex(Some(up), 0, 1);
         encoder.setBuffer_offset_atIndex(Some(out), 0, 2);
+        let mut n_u = n;
+        encoder.setBytes_length_atIndex(
+            NonNull::new(&mut n_u as *mut u32 as *mut _).unwrap(),
+            4,
+            3,
+        );
+    }
+    let tg = 256usize;
+    let n_tg = (n as usize).div_ceil(tg);
+    encoder.dispatchThreadgroups_threadsPerThreadgroup(
+        MTLSize {
+            width: n_tg,
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width: tg,
+            height: 1,
+            depth: 1,
+        },
+    );
+    Ok(())
+}
+
+/// `y[i] += a * x[i]`.
+pub(crate) fn encode_axpy(
+    encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+    device: &Retained<ProtocolObject<dyn MTLDevice>>,
+    y: &ProtocolObject<dyn MTLBuffer>,
+    x: &ProtocolObject<dyn MTLBuffer>,
+    a: f32,
+    n: u32,
+) -> Result<(), MetalError> {
+    let pipe = ensure_pipeline(device, AXPY_KERNEL_SRC, "axpy_f32")?;
+    encoder.setComputePipelineState(&pipe.0);
+    unsafe {
+        encoder.setBuffer_offset_atIndex(Some(y), 0, 0);
+        encoder.setBuffer_offset_atIndex(Some(x), 0, 1);
+        let mut a_f = a;
+        encoder.setBytes_length_atIndex(
+            NonNull::new(&mut a_f as *mut f32 as *mut _).unwrap(),
+            4,
+            2,
+        );
         let mut n_u = n;
         encoder.setBytes_length_atIndex(
             NonNull::new(&mut n_u as *mut u32 as *mut _).unwrap(),

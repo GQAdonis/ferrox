@@ -2301,6 +2301,125 @@ pub fn launch_dense_ffn_swiglu(
     Ok(unsafe { std::slice::from_raw_parts(out_ptr.as_ptr() as *const f32, down.rows).to_vec() })
 }
 
+/// One routed expert's launches + combine weight for [`launch_moe_topk_swiglu`].
+pub struct MoeExpertLaunch<'a> {
+    pub gate: MatvecLaunch<'a>,
+    pub up: MatvecLaunch<'a>,
+    pub down: MatvecLaunch<'a>,
+    pub weight: f32,
+}
+
+/// Top-k MoE SwiGLU on Metal in **one** command buffer: upload `x` once,
+/// run gate+up+SiLU×+down for every routed expert, weighted-accumulate
+/// into a single output, one download. Cuts the ~8 serial CB waits/layer
+/// (OLMoE) down to one — the main Metal MoE orchestration tax vs llama.
+pub fn launch_moe_topk_swiglu(
+    x: &[f32],
+    experts: &[MoeExpertLaunch<'_>],
+) -> Result<Vec<f32>, MetalError> {
+    if experts.is_empty() {
+        return Ok(Vec::new());
+    }
+    let hidden = experts[0].down.rows;
+    let ffn = experts[0].gate.rows;
+    for ex in experts {
+        assert_eq!(ex.gate.rows, ffn);
+        assert_eq!(ex.up.rows, ffn);
+        assert_eq!(ex.down.rows, hidden);
+        let n_blocks = ex.gate.row_bytes / ex.gate.block_bytes;
+        assert_eq!(x.len(), n_blocks * ex.gate.block_elems);
+        assert_eq!(
+            ex.down.row_bytes / ex.down.block_bytes * ex.down.block_elems,
+            ffn
+        );
+    }
+
+    let shared = shared_metal()?;
+    let device = &shared.device;
+    let queue = &shared.queue;
+
+    let x_buf = if let Some(resident) = take_resident_activation_if_matches(x) {
+        resident
+    } else {
+        clear_resident_activation();
+        let mut x_owned = x.to_vec();
+        unsafe {
+            device.newBufferWithBytes_length_options(
+                NonNull::new(x_owned.as_mut_ptr() as *mut _).unwrap(),
+                x_owned.len() * 4,
+                MTLResourceOptions::StorageModeShared,
+            )
+        }
+        .ok_or(MetalError::BufferAllocFailed)?
+    };
+
+    // Scratch reused across experts (serial encodes in one CB).
+    let gate_buf = device
+        .newBufferWithLength_options(ffn * 4, MTLResourceOptions::StorageModeShared)
+        .ok_or(MetalError::BufferAllocFailed)?;
+    let up_buf = device
+        .newBufferWithLength_options(ffn * 4, MTLResourceOptions::StorageModeShared)
+        .ok_or(MetalError::BufferAllocFailed)?;
+    let act_buf = device
+        .newBufferWithLength_options(ffn * 4, MTLResourceOptions::StorageModeShared)
+        .ok_or(MetalError::BufferAllocFailed)?;
+    let down_buf = device
+        .newBufferWithLength_options(hidden * 4, MTLResourceOptions::StorageModeShared)
+        .ok_or(MetalError::BufferAllocFailed)?;
+    // Accumulator must start at zero (newBuffer contents are undefined).
+    let mut zeros = vec![0f32; hidden];
+    let out_buf = unsafe {
+        device.newBufferWithBytes_length_options(
+            NonNull::new(zeros.as_mut_ptr() as *mut _).unwrap(),
+            hidden * 4,
+            MTLResourceOptions::StorageModeShared,
+        )
+    }
+    .ok_or(MetalError::BufferAllocFailed)?;
+
+    let mut weight_bufs = Vec::with_capacity(experts.len() * 3);
+    for ex in experts {
+        weight_bufs.push(resident_weight_buffer(device, ex.gate.weights)?);
+        weight_bufs.push(resident_weight_buffer(device, ex.up.weights)?);
+        weight_bufs.push(resident_weight_buffer(device, ex.down.weights)?);
+    }
+
+    let cmd_buf = queue.commandBuffer().ok_or(MetalError::CommandFailed)?;
+    let encoder = cmd_buf
+        .computeCommandEncoder()
+        .ok_or(MetalError::CommandFailed)?;
+    for (i, ex) in experts.iter().enumerate() {
+        let g_w = &weight_bufs[i * 3];
+        let u_w = &weight_bufs[i * 3 + 1];
+        let d_w = &weight_bufs[i * 3 + 2];
+        encode_matvec(&encoder, device, &ex.gate, g_w, &x_buf, &gate_buf)?;
+        encode_matvec(&encoder, device, &ex.up, u_w, &x_buf, &up_buf)?;
+        crate::elem::encode_silu_mul(
+            &encoder,
+            device,
+            &gate_buf,
+            &up_buf,
+            &act_buf,
+            ffn as u32,
+        )?;
+        encode_matvec(&encoder, device, &ex.down, d_w, &act_buf, &down_buf)?;
+        crate::elem::encode_axpy(
+            &encoder,
+            device,
+            &out_buf,
+            &down_buf,
+            ex.weight,
+            hidden as u32,
+        )?;
+    }
+    encoder.endEncoding();
+    cmd_buf.commit();
+    cmd_buf.waitUntilCompleted();
+
+    let out_ptr = out_buf.contents();
+    Ok(unsafe { std::slice::from_raw_parts(out_ptr.as_ptr() as *const f32, hidden).to_vec() })
+}
+
 /// Encodes one quantized matvec into an existing compute encoder (no
 /// commit/wait). Used by [`crate::attn`] to fuse QKV→RoPE→GQA→O.
 pub(crate) fn encode_matvec(

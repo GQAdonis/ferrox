@@ -611,6 +611,78 @@ impl Decoder {
             })
     }
 
+    /// One Metal CB for all top-k routed experts (weighted sum). Returns
+    /// `None` if any expert lacks a Metal launch (caller falls back).
+    #[cfg(feature = "metal")]
+    fn try_metal_moe_topk(
+        layer: &LayerWeights,
+        normed2: &[f32],
+        decision: &ferrox_moe::RoutingDecision,
+    ) -> Option<Vec<f32>> {
+        if decision.expert_ids.is_empty() {
+            return Some(vec![0f32; normed2.len()]);
+        }
+        // Build launches while holding each expert briefly; collect owned
+        // weight refs via with_expert into temporary MatvecLaunch list.
+        let mut launches: Vec<ferrox_metal::gpu::MoeExpertLaunch<'_>> =
+            Vec::with_capacity(decision.expert_ids.len());
+        // Lifetime: MatvecLaunch borrows WeightMatrix bytes that live in
+        // layer.moe for the duration of this call. Collect via a scoped
+        // approach — we need all launches alive together.
+        // Use indices + rebuild inside a single with_experts loop.
+        struct Pending {
+            eid: usize,
+            weight: f32,
+        }
+        let pending: Vec<Pending> = decision
+            .expert_ids
+            .iter()
+            .zip(decision.weights.iter())
+            .map(|(&eid, &w)| Pending { eid, weight: w })
+            .collect();
+
+        // Validate all experts have Metal launches first.
+        for p in &pending {
+            let ok = layer.moe.with_expert(p.eid, |ex| {
+                Self::metal_matvec_launch(&ex.gate).is_some()
+                    && Self::metal_matvec_launch(&ex.up).is_some()
+                    && Self::metal_matvec_launch(&ex.down).is_some()
+            });
+            if !ok {
+                return None;
+            }
+        }
+
+        // Hold expert refs: Resident experts are in a Vec; with_expert
+        // only borrows one at a time. For Resident backing we can get
+        // all launches by indexing once.
+        match &layer.moe.experts {
+            ExpertBacking::Resident(experts) => {
+                for p in &pending {
+                    let ex = &experts[p.eid];
+                    launches.push(ferrox_metal::gpu::MoeExpertLaunch {
+                        gate: Self::metal_matvec_launch(&ex.gate)?,
+                        up: Self::metal_matvec_launch(&ex.up)?,
+                        down: Self::metal_matvec_launch(&ex.down)?,
+                        weight: p.weight,
+                    });
+                }
+            }
+            ExpertBacking::Stored { .. } => {
+                // Streaming experts: fall back (can't hold all refs easily).
+                return None;
+            }
+        }
+
+        match ferrox_metal::gpu::launch_moe_topk_swiglu(normed2, &launches) {
+            Ok(out) => Some(out),
+            Err(e) => {
+                eprintln!("ferrox: Metal MoE top-k fuse failed, falling back: {e}");
+                None
+            }
+        }
+    }
+
     /// Append host [`KvCache`] positions that Metal already holds but host
     /// skipped (dense-stack fast path). No-op when `cache.seq_len` is caught up.
     #[cfg(feature = "metal")]
@@ -1115,6 +1187,62 @@ impl Decoder {
                                     }
 
                                     if !did_metal_dense && !clear_metal_kv {
+                                        // MoE: fused attn+residual+ffn_norm → host
+                                        // route → one-CB top-k experts.
+                                        let moe_fused = !Self::is_dense_layer(layer)
+                                            && matches!(
+                                                self.config.ffn_activation,
+                                                crate::config::FfnActivation::Swiglu
+                                                    | crate::config::FfnActivation::SwigluFused
+                                            )
+                                            && layer.moe.shared_experts.is_empty();
+                                        if moe_fused {
+                                            match ferrox_metal::attn::launch_decode_moe_attn_ffn_pre(
+                                                &hidden,
+                                                &layer.attn.norm_weight,
+                                                &q_l,
+                                                &k_l,
+                                                &v_l,
+                                                &o_l,
+                                                &mut metal_kvs[l],
+                                                &layer.moe.norm_weight,
+                                                n_heads,
+                                                self.metal_rope_layout(),
+                                                self.config.rope_theta,
+                                                self.config.rope_freqs.as_deref(),
+                                                pos,
+                                                self.config.rms_norm_eps,
+                                                &self.metal_attn_extras(layer),
+                                            ) {
+                                                Ok((new_h, ffn_normed)) => {
+                                                    let ffn_out = Self::run_ffn_block(
+                                                        layer,
+                                                        &ffn_normed,
+                                                        &self.config,
+                                                        hidden_dim,
+                                                        residency.as_ref().map(|p| p.layer_plan(l)),
+                                                    );
+                                                    hidden = new_h;
+                                                    for (h, f) in
+                                                        hidden.iter_mut().zip(ffn_out.iter())
+                                                    {
+                                                        *h += f;
+                                                    }
+                                                    did_metal_attn = true;
+                                                    did_metal_dense = true; // skip second FFN below
+                                                }
+                                                Err(e) => {
+                                                    eprintln!(
+                                                        "ferrox: Metal MoE attn+ffn_pre failed, fallback: {e}"
+                                                    );
+                                                    Self::catch_up_host_kv_from_metal(
+                                                        &metal_kvs[l],
+                                                        cache,
+                                                    );
+                                                    clear_metal_kv = true;
+                                                }
+                                            }
+                                        } else {
                                         match ferrox_metal::attn::launch_decode_attn_block(
                                             &normed,
                                             &q_l,
@@ -1151,6 +1279,7 @@ impl Decoder {
                                                 );
                                                 clear_metal_kv = true;
                                             }
+                                        }
                                         }
                                     }
                                 }
@@ -1586,6 +1715,23 @@ impl Decoder {
                 .collect();
             store.prefetch(&keys);
         }
+
+        // Metal: fuse all top-k experts into one CB (one wait) when every
+        // routed expert has Metal matvec launches. Shared experts (rare
+        // for OLMoE) still run on the host after.
+        #[cfg(feature = "metal")]
+        if ferrox_core::metal_dense_enabled()
+            && matches!(
+                config.ffn_activation,
+                crate::config::FfnActivation::Swiglu | crate::config::FfnActivation::SwigluFused
+            )
+            && layer.moe.shared_experts.is_empty()
+        {
+            if let Some(fused) = Self::try_metal_moe_topk(layer, normed2, &decision) {
+                return fused;
+            }
+        }
+
         let routed_outputs: Vec<(Vec<f32>, f32)> = decision
             .expert_ids
             .iter()

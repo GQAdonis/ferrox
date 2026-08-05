@@ -1,11 +1,12 @@
 //! ferrox-server: OpenAI-compatible HTTP surface (`/health`,
-//! `/v1/models`, `/v1/chat/completions`) over the ferrox-models decoder,
-//! plus a whole-response cache for exact-repeat requests (see `cache`
-//! module). Loads a real GGUF checkpoint and its own real tokenizer
-//! when `-m`/`--model` or `FERROX_MODEL_PATH` is set (see `model`
-//! module). Supports
-//! sampling (temperature/top_p/top_k/repetition_penalty), stop
-//! sequences, and SSE streaming (see `generate` module).
+//! `/v1/models`, `/v1/chat/completions`, `/v1/completions`,
+//! `/v1/tokenize`, `/v1/detokenize`, `/v1/embeddings`) over the
+//! ferrox-models decoder, plus a whole-response cache for exact-repeat
+//! requests (see `cache` module). Loads a real GGUF checkpoint and its
+//! own real tokenizer when `-m`/`--model` or `FERROX_MODEL_PATH` is set
+//! (see `model` module). Supports sampling
+//! (temperature/top_p/top_k/repetition_penalty), stop sequences, and SSE
+//! streaming (see `generate` module).
 //!
 //! Concurrency: the loaded model
 //! (`Model`) is immutable once loaded and shared via `Arc`, not locked
@@ -35,6 +36,7 @@ mod generate;
 mod journal;
 mod limits;
 mod model;
+mod openai_extra;
 mod security;
 mod session;
 
@@ -60,7 +62,7 @@ use cache::{CacheKey, ResponseCache};
 use ferrox_core::cache::KvBlockPool;
 use ferrox_models::kimi_tokenizer::KimiTokenizer;
 use ferrox_models::sampling::SamplingParams;
-use ferrox_models::{Decoder, KimiEngine, PrefixCache};
+use ferrox_models::{Decoder, KimiEngine, MlaEngine, PrefixCache};
 use generate::{FinishReason, GenerationParams};
 use model::ServerTokenizer;
 
@@ -295,13 +297,14 @@ fn apply_cli_overrides(args: &ServerArgs) -> anyhow::Result<()> {
 /// engine-specific (chat template, tokenizer kind reporting, whether
 /// this is the synthetic demo) goes through the small inherent methods
 /// below rather than being matched on ad hoc at every call site.
-#[allow(clippy::large_enum_variant)] // KimiEngine dwarfs Arc<Decoder>; boxing would churn call sites
-enum Model {
+#[allow(clippy::large_enum_variant)] // KimiEngine/MlaEngine dwarf Arc<Decoder>; boxing would churn call sites
+pub(crate) enum Model {
     Gguf(GgufModel),
     Kimi(KimiModel),
+    Mla(MlaModel),
 }
 
-struct GgufModel {
+pub(crate) struct GgufModel {
     decoder: Arc<Decoder>,
     tokenizer: Arc<ServerTokenizer>,
     eos_id: Option<usize>,
@@ -310,10 +313,19 @@ struct GgufModel {
     chat_template: chat_template::ChatTemplate,
 }
 
-struct KimiModel {
+pub(crate) struct KimiModel {
     engine: KimiEngine,
     tokenizer: KimiTokenizer,
     eos_id: Option<usize>,
+    chat_template: chat_template::ChatTemplate,
+}
+
+pub(crate) struct MlaModel {
+    engine: MlaEngine,
+    tokenizer: ServerTokenizer,
+    eos_id: Option<usize>,
+    bos_id: Option<usize>,
+    name: String,
     chat_template: chat_template::ChatTemplate,
 }
 
@@ -322,16 +334,18 @@ impl Model {
         match self {
             Model::Gguf(m) => m.chat_template,
             Model::Kimi(m) => m.chat_template,
+            Model::Mla(m) => m.chat_template,
         }
     }
 
-    /// Kimi K3 has no synthetic-weight demo path through this server
-    /// (unlike GGUF, which falls back to one when `FERROX_MODEL_PATH`
-    /// is unset) -- a loaded `Model::Kimi` is always a real checkpoint.
+    /// Kimi K3 / MLA have no synthetic-weight demo path through this
+    /// server (unlike GGUF, which falls back to one when
+    /// `FERROX_MODEL_PATH` is unset) -- a loaded `Model::Kimi` /
+    /// `Model::Mla` is always a real checkpoint.
     fn is_synthetic(&self) -> bool {
         match self {
             Model::Gguf(m) => m.is_synthetic,
-            Model::Kimi(_) => false,
+            Model::Kimi(_) | Model::Mla(_) => false,
         }
     }
 
@@ -339,6 +353,7 @@ impl Model {
         match self {
             Model::Gguf(m) => m.tokenizer.kind(),
             Model::Kimi(_) => "kimi-tiktoken-bpe",
+            Model::Mla(m) => m.tokenizer.kind(),
         }
     }
 
@@ -349,19 +364,72 @@ impl Model {
         match self {
             Model::Gguf(m) => m.decoder.expert_store_stats(),
             Model::Kimi(m) => m.engine.weights.expert_store_stats(),
+            Model::Mla(_) => None,
         }
     }
 
-    fn name(&self) -> &str {
+    pub(crate) fn name(&self) -> &str {
         match self {
             Model::Gguf(m) => m.decoder.config.name,
             Model::Kimi(_) => "kimi-k3",
+            Model::Mla(m) => m.name.as_str(),
+        }
+    }
+
+    pub(crate) fn encode(&self, text: &str) -> Vec<usize> {
+        match self {
+            Model::Gguf(m) => m.tokenizer.encode(text),
+            Model::Kimi(m) => m
+                .tokenizer
+                .encode(text)
+                .into_iter()
+                .map(|id| id as usize)
+                .collect(),
+            Model::Mla(m) => m.tokenizer.encode(text),
+        }
+    }
+
+    pub(crate) fn decode(&self, ids: &[usize]) -> String {
+        match self {
+            Model::Gguf(m) => m.tokenizer.decode(ids),
+            Model::Kimi(m) => {
+                let ids32: Vec<u32> = ids.iter().map(|&id| id as u32).collect();
+                m.tokenizer.decode(&ids32)
+            }
+            Model::Mla(m) => m.tokenizer.decode(ids),
+        }
+    }
+
+    /// Final-normed last-layer hidden states for GGUF Decoder only.
+    /// Returns `None` for engines without a hidden-state hook (e.g. Kimi/MLA).
+    pub(crate) fn embed_tokens(&self, tokens: &[usize]) -> Option<Vec<Vec<f32>>> {
+        match self {
+            Model::Gguf(m) => {
+                let mut caches: Vec<_> = (0..m.decoder.layers.len())
+                    .map(|_| {
+                        ferrox_core::cache::KvCache::new(
+                            m.decoder.config.n_kv_heads,
+                            m.decoder.config.head_dim,
+                        )
+                    })
+                    .collect();
+                Some(m.decoder.forward_hidden_batch(tokens, 0, &mut caches))
+            }
+            Model::Kimi(_) | Model::Mla(_) => None,
+        }
+    }
+
+    pub(crate) fn vocab_size(&self) -> Option<usize> {
+        match self {
+            Model::Gguf(m) => Some(m.decoder.config.vocab_size),
+            Model::Kimi(m) => Some(m.tokenizer.vocab_size()),
+            Model::Mla(m) => Some(ferrox_models::Engine::vocab_size(&m.engine)),
         }
     }
 }
 
-struct AppState {
-    model: Arc<Model>,
+pub(crate) struct AppState {
+    pub(crate) model: Arc<Model>,
     /// The only shared *mutable* state in the server. Locked only for
     /// the brief get/put around a cache lookup, never held across a
     /// decode -- see the module doc comment.
@@ -377,7 +445,7 @@ struct AppState {
     /// `ferrox_core::cache::KvBlockPool` and `generate::KvPoolConfig`.
     /// `None` (the default) preserves the
     /// original unbounded-per-request behavior exactly.
-    kv_pool: Option<generate::KvPoolConfig>,
+    pub(crate) kv_pool: Option<generate::KvPoolConfig>,
     /// `Some` when `FERROX_PREFIX_CACHE_ENTRIES` is set: a shared,
     /// LRU-bounded store of previously processed prompt+KV-state
     /// snapshots (see `ferrox_models::PrefixCache`), consulted so a
@@ -387,7 +455,7 @@ struct AppState {
     /// comment for why); `None` (the default) means every request
     /// processes its full prompt from scratch, exactly as before this
     /// existed.
-    prefix_cache: Option<Arc<Mutex<PrefixCache>>>,
+    pub(crate) prefix_cache: Option<Arc<Mutex<PrefixCache>>>,
     /// Server-side per-session conversation history -- see
     /// `session::SessionStore`'s doc comment.
     /// Always present (unlike `kv_pool`/`prefix_cache`, it's not
@@ -398,7 +466,7 @@ struct AppState {
     /// Shares `forward_multi_seq` across concurrent GGUF requests. Disabled
     /// when a KV pool or prefix cache is configured (those keep the
     /// private-loop `generate` path).
-    continuous_batcher: Option<batch_scheduler::ContinuousBatcher>,
+    pub(crate) continuous_batcher: Option<batch_scheduler::ContinuousBatcher>,
     requests_total: std::sync::atomic::AtomicU64,
     request_errors_total: std::sync::atomic::AtomicU64,
     started_at: std::time::Instant,
@@ -909,16 +977,16 @@ async fn metrics(State(state): State<Arc<AppState>>) -> Response {
         .into_response()
 }
 
-type ApiError = (StatusCode, Json<serde_json::Value>);
+pub(crate) type ApiError = (StatusCode, Json<serde_json::Value>);
 
-fn unsupported_feature(message: &str) -> ApiError {
+pub(crate) fn unsupported_feature(message: &str) -> ApiError {
     (
         StatusCode::NOT_IMPLEMENTED,
         Json(serde_json::json!({"error": {"message": message, "type": "unsupported"}})),
     )
 }
 
-fn decode_error_response(e: generate::DecodeError) -> ApiError {
+pub(crate) fn decode_error_response(e: generate::DecodeError) -> ApiError {
     let status = match e {
         generate::DecodeError::TokenOutOfVocab { .. } => StatusCode::BAD_REQUEST,
         // Not the client's fault, and true of the exact same request a
@@ -932,7 +1000,7 @@ fn decode_error_response(e: generate::DecodeError) -> ApiError {
     )
 }
 
-fn join_error_response(e: tokio::task::JoinError) -> ApiError {
+pub(crate) fn join_error_response(e: tokio::task::JoinError) -> ApiError {
     tracing::error!("generation task panicked: {e}");
     (
         StatusCode::INTERNAL_SERVER_ERROR,
@@ -1004,6 +1072,20 @@ fn run_generation_emit(
                 }
             },
         )?,
+        Model::Mla(m) => generate::generate_engine(
+            &m.engine,
+            &m.tokenizer,
+            m.eos_id,
+            m.bos_id,
+            prompt,
+            params,
+            |chunk| {
+                chunks.push(chunk.to_string());
+                if !synthetic {
+                    emit(chunk);
+                }
+            },
+        )?,
     };
 
     let mut full = chunks.concat();
@@ -1022,7 +1104,7 @@ fn run_generation_emit(
 
 /// Collecting wrapper around [`run_generation_emit`] for non-streaming
 /// paths and tests.
-fn run_generation(
+pub(crate) fn run_generation(
     model: &Model,
     prompt: &str,
     params: &GenerationParams,
@@ -1513,6 +1595,17 @@ fn build_app_state(
             }),
             None,
         ),
+        model::LoadedModel::Mla(m) => (
+            Model::Mla(MlaModel {
+                engine: m.engine,
+                tokenizer: m.tokenizer,
+                eos_id: m.eos_id,
+                bos_id: m.bos_id,
+                name: m.name,
+                chat_template: m.chat_template,
+            }),
+            None,
+        ),
     };
     AppState {
         model: Arc::new(model),
@@ -1627,6 +1720,11 @@ async fn run() -> anyhow::Result<()> {
             "loaded Kimi K3 checkpoint (tokenizer={} base tokens)",
             k.tokenizer.vocab_size()
         ),
+        model::LoadedModel::Mla(m) => tracing::info!(
+            "loaded MLA GGUF '{}' (tokenizer={})",
+            m.name,
+            m.tokenizer.kind()
+        ),
     }
     // Opt-in VRAM budget for GPU-resident MoE experts. When unset but
     // Metal is active, default to a large budget so routed experts that
@@ -1662,6 +1760,12 @@ async fn run() -> anyhow::Result<()> {
                 tracing::warn!(
                     "FERROX_GPU_VRAM_BUDGET_BYTES is set but the loaded model is Kimi K3 -- not \
                      supported yet (its MoE stack isn't wired to PlacementPlan), ignoring"
+                );
+            }
+            model::LoadedModel::Mla(_) => {
+                tracing::warn!(
+                    "FERROX_GPU_VRAM_BUDGET_BYTES is set but the loaded model is MLA -- dense \
+                     FFN path only today; ignoring expert VRAM budget"
                 );
             }
         }
@@ -1791,10 +1895,10 @@ async fn run() -> anyhow::Result<()> {
                 .expect("FERROX_KV_BYTE_BUDGET must be a positive integer");
             let cfg = match &loaded {
                 model::LoadedModel::Gguf(g) => &g.decoder.config,
-                model::LoadedModel::Kimi(_) => {
+                model::LoadedModel::Kimi(_) | model::LoadedModel::Mla(_) => {
                     panic!(
                         "FERROX_KV_BYTE_BUDGET requires a GGUF decoder model \
-                         (set FERROX_MODEL_PATH to a .gguf file, not a Kimi checkpoint directory)"
+                         (set FERROX_MODEL_PATH to a generic-decoder .gguf file)"
                     );
                 }
             };
@@ -1862,13 +1966,15 @@ async fn run() -> anyhow::Result<()> {
         );
         Arc::new(Mutex::new(PrefixCache::new(max_entries)))
     });
-    if matches!(loaded, model::LoadedModel::Kimi(_))
-        && (kv_pool.is_some() || prefix_cache.is_some())
+    if matches!(
+        loaded,
+        model::LoadedModel::Kimi(_) | model::LoadedModel::Mla(_)
+    ) && (kv_pool.is_some() || prefix_cache.is_some())
     {
         tracing::warn!(
-            "KV pool / prefix cache are configured but the loaded model is Kimi K3 -- neither \
-             is consulted for Kimi requests (its recurrent KDA state can't support the \
-             truncate/restore operations they need); see ferrox_models::engine's module docs"
+            "KV pool / prefix cache are configured but the loaded model is Kimi or MLA -- neither \
+             is consulted for those engines (state shapes differ from Decoder KV); see \
+             ferrox_models::engine's module docs"
         );
     }
     let enable_cb = std::env::var("FERROX_CONTINUOUS_BATCHING")
@@ -1892,6 +1998,10 @@ async fn run() -> anyhow::Result<()> {
     let mut protected = Router::new()
         .route("/v1/models", get(list_models))
         .route("/v1/chat/completions", post(chat_completions))
+        .route("/v1/completions", post(openai_extra::completions))
+        .route("/v1/tokenize", post(openai_extra::tokenize))
+        .route("/v1/detokenize", post(openai_extra::detokenize))
+        .route("/v1/embeddings", post(openai_extra::embeddings))
         .route("/cache/stats", get(cache_stats))
         .route("/metrics", get(metrics));
 
@@ -2025,10 +2135,13 @@ mod tests {
     }
 
     fn test_model() -> Model {
-        let cfg = test_dense_fixture(); // vocab_size = 32
+        // Tiny vocab (32): raw byte ids ≥32 (e.g. ASCII "hello") are OOV.
+        // HTTP/chat-template tests that need full ASCII use
+        // `test_model_full_byte_vocab` instead.
+        let cfg = test_dense_fixture();
         Model::Gguf(GgufModel {
-            decoder: Arc::new(Decoder::new_random_small(cfg, 2, 256)),
-            tokenizer: Arc::new(ServerTokenizer::Byte), // produces ids 0..256
+            decoder: Arc::new(Decoder::new_random_small(cfg, 2, 32)),
+            tokenizer: Arc::new(ServerTokenizer::Byte),
             eos_id: None,
             bos_id: None,
             is_synthetic: true,
@@ -2045,18 +2158,9 @@ mod tests {
         }
     }
 
-    /// `test_model()`'s `config.vocab_size` (32) is real elsewhere in
-    /// this file only because every existing test bypasses chat-
-    /// template rendering entirely, feeding `generate()` a raw prompt
-    /// built straight from a handful of low byte values. A real HTTP
-    /// request goes through `ChatTemplate::render` first, which (even
-    /// for `Plain`) prepends real ASCII role-name text (`"user: "`,
-    /// `"assistant: "`) -- ordinary ASCII bytes comfortably over 32.
-    /// This variant declares the *real* vocab size the model's
-    /// embedding/output_head are actually built at (256, `Byte`-
-    /// tokenizer-compatible with any real text), so HTTP-level tests
-    /// that render real prompts don't spuriously reject their own
-    /// role-name prefix.
+    /// Declares a full 0..255 byte-compatible vocab so HTTP-level tests
+    /// that render chat templates (ASCII role names) do not spuriously
+    /// reject their own prompt prefixes.
     fn test_model_full_byte_vocab() -> Model {
         let mut cfg = test_dense_fixture();
         cfg.vocab_size = 256;
@@ -2092,10 +2196,18 @@ mod tests {
         });
         Router::new()
             .route("/v1/chat/completions", post(chat_completions))
+            .route("/v1/tokenize", post(openai_extra::tokenize))
+            .route("/v1/detokenize", post(openai_extra::detokenize))
+            .route("/v1/embeddings", post(openai_extra::embeddings))
+            .route("/v1/completions", post(openai_extra::completions))
             .with_state(state)
     }
 
-    async fn post_json(app: &Router, body: serde_json::Value) -> serde_json::Value {
+    async fn post_json_uri(
+        app: &Router,
+        uri: &str,
+        body: serde_json::Value,
+    ) -> (StatusCode, serde_json::Value) {
         use http_body_util::BodyExt;
         use tower::ServiceExt;
 
@@ -2104,15 +2216,59 @@ mod tests {
             .oneshot(
                 axum::http::Request::builder()
                     .method("POST")
-                    .uri("/v1/chat/completions")
+                    .uri(uri)
                     .header("content-type", "application/json")
                     .body(axum::body::Body::from(serde_json::to_vec(&body).unwrap()))
                     .unwrap(),
             )
             .await
             .unwrap();
+        let status = response.status();
         let bytes = response.into_body().collect().await.unwrap().to_bytes();
-        serde_json::from_slice(&bytes).unwrap()
+        let json = serde_json::from_slice(&bytes).unwrap_or(serde_json::json!({}));
+        (status, json)
+    }
+
+    async fn post_json(app: &Router, body: serde_json::Value) -> serde_json::Value {
+        post_json_uri(app, "/v1/chat/completions", body).await.1
+    }
+
+    #[tokio::test]
+    async fn tokenize_detokenize_roundtrip_and_embeddings_mean() {
+        let app = test_app();
+        let (status, tok) = post_json_uri(
+            &app,
+            "/v1/tokenize",
+            serde_json::json!({ "prompt": "Hi" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let tokens = tok["tokens"].as_array().unwrap();
+        assert_eq!(tok["count"], tokens.len());
+        assert!(!tokens.is_empty());
+
+        let (status, detok) = post_json_uri(
+            &app,
+            "/v1/detokenize",
+            serde_json::json!({ "tokens": tokens }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(detok["text"], "Hi");
+
+        let (status, emb) = post_json_uri(
+            &app,
+            "/v1/embeddings",
+            serde_json::json!({
+                "input": "Hi",
+                "embedding_type": "mean"
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let vec = emb["data"][0]["embedding"].as_array().unwrap();
+        assert!(!vec.is_empty());
+        assert!(vec.iter().all(|v| v.as_f64().is_some()));
     }
 
     /// The /metrics endpoint must expose the bounded expert cache's

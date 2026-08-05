@@ -651,7 +651,8 @@ mod tests {
 
     #[test]
     fn rejects_out_of_vocab_prompt_tokens() {
-        let decoder = small_decoder(); // vocab_size = 32
+        // ByteTokenizer emits raw bytes; vocab 32 makes ASCII letters OOV.
+        let decoder = Decoder::new_random_small(test_dense_fixture(), 2, 32);
         let result = generate(
             &decoder,
             &ServerTokenizer::Byte,

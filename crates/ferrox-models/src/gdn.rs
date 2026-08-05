@@ -24,8 +24,8 @@
 //! Legacy `qwen3next` may pack β/α into `ssm_ba` or fuse QKV+z into
 //! `ssm_in`; this module implements the split qwen35 layout only.
 //!
-//! Not wired into GGUF load / [`crate::hybrid_engine::HybridEngine`] serve
-//! yet — factory still [`HybridEngine::reject`](crate::hybrid_engine::HybridEngine::reject).
+//! GGUF weight load skeleton: [`crate::hybrid_gguf_loader`]. Serve still
+//! fail-closed — factory [`HybridEngine::reject`](crate::hybrid_engine::HybridEngine::reject).
 
 use ferrox_core::matmul::{rms_norm, silu};
 use ferrox_core::weight_matrix::WeightMatrix;

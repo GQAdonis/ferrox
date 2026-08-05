@@ -1,18 +1,17 @@
 {
-  "host_default": "Host B (Apple M2 Pro, 10 logical cores)",
+  "host_default": "Host B (Apple M2 Pro, 10 logical cores, 32 GiB unified)",
   "threads": 10,
   "max_tokens": 512,
   "reps": 3,
   "workload": "greedy chat, warm then 3x 512-tok capitals list (median)",
+  "host_ram_gb": 32,
   "models": [
     {
       "id": "tinyllama_q8",
       "name": "TinyLlama-1.1B-Chat-v1.0 Q8_0",
       "gguf": "models/tinyllama-1.1b-chat-v1.0.Q8_0.gguf",
-      "backends": [
-        "metal",
-        "cpu"
-      ],
+      "backends": ["metal", "cpu"],
+      "estimated_ram_gb": 3,
       "expect": "ok",
       "notes": "Verified smoke"
     },
@@ -20,21 +19,17 @@
       "id": "llama32_1b_q4km",
       "name": "Llama-3.2-1B-Instruct Q4_K_M",
       "gguf": "models/Llama-3.2-1B-Instruct-Q4_K_M.gguf",
-      "backends": [
-        "metal"
-      ],
+      "backends": ["metal"],
+      "estimated_ram_gb": 2,
       "expect": "ok",
-      "notes": "head_dim=64; FA-vec N/A"
+      "notes": "head_dim=64; FA-vec d=64"
     },
     {
       "id": "olmoe_q4",
       "name": "OLMoE-1B-7B-0924 Q4_0",
       "gguf": "models/olmoe-1b-7b-0924-q4_0.gguf",
-      "backends": [
-        "cpu",
-        "metal",
-        "cuda"
-      ],
+      "backends": ["cpu", "metal", "cuda"],
+      "estimated_ram_gb": 8,
       "expect": "ok",
       "notes": "Verified MoE; Metal/CUDA expert placement when budget set"
     },
@@ -42,73 +37,62 @@
       "id": "llama31_8b_q4km",
       "name": "Llama-3.1-8B-Instruct Q4_K_M",
       "gguf": "models/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf",
-      "backends": [
-        "metal",
-        "cuda"
-      ],
+      "backends": ["metal", "cuda"],
+      "estimated_ram_gb": 10,
       "expect": "ok",
-      "notes": "Host B Metal pin; CUDA fair-chat when --backend cuda + --host-label"
+      "notes": "Host B Metal pin; FA-vec d=128; CUDA fair-chat when --backend cuda + --host-label"
     },
     {
       "id": "llama32_3b_q4km",
       "name": "Llama-3.2-3B-Instruct Q4_K_M",
       "gguf": "models/Llama-3.2-3B-Instruct-Q4_K_M.gguf",
-      "backends": [
-        "metal"
-      ],
+      "backends": ["metal"],
+      "estimated_ram_gb": 5,
       "expect": "ok",
-      "notes": "head_dim=128; FA applies when present"
+      "notes": "head_dim=128; FA-vec d=128"
     },
     {
       "id": "qwen2moe_05b_q4km",
       "name": "Qwen1.5-MoE-A2.7B Q4_K_M",
       "gguf": "models/Qwen1.5-MoE-A2.7B-Chat-Q4_K_M.gguf",
-      "backends": [
-        "cpu",
-        "metal"
-      ],
+      "backends": ["cpu", "metal"],
+      "estimated_ram_gb": 8,
       "expect": "ok",
-      "notes": "Qwen2-MoE: QKV bias + shared_expert_gate; oracle receipt pending real GGUF"
+      "notes": "Qwen2-MoE: QKV bias + shared_expert_gate; GGUF not on Host B disk"
     },
     {
       "id": "mistral_7b_q4km",
       "name": "Mistral-7B-Instruct-v0.2 Q4_K_M",
       "gguf": "models/Mistral-7B-Instruct-v0.2-Q4_K_M.gguf",
-      "backends": [
-        "cpu",
-        "metal"
-      ],
+      "backends": ["cpu", "metal"],
+      "estimated_ram_gb": 10,
       "expect": "ok",
-      "notes": "SWA dense; token-parity receipt pending real GGUF"
+      "notes": "SWA dense"
     },
     {
       "id": "mixtral_8x7b_q4km",
       "name": "Mixtral-8x7B-Instruct Q4_K_M",
       "gguf": "models/Mixtral-8x7B-Instruct-v0.1-Q4_K_M.gguf",
-      "backends": [
-        "cpu"
-      ],
+      "backends": ["cpu"],
+      "estimated_ram_gb": 48,
       "expect": "ok",
-      "notes": "Grouped MoE + SWA; CPU receipt first (Metal MoE after pin)"
+      "notes": "Grouped MoE + SWA; needs ≥48 GiB host — skip on Host B via --fit-host"
     },
     {
       "id": "iq4_xs",
       "name": "Llama-3.2-1B-Instruct IQ4_XS",
       "gguf": "models/Llama-3.2-1B-Instruct-IQ4_XS.gguf",
-      "backends": [
-        "metal"
-      ],
+      "backends": ["metal"],
+      "estimated_ram_gb": 2,
       "expect": "ok",
-      "notes": "IQ4_XS Metal matvec landed 2026-08-04 (llama mul_mv_iq4_xs port)"
+      "notes": "IQ4_XS Metal matvec"
     },
     {
       "id": "gemma2_2b_q4km",
       "name": "Gemma-2-2B-IT Q4_K_M",
       "gguf": "models/gemma-2-2b-it-Q4_K_M.gguf",
-      "backends": [
-        "metal",
-        "cpu"
-      ],
+      "backends": ["metal", "cpu"],
+      "estimated_ram_gb": 4,
       "expect": "ok",
       "notes": "Attn + final logit softcap + SWA; FA-vec skipped when softcap set"
     },
@@ -116,43 +100,35 @@
       "id": "smollm2_135m_q8",
       "name": "SmolLM2-135M-Instruct Q8_0",
       "gguf": "models/hf_test/SmolLM2-135M-Instruct-Q8_0.gguf",
-      "backends": [
-        "metal",
-        "cpu"
-      ],
+      "backends": ["metal", "cpu"],
+      "estimated_ram_gb": 1,
       "expect": "ok",
-      "notes": "new arch support (engine_factory); d=64"
+      "notes": "engine_factory; d=64"
     },
     {
       "id": "qwen25_05b_q8",
       "name": "Qwen2.5-0.5B-Instruct Q8_0",
       "gguf": "models/hf_test/qwen2.5-0.5b-instruct-q8_0.gguf",
-      "backends": [
-        "metal",
-        "cpu"
-      ],
+      "backends": ["metal", "cpu"],
+      "estimated_ram_gb": 1,
       "expect": "ok",
-      "notes": "new arch support (engine_factory); d=64"
+      "notes": "engine_factory; d=64"
     },
     {
       "id": "qwen3_06b_q8",
       "name": "Qwen3-0.6B Q8_0",
       "gguf": "models/hf_test/Qwen3-0.6B-Q8_0.gguf",
-      "backends": [
-        "metal",
-        "cpu"
-      ],
+      "backends": ["metal", "cpu"],
+      "estimated_ram_gb": 2,
       "expect": "ok",
-      "notes": "new arch support (engine_factory); d=128"
+      "notes": "engine_factory; d=128"
     },
     {
       "id": "gemma3_1b_q8",
       "name": "Gemma-3-1B-IT Q8_0",
       "gguf": "models/hf_test/gemma-3-1b-it-Q8_0.gguf",
-      "backends": [
-        "metal",
-        "cpu"
-      ],
+      "backends": ["metal", "cpu"],
+      "estimated_ram_gb": 3,
       "expect": "ok",
       "notes": "full Metal stack; FA-vec d=256"
     },
@@ -160,12 +136,28 @@
       "id": "phi3_mini_q4",
       "name": "Phi-3-mini-4k-Instruct Q4",
       "gguf": "models/hf_test/Phi-3-mini-4k-instruct-q4.gguf",
-      "backends": [
-        "metal",
-        "cpu"
-      ],
+      "backends": ["metal", "cpu"],
+      "estimated_ram_gb": 5,
       "expect": "ok",
-      "notes": "fused QKV/gate+up split as quantized row slices; FA-vec d=96"
+      "notes": "fused QKV/gate+up; FA-vec d=96"
+    },
+    {
+      "id": "gemma4_e2b_q4km",
+      "name": "Gemma-4-E2B-IT Q4_K_M",
+      "gguf": "models/gemma-4-E2B-it-Q4_K_M.gguf",
+      "backends": ["metal", "cpu"],
+      "estimated_ram_gb": 6,
+      "expect": "ok",
+      "notes": "P4 GemmaFamily admit (gemma4 / gemma4-assistant); first Host B receipt"
+    },
+    {
+      "id": "phi4_mini_q4km",
+      "name": "Phi-4-mini-Instruct Q4_K_M",
+      "gguf": "models/Phi-4-mini-instruct-Q4_K_M.gguf",
+      "backends": ["metal", "cpu"],
+      "estimated_ram_gb": 5,
+      "expect": "ok",
+      "notes": "P6 PhiFamily admit (phi4); fused path shared with phi3"
     }
   ]
 }

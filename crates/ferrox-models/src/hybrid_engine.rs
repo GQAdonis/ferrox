@@ -2,8 +2,9 @@
 //!
 //! Fail-closed at load via [`HybridEngine::reject`] (used by
 //! [`crate::engine_factory`] for `nemotron_h` and other hybrid arches).
-//! The Qwen-style GDN primitive lives in [`crate::gdn`] with unit tests;
-//! GGUF load into this engine is not wired yet.
+//! Qwen-style GDN math: [`crate::gdn`]. GGUF hparams + GDN weight load
+//! skeleton: [`crate::hybrid_gguf_loader`] (`try_load` still
+//! `UnsupportedFeature` until this engine assembles layers for serve).
 
 use thiserror::Error;
 
@@ -15,29 +16,31 @@ pub struct HybridUnavailable {
 
 /// Placeholder hybrid serve handle.
 ///
-/// Holds the GGUF arch string and an optional note. Until a loader exists,
-/// construction is via [`Self::stub`]; the factory still calls [`Self::reject`].
+/// Holds the GGUF arch string and an optional note. Construction is via
+/// [`Self::stub`]; the factory still calls [`Self::reject`]. GGUF→GDN
+/// weight probing lives in [`crate::hybrid_gguf_loader::try_load`].
+#[derive(Debug)]
 pub struct HybridEngine {
     pub arch: String,
-    /// e.g. that [`crate::gdn`] exists but GGUF load is not wired.
+    /// e.g. that GDN + loader skeleton exist but assemble/serve is incomplete.
     pub note: Option<String>,
 }
 
 impl HybridEngine {
-    /// Fail-closed entry used by the engine factory until GGUF→GDN load lands.
+    /// Fail-closed entry used by the engine factory until HybridEngine assemble lands.
     pub fn reject(arch: &str) -> Result<(), HybridUnavailable> {
         Err(HybridUnavailable {
             arch: arch.to_string(),
         })
     }
 
-    /// Non-serving stub: records arch + note that the GDN primitive is in
-    /// `gdn.rs` but not yet loaded from GGUF.
+    /// Non-serving stub: records arch + note that GDN + hybrid_gguf_loader
+    /// exist but serve assemble is not wired.
     pub fn stub(arch: &str) -> Self {
         Self {
             arch: arch.to_string(),
             note: Some(
-                "GDN primitive exists in gdn.rs; GGUF load not wired — factory still reject()"
+                "GDN + hybrid_gguf_loader skeleton exist; HybridEngine assemble/serve not wired — factory still reject()"
                     .into(),
             ),
         }
@@ -59,7 +62,7 @@ mod tests {
         let eng = HybridEngine::stub("qwen35");
         assert_eq!(eng.arch, "qwen35");
         let note = eng.note.expect("note");
-        assert!(note.contains("gdn.rs"));
-        assert!(note.contains("GGUF"));
+        assert!(note.contains("GDN"));
+        assert!(note.contains("hybrid_gguf_loader"));
     }
 }

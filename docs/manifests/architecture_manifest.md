@@ -6,7 +6,6 @@ Source of truth for names: pinned llama.cpp `LLM_ARCH_NAMES`.
 | GGUF arch | Scope | Family | Memory | Path |
 |---|---|---|---|---|
 | `llama` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
-| `llama4` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
 | `deci` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
 | `baichuan` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
 | `starcoder` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
@@ -88,6 +87,7 @@ Source of truth for names: pinned llama.cpp `LLM_ARCH_NAMES`.
 | `phi3` | TextGeneration | PhiFamily | KvGqa | generic-gqa |
 | `phimoe` | TextGeneration | PhiFamily | KvGqa | generic-gqa |
 | `phi4` | TextGeneration | PhiFamily | KvGqa | generic-gqa |
+| `llama4` | TextGeneration | Dedicated | KvGqa | dedicated |
 | `minimax-m2` | TextGeneration | Dedicated | KvGqa | dedicated |
 | `minimax-m3` | TextGeneration | Dedicated | KvGqa | dedicated |
 | `deepseek2` | TextGeneration | Mla | KvMla | dedicated |

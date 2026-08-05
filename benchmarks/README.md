@@ -28,17 +28,22 @@ Never invent ratios without a pin under [`receipts/pins/`](receipts/pins/).
 ## Run suite (Metal)
 
 ```bash
-cargo build -p ferrox-server --release --features metal
+cargo build -p ferrox-server -p ferrox-cli --release --features metal
+mkdir -p target/bench
+cp target/release/ferrox-server target/bench/ferrox-server-metal
+cp target/release/ferrox target/bench/ferrox-cli-metal
 
-# list models + whether GGUF is present under models/
+# list models + GGUF presence + host-fit skip hints
 python3 benchmarks/run_suite.py --list
 
-# one model
-python3 benchmarks/run_suite.py --id llama31_8b_q4km --backend metal
-
-# all metal entries that resolve (or write status=missing pins)
-python3 benchmarks/run_suite.py --backend metal
+# all metal entries that resolve and fit this host
+python3 benchmarks/run_suite.py --backend metal --skip-missing --fit-host
 ```
+
+`--fit-host` skips entries whose `estimated_ram_gb` exceeds ~75% of
+physical RAM (e.g. Mixtral on a 32 GiB Host B) and skips `cuda` on
+darwin. `--skip-missing` skips GGUFs not present under `models/`
+instead of writing `status=missing` pins.
 
 Place GGUFs in `models/` at the paths configured by each suite `gguf` field.
 Each run overwrites `receipts/pins/{id}_{backend}.json` and regenerates

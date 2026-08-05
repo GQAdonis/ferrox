@@ -196,7 +196,6 @@ pub fn architecture_catalog() -> &'static [ArchProfile] {
         // --- Verified / standard GQA (Norm RoPE) ---
         for n in [
             "llama",
-            "llama4",
             "deci",
             "baichuan",
             "starcoder",
@@ -337,6 +336,19 @@ pub fn architecture_catalog() -> &'static [ArchProfile] {
             KvGqa,
             Neox,
             ArchPath::GenericGqa { rope: Neox },
+            WholeVector,
+        ));
+        // Llama 4: MoE + interleaved / non-generic attention graph — not
+        // safe to admit as GenericGqa (was wrongly listed with plain llama).
+        v.push(prof(
+            "llama4",
+            TextGeneration,
+            Dedicated,
+            KvGqa,
+            Norm,
+            ArchPath::DedicatedOnly {
+                reason: "llama4 MoE / non-generic graph not yet implemented",
+            },
             WholeVector,
         ));
         // MiniMax M2/M3: 256-expert sigmoid MoE + MTP — not generic GQA.
@@ -767,6 +779,23 @@ mod tests {
                 "{arch} must fail closed, not silent generic GQA"
             );
         }
+        assert!(
+            matches!(
+                resolve_architecture("llama4"),
+                Some(ArchPath::DedicatedOnly {
+                    reason: "llama4 MoE / non-generic graph not yet implemented"
+                })
+            ),
+            "llama4 must fail closed, not silent generic GQA"
+        );
+        assert!(matches!(
+            resolve_architecture("glm4"),
+            Some(ArchPath::DedicatedOnly { .. })
+        ));
+        assert!(matches!(
+            resolve_architecture("glm4moe"),
+            Some(ArchPath::DedicatedOnly { .. })
+        ));
     }
 
     #[test]

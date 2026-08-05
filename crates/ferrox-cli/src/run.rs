@@ -111,6 +111,12 @@ pub struct InferArgs {
     /// Print the final prompt before generation.
     #[arg(long = "verbose-prompt", default_value_t = false)]
     pub verbose_prompt: bool,
+
+    /// KV cache dtype (llama.cpp `-ctk` analogue). Sets `FERROX_CTK`.
+    /// Values: `f16` (default), `q8_0`, `fp8`, `turbo8`, `turbo4`, `turbo3`.
+    /// Non-f16 paths warn and fall back to f16 until Metal kernels land.
+    #[arg(long = "ctk", value_name = "TYPE", default_value = "f16")]
+    pub ctk: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -418,15 +424,21 @@ fn apply_backend_env(args: &InferArgs) -> anyhow::Result<()> {
         }
     }
 
+    // SAFETY: single-threaded init before Metal/CUDA workers spawn.
+    unsafe {
+        std::env::set_var("FERROX_CTK", args.ctk.trim());
+    }
+
     eprintln!(
-        "ferrox: device={} gpu-layers={}",
+        "ferrox: device={} gpu-layers={} ctk={}",
         match device {
             OffloadDevice::Auto => "auto",
             OffloadDevice::None | OffloadDevice::Cpu => "none",
             OffloadDevice::Metal => "Metal",
             OffloadDevice::Cuda => "CUDA",
         },
-        args.n_gpu_layers
+        args.n_gpu_layers,
+        args.ctk.trim()
     );
     Ok(())
 }

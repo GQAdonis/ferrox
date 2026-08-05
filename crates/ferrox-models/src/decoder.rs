@@ -315,6 +315,9 @@ impl Decoder {
     /// quality.
     pub fn new_random_small(config: ModelConfig, n_layers: usize, vocab_size: usize) -> Self {
         let mut rng = Lcg::new(42);
+        let mut config = config;
+        config.n_layers = n_layers;
+        config.vocab_size = vocab_size;
         let hidden = config.hidden_dim;
         let head_dim = config.head_dim;
         let n_heads = config.n_heads;
@@ -406,9 +409,15 @@ impl Decoder {
 
         let final_norm = vec![1.0; hidden];
         let output_head = wm(rng.vec(vocab_size * hidden), vec![vocab_size, hidden]);
+        let execution_plan = crate::execution_plan::ExecutionPlan::from_config(
+            &config,
+            crate::capability::DecoderFamily::StandardGqa,
+            crate::capability::MemoryKind::KvGqa,
+            crate::execution_plan::ExecutionPlan::probe_metal_caps(),
+        );
 
         Decoder {
-            config: config.clone(),
+            config,
             embedding,
             layers,
             final_norm,
@@ -416,12 +425,7 @@ impl Decoder {
             gpu_vram_budget_bytes: None,
             #[cfg(feature = "metal")]
             metal_attn_kv: std::sync::Mutex::new(None),
-            execution_plan: crate::execution_plan::ExecutionPlan::from_config(
-                &config,
-                crate::capability::DecoderFamily::StandardGqa,
-                crate::capability::MemoryKind::KvGqa,
-                crate::execution_plan::ExecutionPlan::probe_metal_caps(),
-            ),
+            execution_plan,
             plan_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
@@ -2380,7 +2384,35 @@ impl Decoder {
     /// (`speculative` module) actually save work rather than just
     /// reshuffle it: verifying `k` draft tokens costs one batched call
     /// here, not `k` calls to `forward_token`.
+    ///
+    /// Thin wrapper over [`Self::forward_hidden_batch`] + `output_head`.
     pub fn forward_batch(
+        &self,
+        tokens: &[usize],
+        start_pos: usize,
+        kv_caches: &mut [KvCache],
+    ) -> Vec<Vec<f32>> {
+        let hiddens = self.forward_hidden_batch(tokens, start_pos, kv_caches);
+        if hiddens.is_empty() {
+            return Vec::new();
+        }
+        let batch_size = hiddens.len();
+        let vocab_size = self.output_head.rows();
+        let flat: Vec<f32> = hiddens.into_iter().flatten().collect();
+        let mut logits_batch = self.output_head.apply_batch(&flat, batch_size);
+        if let Some(sc) = self.config.final_logit_softcap {
+            softcap_inplace(&mut logits_batch, sc);
+        }
+        logits_batch
+            .chunks(vocab_size)
+            .map(|c| c.to_vec())
+            .collect()
+    }
+
+    /// Like [`Self::forward_batch`], but returns final RMS-normed hidden
+    /// states (pre-`output_head`) — one `hidden_dim` vector per input
+    /// token. Used by `/v1/embeddings` pooling (mean / last).
+    pub fn forward_hidden_batch(
         &self,
         tokens: &[usize],
         start_pos: usize,
@@ -2824,21 +2856,9 @@ impl Decoder {
             }
         }
 
-        let vocab_size = self.output_head.rows();
-        let final_normed_batch: Vec<f32> = hidden_batch
+        hidden_batch
             .chunks(hidden_dim)
-            .flat_map(|h| rms_norm(h, &self.final_norm, self.config.rms_norm_eps))
-            .collect();
-        let mut logits_batch = self
-            .output_head
-            .apply_batch(&final_normed_batch, batch_size);
-        if let Some(sc) = self.config.final_logit_softcap {
-            softcap_inplace(&mut logits_batch, sc);
-        }
-
-        logits_batch
-            .chunks(vocab_size)
-            .map(|c| c.to_vec())
+            .map(|h| rms_norm(h, &self.final_norm, self.config.rms_norm_eps))
             .collect()
     }
 

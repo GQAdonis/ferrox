@@ -61,6 +61,55 @@ def resolve_gguf(entry: dict, override: str | None = None) -> Path | None:
     return p if p.is_file() else None
 
 
+def host_ram_gb() -> float | None:
+    """Best-effort physical RAM in GiB (macOS sysctl / Linux /proc)."""
+    try:
+        if sys.platform == "darwin":
+            out = subprocess.check_output(
+                ["sysctl", "-n", "hw.memsize"], text=True, timeout=5
+            ).strip()
+            return int(out) / (1024**3)
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemTotal:"):
+                    return int(line.split()[1]) / (1024**2)
+    except Exception:
+        return None
+    return None
+
+
+def skip_reason(
+    entry: dict,
+    backend: str,
+    *,
+    fit_host: bool,
+    suite_ram_gb: float | None,
+) -> str | None:
+    """Why this (model, backend) should not run on this machine, or None."""
+    if backend == "cuda" and sys.platform == "darwin":
+        return "cuda not available on darwin (use a CUDA host)"
+    if not fit_host:
+        return None
+    need = entry.get("estimated_ram_gb")
+    if not isinstance(need, (int, float)):
+        return None
+    # Prefer live probe; fall back to suite host_ram_gb.
+    have = host_ram_gb()
+    if have is None:
+        have = suite_ram_gb
+    if have is None:
+        return None
+    # Leave ~25% headroom for OS + dual servers + KV (fair-chat runs ferrox
+    # then llama serially, but Metal unified memory still needs slack).
+    budget = float(have) * 0.75
+    if float(need) > budget:
+        return (
+            f"estimated_ram_gb={need} exceeds ~75% of host RAM "
+            f"({have:.0f} GiB → budget {budget:.0f} GiB)"
+        )
+    return None
+
+
 def kill_port(port: int) -> None:
     try:
         out = subprocess.check_output(
@@ -812,13 +861,43 @@ def main() -> None:
     ap.add_argument("--skip-llama", action="store_true")
     ap.add_argument("--skip-ferrox", action="store_true")
     ap.add_argument("--skip-missing", action="store_true", help="Do not write missing pins")
+    ap.add_argument(
+        "--fit-host",
+        action="store_true",
+        help="Skip models whose estimated_ram_gb exceeds ~75%% of host RAM, "
+        "and skip cuda on darwin",
+    )
+    ap.add_argument(
+        "--skip-unfit",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
     ap.add_argument("--no-render", action="store_true")
     args = ap.parse_args()
+    fit_host = args.fit_host or args.skip_unfit
+    suite_ram = suite.get("host_ram_gb")
+    if isinstance(suite_ram, (int, float)):
+        suite_ram_gb = float(suite_ram)
+    else:
+        suite_ram_gb = None
 
     if args.list:
+        ram = host_ram_gb()
+        ram_s = f"{ram:.0f} GiB" if ram else "unknown"
+        print(f"host RAM: {ram_s}  suite host_ram_gb={suite.get('host_ram_gb', '?')}")
         for m in suite["models"]:
             present = "yes" if resolve_gguf(m) else "no"
-            print(f"{m['id']:20} backends={','.join(m['backends']):12} gguf={present}  {m['name']}")
+            ram_need = m.get("estimated_ram_gb", "?")
+            skips = []
+            for b in m["backends"]:
+                r = skip_reason(m, b, fit_host=True, suite_ram_gb=suite_ram_gb)
+                if r:
+                    skips.append(f"{b}:{r.split('(')[0].strip()}")
+            skip_s = f"  skip=[{'; '.join(skips)}]" if skips else ""
+            print(
+                f"{m['id']:22} backends={','.join(m['backends']):12} "
+                f"gguf={present} ram≈{ram_need}G  {m['name']}{skip_s}"
+            )
         return
 
     if not args.backend:
@@ -886,6 +965,12 @@ def main() -> None:
         entries = [m for m in entries if args.backend in m["backends"]]
 
     for entry in entries:
+        reason = skip_reason(
+            entry, args.backend, fit_host=fit_host, suite_ram_gb=suite_ram_gb
+        )
+        if reason:
+            print(f"skip unfit {entry['id']}/{args.backend}: {reason}", flush=True)
+            continue
         if resolve_gguf(entry, args.gguf_override if args.id else None) is None:
             if args.skip_missing:
                 print(f"skip missing {entry['id']}", flush=True)

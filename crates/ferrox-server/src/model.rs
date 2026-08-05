@@ -1,10 +1,10 @@
 //! Loads the model `ferrox-server` actually serves.
 //!
 //! If `FERROX_MODEL_PATH` is set, this loads a real checkpoint: a
-//! `.gguf` **file** through `Decoder::from_gguf` and
-//! `ModelConfig::from_gguf` (deriving the architecture shape from the
-//! file's own hparam metadata, not a hand-tuned preset), auto-selecting
-//! the real tokenizer the file itself names via `tokenizer.ggml.model`
+//! `.gguf` **file** through either the generic `Decoder` path or
+//! [`ferrox_models::load_mla_engine_from_path`] for MLA architectures
+//! (deepseek2 / mistral4 dense-lead), auto-selecting the real tokenizer
+//! the file itself names via `tokenizer.ggml.model`
 //! (`gpt2` -> `GgufBpeTokenizer`, `llama` -> `GgufSpmTokenizer`, `t5` ->
 //! `GgufUnigramTokenizer`); or a Kimi K3 checkpoint **directory** (real
 //! `model.safetensors.index.json` + shards, `tiktoken.model`, optional
@@ -28,8 +28,9 @@ use std::path::Path;
 
 use ferrox_gguf::ShardedGguf;
 use ferrox_models::{
-    deepseek_v4_pro, glm_5_2, kimi_k3, ByteTokenizer, Decoder, GgufBpeTokenizer, GgufSpmTokenizer,
-    GgufUnigramTokenizer, KimiEngine, ModelConfig,
+    deepseek_v4_pro, glm_5_2, kimi_k3, load_mla_engine_from_path, select_engine_kind,
+    ByteTokenizer, Decoder, GgufBpeTokenizer, GgufSpmTokenizer, GgufUnigramTokenizer, KimiEngine,
+    MlaEngine, ModelConfig, SelectedEngineKind, ServedEngine, TextTokenizer,
 };
 
 /// Default expert-cache budget when `FERROX_SSD_STREAMING` is set without
@@ -115,6 +116,39 @@ impl ServerTokenizer {
     }
 }
 
+impl TextTokenizer for ServerTokenizer {
+    fn encode(&self, text: &str) -> Vec<usize> {
+        ServerTokenizer::encode(self, text)
+    }
+
+    fn decode(&self, ids: &[usize]) -> String {
+        ServerTokenizer::decode(self, ids)
+    }
+}
+
+fn tokenizer_from_gguf(file: &ShardedGguf) -> anyhow::Result<ServerTokenizer> {
+    match file.metadata_str("tokenizer.ggml.model") {
+        Some("gpt2") => Ok(ServerTokenizer::Bpe(Box::new(GgufBpeTokenizer::from_gguf(
+            file,
+        )?))),
+        Some("llama") => Ok(ServerTokenizer::Spm(GgufSpmTokenizer::from_gguf(file)?)),
+        // "t5" is the real GGUF tag for a SentencePiece Unigram (ULM)
+        // vocabulary -- confirmed against llama.cpp's own real
+        // vocab-type-loading source, not guessed (see
+        // GgufUnigramTokenizer's doc comment).
+        Some("t5") => Ok(ServerTokenizer::Unigram(GgufUnigramTokenizer::from_gguf(
+            file,
+        )?)),
+        other => {
+            tracing::warn!(
+                "unrecognized or missing tokenizer.ggml.model ({other:?}) -- falling back to \
+                 a raw byte tokenizer, which will not match this checkpoint's real vocabulary"
+            );
+            Ok(ServerTokenizer::Byte)
+        }
+    }
+}
+
 pub struct GgufLoaded {
     pub decoder: Decoder,
     pub tokenizer: ServerTokenizer,
@@ -137,12 +171,22 @@ pub struct KimiLoaded {
     pub chat_template: crate::chat_template::ChatTemplate,
 }
 
+pub struct MlaLoaded {
+    pub engine: MlaEngine,
+    pub tokenizer: ServerTokenizer,
+    pub eos_id: Option<usize>,
+    pub bos_id: Option<usize>,
+    pub name: String,
+    pub chat_template: crate::chat_template::ChatTemplate,
+}
+
 /// Either real checkpoint shape this server can serve. See this
 /// module's doc comment for how `load()` picks between them.
 #[allow(clippy::large_enum_variant)]
 pub enum LoadedModel {
     Gguf(GgufLoaded),
     Kimi(KimiLoaded),
+    Mla(MlaLoaded),
 }
 
 pub fn load() -> anyhow::Result<LoadedModel> {
@@ -151,7 +195,7 @@ pub fn load() -> anyhow::Result<LoadedModel> {
             if Path::new(&path).is_dir() {
                 load_real_kimi_checkpoint(&path).map(LoadedModel::Kimi)
             } else {
-                load_real_gguf_checkpoint(&path).map(LoadedModel::Gguf)
+                load_gguf_file(&path)
             }
         }
         Err(_) => {
@@ -174,7 +218,7 @@ pub fn load() -> anyhow::Result<LoadedModel> {
     }
 }
 
-fn load_real_gguf_checkpoint(path: &str) -> anyhow::Result<GgufLoaded> {
+fn load_gguf_file(path: &str) -> anyhow::Result<LoadedModel> {
     let file = ShardedGguf::open(path)?;
     if file.shard_count() > 1 {
         tracing::info!(
@@ -183,7 +227,56 @@ fn load_real_gguf_checkpoint(path: &str) -> anyhow::Result<GgufLoaded> {
             file.tensor_count()
         );
     }
-    let config = ModelConfig::from_gguf(&file)?;
+    if let Some(arch) = file.metadata_str("general.architecture") {
+        if matches!(select_engine_kind(arch), Ok(SelectedEngineKind::Mla)) {
+            return load_mla_checkpoint(path, &file).map(LoadedModel::Mla);
+        }
+    }
+    load_real_gguf_checkpoint(path, &file).map(LoadedModel::Gguf)
+}
+
+fn load_mla_checkpoint(path: &str, file: &ShardedGguf) -> anyhow::Result<MlaLoaded> {
+    let arch = file
+        .metadata_str("general.architecture")
+        .unwrap_or("mla")
+        .to_string();
+    let name = file
+        .metadata_str("general.name")
+        .unwrap_or(arch.as_str())
+        .to_string();
+    tracing::info!("loading GGUF as MLA engine (arch={arch}, name={name})");
+    let served = load_mla_engine_from_path(Path::new(path)).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let ServedEngine::Mla(engine) = served else {
+        anyhow::bail!("expected ServedEngine::Mla for architecture {arch}");
+    };
+
+    let tokenizer = tokenizer_from_gguf(file)?;
+    let eos_id = file
+        .metadata_u64("tokenizer.ggml.eos_token_id")
+        .map(|v| v as usize);
+    let bos_id = file
+        .metadata_u64("tokenizer.ggml.bos_token_id")
+        .map(|v| v as usize);
+    let byte_tokenizer = matches!(tokenizer, ServerTokenizer::Byte);
+    let chat_template = crate::chat_template::ChatTemplate::detect_for_gguf(
+        file.metadata_str("tokenizer.chat_template"),
+        Some(arch.as_str()),
+        byte_tokenizer,
+    );
+    tracing::info!("detected chat template: {chat_template:?}");
+
+    Ok(MlaLoaded {
+        engine,
+        tokenizer,
+        eos_id,
+        bos_id,
+        name,
+        chat_template,
+    })
+}
+
+fn load_real_gguf_checkpoint(path: &str, file: &ShardedGguf) -> anyhow::Result<GgufLoaded> {
+    let config = ModelConfig::from_gguf(file)?;
     if let Some(arch) = file.metadata_str("general.architecture") {
         ferrox_models::ensure_generic_decoder(arch).map_err(|e| anyhow::anyhow!("{e}"))?;
     }
@@ -197,22 +290,7 @@ fn load_real_gguf_checkpoint(path: &str) -> anyhow::Result<GgufLoaded> {
         );
     }
 
-    let tokenizer = match file.metadata_str("tokenizer.ggml.model") {
-        Some("gpt2") => ServerTokenizer::Bpe(Box::new(GgufBpeTokenizer::from_gguf(&file)?)),
-        Some("llama") => ServerTokenizer::Spm(GgufSpmTokenizer::from_gguf(&file)?),
-        // "t5" is the real GGUF tag for a SentencePiece Unigram (ULM)
-        // vocabulary -- confirmed against llama.cpp's own real
-        // vocab-type-loading source, not guessed (see
-        // GgufUnigramTokenizer's doc comment).
-        Some("t5") => ServerTokenizer::Unigram(GgufUnigramTokenizer::from_gguf(&file)?),
-        other => {
-            tracing::warn!(
-                "unrecognized or missing tokenizer.ggml.model ({other:?}) -- falling back to \
-                 a raw byte tokenizer, which will not match this checkpoint's real vocabulary"
-            );
-            ServerTokenizer::Byte
-        }
-    };
+    let tokenizer = tokenizer_from_gguf(file)?;
 
     let eos_id = file
         .metadata_u64("tokenizer.ggml.eos_token_id")

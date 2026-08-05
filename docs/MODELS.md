@@ -67,12 +67,15 @@ Llama-3.2-1B IQ4_XS.
 | Gemma-2 | Attn softcap + SWA wired (CPU + Metal legacy GQA); needs real GGUF pin |
 | Gemma-4 | Admitted to GemmaFamily (`gemma4` / `gemma4-assistant` GenericGqa NeoX); Works pending receipt — MoE-A4B / VL later |
 | Phi-4 | Arch `phi4` admitted as PhiFamily (same fused path as phi3); no suite pin yet (**P6**) |
+| Llama 4 | DedicatedOnly — MoE / non-generic graph not implemented (was wrongly GenericGqa) (**P6**) |
+| GLM4 / glm4moe | DedicatedOnly — route via `glm52_*` loaders, not generic GQA; no real-checkpoint receipt yet (**P6**) |
+| MiroThinker | No distinct GGUF arch string in the pinned inventory; published GGUFs use `qwen3moe` (already GenericGqa) (**P6**) |
 | MiniMax M2/M3 | DedicatedOnly — 256-expert sigmoid MoE + MTP not implemented (was wrongly generic) |
-| MLA | `mla_gguf_loader` + `load_mla_engine_from_path` + CLI `ferrox run` for dense-lead deepseek2/mistral4; MoE fail-closed; server path still Decoder-only |
-| Hybrid GDN | `gdn.rs` primitive + `HybridEngine` stub (**P3**); hybrid arches remain DedicatedOnly until GGUF load lands |
+| MLA | `mla_gguf_loader` + `load_mla_engine_from_path`; CLI `ferrox run` and **ferrox-server** (`LoadedModel::Mla` / `generate_engine`) for dense-lead deepseek2/mistral4; MoE-after-dense-lead fail-closed |
+| Hybrid GDN | `gdn.rs` + `hybrid_gguf_loader` (hparams / layer detect / GDN weight→`gdn_forward_token`); `try_load` fail-closed until `HybridEngine` assemble; hybrid arches DedicatedOnly (**P3**) |
 | Kimi K3 | Real slice loaders + `kimi_validate` index check; full ~1.56 TB e2e gated on storage |
 | GLM-5.2 / DeepSeek V4 | Dedicated engines (`Glm52Engine`, `DeepseekV4Engine`) + synthetic stacks — no real GGUF e2e (**P8**) |
-| VL / MTP | Deferred (**P7** / **P8**); `vl_engine` stub; no multimodal or MTP serve path |
+| VL / MTP | Deferred (**P7** / **P8**); `vl_engine` stub; `mmproj::find_mmproj_beside` discovers companion projectors; no multimodal or MTP serve path yet |
 | Mamba / T5 | Fail-closed; engine stubs (`recurrent_engine` / `t5_engine`) |
 | CUDA speed | Suite supports `--backend cuda`; need GPU host pins (staged ≥0.5× then parity) |
 

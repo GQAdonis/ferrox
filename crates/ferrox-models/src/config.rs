@@ -119,8 +119,9 @@ pub struct KdaConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RopeLayout {
     /// Adjacent pairs `(2*i, 2*i+1)` -- llama.cpp `LLAMA_ROPE_TYPE_NORM`.
-    /// Used by `llama` (including Llama 3/3.1/3.2), `llama4`, `deepseek2`,
-    /// `mistral3`, and related families.
+    /// Used by `llama` (including Llama 3/3.1/3.2), `deepseek2`,
+    /// `mistral3`, and related families. (`llama4` is DedicatedOnly — MoE
+    /// graph — but its RoPE type in the inventory is still Norm.)
     Norm,
     /// Split-half pairs `(i, i+half)` -- llama.cpp `LLAMA_ROPE_TYPE_NEOX`.
     /// Used by `olmoe`, `qwen2`/`qwen2moe`/`qwen3`, `phi3`, `gemma*`, and

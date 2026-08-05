@@ -3,15 +3,87 @@
   "id": "gemma2_2b_q4km",
   "name": "Gemma-2-2B-IT Q4_K_M",
   "backend": "metal",
-  "expect": "refuse",
-  "date": "2026-08-04",
+  "expect": "ok",
+  "date": "2026-08-05",
   "host": "Host B (Apple M2 Pro, 10 logical cores)",
-  "model": "models/gemma-2-2b-it-Q4_K_M.gguf",
+  "model": "~/Desktop/Dev/ferrox/models/gemma-2-2b-it-Q4_K_M.gguf",
   "max_tokens": 512,
   "reps": 3,
+  "mode": "server",
   "workload": "greedy chat, warm then 3x 512-tok capitals list (median)",
-  "notes": "Fail-closed: final logit soft-cap / SWA",
-  "ferrox": null,
-  "llama": null,
-  "status": "missing"
+  "notes": "Attn + final logit softcap + SWA; FA-vec skipped when softcap set",
+  "ferrox": {
+    "wall_s": 15.808,
+    "predicted_per_second": 36.721,
+    "prompt_per_second": 24.192,
+    "completion_tokens": 512,
+    "wall_tok_s": 31.098,
+    "prefix": "I can't provide a list of 80 European capital cities with a ",
+    "predicted_stddev": 1.251,
+    "prompt_stddev": 0.848,
+    "wall_tok_s_stddev": 0.867,
+    "reps": 3,
+    "runs": [
+      {
+        "predicted_per_second": 34.6039969073851,
+        "prompt_per_second": 24.19217294500595,
+        "wall_tok_s": 30.739,
+        "wall_s": 16.656,
+        "completion_tokens": 512
+      },
+      {
+        "predicted_per_second": 36.818611476733984,
+        "prompt_per_second": 23.026954005281777,
+        "wall_tok_s": 31.098,
+        "wall_s": 12.863,
+        "completion_tokens": 400
+      },
+      {
+        "predicted_per_second": 36.72126356808185,
+        "prompt_per_second": 24.677107650695024,
+        "wall_tok_s": 32.388,
+        "wall_s": 15.808,
+        "completion_tokens": 512
+      }
+    ],
+    "metal_fails": 0,
+    "engine": "ferrox"
+  },
+  "llama": {
+    "wall_s": 9.417,
+    "predicted_per_second": 53.37,
+    "prompt_per_second": 10961.214,
+    "completion_tokens": 501,
+    "wall_tok_s": 53.199,
+    "prefix": "I can't provide a list of 80 European capital cities with a ",
+    "predicted_stddev": 4.383,
+    "prompt_stddev": 12905.129,
+    "wall_tok_s_stddev": 4.429,
+    "reps": 3,
+    "runs": [
+      {
+        "predicted_per_second": 58.40140081234979,
+        "prompt_per_second": 28641.07251675807,
+        "wall_tok_s": 58.256,
+        "wall_s": 8.789,
+        "completion_tokens": 512
+      },
+      {
+        "predicted_per_second": 49.66904120900655,
+        "prompt_per_second": 3516.364619962131,
+        "wall_tok_s": 49.43,
+        "wall_s": 10.358,
+        "completion_tokens": 512
+      },
+      {
+        "predicted_per_second": 53.3699501614148,
+        "prompt_per_second": 10961.214165261383,
+        "wall_tok_s": 53.199,
+        "wall_s": 9.417,
+        "completion_tokens": 501
+      }
+    ],
+    "engine": "llama"
+  },
+  "status": "ok"
 }

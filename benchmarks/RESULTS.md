@@ -32,8 +32,8 @@ Keep off (regressions): legacy GQA NSG=4, sequential GREEDY argmax, float4 elem,
 | Mistral-7B-Instruct-v0.2 Q4_K_M | metal | — | — | — | — | no pin | — |
 | Mixtral-8x7B-Instruct Q4_K_M | cpu | — | — | — | — | no pin | — |
 | Llama-3.2-1B-Instruct IQ4_XS | metal | **148.43** ±0.3 | **138.25** ±0.8 | ~0.93× | ferrox | ok | [`iq4_xs_metal`](receipts/pins/iq4_xs_metal.json) |
-| Gemma-2-2B-IT Q4_K_M | metal | — | — | — | — | missing | [`gemma2_2b_q4km_metal`](receipts/pins/gemma2_2b_q4km_metal.json) |
-| Gemma-2-2B-IT Q4_K_M | cpu | — | — | — | — | no pin | — |
+| Gemma-2-2B-IT Q4_K_M | metal | **36.72** ±1.3 | **53.37** ±4.4 | ~1.45× | llama | ok | [`gemma2_2b_q4km_metal`](receipts/pins/gemma2_2b_q4km_metal.json) |
+| Gemma-2-2B-IT Q4_K_M | cpu | **8.65** ±0.8 | **19.31** ±6.8 (−ngl 0) | ~2.23× | llama | ok | [`gemma2_2b_q4km_cpu`](receipts/pins/gemma2_2b_q4km_cpu.json) |
 | SmolLM2-135M-Instruct Q8_0 | metal | **283.66** ±9.7 | **193.48** ±4.9 | ~0.68× | ferrox | ok | [`smollm2_135m_q8_metal`](receipts/pins/smollm2_135m_q8_metal.json) |
 | SmolLM2-135M-Instruct Q8_0 | cpu | **55.84** ±0.7 | **43.48** ±5.9 (−ngl 0) | ~0.78× | ferrox | ok | [`smollm2_135m_q8_cpu`](receipts/pins/smollm2_135m_q8_cpu.json) |
 | Qwen2.5-0.5B-Instruct Q8_0 | metal | **192.09** ±7.0 | **123.00** ±5.6 | ~0.64× | ferrox | ok | [`qwen25_05b_q8_metal`](receipts/pins/qwen25_05b_q8_metal.json) |
@@ -45,7 +45,6 @@ Keep off (regressions): legacy GQA NSG=4, sequential GREEDY argmax, float4 elem,
 | Phi-3-mini-4k-Instruct Q4 | metal | **39.80** ±0.2 | **50.86** ±0.2 | ~1.28× | llama | ok | [`phi3_mini_q4_metal`](receipts/pins/phi3_mini_q4_metal.json) |
 | Phi-3-mini-4k-Instruct Q4 | cpu | **5.10** ±0.7 | **8.80** ±4.4 (−ngl 0) | ~1.73× | llama | ok | [`phi3_mini_q4_cpu`](receipts/pins/phi3_mini_q4_cpu.json) |
 
-Missing GGUF (no tok/s): `gemma2_2b_q4km`. Place the files at their configured `models/` paths.
 
 ## CLI completion (llama-cli vs `ferrox run`)
 

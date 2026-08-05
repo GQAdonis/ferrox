@@ -21,7 +21,7 @@ ds4 deps — rewrite in-tree.
 Also on this horizon (unchanged intent):
 
 - **Receipts** — real GGUF oracles for Gemma-2, Qwen2-MoE, Mistral, Mixtral (suite entries exist; pins pending checkpoints).
-- **Metal MoE** — keep OLMoE expert placement; fuse only if profiling proves it.
+- **Metal MoE** — unfused `matvec_id` (llama-style occupancy); still ~1.66× on OLMoE — next: simdgroup `mul_mm` prefill + expert residency hoist.
 - **Frontier** — Kimi multi-layer → full e2e; GLM-5.2 / DeepSeek V4 real quants (engines exist; fail-closed until receipts).
 - **CUDA** — fair-chat pins via `run_suite.py --backend cuda --host-label …`; staged ≥0.5× then parity (no invented numbers).
 

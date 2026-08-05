@@ -1161,6 +1161,7 @@ kernel void gqa_prefill_fa_vec(
     constant uint& head_dim [[buffer(6)]],
     constant uint& n_q [[buffer(7)]],
     constant uint& kv_prefix_len [[buffer(8)]],
+    constant float& softcap [[buffer(9)]],
     uint2 tgpig [[threadgroup_position_in_grid]],
     uint2 tid_tg [[thread_position_in_threadgroup]],
     uint2 tg_size [[threads_per_threadgroup]],
@@ -1217,7 +1218,146 @@ kernel void gqa_prefill_fa_vec(
             device const half4* k4 =
                 (device const half4*)(k_cache + ((ic + cc) * n_kv_heads + kv_h) * D);
             float partial = dot(sq4[tiisg], float4(k4[tiisg]));
-            scores[cc] = simd_sum(partial) * scale;
+            float sc = simd_sum(partial) * scale;
+            if (softcap > 0.0f) {
+                sc = softcap * tanh(sc / softcap);
+            }
+            scores[cc] = sc;
+        }
+
+        float s_lane = (tiisg < chunk) ? scores[tiisg] : -INFINITY;
+        float M2 = simd_max(max(M, s_lane));
+        float ms = (M == -INFINITY) ? 0.0f : exp(M - M2);
+        float vs = (s_lane == -INFINITY) ? 0.0f : exp(s_lane - M2);
+        S = S * ms + simd_sum(vs);
+        ss[tiisg] = vs;
+        so4[tiisg] *= ms;
+        M = M2;
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+
+        float4 lo = float4(0.0f);
+        for (uint cc = 0; cc < chunk; cc++) {
+            device const half4* v4 =
+                (device const half4*)(v_cache + ((ic + cc) * n_kv_heads + kv_h) * D);
+            lo += float4(v4[tiisg]) * ss[cc];
+        }
+        so4[tiisg] += lo;
+    }
+
+    if (tiisg == 0u) {
+        ss[0] = S;
+        ss[1] = M;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint r = nsg >> 1; r > 0u; r >>= 1) {
+        if (sgitg < r) {
+            threadgroup float* ss0 = shared + D + sgitg * SG_F;
+            threadgroup float* ss1 = shared + D + (sgitg + r) * SG_F;
+            threadgroup float4* so0 = (threadgroup float4*)(ss0 + C);
+            threadgroup float4* so1 = (threadgroup float4*)(ss1 + C);
+            float S0 = ss0[0];
+            float S1 = ss1[0];
+            float M0 = ss0[1];
+            float M1 = ss1[1];
+            float Mn = max(M0, M1);
+            float a0 = (M0 == -INFINITY) ? 0.0f : exp(M0 - Mn);
+            float a1 = (M1 == -INFINITY) ? 0.0f : exp(M1 - Mn);
+            if (tiisg == 0u) {
+                ss0[0] = S0 * a0 + S1 * a1;
+                ss0[1] = Mn;
+            }
+            so0[tiisg] = so0[tiisg] * a0 + so1[tiisg] * a1;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (sgitg == 0u) {
+        threadgroup float* ss0 = shared + D;
+        threadgroup float4* so0 = (threadgroup float4*)(ss0 + C);
+        float inv = (ss0[0] == 0.0f) ? 0.0f : (1.0f / ss0[0]);
+        device float4* out4 = (device float4*)(out + (qi * n_heads + h) * D);
+        out4[tiisg] = so0[tiisg] * inv;
+    }
+}
+"#;
+
+const GQA_PREFILL_FA_VEC_D256_KERNEL_SRC: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+kernel void gqa_prefill_fa_vec_d256(
+    device const float* q [[buffer(0)]],
+    device const half* k_cache [[buffer(1)]],
+    device const half* v_cache [[buffer(2)]],
+    device float* out [[buffer(3)]],
+    constant uint& n_heads [[buffer(4)]],
+    constant uint& n_kv_heads [[buffer(5)]],
+    constant uint& head_dim [[buffer(6)]],
+    constant uint& n_q [[buffer(7)]],
+    constant uint& kv_prefix_len [[buffer(8)]],
+    constant float& softcap [[buffer(9)]],
+    uint2 tgpig [[threadgroup_position_in_grid]],
+    uint2 tid_tg [[thread_position_in_threadgroup]],
+    uint2 tg_size [[threads_per_threadgroup]],
+    threadgroup float* shared [[threadgroup(0)]]
+) {
+    constexpr uint D = 256u;
+    constexpr uint D4 = 64u;
+    constexpr uint C = 32u;
+    constexpr uint NW = 32u;
+    constexpr uint SG_F = C + D;
+
+    uint h = tgpig.x;
+    uint qi = tgpig.y;
+    if (h >= n_heads || qi >= n_q || head_dim != D) return;
+
+    uint causal_len = kv_prefix_len + qi + 1u;
+    if (causal_len == 0u) return;
+
+    uint tid = tid_tg.x;
+    uint tg = tg_size.x;
+    const uint tiisg = tid % NW;
+    const uint sgitg = tid / NW;
+    const uint nsg = tg / NW;
+
+    threadgroup float4* sq4 = (threadgroup float4*)shared;
+    threadgroup float* ss = shared + D + sgitg * SG_F;
+    threadgroup float4* so4 = (threadgroup float4*)(ss + C);
+
+    uint group_size = n_heads / max(n_kv_heads, 1u);
+    uint kv_h = h / max(group_size, 1u);
+    float scale = 1.0f / sqrt(float(D));
+
+    device const float4* q4 = (device const float4*)(q + (qi * n_heads + h) * D);
+    for (uint i = tid; i < D4; i += tg) {
+        sq4[i] = q4[i];
+    }
+    so4[tiisg] = float4(0.0f);
+    ss[tiisg] = 0.0f;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float S = 0.0f;
+    float M = -INFINITY;
+
+    for (uint ic0 = sgitg; ; ic0 += nsg) {
+        uint ic = ic0 * C;
+        if (ic >= causal_len) break;
+        uint chunk = min(C, causal_len - ic);
+
+        float scores[C];
+        for (uint cc = 0; cc < C; cc++) {
+            scores[cc] = -INFINITY;
+        }
+        for (uint cc = 0; cc < chunk; cc++) {
+            device const half4* k4 =
+                (device const half4*)(k_cache + ((ic + cc) * n_kv_heads + kv_h) * D);
+            float partial = dot(sq4[tiisg], float4(k4[tiisg]));
+            float sc = simd_sum(partial) * scale;
+            if (softcap > 0.0f) {
+                sc = softcap * tanh(sc / softcap);
+            }
+            scores[cc] = sc;
         }
 
         float s_lane = (tiisg < chunk) ? scores[tiisg] : -INFINITY;
@@ -1300,6 +1440,7 @@ kernel void gqa_prefill(
     constant uint& head_dim [[buffer(6)]],
     constant uint& n_q [[buffer(7)]],
     constant uint& kv_prefix_len [[buffer(8)]],
+    constant float& softcap [[buffer(9)]],
     uint2 tgpig [[threadgroup_position_in_grid]],
     uint2 tid_tg [[thread_position_in_threadgroup]],
     uint2 tg_size [[threads_per_threadgroup]],
@@ -1339,6 +1480,9 @@ kernel void gqa_prefill(
             dot += q_h[d] * float(k_t[d]);
         }
         float score = dot * scale;
+        if (softcap > 0.0f) {
+            score = softcap * tanh(score / softcap);
+        }
         float m2 = max(m, score);
         float a = online_rescale_prefill(m, m2);
         float b = exp(score - m2);
@@ -2238,6 +2382,7 @@ fn encode_gqa_prefill_with_kv(
     head_dim: u32,
     n_q: u32,
     kv_prefix_len: u32,
+    attn_softcap: Option<f32>,
 ) -> Result<(), MetalError> {
     let total_seq = kv_prefix_len + n_q;
     match kv.dtype {
@@ -2259,6 +2404,7 @@ fn encode_gqa_prefill_with_kv(
                 head_dim,
                 n_q,
                 kv_prefix_len,
+                attn_softcap,
             )
         }
         _ => encode_gqa_prefill(
@@ -2273,6 +2419,7 @@ fn encode_gqa_prefill_with_kv(
             head_dim,
             n_q,
             kv_prefix_len,
+            attn_softcap,
         ),
     }
 }
@@ -2323,10 +2470,9 @@ fn gqa_prefill_threadgroup_size(seq_len: u32, head_dim: u32) -> u32 {
     tg.max(1)
 }
 
-/// FA-vec prefill currently ships a dedicated kernel for head_dim=128
-/// (Llama-3.1-8B fair-chat). Other FA-vec dims fall back to legacy prefill.
+/// FA-vec prefill for head_dim 128 (Llama-3) and 256 (Gemma-2/3).
 fn gqa_prefill_fa_vec_supported(head_dim: u32) -> bool {
-    head_dim == 128
+    matches!(head_dim, 128 | 256)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2342,11 +2488,17 @@ fn encode_gqa_prefill_fa_vec(
     head_dim: u32,
     n_q: u32,
     kv_prefix_len: u32,
+    softcap: f32,
 ) -> Result<(), MetalError> {
-    if head_dim != 128 {
-        return Err(MetalError::CommandFailed);
-    }
-    let pipe = ensure_pipeline(device, GQA_PREFILL_FA_VEC_KERNEL_SRC, "gqa_prefill_fa_vec")?;
+    let pipe = match head_dim {
+        128 => ensure_pipeline(device, GQA_PREFILL_FA_VEC_KERNEL_SRC, "gqa_prefill_fa_vec")?,
+        256 => ensure_pipeline(
+            device,
+            GQA_PREFILL_FA_VEC_D256_KERNEL_SRC,
+            "gqa_prefill_fa_vec_d256",
+        )?,
+        _ => return Err(MetalError::CommandFailed),
+    };
     encoder.setComputePipelineState(&pipe.0);
     let tg = gqa_fa_vec_threadgroup_size(head_dim);
     let nsg = tg / 32;
@@ -2375,6 +2527,8 @@ fn encode_gqa_prefill_fa_vec(
             4,
             8,
         );
+        let mut sc = softcap;
+        encoder.setBytes_length_atIndex(NonNull::new(&mut sc as *mut f32 as *mut _).unwrap(), 4, 9);
         encoder.setThreadgroupMemoryLength_atIndex(tg_mem, 0);
     }
     encoder.dispatchThreadgroups_threadsPerThreadgroup(
@@ -2553,7 +2707,9 @@ fn encode_gqa_prefill(
     head_dim: u32,
     n_q: u32,
     kv_prefix_len: u32,
+    attn_softcap: Option<f32>,
 ) -> Result<(), MetalError> {
+    let softcap = attn_softcap.filter(|&c| c > 0.0).unwrap_or(0.0);
     if metal_fa_vec_enabled() && gqa_prefill_fa_vec_supported(head_dim) {
         return encode_gqa_prefill_fa_vec(
             encoder,
@@ -2567,6 +2723,7 @@ fn encode_gqa_prefill(
             head_dim,
             n_q,
             kv_prefix_len,
+            softcap,
         );
     }
     let pipe = ensure_pipeline(device, GQA_PREFILL_KERNEL_SRC, "gqa_prefill")?;
@@ -2598,6 +2755,8 @@ fn encode_gqa_prefill(
             4,
             8,
         );
+        let mut sc = softcap;
+        encoder.setBytes_length_atIndex(NonNull::new(&mut sc as *mut f32 as *mut _).unwrap(), 4, 9);
         encoder.setThreadgroupMemoryLength_atIndex(tg_mem, 0);
     }
     encoder.dispatchThreadgroups_threadsPerThreadgroup(
@@ -3020,6 +3179,10 @@ struct MoeDecodeScratch {
     router: Retained<ProtocolObject<dyn MTLBuffer>>,
     ids: Retained<ProtocolObject<dyn MTLBuffer>>,
     route: Retained<ProtocolObject<dyn MTLBuffer>>,
+    /// Pre-SiLU gate projection (unfused MoE matvec_id).
+    gate: Retained<ProtocolObject<dyn MTLBuffer>>,
+    /// Pre-SiLU up projection (unfused MoE matvec_id).
+    up: Retained<ProtocolObject<dyn MTLBuffer>>,
     act: Retained<ProtocolObject<dyn MTLBuffer>>,
     expert_out: Retained<ProtocolObject<dyn MTLBuffer>>,
     moe_out: Retained<ProtocolObject<dyn MTLBuffer>>,
@@ -3075,6 +3238,8 @@ pub fn moe_decode_ensure(hidden_dim: usize) -> Result<(), MetalError> {
                 router: alloc_f32_buffer(device, n_router)?,
                 ids: alloc_u32_buffer(device, top_k_cap)?,
                 route: alloc_f32_buffer(device, top_k_cap)?,
+                gate: alloc_f32_buffer(device, top_k_cap * ffn_rows)?,
+                up: alloc_f32_buffer(device, top_k_cap * ffn_rows)?,
                 act: alloc_f32_buffer(device, top_k_cap * ffn_rows)?,
                 expert_out: alloc_f32_buffer(device, top_k_cap * hidden_dim)?,
                 moe_out: alloc_f32_buffer(device, hidden_dim)?,
@@ -3151,6 +3316,8 @@ fn moe_scratch_ensure_caps(
     if ffn_rows > scratch.ffn_rows || top_k > scratch.top_k_cap {
         let fk = ffn_rows.max(scratch.ffn_rows);
         let tk = top_k.max(scratch.top_k_cap);
+        scratch.gate = alloc_f32_buffer(device, tk * fk)?;
+        scratch.up = alloc_f32_buffer(device, tk * fk)?;
         scratch.act = alloc_f32_buffer(device, tk * fk)?;
         scratch.expert_out = alloc_f32_buffer(device, tk * scratch.hidden_dim)?;
         scratch.ids = alloc_u32_buffer(device, tk)?;
@@ -3609,6 +3776,8 @@ fn encode_moe_layer_fused(
         &layer.packed,
         &scratch.ids,
         &scratch.route,
+        &scratch.gate,
+        &scratch.up,
         &scratch.act,
         &scratch.expert_out,
         &scratch.moe_out,
@@ -4696,6 +4865,7 @@ pub fn launch_prefill_attn_block(
     rope_theta: f32,
     freq_factors: Option<&[f32]>,
     start_pos: usize,
+    attn_softcap: Option<f32>,
 ) -> Result<(Vec<f32>, Vec<f32>, Vec<f32>), MetalError> {
     let head_dim = kv.head_dim;
     let n_kv_heads = kv.n_kv_heads;
@@ -4777,6 +4947,7 @@ pub fn launch_prefill_attn_block(
         head_dim as u32,
         n_q as u32,
         start_pos as u32,
+        attn_softcap,
     );
     encoder.endEncoding();
     prefill_result?;
@@ -4902,6 +5073,7 @@ pub fn launch_gqa_prefill_host(
         head_dim as u32,
         n_q as u32,
         kv_prefix_len as u32,
+        None,
     );
     encoder.endEncoding();
     enc_result?;
@@ -5506,6 +5678,7 @@ mod tests {
             10000.0,
             None,
             start_pos,
+            None,
         )
         .expect("prefill attn");
         assert_eq!(kv.seq_len, n_q);
@@ -5596,6 +5769,7 @@ mod tests {
             10000.0,
             None,
             0,
+            None,
         )
         .expect("f16 prefill");
         let (attn_q8, _, _) = launch_prefill_attn_block(
@@ -5609,6 +5783,7 @@ mod tests {
             10000.0,
             None,
             0,
+            None,
         )
         .expect("q8 prefill");
         assert_eq!(attn_f16.len(), attn_q8.len());

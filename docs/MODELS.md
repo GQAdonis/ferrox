@@ -47,13 +47,13 @@ always prefer the pin / RESULTS Gap for comparisons.
 | Model | Backend (Gap = llama/ferrox; Host B pins) |
 |---|---|
 | TinyLlama-1.1B-Chat-v1.0 Q8_0 | Metal ~0.96× (quiet re-pin); CPU pin exists |
-| Llama-3.2-1B / 3B Q4_K_M | Metal ~1.00× / ~1.14× |
+| Llama-3.2-1B / 3B Q4_K_M | Metal ~1.00× / ~1.04× |
 | Llama-3.2-1B IQ4_XS | Metal ~1.00× |
 | Llama-3.1-8B-Instruct Q4_K_M | Metal fair-chat **~0.97×**; CLI **~1.00×** |
 | Mistral-7B-Instruct-v0.2 Q4_K_M | Metal ~1.06×; CPU pin exists |
-| OLMoE-1B-7B-0924 Q4_0 | Metal ~1.77× (experts); CPU pin exists |
+| OLMoE-1B-7B-0924 Q4_0 | Metal ~1.66× (experts; unfused matvec_id); CPU pin exists |
 | SmolLM2-135M / Qwen2.5-0.5B / Qwen3-0.6B | Metal faster than llama on these small Q8 pins |
-| Gemma-2-2B-IT Q4_K_M | Metal ~1.17× (softcap → legacy GQA) |
+| Gemma-2-2B-IT Q4_K_M | Metal ~1.11×; softcap on FA-vec decode + prefill d=256 |
 | Gemma-3-1B-IT Q8_0 | Metal ~0.87×; GeGLU + SWA + sandwich; FA-vec d=256 |
 | Phi-3-mini-4k-Instruct Q4 | Metal ~1.09×; fused QKV; FA-vec d=96 |
 | Phi-4-mini-Instruct Q4_K_M | Metal ~1.06×; CLI ~1.04× — [`phi4_mini_q4km_metal`](../benchmarks/receipts/pins/phi4_mini_q4km_metal.json) |
@@ -83,5 +83,5 @@ always prefer the pin / RESULTS Gap for comparisons.
 | Backend | Status |
 |---|---|
 | CPU | Dense + MoE; `FERROX_CPU_INT_DOT=1` on suite runs |
-| Metal | Dense + attn + MoE expert placement; FA-vec decode d=64/96/128/256; FA-vec prefill d=128; softcap → legacy GQA |
+| Metal | Dense + attn + MoE expert placement; FA-vec decode d=64/96/128/256; FA-vec prefill d=128/256 + softcap |
 | CUDA | Matvec + resident weights + FFN fuse; fair-chat pins need a CUDA host |

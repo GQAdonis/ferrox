@@ -94,7 +94,7 @@
       "backends": ["metal", "cpu"],
       "estimated_ram_gb": 4,
       "expect": "ok",
-      "notes": "Attn + final logit softcap + SWA; FA-vec skipped when softcap set"
+      "notes": "Attn + final logit softcap + SWA; FA-vec softcap on decode/prefill d=256"
     },
     {
       "id": "smollm2_135m_q8",

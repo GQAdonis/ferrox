@@ -634,8 +634,63 @@ kernel void moe_topk_softmax(
     }
 }
 
-/// llama.cpp `mul_mv_id` style: packed Q4_0 planes, `ids[slot]` selects
+/// llama.cpp `mul_mv_id` style: packed Q4_0 plane, `ids[slot]` selects
 /// expert. Prefill: `n_tokens>1`, slots = `n_tokens * top_k`, `x` strided.
+/// One weight stream per dispatch (gate / up / down) — fused gate+up hurt
+/// occupancy vs sequential matvecs (OLMoE Metal gap vs llama).
+kernel void q4_0_moe_matvec_id(
+    device const uchar* w_all [[buffer(0)]],
+    device const float* x [[buffer(1)]],
+    device float* out [[buffer(2)]],
+    device const int* ids [[buffer(3)]],
+    constant uint& row_bytes [[buffer(4)]],
+    constant uint& n_blocks [[buffer(5)]],
+    constant uint& n_rows [[buffer(6)]],
+    constant uint& top_k [[buffer(7)]],
+    constant uint& expert_stride [[buffer(8)]],
+    constant uint& n_tokens [[buffer(9)]],
+    constant uint& x_stride [[buffer(10)]],
+    uint tgpig [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]]
+) {
+    constexpr uint NR = 4u;
+    constexpr uint NSG = 2u;
+    constexpr uint ROWS_PER_TG = NR * NSG;
+    const uint row_groups = (n_rows + ROWS_PER_TG - 1u) / ROWS_PER_TG;
+    const uint n_slots = n_tokens * top_k;
+    const uint slot = tgpig / row_groups;
+    const uint group = tgpig - slot * row_groups;
+    const uint first_row = (group * NSG + sg) * NR;
+    if (slot >= n_slots) return;
+    const uint token = slot / top_k;
+    const uint eid = uint(ids[slot]);
+    device const uchar* w = w_all + (size_t)eid * expert_stride;
+    float acc[NR] = { 0.0f };
+    const uint ix = lane / 2u;
+    const uint il = (lane % 2u) * 8u;
+    device const float* yb = x + (size_t)token * x_stride + ix * 32u + il;
+    for (uint b = ix; b < n_blocks; b += 16u) {
+        float yl[16];
+        const float sumy = q4_0_load_y(yb, yl);
+        for (uint rr = 0u; rr < NR; ++rr) {
+            const uint row = first_row + rr;
+            if (row >= n_rows) continue;
+            device const uchar* block =
+                w + (size_t)row * row_bytes + (size_t)b * 18u;
+            acc[rr] += q4_0_half_dot(block, sumy, yl, il);
+        }
+        yb += 16u * 32u;
+    }
+    for (uint rr = 0u; rr < NR; ++rr) {
+        const uint row = first_row + rr;
+        const float sum = simd_sum(acc[rr]);
+        if (lane == 0u && row < n_rows) {
+            out[(size_t)slot * n_rows + row] = sum;
+        }
+    }
+}
+
 kernel void q4_0_moe_gate_up_id(
     device const uchar* gate_all [[buffer(0)]],
     device const uchar* up_all [[buffer(1)]],
@@ -653,6 +708,7 @@ kernel void q4_0_moe_gate_up_id(
     uint lane [[thread_index_in_simdgroup]],
     uint sg [[simdgroup_index_in_threadgroup]]
 ) {
+    // Kept for prefill path / tests; decode prefers q4_0_moe_matvec_id ×2.
     constexpr uint NR = 4u;
     constexpr uint NSG = 2u;
     constexpr uint ROWS_PER_TG = NR * NSG;
@@ -2801,8 +2857,73 @@ pub(crate) fn encode_moe_topk_softmax(
     Ok(())
 }
 
-/// Encode packed-id Q4_0 MoE (gate_up_id → down_id → weighted_sum).
-/// `n_tokens=1` is decode; prefill passes `T` with strided `x` / `[T,K]` ids.
+
+fn encode_q4_0_moe_matvec_id(
+    encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+    device: &Retained<ProtocolObject<dyn MTLDevice>>,
+    w: &ResidentWeightBuffer,
+    x_buf: &ProtocolObject<dyn MTLBuffer>,
+    out: &ProtocolObject<dyn MTLBuffer>,
+    ids: &ProtocolObject<dyn MTLBuffer>,
+    row_bytes: u32,
+    n_blocks: u32,
+    n_rows: u32,
+    top_k: u32,
+    expert_stride: u32,
+    n_tokens: u32,
+    x_stride: u32,
+    n_slots: usize,
+) -> Result<(), MetalError> {
+    let pipe = ensure_pipeline(device, Q4_0_MOE_TOPK_KERNEL_SRC, "q4_0_moe_matvec_id")?;
+    encoder.setComputePipelineState(&pipe.0);
+    const ROWS_PER_TG: usize = 8;
+    let tg = 64usize;
+    unsafe {
+        encoder.setBuffer_offset_atIndex(Some(&w.buffer), w.weight_offset, 0);
+        encoder.setBuffer_offset_atIndex(Some(x_buf), 0, 1);
+        encoder.setBuffer_offset_atIndex(Some(out), 0, 2);
+        encoder.setBuffer_offset_atIndex(Some(ids), 0, 3);
+        let mut rb = row_bytes;
+        encoder.setBytes_length_atIndex(NonNull::new(&mut rb as *mut u32 as *mut _).unwrap(), 4, 4);
+        let mut blocks = n_blocks;
+        encoder.setBytes_length_atIndex(
+            NonNull::new(&mut blocks as *mut u32 as *mut _).unwrap(),
+            4,
+            5,
+        );
+        let mut rows = n_rows;
+        encoder.setBytes_length_atIndex(NonNull::new(&mut rows as *mut u32 as *mut _).unwrap(), 4, 6);
+        let mut tk = top_k;
+        encoder.setBytes_length_atIndex(NonNull::new(&mut tk as *mut u32 as *mut _).unwrap(), 4, 7);
+        let mut stride = expert_stride;
+        encoder.setBytes_length_atIndex(
+            NonNull::new(&mut stride as *mut u32 as *mut _).unwrap(),
+            4,
+            8,
+        );
+        let mut nt = n_tokens;
+        encoder.setBytes_length_atIndex(NonNull::new(&mut nt as *mut u32 as *mut _).unwrap(), 4, 9);
+        let mut xs = x_stride;
+        encoder.setBytes_length_atIndex(NonNull::new(&mut xs as *mut u32 as *mut _).unwrap(), 4, 10);
+    }
+    encoder.dispatchThreadgroups_threadsPerThreadgroup(
+        MTLSize {
+            width: n_slots * (n_rows as usize).div_ceil(ROWS_PER_TG),
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width: tg,
+            height: 1,
+            depth: 1,
+        },
+    );
+    Ok(())
+}
+
+/// Encode packed-id Q4_0 MoE: matvec_id(gate) → matvec_id(up) → silu_mul
+/// → down_id → weighted_sum. Matches llama.cpp decode occupancy better than
+/// a fused gate+up kernel. `n_tokens=1` is decode; prefill passes `T`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_q4_0_moe_id(
     encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
@@ -2811,6 +2932,8 @@ pub(crate) fn encode_q4_0_moe_id(
     packed: &MoePackedQ4<'_>,
     ids: &ProtocolObject<dyn MTLBuffer>,
     route: &ProtocolObject<dyn MTLBuffer>,
+    gate_buf: &ProtocolObject<dyn MTLBuffer>,
+    up_buf: &ProtocolObject<dyn MTLBuffer>,
     act_buf: &ProtocolObject<dyn MTLBuffer>,
     expert_out_buf: &ProtocolObject<dyn MTLBuffer>,
     out_buf: &ProtocolObject<dyn MTLBuffer>,
@@ -2830,72 +2953,49 @@ pub(crate) fn encode_q4_0_moe_id(
     let x_stride = (input_blocks * 32) as u32;
     let n_slots = (n_tokens as usize) * (top_k as usize);
 
-    let gate_up = ensure_pipeline(device, Q4_0_MOE_TOPK_KERNEL_SRC, "q4_0_moe_gate_up_id")?;
+    encode_q4_0_moe_matvec_id(
+        encoder,
+        device,
+        &gate_w,
+        x_buf,
+        gate_buf,
+        ids,
+        packed.gate_row_bytes as u32,
+        input_blocks as u32,
+        packed.ffn_rows as u32,
+        top_k,
+        packed.gate_stride as u32,
+        n_tokens,
+        x_stride,
+        n_slots,
+    )?;
+    encode_q4_0_moe_matvec_id(
+        encoder,
+        device,
+        &up_w,
+        x_buf,
+        up_buf,
+        ids,
+        packed.gate_row_bytes as u32,
+        input_blocks as u32,
+        packed.ffn_rows as u32,
+        top_k,
+        packed.up_stride as u32,
+        n_tokens,
+        x_stride,
+        n_slots,
+    )?;
+    crate::elem::encode_silu_mul(
+        encoder,
+        device,
+        gate_buf,
+        up_buf,
+        act_buf,
+        (n_slots * packed.ffn_rows) as u32,
+    )?;
+
     let down = ensure_pipeline(device, Q4_0_MOE_TOPK_KERNEL_SRC, "q4_0_moe_down_id")?;
     let weighted_sum = ensure_pipeline(device, Q4_0_MOE_TOPK_KERNEL_SRC, "moe_weighted_sum")?;
-
-    encoder.setComputePipelineState(&gate_up.0);
-    unsafe {
-        encoder.setBuffer_offset_atIndex(Some(&gate_w.buffer), gate_w.weight_offset, 0);
-        encoder.setBuffer_offset_atIndex(Some(&up_w.buffer), up_w.weight_offset, 1);
-        encoder.setBuffer_offset_atIndex(Some(x_buf), 0, 2);
-        encoder.setBuffer_offset_atIndex(Some(act_buf), 0, 3);
-        encoder.setBuffer_offset_atIndex(Some(ids), 0, 4);
-        let mut row_bytes = packed.gate_row_bytes as u32;
-        encoder.setBytes_length_atIndex(
-            NonNull::new(&mut row_bytes as *mut u32 as *mut _).unwrap(),
-            4,
-            5,
-        );
-        let mut blocks = input_blocks as u32;
-        encoder.setBytes_length_atIndex(
-            NonNull::new(&mut blocks as *mut u32 as *mut _).unwrap(),
-            4,
-            6,
-        );
-        let mut ffn_rows = packed.ffn_rows as u32;
-        encoder.setBytes_length_atIndex(
-            NonNull::new(&mut ffn_rows as *mut u32 as *mut _).unwrap(),
-            4,
-            7,
-        );
-        let mut tk = top_k;
-        encoder.setBytes_length_atIndex(
-            NonNull::new(&mut tk as *mut u32 as *mut _).unwrap(),
-            4,
-            8,
-        );
-        let mut stride = packed.gate_stride as u32;
-        encoder.setBytes_length_atIndex(
-            NonNull::new(&mut stride as *mut u32 as *mut _).unwrap(),
-            4,
-            9,
-        );
-        let mut nt = n_tokens;
-        encoder.setBytes_length_atIndex(
-            NonNull::new(&mut nt as *mut u32 as *mut _).unwrap(),
-            4,
-            10,
-        );
-        let mut xs = x_stride;
-        encoder.setBytes_length_atIndex(
-            NonNull::new(&mut xs as *mut u32 as *mut _).unwrap(),
-            4,
-            11,
-        );
-    }
-    encoder.dispatchThreadgroups_threadsPerThreadgroup(
-        MTLSize {
-            width: n_slots * packed.ffn_rows.div_ceil(ROWS_PER_TG),
-            height: 1,
-            depth: 1,
-        },
-        MTLSize {
-            width: tg,
-            height: 1,
-            depth: 1,
-        },
-    );
 
     encoder.setComputePipelineState(&down.0);
     unsafe {
@@ -3051,6 +3151,12 @@ pub fn launch_moe_prefill_q4_0(
     let act_buf = device
         .newBufferWithLength_options(n_slots * ffn * 4, MTLResourceOptions::StorageModeShared)
         .ok_or(MetalError::BufferAllocFailed)?;
+    let gate_buf = device
+        .newBufferWithLength_options(n_slots * ffn * 4, MTLResourceOptions::StorageModeShared)
+        .ok_or(MetalError::BufferAllocFailed)?;
+    let up_buf = device
+        .newBufferWithLength_options(n_slots * ffn * 4, MTLResourceOptions::StorageModeShared)
+        .ok_or(MetalError::BufferAllocFailed)?;
     let expert_out_buf = device
         .newBufferWithLength_options(
             n_slots * hidden * 4,
@@ -3072,6 +3178,8 @@ pub fn launch_moe_prefill_q4_0(
         packed,
         &ids_buf,
         &route_buf,
+        &gate_buf,
+        &up_buf,
         &act_buf,
         &expert_out_buf,
         &out_buf,

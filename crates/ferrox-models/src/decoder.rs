@@ -555,11 +555,9 @@ impl Decoder {
             return false;
         }
         // Softcaps: final logit softcap is applied on the host after
-        // lm_head (Metal-safe). Attention softcap runs on Metal via the
-        // legacy GQA path (FA-vec skipped when softcap > 0). attention_scale
-        // is compensated by scaling Q on the host/Metal extras path.
-        // Softcaps (Gemma-2) used to disable the entire Metal stack;
-        // that gate is gone now that attn softcap is wired.
+        // lm_head (Metal-safe). Attention softcap runs on Metal FA-vec /
+        // legacy GQA (decode + prefill). attention_scale is compensated
+        // by scaling Q on the host/Metal extras path.
         if self.config.head_dim > 256 {
             return false;
         }
@@ -2570,15 +2568,12 @@ impl Decoder {
                     Some(window) => start_pos + batch_size <= window,
                     None => true,
                 };
-                // Metal prefill kernel has no attn softcap yet — fall back
-                // to CPU attention (which applies softcap) when set.
-                let softcap_ok = self.config.attn_logit_softcap.is_none();
+                // Metal prefill applies attn softcap in FA-vec / legacy GQA.
                 if let Some(guard) = metal_kv_guard.as_mut() {
                     if let Some(metal_kvs) = guard.as_mut() {
                         if metal_kvs[l].seq_len == cache.seq_len
                             && start_pos == cache.seq_len
                             && swa_fits
-                            && softcap_ok
                         {
                             match ferrox_metal::attn::launch_prefill_attn_block(
                                 &q_batch,
@@ -2591,6 +2586,7 @@ impl Decoder {
                                 self.config.layer_rope_theta(l),
                                 self.config.rope_freqs.as_deref(),
                                 start_pos,
+                                self.config.attn_logit_softcap,
                             ) {
                                 Ok((attn_out_batch, k_roped, v_roped)) => {
                                     for b in 0..batch_size {

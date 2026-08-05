@@ -437,24 +437,41 @@ impl WeightMatrix {
             } => {
                 let row_bytes = self.block_bytes_per_row(*kind, *cols);
                 let mut out = vec![0f32; *rows];
-                // FERROX_CPU_INT_DOT=1: quantize the shared activation to
-                // int8 once, then every Q8_0 / Q4_0 row dot becomes an
-                // int8×int8 → i32 SIMD reduction (llama.cpp's CPU matmul).
-                // Small activation-quant error vs the f32 dot, so opt-in.
-                if matches!(*kind, QuantKind::Q8_0 | QuantKind::Q4_0) && cpu_int_dot_enabled() {
-                    let act = ferrox_quant::quantize_activations_q8(x);
-                    out.par_iter_mut()
-                        .with_min_len(Self::min_rows_per_task(*rows))
-                        .enumerate()
-                        .for_each(|(r, o)| {
-                            let row = &data.as_slice()[r * row_bytes..(r + 1) * row_bytes];
-                            *o = match *kind {
-                                QuantKind::Q8_0 => ferrox_quant::dot_q8_0_q8(row, &act),
-                                QuantKind::Q4_0 => ferrox_quant::dot_q4_0_q8(row, &act),
-                                _ => unreachable!(),
-                            };
-                        });
-                    return out;
+                // FERROX_CPU_INT_DOT=1: quantize the shared activation once,
+                // then every row dot is int8×int8 → i32 (llama.cpp CPU matmul).
+                // Q8_0/Q4_0 use 32-elem Q8_0 acts; Q4_K uses 256-elem Q8_K.
+                if cpu_int_dot_enabled() {
+                    match *kind {
+                        QuantKind::Q8_0 | QuantKind::Q4_0 if x.len().is_multiple_of(32) => {
+                            let act = ferrox_quant::quantize_activations_q8(x);
+                            out.par_iter_mut()
+                                .with_min_len(Self::min_rows_per_task(*rows))
+                                .enumerate()
+                                .for_each(|(r, o)| {
+                                    let row =
+                                        &data.as_slice()[r * row_bytes..(r + 1) * row_bytes];
+                                    *o = match *kind {
+                                        QuantKind::Q8_0 => ferrox_quant::dot_q8_0_q8(row, &act),
+                                        QuantKind::Q4_0 => ferrox_quant::dot_q4_0_q8(row, &act),
+                                        _ => unreachable!(),
+                                    };
+                                });
+                            return out;
+                        }
+                        QuantKind::Q4K if x.len().is_multiple_of(256) => {
+                            let act = ferrox_quant::quantize_activations_q8_k(x);
+                            out.par_iter_mut()
+                                .with_min_len(Self::min_rows_per_task(*rows))
+                                .enumerate()
+                                .for_each(|(r, o)| {
+                                    let row =
+                                        &data.as_slice()[r * row_bytes..(r + 1) * row_bytes];
+                                    *o = ferrox_quant::dot_q4_k_q8(row, &act);
+                                });
+                            return out;
+                        }
+                        _ => {}
+                    }
                 }
                 out.par_iter_mut()
                     .with_min_len(Self::min_rows_per_task(*rows))

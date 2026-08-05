@@ -555,6 +555,54 @@ impl Q8Activations {
     }
 }
 
+/// ggml `block_q8_K` activations for K-quant int-dot (`Q4_K`/`Q5_K`/`Q6_K`).
+/// Super-blocks of 256 elements with 16-wide `bsums` for the min term.
+#[derive(Clone, Debug)]
+pub struct Q8KActivations {
+    pub q: Vec<i8>,
+    pub d: Vec<f32>,
+    /// Per 16-wide group sums of `q`, `n_blocks * 16` long.
+    pub bsums: Vec<i16>,
+}
+
+impl Q8KActivations {
+    pub fn n_blocks(&self) -> usize {
+        self.d.len()
+    }
+}
+
+/// Quantize activations to ggml `Q8_K` (256-elem super-blocks). Positive
+/// scale convention (`d = amax/127`) matching our `Q8_0` path; `bsums`
+/// enable the Q4_K min correction without re-scanning `q`.
+pub fn quantize_activations_q8_k(x: &[f32]) -> Q8KActivations {
+    debug_assert_eq!(x.len() % Q4_K_BLOCK_ELEMS, 0);
+    let n_blocks = x.len() / Q4_K_BLOCK_ELEMS;
+    let mut q = vec![0i8; n_blocks * Q4_K_BLOCK_ELEMS];
+    let mut d = vec![0f32; n_blocks];
+    let mut bsums = vec![0i16; n_blocks * 16];
+    for (b, chunk) in x.chunks_exact(Q4_K_BLOCK_ELEMS).enumerate() {
+        let amax = chunk.iter().fold(0f32, |m, &v| m.max(v.abs()));
+        let scale = amax / 127.0;
+        let inv = if scale > 0.0 { 1.0 / scale } else { 0.0 };
+        d[b] = scale;
+        let base = b * Q4_K_BLOCK_ELEMS;
+        for (i, &v) in chunk.iter().enumerate() {
+            let qi = (v * inv).round();
+            q[base + i] = qi.clamp(-127.0, 127.0) as i8;
+        }
+        let bsum_base = b * 16;
+        for g in 0..16 {
+            let mut s = 0i32;
+            let off = base + g * 16;
+            for i in 0..16 {
+                s += q[off + i] as i32;
+            }
+            bsums[bsum_base + g] = s as i16;
+        }
+    }
+    Q8KActivations { q, d, bsums }
+}
+
 /// Quantize an activation row to [`Q8Activations`] (32-element blocks,
 /// ggml `quantize_row_q8_0` rounding: `d = amax/127`, `q = round(x/d)`).
 /// `x.len()` must be a multiple of 32.
@@ -591,6 +639,9 @@ pub fn dot_q8_0_q8(row_bytes: &[u8], act: &Q8Activations) -> f32 {
     }
     #[cfg(target_arch = "aarch64")]
     {
+        if std::arch::is_aarch64_feature_detected!("dotprod") {
+            return unsafe { simd_aarch64::dot_q8_0_q8_neon_sdot(row_bytes, act) };
+        }
         if std::arch::is_aarch64_feature_detected!("neon") {
             return unsafe { simd_aarch64::dot_q8_0_q8_neon(row_bytes, act) };
         }
@@ -629,6 +680,9 @@ pub fn dot_q4_0_q8(row_bytes: &[u8], act: &Q8Activations) -> f32 {
     }
     #[cfg(target_arch = "aarch64")]
     {
+        if std::arch::is_aarch64_feature_detected!("dotprod") {
+            return unsafe { simd_aarch64::dot_q4_0_q8_neon_sdot(row_bytes, act) };
+        }
         if std::arch::is_aarch64_feature_detected!("neon") {
             return unsafe { simd_aarch64::dot_q4_0_q8_neon(row_bytes, act) };
         }
@@ -657,16 +711,81 @@ pub fn dot_q4_0_q8_scalar(row_bytes: &[u8], act: &Q8Activations) -> f32 {
     acc
 }
 
+/// Integer `vec_dot` of a Q4_K weight row against [`Q8KActivations`]
+/// (llama.cpp `ggml_vec_dot_q4_K_q8_K`). Opt-in via `FERROX_CPU_INT_DOT`.
+pub fn dot_q4_k_q8(row_bytes: &[u8], act: &Q8KActivations) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") {
+            return unsafe { simd_x86::dot_q4_k_q8_avx2(row_bytes, act) };
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        if std::arch::is_aarch64_feature_detected!("dotprod") {
+            return unsafe { simd_aarch64::dot_q4_k_q8_neon_sdot(row_bytes, act) };
+        }
+        if std::arch::is_aarch64_feature_detected!("neon") {
+            return unsafe { simd_aarch64::dot_q4_k_q8_neon(row_bytes, act) };
+        }
+    }
+    dot_q4_k_q8_scalar(row_bytes, act)
+}
+
+pub fn dot_q4_k_q8_scalar(row_bytes: &[u8], act: &Q8KActivations) -> f32 {
+    debug_assert_eq!(row_bytes.len() % Q4_K_BLOCK_BYTES, 0);
+    let n_blocks = row_bytes.len() / Q4_K_BLOCK_BYTES;
+    debug_assert_eq!(n_blocks, act.n_blocks());
+    let mut acc = 0f32;
+    for (b, block) in row_bytes.chunks_exact(Q4_K_BLOCK_BYTES).enumerate() {
+        let d = f16::from_le_bytes([block[0], block[1]]).to_f32();
+        let dmin = f16::from_le_bytes([block[2], block[3]]).to_f32();
+        let scales: [u8; Q4_K_SCALE_BYTES] = block[4..16].try_into().unwrap();
+        let qs = &block[16..144];
+        let da = act.d[b];
+        let q8 = &act.q[b * Q4_K_BLOCK_ELEMS..(b + 1) * Q4_K_BLOCK_ELEMS];
+        let bsums = &act.bsums[b * 16..(b + 1) * 16];
+
+        let mut sum_min = 0i32;
+        for i in 0..8 {
+            let (_, m) = q4_k_scale_min(i, &scales);
+            sum_min += m as i32 * (bsums[2 * i] as i32 + bsums[2 * i + 1] as i32);
+        }
+        acc -= dmin * da * sum_min as f32;
+
+        let mut q_off = 0usize;
+        let mut base = 0usize;
+        let mut is = 0usize;
+        for _ in 0..4 {
+            let (sc1, _) = q4_k_scale_min(is, &scales);
+            let (sc2, _) = q4_k_scale_min(is + 1, &scales);
+            let mut isum1 = 0i32;
+            let mut isum2 = 0i32;
+            for l in 0..32 {
+                isum1 += (qs[q_off + l] & 0x0F) as i32 * q8[base + l] as i32;
+            }
+            for l in 0..32 {
+                isum2 += (qs[q_off + l] >> 4) as i32 * q8[base + 32 + l] as i32;
+            }
+            acc += d * da * (sc1 as f32 * isum1 as f32 + sc2 as f32 * isum2 as f32);
+            q_off += 32;
+            base += 64;
+            is += 2;
+        }
+    }
+    acc
+}
+
 #[cfg(target_arch = "x86_64")]
 mod simd_x86 {
     use super::{
         e8m0_scale, q3_k_unpack_scales, q4_k_scale_min, q5_fifth_bits, Q8Activations,
-        IQ4_NL_BLOCK_BYTES, IQ4_NL_BLOCK_ELEMS, IQ4_XS_BLOCK_BYTES, KVALUES_IQ4NL,
+        Q8KActivations, IQ4_NL_BLOCK_BYTES, IQ4_NL_BLOCK_ELEMS, IQ4_XS_BLOCK_BYTES, KVALUES_IQ4NL,
         MXFP4_GROUP_SIZE, Q2_K_BLOCK_BYTES, Q2_K_SCALE_BYTES, Q3_K_BLOCK_BYTES, Q3_K_SCALE_BYTES,
         Q4_0_BLOCK_BYTES, Q4_0_BLOCK_ELEMS, Q4_1_BLOCK_BYTES, Q4_1_BLOCK_ELEMS, Q4_K_BLOCK_BYTES,
-        Q4_K_SCALE_BYTES, Q5_0_BLOCK_BYTES, Q5_0_BLOCK_ELEMS, Q5_1_BLOCK_BYTES, Q5_1_BLOCK_ELEMS,
-        Q5_K_BLOCK_BYTES, Q6_K_BLOCK_BYTES, Q6_K_BLOCK_ELEMS, Q8_0_BLOCK_BYTES, Q8_0_BLOCK_ELEMS,
-        Q8_1_BLOCK_BYTES, Q8_1_BLOCK_ELEMS,
+        Q4_K_BLOCK_ELEMS, Q4_K_SCALE_BYTES, Q5_0_BLOCK_BYTES, Q5_0_BLOCK_ELEMS, Q5_1_BLOCK_BYTES,
+        Q5_1_BLOCK_ELEMS, Q5_K_BLOCK_BYTES, Q6_K_BLOCK_BYTES, Q6_K_BLOCK_ELEMS, Q8_0_BLOCK_BYTES,
+        Q8_0_BLOCK_ELEMS, Q8_1_BLOCK_BYTES, Q8_1_BLOCK_ELEMS,
     };
     use half::f16;
     use std::arch::x86_64::*;
@@ -773,6 +892,66 @@ mod simd_x86 {
             acc += dw * act.d[b] * isum as f32;
         }
         acc
+    }
+
+    /// AVX2 Q4_K × Q8_K int-dot. Matches [`super::dot_q4_k_q8_scalar`].
+    #[target_feature(enable = "avx2")]
+    pub unsafe fn dot_q4_k_q8_avx2(row_bytes: &[u8], act: &Q8KActivations) -> f32 {
+        debug_assert_eq!(row_bytes.len() % Q4_K_BLOCK_BYTES, 0);
+        debug_assert_eq!(row_bytes.len() / Q4_K_BLOCK_BYTES, act.n_blocks());
+        let low_mask = _mm256_set1_epi8(0x0F_u8 as i8);
+        let mut acc = 0f32;
+        for (b, block) in row_bytes.chunks_exact(Q4_K_BLOCK_BYTES).enumerate() {
+            let d = f16::from_le_bytes([block[0], block[1]]).to_f32();
+            let dmin = f16::from_le_bytes([block[2], block[3]]).to_f32();
+            let scales: [u8; Q4_K_SCALE_BYTES] = block[4..16].try_into().unwrap();
+            let qs = &block[16..144];
+            let da = act.d[b];
+            let q8 = act.q.as_ptr().add(b * Q4_K_BLOCK_ELEMS);
+            let bsums = &act.bsums[b * 16..(b + 1) * 16];
+
+            let mut sum_min = 0i32;
+            for i in 0..8 {
+                let (_, m) = q4_k_scale_min(i, &scales);
+                sum_min += m as i32 * (bsums[2 * i] as i32 + bsums[2 * i + 1] as i32);
+            }
+            acc -= dmin * da * sum_min as f32;
+
+            let mut q_off = 0usize;
+            let mut base = 0usize;
+            let mut is = 0usize;
+            for _ in 0..4 {
+                let (sc1, _) = q4_k_scale_min(is, &scales);
+                let (sc2, _) = q4_k_scale_min(is + 1, &scales);
+                let packed = _mm256_loadu_si256(qs.as_ptr().add(q_off) as *const __m256i);
+                let lo = _mm256_and_si256(packed, low_mask);
+                let hi = _mm256_and_si256(_mm256_srli_epi16(packed, 4), low_mask);
+                let a0 = _mm256_loadu_si256(q8.add(base) as *const __m256i);
+                let a1 = _mm256_loadu_si256(q8.add(base + 32) as *const __m256i);
+                let isum1 = madd_i8_avx2(lo, a0);
+                let isum2 = madd_i8_avx2(hi, a1);
+                acc += d * da * (sc1 as f32 * isum1 as f32 + sc2 as f32 * isum2 as f32);
+                q_off += 32;
+                base += 64;
+                is += 2;
+            }
+        }
+        acc
+    }
+
+    #[target_feature(enable = "avx2")]
+    unsafe fn madd_i8_avx2(w: __m256i, a: __m256i) -> i32 {
+        let w_lo = _mm256_cvtepi8_epi16(_mm256_castsi256_si128(w));
+        let w_hi = _mm256_cvtepi8_epi16(_mm256_extracti128_si256(w, 1));
+        let a_lo = _mm256_cvtepi8_epi16(_mm256_castsi256_si128(a));
+        let a_hi = _mm256_cvtepi8_epi16(_mm256_extracti128_si256(a, 1));
+        let prod = _mm256_add_epi32(_mm256_madd_epi16(w_lo, a_lo), _mm256_madd_epi16(w_hi, a_hi));
+        let hi128 = _mm256_extracti128_si256(prod, 1);
+        let lo128 = _mm256_castsi256_si128(prod);
+        let mut sum128 = _mm_add_epi32(lo128, hi128);
+        sum128 = _mm_add_epi32(sum128, _mm_shuffle_epi32(sum128, 0b01_00_11_10));
+        sum128 = _mm_add_epi32(sum128, _mm_shuffle_epi32(sum128, 0b00_00_00_01));
+        _mm_cvtsi128_si32(sum128)
     }
 
     /// AVX2+FMA fused Q4_0 dot product. Each block packs 32 4-bit
@@ -1783,12 +1962,12 @@ mod simd_x86 {
 mod simd_aarch64 {
     use super::{
         e8m0_scale, q3_k_unpack_scales, q4_k_scale_min, q5_fifth_bits, Q8Activations,
-        IQ4_NL_BLOCK_BYTES, IQ4_NL_BLOCK_ELEMS, IQ4_XS_BLOCK_BYTES, KVALUES_IQ4NL,
+        Q8KActivations, IQ4_NL_BLOCK_BYTES, IQ4_NL_BLOCK_ELEMS, IQ4_XS_BLOCK_BYTES, KVALUES_IQ4NL,
         MXFP4_GROUP_SIZE, Q2_K_BLOCK_BYTES, Q2_K_SCALE_BYTES, Q3_K_BLOCK_BYTES, Q3_K_SCALE_BYTES,
         Q4_0_BLOCK_BYTES, Q4_0_BLOCK_ELEMS, Q4_1_BLOCK_BYTES, Q4_1_BLOCK_ELEMS, Q4_K_BLOCK_BYTES,
-        Q4_K_SCALE_BYTES, Q5_0_BLOCK_BYTES, Q5_0_BLOCK_ELEMS, Q5_1_BLOCK_BYTES, Q5_1_BLOCK_ELEMS,
-        Q5_K_BLOCK_BYTES, Q6_K_BLOCK_BYTES, Q6_K_BLOCK_ELEMS, Q8_0_BLOCK_BYTES, Q8_0_BLOCK_ELEMS,
-        Q8_1_BLOCK_BYTES, Q8_1_BLOCK_ELEMS,
+        Q4_K_BLOCK_ELEMS, Q4_K_SCALE_BYTES, Q5_0_BLOCK_BYTES, Q5_0_BLOCK_ELEMS, Q5_1_BLOCK_BYTES,
+        Q5_1_BLOCK_ELEMS, Q5_K_BLOCK_BYTES, Q6_K_BLOCK_BYTES, Q6_K_BLOCK_ELEMS, Q8_0_BLOCK_BYTES,
+        Q8_0_BLOCK_ELEMS, Q8_1_BLOCK_BYTES, Q8_1_BLOCK_ELEMS,
     };
     use half::f16;
     use std::arch::aarch64::*;
@@ -1840,13 +2019,8 @@ mod simd_aarch64 {
         acc
     }
 
-    /// NEON integer Q8_0 × Q8 dot. `vdotq_s32` (SDOT) is still nightly-only
-    /// in `core::arch`, so this stays on stable-safe widening multiplies:
-    /// `vmull_s8` gives int8×int8 → int16 products (max 127² = 16129, well
-    /// within i16), and `vpadalq_s16` pairwise-accumulates them into an
-    /// i32 lane vector; `vaddvq_s32` reduces, then scale by `d_w * d_a`.
-    /// Matches [`super::dot_q8_0_q8_scalar`] exactly. Safety: caller
-    /// checked `is_aarch64_feature_detected!("neon")`.
+    /// NEON integer Q8_0 × Q8 dot via widening multiply (no SDOT).
+    /// Prefer [`dot_q8_0_q8_neon_sdot`] when `dotprod` is available.
     #[target_feature(enable = "neon")]
     pub unsafe fn dot_q8_0_q8_neon(row_bytes: &[u8], act: &Q8Activations) -> f32 {
         debug_assert_eq!(row_bytes.len() % Q8_0_BLOCK_BYTES, 0);
@@ -1863,6 +2037,39 @@ mod simd_aarch64 {
                 let prod_hi = vmull_s8(vget_high_s8(w), vget_high_s8(a));
                 isum = vpadalq_s16(isum, prod_lo);
                 isum = vpadalq_s16(isum, prod_hi);
+            }
+            acc += dw * act.d[b] * vaddvq_s32(isum) as f32;
+        }
+        acc
+    }
+
+    /// Stable SDOT via inline asm (`vdotq_s32` is nightly-only).
+    #[target_feature(enable = "neon,dotprod")]
+    unsafe fn neon_sdot(mut acc: int32x4_t, a: int8x16_t, b: int8x16_t) -> int32x4_t {
+        std::arch::asm!(
+            "sdot {acc:v}.4s, {a:v}.16b, {b:v}.16b",
+            acc = inout(vreg) acc,
+            a = in(vreg) a,
+            b = in(vreg) b,
+            options(pure, nomem, nostack),
+        );
+        acc
+    }
+
+    /// NEON Q8_0 × Q8 int-dot with SDOT (Apple Silicon / ARMv8.2+).
+    #[target_feature(enable = "neon,dotprod")]
+    pub unsafe fn dot_q8_0_q8_neon_sdot(row_bytes: &[u8], act: &Q8Activations) -> f32 {
+        debug_assert_eq!(row_bytes.len() % Q8_0_BLOCK_BYTES, 0);
+        debug_assert_eq!(row_bytes.len() / Q8_0_BLOCK_BYTES, act.n_blocks());
+        let mut acc = 0f32;
+        for (b, block) in row_bytes.chunks_exact(Q8_0_BLOCK_BYTES).enumerate() {
+            let dw = f16::from_le_bytes([block[0], block[1]]).to_f32();
+            let base = b * Q8_0_BLOCK_ELEMS;
+            let mut isum = vdupq_n_s32(0);
+            for g in 0..2 {
+                let w = vld1q_s8(block.as_ptr().add(2 + g * 16) as *const i8);
+                let a = vld1q_s8(act.q.as_ptr().add(base + g * 16));
+                isum = neon_sdot(isum, w, a);
             }
             acc += dw * act.d[b] * vaddvq_s32(isum) as f32;
         }
@@ -1898,6 +2105,142 @@ mod simd_aarch64 {
             isum = vpadalq_s16(isum, p1_lo);
             isum = vpadalq_s16(isum, p1_hi);
             acc += dw * act.d[b] * vaddvq_s32(isum) as f32;
+        }
+        acc
+    }
+
+    /// NEON Q4_0 × Q8 with SDOT.
+    #[target_feature(enable = "neon,dotprod")]
+    pub unsafe fn dot_q4_0_q8_neon_sdot(row_bytes: &[u8], act: &Q8Activations) -> f32 {
+        debug_assert_eq!(row_bytes.len() % Q4_0_BLOCK_BYTES, 0);
+        debug_assert_eq!(row_bytes.len() / Q4_0_BLOCK_BYTES, act.n_blocks());
+        let bias = vdupq_n_s8(8);
+        let low_mask = vdupq_n_u8(0x0F);
+        let mut acc = 0f32;
+        for (b, block) in row_bytes.chunks_exact(Q4_0_BLOCK_BYTES).enumerate() {
+            let dw = f16::from_le_bytes([block[0], block[1]]).to_f32();
+            let base = b * Q4_0_BLOCK_ELEMS;
+            let nibbles = vld1q_u8(block.as_ptr().add(2));
+            let lo = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(nibbles, low_mask)), bias);
+            let hi = vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8(nibbles, 4)), bias);
+            let a0 = vld1q_s8(act.q.as_ptr().add(base));
+            let a1 = vld1q_s8(act.q.as_ptr().add(base + 16));
+            let mut isum = vdupq_n_s32(0);
+            isum = neon_sdot(isum, lo, a0);
+            isum = neon_sdot(isum, hi, a1);
+            acc += dw * act.d[b] * vaddvq_s32(isum) as f32;
+        }
+        acc
+    }
+
+    #[target_feature(enable = "neon")]
+    unsafe fn neon_i8_dot_widen(mut isum: int32x4_t, w: int8x16_t, a: int8x16_t) -> int32x4_t {
+        let prod_lo = vmull_s8(vget_low_s8(w), vget_low_s8(a));
+        let prod_hi = vmull_s8(vget_high_s8(w), vget_high_s8(a));
+        isum = vpadalq_s16(isum, prod_lo);
+        vpadalq_s16(isum, prod_hi)
+    }
+
+    /// NEON Q4_K × Q8_K int-dot (widening path).
+    #[target_feature(enable = "neon")]
+    pub unsafe fn dot_q4_k_q8_neon(row_bytes: &[u8], act: &Q8KActivations) -> f32 {
+        debug_assert_eq!(row_bytes.len() % Q4_K_BLOCK_BYTES, 0);
+        debug_assert_eq!(row_bytes.len() / Q4_K_BLOCK_BYTES, act.n_blocks());
+        let low_mask = vdupq_n_u8(0x0F);
+        let mut acc = 0f32;
+        for (b, block) in row_bytes.chunks_exact(Q4_K_BLOCK_BYTES).enumerate() {
+            let d = f16::from_le_bytes([block[0], block[1]]).to_f32();
+            let dmin = f16::from_le_bytes([block[2], block[3]]).to_f32();
+            let scales: [u8; Q4_K_SCALE_BYTES] = block[4..16].try_into().unwrap();
+            let qs = &block[16..144];
+            let da = act.d[b];
+            let q8 = act.q.as_ptr().add(b * Q4_K_BLOCK_ELEMS);
+            let bsums = &act.bsums[b * 16..(b + 1) * 16];
+
+            let mut sum_min = 0i32;
+            for i in 0..8 {
+                let (_, m) = q4_k_scale_min(i, &scales);
+                sum_min += m as i32 * (bsums[2 * i] as i32 + bsums[2 * i + 1] as i32);
+            }
+            acc -= dmin * da * sum_min as f32;
+
+            let mut q_off = 0usize;
+            let mut base = 0usize;
+            let mut is = 0usize;
+            for _ in 0..4 {
+                let (sc1, _) = q4_k_scale_min(is, &scales);
+                let (sc2, _) = q4_k_scale_min(is + 1, &scales);
+                let mut isum1 = vdupq_n_s32(0);
+                let mut isum2 = vdupq_n_s32(0);
+                for g in 0..2 {
+                    let packed = vld1q_u8(qs.as_ptr().add(q_off + g * 16));
+                    let lo = vreinterpretq_s8_u8(vandq_u8(packed, low_mask));
+                    let hi = vreinterpretq_s8_u8(vshrq_n_u8(packed, 4));
+                    let a0 = vld1q_s8(q8.add(base + g * 16));
+                    let a1 = vld1q_s8(q8.add(base + 32 + g * 16));
+                    isum1 = neon_i8_dot_widen(isum1, lo, a0);
+                    isum2 = neon_i8_dot_widen(isum2, hi, a1);
+                }
+                acc += d
+                    * da
+                    * (sc1 as f32 * vaddvq_s32(isum1) as f32
+                        + sc2 as f32 * vaddvq_s32(isum2) as f32);
+                q_off += 32;
+                base += 64;
+                is += 2;
+            }
+        }
+        acc
+    }
+
+    /// NEON Q4_K × Q8_K with SDOT.
+    #[target_feature(enable = "neon,dotprod")]
+    pub unsafe fn dot_q4_k_q8_neon_sdot(row_bytes: &[u8], act: &Q8KActivations) -> f32 {
+        debug_assert_eq!(row_bytes.len() % Q4_K_BLOCK_BYTES, 0);
+        debug_assert_eq!(row_bytes.len() / Q4_K_BLOCK_BYTES, act.n_blocks());
+        let low_mask = vdupq_n_u8(0x0F);
+        let mut acc = 0f32;
+        for (b, block) in row_bytes.chunks_exact(Q4_K_BLOCK_BYTES).enumerate() {
+            let d = f16::from_le_bytes([block[0], block[1]]).to_f32();
+            let dmin = f16::from_le_bytes([block[2], block[3]]).to_f32();
+            let scales: [u8; Q4_K_SCALE_BYTES] = block[4..16].try_into().unwrap();
+            let qs = &block[16..144];
+            let da = act.d[b];
+            let q8 = act.q.as_ptr().add(b * Q4_K_BLOCK_ELEMS);
+            let bsums = &act.bsums[b * 16..(b + 1) * 16];
+
+            let mut sum_min = 0i32;
+            for i in 0..8 {
+                let (_, m) = q4_k_scale_min(i, &scales);
+                sum_min += m as i32 * (bsums[2 * i] as i32 + bsums[2 * i + 1] as i32);
+            }
+            acc -= dmin * da * sum_min as f32;
+
+            let mut q_off = 0usize;
+            let mut base = 0usize;
+            let mut is = 0usize;
+            for _ in 0..4 {
+                let (sc1, _) = q4_k_scale_min(is, &scales);
+                let (sc2, _) = q4_k_scale_min(is + 1, &scales);
+                let mut isum1 = vdupq_n_s32(0);
+                let mut isum2 = vdupq_n_s32(0);
+                for g in 0..2 {
+                    let packed = vld1q_u8(qs.as_ptr().add(q_off + g * 16));
+                    let lo = vreinterpretq_s8_u8(vandq_u8(packed, low_mask));
+                    let hi = vreinterpretq_s8_u8(vshrq_n_u8(packed, 4));
+                    let a0 = vld1q_s8(q8.add(base + g * 16));
+                    let a1 = vld1q_s8(q8.add(base + 32 + g * 16));
+                    isum1 = neon_sdot(isum1, lo, a0);
+                    isum2 = neon_sdot(isum2, hi, a1);
+                }
+                acc += d
+                    * da
+                    * (sc1 as f32 * vaddvq_s32(isum1) as f32
+                        + sc2 as f32 * vaddvq_s32(isum2) as f32);
+                q_off += 32;
+                base += 64;
+                is += 2;
+            }
         }
         acc
     }
@@ -3993,6 +4336,41 @@ mod tests {
         let act = quantize_activations_q8(&[0f32; 32]);
         assert_eq!(act.d[0], 0.0);
         assert!(act.q.iter().all(|&q| q == 0));
+    }
+
+    #[test]
+    fn dot_q4_k_q8_matches_scalar_and_tracks_float_dot() {
+        let n_blocks = 3;
+        let cols = n_blocks * Q4_K_BLOCK_ELEMS;
+        let x: Vec<f32> = (0..cols)
+            .map(|i| ((i as f32) * 0.017 - 2.1).sin() * 1.8)
+            .collect();
+        // Build a synthetic Q4_K row via quantize then re-pack? Use dequant
+        // round-trip: quantize floats with a simple pattern into Q4_K by
+        // packing known nibbles (same as other K-quant tests).
+        let mut weights = Vec::with_capacity(n_blocks * Q4_K_BLOCK_BYTES);
+        for b in 0..n_blocks {
+            weights.extend_from_slice(&f16::from_f32(0.05 + b as f32 * 0.01).to_le_bytes());
+            weights.extend_from_slice(&f16::from_f32(0.01 + b as f32 * 0.002).to_le_bytes());
+            // 12 scale bytes: simple low-6-bit pattern
+            for i in 0..12u8 {
+                weights.push(20 + i.wrapping_mul(3));
+            }
+            for i in 0..128u8 {
+                weights.push(i.wrapping_mul(17).wrapping_add(b as u8));
+            }
+        }
+        let act = quantize_activations_q8_k(&x);
+        let dispatched = dot_q4_k_q8(&weights, &act);
+        let scalar = dot_q4_k_q8_scalar(&weights, &act);
+        assert_eq!(dispatched, scalar, "dispatch must match scalar");
+        let float_dot = dot_q4_k_f32(&weights, &x);
+        let err = (dispatched - float_dot).abs();
+        let scale = float_dot.abs().max(1.0);
+        assert!(
+            err / scale < 0.05,
+            "int-dot vs f32 relative err {err}/{scale} too large (int={dispatched} f32={float_dot})"
+        );
     }
 
     #[test]

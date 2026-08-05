@@ -650,18 +650,17 @@ kernel void q4_0_moe_matvec_id(
     constant uint& expert_stride [[buffer(8)]],
     constant uint& n_tokens [[buffer(9)]],
     constant uint& x_stride [[buffer(10)]],
-    uint tgpig [[threadgroup_position_in_grid]],
+    uint3 tgpig [[threadgroup_position_in_grid]],
     uint lane [[thread_index_in_simdgroup]],
     uint sg [[simdgroup_index_in_threadgroup]]
 ) {
     constexpr uint NR = 4u;
     constexpr uint NSG = 2u;
-    constexpr uint ROWS_PER_TG = NR * NSG;
-    const uint row_groups = (n_rows + ROWS_PER_TG - 1u) / ROWS_PER_TG;
-    const uint n_slots = n_tokens * top_k;
-    const uint slot = tgpig / row_groups;
-    const uint group = tgpig - slot * row_groups;
+    // llama.cpp grid: (row_groups, 1, n_slots) × (32, NSG, 1)
+    const uint group = tgpig.x;
+    const uint slot = tgpig.z;
     const uint first_row = (group * NSG + sg) * NR;
+    const uint n_slots = n_tokens * top_k;
     if (slot >= n_slots) return;
     const uint token = slot / top_k;
     const uint eid = uint(ids[slot]);
@@ -762,18 +761,16 @@ kernel void q4_0_moe_down_id(
     constant uint& top_k [[buffer(8)]],
     constant uint& expert_stride [[buffer(9)]],
     constant uint& n_tokens [[buffer(10)]],
-    uint tgpig [[threadgroup_position_in_grid]],
+    uint3 tgpig [[threadgroup_position_in_grid]],
     uint lane [[thread_index_in_simdgroup]],
     uint sg [[simdgroup_index_in_threadgroup]]
 ) {
     constexpr uint NR = 4u;
     constexpr uint NSG = 2u;
-    constexpr uint ROWS_PER_TG = NR * NSG;
-    const uint row_groups = (hidden_rows + ROWS_PER_TG - 1u) / ROWS_PER_TG;
-    const uint n_slots = n_tokens * top_k;
-    const uint slot = tgpig / row_groups;
-    const uint group = tgpig - slot * row_groups;
+    const uint group = tgpig.x;
+    const uint slot = tgpig.z;
     const uint first_row = (group * NSG + sg) * NR;
+    const uint n_slots = n_tokens * top_k;
     if (slot >= n_slots) return;
     const uint eid = uint(ids[slot]);
     device const uchar* wd = down_all + (size_t)eid * expert_stride;
@@ -2877,7 +2874,6 @@ fn encode_q4_0_moe_matvec_id(
     let pipe = ensure_pipeline(device, Q4_0_MOE_TOPK_KERNEL_SRC, "q4_0_moe_matvec_id")?;
     encoder.setComputePipelineState(&pipe.0);
     const ROWS_PER_TG: usize = 8;
-    let tg = 64usize;
     unsafe {
         encoder.setBuffer_offset_atIndex(Some(&w.buffer), w.weight_offset, 0);
         encoder.setBuffer_offset_atIndex(Some(x_buf), 0, 1);
@@ -2908,13 +2904,14 @@ fn encode_q4_0_moe_matvec_id(
     }
     encoder.dispatchThreadgroups_threadsPerThreadgroup(
         MTLSize {
-            width: n_slots * (n_rows as usize).div_ceil(ROWS_PER_TG),
+            // llama.cpp: (row_groups, 1, n_slots) × threads (32, NSG, 1)
+            width: (n_rows as usize).div_ceil(ROWS_PER_TG),
             height: 1,
-            depth: 1,
+            depth: n_slots,
         },
         MTLSize {
-            width: tg,
-            height: 1,
+            width: 32,
+            height: 2, // NSG
             depth: 1,
         },
     );
@@ -2946,7 +2943,6 @@ pub(crate) fn encode_q4_0_moe_id(
     let gate_w = resident_weight_buffer(device, packed.gate)?;
     let up_w = resident_weight_buffer(device, packed.up)?;
     let down_w = resident_weight_buffer(device, packed.down)?;
-    let tg = 64usize;
     const ROWS_PER_TG: usize = 8;
     let input_blocks = packed.gate_row_bytes / 18;
     let down_blocks = packed.down_row_bytes / 18;
@@ -3048,13 +3044,13 @@ pub(crate) fn encode_q4_0_moe_id(
     }
     encoder.dispatchThreadgroups_threadsPerThreadgroup(
         MTLSize {
-            width: n_slots * packed.hidden_rows.div_ceil(ROWS_PER_TG),
+            width: packed.hidden_rows.div_ceil(ROWS_PER_TG),
             height: 1,
-            depth: 1,
+            depth: n_slots,
         },
         MTLSize {
-            width: tg,
-            height: 1,
+            width: 32,
+            height: 2,
             depth: 1,
         },
     );

@@ -35,7 +35,7 @@ Keep off (regressions): legacy GQA NSG=4, sequential GREEDY argmax, float4 elem,
 | Mixtral-8x7B-Instruct Q4_K_M | cpu | — | — | — | — | no pin | — |
 | Llama-3.2-1B-Instruct IQ4_XS | metal | **154.36** ±0.2 | **152.26** ±0.4 | ⚪ **1.00×** | ⚪ parity | ok | [`iq4_xs_metal`](receipts/pins/iq4_xs_metal.json) |
 | Gemma-2-2B-IT Q4_K_M | metal | **57.71** ±1.4 | **64.07** ±0.9 | 🔴 **~1.11×** | 🔴 **llama** | ok | [`gemma2_2b_q4km_metal`](receipts/pins/gemma2_2b_q4km_metal.json) |
-| Gemma-2-2B-IT Q4_K_M | cpu | **8.40** ±0.4 | **12.94** ±1.2 (−ngl 0) | 🔴 **~1.54×** | 🔴 **llama** | ok | [`gemma2_2b_q4km_cpu`](receipts/pins/gemma2_2b_q4km_cpu.json) |
+| Gemma-2-2B-IT Q4_K_M | cpu | **15.27** ±0.2 | **14.76** ±0.8 (−ngl 0) | ⚪ **~0.97×** | ⚪ parity | ok | [`gemma2_2b_q4km_cpu`](receipts/pins/gemma2_2b_q4km_cpu.json) |
 | SmolLM2-135M-Instruct Q8_0 | metal | **290.22** ±0.9 | **241.18** ±0.8 | 🟢 **~0.83×** | 🟢 **ferrox** | ok | [`smollm2_135m_q8_metal`](receipts/pins/smollm2_135m_q8_metal.json) |
 | SmolLM2-135M-Instruct Q8_0 | cpu | **55.84** ±0.7 | **43.48** ±5.9 (−ngl 0) | 🟢 **~0.78×** | 🟢 **ferrox** | ok | [`smollm2_135m_q8_cpu`](receipts/pins/smollm2_135m_q8_cpu.json) |
 | Qwen2.5-0.5B-Instruct Q8_0 | metal | **196.10** ±0.2 | **132.80** ±1.2 | 🟢 **~0.68×** | 🟢 **ferrox** | ok | [`qwen25_05b_q8_metal`](receipts/pins/qwen25_05b_q8_metal.json) |

@@ -10,7 +10,7 @@ What ships today: [`FEATURES.md`](FEATURES.md) · [`MODELS.md`](MODELS.md).
 
 **Performance**
 
-- Close the Metal MoE gap (`mul_mm_id` prefill, tighter `mul_mv_id`, multi-CB)
+- Close the Metal MoE gap: fuse/reorder to cut barrier stages (not more `mul_mv_id` tweaks); `mul_mm_id` prefill
 - Improve Metal prefill `prompt_per_second` vs llama.cpp
 - CUDA fair-chat pins on a GPU host
 

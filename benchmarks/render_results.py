@@ -326,9 +326,9 @@ def main() -> None:
     lines.append(
         "1. Metal fair-chat 8B is ahead (~0.92×); 3B ~parity (~0.97×). Keep "
         "watching `prompt_per_second` vs llama after FA-vec prefill.\n"
-        "2. OLMoE Metal — Concurrent + `MoeMemRanges` + `mul_mv_id` shipped "
-        "(~1.42×). Next: closer `mul_mv_id` / `mul_mm_id` prefill / multi-CB "
-        "(`docs/ROADMAP.md`).\n"
+        "2. OLMoE Metal ~1.37× — root cause is GPU dependency-chain bubbles "
+        "(~13 barrier stages/layer), not `mul_mv_id` FLOPs. Next: fuse/reorder "
+        "ops to shorten the critical path (`docs/ROADMAP.md`).\n"
         "3. CUDA — re-measure on comparable CUDA hardware (no in-tree CUDA pin; "
         "skipped on darwin via `--fit-host`).\n"
         "4. Gemma-4-E2B: both ferrox and Homebrew llama refuse (`gemma4` arch / "

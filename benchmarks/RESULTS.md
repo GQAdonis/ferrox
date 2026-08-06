@@ -23,7 +23,7 @@ Keep off (regressions): legacy GQA NSG=4, sequential GREEDY argmax, float4 elem,
 | TinyLlama-1.1B-Chat-v1.0 Q8_0 | cpu | **40.83** ±0.3 | **46.93** ±0.7 (−ngl 0) | 🔴 **~1.15×** | 🔴 **llama** | ok | [`tinyllama_q8_cpu`](receipts/pins/tinyllama_q8_cpu.json) |
 | Llama-3.2-1B-Instruct Q4_K_M | metal | **137.88** ±5.0 | **136.99** ±0.4 | ⚪ **1.00×** | ⚪ parity | ok | [`llama32_1b_q4km_metal`](receipts/pins/llama32_1b_q4km_metal.json) |
 | OLMoE-1B-7B-0924 Q4_0 | cpu | **32.91** ±0.2 | **45.58** ±1.0 (−ngl 0) | 🔴 **~1.38×** | 🔴 **llama** | ok | [`olmoe_q4_cpu`](receipts/pins/olmoe_q4_cpu.json) |
-| OLMoE-1B-7B-0924 Q4_0 | metal | **108.96** ±2.1 | **150.38** ±0.7 | 🔴 **~1.38×** | 🔴 **llama** | ok | [`olmoe_q4_metal`](receipts/pins/olmoe_q4_metal.json) |
+| OLMoE-1B-7B-0924 Q4_0 | metal | **106.75** ±2.3 | **146.78** ±0.1 | 🔴 **~1.37×** | 🔴 **llama** | ok | [`olmoe_q4_metal`](receipts/pins/olmoe_q4_metal.json) |
 | OLMoE-1B-7B-0924 Q4_0 | cuda | — | — | — | — | no pin | — |
 | Llama-3.1-8B-Instruct Q4_K_M | metal | **28.17** ±0.8 | **25.86** ±1.2 | 🟢 **~0.92×** | 🟢 **ferrox** | ok | [`llama31_8b_q4km_metal`](receipts/pins/llama31_8b_q4km_metal.json) |
 | Llama-3.1-8B-Instruct Q4_K_M | cuda | — | — | — | — | no pin | — |
@@ -61,7 +61,7 @@ Pins that used `llama-cli` or rejected options are omitted.
 |---|---|---|---|---|---|---|---|---|
 | TinyLlama-1.1B-Chat-v1.0 Q8_0 | metal | **117.91** ±1.7 | **109.39** ±0.8 | 🟢 **~0.93×** | **0.827** ±0.020 | **0.448** ±0.048 | 🔴 **~1.85×** | [`tinyllama_q8_metal_cli`](receipts/pins/tinyllama_q8_metal_cli.json) |
 | Llama-3.2-1B-Instruct Q4_K_M | metal | **142.16** ±2.0 | **122.83** ±5.8 | 🟢 **~0.86×** | **0.980** ±0.112 | **1.361** ±0.127 | 🟢 **~0.72×** | [`llama32_1b_q4km_metal_cli`](receipts/pins/llama32_1b_q4km_metal_cli.json) |
-| OLMoE-1B-7B-0924 Q4_0 | metal | **84.20** ±0.8 | **140.48** ±2.0 | 🔴 **~1.67×** | **0.619** ±0.026 | **1.069** ±0.554 | 🟢 **~0.58×** | [`olmoe_q4_metal_cli`](receipts/pins/olmoe_q4_metal_cli.json) |
+| OLMoE-1B-7B-0924 Q4_0 | metal | **107.86** ±1.8 | **158.66** ±2.2 | 🔴 **~1.47×** | **0.613** ±0.050 | **0.925** ±0.024 | 🟢 **~0.66×** | [`olmoe_q4_metal_cli`](receipts/pins/olmoe_q4_metal_cli.json) |
 | Llama-3.1-8B-Instruct Q4_K_M | metal | **28.85** ±0.1 | **28.64** ±0.4 | ⚪ **1.00×** | **2.849** ±0.105 | **1.892** ±1.421 | 🔴 **~1.51×** | [`llama31_8b_q4km_metal_cli`](receipts/pins/llama31_8b_q4km_metal_cli.json) |
 | Llama-3.2-3B-Instruct Q4_K_M | metal | **58.82** ±0.8 | **59.08** ±2.9 | ⚪ **1.00×** | **1.544** ±0.102 | **1.354** ±0.467 | 🔴 **~1.14×** | [`llama32_3b_q4km_metal_cli`](receipts/pins/llama32_3b_q4km_metal_cli.json) |
 | Mistral-7B-Instruct-v0.2 Q4_K_M | metal | **29.92** ±0.7 | **29.01** ±0.7 | ⚪ **~0.97×** | **2.546** ±0.067 | **1.131** ±1.254 | 🔴 **~2.25×** | [`mistral_7b_q4km_metal_cli`](receipts/pins/mistral_7b_q4km_metal_cli.json) |
@@ -78,7 +78,7 @@ Pins that used `llama-cli` or rejected options are omitted.
 ## Open
 
 1. Metal fair-chat 8B is ahead (~0.92×); 3B ~parity (~0.97×). Keep watching `prompt_per_second` vs llama after FA-vec prefill.
-2. OLMoE Metal — Concurrent + `MoeMemRanges` + `mul_mv_id` shipped (~1.42×). Next: closer `mul_mv_id` / `mul_mm_id` prefill / multi-CB (`docs/ROADMAP.md`).
+2. OLMoE Metal ~1.37× — root cause is GPU dependency-chain bubbles (~13 barrier stages/layer), not `mul_mv_id` FLOPs. Next: fuse/reorder ops to shorten the critical path (`docs/ROADMAP.md`).
 3. CUDA — re-measure on comparable CUDA hardware (no in-tree CUDA pin; skipped on darwin via `--fit-host`).
 4. Gemma-4-E2B: both ferrox and Homebrew llama refuse (`gemma4` arch / per-layer+shared-KV+SWA split); suite `expect=refuse`.
 5. CB multi-request tok/s receipt.

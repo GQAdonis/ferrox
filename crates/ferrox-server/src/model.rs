@@ -360,10 +360,12 @@ fn load_gemma4_checkpoint(path: &str, file: &ShardedGguf) -> anyhow::Result<Gemm
         .unwrap_or(arch.as_str())
         .to_string();
     tracing::info!("loading GGUF as Gemma4 engine (arch={arch}, name={name})");
-    let served = load_gemma4_engine_from_path(Path::new(path)).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let served =
+        load_gemma4_engine_from_path(Path::new(path)).map_err(|e| anyhow::anyhow!("{e}"))?;
     let ServedEngine::Gemma4(engine) = served else {
         anyhow::bail!("expected ServedEngine::Gemma4 for architecture {arch}");
     };
+    let engine = *engine;
 
     let tokenizer = tokenizer_from_gguf(file)?;
     let eos_id = file

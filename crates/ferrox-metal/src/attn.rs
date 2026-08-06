@@ -42,11 +42,12 @@ use crate::elem::{
 use crate::embd::{encode_get_rows, EmbdKind};
 use crate::gpu::{
     compute_encoder_concurrent, encode_matvec, encode_matvec_with_offsets, encode_moe_topk_softmax,
-    encode_q4_0_moe_gate_up_id, encode_q4_0_moe_gate_then_up_silu, encode_q4_0_moe_gate_up_silu_fused,
-    encode_q4_0_moe_id, encode_q4_0_moe_id_ex, encode_q4_0_moe_topk, encode_q4_0_mul_mm,
-    ensure_pipeline, memory_barrier_buffers, memory_barrier_resources, resident_f32_buffer,
-    resident_weight_buffer, shared_metal, MatvecLaunch, MetalError, MoeExpertLaunch, MoePackedQ4,
-    ResidentF32Buffer, ResidentWeightBuffer,
+    encode_q4_0_moe_gate_then_up_silu, encode_q4_0_moe_gate_up_id,
+    encode_q4_0_moe_gate_up_silu_fused, encode_q4_0_moe_id, encode_q4_0_moe_id_ex,
+    encode_q4_0_moe_topk, encode_q4_0_mul_mm, ensure_pipeline, memory_barrier_buffers,
+    memory_barrier_resources, resident_f32_buffer, resident_weight_buffer, shared_metal,
+    MatvecLaunch, MetalError, MoeExpertLaunch, MoePackedQ4, ResidentF32Buffer,
+    ResidentWeightBuffer,
 };
 use crate::moe_ranges::MoeMemRanges;
 use objc2::rc::Retained;
@@ -4033,11 +4034,7 @@ fn encode_moe_layer_fused(
     // Q∥K∥V — one Concurrent set (shared src, disjoint dsts).
     {
         let srcs = [scratch.x_attn.as_ref()];
-        let dsts = [
-            scratch.q.as_ref(),
-            scratch.k.as_ref(),
-            scratch.v.as_ref(),
-        ];
+        let dsts = [scratch.q.as_ref(), scratch.k.as_ref(), scratch.v.as_ref()];
         mrs.begin_op(encoder, &srcs, &dsts);
         encode_matvec(encoder, device, &layer.q, q_w, &scratch.x_attn, &scratch.q)?;
         encode_matvec(encoder, device, &layer.k, k_w, &scratch.x_attn, &scratch.k)?;
@@ -4193,7 +4190,9 @@ fn encode_moe_layer_fused(
         mrs.end_op(&srcs, &dsts);
     }
     let fused_gate_up = matches!(
-        std::env::var("FERROX_METAL_MOE_FUSED_GATE_UP").ok().as_deref(),
+        std::env::var("FERROX_METAL_MOE_FUSED_GATE_UP")
+            .ok()
+            .as_deref(),
         Some("1") | Some("true") | Some("on")
     );
     // Default: Concurrent gate∥up (Host B faster than gate→silu×up).
@@ -5773,13 +5772,7 @@ pub fn launch_prefill_attn_o_residual(
         }
     }
     memory_barrier_resources(&encoder, &[o_buf.as_ref()]);
-    encode_vec_add(
-        &encoder,
-        device,
-        &h_buf,
-        &o_buf,
-        (n_q * hidden) as u32,
-    )?;
+    encode_vec_add(&encoder, device, &h_buf, &o_buf, (n_q * hidden) as u32)?;
     encoder.endEncoding();
     cmd_buf.commit();
     cmd_buf.waitUntilCompleted();

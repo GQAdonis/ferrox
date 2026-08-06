@@ -116,7 +116,9 @@ pub enum ServedEngine {
     Kimi(KimiEngine),
     Glm52(Glm52Engine),
     Mla(MlaEngine),
-    Gemma4(Gemma4Engine),
+    // Boxed: the Gemma-4 engine is ~200 bytes larger than any other
+    // variant, so inlining it would pad every `ServedEngine` to its size.
+    Gemma4(Box<Gemma4Engine>),
 }
 
 impl ServedEngine {
@@ -126,7 +128,7 @@ impl ServedEngine {
             Self::Kimi(k) => Engine::vocab_size(k),
             Self::Glm52(g) => Engine::vocab_size(g),
             Self::Mla(m) => Engine::vocab_size(m),
-            Self::Gemma4(g) => Engine::vocab_size(g),
+            Self::Gemma4(g) => Engine::vocab_size(g.as_ref()),
         }
     }
 }
@@ -252,9 +254,9 @@ pub fn load_gemma4_engine_from_path(path: &std::path::Path) -> Result<ServedEngi
             return Err(LoadError::DedicatedArchitectureRequired(a, r));
         }
     }
-    Ok(ServedEngine::Gemma4(gemma4_gguf_loader::load_gemma4_engine(
-        &file,
-    )?))
+    Ok(ServedEngine::Gemma4(Box::new(
+        gemma4_gguf_loader::load_gemma4_engine(&file)?,
+    )))
 }
 
 #[cfg(test)]

@@ -51,6 +51,11 @@ impl Default for SamplingParams {
     }
 }
 
+/// Zeroes out logits a caller wants to forbid, in place, before the
+/// sampler looks at them. Used by JSON-object mode to keep generation
+/// inside the grammar.
+pub type LogitMask<'a> = &'a mut dyn FnMut(&mut [f32]);
+
 /// A small, seedable xorshift64* generator. Not cryptographically
 /// secure -- sampling doesn't need that -- but reproducible given a
 /// seed, which greedy argmax already was for free.
@@ -96,7 +101,7 @@ impl Sampler {
         logits: &[f32],
         params: &SamplingParams,
         history: &[usize],
-        mut mask: Option<&mut dyn FnMut(&mut [f32])>,
+        mut mask: Option<LogitMask<'_>>,
     ) -> usize {
         if params.temperature <= 0.0 && mask.is_none() {
             if logits.len() == 1 {
@@ -110,7 +115,7 @@ impl Sampler {
         let mut scores: Vec<f32> = logits.to_vec();
         apply_history_penalties(&mut scores, params, history);
 
-        if let Some(m) = mask.as_deref_mut() {
+        if let Some(m) = mask.as_mut() {
             m(&mut scores);
         }
 

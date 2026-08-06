@@ -681,6 +681,7 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    #[allow(clippy::too_many_arguments)] // test fixture: mirrors the MLA tensor shape set
     fn push_mla_attn_tensors(
         tensors: &mut Vec<FixtureTensor>,
         l: usize,
@@ -760,7 +761,15 @@ mod tests {
         ];
         // Layer 0: dense
         push_mla_attn_tensors(
-            &mut tensors, 0, h, n_heads, q_lora, kv_lora, qk_nope, qk_rope, v_dim,
+            &mut tensors,
+            0,
+            h,
+            n_heads,
+            q_lora,
+            kv_lora,
+            qk_nope,
+            qk_rope,
+            v_dim,
         );
         tensors.push(f32_tensor(
             "blk.0.ffn_gate.weight",
@@ -779,7 +788,15 @@ mod tests {
         ));
         // Layer 1: MoE
         push_mla_attn_tensors(
-            &mut tensors, 1, h, n_heads, q_lora, kv_lora, qk_nope, qk_rope, v_dim,
+            &mut tensors,
+            1,
+            h,
+            n_heads,
+            q_lora,
+            kv_lora,
+            qk_nope,
+            qk_rope,
+            v_dim,
         );
         tensors.push(f32_tensor(
             "blk.1.ffn_gate_inp.weight",
@@ -842,16 +859,20 @@ mod tests {
             ("deepseek2.expert_weights_scale", 1.0f32),
         ];
         let bytes = build_gguf(arch, &kv, &fkv, &tensors);
-        let path = std::env::temp_dir().join(format!(
-            "ferrox_mla_moe_gguf_{}.gguf",
-            std::process::id()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("ferrox_mla_moe_gguf_{}.gguf", std::process::id()));
         std::fs::write(&path, &bytes).unwrap();
         let file = GgufFile::open(&path).unwrap();
         let engine = load_mla_engine(&file).expect("load mla moe");
         assert_eq!(engine.layers.len(), 2);
-        assert!(matches!(engine.layers[0].ffn, crate::engine::MlaLayerFfn::Dense(_)));
-        assert!(matches!(engine.layers[1].ffn, crate::engine::MlaLayerFfn::Moe(_)));
+        assert!(matches!(
+            engine.layers[0].ffn,
+            crate::engine::MlaLayerFfn::Dense(_)
+        ));
+        assert!(matches!(
+            engine.layers[1].ffn,
+            crate::engine::MlaLayerFfn::Moe(_)
+        ));
         assert!(engine.moe.is_some());
         let mut state = engine.new_state();
         let logits = engine.forward_token(0, 0, &mut state);
@@ -888,7 +909,15 @@ mod tests {
         ];
         for l in 0..2usize {
             push_mla_attn_tensors(
-                &mut tensors, l, h, n_heads, q_lora, kv_lora, qk_nope, qk_rope, v_dim,
+                &mut tensors,
+                l,
+                h,
+                n_heads,
+                q_lora,
+                kv_lora,
+                qk_nope,
+                qk_rope,
+                v_dim,
             );
             // Only dense FFN tensors — MoE layer 1 will fail closed.
             tensors.push(f32_tensor(

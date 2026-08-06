@@ -67,8 +67,8 @@ pub use engine_factory::{
     load_mla_engine_from_path, select_engine_kind, EngineSelectError, SelectedEngineKind,
     ServedEngine,
 };
-pub use gemma4_engine::{Gemma4Engine, Gemma4Hparams, GEMMA4_ARCHES};
 pub use execution_plan::{ExecutionPlan, FusedOpCaps, MemoryPlan, PlanGeometry};
+pub use gemma4_engine::{Gemma4Engine, Gemma4Hparams, GEMMA4_ARCHES};
 pub use loader::LoadError;
 pub use output_projection::grouped_output_projection;
 pub use prefix_cache::{PrefixCache, PrefixCacheStats, PrefixMatch};

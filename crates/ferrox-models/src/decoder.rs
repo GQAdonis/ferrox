@@ -2271,7 +2271,7 @@ impl Decoder {
         }
         let ffn_rows = experts[decision.expert_ids[0]].gate.rows();
         // Even ffn_rows: par_chunks_mut(2) never crosses a slot boundary.
-        if ffn_rows % 2 != 0 {
+        if !ffn_rows.is_multiple_of(2) {
             return None;
         }
         let act = ferrox_quant::quantize_activations_q8(normed2);
@@ -2808,36 +2808,38 @@ impl Decoder {
                                         self.config.attn_logit_softcap,
                                         false,
                                     )
-                                    .map(|(attn_out_batch, _, _)| {
-                                        cache.advance_len(batch_size).expect(
-                                            "unbounded/planned KvCache growth is infallible",
-                                        );
-                                        let projected_batch = layer
-                                            .attn
-                                            .o_proj
-                                            .apply_batch(&attn_out_batch, batch_size);
-                                        let projected_batch =
-                                            if let Some(post) = &layer.attn.post_attn_norm {
-                                                projected_batch
-                                                    .chunks(hidden_dim)
-                                                    .flat_map(|row| {
-                                                        rms_norm(
-                                                            row,
-                                                            post,
-                                                            self.config.rms_norm_eps,
-                                                        )
-                                                    })
-                                                    .collect::<Vec<_>>()
-                                            } else {
-                                                projected_batch
-                                            };
-                                        for (h, p) in
-                                            hidden_batch.iter_mut().zip(projected_batch.iter())
-                                        {
-                                            *h += p;
-                                        }
-                                        true
-                                    })
+                                    .map(
+                                        |(attn_out_batch, _, _)| {
+                                            cache.advance_len(batch_size).expect(
+                                                "unbounded/planned KvCache growth is infallible",
+                                            );
+                                            let projected_batch = layer
+                                                .attn
+                                                .o_proj
+                                                .apply_batch(&attn_out_batch, batch_size);
+                                            let projected_batch =
+                                                if let Some(post) = &layer.attn.post_attn_norm {
+                                                    projected_batch
+                                                        .chunks(hidden_dim)
+                                                        .flat_map(|row| {
+                                                            rms_norm(
+                                                                row,
+                                                                post,
+                                                                self.config.rms_norm_eps,
+                                                            )
+                                                        })
+                                                        .collect::<Vec<_>>()
+                                                } else {
+                                                    projected_batch
+                                                };
+                                            for (h, p) in
+                                                hidden_batch.iter_mut().zip(projected_batch.iter())
+                                            {
+                                                *h += p;
+                                            }
+                                            true
+                                        },
+                                    )
                                 }
                             } {
                                 Ok(true) => {

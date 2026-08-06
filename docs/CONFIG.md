@@ -22,8 +22,8 @@ library or overriding the CLI.
 | `FERROX_METAL_ATTN` | `1` / `0` — fused Metal attention + resident KV |
 | `FERROX_CTK` | KV dtype: `f16` (default), `q8_0` / `turbo8` / `fp8` / `turbo4` (Metal); `turbo3` falls back to F16. Same as `--ctk` |
 | `FERROX_CUDA` | `1` / `0` / `auto` (build with `--features cuda`) |
-| `FERROX_CPU_THREADS` | Worker threads; same as `-t` |
-| `FERROX_CPU_INT_DOT` | `1` — int8×int8 matvec; suite CPU runs set this |
+| `FERROX_CPU_THREADS` | Worker threads; same as `-t`. Default: **performance cores** (`hw.perflevel0.physicalcpu` on macOS), matching llama.cpp — not logical cores |
+| `FERROX_CPU_INT_DOT` | int8×int8 matvec + repacked GEMV. **On by default** in `ferrox` / `ferrox-server`; `0` opts out. Off in the library so golden cross-validation stays reference-exact |
 
 ## Tuning
 
@@ -32,6 +32,8 @@ library or overriding the CLI.
 | `FERROX_CONTINUOUS_BATCHING` | `1` — share decode across concurrent requests |
 | `FERROX_CHUNKED_PREFILL` | Split long prefills into N-token chunks |
 | `FERROX_CPU_KV_OFFLOAD` | `1` — sync Metal KV to host after each decode step |
+| `FERROX_TOKIO_WORKERS` | `ferrox-server` async worker threads (default `2`); keeps the HTTP runtime from oversubscribing the decode pool |
+| `FERROX_QOS_LOG` | `1` — log each rayon worker's macOS QoS class at pool start |
 | `FERROX_UI` | `1` — serve chat UI at `/` and `/ui` |
 | `FERROX_KV_POOL_BLOCKS` | Paged-KV pool size (blocks) |
 | `FERROX_EXPERT_CACHE_BYTES` | MoE expert-streaming cache budget |

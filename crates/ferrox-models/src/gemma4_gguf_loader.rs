@@ -9,7 +9,8 @@ use ferrox_core::weight_matrix::{QuantKind, WeightBytes, WeightMatrix};
 use ferrox_gguf::{GgmlType, GgufValue, TensorSource};
 
 use crate::gemma4_engine::{
-    Gemma4AttnWeights, Gemma4Engine, Gemma4Hparams, Gemma4LayerWeights, Gemma4Weights, GEMMA4_ARCHES,
+    Gemma4AttnWeights, Gemma4Engine, Gemma4Hparams, Gemma4LayerWeights, Gemma4Weights,
+    GEMMA4_ARCHES,
 };
 use crate::loader::LoadError;
 
@@ -74,9 +75,8 @@ pub fn read_gemma4_hparams(file: &impl TensorSource) -> Result<Gemma4Hparams, Lo
     let p = |suffix: &str| format!("{arch}.{suffix}");
     let n_layer = meta_u64(file, &p("block_count"))? as usize;
     let hidden_dim = meta_u64(file, &p("embedding_length"))? as usize;
-    let ffn_dims = meta_usize_array(file, &p("feed_forward_length")).ok_or_else(|| {
-        LoadError::MissingHparam(p("feed_forward_length"))
-    })?;
+    let ffn_dims = meta_usize_array(file, &p("feed_forward_length"))
+        .ok_or_else(|| LoadError::MissingHparam(p("feed_forward_length")))?;
     if ffn_dims.len() != 1 && ffn_dims.len() != n_layer {
         return Err(LoadError::MissingHparam(format!(
             "{}: expected 1 or {n_layer} feed_forward_length entries, got {}",
@@ -247,7 +247,10 @@ fn load_layer(
     };
     let (per_layer_inp_gate, per_layer_proj, per_layer_post_norm) = if hp.embd_per_layer > 0 {
         (
-            Some(load_weight_matrix(file, &format!("blk.{il}.inp_gate.weight"))?),
+            Some(load_weight_matrix(
+                file,
+                &format!("blk.{il}.inp_gate.weight"),
+            )?),
             Some(load_weight_matrix(file, &format!("blk.{il}.proj.weight"))?),
             Some(load_f32_vec(file, &format!("blk.{il}.post_norm.weight"))?),
         )
@@ -286,16 +289,16 @@ pub fn load_gemma4_engine(file: &impl TensorSource) -> Result<Gemma4Engine, Load
         Ok(w) => w,
         Err(_) => load_weight_matrix(file, "token_embd.weight")?,
     };
-    let (per_layer_token_embd, per_layer_model_proj, per_layer_proj_norm) =
-        if hp.embd_per_layer > 0 {
-            (
-                Some(load_weight_matrix(file, "per_layer_token_embd.weight")?),
-                Some(load_weight_matrix(file, "per_layer_model_proj.weight")?),
-                Some(load_f32_vec(file, "per_layer_proj_norm.weight")?),
-            )
-        } else {
-            (None, None, None)
-        };
+    let (per_layer_token_embd, per_layer_model_proj, per_layer_proj_norm) = if hp.embd_per_layer > 0
+    {
+        (
+            Some(load_weight_matrix(file, "per_layer_token_embd.weight")?),
+            Some(load_weight_matrix(file, "per_layer_model_proj.weight")?),
+            Some(load_f32_vec(file, "per_layer_proj_norm.weight")?),
+        )
+    } else {
+        (None, None, None)
+    };
     let rope_freqs = if file.find_tensor("rope_freqs.weight").is_some() {
         Some(load_f32_vec(file, "rope_freqs.weight")?)
     } else {
@@ -426,11 +429,7 @@ mod tests {
         let h = 32usize;
         let swa = [true, true, true, true, false];
         let tensors = vec![
-            f32_tensor(
-                "token_embd.weight",
-                vec![4u64, h as u64],
-                vec![0.01; 4 * h],
-            ),
+            f32_tensor("token_embd.weight", vec![4u64, h as u64], vec![0.01; 4 * h]),
             f32_tensor("output_norm.weight", vec![h as u64], vec![1.0; h]),
         ];
         // Minimal tensors — only testing hparam parse via read_gemma4_hparams
@@ -460,10 +459,8 @@ mod tests {
             Some(("gemma4.attention.sliding_window_pattern", &swa)),
             &tensors,
         );
-        let path = std::env::temp_dir().join(format!(
-            "ferrox_gemma4_hp_{}.gguf",
-            std::process::id()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("ferrox_gemma4_hp_{}.gguf", std::process::id()));
         std::fs::write(&path, &bytes).unwrap();
         let file = GgufFile::open(&path).unwrap();
         let hp = read_gemma4_hparams(&file).expect("hparams");
@@ -516,8 +513,8 @@ mod tests {
                 vec![1.0; n_pl],
             ),
         ];
-        for il in 0..n_layer {
-            let hd = if swa[il] { hd_swa } else { hd_full };
+        for (il, &is_swa) in swa.iter().enumerate().take(n_layer) {
+            let hd = if is_swa { hd_swa } else { hd_full };
             tensors.push(f32_tensor(
                 &format!("blk.{il}.attn_norm.weight"),
                 vec![h as u64],
@@ -629,10 +626,8 @@ mod tests {
             Some(("gemma4.attention.sliding_window_pattern", &swa)),
             &tensors,
         );
-        let path = std::env::temp_dir().join(format!(
-            "ferrox_gemma4_fwd_{}.gguf",
-            std::process::id()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("ferrox_gemma4_fwd_{}.gguf", std::process::id()));
         std::fs::write(&path, &bytes).unwrap();
         let file = GgufFile::open(&path).unwrap();
         let engine = load_gemma4_engine(&file).expect("load");

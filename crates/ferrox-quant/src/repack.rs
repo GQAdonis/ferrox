@@ -3,7 +3,10 @@
 //! - Q4_K: packs 8 rows into `block_q4_Kx8` (`make_block_q4_Kx8`).
 //! - Q8_0: packs 4 rows into `block_q8_0x4` (`make_block_q8_0x4`) with
 //!   4-byte interleave for NEON SDOT `ggml_gemv_q8_0_4x4_q8_0`.
-//! Opt-in via `FERROX_CPU_INT_DOT`.
+//!
+//! Gated on `FERROX_CPU_INT_DOT`, which `ferrox` and `ferrox-server`
+//! turn on by default (`=0` opts out); off in the library so golden
+//! cross-validation stays reference-exact.
 
 use crate::{
     Q8Activations, Q8KActivations, Q4_K_BLOCK_BYTES, Q4_K_BLOCK_ELEMS, Q8_0_BLOCK_BYTES,
@@ -366,7 +369,10 @@ pub const Q8_0X4_INTERLEAVE: usize = 4;
 
 /// Pack four canonical Q8_0 blocks (same column-block) into one
 /// `block_q8_0x4`. `interleave` is 4 (ARM 4x4) or 8 (4x8).
-pub fn make_block_q8_0x4(rows: [&[u8]; Q8_0X4_NROWS], interleave: usize) -> [u8; Q8_0X4_BLOCK_BYTES] {
+pub fn make_block_q8_0x4(
+    rows: [&[u8]; Q8_0X4_NROWS],
+    interleave: usize,
+) -> [u8; Q8_0X4_BLOCK_BYTES] {
     debug_assert!(interleave == 4 || interleave == 8);
     for r in &rows {
         debug_assert_eq!(r.len(), Q8_0_BLOCK_BYTES);
@@ -891,7 +897,9 @@ mod avx2 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{dot_q4_k_q8_scalar, dot_q8_0_q8_scalar, quantize_activations_q8, quantize_activations_q8_k};
+    use crate::{
+        dot_q4_k_q8_scalar, dot_q8_0_q8_scalar, quantize_activations_q8, quantize_activations_q8_k,
+    };
 
     fn synth_q4_k_row(n_blocks: usize, seed: u8) -> Vec<u8> {
         let mut weights = Vec::with_capacity(n_blocks * Q4_K_BLOCK_BYTES);
@@ -920,8 +928,10 @@ mod tests {
             );
             for i in 0..32u8 {
                 // signed i8 stored as u8 bytes
-                let q = ((i as i8).wrapping_mul(3).wrapping_add(seed as i8).wrapping_add(b as i8))
-                    as u8;
+                let q = ((i as i8)
+                    .wrapping_mul(3)
+                    .wrapping_add(seed as i8)
+                    .wrapping_add(b as i8)) as u8;
                 weights.push(q);
             }
         }

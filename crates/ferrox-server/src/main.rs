@@ -1752,12 +1752,11 @@ async fn chat_completions_stream(
         }
     });
 
-    let stream = futures_util::stream::unfold(rx, |mut rx| async move {
-        match rx.recv().await {
-            Some(ev) => Some((ev, rx)),
-            None => None,
-        }
-    });
+    let stream =
+        futures_util::stream::unfold(
+            rx,
+            |mut rx| async move { rx.recv().await.map(|ev| (ev, rx)) },
+        );
     Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
 }
 
@@ -1855,32 +1854,34 @@ fn build_app_state(
     }
 }
 
-/// Prefer `FERROX_CPU_THREADS`, then existing `RAYON_NUM_THREADS`. If
-/// neither is set on Apple Silicon, set `RAYON_NUM_THREADS` to a
-/// performance-core heuristic before the global rayon pool is built.
-fn init_rayon_threads() {
-    if std::env::var_os("RAYON_NUM_THREADS").is_some()
-        || std::env::var_os("FERROX_CPU_THREADS").is_some()
-    {
-        if let Ok(v) = std::env::var("FERROX_CPU_THREADS") {
-            if std::env::var_os("RAYON_NUM_THREADS").is_none() {
-                // SAFETY: single-threaded init before worker threads spawn.
-                unsafe { std::env::set_var("RAYON_NUM_THREADS", &v) };
-            }
-        }
-        tracing::info!("rayon threads from env (FERROX_CPU_THREADS / RAYON_NUM_THREADS)");
-        return;
+/// Builds the global rayon pool up front, on the main thread, with an
+/// explicit width and QoS (see [`ferrox_core::threads`]).
+///
+/// Doing this from `main` rather than letting rayon build lazily is the
+/// point: the first rayon call inside this server happens on a Tokio
+/// `spawn_blocking` thread, so the workers used to inherit that thread's
+/// QoS class -- which on macOS decides whether they land on performance
+/// or efficiency cores.
+fn init_cpu_pool() {
+    match ferrox_core::threads::init_cpu_pool() {
+        Some(n) => eprintln!(
+            "ferrox-server: rayon pool {n} threads (perf cores {}; override with FERROX_CPU_THREADS)",
+            ferrox_core::threads::perf_core_count()
+        ),
+        None => eprintln!("ferrox-server: global rayon pool already built; leaving it alone"),
     }
-    #[cfg(target_os = "macos")]
-    {
-        if let Ok(n) = std::thread::available_parallelism() {
-            let n = (n.get() / 2).max(1);
-            unsafe { std::env::set_var("RAYON_NUM_THREADS", n.to_string()) };
-            tracing::info!(
-                "rayon thread pool target: {n} (Apple P-core heuristic; override with FERROX_CPU_THREADS)"
-            );
-        }
-    }
+}
+
+/// Tokio worker threads. The default is one per logical core, which on a
+/// 10-core M2 Pro means 10 async workers oversubscribing the same cores
+/// the rayon decode pool needs. Serving work here is almost entirely I/O
+/// plus `spawn_blocking` handoff, so a small fixed pool is enough.
+fn tokio_worker_threads() -> usize {
+    std::env::var("FERROX_TOKIO_WORKERS")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(2)
 }
 
 /// Parses llama-server-style options and applies their environment
@@ -1911,7 +1912,14 @@ fn main() -> anyhow::Result<()> {
             .map(|v| v == "1")
             .unwrap_or(false);
 
+    // Before Tokio exists, so the decode pool's threads are not spawned
+    // from (and do not inherit the QoS of) a blocking-pool thread.
+    // SAFETY: still single-threaded here.
+    unsafe { ferrox_core::weight_matrix::default_cpu_int_dot_on() };
+    init_cpu_pool();
+
     let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(tokio_worker_threads())
         .enable_all()
         .build()?;
     let result = runtime.block_on(run(mcp_config_path, ui_server));
@@ -1927,7 +1935,6 @@ fn main() -> anyhow::Result<()> {
 
 async fn run(mcp_config_path: Option<PathBuf>, ui_server: bool) -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
-    init_rayon_threads();
 
     // Fail-closed listener check, before anything else (including
     // loading the model, so a misconfigured bind fails fast rather than

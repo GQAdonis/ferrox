@@ -55,12 +55,8 @@ fn get_or_repack_q8x4(data: &[u8], rows: usize, cols: usize) -> Arc<[u8]> {
             return Arc::clone(hit);
         }
     }
-    let packed = ferrox_quant::pack_q8_0_matrix_x4(
-        data,
-        rows,
-        cols,
-        ferrox_quant::Q8_0X4_INTERLEAVE,
-    );
+    let packed =
+        ferrox_quant::pack_q8_0_matrix_x4(data, rows, cols, ferrox_quant::Q8_0X4_INTERLEAVE);
     let arc: Arc<[u8]> = Arc::from(packed.into_boxed_slice());
     let mut cache = q8x4_repack_cache().lock().unwrap();
     Arc::clone(cache.entry(key).or_insert_with(|| Arc::clone(&arc)))
@@ -214,11 +210,21 @@ pub fn cuda_dense_enabled() -> bool {
 }
 
 /// Whether CPU Q8_0 / Q4_0 / Q4_K / Q5_K / Q6_K matvec should quantize the
-/// activation to int8 and use the integer `vec_dot` path
-/// (`FERROX_CPU_INT_DOT=1`). Off by default: it trades a small
-/// activation-quant error for integer-SIMD throughput, so callers opt in
-/// explicitly. Q4_K additionally lazy-repacks into interleaved
-/// `block_q4_Kx8` for 8-wide GEMV; Q8_0 into `block_q8_0x4` for 4-wide GEMV.
+/// activation to int8 and use the integer `vec_dot` path. Q4_K
+/// additionally lazy-repacks into interleaved `block_q4_Kx8` for 8-wide
+/// GEMV; Q8_0 into `block_q8_0x4` for 4-wide GEMV.
+///
+/// Off by default *as a library*, and turned on by both binaries (see
+/// `ferrox_core::threads`'s siblings in `ferrox-cli`/`ferrox-server`,
+/// which set `FERROX_CPU_INT_DOT=1` unless the caller already chose).
+/// The split is deliberate: this is what llama.cpp's CPU backend does
+/// unconditionally -- quantize the activation to Q8, run integer
+/// `vec_dot` -- and it is worth 28% of CPU decode on Host B
+/// (Qwen2.5-0.5B Q8_0, `-ngl 0 -t 6`: 58.0 -> 80.5 tok/s). But it also
+/// perturbs results below the f32 reference's precision, and this
+/// crate's golden cross-validation against the independent NumPy
+/// reference asserts exact agreement. So the *inference product*
+/// defaults to fast and the *library default* stays reference-exact.
 pub fn cpu_int_dot_enabled() -> bool {
     use std::sync::OnceLock;
     static ENABLED: OnceLock<bool> = OnceLock::new();
@@ -228,6 +234,20 @@ pub fn cpu_int_dot_enabled() -> bool {
             Some("1") | Some("true") | Some("on")
         )
     })
+}
+
+/// Sets `FERROX_CPU_INT_DOT=1` unless the caller already expressed a
+/// preference. Call from a binary's startup, before any worker threads
+/// exist. See [`cpu_int_dot_enabled`] for why the default lives here
+/// rather than in the getter.
+///
+/// # Safety
+/// Must be called while the process is still single-threaded, since it
+/// mutates the process environment.
+pub unsafe fn default_cpu_int_dot_on() {
+    if std::env::var_os("FERROX_CPU_INT_DOT").is_none() {
+        unsafe { std::env::set_var("FERROX_CPU_INT_DOT", "1") };
+    }
 }
 
 pub enum WeightMatrix {
@@ -768,10 +788,8 @@ impl WeightMatrix {
                 }
                 if *rows % 2 == 1 {
                     let r = *rows - 1;
-                    out[r] = ferrox_quant::dot_q4_0_q8(
-                        &data[r * row_bytes..(r + 1) * row_bytes],
-                        act,
-                    );
+                    out[r] =
+                        ferrox_quant::dot_q4_0_q8(&data[r * row_bytes..(r + 1) * row_bytes], act);
                 }
                 return Some(out);
             }

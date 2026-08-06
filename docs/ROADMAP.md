@@ -13,6 +13,15 @@ What ships today: [`FEATURES.md`](FEATURES.md) · [`MODELS.md`](MODELS.md).
 - Re-pin OLMoE Metal; chase Gap ≤ ~1.05× (full multi-layer prefill stack CB)
 - Deferred MoE residual (dense-style) — correct tokens then land
 - Improve Metal dense prefill `prompt_per_second` (true simdgroup `mul_mm`)
+- **Benchmark harness: stop forcing `-t 10`.** It handicaps llama.cpp 2–4×
+  on Host B, so every CPU row in `RESULTS.md` overstates ferrox. Report
+  each engine at its own default plus a thread sweep, and split the
+  engine number (`llama-bench`-style, no HTTP) from the serving number.
+  See [`.scratch/NOTES_LLAMA_CPU.md`](../.scratch/NOTES_LLAMA_CPU.md)
+- CPU: persistent spin-barrier worker pool (llama `ggml_barrier`) to
+  replace per-matvec rayon fork-join — ferrox's parallel scaling ceilings
+  at ~1.9× where llama keeps going
+- CPU: per-thread GEMV throughput is ~2× off llama at equal thread count
 - CPU: close remaining SmolLM2/Qwen3/Phi-3 gaps (Q5_Kx8 / deeper Q8)
 - CUDA fair-chat pins on a GPU host
 

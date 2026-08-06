@@ -12,8 +12,8 @@ use ferrox_gguf::ShardedGguf;
 use ferrox_models::{
     ensure_generic_decoder, load_gemma4_engine_from_path, load_glm52_engine_from_path,
     load_mla_engine_from_path, select_engine_kind, ByteTokenizer, Decoder, Engine,
-    GgufBpeTokenizer, GgufSpmTokenizer, GgufUnigramTokenizer, ModelConfig, Sampler,
-    SamplingParams, SelectedEngineKind, ServedEngine,
+    GgufBpeTokenizer, GgufSpmTokenizer, GgufUnigramTokenizer, ModelConfig, Sampler, SamplingParams,
+    SelectedEngineKind, ServedEngine,
 };
 
 /// llama.cpp-compatible completion flags.
@@ -375,6 +375,11 @@ fn apply_backend_env(args: &InferArgs) -> anyhow::Result<()> {
             std::env::set_var("FERROX_CPU_THREADS", args.threads.to_string());
         }
     }
+    // SAFETY: still single-threaded here; rayon/Metal workers below.
+    unsafe { ferrox_core::weight_matrix::default_cpu_int_dot_on() };
+    // Same pool policy as `ferrox-server`: explicit width (performance
+    // cores by default, as llama.cpp does) and explicit QoS.
+    ferrox_core::threads::init_cpu_pool();
 
     let device = if args.n_gpu_layers.offload_enabled() {
         args.device.unwrap_or(OffloadDevice::Auto)
@@ -492,7 +497,10 @@ pub fn run_infer(args: InferArgs) -> anyhow::Result<()> {
     if matches!(select_engine_kind(&arch_early), Ok(SelectedEngineKind::Mla)) {
         return run_mla_infer(args, path, &file);
     }
-    if matches!(select_engine_kind(&arch_early), Ok(SelectedEngineKind::Gemma4)) {
+    if matches!(
+        select_engine_kind(&arch_early),
+        Ok(SelectedEngineKind::Gemma4)
+    ) {
         return run_gemma4_infer(args, path, &file);
     }
     if matches!(arch_early.as_str(), "glm-dsa" | "glm4" | "glm4moe") {
@@ -879,6 +887,7 @@ fn run_gemma4_infer(args: InferArgs, path: &Path, file: &ShardedGguf) -> anyhow:
     let ServedEngine::Gemma4(engine) = served else {
         anyhow::bail!("expected ServedEngine::Gemma4");
     };
+    let engine = *engine;
     eprintln!("ferrox: loaded in {:.2}s", load_t.elapsed().as_secs_f64());
 
     let mut tokens = tokenizer.encode(&prompt);

@@ -156,6 +156,7 @@ fn chunked_prefill_tokens() -> Option<usize> {
         .filter(|&n| n > 0)
 }
 
+#[cfg(feature = "metal")]
 fn cpu_kv_offload_enabled() -> bool {
     matches!(
         std::env::var("FERROX_CPU_KV_OFFLOAD").ok().as_deref(),
@@ -444,6 +445,8 @@ pub fn generate(
 /// exactly one place. Returns the finish reason, the generated token
 /// ids, and the final logits (the prediction for whatever would come
 /// next), since `generate`'s prefix-cache storage needs both.
+#[allow(clippy::too_many_arguments)] // one call site each from `generate`
+                                     // and `generate_engine`; splitting it would only move the arguments.
 fn sample_until_stop(
     mut logits: Vec<f32>,
     mut pos: usize,
@@ -464,7 +467,7 @@ fn sample_until_stop(
         let next = if params.json_object {
             if let Some(decode_token) = decode_token {
                 let mut mask_fn = |scores: &mut [f32]| {
-                    mask_logits_for_json(scores, |i| decode_token(i));
+                    mask_logits_for_json(scores, decode_token);
                 };
                 sampler.sample_with_mask(
                     &logits,

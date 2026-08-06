@@ -9,8 +9,7 @@
 //! Graph mirrors `.scratch/llama.cpp/src/models/gemma4.cpp`.
 
 use ferrox_core::attention::{
-    apply_rope, apply_rope_with_freq_factors, causal_gqa_attention,
-    causal_gqa_attention_windowed,
+    apply_rope, apply_rope_with_freq_factors, causal_gqa_attention, causal_gqa_attention_windowed,
 };
 use ferrox_core::cache::KvCache;
 use ferrox_core::matmul::{geglu, gelu, rms_norm, rms_norm_per_head, softcap_inplace};
@@ -367,10 +366,11 @@ impl Engine for Gemma4Engine {
             hidden = cur;
         }
 
-        let mut logits = self
-            .weights
-            .output_head
-            .apply(&rms_norm(&hidden, &self.weights.output_norm, hp.rms_norm_eps));
+        let mut logits = self.weights.output_head.apply(&rms_norm(
+            &hidden,
+            &self.weights.output_norm,
+            hp.rms_norm_eps,
+        ));
         if let Some(sc) = hp.final_logit_softcap {
             softcap_inplace(&mut logits, sc);
         }

@@ -13,8 +13,8 @@ Metal + CUDA kernels, OpenAI-compatible `ferrox-server`.
   **~0.92×**; Llama-3.2-3B **~0.97×** — see `benchmarks/RESULTS.md`).
 - Phi-4-mini Q4_K_M Metal ~parity; Gemma-4-E2B fail-closed until
   dedicated engine (per-layer emb / shared KV / SWA split).
-- MoE GQA: OLMoE-1B-7B-0924 (Metal ~1.51× — Serial MoE + Concurrent
-  gate∥up windows; full Concurrent races tokens on Host B; CPU ~1.38×).
+- MoE GQA: OLMoE-1B-7B-0924 (Metal Concurrent + `MoeMemRanges` like
+  llama `ggml_mem_ranges`; CPU ~1.38× — see pins).
 - Metal dense stack (`FERROX_METAL` / `FERROX_METAL_ATTN`); FA-vec
   decode d=64/96/128/256 + prefill d=128; CUDA matvec + resident weights
   + FFN fuse (CUDA fair-chat pins need a GPU host).

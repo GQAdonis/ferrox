@@ -23,7 +23,7 @@ Keep off (regressions): legacy GQA NSG=4, sequential GREEDY argmax, float4 elem,
 | TinyLlama-1.1B-Chat-v1.0 Q8_0 | cpu | **40.83** ±0.3 | **46.93** ±0.7 (−ngl 0) | 🔴 **~1.15×** | 🔴 **llama** | ok | [`tinyllama_q8_cpu`](receipts/pins/tinyllama_q8_cpu.json) |
 | Llama-3.2-1B-Instruct Q4_K_M | metal | **137.88** ±5.0 | **136.99** ±0.4 | ⚪ **1.00×** | ⚪ parity | ok | [`llama32_1b_q4km_metal`](receipts/pins/llama32_1b_q4km_metal.json) |
 | OLMoE-1B-7B-0924 Q4_0 | cpu | **32.91** ±0.2 | **45.58** ±1.0 (−ngl 0) | 🔴 **~1.38×** | 🔴 **llama** | ok | [`olmoe_q4_cpu`](receipts/pins/olmoe_q4_cpu.json) |
-| OLMoE-1B-7B-0924 Q4_0 | metal | **106.24** ±1.1 | **160.82** ±2.4 | 🔴 **~1.51×** | 🔴 **llama** | ok | [`olmoe_q4_metal`](receipts/pins/olmoe_q4_metal.json) |
+| OLMoE-1B-7B-0924 Q4_0 | metal | **111.73** ±0.0 | **159.19** ±0.5 | 🔴 **~1.42×** | 🔴 **llama** | ok | [`olmoe_q4_metal`](receipts/pins/olmoe_q4_metal.json) |
 | OLMoE-1B-7B-0924 Q4_0 | cuda | — | — | — | — | no pin | — |
 | Llama-3.1-8B-Instruct Q4_K_M | metal | **28.17** ±0.8 | **25.86** ±1.2 | 🟢 **~0.92×** | 🟢 **ferrox** | ok | [`llama31_8b_q4km_metal`](receipts/pins/llama31_8b_q4km_metal.json) |
 | Llama-3.1-8B-Instruct Q4_K_M | cuda | — | — | — | — | no pin | — |
@@ -78,7 +78,7 @@ Pins that used `llama-cli` or rejected options are omitted.
 ## Open
 
 1. Metal fair-chat 8B is ahead (~0.92×); 3B ~parity (~0.97×). Keep watching `prompt_per_second` vs llama after FA-vec prefill.
-2. OLMoE Metal ~1.51× (Serial MoE + Concurrent gate∥up windows; full Concurrent + scope barriers still race tokens on Host B); CPU 2-row SDOT mul_mat_id. Next: MoE Concurrent barrier root-cause / `mul_mv_id` (`docs/ROADMAP.md`).
+2. OLMoE Metal — Concurrent + `MoeMemRanges` (llama `ggml_mem_ranges`); CPU 2-row SDOT mul_mat_id. Next: tighter `mul_mv_id` / multi-CB (`docs/ROADMAP.md`).
 3. CUDA — re-measure on comparable CUDA hardware (no in-tree CUDA pin; skipped on darwin via `--fit-host`).
 4. Gemma-4-E2B: both ferrox and Homebrew llama refuse (`gemma4` arch / per-layer+shared-KV+SWA split); suite `expect=refuse`.
 5. CB multi-request tok/s receipt.

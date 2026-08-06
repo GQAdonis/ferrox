@@ -697,6 +697,7 @@ kernel void q4_0_moe_matvec_id(
     uint lane [[thread_index_in_simdgroup]],
     uint sg [[simdgroup_index_in_threadgroup]]
 ) {
+    // llama.cpp Q4_0 mul_mv: NR0=4, NSG=2. (NSG=4 tried for dense — regress.)
     constexpr uint NR = 4u;
     constexpr uint NSG = 2u;
     // llama.cpp grid: (row_groups, 1, n_slots) × (32, NSG, 1)
@@ -4869,5 +4870,234 @@ mod tests {
         for (i, (a, b)) in got.iter().zip(expected.iter()).enumerate() {
             assert_close_relative(*a, *b, i);
         }
+    }
+
+    /// OLMoE-shaped MoE vs dense Q4_0: isolate `mul_mv_id` GPU cost.
+    /// `cargo test -p ferrox-metal --features metal --release -- --ignored bench_olmoe_moe_vs_dense_q4 --nocapture`
+    #[test]
+    #[ignore = "needs Metal GPU; microbench"]
+    fn bench_olmoe_moe_vs_dense_q4() {
+        let hidden = 2048usize;
+        let ffn = 1024usize;
+        let top_k = 8usize;
+        let layers = 16usize;
+        let gate_blocks = hidden / 32;
+        let gate_row_bytes = gate_blocks * 18;
+        let down_blocks = ffn / 32;
+        let down_row_bytes = down_blocks * 18;
+
+        let mut mk_plane = |rows: usize, row_bytes: usize| -> Vec<u8> {
+            let mut w = vec![0u8; rows * row_bytes];
+            for (i, b) in w.chunks_exact_mut(18).enumerate() {
+                b[..2].copy_from_slice(&half::f16::from_f32(0.02 + (i % 17) as f32 * 0.001).to_le_bytes());
+                for j in 0..16 {
+                    b[2 + j] = ((i + j) % 255) as u8;
+                }
+            }
+            w
+        };
+        let gate = mk_plane(ffn, gate_row_bytes);
+        let up = mk_plane(ffn, gate_row_bytes);
+        let down = mk_plane(hidden, down_row_bytes);
+        let packed = MoePackedQ4 {
+            gate: &gate,
+            up: &up,
+            down: &down,
+            gate_stride: gate.len(),
+            up_stride: up.len(),
+            down_stride: down.len(),
+            n_experts: 1,
+            ffn_rows: ffn,
+            hidden_rows: hidden,
+            gate_row_bytes,
+            down_row_bytes,
+        };
+        let x: Vec<f32> = (0..hidden).map(|i| ((i as f32) * 0.01).sin()).collect();
+        let ids = vec![0i32; top_k];
+        let route = vec![1.0f32 / top_k as f32; top_k];
+
+        let shared = shared_metal().expect("metal");
+        let device = &shared.device;
+        let queue = &shared.queue;
+
+        // Warmup
+        for _ in 0..4 {
+            let _ = launch_moe_prefill_q4_0(&x, 1, &packed, &ids, &route, top_k).unwrap();
+            let _ = launch_q4_0_matvec(&gate, &x, ffn, gate_row_bytes).unwrap();
+        }
+
+        let iters = 32usize;
+        // MoE FFN (gate+up+silu+down+sum) × layers, one CB per layer-equiv via prefill×layers
+        let t0 = std::time::Instant::now();
+        let mut gpu_moe = 0.0f64;
+        for _ in 0..iters {
+            let cmd = queue.commandBuffer().unwrap();
+            let enc = cmd.computeCommandEncoder().unwrap();
+            // replicate 16 layers of expert work in one CB
+            let x_buf = unsafe {
+                device.newBufferWithBytes_length_options(
+                    NonNull::new(x.as_ptr() as *mut _).unwrap(),
+                    x.len() * 4,
+                    MTLResourceOptions::StorageModeShared,
+                )
+            }
+            .unwrap();
+            let mut ids_m = ids.clone();
+            let ids_buf = unsafe {
+                device.newBufferWithBytes_length_options(
+                    NonNull::new(ids_m.as_mut_ptr() as *mut _).unwrap(),
+                    ids_m.len() * 4,
+                    MTLResourceOptions::StorageModeShared,
+                )
+            }
+            .unwrap();
+            let mut route_m = route.clone();
+            let route_buf = unsafe {
+                device.newBufferWithBytes_length_options(
+                    NonNull::new(route_m.as_mut_ptr() as *mut _).unwrap(),
+                    route_m.len() * 4,
+                    MTLResourceOptions::StorageModeShared,
+                )
+            }
+            .unwrap();
+            let n_slots = top_k;
+            let gate_buf = device
+                .newBufferWithLength_options(n_slots * ffn * 4, MTLResourceOptions::StorageModeShared)
+                .unwrap();
+            let up_buf = device
+                .newBufferWithLength_options(n_slots * ffn * 4, MTLResourceOptions::StorageModeShared)
+                .unwrap();
+            let act_buf = device
+                .newBufferWithLength_options(n_slots * ffn * 4, MTLResourceOptions::StorageModeShared)
+                .unwrap();
+            let expert_out = device
+                .newBufferWithLength_options(n_slots * hidden * 4, MTLResourceOptions::StorageModeShared)
+                .unwrap();
+            let out_buf = device
+                .newBufferWithLength_options(hidden * 4, MTLResourceOptions::StorageModeShared)
+                .unwrap();
+            for _ in 0..layers {
+                encode_q4_0_moe_id(
+                    &enc,
+                    device,
+                    &x_buf,
+                    &packed,
+                    &ids_buf,
+                    &route_buf,
+                    &gate_buf,
+                    &up_buf,
+                    &act_buf,
+                    &expert_out,
+                    &out_buf,
+                    top_k as u32,
+                    1,
+                    false,
+                    false,
+                )
+                .unwrap();
+                memory_barrier_buffers(&enc);
+            }
+            enc.endEncoding();
+            cmd.commit();
+            cmd.waitUntilCompleted();
+            gpu_moe += cmd.GPUEndTime() - cmd.GPUStartTime();
+        }
+        let wall_moe = t0.elapsed().as_secs_f64();
+
+        // Dense equivalent FLOPs: 16 layers × (gate + up + down) without id, top_k=1 each
+        // Fairer: 16×8 slots as separate dense matvecs = same MAC count as id path
+        let t1 = std::time::Instant::now();
+        let mut gpu_dense = 0.0f64;
+        for _ in 0..iters {
+            let cmd = queue.commandBuffer().unwrap();
+            let enc = cmd.computeCommandEncoderWithDispatchType(MTLDispatchType::Concurrent)
+                .unwrap();
+            let x_buf = unsafe {
+                device.newBufferWithBytes_length_options(
+                    NonNull::new(x.as_ptr() as *mut _).unwrap(),
+                    x.len() * 4,
+                    MTLResourceOptions::StorageModeShared,
+                )
+            }
+            .unwrap();
+            let gate_w = resident_weight_buffer(device, &gate).unwrap();
+            let up_w = resident_weight_buffer(device, &up).unwrap();
+            let down_w = resident_weight_buffer(device, &down).unwrap();
+            let act_x: Vec<f32> = (0..ffn).map(|i| ((i as f32) * 0.02).cos()).collect();
+            let act_buf = unsafe {
+                device.newBufferWithBytes_length_options(
+                    NonNull::new(act_x.as_ptr() as *mut _).unwrap(),
+                    act_x.len() * 4,
+                    MTLResourceOptions::StorageModeShared,
+                )
+            }
+            .unwrap();
+            for _l in 0..layers {
+                for _s in 0..top_k {
+                    let g_out = device
+                        .newBufferWithLength_options(ffn * 4, MTLResourceOptions::StorageModeShared)
+                        .unwrap();
+                    let u_out = device
+                        .newBufferWithLength_options(ffn * 4, MTLResourceOptions::StorageModeShared)
+                        .unwrap();
+                    let d_out = device
+                        .newBufferWithLength_options(hidden * 4, MTLResourceOptions::StorageModeShared)
+                        .unwrap();
+                    let launch_g = MatvecLaunch {
+                        kernel_src: Q4_0_MATVEC_KERNEL_SRC,
+                        fn_name: "q4_0_matvec",
+                        block_bytes: 18,
+                        block_elems: 32,
+                        weights: &gate,
+                        rows: ffn,
+                        row_bytes: gate_row_bytes,
+                        rows_per_tg: 8,
+                    };
+                    let launch_u = MatvecLaunch {
+                        kernel_src: Q4_0_MATVEC_KERNEL_SRC,
+                        fn_name: "q4_0_matvec",
+                        block_bytes: 18,
+                        block_elems: 32,
+                        weights: &up,
+                        rows: ffn,
+                        row_bytes: gate_row_bytes,
+                        rows_per_tg: 8,
+                    };
+                    let launch_d = MatvecLaunch {
+                        kernel_src: Q4_0_MATVEC_KERNEL_SRC,
+                        fn_name: "q4_0_matvec",
+                        block_bytes: 18,
+                        block_elems: 32,
+                        weights: &down,
+                        rows: hidden,
+                        row_bytes: down_row_bytes,
+                        rows_per_tg: 8,
+                    };
+                    encode_matvec(&enc, device, &launch_g, &gate_w, &x_buf, &g_out).unwrap();
+                    encode_matvec(&enc, device, &launch_u, &up_w, &x_buf, &u_out).unwrap();
+                    memory_barrier_buffers(&enc);
+                    encode_matvec(&enc, device, &launch_d, &down_w, &act_buf, &d_out).unwrap();
+                    memory_barrier_buffers(&enc);
+                }
+            }
+            enc.endEncoding();
+            cmd.commit();
+            cmd.waitUntilCompleted();
+            gpu_dense += cmd.GPUEndTime() - cmd.GPUStartTime();
+            let _ = t1; // wall measured below
+        }
+        let wall_dense = t1.elapsed().as_secs_f64();
+
+        let moe_ms = gpu_moe / iters as f64 * 1e3;
+        let dense_ms = gpu_dense / iters as f64 * 1e3;
+        eprintln!(
+            "OLMoE-shaped GPU ms/tok-equiv: moe_id={moe_ms:.3} (wall {:.3}) dense×{top_k}={dense_ms:.3} (wall {:.3}) ratio_moe/dense={:.3}",
+            wall_moe / iters as f64 * 1e3,
+            wall_dense / iters as f64 * 1e3,
+            moe_ms / dense_ms
+        );
+        // Sanity: both paths did work
+        assert!(moe_ms > 0.5);
+        assert!(dense_ms > 0.5);
     }
 }

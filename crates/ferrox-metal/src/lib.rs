@@ -21,6 +21,9 @@ pub mod gpu;
 pub mod attn;
 
 #[cfg(feature = "metal")]
+mod moe_ranges;
+
+#[cfg(feature = "metal")]
 pub mod elem;
 
 #[cfg(feature = "metal")]

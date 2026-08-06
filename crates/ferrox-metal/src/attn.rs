@@ -46,6 +46,7 @@ use crate::gpu::{
     resident_f32_buffer, resident_weight_buffer, shared_metal, MatvecLaunch, MetalError,
     MoeExpertLaunch, MoePackedQ4, ResidentF32Buffer, ResidentWeightBuffer,
 };
+use crate::moe_ranges::MoeMemRanges;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{
@@ -3976,30 +3977,13 @@ fn moe_layer_resident(
     Ok(bound)
 }
 
-/// End current compute encoder and open a new one on the same CB.
-/// Ending an encoder creates a GPU dependency on prior dispatches — used
-/// instead of in-encoder barriers under `MTLDispatchTypeConcurrent` (those
-/// raced OLMoE tokens on Host B even when placed between every matvec).
-fn renew_moe_encoder(
-    cmd_buf: &ProtocolObject<dyn MTLCommandBuffer>,
-    encoder: &mut Retained<ProtocolObject<dyn MTLComputeCommandEncoder>>,
-    concurrent: bool,
-) -> Result<(), MetalError> {
-    encoder.endEncoding();
-    *encoder = if concurrent {
-        compute_encoder_concurrent(cmd_buf)?
-    } else {
-        cmd_buf
-            .computeCommandEncoder()
-            .ok_or(MetalError::CommandFailed)?
-    };
-    Ok(())
-}
-
+/// One MoE layer into a Concurrent encoder using llama-style [`MoeMemRanges`]
+/// barriers (only on SRC↔DST / DST↔DST conflicts). Same shape as dense
+/// [`launch_decode_dense_stack`] and llama `ggml_metal_op` + `mem_ranges`.
 #[allow(clippy::too_many_arguments)]
 fn encode_moe_layer_fused(
-    cmd_buf: &ProtocolObject<dyn MTLCommandBuffer>,
-    encoder: &mut Retained<ProtocolObject<dyn MTLComputeCommandEncoder>>,
+    encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+    mrs: &mut MoeMemRanges,
     device: &Retained<ProtocolObject<dyn MTLDevice>>,
     scratch: &MoeDecodeScratch,
     layer_idx: usize,
@@ -4026,151 +4010,259 @@ fn encode_moe_layer_fused(
     let o_w = &bound.o_w;
     let r_w = &bound.r_w;
 
-    // Serial chain + Concurrent gate∥up encoder window. A single Concurrent
-    // MoE encoder + `memoryBarrierWithScope(Buffers)` still races OLMoE
-    // tokens on Host B; encoder-end is the reliable sync boundary.
-    encode_rms_norm(
-        encoder,
-        device,
-        &scratch.h,
-        &attn_nw.buffer,
-        &scratch.x_attn,
-        hidden_dim as u32,
-        rms_eps,
-    )?;
-    encode_matvec(encoder, device, &layer.q, q_w, &scratch.x_attn, &scratch.q)?;
-    encode_matvec(encoder, device, &layer.k, k_w, &scratch.x_attn, &scratch.k)?;
-    encode_matvec(encoder, device, &layer.v, v_w, &scratch.x_attn, &scratch.v)?;
-    encode_attn_extras(
-        encoder,
-        device,
-        &layer.extras,
-        &scratch.q,
-        &scratch.k,
-        &scratch.v,
-        layer.q.rows,
-        layer.k.rows,
-        layer.v.rows,
-        n_heads,
-        n_kv_heads,
-        head_dim,
-        rms_eps,
-    )?;
-    encode_rope(
-        encoder,
-        device,
-        rope_layout,
-        &scratch.q,
-        n_heads as u32,
-        head_dim as u32,
-        rope_theta,
-        pos as u32,
-        ff_buf,
-    )?;
-    encode_rope(
-        encoder,
-        device,
-        rope_layout,
-        &scratch.k,
-        n_kv_heads as u32,
-        head_dim as u32,
-        rope_theta,
-        pos as u32,
-        ff_buf,
-    )?;
+    // attn_norm: h → x_attn
+    {
+        let srcs = [scratch.h.as_ref()];
+        let dsts = [scratch.x_attn.as_ref()];
+        mrs.begin_op(encoder, &srcs, &dsts);
+        encode_rms_norm(
+            encoder,
+            device,
+            &scratch.h,
+            &attn_nw.buffer,
+            &scratch.x_attn,
+            hidden_dim as u32,
+            rms_eps,
+        )?;
+        mrs.end_op(&srcs, &dsts);
+    }
+    // Q∥K∥V — shared src x_attn, disjoint dsts (llama Concurrent set).
+    {
+        let srcs = [scratch.x_attn.as_ref()];
+        let dsts = [scratch.q.as_ref()];
+        mrs.begin_op(encoder, &srcs, &dsts);
+        encode_matvec(encoder, device, &layer.q, q_w, &scratch.x_attn, &scratch.q)?;
+        mrs.end_op(&srcs, &dsts);
+    }
+    {
+        let srcs = [scratch.x_attn.as_ref()];
+        let dsts = [scratch.k.as_ref()];
+        mrs.begin_op(encoder, &srcs, &dsts);
+        encode_matvec(encoder, device, &layer.k, k_w, &scratch.x_attn, &scratch.k)?;
+        mrs.end_op(&srcs, &dsts);
+    }
+    {
+        let srcs = [scratch.x_attn.as_ref()];
+        let dsts = [scratch.v.as_ref()];
+        mrs.begin_op(encoder, &srcs, &dsts);
+        encode_matvec(encoder, device, &layer.v, v_w, &scratch.x_attn, &scratch.v)?;
+        mrs.end_op(&srcs, &dsts);
+    }
+    // extras + rope touch q/k/v in place (dst = src).
+    {
+        let srcs = [scratch.q.as_ref(), scratch.k.as_ref(), scratch.v.as_ref()];
+        let dsts = [scratch.q.as_ref(), scratch.k.as_ref(), scratch.v.as_ref()];
+        mrs.begin_op(encoder, &srcs, &dsts);
+        encode_attn_extras(
+            encoder,
+            device,
+            &layer.extras,
+            &scratch.q,
+            &scratch.k,
+            &scratch.v,
+            layer.q.rows,
+            layer.k.rows,
+            layer.v.rows,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            rms_eps,
+        )?;
+        mrs.end_op(&srcs, &dsts);
+    }
+    {
+        let srcs = [scratch.q.as_ref()];
+        let dsts = [scratch.q.as_ref()];
+        mrs.begin_op(encoder, &srcs, &dsts);
+        encode_rope(
+            encoder,
+            device,
+            rope_layout,
+            &scratch.q,
+            n_heads as u32,
+            head_dim as u32,
+            rope_theta,
+            pos as u32,
+            ff_buf,
+        )?;
+        mrs.end_op(&srcs, &dsts);
+    }
+    {
+        let srcs = [scratch.k.as_ref()];
+        let dsts = [scratch.k.as_ref()];
+        mrs.begin_op(encoder, &srcs, &dsts);
+        encode_rope(
+            encoder,
+            device,
+            rope_layout,
+            &scratch.k,
+            n_kv_heads as u32,
+            head_dim as u32,
+            rope_theta,
+            pos as u32,
+            ff_buf,
+        )?;
+        mrs.end_op(&srcs, &dsts);
+    }
     let token_elems = (n_kv_heads * head_dim) as u32;
     let offset = (pos * n_kv_heads * head_dim) as u32;
-    encode_kv_store_append(
-        encoder,
-        device,
-        &scratch.k,
-        kv,
-        KvPlane::K,
-        offset,
-        token_elems,
-    )?;
-    encode_kv_store_append(
-        encoder,
-        device,
-        &scratch.v,
-        kv,
-        KvPlane::V,
-        offset,
-        token_elems,
-    )?;
-    encode_gqa_with_kv(
-        encoder,
-        device,
-        &scratch.q,
-        kv,
-        &scratch.attn,
-        n_heads as u32,
-        n_kv_heads as u32,
-        head_dim as u32,
-        (pos + 1) as u32,
-        0,
-        layer.extras.attn_logit_softcap,
-    )?;
-    encode_matvec(encoder, device, &layer.o, o_w, &scratch.attn, &scratch.o)?;
-    encode_add_rms_norm(
-        encoder,
-        device,
-        &scratch.h,
-        &scratch.o,
-        &ffn_nw.buffer,
-        &scratch.x2,
-        hidden_dim as u32,
-        rms_eps,
-    )?;
-    encode_matvec(
-        encoder,
-        device,
-        &layer.router,
-        r_w,
-        &scratch.x2,
-        &scratch.router,
-    )?;
-    encode_moe_topk_softmax(
-        encoder,
-        device,
-        &scratch.router,
-        &scratch.ids,
-        &scratch.route,
-        layer.router.rows as u32,
-        top_k as u32,
-        norm_topk_prob,
-    )?;
-    // Concurrent gate∥up window; encoder end = sync.
-    renew_moe_encoder(cmd_buf, encoder, true)?;
-    encode_q4_0_moe_gate_up_id(
-        encoder,
-        device,
-        &scratch.x2,
-        &layer.packed,
-        &scratch.ids,
-        &scratch.gate,
-        &scratch.up,
-        top_k as u32,
-        1,
-    )?;
-    renew_moe_encoder(cmd_buf, encoder, false)?;
-    encode_q4_0_moe_id(
-        encoder,
-        device,
-        &scratch.x2,
-        &layer.packed,
-        &scratch.ids,
-        &scratch.route,
-        &scratch.gate,
-        &scratch.up,
-        &scratch.act,
-        &scratch.expert_out,
-        &scratch.h,
-        top_k as u32,
-        1,
-        true,
-        true,
-    )?;
+    {
+        let srcs = [scratch.k.as_ref()];
+        let dsts = [kv.k.as_ref()];
+        mrs.begin_op(encoder, &srcs, &dsts);
+        encode_kv_store_append(
+            encoder,
+            device,
+            &scratch.k,
+            kv,
+            KvPlane::K,
+            offset,
+            token_elems,
+        )?;
+        mrs.end_op(&srcs, &dsts);
+    }
+    {
+        let srcs = [scratch.v.as_ref()];
+        let dsts = [kv.v.as_ref()];
+        mrs.begin_op(encoder, &srcs, &dsts);
+        encode_kv_store_append(
+            encoder,
+            device,
+            &scratch.v,
+            kv,
+            KvPlane::V,
+            offset,
+            token_elems,
+        )?;
+        mrs.end_op(&srcs, &dsts);
+    }
+    {
+        let srcs = [scratch.q.as_ref(), kv.k.as_ref(), kv.v.as_ref()];
+        let dsts = [scratch.attn.as_ref()];
+        mrs.begin_op(encoder, &srcs, &dsts);
+        encode_gqa_with_kv(
+            encoder,
+            device,
+            &scratch.q,
+            kv,
+            &scratch.attn,
+            n_heads as u32,
+            n_kv_heads as u32,
+            head_dim as u32,
+            (pos + 1) as u32,
+            0,
+            layer.extras.attn_logit_softcap,
+        )?;
+        mrs.end_op(&srcs, &dsts);
+    }
+    {
+        let srcs = [scratch.attn.as_ref()];
+        let dsts = [scratch.o.as_ref()];
+        mrs.begin_op(encoder, &srcs, &dsts);
+        encode_matvec(encoder, device, &layer.o, o_w, &scratch.attn, &scratch.o)?;
+        mrs.end_op(&srcs, &dsts);
+    }
+    // h += o; x2 = rms(h) — h is both src and dst.
+    {
+        let srcs = [scratch.h.as_ref(), scratch.o.as_ref()];
+        let dsts = [scratch.h.as_ref(), scratch.x2.as_ref()];
+        mrs.begin_op(encoder, &srcs, &dsts);
+        encode_add_rms_norm(
+            encoder,
+            device,
+            &scratch.h,
+            &scratch.o,
+            &ffn_nw.buffer,
+            &scratch.x2,
+            hidden_dim as u32,
+            rms_eps,
+        )?;
+        mrs.end_op(&srcs, &dsts);
+    }
+    {
+        let srcs = [scratch.x2.as_ref()];
+        let dsts = [scratch.router.as_ref()];
+        mrs.begin_op(encoder, &srcs, &dsts);
+        encode_matvec(
+            encoder,
+            device,
+            &layer.router,
+            r_w,
+            &scratch.x2,
+            &scratch.router,
+        )?;
+        mrs.end_op(&srcs, &dsts);
+    }
+    {
+        let srcs = [scratch.router.as_ref()];
+        let dsts = [scratch.ids.as_ref(), scratch.route.as_ref()];
+        mrs.begin_op(encoder, &srcs, &dsts);
+        encode_moe_topk_softmax(
+            encoder,
+            device,
+            &scratch.router,
+            &scratch.ids,
+            &scratch.route,
+            layer.router.rows as u32,
+            top_k as u32,
+            norm_topk_prob,
+        )?;
+        mrs.end_op(&srcs, &dsts);
+    }
+    // gate∥up as one Concurrent set (disjoint dsts, shared x2/ids).
+    {
+        let srcs = [scratch.x2.as_ref(), scratch.ids.as_ref()];
+        let dsts = [scratch.gate.as_ref(), scratch.up.as_ref()];
+        mrs.begin_op(encoder, &srcs, &dsts);
+        encode_q4_0_moe_gate_up_id(
+            encoder,
+            device,
+            &scratch.x2,
+            &layer.packed,
+            &scratch.ids,
+            &scratch.gate,
+            &scratch.up,
+            top_k as u32,
+            1,
+        )?;
+        mrs.end_op(&srcs, &dsts);
+    }
+    // silu → down → residual (encode_q4_0_moe_id with gate_up_done; internal
+    // barriers cover silu↔down↔sum; mrs tracks the net h write).
+    {
+        let srcs = [
+            scratch.x2.as_ref(),
+            scratch.ids.as_ref(),
+            scratch.route.as_ref(),
+            scratch.gate.as_ref(),
+            scratch.up.as_ref(),
+            scratch.h.as_ref(),
+        ];
+        let dsts = [
+            scratch.act.as_ref(),
+            scratch.expert_out.as_ref(),
+            scratch.h.as_ref(),
+        ];
+        mrs.begin_op(encoder, &srcs, &dsts);
+        encode_q4_0_moe_id(
+            encoder,
+            device,
+            &scratch.x2,
+            &layer.packed,
+            &scratch.ids,
+            &scratch.route,
+            &scratch.gate,
+            &scratch.up,
+            &scratch.act,
+            &scratch.expert_out,
+            &scratch.h,
+            top_k as u32,
+            1,
+            true,
+            true, // gate∥up already in Concurrent set above
+        )?;
+        mrs.end_op(&srcs, &dsts);
+    }
     Ok(())
 }
 
@@ -4370,13 +4462,16 @@ pub fn launch_moe_decode_stack(
         }
 
         let cmd_buf = queue.commandBuffer().ok_or(MetalError::CommandFailed)?;
-        // Serial + Concurrent gate∥up windows (see encode_moe_layer_fused).
-        let mut encoder = cmd_buf
-            .computeCommandEncoder()
-            .ok_or(MetalError::CommandFailed)?;
+        // llama.cpp / dense-stack: one Concurrent encoder for the full graph,
+        // barriers only via MoeMemRanges (ggml_mem_ranges).
+        let encoder = compute_encoder_concurrent(&cmd_buf)?;
+        let mut mrs = MoeMemRanges::new();
 
         let _embd_w = if let Some(e) = embd {
             let w = resident_weight_buffer(device, e.weights)?;
+            let srcs: [&ProtocolObject<dyn MTLBuffer>; 0] = [];
+            let dsts = [scratch.h.as_ref()];
+            mrs.begin_op(&encoder, &srcs, &dsts);
             encode_get_rows(
                 &encoder,
                 device,
@@ -4387,6 +4482,7 @@ pub fn launch_moe_decode_stack(
                 e.n_cols as u32,
                 e.token_id as u32,
             )?;
+            mrs.end_op(&srcs, &dsts);
             Some(w)
         } else {
             None
@@ -4394,8 +4490,8 @@ pub fn launch_moe_decode_stack(
 
         for (layer_idx, (layer, kv)) in layers.iter().zip(kvs.iter()).enumerate() {
             encode_moe_layer_fused(
-                &cmd_buf,
-                &mut encoder,
+                &encoder,
+                &mut mrs,
                 device,
                 scratch,
                 layer_idx,
@@ -4419,28 +4515,46 @@ pub fn launch_moe_decode_stack(
         let (download_n, download_logits, download_argmax) = if let Some(fnw) = final_norm_w {
             assert_eq!(fnw.len(), hidden_dim);
             let fn_buf = resident_f32_buffer(device, fnw)?;
-            encode_rms_norm(
-                &encoder,
-                device,
-                &scratch.h,
-                &fn_buf.buffer,
-                &scratch.x_attn,
-                hidden_dim as u32,
-                rms_eps,
-            )?;
+            {
+                let srcs = [scratch.h.as_ref()];
+                let dsts = [scratch.x_attn.as_ref()];
+                mrs.begin_op(&encoder, &srcs, &dsts);
+                encode_rms_norm(
+                    &encoder,
+                    device,
+                    &scratch.h,
+                    &fn_buf.buffer,
+                    &scratch.x_attn,
+                    hidden_dim as u32,
+                    rms_eps,
+                )?;
+                mrs.end_op(&srcs, &dsts);
+            }
             if let Some(out_l) = output {
                 let logits = scratch.logits.as_ref().ok_or(MetalError::CommandFailed)?;
                 assert_eq!(out_l.rows, scratch.logits_cap);
                 let out_w = resident_weight_buffer(device, out_l.weights)?;
-                encode_matvec(&encoder, device, out_l, &out_w, &scratch.x_attn, logits)?;
+                {
+                    let srcs = [scratch.x_attn.as_ref()];
+                    let dsts = [logits.as_ref()];
+                    mrs.begin_op(&encoder, &srcs, &dsts);
+                    encode_matvec(&encoder, device, out_l, &out_w, &scratch.x_attn, logits)?;
+                    mrs.end_op(&srcs, &dsts);
+                }
                 if argmax_only {
-                    encode_argmax(
-                        &encoder,
-                        device,
-                        logits,
-                        &scratch.argmax_idx,
-                        out_l.rows as u32,
-                    )?;
+                    {
+                        let srcs = [logits.as_ref()];
+                        let dsts = [scratch.argmax_idx.as_ref()];
+                        mrs.begin_op(&encoder, &srcs, &dsts);
+                        encode_argmax(
+                            &encoder,
+                            device,
+                            logits,
+                            &scratch.argmax_idx,
+                            out_l.rows as u32,
+                        )?;
+                        mrs.end_op(&srcs, &dsts);
+                    }
                     (1, false, true)
                 } else {
                     (out_l.rows, true, false)
@@ -4456,6 +4570,22 @@ pub fn launch_moe_decode_stack(
         encoder.endEncoding();
         cmd_buf.commit();
         cmd_buf.waitUntilCompleted();
+        if std::env::var_os("FERROX_METAL_GPU_TIMING").is_some() {
+            static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            static GPU_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let dt = cmd_buf.GPUEndTime() - cmd_buf.GPUStartTime();
+            let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            let acc = GPU_NS.fetch_add((dt * 1e9) as u64, std::sync::atomic::Ordering::Relaxed)
+                + (dt * 1e9) as u64;
+            if n % 32 == 0 {
+                eprintln!(
+                    "ferrox: metal gpu {:.3} ms/tok avg over {} (last {:.3} ms)",
+                    (acc as f64 / n as f64) / 1e6,
+                    n,
+                    dt * 1e3
+                );
+            }
+        }
 
         for kv in kvs.iter_mut() {
             kv.seq_len = pos + 1;

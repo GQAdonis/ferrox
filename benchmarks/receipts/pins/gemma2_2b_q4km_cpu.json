@@ -4,7 +4,7 @@
   "name": "Gemma-2-2B-IT Q4_K_M",
   "backend": "cpu",
   "expect": "ok",
-  "date": "2026-08-05",
+  "date": "2026-08-06",
   "host": "Host B (Apple M2 Pro, 10 logical cores, 32 GiB unified)",
   "model": "~/Desktop/Dev/ferrox/models/gemma-2-2b-it-Q4_K_M.gguf",
   "max_tokens": 512,
@@ -13,36 +13,36 @@
   "workload": "greedy chat, warm then 3x 512-tok capitals list (median)",
   "notes": "Attn + final logit softcap + SWA; FA-vec softcap on decode/prefill d=256",
   "ferrox": {
-    "wall_s": 36.257,
-    "predicted_per_second": 15.273,
-    "prompt_per_second": 17.205,
+    "wall_s": 35.179,
+    "predicted_per_second": 15.542,
+    "prompt_per_second": 20.732,
     "completion_tokens": 512,
-    "wall_tok_s": 14.121,
+    "wall_tok_s": 14.554,
     "prefix": "I can't provide a list of 80 European capital cities with a ",
-    "predicted_stddev": 0.24,
-    "prompt_stddev": 0.311,
-    "wall_tok_s_stddev": 0.23,
+    "predicted_stddev": 0.032,
+    "prompt_stddev": 0.187,
+    "wall_tok_s_stddev": 0.025,
     "reps": 3,
     "runs": [
       {
-        "predicted_per_second": 14.901497608559962,
-        "prompt_per_second": 16.69465970953016,
-        "wall_tok_s": 13.795,
-        "wall_s": 37.116,
+        "predicted_per_second": 15.560764398586286,
+        "prompt_per_second": 20.66523063158261,
+        "wall_tok_s": 14.554,
+        "wall_s": 35.179,
         "completion_tokens": 512
       },
       {
-        "predicted_per_second": 15.272608928838507,
-        "prompt_per_second": 17.204681302268085,
-        "wall_tok_s": 14.121,
-        "wall_s": 36.257,
+        "predicted_per_second": 15.542132775393027,
+        "prompt_per_second": 20.732265492098854,
+        "wall_tok_s": 14.561,
+        "wall_s": 35.163,
         "completion_tokens": 512
       },
       {
-        "predicted_per_second": 15.351984613539868,
-        "prompt_per_second": 17.258039216338396,
-        "wall_tok_s": 14.238,
-        "wall_s": 35.96,
+        "predicted_per_second": 15.498438992790033,
+        "prompt_per_second": 21.01656373832151,
+        "wall_tok_s": 14.515,
+        "wall_s": 35.273,
         "completion_tokens": 512
       }
     ],
@@ -50,37 +50,37 @@
     "engine": "ferrox"
   },
   "llama": {
-    "wall_s": 31.504,
-    "predicted_per_second": 14.764,
-    "prompt_per_second": 72.416,
-    "completion_tokens": 432,
-    "wall_tok_s": 14.691,
+    "wall_s": 20.009,
+    "predicted_per_second": 20.704,
+    "prompt_per_second": 99.352,
+    "completion_tokens": 430,
+    "wall_tok_s": 20.341,
     "prefix": "I can't provide a list of 80 European capital cities with a ",
-    "predicted_stddev": 0.833,
-    "prompt_stddev": 11.462,
-    "wall_tok_s_stddev": 0.731,
+    "predicted_stddev": 0.246,
+    "prompt_stddev": 16.199,
+    "wall_tok_s_stddev": 0.19,
     "reps": 3,
     "runs": [
       {
-        "predicted_per_second": 15.450953098733253,
-        "prompt_per_second": 89.94675152309833,
-        "wall_tok_s": 15.142,
-        "wall_s": 25.161,
-        "completion_tokens": 381
+        "predicted_per_second": 20.772473685690628,
+        "prompt_per_second": 113.63883643502881,
+        "wall_tok_s": 20.341,
+        "wall_s": 20.009,
+        "completion_tokens": 407
       },
       {
-        "predicted_per_second": 14.763809186186254,
-        "prompt_per_second": 72.41566592239454,
-        "wall_tok_s": 14.691,
-        "wall_s": 34.852,
-        "completion_tokens": 512
+        "predicted_per_second": 20.316136394291092,
+        "prompt_per_second": 99.35172996199796,
+        "wall_tok_s": 20.186,
+        "wall_s": 19.766,
+        "completion_tokens": 399
       },
       {
-        "predicted_per_second": 13.793398517784384,
-        "prompt_per_second": 68.38853808101763,
-        "wall_tok_s": 13.713,
-        "wall_s": 31.504,
-        "completion_tokens": 432
+        "predicted_per_second": 20.70376428138438,
+        "prompt_per_second": 81.3140348024069,
+        "wall_tok_s": 20.564,
+        "wall_s": 20.91,
+        "completion_tokens": 430
       }
     ],
     "engine": "llama"

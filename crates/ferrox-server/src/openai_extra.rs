@@ -214,9 +214,7 @@ pub async fn embeddings(
     .await
     .map_err(join_error_response)??;
 
-    let model_name = req
-        .model
-        .unwrap_or_else(|| state.model.name().to_string());
+    let model_name = req.model.unwrap_or_else(|| state.model.name().to_string());
     Ok(Json(serde_json::json!({
         "object": "list",
         "data": data,
@@ -271,9 +269,7 @@ pub async fn completions(
         FinishReason::Stop => "stop",
         FinishReason::Length => "length",
     };
-    let model_name = req
-        .model
-        .unwrap_or_else(|| state.model.name().to_string());
+    let model_name = req.model.unwrap_or_else(|| state.model.name().to_string());
 
     Ok(Json(serde_json::json!({
         "id": "ferrox-cmpl-0",

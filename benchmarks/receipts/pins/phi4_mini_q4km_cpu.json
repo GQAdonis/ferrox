@@ -1,0 +1,89 @@
+{
+  "schema": 1,
+  "id": "phi4_mini_q4km",
+  "name": "Phi-4-mini-Instruct Q4_K_M",
+  "backend": "cpu",
+  "expect": "ok",
+  "date": "2026-08-06",
+  "host": "Host B (Apple M2 Pro, 10 logical cores, 32 GiB unified)",
+  "model": "~/Desktop/Dev/ferrox/models/Phi-4-mini-instruct-Q4_K_M.gguf",
+  "max_tokens": 512,
+  "reps": 3,
+  "mode": "server",
+  "workload": "greedy chat, warm then 3x 512-tok capitals list (median)",
+  "notes": "P6 PhiFamily (phi4 fused QKV); Host B receipt",
+  "ferrox": {
+    "wall_s": 3.053,
+    "predicted_per_second": 11.979,
+    "prompt_per_second": 14.601,
+    "completion_tokens": 2,
+    "wall_tok_s": 0.655,
+    "prefix": "1\n",
+    "predicted_stddev": 0.558,
+    "prompt_stddev": 0.287,
+    "wall_tok_s_stddev": 0.028,
+    "reps": 3,
+    "runs": [
+      {
+        "predicted_per_second": 11.979039651411862,
+        "prompt_per_second": 14.315663428841022,
+        "wall_tok_s": 0.63,
+        "wall_s": 3.173,
+        "completion_tokens": 2
+      },
+      {
+        "predicted_per_second": 12.520453334314103,
+        "prompt_per_second": 14.89043409401186,
+        "wall_tok_s": 0.686,
+        "wall_s": 2.914,
+        "completion_tokens": 2
+      },
+      {
+        "predicted_per_second": 11.404911646092453,
+        "prompt_per_second": 14.601266573449657,
+        "wall_tok_s": 0.655,
+        "wall_s": 3.053,
+        "completion_tokens": 2
+      }
+    ],
+    "metal_fails": 0,
+    "engine": "ferrox"
+  },
+  "llama": {
+    "wall_s": 26.782,
+    "predicted_per_second": 19.635,
+    "prompt_per_second": 52.584,
+    "completion_tokens": 512,
+    "wall_tok_s": 19.117,
+    "prefix": "Sure, here is a list of 80 European capital cities with one ",
+    "predicted_stddev": 1.366,
+    "prompt_stddev": 8.351,
+    "wall_tok_s_stddev": 1.353,
+    "reps": 3,
+    "runs": [
+      {
+        "predicted_per_second": 19.634552655671037,
+        "prompt_per_second": 52.58438016517181,
+        "wall_tok_s": 19.117,
+        "wall_s": 26.782,
+        "completion_tokens": 512
+      },
+      {
+        "predicted_per_second": 18.00248504615844,
+        "prompt_per_second": 47.27557608666288,
+        "wall_tok_s": 17.903,
+        "wall_s": 28.598,
+        "completion_tokens": 512
+      },
+      {
+        "predicted_per_second": 20.71503359982496,
+        "prompt_per_second": 63.645114839654084,
+        "wall_tok_s": 20.604,
+        "wall_s": 24.85,
+        "completion_tokens": 512
+      }
+    ],
+    "engine": "llama"
+  },
+  "status": "ok"
+}

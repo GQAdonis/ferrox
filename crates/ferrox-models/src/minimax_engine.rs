@@ -27,7 +27,8 @@ pub struct MinimaxEngine {
 impl MinimaxEngine {
     pub fn reject(_arch: &str) -> Result<(), MinimaxUnavailable> {
         Err(MinimaxUnavailable {
-            reason: "MiniMax 256-expert sigmoid MoE + MTP not yet implemented (see minimax_engine.rs)",
+            reason:
+                "MiniMax 256-expert sigmoid MoE + MTP not yet implemented (see minimax_engine.rs)",
         })
     }
 }

@@ -411,10 +411,7 @@ impl MetalKvDtype {
 
     /// True when attention must dequant store → f16 scratch before FA/GQA.
     pub fn needs_f16_scratch(self) -> bool {
-        matches!(
-            self,
-            Self::Q8_0 | Self::Turbo8 | Self::Turbo4 | Self::Fp8
-        )
+        matches!(self, Self::Q8_0 | Self::Turbo8 | Self::Turbo4 | Self::Fp8)
     }
 
     /// Uses ggml Q8_0 / fp8 34-byte blocks.
@@ -1928,10 +1925,12 @@ impl MetalKvBuffers {
             _ => {
                 let k_ptr = self.k.contents();
                 let v_ptr = self.v.contents();
-                let k =
-                    unsafe { std::slice::from_raw_parts(k_ptr.as_ptr() as *const u16, off + elems) };
-                let v =
-                    unsafe { std::slice::from_raw_parts(v_ptr.as_ptr() as *const u16, off + elems) };
+                let k = unsafe {
+                    std::slice::from_raw_parts(k_ptr.as_ptr() as *const u16, off + elems)
+                };
+                let v = unsafe {
+                    std::slice::from_raw_parts(v_ptr.as_ptr() as *const u16, off + elems)
+                };
                 (
                     k[off..off + elems]
                         .iter()
@@ -2408,7 +2407,11 @@ fn encode_dequant_q8_0_to_f16(
     if !n_elems.is_multiple_of(ferrox_quant::Q8_0_BLOCK_ELEMS as u32) {
         return Err(MetalError::CommandFailed);
     }
-    let pipe = ensure_pipeline(device, DEQUANT_Q8_0_TO_F16_KERNEL_SRC, "dequant_q8_0_to_f16")?;
+    let pipe = ensure_pipeline(
+        device,
+        DEQUANT_Q8_0_TO_F16_KERNEL_SRC,
+        "dequant_q8_0_to_f16",
+    )?;
     encoder.setComputePipelineState(&pipe.0);
     unsafe {
         encoder.setBuffer_offset_atIndex(Some(src), 0, 0);
@@ -2489,7 +2492,11 @@ fn encode_dequant_turbo4_to_f16(
     if !n_elems.is_multiple_of(ferrox_quant::TURBO4_KV_GROUP as u32) {
         return Err(MetalError::CommandFailed);
     }
-    let pipe = ensure_pipeline(device, DEQUANT_TURBO4_TO_F16_KERNEL_SRC, "dequant_turbo4_to_f16")?;
+    let pipe = ensure_pipeline(
+        device,
+        DEQUANT_TURBO4_TO_F16_KERNEL_SRC,
+        "dequant_turbo4_to_f16",
+    )?;
     encoder.setComputePipelineState(&pipe.0);
     unsafe {
         encoder.setBuffer_offset_atIndex(Some(src), 0, 0);
@@ -2575,33 +2582,13 @@ fn encode_gqa_with_kv(
         encode_kv_dequant_to_f16(encoder, device, kv.dtype, &kv.k, &scratch.k, elems as u32)?;
         encode_kv_dequant_to_f16(encoder, device, kv.dtype, &kv.v, &scratch.v, elems as u32)?;
         encode_gqa(
-            encoder,
-            device,
-            q,
-            &scratch.k,
-            &scratch.v,
-            out,
-            n_heads,
-            n_kv_heads,
-            head_dim,
-            seq_len,
-            kv_start,
-            softcap,
+            encoder, device, q, &scratch.k, &scratch.v, out, n_heads, n_kv_heads, head_dim,
+            seq_len, kv_start, softcap,
         )
     } else {
         encode_gqa(
-            encoder,
-            device,
-            q,
-            &kv.k,
-            &kv.v,
-            out,
-            n_heads,
-            n_kv_heads,
-            head_dim,
-            seq_len,
-            kv_start,
-            softcap,
+            encoder, device, q, &kv.k, &kv.v, out, n_heads, n_kv_heads, head_dim, seq_len,
+            kv_start, softcap,
         )
     }
 }
@@ -3202,8 +3189,24 @@ pub fn launch_decode_attn_block(
 
     let token_elems = (n_kv_heads * head_dim) as u32;
     let offset = (kv.seq_len * n_kv_heads * head_dim) as u32;
-    encode_kv_store_append(&encoder, device, &k_buf, kv, KvPlane::K, offset, token_elems)?;
-    encode_kv_store_append(&encoder, device, &v_buf, kv, KvPlane::V, offset, token_elems)?;
+    encode_kv_store_append(
+        &encoder,
+        device,
+        &k_buf,
+        kv,
+        KvPlane::K,
+        offset,
+        token_elems,
+    )?;
+    encode_kv_store_append(
+        &encoder,
+        device,
+        &v_buf,
+        kv,
+        KvPlane::V,
+        offset,
+        token_elems,
+    )?;
 
     let new_seq = (kv.seq_len + 1) as u32;
     encode_gqa_with_kv(
@@ -3356,8 +3359,24 @@ pub fn launch_decode_moe_attn_ffn_pre(
     )?;
     let token_elems = (n_kv_heads * head_dim) as u32;
     let offset = (kv.seq_len * n_kv_heads * head_dim) as u32;
-    encode_kv_store_append(&encoder, device, &k_buf, kv, KvPlane::K, offset, token_elems)?;
-    encode_kv_store_append(&encoder, device, &v_buf, kv, KvPlane::V, offset, token_elems)?;
+    encode_kv_store_append(
+        &encoder,
+        device,
+        &k_buf,
+        kv,
+        KvPlane::K,
+        offset,
+        token_elems,
+    )?;
+    encode_kv_store_append(
+        &encoder,
+        device,
+        &v_buf,
+        kv,
+        KvPlane::V,
+        offset,
+        token_elems,
+    )?;
     let new_seq = (kv.seq_len + 1) as u32;
     encode_gqa_with_kv(
         &encoder,
@@ -3502,11 +3521,7 @@ pub fn moe_decode_seed(hidden: &[f32]) -> Result<(), MetalError> {
         let hidden_dim = scratch.hidden_dim;
         let dst = scratch.h.contents();
         unsafe {
-            std::ptr::copy_nonoverlapping(
-                hidden.as_ptr(),
-                dst.as_ptr() as *mut f32,
-                hidden_dim,
-            );
+            std::ptr::copy_nonoverlapping(hidden.as_ptr(), dst.as_ptr() as *mut f32, hidden_dim);
         }
         Ok(())
     })
@@ -3618,9 +3633,7 @@ pub fn launch_moe_decode_pre(
 
     MOE_SCRATCH.with(|cell| {
         let mut slot = cell.borrow_mut();
-        let scratch = slot
-            .as_mut()
-            .ok_or(MetalError::CommandFailed)?;
+        let scratch = slot.as_mut().ok_or(MetalError::CommandFailed)?;
         if scratch.hidden_dim != hidden_dim {
             return Err(MetalError::CommandFailed);
         }
@@ -3723,8 +3736,24 @@ pub fn launch_moe_decode_pre(
         )?;
         let token_elems = (n_kv_heads * head_dim) as u32;
         let offset = (kv.seq_len * n_kv_heads * head_dim) as u32;
-        encode_kv_store_append(&encoder, device, &scratch.k, kv, KvPlane::K, offset, token_elems)?;
-        encode_kv_store_append(&encoder, device, &scratch.v, kv, KvPlane::V, offset, token_elems)?;
+        encode_kv_store_append(
+            &encoder,
+            device,
+            &scratch.k,
+            kv,
+            KvPlane::K,
+            offset,
+            token_elems,
+        )?;
+        encode_kv_store_append(
+            &encoder,
+            device,
+            &scratch.v,
+            kv,
+            KvPlane::V,
+            offset,
+            token_elems,
+        )?;
         let new_seq = (kv.seq_len + 1) as u32;
         encode_gqa_with_kv(
             &encoder,
@@ -3739,14 +3768,7 @@ pub fn launch_moe_decode_pre(
             0,
             extras.attn_logit_softcap,
         )?;
-        encode_matvec(
-            &encoder,
-            device,
-            o_launch,
-            &o_w,
-            &scratch.attn,
-            &scratch.o,
-        )?;
+        encode_matvec(&encoder, device, o_launch, &o_w, &scratch.attn, &scratch.o)?;
         encode_add_rms_norm(
             &encoder,
             device,
@@ -3960,8 +3982,24 @@ fn encode_moe_layer_fused(
     )?;
     let token_elems = (n_kv_heads * head_dim) as u32;
     let offset = (pos * n_kv_heads * head_dim) as u32;
-    encode_kv_store_append(encoder, device, &scratch.k, kv, KvPlane::K, offset, token_elems)?;
-    encode_kv_store_append(encoder, device, &scratch.v, kv, KvPlane::V, offset, token_elems)?;
+    encode_kv_store_append(
+        encoder,
+        device,
+        &scratch.k,
+        kv,
+        KvPlane::K,
+        offset,
+        token_elems,
+    )?;
+    encode_kv_store_append(
+        encoder,
+        device,
+        &scratch.v,
+        kv,
+        KvPlane::V,
+        offset,
+        token_elems,
+    )?;
     encode_gqa_with_kv(
         encoder,
         device,
@@ -4019,7 +4057,13 @@ fn encode_moe_layer_fused(
         top_k as u32,
         1,
     )?;
-    encode_vec_add(encoder, device, &scratch.h, &scratch.moe_out, hidden_dim as u32)?;
+    encode_vec_add(
+        encoder,
+        device,
+        &scratch.h,
+        &scratch.moe_out,
+        hidden_dim as u32,
+    )?;
     Ok(())
 }
 
@@ -4262,50 +4306,42 @@ pub fn launch_moe_decode_stack(
         }
 
         // final_norm → optional lm_head → optional argmax (dense-stack parity).
-        let (download_n, download_logits, download_argmax) =
-            if let Some(fnw) = final_norm_w {
-                assert_eq!(fnw.len(), hidden_dim);
-                let fn_buf = resident_f32_buffer(device, fnw)?;
-                encode_rms_norm(
-                    &encoder,
-                    device,
-                    &scratch.h,
-                    &fn_buf.buffer,
-                    &scratch.x_attn,
-                    hidden_dim as u32,
-                    rms_eps,
-                )?;
-                if let Some(out_l) = output {
-                    let logits = scratch.logits.as_ref().ok_or(MetalError::CommandFailed)?;
-                    assert_eq!(out_l.rows, scratch.logits_cap);
-                    let out_w = resident_weight_buffer(device, out_l.weights)?;
-                    encode_matvec(
+        let (download_n, download_logits, download_argmax) = if let Some(fnw) = final_norm_w {
+            assert_eq!(fnw.len(), hidden_dim);
+            let fn_buf = resident_f32_buffer(device, fnw)?;
+            encode_rms_norm(
+                &encoder,
+                device,
+                &scratch.h,
+                &fn_buf.buffer,
+                &scratch.x_attn,
+                hidden_dim as u32,
+                rms_eps,
+            )?;
+            if let Some(out_l) = output {
+                let logits = scratch.logits.as_ref().ok_or(MetalError::CommandFailed)?;
+                assert_eq!(out_l.rows, scratch.logits_cap);
+                let out_w = resident_weight_buffer(device, out_l.weights)?;
+                encode_matvec(&encoder, device, out_l, &out_w, &scratch.x_attn, logits)?;
+                if argmax_only {
+                    encode_argmax(
                         &encoder,
                         device,
-                        out_l,
-                        &out_w,
-                        &scratch.x_attn,
                         logits,
+                        &scratch.argmax_idx,
+                        out_l.rows as u32,
                     )?;
-                    if argmax_only {
-                        encode_argmax(
-                            &encoder,
-                            device,
-                            logits,
-                            &scratch.argmax_idx,
-                            out_l.rows as u32,
-                        )?;
-                        (1, false, true)
-                    } else {
-                        (out_l.rows, true, false)
-                    }
+                    (1, false, true)
                 } else {
-                    (hidden_dim, false, false)
+                    (out_l.rows, true, false)
                 }
             } else {
-                assert!(output.is_none(), "MoE stack lm_head requires final_norm");
                 (hidden_dim, false, false)
-            };
+            }
+        } else {
+            assert!(output.is_none(), "MoE stack lm_head requires final_norm");
+            (hidden_dim, false, false)
+        };
 
         encoder.endEncoding();
         cmd_buf.commit();
@@ -4484,8 +4520,24 @@ pub fn launch_decode_dense_layer(
 
     let token_elems = (n_kv_heads * head_dim) as u32;
     let offset = (kv.seq_len * n_kv_heads * head_dim) as u32;
-    encode_kv_store_append(&encoder, device, &k_buf, kv, KvPlane::K, offset, token_elems)?;
-    encode_kv_store_append(&encoder, device, &v_buf, kv, KvPlane::V, offset, token_elems)?;
+    encode_kv_store_append(
+        &encoder,
+        device,
+        &k_buf,
+        kv,
+        KvPlane::K,
+        offset,
+        token_elems,
+    )?;
+    encode_kv_store_append(
+        &encoder,
+        device,
+        &v_buf,
+        kv,
+        KvPlane::V,
+        offset,
+        token_elems,
+    )?;
 
     let new_seq = (kv.seq_len + 1) as u32;
     encode_gqa_with_kv(
@@ -5168,8 +5220,24 @@ pub fn launch_prefill_attn_block(
 
     let token_elems = (n_q * kv_width) as u32;
     let offset = (kv.seq_len * kv_width) as u32;
-    encode_kv_store_append(&encoder, device, &k_buf, kv, KvPlane::K, offset, token_elems)?;
-    encode_kv_store_append(&encoder, device, &v_buf, kv, KvPlane::V, offset, token_elems)?;
+    encode_kv_store_append(
+        &encoder,
+        device,
+        &k_buf,
+        kv,
+        KvPlane::K,
+        offset,
+        token_elems,
+    )?;
+    encode_kv_store_append(
+        &encoder,
+        device,
+        &v_buf,
+        kv,
+        KvPlane::V,
+        offset,
+        token_elems,
+    )?;
 
     let prefill_result = encode_gqa_prefill_with_kv(
         &encoder,
@@ -5982,20 +6050,12 @@ mod tests {
         let v: Vec<f32> = (0..n_q * n_kv_heads * head_dim)
             .map(|i| (i as f32 * 0.04).sin())
             .collect();
-        let mut kv_f16 = MetalKvBuffers::with_capacity_dtype(
-            n_kv_heads,
-            head_dim,
-            16,
-            MetalKvDtype::F16,
-        )
-        .expect("f16 kv");
-        let mut kv_q8 = MetalKvBuffers::with_capacity_dtype(
-            n_kv_heads,
-            head_dim,
-            16,
-            MetalKvDtype::Q8_0,
-        )
-        .expect("q8 kv");
+        let mut kv_f16 =
+            MetalKvBuffers::with_capacity_dtype(n_kv_heads, head_dim, 16, MetalKvDtype::F16)
+                .expect("f16 kv");
+        let mut kv_q8 =
+            MetalKvBuffers::with_capacity_dtype(n_kv_heads, head_dim, 16, MetalKvDtype::Q8_0)
+                .expect("q8 kv");
         assert_eq!(kv_q8.dtype(), MetalKvDtype::Q8_0);
         let (attn_f16, _, _) = launch_prefill_attn_block(
             &q,

@@ -123,7 +123,10 @@ pub fn read_hybrid_hparams(file: &impl TensorSource) -> Result<HybridHparams, Lo
 /// Detect layer type from tensors:
 /// - GDN if `ssm_conv1d.weight` **or** (`attn_qkv.weight` + `ssm_a`) present
 /// - full attn if `attn_q.weight` present
-pub fn detect_layer_kind(file: &impl TensorSource, layer_idx: usize) -> Result<HybridLayerKind, LoadError> {
+pub fn detect_layer_kind(
+    file: &impl TensorSource,
+    layer_idx: usize,
+) -> Result<HybridLayerKind, LoadError> {
     let l = layer_idx;
     let has_conv = file
         .find_tensor(&format!("blk.{l}.ssm_conv1d.weight"))
@@ -281,9 +284,7 @@ pub fn load_gdn_layer_weights(
     if kind != HybridLayerKind::Gdn {
         return Err(LoadError::UnsupportedFeature(
             hp.arch.clone(),
-            format!(
-                "blk.{layer_idx} is {kind:?}, not GDN — cannot load into GdnWeights"
-            ),
+            format!("blk.{layer_idx} is {kind:?}, not GDN — cannot load into GdnWeights"),
         ));
     }
     let cfg = gdn_config_from_hparams(hp)?;
@@ -294,10 +295,7 @@ pub fn load_gdn_layer_weights(
     let ssm_conv1d = load_f32_vec(file, &format!("blk.{l}.ssm_conv1d.weight"))?;
     let (_, ssm_dt) = load_f32_vec_first_of(
         file,
-        &[
-            &format!("blk.{l}.ssm_dt.bias"),
-            &format!("blk.{l}.ssm_dt"),
-        ],
+        &[&format!("blk.{l}.ssm_dt.bias"), &format!("blk.{l}.ssm_dt")],
     )?;
     let ssm_a = load_f32_vec(file, &format!("blk.{l}.ssm_a"))?;
     let ssm_beta = load_weight_matrix(file, &format!("blk.{l}.ssm_beta.weight"))?;
@@ -357,10 +355,7 @@ pub fn load_gdn_layer_weights(
 }
 
 fn serve_gap_message(hp: &HybridHparams, kinds: &[HybridLayerKind]) -> String {
-    let n_gdn = kinds
-        .iter()
-        .filter(|k| **k == HybridLayerKind::Gdn)
-        .count();
+    let n_gdn = kinds.iter().filter(|k| **k == HybridLayerKind::Gdn).count();
     let n_full = kinds
         .iter()
         .filter(|k| **k == HybridLayerKind::FullAttn)
@@ -376,10 +371,7 @@ fn serve_gap_message(hp: &HybridHparams, kinds: &[HybridLayerKind]) -> String {
         ));
     }
     if hp.n_expert > 0 {
-        missing.push(format!(
-            "MoE expert routing (expert_count={})",
-            hp.n_expert
-        ));
+        missing.push(format!("MoE expert routing (expert_count={})", hp.n_expert));
     }
     if hp.ssm_group_count != hp.ssm_time_step_rank {
         missing.push(format!(
@@ -452,9 +444,15 @@ mod tests {
         }
     }
 
-    fn build_gguf(arch: &str, kv: &[(&str, u64)], fkv: &[(&str, f32)], tensors: &[FixtureTensor]) -> Vec<u8> {
+    fn build_gguf(
+        arch: &str,
+        kv: &[(&str, u64)],
+        fkv: &[(&str, f32)],
+        tensors: &[FixtureTensor],
+    ) -> Vec<u8> {
         let mut buf = Vec::new();
-        buf.write_u32::<LittleEndian>(ferrox_gguf::GGUF_MAGIC).unwrap();
+        buf.write_u32::<LittleEndian>(ferrox_gguf::GGUF_MAGIC)
+            .unwrap();
         buf.write_u32::<LittleEndian>(3).unwrap();
         buf.write_u64::<LittleEndian>(tensors.len() as u64).unwrap();
         let kv_count = 1 + kv.len() + fkv.len();
@@ -654,7 +652,10 @@ mod tests {
             LoadError::UnsupportedFeature(arch, msg) => {
                 assert_eq!(arch, "qwen35");
                 assert!(msg.contains("HybridEngine"), "{msg}");
-                assert!(msg.contains("serve blocked") || msg.contains("missing"), "{msg}");
+                assert!(
+                    msg.contains("serve blocked") || msg.contains("missing"),
+                    "{msg}"
+                );
                 assert!(msg.contains("load_gdn_layer_weights"), "{msg}");
             }
             other => panic!("expected UnsupportedFeature, got {other:?}"),

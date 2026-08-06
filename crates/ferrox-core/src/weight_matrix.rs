@@ -448,8 +448,7 @@ impl WeightMatrix {
                                 .with_min_len(Self::min_rows_per_task(*rows))
                                 .enumerate()
                                 .for_each(|(r, o)| {
-                                    let row =
-                                        &data.as_slice()[r * row_bytes..(r + 1) * row_bytes];
+                                    let row = &data.as_slice()[r * row_bytes..(r + 1) * row_bytes];
                                     *o = match *kind {
                                         QuantKind::Q8_0 => ferrox_quant::dot_q8_0_q8(row, &act),
                                         QuantKind::Q4_0 => ferrox_quant::dot_q4_0_q8(row, &act),
@@ -464,8 +463,7 @@ impl WeightMatrix {
                                 .with_min_len(Self::min_rows_per_task(*rows))
                                 .enumerate()
                                 .for_each(|(r, o)| {
-                                    let row =
-                                        &data.as_slice()[r * row_bytes..(r + 1) * row_bytes];
+                                    let row = &data.as_slice()[r * row_bytes..(r + 1) * row_bytes];
                                     *o = ferrox_quant::dot_q4_k_q8(row, &act);
                                 });
                             return out;
@@ -635,16 +633,11 @@ impl WeightMatrix {
                                 .with_min_len(Self::min_rows_per_task(*rows))
                                 .enumerate()
                                 .for_each(|(r, out_row)| {
-                                    let row =
-                                        &data.as_slice()[r * row_bytes..(r + 1) * row_bytes];
+                                    let row = &data.as_slice()[r * row_bytes..(r + 1) * row_bytes];
                                     for (b, act) in acts.iter().enumerate() {
                                         out_row[b] = match *kind {
-                                            QuantKind::Q8_0 => {
-                                                ferrox_quant::dot_q8_0_q8(row, act)
-                                            }
-                                            QuantKind::Q4_0 => {
-                                                ferrox_quant::dot_q4_0_q8(row, act)
-                                            }
+                                            QuantKind::Q8_0 => ferrox_quant::dot_q8_0_q8(row, act),
+                                            QuantKind::Q4_0 => ferrox_quant::dot_q4_0_q8(row, act),
                                             _ => unreachable!(),
                                         };
                                     }
@@ -670,8 +663,7 @@ impl WeightMatrix {
                                 .with_min_len(Self::min_rows_per_task(*rows))
                                 .enumerate()
                                 .for_each(|(r, out_row)| {
-                                    let row =
-                                        &data.as_slice()[r * row_bytes..(r + 1) * row_bytes];
+                                    let row = &data.as_slice()[r * row_bytes..(r + 1) * row_bytes];
                                     for (b, act) in acts.iter().enumerate() {
                                         out_row[b] = ferrox_quant::dot_q4_k_q8(row, act);
                                     }

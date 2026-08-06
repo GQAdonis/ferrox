@@ -591,12 +591,8 @@ pub fn read_glm52_hparams(
         .metadata_u64(&p("leading_dense_block_count"))
         .unwrap_or(0) as usize;
     let n_experts = file.metadata_u64(&p("expert_count")).unwrap_or(0) as usize;
-    let n_shared_experts = file
-        .metadata_u64(&p("expert_shared_count"))
-        .unwrap_or(1) as usize;
-    let n_experts_active = file
-        .metadata_u64(&p("expert_used_count"))
-        .unwrap_or(8) as usize;
+    let n_shared_experts = file.metadata_u64(&p("expert_shared_count")).unwrap_or(1) as usize;
+    let n_experts_active = file.metadata_u64(&p("expert_used_count")).unwrap_or(8) as usize;
     let indexer_n_heads = file
         .metadata_u64(&p("attention.indexer_n_heads"))
         .unwrap_or(4) as usize;
@@ -666,7 +662,10 @@ fn load_embedding_tensor(
         let r = wm.dequant_row(row);
         data[row * hidden_dim..(row + 1) * hidden_dim].copy_from_slice(&r);
     }
-    Ok(ferrox_core::tensor::Tensor::new(data, vec![vocab, hidden_dim]))
+    Ok(ferrox_core::tensor::Tensor::new(
+        data,
+        vec![vocab, hidden_dim],
+    ))
 }
 
 /// Load a GLM-5.2 / GLM4-family GGUF into [`crate::engine::Glm52Engine`].
@@ -674,8 +673,8 @@ pub fn load_glm52_engine(
     file: &impl TensorSource,
 ) -> Result<crate::engine::Glm52Engine, LoadError> {
     use crate::glm52_decoder::{
-        Glm52DecoderConfig, Glm52DecoderLayerWeights, Glm52DecoderWeights, Glm52LayerFfn,
-        Glm52DenseFfnWeights as DecDenseFfn, Glm52MoeFfnWeights as DecMoeFfn,
+        Glm52DecoderConfig, Glm52DecoderLayerWeights, Glm52DecoderWeights,
+        Glm52DenseFfnWeights as DecDenseFfn, Glm52LayerFfn, Glm52MoeFfnWeights as DecMoeFfn,
     };
 
     let (hp, meta) = read_glm52_hparams(file)?;

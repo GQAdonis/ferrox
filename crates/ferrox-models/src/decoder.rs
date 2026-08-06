@@ -770,21 +770,23 @@ impl Decoder {
         let n = experts.len();
         // Contiguity: expert i's gate starts at gate0 + i*stride (same for up/down).
         let last = n - 1;
-        let (WeightMatrix::Quantized {
-            data: gd,
-            kind: ferrox_core::QuantKind::Q4_0,
-            ..
-        },
-        WeightMatrix::Quantized {
-            data: ud,
-            kind: ferrox_core::QuantKind::Q4_0,
-            ..
-        },
-        WeightMatrix::Quantized {
-            data: dd,
-            kind: ferrox_core::QuantKind::Q4_0,
-            ..
-        }) = (&experts[last].gate, &experts[last].up, &experts[last].down)
+        let (
+            WeightMatrix::Quantized {
+                data: gd,
+                kind: ferrox_core::QuantKind::Q4_0,
+                ..
+            },
+            WeightMatrix::Quantized {
+                data: ud,
+                kind: ferrox_core::QuantKind::Q4_0,
+                ..
+            },
+            WeightMatrix::Quantized {
+                data: dd,
+                kind: ferrox_core::QuantKind::Q4_0,
+                ..
+            },
+        ) = (&experts[last].gate, &experts[last].up, &experts[last].down)
         else {
             return None;
         };
@@ -804,21 +806,23 @@ impl Decoder {
         // align first+last by chance).
         if n > 2 {
             let mid = n / 2;
-            let (WeightMatrix::Quantized {
-                data: gd,
-                kind: ferrox_core::QuantKind::Q4_0,
-                ..
-            },
-            WeightMatrix::Quantized {
-                data: ud,
-                kind: ferrox_core::QuantKind::Q4_0,
-                ..
-            },
-            WeightMatrix::Quantized {
-                data: dd,
-                kind: ferrox_core::QuantKind::Q4_0,
-                ..
-            }) = (&experts[mid].gate, &experts[mid].up, &experts[mid].down)
+            let (
+                WeightMatrix::Quantized {
+                    data: gd,
+                    kind: ferrox_core::QuantKind::Q4_0,
+                    ..
+                },
+                WeightMatrix::Quantized {
+                    data: ud,
+                    kind: ferrox_core::QuantKind::Q4_0,
+                    ..
+                },
+                WeightMatrix::Quantized {
+                    data: dd,
+                    kind: ferrox_core::QuantKind::Q4_0,
+                    ..
+                },
+            ) = (&experts[mid].gate, &experts[mid].up, &experts[mid].down)
             else {
                 return None;
             };
@@ -886,12 +890,7 @@ impl Decoder {
         let mut route = Vec::with_capacity(batch_size * top_k);
         for b in 0..batch_size {
             let logits = &router_logits_batch[b * n_experts..(b + 1) * n_experts];
-            let decision = route_top_k(
-                logits,
-                top_k,
-                config.moe.gating,
-                config.moe.norm_topk_prob,
-            );
+            let decision = route_top_k(logits, top_k, config.moe.gating, config.moe.norm_topk_prob);
             layer.moe.record_activations(&decision.expert_ids);
             if decision.expert_ids.len() != top_k {
                 return None;
@@ -1219,10 +1218,7 @@ impl Decoder {
         #[cfg(feature = "metal")]
         if use_metal_attn
             && ferrox_metal::attn::metal_moe_resident_enabled()
-            && matches!(
-                self.config.moe.gating,
-                ferrox_moe::GatingFunction::Softmax
-            )
+            && matches!(self.config.moe.gating, ferrox_moe::GatingFunction::Softmax)
             && self
                 .layers
                 .iter()
@@ -1268,17 +1264,14 @@ impl Decoder {
                         if ok {
                             // Greedy / FERROX_METAL_LOGITS: fold lm_head(+argmax)
                             // like dense stack — download 1×u32 or vocab, skip host.
-                            let greedy_gpu =
-                                ferrox_metal::attn::metal_greedy_argmax_active();
-                            let lm_head_gpu_launch =
-                                Self::metal_matvec_launch(&self.output_head);
-                            let out_launch = if greedy_gpu
-                                || ferrox_metal::attn::metal_logits_enabled()
-                            {
-                                lm_head_gpu_launch
-                            } else {
-                                None
-                            };
+                            let greedy_gpu = ferrox_metal::attn::metal_greedy_argmax_active();
+                            let lm_head_gpu_launch = Self::metal_matvec_launch(&self.output_head);
+                            let out_launch =
+                                if greedy_gpu || ferrox_metal::attn::metal_logits_enabled() {
+                                    lm_head_gpu_launch
+                                } else {
+                                    None
+                                };
                             let embd_launch = Self::metal_matvec_launch(&self.embedding);
                             // Gemma scales embd on host; GPU gather has no scale.
                             let embd_gather = if self.config.embedding_scale.is_some() {
@@ -1334,8 +1327,7 @@ impl Decoder {
                                 )
                             }) {
                                 Ok((out, per_layer_ids)) => {
-                                    for (layer, ids) in
-                                        self.layers.iter().zip(per_layer_ids.iter())
+                                    for (layer, ids) in self.layers.iter().zip(per_layer_ids.iter())
                                     {
                                         if !ids.is_empty() {
                                             layer.moe.record_activations(ids);
@@ -1729,34 +1721,34 @@ impl Decoder {
                                                 };
 
                                                 if !fused_ok {
-                                                match ferrox_metal::attn::launch_moe_decode_pre(
-                                                    &layer.attn.norm_weight,
-                                                    &q_l,
-                                                    &k_l,
-                                                    &v_l,
-                                                    &o_l,
-                                                    &mut metal_kvs[l],
-                                                    &layer.moe.norm_weight,
-                                                    &router_l,
-                                                    n_heads,
-                                                    self.metal_rope_layout(),
-                                                    self.config.rope_theta,
-                                                    self.config.rope_freqs.as_deref(),
-                                                    pos,
-                                                    self.config.rms_norm_eps,
-                                                    &self.metal_attn_extras(layer),
-                                                ) {
-                                                    Ok(logits) => {
-                                                        let decision = route_top_k(
-                                                            &logits,
-                                                            self.config.moe.n_experts_active,
-                                                            self.config.moe.gating,
-                                                            self.config.moe.norm_topk_prob,
-                                                        );
-                                                        layer
-                                                            .moe
-                                                            .record_activations(&decision.expert_ids);
-                                                        if let Some(()) = Self::try_metal_moe_experts_resident(
+                                                    match ferrox_metal::attn::launch_moe_decode_pre(
+                                                        &layer.attn.norm_weight,
+                                                        &q_l,
+                                                        &k_l,
+                                                        &v_l,
+                                                        &o_l,
+                                                        &mut metal_kvs[l],
+                                                        &layer.moe.norm_weight,
+                                                        &router_l,
+                                                        n_heads,
+                                                        self.metal_rope_layout(),
+                                                        self.config.rope_theta,
+                                                        self.config.rope_freqs.as_deref(),
+                                                        pos,
+                                                        self.config.rms_norm_eps,
+                                                        &self.metal_attn_extras(layer),
+                                                    ) {
+                                                        Ok(logits) => {
+                                                            let decision = route_top_k(
+                                                                &logits,
+                                                                self.config.moe.n_experts_active,
+                                                                self.config.moe.gating,
+                                                                self.config.moe.norm_topk_prob,
+                                                            );
+                                                            layer.moe.record_activations(
+                                                                &decision.expert_ids,
+                                                            );
+                                                            if let Some(()) = Self::try_metal_moe_experts_resident(
                                                             layer,
                                                             &decision,
                                                         ) {
@@ -1789,26 +1781,27 @@ impl Decoder {
                                                             did_metal_attn = true;
                                                             did_metal_moe = true; // skip second FFN
                                                         }
-                                                    }
-                                                    Err(e) => {
-                                                        eprintln!(
+                                                        }
+                                                        Err(e) => {
+                                                            eprintln!(
                                                             "ferrox: Metal MoE pre failed, fallback: {e}"
                                                         );
-                                                        if let Some(h) =
+                                                            if let Some(h) =
                                                             ferrox_metal::attn::moe_decode_take_hidden()
                                                         {
                                                             hidden = h;
                                                         }
-                                                        metal_moe_resident = false;
-                                                        if metal_kvs[l].seq_len != cache.seq_len {
-                                                            Self::catch_up_host_kv_from_metal(
-                                                                &metal_kvs[l],
-                                                                cache,
-                                                            );
-                                                            clear_metal_kv = true;
+                                                            metal_moe_resident = false;
+                                                            if metal_kvs[l].seq_len != cache.seq_len
+                                                            {
+                                                                Self::catch_up_host_kv_from_metal(
+                                                                    &metal_kvs[l],
+                                                                    cache,
+                                                                );
+                                                                clear_metal_kv = true;
+                                                            }
                                                         }
                                                     }
-                                                }
                                                 }
                                             }
                                         }
@@ -2312,52 +2305,22 @@ impl Decoder {
             }
         }
 
-        let routed_outputs: Vec<(Vec<f32>, f32)> = {
-            // Resident MoE: run top-k experts in parallel (OLMoE k=8).
-            // Store-backed experts stay sequential (shared ExpertStore lock).
-            let parallel = matches!(layer.moe.experts, ExpertBacking::Resident(_))
-                && decision.expert_ids.len() > 1
-                && plan.map(|p| {
-                    decision
-                        .expert_ids
-                        .iter()
-                        .all(|&eid| matches!(p.placement_for(eid), ExpertPlacement::Cpu))
-                })
-                .unwrap_or(true);
-            if parallel {
-                use rayon::prelude::*;
-                decision
-                    .expert_ids
-                    .par_iter()
-                    .zip(decision.weights.par_iter())
-                    .map(|(&eid, &w)| {
-                        (
-                            layer
-                                .moe
-                                .with_expert(eid, |ex| run_expert_placed(normed2, ex, ExpertPlacement::Cpu)),
-                            w,
-                        )
-                    })
-                    .collect()
-            } else {
-                decision
-                    .expert_ids
-                    .iter()
-                    .zip(decision.weights.iter())
-                    .map(|(&eid, &w)| {
-                        let placement = plan
-                            .map(|p| p.placement_for(eid))
-                            .unwrap_or(ExpertPlacement::Cpu);
-                        (
-                            layer
-                                .moe
-                                .with_expert(eid, |ex| run_expert_placed(normed2, ex, placement)),
-                            w,
-                        )
-                    })
-                    .collect()
-            }
-        };
+        let routed_outputs: Vec<(Vec<f32>, f32)> = decision
+            .expert_ids
+            .iter()
+            .zip(decision.weights.iter())
+            .map(|(&eid, &w)| {
+                let placement = plan
+                    .map(|p| p.placement_for(eid))
+                    .unwrap_or(ExpertPlacement::Cpu);
+                (
+                    layer
+                        .moe
+                        .with_expert(eid, |ex| run_expert_placed(normed2, ex, placement)),
+                    w,
+                )
+            })
+            .collect();
         // Shared experts fire on every token regardless of routing, so
         // there's no offload decision to make for them the way there
         // is for routed experts -- always CPU, matching `run_expert`.
@@ -2718,9 +2681,7 @@ impl Decoder {
                         if let Some(post) = &layer.attn.post_ffn_norm {
                             ffn_batch = ffn_batch
                                 .chunks(hidden_dim)
-                                .flat_map(|row| {
-                                    rms_norm(row, post, self.config.rms_norm_eps)
-                                })
+                                .flat_map(|row| rms_norm(row, post, self.config.rms_norm_eps))
                                 .collect();
                         }
                         for (h, f) in hidden_batch.iter_mut().zip(ffn_batch.iter()) {

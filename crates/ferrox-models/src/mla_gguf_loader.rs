@@ -117,7 +117,10 @@ fn load_f32_vec(file: &impl TensorSource, name: &str) -> Result<Vec<f32>, LoadEr
     }
 }
 
-fn load_f32_vec_optional(file: &impl TensorSource, name: &str) -> Result<Option<Vec<f32>>, LoadError> {
+fn load_f32_vec_optional(
+    file: &impl TensorSource,
+    name: &str,
+) -> Result<Option<Vec<f32>>, LoadError> {
     if file.find_tensor(name).is_none() {
         return Ok(None);
     }
@@ -188,7 +191,10 @@ fn load_mla_attn(
     let o_proj = load_weight_matrix(file, &format!("blk.{l}.attn_output.weight"))?;
 
     // Prefer combined `attn_kv_b`; else refuse split k_b/v_b until concat lands.
-    let kv_b_proj = if file.find_tensor(&format!("blk.{l}.attn_kv_b.weight")).is_some() {
+    let kv_b_proj = if file
+        .find_tensor(&format!("blk.{l}.attn_kv_b.weight"))
+        .is_some()
+    {
         load_weight_matrix(file, &format!("blk.{l}.attn_kv_b.weight"))?
     } else {
         return Err(LoadError::Gguf(ferrox_gguf::GgufError::TensorNotFound(
@@ -297,8 +303,8 @@ pub fn load_mla_engine(file: &impl TensorSource) -> Result<MlaEngine, LoadError>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use byteorder::{LittleEndian, WriteBytesExt};
     use crate::engine::Engine;
+    use byteorder::{LittleEndian, WriteBytesExt};
     use ferrox_gguf::GgufFile;
     use std::io::Write;
 
@@ -324,9 +330,15 @@ mod tests {
         }
     }
 
-    fn build_gguf(arch: &str, kv: &[(&str, u64)], fkv: &[(&str, f32)], tensors: &[FixtureTensor]) -> Vec<u8> {
+    fn build_gguf(
+        arch: &str,
+        kv: &[(&str, u64)],
+        fkv: &[(&str, f32)],
+        tensors: &[FixtureTensor],
+    ) -> Vec<u8> {
         let mut buf = Vec::new();
-        buf.write_u32::<LittleEndian>(ferrox_gguf::GGUF_MAGIC).unwrap();
+        buf.write_u32::<LittleEndian>(ferrox_gguf::GGUF_MAGIC)
+            .unwrap();
         buf.write_u32::<LittleEndian>(3).unwrap();
         buf.write_u64::<LittleEndian>(tensors.len() as u64).unwrap();
         // general.architecture + uint + float kvs
@@ -478,10 +490,8 @@ mod tests {
             ("deepseek2.rope.freq_base", 10000.0f32),
         ];
         let bytes = build_gguf(arch, &kv, &fkv, &tensors);
-        let path = std::env::temp_dir().join(format!(
-            "ferrox_mla_gguf_{}.gguf",
-            std::process::id()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("ferrox_mla_gguf_{}.gguf", std::process::id()));
         std::fs::write(&path, &bytes).unwrap();
         let file = GgufFile::open(&path).unwrap();
         let engine = load_mla_engine(&file).expect("load mla");

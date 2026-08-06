@@ -491,7 +491,6 @@ dependencies = [
  "ferrox-moe",
  "ferrox-quant",
  "ferrox-safetensors",
- "rayon",
  "regex",
  "serde",
  "serde_json",

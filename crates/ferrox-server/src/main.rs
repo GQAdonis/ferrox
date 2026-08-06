@@ -29,16 +29,16 @@
 //! Continuous-batching streaming also buffers (batcher returns one
 //! string).
 
+mod anthropic;
 mod batch_scheduler;
 mod cache;
 mod chat_template;
 mod generate;
-mod json_mode;
 mod journal;
+mod json_mode;
 mod limits;
 mod mcp;
 mod model;
-mod anthropic;
 mod openai_extra;
 mod security;
 mod session;
@@ -553,9 +553,9 @@ impl MessageContent {
     fn has_image(&self) -> bool {
         match self {
             Self::Text(_) => false,
-            Self::Parts(parts) => parts.iter().any(|p| {
-                p.kind == "image_url" || p.image_url.is_some()
-            }),
+            Self::Parts(parts) => parts
+                .iter()
+                .any(|p| p.kind == "image_url" || p.image_url.is_some()),
         }
     }
 }
@@ -1406,7 +1406,8 @@ fn resolve_history(state: &AppState, req: &ChatCompletionRequest) -> Vec<ChatMes
 }
 
 fn inject_json_object_system_hint(messages: &mut Vec<ChatMessage>) {
-    const HINT: &str = "You must respond with valid JSON only (a single JSON object, no markdown fences).";
+    const HINT: &str =
+        "You must respond with valid JSON only (a single JSON object, no markdown fences).";
     if let Some(sys) = messages.iter_mut().find(|m| m.role == "system") {
         match &mut sys.content {
             Some(MessageContent::Text(s)) if !s.contains("JSON") => {
@@ -2208,9 +2209,7 @@ async fn run(mcp_config_path: Option<PathBuf>, ui_server: bool) -> anyhow::Resul
     if let Ok(n) = std::env::var("FERROX_CHUNKED_PREFILL") {
         if let Ok(chunk) = n.parse::<usize>() {
             if chunk > 0 {
-                tracing::info!(
-                    "chunked prefill enabled: {chunk} tokens per forward_batch chunk"
-                );
+                tracing::info!("chunked prefill enabled: {chunk} tokens per forward_batch chunk");
             }
         }
     }
@@ -2237,7 +2236,13 @@ async fn run(mcp_config_path: Option<PathBuf>, ui_server: bool) -> anyhow::Resul
         None => None,
     };
 
-    let state = Arc::new(build_app_state(loaded, kv_pool, prefix_cache, enable_cb, mcp));
+    let state = Arc::new(build_app_state(
+        loaded,
+        kv_pool,
+        prefix_cache,
+        enable_cb,
+        mcp,
+    ));
 
     let mut public = Router::new().route("/health", get(health));
     if ui_server {
@@ -2306,9 +2311,7 @@ async fn run(mcp_config_path: Option<PathBuf>, ui_server: bool) -> anyhow::Resul
         protected = protected.route_layer(cors);
     }
 
-    let app = public
-        .merge(protected)
-        .with_state(state);
+    let app = public.merge(protected).with_state(state);
 
     // TLS is off by default -- set FERROX_TLS_CERT and FERROX_TLS_KEY
     // together to serve HTTPS instead of plain HTTP; unset (either or
@@ -2488,12 +2491,8 @@ mod tests {
     #[tokio::test]
     async fn tokenize_detokenize_roundtrip_and_embeddings_mean() {
         let app = test_app();
-        let (status, tok) = post_json_uri(
-            &app,
-            "/v1/tokenize",
-            serde_json::json!({ "prompt": "Hi" }),
-        )
-        .await;
+        let (status, tok) =
+            post_json_uri(&app, "/v1/tokenize", serde_json::json!({ "prompt": "Hi" })).await;
         assert_eq!(status, StatusCode::OK);
         let tokens = tok["tokens"].as_array().unwrap();
         assert_eq!(tok["count"], tokens.len());

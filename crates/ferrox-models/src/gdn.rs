@@ -57,12 +57,12 @@ pub struct GdnWeights {
     pub attn_gate: WeightMatrix, // [v_dim, hidden]
     /// Depthwise taps, row-major `[qkv_dim, conv_kernel_size]`.
     pub ssm_conv1d: Vec<f32>,
-    pub ssm_dt: Vec<f32>,          // [num_v_heads]
-    pub ssm_a: Vec<f32>,           // [num_v_heads]
-    pub ssm_beta: WeightMatrix,    // [num_v_heads, hidden]
-    pub ssm_alpha: WeightMatrix,   // [num_v_heads, hidden]
-    pub ssm_norm: Vec<f32>,        // [head_dim]
-    pub ssm_out: WeightMatrix,     // [hidden, v_dim]
+    pub ssm_dt: Vec<f32>,        // [num_v_heads]
+    pub ssm_a: Vec<f32>,         // [num_v_heads]
+    pub ssm_beta: WeightMatrix,  // [num_v_heads, hidden]
+    pub ssm_alpha: WeightMatrix, // [num_v_heads, hidden]
+    pub ssm_norm: Vec<f32>,      // [head_dim]
+    pub ssm_out: WeightMatrix,   // [hidden, v_dim]
 }
 
 /// Fixed-size recurrent + short-conv state (unlike growing KV).
@@ -326,8 +326,7 @@ mod tests {
         assert!(out1.iter().all(|x| x.is_finite()));
         // Second step must see non-zero recurrent state → different output.
         assert!(
-            out0
-                .iter()
+            out0.iter()
                 .zip(out1.iter())
                 .any(|(a, b)| (a - b).abs() > 1e-6),
             "recurrent state should change the second token"

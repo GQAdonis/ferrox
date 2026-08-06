@@ -2894,6 +2894,7 @@ pub struct MoePackedQ4<'a> {
 }
 
 /// Encode softmax top-k routing (n≤256, k≤8) into an existing encoder.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_moe_topk_softmax(
     encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
     device: &Retained<ProtocolObject<dyn MTLDevice>>,
@@ -2944,7 +2945,7 @@ pub(crate) fn encode_moe_topk_softmax(
     Ok(())
 }
 
-
+#[allow(clippy::too_many_arguments)]
 fn encode_q4_0_moe_matvec_id(
     encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
     device: &Retained<ProtocolObject<dyn MTLDevice>>,
@@ -2978,7 +2979,11 @@ fn encode_q4_0_moe_matvec_id(
             5,
         );
         let mut rows = n_rows;
-        encoder.setBytes_length_atIndex(NonNull::new(&mut rows as *mut u32 as *mut _).unwrap(), 4, 6);
+        encoder.setBytes_length_atIndex(
+            NonNull::new(&mut rows as *mut u32 as *mut _).unwrap(),
+            4,
+            6,
+        );
         let mut tk = top_k;
         encoder.setBytes_length_atIndex(NonNull::new(&mut tk as *mut u32 as *mut _).unwrap(), 4, 7);
         let mut stride = expert_stride;
@@ -2990,7 +2995,11 @@ fn encode_q4_0_moe_matvec_id(
         let mut nt = n_tokens;
         encoder.setBytes_length_atIndex(NonNull::new(&mut nt as *mut u32 as *mut _).unwrap(), 4, 9);
         let mut xs = x_stride;
-        encoder.setBytes_length_atIndex(NonNull::new(&mut xs as *mut u32 as *mut _).unwrap(), 4, 10);
+        encoder.setBytes_length_atIndex(
+            NonNull::new(&mut xs as *mut u32 as *mut _).unwrap(),
+            4,
+            10,
+        );
     }
     encoder.dispatchThreadgroups_threadsPerThreadgroup(
         MTLSize {
@@ -3157,11 +3166,7 @@ pub(crate) fn encode_q4_0_moe_id(
             7,
         );
         let mut tk = top_k;
-        encoder.setBytes_length_atIndex(
-            NonNull::new(&mut tk as *mut u32 as *mut _).unwrap(),
-            4,
-            8,
-        );
+        encoder.setBytes_length_atIndex(NonNull::new(&mut tk as *mut u32 as *mut _).unwrap(), 4, 8);
         let mut stride = packed.down_stride as u32;
         encoder.setBytes_length_atIndex(
             NonNull::new(&mut stride as *mut u32 as *mut _).unwrap(),
@@ -3200,17 +3205,9 @@ pub(crate) fn encode_q4_0_moe_id(
             3,
         );
         let mut tk = top_k;
-        encoder.setBytes_length_atIndex(
-            NonNull::new(&mut tk as *mut u32 as *mut _).unwrap(),
-            4,
-            4,
-        );
+        encoder.setBytes_length_atIndex(NonNull::new(&mut tk as *mut u32 as *mut _).unwrap(), 4, 4);
         let mut nt = n_tokens;
-        encoder.setBytes_length_atIndex(
-            NonNull::new(&mut nt as *mut u32 as *mut _).unwrap(),
-            4,
-            5,
-        );
+        encoder.setBytes_length_atIndex(NonNull::new(&mut nt as *mut u32 as *mut _).unwrap(), 4, 5);
     }
     const SUM_TG: usize = 256;
     let sum_elems = (n_tokens as usize) * packed.hidden_rows;
@@ -3287,10 +3284,7 @@ pub fn launch_moe_prefill_q4_0(
         .newBufferWithLength_options(n_slots * ffn * 4, MTLResourceOptions::StorageModeShared)
         .ok_or(MetalError::BufferAllocFailed)?;
     let expert_out_buf = device
-        .newBufferWithLength_options(
-            n_slots * hidden * 4,
-            MTLResourceOptions::StorageModeShared,
-        )
+        .newBufferWithLength_options(n_slots * hidden * 4, MTLResourceOptions::StorageModeShared)
         .ok_or(MetalError::BufferAllocFailed)?;
     let out_buf = device
         .newBufferWithLength_options(n_tokens * hidden * 4, MTLResourceOptions::StorageModeShared)
@@ -4325,7 +4319,10 @@ mod tests {
                 for r in 0..ffn {
                     let range = g_base + r * gu_row_bytes..g_base + (r + 1) * gu_row_bytes;
                     let g = ferrox_quant::dot_q4_0_f32_scalar(&gate[range.clone()], &x);
-                    let u = ferrox_quant::dot_q4_0_f32_scalar(&up[u_base + r * gu_row_bytes..u_base + (r + 1) * gu_row_bytes], &x);
+                    let u = ferrox_quant::dot_q4_0_f32_scalar(
+                        &up[u_base + r * gu_row_bytes..u_base + (r + 1) * gu_row_bytes],
+                        &x,
+                    );
                     act[r] = ferrox_core_silu(g) * u;
                 }
                 for r in 0..hidden {

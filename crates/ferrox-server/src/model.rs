@@ -30,9 +30,9 @@ use std::path::Path;
 use ferrox_gguf::ShardedGguf;
 use ferrox_models::{
     deepseek_v4_pro, glm_5_2, kimi_k3, load_glm52_engine_from_path, load_mla_engine_from_path,
-    select_engine_kind, ByteTokenizer, Decoder, Glm52Engine, GgufBpeTokenizer, GgufSpmTokenizer,
-    GgufUnigramTokenizer, KimiEngine, MlaEngine, ModelConfig, SelectedEngineKind, ServedEngine,
-    TextTokenizer,
+    select_engine_kind, ByteTokenizer, Decoder, GgufBpeTokenizer, GgufSpmTokenizer,
+    GgufUnigramTokenizer, Glm52Engine, KimiEngine, MlaEngine, ModelConfig, SelectedEngineKind,
+    ServedEngine, TextTokenizer,
 };
 
 /// Default expert-cache budget when `FERROX_SSD_STREAMING` is set without
@@ -267,7 +267,8 @@ fn load_glm52_checkpoint(path: &str, file: &ShardedGguf) -> anyhow::Result<Glm52
         .unwrap_or(arch.as_str())
         .to_string();
     tracing::info!("loading GGUF as GLM-5.2 engine (arch={arch}, name={name})");
-    let served = load_glm52_engine_from_path(Path::new(path)).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let served =
+        load_glm52_engine_from_path(Path::new(path)).map_err(|e| anyhow::anyhow!("{e}"))?;
     let ServedEngine::Glm52(engine) = served else {
         anyhow::bail!("expected ServedEngine::Glm52 for architecture {arch}");
     };

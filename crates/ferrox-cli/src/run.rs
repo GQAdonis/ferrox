@@ -488,10 +488,7 @@ pub fn run_infer(args: InferArgs) -> anyhow::Result<()> {
         .unwrap_or("unknown")
         .to_string();
     ferrox_models::mmproj::eprint_mmproj_if_present(path, Some(arch_early.as_str()));
-    if matches!(
-        select_engine_kind(&arch_early),
-        Ok(SelectedEngineKind::Mla)
-    ) {
+    if matches!(select_engine_kind(&arch_early), Ok(SelectedEngineKind::Mla)) {
         return run_mla_infer(args, path, &file);
     }
     if matches!(arch_early.as_str(), "glm-dsa" | "glm4" | "glm4moe") {
@@ -681,11 +678,7 @@ pub fn run_infer(args: InferArgs) -> anyhow::Result<()> {
 }
 
 /// Dense-lead DeepSeek-2 / Mistral-4 path via [`MlaEngine`].
-fn run_mla_infer(
-    args: InferArgs,
-    path: &Path,
-    file: &ShardedGguf,
-) -> anyhow::Result<()> {
+fn run_mla_infer(args: InferArgs, path: &Path, file: &ShardedGguf) -> anyhow::Result<()> {
     let tokenizer = match file.metadata_str("tokenizer.ggml.model") {
         Some("gpt2") => CliTokenizer::Bpe(Box::new(GgufBpeTokenizer::from_gguf(file)?)),
         Some("llama") => CliTokenizer::Spm(GgufSpmTokenizer::from_gguf(file)?),
@@ -829,11 +822,7 @@ fn run_mla_infer(
 }
 
 /// GLM-5.2 / GLM4-family path via [`Glm52Engine`].
-fn run_glm52_infer(
-    args: InferArgs,
-    path: &Path,
-    file: &ShardedGguf,
-) -> anyhow::Result<()> {
+fn run_glm52_infer(args: InferArgs, path: &Path, file: &ShardedGguf) -> anyhow::Result<()> {
     let tokenizer = match file.metadata_str("tokenizer.ggml.model") {
         Some("gpt2") => CliTokenizer::Bpe(Box::new(GgufBpeTokenizer::from_gguf(file)?)),
         Some("llama") => CliTokenizer::Spm(GgufSpmTokenizer::from_gguf(file)?),

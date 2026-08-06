@@ -193,7 +193,9 @@ pub fn load_glm52_engine_from_path(path: &std::path::Path) -> Result<ServedEngin
             return Err(LoadError::DedicatedArchitectureRequired(a, r));
         }
     }
-    Ok(ServedEngine::Glm52(glm52_gguf_loader::load_glm52_engine(&file)?))
+    Ok(ServedEngine::Glm52(glm52_gguf_loader::load_glm52_engine(
+        &file,
+    )?))
 }
 
 #[cfg(test)]

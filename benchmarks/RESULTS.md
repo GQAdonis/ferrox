@@ -20,9 +20,9 @@ Keep off (regressions): legacy GQA NSG=4, sequential GREEDY argmax, float4 elem,
 | Model | Backend | ferrox pred (tok/s) | llama pred (tok/s) | Gap | Winner | Status | Pin |
 |---|---|---|---|---|---|---|---|
 | TinyLlama-1.1B-Chat-v1.0 Q8_0 | metal | **114.63** ±0.5 | **110.26** ±0.5 | ⚪ **~0.96×** | ⚪ parity | ok | [`tinyllama_q8_metal`](receipts/pins/tinyllama_q8_metal.json) |
-| TinyLlama-1.1B-Chat-v1.0 Q8_0 | cpu | **38.60** ±2.3 | **41.99** ±0.9 (−ngl 0) | 🔴 **~1.09×** | 🔴 **llama** | ok | [`tinyllama_q8_cpu`](receipts/pins/tinyllama_q8_cpu.json) |
+| TinyLlama-1.1B-Chat-v1.0 Q8_0 | cpu | **40.83** ±0.3 | **46.93** ±0.7 (−ngl 0) | 🔴 **~1.15×** | 🔴 **llama** | ok | [`tinyllama_q8_cpu`](receipts/pins/tinyllama_q8_cpu.json) |
 | Llama-3.2-1B-Instruct Q4_K_M | metal | **137.88** ±5.0 | **136.99** ±0.4 | ⚪ **1.00×** | ⚪ parity | ok | [`llama32_1b_q4km_metal`](receipts/pins/llama32_1b_q4km_metal.json) |
-| OLMoE-1B-7B-0924 Q4_0 | cpu | **22.20** ±0.7 | **44.34** ±11.0 (−ngl 0) | 🔴 **~2.00×** | 🔴 **llama** | ok | [`olmoe_q4_cpu`](receipts/pins/olmoe_q4_cpu.json) |
+| OLMoE-1B-7B-0924 Q4_0 | cpu | **22.85** ±0.2 | **49.44** ±1.8 (−ngl 0) | 🔴 **~2.16×** | 🔴 **llama** | ok | [`olmoe_q4_cpu`](receipts/pins/olmoe_q4_cpu.json) |
 | OLMoE-1B-7B-0924 Q4_0 | metal | **85.86** ±0.5 | **146.94** ±2.2 | 🔴 **~1.71×** | 🔴 **llama** | ok | [`olmoe_q4_metal`](receipts/pins/olmoe_q4_metal.json) |
 | OLMoE-1B-7B-0924 Q4_0 | cuda | — | — | — | — | no pin | — |
 | Llama-3.1-8B-Instruct Q4_K_M | metal | **28.17** ±0.8 | **25.86** ±1.2 | 🟢 **~0.92×** | 🟢 **ferrox** | ok | [`llama31_8b_q4km_metal`](receipts/pins/llama31_8b_q4km_metal.json) |
@@ -30,26 +30,26 @@ Keep off (regressions): legacy GQA NSG=4, sequential GREEDY argmax, float4 elem,
 | Llama-3.2-3B-Instruct Q4_K_M | metal | **57.70** ±0.1 | **64.31** ±0.4 | 🔴 **~1.11×** | 🔴 **llama** | ok | [`llama32_3b_q4km_metal`](receipts/pins/llama32_3b_q4km_metal.json) |
 | Qwen1.5-MoE-A2.7B Q4_K_M | cpu | — | — | — | — | no pin | — |
 | Qwen1.5-MoE-A2.7B Q4_K_M | metal | — | — | — | — | no pin | — |
-| Mistral-7B-Instruct-v0.2 Q4_K_M | cpu | **8.58** ±0.0 | **7.24** ±0.9 (−ngl 0) | 🟢 **~0.84×** | 🟢 **ferrox** | ok | [`mistral_7b_q4km_cpu`](receipts/pins/mistral_7b_q4km_cpu.json) |
+| Mistral-7B-Instruct-v0.2 Q4_K_M | cpu | **8.18** ±0.1 | **9.35** ±0.4 (−ngl 0) | 🔴 **~1.14×** | 🔴 **llama** | ok | [`mistral_7b_q4km_cpu`](receipts/pins/mistral_7b_q4km_cpu.json) |
 | Mistral-7B-Instruct-v0.2 Q4_K_M | metal | **27.76** ±1.4 | **26.41** ±1.3 | ⚪ **~0.95×** | ⚪ parity | ok | [`mistral_7b_q4km_metal`](receipts/pins/mistral_7b_q4km_metal.json) |
 | Mixtral-8x7B-Instruct Q4_K_M | cpu | — | — | — | — | no pin | — |
 | Llama-3.2-1B-Instruct IQ4_XS | metal | **146.29** ±2.4 | **138.21** ±3.3 | 🟢 **~0.94×** | 🟢 **ferrox** | ok | [`iq4_xs_metal`](receipts/pins/iq4_xs_metal.json) |
 | Gemma-2-2B-IT Q4_K_M | metal | **57.75** ±1.0 | **63.59** ±0.2 | 🔴 **~1.10×** | 🔴 **llama** | ok | [`gemma2_2b_q4km_metal`](receipts/pins/gemma2_2b_q4km_metal.json) |
-| Gemma-2-2B-IT Q4_K_M | cpu | **15.27** ±0.2 | **14.76** ±0.8 (−ngl 0) | ⚪ **~0.97×** | ⚪ parity | ok | [`gemma2_2b_q4km_cpu`](receipts/pins/gemma2_2b_q4km_cpu.json) |
+| Gemma-2-2B-IT Q4_K_M | cpu | **15.54** ±0.0 | **20.70** ±0.2 (−ngl 0) | 🔴 **~1.33×** | 🔴 **llama** | ok | [`gemma2_2b_q4km_cpu`](receipts/pins/gemma2_2b_q4km_cpu.json) |
 | SmolLM2-135M-Instruct Q8_0 | metal | **282.29** ±0.8 | **217.91** ±4.4 | 🟢 **~0.77×** | 🟢 **ferrox** | ok | [`smollm2_135m_q8_metal`](receipts/pins/smollm2_135m_q8_metal.json) |
-| SmolLM2-135M-Instruct Q8_0 | cpu | **55.84** ±0.7 | **43.48** ±5.9 (−ngl 0) | 🟢 **~0.78×** | 🟢 **ferrox** | ok | [`smollm2_135m_q8_cpu`](receipts/pins/smollm2_135m_q8_cpu.json) |
+| SmolLM2-135M-Instruct Q8_0 | cpu | **70.17** ±1.0 | **146.99** ±11.3 (−ngl 0) | 🔴 **~2.09×** | 🔴 **llama** | ok | [`smollm2_135m_q8_cpu`](receipts/pins/smollm2_135m_q8_cpu.json) |
 | Qwen2.5-0.5B-Instruct Q8_0 | metal | **185.66** ±1.1 | **116.03** ±0.4 | 🟢 **~0.62×** | 🟢 **ferrox** | ok | [`qwen25_05b_q8_metal`](receipts/pins/qwen25_05b_q8_metal.json) |
-| Qwen2.5-0.5B-Instruct Q8_0 | cpu | **50.97** ±0.9 | **44.86** ±6.4 (−ngl 0) | 🟢 **~0.88×** | 🟢 **ferrox** | ok | [`qwen25_05b_q8_cpu`](receipts/pins/qwen25_05b_q8_cpu.json) |
+| Qwen2.5-0.5B-Instruct Q8_0 | cpu | **64.06** ±0.6 | **94.04** ±6.4 (−ngl 0) | 🔴 **~1.47×** | 🔴 **llama** | ok | [`qwen25_05b_q8_cpu`](receipts/pins/qwen25_05b_q8_cpu.json) |
 | Qwen3-0.6B Q8_0 | metal | **131.50** ±0.9 | **107.06** ±1.9 | 🟢 **~0.81×** | 🟢 **ferrox** | ok | [`qwen3_06b_q8_metal`](receipts/pins/qwen3_06b_q8_metal.json) |
-| Qwen3-0.6B Q8_0 | cpu | **33.38** ±0.9 | **29.82** ±5.7 (−ngl 0) | 🟢 **~0.89×** | 🟢 **ferrox** | ok | [`qwen3_06b_q8_cpu`](receipts/pins/qwen3_06b_q8_cpu.json) |
+| Qwen3-0.6B Q8_0 | cpu | **34.35** ±0.1 | **61.64** ±3.2 (−ngl 0) | 🔴 **~1.79×** | 🔴 **llama** | ok | [`qwen3_06b_q8_cpu`](receipts/pins/qwen3_06b_q8_cpu.json) |
 | Gemma-3-1B-IT Q8_0 | metal | **91.22** ±1.0 | **74.43** ±0.6 | 🟢 **~0.82×** | 🟢 **ferrox** | ok | [`gemma3_1b_q8_metal`](receipts/pins/gemma3_1b_q8_metal.json) |
-| Gemma-3-1B-IT Q8_0 | cpu | **31.67** ±3.7 | **19.72** ±1.9 (−ngl 0) | 🟢 **~0.62×** | 🟢 **ferrox** | ok | [`gemma3_1b_q8_cpu`](receipts/pins/gemma3_1b_q8_cpu.json) |
+| Gemma-3-1B-IT Q8_0 | cpu | **40.26** ±0.3 | **49.15** ±0.6 (−ngl 0) | 🔴 **~1.22×** | 🔴 **llama** | ok | [`gemma3_1b_q8_cpu`](receipts/pins/gemma3_1b_q8_cpu.json) |
 | Phi-3-mini-4k-Instruct Q4 | metal | **48.19** ±3.8 | **44.56** ±1.4 | 🟢 **~0.92×** | 🟢 **ferrox** | ok | [`phi3_mini_q4_metal`](receipts/pins/phi3_mini_q4_metal.json) |
-| Phi-3-mini-4k-Instruct Q4 | cpu | **7.91** ±0.1 | **7.68** ±4.8 (−ngl 0) | ⚪ **~0.97×** | ⚪ parity | ok | [`phi3_mini_q4_cpu`](receipts/pins/phi3_mini_q4_cpu.json) |
+| Phi-3-mini-4k-Instruct Q4 | cpu | **8.91** ±0.2 | **17.89** ±0.2 (−ngl 0) | 🔴 **~2.01×** | 🔴 **llama** | ok | [`phi3_mini_q4_cpu`](receipts/pins/phi3_mini_q4_cpu.json) |
 | Gemma-4-E2B-IT Q4_K_M | metal | refused | — | — | — | refuse | [`gemma4_e2b_q4km_metal`](receipts/pins/gemma4_e2b_q4km_metal.json) |
-| Gemma-4-E2B-IT Q4_K_M | cpu | — | — | — | — | no pin | — |
+| Gemma-4-E2B-IT Q4_K_M | cpu | refused | — | — | — | refuse | [`gemma4_e2b_q4km_cpu`](receipts/pins/gemma4_e2b_q4km_cpu.json) |
 | Phi-4-mini-Instruct Q4_K_M | metal | **49.54** ±0.3 | **49.96** ±0.2 | ⚪ **1.00×** | ⚪ parity | ok | [`phi4_mini_q4km_metal`](receipts/pins/phi4_mini_q4km_metal.json) |
-| Phi-4-mini-Instruct Q4_K_M | cpu | — | — | — | — | no pin | — |
+| Phi-4-mini-Instruct Q4_K_M | cpu | **11.98** ±0.6 | **19.64** ±1.4 (−ngl 0) | 🔴 **~1.64×** | 🔴 **llama** | ok | [`phi4_mini_q4km_cpu`](receipts/pins/phi4_mini_q4km_cpu.json) |
 
 
 ## CLI completion (`llama-completion` vs `ferrox run`)

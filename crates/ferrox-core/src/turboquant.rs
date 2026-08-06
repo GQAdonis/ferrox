@@ -12,7 +12,10 @@
 /// In-place Fast Walsh–Hadamard Transform. `x.len()` must be a power of two.
 pub fn fwht_inplace(x: &mut [f32]) {
     let n = x.len();
-    assert!(n.is_power_of_two() && n > 0, "fwht length must be 2^k, got {n}");
+    assert!(
+        n.is_power_of_two() && n > 0,
+        "fwht length must be 2^k, got {n}"
+    );
     let mut h = 1usize;
     while h < n {
         let step = h * 2;

@@ -16,8 +16,9 @@ pub mod iq_tables;
 pub mod repack;
 
 pub use repack::{
-    gemv_q4_kx8_group, gemv_q4_kx8_q8_k, make_block_q4_kx8, pack_q4_k_matrix_x8, q4_kx8_interleave,
-    Q4_KX8_BLOCK_BYTES, Q4_KX8_NROWS,
+    gemv_q4_kx8_group, gemv_q4_kx8_q8_k, gemv_q8_0x4_group, gemv_q8_0x4_q8_0, make_block_q4_kx8,
+    make_block_q8_0x4, pack_q4_k_matrix_x8, pack_q8_0_matrix_x4, q4_kx8_interleave,
+    Q4_KX8_BLOCK_BYTES, Q4_KX8_NROWS, Q8_0X4_BLOCK_BYTES, Q8_0X4_INTERLEAVE, Q8_0X4_NROWS,
 };
 
 use half::f16;
@@ -857,6 +858,106 @@ pub fn dot_q4_k_q8_scalar(row_bytes: &[u8], act: &Q8KActivations) -> f32 {
             base += 64;
             is += 2;
         }
+    }
+    acc
+}
+
+/// Integer `vec_dot` of a Q5_K weight row against [`Q8KActivations`]
+/// (llama.cpp `ggml_vec_dot_q5_K_q8_K`). Opt-in via `FERROX_CPU_INT_DOT`.
+pub fn dot_q5_k_q8(row_bytes: &[u8], act: &Q8KActivations) -> f32 {
+    dot_q5_k_q8_scalar(row_bytes, act)
+}
+
+pub fn dot_q5_k_q8_scalar(row_bytes: &[u8], act: &Q8KActivations) -> f32 {
+    debug_assert_eq!(row_bytes.len() % Q5_K_BLOCK_BYTES, 0);
+    let n_blocks = row_bytes.len() / Q5_K_BLOCK_BYTES;
+    debug_assert_eq!(n_blocks, act.n_blocks());
+    let mut acc = 0f32;
+    for (b, block) in row_bytes.chunks_exact(Q5_K_BLOCK_BYTES).enumerate() {
+        let d = f16::from_le_bytes([block[0], block[1]]).to_f32();
+        let dmin = f16::from_le_bytes([block[2], block[3]]).to_f32();
+        let scales: [u8; Q4_K_SCALE_BYTES] = block[4..16].try_into().unwrap();
+        let qh = &block[16..48];
+        let qs = &block[48..176];
+        let da = act.d[b];
+        let q8 = &act.q[b * Q5_K_BLOCK_ELEMS..(b + 1) * Q5_K_BLOCK_ELEMS];
+        let bsums = &act.bsums[b * 16..(b + 1) * 16];
+
+        let mut sum_min = 0i32;
+        for i in 0..8 {
+            let (_, m) = q4_k_scale_min(i, &scales);
+            sum_min += m as i32 * (bsums[2 * i] as i32 + bsums[2 * i + 1] as i32);
+        }
+        acc -= dmin * da * sum_min as f32;
+
+        let mut q_off = 0usize;
+        let mut base = 0usize;
+        let mut is = 0usize;
+        let (mut u1, mut u2) = (1u8, 2u8);
+        for _ in 0..4 {
+            let (sc1, _) = q4_k_scale_min(is, &scales);
+            let (sc2, _) = q4_k_scale_min(is + 1, &scales);
+            let mut isum1 = 0i32;
+            let mut isum2 = 0i32;
+            for l in 0..32 {
+                let hi = if qh[l] & u1 != 0 { 16 } else { 0 };
+                isum1 += ((qs[q_off + l] & 0x0F) + hi) as i32 * q8[base + l] as i32;
+            }
+            for l in 0..32 {
+                let hi = if qh[l] & u2 != 0 { 16 } else { 0 };
+                isum2 += ((qs[q_off + l] >> 4) + hi) as i32 * q8[base + 32 + l] as i32;
+            }
+            acc += d * da * (sc1 as f32 * isum1 as f32 + sc2 as f32 * isum2 as f32);
+            q_off += 32;
+            base += 64;
+            is += 2;
+            u1 <<= 2;
+            u2 <<= 2;
+        }
+    }
+    acc
+}
+
+/// Integer `vec_dot` of a Q6_K weight row against [`Q8KActivations`]
+/// (llama.cpp `ggml_vec_dot_q6_K_q8_K`). Opt-in via `FERROX_CPU_INT_DOT`.
+pub fn dot_q6_k_q8(row_bytes: &[u8], act: &Q8KActivations) -> f32 {
+    dot_q6_k_q8_scalar(row_bytes, act)
+}
+
+pub fn dot_q6_k_q8_scalar(row_bytes: &[u8], act: &Q8KActivations) -> f32 {
+    debug_assert_eq!(row_bytes.len() % Q6_K_BLOCK_BYTES, 0);
+    let n_blocks = row_bytes.len() / Q6_K_BLOCK_BYTES;
+    debug_assert_eq!(n_blocks, act.n_blocks());
+    // Q6_K uses 256-elem super-blocks; Q8_K acts share that width.
+    debug_assert_eq!(Q6_K_BLOCK_ELEMS, Q4_K_BLOCK_ELEMS);
+    let mut acc = 0f32;
+    for (b, block) in row_bytes.chunks_exact(Q6_K_BLOCK_BYTES).enumerate() {
+        let ql_full = &block[0..128];
+        let qh_full = &block[128..192];
+        let sc_full = &block[192..208];
+        let d = f16::from_le_bytes([block[208], block[209]]).to_f32();
+        let da = act.d[b];
+        let q8 = &act.q[b * Q6_K_BLOCK_ELEMS..(b + 1) * Q6_K_BLOCK_ELEMS];
+        let mut isum = 0i32;
+
+        for half in 0..2 {
+            let ql = &ql_full[half * 64..half * 64 + 64];
+            let qh = &qh_full[half * 32..half * 32 + 32];
+            let sc = &sc_full[half * 8..half * 8 + 8];
+            let q8h = &q8[half * 128..half * 128 + 128];
+            for l in 0..32 {
+                let is = l / 16;
+                let q1 = ((ql[l] & 0x0F) | ((qh[l] & 3) << 4)) as i8 as i32 - 32;
+                let q2 = ((ql[l + 32] & 0x0F) | (((qh[l] >> 2) & 3) << 4)) as i8 as i32 - 32;
+                let q3 = ((ql[l] >> 4) | (((qh[l] >> 4) & 3) << 4)) as i8 as i32 - 32;
+                let q4 = ((ql[l + 32] >> 4) | (((qh[l] >> 6) & 3) << 4)) as i8 as i32 - 32;
+                isum += (sc[is] as i8 as i32) * q1 * (q8h[l] as i32);
+                isum += (sc[is + 2] as i8 as i32) * q2 * (q8h[l + 32] as i32);
+                isum += (sc[is + 4] as i8 as i32) * q3 * (q8h[l + 64] as i32);
+                isum += (sc[is + 6] as i8 as i32) * q4 * (q8h[l + 96] as i32);
+            }
+        }
+        acc += d * da * isum as f32;
     }
     acc
 }
@@ -4559,6 +4660,42 @@ mod tests {
         assert!(
             err / scale < 0.05,
             "int-dot vs f32 relative err {err}/{scale} too large (int={dispatched} f32={float_dot})"
+        );
+    }
+
+    #[test]
+    fn dot_q5_k_q8_matches_scalar_and_tracks_float_dot() {
+        let x: Vec<f32> = (0..Q5_K_BLOCK_ELEMS)
+            .map(|i| ((i as f32) * 0.013 - 1.7).sin() * 1.5)
+            .collect();
+        let act = quantize_activations_q8_k(&x);
+        let dispatched = dot_q5_k_q8(&Q5_K_TEST_BLOCK, &act);
+        let scalar = dot_q5_k_q8_scalar(&Q5_K_TEST_BLOCK, &act);
+        assert_eq!(dispatched, scalar, "dispatch must match scalar");
+        let float_dot = dot_q5_k_f32(&Q5_K_TEST_BLOCK, &x);
+        let err = (dispatched - float_dot).abs();
+        let scale = float_dot.abs().max(1.0);
+        assert!(
+            err / scale < 0.05,
+            "Q5_K int-dot vs f32 relative err {err}/{scale} (int={dispatched} f32={float_dot})"
+        );
+    }
+
+    #[test]
+    fn dot_q6_k_q8_matches_scalar_and_tracks_float_dot() {
+        let x: Vec<f32> = (0..Q6_K_BLOCK_ELEMS)
+            .map(|i| ((i as f32) * 0.011 - 0.9).cos() * 1.9)
+            .collect();
+        let act = quantize_activations_q8_k(&x);
+        let dispatched = dot_q6_k_q8(&Q6_K_TEST_BLOCK, &act);
+        let scalar = dot_q6_k_q8_scalar(&Q6_K_TEST_BLOCK, &act);
+        assert_eq!(dispatched, scalar, "dispatch must match scalar");
+        let float_dot = dot_q6_k_f32(&Q6_K_TEST_BLOCK, &x);
+        let err = (dispatched - float_dot).abs();
+        let scale = float_dot.abs().max(1.0);
+        assert!(
+            err / scale < 0.05,
+            "Q6_K int-dot vs f32 relative err {err}/{scale} (int={dispatched} f32={float_dot})"
         );
     }
 

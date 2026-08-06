@@ -10,10 +10,10 @@ What ships today: [`FEATURES.md`](FEATURES.md) · [`MODELS.md`](MODELS.md).
 
 **Performance**
 
-- Re-pin OLMoE Metal after fused encode groups + `mul_mm_id` prefill; chase Gap ≤ ~1.05×
+- Re-pin OLMoE Metal; chase Gap ≤ ~1.05× (fused multi-layer prefill CB)
 - Deferred MoE residual (dense-style) — correct tokens then land
 - Improve Metal dense prefill `prompt_per_second` (true simdgroup `mul_mm`)
-- CPU: extend interleaved repack beyond Q4_K (Q8_0 / Q5_K / Q6_K); re-pin Host B CPU suite
+- CPU: close remaining SmolLM2/Qwen3/Phi-3 Q8/Q5 gaps (~1.2–1.6×)
 - CUDA fair-chat pins on a GPU host
 
 **Models**

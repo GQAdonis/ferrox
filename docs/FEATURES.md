@@ -28,7 +28,7 @@ Full matrix and pins: [`MODELS.md`](MODELS.md) ·
 
 | Backend | Capabilities |
 |---|---|
-| **CPU** | Dense + MoE; `FERROX_CPU_INT_DOT` int8×int8 + interleaved Q4_Kx8 GEMV |
+| **CPU** | Dense + MoE; `FERROX_CPU_INT_DOT` int8×int8 + interleaved Q4_Kx8 / Q8_0x4 GEMV + Q5/Q6 int-dot |
 | **Metal** | FA-vec attention (decode d=64/96/128/256, prefill d=128/256), concurrent FFN/QKV encode, MoE Concurrent + fused groups + `MoeMemRanges` + `mul_mm_id` prefill, quantized KV (`q8_0` / `turbo8` / `fp8` / `turbo4`) |
 | **CUDA** | Matvec, resident weights, FFN fuse (`--features cuda`) |
 

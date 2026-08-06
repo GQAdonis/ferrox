@@ -66,7 +66,7 @@ Architecture list: `ferrox archs` →
 
 | Backend | What it covers |
 |---|---|
-| CPU | Dense + MoE; `FERROX_CPU_INT_DOT=1` (+ interleaved Q4_K) on suite runs |
+| CPU | Dense + MoE; `FERROX_CPU_INT_DOT=1` (Q4_Kx8 / Q8_0x4 / Q5·Q6 int-dot) on suite runs |
 | Metal | Dense + MoE + FA-vec; fused MoE encode groups; `mul_mm_id` prefill; quantized KV |
 | CUDA | Matvec + resident weights + FFN fuse |
 

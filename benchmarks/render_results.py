@@ -326,9 +326,9 @@ def main() -> None:
     lines.append(
         "1. Metal fair-chat 8B is ahead (~0.92×); 3B ~parity (~0.97×). Keep "
         "watching `prompt_per_second` vs llama after FA-vec prefill.\n"
-        "2. OLMoE Metal ~1.41× — fused encode groups + barrier instrumentation "
-        "landed; deferred residual + single-grid `mul_mm_id` still open "
-        "(`docs/ROADMAP.md`). Prefill `prompt_per_second` still ≪ llama.\n"
+        "2. OLMoE Metal ~1.43× — Concurrent gate∥up remains best; gate→silu×up "
+        "and sparse `mul_mm_id` host loops regress. Prefill still needs a "
+        "fused multi-layer CB (scratch reuse landed). See `docs/ROADMAP.md`.\n"
         "3. CUDA — re-measure on comparable CUDA hardware (no in-tree CUDA pin; "
         "skipped on darwin via `--fit-host`).\n"
         "4. Gemma-4-E2B: `Gemma4Engine` loads; tokenizer `gemma4` still "
@@ -339,8 +339,9 @@ def main() -> None:
         "(MoE-after-dense wired in `MlaEngine`).\n"
         "7. Qwen2-MoE / Mixtral: missing GGUF or `--fit-host` RAM skip on Host B.\n"
         "8. Suite contention: re-pin outliers alone if full-suite medians disagree with CLI.\n"
-        "9. CPU: interleaved Q4_K closed Mistral/Phi4/OLMoE gaps (ferrox ahead); "
-        "extend to Q8_0 for small-model CPU pins.\n"
+        "9. CPU: Q8_0x4 + Q5/Q6 int-dot closed most reds (TinyLlama/Gemma-3/Gemma-2 "
+        "ahead or parity). Remaining: SmolLM2 ~1.63×, Qwen3/Phi-3 ~1.23×, "
+        "Qwen2.5 ~1.12×.\n"
     )
 
     OUT.write_text("".join(lines))

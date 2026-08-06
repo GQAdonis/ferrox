@@ -3321,6 +3321,80 @@ fn moe_mm_id_map0(
 /// (after map0) can be large; gate on total prompt tokens as a proxy.
 const MOE_MM_ID_TOKEN_MIN: usize = 32;
 
+/// Reused MoE prefill scratch (avoids alloc+wait tax every layer).
+struct MoePrefillScratch {
+    n_slots: usize,
+    ffn: usize,
+    hidden: usize,
+    n_tokens: usize,
+    act: Retained<ProtocolObject<dyn MTLBuffer>>,
+    gate: Retained<ProtocolObject<dyn MTLBuffer>>,
+    up: Retained<ProtocolObject<dyn MTLBuffer>>,
+    expert_out: Retained<ProtocolObject<dyn MTLBuffer>>,
+    out: Retained<ProtocolObject<dyn MTLBuffer>>,
+}
+
+thread_local! {
+    static TL_MOE_PREFILL: RefCell<Option<MoePrefillScratch>> = const { RefCell::new(None) };
+}
+
+fn moe_prefill_scratch(
+    device: &Retained<ProtocolObject<dyn MTLDevice>>,
+    n_tokens: usize,
+    n_slots: usize,
+    ffn: usize,
+    hidden: usize,
+) -> Result<(), MetalError> {
+    TL_MOE_PREFILL.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        let need = match slot.as_ref() {
+            None => true,
+            Some(s) => {
+                s.n_slots < n_slots || s.ffn < ffn || s.hidden < hidden || s.n_tokens < n_tokens
+            }
+        };
+        if need {
+            *slot = Some(MoePrefillScratch {
+                n_slots,
+                ffn,
+                hidden,
+                n_tokens,
+                act: device
+                    .newBufferWithLength_options(
+                        n_slots * ffn * 4,
+                        MTLResourceOptions::StorageModeShared,
+                    )
+                    .ok_or(MetalError::BufferAllocFailed)?,
+                gate: device
+                    .newBufferWithLength_options(
+                        n_slots * ffn * 4,
+                        MTLResourceOptions::StorageModeShared,
+                    )
+                    .ok_or(MetalError::BufferAllocFailed)?,
+                up: device
+                    .newBufferWithLength_options(
+                        n_slots * ffn * 4,
+                        MTLResourceOptions::StorageModeShared,
+                    )
+                    .ok_or(MetalError::BufferAllocFailed)?,
+                expert_out: device
+                    .newBufferWithLength_options(
+                        n_slots * hidden * 4,
+                        MTLResourceOptions::StorageModeShared,
+                    )
+                    .ok_or(MetalError::BufferAllocFailed)?,
+                out: device
+                    .newBufferWithLength_options(
+                        n_tokens * hidden * 4,
+                        MTLResourceOptions::StorageModeShared,
+                    )
+                    .ok_or(MetalError::BufferAllocFailed)?,
+            });
+        }
+        Ok(())
+    })
+}
+
 /// Pre-bound packed expert planes (llama: experts stay in one MTLBuffer
 /// after load; encode only rebinds ids/scratch). Keyed by gate base ptr.
 pub(crate) struct MoePackedResident {
@@ -3427,6 +3501,98 @@ pub(crate) fn encode_q4_0_moe_gate_up_id(
         x_stride,
         n_slots,
     )?;
+    Ok(())
+}
+
+/// Decode FFN: `gate = matvec_id(gate)`; barrier; `act = silu(gate)*matvec_id(up)`.
+/// Drops a separate `silu_mul` dispatch vs Concurrent gate∥up + silu.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_q4_0_moe_gate_then_up_silu(
+    encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+    device: &Retained<ProtocolObject<dyn MTLDevice>>,
+    x_buf: &ProtocolObject<dyn MTLBuffer>,
+    packed: &MoePackedQ4<'_>,
+    ids: &ProtocolObject<dyn MTLBuffer>,
+    gate_buf: &ProtocolObject<dyn MTLBuffer>,
+    act_buf: &ProtocolObject<dyn MTLBuffer>,
+    top_k: u32,
+    n_tokens: u32,
+) -> Result<(), MetalError> {
+    assert_eq!(packed.gate_stride, packed.up_stride);
+    assert!(n_tokens >= 1 && top_k >= 1);
+    let bound = moe_packed_resident(device, packed)?;
+    let input_blocks = packed.gate_row_bytes / 18;
+    let x_stride = (input_blocks * 32) as u32;
+    let n_slots = (n_tokens as usize) * (top_k as usize);
+    encode_q4_0_moe_matvec_id(
+        encoder,
+        device,
+        &bound.gate,
+        x_buf,
+        gate_buf,
+        ids,
+        packed.gate_row_bytes as u32,
+        input_blocks as u32,
+        packed.ffn_rows as u32,
+        top_k,
+        packed.gate_stride as u32,
+        n_tokens,
+        x_stride,
+        n_slots,
+    )?;
+    memory_barrier_resources(encoder, &[gate_buf]);
+    let pipe = ensure_pipeline(device, Q4_0_MOE_TOPK_KERNEL_SRC, "q4_0_moe_matvec_id_silu")?;
+    encoder.setComputePipelineState(&pipe.0);
+    const ROWS_PER_TG: usize = 8;
+    unsafe {
+        encoder.setBuffer_offset_atIndex(Some(&bound.up.buffer), bound.up.weight_offset, 0);
+        encoder.setBuffer_offset_atIndex(Some(x_buf), 0, 1);
+        encoder.setBuffer_offset_atIndex(Some(act_buf), 0, 2);
+        encoder.setBuffer_offset_atIndex(Some(ids), 0, 3);
+        let mut rb = packed.gate_row_bytes as u32;
+        encoder.setBytes_length_atIndex(NonNull::new(&mut rb as *mut u32 as *mut _).unwrap(), 4, 4);
+        let mut blocks = input_blocks as u32;
+        encoder.setBytes_length_atIndex(
+            NonNull::new(&mut blocks as *mut u32 as *mut _).unwrap(),
+            4,
+            5,
+        );
+        let mut rows = packed.ffn_rows as u32;
+        encoder.setBytes_length_atIndex(
+            NonNull::new(&mut rows as *mut u32 as *mut _).unwrap(),
+            4,
+            6,
+        );
+        let mut tk = top_k;
+        encoder.setBytes_length_atIndex(NonNull::new(&mut tk as *mut u32 as *mut _).unwrap(), 4, 7);
+        let mut stride = packed.up_stride as u32;
+        encoder.setBytes_length_atIndex(
+            NonNull::new(&mut stride as *mut u32 as *mut _).unwrap(),
+            4,
+            8,
+        );
+        let mut nt = n_tokens;
+        encoder.setBytes_length_atIndex(NonNull::new(&mut nt as *mut u32 as *mut _).unwrap(), 4, 9);
+        let mut xs = x_stride;
+        encoder.setBytes_length_atIndex(
+            NonNull::new(&mut xs as *mut u32 as *mut _).unwrap(),
+            4,
+            10,
+        );
+        encoder.setBuffer_offset_atIndex(Some(gate_buf), 0, 11);
+    }
+    encoder.dispatchThreadgroups_threadsPerThreadgroup(
+        MTLSize {
+            width: packed.ffn_rows.div_ceil(ROWS_PER_TG),
+            height: 1,
+            depth: n_slots,
+        },
+        MTLSize {
+            width: 32,
+            height: 2,
+            depth: 1,
+        },
+    );
     Ok(())
 }
 
@@ -3805,177 +3971,167 @@ pub fn launch_moe_prefill_q4_0(
         )
     }
     .ok_or(MetalError::BufferAllocFailed)?;
-    let act_buf = device
-        .newBufferWithLength_options(n_slots * ffn * 4, MTLResourceOptions::StorageModeShared)
-        .ok_or(MetalError::BufferAllocFailed)?;
-    let gate_buf = device
-        .newBufferWithLength_options(n_slots * ffn * 4, MTLResourceOptions::StorageModeShared)
-        .ok_or(MetalError::BufferAllocFailed)?;
-    let up_buf = device
-        .newBufferWithLength_options(n_slots * ffn * 4, MTLResourceOptions::StorageModeShared)
-        .ok_or(MetalError::BufferAllocFailed)?;
-    let expert_out_buf = device
-        .newBufferWithLength_options(n_slots * hidden * 4, MTLResourceOptions::StorageModeShared)
-        .ok_or(MetalError::BufferAllocFailed)?;
-    let out_buf = device
-        .newBufferWithLength_options(n_tokens * hidden * 4, MTLResourceOptions::StorageModeShared)
-        .ok_or(MetalError::BufferAllocFailed)?;
+    moe_prefill_scratch(device, n_tokens, n_slots, ffn, hidden)?;
 
-    let cmd_buf = queue.commandBuffer().ok_or(MetalError::CommandFailed)?;
-    let encoder = cmd_buf
-        .computeCommandEncoder()
-        .ok_or(MetalError::CommandFailed)?;
+    let result = TL_MOE_PREFILL.with(|cell| {
+        let scratch = cell.borrow();
+        let scratch = scratch.as_ref().ok_or(MetalError::CommandFailed)?;
+        let act_buf = scratch.act.as_ref();
+        let gate_buf = scratch.gate.as_ref();
+        let up_buf = scratch.up.as_ref();
+        let expert_out_buf = scratch.expert_out.as_ref();
+        let out_buf = scratch.out.as_ref();
 
-    if use_mm_id {
-        let bound = moe_packed_resident(device, packed)?;
-        let input_blocks = (packed.gate_row_bytes / 18) as u32;
-        let x_stride = packed.hidden_rows as u32;
-        // Flatten map0 into contiguous buffers with per-expert offsets.
-        let mut flat_tok = Vec::new();
-        let mut flat_slot = Vec::new();
-        let mut offsets = Vec::with_capacity(packed.n_experts);
-        for list in &per_expert {
-            offsets.push(flat_tok.len());
-            for &(t, s) in list {
-                flat_tok.push(t);
-                flat_slot.push(s);
+        let cmd_buf = queue.commandBuffer().ok_or(MetalError::CommandFailed)?;
+        let encoder = cmd_buf
+            .computeCommandEncoder()
+            .ok_or(MetalError::CommandFailed)?;
+
+        if use_mm_id {
+            let bound = moe_packed_resident(device, packed)?;
+            let input_blocks = (packed.gate_row_bytes / 18) as u32;
+            let x_stride = packed.hidden_rows as u32;
+            let mut flat_tok = Vec::new();
+            let mut flat_slot = Vec::new();
+            let mut offsets = Vec::with_capacity(packed.n_experts);
+            for list in &per_expert {
+                offsets.push(flat_tok.len());
+                for &(t, s) in list {
+                    flat_tok.push(t);
+                    flat_slot.push(s);
+                }
             }
-        }
-        let tok_buf = if flat_tok.is_empty() {
-            None
-        } else {
-            Some(
-                unsafe {
-                    device.newBufferWithBytes_length_options(
-                        NonNull::new(flat_tok.as_mut_ptr() as *mut _).unwrap(),
-                        flat_tok.len() * 4,
-                        MTLResourceOptions::StorageModeShared,
-                    )
-                }
-                .ok_or(MetalError::BufferAllocFailed)?,
-            )
-        };
-        let slot_map_buf = if flat_slot.is_empty() {
-            None
-        } else {
-            Some(
-                unsafe {
-                    device.newBufferWithBytes_length_options(
-                        NonNull::new(flat_slot.as_mut_ptr() as *mut _).unwrap(),
-                        flat_slot.len() * 4,
-                        MTLResourceOptions::StorageModeShared,
-                    )
-                }
-                .ok_or(MetalError::BufferAllocFailed)?,
-            )
-        };
+            let tok_buf = if flat_tok.is_empty() {
+                None
+            } else {
+                Some(
+                    unsafe {
+                        device.newBufferWithBytes_length_options(
+                            NonNull::new(flat_tok.as_mut_ptr() as *mut _).unwrap(),
+                            flat_tok.len() * 4,
+                            MTLResourceOptions::StorageModeShared,
+                        )
+                    }
+                    .ok_or(MetalError::BufferAllocFailed)?,
+                )
+            };
+            let slot_map_buf = if flat_slot.is_empty() {
+                None
+            } else {
+                Some(
+                    unsafe {
+                        device.newBufferWithBytes_length_options(
+                            NonNull::new(flat_slot.as_mut_ptr() as *mut _).unwrap(),
+                            flat_slot.len() * 4,
+                            MTLResourceOptions::StorageModeShared,
+                        )
+                    }
+                    .ok_or(MetalError::BufferAllocFailed)?,
+                )
+            };
 
-        if let (Some(tok_b), Some(slot_b)) = (tok_buf.as_ref(), slot_map_buf.as_ref()) {
-            for (eid, list) in per_expert.iter().enumerate() {
-                let batch = list.len() as u32;
-                if batch == 0 {
-                    continue;
+            if let (Some(tok_b), Some(slot_b)) = (tok_buf.as_ref(), slot_map_buf.as_ref()) {
+                for (eid, list) in per_expert.iter().enumerate() {
+                    let batch = list.len() as u32;
+                    if batch == 0 {
+                        continue;
+                    }
+                    let off = offsets[eid];
+                    encode_q4_0_moe_mul_mm_id(
+                        &encoder,
+                        device,
+                        &bound.gate,
+                        eid * packed.gate_stride,
+                        &x_buf,
+                        gate_buf,
+                        tok_b,
+                        slot_b,
+                        off,
+                        packed.gate_row_bytes as u32,
+                        input_blocks,
+                        ffn as u32,
+                        batch,
+                        x_stride,
+                    )?;
+                    encode_q4_0_moe_mul_mm_id(
+                        &encoder,
+                        device,
+                        &bound.up,
+                        eid * packed.up_stride,
+                        &x_buf,
+                        up_buf,
+                        tok_b,
+                        slot_b,
+                        off,
+                        packed.gate_row_bytes as u32,
+                        input_blocks,
+                        ffn as u32,
+                        batch,
+                        x_stride,
+                    )?;
                 }
-                let off = offsets[eid];
-                // gate
-                encode_q4_0_moe_mul_mm_id(
+                memory_barrier_resources(&encoder, &[gate_buf, up_buf]);
+                crate::elem::encode_silu_mul(
                     &encoder,
                     device,
-                    &bound.gate,
-                    eid * packed.gate_stride,
-                    &x_buf,
-                    &gate_buf,
-                    tok_b,
-                    slot_b,
-                    off,
-                    packed.gate_row_bytes as u32,
-                    input_blocks,
-                    ffn as u32,
-                    batch,
-                    x_stride,
+                    gate_buf,
+                    up_buf,
+                    act_buf,
+                    (n_slots * ffn) as u32,
                 )?;
-                // up
-                encode_q4_0_moe_mul_mm_id(
+                memory_barrier_resources(&encoder, &[act_buf]);
+                encode_q4_0_moe_id_ex(
                     &encoder,
                     device,
-                    &bound.up,
-                    eid * packed.up_stride,
                     &x_buf,
-                    &up_buf,
-                    tok_b,
-                    slot_b,
-                    off,
-                    packed.gate_row_bytes as u32,
-                    input_blocks,
-                    ffn as u32,
-                    batch,
-                    x_stride,
+                    packed,
+                    &ids_buf,
+                    &route_buf,
+                    gate_buf,
+                    up_buf,
+                    act_buf,
+                    expert_out_buf,
+                    out_buf,
+                    top_k as u32,
+                    n_tokens as u32,
+                    false,
+                    true,
+                    true,
                 )?;
             }
-            memory_barrier_resources(&encoder, &[&gate_buf, &up_buf]);
-            crate::elem::encode_silu_mul(
-                &encoder,
-                device,
-                &gate_buf,
-                &up_buf,
-                &act_buf,
-                (n_slots * ffn) as u32,
-            )?;
-            memory_barrier_resources(&encoder, &[&act_buf]);
-            // down: act is slot-major; map tokens aren't needed — use slot as
-            // "token" index into act with stride = ffn, and identity slot map.
-            // Reuse matvec_id down path (already parallel over slots).
-            encode_q4_0_moe_id_ex(
+            encoder.endEncoding();
+            cmd_buf.commit();
+            cmd_buf.waitUntilCompleted();
+            let _keep = (flat_tok, flat_slot);
+        } else {
+            encode_q4_0_moe_id(
                 &encoder,
                 device,
                 &x_buf,
                 packed,
                 &ids_buf,
                 &route_buf,
-                &gate_buf,
-                &up_buf,
-                &act_buf,
-                &expert_out_buf,
-                &out_buf,
+                gate_buf,
+                up_buf,
+                act_buf,
+                expert_out_buf,
+                out_buf,
                 top_k as u32,
                 n_tokens as u32,
                 false,
-                true,
-                true, // act done
+                false,
             )?;
+            encoder.endEncoding();
+            cmd_buf.commit();
+            cmd_buf.waitUntilCompleted();
         }
-        // Keep flat_tok/flat_slot alive until GPU done.
-        encoder.endEncoding();
-        cmd_buf.commit();
-        cmd_buf.waitUntilCompleted();
-        let _keep = (flat_tok, flat_slot);
-    } else {
-        encode_q4_0_moe_id(
-            &encoder,
-            device,
-            &x_buf,
-            packed,
-            &ids_buf,
-            &route_buf,
-            &gate_buf,
-            &up_buf,
-            &act_buf,
-            &expert_out_buf,
-            &out_buf,
-            top_k as u32,
-            n_tokens as u32,
-            false, // prefill: out = weighted (no residual)
-            false, // encode gate∥up in this encoder
-        )?;
-        encoder.endEncoding();
-        cmd_buf.commit();
-        cmd_buf.waitUntilCompleted();
-    }
 
-    let ptr = out_buf.contents();
-    Ok(unsafe {
-        std::slice::from_raw_parts(ptr.as_ptr() as *const f32, n_tokens * hidden).to_vec()
-    })
+        let ptr = out_buf.contents();
+        Ok(unsafe {
+            std::slice::from_raw_parts(ptr.as_ptr() as *const f32, n_tokens * hidden).to_vec()
+        })
+    })?;
+    Ok(result)
 }
 
 /// Encode llama-style batched Q4_0 MoE (gate+up+SiLU, down, weighted sum)

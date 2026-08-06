@@ -1,9 +1,7 @@
-//! Metal attention path: Norm/NeoX RoPE, KV append, and online-softmax GQA.
-//!
-//! Device K/V caches default to **f16** (llama.cpp `-ctk f16 -ctv f16`);
-//! `FERROX_CTK=q8_0` stores ggml Q8_0 blocks and dequants to a process-wide
-//! f16 scratch before FA/GQA (shared across layers → real resident savings).
-//! Q/activations stay f32. Append converts f32→half or f32→Q8_0 on GPU.
+//! Device K/V caches default to **f16** (llama.cpp `-ctk f16 -ctv f16`).
+//! Quantized stores: `FERROX_CTK=q8_0|turbo8|turbo4|fp8` (turbo3 still falls
+//! back to f16). Quant caches dequant to a process-wide f16 scratch before
+//! FA/GQA. Q/activations stay f32. Append converts on GPU.
 //!
 //! **Decode (B=1):** Q/K/V/O matvecs fused with RoPE→KV→GQA in one command
 //! buffer ([`launch_decode_attn_block`]); dense layers can continue through
@@ -36,8 +34,7 @@
 //! (default **on** for `head_dim` in {64,96,128,256}). Other head dims keep
 //! legacy online-softmax GQA.
 //!
-//! `FERROX_CTK=f16|q8_0` selects the requested KV dtype ([`MetalKvDtype`]);
-//! only F16 buffers are implemented today — `q8_0` warns once and keeps F16.
+//! `FERROX_CTK` selects KV dtype ([`MetalKvDtype`]); see [`is_implemented`].
 use crate::elem::{
     encode_add_rms_norm, encode_argmax, encode_gelu_mul, encode_rms_norm, encode_rms_norm_per_head,
     encode_silu_mul, encode_vec_add,
@@ -290,6 +287,72 @@ kernel void dequant_q8_0_to_f16(
 }
 "#;
 
+/// TurboQuant-style 4-bit KV: f16 scale + 16 nibble bytes / 32 elems (18 B).
+const KV_APPEND_TURBO4_KERNEL_SRC: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+kernel void kv_append_turbo4(
+    device const float* src [[buffer(0)]],
+    device uchar* dst [[buffer(1)]],
+    constant uint& offset_elems [[buffer(2)]],
+    constant uint& n_elems [[buffer(3)]],
+    uint b [[thread_position_in_grid]]
+) {
+    const uint BLOCK = 32u;
+    const uint BLOCK_BYTES = 18u;
+    uint n_blocks = n_elems / BLOCK;
+    if (b >= n_blocks) return;
+    uint src_base = b * BLOCK;
+    float amax = 0.0f;
+    for (uint i = 0u; i < BLOCK; i++) {
+        amax = fmax(amax, fabs(src[src_base + i]));
+    }
+    float d = amax / 7.0f;
+    float id = (d != 0.0f) ? (1.0f / d) : 0.0f;
+    uint dst_block = (offset_elems / BLOCK) + b;
+    uint dst_base = dst_block * BLOCK_BYTES;
+    half d_h = half(d);
+    dst[dst_base + 0] = uchar(as_type<ushort>(d_h) & 0xFFu);
+    dst[dst_base + 1] = uchar(as_type<ushort>(d_h) >> 8u);
+    for (uint i = 0u; i < 16u; i++) {
+        int q0 = int(round(src[src_base + 2u * i] * id));
+        int q1 = int(round(src[src_base + 2u * i + 1u] * id));
+        q0 = clamp(q0, -8, 7);
+        q1 = clamp(q1, -8, 7);
+        dst[dst_base + 2u + i] = uchar((q0 & 0xF) | ((q1 & 0xF) << 4));
+    }
+}
+"#;
+
+const DEQUANT_TURBO4_TO_F16_KERNEL_SRC: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+kernel void dequant_turbo4_to_f16(
+    device const uchar* src [[buffer(0)]],
+    device half* dst [[buffer(1)]],
+    constant uint& n_elems [[buffer(2)]],
+    uint b [[thread_position_in_grid]]
+) {
+    const uint BLOCK = 32u;
+    const uint BLOCK_BYTES = 18u;
+    uint n_blocks = n_elems / BLOCK;
+    if (b >= n_blocks) return;
+    uint src_base = b * BLOCK_BYTES;
+    ushort d_bits = ushort(src[src_base]) | (ushort(src[src_base + 1u]) << 8u);
+    float d = float(as_type<half>(d_bits));
+    uint dst_base = b * BLOCK;
+    for (uint i = 0u; i < 16u; i++) {
+        uchar byte = src[src_base + 2u + i];
+        int q0 = int(char((byte & 0xFu) << 4) >> 4);
+        int q1 = int(char((byte >> 4) << 4) >> 4);
+        dst[dst_base + 2u * i] = half(float(q0) * d);
+        dst[dst_base + 2u * i + 1u] = half(float(q1) * d);
+    }
+}
+"#;
+
 /// Whether FA-vec GQA decode is enabled.
 ///
 /// Default: **on** for supported head dims (64 / 96 / 128 / 256) via
@@ -311,20 +374,19 @@ pub fn metal_fa_vec_enabled() -> bool {
 
 /// Device KV cache element type (llama.cpp `-ctk` / `--kvcache-dtype` analogue).
 ///
-/// Selected via `FERROX_CTK` ([`metal_kv_dtype`]). [`MetalKvDtype::F16`] and
-/// [`MetalKvDtype::Q8_0`] allocate matching buffers; other variants warn once
-/// and fall back to F16 until kernels land.
+/// Selected via `FERROX_CTK` ([`metal_kv_dtype`]). Implemented: F16, Q8_0,
+/// Turbo8 (=Q8_0 wire), Turbo4, Fp8 (=Q8_0 wire). Turbo3 warns → F16.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MetalKvDtype {
     F16,
     Q8_0,
-    /// FP8 E4M3-style KV (8-bit).
+    /// FP8-style KV (scaled int8 / Q8_0 layout).
     Fp8,
-    /// TurboQuant-style 8-bit (WHT + codebook; P5b).
+    /// TurboQuant 8-bit (Metal: same store as Q8_0; host WHT optional).
     Turbo8,
-    /// TurboQuant-style 4-bit (WHT + Lloyd-Max; P5b).
+    /// TurboQuant 4-bit (WHT optional on host; Metal absmax nibble groups).
     Turbo4,
-    /// TurboQuant-style 3-bit (experimental; P5b).
+    /// TurboQuant 3-bit (experimental; not implemented yet).
     Turbo3,
 }
 
@@ -341,7 +403,23 @@ impl MetalKvDtype {
     }
 
     pub fn is_implemented(self) -> bool {
-        matches!(self, Self::F16 | Self::Q8_0)
+        matches!(
+            self,
+            Self::F16 | Self::Q8_0 | Self::Turbo8 | Self::Turbo4 | Self::Fp8
+        )
+    }
+
+    /// True when attention must dequant store → f16 scratch before FA/GQA.
+    pub fn needs_f16_scratch(self) -> bool {
+        matches!(
+            self,
+            Self::Q8_0 | Self::Turbo8 | Self::Turbo4 | Self::Fp8
+        )
+    }
+
+    /// Uses ggml Q8_0 / fp8 34-byte blocks.
+    fn is_q8_wire(self) -> bool {
+        matches!(self, Self::Q8_0 | Self::Turbo8 | Self::Fp8)
     }
 }
 
@@ -350,19 +428,36 @@ pub fn metal_kv_q8_0_viable(n_kv_heads: usize, head_dim: usize) -> bool {
     (n_kv_heads * head_dim).is_multiple_of(ferrox_quant::Q8_0_BLOCK_ELEMS)
 }
 
+/// turbo4 / fp8 share the 32-elem group alignment.
+pub fn metal_kv_turbo4_viable(n_kv_heads: usize, head_dim: usize) -> bool {
+    (n_kv_heads * head_dim).is_multiple_of(ferrox_quant::TURBO4_KV_GROUP)
+}
+
 /// Dtype actually used for new [`MetalKvBuffers`] (unimplemented / non-viable → F16).
 pub fn effective_metal_kv_dtype(n_kv_heads: usize, head_dim: usize) -> MetalKvDtype {
     let requested = metal_kv_dtype();
     if !requested.is_implemented() {
         return MetalKvDtype::F16;
     }
-    if requested == MetalKvDtype::Q8_0 && !metal_kv_q8_0_viable(n_kv_heads, head_dim) {
+    if requested.is_q8_wire() && !metal_kv_q8_0_viable(n_kv_heads, head_dim) {
         static WARNED: OnceLock<()> = OnceLock::new();
         let _ = WARNED.get_or_init(|| {
             eprintln!(
-                "FERROX_CTK=q8_0: n_kv_heads*head_dim={} not divisible by {}; using f16",
+                "FERROX_CTK={}: n_kv_heads*head_dim={} not divisible by {}; using f16",
+                requested.as_str(),
                 n_kv_heads * head_dim,
                 ferrox_quant::Q8_0_BLOCK_ELEMS
+            );
+        });
+        return MetalKvDtype::F16;
+    }
+    if requested == MetalKvDtype::Turbo4 && !metal_kv_turbo4_viable(n_kv_heads, head_dim) {
+        static WARNED: OnceLock<()> = OnceLock::new();
+        let _ = WARNED.get_or_init(|| {
+            eprintln!(
+                "FERROX_CTK=turbo4: n_kv_heads*head_dim={} not divisible by {}; using f16",
+                n_kv_heads * head_dim,
+                ferrox_quant::TURBO4_KV_GROUP
             );
         });
         return MetalKvDtype::F16;
@@ -1626,11 +1721,17 @@ unsafe impl Sync for MetalKvBuffers {}
 fn kv_store_nbytes(dtype: MetalKvDtype, elems: usize) -> Result<usize, MetalError> {
     match dtype {
         MetalKvDtype::F16 => Ok(elems * 2),
-        MetalKvDtype::Q8_0 => {
+        d if d.is_q8_wire() => {
             if !elems.is_multiple_of(ferrox_quant::Q8_0_BLOCK_ELEMS) {
                 return Err(MetalError::CommandFailed);
             }
             Ok((elems / ferrox_quant::Q8_0_BLOCK_ELEMS) * ferrox_quant::Q8_0_BLOCK_BYTES)
+        }
+        MetalKvDtype::Turbo4 => {
+            if !elems.is_multiple_of(ferrox_quant::TURBO4_KV_GROUP) {
+                return Err(MetalError::CommandFailed);
+            }
+            Ok((elems / ferrox_quant::TURBO4_KV_GROUP) * ferrox_quant::TURBO4_KV_BLOCK_BYTES)
         }
         _ => Ok(elems * 2),
     }
@@ -1656,7 +1757,10 @@ impl MetalKvBuffers {
     ) -> Result<Self, MetalError> {
         let shared = shared_metal()?;
         let dtype = match dtype {
-            MetalKvDtype::Q8_0 if !metal_kv_q8_0_viable(n_kv_heads, head_dim) => {
+            d if d.is_q8_wire() && !metal_kv_q8_0_viable(n_kv_heads, head_dim) => {
+                return Err(MetalError::CommandFailed);
+            }
+            MetalKvDtype::Turbo4 if !metal_kv_turbo4_viable(n_kv_heads, head_dim) => {
                 return Err(MetalError::CommandFailed);
             }
             d if d.is_implemented() => d,
@@ -1711,9 +1815,25 @@ impl MetalKvBuffers {
         }
         let n = seq_len * self.elems_per_token();
         match self.dtype {
-            MetalKvDtype::Q8_0 => {
+            d if d.is_q8_wire() => {
                 let k_q = ferrox_quant::quantize_q8_0(&k[..n]);
                 let v_q = ferrox_quant::quantize_q8_0(&v[..n]);
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        k_q.as_ptr(),
+                        self.k.contents().as_ptr() as *mut u8,
+                        k_q.len(),
+                    );
+                    std::ptr::copy_nonoverlapping(
+                        v_q.as_ptr(),
+                        self.v.contents().as_ptr() as *mut u8,
+                        v_q.len(),
+                    );
+                }
+            }
+            MetalKvDtype::Turbo4 => {
+                let k_q = ferrox_quant::pack_turbo4_kv_blocks(&k[..n]);
+                let v_q = ferrox_quant::pack_turbo4_kv_blocks(&v[..n]);
                 unsafe {
                     std::ptr::copy_nonoverlapping(
                         k_q.as_ptr(),
@@ -1769,7 +1889,7 @@ impl MetalKvBuffers {
         let off = start * per;
         let elems = n * per;
         match self.dtype {
-            MetalKvDtype::Q8_0 => {
+            d if d.is_q8_wire() => {
                 let nbytes =
                     (elems / ferrox_quant::Q8_0_BLOCK_ELEMS) * ferrox_quant::Q8_0_BLOCK_BYTES;
                 let byte_off =
@@ -1785,6 +1905,24 @@ impl MetalKvBuffers {
                 (
                     ferrox_quant::dequant_q8_0(k_bytes).expect("q8 k aligned"),
                     ferrox_quant::dequant_q8_0(v_bytes).expect("q8 v aligned"),
+                )
+            }
+            MetalKvDtype::Turbo4 => {
+                let nbytes =
+                    (elems / ferrox_quant::TURBO4_KV_GROUP) * ferrox_quant::TURBO4_KV_BLOCK_BYTES;
+                let byte_off =
+                    (off / ferrox_quant::TURBO4_KV_GROUP) * ferrox_quant::TURBO4_KV_BLOCK_BYTES;
+                let k_ptr = self.k.contents();
+                let v_ptr = self.v.contents();
+                let k_bytes = unsafe {
+                    std::slice::from_raw_parts(k_ptr.as_ptr().add(byte_off) as *const u8, nbytes)
+                };
+                let v_bytes = unsafe {
+                    std::slice::from_raw_parts(v_ptr.as_ptr().add(byte_off) as *const u8, nbytes)
+                };
+                (
+                    ferrox_quant::unpack_turbo4_kv_blocks(k_bytes).expect("turbo4 k"),
+                    ferrox_quant::unpack_turbo4_kv_blocks(v_bytes).expect("turbo4 v"),
                 )
             }
             _ => {
@@ -2296,6 +2434,102 @@ fn encode_dequant_q8_0_to_f16(
     Ok(())
 }
 
+fn encode_kv_append_turbo4(
+    encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+    device: &Retained<ProtocolObject<dyn MTLDevice>>,
+    src: &ProtocolObject<dyn MTLBuffer>,
+    dst: &ProtocolObject<dyn MTLBuffer>,
+    offset_elems: u32,
+    n_elems: u32,
+) -> Result<(), MetalError> {
+    if !offset_elems.is_multiple_of(ferrox_quant::TURBO4_KV_GROUP as u32)
+        || !n_elems.is_multiple_of(ferrox_quant::TURBO4_KV_GROUP as u32)
+    {
+        return Err(MetalError::CommandFailed);
+    }
+    let pipe = ensure_pipeline(device, KV_APPEND_TURBO4_KERNEL_SRC, "kv_append_turbo4")?;
+    encoder.setComputePipelineState(&pipe.0);
+    unsafe {
+        encoder.setBuffer_offset_atIndex(Some(src), 0, 0);
+        encoder.setBuffer_offset_atIndex(Some(dst), 0, 1);
+        let mut off = offset_elems;
+        encoder.setBytes_length_atIndex(
+            NonNull::new(&mut off as *mut u32 as *mut _).unwrap(),
+            4,
+            2,
+        );
+        let mut n = n_elems;
+        encoder.setBytes_length_atIndex(NonNull::new(&mut n as *mut u32 as *mut _).unwrap(), 4, 3);
+    }
+    let n_blocks = (n_elems as usize) / ferrox_quant::TURBO4_KV_GROUP;
+    let tg = 256usize.min(n_blocks).max(1);
+    let n_tg = n_blocks.div_ceil(tg);
+    encoder.dispatchThreadgroups_threadsPerThreadgroup(
+        MTLSize {
+            width: n_tg,
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width: tg,
+            height: 1,
+            depth: 1,
+        },
+    );
+    Ok(())
+}
+
+fn encode_dequant_turbo4_to_f16(
+    encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+    device: &Retained<ProtocolObject<dyn MTLDevice>>,
+    src: &ProtocolObject<dyn MTLBuffer>,
+    dst: &ProtocolObject<dyn MTLBuffer>,
+    n_elems: u32,
+) -> Result<(), MetalError> {
+    if !n_elems.is_multiple_of(ferrox_quant::TURBO4_KV_GROUP as u32) {
+        return Err(MetalError::CommandFailed);
+    }
+    let pipe = ensure_pipeline(device, DEQUANT_TURBO4_TO_F16_KERNEL_SRC, "dequant_turbo4_to_f16")?;
+    encoder.setComputePipelineState(&pipe.0);
+    unsafe {
+        encoder.setBuffer_offset_atIndex(Some(src), 0, 0);
+        encoder.setBuffer_offset_atIndex(Some(dst), 0, 1);
+        let mut n = n_elems;
+        encoder.setBytes_length_atIndex(NonNull::new(&mut n as *mut u32 as *mut _).unwrap(), 4, 2);
+    }
+    let n_blocks = (n_elems as usize) / ferrox_quant::TURBO4_KV_GROUP;
+    let tg = 256usize.min(n_blocks).max(1);
+    let n_tg = n_blocks.div_ceil(tg);
+    encoder.dispatchThreadgroups_threadsPerThreadgroup(
+        MTLSize {
+            width: n_tg,
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width: tg,
+            height: 1,
+            depth: 1,
+        },
+    );
+    Ok(())
+}
+
+fn encode_kv_dequant_to_f16(
+    encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+    device: &Retained<ProtocolObject<dyn MTLDevice>>,
+    dtype: MetalKvDtype,
+    src: &ProtocolObject<dyn MTLBuffer>,
+    dst: &ProtocolObject<dyn MTLBuffer>,
+    n_elems: u32,
+) -> Result<(), MetalError> {
+    match dtype {
+        d if d.is_q8_wire() => encode_dequant_q8_0_to_f16(encoder, device, src, dst, n_elems),
+        MetalKvDtype::Turbo4 => encode_dequant_turbo4_to_f16(encoder, device, src, dst, n_elems),
+        _ => Err(MetalError::CommandFailed),
+    }
+}
+
 fn encode_kv_store_append(
     encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
     device: &Retained<ProtocolObject<dyn MTLDevice>>,
@@ -2310,8 +2544,11 @@ fn encode_kv_store_append(
         KvPlane::V => &kv.v,
     };
     match kv.dtype {
-        MetalKvDtype::Q8_0 => {
+        d if d.is_q8_wire() => {
             encode_kv_append_q8_0(encoder, device, src, dst, offset_elems, n_elems)
+        }
+        MetalKvDtype::Turbo4 => {
+            encode_kv_append_turbo4(encoder, device, src, dst, offset_elems, n_elems)
         }
         _ => encode_kv_append(encoder, device, src, dst, offset_elems, n_elems),
     }
@@ -2331,29 +2568,28 @@ fn encode_gqa_with_kv(
     kv_start: u32,
     softcap: Option<f32>,
 ) -> Result<(), MetalError> {
-    match kv.dtype {
-        MetalKvDtype::Q8_0 => {
-            let elems = (seq_len as usize) * kv.elems_per_token();
-            let mut guard = borrow_q8_attn_scratch(device, elems)?;
-            let scratch = guard.as_mut().unwrap();
-            encode_dequant_q8_0_to_f16(encoder, device, &kv.k, &scratch.k, elems as u32)?;
-            encode_dequant_q8_0_to_f16(encoder, device, &kv.v, &scratch.v, elems as u32)?;
-            encode_gqa(
-                encoder,
-                device,
-                q,
-                &scratch.k,
-                &scratch.v,
-                out,
-                n_heads,
-                n_kv_heads,
-                head_dim,
-                seq_len,
-                kv_start,
-                softcap,
-            )
-        }
-        _ => encode_gqa(
+    if kv.dtype.needs_f16_scratch() {
+        let elems = (seq_len as usize) * kv.elems_per_token();
+        let mut guard = borrow_q8_attn_scratch(device, elems)?;
+        let scratch = guard.as_mut().unwrap();
+        encode_kv_dequant_to_f16(encoder, device, kv.dtype, &kv.k, &scratch.k, elems as u32)?;
+        encode_kv_dequant_to_f16(encoder, device, kv.dtype, &kv.v, &scratch.v, elems as u32)?;
+        encode_gqa(
+            encoder,
+            device,
+            q,
+            &scratch.k,
+            &scratch.v,
+            out,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            seq_len,
+            kv_start,
+            softcap,
+        )
+    } else {
+        encode_gqa(
             encoder,
             device,
             q,
@@ -2366,7 +2602,7 @@ fn encode_gqa_with_kv(
             seq_len,
             kv_start,
             softcap,
-        ),
+        )
     }
 }
 
@@ -2385,29 +2621,28 @@ fn encode_gqa_prefill_with_kv(
     attn_softcap: Option<f32>,
 ) -> Result<(), MetalError> {
     let total_seq = kv_prefix_len + n_q;
-    match kv.dtype {
-        MetalKvDtype::Q8_0 => {
-            let elems = (total_seq as usize) * kv.elems_per_token();
-            let mut guard = borrow_q8_attn_scratch(device, elems)?;
-            let scratch = guard.as_mut().unwrap();
-            encode_dequant_q8_0_to_f16(encoder, device, &kv.k, &scratch.k, elems as u32)?;
-            encode_dequant_q8_0_to_f16(encoder, device, &kv.v, &scratch.v, elems as u32)?;
-            encode_gqa_prefill(
-                encoder,
-                device,
-                q,
-                &scratch.k,
-                &scratch.v,
-                out,
-                n_heads,
-                n_kv_heads,
-                head_dim,
-                n_q,
-                kv_prefix_len,
-                attn_softcap,
-            )
-        }
-        _ => encode_gqa_prefill(
+    if kv.dtype.needs_f16_scratch() {
+        let elems = (total_seq as usize) * kv.elems_per_token();
+        let mut guard = borrow_q8_attn_scratch(device, elems)?;
+        let scratch = guard.as_mut().unwrap();
+        encode_kv_dequant_to_f16(encoder, device, kv.dtype, &kv.k, &scratch.k, elems as u32)?;
+        encode_kv_dequant_to_f16(encoder, device, kv.dtype, &kv.v, &scratch.v, elems as u32)?;
+        encode_gqa_prefill(
+            encoder,
+            device,
+            q,
+            &scratch.k,
+            &scratch.v,
+            out,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            n_q,
+            kv_prefix_len,
+            attn_softcap,
+        )
+    } else {
+        encode_gqa_prefill(
             encoder,
             device,
             q,
@@ -2420,7 +2655,7 @@ fn encode_gqa_prefill_with_kv(
             n_q,
             kv_prefix_len,
             attn_softcap,
-        ),
+        )
     }
 }
 
@@ -5113,11 +5348,15 @@ mod tests {
         assert_eq!(parse_metal_kv_dtype(Some("turbo8")), MetalKvDtype::Turbo8);
         assert_eq!(parse_metal_kv_dtype(Some("turbo4")), MetalKvDtype::Turbo4);
         assert_eq!(parse_metal_kv_dtype(Some("turbo3")), MetalKvDtype::Turbo3);
-        assert!(!MetalKvDtype::Turbo4.is_implemented());
+        assert!(MetalKvDtype::Turbo4.is_implemented());
+        assert!(MetalKvDtype::Turbo8.is_implemented());
+        assert!(MetalKvDtype::Fp8.is_implemented());
+        assert!(!MetalKvDtype::Turbo3.is_implemented());
         assert!(MetalKvDtype::F16.is_implemented());
         assert!(MetalKvDtype::Q8_0.is_implemented());
         assert!(metal_kv_q8_0_viable(4, 64));
         assert!(!metal_kv_q8_0_viable(2, 8));
+        assert!(metal_kv_turbo4_viable(4, 64));
     }
 
     fn cpu_gqa(

@@ -16,7 +16,7 @@ ds4 deps — rewrite in-tree.
 | **P2** | MLA GGUF → `MlaEngine` | CLI + **ferrox-server** dense-lead deepseek2/mistral4; MoE-after-dense fail-closed; GLM-4.7 / DS V3 MoE still open |
 | **P3** | Hybrid GDN | `gdn.rs` + loader scaffold; `HybridEngine` assemble + Qwen3.5 smoke still open |
 | **P4** | Gemma-4 text | E2B fail-closed (**DedicatedOnly**: per-layer emb + shared KV + SWA/full head-dim); suite refuse pin; MoE-A4B / VL → P7 |
-| **P5** | KV quant | Metal `q8_0` store + shared f16 dequant scratch landed; `fp8`/`turbo*` still warn→F16; CPU turbo4 sketch |
+| **P5** | KV quant | Metal `q8_0`/`turbo8`/`fp8`/`turbo4` store + shared f16 dequant; `turbo3` still warn→F16; CPU FWHT + turbo4 sketch |
 
 Also on this horizon (unchanged intent):
 

@@ -79,7 +79,7 @@ always prefer the pin / RESULTS Gap for comparisons.
 | Embeddings (`/v1/embeddings`) | **Supported** for GGUF `Decoder` (mean/last pool); BERT-family **DeferredEncoder** |
 | Mamba / T5 | Fail-closed stubs |
 | CUDA speed | Suite `--backend cuda`; need GPU host pins |
-| Metal KV quant | `FERROX_CTK=q8_0` / `--ctk q8_0`: ggml Q8_0 resident store + process-wide f16 dequant for FA (needs `n_kv*head_dim` % 32 == 0); `fp8`/`turbo*` still F16 |
+| Metal KV quant | `FERROX_CTK` / `--ctk`: `f16`, `q8_0`/`turbo8`/`fp8` (34 B/32), `turbo4` (18 B/32) + shared f16 FA scratch (`n_kv*d` % 32 == 0); `turbo3` → F16 |
 
 ## Backends
 

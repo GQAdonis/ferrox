@@ -1,9 +1,9 @@
 //! Walsh–Hadamard transform helpers for TurboQuant-style KV compression.
 //!
-//! CPU reference only — Metal kernels for turbo{8,4,3} are not wired yet.
+//! Host FWHT + group quant; Metal `FERROX_CTK=turbo4` stores the 4-bit
+//! groups (WHT optional on host upload). turbo8 aliases ggml Q8_0 on Metal.
 //! Algorithm follows the public TurboQuant line (randomized Hadamard +
-//! per-group scale); this module ships the length-power-of-two FWHT used
-//! as the first stage.
+//! per-group scale).
 //!
 //! In-place FWHT on `x` of length `n = 2^k`. Output is unnormalized
 //! (each butterfly is `a+b`, `a-b`); callers that need orthonormal

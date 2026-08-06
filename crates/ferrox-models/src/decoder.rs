@@ -2225,6 +2225,141 @@ impl Decoder {
         layer.moe.n_experts() == 1 && layer.moe.shared_experts.is_empty()
     }
 
+    /// llama.cpp `mul_mat_id` style: shared Q8 act + one flat rayon pass
+    /// over `(slot, row)` for gate and up, then SwiGLU, then down.
+    /// Avoids serial top-k × nested rayon fork-join.
+    fn try_cpu_moe_mul_mat_id(
+        experts: &[ExpertWeights],
+        normed2: &[f32],
+        decision: &ferrox_moe::RoutingDecision,
+        hidden_dim: usize,
+    ) -> Option<Vec<(Vec<f32>, f32)>> {
+        use rayon::prelude::*;
+        if !ferrox_core::weight_matrix::cpu_int_dot_enabled() || !normed2.len().is_multiple_of(32)
+        {
+            return None;
+        }
+        let n_slots = decision.expert_ids.len();
+        if n_slots == 0 {
+            return Some(Vec::new());
+        }
+        for &eid in &decision.expert_ids {
+            let ex = experts.get(eid)?;
+            if ex.gate.rows() == 0
+                || ex.up.rows() != ex.gate.rows()
+                || ex.down.rows() != hidden_dim
+                || ex.gate.cols() != normed2.len()
+                || ex.up.cols() != normed2.len()
+                || ex.down.cols() != ex.gate.rows()
+            {
+                return None;
+            }
+            // Reject non-INT_DOT quants without allocating.
+            if !matches!(
+                &ex.gate,
+                WeightMatrix::Quantized {
+                    kind: ferrox_core::QuantKind::Q4_0 | ferrox_core::QuantKind::Q8_0,
+                    ..
+                }
+            ) || !matches!(
+                &ex.up,
+                WeightMatrix::Quantized {
+                    kind: ferrox_core::QuantKind::Q4_0 | ferrox_core::QuantKind::Q8_0,
+                    ..
+                }
+            ) {
+                return None;
+            }
+        }
+        let ffn_rows = experts[decision.expert_ids[0]].gate.rows();
+        let act = ferrox_quant::quantize_activations_q8(normed2);
+        let mut gate = vec![0f32; n_slots * ffn_rows];
+        let mut up = vec![0f32; n_slots * ffn_rows];
+        let eids = &decision.expert_ids;
+        gate.par_iter_mut()
+            .zip(up.par_iter_mut())
+            .enumerate()
+            .for_each(|(idx, (g, u))| {
+                let slot = idx / ffn_rows;
+                let row = idx % ffn_rows;
+                let ex = &experts[eids[slot]];
+                *g = ex.gate.dot_row_cpu_q8(row, &act).unwrap_or(0.0);
+                *u = ex.up.dot_row_cpu_q8(row, &act).unwrap_or(0.0);
+            });
+        let mut activated = vec![0f32; n_slots * ffn_rows];
+        activated
+            .par_iter_mut()
+            .enumerate()
+            .for_each(|(idx, a)| {
+                let g = gate[idx];
+                *a = (g / (1.0 + (-g).exp())) * up[idx];
+            });
+        let mut outs: Vec<(Vec<f32>, f32)> = decision
+            .weights
+            .iter()
+            .map(|&w| (vec![0f32; hidden_dim], w))
+            .collect();
+        outs.par_iter_mut().enumerate().for_each(|(slot, (out, _))| {
+            let ex = &experts[eids[slot]];
+            let act_slot = &activated[slot * ffn_rows..(slot + 1) * ffn_rows];
+            if act_slot.len().is_multiple_of(32) {
+                let q8 = ferrox_quant::quantize_activations_q8(act_slot);
+                if let Some(d) = ex.down.apply_cpu_q8(&q8) {
+                    *out = d;
+                    return;
+                }
+            }
+            *out = ex.down.apply(act_slot);
+        });
+        Some(outs)
+    }
+
+    /// Fallback: serial top-k with shared Q8 act (pre-mul_mat_id path).
+    fn cpu_moe_serial_experts(
+        layer: &LayerWeights,
+        normed2: &[f32],
+        decision: &ferrox_moe::RoutingDecision,
+        plan: Option<&PlacementPlan>,
+    ) -> Vec<(Vec<f32>, f32)> {
+        let shared_act = if ferrox_core::weight_matrix::cpu_int_dot_enabled()
+            && normed2.len().is_multiple_of(32)
+            && plan
+                .map(|p| {
+                    decision
+                        .expert_ids
+                        .iter()
+                        .all(|&eid| matches!(p.placement_for(eid), ExpertPlacement::Cpu))
+                })
+                .unwrap_or(true)
+        {
+            Some(ferrox_quant::quantize_activations_q8(normed2))
+        } else {
+            None
+        };
+        decision
+            .expert_ids
+            .iter()
+            .zip(decision.weights.iter())
+            .map(|(&eid, &w)| {
+                let placement = plan
+                    .map(|p| p.placement_for(eid))
+                    .unwrap_or(ExpertPlacement::Cpu);
+                let out = layer.moe.with_expert(eid, |ex| {
+                    if let Some(ref act) = shared_act {
+                        if let (Some(gate), Some(up)) =
+                            (ex.gate.apply_cpu_q8(act), ex.up.apply_cpu_q8(act))
+                        {
+                            let activated = ferrox_core::matmul::swiglu(&gate, &up);
+                            return ex.down.apply(&activated);
+                        }
+                    }
+                    run_expert_placed(normed2, ex, placement)
+                });
+                (out, w)
+            })
+            .collect()
+    }
+
     /// Runs one position's normalized hidden state through this
     /// layer's MoE FFN block, given already-computed router logits for
     /// that position, returning the combined output to add back into
@@ -2306,45 +2441,28 @@ impl Decoder {
         }
 
         let routed_outputs: Vec<(Vec<f32>, f32)> = {
-            // llama.cpp mul_mat_id: quantize activations once per op, reuse
-            // across all top-k experts (not once per expert).
-            let shared_act = if ferrox_core::weight_matrix::cpu_int_dot_enabled()
-                && normed2.len().is_multiple_of(32)
-                && plan
-                    .map(|p| {
-                        decision
-                            .expert_ids
-                            .iter()
-                            .all(|&eid| matches!(p.placement_for(eid), ExpertPlacement::Cpu))
-                    })
-                    .unwrap_or(true)
-            {
-                Some(ferrox_quant::quantize_activations_q8(normed2))
-            } else {
-                None
-            };
-            decision
-                .expert_ids
-                .iter()
-                .zip(decision.weights.iter())
-                .map(|(&eid, &w)| {
-                    let placement = plan
-                        .map(|p| p.placement_for(eid))
-                        .unwrap_or(ExpertPlacement::Cpu);
-                    let out = layer.moe.with_expert(eid, |ex| {
-                        if let Some(ref act) = shared_act {
-                            if let (Some(gate), Some(up)) =
-                                (ex.gate.apply_cpu_q8(act), ex.up.apply_cpu_q8(act))
-                            {
-                                let activated = ferrox_core::matmul::swiglu(&gate, &up);
-                                return ex.down.apply(&activated);
-                            }
-                        }
-                        run_expert_placed(normed2, ex, placement)
-                    });
-                    (out, w)
+            // llama.cpp mul_mat_id: one shared Q8 act + flat (slot,row)
+            // parallel over all top-k experts (not serial expert loops each
+            // with their own rayon fork-join).
+            let all_cpu = plan
+                .map(|p| {
+                    decision
+                        .expert_ids
+                        .iter()
+                        .all(|&eid| matches!(p.placement_for(eid), ExpertPlacement::Cpu))
                 })
-                .collect()
+                .unwrap_or(true);
+            if let (true, ExpertBacking::Resident(experts)) = (all_cpu, &layer.moe.experts) {
+                if let Some(outs) =
+                    Self::try_cpu_moe_mul_mat_id(experts, normed2, &decision, hidden_dim)
+                {
+                    outs
+                } else {
+                    Self::cpu_moe_serial_experts(layer, normed2, &decision, plan)
+                }
+            } else {
+                Self::cpu_moe_serial_experts(layer, normed2, &decision, plan)
+            }
         };
         // Shared experts fire on every token regardless of routing, so
         // there's no offload decision to make for them the way there

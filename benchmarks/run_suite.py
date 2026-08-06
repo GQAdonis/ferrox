@@ -172,6 +172,15 @@ def chat(port: int, n: int, content: str) -> dict:
     }
 
 
+def _trim_outliers(vals: list[float]) -> list[float]:
+    """Drop min/max when n≥5 so one thermal cliff does not inflate ±stddev
+    (CPU llama OLMoE saw 24–40 tok/s in one 5-rep window)."""
+    if len(vals) < 5:
+        return vals
+    ordered = sorted(vals)
+    return ordered[1:-1]
+
+
 def aggregate(runs: list[dict], reps: int) -> dict:
     """Median across repetitions for the headline metrics (llama-bench
     style: N repetitions, report central tendency + spread, never a
@@ -202,9 +211,10 @@ def aggregate(runs: list[dict], reps: int) -> dict:
     ):
         vals = series(key)
         if vals:
-            agg[key] = round(statistics.median(vals), 3)
-            if len(vals) >= 2 and key in spread_name:
-                agg[spread_name[key]] = round(statistics.stdev(vals), 3)
+            core = _trim_outliers(vals)
+            agg[key] = round(statistics.median(core), 3)
+            if len(core) >= 2 and key in spread_name:
+                agg[spread_name[key]] = round(statistics.stdev(core), 3)
     agg["reps"] = reps
     agg["runs"] = [
         {
@@ -309,6 +319,179 @@ def run_ferrox(
         except Exception:
             proc.kill()
         log.close()
+
+
+def _start_ferrox_server(
+    bin_path: str, model: str, port: int, backend: str, threads: int
+):
+    """Spawn ferrox-server; returns (proc, log_path) or error dict."""
+    if backend == "metal":
+        if b"FERROX_METAL_FA_VEC" not in Path(bin_path).read_bytes():
+            return {
+                "error": "ferrox binary lacks metal feature "
+                "(rebuild with --features metal)",
+                "engine": "ferrox",
+            }, None, None
+    kill_port(port)
+    env = os.environ.copy()
+    env["FERROX_MODEL_PATH"] = model
+    env["FERROX_ADDR"] = f"127.0.0.1:{port}"
+    env["RAYON_NUM_THREADS"] = str(threads)
+    if backend == "metal":
+        env["FERROX_METAL"] = "1"
+        env["FERROX_METAL_ATTN"] = "1"
+        env["FERROX_CUDA"] = "0"
+    elif backend == "cuda":
+        env["FERROX_METAL"] = "0"
+        env["FERROX_CUDA"] = "1"
+        env.setdefault("FERROX_CUDA_GQA", "1")
+    else:
+        env["FERROX_METAL"] = "0"
+        env["FERROX_CUDA"] = "0"
+        env["FERROX_CPU_INT_DOT"] = env.get("FERROX_CPU_INT_DOT", "1")
+    RECEIPTS.mkdir(parents=True, exist_ok=True)
+    log_path = RECEIPTS / f"_tmp_ferrox_{port}.log"
+    log = open(log_path, "w")
+    proc = subprocess.Popen([bin_path], env=env, stdout=log, stderr=subprocess.STDOUT)
+    if not wait_health(port):
+        proc.send_signal(signal.SIGTERM)
+        try:
+            proc.wait(timeout=20)
+        except Exception:
+            proc.kill()
+        log.close()
+        return {
+            "error": "ferrox health fail",
+            "log_tail": log_path.read_text()[-2000:],
+            "engine": "ferrox",
+        }, None, None
+    return None, proc, (log, log_path)
+
+
+def _start_llama_server(bin_path: str, model: str, port: int, backend: str, threads: int):
+    kill_port(port)
+    RECEIPTS.mkdir(parents=True, exist_ok=True)
+    log_path = RECEIPTS / f"_tmp_llama_{port}.log"
+    log = open(log_path, "w")
+    ngl = "0" if backend == "cpu" else "99"
+    cmd = [
+        bin_path,
+        "-m",
+        model,
+        "-ngl",
+        ngl,
+        "-t",
+        str(threads),
+        "--port",
+        str(port),
+        "--host",
+        "127.0.0.1",
+        "-c",
+        "4096",
+        "--jinja",
+    ]
+    proc = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT)
+    if not wait_health(port):
+        proc.send_signal(signal.SIGTERM)
+        try:
+            proc.wait(timeout=25)
+        except Exception:
+            proc.kill()
+        log.close()
+        return {
+            "error": "llama health fail",
+            "log_tail": log_path.read_text()[-2000:],
+            "engine": "llama",
+        }, None, None
+    return None, proc, (log, log_path)
+
+
+def _stop_server(proc, log_handle, timeout: int = 20) -> None:
+    if proc is None:
+        return
+    proc.send_signal(signal.SIGTERM)
+    try:
+        proc.wait(timeout=timeout)
+    except Exception:
+        proc.kill()
+    if log_handle is not None:
+        log_handle.close()
+
+
+def run_fair_chat_interleaved(
+    ferrox_bin: str,
+    llama_bin: str,
+    model: str,
+    ferrox_port: int,
+    llama_port: int,
+    n: int,
+    backend: str,
+    threads: int,
+    reps: int = 1,
+) -> tuple[dict, dict]:
+    """Run both servers concurrently; llama then ferrox each rep.
+
+    Cuts CPU thermal/page-cache skew from ferrox-all-then-llama-all
+    (OLMoE llama ±5 tok/s → much tighter when paired).
+    """
+    ferr, f_proc, f_meta = _start_ferrox_server(
+        ferrox_bin, model, ferrox_port, backend, threads
+    )
+    if ferr is not None:
+        return ferr, {"error": "ferrox failed to start", "engine": "llama"}
+    f_log, f_log_path = f_meta
+
+    lerr, l_proc, l_meta = _start_llama_server(
+        llama_bin, model, llama_port, backend, threads
+    )
+    if lerr is not None:
+        _stop_server(f_proc, f_log)
+        return {"error": "llama failed to start", "engine": "ferrox"}, lerr
+    l_log, _l_log_path = l_meta
+
+    try:
+        chat(ferrox_port, 4, f"Hi {uuid.uuid4().hex[:8]}-w")
+        chat(llama_port, 4, f"Hi {uuid.uuid4().hex[:8]}-w")
+        # Extra settle on CPU — thermal after dual warm.
+        if backend == "cpu":
+            time.sleep(2.0)
+        ferrox_runs = []
+        llama_runs = []
+        for i in range(max(reps, 1)):
+            print(f"--- llama (server) rep {i+1}/{reps} ---", flush=True)
+            llama_runs.append(chat(llama_port, n, PROMPT.format(uid=uuid.uuid4().hex[:8])))
+            print(f"--- ferrox (server) rep {i+1}/{reps} ---", flush=True)
+            ferrox_runs.append(
+                chat(ferrox_port, n, PROMPT.format(uid=uuid.uuid4().hex[:8]))
+            )
+            if backend == "cpu" and i + 1 < max(reps, 1):
+                time.sleep(1.0)
+        f_row = aggregate(ferrox_runs, max(reps, 1))
+        txt = f_log_path.read_text()
+        f_row["metal_fails"] = sum(
+            txt.count(s)
+            for s in (
+                "Metal attn block failed",
+                "Metal dense layer failed",
+                "Metal dense stack failed",
+            )
+        )
+        f_row["engine"] = "ferrox"
+        l_row = aggregate(llama_runs, max(reps, 1))
+        l_row["engine"] = "llama"
+        return f_row, l_row
+    except Exception as e:
+        return (
+            {
+                "error": str(e),
+                "engine": "ferrox",
+                "log_tail": f_log_path.read_text()[-2000:] if f_log_path.exists() else "",
+            },
+            {"error": str(e), "engine": "llama"},
+        )
+    finally:
+        _stop_server(f_proc, f_log)
+        _stop_server(l_proc, l_log, timeout=25)
 
 
 def run_llama(
@@ -769,18 +952,52 @@ def run_one(
                 pin["ferrox"]["startup_s"] = round(statistics.median(startups), 3)
             print(json.dumps(pin["ferrox"], indent=2), flush=True)
     else:
-        if not skip_ferrox:
-            print("--- ferrox ---", flush=True)
-            pin["ferrox"] = run_ferrox(
-                ferrox_bin, str(model_path), ferrox_port, max_tokens, backend, threads, reps
+        # CPU: both servers warm, llama→ferrox each rep (cuts thermal/
+        # page-cache skew — OLMoE llama was ±5 tok/s sequential).
+        # Metal/CUDA: keep sequential — dual GPU-resident servers contend.
+        if backend == "cpu" and not skip_ferrox and not skip_llama:
+            print(
+                f"--- server interleaved (llama then ferrox each of {reps}) ---",
+                flush=True,
             )
-            print(json.dumps(pin["ferrox"], indent=2), flush=True)
-        if not skip_llama:
-            print("--- llama ---", flush=True)
-            pin["llama"] = run_llama(
-                llama_bin, str(model_path), llama_port, max_tokens, backend, threads, reps
+            pin["ferrox"], pin["llama"] = run_fair_chat_interleaved(
+                ferrox_bin,
+                llama_bin,
+                str(model_path),
+                ferrox_port,
+                llama_port,
+                max_tokens,
+                backend,
+                threads,
+                reps,
             )
             print(json.dumps(pin["llama"], indent=2), flush=True)
+            print(json.dumps(pin["ferrox"], indent=2), flush=True)
+        else:
+            if not skip_ferrox:
+                print("--- ferrox ---", flush=True)
+                pin["ferrox"] = run_ferrox(
+                    ferrox_bin,
+                    str(model_path),
+                    ferrox_port,
+                    max_tokens,
+                    backend,
+                    threads,
+                    reps,
+                )
+                print(json.dumps(pin["ferrox"], indent=2), flush=True)
+            if not skip_llama:
+                print("--- llama ---", flush=True)
+                pin["llama"] = run_llama(
+                    llama_bin,
+                    str(model_path),
+                    llama_port,
+                    max_tokens,
+                    backend,
+                    threads,
+                    reps,
+                )
+                print(json.dumps(pin["llama"], indent=2), flush=True)
 
     pin["status"] = pin_status(entry.get("expect", "ok"), pin["ferrox"], pin["llama"])
     # Prefer refuse when expect=refuse and ferrox errored

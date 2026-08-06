@@ -880,6 +880,68 @@ kernel void q4_0_moe_down_id(
         }
     }
 }
+
+/// Fused down × top-k + weighted sum (llama decode: one op writes MoE out).
+/// Grid depth = `n_tokens` (not n_slots) — loops experts in-kernel.
+kernel void q4_0_moe_down_id_sum(
+    device const uchar* down_all [[buffer(0)]],
+    device const float* act [[buffer(1)]],
+    device float* out [[buffer(2)]],
+    device const int* ids [[buffer(3)]],
+    device const float* route [[buffer(4)]],
+    constant uint& row_bytes [[buffer(5)]],
+    constant uint& n_blocks [[buffer(6)]],
+    constant uint& hidden_rows [[buffer(7)]],
+    constant uint& ffn_rows [[buffer(8)]],
+    constant uint& top_k [[buffer(9)]],
+    constant uint& expert_stride [[buffer(10)]],
+    constant uint& n_tokens [[buffer(11)]],
+    uint3 tgpig [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]]
+) {
+    constexpr uint NR = 4u;
+    constexpr uint NSG = 2u;
+    const uint group = tgpig.x;
+    const uint token = tgpig.z;
+    const uint first_row = (group * NSG + sg) * NR;
+    if (token >= n_tokens) return;
+    float acc[NR] = { 0.0f };
+    for (uint k = 0u; k < top_k; ++k) {
+        const uint slot = token * top_k + k;
+        const uint eid = uint(ids[slot]);
+        const float rw = route[slot];
+        device const uchar* wd = down_all + (size_t)eid * expert_stride;
+        device const float* xa = act + (size_t)slot * ffn_rows;
+        float partial[NR] = { 0.0f };
+        device const uchar* ax[NR];
+        for (uint rr = 0u; rr < NR; ++rr) {
+            const uint row = min(first_row + rr, hidden_rows > 0u ? hidden_rows - 1u : 0u);
+            ax[rr] = wd + (size_t)row * row_bytes;
+        }
+        const uint ix = lane / 2u;
+        const uint il = (lane % 2u) * 8u;
+        device const float* yb = xa + ix * 32u + il;
+        for (uint b = ix; b < n_blocks; b += 16u) {
+            float yl[16];
+            const float sumy = q4_0_load_y(yb, yl);
+            #pragma clang loop unroll(full)
+            for (uint rr = 0u; rr < NR; ++rr) {
+                partial[rr] += q4_0_half_dot(ax[rr] + (size_t)b * 18u, sumy, yl, il);
+            }
+            yb += 16u * 32u;
+        }
+        for (uint rr = 0u; rr < NR; ++rr) {
+            acc[rr] += rw * simd_sum(partial[rr]);
+        }
+    }
+    for (uint rr = 0u; rr < NR; ++rr) {
+        const uint row = first_row + rr;
+        if (lane == 0u && row < hidden_rows) {
+            out[(size_t)token * hidden_rows + row] = acc[rr];
+        }
+    }
+}
 "#;
 
 /// Launches the Q4_0 matvec kernel. Verified on a real Apple M2 Pro GPU
@@ -3034,6 +3096,60 @@ fn encode_q4_0_moe_matvec_id(
     Ok(())
 }
 
+/// Pre-bound packed expert planes (llama: experts stay in one MTLBuffer
+/// after load; encode only rebinds ids/scratch). Keyed by gate base ptr.
+pub(crate) struct MoePackedResident {
+    key: usize,
+    pub(crate) gate: Arc<ResidentWeightBuffer>,
+    pub(crate) up: Arc<ResidentWeightBuffer>,
+    pub(crate) down: Arc<ResidentWeightBuffer>,
+}
+
+thread_local! {
+    /// Hoisted packed gate/up/down MTLBuffers — one resolve per layer,
+    /// not per token (ROADMAP “expert residency hoist”).
+    static TL_MOE_PACKED: RefCell<HashMap<usize, MoePackedResident>> =
+        RefCell::new(HashMap::new());
+}
+
+pub(crate) fn moe_packed_resident(
+    device: &Retained<ProtocolObject<dyn MTLDevice>>,
+    packed: &MoePackedQ4<'_>,
+) -> Result<MoePackedResident, MetalError> {
+    let key = packed.gate.as_ptr() as usize;
+    if let Some(hit) = TL_MOE_PACKED.with(|c| {
+        c.borrow().get(&key).map(|r| MoePackedResident {
+            key: r.key,
+            gate: r.gate.clone(),
+            up: r.up.clone(),
+            down: r.down.clone(),
+        })
+    }) {
+        return Ok(hit);
+    }
+    let gate = resident_weight_buffer(device, packed.gate)?;
+    let up = resident_weight_buffer(device, packed.up)?;
+    let down = resident_weight_buffer(device, packed.down)?;
+    let bound = MoePackedResident {
+        key,
+        gate,
+        up,
+        down,
+    };
+    TL_MOE_PACKED.with(|c| {
+        c.borrow_mut().insert(
+            key,
+            MoePackedResident {
+                key: bound.key,
+                gate: bound.gate.clone(),
+                up: bound.up.clone(),
+                down: bound.down.clone(),
+            },
+        );
+    });
+    Ok(bound)
+}
+
 /// Encode packed-id Q4_0 MoE: matvec_id(gate) ∥ matvec_id(up) → barrier →
 /// silu_mul → barrier → down_id → weighted_sum.
 ///
@@ -3059,9 +3175,10 @@ pub(crate) fn encode_q4_0_moe_id(
     assert_eq!(packed.gate_stride, packed.up_stride);
     assert!(n_tokens >= 1);
     assert!(top_k >= 1);
-    let gate_w = resident_weight_buffer(device, packed.gate)?;
-    let up_w = resident_weight_buffer(device, packed.up)?;
-    let down_w = resident_weight_buffer(device, packed.down)?;
+    let bound = moe_packed_resident(device, packed)?;
+    let gate_w = &bound.gate;
+    let up_w = &bound.up;
+    let down_w = &bound.down;
     let input_blocks = packed.gate_row_bytes / 18;
     let down_blocks = packed.down_row_bytes / 18;
     let x_stride = (input_blocks * 32) as u32;
@@ -3071,7 +3188,7 @@ pub(crate) fn encode_q4_0_moe_id(
     encode_q4_0_moe_matvec_id(
         encoder,
         device,
-        &gate_w,
+        gate_w,
         x_buf,
         gate_buf,
         ids,
@@ -3087,7 +3204,7 @@ pub(crate) fn encode_q4_0_moe_id(
     encode_q4_0_moe_matvec_id(
         encoder,
         device,
-        &up_w,
+        up_w,
         x_buf,
         up_buf,
         ids,
@@ -3111,96 +3228,66 @@ pub(crate) fn encode_q4_0_moe_id(
     )?;
     memory_barrier_buffers(encoder);
 
-    let down = ensure_pipeline(device, Q4_0_MOE_TOPK_KERNEL_SRC, "q4_0_moe_down_id")?;
-    let weighted_sum = ensure_pipeline(device, Q4_0_MOE_TOPK_KERNEL_SRC, "moe_weighted_sum")?;
-
-    encoder.setComputePipelineState(&down.0);
+    // Fused down+weighted_sum: one dispatch (depth=n_tokens), loop top-k
+    // in-kernel — drops expert_out buffer traffic + separate sum kernel.
+    let _ = expert_out_buf; // kept for API/scratch sizing; unused here
+    let down_sum = ensure_pipeline(device, Q4_0_MOE_TOPK_KERNEL_SRC, "q4_0_moe_down_id_sum")?;
+    encoder.setComputePipelineState(&down_sum.0);
     const ROWS_PER_TG: usize = 8;
     unsafe {
         encoder.setBuffer_offset_atIndex(Some(&down_w.buffer), down_w.weight_offset, 0);
         encoder.setBuffer_offset_atIndex(Some(act_buf), 0, 1);
-        encoder.setBuffer_offset_atIndex(Some(expert_out_buf), 0, 2);
+        encoder.setBuffer_offset_atIndex(Some(out_buf), 0, 2);
         encoder.setBuffer_offset_atIndex(Some(ids), 0, 3);
+        encoder.setBuffer_offset_atIndex(Some(route), 0, 4);
         let mut row_bytes = packed.down_row_bytes as u32;
         encoder.setBytes_length_atIndex(
             NonNull::new(&mut row_bytes as *mut u32 as *mut _).unwrap(),
             4,
-            4,
+            5,
         );
         let mut blocks = down_blocks as u32;
         encoder.setBytes_length_atIndex(
             NonNull::new(&mut blocks as *mut u32 as *mut _).unwrap(),
             4,
-            5,
+            6,
         );
         let mut hidden_rows = packed.hidden_rows as u32;
         encoder.setBytes_length_atIndex(
             NonNull::new(&mut hidden_rows as *mut u32 as *mut _).unwrap(),
             4,
-            6,
+            7,
         );
         let mut ffn_rows = packed.ffn_rows as u32;
         encoder.setBytes_length_atIndex(
             NonNull::new(&mut ffn_rows as *mut u32 as *mut _).unwrap(),
             4,
-            7,
+            8,
         );
         let mut tk = top_k;
-        encoder.setBytes_length_atIndex(NonNull::new(&mut tk as *mut u32 as *mut _).unwrap(), 4, 8);
+        encoder.setBytes_length_atIndex(NonNull::new(&mut tk as *mut u32 as *mut _).unwrap(), 4, 9);
         let mut stride = packed.down_stride as u32;
         encoder.setBytes_length_atIndex(
             NonNull::new(&mut stride as *mut u32 as *mut _).unwrap(),
             4,
-            9,
+            10,
         );
         let mut nt = n_tokens;
         encoder.setBytes_length_atIndex(
             NonNull::new(&mut nt as *mut u32 as *mut _).unwrap(),
             4,
-            10,
+            11,
         );
     }
     encoder.dispatchThreadgroups_threadsPerThreadgroup(
         MTLSize {
             width: packed.hidden_rows.div_ceil(ROWS_PER_TG),
             height: 1,
-            depth: n_slots,
+            depth: n_tokens as usize,
         },
         MTLSize {
             width: 32,
             height: 2,
-            depth: 1,
-        },
-    );
-    memory_barrier_buffers(encoder);
-
-    encoder.setComputePipelineState(&weighted_sum.0);
-    unsafe {
-        encoder.setBuffer_offset_atIndex(Some(expert_out_buf), 0, 0);
-        encoder.setBuffer_offset_atIndex(Some(route), 0, 1);
-        encoder.setBuffer_offset_atIndex(Some(out_buf), 0, 2);
-        let mut hidden_rows = packed.hidden_rows as u32;
-        encoder.setBytes_length_atIndex(
-            NonNull::new(&mut hidden_rows as *mut u32 as *mut _).unwrap(),
-            4,
-            3,
-        );
-        let mut tk = top_k;
-        encoder.setBytes_length_atIndex(NonNull::new(&mut tk as *mut u32 as *mut _).unwrap(), 4, 4);
-        let mut nt = n_tokens;
-        encoder.setBytes_length_atIndex(NonNull::new(&mut nt as *mut u32 as *mut _).unwrap(), 4, 5);
-    }
-    const SUM_TG: usize = 256;
-    let sum_elems = (n_tokens as usize) * packed.hidden_rows;
-    encoder.dispatchThreadgroups_threadsPerThreadgroup(
-        MTLSize {
-            width: sum_elems.div_ceil(SUM_TG),
-            height: 1,
-            depth: 1,
-        },
-        MTLSize {
-            width: SUM_TG,
-            height: 1,
             depth: 1,
         },
     );

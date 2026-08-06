@@ -537,6 +537,35 @@ impl WeightMatrix {
         Some(out)
     }
 
+    /// Single-row INT_DOT against pre-quantized Q8_0 acts (llama `mul_mat_id`
+    /// inner loop). Returns `None` if this matrix is not Q4_0/Q8_0 INT_DOT.
+    pub fn dot_row_cpu_q8(&self, row: usize, act: &ferrox_quant::Q8Activations) -> Option<f32> {
+        let WeightMatrix::Quantized {
+            data,
+            rows,
+            cols,
+            kind,
+        } = self
+        else {
+            return None;
+        };
+        if row >= *rows
+            || !matches!(*kind, QuantKind::Q8_0 | QuantKind::Q4_0)
+            || !cpu_int_dot_enabled()
+            || act.q.len() != *cols
+            || !cols.is_multiple_of(32)
+        {
+            return None;
+        }
+        let row_bytes = self.block_bytes_per_row(*kind, *cols);
+        let bytes = &data.as_slice()[row * row_bytes..(row + 1) * row_bytes];
+        Some(match *kind {
+            QuantKind::Q8_0 => ferrox_quant::dot_q8_0_q8(bytes, act),
+            QuantKind::Q4_0 => ferrox_quant::dot_q4_0_q8(bytes, act),
+            _ => unreachable!(),
+        })
+    }
+
     /// Computes `W @ X` for a *batch* of activation vectors at once:
     /// `x_batch` is `batch_size` rows of `self.cols()` elements each,
     /// flattened row-major; returns `batch_size` rows of

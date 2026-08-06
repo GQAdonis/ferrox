@@ -44,6 +44,7 @@ use crate::gpu::{
     compute_encoder_concurrent, encode_matvec, encode_moe_topk_softmax, encode_q4_0_moe_id,
     encode_q4_0_moe_topk, ensure_pipeline, memory_barrier_buffers, resident_f32_buffer,
     resident_weight_buffer, shared_metal, MatvecLaunch, MetalError, MoeExpertLaunch, MoePackedQ4,
+    ResidentF32Buffer, ResidentWeightBuffer,
 };
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
@@ -3904,11 +3905,83 @@ pub struct MoeLayerMetal<'a> {
     pub extras: AttnExtras<'a>,
 }
 
+/// Pre-bound MTLBuffers for one MoE layer (llama: bind weights once).
+struct MoeLayerResident {
+    attn_key: usize,
+    attn_nw: std::sync::Arc<ResidentF32Buffer>,
+    ffn_nw: std::sync::Arc<ResidentF32Buffer>,
+    q_w: std::sync::Arc<ResidentWeightBuffer>,
+    k_w: std::sync::Arc<ResidentWeightBuffer>,
+    v_w: std::sync::Arc<ResidentWeightBuffer>,
+    o_w: std::sync::Arc<ResidentWeightBuffer>,
+    r_w: std::sync::Arc<ResidentWeightBuffer>,
+}
+
+thread_local! {
+    /// Hoisted per-layer QKV/router/norm buffers for the MoE stack.
+    static TL_MOE_LAYER_RESIDENT: RefCell<Vec<Option<MoeLayerResident>>> =
+        const { RefCell::new(Vec::new()) };
+}
+
+fn moe_layer_resident(
+    device: &Retained<ProtocolObject<dyn MTLDevice>>,
+    layer_idx: usize,
+    layer: &MoeLayerMetal<'_>,
+) -> Result<MoeLayerResident, MetalError> {
+    let attn_key = layer.attn_norm_w.as_ptr() as usize;
+    if let Some(hit) = TL_MOE_LAYER_RESIDENT.with(|c| {
+        c.borrow().get(layer_idx).and_then(|slot| {
+            slot.as_ref().filter(|r| r.attn_key == attn_key).map(|r| {
+                MoeLayerResident {
+                    attn_key: r.attn_key,
+                    attn_nw: r.attn_nw.clone(),
+                    ffn_nw: r.ffn_nw.clone(),
+                    q_w: r.q_w.clone(),
+                    k_w: r.k_w.clone(),
+                    v_w: r.v_w.clone(),
+                    o_w: r.o_w.clone(),
+                    r_w: r.r_w.clone(),
+                }
+            })
+        })
+    }) {
+        return Ok(hit);
+    }
+    let bound = MoeLayerResident {
+        attn_key,
+        attn_nw: resident_f32_buffer(device, layer.attn_norm_w)?,
+        ffn_nw: resident_f32_buffer(device, layer.ffn_norm_w)?,
+        q_w: resident_weight_buffer(device, layer.q.weights)?,
+        k_w: resident_weight_buffer(device, layer.k.weights)?,
+        v_w: resident_weight_buffer(device, layer.v.weights)?,
+        o_w: resident_weight_buffer(device, layer.o.weights)?,
+        r_w: resident_weight_buffer(device, layer.router.weights)?,
+    };
+    TL_MOE_LAYER_RESIDENT.with(|c| {
+        let mut v = c.borrow_mut();
+        if v.len() <= layer_idx {
+            v.resize_with(layer_idx + 1, || None);
+        }
+        v[layer_idx] = Some(MoeLayerResident {
+            attn_key: bound.attn_key,
+            attn_nw: bound.attn_nw.clone(),
+            ffn_nw: bound.ffn_nw.clone(),
+            q_w: bound.q_w.clone(),
+            k_w: bound.k_w.clone(),
+            v_w: bound.v_w.clone(),
+            o_w: bound.o_w.clone(),
+            r_w: bound.r_w.clone(),
+        });
+    });
+    Ok(bound)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn encode_moe_layer_fused(
     encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
     device: &Retained<ProtocolObject<dyn MTLDevice>>,
     scratch: &MoeDecodeScratch,
+    layer_idx: usize,
     layer: &MoeLayerMetal<'_>,
     kv: &MetalKvBuffers,
     top_k: usize,
@@ -3923,13 +3996,14 @@ fn encode_moe_layer_fused(
     pos: usize,
     rms_eps: f32,
 ) -> Result<(), MetalError> {
-    let attn_nw = resident_f32_buffer(device, layer.attn_norm_w)?;
-    let ffn_nw = resident_f32_buffer(device, layer.ffn_norm_w)?;
-    let q_w = resident_weight_buffer(device, layer.q.weights)?;
-    let k_w = resident_weight_buffer(device, layer.k.weights)?;
-    let v_w = resident_weight_buffer(device, layer.v.weights)?;
-    let o_w = resident_weight_buffer(device, layer.o.weights)?;
-    let r_w = resident_weight_buffer(device, layer.router.weights)?;
+    let bound = moe_layer_resident(device, layer_idx, layer)?;
+    let attn_nw = &bound.attn_nw;
+    let ffn_nw = &bound.ffn_nw;
+    let q_w = &bound.q_w;
+    let k_w = &bound.k_w;
+    let v_w = &bound.v_w;
+    let o_w = &bound.o_w;
+    let r_w = &bound.r_w;
 
     encode_rms_norm(
         encoder,
@@ -3942,9 +4016,9 @@ fn encode_moe_layer_fused(
     )?;
     memory_barrier_buffers(encoder);
     // Q∥K∥V — disjoint destinations
-    encode_matvec(encoder, device, &layer.q, &q_w, &scratch.x_attn, &scratch.q)?;
-    encode_matvec(encoder, device, &layer.k, &k_w, &scratch.x_attn, &scratch.k)?;
-    encode_matvec(encoder, device, &layer.v, &v_w, &scratch.x_attn, &scratch.v)?;
+    encode_matvec(encoder, device, &layer.q, q_w, &scratch.x_attn, &scratch.q)?;
+    encode_matvec(encoder, device, &layer.k, k_w, &scratch.x_attn, &scratch.k)?;
+    encode_matvec(encoder, device, &layer.v, v_w, &scratch.x_attn, &scratch.v)?;
     memory_barrier_buffers(encoder);
     encode_attn_extras(
         encoder,
@@ -4020,7 +4094,7 @@ fn encode_moe_layer_fused(
         layer.extras.attn_logit_softcap,
     )?;
     memory_barrier_buffers(encoder);
-    encode_matvec(encoder, device, &layer.o, &o_w, &scratch.attn, &scratch.o)?;
+    encode_matvec(encoder, device, &layer.o, o_w, &scratch.attn, &scratch.o)?;
     memory_barrier_buffers(encoder);
     encode_add_rms_norm(
         encoder,
@@ -4037,7 +4111,7 @@ fn encode_moe_layer_fused(
         encoder,
         device,
         &layer.router,
-        &r_w,
+        r_w,
         &scratch.x2,
         &scratch.router,
     )?;
@@ -4298,11 +4372,12 @@ pub fn launch_moe_decode_stack(
             None
         };
 
-        for (layer, kv) in layers.iter().zip(kvs.iter()) {
+        for (layer_idx, (layer, kv)) in layers.iter().zip(kvs.iter()).enumerate() {
             encode_moe_layer_fused(
                 &encoder,
                 device,
                 scratch,
+                layer_idx,
                 layer,
                 kv,
                 top_k,

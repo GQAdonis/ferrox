@@ -21,7 +21,7 @@ ds4 deps — rewrite in-tree.
 Also on this horizon (unchanged intent):
 
 - **Receipts** — real GGUF oracles for Gemma-2, Qwen2-MoE, Mistral, Mixtral (suite entries exist; pins pending checkpoints).
-- **Metal MoE** — concurrent encode (`MTLDispatchTypeConcurrent`, gate∥up + Q∥K∥V) + unfused `matvec_id`; OLMoE Metal **~1.59×**, CPU **~1.40×** — next: expert residency hoist + simdgroup `mul_mm` prefill.
+- **Metal MoE** — concurrent encode + expert residency hoist + fused down×topk sum; OLMoE Metal **~1.56×**, CPU **~1.38×** (flat `mul_mat_id` GEMV + interleaved fair-chat). Next: tighter Q4_0 `mul_mv_id` vs ggml + `mul_mm_id` prefill.
 - **Frontier** — Kimi multi-layer → full e2e; GLM-5.2 / DeepSeek V4 real quants (engines exist; fail-closed until receipts).
 - **CUDA** — fair-chat pins via `run_suite.py --backend cuda --host-label …`; staged ≥0.5× then parity (no invented numbers).
 

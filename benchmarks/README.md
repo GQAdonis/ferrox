@@ -66,6 +66,10 @@ python3 benchmarks/run_suite.py --id tinyllama_q8 --backend cpu
 CPU path sets `FERROX_METAL=0`, `FERROX_CPU_INT_DOT=1`,
 `RAYON_NUM_THREADS=10`; llama uses `-ngl 0 -t 10`.
 
+Fair-chat on CPU **interleaves** llama→ferrox each rep with both servers
+warm (cuts thermal/page-cache skew that inflated llama ±stddev). Metal
+stays sequential so two GPU-resident servers do not contend.
+
 ## CLI completion (+ load / startup)
 
 One-shot `llama-completion` vs `ferrox run` (fresh process per rep).

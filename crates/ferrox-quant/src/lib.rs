@@ -754,6 +754,21 @@ pub fn dot_q4_0_q8(row_bytes: &[u8], act: &Q8Activations) -> f32 {
     dot_q4_0_q8_scalar(row_bytes, act)
 }
 
+/// Two contiguous Q4_0 rows × one Q8 act (shared act loads). Faster than
+/// two [`dot_q4_0_q8`] calls on Apple DotProd.
+pub fn dot_q4_0_q8_2row(row0: &[u8], row1: &[u8], act: &Q8Activations) -> (f32, f32) {
+    #[cfg(target_arch = "aarch64")]
+    {
+        if std::arch::is_aarch64_feature_detected!("dotprod")
+            && row0.len() == row1.len()
+            && row0.len().is_multiple_of(Q4_0_BLOCK_BYTES)
+        {
+            return unsafe { simd_aarch64::dot_q4_0_q8_neon_sdot_2row(row0, row1, act) };
+        }
+    }
+    (dot_q4_0_q8(row0, act), dot_q4_0_q8(row1, act))
+}
+
 pub fn dot_q4_0_q8_scalar(row_bytes: &[u8], act: &Q8Activations) -> f32 {
     debug_assert_eq!(row_bytes.len() % Q4_0_BLOCK_BYTES, 0);
     let n_blocks = row_bytes.len() / Q4_0_BLOCK_BYTES;
@@ -2198,6 +2213,45 @@ mod simd_aarch64 {
             acc += dw * act.d[b] * vaddvq_s32(isum) as f32;
         }
         acc
+    }
+
+    /// Two weight rows × one act: share Q8 loads, dual SDOT accumulate.
+    #[target_feature(enable = "neon,dotprod")]
+    pub unsafe fn dot_q4_0_q8_neon_sdot_2row(
+        row0: &[u8],
+        row1: &[u8],
+        act: &Q8Activations,
+    ) -> (f32, f32) {
+        debug_assert_eq!(row0.len(), row1.len());
+        debug_assert_eq!(row0.len() % Q4_0_BLOCK_BYTES, 0);
+        let bias = vdupq_n_s8(8);
+        let low_mask = vdupq_n_u8(0x0F);
+        let nb = row0.len() / Q4_0_BLOCK_BYTES;
+        let mut sum0 = vdupq_n_f32(0.0);
+        let mut sum1 = vdupq_n_f32(0.0);
+        for b in 0..nb {
+            let p0 = row0.as_ptr().add(b * Q4_0_BLOCK_BYTES);
+            let p1 = row1.as_ptr().add(b * Q4_0_BLOCK_BYTES);
+            let dw0 = f16::from_le_bytes([*p0, *p0.add(1)]).to_f32();
+            let dw1 = f16::from_le_bytes([*p1, *p1.add(1)]).to_f32();
+            let base = b * Q4_0_BLOCK_ELEMS;
+            let a_lo = vld1q_s8(act.q.as_ptr().add(base));
+            let a_hi = vld1q_s8(act.q.as_ptr().add(base + 16));
+            let nib0 = vld1q_u8(p0.add(2));
+            let nib1 = vld1q_u8(p1.add(2));
+            let lo0 = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(nib0, low_mask)), bias);
+            let hi0 = vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8(nib0, 4)), bias);
+            let lo1 = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(nib1, low_mask)), bias);
+            let hi1 = vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8(nib1, 4)), bias);
+            let mut is0 = neon_sdot(vdupq_n_s32(0), lo0, a_lo);
+            is0 = neon_sdot(is0, hi0, a_hi);
+            let mut is1 = neon_sdot(vdupq_n_s32(0), lo1, a_lo);
+            is1 = neon_sdot(is1, hi1, a_hi);
+            let scale = act.d[b];
+            sum0 = vmlaq_n_f32(sum0, vcvtq_f32_s32(is0), dw0 * scale);
+            sum1 = vmlaq_n_f32(sum1, vcvtq_f32_s32(is1), dw1 * scale);
+        }
+        (vaddvq_f32(sum0), vaddvq_f32(sum1))
     }
 
     /// NEON Q4_0 × Q8 with SDOT. Two-block unroll + float4 scale-accumulate.

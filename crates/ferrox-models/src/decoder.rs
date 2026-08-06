@@ -2225,9 +2225,9 @@ impl Decoder {
         layer.moe.n_experts() == 1 && layer.moe.shared_experts.is_empty()
     }
 
-    /// llama.cpp `mul_mat_id` style: shared Q8 act + one flat rayon pass
-    /// over `(slot, row)` for gate and up, then SwiGLU, then down.
-    /// Avoids serial top-k × nested rayon fork-join.
+    /// llama.cpp `mul_mat_id` style: shared Q8 act + flat rayon over
+    /// `(slot, row_pair)` for gate∥up (2-row SDOT), then SwiGLU, then
+    /// per-slot down. One outer fork-join — no nested `apply_cpu_q8`.
     fn try_cpu_moe_mul_mat_id(
         experts: &[ExpertWeights],
         normed2: &[f32],
@@ -2254,7 +2254,6 @@ impl Decoder {
             {
                 return None;
             }
-            // Reject non-INT_DOT quants without allocating.
             if !matches!(
                 &ex.gate,
                 WeightMatrix::Quantized {
@@ -2272,19 +2271,36 @@ impl Decoder {
             }
         }
         let ffn_rows = experts[decision.expert_ids[0]].gate.rows();
+        // Even ffn_rows: par_chunks_mut(2) never crosses a slot boundary.
+        if ffn_rows % 2 != 0 {
+            return None;
+        }
         let act = ferrox_quant::quantize_activations_q8(normed2);
+        let eids = &decision.expert_ids;
         let mut gate = vec![0f32; n_slots * ffn_rows];
         let mut up = vec![0f32; n_slots * ffn_rows];
-        let eids = &decision.expert_ids;
-        gate.par_iter_mut()
-            .zip(up.par_iter_mut())
+        gate.par_chunks_mut(2)
+            .zip(up.par_chunks_mut(2))
             .enumerate()
-            .for_each(|(idx, (g, u))| {
-                let slot = idx / ffn_rows;
-                let row = idx % ffn_rows;
+            .for_each(|(p, (gc, uc))| {
+                let row0 = p * 2;
+                let slot = row0 / ffn_rows;
+                let r = row0 % ffn_rows;
                 let ex = &experts[eids[slot]];
-                *g = ex.gate.dot_row_cpu_q8(row, &act).unwrap_or(0.0);
-                *u = ex.up.dot_row_cpu_q8(row, &act).unwrap_or(0.0);
+                if let (Some((g0, g1)), Some((u0, u1))) = (
+                    ex.gate.dot_pair_cpu_q8(r, &act),
+                    ex.up.dot_pair_cpu_q8(r, &act),
+                ) {
+                    gc[0] = g0;
+                    gc[1] = g1;
+                    uc[0] = u0;
+                    uc[1] = u1;
+                } else {
+                    gc[0] = ex.gate.dot_row_cpu_q8(r, &act).unwrap_or(0.0);
+                    gc[1] = ex.gate.dot_row_cpu_q8(r + 1, &act).unwrap_or(0.0);
+                    uc[0] = ex.up.dot_row_cpu_q8(r, &act).unwrap_or(0.0);
+                    uc[1] = ex.up.dot_row_cpu_q8(r + 1, &act).unwrap_or(0.0);
+                }
             });
         let mut activated = vec![0f32; n_slots * ffn_rows];
         activated

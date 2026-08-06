@@ -523,18 +523,82 @@ impl WeightMatrix {
         }
         let row_bytes = self.block_bytes_per_row(*kind, *cols);
         let mut out = vec![0f32; *rows];
+        let kind = *kind;
+        let data = data.as_slice();
+        // Q4_0: pair rows for shared-act SDOT (llama-style). Odd tail solo.
+        if matches!(kind, QuantKind::Q4_0) && *rows >= 2 {
+            let n_pairs = *rows / 2;
+            out.par_chunks_mut(2)
+                .with_min_len(Self::min_rows_per_task(n_pairs).max(1))
+                .enumerate()
+                .for_each(|(p, chunk)| {
+                    if chunk.len() < 2 {
+                        let r = p * 2;
+                        chunk[0] = ferrox_quant::dot_q4_0_q8(
+                            &data[r * row_bytes..(r + 1) * row_bytes],
+                            act,
+                        );
+                        return;
+                    }
+                    let r = p * 2;
+                    let (a, b) = ferrox_quant::dot_q4_0_q8_2row(
+                        &data[r * row_bytes..(r + 1) * row_bytes],
+                        &data[(r + 1) * row_bytes..(r + 2) * row_bytes],
+                        act,
+                    );
+                    chunk[0] = a;
+                    chunk[1] = b;
+                });
+            return Some(out);
+        }
         out.par_iter_mut()
             .with_min_len(Self::min_rows_per_task(*rows))
             .enumerate()
             .for_each(|(r, o)| {
-                let row = &data.as_slice()[r * row_bytes..(r + 1) * row_bytes];
-                *o = match *kind {
+                let row = &data[r * row_bytes..(r + 1) * row_bytes];
+                *o = match kind {
                     QuantKind::Q8_0 => ferrox_quant::dot_q8_0_q8(row, act),
                     QuantKind::Q4_0 => ferrox_quant::dot_q4_0_q8(row, act),
                     _ => unreachable!(),
                 };
             });
         Some(out)
+    }
+
+    /// Two contiguous rows × one Q8 act (shared act loads). Q4_0 uses
+    /// [`ferrox_quant::dot_q4_0_q8_2row`]; Q8_0 falls back to two singles.
+    pub fn dot_pair_cpu_q8(
+        &self,
+        row: usize,
+        act: &ferrox_quant::Q8Activations,
+    ) -> Option<(f32, f32)> {
+        let WeightMatrix::Quantized {
+            data,
+            rows,
+            cols,
+            kind,
+        } = self
+        else {
+            return None;
+        };
+        if !matches!(*kind, QuantKind::Q8_0 | QuantKind::Q4_0) || !cpu_int_dot_enabled() {
+            return None;
+        }
+        if act.q.len() != *cols || !cols.is_multiple_of(32) || row + 1 >= *rows {
+            return None;
+        }
+        let row_bytes = self.block_bytes_per_row(*kind, *cols);
+        let bytes = data.as_slice();
+        let r0 = &bytes[row * row_bytes..(row + 1) * row_bytes];
+        let r1 = &bytes[(row + 1) * row_bytes..(row + 2) * row_bytes];
+        Some(match *kind {
+            QuantKind::Q4_0 => ferrox_quant::dot_q4_0_q8_2row(r0, r1, act),
+            QuantKind::Q8_0 => (
+                ferrox_quant::dot_q8_0_q8(r0, act),
+                ferrox_quant::dot_q8_0_q8(r1, act),
+            ),
+            _ => unreachable!(),
+        })
     }
 
     /// Single-row INT_DOT against pre-quantized Q8_0 acts (llama `mul_mat_id`

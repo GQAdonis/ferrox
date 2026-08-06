@@ -41,10 +41,10 @@ use crate::elem::{
 };
 use crate::embd::{encode_get_rows, EmbdKind};
 use crate::gpu::{
-    compute_encoder_concurrent, encode_matvec, encode_moe_topk_softmax, encode_q4_0_moe_id,
-    encode_q4_0_moe_topk, ensure_pipeline, memory_barrier_buffers, resident_f32_buffer,
-    resident_weight_buffer, shared_metal, MatvecLaunch, MetalError, MoeExpertLaunch, MoePackedQ4,
-    ResidentF32Buffer, ResidentWeightBuffer,
+    compute_encoder_concurrent, encode_matvec, encode_moe_topk_softmax, encode_q4_0_moe_gate_up_id,
+    encode_q4_0_moe_id, encode_q4_0_moe_topk, ensure_pipeline, memory_barrier_buffers,
+    resident_f32_buffer, resident_weight_buffer, shared_metal, MatvecLaunch, MetalError,
+    MoeExpertLaunch, MoePackedQ4, ResidentF32Buffer, ResidentWeightBuffer,
 };
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
@@ -3976,9 +3976,30 @@ fn moe_layer_resident(
     Ok(bound)
 }
 
+/// End current compute encoder and open a new one on the same CB.
+/// Ending an encoder creates a GPU dependency on prior dispatches — used
+/// instead of in-encoder barriers under `MTLDispatchTypeConcurrent` (those
+/// raced OLMoE tokens on Host B even when placed between every matvec).
+fn renew_moe_encoder(
+    cmd_buf: &ProtocolObject<dyn MTLCommandBuffer>,
+    encoder: &mut Retained<ProtocolObject<dyn MTLComputeCommandEncoder>>,
+    concurrent: bool,
+) -> Result<(), MetalError> {
+    encoder.endEncoding();
+    *encoder = if concurrent {
+        compute_encoder_concurrent(cmd_buf)?
+    } else {
+        cmd_buf
+            .computeCommandEncoder()
+            .ok_or(MetalError::CommandFailed)?
+    };
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn encode_moe_layer_fused(
-    encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+    cmd_buf: &ProtocolObject<dyn MTLCommandBuffer>,
+    encoder: &mut Retained<ProtocolObject<dyn MTLComputeCommandEncoder>>,
     device: &Retained<ProtocolObject<dyn MTLDevice>>,
     scratch: &MoeDecodeScratch,
     layer_idx: usize,
@@ -4005,6 +4026,9 @@ fn encode_moe_layer_fused(
     let o_w = &bound.o_w;
     let r_w = &bound.r_w;
 
+    // Serial chain + Concurrent gate∥up encoder window. A single Concurrent
+    // MoE encoder + `memoryBarrierWithScope(Buffers)` still races OLMoE
+    // tokens on Host B; encoder-end is the reliable sync boundary.
     encode_rms_norm(
         encoder,
         device,
@@ -4014,12 +4038,9 @@ fn encode_moe_layer_fused(
         hidden_dim as u32,
         rms_eps,
     )?;
-    memory_barrier_buffers(encoder);
-    // Q∥K∥V — disjoint destinations
     encode_matvec(encoder, device, &layer.q, q_w, &scratch.x_attn, &scratch.q)?;
     encode_matvec(encoder, device, &layer.k, k_w, &scratch.x_attn, &scratch.k)?;
     encode_matvec(encoder, device, &layer.v, v_w, &scratch.x_attn, &scratch.v)?;
-    memory_barrier_buffers(encoder);
     encode_attn_extras(
         encoder,
         device,
@@ -4035,7 +4056,6 @@ fn encode_moe_layer_fused(
         head_dim,
         rms_eps,
     )?;
-    memory_barrier_buffers(encoder);
     encode_rope(
         encoder,
         device,
@@ -4058,7 +4078,6 @@ fn encode_moe_layer_fused(
         pos as u32,
         ff_buf,
     )?;
-    memory_barrier_buffers(encoder);
     let token_elems = (n_kv_heads * head_dim) as u32;
     let offset = (pos * n_kv_heads * head_dim) as u32;
     encode_kv_store_append(
@@ -4079,7 +4098,6 @@ fn encode_moe_layer_fused(
         offset,
         token_elems,
     )?;
-    memory_barrier_buffers(encoder);
     encode_gqa_with_kv(
         encoder,
         device,
@@ -4093,9 +4111,7 @@ fn encode_moe_layer_fused(
         0,
         layer.extras.attn_logit_softcap,
     )?;
-    memory_barrier_buffers(encoder);
     encode_matvec(encoder, device, &layer.o, o_w, &scratch.attn, &scratch.o)?;
-    memory_barrier_buffers(encoder);
     encode_add_rms_norm(
         encoder,
         device,
@@ -4106,7 +4122,6 @@ fn encode_moe_layer_fused(
         hidden_dim as u32,
         rms_eps,
     )?;
-    memory_barrier_buffers(encoder);
     encode_matvec(
         encoder,
         device,
@@ -4115,7 +4130,6 @@ fn encode_moe_layer_fused(
         &scratch.x2,
         &scratch.router,
     )?;
-    memory_barrier_buffers(encoder);
     encode_moe_topk_softmax(
         encoder,
         device,
@@ -4126,7 +4140,20 @@ fn encode_moe_layer_fused(
         top_k as u32,
         norm_topk_prob,
     )?;
-    memory_barrier_buffers(encoder);
+    // Concurrent gate∥up window; encoder end = sync.
+    renew_moe_encoder(cmd_buf, encoder, true)?;
+    encode_q4_0_moe_gate_up_id(
+        encoder,
+        device,
+        &scratch.x2,
+        &layer.packed,
+        &scratch.ids,
+        &scratch.gate,
+        &scratch.up,
+        top_k as u32,
+        1,
+    )?;
+    renew_moe_encoder(cmd_buf, encoder, false)?;
     encode_q4_0_moe_id(
         encoder,
         device,
@@ -4138,20 +4165,12 @@ fn encode_moe_layer_fused(
         &scratch.up,
         &scratch.act,
         &scratch.expert_out,
-        &scratch.moe_out,
+        &scratch.h,
         top_k as u32,
         1,
+        true,
+        true,
     )?;
-    memory_barrier_buffers(encoder);
-    encode_vec_add(
-        encoder,
-        device,
-        &scratch.h,
-        &scratch.moe_out,
-        hidden_dim as u32,
-    )?;
-    // Next layer's attn_norm reads `h` — must wait for residual.
-    memory_barrier_buffers(encoder);
     Ok(())
 }
 
@@ -4351,8 +4370,10 @@ pub fn launch_moe_decode_stack(
         }
 
         let cmd_buf = queue.commandBuffer().ok_or(MetalError::CommandFailed)?;
-        // llama.cpp: MTLDispatchTypeConcurrent so gate∥up / Q∥K∥V overlap
-        let encoder = compute_encoder_concurrent(&cmd_buf)?;
+        // Serial + Concurrent gate∥up windows (see encode_moe_layer_fused).
+        let mut encoder = cmd_buf
+            .computeCommandEncoder()
+            .ok_or(MetalError::CommandFailed)?;
 
         let _embd_w = if let Some(e) = embd {
             let w = resident_weight_buffer(device, e.weights)?;
@@ -4366,7 +4387,6 @@ pub fn launch_moe_decode_stack(
                 e.n_cols as u32,
                 e.token_id as u32,
             )?;
-            memory_barrier_buffers(&encoder);
             Some(w)
         } else {
             None
@@ -4374,7 +4394,8 @@ pub fn launch_moe_decode_stack(
 
         for (layer_idx, (layer, kv)) in layers.iter().zip(kvs.iter()).enumerate() {
             encode_moe_layer_fused(
-                &encoder,
+                &cmd_buf,
+                &mut encoder,
                 device,
                 scratch,
                 layer_idx,

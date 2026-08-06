@@ -11,7 +11,7 @@
   "reps": 5,
   "mode": "server",
   "workload": "greedy chat, warm then 3x 512-tok capitals list (median)",
-  "notes": "Verified MoE; Metal/CUDA expert placement when budget set",
+  "notes": "Quiet interleaved fair-chat pin (pre-thermal). Later same-day pins saw llama collapse to ~8 tok/s — discard those.",
   "ferrox": {
     "wall_s": 16.321,
     "predicted_per_second": 32.911,

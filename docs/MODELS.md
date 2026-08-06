@@ -52,7 +52,7 @@ always prefer the pin / RESULTS Gap for comparisons.
 | Llama-3.2-1B IQ4_XS | Metal ~0.94× |
 | Llama-3.1-8B-Instruct Q4_K_M | Metal fair-chat **~0.92×**; CLI **~1.00×** |
 | Mistral-7B-Instruct-v0.2 Q4_K_M | Metal ~0.95×; CPU pin exists |
-| OLMoE-1B-7B-0924 Q4_0 | Metal **~1.56×** (hoisted resident + fused down×sum); CPU **~1.38×** (flat mul_mat_id GEMV; interleaved fair-chat) — still trails llama |
+| OLMoE-1B-7B-0924 Q4_0 | Metal **~1.5×** (serial MoE CB — Concurrent races tokens; see ROADMAP); CPU 2-row SDOT `mul_mat_id` — still trails llama on quiet pins |
 | SmolLM2-135M / Qwen2.5-0.5B / Qwen3-0.6B | Metal faster than llama on these small Q8 pins |
 | Gemma-2-2B-IT Q4_K_M | Metal ~1.10×; softcap on FA-vec decode + prefill d=256 |
 | Gemma-3-1B-IT Q8_0 | Metal ~0.82×; GeGLU + SWA + sandwich; FA-vec d=256 |

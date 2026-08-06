@@ -538,6 +538,200 @@ pub fn load_glm52_moe_ffn(
     })
 }
 
+fn meta_u64(file: &impl TensorSource, key: &str) -> Result<u64, LoadError> {
+    file.metadata_u64(key)
+        .ok_or_else(|| LoadError::MissingHparam(key.to_string()))
+}
+
+fn meta_f32(file: &impl TensorSource, key: &str, default: f32) -> f32 {
+    file.metadata_f32(key).unwrap_or(default)
+}
+
+/// GGUF-side metadata needed alongside [`Glm52GgufHparams`] to build
+/// [`crate::engine::Glm52Engine`].
+pub struct Glm52FileMeta {
+    pub arch: String,
+    pub n_layer: usize,
+    pub leading_dense: usize,
+    pub rms_norm_eps: f32,
+    pub n_experts_active: usize,
+    pub moe_renormalize: bool,
+    pub routed_scaling_factor: f32,
+}
+
+/// Read GLM-5.2 / GLM4-family hparams from an opened GGUF (`glm-dsa`,
+/// `glm4`, `glm4moe`).
+pub fn read_glm52_hparams(
+    file: &impl TensorSource,
+) -> Result<(Glm52GgufHparams, Glm52FileMeta), LoadError> {
+    let arch = file
+        .metadata_str("general.architecture")
+        .ok_or_else(|| LoadError::MissingHparam("general.architecture".into()))?
+        .to_string();
+    if !matches!(arch.as_str(), "glm-dsa" | "glm4" | "glm4moe") {
+        return Err(LoadError::UnsupportedArchitecture(arch));
+    }
+    let p = |suffix: &str| format!("{arch}.{suffix}");
+    let n_layer = meta_u64(file, &p("block_count"))? as usize;
+    let hidden_dim = meta_u64(file, &p("embedding_length"))? as usize;
+    let dense_ffn_dim = meta_u64(file, &p("feed_forward_length"))? as usize;
+    let moe_ffn_dim = file
+        .metadata_u64(&p("expert_feed_forward_length"))
+        .unwrap_or(dense_ffn_dim as u64) as usize;
+    let n_heads = meta_u64(file, &p("attention.head_count"))? as usize;
+    let q_lora_rank = meta_u64(file, &p("attention.q_lora_rank"))? as usize;
+    let kv_lora_rank = meta_u64(file, &p("attention.kv_lora_rank"))? as usize;
+    let qk_nope_head_dim = meta_u64(file, &p("attention.qk_nope_head_dim"))? as usize;
+    let qk_rope_head_dim = meta_u64(file, &p("attention.qk_rope_head_dim"))? as usize;
+    let v_head_dim = file
+        .metadata_u64(&p("attention.v_head_dim"))
+        .or_else(|| file.metadata_u64(&p("attention.key_length")))
+        .unwrap_or(qk_nope_head_dim as u64) as usize;
+    let leading_dense = file
+        .metadata_u64(&p("leading_dense_block_count"))
+        .unwrap_or(0) as usize;
+    let n_experts = file.metadata_u64(&p("expert_count")).unwrap_or(0) as usize;
+    let n_shared_experts = file
+        .metadata_u64(&p("expert_shared_count"))
+        .unwrap_or(1) as usize;
+    let n_experts_active = file
+        .metadata_u64(&p("expert_used_count"))
+        .unwrap_or(8) as usize;
+    let indexer_n_heads = file
+        .metadata_u64(&p("attention.indexer_n_heads"))
+        .unwrap_or(4) as usize;
+    let indexer_head_dim = file
+        .metadata_u64(&p("attention.indexer_head_dim"))
+        .unwrap_or(128) as usize;
+    let indexer_top_k = file
+        .metadata_u64(&p("attention.indexer_top_k"))
+        .unwrap_or(2048) as usize;
+    let hp = Glm52GgufHparams {
+        hidden_dim,
+        num_heads: n_heads,
+        q_lora_rank,
+        kv_lora_rank,
+        qk_nope_head_dim,
+        qk_rope_head_dim,
+        v_head_dim,
+        rope_theta: meta_f32(file, &p("rope.freq_base"), 1_000_000.0),
+        indexer_n_heads,
+        indexer_head_dim,
+        indexer_rope_dim: qk_rope_head_dim,
+        indexer_top_k,
+        dense_ffn_dim,
+        moe_ffn_dim,
+        n_experts,
+        n_shared_experts,
+    };
+    let meta = Glm52FileMeta {
+        arch: arch.clone(),
+        n_layer,
+        leading_dense: leading_dense.min(n_layer),
+        rms_norm_eps: meta_f32(file, &p("attention.layer_norm_rms_epsilon"), 1e-5),
+        n_experts_active,
+        moe_renormalize: file
+            .metadata_u64(&p("expert_norm_topk_prob"))
+            .is_some_and(|v| v != 0),
+        routed_scaling_factor: meta_f32(file, &p("expert_routing_scale"), 2.5),
+    };
+    Ok((hp, meta))
+}
+
+fn is_full_indexer_layer(file: &impl TensorSource, layer_idx: usize) -> bool {
+    file.find_tensor(&format!("blk.{layer_idx}.indexer.proj.weight"))
+        .is_some()
+}
+
+fn is_dense_ffn_layer(file: &impl TensorSource, layer_idx: usize, leading_dense: usize) -> bool {
+    if layer_idx < leading_dense {
+        return true;
+    }
+    file.find_tensor(&format!("blk.{layer_idx}.ffn_gate.weight"))
+        .is_some()
+        && file
+            .find_tensor(&format!("blk.{layer_idx}.ffn_gate_inp.weight"))
+            .is_none()
+}
+
+fn load_embedding_tensor(
+    file: &impl TensorSource,
+    hidden_dim: usize,
+) -> Result<ferrox_core::tensor::Tensor, LoadError> {
+    let wm = load_weight_matrix(file, "token_embd.weight")?;
+    let vocab = wm.rows();
+    assert_eq!(wm.cols(), hidden_dim, "token_embd.weight col count");
+    let mut data = vec![0f32; vocab * hidden_dim];
+    for row in 0..vocab {
+        let r = wm.dequant_row(row);
+        data[row * hidden_dim..(row + 1) * hidden_dim].copy_from_slice(&r);
+    }
+    Ok(ferrox_core::tensor::Tensor::new(data, vec![vocab, hidden_dim]))
+}
+
+/// Load a GLM-5.2 / GLM4-family GGUF into [`crate::engine::Glm52Engine`].
+pub fn load_glm52_engine(
+    file: &impl TensorSource,
+) -> Result<crate::engine::Glm52Engine, LoadError> {
+    use crate::glm52_decoder::{
+        Glm52DecoderConfig, Glm52DecoderLayerWeights, Glm52DecoderWeights, Glm52LayerFfn,
+        Glm52DenseFfnWeights as DecDenseFfn, Glm52MoeFfnWeights as DecMoeFfn,
+    };
+
+    let (hp, meta) = read_glm52_hparams(file)?;
+    let embedding = load_embedding_tensor(file, hp.hidden_dim)?;
+    let final_norm_weight = load_f32_vec(file, "output_norm.weight")?;
+    let output_head = match load_weight_matrix(file, "output.weight") {
+        Ok(w) => w,
+        Err(_) => load_weight_matrix(file, "token_embd.weight")?,
+    };
+
+    let mut layers = Vec::with_capacity(meta.n_layer);
+    for layer_idx in 0..meta.n_layer {
+        let is_full = is_full_indexer_layer(file, layer_idx);
+        let attn = load_glm52_attn(file, &hp, layer_idx, is_full)?;
+        let ffn = if is_dense_ffn_layer(file, layer_idx, meta.leading_dense) {
+            let d = load_glm52_dense_ffn(file, layer_idx)?;
+            Glm52LayerFfn::Dense(Box::new(DecDenseFfn {
+                gate_proj: d.gate_proj,
+                up_proj: d.up_proj,
+                down_proj: d.down_proj,
+            }))
+        } else {
+            let m = load_glm52_moe_ffn(file, &hp, layer_idx)?;
+            Glm52LayerFfn::Moe(Box::new(DecMoeFfn {
+                router_weight: m.router_weight,
+                e_score_correction_bias: m.e_score_correction_bias,
+                experts: m.experts,
+                shared_expert: m.shared_expert,
+            }))
+        };
+        layers.push(Glm52DecoderLayerWeights {
+            attn_norm_weight: load_f32_vec(file, &format!("blk.{layer_idx}.attn_norm.weight"))?,
+            attn,
+            ffn_norm_weight: load_f32_vec(file, &format!("blk.{layer_idx}.ffn_norm.weight"))?,
+            ffn,
+            is_full_indexer_layer: is_full,
+        });
+    }
+
+    let weights = Glm52DecoderWeights {
+        embedding,
+        layers,
+        final_norm_weight,
+        output_head,
+    };
+    let cfg = Glm52DecoderConfig {
+        rms_norm_eps: meta.rms_norm_eps,
+        mla: glm52_mla_config(&hp),
+        indexer: glm52_indexer_config(&hp),
+        n_experts_active: meta.n_experts_active,
+        moe_renormalize: meta.moe_renormalize,
+        routed_scaling_factor: meta.routed_scaling_factor,
+    };
+    Ok(crate::engine::Glm52Engine { weights, cfg })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

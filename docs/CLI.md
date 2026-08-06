@@ -74,8 +74,11 @@ Same via explicit subcommand: `ferrox run -m …`.
 | `-e` / `--escape` | `\n` `\t` `\r` `\\` in `-p` |
 | `--ignore-eos` | Always emit up to `-n` |
 | `--verbose-prompt` | Print final prompt to stderr |
+| `--mtp` | Fail-closed: MTP draft heads not loaded from GGUF yet |
 
 Stderr prints load and throughput timings. Generated text goes to stdout.
+
+**Speculative decoding:** prompt-lookup demo via `ferrox speculative` (no draft model). `--mtp` is reserved for future MiniMax/GLM MTP draft heads (`num_nextn_predict_layers`) and currently errors honestly.
 
 `--device none` (or `cpu`) and `-ngl 0` force CPU execution. The default is
 `--device auto -ngl auto`, which probes the GPU backends compiled into the
@@ -104,6 +107,17 @@ enables all supported operations on the selected backend.
 ./target/release/ferrox run-kimi /path/to/kimi --prompt "Hi" --max-new-tokens 32
 ```
 
+## Hugging Face Hub (`pull`)
+
+Download a GGUF via the [`hf` CLI](https://huggingface.co/docs/huggingface_hub/guides/cli) (install: `pip install huggingface_hub`):
+
+```bash
+./target/release/ferrox pull org/model --file '*.gguf'
+# Prints local path; also works as: ferrox -m org/model (auto-download when path missing)
+```
+
+Cache default: `~/.cache/ferrox/hf/<org--model>/`.
+
 ## Interactive chat (`chat`)
 
 Multi-turn REPL against a running `ferrox-server` (reuses chat-template + SSE):
@@ -129,6 +143,12 @@ OpenAI-compatible HTTP API:
 ./target/release/ferrox-server \
   -m models/tinyllama-1.1b-chat-v1.0.Q8_0.gguf \
   --host 127.0.0.1 --port 8383 -dev metal -ngl all
+
+# Optional static browser UI at / and /ui
+./target/release/ferrox-server -m model.gguf --ui-server
+
+# MCP config stub (listed in GET /v1/models metadata; invoke not wired)
+./target/release/ferrox-server -m model.gguf --mcp-config mcp.json
 
 curl -s -X POST http://127.0.0.1:8383/v1/chat/completions \
   -H 'content-type: application/json' \

@@ -39,6 +39,8 @@ pub struct CacheKey {
     pub top_p_bits: u32,
     pub top_k: usize,
     pub repetition_penalty_bits: u32,
+    pub presence_penalty_bits: u32,
+    pub frequency_penalty_bits: u32,
     pub seed: Option<u64>,
     pub stop: Vec<String>,
 }
@@ -186,6 +188,8 @@ mod tests {
             top_p_bits: 1.0f32.to_bits(),
             top_k: 0,
             repetition_penalty_bits: 1.0f32.to_bits(),
+            presence_penalty_bits: 0.0f32.to_bits(),
+            frequency_penalty_bits: 0.0f32.to_bits(),
             seed: None,
             stop: Vec::new(),
         }

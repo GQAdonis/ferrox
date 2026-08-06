@@ -208,7 +208,7 @@ mod tests {
     fn msg(role: &str, content: &str) -> ChatMessage {
         ChatMessage {
             role: role.to_string(),
-            content: Some(content.to_string()),
+            content: Some(crate::MessageContent::Text(content.to_string())),
             tool_calls: None,
             tool_call_id: None,
         }

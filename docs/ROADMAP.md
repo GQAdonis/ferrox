@@ -29,9 +29,9 @@ Also on this horizon (unchanged intent):
 
 | Phase | Focus | Notes |
 |---|---|---|
-| **P6** | Text / MoE matrix | Phi-4-mini Metal pin landed; Qwen3-MoE / GLM4 / Llama4 / MiniMax / MiroThinker still open |
-| **P7** | VL | Qwen3-VL, Gemma4-VL, Mistral3-VL + mmproj GGUF; server `image_url` later |
-| **P8** | MTP / embed / GLM-5.2 | Speculative MTP heads, embeddings engine, GLM-5.2 / DSA e2e on real GGUF |
+| **P6** | Text / MoE matrix | Phi-4-mini Metal pin landed; **yi** GenericGqa; MiroThinker→`qwen3moe`; llama4/minimax stubs; GLM4 serve path wired (loader-level, no e2e pin) |
+| **P7** | VL | `mmproj::find_mmproj_beside` + load warnings; `vl_engine` projector stub; server **rejects** `image_url` (400) |
+| **P8** | MTP / embed / GLM-5.2 | `--mtp` fail-closed; `/v1/embeddings` documented Supported (Decoder); GLM-5.2 CLI+server via `load_glm52_engine_from_path` |
 
 Also: recurrent / hybrid / T5 stubs already exist — implement after receipts, not before.
 
@@ -39,11 +39,13 @@ Also: recurrent / hybrid / T5 stubs already exist — implement after receipts, 
 
 | Phase | Focus | Notes |
 |---|---|---|
-| **P9** | Server API | Tokenize / detokenize / completions / decoder embeddings + **Anthropic `/v1/messages`** (non-stream text); guided decode, MCP, web UI still Planned in [`API.md`](API.md) |
-| **P10** | Runtime scale | CB opt-in exists (`FERROX_CONTINUOUS_BATCHING`); throughput pin + TP/PD/HF hub still open |
-| **P11** | Polish | Agent cookbook ([`AGENTS_COOKBOOK.md`](AGENTS_COOKBOOK.md)); Metal/CUDA fair-chat pins + optional ISQ still open |
+| **P9** | Server API | Tokenize / detokenize / completions / decoder embeddings + **Anthropic `/v1/messages`**; **presence/frequency penalties**, best-effort **`json_object`**, **web UI** (`--ui-server`), **MCP config stub** — shipped; full grammar / MCP invoke still open |
+| **P10** | Runtime scale | CB opt-in + `cb_throughput.py`; **chunked prefill** (`FERROX_CHUNKED_PREFILL`), **HF hub pull** (`ferrox pull`), **CPU KV offload stub** (`FERROX_CPU_KV_OFFLOAD`); multi-GPU / TP / PD **planned** |
+| **P11** | Polish | Agent cookbook (Anthropic route, CB, UI); CUDA fair-chat pins still need GPU host; optional ISQ deferred |
 
-Also: continuous-batching throughput pin (`benchmarks/cb_throughput.py` against a live server) under **P10**.
+Also: continuous-batching throughput pin (`benchmarks/cb_throughput.py` against a live server) under **P10**. Multi-GPU, tensor parallel, and prefill/decode disaggregation remain **planned** (no fake implementation).
+
+Also under **P10**: `FERROX_CHUNKED_PREFILL=N` splits long prompt prefill into incremental `forward_batch` chunks; `ferrox pull org/model` (or `FERROX_MODEL_PATH=org/model` when `hf` CLI is installed) fetches GGUF from Hugging Face Hub; `FERROX_CPU_KV_OFFLOAD=1` syncs Metal KV to host each decode step (minimal spill — full layer offload still open).
 
 ## Shipped (do not re-list as open)
 

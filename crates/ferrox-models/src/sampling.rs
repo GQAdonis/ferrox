@@ -28,6 +28,12 @@ pub struct SamplingParams {
     /// > (divide positive logits, multiply negative ones) so the penalty
     /// > always pushes toward *less* likely, regardless of logit sign.
     pub repetition_penalty: f32,
+    /// OpenAI-style presence penalty: subtract from logits of tokens
+    /// that already appeared in `history` (once per distinct token).
+    pub presence_penalty: f32,
+    /// OpenAI-style frequency penalty: subtract `frequency_penalty *
+    /// count` from logits for each token id seen in `history`.
+    pub frequency_penalty: f32,
 }
 
 impl Default for SamplingParams {
@@ -39,6 +45,8 @@ impl Default for SamplingParams {
             top_p: 1.0,
             top_k: 0,
             repetition_penalty: 1.0,
+            presence_penalty: 0.0,
+            frequency_penalty: 0.0,
         }
     }
 }
@@ -78,25 +86,39 @@ impl Sampler {
     /// id (`logits[0] as usize`) — used by the Metal dense-stack path that
     /// returns GPU argmax instead of downloading the full vocab.
     pub fn sample(&mut self, logits: &[f32], params: &SamplingParams, history: &[usize]) -> usize {
-        if params.temperature <= 0.0 {
+        self.sample_with_mask(logits, params, history, None)
+    }
+
+    /// Like [`Self::sample`], but optionally zeroes disallowed logits via
+    /// `mask` before argmax / nucleus sampling (used for JSON-object mode).
+    pub fn sample_with_mask(
+        &mut self,
+        logits: &[f32],
+        params: &SamplingParams,
+        history: &[usize],
+        mut mask: Option<&mut dyn FnMut(&mut [f32])>,
+    ) -> usize {
+        if params.temperature <= 0.0 && mask.is_none() {
             if logits.len() == 1 {
                 return logits[0] as usize;
             }
-            return argmax(logits);
+            let mut scores = logits.to_vec();
+            apply_history_penalties(&mut scores, params, history);
+            return argmax(&scores);
         }
 
         let mut scores: Vec<f32> = logits.to_vec();
+        apply_history_penalties(&mut scores, params, history);
 
-        if params.repetition_penalty != 1.0 {
-            for &tok in history {
-                if let Some(s) = scores.get_mut(tok) {
-                    *s = if *s > 0.0 {
-                        *s / params.repetition_penalty
-                    } else {
-                        *s * params.repetition_penalty
-                    };
-                }
+        if let Some(m) = mask.as_deref_mut() {
+            m(&mut scores);
+        }
+
+        if params.temperature <= 0.0 {
+            if scores.len() == 1 {
+                return scores[0] as usize;
             }
+            return argmax(&scores);
         }
 
         for s in scores.iter_mut() {
@@ -158,6 +180,32 @@ impl Sampler {
             .find(|&(_, &p)| p > 0.0)
             .map(|(i, _)| i)
             .unwrap_or(0)
+    }
+}
+
+fn apply_history_penalties(scores: &mut [f32], params: &SamplingParams, history: &[usize]) {
+    if params.repetition_penalty != 1.0 {
+        for &tok in history {
+            if let Some(s) = scores.get_mut(tok) {
+                *s = if *s > 0.0 {
+                    *s / params.repetition_penalty
+                } else {
+                    *s * params.repetition_penalty
+                };
+            }
+        }
+    }
+    if params.presence_penalty != 0.0 || params.frequency_penalty != 0.0 {
+        let mut counts = std::collections::HashMap::<usize, usize>::new();
+        for &tok in history {
+            *counts.entry(tok).or_insert(0) += 1;
+        }
+        for (tok, count) in counts {
+            if let Some(s) = scores.get_mut(tok) {
+                *s -= params.frequency_penalty * count as f32;
+                *s -= params.presence_penalty;
+            }
+        }
     }
 }
 
@@ -253,6 +301,42 @@ mod tests {
         for _ in 0..20 {
             assert_eq!(sampler.sample(&logits, &params, &[]), 1);
         }
+    }
+
+    #[test]
+    fn presence_and_frequency_penalties_reduce_seen_token_logits() {
+        let logits = vec![0.0, 5.0, 0.0];
+        let params = SamplingParams {
+            temperature: 1.0,
+            presence_penalty: 10.0,
+            frequency_penalty: 0.0,
+            ..SamplingParams::default()
+        };
+        let mut sampler = Sampler::new(1);
+        let mut counts = [0usize; 3];
+        for _ in 0..500 {
+            counts[sampler.sample(&logits, &params, &[1])] += 1;
+        }
+        assert!(
+            counts[1] < 250,
+            "presence_penalty should discourage token 1; counts={counts:?}"
+        );
+
+        let params = SamplingParams {
+            temperature: 1.0,
+            presence_penalty: 0.0,
+            frequency_penalty: 10.0,
+            ..SamplingParams::default()
+        };
+        let mut sampler = Sampler::new(2);
+        counts = [0; 3];
+        for _ in 0..500 {
+            counts[sampler.sample(&logits, &params, &[1, 1, 1])] += 1;
+        }
+        assert!(
+            counts[1] < 250,
+            "frequency_penalty should discourage repeated token 1; counts={counts:?}"
+        );
     }
 
     #[test]

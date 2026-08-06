@@ -8,6 +8,7 @@
 use crate::capability::{resolve_profile, ArchPath, DecoderFamily};
 use crate::decoder::Decoder;
 use crate::engine::{Engine, Glm52Engine, KimiEngine, MlaEngine};
+use crate::glm52_gguf_loader;
 use crate::loader::LoadError;
 use crate::mla_gguf_loader;
 use thiserror::Error;
@@ -71,7 +72,11 @@ pub fn ensure_generic_decoder(arch: &str) -> Result<(), EngineSelectError> {
         SelectedEngineKind::GenericDecoder => Ok(()),
         SelectedEngineKind::DedicatedStack => Err(EngineSelectError::DedicatedUnavailable(
             arch.to_string(),
-            "use the dedicated Kimi/GLM/DeepSeek loader, not generic Decoder",
+            if is_glm52_arch(arch) {
+                "use load_glm52_engine_from_path / ServedEngine::Glm52 — not generic Decoder"
+            } else {
+                "use the dedicated Kimi/GLM/DeepSeek loader, not generic Decoder"
+            },
         )),
         SelectedEngineKind::Mla => Err(EngineSelectError::DedicatedUnavailable(
             arch.to_string(),
@@ -148,6 +153,49 @@ pub fn load_mla_engine_from_path(path: &std::path::Path) -> Result<ServedEngine,
     Ok(ServedEngine::Mla(mla_gguf_loader::load_mla_engine(&file)?))
 }
 
+fn is_glm52_arch(arch: &str) -> bool {
+    matches!(arch, "glm-dsa" | "glm4" | "glm4moe")
+}
+
+/// Open a GLM-5.2 / GLM4-family GGUF and build [`ServedEngine::Glm52`].
+pub fn load_glm52_engine_from_path(path: &std::path::Path) -> Result<ServedEngine, LoadError> {
+    let file = ferrox_gguf::ShardedGguf::open(path)?;
+    let arch = file
+        .metadata_str("general.architecture")
+        .unwrap_or("unknown");
+    if !is_glm52_arch(arch) {
+        return Err(LoadError::DedicatedArchitectureRequired(
+            arch.to_string(),
+            "not a GLM-5.2 / GLM4-family architecture (expected glm-dsa/glm4/glm4moe)",
+        ));
+    }
+    match select_engine_kind(arch) {
+        Ok(SelectedEngineKind::DedicatedStack) => {}
+        Ok(other) => {
+            return Err(LoadError::DedicatedArchitectureRequired(
+                arch.to_string(),
+                match other {
+                    SelectedEngineKind::GenericDecoder => "generic decoder arch, not GLM DSA",
+                    SelectedEngineKind::Mla => "MLA arch, not GLM DSA",
+                    SelectedEngineKind::RecurrentHybrid => "hybrid/recurrent, not GLM DSA",
+                    SelectedEngineKind::EncoderDecoder => "encoder-decoder, not GLM DSA",
+                    SelectedEngineKind::DedicatedStack => unreachable!(),
+                },
+            ));
+        }
+        Err(EngineSelectError::Unknown(a)) => {
+            return Err(LoadError::UnsupportedArchitecture(a));
+        }
+        Err(EngineSelectError::OutOfScope(a, r)) => {
+            return Err(LoadError::UnsupportedFeature(a, r.to_string()));
+        }
+        Err(EngineSelectError::DedicatedUnavailable(a, r)) => {
+            return Err(LoadError::DedicatedArchitectureRequired(a, r));
+        }
+    }
+    Ok(ServedEngine::Glm52(glm52_gguf_loader::load_glm52_engine(&file)?))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -192,5 +240,14 @@ mod tests {
             SelectedEngineKind::Mla
         );
         assert!(ensure_generic_decoder("deepseek2").is_err());
+    }
+
+    #[test]
+    fn glm4_is_dedicated_stack_not_generic() {
+        assert_eq!(
+            select_engine_kind("glm4").unwrap(),
+            SelectedEngineKind::DedicatedStack
+        );
+        assert!(ensure_generic_decoder("glm4").is_err());
     }
 }

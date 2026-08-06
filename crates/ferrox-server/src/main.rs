@@ -33,8 +33,10 @@ mod batch_scheduler;
 mod cache;
 mod chat_template;
 mod generate;
+mod json_mode;
 mod journal;
 mod limits;
+mod mcp;
 mod model;
 mod anthropic;
 mod openai_extra;
@@ -44,6 +46,7 @@ mod session;
 use std::convert::Infallible;
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
@@ -113,6 +116,14 @@ struct ServerArgs {
         value_name = "N"
     )]
     n_gpu_layers: Option<GpuLayers>,
+
+    /// Serve a minimal static chat UI at `/` and `/ui`.
+    #[arg(long = "ui-server", default_value_t = false)]
+    ui_server: bool,
+
+    /// MCP tool-server config JSON (stub: listed in `/v1/models` metadata).
+    #[arg(long = "mcp-config", value_name = "PATH")]
+    mcp_config: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -231,61 +242,70 @@ fn apply_cli_overrides(args: &ServerArgs) -> anyhow::Result<()> {
     }
 
     if args.device.is_none() && args.n_gpu_layers.is_none() {
-        return Ok(());
+        // device overrides skipped
+    } else {
+        let layers = args.n_gpu_layers.unwrap_or(GpuLayers::Auto);
+        let device = if layers.offload_enabled() {
+            args.device.unwrap_or(OffloadDevice::Auto)
+        } else {
+            OffloadDevice::None
+        };
+
+        match device {
+            OffloadDevice::None | OffloadDevice::Cpu => unsafe {
+                std::env::set_var("FERROX_METAL", "0");
+                std::env::set_var("FERROX_METAL_ATTN", "0");
+                std::env::set_var("FERROX_CUDA", "0");
+            },
+            OffloadDevice::Auto => unsafe {
+                std::env::set_var("FERROX_METAL", "auto");
+                std::env::set_var("FERROX_CUDA", "auto");
+                std::env::set_var("FERROX_METAL_ATTN", "1");
+            },
+            OffloadDevice::Metal => {
+                #[cfg(not(feature = "metal"))]
+                {
+                    anyhow::bail!(
+                        "Metal requested but this binary was built without --features metal"
+                    );
+                }
+                #[cfg(feature = "metal")]
+                {
+                    if !ferrox_metal::MetalProfile::detect().available {
+                        anyhow::bail!("Metal requested but no Metal device is available");
+                    }
+                    unsafe {
+                        std::env::set_var("FERROX_METAL", "1");
+                        std::env::set_var("FERROX_METAL_ATTN", "1");
+                        std::env::set_var("FERROX_CUDA", "0");
+                    }
+                }
+            }
+            OffloadDevice::Cuda => {
+                #[cfg(not(feature = "cuda"))]
+                {
+                    anyhow::bail!(
+                        "CUDA requested but this binary was built without --features cuda"
+                    );
+                }
+                #[cfg(feature = "cuda")]
+                {
+                    if !ferrox_cuda::HardwareProfile::detect().cuda_available {
+                        anyhow::bail!("CUDA requested but no CUDA device is available");
+                    }
+                    unsafe {
+                        std::env::set_var("FERROX_CUDA", "1");
+                        std::env::set_var("FERROX_METAL", "0");
+                        std::env::set_var("FERROX_METAL_ATTN", "0");
+                    }
+                }
+            }
+        }
     }
 
-    let layers = args.n_gpu_layers.unwrap_or(GpuLayers::Auto);
-    let device = if layers.offload_enabled() {
-        args.device.unwrap_or(OffloadDevice::Auto)
-    } else {
-        OffloadDevice::None
-    };
-
-    match device {
-        OffloadDevice::None | OffloadDevice::Cpu => unsafe {
-            std::env::set_var("FERROX_METAL", "0");
-            std::env::set_var("FERROX_METAL_ATTN", "0");
-            std::env::set_var("FERROX_CUDA", "0");
-        },
-        OffloadDevice::Auto => unsafe {
-            std::env::set_var("FERROX_METAL", "auto");
-            std::env::set_var("FERROX_CUDA", "auto");
-            std::env::set_var("FERROX_METAL_ATTN", "1");
-        },
-        OffloadDevice::Metal => {
-            #[cfg(not(feature = "metal"))]
-            {
-                anyhow::bail!("Metal requested but this binary was built without --features metal");
-            }
-            #[cfg(feature = "metal")]
-            {
-                if !ferrox_metal::MetalProfile::detect().available {
-                    anyhow::bail!("Metal requested but no Metal device is available");
-                }
-                unsafe {
-                    std::env::set_var("FERROX_METAL", "1");
-                    std::env::set_var("FERROX_METAL_ATTN", "1");
-                    std::env::set_var("FERROX_CUDA", "0");
-                }
-            }
-        }
-        OffloadDevice::Cuda => {
-            #[cfg(not(feature = "cuda"))]
-            {
-                anyhow::bail!("CUDA requested but this binary was built without --features cuda");
-            }
-            #[cfg(feature = "cuda")]
-            {
-                if !ferrox_cuda::HardwareProfile::detect().cuda_available {
-                    anyhow::bail!("CUDA requested but no CUDA device is available");
-                }
-                unsafe {
-                    std::env::set_var("FERROX_CUDA", "1");
-                    std::env::set_var("FERROX_METAL", "0");
-                    std::env::set_var("FERROX_METAL_ATTN", "0");
-                }
-            }
-        }
+    if args.ui_server {
+        // SAFETY: called before the runtime starts worker threads.
+        unsafe { std::env::set_var("FERROX_UI", "1") };
     }
 
     Ok(())
@@ -303,6 +323,7 @@ pub(crate) enum Model {
     Gguf(GgufModel),
     Kimi(KimiModel),
     Mla(MlaModel),
+    Glm52(Glm52Model),
 }
 
 pub(crate) struct GgufModel {
@@ -330,23 +351,33 @@ pub(crate) struct MlaModel {
     chat_template: chat_template::ChatTemplate,
 }
 
+pub(crate) struct Glm52Model {
+    engine: ferrox_models::Glm52Engine,
+    tokenizer: ServerTokenizer,
+    eos_id: Option<usize>,
+    bos_id: Option<usize>,
+    name: String,
+    chat_template: chat_template::ChatTemplate,
+}
+
 impl Model {
     pub(crate) fn chat_template(&self) -> chat_template::ChatTemplate {
         match self {
             Model::Gguf(m) => m.chat_template,
             Model::Kimi(m) => m.chat_template,
             Model::Mla(m) => m.chat_template,
+            Model::Glm52(m) => m.chat_template,
         }
     }
 
-    /// Kimi K3 / MLA have no synthetic-weight demo path through this
+    /// Kimi K3 / MLA / GLM-5.2 have no synthetic-weight demo path through this
     /// server (unlike GGUF, which falls back to one when
     /// `FERROX_MODEL_PATH` is unset) -- a loaded `Model::Kimi` /
-    /// `Model::Mla` is always a real checkpoint.
+    /// `Model::Mla` / `Model::Glm52` is always a real checkpoint.
     fn is_synthetic(&self) -> bool {
         match self {
             Model::Gguf(m) => m.is_synthetic,
-            Model::Kimi(_) | Model::Mla(_) => false,
+            Model::Kimi(_) | Model::Mla(_) | Model::Glm52(_) => false,
         }
     }
 
@@ -355,6 +386,7 @@ impl Model {
             Model::Gguf(m) => m.tokenizer.kind(),
             Model::Kimi(_) => "kimi-tiktoken-bpe",
             Model::Mla(m) => m.tokenizer.kind(),
+            Model::Glm52(m) => m.tokenizer.kind(),
         }
     }
 
@@ -365,7 +397,7 @@ impl Model {
         match self {
             Model::Gguf(m) => m.decoder.expert_store_stats(),
             Model::Kimi(m) => m.engine.weights.expert_store_stats(),
-            Model::Mla(_) => None,
+            Model::Mla(_) | Model::Glm52(_) => None,
         }
     }
 
@@ -374,6 +406,7 @@ impl Model {
             Model::Gguf(m) => m.decoder.config.name,
             Model::Kimi(_) => "kimi-k3",
             Model::Mla(m) => m.name.as_str(),
+            Model::Glm52(m) => m.name.as_str(),
         }
     }
 
@@ -387,6 +420,7 @@ impl Model {
                 .map(|id| id as usize)
                 .collect(),
             Model::Mla(m) => m.tokenizer.encode(text),
+            Model::Glm52(m) => m.tokenizer.encode(text),
         }
     }
 
@@ -398,11 +432,12 @@ impl Model {
                 m.tokenizer.decode(&ids32)
             }
             Model::Mla(m) => m.tokenizer.decode(ids),
+            Model::Glm52(m) => m.tokenizer.decode(ids),
         }
     }
 
     /// Final-normed last-layer hidden states for GGUF Decoder only.
-    /// Returns `None` for engines without a hidden-state hook (e.g. Kimi/MLA).
+    /// Returns `None` for engines without a hidden-state hook (e.g. Kimi/MLA/GLM).
     pub(crate) fn embed_tokens(&self, tokens: &[usize]) -> Option<Vec<Vec<f32>>> {
         match self {
             Model::Gguf(m) => {
@@ -416,7 +451,7 @@ impl Model {
                     .collect();
                 Some(m.decoder.forward_hidden_batch(tokens, 0, &mut caches))
             }
-            Model::Kimi(_) | Model::Mla(_) => None,
+            Model::Kimi(_) | Model::Mla(_) | Model::Glm52(_) => None,
         }
     }
 
@@ -425,6 +460,7 @@ impl Model {
             Model::Gguf(m) => Some(m.decoder.config.vocab_size),
             Model::Kimi(m) => Some(m.tokenizer.vocab_size()),
             Model::Mla(m) => Some(ferrox_models::Engine::vocab_size(&m.engine)),
+            Model::Glm52(m) => Some(ferrox_models::Engine::vocab_size(&m.engine)),
         }
     }
 }
@@ -471,6 +507,8 @@ pub(crate) struct AppState {
     requests_total: std::sync::atomic::AtomicU64,
     request_errors_total: std::sync::atomic::AtomicU64,
     started_at: std::time::Instant,
+    /// Loaded MCP config (`--mcp-config`); tool invocation not wired yet.
+    mcp: Option<mcp::LoadedMcpConfig>,
 }
 
 /// Defense in depth: if a panic ever happened while this lock was held
@@ -484,13 +522,52 @@ fn lock_cache(cache: &Mutex<ResponseCache>) -> MutexGuard<'_, ResponseCache> {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub(crate) enum MessageContent {
+    Text(String),
+    Parts(Vec<ContentPart>),
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ContentPart {
+    #[serde(rename = "type")]
+    kind: String,
+    #[serde(default)]
+    text: Option<String>,
+    #[serde(default)]
+    image_url: Option<serde_json::Value>,
+}
+
+impl MessageContent {
+    fn as_text(&self) -> String {
+        match self {
+            Self::Text(s) => s.clone(),
+            Self::Parts(parts) => parts
+                .iter()
+                .filter_map(|p| p.text.as_deref())
+                .collect::<Vec<_>>()
+                .join(""),
+        }
+    }
+
+    fn has_image(&self) -> bool {
+        match self {
+            Self::Text(_) => false,
+            Self::Parts(parts) => parts.iter().any(|p| {
+                p.kind == "image_url" || p.image_url.is_some()
+            }),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
 pub(crate) struct ChatMessage {
     pub(crate) role: String,
     /// `None` for an assistant message that made tool calls instead of
     /// replying with text (the real OpenAI convention: `content` and
     /// `tool_calls` are mutually exclusive on an assistant message).
     #[serde(default)]
-    pub(crate) content: Option<String>,
+    pub(crate) content: Option<MessageContent>,
     /// Present on a replayed assistant message that previously made
     /// one or more tool calls (conversation history a client sends
     /// back on a follow-up request).
@@ -513,7 +590,11 @@ impl ChatMessage {
     /// text a model is asked to produce for a *new* call -- see
     /// `chat_template`'s module doc comment for why.
     fn rendered_content(&self) -> String {
-        let mut out = self.content.clone().unwrap_or_default();
+        let mut out = self
+            .content
+            .as_ref()
+            .map(MessageContent::as_text)
+            .unwrap_or_default();
         if let Some(calls) = &self.tool_calls {
             for call in calls {
                 out.push_str(&format!(
@@ -648,6 +729,8 @@ impl ChatCompletionRequest {
             top_p: self.top_p.unwrap_or(1.0),
             top_k: self.top_k.unwrap_or(0),
             repetition_penalty: self.repetition_penalty.unwrap_or(1.0),
+            presence_penalty: self.presence_penalty.unwrap_or(0.0),
+            frequency_penalty: self.frequency_penalty.unwrap_or(0.0),
         }
     }
 
@@ -673,6 +756,13 @@ impl ChatCompletionRequest {
     /// Reject OpenAI fields we do not implement, and `tool_choice`
     /// values that would silently lie (required / named function).
     fn validate_supported_fields(&self) -> Result<(), ApiError> {
+        for msg in &self.messages {
+            if msg.content.as_ref().is_some_and(MessageContent::has_image) {
+                return Err(unsupported_feature(
+                    "image_url content parts are not implemented (multimodal/VL deferred — see docs/API.md)",
+                ));
+            }
+        }
         if self.logprobs == Some(true) || self.top_logprobs.is_some() {
             return Err(unsupported_feature(
                 "logprobs / top_logprobs are not implemented yet (see docs/API.md)",
@@ -683,15 +773,32 @@ impl ChatCompletionRequest {
                 "n > 1 is not implemented (single completion only)",
             ));
         }
-        if self.presence_penalty.is_some() || self.frequency_penalty.is_some() {
-            return Err(unsupported_feature(
-                "presence_penalty / frequency_penalty are not implemented; use repetition_penalty",
-            ));
-        }
-        if self.response_format.is_some() {
-            return Err(unsupported_feature(
-                "response_format / JSON mode is not implemented",
-            ));
+        if let Some(fmt) = &self.response_format {
+            match fmt.get("type").and_then(|v| v.as_str()) {
+                Some("json_object") => {}
+                Some(other) => {
+                    return Err((
+                        StatusCode::BAD_REQUEST,
+                        Json(serde_json::json!({
+                            "error": {
+                                "message": format!(
+                                    "response_format type {other:?} is not supported (only json_object)"
+                                )
+                            }
+                        })),
+                    ));
+                }
+                None => {
+                    return Err((
+                        StatusCode::BAD_REQUEST,
+                        Json(serde_json::json!({
+                            "error": {
+                                "message": "response_format must include \"type\" (only json_object is supported)"
+                            }
+                        })),
+                    ));
+                }
+            }
         }
         match &self.tool_choice {
             Some(ToolChoice::Mode(m)) if m == "required" => {
@@ -723,12 +830,21 @@ impl ChatCompletionRequest {
         stop
     }
 
+    fn json_object_mode(&self) -> bool {
+        self.response_format
+            .as_ref()
+            .and_then(|v| v.get("type"))
+            .and_then(|v| v.as_str())
+            == Some("json_object")
+    }
+
     fn generation_params(&self) -> GenerationParams {
         GenerationParams {
             max_tokens: self.max_tokens,
             sampling: self.sampling_params(),
             seed: self.resolved_seed(),
             stop: self.effective_stop_sequences(),
+            json_object: self.json_object_mode(),
         }
     }
 
@@ -768,6 +884,8 @@ impl ChatCompletionRequest {
             top_p_bits: self.top_p.unwrap_or(1.0).to_bits(),
             top_k: self.top_k.unwrap_or(0),
             repetition_penalty_bits: self.repetition_penalty.unwrap_or(1.0).to_bits(),
+            presence_penalty_bits: self.presence_penalty.unwrap_or(0.0).to_bits(),
+            frequency_penalty_bits: self.frequency_penalty.unwrap_or(0.0).to_bits(),
             seed: self.seed,
             stop: self.effective_stop_sequences(),
         }
@@ -871,15 +989,28 @@ async fn health() -> &'static str {
 }
 
 async fn list_models(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+    let mut model_entry = serde_json::json!({
+        "id": state.model.name(),
+        "object": "model",
+        "ferrox_synthetic_weights": state.model.is_synthetic(),
+        "ferrox_tokenizer": state.model.tokenizer_kind(),
+    });
+    if let Some(mcp) = &state.mcp {
+        model_entry["ferrox_mcp"] = mcp.models_metadata();
+    }
     Json(serde_json::json!({
         "object": "list",
-        "data": [{
-            "id": state.model.name(),
-            "object": "model",
-            "ferrox_synthetic_weights": state.model.is_synthetic(),
-            "ferrox_tokenizer": state.model.tokenizer_kind(),
-        }]
+        "data": [model_entry]
     }))
+}
+
+const UI_HTML: &str = include_str!("../static/ui.html");
+
+async fn ui_page() -> impl IntoResponse {
+    (
+        [(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        UI_HTML,
+    )
 }
 
 #[derive(Serialize)]
@@ -1087,6 +1218,20 @@ fn run_generation_emit(
                 }
             },
         )?,
+        Model::Glm52(m) => generate::generate_engine(
+            &m.engine,
+            &m.tokenizer,
+            m.eos_id,
+            m.bos_id,
+            prompt,
+            params,
+            |chunk| {
+                chunks.push(chunk.to_string());
+                if !synthetic {
+                    emit(chunk);
+                }
+            },
+        )?,
     };
 
     let mut full = chunks.concat();
@@ -1144,7 +1289,7 @@ pub(crate) fn prompt_from_messages(
         let mut with_preamble = Vec::with_capacity(messages.len() + 1);
         with_preamble.push(ChatMessage {
             role: "system".to_string(),
-            content: Some(tool_preamble(tools)),
+            content: Some(MessageContent::Text(tool_preamble(tools))),
             tool_calls: None,
             tool_call_id: None,
         });
@@ -1250,9 +1395,39 @@ fn build_response_message(
 /// `session` module) `req.messages` appended to `session_id`'s stored
 /// history, returning the accumulated whole.
 fn resolve_history(state: &AppState, req: &ChatCompletionRequest) -> Vec<ChatMessage> {
-    match &req.session_id {
+    let mut history = match &req.session_id {
         Some(id) => state.sessions.extend_and_get(id, &req.messages),
         None => req.messages.clone(),
+    };
+    if req.json_object_mode() {
+        inject_json_object_system_hint(&mut history);
+    }
+    history
+}
+
+fn inject_json_object_system_hint(messages: &mut Vec<ChatMessage>) {
+    const HINT: &str = "You must respond with valid JSON only (a single JSON object, no markdown fences).";
+    if let Some(sys) = messages.iter_mut().find(|m| m.role == "system") {
+        match &mut sys.content {
+            Some(MessageContent::Text(s)) if !s.contains("JSON") => {
+                s.push_str("\n\n");
+                s.push_str(HINT);
+            }
+            None => {
+                sys.content = Some(MessageContent::Text(HINT.to_string()));
+            }
+            _ => {}
+        }
+    } else {
+        messages.insert(
+            0,
+            ChatMessage {
+                role: "system".to_string(),
+                content: Some(MessageContent::Text(HINT.to_string())),
+                tool_calls: None,
+                tool_call_id: None,
+            },
+        );
     }
 }
 
@@ -1342,6 +1517,10 @@ async fn chat_completions_full(
     };
     let content = completion.content;
 
+    if req.json_object_mode() {
+        json_mode::validate_json_object_output(&content)?;
+    }
+
     // Stored regardless of cache hit/miss, so a session's history is
     // always consistent with what a client would see, whether or not
     // this exact prompt happened to be served from cache.
@@ -1350,7 +1529,7 @@ async fn chat_completions_full(
             id,
             ChatMessage {
                 role: "assistant".to_string(),
-                content: Some(content.clone()),
+                content: Some(MessageContent::Text(content.clone())),
                 tool_calls: None,
                 tool_call_id: None,
             },
@@ -1441,7 +1620,7 @@ async fn chat_completions_stream(
                         id,
                         ChatMessage {
                             role: "assistant".to_string(),
-                            content: Some(full_text.clone()),
+                            content: Some(MessageContent::Text(full_text.clone())),
                             tool_calls: None,
                             tool_call_id: None,
                         },
@@ -1556,6 +1735,7 @@ fn build_app_state(
     kv_pool: Option<generate::KvPoolConfig>,
     prefix_cache: Option<Arc<Mutex<PrefixCache>>>,
     enable_continuous_batching: bool,
+    mcp: Option<mcp::LoadedMcpConfig>,
 ) -> AppState {
     let (model, continuous_batcher) = match loaded {
         model::LoadedModel::Gguf(g) => {
@@ -1607,6 +1787,17 @@ fn build_app_state(
             }),
             None,
         ),
+        model::LoadedModel::Glm52(g) => (
+            Model::Glm52(Glm52Model {
+                engine: g.engine,
+                tokenizer: g.tokenizer,
+                eos_id: g.eos_id,
+                bos_id: g.bos_id,
+                name: g.name,
+                chat_template: g.chat_template,
+            }),
+            None,
+        ),
     };
     AppState {
         model: Arc::new(model),
@@ -1618,6 +1809,7 @@ fn build_app_state(
         requests_total: std::sync::atomic::AtomicU64::new(0),
         request_errors_total: std::sync::atomic::AtomicU64::new(0),
         started_at: std::time::Instant::now(),
+        mcp,
     }
 }
 
@@ -1671,10 +1863,16 @@ fn main() -> anyhow::Result<()> {
     ));
     journal::install_panic_hook(journal.clone());
 
+    let mcp_config_path = args.mcp_config.clone();
+    let ui_server = args.ui_server
+        || std::env::var("FERROX_UI")
+            .map(|v| v == "1")
+            .unwrap_or(false);
+
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
-    let result = runtime.block_on(run());
+    let result = runtime.block_on(run(mcp_config_path, ui_server));
 
     let reason = match &result {
         Ok(()) => "normal".to_string(),
@@ -1685,7 +1883,7 @@ fn main() -> anyhow::Result<()> {
     result
 }
 
-async fn run() -> anyhow::Result<()> {
+async fn run(mcp_config_path: Option<PathBuf>, ui_server: bool) -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
     init_rayon_threads();
 
@@ -1725,6 +1923,11 @@ async fn run() -> anyhow::Result<()> {
             "loaded MLA GGUF '{}' (tokenizer={})",
             m.name,
             m.tokenizer.kind()
+        ),
+        model::LoadedModel::Glm52(g) => tracing::info!(
+            "loaded GLM-5.2 GGUF '{}' (tokenizer={})",
+            g.name,
+            g.tokenizer.kind()
         ),
     }
     // Opt-in VRAM budget for GPU-resident MoE experts. When unset but
@@ -1767,6 +1970,12 @@ async fn run() -> anyhow::Result<()> {
                 tracing::warn!(
                     "FERROX_GPU_VRAM_BUDGET_BYTES is set but the loaded model is MLA -- dense \
                      FFN path only today; ignoring expert VRAM budget"
+                );
+            }
+            model::LoadedModel::Glm52(_) => {
+                tracing::warn!(
+                    "FERROX_GPU_VRAM_BUDGET_BYTES is set but the loaded model is GLM-5.2 DSA -- \
+                     GPU expert placement not wired yet; ignoring"
                 );
             }
         }
@@ -1896,7 +2105,9 @@ async fn run() -> anyhow::Result<()> {
                 .expect("FERROX_KV_BYTE_BUDGET must be a positive integer");
             let cfg = match &loaded {
                 model::LoadedModel::Gguf(g) => &g.decoder.config,
-                model::LoadedModel::Kimi(_) | model::LoadedModel::Mla(_) => {
+                model::LoadedModel::Kimi(_)
+                | model::LoadedModel::Mla(_)
+                | model::LoadedModel::Glm52(_) => {
                     panic!(
                         "FERROX_KV_BYTE_BUDGET requires a GGUF decoder model \
                          (set FERROX_MODEL_PATH to a generic-decoder .gguf file)"
@@ -1969,12 +2180,12 @@ async fn run() -> anyhow::Result<()> {
     });
     if matches!(
         loaded,
-        model::LoadedModel::Kimi(_) | model::LoadedModel::Mla(_)
+        model::LoadedModel::Kimi(_) | model::LoadedModel::Mla(_) | model::LoadedModel::Glm52(_)
     ) && (kv_pool.is_some() || prefix_cache.is_some())
     {
         tracing::warn!(
-            "KV pool / prefix cache are configured but the loaded model is Kimi or MLA -- neither \
-             is consulted for those engines (state shapes differ from Decoder KV); see \
+            "KV pool / prefix cache are configured but the loaded model is Kimi, MLA, or GLM-5.2 -- \
+             neither is consulted for those engines (state shapes differ from Decoder KV); see \
              ferrox_models::engine's module docs"
         );
     }
@@ -1994,7 +2205,45 @@ async fn run() -> anyhow::Result<()> {
              (those modes keep the private generate path)"
         );
     }
-    let state = Arc::new(build_app_state(loaded, kv_pool, prefix_cache, enable_cb));
+    if let Ok(n) = std::env::var("FERROX_CHUNKED_PREFILL") {
+        if let Ok(chunk) = n.parse::<usize>() {
+            if chunk > 0 {
+                tracing::info!(
+                    "chunked prefill enabled: {chunk} tokens per forward_batch chunk"
+                );
+            }
+        }
+    }
+    if matches!(
+        std::env::var("FERROX_CPU_KV_OFFLOAD").ok().as_deref(),
+        Some("1")
+    ) {
+        tracing::warn!(
+            "FERROX_CPU_KV_OFFLOAD=1: syncing Metal KV to host after each decode step \
+             (minimal spill; full layer offload still planned)"
+        );
+    }
+
+    let mcp = match mcp_config_path {
+        Some(path) => {
+            let loaded = mcp::load_mcp_config(&path)?;
+            tracing::info!(
+                "MCP config loaded from {} ({} server(s); invocation not wired yet)",
+                loaded.path,
+                loaded.servers.len()
+            );
+            Some(loaded)
+        }
+        None => None,
+    };
+
+    let state = Arc::new(build_app_state(loaded, kv_pool, prefix_cache, enable_cb, mcp));
+
+    let mut public = Router::new().route("/health", get(health));
+    if ui_server {
+        tracing::info!("web UI enabled at / and /ui");
+        public = public.route("/", get(ui_page)).route("/ui", get(ui_page));
+    }
 
     let mut protected = Router::new()
         .route("/v1/models", get(list_models))
@@ -2057,8 +2306,7 @@ async fn run() -> anyhow::Result<()> {
         protected = protected.route_layer(cors);
     }
 
-    let app = Router::new()
-        .route("/health", get(health))
+    let app = public
         .merge(protected)
         .with_state(state);
 
@@ -2157,6 +2405,7 @@ mod tests {
             sampling: SamplingParams::default(),
             seed: 1,
             stop: Vec::new(),
+            json_object: false,
         }
     }
 
@@ -2195,6 +2444,7 @@ mod tests {
             requests_total: std::sync::atomic::AtomicU64::new(0),
             request_errors_total: std::sync::atomic::AtomicU64::new(0),
             started_at: std::time::Instant::now(),
+            mcp: None,
         });
         Router::new()
             .route("/v1/chat/completions", post(chat_completions))
@@ -2324,6 +2574,7 @@ mod tests {
             requests_total: std::sync::atomic::AtomicU64::new(0),
             request_errors_total: std::sync::atomic::AtomicU64::new(0),
             started_at: std::time::Instant::now(),
+            mcp: None,
         });
         let app = Router::new()
             .route("/metrics", axum::routing::get(metrics))
@@ -3188,7 +3439,7 @@ mod tests {
     #[test]
     fn kimi_model_serves_real_text_end_to_end_via_run_generation() {
         let loaded = build_synthetic_kimi_loaded();
-        let state = build_app_state(model::LoadedModel::Kimi(loaded), None, None, false);
+        let state = build_app_state(model::LoadedModel::Kimi(loaded), None, None, false, None);
         assert_eq!(state.model.tokenizer_kind(), "kimi-tiktoken-bpe");
         assert!(!state.model.is_synthetic());
 
@@ -3210,7 +3461,7 @@ mod tests {
     #[test]
     fn kv_pool_and_prefix_cache_are_never_consulted_for_a_kimi_model() {
         let loaded = build_synthetic_kimi_loaded();
-        let state = build_app_state(model::LoadedModel::Kimi(loaded), None, None, false);
+        let state = build_app_state(model::LoadedModel::Kimi(loaded), None, None, false, None);
 
         let pool = Arc::new(Mutex::new(ferrox_core::cache::KvBlockPool::new(64, 4)));
         let kv_pool_config = generate::KvPoolConfig {

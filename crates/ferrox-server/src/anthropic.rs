@@ -101,7 +101,7 @@ fn to_chat_messages(req: &MessagesRequest) -> Result<Vec<ChatMessage>, ApiError>
     if let Some(system) = &req.system {
         out.push(ChatMessage {
             role: "system".to_string(),
-            content: Some(system_to_text(system)?),
+            content: Some(crate::MessageContent::Text(system_to_text(system)?)),
             tool_calls: None,
             tool_call_id: None,
         });
@@ -122,7 +122,7 @@ fn to_chat_messages(req: &MessagesRequest) -> Result<Vec<ChatMessage>, ApiError>
         }
         out.push(ChatMessage {
             role: m.role.clone(),
-            content: Some(content_to_text(&m.content)?),
+            content: Some(crate::MessageContent::Text(content_to_text(&m.content)?)),
             tool_calls: None,
             tool_call_id: None,
         });
@@ -176,9 +176,12 @@ pub async fn messages(
             top_p: req.top_p.unwrap_or(1.0),
             top_k: req.top_k.unwrap_or(0),
             repetition_penalty: 1.0,
+            presence_penalty: 0.0,
+            frequency_penalty: 0.0,
         },
         seed: 0,
         stop,
+        json_object: false,
     };
 
     let model = Arc::clone(&state.model);

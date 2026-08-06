@@ -3,7 +3,8 @@
 //! If `FERROX_MODEL_PATH` is set, this loads a real checkpoint: a
 //! `.gguf` **file** through either the generic `Decoder` path or
 //! [`ferrox_models::load_mla_engine_from_path`] for MLA architectures
-//! (deepseek2 / mistral4 dense-lead), auto-selecting the real tokenizer
+//! (deepseek2 / mistral4 dense-lead), or [`ferrox_models::load_glm52_engine_from_path`]
+//! for GLM-5.2 / GLM4-family GGUFs (`glm-dsa`, `glm4`, `glm4moe`) when
 //! the file itself names via `tokenizer.ggml.model`
 //! (`gpt2` -> `GgufBpeTokenizer`, `llama` -> `GgufSpmTokenizer`, `t5` ->
 //! `GgufUnigramTokenizer`); or a Kimi K3 checkpoint **directory** (real
@@ -28,9 +29,10 @@ use std::path::Path;
 
 use ferrox_gguf::ShardedGguf;
 use ferrox_models::{
-    deepseek_v4_pro, glm_5_2, kimi_k3, load_mla_engine_from_path, select_engine_kind,
-    ByteTokenizer, Decoder, GgufBpeTokenizer, GgufSpmTokenizer, GgufUnigramTokenizer, KimiEngine,
-    MlaEngine, ModelConfig, SelectedEngineKind, ServedEngine, TextTokenizer,
+    deepseek_v4_pro, glm_5_2, kimi_k3, load_glm52_engine_from_path, load_mla_engine_from_path,
+    select_engine_kind, ByteTokenizer, Decoder, Glm52Engine, GgufBpeTokenizer, GgufSpmTokenizer,
+    GgufUnigramTokenizer, KimiEngine, MlaEngine, ModelConfig, SelectedEngineKind, ServedEngine,
+    TextTokenizer,
 };
 
 /// Default expert-cache budget when `FERROX_SSD_STREAMING` is set without
@@ -180,6 +182,15 @@ pub struct MlaLoaded {
     pub chat_template: crate::chat_template::ChatTemplate,
 }
 
+pub struct Glm52Loaded {
+    pub engine: Glm52Engine,
+    pub tokenizer: ServerTokenizer,
+    pub eos_id: Option<usize>,
+    pub bos_id: Option<usize>,
+    pub name: String,
+    pub chat_template: crate::chat_template::ChatTemplate,
+}
+
 /// Either real checkpoint shape this server can serve. See this
 /// module's doc comment for how `load()` picks between them.
 #[allow(clippy::large_enum_variant)]
@@ -187,11 +198,17 @@ pub enum LoadedModel {
     Gguf(GgufLoaded),
     Kimi(KimiLoaded),
     Mla(MlaLoaded),
+    Glm52(Glm52Loaded),
+}
+
+fn is_glm52_arch(arch: &str) -> bool {
+    matches!(arch, "glm-dsa" | "glm4" | "glm4moe")
 }
 
 pub fn load() -> anyhow::Result<LoadedModel> {
     match std::env::var("FERROX_MODEL_PATH") {
         Ok(path) => {
+            let path = ferrox_models::hf_pull::resolve_model_path(&path)?;
             if Path::new(&path).is_dir() {
                 load_real_kimi_checkpoint(&path).map(LoadedModel::Kimi)
             } else {
@@ -227,12 +244,57 @@ fn load_gguf_file(path: &str) -> anyhow::Result<LoadedModel> {
             file.tensor_count()
         );
     }
-    if let Some(arch) = file.metadata_str("general.architecture") {
+    let arch = file.metadata_str("general.architecture");
+    ferrox_models::mmproj::warn_mmproj_if_present(Path::new(path), arch);
+    if let Some(arch) = arch {
+        if is_glm52_arch(arch) {
+            return load_glm52_checkpoint(path, &file).map(LoadedModel::Glm52);
+        }
         if matches!(select_engine_kind(arch), Ok(SelectedEngineKind::Mla)) {
             return load_mla_checkpoint(path, &file).map(LoadedModel::Mla);
         }
     }
     load_real_gguf_checkpoint(path, &file).map(LoadedModel::Gguf)
+}
+
+fn load_glm52_checkpoint(path: &str, file: &ShardedGguf) -> anyhow::Result<Glm52Loaded> {
+    let arch = file
+        .metadata_str("general.architecture")
+        .unwrap_or("glm-dsa")
+        .to_string();
+    let name = file
+        .metadata_str("general.name")
+        .unwrap_or(arch.as_str())
+        .to_string();
+    tracing::info!("loading GGUF as GLM-5.2 engine (arch={arch}, name={name})");
+    let served = load_glm52_engine_from_path(Path::new(path)).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let ServedEngine::Glm52(engine) = served else {
+        anyhow::bail!("expected ServedEngine::Glm52 for architecture {arch}");
+    };
+
+    let tokenizer = tokenizer_from_gguf(file)?;
+    let eos_id = file
+        .metadata_u64("tokenizer.ggml.eos_token_id")
+        .map(|v| v as usize);
+    let bos_id = file
+        .metadata_u64("tokenizer.ggml.bos_token_id")
+        .map(|v| v as usize);
+    let byte_tokenizer = matches!(tokenizer, ServerTokenizer::Byte);
+    let chat_template = crate::chat_template::ChatTemplate::detect_for_gguf(
+        file.metadata_str("tokenizer.chat_template"),
+        Some(arch.as_str()),
+        byte_tokenizer,
+    );
+    tracing::info!("detected chat template: {chat_template:?}");
+
+    Ok(Glm52Loaded {
+        engine,
+        tokenizer,
+        eos_id,
+        bos_id,
+        name,
+        chat_template,
+    })
 }
 
 fn load_mla_checkpoint(path: &str, file: &ShardedGguf) -> anyhow::Result<MlaLoaded> {

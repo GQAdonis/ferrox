@@ -252,7 +252,7 @@ pub fn architecture_catalog() -> &'static [ArchProfile] {
         for n in [
             "olmoe", "qwen", "qwen2", "qwen2moe", "falcon", "gptneox", "stablelm", "mistral",
             "mixtral", "olmo2", "gpt2", "bloom", "mpt", "refact", "bitnet", "jais", "jais2",
-            "grok", "dbrx", "exaone4",
+            "grok", "dbrx", "exaone4", "yi",
         ] {
             v.push(gqa_neox(n));
         }
@@ -351,7 +351,7 @@ pub fn architecture_catalog() -> &'static [ArchProfile] {
             KvGqa,
             Norm,
             ArchPath::DedicatedOnly {
-                reason: "llama4 MoE / non-generic graph not yet implemented",
+                reason: "llama4 MoE + non-GQA attn — see llama4_engine.rs tensor list",
             },
             WholeVector,
         ));
@@ -364,7 +364,7 @@ pub fn architecture_catalog() -> &'static [ArchProfile] {
                 KvGqa,
                 Norm,
                 ArchPath::DedicatedOnly {
-                    reason: "MiniMax 256-expert sigmoid MoE + MTP not yet implemented",
+                    reason: "MiniMax 256-expert sigmoid MoE + MTP — see minimax_engine.rs",
                 },
                 WholeVector,
             ));
@@ -538,6 +538,7 @@ pub fn architecture_catalog() -> &'static [ArchProfile] {
                 DeferredEncoderEmbedding,
                 "embedding variant; deferred",
             ),
+            ("yi-vl", DeferredMultimodal, "Yi vision-language; deferred"),
             ("qwen2vl", DeferredMultimodal, "vision-language; deferred"),
             ("qwen3vl", DeferredMultimodal, "vision-language; deferred"),
             ("qwen3vlmoe", DeferredMultimodal, "vision-language; deferred"),
@@ -688,6 +689,12 @@ mod tests {
             })
         );
         assert_eq!(
+            resolve_architecture("yi"),
+            Some(ArchPath::GenericGqa {
+                rope: RopeLayout::Neox
+            })
+        );
+        assert_eq!(
             resolve_architecture("mixtral"),
             Some(ArchPath::GenericGqa {
                 rope: RopeLayout::Neox
@@ -777,7 +784,7 @@ mod tests {
                 matches!(
                     resolve_architecture(arch),
                     Some(ArchPath::DedicatedOnly {
-                        reason: "MiniMax 256-expert sigmoid MoE + MTP not yet implemented"
+                        reason: "MiniMax 256-expert sigmoid MoE + MTP — see minimax_engine.rs"
                     })
                 ),
                 "{arch} must fail closed, not silent generic GQA"
@@ -787,7 +794,7 @@ mod tests {
             matches!(
                 resolve_architecture("llama4"),
                 Some(ArchPath::DedicatedOnly {
-                    reason: "llama4 MoE / non-generic graph not yet implemented"
+                    reason: "llama4 MoE + non-GQA attn — see llama4_engine.rs tensor list"
                 })
             ),
             "llama4 must fail closed, not silent generic GQA"

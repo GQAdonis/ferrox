@@ -19,6 +19,7 @@ pub mod execution_plan;
 pub mod glm52_decoder;
 pub mod glm52_gguf_loader;
 pub mod gdn;
+pub mod hf_pull;
 pub mod glm_dsa;
 pub mod hybrid_engine;
 pub mod hybrid_gguf_loader;
@@ -31,7 +32,9 @@ pub mod kimi_loader;
 pub mod kimi_tokenizer;
 pub mod kimi_validate;
 pub mod latent_moe;
+pub mod llama4_engine;
 pub mod loader;
+pub mod minimax_engine;
 pub mod mla;
 pub mod mla_gguf_loader;
 pub mod mmproj;
@@ -57,8 +60,8 @@ pub use engine::{
     DeepseekV4Engine, Engine, Glm52Engine, KimiEngine, MlaEngine, MlaLayerWeights, TextTokenizer,
 };
 pub use engine_factory::{
-    ensure_generic_decoder, load_mla_engine_from_path, select_engine_kind, EngineSelectError,
-    SelectedEngineKind, ServedEngine,
+    ensure_generic_decoder, load_glm52_engine_from_path, load_mla_engine_from_path,
+    select_engine_kind, EngineSelectError, SelectedEngineKind, ServedEngine,
 };
 pub use execution_plan::{ExecutionPlan, FusedOpCaps, MemoryPlan, PlanGeometry};
 pub use loader::LoadError;

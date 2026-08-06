@@ -239,9 +239,12 @@ pub async fn completions(
             top_p: req.top_p.unwrap_or(1.0),
             top_k: 0,
             repetition_penalty: 1.0,
+            presence_penalty: 0.0,
+            frequency_penalty: 0.0,
         },
         seed: req.seed.unwrap_or(0),
         stop: Vec::new(),
+        json_object: false,
     };
     let model = Arc::clone(&state.model);
     let kv_pool = state.kv_pool.clone();

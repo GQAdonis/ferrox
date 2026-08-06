@@ -10,6 +10,7 @@ effect (documented here so clients are not surprised).
 | Endpoint | Status |
 |---|---|
 | `GET /health` | Supported |
+| `GET /` / `GET /ui` | Supported when `--ui-server` or `FERROX_UI=1` (static chat UI) |
 | `GET /v1/models` | Supported |
 | `POST /v1/chat/completions` | Supported (non-stream + SSE) |
 | `POST /v1/completions` | Supported (minimal: `prompt`, `max_tokens`, sampling subset) |
@@ -26,14 +27,15 @@ effect (documented here so clients are not surprised).
 |---|---|
 | `model`, `messages`, `max_tokens` | Supported |
 | `temperature`, `top_p`, `top_k`, `repetition_penalty`, `seed`, `stop` | Supported |
+| `presence_penalty`, `frequency_penalty` | Supported (OpenAI-style logit penalties on generated history) |
 | `stream` | Supported — overlapped SSE when tools inactive and continuous batching off |
 | `tools` / tool-call stop markers | Supported (prompt-engineered; not grammar-constrained) |
 | `tool_choice: "none"` / `"auto"` | Supported |
 | `tool_choice: "required"` / named function | **Reject** (501) — needs constrained decoding |
 | `logprobs` / `top_logprobs` | **Reject** until implemented |
 | `n` (>1) | **Reject** |
-| `presence_penalty` / `frequency_penalty` | **Reject** (use `repetition_penalty`) |
-| `response_format` / JSON mode | **Reject** |
+| `response_format: { "type": "json_object" }` | Supported (best-effort: JSON-safe token mask + post-validate; not full grammar) |
+| `response_format` (other types) | **Reject** |
 | `session_id` | Ferrox extension (server-side history) |
 
 ## Continuous batching
@@ -42,18 +44,24 @@ Opt-in via `FERROX_CONTINUOUS_BATCHING=1`. Mutually exclusive with
 `FERROX_KV_POOL_BLOCKS` and `FERROX_PREFIX_CACHE_ENTRIES`. Throughput
 receipt helper: [`benchmarks/cb_throughput.py`](../benchmarks/cb_throughput.py).
 
-## Planned (roadmap P8–P9)
+## MCP tool servers
+
+`--mcp-config PATH` loads a JSON list of MCP servers and exposes stub
+metadata under `ferrox_mcp` in `GET /v1/models`. Tool invocation is
+**not implemented** yet (planned P9+).
+
+## Planned (roadmap)
 
 Not implemented. Listed so clients and contributors know the intended
 surface; rows stay **Not implemented** / **Reject** until code + tests
-land. Do not treat this section as Supported.
+land.
 
 | Item | Phase | Notes |
 |---|---|---|
-| Anthropic Messages streaming / tools / images | P9 | Non-stream text `/v1/messages` shipped |
-| Guided decode / JSON schema / grammar | P9 | Unlocks `response_format` + `tool_choice=required` |
-| MCP tool servers (`--mcp-config`) | P9 | External tool attach |
-| Built-in web UI (`--ui-server`) | P9 | Static chat UI; `ferrox chat` remains first-class |
-| `presence_penalty` / `frequency_penalty` | P9 | Fill current Rejects |
+| Anthropic Messages streaming / tools / images | P9+ | Non-stream text `/v1/messages` shipped |
+| JSON schema / full grammar constrained decode | P9+ | `json_object` best-effort shipped |
+| MCP tool invocation | P9+ | Config + models metadata stub shipped |
+| `tool_choice=required` | P9+ | Needs grammar |
 | Continuous-batching default + pin | P10 | See CB section above |
 | Dedicated embedding models / base64 encoding | later | `/v1/embeddings` today pools decoder hiddens only |
+| Multi-GPU / tensor parallel / prefill-decode disaggregation | P10+ | Documented in ROADMAP only |

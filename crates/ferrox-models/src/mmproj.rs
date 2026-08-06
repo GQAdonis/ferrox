@@ -6,6 +6,8 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::capability::{resolve_profile, ArchScope};
+
 /// Look for `mmproj*.gguf` (case-insensitive) in the same directory as
 /// `main_gguf`. Returns the first match by name, if any.
 pub fn find_mmproj_beside(main_gguf: &Path) -> Option<PathBuf> {
@@ -30,6 +32,50 @@ pub fn find_mmproj_beside(main_gguf: &Path) -> Option<PathBuf> {
         .collect();
     matches.sort();
     matches.into_iter().next()
+}
+
+/// Log a clear warning when a companion mmproj exists but VL is not implemented.
+/// Known VL architectures get a stronger message (fail-closed hint for operators).
+pub fn warn_mmproj_if_present(main_gguf: &Path, arch: Option<&str>) {
+    let Some(mmproj) = find_mmproj_beside(main_gguf) else {
+        return;
+    };
+    let vl_arch = arch.is_some_and(|a| {
+        resolve_profile(a).is_some_and(|p| p.scope == ArchScope::DeferredMultimodal)
+    });
+    let arch_note = arch.map(|a| format!(" (arch={a})")).unwrap_or_default();
+    if vl_arch {
+        eprintln!(
+            "ferrox: warning: mmproj {} beside {}{} — VL architecture but multimodal \
+             generation not implemented (see docs/MODELS.md P7)",
+            mmproj.display(),
+            main_gguf.display(),
+            arch_note
+        );
+    } else {
+        eprintln!(
+            "ferrox: warning: mmproj companion {} found beside {}{} — vision projector not \
+             loaded; text-only path continues (see docs/MODELS.md P7)",
+            mmproj.display(),
+            main_gguf.display(),
+            arch_note
+        );
+    }
+}
+
+/// CLI-facing stderr variant of [`warn_mmproj_if_present`].
+pub fn eprint_mmproj_if_present(main_gguf: &Path, arch: Option<&str>) {
+    let Some(mmproj) = find_mmproj_beside(main_gguf) else {
+        return;
+    };
+    let arch_note = arch.map(|a| format!(" (arch={a})")).unwrap_or_default();
+    eprintln!(
+        "ferrox: warning: mmproj companion {} found beside {}{} — VL/projector not \
+         implemented; text-only load continues (see docs/MODELS.md)",
+        mmproj.display(),
+        main_gguf.display(),
+        arch_note
+    );
 }
 
 #[cfg(test)]

@@ -2,6 +2,7 @@
 //! inspect / presets / smoke / Kimi helpers. See `docs/CLI.md`.
 
 mod chat;
+mod pull;
 mod run;
 
 use clap::{Parser, Subcommand};
@@ -30,6 +31,8 @@ enum Commands {
     /// Reuses the server's chat-template + streaming path — start the
     /// server first (`FERROX_MODEL_PATH=… ferrox-server`).
     Chat(chat::ChatArgs),
+    /// Download a GGUF from Hugging Face Hub (`hf download`).
+    Pull(pull::PullArgs),
     /// Print GGUF header metadata and tensor list for a model file.
     Inspect { path: String },
     /// Dry-run residency plan for a GGUF checkpoint: what it would
@@ -206,6 +209,7 @@ fn rewrite_llama_style_argv(args: Vec<String>) -> Vec<String> {
     }
     const SUBCOMMANDS: &[&str] = &[
         "run",
+        "pull",
         "chat",
         "inspect",
         "inspect-plan",
@@ -243,6 +247,7 @@ fn main() -> anyhow::Result<()> {
     match cli.command {
         Commands::Run(args) => run::run_infer(args)?,
         Commands::Chat(args) => chat::run_chat(args)?,
+        Commands::Pull(args) => pull::run_pull(args)?,
         Commands::Inspect { path } => {
             let file = ShardedGguf::open(&path)?;
             if file.shard_count() > 1 {
@@ -849,6 +854,8 @@ fn main() -> anyhow::Result<()> {
                 top_p,
                 top_k,
                 repetition_penalty,
+                presence_penalty: 0.0,
+                frequency_penalty: 0.0,
             };
 
             println!("Generating (max {max_new_tokens} new tokens)...");

@@ -1,0 +1,72 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Ferrox Chat</title>
+  <style>
+    :root { font-family: system-ui, sans-serif; color: #111; background: #f6f6f8; }
+    body { max-width: 48rem; margin: 0 auto; padding: 1rem; }
+    h1 { font-size: 1.25rem; margin: 0 0 1rem; }
+    #log { background: #fff; border: 1px solid #ddd; border-radius: 8px; padding: 1rem; min-height: 12rem; white-space: pre-wrap; }
+    .user { color: #036; }
+    .assistant { color: #060; }
+    form { display: flex; gap: 0.5rem; margin-top: 1rem; }
+    input[type=text] { flex: 1; padding: 0.5rem; border: 1px solid #ccc; border-radius: 6px; }
+    button { padding: 0.5rem 1rem; border: 0; border-radius: 6px; background: #222; color: #fff; cursor: pointer; }
+    button:disabled { opacity: 0.5; }
+    .meta { font-size: 0.85rem; color: #666; margin-top: 0.5rem; }
+  </style>
+</head>
+<body>
+  <h1>Ferrox Chat</h1>
+  <div id="log"></div>
+  <form id="form">
+    <input id="input" type="text" placeholder="Message…" autocomplete="off" />
+    <button type="submit">Send</button>
+  </form>
+  <p class="meta">Posts to <code>/v1/chat/completions</code> on this host. Use <code>ferrox chat</code> for a richer REPL.</p>
+  <script>
+    const log = document.getElementById('log');
+    const form = document.getElementById('form');
+    const input = document.getElementById('input');
+    const messages = [];
+
+    function append(role, text) {
+      const line = document.createElement('div');
+      line.className = role;
+      line.textContent = (role === 'user' ? 'You: ' : 'Assistant: ') + text;
+      log.appendChild(line);
+      log.scrollTop = log.scrollHeight;
+    }
+
+    form.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const text = input.value.trim();
+      if (!text) return;
+      input.value = '';
+      messages.push({ role: 'user', content: text });
+      append('user', text);
+      form.querySelector('button').disabled = true;
+      try {
+        const res = await fetch('/v1/chat/completions', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ model: 'ferrox', messages, max_tokens: 256, temperature: 0.7 }),
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error?.message || res.statusText);
+        const reply = data.choices?.[0]?.message?.content ?? '';
+        messages.push({ role: 'assistant', content: reply });
+        append('assistant', reply);
+      } catch (err) {
+        append('assistant', '[error] ' + err.message);
+      } finally {
+        form.querySelector('button').disabled = false;
+        input.focus();
+      }
+    });
+    input.focus();
+  </script>
+</body>
+</html>

@@ -12,6 +12,7 @@ use ferrox_core::cache::{KvBlockPool, KvCache, KvPoolExhausted as CacheKvPoolExh
 use ferrox_models::sampling::{Sampler, SamplingParams};
 use ferrox_models::{Decoder, Engine, PrefixCache, TextTokenizer};
 
+use crate::json_mode::mask_logits_for_json;
 use crate::model::ServerTokenizer;
 
 #[derive(Debug, thiserror::Error)]
@@ -142,6 +143,49 @@ pub struct GenerationParams {
     pub sampling: SamplingParams,
     pub seed: u64,
     pub stop: Vec<String>,
+    /// When true, constrain sampling toward JSON-safe token pieces and
+    /// validate the emitted text is a JSON object (best-effort; see
+    /// `json_mode` module).
+    pub json_object: bool,
+}
+
+fn chunked_prefill_tokens() -> Option<usize> {
+    std::env::var("FERROX_CHUNKED_PREFILL")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|&n| n > 0)
+}
+
+fn cpu_kv_offload_enabled() -> bool {
+    matches!(
+        std::env::var("FERROX_CPU_KV_OFFLOAD").ok().as_deref(),
+        Some("1")
+    )
+}
+
+/// Batched prompt prefill, optionally split into `FERROX_CHUNKED_PREFILL`-sized
+/// chunks that append into the same KV caches.
+fn forward_prompt_batch(
+    decoder: &Decoder,
+    tokens: &[usize],
+    start_pos: usize,
+    caches: &mut [KvCache],
+) -> Vec<f32> {
+    if let Some(chunk) = chunked_prefill_tokens() {
+        let mut pos = start_pos;
+        let mut last = Vec::new();
+        for part in tokens.chunks(chunk) {
+            let rows = decoder.forward_batch(part, pos, caches);
+            pos += part.len();
+            last = rows.into_iter().last().unwrap_or_default();
+        }
+        last
+    } else {
+        let rows = decoder.forward_batch(tokens, start_pos, caches);
+        rows.into_iter()
+            .last()
+            .expect("forward_batch returns one logits row per prompt token")
+    }
 }
 
 /// Runs the prompt through `decoder`, then generates up to
@@ -309,16 +353,18 @@ pub fn generate(
             // traffic on CPU; fewer per-token bookkeeping costs). Last
             // row's logits predict the first generated token — same as
             // the sequential loop this replaces (see unit test below).
-            let rows = decoder.forward_batch(&tokens, 0, &mut caches);
+            // When `FERROX_CHUNKED_PREFILL` is set, split long prompts
+            // into chunks that reuse the same KV caches.
             pos = tokens.len();
-            rows.into_iter()
-                .last()
-                .expect("forward_batch returns one logits row per prompt token")
+            forward_prompt_batch(decoder, &tokens, 0, &mut caches)
         };
     }
 
     let prefill_secs = prefill_start.elapsed().as_secs_f64();
     let decode_start = std::time::Instant::now();
+    #[cfg(feature = "metal")]
+    let kv_offload = cpu_kv_offload_enabled();
+    let decode_token = |id: usize| tokenizer.decode(&[id]);
 
     // `logits` becomes the prediction for the position after each
     // generated token; every generated token gets exactly one
@@ -331,8 +377,20 @@ pub fn generate(
         eos_id,
         params,
         |ids| tokenizer.decode(ids),
-        |next, pos| decoder.forward_token(next, pos, &mut caches),
+        |next, pos| {
+            let l = decoder.forward_token(next, pos, &mut caches);
+            #[cfg(feature = "metal")]
+            if kv_offload {
+                decoder.sync_metal_attn_kv_to_host(&mut caches);
+            }
+            l
+        },
         &mut emit,
+        if params.json_object {
+            Some(&decode_token as &dyn Fn(usize) -> String)
+        } else {
+            None
+        },
     );
     let decode_secs = decode_start.elapsed().as_secs_f64();
     logits = final_logits;
@@ -394,6 +452,7 @@ fn sample_until_stop(
     mut decode_one: impl FnMut(&[usize]) -> String,
     mut step: impl FnMut(usize, usize) -> Vec<f32>,
     mut emit: impl FnMut(&str),
+    decode_token: Option<&dyn Fn(usize) -> String>,
 ) -> (FinishReason, Vec<usize>, Vec<f32>) {
     let max_stop_len = params.stop.iter().map(|s| s.len()).max().unwrap_or(0);
     let mut sampler = Sampler::new(params.seed);
@@ -402,7 +461,23 @@ fn sample_until_stop(
     let mut finish = FinishReason::Length;
 
     for _ in 0..params.max_tokens {
-        let next = sampler.sample(&logits, &params.sampling, &generated_ids);
+        let next = if params.json_object {
+            if let Some(decode_token) = decode_token {
+                let mut mask_fn = |scores: &mut [f32]| {
+                    mask_logits_for_json(scores, |i| decode_token(i));
+                };
+                sampler.sample_with_mask(
+                    &logits,
+                    &params.sampling,
+                    &generated_ids,
+                    Some(&mut mask_fn),
+                )
+            } else {
+                sampler.sample(&logits, &params.sampling, &generated_ids)
+            }
+        } else {
+            sampler.sample(&logits, &params.sampling, &generated_ids)
+        };
         if Some(next) == eos_id {
             finish = FinishReason::Stop;
             break;
@@ -492,6 +567,7 @@ pub fn generate_engine<E: Engine, T: TextTokenizer>(
         |ids| tokenizer.decode(ids),
         |next, pos| engine.forward_token(next, pos, &mut state),
         &mut emit,
+        None,
     );
 
     Ok((finish, Usage::new(prompt_tokens, generated_ids.len())))
@@ -533,6 +609,7 @@ mod tests {
             sampling: SamplingParams::default(),
             seed: 1,
             stop: Vec::new(),
+            json_object: false,
         }
     }
 
@@ -784,6 +861,7 @@ mod tests {
                 sampling: SamplingParams::default(),
                 seed: 1,
                 stop: vec!["ZZ_NEVER_MATCHES_ZZ".to_string()],
+                json_object: false,
             },
             None,
             None,
@@ -840,6 +918,7 @@ mod tests {
                 sampling: SamplingParams::default(),
                 seed: 1,
                 stop: vec![stop_str],
+                json_object: false,
             },
             None,
             None,

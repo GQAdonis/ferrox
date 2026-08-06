@@ -32,6 +32,9 @@ Defaults are sensible; measure before changing these.
 | Variable | Purpose |
 |---|---|
 | `FERROX_CONTINUOUS_BATCHING` | `1` — share decode steps across concurrent server requests |
+| `FERROX_CHUNKED_PREFILL` | Positive integer — split long prompt prefill into N-token `forward_batch` chunks |
+| `FERROX_CPU_KV_OFFLOAD` | `1` — after each Metal decode step, sync GPU KV into host caches (minimal spill stub) |
+| `FERROX_UI` | `1` — serve static chat UI at `/` and `/ui` (same as `--ui-server`) |
 | `FERROX_KV_POOL_BLOCKS` | Paged-KV pool size (blocks) for the server |
 | `FERROX_EXPERT_CACHE_BYTES` | MoE expert-streaming cache budget (bytes) |
 | `FERROX_SSD_STREAMING` | `1` — stream MoE experts from disk (defaults cache to 2 GiB) |

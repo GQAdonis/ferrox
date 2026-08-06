@@ -76,6 +76,7 @@ Source of truth for names: pinned llama.cpp `LLM_ARCH_NAMES`.
 | `grok` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
 | `dbrx` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
 | `exaone4` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
+| `yi` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
 | `qwen3` | TextGeneration | Qwen3Family | KvGqa | generic-gqa |
 | `qwen3moe` | TextGeneration | Qwen3Family | KvGqa | generic-gqa |
 | `gemma` | TextGeneration | GemmaFamily | KvGqa | generic-gqa |
@@ -130,6 +131,7 @@ Source of truth for names: pinned llama.cpp `LLM_ARCH_NAMES`.
 | `llama-embed` | DeferredEncoderEmbedding | StandardGqa | None | deferred |
 | `gemma-embedding` | DeferredEncoderEmbedding | StandardGqa | None | deferred |
 | `pangu-embedded` | DeferredEncoderEmbedding | StandardGqa | None | deferred |
+| `yi-vl` | DeferredMultimodal | StandardGqa | None | deferred |
 | `qwen2vl` | DeferredMultimodal | StandardGqa | None | deferred |
 | `qwen3vl` | DeferredMultimodal | StandardGqa | None | deferred |
 | `qwen3vlmoe` | DeferredMultimodal | StandardGqa | None | deferred |

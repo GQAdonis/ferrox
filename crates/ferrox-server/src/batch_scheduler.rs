@@ -355,9 +355,12 @@ mod tests {
                 top_p: 1.0,
                 top_k: 0,
                 repetition_penalty: 1.0,
+                presence_penalty: 0.0,
+                frequency_penalty: 0.0,
             },
             seed,
             stop: vec![],
+            json_object: false,
         }
     }
 
@@ -425,9 +428,12 @@ mod tests {
                     top_p: params[i].sampling.top_p,
                     top_k: params[i].sampling.top_k,
                     repetition_penalty: params[i].sampling.repetition_penalty,
+                    presence_penalty: params[i].sampling.presence_penalty,
+                    frequency_penalty: params[i].sampling.frequency_penalty,
                 },
                 seed: params[i].seed,
                 stop: vec![],
+                json_object: params[i].json_object,
             };
             threads.push(thread::spawn(move || {
                 barrier.wait();

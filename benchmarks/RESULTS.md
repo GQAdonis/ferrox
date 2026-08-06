@@ -22,15 +22,15 @@ Keep off (regressions): legacy GQA NSG=4, sequential GREEDY argmax, float4 elem,
 | TinyLlama-1.1B-Chat-v1.0 Q8_0 | metal | **114.63** ±0.5 | **110.26** ±0.5 | ⚪ **~0.96×** | ⚪ parity | ok | [`tinyllama_q8_metal`](receipts/pins/tinyllama_q8_metal.json) |
 | TinyLlama-1.1B-Chat-v1.0 Q8_0 | cpu | **40.83** ±0.3 | **46.93** ±0.7 (−ngl 0) | 🔴 **~1.15×** | 🔴 **llama** | ok | [`tinyllama_q8_cpu`](receipts/pins/tinyllama_q8_cpu.json) |
 | Llama-3.2-1B-Instruct Q4_K_M | metal | **137.88** ±5.0 | **136.99** ±0.4 | ⚪ **1.00×** | ⚪ parity | ok | [`llama32_1b_q4km_metal`](receipts/pins/llama32_1b_q4km_metal.json) |
-| OLMoE-1B-7B-0924 Q4_0 | cpu | **32.91** ±0.2 | **45.58** ±1.0 (−ngl 0) | 🔴 **~1.38×** | 🔴 **llama** | ok | [`olmoe_q4_cpu`](receipts/pins/olmoe_q4_cpu.json) |
-| OLMoE-1B-7B-0924 Q4_0 | metal | **106.75** ±2.3 | **146.78** ±0.1 | 🔴 **~1.37×** | 🔴 **llama** | ok | [`olmoe_q4_metal`](receipts/pins/olmoe_q4_metal.json) |
+| OLMoE-1B-7B-0924 Q4_0 | cpu | **31.08** ±0.7 | **29.79** ±0.7 (−ngl 0) | ⚪ **~0.96×** | ⚪ parity | ok | [`olmoe_q4_cpu`](receipts/pins/olmoe_q4_cpu.json) |
+| OLMoE-1B-7B-0924 Q4_0 | metal | **106.16** ±0.7 | **150.20** ±1.5 | 🔴 **~1.41×** | 🔴 **llama** | ok | [`olmoe_q4_metal`](receipts/pins/olmoe_q4_metal.json) |
 | OLMoE-1B-7B-0924 Q4_0 | cuda | — | — | — | — | no pin | — |
 | Llama-3.1-8B-Instruct Q4_K_M | metal | **28.17** ±0.8 | **25.86** ±1.2 | 🟢 **~0.92×** | 🟢 **ferrox** | ok | [`llama31_8b_q4km_metal`](receipts/pins/llama31_8b_q4km_metal.json) |
 | Llama-3.1-8B-Instruct Q4_K_M | cuda | — | — | — | — | no pin | — |
 | Llama-3.2-3B-Instruct Q4_K_M | metal | **62.74** ±1.5 | **61.03** ±0.9 | ⚪ **~0.97×** | ⚪ parity | ok | [`llama32_3b_q4km_metal`](receipts/pins/llama32_3b_q4km_metal.json) |
 | Qwen1.5-MoE-A2.7B Q4_K_M | cpu | — | — | — | — | no pin | — |
 | Qwen1.5-MoE-A2.7B Q4_K_M | metal | — | — | — | — | no pin | — |
-| Mistral-7B-Instruct-v0.2 Q4_K_M | cpu | **8.18** ±0.1 | **9.35** ±0.4 (−ngl 0) | 🔴 **~1.14×** | 🔴 **llama** | ok | [`mistral_7b_q4km_cpu`](receipts/pins/mistral_7b_q4km_cpu.json) |
+| Mistral-7B-Instruct-v0.2 Q4_K_M | cpu | **9.75** ±0.3 | **8.00** ±0.2 (−ngl 0) | 🟢 **~0.82×** | 🟢 **ferrox** | ok | [`mistral_7b_q4km_cpu`](receipts/pins/mistral_7b_q4km_cpu.json) |
 | Mistral-7B-Instruct-v0.2 Q4_K_M | metal | **27.76** ±1.4 | **26.41** ±1.3 | ⚪ **~0.95×** | ⚪ parity | ok | [`mistral_7b_q4km_metal`](receipts/pins/mistral_7b_q4km_metal.json) |
 | Mixtral-8x7B-Instruct Q4_K_M | cpu | — | — | — | — | no pin | — |
 | Llama-3.2-1B-Instruct IQ4_XS | metal | **146.29** ±2.4 | **138.21** ±3.3 | 🟢 **~0.94×** | 🟢 **ferrox** | ok | [`iq4_xs_metal`](receipts/pins/iq4_xs_metal.json) |
@@ -49,7 +49,7 @@ Keep off (regressions): legacy GQA NSG=4, sequential GREEDY argmax, float4 elem,
 | Gemma-4-E2B-IT Q4_K_M | metal | refused | — | — | — | refuse | [`gemma4_e2b_q4km_metal`](receipts/pins/gemma4_e2b_q4km_metal.json) |
 | Gemma-4-E2B-IT Q4_K_M | cpu | refused | — | — | — | refuse | [`gemma4_e2b_q4km_cpu`](receipts/pins/gemma4_e2b_q4km_cpu.json) |
 | Phi-4-mini-Instruct Q4_K_M | metal | **49.54** ±0.3 | **49.96** ±0.2 | ⚪ **1.00×** | ⚪ parity | ok | [`phi4_mini_q4km_metal`](receipts/pins/phi4_mini_q4km_metal.json) |
-| Phi-4-mini-Instruct Q4_K_M | cpu | **11.98** ±0.6 | **19.64** ±1.4 (−ngl 0) | 🔴 **~1.64×** | 🔴 **llama** | ok | [`phi4_mini_q4km_cpu`](receipts/pins/phi4_mini_q4km_cpu.json) |
+| Phi-4-mini-Instruct Q4_K_M | cpu | **12.34** ±2.1 | **10.71** ±4.2 (−ngl 0) | 🟢 **~0.87×** | 🟢 **ferrox** | ok | [`phi4_mini_q4km_cpu`](receipts/pins/phi4_mini_q4km_cpu.json) |
 
 
 ## CLI completion (`llama-completion` vs `ferrox run`)
@@ -78,10 +78,11 @@ Pins that used `llama-cli` or rejected options are omitted.
 ## Open
 
 1. Metal fair-chat 8B is ahead (~0.92×); 3B ~parity (~0.97×). Keep watching `prompt_per_second` vs llama after FA-vec prefill.
-2. OLMoE Metal ~1.37× — root cause is GPU dependency-chain bubbles (~13 barrier stages/layer), not `mul_mv_id` FLOPs. Next: fuse/reorder ops to shorten the critical path (`docs/ROADMAP.md`).
+2. OLMoE Metal ~1.41× — fused encode groups + barrier instrumentation landed; deferred residual + single-grid `mul_mm_id` still open (`docs/ROADMAP.md`). Prefill `prompt_per_second` still ≪ llama.
 3. CUDA — re-measure on comparable CUDA hardware (no in-tree CUDA pin; skipped on darwin via `--fit-host`).
-4. Gemma-4-E2B: both ferrox and Homebrew llama refuse (`gemma4` arch / per-layer+shared-KV+SWA split); suite `expect=refuse`.
+4. Gemma-4-E2B: `Gemma4Engine` loads; tokenizer `gemma4` still byte-fallback; suite `expect=refuse` until fair-chat pin. Homebrew llama also unknown-arch.
 5. CB multi-request tok/s receipt.
-6. DS4 / GLM / MLA MoE real-checkpoint e2e when feasible.
+6. DS4 / GLM / MLA MoE real-checkpoint e2e when feasible (MoE-after-dense wired in `MlaEngine`).
 7. Qwen2-MoE / Mixtral: missing GGUF or `--fit-host` RAM skip on Host B.
 8. Suite contention: re-pin outliers alone if full-suite medians disagree with CLI.
+9. CPU: interleaved Q4_K closed Mistral/Phi4/OLMoE gaps (ferrox ahead); extend to Q8_0 for small-model CPU pins.

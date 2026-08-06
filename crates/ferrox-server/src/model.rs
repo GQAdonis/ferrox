@@ -29,10 +29,10 @@ use std::path::Path;
 
 use ferrox_gguf::ShardedGguf;
 use ferrox_models::{
-    deepseek_v4_pro, glm_5_2, kimi_k3, load_glm52_engine_from_path, load_mla_engine_from_path,
-    select_engine_kind, ByteTokenizer, Decoder, GgufBpeTokenizer, GgufSpmTokenizer,
-    GgufUnigramTokenizer, Glm52Engine, KimiEngine, MlaEngine, ModelConfig, SelectedEngineKind,
-    ServedEngine, TextTokenizer,
+    deepseek_v4_pro, glm_5_2, kimi_k3, load_gemma4_engine_from_path, load_glm52_engine_from_path,
+    load_mla_engine_from_path, select_engine_kind, ByteTokenizer, Decoder, Gemma4Engine,
+    GgufBpeTokenizer, GgufSpmTokenizer, GgufUnigramTokenizer, Glm52Engine, KimiEngine, MlaEngine,
+    ModelConfig, SelectedEngineKind, ServedEngine, TextTokenizer,
 };
 
 /// Default expert-cache budget when `FERROX_SSD_STREAMING` is set without
@@ -182,6 +182,15 @@ pub struct MlaLoaded {
     pub chat_template: crate::chat_template::ChatTemplate,
 }
 
+pub struct Gemma4Loaded {
+    pub engine: Gemma4Engine,
+    pub tokenizer: ServerTokenizer,
+    pub eos_id: Option<usize>,
+    pub bos_id: Option<usize>,
+    pub name: String,
+    pub chat_template: crate::chat_template::ChatTemplate,
+}
+
 pub struct Glm52Loaded {
     pub engine: Glm52Engine,
     pub tokenizer: ServerTokenizer,
@@ -198,6 +207,7 @@ pub enum LoadedModel {
     Gguf(GgufLoaded),
     Kimi(KimiLoaded),
     Mla(MlaLoaded),
+    Gemma4(Gemma4Loaded),
     Glm52(Glm52Loaded),
 }
 
@@ -252,6 +262,9 @@ fn load_gguf_file(path: &str) -> anyhow::Result<LoadedModel> {
         }
         if matches!(select_engine_kind(arch), Ok(SelectedEngineKind::Mla)) {
             return load_mla_checkpoint(path, &file).map(LoadedModel::Mla);
+        }
+        if matches!(select_engine_kind(arch), Ok(SelectedEngineKind::Gemma4)) {
+            return load_gemma4_checkpoint(path, &file).map(LoadedModel::Gemma4);
         }
     }
     load_real_gguf_checkpoint(path, &file).map(LoadedModel::Gguf)
@@ -329,6 +342,45 @@ fn load_mla_checkpoint(path: &str, file: &ShardedGguf) -> anyhow::Result<MlaLoad
     tracing::info!("detected chat template: {chat_template:?}");
 
     Ok(MlaLoaded {
+        engine,
+        tokenizer,
+        eos_id,
+        bos_id,
+        name,
+        chat_template,
+    })
+}
+fn load_gemma4_checkpoint(path: &str, file: &ShardedGguf) -> anyhow::Result<Gemma4Loaded> {
+    let arch = file
+        .metadata_str("general.architecture")
+        .unwrap_or("gemma4")
+        .to_string();
+    let name = file
+        .metadata_str("general.name")
+        .unwrap_or(arch.as_str())
+        .to_string();
+    tracing::info!("loading GGUF as Gemma4 engine (arch={arch}, name={name})");
+    let served = load_gemma4_engine_from_path(Path::new(path)).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let ServedEngine::Gemma4(engine) = served else {
+        anyhow::bail!("expected ServedEngine::Gemma4 for architecture {arch}");
+    };
+
+    let tokenizer = tokenizer_from_gguf(file)?;
+    let eos_id = file
+        .metadata_u64("tokenizer.ggml.eos_token_id")
+        .map(|v| v as usize);
+    let bos_id = file
+        .metadata_u64("tokenizer.ggml.bos_token_id")
+        .map(|v| v as usize);
+    let byte_tokenizer = matches!(tokenizer, ServerTokenizer::Byte);
+    let chat_template = crate::chat_template::ChatTemplate::detect_for_gguf(
+        file.metadata_str("tokenizer.chat_template"),
+        Some(arch.as_str()),
+        byte_tokenizer,
+    );
+    tracing::info!("detected chat template: {chat_template:?}");
+
+    Ok(Gemma4Loaded {
         engine,
         tokenizer,
         eos_id,

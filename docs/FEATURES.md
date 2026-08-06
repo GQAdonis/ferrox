@@ -12,9 +12,12 @@ Verified against llama.cpp on the same host and GGUF (Gap =
 - **Dense GQA** — TinyLlama, Llama 3.1/3.2, Mistral-7B, SmolLM2,
   Qwen2.5/Qwen3, Gemma-2/3, Phi-3/4. Llama-8B Metal fair-chat Gap
   **~0.92×**; Llama-3.2-3B **~0.97×**.
-- **MoE** — OLMoE-1B-7B (Metal Concurrent encode + `MoeMemRanges` +
-  `mul_mv_id`; CPU int-dot path).
-- **MLA** — dense-lead `deepseek2` / `mistral4` on CLI and server.
+- **MoE** — OLMoE-1B-7B (Metal Concurrent + fused encode groups +
+  `MoeMemRanges` + `mul_mv_id` / prefill `mul_mm_id`; CPU int-dot +
+  interleaved Q4_K).
+- **MLA** — dense-lead and MoE-after-dense `deepseek2` / `mistral4`.
+- **Gemma-4** — dedicated engine (per-layer emb + shared KV + SWA/full);
+  tokenizer pin pending.
 - **Also loadable** — yi, qwen3moe (e.g. MiroThinker GGUFs), GLM4 when
   tensors are present.
 
@@ -25,8 +28,8 @@ Full matrix and pins: [`MODELS.md`](MODELS.md) ·
 
 | Backend | Capabilities |
 |---|---|
-| **CPU** | Dense + MoE; optional int8×int8 matvec (`FERROX_CPU_INT_DOT`) |
-| **Metal** | FA-vec attention (decode d=64/96/128/256, prefill d=128/256), concurrent FFN/QKV encode, MoE Concurrent + `MoeMemRanges`, quantized KV (`q8_0` / `turbo8` / `fp8` / `turbo4`) |
+| **CPU** | Dense + MoE; `FERROX_CPU_INT_DOT` int8×int8 + interleaved Q4_Kx8 GEMV |
+| **Metal** | FA-vec attention (decode d=64/96/128/256, prefill d=128/256), concurrent FFN/QKV encode, MoE Concurrent + fused groups + `MoeMemRanges` + `mul_mm_id` prefill, quantized KV (`q8_0` / `turbo8` / `fp8` / `turbo4`) |
 | **CUDA** | Matvec, resident weights, FFN fuse (`--features cuda`) |
 
 ## CLI

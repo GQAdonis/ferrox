@@ -1,0 +1,763 @@
+//! Interleaved Q4_K × Q8_K GEMV (llama.cpp `block_q4_Kx8` layout).
+//!
+//! Packs 8 Q4_K rows into one interleaved super-block so a single GEMV
+//! can share activation loads across 8 outputs. Layout matches ggml
+//! `block_q4_Kx8` / `make_block_q4_Kx8`. Opt-in via `FERROX_CPU_INT_DOT`.
+
+use crate::{Q8KActivations, Q4_K_BLOCK_BYTES, Q4_K_BLOCK_ELEMS};
+use half::f16;
+
+/// Bytes per interleaved `block_q4_Kx8` (8 × f16 d + 8 × f16 dmin + 96 scales + 1024 qs).
+pub const Q4_KX8_BLOCK_BYTES: usize = 1152;
+/// Number of Q4_K rows packed into one interleaved block.
+pub const Q4_KX8_NROWS: usize = 8;
+
+const KMASK1: u32 = 0x3f3f_3f3f;
+const KMASK2: u32 = 0x0f0f_0f0f;
+const KMASK3: u32 = 0x0303_0303;
+
+/// Preferred qs interleave width for this CPU: 4 on Apple DotProd NEON, 8 on AVX2.
+#[inline]
+pub fn q4_kx8_interleave() -> usize {
+    if cfg!(target_arch = "x86_64") {
+        8
+    } else {
+        4
+    }
+}
+
+#[inline]
+fn f16_from_bytes(b: &[u8]) -> f32 {
+    f16::from_le_bytes([b[0], b[1]]).to_f32()
+}
+
+/// Pack eight canonical Q4_K super-blocks (same column-block index) into
+/// one `block_q4_Kx8`. `interleave` is 4 (ARM) or 8 (x86).
+pub fn make_block_q4_kx8(
+    rows: [&[u8]; Q4_KX8_NROWS],
+    interleave: usize,
+) -> [u8; Q4_KX8_BLOCK_BYTES] {
+    debug_assert!(interleave == 4 || interleave == 8);
+    for r in &rows {
+        debug_assert_eq!(r.len(), Q4_K_BLOCK_BYTES);
+    }
+    let mut out = [0u8; Q4_KX8_BLOCK_BYTES];
+    // d[8] at 0, dmin[8] at 16, scales[96] at 32, qs[1024] at 128.
+    for (i, row) in rows.iter().enumerate() {
+        out[i * 2] = row[0];
+        out[i * 2 + 1] = row[1];
+        out[16 + i * 2] = row[2];
+        out[16 + i * 2 + 1] = row[3];
+    }
+
+    let end = (Q4_K_BLOCK_ELEMS * 4) / interleave; // qs bytes * 8 rows / interleave
+    let qs_out = &mut out[128..];
+    for i in 0..end {
+        let src_id = i % Q4_KX8_NROWS;
+        let src_offset = (i / Q4_KX8_NROWS) * interleave;
+        let dst_offset = i * interleave;
+        let src_qs = &rows[src_id][16..144];
+        qs_out[dst_offset..dst_offset + interleave]
+            .copy_from_slice(&src_qs[src_offset..src_offset + interleave]);
+    }
+
+    // Rearrange 6-bit scales/mins across 8 rows into 96 packed bytes
+    // (llama.cpp `make_block_q4_Kx8`).
+    let mut s = [0u8; 8];
+    let mut m = [0u8; 8];
+    let scales_out = &mut out[32..128];
+
+    for i in 0..4 {
+        for j in 0..8 {
+            let sc = &rows[j][4..16];
+            s[j] = sc[i] & 63;
+            m[j] = sc[i + 4] & 63;
+        }
+        let base = i * 12;
+        scales_out[base] = (s[0] & 63) + ((s[4] & 48) << 2);
+        scales_out[base + 1] = (s[1] & 63) + ((s[5] & 48) << 2);
+        scales_out[base + 2] = (s[2] & 63) + ((s[6] & 48) << 2);
+        scales_out[base + 3] = (s[3] & 63) + ((s[7] & 48) << 2);
+        scales_out[base + 4] = (m[0] & 63) + ((m[4] & 48) << 2);
+        scales_out[base + 5] = (m[1] & 63) + ((m[5] & 48) << 2);
+        scales_out[base + 6] = (m[2] & 63) + ((m[6] & 48) << 2);
+        scales_out[base + 7] = (m[3] & 63) + ((m[7] & 48) << 2);
+        scales_out[base + 8] = (s[4] & 15) + ((m[4] & 15) << 4);
+        scales_out[base + 9] = (s[5] & 15) + ((m[5] & 15) << 4);
+        scales_out[base + 10] = (s[6] & 15) + ((m[6] & 15) << 4);
+        scales_out[base + 11] = (s[7] & 15) + ((m[7] & 15) << 4);
+    }
+
+    for i in 0..4 {
+        for j in 0..8 {
+            let sc = &rows[j][4..16];
+            s[j] = ((sc[i] & 192) >> 2) | (sc[i + 8] & 15);
+            m[j] = ((sc[i + 4] & 192) >> 2) | ((sc[i + 8] & 240) >> 4);
+        }
+        let base = 48 + i * 12;
+        scales_out[base] = (s[0] & 63) + ((s[4] & 48) << 2);
+        scales_out[base + 1] = (s[1] & 63) + ((s[5] & 48) << 2);
+        scales_out[base + 2] = (s[2] & 63) + ((s[6] & 48) << 2);
+        scales_out[base + 3] = (s[3] & 63) + ((s[7] & 48) << 2);
+        scales_out[base + 4] = (m[0] & 63) + ((m[4] & 48) << 2);
+        scales_out[base + 5] = (m[1] & 63) + ((m[5] & 48) << 2);
+        scales_out[base + 6] = (m[2] & 63) + ((m[6] & 48) << 2);
+        scales_out[base + 7] = (m[3] & 63) + ((m[7] & 48) << 2);
+        scales_out[base + 8] = (s[4] & 15) + ((m[4] & 15) << 4);
+        scales_out[base + 9] = (s[5] & 15) + ((m[5] & 15) << 4);
+        scales_out[base + 10] = (s[6] & 15) + ((m[6] & 15) << 4);
+        scales_out[base + 11] = (s[7] & 15) + ((m[7] & 15) << 4);
+    }
+
+    out
+}
+
+/// Repack a full Q4_K matrix (row-major canonical blocks) into interleaved
+/// `block_q4_Kx8` groups. Rows not divisible by 8 are left out (caller
+/// handles the tail with per-row dots). `interleave` defaults via
+/// [`q4_kx8_interleave`].
+pub fn pack_q4_k_matrix_x8(data: &[u8], rows: usize, cols: usize, interleave: usize) -> Vec<u8> {
+    assert!(cols.is_multiple_of(Q4_K_BLOCK_ELEMS));
+    let n_blocks = cols / Q4_K_BLOCK_ELEMS;
+    let row_bytes = n_blocks * Q4_K_BLOCK_BYTES;
+    assert_eq!(data.len(), rows * row_bytes);
+    let n_groups = rows / Q4_KX8_NROWS;
+    let mut out = Vec::with_capacity(n_groups * n_blocks * Q4_KX8_BLOCK_BYTES);
+    for g in 0..n_groups {
+        for b in 0..n_blocks {
+            let mut row_refs: [&[u8]; Q4_KX8_NROWS] = [&[]; Q4_KX8_NROWS];
+            for (r, slot) in row_refs.iter_mut().enumerate() {
+                let base = (g * Q4_KX8_NROWS + r) * row_bytes + b * Q4_K_BLOCK_BYTES;
+                *slot = &data[base..base + Q4_K_BLOCK_BYTES];
+            }
+            out.extend_from_slice(&make_block_q4_kx8(row_refs, interleave));
+        }
+    }
+    out
+}
+
+/// Decode one 12-byte packed scale/min group into 8 scales + 8 mins (u8).
+#[inline]
+fn decode_scales_mins(scales12: &[u8], scales_out: &mut [u8; 8], mins_out: &mut [u8; 8]) {
+    debug_assert!(scales12.len() >= 12);
+    let mut utmp = [0u32; 4];
+    utmp[0] = u32::from_le_bytes(scales12[0..4].try_into().unwrap());
+    utmp[1] = u32::from_le_bytes(scales12[4..8].try_into().unwrap());
+    utmp[2] = u32::from_le_bytes(scales12[8..12].try_into().unwrap());
+    utmp[3] = ((utmp[2] >> 4) & KMASK2) | (((utmp[1] >> 6) & KMASK3) << 4);
+    let uaux_0 = utmp[1] & KMASK1;
+    utmp[1] = (utmp[2] & KMASK2) | (((utmp[0] >> 6) & KMASK3) << 4);
+    utmp[2] = uaux_0;
+    utmp[0] &= KMASK1;
+    let bytes = unsafe { std::slice::from_raw_parts(utmp.as_ptr() as *const u8, 16) };
+    scales_out.copy_from_slice(&bytes[0..8]);
+    mins_out.copy_from_slice(&bytes[8..16]);
+}
+
+/// Scalar GEMV for interleave=4 (`ggml_gemv_q4_K_8x4_q8_K_generic`).
+fn gemv_q4_kx8_q8_k_scalar_4(
+    packed: &[u8],
+    act: &Q8KActivations,
+    n_cols: usize,
+    n_row_groups: usize,
+    out: &mut [f32],
+) {
+    let nb = n_cols / Q4_K_BLOCK_ELEMS;
+    let blocklen = 4;
+    let ncols_interleaved = Q4_KX8_NROWS;
+    debug_assert_eq!(act.n_blocks(), nb);
+    debug_assert_eq!(out.len(), n_row_groups * ncols_interleaved);
+    debug_assert_eq!(packed.len(), n_row_groups * nb * Q4_KX8_BLOCK_BYTES);
+
+    for x in 0..n_row_groups {
+        let mut sumf = [0f32; 8];
+        let mut sum_minf = [0f32; 8];
+        let group_off = x * nb * Q4_KX8_BLOCK_BYTES;
+        for l in 0..nb {
+            let blk = &packed[group_off + l * Q4_KX8_BLOCK_BYTES..][..Q4_KX8_BLOCK_BYTES];
+            let d = &blk[0..16];
+            let dmin = &blk[16..32];
+            let scales = &blk[32..128];
+            let qs = &blk[128..];
+            let da = act.d[l];
+            let q8 = &act.q[l * Q4_K_BLOCK_ELEMS..(l + 1) * Q4_K_BLOCK_ELEMS];
+            let bsums = &act.bsums[l * 16..(l + 1) * 16];
+
+            let mut all_scales = [[0u8; 8]; 8];
+            let mut all_mins = [[0u8; 8]; 8];
+            for sb in 0..8 {
+                decode_scales_mins(&scales[sb * 12..], &mut all_scales[sb], &mut all_mins[sb]);
+            }
+
+            let n_k = Q4_K_BLOCK_ELEMS / (2 * blocklen); // 32
+            for k in 0..n_k {
+                let sb_pair = k / 8;
+                let sc0 = &all_scales[sb_pair * 2];
+                let sc1 = &all_scales[sb_pair * 2 + 1];
+                for j in 0..ncols_interleaved {
+                    let mut sumi = 0i32;
+                    for i in 0..blocklen {
+                        let qbyte = qs[k * ncols_interleaved * blocklen + j * blocklen + i];
+                        let v0 = (qbyte & 0x0F) as i32;
+                        let v1 = (qbyte >> 4) as i32;
+                        let a0 = q8[(k / 8) * 64 + (k % 8) * blocklen + i] as i32;
+                        let a1 = q8[(k / 8) * 64 + (k % 8) * blocklen + i + 32] as i32;
+                        sumi += v0 * a0 * sc0[j] as i32 + v1 * a1 * sc1[j] as i32;
+                    }
+                    sumf[j] += sumi as f32 * f16_from_bytes(&d[j * 2..]) * da;
+                }
+            }
+            for sb in 0..8 {
+                let mins = &all_mins[sb];
+                let bsum = bsums[sb * 2] as i32 + bsums[sb * 2 + 1] as i32;
+                for j in 0..ncols_interleaved {
+                    sum_minf[j] +=
+                        mins[j] as f32 * bsum as f32 * f16_from_bytes(&dmin[j * 2..]) * da;
+                }
+            }
+        }
+        let base = x * ncols_interleaved;
+        for j in 0..ncols_interleaved {
+            out[base + j] = sumf[j] - sum_minf[j];
+        }
+    }
+}
+
+/// Scalar GEMV for interleave=8 (`ggml_gemv_q4_K_8x8_q8_K_generic`).
+fn gemv_q4_kx8_q8_k_scalar_8(
+    packed: &[u8],
+    act: &Q8KActivations,
+    n_cols: usize,
+    n_row_groups: usize,
+    out: &mut [f32],
+) {
+    let nb = n_cols / Q4_K_BLOCK_ELEMS;
+    let blocklen = 8;
+    let ncols_interleaved = Q4_KX8_NROWS;
+    debug_assert_eq!(act.n_blocks(), nb);
+    debug_assert_eq!(out.len(), n_row_groups * ncols_interleaved);
+
+    for x in 0..n_row_groups {
+        let mut sumf = [0f32; 8];
+        let mut sum_minf = [0f32; 8];
+        let group_off = x * nb * Q4_KX8_BLOCK_BYTES;
+        for l in 0..nb {
+            let blk = &packed[group_off + l * Q4_KX8_BLOCK_BYTES..][..Q4_KX8_BLOCK_BYTES];
+            let d = &blk[0..16];
+            let dmin = &blk[16..32];
+            let scales = &blk[32..128];
+            let qs = &blk[128..];
+            let da = act.d[l];
+            let q8 = &act.q[l * Q4_K_BLOCK_ELEMS..(l + 1) * Q4_K_BLOCK_ELEMS];
+            let bsums = &act.bsums[l * 16..(l + 1) * 16];
+
+            let mut all_scales = [[0u8; 8]; 8];
+            let mut all_mins = [[0u8; 8]; 8];
+            for sb in 0..8 {
+                decode_scales_mins(&scales[sb * 12..], &mut all_scales[sb], &mut all_mins[sb]);
+            }
+
+            let n_k = Q4_K_BLOCK_ELEMS / (2 * blocklen); // 16
+            for k in 0..n_k {
+                let sb_pair = k / 4;
+                let sc0 = &all_scales[sb_pair * 2];
+                let sc1 = &all_scales[sb_pair * 2 + 1];
+                for j in 0..ncols_interleaved {
+                    let mut sumi = 0i32;
+                    for i in 0..blocklen {
+                        let qbyte = qs[k * ncols_interleaved * blocklen + j * blocklen + i];
+                        let v0 = (qbyte & 0x0F) as i32;
+                        let v1 = (qbyte >> 4) as i32;
+                        let a0 = q8[(k >> 2) * 64 + (k % 4) * blocklen + i] as i32;
+                        let a1 = q8[(k >> 2) * 64 + (k % 4) * blocklen + i + 32] as i32;
+                        sumi += v0 * a0 * sc0[j] as i32 + v1 * a1 * sc1[j] as i32;
+                    }
+                    sumf[j] += sumi as f32 * f16_from_bytes(&d[j * 2..]) * da;
+                }
+            }
+            for sb in 0..8 {
+                let mins = &all_mins[sb];
+                let bsum = bsums[sb * 2] as i32 + bsums[sb * 2 + 1] as i32;
+                for j in 0..ncols_interleaved {
+                    sum_minf[j] +=
+                        mins[j] as f32 * bsum as f32 * f16_from_bytes(&dmin[j * 2..]) * da;
+                }
+            }
+        }
+        let base = x * ncols_interleaved;
+        for j in 0..ncols_interleaved {
+            out[base + j] = sumf[j] - sum_minf[j];
+        }
+    }
+}
+
+/// GEMV: interleaved Q4_K weights × Q8_K activation → `n_row_groups * 8` f32s.
+/// Dispatches to NEON (interleave 4) / AVX2 (interleave 8) when available.
+pub fn gemv_q4_kx8_q8_k(
+    packed: &[u8],
+    act: &Q8KActivations,
+    n_cols: usize,
+    n_row_groups: usize,
+    interleave: usize,
+    out: &mut [f32],
+) {
+    assert!(n_cols.is_multiple_of(Q4_K_BLOCK_ELEMS));
+    assert_eq!(out.len(), n_row_groups * Q4_KX8_NROWS);
+    match interleave {
+        4 => {
+            #[cfg(target_arch = "aarch64")]
+            {
+                if std::arch::is_aarch64_feature_detected!("dotprod") {
+                    unsafe {
+                        neon::gemv_q4_kx8_q8_k_neon_sdot(packed, act, n_cols, n_row_groups, out);
+                    }
+                    return;
+                }
+            }
+            gemv_q4_kx8_q8_k_scalar_4(packed, act, n_cols, n_row_groups, out);
+        }
+        8 => {
+            #[cfg(target_arch = "x86_64")]
+            {
+                if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+                    unsafe {
+                        avx2::gemv_q4_kx8_q8_k_avx2(packed, act, n_cols, n_row_groups, out);
+                    }
+                    return;
+                }
+            }
+            gemv_q4_kx8_q8_k_scalar_8(packed, act, n_cols, n_row_groups, out);
+        }
+        _ => panic!("q4_kx8 interleave must be 4 or 8, got {interleave}"),
+    }
+}
+
+/// One row-group (8 outputs) starting at `group` within a packed matrix.
+#[inline]
+pub fn gemv_q4_kx8_group(
+    packed: &[u8],
+    group: usize,
+    act: &Q8KActivations,
+    n_cols: usize,
+    interleave: usize,
+    out8: &mut [f32],
+) {
+    debug_assert_eq!(out8.len(), Q4_KX8_NROWS);
+    let nb = n_cols / Q4_K_BLOCK_ELEMS;
+    let off = group * nb * Q4_KX8_BLOCK_BYTES;
+    let slice = &packed[off..off + nb * Q4_KX8_BLOCK_BYTES];
+    gemv_q4_kx8_q8_k(slice, act, n_cols, 1, interleave, out8);
+}
+
+#[cfg(target_arch = "aarch64")]
+mod neon {
+    use super::*;
+    use std::arch::aarch64::*;
+
+    #[target_feature(enable = "neon,dotprod")]
+    unsafe fn sdot_lane(mut acc: int32x4_t, a: int8x16_t, b: int8x16_t, lane: u32) -> int32x4_t {
+        // sdot Vd.4S, Vn.16B, Vm.4B[lane]
+        match lane {
+            0 => std::arch::asm!(
+                "sdot {acc:v}.4s, {a:v}.16b, {b:v}.4b[0]",
+                acc = inout(vreg) acc,
+                a = in(vreg) a,
+                b = in(vreg) b,
+                options(pure, nomem, nostack),
+            ),
+            1 => std::arch::asm!(
+                "sdot {acc:v}.4s, {a:v}.16b, {b:v}.4b[1]",
+                acc = inout(vreg) acc,
+                a = in(vreg) a,
+                b = in(vreg) b,
+                options(pure, nomem, nostack),
+            ),
+            2 => std::arch::asm!(
+                "sdot {acc:v}.4s, {a:v}.16b, {b:v}.4b[2]",
+                acc = inout(vreg) acc,
+                a = in(vreg) a,
+                b = in(vreg) b,
+                options(pure, nomem, nostack),
+            ),
+            3 => std::arch::asm!(
+                "sdot {acc:v}.4s, {a:v}.16b, {b:v}.4b[3]",
+                acc = inout(vreg) acc,
+                a = in(vreg) a,
+                b = in(vreg) b,
+                options(pure, nomem, nostack),
+            ),
+            _ => unreachable!(),
+        }
+        acc
+    }
+
+    /// NEON DotProd GEMV for interleave-4 packed weights (Apple Silicon path).
+    #[target_feature(enable = "neon,dotprod")]
+    pub unsafe fn gemv_q4_kx8_q8_k_neon_sdot(
+        packed: &[u8],
+        act: &Q8KActivations,
+        n_cols: usize,
+        n_row_groups: usize,
+        out: &mut [f32],
+    ) {
+        let nb = n_cols / Q4_K_BLOCK_ELEMS;
+        let m4b = vdupq_n_u8(0x0f);
+
+        for x in 0..n_row_groups {
+            let mut acc_f32 = [vdupq_n_f32(0.0), vdupq_n_f32(0.0)];
+            let group_off = x * nb * Q4_KX8_BLOCK_BYTES;
+
+            for b in 0..nb {
+                let blk = packed.as_ptr().add(group_off + b * Q4_KX8_BLOCK_BYTES);
+                let mut d_arr = [0f32; 8];
+                let mut dmin_arr = [0f32; 8];
+                for j in 0..8 {
+                    d_arr[j] = f16_from_bytes(std::slice::from_raw_parts(blk.add(j * 2), 2));
+                    dmin_arr[j] =
+                        f16_from_bytes(std::slice::from_raw_parts(blk.add(16 + j * 2), 2));
+                }
+                let q8_d = act.d[b];
+                let sb_scale_0123 = vmulq_n_f32(vld1q_f32(d_arr.as_ptr()), q8_d);
+                let sb_scale_4567 = vmulq_n_f32(vld1q_f32(d_arr.as_ptr().add(4)), q8_d);
+                let sb_min_0123 = vmulq_n_f32(vld1q_f32(dmin_arr.as_ptr()), q8_d);
+                let sb_min_4567 = vmulq_n_f32(vld1q_f32(dmin_arr.as_ptr().add(4)), q8_d);
+
+                let mut bias_acc = [vdupq_n_s32(0), vdupq_n_s32(0)];
+                let q8_base = act.q.as_ptr().add(b * Q4_K_BLOCK_ELEMS);
+                let bsums_ptr = act.bsums.as_ptr().add(b * 16);
+                // Pairwise-add 16 bsums → 8 (matching llama vpaddq_s16).
+                let mut bsums_arr = [0i16; 8];
+                for (i, slot) in bsums_arr.iter_mut().enumerate() {
+                    *slot = *bsums_ptr.add(2 * i) + *bsums_ptr.add(2 * i + 1);
+                }
+
+                let scales_base = blk.add(32);
+                let qs_base = blk.add(128);
+
+                for sb in 0..4 {
+                    let mut acc_lo = [vdupq_n_s32(0), vdupq_n_s32(0)];
+                    let mut acc_hi = [vdupq_n_s32(0), vdupq_n_s32(0)];
+
+                    let mut q4sb_mins = [vdupq_n_s16(0); 2];
+                    let mut q4sb_scales = [vdupq_n_s16(0); 2];
+                    for i in 0..2 {
+                        let mut sc = [0u8; 8];
+                        let mut mn = [0u8; 8];
+                        let offset = sb * 24 + i * 12;
+                        decode_scales_mins(
+                            std::slice::from_raw_parts(scales_base.add(offset), 12),
+                            &mut sc,
+                            &mut mn,
+                        );
+                        let mut sc_i8 = [0i8; 8];
+                        let mut mn_i8 = [0i8; 8];
+                        for t in 0..8 {
+                            sc_i8[t] = sc[t] as i8;
+                            mn_i8[t] = mn[t] as i8;
+                        }
+                        q4sb_scales[i] = vmovl_s8(vld1_s8(sc_i8.as_ptr()));
+                        q4sb_mins[i] = vmovl_s8(vld1_s8(mn_i8.as_ptr()));
+                    }
+
+                    let mut q8_qs = [vdupq_n_s8(0); 4];
+                    for (i, slot) in q8_qs.iter_mut().enumerate() {
+                        *slot = vld1q_s8(q8_base.add(sb * 64 + i * 16));
+                    }
+
+                    for c in 0..2 {
+                        let mut q4_cols = [vdupq_n_u8(0); 8];
+                        for (i, slot) in q4_cols.iter_mut().enumerate() {
+                            *slot = vld1q_u8(qs_base.add(sb * Q4_K_BLOCK_ELEMS + i * 32 + 16 * c));
+                        }
+
+                        acc_lo[c] = sdot_lane(
+                            acc_lo[c],
+                            vreinterpretq_s8_u8(vandq_u8(q4_cols[0], m4b)),
+                            q8_qs[0],
+                            0,
+                        );
+                        acc_lo[c] = sdot_lane(
+                            acc_lo[c],
+                            vreinterpretq_s8_u8(vandq_u8(q4_cols[1], m4b)),
+                            q8_qs[0],
+                            1,
+                        );
+                        acc_lo[c] = sdot_lane(
+                            acc_lo[c],
+                            vreinterpretq_s8_u8(vandq_u8(q4_cols[2], m4b)),
+                            q8_qs[0],
+                            2,
+                        );
+                        acc_lo[c] = sdot_lane(
+                            acc_lo[c],
+                            vreinterpretq_s8_u8(vandq_u8(q4_cols[3], m4b)),
+                            q8_qs[0],
+                            3,
+                        );
+                        acc_lo[c] = sdot_lane(
+                            acc_lo[c],
+                            vreinterpretq_s8_u8(vandq_u8(q4_cols[4], m4b)),
+                            q8_qs[1],
+                            0,
+                        );
+                        acc_lo[c] = sdot_lane(
+                            acc_lo[c],
+                            vreinterpretq_s8_u8(vandq_u8(q4_cols[5], m4b)),
+                            q8_qs[1],
+                            1,
+                        );
+                        acc_lo[c] = sdot_lane(
+                            acc_lo[c],
+                            vreinterpretq_s8_u8(vandq_u8(q4_cols[6], m4b)),
+                            q8_qs[1],
+                            2,
+                        );
+                        acc_lo[c] = sdot_lane(
+                            acc_lo[c],
+                            vreinterpretq_s8_u8(vandq_u8(q4_cols[7], m4b)),
+                            q8_qs[1],
+                            3,
+                        );
+
+                        acc_hi[c] = sdot_lane(
+                            acc_hi[c],
+                            vreinterpretq_s8_u8(vshrq_n_u8(q4_cols[0], 4)),
+                            q8_qs[2],
+                            0,
+                        );
+                        acc_hi[c] = sdot_lane(
+                            acc_hi[c],
+                            vreinterpretq_s8_u8(vshrq_n_u8(q4_cols[1], 4)),
+                            q8_qs[2],
+                            1,
+                        );
+                        acc_hi[c] = sdot_lane(
+                            acc_hi[c],
+                            vreinterpretq_s8_u8(vshrq_n_u8(q4_cols[2], 4)),
+                            q8_qs[2],
+                            2,
+                        );
+                        acc_hi[c] = sdot_lane(
+                            acc_hi[c],
+                            vreinterpretq_s8_u8(vshrq_n_u8(q4_cols[3], 4)),
+                            q8_qs[2],
+                            3,
+                        );
+                        acc_hi[c] = sdot_lane(
+                            acc_hi[c],
+                            vreinterpretq_s8_u8(vshrq_n_u8(q4_cols[4], 4)),
+                            q8_qs[3],
+                            0,
+                        );
+                        acc_hi[c] = sdot_lane(
+                            acc_hi[c],
+                            vreinterpretq_s8_u8(vshrq_n_u8(q4_cols[5], 4)),
+                            q8_qs[3],
+                            1,
+                        );
+                        acc_hi[c] = sdot_lane(
+                            acc_hi[c],
+                            vreinterpretq_s8_u8(vshrq_n_u8(q4_cols[6], 4)),
+                            q8_qs[3],
+                            2,
+                        );
+                        acc_hi[c] = sdot_lane(
+                            acc_hi[c],
+                            vreinterpretq_s8_u8(vshrq_n_u8(q4_cols[7], 4)),
+                            q8_qs[3],
+                            3,
+                        );
+                    }
+
+                    let sc_0123_lo = vget_low_s16(q4sb_scales[0]);
+                    let sc_0123_hi = vget_low_s16(q4sb_scales[1]);
+                    let sumf_0123 = vcvtq_f32_s32(vaddq_s32(
+                        vmulq_s32(vmovl_s16(sc_0123_lo), acc_lo[0]),
+                        vmulq_s32(vmovl_s16(sc_0123_hi), acc_hi[0]),
+                    ));
+                    acc_f32[0] = vfmaq_f32(acc_f32[0], sb_scale_0123, sumf_0123);
+
+                    let sc_4567_lo = vget_high_s16(q4sb_scales[0]);
+                    let sc_4567_hi = vget_high_s16(q4sb_scales[1]);
+                    let sumf_4567 = vcvtq_f32_s32(vaddq_s32(
+                        vmulq_s32(vmovl_s16(sc_4567_lo), acc_lo[1]),
+                        vmulq_s32(vmovl_s16(sc_4567_hi), acc_hi[1]),
+                    ));
+                    acc_f32[1] = vfmaq_f32(acc_f32[1], sb_scale_4567, sumf_4567);
+
+                    let bsums_vec_lo = vdup_n_s16(bsums_arr[2 * sb]);
+                    let bsums_vec_hi = vdup_n_s16(bsums_arr[2 * sb + 1]);
+                    bias_acc[0] = vmlal_s16(bias_acc[0], bsums_vec_lo, vget_low_s16(q4sb_mins[0]));
+                    bias_acc[0] = vmlal_s16(bias_acc[0], bsums_vec_hi, vget_low_s16(q4sb_mins[1]));
+                    bias_acc[1] = vmlal_s16(bias_acc[1], bsums_vec_lo, vget_high_s16(q4sb_mins[0]));
+                    bias_acc[1] = vmlal_s16(bias_acc[1], bsums_vec_hi, vget_high_s16(q4sb_mins[1]));
+                }
+
+                acc_f32[0] = vmlsq_f32(acc_f32[0], vcvtq_f32_s32(bias_acc[0]), sb_min_0123);
+                acc_f32[1] = vmlsq_f32(acc_f32[1], vcvtq_f32_s32(bias_acc[1]), sb_min_4567);
+            }
+
+            let base = x * Q4_KX8_NROWS;
+            vst1q_f32(out.as_mut_ptr().add(base), acc_f32[0]);
+            vst1q_f32(out.as_mut_ptr().add(base + 4), acc_f32[1]);
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+mod avx2 {
+    use super::*;
+    use std::arch::x86_64::*;
+
+    /// AVX2 GEMV for interleave-8 packed weights. Accumulates 8 f32 outputs
+    /// in `__m256` lanes; inner int dots use maddubs over nibble×act pairs.
+    #[target_feature(enable = "avx2,fma")]
+    pub unsafe fn gemv_q4_kx8_q8_k_avx2(
+        packed: &[u8],
+        act: &Q8KActivations,
+        n_cols: usize,
+        n_row_groups: usize,
+        out: &mut [f32],
+    ) {
+        let nb = n_cols / Q4_K_BLOCK_ELEMS;
+        let blocklen = 8;
+        let ncols = Q4_KX8_NROWS;
+
+        for x in 0..n_row_groups {
+            let mut acc = _mm256_setzero_ps();
+            let mut acc_min = _mm256_setzero_ps();
+            let group_off = x * nb * Q4_KX8_BLOCK_BYTES;
+
+            for l in 0..nb {
+                let blk = packed.as_ptr().add(group_off + l * Q4_KX8_BLOCK_BYTES);
+                let mut d_arr = [0f32; 8];
+                let mut dmin_arr = [0f32; 8];
+                for j in 0..8 {
+                    d_arr[j] = f16_from_bytes(std::slice::from_raw_parts(blk.add(j * 2), 2));
+                    dmin_arr[j] =
+                        f16_from_bytes(std::slice::from_raw_parts(blk.add(16 + j * 2), 2));
+                }
+                let da = act.d[l];
+                let d_vec = _mm256_mul_ps(_mm256_loadu_ps(d_arr.as_ptr()), _mm256_set1_ps(da));
+                let dmin_vec =
+                    _mm256_mul_ps(_mm256_loadu_ps(dmin_arr.as_ptr()), _mm256_set1_ps(da));
+
+                let scales = std::slice::from_raw_parts(blk.add(32), 96);
+                let qs = std::slice::from_raw_parts(blk.add(128), 1024);
+                let q8 = &act.q[l * Q4_K_BLOCK_ELEMS..(l + 1) * Q4_K_BLOCK_ELEMS];
+                let bsums = &act.bsums[l * 16..(l + 1) * 16];
+
+                let mut all_scales = [[0u8; 8]; 8];
+                let mut all_mins = [[0u8; 8]; 8];
+                for sb in 0..8 {
+                    decode_scales_mins(&scales[sb * 12..], &mut all_scales[sb], &mut all_mins[sb]);
+                }
+
+                let mut isum = [0i32; 8];
+                let n_k = Q4_K_BLOCK_ELEMS / (2 * blocklen);
+                for k in 0..n_k {
+                    let sb_pair = k / 4;
+                    let sc0 = &all_scales[sb_pair * 2];
+                    let sc1 = &all_scales[sb_pair * 2 + 1];
+                    for j in 0..ncols {
+                        let mut s = 0i32;
+                        for i in 0..blocklen {
+                            let qbyte = qs[k * ncols * blocklen + j * blocklen + i];
+                            let v0 = (qbyte & 0x0F) as i32;
+                            let v1 = (qbyte >> 4) as i32;
+                            let a0 = q8[(k >> 2) * 64 + (k % 4) * blocklen + i] as i32;
+                            let a1 = q8[(k >> 2) * 64 + (k % 4) * blocklen + i + 32] as i32;
+                            s += v0 * a0 * sc0[j] as i32 + v1 * a1 * sc1[j] as i32;
+                        }
+                        isum[j] += s;
+                    }
+                }
+
+                let isum_ps =
+                    _mm256_cvtepi32_ps(_mm256_loadu_si256(isum.as_ptr() as *const __m256i));
+                acc = _mm256_fmadd_ps(isum_ps, d_vec, acc);
+
+                let mut minsum = [0i32; 8];
+                for sb in 0..8 {
+                    let bsum = bsums[sb * 2] as i32 + bsums[sb * 2 + 1] as i32;
+                    for j in 0..ncols {
+                        minsum[j] += all_mins[sb][j] as i32 * bsum;
+                    }
+                }
+                let minsum_ps =
+                    _mm256_cvtepi32_ps(_mm256_loadu_si256(minsum.as_ptr() as *const __m256i));
+                acc_min = _mm256_fmadd_ps(minsum_ps, dmin_vec, acc_min);
+            }
+
+            _mm256_storeu_ps(out.as_mut_ptr().add(x * ncols), _mm256_sub_ps(acc, acc_min));
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{dot_q4_k_q8_scalar, quantize_activations_q8_k};
+
+    fn synth_q4_k_row(n_blocks: usize, seed: u8) -> Vec<u8> {
+        let mut weights = Vec::with_capacity(n_blocks * Q4_K_BLOCK_BYTES);
+        for b in 0..n_blocks {
+            weights.extend_from_slice(
+                &f16::from_f32(0.05 + (b as f32 + seed as f32) * 0.01).to_le_bytes(),
+            );
+            weights.extend_from_slice(
+                &f16::from_f32(0.01 + (b as f32 + seed as f32) * 0.002).to_le_bytes(),
+            );
+            for i in 0..12u8 {
+                weights.push(20 + i.wrapping_mul(3).wrapping_add(seed));
+            }
+            for i in 0..128u8 {
+                weights.push(i.wrapping_mul(17).wrapping_add(b as u8).wrapping_add(seed));
+            }
+        }
+        weights
+    }
+
+    #[test]
+    fn pack_and_gemv_matches_scalar_row_dots() {
+        let n_blocks = 2;
+        let cols = n_blocks * Q4_K_BLOCK_ELEMS;
+        let rows = 16; // two full groups
+        let mut matrix = Vec::new();
+        for r in 0..rows {
+            matrix.extend_from_slice(&synth_q4_k_row(n_blocks, r as u8));
+        }
+        let x: Vec<f32> = (0..cols)
+            .map(|i| ((i as f32) * 0.017 - 2.1).sin() * 1.8)
+            .collect();
+        let act = quantize_activations_q8_k(&x);
+
+        let mut reference = vec![0f32; rows];
+        let row_bytes = n_blocks * Q4_K_BLOCK_BYTES;
+        for r in 0..rows {
+            reference[r] = dot_q4_k_q8_scalar(&matrix[r * row_bytes..(r + 1) * row_bytes], &act);
+        }
+
+        for &interleave in &[4usize, 8] {
+            let packed = pack_q4_k_matrix_x8(&matrix, rows, cols, interleave);
+            let n_groups = rows / Q4_KX8_NROWS;
+            let mut out = vec![0f32; rows];
+            gemv_q4_kx8_q8_k(&packed, &act, cols, n_groups, interleave, &mut out);
+            for r in 0..rows {
+                let err = (out[r] - reference[r]).abs();
+                let scale = reference[r].abs().max(1.0);
+                assert!(
+                    err / scale < 1e-4 || err < 1e-3,
+                    "interleave={interleave} row {r}: got {} want {} err={err}",
+                    out[r],
+                    reference[r]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn block_size_matches_ggml() {
+        assert_eq!(Q4_KX8_BLOCK_BYTES, 16 + 16 + 96 + 1024);
+    }
+}

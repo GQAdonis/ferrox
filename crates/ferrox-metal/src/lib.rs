@@ -24,6 +24,9 @@ pub mod attn;
 mod moe_ranges;
 
 #[cfg(feature = "metal")]
+pub use moe_ranges::{moe_barrier_stats, moe_barrier_stats_reset};
+
+#[cfg(feature = "metal")]
 pub mod elem;
 
 #[cfg(feature = "metal")]

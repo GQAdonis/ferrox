@@ -37,7 +37,7 @@ Architecture list: `ferrox archs` →
 | Llama-3.2-1B IQ4_XS | ~0.94× | |
 | Llama-3.1-8B-Instruct Q4_K_M | **~0.92×** | CLI ~1.00× |
 | Mistral-7B-Instruct-v0.2 Q4_K_M | ~0.95× | CPU pin exists |
-| OLMoE-1B-7B-0924 Q4_0 | **~1.42×** | CPU ~1.38×; Concurrent + `MoeMemRanges` |
+| OLMoE-1B-7B-0924 Q4_0 | **~1.41×** | CPU **~0.96×** (ahead); Metal fused encode + `mul_mm_id` (gated) |
 | SmolLM2-135M / Qwen2.5-0.5B / Qwen3-0.6B | ahead | Small Q8 pins |
 | Gemma-2-2B-IT Q4_K_M | ~1.10× | Softcap + FA-vec |
 | Gemma-3-1B-IT Q8_0 | ~0.82× | GeGLU + SWA |
@@ -52,9 +52,9 @@ Architecture list: `ferrox archs` →
 | MiroThinker | Works via `qwen3moe` |
 | Qwen2-MoE | Loads; suite entry; GGUF not on Host B |
 | Mixtral | Suite entry; skipped on 32 GiB Host B (`--fit-host`) |
-| MLA (`deepseek2` / `mistral4`) | Dense-lead on CLI + server; MoE-after-dense refused |
+| MLA (`deepseek2` / `mistral4`) | Dense-lead + MoE-after-dense via `MlaEngine` |
 | GLM4 / glm4moe | Loads via GLM-5.2 path when tensors present; no e2e pin |
-| Gemma-4-E2B | Refused (needs dedicated engine) |
+| Gemma-4-E2B | Dedicated `Gemma4Engine` loads (per-layer emb + shared KV + SWA/full head-dim). Tokenizer `gemma4` still falls back to byte; suite `expect=refuse` until fair-chat pin. GGUF: `models/gemma-4-E2B-it-Q4_K_M.gguf` |
 | Llama 4 / MiniMax | Refused (stubs) |
 | Hybrid GDN / Qwen3.5 | Scaffold only |
 | Kimi K3 / GLM-5.2 / DeepSeek V4 | Loaders/primitives; no frontier e2e pin |
@@ -66,8 +66,8 @@ Architecture list: `ferrox archs` →
 
 | Backend | What it covers |
 |---|---|
-| CPU | Dense + MoE; `FERROX_CPU_INT_DOT=1` on suite runs |
-| Metal | Dense + MoE + FA-vec attn; concurrent encode; quantized KV |
+| CPU | Dense + MoE; `FERROX_CPU_INT_DOT=1` (+ interleaved Q4_K) on suite runs |
+| Metal | Dense + MoE + FA-vec; fused MoE encode groups; `mul_mm_id` prefill; quantized KV |
 | CUDA | Matvec + resident weights + FFN fuse |
 
 Capabilities overview: [`FEATURES.md`](FEATURES.md).

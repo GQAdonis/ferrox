@@ -10,18 +10,21 @@ What ships today: [`FEATURES.md`](FEATURES.md) · [`MODELS.md`](MODELS.md).
 
 **Performance**
 
-- Close the Metal MoE gap: fuse/reorder to cut barrier stages (not more `mul_mv_id` tweaks); `mul_mm_id` prefill
-- Improve Metal prefill `prompt_per_second` vs llama.cpp
+- Re-pin OLMoE Metal after fused encode groups + `mul_mm_id` prefill; chase Gap ≤ ~1.05×
+- Deferred MoE residual (dense-style) — correct tokens then land
+- Improve Metal dense prefill `prompt_per_second` (true simdgroup `mul_mm`)
+- CPU: extend interleaved repack beyond Q4_K (Q8_0 / Q5_K / Q6_K); re-pin Host B CPU suite
 - CUDA fair-chat pins on a GPU host
 
 **Models**
 
-- Gemma-4 dedicated engine
-- MLA MoE-after-dense; HybridEngine + Qwen3.5
+- Gemma-4 tokenizer (`gemma4`) + fair-chat pin (engine loads today)
+- HybridEngine + Qwen3.5
 - Llama 4 / MiniMax engines
 - Vision (projector + generate)
 - Real GLM-5.2 / DeepSeek V4 / full Kimi e2e
 - MTP draft heads
+- Qwen2-MoE / Mixtral pins when GGUF fits Host B
 
 **Serving**
 

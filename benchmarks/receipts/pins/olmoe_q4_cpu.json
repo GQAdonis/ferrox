@@ -8,55 +8,41 @@
   "host": "Host B (Apple M2 Pro, 10 logical cores, 32 GiB unified)",
   "model": "~/Desktop/Dev/ferrox/models/olmoe-1b-7b-0924-q4_0.gguf",
   "max_tokens": 512,
-  "reps": 5,
+  "reps": 3,
   "mode": "server",
   "workload": "greedy chat, warm then 3x 512-tok capitals list (median)",
-  "notes": "Quiet interleaved fair-chat pin (pre-thermal). Later same-day pins saw llama collapse to ~8 tok/s — discard those.",
+  "notes": "Verified MoE; Metal/CUDA expert placement when budget set",
   "ferrox": {
-    "wall_s": 16.321,
-    "predicted_per_second": 32.911,
-    "prompt_per_second": 68.6,
+    "wall_s": 17.303,
+    "predicted_per_second": 31.08,
+    "prompt_per_second": 63.079,
     "completion_tokens": 512,
-    "wall_tok_s": 31.371,
+    "wall_tok_s": 29.59,
     "prefix": "Write a detailed numbered list of 80 European capital cities",
-    "predicted_stddev": 0.21,
-    "prompt_stddev": 0.994,
-    "wall_tok_s_stddev": 0.146,
-    "reps": 5,
+    "predicted_stddev": 0.697,
+    "prompt_stddev": 8.418,
+    "wall_tok_s_stddev": 0.78,
+    "reps": 3,
     "runs": [
       {
-        "predicted_per_second": 31.704953210037498,
-        "prompt_per_second": 63.84733496572119,
-        "wall_tok_s": 30.068,
-        "wall_s": 17.028,
+        "predicted_per_second": 31.811834984307506,
+        "prompt_per_second": 63.07875655140983,
+        "wall_tok_s": 30.172,
+        "wall_s": 16.97,
         "completion_tokens": 512
       },
       {
-        "predicted_per_second": 33.27925670780143,
-        "prompt_per_second": 68.6001133632519,
-        "wall_tok_s": 31.57,
-        "wall_s": 16.218,
+        "predicted_per_second": 31.079521062781208,
+        "prompt_per_second": 67.69005569622395,
+        "wall_tok_s": 29.59,
+        "wall_s": 17.303,
         "completion_tokens": 512
       },
       {
-        "predicted_per_second": 32.90456218183349,
-        "prompt_per_second": 73.80950857689818,
-        "wall_tok_s": 31.371,
-        "wall_s": 16.321,
-        "completion_tokens": 512
-      },
-      {
-        "predicted_per_second": 33.271588560454084,
-        "prompt_per_second": 70.06423728766835,
-        "wall_tok_s": 31.654,
-        "wall_s": 16.175,
-        "completion_tokens": 512
-      },
-      {
-        "predicted_per_second": 32.910998992019536,
-        "prompt_per_second": 68.16647723161331,
-        "wall_tok_s": 31.285,
-        "wall_s": 16.365,
+        "predicted_per_second": 30.418909073933094,
+        "prompt_per_second": 51.362330311665566,
+        "wall_tok_s": 28.627,
+        "wall_s": 17.885,
         "completion_tokens": 512
       }
     ],
@@ -64,50 +50,36 @@
     "engine": "ferrox"
   },
   "llama": {
-    "wall_s": 11.369,
-    "predicted_per_second": 45.575,
-    "prompt_per_second": 152.814,
+    "wall_s": 17.405,
+    "predicted_per_second": 29.785,
+    "prompt_per_second": 109.866,
     "completion_tokens": 512,
-    "wall_tok_s": 45.033,
+    "wall_tok_s": 29.418,
     "prefix": "Write a detailed numbered list of 80 European capital cities",
-    "predicted_stddev": 1.014,
-    "prompt_stddev": 15.864,
-    "wall_tok_s_stddev": 0.936,
-    "reps": 5,
+    "predicted_stddev": 0.65,
+    "prompt_stddev": 47.565,
+    "wall_tok_s_stddev": 0.67,
+    "reps": 3,
     "runs": [
       {
-        "predicted_per_second": 40.45231694990794,
-        "prompt_per_second": 127.11428926884943,
-        "wall_tok_s": 39.285,
-        "wall_s": 13.033,
+        "predicted_per_second": 29.9306386678013,
+        "prompt_per_second": 168.5937873189373,
+        "wall_tok_s": 29.432,
+        "wall_s": 17.396,
         "completion_tokens": 512
       },
       {
-        "predicted_per_second": 45.5747253254921,
-        "prompt_per_second": 171.28567024082767,
-        "wall_tok_s": 45.033,
-        "wall_s": 11.369,
+        "predicted_per_second": 29.78450041357989,
+        "prompt_per_second": 109.8659635245001,
+        "wall_tok_s": 29.418,
+        "wall_s": 17.405,
         "completion_tokens": 512
       },
       {
-        "predicted_per_second": 47.278957484212796,
-        "prompt_per_second": 152.81395991908138,
-        "wall_tok_s": 46.583,
-        "wall_s": 10.991,
-        "completion_tokens": 512
-      },
-      {
-        "predicted_per_second": 54.14752026566127,
-        "prompt_per_second": 123.661802635763,
-        "wall_tok_s": 53.014,
-        "wall_s": 9.658,
-        "completion_tokens": 512
-      },
-      {
-        "predicted_per_second": 45.47521600727604,
-        "prompt_per_second": 156.07672403170824,
-        "wall_tok_s": 44.899,
-        "wall_s": 11.403,
+        "predicted_per_second": 28.738549975131612,
+        "prompt_per_second": 74.41715421714926,
+        "wall_tok_s": 28.265,
+        "wall_s": 18.114,
         "completion_tokens": 512
       }
     ],

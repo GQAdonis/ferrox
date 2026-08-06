@@ -8,6 +8,8 @@
 use crate::capability::{resolve_profile, ArchPath, DecoderFamily};
 use crate::decoder::Decoder;
 use crate::engine::{Engine, Glm52Engine, KimiEngine, MlaEngine};
+use crate::gemma4_engine::Gemma4Engine;
+use crate::gemma4_gguf_loader;
 use crate::glm52_gguf_loader;
 use crate::loader::LoadError;
 use crate::mla_gguf_loader;
@@ -33,6 +35,8 @@ pub enum SelectedEngineKind {
     DedicatedStack,
     /// MLA memory engines (DeepSeek2 / Mistral4) — fail-closed for generic.
     Mla,
+    /// Gemma-4 dedicated text engine (per-layer emb + shared KV + SWA split).
+    Gemma4,
     /// Recurrent / hybrid SSM families — fail-closed until wired.
     RecurrentHybrid,
     /// T5 encoder-decoder — fail-closed until wired.
@@ -53,6 +57,7 @@ pub fn select_engine_kind(arch: &str) -> Result<SelectedEngineKind, EngineSelect
         ArchPath::DedicatedOnly { reason } => match profile.family {
             DecoderFamily::Dedicated => Ok(SelectedEngineKind::DedicatedStack),
             DecoderFamily::Mla => Ok(SelectedEngineKind::Mla),
+            DecoderFamily::GemmaFamily if is_gemma4_arch(arch) => Ok(SelectedEngineKind::Gemma4),
             DecoderFamily::Hybrid | DecoderFamily::Recurrent => {
                 Ok(SelectedEngineKind::RecurrentHybrid)
             }
@@ -82,6 +87,10 @@ pub fn ensure_generic_decoder(arch: &str) -> Result<(), EngineSelectError> {
             arch.to_string(),
             "use load_mla_engine_from_path / ServedEngine::Mla — not generic Decoder",
         )),
+        SelectedEngineKind::Gemma4 => Err(EngineSelectError::DedicatedUnavailable(
+            arch.to_string(),
+            "use load_gemma4_engine_from_path / ServedEngine::Gemma4 — not generic Decoder",
+        )),
         SelectedEngineKind::RecurrentHybrid => {
             let _ = crate::recurrent_engine::RecurrentEngine::reject(arch);
             let _ = crate::hybrid_engine::HybridEngine::reject(arch);
@@ -107,6 +116,7 @@ pub enum ServedEngine {
     Kimi(KimiEngine),
     Glm52(Glm52Engine),
     Mla(MlaEngine),
+    Gemma4(Gemma4Engine),
 }
 
 impl ServedEngine {
@@ -116,6 +126,7 @@ impl ServedEngine {
             Self::Kimi(k) => Engine::vocab_size(k),
             Self::Glm52(g) => Engine::vocab_size(g),
             Self::Mla(m) => Engine::vocab_size(m),
+            Self::Gemma4(g) => Engine::vocab_size(g),
         }
     }
 }
@@ -136,6 +147,7 @@ pub fn load_mla_engine_from_path(path: &std::path::Path) -> Result<ServedEngine,
                     SelectedEngineKind::DedicatedStack => "dedicated non-MLA stack",
                     SelectedEngineKind::RecurrentHybrid => "hybrid/recurrent, not MLA",
                     SelectedEngineKind::EncoderDecoder => "encoder-decoder, not MLA",
+                    SelectedEngineKind::Gemma4 => "gemma4 dedicated, not MLA",
                     SelectedEngineKind::Mla => unreachable!(),
                 },
             ));
@@ -155,6 +167,10 @@ pub fn load_mla_engine_from_path(path: &std::path::Path) -> Result<ServedEngine,
 
 fn is_glm52_arch(arch: &str) -> bool {
     matches!(arch, "glm-dsa" | "glm4" | "glm4moe")
+}
+
+fn is_gemma4_arch(arch: &str) -> bool {
+    crate::gemma4_engine::GEMMA4_ARCHES.contains(&arch)
 }
 
 /// Open a GLM-5.2 / GLM4-family GGUF and build [`ServedEngine::Glm52`].
@@ -179,6 +195,7 @@ pub fn load_glm52_engine_from_path(path: &std::path::Path) -> Result<ServedEngin
                     SelectedEngineKind::Mla => "MLA arch, not GLM DSA",
                     SelectedEngineKind::RecurrentHybrid => "hybrid/recurrent, not GLM DSA",
                     SelectedEngineKind::EncoderDecoder => "encoder-decoder, not GLM DSA",
+                    SelectedEngineKind::Gemma4 => "gemma4 dedicated, not GLM DSA",
                     SelectedEngineKind::DedicatedStack => unreachable!(),
                 },
             ));
@@ -194,6 +211,48 @@ pub fn load_glm52_engine_from_path(path: &std::path::Path) -> Result<ServedEngin
         }
     }
     Ok(ServedEngine::Glm52(glm52_gguf_loader::load_glm52_engine(
+        &file,
+    )?))
+}
+
+/// Open a Gemma-4 GGUF and build [`ServedEngine::Gemma4`].
+pub fn load_gemma4_engine_from_path(path: &std::path::Path) -> Result<ServedEngine, LoadError> {
+    let file = ferrox_gguf::ShardedGguf::open(path)?;
+    let arch = file
+        .metadata_str("general.architecture")
+        .unwrap_or("unknown");
+    if !is_gemma4_arch(arch) {
+        return Err(LoadError::DedicatedArchitectureRequired(
+            arch.to_string(),
+            "not a gemma4 / gemma4-assistant architecture",
+        ));
+    }
+    match select_engine_kind(arch) {
+        Ok(SelectedEngineKind::Gemma4) => {}
+        Ok(other) => {
+            return Err(LoadError::DedicatedArchitectureRequired(
+                arch.to_string(),
+                match other {
+                    SelectedEngineKind::GenericDecoder => "generic decoder arch, not Gemma4",
+                    SelectedEngineKind::Mla => "MLA arch, not Gemma4",
+                    SelectedEngineKind::DedicatedStack => "dedicated non-Gemma4 stack",
+                    SelectedEngineKind::RecurrentHybrid => "hybrid/recurrent, not Gemma4",
+                    SelectedEngineKind::EncoderDecoder => "encoder-decoder, not Gemma4",
+                    SelectedEngineKind::Gemma4 => unreachable!(),
+                },
+            ));
+        }
+        Err(EngineSelectError::Unknown(a)) => {
+            return Err(LoadError::UnsupportedArchitecture(a));
+        }
+        Err(EngineSelectError::OutOfScope(a, r)) => {
+            return Err(LoadError::UnsupportedFeature(a, r.to_string()));
+        }
+        Err(EngineSelectError::DedicatedUnavailable(a, r)) => {
+            return Err(LoadError::DedicatedArchitectureRequired(a, r));
+        }
+    }
+    Ok(ServedEngine::Gemma4(gemma4_gguf_loader::load_gemma4_engine(
         &file,
     )?))
 }
@@ -251,5 +310,18 @@ mod tests {
             SelectedEngineKind::DedicatedStack
         );
         assert!(ensure_generic_decoder("glm4").is_err());
+    }
+
+    #[test]
+    fn gemma4_selects_dedicated_engine() {
+        assert_eq!(
+            select_engine_kind("gemma4").unwrap(),
+            SelectedEngineKind::Gemma4
+        );
+        assert_eq!(
+            select_engine_kind("gemma4-assistant").unwrap(),
+            SelectedEngineKind::Gemma4
+        );
+        assert!(ensure_generic_decoder("gemma4").is_err());
     }
 }

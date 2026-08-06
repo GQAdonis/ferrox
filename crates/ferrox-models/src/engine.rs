@@ -133,9 +133,10 @@ impl Engine for Glm52Engine {
 /// Multi-layer MLA stack for DeepSeek-2 / Mistral-4-style GGUF serve.
 ///
 /// Uses [`crate::mla::mla_forward_token`] with asymmetric K/V caches
-/// (plain `Vec<f32>`, not [`KvCache`]). Fail-closed at GGUF load until a
-/// real DeepSeek-2 weight loader lands — this engine is the serve wire
-/// for synthetic / fixture weights and for future loader integration.
+/// (plain `Vec<f32>`, not [`KvCache`]). Layers
+/// `[0, leading_dense)` use dense SwiGLU; later layers use MoE
+/// (`ferrox_moe`) when the GGUF carries experts — fail-closed at load if
+/// expert tensors are missing.
 pub struct MlaEngine {
     pub embedding: WeightMatrix,
     pub layers: Vec<MlaLayerWeights>,
@@ -144,15 +145,43 @@ pub struct MlaEngine {
     pub mla_cfg: MlaConfig,
     pub rms_norm_eps: f32,
     pub hidden_dim: usize,
+    /// Present when any layer uses [`MlaLayerFfn::Moe`].
+    pub moe: Option<MlaMoeRuntime>,
+}
+
+/// MoE routing knobs shared by every MoE layer (DeepSeek-2 / Mistral-4).
+#[derive(Debug, Clone)]
+pub struct MlaMoeRuntime {
+    pub n_experts_active: usize,
+    pub gating: ferrox_moe::GatingFunction,
+    pub norm_topk_prob: bool,
+    pub expert_weights_scale: f32,
+}
+
+pub struct MlaDenseFfn {
+    pub gate: WeightMatrix,
+    pub up: WeightMatrix,
+    pub down: WeightMatrix,
+}
+
+pub struct MlaMoeFfn {
+    pub router: WeightMatrix,
+    pub experts: Vec<ferrox_moe::ExpertWeights>,
+    pub shared_expert: ferrox_moe::ExpertWeights,
+    /// Optional aux-loss-free bias (`ffn_exp_probs_b.bias`).
+    pub exp_probs_bias: Option<Vec<f32>>,
+}
+
+pub enum MlaLayerFfn {
+    Dense(MlaDenseFfn),
+    Moe(MlaMoeFfn),
 }
 
 pub struct MlaLayerWeights {
     pub attn_norm: Vec<f32>,
     pub attn: crate::mla::MlaAttnWeights,
     pub ffn_norm: Vec<f32>,
-    pub ffn_gate: WeightMatrix,
-    pub ffn_up: WeightMatrix,
-    pub ffn_down: WeightMatrix,
+    pub ffn: MlaLayerFfn,
 }
 
 pub struct MlaDecodeState {
@@ -166,6 +195,49 @@ impl MlaEngine {
                 .map(|_| (Vec::new(), Vec::new()))
                 .collect(),
         }
+    }
+
+    fn moe_ffn_forward(&self, ffn: &MlaMoeFfn, x: &[f32]) -> Vec<f32> {
+        use ferrox_moe::{
+            combine_expert_outputs, route_top_k, route_top_k_sigmoid_with_bias, run_expert,
+            GatingFunction,
+        };
+        let moe = self
+            .moe
+            .as_ref()
+            .expect("MlaLayerFfn::Moe requires MlaEngine.moe");
+        let router_logits = ffn.router.apply(x);
+        let decision = match (moe.gating, ffn.exp_probs_bias.as_deref()) {
+            (GatingFunction::Sigmoid, Some(bias)) => route_top_k_sigmoid_with_bias(
+                &router_logits,
+                bias,
+                moe.n_experts_active,
+                moe.norm_topk_prob,
+                moe.expert_weights_scale,
+            ),
+            _ => {
+                let mut d = route_top_k(
+                    &router_logits,
+                    moe.n_experts_active,
+                    moe.gating,
+                    moe.norm_topk_prob,
+                );
+                if (moe.expert_weights_scale - 1.0).abs() > f32::EPSILON {
+                    for w in d.weights.iter_mut() {
+                        *w *= moe.expert_weights_scale;
+                    }
+                }
+                d
+            }
+        };
+        let routed: Vec<(Vec<f32>, f32)> = decision
+            .expert_ids
+            .iter()
+            .zip(decision.weights.iter())
+            .map(|(&e, &w)| (run_expert(x, &ffn.experts[e]), w))
+            .collect();
+        let shared = run_expert(x, &ffn.shared_expert);
+        combine_expert_outputs(&routed, &[shared], x.len())
     }
 }
 
@@ -197,10 +269,14 @@ impl Engine for MlaEngine {
                 *h += a;
             }
             let ffn_in = rms_norm(&hidden, &layer.ffn_norm, self.rms_norm_eps);
-            let gate = layer.ffn_gate.apply(&ffn_in);
-            let up = layer.ffn_up.apply(&ffn_in);
-            let activated = swiglu(&gate, &up);
-            let down = layer.ffn_down.apply(&activated);
+            let down = match &layer.ffn {
+                MlaLayerFfn::Dense(d) => {
+                    let gate = d.gate.apply(&ffn_in);
+                    let up = d.up.apply(&ffn_in);
+                    d.down.apply(&swiglu(&gate, &up))
+                }
+                MlaLayerFfn::Moe(m) => self.moe_ffn_forward(m, &ffn_in),
+            };
             for (h, d) in hidden.iter_mut().zip(down.iter()) {
                 *h += d;
             }

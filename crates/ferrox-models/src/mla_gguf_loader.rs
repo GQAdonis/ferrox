@@ -3,8 +3,9 @@
 //! Tensor names follow llama.cpp `deepseek2` / `mistral4` (same graph):
 //! `blk.{i}.attn_q_a|attn_q_b|attn_kv_a_mqa|attn_kv_b|attn_output` plus
 //! optional `attn_q_a_norm` / `attn_kv_a_norm`. Dense FFN:
-//! `ffn_{gate,up,down}`. MoE after `leading_dense_block_count` is
-//! **fail-closed** until wired (clear error, not silent dense fallback).
+//! `ffn_{gate,up,down}`. MoE after `leading_dense_block_count` uses
+//! `ffn_gate_inp` + packed `ffn_{gate,up,down}_exps` + shared
+//! `ffn_{gate,up,down}_shexp` (fail-closed if any are missing).
 //!
 //! `use_output_gate` is off (classic DeepSeek-2). RoPE uses interleaved
 //! Norm layout via [`crate::config::MlaRopeConfig`].
@@ -12,9 +13,12 @@
 use ferrox_core::tensor::Tensor;
 use ferrox_core::weight_matrix::{QuantKind, WeightBytes, WeightMatrix};
 use ferrox_gguf::{GgmlType, TensorSource};
+use ferrox_moe::GatingFunction;
 
 use crate::config::{MlaConfig, MlaRopeConfig};
-use crate::engine::{MlaEngine, MlaLayerWeights};
+use crate::engine::{
+    MlaDenseFfn, MlaEngine, MlaLayerFfn, MlaLayerWeights, MlaMoeFfn, MlaMoeRuntime,
+};
 use crate::loader::LoadError;
 use crate::mla::MlaAttnWeights;
 
@@ -36,6 +40,12 @@ pub struct Deepseek2Hparams {
     /// Layers `[0, leading_dense)` use dense SwiGLU; rest require MoE.
     pub leading_dense_block_count: usize,
     pub n_expert: usize,
+    pub n_expert_used: usize,
+    pub n_shared_experts: usize,
+    pub expert_ffn_dim: usize,
+    pub gating: GatingFunction,
+    pub norm_topk_prob: bool,
+    pub expert_weights_scale: f32,
 }
 
 fn meta_u64(file: &impl TensorSource, key: &str) -> Result<u64, LoadError> {
@@ -72,8 +82,35 @@ pub fn read_deepseek2_hparams(file: &impl TensorSource) -> Result<Deepseek2Hpara
         .metadata_u64(&p("leading_dense_block_count"))
         .unwrap_or(n_layer as u64) as usize;
     let n_expert = file.metadata_u64(&p("expert_count")).unwrap_or(0) as usize;
+    let n_expert_used = file
+        .metadata_u64(&p("expert_used_count"))
+        .unwrap_or(if n_expert > 0 { 6 } else { 0 }) as usize;
+    let n_shared_experts = file.metadata_u64(&p("expert_shared_count")).unwrap_or(1) as usize;
+    let expert_ffn_dim = file
+        .metadata_u64(&p("expert_feed_forward_length"))
+        .unwrap_or(ffn_dim as u64) as usize;
     let rms_norm_eps = meta_f32(file, &p("attention.layer_norm_rms_epsilon"), 1e-6);
     let rope_theta = meta_f32(file, &p("rope.freq_base"), 10000.0);
+    // llama.cpp deepseek2: default Softmax unless expert_gating_func set
+    // (1=softmax, 2=sigmoid); special-case GLM 4.7 Lite sigmoid when absent.
+    let gating = match file.metadata_u64(&p("expert_gating_func")) {
+        Some(2) => GatingFunction::Sigmoid,
+        Some(1) => GatingFunction::Softmax,
+        _ if (n_layer == 47 || n_layer == 48)
+            && file
+                .find_tensor("token_embd.weight")
+                .map(|t| t.shape.last().copied().unwrap_or(0) == 154880)
+                .unwrap_or(false) =>
+        {
+            GatingFunction::Sigmoid
+        }
+        _ => GatingFunction::Softmax,
+    };
+    let norm_topk_prob = file
+        .metadata_u64(&p("expert_weights_norm"))
+        .map(|v| v != 0)
+        .unwrap_or(true);
+    let expert_weights_scale = meta_f32(file, &p("expert_weights_scale"), 1.0);
     Ok(Deepseek2Hparams {
         arch,
         n_layer,
@@ -89,6 +126,12 @@ pub fn read_deepseek2_hparams(file: &impl TensorSource) -> Result<Deepseek2Hpara
         rope_theta,
         leading_dense_block_count: leading_dense.min(n_layer),
         n_expert,
+        n_expert_used: n_expert_used.min(n_expert.max(1)),
+        n_shared_experts: n_shared_experts.max(1),
+        expert_ffn_dim,
+        gating,
+        norm_topk_prob,
+        expert_weights_scale,
     })
 }
 
@@ -222,40 +265,162 @@ fn load_mla_attn(
     })
 }
 
-fn load_dense_layer(
+fn split_expert_tensor(
+    file: &impl TensorSource,
+    name: &str,
+    n_experts: usize,
+) -> Result<Vec<WeightMatrix>, LoadError> {
+    let info = find_info(file, name)?;
+    if info.shape.len() != 3 || info.shape[2] as usize != n_experts {
+        let file_experts = info.shape.last().map(|&d| d as usize).unwrap_or(0);
+        return Err(LoadError::ExpertCountMismatch(
+            name.to_string(),
+            file_experts,
+            n_experts,
+        ));
+    }
+    let out_dim = info.shape[1] as usize;
+    let in_dim = info.shape[0] as usize;
+    let raw = file.tensor_bytes(name)?;
+
+    match info.dtype {
+        GgmlType::F32 | GgmlType::BF16 => {
+            let all = if info.dtype == GgmlType::BF16 {
+                ferrox_quant::dequant_bf16(raw)
+                    .map_err(|_| LoadError::UnsupportedDtype(name.to_string(), GgmlType::BF16))?
+            } else {
+                let mut out = Vec::with_capacity(raw.len() / 4);
+                for chunk in raw.chunks_exact(4) {
+                    out.push(f32::from_le_bytes(chunk.try_into().unwrap()));
+                }
+                out
+            };
+            let per_expert = out_dim * in_dim;
+            Ok((0..n_experts)
+                .map(|e| {
+                    WeightMatrix::F32(Tensor::new(
+                        all[e * per_expert..(e + 1) * per_expert].to_vec(),
+                        vec![out_dim, in_dim],
+                    ))
+                })
+                .collect())
+        }
+        other => match quant_kind_for(other) {
+            Some(kind) => {
+                let (mmap, full_range) = file.tensor_mapped_range(name)?;
+                let bytes_per_expert = raw.len() / n_experts;
+                Ok((0..n_experts)
+                    .map(|e| WeightMatrix::Quantized {
+                        data: WeightBytes::Mapped {
+                            mmap: std::sync::Arc::clone(&mmap),
+                            range: (full_range.start + e * bytes_per_expert)
+                                ..(full_range.start + (e + 1) * bytes_per_expert),
+                        },
+                        rows: out_dim,
+                        cols: in_dim,
+                        kind,
+                    })
+                    .collect())
+            }
+            None => Err(LoadError::UnsupportedDtype(name.to_string(), other)),
+        },
+    }
+}
+
+fn require_tensor(file: &impl TensorSource, name: &str) -> Result<(), LoadError> {
+    if file.find_tensor(name).is_none() {
+        return Err(LoadError::Gguf(ferrox_gguf::GgufError::TensorNotFound(
+            name.to_string(),
+        )));
+    }
+    Ok(())
+}
+
+fn load_dense_ffn(file: &impl TensorSource, layer_idx: usize) -> Result<MlaDenseFfn, LoadError> {
+    let l = layer_idx;
+    Ok(MlaDenseFfn {
+        gate: load_weight_matrix(file, &format!("blk.{l}.ffn_gate.weight"))?,
+        up: load_weight_matrix(file, &format!("blk.{l}.ffn_up.weight"))?,
+        down: load_weight_matrix(file, &format!("blk.{l}.ffn_down.weight"))?,
+    })
+}
+
+fn load_moe_ffn(
+    file: &impl TensorSource,
+    layer_idx: usize,
+    hp: &Deepseek2Hparams,
+) -> Result<MlaMoeFfn, LoadError> {
+    let l = layer_idx;
+    // Fail-closed: every MoE tensor must be present (no silent dense fallback).
+    for name in [
+        format!("blk.{l}.ffn_gate_inp.weight"),
+        format!("blk.{l}.ffn_gate_exps.weight"),
+        format!("blk.{l}.ffn_up_exps.weight"),
+        format!("blk.{l}.ffn_down_exps.weight"),
+        format!("blk.{l}.ffn_gate_shexp.weight"),
+        format!("blk.{l}.ffn_up_shexp.weight"),
+        format!("blk.{l}.ffn_down_shexp.weight"),
+    ] {
+        require_tensor(file, &name)?;
+    }
+    let gate_exps =
+        split_expert_tensor(file, &format!("blk.{l}.ffn_gate_exps.weight"), hp.n_expert)?;
+    let up_exps = split_expert_tensor(file, &format!("blk.{l}.ffn_up_exps.weight"), hp.n_expert)?;
+    let down_exps =
+        split_expert_tensor(file, &format!("blk.{l}.ffn_down_exps.weight"), hp.n_expert)?;
+    let experts = gate_exps
+        .into_iter()
+        .zip(up_exps)
+        .zip(down_exps)
+        .map(|((gate, up), down)| ferrox_moe::ExpertWeights { gate, up, down })
+        .collect();
+    let shared_expert = ferrox_moe::ExpertWeights {
+        gate: load_weight_matrix(file, &format!("blk.{l}.ffn_gate_shexp.weight"))?,
+        up: load_weight_matrix(file, &format!("blk.{l}.ffn_up_shexp.weight"))?,
+        down: load_weight_matrix(file, &format!("blk.{l}.ffn_down_shexp.weight"))?,
+    };
+    let exp_probs_bias = load_f32_vec_optional(file, &format!("blk.{l}.ffn_exp_probs_b.bias"))?;
+    Ok(MlaMoeFfn {
+        router: load_weight_matrix(file, &format!("blk.{l}.ffn_gate_inp.weight"))?,
+        experts,
+        shared_expert,
+        exp_probs_bias,
+    })
+}
+
+fn load_layer(
     file: &impl TensorSource,
     layer_idx: usize,
     hp: &Deepseek2Hparams,
 ) -> Result<MlaLayerWeights, LoadError> {
     let l = layer_idx;
+    let ffn = if layer_idx < hp.leading_dense_block_count || hp.n_expert == 0 {
+        MlaLayerFfn::Dense(load_dense_ffn(file, layer_idx)?)
+    } else {
+        MlaLayerFfn::Moe(load_moe_ffn(file, layer_idx, hp)?)
+    };
     Ok(MlaLayerWeights {
         attn_norm: load_f32_vec(file, &format!("blk.{l}.attn_norm.weight"))?,
         attn: load_mla_attn(file, layer_idx, hp)?,
         ffn_norm: load_f32_vec(file, &format!("blk.{l}.ffn_norm.weight"))?,
-        ffn_gate: load_weight_matrix(file, &format!("blk.{l}.ffn_gate.weight"))?,
-        ffn_up: load_weight_matrix(file, &format!("blk.{l}.ffn_up.weight"))?,
-        ffn_down: load_weight_matrix(file, &format!("blk.{l}.ffn_down.weight"))?,
+        ffn,
     })
 }
 
-/// Load a dense-lead (or fully dense) DeepSeek-2 / Mistral-4 GGUF into [`MlaEngine`].
+/// Load a DeepSeek-2 / Mistral-4 GGUF into [`MlaEngine`] (dense lead + MoE tail).
 pub fn load_mla_engine(file: &impl TensorSource) -> Result<MlaEngine, LoadError> {
     let hp = read_deepseek2_hparams(file)?;
-    if hp.n_expert > 0 && hp.leading_dense_block_count < hp.n_layer {
+    if hp.n_expert > 0 && hp.leading_dense_block_count >= hp.n_layer {
+        // Experts declared but every layer is still dense — ignore MoE.
+    } else if hp.n_expert > 0 && hp.n_expert_used == 0 {
         return Err(LoadError::UnsupportedArchitecture(format!(
-            "{}: MoE layers after leading_dense_block_count={} not wired in MlaEngine yet \
-             (n_layer={}, n_expert={})",
-            hp.arch, hp.leading_dense_block_count, hp.n_layer, hp.n_expert
+            "{}: expert_count={} but expert_used_count is 0",
+            hp.arch, hp.n_expert
         )));
     }
-    let n_load = if hp.n_expert > 0 {
-        hp.leading_dense_block_count
-    } else {
-        hp.n_layer
-    };
-    if n_load == 0 {
+    if hp.n_layer == 0 {
         return Err(LoadError::UnsupportedArchitecture(format!(
-            "{}: no dense layers to load",
+            "{}: no layers to load",
             hp.arch
         )));
     }
@@ -273,10 +438,21 @@ pub fn load_mla_engine(file: &impl TensorSource) -> Result<MlaEngine, LoadError>
         Err(_) => load_weight_matrix(file, "token_embd.weight")?,
     };
 
-    let mut layers = Vec::with_capacity(n_load);
-    for i in 0..n_load {
-        layers.push(load_dense_layer(file, i, &hp)?);
+    let mut layers = Vec::with_capacity(hp.n_layer);
+    for i in 0..hp.n_layer {
+        layers.push(load_layer(file, i, &hp)?);
     }
+    let has_moe = layers.iter().any(|l| matches!(l.ffn, MlaLayerFfn::Moe(_)));
+    let moe = if has_moe {
+        Some(MlaMoeRuntime {
+            n_experts_active: hp.n_expert_used,
+            gating: hp.gating,
+            norm_topk_prob: hp.norm_topk_prob,
+            expert_weights_scale: hp.expert_weights_scale,
+        })
+    } else {
+        None
+    };
 
     Ok(MlaEngine {
         embedding,
@@ -297,6 +473,7 @@ pub fn load_mla_engine(file: &impl TensorSource) -> Result<MlaEngine, LoadError>
         },
         rms_norm_eps: hp.rms_norm_eps,
         hidden_dim: hp.hidden_dim,
+        moe,
     })
 }
 
@@ -501,6 +678,269 @@ mod tests {
         let logits = engine.forward_token(0, 0, &mut state);
         assert_eq!(logits.len(), vocab);
         assert!(logits.iter().all(|x| x.is_finite()));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    fn push_mla_attn_tensors(
+        tensors: &mut Vec<FixtureTensor>,
+        l: usize,
+        h: usize,
+        n_heads: usize,
+        q_lora: usize,
+        kv_lora: usize,
+        qk_nope: usize,
+        qk_rope: usize,
+        v_dim: usize,
+    ) {
+        let q_head = qk_nope + qk_rope;
+        tensors.push(f32_tensor(
+            &format!("blk.{l}.attn_norm.weight"),
+            vec![h as u64],
+            vec![1.0; h],
+        ));
+        tensors.push(f32_tensor(
+            &format!("blk.{l}.ffn_norm.weight"),
+            vec![h as u64],
+            vec![1.0; h],
+        ));
+        tensors.push(f32_tensor(
+            &format!("blk.{l}.attn_q_a.weight"),
+            vec![q_lora as u64, h as u64],
+            vec![0.01; h * q_lora],
+        ));
+        tensors.push(f32_tensor(
+            &format!("blk.{l}.attn_q_b.weight"),
+            vec![(n_heads * q_head) as u64, q_lora as u64],
+            vec![0.01; q_lora * n_heads * q_head],
+        ));
+        tensors.push(f32_tensor(
+            &format!("blk.{l}.attn_kv_a_mqa.weight"),
+            vec![(kv_lora + qk_rope) as u64, h as u64],
+            vec![0.01; h * (kv_lora + qk_rope)],
+        ));
+        tensors.push(f32_tensor(
+            &format!("blk.{l}.attn_kv_b.weight"),
+            vec![(n_heads * (qk_nope + v_dim)) as u64, kv_lora as u64],
+            vec![0.01; kv_lora * n_heads * (qk_nope + v_dim)],
+        ));
+        tensors.push(f32_tensor(
+            &format!("blk.{l}.attn_output.weight"),
+            vec![h as u64, (n_heads * v_dim) as u64],
+            vec![0.01; n_heads * v_dim * h],
+        ));
+    }
+
+    #[test]
+    fn load_synthetic_deepseek2_moe_after_dense_and_forward() {
+        let h = 16usize;
+        let n_heads = 2usize;
+        let q_lora = 8usize;
+        let kv_lora = 4usize;
+        let qk_nope = 4usize;
+        let qk_rope = 2usize;
+        let v_dim = 4usize;
+        let ffn = 32usize;
+        let exp_ff = 16usize;
+        let n_exp = 4usize;
+        let vocab = 8usize;
+        let arch = "deepseek2";
+
+        let mut tensors = vec![
+            f32_tensor(
+                "token_embd.weight",
+                vec![vocab as u64, h as u64],
+                vec![0.01; h * vocab],
+            ),
+            f32_tensor("output_norm.weight", vec![h as u64], vec![1.0; h]),
+            f32_tensor(
+                "output.weight",
+                vec![vocab as u64, h as u64],
+                vec![0.02; h * vocab],
+            ),
+        ];
+        // Layer 0: dense
+        push_mla_attn_tensors(
+            &mut tensors, 0, h, n_heads, q_lora, kv_lora, qk_nope, qk_rope, v_dim,
+        );
+        tensors.push(f32_tensor(
+            "blk.0.ffn_gate.weight",
+            vec![ffn as u64, h as u64],
+            vec![0.01; h * ffn],
+        ));
+        tensors.push(f32_tensor(
+            "blk.0.ffn_up.weight",
+            vec![ffn as u64, h as u64],
+            vec![0.01; h * ffn],
+        ));
+        tensors.push(f32_tensor(
+            "blk.0.ffn_down.weight",
+            vec![h as u64, ffn as u64],
+            vec![0.01; ffn * h],
+        ));
+        // Layer 1: MoE
+        push_mla_attn_tensors(
+            &mut tensors, 1, h, n_heads, q_lora, kv_lora, qk_nope, qk_rope, v_dim,
+        );
+        tensors.push(f32_tensor(
+            "blk.1.ffn_gate_inp.weight",
+            vec![n_exp as u64, h as u64],
+            vec![0.01; h * n_exp],
+        ));
+        // Packed expert tensors: logical [n_experts, out, in] → GGUF shape write uses rev
+        // so pass shape as [n_experts, out, in] matching other fixtures' logical order.
+        tensors.push(f32_tensor(
+            "blk.1.ffn_gate_exps.weight",
+            vec![n_exp as u64, exp_ff as u64, h as u64],
+            vec![0.01; n_exp * exp_ff * h],
+        ));
+        tensors.push(f32_tensor(
+            "blk.1.ffn_up_exps.weight",
+            vec![n_exp as u64, exp_ff as u64, h as u64],
+            vec![0.01; n_exp * exp_ff * h],
+        ));
+        tensors.push(f32_tensor(
+            "blk.1.ffn_down_exps.weight",
+            vec![n_exp as u64, h as u64, exp_ff as u64],
+            vec![0.01; n_exp * h * exp_ff],
+        ));
+        tensors.push(f32_tensor(
+            "blk.1.ffn_gate_shexp.weight",
+            vec![exp_ff as u64, h as u64],
+            vec![0.01; h * exp_ff],
+        ));
+        tensors.push(f32_tensor(
+            "blk.1.ffn_up_shexp.weight",
+            vec![exp_ff as u64, h as u64],
+            vec![0.01; h * exp_ff],
+        ));
+        tensors.push(f32_tensor(
+            "blk.1.ffn_down_shexp.weight",
+            vec![h as u64, exp_ff as u64],
+            vec![0.01; exp_ff * h],
+        ));
+
+        let kv = [
+            ("deepseek2.block_count", 2u64),
+            ("deepseek2.embedding_length", h as u64),
+            ("deepseek2.feed_forward_length", ffn as u64),
+            ("deepseek2.attention.head_count", n_heads as u64),
+            ("deepseek2.attention.q_lora_rank", q_lora as u64),
+            ("deepseek2.attention.kv_lora_rank", kv_lora as u64),
+            ("deepseek2.attention.qk_nope_head_dim", qk_nope as u64),
+            ("deepseek2.attention.qk_rope_head_dim", qk_rope as u64),
+            ("deepseek2.attention.v_head_dim", v_dim as u64),
+            ("deepseek2.leading_dense_block_count", 1u64),
+            ("deepseek2.expert_count", n_exp as u64),
+            ("deepseek2.expert_used_count", 2u64),
+            ("deepseek2.expert_shared_count", 1u64),
+            ("deepseek2.expert_feed_forward_length", exp_ff as u64),
+            ("deepseek2.expert_gating_func", 1u64), // softmax
+        ];
+        let fkv = [
+            ("deepseek2.attention.layer_norm_rms_epsilon", 1e-5f32),
+            ("deepseek2.rope.freq_base", 10000.0f32),
+            ("deepseek2.expert_weights_scale", 1.0f32),
+        ];
+        let bytes = build_gguf(arch, &kv, &fkv, &tensors);
+        let path = std::env::temp_dir().join(format!(
+            "ferrox_mla_moe_gguf_{}.gguf",
+            std::process::id()
+        ));
+        std::fs::write(&path, &bytes).unwrap();
+        let file = GgufFile::open(&path).unwrap();
+        let engine = load_mla_engine(&file).expect("load mla moe");
+        assert_eq!(engine.layers.len(), 2);
+        assert!(matches!(engine.layers[0].ffn, crate::engine::MlaLayerFfn::Dense(_)));
+        assert!(matches!(engine.layers[1].ffn, crate::engine::MlaLayerFfn::Moe(_)));
+        assert!(engine.moe.is_some());
+        let mut state = engine.new_state();
+        let logits = engine.forward_token(0, 0, &mut state);
+        assert_eq!(logits.len(), vocab);
+        assert!(logits.iter().all(|x| x.is_finite()));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn moe_after_dense_fails_closed_without_expert_tensors() {
+        let h = 16usize;
+        let n_heads = 2usize;
+        let q_lora = 8usize;
+        let kv_lora = 4usize;
+        let qk_nope = 4usize;
+        let qk_rope = 2usize;
+        let v_dim = 4usize;
+        let ffn = 32usize;
+        let vocab = 8usize;
+        let arch = "deepseek2";
+
+        let mut tensors = vec![
+            f32_tensor(
+                "token_embd.weight",
+                vec![vocab as u64, h as u64],
+                vec![0.01; h * vocab],
+            ),
+            f32_tensor("output_norm.weight", vec![h as u64], vec![1.0; h]),
+            f32_tensor(
+                "output.weight",
+                vec![vocab as u64, h as u64],
+                vec![0.02; h * vocab],
+            ),
+        ];
+        for l in 0..2usize {
+            push_mla_attn_tensors(
+                &mut tensors, l, h, n_heads, q_lora, kv_lora, qk_nope, qk_rope, v_dim,
+            );
+            // Only dense FFN tensors — MoE layer 1 will fail closed.
+            tensors.push(f32_tensor(
+                &format!("blk.{l}.ffn_gate.weight"),
+                vec![ffn as u64, h as u64],
+                vec![0.01; h * ffn],
+            ));
+            tensors.push(f32_tensor(
+                &format!("blk.{l}.ffn_up.weight"),
+                vec![ffn as u64, h as u64],
+                vec![0.01; h * ffn],
+            ));
+            tensors.push(f32_tensor(
+                &format!("blk.{l}.ffn_down.weight"),
+                vec![h as u64, ffn as u64],
+                vec![0.01; ffn * h],
+            ));
+        }
+        let kv = [
+            ("deepseek2.block_count", 2u64),
+            ("deepseek2.embedding_length", h as u64),
+            ("deepseek2.feed_forward_length", ffn as u64),
+            ("deepseek2.attention.head_count", n_heads as u64),
+            ("deepseek2.attention.q_lora_rank", q_lora as u64),
+            ("deepseek2.attention.kv_lora_rank", kv_lora as u64),
+            ("deepseek2.attention.qk_nope_head_dim", qk_nope as u64),
+            ("deepseek2.attention.qk_rope_head_dim", qk_rope as u64),
+            ("deepseek2.attention.v_head_dim", v_dim as u64),
+            ("deepseek2.leading_dense_block_count", 1u64),
+            ("deepseek2.expert_count", 4u64),
+            ("deepseek2.expert_used_count", 2u64),
+        ];
+        let fkv = [
+            ("deepseek2.attention.layer_norm_rms_epsilon", 1e-5f32),
+            ("deepseek2.rope.freq_base", 10000.0f32),
+        ];
+        let bytes = build_gguf(arch, &kv, &fkv, &tensors);
+        let path = std::env::temp_dir().join(format!(
+            "ferrox_mla_moe_missing_{}.gguf",
+            std::process::id()
+        ));
+        std::fs::write(&path, &bytes).unwrap();
+        let file = GgufFile::open(&path).unwrap();
+        let err = match load_mla_engine(&file) {
+            Err(e) => e,
+            Ok(_) => panic!("expected missing MoE tensors to fail closed"),
+        };
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("ffn_gate_inp") || msg.contains("TensorNotFound"),
+            "unexpected error: {msg}"
+        );
         let _ = std::fs::remove_file(&path);
     }
 }

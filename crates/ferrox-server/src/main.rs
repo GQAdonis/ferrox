@@ -66,7 +66,7 @@ use cache::{CacheKey, ResponseCache};
 use ferrox_core::cache::KvBlockPool;
 use ferrox_models::kimi_tokenizer::KimiTokenizer;
 use ferrox_models::sampling::SamplingParams;
-use ferrox_models::{Decoder, KimiEngine, MlaEngine, PrefixCache};
+use ferrox_models::{Decoder, Gemma4Engine, KimiEngine, MlaEngine, PrefixCache};
 use generate::{FinishReason, GenerationParams};
 use model::ServerTokenizer;
 
@@ -323,6 +323,7 @@ pub(crate) enum Model {
     Gguf(GgufModel),
     Kimi(KimiModel),
     Mla(MlaModel),
+    Gemma4(Gemma4Model),
     Glm52(Glm52Model),
 }
 
@@ -351,6 +352,15 @@ pub(crate) struct MlaModel {
     chat_template: chat_template::ChatTemplate,
 }
 
+pub(crate) struct Gemma4Model {
+    engine: Gemma4Engine,
+    tokenizer: ServerTokenizer,
+    eos_id: Option<usize>,
+    bos_id: Option<usize>,
+    name: String,
+    chat_template: chat_template::ChatTemplate,
+}
+
 pub(crate) struct Glm52Model {
     engine: ferrox_models::Glm52Engine,
     tokenizer: ServerTokenizer,
@@ -366,6 +376,7 @@ impl Model {
             Model::Gguf(m) => m.chat_template,
             Model::Kimi(m) => m.chat_template,
             Model::Mla(m) => m.chat_template,
+            Model::Gemma4(m) => m.chat_template,
             Model::Glm52(m) => m.chat_template,
         }
     }
@@ -377,7 +388,7 @@ impl Model {
     fn is_synthetic(&self) -> bool {
         match self {
             Model::Gguf(m) => m.is_synthetic,
-            Model::Kimi(_) | Model::Mla(_) | Model::Glm52(_) => false,
+            Model::Kimi(_) | Model::Mla(_) | Model::Gemma4(_) | Model::Glm52(_) => false,
         }
     }
 
@@ -386,6 +397,7 @@ impl Model {
             Model::Gguf(m) => m.tokenizer.kind(),
             Model::Kimi(_) => "kimi-tiktoken-bpe",
             Model::Mla(m) => m.tokenizer.kind(),
+            Model::Gemma4(m) => m.tokenizer.kind(),
             Model::Glm52(m) => m.tokenizer.kind(),
         }
     }
@@ -397,7 +409,7 @@ impl Model {
         match self {
             Model::Gguf(m) => m.decoder.expert_store_stats(),
             Model::Kimi(m) => m.engine.weights.expert_store_stats(),
-            Model::Mla(_) | Model::Glm52(_) => None,
+            Model::Mla(_) | Model::Gemma4(_) | Model::Glm52(_) => None,
         }
     }
 
@@ -406,6 +418,7 @@ impl Model {
             Model::Gguf(m) => m.decoder.config.name,
             Model::Kimi(_) => "kimi-k3",
             Model::Mla(m) => m.name.as_str(),
+            Model::Gemma4(m) => m.name.as_str(),
             Model::Glm52(m) => m.name.as_str(),
         }
     }
@@ -420,6 +433,7 @@ impl Model {
                 .map(|id| id as usize)
                 .collect(),
             Model::Mla(m) => m.tokenizer.encode(text),
+            Model::Gemma4(m) => m.tokenizer.encode(text),
             Model::Glm52(m) => m.tokenizer.encode(text),
         }
     }
@@ -432,6 +446,7 @@ impl Model {
                 m.tokenizer.decode(&ids32)
             }
             Model::Mla(m) => m.tokenizer.decode(ids),
+            Model::Gemma4(m) => m.tokenizer.decode(ids),
             Model::Glm52(m) => m.tokenizer.decode(ids),
         }
     }
@@ -451,7 +466,7 @@ impl Model {
                     .collect();
                 Some(m.decoder.forward_hidden_batch(tokens, 0, &mut caches))
             }
-            Model::Kimi(_) | Model::Mla(_) | Model::Glm52(_) => None,
+            Model::Kimi(_) | Model::Mla(_) | Model::Gemma4(_) | Model::Glm52(_) => None,
         }
     }
 
@@ -460,6 +475,7 @@ impl Model {
             Model::Gguf(m) => Some(m.decoder.config.vocab_size),
             Model::Kimi(m) => Some(m.tokenizer.vocab_size()),
             Model::Mla(m) => Some(ferrox_models::Engine::vocab_size(&m.engine)),
+            Model::Gemma4(m) => Some(ferrox_models::Engine::vocab_size(&m.engine)),
             Model::Glm52(m) => Some(ferrox_models::Engine::vocab_size(&m.engine)),
         }
     }
@@ -1218,6 +1234,20 @@ fn run_generation_emit(
                 }
             },
         )?,
+        Model::Gemma4(m) => generate::generate_engine(
+            &m.engine,
+            &m.tokenizer,
+            m.eos_id,
+            m.bos_id,
+            prompt,
+            params,
+            |chunk| {
+                chunks.push(chunk.to_string());
+                if !synthetic {
+                    emit(chunk);
+                }
+            },
+        )?,
         Model::Glm52(m) => generate::generate_engine(
             &m.engine,
             &m.tokenizer,
@@ -1788,6 +1818,17 @@ fn build_app_state(
             }),
             None,
         ),
+        model::LoadedModel::Gemma4(m) => (
+            Model::Gemma4(Gemma4Model {
+                engine: m.engine,
+                tokenizer: m.tokenizer,
+                eos_id: m.eos_id,
+                bos_id: m.bos_id,
+                name: m.name,
+                chat_template: m.chat_template,
+            }),
+            None,
+        ),
         model::LoadedModel::Glm52(g) => (
             Model::Glm52(Glm52Model {
                 engine: g.engine,
@@ -1925,6 +1966,11 @@ async fn run(mcp_config_path: Option<PathBuf>, ui_server: bool) -> anyhow::Resul
             m.name,
             m.tokenizer.kind()
         ),
+        model::LoadedModel::Gemma4(m) => tracing::info!(
+            "loaded Gemma4 GGUF '{}' (tokenizer={})",
+            m.name,
+            m.tokenizer.kind()
+        ),
         model::LoadedModel::Glm52(g) => tracing::info!(
             "loaded GLM-5.2 GGUF '{}' (tokenizer={})",
             g.name,
@@ -1971,6 +2017,12 @@ async fn run(mcp_config_path: Option<PathBuf>, ui_server: bool) -> anyhow::Resul
                 tracing::warn!(
                     "FERROX_GPU_VRAM_BUDGET_BYTES is set but the loaded model is MLA -- dense \
                      FFN path only today; ignoring expert VRAM budget"
+                );
+            }
+            model::LoadedModel::Gemma4(_) => {
+                tracing::warn!(
+                    "FERROX_GPU_VRAM_BUDGET_BYTES is set but the loaded model is Gemma4 -- \
+                     ignoring expert VRAM budget"
                 );
             }
             model::LoadedModel::Glm52(_) => {
@@ -2108,6 +2160,7 @@ async fn run(mcp_config_path: Option<PathBuf>, ui_server: bool) -> anyhow::Resul
                 model::LoadedModel::Gguf(g) => &g.decoder.config,
                 model::LoadedModel::Kimi(_)
                 | model::LoadedModel::Mla(_)
+                | model::LoadedModel::Gemma4(_)
                 | model::LoadedModel::Glm52(_) => {
                     panic!(
                         "FERROX_KV_BYTE_BUDGET requires a GGUF decoder model \

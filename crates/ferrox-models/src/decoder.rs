@@ -2235,8 +2235,7 @@ impl Decoder {
         hidden_dim: usize,
     ) -> Option<Vec<(Vec<f32>, f32)>> {
         use rayon::prelude::*;
-        if !ferrox_core::weight_matrix::cpu_int_dot_enabled() || !normed2.len().is_multiple_of(32)
-        {
+        if !ferrox_core::weight_matrix::cpu_int_dot_enabled() || !normed2.len().is_multiple_of(32) {
             return None;
         }
         let n_slots = decision.expert_ids.len();
@@ -2303,30 +2302,29 @@ impl Decoder {
                 }
             });
         let mut activated = vec![0f32; n_slots * ffn_rows];
-        activated
-            .par_iter_mut()
-            .enumerate()
-            .for_each(|(idx, a)| {
-                let g = gate[idx];
-                *a = (g / (1.0 + (-g).exp())) * up[idx];
-            });
+        activated.par_iter_mut().enumerate().for_each(|(idx, a)| {
+            let g = gate[idx];
+            *a = (g / (1.0 + (-g).exp())) * up[idx];
+        });
         let mut outs: Vec<(Vec<f32>, f32)> = decision
             .weights
             .iter()
             .map(|&w| (vec![0f32; hidden_dim], w))
             .collect();
-        outs.par_iter_mut().enumerate().for_each(|(slot, (out, _))| {
-            let ex = &experts[eids[slot]];
-            let act_slot = &activated[slot * ffn_rows..(slot + 1) * ffn_rows];
-            if act_slot.len().is_multiple_of(32) {
-                let q8 = ferrox_quant::quantize_activations_q8(act_slot);
-                if let Some(d) = ex.down.apply_cpu_q8(&q8) {
-                    *out = d;
-                    return;
+        outs.par_iter_mut()
+            .enumerate()
+            .for_each(|(slot, (out, _))| {
+                let ex = &experts[eids[slot]];
+                let act_slot = &activated[slot * ffn_rows..(slot + 1) * ffn_rows];
+                if act_slot.len().is_multiple_of(32) {
+                    let q8 = ferrox_quant::quantize_activations_q8(act_slot);
+                    if let Some(d) = ex.down.apply_cpu_q8(&q8) {
+                        *out = d;
+                        return;
+                    }
                 }
-            }
-            *out = ex.down.apply(act_slot);
-        });
+                *out = ex.down.apply(act_slot);
+            });
         Some(outs)
     }
 

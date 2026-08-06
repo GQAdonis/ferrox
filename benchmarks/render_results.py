@@ -326,17 +326,21 @@ def main() -> None:
     lines.append(
         "1. Metal fair-chat 8B is ahead (~0.92×); 3B ~parity (~0.97×). Keep "
         "watching `prompt_per_second` vs llama after FA-vec prefill.\n"
-        "2. OLMoE Metal ~1.37× — root cause is GPU dependency-chain bubbles "
-        "(~13 barrier stages/layer), not `mul_mv_id` FLOPs. Next: fuse/reorder "
-        "ops to shorten the critical path (`docs/ROADMAP.md`).\n"
+        "2. OLMoE Metal ~1.41× — fused encode groups + barrier instrumentation "
+        "landed; deferred residual + single-grid `mul_mm_id` still open "
+        "(`docs/ROADMAP.md`). Prefill `prompt_per_second` still ≪ llama.\n"
         "3. CUDA — re-measure on comparable CUDA hardware (no in-tree CUDA pin; "
         "skipped on darwin via `--fit-host`).\n"
-        "4. Gemma-4-E2B: both ferrox and Homebrew llama refuse (`gemma4` arch / "
-        "per-layer+shared-KV+SWA split); suite `expect=refuse`.\n"
+        "4. Gemma-4-E2B: `Gemma4Engine` loads; tokenizer `gemma4` still "
+        "byte-fallback; suite `expect=refuse` until fair-chat pin. Homebrew "
+        "llama also unknown-arch.\n"
         "5. CB multi-request tok/s receipt.\n"
-        "6. DS4 / GLM / MLA MoE real-checkpoint e2e when feasible.\n"
+        "6. DS4 / GLM / MLA MoE real-checkpoint e2e when feasible "
+        "(MoE-after-dense wired in `MlaEngine`).\n"
         "7. Qwen2-MoE / Mixtral: missing GGUF or `--fit-host` RAM skip on Host B.\n"
         "8. Suite contention: re-pin outliers alone if full-suite medians disagree with CLI.\n"
+        "9. CPU: interleaved Q4_K closed Mistral/Phi4/OLMoE gaps (ferrox ahead); "
+        "extend to Q8_0 for small-model CPU pins.\n"
     )
 
     OUT.write_text("".join(lines))

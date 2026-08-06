@@ -148,7 +148,7 @@
       "backends": ["metal", "cpu"],
       "estimated_ram_gb": 6,
       "expect": "refuse",
-      "notes": "E2B: per-layer emb + shared_kv_layers + SWA/full head-dim split — DedicatedOnly until engine lands; llama may still pin"
+      "notes": "Gemma4Engine loads real GGUF; tokenizer.ggml.model=gemma4 still byte-fallback; suite stays refuse until tokenizer + fair-chat pin; Homebrew llama unknown-arch"
     },
     {
       "id": "phi4_mini_q4km",

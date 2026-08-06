@@ -16,6 +16,25 @@
 use crate::gpu::memory_barrier_resources;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{MTLBuffer, MTLComputeCommandEncoder};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Process-wide barrier count (decode encode). Enable logging with
+/// `FERROX_METAL_MOE_BARRIER_LOG=1`.
+static BARRIER_COUNT: AtomicU64 = AtomicU64::new(0);
+static BEGIN_OP_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// Snapshot `(barriers, begin_ops)` since last reset (test / debug).
+pub fn moe_barrier_stats() -> (u64, u64) {
+    (
+        BARRIER_COUNT.load(Ordering::Relaxed),
+        BEGIN_OP_COUNT.load(Ordering::Relaxed),
+    )
+}
+
+pub fn moe_barrier_stats_reset() {
+    BARRIER_COUNT.store(0, Ordering::Relaxed);
+    BEGIN_OP_COUNT.store(0, Ordering::Relaxed);
+}
 
 #[derive(Default)]
 pub(crate) struct MoeMemRanges {
@@ -96,16 +115,22 @@ impl MoeMemRanges {
         srcs: &[&ProtocolObject<dyn MTLBuffer>],
         dsts: &[&ProtocolObject<dyn MTLBuffer>],
     ) {
+        BEGIN_OP_COUNT.fetch_add(1, Ordering::Relaxed);
         if !self.check(srcs, dsts) {
             // SAFETY: pointers were taken from live encoder-bound scratch /
             // weight buffers that outlive this encode pass.
-            let refs: Vec<&ProtocolObject<dyn MTLBuffer>> = self
-                .bufs
-                .iter()
-                .map(|&p| unsafe { &*p })
-                .collect();
+            let refs: Vec<&ProtocolObject<dyn MTLBuffer>> =
+                self.bufs.iter().map(|&p| unsafe { &*p }).collect();
             memory_barrier_resources(encoder, &refs);
             self.reset();
+            let n = BARRIER_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+            if std::env::var_os("FERROX_METAL_MOE_BARRIER_LOG").is_some() && n % 64 == 0 {
+                let begins = BEGIN_OP_COUNT.load(Ordering::Relaxed);
+                eprintln!(
+                    "ferrox: metal moe barriers={n} begin_ops={begins} (~{:.2} bar/op)",
+                    n as f64 / begins.max(1) as f64
+                );
+            }
         }
     }
 

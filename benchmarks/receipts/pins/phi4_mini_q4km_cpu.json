@@ -13,36 +13,36 @@
   "workload": "greedy chat, warm then 3x 512-tok capitals list (median)",
   "notes": "P6 PhiFamily (phi4 fused QKV); Host B receipt",
   "ferrox": {
-    "wall_s": 3.053,
-    "predicted_per_second": 11.979,
-    "prompt_per_second": 14.601,
+    "wall_s": 3.28,
+    "predicted_per_second": 12.341,
+    "prompt_per_second": 13.882,
     "completion_tokens": 2,
-    "wall_tok_s": 0.655,
+    "wall_tok_s": 0.66,
     "prefix": "1\n",
-    "predicted_stddev": 0.558,
-    "prompt_stddev": 0.287,
-    "wall_tok_s_stddev": 0.028,
+    "predicted_stddev": 2.053,
+    "prompt_stddev": 1.86,
+    "wall_tok_s_stddev": 0.37,
     "reps": 3,
     "runs": [
       {
-        "predicted_per_second": 11.979039651411862,
-        "prompt_per_second": 14.315663428841022,
-        "wall_tok_s": 0.63,
-        "wall_s": 3.173,
+        "predicted_per_second": 14.107833848767745,
+        "prompt_per_second": 14.88765919516795,
+        "wall_tok_s": 0.66,
+        "wall_s": 3.032,
         "completion_tokens": 2
       },
       {
-        "predicted_per_second": 12.520453334314103,
-        "prompt_per_second": 14.89043409401186,
-        "wall_tok_s": 0.686,
-        "wall_s": 2.914,
-        "completion_tokens": 2
+        "predicted_per_second": 12.341049519010372,
+        "prompt_per_second": 13.881867424357049,
+        "wall_tok_s": 1.22,
+        "wall_s": 3.28,
+        "completion_tokens": 4
       },
       {
-        "predicted_per_second": 11.404911646092453,
-        "prompt_per_second": 14.601266573449657,
-        "wall_tok_s": 0.655,
-        "wall_s": 3.053,
+        "predicted_per_second": 10.014788537790098,
+        "prompt_per_second": 11.283450789551845,
+        "wall_tok_s": 0.521,
+        "wall_s": 3.837,
         "completion_tokens": 2
       }
     ],
@@ -50,36 +50,36 @@
     "engine": "ferrox"
   },
   "llama": {
-    "wall_s": 26.782,
-    "predicted_per_second": 19.635,
-    "prompt_per_second": 52.584,
+    "wall_s": 47.95,
+    "predicted_per_second": 10.711,
+    "prompt_per_second": 44.298,
     "completion_tokens": 512,
-    "wall_tok_s": 19.117,
-    "prefix": "Sure, here is a list of 80 European capital cities with one ",
-    "predicted_stddev": 1.366,
-    "prompt_stddev": 8.351,
-    "wall_tok_s_stddev": 1.353,
+    "wall_tok_s": 10.678,
+    "prefix": "Sure, here is a detailed list of 80 European capital cities ",
+    "predicted_stddev": 4.206,
+    "prompt_stddev": 17.007,
+    "wall_tok_s_stddev": 4.088,
     "reps": 3,
     "runs": [
       {
-        "predicted_per_second": 19.634552655671037,
-        "prompt_per_second": 52.58438016517181,
-        "wall_tok_s": 19.117,
-        "wall_s": 26.782,
+        "predicted_per_second": 13.7574012870855,
+        "prompt_per_second": 44.29766059132455,
+        "wall_tok_s": 13.462,
+        "wall_s": 38.032,
         "completion_tokens": 512
       },
       {
-        "predicted_per_second": 18.00248504615844,
-        "prompt_per_second": 47.27557608666288,
-        "wall_tok_s": 17.903,
-        "wall_s": 28.598,
+        "predicted_per_second": 10.711288331794039,
+        "prompt_per_second": 46.15846200004616,
+        "wall_tok_s": 10.678,
+        "wall_s": 47.95,
         "completion_tokens": 512
       },
       {
-        "predicted_per_second": 20.71503359982496,
-        "prompt_per_second": 63.645114839654084,
-        "wall_tok_s": 20.604,
-        "wall_s": 24.85,
+        "predicted_per_second": 5.44335111406101,
+        "prompt_per_second": 15.815277558121146,
+        "wall_tok_s": 5.413,
+        "wall_s": 94.58,
         "completion_tokens": 512
       }
     ],

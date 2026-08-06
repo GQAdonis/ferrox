@@ -13,6 +13,12 @@
 //! GGUF-roundtrip tests.
 
 pub mod iq_tables;
+pub mod repack;
+
+pub use repack::{
+    gemv_q4_kx8_group, gemv_q4_kx8_q8_k, make_block_q4_kx8, pack_q4_k_matrix_x8, q4_kx8_interleave,
+    Q4_KX8_BLOCK_BYTES, Q4_KX8_NROWS,
+};
 
 use half::f16;
 

@@ -43,7 +43,7 @@ use crate::embd::{encode_get_rows, EmbdKind};
 use crate::gpu::{
     compute_encoder_concurrent, encode_matvec, encode_moe_topk_softmax, encode_q4_0_moe_gate_up_id,
     encode_q4_0_moe_gate_up_silu_fused, encode_q4_0_moe_id, encode_q4_0_moe_id_ex,
-    encode_q4_0_moe_topk, ensure_pipeline, memory_barrier_buffers,
+    encode_q4_0_moe_topk, ensure_pipeline, memory_barrier_buffers, memory_barrier_resources,
     resident_f32_buffer, resident_weight_buffer, shared_metal, MatvecLaunch, MetalError,
     MoeExpertLaunch, MoePackedQ4, ResidentF32Buffer, ResidentWeightBuffer,
 };
@@ -3933,8 +3933,9 @@ fn moe_layer_resident(
     let attn_key = layer.attn_norm_w.as_ptr() as usize;
     if let Some(hit) = TL_MOE_LAYER_RESIDENT.with(|c| {
         c.borrow().get(layer_idx).and_then(|slot| {
-            slot.as_ref().filter(|r| r.attn_key == attn_key).map(|r| {
-                MoeLayerResident {
+            slot.as_ref()
+                .filter(|r| r.attn_key == attn_key)
+                .map(|r| MoeLayerResident {
                     attn_key: r.attn_key,
                     attn_nw: r.attn_nw.clone(),
                     ffn_nw: r.ffn_nw.clone(),
@@ -3943,8 +3944,7 @@ fn moe_layer_resident(
                     v_w: r.v_w.clone(),
                     o_w: r.o_w.clone(),
                     r_w: r.r_w.clone(),
-                }
-            })
+                })
         })
     }) {
         return Ok(hit);
@@ -3981,6 +3981,8 @@ fn moe_layer_resident(
 /// One MoE layer into a Concurrent encoder using llama-style [`MoeMemRanges`]
 /// barriers (only on SRC↔DST / DST↔DST conflicts). Same shape as dense
 /// [`launch_decode_dense_stack`] and llama `ggml_metal_op` + `mem_ranges`.
+///
+/// Fused Concurrent groups (fewer barriers): Q∥K∥V, extras+RoPE, KV stores.
 #[allow(clippy::too_many_arguments)]
 fn encode_moe_layer_fused(
     encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
@@ -4027,29 +4029,21 @@ fn encode_moe_layer_fused(
         )?;
         mrs.end_op(&srcs, &dsts);
     }
-    // Q∥K∥V — shared src x_attn, disjoint dsts (llama Concurrent set).
+    // Q∥K∥V — one Concurrent set (shared src, disjoint dsts).
     {
         let srcs = [scratch.x_attn.as_ref()];
-        let dsts = [scratch.q.as_ref()];
+        let dsts = [
+            scratch.q.as_ref(),
+            scratch.k.as_ref(),
+            scratch.v.as_ref(),
+        ];
         mrs.begin_op(encoder, &srcs, &dsts);
         encode_matvec(encoder, device, &layer.q, q_w, &scratch.x_attn, &scratch.q)?;
-        mrs.end_op(&srcs, &dsts);
-    }
-    {
-        let srcs = [scratch.x_attn.as_ref()];
-        let dsts = [scratch.k.as_ref()];
-        mrs.begin_op(encoder, &srcs, &dsts);
         encode_matvec(encoder, device, &layer.k, k_w, &scratch.x_attn, &scratch.k)?;
-        mrs.end_op(&srcs, &dsts);
-    }
-    {
-        let srcs = [scratch.x_attn.as_ref()];
-        let dsts = [scratch.v.as_ref()];
-        mrs.begin_op(encoder, &srcs, &dsts);
         encode_matvec(encoder, device, &layer.v, v_w, &scratch.x_attn, &scratch.v)?;
         mrs.end_op(&srcs, &dsts);
     }
-    // extras + rope touch q/k/v in place (dst = src).
+    // extras + RoPE on q/k — fused group (one barrier before in-place chain).
     {
         let srcs = [scratch.q.as_ref(), scratch.k.as_ref(), scratch.v.as_ref()];
         let dsts = [scratch.q.as_ref(), scratch.k.as_ref(), scratch.v.as_ref()];
@@ -4069,12 +4063,11 @@ fn encode_moe_layer_fused(
             head_dim,
             rms_eps,
         )?;
-        mrs.end_op(&srcs, &dsts);
-    }
-    {
-        let srcs = [scratch.q.as_ref()];
-        let dsts = [scratch.q.as_ref()];
-        mrs.begin_op(encoder, &srcs, &dsts);
+        // Concurrent: barrier before RoPE reads q/k/v written by extras.
+        memory_barrier_resources(
+            encoder,
+            &[scratch.q.as_ref(), scratch.k.as_ref(), scratch.v.as_ref()],
+        );
         encode_rope(
             encoder,
             device,
@@ -4086,12 +4079,6 @@ fn encode_moe_layer_fused(
             pos as u32,
             ff_buf,
         )?;
-        mrs.end_op(&srcs, &dsts);
-    }
-    {
-        let srcs = [scratch.k.as_ref()];
-        let dsts = [scratch.k.as_ref()];
-        mrs.begin_op(encoder, &srcs, &dsts);
         encode_rope(
             encoder,
             device,
@@ -4108,9 +4095,10 @@ fn encode_moe_layer_fused(
     let token_elems = (n_kv_heads * head_dim) as u32;
     let offset = (pos * n_kv_heads * head_dim) as u32;
     {
-        let srcs = [scratch.k.as_ref()];
-        let dsts = [kv.k.as_ref()];
+        let srcs = [scratch.k.as_ref(), scratch.v.as_ref()];
+        let dsts = [kv.k.as_ref(), kv.v.as_ref()];
         mrs.begin_op(encoder, &srcs, &dsts);
+        // RoPE must complete before KV store (begin_op may already barrier).
         encode_kv_store_append(
             encoder,
             device,
@@ -4120,12 +4108,6 @@ fn encode_moe_layer_fused(
             offset,
             token_elems,
         )?;
-        mrs.end_op(&srcs, &dsts);
-    }
-    {
-        let srcs = [scratch.v.as_ref()];
-        let dsts = [kv.v.as_ref()];
-        mrs.begin_op(encoder, &srcs, &dsts);
         encode_kv_store_append(
             encoder,
             device,
@@ -4163,7 +4145,6 @@ fn encode_moe_layer_fused(
         encode_matvec(encoder, device, &layer.o, o_w, &scratch.attn, &scratch.o)?;
         mrs.end_op(&srcs, &dsts);
     }
-    // h += o; x2 = rms(h) — h is both src and dst.
     {
         let srcs = [scratch.h.as_ref(), scratch.o.as_ref()];
         let dsts = [scratch.h.as_ref(), scratch.x2.as_ref()];
@@ -4210,8 +4191,6 @@ fn encode_moe_layer_fused(
         )?;
         mrs.end_op(&srcs, &dsts);
     }
-    // Concurrent gate∥up is faster on Host B than fused gate+up+silu
-    // (one dispatch). Opt into fused with FERROX_METAL_MOE_FUSED_GATE_UP=1.
     let fused_gate_up = matches!(
         std::env::var("FERROX_METAL_MOE_FUSED_GATE_UP").ok().as_deref(),
         Some("1") | Some("true") | Some("on")
@@ -4306,7 +4285,7 @@ fn encode_moe_layer_fused(
                 1,
                 true,
                 true,
-                true, // act already filled by fused gate_up_silu
+                true,
             )?;
             mrs.end_op(&srcs, &dsts);
         }

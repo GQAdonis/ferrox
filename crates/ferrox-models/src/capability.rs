@@ -301,10 +301,9 @@ pub fn architecture_catalog() -> &'static [ArchProfile] {
             ArchPath::GenericGqa { rope: Neox },
             PerHead,
         ));
-        // Gemma-4 text GGUFs (E2B) currently ship per-layer embeddings,
-        // shared-KV layers, and split SWA/full head dims
-        // (`attention.key_length` vs `key_length_swa`). Fail closed like
-        // gemma3n until a dedicated path lands — do not pretend GenericGqa.
+        // Gemma-4 text GGUFs (E2B): per-layer embeddings, shared-KV
+        // layers, and split SWA/full head dims — dedicated
+        // [`crate::gemma4_engine::Gemma4Engine`] (not GenericGqa).
         for n in ["gemma4", "gemma4-assistant"] {
             v.push(prof(
                 n,
@@ -313,7 +312,7 @@ pub fn architecture_catalog() -> &'static [ArchProfile] {
                 KvIswa,
                 Neox,
                 ArchPath::DedicatedOnly {
-                    reason: "gemma4 E2B needs per-layer emb + shared KV + SWA/full head-dim split",
+                    reason: "use load_gemma4_engine_from_path / ServedEngine::Gemma4",
                 },
                 PerHead,
             ));
@@ -728,7 +727,7 @@ mod tests {
                     resolve_architecture(arch),
                     Some(ArchPath::DedicatedOnly { .. })
                 ),
-                "{arch} E2B needs dedicated engine (per-layer emb / shared KV / SWA split)"
+                "{arch} uses dedicated Gemma4 engine"
             );
             assert_eq!(
                 resolve_profile(arch).map(|p| p.family),

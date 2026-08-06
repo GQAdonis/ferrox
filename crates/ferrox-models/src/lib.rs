@@ -17,6 +17,8 @@ pub mod engine;
 pub mod engine_factory;
 pub mod execution_plan;
 pub mod gdn;
+pub mod gemma4_engine;
+pub mod gemma4_gguf_loader;
 pub mod glm52_decoder;
 pub mod glm52_gguf_loader;
 pub mod glm_dsa;
@@ -57,12 +59,15 @@ pub use capability::{
 pub use config::{deepseek_v4_pro, glm_5_2, kimi_k3, FfnActivation, ModelConfig, RopeLayout};
 pub use decoder::Decoder;
 pub use engine::{
-    DeepseekV4Engine, Engine, Glm52Engine, KimiEngine, MlaEngine, MlaLayerWeights, TextTokenizer,
+    DeepseekV4Engine, Engine, Glm52Engine, KimiEngine, MlaDenseFfn, MlaEngine, MlaLayerFfn,
+    MlaLayerWeights, MlaMoeFfn, MlaMoeRuntime, TextTokenizer,
 };
 pub use engine_factory::{
-    ensure_generic_decoder, load_glm52_engine_from_path, load_mla_engine_from_path,
-    select_engine_kind, EngineSelectError, SelectedEngineKind, ServedEngine,
+    ensure_generic_decoder, load_gemma4_engine_from_path, load_glm52_engine_from_path,
+    load_mla_engine_from_path, select_engine_kind, EngineSelectError, SelectedEngineKind,
+    ServedEngine,
 };
+pub use gemma4_engine::{Gemma4Engine, Gemma4Hparams, GEMMA4_ARCHES};
 pub use execution_plan::{ExecutionPlan, FusedOpCaps, MemoryPlan, PlanGeometry};
 pub use loader::LoadError;
 pub use output_projection::grouped_output_projection;

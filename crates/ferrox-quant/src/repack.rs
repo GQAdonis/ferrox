@@ -782,10 +782,14 @@ mod neon {
                 ret = sdot_lane(ret, b6, a1, 2);
                 ret = sdot_lane(ret, b7, a1, 3);
 
+                // Four f16 weight scales at blk[0..8] — load as u16 then
+                // convert (avoids 4× scalar half::f16 path per block).
+                let d_bits = vld1_u16(blk as *const u16);
                 let mut dw = [0f32; 4];
-                for j in 0..4 {
-                    dw[j] = f16_from_bytes(std::slice::from_raw_parts(blk.add(j * 2), 2));
-                }
+                dw[0] = f16::from_bits(vget_lane_u16(d_bits, 0)).to_f32();
+                dw[1] = f16::from_bits(vget_lane_u16(d_bits, 1)).to_f32();
+                dw[2] = f16::from_bits(vget_lane_u16(d_bits, 2)).to_f32();
+                dw[3] = f16::from_bits(vget_lane_u16(d_bits, 3)).to_f32();
                 let scale = vmulq_n_f32(vld1q_f32(dw.as_ptr()), act.d[b]);
                 acc = vfmaq_f32(acc, vcvtq_f32_s32(ret), scale);
             }

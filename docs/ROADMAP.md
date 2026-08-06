@@ -10,10 +10,10 @@ What ships today: [`FEATURES.md`](FEATURES.md) · [`MODELS.md`](MODELS.md).
 
 **Performance**
 
-- Re-pin OLMoE Metal; chase Gap ≤ ~1.05× (fused multi-layer prefill CB)
+- Re-pin OLMoE Metal; chase Gap ≤ ~1.05× (full multi-layer prefill stack CB)
 - Deferred MoE residual (dense-style) — correct tokens then land
 - Improve Metal dense prefill `prompt_per_second` (true simdgroup `mul_mm`)
-- CPU: close remaining SmolLM2/Qwen3/Phi-3 Q8/Q5 gaps (~1.2–1.6×)
+- CPU: close remaining SmolLM2/Qwen3/Phi-3 gaps (Q5_Kx8 / deeper Q8)
 - CUDA fair-chat pins on a GPU host
 
 **Models**

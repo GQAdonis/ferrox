@@ -326,9 +326,9 @@ def main() -> None:
     lines.append(
         "1. Metal fair-chat 8B is ahead (~0.92×); 3B ~parity (~0.97×). Keep "
         "watching `prompt_per_second` vs llama after FA-vec prefill.\n"
-        "2. OLMoE Metal ~1.43× — Concurrent gate∥up remains best; gate→silu×up "
-        "and sparse `mul_mm_id` host loops regress. Prefill still needs a "
-        "fused multi-layer CB (scratch reuse landed). See `docs/ROADMAP.md`.\n"
+        "2. OLMoE Metal ~1.43× decode — Concurrent gate∥up remains best. Prefill: "
+        "fused attn+O residual CB + skip host KV download landed; full multi-layer "
+        "stack CB still open. See `docs/ROADMAP.md`.\n"
         "3. CUDA — re-measure on comparable CUDA hardware (no in-tree CUDA pin; "
         "skipped on darwin via `--fit-host`).\n"
         "4. Gemma-4-E2B: `Gemma4Engine` loads; tokenizer `gemma4` still "
@@ -339,9 +339,9 @@ def main() -> None:
         "(MoE-after-dense wired in `MlaEngine`).\n"
         "7. Qwen2-MoE / Mixtral: missing GGUF or `--fit-host` RAM skip on Host B.\n"
         "8. Suite contention: re-pin outliers alone if full-suite medians disagree with CLI.\n"
-        "9. CPU: Q8_0x4 + Q5/Q6 int-dot closed most reds (TinyLlama/Gemma-3/Gemma-2 "
-        "ahead or parity). Remaining: SmolLM2 ~1.63×, Qwen3/Phi-3 ~1.23×, "
-        "Qwen2.5 ~1.12×.\n"
+        "9. CPU: Q8_0x4 wired into dense FFN `apply_cpu_q8` + serial floor for tiny "
+        "mats (SmolLM2 fair-chat ~70→85 tok/s). Remaining: SmolLM2 ~1.6× vs llama, "
+        "Qwen3/Phi-3 ~1.2×, Qwen2.5 ~1.1×; Q5_Kx8 next for Phi-3.\n"
     )
 
     OUT.write_text("".join(lines))

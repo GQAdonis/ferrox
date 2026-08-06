@@ -41,11 +41,12 @@ use crate::elem::{
 };
 use crate::embd::{encode_get_rows, EmbdKind};
 use crate::gpu::{
-    compute_encoder_concurrent, encode_matvec, encode_moe_topk_softmax, encode_q4_0_moe_gate_up_id,
-    encode_q4_0_moe_gate_then_up_silu, encode_q4_0_moe_gate_up_silu_fused, encode_q4_0_moe_id,
-    encode_q4_0_moe_id_ex, encode_q4_0_moe_topk, ensure_pipeline, memory_barrier_buffers,
-    memory_barrier_resources, resident_f32_buffer, resident_weight_buffer, shared_metal,
-    MatvecLaunch, MetalError, MoeExpertLaunch, MoePackedQ4, ResidentF32Buffer, ResidentWeightBuffer,
+    compute_encoder_concurrent, encode_matvec, encode_matvec_with_offsets, encode_moe_topk_softmax,
+    encode_q4_0_moe_gate_up_id, encode_q4_0_moe_gate_then_up_silu, encode_q4_0_moe_gate_up_silu_fused,
+    encode_q4_0_moe_id, encode_q4_0_moe_id_ex, encode_q4_0_moe_topk, encode_q4_0_mul_mm,
+    ensure_pipeline, memory_barrier_buffers, memory_barrier_resources, resident_f32_buffer,
+    resident_weight_buffer, shared_metal, MatvecLaunch, MetalError, MoeExpertLaunch, MoePackedQ4,
+    ResidentF32Buffer, ResidentWeightBuffer,
 };
 use crate::moe_ranges::MoeMemRanges;
 use objc2::rc::Retained;
@@ -5486,6 +5487,7 @@ pub fn launch_prefill_attn_block(
     freq_factors: Option<&[f32]>,
     start_pos: usize,
     attn_softcap: Option<f32>,
+    return_kv: bool,
 ) -> Result<(Vec<f32>, Vec<f32>, Vec<f32>), MetalError> {
     let head_dim = kv.head_dim;
     let n_kv_heads = kv.n_kv_heads;
@@ -5596,6 +5598,9 @@ pub fn launch_prefill_attn_block(
     let attn = unsafe {
         std::slice::from_raw_parts(attn_ptr.as_ptr() as *const f32, n_q * q_width).to_vec()
     };
+    if !return_kv {
+        return Ok((attn, Vec::new(), Vec::new()));
+    }
     let k_ptr = k_buf.contents();
     let v_ptr = v_buf.contents();
     let k_roped = unsafe {
@@ -5605,6 +5610,184 @@ pub fn launch_prefill_attn_block(
         std::slice::from_raw_parts(v_ptr.as_ptr() as *const f32, n_q * kv_width).to_vec()
     };
     Ok((attn, k_roped, v_roped))
+}
+
+/// Prefill attn + Q4_0 O projection + residual add in one CB.
+/// Skips host K/V download (Metal KV is authoritative). Returns `h_out`.
+#[allow(clippy::too_many_arguments)]
+pub fn launch_prefill_attn_o_residual(
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    h_in: &[f32],
+    o: &MatvecLaunch<'_>,
+    kv: &mut MetalKvBuffers,
+    n_heads: usize,
+    n_q: usize,
+    rope_layout: MetalRopeLayout,
+    rope_theta: f32,
+    freq_factors: Option<&[f32]>,
+    start_pos: usize,
+    attn_softcap: Option<f32>,
+) -> Result<Vec<f32>, MetalError> {
+    if o.fn_name != "q4_0_matvec" || o.block_bytes != 18 {
+        return Err(MetalError::CommandFailed);
+    }
+    let head_dim = kv.head_dim;
+    let n_kv_heads = kv.n_kv_heads;
+    let q_width = n_heads * head_dim;
+    let kv_width = n_kv_heads * head_dim;
+    let hidden = o.rows;
+    assert_eq!(q.len(), n_q * q_width);
+    assert_eq!(k.len(), n_q * kv_width);
+    assert_eq!(v.len(), n_q * kv_width);
+    assert_eq!(h_in.len(), n_q * hidden);
+    assert_eq!(start_pos, kv.seq_len);
+    if kv.seq_len + n_q > kv.capacity {
+        return Err(MetalError::CommandFailed);
+    }
+    if let Some(ff) = freq_factors {
+        assert_eq!(ff.len(), head_dim / 2);
+    }
+    if n_q == 0 {
+        return Ok(Vec::new());
+    }
+
+    let shared = shared_metal()?;
+    let device = &shared.device;
+    let queue = &shared.queue;
+
+    let q_buf = upload_f32(device, q)?;
+    let k_buf = upload_f32(device, k)?;
+    let v_buf = upload_f32(device, v)?;
+    let mut h_owned = h_in.to_vec();
+    let h_buf = unsafe {
+        device.newBufferWithBytes_length_options(
+            NonNull::new(h_owned.as_mut_ptr() as *mut _).unwrap(),
+            h_owned.len() * 4,
+            MTLResourceOptions::StorageModeShared,
+        )
+    }
+    .ok_or(MetalError::BufferAllocFailed)?;
+    let attn_buf = alloc_f32_buffer(device, n_q * q_width)?;
+    let o_buf = alloc_f32_buffer(device, n_q * hidden)?;
+    let o_w = resident_weight_buffer(device, o.weights)?;
+    let ff_buf = match freq_factors {
+        Some(ff) => Some(upload_f32(device, ff)?),
+        None => None,
+    };
+
+    let cmd_buf = queue.commandBuffer().ok_or(MetalError::CommandFailed)?;
+    let encoder = cmd_buf
+        .computeCommandEncoder()
+        .ok_or(MetalError::CommandFailed)?;
+
+    encode_rope_batch(
+        &encoder,
+        device,
+        rope_layout,
+        &q_buf,
+        n_heads as u32,
+        head_dim as u32,
+        rope_theta,
+        start_pos as u32,
+        n_q as u32,
+        ff_buf.as_deref(),
+    )?;
+    encode_rope_batch(
+        &encoder,
+        device,
+        rope_layout,
+        &k_buf,
+        n_kv_heads as u32,
+        head_dim as u32,
+        rope_theta,
+        start_pos as u32,
+        n_q as u32,
+        ff_buf.as_deref(),
+    )?;
+
+    let token_elems = (n_q * kv_width) as u32;
+    let offset = (kv.seq_len * kv_width) as u32;
+    encode_kv_store_append(
+        &encoder,
+        device,
+        &k_buf,
+        kv,
+        KvPlane::K,
+        offset,
+        token_elems,
+    )?;
+    encode_kv_store_append(
+        &encoder,
+        device,
+        &v_buf,
+        kv,
+        KvPlane::V,
+        offset,
+        token_elems,
+    )?;
+
+    encode_gqa_prefill_with_kv(
+        &encoder,
+        device,
+        &q_buf,
+        kv,
+        &attn_buf,
+        n_heads as u32,
+        n_kv_heads as u32,
+        head_dim as u32,
+        n_q as u32,
+        start_pos as u32,
+        attn_softcap,
+    )?;
+    // Attn must finish before O reads it.
+    memory_barrier_resources(&encoder, &[attn_buf.as_ref()]);
+    // Small T: per-token matvec (mul_mm underperforms below ~32).
+    // Large T: weight-reuse mul_mm.
+    if n_q >= 32 {
+        let n_blocks = o.row_bytes / o.block_bytes;
+        encode_q4_0_mul_mm(
+            &encoder,
+            device,
+            &o_w,
+            &attn_buf,
+            &o_buf,
+            o.row_bytes,
+            n_blocks,
+            o.rows,
+            n_q,
+        )?;
+    } else {
+        for t in 0..n_q {
+            encode_matvec_with_offsets(
+                &encoder,
+                device,
+                o,
+                &o_w,
+                &attn_buf,
+                t * q_width * 4,
+                &o_buf,
+                t * hidden * 4,
+            )?;
+        }
+    }
+    memory_barrier_resources(&encoder, &[o_buf.as_ref()]);
+    encode_vec_add(
+        &encoder,
+        device,
+        &h_buf,
+        &o_buf,
+        (n_q * hidden) as u32,
+    )?;
+    encoder.endEncoding();
+    cmd_buf.commit();
+    cmd_buf.waitUntilCompleted();
+
+    kv.seq_len += n_q;
+
+    let h_ptr = h_buf.contents();
+    Ok(unsafe { std::slice::from_raw_parts(h_ptr.as_ptr() as *const f32, n_q * hidden).to_vec() })
 }
 
 /// Host-upload multi-pos RoPE (parity testing). Layout `[n_tokens, n_heads, head_dim]`.
@@ -6319,6 +6502,7 @@ mod tests {
             None,
             start_pos,
             None,
+            true,
         )
         .expect("prefill attn");
         assert_eq!(kv.seq_len, n_q);
@@ -6402,6 +6586,7 @@ mod tests {
             None,
             0,
             None,
+            false,
         )
         .expect("f16 prefill");
         let (attn_q8, _, _) = launch_prefill_attn_block(
@@ -6416,6 +6601,7 @@ mod tests {
             None,
             0,
             None,
+            false,
         )
         .expect("q8 prefill");
         assert_eq!(attn_f16.len(), attn_q8.len());

@@ -13,7 +13,8 @@ Verified against llama.cpp on the same host and GGUF (Gap =
   Qwen2.5/Qwen3, Gemma-2/3, Phi-3/4. Llama-8B Metal fair-chat Gap
   **~0.92×**; Llama-3.2-3B **~0.97×**.
 - **MoE** — OLMoE-1B-7B (Metal Concurrent + fused encode groups +
-  `MoeMemRanges` + `mul_mv_id` / prefill `mul_mm_id`; CPU int-dot +
+  `MoeMemRanges` + `mul_mv_id` / prefill `mul_mm_id` + fused attn+O
+  residual CB (`FERROX_METAL_PREFILL_FUSE_O=1`); CPU int-dot +
   interleaved Q4_K).
 - **MLA** — dense-lead and MoE-after-dense `deepseek2` / `mistral4`.
 - **Gemma-4** — dedicated engine (per-layer emb + shared KV + SWA/full);

@@ -241,6 +241,21 @@ impl KvCache {
         Ok(())
     }
 
+    /// Advance length by `n` positions without storing real K/V values
+    /// (zero-fill). Used when Metal owns the KV plane and the host cache
+    /// only needs matching `seq_len` for sync checks.
+    pub fn advance_len(&mut self, n: usize) -> Result<(), KvPoolExhausted> {
+        if n == 0 {
+            return Ok(());
+        }
+        let elems_per_position = self.n_kv_heads * self.head_dim;
+        let zeros = vec![0f32; elems_per_position];
+        for _ in 0..n {
+            self.push(&zeros, &zeros)?;
+        }
+        Ok(())
+    }
+
     /// Returns this cache's blocks to its shared pool immediately
     /// (rather than waiting for `Drop`) and detaches it from pool
     /// accounting; a no-op for caches that aren't pool-backed, and

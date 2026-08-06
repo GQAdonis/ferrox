@@ -2756,50 +2756,94 @@ impl Decoder {
                             && start_pos == cache.seq_len
                             && swa_fits
                         {
-                            match ferrox_metal::attn::launch_prefill_attn_block(
-                                &q_batch,
-                                &k_batch,
-                                &v_batch,
-                                &mut metal_kvs[l],
-                                n_heads,
-                                batch_size,
-                                self.metal_rope_layout(),
-                                self.config.layer_rope_theta(l),
-                                self.config.rope_freqs.as_deref(),
-                                start_pos,
-                                self.config.attn_logit_softcap,
-                            ) {
-                                Ok((attn_out_batch, k_roped, v_roped)) => {
-                                    for b in 0..batch_size {
-                                        cache
-                                            .push(
-                                                &k_roped[b * kv_width..(b + 1) * kv_width],
-                                                &v_roped[b * kv_width..(b + 1) * kv_width],
-                                            )
-                                            .expect(
-                                                "unbounded/planned KvCache growth is infallible",
-                                            );
-                                    }
-                                    let projected_batch =
-                                        layer.attn.o_proj.apply_batch(&attn_out_batch, batch_size);
-                                    let projected_batch =
-                                        if let Some(post) = &layer.attn.post_attn_norm {
-                                            projected_batch
-                                                .chunks(hidden_dim)
-                                                .flat_map(|row| {
-                                                    rms_norm(row, post, self.config.rms_norm_eps)
-                                                })
-                                                .collect::<Vec<_>>()
-                                        } else {
-                                            projected_batch
-                                        };
-                                    for (h, p) in
-                                        hidden_batch.iter_mut().zip(projected_batch.iter())
-                                    {
-                                        *h += p;
-                                    }
+                            match {
+                                let o_launch = Self::metal_matvec_launch(&layer.attn.o_proj);
+                                // Prefill O fusion: opt-in. Default off until
+                                // fair-chat prompt_per_s proves a win without
+                                // decode noise (Host B contention-sensitive).
+                                let fuse_o = matches!(
+                                    std::env::var("FERROX_METAL_PREFILL_FUSE_O").ok().as_deref(),
+                                    Some("1") | Some("true") | Some("on")
+                                ) && o_launch.as_ref().is_some_and(|o| {
+                                    o.fn_name == "q4_0_matvec"
+                                        && o.block_bytes == 18
+                                        && layer.attn.post_attn_norm.is_none()
+                                });
+                                if fuse_o {
+                                    let o = o_launch.as_ref().unwrap();
+                                    ferrox_metal::attn::launch_prefill_attn_o_residual(
+                                        &q_batch,
+                                        &k_batch,
+                                        &v_batch,
+                                        &hidden_batch,
+                                        o,
+                                        &mut metal_kvs[l],
+                                        n_heads,
+                                        batch_size,
+                                        self.metal_rope_layout(),
+                                        self.config.layer_rope_theta(l),
+                                        self.config.rope_freqs.as_deref(),
+                                        start_pos,
+                                        self.config.attn_logit_softcap,
+                                    )
+                                    .map(|h_out| {
+                                        cache.advance_len(batch_size).expect(
+                                            "unbounded/planned KvCache growth is infallible",
+                                        );
+                                        hidden_batch = h_out;
+                                        true
+                                    })
+                                } else {
+                                    ferrox_metal::attn::launch_prefill_attn_block(
+                                        &q_batch,
+                                        &k_batch,
+                                        &v_batch,
+                                        &mut metal_kvs[l],
+                                        n_heads,
+                                        batch_size,
+                                        self.metal_rope_layout(),
+                                        self.config.layer_rope_theta(l),
+                                        self.config.rope_freqs.as_deref(),
+                                        start_pos,
+                                        self.config.attn_logit_softcap,
+                                        false,
+                                    )
+                                    .map(|(attn_out_batch, _, _)| {
+                                        cache.advance_len(batch_size).expect(
+                                            "unbounded/planned KvCache growth is infallible",
+                                        );
+                                        let projected_batch = layer
+                                            .attn
+                                            .o_proj
+                                            .apply_batch(&attn_out_batch, batch_size);
+                                        let projected_batch =
+                                            if let Some(post) = &layer.attn.post_attn_norm {
+                                                projected_batch
+                                                    .chunks(hidden_dim)
+                                                    .flat_map(|row| {
+                                                        rms_norm(
+                                                            row,
+                                                            post,
+                                                            self.config.rms_norm_eps,
+                                                        )
+                                                    })
+                                                    .collect::<Vec<_>>()
+                                            } else {
+                                                projected_batch
+                                            };
+                                        for (h, p) in
+                                            hidden_batch.iter_mut().zip(projected_batch.iter())
+                                        {
+                                            *h += p;
+                                        }
+                                        true
+                                    })
+                                }
+                            } {
+                                Ok(true) => {
                                     did_metal_prefill = true;
                                 }
+                                Ok(false) => {}
                                 Err(e) => {
                                     eprintln!(
                                         "ferrox: Metal prefill attn failed, CPU fallback: {e}"

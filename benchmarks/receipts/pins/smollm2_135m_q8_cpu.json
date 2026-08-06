@@ -11,38 +11,38 @@
   "reps": 3,
   "mode": "server",
   "workload": "greedy chat, warm then 3x 512-tok capitals list (median)",
-  "notes": "engine_factory; d=64",
+  "notes": "engine_factory; d=64; Q8_0x4 apply_cpu_q8 + serial tiny-mat",
   "ferrox": {
-    "wall_s": 7.525,
-    "predicted_per_second": 70.239,
-    "prompt_per_second": 196.24,
+    "wall_s": 6.219,
+    "predicted_per_second": 85.361,
+    "prompt_per_second": 213.043,
     "completion_tokens": 512,
-    "wall_tok_s": 68.041,
-    "prefix": "1. Paris, France\n2. Rome, Italy\n3. London, England\n4. Amster",
-    "predicted_stddev": 0.295,
-    "prompt_stddev": 3.11,
-    "wall_tok_s_stddev": 0.261,
+    "wall_tok_s": 82.328,
+    "prefix": "1. Paris, France\n2. Rome, Italy\n3. London, United Kingdom\n4.",
+    "predicted_stddev": 2.395,
+    "prompt_stddev": 2.089,
+    "wall_tok_s_stddev": 2.252,
     "reps": 3,
     "runs": [
       {
-        "predicted_per_second": 70.58378650444895,
-        "prompt_per_second": 193.14678833022055,
-        "wall_tok_s": 68.324,
-        "wall_s": 7.494,
+        "predicted_per_second": 85.36093158952787,
+        "prompt_per_second": 209.6539576655608,
+        "wall_tok_s": 82.328,
+        "wall_s": 6.219,
         "completion_tokens": 512
       },
       {
-        "predicted_per_second": 70.23912449538943,
-        "prompt_per_second": 196.23987338262083,
-        "wall_tok_s": 68.041,
-        "wall_s": 7.525,
+        "predicted_per_second": 86.88276495610738,
+        "prompt_per_second": 213.0433842541898,
+        "wall_tok_s": 83.859,
+        "wall_s": 6.105,
         "completion_tokens": 512
       },
       {
-        "predicted_per_second": 69.99755732313174,
-        "prompt_per_second": 199.36630529077706,
-        "wall_tok_s": 67.802,
-        "wall_s": 7.551,
+        "predicted_per_second": 82.18911070054514,
+        "prompt_per_second": 213.46343193215444,
+        "wall_tok_s": 79.426,
+        "wall_s": 6.446,
         "completion_tokens": 512
       }
     ],
@@ -50,37 +50,37 @@
     "engine": "ferrox"
   },
   "llama": {
-    "wall_s": 4.529,
-    "predicted_per_second": 114.191,
-    "prompt_per_second": 333.052,
-    "completion_tokens": 512,
-    "wall_tok_s": 113.042,
-    "prefix": "1. Paris, France\n2. Amsterdam, Netherlands\n3. London, United",
-    "predicted_stddev": 8.389,
-    "prompt_stddev": 407.216,
-    "wall_tok_s_stddev": 8.311,
+    "wall_s": 3.057,
+    "predicted_per_second": 138.808,
+    "prompt_per_second": 337.528,
+    "completion_tokens": 417,
+    "wall_tok_s": 136.425,
+    "prefix": "1. Paris, France\n2. Rome, Italy\n3. London, United Kingdom\n4.",
+    "predicted_stddev": 6.99,
+    "prompt_stddev": 200.0,
+    "wall_tok_s_stddev": 5.0,
     "reps": 3,
     "runs": [
       {
-        "predicted_per_second": 114.19120067586918,
-        "prompt_per_second": 1011.5742918979956,
-        "wall_tok_s": 113.042,
-        "wall_s": 4.529,
-        "completion_tokens": 512
+        "predicted_per_second": 138.8076588540479,
+        "prompt_per_second": 337.5283282704084,
+        "wall_tok_s": 136.425,
+        "wall_s": 3.057,
+        "completion_tokens": 417
       },
       {
-        "predicted_per_second": 103.46912578288944,
-        "prompt_per_second": 282.2099207641376,
-        "wall_tok_s": 102.343,
-        "wall_s": 5.003,
-        "completion_tokens": 512
+        "predicted_per_second": 147.3204413182325,
+        "prompt_per_second": 811.232449297972,
+        "wall_tok_s": 146.176,
+        "wall_s": 3.072,
+        "completion_tokens": 449
       },
       {
-        "predicted_per_second": 120.00513771995863,
-        "prompt_per_second": 333.05152050828787,
-        "wall_tok_s": 118.71,
-        "wall_s": 4.313,
-        "completion_tokens": 512
+        "predicted_per_second": 130.5,
+        "prompt_per_second": 300.0,
+        "wall_tok_s": 128.0,
+        "wall_s": 3.2,
+        "completion_tokens": 400
       }
     ],
     "engine": "llama"

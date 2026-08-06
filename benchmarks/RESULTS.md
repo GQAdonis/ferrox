@@ -23,7 +23,7 @@ Keep off (regressions): legacy GQA NSG=4, sequential GREEDY argmax, float4 elem,
 | TinyLlama-1.1B-Chat-v1.0 Q8_0 | cpu | **38.13** ±0.9 | **30.12** ±4.0 (−ngl 0) | 🟢 **~0.79×** | 🟢 **ferrox** | ok | [`tinyllama_q8_cpu`](receipts/pins/tinyllama_q8_cpu.json) |
 | Llama-3.2-1B-Instruct Q4_K_M | metal | **137.88** ±5.0 | **136.99** ±0.4 | ⚪ **1.00×** | ⚪ parity | ok | [`llama32_1b_q4km_metal`](receipts/pins/llama32_1b_q4km_metal.json) |
 | OLMoE-1B-7B-0924 Q4_0 | cpu | **31.08** ±0.7 | **29.79** ±0.7 (−ngl 0) | ⚪ **~0.96×** | ⚪ parity | ok | [`olmoe_q4_cpu`](receipts/pins/olmoe_q4_cpu.json) |
-| OLMoE-1B-7B-0924 Q4_0 | metal | **105.50** ±2.0 | **151.25** ±8.7 | 🔴 **~1.43×** | 🔴 **llama** | ok | [`olmoe_q4_metal`](receipts/pins/olmoe_q4_metal.json) |
+| OLMoE-1B-7B-0924 Q4_0 | metal | **111.57** ±1.0 | **162.01** ±7.4 | 🔴 **~1.45×** | 🔴 **llama** | ok | [`olmoe_q4_metal`](receipts/pins/olmoe_q4_metal.json) |
 | OLMoE-1B-7B-0924 Q4_0 | cuda | — | — | — | — | no pin | — |
 | Llama-3.1-8B-Instruct Q4_K_M | metal | **28.17** ±0.8 | **25.86** ±1.2 | 🟢 **~0.92×** | 🟢 **ferrox** | ok | [`llama31_8b_q4km_metal`](receipts/pins/llama31_8b_q4km_metal.json) |
 | Llama-3.1-8B-Instruct Q4_K_M | cuda | — | — | — | — | no pin | — |
@@ -37,7 +37,7 @@ Keep off (regressions): legacy GQA NSG=4, sequential GREEDY argmax, float4 elem,
 | Gemma-2-2B-IT Q4_K_M | metal | **61.73** ±2.5 | **65.34** ±2.0 | 🔴 **~1.06×** | 🔴 **llama** | ok | [`gemma2_2b_q4km_metal`](receipts/pins/gemma2_2b_q4km_metal.json) |
 | Gemma-2-2B-IT Q4_K_M | cpu | **18.02** ±0.5 | **18.15** ±2.4 (−ngl 0) | ⚪ **1.00×** | ⚪ parity | ok | [`gemma2_2b_q4km_cpu`](receipts/pins/gemma2_2b_q4km_cpu.json) |
 | SmolLM2-135M-Instruct Q8_0 | metal | **282.29** ±0.8 | **217.91** ±4.4 | 🟢 **~0.77×** | 🟢 **ferrox** | ok | [`smollm2_135m_q8_metal`](receipts/pins/smollm2_135m_q8_metal.json) |
-| SmolLM2-135M-Instruct Q8_0 | cpu | **70.24** ±0.3 | **114.19** ±8.4 (−ngl 0) | 🔴 **~1.63×** | 🔴 **llama** | ok | [`smollm2_135m_q8_cpu`](receipts/pins/smollm2_135m_q8_cpu.json) |
+| SmolLM2-135M-Instruct Q8_0 | cpu | **85.36** ±2.4 | **138.81** ±7.0 (−ngl 0) | 🔴 **~1.63×** | 🔴 **llama** | ok | [`smollm2_135m_q8_cpu`](receipts/pins/smollm2_135m_q8_cpu.json) |
 | Qwen2.5-0.5B-Instruct Q8_0 | metal | **185.66** ±1.1 | **116.03** ±0.4 | 🟢 **~0.62×** | 🟢 **ferrox** | ok | [`qwen25_05b_q8_metal`](receipts/pins/qwen25_05b_q8_metal.json) |
 | Qwen2.5-0.5B-Instruct Q8_0 | cpu | **62.89** ±0.1 | **70.56** ±3.1 (−ngl 0) | 🔴 **~1.12×** | 🔴 **llama** | ok | [`qwen25_05b_q8_cpu`](receipts/pins/qwen25_05b_q8_cpu.json) |
 | Qwen3-0.6B Q8_0 | metal | **131.50** ±0.9 | **107.06** ±1.9 | 🟢 **~0.81×** | 🟢 **ferrox** | ok | [`qwen3_06b_q8_metal`](receipts/pins/qwen3_06b_q8_metal.json) |
@@ -78,11 +78,11 @@ Pins that used `llama-cli` or rejected options are omitted.
 ## Open
 
 1. Metal fair-chat 8B is ahead (~0.92×); 3B ~parity (~0.97×). Keep watching `prompt_per_second` vs llama after FA-vec prefill.
-2. OLMoE Metal ~1.43× — Concurrent gate∥up remains best; gate→silu×up and sparse `mul_mm_id` host loops regress. Prefill still needs a fused multi-layer CB (scratch reuse landed). See `docs/ROADMAP.md`.
+2. OLMoE Metal ~1.43× decode — Concurrent gate∥up remains best. Prefill: fused attn+O residual CB + skip host KV download landed; full multi-layer stack CB still open. See `docs/ROADMAP.md`.
 3. CUDA — re-measure on comparable CUDA hardware (no in-tree CUDA pin; skipped on darwin via `--fit-host`).
 4. Gemma-4-E2B: `Gemma4Engine` loads; tokenizer `gemma4` still byte-fallback; suite `expect=refuse` until fair-chat pin. Homebrew llama also unknown-arch.
 5. CB multi-request tok/s receipt.
 6. DS4 / GLM / MLA MoE real-checkpoint e2e when feasible (MoE-after-dense wired in `MlaEngine`).
 7. Qwen2-MoE / Mixtral: missing GGUF or `--fit-host` RAM skip on Host B.
 8. Suite contention: re-pin outliers alone if full-suite medians disagree with CLI.
-9. CPU: Q8_0x4 + Q5/Q6 int-dot closed most reds (TinyLlama/Gemma-3/Gemma-2 ahead or parity). Remaining: SmolLM2 ~1.63×, Qwen3/Phi-3 ~1.23×, Qwen2.5 ~1.12×.
+9. CPU: Q8_0x4 wired into dense FFN `apply_cpu_q8` + serial floor for tiny mats (SmolLM2 fair-chat ~70→85 tok/s). Remaining: SmolLM2 ~1.6× vs llama, Qwen3/Phi-3 ~1.2×, Qwen2.5 ~1.1×; Q5_Kx8 next for Phi-3.

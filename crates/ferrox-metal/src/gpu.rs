@@ -1223,19 +1223,52 @@ pub fn launch_q4_0_mul_mm(
         .newBufferWithLength_options(out_elems * 4, MTLResourceOptions::StorageModeShared)
         .ok_or(MetalError::BufferAllocFailed)?;
 
-    let pipeline = ensure_pipeline(device, Q4_0_MUL_MM_KERNEL_SRC, "q4_0_mul_mm")?;
-
     let cmd_buf = queue.commandBuffer().ok_or(MetalError::CommandFailed)?;
     let enc = cmd_buf
         .computeCommandEncoder()
         .ok_or(MetalError::CommandFailed)?;
 
+    encode_q4_0_mul_mm(
+        &enc,
+        device,
+        &weights_buf,
+        &x_buf,
+        &out_buf,
+        row_bytes,
+        n_blocks_per_row,
+        rows,
+        batch_size,
+    )?;
+    enc.endEncoding();
+    cmd_buf.commit();
+    cmd_buf.waitUntilCompleted();
+
+    let out_ptr = out_buf.contents();
+    let out_slice =
+        unsafe { std::slice::from_raw_parts(out_ptr.as_ptr() as *const f32, out_elems) };
+    Ok(out_slice.to_vec())
+}
+
+/// Encode one `q4_0_mul_mm` dispatch (caller owns encoder barriers).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_q4_0_mul_mm(
+    enc: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+    device: &Retained<ProtocolObject<dyn MTLDevice>>,
+    weights_buf: &ResidentWeightBuffer,
+    x_buf: &ProtocolObject<dyn MTLBuffer>,
+    out_buf: &ProtocolObject<dyn MTLBuffer>,
+    row_bytes: usize,
+    n_blocks_per_row: usize,
+    rows: usize,
+    batch_size: usize,
+) -> Result<(), MetalError> {
+    let pipeline = ensure_pipeline(device, Q4_0_MUL_MM_KERNEL_SRC, "q4_0_mul_mm")?;
     let tg = 64u32;
     unsafe {
         enc.setComputePipelineState(&pipeline.0);
         enc.setBuffer_offset_atIndex(Some(&weights_buf.buffer), weights_buf.weight_offset, 0);
-        enc.setBuffer_offset_atIndex(Some(&x_buf), 0, 1);
-        enc.setBuffer_offset_atIndex(Some(&out_buf), 0, 2);
+        enc.setBuffer_offset_atIndex(Some(x_buf), 0, 1);
+        enc.setBuffer_offset_atIndex(Some(out_buf), 0, 2);
         let mut row_bytes_u32 = row_bytes as u32;
         enc.setBytes_length_atIndex(
             NonNull::new(&mut row_bytes_u32 as *mut u32 as *mut _).unwrap(),
@@ -1275,14 +1308,7 @@ pub fn launch_q4_0_mul_mm(
             depth: 1,
         },
     );
-    enc.endEncoding();
-    cmd_buf.commit();
-    cmd_buf.waitUntilCompleted();
-
-    let out_ptr = out_buf.contents();
-    let out_slice =
-        unsafe { std::slice::from_raw_parts(out_ptr.as_ptr() as *const f32, out_elems) };
-    Ok(out_slice.to_vec())
+    Ok(())
 }
 
 /// ggml-metal `kernel_mul_mv_q4_K_f32` port: `N_R0=2` rows per simdgroup,

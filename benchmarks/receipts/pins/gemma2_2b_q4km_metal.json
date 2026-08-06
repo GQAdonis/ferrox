@@ -4,45 +4,45 @@
   "name": "Gemma-2-2B-IT Q4_K_M",
   "backend": "metal",
   "expect": "ok",
-  "date": "2026-08-05",
+  "date": "2026-08-06",
   "host": "Host B (Apple M2 Pro, 10 logical cores, 32 GiB unified)",
   "model": "~/Desktop/Dev/ferrox/models/gemma-2-2b-it-Q4_K_M.gguf",
   "max_tokens": 512,
   "reps": 3,
   "mode": "server",
   "workload": "greedy chat, warm then 3x 512-tok capitals list (median)",
-  "notes": "Attn + final logit softcap + SWA; FA-vec skipped when softcap set",
+  "notes": "Attn + final logit softcap + SWA; FA-vec softcap on decode/prefill d=256",
   "ferrox": {
-    "wall_s": 9.877,
-    "predicted_per_second": 57.711,
-    "prompt_per_second": 27.217,
+    "wall_s": 10.675,
+    "predicted_per_second": 57.752,
+    "prompt_per_second": 25.661,
     "completion_tokens": 512,
-    "wall_tok_s": 47.382,
+    "wall_tok_s": 47.849,
     "prefix": "##  European Capitals: A Journey Through History\n\nHere's a n",
-    "predicted_stddev": 1.392,
-    "prompt_stddev": 0.416,
-    "wall_tok_s_stddev": 1.556,
+    "predicted_stddev": 1.01,
+    "prompt_stddev": 0.902,
+    "wall_tok_s_stddev": 1.413,
     "reps": 3,
     "runs": [
       {
-        "predicted_per_second": 59.46855688627343,
-        "prompt_per_second": 27.435158642561127,
-        "wall_tok_s": 44.923,
-        "wall_s": 6.723,
-        "completion_tokens": 302
+        "predicted_per_second": 59.49060517893411,
+        "prompt_per_second": 27.132421132531896,
+        "wall_tok_s": 45.459,
+        "wall_s": 7.039,
+        "completion_tokens": 320
       },
       {
-        "predicted_per_second": 57.71094351781865,
-        "prompt_per_second": 26.630505839375836,
-        "wall_tok_s": 47.382,
-        "wall_s": 9.877,
-        "completion_tokens": 468
+        "predicted_per_second": 57.73122243499457,
+        "prompt_per_second": 25.49352425911008,
+        "wall_tok_s": 47.961,
+        "wall_s": 10.675,
+        "completion_tokens": 512
       },
       {
-        "predicted_per_second": 56.7191568121286,
-        "prompt_per_second": 27.21680575180187,
-        "wall_tok_s": 47.803,
-        "wall_s": 10.711,
+        "predicted_per_second": 57.751826569892295,
+        "prompt_per_second": 25.660528272476594,
+        "wall_tok_s": 47.849,
+        "wall_s": 10.7,
         "completion_tokens": 512
       }
     ],
@@ -50,37 +50,37 @@
     "engine": "ferrox"
   },
   "llama": {
-    "wall_s": 7.904,
-    "predicted_per_second": 64.073,
-    "prompt_per_second": 8222.644,
-    "completion_tokens": 467,
-    "wall_tok_s": 63.904,
+    "wall_s": 8.086,
+    "predicted_per_second": 63.595,
+    "prompt_per_second": 5842.259,
+    "completion_tokens": 512,
+    "wall_tok_s": 63.317,
     "prefix": "I can't provide a list of 80 European capital cities with a ",
-    "predicted_stddev": 0.894,
-    "prompt_stddev": 3882.269,
-    "wall_tok_s_stddev": 0.95,
+    "predicted_stddev": 0.206,
+    "prompt_stddev": 4696.633,
+    "wall_tok_s_stddev": 0.134,
     "reps": 3,
     "runs": [
       {
-        "predicted_per_second": 64.07329183669971,
-        "prompt_per_second": 11993.60341151386,
-        "wall_tok_s": 63.904,
-        "wall_s": 8.012,
+        "predicted_per_second": 63.25774938317517,
+        "prompt_per_second": 13368.206916594014,
+        "wall_tok_s": 63.093,
+        "wall_s": 8.115,
         "completion_tokens": 512
       },
       {
-        "predicted_per_second": 64.96658091162578,
-        "prompt_per_second": 8222.643896268184,
-        "wall_tok_s": 64.775,
-        "wall_s": 7.904,
+        "predicted_per_second": 63.632957149044664,
+        "prompt_per_second": 4737.46545598105,
+        "wall_tok_s": 63.317,
+        "wall_s": 8.086,
         "completion_tokens": 512
       },
       {
-        "predicted_per_second": 63.178868440761754,
-        "prompt_per_second": 4230.1184433164135,
-        "wall_tok_s": 62.878,
-        "wall_s": 7.427,
-        "completion_tokens": 467
+        "predicted_per_second": 63.59473460439169,
+        "prompt_per_second": 5842.25900681597,
+        "wall_tok_s": 63.333,
+        "wall_s": 8.084,
+        "completion_tokens": 512
       }
     ],
     "engine": "llama"

@@ -4,7 +4,7 @@
   "name": "Gemma-4-E2B-IT Q4_K_M",
   "backend": "metal",
   "expect": "refuse",
-  "date": "2026-08-05",
+  "date": "2026-08-06",
   "host": "Host B (Apple M2 Pro, 10 logical cores, 32 GiB unified)",
   "model": "~/Desktop/Dev/ferrox/models/gemma-4-E2B-it-Q4_K_M.gguf",
   "max_tokens": 512,

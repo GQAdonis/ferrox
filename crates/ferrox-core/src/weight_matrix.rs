@@ -506,6 +506,39 @@ impl WeightMatrix {
         }
     }
 
+    /// INT_DOT matvec against a pre-quantized Q8_0 activation (shared gate/up).
+    pub fn apply_cpu_q8(&self, act: &ferrox_quant::Q8Activations) -> Option<Vec<f32>> {
+        let WeightMatrix::Quantized {
+            data,
+            rows,
+            cols,
+            kind,
+        } = self
+        else {
+            return None;
+        };
+        if !matches!(*kind, QuantKind::Q8_0 | QuantKind::Q4_0) || !cpu_int_dot_enabled() {
+            return None;
+        }
+        if act.q.len() != *cols || !cols.is_multiple_of(32) {
+            return None;
+        }
+        let row_bytes = self.block_bytes_per_row(*kind, *cols);
+        let mut out = vec![0f32; *rows];
+        out.par_iter_mut()
+            .with_min_len(Self::min_rows_per_task(*rows))
+            .enumerate()
+            .for_each(|(r, o)| {
+                let row = &data.as_slice()[r * row_bytes..(r + 1) * row_bytes];
+                *o = match *kind {
+                    QuantKind::Q8_0 => ferrox_quant::dot_q8_0_q8(row, act),
+                    QuantKind::Q4_0 => ferrox_quant::dot_q4_0_q8(row, act),
+                    _ => unreachable!(),
+                };
+            });
+        Some(out)
+    }
+
     /// Computes `W @ X` for a *batch* of activation vectors at once:
     /// `x_batch` is `batch_size` rows of `self.cols()` elements each,
     /// flattened row-major; returns `batch_size` rows of
@@ -584,6 +617,77 @@ impl WeightMatrix {
                 // par_chunks_mut, unlike the [batch, rows] layout the
                 // function returns), then transposed once at the end.
                 let mut by_row = vec![0f32; rows * batch_size];
+
+                // Prefill INT_DOT: quantize each activation once, then
+                // reuse Q8 packs across all weight rows (llama CPU path).
+                if cpu_int_dot_enabled() {
+                    match *kind {
+                        QuantKind::Q8_0 | QuantKind::Q4_0 if cols.is_multiple_of(32) => {
+                            let acts: Vec<_> = (0..batch_size)
+                                .map(|b| {
+                                    ferrox_quant::quantize_activations_q8(
+                                        &x_batch[b * cols..(b + 1) * cols],
+                                    )
+                                })
+                                .collect();
+                            by_row
+                                .par_chunks_mut(batch_size)
+                                .with_min_len(Self::min_rows_per_task(*rows))
+                                .enumerate()
+                                .for_each(|(r, out_row)| {
+                                    let row =
+                                        &data.as_slice()[r * row_bytes..(r + 1) * row_bytes];
+                                    for (b, act) in acts.iter().enumerate() {
+                                        out_row[b] = match *kind {
+                                            QuantKind::Q8_0 => {
+                                                ferrox_quant::dot_q8_0_q8(row, act)
+                                            }
+                                            QuantKind::Q4_0 => {
+                                                ferrox_quant::dot_q4_0_q8(row, act)
+                                            }
+                                            _ => unreachable!(),
+                                        };
+                                    }
+                                });
+                            let mut out = vec![0f32; batch_size * rows];
+                            for r in 0..*rows {
+                                for b in 0..batch_size {
+                                    out[b * rows + r] = by_row[r * batch_size + b];
+                                }
+                            }
+                            return out;
+                        }
+                        QuantKind::Q4K if cols.is_multiple_of(256) => {
+                            let acts: Vec<_> = (0..batch_size)
+                                .map(|b| {
+                                    ferrox_quant::quantize_activations_q8_k(
+                                        &x_batch[b * cols..(b + 1) * cols],
+                                    )
+                                })
+                                .collect();
+                            by_row
+                                .par_chunks_mut(batch_size)
+                                .with_min_len(Self::min_rows_per_task(*rows))
+                                .enumerate()
+                                .for_each(|(r, out_row)| {
+                                    let row =
+                                        &data.as_slice()[r * row_bytes..(r + 1) * row_bytes];
+                                    for (b, act) in acts.iter().enumerate() {
+                                        out_row[b] = ferrox_quant::dot_q4_k_q8(row, act);
+                                    }
+                                });
+                            let mut out = vec![0f32; batch_size * rows];
+                            for r in 0..*rows {
+                                for b in 0..batch_size {
+                                    out[b * rows + r] = by_row[r * batch_size + b];
+                                }
+                            }
+                            return out;
+                        }
+                        _ => {}
+                    }
+                }
+
                 by_row
                     .par_chunks_mut(batch_size)
                     .with_min_len(Self::min_rows_per_task(*rows))

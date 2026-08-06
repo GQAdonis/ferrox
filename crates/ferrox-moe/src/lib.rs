@@ -641,6 +641,18 @@ pub fn run_expert(hidden: &[f32], expert: &ExpertWeights) -> Vec<f32> {
             return expert.down.apply(&activated);
         }
     }
+    // Share one Q8 activation quant across gate+up when INT_DOT is on
+    // (OLMoE: avoids 2× quantize_activations_q8 per expert).
+    if ferrox_core::weight_matrix::cpu_int_dot_enabled() && hidden.len().is_multiple_of(32) {
+        let act = ferrox_quant::quantize_activations_q8(hidden);
+        if let (Some(gate), Some(up)) = (
+            expert.gate.apply_cpu_q8(&act),
+            expert.up.apply_cpu_q8(&act),
+        ) {
+            let activated = swiglu(&gate, &up);
+            return expert.down.apply(&activated);
+        }
+    }
     let gate = expert.gate.apply(hidden);
     let up = expert.up.apply(hidden);
     let activated = swiglu(&gate, &up);

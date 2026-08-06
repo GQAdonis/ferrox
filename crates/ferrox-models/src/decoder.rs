@@ -726,6 +726,8 @@ impl Decoder {
     }
 
     /// Contiguous Q4_0 expert planes for llama-style `mul_mv_id` MoE.
+    /// Fast path: experts are mmap-packed by the loader; validate first + last
+    /// only (full walk was ~64 checks × 16 layers / token on OLMoE).
     #[cfg(feature = "metal")]
     fn packed_q4_moe_experts(
         experts: &[ExpertWeights],
@@ -765,7 +767,43 @@ impl Decoder {
         if gate_stride == 0 || up_stride != gate_stride || down_stride == 0 {
             return None;
         }
-        for (i, ex) in experts.iter().enumerate() {
+        let n = experts.len();
+        // Contiguity: expert i's gate starts at gate0 + i*stride (same for up/down).
+        let last = n - 1;
+        let (WeightMatrix::Quantized {
+            data: gd,
+            kind: ferrox_core::QuantKind::Q4_0,
+            ..
+        },
+        WeightMatrix::Quantized {
+            data: ud,
+            kind: ferrox_core::QuantKind::Q4_0,
+            ..
+        },
+        WeightMatrix::Quantized {
+            data: dd,
+            kind: ferrox_core::QuantKind::Q4_0,
+            ..
+        }) = (&experts[last].gate, &experts[last].up, &experts[last].down)
+        else {
+            return None;
+        };
+        let g = gd.as_slice();
+        let u = ud.as_slice();
+        let d = dd.as_slice();
+        if g.len() != gate_stride
+            || u.len() != up_stride
+            || d.len() != down_stride
+            || g.as_ptr() != unsafe { gate0.0.as_ptr().add(last * gate_stride) }
+            || u.as_ptr() != unsafe { up0.as_ptr().add(last * up_stride) }
+            || d.as_ptr() != unsafe { down0.0.as_ptr().add(last * down_stride) }
+        {
+            return None;
+        }
+        // Midpoint spot-check (catches sparse/shuffled banks that still
+        // align first+last by chance).
+        if n > 2 {
+            let mid = n / 2;
             let (WeightMatrix::Quantized {
                 data: gd,
                 kind: ferrox_core::QuantKind::Q4_0,
@@ -780,24 +818,17 @@ impl Decoder {
                 data: dd,
                 kind: ferrox_core::QuantKind::Q4_0,
                 ..
-            }) = (&ex.gate, &ex.up, &ex.down)
+            }) = (&experts[mid].gate, &experts[mid].up, &experts[mid].down)
             else {
                 return None;
             };
-            let g = gd.as_slice();
-            let u = ud.as_slice();
-            let d = dd.as_slice();
-            if g.len() != gate_stride
-                || u.len() != up_stride
-                || d.len() != down_stride
-                || g.as_ptr() != unsafe { gate0.0.as_ptr().add(i * gate_stride) }
-                || u.as_ptr() != unsafe { up0.as_ptr().add(i * up_stride) }
-                || d.as_ptr() != unsafe { down0.0.as_ptr().add(i * down_stride) }
+            if gd.as_slice().as_ptr() != unsafe { gate0.0.as_ptr().add(mid * gate_stride) }
+                || ud.as_slice().as_ptr() != unsafe { up0.as_ptr().add(mid * up_stride) }
+                || dd.as_slice().as_ptr() != unsafe { down0.0.as_ptr().add(mid * down_stride) }
             {
                 return None;
             }
         }
-        let n = experts.len();
         let gate = unsafe { std::slice::from_raw_parts(gate0.0.as_ptr(), n * gate_stride) };
         let up = unsafe { std::slice::from_raw_parts(up0.as_ptr(), n * up_stride) };
         let down = unsafe { std::slice::from_raw_parts(down0.0.as_ptr(), n * down_stride) };
@@ -2281,22 +2312,52 @@ impl Decoder {
             }
         }
 
-        let routed_outputs: Vec<(Vec<f32>, f32)> = decision
-            .expert_ids
-            .iter()
-            .zip(decision.weights.iter())
-            .map(|(&eid, &w)| {
-                let placement = plan
-                    .map(|p| p.placement_for(eid))
-                    .unwrap_or(ExpertPlacement::Cpu);
-                (
-                    layer
-                        .moe
-                        .with_expert(eid, |ex| run_expert_placed(normed2, ex, placement)),
-                    w,
-                )
-            })
-            .collect();
+        let routed_outputs: Vec<(Vec<f32>, f32)> = {
+            // Resident MoE: run top-k experts in parallel (OLMoE k=8).
+            // Store-backed experts stay sequential (shared ExpertStore lock).
+            let parallel = matches!(layer.moe.experts, ExpertBacking::Resident(_))
+                && decision.expert_ids.len() > 1
+                && plan.map(|p| {
+                    decision
+                        .expert_ids
+                        .iter()
+                        .all(|&eid| matches!(p.placement_for(eid), ExpertPlacement::Cpu))
+                })
+                .unwrap_or(true);
+            if parallel {
+                use rayon::prelude::*;
+                decision
+                    .expert_ids
+                    .par_iter()
+                    .zip(decision.weights.par_iter())
+                    .map(|(&eid, &w)| {
+                        (
+                            layer
+                                .moe
+                                .with_expert(eid, |ex| run_expert_placed(normed2, ex, ExpertPlacement::Cpu)),
+                            w,
+                        )
+                    })
+                    .collect()
+            } else {
+                decision
+                    .expert_ids
+                    .iter()
+                    .zip(decision.weights.iter())
+                    .map(|(&eid, &w)| {
+                        let placement = plan
+                            .map(|p| p.placement_for(eid))
+                            .unwrap_or(ExpertPlacement::Cpu);
+                        (
+                            layer
+                                .moe
+                                .with_expert(eid, |ex| run_expert_placed(normed2, ex, placement)),
+                            w,
+                        )
+                    })
+                    .collect()
+            }
+        };
         // Shared experts fire on every token regardless of routing, so
         // there's no offload decision to make for them the way there
         // is for routed experts -- always CPU, matching `run_expert`.

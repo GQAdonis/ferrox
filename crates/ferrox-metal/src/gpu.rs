@@ -62,7 +62,7 @@ use objc2_metal::{
     MTLComputePipelineState, MTLCreateSystemDefaultDevice, MTLDevice, MTLLibrary,
     MTLResourceOptions, MTLSize,
 };
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::ptr::NonNull;
 use std::sync::{Arc, Mutex};
@@ -666,18 +666,22 @@ kernel void q4_0_moe_matvec_id(
     const uint eid = uint(ids[slot]);
     device const uchar* w = w_all + (size_t)eid * expert_stride;
     float acc[NR] = { 0.0f };
+    device const uchar* ax[NR];
+    for (uint rr = 0u; rr < NR; ++rr) {
+        // Match llama mul_vec: always bind a row ptr (clamp) so the hot
+        // loop stays branch-free; discard OOB rows only at the write.
+        const uint row = min(first_row + rr, n_rows > 0u ? n_rows - 1u : 0u);
+        ax[rr] = w + (size_t)row * row_bytes;
+    }
     const uint ix = lane / 2u;
     const uint il = (lane % 2u) * 8u;
     device const float* yb = x + (size_t)token * x_stride + ix * 32u + il;
     for (uint b = ix; b < n_blocks; b += 16u) {
         float yl[16];
         const float sumy = q4_0_load_y(yb, yl);
+        #pragma clang loop unroll(full)
         for (uint rr = 0u; rr < NR; ++rr) {
-            const uint row = first_row + rr;
-            if (row >= n_rows) continue;
-            device const uchar* block =
-                w + (size_t)row * row_bytes + (size_t)b * 18u;
-            acc[rr] += q4_0_half_dot(block, sumy, yl, il);
+            acc[rr] += q4_0_half_dot(ax[rr] + (size_t)b * 18u, sumy, yl, il);
         }
         yb += 16u * 32u;
     }
@@ -686,6 +690,64 @@ kernel void q4_0_moe_matvec_id(
         const float sum = simd_sum(acc[rr]);
         if (lane == 0u && row < n_rows) {
             out[(size_t)slot * n_rows + row] = sum;
+        }
+    }
+}
+
+/// Like matvec_id, but writes silu(gate)*dot into `out` (skips a separate
+/// silu_mul pass after the up projection).
+kernel void q4_0_moe_matvec_id_silu(
+    device const uchar* w_all [[buffer(0)]],
+    device const float* x [[buffer(1)]],
+    device float* out [[buffer(2)]],
+    device const int* ids [[buffer(3)]],
+    constant uint& row_bytes [[buffer(4)]],
+    constant uint& n_blocks [[buffer(5)]],
+    constant uint& n_rows [[buffer(6)]],
+    constant uint& top_k [[buffer(7)]],
+    constant uint& expert_stride [[buffer(8)]],
+    constant uint& n_tokens [[buffer(9)]],
+    constant uint& x_stride [[buffer(10)]],
+    device const float* gate [[buffer(11)]],
+    uint3 tgpig [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]]
+) {
+    constexpr uint NR = 4u;
+    constexpr uint NSG = 2u;
+    const uint group = tgpig.x;
+    const uint slot = tgpig.z;
+    const uint first_row = (group * NSG + sg) * NR;
+    const uint n_slots = n_tokens * top_k;
+    if (slot >= n_slots) return;
+    const uint token = slot / top_k;
+    const uint eid = uint(ids[slot]);
+    device const uchar* w = w_all + (size_t)eid * expert_stride;
+    float acc[NR] = { 0.0f };
+    device const uchar* ax[NR];
+    for (uint rr = 0u; rr < NR; ++rr) {
+        const uint row = min(first_row + rr, n_rows > 0u ? n_rows - 1u : 0u);
+        ax[rr] = w + (size_t)row * row_bytes;
+    }
+    const uint ix = lane / 2u;
+    const uint il = (lane % 2u) * 8u;
+    device const float* yb = x + (size_t)token * x_stride + ix * 32u + il;
+    for (uint b = ix; b < n_blocks; b += 16u) {
+        float yl[16];
+        const float sumy = q4_0_load_y(yb, yl);
+        #pragma clang loop unroll(full)
+        for (uint rr = 0u; rr < NR; ++rr) {
+            acc[rr] += q4_0_half_dot(ax[rr] + (size_t)b * 18u, sumy, yl, il);
+        }
+        yb += 16u * 32u;
+    }
+    for (uint rr = 0u; rr < NR; ++rr) {
+        const uint row = first_row + rr;
+        const float sum = simd_sum(acc[rr]);
+        if (lane == 0u && row < n_rows) {
+            const float g = gate[(size_t)slot * n_rows + row];
+            const float silu = g / (1.0f + exp(-g));
+            out[(size_t)slot * n_rows + row] = silu * sum;
         }
     }
 }
@@ -776,18 +838,20 @@ kernel void q4_0_moe_down_id(
     device const uchar* wd = down_all + (size_t)eid * expert_stride;
     device const float* xa = act + (size_t)slot * ffn_rows;
     float acc[NR] = { 0.0f };
+    device const uchar* ax[NR];
+    for (uint rr = 0u; rr < NR; ++rr) {
+        const uint row = min(first_row + rr, hidden_rows > 0u ? hidden_rows - 1u : 0u);
+        ax[rr] = wd + (size_t)row * row_bytes;
+    }
     const uint ix = lane / 2u;
     const uint il = (lane % 2u) * 8u;
     device const float* yb = xa + ix * 32u + il;
     for (uint b = ix; b < n_blocks; b += 16u) {
         float yl[16];
         const float sumy = q4_0_load_y(yb, yl);
+        #pragma clang loop unroll(full)
         for (uint rr = 0u; rr < NR; ++rr) {
-            const uint row = first_row + rr;
-            if (row >= hidden_rows) continue;
-            device const uchar* block =
-                wd + (size_t)row * row_bytes + (size_t)b * 18u;
-            acc[rr] += q4_0_half_dot(block, sumy, yl, il);
+            acc[rr] += q4_0_half_dot(ax[rr] + (size_t)b * 18u, sumy, yl, il);
         }
         yb += 16u * 32u;
     }
@@ -2273,31 +2337,46 @@ unsafe impl Sync for CachedPipeline {}
 
 static PIPELINE_CACHE: Mutex<Option<HashMap<&'static str, Arc<CachedPipeline>>>> = Mutex::new(None);
 
+thread_local! {
+    /// Hot-path mirror of [`PIPELINE_CACHE`]: MoE/dense encode hits this
+    /// without taking the process Mutex (~100+ lookups/token on OLMoE).
+    static TL_PIPELINE_CACHE: RefCell<HashMap<&'static str, Arc<CachedPipeline>>> =
+        RefCell::new(HashMap::new());
+}
+
 pub(crate) fn ensure_pipeline(
     device: &Retained<ProtocolObject<dyn MTLDevice>>,
     kernel_src: &'static str,
     fn_name: &'static str,
 ) -> Result<Arc<CachedPipeline>, MetalError> {
-    let mut guard = PIPELINE_CACHE.lock().unwrap();
-    let cache = guard.get_or_insert_with(HashMap::new);
-    if let Some(cached) = cache.get(fn_name) {
-        return Ok(cached.clone());
+    if let Some(cached) = TL_PIPELINE_CACHE.with(|c| c.borrow().get(fn_name).cloned()) {
+        return Ok(cached);
     }
-
-    let src = NSString::from_str(kernel_src);
-    let library = device
-        .newLibraryWithSource_options_error(&src, None)
-        .map_err(|e| MetalError::CompileFailed(e.to_string()))?;
-    let func_name = NSString::from_str(fn_name);
-    let function = library
-        .newFunctionWithName(&func_name)
-        .ok_or(MetalError::FunctionNotFound(fn_name))?;
-    let pipeline = device
-        .newComputePipelineStateWithFunction_error(&function)
-        .map_err(|e| MetalError::PipelineFailed(e.to_string()))?;
-
-    let cached = Arc::new(CachedPipeline(pipeline));
-    cache.insert(fn_name, cached.clone());
+    let cached = {
+        let mut guard = PIPELINE_CACHE.lock().unwrap();
+        let cache = guard.get_or_insert_with(HashMap::new);
+        if let Some(cached) = cache.get(fn_name) {
+            cached.clone()
+        } else {
+            let src = NSString::from_str(kernel_src);
+            let library = device
+                .newLibraryWithSource_options_error(&src, None)
+                .map_err(|e| MetalError::CompileFailed(e.to_string()))?;
+            let func_name = NSString::from_str(fn_name);
+            let function = library
+                .newFunctionWithName(&func_name)
+                .ok_or(MetalError::FunctionNotFound(fn_name))?;
+            let pipeline = device
+                .newComputePipelineStateWithFunction_error(&function)
+                .map_err(|e| MetalError::PipelineFailed(e.to_string()))?;
+            let cached = Arc::new(CachedPipeline(pipeline));
+            cache.insert(fn_name, cached.clone());
+            cached
+        }
+    };
+    TL_PIPELINE_CACHE.with(|c| {
+        c.borrow_mut().insert(fn_name, cached.clone());
+    });
     Ok(cached)
 }
 
@@ -2328,6 +2407,11 @@ type WeightCacheMap = HashMap<WeightCacheKey, Arc<ResidentWeightBuffer>>;
 
 static WEIGHT_CACHE: Mutex<Option<WeightCacheMap>> = Mutex::new(None);
 
+thread_local! {
+    static TL_WEIGHT_CACHE: RefCell<HashMap<(usize, usize), Arc<ResidentWeightBuffer>>> =
+        RefCell::new(HashMap::new());
+}
+
 fn weight_cache_budget_bytes() -> usize {
     match std::env::var("FERROX_METAL_WEIGHT_CACHE_BYTES") {
         Ok(v) => v.parse().unwrap_or(usize::MAX),
@@ -2342,35 +2426,35 @@ pub(crate) fn resident_weight_buffer(
     weights: &[u8],
 ) -> Result<Arc<ResidentWeightBuffer>, MetalError> {
     let key = (weights.as_ptr() as usize, weights.len());
-    {
-        let guard = WEIGHT_CACHE.lock().unwrap();
-        if let Some(cache) = guard.as_ref() {
-            if let Some(cached) = cache.get(&key) {
-                return Ok(cached.clone());
+    if let Some(cached) = TL_WEIGHT_CACHE.with(|c| c.borrow().get(&key).cloned()) {
+        return Ok(cached);
+    }
+    let cached = {
+        let mut guard = WEIGHT_CACHE.lock().unwrap();
+        let cache = guard.get_or_insert_with(HashMap::new);
+        if let Some(cached) = cache.get(&key) {
+            cached.clone()
+        } else {
+            let budget = weight_cache_budget_bytes();
+            let used: usize = cache.values().map(|b| b.nbytes).sum();
+            if used.saturating_add(weights.len()) > budget {
+                // Drop everything and retry with a clean slate for this matrix.
+                // Better than silently re-uploading forever under a tight budget.
+                cache.clear();
+                TL_WEIGHT_CACHE.with(|c| c.borrow_mut().clear());
             }
+            if weights.len() > budget {
+                // Matrix alone exceeds budget: one-shot upload, do not cache.
+                return Ok(Arc::new(build_resident_weight_buffer(device, weights)?));
+            }
+            let cached = Arc::new(build_resident_weight_buffer(device, weights)?);
+            cache.insert(key, cached.clone());
+            cached
         }
-    }
-
-    let mut guard = WEIGHT_CACHE.lock().unwrap();
-    let cache = guard.get_or_insert_with(HashMap::new);
-    if let Some(cached) = cache.get(&key) {
-        return Ok(cached.clone());
-    }
-
-    let budget = weight_cache_budget_bytes();
-    let used: usize = cache.values().map(|b| b.nbytes).sum();
-    if used.saturating_add(weights.len()) > budget {
-        // Drop everything and retry with a clean slate for this matrix.
-        // Better than silently re-uploading forever under a tight budget.
-        cache.clear();
-    }
-    if weights.len() > budget {
-        // Matrix alone exceeds budget: one-shot upload, do not cache.
-        return Ok(Arc::new(build_resident_weight_buffer(device, weights)?));
-    }
-
-    let cached = Arc::new(build_resident_weight_buffer(device, weights)?);
-    cache.insert(key, cached.clone());
+    };
+    TL_WEIGHT_CACHE.with(|c| {
+        c.borrow_mut().insert(key, cached.clone());
+    });
     Ok(cached)
 }
 
@@ -2531,59 +2615,65 @@ type F32CacheMap = HashMap<F32CacheKey, Arc<ResidentF32Buffer>>;
 
 static F32_CACHE: Mutex<Option<F32CacheMap>> = Mutex::new(None);
 
+thread_local! {
+    static TL_F32_CACHE: RefCell<HashMap<(usize, usize), Arc<ResidentF32Buffer>>> =
+        RefCell::new(HashMap::new());
+}
+
 pub(crate) fn resident_f32_buffer(
     device: &Retained<ProtocolObject<dyn MTLDevice>>,
     data: &[f32],
 ) -> Result<Arc<ResidentF32Buffer>, MetalError> {
     let key = (data.as_ptr() as usize, data.len());
+    if let Some(cached) = TL_F32_CACHE.with(|c| c.borrow().get(&key).cloned()) {
+        return Ok(cached);
+    }
     let nbytes = std::mem::size_of_val(data);
-    {
-        let guard = F32_CACHE.lock().unwrap();
-        if let Some(cache) = guard.as_ref() {
-            if let Some(cached) = cache.get(&key) {
-                return Ok(cached.clone());
+    let cached = {
+        let mut guard = F32_CACHE.lock().unwrap();
+        let cache = guard.get_or_insert_with(HashMap::new);
+        if let Some(cached) = cache.get(&key) {
+            cached.clone()
+        } else {
+            let budget = weight_cache_budget_bytes();
+            let used: usize = cache.values().map(|b| b.nbytes).sum();
+            if used.saturating_add(nbytes) > budget {
+                // Drop everything and retry with a clean slate for this matrix.
+                // Better than silently re-uploading forever under a tight budget.
+                cache.clear();
+                TL_F32_CACHE.with(|c| c.borrow_mut().clear());
             }
+            if nbytes > budget {
+                // Matrix alone exceeds budget: one-shot upload, do not cache.
+                let mut data_owned = data.to_vec();
+                let buffer = unsafe {
+                    device.newBufferWithBytes_length_options(
+                        NonNull::new(data_owned.as_mut_ptr() as *mut _).unwrap(),
+                        nbytes,
+                        MTLResourceOptions::StorageModeShared,
+                    )
+                }
+                .ok_or(MetalError::BufferAllocFailed)?;
+                return Ok(Arc::new(ResidentF32Buffer { buffer, nbytes }));
+            }
+
+            let mut data_owned = data.to_vec();
+            let buffer = unsafe {
+                device.newBufferWithBytes_length_options(
+                    NonNull::new(data_owned.as_mut_ptr() as *mut _).unwrap(),
+                    nbytes,
+                    MTLResourceOptions::StorageModeShared,
+                )
+            }
+            .ok_or(MetalError::BufferAllocFailed)?;
+            let cached = Arc::new(ResidentF32Buffer { buffer, nbytes });
+            cache.insert(key, cached.clone());
+            cached
         }
-    }
-
-    let mut guard = F32_CACHE.lock().unwrap();
-    let cache = guard.get_or_insert_with(HashMap::new);
-    if let Some(cached) = cache.get(&key) {
-        return Ok(cached.clone());
-    }
-
-    let budget = weight_cache_budget_bytes();
-    let used: usize = cache.values().map(|b| b.nbytes).sum();
-    if used.saturating_add(nbytes) > budget {
-        // Drop everything and retry with a clean slate for this matrix.
-        // Better than silently re-uploading forever under a tight budget.
-        cache.clear();
-    }
-    if nbytes > budget {
-        // Matrix alone exceeds budget: one-shot upload, do not cache.
-        let mut data_owned = data.to_vec();
-        let buffer = unsafe {
-            device.newBufferWithBytes_length_options(
-                NonNull::new(data_owned.as_mut_ptr() as *mut _).unwrap(),
-                nbytes,
-                MTLResourceOptions::StorageModeShared,
-            )
-        }
-        .ok_or(MetalError::BufferAllocFailed)?;
-        return Ok(Arc::new(ResidentF32Buffer { buffer, nbytes }));
-    }
-
-    let mut data_owned = data.to_vec();
-    let buffer = unsafe {
-        device.newBufferWithBytes_length_options(
-            NonNull::new(data_owned.as_mut_ptr() as *mut _).unwrap(),
-            nbytes,
-            MTLResourceOptions::StorageModeShared,
-        )
-    }
-    .ok_or(MetalError::BufferAllocFailed)?;
-    let cached = Arc::new(ResidentF32Buffer { buffer, nbytes });
-    cache.insert(key, cached.clone());
+    };
+    TL_F32_CACHE.with(|c| {
+        c.borrow_mut().insert(key, cached.clone());
+    });
     Ok(cached)
 }
 
@@ -2918,9 +3008,9 @@ fn encode_q4_0_moe_matvec_id(
     Ok(())
 }
 
-/// Encode packed-id Q4_0 MoE: matvec_id(gate) → matvec_id(up) → silu_mul
-/// → down_id → weighted_sum. Matches llama.cpp decode occupancy better than
-/// a fused gate+up kernel. `n_tokens=1` is decode; prefill passes `T`.
+/// Encode packed-id Q4_0 MoE: matvec_id(gate) → matvec_id_silu(up,gate)→act
+/// → down_id → weighted_sum. SiLU fused into the up write (saves a pass).
+/// `n_tokens=1` is decode; prefill passes `T`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_q4_0_moe_id(
     encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
@@ -2940,6 +3030,7 @@ pub(crate) fn encode_q4_0_moe_id(
     assert_eq!(packed.gate_stride, packed.up_stride);
     assert!(n_tokens >= 1);
     assert!(top_k >= 1);
+    let _ = up_buf; // kept for API/scratch layout parity; silu writes act directly
     let gate_w = resident_weight_buffer(device, packed.gate)?;
     let up_w = resident_weight_buffer(device, packed.up)?;
     let down_w = resident_weight_buffer(device, packed.down)?;
@@ -2965,30 +3056,72 @@ pub(crate) fn encode_q4_0_moe_id(
         x_stride,
         n_slots,
     )?;
-    encode_q4_0_moe_matvec_id(
-        encoder,
-        device,
-        &up_w,
-        x_buf,
-        up_buf,
-        ids,
-        packed.gate_row_bytes as u32,
-        input_blocks as u32,
-        packed.ffn_rows as u32,
-        top_k,
-        packed.up_stride as u32,
-        n_tokens,
-        x_stride,
-        n_slots,
-    )?;
-    crate::elem::encode_silu_mul(
-        encoder,
-        device,
-        gate_buf,
-        up_buf,
-        act_buf,
-        (n_slots * packed.ffn_rows) as u32,
-    )?;
+    // up matvec × silu(gate) → act (one dispatch; no separate silu_mul)
+    {
+        let pipe = ensure_pipeline(device, Q4_0_MOE_TOPK_KERNEL_SRC, "q4_0_moe_matvec_id_silu")?;
+        encoder.setComputePipelineState(&pipe.0);
+        unsafe {
+            encoder.setBuffer_offset_atIndex(Some(&up_w.buffer), up_w.weight_offset, 0);
+            encoder.setBuffer_offset_atIndex(Some(x_buf), 0, 1);
+            encoder.setBuffer_offset_atIndex(Some(act_buf), 0, 2);
+            encoder.setBuffer_offset_atIndex(Some(ids), 0, 3);
+            let mut rb = packed.gate_row_bytes as u32;
+            encoder.setBytes_length_atIndex(
+                NonNull::new(&mut rb as *mut u32 as *mut _).unwrap(),
+                4,
+                4,
+            );
+            let mut blocks = input_blocks as u32;
+            encoder.setBytes_length_atIndex(
+                NonNull::new(&mut blocks as *mut u32 as *mut _).unwrap(),
+                4,
+                5,
+            );
+            let mut rows = packed.ffn_rows as u32;
+            encoder.setBytes_length_atIndex(
+                NonNull::new(&mut rows as *mut u32 as *mut _).unwrap(),
+                4,
+                6,
+            );
+            let mut tk = top_k;
+            encoder.setBytes_length_atIndex(
+                NonNull::new(&mut tk as *mut u32 as *mut _).unwrap(),
+                4,
+                7,
+            );
+            let mut stride = packed.up_stride as u32;
+            encoder.setBytes_length_atIndex(
+                NonNull::new(&mut stride as *mut u32 as *mut _).unwrap(),
+                4,
+                8,
+            );
+            let mut nt = n_tokens;
+            encoder.setBytes_length_atIndex(
+                NonNull::new(&mut nt as *mut u32 as *mut _).unwrap(),
+                4,
+                9,
+            );
+            let mut xs = x_stride;
+            encoder.setBytes_length_atIndex(
+                NonNull::new(&mut xs as *mut u32 as *mut _).unwrap(),
+                4,
+                10,
+            );
+            encoder.setBuffer_offset_atIndex(Some(gate_buf), 0, 11);
+        }
+        encoder.dispatchThreadgroups_threadsPerThreadgroup(
+            MTLSize {
+                width: packed.ffn_rows.div_ceil(ROWS_PER_TG),
+                height: 1,
+                depth: n_slots,
+            },
+            MTLSize {
+                width: 32,
+                height: 2,
+                depth: 1,
+            },
+        );
+    }
 
     let down = ensure_pipeline(device, Q4_0_MOE_TOPK_KERNEL_SRC, "q4_0_moe_down_id")?;
     let weighted_sum = ensure_pipeline(device, Q4_0_MOE_TOPK_KERNEL_SRC, "moe_weighted_sum")?;

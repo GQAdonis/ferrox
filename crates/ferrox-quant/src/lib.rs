@@ -2121,17 +2121,44 @@ mod simd_aarch64 {
     }
 
     /// NEON Q8_0 × Q8 int-dot with SDOT (Apple Silicon / ARMv8.2+).
+    /// Two-block unroll + float4 scale-accumulate (llama.cpp ARM style).
     #[target_feature(enable = "neon,dotprod")]
     pub unsafe fn dot_q8_0_q8_neon_sdot(row_bytes: &[u8], act: &Q8Activations) -> f32 {
         debug_assert_eq!(row_bytes.len() % Q8_0_BLOCK_BYTES, 0);
         debug_assert_eq!(row_bytes.len() / Q8_0_BLOCK_BYTES, act.n_blocks());
-        let mut acc = 0f32;
-        for (b, block) in row_bytes.chunks_exact(Q8_0_BLOCK_BYTES).enumerate() {
-            let dw = f16::from_le_bytes([block[0], block[1]]).to_f32();
+        let nb = row_bytes.len() / Q8_0_BLOCK_BYTES;
+        let mut sumv0 = vdupq_n_f32(0.0);
+        let mut sumv1 = vdupq_n_f32(0.0);
+        let mut b = 0usize;
+        while b + 1 < nb {
+            let block0 = row_bytes.as_ptr().add(b * Q8_0_BLOCK_BYTES);
+            let block1 = row_bytes.as_ptr().add((b + 1) * Q8_0_BLOCK_BYTES);
+            let dw0 = f16::from_le_bytes([*block0, *block0.add(1)]).to_f32();
+            let dw1 = f16::from_le_bytes([*block1, *block1.add(1)]).to_f32();
+            let base0 = b * Q8_0_BLOCK_ELEMS;
+            let base1 = (b + 1) * Q8_0_BLOCK_ELEMS;
+            let mut isum0 = vdupq_n_s32(0);
+            let mut isum1 = vdupq_n_s32(0);
+            for g in 0..2 {
+                let w0 = vld1q_s8(block0.add(2 + g * 16) as *const i8);
+                let w1 = vld1q_s8(block1.add(2 + g * 16) as *const i8);
+                let a0 = vld1q_s8(act.q.as_ptr().add(base0 + g * 16));
+                let a1 = vld1q_s8(act.q.as_ptr().add(base1 + g * 16));
+                isum0 = neon_sdot(isum0, w0, a0);
+                isum1 = neon_sdot(isum1, w1, a1);
+            }
+            sumv0 = vmlaq_n_f32(sumv0, vcvtq_f32_s32(isum0), dw0 * act.d[b]);
+            sumv1 = vmlaq_n_f32(sumv1, vcvtq_f32_s32(isum1), dw1 * act.d[b + 1]);
+            b += 2;
+        }
+        let mut acc = vaddvq_f32(sumv0) + vaddvq_f32(sumv1);
+        if b < nb {
+            let block = row_bytes.as_ptr().add(b * Q8_0_BLOCK_BYTES);
+            let dw = f16::from_le_bytes([*block, *block.add(1)]).to_f32();
             let base = b * Q8_0_BLOCK_ELEMS;
             let mut isum = vdupq_n_s32(0);
             for g in 0..2 {
-                let w = vld1q_s8(block.as_ptr().add(2 + g * 16) as *const i8);
+                let w = vld1q_s8(block.add(2 + g * 16) as *const i8);
                 let a = vld1q_s8(act.q.as_ptr().add(base + g * 16));
                 isum = neon_sdot(isum, w, a);
             }
@@ -2173,25 +2200,48 @@ mod simd_aarch64 {
         acc
     }
 
-    /// NEON Q4_0 × Q8 with SDOT.
+    /// NEON Q4_0 × Q8 with SDOT. Two-block unroll + float4 scale-accumulate.
     #[target_feature(enable = "neon,dotprod")]
     pub unsafe fn dot_q4_0_q8_neon_sdot(row_bytes: &[u8], act: &Q8Activations) -> f32 {
         debug_assert_eq!(row_bytes.len() % Q4_0_BLOCK_BYTES, 0);
         debug_assert_eq!(row_bytes.len() / Q4_0_BLOCK_BYTES, act.n_blocks());
         let bias = vdupq_n_s8(8);
         let low_mask = vdupq_n_u8(0x0F);
-        let mut acc = 0f32;
-        for (b, block) in row_bytes.chunks_exact(Q4_0_BLOCK_BYTES).enumerate() {
+        let nb = row_bytes.len() / Q4_0_BLOCK_BYTES;
+        let mut sumv0 = vdupq_n_f32(0.0);
+        let mut sumv1 = vdupq_n_f32(0.0);
+        let mut b = 0usize;
+        while b + 1 < nb {
+            let block0 = row_bytes.as_ptr().add(b * Q4_0_BLOCK_BYTES);
+            let block1 = row_bytes.as_ptr().add((b + 1) * Q4_0_BLOCK_BYTES);
+            let dw0 = f16::from_le_bytes([*block0, *block0.add(1)]).to_f32();
+            let dw1 = f16::from_le_bytes([*block1, *block1.add(1)]).to_f32();
+            let base0 = b * Q4_0_BLOCK_ELEMS;
+            let base1 = (b + 1) * Q4_0_BLOCK_ELEMS;
+            let nib0 = vld1q_u8(block0.add(2));
+            let nib1 = vld1q_u8(block1.add(2));
+            let lo0 = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(nib0, low_mask)), bias);
+            let hi0 = vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8(nib0, 4)), bias);
+            let lo1 = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(nib1, low_mask)), bias);
+            let hi1 = vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8(nib1, 4)), bias);
+            let mut isum0 = neon_sdot(vdupq_n_s32(0), lo0, vld1q_s8(act.q.as_ptr().add(base0)));
+            isum0 = neon_sdot(isum0, hi0, vld1q_s8(act.q.as_ptr().add(base0 + 16)));
+            let mut isum1 = neon_sdot(vdupq_n_s32(0), lo1, vld1q_s8(act.q.as_ptr().add(base1)));
+            isum1 = neon_sdot(isum1, hi1, vld1q_s8(act.q.as_ptr().add(base1 + 16)));
+            sumv0 = vmlaq_n_f32(sumv0, vcvtq_f32_s32(isum0), dw0 * act.d[b]);
+            sumv1 = vmlaq_n_f32(sumv1, vcvtq_f32_s32(isum1), dw1 * act.d[b + 1]);
+            b += 2;
+        }
+        let mut acc = vaddvq_f32(sumv0) + vaddvq_f32(sumv1);
+        if b < nb {
+            let block = &row_bytes[b * Q4_0_BLOCK_BYTES..(b + 1) * Q4_0_BLOCK_BYTES];
             let dw = f16::from_le_bytes([block[0], block[1]]).to_f32();
             let base = b * Q4_0_BLOCK_ELEMS;
             let nibbles = vld1q_u8(block.as_ptr().add(2));
             let lo = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(nibbles, low_mask)), bias);
             let hi = vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8(nibbles, 4)), bias);
-            let a0 = vld1q_s8(act.q.as_ptr().add(base));
-            let a1 = vld1q_s8(act.q.as_ptr().add(base + 16));
-            let mut isum = vdupq_n_s32(0);
-            isum = neon_sdot(isum, lo, a0);
-            isum = neon_sdot(isum, hi, a1);
+            let mut isum = neon_sdot(vdupq_n_s32(0), lo, vld1q_s8(act.q.as_ptr().add(base)));
+            isum = neon_sdot(isum, hi, vld1q_s8(act.q.as_ptr().add(base + 16)));
             acc += dw * act.d[b] * vaddvq_s32(isum) as f32;
         }
         acc

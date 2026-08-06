@@ -10,6 +10,7 @@ readme = "../../README.md"
 
 [dependencies]
 ferrox-core = { workspace = true }
+ferrox-quant = { workspace = true }
 rayon = { workspace = true }
 anyhow = { workspace = true }
 

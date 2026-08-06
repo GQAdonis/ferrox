@@ -41,9 +41,9 @@ use crate::elem::{
 };
 use crate::embd::{encode_get_rows, EmbdKind};
 use crate::gpu::{
-    encode_matvec, encode_moe_topk_softmax, encode_q4_0_moe_id, encode_q4_0_moe_topk,
-    ensure_pipeline, resident_f32_buffer, resident_weight_buffer, shared_metal, MatvecLaunch,
-    MetalError, MoeExpertLaunch, MoePackedQ4,
+    compute_encoder_concurrent, encode_matvec, encode_moe_topk_softmax, encode_q4_0_moe_id,
+    encode_q4_0_moe_topk, ensure_pipeline, memory_barrier_buffers, resident_f32_buffer,
+    resident_weight_buffer, shared_metal, MatvecLaunch, MetalError, MoeExpertLaunch, MoePackedQ4,
 };
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
@@ -3940,9 +3940,12 @@ fn encode_moe_layer_fused(
         hidden_dim as u32,
         rms_eps,
     )?;
+    memory_barrier_buffers(encoder);
+    // Q∥K∥V — disjoint destinations
     encode_matvec(encoder, device, &layer.q, &q_w, &scratch.x_attn, &scratch.q)?;
     encode_matvec(encoder, device, &layer.k, &k_w, &scratch.x_attn, &scratch.k)?;
     encode_matvec(encoder, device, &layer.v, &v_w, &scratch.x_attn, &scratch.v)?;
+    memory_barrier_buffers(encoder);
     encode_attn_extras(
         encoder,
         device,
@@ -3958,6 +3961,7 @@ fn encode_moe_layer_fused(
         head_dim,
         rms_eps,
     )?;
+    memory_barrier_buffers(encoder);
     encode_rope(
         encoder,
         device,
@@ -3980,6 +3984,7 @@ fn encode_moe_layer_fused(
         pos as u32,
         ff_buf,
     )?;
+    memory_barrier_buffers(encoder);
     let token_elems = (n_kv_heads * head_dim) as u32;
     let offset = (pos * n_kv_heads * head_dim) as u32;
     encode_kv_store_append(
@@ -4000,6 +4005,7 @@ fn encode_moe_layer_fused(
         offset,
         token_elems,
     )?;
+    memory_barrier_buffers(encoder);
     encode_gqa_with_kv(
         encoder,
         device,
@@ -4013,7 +4019,9 @@ fn encode_moe_layer_fused(
         0,
         layer.extras.attn_logit_softcap,
     )?;
+    memory_barrier_buffers(encoder);
     encode_matvec(encoder, device, &layer.o, &o_w, &scratch.attn, &scratch.o)?;
+    memory_barrier_buffers(encoder);
     encode_add_rms_norm(
         encoder,
         device,
@@ -4024,6 +4032,7 @@ fn encode_moe_layer_fused(
         hidden_dim as u32,
         rms_eps,
     )?;
+    memory_barrier_buffers(encoder);
     encode_matvec(
         encoder,
         device,
@@ -4032,6 +4041,7 @@ fn encode_moe_layer_fused(
         &scratch.x2,
         &scratch.router,
     )?;
+    memory_barrier_buffers(encoder);
     encode_moe_topk_softmax(
         encoder,
         device,
@@ -4042,6 +4052,7 @@ fn encode_moe_layer_fused(
         top_k as u32,
         norm_topk_prob,
     )?;
+    memory_barrier_buffers(encoder);
     encode_q4_0_moe_id(
         encoder,
         device,
@@ -4057,6 +4068,7 @@ fn encode_moe_layer_fused(
         top_k as u32,
         1,
     )?;
+    memory_barrier_buffers(encoder);
     encode_vec_add(
         encoder,
         device,
@@ -4064,6 +4076,8 @@ fn encode_moe_layer_fused(
         &scratch.moe_out,
         hidden_dim as u32,
     )?;
+    // Next layer's attn_norm reads `h` — must wait for residual.
+    memory_barrier_buffers(encoder);
     Ok(())
 }
 
@@ -4263,9 +4277,8 @@ pub fn launch_moe_decode_stack(
         }
 
         let cmd_buf = queue.commandBuffer().ok_or(MetalError::CommandFailed)?;
-        let encoder = cmd_buf
-            .computeCommandEncoder()
-            .ok_or(MetalError::CommandFailed)?;
+        // llama.cpp: MTLDispatchTypeConcurrent so gate∥up / Q∥K∥V overlap
+        let encoder = compute_encoder_concurrent(&cmd_buf)?;
 
         let _embd_w = if let Some(e) = embd {
             let w = resident_weight_buffer(device, e.weights)?;
@@ -4279,6 +4292,7 @@ pub fn launch_moe_decode_stack(
                 e.n_cols as u32,
                 e.token_id as u32,
             )?;
+            memory_barrier_buffers(&encoder);
             Some(w)
         } else {
             None
@@ -4750,9 +4764,8 @@ pub fn launch_decode_dense_stack(
     let ff_buf = ff_resident.as_ref().map(|b| b.buffer.as_ref());
 
     let cmd_buf = queue.commandBuffer().ok_or(MetalError::CommandFailed)?;
-    let encoder = cmd_buf
-        .computeCommandEncoder()
-        .ok_or(MetalError::CommandFailed)?;
+    // llama.cpp concurrent encode: gate∥up and Q∥K∥V overlap
+    let encoder = compute_encoder_concurrent(&cmd_buf)?;
 
     let embd_resident = if let Some(e) = embd {
         let w = resident_weight_buffer(device, e.weights)?;
@@ -4766,6 +4779,7 @@ pub fn launch_decode_dense_stack(
             e.n_cols as u32,
             e.token_id as u32,
         )?;
+        memory_barrier_buffers(&encoder);
         Some(w)
     } else {
         None
@@ -4813,9 +4827,12 @@ pub fn launch_decode_dense_stack(
                 rms_eps,
             )?;
         }
+        memory_barrier_buffers(&encoder);
+        // Q∥K∥V
         encode_matvec(&encoder, device, &layer.q, &q_w, x_buf, q_buf)?;
         encode_matvec(&encoder, device, &layer.k, &k_w, x_buf, k_buf)?;
         encode_matvec(&encoder, device, &layer.v, &v_w, x_buf, v_buf)?;
+        memory_barrier_buffers(&encoder);
         encode_attn_extras(
             &encoder,
             device,
@@ -4831,6 +4848,7 @@ pub fn launch_decode_dense_stack(
             head_dim,
             rms_eps,
         )?;
+        memory_barrier_buffers(&encoder);
         let layer_theta = layer.rope_theta.unwrap_or(rope_theta);
         encode_rope(
             &encoder,
@@ -4854,10 +4872,12 @@ pub fn launch_decode_dense_stack(
             pos as u32,
             ff_buf,
         )?;
+        memory_barrier_buffers(&encoder);
         let token_elems = (n_kv_heads * head_dim) as u32;
         let offset = (pos * n_kv_heads * head_dim) as u32;
         encode_kv_store_append(&encoder, device, k_buf, kv, KvPlane::K, offset, token_elems)?;
         encode_kv_store_append(&encoder, device, v_buf, kv, KvPlane::V, offset, token_elems)?;
+        memory_barrier_buffers(&encoder);
         let new_seq = (pos + 1) as u32;
         // Sliding window: only the last `window` positions (incl. current)
         // are visible, matching `causal_gqa_attention_windowed`.
@@ -4878,7 +4898,9 @@ pub fn launch_decode_dense_stack(
             kv_start,
             layer.extras.attn_logit_softcap,
         )?;
+        memory_barrier_buffers(&encoder);
         encode_matvec(&encoder, device, &layer.o, &o_w, attn_buf, o_buf)?;
+        memory_barrier_buffers(&encoder);
         // Gemma sandwich norm: normalize the attn block output *before*
         // the residual add (in-place: each thread reads x[i] only after
         // the barriered reduction, so out == x is safe).
@@ -4894,6 +4916,7 @@ pub fn launch_decode_dense_stack(
                 hidden_dim as u32,
                 rms_eps,
             )?;
+            memory_barrier_buffers(&encoder);
         }
         // Fuse attn residual + ffn_norm into one dispatch.
         encode_add_rms_norm(
@@ -4906,8 +4929,11 @@ pub fn launch_decode_dense_stack(
             hidden_dim as u32,
             rms_eps,
         )?;
+        memory_barrier_buffers(&encoder);
+        // gate ∥ up (llama concurrent)
         encode_matvec(&encoder, device, &layer.gate, &gate_w, x2_buf, gate_buf)?;
         encode_matvec(&encoder, device, &layer.up, &up_w, x2_buf, up_buf)?;
+        memory_barrier_buffers(&encoder);
         if gelu_ffn {
             encode_gelu_mul(
                 &encoder,
@@ -4927,6 +4953,7 @@ pub fn launch_decode_dense_stack(
                 layer.gate.rows as u32,
             )?;
         }
+        memory_barrier_buffers(&encoder);
         encode_matvec(&encoder, device, &layer.down, &down_w, act_buf, down_buf)?;
         if let Some(post) = layer.post_ffn_norm {
             assert_eq!(post.len(), hidden_dim);
@@ -4941,6 +4968,8 @@ pub fn launch_decode_dense_stack(
                 rms_eps,
             )?;
         }
+        // Next layer's fused attn_norm reads prior `down_buf`.
+        memory_barrier_buffers(&encoder);
         // Defer `h += down` until the next layer's attn_norm (or final_norm)
         // so it fuses with that RMSNorm. Last layer handled below.
     }

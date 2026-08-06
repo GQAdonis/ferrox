@@ -2305,22 +2305,47 @@ impl Decoder {
             }
         }
 
-        let routed_outputs: Vec<(Vec<f32>, f32)> = decision
-            .expert_ids
-            .iter()
-            .zip(decision.weights.iter())
-            .map(|(&eid, &w)| {
-                let placement = plan
-                    .map(|p| p.placement_for(eid))
-                    .unwrap_or(ExpertPlacement::Cpu);
-                (
-                    layer
-                        .moe
-                        .with_expert(eid, |ex| run_expert_placed(normed2, ex, placement)),
-                    w,
-                )
-            })
-            .collect();
+        let routed_outputs: Vec<(Vec<f32>, f32)> = {
+            // llama.cpp mul_mat_id: quantize activations once per op, reuse
+            // across all top-k experts (not once per expert).
+            let shared_act = if ferrox_core::weight_matrix::cpu_int_dot_enabled()
+                && normed2.len().is_multiple_of(32)
+                && plan
+                    .map(|p| {
+                        decision
+                            .expert_ids
+                            .iter()
+                            .all(|&eid| matches!(p.placement_for(eid), ExpertPlacement::Cpu))
+                    })
+                    .unwrap_or(true)
+            {
+                Some(ferrox_quant::quantize_activations_q8(normed2))
+            } else {
+                None
+            };
+            decision
+                .expert_ids
+                .iter()
+                .zip(decision.weights.iter())
+                .map(|(&eid, &w)| {
+                    let placement = plan
+                        .map(|p| p.placement_for(eid))
+                        .unwrap_or(ExpertPlacement::Cpu);
+                    let out = layer.moe.with_expert(eid, |ex| {
+                        if let Some(ref act) = shared_act {
+                            if let (Some(gate), Some(up)) =
+                                (ex.gate.apply_cpu_q8(act), ex.up.apply_cpu_q8(act))
+                            {
+                                let activated = ferrox_core::matmul::swiglu(&gate, &up);
+                                return ex.down.apply(&activated);
+                            }
+                        }
+                        run_expert_placed(normed2, ex, placement)
+                    });
+                    (out, w)
+                })
+                .collect()
+        };
         // Shared experts fire on every token regardless of routing, so
         // there's no offload decision to make for them the way there
         // is for routed experts -- always CPU, matching `run_expert`.

@@ -58,9 +58,9 @@ use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_foundation::NSString;
 use objc2_metal::{
-    MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder,
-    MTLComputePipelineState, MTLCreateSystemDefaultDevice, MTLDevice, MTLLibrary,
-    MTLResourceOptions, MTLSize,
+    MTLBarrierScope, MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue,
+    MTLComputeCommandEncoder, MTLComputePipelineState, MTLCreateSystemDefaultDevice, MTLDevice,
+    MTLDispatchType, MTLLibrary, MTLResourceOptions, MTLSize,
 };
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -81,6 +81,23 @@ pub enum MetalError {
     BufferAllocFailed,
     #[error("Metal command buffer/encoder creation failed")]
     CommandFailed,
+}
+
+/// Concurrent compute encoder (llama.cpp `MTLDispatchTypeConcurrent`).
+/// Independent dispatches (e.g. MoE gate∥up, Q∥K∥V) can overlap; callers
+/// must insert [`memory_barrier_buffers`] between RAW/WAR/WAW hazards.
+pub(crate) fn compute_encoder_concurrent(
+    cmd_buf: &ProtocolObject<dyn MTLCommandBuffer>,
+) -> Result<Retained<ProtocolObject<dyn MTLComputeCommandEncoder>>, MetalError> {
+    cmd_buf
+        .computeCommandEncoderWithDispatchType(MTLDispatchType::Concurrent)
+        .ok_or(MetalError::CommandFailed)
+}
+
+/// Buffer-scope barrier — same as llama `ggml_metal_encoder_memory_barrier`.
+#[inline]
+pub(crate) fn memory_barrier_buffers(encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>) {
+    encoder.memoryBarrierWithScope(MTLBarrierScope::Buffers);
 }
 
 /// Thread-local pointer + length for a Metal-resident activation buffer
@@ -3017,8 +3034,11 @@ fn encode_q4_0_moe_matvec_id(
     Ok(())
 }
 
-/// Encode packed-id Q4_0 MoE: matvec_id(gate) → matvec_id_silu(up,gate)→act
-/// → down_id → weighted_sum. SiLU fused into the up write (saves a pass).
+/// Encode packed-id Q4_0 MoE: matvec_id(gate) ∥ matvec_id(up) → barrier →
+/// silu_mul → barrier → down_id → weighted_sum.
+///
+/// Matches llama.cpp: gate/up have disjoint destinations so a concurrent
+/// encoder can overlap them; silu/down need barriers (RAW on gate/up/act).
 /// `n_tokens=1` is decode; prefill passes `T`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_q4_0_moe_id(
@@ -3039,16 +3059,15 @@ pub(crate) fn encode_q4_0_moe_id(
     assert_eq!(packed.gate_stride, packed.up_stride);
     assert!(n_tokens >= 1);
     assert!(top_k >= 1);
-    let _ = up_buf; // kept for API/scratch layout parity; silu writes act directly
     let gate_w = resident_weight_buffer(device, packed.gate)?;
     let up_w = resident_weight_buffer(device, packed.up)?;
     let down_w = resident_weight_buffer(device, packed.down)?;
-    const ROWS_PER_TG: usize = 8;
     let input_blocks = packed.gate_row_bytes / 18;
     let down_blocks = packed.down_row_bytes / 18;
     let x_stride = (input_blocks * 32) as u32;
     let n_slots = (n_tokens as usize) * (top_k as usize);
 
+    // gate ∥ up (disjoint outs) — llama concurrent encode
     encode_q4_0_moe_matvec_id(
         encoder,
         device,
@@ -3065,77 +3084,38 @@ pub(crate) fn encode_q4_0_moe_id(
         x_stride,
         n_slots,
     )?;
-    // up matvec × silu(gate) → act (one dispatch; no separate silu_mul)
-    {
-        let pipe = ensure_pipeline(device, Q4_0_MOE_TOPK_KERNEL_SRC, "q4_0_moe_matvec_id_silu")?;
-        encoder.setComputePipelineState(&pipe.0);
-        unsafe {
-            encoder.setBuffer_offset_atIndex(Some(&up_w.buffer), up_w.weight_offset, 0);
-            encoder.setBuffer_offset_atIndex(Some(x_buf), 0, 1);
-            encoder.setBuffer_offset_atIndex(Some(act_buf), 0, 2);
-            encoder.setBuffer_offset_atIndex(Some(ids), 0, 3);
-            let mut rb = packed.gate_row_bytes as u32;
-            encoder.setBytes_length_atIndex(
-                NonNull::new(&mut rb as *mut u32 as *mut _).unwrap(),
-                4,
-                4,
-            );
-            let mut blocks = input_blocks as u32;
-            encoder.setBytes_length_atIndex(
-                NonNull::new(&mut blocks as *mut u32 as *mut _).unwrap(),
-                4,
-                5,
-            );
-            let mut rows = packed.ffn_rows as u32;
-            encoder.setBytes_length_atIndex(
-                NonNull::new(&mut rows as *mut u32 as *mut _).unwrap(),
-                4,
-                6,
-            );
-            let mut tk = top_k;
-            encoder.setBytes_length_atIndex(
-                NonNull::new(&mut tk as *mut u32 as *mut _).unwrap(),
-                4,
-                7,
-            );
-            let mut stride = packed.up_stride as u32;
-            encoder.setBytes_length_atIndex(
-                NonNull::new(&mut stride as *mut u32 as *mut _).unwrap(),
-                4,
-                8,
-            );
-            let mut nt = n_tokens;
-            encoder.setBytes_length_atIndex(
-                NonNull::new(&mut nt as *mut u32 as *mut _).unwrap(),
-                4,
-                9,
-            );
-            let mut xs = x_stride;
-            encoder.setBytes_length_atIndex(
-                NonNull::new(&mut xs as *mut u32 as *mut _).unwrap(),
-                4,
-                10,
-            );
-            encoder.setBuffer_offset_atIndex(Some(gate_buf), 0, 11);
-        }
-        encoder.dispatchThreadgroups_threadsPerThreadgroup(
-            MTLSize {
-                width: packed.ffn_rows.div_ceil(ROWS_PER_TG),
-                height: 1,
-                depth: n_slots,
-            },
-            MTLSize {
-                width: 32,
-                height: 2,
-                depth: 1,
-            },
-        );
-    }
+    encode_q4_0_moe_matvec_id(
+        encoder,
+        device,
+        &up_w,
+        x_buf,
+        up_buf,
+        ids,
+        packed.gate_row_bytes as u32,
+        input_blocks as u32,
+        packed.ffn_rows as u32,
+        top_k,
+        packed.up_stride as u32,
+        n_tokens,
+        x_stride,
+        n_slots,
+    )?;
+    memory_barrier_buffers(encoder);
+    crate::elem::encode_silu_mul(
+        encoder,
+        device,
+        gate_buf,
+        up_buf,
+        act_buf,
+        (n_slots * packed.ffn_rows) as u32,
+    )?;
+    memory_barrier_buffers(encoder);
 
     let down = ensure_pipeline(device, Q4_0_MOE_TOPK_KERNEL_SRC, "q4_0_moe_down_id")?;
     let weighted_sum = ensure_pipeline(device, Q4_0_MOE_TOPK_KERNEL_SRC, "moe_weighted_sum")?;
 
     encoder.setComputePipelineState(&down.0);
+    const ROWS_PER_TG: usize = 8;
     unsafe {
         encoder.setBuffer_offset_atIndex(Some(&down_w.buffer), down_w.weight_offset, 0);
         encoder.setBuffer_offset_atIndex(Some(act_buf), 0, 1);
@@ -3192,6 +3172,7 @@ pub(crate) fn encode_q4_0_moe_id(
             depth: 1,
         },
     );
+    memory_barrier_buffers(encoder);
 
     encoder.setComputePipelineState(&weighted_sum.0);
     unsafe {

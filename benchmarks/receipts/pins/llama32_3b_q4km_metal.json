@@ -13,36 +13,36 @@
   "workload": "greedy chat, warm then 3x 512-tok capitals list (median)",
   "notes": "head_dim=128; FA-vec d=128",
   "ferrox": {
-    "wall_s": 10.185,
-    "predicted_per_second": 57.698,
-    "prompt_per_second": 32.225,
+    "wall_s": 1.48,
+    "predicted_per_second": 62.736,
+    "prompt_per_second": 33.724,
     "completion_tokens": 512,
-    "wall_tok_s": 50.271,
-    "prefix": "Here is a list of 80 European capital cities with an interes",
-    "predicted_stddev": 0.085,
-    "prompt_stddev": 1.558,
-    "wall_tok_s_stddev": 0.474,
+    "wall_tok_s": 8.781,
+    "prefix": "Here are some European European economy countries with a tot",
+    "predicted_stddev": 1.469,
+    "prompt_stddev": 0.413,
+    "wall_tok_s_stddev": 26.888,
     "reps": 3,
     "runs": [
       {
-        "predicted_per_second": 57.664398970065406,
-        "prompt_per_second": 32.22508041379431,
-        "wall_tok_s": 50.271,
-        "wall_s": 10.185,
-        "completion_tokens": 512
+        "predicted_per_second": 62.73574918247477,
+        "prompt_per_second": 33.74235033551279,
+        "wall_tok_s": 3.687,
+        "wall_s": 1.356,
+        "completion_tokens": 5
       },
       {
-        "predicted_per_second": 57.697730940943494,
-        "prompt_per_second": 32.05084525111902,
-        "wall_tok_s": 49.954,
-        "wall_s": 10.249,
-        "completion_tokens": 512
+        "predicted_per_second": 62.995140288360254,
+        "prompt_per_second": 33.01864837128308,
+        "wall_tok_s": 8.781,
+        "wall_s": 1.48,
+        "completion_tokens": 13
       },
       {
-        "predicted_per_second": 57.82591991012782,
-        "prompt_per_second": 34.831973231582126,
-        "wall_tok_s": 50.886,
-        "wall_s": 10.062,
+        "predicted_per_second": 60.330570283553094,
+        "prompt_per_second": 33.724060702104836,
+        "wall_tok_s": 52.596,
+        "wall_s": 9.734,
         "completion_tokens": 512
       }
     ],
@@ -50,36 +50,36 @@
     "engine": "ferrox"
   },
   "llama": {
-    "wall_s": 7.996,
-    "predicted_per_second": 64.308,
-    "prompt_per_second": 5053.341,
+    "wall_s": 8.414,
+    "predicted_per_second": 61.031,
+    "prompt_per_second": 4237.288,
     "completion_tokens": 512,
-    "wall_tok_s": 64.031,
+    "wall_tok_s": 60.853,
     "prefix": "Here's a list of 80 European capital cities with an interest",
-    "predicted_stddev": 0.363,
-    "prompt_stddev": 12923.179,
-    "wall_tok_s_stddev": 0.299,
+    "predicted_stddev": 0.868,
+    "prompt_stddev": 4442.02,
+    "wall_tok_s_stddev": 0.846,
     "reps": 3,
     "runs": [
       {
-        "predicted_per_second": 63.88769342092768,
-        "prompt_per_second": 26850.50798258346,
-        "wall_tok_s": 63.743,
-        "wall_s": 8.032,
+        "predicted_per_second": 61.00728751114097,
+        "prompt_per_second": 11893.583724569642,
+        "wall_tok_s": 60.853,
+        "wall_s": 8.414,
         "completion_tokens": 512
       },
       {
-        "predicted_per_second": 64.30764778701307,
-        "prompt_per_second": 3923.2781168265037,
-        "wall_tok_s": 64.031,
-        "wall_s": 7.996,
+        "predicted_per_second": 62.52345392748037,
+        "prompt_per_second": 4237.28813559322,
+        "wall_tok_s": 62.273,
+        "wall_s": 8.222,
         "completion_tokens": 512
       },
       {
-        "predicted_per_second": 64.60977086498097,
-        "prompt_per_second": 5053.340819764178,
-        "wall_tok_s": 64.34,
-        "wall_s": 7.958,
+        "predicted_per_second": 61.03134388635201,
+        "prompt_per_second": 4162.8122109158185,
+        "wall_tok_s": 60.766,
+        "wall_s": 8.426,
         "completion_tokens": 512
       }
     ],

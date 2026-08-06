@@ -22,12 +22,12 @@ Keep off (regressions): legacy GQA NSG=4, sequential GREEDY argmax, float4 elem,
 | TinyLlama-1.1B-Chat-v1.0 Q8_0 | metal | **114.63** ±0.5 | **110.26** ±0.5 | ⚪ **~0.96×** | ⚪ parity | ok | [`tinyllama_q8_metal`](receipts/pins/tinyllama_q8_metal.json) |
 | TinyLlama-1.1B-Chat-v1.0 Q8_0 | cpu | **40.83** ±0.3 | **46.93** ±0.7 (−ngl 0) | 🔴 **~1.15×** | 🔴 **llama** | ok | [`tinyllama_q8_cpu`](receipts/pins/tinyllama_q8_cpu.json) |
 | Llama-3.2-1B-Instruct Q4_K_M | metal | **137.88** ±5.0 | **136.99** ±0.4 | ⚪ **1.00×** | ⚪ parity | ok | [`llama32_1b_q4km_metal`](receipts/pins/llama32_1b_q4km_metal.json) |
-| OLMoE-1B-7B-0924 Q4_0 | cpu | **22.85** ±0.2 | **49.44** ±1.8 (−ngl 0) | 🔴 **~2.16×** | 🔴 **llama** | ok | [`olmoe_q4_cpu`](receipts/pins/olmoe_q4_cpu.json) |
-| OLMoE-1B-7B-0924 Q4_0 | metal | **85.86** ±0.5 | **146.94** ±2.2 | 🔴 **~1.71×** | 🔴 **llama** | ok | [`olmoe_q4_metal`](receipts/pins/olmoe_q4_metal.json) |
+| OLMoE-1B-7B-0924 Q4_0 | cpu | **23.44** ±0.1 | **32.89** ±5.0 (−ngl 0) | 🔴 **~1.40×** | 🔴 **llama** | ok | [`olmoe_q4_cpu`](receipts/pins/olmoe_q4_cpu.json) |
+| OLMoE-1B-7B-0924 Q4_0 | metal | **89.92** ±1.6 | **143.41** ±1.1 | 🔴 **~1.59×** | 🔴 **llama** | ok | [`olmoe_q4_metal`](receipts/pins/olmoe_q4_metal.json) |
 | OLMoE-1B-7B-0924 Q4_0 | cuda | — | — | — | — | no pin | — |
 | Llama-3.1-8B-Instruct Q4_K_M | metal | **28.17** ±0.8 | **25.86** ±1.2 | 🟢 **~0.92×** | 🟢 **ferrox** | ok | [`llama31_8b_q4km_metal`](receipts/pins/llama31_8b_q4km_metal.json) |
 | Llama-3.1-8B-Instruct Q4_K_M | cuda | — | — | — | — | no pin | — |
-| Llama-3.2-3B-Instruct Q4_K_M | metal | **57.70** ±0.1 | **64.31** ±0.4 | 🔴 **~1.11×** | 🔴 **llama** | ok | [`llama32_3b_q4km_metal`](receipts/pins/llama32_3b_q4km_metal.json) |
+| Llama-3.2-3B-Instruct Q4_K_M | metal | **62.74** ±1.5 | **61.03** ±0.9 | ⚪ **~0.97×** | ⚪ parity | ok | [`llama32_3b_q4km_metal`](receipts/pins/llama32_3b_q4km_metal.json) |
 | Qwen1.5-MoE-A2.7B Q4_K_M | cpu | — | — | — | — | no pin | — |
 | Qwen1.5-MoE-A2.7B Q4_K_M | metal | — | — | — | — | no pin | — |
 | Mistral-7B-Instruct-v0.2 Q4_K_M | cpu | **8.18** ±0.1 | **9.35** ±0.4 (−ngl 0) | 🔴 **~1.14×** | 🔴 **llama** | ok | [`mistral_7b_q4km_cpu`](receipts/pins/mistral_7b_q4km_cpu.json) |

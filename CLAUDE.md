@@ -10,10 +10,11 @@ Metal + CUDA kernels, OpenAI-compatible `ferrox-server`.
 **Works today (evidence in docs):**
 
 - Dense GQA: TinyLlama, Llama-3.1-8B Q4_K_M (Metal fair-chat Gap
-  **~0.97×**; CLI pin **~1.00×** — see `benchmarks/RESULTS.md`).
-- Phi-4-mini Q4_K_M Metal pin (~1.06×); Gemma-4-E2B fail-closed until
+  **~0.92×**; Llama-3.2-3B **~0.97×** — see `benchmarks/RESULTS.md`).
+- Phi-4-mini Q4_K_M Metal ~parity; Gemma-4-E2B fail-closed until
   dedicated engine (per-layer emb / shared KV / SWA split).
-- MoE GQA: OLMoE-1B-7B-0924 (CPU + Metal expert placement).
+- MoE GQA: OLMoE-1B-7B-0924 (Metal concurrent encode ~1.59×; CPU shared
+  Q8 act ~1.40× — still closing vs llama).
 - Metal dense stack (`FERROX_METAL` / `FERROX_METAL_ATTN`); FA-vec
   decode d=64/96/128/256 + prefill d=128; CUDA matvec + resident weights
   + FFN fuse (CUDA fair-chat pins need a GPU host).

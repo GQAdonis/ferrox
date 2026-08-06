@@ -324,16 +324,18 @@ def main() -> None:
 
     lines.append("\n## Open\n\n")
     lines.append(
-        "1. Metal fair-chat 8B is ~parity (~0.97× quiet pin); keep watching "
-        "`prompt_per_second` vs llama after FA-vec prefill.\n"
-        "2. CUDA — re-measure on comparable CUDA hardware (no in-tree CUDA pin; "
+        "1. Metal fair-chat 8B is ahead (~0.92×); 3B ~parity (~0.97×). Keep "
+        "watching `prompt_per_second` vs llama after FA-vec prefill.\n"
+        "2. OLMoE Metal ~1.59× / CPU ~1.40× after concurrent encode + shared "
+        "Q8 act — next: expert residency hoist (`docs/ROADMAP.md`).\n"
+        "3. CUDA — re-measure on comparable CUDA hardware (no in-tree CUDA pin; "
         "skipped on darwin via `--fit-host`).\n"
-        "3. Gemma-4-E2B: both ferrox and Homebrew llama refuse (`gemma4` arch / "
-        "per-layer+shared-KV+SWA split); suite `expect=refuse`. Phi-4-mini metal pin landed.\n"
-        "4. CB multi-request tok/s receipt.\n"
-        "5. DS4 / GLM / MLA MoE real-checkpoint e2e when feasible.\n"
-        "6. Qwen2-MoE / Mixtral: missing GGUF or `--fit-host` RAM skip on Host B.\n"
-        "7. Suite contention: re-pin outliers alone if full-suite medians disagree with CLI.\n"
+        "4. Gemma-4-E2B: both ferrox and Homebrew llama refuse (`gemma4` arch / "
+        "per-layer+shared-KV+SWA split); suite `expect=refuse`.\n"
+        "5. CB multi-request tok/s receipt.\n"
+        "6. DS4 / GLM / MLA MoE real-checkpoint e2e when feasible.\n"
+        "7. Qwen2-MoE / Mixtral: missing GGUF or `--fit-host` RAM skip on Host B.\n"
+        "8. Suite contention: re-pin outliers alone if full-suite medians disagree with CLI.\n"
     )
     lines.append("\nDo not invent numbers without a pin.\n")
 

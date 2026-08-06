@@ -12,7 +12,7 @@ ds4 deps — rewrite in-tree.
 
 | Phase | Focus | Notes |
 |---|---|---|
-| **P1** | Metal prefill | FA-vec prefill d=128 landed; Llama-3.1-8B Metal fair-chat ~parity (~0.97×) — re-check `prompt_per_second` under quiet host |
+| **P1** | Metal prefill | FA-vec prefill d=128 landed; Llama-3.1-8B Metal fair-chat **~0.92×**; Llama-3.2-3B **~0.97×** — re-check `prompt_per_second` under quiet host |
 | **P2** | MLA GGUF → `MlaEngine` | CLI + **ferrox-server** dense-lead deepseek2/mistral4; MoE-after-dense fail-closed; GLM-4.7 / DS V3 MoE still open |
 | **P3** | Hybrid GDN | `gdn.rs` + loader scaffold; `HybridEngine` assemble + Qwen3.5 smoke still open |
 | **P4** | Gemma-4 text | E2B fail-closed (**DedicatedOnly**: per-layer emb + shared KV + SWA/full head-dim); suite refuse pin; MoE-A4B / VL → P7 |
@@ -21,7 +21,7 @@ ds4 deps — rewrite in-tree.
 Also on this horizon (unchanged intent):
 
 - **Receipts** — real GGUF oracles for Gemma-2, Qwen2-MoE, Mistral, Mixtral (suite entries exist; pins pending checkpoints).
-- **Metal MoE** — unfused `matvec_id` (llama-style occupancy); still ~1.66× on OLMoE — next: simdgroup `mul_mm` prefill + expert residency hoist.
+- **Metal MoE** — concurrent encode (`MTLDispatchTypeConcurrent`, gate∥up + Q∥K∥V) + unfused `matvec_id`; OLMoE Metal **~1.59×**, CPU **~1.40×** — next: expert residency hoist + simdgroup `mul_mm` prefill.
 - **Frontier** — Kimi multi-layer → full e2e; GLM-5.2 / DeepSeek V4 real quants (engines exist; fail-closed until receipts).
 - **CUDA** — fair-chat pins via `run_suite.py --backend cuda --host-label …`; staged ≥0.5× then parity (no invented numbers).
 

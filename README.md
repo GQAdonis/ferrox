@@ -13,9 +13,10 @@ and an OpenAI-compatible HTTP server.
 - **Zero-copy loading** — GGUF weights are mmapped and stay quantized;
   dequantization is fused into the dot products.
 - **Fast where it counts** — benchmarked against llama.cpp on the same
-  host, backend, and GGUF. CPU decode meets or beats llama.cpp on most
-  tested models; Metal is at parity for the Llama family and ahead for
-  Qwen. **CLI model load/startup is consistently faster** (mmap path;
+  host, backend, and GGUF. Metal is at or ahead of llama.cpp on the Llama
+  family (8B fair-chat Gap **~0.92×**, 3B **~0.97×**) and ahead for Qwen /
+  SmolLM2. MoE (OLMoE) still trails on Metal (~1.59×) while closing.
+  **CLI model load/startup is consistently faster** (mmap path;
   e.g. Llama-8B Metal load Gap ~0.03×, Mistral ~0.07× — Load gap =
   `ferrox_load / llama_load`, same &lt;1 = ferrox better rule as decode).
   Every claim has a pinned receipt in
@@ -92,10 +93,10 @@ curl -s -X POST http://127.0.0.1:8383/v1/chat/completions \
 
 | Area | State |
 |---|---|
-| Dense GQA (CPU / Metal) | Verified — TinyLlama, Llama 3.1/3.2; Llama-8B Metal fair-chat Gap **~0.97×** (CLI **~1.00×**) |
+| Dense GQA (CPU / Metal) | Verified — TinyLlama, Llama 3.1/3.2; Llama-8B Metal fair-chat Gap **~0.92×**; 3B **~0.97×** |
 | Qwen2.5 / Qwen3 / SmolLM2 | Verified — Metal ahead of llama.cpp on Host B pins |
 | Gemma-2 / Gemma-3 / Phi-3 / Phi-4 | Verified Metal pins; Gemma-4-E2B **refuse** (dedicated engine needed) |
-| MoE (CPU / Metal) | Verified — OLMoE; Metal expert placement (still trails llama on Metal MoE) |
+| MoE (CPU / Metal) | Verified — OLMoE; Metal concurrent `matvec_id` (~1.59×); CPU shared Q8 act (~1.40×) — still closing vs llama |
 | MLA / hybrid GDN | Partial — dense-lead MLA on CLI+server; hybrid loader scaffold only |
 | Kimi / GLM / DeepSeek | Partial — primitives and synthetic stacks, no frontier checkpoint e2e |
 | CUDA performance | Deferred — suite supports `--backend cuda`; needs GPU host pins |

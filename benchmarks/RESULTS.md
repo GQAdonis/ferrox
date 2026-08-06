@@ -77,12 +77,13 @@ Pins that used `llama-cli` or rejected options are omitted.
 
 ## Open
 
-1. Metal fair-chat 8B is ~parity (~0.97× quiet pin); keep watching `prompt_per_second` vs llama after FA-vec prefill.
-2. CUDA — re-measure on comparable CUDA hardware (no in-tree CUDA pin; skipped on darwin via `--fit-host`).
-3. Gemma-4-E2B: both ferrox and Homebrew llama refuse (`gemma4` arch / per-layer+shared-KV+SWA split); suite `expect=refuse`. Phi-4-mini metal pin landed.
-4. CB multi-request tok/s receipt.
-5. DS4 / GLM / MLA MoE real-checkpoint e2e when feasible.
-6. Qwen2-MoE / Mixtral: missing GGUF or `--fit-host` RAM skip on Host B.
-7. Suite contention: re-pin outliers alone if full-suite medians disagree with CLI.
+1. Metal fair-chat 8B is ahead (~0.92×); 3B ~parity (~0.97×). Keep watching `prompt_per_second` vs llama after FA-vec prefill.
+2. OLMoE Metal ~1.59× / CPU ~1.40× after concurrent encode + shared Q8 act — next: expert residency hoist (`docs/ROADMAP.md`).
+3. CUDA — re-measure on comparable CUDA hardware (no in-tree CUDA pin; skipped on darwin via `--fit-host`).
+4. Gemma-4-E2B: both ferrox and Homebrew llama refuse (`gemma4` arch / per-layer+shared-KV+SWA split); suite `expect=refuse`.
+5. CB multi-request tok/s receipt.
+6. DS4 / GLM / MLA MoE real-checkpoint e2e when feasible.
+7. Qwen2-MoE / Mixtral: missing GGUF or `--fit-host` RAM skip on Host B.
+8. Suite contention: re-pin outliers alone if full-suite medians disagree with CLI.
 
 Do not invent numbers without a pin.

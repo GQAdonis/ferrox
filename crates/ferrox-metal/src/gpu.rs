@@ -60,7 +60,7 @@ use objc2_foundation::NSString;
 use objc2_metal::{
     MTLBarrierScope, MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue,
     MTLComputeCommandEncoder, MTLComputePipelineState, MTLCreateSystemDefaultDevice, MTLDevice,
-    MTLDispatchType, MTLLibrary, MTLResourceOptions, MTLSize,
+    MTLDispatchType, MTLLibrary, MTLResource, MTLResourceOptions, MTLSize,
 };
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -95,9 +95,39 @@ pub(crate) fn compute_encoder_concurrent(
 }
 
 /// Buffer-scope barrier — same as llama `ggml_metal_encoder_memory_barrier`.
+/// Prefer [`memory_barrier_resources`] when the conflicting set is known:
+/// scope-Buffers waits for *all* buffer traffic (including huge weight
+/// reads), which bubbles the GPU on OLMoE Concurrent encode.
 #[inline]
 pub(crate) fn memory_barrier_buffers(encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>) {
     encoder.memoryBarrierWithScope(MTLBarrierScope::Buffers);
+}
+
+/// Resource-scoped Concurrent barrier: only the listed buffers are ordered.
+/// Subsequent dispatches that don't touch these resources can overlap with
+/// in-flight work on other buffers (e.g. weight reads from a prior matvec).
+#[inline]
+pub(crate) fn memory_barrier_resources(
+    encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+    bufs: &[&ProtocolObject<dyn MTLBuffer>],
+) {
+    if bufs.is_empty() {
+        memory_barrier_buffers(encoder);
+        return;
+    }
+    // MTLBuffer: MTLResource — build a contiguous pointer list for the API.
+    let mut resources: Vec<NonNull<ProtocolObject<dyn MTLResource>>> =
+        Vec::with_capacity(bufs.len());
+    for b in bufs {
+        let r: &ProtocolObject<dyn MTLResource> = ProtocolObject::from_ref(*b);
+        resources.push(NonNull::from(r));
+    }
+    unsafe {
+        encoder.memoryBarrierWithResources_count(
+            NonNull::new(resources.as_mut_ptr()).unwrap(),
+            resources.len(),
+        );
+    }
 }
 
 /// Thread-local pointer + length for a Metal-resident activation buffer
@@ -3232,10 +3262,79 @@ pub(crate) fn encode_q4_0_moe_gate_up_id(
     Ok(())
 }
 
+/// One dispatch: `act = silu(gate_id(x)) * up_id(x)` (reads x once).
+/// Shortens the MoE critical path vs Concurrent gate∥up + silu (+barrier).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_q4_0_moe_gate_up_silu_fused(
+    encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+    device: &Retained<ProtocolObject<dyn MTLDevice>>,
+    x_buf: &ProtocolObject<dyn MTLBuffer>,
+    packed: &MoePackedQ4<'_>,
+    ids: &ProtocolObject<dyn MTLBuffer>,
+    act_buf: &ProtocolObject<dyn MTLBuffer>,
+    top_k: u32,
+    n_tokens: u32,
+) -> Result<(), MetalError> {
+    assert_eq!(packed.gate_stride, packed.up_stride);
+    assert!(n_tokens >= 1 && top_k >= 1);
+    let bound = moe_packed_resident(device, packed)?;
+    let input_blocks = packed.gate_row_bytes / 18;
+    let x_stride = (input_blocks * 32) as u32;
+    let n_slots = (n_tokens as usize) * (top_k as usize);
+    let pipe = ensure_pipeline(device, Q4_0_MOE_TOPK_KERNEL_SRC, "q4_0_moe_gate_up_id")?;
+    encoder.setComputePipelineState(&pipe.0);
+    const ROWS_PER_TG: usize = 8;
+    let row_groups = packed.ffn_rows.div_ceil(ROWS_PER_TG);
+    unsafe {
+        encoder.setBuffer_offset_atIndex(Some(&bound.gate.buffer), bound.gate.weight_offset, 0);
+        encoder.setBuffer_offset_atIndex(Some(&bound.up.buffer), bound.up.weight_offset, 1);
+        encoder.setBuffer_offset_atIndex(Some(x_buf), 0, 2);
+        encoder.setBuffer_offset_atIndex(Some(act_buf), 0, 3);
+        encoder.setBuffer_offset_atIndex(Some(ids), 0, 4);
+        let mut rb = packed.gate_row_bytes as u32;
+        encoder.setBytes_length_atIndex(NonNull::new(&mut rb as *mut u32 as *mut _).unwrap(), 4, 5);
+        let mut blocks = input_blocks as u32;
+        encoder.setBytes_length_atIndex(
+            NonNull::new(&mut blocks as *mut u32 as *mut _).unwrap(),
+            4,
+            6,
+        );
+        let mut ffn = packed.ffn_rows as u32;
+        encoder.setBytes_length_atIndex(NonNull::new(&mut ffn as *mut u32 as *mut _).unwrap(), 4, 7);
+        let mut tk = top_k;
+        encoder.setBytes_length_atIndex(NonNull::new(&mut tk as *mut u32 as *mut _).unwrap(), 4, 8);
+        let mut stride = packed.gate_stride as u32;
+        encoder.setBytes_length_atIndex(
+            NonNull::new(&mut stride as *mut u32 as *mut _).unwrap(),
+            4,
+            9,
+        );
+        let mut nt = n_tokens;
+        encoder.setBytes_length_atIndex(NonNull::new(&mut nt as *mut u32 as *mut _).unwrap(), 4, 10);
+        let mut xs = x_stride;
+        encoder.setBytes_length_atIndex(NonNull::new(&mut xs as *mut u32 as *mut _).unwrap(), 4, 11);
+    }
+    encoder.dispatchThreadgroups_threadsPerThreadgroup(
+        MTLSize {
+            width: n_slots * row_groups,
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width: 32,
+            height: 2,
+            depth: 1,
+        },
+    );
+    Ok(())
+}
+
 /// Encode packed-id Q4_0 MoE: optional gate∥up → silu_mul → down_id → sum.
 ///
 /// Set `gate_up_done=true` when [`encode_q4_0_moe_gate_up_id`] already ran
 /// in a prior Concurrent encoder window (MoE stack on Host B).
+/// Set `act_done=true` when [`encode_q4_0_moe_gate_up_silu_fused`] already
+/// wrote `act` (skips gate/up/silu).
 ///
 /// `n_tokens=1` is decode; prefill passes `T`.
 /// When `residual_into_out` and `n_tokens==1`, the final sum does
@@ -3258,6 +3357,45 @@ pub(crate) fn encode_q4_0_moe_id(
     residual_into_out: bool,
     gate_up_done: bool,
 ) -> Result<(), MetalError> {
+    encode_q4_0_moe_id_ex(
+        encoder,
+        device,
+        x_buf,
+        packed,
+        ids,
+        route,
+        gate_buf,
+        up_buf,
+        act_buf,
+        expert_out_buf,
+        out_buf,
+        top_k,
+        n_tokens,
+        residual_into_out,
+        gate_up_done,
+        false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_q4_0_moe_id_ex(
+    encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+    device: &Retained<ProtocolObject<dyn MTLDevice>>,
+    x_buf: &ProtocolObject<dyn MTLBuffer>,
+    packed: &MoePackedQ4<'_>,
+    ids: &ProtocolObject<dyn MTLBuffer>,
+    route: &ProtocolObject<dyn MTLBuffer>,
+    gate_buf: &ProtocolObject<dyn MTLBuffer>,
+    up_buf: &ProtocolObject<dyn MTLBuffer>,
+    act_buf: &ProtocolObject<dyn MTLBuffer>,
+    expert_out_buf: &ProtocolObject<dyn MTLBuffer>,
+    out_buf: &ProtocolObject<dyn MTLBuffer>,
+    top_k: u32,
+    n_tokens: u32,
+    residual_into_out: bool,
+    gate_up_done: bool,
+    act_done: bool,
+) -> Result<(), MetalError> {
     assert_eq!(packed.gate_stride, packed.up_stride);
     assert!(n_tokens >= 1);
     assert!(top_k >= 1);
@@ -3266,21 +3404,23 @@ pub(crate) fn encode_q4_0_moe_id(
     let down_blocks = packed.down_row_bytes / 18;
     let n_slots = (n_tokens as usize) * (top_k as usize);
 
-    if !gate_up_done {
-        encode_q4_0_moe_gate_up_id(
-            encoder, device, x_buf, packed, ids, gate_buf, up_buf, top_k, n_tokens,
+    if !act_done {
+        if !gate_up_done {
+            encode_q4_0_moe_gate_up_id(
+                encoder, device, x_buf, packed, ids, gate_buf, up_buf, top_k, n_tokens,
+            )?;
+            memory_barrier_resources(encoder, &[gate_buf, up_buf]);
+        }
+        crate::elem::encode_silu_mul(
+            encoder,
+            device,
+            gate_buf,
+            up_buf,
+            act_buf,
+            (n_slots * packed.ffn_rows) as u32,
         )?;
-        memory_barrier_buffers(encoder);
+        memory_barrier_resources(encoder, &[act_buf]);
     }
-    crate::elem::encode_silu_mul(
-        encoder,
-        device,
-        gate_buf,
-        up_buf,
-        act_buf,
-        (n_slots * packed.ffn_rows) as u32,
-    )?;
-    memory_barrier_buffers(encoder);
 
     // Parallel down like llama mul_mv_id (depth=n_slots), then weighted
     // sum. In-kernel top-k loop (down_id_sum) serialized experts and
@@ -3348,7 +3488,7 @@ pub(crate) fn encode_q4_0_moe_id(
             depth: 1,
         },
     );
-    memory_barrier_buffers(encoder);
+    memory_barrier_resources(encoder, &[expert_out_buf]);
 
     const SUM_TG: usize = 256;
     if residual_into_out && n_tokens == 1 {
@@ -4870,234 +5010,5 @@ mod tests {
         for (i, (a, b)) in got.iter().zip(expected.iter()).enumerate() {
             assert_close_relative(*a, *b, i);
         }
-    }
-
-    /// OLMoE-shaped MoE vs dense Q4_0: isolate `mul_mv_id` GPU cost.
-    /// `cargo test -p ferrox-metal --features metal --release -- --ignored bench_olmoe_moe_vs_dense_q4 --nocapture`
-    #[test]
-    #[ignore = "needs Metal GPU; microbench"]
-    fn bench_olmoe_moe_vs_dense_q4() {
-        let hidden = 2048usize;
-        let ffn = 1024usize;
-        let top_k = 8usize;
-        let layers = 16usize;
-        let gate_blocks = hidden / 32;
-        let gate_row_bytes = gate_blocks * 18;
-        let down_blocks = ffn / 32;
-        let down_row_bytes = down_blocks * 18;
-
-        let mut mk_plane = |rows: usize, row_bytes: usize| -> Vec<u8> {
-            let mut w = vec![0u8; rows * row_bytes];
-            for (i, b) in w.chunks_exact_mut(18).enumerate() {
-                b[..2].copy_from_slice(&half::f16::from_f32(0.02 + (i % 17) as f32 * 0.001).to_le_bytes());
-                for j in 0..16 {
-                    b[2 + j] = ((i + j) % 255) as u8;
-                }
-            }
-            w
-        };
-        let gate = mk_plane(ffn, gate_row_bytes);
-        let up = mk_plane(ffn, gate_row_bytes);
-        let down = mk_plane(hidden, down_row_bytes);
-        let packed = MoePackedQ4 {
-            gate: &gate,
-            up: &up,
-            down: &down,
-            gate_stride: gate.len(),
-            up_stride: up.len(),
-            down_stride: down.len(),
-            n_experts: 1,
-            ffn_rows: ffn,
-            hidden_rows: hidden,
-            gate_row_bytes,
-            down_row_bytes,
-        };
-        let x: Vec<f32> = (0..hidden).map(|i| ((i as f32) * 0.01).sin()).collect();
-        let ids = vec![0i32; top_k];
-        let route = vec![1.0f32 / top_k as f32; top_k];
-
-        let shared = shared_metal().expect("metal");
-        let device = &shared.device;
-        let queue = &shared.queue;
-
-        // Warmup
-        for _ in 0..4 {
-            let _ = launch_moe_prefill_q4_0(&x, 1, &packed, &ids, &route, top_k).unwrap();
-            let _ = launch_q4_0_matvec(&gate, &x, ffn, gate_row_bytes).unwrap();
-        }
-
-        let iters = 32usize;
-        // MoE FFN (gate+up+silu+down+sum) × layers, one CB per layer-equiv via prefill×layers
-        let t0 = std::time::Instant::now();
-        let mut gpu_moe = 0.0f64;
-        for _ in 0..iters {
-            let cmd = queue.commandBuffer().unwrap();
-            let enc = cmd.computeCommandEncoder().unwrap();
-            // replicate 16 layers of expert work in one CB
-            let x_buf = unsafe {
-                device.newBufferWithBytes_length_options(
-                    NonNull::new(x.as_ptr() as *mut _).unwrap(),
-                    x.len() * 4,
-                    MTLResourceOptions::StorageModeShared,
-                )
-            }
-            .unwrap();
-            let mut ids_m = ids.clone();
-            let ids_buf = unsafe {
-                device.newBufferWithBytes_length_options(
-                    NonNull::new(ids_m.as_mut_ptr() as *mut _).unwrap(),
-                    ids_m.len() * 4,
-                    MTLResourceOptions::StorageModeShared,
-                )
-            }
-            .unwrap();
-            let mut route_m = route.clone();
-            let route_buf = unsafe {
-                device.newBufferWithBytes_length_options(
-                    NonNull::new(route_m.as_mut_ptr() as *mut _).unwrap(),
-                    route_m.len() * 4,
-                    MTLResourceOptions::StorageModeShared,
-                )
-            }
-            .unwrap();
-            let n_slots = top_k;
-            let gate_buf = device
-                .newBufferWithLength_options(n_slots * ffn * 4, MTLResourceOptions::StorageModeShared)
-                .unwrap();
-            let up_buf = device
-                .newBufferWithLength_options(n_slots * ffn * 4, MTLResourceOptions::StorageModeShared)
-                .unwrap();
-            let act_buf = device
-                .newBufferWithLength_options(n_slots * ffn * 4, MTLResourceOptions::StorageModeShared)
-                .unwrap();
-            let expert_out = device
-                .newBufferWithLength_options(n_slots * hidden * 4, MTLResourceOptions::StorageModeShared)
-                .unwrap();
-            let out_buf = device
-                .newBufferWithLength_options(hidden * 4, MTLResourceOptions::StorageModeShared)
-                .unwrap();
-            for _ in 0..layers {
-                encode_q4_0_moe_id(
-                    &enc,
-                    device,
-                    &x_buf,
-                    &packed,
-                    &ids_buf,
-                    &route_buf,
-                    &gate_buf,
-                    &up_buf,
-                    &act_buf,
-                    &expert_out,
-                    &out_buf,
-                    top_k as u32,
-                    1,
-                    false,
-                    false,
-                )
-                .unwrap();
-                memory_barrier_buffers(&enc);
-            }
-            enc.endEncoding();
-            cmd.commit();
-            cmd.waitUntilCompleted();
-            gpu_moe += cmd.GPUEndTime() - cmd.GPUStartTime();
-        }
-        let wall_moe = t0.elapsed().as_secs_f64();
-
-        // Dense equivalent FLOPs: 16 layers × (gate + up + down) without id, top_k=1 each
-        // Fairer: 16×8 slots as separate dense matvecs = same MAC count as id path
-        let t1 = std::time::Instant::now();
-        let mut gpu_dense = 0.0f64;
-        for _ in 0..iters {
-            let cmd = queue.commandBuffer().unwrap();
-            let enc = cmd.computeCommandEncoderWithDispatchType(MTLDispatchType::Concurrent)
-                .unwrap();
-            let x_buf = unsafe {
-                device.newBufferWithBytes_length_options(
-                    NonNull::new(x.as_ptr() as *mut _).unwrap(),
-                    x.len() * 4,
-                    MTLResourceOptions::StorageModeShared,
-                )
-            }
-            .unwrap();
-            let gate_w = resident_weight_buffer(device, &gate).unwrap();
-            let up_w = resident_weight_buffer(device, &up).unwrap();
-            let down_w = resident_weight_buffer(device, &down).unwrap();
-            let act_x: Vec<f32> = (0..ffn).map(|i| ((i as f32) * 0.02).cos()).collect();
-            let act_buf = unsafe {
-                device.newBufferWithBytes_length_options(
-                    NonNull::new(act_x.as_ptr() as *mut _).unwrap(),
-                    act_x.len() * 4,
-                    MTLResourceOptions::StorageModeShared,
-                )
-            }
-            .unwrap();
-            for _l in 0..layers {
-                for _s in 0..top_k {
-                    let g_out = device
-                        .newBufferWithLength_options(ffn * 4, MTLResourceOptions::StorageModeShared)
-                        .unwrap();
-                    let u_out = device
-                        .newBufferWithLength_options(ffn * 4, MTLResourceOptions::StorageModeShared)
-                        .unwrap();
-                    let d_out = device
-                        .newBufferWithLength_options(hidden * 4, MTLResourceOptions::StorageModeShared)
-                        .unwrap();
-                    let launch_g = MatvecLaunch {
-                        kernel_src: Q4_0_MATVEC_KERNEL_SRC,
-                        fn_name: "q4_0_matvec",
-                        block_bytes: 18,
-                        block_elems: 32,
-                        weights: &gate,
-                        rows: ffn,
-                        row_bytes: gate_row_bytes,
-                        rows_per_tg: 8,
-                    };
-                    let launch_u = MatvecLaunch {
-                        kernel_src: Q4_0_MATVEC_KERNEL_SRC,
-                        fn_name: "q4_0_matvec",
-                        block_bytes: 18,
-                        block_elems: 32,
-                        weights: &up,
-                        rows: ffn,
-                        row_bytes: gate_row_bytes,
-                        rows_per_tg: 8,
-                    };
-                    let launch_d = MatvecLaunch {
-                        kernel_src: Q4_0_MATVEC_KERNEL_SRC,
-                        fn_name: "q4_0_matvec",
-                        block_bytes: 18,
-                        block_elems: 32,
-                        weights: &down,
-                        rows: hidden,
-                        row_bytes: down_row_bytes,
-                        rows_per_tg: 8,
-                    };
-                    encode_matvec(&enc, device, &launch_g, &gate_w, &x_buf, &g_out).unwrap();
-                    encode_matvec(&enc, device, &launch_u, &up_w, &x_buf, &u_out).unwrap();
-                    memory_barrier_buffers(&enc);
-                    encode_matvec(&enc, device, &launch_d, &down_w, &act_buf, &d_out).unwrap();
-                    memory_barrier_buffers(&enc);
-                }
-            }
-            enc.endEncoding();
-            cmd.commit();
-            cmd.waitUntilCompleted();
-            gpu_dense += cmd.GPUEndTime() - cmd.GPUStartTime();
-            let _ = t1; // wall measured below
-        }
-        let wall_dense = t1.elapsed().as_secs_f64();
-
-        let moe_ms = gpu_moe / iters as f64 * 1e3;
-        let dense_ms = gpu_dense / iters as f64 * 1e3;
-        eprintln!(
-            "OLMoE-shaped GPU ms/tok-equiv: moe_id={moe_ms:.3} (wall {:.3}) dense×{top_k}={dense_ms:.3} (wall {:.3}) ratio_moe/dense={:.3}",
-            wall_moe / iters as f64 * 1e3,
-            wall_dense / iters as f64 * 1e3,
-            moe_ms / dense_ms
-        );
-        // Sanity: both paths did work
-        assert!(moe_ms > 0.5);
-        assert!(dense_ms > 0.5);
     }
 }

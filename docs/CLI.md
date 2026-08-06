@@ -1,19 +1,16 @@
 # CLI
 
 `ferrox` accepts common [llama.cpp](https://github.com/ggerganov/llama.cpp)
-completion flags. Top-level `-m` / `-p` work without typing `run` (argv is
-rewritten to `ferrox run …`).
-
-Build:
+completion flags. Top-level `-m` / `-p` work without typing `run`
+(rewritten to `ferrox run …`).
 
 ```bash
-cargo build --release -p ferrox-cli --features metal   # Metal on macOS
-# or: cargo build --release -p ferrox-cli               # CPU only
+cargo build --release -p ferrox-cli --features metal   # macOS Metal + CPU
+cargo build --release -p ferrox-cli                    # CPU only
 ```
 
-Binary: `./target/release/ferrox`.
-The Metal build also contains the CPU path; select either backend at runtime
-instead of maintaining separate executables.
+Binary: `./target/release/ferrox`. One executable covers every backend
+compiled in; pick at runtime with `-dev` / `-ngl`.
 
 ## Completion (`run`)
 
@@ -74,17 +71,16 @@ Same via explicit subcommand: `ferrox run -m …`.
 | `-e` / `--escape` | `\n` `\t` `\r` `\\` in `-p` |
 | `--ignore-eos` | Always emit up to `-n` |
 | `--verbose-prompt` | Print final prompt to stderr |
-| `--mtp` | Fail-closed: MTP draft heads not loaded from GGUF yet |
+| `--mtp` | Errors: MTP draft heads not loaded from GGUF yet |
 
 Stderr prints load and throughput timings. Generated text goes to stdout.
 
-**Speculative decoding:** prompt-lookup demo via `ferrox speculative` (no draft model). `--mtp` is reserved for future MiniMax/GLM MTP draft heads (`num_nextn_predict_layers`) and currently errors honestly.
+**Speculative decoding:** prompt-lookup demo via `ferrox speculative` (no draft model). `--mtp` is reserved for future MiniMax/GLM MTP draft heads (`num_nextn_predict_layers`) and currently errors.
 
-`--device none` (or `cpu`) and `-ngl 0` force CPU execution. The default is
-`--device auto -ngl auto`, which probes the GPU backends compiled into the
-binary. Ferrox does not yet place an exact subset of decoder layers: until
-partial layer placement is implemented, any positive `-ngl`, `auto`, or `all`
-enables all supported operations on the selected backend.
+`--device none` (or `cpu`) and `-ngl 0` force CPU. Default is
+`--device auto -ngl auto`. Any positive `-ngl`, `auto`, or `all` enables
+all supported ops on the selected backend (partial layer placement is
+not available yet).
 
 ### Chat vs completion
 
@@ -144,10 +140,10 @@ OpenAI-compatible HTTP API:
   -m models/tinyllama-1.1b-chat-v1.0.Q8_0.gguf \
   --host 127.0.0.1 --port 8383 -dev metal -ngl all
 
-# Optional static browser UI at / and /ui
+# Optional browser UI at / and /ui
 ./target/release/ferrox-server -m model.gguf --ui-server
 
-# MCP config stub (listed in GET /v1/models metadata; invoke not wired)
+# MCP config (metadata in GET /v1/models; invoke not wired)
 ./target/release/ferrox-server -m model.gguf --mcp-config mcp.json
 
 curl -s -X POST http://127.0.0.1:8383/v1/chat/completions \
@@ -161,4 +157,4 @@ The server accepts `-m/--model`, `--host`, `--port`, `-t/--threads`,
 supported; command-line values take precedence. Keep secrets such as
 `FERROX_API_KEY` in the environment.
 
-Models and backends: [`MODELS.md`](MODELS.md).
+See also: [`FEATURES.md`](FEATURES.md) · [`MODELS.md`](MODELS.md) · [`API.md`](API.md).

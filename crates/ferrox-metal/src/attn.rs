@@ -42,7 +42,8 @@ use crate::elem::{
 use crate::embd::{encode_get_rows, EmbdKind};
 use crate::gpu::{
     compute_encoder_concurrent, encode_matvec, encode_moe_topk_softmax, encode_q4_0_moe_gate_up_id,
-    encode_q4_0_moe_id, encode_q4_0_moe_topk, ensure_pipeline, memory_barrier_buffers,
+    encode_q4_0_moe_gate_up_silu_fused, encode_q4_0_moe_id, encode_q4_0_moe_id_ex,
+    encode_q4_0_moe_topk, ensure_pipeline, memory_barrier_buffers,
     resident_f32_buffer, resident_weight_buffer, shared_metal, MatvecLaunch, MetalError,
     MoeExpertLaunch, MoePackedQ4, ResidentF32Buffer, ResidentWeightBuffer,
 };
@@ -4209,8 +4210,13 @@ fn encode_moe_layer_fused(
         )?;
         mrs.end_op(&srcs, &dsts);
     }
-    // gate∥up as one Concurrent set (disjoint dsts, shared x2/ids).
-    {
+    // Concurrent gate∥up is faster on Host B than fused gate+up+silu
+    // (one dispatch). Opt into fused with FERROX_METAL_MOE_FUSED_GATE_UP=1.
+    let fused_gate_up = matches!(
+        std::env::var("FERROX_METAL_MOE_FUSED_GATE_UP").ok().as_deref(),
+        Some("1") | Some("true") | Some("on")
+    );
+    if !fused_gate_up {
         let srcs = [scratch.x2.as_ref(), scratch.ids.as_ref()];
         let dsts = [scratch.gate.as_ref(), scratch.up.as_ref()];
         mrs.begin_op(encoder, &srcs, &dsts);
@@ -4226,10 +4232,6 @@ fn encode_moe_layer_fused(
             1,
         )?;
         mrs.end_op(&srcs, &dsts);
-    }
-    // silu → down → residual (encode_q4_0_moe_id with gate_up_done; internal
-    // barriers cover silu↔down↔sum; mrs tracks the net h write).
-    {
         let srcs = [
             scratch.x2.as_ref(),
             scratch.ids.as_ref(),
@@ -4259,9 +4261,55 @@ fn encode_moe_layer_fused(
             top_k as u32,
             1,
             true,
-            true, // gate∥up already in Concurrent set above
+            true,
         )?;
         mrs.end_op(&srcs, &dsts);
+    } else {
+        {
+            let srcs = [scratch.x2.as_ref(), scratch.ids.as_ref()];
+            let dsts = [scratch.act.as_ref()];
+            mrs.begin_op(encoder, &srcs, &dsts);
+            encode_q4_0_moe_gate_up_silu_fused(
+                encoder,
+                device,
+                &scratch.x2,
+                &layer.packed,
+                &scratch.ids,
+                &scratch.act,
+                top_k as u32,
+                1,
+            )?;
+            mrs.end_op(&srcs, &dsts);
+        }
+        {
+            let srcs = [
+                scratch.ids.as_ref(),
+                scratch.route.as_ref(),
+                scratch.act.as_ref(),
+                scratch.h.as_ref(),
+            ];
+            let dsts = [scratch.expert_out.as_ref(), scratch.h.as_ref()];
+            mrs.begin_op(encoder, &srcs, &dsts);
+            encode_q4_0_moe_id_ex(
+                encoder,
+                device,
+                &scratch.x2,
+                &layer.packed,
+                &scratch.ids,
+                &scratch.route,
+                &scratch.gate,
+                &scratch.up,
+                &scratch.act,
+                &scratch.expert_out,
+                &scratch.h,
+                top_k as u32,
+                1,
+                true,
+                true,
+                true, // act already filled by fused gate_up_silu
+            )?;
+            mrs.end_op(&srcs, &dsts);
+        }
     }
     Ok(())
 }

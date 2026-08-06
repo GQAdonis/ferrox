@@ -253,21 +253,22 @@ impl ModelConfig {
         };
         let n_shared_experts =
             metadata_u64_any(file, &[key("expert_shared_count")]).unwrap_or(0) as usize;
-        let expert_ffn_dim = if is_moe {
-            metadata_u64_any(file, &[key("expert_feed_forward_length")]).unwrap_or_else(|| {
-                best_effort_fields.push(
-                    "moe.expert_ffn_dim (no expert_feed_forward_length key; defaulted to 4x hidden_dim)",
-                );
-                (hidden_dim * 4) as u64
-            }) as usize
-        } else {
-            metadata_u64_any(file, &[key("feed_forward_length")]).unwrap_or_else(|| {
-                best_effort_fields.push(
-                    "moe.expert_ffn_dim (no feed_forward_length key; defaulted to 4x hidden_dim)",
-                );
-                (hidden_dim * 4) as u64
-            }) as usize
-        };
+        // MoE GGUFs often only set `feed_forward_length` (OLMoE=1024);
+        // `expert_feed_forward_length` is optional. Prefer expert key, then
+        // dense FFN length, then 4×hidden — never ignore feed_forward_length.
+        let expert_ffn_dim = metadata_u64_any(
+            file,
+            &[
+                key("expert_feed_forward_length"),
+                key("feed_forward_length"),
+            ],
+        )
+        .unwrap_or_else(|| {
+            best_effort_fields.push(
+                "moe.expert_ffn_dim (no expert_feed_forward_length/feed_forward_length; defaulted to 4x hidden_dim)",
+            );
+            (hidden_dim * 4) as u64
+        }) as usize;
         let n_dense_leading_layers =
             metadata_u64_any(file, &[key("leading_dense_block_count")]).unwrap_or(0) as usize;
 

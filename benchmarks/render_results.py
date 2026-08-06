@@ -326,8 +326,8 @@ def main() -> None:
     lines.append(
         "1. Metal fair-chat 8B is ahead (~0.92×); 3B ~parity (~0.97×). Keep "
         "watching `prompt_per_second` vs llama after FA-vec prefill.\n"
-        "2. OLMoE Metal — Concurrent + `MoeMemRanges` (llama `ggml_mem_ranges`); "
-        "CPU 2-row SDOT mul_mat_id. Next: tighter `mul_mv_id` / multi-CB "
+        "2. OLMoE Metal — Concurrent + `MoeMemRanges` + `mul_mv_id` shipped "
+        "(~1.42×). Next: closer `mul_mv_id` / `mul_mm_id` prefill / multi-CB "
         "(`docs/ROADMAP.md`).\n"
         "3. CUDA — re-measure on comparable CUDA hardware (no in-tree CUDA pin; "
         "skipped on darwin via `--fit-host`).\n"
@@ -338,7 +338,6 @@ def main() -> None:
         "7. Qwen2-MoE / Mixtral: missing GGUF or `--fit-host` RAM skip on Host B.\n"
         "8. Suite contention: re-pin outliers alone if full-suite medians disagree with CLI.\n"
     )
-    lines.append("\nDo not invent numbers without a pin.\n")
 
     OUT.write_text("".join(lines))
     print(f"wrote {OUT}")

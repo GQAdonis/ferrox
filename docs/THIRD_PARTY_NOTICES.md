@@ -90,6 +90,16 @@ tensor-name-regex offload controls popularized by ik_llama.cpp
 
 ik_llama.cpp is a fork of llama.cpp and inherits its MIT license.
 
+## Metal Concurrent MoE hazard tracking
+
+`ferrox-metal`'s `MoeMemRanges` (and the one-Concurrent-command-buffer MoE
+encode path that uses it) follows the same hazard-tracking idea as
+llama.cpp / ggml `ggml_mem_ranges` under `MTLDispatchTypeConcurrent`:
+overlapping dispatches may share sources when destinations do not alias.
+The Rust implementation in `crates/ferrox-metal/src/moe_ranges.rs` is
+written independently against that public design; no ggml source lines
+are copied.
+
 ## CUDA execution path and hardware capability detection
 
 `ferrox-cuda`'s `HardwareProfile`/`SimdCaps` detection (probe once,

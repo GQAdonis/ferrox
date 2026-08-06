@@ -7,33 +7,19 @@ Guidance for agents working in this repo.
 Pure-Rust GGUF / MoE inference engine: mmap loaders, quantized CPU +
 Metal + CUDA kernels, OpenAI-compatible `ferrox-server`.
 
-**Works today (evidence in docs):**
-
-- Dense GQA: TinyLlama, Llama-3.1-8B Q4_K_M (Metal fair-chat Gap
-  **~0.92×**; Llama-3.2-3B **~0.97×** — see `benchmarks/RESULTS.md`).
-- Phi-4-mini Q4_K_M Metal ~parity; Gemma-4-E2B fail-closed until
-  dedicated engine (per-layer emb / shared KV / SWA split).
-- MoE GQA: OLMoE-1B-7B-0924 (Metal Concurrent + `MoeMemRanges` like
-  llama `ggml_mem_ranges`; CPU ~1.38× — see pins).
-- Metal dense stack (`FERROX_METAL` / `FERROX_METAL_ATTN`); FA-vec
-  decode d=64/96/128/256 + prefill d=128; CUDA matvec + resident weights
-  + FFN fuse (CUDA fair-chat pins need a GPU host).
-
-**Not e2e yet:** Gemma-4-E2B, real GLM-5.2 / DeepSeek V4 checkpoints;
-full Kimi K3 (~1.56 TB). See `docs/MODELS.md`.
-
-**Discipline:** evidence-first. Presets list `best_effort_fields`.
-Authoritative docs:
+Capabilities: `docs/FEATURES.md`. Models & pins: `docs/MODELS.md`,
+`benchmarks/RESULTS.md`. Planned: `docs/ROADMAP.md`.
 
 | Doc | Role |
 |---|---|
-| `docs/CLI.md` | `ferrox` llama.cpp-style flags + `ferrox chat` |
+| `docs/FEATURES.md` | capabilities overview |
+| `docs/CLI.md` | `ferrox` flags + `ferrox chat` |
 | `docs/MODELS.md` | what runs / what doesn’t |
 | `docs/API.md` | OpenAI compatibility matrix |
 | `docs/AGENTS_COOKBOOK.md` | point IDEs at `ferrox-server` |
-| `docs/CONFIG.md` | env vars (`FERROX_CTK`, Metal, CB, …) |
+| `docs/CONFIG.md` | env vars |
 | `benchmarks/RESULTS.md` | tok/s vs llama.cpp (Gap = llama/ferrox) |
-| `docs/ROADMAP.md` | future work only |
+| `docs/ROADMAP.md` | planned work |
 
 ## Commands
 

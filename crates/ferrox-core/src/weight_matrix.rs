@@ -1006,15 +1006,16 @@ impl WeightMatrix {
                                     .with_min_len(Self::min_rows_per_task(n_groups).max(1))
                                     .enumerate()
                                     .for_each(|(g, group_out)| {
-                                        let mut tmp = [0f32; ferrox_quant::Q8_0X4_NROWS];
-                                        for (b, act) in acts.iter().enumerate() {
-                                            ferrox_quant::gemv_q8_0x4_group(
-                                                &packed, g, act, cols, &mut tmp,
-                                            );
-                                            for r in 0..ferrox_quant::Q8_0X4_NROWS {
-                                                group_out[r * batch_size + b] = tmp[r];
-                                            }
-                                        }
+                                        // GEMM, not a GEMV per position:
+                                        // `group_out` is already
+                                        // `[row][batch]`, which is the
+                                        // layout the batched kernel
+                                        // writes, and the group's weight
+                                        // vectors stay in registers
+                                        // across a tile of activations.
+                                        ferrox_quant::gemm_q8_0x4_group(
+                                            &packed, g, &acts, cols, group_out,
+                                        );
                                     });
                                 let data_slice = data.as_slice();
                                 by_row[n_groups * group_stride..]

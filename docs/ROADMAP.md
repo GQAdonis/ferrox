@@ -16,11 +16,13 @@ What ships today: [`FEATURES.md`](FEATURES.md) · [`MODELS.md`](MODELS.md).
 - **Batched prefill is the biggest gap in the project: ~4–5× on CPU
   after batching the dense FFN, 15–90× on Metal** (`ferrox bench` vs
   `llama-bench`, both at their own default threads). CPU next step is a
-  real GEMM with register blocking over the batch dimension
-  (llama's `ggml_gemm_q4_K_8x8_q8_K` / `ggml_gemm_q8_0_4x4_q8_0`);
-  `apply_batch` still calls a GEMV per position, so today's only win is
-  weight-cache reuse. Metal needs the simdgroup `mul_mm`. The fair-chat
-  suite could not see any of this: its prompt is ~30 tokens
+  Q4_K GEMM (`ggml_gemm_q4_K_8x8_q8_K`) — Q8_0 now has one
+  (`gemm_q8_0x4_group`, +8–14%), Q4_K still runs a GEMV per position, so
+  Phi-3 and Gemma-2 barely moved. Metal needs the simdgroup `mul_mm`.
+  The fair-chat suite could not see any of this: its prompt is ~30 tokens
+- Benchmark stability: sequential runs spread ±20% on Host B. Anything
+  claiming <20% must be measured by interleaved A/B, as
+  `gemm_q8_0x4_group` was
 - MoE prefill: group positions by expert (llama `mul_mat_id` map0) so
   MoE layers can batch too — they still run one position at a time
 - **Benchmark harness: stop forcing `-t 10`.** It handicaps llama.cpp 2–4×

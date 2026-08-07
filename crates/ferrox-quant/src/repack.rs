@@ -478,6 +478,61 @@ pub fn gemv_q8_0x4_q8_0(
     gemv_q8_0x4_q8_0_scalar(packed, act, n_cols, n_row_groups, out);
 }
 
+/// How many activations one [`gemm_q8_0x4_group`] pass keeps in flight.
+/// Four f32x4 accumulators plus the eight loaded weight vectors fit
+/// comfortably in NEON's register file, so each weight load is amortized
+/// over four activations instead of being repeated per activation.
+pub const Q8_0X4_GEMM_NC: usize = 4;
+
+/// GEMM counterpart of [`gemv_q8_0x4_group`]: one row-group (4 rows)
+/// against `acts.len()` activations at once.
+///
+/// The difference that matters is register blocking over the *batch*
+/// dimension. Calling the GEMV once per activation reloads the group's
+/// eight `int8x16` weight vectors for every activation; this loads them
+/// once per `Q8_0X4_GEMM_NC` activations and issues the dot products
+/// back to back. That is the same reason llama.cpp ships
+/// `ggml_gemm_q8_0_4x4_q8_0` next to `ggml_gemv_q8_0_4x4_q8_0` rather
+/// than looping the GEMV.
+///
+/// `out` is `[row][act]`: `out[r * acts.len() + j]`, which is the layout
+/// `WeightMatrix::apply_batch` accumulates into.
+pub fn gemm_q8_0x4_group(
+    packed: &[u8],
+    group: usize,
+    acts: &[Q8Activations],
+    n_cols: usize,
+    out: &mut [f32],
+) {
+    assert_eq!(out.len(), Q8_0X4_NROWS * acts.len());
+    assert!(n_cols.is_multiple_of(Q8_0_BLOCK_ELEMS));
+    if acts.is_empty() {
+        return;
+    }
+    let nb = n_cols / Q8_0_BLOCK_ELEMS;
+    let off = group * nb * Q8_0X4_BLOCK_BYTES;
+    let slice = &packed[off..off + nb * Q8_0X4_BLOCK_BYTES];
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        if std::arch::is_aarch64_feature_detected!("dotprod") {
+            unsafe {
+                neon::gemm_q8_0x4_q8_0_neon_sdot(slice, acts, n_cols, out);
+            }
+            return;
+        }
+    }
+    // Portable fallback: the GEMV, once per activation. Same results,
+    // none of the reuse.
+    let mut tmp = [0f32; Q8_0X4_NROWS];
+    for (j, act) in acts.iter().enumerate() {
+        gemv_q8_0x4_q8_0(slice, act, n_cols, 1, &mut tmp);
+        for (r, v) in tmp.iter().enumerate() {
+            out[r * acts.len() + j] = *v;
+        }
+    }
+}
+
 /// One row-group (4 outputs) starting at `group` within a packed Q8_0x4 matrix.
 #[inline]
 pub fn gemv_q8_0x4_group(
@@ -802,6 +857,75 @@ mod neon {
             vst1q_f32(out.as_mut_ptr().add(x * Q8_0X4_NROWS), acc);
         }
     }
+
+    /// NEON DotProd GEMM for one `block_q8_0x4` row-group against
+    /// several activations (llama `ggml_gemm_q8_0_4x4_q8_0` in shape).
+    ///
+    /// The eight weight vectors of a block are loaded once and reused
+    /// across a tile of [`Q8_0X4_GEMM_NC`] activations, which is the
+    /// whole point of having a GEMM rather than a loop over the GEMV.
+    #[target_feature(enable = "neon,dotprod")]
+    pub unsafe fn gemm_q8_0x4_q8_0_neon_sdot(
+        group: &[u8],
+        acts: &[Q8Activations],
+        n_cols: usize,
+        out: &mut [f32],
+    ) {
+        let nb = n_cols / Q8_0_BLOCK_ELEMS;
+        let n_acts = acts.len();
+        let mut j0 = 0;
+        while j0 < n_acts {
+            let tile = Q8_0X4_GEMM_NC.min(n_acts - j0);
+            let mut acc = [vdupq_n_f32(0.0); Q8_0X4_GEMM_NC];
+            for b in 0..nb {
+                let blk = group.as_ptr().add(b * Q8_0X4_BLOCK_BYTES);
+                let qs = blk.add(8);
+                let w = [
+                    vld1q_s8(qs as *const i8),
+                    vld1q_s8(qs.add(16) as *const i8),
+                    vld1q_s8(qs.add(32) as *const i8),
+                    vld1q_s8(qs.add(48) as *const i8),
+                    vld1q_s8(qs.add(64) as *const i8),
+                    vld1q_s8(qs.add(80) as *const i8),
+                    vld1q_s8(qs.add(96) as *const i8),
+                    vld1q_s8(qs.add(112) as *const i8),
+                ];
+                let d_bits = vld1_u16(blk as *const u16);
+                let mut dw = [0f32; 4];
+                dw[0] = f16::from_bits(vget_lane_u16(d_bits, 0)).to_f32();
+                dw[1] = f16::from_bits(vget_lane_u16(d_bits, 1)).to_f32();
+                dw[2] = f16::from_bits(vget_lane_u16(d_bits, 2)).to_f32();
+                dw[3] = f16::from_bits(vget_lane_u16(d_bits, 3)).to_f32();
+                let dw_v = vld1q_f32(dw.as_ptr());
+
+                for t in 0..tile {
+                    let act = &acts[j0 + t];
+                    let a_ptr = act.q.as_ptr().add(b * Q8_0_BLOCK_ELEMS);
+                    let a0 = vld1q_s8(a_ptr);
+                    let a1 = vld1q_s8(a_ptr.add(16));
+                    let mut ret = vdupq_n_s32(0);
+                    ret = sdot_lane(ret, w[0], a0, 0);
+                    ret = sdot_lane(ret, w[1], a0, 1);
+                    ret = sdot_lane(ret, w[2], a0, 2);
+                    ret = sdot_lane(ret, w[3], a0, 3);
+                    ret = sdot_lane(ret, w[4], a1, 0);
+                    ret = sdot_lane(ret, w[5], a1, 1);
+                    ret = sdot_lane(ret, w[6], a1, 2);
+                    ret = sdot_lane(ret, w[7], a1, 3);
+                    let scale = vmulq_n_f32(dw_v, act.d[b]);
+                    acc[t] = vfmaq_f32(acc[t], vcvtq_f32_s32(ret), scale);
+                }
+            }
+            for t in 0..tile {
+                let mut lanes = [0f32; Q8_0X4_NROWS];
+                vst1q_f32(lanes.as_mut_ptr(), acc[t]);
+                for (r, v) in lanes.iter().enumerate() {
+                    out[r * n_acts + j0 + t] = *v;
+                }
+            }
+            j0 += tile;
+        }
+    }
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -1010,6 +1134,66 @@ mod tests {
                 reference[r]
             );
         }
+    }
+
+    /// The GEMM exists purely to reuse weight loads across activations,
+    /// so it must produce exactly what the per-activation GEMV produces
+    /// -- not merely something close. Any divergence would be a
+    /// batch-size-dependent numeric difference, i.e. prefill and decode
+    /// disagreeing about the same prompt.
+    #[test]
+    fn q8_0x4_gemm_matches_the_gemv_run_once_per_activation() {
+        let n_blocks = 4;
+        let cols = n_blocks * Q8_0_BLOCK_ELEMS;
+        let rows = 8;
+        let mut matrix = Vec::new();
+        for r in 0..rows {
+            matrix.extend_from_slice(&synth_q8_0_row(n_blocks, (r * 3 + 1) as u8));
+        }
+        let packed = pack_q8_0_matrix_x4(&matrix, rows, cols, Q8_0X4_INTERLEAVE);
+
+        // Deliberately not a multiple of the tile width, so the tail
+        // path is covered too.
+        let n_acts = 7;
+        let acts: Vec<Q8Activations> = (0..n_acts)
+            .map(|j| {
+                let x: Vec<f32> = (0..cols)
+                    .map(|i| (((i + j * 13) as f32) * 0.017 - 0.9).sin() * 1.7)
+                    .collect();
+                quantize_activations_q8(&x)
+            })
+            .collect();
+
+        for group in 0..rows / Q8_0X4_NROWS {
+            let mut gemm_out = vec![0f32; Q8_0X4_NROWS * n_acts];
+            gemm_q8_0x4_group(&packed, group, &acts, cols, &mut gemm_out);
+
+            for (j, act) in acts.iter().enumerate() {
+                let mut gemv_out = [0f32; Q8_0X4_NROWS];
+                gemv_q8_0x4_group(&packed, group, act, cols, &mut gemv_out);
+                for r in 0..Q8_0X4_NROWS {
+                    assert_eq!(
+                        gemm_out[r * n_acts + j],
+                        gemv_out[r],
+                        "group {group} row {r} act {j}: GEMM and GEMV disagree"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn q8_0x4_gemm_with_no_activations_is_a_no_op() {
+        let n_blocks = 2;
+        let cols = n_blocks * Q8_0_BLOCK_ELEMS;
+        let mut matrix = Vec::new();
+        for r in 0..Q8_0X4_NROWS {
+            matrix.extend_from_slice(&synth_q8_0_row(n_blocks, r as u8));
+        }
+        let packed = pack_q8_0_matrix_x4(&matrix, Q8_0X4_NROWS, cols, Q8_0X4_INTERLEAVE);
+        let mut out: Vec<f32> = Vec::new();
+        gemm_q8_0x4_group(&packed, 0, &[], cols, &mut out);
+        assert!(out.is_empty());
     }
 
     #[test]

@@ -2505,6 +2505,59 @@ impl Decoder {
         combine_expert_outputs(&routed_outputs, &shared_outputs, hidden_dim)
     }
 
+    /// The dense FFN for a whole batch of positions in three batched
+    /// matmuls (gate, up, down) instead of three per position.
+    ///
+    /// This is the counterpart of what `forward_hidden_batch` already
+    /// did for Q/K/V and the router, and it is where a dense model's
+    /// prefill time actually goes: `WeightMatrix::apply_batch` reads
+    /// each weight row once and dots it against every position, rather
+    /// than re-reading the whole FFN for each one.
+    ///
+    /// `None` for anything that is not a plain dense layer -- MoE
+    /// routing is per position by construction, so those keep the
+    /// sequential path.
+    ///
+    /// Also `None` whenever a GPU backend is driving dense weights. The
+    /// per-position path there is not three matvecs but one *fused*
+    /// gate+up+SiLU+down launch (`apply_gpu_dense_ffn_swiglu`), and
+    /// three separate batched launches lose to it: measured on Host B
+    /// Metal, `pp512` went 18.8 -> 10.7 on Llama-3.1-8B Q4_K_M and 26.3
+    /// -> 21.6 on Gemma-2-2B Q4_K_M when this path was taken. (Q8_0 went
+    /// the other way -- SmolLM2 131 -> 353 -- so the GPU prefill answer
+    /// is a real `mul_mm`, not this.)
+    fn dense_ffn_batch(
+        layer: &LayerWeights,
+        normed2_batch: &[f32],
+        batch_size: usize,
+        config: &ModelConfig,
+    ) -> Option<Vec<f32>> {
+        if !Self::is_dense_layer(layer) || batch_size < 2 {
+            return None;
+        }
+        #[cfg(feature = "metal")]
+        if ferrox_core::weight_matrix::metal_dense_enabled() {
+            return None;
+        }
+        #[cfg(feature = "cuda")]
+        if ferrox_core::weight_matrix::cuda_dense_enabled() {
+            return None;
+        }
+        layer.moe.record_activations(&[0]);
+        Some(layer.moe.with_expert(0, |ex| {
+            let gate = ex.gate.apply_batch(normed2_batch, batch_size);
+            let up = ex.up.apply_batch(normed2_batch, batch_size);
+            let activated: Vec<f32> = match config.ffn_activation {
+                crate::config::FfnActivation::Swiglu
+                | crate::config::FfnActivation::SwigluFused => {
+                    ferrox_core::matmul::swiglu(&gate, &up)
+                }
+                crate::config::FfnActivation::Gelu => geglu(&gate, &up),
+            };
+            ex.down.apply_batch(&activated, batch_size)
+        }))
+    }
+
     /// `forward_token`'s MoE FFN block for one position: the dense
     /// fast path (see `is_dense_layer`) or the full router+combine path
     /// with the router computed inline via a single-position `apply`.
@@ -2890,6 +2943,18 @@ impl Decoder {
                         for (h, f) in hidden_batch.iter_mut().zip(ffn_batch.iter()) {
                             *h += f;
                         }
+                    } else if let Some(mut ffn_batch) =
+                        Self::dense_ffn_batch(layer, &normed2_batch, batch_size, &self.config)
+                    {
+                        if let Some(post) = &layer.attn.post_ffn_norm {
+                            ffn_batch = ffn_batch
+                                .chunks(hidden_dim)
+                                .flat_map(|row| rms_norm(row, post, self.config.rms_norm_eps))
+                                .collect();
+                        }
+                        for (h, f) in hidden_batch.iter_mut().zip(ffn_batch.iter()) {
+                            *h += f;
+                        }
                     } else {
                         let n_experts = layer.moe.n_experts().max(1);
                         for b in 0..batch_size {
@@ -3033,6 +3098,23 @@ impl Decoder {
             #[cfg(not(feature = "metal"))]
             let metal_ffn: Option<Vec<f32>> = None;
             if let Some(mut ffn_batch) = metal_ffn {
+                if let Some(post) = &layer.attn.post_ffn_norm {
+                    ffn_batch = ffn_batch
+                        .chunks(hidden_dim)
+                        .flat_map(|row| rms_norm(row, post, self.config.rms_norm_eps))
+                        .collect();
+                }
+                for (h, f) in hidden_batch.iter_mut().zip(ffn_batch.iter()) {
+                    *h += f;
+                }
+            } else if let Some(mut ffn_batch) =
+                Self::dense_ffn_batch(layer, &normed2_batch, batch_size, &self.config)
+            {
+                // Dense FFN, batched. Without this the FFN -- the
+                // majority of a dense model's prefill work -- ran one
+                // position at a time while Q/K/V and the router were
+                // already batched, which is why `pp512` measured about
+                // the same as `tg128`.
                 if let Some(post) = &layer.attn.post_ffn_norm {
                     ffn_batch = ffn_batch
                         .chunks(hidden_dim)

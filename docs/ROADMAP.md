@@ -13,12 +13,16 @@ What ships today: [`FEATURES.md`](FEATURES.md) · [`MODELS.md`](MODELS.md).
 - Re-pin OLMoE Metal; chase Gap ≤ ~1.05× (full multi-layer prefill stack CB)
 - Deferred MoE residual (dense-style) — correct tokens then land
 - Improve Metal dense prefill `prompt_per_second` (true simdgroup `mul_mm`)
-- **Batched prefill is the biggest gap in the project: 6–9× on CPU,
-  15–90× on Metal** (`ferrox bench` vs `llama-bench`, both at their own
-  default threads). On CPU `pp512 ≈ tg128` — batched prefill is still
-  N× matvec, with no GEMM. llama.cpp uses llamafile `sgemm` / repack
-  `ggml_gemm_*` on CPU and `kernel_mul_mm` on Metal. The fair-chat suite
-  could not see this: its prompt is ~30 tokens
+- **Batched prefill is the biggest gap in the project: ~4–5× on CPU
+  after batching the dense FFN, 15–90× on Metal** (`ferrox bench` vs
+  `llama-bench`, both at their own default threads). CPU next step is a
+  real GEMM with register blocking over the batch dimension
+  (llama's `ggml_gemm_q4_K_8x8_q8_K` / `ggml_gemm_q8_0_4x4_q8_0`);
+  `apply_batch` still calls a GEMV per position, so today's only win is
+  weight-cache reuse. Metal needs the simdgroup `mul_mm`. The fair-chat
+  suite could not see any of this: its prompt is ~30 tokens
+- MoE prefill: group positions by expert (llama `mul_mat_id` map0) so
+  MoE layers can batch too — they still run one position at a time
 - **Benchmark harness: stop forcing `-t 10`.** It handicaps llama.cpp 2–4×
   on Host B, so every CPU row in `RESULTS.md` overstates ferrox. Report
   each engine at its own default plus a thread sweep, and split the

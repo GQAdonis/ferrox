@@ -465,6 +465,31 @@ impl WeightMatrix {
         }
     }
 
+    /// Whether batching this matrix during prefill beats running the
+    /// fused per-position dense-FFN launch once per token.
+    ///
+    /// Measured, not assumed. Q4_K/Q6_K have a real simdgroup GEMM and
+    /// win by ~4x. Q8_0 has only a batched matvec and still wins clearly
+    /// (TinyLlama Metal `pp512` 74 -> 139), because the fused path pays a
+    /// launch per token. The IQ codebook kinds are the exception -- their
+    /// batched matvec loses to the fused launch (Llama-3.2-1B IQ4_XS
+    /// regressed 72.1 -> 33.2), so they keep the per-position path until
+    /// they get a GEMM of their own.
+    #[cfg(any(feature = "metal", feature = "cuda"))]
+    pub fn prefers_gpu_batch(&self) -> bool {
+        !matches!(
+            self,
+            WeightMatrix::Quantized {
+                kind: QuantKind::IQ4NL
+                    | QuantKind::IQ4XS
+                    | QuantKind::IQ1S
+                    | QuantKind::IQ2XXS
+                    | QuantKind::IQ3XXS,
+                ..
+            }
+        )
+    }
+
     /// Computes `W @ x` for a single activation vector `x` of length
     /// `self.cols()`, returning a vector of length `self.rows()`.
     /// Parallelized over output rows with rayon, same decomposition as

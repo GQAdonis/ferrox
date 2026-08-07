@@ -2542,9 +2542,27 @@ impl Decoder {
         if !Self::is_dense_layer(layer) || batch_size < 4 {
             return None;
         }
-        #[cfg(feature = "cuda")]
-        if ferrox_core::weight_matrix::cuda_dense_enabled() {
-            return None;
+        // On a GPU backend this only wins when the weights have a real
+        // batched GEMM; otherwise `apply_batch` is a batched matvec and
+        // loses to the fused per-position launch.
+        #[cfg(any(feature = "metal", feature = "cuda"))]
+        {
+            #[cfg(feature = "metal")]
+            let gpu_dense = ferrox_core::weight_matrix::metal_dense_enabled();
+            #[cfg(not(feature = "metal"))]
+            let gpu_dense = false;
+            #[cfg(feature = "cuda")]
+            let gpu_dense = gpu_dense || ferrox_core::weight_matrix::cuda_dense_enabled();
+            if gpu_dense {
+                let all_gemm = layer.moe.with_expert(0, |ex| {
+                    ex.gate.prefers_gpu_batch()
+                        && ex.up.prefers_gpu_batch()
+                        && ex.down.prefers_gpu_batch()
+                });
+                if !all_gemm {
+                    return None;
+                }
+            }
         }
         layer.moe.record_activations(&[0]);
         Some(layer.moe.with_expert(0, |ex| {

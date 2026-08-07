@@ -157,4 +157,34 @@ The server accepts `-m/--model`, `--host`, `--port`, `-t/--threads`,
 supported; command-line values take precedence. Keep secrets such as
 `FERROX_API_KEY` in the environment.
 
+## Benchmark (`ferrox bench`)
+
+With `-m`, `bench` is a [`llama-bench`](https://github.com/ggerganov/llama.cpp/tree/master/tools/llama-bench)
+work-alike: same workload names (`pp<N>` batched prefill, `tg<N>` decode),
+same reporting (median ± population stddev over `-r` reps, one warmup
+discarded), same flag names — so the two outputs can be read side by side.
+
+```bash
+# CPU (default). Prints the exact llama-bench command to compare against.
+./target/release/ferrox bench -m model.gguf -p 512 -n 128 -r 3
+
+# Metal
+./target/release/ferrox bench -m model.gguf --n-gpu-layers 99 -p 512 -n 128
+```
+
+| Flag | Meaning |
+|---|---|
+| `-m/--model` | GGUF to benchmark; without it, `bench` runs the synthetic matvec microbenchmark instead |
+| `-p/--n-prompt` | Prefill tokens (default 512; `0` skips the `pp` row) |
+| `-n/--n-gen` | Decode steps (default 128; `0` skips the `tg` row) |
+| `-r/--repetitions` | Timed reps (default 3), plus one discarded warmup |
+| `-t/--threads` | CPU threads (`0` = performance-core default) |
+| `--n-gpu-layers` | `0` forces CPU; anything else offloads |
+
+This is the **engine** number: no HTTP, no chat template, no tokenizer, no
+sampling. The **serving** number — what a `ferrox-server` user actually
+gets — is measured separately by
+[`benchmarks/run_suite.py`](../benchmarks/README.md). Do not mix them:
+a regression in one is not a regression in the other.
+
 See also: [`FEATURES.md`](FEATURES.md) · [`MODELS.md`](MODELS.md) · [`API.md`](API.md).

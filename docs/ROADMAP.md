@@ -13,10 +13,16 @@ What ships today: [`FEATURES.md`](FEATURES.md) · [`MODELS.md`](MODELS.md).
 - Re-pin OLMoE Metal; chase Gap ≤ ~1.05× (full multi-layer prefill stack CB)
 - Deferred MoE residual (dense-style) — correct tokens then land
 - Improve Metal dense prefill `prompt_per_second` (true simdgroup `mul_mm`)
+- **Batched prefill is the biggest gap in the project: 6–9× on CPU,
+  15–90× on Metal** (`ferrox bench` vs `llama-bench`, both at their own
+  default threads). On CPU `pp512 ≈ tg128` — batched prefill is still
+  N× matvec, with no GEMM. llama.cpp uses llamafile `sgemm` / repack
+  `ggml_gemm_*` on CPU and `kernel_mul_mm` on Metal. The fair-chat suite
+  could not see this: its prompt is ~30 tokens
 - **Benchmark harness: stop forcing `-t 10`.** It handicaps llama.cpp 2–4×
   on Host B, so every CPU row in `RESULTS.md` overstates ferrox. Report
   each engine at its own default plus a thread sweep, and split the
-  engine number (`llama-bench`-style, no HTTP) from the serving number.
+  engine number (`ferrox bench`, landed) from the serving number.
   See [`.scratch/NOTES_LLAMA_CPU.md`](../.scratch/NOTES_LLAMA_CPU.md)
 - CPU: persistent spin-barrier worker pool (llama `ggml_barrier`) to
   replace per-matvec rayon fork-join — ferrox's parallel scaling ceilings

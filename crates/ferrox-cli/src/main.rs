@@ -1,6 +1,7 @@
 //! ferrox CLI — llama.cpp-style GGUF completion (`-m`/`-p`/`-n`/…) plus
 //! inspect / presets / smoke / Kimi helpers. See `docs/CLI.md`.
 
+mod bench_model;
 mod chat;
 mod pull;
 mod run;
@@ -99,6 +100,29 @@ enum Commands {
     /// throughput (tokens/sec) for each preset at synthetic-but-full-
     /// scale-shape dimensions.
     Bench {
+        /// Real GGUF to benchmark. With this set, `bench` becomes a
+        /// `llama-bench` work-alike (pp/tg on real weights) and the
+        /// synthetic matvec microbenchmark below is skipped.
+        #[arg(short = 'm', long)]
+        model: Option<String>,
+        /// Prompt tokens for the `pp<N>` batched-prefill row (`0` skips).
+        #[arg(short = 'p', long = "n-prompt", default_value_t = 512)]
+        n_prompt: usize,
+        /// Decode steps for the `tg<N>` row (`0` skips).
+        #[arg(short = 'n', long = "n-gen", default_value_t = 128)]
+        n_gen: usize,
+        /// Timed repetitions per row; one extra warmup is discarded.
+        #[arg(short = 'r', long = "repetitions", default_value_t = 3)]
+        reps: usize,
+        /// CPU threads (`0` = performance-core default)
+        #[arg(short = 't', long, default_value_t = 0)]
+        threads: usize,
+        /// GPU layers: `0` forces CPU, anything else offloads
+        #[arg(long = "n-gpu-layers", default_value_t = 0)]
+        n_gpu_layers: usize,
+        /// Context size (`0` = GGUF default)
+        #[arg(short = 'c', long, default_value_t = 0)]
+        ctx_size: usize,
         #[arg(long, default_value_t = 4096)]
         hidden: usize,
         #[arg(long, default_value_t = 14336)]
@@ -172,24 +196,20 @@ fn preset_by_name(name: &str) -> anyhow::Result<ModelConfig> {
     }
 }
 
+/// Seeds `RAYON_NUM_THREADS` for subcommands that never reach
+/// `apply_backend_env` / `bench_model::apply_env` (both of which build
+/// the pool explicitly via [`ferrox_core::threads::init_cpu_pool`] once
+/// their `-t` is known). Subcommand flags parsed later still win, since
+/// those paths overwrite the variable before the pool is built.
+///
+/// This used to be `available_parallelism() / 2`, which on a 6P+4E M2
+/// Pro guessed 5 -- close enough to look right, wrong enough to make
+/// every default-config CPU measurement run one core short.
 fn init_rayon_threads() {
-    if std::env::var_os("RAYON_NUM_THREADS").is_some()
-        || std::env::var_os("FERROX_CPU_THREADS").is_some()
-    {
-        if let Ok(v) = std::env::var("FERROX_CPU_THREADS") {
-            if std::env::var_os("RAYON_NUM_THREADS").is_none() {
-                // SAFETY: single-threaded init before worker threads spawn.
-                unsafe { std::env::set_var("RAYON_NUM_THREADS", &v) };
-            }
-        }
-        return;
-    }
-    #[cfg(target_os = "macos")]
-    {
-        if let Ok(n) = std::thread::available_parallelism() {
-            let n = (n.get() / 2).max(1);
-            unsafe { std::env::set_var("RAYON_NUM_THREADS", n.to_string()) };
-        }
+    if std::env::var_os("RAYON_NUM_THREADS").is_none() {
+        let n = ferrox_core::threads::resolve_cpu_threads();
+        // SAFETY: single-threaded init before worker threads spawn.
+        unsafe { std::env::set_var("RAYON_NUM_THREADS", n.to_string()) };
     }
 }
 
@@ -451,10 +471,27 @@ fn main() -> anyhow::Result<()> {
             }
         }
         Commands::Bench {
+            model,
+            n_prompt,
+            n_gen,
+            reps,
+            threads,
+            n_gpu_layers,
+            ctx_size,
             hidden,
             ffn_dim,
             iters,
         } => {
+            if let Some(model) = model {
+                bench_model::apply_env(threads, n_gpu_layers);
+                return bench_model::run(bench_model::BenchArgs {
+                    model,
+                    n_prompt,
+                    n_gen,
+                    reps,
+                    ctx_size,
+                });
+            }
             use ferrox_core::weight_matrix::{QuantKind, WeightBytes, WeightMatrix};
             use std::time::Instant;
 

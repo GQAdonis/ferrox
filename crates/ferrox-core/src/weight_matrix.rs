@@ -1668,6 +1668,26 @@ impl WeightMatrix {
                     }
                 }
                 QuantKind::Q4K => {
+                    // True simdgroup GEMM: each 64x32 output tile reads its
+                    // weight slice once into threadgroup memory instead of
+                    // once per token. `launch_q4_k_mul_mm` below is the
+                    // batched-matvec fallback it replaces -- correct, but it
+                    // re-reads the whole matrix for every token, which is why
+                    // Metal `pp512` was 14-99x behind llama.cpp.
+                    match ferrox_metal::gpu::launch_q4_k_mul_mm_sg(
+                        data.as_slice(),
+                        x_batch,
+                        *rows,
+                        row_bytes,
+                        batch_size,
+                    ) {
+                        Ok(out) => return Some(out),
+                        Err(e) => {
+                            eprintln!(
+                                "ferrox: Metal Q4_K simdgroup mul_mm failed, batched-matvec fallback: {e}"
+                            );
+                        }
+                    }
                     match ferrox_metal::gpu::launch_q4_k_mul_mm(
                         data.as_slice(),
                         x_batch,

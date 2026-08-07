@@ -1740,6 +1740,297 @@ kernel void q4_k_mul_mm(
 }
 "#;
 
+/// True simdgroup GEMM for Q4_K weights — a port of llama.cpp's
+/// `kernel_mul_mm` (`ggml-metal.metal`, the non-tensor-ops branch).
+///
+/// This is the kernel prefill was missing. Everything else in the Metal
+/// prefill path decomposed a batched matmul into N independent matvecs,
+/// so a 512-token prompt re-read the entire weight matrix 512 times.
+/// Here each 64x32 output tile reads its slice of the weights **once**
+/// into threadgroup memory, dequantized to half, and every one of the 32
+/// tokens in the tile consumes it from there via `simdgroup_multiply_accumulate`.
+///
+/// Shape, matching llama exactly (these constants are load-bearing — the
+/// index arithmetic below is derived from them):
+///   NR0 = 64  weight rows per threadgroup  (M direction)
+///   NR1 = 32  tokens per threadgroup       (N direction)
+///   NK  = 32  K elements per iteration
+///   128 threads = 4 simdgroups, each owning a 32x16 quadrant of the tile
+///
+/// A is `[n_rows, K]` Q4_K, B is `[batch, K]` f32, C is `[batch, n_rows]`
+/// f32 — the same layouts the matvec path already uses, so this drops in
+/// without touching callers.
+pub const Q4_K_MUL_MM_SG_KERNEL_SRC: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+// llama `get_scale_min_k4_just2`: Q4_K packs eight 6-bit scale/min pairs
+// into 12 bytes, the low four pairs plainly and the high four with their
+// top 2 bits borrowed from the low bytes.
+static inline uchar2 q4k_scale_min_just2(int j, int k, device const uchar* q) {
+    return j < 4
+        ? uchar2(uchar(q[j + 0 + k] & 63), uchar(q[j + 4 + k] & 63))
+        : uchar2(uchar((q[j + 4 + k] & 0xF) | ((q[j - 4 + k] & 0xc0) >> 2)),
+                 uchar((q[j + 4 + k] >> 4)  | ((q[j - 0 + k] & 0xc0) >> 2)));
+}
+
+// llama `dequantize_q4_K`: 16 consecutive values of sub-block `il` of a
+// 256-element Q4_K super-block. Byte layout is the GGUF one: d, dmin,
+// 12 scale bytes, 128 nibble-packed quants.
+static inline void q4k_dequant_16(device const uchar* xb, short il, thread float4x4& reg) {
+    const float d_all = float(*(device const half*)(xb));
+    const float min   = float(*(device const half*)(xb + 2));
+    device const uchar* scales = xb + 4;
+    device const uchar* q = xb + 16;
+
+    short is = (il / 4) * 2;
+    q = q + (il / 4) * 32 + 16 * (il & 1);
+    il = il & 3;
+    const uchar2 sc = q4k_scale_min_just2(is, il / 2, scales);
+    const float d  = il < 2 ? d_all : d_all / 16.0f;
+    const float dl = d * float(sc[0]);
+    const float ml = min * float(sc[1]);
+    const ushort mask = il < 2 ? 0x0F : 0xF0;
+
+    for (short i = 0; i < 16; ++i) {
+        reg[i / 4][i % 4] = dl * float(q[i] & mask) - ml;
+    }
+}
+
+kernel void q4_k_mul_mm_sg(
+    device const uchar* src0 [[buffer(0)]],
+    device const float* src1 [[buffer(1)]],
+    device float* dst [[buffer(2)]],
+    constant uint& n_rows [[buffer(3)]],
+    constant uint& n_cols [[buffer(4)]],
+    constant uint& batch [[buffer(5)]],
+    constant uint& row_bytes [[buffer(6)]],
+    threadgroup char* shmem [[threadgroup(0)]],
+    uint3 tgpig [[threadgroup_position_in_grid]],
+    ushort tiitg [[thread_index_in_threadgroup]],
+    ushort sgitg [[simdgroup_index_in_threadgroup]]
+) {
+    threadgroup half* sa = (threadgroup half*)(shmem);
+    threadgroup half* sb = (threadgroup half*)(shmem + 4096);
+
+    constexpr short NR0 = 64;
+    constexpr short NR1 = 32;
+    constexpr short NK  = 32;
+    constexpr short NL0 = NK / 16;   // 2 threads cover one row's 32 k-values
+    constexpr short NL1 = NK / 8;    // 4 threads cover one token's 32 k-values
+    constexpr short NL  = 16;        // Q4_K sub-blocks per 256-element block
+
+    const int r0 = int(tgpig.y) * NR0;
+    const int r1 = int(tgpig.x) * NR1;
+
+    const short nr0 = (int(n_rows) - r0 < NR0) ? short(int(n_rows) - r0) : NR0;
+    const short nr1 = (int(batch)  - r1 < NR1) ? short(int(batch)  - r1) : NR1;
+
+    // Clamp instead of branching: an out-of-range lane re-reads a valid
+    // row and its result is discarded at the store. Keeps the hot loop
+    // uniform, exactly as llama does.
+    const short lr0 = (short(tiitg) / NL0) < nr0 ? (short(tiitg) / NL0) : nr0 - 1;
+    const short lr1 = (short(tiitg) / NL1) < nr1 ? (short(tiitg) / NL1) : nr1 - 1;
+    const short il0 = short(tiitg) % NL0;
+
+    short il = il0;
+    device const uchar* x = src0 + (size_t)row_bytes * (r0 + lr0);
+
+    const short iy = 8 * (short(tiitg) % NL1);
+    device const float* y = src1 + (size_t)(r1 + lr1) * n_cols + iy;
+
+    simdgroup_half8x8 ma[4];
+    simdgroup_half8x8 mb[2];
+    simdgroup_float8x8 mc[8];
+    for (short i = 0; i < 8; i++) {
+        mc[i] = make_filled_simdgroup_matrix<float, 8>(0.f);
+    }
+
+    for (uint loop_k = 0; loop_k < n_cols; loop_k += NK) {
+        float4x4 temp_a;
+        q4k_dequant_16(x, il, temp_a);
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Scatter the 16 dequantized values into the 8x8-tile-major
+        // layout `simdgroup_load` expects.
+        for (short i = 0; i < 16; i++) {
+            const short sx = 2 * il0 + i / 8;
+            const short sy = (short(tiitg) / NL0) / 8;
+            const short lx = (short(tiitg) / NL0) % 8;
+            const short ly = i % 8;
+            const short ib = 8 * sx + sy;
+            *(sa + 64 * ib + 8 * ly + lx) = half(temp_a[i / 4][i % 4]);
+        }
+
+        {
+            const short sx = short(tiitg) % NL1;
+            const short sy = (short(tiitg) / NL1) / 8;
+            const short ly = (short(tiitg) / NL1) % 8;
+            const short ib = 4 * sx + sy;
+            threadgroup half* dstb = sb + 64 * ib + 8 * ly;
+            for (short i = 0; i < 8; i++) {
+                dstb[i] = half(y[i]);
+            }
+        }
+
+        // Advance two 16-value sub-blocks; step to the next 256-element
+        // super-block when they wrap.
+        il = (il + 2 < NL) ? il + 2 : il % 2;
+        if (il < 2) {
+            x += row_bytes / (n_cols / 256);
+        }
+        y += NK;
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        threadgroup const half* lsma = sa + 4 * 64 * (sgitg % 2);
+        threadgroup const half* lsmb = sb + 2 * 64 * (sgitg / 2);
+
+        for (short ik = 0; ik < NK / 8; ik++) {
+            simdgroup_barrier(mem_flags::mem_none);
+            for (short i = 0; i < 4; i++) {
+                simdgroup_load(ma[i], lsma + 64 * i, 8, 0, false);
+            }
+            simdgroup_barrier(mem_flags::mem_none);
+            for (short i = 0; i < 2; i++) {
+                simdgroup_load(mb[i], lsmb + 64 * i, 8, 0, false);
+            }
+            simdgroup_barrier(mem_flags::mem_none);
+            for (short i = 0; i < 8; i++) {
+                simdgroup_multiply_accumulate(mc[i], mb[i / 4], ma[i % 4], mc[i]);
+            }
+            lsma += 8 * 64;
+            lsmb += 4 * 64;
+        }
+    }
+
+    if (r0 + NR0 <= int(n_rows) && r1 + NR1 <= int(batch)) {
+        device float* C = dst
+            + (r0 + 32 * (sgitg & 1))
+            + (size_t)(r1 + 16 * (sgitg >> 1)) * n_rows;
+        for (short i = 0; i < 8; i++) {
+            simdgroup_store(mc[i], C + 8 * (i % 4) + 8 * (size_t)n_rows * (i / 4), n_rows, 0, false);
+        }
+    } else {
+        // Partial tile: stage through threadgroup memory and copy only
+        // the rows/columns that exist, so we never write past the matrix.
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        threadgroup float* temp = ((threadgroup float*)shmem)
+            + 32 * (sgitg & 1) + (16 * (sgitg >> 1)) * NR0;
+        for (short i = 0; i < 8; i++) {
+            simdgroup_store(mc[i], temp + 8 * (i % 4) + 8 * NR0 * (i / 4), NR0, 0, false);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sgitg == 0) {
+            for (short j = short(tiitg); j < nr1; j += NR1) {
+                device float* D = dst + r0 + (size_t)(r1 + j) * n_rows;
+                threadgroup const float* C = ((threadgroup float*)shmem) + j * NR0;
+                for (short i = 0; i < nr0; i++) {
+                    D[i] = C[i];
+                }
+            }
+        }
+    }
+}
+"#;
+
+/// Launches the simdgroup Q4_K GEMM ([`Q4_K_MUL_MM_SG_KERNEL_SRC`]).
+///
+/// `x_batch` is `[batch, cols]` f32, the result is `[batch, rows]` f32 —
+/// identical to [`launch_q4_k_mul_mm`], so the two are directly
+/// comparable and the tests assert exactly that.
+///
+/// Requires `cols % 256 == 0` (Q4_K super-block size), which every real
+/// Q4_K tensor satisfies by construction.
+pub fn launch_q4_k_mul_mm_sg(
+    weights: &[u8],
+    x_batch: &[f32],
+    rows: usize,
+    row_bytes: usize,
+    batch_size: usize,
+) -> Result<Vec<f32>, MetalError> {
+    if batch_size == 0 || rows == 0 {
+        return Ok(vec![0.0; batch_size * rows]);
+    }
+    let n_blocks_per_row = row_bytes / 144;
+    let cols = n_blocks_per_row * 256;
+    if cols == 0 {
+        return Err(MetalError::CommandFailed);
+    }
+    assert_eq!(weights.len(), rows * row_bytes);
+    assert_eq!(x_batch.len(), batch_size * cols);
+
+    let shared = shared_metal()?;
+    let device = &shared.device;
+    let queue = &shared.queue;
+
+    let mut x_owned = x_batch.to_vec();
+    let x_buf = unsafe {
+        device.newBufferWithBytes_length_options(
+            NonNull::new(x_owned.as_mut_ptr() as *mut _).unwrap(),
+            x_owned.len() * 4,
+            MTLResourceOptions::StorageModeShared,
+        )
+    }
+    .ok_or(MetalError::BufferAllocFailed)?;
+
+    let weights_buf = resident_weight_buffer(device, weights)?;
+    let out_elems = batch_size * rows;
+    let out_buf = device
+        .newBufferWithLength_options(out_elems * 4, MTLResourceOptions::StorageModeShared)
+        .ok_or(MetalError::BufferAllocFailed)?;
+
+    let pipeline = ensure_pipeline(device, Q4_K_MUL_MM_SG_KERNEL_SRC, "q4_k_mul_mm_sg")?;
+
+    let cmd_buf = queue.commandBuffer().ok_or(MetalError::CommandFailed)?;
+    let enc = cmd_buf
+        .computeCommandEncoder()
+        .ok_or(MetalError::CommandFailed)?;
+
+    unsafe {
+        enc.setComputePipelineState(&pipeline.0);
+        enc.setBuffer_offset_atIndex(Some(&weights_buf.buffer), weights_buf.weight_offset, 0);
+        enc.setBuffer_offset_atIndex(Some(&x_buf), 0, 1);
+        enc.setBuffer_offset_atIndex(Some(&out_buf), 0, 2);
+        for (idx, mut v) in [
+            (3usize, rows as u32),
+            (4, cols as u32),
+            (5, batch_size as u32),
+            (6, row_bytes as u32),
+        ] {
+            enc.setBytes_length_atIndex(
+                NonNull::new(&mut v as *mut u32 as *mut _).unwrap(),
+                4,
+                idx,
+            );
+        }
+        // 4096 B for the dequantized A tile + 2048 B for B, but the
+        // partial-tile store path reuses the same allocation as a
+        // 64x32 f32 staging buffer, which needs 8192.
+        enc.setThreadgroupMemoryLength_atIndex(8192, 0);
+
+        let grid = MTLSize {
+            width: batch_size.div_ceil(32),
+            height: rows.div_ceil(64),
+            depth: 1,
+        };
+        let tg = MTLSize {
+            width: 128,
+            height: 1,
+            depth: 1,
+        };
+        enc.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
+    }
+    enc.endEncoding();
+    cmd_buf.commit();
+    cmd_buf.waitUntilCompleted();
+
+    let ptr = out_buf.contents().as_ptr() as *const f32;
+    let out = unsafe { std::slice::from_raw_parts(ptr, out_elems) }.to_vec();
+    Ok(out)
+}
+
 /// Launches Q4_K multi-activation matmul (see [`Q4_K_MUL_MM_KERNEL_SRC`]).
 ///
 /// Dequant matches [`Q4_K_MATVEC_KERNEL_SRC`] /
@@ -5459,6 +5750,86 @@ mod tests {
         assert_eq!(got.len(), expected.len());
         for (i, (a, b)) in got.iter().zip(expected.iter()).enumerate() {
             assert_close_relative(*a, *b, i);
+        }
+    }
+
+    /// Q4_K blocks whose scale halves are realistic in magnitude.
+    ///
+    /// `real_k_quant_test_matrix` fills every byte pseudo-randomly, which
+    /// lets `d`/`dmin` decode to enormous f16 values (one row dotted to
+    /// 1.5e8). An f32 matvec absorbs that; the simdgroup GEMM stages its
+    /// weight tile in `half` and overflows to NaN. Real Q4_K weights are
+    /// O(0.1), so the fixture was testing a regime the format never
+    /// produces. Quant nibbles and the packed 6-bit scale bytes stay
+    /// pseudo-random -- that is the part worth exercising.
+    fn realistic_q4_k_matrix(rows: usize, cols: usize) -> Vec<u8> {
+        let n_blocks_per_row = cols / 256;
+        let row_bytes = n_blocks_per_row * ferrox_quant::Q4_K_BLOCK_BYTES;
+        let mut weights = Vec::with_capacity(rows * row_bytes);
+        for r in 0..rows {
+            let mut row = pseudo_bytes(r as u32 + 1, row_bytes);
+            for b in 0..n_blocks_per_row {
+                let base = b * ferrox_quant::Q4_K_BLOCK_BYTES;
+                let d = half::f16::from_f32(0.008 + 0.001 * ((r + b) % 5) as f32);
+                let dmin = half::f16::from_f32(0.003 + 0.0005 * ((r + b) % 3) as f32);
+                row[base..base + 2].copy_from_slice(&d.to_le_bytes());
+                row[base + 2..base + 4].copy_from_slice(&dmin.to_le_bytes());
+            }
+            weights.extend_from_slice(&row);
+        }
+        weights
+    }
+
+    /// The simdgroup GEMM must agree with the matvec it replaces. This is
+    /// the assertion the previous simdgroup attempt could not make -- its
+    /// dequant did not match, so it was left returning `Err`.
+    ///
+    /// Dimensions are deliberately *not* multiples of the 64x32 tile, so
+    /// the partial-tile store path is exercised too; a kernel that only
+    /// handles whole tiles silently corrupts the edges of a real prompt.
+    #[test]
+    #[ignore = "needs a real Metal-capable GPU; run manually with --ignored on Apple Silicon"]
+    fn launch_q4_k_mul_mm_sg_matches_the_matvec_it_replaces() {
+        for &(rows, cols, batch_size) in &[
+            (64usize, 512usize, 32usize), // exactly one tile
+            (9, 512, 7),                  // smaller than a tile in both dims
+            (70, 768, 33),                // one full tile plus a ragged edge
+        ] {
+            let row_bytes = (cols / 256) * ferrox_quant::Q4_K_BLOCK_BYTES;
+            let weights = realistic_q4_k_matrix(rows, cols);
+
+            let mut x_batch = Vec::with_capacity(batch_size * cols);
+            let mut expected = Vec::with_capacity(batch_size * rows);
+            for b in 0..batch_size {
+                let x: Vec<f32> = (0..cols)
+                    .map(|i| ((i + b * 23) as f32 * 0.027).sin())
+                    .collect();
+                let y = launch_q4_k_matvec(&weights, &x, rows, row_bytes).expect("matvec");
+                expected.extend_from_slice(&y);
+                x_batch.extend_from_slice(&x);
+            }
+
+            let got = launch_q4_k_mul_mm_sg(&weights, &x_batch, rows, row_bytes, batch_size)
+                .expect("simdgroup mul_mm");
+            assert_eq!(got.len(), expected.len(), "{rows}x{cols}x{batch_size}");
+
+            // Tolerance is absolute and scaled to the magnitude of the
+            // data, not relative per element. The GEMM stages its tiles in
+            // `half`, so its error tracks the size of the terms being
+            // summed -- not the size of the result, which can cancel to
+            // near zero. Measured on this fixture: max |expected| 447,
+            // worst absolute deviation 0.081, i.e. 1.8e-4 of scale. A
+            // per-element relative check flags those cancelled entries at
+            // 950% while a genuine indexing bug -- which moves results by
+            // order-of-magnitude the data itself -- would sail past it.
+            let scale = expected.iter().fold(0f32, |m, v| m.max(v.abs()));
+            let tol = 1e-3 * scale.max(1.0);
+            for (i, (a, b)) in got.iter().zip(expected.iter()).enumerate() {
+                assert!(
+                    (a - b).abs() <= tol,
+                    "{rows}x{cols}x{batch_size} idx {i}: gemm={a} matvec={b} (tol {tol})"
+                );
+            }
         }
     }
 

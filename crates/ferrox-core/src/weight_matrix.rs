@@ -1704,6 +1704,24 @@ impl WeightMatrix {
                     }
                 }
                 QuantKind::Q6K => {
+                    // Same simdgroup GEMM as Q4_K. `ffn_down` and `attn_v`
+                    // are Q6_K in every Q4_K_M checkpoint, so without this
+                    // a third of the FFN stayed on the batched-matvec path
+                    // and capped what the Q4_K GEMM could deliver.
+                    match ferrox_metal::gpu::launch_q6_k_mul_mm_sg(
+                        data.as_slice(),
+                        x_batch,
+                        *rows,
+                        row_bytes,
+                        batch_size,
+                    ) {
+                        Ok(out) => return Some(out),
+                        Err(e) => {
+                            eprintln!(
+                                "ferrox: Metal Q6_K simdgroup mul_mm failed, matmul-batch fallback: {e}"
+                            );
+                        }
+                    }
                     match ferrox_metal::gpu::launch_q6_k_matmul_batch(
                         data.as_slice(),
                         x_batch,

@@ -1760,7 +1760,7 @@ kernel void q4_k_mul_mm(
 /// A is `[n_rows, K]` Q4_K, B is `[batch, K]` f32, C is `[batch, n_rows]`
 /// f32 — the same layouts the matvec path already uses, so this drops in
 /// without touching callers.
-pub const Q4_K_MUL_MM_SG_KERNEL_SRC: &str = r#"
+pub const K_QUANT_MUL_MM_SG_KERNEL_SRC: &str = r#"
 #include <metal_stdlib>
 using namespace metal;
 
@@ -1797,18 +1797,74 @@ static inline void q4k_dequant_16(device const uchar* xb, short il, thread float
     }
 }
 
-kernel void q4_k_mul_mm_sg(
-    device const uchar* src0 [[buffer(0)]],
-    device const float* src1 [[buffer(1)]],
-    device float* dst [[buffer(2)]],
-    constant uint& n_rows [[buffer(3)]],
-    constant uint& n_cols [[buffer(4)]],
-    constant uint& batch [[buffer(5)]],
-    constant uint& row_bytes [[buffer(6)]],
-    threadgroup char* shmem [[threadgroup(0)]],
-    uint3 tgpig [[threadgroup_position_in_grid]],
-    ushort tiitg [[thread_index_in_threadgroup]],
-    ushort sgitg [[simdgroup_index_in_threadgroup]]
+// Dequant functors. The tile/simdgroup machinery below is identical for
+// every K-quant -- only the 16-value unpack differs -- so it lives in one
+// templated body rather than being copy-pasted per format. The previous
+// generation of these kernels *was* copy-pasted, which is exactly how
+// `gqa_prefill_fa_vec_d256` ended up handling half a head.
+struct Q4KDequant {
+    static inline void get(device const uchar* xb, short il, thread float4x4& reg) {
+        q4k_dequant_16(xb, il, reg);
+    }
+};
+
+// llama `dequantize_q6_K`. GGUF layout: ql[128], qh[64], int8 scales[16],
+// half d.
+struct Q6KDequant {
+    static inline void get(device const uchar* xb, short il, thread float4x4& reg) {
+        const float d_all = float(*(device const half*)(xb + 208));
+        device const uchar* ql8 = xb;
+        device const uchar* qh8 = xb + 128;
+        device const char* scales = (device const char*)(xb + 192);
+
+        const short ql_off = 64 * (il / 8) + 32 * ((il / 2) & 1) + 16 * (il & 1);
+        const short qh_off = 32 * (il / 8) + 16 * (il & 1);
+        const float sc = float(scales[(il % 2) + 2 * (il / 2)]);
+        il = (il / 2) & 3;
+
+        const uint kmask1 = il > 1 ? (il > 2 ? 0xC0C0C0C0u : 0x30303030u)
+                                   : (il > 0 ? 0x0C0C0C0Cu : 0x03030303u);
+        const uint kmask2 = il > 1 ? 0xF0F0F0F0u : 0x0F0F0F0Fu;
+        const float ml = d_all * sc * 32.0f;
+        const float dl0 = d_all * sc;
+        const float dl1 = dl0 / 256.0f;
+        const float dl2 = dl0 / (256.0f * 256.0f);
+        const float dl3 = dl0 / (256.0f * 256.0f * 256.0f);
+        const uchar shr_h = il > 2 ? 2 : 0;
+        const uchar shl_h = il > 1 ? 0 : (il > 0 ? 2 : 4);
+        const uchar shr_l = il > 1 ? 4 : 0;
+
+        for (short i = 0; i < 4; ++i) {
+            // Rebuild llama's uint16 pair reads from bytes: the tensor is
+            // only 2-byte aligned per row, so a ushort* cast is not safe.
+            device const uchar* lp = ql8 + ql_off + 4 * i;
+            device const uchar* hp = qh8 + qh_off + 4 * i;
+            const uint low = ((uint(lp[0]) | (uint(lp[1]) << 8))
+                           | ((uint(lp[2]) | (uint(lp[3]) << 8)) << 16)) & kmask2;
+            const uint high = ((uint(hp[0]) | (uint(hp[1]) << 8))
+                            | ((uint(hp[2]) | (uint(hp[3]) << 8)) << 16)) & kmask1;
+            const uint q = ((high << shl_h) >> shr_h) | (low >> shr_l);
+            reg[i][0] = dl0 * float(q & 0xFFu) - ml;
+            reg[i][1] = dl1 * float(q & 0xFF00u) - ml;
+            reg[i][2] = dl2 * float(q & 0xFF0000u) - ml;
+            reg[i][3] = dl3 * float(q & 0xFF000000u) - ml;
+        }
+    }
+};
+
+template<typename DQ>
+static inline void mul_mm_sg_impl(
+    device const uchar* src0,
+    device const float* src1,
+    device float* dst,
+    uint n_rows,
+    uint n_cols,
+    uint batch,
+    uint row_bytes,
+    threadgroup char* shmem,
+    uint3 tgpig,
+    ushort tiitg,
+    ushort sgitg
 ) {
     threadgroup half* sa = (threadgroup half*)(shmem);
     threadgroup half* sb = (threadgroup half*)(shmem + 4096);
@@ -1848,7 +1904,7 @@ kernel void q4_k_mul_mm_sg(
 
     for (uint loop_k = 0; loop_k < n_cols; loop_k += NK) {
         float4x4 temp_a;
-        q4k_dequant_16(x, il, temp_a);
+        DQ::get(x, il, temp_a);
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -1933,9 +1989,31 @@ kernel void q4_k_mul_mm_sg(
         }
     }
 }
+
+
+#define MUL_MM_SG_ENTRY(NAME, DQ)                                           \
+kernel void NAME(                                                           \
+    device const uchar* src0 [[buffer(0)]],                                 \
+    device const float* src1 [[buffer(1)]],                                 \
+    device float* dst [[buffer(2)]],                                        \
+    constant uint& n_rows [[buffer(3)]],                                    \
+    constant uint& n_cols [[buffer(4)]],                                    \
+    constant uint& batch [[buffer(5)]],                                     \
+    constant uint& row_bytes [[buffer(6)]],                                 \
+    threadgroup char* shmem [[threadgroup(0)]],                             \
+    uint3 tgpig [[threadgroup_position_in_grid]],                           \
+    ushort tiitg [[thread_index_in_threadgroup]],                           \
+    ushort sgitg [[simdgroup_index_in_threadgroup]]                         \
+) {                                                                         \
+    mul_mm_sg_impl<DQ>(src0, src1, dst, n_rows, n_cols, batch, row_bytes,   \
+                       shmem, tgpig, tiitg, sgitg);                         \
+}
+
+MUL_MM_SG_ENTRY(q4_k_mul_mm_sg, Q4KDequant)
+MUL_MM_SG_ENTRY(q6_k_mul_mm_sg, Q6KDequant)
 "#;
 
-/// Launches the simdgroup Q4_K GEMM ([`Q4_K_MUL_MM_SG_KERNEL_SRC`]).
+/// Launches the simdgroup Q4_K GEMM ([`K_QUANT_MUL_MM_SG_KERNEL_SRC`]).
 ///
 /// `x_batch` is `[batch, cols]` f32, the result is `[batch, rows]` f32 —
 /// identical to [`launch_q4_k_mul_mm`], so the two are directly
@@ -1950,10 +2028,40 @@ pub fn launch_q4_k_mul_mm_sg(
     row_bytes: usize,
     batch_size: usize,
 ) -> Result<Vec<f32>, MetalError> {
+    launch_k_quant_mul_mm_sg(weights, x_batch, rows, row_bytes, batch_size, 144)
+}
+
+/// Q6_K twin of [`launch_q4_k_mul_mm_sg`]. `ffn_down` and `attn_v` are
+/// Q6_K in every `*_Q4_K_M` checkpoint -- `ffn_down` alone is a third of
+/// the FFN -- so leaving Q6_K on the batched-matvec path capped what the
+/// Q4_K GEMM could deliver.
+pub fn launch_q6_k_mul_mm_sg(
+    weights: &[u8],
+    x_batch: &[f32],
+    rows: usize,
+    row_bytes: usize,
+    batch_size: usize,
+) -> Result<Vec<f32>, MetalError> {
+    launch_k_quant_mul_mm_sg(weights, x_batch, rows, row_bytes, batch_size, 210)
+}
+
+fn launch_k_quant_mul_mm_sg(
+    weights: &[u8],
+    x_batch: &[f32],
+    rows: usize,
+    row_bytes: usize,
+    batch_size: usize,
+    block_bytes: usize,
+) -> Result<Vec<f32>, MetalError> {
     if batch_size == 0 || rows == 0 {
         return Ok(vec![0.0; batch_size * rows]);
     }
-    let n_blocks_per_row = row_bytes / 144;
+    let fn_name = if block_bytes == 210 {
+        "q6_k_mul_mm_sg"
+    } else {
+        "q4_k_mul_mm_sg"
+    };
+    let n_blocks_per_row = row_bytes / block_bytes;
     let cols = n_blocks_per_row * 256;
     if cols == 0 {
         return Err(MetalError::CommandFailed);
@@ -1981,7 +2089,7 @@ pub fn launch_q4_k_mul_mm_sg(
         .newBufferWithLength_options(out_elems * 4, MTLResourceOptions::StorageModeShared)
         .ok_or(MetalError::BufferAllocFailed)?;
 
-    let pipeline = ensure_pipeline(device, Q4_K_MUL_MM_SG_KERNEL_SRC, "q4_k_mul_mm_sg")?;
+    let pipeline = ensure_pipeline(device, K_QUANT_MUL_MM_SG_KERNEL_SRC, fn_name)?;
 
     let cmd_buf = queue.commandBuffer().ok_or(MetalError::CommandFailed)?;
     let enc = cmd_buf
@@ -5750,6 +5858,61 @@ mod tests {
         assert_eq!(got.len(), expected.len());
         for (i, (a, b)) in got.iter().zip(expected.iter()).enumerate() {
             assert_close_relative(*a, *b, i);
+        }
+    }
+
+    /// Q6_K counterpart of [`realistic_q4_k_matrix`]: the block's `d` half
+    /// (bytes 208..210) is forced to a realistic magnitude so the value
+    /// range matches what the format actually produces. Left random, it
+    /// dotted to -2.4e8 and overflowed the GEMM's half tiles to NaN.
+    fn realistic_q6_k_matrix(rows: usize, cols: usize) -> Vec<u8> {
+        let n_blocks_per_row = cols / 256;
+        let row_bytes = n_blocks_per_row * ferrox_quant::Q6_K_BLOCK_BYTES;
+        let mut weights = Vec::with_capacity(rows * row_bytes);
+        for r in 0..rows {
+            let mut row = pseudo_bytes(r as u32 + 7, row_bytes);
+            for b in 0..n_blocks_per_row {
+                let d_off = b * ferrox_quant::Q6_K_BLOCK_BYTES + 208;
+                let d = half::f16::from_f32(0.0015 + 0.0004 * ((r + b) % 4) as f32);
+                row[d_off..d_off + 2].copy_from_slice(&d.to_le_bytes());
+            }
+            weights.extend_from_slice(&row);
+        }
+        weights
+    }
+
+    /// Q6_K twin of the Q4_K GEMM check. Same reasoning: shapes chosen to
+    /// include ones that are not multiples of the 64x32 tile.
+    #[test]
+    #[ignore = "needs a real Metal-capable GPU; run manually with --ignored on Apple Silicon"]
+    fn launch_q6_k_mul_mm_sg_matches_the_matvec_it_replaces() {
+        for &(rows, cols, batch_size) in &[(64usize, 512usize, 32usize), (9, 512, 7), (70, 768, 33)]
+        {
+            let row_bytes = (cols / 256) * ferrox_quant::Q6_K_BLOCK_BYTES;
+            let weights = realistic_q6_k_matrix(rows, cols);
+
+            let mut x_batch = Vec::with_capacity(batch_size * cols);
+            let mut expected = Vec::with_capacity(batch_size * rows);
+            for b in 0..batch_size {
+                let x: Vec<f32> = (0..cols)
+                    .map(|i| ((i + b * 23) as f32 * 0.027).sin())
+                    .collect();
+                let y = launch_q6_k_matvec(&weights, &x, rows, row_bytes).expect("matvec");
+                expected.extend_from_slice(&y);
+                x_batch.extend_from_slice(&x);
+            }
+
+            let got = launch_q6_k_mul_mm_sg(&weights, &x_batch, rows, row_bytes, batch_size)
+                .expect("simdgroup q6_k mul_mm");
+            assert_eq!(got.len(), expected.len(), "{rows}x{cols}x{batch_size}");
+            let scale = expected.iter().fold(0f32, |m, v| m.max(v.abs()));
+            let tol = 1e-3 * scale.max(1.0);
+            for (i, (a, b)) in got.iter().zip(expected.iter()).enumerate() {
+                assert!(
+                    (a - b).abs() <= tol,
+                    "{rows}x{cols}x{batch_size} idx {i}: gemm={a} matvec={b} (tol {tol})"
+                );
+            }
         }
     }
 

@@ -2518,25 +2518,28 @@ impl Decoder {
     /// routing is per position by construction, so those keep the
     /// sequential path.
     ///
-    /// Also `None` whenever a GPU backend is driving dense weights. The
-    /// per-position path there is not three matvecs but one *fused*
-    /// gate+up+SiLU+down launch (`apply_gpu_dense_ffn_swiglu`), and
-    /// three separate batched launches lose to it: measured on Host B
-    /// Metal, `pp512` went 18.8 -> 10.7 on Llama-3.1-8B Q4_K_M and 26.3
-    /// -> 21.6 on Gemma-2-2B Q4_K_M when this path was taken. (Q8_0 went
-    /// the other way -- SmolLM2 131 -> 353 -- so the GPU prefill answer
-    /// is a real `mul_mm`, not this.)
+    /// On a GPU backend the per-position alternative is one *fused*
+    /// gate+up+SiLU+down launch (`apply_gpu_dense_ffn_swiglu`), so this
+    /// used to be gated off there: three separate batched launches lost
+    /// to it while `apply_batch` was still a batched *matvec*.
+    ///
+    /// That stopped being true once the simdgroup GEMM landed, and the
+    /// old gate turned out to be the dominant cost of Metal prefill --
+    /// a 512-token prompt ran the FFN one position at a time, 512 x
+    /// n_layers fused launches, which a profile put at 90% of prefill
+    /// while the GEMM it bypassed accounted for 21%.
+    ///
+    /// Decode (`batch_size == 1`) still takes the fused per-position
+    /// launch, which is the right shape there.
     fn dense_ffn_batch(
         layer: &LayerWeights,
         normed2_batch: &[f32],
         batch_size: usize,
         config: &ModelConfig,
     ) -> Option<Vec<f32>> {
-        if !Self::is_dense_layer(layer) || batch_size < 2 {
-            return None;
-        }
-        #[cfg(feature = "metal")]
-        if ferrox_core::weight_matrix::metal_dense_enabled() {
+        // Match the GPU `mul_mm` threshold: below it the per-call launch
+        // overhead outweighs the weight reuse.
+        if !Self::is_dense_layer(layer) || batch_size < 4 {
             return None;
         }
         #[cfg(feature = "cuda")]

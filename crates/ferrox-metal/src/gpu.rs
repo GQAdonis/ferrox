@@ -2072,12 +2072,16 @@ fn launch_k_quant_mul_mm_sg(
     let shared = shared_metal()?;
     let device = &shared.device;
     let queue = &shared.queue;
+    let timing = std::env::var_os("FERROX_METAL_MM_TIMING").is_some();
+    let t_setup = std::time::Instant::now();
 
-    let mut x_owned = x_batch.to_vec();
+    // `newBufferWithBytes` copies, so the extra `to_vec` this used to do
+    // was a second full copy of the activation batch on every call --
+    // 8 MB per FFN matrix at batch 512, ~224 calls per 8B prefill.
     let x_buf = unsafe {
         device.newBufferWithBytes_length_options(
-            NonNull::new(x_owned.as_mut_ptr() as *mut _).unwrap(),
-            x_owned.len() * 4,
+            NonNull::new(x_batch.as_ptr() as *mut std::ffi::c_void).unwrap(),
+            std::mem::size_of_val(x_batch),
             MTLResourceOptions::StorageModeShared,
         )
     }
@@ -2090,6 +2094,7 @@ fn launch_k_quant_mul_mm_sg(
         .ok_or(MetalError::BufferAllocFailed)?;
 
     let pipeline = ensure_pipeline(device, K_QUANT_MUL_MM_SG_KERNEL_SRC, fn_name)?;
+    let setup_us = t_setup.elapsed().as_micros();
 
     let cmd_buf = queue.commandBuffer().ok_or(MetalError::CommandFailed)?;
     let enc = cmd_buf
@@ -2131,12 +2136,41 @@ fn launch_k_quant_mul_mm_sg(
         enc.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
     }
     enc.endEncoding();
+    let t_gpu = std::time::Instant::now();
     cmd_buf.commit();
     cmd_buf.waitUntilCompleted();
+    let gpu_us = t_gpu.elapsed().as_micros();
 
+    let t_read = std::time::Instant::now();
     let ptr = out_buf.contents().as_ptr() as *const f32;
     let out = unsafe { std::slice::from_raw_parts(ptr, out_elems) }.to_vec();
+    if timing {
+        // Where prefill time actually goes, per matrix. Set
+        // FERROX_METAL_MM_TIMING=1 and read the totals at the end.
+        mm_timing_add(setup_us, gpu_us, t_read.elapsed().as_micros());
+    }
     Ok(out)
+}
+
+use std::sync::atomic::{AtomicU64, Ordering as AtomOrd};
+static MM_SETUP_US: AtomicU64 = AtomicU64::new(0);
+static MM_GPU_US: AtomicU64 = AtomicU64::new(0);
+static MM_READ_US: AtomicU64 = AtomicU64::new(0);
+static MM_CALLS: AtomicU64 = AtomicU64::new(0);
+
+fn mm_timing_add(setup: u128, gpu: u128, read: u128) {
+    MM_SETUP_US.fetch_add(setup as u64, AtomOrd::Relaxed);
+    MM_GPU_US.fetch_add(gpu as u64, AtomOrd::Relaxed);
+    MM_READ_US.fetch_add(read as u64, AtomOrd::Relaxed);
+    let n = MM_CALLS.fetch_add(1, AtomOrd::Relaxed) + 1;
+    if n % 224 == 0 {
+        eprintln!(
+            "ferrox: mul_mm {n} calls -- setup {:.1} ms, gpu {:.1} ms, readback {:.1} ms",
+            MM_SETUP_US.load(AtomOrd::Relaxed) as f64 / 1000.0,
+            MM_GPU_US.load(AtomOrd::Relaxed) as f64 / 1000.0,
+            MM_READ_US.load(AtomOrd::Relaxed) as f64 / 1000.0,
+        );
+    }
 }
 
 /// Launches Q4_K multi-activation matmul (see [`Q4_K_MUL_MM_KERNEL_SRC`]).

@@ -1,0 +1,40 @@
+{
+  "approx_params": 692846592,
+  "arch": "qwen3",
+  "backend": "cpu",
+  "backend_active": "CPU",
+  "ferrox_version": "0.2.0",
+  "id": "qwen3_06b_q8",
+  "kind": "engine",
+  "load_s": 0.062848,
+  "model_path": "models/hf_test/Qwen3-0.6B-Q8_0.gguf",
+  "quant": "quantized",
+  "reps": 2,
+  "schema": 1,
+  "size_bytes": 639446688,
+  "tests": [
+    {
+      "ferrox_samples": [
+        105.11862249025761,
+        103.16188144302114
+      ],
+      "ferrox_stddev": 0.9783705236182314,
+      "ferrox_tps": 104.14025196663937,
+      "gap": 5.282683588822444,
+      "llama_tps": 550.14,
+      "test": "pp512"
+    },
+    {
+      "ferrox_samples": [
+        60.22147860196778,
+        64.8923111665266
+      ],
+      "ferrox_stddev": 2.3354162822794073,
+      "ferrox_tps": 62.556894884247185,
+      "gap": 1.780778924627416,
+      "llama_tps": 111.4,
+      "test": "tg128"
+    }
+  ],
+  "threads": 6
+}

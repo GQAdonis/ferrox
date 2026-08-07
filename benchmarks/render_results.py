@@ -25,6 +25,7 @@ ENGINE_END = "<!-- END ENGINE TABLE -->\n"
 BENCH = Path(__file__).resolve().parent
 SUITE_PATH = BENCH / "suite.json"
 PINS = BENCH / "receipts" / "pins"
+ENGINE = BENCH / "receipts" / "engine"
 OUT = BENCH / "RESULTS.md"
 
 
@@ -189,13 +190,35 @@ def main() -> None:
             f"pins: {', '.join(orphan_pin_files)}"
         )
 
+    # Headline the *engine* number when one exists. The serving pin for the
+    # same model is currently 0.92x while the freshly measured engine decode
+    # is 1.03x — quoting the flattering one at the top of a file that
+    # contradicts it three tables down is exactly the trap this ledger is
+    # supposed to prevent.
+    engine8 = load_json(ENGINE / "llama31_8b_q4km_metal.json")
+    tg8 = None
+    if engine8:
+        tg8 = next(
+            (t for t in engine8.get("tests", []) if str(t.get("test", "")).startswith("tg")),
+            None,
+        )
     metal8 = pins.get(("llama31_8b_q4km", "metal"))
-    if metal8 and pred(metal8.get("ferrox")) and pred(metal8.get("llama")):
+    if tg8 and tg8.get("ferrox_tps") and tg8.get("llama_tps"):
+        fp = tg8["ferrox_tps"]
+        lp = tg8["llama_tps"]
+        north = (
+            f"**8B Metal decode (engine):** {fmt_num(fp)} vs llama {fmt_num(lp)} "
+            f"{tg8.get('test', 'tg')} ({gap_str(fp, lp)}) — "
+            "[`engine/llama31_8b_q4km_metal.json`]"
+            "(receipts/engine/llama31_8b_q4km_metal.json). "
+            "Prefill is far behind; see the engine table.\n"
+        )
+    elif metal8 and pred(metal8.get("ferrox")) and pred(metal8.get("llama")):
         fp = pred(metal8["ferrox"])
         lp = pred(metal8["llama"])
         north = (
-            f"**8B Metal pin:** {fmt_num(fp)} vs llama {fmt_num(lp)} pred "
-            f"({gap_str(fp, lp)}) — "
+            f"**8B Metal pin (serving, stale):** {fmt_num(fp)} vs llama "
+            f"{fmt_num(lp)} pred ({gap_str(fp, lp)}) — "
             f"[`pins/llama31_8b_q4km_metal.json`](receipts/pins/llama31_8b_q4km_metal.json).\n"
         )
     else:
@@ -210,7 +233,8 @@ def main() -> None:
         f"`max_tokens={suite.get('max_tokens', 512)}` × {suite.get('reps', 3)} reps "
         f"(median ± stddev) unless noted. Prefer **predicted** tok/s.\n",
         "\n",
-        "Suite: [`suite.json`](suite.json). Runner: [`run_suite.py`](run_suite.py). "
+        "Suite: [`suite.json`](suite.json) (shared). Runners: `ferrox bench --suite` "
+        "(engine) and [`run_suite.py`](run_suite.py) (serving). "
         "Pins: [`receipts/pins/`](receipts/pins/). "
         "**This file is generated**: serving tables by "
         "[`render_results.py`](render_results.py), the engine table by "
@@ -221,6 +245,16 @@ def main() -> None:
         f"(near-parity within ~{PARITY_BAND * 100:.0f}%).\n",
         "\n",
         "**North star:** ≥ llama.cpp same host/GGUF/backend.\n",
+        "\n",
+        "> [!WARNING]\n"
+        "> **The serving pins below predate the thread-forcing fix.** They were\n"
+        "> measured with the harness forcing `-t 10` on both engines. On this\n"
+        "> host llama.cpp defaults to 6 performance cores and loses 2–4× when\n"
+        "> pushed above them, so its numbers here are handicapped and every CPU\n"
+        "> row flatters ferrox. Re-pin with `run_suite.py` (which no longer\n"
+        "> forces `-t`) before quoting any of them. **The engine table is\n"
+        "> freshly measured and is the current reference.**\n",
+        "\n",
         north,
         "\n",
         "One pin per `(model_id, backend)`. Re-run overwrites the pin. "
@@ -307,6 +341,11 @@ def main() -> None:
     if cli_pins:
         lines.append(
             "\n## CLI completion (`llama-completion` vs `ferrox run`)\n\n"
+            "> [!NOTE]\n"
+            "> Superseded for throughput by the engine table — use `ferrox bench`.\n"
+            "> These pins disagree with the fair-chat ones (SmolLM2 metal: 80.71\n"
+            "> here vs 282.29 there, same model and backend), so read this table\n"
+            "> for **process startup cost**, not engine speed.\n\n"
             "One-shot `-p … -n N --ignore-eos -c 4096` with the **same capitals "
             "prompt + chat template** as fair-chat server (ferrox wraps via GGUF "
             "template; llama `-cnv --jinja`). Fresh process per rep, interleaved "
@@ -351,24 +390,35 @@ def main() -> None:
 
     lines.append("\n## Open\n\n")
     lines.append(
-        "1. Metal fair-chat 8B is ahead (~0.92×); 3B ~parity (~0.97×). Keep "
-        "watching `prompt_per_second` vs llama after FA-vec prefill.\n"
-        "2. OLMoE Metal ~1.43× decode — Concurrent gate∥up remains best. Prefill: "
-        "fused attn+O residual CB + skip host KV download landed; full multi-layer "
-        "stack CB still open. See `docs/ROADMAP.md`.\n"
-        "3. CUDA — re-measure on comparable CUDA hardware (no in-tree CUDA pin; "
-        "skipped on darwin via `--fit-host`).\n"
-        "4. Gemma-4-E2B: `Gemma4Engine` loads; tokenizer `gemma4` still "
-        "byte-fallback; suite `expect=refuse` until fair-chat pin. Homebrew "
-        "llama also unknown-arch.\n"
-        "5. CB multi-request tok/s receipt.\n"
-        "6. DS4 / GLM / MLA MoE real-checkpoint e2e when feasible "
-        "(MoE-after-dense wired in `MlaEngine`).\n"
-        "7. Qwen2-MoE / Mixtral: missing GGUF or `--fit-host` RAM skip on Host B.\n"
-        "8. Suite contention: re-pin outliers alone if full-suite medians disagree with CLI.\n"
-        "9. CPU: Q8_0x4 wired into dense FFN `apply_cpu_q8` + serial floor for tiny "
-        "mats (SmolLM2 fair-chat ~70→85 tok/s). Remaining: SmolLM2 ~1.6× vs llama, "
-        "Qwen3/Phi-3 ~1.2×, Qwen2.5 ~1.1×; Q5_Kx8 next for Phi-3.\n"
+        "1. **Prefill is the largest gap in the project.** Engine `pp512`: CPU "
+        "3.0–8.2× behind llama.cpp, Metal 13.7–98.6× (SmolLM2 metal: 123 vs "
+        "12134 tok/s). CPU needs a Q4_K batch GEMM (Q8_0 has one); Metal needs "
+        "a real simdgroup `mul_mm` — today's Q4_K one is a stub. See "
+        "`docs/ROADMAP.md`.\n"
+        "2. **Metal decode is healthy.** ferrox leads or ties on 12 of 15 rows "
+        "(Qwen2.5-0.5B 0.60×, SmolLM2 0.64×, Qwen3 0.71×, 8B 1.03×). The three "
+        "losses are the MoE/Gemma shapes below.\n"
+        "3. **Qwen1.5-MoE metal 2.75× is the worst decode row** — newly "
+        "measurable now that the engine suite covers it; the old ledger had no "
+        "pin. OLMoE metal 1.29×, Gemma-2-2B metal 1.14×.\n"
+        "4. **CPU decode is behind everywhere** (1.33×–2.60×). Two distinct "
+        "causes measured: ~2× lower per-thread GEMV throughput, and a "
+        "parallel-scaling ceiling at ~1.9× total where llama keeps scaling "
+        "(rayon fork-join per matvec vs llama's persistent spin-barrier pool).\n"
+        "5. **Serving pins need re-measuring.** All of them predate the "
+        "thread-forcing fix; see the warning at the top.\n"
+        "6. CUDA — no in-tree pin; skipped on darwin via `--fit-host`. Needs a "
+        "GPU host.\n"
+        "7. Gemma-4-E2B: `Gemma4Engine` loads; tokenizer `gemma4` still "
+        "byte-fallback; suite `expect=refuse` until pinned. Homebrew llama also "
+        "reports unknown-arch.\n"
+        "8. Continuous-batching multi-request receipt "
+        "(`cb_throughput.py` exists; its output is not yet in this ledger).\n"
+        "9. DS4 / GLM / MLA MoE real-checkpoint e2e when feasible "
+        "(MoE-after-dense wired in `MlaEngine`). Mixtral still skipped by "
+        "`--fit-host` on Host B.\n"
+        "10. Run-to-run spread on this host is ~20%; anything claiming less "
+        "must be measured by interleaved A/B, not two batches of runs.\n"
     )
 
     OUT.write_text("".join(lines))

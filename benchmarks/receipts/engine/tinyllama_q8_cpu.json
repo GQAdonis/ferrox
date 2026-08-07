@@ -1,0 +1,40 @@
+{
+  "approx_params": 1261436928,
+  "arch": "llama",
+  "backend": "cpu",
+  "backend_active": "CPU",
+  "ferrox_version": "0.2.0",
+  "id": "tinyllama_q8",
+  "kind": "engine",
+  "load_s": 0.05134675,
+  "model_path": "models/tinyllama-1.1b-chat-v1.0.Q8_0.gguf",
+  "quant": "quantized",
+  "reps": 2,
+  "schema": 1,
+  "size_bytes": 1170781568,
+  "tests": [
+    {
+      "ferrox_samples": [
+        102.96368929671327,
+        102.33319347337192
+      ],
+      "ferrox_stddev": 0.31524791167067434,
+      "ferrox_tps": 102.64844138504259,
+      "gap": 3.002481049311961,
+      "llama_tps": 308.2,
+      "test": "pp512"
+    },
+    {
+      "ferrox_samples": [
+        41.96336246030538,
+        45.6173779649402
+      ],
+      "ferrox_stddev": 1.8270077523174066,
+      "ferrox_tps": 43.79037021262279,
+      "gap": 1.3329414598823044,
+      "llama_tps": 58.37,
+      "test": "tg128"
+    }
+  ],
+  "threads": 6
+}

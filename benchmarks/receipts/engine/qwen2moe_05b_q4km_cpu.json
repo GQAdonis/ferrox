@@ -1,0 +1,40 @@
+{
+  "approx_params": 4346871808,
+  "arch": "qwen2moe",
+  "backend": "cpu",
+  "backend_active": "CPU",
+  "ferrox_version": "0.2.0",
+  "id": "qwen2moe_05b_q4km",
+  "kind": "engine",
+  "load_s": 0.442444042,
+  "model_path": "models/Qwen1.5-MoE-A2.7B-Chat-Q4_K_M.gguf",
+  "quant": "quantized",
+  "reps": 2,
+  "schema": 1,
+  "size_bytes": 9496236768,
+  "tests": [
+    {
+      "ferrox_samples": [
+        20.657040198752775,
+        20.74599428188865
+      ],
+      "ferrox_stddev": 0.04447704156793719,
+      "ferrox_tps": 20.70151724032071,
+      "gap": 5.765760964008977,
+      "llama_tps": 119.36,
+      "test": "pp512"
+    },
+    {
+      "ferrox_samples": [
+        22.383367573709894,
+        21.12856017012618
+      ],
+      "ferrox_stddev": 0.6274037017918577,
+      "ferrox_tps": 21.755963871918034,
+      "gap": 1.6933287909873764,
+      "llama_tps": 36.84,
+      "test": "tg128"
+    }
+  ],
+  "threads": 6
+}

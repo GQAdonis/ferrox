@@ -1,0 +1,40 @@
+{
+  "approx_params": 176062464,
+  "arch": "llama",
+  "backend": "metal",
+  "backend_active": "Metal",
+  "ferrox_version": "0.2.0",
+  "id": "smollm2_135m_q8",
+  "kind": "engine",
+  "load_s": 0.063766292,
+  "model_path": "models/hf_test/SmolLM2-135M-Instruct-Q8_0.gguf",
+  "quant": "quantized",
+  "reps": 2,
+  "schema": 1,
+  "size_bytes": 144811360,
+  "tests": [
+    {
+      "ferrox_samples": [
+        122.4022030005872,
+        123.82390216687809
+      ],
+      "ferrox_stddev": 0.7108495831454391,
+      "ferrox_tps": 123.11305258373264,
+      "gap": 98.56168574609235,
+      "llama_tps": 12134.23,
+      "test": "pp512"
+    },
+    {
+      "ferrox_samples": [
+        328.6523558028096,
+        343.21249864300347
+      ],
+      "ferrox_stddev": 7.280071420096931,
+      "ferrox_tps": 335.93242722290654,
+      "gap": 0.6410813084653444,
+      "llama_tps": 215.36,
+      "test": "tg128"
+    }
+  ],
+  "threads": 6
+}

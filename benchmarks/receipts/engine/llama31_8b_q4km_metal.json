@@ -1,0 +1,40 @@
+{
+  "approx_params": 8835301376,
+  "arch": "llama",
+  "backend": "metal",
+  "backend_active": "Metal",
+  "ferrox_version": "0.2.0",
+  "id": "llama31_8b_q4km",
+  "kind": "engine",
+  "load_s": 0.112726459,
+  "model_path": "models/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf",
+  "quant": "quantized",
+  "reps": 2,
+  "schema": 1,
+  "size_bytes": 4920739168,
+  "tests": [
+    {
+      "ferrox_samples": [
+        18.275228655928263,
+        18.536036423854622
+      ],
+      "ferrox_stddev": 0.13040388396317937,
+      "ferrox_tps": 18.405632539891442,
+      "gap": 14.283671013761888,
+      "llama_tps": 262.9,
+      "test": "pp512"
+    },
+    {
+      "ferrox_samples": [
+        28.98098772171867,
+        27.7894499377599
+      ],
+      "ferrox_stddev": 0.5957688919793842,
+      "ferrox_tps": 28.385218829739287,
+      "gap": 1.0283521214012112,
+      "llama_tps": 29.19,
+      "test": "tg128"
+    }
+  ],
+  "threads": 6
+}

@@ -1,0 +1,40 @@
+{
+  "approx_params": 3387949056,
+  "arch": "gemma2",
+  "backend": "metal",
+  "backend_active": "Metal",
+  "ferrox_version": "0.2.0",
+  "id": "gemma2_2b_q4km",
+  "kind": "engine",
+  "load_s": 0.069145959,
+  "model_path": "models/gemma-2-2b-it-Q4_K_M.gguf",
+  "quant": "quantized",
+  "reps": 2,
+  "schema": 1,
+  "size_bytes": 1708582752,
+  "tests": [
+    {
+      "ferrox_samples": [
+        27.191748415138925,
+        26.711999446498574
+      ],
+      "ferrox_stddev": 0.23987448432017544,
+      "ferrox_tps": 26.95187393081875,
+      "gap": 33.85590190656849,
+      "llama_tps": 912.48,
+      "test": "pp512"
+    },
+    {
+      "ferrox_samples": [
+        58.79763318855373,
+        59.29976934761714
+      ],
+      "ferrox_stddev": 0.25106807953170573,
+      "ferrox_tps": 59.04870126808544,
+      "gap": 1.1434629136626433,
+      "llama_tps": 67.52,
+      "test": "tg128"
+    }
+  ],
+  "threads": 6
+}

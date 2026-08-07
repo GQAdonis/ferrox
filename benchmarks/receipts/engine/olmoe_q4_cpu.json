@@ -1,0 +1,40 @@
+{
+  "approx_params": 1279787008,
+  "arch": "olmoe",
+  "backend": "cpu",
+  "backend_active": "CPU",
+  "ferrox_version": "0.2.0",
+  "id": "olmoe_q4",
+  "kind": "engine",
+  "load_s": 0.076440334,
+  "model_path": "models/olmoe-1b-7b-0924-q4_0.gguf",
+  "quant": "quantized",
+  "reps": 2,
+  "schema": 1,
+  "size_bytes": 3928036960,
+  "tests": [
+    {
+      "ferrox_samples": [
+        56.77763102013259,
+        60.98821697523041
+      ],
+      "ferrox_stddev": 2.1052929775489098,
+      "ferrox_tps": 58.8829239976815,
+      "gap": 4.850302610842584,
+      "llama_tps": 285.6,
+      "test": "pp512"
+    },
+    {
+      "ferrox_samples": [
+        54.862095125233296,
+        54.281973009773196
+      ],
+      "ferrox_stddev": 0.29006105773004975,
+      "ferrox_tps": 54.572034067503246,
+      "gap": 1.707834453902078,
+      "llama_tps": 93.2,
+      "test": "tg128"
+    }
+  ],
+  "threads": 6
+}

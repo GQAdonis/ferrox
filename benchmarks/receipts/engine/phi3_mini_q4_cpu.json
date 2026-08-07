@@ -1,0 +1,40 @@
+{
+  "approx_params": 3820879872,
+  "arch": "phi3",
+  "backend": "cpu",
+  "backend_active": "CPU",
+  "ferrox_version": "0.2.0",
+  "id": "phi3_mini_q4",
+  "kind": "engine",
+  "load_s": 0.055373625,
+  "model_path": "models/hf_test/Phi-3-mini-4k-instruct-q4.gguf",
+  "quant": "quantized",
+  "reps": 2,
+  "schema": 1,
+  "size_bytes": 2393231072,
+  "tests": [
+    {
+      "ferrox_samples": [
+        18.483495526833885,
+        18.815758370740472
+      ],
+      "ferrox_stddev": 0.16613142195329367,
+      "ferrox_tps": 18.64962694878718,
+      "gap": 5.774914441760667,
+      "llama_tps": 107.7,
+      "test": "pp512"
+    },
+    {
+      "ferrox_samples": [
+        15.849479719932884,
+        15.716188473750442
+      ],
+      "ferrox_stddev": 0.06664562309122068,
+      "ferrox_tps": 15.782834096841663,
+      "gap": 2.04399284704232,
+      "llama_tps": 32.26,
+      "test": "tg128"
+    }
+  ],
+  "threads": 6
+}

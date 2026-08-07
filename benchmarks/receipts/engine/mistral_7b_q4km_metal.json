@@ -1,0 +1,40 @@
+{
+  "approx_params": 8046772224,
+  "arch": "llama",
+  "backend": "metal",
+  "backend_active": "Metal",
+  "ferrox_version": "0.2.0",
+  "id": "mistral_7b_q4km",
+  "kind": "engine",
+  "load_s": 0.03746675,
+  "model_path": "models/Mistral-7B-Instruct-v0.2-Q4_K_M.gguf",
+  "quant": "quantized",
+  "reps": 2,
+  "schema": 1,
+  "size_bytes": 4368439584,
+  "tests": [
+    {
+      "ferrox_samples": [
+        20.24208085665593,
+        19.744814596293907
+      ],
+      "ferrox_stddev": 0.24863313018101252,
+      "ferrox_tps": 19.99344772647492,
+      "gap": 13.727997479721939,
+      "llama_tps": 274.47,
+      "test": "pp512"
+    },
+    {
+      "ferrox_samples": [
+        32.352298330653,
+        32.25657078001995
+      ],
+      "ferrox_stddev": 0.04786377531652519,
+      "ferrox_tps": 32.30443455533647,
+      "gap": 0.9924334055462956,
+      "llama_tps": 32.06,
+      "test": "tg128"
+    }
+  ],
+  "threads": 6
+}

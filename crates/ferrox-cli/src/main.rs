@@ -2,6 +2,7 @@
 //! inspect / presets / smoke / Kimi helpers. See `docs/CLI.md`.
 
 mod bench_model;
+mod bench_suite;
 mod chat;
 mod pull;
 mod run;
@@ -129,6 +130,41 @@ enum Commands {
         ffn_dim: usize,
         #[arg(long, default_value_t = 20)]
         iters: usize,
+        /// Also run `llama-bench` on the same GGUF and print the gap.
+        #[arg(long)]
+        compare: bool,
+        /// Run every entry in `benchmarks/suite.json` (each in a fresh
+        /// child process), write engine receipts, then re-render the
+        /// engine table in `benchmarks/RESULTS.md`.
+        #[arg(long)]
+        suite: bool,
+        /// Re-render the engine table from existing receipts only.
+        #[arg(long)]
+        render: bool,
+        /// Restrict `--suite` to one suite id.
+        #[arg(long)]
+        id: Option<String>,
+        /// Restrict `--suite` to one backend.
+        #[arg(long)]
+        backend: Option<String>,
+        /// Skip suite entries whose estimated RAM exceeds ~75% of host RAM.
+        #[arg(long)]
+        fit_host: bool,
+        /// Skip suite entries whose GGUF is not present.
+        #[arg(long)]
+        skip_missing: bool,
+        /// benchmarks/ directory.
+        #[arg(long, default_value = "benchmarks")]
+        bench_dir: String,
+        /// Internal (`--suite` children): suite id to record in the receipt.
+        #[arg(long)]
+        suite_id: Option<String>,
+        /// Internal (`--suite` children): backend label for the receipt.
+        #[arg(long, default_value = "cpu")]
+        backend_label: String,
+        /// Write a JSON receipt to this path.
+        #[arg(long)]
+        receipt: Option<String>,
     },
     /// Demonstrate prompt-lookup speculative decoding on a repetitive
     /// prompt, reporting forward_batch call count vs. tokens produced.
@@ -481,7 +517,33 @@ fn main() -> anyhow::Result<()> {
             hidden,
             ffn_dim,
             iters,
+            compare,
+            suite,
+            render,
+            id,
+            backend,
+            fit_host,
+            skip_missing,
+            bench_dir,
+            suite_id,
+            backend_label,
+            receipt,
         } => {
+            if render {
+                return bench_suite::render(std::path::Path::new(&bench_dir));
+            }
+            if suite {
+                return bench_suite::run_suite(bench_suite::SuiteArgs {
+                    bench_dir: bench_dir.into(),
+                    n_prompt,
+                    n_gen,
+                    reps,
+                    only_id: id,
+                    only_backend: backend,
+                    fit_host,
+                    skip_missing,
+                });
+            }
             if let Some(model) = model {
                 bench_model::apply_env(threads, n_gpu_layers);
                 return bench_model::run(bench_model::BenchArgs {
@@ -490,6 +552,10 @@ fn main() -> anyhow::Result<()> {
                     n_gen,
                     reps,
                     ctx_size,
+                    compare,
+                    backend: backend_label,
+                    receipt: receipt.map(Into::into),
+                    id: suite_id,
                 });
             }
             use ferrox_core::weight_matrix::{QuantKind, WeightBytes, WeightMatrix};

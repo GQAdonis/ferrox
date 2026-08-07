@@ -90,6 +90,15 @@ pub struct BenchArgs {
     pub n_gen: usize,
     pub reps: usize,
     pub ctx_size: usize,
+    /// Also run `llama-bench` on the same GGUF with matching flags and
+    /// report the gap, instead of leaving the comparison to the reader.
+    pub compare: bool,
+    /// Backend label recorded in the receipt (`cpu` / `metal` / `cuda`).
+    pub backend: String,
+    /// Where to write the JSON receipt, if anywhere.
+    pub receipt: Option<std::path::PathBuf>,
+    /// Suite id this run belongs to, for the receipt.
+    pub id: Option<String>,
 }
 
 pub fn run(args: BenchArgs) -> anyhow::Result<()> {
@@ -165,12 +174,63 @@ pub fn run(args: BenchArgs) -> anyhow::Result<()> {
         "\nferrox bench: load {load_s:.2}s, {} reps + 1 discarded warmup each",
         args.reps
     );
-    eprintln!(
-        "compare: llama-bench -m {model} -p {} -n {} -t {threads} -ngl {}",
-        args.n_prompt,
-        args.n_gen,
-        if backend == "CPU" { 0 } else { 99 },
-    );
+
+    let ngl = if backend == "CPU" { 0 } else { 99 };
+    let llama = if args.compare {
+        match run_llama_bench(&model, args.n_prompt, args.n_gen, args.reps, ngl) {
+            Ok(v) => Some(v),
+            Err(e) => {
+                eprintln!("ferrox bench: llama-bench comparison unavailable: {e}");
+                None
+            }
+        }
+    } else {
+        eprintln!(
+            "compare: llama-bench -m {model} -p {} -n {} -ngl {ngl}   (or pass --compare)",
+            args.n_prompt, args.n_gen,
+        );
+        None
+    };
+
+    if let Some(llama) = &llama {
+        println!();
+        println!(
+            "| {:<15} | {:>12} | {:>12} | {:>8} |",
+            "test", "ferrox", "llama.cpp", "gap"
+        );
+        println!("| {:-<15} | {:->12} | {:->12} | {:->8} |", "", "", "", "");
+        for row in &rows {
+            let l = llama.get(&row.test).copied();
+            let gap = l.map(|l| l / row.median());
+            println!(
+                "| {:<15} | {:>12.2} | {:>12} | {:>8} |",
+                row.test,
+                row.median(),
+                l.map(|v| format!("{v:.2}")).unwrap_or_else(|| "—".into()),
+                gap.map(|g| format!("{g:.2}×"))
+                    .unwrap_or_else(|| "—".into()),
+            );
+        }
+        eprintln!("gap = llama / ferrox; <1 means ferrox is faster");
+    }
+
+    if let Some(dest) = &args.receipt {
+        write_receipt(
+            dest,
+            &args,
+            &model,
+            &arch,
+            &file,
+            size_bytes,
+            params_b,
+            threads,
+            backend,
+            &rows,
+            llama.as_ref(),
+            load_s,
+        )?;
+        eprintln!("ferrox bench: receipt written to {}", dest.display());
+    }
     Ok(())
 }
 
@@ -289,6 +349,122 @@ fn human_params(p: u64) -> String {
     } else {
         format!("{:.2} M", b / 1e6)
     }
+}
+
+/// Runs `llama-bench` on the same GGUF with matching workload flags and
+/// parses its markdown table into `{test -> tok/s}`.
+///
+/// Thread count is deliberately *not* forced. Each engine picking its
+/// own default is the comparison that means something: llama.cpp
+/// defaults to performance cores and degrades sharply above them, so
+/// pinning both engines to the same oversubscribed count (as the old
+/// suite did with `-t 10`) handicaps llama by 2-4x on Apple Silicon and
+/// flatters ferrox.
+fn run_llama_bench(
+    model: &str,
+    n_prompt: usize,
+    n_gen: usize,
+    reps: usize,
+    ngl: usize,
+) -> anyhow::Result<std::collections::BTreeMap<String, f64>> {
+    let out = std::process::Command::new("llama-bench")
+        .args([
+            "-m",
+            model,
+            "-p",
+            &n_prompt.to_string(),
+            "-n",
+            &n_gen.to_string(),
+            "-r",
+            &reps.to_string(),
+            "-ngl",
+            &ngl.to_string(),
+        ])
+        .output()
+        .map_err(|e| anyhow::anyhow!("could not run llama-bench (is it on PATH?): {e}"))?;
+    if !out.status.success() {
+        anyhow::bail!("llama-bench exited with {}", out.status);
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    Ok(parse_llama_bench_table(&text))
+}
+
+/// Extracts `{test -> tok/s}` from `llama-bench`'s markdown table.
+///
+/// Its rows look like `| model | size | params | backend | threads |
+/// test | t/s |`, where the `t/s` cell is `123.45 ± 6.78`. Anything that
+/// does not have that shape (header, separator, the trailing `build:`
+/// line) is skipped rather than guessed at.
+fn parse_llama_bench_table(text: &str) -> std::collections::BTreeMap<String, f64> {
+    let mut out = std::collections::BTreeMap::new();
+    for line in text.lines() {
+        let cells: Vec<&str> = line.split('|').map(str::trim).collect();
+        if cells.len() < 8 {
+            continue;
+        }
+        let test = cells[6];
+        if test.is_empty() || test == "test" || test.starts_with('-') {
+            continue;
+        }
+        let Some(value) = cells[7].split('±').next() else {
+            continue;
+        };
+        if let Ok(v) = value.trim().parse::<f64>() {
+            out.insert(test.to_string(), v);
+        }
+    }
+    out
+}
+
+#[allow(clippy::too_many_arguments)] // one call site; every field is reported
+fn write_receipt(
+    dest: &Path,
+    args: &BenchArgs,
+    model: &str,
+    arch: &str,
+    file: &ferrox_gguf::ShardedGguf,
+    size_bytes: u64,
+    params: u64,
+    threads: usize,
+    backend: &str,
+    rows: &[Row],
+    llama: Option<&std::collections::BTreeMap<String, f64>>,
+    load_s: f64,
+) -> anyhow::Result<()> {
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut tests = Vec::new();
+    for row in rows {
+        let l = llama.and_then(|m| m.get(&row.test)).copied();
+        tests.push(serde_json::json!({
+            "test": row.test,
+            "ferrox_tps": row.median(),
+            "ferrox_stddev": row.stddev(),
+            "ferrox_samples": row.samples,
+            "llama_tps": l,
+            "gap": l.map(|l| l / row.median()),
+        }));
+    }
+    let receipt = serde_json::json!({
+        "schema": 1,
+        "kind": "engine",
+        "id": args.id,
+        "model_path": model,
+        "arch": arch,
+        "quant": quant_label(file),
+        "size_bytes": size_bytes,
+        "approx_params": params,
+        "backend": args.backend,
+        "backend_active": backend,
+        "threads": threads,
+        "reps": args.reps,
+        "load_s": load_s,
+        "ferrox_version": env!("CARGO_PKG_VERSION"),
+        "tests": tests,
+    });
+    std::fs::write(dest, serde_json::to_string_pretty(&receipt)? + "\n")?;
+    Ok(())
 }
 
 #[cfg(test)]

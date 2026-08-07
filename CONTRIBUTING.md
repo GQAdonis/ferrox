@@ -23,8 +23,19 @@ kernel tests stay `#[ignore]`d on hosted CI.
   `best_effort_fields`.
 - New quant kernels need independent goldens (not only self-parity).
 - Hardware claims state the machine, or say compile-tested only.
-- Suite: `benchmarks/suite.json` → `run_suite.py` → pins → generated
-  `benchmarks/RESULTS.md` (do not hand-edit headlines).
+- Two tracks, both driven from `benchmarks/suite.json`, both generated
+  into `benchmarks/RESULTS.md` (never hand-edited):
+  - **Engine** — `ferrox bench --suite` vs `llama-bench`, no HTTP.
+  - **Serving** — `run_suite.py` vs `llama-server`, over HTTP.
+  Do not quote one as the other.
+- Never force a thread count on either engine. llama.cpp defaults to
+  performance cores and loses 2-4x above them, so pinning both to the
+  same count flatters ferrox rather than making it fair.
+- Run-to-run spread on Apple Silicon is ~20%. Any claim under that needs
+  interleaved A/B (alternate the two binaries round by round in one
+  session and count rounds won), not two batches of runs.
+- Negative results get committed too. `.scratch/NOTES_LLAMA_*.md` is the
+  record of what was tried and did not work; it is as useful as the wins.
 
 ## Documentation
 

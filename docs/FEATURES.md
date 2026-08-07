@@ -29,7 +29,7 @@ Full matrix and pins: [`MODELS.md`](MODELS.md) ·
 
 | Backend | Capabilities |
 |---|---|
-| **CPU** | Dense + MoE; `FERROX_CPU_INT_DOT` int8×int8 + interleaved Q4_Kx8 / Q8_0x4 GEMV + Q5/Q6 int-dot |
+| **CPU** | Dense + MoE; int8×int8 matvec on by default (`FERROX_CPU_INT_DOT=0` opts out) + interleaved Q4_Kx8 / Q8_0x4 GEMV, Q8_0x4 batch GEMM for prefill, Q5/Q6 int-dot; pool sized to performance cores |
 | **Metal** | FA-vec attention (decode d=64/96/128/256, prefill d=128/256), concurrent FFN/QKV encode, MoE Concurrent + fused groups + `MoeMemRanges` + `mul_mm_id` prefill, quantized KV (`q8_0` / `turbo8` / `fp8` / `turbo4`) |
 | **CUDA** | Matvec, resident weights, FFN fuse (`--features cuda`) |
 
@@ -38,6 +38,14 @@ Full matrix and pins: [`MODELS.md`](MODELS.md) ·
 llama.cpp-style completion flags (`-m`, `-p`, `-n`, `-ngl`, `--ctk`, …),
 plus `ferrox chat`, `ferrox pull` (Hugging Face Hub), `inspect`, `archs`,
 and `presets`. See [`CLI.md`](CLI.md).
+
+`ferrox bench -m model.gguf` is a `llama-bench` work-alike (`pp512` /
+`tg128`, median ± stddev); `--compare` runs `llama-bench` alongside it
+and prints the gap, and `--suite` drives every entry in
+[`benchmarks/suite.json`](../benchmarks/suite.json) and regenerates the
+engine table in [`RESULTS.md`](../benchmarks/RESULTS.md). That is the
+*engine* number — the *serving* number comes from
+[`benchmarks/run_suite.py`](../benchmarks/README.md).
 
 ## Server
 

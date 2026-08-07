@@ -180,6 +180,11 @@ discarded), same flag names — so the two outputs can be read side by side.
 | `-r/--repetitions` | Timed reps (default 3), plus one discarded warmup |
 | `-t/--threads` | CPU threads (`0` = performance-core default) |
 | `--n-gpu-layers` | `0` forces CPU; anything else offloads |
+| `--compare` | Also run `llama-bench` on the same GGUF and print the gap |
+| `--suite` | Run every [`benchmarks/suite.json`](../benchmarks/suite.json) entry (fresh process each), write receipts, re-render the engine table |
+| `--render` | Re-render the engine table from existing receipts, measuring nothing |
+| `--id` / `--backend` | Restrict `--suite` to one entry / backend |
+| `--fit-host` / `--skip-missing` | Skip entries too large for the host / with no GGUF present |
 
 This is the **engine** number: no HTTP, no chat template, no tokenizer, no
 sampling. The **serving** number — what a `ferrox-server` user actually

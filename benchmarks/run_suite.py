@@ -265,7 +265,8 @@ def run_ferrox(
     env = os.environ.copy()
     env["FERROX_MODEL_PATH"] = model
     env["FERROX_ADDR"] = f"127.0.0.1:{port}"
-    env["RAYON_NUM_THREADS"] = str(threads)
+    if threads > 0:
+        env["RAYON_NUM_THREADS"] = str(threads)
     if backend == "metal":
         env["FERROX_METAL"] = "1"
         env["FERROX_METAL_ATTN"] = "1"
@@ -336,7 +337,8 @@ def _start_ferrox_server(
     env = os.environ.copy()
     env["FERROX_MODEL_PATH"] = model
     env["FERROX_ADDR"] = f"127.0.0.1:{port}"
-    env["RAYON_NUM_THREADS"] = str(threads)
+    if threads > 0:
+        env["RAYON_NUM_THREADS"] = str(threads)
     if backend == "metal":
         env["FERROX_METAL"] = "1"
         env["FERROX_METAL_ATTN"] = "1"
@@ -380,8 +382,7 @@ def _start_llama_server(bin_path: str, model: str, port: int, backend: str, thre
         model,
         "-ngl",
         ngl,
-        "-t",
-        str(threads),
+        *(["-t", str(threads)] if threads > 0 else []),
         "--port",
         str(port),
         "--host",
@@ -514,8 +515,7 @@ def run_llama(
         model,
         "-ngl",
         ngl,
-        "-t",
-        str(threads),
+        *(["-t", str(threads)] if threads > 0 else []),
         "--port",
         str(port),
         "--host",
@@ -742,7 +742,7 @@ def run_cli_engine(
             # Chat-template wrap (same as ferrox-server /v1/chat/completions).
             cmd = [
                 bin_path, "-m", model, "-p", prompt,
-                "-n", str(n), "-t", str(threads), "-c", str(ctx),
+                "-n", str(n), *(["-t", str(threads)] if threads > 0 else []), "-c", str(ctx),
                 "--ngl", ngl,
                 "--temp", "0", "--ignore-eos",
             ]
@@ -751,7 +751,7 @@ def run_cli_engine(
             # `-cnv` with `-p` is non-interactive (first turn predefined).
             cmd = [
                 bin_path, "-m", model, "-p", prompt,
-                "-n", str(n), "-t", str(threads), "-c", str(ctx),
+                "-n", str(n), *(["-t", str(threads)] if threads > 0 else []), "-c", str(ctx),
                 "-ngl", ngl,
                 "--temp", "0", "-cnv", "--jinja", "-st", "--ignore-eos",
                 "--no-display-prompt",
@@ -881,7 +881,7 @@ def run_one(
                 env = dict(env_base)
                 cmd = [
                     llama_bin, "-m", str(model_path), "-p", prompt,
-                    "-n", str(max_tokens), "-t", str(threads), "-c", "4096",
+                    "-n", str(max_tokens), *(["-t", str(threads)] if threads > 0 else []), "-c", "4096",
                     "-ngl", ngl, "--temp", "0", "-cnv", "--jinja", "-st",
                     "--ignore-eos", "--no-display-prompt",
                 ]
@@ -909,7 +909,7 @@ def run_one(
                 else:
                     cmd = [
                         ferrox_bin, "-m", str(model_path), "-p", prompt,
-                        "-n", str(max_tokens), "-t", str(threads), "-c", "4096",
+                        "-n", str(max_tokens), *(["-t", str(threads)] if threads > 0 else []), "-c", "4096",
                         "--ngl", ngl, "--temp", "0", "--ignore-eos",
                     ]
                     print(f"--- ferrox (cli) rep {i+1}/{reps} ---", flush=True)
@@ -1072,7 +1072,18 @@ def main() -> None:
         default=suite.get("reps", 3),
         help="Measured repetitions per engine (median ± stddev; llama-bench style)",
     )
-    ap.add_argument("--threads", type=int, default=suite.get("threads", 10))
+    ap.add_argument(
+        "--threads",
+        type=int,
+        default=0,
+        help=(
+            "Force a thread count on BOTH engines. Default 0 = let each pick "
+            "its own, which is the comparison that means something: llama.cpp "
+            "defaults to performance cores and loses 2-4x when pushed above "
+            "them, so pinning both to the same count flatters ferrox. This "
+            "suite used to force 10 and every CPU row it produced was skewed."
+        ),
+    )
     ap.add_argument("--ferrox-port", type=int, default=8383)
     ap.add_argument("--llama-port", type=int, default=8384)
     ap.add_argument("--skip-llama", action="store_true")

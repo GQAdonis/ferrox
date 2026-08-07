@@ -72,7 +72,8 @@ curl -s -X POST http://127.0.0.1:8383/v1/chat/completions \
 | [docs/API.md](docs/API.md) | OpenAI-compatible API |
 | [docs/CONFIG.md](docs/CONFIG.md) | Environment variables |
 | [docs/AGENTS_COOKBOOK.md](docs/AGENTS_COOKBOOK.md) | Point IDEs / agents at the server |
-| [benchmarks/RESULTS.md](benchmarks/RESULTS.md) | Speed vs llama.cpp |
+| [benchmarks/RESULTS.md](benchmarks/RESULTS.md) | Speed vs llama.cpp (engine + serving) |
+| [benchmarks/README.md](benchmarks/README.md) | How the two benchmark tracks are measured |
 | [docs/ROADMAP.md](docs/ROADMAP.md) | Planned work |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | How to contribute |
 

@@ -1430,7 +1430,13 @@ kernel void gqa_prefill_fa_vec_d256(
     for (uint i = tid; i < D4; i += tg) {
         sq4[i] = q4[i];
     }
+    // D=256 is 64 float4 spread over 32 lanes, so each lane owns *two*
+    // of them: tiisg and tiisg+NW. Touching only the first truncated both
+    // the Q.K dot and the output to the first 128 of 256 head dims. This
+    // kernel was cloned from the d=128 one, where one float4 per lane is
+    // exactly right; at d=256 it silently dropped half of every head.
     so4[tiisg] = float4(0.0f);
+    so4[tiisg + NW] = float4(0.0f);
     ss[tiisg] = 0.0f;
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -1449,7 +1455,8 @@ kernel void gqa_prefill_fa_vec_d256(
         for (uint cc = 0; cc < chunk; cc++) {
             device const half4* k4 =
                 (device const half4*)(k_cache + ((ic + cc) * n_kv_heads + kv_h) * D);
-            float partial = dot(sq4[tiisg], float4(k4[tiisg]));
+            float partial = dot(sq4[tiisg], float4(k4[tiisg]))
+                          + dot(sq4[tiisg + NW], float4(k4[tiisg + NW]));
             float sc = simd_sum(partial) * scale;
             if (softcap > 0.0f) {
                 sc = softcap * tanh(sc / softcap);
@@ -1464,16 +1471,20 @@ kernel void gqa_prefill_fa_vec_d256(
         S = S * ms + simd_sum(vs);
         ss[tiisg] = vs;
         so4[tiisg] *= ms;
+        so4[tiisg + NW] *= ms;
         M = M2;
         simdgroup_barrier(mem_flags::mem_threadgroup);
 
-        float4 lo = float4(0.0f);
+        float4 lo0 = float4(0.0f);
+        float4 lo1 = float4(0.0f);
         for (uint cc = 0; cc < chunk; cc++) {
             device const half4* v4 =
                 (device const half4*)(v_cache + ((ic + cc) * n_kv_heads + kv_h) * D);
-            lo += float4(v4[tiisg]) * ss[cc];
+            lo0 += float4(v4[tiisg]) * ss[cc];
+            lo1 += float4(v4[tiisg + NW]) * ss[cc];
         }
-        so4[tiisg] += lo;
+        so4[tiisg] += lo0;
+        so4[tiisg + NW] += lo1;
     }
 
     if (tiisg == 0u) {
@@ -1500,6 +1511,7 @@ kernel void gqa_prefill_fa_vec_d256(
                 ss0[1] = Mn;
             }
             so0[tiisg] = so0[tiisg] * a0 + so1[tiisg] * a1;
+            so0[tiisg + NW] = so0[tiisg + NW] * a0 + so1[tiisg + NW] * a1;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
@@ -1510,6 +1522,7 @@ kernel void gqa_prefill_fa_vec_d256(
         float inv = (ss0[0] == 0.0f) ? 0.0f : (1.0f / ss0[0]);
         device float4* out4 = (device float4*)(out + (qi * n_heads + h) * D);
         out4[tiisg] = so0[tiisg] * inv;
+        out4[tiisg + NW] = so0[tiisg + NW] * inv;
     }
 }
 "#;
@@ -5851,6 +5864,33 @@ pub fn launch_gqa_prefill_host(
     n_q: usize,
     kv_prefix_len: usize,
 ) -> Result<Vec<f32>, MetalError> {
+    launch_gqa_prefill_host_ex(
+        q,
+        k_cache,
+        v_cache,
+        n_heads,
+        n_kv_heads,
+        head_dim,
+        n_q,
+        kv_prefix_len,
+        None,
+    )
+}
+
+/// [`launch_gqa_prefill_host`] with an attention-logit softcap, so the
+/// Gemma prefill path can be checked against the CPU reference.
+#[allow(clippy::too_many_arguments)]
+pub fn launch_gqa_prefill_host_ex(
+    q: &[f32],
+    k_cache: &[f32],
+    v_cache: &[f32],
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    n_q: usize,
+    kv_prefix_len: usize,
+    attn_softcap: Option<f32>,
+) -> Result<Vec<f32>, MetalError> {
     let total_seq = kv_prefix_len + n_q;
     assert_eq!(q.len(), n_q * n_heads * head_dim);
     assert_eq!(k_cache.len(), total_seq * n_kv_heads * head_dim);
@@ -5885,7 +5925,7 @@ pub fn launch_gqa_prefill_host(
         head_dim as u32,
         n_q as u32,
         kv_prefix_len as u32,
-        None,
+        attn_softcap,
     );
     encoder.endEncoding();
     enc_result?;
@@ -6353,6 +6393,76 @@ mod tests {
         for (i, (a, b)) in cpu.iter().zip(gpu.iter()).enumerate() {
             let tol = 5e-3 * a.abs().max(1.0);
             assert!((a - b).abs() <= tol, "elem {i}: cpu={a} gpu={b} tol={tol}");
+        }
+    }
+
+    /// Gemma-2 attends through the **prefill** FA-vec kernel at head_dim
+    /// 256 with an attention-logit softcap, and nothing covered that: the
+    /// only prefill parity test was d=128 without softcap, and every
+    /// d=256 decode case fit inside a single 32-wide KV chunk. The kernel
+    /// was dropping the upper half of every head and no test noticed.
+    #[test]
+    #[ignore = "needs a real Metal GPU"]
+    fn gqa_prefill_fa_vec_d256_softcap_matches_cpu() {
+        std::env::set_var("FERROX_METAL_FA_VEC", "1");
+        // (n_heads, n_kv, head_dim, n_q, kv_prefix, softcap)
+        let cases = [
+            (8usize, 4usize, 256usize, 3usize, 5usize, Some(50.0f32)),
+            (8, 4, 256, 16, 0, Some(50.0)),
+            (8, 4, 256, 40, 9, Some(50.0)),
+            (8, 4, 256, 3, 5, None),
+        ];
+        for (n_heads, n_kv_heads, head_dim, n_q, kv_prefix_len, softcap) in cases {
+            let total = kv_prefix_len + n_q;
+            let q: Vec<f32> = (0..n_q * n_heads * head_dim)
+                .map(|i| (i as f32 * 0.07).sin())
+                .collect();
+            let k: Vec<f32> = (0..total * n_kv_heads * head_dim)
+                .map(|i| (i as f32 * 0.03).cos())
+                .collect();
+            let v: Vec<f32> = (0..total * n_kv_heads * head_dim)
+                .map(|i| (i as f32 * 0.05).sin())
+                .collect();
+
+            let q_width = n_heads * head_dim;
+            let mut cpu = vec![0f32; n_q * q_width];
+            for qi in 0..n_q {
+                let causal_len = kv_prefix_len + qi + 1;
+                let kv_elems = causal_len * n_kv_heads * head_dim;
+                let row = cpu_gqa_ex(
+                    &q[qi * q_width..(qi + 1) * q_width],
+                    &k[..kv_elems],
+                    &v[..kv_elems],
+                    n_heads,
+                    n_kv_heads,
+                    head_dim,
+                    causal_len,
+                    0,
+                    softcap,
+                );
+                cpu[qi * q_width..(qi + 1) * q_width].copy_from_slice(&row);
+            }
+
+            let gpu = launch_gqa_prefill_host_ex(
+                &q,
+                &k,
+                &v,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                n_q,
+                kv_prefix_len,
+                softcap,
+            )
+            .expect("metal gqa prefill fa-vec d256");
+            assert_eq!(cpu.len(), gpu.len());
+            for (i, (a, b)) in cpu.iter().zip(gpu.iter()).enumerate() {
+                let tol = 5e-3 * a.abs().max(1.0);
+                assert!(
+                    (a - b).abs() <= tol,
+                    "hd={head_dim} n_q={n_q} pre={kv_prefix_len} sc={softcap:?} elem {i}: cpu={a} gpu={b}"
+                );
+            }
         }
     }
 

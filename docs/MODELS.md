@@ -11,11 +11,11 @@ Architecture list: `ferrox archs` →
 
 | Model | Notes |
 |---|---|
-| SmolLM2-135M-Instruct Q8_0 | Tiny; Metal ahead of llama |
+| SmolLM2-135M-Instruct Q8_0 | Tiny; Metal ahead of llama, CPU well behind |
 | TinyLlama-1.1B-Chat Q8_0 | Smallest verified smoke |
 | Phi-4-mini-Instruct Q4_K_M | Metal ~parity |
-| Llama-3.2-3B-Instruct Q4_K_M | Metal ~parity (~0.97×) |
-| Llama-3.1-8B-Instruct Q4_K_M | Metal fair-chat ahead (~0.92×) |
+| Llama-3.2-3B-Instruct Q4_K_M | Metal ahead (~0.94×) |
+| Llama-3.1-8B-Instruct Q4_K_M | Metal ~parity (~1.05×) |
 
 ```bash
 ./target/release/ferrox -m /path/to/model.gguf \
@@ -29,20 +29,31 @@ Architecture list: `ferrox archs` →
 
 ## Verified (Host B pins)
 
-| Model | Metal Gap | Notes |
-|---|---|---|
-| TinyLlama-1.1B-Chat Q8_0 | ~0.96× | CPU pin also exists |
-| Llama-3.2-1B Q4_K_M | ~1.00× | |
-| Llama-3.2-3B Q4_K_M | **~0.97×** | Concurrent FFN encode |
-| Llama-3.2-1B IQ4_XS | ~0.94× | |
-| Llama-3.1-8B-Instruct Q4_K_M | **~0.92×** | CLI ~1.00× |
-| Mistral-7B-Instruct-v0.2 Q4_K_M | ~0.95× | CPU pin exists |
-| OLMoE-1B-7B-0924 Q4_0 | **~1.41×** | CPU **~0.96×** (ahead); Metal fused encode + `mul_mm_id` (gated) |
-| SmolLM2-135M / Qwen2.5-0.5B / Qwen3-0.6B | ahead | Small Q8 pins |
-| Gemma-2-2B-IT Q4_K_M | ~1.10× | Softcap + FA-vec |
-| Gemma-3-1B-IT Q8_0 | ~0.82× | GeGLU + SWA |
-| Phi-3-mini-4k Q4 | ~0.92× | Fused QKV; FA-vec d=96 |
-| Phi-4-mini-Instruct Q4_K_M | ~1.00× | CLI ~1.04× |
+| Model | Metal serving | Metal decode (engine) | CPU decode (engine) |
+|---|---|---|---|
+| SmolLM2-135M Q8_0 | **0.76×** | **0.64×** | 2.60× |
+| Qwen2.5-0.5B Q8_0 | **0.63×** | **0.60×** | 1.84× |
+| Qwen3-0.6B Q8_0 | **0.81×** | **0.71×** | 1.78× |
+| Gemma-3-1B-IT Q8_0 | **0.74×** | **0.79×** | 1.92× |
+| Llama-3.2-1B IQ4_XS | **0.83×** | **0.94×** | — |
+| Llama-3.2-1B Q4_K_M | **0.88×** | **0.95×** | — |
+| TinyLlama-1.1B Q8_0 | **0.89×** | **0.89×** | 1.33× |
+| Phi-3-mini-4k Q4 | **0.91×** | **0.93×** | 2.04× |
+| Llama-3.2-3B Q4_K_M | **0.94×** | **0.84×** | — |
+| Phi-4-mini Q4_K_M | 1.00× | **0.93×** | 1.92× |
+| Mistral-7B-v0.2 Q4_K_M | 1.04× | 0.99× | 1.62× |
+| Llama-3.1-8B Q4_K_M | 1.05× | 1.03× | — |
+| Gemma-2-2B-IT Q4_K_M | 1.14× | 1.14× | 2.36× |
+| OLMoE-1B-7B Q4_0 | 1.59× | 1.29× | 1.71× |
+| Qwen1.5-MoE-A2.7B Q4_K_M | 2.83× | 2.75× | 1.69× |
+
+Gap = `llama / ferrox`; **bold** = ferrox faster. *Serving* is over HTTP
+with template and sampler in the loop; *engine* is `ferrox bench` vs
+`llama-bench`, no HTTP. Neither engine's thread count is forced.
+
+**Prefill is not in this table because ferrox loses it everywhere** —
+`pp512` is 3.0–8.2× behind on CPU and 13.7–98.6× on Metal. See
+[`benchmarks/RESULTS.md`](../benchmarks/RESULTS.md).
 
 ## Other support
 

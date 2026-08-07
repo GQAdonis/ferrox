@@ -835,6 +835,12 @@ def run_one(
         "model": entry["gguf"] if not model_path else redact_home(str(model_path)),
         "max_tokens": max_tokens,
         "reps": reps,
+        # None = neither engine was pinned to a thread count, which is the
+        # only comparison worth quoting on a hybrid-core host. A number
+        # means --threads forced it on both. Pins written before this field
+        # existed were all measured with a forced 10 and are not comparable;
+        # render_results.py warns on any pin missing the key.
+        "threads_forced": threads if threads > 0 else None,
         "mode": mode,
         "workload": PROMPT.split("unique=")[0].strip() + " (unique suffix)",
         "notes": entry.get("notes"),

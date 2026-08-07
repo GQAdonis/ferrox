@@ -4,17 +4,17 @@
   "name": "Gemma-4-E2B-IT Q4_K_M",
   "backend": "cpu",
   "expect": "refuse",
-  "date": "2026-08-06",
-  "host": "Host B (Apple M2 Pro, 10 logical cores, 32 GiB unified)",
+  "date": "2026-08-07",
+  "host": "Host B (Apple M2 Pro, 6 performance + 4 efficiency cores, 32 GiB unified)",
   "model": "~/Desktop/Dev/ferrox/models/gemma-4-E2B-it-Q4_K_M.gguf",
   "max_tokens": 512,
   "reps": 3,
+  "threads_forced": null,
   "mode": "server",
   "workload": "greedy chat, warm then 3x 512-tok capitals list (median)",
-  "notes": "E2B: per-layer emb + shared_kv_layers + SWA/full head-dim split \u2014 DedicatedOnly until engine lands; llama may still pin",
+  "notes": "Gemma4Engine loads real GGUF; tokenizer.ggml.model=gemma4 still byte-fallback; suite stays refuse until tokenizer + fair-chat pin; Homebrew llama unknown-arch",
   "ferrox": {
-    "error": "ferrox health fail",
-    "log_tail": "ferrox-server: process lifecycle journal at \"ferrox-journal.log\" (override with FERROX_JOURNAL_PATH)\nError: architecture 'gemma4' cannot use the generic Decoder: gemma4 E2B needs per-layer emb + shared KV + SWA/full head-dim split\n",
+    "error": "llama failed to start",
     "engine": "ferrox"
   },
   "llama": {

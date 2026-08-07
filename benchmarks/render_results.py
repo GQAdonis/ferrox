@@ -190,6 +190,27 @@ def main() -> None:
             f"pins: {', '.join(orphan_pin_files)}"
         )
 
+    # A pin is "stale" if it was measured with a forced thread count, or
+    # predates the `threads_forced` key entirely (all of those used -t 10).
+    # Deriving the banner from the pins means it disappears by itself as they
+    # are re-pinned, rather than becoming another stale claim in a file whose
+    # whole problem was stale claims.
+    ok_pins = [v for v in pins.values() if v.get("status") == "ok"]
+    stale_pins = [v for v in ok_pins if v.get("threads_forced", "absent") is not None]
+    if stale_pins:
+        stale_banner = (
+            "> [!WARNING]\n"
+            f"> **{len(stale_pins)} of {len(ok_pins)} serving pins were measured with a\n"
+            "> forced thread count** (the harness used to pin both engines to `-t 10`).\n"
+            "> On this host llama.cpp defaults to 6 performance cores and loses 2-4x\n"
+            "> when pushed above them, so those rows handicap llama and flatter ferrox.\n"
+            "> Re-pin with `run_suite.py`, which no longer forces `-t`. The engine\n"
+            "> table is freshly measured.\n"
+            "\n"
+        )
+    else:
+        stale_banner = ""
+
     # Headline the *engine* number when one exists. The serving pin for the
     # same model is currently 0.92x while the freshly measured engine decode
     # is 1.03x — quoting the flattering one at the top of a file that
@@ -246,15 +267,7 @@ def main() -> None:
         "\n",
         "**North star:** ≥ llama.cpp same host/GGUF/backend.\n",
         "\n",
-        "> [!WARNING]\n"
-        "> **The serving pins below predate the thread-forcing fix.** They were\n"
-        "> measured with the harness forcing `-t 10` on both engines. On this\n"
-        "> host llama.cpp defaults to 6 performance cores and loses 2–4× when\n"
-        "> pushed above them, so its numbers here are handicapped and every CPU\n"
-        "> row flatters ferrox. Re-pin with `run_suite.py` (which no longer\n"
-        "> forces `-t`) before quoting any of them. **The engine table is\n"
-        "> freshly measured and is the current reference.**\n",
-        "\n",
+        stale_banner,
         north,
         "\n",
         "One pin per `(model_id, backend)`. Re-run overwrites the pin. "
@@ -344,8 +357,10 @@ def main() -> None:
             "> [!NOTE]\n"
             "> Superseded for throughput by the engine table — use `ferrox bench`.\n"
             "> These pins disagree with the fair-chat ones (SmolLM2 metal: 80.71\n"
-            "> here vs 282.29 there, same model and backend), so read this table\n"
-            "> for **process startup cost**, not engine speed.\n\n"
+            "> here vs 282.29 there, same model and backend), and they were all\n"
+            "> measured with a forced `-t 10` that the serving pins above no\n"
+            "> longer use, so read this table for **process startup cost**, not\n"
+            "> engine speed.\n\n"
             "One-shot `-p … -n N --ignore-eos -c 4096` with the **same capitals "
             "prompt + chat template** as fair-chat server (ferrox wraps via GGUF "
             "template; llama `-cnv --jinja`). Fresh process per rep, interleaved "
@@ -405,12 +420,17 @@ def main() -> None:
         "causes measured: ~2× lower per-thread GEMV throughput, and a "
         "parallel-scaling ceiling at ~1.9× total where llama keeps scaling "
         "(rayon fork-join per matvec vs llama's persistent spin-barrier pool).\n"
-        "5. **Serving pins need re-measuring.** All of them predate the "
-        "thread-forcing fix; see the warning at the top.\n"
+        "5. **Serving pins re-measured** with neither engine's threads forced. "
+        "Every CPU row is now a loss (1.35\u00d7\u20132.57\u00d7); the five previous CPU "
+        "\"wins\" were artifacts of the old `-t 10`. ferrox's own throughput rose "
+        "slightly in every row \u2014 llama's roughly doubled. Metal barely moved, as "
+        "expected at `-ngl 99`, except the 8B lead (0.92\u00d7 \u2192 1.05\u00d7).\n"
         "6. CUDA — no in-tree pin; skipped on darwin via `--fit-host`. Needs a "
         "GPU host.\n"
         "7. Gemma-4-E2B: `Gemma4Engine` loads; tokenizer `gemma4` still "
-        "byte-fallback; suite `expect=refuse` until pinned. Homebrew llama also "
+        "byte-fallback. **Metal now emits 2 garbage tokens instead of refusing** "
+        "(pin `status=error`, `expect=refuse`) \u2014 worse than a clean refusal, "
+        "since it looks like it works. CPU still refuses. Homebrew llama also "
         "reports unknown-arch.\n"
         "8. Continuous-batching multi-request receipt "
         "(`cb_throughput.py` exists; its output is not yet in this ledger).\n"

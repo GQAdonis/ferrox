@@ -1,0 +1,90 @@
+{
+  "schema": 1,
+  "id": "qwen2moe_05b_q4km",
+  "name": "Qwen1.5-MoE-A2.7B Q4_K_M",
+  "backend": "cpu",
+  "expect": "ok",
+  "date": "2026-08-07",
+  "host": "Host B (Apple M2 Pro, 6 performance + 4 efficiency cores, 32 GiB unified)",
+  "model": "~/Desktop/Dev/ferrox/models/Qwen1.5-MoE-A2.7B-Chat-Q4_K_M.gguf",
+  "max_tokens": 512,
+  "reps": 3,
+  "threads_forced": null,
+  "mode": "server",
+  "workload": "greedy chat, warm then 3x 512-tok capitals list (median)",
+  "notes": "Qwen2-MoE: QKV bias + shared_expert_gate; GGUF not on Host B disk",
+  "ferrox": {
+    "wall_s": 39.06,
+    "predicted_per_second": 14.16,
+    "prompt_per_second": 14.539,
+    "completion_tokens": 512,
+    "wall_tok_s": 13.108,
+    "prefix": "\u5f18\u626c\u626c\u653e\u7f6e\u540c\u80de\u61d2,\u62c9\u5212,\u90fd\u5e94\u8be5\u8be5,,,\u5168\u4f53\u5458\u5de5\u5168\u4f53\u5458\u5de5,,,,,,\u6253\u4f18\u62c9,,\u8be5,,,\u7ade,\u540c\u5fd7\u4eec,\u8be5\u8be5\u7ade\u8be5\u4f18,,,\u6253,,,",
+    "predicted_stddev": 0.802,
+    "prompt_stddev": 6.239,
+    "wall_tok_s_stddev": 1.709,
+    "reps": 3,
+    "runs": [
+      {
+        "predicted_per_second": 12.935001151834063,
+        "prompt_per_second": 4.4870756589292355,
+        "wall_tok_s": 10.226,
+        "wall_s": 50.071,
+        "completion_tokens": 512
+      },
+      {
+        "predicted_per_second": 14.444697955476434,
+        "prompt_per_second": 14.53868840766792,
+        "wall_tok_s": 13.258,
+        "wall_s": 38.619,
+        "completion_tokens": 512
+      },
+      {
+        "predicted_per_second": 14.159816861021792,
+        "prompt_per_second": 15.914750675647939,
+        "wall_tok_s": 13.108,
+        "wall_s": 39.06,
+        "completion_tokens": 512
+      }
+    ],
+    "metal_fails": 0,
+    "engine": "ferrox"
+  },
+  "llama": {
+    "wall_s": 17.412,
+    "predicted_per_second": 33.061,
+    "prompt_per_second": 6.44,
+    "completion_tokens": 512,
+    "wall_tok_s": 29.405,
+    "prefix": "1. Athens, Greece - Home to the ancient Parthenon, built in ",
+    "predicted_stddev": 15.582,
+    "prompt_stddev": 0.545,
+    "wall_tok_s_stddev": 13.745,
+    "reps": 3,
+    "runs": [
+      {
+        "predicted_per_second": 8.406528003942661,
+        "prompt_per_second": 6.440403257210385,
+        "wall_tok_s": 7.61,
+        "wall_s": 67.282,
+        "completion_tokens": 512
+      },
+      {
+        "predicted_per_second": 33.061356324062764,
+        "prompt_per_second": 6.2012427290429,
+        "wall_tok_s": 29.405,
+        "wall_s": 17.412,
+        "completion_tokens": 512
+      },
+      {
+        "predicted_per_second": 37.242476819649596,
+        "prompt_per_second": 7.241300030594492,
+        "wall_tok_s": 33.017,
+        "wall_s": 15.507,
+        "completion_tokens": 512
+      }
+    ],
+    "engine": "llama"
+  },
+  "status": "ok"
+}

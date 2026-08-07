@@ -10,9 +10,13 @@ Verified against llama.cpp on the same host and GGUF (Gap =
 `llama_pred / ferrox_pred`; &lt;1 means Ferrox is faster):
 
 - **Dense GQA** — TinyLlama, Llama 3.1/3.2, Mistral-7B, SmolLM2,
-  Qwen2.5/Qwen3, Gemma-2/3, Phi-3/4. Llama-8B Metal fair-chat Gap
-  **~0.92×**; Llama-3.2-3B **~0.97×**.
-- **MoE** — OLMoE-1B-7B (Metal Concurrent + fused encode groups +
+  Qwen2.5/Qwen3, Gemma-2/3, Phi-3/4. Metal decode leads on the small and
+  mid models (Qwen2.5-0.5B **~0.63×**, SmolLM2 **~0.76×**, Gemma-3-1B
+  **~0.74×**) and is ~parity at 7-8B (Llama-3.1-8B ~1.05×). **CPU decode
+  is behind everywhere (1.3-2.6×), and prefill is behind on both
+  backends.**
+- **MoE** — OLMoE-1B-7B; still behind on Metal decode (~1.3-1.6×), and
+  Qwen1.5-MoE is the worst row in the suite (~2.8×). (Metal Concurrent + fused encode groups +
   `MoeMemRanges` + `mul_mv_id` / prefill `mul_mm_id` + fused attn+O
   residual CB (`FERROX_METAL_PREFILL_FUSE_O=1`); CPU int-dot +
   interleaved Q4_K).

@@ -2018,6 +2018,7 @@ static inline void mul_mm_sg_impl(
 
         // Scatter the 16 dequantized values into the 8x8-tile-major
         // layout `simdgroup_load` expects.
+#pragma clang loop unroll(full)
         for (short i = 0; i < 16; i++) {
             const short sx = 2 * il0 + i / 8;
             const short sy = (short(tiitg) / NL0) / 8;
@@ -2032,10 +2033,15 @@ static inline void mul_mm_sg_impl(
             const short sy = (short(tiitg) / NL1) / 8;
             const short ly = (short(tiitg) / NL1) % 8;
             const short ib = 4 * sx + sy;
-            threadgroup half* dstb = sb + 64 * ib + 8 * ly;
-            for (short i = 0; i < 8; i++) {
-                dstb[i] = half(y[i]);
-            }
+            // One 8-wide vector load + convert + store, not 8 scalar
+            // round trips. This is llama's non-bounds-checked B-tile
+            // path (`*(threadgroup S1_2x4 *)(sb + ...) = (S1_2x4)(*(device
+            // T1_2x4 *) y)`); the scalar loop it replaces was costing
+            // 8 loads and 8 stores per thread per K step. Both sides are
+            // 32-byte aligned: `iy` is a multiple of 8 floats and every
+            // real tensor's column count is a multiple of 8.
+            *(threadgroup half2x4*)(sb + 64 * ib + 8 * ly) =
+                half2x4(*(device const float2x4*)y);
         }
 
         // Advance two 16-value sub-blocks; step to the next super-block
@@ -2053,16 +2059,20 @@ static inline void mul_mm_sg_impl(
         threadgroup const half* lsma = sa + 4 * 64 * (sgitg % 2);
         threadgroup const half* lsmb = sb + 2 * 64 * (sgitg / 2);
 
+#pragma clang loop unroll(full)
         for (short ik = 0; ik < NK / 8; ik++) {
             simdgroup_barrier(mem_flags::mem_none);
+#pragma clang loop unroll(full)
             for (short i = 0; i < 4; i++) {
                 simdgroup_load(ma[i], lsma + 64 * i, 8, 0, false);
             }
             simdgroup_barrier(mem_flags::mem_none);
+#pragma clang loop unroll(full)
             for (short i = 0; i < 2; i++) {
                 simdgroup_load(mb[i], lsmb + 64 * i, 8, 0, false);
             }
             simdgroup_barrier(mem_flags::mem_none);
+#pragma clang loop unroll(full)
             for (short i = 0; i < 8; i++) {
                 simdgroup_multiply_accumulate(mc[i], mb[i / 4], ma[i % 4], mc[i]);
             }
@@ -2092,7 +2102,17 @@ static inline void mul_mm_sg_impl(
             for (short j = short(tiitg); j < nr1; j += NR1) {
                 device float* D = dst + r0 + (size_t)(r1 + j) * n_rows;
                 threadgroup const float* C = ((threadgroup float*)shmem) + j * NR0;
-                for (short i = 0; i < nr0; i++) {
+                // float4 for the aligned bulk, scalars for the tail --
+                // llama does the same. The edge tile is copied by a
+                // single simdgroup, so a scalar loop here serializes the
+                // whole dispatch behind it.
+                device float4* D4 = (device float4*)D;
+                threadgroup const float4* C4 = (threadgroup const float4*)C;
+                short i = 0;
+                for (; i < nr0 / 4; i++) {
+                    D4[i] = C4[i];
+                }
+                for (i *= 4; i < nr0; i++) {
                     D[i] = C[i];
                 }
             }

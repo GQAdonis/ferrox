@@ -30,6 +30,11 @@ rayon = { workspace = true }
 
 [features]
 default = []
-cuda = ["ferrox-cuda/cuda"]
+# Must forward to ferrox-models the same way `metal` does, or the CLI
+# links a ferrox-core built *without* `cuda` -- no `cuda_dense_enabled`,
+# no `apply_gpu` CUDA arm -- and `cargo build -p ferrox-cli --features
+# cuda` does not compile at all. Only ever caught on a real CUDA host,
+# because CI has none.
+cuda = ["ferrox-cuda/cuda", "ferrox-models/cuda"]
 # Caps detection + Metal apply_gpu dispatch through ferrox-models.
 metal = ["ferrox-metal/metal", "ferrox-models/metal"]

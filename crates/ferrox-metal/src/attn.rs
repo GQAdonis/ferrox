@@ -1241,14 +1241,34 @@ kernel void gqa_decode(
 }
 "#;
 
-/// FA-vec multi-query causal prefill for **head_dim=128**, f16 KV, C=32.
-/// One TG per `(head, query_token)`; same tile/merge as decode FA-vec, but
-/// each query `qi` attends only over `[0 ..= kv_prefix_len + qi]`.
-const GQA_PREFILL_FA_VEC_KERNEL_SRC: &str = r#"
+/// FA-vec multi-query causal prefill for head_dim **64 / 96 / 128**, f16
+/// KV, C=32. One TG per `(head, query_token)`; same tile/merge as decode
+/// FA-vec, but each query `qi` attends only over `[0 ..= kv_prefix_len + qi]`.
+///
+/// One body, three entry points. Only 128 existed before, which meant
+/// every d=64 model (SmolLM2, TinyLlama, Llama-3.2-1B, Qwen2.5-0.5B) ran
+/// the legacy `gqa_prefill` kernel instead. That kernel keeps a
+/// *per-thread* accumulator in threadgroup memory — `tg * head_dim`
+/// floats, ~27 KB at 108 threads — which caps occupancy at roughly one
+/// threadgroup per core. This one needs `D + nsg*(C+D)` floats, 3.3 KB at
+/// d=64. Profiling SmolLM2 metal `pp512` put 62% of prefill inside that
+/// legacy kernel's `waitUntilCompleted`.
+///
+/// `D4 = D/4` is how many float4 lanes carry the query and the output.
+/// At d=128 that is exactly the 32-lane simdgroup; at d=64 and d=96 it is
+/// fewer, so the lanes above `D4` sit out the dot product and the
+/// accumulator updates. They still participate in `simd_sum`/`simd_max`,
+/// which is what makes the masking safe rather than merely lucky.
+macro_rules! gqa_prefill_fa_vec_src {
+    ($name:literal, $d:literal) => {
+        concat!(
+            r#"
 #include <metal_stdlib>
 using namespace metal;
 
-kernel void gqa_prefill_fa_vec(
+kernel void "#,
+            $name,
+            r#"(
     device const float* q [[buffer(0)]],
     device const half* k_cache [[buffer(1)]],
     device const half* v_cache [[buffer(2)]],
@@ -1264,8 +1284,10 @@ kernel void gqa_prefill_fa_vec(
     uint2 tg_size [[threads_per_threadgroup]],
     threadgroup float* shared [[threadgroup(0)]]
 ) {
-    constexpr uint D = 128u;
-    constexpr uint D4 = 32u;
+    constexpr uint D = "#,
+            $d,
+            r#"u;
+    constexpr uint D4 = D / 4u;
     constexpr uint C = 32u;
     constexpr uint NW = 32u;
     constexpr uint SG_F = C + D;
@@ -1282,6 +1304,7 @@ kernel void gqa_prefill_fa_vec(
     const uint tiisg = tid % NW;
     const uint sgitg = tid / NW;
     const uint nsg = tg / NW;
+    const bool own = tiisg < D4;
 
     threadgroup float4* sq4 = (threadgroup float4*)shared;
     threadgroup float* ss = shared + D + sgitg * SG_F;
@@ -1295,7 +1318,9 @@ kernel void gqa_prefill_fa_vec(
     for (uint i = tid; i < D4; i += tg) {
         sq4[i] = q4[i];
     }
-    so4[tiisg] = float4(0.0f);
+    if (own) {
+        so4[tiisg] = float4(0.0f);
+    }
     ss[tiisg] = 0.0f;
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -1314,7 +1339,7 @@ kernel void gqa_prefill_fa_vec(
         for (uint cc = 0; cc < chunk; cc++) {
             device const half4* k4 =
                 (device const half4*)(k_cache + ((ic + cc) * n_kv_heads + kv_h) * D);
-            float partial = dot(sq4[tiisg], float4(k4[tiisg]));
+            float partial = own ? dot(sq4[tiisg], float4(k4[tiisg])) : 0.0f;
             float sc = simd_sum(partial) * scale;
             if (softcap > 0.0f) {
                 sc = softcap * tanh(sc / softcap);
@@ -1328,17 +1353,21 @@ kernel void gqa_prefill_fa_vec(
         float vs = (s_lane == -INFINITY) ? 0.0f : exp(s_lane - M2);
         S = S * ms + simd_sum(vs);
         ss[tiisg] = vs;
-        so4[tiisg] *= ms;
+        if (own) {
+            so4[tiisg] *= ms;
+        }
         M = M2;
         simdgroup_barrier(mem_flags::mem_threadgroup);
 
-        float4 lo = float4(0.0f);
-        for (uint cc = 0; cc < chunk; cc++) {
-            device const half4* v4 =
-                (device const half4*)(v_cache + ((ic + cc) * n_kv_heads + kv_h) * D);
-            lo += float4(v4[tiisg]) * ss[cc];
+        if (own) {
+            float4 lo = float4(0.0f);
+            for (uint cc = 0; cc < chunk; cc++) {
+                device const half4* v4 =
+                    (device const half4*)(v_cache + ((ic + cc) * n_kv_heads + kv_h) * D);
+                lo += float4(v4[tiisg]) * ss[cc];
+            }
+            so4[tiisg] += lo;
         }
-        so4[tiisg] += lo;
     }
 
     if (tiisg == 0u) {
@@ -1364,12 +1393,14 @@ kernel void gqa_prefill_fa_vec(
                 ss0[0] = S0 * a0 + S1 * a1;
                 ss0[1] = Mn;
             }
-            so0[tiisg] = so0[tiisg] * a0 + so1[tiisg] * a1;
+            if (own) {
+                so0[tiisg] = so0[tiisg] * a0 + so1[tiisg] * a1;
+            }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
-    if (sgitg == 0u) {
+    if (sgitg == 0u && own) {
         threadgroup float* ss0 = shared + D;
         threadgroup float4* so0 = (threadgroup float4*)(ss0 + C);
         float inv = (ss0[0] == 0.0f) ? 0.0f : (1.0f / ss0[0]);
@@ -1377,7 +1408,16 @@ kernel void gqa_prefill_fa_vec(
         out4[tiisg] = so0[tiisg] * inv;
     }
 }
-"#;
+"#
+        )
+    };
+}
+
+const GQA_PREFILL_FA_VEC_KERNEL_SRC: &str = gqa_prefill_fa_vec_src!("gqa_prefill_fa_vec", "128");
+const GQA_PREFILL_FA_VEC_D64_KERNEL_SRC: &str =
+    gqa_prefill_fa_vec_src!("gqa_prefill_fa_vec_d64", "64");
+const GQA_PREFILL_FA_VEC_D96_KERNEL_SRC: &str =
+    gqa_prefill_fa_vec_src!("gqa_prefill_fa_vec_d96", "96");
 
 const GQA_PREFILL_FA_VEC_D256_KERNEL_SRC: &str = r#"
 #include <metal_stdlib>
@@ -2710,9 +2750,11 @@ fn gqa_prefill_threadgroup_size(seq_len: u32, head_dim: u32) -> u32 {
     tg.max(1)
 }
 
-/// FA-vec prefill for head_dim 128 (Llama-3) and 256 (Gemma-2/3).
+/// FA-vec prefill head dims: 64 (SmolLM2 / TinyLlama / Llama-3.2-1B),
+/// 96, 128 (Llama-3), 256 (Gemma-2/3). Anything else falls back to the
+/// legacy per-thread-accumulator `gqa_prefill`.
 fn gqa_prefill_fa_vec_supported(head_dim: u32) -> bool {
-    matches!(head_dim, 128 | 256)
+    matches!(head_dim, 64 | 96 | 128 | 256)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2731,6 +2773,16 @@ fn encode_gqa_prefill_fa_vec(
     softcap: f32,
 ) -> Result<(), MetalError> {
     let pipe = match head_dim {
+        64 => ensure_pipeline(
+            device,
+            GQA_PREFILL_FA_VEC_D64_KERNEL_SRC,
+            "gqa_prefill_fa_vec_d64",
+        )?,
+        96 => ensure_pipeline(
+            device,
+            GQA_PREFILL_FA_VEC_D96_KERNEL_SRC,
+            "gqa_prefill_fa_vec_d96",
+        )?,
         128 => ensure_pipeline(device, GQA_PREFILL_FA_VEC_KERNEL_SRC, "gqa_prefill_fa_vec")?,
         256 => ensure_pipeline(
             device,
@@ -6403,14 +6455,26 @@ mod tests {
     /// was dropping the upper half of every head and no test noticed.
     #[test]
     #[ignore = "needs a real Metal GPU"]
-    fn gqa_prefill_fa_vec_d256_softcap_matches_cpu() {
+    fn gqa_prefill_fa_vec_softcap_matches_cpu() {
         std::env::set_var("FERROX_METAL_FA_VEC", "1");
+        // Every head dim the FA-vec prefill path claims to cover. d=64
+        // and d=96 are the ones where fewer than 32 lanes own a float4 of
+        // the output, so the lane masking is what these cases pin down --
+        // an unmasked lane reads `sq4` past the end of the query and the
+        // score is silently wrong for every token.
         // (n_heads, n_kv, head_dim, n_q, kv_prefix, softcap)
         let cases = [
             (8usize, 4usize, 256usize, 3usize, 5usize, Some(50.0f32)),
             (8, 4, 256, 16, 0, Some(50.0)),
             (8, 4, 256, 40, 9, Some(50.0)),
             (8, 4, 256, 3, 5, None),
+            (8, 4, 128, 40, 9, Some(50.0)),
+            (8, 4, 128, 33, 0, None),
+            (9, 3, 64, 40, 9, Some(50.0)),
+            (8, 4, 64, 65, 0, None),
+            (8, 8, 64, 3, 5, None),
+            (4, 2, 96, 40, 9, Some(50.0)),
+            (4, 4, 96, 33, 7, None),
         ];
         for (n_heads, n_kv_heads, head_dim, n_q, kv_prefix_len, softcap) in cases {
             let total = kv_prefix_len + n_q;

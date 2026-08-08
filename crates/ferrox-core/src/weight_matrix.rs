@@ -468,23 +468,19 @@ impl WeightMatrix {
     /// Whether batching this matrix during prefill beats running the
     /// fused per-position dense-FFN launch once per token.
     ///
-    /// Measured, not assumed. Q4_K/Q6_K have a real simdgroup GEMM and
-    /// win by ~4x. Q8_0 has only a batched matvec and still wins clearly
-    /// (TinyLlama Metal `pp512` 74 -> 139), because the fused path pays a
-    /// launch per token. The IQ codebook kinds are the exception -- their
-    /// batched matvec loses to the fused launch (Llama-3.2-1B IQ4_XS
-    /// regressed 72.1 -> 33.2), so they keep the per-position path until
-    /// they get a GEMM of their own.
+    /// Measured, not assumed. Every kind with a simdgroup GEMM
+    /// (`*_mul_mm_sg`) batches: Q4_K, Q5_K, Q6_K, Q8_0, Q4_0, IQ4_XS.
+    /// The remaining IQ codebook kinds have no GEMM, and their batched
+    /// *matvec* loses to the fused per-position launch — IQ4_XS
+    /// regressed 72.1 -> 33.2 on Llama-3.2-1B while it was in that
+    /// state — so they keep the per-position path until a GEMM exists
+    /// for them too.
     #[cfg(any(feature = "metal", feature = "cuda"))]
     pub fn prefers_gpu_batch(&self) -> bool {
         !matches!(
             self,
             WeightMatrix::Quantized {
-                kind: QuantKind::IQ4NL
-                    | QuantKind::IQ4XS
-                    | QuantKind::IQ1S
-                    | QuantKind::IQ2XXS
-                    | QuantKind::IQ3XXS,
+                kind: QuantKind::IQ4NL | QuantKind::IQ1S | QuantKind::IQ2XXS | QuantKind::IQ3XXS,
                 ..
             }
         )
@@ -1679,6 +1675,20 @@ impl WeightMatrix {
         if use_mul_mm {
             match kind {
                 QuantKind::Q4_0 => {
+                    match ferrox_metal::gpu::launch_q4_0_mul_mm_sg(
+                        data.as_slice(),
+                        x_batch,
+                        *rows,
+                        row_bytes,
+                        batch_size,
+                    ) {
+                        Ok(out) => return Some(out),
+                        Err(e) => {
+                            eprintln!(
+                                "ferrox: Metal Q4_0 simdgroup mul_mm failed, batched fallback: {e}"
+                            );
+                        }
+                    }
                     match ferrox_metal::gpu::launch_q4_0_mul_mm(
                         data.as_slice(),
                         x_batch,
@@ -1689,6 +1699,57 @@ impl WeightMatrix {
                         Ok(out) => return Some(out),
                         Err(e) => {
                             eprintln!("ferrox: Metal Q4_0 mul_mm failed, matvec fallback: {e}");
+                        }
+                    }
+                }
+                // Q8_0 had no batched GPU kernel at all, so a 512-token
+                // prefill ran 512 independent matvecs over the same
+                // weights. Those are the 14-30x `pp512` rows.
+                QuantKind::Q8_0 => {
+                    match ferrox_metal::gpu::launch_q8_0_mul_mm_sg(
+                        data.as_slice(),
+                        x_batch,
+                        *rows,
+                        row_bytes,
+                        batch_size,
+                    ) {
+                        Ok(out) => return Some(out),
+                        Err(e) => {
+                            eprintln!(
+                                "ferrox: Metal Q8_0 simdgroup mul_mm failed, matvec fallback: {e}"
+                            );
+                        }
+                    }
+                }
+                QuantKind::Q5K => {
+                    match ferrox_metal::gpu::launch_q5_k_mul_mm_sg(
+                        data.as_slice(),
+                        x_batch,
+                        *rows,
+                        row_bytes,
+                        batch_size,
+                    ) {
+                        Ok(out) => return Some(out),
+                        Err(e) => {
+                            eprintln!(
+                                "ferrox: Metal Q5_K simdgroup mul_mm failed, matvec fallback: {e}"
+                            );
+                        }
+                    }
+                }
+                QuantKind::IQ4XS => {
+                    match ferrox_metal::gpu::launch_iq4_xs_mul_mm_sg(
+                        data.as_slice(),
+                        x_batch,
+                        *rows,
+                        row_bytes,
+                        batch_size,
+                    ) {
+                        Ok(out) => return Some(out),
+                        Err(e) => {
+                            eprintln!(
+                                "ferrox: Metal IQ4_XS simdgroup mul_mm failed, matvec fallback: {e}"
+                            );
                         }
                     }
                 }
@@ -1825,7 +1886,12 @@ impl WeightMatrix {
     fn metal_kind_supported(kind: QuantKind) -> bool {
         matches!(
             kind,
-            QuantKind::Q8_0 | QuantKind::Q4_0 | QuantKind::Q4K | QuantKind::Q5K | QuantKind::Q6K
+            QuantKind::Q8_0
+                | QuantKind::Q4_0
+                | QuantKind::Q4K
+                | QuantKind::Q5K
+                | QuantKind::Q6K
+                | QuantKind::IQ4XS
         )
     }
 

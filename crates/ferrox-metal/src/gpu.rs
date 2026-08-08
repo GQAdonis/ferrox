@@ -1802,15 +1802,123 @@ static inline void q4k_dequant_16(device const uchar* xb, short il, thread float
 // templated body rather than being copy-pasted per format. The previous
 // generation of these kernels *was* copy-pasted, which is exactly how
 // `gqa_prefill_fa_vec_d256` ended up handling half a head.
+//
+// Each functor also carries its block geometry, because the shared body
+// needs it to walk the row: NL is how many 16-value sub-blocks a
+// super-block holds (llama's `nl` template argument -- 16 for the
+// 256-element K-quants, 2 for the 32-element legacy ones), and
+// BLOCK_BYTES is the on-disk stride of one super-block.
 struct Q4KDequant {
+    static constexpr constant short NL = 16;
+    static constexpr constant short BLOCK_BYTES = 144;
     static inline void get(device const uchar* xb, short il, thread float4x4& reg) {
         q4k_dequant_16(xb, il, reg);
+    }
+};
+
+// llama `dequantize_q8_0`. GGUF layout: half d, then 32 int8 quants.
+// 32-element block, so NL = 2: `il` selects the low or high 16.
+struct Q8_0Dequant {
+    static constexpr constant short NL = 2;
+    static constexpr constant short BLOCK_BYTES = 34;
+    static inline void get(device const uchar* xb, short il, thread float4x4& reg) {
+        const float d = float(*(device const half*)(xb));
+        device const char* qs = (device const char*)(xb + 2) + 16 * il;
+        for (short i = 0; i < 16; ++i) {
+            reg[i / 4][i % 4] = float(qs[i]) * d;
+        }
+    }
+};
+
+// llama `dequantize_q4_0`. GGUF layout: half d, then 16 bytes holding 32
+// nibbles. llama reads them as uint16 pairs; the tensor is only 2-byte
+// aligned per row here, so this composes the same words from bytes
+// instead (same reason `Q6KDequant` does).
+struct Q4_0Dequant {
+    static constexpr constant short NL = 2;
+    static constexpr constant short BLOCK_BYTES = 18;
+    static inline void get(device const uchar* xb, short il, thread float4x4& reg) {
+        const float d = float(*(device const half*)(xb));
+        device const uchar* qs = xb + 2;
+        const float d1 = il ? d / 16.0f : d;
+        const float d2 = d1 / 256.0f;
+        const float md = -8.0f * d;
+        const ushort mask0 = il ? 0x00F0 : 0x000F;
+        const ushort mask1 = mask0 << 8;
+        for (short i = 0; i < 8; ++i) {
+            const ushort w = ushort(qs[2 * i]) | (ushort(qs[2 * i + 1]) << 8);
+            reg[i / 2][2 * (i % 2) + 0] = d1 * float(w & mask0) + md;
+            reg[i / 2][2 * (i % 2) + 1] = d2 * float(w & mask1) + md;
+        }
+    }
+};
+
+// llama `dequantize_q5_K`. GGUF layout: half d, half dmin, scales[12],
+// qh[32], qs[128] -- the 5th bit of each quant lives in `qh`.
+struct Q5KDequant {
+    static constexpr constant short NL = 16;
+    static constexpr constant short BLOCK_BYTES = 176;
+    static inline void get(device const uchar* xb, short il, thread float4x4& reg) {
+        const float d_all = float(*(device const half*)(xb));
+        const float min = float(*(device const half*)(xb + 2));
+        device const uchar* scales = xb + 4;
+        device const uchar* q = xb + 48 + 32 * (il / 4) + 16 * (il & 1);
+        device const uchar* qh = xb + 16 + 16 * (il & 1);
+
+        const short is = (il / 4) * 2;
+        const uchar ul = 1 << (il / 2);
+        il = il & 3;
+        const uchar2 sc = q4k_scale_min_just2(is, il / 2, scales);
+        const float d = il < 2 ? d_all : d_all / 16.0f;
+        const float dl = d * float(sc[0]);
+        const float ml = min * float(sc[1]);
+
+        const ushort mask = il < 2 ? 0x0F : 0xF0;
+        const float qh_val = il < 2 ? 16.0f : 256.0f;
+        for (short i = 0; i < 16; ++i) {
+            reg[i / 4][i % 4] =
+                dl * (float(q[i] & mask) + ((qh[i] & ul) ? qh_val : 0.0f)) - ml;
+        }
+    }
+};
+
+// llama `dequantize_iq4_xs`. GGUF layout: half d, uint16 scales_h,
+// scales_l[4], qs[128]. Values come from the shared IQ4 codebook rather
+// than an affine dequant, which is why this format had no GEMM before.
+constant float kvalues_iq4nl_f[16] = {
+    -127.f, -104.f, -83.f, -65.f, -49.f, -35.f, -22.f, -10.f,
+    1.f, 13.f, 25.f, 38.f, 53.f, 69.f, 89.f, 113.f
+};
+
+struct IQ4XSDequant {
+    static constexpr constant short NL = 16;
+    static constexpr constant short BLOCK_BYTES = 136;
+    static inline void get(device const uchar* xb, short il, thread float4x4& reg) {
+        const float dv = float(*(device const half*)(xb));
+        const ushort scales_h = ushort(xb[2]) | (ushort(xb[3]) << 8);
+        device const uchar* scales_l = xb + 4;
+        device const uchar* qs = xb + 8;
+
+        const short ib32 = il / 2;
+        il = il % 2;
+        device const uchar* q4 = qs + 16 * ib32;
+        const int ls = int((scales_l[ib32 / 2] >> (4 * (ib32 % 2))) & 0xF)
+                     | (int((scales_h >> (2 * ib32)) & 3) << 4);
+        const float d = dv * float(ls - 32);
+        const uchar shift = 4 * il;
+        for (short i = 0; i < 4; ++i) {
+            for (short j = 0; j < 4; ++j) {
+                reg[i][j] = d * kvalues_iq4nl_f[(q4[4 * i + j] >> shift) & 0xF];
+            }
+        }
     }
 };
 
 // llama `dequantize_q6_K`. GGUF layout: ql[128], qh[64], int8 scales[16],
 // half d.
 struct Q6KDequant {
+    static constexpr constant short NL = 16;
+    static constexpr constant short BLOCK_BYTES = 210;
     static inline void get(device const uchar* xb, short il, thread float4x4& reg) {
         const float d_all = float(*(device const half*)(xb + 208));
         device const uchar* ql8 = xb;
@@ -1874,7 +1982,7 @@ static inline void mul_mm_sg_impl(
     constexpr short NK  = 32;
     constexpr short NL0 = NK / 16;   // 2 threads cover one row's 32 k-values
     constexpr short NL1 = NK / 8;    // 4 threads cover one token's 32 k-values
-    constexpr short NL  = 16;        // Q4_K sub-blocks per 256-element block
+    constexpr short NL  = DQ::NL;    // 16-value sub-blocks per super-block
 
     const int r0 = int(tgpig.y) * NR0;
     const int r1 = int(tgpig.x) * NR1;
@@ -1930,11 +2038,13 @@ static inline void mul_mm_sg_impl(
             }
         }
 
-        // Advance two 16-value sub-blocks; step to the next 256-element
-        // super-block when they wrap.
+        // Advance two 16-value sub-blocks; step to the next super-block
+        // when they wrap. For a 32-element format (NL == 2) `il` never
+        // moves and every iteration steps a block, which is correct:
+        // one block is exactly NK there.
         il = (il + 2 < NL) ? il + 2 : il % 2;
         if (il < 2) {
-            x += row_bytes / (n_cols / 256);
+            x += DQ::BLOCK_BYTES;
         }
         y += NK;
 
@@ -2011,6 +2121,10 @@ kernel void NAME(                                                           \
 
 MUL_MM_SG_ENTRY(q4_k_mul_mm_sg, Q4KDequant)
 MUL_MM_SG_ENTRY(q6_k_mul_mm_sg, Q6KDequant)
+MUL_MM_SG_ENTRY(q5_k_mul_mm_sg, Q5KDequant)
+MUL_MM_SG_ENTRY(q8_0_mul_mm_sg, Q8_0Dequant)
+MUL_MM_SG_ENTRY(q4_0_mul_mm_sg, Q4_0Dequant)
+MUL_MM_SG_ENTRY(iq4_xs_mul_mm_sg, IQ4XSDequant)
 "#;
 
 /// Launches the simdgroup Q4_K GEMM ([`K_QUANT_MUL_MM_SG_KERNEL_SRC`]).
@@ -2028,7 +2142,104 @@ pub fn launch_q4_k_mul_mm_sg(
     row_bytes: usize,
     batch_size: usize,
 ) -> Result<Vec<f32>, MetalError> {
-    launch_k_quant_mul_mm_sg(weights, x_batch, rows, row_bytes, batch_size, 144)
+    launch_k_quant_mul_mm_sg(
+        weights,
+        x_batch,
+        rows,
+        row_bytes,
+        batch_size,
+        "q4_k_mul_mm_sg",
+        144,
+        256,
+    )
+}
+
+/// Q5_K twin of [`launch_q4_k_mul_mm_sg`] (`*_Q5_K_M` checkpoints).
+pub fn launch_q5_k_mul_mm_sg(
+    weights: &[u8],
+    x_batch: &[f32],
+    rows: usize,
+    row_bytes: usize,
+    batch_size: usize,
+) -> Result<Vec<f32>, MetalError> {
+    launch_k_quant_mul_mm_sg(
+        weights,
+        x_batch,
+        rows,
+        row_bytes,
+        batch_size,
+        "q5_k_mul_mm_sg",
+        176,
+        256,
+    )
+}
+
+/// Q8_0 twin of [`launch_q4_k_mul_mm_sg`]. Q8_0 carried the *worst*
+/// prefill rows in the suite (SmolLM2 metal `pp512` 29.6x behind,
+/// Qwen2.5-0.5B 20.6x, Gemma-3-1B 20.8x) purely because no GEMM existed
+/// for it and every token re-read the whole matrix.
+pub fn launch_q8_0_mul_mm_sg(
+    weights: &[u8],
+    x_batch: &[f32],
+    rows: usize,
+    row_bytes: usize,
+    batch_size: usize,
+) -> Result<Vec<f32>, MetalError> {
+    launch_k_quant_mul_mm_sg(
+        weights,
+        x_batch,
+        rows,
+        row_bytes,
+        batch_size,
+        "q8_0_mul_mm_sg",
+        34,
+        32,
+    )
+}
+
+/// Q4_0 twin of [`launch_q4_k_mul_mm_sg`] (OLMoE and the other Q4_0
+/// checkpoints). Replaces `launch_q4_0_mul_mm`, which was a batched
+/// matvec rather than a tiled GEMM.
+pub fn launch_q4_0_mul_mm_sg(
+    weights: &[u8],
+    x_batch: &[f32],
+    rows: usize,
+    row_bytes: usize,
+    batch_size: usize,
+) -> Result<Vec<f32>, MetalError> {
+    launch_k_quant_mul_mm_sg(
+        weights,
+        x_batch,
+        rows,
+        row_bytes,
+        batch_size,
+        "q4_0_mul_mm_sg",
+        18,
+        32,
+    )
+}
+
+/// IQ4_XS twin of [`launch_q4_k_mul_mm_sg`]. The IQ codebook kinds were
+/// explicitly kept *off* the batched path (`prefers_gpu_batch`) because
+/// the batched-matvec fallback lost to N x matvec for them; with a real
+/// GEMM that reason no longer applies.
+pub fn launch_iq4_xs_mul_mm_sg(
+    weights: &[u8],
+    x_batch: &[f32],
+    rows: usize,
+    row_bytes: usize,
+    batch_size: usize,
+) -> Result<Vec<f32>, MetalError> {
+    launch_k_quant_mul_mm_sg(
+        weights,
+        x_batch,
+        rows,
+        row_bytes,
+        batch_size,
+        "iq4_xs_mul_mm_sg",
+        136,
+        256,
+    )
 }
 
 /// Q6_K twin of [`launch_q4_k_mul_mm_sg`]. `ffn_down` and `attn_v` are
@@ -2042,27 +2253,34 @@ pub fn launch_q6_k_mul_mm_sg(
     row_bytes: usize,
     batch_size: usize,
 ) -> Result<Vec<f32>, MetalError> {
-    launch_k_quant_mul_mm_sg(weights, x_batch, rows, row_bytes, batch_size, 210)
+    launch_k_quant_mul_mm_sg(
+        weights,
+        x_batch,
+        rows,
+        row_bytes,
+        batch_size,
+        "q6_k_mul_mm_sg",
+        210,
+        256,
+    )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn launch_k_quant_mul_mm_sg(
     weights: &[u8],
     x_batch: &[f32],
     rows: usize,
     row_bytes: usize,
     batch_size: usize,
+    fn_name: &'static str,
     block_bytes: usize,
+    block_elems: usize,
 ) -> Result<Vec<f32>, MetalError> {
     if batch_size == 0 || rows == 0 {
         return Ok(vec![0.0; batch_size * rows]);
     }
-    let fn_name = if block_bytes == 210 {
-        "q6_k_mul_mm_sg"
-    } else {
-        "q4_k_mul_mm_sg"
-    };
     let n_blocks_per_row = row_bytes / block_bytes;
-    let cols = n_blocks_per_row * 256;
+    let cols = n_blocks_per_row * block_elems;
     if cols == 0 {
         return Err(MetalError::CommandFailed);
     }
@@ -3065,8 +3283,41 @@ pub(crate) struct ResidentWeightBuffer {
     /// this buffer at argument slot 0 must bind it at this offset.
     pub(crate) weight_offset: usize,
     nbytes: usize,
+    /// Sampled fingerprint of the host bytes this buffer was built from.
+    /// `(pointer, length)` is *not* an identity: free a tensor and the
+    /// allocator can hand the same address and length to a different one,
+    /// after which the cache would serve the old contents. Long-lived
+    /// mmap-backed weights never hit that, but owned `WeightBytes` and
+    /// short-lived test fixtures do. Checked on every cache hit.
+    fingerprint: u64,
     /// Keeps the registered mmap MTLBuffer entry alive for NoCopy aliases.
     _keepalive: Option<Arc<ResidentMmapFile>>,
+}
+
+/// Cheap content fingerprint: FNV-1a over at most 64 sampled 8-byte
+/// words spread across the slice, plus the length. Hashing a 200 MB
+/// tensor on every matmul would cost more than the upload it is
+/// protecting; sampling makes an accidental collision between two
+/// distinct tensors of equal length vanishingly unlikely at constant
+/// cost.
+fn weight_fingerprint(weights: &[u8]) -> u64 {
+    const SAMPLES: usize = 64;
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut mix = |v: u64| {
+        h ^= v;
+        h = h.wrapping_mul(0x100_0000_01b3);
+    };
+    mix(weights.len() as u64);
+    let stride = (weights.len() / SAMPLES).max(1);
+    let mut off = 0usize;
+    while off < weights.len() {
+        let end = (off + 8).min(weights.len());
+        let mut word = [0u8; 8];
+        word[..end - off].copy_from_slice(&weights[off..end]);
+        mix(u64::from_le_bytes(word));
+        off += stride;
+    }
+    h
 }
 
 // SAFETY: same justification as `SharedMetal` -- `MTLBuffer` created
@@ -3099,13 +3350,21 @@ pub(crate) fn resident_weight_buffer(
     weights: &[u8],
 ) -> Result<Arc<ResidentWeightBuffer>, MetalError> {
     let key = (weights.as_ptr() as usize, weights.len());
+    let fingerprint = weight_fingerprint(weights);
     if let Some(cached) = TL_WEIGHT_CACHE.with(|c| c.borrow().get(&key).cloned()) {
-        return Ok(cached);
+        if cached.fingerprint == fingerprint {
+            return Ok(cached);
+        }
+        // Address reused by different bytes: drop the stale alias and
+        // fall through to rebuild.
+        TL_WEIGHT_CACHE.with(|c| {
+            c.borrow_mut().remove(&key);
+        });
     }
     let cached = {
         let mut guard = WEIGHT_CACHE.lock().unwrap();
         let cache = guard.get_or_insert_with(HashMap::new);
-        if let Some(cached) = cache.get(&key) {
+        if let Some(cached) = cache.get(&key).filter(|c| c.fingerprint == fingerprint) {
             cached.clone()
         } else {
             let budget = weight_cache_budget_bytes();
@@ -3249,6 +3508,7 @@ fn build_resident_weight_buffer(
                 buffer: file.buffer.clone(),
                 weight_offset: offset,
                 nbytes: 0, // aliased: no cache-budget cost
+                fingerprint: weight_fingerprint(weights),
                 _keepalive: Some(file),
             });
         }
@@ -3268,6 +3528,7 @@ fn build_resident_weight_buffer(
         buffer,
         weight_offset: 0,
         nbytes: weights.len(),
+        fingerprint: weight_fingerprint(weights),
         _keepalive: None,
     })
 }
@@ -6028,6 +6289,159 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Pseudo-random blocks whose leading `half` scales are forced to a
+    /// realistic magnitude, for the formats that keep `d` (and optionally
+    /// `dmin`) at the front of the block: Q8_0, Q4_0, Q5_K, IQ4_XS. Same
+    /// reasoning as [`realistic_q4_k_matrix`] — random scale halves decode
+    /// to values the format never produces and overflow the GEMM's `half`
+    /// tiles to NaN, so the test would be exercising a regime that cannot
+    /// occur rather than the indexing that can actually be wrong.
+    fn realistic_blocks(
+        rows: usize,
+        blocks_per_row: usize,
+        block_bytes: usize,
+        seed: u32,
+        d: f32,
+        dmin: Option<f32>,
+    ) -> Vec<u8> {
+        let row_bytes = blocks_per_row * block_bytes;
+        let mut weights = Vec::with_capacity(rows * row_bytes);
+        for r in 0..rows {
+            let mut row = pseudo_bytes(r as u32 + seed, row_bytes);
+            for b in 0..blocks_per_row {
+                let base = b * block_bytes;
+                let dv = half::f16::from_f32(d * (1.0 + 0.1 * ((r + b) % 5) as f32));
+                row[base..base + 2].copy_from_slice(&dv.to_le_bytes());
+                if let Some(m) = dmin {
+                    let mv = half::f16::from_f32(m * (1.0 + 0.1 * ((r + b) % 3) as f32));
+                    row[base + 2..base + 4].copy_from_slice(&mv.to_le_bytes());
+                }
+            }
+            weights.extend_from_slice(&row);
+        }
+        weights
+    }
+
+    /// Shared body for "the new simdgroup GEMM agrees with the matvec it
+    /// replaces", parameterized by format. Shapes deliberately include
+    /// ones that are not multiples of the 64x32 tile so the partial-tile
+    /// store path is exercised: a kernel that only handles whole tiles
+    /// corrupts the edges of a real prompt silently.
+    fn assert_mul_mm_sg_matches_matvec(
+        label: &str,
+        block_elems: usize,
+        block_bytes: usize,
+        seed: u32,
+        d: f32,
+        dmin: Option<f32>,
+        matvec: impl Fn(&[u8], &[f32], usize, usize) -> Result<Vec<f32>, MetalError>,
+        gemm: impl Fn(&[u8], &[f32], usize, usize, usize) -> Result<Vec<f32>, MetalError>,
+    ) {
+        for &(rows, cols, batch_size) in &[
+            (64usize, 512usize, 32usize), // exactly one tile
+            (9, 512, 7),                  // smaller than a tile in both dims
+            (70, 768, 33),                // one full tile plus a ragged edge
+        ] {
+            let blocks_per_row = cols / block_elems;
+            let row_bytes = blocks_per_row * block_bytes;
+            let weights = realistic_blocks(rows, blocks_per_row, block_bytes, seed, d, dmin);
+
+            let mut x_batch = Vec::with_capacity(batch_size * cols);
+            let mut expected = Vec::with_capacity(batch_size * rows);
+            for b in 0..batch_size {
+                let x: Vec<f32> = (0..cols)
+                    .map(|i| ((i + b * 23) as f32 * 0.027).sin())
+                    .collect();
+                let y = matvec(&weights, &x, rows, row_bytes).expect("matvec");
+                expected.extend_from_slice(&y);
+                x_batch.extend_from_slice(&x);
+            }
+
+            let got = gemm(&weights, &x_batch, rows, row_bytes, batch_size).expect("mul_mm_sg");
+            assert_eq!(
+                got.len(),
+                expected.len(),
+                "{label} {rows}x{cols}x{batch_size}"
+            );
+            let scale = expected.iter().fold(0f32, |m, v| m.max(v.abs()));
+            let tol = 1e-3 * scale.max(1.0);
+            for (i, (a, b)) in got.iter().zip(expected.iter()).enumerate() {
+                assert!(
+                    (a - b).abs() <= tol,
+                    "{label} {rows}x{cols}x{batch_size} idx {i}: gemm={a} matvec={b} (tol {tol})"
+                );
+            }
+        }
+    }
+
+    /// Q8_0 is a 32-element format, so it runs the shared GEMM body with
+    /// `NL = 2` — the path where `il` never advances and every iteration
+    /// steps a whole block. That is exactly the arithmetic this test
+    /// exists to pin down.
+    #[test]
+    #[ignore = "needs a real Metal-capable GPU; run manually with --ignored on Apple Silicon"]
+    fn launch_q8_0_mul_mm_sg_matches_the_matvec_it_replaces() {
+        assert_mul_mm_sg_matches_matvec(
+            "q8_0",
+            32,
+            34,
+            11,
+            0.01,
+            None,
+            |w, x, r, rb| launch_q8_0_matvec(w, x, r, rb),
+            launch_q8_0_mul_mm_sg,
+        );
+    }
+
+    /// Q4_0: the other `NL = 2` format, and the one whose dequant packs
+    /// two values per byte, so a wrong nibble mask shows up here.
+    #[test]
+    #[ignore = "needs a real Metal-capable GPU; run manually with --ignored on Apple Silicon"]
+    fn launch_q4_0_mul_mm_sg_matches_the_matvec_it_replaces() {
+        assert_mul_mm_sg_matches_matvec(
+            "q4_0",
+            32,
+            18,
+            13,
+            0.02,
+            None,
+            |w, x, r, rb| launch_q4_0_matvec(w, x, r, rb),
+            launch_q4_0_mul_mm_sg,
+        );
+    }
+
+    #[test]
+    #[ignore = "needs a real Metal-capable GPU; run manually with --ignored on Apple Silicon"]
+    fn launch_q5_k_mul_mm_sg_matches_the_matvec_it_replaces() {
+        assert_mul_mm_sg_matches_matvec(
+            "q5_k",
+            256,
+            176,
+            17,
+            0.008,
+            Some(0.003),
+            |w, x, r, rb| launch_q5_k_matvec(w, x, r, rb),
+            launch_q5_k_mul_mm_sg,
+        );
+    }
+
+    /// IQ4_XS reads its values from the IQ4 codebook rather than an affine
+    /// dequant, so this is the first codebook format on the batched path.
+    #[test]
+    #[ignore = "needs a real Metal-capable GPU; run manually with --ignored on Apple Silicon"]
+    fn launch_iq4_xs_mul_mm_sg_matches_the_matvec_it_replaces() {
+        assert_mul_mm_sg_matches_matvec(
+            "iq4_xs",
+            256,
+            136,
+            19,
+            0.0002,
+            None,
+            |w, x, r, rb| launch_iq4_xs_matvec(w, x, r, rb),
+            launch_iq4_xs_mul_mm_sg,
+        );
     }
 
     #[test]

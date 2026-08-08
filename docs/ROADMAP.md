@@ -55,6 +55,33 @@ each engine at its own default thread count), from
 - The serving suite's prompt is ~30 tokens and cannot see prefill. Use
   the engine table for it.
 
+## Direction
+
+Where the project should go next, beyond closing the measured gaps above.
+Roughly in priority order.
+
+1. **Run bigger models on the same hardware.** The headline goal: make
+   Qwen3 35B-A3B Q5 usable on a box that today only sensibly runs Q4, or
+   an 8B. This is the one that decides whether ferrox is worth choosing,
+   and most items below serve it.
+2. **RAM / VRAM optimization.** Residency planning already exists
+   (`ferrox inspect-plan`); what is missing is acting on it hard enough
+   to change which models fit — tighter KV (`turbo3`, quantized CTK),
+   streaming expert residency, and not materializing activations we do
+   not need.
+3. **Hybrid CPU/GPU, especially MoE.** Routed experts are the natural
+   split: hot experts resident on GPU, cold ones streamed or run on CPU.
+   `PlacementPlan` and `ExpertStore` are the groundwork. This is how
+   point 1 gets reached for MoE checkpoints.
+4. **CUDA performance.** No in-tree CUDA pin exists at all — the kernels
+   are written but unmeasured on real hardware. Needs a GPU host before
+   any claim can be made about it.
+5. **Tool calling** and **full OpenAI API compatibility.** See
+   [`API.md`](API.md) for the current matrix; grammar/JSON-schema
+   constrained decoding and MCP invocation are the gaps.
+6. **Docker images**, so none of the above requires a Rust toolchain to
+   evaluate.
+
 **Models**
 
 - Gemma-4 tokenizer (`gemma4`) + fair-chat pin (engine loads today)
@@ -67,11 +94,30 @@ each engine at its own default thread count), from
 
 **Serving**
 
+- Tool calling: OpenAI `tools` / `tool_choice` request + response shape
 - Full grammar / JSON schema constrained decoding
 - MCP tool invocation; Anthropic streaming + tools
+- Full OpenAI API surface (see [`API.md`](API.md) for what is missing)
+- Docker images (CPU / Metal / CUDA variants)
 - Continuous-batching multi-request throughput pin
 - Full KV layer offload; multi-GPU / tensor parallel / PD disaggregation
 
-**KV cache**
+**KV cache / memory**
 
 - `turbo3` dtype; Metal WHT on the CTK path
+- Act on `inspect-plan`'s residency plan: stream cold experts, bound the
+  KV budget, and report what a host can actually fit
+- Hybrid CPU/GPU expert placement for MoE (hot on GPU, cold on CPU or
+  streamed) — the main lever for running a larger model or a higher quant
+  on unchanged hardware
+
+**Correctness (blocking, ahead of further speed work)**
+
+- Gemma-2-2B Metal decode diverges after a few tokens
+  (`FERROX_METAL_ATTN=0` is correct, so it is in the Metal attention
+  path)
+- Gemma-3-1B Metal is wrong from the first token, and stays wrong with
+  `FERROX_METAL_ATTN=0` — a separate bug in the dense path
+- Neither benchmark harness inspects generated text, so both models
+  report healthy tok/s while producing garbage. Add an output-sanity
+  check to the suite

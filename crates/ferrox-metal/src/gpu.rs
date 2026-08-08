@@ -1219,9 +1219,8 @@ pub fn launch_q4_0_mul_mm(
 
     let weights_buf = resident_weight_buffer(device, weights)?;
     let out_elems = batch_size * rows;
-    let out_buf = device
-        .newBufferWithLength_options(out_elems * 4, MTLResourceOptions::StorageModeShared)
-        .ok_or(MetalError::BufferAllocFailed)?;
+    let out_scratch = borrow_scratch(device, out_elems * 4, MTLResourceOptions::StorageModeShared)?;
+    let out_buf = out_scratch.get();
 
     let cmd_buf = queue.commandBuffer().ok_or(MetalError::CommandFailed)?;
     let enc = cmd_buf
@@ -2285,6 +2284,104 @@ pub fn launch_q6_k_mul_mm_sg(
     )
 }
 
+/// Recycled scratch `MTLBuffer`s, keyed by exact byte length.
+///
+/// Every batched launch used to allocate its output and intermediates
+/// fresh and drop them on return: at batch 512 on an 8B model the FFN
+/// down-projection alone allocates and frees 28 MiB, and allocation
+/// accounts for roughly 318 ms of an 8B prefill. llama.cpp allocates
+/// nothing while encoding a graph — its buffers are kept alive across
+/// submissions (`ggml_metal_device_rsets_keep_alive`).
+///
+/// Reuse is safe because every launch here is synchronous: it commits
+/// and calls `waitUntilCompleted` before the guard drops, so the GPU is
+/// provably done with the buffer before it returns to the pool.
+struct ScratchPool {
+    free: HashMap<usize, Vec<Retained<ProtocolObject<dyn MTLBuffer>>>>,
+    bytes: usize,
+}
+
+// SAFETY: same justification as `SharedMetal` -- `MTLBuffer`s are safe
+// to share across threads; only `MTLCommandBuffer`/encoders are not.
+unsafe impl Send for ScratchPool {}
+
+static SCRATCH_POOL: Mutex<Option<ScratchPool>> = Mutex::new(None);
+
+/// Upper bound on pooled bytes. Past this, buffers are dropped on return
+/// rather than retained, so a one-off huge batch cannot pin memory for
+/// the life of the process.
+fn scratch_pool_budget_bytes() -> usize {
+    std::env::var("FERROX_METAL_SCRATCH_BUDGET_BYTES")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(768 * 1024 * 1024)
+}
+
+/// A scratch buffer borrowed from [`SCRATCH_POOL`], returned on drop.
+struct ScratchBuffer {
+    buf: Option<Retained<ProtocolObject<dyn MTLBuffer>>>,
+    bytes: usize,
+}
+
+impl ScratchBuffer {
+    fn get(&self) -> &ProtocolObject<dyn MTLBuffer> {
+        self.buf
+            .as_ref()
+            .expect("borrowed for the guard's lifetime")
+    }
+}
+
+impl Drop for ScratchBuffer {
+    fn drop(&mut self) {
+        let Some(buf) = self.buf.take() else { return };
+        let mut guard = match SCRATCH_POOL.lock() {
+            Ok(g) => g,
+            Err(_) => return,
+        };
+        let pool = guard.get_or_insert_with(|| ScratchPool {
+            free: HashMap::new(),
+            bytes: 0,
+        });
+        if pool.bytes + self.bytes > scratch_pool_budget_bytes() {
+            return; // over budget: let it go
+        }
+        pool.bytes += self.bytes;
+        pool.free.entry(self.bytes).or_default().push(buf);
+    }
+}
+
+/// A zero-initialisation-free scratch buffer of exactly `bytes` bytes.
+/// Contents are undefined — every caller either fully overwrites it with
+/// a kernel or copies into it first.
+fn borrow_scratch(
+    device: &Retained<ProtocolObject<dyn MTLDevice>>,
+    bytes: usize,
+    storage: MTLResourceOptions,
+) -> Result<ScratchBuffer, MetalError> {
+    // Private and Shared buffers are not interchangeable, so they are
+    // pooled under distinct keys: the low bit of the length is unused
+    // (every allocation here is a multiple of 4) and carries the mode.
+    let key = bytes | usize::from(storage.contains(MTLResourceOptions::StorageModePrivate));
+    if let Ok(mut guard) = SCRATCH_POOL.lock() {
+        if let Some(pool) = guard.as_mut() {
+            if let Some(buf) = pool.free.get_mut(&key).and_then(|v| v.pop()) {
+                pool.bytes = pool.bytes.saturating_sub(key);
+                return Ok(ScratchBuffer {
+                    buf: Some(buf),
+                    bytes: key,
+                });
+            }
+        }
+    }
+    let buf = device
+        .newBufferWithLength_options(bytes, storage)
+        .ok_or(MetalError::BufferAllocFailed)?;
+    Ok(ScratchBuffer {
+        buf: Some(buf),
+        bytes: key,
+    })
+}
+
 /// One quantized matrix bound for the simdgroup GEMM, as a descriptor
 /// so several can be encoded into a single command buffer.
 pub struct MulMmSgLaunch<'a> {
@@ -2410,31 +2507,33 @@ pub fn launch_dense_ffn_swiglu_batch(
 
     let ffn_elems = batch_size * gate.rows;
     // Gate / up / activation never leave the GPU, so they can be Private.
-    let mid = |n: usize| {
-        device
-            .newBufferWithLength_options(n * 4, MTLResourceOptions::StorageModePrivate)
-            .ok_or(MetalError::BufferAllocFailed)
-    };
+    // All four come from the scratch pool: at batch 512 on an 8B these
+    // are 28 MiB apiece and allocating them per layer dominated `setup`.
+    let mid = |n: usize| borrow_scratch(device, n * 4, MTLResourceOptions::StorageModePrivate);
     let gate_buf = mid(ffn_elems)?;
     let up_buf = mid(ffn_elems)?;
     let act_buf = mid(ffn_elems)?;
     let out_elems = batch_size * down.rows;
-    let out_buf = device
-        .newBufferWithLength_options(out_elems * 4, MTLResourceOptions::StorageModeShared)
-        .ok_or(MetalError::BufferAllocFailed)?;
+    let out_scratch = borrow_scratch(device, out_elems * 4, MTLResourceOptions::StorageModeShared)?;
+    let (gate_buf, up_buf, act_buf, out_buf) = (
+        gate_buf.get(),
+        up_buf.get(),
+        act_buf.get(),
+        out_scratch.get(),
+    );
 
     let cmd_buf = queue.commandBuffer().ok_or(MetalError::CommandFailed)?;
     let enc = cmd_buf
         .computeCommandEncoder()
         .ok_or(MetalError::CommandFailed)?;
-    encode_mul_mm_sg(&enc, device, gate, &gate_w, &x_buf, &gate_buf, batch_size)?;
-    encode_mul_mm_sg(&enc, device, up, &up_w, &x_buf, &up_buf, batch_size)?;
+    encode_mul_mm_sg(&enc, device, gate, &gate_w, &x_buf, gate_buf, batch_size)?;
+    encode_mul_mm_sg(&enc, device, up, &up_w, &x_buf, up_buf, batch_size)?;
     if gelu {
-        crate::elem::encode_gelu_mul(&enc, device, &gate_buf, &up_buf, &act_buf, ffn_elems as u32)?;
+        crate::elem::encode_gelu_mul(&enc, device, gate_buf, up_buf, act_buf, ffn_elems as u32)?;
     } else {
-        crate::elem::encode_silu_mul(&enc, device, &gate_buf, &up_buf, &act_buf, ffn_elems as u32)?;
+        crate::elem::encode_silu_mul(&enc, device, gate_buf, up_buf, act_buf, ffn_elems as u32)?;
     }
-    encode_mul_mm_sg(&enc, device, down, &down_w, &act_buf, &out_buf, batch_size)?;
+    encode_mul_mm_sg(&enc, device, down, &down_w, act_buf, out_buf, batch_size)?;
     enc.endEncoding();
     cmd_buf.commit();
     cmd_buf.waitUntilCompleted();
@@ -2485,9 +2584,8 @@ fn launch_k_quant_mul_mm_sg(
 
     let weights_buf = resident_weight_buffer(device, weights)?;
     let out_elems = batch_size * rows;
-    let out_buf = device
-        .newBufferWithLength_options(out_elems * 4, MTLResourceOptions::StorageModeShared)
-        .ok_or(MetalError::BufferAllocFailed)?;
+    let out_scratch = borrow_scratch(device, out_elems * 4, MTLResourceOptions::StorageModeShared)?;
+    let out_buf = out_scratch.get();
 
     let pipeline = ensure_pipeline(device, K_QUANT_MUL_MM_SG_KERNEL_SRC, fn_name)?;
     let setup_us = t_setup.elapsed().as_micros();
@@ -2501,7 +2599,7 @@ fn launch_k_quant_mul_mm_sg(
         enc.setComputePipelineState(&pipeline.0);
         enc.setBuffer_offset_atIndex(Some(&weights_buf.buffer), weights_buf.weight_offset, 0);
         enc.setBuffer_offset_atIndex(Some(&x_buf), 0, 1);
-        enc.setBuffer_offset_atIndex(Some(&out_buf), 0, 2);
+        enc.setBuffer_offset_atIndex(Some(out_buf), 0, 2);
         for (idx, mut v) in [
             (3usize, rows as u32),
             (4, cols as u32),

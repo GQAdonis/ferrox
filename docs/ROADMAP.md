@@ -126,11 +126,50 @@ once per expert. llama's `ggml_mul_mat_id` builds a token→expert map
 tokens routed to it, and scatters the results back. Porting that map is
 what makes MoE prefill batch at all.
 
-### 6. CUDA
+### 6. CUDA is measured now, and it is far worse than Metal
 
-Now buildable and measured on a rented RTX 4090 — see the CUDA table in
-[`RESULTS.md`](../benchmarks/RESULTS.md). Everything above is Metal/CPU
-work; the CUDA kernels have had no tuning pass at all.
+First run on real CUDA hardware (rented RTX 4090, driver 550.127.08,
+CUDA 12.4). Two blockers were fixed to get that far: the `cuda` feature
+did not compile at all, and `apply_batch` had no CUDA arm so batched
+prefill ran entirely on the CPU. What the numbers then showed, ferrox vs
+`llama-bench` on the same GGUF and GPU:
+
+| Workload | Gap (llama / ferrox) |
+|---|---|
+| `pp512` | 566× – 1359× |
+| `tg128` | 5.6× – 23.8× |
+
+This is not a tuning problem. CUDA has no batched GEMM (`mul_mm`) at all,
+so prefill is a per-position matvec even after the dispatch fix, and the
+matvec itself is far off llama's. Treat the CUDA backend as functional
+but unoptimized; it needs the same porting pass Metal has now had, and
+the ordering above (GEMM first, then residency, then MoE) applies
+unchanged.
+
+### Full ranked plan
+
+The complete gap analysis and porting plan — every item scored
+`(gap closed × rows affected) / effort`, each naming the llama.cpp
+function to port, the ferrox files to change, and the `ferrox bench`
+invocation that measures it — lives in
+[`.scratch/NOTES_LLAMA_PARITY_PLAN.md`](../.scratch/NOTES_LLAMA_PARITY_PLAN.md)
+and [`.scratch/NOTES_PP512_PLAN.md`](../.scratch/NOTES_PP512_PLAN.md).
+Top of the ranking, after what has landed:
+
+| # | Item | Axis | Score |
+|---|---|---|---|
+| P1 | Metal MoE `mul_mm_id` / `mul_mv_id` for every quant kind | MoE prefill + decode | 3.31 |
+| P2 | CPU Q4_K 4-row GEMM tile (`ggml_gemm_q4_K_8x4_q8_K`) | CPU prefill | 2.82 |
+| P3 | One command buffer per prefill layer, attention glue on-GPU | Metal prefill | 1.96 |
+| P4 | CPU token→expert bucketing | MoE, CPU prefill | 1.82 |
+| P5 | i8mm (SMMLA) GEMM tier — blocked on P2 | CPU prefill | 1.48 |
+
+P1 is the one structural gap left on Metal: ferrox's id-indexed MoE
+matvec exists only for Q4_0, so every Q4_K/Q6_K/Q8_0 MoE falls back to
+`5 × top_k` dispatches against `4 × top_k` freshly allocated buffers.
+llama gets every quant kind from one generic `kernel_mul_mv_id` wrapper
+that calls the *unmodified* per-quant matvec body through a template
+parameter — one line per format, no new kernel bodies.
 
 ## Correctness (blocking — these rows are timings of the wrong computation)
 

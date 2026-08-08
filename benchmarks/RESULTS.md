@@ -53,7 +53,7 @@ pinning both to the same count does not make the comparison fairer.
 | Mistral-7B-Instruct-v0.2 Q4_K_M | metal | tg128 | **19.65** | **17.96** | 🟢 **0.91×** |
 | OLMoE-1B-7B-0924 Q4_0 | cpu | pp512 | **69.24** | **288.12** | 🔴 **4.16×** |
 | OLMoE-1B-7B-0924 Q4_0 | cpu | tg128 | **42.62** | **89.93** | 🔴 **2.11×** |
-| OLMoE-1B-7B-0924 Q4_0 | metal | pp512 | **100.42** | **1543.22** | 🔴 **15.37×** |
+| OLMoE-1B-7B-0924 Q4_0 | metal | pp512 | **589.14** | **1558.81** | 🔴 **2.65×** |
 | OLMoE-1B-7B-0924 Q4_0 | metal | tg128 | **105.20** | **140.99** | 🔴 **1.34×** |
 | Phi-3-mini-4k-Instruct Q4 | cpu | pp512 | **16.86** | **82.76** | 🔴 **4.91×** |
 | Phi-3-mini-4k-Instruct Q4 | cpu | tg128 | **13.38** | **22.31** | 🔴 **1.67×** |
@@ -69,7 +69,7 @@ pinning both to the same count does not make the comparison fairer.
 | Qwen2.5-0.5B-Instruct Q8_0 | metal | tg128 | **94.97** | **65.09** | 🟢 **0.69×** |
 | Qwen1.5-MoE-A2.7B Q4_K_M | cpu | pp512 | **28.46** | **123.41** | 🔴 **4.34×** |
 | Qwen1.5-MoE-A2.7B Q4_K_M | cpu | tg128 | **21.45** | **46.75** | 🔴 **2.18×** |
-| Qwen1.5-MoE-A2.7B Q4_K_M | metal | pp512 | **33.99** | **671.46** | 🔴 **19.75×** |
+| Qwen1.5-MoE-A2.7B Q4_K_M | metal | pp512 | **35.95** | **742.49** | 🔴 **20.65×** |
 | Qwen1.5-MoE-A2.7B Q4_K_M | metal | tg128 | **23.21** | **62.60** | 🔴 **2.70×** |
 | Qwen3-0.6B Q8_0 | cpu | pp512 | **97.71** | **421.05** | 🔴 **4.31×** |
 | Qwen3-0.6B Q8_0 | cpu | tg128 | **52.84** | **69.97** | 🔴 **1.32×** |
@@ -77,7 +77,7 @@ pinning both to the same count does not make the comparison fairer.
 | Qwen3-0.6B Q8_0 | metal | tg128 | **89.85** | **61.33** | 🟢 **0.68×** |
 | SmolLM2-135M-Instruct Q8_0 | cpu | pp512 | **283.69** | **1225.64** | 🔴 **4.32×** |
 | SmolLM2-135M-Instruct Q8_0 | cpu | tg128 | **120.68** | **158.93** | 🔴 **1.32×** |
-| SmolLM2-135M-Instruct Q8_0 | metal | pp512 | **1459.15** | **11865.21** | 🔴 **8.13×** |
+| SmolLM2-135M-Instruct Q8_0 | metal | pp512 | **4111.48** | **12219.05** | 🔴 **2.97×** |
 | SmolLM2-135M-Instruct Q8_0 | metal | tg128 | **200.04** | **137.52** | 🟢 **0.69×** |
 | TinyLlama-1.1B-Chat-v1.0 Q8_0 | cpu | pp512 | **105.54** | **311.19** | 🔴 **2.95×** |
 | TinyLlama-1.1B-Chat-v1.0 Q8_0 | cpu | tg128 | **49.25** | **77.21** | 🔴 **1.57×** |
@@ -161,9 +161,9 @@ Pins that used `llama-cli` or rejected options are omitted.
 
 ## Open
 
-1. **Prefill is the largest gap in the project.** Engine `pp512` (re-rendered 2026-08-08): CPU ~3–5× behind llama.cpp; Metal dense still multi-× on small Q8_0 (Qwen2.5-0.5B **20.55×**, Gemma-3-1B **20.83×**, Qwen3 **18.00×**) while post-`mul_mm_sg` rows improved a lot (SmolLM2 metal **8.13×** / 1459 vs 11865, IQ4_XS **2.78×**, TinyLlama metal **2.64×**, 8B metal **1.47×**). Worst Metal prefill is still MoE (Qwen1.5-MoE **19.75×**, OLMoE **11.32×**). CPU still needs Q4_K batch GEMM (WIP in tree); Metal MoE needs real `mul_mm_id`. See `docs/ROADMAP.md`.
-2. **Metal decode is healthy.** ferrox leads or ties on most dense rows (Qwen2.5-0.5B **0.69×**, SmolLM2 **0.69×**, Qwen3 **0.68×**, 8B **0.98×**). Losses are MoE/Gemma shapes below.
-3. **Qwen1.5-MoE metal tg128 2.70× is the worst decode row.** OLMoE metal 1.34×, Gemma-2-2B metal 1.22×.
+1. **Prefill is the largest gap in the project.** Quiet-host re-measure (2026-08-08): SmolLM2 metal pp512 **2.97×** (was 8.13×; multi-layer prefill stack), OLMoE metal **2.65×** (was ~11–15×; gather/`mul_mm_sg` + Q4_0 `mul_mv_id`). Qwen1.5-MoE metal still **20.65×** (mixed Q4_K/Q8_0 `matvec_id` landed; still needs fused `kernel_mul_mm_id`). Tiny Q8_0 dense rows still multi-×. See `docs/ROADMAP.md`.
+2. **Metal decode is healthy** on dense models with answer parity (SmolLM2 / Llama / Qwen MoE / OLMoE greedy “Paris” OK). **Gemma-2 Metal greedy is non-claimable** until output is sane (2026-08-08: word salad / `*` spam at `-ngl 99`; do not close speed rows).
+3. **Qwen1.5-MoE metal tg128 ~2.70×** remains the worst decode row; answers OK after shexp + `norm_topk_prob=false` + `add_bos=false`.
 4. **CPU decode is behind everywhere** (1.33×–2.60×). Two distinct causes measured: ~2× lower per-thread GEMV throughput, and a parallel-scaling ceiling at ~1.9× total where llama keeps scaling (rayon fork-join per matvec vs llama's persistent spin-barrier pool).
 5. **Serving pins re-measured** with neither engine's threads forced. Every CPU row is now a loss (1.35×–2.57×); the five previous CPU "wins" were artifacts of the old `-t 10`. ferrox's own throughput rose slightly in every row — llama's roughly doubled. Metal barely moved, as expected at `-ngl 99`, except the 8B lead (0.92× → 1.05×).
 6. CUDA — no in-tree pin; skipped on darwin via `--fit-host`. Needs a GPU host.

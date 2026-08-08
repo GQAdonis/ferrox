@@ -599,6 +599,21 @@ pub(crate) fn encode_argmax(
     Ok(())
 }
 
+/// Front-load elementwise pipelines used by [`crate::attn::launch_prefill_dense_layer`].
+pub(crate) fn warm_prefill_elem_pipelines(
+    device: &Retained<ProtocolObject<dyn MTLDevice>>,
+    gelu_ffn: bool,
+) -> Result<(), MetalError> {
+    ensure_pipeline(device, RMS_NORM_KERNEL_SRC, "rms_norm_f32")?;
+    ensure_pipeline(device, VEC_ADD_KERNEL_SRC, "vec_add_f32")?;
+    if gelu_ffn {
+        ensure_pipeline(device, GELU_MUL_KERNEL_SRC, "gelu_mul_f32")?;
+    } else {
+        ensure_pipeline(device, SILU_MUL_KERNEL_SRC, "silu_mul_f32")?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

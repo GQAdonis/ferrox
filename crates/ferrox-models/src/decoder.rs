@@ -146,6 +146,87 @@ pub struct MoeWeights {
     /// `PlacementPlan::from_budget` needs to prioritize actually-hot
     /// experts for GPU residency instead of guessing by index.
     pub activation_counts: Vec<AtomicU64>,
+    /// Verified-at-load contiguous expert planes for Metal MoE
+    /// (`mul_mm_sg` gather/id). Built in `loader` when every routed expert
+    /// is mmap-backed with a simdgroup-GEMM quant (Q4_0 / Q4_K / Q8_0 / …)
+    /// and back-to-back gate/up/down slices. Gate/up/down kinds may differ
+    /// (Qwen1.5-MoE: Q4_K gate/up + Q8_0 down). `None` for store-backed,
+    /// F32, or non-contiguous layouts.
+    #[cfg(feature = "metal")]
+    pub packed_q4: Option<MoePackedQ4Planes>,
+}
+
+/// Load-time validated contiguous expert tensor planes (any `mul_mm_sg` quant).
+#[cfg(feature = "metal")]
+pub struct MoePackedQ4Planes {
+    gate: ferrox_core::weight_matrix::WeightBytes,
+    up: ferrox_core::weight_matrix::WeightBytes,
+    down: ferrox_core::weight_matrix::WeightBytes,
+    gate_stride: usize,
+    up_stride: usize,
+    down_stride: usize,
+    n_experts: usize,
+    ffn_rows: usize,
+    hidden_rows: usize,
+    gate_row_bytes: usize,
+    down_row_bytes: usize,
+    gate_kind: &'static str,
+    up_kind: &'static str,
+    down_kind: &'static str,
+}
+
+#[cfg(feature = "metal")]
+impl MoePackedQ4Planes {
+    pub(crate) fn new(
+        gate: ferrox_core::weight_matrix::WeightBytes,
+        up: ferrox_core::weight_matrix::WeightBytes,
+        down: ferrox_core::weight_matrix::WeightBytes,
+        gate_stride: usize,
+        up_stride: usize,
+        down_stride: usize,
+        n_experts: usize,
+        ffn_rows: usize,
+        hidden_rows: usize,
+        gate_kind: &'static str,
+        up_kind: &'static str,
+        down_kind: &'static str,
+    ) -> Self {
+        Self {
+            gate,
+            up,
+            down,
+            gate_stride,
+            up_stride,
+            down_stride,
+            n_experts,
+            ffn_rows,
+            hidden_rows,
+            gate_row_bytes: gate_stride / ffn_rows,
+            down_row_bytes: down_stride / hidden_rows,
+            gate_kind,
+            up_kind,
+            down_kind,
+        }
+    }
+
+    pub fn view(&self) -> ferrox_metal::gpu::MoePackedQ4<'_> {
+        ferrox_metal::gpu::MoePackedQ4 {
+            gate: self.gate.as_slice(),
+            up: self.up.as_slice(),
+            down: self.down.as_slice(),
+            gate_stride: self.gate_stride,
+            up_stride: self.up_stride,
+            down_stride: self.down_stride,
+            n_experts: self.n_experts,
+            ffn_rows: self.ffn_rows,
+            hidden_rows: self.hidden_rows,
+            gate_row_bytes: self.gate_row_bytes,
+            down_row_bytes: self.down_row_bytes,
+            gate_kind: self.gate_kind,
+            up_kind: self.up_kind,
+            down_kind: self.down_kind,
+        }
+    }
 }
 
 impl MoeWeights {
@@ -402,6 +483,8 @@ impl Decoder {
                 shared_expert_gate: None,
                 norm_weight: vec![1.0; hidden],
                 activation_counts,
+                #[cfg(feature = "metal")]
+                packed_q4: None,
             };
 
             layers.push(LayerWeights { attn, moe });
@@ -634,6 +717,152 @@ impl Decoder {
             })
     }
 
+    /// One-CB dense prefill (`mul_mm_sg` stack) when QKV bias / QK-norm
+    /// are absent — those need host proj or [`AttnExtras`].
+    #[cfg(feature = "metal")]
+    fn metal_prefill_dense_layer_eligible(layer: &LayerWeights) -> bool {
+        Self::is_dense_layer(layer)
+            && layer.attn.q_bias.is_none()
+            && layer.attn.k_bias.is_none()
+            && layer.attn.v_bias.is_none()
+            && layer.attn.q_norm.is_none()
+            && layer.attn.k_norm.is_none()
+    }
+
+    #[cfg(feature = "metal")]
+    fn metal_prefill_dense_swa_fits(
+        &self,
+        layer_idx: usize,
+        start_pos: usize,
+        batch_size: usize,
+    ) -> bool {
+        match self.config.layer_sliding_window(layer_idx) {
+            Some(window) => start_pos + batch_size <= window,
+            None => true,
+        }
+    }
+
+    /// Length of a consecutive run of Metal dense-prefill layers from
+    /// `start`, or `None` when fewer than two layers qualify.
+    #[cfg(feature = "metal")]
+    fn metal_prefill_dense_stack_run_len(
+        &self,
+        start: usize,
+        start_pos: usize,
+        batch_size: usize,
+        kv_caches: &[KvCache],
+        metal_kvs: Option<&[ferrox_metal::attn::MetalKvBuffers]>,
+    ) -> Option<usize> {
+        let metal_kvs = metal_kvs?;
+        let mut run = 0usize;
+        for li in start..self.layers.len() {
+            let layer = &self.layers[li];
+            let cache = &kv_caches[li];
+            if !Self::metal_prefill_dense_layer_eligible(layer) {
+                break;
+            }
+            if !self.metal_prefill_dense_swa_fits(li, start_pos, batch_size) {
+                break;
+            }
+            if metal_kvs[li].seq_len != cache.seq_len || start_pos != cache.seq_len {
+                break;
+            }
+            let ExpertBacking::Resident(experts) = &layer.moe.experts else {
+                break;
+            };
+            let ex = &experts[0];
+            let ok = layer.attn.q_proj.mul_mm_sg_launch().is_some()
+                && layer.attn.k_proj.mul_mm_sg_launch().is_some()
+                && layer.attn.v_proj.mul_mm_sg_launch().is_some()
+                && layer.attn.o_proj.mul_mm_sg_launch().is_some()
+                && ex.gate.mul_mm_sg_launch().is_some()
+                && ex.up.mul_mm_sg_launch().is_some()
+                && ex.down.mul_mm_sg_launch().is_some();
+            if !ok {
+                break;
+            }
+            run += 1;
+        }
+        (run >= 2).then_some(run)
+    }
+
+    /// Try [`ferrox_metal::attn::launch_prefill_dense_stack`] for
+    /// `run_len` layers starting at `start`. Advances host + Metal KV
+    /// on success.
+    #[cfg(feature = "metal")]
+    fn try_metal_prefill_dense_stack(
+        &self,
+        start: usize,
+        run_len: usize,
+        hidden_batch: &[f32],
+        start_pos: usize,
+        batch_size: usize,
+        n_heads: usize,
+        metal_kvs: &mut [ferrox_metal::attn::MetalKvBuffers],
+        kv_caches: &mut [KvCache],
+    ) -> Option<Vec<f32>> {
+        let gelu = matches!(
+            self.config.ffn_activation,
+            crate::config::FfnActivation::Gelu
+        );
+        let mut prefill_layers = Vec::with_capacity(run_len);
+        let mut rope_thetas = Vec::with_capacity(run_len);
+        for li in start..start + run_len {
+            let layer = &self.layers[li];
+            layer.moe.record_activations(&[0]);
+            let ExpertBacking::Resident(experts) = &layer.moe.experts else {
+                return None;
+            };
+            let ex = &experts[0];
+            let (q, k, v, o, gate, up, down) = (
+                layer.attn.q_proj.mul_mm_sg_launch()?,
+                layer.attn.k_proj.mul_mm_sg_launch()?,
+                layer.attn.v_proj.mul_mm_sg_launch()?,
+                layer.attn.o_proj.mul_mm_sg_launch()?,
+                ex.gate.mul_mm_sg_launch()?,
+                ex.up.mul_mm_sg_launch()?,
+                ex.down.mul_mm_sg_launch()?,
+            );
+            prefill_layers.push(ferrox_metal::attn::PrefillDenseLayerMetal {
+                attn_norm_w: &layer.attn.norm_weight,
+                ffn_norm_w: &layer.moe.norm_weight,
+                q,
+                k,
+                v,
+                o,
+                gate,
+                up,
+                down,
+                post_attn_norm: layer.attn.post_attn_norm.as_deref(),
+                post_ffn_norm: layer.attn.post_ffn_norm.as_deref(),
+                layer_idx: li as u32,
+            });
+            rope_thetas.push(self.config.layer_rope_theta(li));
+        }
+        let kvs = &mut metal_kvs[start..start + run_len];
+        let h_out = ferrox_metal::attn::launch_prefill_dense_stack(
+            hidden_batch,
+            &prefill_layers,
+            kvs,
+            n_heads,
+            batch_size,
+            self.metal_rope_layout(),
+            &rope_thetas,
+            self.config.rope_freqs.as_deref(),
+            start_pos,
+            self.config.rms_norm_eps,
+            gelu,
+            self.config.attn_logit_softcap,
+        )
+        .ok()?;
+        for cache in &mut kv_caches[start..start + run_len] {
+            cache
+                .advance_len(batch_size)
+                .expect("unbounded/planned KvCache growth is infallible");
+        }
+        Some(h_out)
+    }
+
     /// MoE layer eligible for resident Metal decode (attn+router+experts
     /// without host residual ping-pong). Requires SwiGLU, no shared
     /// experts, Resident expert backing, and Metal router/QKV/O.
@@ -726,135 +955,15 @@ impl Decoder {
     }
 
     /// Contiguous Q4_0 expert planes for llama-style `mul_mv_id` MoE.
-    /// Fast path: experts are mmap-packed by the loader; validate first + last
-    /// only (full walk was ~64 checks × 16 layers / token on OLMoE).
     #[cfg(feature = "metal")]
-    fn packed_q4_moe_experts(
-        experts: &[ExpertWeights],
-    ) -> Option<ferrox_metal::gpu::MoePackedQ4<'_>> {
-        if experts.is_empty() {
-            return None;
-        }
-        let gate0 = match &experts[0].gate {
-            WeightMatrix::Quantized {
-                data,
-                rows,
-                kind: ferrox_core::QuantKind::Q4_0,
-                ..
-            } => (data.as_slice(), *rows),
-            _ => return None,
-        };
-        let up0 = match &experts[0].up {
-            WeightMatrix::Quantized {
-                data,
-                kind: ferrox_core::QuantKind::Q4_0,
-                ..
-            } => data.as_slice(),
-            _ => return None,
-        };
-        let down0 = match &experts[0].down {
-            WeightMatrix::Quantized {
-                data,
-                rows,
-                kind: ferrox_core::QuantKind::Q4_0,
-                ..
-            } => (data.as_slice(), *rows),
-            _ => return None,
-        };
-        let gate_stride = gate0.0.len();
-        let up_stride = up0.len();
-        let down_stride = down0.0.len();
-        if gate_stride == 0 || up_stride != gate_stride || down_stride == 0 {
-            return None;
-        }
-        let n = experts.len();
-        // Contiguity: expert i's gate starts at gate0 + i*stride (same for up/down).
-        let last = n - 1;
-        let (
-            WeightMatrix::Quantized {
-                data: gd,
-                kind: ferrox_core::QuantKind::Q4_0,
-                ..
-            },
-            WeightMatrix::Quantized {
-                data: ud,
-                kind: ferrox_core::QuantKind::Q4_0,
-                ..
-            },
-            WeightMatrix::Quantized {
-                data: dd,
-                kind: ferrox_core::QuantKind::Q4_0,
-                ..
-            },
-        ) = (&experts[last].gate, &experts[last].up, &experts[last].down)
-        else {
-            return None;
-        };
-        let g = gd.as_slice();
-        let u = ud.as_slice();
-        let d = dd.as_slice();
-        if g.len() != gate_stride
-            || u.len() != up_stride
-            || d.len() != down_stride
-            || g.as_ptr() != unsafe { gate0.0.as_ptr().add(last * gate_stride) }
-            || u.as_ptr() != unsafe { up0.as_ptr().add(last * up_stride) }
-            || d.as_ptr() != unsafe { down0.0.as_ptr().add(last * down_stride) }
-        {
-            return None;
-        }
-        // Midpoint spot-check (catches sparse/shuffled banks that still
-        // align first+last by chance).
-        if n > 2 {
-            let mid = n / 2;
-            let (
-                WeightMatrix::Quantized {
-                    data: gd,
-                    kind: ferrox_core::QuantKind::Q4_0,
-                    ..
-                },
-                WeightMatrix::Quantized {
-                    data: ud,
-                    kind: ferrox_core::QuantKind::Q4_0,
-                    ..
-                },
-                WeightMatrix::Quantized {
-                    data: dd,
-                    kind: ferrox_core::QuantKind::Q4_0,
-                    ..
-                },
-            ) = (&experts[mid].gate, &experts[mid].up, &experts[mid].down)
-            else {
-                return None;
-            };
-            if gd.as_slice().as_ptr() != unsafe { gate0.0.as_ptr().add(mid * gate_stride) }
-                || ud.as_slice().as_ptr() != unsafe { up0.as_ptr().add(mid * up_stride) }
-                || dd.as_slice().as_ptr() != unsafe { down0.0.as_ptr().add(mid * down_stride) }
-            {
-                return None;
-            }
-        }
-        let gate = unsafe { std::slice::from_raw_parts(gate0.0.as_ptr(), n * gate_stride) };
-        let up = unsafe { std::slice::from_raw_parts(up0.as_ptr(), n * up_stride) };
-        let down = unsafe { std::slice::from_raw_parts(down0.0.as_ptr(), n * down_stride) };
-        let gate_row_bytes = gate_stride / gate0.1;
-        let down_row_bytes = down_stride / down0.1;
-        Some(ferrox_metal::gpu::MoePackedQ4 {
-            gate,
-            up,
-            down,
-            gate_stride,
-            up_stride,
-            down_stride,
-            n_experts: n,
-            ffn_rows: gate0.1,
-            hidden_rows: down0.1,
-            gate_row_bytes,
-            down_row_bytes,
-        })
+    fn moe_packed_q4(moe: &MoeWeights) -> Option<ferrox_metal::gpu::MoePackedQ4<'_>> {
+        moe.packed_q4.as_ref().map(MoePackedQ4Planes::view)
     }
 
     /// Prefill MoE FFN on Metal: host route over T, then one packed-id CB
-    /// (`launch_moe_prefill_q4_0`). Returns FFN outs `[T, H]` or `None`.
+    /// (`launch_moe_prefill_q4_0`). Shared experts (if any) run as dense
+    /// batch FFN on the host/GPU path afterwards — not through `mul_mm_id`.
+    /// Returns FFN outs `[T, H]` or `None`.
     #[cfg(feature = "metal")]
     fn try_metal_moe_prefill_batch(
         layer: &LayerWeights,
@@ -872,15 +981,14 @@ impl Decoder {
                 crate::config::FfnActivation::Swiglu | crate::config::FfnActivation::SwigluFused
             )
             || !matches!(config.moe.gating, ferrox_moe::GatingFunction::Softmax)
-            || !layer.moe.shared_experts.is_empty()
             || config.moe.expert_group_count.is_some()
         {
             return None;
         }
-        let ExpertBacking::Resident(experts) = &layer.moe.experts else {
+        let ExpertBacking::Resident(_) = &layer.moe.experts else {
             return None;
         };
-        let packed = Self::packed_q4_moe_experts(experts)?;
+        let packed = Self::moe_packed_q4(&layer.moe)?;
         let top_k = config.moe.n_experts_active;
         if top_k == 0 || top_k > 8 || packed.hidden_rows != hidden_dim {
             return None;
@@ -900,7 +1008,7 @@ impl Decoder {
                 route.push(w);
             }
         }
-        match ferrox_metal::gpu::launch_moe_prefill_q4_0(
+        let mut out = match ferrox_metal::gpu::launch_moe_prefill_q4_0(
             normed2_batch,
             batch_size,
             &packed,
@@ -908,10 +1016,78 @@ impl Decoder {
             &route,
             top_k,
         ) {
-            Ok(out) => Some(out),
+            Ok(out) => out,
             Err(e) => {
                 eprintln!("ferrox: Metal MoE prefill failed, CPU fallback: {e}");
+                return None;
+            }
+        };
+        Self::accumulate_shared_experts_batch(
+            layer,
+            normed2_batch,
+            batch_size,
+            hidden_dim,
+            &mut out,
+        );
+        Some(out)
+    }
+
+    /// Shared expert as dense batch FFN (llama qwen2moe: not through
+    /// `mul_mat_id`). Optional sigmoid gate scales per token.
+    fn accumulate_shared_experts_batch(
+        layer: &LayerWeights,
+        normed2_batch: &[f32],
+        batch_size: usize,
+        hidden_dim: usize,
+        acc: &mut [f32],
+    ) {
+        for shex in &layer.moe.shared_experts {
+            // Prefer one Metal FFN CB (gate∥up→SiLU→down) over three
+            // `apply_batch` round-trips — Qwen shexp is 4× routed width.
+            #[cfg(feature = "metal")]
+            let down = if ferrox_core::metal_dense_enabled() && batch_size >= 4 {
+                match (
+                    shex.gate.mul_mm_sg_launch(),
+                    shex.up.mul_mm_sg_launch(),
+                    shex.down.mul_mm_sg_launch(),
+                ) {
+                    (Some(g), Some(u), Some(d)) => ferrox_metal::gpu::launch_dense_ffn_swiglu_batch(
+                        &g,
+                        &u,
+                        &d,
+                        normed2_batch,
+                        batch_size,
+                        false,
+                    )
+                    .ok(),
+                    _ => None,
+                }
+            } else {
                 None
+            };
+            #[cfg(not(feature = "metal"))]
+            let down: Option<Vec<f32>> = None;
+            let down = down.unwrap_or_else(|| {
+                let gate = shex.gate.apply_batch(normed2_batch, batch_size);
+                let up = shex.up.apply_batch(normed2_batch, batch_size);
+                let activated = ferrox_core::matmul::swiglu(&gate, &up);
+                shex.down.apply_batch(&activated, batch_size)
+            });
+            if let Some(gate_w) = &layer.moe.shared_expert_gate {
+                for b in 0..batch_size {
+                    let x = &normed2_batch[b * hidden_dim..(b + 1) * hidden_dim];
+                    let logit: f32 = gate_w.iter().zip(x.iter()).map(|(g, v)| g * v).sum();
+                    let scale = 1.0 / (1.0 + (-logit).exp());
+                    let out = &down[b * hidden_dim..(b + 1) * hidden_dim];
+                    let row = &mut acc[b * hidden_dim..(b + 1) * hidden_dim];
+                    for (a, &o) in row.iter_mut().zip(out.iter()) {
+                        *a += scale * o;
+                    }
+                }
+            } else {
+                for (a, &o) in acc.iter_mut().zip(down.iter()) {
+                    *a += o;
+                }
             }
         }
     }
@@ -1231,11 +1407,11 @@ impl Decoder {
                         let mut moe_layers = Vec::with_capacity(self.layers.len());
                         let mut ok = true;
                         for layer in &self.layers {
-                            let ExpertBacking::Resident(experts) = &layer.moe.experts else {
+                            let ExpertBacking::Resident(_) = &layer.moe.experts else {
                                 ok = false;
                                 break;
                             };
-                            let Some(packed) = Self::packed_q4_moe_experts(experts) else {
+                            let Some(packed) = Self::moe_packed_q4(&layer.moe) else {
                                 ok = false;
                                 break;
                             };
@@ -1676,9 +1852,9 @@ impl Decoder {
                                                     self.config.moe.gating,
                                                     ferrox_moe::GatingFunction::Softmax
                                                 ) && match &layer.moe.experts {
-                                                    ExpertBacking::Resident(experts) => {
+                                                    ExpertBacking::Resident(_) => {
                                                         if let Some(packed) =
-                                                            Self::packed_q4_moe_experts(experts)
+                                                            Self::moe_packed_q4(&layer.moe)
                                                         {
                                                             match ferrox_metal::attn::launch_moe_decode_layer_fused(
                                                                 &layer.attn.norm_weight,
@@ -2228,7 +2404,7 @@ impl Decoder {
     /// llama.cpp `mul_mat_id` style: shared Q8 act + flat rayon over
     /// `(slot, row_pair)` for gate∥up (2-row SDOT), then SwiGLU, then
     /// per-slot down. One outer fork-join — no nested `apply_cpu_q8`.
-    fn try_cpu_moe_mul_mat_id(
+    fn cpu_moe_topk_parallel_slots(
         experts: &[ExpertWeights],
         normed2: &[f32],
         decision: &ferrox_moe::RoutingDecision,
@@ -2468,7 +2644,7 @@ impl Decoder {
                 .unwrap_or(true);
             if let (true, ExpertBacking::Resident(experts)) = (all_cpu, &layer.moe.experts) {
                 if let Some(outs) =
-                    Self::try_cpu_moe_mul_mat_id(experts, normed2, &decision, hidden_dim)
+                    Self::cpu_moe_topk_parallel_slots(experts, normed2, &decision, hidden_dim)
                 {
                     outs
                 } else {
@@ -2609,9 +2785,10 @@ impl Decoder {
 
     /// CPU MoE prefill: bucket tokens by expert, then one
     /// `apply_batch` per expert with tokens instead of per-token
-    /// `combine_ffn_outputs_for_position`. `None` when gates fail
-    /// (small batch, dense, Metal preferred, shared experts, non-SwiGLU,
-    /// non-resident, or any GPU-placed expert).
+    /// `combine_ffn_outputs_for_position`. Shared experts append via
+    /// [`Self::accumulate_shared_experts_batch`]. `None` when gates fail
+    /// (small batch, dense, Metal preferred, non-SwiGLU, non-resident,
+    /// or any GPU-placed expert).
     fn moe_ffn_batch(
         layer: &LayerWeights,
         normed2_batch: &[f32],
@@ -2628,9 +2805,6 @@ impl Decoder {
         // (`try_metal_moe_prefill_batch`); do not steal the path.
         #[cfg(feature = "metal")]
         if ferrox_core::metal_dense_enabled() {
-            return None;
-        }
-        if !layer.moe.shared_experts.is_empty() || layer.moe.shared_expert_gate.is_some() {
             return None;
         }
         if !matches!(
@@ -2704,6 +2878,14 @@ impl Decoder {
                 }
             }
         }
+
+        Self::accumulate_shared_experts_batch(
+            layer,
+            normed2_batch,
+            batch_size,
+            hidden_dim,
+            &mut acc,
+        );
         Some(acc)
     }
 
@@ -2928,26 +3110,54 @@ impl Decoder {
             }
         }
 
-        for (l, (layer, cache)) in self.layers.iter().zip(kv_caches.iter_mut()).enumerate() {
+        let n_layers = self.layers.len();
+        let mut l = 0usize;
+        while l < n_layers {
+            let layer = &self.layers[l];
             let q_width = n_heads * head_dim;
             let kv_width = n_kv_heads * head_dim;
+
+            // Multi-layer dense prefill: one CB, activations stay on GPU.
+            #[cfg(feature = "metal")]
+            if use_metal_attn && batch_size >= 4 {
+                if let Some(guard) = metal_kv_guard.as_mut() {
+                    if let Some(metal_kvs) = guard.as_mut() {
+                        if let Some(run_len) = self.metal_prefill_dense_stack_run_len(
+                            l,
+                            start_pos,
+                            batch_size,
+                            kv_caches,
+                            Some(metal_kvs.as_slice()),
+                        ) {
+                            if let Some(h_out) = self.try_metal_prefill_dense_stack(
+                                l,
+                                run_len,
+                                &hidden_batch,
+                                start_pos,
+                                batch_size,
+                                n_heads,
+                                metal_kvs,
+                                kv_caches,
+                            ) {
+                                hidden_batch = h_out;
+                                l += run_len;
+                                continue;
+                            }
+                        }
+                    }
+                }
+            }
+
+            let cache = &mut kv_caches[l];
 
             // One-CB dense prefill (RMSNorm→QKV GEMM→attn→O→FFN) when every
             // projection has mul_mm_sg and the layer has no QKV bias / QK-norm.
             #[cfg(feature = "metal")]
             if use_metal_attn
                 && batch_size >= 4
-                && Self::is_dense_layer(layer)
-                && layer.attn.q_bias.is_none()
-                && layer.attn.k_bias.is_none()
-                && layer.attn.v_bias.is_none()
-                && layer.attn.q_norm.is_none()
-                && layer.attn.k_norm.is_none()
+                && Self::metal_prefill_dense_layer_eligible(layer)
             {
-                let swa_fits = match self.config.layer_sliding_window(l) {
-                    Some(window) => start_pos + batch_size <= window,
-                    None => true,
-                };
+                let swa_fits = self.metal_prefill_dense_swa_fits(l, start_pos, batch_size);
                 if swa_fits {
                     if let Some(guard) = metal_kv_guard.as_mut() {
                         if let Some(metal_kvs) = guard.as_mut() {
@@ -3002,6 +3212,7 @@ impl Decoder {
                                         "unbounded/planned KvCache growth is infallible",
                                     );
                                     hidden_batch = h_out;
+                                    l += 1;
                                     continue;
                                 }
                             }
@@ -3270,6 +3481,7 @@ impl Decoder {
                             }
                         }
                     }
+                    l += 1;
                     continue;
                 }
             }
@@ -3456,6 +3668,7 @@ impl Decoder {
                     }
                 }
             }
+            l += 1;
         }
 
         hidden_batch

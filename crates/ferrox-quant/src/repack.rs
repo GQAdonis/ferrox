@@ -3,14 +3,16 @@
 //! - Q4_K: packs 8 rows into `block_q4_Kx8` (`make_block_q4_Kx8`).
 //! - Q8_0: packs 4 rows into `block_q8_0x4` (`make_block_q8_0x4`) with
 //!   4-byte interleave for NEON SDOT `ggml_gemv_q8_0_4x4_q8_0`.
+//! - Q4_0: packs 4 rows into `block_q4_0x4` (`make_block_q4_0x4`) with
+//!   4-byte interleave + XOR `0x88888888` for `ggml_gemv_q4_0_4x4_q8_0`.
 //!
 //! Gated on `FERROX_CPU_INT_DOT`, which `ferrox` and `ferrox-server`
 //! turn on by default (`=0` opts out); off in the library so golden
 //! cross-validation stays reference-exact.
 
 use crate::{
-    Q8Activations, Q8KActivations, Q4_K_BLOCK_BYTES, Q4_K_BLOCK_ELEMS, Q8_0_BLOCK_BYTES,
-    Q8_0_BLOCK_ELEMS,
+    Q4_0_BLOCK_BYTES, Q4_0_BLOCK_ELEMS, Q8Activations, Q8KActivations, Q4_K_BLOCK_BYTES,
+    Q4_K_BLOCK_ELEMS, Q8_0_BLOCK_BYTES, Q8_0_BLOCK_ELEMS,
 };
 use half::f16;
 
@@ -574,14 +576,19 @@ pub fn gemm_q4_kx8_group(
     {
         // The NEON kernel is written against the interleave-4 layout the
         // GEMV uses; any other packing falls through to the GEMV loop.
-        if interleave == 4
-            && acts.len() <= Q4_KX8_GEMM_NC
-            && std::arch::is_aarch64_feature_detected!("dotprod")
-        {
-            unsafe {
-                neon::gemm_q4_kx8_q8_k_neon_sdot(slice, acts, n_cols, out);
+        if interleave == 4 && acts.len() <= Q4_KX8_GEMM_NC {
+            if std::arch::is_aarch64_feature_detected!("i8mm") {
+                unsafe {
+                    neon::gemm_q4_kx8_q8_k_neon_i8mm(slice, acts, n_cols, out);
+                }
+                return;
             }
-            return;
+            if std::arch::is_aarch64_feature_detected!("dotprod") {
+                unsafe {
+                    neon::gemm_q4_kx8_q8_k_neon_sdot(slice, acts, n_cols, out);
+                }
+                return;
+            }
         }
     }
     // Portable fallback: the GEMV, once per activation. Same results,
@@ -593,6 +600,213 @@ pub fn gemm_q4_kx8_group(
             out[r * acts.len() + j] = *v;
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Q4_0 ×4 interleaved GEMV/GEMM (llama.cpp `block_q4_0x4` / `ggml_gemv_q4_0_4x4`)
+// ---------------------------------------------------------------------------
+
+/// Bytes per interleaved `block_q4_0x4` (4 × f16 d + 64 qs).
+pub const Q4_0X4_BLOCK_BYTES: usize = 72;
+/// Number of Q4_0 rows packed into one interleaved block.
+pub const Q4_0X4_NROWS: usize = 4;
+/// qs interleave width for `ggml_gemv_q4_0_4x4_q8_0` (NEON SDOT).
+pub const Q4_0X4_INTERLEAVE: usize = 4;
+
+const Q4_0X4_XOR_MASK_U32: u32 = 0x8888_8888;
+const Q4_0X4_XOR_MASK_U64: u64 = 0x8888_8888_8888_8888;
+
+/// Pack four canonical Q4_0 blocks (same column-block) into one
+/// `block_q4_0x4`. Nibble bytes are XOR-masked during interleave so
+/// NEON can unpack without explicit `- 8` bias subtraction.
+pub fn make_block_q4_0x4(
+    rows: [&[u8]; Q4_0X4_NROWS],
+    interleave: usize,
+) -> [u8; Q4_0X4_BLOCK_BYTES] {
+    debug_assert!(interleave == 4 || interleave == 8);
+    for r in &rows {
+        debug_assert_eq!(r.len(), Q4_0_BLOCK_BYTES);
+    }
+    let mut out = [0u8; Q4_0X4_BLOCK_BYTES];
+    for (i, row) in rows.iter().enumerate() {
+        out[i * 2] = row[0];
+        out[i * 2 + 1] = row[1];
+    }
+    let end = (Q4_0_BLOCK_ELEMS * 2) / interleave;
+    let qs_out = &mut out[8..];
+    for i in 0..end {
+        let src_id = i % Q4_0X4_NROWS;
+        let src_offset = (i / Q4_0X4_NROWS) * interleave;
+        let dst_offset = i * interleave;
+        let src_qs = &rows[src_id][2..18];
+        if interleave == 4 {
+            let mut elems = u32::from_le_bytes(
+                src_qs[src_offset..src_offset + 4]
+                    .try_into()
+                    .expect("4-byte interleave chunk"),
+            );
+            elems ^= Q4_0X4_XOR_MASK_U32;
+            qs_out[dst_offset..dst_offset + 4].copy_from_slice(&elems.to_le_bytes());
+        } else {
+            let mut elems = u64::from_le_bytes(
+                src_qs[src_offset..src_offset + 8]
+                    .try_into()
+                    .expect("8-byte interleave chunk"),
+            );
+            elems ^= Q4_0X4_XOR_MASK_U64;
+            qs_out[dst_offset..dst_offset + 8].copy_from_slice(&elems.to_le_bytes());
+        }
+    }
+    out
+}
+
+/// Repack a Q4_0 matrix into interleaved `block_q4_0x4` groups. Tail rows
+/// (not divisible by 4) are omitted; caller dots them with [`crate::dot_q4_0_q8`].
+pub fn pack_q4_0_matrix_x4(data: &[u8], rows: usize, cols: usize, interleave: usize) -> Vec<u8> {
+    assert!(cols.is_multiple_of(Q4_0_BLOCK_ELEMS));
+    let n_blocks = cols / Q4_0_BLOCK_ELEMS;
+    let row_bytes = n_blocks * Q4_0_BLOCK_BYTES;
+    assert_eq!(data.len(), rows * row_bytes);
+    let n_groups = rows / Q4_0X4_NROWS;
+    let mut out = Vec::with_capacity(n_groups * n_blocks * Q4_0X4_BLOCK_BYTES);
+    for g in 0..n_groups {
+        for b in 0..n_blocks {
+            let mut row_refs: [&[u8]; Q4_0X4_NROWS] = [&[]; Q4_0X4_NROWS];
+            for (r, slot) in row_refs.iter_mut().enumerate() {
+                let base = (g * Q4_0X4_NROWS + r) * row_bytes + b * Q4_0_BLOCK_BYTES;
+                *slot = &data[base..base + Q4_0_BLOCK_BYTES];
+            }
+            out.extend_from_slice(&make_block_q4_0x4(row_refs, interleave));
+        }
+    }
+    out
+}
+
+#[inline]
+fn q4_0x4_nibble_dot(byte: u8, q8_lo: i32, q8_hi: i32) -> i32 {
+    let v0 = ((byte << 4) as i8) as i32;
+    let v1 = ((byte & 0xF0) as i8) as i32;
+    ((v0 * q8_lo) + (v1 * q8_hi)) >> 4
+}
+
+/// Scalar GEMV for interleave=4 (`ggml_gemv_q4_0_4x4_q8_0_generic`).
+fn gemv_q4_0x4_q8_0_scalar(
+    packed: &[u8],
+    act: &Q8Activations,
+    n_cols: usize,
+    n_row_groups: usize,
+    out: &mut [f32],
+) {
+    let nb = n_cols / Q4_0_BLOCK_ELEMS;
+    let blocklen = Q4_0X4_INTERLEAVE;
+    let ncols = Q4_0X4_NROWS;
+    debug_assert_eq!(act.n_blocks(), nb);
+    debug_assert_eq!(out.len(), n_row_groups * ncols);
+    debug_assert_eq!(packed.len(), n_row_groups * nb * Q4_0X4_BLOCK_BYTES);
+
+    for x in 0..n_row_groups {
+        let mut sumf = [0f32; 4];
+        let group_off = x * nb * Q4_0X4_BLOCK_BYTES;
+        for l in 0..nb {
+            let blk = &packed[group_off + l * Q4_0X4_BLOCK_BYTES..][..Q4_0X4_BLOCK_BYTES];
+            let da = act.d[l];
+            let q8 = &act.q[l * Q4_0_BLOCK_ELEMS..(l + 1) * Q4_0_BLOCK_ELEMS];
+            for k in 0..(Q4_0_BLOCK_ELEMS / (2 * blocklen)) {
+                for j in 0..ncols {
+                    let mut sumi = 0i32;
+                    for i in 0..blocklen {
+                        let byte = blk[8 + k * ncols * blocklen + j * blocklen + i];
+                        sumi += q4_0x4_nibble_dot(
+                            byte,
+                            q8[k * blocklen + i] as i32,
+                            q8[k * blocklen + i + Q4_0_BLOCK_ELEMS / 2] as i32,
+                        );
+                    }
+                    sumf[j] += sumi as f32 * f16_from_bytes(&blk[j * 2..]) * da;
+                }
+            }
+        }
+        let base = x * ncols;
+        out[base..base + ncols].copy_from_slice(&sumf);
+    }
+}
+
+/// GEMV: interleaved Q4_0 weights × Q8 activation → `n_row_groups * 4` f32s.
+pub fn gemv_q4_0x4_q8_0(
+    packed: &[u8],
+    act: &Q8Activations,
+    n_cols: usize,
+    n_row_groups: usize,
+    out: &mut [f32],
+) {
+    assert!(n_cols.is_multiple_of(Q4_0_BLOCK_ELEMS));
+    assert_eq!(out.len(), n_row_groups * Q4_0X4_NROWS);
+    #[cfg(target_arch = "aarch64")]
+    {
+        if std::arch::is_aarch64_feature_detected!("dotprod") {
+            unsafe {
+                neon::gemv_q4_0x4_q8_0_neon_sdot(packed, act, n_cols, n_row_groups, out);
+            }
+            return;
+        }
+    }
+    gemv_q4_0x4_q8_0_scalar(packed, act, n_cols, n_row_groups, out);
+}
+
+/// How many activations one [`gemm_q4_0x4_group`] pass keeps in flight.
+pub const Q4_0X4_GEMM_NC: usize = 4;
+
+/// GEMM counterpart of [`gemv_q4_0x4_group`]: one row-group (4 rows)
+/// against `acts.len()` activations at once. `out` is `[row][act]`:
+/// `out[r * acts.len() + j]`.
+pub fn gemm_q4_0x4_group(
+    packed: &[u8],
+    group: usize,
+    acts: &[Q8Activations],
+    n_cols: usize,
+    out: &mut [f32],
+) {
+    assert_eq!(out.len(), Q4_0X4_NROWS * acts.len());
+    assert!(n_cols.is_multiple_of(Q4_0_BLOCK_ELEMS));
+    if acts.is_empty() {
+        return;
+    }
+    let nb = n_cols / Q4_0_BLOCK_ELEMS;
+    let off = group * nb * Q4_0X4_BLOCK_BYTES;
+    let slice = &packed[off..off + nb * Q4_0X4_BLOCK_BYTES];
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        if std::arch::is_aarch64_feature_detected!("dotprod") {
+            unsafe {
+                neon::gemm_q4_0x4_q8_0_neon_sdot(slice, acts, n_cols, out);
+            }
+            return;
+        }
+    }
+    let mut tmp = [0f32; Q4_0X4_NROWS];
+    for (j, act) in acts.iter().enumerate() {
+        gemv_q4_0x4_q8_0(slice, act, n_cols, 1, &mut tmp);
+        for (r, v) in tmp.iter().enumerate() {
+            out[r * acts.len() + j] = *v;
+        }
+    }
+}
+
+/// One row-group (4 outputs) starting at `group` within a packed Q4_0x4 matrix.
+#[inline]
+pub fn gemv_q4_0x4_group(
+    packed: &[u8],
+    group: usize,
+    act: &Q8Activations,
+    n_cols: usize,
+    out4: &mut [f32],
+) {
+    debug_assert_eq!(out4.len(), Q4_0X4_NROWS);
+    let nb = n_cols / Q4_0_BLOCK_ELEMS;
+    let off = group * nb * Q4_0X4_BLOCK_BYTES;
+    let slice = &packed[off..off + nb * Q4_0X4_BLOCK_BYTES];
+    gemv_q4_0x4_q8_0(slice, act, n_cols, 1, out4);
 }
 
 /// One row-group (4 outputs) starting at `group` within a packed Q8_0x4 matrix.
@@ -1048,6 +1262,20 @@ mod neon {
         }
     }
 
+    /// i8mm GEMM hook for interleave-4 Q4_K×8 tiles. SMMLA needs repacked
+    /// weights (llama.cpp `ggml_gemm_q4_K_8x8_q8_K` / repack.cpp); until ferrox
+    /// ships that layout this delegates to the dotprod GEMM with identical
+    /// numerics.
+    #[target_feature(enable = "neon,i8mm")]
+    pub unsafe fn gemm_q4_kx8_q8_k_neon_i8mm(
+        packed: &[u8],
+        acts: &[Q8KActivations],
+        n_cols: usize,
+        out: &mut [f32],
+    ) {
+        gemm_q4_kx8_q8_k_neon_sdot(packed, acts, n_cols, out);
+    }
+
     /// NEON DotProd GEMV for `block_q8_0x4` (llama `ggml_gemv_q8_0_4x4_q8_0`).
     #[target_feature(enable = "neon,dotprod")]
     pub unsafe fn gemv_q8_0x4_q8_0_neon_sdot(
@@ -1171,6 +1399,109 @@ mod neon {
             j0 += tile;
         }
     }
+
+    /// NEON DotProd GEMV for `block_q4_0x4` (llama `ggml_gemv_q4_0_4x4_q8_0`).
+    #[target_feature(enable = "neon,dotprod")]
+    pub unsafe fn gemv_q4_0x4_q8_0_neon_sdot(
+        packed: &[u8],
+        act: &Q8Activations,
+        n_cols: usize,
+        n_row_groups: usize,
+        out: &mut [f32],
+    ) {
+        let nb = n_cols / Q4_0_BLOCK_ELEMS;
+        let maskf0 = vdupq_n_u8(0xF0);
+        for x in 0..n_row_groups {
+            let mut acc = vdupq_n_f32(0.0);
+            let group_off = x * nb * Q4_0X4_BLOCK_BYTES;
+            for b in 0..nb {
+                let blk = packed.as_ptr().add(group_off + b * Q4_0X4_BLOCK_BYTES);
+                let qs = blk.add(8);
+                let a_ptr = act.q.as_ptr().add(b * Q4_0_BLOCK_ELEMS);
+                let a0 = vld1q_s8(a_ptr);
+                let a1 = vld1q_s8(a_ptr.add(16));
+
+                let mut ret = vdupq_n_s32(0);
+                for wi in 0..4u32 {
+                    let w = vld1q_u8(qs.add(wi as usize * 16));
+                    let hi = vreinterpretq_s8_u8(vshlq_n_u8(w, 4));
+                    let lo = vreinterpretq_s8_u8(vandq_u8(w, maskf0));
+                    ret = sdot_lane(ret, hi, a0, wi);
+                    ret = sdot_lane(ret, lo, a1, wi);
+                }
+
+                let d_bits = vld1_u16(blk as *const u16);
+                let mut dw = [0f32; 4];
+                dw[0] = f16::from_bits(vget_lane_u16(d_bits, 0)).to_f32();
+                dw[1] = f16::from_bits(vget_lane_u16(d_bits, 1)).to_f32();
+                dw[2] = f16::from_bits(vget_lane_u16(d_bits, 2)).to_f32();
+                dw[3] = f16::from_bits(vget_lane_u16(d_bits, 3)).to_f32();
+                let scale = vmulq_n_f32(vld1q_f32(dw.as_ptr()), act.d[b]);
+                acc = vfmaq_f32(acc, vcvtq_f32_s32(vshrq_n_s32(ret, 4)), scale);
+            }
+            vst1q_f32(out.as_mut_ptr().add(x * Q4_0X4_NROWS), acc);
+        }
+    }
+
+    /// NEON DotProd GEMM for one `block_q4_0x4` row-group against several
+    /// activations (llama `ggml_gemm_q4_0_4x4_q8_0` in shape).
+    #[target_feature(enable = "neon,dotprod")]
+    pub unsafe fn gemm_q4_0x4_q8_0_neon_sdot(
+        group: &[u8],
+        acts: &[Q8Activations],
+        n_cols: usize,
+        out: &mut [f32],
+    ) {
+        let nb = n_cols / Q4_0_BLOCK_ELEMS;
+        let n_acts = acts.len();
+        let maskf0 = vdupq_n_u8(0xF0);
+        let mut j0 = 0;
+        while j0 < n_acts {
+            let tile = Q4_0X4_GEMM_NC.min(n_acts - j0);
+            let mut acc = [vdupq_n_f32(0.0); Q4_0X4_GEMM_NC];
+            for b in 0..nb {
+                let blk = group.as_ptr().add(b * Q4_0X4_BLOCK_BYTES);
+                let qs = blk.add(8);
+                let w = [
+                    vld1q_u8(qs),
+                    vld1q_u8(qs.add(16)),
+                    vld1q_u8(qs.add(32)),
+                    vld1q_u8(qs.add(48)),
+                ];
+                let d_bits = vld1_u16(blk as *const u16);
+                let mut dw = [0f32; 4];
+                dw[0] = f16::from_bits(vget_lane_u16(d_bits, 0)).to_f32();
+                dw[1] = f16::from_bits(vget_lane_u16(d_bits, 1)).to_f32();
+                dw[2] = f16::from_bits(vget_lane_u16(d_bits, 2)).to_f32();
+                dw[3] = f16::from_bits(vget_lane_u16(d_bits, 3)).to_f32();
+                let dw_v = vld1q_f32(dw.as_ptr());
+
+                for t in 0..tile {
+                    let act = &acts[j0 + t];
+                    let a_ptr = act.q.as_ptr().add(b * Q4_0_BLOCK_ELEMS);
+                    let a0 = vld1q_s8(a_ptr);
+                    let a1 = vld1q_s8(a_ptr.add(16));
+                    let mut ret = vdupq_n_s32(0);
+                    for (wi, wchunk) in w.iter().enumerate() {
+                        let hi = vreinterpretq_s8_u8(vshlq_n_u8(*wchunk, 4));
+                        let lo = vreinterpretq_s8_u8(vandq_u8(*wchunk, maskf0));
+                        ret = sdot_lane(ret, hi, a0, wi as u32);
+                        ret = sdot_lane(ret, lo, a1, wi as u32);
+                    }
+                    let scale = vmulq_n_f32(dw_v, act.d[b]);
+                    acc[t] = vfmaq_f32(acc[t], vcvtq_f32_s32(vshrq_n_s32(ret, 4)), scale);
+                }
+            }
+            for t in 0..tile {
+                let mut lanes = [0f32; Q4_0X4_NROWS];
+                vst1q_f32(lanes.as_mut_ptr(), acc[t]);
+                for (r, v) in lanes.iter().enumerate() {
+                    out[r * n_acts + j0 + t] = *v;
+                }
+            }
+            j0 += tile;
+        }
+    }
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -1267,7 +1598,8 @@ mod avx2 {
 mod tests {
     use super::*;
     use crate::{
-        dot_q4_k_q8_scalar, dot_q8_0_q8_scalar, quantize_activations_q8, quantize_activations_q8_k,
+        dot_q4_0_q8_scalar, dot_q4_k_q8_scalar, dot_q8_0_q8_scalar, quantize_activations_q8,
+        quantize_activations_q8_k, Q4_0_BLOCK_BYTES,
     };
 
     fn synth_q4_k_row(n_blocks: usize, seed: u8) -> Vec<u8> {
@@ -1284,6 +1616,19 @@ mod tests {
             }
             for i in 0..128u8 {
                 weights.push(i.wrapping_mul(17).wrapping_add(b as u8).wrapping_add(seed));
+            }
+        }
+        weights
+    }
+
+    fn synth_q4_0_row(n_blocks: usize, seed: u8) -> Vec<u8> {
+        let mut weights = Vec::with_capacity(n_blocks * Q4_0_BLOCK_BYTES);
+        for b in 0..n_blocks {
+            weights.extend_from_slice(
+                &f16::from_f32(0.05 + (b as f32 + seed as f32) * 0.012).to_le_bytes(),
+            );
+            for i in 0..16u8 {
+                weights.push(i.wrapping_mul(23).wrapping_add(b as u8).wrapping_add(seed));
             }
         }
         weights
@@ -1343,6 +1688,95 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn q4_0x4_pack_and_gemv_matches_scalar_row_dots() {
+        let n_blocks = 3;
+        let cols = n_blocks * Q4_0_BLOCK_ELEMS;
+        let rows = 12;
+        let mut matrix = Vec::new();
+        for r in 0..rows {
+            matrix.extend_from_slice(&synth_q4_0_row(n_blocks, r as u8));
+        }
+        let x: Vec<f32> = (0..cols)
+            .map(|i| ((i as f32) * 0.019 - 1.2).sin() * 2.1)
+            .collect();
+        let act = quantize_activations_q8(&x);
+
+        let row_bytes = n_blocks * Q4_0_BLOCK_BYTES;
+        let mut reference = vec![0f32; rows];
+        for r in 0..rows {
+            reference[r] = dot_q4_0_q8_scalar(&matrix[r * row_bytes..(r + 1) * row_bytes], &act);
+        }
+
+        let packed = pack_q4_0_matrix_x4(&matrix, rows, cols, Q4_0X4_INTERLEAVE);
+        let n_groups = rows / Q4_0X4_NROWS;
+        let mut out = vec![0f32; rows];
+        gemv_q4_0x4_q8_0(&packed, &act, cols, n_groups, &mut out);
+        for r in 0..rows {
+            let err = (out[r] - reference[r]).abs();
+            let scale = reference[r].abs().max(1.0);
+            assert!(
+                err / scale < 1e-4 || err < 1e-3,
+                "Q4_0x4 row {r}: got {} want {} err={err}",
+                out[r],
+                reference[r]
+            );
+        }
+    }
+
+    #[test]
+    fn q4_0x4_gemm_matches_the_gemv_run_once_per_activation() {
+        let n_blocks = 4;
+        let cols = n_blocks * Q4_0_BLOCK_ELEMS;
+        let rows = 8;
+        let mut matrix = Vec::new();
+        for r in 0..rows {
+            matrix.extend_from_slice(&synth_q4_0_row(n_blocks, (r * 2 + 5) as u8));
+        }
+        let packed = pack_q4_0_matrix_x4(&matrix, rows, cols, Q4_0X4_INTERLEAVE);
+
+        let n_acts = 7;
+        let acts: Vec<Q8Activations> = (0..n_acts)
+            .map(|j| {
+                let x: Vec<f32> = (0..cols)
+                    .map(|i| (((i + j * 11) as f32) * 0.021 - 0.7).cos() * 1.9)
+                    .collect();
+                quantize_activations_q8(&x)
+            })
+            .collect();
+
+        for group in 0..rows / Q4_0X4_NROWS {
+            let mut gemm_out = vec![0f32; Q4_0X4_NROWS * n_acts];
+            gemm_q4_0x4_group(&packed, group, &acts, cols, &mut gemm_out);
+
+            for (j, act) in acts.iter().enumerate() {
+                let mut gemv_out = [0f32; Q4_0X4_NROWS];
+                gemv_q4_0x4_group(&packed, group, act, cols, &mut gemv_out);
+                for r in 0..Q4_0X4_NROWS {
+                    assert_eq!(
+                        gemm_out[r * n_acts + j],
+                        gemv_out[r],
+                        "group {group} row {r} act {j}: Q4_0 GEMM and GEMV disagree"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn q4_0x4_gemm_with_no_activations_is_a_no_op() {
+        let n_blocks = 2;
+        let cols = n_blocks * Q4_0_BLOCK_ELEMS;
+        let mut matrix = Vec::new();
+        for r in 0..Q4_0X4_NROWS {
+            matrix.extend_from_slice(&synth_q4_0_row(n_blocks, r as u8));
+        }
+        let packed = pack_q4_0_matrix_x4(&matrix, Q4_0X4_NROWS, cols, Q4_0X4_INTERLEAVE);
+        let mut out: Vec<f32> = Vec::new();
+        gemm_q4_0x4_group(&packed, 0, &[], cols, &mut out);
+        assert!(out.is_empty());
     }
 
     #[test]
@@ -1511,5 +1945,6 @@ mod tests {
     fn block_size_matches_ggml() {
         assert_eq!(Q4_KX8_BLOCK_BYTES, 16 + 16 + 96 + 1024);
         assert_eq!(Q8_0X4_BLOCK_BYTES, 4 * 2 + Q8_0_BLOCK_ELEMS * Q8_0X4_NROWS);
+        assert_eq!(Q4_0X4_BLOCK_BYTES, 4 * 2 + Q4_0_BLOCK_ELEMS * 2);
     }
 }

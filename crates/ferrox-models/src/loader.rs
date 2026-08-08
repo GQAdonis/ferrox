@@ -19,12 +19,8 @@
 //!
 //! Verified end to end (see `crates/ferrox-models/tests/gguf_roundtrip.rs`)
 //! against a genuinely Q8_0-quantized, generated on-disk GGUF fixture
-//! for the dense (single-expert) case. The
-//! multi-expert 3D-packed-tensor path is implemented against the
-//! documented llama.cpp/ik_llama.cpp convention but is **not yet
-//! verified against a real multi-expert GGUF file** -- no such file was
-//! available to test against in this environment. Treat that path as
-//! best-effort until it has been run against a real MoE checkpoint.
+//! for the dense (single-expert) case, and against real OLMoE / Qwen2-MoE
+//! checkpoints for the multi-expert 3D-packed-tensor path.
 
 use ferrox_core::expert_store::{ExpertKey, ExpertSource, ExpertStore};
 use ferrox_core::tensor::Tensor;
@@ -36,6 +32,8 @@ use thiserror::Error;
 
 use crate::config::ModelConfig;
 use crate::decoder::{AttnWeights, Decoder, ExpertBacking, LayerWeights, MoeWeights};
+#[cfg(feature = "metal")]
+use crate::decoder::MoePackedQ4Planes;
 
 #[derive(Debug, Error)]
 pub enum LoadError {
@@ -271,22 +269,29 @@ impl ModelConfig {
             }
             None => 0,
         };
-        // MoE GGUFs often only set `feed_forward_length` (OLMoE=1024);
-        // `expert_feed_forward_length` is optional. Prefer expert key, then
-        // dense FFN length, then 4×hidden — never ignore feed_forward_length.
-        let expert_ffn_dim = metadata_u64_any(
-            file,
-            &[
-                key("expert_feed_forward_length"),
-                key("feed_forward_length"),
-            ],
-        )
-        .unwrap_or_else(|| {
-            best_effort_fields.push(
-                "moe.expert_ffn_dim (no expert_feed_forward_length/feed_forward_length; defaulted to 4x hidden_dim)",
-            );
-            (hidden_dim * 4) as u64
-        }) as usize;
+        // MoE GGUFs often only set `feed_forward_length` (OLMoE=1024,
+        // Qwen2-MoE=5632 for the shared expert). `expert_feed_forward_length`
+        // is optional. llama.cpp `qwen2moe.cpp` uses
+        // `n_ff_exp = n_ff_exp ? n_ff_exp : n_ff / n_expert_used` (1408 for
+        // Qwen1.5-MoE); the shared expert keeps the full `n_ff` (5632).
+        let feed_forward_length =
+            metadata_u64_any(file, &[key("feed_forward_length")]);
+        let expert_ffn_dim = metadata_u64_any(file, &[key("expert_feed_forward_length")])
+            .or_else(|| {
+                feed_forward_length.and_then(|ff| {
+                    if is_moe && n_experts_active > 0 {
+                        Some(ff / n_experts_active as u64)
+                    } else {
+                        Some(ff)
+                    }
+                })
+            })
+            .unwrap_or_else(|| {
+                best_effort_fields.push(
+                    "moe.expert_ffn_dim (no expert_feed_forward_length/feed_forward_length; defaulted to 4x hidden_dim)",
+                );
+                (hidden_dim * 4) as u64
+            }) as usize;
         let n_dense_leading_layers =
             metadata_u64_any(file, &[key("leading_dense_block_count")]).unwrap_or(0) as usize;
 
@@ -784,9 +789,8 @@ fn load_weight_matrix(file: &impl TensorSource, name: &str) -> Result<WeightMatr
 /// (shape `[n_experts, out_dim, in_dim]`) into per-expert `WeightMatrix`es,
 /// slicing raw bytes directly (quantized tensors stay quantized; block
 /// boundaries never cross expert boundaries since `in_dim` is a whole
-/// number of quantization blocks). Documented llama.cpp/ik_llama.cpp
-/// convention, not yet verified against a real multi-expert file (see
-/// module doc comment).
+/// number of quantization blocks). Matches llama.cpp/ik_llama.cpp layout
+/// confirmed on real OLMoE and Qwen2-MoE GGUF checkpoints.
 fn split_expert_tensor(
     file: &impl TensorSource,
     name: &str,
@@ -795,13 +799,10 @@ fn split_expert_tensor(
     let info = find_info(file, name)?;
     // Real raw shape is `[in_dim, out_dim, n_experts]` (ggml's
     // fastest-first `ne[]` order -- see `load_weight_matrix`'s doc
-    // comment for the confirmed 2D case this generalizes from; the 3D
-    // case itself remains unverified against a real multi-expert file,
-    // per this function's own doc comment above). `n_experts` is the
-    // slowest-varying (last, i.e. outermost/most-major) dimension, so
-    // the existing per-expert byte-chunking below (each expert's
-    // `out_dim*in_dim` block contiguous, experts back-to-back) needed no
-    // change -- only which shape index means what.
+    // comment for the confirmed 2D case this generalizes from). `n_experts`
+    // is the slowest-varying (last, i.e. outermost/most-major) dimension,
+    // so each expert's `out_dim*in_dim` block is contiguous with experts
+    // back-to-back in the mmap.
     if info.shape.len() != 3 || info.shape[2] as usize != n_experts {
         let file_experts = info.shape.last().map(|&d| d as usize).unwrap_or(0);
         return Err(LoadError::ExpertCountMismatch(
@@ -858,6 +859,152 @@ fn split_expert_tensor(
             None => Err(LoadError::UnsupportedDtype(name.to_string(), other)),
         },
     }
+}
+
+/// When every routed expert is mmap-backed with a Metal simdgroup-GEMM
+/// kind and back-to-back slices, record the combined gate/up/down planes
+/// for Metal packed MoE. Gate/up/down may differ in kind (e.g. Q4_K /
+/// Q4_K / Q8_0) but must be uniform across experts per role.
+#[cfg(feature = "metal")]
+fn try_build_moe_packed_q4_planes(experts: &[ExpertWeights]) -> Option<MoePackedQ4Planes> {
+    use ferrox_core::weight_matrix::{QuantKind, WeightBytes};
+    use std::sync::Arc;
+
+    if experts.is_empty() {
+        return None;
+    }
+
+    fn mapped_sg(m: &WeightMatrix) -> Option<(WeightBytes, usize, &'static str)> {
+        match m {
+            WeightMatrix::Quantized {
+                data: WeightBytes::Mapped { mmap, range },
+                rows,
+                kind,
+                ..
+            } => {
+                let kind_str = match kind {
+                    QuantKind::Q4_0 => "Q4_0",
+                    QuantKind::Q4K => "Q4_K",
+                    QuantKind::Q5K => "Q5_K",
+                    QuantKind::Q6K => "Q6_K",
+                    QuantKind::Q8_0 => "Q8_0",
+                    QuantKind::IQ4XS => "IQ4_XS",
+                    _ => return None,
+                };
+                let _ = ferrox_metal::gpu::mul_mm_sg_meta(kind_str)?;
+                Some((
+                    WeightBytes::Mapped {
+                        mmap: Arc::clone(mmap),
+                        range: range.clone(),
+                    },
+                    *rows,
+                    kind_str,
+                ))
+            }
+            _ => None,
+        }
+    }
+
+    let (gate0, ffn_rows, gate_kind) = mapped_sg(&experts[0].gate)?;
+    let (up0, up_rows, up_kind) = mapped_sg(&experts[0].up)?;
+    let (down0, hidden_rows, down_kind) = mapped_sg(&experts[0].down)?;
+    if up_rows != ffn_rows {
+        return None;
+    }
+    let WeightBytes::Mapped {
+        mmap: gate_mmap,
+        range: gate0_range,
+    } = &gate0
+    else {
+        return None;
+    };
+    let WeightBytes::Mapped {
+        mmap: up_mmap,
+        range: up0_range,
+    } = &up0
+    else {
+        return None;
+    };
+    let WeightBytes::Mapped {
+        mmap: down_mmap,
+        range: down0_range,
+    } = &down0
+    else {
+        return None;
+    };
+
+    let gate_stride = gate0_range.len();
+    let up_stride = up0_range.len();
+    let down_stride = down0_range.len();
+    if gate_stride == 0 || up_stride == 0 || down_stride == 0 {
+        return None;
+    }
+
+    let n = experts.len();
+    for (i, ex) in experts.iter().enumerate().skip(1) {
+        let (g, fr, gk) = mapped_sg(&ex.gate)?;
+        let (u, ur, uk) = mapped_sg(&ex.up)?;
+        let (d, hr, dk) = mapped_sg(&ex.down)?;
+        if gk != gate_kind || uk != up_kind || dk != down_kind {
+            return None;
+        }
+        let WeightBytes::Mapped { mmap, range } = &g else {
+            return None;
+        };
+        if fr != ffn_rows {
+            return None;
+        }
+        if !Arc::ptr_eq(mmap, gate_mmap)
+            || range.len() != gate_stride
+            || range.start != gate0_range.start + i * gate_stride
+        {
+            return None;
+        }
+        let WeightBytes::Mapped { mmap, range } = &u else {
+            return None;
+        };
+        if ur != ffn_rows
+            || !Arc::ptr_eq(mmap, up_mmap)
+            || range.len() != up_stride
+            || range.start != up0_range.start + i * up_stride
+        {
+            return None;
+        }
+        let WeightBytes::Mapped { mmap, range } = &d else {
+            return None;
+        };
+        if hr != hidden_rows
+            || !Arc::ptr_eq(mmap, down_mmap)
+            || range.len() != down_stride
+            || range.start != down0_range.start + i * down_stride
+        {
+            return None;
+        }
+    }
+
+    Some(MoePackedQ4Planes::new(
+        WeightBytes::Mapped {
+            mmap: Arc::clone(gate_mmap),
+            range: gate0_range.start..gate0_range.start + n * gate_stride,
+        },
+        WeightBytes::Mapped {
+            mmap: Arc::clone(up_mmap),
+            range: up0_range.start..up0_range.start + n * up_stride,
+        },
+        WeightBytes::Mapped {
+            mmap: Arc::clone(down_mmap),
+            range: down0_range.start..down0_range.start + n * down_stride,
+        },
+        gate_stride,
+        up_stride,
+        down_stride,
+        n,
+        ffn_rows,
+        hidden_rows,
+        gate_kind,
+        up_kind,
+        down_kind,
+    ))
 }
 
 /// One matrix's place inside a store-backed expert's combined byte
@@ -1259,6 +1406,11 @@ impl Decoder {
             } else {
                 load_f32_vec_optional(&file, &format!("blk.{l}.ffn_gate_inp_shexp.weight"))?
             };
+            #[cfg(feature = "metal")]
+            let packed_q4 = match &experts {
+                ExpertBacking::Resident(v) if !v.is_empty() => try_build_moe_packed_q4_planes(v),
+                _ => None,
+            };
             let moe = MoeWeights {
                 router,
                 experts,
@@ -1266,6 +1418,8 @@ impl Decoder {
                 shared_expert_gate,
                 norm_weight: load_f32_vec(&file, &format!("blk.{l}.ffn_norm.weight"))?,
                 activation_counts,
+                #[cfg(feature = "metal")]
+                packed_q4,
             };
 
             layers.push(LayerWeights { attn, moe });
@@ -1988,14 +2142,12 @@ mod tests {
             );
         }
     }
-}
 
-#[cfg(test)]
-mod qwen_norm_topk_tests {
     #[test]
     fn qwen2moe_disables_topk_renorm() {
-        assert!(super::NO_TOPK_RENORMALIZE_ARCHITECTURES.contains(&"qwen2moe"));
-        let norm = !super::NO_TOPK_RENORMALIZE_ARCHITECTURES.contains(&"qwen2moe");
-        assert!(!norm, "qwen2moe must have norm_topk_prob=false");
+        assert!(
+            NO_TOPK_RENORMALIZE_ARCHITECTURES.contains(&"qwen2moe"),
+            "qwen2moe must have norm_topk_prob=false (llama.cpp build_moe_ffn norm_w=false)"
+        );
     }
 }

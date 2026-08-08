@@ -16,10 +16,12 @@ pub mod iq_tables;
 pub mod repack;
 
 pub use repack::{
-    gemm_q4_kx8_group, gemm_q8_0x4_group, gemv_q4_kx8_group, gemv_q4_kx8_q8_k, gemv_q8_0x4_group,
-    gemv_q8_0x4_q8_0, make_block_q4_kx8, make_block_q8_0x4, pack_q4_k_matrix_x8,
-    pack_q8_0_matrix_x4, q4_kx8_interleave, Q4_KX8_BLOCK_BYTES, Q4_KX8_GEMM_NC, Q4_KX8_NROWS,
-    Q8_0X4_BLOCK_BYTES, Q8_0X4_INTERLEAVE, Q8_0X4_NROWS,
+    gemm_q4_0x4_group, gemm_q4_kx8_group, gemm_q8_0x4_group, gemv_q4_0x4_group,
+    gemv_q4_kx8_group, gemv_q4_kx8_q8_k, gemv_q8_0x4_group, gemv_q8_0x4_q8_0,
+    make_block_q4_0x4, make_block_q4_kx8, make_block_q8_0x4, pack_q4_0_matrix_x4,
+    pack_q4_k_matrix_x8, pack_q8_0_matrix_x4, q4_kx8_interleave, Q4_0X4_BLOCK_BYTES,
+    Q4_0X4_GEMM_NC, Q4_0X4_INTERLEAVE, Q4_0X4_NROWS, Q4_KX8_BLOCK_BYTES, Q4_KX8_GEMM_NC,
+    Q4_KX8_NROWS, Q8_0X4_BLOCK_BYTES, Q8_0X4_INTERLEAVE, Q8_0X4_NROWS,
 };
 
 use half::f16;
@@ -844,6 +846,9 @@ pub fn dot_q4_k_q8(row_bytes: &[u8], act: &Q8KActivations) -> f32 {
     }
     #[cfg(target_arch = "aarch64")]
     {
+        if std::arch::is_aarch64_feature_detected!("i8mm") {
+            return unsafe { simd_aarch64::dot_q4_k_q8_neon_i8mm(row_bytes, act) };
+        }
         if std::arch::is_aarch64_feature_detected!("dotprod") {
             return unsafe { simd_aarch64::dot_q4_k_q8_neon_sdot(row_bytes, act) };
         }
@@ -2517,6 +2522,16 @@ mod simd_aarch64 {
             }
         }
         acc
+    }
+
+    /// NEON Q4_K × Q8_K on i8mm hosts. llama.cpp `ggml_vec_dot_q4_K_q8_K`
+    /// uses SMMLA only for nrc==2 / repacked GEMM tiles (see repack.cpp);
+    /// single-row vec-dot stays on dotprod until ferrox Q4_K repack lands.
+    /// Dispatched when `is_aarch64_feature_detected!("i8mm")` so callers
+    /// can prefer the feature without changing numerics.
+    #[target_feature(enable = "neon,i8mm")]
+    pub unsafe fn dot_q4_k_q8_neon_i8mm(row_bytes: &[u8], act: &Q8KActivations) -> f32 {
+        dot_q4_k_q8_neon_sdot(row_bytes, act)
     }
 
     /// NEON Q4_K × Q8_K with SDOT.
@@ -5000,6 +5015,36 @@ mod tests {
             err / scale < 0.05,
             "int-dot vs f32 relative err {err}/{scale} too large (int={dispatched} f32={float_dot})"
         );
+    }
+
+    #[test]
+    #[cfg(target_arch = "aarch64")]
+    fn dot_q4_k_q8_i8mm_matches_scalar_when_available() {
+        if !std::arch::is_aarch64_feature_detected!("i8mm") {
+            return;
+        }
+        let n_blocks = 3;
+        let cols = n_blocks * Q4_K_BLOCK_ELEMS;
+        let x: Vec<f32> = (0..cols)
+            .map(|i| ((i as f32) * 0.017 - 2.1).sin() * 1.8)
+            .collect();
+        let mut weights = Vec::with_capacity(n_blocks * Q4_K_BLOCK_BYTES);
+        for b in 0..n_blocks {
+            weights.extend_from_slice(&f16::from_f32(0.05 + b as f32 * 0.01).to_le_bytes());
+            weights.extend_from_slice(&f16::from_f32(0.01 + b as f32 * 0.002).to_le_bytes());
+            for i in 0..12u8 {
+                weights.push(20 + i.wrapping_mul(3));
+            }
+            for i in 0..128u8 {
+                weights.push(i.wrapping_mul(17).wrapping_add(b as u8));
+            }
+        }
+        let act = quantize_activations_q8_k(&x);
+        let scalar = dot_q4_k_q8_scalar(&weights, &act);
+        let i8mm = unsafe { simd_aarch64::dot_q4_k_q8_neon_i8mm(&weights, &act) };
+        assert_eq!(i8mm, scalar, "i8mm must match scalar");
+        let dispatched = dot_q4_k_q8(&weights, &act);
+        assert_eq!(dispatched, scalar, "dispatch must match scalar on i8mm host");
     }
 
     #[test]

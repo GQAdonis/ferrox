@@ -9,15 +9,18 @@
 //! [`launch_decode_dense_stack`]).
 //!
 //! **Prefill (T≥1):** dense layers with B≥4 can run
-//! [`launch_prefill_dense_layer`] — one CB: RMSNorm → Q/K/V `mul_mm_sg` →
-//! RoPE/KV/GQA → O → FFN (gate∥up→act→down) with residual activations
+//! [`launch_prefill_dense_layer`] (one layer) or [`launch_prefill_dense_stack`]
+//! (consecutive layers, one CB, one host readback) — RMSNorm → Q/K/V
+//! `mul_mm_sg` → RoPE/KV/GQA → O → FFN (gate∥up→act→down) with activations
 //! resident on GPU scratch (decode-stack barriers). Otherwise host (or
 //! batched) Q/K/V feed [`launch_prefill_attn_block`] — multi-pos RoPE,
 //! batch KV append into [`MetalKvBuffers`], causal GQA — so decode can
 //! skip [`MetalKvBuffers::upload_from_host`] when seq_lens already match.
 //!
 //! Prefill GEMM timing: `FERROX_METAL_MM_TIMING=1` (see
-//! [`crate::gpu::launch_dense_ffn_swiglu_batch`] / mul_mm_sg launches).
+//! [`crate::gpu::launch_dense_ffn_swiglu_batch`] / mul_mm_sg launches, and
+//! [`launch_prefill_dense_layer`] / [`launch_prefill_dense_stack`]
+//! setup/gpu/readback totals).
 //!
 //! Scope:
 //! - `LLAMA_ROPE_TYPE_NORM` (interleaved) or `NEOX` ± Llama-3 freq factors
@@ -43,7 +46,7 @@
 //! `FERROX_CTK` selects KV dtype ([`MetalKvDtype`]); see [`is_implemented`].
 use crate::elem::{
     encode_add_rms_norm, encode_argmax, encode_gelu_mul, encode_rms_norm, encode_rms_norm_at,
-    encode_rms_norm_per_head, encode_silu_mul, encode_vec_add,
+    encode_rms_norm_per_head, encode_silu_mul, encode_vec_add, warm_prefill_elem_pipelines,
 };
 use crate::embd::{encode_get_rows, EmbdKind};
 use crate::gpu::{
@@ -52,8 +55,8 @@ use crate::gpu::{
     encode_q4_0_moe_gate_up_silu_fused, encode_q4_0_moe_id, encode_q4_0_moe_id_ex,
     encode_q4_0_moe_topk, encode_q4_0_mul_mm, ensure_pipeline, memory_barrier_buffers,
     memory_barrier_resources, resident_f32_buffer, resident_weight_buffer, shared_metal,
-    MatvecLaunch, MetalError, MoeExpertLaunch, MoePackedQ4, MulMmSgLaunch, ResidentF32Buffer,
-    ResidentWeightBuffer,
+    warm_mul_mm_sg_pipeline, MatvecLaunch, MetalError, MoeExpertLaunch, MoePackedQ4,
+    MulMmSgLaunch, ResidentF32Buffer, ResidentWeightBuffer,
 };
 use crate::moe_ranges::MoeMemRanges;
 use objc2::rc::Retained;
@@ -2183,25 +2186,58 @@ pub struct PrefillCbKey {
     pub q_rows: u32,
 }
 
+/// Shape key for a multi-layer prefill command-buffer plan.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct PrefillStackCbKey {
+    pub start_layer: u32,
+    pub depth: u32,
+    pub batch: u32,
+    pub hidden: u32,
+}
+
 /// Stub cache for one-CB-per-layer encoding plans.
 ///
-/// TODO(`ggml_metal_graph_compute`): retain encoded `MTLCommandBuffer`
-/// templates (or ICB / graph nodes) keyed by [`PrefillCbKey`] and replay
-/// with updated buffer bindings — matching llama.cpp metal graph compute.
-/// Today this only records keys seen by [`launch_prefill_dense_layer`] so
-/// call sites can wire residency without a full graph compiler.
+/// Partial step toward llama.cpp `ggml_metal_graph_compute`: retain encoded
+/// `MTLCommandBuffer` templates (or ICB / graph nodes) keyed by
+/// [`PrefillCbKey`] and replay with updated buffer bindings. Today we
+/// record shape keys and which compute pipelines are warmed (compiled once
+/// via [`MetalGraph::warm_prefill_pipelines`]) so the first dense-prefill
+/// layer avoids repeated `ensure_pipeline` / Metal compile latency.
 #[derive(Default, Debug)]
 pub struct PrefillCbCache {
     keys: HashSet<PrefillCbKey>,
+    stack_keys: HashSet<PrefillStackCbKey>,
+    /// Kernel function names compiled and resident (process pipeline cache).
+    hot_pipelines: HashSet<&'static str>,
 }
 
 impl PrefillCbCache {
-    pub fn note(&mut self, key: PrefillCbKey) {
-        self.keys.insert(key);
+    pub fn note(&mut self, key: PrefillCbKey) -> bool {
+        self.keys.insert(key)
+    }
+
+    pub fn note_stack(&mut self, key: PrefillStackCbKey) -> bool {
+        self.stack_keys.insert(key)
     }
 
     pub fn contains(&self, key: &PrefillCbKey) -> bool {
         self.keys.contains(key)
+    }
+
+    pub fn contains_stack(&self, key: &PrefillStackCbKey) -> bool {
+        self.stack_keys.contains(key)
+    }
+
+    pub fn mark_pipeline_hot(&mut self, fn_name: &'static str) {
+        self.hot_pipelines.insert(fn_name);
+    }
+
+    pub fn is_pipeline_hot(&self, fn_name: &str) -> bool {
+        self.hot_pipelines.contains(fn_name)
+    }
+
+    pub fn hot_pipeline_count(&self) -> usize {
+        self.hot_pipelines.len()
     }
 
     pub fn len(&self) -> usize {
@@ -2213,16 +2249,134 @@ impl PrefillCbCache {
     }
 }
 
+/// Parameters for [`MetalGraph::warm_prefill_pipelines`].
+pub struct PrefillWarmParams<'a> {
+    pub layer: &'a PrefillDenseLayerMetal<'a>,
+    pub rope_layout: MetalRopeLayout,
+    pub head_dim: u32,
+    pub gelu_ffn: bool,
+    pub kv_dtype: MetalKvDtype,
+}
+
 /// Minimal Metal encode-plan holder (prefill CB cache; decode replay later).
 #[derive(Default, Debug)]
 pub struct MetalGraph {
     pub prefill: PrefillCbCache,
+    prefill_pipelines_warmed: bool,
 }
 
 impl MetalGraph {
     pub fn new() -> Self {
         Self::default()
     }
+
+    pub fn prefill_pipelines_warmed(&self) -> bool {
+        self.prefill_pipelines_warmed
+    }
+
+    /// Compile mul_mm_sg, RMSNorm, RoPE, KV append/dequant, GQA, and FFN
+    /// elementwise pipelines used by [`launch_prefill_dense_layer`]. Mirrors
+    /// the pipeline residency half of llama.cpp `ggml_metal_graph_compute`
+    /// (full CB / graph replay is still TODO).
+    pub fn warm_prefill_pipelines(
+        &mut self,
+        device: &Retained<ProtocolObject<dyn MTLDevice>>,
+        params: PrefillWarmParams<'_>,
+    ) -> Result<(), MetalError> {
+        let mut mark = |name: &'static str| self.prefill.mark_pipeline_hot(name);
+
+        warm_prefill_elem_pipelines(device, params.gelu_ffn)?;
+        mark("rms_norm_f32");
+        mark("vec_add_f32");
+        mark(if params.gelu_ffn {
+            "gelu_mul_f32"
+        } else {
+            "silu_mul_f32"
+        });
+
+        for launch in [
+            &params.layer.q,
+            &params.layer.k,
+            &params.layer.v,
+            &params.layer.o,
+            &params.layer.gate,
+            &params.layer.up,
+            &params.layer.down,
+        ] {
+            warm_mul_mm_sg_pipeline(device, launch.fn_name)?;
+            mark(launch.fn_name);
+        }
+
+        let (rope_src, rope_name) = match params.rope_layout {
+            MetalRopeLayout::Norm => (ROPE_NORM_BATCH_KERNEL_SRC, "rope_interleaved_heads_batch"),
+            MetalRopeLayout::Neox => (ROPE_NEOX_BATCH_KERNEL_SRC, "rope_neox_heads_batch"),
+        };
+        ensure_pipeline(device, rope_src, rope_name)?;
+        mark(rope_name);
+
+        match params.kv_dtype {
+            d if d.is_q8_wire() => {
+                ensure_pipeline(device, KV_APPEND_Q8_0_KERNEL_SRC, "kv_append_q8_0")?;
+                mark("kv_append_q8_0");
+                ensure_pipeline(
+                    device,
+                    DEQUANT_Q8_0_TO_F16_KERNEL_SRC,
+                    "dequant_q8_0_to_f16",
+                )?;
+                mark("dequant_q8_0_to_f16");
+            }
+            MetalKvDtype::Turbo4 => {
+                ensure_pipeline(device, KV_APPEND_TURBO4_KERNEL_SRC, "kv_append_turbo4")?;
+                mark("kv_append_turbo4");
+                ensure_pipeline(
+                    device,
+                    DEQUANT_TURBO4_TO_F16_KERNEL_SRC,
+                    "dequant_turbo4_to_f16",
+                )?;
+                mark("dequant_turbo4_to_f16");
+            }
+            _ => {
+                ensure_pipeline(device, KV_APPEND_KERNEL_SRC, "kv_append")?;
+                mark("kv_append");
+            }
+        }
+
+        warm_gqa_prefill_pipeline(device, params.head_dim, &mut mark)?;
+
+        self.prefill_pipelines_warmed = true;
+        Ok(())
+    }
+}
+
+fn warm_gqa_prefill_pipeline(
+    device: &Retained<ProtocolObject<dyn MTLDevice>>,
+    head_dim: u32,
+    mark: &mut dyn FnMut(&'static str),
+) -> Result<(), MetalError> {
+    if metal_fa_vec_enabled() && gqa_prefill_fa_vec_supported(head_dim) {
+        let (src, name) = match head_dim {
+            64 => (
+                GQA_PREFILL_FA_VEC_D64_KERNEL_SRC,
+                "gqa_prefill_fa_vec_d64",
+            ),
+            96 => (
+                GQA_PREFILL_FA_VEC_D96_KERNEL_SRC,
+                "gqa_prefill_fa_vec_d96",
+            ),
+            128 => (GQA_PREFILL_FA_VEC_KERNEL_SRC, "gqa_prefill_fa_vec"),
+            256 => (
+                GQA_PREFILL_FA_VEC_D256_KERNEL_SRC,
+                "gqa_prefill_fa_vec_d256",
+            ),
+            _ => return Err(MetalError::CommandFailed),
+        };
+        ensure_pipeline(device, src, name)?;
+        mark(name);
+    } else {
+        ensure_pipeline(device, GQA_PREFILL_KERNEL_SRC, "gqa_prefill")?;
+        mark("gqa_prefill");
+    }
+    Ok(())
 }
 
 static PREFILL_GRAPH: OnceLock<Mutex<MetalGraph>> = OnceLock::new();
@@ -4648,6 +4802,9 @@ pub fn launch_moe_decode_layer_fused(
             hidden_rows: packed.hidden_rows,
             gate_row_bytes: packed.gate_row_bytes,
             down_row_bytes: packed.down_row_bytes,
+            gate_kind: packed.gate_kind,
+            up_kind: packed.up_kind,
+            down_kind: packed.down_kind,
         },
         extras: AttnExtras {
             q_bias: extras.q_bias,
@@ -5567,7 +5724,8 @@ pub fn launch_decode_dense_stack(
     Ok(unsafe { std::slice::from_raw_parts(out_ptr.as_ptr() as *const f32, download_n).to_vec() })
 }
 
-/// Per-layer `mul_mm_sg` launches for [`launch_prefill_dense_layer`].
+/// Per-layer `mul_mm_sg` launches for [`launch_prefill_dense_layer`] /
+/// [`launch_prefill_dense_stack`].
 pub struct PrefillDenseLayerMetal<'a> {
     pub attn_norm_w: &'a [f32],
     pub ffn_norm_w: &'a [f32],
@@ -5584,13 +5742,441 @@ pub struct PrefillDenseLayerMetal<'a> {
     pub layer_idx: u32,
 }
 
+struct PrefillScratchView<'a> {
+    h: &'a ProtocolObject<dyn MTLBuffer>,
+    x: &'a ProtocolObject<dyn MTLBuffer>,
+    x2: &'a ProtocolObject<dyn MTLBuffer>,
+    q: &'a ProtocolObject<dyn MTLBuffer>,
+    k: &'a ProtocolObject<dyn MTLBuffer>,
+    v: &'a ProtocolObject<dyn MTLBuffer>,
+    attn: &'a ProtocolObject<dyn MTLBuffer>,
+    o: &'a ProtocolObject<dyn MTLBuffer>,
+    gate: &'a ProtocolObject<dyn MTLBuffer>,
+    up: &'a ProtocolObject<dyn MTLBuffer>,
+    act: &'a ProtocolObject<dyn MTLBuffer>,
+    down: &'a ProtocolObject<dyn MTLBuffer>,
+}
+
+struct PrefillDenseLayerResident {
+    attn_nw: std::sync::Arc<ResidentF32Buffer>,
+    ffn_nw: std::sync::Arc<ResidentF32Buffer>,
+    q_w: std::sync::Arc<ResidentWeightBuffer>,
+    k_w: std::sync::Arc<ResidentWeightBuffer>,
+    v_w: std::sync::Arc<ResidentWeightBuffer>,
+    o_w: std::sync::Arc<ResidentWeightBuffer>,
+    gate_w: std::sync::Arc<ResidentWeightBuffer>,
+    up_w: std::sync::Arc<ResidentWeightBuffer>,
+    down_w: std::sync::Arc<ResidentWeightBuffer>,
+    post_attn_w: Option<std::sync::Arc<ResidentF32Buffer>>,
+    post_ffn_w: Option<std::sync::Arc<ResidentF32Buffer>>,
+}
+
+fn resident_prefill_dense_layer(
+    device: &Retained<ProtocolObject<dyn MTLDevice>>,
+    layer: &PrefillDenseLayerMetal<'_>,
+    hidden_dim: usize,
+) -> Result<PrefillDenseLayerResident, MetalError> {
+    let post_attn_w = if let Some(post) = layer.post_attn_norm {
+        assert_eq!(post.len(), hidden_dim);
+        Some(resident_f32_buffer(device, post)?)
+    } else {
+        None
+    };
+    let post_ffn_w = if let Some(post) = layer.post_ffn_norm {
+        assert_eq!(post.len(), hidden_dim);
+        Some(resident_f32_buffer(device, post)?)
+    } else {
+        None
+    };
+    Ok(PrefillDenseLayerResident {
+        attn_nw: resident_f32_buffer(device, layer.attn_norm_w)?,
+        ffn_nw: resident_f32_buffer(device, layer.ffn_norm_w)?,
+        q_w: resident_weight_buffer(device, layer.q.weights)?,
+        k_w: resident_weight_buffer(device, layer.k.weights)?,
+        v_w: resident_weight_buffer(device, layer.v.weights)?,
+        o_w: resident_weight_buffer(device, layer.o.weights)?,
+        gate_w: resident_weight_buffer(device, layer.gate.weights)?,
+        up_w: resident_weight_buffer(device, layer.up.weights)?,
+        down_w: resident_weight_buffer(device, layer.down.weights)?,
+        post_attn_w,
+        post_ffn_w,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn encode_prefill_dense_layer(
+    encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+    device: &Retained<ProtocolObject<dyn MTLDevice>>,
+    layer: &PrefillDenseLayerMetal<'_>,
+    resident: &PrefillDenseLayerResident,
+    scratch: &PrefillScratchView<'_>,
+    kv: &MetalKvBuffers,
+    n_heads: usize,
+    batch: usize,
+    hidden_dim: usize,
+    rope_layout: MetalRopeLayout,
+    rope_theta: f32,
+    ff_buf: Option<&ProtocolObject<dyn MTLBuffer>>,
+    start_pos: usize,
+    rms_eps: f32,
+    gelu_ffn: bool,
+    attn_softcap: Option<f32>,
+) -> Result<(), MetalError> {
+    let n_kv_heads = kv.n_kv_heads;
+    let head_dim = kv.head_dim;
+    let h_buf = scratch.h;
+    let x_buf = scratch.x;
+    let x2_buf = scratch.x2;
+    let q_buf = scratch.q;
+    let k_buf = scratch.k;
+    let v_buf = scratch.v;
+    let attn_buf = scratch.attn;
+    let o_buf = scratch.o;
+    let gate_buf = scratch.gate;
+    let up_buf = scratch.up;
+    let act_buf = scratch.act;
+    let down_buf = scratch.down;
+
+    for b in 0..batch {
+        let off = b * hidden_dim * 4;
+        encode_rms_norm_at(
+            encoder,
+            device,
+            h_buf,
+            off,
+            &resident.attn_nw.buffer,
+            x_buf,
+            off,
+            hidden_dim as u32,
+            rms_eps,
+        )?;
+    }
+    memory_barrier_buffers(encoder);
+
+    encode_mul_mm_sg(encoder, device, &layer.q, &resident.q_w, x_buf, q_buf, batch)?;
+    encode_mul_mm_sg(encoder, device, &layer.k, &resident.k_w, x_buf, k_buf, batch)?;
+    encode_mul_mm_sg(encoder, device, &layer.v, &resident.v_w, x_buf, v_buf, batch)?;
+    memory_barrier_buffers(encoder);
+
+    encode_rope_batch(
+        encoder,
+        device,
+        rope_layout,
+        q_buf,
+        n_heads as u32,
+        head_dim as u32,
+        rope_theta,
+        start_pos as u32,
+        batch as u32,
+        ff_buf,
+    )?;
+    encode_rope_batch(
+        encoder,
+        device,
+        rope_layout,
+        k_buf,
+        n_kv_heads as u32,
+        head_dim as u32,
+        rope_theta,
+        start_pos as u32,
+        batch as u32,
+        ff_buf,
+    )?;
+    memory_barrier_buffers(encoder);
+
+    let kv_width = n_kv_heads * head_dim;
+    let token_elems = (batch * kv_width) as u32;
+    let offset = (kv.seq_len * kv_width) as u32;
+    encode_kv_store_append(encoder, device, k_buf, kv, KvPlane::K, offset, token_elems)?;
+    encode_kv_store_append(encoder, device, v_buf, kv, KvPlane::V, offset, token_elems)?;
+    memory_barrier_buffers(encoder);
+
+    encode_gqa_prefill_with_kv(
+        encoder,
+        device,
+        q_buf,
+        kv,
+        attn_buf,
+        n_heads as u32,
+        n_kv_heads as u32,
+        head_dim as u32,
+        batch as u32,
+        start_pos as u32,
+        attn_softcap,
+    )?;
+    memory_barrier_buffers(encoder);
+
+    encode_mul_mm_sg(encoder, device, &layer.o, &resident.o_w, attn_buf, o_buf, batch)?;
+    memory_barrier_buffers(encoder);
+
+    if let Some(pw) = resident.post_attn_w.as_ref() {
+        for b in 0..batch {
+            let off = b * hidden_dim * 4;
+            encode_rms_norm_at(
+                encoder,
+                device,
+                o_buf,
+                off,
+                &pw.buffer,
+                o_buf,
+                off,
+                hidden_dim as u32,
+                rms_eps,
+            )?;
+        }
+        memory_barrier_buffers(encoder);
+    }
+
+    encode_vec_add(encoder, device, h_buf, o_buf, (batch * hidden_dim) as u32)?;
+    memory_barrier_buffers(encoder);
+    for b in 0..batch {
+        let off = b * hidden_dim * 4;
+        encode_rms_norm_at(
+            encoder,
+            device,
+            h_buf,
+            off,
+            &resident.ffn_nw.buffer,
+            x2_buf,
+            off,
+            hidden_dim as u32,
+            rms_eps,
+        )?;
+    }
+    memory_barrier_buffers(encoder);
+
+    encode_mul_mm_sg(encoder, device, &layer.gate, &resident.gate_w, x2_buf, gate_buf, batch)?;
+    encode_mul_mm_sg(encoder, device, &layer.up, &resident.up_w, x2_buf, up_buf, batch)?;
+    memory_barrier_buffers(encoder);
+    let ffn_elems = (batch * layer.gate.rows) as u32;
+    if gelu_ffn {
+        encode_gelu_mul(encoder, device, gate_buf, up_buf, act_buf, ffn_elems)?;
+    } else {
+        encode_silu_mul(encoder, device, gate_buf, up_buf, act_buf, ffn_elems)?;
+    }
+    memory_barrier_buffers(encoder);
+    encode_mul_mm_sg(encoder, device, &layer.down, &resident.down_w, act_buf, down_buf, batch)?;
+    memory_barrier_buffers(encoder);
+
+    if let Some(pw) = resident.post_ffn_w.as_ref() {
+        for b in 0..batch {
+            let off = b * hidden_dim * 4;
+            encode_rms_norm_at(
+                encoder,
+                device,
+                down_buf,
+                off,
+                &pw.buffer,
+                down_buf,
+                off,
+                hidden_dim as u32,
+                rms_eps,
+            )?;
+        }
+        memory_barrier_buffers(encoder);
+    }
+
+    encode_vec_add(
+        encoder,
+        device,
+        h_buf,
+        down_buf,
+        (batch * hidden_dim) as u32,
+    )?;
+    memory_barrier_buffers(encoder);
+    Ok(())
+}
+
+/// Consecutive dense prefill layers in **one** command buffer (B≥4).
+///
+/// Layer 0 copies `hidden` into scratch `h`; later layers leave `h` in
+/// place after each residual add. Activations stay in [`PrefillScratch`]
+/// across layers; host readback happens once at the end. Records
+/// [`PrefillStackCbKey`] plus per-layer [`PrefillCbKey`] entries in the
+/// process [`MetalGraph`].
+///
+/// Timing: `FERROX_METAL_MM_TIMING=1` logs setup/gpu/readback totals.
+#[allow(clippy::too_many_arguments)]
+pub fn launch_prefill_dense_stack(
+    hidden: &[f32],
+    layers: &[PrefillDenseLayerMetal<'_>],
+    kvs: &mut [MetalKvBuffers],
+    n_heads: usize,
+    batch: usize,
+    rope_layout: MetalRopeLayout,
+    rope_thetas: &[f32],
+    freq_factors: Option<&[f32]>,
+    start_pos: usize,
+    rms_eps: f32,
+    gelu_ffn: bool,
+    attn_softcap: Option<f32>,
+) -> Result<Vec<f32>, MetalError> {
+    if batch < 4 {
+        return Err(MetalError::CommandFailed);
+    }
+    assert_eq!(layers.len(), kvs.len());
+    assert_eq!(layers.len(), rope_thetas.len());
+    assert!(!layers.is_empty());
+
+    let hidden_dim = layers[0].attn_norm_w.len();
+    assert_eq!(hidden.len(), batch * hidden_dim);
+    let head_dim = kvs[0].head_dim;
+    let n_kv_heads = kvs[0].n_kv_heads;
+    for (layer, kv) in layers.iter().zip(kvs.iter()) {
+        assert_eq!(layer.attn_norm_w.len(), hidden_dim);
+        assert_eq!(layer.ffn_norm_w.len(), hidden_dim);
+        assert_eq!(layer.q.rows, n_heads * head_dim);
+        assert_eq!(layer.k.rows, n_kv_heads * head_dim);
+        assert_eq!(layer.v.rows, n_kv_heads * head_dim);
+        assert_eq!(layer.o.rows, hidden_dim);
+        assert_eq!(layer.down.rows, hidden_dim);
+        assert_eq!(layer.gate.rows, layer.up.rows);
+        assert_eq!(start_pos, kv.seq_len);
+        if kv.seq_len + batch > kv.capacity {
+            return Err(MetalError::CommandFailed);
+        }
+        assert_eq!(kv.head_dim, head_dim);
+        assert_eq!(kv.n_kv_heads, n_kv_heads);
+    }
+    if let Some(ff) = freq_factors {
+        assert_eq!(ff.len(), head_dim / 2);
+    }
+
+    let max_q = layers.iter().map(|l| l.q.rows).max().unwrap();
+    let max_kv = layers
+        .iter()
+        .map(|l| l.k.rows.max(l.v.rows))
+        .max()
+        .unwrap();
+    let max_gate = layers.iter().map(|l| l.gate.rows).max().unwrap();
+
+    let timing = std::env::var_os("FERROX_METAL_MM_TIMING").is_some();
+    let t_setup = std::time::Instant::now();
+
+    let shared = shared_metal()?;
+    let device = &shared.device;
+    let queue = &shared.queue;
+
+    let scratch_guard = borrow_prefill_scratch(
+        device,
+        PrefillScratchCaps {
+            batch,
+            hidden: hidden_dim,
+            max_q,
+            max_kv,
+            max_gate,
+        },
+    )?;
+    let scratch = scratch_guard.as_ref().expect("prefill scratch ensured");
+    copy_f32_into(&scratch.h, hidden);
+
+    let scratch_view = PrefillScratchView {
+        h: &scratch.h,
+        x: &scratch.x,
+        x2: &scratch.x2,
+        q: &scratch.q,
+        k: &scratch.k,
+        v: &scratch.v,
+        attn: &scratch.attn,
+        o: &scratch.o,
+        gate: &scratch.gate,
+        up: &scratch.up,
+        act: &scratch.act,
+        down: &scratch.down,
+    };
+
+    let ff_resident = match freq_factors {
+        Some(ff) => Some(resident_f32_buffer(device, ff)?),
+        None => None,
+    };
+    let ff_buf = ff_resident.as_ref().map(|b| b.buffer.as_ref());
+
+    {
+        let mut graph = metal_graph();
+        if !graph.prefill_pipelines_warmed() {
+            graph.warm_prefill_pipelines(
+                device,
+                PrefillWarmParams {
+                    layer: &layers[0],
+                    rope_layout,
+                    head_dim: head_dim as u32,
+                    gelu_ffn,
+                    kv_dtype: kvs[0].dtype,
+                },
+            )?;
+        }
+        graph.prefill.note_stack(PrefillStackCbKey {
+            start_layer: layers[0].layer_idx,
+            depth: layers.len() as u32,
+            batch: batch as u32,
+            hidden: hidden_dim as u32,
+        });
+        for layer in layers {
+            graph.prefill.note(PrefillCbKey {
+                layer: layer.layer_idx,
+                batch: batch as u32,
+                hidden: hidden_dim as u32,
+                ffn: layer.gate.rows as u32,
+                q_rows: layer.q.rows as u32,
+            });
+        }
+    }
+
+    let setup_us = t_setup.elapsed().as_micros();
+    let cmd_buf = queue.commandBuffer().ok_or(MetalError::CommandFailed)?;
+    let encoder = compute_encoder_concurrent(&cmd_buf)?;
+
+    for (layer_idx, (layer, kv)) in layers.iter().zip(kvs.iter()).enumerate() {
+        let resident = resident_prefill_dense_layer(device, layer, hidden_dim)?;
+        encode_prefill_dense_layer(
+            &encoder,
+            device,
+            layer,
+            &resident,
+            &scratch_view,
+            kv,
+            n_heads,
+            batch,
+            hidden_dim,
+            rope_layout,
+            rope_thetas[layer_idx],
+            ff_buf,
+            start_pos,
+            rms_eps,
+            gelu_ffn,
+            attn_softcap,
+        )?;
+    }
+
+    encoder.endEncoding();
+    let t_gpu = std::time::Instant::now();
+    cmd_buf.commit();
+    cmd_buf.waitUntilCompleted();
+    let gpu_us = t_gpu.elapsed().as_micros();
+
+    for kv in kvs.iter_mut() {
+        kv.seq_len += batch;
+    }
+
+    let t_read = std::time::Instant::now();
+    let out_ptr = scratch.h.contents();
+    let out = unsafe {
+        std::slice::from_raw_parts(out_ptr.as_ptr() as *const f32, batch * hidden_dim).to_vec()
+    };
+    if timing {
+        crate::gpu::mm_timing_add(setup_us, gpu_us, t_read.elapsed().as_micros());
+    }
+    Ok(out)
+}
+
 /// One dense prefill layer in **one** command buffer (B≥4).
 ///
 /// Encodes: attn RMSNorm (per row) → Q∥K∥V `mul_mm_sg` → RoPE → KV append →
 /// causal GQA → O `mul_mm_sg` → residual → FFN RMSNorm → gate∥up → act →
 /// down → residual. Activations stay in [`PrefillScratch`]; barriers match
 /// the decode-stack Concurrent pattern. Records a [`PrefillCbKey`] in the
-/// process [`MetalGraph`] stub (no CB replay yet).
+/// process [`MetalGraph`] and warms prefill pipelines on the first call
+/// (llama.cpp `ggml_metal_graph_compute` residency; CB replay still TODO).
 ///
 /// Rejects `batch < 4` and models that need QKV bias / QK-norm on this path
 /// (caller should fall back to host proj + [`launch_prefill_attn_block`]).
@@ -5611,265 +6197,20 @@ pub fn launch_prefill_dense_layer(
     gelu_ffn: bool,
     attn_softcap: Option<f32>,
 ) -> Result<Vec<f32>, MetalError> {
-    if batch < 4 {
-        return Err(MetalError::CommandFailed);
-    }
-    let head_dim = kv.head_dim;
-    let n_kv_heads = kv.n_kv_heads;
-    let hidden_dim = layer.attn_norm_w.len();
-    assert_eq!(layer.ffn_norm_w.len(), hidden_dim);
-    assert_eq!(hidden.len(), batch * hidden_dim);
-    assert_eq!(layer.q.rows, n_heads * head_dim);
-    assert_eq!(layer.k.rows, n_kv_heads * head_dim);
-    assert_eq!(layer.v.rows, n_kv_heads * head_dim);
-    assert_eq!(layer.o.rows, hidden_dim);
-    assert_eq!(layer.down.rows, hidden_dim);
-    assert_eq!(layer.gate.rows, layer.up.rows);
-    assert_eq!(start_pos, kv.seq_len);
-    if kv.seq_len + batch > kv.capacity {
-        return Err(MetalError::CommandFailed);
-    }
-    if let Some(ff) = freq_factors {
-        assert_eq!(ff.len(), head_dim / 2);
-    }
-
-    let timing = std::env::var_os("FERROX_METAL_MM_TIMING").is_some();
-    let t_setup = std::time::Instant::now();
-
-    let shared = shared_metal()?;
-    let device = &shared.device;
-    let queue = &shared.queue;
-
-    let scratch_guard = borrow_prefill_scratch(
-        device,
-        PrefillScratchCaps {
-            batch,
-            hidden: hidden_dim,
-            max_q: layer.q.rows,
-            max_kv: layer.k.rows.max(layer.v.rows),
-            max_gate: layer.gate.rows,
-        },
-    )?;
-    let scratch = scratch_guard.as_ref().expect("prefill scratch ensured");
-    copy_f32_into(&scratch.h, hidden);
-
-    let h_buf = &scratch.h;
-    let x_buf = &scratch.x;
-    let x2_buf = &scratch.x2;
-    let q_buf = &scratch.q;
-    let k_buf = &scratch.k;
-    let v_buf = &scratch.v;
-    let attn_buf = &scratch.attn;
-    let o_buf = &scratch.o;
-    let gate_buf = &scratch.gate;
-    let up_buf = &scratch.up;
-    let act_buf = &scratch.act;
-    let down_buf = &scratch.down;
-
-    let attn_nw = resident_f32_buffer(device, layer.attn_norm_w)?;
-    let ffn_nw = resident_f32_buffer(device, layer.ffn_norm_w)?;
-    let q_w = resident_weight_buffer(device, layer.q.weights)?;
-    let k_w = resident_weight_buffer(device, layer.k.weights)?;
-    let v_w = resident_weight_buffer(device, layer.v.weights)?;
-    let o_w = resident_weight_buffer(device, layer.o.weights)?;
-    let gate_w = resident_weight_buffer(device, layer.gate.weights)?;
-    let up_w = resident_weight_buffer(device, layer.up.weights)?;
-    let down_w = resident_weight_buffer(device, layer.down.weights)?;
-    let ff_resident = match freq_factors {
-        Some(ff) => Some(resident_f32_buffer(device, ff)?),
-        None => None,
-    };
-    let ff_buf = ff_resident.as_ref().map(|b| b.buffer.as_ref());
-
-    let key = PrefillCbKey {
-        layer: layer.layer_idx,
-        batch: batch as u32,
-        hidden: hidden_dim as u32,
-        ffn: layer.gate.rows as u32,
-        q_rows: layer.q.rows as u32,
-    };
-    metal_graph().prefill.note(key);
-
-    let setup_us = t_setup.elapsed().as_micros();
-    let cmd_buf = queue.commandBuffer().ok_or(MetalError::CommandFailed)?;
-    // Concurrent encode so Q∥K∥V / gate∥up can overlap; barriers on RAW
-    // edges. Prefill GQA itself is issued after a barrier (same pattern as
-    // decode stack). KV-dequant-inside-GQA still needs the barrier we
-    // place before `encode_gqa_prefill_with_kv`.
-    let encoder = compute_encoder_concurrent(&cmd_buf)?;
-
-    // Attn RMSNorm per row (independent → Concurrent-safe).
-    for b in 0..batch {
-        let off = b * hidden_dim * 4;
-        encode_rms_norm_at(
-            &encoder,
-            device,
-            h_buf,
-            off,
-            &attn_nw.buffer,
-            x_buf,
-            off,
-            hidden_dim as u32,
-            rms_eps,
-        )?;
-    }
-    memory_barrier_buffers(&encoder);
-
-    // Q∥K∥V batched GEMMs
-    encode_mul_mm_sg(&encoder, device, &layer.q, &q_w, x_buf, q_buf, batch)?;
-    encode_mul_mm_sg(&encoder, device, &layer.k, &k_w, x_buf, k_buf, batch)?;
-    encode_mul_mm_sg(&encoder, device, &layer.v, &v_w, x_buf, v_buf, batch)?;
-    memory_barrier_buffers(&encoder);
-
-    encode_rope_batch(
-        &encoder,
-        device,
+    launch_prefill_dense_stack(
+        hidden,
+        std::slice::from_ref(layer),
+        std::slice::from_mut(kv),
+        n_heads,
+        batch,
         rope_layout,
-        q_buf,
-        n_heads as u32,
-        head_dim as u32,
-        rope_theta,
-        start_pos as u32,
-        batch as u32,
-        ff_buf,
-    )?;
-    encode_rope_batch(
-        &encoder,
-        device,
-        rope_layout,
-        k_buf,
-        n_kv_heads as u32,
-        head_dim as u32,
-        rope_theta,
-        start_pos as u32,
-        batch as u32,
-        ff_buf,
-    )?;
-    memory_barrier_buffers(&encoder);
-
-    let kv_width = n_kv_heads * head_dim;
-    let token_elems = (batch * kv_width) as u32;
-    let offset = (kv.seq_len * kv_width) as u32;
-    encode_kv_store_append(&encoder, device, k_buf, kv, KvPlane::K, offset, token_elems)?;
-    encode_kv_store_append(&encoder, device, v_buf, kv, KvPlane::V, offset, token_elems)?;
-    memory_barrier_buffers(&encoder);
-
-    encode_gqa_prefill_with_kv(
-        &encoder,
-        device,
-        q_buf,
-        kv,
-        attn_buf,
-        n_heads as u32,
-        n_kv_heads as u32,
-        head_dim as u32,
-        batch as u32,
-        start_pos as u32,
+        std::slice::from_ref(&rope_theta),
+        freq_factors,
+        start_pos,
+        rms_eps,
+        gelu_ffn,
         attn_softcap,
-    )?;
-    memory_barrier_buffers(&encoder);
-
-    encode_mul_mm_sg(&encoder, device, &layer.o, &o_w, attn_buf, o_buf, batch)?;
-    memory_barrier_buffers(&encoder);
-
-    if let Some(post) = layer.post_attn_norm {
-        assert_eq!(post.len(), hidden_dim);
-        let pw = resident_f32_buffer(device, post)?;
-        for b in 0..batch {
-            let off = b * hidden_dim * 4;
-            encode_rms_norm_at(
-                &encoder,
-                device,
-                o_buf,
-                off,
-                &pw.buffer,
-                o_buf,
-                off,
-                hidden_dim as u32,
-                rms_eps,
-            )?;
-        }
-        memory_barrier_buffers(&encoder);
-    }
-
-    // Attn residual + FFN RMSNorm (per row).
-    encode_vec_add(&encoder, device, h_buf, o_buf, (batch * hidden_dim) as u32)?;
-    memory_barrier_buffers(&encoder);
-    for b in 0..batch {
-        let off = b * hidden_dim * 4;
-        encode_rms_norm_at(
-            &encoder,
-            device,
-            h_buf,
-            off,
-            &ffn_nw.buffer,
-            x2_buf,
-            off,
-            hidden_dim as u32,
-            rms_eps,
-        )?;
-    }
-    memory_barrier_buffers(&encoder);
-
-    // gate∥up → act → down (same fusion as launch_dense_ffn_swiglu_batch)
-    encode_mul_mm_sg(&encoder, device, &layer.gate, &gate_w, x2_buf, gate_buf, batch)?;
-    encode_mul_mm_sg(&encoder, device, &layer.up, &up_w, x2_buf, up_buf, batch)?;
-    memory_barrier_buffers(&encoder);
-    let ffn_elems = (batch * layer.gate.rows) as u32;
-    if gelu_ffn {
-        encode_gelu_mul(&encoder, device, gate_buf, up_buf, act_buf, ffn_elems)?;
-    } else {
-        encode_silu_mul(&encoder, device, gate_buf, up_buf, act_buf, ffn_elems)?;
-    }
-    memory_barrier_buffers(&encoder);
-    encode_mul_mm_sg(&encoder, device, &layer.down, &down_w, act_buf, down_buf, batch)?;
-    memory_barrier_buffers(&encoder);
-
-    if let Some(post) = layer.post_ffn_norm {
-        assert_eq!(post.len(), hidden_dim);
-        let pw = resident_f32_buffer(device, post)?;
-        for b in 0..batch {
-            let off = b * hidden_dim * 4;
-            encode_rms_norm_at(
-                &encoder,
-                device,
-                down_buf,
-                off,
-                &pw.buffer,
-                down_buf,
-                off,
-                hidden_dim as u32,
-                rms_eps,
-            )?;
-        }
-        memory_barrier_buffers(&encoder);
-    }
-
-    encode_vec_add(
-        &encoder,
-        device,
-        h_buf,
-        down_buf,
-        (batch * hidden_dim) as u32,
-    )?;
-
-    encoder.endEncoding();
-    let t_gpu = std::time::Instant::now();
-    cmd_buf.commit();
-    cmd_buf.waitUntilCompleted();
-    let gpu_us = t_gpu.elapsed().as_micros();
-
-    kv.seq_len += batch;
-
-    let t_read = std::time::Instant::now();
-    let out_ptr = h_buf.contents();
-    let out = unsafe {
-        std::slice::from_raw_parts(out_ptr.as_ptr() as *const f32, batch * hidden_dim).to_vec()
-    };
-    if timing {
-        crate::gpu::mm_timing_add(setup_us, gpu_us, t_read.elapsed().as_micros());
-    }
-    Ok(out)
+    )
 }
 
 /// Host-upload RoPE only (parity testing). Applies `layout` RoPE in-place
@@ -6454,6 +6795,44 @@ pub fn launch_gqa_prefill_host_ex(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prefill_cb_cache_tracks_keys_and_hot_pipelines() {
+        let mut cache = PrefillCbCache::default();
+        let key = PrefillCbKey {
+            layer: 3,
+            batch: 8,
+            hidden: 4096,
+            ffn: 14336,
+            q_rows: 4096,
+        };
+        assert!(cache.note(key));
+        assert!(!cache.note(key));
+        assert!(cache.contains(&key));
+        assert_eq!(cache.len(), 1);
+        let stack = PrefillStackCbKey {
+            start_layer: 0,
+            depth: 32,
+            batch: 8,
+            hidden: 4096,
+        };
+        assert!(cache.note_stack(stack));
+        assert!(!cache.note_stack(stack));
+        assert!(cache.contains_stack(&stack));
+        cache.mark_pipeline_hot("q4_k_mul_mm_sg");
+        cache.mark_pipeline_hot("rms_norm_f32");
+        assert!(cache.is_pipeline_hot("q4_k_mul_mm_sg"));
+        assert!(!cache.is_pipeline_hot("gqa_prefill"));
+        assert_eq!(cache.hot_pipeline_count(), 2);
+    }
+
+    #[test]
+    fn metal_mm_timing_env_is_optional() {
+        // Documented hook for [`launch_prefill_dense_layer`]: when set, setup/gpu/readback
+        // microseconds accumulate via [`crate::gpu::mm_timing_add`].
+        let enabled = std::env::var_os("FERROX_METAL_MM_TIMING").is_some();
+        let _ = enabled;
+    }
 
     #[test]
     fn parse_metal_kv_dtype_f16_default_and_aliases() {

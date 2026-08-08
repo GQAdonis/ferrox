@@ -45,7 +45,14 @@ fn qwen2moe_cpu_greedy_paris_regression() {
     let config = ModelConfig::from_gguf(&file).expect("from_gguf");
     eprintln!(
         "config: sliding_window={:?} expert_ffn_dim={} norm_topk_prob={} n_shared={}",
-        config.sliding_window, config.moe.expert_ffn_dim, config.moe.norm_topk_prob, config.moe.n_shared_experts
+        config.sliding_window,
+        config.moe.expert_ffn_dim,
+        config.moe.norm_topk_prob,
+        config.moe.n_shared_experts
+    );
+    assert_eq!(
+        config.moe.expert_ffn_dim, 1408,
+        "routed expert ffn dim should be feed_forward_length/expert_used_count"
     );
     let tok = GgufBpeTokenizer::from_gguf(&file).expect("tokenizer");
     let decoder = Decoder::from_gguf(&path, config.clone()).expect("load decoder");
@@ -57,12 +64,25 @@ fn qwen2moe_cpu_greedy_paris_regression() {
         .collect();
     // llama.cpp qwen2 pre: add_bos=false — do not prepend bos_token_id.
 
+    eprintln!("prompt tokens ({}) = {tokens:?}", tokens.len());
+
     let mut caches: Vec<KvCache> = (0..config.n_layers)
+        .map(|_| KvCache::new(config.n_kv_heads, config.head_dim))
+        .collect();
+    let mut caches_last: Vec<KvCache> = (0..config.n_layers)
         .map(|_| KvCache::new(config.n_kv_heads, config.head_dim))
         .collect();
 
     let logits_per_pos = decoder.forward_batch(&tokens, 0, &mut caches);
-    let mut last_logits = logits_per_pos.last().expect("non-empty prompt").clone();
+    let batch_last = logits_per_pos.last().expect("non-empty prompt");
+    let prefill_last = decoder.forward_batch_last(&tokens, 0, &mut caches_last);
+    for (i, (a, b)) in batch_last.iter().zip(prefill_last.iter()).enumerate() {
+        assert!(
+            (a - b).abs() < 1e-3,
+            "forward_batch vs forward_batch_last logit {i}: {a} vs {b}"
+        );
+    }
+    let mut last_logits = prefill_last;
 
     let mut generated = Vec::with_capacity(MAX_NEW_TOKENS);
     for step in 0..MAX_NEW_TOKENS {

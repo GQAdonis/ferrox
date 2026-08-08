@@ -768,84 +768,6 @@ kernel void q4_0_moe_matvec_id(
     }
 }
 
-/// Prefill `mul_mm_id` (llama `ne21_mm_id_min`-style): one expert, many
-/// tokens as a batch tile (`NB=8`), scatter into slot-major `out`.
-/// `token_ids`/`slot_ids` length = `batch_size` (map0 output for one expert).
-kernel void q4_0_moe_mul_mm_id(
-    device const uchar* weights [[buffer(0)]],
-    device const float* x [[buffer(1)]],
-    device float* out [[buffer(2)]],
-    device const int* token_ids [[buffer(3)]],
-    device const int* slot_ids [[buffer(4)]],
-    constant uint& row_bytes [[buffer(5)]],
-    constant uint& n_blocks_per_row [[buffer(6)]],
-    constant uint& n_rows [[buffer(7)]],
-    constant uint& batch_size [[buffer(8)]],
-    constant uint& x_stride [[buffer(9)]],
-    uint row [[threadgroup_position_in_grid]],
-    uint tid [[thread_position_in_threadgroup]],
-    uint tg_size [[threads_per_threadgroup]],
-    threadgroup float* partial [[threadgroup(0)]]
-) {
-    if (row >= n_rows || batch_size == 0u) {
-        return;
-    }
-    constexpr short NB = 8;
-    device const uchar* row_ptr = weights + (size_t)row * row_bytes;
-
-    for (int bt = 0; bt < int(batch_size); bt += NB) {
-        float acc[8];
-        for (short b = 0; b < NB; ++b) {
-            acc[b] = 0.0f;
-        }
-        for (uint blk = tid; blk < n_blocks_per_row; blk += tg_size) {
-            device const uchar* block = row_ptr + blk * 18u;
-            const float scale = float(*(device const half*)block);
-            const uint base = blk * 32u;
-            for (short b = 0; b < NB; ++b) {
-                const int batch_idx = bt + b;
-                if (batch_idx >= int(batch_size)) {
-                    break;
-                }
-                const uint tok = uint(token_ids[batch_idx]);
-                device const float* xb = x + (size_t)tok * x_stride + base;
-                float block_acc = 0.0f;
-                for (uint i = 0u; i < 16u; i++) {
-                    const uchar byte = block[2 + i];
-                    const int lo = (int)(byte & 0x0Fu) - 8;
-                    const int hi = (int)((byte >> 4) & 0x0Fu) - 8;
-                    block_acc += float(lo) * xb[i];
-                    block_acc += float(hi) * xb[i + 16];
-                }
-                acc[b] += block_acc * scale;
-            }
-        }
-        for (short b = 0; b < NB; ++b) {
-            const int batch_idx = bt + b;
-            if (batch_idx >= int(batch_size)) {
-                break;
-            }
-            partial[tid] = acc[b];
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            float s = simd_sum(acc[b]);
-            if ((tid & 31u) == 0u) {
-                partial[tid / 32u] = s;
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            if (tid == 0u) {
-                float total = 0.0f;
-                const uint nsg = (tg_size + 31u) / 32u;
-                for (uint i = 0u; i < nsg; i++) {
-                    total += partial[i];
-                }
-                const uint slot = uint(slot_ids[batch_idx]);
-                out[(size_t)slot * n_rows + row] = total;
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-        }
-    }
-}
-
 /// Like matvec_id, but writes silu(gate)*dot into `out` (skips a separate
 /// silu_mul pass after the up projection).
 kernel void q4_0_moe_matvec_id_silu(
@@ -1476,6 +1398,432 @@ kernel void q4_k_matvec(
         float sum_all = simd_sum(sumf[row]);
         if (tiisg == 0 && first_row + row < int(n_rows)) {
             out[first_row + row] = sum_all;
+        }
+    }
+}
+"#;
+
+/// llama.cpp `mul_mv_id` slot-parallel MoE matvec for Q4_K packed planes.
+pub const Q4_K_MOE_MATVEC_ID_KERNEL_SRC: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+kernel void q4_k_moe_matvec_id(
+    device const uchar* w_all [[buffer(0)]],
+    device const float* x [[buffer(1)]],
+    device float* out [[buffer(2)]],
+    device const int* ids [[buffer(3)]],
+    constant uint& row_bytes [[buffer(4)]],
+    constant uint& n_blocks_per_row [[buffer(5)]],
+    constant uint& n_rows [[buffer(6)]],
+    constant uint& top_k [[buffer(7)]],
+    constant uint& expert_stride [[buffer(8)]],
+    constant uint& n_tokens [[buffer(9)]],
+    constant uint& x_stride [[buffer(10)]],
+    uint3 tgpig [[threadgroup_position_in_grid]],
+    uint tiisg [[thread_index_in_simdgroup]],
+    uint sgitg [[simdgroup_index_in_threadgroup]]
+) {
+    constexpr short NSG = 2;
+    constexpr short nr0 = 2;
+    constexpr uint16_t kmask1 = 0x3f3f;
+    constexpr uint16_t kmask2 = 0x0f0f;
+    constexpr uint16_t kmask3 = 0xc0c0;
+
+    const uint slot = tgpig.z;
+    const uint n_slots = n_tokens * top_k;
+    if (slot >= n_slots) return;
+    const uint token = slot / top_k;
+    const uint eid = uint(ids[slot]);
+    device const uchar* weights = w_all + (size_t)eid * expert_stride;
+
+    const short ix = tiisg / 8;
+    const short it = tiisg % 8;
+    const short iq = it / 4;
+    const short ir = it % 4;
+
+    const int first_row = int(tgpig.x * NSG + sgitg) * nr0;
+    const int nb = int(n_blocks_per_row);
+
+    float yl[16];
+    float yh[16];
+    float sumf[2] = {0.0f, 0.0f};
+
+    device const float* y4 = x + (size_t)token * x_stride + ix * 256 + 64 * iq + 8 * ir;
+
+    for (int ib = ix; ib < nb; ib += 4) {
+        float4 sumy = float4(0.0f);
+
+        #pragma clang loop unroll(full)
+        for (short i = 0; i < 8; ++i) {
+            yl[i + 0] = y4[i + 0];
+            sumy[0] += yl[i + 0];
+            yl[i + 8] = y4[i + 32];
+            sumy[1] += yl[i + 8];
+            yh[i + 0] = y4[i + 128];
+            sumy[2] += yh[i + 0];
+            yh[i + 8] = y4[i + 160];
+            sumy[3] += yh[i + 8];
+        }
+
+        device const uchar* block0 =
+            weights + (size_t)first_row * row_bytes + (size_t)ib * 144u;
+        device const uint16_t* sc =
+            (device const uint16_t*)(block0 + 4) + iq;
+        device const uint16_t* q1 =
+            (device const uint16_t*)(block0 + 16) + 16 * iq + 4 * ir;
+        device const half* dh = (device const half*)(block0);
+
+        uint16_t sc16[4];
+        thread const uint8_t* sc8 = (thread const uint8_t*)sc16;
+
+        for (short row = 0; row < nr0; row++) {
+            sc16[0] = sc[0] & kmask1;
+            sc16[1] = sc[2] & kmask1;
+            sc16[2] = ((sc[4] >> 0) & kmask2) | ((sc[0] & kmask3) >> 2);
+            sc16[3] = ((sc[4] >> 4) & kmask2) | ((sc[2] & kmask3) >> 2);
+
+            device const uint16_t* q2 = q1 + 32;
+
+            float4 acc1 = float4(0.0f);
+            float4 acc2 = float4(0.0f);
+
+            #pragma clang loop unroll(full)
+            for (short i = 0; i < 4; ++i) {
+                acc1[0] += yl[2 * i + 0] * float(q1[i] & 0x000F);
+                acc1[1] += yl[2 * i + 1] * float(q1[i] & 0x0F00);
+                acc1[2] += yl[2 * i + 8] * float(q1[i] & 0x00F0);
+                acc1[3] += yl[2 * i + 9] * float(q1[i] & 0xF000);
+                acc2[0] += yh[2 * i + 0] * float(q2[i] & 0x000F);
+                acc2[1] += yh[2 * i + 1] * float(q2[i] & 0x0F00);
+                acc2[2] += yh[2 * i + 8] * float(q2[i] & 0x00F0);
+                acc2[3] += yh[2 * i + 9] * float(q2[i] & 0xF000);
+            }
+
+            sumf[row] += float(dh[0])
+                    * ((acc1[0] + (1.0f / 256.0f) * acc1[1]) * float(sc8[0])
+                        + (acc1[2] + (1.0f / 256.0f) * acc1[3]) * float(sc8[1])
+                            * (1.0f / 16.0f)
+                        + (acc2[0] + (1.0f / 256.0f) * acc2[1]) * float(sc8[4])
+                        + (acc2[2] + (1.0f / 256.0f) * acc2[3]) * float(sc8[5])
+                            * (1.0f / 16.0f))
+                - float(dh[1])
+                    * (sumy[0] * float(sc8[2]) + sumy[1] * float(sc8[3])
+                        + sumy[2] * float(sc8[6]) + sumy[3] * float(sc8[7]));
+
+            q1 += row_bytes / 2;
+            sc += row_bytes / 2;
+            dh += row_bytes / 2;
+        }
+
+        y4 += 4 * 256;
+    }
+
+    for (int row = 0; row < nr0; ++row) {
+        float sum_all = simd_sum(sumf[row]);
+        if (tiisg == 0 && first_row + row < int(n_rows)) {
+            out[(size_t)slot * n_rows + first_row + row] = sum_all;
+        }
+    }
+}
+
+kernel void q4_k_moe_down_id(
+    device const uchar* down_all [[buffer(0)]],
+    device const float* act [[buffer(1)]],
+    device float* expert_out [[buffer(2)]],
+    device const int* ids [[buffer(3)]],
+    constant uint& row_bytes [[buffer(4)]],
+    constant uint& n_blocks_per_row [[buffer(5)]],
+    constant uint& hidden_rows [[buffer(6)]],
+    constant uint& ffn_rows [[buffer(7)]],
+    constant uint& top_k [[buffer(8)]],
+    constant uint& expert_stride [[buffer(9)]],
+    constant uint& n_tokens [[buffer(10)]],
+    uint3 tgpig [[threadgroup_position_in_grid]],
+    uint tiisg [[thread_index_in_simdgroup]],
+    uint sgitg [[simdgroup_index_in_threadgroup]]
+) {
+    constexpr short NSG = 2;
+    constexpr short nr0 = 2;
+    constexpr uint16_t kmask1 = 0x3f3f;
+    constexpr uint16_t kmask2 = 0x0f0f;
+    constexpr uint16_t kmask3 = 0xc0c0;
+
+    const uint slot = tgpig.z;
+    const uint n_slots = n_tokens * top_k;
+    if (slot >= n_slots) return;
+    const uint eid = uint(ids[slot]);
+    device const uchar* weights = down_all + (size_t)eid * expert_stride;
+    device const float* xa = act + (size_t)slot * ffn_rows;
+
+    const short ix = tiisg / 8;
+    const short it = tiisg % 8;
+    const short iq = it / 4;
+    const short ir = it % 4;
+
+    const int first_row = int(tgpig.x * NSG + sgitg) * nr0;
+    const int nb = int(n_blocks_per_row);
+
+    float yl[16];
+    float yh[16];
+    float sumf[2] = {0.0f, 0.0f};
+
+    device const float* y4 = xa + ix * 256 + 64 * iq + 8 * ir;
+
+    for (int ib = ix; ib < nb; ib += 4) {
+        float4 sumy = float4(0.0f);
+
+        #pragma clang loop unroll(full)
+        for (short i = 0; i < 8; ++i) {
+            yl[i + 0] = y4[i + 0];
+            sumy[0] += yl[i + 0];
+            yl[i + 8] = y4[i + 32];
+            sumy[1] += yl[i + 8];
+            yh[i + 0] = y4[i + 128];
+            sumy[2] += yh[i + 0];
+            yh[i + 8] = y4[i + 160];
+            sumy[3] += yh[i + 8];
+        }
+
+        device const uchar* block0 =
+            weights + (size_t)first_row * row_bytes + (size_t)ib * 144u;
+        device const uint16_t* sc =
+            (device const uint16_t*)(block0 + 4) + iq;
+        device const uint16_t* q1 =
+            (device const uint16_t*)(block0 + 16) + 16 * iq + 4 * ir;
+        device const half* dh = (device const half*)(block0);
+
+        uint16_t sc16[4];
+        thread const uint8_t* sc8 = (thread const uint8_t*)sc16;
+
+        for (short row = 0; row < nr0; row++) {
+            sc16[0] = sc[0] & kmask1;
+            sc16[1] = sc[2] & kmask1;
+            sc16[2] = ((sc[4] >> 0) & kmask2) | ((sc[0] & kmask3) >> 2);
+            sc16[3] = ((sc[4] >> 4) & kmask2) | ((sc[2] & kmask3) >> 2);
+
+            device const uint16_t* q2 = q1 + 32;
+
+            float4 acc1 = float4(0.0f);
+            float4 acc2 = float4(0.0f);
+
+            #pragma clang loop unroll(full)
+            for (short i = 0; i < 4; ++i) {
+                acc1[0] += yl[2 * i + 0] * float(q1[i] & 0x000F);
+                acc1[1] += yl[2 * i + 1] * float(q1[i] & 0x0F00);
+                acc1[2] += yl[2 * i + 8] * float(q1[i] & 0x00F0);
+                acc1[3] += yl[2 * i + 9] * float(q1[i] & 0xF000);
+                acc2[0] += yh[2 * i + 0] * float(q2[i] & 0x000F);
+                acc2[1] += yh[2 * i + 1] * float(q2[i] & 0x0F00);
+                acc2[2] += yh[2 * i + 8] * float(q2[i] & 0x00F0);
+                acc2[3] += yh[2 * i + 9] * float(q2[i] & 0xF000);
+            }
+
+            sumf[row] += float(dh[0])
+                    * ((acc1[0] + (1.0f / 256.0f) * acc1[1]) * float(sc8[0])
+                        + (acc1[2] + (1.0f / 256.0f) * acc1[3]) * float(sc8[1])
+                            * (1.0f / 16.0f)
+                        + (acc2[0] + (1.0f / 256.0f) * acc2[1]) * float(sc8[4])
+                        + (acc2[2] + (1.0f / 256.0f) * acc2[3]) * float(sc8[5])
+                            * (1.0f / 16.0f))
+                - float(dh[1])
+                    * (sumy[0] * float(sc8[2]) + sumy[1] * float(sc8[3])
+                        + sumy[2] * float(sc8[6]) + sumy[3] * float(sc8[7]));
+
+            q1 += row_bytes / 2;
+            sc += row_bytes / 2;
+            dh += row_bytes / 2;
+        }
+
+        y4 += 4 * 256;
+    }
+
+    for (int row = 0; row < nr0; ++row) {
+        float sum_all = simd_sum(sumf[row]);
+        if (tiisg == 0 && first_row + row < int(hidden_rows)) {
+            expert_out[(size_t)slot * hidden_rows + first_row + row] = sum_all;
+        }
+    }
+}
+"#;
+
+/// llama.cpp `mul_mv_id` slot-parallel MoE matvec for Q8_0 packed planes.
+pub const Q8_0_MOE_MATVEC_ID_KERNEL_SRC: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+kernel void q8_0_moe_matvec_id(
+    device const uchar* w_all [[buffer(0)]],
+    device const float* x [[buffer(1)]],
+    device float* out [[buffer(2)]],
+    device const int* ids [[buffer(3)]],
+    constant uint& row_bytes [[buffer(4)]],
+    constant uint& n_blocks_per_row [[buffer(5)]],
+    constant uint& n_rows [[buffer(6)]],
+    constant uint& top_k [[buffer(7)]],
+    constant uint& expert_stride [[buffer(8)]],
+    constant uint& n_tokens [[buffer(9)]],
+    constant uint& x_stride [[buffer(10)]],
+    uint3 tgpig [[threadgroup_position_in_grid]],
+    uint tiisg [[thread_index_in_simdgroup]],
+    uint sgitg [[simdgroup_index_in_threadgroup]],
+    threadgroup float* partial [[threadgroup(0)]]
+) {
+    constexpr short NSG = 4;
+    constexpr short nr0 = 2;
+    constexpr short NQ = 8;
+
+    const uint slot = tgpig.z;
+    const uint n_slots = n_tokens * top_k;
+    if (slot >= n_slots) return;
+    const uint token = slot / top_k;
+    const uint eid = uint(ids[slot]);
+    device const uchar* weights = w_all + (size_t)eid * expert_stride;
+
+    const int nb = int(n_blocks_per_row);
+    const int first_row = int(tgpig.x) * nr0;
+
+    device const uchar* row_ptr[nr0];
+    for (short row = 0; row < nr0; ++row) {
+        row_ptr[row] = weights + (size_t)(first_row + row) * row_bytes;
+    }
+
+    const short ix = short(tiisg) / (32 / NQ);
+    const short il = short(tiisg) % (32 / NQ);
+
+    const int ib0 = int(sgitg) * NQ + ix;
+
+    float sumf[nr0] = {0.0f, 0.0f};
+    float yl[NQ];
+
+    device const float* yb = x + (size_t)token * x_stride + ib0 * 32 + il * NQ;
+
+    for (int ib = ib0; ib < nb; ib += NSG * NQ) {
+        #pragma clang loop unroll(full)
+        for (short i = 0; i < NQ; ++i) {
+            yl[i] = yb[i];
+        }
+
+        for (short row = 0; row < nr0; ++row) {
+            device const uchar* block = row_ptr[row] + (size_t)ib * 34u;
+            device const char* qs = (device const char*)(block + 2) + il * NQ;
+
+            float sumq = 0.0f;
+            #pragma clang loop unroll(full)
+            for (short i = 0; i < NQ; ++i) {
+                sumq += float(qs[i]) * yl[i];
+            }
+
+            sumf[row] += sumq * float(*(device const half*)(block));
+        }
+
+        yb += NSG * NQ * 32;
+    }
+
+    for (short row = 0; row < nr0; ++row) {
+        float s = simd_sum(sumf[row]);
+        if (tiisg == 0) {
+            partial[row * NSG + sgitg] = s;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sgitg == 0 && tiisg == 0) {
+        for (short row = 0; row < nr0; ++row) {
+            if (first_row + row < int(n_rows)) {
+                float total = 0.0f;
+                for (short sg = 0; sg < NSG; ++sg) {
+                    total += partial[row * NSG + sg];
+                }
+                out[(size_t)slot * n_rows + first_row + row] = total;
+            }
+        }
+    }
+}
+
+kernel void q8_0_moe_down_id(
+    device const uchar* down_all [[buffer(0)]],
+    device const float* act [[buffer(1)]],
+    device float* expert_out [[buffer(2)]],
+    device const int* ids [[buffer(3)]],
+    constant uint& row_bytes [[buffer(4)]],
+    constant uint& n_blocks_per_row [[buffer(5)]],
+    constant uint& hidden_rows [[buffer(6)]],
+    constant uint& ffn_rows [[buffer(7)]],
+    constant uint& top_k [[buffer(8)]],
+    constant uint& expert_stride [[buffer(9)]],
+    constant uint& n_tokens [[buffer(10)]],
+    uint3 tgpig [[threadgroup_position_in_grid]],
+    uint tiisg [[thread_index_in_simdgroup]],
+    uint sgitg [[simdgroup_index_in_threadgroup]],
+    threadgroup float* partial [[threadgroup(0)]]
+) {
+    constexpr short NSG = 4;
+    constexpr short nr0 = 2;
+    constexpr short NQ = 8;
+
+    const uint slot = tgpig.z;
+    const uint n_slots = n_tokens * top_k;
+    if (slot >= n_slots) return;
+    const uint eid = uint(ids[slot]);
+    device const uchar* weights = down_all + (size_t)eid * expert_stride;
+    device const float* xa = act + (size_t)slot * ffn_rows;
+
+    const int nb = int(n_blocks_per_row);
+    const int first_row = int(tgpig.x) * nr0;
+
+    device const uchar* row_ptr[nr0];
+    for (short row = 0; row < nr0; ++row) {
+        row_ptr[row] = weights + (size_t)(first_row + row) * row_bytes;
+    }
+
+    const short ix = short(tiisg) / (32 / NQ);
+    const short il = short(tiisg) % (32 / NQ);
+
+    const int ib0 = int(sgitg) * NQ + ix;
+
+    float sumf[nr0] = {0.0f, 0.0f};
+    float yl[NQ];
+
+    device const float* yb = xa + ib0 * 32 + il * NQ;
+
+    for (int ib = ib0; ib < nb; ib += NSG * NQ) {
+        #pragma clang loop unroll(full)
+        for (short i = 0; i < NQ; ++i) {
+            yl[i] = yb[i];
+        }
+
+        for (short row = 0; row < nr0; ++row) {
+            device const uchar* block = row_ptr[row] + (size_t)ib * 34u;
+            device const char* qs = (device const char*)(block + 2) + il * NQ;
+
+            float sumq = 0.0f;
+            #pragma clang loop unroll(full)
+            for (short i = 0; i < NQ; ++i) {
+                sumq += float(qs[i]) * yl[i];
+            }
+
+            sumf[row] += sumq * float(*(device const half*)(block));
+        }
+
+        yb += NSG * NQ * 32;
+    }
+
+    for (short row = 0; row < nr0; ++row) {
+        float s = simd_sum(sumf[row]);
+        if (tiisg == 0) {
+            partial[row * NSG + sgitg] = s;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sgitg == 0 && tiisg == 0) {
+        for (short row = 0; row < nr0; ++row) {
+            if (first_row + row < int(hidden_rows)) {
+                float total = 0.0f;
+                for (short sg = 0; sg < NSG; ++sg) {
+                    total += partial[row * NSG + sg];
+                }
+                expert_out[(size_t)slot * hidden_rows + first_row + row] = total;
+            }
         }
     }
 }
@@ -2745,7 +3093,8 @@ pub(crate) fn mm_timing_add(setup: u128, gpu: u128, read: u128) {
     MM_GPU_US.fetch_add(gpu as u64, AtomOrd::Relaxed);
     MM_READ_US.fetch_add(read as u64, AtomOrd::Relaxed);
     let n = MM_CALLS.fetch_add(1, AtomOrd::Relaxed) + 1;
-    if n % 224 == 0 {
+    // First call + every 224: stack prefill is often one timed launch.
+    if n == 1 || n % 224 == 0 {
         eprintln!(
             "ferrox: mul_mm {n} calls -- setup {:.1} ms, gpu {:.1} ms, readback {:.1} ms",
             MM_SETUP_US.load(AtomOrd::Relaxed) as f64 / 1000.0,
@@ -3635,6 +3984,16 @@ pub(crate) fn ensure_pipeline(
     Ok(cached)
 }
 
+/// Compile-once helper for prefill [`encode_mul_mm_sg`] kernels. Used by
+/// [`crate::attn::MetalGraph::warm_prefill_pipelines`] to front-load Metal
+/// pipeline creation before the first dense-prefill command buffer.
+pub(crate) fn warm_mul_mm_sg_pipeline(
+    device: &Retained<ProtocolObject<dyn MTLDevice>>,
+    fn_name: &'static str,
+) -> Result<Arc<CachedPipeline>, MetalError> {
+    ensure_pipeline(device, K_QUANT_MUL_MM_SG_KERNEL_SRC, fn_name)
+}
+
 /// Process-wide cache of quantized weight `MTLBuffer`s, keyed by the
 /// host slice's base pointer and length. Stable for mmap-backed and
 /// owned `WeightBytes` after load (weights are not mutated in place).
@@ -4189,6 +4548,9 @@ pub struct MoePackedQ4<'a> {
     pub hidden_rows: usize,
     pub gate_row_bytes: usize,
     pub down_row_bytes: usize,
+    pub gate_kind: &'static str,
+    pub up_kind: &'static str,
+    pub down_kind: &'static str,
 }
 
 /// Encode softmax top-k routing (n≤256, k≤8) into an existing encoder.
@@ -4243,10 +4605,85 @@ pub(crate) fn encode_moe_topk_softmax(
     Ok(())
 }
 
+struct MoeMatvecIdDispatch {
+    kernel_src: &'static str,
+    fn_name: &'static str,
+    rows_per_tg: usize,
+    tg_threads: (usize, usize, usize),
+    tg_mem: usize,
+}
+
+fn moe_matvec_id_dispatch(kind: &str) -> Option<MoeMatvecIdDispatch> {
+    match kind {
+        "Q4_0" => Some(MoeMatvecIdDispatch {
+            kernel_src: Q4_0_MOE_TOPK_KERNEL_SRC,
+            fn_name: "q4_0_moe_matvec_id",
+            rows_per_tg: 8,
+            tg_threads: (32, 2, 1),
+            tg_mem: 0,
+        }),
+        "Q4_K" => Some(MoeMatvecIdDispatch {
+            kernel_src: Q4_K_MOE_MATVEC_ID_KERNEL_SRC,
+            fn_name: "q4_k_moe_matvec_id",
+            rows_per_tg: 4,
+            tg_threads: (64, 1, 1),
+            tg_mem: 0,
+        }),
+        "Q8_0" => Some(MoeMatvecIdDispatch {
+            kernel_src: Q8_0_MOE_MATVEC_ID_KERNEL_SRC,
+            fn_name: "q8_0_moe_matvec_id",
+            rows_per_tg: 2,
+            tg_threads: (128, 1, 1),
+            tg_mem: 32,
+        }),
+        _ => None,
+    }
+}
+
+fn moe_down_id_dispatch(kind: &str) -> Option<MoeMatvecIdDispatch> {
+    match kind {
+        "Q4_0" => Some(MoeMatvecIdDispatch {
+            kernel_src: Q4_0_MOE_TOPK_KERNEL_SRC,
+            fn_name: "q4_0_moe_down_id",
+            rows_per_tg: 8,
+            tg_threads: (32, 2, 1),
+            tg_mem: 0,
+        }),
+        "Q4_K" => Some(MoeMatvecIdDispatch {
+            kernel_src: Q4_K_MOE_MATVEC_ID_KERNEL_SRC,
+            fn_name: "q4_k_moe_down_id",
+            rows_per_tg: 4,
+            tg_threads: (64, 1, 1),
+            tg_mem: 0,
+        }),
+        "Q8_0" => Some(MoeMatvecIdDispatch {
+            kernel_src: Q8_0_MOE_MATVEC_ID_KERNEL_SRC,
+            fn_name: "q8_0_moe_down_id",
+            rows_per_tg: 2,
+            tg_threads: (128, 1, 1),
+            tg_mem: 32,
+        }),
+        _ => None,
+    }
+}
+
+fn moe_row_blocks(row_bytes: usize, kind: &str) -> Result<u32, MetalError> {
+    let (_, _, block_bytes, _, _) =
+        matvec_launch_meta(kind).ok_or(MetalError::CommandFailed)?;
+    Ok((row_bytes / block_bytes) as u32)
+}
+
+fn moe_x_stride(row_bytes: usize, kind: &str) -> Result<u32, MetalError> {
+    let (_, _, block_bytes, block_elems, _) =
+        matvec_launch_meta(kind).ok_or(MetalError::CommandFailed)?;
+    Ok(((row_bytes / block_bytes) * block_elems) as u32)
+}
+
 #[allow(clippy::too_many_arguments)]
-fn encode_q4_0_moe_matvec_id(
+fn encode_moe_matvec_id(
     encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
     device: &Retained<ProtocolObject<dyn MTLDevice>>,
+    kind: &str,
     w: &ResidentWeightBuffer,
     x_buf: &ProtocolObject<dyn MTLBuffer>,
     out: &ProtocolObject<dyn MTLBuffer>,
@@ -4260,9 +4697,9 @@ fn encode_q4_0_moe_matvec_id(
     x_stride: u32,
     n_slots: usize,
 ) -> Result<(), MetalError> {
-    let pipe = ensure_pipeline(device, Q4_0_MOE_TOPK_KERNEL_SRC, "q4_0_moe_matvec_id")?;
+    let disp = moe_matvec_id_dispatch(kind).ok_or(MetalError::CommandFailed)?;
+    let pipe = ensure_pipeline(device, disp.kernel_src, disp.fn_name)?;
     encoder.setComputePipelineState(&pipe.0);
-    const ROWS_PER_TG: usize = 8;
     unsafe {
         encoder.setBuffer_offset_atIndex(Some(&w.buffer), w.weight_offset, 0);
         encoder.setBuffer_offset_atIndex(Some(x_buf), 0, 1);
@@ -4298,21 +4735,138 @@ fn encode_q4_0_moe_matvec_id(
             4,
             10,
         );
+        if disp.tg_mem > 0 {
+            encoder.setThreadgroupMemoryLength_atIndex(disp.tg_mem, 0);
+        }
     }
     encoder.dispatchThreadgroups_threadsPerThreadgroup(
         MTLSize {
-            // llama.cpp: (row_groups, 1, n_slots) × threads (32, NSG, 1)
-            width: (n_rows as usize).div_ceil(ROWS_PER_TG),
+            width: (n_rows as usize).div_ceil(disp.rows_per_tg),
             height: 1,
             depth: n_slots,
         },
         MTLSize {
-            width: 32,
-            height: 2, // NSG
-            depth: 1,
+            width: disp.tg_threads.0,
+            height: disp.tg_threads.1,
+            depth: disp.tg_threads.2,
         },
     );
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn encode_moe_down_id(
+    encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+    device: &Retained<ProtocolObject<dyn MTLDevice>>,
+    kind: &str,
+    down_w: &ResidentWeightBuffer,
+    act_buf: &ProtocolObject<dyn MTLBuffer>,
+    expert_out_buf: &ProtocolObject<dyn MTLBuffer>,
+    ids: &ProtocolObject<dyn MTLBuffer>,
+    row_bytes: u32,
+    n_blocks: u32,
+    hidden_rows: u32,
+    ffn_rows: u32,
+    top_k: u32,
+    expert_stride: u32,
+    n_tokens: u32,
+    n_slots: usize,
+) -> Result<(), MetalError> {
+    let disp = moe_down_id_dispatch(kind).ok_or(MetalError::CommandFailed)?;
+    let pipe = ensure_pipeline(device, disp.kernel_src, disp.fn_name)?;
+    encoder.setComputePipelineState(&pipe.0);
+    unsafe {
+        encoder.setBuffer_offset_atIndex(Some(&down_w.buffer), down_w.weight_offset, 0);
+        encoder.setBuffer_offset_atIndex(Some(act_buf), 0, 1);
+        encoder.setBuffer_offset_atIndex(Some(expert_out_buf), 0, 2);
+        encoder.setBuffer_offset_atIndex(Some(ids), 0, 3);
+        let mut rb = row_bytes;
+        encoder.setBytes_length_atIndex(NonNull::new(&mut rb as *mut u32 as *mut _).unwrap(), 4, 4);
+        let mut blocks = n_blocks;
+        encoder.setBytes_length_atIndex(
+            NonNull::new(&mut blocks as *mut u32 as *mut _).unwrap(),
+            4,
+            5,
+        );
+        let mut hidden = hidden_rows;
+        encoder.setBytes_length_atIndex(
+            NonNull::new(&mut hidden as *mut u32 as *mut _).unwrap(),
+            4,
+            6,
+        );
+        let mut ffn = ffn_rows;
+        encoder.setBytes_length_atIndex(
+            NonNull::new(&mut ffn as *mut u32 as *mut _).unwrap(),
+            4,
+            7,
+        );
+        let mut tk = top_k;
+        encoder.setBytes_length_atIndex(NonNull::new(&mut tk as *mut u32 as *mut _).unwrap(), 4, 8);
+        let mut stride = expert_stride;
+        encoder.setBytes_length_atIndex(
+            NonNull::new(&mut stride as *mut u32 as *mut _).unwrap(),
+            4,
+            9,
+        );
+        let mut nt = n_tokens;
+        encoder.setBytes_length_atIndex(
+            NonNull::new(&mut nt as *mut u32 as *mut _).unwrap(),
+            4,
+            10,
+        );
+        if disp.tg_mem > 0 {
+            encoder.setThreadgroupMemoryLength_atIndex(disp.tg_mem, 0);
+        }
+    }
+    encoder.dispatchThreadgroups_threadsPerThreadgroup(
+        MTLSize {
+            width: (hidden_rows as usize).div_ceil(disp.rows_per_tg),
+            height: 1,
+            depth: n_slots,
+        },
+        MTLSize {
+            width: disp.tg_threads.0,
+            height: disp.tg_threads.1,
+            depth: disp.tg_threads.2,
+        },
+    );
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn encode_q4_0_moe_matvec_id(
+    encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+    device: &Retained<ProtocolObject<dyn MTLDevice>>,
+    w: &ResidentWeightBuffer,
+    x_buf: &ProtocolObject<dyn MTLBuffer>,
+    out: &ProtocolObject<dyn MTLBuffer>,
+    ids: &ProtocolObject<dyn MTLBuffer>,
+    row_bytes: u32,
+    n_blocks: u32,
+    n_rows: u32,
+    top_k: u32,
+    expert_stride: u32,
+    n_tokens: u32,
+    x_stride: u32,
+    n_slots: usize,
+) -> Result<(), MetalError> {
+    encode_moe_matvec_id(
+        encoder,
+        device,
+        "Q4_0",
+        w,
+        x_buf,
+        out,
+        ids,
+        row_bytes,
+        n_blocks,
+        n_rows,
+        top_k,
+        expert_stride,
+        n_tokens,
+        x_stride,
+        n_slots,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4428,72 +4982,6 @@ fn encode_moe_scatter_rows(
         },
         MTLSize {
             width: TG,
-            height: 1,
-            depth: 1,
-        },
-    );
-    Ok(())
-}
-
-/// llama `mul_mm_id` encode for one expert's gathered tokens (legacy stub).
-#[allow(dead_code, clippy::too_many_arguments)]
-fn encode_q4_0_moe_mul_mm_id(
-    encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
-    device: &Retained<ProtocolObject<dyn MTLDevice>>,
-    w: &ResidentWeightBuffer,
-    expert_byte_offset: usize,
-    x_buf: &ProtocolObject<dyn MTLBuffer>,
-    out: &ProtocolObject<dyn MTLBuffer>,
-    token_ids: &ProtocolObject<dyn MTLBuffer>,
-    slot_ids: &ProtocolObject<dyn MTLBuffer>,
-    map_offset_elems: usize,
-    row_bytes: u32,
-    n_blocks: u32,
-    n_rows: u32,
-    batch_size: u32,
-    x_stride: u32,
-) -> Result<(), MetalError> {
-    if batch_size == 0 {
-        return Ok(());
-    }
-    let pipe = ensure_pipeline(device, Q4_0_MOE_TOPK_KERNEL_SRC, "q4_0_moe_mul_mm_id")?;
-    encoder.setComputePipelineState(&pipe.0);
-    let tg = 64u32;
-    let id_byte = map_offset_elems * 4;
-    unsafe {
-        encoder.setBuffer_offset_atIndex(Some(&w.buffer), w.weight_offset + expert_byte_offset, 0);
-        encoder.setBuffer_offset_atIndex(Some(x_buf), 0, 1);
-        encoder.setBuffer_offset_atIndex(Some(out), 0, 2);
-        encoder.setBuffer_offset_atIndex(Some(token_ids), id_byte, 3);
-        encoder.setBuffer_offset_atIndex(Some(slot_ids), id_byte, 4);
-        let mut rb = row_bytes;
-        encoder.setBytes_length_atIndex(NonNull::new(&mut rb as *mut u32 as *mut _).unwrap(), 4, 5);
-        let mut blocks = n_blocks;
-        encoder.setBytes_length_atIndex(
-            NonNull::new(&mut blocks as *mut u32 as *mut _).unwrap(),
-            4,
-            6,
-        );
-        let mut rows = n_rows;
-        encoder.setBytes_length_atIndex(
-            NonNull::new(&mut rows as *mut u32 as *mut _).unwrap(),
-            4,
-            7,
-        );
-        let mut bs = batch_size;
-        encoder.setBytes_length_atIndex(NonNull::new(&mut bs as *mut u32 as *mut _).unwrap(), 4, 8);
-        let mut xs = x_stride;
-        encoder.setBytes_length_atIndex(NonNull::new(&mut xs as *mut u32 as *mut _).unwrap(), 4, 9);
-        encoder.setThreadgroupMemoryLength_atIndex((tg as usize) * 4, 0);
-    }
-    encoder.dispatchThreadgroups_threadsPerThreadgroup(
-        MTLSize {
-            width: n_rows as usize,
-            height: 1,
-            depth: 1,
-        },
-        MTLSize {
-            width: tg as usize,
             height: 1,
             depth: 1,
         },
@@ -4685,18 +5173,21 @@ pub(crate) fn encode_q4_0_moe_gate_up_id(
     assert_eq!(packed.gate_stride, packed.up_stride);
     assert!(n_tokens >= 1 && top_k >= 1);
     let bound = moe_packed_resident(device, packed)?;
-    let input_blocks = packed.gate_row_bytes / 18;
-    let x_stride = (input_blocks * 32) as u32;
+    let x_stride = moe_x_stride(packed.gate_row_bytes, packed.gate_kind)?;
+    let gate_blocks = moe_row_blocks(packed.gate_row_bytes, packed.gate_kind)?;
+    let up_row_bytes = packed.up_stride / packed.ffn_rows;
+    let up_blocks = moe_row_blocks(up_row_bytes, packed.up_kind)?;
     let n_slots = (n_tokens as usize) * (top_k as usize);
-    encode_q4_0_moe_matvec_id(
+    encode_moe_matvec_id(
         encoder,
         device,
+        packed.gate_kind,
         &bound.gate,
         x_buf,
         gate_buf,
         ids,
         packed.gate_row_bytes as u32,
-        input_blocks as u32,
+        gate_blocks,
         packed.ffn_rows as u32,
         top_k,
         packed.gate_stride as u32,
@@ -4704,15 +5195,16 @@ pub(crate) fn encode_q4_0_moe_gate_up_id(
         x_stride,
         n_slots,
     )?;
-    encode_q4_0_moe_matvec_id(
+    encode_moe_matvec_id(
         encoder,
         device,
+        packed.up_kind,
         &bound.up,
         x_buf,
         up_buf,
         ids,
-        packed.gate_row_bytes as u32,
-        input_blocks as u32,
+        up_row_bytes as u32,
+        up_blocks,
         packed.ffn_rows as u32,
         top_k,
         packed.up_stride as u32,
@@ -4970,7 +5462,7 @@ pub(crate) fn encode_q4_0_moe_id_ex(
     assert!(top_k >= 1);
     let bound = moe_packed_resident(device, packed)?;
     let down_w = &bound.down;
-    let down_blocks = packed.down_row_bytes / 18;
+    let down_blocks = moe_row_blocks(packed.down_row_bytes, packed.down_kind)?;
     let n_slots = (n_tokens as usize) * (top_k as usize);
 
     if !act_done {
@@ -4994,69 +5486,23 @@ pub(crate) fn encode_q4_0_moe_id_ex(
     let weighted_sum = ensure_pipeline(device, Q4_0_MOE_TOPK_KERNEL_SRC, "moe_weighted_sum")?;
 
     if !down_done {
-    // Parallel down like llama mul_mv_id (depth=n_slots), then weighted
-    // sum. Prefill with enough tokens uses grouped mul_mm_id instead
-    // (`down_done=true`) to avoid re-reading each expert once per slot.
-    let down = ensure_pipeline(device, Q4_0_MOE_TOPK_KERNEL_SRC, "q4_0_moe_down_id")?;
-
-    encoder.setComputePipelineState(&down.0);
-    const ROWS_PER_TG: usize = 8;
-    unsafe {
-        encoder.setBuffer_offset_atIndex(Some(&down_w.buffer), down_w.weight_offset, 0);
-        encoder.setBuffer_offset_atIndex(Some(act_buf), 0, 1);
-        encoder.setBuffer_offset_atIndex(Some(expert_out_buf), 0, 2);
-        encoder.setBuffer_offset_atIndex(Some(ids), 0, 3);
-        let mut row_bytes = packed.down_row_bytes as u32;
-        encoder.setBytes_length_atIndex(
-            NonNull::new(&mut row_bytes as *mut u32 as *mut _).unwrap(),
-            4,
-            4,
-        );
-        let mut blocks = down_blocks as u32;
-        encoder.setBytes_length_atIndex(
-            NonNull::new(&mut blocks as *mut u32 as *mut _).unwrap(),
-            4,
-            5,
-        );
-        let mut hidden_rows = packed.hidden_rows as u32;
-        encoder.setBytes_length_atIndex(
-            NonNull::new(&mut hidden_rows as *mut u32 as *mut _).unwrap(),
-            4,
-            6,
-        );
-        let mut ffn_rows = packed.ffn_rows as u32;
-        encoder.setBytes_length_atIndex(
-            NonNull::new(&mut ffn_rows as *mut u32 as *mut _).unwrap(),
-            4,
-            7,
-        );
-        let mut tk = top_k;
-        encoder.setBytes_length_atIndex(NonNull::new(&mut tk as *mut u32 as *mut _).unwrap(), 4, 8);
-        let mut stride = packed.down_stride as u32;
-        encoder.setBytes_length_atIndex(
-            NonNull::new(&mut stride as *mut u32 as *mut _).unwrap(),
-            4,
-            9,
-        );
-        let mut nt = n_tokens;
-        encoder.setBytes_length_atIndex(
-            NonNull::new(&mut nt as *mut u32 as *mut _).unwrap(),
-            4,
-            10,
-        );
-    }
-    encoder.dispatchThreadgroups_threadsPerThreadgroup(
-        MTLSize {
-            width: packed.hidden_rows.div_ceil(ROWS_PER_TG),
-            height: 1,
-            depth: n_slots,
-        },
-        MTLSize {
-            width: 32,
-            height: 2,
-            depth: 1,
-        },
-    );
+        encode_moe_down_id(
+            encoder,
+            device,
+            packed.down_kind,
+            down_w,
+            act_buf,
+            expert_out_buf,
+            ids,
+            packed.down_row_bytes as u32,
+            down_blocks,
+            packed.hidden_rows as u32,
+            packed.ffn_rows as u32,
+            top_k,
+            packed.down_stride as u32,
+            n_tokens,
+            n_slots,
+        )?;
     memory_barrier_resources(encoder, &[expert_out_buf]);
     } // !down_done
 
@@ -5215,21 +5661,35 @@ pub fn launch_moe_prefill_q4_0(
             let bound = moe_packed_resident(device, packed)?;
             let hidden_u = hidden as u32;
             let ffn_u = ffn as u32;
-            let gu_launch = MulMmSgLaunch {
+            let (gate_fn, gate_bb, gate_be) =
+                mul_mm_sg_meta(packed.gate_kind).ok_or(MetalError::CommandFailed)?;
+            let (up_fn, up_bb, up_be) =
+                mul_mm_sg_meta(packed.up_kind).ok_or(MetalError::CommandFailed)?;
+            let (down_fn, down_bb, down_be) =
+                mul_mm_sg_meta(packed.down_kind).ok_or(MetalError::CommandFailed)?;
+            let gate_launch = MulMmSgLaunch {
                 weights: &[],
                 rows: ffn,
                 row_bytes: packed.gate_row_bytes,
-                fn_name: "q4_0_mul_mm_sg",
-                block_bytes: 18,
-                block_elems: 32,
+                fn_name: gate_fn,
+                block_bytes: gate_bb,
+                block_elems: gate_be,
+            };
+            let up_launch = MulMmSgLaunch {
+                weights: &[],
+                rows: ffn,
+                row_bytes: packed.up_stride / ffn,
+                fn_name: up_fn,
+                block_bytes: up_bb,
+                block_elems: up_be,
             };
             let down_launch = MulMmSgLaunch {
                 weights: &[],
                 rows: hidden,
                 row_bytes: packed.down_row_bytes,
-                fn_name: "q4_0_mul_mm_sg",
-                block_bytes: 18,
-                block_elems: 32,
+                fn_name: down_fn,
+                block_bytes: down_bb,
+                block_elems: down_be,
             };
             let contig_in = scratch.contig_in.as_ref();
             let contig_out = scratch.contig_out.as_ref();
@@ -5295,7 +5755,7 @@ pub fn launch_moe_prefill_q4_0(
                     encode_mul_mm_sg_offset(
                         &encoder,
                         device,
-                        &gu_launch,
+                        &gate_launch,
                         &bound.gate,
                         eid * packed.gate_stride,
                         contig_in,
@@ -5329,7 +5789,7 @@ pub fn launch_moe_prefill_q4_0(
                     encode_mul_mm_sg_offset(
                         &encoder,
                         device,
-                        &gu_launch,
+                        &up_launch,
                         &bound.up,
                         eid * packed.up_stride,
                         contig_in,
@@ -6430,6 +6890,9 @@ mod tests {
             hidden_rows: hidden,
             gate_row_bytes: gu_row_bytes,
             down_row_bytes,
+            gate_kind: "Q4_0",
+            up_kind: "Q4_0",
+            down_kind: "Q4_0",
         };
         let mut x_batch = Vec::with_capacity(n_tokens * hidden);
         let mut ids = Vec::with_capacity(n_tokens * top_k);
@@ -6476,6 +6939,111 @@ mod tests {
         for (i, (&g, &w)) in got.iter().zip(&expected).enumerate() {
             let tol = 5e-3 * w.abs().max(1.0);
             assert!((g - w).abs() <= tol, "elem {i}: gpu={g} cpu={w} tol={tol}");
+        }
+    }
+
+    #[test]
+    #[ignore = "needs a real Metal-capable GPU; run manually with --ignored on Apple Silicon"]
+    fn launch_moe_prefill_mixed_q4_k_q8_0_matches_per_token_packed() {
+        let hidden = 512;
+        let ffn = 512;
+        let n_experts = 4;
+        let top_k = 2;
+        let n_tokens = 3;
+        let gu_row_bytes =
+            (hidden / ferrox_quant::Q4_K_BLOCK_ELEMS) * ferrox_quant::Q4_K_BLOCK_BYTES;
+        let down_row_bytes =
+            (ffn / ferrox_quant::Q8_0_BLOCK_ELEMS) * ferrox_quant::Q8_0_BLOCK_BYTES;
+
+        fn q8_matrix(rows: usize, cols: usize, seed: u8) -> Vec<u8> {
+            let blocks = cols / ferrox_quant::Q8_0_BLOCK_ELEMS;
+            let mut out = Vec::with_capacity(rows * blocks * ferrox_quant::Q8_0_BLOCK_BYTES);
+            for r in 0..rows {
+                for b in 0..blocks {
+                    out.extend_from_slice(
+                        &half::f16::from_f32(
+                            0.02 + ((r * blocks + b + seed as usize) % 13) as f32 * 0.004,
+                        )
+                        .to_le_bytes(),
+                    );
+                    for i in 0..32u8 {
+                        out.push(i.wrapping_add(r as u8).wrapping_add(seed).wrapping_mul(3));
+                    }
+                }
+            }
+            out
+        }
+
+        let mut gate = Vec::new();
+        let mut up = Vec::new();
+        let mut down = Vec::new();
+        for e in 0..n_experts {
+            gate.extend(pseudo_bytes((e * 3 + 1) as u32, ffn * gu_row_bytes));
+            up.extend(pseudo_bytes((e * 3 + 2) as u32, ffn * gu_row_bytes));
+            down.extend(q8_matrix(hidden, ffn, (e * 3 + 3) as u8));
+        }
+        let gate_stride = ffn * gu_row_bytes;
+        let down_stride = hidden * down_row_bytes;
+        let packed = MoePackedQ4 {
+            gate: &gate,
+            up: &up,
+            down: &down,
+            gate_stride,
+            up_stride: gate_stride,
+            down_stride,
+            n_experts,
+            ffn_rows: ffn,
+            hidden_rows: hidden,
+            gate_row_bytes: gu_row_bytes,
+            down_row_bytes,
+            gate_kind: "Q4_K",
+            up_kind: "Q4_K",
+            down_kind: "Q8_0",
+        };
+        let mut x_batch = Vec::with_capacity(n_tokens * hidden);
+        let mut ids = Vec::with_capacity(n_tokens * top_k);
+        let mut route = Vec::with_capacity(n_tokens * top_k);
+        let mut expected = Vec::with_capacity(n_tokens * hidden);
+        for t in 0..n_tokens {
+            let x: Vec<f32> = (0..hidden)
+                .map(|i| ((i + t * 7) as f32 * 0.071).sin())
+                .collect();
+            let e0 = t % n_experts;
+            let e1 = (t + 1) % n_experts;
+            let w0 = 0.6f32;
+            let w1 = 0.4f32;
+            ids.push(e0 as i32);
+            ids.push(e1 as i32);
+            route.push(w0);
+            route.push(w1);
+            x_batch.extend_from_slice(&x);
+            let mut out_t = vec![0f32; hidden];
+            for (eid, w) in [(e0, w0), (e1, w1)] {
+                let mut act = vec![0f32; ffn];
+                let g_base = eid * gate_stride;
+                let u_base = eid * gate_stride;
+                let d_base = eid * down_stride;
+                for r in 0..ffn {
+                    let range = g_base + r * gu_row_bytes..g_base + (r + 1) * gu_row_bytes;
+                    let g = ferrox_quant::dot_q4_k_f32_scalar(&gate[range.clone()], &x);
+                    let u = ferrox_quant::dot_q4_k_f32_scalar(
+                        &up[u_base + r * gu_row_bytes..u_base + (r + 1) * gu_row_bytes],
+                        &x,
+                    );
+                    act[r] = ferrox_core_silu(g) * u;
+                }
+                for r in 0..hidden {
+                    let range = d_base + r * down_row_bytes..d_base + (r + 1) * down_row_bytes;
+                    out_t[r] += w * ferrox_quant::dot_q8_0_f32_scalar(&down[range], &act);
+                }
+            }
+            expected.extend_from_slice(&out_t);
+        }
+        let got = launch_moe_prefill_q4_0(&x_batch, n_tokens, &packed, &ids, &route, top_k)
+            .expect("prefill mixed MoE");
+        assert_eq!(got.len(), expected.len());
+        for (i, (&g, &w)) in got.iter().zip(&expected).enumerate() {
+            assert_close_relative(g, w, i);
         }
     }
 

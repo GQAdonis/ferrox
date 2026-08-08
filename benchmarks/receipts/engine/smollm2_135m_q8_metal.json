@@ -15,12 +15,12 @@
   "tests": [
     {
       "ferrox_samples": [
-        1459.15
+        4111.48
       ],
-      "ferrox_stddev": 61.93,
-      "ferrox_tps": 1459.15,
-      "gap": 8.13159030942672,
-      "llama_tps": 11865.21,
+      "ferrox_stddev": 12.79,
+      "ferrox_tps": 4111.48,
+      "gap": 2.9719346804557,
+      "llama_tps": 12219.05,
       "test": "pp512"
     },
     {

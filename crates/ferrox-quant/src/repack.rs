@@ -533,6 +533,68 @@ pub fn gemm_q8_0x4_group(
     }
 }
 
+/// How many activations one [`gemm_q4_kx8_group`] pass keeps in flight.
+///
+/// Four is llama's shape for `ggml_gemm_q4_K_8x4_q8_K` (`q8_k_blocklen`),
+/// and it is what the register file allows here: eight `uint8x16` weight
+/// columns plus one activation's four `int8x16` and its accumulator pair
+/// stay resident while the batch loop turns.
+pub const Q4_KX8_GEMM_NC: usize = 4;
+
+/// GEMM counterpart of [`gemv_q4_kx8_group`]: one row-group (8 rows)
+/// against `acts.len()` activations at once.
+///
+/// Q4_K was the expensive omission. The GEMV repeats, *per activation*,
+/// work that depends only on the weights: 16 f16 scale conversions, 8
+/// `decode_scales_mins` calls and 16 `q4_cols` loads per 256-element
+/// super-block. At batch 512 that is the same 6-bit scale decode run 512
+/// times. Q8_0 already had `gemm_q8_0x4_group`; this is the same idea for
+/// the format that carries every `*_Q4_K_M` checkpoint's FFN.
+///
+/// `out` is `[row][act]`: `out[r * acts.len() + j]`, matching
+/// [`gemm_q8_0x4_group`] and what `WeightMatrix::apply_batch` writes.
+pub fn gemm_q4_kx8_group(
+    packed: &[u8],
+    group: usize,
+    acts: &[Q8KActivations],
+    n_cols: usize,
+    interleave: usize,
+    out: &mut [f32],
+) {
+    assert_eq!(out.len(), Q4_KX8_NROWS * acts.len());
+    assert!(n_cols.is_multiple_of(Q4_K_BLOCK_ELEMS));
+    if acts.is_empty() {
+        return;
+    }
+    let nb = n_cols / Q4_K_BLOCK_ELEMS;
+    let off = group * nb * Q4_KX8_BLOCK_BYTES;
+    let slice = &packed[off..off + nb * Q4_KX8_BLOCK_BYTES];
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        // The NEON kernel is written against the interleave-4 layout the
+        // GEMV uses; any other packing falls through to the GEMV loop.
+        if interleave == 4
+            && acts.len() <= Q4_KX8_GEMM_NC
+            && std::arch::is_aarch64_feature_detected!("dotprod")
+        {
+            unsafe {
+                neon::gemm_q4_kx8_q8_k_neon_sdot(slice, acts, n_cols, out);
+            }
+            return;
+        }
+    }
+    // Portable fallback: the GEMV, once per activation. Same results,
+    // none of the reuse.
+    let mut tmp = [0f32; Q4_KX8_NROWS];
+    for (j, act) in acts.iter().enumerate() {
+        gemv_q4_kx8_q8_k(slice, act, n_cols, 1, interleave, &mut tmp);
+        for (r, v) in tmp.iter().enumerate() {
+            out[r * acts.len() + j] = *v;
+        }
+    }
+}
+
 /// One row-group (4 outputs) starting at `group` within a packed Q8_0x4 matrix.
 #[inline]
 pub fn gemv_q8_0x4_group(
@@ -800,6 +862,192 @@ mod neon {
             let base = x * Q4_KX8_NROWS;
             vst1q_f32(out.as_mut_ptr().add(base), acc_f32[0]);
             vst1q_f32(out.as_mut_ptr().add(base + 4), acc_f32[1]);
+        }
+    }
+
+    /// NEON DotProd **GEMM** for interleave-4 packed Q4_K weights: one
+    /// row-group (8 rows) against up to [`Q4_KX8_GEMM_NC`] activations.
+    ///
+    /// Same arithmetic as [`gemv_q4_kx8_q8_k_neon_sdot`], reordered so
+    /// the weight-side unpack happens once per activation *tile* rather
+    /// than once per activation. Per 256-element super-block that hoists
+    /// 16 f16 scale conversions, 8 `decode_scales_mins` calls and 16
+    /// `q4_cols` loads out of the batch loop -- which is the whole point,
+    /// and the same reason llama.cpp ships `ggml_gemm_q4_K_8x4_q8_K`
+    /// beside its GEMV rather than looping the GEMV.
+    ///
+    /// `out` is `[row][act]`: `out[r * na + j]`.
+    #[target_feature(enable = "neon,dotprod")]
+    pub unsafe fn gemm_q4_kx8_q8_k_neon_sdot(
+        packed: &[u8],
+        acts: &[Q8KActivations],
+        n_cols: usize,
+        out: &mut [f32],
+    ) {
+        let na = acts.len();
+        debug_assert!(na <= Q4_KX8_GEMM_NC);
+        let nb = n_cols / Q4_K_BLOCK_ELEMS;
+        let m4b = vdupq_n_u8(0x0f);
+
+        // [act][row-half]; row-half 0 is rows 0..3, 1 is rows 4..7.
+        let mut acc_f32 = [[vdupq_n_f32(0.0); 2]; Q4_KX8_GEMM_NC];
+        let mut bias_acc = [[vdupq_n_s32(0); 2]; Q4_KX8_GEMM_NC];
+
+        for b in 0..nb {
+            let blk = packed.as_ptr().add(b * Q4_KX8_BLOCK_BYTES);
+
+            // --- weight-side, once per block (was once per activation) ---
+            let mut d_arr = [0f32; 8];
+            let mut dmin_arr = [0f32; 8];
+            for j in 0..8 {
+                d_arr[j] = f16_from_bytes(std::slice::from_raw_parts(blk.add(j * 2), 2));
+                dmin_arr[j] = f16_from_bytes(std::slice::from_raw_parts(blk.add(16 + j * 2), 2));
+            }
+            let d_lo = vld1q_f32(d_arr.as_ptr());
+            let d_hi = vld1q_f32(d_arr.as_ptr().add(4));
+            let dmin_lo = vld1q_f32(dmin_arr.as_ptr());
+            let dmin_hi = vld1q_f32(dmin_arr.as_ptr().add(4));
+
+            // Per-activation scaling of those, plus the pairwise-added
+            // bsums this block needs (llama's vpaddq_s16).
+            let mut sb_scale = [[vdupq_n_f32(0.0); 2]; Q4_KX8_GEMM_NC];
+            let mut sb_min = [[vdupq_n_f32(0.0); 2]; Q4_KX8_GEMM_NC];
+            let mut bsums_arr = [[0i16; 8]; Q4_KX8_GEMM_NC];
+            for (a, act) in acts.iter().enumerate() {
+                let q8_d = act.d[b];
+                sb_scale[a] = [vmulq_n_f32(d_lo, q8_d), vmulq_n_f32(d_hi, q8_d)];
+                sb_min[a] = [vmulq_n_f32(dmin_lo, q8_d), vmulq_n_f32(dmin_hi, q8_d)];
+                let bsums_ptr = act.bsums.as_ptr().add(b * 16);
+                for (i, slot) in bsums_arr[a].iter_mut().enumerate() {
+                    *slot = *bsums_ptr.add(2 * i) + *bsums_ptr.add(2 * i + 1);
+                }
+            }
+
+            let scales_base = blk.add(32);
+            let qs_base = blk.add(128);
+
+            for sb in 0..4 {
+                // 6-bit scale/min decode: once per block-quarter, not
+                // once per (block-quarter, activation).
+                let mut q4sb_mins = [vdupq_n_s16(0); 2];
+                let mut q4sb_scales = [vdupq_n_s16(0); 2];
+                for i in 0..2 {
+                    let mut sc = [0u8; 8];
+                    let mut mn = [0u8; 8];
+                    let offset = sb * 24 + i * 12;
+                    decode_scales_mins(
+                        std::slice::from_raw_parts(scales_base.add(offset), 12),
+                        &mut sc,
+                        &mut mn,
+                    );
+                    let mut sc_i8 = [0i8; 8];
+                    let mut mn_i8 = [0i8; 8];
+                    for t in 0..8 {
+                        sc_i8[t] = sc[t] as i8;
+                        mn_i8[t] = mn[t] as i8;
+                    }
+                    q4sb_scales[i] = vmovl_s8(vld1_s8(sc_i8.as_ptr()));
+                    q4sb_mins[i] = vmovl_s8(vld1_s8(mn_i8.as_ptr()));
+                }
+
+                // `c` selects the row half, so each pass owns one output
+                // quad and the accumulators can be consumed immediately
+                // instead of all eight staying live.
+                for c in 0..2 {
+                    let mut q4_cols = [vdupq_n_u8(0); 8];
+                    for (i, slot) in q4_cols.iter_mut().enumerate() {
+                        *slot = vld1q_u8(qs_base.add(sb * Q4_K_BLOCK_ELEMS + i * 32 + 16 * c));
+                    }
+                    let (sc_lo, sc_hi) = if c == 0 {
+                        (vget_low_s16(q4sb_scales[0]), vget_low_s16(q4sb_scales[1]))
+                    } else {
+                        (
+                            vget_high_s16(q4sb_scales[0]),
+                            vget_high_s16(q4sb_scales[1]),
+                        )
+                    };
+
+                    // Mask once per weight tile, not once per
+                    // activation, and keep the lane indices literal --
+                    // a runtime lane forces a real call per `sdot`
+                    // instead of the single instruction it should be.
+                    let lo0 = vreinterpretq_s8_u8(vandq_u8(q4_cols[0], m4b));
+                    let lo1 = vreinterpretq_s8_u8(vandq_u8(q4_cols[1], m4b));
+                    let lo2 = vreinterpretq_s8_u8(vandq_u8(q4_cols[2], m4b));
+                    let lo3 = vreinterpretq_s8_u8(vandq_u8(q4_cols[3], m4b));
+                    let lo4 = vreinterpretq_s8_u8(vandq_u8(q4_cols[4], m4b));
+                    let lo5 = vreinterpretq_s8_u8(vandq_u8(q4_cols[5], m4b));
+                    let lo6 = vreinterpretq_s8_u8(vandq_u8(q4_cols[6], m4b));
+                    let lo7 = vreinterpretq_s8_u8(vandq_u8(q4_cols[7], m4b));
+                    let hi0 = vreinterpretq_s8_u8(vshrq_n_u8(q4_cols[0], 4));
+                    let hi1 = vreinterpretq_s8_u8(vshrq_n_u8(q4_cols[1], 4));
+                    let hi2 = vreinterpretq_s8_u8(vshrq_n_u8(q4_cols[2], 4));
+                    let hi3 = vreinterpretq_s8_u8(vshrq_n_u8(q4_cols[3], 4));
+                    let hi4 = vreinterpretq_s8_u8(vshrq_n_u8(q4_cols[4], 4));
+                    let hi5 = vreinterpretq_s8_u8(vshrq_n_u8(q4_cols[5], 4));
+                    let hi6 = vreinterpretq_s8_u8(vshrq_n_u8(q4_cols[6], 4));
+                    let hi7 = vreinterpretq_s8_u8(vshrq_n_u8(q4_cols[7], 4));
+                    let sc_lo_w = vmovl_s16(sc_lo);
+                    let sc_hi_w = vmovl_s16(sc_hi);
+
+                    for a in 0..na {
+                        let q8_base = acts[a].q.as_ptr().add(b * Q4_K_BLOCK_ELEMS);
+                        let y0 = vld1q_s8(q8_base.add(sb * 64));
+                        let y1 = vld1q_s8(q8_base.add(sb * 64 + 16));
+                        let y2 = vld1q_s8(q8_base.add(sb * 64 + 32));
+                        let y3 = vld1q_s8(q8_base.add(sb * 64 + 48));
+                        let mut acc_lo = vdupq_n_s32(0);
+                        let mut acc_hi = vdupq_n_s32(0);
+                        acc_lo = sdot_lane(acc_lo, lo0, y0, 0);
+                        acc_lo = sdot_lane(acc_lo, lo1, y0, 1);
+                        acc_lo = sdot_lane(acc_lo, lo2, y0, 2);
+                        acc_lo = sdot_lane(acc_lo, lo3, y0, 3);
+                        acc_lo = sdot_lane(acc_lo, lo4, y1, 0);
+                        acc_lo = sdot_lane(acc_lo, lo5, y1, 1);
+                        acc_lo = sdot_lane(acc_lo, lo6, y1, 2);
+                        acc_lo = sdot_lane(acc_lo, lo7, y1, 3);
+                        acc_hi = sdot_lane(acc_hi, hi0, y2, 0);
+                        acc_hi = sdot_lane(acc_hi, hi1, y2, 1);
+                        acc_hi = sdot_lane(acc_hi, hi2, y2, 2);
+                        acc_hi = sdot_lane(acc_hi, hi3, y2, 3);
+                        acc_hi = sdot_lane(acc_hi, hi4, y3, 0);
+                        acc_hi = sdot_lane(acc_hi, hi5, y3, 1);
+                        acc_hi = sdot_lane(acc_hi, hi6, y3, 2);
+                        acc_hi = sdot_lane(acc_hi, hi7, y3, 3);
+                        let sumf = vcvtq_f32_s32(vaddq_s32(
+                            vmulq_s32(sc_lo_w, acc_lo),
+                            vmulq_s32(sc_hi_w, acc_hi),
+                        ));
+                        acc_f32[a][c] = vfmaq_f32(acc_f32[a][c], sb_scale[a][c], sumf);
+                    }
+                }
+
+                for a in 0..na {
+                    let bs_lo = vdup_n_s16(bsums_arr[a][2 * sb]);
+                    let bs_hi = vdup_n_s16(bsums_arr[a][2 * sb + 1]);
+                    bias_acc[a][0] = vmlal_s16(bias_acc[a][0], bs_lo, vget_low_s16(q4sb_mins[0]));
+                    bias_acc[a][0] = vmlal_s16(bias_acc[a][0], bs_hi, vget_low_s16(q4sb_mins[1]));
+                    bias_acc[a][1] = vmlal_s16(bias_acc[a][1], bs_lo, vget_high_s16(q4sb_mins[0]));
+                    bias_acc[a][1] = vmlal_s16(bias_acc[a][1], bs_hi, vget_high_s16(q4sb_mins[1]));
+                }
+            }
+
+            for a in 0..na {
+                for c in 0..2 {
+                    acc_f32[a][c] =
+                        vmlsq_f32(acc_f32[a][c], vcvtq_f32_s32(bias_acc[a][c]), sb_min[a][c]);
+                    bias_acc[a][c] = vdupq_n_s32(0);
+                }
+            }
+        }
+
+        for a in 0..na {
+            let mut row = [0f32; Q4_KX8_NROWS];
+            vst1q_f32(row.as_mut_ptr(), acc_f32[a][0]);
+            vst1q_f32(row.as_mut_ptr().add(4), acc_f32[a][1]);
+            for (r, v) in row.iter().enumerate() {
+                out[r * na + a] = *v;
+            }
         }
     }
 
@@ -1180,6 +1428,72 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The Q4_K GEMM must agree with the GEMV **exactly**, for the same
+    /// reason as the Q8_0 pair above: the two run on the same prompt in
+    /// different batch regimes (prefill vs the `< 4` tail vs decode), so
+    /// any divergence is prefill and decode disagreeing about the same
+    /// tokens. The GEMM only reorders which loop the weight unpack sits
+    /// in — every multiply-accumulate happens in the same order and the
+    /// same precision — so equality is the right assertion, not
+    /// closeness.
+    #[test]
+    fn q4_kx8_gemm_matches_the_gemv_run_once_per_activation() {
+        let n_blocks = 3;
+        let cols = n_blocks * Q4_K_BLOCK_ELEMS;
+        let rows = 2 * Q4_KX8_NROWS;
+        let mut matrix = Vec::new();
+        for r in 0..rows {
+            matrix.extend_from_slice(&synth_q4_k_row(n_blocks, (r * 5 + 3) as u8));
+        }
+        let interleave = 4;
+        let packed = pack_q4_k_matrix_x8(&matrix, rows, cols, interleave);
+
+        // Not a multiple of the tile width, so the ragged tail the
+        // caller has to chunk around is covered too.
+        let n_acts = 6;
+        let acts: Vec<Q8KActivations> = (0..n_acts)
+            .map(|j| {
+                let x: Vec<f32> = (0..cols)
+                    .map(|i| (((i + j * 29) as f32) * 0.011 - 0.4).cos() * 2.3)
+                    .collect();
+                quantize_activations_q8_k(&x)
+            })
+            .collect();
+
+        for group in 0..rows / Q4_KX8_NROWS {
+            for chunk in acts.chunks(Q4_KX8_GEMM_NC) {
+                let mut gemm_out = vec![0f32; Q4_KX8_NROWS * chunk.len()];
+                gemm_q4_kx8_group(&packed, group, chunk, cols, interleave, &mut gemm_out);
+
+                for (j, act) in chunk.iter().enumerate() {
+                    let mut gemv_out = [0f32; Q4_KX8_NROWS];
+                    gemv_q4_kx8_group(&packed, group, act, cols, interleave, &mut gemv_out);
+                    for r in 0..Q4_KX8_NROWS {
+                        assert_eq!(
+                            gemm_out[r * chunk.len() + j],
+                            gemv_out[r],
+                            "group {group} row {r} act {j}: Q4_K GEMM and GEMV disagree"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn q4_kx8_gemm_with_no_activations_is_a_no_op() {
+        let n_blocks = 2;
+        let cols = n_blocks * Q4_K_BLOCK_ELEMS;
+        let mut matrix = Vec::new();
+        for r in 0..Q4_KX8_NROWS {
+            matrix.extend_from_slice(&synth_q4_k_row(n_blocks, r as u8));
+        }
+        let packed = pack_q4_k_matrix_x8(&matrix, Q4_KX8_NROWS, cols, 4);
+        let mut out: Vec<f32> = Vec::new();
+        gemm_q4_kx8_group(&packed, 0, &[], cols, 4, &mut out);
+        assert!(out.is_empty());
     }
 
     #[test]

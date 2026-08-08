@@ -16,9 +16,9 @@ pub mod iq_tables;
 pub mod repack;
 
 pub use repack::{
-    gemm_q8_0x4_group, gemv_q4_kx8_group, gemv_q4_kx8_q8_k, gemv_q8_0x4_group, gemv_q8_0x4_q8_0,
+    gemm_q4_kx8_group, gemm_q8_0x4_group, gemv_q4_kx8_group, gemv_q4_kx8_q8_k, gemv_q8_0x4_group, gemv_q8_0x4_q8_0,
     make_block_q4_kx8, make_block_q8_0x4, pack_q4_k_matrix_x8, pack_q8_0_matrix_x4,
-    q4_kx8_interleave, Q4_KX8_BLOCK_BYTES, Q4_KX8_NROWS, Q8_0X4_BLOCK_BYTES, Q8_0X4_INTERLEAVE,
+    q4_kx8_interleave, Q4_KX8_BLOCK_BYTES, Q4_KX8_GEMM_NC, Q4_KX8_NROWS, Q8_0X4_BLOCK_BYTES, Q8_0X4_INTERLEAVE,
     Q8_0X4_NROWS,
 };
 

@@ -1180,13 +1180,29 @@ impl WeightMatrix {
                                     .with_min_len(Self::min_rows_per_task(n_groups).max(1))
                                     .enumerate()
                                     .for_each(|(g, group_out)| {
-                                        let mut tmp = [0f32; ferrox_quant::Q4_KX8_NROWS];
-                                        for (b, act) in acts.iter().enumerate() {
-                                            ferrox_quant::gemv_q4_kx8_group(
-                                                &packed, g, act, cols, interleave, &mut tmp,
+                                        // Tile the batch so each group's
+                                        // weight unpack -- 16 f16 scale
+                                        // conversions, 8 6-bit scale
+                                        // decodes and 16 nibble loads per
+                                        // super-block -- is paid once per
+                                        // `Q4_KX8_GEMM_NC` activations
+                                        // instead of once per activation.
+                                        let nc = ferrox_quant::Q4_KX8_GEMM_NC;
+                                        let mut tile =
+                                            vec![0f32; ferrox_quant::Q4_KX8_NROWS * nc];
+                                        for (t, chunk) in
+                                            acts.chunks(nc).enumerate()
+                                        {
+                                            let n = chunk.len();
+                                            let tile = &mut tile[..ferrox_quant::Q4_KX8_NROWS * n];
+                                            ferrox_quant::gemm_q4_kx8_group(
+                                                &packed, g, chunk, cols, interleave, tile,
                                             );
                                             for r in 0..ferrox_quant::Q4_KX8_NROWS {
-                                                group_out[r * batch_size + b] = tmp[r];
+                                                for j in 0..n {
+                                                    group_out[r * batch_size + t * nc + j] =
+                                                        tile[r * n + j];
+                                                }
                                             }
                                         }
                                     });

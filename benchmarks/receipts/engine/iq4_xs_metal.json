@@ -9,19 +9,18 @@
   "load_s": 0.084005292,
   "model_path": "models/Llama-3.2-1B-Instruct-IQ4_XS.gguf",
   "quant": "quantized",
-  "reps": 2,
+  "reps": 3,
   "schema": 1,
   "size_bytes": 743141504,
   "tests": [
     {
       "ferrox_samples": [
-        32.50235212301333,
-        33.973600599859076
+        676.99
       ],
-      "ferrox_stddev": 0.7356242384228722,
-      "ferrox_tps": 33.2379763614362,
-      "gap": 35.05658669857877,
-      "llama_tps": 1165.21,
+      "ferrox_stddev": 18.01,
+      "ferrox_tps": 676.99,
+      "gap": 2.7774560924090457,
+      "llama_tps": 1880.31,
       "test": "pp512"
     },
     {

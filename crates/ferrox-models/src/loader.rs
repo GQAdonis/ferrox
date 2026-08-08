@@ -251,8 +251,25 @@ impl ModelConfig {
         } else {
             1
         };
-        let n_shared_experts =
-            metadata_u64_any(file, &[key("expert_shared_count")]).unwrap_or(0) as usize;
+        // Prefer the GGUF hparam when present. Qwen2MoE (and some other
+        // HF→GGUF exports) omit `expert_shared_count` but still ship
+        // `blk.N.ffn_{gate,up,down}_shexp.weight` — without a tensor-
+        // presence fallback those weights are silently dropped and the
+        // model runs with a large chunk of active FFN missing.
+        let n_shared_experts = match metadata_u64_any(file, &[key("expert_shared_count")]) {
+            Some(n) => n as usize,
+            None if is_moe
+                && file
+                    .find_tensor("blk.0.ffn_gate_shexp.weight")
+                    .is_some() =>
+            {
+                best_effort_fields.push(
+                    "moe.n_shared_experts (no expert_shared_count; inferred 1 from blk.0.ffn_gate_shexp.weight)",
+                );
+                1
+            }
+            None => 0,
+        };
         // MoE GGUFs often only set `feed_forward_length` (OLMoE=1024);
         // `expert_feed_forward_length` is optional. Prefer expert key, then
         // dense FFN length, then 4×hidden — never ignore feed_forward_length.

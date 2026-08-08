@@ -9,19 +9,18 @@
   "load_s": 0.075237041,
   "model_path": "models/hf_test/SmolLM2-135M-Instruct-Q8_0.gguf",
   "quant": "quantized",
-  "reps": 2,
+  "reps": 3,
   "schema": 1,
   "size_bytes": 144811360,
   "tests": [
     {
       "ferrox_samples": [
-        250.98914811014882,
-        248.84725373643448
+        1459.15
       ],
-      "ferrox_stddev": 1.0709471868571683,
-      "ferrox_tps": 249.91820092329164,
-      "gap": 29.644019413671852,
-      "llama_tps": 7408.58,
+      "ferrox_stddev": 61.93,
+      "ferrox_tps": 1459.15,
+      "gap": 8.13159030942672,
+      "llama_tps": 11865.21,
       "test": "pp512"
     },
     {

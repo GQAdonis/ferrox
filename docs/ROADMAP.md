@@ -94,18 +94,22 @@ Every `(b, h)` pair is independent once the push loop has populated
 disjoint slices. Quant-kind-independent, so it caps whatever item 3 can
 recover. Affects all 11 CPU `pp512` rows.
 
-### 3. CPU batch GEMM for Q4_K, Q5_K, Q6_K, Q4_0
+### 3. CPU: the remaining Q4_K gap is i8mm, not loop structure
 
-Exactly one kind has a real CPU batch GEMM: Q8_0 on aarch64+dotprod
-(`gemm_q8_0x4_group`). Q4_K runs a GEMV per position; Q5_K, Q6_K and the
-fallback run a scalar row-dot per (row, position). llama ships 15
-`ggml_gemm_*` kernels on ARM covering Q4_0, Q4_K, Q5_K, Q6_K, Q2_K,
-Q8_0, IQ4_NL and MXFP4.
+`gemm_q4_kx8_group` has landed — llama's `ggml_gemm_q4_K_8x4_q8_K`
+shape, bit-exact against the GEMV. It is worth **+6%** on Gemma-2-2B CPU
+`pp512` (interleaved A/B, 4 of 5 rounds), against a predicted 5.82× →
+3.2×. That prediction was wrong, and usefully so: hoisting the repeated
+weight unpack is not what Q4_K CPU prefill is spending its time on.
 
-Add `gemm_q4_kx8_group` mirroring `gemm_q8_0x4_group` — hoist the
-per-block weight unpack out of the activation loop and accumulate 4 Q8_K
-activations against the 8-row group, llama's `q8_k_blocklen = 4 ×
-ncols_interleaved = 8` shape. Q5_K and Q6_K need a repack first.
+What is left is the arithmetic tier. llama selects
+`ggml_gemm_q4_K_8x8_q8_K` and `ggml_gemm_q8_0_4x8_q8_0` on M2+, both
+built on `vmmlaq_s32` (i8mm/SMMLA); ferrox is on the older dotprod 4×4
+tier. That is the prerequisite for CPU parity, not more restructuring.
+
+Q5_K, Q6_K and Q4_0 still run a scalar row-dot or a GEMV per position
+and need a repack before they get a GEMM at all — but given the Q4_K
+result, expect single-digit percentages from that alone.
 
 ### 4. Remove the `apply_batch` transpose; dedupe activation quantization
 

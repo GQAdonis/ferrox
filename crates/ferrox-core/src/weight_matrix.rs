@@ -1022,6 +1022,34 @@ impl WeightMatrix {
             }
         }
 
+        // CUDA has no batched GEMM yet, but `apply` does dispatch a real
+        // CUDA matvec per position. Without this arm a batched prefill
+        // fell through to the CPU branch below and never touched the
+        // GPU at all -- measured on an RTX 4090, SmolLM2 `pp512` ran at
+        // 28 tok/s against llama.cpp's 57466. Per-position matvec is
+        // still the wrong shape (see ROADMAP: CUDA needs `mul_mm`), but
+        // it is the GPU rather than 26 idle SMs.
+        #[cfg(feature = "cuda")]
+        {
+            if cuda_dense_enabled()
+                && matches!(self, WeightMatrix::Quantized { .. })
+                && self.apply_gpu(&x_batch[..cols]).is_some()
+            {
+                let rows = self.rows();
+                let mut out = vec![0f32; batch_size * rows];
+                for b in 0..batch_size {
+                    match self.apply_gpu(&x_batch[b * cols..(b + 1) * cols]) {
+                        Some(y) => out[b * rows..(b + 1) * rows].copy_from_slice(&y),
+                        None => {
+                            let y = self.apply(&x_batch[b * cols..(b + 1) * cols]);
+                            out[b * rows..(b + 1) * rows].copy_from_slice(&y);
+                        }
+                    }
+                }
+                return out;
+            }
+        }
+
         match self {
             WeightMatrix::F32(t) => {
                 let xt = Tensor::new(x_batch.to_vec(), vec![batch_size, cols]);

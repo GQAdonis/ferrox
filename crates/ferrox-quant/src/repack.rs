@@ -961,10 +961,7 @@ mod neon {
                     let (sc_lo, sc_hi) = if c == 0 {
                         (vget_low_s16(q4sb_scales[0]), vget_low_s16(q4sb_scales[1]))
                     } else {
-                        (
-                            vget_high_s16(q4sb_scales[0]),
-                            vget_high_s16(q4sb_scales[1]),
-                        )
+                        (vget_high_s16(q4sb_scales[0]), vget_high_s16(q4sb_scales[1]))
                     };
 
                     // Mask once per weight tile, not once per

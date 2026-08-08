@@ -258,11 +258,7 @@ impl ModelConfig {
         // model runs with a large chunk of active FFN missing.
         let n_shared_experts = match metadata_u64_any(file, &[key("expert_shared_count")]) {
             Some(n) => n as usize,
-            None if is_moe
-                && file
-                    .find_tensor("blk.0.ffn_gate_shexp.weight")
-                    .is_some() =>
-            {
+            None if is_moe && file.find_tensor("blk.0.ffn_gate_shexp.weight").is_some() => {
                 best_effort_fields.push(
                     "moe.n_shared_experts (no expert_shared_count; inferred 1 from blk.0.ffn_gate_shexp.weight)",
                 );

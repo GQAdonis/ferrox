@@ -1188,11 +1188,8 @@ impl WeightMatrix {
                                         // `Q4_KX8_GEMM_NC` activations
                                         // instead of once per activation.
                                         let nc = ferrox_quant::Q4_KX8_GEMM_NC;
-                                        let mut tile =
-                                            vec![0f32; ferrox_quant::Q4_KX8_NROWS * nc];
-                                        for (t, chunk) in
-                                            acts.chunks(nc).enumerate()
-                                        {
+                                        let mut tile = vec![0f32; ferrox_quant::Q4_KX8_NROWS * nc];
+                                        for (t, chunk) in acts.chunks(nc).enumerate() {
                                             let n = chunk.len();
                                             let tile = &mut tile[..ferrox_quant::Q4_KX8_NROWS * n];
                                             ferrox_quant::gemm_q4_kx8_group(

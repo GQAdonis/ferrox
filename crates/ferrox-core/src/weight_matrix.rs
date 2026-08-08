@@ -475,6 +475,41 @@ impl WeightMatrix {
     /// regressed 72.1 -> 33.2 on Llama-3.2-1B while it was in that
     /// state — so they keep the per-position path until a GEMM exists
     /// for them too.
+    /// This matrix as a Metal simdgroup-GEMM descriptor, or `None` if
+    /// its quant kind has no GEMM (so it must stay on the matvec path).
+    /// Lets several matmuls be encoded into one command buffer instead
+    /// of one launch each.
+    #[cfg(feature = "metal")]
+    pub fn mul_mm_sg_launch(&self) -> Option<ferrox_metal::gpu::MulMmSgLaunch<'_>> {
+        let WeightMatrix::Quantized {
+            data,
+            rows,
+            cols,
+            kind,
+        } = self
+        else {
+            return None;
+        };
+        let kind_name = match kind {
+            QuantKind::Q8_0 => "Q8_0",
+            QuantKind::Q4_0 => "Q4_0",
+            QuantKind::Q4K => "Q4_K",
+            QuantKind::Q5K => "Q5_K",
+            QuantKind::Q6K => "Q6_K",
+            QuantKind::IQ4XS => "IQ4_XS",
+            _ => return None,
+        };
+        let (fn_name, block_bytes, block_elems) = ferrox_metal::gpu::mul_mm_sg_meta(kind_name)?;
+        Some(ferrox_metal::gpu::MulMmSgLaunch {
+            weights: data.as_slice(),
+            rows: *rows,
+            row_bytes: self.block_bytes_per_row(*kind, *cols),
+            fn_name,
+            block_bytes,
+            block_elems,
+        })
+    }
+
     #[cfg(any(feature = "metal", feature = "cuda"))]
     pub fn prefers_gpu_batch(&self) -> bool {
         !matches!(

@@ -643,11 +643,9 @@ pub fn run_infer(args: InferArgs) -> anyhow::Result<()> {
         pos = 1;
         l
     } else {
-        let rows = decoder.forward_batch(&tokens, 0, &mut caches);
+        let l = decoder.forward_batch_last(&tokens, 0, &mut caches);
         pos = tokens.len();
-        rows.into_iter()
-            .last()
-            .expect("forward_batch returns one logits row per prompt token")
+        l
     };
     let prefill_secs = prefill_t.elapsed().as_secs_f64();
 

@@ -176,16 +176,12 @@ fn forward_prompt_batch(
         let mut pos = start_pos;
         let mut last = Vec::new();
         for part in tokens.chunks(chunk) {
-            let rows = decoder.forward_batch(part, pos, caches);
+            last = decoder.forward_batch_last(part, pos, caches);
             pos += part.len();
-            last = rows.into_iter().last().unwrap_or_default();
         }
         last
     } else {
-        let rows = decoder.forward_batch(tokens, start_pos, caches);
-        rows.into_iter()
-            .last()
-            .expect("forward_batch returns one logits row per prompt token")
+        decoder.forward_batch_last(tokens, start_pos, caches)
     }
 }
 

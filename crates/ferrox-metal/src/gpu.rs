@@ -2285,6 +2285,164 @@ pub fn launch_q6_k_mul_mm_sg(
     )
 }
 
+/// One quantized matrix bound for the simdgroup GEMM, as a descriptor
+/// so several can be encoded into a single command buffer.
+pub struct MulMmSgLaunch<'a> {
+    pub weights: &'a [u8],
+    pub rows: usize,
+    pub row_bytes: usize,
+    pub fn_name: &'static str,
+    pub block_bytes: usize,
+    pub block_elems: usize,
+}
+
+impl MulMmSgLaunch<'_> {
+    fn cols(&self) -> usize {
+        (self.row_bytes / self.block_bytes) * self.block_elems
+    }
+}
+
+/// Kernel name and block geometry for the kinds that have a simdgroup
+/// GEMM. `None` for anything still limited to a matvec.
+pub fn mul_mm_sg_meta(kind: &str) -> Option<(&'static str, usize, usize)> {
+    match kind {
+        "Q4_K" => Some(("q4_k_mul_mm_sg", 144, 256)),
+        "Q5_K" => Some(("q5_k_mul_mm_sg", 176, 256)),
+        "Q6_K" => Some(("q6_k_mul_mm_sg", 210, 256)),
+        "Q8_0" => Some(("q8_0_mul_mm_sg", 34, 32)),
+        "Q4_0" => Some(("q4_0_mul_mm_sg", 18, 32)),
+        "IQ4_XS" => Some(("iq4_xs_mul_mm_sg", 136, 256)),
+        _ => None,
+    }
+}
+
+fn encode_mul_mm_sg(
+    enc: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+    device: &Retained<ProtocolObject<dyn MTLDevice>>,
+    l: &MulMmSgLaunch<'_>,
+    w: &ResidentWeightBuffer,
+    x_buf: &ProtocolObject<dyn MTLBuffer>,
+    out_buf: &ProtocolObject<dyn MTLBuffer>,
+    batch_size: usize,
+) -> Result<(), MetalError> {
+    let pipeline = ensure_pipeline(device, K_QUANT_MUL_MM_SG_KERNEL_SRC, l.fn_name)?;
+    unsafe {
+        enc.setComputePipelineState(&pipeline.0);
+        enc.setBuffer_offset_atIndex(Some(&w.buffer), w.weight_offset, 0);
+        enc.setBuffer_offset_atIndex(Some(x_buf), 0, 1);
+        enc.setBuffer_offset_atIndex(Some(out_buf), 0, 2);
+        for (idx, mut v) in [
+            (3usize, l.rows as u32),
+            (4, l.cols() as u32),
+            (5, batch_size as u32),
+            (6, l.row_bytes as u32),
+        ] {
+            enc.setBytes_length_atIndex(
+                NonNull::new(&mut v as *mut u32 as *mut _).unwrap(),
+                4,
+                idx,
+            );
+        }
+        enc.setThreadgroupMemoryLength_atIndex(8192, 0);
+        enc.dispatchThreadgroups_threadsPerThreadgroup(
+            MTLSize {
+                width: batch_size.div_ceil(32),
+                height: l.rows.div_ceil(64),
+                depth: 1,
+            },
+            MTLSize {
+                width: 128,
+                height: 1,
+                depth: 1,
+            },
+        );
+    }
+    Ok(())
+}
+
+/// Whole dense FFN for a batch of positions in **one** command buffer:
+/// gate GEMM, up GEMM, the activation, then the down GEMM, with the two
+/// intermediates staying in device memory.
+///
+/// Run as three separate `launch_*_mul_mm_sg` calls instead, the same
+/// work costs three command-buffer round trips per layer plus four host
+/// copies of tensors that are `batch x ffn_dim` -- 29 MB apiece at batch
+/// 512 on an 8B model -- and the activation runs on the CPU. Profiling
+/// put ~20-25% of every GEMM call in that copying. llama.cpp never pays
+/// it because it submits the whole graph, not one node at a time.
+///
+/// `x_batch` is `[batch, hidden]`, the result `[batch, down.rows]`.
+pub fn launch_dense_ffn_swiglu_batch(
+    gate: &MulMmSgLaunch<'_>,
+    up: &MulMmSgLaunch<'_>,
+    down: &MulMmSgLaunch<'_>,
+    x_batch: &[f32],
+    batch_size: usize,
+    gelu: bool,
+) -> Result<Vec<f32>, MetalError> {
+    if batch_size == 0 || gate.rows == 0 || down.rows == 0 {
+        return Ok(vec![0.0; batch_size * down.rows]);
+    }
+    let hidden = gate.cols();
+    if hidden == 0 || up.cols() != hidden || down.cols() != gate.rows || up.rows != gate.rows {
+        return Err(MetalError::CommandFailed);
+    }
+    if x_batch.len() != batch_size * hidden {
+        return Err(MetalError::CommandFailed);
+    }
+
+    let shared = shared_metal()?;
+    let device = &shared.device;
+    let queue = &shared.queue;
+
+    let x_buf = unsafe {
+        device.newBufferWithBytes_length_options(
+            NonNull::new(x_batch.as_ptr() as *mut std::ffi::c_void).unwrap(),
+            std::mem::size_of_val(x_batch),
+            MTLResourceOptions::StorageModeShared,
+        )
+    }
+    .ok_or(MetalError::BufferAllocFailed)?;
+
+    let gate_w = resident_weight_buffer(device, gate.weights)?;
+    let up_w = resident_weight_buffer(device, up.weights)?;
+    let down_w = resident_weight_buffer(device, down.weights)?;
+
+    let ffn_elems = batch_size * gate.rows;
+    // Gate / up / activation never leave the GPU, so they can be Private.
+    let mid = |n: usize| {
+        device
+            .newBufferWithLength_options(n * 4, MTLResourceOptions::StorageModePrivate)
+            .ok_or(MetalError::BufferAllocFailed)
+    };
+    let gate_buf = mid(ffn_elems)?;
+    let up_buf = mid(ffn_elems)?;
+    let act_buf = mid(ffn_elems)?;
+    let out_elems = batch_size * down.rows;
+    let out_buf = device
+        .newBufferWithLength_options(out_elems * 4, MTLResourceOptions::StorageModeShared)
+        .ok_or(MetalError::BufferAllocFailed)?;
+
+    let cmd_buf = queue.commandBuffer().ok_or(MetalError::CommandFailed)?;
+    let enc = cmd_buf
+        .computeCommandEncoder()
+        .ok_or(MetalError::CommandFailed)?;
+    encode_mul_mm_sg(&enc, device, gate, &gate_w, &x_buf, &gate_buf, batch_size)?;
+    encode_mul_mm_sg(&enc, device, up, &up_w, &x_buf, &up_buf, batch_size)?;
+    if gelu {
+        crate::elem::encode_gelu_mul(&enc, device, &gate_buf, &up_buf, &act_buf, ffn_elems as u32)?;
+    } else {
+        crate::elem::encode_silu_mul(&enc, device, &gate_buf, &up_buf, &act_buf, ffn_elems as u32)?;
+    }
+    encode_mul_mm_sg(&enc, device, down, &down_w, &act_buf, &out_buf, batch_size)?;
+    enc.endEncoding();
+    cmd_buf.commit();
+    cmd_buf.waitUntilCompleted();
+
+    let ptr = out_buf.contents().as_ptr() as *const f32;
+    Ok(unsafe { std::slice::from_raw_parts(ptr, out_elems) }.to_vec())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn launch_k_quant_mul_mm_sg(
     weights: &[u8],

@@ -242,11 +242,15 @@ fn bench_prefill(decoder: &Decoder, n_prompt: usize, reps: usize) -> anyhow::Res
     for rep in 0..reps + 1 {
         let mut caches = fresh_caches(decoder);
         let t = Instant::now();
-        let rows = decoder.forward_batch(&tokens, 0, &mut caches);
+        // `forward_batch_last`, not `forward_batch`: llama-bench's
+        // `pp512` asks for logits at the final position only, so
+        // projecting all 512 rows through the vocabulary would be work
+        // the reference engine never does.
+        let logits = decoder.forward_batch_last(&tokens, 0, &mut caches);
         let dt = t.elapsed().as_secs_f64();
         anyhow::ensure!(
-            !rows.is_empty(),
-            "forward_batch returned no logits rows for a {n_prompt}-token prompt"
+            !logits.is_empty(),
+            "forward_batch_last returned no logits for a {n_prompt}-token prompt"
         );
         // Rep 0 is the warmup: first touch of every weight page, and on
         // Metal the first pipeline compile. Timing it would measure the

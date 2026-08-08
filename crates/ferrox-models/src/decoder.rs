@@ -2565,6 +2565,34 @@ impl Decoder {
             }
         }
         layer.moe.record_activations(&[0]);
+        // One command buffer for the whole FFN when every matrix has a
+        // simdgroup GEMM: gate and up feed the activation and the down
+        // projection without the intermediates ever touching the host.
+        // Three separate launches cost three round trips per layer plus
+        // four copies of a `batch x ffn_dim` tensor.
+        #[cfg(feature = "metal")]
+        if ferrox_core::weight_matrix::metal_dense_enabled() {
+            let gelu = matches!(config.ffn_activation, crate::config::FfnActivation::Gelu);
+            let fused = layer.moe.with_expert(0, |ex| {
+                let (g, u, d) = (
+                    ex.gate.mul_mm_sg_launch()?,
+                    ex.up.mul_mm_sg_launch()?,
+                    ex.down.mul_mm_sg_launch()?,
+                );
+                ferrox_metal::gpu::launch_dense_ffn_swiglu_batch(
+                    &g,
+                    &u,
+                    &d,
+                    normed2_batch,
+                    batch_size,
+                    gelu,
+                )
+                .ok()
+            });
+            if let Some(out) = fused {
+                return Some(out);
+            }
+        }
         Some(layer.moe.with_expert(0, |ex| {
             let gate = ex.gate.apply_batch(normed2_batch, batch_size);
             let up = ex.up.apply_batch(normed2_batch, batch_size);
@@ -2660,6 +2688,42 @@ impl Decoder {
             .chunks(vocab_size)
             .map(|c| c.to_vec())
             .collect()
+    }
+
+    /// [`Self::forward_batch`] for the common case where only the final
+    /// position's logits are wanted: prefill a prompt, then sample the
+    /// next token. Runs `output_head` on **one** row instead of all
+    /// `batch_size` of them.
+    ///
+    /// The KV cache and every hidden state are identical either way —
+    /// only the vocabulary projection is skipped, and only for rows
+    /// whose logits the caller was going to drop. That projection is not
+    /// a rounding error: it is `[batch x hidden] x [hidden x vocab]`,
+    /// which for a large-vocabulary model with a small body is a large
+    /// share of prefill. `V*H / (V*H + L*P_layer)` comes to 30% on
+    /// Gemma-3-1B, 21% on Llama-3.2-1B and SmolLM2, 23% on Gemma-2-2B.
+    /// llama.cpp does not do this work at all during `pp512` —
+    /// `llama_batch_get_one` leaves `logits` unset, so `inp_out_ids`
+    /// selects a single row.
+    ///
+    /// [`Self::forward_batch`] stays for the callers that genuinely need
+    /// every row: speculative verification checks each draft position,
+    /// and `/v1/embeddings` pools over all of them.
+    pub fn forward_batch_last(
+        &self,
+        tokens: &[usize],
+        start_pos: usize,
+        kv_caches: &mut [KvCache],
+    ) -> Vec<f32> {
+        let hiddens = self.forward_hidden_batch(tokens, start_pos, kv_caches);
+        let Some(last) = hiddens.last() else {
+            return Vec::new();
+        };
+        let mut logits = self.output_head.apply(last);
+        if let Some(sc) = self.config.final_logit_softcap {
+            softcap_inplace(&mut logits, sc);
+        }
+        logits
     }
 
     /// Like [`Self::forward_batch`], but returns final RMS-normed hidden
@@ -3709,6 +3773,58 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// `forward_batch_last` exists to skip the vocabulary projection for
+    /// every position but the last, so the one thing that must hold is
+    /// that the row it *does* produce is the same row `forward_batch`
+    /// would have produced. It must also leave the KV cache in the same
+    /// state -- prefill's whole purpose -- which is checked by decoding
+    /// one more token from each cache and comparing.
+    #[test]
+    fn forward_batch_last_matches_the_final_row_of_forward_batch() {
+        let cfg = tiny_test_config();
+        let vocab = 16;
+        let tokens = vec![1usize, 4, 7, 2, 9];
+
+        let decoder_a = Decoder::new_random_small(cfg.clone(), 2, vocab);
+        let mut caches_a: Vec<KvCache> = (0..2)
+            .map(|_| KvCache::new(decoder_a.config.n_kv_heads, decoder_a.config.head_dim))
+            .collect();
+        let all_rows = decoder_a.forward_batch(&tokens, 0, &mut caches_a);
+
+        let decoder_b = Decoder::new_random_small(cfg, 2, vocab);
+        let mut caches_b: Vec<KvCache> = (0..2)
+            .map(|_| KvCache::new(decoder_b.config.n_kv_heads, decoder_b.config.head_dim))
+            .collect();
+        let last = decoder_b.forward_batch_last(&tokens, 0, &mut caches_b);
+
+        let expected = all_rows.last().expect("one row per prompt token");
+        assert_eq!(last.len(), expected.len());
+        for (i, (a, b)) in expected.iter().zip(last.iter()).enumerate() {
+            assert!(
+                (a - b).abs() < 1e-4,
+                "logit {i}: forward_batch={a} forward_batch_last={b}"
+            );
+        }
+
+        // Same KV state: the next token's logits must agree too.
+        let next_a = decoder_a.forward_token(3, tokens.len(), &mut caches_a);
+        let next_b = decoder_b.forward_token(3, tokens.len(), &mut caches_b);
+        for (i, (a, b)) in next_a.iter().zip(next_b.iter()).enumerate() {
+            assert!(
+                (a - b).abs() < 1e-4,
+                "post-prefill decode logit {i}: {a} vs {b}"
+            );
+        }
+
+        // Empty prompt is the degenerate case both paths must survive.
+        let mut caches_c: Vec<KvCache> = (0..2)
+            .map(|_| KvCache::new(decoder_b.config.n_kv_heads, decoder_b.config.head_dim))
+            .collect();
+        assert!(decoder_b
+            .forward_batch_last(&[], 0, &mut caches_c)
+            .is_empty());
     }
 
     /// `forward_multi_seq`'s core correctness property: batching N

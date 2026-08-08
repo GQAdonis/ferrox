@@ -31,7 +31,7 @@ pinning both to the same count does not make the comparison fairer.
 
 | Model | Backend | Test | ferrox tok/s | llama.cpp tok/s | Gap |
 |---|---|---|---|---|---|
-| Gemma-2-2B-IT Q4_K_M | cpu | pp512 | **20.77** | **120.77** | 🔴 **5.82×** |
+| Gemma-2-2B-IT Q4_K_M | cpu | pp512 | **40.61** | **167.82** | 🔴 **4.13×** |
 | Gemma-2-2B-IT Q4_K_M | cpu | tg128 | **16.55** | **26.04** | 🔴 **1.57×** |
 | Gemma-2-2B-IT Q4_K_M | metal | pp512 | **136.10** | **547.17** | 🔴 **4.02×** |
 | Gemma-2-2B-IT Q4_K_M | metal | tg128 | **33.66** | **41.01** | 🔴 **1.22×** |
@@ -53,7 +53,7 @@ pinning both to the same count does not make the comparison fairer.
 | Mistral-7B-Instruct-v0.2 Q4_K_M | metal | tg128 | **19.65** | **17.96** | 🟢 **0.91×** |
 | OLMoE-1B-7B-0924 Q4_0 | cpu | pp512 | **69.24** | **288.12** | 🔴 **4.16×** |
 | OLMoE-1B-7B-0924 Q4_0 | cpu | tg128 | **42.62** | **89.93** | 🔴 **2.11×** |
-| OLMoE-1B-7B-0924 Q4_0 | metal | pp512 | **124.47** | **1409.52** | 🔴 **11.32×** |
+| OLMoE-1B-7B-0924 Q4_0 | metal | pp512 | **100.42** | **1543.22** | 🔴 **15.37×** |
 | OLMoE-1B-7B-0924 Q4_0 | metal | tg128 | **105.20** | **140.99** | 🔴 **1.34×** |
 | Phi-3-mini-4k-Instruct Q4 | cpu | pp512 | **16.86** | **82.76** | 🔴 **4.91×** |
 | Phi-3-mini-4k-Instruct Q4 | cpu | tg128 | **13.38** | **22.31** | 🔴 **1.67×** |

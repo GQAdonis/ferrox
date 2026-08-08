@@ -2607,6 +2607,106 @@ impl Decoder {
         }))
     }
 
+    /// CPU MoE prefill: bucket tokens by expert, then one
+    /// `apply_batch` per expert with tokens instead of per-token
+    /// `combine_ffn_outputs_for_position`. `None` when gates fail
+    /// (small batch, dense, Metal preferred, shared experts, non-SwiGLU,
+    /// non-resident, or any GPU-placed expert).
+    fn moe_ffn_batch(
+        layer: &LayerWeights,
+        normed2_batch: &[f32],
+        router_logits_batch: &[f32],
+        batch_size: usize,
+        hidden_dim: usize,
+        config: &ModelConfig,
+        plan: Option<&PlacementPlan>,
+    ) -> Option<Vec<f32>> {
+        if batch_size < 32 || Self::is_dense_layer(layer) {
+            return None;
+        }
+        // Metal prefill owns MoE when dense Metal is on
+        // (`try_metal_moe_prefill_batch`); do not steal the path.
+        #[cfg(feature = "metal")]
+        if ferrox_core::metal_dense_enabled() {
+            return None;
+        }
+        if !layer.moe.shared_experts.is_empty() || layer.moe.shared_expert_gate.is_some() {
+            return None;
+        }
+        if !matches!(
+            config.ffn_activation,
+            crate::config::FfnActivation::Swiglu | crate::config::FfnActivation::SwigluFused
+        ) {
+            return None;
+        }
+        let ExpertBacking::Resident(experts) = &layer.moe.experts else {
+            return None;
+        };
+        let n_experts = experts.len();
+        let all_cpu = plan
+            .map(|p| (0..n_experts).all(|eid| matches!(p.placement_for(eid), ExpertPlacement::Cpu)))
+            .unwrap_or(true);
+        if !all_cpu || n_experts == 0 {
+            return None;
+        }
+
+        let mut buckets: Vec<Vec<(usize, f32)>> = vec![Vec::new(); n_experts];
+        for b in 0..batch_size {
+            let logits = &router_logits_batch[b * n_experts..(b + 1) * n_experts];
+            let decision = match (
+                config.moe.expert_group_count,
+                config.moe.expert_group_used_count,
+            ) {
+                (Some(n_groups), Some(k_per_group)) if n_groups > 1 && k_per_group > 0 => {
+                    ferrox_moe::route_top_k_grouped(
+                        logits,
+                        n_groups,
+                        k_per_group,
+                        config.moe.n_experts_active,
+                        config.moe.gating,
+                        config.moe.norm_topk_prob,
+                    )
+                }
+                _ => route_top_k(
+                    logits,
+                    config.moe.n_experts_active,
+                    config.moe.gating,
+                    config.moe.norm_topk_prob,
+                ),
+            };
+            layer.moe.record_activations(&decision.expert_ids);
+            for (&eid, &w) in decision.expert_ids.iter().zip(decision.weights.iter()) {
+                buckets[eid].push((b, w));
+            }
+        }
+
+        let mut acc = vec![0f32; batch_size * hidden_dim];
+        for (eid, toks) in buckets.iter().enumerate() {
+            if toks.is_empty() {
+                continue;
+            }
+            let n = toks.len();
+            let mut gathered = vec![0f32; n * hidden_dim];
+            for (i, &(tok, _)) in toks.iter().enumerate() {
+                gathered[i * hidden_dim..(i + 1) * hidden_dim]
+                    .copy_from_slice(&normed2_batch[tok * hidden_dim..(tok + 1) * hidden_dim]);
+            }
+            let ex = &experts[eid];
+            let gate = ex.gate.apply_batch(&gathered, n);
+            let up = ex.up.apply_batch(&gathered, n);
+            let activated = ferrox_core::matmul::swiglu(&gate, &up);
+            let down = ex.down.apply_batch(&activated, n);
+            for (i, &(tok, w)) in toks.iter().enumerate() {
+                let out = &down[i * hidden_dim..(i + 1) * hidden_dim];
+                let row = &mut acc[tok * hidden_dim..(tok + 1) * hidden_dim];
+                for (a, &o) in row.iter_mut().zip(out.iter()) {
+                    *a += w * o;
+                }
+            }
+        }
+        Some(acc)
+    }
+
     /// `forward_token`'s MoE FFN block for one position: the dense
     /// fast path (see `is_dense_layer`) or the full router+combine path
     /// with the router computed inline via a single-position `apply`.
@@ -2829,6 +2929,87 @@ impl Decoder {
         }
 
         for (l, (layer, cache)) in self.layers.iter().zip(kv_caches.iter_mut()).enumerate() {
+            let q_width = n_heads * head_dim;
+            let kv_width = n_kv_heads * head_dim;
+
+            // One-CB dense prefill (RMSNorm→QKV GEMM→attn→O→FFN) when every
+            // projection has mul_mm_sg and the layer has no QKV bias / QK-norm.
+            #[cfg(feature = "metal")]
+            if use_metal_attn
+                && batch_size >= 4
+                && Self::is_dense_layer(layer)
+                && layer.attn.q_bias.is_none()
+                && layer.attn.k_bias.is_none()
+                && layer.attn.v_bias.is_none()
+                && layer.attn.q_norm.is_none()
+                && layer.attn.k_norm.is_none()
+            {
+                let swa_fits = match self.config.layer_sliding_window(l) {
+                    Some(window) => start_pos + batch_size <= window,
+                    None => true,
+                };
+                if swa_fits {
+                    if let Some(guard) = metal_kv_guard.as_mut() {
+                        if let Some(metal_kvs) = guard.as_mut() {
+                            if metal_kvs[l].seq_len == cache.seq_len && start_pos == cache.seq_len {
+                                layer.moe.record_activations(&[0]);
+                                let fused = layer.moe.with_expert(0, |ex| {
+                                    let (q, k, v, o, gate, up, down) = (
+                                        layer.attn.q_proj.mul_mm_sg_launch()?,
+                                        layer.attn.k_proj.mul_mm_sg_launch()?,
+                                        layer.attn.v_proj.mul_mm_sg_launch()?,
+                                        layer.attn.o_proj.mul_mm_sg_launch()?,
+                                        ex.gate.mul_mm_sg_launch()?,
+                                        ex.up.mul_mm_sg_launch()?,
+                                        ex.down.mul_mm_sg_launch()?,
+                                    );
+                                    let gelu = matches!(
+                                        self.config.ffn_activation,
+                                        crate::config::FfnActivation::Gelu
+                                    );
+                                    let prefill_layer = ferrox_metal::attn::PrefillDenseLayerMetal {
+                                        attn_norm_w: &layer.attn.norm_weight,
+                                        ffn_norm_w: &layer.moe.norm_weight,
+                                        q,
+                                        k,
+                                        v,
+                                        o,
+                                        gate,
+                                        up,
+                                        down,
+                                        post_attn_norm: layer.attn.post_attn_norm.as_deref(),
+                                        post_ffn_norm: layer.attn.post_ffn_norm.as_deref(),
+                                        layer_idx: l as u32,
+                                    };
+                                    ferrox_metal::attn::launch_prefill_dense_layer(
+                                        &hidden_batch,
+                                        &prefill_layer,
+                                        &mut metal_kvs[l],
+                                        n_heads,
+                                        batch_size,
+                                        self.metal_rope_layout(),
+                                        self.config.layer_rope_theta(l),
+                                        self.config.rope_freqs.as_deref(),
+                                        start_pos,
+                                        self.config.rms_norm_eps,
+                                        gelu,
+                                        self.config.attn_logit_softcap,
+                                    )
+                                    .ok()
+                                });
+                                if let Some(h_out) = fused {
+                                    cache.advance_len(batch_size).expect(
+                                        "unbounded/planned KvCache growth is infallible",
+                                    );
+                                    hidden_batch = h_out;
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
             // --- attention block ---
             let normed_batch: Vec<f32> = hidden_batch
                 .chunks(hidden_dim)
@@ -2838,9 +3019,6 @@ impl Decoder {
             let mut q_batch = layer.attn.q_proj.apply_batch(&normed_batch, batch_size);
             let mut k_batch = layer.attn.k_proj.apply_batch(&normed_batch, batch_size);
             let mut v_batch = layer.attn.v_proj.apply_batch(&normed_batch, batch_size);
-
-            let q_width = n_heads * head_dim;
-            let kv_width = n_kv_heads * head_dim;
 
             if let Some(bias) = &layer.attn.q_bias {
                 for row in q_batch.chunks_mut(q_width) {
@@ -3040,6 +3218,24 @@ impl Decoder {
                         for (h, f) in hidden_batch.iter_mut().zip(ffn_batch.iter()) {
                             *h += f;
                         }
+                    } else if let Some(mut ffn_batch) = Self::moe_ffn_batch(
+                        layer,
+                        &normed2_batch,
+                        &router_logits_batch,
+                        batch_size,
+                        hidden_dim,
+                        &self.config,
+                        residency.as_ref().map(|p| p.layer_plan(l)),
+                    ) {
+                        if let Some(post) = &layer.attn.post_ffn_norm {
+                            ffn_batch = ffn_batch
+                                .chunks(hidden_dim)
+                                .flat_map(|row| rms_norm(row, post, self.config.rms_norm_eps))
+                                .collect();
+                        }
+                        for (h, f) in hidden_batch.iter_mut().zip(ffn_batch.iter()) {
+                            *h += f;
+                        }
                     } else {
                         let n_experts = layer.moe.n_experts().max(1);
                         for b in 0..batch_size {
@@ -3200,6 +3396,24 @@ impl Decoder {
                 // position at a time while Q/K/V and the router were
                 // already batched, which is why `pp512` measured about
                 // the same as `tg128`.
+                if let Some(post) = &layer.attn.post_ffn_norm {
+                    ffn_batch = ffn_batch
+                        .chunks(hidden_dim)
+                        .flat_map(|row| rms_norm(row, post, self.config.rms_norm_eps))
+                        .collect();
+                }
+                for (h, f) in hidden_batch.iter_mut().zip(ffn_batch.iter()) {
+                    *h += f;
+                }
+            } else if let Some(mut ffn_batch) = Self::moe_ffn_batch(
+                layer,
+                &normed2_batch,
+                &router_logits_batch,
+                batch_size,
+                hidden_dim,
+                &self.config,
+                residency.as_ref().map(|p| p.layer_plan(l)),
+            ) {
                 if let Some(post) = &layer.attn.post_ffn_norm {
                     ffn_batch = ffn_batch
                         .chunks(hidden_dim)

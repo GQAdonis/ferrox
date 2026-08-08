@@ -396,7 +396,11 @@ fn apply_backend_env(args: &InferArgs) -> anyhow::Result<()> {
         OffloadDevice::Auto => unsafe {
             std::env::set_var("FERROX_METAL", "auto");
             std::env::set_var("FERROX_CUDA", "auto");
-            std::env::set_var("FERROX_METAL_ATTN", "1");
+            // Honor a pre-set FERROX_METAL_ATTN so ablations like
+            // `FERROX_METAL_ATTN=0 … --ngl 99` actually disable attn.
+            if std::env::var_os("FERROX_METAL_ATTN").is_none() {
+                std::env::set_var("FERROX_METAL_ATTN", "1");
+            }
         },
         OffloadDevice::Metal => {
             #[cfg(not(feature = "metal"))]
@@ -410,7 +414,9 @@ fn apply_backend_env(args: &InferArgs) -> anyhow::Result<()> {
                 }
                 unsafe {
                     std::env::set_var("FERROX_METAL", "1");
-                    std::env::set_var("FERROX_METAL_ATTN", "1");
+                    if std::env::var_os("FERROX_METAL_ATTN").is_none() {
+                        std::env::set_var("FERROX_METAL_ATTN", "1");
+                    }
                     std::env::set_var("FERROX_CUDA", "0");
                 }
             }
@@ -580,9 +586,13 @@ pub fn run_infer(args: InferArgs) -> anyhow::Result<()> {
     eprintln!("ferrox: loaded in {:.2}s", load_t.elapsed().as_secs_f64());
 
     let mut tokens = tokenizer.encode(&prompt);
-    if let Some(bos) = bos_id {
-        if tokens.first() != Some(&bos) {
-            tokens.insert(0, bos);
+    // Match llama.cpp vocab add_bos (qwen2/BPE default false). Blindly
+    // prepending bos_token_id poisons Qwen2-MoE (`<|endoftext|>`).
+    if ferrox_models::tokenizer::should_add_bos_token(&file) {
+        if let Some(bos) = bos_id {
+            if tokens.first() != Some(&bos) {
+                tokens.insert(0, bos);
+            }
         }
     }
     let vocab_size = decoder.config.vocab_size;
@@ -744,9 +754,11 @@ fn run_mla_infer(args: InferArgs, path: &Path, file: &ShardedGguf) -> anyhow::Re
     eprintln!("ferrox: loaded in {:.2}s", load_t.elapsed().as_secs_f64());
 
     let mut tokens = tokenizer.encode(&prompt);
-    if let Some(bos) = bos_id {
-        if tokens.first() != Some(&bos) {
-            tokens.insert(0, bos);
+    if ferrox_models::tokenizer::should_add_bos_token(file) {
+        if let Some(bos) = bos_id {
+            if tokens.first() != Some(&bos) {
+                tokens.insert(0, bos);
+            }
         }
     }
     let vocab_size = Engine::vocab_size(&engine);
@@ -889,9 +901,11 @@ fn run_gemma4_infer(args: InferArgs, path: &Path, file: &ShardedGguf) -> anyhow:
     eprintln!("ferrox: loaded in {:.2}s", load_t.elapsed().as_secs_f64());
 
     let mut tokens = tokenizer.encode(&prompt);
-    if let Some(bos) = bos_id {
-        if tokens.first() != Some(&bos) {
-            tokens.insert(0, bos);
+    if ferrox_models::tokenizer::should_add_bos_token(file) {
+        if let Some(bos) = bos_id {
+            if tokens.first() != Some(&bos) {
+                tokens.insert(0, bos);
+            }
         }
     }
     let vocab_size = Engine::vocab_size(&engine);
@@ -1033,9 +1047,11 @@ fn run_glm52_infer(args: InferArgs, path: &Path, file: &ShardedGguf) -> anyhow::
     eprintln!("ferrox: loaded in {:.2}s", load_t.elapsed().as_secs_f64());
 
     let mut tokens = tokenizer.encode(&prompt);
-    if let Some(bos) = bos_id {
-        if tokens.first() != Some(&bos) {
-            tokens.insert(0, bos);
+    if ferrox_models::tokenizer::should_add_bos_token(file) {
+        if let Some(bos) = bos_id {
+            if tokens.first() != Some(&bos) {
+                tokens.insert(0, bos);
+            }
         }
     }
     let vocab_size = Engine::vocab_size(&engine);

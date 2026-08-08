@@ -256,13 +256,29 @@ pub(crate) fn encode_rms_norm(
     n: u32,
     eps: f32,
 ) -> Result<(), MetalError> {
+    encode_rms_norm_at(encoder, device, x, 0, weight, out, 0, n, eps)
+}
+
+/// [`encode_rms_norm`] with byte offsets into `x` / `out` (prefill batch rows).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_rms_norm_at(
+    encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+    device: &Retained<ProtocolObject<dyn MTLDevice>>,
+    x: &ProtocolObject<dyn MTLBuffer>,
+    x_off_bytes: usize,
+    weight: &ProtocolObject<dyn MTLBuffer>,
+    out: &ProtocolObject<dyn MTLBuffer>,
+    out_off_bytes: usize,
+    n: u32,
+    eps: f32,
+) -> Result<(), MetalError> {
     let pipe = ensure_pipeline(device, RMS_NORM_KERNEL_SRC, "rms_norm_f32")?;
     encoder.setComputePipelineState(&pipe.0);
     let tg = 256u32;
     unsafe {
-        encoder.setBuffer_offset_atIndex(Some(x), 0, 0);
+        encoder.setBuffer_offset_atIndex(Some(x), x_off_bytes, 0);
         encoder.setBuffer_offset_atIndex(Some(weight), 0, 1);
-        encoder.setBuffer_offset_atIndex(Some(out), 0, 2);
+        encoder.setBuffer_offset_atIndex(Some(out), out_off_bytes, 2);
         let mut n_u = n;
         encoder.setBytes_length_atIndex(
             NonNull::new(&mut n_u as *mut u32 as *mut _).unwrap(),

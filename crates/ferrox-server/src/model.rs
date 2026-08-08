@@ -290,9 +290,15 @@ fn load_glm52_checkpoint(path: &str, file: &ShardedGguf) -> anyhow::Result<Glm52
     let eos_id = file
         .metadata_u64("tokenizer.ggml.eos_token_id")
         .map(|v| v as usize);
-    let bos_id = file
-        .metadata_u64("tokenizer.ggml.bos_token_id")
-        .map(|v| v as usize);
+    // Only surface BOS when llama.cpp would add it (see
+    // `ferrox_models::tokenizer::should_add_bos_token`). Qwen2/BPE leave
+    // add_bos=false; prepending `<|endoftext|>` poisons decode.
+    let bos_id = if ferrox_models::tokenizer::should_add_bos_token(file) {
+        file.metadata_u64("tokenizer.ggml.bos_token_id")
+            .map(|v| v as usize)
+    } else {
+        None
+    };
     let byte_tokenizer = matches!(tokenizer, ServerTokenizer::Byte);
     let chat_template = crate::chat_template::ChatTemplate::detect_for_gguf(
         file.metadata_str("tokenizer.chat_template"),
@@ -330,9 +336,15 @@ fn load_mla_checkpoint(path: &str, file: &ShardedGguf) -> anyhow::Result<MlaLoad
     let eos_id = file
         .metadata_u64("tokenizer.ggml.eos_token_id")
         .map(|v| v as usize);
-    let bos_id = file
-        .metadata_u64("tokenizer.ggml.bos_token_id")
-        .map(|v| v as usize);
+    // Only surface BOS when llama.cpp would add it (see
+    // `ferrox_models::tokenizer::should_add_bos_token`). Qwen2/BPE leave
+    // add_bos=false; prepending `<|endoftext|>` poisons decode.
+    let bos_id = if ferrox_models::tokenizer::should_add_bos_token(file) {
+        file.metadata_u64("tokenizer.ggml.bos_token_id")
+            .map(|v| v as usize)
+    } else {
+        None
+    };
     let byte_tokenizer = matches!(tokenizer, ServerTokenizer::Byte);
     let chat_template = crate::chat_template::ChatTemplate::detect_for_gguf(
         file.metadata_str("tokenizer.chat_template"),
@@ -371,9 +383,15 @@ fn load_gemma4_checkpoint(path: &str, file: &ShardedGguf) -> anyhow::Result<Gemm
     let eos_id = file
         .metadata_u64("tokenizer.ggml.eos_token_id")
         .map(|v| v as usize);
-    let bos_id = file
-        .metadata_u64("tokenizer.ggml.bos_token_id")
-        .map(|v| v as usize);
+    // Only surface BOS when llama.cpp would add it (see
+    // `ferrox_models::tokenizer::should_add_bos_token`). Qwen2/BPE leave
+    // add_bos=false; prepending `<|endoftext|>` poisons decode.
+    let bos_id = if ferrox_models::tokenizer::should_add_bos_token(file) {
+        file.metadata_u64("tokenizer.ggml.bos_token_id")
+            .map(|v| v as usize)
+    } else {
+        None
+    };
     let byte_tokenizer = matches!(tokenizer, ServerTokenizer::Byte);
     let chat_template = crate::chat_template::ChatTemplate::detect_for_gguf(
         file.metadata_str("tokenizer.chat_template"),
@@ -412,9 +430,15 @@ fn load_real_gguf_checkpoint(path: &str, file: &ShardedGguf) -> anyhow::Result<G
     let eos_id = file
         .metadata_u64("tokenizer.ggml.eos_token_id")
         .map(|v| v as usize);
-    let bos_id = file
-        .metadata_u64("tokenizer.ggml.bos_token_id")
-        .map(|v| v as usize);
+    // Only surface BOS when llama.cpp would add it (see
+    // `ferrox_models::tokenizer::should_add_bos_token`). Qwen2/BPE leave
+    // add_bos=false; prepending `<|endoftext|>` poisons decode.
+    let bos_id = if ferrox_models::tokenizer::should_add_bos_token(file) {
+        file.metadata_u64("tokenizer.ggml.bos_token_id")
+            .map(|v| v as usize)
+    } else {
+        None
+    };
 
     let byte_tokenizer = matches!(tokenizer, ServerTokenizer::Byte);
     let chat_template = crate::chat_template::ChatTemplate::detect_for_gguf(

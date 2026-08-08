@@ -260,7 +260,9 @@ fn apply_cli_overrides(args: &ServerArgs) -> anyhow::Result<()> {
             OffloadDevice::Auto => unsafe {
                 std::env::set_var("FERROX_METAL", "auto");
                 std::env::set_var("FERROX_CUDA", "auto");
-                std::env::set_var("FERROX_METAL_ATTN", "1");
+                if std::env::var_os("FERROX_METAL_ATTN").is_none() {
+                    std::env::set_var("FERROX_METAL_ATTN", "1");
+                }
             },
             OffloadDevice::Metal => {
                 #[cfg(not(feature = "metal"))]
@@ -276,7 +278,9 @@ fn apply_cli_overrides(args: &ServerArgs) -> anyhow::Result<()> {
                     }
                     unsafe {
                         std::env::set_var("FERROX_METAL", "1");
-                        std::env::set_var("FERROX_METAL_ATTN", "1");
+                        if std::env::var_os("FERROX_METAL_ATTN").is_none() {
+                            std::env::set_var("FERROX_METAL_ATTN", "1");
+                        }
                         std::env::set_var("FERROX_CUDA", "0");
                     }
                 }

@@ -76,7 +76,9 @@ pub fn apply_env(threads: usize, n_gpu_layers: usize) {
             std::env::set_var("FERROX_CUDA", "0");
         } else {
             std::env::set_var("FERROX_METAL", "auto");
-            std::env::set_var("FERROX_METAL_ATTN", "1");
+            if std::env::var_os("FERROX_METAL_ATTN").is_none() {
+                std::env::set_var("FERROX_METAL_ATTN", "1");
+            }
             std::env::set_var("FERROX_CUDA", "auto");
         }
         ferrox_core::weight_matrix::default_cpu_int_dot_on();

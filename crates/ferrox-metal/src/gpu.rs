@@ -1077,6 +1077,56 @@ kernel void q4_0_moe_down_id_sum(
         }
     }
 }
+
+/// Gather rows for `mul_mm_id` host map0: `dst[i*dst_stride+j] =
+/// src[ids[i]*src_stride+j]`. One threadgroup per batch row.
+kernel void moe_gather_rows(
+    device const float* src [[buffer(0)]],
+    device float* dst [[buffer(1)]],
+    device const int* ids [[buffer(2)]],
+    constant uint& batch_size [[buffer(3)]],
+    constant uint& cols [[buffer(4)]],
+    constant uint& src_stride [[buffer(5)]],
+    constant uint& dst_stride [[buffer(6)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint tg_size [[threads_per_threadgroup]]
+) {
+    if (row >= batch_size) {
+        return;
+    }
+    const uint id = uint(ids[row]);
+    device const float* srow = src + (size_t)id * src_stride;
+    device float* drow = dst + (size_t)row * dst_stride;
+    for (uint j = tid; j < cols; j += tg_size) {
+        drow[j] = srow[j];
+    }
+}
+
+/// Scatter rows after batched GEMM: `dst[ids[i]*dst_stride+j] =
+/// src[i*src_stride+j]`.
+kernel void moe_scatter_rows(
+    device const float* src [[buffer(0)]],
+    device float* dst [[buffer(1)]],
+    device const int* ids [[buffer(2)]],
+    constant uint& batch_size [[buffer(3)]],
+    constant uint& cols [[buffer(4)]],
+    constant uint& src_stride [[buffer(5)]],
+    constant uint& dst_stride [[buffer(6)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint tg_size [[threads_per_threadgroup]]
+) {
+    if (row >= batch_size) {
+        return;
+    }
+    const uint id = uint(ids[row]);
+    device const float* srow = src + (size_t)row * src_stride;
+    device float* drow = dst + (size_t)id * dst_stride;
+    for (uint j = tid; j < cols; j += tg_size) {
+        drow[j] = srow[j];
+    }
+}
 "#;
 
 /// Launches the Q4_0 matvec kernel. Verified on a real Apple M2 Pro GPU
@@ -2413,7 +2463,7 @@ pub fn mul_mm_sg_meta(kind: &str) -> Option<(&'static str, usize, usize)> {
     }
 }
 
-fn encode_mul_mm_sg(
+pub(crate) fn encode_mul_mm_sg(
     enc: &ProtocolObject<dyn MTLComputeCommandEncoder>,
     device: &Retained<ProtocolObject<dyn MTLDevice>>,
     l: &MulMmSgLaunch<'_>,
@@ -2422,10 +2472,27 @@ fn encode_mul_mm_sg(
     out_buf: &ProtocolObject<dyn MTLBuffer>,
     batch_size: usize,
 ) -> Result<(), MetalError> {
+    encode_mul_mm_sg_offset(enc, device, l, w, 0, x_buf, out_buf, batch_size)
+}
+
+pub(crate) fn encode_mul_mm_sg_offset(
+    enc: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+    device: &Retained<ProtocolObject<dyn MTLDevice>>,
+    l: &MulMmSgLaunch<'_>,
+    w: &ResidentWeightBuffer,
+    weight_byte_offset: usize,
+    x_buf: &ProtocolObject<dyn MTLBuffer>,
+    out_buf: &ProtocolObject<dyn MTLBuffer>,
+    batch_size: usize,
+) -> Result<(), MetalError> {
     let pipeline = ensure_pipeline(device, K_QUANT_MUL_MM_SG_KERNEL_SRC, l.fn_name)?;
     unsafe {
         enc.setComputePipelineState(&pipeline.0);
-        enc.setBuffer_offset_atIndex(Some(&w.buffer), w.weight_offset, 0);
+        enc.setBuffer_offset_atIndex(
+            Some(&w.buffer),
+            w.weight_offset + weight_byte_offset,
+            0,
+        );
         enc.setBuffer_offset_atIndex(Some(x_buf), 0, 1);
         enc.setBuffer_offset_atIndex(Some(out_buf), 0, 2);
         for (idx, mut v) in [
@@ -2468,6 +2535,11 @@ fn encode_mul_mm_sg(
 /// put ~20-25% of every GEMM call in that copying. llama.cpp never pays
 /// it because it submits the whole graph, not one node at a time.
 ///
+/// Prefill evidence: set `FERROX_METAL_MM_TIMING=1` — this path and
+/// [`launch_k_quant_mul_mm_sg`] accumulate setup/gpu/readback totals
+/// (printed every 224 calls). For a fuller one-CB-per-layer prefill see
+/// [`crate::attn::launch_prefill_dense_layer`].
+///
 /// `x_batch` is `[batch, hidden]`, the result `[batch, down.rows]`.
 pub fn launch_dense_ffn_swiglu_batch(
     gate: &MulMmSgLaunch<'_>,
@@ -2491,15 +2563,20 @@ pub fn launch_dense_ffn_swiglu_batch(
     let shared = shared_metal()?;
     let device = &shared.device;
     let queue = &shared.queue;
+    let timing = std::env::var_os("FERROX_METAL_MM_TIMING").is_some();
+    let t_setup = std::time::Instant::now();
 
-    let x_buf = unsafe {
-        device.newBufferWithBytes_length_options(
-            NonNull::new(x_batch.as_ptr() as *mut std::ffi::c_void).unwrap(),
-            std::mem::size_of_val(x_batch),
-            MTLResourceOptions::StorageModeShared,
-        )
+    // Shared scratch + memcpy (no per-call `newBufferWithBytes` alloc).
+    let x_elems = batch_size * hidden;
+    let x_scratch = borrow_scratch(device, x_elems * 4, MTLResourceOptions::StorageModeShared)?;
+    let x_buf = x_scratch.get();
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            x_batch.as_ptr() as *const u8,
+            x_buf.contents().as_ptr() as *mut u8,
+            x_elems * 4,
+        );
     }
-    .ok_or(MetalError::BufferAllocFailed)?;
 
     let gate_w = resident_weight_buffer(device, gate.weights)?;
     let up_w = resident_weight_buffer(device, up.weights)?;
@@ -2521,25 +2598,35 @@ pub fn launch_dense_ffn_swiglu_batch(
         act_buf.get(),
         out_scratch.get(),
     );
+    let setup_us = t_setup.elapsed().as_micros();
 
+    // Decode-stack pattern: Concurrent encode + barriers around RAW edges
+    // so gate∥up can overlap like llama `ggml_metal_op`.
     let cmd_buf = queue.commandBuffer().ok_or(MetalError::CommandFailed)?;
-    let enc = cmd_buf
-        .computeCommandEncoder()
-        .ok_or(MetalError::CommandFailed)?;
-    encode_mul_mm_sg(&enc, device, gate, &gate_w, &x_buf, gate_buf, batch_size)?;
-    encode_mul_mm_sg(&enc, device, up, &up_w, &x_buf, up_buf, batch_size)?;
+    let enc = compute_encoder_concurrent(&cmd_buf)?;
+    encode_mul_mm_sg(&enc, device, gate, &gate_w, x_buf, gate_buf, batch_size)?;
+    encode_mul_mm_sg(&enc, device, up, &up_w, x_buf, up_buf, batch_size)?;
+    memory_barrier_buffers(&enc);
     if gelu {
         crate::elem::encode_gelu_mul(&enc, device, gate_buf, up_buf, act_buf, ffn_elems as u32)?;
     } else {
         crate::elem::encode_silu_mul(&enc, device, gate_buf, up_buf, act_buf, ffn_elems as u32)?;
     }
+    memory_barrier_buffers(&enc);
     encode_mul_mm_sg(&enc, device, down, &down_w, act_buf, out_buf, batch_size)?;
     enc.endEncoding();
+    let t_gpu = std::time::Instant::now();
     cmd_buf.commit();
     cmd_buf.waitUntilCompleted();
+    let gpu_us = t_gpu.elapsed().as_micros();
 
+    let t_read = std::time::Instant::now();
     let ptr = out_buf.contents().as_ptr() as *const f32;
-    Ok(unsafe { std::slice::from_raw_parts(ptr, out_elems) }.to_vec())
+    let out = unsafe { std::slice::from_raw_parts(ptr, out_elems) }.to_vec();
+    if timing {
+        mm_timing_add(setup_us, gpu_us, t_read.elapsed().as_micros());
+    }
+    Ok(out)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2652,7 +2739,8 @@ static MM_GPU_US: AtomicU64 = AtomicU64::new(0);
 static MM_READ_US: AtomicU64 = AtomicU64::new(0);
 static MM_CALLS: AtomicU64 = AtomicU64::new(0);
 
-fn mm_timing_add(setup: u128, gpu: u128, read: u128) {
+/// Accumulate into the `FERROX_METAL_MM_TIMING` counters (prefill evidence).
+pub(crate) fn mm_timing_add(setup: u128, gpu: u128, read: u128) {
     MM_SETUP_US.fetch_add(setup as u64, AtomOrd::Relaxed);
     MM_GPU_US.fetch_add(gpu as u64, AtomOrd::Relaxed);
     MM_READ_US.fetch_add(read as u64, AtomOrd::Relaxed);
@@ -4227,8 +4315,128 @@ fn encode_q4_0_moe_matvec_id(
     Ok(())
 }
 
-/// llama `mul_mm_id` encode for one expert's gathered tokens.
 #[allow(clippy::too_many_arguments)]
+fn encode_moe_gather_rows(
+    encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+    device: &Retained<ProtocolObject<dyn MTLDevice>>,
+    src: &ProtocolObject<dyn MTLBuffer>,
+    dst: &ProtocolObject<dyn MTLBuffer>,
+    ids: &ProtocolObject<dyn MTLBuffer>,
+    id_offset_elems: usize,
+    batch_size: u32,
+    cols: u32,
+    src_stride: u32,
+    dst_stride: u32,
+) -> Result<(), MetalError> {
+    if batch_size == 0 {
+        return Ok(());
+    }
+    const TG: usize = 256;
+    let pipe = ensure_pipeline(device, Q4_0_MOE_TOPK_KERNEL_SRC, "moe_gather_rows")?;
+    encoder.setComputePipelineState(&pipe.0);
+    let id_byte = id_offset_elems * 4;
+    unsafe {
+        encoder.setBuffer_offset_atIndex(Some(src), 0, 0);
+        encoder.setBuffer_offset_atIndex(Some(dst), 0, 1);
+        encoder.setBuffer_offset_atIndex(Some(ids), id_byte, 2);
+        let mut bs = batch_size;
+        encoder.setBytes_length_atIndex(
+            NonNull::new(&mut bs as *mut u32 as *mut _).unwrap(),
+            4,
+            3,
+        );
+        let mut c = cols;
+        encoder.setBytes_length_atIndex(NonNull::new(&mut c as *mut u32 as *mut _).unwrap(), 4, 4);
+        let mut ss = src_stride;
+        encoder.setBytes_length_atIndex(
+            NonNull::new(&mut ss as *mut u32 as *mut _).unwrap(),
+            4,
+            5,
+        );
+        let mut ds = dst_stride;
+        encoder.setBytes_length_atIndex(
+            NonNull::new(&mut ds as *mut u32 as *mut _).unwrap(),
+            4,
+            6,
+        );
+    }
+    encoder.dispatchThreadgroups_threadsPerThreadgroup(
+        MTLSize {
+            width: batch_size as usize,
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width: TG,
+            height: 1,
+            depth: 1,
+        },
+    );
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn encode_moe_scatter_rows(
+    encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+    device: &Retained<ProtocolObject<dyn MTLDevice>>,
+    src: &ProtocolObject<dyn MTLBuffer>,
+    dst: &ProtocolObject<dyn MTLBuffer>,
+    ids: &ProtocolObject<dyn MTLBuffer>,
+    id_offset_elems: usize,
+    batch_size: u32,
+    cols: u32,
+    src_stride: u32,
+    dst_stride: u32,
+) -> Result<(), MetalError> {
+    if batch_size == 0 {
+        return Ok(());
+    }
+    const TG: usize = 256;
+    let pipe = ensure_pipeline(device, Q4_0_MOE_TOPK_KERNEL_SRC, "moe_scatter_rows")?;
+    encoder.setComputePipelineState(&pipe.0);
+    let id_byte = id_offset_elems * 4;
+    unsafe {
+        encoder.setBuffer_offset_atIndex(Some(src), 0, 0);
+        encoder.setBuffer_offset_atIndex(Some(dst), 0, 1);
+        encoder.setBuffer_offset_atIndex(Some(ids), id_byte, 2);
+        let mut bs = batch_size;
+        encoder.setBytes_length_atIndex(
+            NonNull::new(&mut bs as *mut u32 as *mut _).unwrap(),
+            4,
+            3,
+        );
+        let mut c = cols;
+        encoder.setBytes_length_atIndex(NonNull::new(&mut c as *mut u32 as *mut _).unwrap(), 4, 4);
+        let mut ss = src_stride;
+        encoder.setBytes_length_atIndex(
+            NonNull::new(&mut ss as *mut u32 as *mut _).unwrap(),
+            4,
+            5,
+        );
+        let mut ds = dst_stride;
+        encoder.setBytes_length_atIndex(
+            NonNull::new(&mut ds as *mut u32 as *mut _).unwrap(),
+            4,
+            6,
+        );
+    }
+    encoder.dispatchThreadgroups_threadsPerThreadgroup(
+        MTLSize {
+            width: batch_size as usize,
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width: TG,
+            height: 1,
+            depth: 1,
+        },
+    );
+    Ok(())
+}
+
+/// llama `mul_mm_id` encode for one expert's gathered tokens (legacy stub).
+#[allow(dead_code, clippy::too_many_arguments)]
 fn encode_q4_0_moe_mul_mm_id(
     encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
     device: &Retained<ProtocolObject<dyn MTLDevice>>,
@@ -4328,6 +4536,8 @@ struct MoePrefillScratch {
     up: Retained<ProtocolObject<dyn MTLBuffer>>,
     expert_out: Retained<ProtocolObject<dyn MTLBuffer>>,
     out: Retained<ProtocolObject<dyn MTLBuffer>>,
+    contig_in: Retained<ProtocolObject<dyn MTLBuffer>>,
+    contig_out: Retained<ProtocolObject<dyn MTLBuffer>>,
 }
 
 thread_local! {
@@ -4350,6 +4560,7 @@ fn moe_prefill_scratch(
             }
         };
         if need {
+            let contig_elems = n_slots * ffn.max(hidden);
             *slot = Some(MoePrefillScratch {
                 n_slots,
                 ffn,
@@ -4382,6 +4593,18 @@ fn moe_prefill_scratch(
                 out: device
                     .newBufferWithLength_options(
                         n_tokens * hidden * 4,
+                        MTLResourceOptions::StorageModeShared,
+                    )
+                    .ok_or(MetalError::BufferAllocFailed)?,
+                contig_in: device
+                    .newBufferWithLength_options(
+                        contig_elems * 4,
+                        MTLResourceOptions::StorageModeShared,
+                    )
+                    .ok_or(MetalError::BufferAllocFailed)?,
+                contig_out: device
+                    .newBufferWithLength_options(
+                        contig_elems * 4,
                         MTLResourceOptions::StorageModeShared,
                     )
                     .ok_or(MetalError::BufferAllocFailed)?,
@@ -4716,6 +4939,7 @@ pub(crate) fn encode_q4_0_moe_id(
         residual_into_out,
         gate_up_done,
         false,
+        false,
     )
 }
 
@@ -4737,6 +4961,9 @@ pub(crate) fn encode_q4_0_moe_id_ex(
     residual_into_out: bool,
     gate_up_done: bool,
     act_done: bool,
+    // When true, caller already wrote `expert_out` via grouped `mul_mm_id`
+    // on down (prefill path); skip the per-slot `q4_0_moe_down_id` matvec.
+    down_done: bool,
 ) -> Result<(), MetalError> {
     assert_eq!(packed.gate_stride, packed.up_stride);
     assert!(n_tokens >= 1);
@@ -4764,13 +4991,13 @@ pub(crate) fn encode_q4_0_moe_id_ex(
         memory_barrier_resources(encoder, &[act_buf]);
     }
 
-    // Parallel down like llama mul_mv_id (depth=n_slots), then weighted
-    // sum. In-kernel top-k loop (down_id_sum) serialized experts and
-    // cost ~occupancy on the largest MoE matvec — keep it for experiments
-    // only via the kernel source, not this encode path.
-    // (Tried atomic float residual into h: wrong tokens on M2 — reverted.)
-    let down = ensure_pipeline(device, Q4_0_MOE_TOPK_KERNEL_SRC, "q4_0_moe_down_id")?;
     let weighted_sum = ensure_pipeline(device, Q4_0_MOE_TOPK_KERNEL_SRC, "moe_weighted_sum")?;
+
+    if !down_done {
+    // Parallel down like llama mul_mv_id (depth=n_slots), then weighted
+    // sum. Prefill with enough tokens uses grouped mul_mm_id instead
+    // (`down_done=true`) to avoid re-reading each expert once per slot.
+    let down = ensure_pipeline(device, Q4_0_MOE_TOPK_KERNEL_SRC, "q4_0_moe_down_id")?;
 
     encoder.setComputePipelineState(&down.0);
     const ROWS_PER_TG: usize = 8;
@@ -4831,6 +5058,7 @@ pub(crate) fn encode_q4_0_moe_id_ex(
         },
     );
     memory_barrier_resources(encoder, &[expert_out_buf]);
+    } // !down_done
 
     const SUM_TG: usize = 256;
     if residual_into_out && n_tokens == 1 {
@@ -4985,8 +5213,26 @@ pub fn launch_moe_prefill_q4_0(
 
         if use_mm_id {
             let bound = moe_packed_resident(device, packed)?;
-            let input_blocks = (packed.gate_row_bytes / 18) as u32;
-            let x_stride = packed.hidden_rows as u32;
+            let hidden_u = hidden as u32;
+            let ffn_u = ffn as u32;
+            let gu_launch = MulMmSgLaunch {
+                weights: &[],
+                rows: ffn,
+                row_bytes: packed.gate_row_bytes,
+                fn_name: "q4_0_mul_mm_sg",
+                block_bytes: 18,
+                block_elems: 32,
+            };
+            let down_launch = MulMmSgLaunch {
+                weights: &[],
+                rows: hidden,
+                row_bytes: packed.down_row_bytes,
+                fn_name: "q4_0_mul_mm_sg",
+                block_bytes: 18,
+                block_elems: 32,
+            };
+            let contig_in = scratch.contig_in.as_ref();
+            let contig_out = scratch.contig_out.as_ref();
             let mut flat_tok = Vec::new();
             let mut flat_slot = Vec::new();
             let mut offsets = Vec::with_capacity(packed.n_experts);
@@ -5028,42 +5274,79 @@ pub fn launch_moe_prefill_q4_0(
 
             if let (Some(tok_b), Some(slot_b)) = (tok_buf.as_ref(), slot_map_buf.as_ref()) {
                 for (eid, list) in per_expert.iter().enumerate() {
-                    let batch = list.len() as u32;
+                    let batch = list.len();
                     if batch == 0 {
                         continue;
                     }
                     let off = offsets[eid];
-                    encode_q4_0_moe_mul_mm_id(
+                    let batch_u = batch as u32;
+                    encode_moe_gather_rows(
                         &encoder,
                         device,
+                        &x_buf,
+                        contig_in,
+                        tok_b,
+                        off,
+                        batch_u,
+                        hidden_u,
+                        hidden_u,
+                        hidden_u,
+                    )?;
+                    encode_mul_mm_sg_offset(
+                        &encoder,
+                        device,
+                        &gu_launch,
                         &bound.gate,
                         eid * packed.gate_stride,
-                        &x_buf,
-                        gate_buf,
-                        tok_b,
-                        slot_b,
-                        off,
-                        packed.gate_row_bytes as u32,
-                        input_blocks,
-                        ffn as u32,
+                        contig_in,
+                        contig_out,
                         batch,
-                        x_stride,
                     )?;
-                    encode_q4_0_moe_mul_mm_id(
+                    encode_moe_scatter_rows(
                         &encoder,
                         device,
-                        &bound.up,
-                        eid * packed.up_stride,
-                        &x_buf,
-                        up_buf,
-                        tok_b,
+                        contig_out,
+                        gate_buf,
                         slot_b,
                         off,
-                        packed.gate_row_bytes as u32,
-                        input_blocks,
-                        ffn as u32,
+                        batch_u,
+                        ffn_u,
+                        ffn_u,
+                        ffn_u,
+                    )?;
+                    encode_moe_gather_rows(
+                        &encoder,
+                        device,
+                        &x_buf,
+                        contig_in,
+                        tok_b,
+                        off,
+                        batch_u,
+                        hidden_u,
+                        hidden_u,
+                        hidden_u,
+                    )?;
+                    encode_mul_mm_sg_offset(
+                        &encoder,
+                        device,
+                        &gu_launch,
+                        &bound.up,
+                        eid * packed.up_stride,
+                        contig_in,
+                        contig_out,
                         batch,
-                        x_stride,
+                    )?;
+                    encode_moe_scatter_rows(
+                        &encoder,
+                        device,
+                        contig_out,
+                        up_buf,
+                        slot_b,
+                        off,
+                        batch_u,
+                        ffn_u,
+                        ffn_u,
+                        ffn_u,
                     )?;
                 }
                 memory_barrier_resources(&encoder, &[gate_buf, up_buf]);
@@ -5076,6 +5359,49 @@ pub fn launch_moe_prefill_q4_0(
                     (n_slots * ffn) as u32,
                 )?;
                 memory_barrier_resources(&encoder, &[act_buf]);
+                for (eid, list) in per_expert.iter().enumerate() {
+                    let batch = list.len();
+                    if batch == 0 {
+                        continue;
+                    }
+                    let off = offsets[eid];
+                    let batch_u = batch as u32;
+                    encode_moe_gather_rows(
+                        &encoder,
+                        device,
+                        act_buf,
+                        contig_in,
+                        slot_b,
+                        off,
+                        batch_u,
+                        ffn_u,
+                        ffn_u,
+                        ffn_u,
+                    )?;
+                    encode_mul_mm_sg_offset(
+                        &encoder,
+                        device,
+                        &down_launch,
+                        &bound.down,
+                        eid * packed.down_stride,
+                        contig_in,
+                        contig_out,
+                        batch,
+                    )?;
+                    encode_moe_scatter_rows(
+                        &encoder,
+                        device,
+                        contig_out,
+                        expert_out_buf,
+                        slot_b,
+                        off,
+                        batch_u,
+                        hidden_u,
+                        hidden_u,
+                        hidden_u,
+                    )?;
+                }
+                memory_barrier_resources(&encoder, &[expert_out_buf]);
                 encode_q4_0_moe_id_ex(
                     &encoder,
                     device,
@@ -5091,6 +5417,7 @@ pub fn launch_moe_prefill_q4_0(
                     top_k as u32,
                     n_tokens as u32,
                     false,
+                    true,
                     true,
                     true,
                 )?;

@@ -6,22 +6,23 @@
   "ferrox_version": "0.2.0",
   "id": "gemma2_2b_q4km",
   "kind": "engine",
-  "load_s": 0.063430417,
+  "load_s": 0.075390667,
   "model_path": "models/gemma-2-2b-it-Q4_K_M.gguf",
   "quant": "quantized",
-  "reps": 2,
+  "reps": 3,
   "schema": 1,
   "size_bytes": 1708582752,
   "tests": [
     {
       "ferrox_samples": [
-        20.678770685595335,
-        20.854311074843576
+        40.780473212431154,
+        40.60570614420132,
+        35.90897771904545
       ],
-      "ferrox_stddev": 0.08777019462412028,
-      "ferrox_tps": 20.766540880219456,
-      "gap": 5.815605049324119,
-      "llama_tps": 120.77,
+      "ferrox_stddev": 2.256380330674231,
+      "ferrox_tps": 40.60570614420132,
+      "gap": 4.132916674420781,
+      "llama_tps": 167.82,
       "test": "pp512"
     },
     {

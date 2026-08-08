@@ -56,6 +56,18 @@ pub enum GgufValue {
 }
 
 impl GgufValue {
+    pub fn as_bool(&self) -> Option<bool> {
+        match self {
+            GgufValue::Bool(v) => Some(*v),
+            // Some exporters store bool hparams as 0/1 integers.
+            GgufValue::U8(v) => Some(*v != 0),
+            GgufValue::U32(v) => Some(*v != 0),
+            GgufValue::U64(v) => Some(*v != 0),
+            GgufValue::I32(v) => Some(*v != 0),
+            _ => None,
+        }
+    }
+
     pub fn as_u64(&self) -> Option<u64> {
         match self {
             GgufValue::U8(v) => Some(*v as u64),
@@ -368,6 +380,9 @@ pub trait TensorSource {
     }
     fn metadata_f32(&self, key: &str) -> Option<f32> {
         self.metadata(key).and_then(|v| v.as_f32())
+    }
+    fn metadata_bool(&self, key: &str) -> Option<bool> {
+        self.metadata(key).and_then(|v| v.as_bool())
     }
 }
 

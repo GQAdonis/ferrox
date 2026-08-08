@@ -16,6 +16,27 @@
 //! next step and now exists below (`GgufBpeTokenizer`,
 //! `GgufSpmTokenizer`, `GgufUnigramTokenizer`).
 
+/// Whether prompt encoding should prepend the GGUF BOS token.
+///
+/// Port of llama.cpp `llama_vocab` add_bos defaults
+/// (`.scratch/llama.cpp/src/llama-vocab.cpp`): explicit
+/// `tokenizer.ggml.add_bos_token` wins; else SPM → true, BPE/`qwen2` pre
+/// → false. Qwen2-MoE ships `bos_token_id=<|endoftext|>` but
+/// `add_bos=false` — always prepending that token poisons greedy decode.
+pub fn should_add_bos_token(file: &impl ferrox_gguf::TensorSource) -> bool {
+    if let Some(v) = file.metadata_bool("tokenizer.ggml.add_bos_token") {
+        return v;
+    }
+    let model = file.metadata_str("tokenizer.ggml.model").unwrap_or("");
+    let pre = file.metadata_str("tokenizer.ggml.pre").unwrap_or("");
+    // llama.cpp: SPM/WPM default add_bos=true; BPE defaults false unless
+    // a pre-tokenizer (tekken/chameleon) opts in. qwen2 leaves false.
+    if matches!(model, "llama" | "spm") || model.contains("sentencepiece") {
+        return true;
+    }
+    matches!(pre, "tekken" | "chameleon")
+}
+
 pub struct ByteTokenizer;
 
 impl ByteTokenizer {

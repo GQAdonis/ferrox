@@ -86,7 +86,12 @@ const SIGMOID_GATING_ARCHITECTURES: &[&str] = &["deepseek2", "glm4moe"];
 /// `MoeLayerConfig::norm_topk_prob`'s doc comment for why this matters:
 /// getting it wrong silently produces wrong generation output even
 /// though the file loads and shape-validates fine.
-const NO_TOPK_RENORMALIZE_ARCHITECTURES: &[&str] = &["olmoe"];
+// Architectures whose reference graphs pass `norm_w=false` to
+// `build_moe_ffn` (llama.cpp) / `norm_topk_prob=false` in HF config.
+// Qwen2-MoE: `.scratch/llama.cpp/src/models/qwen2moe.cpp` — Softmax +
+// `false` for the norm_topk slot. Renormalizing top-k weights made
+// Qwen1.5-MoE greedy decode emit garbage despite shared-expert load.
+const NO_TOPK_RENORMALIZE_ARCHITECTURES: &[&str] = &["olmoe", "qwen2moe"];
 
 fn metadata_u64_any(file: &impl TensorSource, keys: &[String]) -> Option<u64> {
     keys.iter().find_map(|k| file.metadata_u64(k))
@@ -1982,5 +1987,15 @@ mod tests {
                 expected_dot
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod qwen_norm_topk_tests {
+    #[test]
+    fn qwen2moe_disables_topk_renorm() {
+        assert!(super::NO_TOPK_RENORMALIZE_ARCHITECTURES.contains(&"qwen2moe"));
+        let norm = !super::NO_TOPK_RENORMALIZE_ARCHITECTURES.contains(&"qwen2moe");
+        assert!(!norm, "qwen2moe must have norm_topk_prob=false");
     }
 }

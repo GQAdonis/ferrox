@@ -217,6 +217,8 @@ enum ChatKind {
     GenericRoleMarkers,
     Llama3,
     Gemma,
+    /// Gemma-4 IT: `<|turn>user\n…<turn|>\n<|turn>model\n`.
+    Gemma4,
     Plain,
 }
 
@@ -229,6 +231,10 @@ impl ChatKind {
                 ChatKind::GenericRoleMarkers
             }
             Some(t) if t.contains("<start_of_turn>") => ChatKind::Gemma,
+            // Gemma-4 IT: `<|turn>{role}\n…<turn|>\n` (not Gemma-2's
+            // `<start_of_turn>`). Detect before Plain so chat mode does
+            // not fall through to `user: …` framing.
+            Some(t) if t.contains("<|turn>") || t.contains("<turn|>") => ChatKind::Gemma4,
             _ => ChatKind::Plain,
         }
     }
@@ -294,6 +300,18 @@ impl ChatKind {
                     out.push_str(user);
                     out.push_str("<end_of_turn>\n<start_of_turn>model\n");
                 }
+                out
+            }
+            ChatKind::Gemma4 => {
+                let mut out = String::new();
+                if let Some(sys) = system {
+                    out.push_str("<|turn>system\n");
+                    out.push_str(sys);
+                    out.push_str("<turn|>\n");
+                }
+                out.push_str("<|turn>user\n");
+                out.push_str(user);
+                out.push_str("<turn|>\n<|turn>model\n");
                 out
             }
             // Match `ferrox-server::chat_template::ChatTemplate::Plain`

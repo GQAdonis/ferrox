@@ -164,10 +164,18 @@ pub async fn messages(
     let template = state.model.chat_template();
     let prompt = prompt_from_messages(&history, template, &[]);
     let mut stop = req.stop_sequences.clone().unwrap_or_default();
-    if matches!(template, crate::chat_template::ChatTemplate::Gemma)
-        && !stop.iter().any(|s| s == "<end_of_turn>")
-    {
-        stop.push("<end_of_turn>".to_string());
+    if matches!(
+        template,
+        crate::chat_template::ChatTemplate::Gemma | crate::chat_template::ChatTemplate::Gemma4
+    ) {
+        let marker = match template {
+            crate::chat_template::ChatTemplate::Gemma => "<end_of_turn>",
+            crate::chat_template::ChatTemplate::Gemma4 => "<turn|>",
+            _ => unreachable!(),
+        };
+        if !stop.iter().any(|s| s == marker) {
+            stop.push(marker.to_string());
+        }
     }
     let params = GenerationParams {
         max_tokens: req.max_tokens,

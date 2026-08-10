@@ -64,6 +64,11 @@ pub enum ChatTemplate {
     /// server's `bos_id` prepending in `generate` owns that, matching
     /// the GGUF template's leading `{{ bos_token }}`.
     Gemma,
+    /// Gemma-4 Instruct: `<|turn>{role}\n{content}<turn|>\n`, with
+    /// `assistant` rendered as `model`, ending with `<|turn>model\n`.
+    /// GGUF `eos_token_id` is `<turn|>` (end-of-turn), so chat stop
+    /// aligns with that id once the generation prompt is correct.
+    Gemma4,
     /// `{role}: {content}`, one per line, no special tokens at all --
     /// used when the GGUF carries no `tokenizer.chat_template` (or an
     /// unrecognized one), matching the plain completion-style behavior
@@ -83,6 +88,7 @@ impl ChatTemplate {
                 ChatTemplate::GenericRoleMarkers
             }
             Some(t) if t.contains("<start_of_turn>") => ChatTemplate::Gemma,
+            Some(t) if t.contains("<|turn>") || t.contains("<turn|>") => ChatTemplate::Gemma4,
             _ => ChatTemplate::Plain,
         }
     }
@@ -189,6 +195,20 @@ impl ChatTemplate {
                 }
                 out.push_str("<start_of_turn>model\n");
             }
+            ChatTemplate::Gemma4 => {
+                for m in messages {
+                    let role = match m.role.as_str() {
+                        "assistant" | "model" => "model",
+                        other => other,
+                    };
+                    out.push_str("<|turn>");
+                    out.push_str(role);
+                    out.push('\n');
+                    out.push_str(&m.rendered_content());
+                    out.push_str("<turn|>\n");
+                }
+                out.push_str("<|turn>model\n");
+            }
             ChatTemplate::Plain => {
                 let lines: Vec<String> = messages
                     .iter()
@@ -265,6 +285,17 @@ mod tests {
     fn detects_gemma_from_start_of_turn_marker() {
         let template = "{{ bos_token }}{% for message in messages %}<start_of_turn>{{ message['role'] }}\n{{ message['content'] }}<end_of_turn>\n{% endfor %}";
         assert_eq!(ChatTemplate::detect(Some(template)), ChatTemplate::Gemma);
+    }
+
+    #[test]
+    fn detects_gemma4_from_turn_markers() {
+        let template = "{%- for message in messages -%}{{- '<|turn>' + message['role'] + '\\n' -}}{{- message['content'] -}}{{- '<turn|>\\n' -}}{%- endfor -%}{{- '<|turn>model\\n' -}}";
+        assert_eq!(ChatTemplate::detect(Some(template)), ChatTemplate::Gemma4);
+        let rendered = ChatTemplate::Gemma4.render(&[msg("user", "How are you?")]);
+        assert_eq!(
+            rendered,
+            "<|turn>user\nHow are you?<turn|>\n<|turn>model\n"
+        );
     }
 
     #[test]

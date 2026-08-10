@@ -875,10 +875,18 @@ impl ChatCompletionRequest {
         template: chat_template::ChatTemplate,
     ) -> GenerationParams {
         let mut params = self.generation_params();
-        if matches!(template, chat_template::ChatTemplate::Gemma)
-            && !params.stop.iter().any(|s| s == "<end_of_turn>")
-        {
-            params.stop.push("<end_of_turn>".to_string());
+        if matches!(
+            template,
+            chat_template::ChatTemplate::Gemma | chat_template::ChatTemplate::Gemma4
+        ) {
+            let stop = match template {
+                chat_template::ChatTemplate::Gemma => "<end_of_turn>",
+                chat_template::ChatTemplate::Gemma4 => "<turn|>",
+                _ => unreachable!(),
+            };
+            if !params.stop.iter().any(|s| s == stop) {
+                params.stop.push(stop.to_string());
+            }
         }
         params
     }

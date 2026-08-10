@@ -513,7 +513,6 @@ name = "ferrox-quant"
 version = "0.3.0"
 dependencies = [
  "half",
- "rayon",
  "thiserror",
 ]
 

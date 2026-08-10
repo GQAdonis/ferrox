@@ -21,6 +21,14 @@
 //!    runs on efficiency cores. [`init_cpu_pool`] pins the workers to
 //!    `USER_INTERACTIVE` explicitly so the pool's placement does not
 //!    depend on who happened to touch rayon first.
+//!
+//! 3. **Dedicated GEMV pool.** Row-parallel matvec runs on a
+//!    crate-owned [`rayon::ThreadPool`], not rayon's global pool, so
+//!    library consumers and Tokio blocking threads do not fight over
+//!    thread count or scheduling. See [`for_each_row`].
+
+use rayon::prelude::*;
+use std::sync::OnceLock;
 
 /// macOS QoS classes (`sys/qos.h`). Only the ones we name are listed.
 #[cfg(target_os = "macos")]
@@ -127,6 +135,162 @@ pub fn resolve_cpu_threads() -> usize {
     perf_core_count()
 }
 
+/// GEMV pool width: `FERROX_GEMV_THREADS`, else [`resolve_cpu_threads`].
+pub fn resolve_gemv_threads() -> usize {
+    if let Ok(v) = std::env::var("FERROX_GEMV_THREADS") {
+        if let Ok(n) = v.trim().parse::<usize>() {
+            if n > 0 {
+                return n;
+            }
+        }
+    }
+    resolve_cpu_threads()
+}
+
+static GEMV_POOL: OnceLock<Option<rayon::ThreadPool>> = OnceLock::new();
+
+fn gemv_pool_qos_start_handler(idx: usize) {
+    #[cfg(target_os = "macos")]
+    {
+        let log = std::env::var_os("FERROX_QOS_LOG").is_some();
+        let before = unsafe { qos::qos_class_self() };
+        let rc =
+            unsafe { qos::pthread_set_qos_class_self_np(qos::QOS_CLASS_USER_INTERACTIVE, 0) };
+        if log {
+            eprintln!(
+                "ferrox: gemv worker {idx} qos {} -> {} (rc={rc})",
+                qos::name(before),
+                qos::name(unsafe { qos::qos_class_self() }),
+            );
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = idx;
+    }
+}
+
+fn gemv_pool() -> Option<&'static rayon::ThreadPool> {
+    GEMV_POOL
+        .get_or_init(|| {
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(resolve_gemv_threads())
+                .thread_name(|i| format!("ferrox-gemv-{i}"))
+                .start_handler(gemv_pool_qos_start_handler)
+                .build()
+                .ok()
+        })
+        .as_ref()
+}
+
+/// Eagerly build the dedicated GEMV pool (no-op if already built).
+pub fn init_gemv_pool() {
+    let _ = gemv_pool();
+}
+
+/// Active GEMV pool width, or `1` when the pool is unavailable.
+pub fn gemv_num_threads() -> usize {
+    match gemv_pool() {
+        Some(pool) => pool.current_num_threads(),
+        None => 1,
+    }
+}
+
+/// Prefer serial when fork-join overhead exceeds the matvec work.
+/// ~256k element-ops matches the previous `prefer_serial_matvec` gate.
+pub fn should_parallelize(n_rows: usize, n_cols: usize) -> bool {
+    n_rows > 1 && n_rows.saturating_mul(n_cols) >= 256_000
+}
+
+/// One output row per slot; parallel when [`should_parallelize`] and the
+/// GEMV pool has more than one worker. Rows are never split.
+pub fn for_each_row<F>(output: &mut [f32], n_rows: usize, n_cols: usize, row_fn: F)
+where
+    F: Fn(usize, &mut f32) + Send + Sync,
+{
+    let n = n_rows.min(output.len());
+    if !should_parallelize(n, n_cols) {
+        for (row, out) in output.iter_mut().enumerate().take(n) {
+            row_fn(row, out);
+        }
+        return;
+    }
+    // Default: global rayon (same pool as act-quant). Dedicated pool via
+    // FERROX_GEMV_DEDICATED=1 once callers stop using global rayon mid-matvec.
+    let use_dedicated = matches!(
+        std::env::var("FERROX_GEMV_DEDICATED").ok().as_deref(),
+        Some("1") | Some("true") | Some("on")
+    );
+    let rows = &mut output[..n];
+    if use_dedicated {
+        if let Some(pool) = gemv_pool() {
+            if pool.current_num_threads() > 1 {
+                pool.install(move || {
+                    rows.par_iter_mut()
+                        .enumerate()
+                        .for_each(|(row, out)| row_fn(row, out));
+                });
+                return;
+            }
+        }
+    }
+    rows.par_iter_mut()
+        .enumerate()
+        .for_each(|(row, out)| row_fn(row, out));
+}
+
+/// Chunk-parallel sibling of [`for_each_row`]; chunks are never split.
+pub fn for_each_chunk_init<S, I, F>(
+    output: &mut [f32],
+    chunk_len: usize,
+    work_per_chunk: usize,
+    init: I,
+    f: F,
+) where
+    I: Fn() -> S + Send + Sync,
+    S: Send,
+    F: Fn(&mut S, usize, &mut [f32]) + Send + Sync,
+{
+    if chunk_len == 0 {
+        return;
+    }
+    let n_chunks = output.len() / chunk_len;
+    if !should_parallelize(n_chunks, work_per_chunk) {
+        let mut state = init();
+        for (i, chunk) in output[..n_chunks * chunk_len]
+            .chunks_mut(chunk_len)
+            .enumerate()
+        {
+            f(&mut state, i, chunk);
+        }
+        return;
+    }
+    let use_dedicated = matches!(
+        std::env::var("FERROX_GEMV_DEDICATED").ok().as_deref(),
+        Some("1") | Some("true") | Some("on")
+    );
+    let chunks = &mut output[..n_chunks * chunk_len];
+    let init = &init;
+    let f = &f;
+    if use_dedicated {
+        if let Some(pool) = gemv_pool() {
+            if pool.current_num_threads() > 1 {
+                pool.install(move || {
+                    chunks
+                        .par_chunks_mut(chunk_len)
+                        .enumerate()
+                        .for_each_init(init, |state, (i, c)| f(state, i, c));
+                });
+                return;
+            }
+        }
+    }
+    chunks
+        .par_chunks_mut(chunk_len)
+        .enumerate()
+        .for_each_init(init, |state, (i, c)| f(state, i, c));
+}
+
 /// Builds the global rayon pool with an explicit width and an explicit
 /// QoS, so neither depends on which thread first touched rayon. Safe to
 /// call more than once and from either binary; a pool that already
@@ -134,7 +298,18 @@ pub fn resolve_cpu_threads() -> usize {
 ///
 /// Returns the thread count the pool was built with, or `None` if the
 /// global pool already existed.
+/// Builds the dedicated GEMV pool (and, for legacy callers that still
+/// touch `rayon::prelude` on the global pool, a matching global pool).
+/// Prefer [`for_each_row`] / [`for_each_chunk_init`] so matvecs stay on
+/// the dedicated pool — mixing both pools oversubscribes P-cores.
+///
+/// Returns the thread count the **global** pool was built with, or
+/// `None` if the global pool already existed.
 pub fn init_cpu_pool() -> Option<usize> {
+    // Do not eagerly build the dedicated GEMV pool here — a second idle
+    // rayon pool of P-core width was measured to regress CPU pp512 on
+    // Host B (~40 → ~14 tok/s). Callers opt in via `for_each_*` (lazy) or
+    // `init_gemv_pool()` + `FERROX_GEMV_DEDICATED=1`.
     let threads = resolve_cpu_threads();
     let log = std::env::var_os("FERROX_QOS_LOG").is_some();
     let built = rayon::ThreadPoolBuilder::new()
@@ -204,5 +379,20 @@ mod tests {
         assert!(qos.is_some(), "macOS must report a QoS class");
         #[cfg(not(target_os = "macos"))]
         assert!(qos.is_none(), "QoS is a macOS-only concept");
+    }
+
+    #[test]
+    fn for_each_row_parallel_matches_serial() {
+        let n = 4097usize;
+        let f = |row: usize| ((row % 97) as f32) * 0.25 - 3.0;
+
+        let mut par = vec![0.0f32; n];
+        for_each_row(&mut par, n, 4096, |row, slot| *slot = f(row));
+
+        let mut serial = vec![0.0f32; n];
+        for (row, slot) in serial.iter_mut().enumerate() {
+            *slot = f(row);
+        }
+        assert_eq!(par, serial);
     }
 }

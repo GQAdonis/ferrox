@@ -528,7 +528,7 @@ pub fn run_infer(args: InferArgs) -> anyhow::Result<()> {
     }
 
     let tokenizer = match file.metadata_str("tokenizer.ggml.model") {
-        Some("gpt2") => CliTokenizer::Bpe(Box::new(GgufBpeTokenizer::from_gguf(&file)?)),
+        Some("gpt2" | "gemma4") => CliTokenizer::Bpe(Box::new(GgufBpeTokenizer::from_gguf(&file)?)),
         Some("llama") => CliTokenizer::Spm(GgufSpmTokenizer::from_gguf(&file)?),
         Some("t5") => CliTokenizer::Unigram(GgufUnigramTokenizer::from_gguf(&file)?),
         other => {
@@ -700,7 +700,7 @@ pub fn run_infer(args: InferArgs) -> anyhow::Result<()> {
 /// Dense-lead DeepSeek-2 / Mistral-4 path via [`MlaEngine`].
 fn run_mla_infer(args: InferArgs, path: &Path, file: &ShardedGguf) -> anyhow::Result<()> {
     let tokenizer = match file.metadata_str("tokenizer.ggml.model") {
-        Some("gpt2") => CliTokenizer::Bpe(Box::new(GgufBpeTokenizer::from_gguf(file)?)),
+        Some("gpt2" | "gemma4") => CliTokenizer::Bpe(Box::new(GgufBpeTokenizer::from_gguf(file)?)),
         Some("llama") => CliTokenizer::Spm(GgufSpmTokenizer::from_gguf(file)?),
         Some("t5") => CliTokenizer::Unigram(GgufUnigramTokenizer::from_gguf(file)?),
         other => {
@@ -846,7 +846,7 @@ fn run_mla_infer(args: InferArgs, path: &Path, file: &ShardedGguf) -> anyhow::Re
 /// GLM-5.2 / GLM4-family path via [`Glm52Engine`]./// Gemma-4 dedicated path via [`ferrox_models::Gemma4Engine`].
 fn run_gemma4_infer(args: InferArgs, path: &Path, file: &ShardedGguf) -> anyhow::Result<()> {
     let tokenizer = match file.metadata_str("tokenizer.ggml.model") {
-        Some("gpt2") => CliTokenizer::Bpe(Box::new(GgufBpeTokenizer::from_gguf(file)?)),
+        Some("gpt2" | "gemma4") => CliTokenizer::Bpe(Box::new(GgufBpeTokenizer::from_gguf(file)?)),
         Some("llama") => CliTokenizer::Spm(GgufSpmTokenizer::from_gguf(file)?),
         Some("t5") => CliTokenizer::Unigram(GgufUnigramTokenizer::from_gguf(file)?),
         other => {
@@ -993,7 +993,7 @@ fn run_gemma4_infer(args: InferArgs, path: &Path, file: &ShardedGguf) -> anyhow:
 /// GLM-5.2 / GLM4-family path via [`Glm52Engine`].
 fn run_glm52_infer(args: InferArgs, path: &Path, file: &ShardedGguf) -> anyhow::Result<()> {
     let tokenizer = match file.metadata_str("tokenizer.ggml.model") {
-        Some("gpt2") => CliTokenizer::Bpe(Box::new(GgufBpeTokenizer::from_gguf(file)?)),
+        Some("gpt2" | "gemma4") => CliTokenizer::Bpe(Box::new(GgufBpeTokenizer::from_gguf(file)?)),
         Some("llama") => CliTokenizer::Spm(GgufSpmTokenizer::from_gguf(file)?),
         Some("t5") => CliTokenizer::Unigram(GgufUnigramTokenizer::from_gguf(file)?),
         other => {

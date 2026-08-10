@@ -130,7 +130,7 @@ impl TextTokenizer for ServerTokenizer {
 
 fn tokenizer_from_gguf(file: &ShardedGguf) -> anyhow::Result<ServerTokenizer> {
     match file.metadata_str("tokenizer.ggml.model") {
-        Some("gpt2") => Ok(ServerTokenizer::Bpe(Box::new(GgufBpeTokenizer::from_gguf(
+        Some("gpt2" | "gemma4") => Ok(ServerTokenizer::Bpe(Box::new(GgufBpeTokenizer::from_gguf(
             file,
         )?))),
         Some("llama") => Ok(ServerTokenizer::Spm(GgufSpmTokenizer::from_gguf(file)?)),

@@ -55,43 +55,18 @@ impl ByteTokenizer {
     pub const VOCAB_SIZE: usize = 256;
 }
 
-/// A real BPE tokenizer built from a GGUF file's own
-/// `tokenizer.ggml.tokens` / `tokenizer.ggml.merges` metadata arrays --
-/// the same fields mistral.rs's `gguf_tokenizer.rs` reads to build a
-/// HuggingFace `tokenizers::Tokenizer`. Ferrox implements the encode
-/// loop itself (greedy longest-pair-first BPE merge, GPT2-style) rather
-/// than depending on the `tokenizers` crate, to keep the dependency
-/// tree pure-Rust and minimal.
+/// How a GGUF BPE vocabulary remaps text before merge lookup.
 ///
-/// Verified against a real file: `tests/fixtures/llama-bpe-vocab.gguf`,
-/// downloaded directly from ggml-org/llama.cpp's own repo (not
-/// synthesized), which ships exactly these two metadata arrays. See
-/// `crates/ferrox-models/tests/gguf_vocab.rs`.
-///
-/// This loads whatever vocabulary is embedded in a GGUF file. It does
-/// **not** mean GLM-5.2/DeepSeek-V4-Pro/Kimi-K3's specific vocabularies
-/// are available -- their real GGUF files (with their own tokens/merges
-/// arrays) are not obtainable in this environment (see
-/// docs/MODELS.md). This is the loader; it has only been exercised
-/// against a real llama-family vocabulary so far.
-pub struct GgufBpeTokenizer {
-    token_to_id: std::collections::HashMap<String, u32>,
-    id_to_token: Vec<String>,
-    /// merge rank: lower = merges earlier (higher priority), matching
-    /// the standard BPE convention of applying the most-frequent
-    /// (lowest-rank) merge first.
-    merge_rank: std::collections::HashMap<(String, String), usize>,
-    byte_to_unicode: [char; 256],
-    unicode_to_byte: std::collections::HashMap<char, u8>,
-    /// Control/user-defined tokens (chat-template markers and similar
-    /// added special tokens) from `tokenizer.ggml.token_type`, matched
-    /// as atomic substrings before normal BPE runs -- see
-    /// `split_on_special_tokens`.
-    special_tokens: Vec<(String, u32)>,
-    /// Compiled GPT2-style pre-tokenization pattern (see
-    /// `gpt2_pretokenize_regex`'s doc comment for exactly what this
-    /// does and does not match compared to the real GPT2 regex).
-    pretokenize_pattern: regex::Regex,
+/// GPT-2-style vocabs store merges in the OpenAI byte↔unicode remapped
+/// space; Gemma-4 (and similar SPM-flavoured BPE) stores merges over
+/// raw UTF-8 with spaces already escaped to U+2581 (`▁`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BpeEncodingStyle {
+    Gpt2,
+    /// llama.cpp `LLAMA_VOCAB_PRE_TYPE_GEMMA4`: escape `" "` → `▁`,
+    /// split only on newlines, merge on raw UTF-8 codepoints
+    /// (`byte_encode = false`).
+    SpmWhitespace,
 }
 
 /// Builds the GPT2 byte-to-unicode remap table: bytes in the "already
@@ -151,6 +126,44 @@ fn gpt2_byte_to_unicode() -> ([char; 256], std::collections::HashMap<char, u8>) 
 fn gpt2_pretokenize_regex() -> regex::Regex {
     regex::Regex::new(r"'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+")
         .expect("GPT2 pre-tokenization pattern is a fixed, valid regex")
+}
+
+/// Gemma-4 / SARVAM-style pre-split: only carve on newlines so BPE can
+/// merge across ordinary word boundaries after `" "` → `▁` escaping
+/// (llama.cpp `LLAMA_VOCAB_PRE_TYPE_GEMMA4`).
+fn newline_pretokenize_regex() -> regex::Regex {
+    regex::Regex::new(r"[^\n]+|[\n]+").expect("newline pretokenize pattern is fixed")
+}
+
+/// U+2581 FIGURE SPACE used by SentencePiece-style BPE merge tables.
+const SPM_SPACE: char = '\u{2581}';
+
+/// A real BPE tokenizer built from a GGUF file's own
+/// `tokenizer.ggml.tokens` / `tokenizer.ggml.merges` metadata arrays.
+/// Supports GPT-2 byte-remap BPE (`tokenizer.ggml.model == "gpt2"`) and
+/// Gemma-4 SPM-style BPE (`"gemma4"`: escape spaces to `▁`, merge on
+/// raw UTF-8, newline-only pre-split).
+///
+/// Verified against `tests/fixtures/llama-bpe-vocab.gguf` (GPT-2 path).
+/// See `crates/ferrox-models/tests/gguf_vocab.rs`.
+pub struct GgufBpeTokenizer {
+    token_to_id: std::collections::HashMap<String, u32>,
+    id_to_token: Vec<String>,
+    /// merge rank: lower = merges earlier (higher priority), matching
+    /// the standard BPE convention of applying the most-frequent
+    /// (lowest-rank) merge first.
+    merge_rank: std::collections::HashMap<(String, String), usize>,
+    byte_to_unicode: [char; 256],
+    unicode_to_byte: std::collections::HashMap<char, u8>,
+    /// Control/user-defined tokens (chat-template markers and similar
+    /// added special tokens) from `tokenizer.ggml.token_type`, matched
+    /// as atomic substrings before normal BPE runs -- see
+    /// `split_on_special_tokens`.
+    special_tokens: Vec<(String, u32)>,
+    /// Compiled pre-tokenization pattern (GPT-2 word regex, or
+    /// newline-only for Gemma-4 SPM-BPE).
+    pretokenize_pattern: regex::Regex,
+    style: BpeEncodingStyle,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -332,7 +345,8 @@ impl GgufBpeTokenizer {
     /// Loads the vocabulary + merge table from a GGUF file's metadata.
     /// Merges are optional (some tokenizer types, e.g. byte-level
     /// unigram, don't use them); if absent, encoding falls back to
-    /// per-byte token lookup.
+    /// per-byte token lookup. `tokenizer.ggml.model == "gemma4"` selects
+    /// SPM-whitespace BPE; everything else with merges uses GPT-2 style.
     pub fn from_gguf(file: &impl ferrox_gguf::TensorSource) -> Result<Self, TokenizerLoadError> {
         let tokens_value = file
             .metadata("tokenizer.ggml.tokens")
@@ -352,19 +366,27 @@ impl GgufBpeTokenizer {
             .map(|(i, t)| (t.clone(), i as u32))
             .collect();
 
+        let style = match file.metadata_str("tokenizer.ggml.model") {
+            Some("gemma4") => BpeEncodingStyle::SpmWhitespace,
+            _ => BpeEncodingStyle::Gpt2,
+        };
+
         let mut merge_rank = std::collections::HashMap::new();
         if let Some(ferrox_gguf::GgufValue::Array(items)) = file.metadata("tokenizer.ggml.merges") {
             for (rank, item) in items.iter().enumerate() {
                 if let Some(s) = item.as_str() {
-                    if let Some((a, b)) = s.split_once(' ') {
-                        merge_rank.insert((a.to_string(), b.to_string()), rank);
+                    if let Some((a, b)) = split_bpe_merge_pair(s, style) {
+                        merge_rank.insert((a, b), rank);
                     }
                 }
             }
         }
 
         let (byte_to_unicode, unicode_to_byte) = gpt2_byte_to_unicode();
-        let pretokenize_pattern = gpt2_pretokenize_regex();
+        let pretokenize_pattern = match style {
+            BpeEncodingStyle::Gpt2 => gpt2_pretokenize_regex(),
+            BpeEncodingStyle::SpmWhitespace => newline_pretokenize_regex(),
+        };
         let special_tokens = load_special_tokens(file, &id_to_token);
 
         Ok(GgufBpeTokenizer {
@@ -375,6 +397,7 @@ impl GgufBpeTokenizer {
             unicode_to_byte,
             special_tokens,
             pretokenize_pattern,
+            style,
         })
     }
 
@@ -386,21 +409,17 @@ impl GgufBpeTokenizer {
         !self.merge_rank.is_empty()
     }
 
-    /// Greedy BPE merge over a word's GPT2-remapped byte sequence: the
-    /// word's raw UTF-8 bytes are first mapped through
-    /// `byte_to_unicode` (so the merge table, which is keyed in that
-    /// same remapped space, can actually match), then adjacent pairs
-    /// are repeatedly merged by lowest rank until no known merge
-    /// applies, then the resulting pieces are mapped to vocabulary ids
-    /// (falling back to a per-remapped-character byte lookup for any
-    /// piece not found directly, which real vocabularies guarantee
-    /// exists since every single remapped byte character is itself a
-    /// base token).
+    /// Greedy BPE merge over one pre-split chunk. GPT-2 style remaps
+    /// bytes through `byte_to_unicode`; Gemma-4 style merges raw UTF-8
+    /// codepoints (after `" "` → `▁` escaping in `encode`).
     pub fn encode_word(&self, word: &str) -> Vec<u32> {
-        let mut pieces: Vec<String> = word
-            .bytes()
-            .map(|b| self.byte_to_unicode[b as usize].to_string())
-            .collect();
+        let mut pieces: Vec<String> = match self.style {
+            BpeEncodingStyle::Gpt2 => word
+                .bytes()
+                .map(|b| self.byte_to_unicode[b as usize].to_string())
+                .collect(),
+            BpeEncodingStyle::SpmWhitespace => word.chars().map(|c| c.to_string()).collect(),
+        };
         if pieces.is_empty() {
             return Vec::new();
         }
@@ -428,68 +447,152 @@ impl GgufBpeTokenizer {
 
         pieces
             .iter()
-            .map(|p| {
-                self.token_to_id.get(p).copied().unwrap_or_else(|| {
-                    // A merged multi-character piece not in the
-                    // vocabulary; fall back to encoding just its first
-                    // remapped-byte character, which every real
-                    // llama.cpp-style vocabulary includes as a base
-                    // token. This only triggers for merges the
-                    // vocabulary's own merge table produced but never
-                    // assigned an id to, which should not happen
-                    // against a self-consistent real vocabulary file.
-                    p.chars()
-                        .next()
-                        .and_then(|c| self.token_to_id.get(&c.to_string()))
-                        .copied()
-                        .unwrap_or(0)
-                })
-            })
+            .flat_map(|p| self.piece_to_ids(p))
             .collect()
     }
 
-    /// Encodes arbitrary text the way a real GPT2-style tokenizer
-    /// does: first carve out any literal occurrence of a control/
-    /// user-defined special token (chat-template markers like
-    /// `<|user|>`, see `split_on_special_tokens`) so they're never
-    /// shattered into ordinary byte pieces, then split each remaining
-    /// text run into pre-tokenized chunks via `gpt2_pretokenize_regex`
-    /// (so BPE merging never crosses a word boundary), then run
-    /// `encode_word` on each chunk and concatenate the resulting ids.
-    /// Use this, not `encode_word`, for real text -- `encode_word` is
-    /// kept public for testing the merge algorithm in isolation on a
-    /// single pre-split chunk.
+    fn piece_to_ids(&self, piece: &str) -> Vec<u32> {
+        if let Some(&id) = self.token_to_id.get(piece) {
+            return vec![id];
+        }
+        match self.style {
+            BpeEncodingStyle::Gpt2 => {
+                // Fall back to first remapped-byte character (GPT-2 base).
+                piece
+                    .chars()
+                    .next()
+                    .and_then(|c| self.token_to_id.get(&c.to_string()))
+                    .copied()
+                    .map(|id| vec![id])
+                    .unwrap_or_else(|| vec![0])
+            }
+            BpeEncodingStyle::SpmWhitespace => {
+                // llama.cpp non-byte-encoded BPE: unknown pieces → `<0xXX>`.
+                piece
+                    .bytes()
+                    .filter_map(|b| {
+                        let hex = format!("<0x{b:02X}>");
+                        self.token_to_id.get(&hex).copied()
+                    })
+                    .collect()
+            }
+        }
+    }
+
+    /// Encodes text: specials first, then style-specific pretokenize +
+    /// `encode_word`. Gemma-4 escapes spaces to `▁` and splits only on
+    /// newlines; newline-only chunks look up the whole string in vocab
+    /// (multi-newline tokens) before BPE.
     pub fn encode(&self, text: &str) -> Vec<u32> {
         split_on_special_tokens(text, &self.special_tokens)
             .into_iter()
             .flat_map(|seg| -> Vec<u32> {
                 match seg {
                     TextOrSpecial::Special(id) => vec![id],
-                    TextOrSpecial::Text(t) => self
-                        .pretokenize_pattern
-                        .find_iter(t)
-                        .flat_map(|m| self.encode_word(m.as_str()))
-                        .collect(),
+                    TextOrSpecial::Text(t) => self.encode_text_run(t),
                 }
             })
             .collect()
     }
 
-    /// Reverses `encode_word`: joins the id->token strings (each still
-    /// in GPT2-remapped-unicode space) back into raw bytes via
-    /// `unicode_to_byte`, then UTF-8-decodes. Any remapped character
-    /// not found in the reverse table (which should not happen for
-    /// tokens actually produced by this tokenizer's own vocabulary) is
-    /// dropped rather than corrupting the rest of the output.
-    pub fn decode(&self, ids: &[u32]) -> String {
-        let bytes: Vec<u8> = ids
-            .iter()
-            .filter_map(|&id| self.id_to_token.get(id as usize))
-            .flat_map(|token| token.chars())
-            .filter_map(|c| self.unicode_to_byte.get(&c).copied())
-            .collect();
-        String::from_utf8_lossy(&bytes).into_owned()
+    fn encode_text_run(&self, text: &str) -> Vec<u32> {
+        match self.style {
+            BpeEncodingStyle::Gpt2 => self
+                .pretokenize_pattern
+                .find_iter(text)
+                .flat_map(|m| self.encode_word(m.as_str()))
+                .collect(),
+            BpeEncodingStyle::SpmWhitespace => {
+                let escaped: String = text
+                    .chars()
+                    .map(|c| if c == ' ' { SPM_SPACE } else { c })
+                    .collect();
+                // Manual newline split (O(n)); avoids regex stack issues
+                // on long non-newline spans (llama.cpp PR #21587).
+                let mut out = Vec::new();
+                let bytes = escaped.as_bytes();
+                let mut i = 0usize;
+                while i < bytes.len() {
+                    let is_nl = bytes[i] == b'\n';
+                    let mut j = i + 1;
+                    while j < bytes.len() && (bytes[j] == b'\n') == is_nl {
+                        j += 1;
+                    }
+                    // Safe: we only split on ASCII `\n`, so `i..j` is UTF-8.
+                    let word = std::str::from_utf8(&bytes[i..j]).expect("newline split keeps utf8");
+                    if is_nl {
+                        if let Some(&id) = self.token_to_id.get(word) {
+                            out.push(id);
+                        } else {
+                            out.extend(self.encode_word(word));
+                        }
+                    } else {
+                        out.extend(self.encode_word(word));
+                    }
+                    i = j;
+                }
+                out
+            }
+        }
     }
+
+    /// GPT-2: remapped unicode → bytes. Gemma-4: unescape `▁` → space and
+    /// expand `<0xXX>` byte tokens (same shape as SPM decode).
+    pub fn decode(&self, ids: &[u32]) -> String {
+        match self.style {
+            BpeEncodingStyle::Gpt2 => {
+                let bytes: Vec<u8> = ids
+                    .iter()
+                    .filter_map(|&id| self.id_to_token.get(id as usize))
+                    .flat_map(|token| token.chars())
+                    .filter_map(|c| self.unicode_to_byte.get(&c).copied())
+                    .collect();
+                String::from_utf8_lossy(&bytes).into_owned()
+            }
+            BpeEncodingStyle::SpmWhitespace => {
+                let mut bytes: Vec<u8> = Vec::new();
+                for &id in ids {
+                    let Some(token) = self.id_to_token.get(id as usize) else {
+                        continue;
+                    };
+                    if let Some(b) = spm_byte_fallback_value(token) {
+                        bytes.push(b);
+                    } else {
+                        bytes.extend(token.replace(SPM_SPACE, " ").into_bytes());
+                    }
+                }
+                String::from_utf8_lossy(&bytes).into_owned()
+            }
+        }
+    }
+}
+
+/// Split a GGUF merge line `"left right"` into pair. Gemma-4 / llama.cpp
+/// use `find(' ', 1)` on the raw byte string so a leading ASCII space in
+/// `left` is not the separator; search from byte 1 (not char 1) to match.
+fn split_bpe_merge_pair(s: &str, style: BpeEncodingStyle) -> Option<(String, String)> {
+    match style {
+        BpeEncodingStyle::Gpt2 => s
+            .split_once(' ')
+            .map(|(a, b)| (a.to_string(), b.to_string())),
+        BpeEncodingStyle::SpmWhitespace => {
+            let bytes = s.as_bytes();
+            if bytes.len() < 2 {
+                return None;
+            }
+            let pos = bytes[1..].iter().position(|&b| b == b' ')? + 1;
+            // ASCII space is always a UTF-8 char boundary.
+            Some((s[..pos].to_string(), s[pos + 1..].to_string()))
+        }
+    }
+}
+
+fn spm_byte_fallback_value(token: &str) -> Option<u8> {
+    let hex = token.strip_prefix("<0x")?.strip_suffix('>')?;
+    if hex.len() != 2 {
+        return None;
+    }
+    u8::from_str_radix(hex, 16).ok()
 }
 
 /// A real SentencePiece-BPE tokenizer, built from a GGUF file's

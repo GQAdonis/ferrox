@@ -1382,9 +1382,11 @@ pub fn make_block_q6_kx8(
 }
 
 pub fn pack_q6_k_matrix_x8(data: &[u8], rows: usize, cols: usize, interleave: usize) -> Vec<u8> {
-    assert!(rows.is_multiple_of(Q6_KX8_NROWS));
+    // Rows past the last full group of 8 are left canonical, same as the
+    // other pack_*_matrix helpers; callers dot them row-by-row.
     assert!(cols.is_multiple_of(Q6_K_BLOCK_ELEMS));
     let row_bytes = (cols / Q6_K_BLOCK_ELEMS) * Q6_K_BLOCK_BYTES;
+    assert_eq!(data.len(), rows * row_bytes);
     let n_blocks = cols / Q6_K_BLOCK_ELEMS;
     let n_groups = rows / Q6_KX8_NROWS;
     let mut out = Vec::with_capacity(n_groups * n_blocks * Q6_KX8_BLOCK_BYTES);

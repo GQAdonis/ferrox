@@ -1552,9 +1552,7 @@ impl WeightMatrix {
                                     )
                                 })
                                 .collect();
-                            // Row NEON until Q6_Kx8 NEON lands (scalar Kx8
-                            // was slower than row NEON on Phi ffn_down).
-                            let use_kx8 = false;
+                            let use_kx8 = cfg!(target_arch = "aarch64");
                             let n_groups = if use_kx8 {
                                 *rows / ferrox_quant::Q6_KX8_NROWS
                             } else {

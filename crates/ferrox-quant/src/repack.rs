@@ -1290,7 +1290,18 @@ pub fn gemv_q6_kx8_q8_k(
 ) {
     assert_eq!(out.len(), n_row_groups * Q6_KX8_NROWS);
     match interleave {
-        4 => gemv_q6_kx8_q8_k_scalar(packed, act, n_cols, n_row_groups, 4, out),
+        4 => {
+            #[cfg(target_arch = "aarch64")]
+            {
+                if std::arch::is_aarch64_feature_detected!("dotprod") {
+                    unsafe {
+                        neon::gemv_q6_kx8_q8_k_neon_sdot(packed, act, n_cols, n_row_groups, out);
+                    }
+                    return;
+                }
+            }
+            gemv_q6_kx8_q8_k_scalar(packed, act, n_cols, n_row_groups, 4, out);
+        }
         8 => gemv_q6_kx8_q8_k_scalar(packed, act, n_cols, n_row_groups, 8, out),
         _ => panic!("q6_kx8 interleave must be 4 or 8, got {interleave}"),
     }
@@ -1311,7 +1322,8 @@ pub fn gemv_q6_kx8_group(
     gemv_q6_kx8_q8_k(slice, act, n_cols, 1, interleave, out8);
 }
 
-pub const Q6_KX8_GEMM_NC: usize = 8;
+/// How many activations one [`gemm_q6_kx8_group`] pass keeps in flight.
+pub const Q6_KX8_GEMM_NC: usize = 4;
 
 /// Multi-act GEMM for one Q6_Kx8 row-group; weight decode amortized across acts.
 pub fn gemm_q6_kx8_group(
@@ -1330,6 +1342,18 @@ pub fn gemm_q6_kx8_group(
     let nb = n_cols / Q6_K_BLOCK_ELEMS;
     let off = group * nb * Q6_KX8_BLOCK_BYTES;
     let slice = &packed[off..off + nb * Q6_KX8_BLOCK_BYTES];
+    #[cfg(target_arch = "aarch64")]
+    {
+        if interleave == 4
+            && acts.len() <= Q6_KX8_GEMM_NC
+            && std::arch::is_aarch64_feature_detected!("dotprod")
+        {
+            unsafe {
+                neon::gemm_q6_kx8_q8_k_neon_sdot(slice, acts, n_cols, out);
+            }
+            return;
+        }
+    }
     let blocklen = interleave;
     assert!(blocklen == 4 || blocklen == 8);
     let na = acts.len();
@@ -1669,6 +1693,18 @@ mod neon {
             ),
             _ => unreachable!(),
         }
+        acc
+    }
+
+    #[target_feature(enable = "neon,dotprod")]
+    unsafe fn sdot_vec(mut acc: int32x4_t, a: int8x16_t, b: int8x16_t) -> int32x4_t {
+        std::arch::asm!(
+            "sdot {acc:v}.4s, {a:v}.16b, {b:v}.16b",
+            acc = inout(vreg) acc,
+            a = in(vreg) a,
+            b = in(vreg) b,
+            options(pure, nomem, nostack),
+        );
         acc
     }
 
@@ -2581,6 +2617,349 @@ mod neon {
             let mut row = [0f32; Q4_KX8_NROWS];
             vst1q_f32(row.as_mut_ptr(), acc_f32[2 * a]);
             vst1q_f32(row.as_mut_ptr().add(4), acc_f32[2 * a + 1]);
+            for (r, v) in row.iter().enumerate() {
+                out[r * na + a] = *v;
+            }
+        }
+    }
+
+    /// NEON DotProd GEMV for interleave-4 `block_q6_Kx8` (llama
+    /// `ggml_gemv_q6_K_8x4_q8_K`). Bias via bsums×scales×32 skips the -32
+    /// shift on reconstructed quants.
+    #[target_feature(enable = "neon,dotprod")]
+    pub unsafe fn gemv_q6_kx8_q8_k_neon_sdot(
+        packed: &[u8],
+        act: &Q8KActivations,
+        n_cols: usize,
+        n_row_groups: usize,
+        out: &mut [f32],
+    ) {
+        let nb = n_cols / Q6_K_BLOCK_ELEMS;
+        let m4b = vdupq_n_u8(0x0f);
+        let mask_lo = vdupq_n_u8(0x03);
+        let mask_hi = vdupq_n_u8(0x30);
+
+        for x in 0..n_row_groups {
+            let mut acc_f32 = [vdupq_n_f32(0.0), vdupq_n_f32(0.0)];
+            let group_off = x * nb * Q6_KX8_BLOCK_BYTES;
+
+            for b in 0..nb {
+                let blk = packed.as_ptr().add(group_off + b * Q6_KX8_BLOCK_BYTES);
+                let mut d_arr = [0f32; 8];
+                for j in 0..8 {
+                    d_arr[j] = f16_from_bytes(std::slice::from_raw_parts(blk.add(j * 2), 2));
+                }
+                let q8_d = act.d[b];
+                let sb_scale_0 = vmulq_n_f32(vld1q_f32(d_arr.as_ptr()), q8_d);
+                let sb_scale_1 = vmulq_n_f32(vld1q_f32(d_arr.as_ptr().add(4)), q8_d);
+
+                let scales_base = blk.add(16);
+                let ql_all = blk.add(144);
+                let qh_all = blk.add(1168);
+
+                let mut q6_scales = [0i16; 16 * 8];
+                for i in 0..16 {
+                    let sc8 = vld1_s8(scales_base.add(i * 8) as *const i8);
+                    vst1q_s16(q6_scales.as_mut_ptr().add(i * 8), vmovl_s8(sc8));
+                }
+
+                let bsums_ptr = act.bsums.as_ptr().add(b * 16);
+                let mut bias_lo = vdupq_n_s32(0);
+                let mut bias_hi = vdupq_n_s32(0);
+                for i in (0..16).step_by(4) {
+                    let bsums_vec = vld1_s16(bsums_ptr.add(i));
+                    let scales_lo_0 = vld1_s16(q6_scales.as_ptr().add(i * 8));
+                    let scales_hi_0 = vld1_s16(q6_scales.as_ptr().add(i * 8 + 4));
+                    let scales_lo_1 = vld1_s16(q6_scales.as_ptr().add((i + 1) * 8));
+                    let scales_hi_1 = vld1_s16(q6_scales.as_ptr().add((i + 1) * 8 + 4));
+                    let scales_lo_2 = vld1_s16(q6_scales.as_ptr().add((i + 2) * 8));
+                    let scales_hi_2 = vld1_s16(q6_scales.as_ptr().add((i + 2) * 8 + 4));
+                    let scales_lo_3 = vld1_s16(q6_scales.as_ptr().add((i + 3) * 8));
+                    let scales_hi_3 = vld1_s16(q6_scales.as_ptr().add((i + 3) * 8 + 4));
+                    bias_lo = vmlal_lane_s16(bias_lo, scales_lo_0, bsums_vec, 0);
+                    bias_hi = vmlal_lane_s16(bias_hi, scales_hi_0, bsums_vec, 0);
+                    bias_lo = vmlal_lane_s16(bias_lo, scales_lo_1, bsums_vec, 1);
+                    bias_hi = vmlal_lane_s16(bias_hi, scales_hi_1, bsums_vec, 1);
+                    bias_lo = vmlal_lane_s16(bias_lo, scales_lo_2, bsums_vec, 2);
+                    bias_hi = vmlal_lane_s16(bias_hi, scales_hi_2, bsums_vec, 2);
+                    bias_lo = vmlal_lane_s16(bias_lo, scales_lo_3, bsums_vec, 3);
+                    bias_hi = vmlal_lane_s16(bias_hi, scales_hi_3, bsums_vec, 3);
+                }
+                bias_lo = vshlq_n_s32(bias_lo, 5);
+                bias_hi = vshlq_n_s32(bias_hi, 5);
+
+                let mut acc = [vdupq_n_s32(0), vdupq_n_s32(0)];
+                let q8_base = act.q.as_ptr().add(b * Q6_K_BLOCK_ELEMS);
+
+                for half in 0..2 {
+                    let ql_base = ql_all.add(half * 512);
+                    let qh_base = qh_all.add(half * 256);
+                    for sb in 0..4 {
+                        let q8_base_l = q8_base.add(half * 128 + sb * 16);
+                        let q8_base_h = q8_base_l.add(64);
+                        let mut q8_l = [vdupq_n_s8(0); 4];
+                        let mut q8_h = [vdupq_n_s8(0); 4];
+                        for i in 0..4 {
+                            q8_l[i] = vreinterpretq_s8_s32(vld1q_dup_s32(
+                                q8_base_l.add(i * 4) as *const i32,
+                            ));
+                            q8_h[i] = vreinterpretq_s8_s32(vld1q_dup_s32(
+                                q8_base_h.add(i * 4) as *const i32,
+                            ));
+                        }
+
+                        let ql_off_base = sb * 128; // QK_K/2
+                        let qh_off_base = ql_off_base & 255;
+                        let mut q6_ql = [vdupq_n_u8(0); 8];
+                        let mut q6_qh = [vdupq_n_u8(0); 8];
+                        for i in 0..8 {
+                            q6_ql[i] = vld1q_u8(ql_base.add(ql_off_base + i * 16));
+                            q6_qh[i] = vld1q_u8(qh_base.add(qh_off_base + i * 16));
+                        }
+                        if sb > 1 {
+                            for i in 0..8 {
+                                q6_qh[i] = vshrq_n_u8(q6_qh[i], 2);
+                            }
+                        }
+
+                        for g in 0..2 {
+                            let mut sb_acc_l = vdupq_n_s32(0);
+                            let mut sb_acc_h = vdupq_n_s32(0);
+                            for chunk in 0..4 {
+                                let idx = chunk * 2 + g;
+                                let q6_qs_l = q6_ql[idx];
+                                let q6_qs_h = q6_qh[idx];
+                                let q6_qs_hh = vandq_u8(q6_qs_h, mask_hi);
+                                let q6_l = vreinterpretq_s8_u8(vorrq_u8(
+                                    vandq_u8(q6_qs_l, m4b),
+                                    vshlq_n_u8(vandq_u8(q6_qs_h, mask_lo), 4),
+                                ));
+                                let q6_h = vreinterpretq_s8_u8(vorrq_u8(
+                                    vshrq_n_u8(q6_qs_l, 4),
+                                    q6_qs_hh,
+                                ));
+                                sb_acc_l = sdot_vec(sb_acc_l, q6_l, q8_l[chunk]);
+                                sb_acc_h = sdot_vec(sb_acc_h, q6_h, q8_h[chunk]);
+                            }
+                            let scale_idx_l = half * 8 + sb;
+                            let scale_idx_h = half * 8 + sb + 4;
+                            let scale_vec_l =
+                                vmovl_s16(vld1_s16(q6_scales.as_ptr().add(scale_idx_l * 8 + g * 4)));
+                            let scale_vec_h =
+                                vmovl_s16(vld1_s16(q6_scales.as_ptr().add(scale_idx_h * 8 + g * 4)));
+                            acc[g] = vmlaq_s32(acc[g], sb_acc_l, scale_vec_l);
+                            acc[g] = vmlaq_s32(acc[g], sb_acc_h, scale_vec_h);
+                        }
+                    }
+                }
+
+                acc[0] = vsubq_s32(acc[0], bias_lo);
+                acc[1] = vsubq_s32(acc[1], bias_hi);
+                acc_f32[0] = vaddq_f32(acc_f32[0], vmulq_f32(vcvtq_f32_s32(acc[0]), sb_scale_0));
+                acc_f32[1] = vaddq_f32(acc_f32[1], vmulq_f32(vcvtq_f32_s32(acc[1]), sb_scale_1));
+            }
+
+            let base = x * Q6_KX8_NROWS;
+            vst1q_f32(out.as_mut_ptr().add(base), acc_f32[0]);
+            vst1q_f32(out.as_mut_ptr().add(base + 4), acc_f32[1]);
+        }
+    }
+
+    /// Multi-act NEON GEMM for interleave-4 Q6_Kx8; shared weight unpack across acts
+    /// (llama `ggml_gemm_q6_K_8x4_q8_K` motivation — not gemv-per-act).
+    #[target_feature(enable = "neon,dotprod")]
+    pub unsafe fn gemm_q6_kx8_q8_k_neon_sdot(
+        packed: &[u8],
+        acts: &[Q8KActivations],
+        n_cols: usize,
+        out: &mut [f32],
+    ) {
+        let na = acts.len();
+        debug_assert!(na > 0 && na <= Q6_KX8_GEMM_NC);
+        let nb = n_cols / Q6_K_BLOCK_ELEMS;
+        let m4b = vdupq_n_u8(0x0f);
+        let mask_lo = vdupq_n_u8(0x03);
+        let mask_hi = vdupq_n_u8(0x30);
+
+        let mut acc_f32 = [[vdupq_n_f32(0.0); 2]; Q6_KX8_GEMM_NC];
+
+        for b in 0..nb {
+            let blk = packed.as_ptr().add(b * Q6_KX8_BLOCK_BYTES);
+            let mut d_arr = [0f32; 8];
+            for j in 0..8 {
+                d_arr[j] = f16_from_bytes(std::slice::from_raw_parts(blk.add(j * 2), 2));
+            }
+            let d_lo = vld1q_f32(d_arr.as_ptr());
+            let d_hi = vld1q_f32(d_arr.as_ptr().add(4));
+
+            let mut sb_scale = [[vdupq_n_f32(0.0); 2]; Q6_KX8_GEMM_NC];
+            for (a, act) in acts.iter().enumerate() {
+                let q8_d = act.d[b];
+                sb_scale[a] = [vmulq_n_f32(d_lo, q8_d), vmulq_n_f32(d_hi, q8_d)];
+            }
+
+            let scales_base = blk.add(16);
+            let ql_all = blk.add(144);
+            let qh_all = blk.add(1168);
+
+            let mut q6_scales = [0i16; 16 * 8];
+            for i in 0..16 {
+                let sc8 = vld1_s8(scales_base.add(i * 8) as *const i8);
+                vst1q_s16(q6_scales.as_mut_ptr().add(i * 8), vmovl_s8(sc8));
+            }
+
+            let mut bias = [[vdupq_n_s32(0); 2]; Q6_KX8_GEMM_NC];
+            for (a, act) in acts.iter().enumerate() {
+                let bsums_ptr = act.bsums.as_ptr().add(b * 16);
+                let mut bias_lo = vdupq_n_s32(0);
+                let mut bias_hi = vdupq_n_s32(0);
+                for i in (0..16).step_by(4) {
+                    let bsums_vec = vld1_s16(bsums_ptr.add(i));
+                    bias_lo = vmlal_lane_s16(
+                        bias_lo,
+                        vld1_s16(q6_scales.as_ptr().add(i * 8)),
+                        bsums_vec,
+                        0,
+                    );
+                    bias_hi = vmlal_lane_s16(
+                        bias_hi,
+                        vld1_s16(q6_scales.as_ptr().add(i * 8 + 4)),
+                        bsums_vec,
+                        0,
+                    );
+                    bias_lo = vmlal_lane_s16(
+                        bias_lo,
+                        vld1_s16(q6_scales.as_ptr().add((i + 1) * 8)),
+                        bsums_vec,
+                        1,
+                    );
+                    bias_hi = vmlal_lane_s16(
+                        bias_hi,
+                        vld1_s16(q6_scales.as_ptr().add((i + 1) * 8 + 4)),
+                        bsums_vec,
+                        1,
+                    );
+                    bias_lo = vmlal_lane_s16(
+                        bias_lo,
+                        vld1_s16(q6_scales.as_ptr().add((i + 2) * 8)),
+                        bsums_vec,
+                        2,
+                    );
+                    bias_hi = vmlal_lane_s16(
+                        bias_hi,
+                        vld1_s16(q6_scales.as_ptr().add((i + 2) * 8 + 4)),
+                        bsums_vec,
+                        2,
+                    );
+                    bias_lo = vmlal_lane_s16(
+                        bias_lo,
+                        vld1_s16(q6_scales.as_ptr().add((i + 3) * 8)),
+                        bsums_vec,
+                        3,
+                    );
+                    bias_hi = vmlal_lane_s16(
+                        bias_hi,
+                        vld1_s16(q6_scales.as_ptr().add((i + 3) * 8 + 4)),
+                        bsums_vec,
+                        3,
+                    );
+                }
+                bias[a] = [vshlq_n_s32(bias_lo, 5), vshlq_n_s32(bias_hi, 5)];
+            }
+
+            let mut acc = [[vdupq_n_s32(0); 2]; Q6_KX8_GEMM_NC];
+
+            for half in 0..2 {
+                let ql_base = ql_all.add(half * 512);
+                let qh_base = qh_all.add(half * 256);
+                for sb in 0..4 {
+                    let ql_off_base = sb * 128;
+                    let qh_off_base = ql_off_base & 255;
+                    let mut q6_ql = [vdupq_n_u8(0); 8];
+                    let mut q6_qh = [vdupq_n_u8(0); 8];
+                    for i in 0..8 {
+                        q6_ql[i] = vld1q_u8(ql_base.add(ql_off_base + i * 16));
+                        q6_qh[i] = vld1q_u8(qh_base.add(qh_off_base + i * 16));
+                    }
+                    if sb > 1 {
+                        for i in 0..8 {
+                            q6_qh[i] = vshrq_n_u8(q6_qh[i], 2);
+                        }
+                    }
+
+                    // Pre-decode q6 for both col-groups × 4 chunks.
+                    let mut q6_l = [[vdupq_n_s8(0); 4]; 2];
+                    let mut q6_h = [[vdupq_n_s8(0); 4]; 2];
+                    for g in 0..2 {
+                        for chunk in 0..4 {
+                            let idx = chunk * 2 + g;
+                            let q6_qs_l = q6_ql[idx];
+                            let q6_qs_h = q6_qh[idx];
+                            let q6_qs_hh = vandq_u8(q6_qs_h, mask_hi);
+                            q6_l[g][chunk] = vreinterpretq_s8_u8(vorrq_u8(
+                                vandq_u8(q6_qs_l, m4b),
+                                vshlq_n_u8(vandq_u8(q6_qs_h, mask_lo), 4),
+                            ));
+                            q6_h[g][chunk] = vreinterpretq_s8_u8(vorrq_u8(
+                                vshrq_n_u8(q6_qs_l, 4),
+                                q6_qs_hh,
+                            ));
+                        }
+                    }
+
+                    let scale_idx_l = half * 8 + sb;
+                    let scale_idx_h = half * 8 + sb + 4;
+                    let scale_l = [
+                        vmovl_s16(vld1_s16(q6_scales.as_ptr().add(scale_idx_l * 8))),
+                        vmovl_s16(vld1_s16(q6_scales.as_ptr().add(scale_idx_l * 8 + 4))),
+                    ];
+                    let scale_h = [
+                        vmovl_s16(vld1_s16(q6_scales.as_ptr().add(scale_idx_h * 8))),
+                        vmovl_s16(vld1_s16(q6_scales.as_ptr().add(scale_idx_h * 8 + 4))),
+                    ];
+
+                    for (a, act) in acts.iter().enumerate() {
+                        let q8_base = act.q.as_ptr().add(b * Q6_K_BLOCK_ELEMS);
+                        let q8_base_l = q8_base.add(half * 128 + sb * 16);
+                        let q8_base_h = q8_base_l.add(64);
+                        let mut q8_l = [vdupq_n_s8(0); 4];
+                        let mut q8_h = [vdupq_n_s8(0); 4];
+                        for i in 0..4 {
+                            q8_l[i] = vreinterpretq_s8_s32(vld1q_dup_s32(
+                                q8_base_l.add(i * 4) as *const i32,
+                            ));
+                            q8_h[i] = vreinterpretq_s8_s32(vld1q_dup_s32(
+                                q8_base_h.add(i * 4) as *const i32,
+                            ));
+                        }
+                        for g in 0..2 {
+                            let mut sb_acc_l = vdupq_n_s32(0);
+                            let mut sb_acc_h = vdupq_n_s32(0);
+                            for chunk in 0..4 {
+                                sb_acc_l = sdot_vec(sb_acc_l, q6_l[g][chunk], q8_l[chunk]);
+                                sb_acc_h = sdot_vec(sb_acc_h, q6_h[g][chunk], q8_h[chunk]);
+                            }
+                            acc[a][g] = vmlaq_s32(acc[a][g], sb_acc_l, scale_l[g]);
+                            acc[a][g] = vmlaq_s32(acc[a][g], sb_acc_h, scale_h[g]);
+                        }
+                    }
+                }
+            }
+
+            for a in 0..na {
+                let a0 = vsubq_s32(acc[a][0], bias[a][0]);
+                let a1 = vsubq_s32(acc[a][1], bias[a][1]);
+                acc_f32[a][0] =
+                    vaddq_f32(acc_f32[a][0], vmulq_f32(vcvtq_f32_s32(a0), sb_scale[a][0]));
+                acc_f32[a][1] =
+                    vaddq_f32(acc_f32[a][1], vmulq_f32(vcvtq_f32_s32(a1), sb_scale[a][1]));
+            }
+        }
+
+        for a in 0..na {
+            let mut row = [0f32; Q6_KX8_NROWS];
+            vst1q_f32(row.as_mut_ptr(), acc_f32[a][0]);
+            vst1q_f32(row.as_mut_ptr().add(4), acc_f32[a][1]);
             for (r, v) in row.iter().enumerate() {
                 out[r * na + a] = *v;
             }

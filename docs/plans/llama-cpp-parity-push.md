@@ -1,0 +1,539 @@
+---
+name: llama.cpp parity push
+overview: "MAIN GOAL: fix every performance gap against llama.cpp — gap ≤ 1.0× on all 29 currently-red engine suite rows, with answer parity, plus honest model/weight coverage (no arch that silently computes the wrong graph). VALIDATION RULE: every improvement is validated by a full `--suite --fit-host --skip-missing` + `--render` run, not just the model it targeted — a change is not landed until the whole ledger is re-measured and no row regressed. Default method: read `.scratch/llama.cpp` and port kernels/glue to Ferrox Rust/MSL. Re-ranked 2026-08-10 from a four-way code audit: the CPU prefill gap is a scalar activation re-interleave inside the i8mm GEMM (not the arithmetic tier), and the Metal prefill gap is a 12.5%-lane-occupancy attention kernel (not command-buffer batching). Both prior diagnoses were wrong and are corrected below."
+todos:
+  - id: cpu-act-interleave-hoist
+    content: "Hoist Q8_K activation interleave out of gemm_q4_kx8_q8_k_neon_i8mm into a Q8KActivationsX4 built once per apply_batch (llama block_q8_Kx4 / ggml_quantize_mat_q8_K_4x8)"
+    status: pending
+  - id: cpu-kill-transpose
+    content: "Delete the 7 serial [rows,batch] -> [batch,rows] scatter loops; have group kernels write [batch,rows] directly with a dst row stride (llama forward_mul_mat_one_chunk)"
+    status: pending
+  - id: cpu-i8mm-q5k-q6k
+    content: "Port ggml_gemm_q5_K_8x8_q8_K + ggml_gemm_q6_K_8x8_q8_K; flip q5_kx8_interleave/q6_kx8_interleave to 8 under i8mm. Upstream DOES have these — the in-tree 'until it lands' comments are wrong"
+    status: pending
+  - id: cpu-i8mm-q8_0-q4_0
+    content: "Un-pin Q8_0X4_INTERLEAVE/Q4_0X4_INTERLEAVE from 4; port ggml_gemm_q8_0_4x8_q8_0 + ggml_gemm_q4_0_4x8_q8_0 (SMMLA) + ggml_quantize_mat_q8_0_4x8"
+    status: pending
+  - id: cpu-actquant-flat
+    content: "De-nest activation quantization (serial internals, parallelize once at apply_batch over row-quads into one wdata buffer); share one quant pass across q/k/v and gate/up"
+    status: pending
+  - id: cpu-threadpool-chunking
+    content: "Chunk matmuls over both row and batch dims with atomic work-stealing (llama current_chunk, nchunk0*nchunk1 >= nth*4); persistent spin-barrier pool if decode still >1x"
+    status: pending
+  - id: cpu-prefill-attn-block
+    content: "Block prefill attention: QK^T tile GEMM + vectorized softmax + V GEMM, replacing the per-KV-position online_attn_accumulate with 2 scalar expf per position"
+    status: pending
+  - id: metal-fa-mma
+    content: "Port kernel_flash_attn_ext MMA (Q.K^T AND P.V via simdgroup_half8x8) for d=64/128 — attn.rs has ZERO simdgroup MMA today, 16 of 128 lanes active. This is the sub-1.5B Metal prefill gap"
+    status: pending
+  - id: metal-moe-stack
+    content: "Move MoE layers onto the fused prefill stack: MoE PrefillDenseLayerMetal variant, GPU router+top-k, wire the already-written-but-uncalled encode_moe_mm_id_map0. Kills ~112 command buffers per pp512"
+    status: pending
+  - id: metal-barrier-ranges
+    content: "Replace 15 blanket per-layer buffer barriers with llama's mem-range overlap tracker; fuse rmsnorm+f32->f16 and silu_mul+f32->f16"
+    status: pending
+  - id: metal-mm-occupancy
+    content: "Compile a bc_out=false mul_mm_sg variant needing 6144B threadgroup memory instead of always 8192B"
+    status: pending
+  - id: coverage-fail-closed
+    content: "BLOCKING CORRECTNESS: ~50 archs are admitted to the generic GQA path and emit wrong logits instead of refusing. Gate on required graph features; refuse what is not implemented"
+    status: pending
+  - id: coverage-f16
+    content: "F16 tensors do not load at all (GgmlType::F16 is parsed and sized but has no dequant arm anywhere) — every F16 GGUF is a hard UnsupportedDtype"
+    status: pending
+  - id: coverage-mxfp4-gptoss
+    content: "MXFP4 Metal+CUDA kernels (CPU is scalar-only) + gpt-oss graph (attn sinks, swiglu_oai clamp, SWA)"
+    status: pending
+  - id: coverage-cheap-archs
+    content: "ffn_exp_probs_b in the generic MoE loader (unlocks 8 archs at once); granite/minicpm multipliers; cohere2 parallel residual; partial rotary + full bias"
+    status: pending
+  - id: hygiene-clippy
+    content: "HEAD already fails the documented `clippy --workspace -- -D warnings` gate (11 errors in ferrox-quant alone); restore the gate before adding kernels"
+    status: pending
+  - id: legacy-cleanup
+    content: "Delete superseded paths as replacements land: dead encode_moe_mm_id_map0 duplication, per-call pack_q8_k_qs_x4_i8, by_row transposes, CUDA per-position batch arm"
+    status: pending
+  - id: suite-validate-every-change
+    content: "MANDATORY per improvement: full `bench --suite --fit-host --skip-missing` + `--render` on a quiet host after every landed change; compare against the previous ledger; revert or explain any regressed row"
+    status: pending
+  - id: quality-gates
+    content: "Golden/kernel tests + answer-parity smoke; row closed only at gap <=1.0x AND answers match llama"
+    status: pending
+  - id: close-all-red-rows
+    content: "Definition of done: all 29 red rows (11 Metal pp512, 2 Metal tg128, 8 CPU pp512, 8 CPU tg128) at gap <=1.0x, and Gemma-4 given a real llama baseline so it stops being unmeasurable"
+    status: pending
+isProject: false
+---
+
+# llama.cpp parity push
+
+> Working plan for closing the measured gaps against
+> [`benchmarks/RESULTS.md`](../../benchmarks/RESULTS.md). Re-ranked
+> **2026-08-10** from a four-way read-only audit of `ferrox` against
+> `.scratch/llama.cpp` (CPU prefill, CPU kernel coverage, Metal, and
+> model/weight coverage). Every claim below carries a `file:line`; the two
+> load-bearing ones were re-verified by hand before landing this document.
+>
+> Ordering is by measured gap × known cause, not by phase number. Phase 1
+> (CPU prefill) and Phase 4 (coverage) are independent and can proceed in
+> parallel. The frontmatter `todos` list is the checklist.
+
+## Status of the previous plan
+
+Phases 0–3 of the prior plan are **done** and their rows moved: Metal dense
+prefill went from ~18–21× to ~1.2–2.1×, Metal decode is at or below parity on
+most dense models, MoE loader/shexp bugs are fixed, SmolLM2 Metal greedy
+lm_head is fixed, CPU MoE bucketing landed.
+
+What did **not** work as predicted, and why the plan is re-ranked:
+
+| Prior belief | Reality (2026-08-10 audit) |
+|---|---|
+| CPU Q4_K GEMM would give 5.82× → 3.2×; it gave +6%, so "loop structure is not the problem, the arithmetic tier is" | Half right. The i8mm GEMM **is** live and reachable. It is fronted by a scalar activation re-interleave that costs ~4× the GEMM it feeds. Loop structure *was* the problem, one level down. |
+| Sub-1.5B Metal pp512 needs a compiled graph / pre-encoded command buffers | False. Ferrox already issues **1 command buffer per prefill graph**; llama issues 2. The gap is a scalar attention kernel with 16 of 128 lanes active. |
+| Upstream has no i8mm `gemm_q5_K_8x8` / `gemm_q6_K_8x8` ("until it lands") | Both exist upstream and are selected on any NEON+i8mm host. The in-tree comments are wrong and should be deleted with the fix. |
+| Arch coverage is a list of missing loaders | Worse: the name registry is complete, so ~50 archs **load and produce wrong logits** instead of refusing. |
+
+## Defaults
+
+- **Backend order:** CPU prefill first (5–11× gaps, largest in the ledger and
+  the cause is now known), Metal attention second, Metal MoE third, coverage
+  and correctness in parallel (they are cheap and independent).
+- **Iteration style:** CLI-bench the largest-gap model, change one lever,
+  re-bench the same model. That is the *inner* loop for deciding whether to
+  keep a change — it is not the validation.
+- **Validation is the full suite, every time.** Once a change is kept, run
+  `bench --suite --fit-host --skip-missing` + `--render` and diff the whole
+  ledger against the previous one. A kernel that speeds up its target model
+  and quietly costs 15% somewhere else is a regression, and the only way to
+  see it is to measure every row. No change is considered landed on a
+  partial measurement.
+- **Bench load:** Never run ferrox and llama benches in parallel, and never
+  while subagents or builds are running. Check `uptime` before quoting
+  numbers; abort above ~2.0. Prefer `ferrox bench … --compare` (sequential in
+  one process).
+- **Success bar:** gap ≤ 1.0× on every engine suite row computing the right
+  model. Gap = `llama / ferrox`. Within ~5% counts as closed; run-to-run
+  spread on Host B is ~20%, so claims tighter than that need interleaved A/B.
+- **Quality:** no speed win without golden/kernel tests and answer parity.
+- **Coverage:** an arch that computes the wrong graph is a bug, not a gap. It
+  must refuse to load until implemented.
+- **Port from llama.cpp:** read the reference under `.scratch/llama.cpp`
+  first, then port to Rust (and MSL strings in `ferrox-metal`). Cite the
+  llama file/symbol in the commit body.
+
+## Measurement contract (non-negotiable)
+
+```bash
+cargo build --release -p ferrox-cli --features metal
+
+# INNER LOOP (deciding whether a change is worth keeping):
+# Never -t; ngl 0 (CPU) or 99 (Metal)
+./target/release/ferrox bench -m <gguf> -p 512 -n 128 -r 3 --n-gpu-layers 0 --compare
+# Prefill-only for faster iteration when decode is already healthy:
+./target/release/ferrox bench -m <gguf> -p 512 -n 0 -r 3 --n-gpu-layers 0 --compare
+
+# VALIDATION (mandatory after every kept change, before it counts as landed):
+uptime                                   # abort above ~2.0 load
+./target/release/ferrox bench --suite --fit-host --skip-missing
+./target/release/ferrox bench --render
+git diff benchmarks/RESULTS.md            # read EVERY row, not just the target
+```
+
+The suite is the unit of truth. A change that improves its target row and
+regresses another has not made the engine faster — it has moved the gap. The
+`--render` diff is the artifact that proves otherwise, and it belongs in the
+commit that made the change.
+
+---
+
+## Phase 1 — CPU prefill (largest gaps in the ledger: 3.5×–11×)
+
+Current CPU pp512 vs tg128 is the tell — batching buys almost nothing:
+
+| Model | ferrox pp512 | ferrox tg128 | pp/tg | llama pp/tg | gap |
+|---|---|---|---|---|---|
+| Phi-4-mini Q4_K_M | 10.50 | 11.03 | **0.95×** | 3.88× | 10.97× |
+| Mistral-7B Q4_K_M | 5.39 | 6.50 | **0.83×** | 2.76× | 9.80× |
+| SmolLM2-135M Q8_0 | 155.46 | 93.39 | 1.66× | 5.36× | 10.68× |
+| Qwen3-0.6B Q8_0 | 80.31 | 52.24 | 1.54× | 4.87× | 6.57× |
+
+Batch 1 and batch 512 run at the same speed, so the batch dimension is being
+consumed inside the kernels rather than exploited.
+
+### 1a. Hoist the activation interleave (single largest CPU win)
+
+`gemm_q4_kx8_q8_k_neon_i8mm` (`crates/ferrox-quant/src/repack.rs:2446`) calls
+`pack_q8_k_qs_x4_i8` (`repack.rs:2428`) **inside** its `for b in 0..nb` loop,
+at `repack.rs:2463`. That helper is a scalar loop over 1024 elements with a
+div and a mod per element. The kernel is invoked once per (row-group,
+4-activation tile) from `weight_matrix.rs:1407-1423`, so the *same* activation
+bytes are re-interleaved once per weight row-group.
+
+Cost per matmul: `rows·batch·cols/8` scalar gather-stores against
+`rows·batch·cols/32` `vmmlaq_s32` for the real math — roughly 4× the
+instruction count and far more µops, all scalar. Decode (batch 1) never enters
+this path (it uses `dot_q4_k_q8_neon_i8mm`, `lib.rs:852`), which is exactly why
+`pp ≈ tg`.
+
+llama does this once: `ggml_quantize_mat_q8_K_4x8` writes the interleaved
+`block_q8_Kx4` into `params->wdata` (`ggml-cpu/repack.cpp:4298-4307`), and
+`ggml_gemm_q4_K_8x8_q8_K` (`arch/arm/repack.cpp:3752`) reads it directly with
+the activation-quad loop **outer** and the weight-group loop **inner**.
+
+**Fix:** make the interleaved layout the storage form. Add
+`Q8KActivationsX4 { qs: Vec<i8> /* pre-interleaved */, d, bsums }`, build it
+once per `apply_batch`, change the kernel to take `&Q8KActivationsX4`, delete
+`pack_q8_k_qs_x4_i8`. Keep a bit-exactness test against the current kernel.
+
+### 1b. Delete the output transpose
+
+Seven copies of the same serial scatter loop convert `[rows,batch]` to
+`[batch,rows]`: `weight_matrix.rs:1324-1330`, `1381-1387`, `1451-1457`,
+`1538-1544`, `1624-1630`, `1649-1654`, `1681-1687`. Single-threaded,
+`O(rows×batch)` with stride-`rows` writes into a 3–16 MB buffer, sitting
+downstream of an `O(rows×batch×cols)` parallel GEMM — its Amdahl share grows
+as 1a lands.
+
+llama never transposes: `forward_mul_mat_one_chunk`
+(`ggml-cpu/repack.cpp:4204-4248`) passes a `dst_ptr` plus row stride and the
+kernel stores `s[m*bs + n]` straight into final layout.
+
+**Fix:** give the group kernels `dst: *mut f32` + `dst_row_stride`; drop
+`by_row` entirely; make the Rayon unit a `(row-chunk, batch-chunk)` tile
+writing disjoint sub-rectangles.
+
+### 1c. i8mm for Q5_K and Q6_K
+
+`q5_kx8_interleave()` (`repack.rs:622`) and `q6_kx8_interleave()`
+(`repack.rs:1138`) hard-return 4 on aarch64, so the `interleave == 8` guard
+never holds and only `_sdot` kernels can be selected. Q4_K_M puts `attn_v` and
+about half of `ffn_down` in Q6_K, so a real slice of the FFN runs at SDOT rate
+(16 MAC/instr) instead of SMMLA rate (32 MAC/instr, 2 activation rows free).
+
+Port `ggml_gemm_q5_K_8x8_q8_K` (`arch/arm/repack.cpp:4272`, guard 4293) and
+`ggml_gemm_q6_K_8x8_q8_K` (`arch/arm/repack.cpp:4721`, guard 4742). Mirror the
+detection `q4_kx8_interleave()` already does correctly at `repack.rs:33-44`.
+Delete the two "until i8mm … lands" comments — they are false.
+
+> **Uncommitted work in the tree:** `repack.rs` currently has an unstaged
+> Q6_K NEON **sdot** GEMV/GEMM (`gemv_q6_kx8_q8_k_neon_sdot`,
+> `gemm_q6_kx8_q8_k_neon_sdot`) plus `weight_matrix.rs:1555` flipping
+> `use_kx8` to true on aarch64. `cargo test -p ferrox-quant` passes (96/96,
+> including `q6_kx8_gemm_matches_the_gemv_run_once_per_activation`). Land it
+> as the correctness-preserving step, then upgrade it to the 8×8 SMMLA shape
+> rather than treating sdot as the destination.
+
+### 1d. i8mm for Q8_0 and Q4_0
+
+`Q8_0X4_INTERLEAVE` (`repack.rs:378`) and `Q4_0X4_INTERLEAVE`
+(`repack.rs:1431`) are hardcoded to 4, so no SMMLA path can exist for either.
+llama's `ggml_repack_get_optimal_repack_type` (`ggml-cpu/repack.cpp:4699`)
+picks `q8_0_4x8_q8_0` whenever `neon && matmul_int8` — i.e. always on M2 —
+landing on `ggml_gemm_q8_0_4x8_q8_0` (`arch/arm/repack.cpp:5006`), fed by
+`ggml_quantize_mat_q8_0_4x8` (`arch/arm/repack.cpp:119`). Same story for
+`ggml_gemm_q4_0_4x8_q8_0` (`arch/arm/repack.cpp:2307`).
+
+This is the structural source of the Q8_0 CPU gaps (SmolLM2 10.68×,
+Qwen3-0.6B 6.57×, Qwen2.5-0.5B 5.84×, Gemma-3-1B 5.14×, TinyLlama 3.52×).
+Needs the interleaved activation packer from 1a generalized to Q8_0.
+
+### 1e. De-nest activation quantization
+
+`weight_matrix.rs:1269-1276` (and 1333, 1390, 1460, 1547) run
+`(0..batch_size).into_par_iter().map(quantize_activations_q8*)`, and those
+functions are themselves Rayon regions (`lib.rs:683-690`, `lib.rs:724-728`).
+So each of 512 outer tasks opens an inner parallel region. The Q8_0 one splits
+on `par_chunks_mut(32)` over `i8` — 32-byte chunks, two per cache line, with
+`d.par_iter_mut()` writing adjacent `f32`: guaranteed false sharing on every
+store. Per prefill: ~100k nested regions and ~200k heap allocations.
+
+llama quantizes once, thread-split by *column block*, then one barrier
+(`ggml-cpu.c:1322-1359`). **Fix:** serial internals, parallelize only at the
+`apply_batch` level over row-quads into one contiguous `wdata`-style buffer.
+Also cache the quantized activations per `normed_batch` so q/k/v share one
+pass and gate/up share one — currently 5 quantizations where 2 suffice.
+
+### 1f. Chunked work-stealing
+
+Ferrox does a fresh Rayon fork-join per matmul with a static `with_min_len`
+from `min_rows_per_task` (`weight_matrix.rs:442-445`) — about 6 tasks for a
+192-row `k_proj` on a 10-thread pool. llama chunks over **both** row and batch
+dims with an atomic `current_chunk` and `nchunk0·nchunk1 ≥ nth*4`, plus a
+re-chunk fallback (`ggml-cpu.c:1391-1430`, `repack.cpp:4355-4382`).
+Persistent spin-barrier pool (`ggml-cpu.c:584-606`) only if decode is still
+>1.0× after the kernel work.
+
+### 1g. Block the prefill attention
+
+`causal_gqa_attention_prefill_shared_kv` (`attention.rs:570-613`) parallelizes
+over `n_q × n_heads`, but each task walks KV one position at a time through
+`online_attn_accumulate` (`attention.rs:146-175`): two scalar `f32::exp` calls
+and a full-width rescale **per KV position**, with no K-tile reuse across
+queries. Port llama's shape — `QKᵀ` as a real GEMM, vectorized softmax over
+the whole row, `V·P` as a second GEMM.
+
+### CPU order and expected movement
+
+1. **1a** — the dominant term on every Q4_K row. Re-bench Phi-4 immediately.
+2. **1b** — compounds with 1a; grows in relative weight as 1a lands.
+3. **1d** — unlocks the five Q8_0 rows, which are the widest gaps after Phi-4.
+4. **1c** — finishes Q4_K_M's FFN tail.
+5. **1e**, **1f** — scheduling overhead, worth re-measuring after 1a–1d.
+6. **1g** — last; ~5% and shared with decode.
+
+---
+
+## Phase 2 — Metal prefill attention (the real sub-1.5B lever)
+
+**The prior "needs a compiled graph" hypothesis is dead.** Ferrox's
+`forward_hidden_batch` already finds the maximal run of consecutive dense
+layers (`decoder.rs:746-785`) and hands it to `launch_prefill_dense_stack`
+(`decoder.rs:842`), which uses **one** command buffer, one concurrent encoder,
+one commit, one `waitUntilCompleted` for all layers
+(`ferrox-metal/src/attn.rs:6925-6953`). llama uses 2 CBs per graph
+(`ggml-metal-context.m:463-466`). Ferrox is ahead here; graph pre-encoding is
+now the *last* item, not a prerequisite.
+
+### 2a. Port `kernel_flash_attn_ext` MMA (blocking for sub-1.5B ≤1×)
+
+`grep -c "simdgroup_multiply_accumulate\|simdgroup_half8x8" attn.rs` → **0**.
+Every prefill attention kernel is a vector/`simd_sum` kernel. In the default
+d=64 path `gqa_prefill_fa_ext_d64` (default-on for d=64, n_q≥8 —
+`attn.rs:3616-3650`), despite the name:
+
+- Q·Kᵀ runs in **one simdgroup only** (`if (sgitg == 0u)`, `attn.rs:1718`) —
+  3 of 4 simdgroups idle for the whole score phase;
+- inside it only 16 of 32 lanes participate (`own = tiisg < 16`,
+  `attn.rs:1675, 1724`) → **16/128 = 12.5% lane utilization**;
+- it is a scalar `dot` + `simd_sum` per (query, key) pair — 512 shuffle
+  reductions per 64-key chunk per (head, query-block), `attn.rs:1719-1727`;
+- P·V is a scalar FMA gather, per the code's own comment at
+  `attn.rs:1774-1786`: *"P·V: scalar gather (V staging + MMA layout still
+  WIP)"*.
+
+llama uses real 8×8 MMA for both Q·Kᵀ and P·V (`ggml-metal.metal:6701,
+6720-6721, 6878-6879, 6901-6904`; template 7069, d=64 instantiation 7126).
+
+This explains the size scaling exactly: attention is ~8% of SmolLM2-135M's
+prefill FLOPs (h=576) but ~1% of Mistral-7B's (h=4096), and the measured gap
+runs 2.98× → 1.84× → 1.62× → 1.29× → 1.21× monotonically with hidden size.
+An in-tree profile already agrees: *"62% of prefill inside that legacy
+kernel's waitUntilCompleted"* (`attn.rs:1266-1268`).
+
+**Expected:** SmolLM2/TinyLlama/Qwen2.5/Llama-3.2-1B pp512 2.98× → ~1.4×;
+~1.15× on 3B+.
+
+### 2b. Barrier ranges + fusion
+
+`encode_prefill_dense_layer` (`attn.rs:6615-6785`) emits ~19 dispatches and
+**15 blanket `memoryBarrierWithScope(Buffers)`** per layer — 450 full drains
+for a 30-layer SmolLM2 pass. llama emits 0-or-1 barrier per node, only on a
+real RAW/WAR/WAW overlap found by `ggml_mem_ranges_check`
+(`ggml-metal-ops.cpp:221-224`, `ggml-metal-common.cpp:124-153`), after a
+graph-optimize pass that reorders up to 64 nodes to widen concurrent sets.
+Also fuse `rmsnorm + f32→f16` and `silu_mul + f32→f16` to remove 3 tensor
+passes per layer (`attn.rs:6698, 6746, 6758`). ~5–10%.
+
+### 2c. GEMM occupancy
+
+The simdgroup GEMM tile is **byte-for-byte llama's** — NR0/NR1/NK = 64/32/32,
+4 simdgroups, `mc[8]`, `ma[4]`, `mb[2]`, 2×2 SG tiling (`gpu.rs:2488-2568` vs
+`ggml-metal.metal:10186-10314`). One difference: ferrox always requests 8192 B
+threadgroup memory (`gpu.rs:3746`) because the partial-tile staging path
+shares the allocation, where llama compiles a `bc_out=false` variant needing
+6144 B (`ggml-metal-device.cpp:793`). Costs one threadgroup of occupancy per
+core. ~3–8% on small-hidden models.
+
+### 2d. Host-side leftovers
+
+Every `apply_batch` does three `std::env::var` lookups per GEMM
+(`weight_matrix.rs:2099, 2109`) and a 64-sample page-touching
+`weight_fingerprint` per weight per call (`gpu.rs:4989-5006`, called at
+`gpu.rs:5039` *before* the cache lookup). ~1–2%, mostly on the MoE path.
+
+---
+
+## Phase 3 — Metal MoE (OLMoE pp512 2.73×, tg128 1.54×)
+
+Ferrox **already has a true `mul_mm_id`** — no gather, no scatter.
+`mul_mm_id_impl` reads src1 indirectly (`gpu.rs:2824-2831`), writes dst
+indirectly (`gpu.rs:2906-2919`), one z-slice per expert with a `tpe[im]`
+early-return (`gpu.rs:2810-2813`). That matches `kernel_mul_mm_id`
+(`ggml-metal.metal:10485-10520`). The prior plan item "port a real
+`mul_mm_id`" is **already done**.
+
+What is actually missing is that MoE layers are excluded from the fused stack
+(`metal_prefill_dense_layer_eligible` is dense-only, `decoder.rs:726-728`), so
+they fall to the legacy per-op path. Per layer that is q/k/v/o/router
+`apply_batch` (each its own CB + commit + wait + host readback), plus the attn
+block CB, plus the MoE CB: **~7 CBs / 7 syncs / 7 readbacks per layer × 16
+layers ≈ 112 command buffers per pp512**, against llama's 2.
+
+Fourteen distinct CPU round-trips per MoE layer are enumerated in the audit —
+CPU rms_norm, CPU QKV bias, CPU QK-norm, CPU residual adds, CPU `route_top_k`
+softmax+top-k, host `ids`/`route` buffer builds, and a **host** `map0`.
+
+Note: `encode_moe_mm_id_map0` and its kernels
+`moe_mm_id_map0_ne20_{2,4,6,8}` are already written (`gpu.rs:1006-1085`,
+`gpu.rs:3483`) and have **zero callers** — the host version at `gpu.rs:5956`
+is used instead. llama runs map0 as a kernel
+(`ggml-metal.metal:10385-10437`).
+
+**Fix:** add MoE variants to `PrefillDenseLayerMetal` (`attn.rs:6497-6514`);
+encode router GEMM → GPU `soft_max_topk` → `encode_moe_mm_id_map0` →
+`encode_mul_mm_id`×2 → `silu_mul` → `encode_mul_mm_id` → weighted sum →
+residual into the existing stack encoder. **No new MSL required** beyond
+wiring the written map0 kernel and a GPU top-k.
+
+**Expected:** MoE pp512 2.73× → ~1.3×, tg128 1.54× → ~1.1×.
+
+---
+
+## Phase 4 — Coverage and honest refusal (parallel track, independent of perf)
+
+### 4a. Fail closed on unimplemented graphs (correctness, blocking)
+
+Every `LLM_ARCH_NAMES` string in `llama-arch.cpp:9-147` has an entry in
+`capability.rs:196-590`, so nothing fails as "unknown arch". About 50 archs
+are admitted to `ArchPath::GenericGqa`, whose graph features the generic
+decoder does not implement — **they load and produce wrong logits rather than
+refusing**, which is worse than missing.
+
+The generic decoder implements (`tensor_role.rs:40-59`): attn_norm, q/k/v/qkv,
+output, q_norm/k_norm, post_attention_norm, ffn_norm/gate/up/down,
+post_ffw_norm, ffn_gate_inp + `_exps`, shared experts, grouped top-k, Q/K/V
+bias only, Gemma SWA + embedding scale.
+
+Absent everywhere on that path: ALiBi, learned `position_embd`, attn/ffn/output
+bias beyond QKV, attention sinks, partial rotary (`n_rot < head_dim`),
+residual/embedding/attn multipliers, parallel attn+FFN residual, non-Gemma
+logit softcap, and MoE routing bias `ffn_exp_probs_b`.
+
+Related: `unsupported_feature_keys` (`capability.rs:616-640`) refuses
+softcap/SWA only via `{arch}.attention.sliding_window_pattern`. Archs that set
+plain `{arch}.attention.sliding_window` without a pattern key — gpt-oss,
+cohere2, exaone4 — pass the check and silently run full attention.
+
+**Fix:** derive required graph features per arch, gate `GenericGqa` admission
+on them, and refuse with a named-feature error otherwise. Add a test that
+every arch on the generic path declares only implemented features.
+
+### 4b. F16 does not load
+
+`GgmlType::F16` is parsed (`ferrox-gguf/src/lib.rs:143`) and sized
+(`lib.rs:171`) but has **no dequant arm anywhere** — the only two references
+in the whole workspace are those two lines. Every F16 tensor hits
+`UnsupportedDtype` (`loader.rs:735`). The BF16 arm at `loader.rs:776` is the
+template. Cost: XS. Value: every `*-f16.gguf`.
+
+### 4c. Ranked coverage additions
+
+| # | Addition | Why | Cost | Port from |
+|---|---|---|---|---|
+| 1 | F16 tensor loading | hard load error today | XS | mirror BF16 arm, `loader.rs:776` |
+| 2 | MXFP4 Metal + CUDA | gpt-oss-20b/120b; CPU-scalar only now | M | `ggml-metal.metal` `kernel_mul_mv_mxfp4_f32`, `ggml-cuda/mmvq.cu` |
+| 3 | gpt-oss graph: attn sinks, swiglu_oai clamp, SWA | pairs with #2; silently wrong today | M | `src/models/openai-moe.cpp` |
+| 4 | `ffn_exp_probs_b` in generic MoE loader | unlocks dots1, ernie4_5-moe, bailingmoe2, exaone-moe, hunyuan-moe, afmoe in one change | S | `llama-graph.cpp` `build_moe_ffn` |
+| 5 | Metal/CUDA Q2_K + Q3_K + IQ4_NL matvec | Q3_K_M/Q2_K standard for 30B+; CPU-only now | M | `ggml-metal.metal`, `ggml-cuda/vecdotq.cuh` |
+| 6 | IQ2_XS / IQ2_S / IQ3_S / IQ1_M | tiers Unsloth Dynamic ships; sibling grids already in `iq_tables.rs` | M | `ggml-quants.c` |
+| 7 | Granite / MiniCPM multipliers | ~3 scalars, widely quantized archs | XS | `src/models/granite.cpp`, `minicpm.cpp` |
+| 8 | Cohere2 / Command-R parallel residual + logit scale | common GGUFs, wrong today | S | `src/models/cohere2.cpp` |
+| 9 | Partial rotary (`n_rot`) + full bias | fixes stablelm, phi2, gptneox, starcoder2, gpt2 at once | S | `src/models/stablelm.cpp`, `starcoder2.cpp` |
+| 10 | olmo2 post-norm + ALiBi (bloom/mpt/jais) | last structural families in the "admitted but wrong" bucket | S/M | `src/models/olmo2.cpp`, `bloom.cpp` |
+
+**Below the line:** recurrent (`mamba2`, `rwkv7`) and hybrid (`qwen3next`,
+`lfm2`) need a whole state-carrying engine, and ferrox already fails closed on
+them — they cost more and hurt less than anything above.
+
+---
+
+## Phase 5 — Hygiene and legacy cleanup
+
+- **Restore the clippy gate.** `CLAUDE.md` documents
+  `cargo clippy --workspace --all-targets -- -D warnings`, but HEAD already
+  fails it: 11 errors in `ferrox-quant` alone (verified in a clean worktree at
+  HEAD), 14 with the uncommitted Q6_K work. Fix before adding kernels, or the
+  gate stops catching anything.
+- `cpu_int_dot_enabled()` (`weight_matrix.rs:297-306`) is off unless a binary
+  opts in. The bench, CLI and server all call `default_cpu_int_dot_on()`, so
+  suite numbers are fine — but any embedder of `ferrox-core` silently falls
+  through to the f32 dequant-dot at `weight_matrix.rs:1637-1647`, a much
+  slower engine. Move the default into the getter.
+- Asymmetric contract: `Q8_0X4_GEMM_NC = 8` (kernel tiles internally) vs
+  `Q4_KX8_GEMM_NC = 4` (caller chunks). Unify while touching both in 1a/1b.
+- CUDA batch arm (`weight_matrix.rs:1224-1243`) is still a per-position matvec
+  loop — already flagged in its own comment, not on the M2 path, but the same
+  class of bug as everything in Phase 1.
+- Delete as replacements land: `pack_q8_k_qs_x4_i8`, the seven `by_row`
+  transposes, the host `map0` at `gpu.rs:5956` once the kernel is wired, the
+  false "until i8mm … lands" comments, and stale ROADMAP/RESULTS bullets.
+- Keep: one scalar/non-SIMD CPU reference for golden tests; per-op Metal
+  fallback until the fused stack covers MoE too.
+
+---
+
+## Out of scope this push
+
+- CUDA parity (no Host B pin); keep CUDA builds compiling only.
+- Serving-suite prefill claims (the engine table is the parity ledger).
+- Recurrent/hybrid/vision/embedding engines (Phase 4 "below the line").
+- Broad IQ coverage beyond item 4c.6 unless it unblocks a suite row.
+
+---
+
+## Definition of done
+
+The push is finished when **all 29 red rows** in
+[`benchmarks/RESULTS.md`](../../benchmarks/RESULTS.md) read ≤ 1.0×, with
+answer parity. Tracked explicitly so "mostly done" is not a resting place:
+
+| Backend / test | Rows still red | Worst | Owning phase |
+|---|---|---|---|
+| Metal `pp512` | 11 — SmolLM2 2.98, OLMoE 2.73, Qwen2.5-0.5B 2.06, Qwen3-0.6B 1.90, TinyLlama 1.84, Llama-3.2-1B IQ4_XS 1.65, Llama-3.2-1B Q4_K_M 1.62, Llama-3.2-3B 1.29, Phi-4 1.29, Gemma-3-1B 1.27, Mistral-7B 1.21 | 2.98× | 2a (+3 for OLMoE) |
+| Metal `tg128` | 2 — OLMoE 1.54, Llama-3.2-3B 1.11 | 1.54× | 3 |
+| CPU `pp512` | 8 — Phi-4 10.97, SmolLM2 10.68, Mistral 9.80, Qwen3-0.6B 6.57, OLMoE 6.24, Qwen2.5-0.5B 5.84, Gemma-3-1B 5.14, TinyLlama 3.52 | 10.97× | 1a–1d |
+| CPU `tg128` | 8 — SmolLM2 3.32, Mistral 2.94, Phi-4 2.69, Qwen2.5-0.5B 2.10, Qwen3-0.6B 2.07, Gemma-3-1B 1.86, OLMoE 1.71, TinyLlama 1.59 | 3.32× | 1e–1g |
+
+Plus one row that is **not measurable today**: Gemma-4-E2B has no llama column
+because Homebrew `llama-bench` lacks the `gemma4` arch, and ferrox's own
+number uses sequential `forward_token` for `pp*` (`bench_model.rs:148-152`).
+Both sides need fixing before that row can be called anything — a blank gap
+is not a closed gap.
+
+Track the ledger after each validation run; a phase is done when its rows are
+green **and stay green** in a later suite run.
+
+## Verification loop (every change)
+
+1. `cargo test` for touched crates + Metal shape sweeps
+   (`assert_mul_mm_sg_matches_matvec`); bit-exactness tests against the
+   superseded kernel for every 1a–1d port.
+2. Targeted `ferrox bench … --compare` on the affected model, quiet host —
+   keep the change only if the gap shrank.
+3. Answer check: same prompt, greedy, vs llama.cpp, sequential.
+4. **Full `--suite --fit-host --skip-missing` + `--render`.** Diff every row
+   against the previous ledger. Any regression beyond the ~20% host spread is
+   either explained in the commit body or the change is reverted.
+5. Row closed only at gap ≤ 1.0× **and** matching answers. Within ~5% counts;
+   >1.05× means keep going.
+6. Remove the superseded legacy path in the same or next commit.
+7. Commit the regenerated `RESULTS.md` + receipts with the change that earned
+   them, so every speed claim in git history has a measurement behind it.
+
+```mermaid
+flowchart LR
+  CPU[Phase 1 CPU prefill: hoist interleave, kill transpose, i8mm tiers] --> Bench[Bench same model]
+  Metal[Phase 2 Metal FA MMA] --> Bench
+  MoE[Phase 3 MoE on fused stack] --> Bench
+  Bench --> Answers[Answer parity vs llama]
+  Answers --> Suite[Full suite plus render - every change]
+  Suite --> Reg{Any row regressed?}
+  Reg -->|yes| Revert[Revert or explain in commit]
+  Reg -->|no| Legacy[Delete superseded path, commit RESULTS]
+  Revert --> Bench
+  Legacy --> Done{All 29 rows under 1.0x?}
+  Done -->|no| Next[Next lever]
+  Next --> Bench
+  Cover[Phase 4 fail-closed plus F16 plus MXFP4] --> Suite
+```

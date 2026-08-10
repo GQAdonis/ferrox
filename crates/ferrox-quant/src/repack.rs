@@ -309,7 +309,7 @@ fn gemv_q4_kx8_q8_k_scalar_8(
 }
 
 /// GEMV: interleaved Q4_K weights × Q8_K activation → `n_row_groups * 8` f32s.
-/// Dispatches to NEON (interleave 4) / AVX2 (interleave 8) when available.
+/// Dispatches to NEON (both interleaves) / AVX2 (interleave 8) when available.
 pub fn gemv_q4_kx8_q8_k(
     packed: &[u8],
     act: &Q8KActivations,
@@ -339,6 +339,15 @@ pub fn gemv_q4_kx8_q8_k(
                 if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
                     unsafe {
                         avx2::gemv_q4_kx8_q8_k_avx2(packed, act, n_cols, n_row_groups, out);
+                    }
+                    return;
+                }
+            }
+            #[cfg(target_arch = "aarch64")]
+            {
+                if std::arch::is_aarch64_feature_detected!("dotprod") {
+                    unsafe {
+                        neon::gemv_q4_kx8_q8_k_neon_8x8(packed, act, n_cols, n_row_groups, out);
                     }
                     return;
                 }
@@ -2553,6 +2562,143 @@ mod neon {
         }
     }
 
+    /// NEON DotProd GEMV for interleave-8 packed Q4_K weights (llama.cpp
+    /// `ggml_gemv_q4_K_8x8_q8_K` in `arch/arm/repack.cpp`). Each 8-byte q8
+    /// run is broadcast to both vector halves so one `sdot` covers two
+    /// interleaved columns at once.
+    #[target_feature(enable = "neon,dotprod")]
+    pub unsafe fn gemv_q4_kx8_q8_k_neon_8x8(
+        packed: &[u8],
+        act: &Q8KActivations,
+        n_cols: usize,
+        n_row_groups: usize,
+        out: &mut [f32],
+    ) {
+        let nb = n_cols / Q4_K_BLOCK_ELEMS;
+        let m4b = vdupq_n_u8(0x0f);
+
+        for x in 0..n_row_groups {
+            let mut acc_f32 = [vdupq_n_f32(0.0), vdupq_n_f32(0.0)];
+            let group_off = x * nb * Q4_KX8_BLOCK_BYTES;
+
+            for b in 0..nb {
+                let blk = packed.as_ptr().add(group_off + b * Q4_KX8_BLOCK_BYTES);
+                let mut d_arr = [0f32; 8];
+                let mut dmin_arr = [0f32; 8];
+                for j in 0..8 {
+                    d_arr[j] = f16_from_bytes(std::slice::from_raw_parts(blk.add(j * 2), 2));
+                    dmin_arr[j] =
+                        f16_from_bytes(std::slice::from_raw_parts(blk.add(16 + j * 2), 2));
+                }
+                let q8_d = act.d[b];
+                let sb_scale = [
+                    vmulq_n_f32(vld1q_f32(d_arr.as_ptr()), q8_d),
+                    vmulq_n_f32(vld1q_f32(d_arr.as_ptr().add(4)), q8_d),
+                ];
+                let sb_min = [
+                    vmulq_n_f32(vld1q_f32(dmin_arr.as_ptr()), q8_d),
+                    vmulq_n_f32(vld1q_f32(dmin_arr.as_ptr().add(4)), q8_d),
+                ];
+
+                let q8_base = act.q.as_ptr().add(b * Q4_K_BLOCK_ELEMS);
+                let bsums_ptr = act.bsums.as_ptr().add(b * 16);
+                let mut bsums_arr = [0i16; 8];
+                for (i, slot) in bsums_arr.iter_mut().enumerate() {
+                    *slot = *bsums_ptr.add(2 * i) + *bsums_ptr.add(2 * i + 1);
+                }
+
+                let scales_base = blk.add(32);
+                let qs_base = blk.add(128);
+
+                let mut bias_acc = [vdupq_n_s32(0), vdupq_n_s32(0)];
+
+                for sb in 0..4 {
+                    let mut acc_lo = [vdupq_n_s32(0); 4];
+                    let mut acc_hi = [vdupq_n_s32(0); 4];
+
+                    let mut q4sb_scales = [vdupq_n_s16(0); 2];
+                    let mut q4sb_mins = [vdupq_n_s16(0); 2];
+                    for i in 0..2 {
+                        let mut sc = [0u8; 8];
+                        let mut mn = [0u8; 8];
+                        let offset = sb * 24 + i * 12;
+                        decode_scales_mins(
+                            std::slice::from_raw_parts(scales_base.add(offset), 12),
+                            &mut sc,
+                            &mut mn,
+                        );
+                        let mut sc_i8 = [0i8; 8];
+                        let mut mn_i8 = [0i8; 8];
+                        for t in 0..8 {
+                            sc_i8[t] = sc[t] as i8;
+                            mn_i8[t] = mn[t] as i8;
+                        }
+                        q4sb_scales[i] = vmovl_s8(vld1_s8(sc_i8.as_ptr()));
+                        q4sb_mins[i] = vmovl_s8(vld1_s8(mn_i8.as_ptr()));
+                    }
+
+                    let q8_sb = q8_base.add(sb * 64);
+                    let mut q8_qs = [vdupq_n_s8(0); 8];
+                    for (i, slot) in q8_qs.iter_mut().enumerate() {
+                        *slot = vreinterpretq_s8_s64(vld1q_dup_s64(
+                            q8_sb.add(i * 8) as *const i64
+                        ));
+                    }
+
+                    for cp in 0..4 {
+                        let q4_qs = [
+                            vld1q_u8(qs_base.add(sb * Q4_K_BLOCK_ELEMS + 16 * cp)),
+                            vld1q_u8(qs_base.add(sb * Q4_K_BLOCK_ELEMS + 16 * cp + 64)),
+                            vld1q_u8(qs_base.add(sb * Q4_K_BLOCK_ELEMS + 16 * cp + 128)),
+                            vld1q_u8(qs_base.add(sb * Q4_K_BLOCK_ELEMS + 16 * cp + 192)),
+                        ];
+                        for m in 0..4 {
+                            let q4_lo = vreinterpretq_s8_u8(vandq_u8(q4_qs[m], m4b));
+                            let q4_hi = vreinterpretq_s8_u8(vshrq_n_u8(q4_qs[m], 4));
+                            acc_lo[cp] = sdot(acc_lo[cp], q4_lo, q8_qs[m]);
+                            acc_hi[cp] = sdot(acc_hi[cp], q4_hi, q8_qs[m + 4]);
+                        }
+                    }
+
+                    for i in 0..2 {
+                        let p = i * 2;
+                        let (scales_lo, scales_hi) = if i == 0 {
+                            (vget_low_s16(q4sb_scales[0]), vget_low_s16(q4sb_scales[1]))
+                        } else {
+                            (vget_high_s16(q4sb_scales[0]), vget_high_s16(q4sb_scales[1]))
+                        };
+                        let sumf_0 = vcvtq_f32_s32(vmulq_s32(
+                            vmovl_s16(scales_lo),
+                            vpaddq_s32(acc_lo[p], acc_lo[p + 1]),
+                        ));
+                        acc_f32[i] = vfmaq_f32(acc_f32[i], sb_scale[i], sumf_0);
+                        let sumf_1 = vcvtq_f32_s32(vmulq_s32(
+                            vmovl_s16(scales_hi),
+                            vpaddq_s32(acc_hi[p], acc_hi[p + 1]),
+                        ));
+                        acc_f32[i] = vfmaq_f32(acc_f32[i], sb_scale[i], sumf_1);
+                    }
+
+                    let bsums_vec_lo = vdup_n_s16(bsums_arr[2 * sb]);
+                    let bsums_vec_hi = vdup_n_s16(bsums_arr[2 * sb + 1]);
+                    bias_acc[0] = vmlal_s16(bias_acc[0], bsums_vec_lo, vget_low_s16(q4sb_mins[0]));
+                    bias_acc[0] = vmlal_s16(bias_acc[0], bsums_vec_hi, vget_low_s16(q4sb_mins[1]));
+                    bias_acc[1] =
+                        vmlal_s16(bias_acc[1], bsums_vec_lo, vget_high_s16(q4sb_mins[0]));
+                    bias_acc[1] =
+                        vmlal_s16(bias_acc[1], bsums_vec_hi, vget_high_s16(q4sb_mins[1]));
+                }
+
+                acc_f32[0] = vmlsq_f32(acc_f32[0], vcvtq_f32_s32(bias_acc[0]), sb_min[0]);
+                acc_f32[1] = vmlsq_f32(acc_f32[1], vcvtq_f32_s32(bias_acc[1]), sb_min[1]);
+            }
+
+            let base = x * Q4_KX8_NROWS;
+            vst1q_f32(out.as_mut_ptr().add(base), acc_f32[0]);
+            vst1q_f32(out.as_mut_ptr().add(base + 4), acc_f32[1]);
+        }
+    }
+
     /// NEON DotProd GEMV for interleave-8 packed Q5_K weights (llama.cpp
     /// `ggml_gemv_q5_K_8x8_q8_K` in `arch/arm/repack.cpp`). Each 8-byte q8
     /// run is broadcast to both vector halves so one `sdot` covers two
@@ -4739,6 +4885,42 @@ mod tests {
                         want[r]
                     );
                 }
+            }
+        }
+    }
+
+    /// The interleave-8 DotProd GEMV against the scalar interleave-8
+    /// reference (the i8mm GEMM side of Q4_K is covered above).
+    #[test]
+    #[cfg(target_arch = "aarch64")]
+    fn q4_kx8_interleave8_neon_gemv_matches_scalar_when_available() {
+        if !std::arch::is_aarch64_feature_detected!("dotprod") {
+            return;
+        }
+        let n_blocks = 3;
+        let cols = n_blocks * Q4_K_BLOCK_ELEMS;
+        let n_groups = 2;
+        let rows = n_groups * Q4_KX8_NROWS;
+        let mut matrix = Vec::new();
+        for r in 0..rows {
+            matrix.extend_from_slice(&synth_q4_k_row(n_blocks, (r * 11 + 5) as u8));
+        }
+        let packed = pack_q4_k_matrix_x8(&matrix, rows, cols, 8);
+
+        let acts = synth_q8_k_acts(4, cols);
+        for act in &acts {
+            let mut got = vec![0f32; rows];
+            gemv_q4_kx8_q8_k(&packed, act, cols, n_groups, 8, &mut got);
+            let mut want = vec![0f32; rows];
+            gemv_q4_kx8_q8_k_scalar_8(&packed, act, cols, n_groups, &mut want);
+            for r in 0..rows {
+                let err = (got[r] - want[r]).abs();
+                assert!(
+                    err / want[r].abs().max(1.0) < 1e-5 || err < 1e-3,
+                    "gemv row {r}: NEON 8x8 {} vs scalar {}",
+                    got[r],
+                    want[r]
+                );
             }
         }
     }

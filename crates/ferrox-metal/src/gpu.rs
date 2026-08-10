@@ -1000,6 +1000,90 @@ kernel void q4_0_moe_down_id_sum(
     }
 }
 
+/// llama `kernel_mul_mm_id_map0`: per-expert token/slot lists from routing
+/// ids `[n_tokens, top_k]`. One thread per expert.
+template<short ne20>
+static inline void moe_mm_id_map0_impl(
+    device const int* src2,
+    device uint* htpe,
+    device int* hids,
+    uint n_tokens,
+    ushort tpitg,
+    ushort ntg,
+    threadgroup ushort* shmem
+) {
+    const short ide = short(tpitg);
+    uint32_t n_all = 0;
+    device int* ids_i32 = hids + ide * n_tokens;
+
+    for (uint i21 = 0; i21 < n_tokens; i21 += ntg) {
+        if (i21 + tpitg < n_tokens) {
+            device const int* row = src2 + (i21 + tpitg) * ne20;
+            threadgroup ushort* sids = shmem + tpitg * ne20;
+#pragma clang loop unroll(full)
+            for (short i20 = 0; i20 < ne20; i20++) {
+                sids[i20] = ushort(row[i20]);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (short t = 0; t < short(ntg); t++) {
+            if (i21 + uint(t) >= n_tokens) {
+                break;
+            }
+            threadgroup const ushort* sids = shmem + uint(t) * ne20;
+            short sel = 0;
+#pragma clang loop unroll(full)
+            for (short i20 = 0; i20 < ne20; i20++) {
+                sel += (sids[i20] == ushort(ide)) * (i20 + 1);
+            }
+            ids_i32[n_all] = int((i21 + uint(t)) * uint(ne20) + uint(sel - 1));
+            n_all += sel > 0;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    htpe[ide] = n_all;
+}
+
+kernel void moe_mm_id_map0_ne20_2(
+    device const int* src2 [[buffer(0)]],
+    device uint* htpe [[buffer(1)]],
+    device int* hids [[buffer(2)]],
+    constant uint& n_tokens [[buffer(3)]],
+    ushort tpitg [[thread_position_in_threadgroup]],
+    ushort ntg [[threads_per_threadgroup]],
+    threadgroup ushort* shmem [[threadgroup(0)]]
+) { moe_mm_id_map0_impl<2>(src2, htpe, hids, n_tokens, tpitg, ntg, shmem); }
+
+kernel void moe_mm_id_map0_ne20_4(
+    device const int* src2 [[buffer(0)]],
+    device uint* htpe [[buffer(1)]],
+    device int* hids [[buffer(2)]],
+    constant uint& n_tokens [[buffer(3)]],
+    ushort tpitg [[thread_position_in_threadgroup]],
+    ushort ntg [[threads_per_threadgroup]],
+    threadgroup ushort* shmem [[threadgroup(0)]]
+) { moe_mm_id_map0_impl<4>(src2, htpe, hids, n_tokens, tpitg, ntg, shmem); }
+
+kernel void moe_mm_id_map0_ne20_6(
+    device const int* src2 [[buffer(0)]],
+    device uint* htpe [[buffer(1)]],
+    device int* hids [[buffer(2)]],
+    constant uint& n_tokens [[buffer(3)]],
+    ushort tpitg [[thread_position_in_threadgroup]],
+    ushort ntg [[threads_per_threadgroup]],
+    threadgroup ushort* shmem [[threadgroup(0)]]
+) { moe_mm_id_map0_impl<6>(src2, htpe, hids, n_tokens, tpitg, ntg, shmem); }
+
+kernel void moe_mm_id_map0_ne20_8(
+    device const int* src2 [[buffer(0)]],
+    device uint* htpe [[buffer(1)]],
+    device int* hids [[buffer(2)]],
+    constant uint& n_tokens [[buffer(3)]],
+    ushort tpitg [[thread_position_in_threadgroup]],
+    ushort ntg [[threads_per_threadgroup]],
+    threadgroup ushort* shmem [[threadgroup(0)]]
+) { moe_mm_id_map0_impl<8>(src2, htpe, hids, n_tokens, tpitg, ntg, shmem); }
+
 /// Gather rows for `mul_mm_id` host map0: `dst[i*dst_stride+j] =
 /// src[ids[i]*src_stride+j]`. One threadgroup per batch row.
 kernel void moe_gather_rows(
@@ -2836,6 +2920,154 @@ static inline void mul_mm_id_impl(
     }
 }
 
+// f16 src1 twin of `mul_mm_id_impl` (dense prefill `mul_mm_sg_f16` path).
+template<typename DQ>
+static inline void mul_mm_id_impl_f16(
+    device const uchar* src0,
+    device const half* src1,
+    device float* dst,
+    device const int* ids,
+    device const uint* tpe,
+    uint expert_stride,
+    uint n_rows,
+    uint n_cols,
+    uint top_k,
+    uint ids_stride,
+    uint row_bytes,
+    uint src1_per_slot,
+    threadgroup char* shmem,
+    uint3 tgpig,
+    ushort tiitg,
+    ushort tiisg,
+    ushort sgitg
+) {
+    threadgroup half* sa = (threadgroup half*)(shmem);
+    threadgroup half* sb = (threadgroup half*)(shmem + 4096);
+
+    constexpr short NR0 = 64;
+    constexpr short NR1 = 32;
+    constexpr short NK  = 32;
+    constexpr short NL0 = NK / 16;
+    constexpr short NL1 = NK / 8;
+    constexpr short NL  = DQ::NL;
+
+    const uint im = tgpig.z;
+    const int r0 = int(tgpig.y) * NR0;
+    const int r1 = int(tgpig.x) * NR1;
+
+    const int neh1 = int(tpe[im]);
+    if (r1 >= neh1) {
+        return;
+    }
+
+    const short nr0 = (int(n_rows) - r0 < NR0) ? short(int(n_rows) - r0) : NR0;
+    const short nr1 = (neh1 - r1 < NR1) ? short(neh1 - r1) : NR1;
+
+    const short lr0 = (short(tiitg) / NL0) < nr0 ? (short(tiitg) / NL0) : nr0 - 1;
+    const short lr1 = (short(tiitg) / NL1) < nr1 ? (short(tiitg) / NL1) : nr1 - 1;
+
+    const short il0 = short(tiitg) % NL0;
+    short il = il0;
+
+    const int id = ids[im * ids_stride + r1 + lr1];
+    const int src1_row = src1_per_slot != 0u ? id : (id / int(top_k));
+
+    device const uchar* row_base = src0 + (size_t)im * expert_stride;
+    device const uchar* x = row_base + (size_t)row_bytes * (r0 + lr0);
+
+    const short iy = 8 * (short(tiitg) % NL1);
+    device const half* y = src1 + (size_t)src1_row * n_cols + iy;
+
+    simdgroup_half8x8 ma[4];
+    simdgroup_half8x8 mb[2];
+    simdgroup_float8x8 mc[8];
+    for (short i = 0; i < 8; i++) {
+        mc[i] = make_filled_simdgroup_matrix<float, 8>(0.f);
+    }
+
+    for (uint loop_k = 0; loop_k < n_cols; loop_k += NK) {
+        float4x4 temp_a;
+        DQ::get(x, il, temp_a);
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+#pragma clang loop unroll(full)
+        for (short i = 0; i < 16; i++) {
+            const short sx = 2 * il0 + i / 8;
+            const short sy = (short(tiitg) / NL0) / 8;
+            const short lx = (short(tiitg) / NL0) % 8;
+            const short ly = i % 8;
+            const short ib = 8 * sx + sy;
+            *(sa + 64 * ib + 8 * ly + lx) = half(temp_a[i / 4][i % 4]);
+        }
+
+        {
+            const short sx = short(tiitg) % NL1;
+            const short sy = (short(tiitg) / NL1) / 8;
+            const short ly = (short(tiitg) / NL1) % 8;
+            const short ib = 4 * sx + sy;
+            *(threadgroup half2x4*)(sb + 64 * ib + 8 * ly) =
+                *(device const half2x4*)y;
+        }
+
+        il = (il + 2 < NL) ? il + 2 : il % 2;
+        if (il < 2) {
+            x += DQ::BLOCK_BYTES;
+        }
+        y += NK;
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        threadgroup const half* lsma = sa + 4 * 64 * (sgitg % 2);
+        threadgroup const half* lsmb = sb + 2 * 64 * (sgitg / 2);
+
+#pragma clang loop unroll(full)
+        for (short ik = 0; ik < NK / 8; ik++) {
+            simdgroup_barrier(mem_flags::mem_none);
+#pragma clang loop unroll(full)
+            for (short i = 0; i < 4; i++) {
+                simdgroup_load(ma[i], lsma + 64 * i, 8, 0, false);
+            }
+            simdgroup_barrier(mem_flags::mem_none);
+#pragma clang loop unroll(full)
+            for (short i = 0; i < 2; i++) {
+                simdgroup_load(mb[i], lsmb + 64 * i, 8, 0, false);
+            }
+            simdgroup_barrier(mem_flags::mem_none);
+#pragma clang loop unroll(full)
+            for (short i = 0; i < 8; i++) {
+                simdgroup_multiply_accumulate(mc[i], mb[i / 4], ma[i % 4], mc[i]);
+            }
+            lsma += 8 * 64;
+            lsmb += 4 * 64;
+        }
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    threadgroup float* temp_str = ((threadgroup float*)shmem)
+        + 32 * (sgitg & 1) + (16 * (sgitg >> 1)) * NR0;
+    for (short i = 0; i < 8; i++) {
+        simdgroup_store(mc[i], temp_str + 8 * (i % 4) + 8 * NR0 * (i / 4), NR0, 0, false);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (short j = sgitg; j < nr1; j += 4) {
+        const int sid = ids[im * ids_stride + r1 + j];
+        device float* D = dst + (size_t)sid * n_rows + r0;
+        device float4* D4 = (device float4*)D;
+        threadgroup float* C = ((threadgroup float*)shmem) + j * NR0;
+        threadgroup float4* C4 = (threadgroup float4*)C;
+        int i = int(tiisg);
+        for (; i < nr0 / 4; i += 32) {
+            D4[i] = C4[i];
+        }
+        i = (4 * (nr0 / 4)) + int(tiisg);
+        for (; i < nr0; i += 32) {
+            D[i] = C[i];
+        }
+    }
+}
+
 #define MUL_MM_ID_ENTRY(NAME, DQ)                                           \
 kernel void NAME(                                                           \
     device const uchar* src0 [[buffer(0)]],                                 \
@@ -2859,6 +3091,31 @@ kernel void NAME(                                                           \
     mul_mm_id_impl<DQ>(src0, src1, dst, ids, tpe, expert_stride, n_rows,   \
                        n_cols, top_k, ids_stride, row_bytes, src1_per_slot,  \
                        shmem, tgpig, tiitg, tiisg, sgitg);                  \
+}
+
+#define MUL_MM_ID_F16_ENTRY(NAME, DQ)                                       \
+kernel void NAME(                                                           \
+    device const uchar* src0 [[buffer(0)]],                                 \
+    device const half* src1 [[buffer(1)]],                                  \
+    device float* dst [[buffer(2)]],                                        \
+    device const int* ids [[buffer(3)]],                                    \
+    device const uint* tpe [[buffer(4)]],                                   \
+    constant uint& n_rows [[buffer(5)]],                                    \
+    constant uint& n_cols [[buffer(6)]],                                    \
+    constant uint& top_k [[buffer(7)]],                                     \
+    constant uint& ids_stride [[buffer(8)]],                                \
+    constant uint& row_bytes [[buffer(9)]],                                 \
+    constant uint& expert_stride [[buffer(10)]],                            \
+    constant uint& src1_per_slot [[buffer(11)]],                            \
+    threadgroup char* shmem [[threadgroup(0)]],                             \
+    uint3 tgpig [[threadgroup_position_in_grid]],                           \
+    ushort tiitg [[thread_index_in_threadgroup]],                           \
+    ushort tiisg [[thread_index_in_simdgroup]],                             \
+    ushort sgitg [[simdgroup_index_in_threadgroup]]                         \
+) {                                                                         \
+    mul_mm_id_impl_f16<DQ>(src0, src1, dst, ids, tpe, expert_stride, n_rows, \
+                           n_cols, top_k, ids_stride, row_bytes,             \
+                           src1_per_slot, shmem, tgpig, tiitg, tiisg, sgitg); \
 }
 
 #define MUL_MM_SG_ENTRY(NAME, DQ)                                           \
@@ -2907,6 +3164,9 @@ MUL_MM_SG_ENTRY(iq4_xs_mul_mm_sg, IQ4XSDequant)
 MUL_MM_ID_ENTRY(q4_0_mul_mm_id, Q4_0Dequant)
 MUL_MM_ID_ENTRY(q4_k_mul_mm_id, Q4KDequant)
 MUL_MM_ID_ENTRY(q8_0_mul_mm_id, Q8_0Dequant)
+MUL_MM_ID_F16_ENTRY(q4_0_mul_mm_id_f16, Q4_0Dequant)
+MUL_MM_ID_F16_ENTRY(q4_k_mul_mm_id_f16, Q4KDequant)
+MUL_MM_ID_F16_ENTRY(q8_0_mul_mm_id_f16, Q8_0Dequant)
 MUL_MM_SG_F16_ENTRY(q4_k_mul_mm_sg_f16, Q4KDequant)
 MUL_MM_SG_F16_ENTRY(q6_k_mul_mm_sg_f16, Q6KDequant)
 MUL_MM_SG_F16_ENTRY(q5_k_mul_mm_sg_f16, Q5KDequant)
@@ -3192,6 +3452,185 @@ pub fn mul_mm_id_meta(kind: &str) -> Option<(&'static str, usize, usize)> {
         "Q4_0" => Some(("q4_0_mul_mm_id", 18, 32)),
         _ => None,
     }
+}
+
+pub fn mul_mm_id_f16_meta(kind: &str) -> Option<(&'static str, usize, usize)> {
+    mul_mm_id_meta(kind).map(|(base, bb, be)| {
+        (
+            match base {
+                "q4_k_mul_mm_id" => "q4_k_mul_mm_id_f16",
+                "q8_0_mul_mm_id" => "q8_0_mul_mm_id_f16",
+                "q4_0_mul_mm_id" => "q4_0_mul_mm_id_f16",
+                _ => base,
+            },
+            bb,
+            be,
+        )
+    })
+}
+
+fn moe_mm_id_map0_fn(top_k: usize) -> Option<&'static str> {
+    match top_k {
+        2 => Some("moe_mm_id_map0_ne20_2"),
+        4 => Some("moe_mm_id_map0_ne20_4"),
+        6 => Some("moe_mm_id_map0_ne20_6"),
+        8 => Some("moe_mm_id_map0_ne20_8"),
+        _ => None,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_moe_mm_id_map0(
+    enc: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+    device: &Retained<ProtocolObject<dyn MTLDevice>>,
+    route_ids: &ProtocolObject<dyn MTLBuffer>,
+    tpe_buf: &ProtocolObject<dyn MTLBuffer>,
+    mm_ids_buf: &ProtocolObject<dyn MTLBuffer>,
+    n_experts: u32,
+    n_tokens: u32,
+    top_k: usize,
+) -> Result<(), MetalError> {
+    let fn_name = moe_mm_id_map0_fn(top_k).ok_or(MetalError::CommandFailed)?;
+    let pipeline = ensure_pipeline(device, Q4_0_MOE_TOPK_KERNEL_SRC, fn_name)?;
+    let smem = (n_experts as usize) * top_k * 2;
+    enc.setComputePipelineState(&pipeline.0);
+    unsafe {
+        enc.setBuffer_offset_atIndex(Some(route_ids), 0, 0);
+        enc.setBuffer_offset_atIndex(Some(tpe_buf), 0, 1);
+        enc.setBuffer_offset_atIndex(Some(mm_ids_buf), 0, 2);
+        let mut nt = n_tokens;
+        enc.setBytes_length_atIndex(
+            NonNull::new(&mut nt as *mut u32 as *mut _).unwrap(),
+            4,
+            3,
+        );
+        enc.setThreadgroupMemoryLength_atIndex(smem, 0);
+    }
+    enc.dispatchThreadgroups_threadsPerThreadgroup(
+        MTLSize {
+            width: 1,
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width: n_experts as usize,
+            height: 1,
+            depth: 1,
+        },
+    );
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_mul_mm_id_f16(
+    enc: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+    device: &Retained<ProtocolObject<dyn MTLDevice>>,
+    fn_name: &'static str,
+    w: &ResidentWeightBuffer,
+    expert_stride: u32,
+    x_h: &ProtocolObject<dyn MTLBuffer>,
+    out_buf: &ProtocolObject<dyn MTLBuffer>,
+    ids_buf: &ProtocolObject<dyn MTLBuffer>,
+    tpe_buf: &ProtocolObject<dyn MTLBuffer>,
+    n_experts: u32,
+    n_tokens: u32,
+    top_k: u32,
+    rows: u32,
+    cols: u32,
+    row_bytes: u32,
+    src1_per_slot: u32,
+) -> Result<(), MetalError> {
+    let pipeline = ensure_pipeline(device, K_QUANT_MUL_MM_SG_KERNEL_SRC, fn_name)?;
+    unsafe {
+        enc.setComputePipelineState(&pipeline.0);
+        enc.setBuffer_offset_atIndex(Some(&w.buffer), w.weight_offset, 0);
+        enc.setBuffer_offset_atIndex(Some(x_h), 0, 1);
+        enc.setBuffer_offset_atIndex(Some(out_buf), 0, 2);
+        enc.setBuffer_offset_atIndex(Some(ids_buf), 0, 3);
+        enc.setBuffer_offset_atIndex(Some(tpe_buf), 0, 4);
+        for (idx, mut v) in [
+            (5usize, rows),
+            (6, cols),
+            (7, top_k),
+            (8, n_tokens),
+            (9, row_bytes),
+            (10, expert_stride),
+            (11, src1_per_slot),
+        ] {
+            enc.setBytes_length_atIndex(
+                NonNull::new(&mut v as *mut u32 as *mut _).unwrap(),
+                4,
+                idx,
+            );
+        }
+        enc.setThreadgroupMemoryLength_atIndex(8192, 0);
+        enc.dispatchThreadgroups_threadsPerThreadgroup(
+            MTLSize {
+                width: (n_tokens as usize).div_ceil(32),
+                height: (rows as usize).div_ceil(64),
+                depth: n_experts as usize,
+            },
+            MTLSize {
+                width: 128,
+                height: 1,
+                depth: 1,
+            },
+        );
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_moe_prefill_weighted_sum(
+    encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+    device: &Retained<ProtocolObject<dyn MTLDevice>>,
+    expert_out_buf: &ProtocolObject<dyn MTLBuffer>,
+    route_buf: &ProtocolObject<dyn MTLBuffer>,
+    out_buf: &ProtocolObject<dyn MTLBuffer>,
+    hidden_rows: u32,
+    top_k: u32,
+    n_tokens: u32,
+) -> Result<(), MetalError> {
+    const SUM_TG: usize = 256;
+    let weighted_sum = ensure_pipeline(device, Q4_0_MOE_TOPK_KERNEL_SRC, "moe_weighted_sum")?;
+    encoder.setComputePipelineState(&weighted_sum.0);
+    unsafe {
+        encoder.setBuffer_offset_atIndex(Some(expert_out_buf), 0, 0);
+        encoder.setBuffer_offset_atIndex(Some(route_buf), 0, 1);
+        encoder.setBuffer_offset_atIndex(Some(out_buf), 0, 2);
+        let mut hr = hidden_rows;
+        encoder.setBytes_length_atIndex(
+            NonNull::new(&mut hr as *mut u32 as *mut _).unwrap(),
+            4,
+            3,
+        );
+        let mut tk = top_k;
+        encoder.setBytes_length_atIndex(
+            NonNull::new(&mut tk as *mut u32 as *mut _).unwrap(),
+            4,
+            4,
+        );
+        let mut nt = n_tokens;
+        encoder.setBytes_length_atIndex(
+            NonNull::new(&mut nt as *mut u32 as *mut _).unwrap(),
+            4,
+            5,
+        );
+    }
+    let sum_elems = (n_tokens as usize) * (hidden_rows as usize);
+    encoder.dispatchThreadgroups_threadsPerThreadgroup(
+        MTLSize {
+            width: sum_elems.div_ceil(SUM_TG),
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width: SUM_TG,
+            height: 1,
+            depth: 1,
+        },
+    );
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5543,11 +5982,18 @@ struct MoePrefillScratch {
     ffn: usize,
     hidden: usize,
     n_tokens: usize,
+    n_experts: usize,
     act: Retained<ProtocolObject<dyn MTLBuffer>>,
     gate: Retained<ProtocolObject<dyn MTLBuffer>>,
     up: Retained<ProtocolObject<dyn MTLBuffer>>,
     expert_out: Retained<ProtocolObject<dyn MTLBuffer>>,
     out: Retained<ProtocolObject<dyn MTLBuffer>>,
+    /// GPU map0: tokens-per-expert `[n_experts]`.
+    mm_id_tpe: Retained<ProtocolObject<dyn MTLBuffer>>,
+    /// GPU map0: slot ids `[n_experts, n_tokens]`.
+    mm_id_ids: Retained<ProtocolObject<dyn MTLBuffer>>,
+    /// f16 activations for `mul_mm_id_f16` (size ≥ `n_slots * ffn`).
+    half_in: Retained<ProtocolObject<dyn MTLBuffer>>,
     contig_in: Retained<ProtocolObject<dyn MTLBuffer>>,
     contig_out: Retained<ProtocolObject<dyn MTLBuffer>>,
 }
@@ -5562,22 +6008,29 @@ fn moe_prefill_scratch(
     n_slots: usize,
     ffn: usize,
     hidden: usize,
+    n_experts: usize,
 ) -> Result<(), MetalError> {
     TL_MOE_PREFILL.with(|cell| {
         let mut slot = cell.borrow_mut();
         let need = match slot.as_ref() {
             None => true,
             Some(s) => {
-                s.n_slots < n_slots || s.ffn < ffn || s.hidden < hidden || s.n_tokens < n_tokens
+                s.n_slots < n_slots
+                    || s.ffn < ffn
+                    || s.hidden < hidden
+                    || s.n_tokens < n_tokens
+                    || s.n_experts < n_experts
             }
         };
         if need {
             let contig_elems = n_slots * ffn.max(hidden);
+            let half_elems = (n_tokens * hidden).max(n_slots * ffn);
             *slot = Some(MoePrefillScratch {
                 n_slots,
                 ffn,
                 hidden,
                 n_tokens,
+                n_experts,
                 act: device
                     .newBufferWithLength_options(
                         n_slots * ffn * 4,
@@ -5605,6 +6058,24 @@ fn moe_prefill_scratch(
                 out: device
                     .newBufferWithLength_options(
                         n_tokens * hidden * 4,
+                        MTLResourceOptions::StorageModeShared,
+                    )
+                    .ok_or(MetalError::BufferAllocFailed)?,
+                mm_id_tpe: device
+                    .newBufferWithLength_options(
+                        n_experts * 4,
+                        MTLResourceOptions::StorageModeShared,
+                    )
+                    .ok_or(MetalError::BufferAllocFailed)?,
+                mm_id_ids: device
+                    .newBufferWithLength_options(
+                        n_experts * n_tokens * 4,
+                        MTLResourceOptions::StorageModeShared,
+                    )
+                    .ok_or(MetalError::BufferAllocFailed)?,
+                half_in: device
+                    .newBufferWithLength_options(
+                        half_elems * 2,
                         MTLResourceOptions::StorageModeShared,
                     )
                     .ok_or(MetalError::BufferAllocFailed)?,
@@ -6166,7 +6637,7 @@ pub fn launch_moe_prefill_q4_0(
         )
     }
     .ok_or(MetalError::BufferAllocFailed)?;
-    moe_prefill_scratch(device, n_tokens, n_slots, ffn, hidden)?;
+    moe_prefill_scratch(device, n_tokens, n_slots, ffn, hidden, packed.n_experts)?;
 
     let result = TL_MOE_PREFILL.with(|cell| {
         let scratch = cell.borrow();
@@ -6176,13 +6647,15 @@ pub fn launch_moe_prefill_q4_0(
         let up_buf = scratch.up.as_ref();
         let expert_out_buf = scratch.expert_out.as_ref();
         let out_buf = scratch.out.as_ref();
+            let mm_id_tpe_buf: &ProtocolObject<dyn MTLBuffer> = scratch.mm_id_tpe.as_ref();
+            let mm_id_ids_buf: &ProtocolObject<dyn MTLBuffer> = scratch.mm_id_ids.as_ref();
 
         let cmd_buf = queue.commandBuffer().ok_or(MetalError::CommandFailed)?;
-        let encoder = cmd_buf
-            .computeCommandEncoder()
-            .ok_or(MetalError::CommandFailed)?;
 
         if use_mm_id {
+            let encoder = cmd_buf
+                .computeCommandEncoder()
+                .ok_or(MetalError::CommandFailed)?;
             let bound = moe_packed_resident(device, packed)?;
             let (gate_fn, gate_bb, gate_be) =
                 mul_mm_id_meta(packed.gate_kind).ok_or(MetalError::CommandFailed)?;
@@ -6200,30 +6673,26 @@ pub fn launch_moe_prefill_q4_0(
             let up_cols = ((up_row_bytes / up_bb) * up_be) as u32;
             let down_cols = ((packed.down_row_bytes / down_bb) * down_be) as u32;
 
-            let mut tpe = vec![0u32; packed.n_experts];
-            let mut mm_ids = vec![0i32; packed.n_experts * n_tokens];
+            let mut tpe_host = vec![0u32; packed.n_experts];
+            let mut ids_host = vec![0i32; packed.n_experts * n_tokens];
             for (eid, list) in per_expert.iter().enumerate() {
-                tpe[eid] = list.len() as u32;
+                tpe_host[eid] = list.len() as u32;
                 for (i, &(_token, slot)) in list.iter().enumerate() {
-                    mm_ids[eid * n_tokens + i] = slot;
+                    ids_host[eid * n_tokens + i] = slot;
                 }
             }
-            let tpe_buf = unsafe {
-                device.newBufferWithBytes_length_options(
-                    NonNull::new(tpe.as_mut_ptr() as *mut _).unwrap(),
-                    tpe.len() * 4,
-                    MTLResourceOptions::StorageModeShared,
-                )
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    tpe_host.as_ptr(),
+                    mm_id_tpe_buf.contents().as_ptr() as *mut u32,
+                    tpe_host.len(),
+                );
+                std::ptr::copy_nonoverlapping(
+                    ids_host.as_ptr(),
+                    mm_id_ids_buf.contents().as_ptr() as *mut i32,
+                    ids_host.len(),
+                );
             }
-            .ok_or(MetalError::BufferAllocFailed)?;
-            let mm_ids_buf = unsafe {
-                device.newBufferWithBytes_length_options(
-                    NonNull::new(mm_ids.as_mut_ptr() as *mut _).unwrap(),
-                    mm_ids.len() * 4,
-                    MTLResourceOptions::StorageModeShared,
-                )
-            }
-            .ok_or(MetalError::BufferAllocFailed)?;
 
             encode_mul_mm_id(
                 &encoder,
@@ -6233,8 +6702,8 @@ pub fn launch_moe_prefill_q4_0(
                 packed.gate_stride as u32,
                 &x_buf,
                 gate_buf,
-                &mm_ids_buf,
-                &tpe_buf,
+                mm_id_ids_buf,
+                mm_id_tpe_buf,
                 n_experts_u,
                 n_tokens_u,
                 top_k_u,
@@ -6243,7 +6712,6 @@ pub fn launch_moe_prefill_q4_0(
                 packed.gate_row_bytes as u32,
                 0,
             )?;
-            memory_barrier_resources(&encoder, &[gate_buf]);
             encode_mul_mm_id(
                 &encoder,
                 device,
@@ -6252,8 +6720,8 @@ pub fn launch_moe_prefill_q4_0(
                 packed.up_stride as u32,
                 &x_buf,
                 up_buf,
-                &mm_ids_buf,
-                &tpe_buf,
+                mm_id_ids_buf,
+                mm_id_tpe_buf,
                 n_experts_u,
                 n_tokens_u,
                 top_k_u,
@@ -6280,8 +6748,8 @@ pub fn launch_moe_prefill_q4_0(
                 packed.down_stride as u32,
                 act_buf,
                 expert_out_buf,
-                &mm_ids_buf,
-                &tpe_buf,
+                mm_id_ids_buf,
+                mm_id_tpe_buf,
                 n_experts_u,
                 n_tokens_u,
                 top_k_u,
@@ -6291,30 +6759,23 @@ pub fn launch_moe_prefill_q4_0(
                 1,
             )?;
             memory_barrier_resources(&encoder, &[expert_out_buf]);
-            encode_q4_0_moe_id_ex(
+            encode_moe_prefill_weighted_sum(
                 &encoder,
                 device,
-                &x_buf,
-                packed,
-                &ids_buf,
-                &route_buf,
-                gate_buf,
-                up_buf,
-                act_buf,
                 expert_out_buf,
+                &route_buf,
                 out_buf,
+                hidden_u,
                 top_k_u,
                 n_tokens_u,
-                false,
-                true,
-                true,
-                true,
             )?;
             encoder.endEncoding();
             cmd_buf.commit();
             cmd_buf.waitUntilCompleted();
-            let _keep = (tpe, mm_ids);
         } else {
+            let encoder = cmd_buf
+                .computeCommandEncoder()
+                .ok_or(MetalError::CommandFailed)?;
             encode_q4_0_moe_id(
                 &encoder,
                 device,

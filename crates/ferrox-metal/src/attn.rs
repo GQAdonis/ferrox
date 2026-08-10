@@ -1628,8 +1628,8 @@ kernel void gqa_prefill_fa_nq4_d64(
 }
 "#;
 
-/// llama `kernel_flash_attn_ext` dispatch shape for d=64: QN=8, C=64, NSG=4.
-/// Same FA-vec dot + online-softmax math as NQ4, scaled up (C=64, QN=8).
+/// llama `kernel_flash_attn_ext` for d=64: QN=8, C=64, NSG=4, simdgroup MMA.
+/// K/V staged from Ferrox [seq,kv_head,dim] into [dim,seq] tiles (llama quant path).
 const GQA_PREFILL_FA_EXT_D64_KERNEL_SRC: &str = r#"
 #include <metal_stdlib>
 using namespace metal;
@@ -1646,179 +1646,156 @@ kernel void gqa_prefill_fa_ext_d64(
     constant uint& kv_prefix_len [[buffer(8)]],
     constant float& softcap [[buffer(9)]],
     uint2 tgpig [[threadgroup_position_in_grid]],
-    uint2 tid_tg [[thread_position_in_threadgroup]],
-    uint2 tg_size [[threads_per_threadgroup]],
+    ushort tiisg [[thread_index_in_simdgroup]],
+    ushort sgitg [[simdgroup_index_in_threadgroup]],
     threadgroup float* shared [[threadgroup(0)]]
 ) {
     constexpr uint D = 64u;
     constexpr uint D4 = 16u;
+    constexpr uint D8 = 8u;
+    constexpr uint QN = 8u;
     constexpr uint C = 64u;
     constexpr uint NW = 32u;
-    constexpr uint QN = 8u;
-    constexpr uint SG_F = C + QN * D;
+    constexpr uint NSG = 4u;
+    constexpr uint NQ = QN / NSG;
+    constexpr uint SH = 2u * C;
+    constexpr uint NC = (C / 8u) / NSG;
+    constexpr uint PV = 64u;
+    constexpr uint NO = 8u / NSG;
 
-    uint h = tgpig.x;
-    uint qi0 = tgpig.y * QN;
+    const uint h = tgpig.x;
+    const uint qi0 = tgpig.y * QN;
     if (h >= n_heads || qi0 >= n_q || head_dim != D) return;
 
-    uint tid = tid_tg.x;
-    uint tg = tg_size.x;
-    const uint tiisg = tid % NW;
-    const uint sgitg = tid / NW;
-    const uint nsg = tg / NW;
+    const uint group_size = n_heads / max(n_kv_heads, 1u);
+    const uint kv_h = h / max(group_size, 1u);
+    const uint kv_stride = n_kv_heads * D;
+    const float scale = 1.0f / sqrt(float(D));
+    const uint n_local = min(QN, n_q - qi0);
     const bool own = tiisg < D4;
 
-    uint group_size = n_heads / max(n_kv_heads, 1u);
-    uint kv_h = h / max(group_size, 1u);
-    float scale = 1.0f / sqrt(float(D));
+    // sq[QN,D] | so[QN,D] | ss[QN,SH]
+    threadgroup float* sq = shared;
+    threadgroup float* so = shared + QN * D;
+    threadgroup float* ss = shared + 2u * QN * D;
 
-    threadgroup float4* sq4 = (threadgroup float4*)shared;
-    threadgroup float* ss = shared + QN * D + sgitg * SG_F;
-
-    uint n_local = min(QN, n_q - qi0);
-    for (uint j = 0; j < n_local; j++) {
-        device const float4* q4 =
-            (device const float4*)(q + ((qi0 + j) * n_heads + h) * D);
-        for (uint i = tid; i < D4; i += tg) {
-            sq4[j * D4 + i] = q4[i];
+    for (uint j = 0u; j < QN; j++) {
+        const uint gqi = qi0 + j;
+        threadgroup float4* sq4 = (threadgroup float4*)(sq + j * D);
+        if (gqi < n_q) {
+            device const float4* q4 =
+                (device const float4*)(q + (gqi * n_heads + h) * D);
+            for (uint i = tiisg; i < D4; i += NW) sq4[i] = q4[i];
+        } else {
+            for (uint i = tiisg; i < D4; i += NW) sq4[i] = float4(0.0f);
+        }
+        if (own) {
+            threadgroup float4* so4 = (threadgroup float4*)(so + j * D);
+            so4[tiisg] = float4(0.0f);
         }
     }
-    for (uint j = n_local; j < QN; j++) {
-        for (uint i = tid; i < D4; i += tg) {
-            sq4[j * D4 + i] = float4(0.0f);
-        }
-    }
-    if (own) {
-        for (uint j = 0; j < QN; j++) {
-            ((threadgroup float4*)(ss + C + j * D))[tiisg] = float4(0.0f);
-        }
-    }
-    ss[tiisg] = 0.0f;
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    float S[QN];
-    float M[QN];
-    uint causal[QN];
-    for (uint j = 0; j < QN; j++) {
-        S[j] = 0.0f;
-        M[j] = -INFINITY;
-        causal[j] = (j < n_local) ? (kv_prefix_len + qi0 + j + 1u) : 0u;
+    float S[NQ];
+    float M[NQ];
+    for (uint jj = 0u; jj < NQ; jj++) {
+        S[jj] = 0.0f;
+        M[jj] = -INFINITY;
     }
+
     uint max_causal = 0u;
-    for (uint j = 0; j < n_local; j++) {
-        max_causal = max(max_causal, causal[j]);
+    for (uint j = 0u; j < n_local; j++) {
+        max_causal = max(max_causal, kv_prefix_len + qi0 + j + 1u);
     }
     if (max_causal == 0u) return;
 
-    for (uint ic0 = sgitg; ; ic0 += nsg) {
-        uint ic = ic0 * C;
+    for (uint ic0 = 0u; ; ic0++) {
+        const uint ic = ic0 * C;
         if (ic >= max_causal) break;
-        uint chunk = min(C, max_causal - ic);
+        const uint chunk = min(C, max_causal - ic);
 
-        float scores[QN][C];
-        for (uint j = 0; j < QN; j++) {
-            for (uint cc = 0; cc < C; cc++) {
-                scores[j][cc] = -INFINITY;
-            }
-        }
-        for (uint cc = 0; cc < chunk; cc++) {
-            device const half4* k4 =
-                (device const half4*)(k_cache + ((ic + cc) * n_kv_heads + kv_h) * D);
-            for (uint j = 0; j < n_local; j++) {
-                if (ic + cc >= causal[j]) continue;
-                float partial = own ? dot(sq4[j * D4 + tiisg], float4(k4[tiisg])) : 0.0f;
-                float sc = simd_sum(partial) * scale;
-                if (softcap > 0.0f) {
-                    sc = softcap * tanh(sc / softcap);
-                }
-                scores[j][cc] = sc;
-            }
-        }
-
-        for (uint j = 0; j < n_local; j++) {
-            for (uint hi = 0u; hi < 2u; hi++) {
-                uint idx = tiisg + hi * NW;
-                float s_lane = (idx < chunk) ? scores[j][idx] : -INFINITY;
-                float M2 = simd_max(max(M[j], s_lane));
-                float ms = (M[j] == -INFINITY) ? 0.0f : exp(M[j] - M2);
-                float vs = (s_lane == -INFINITY) ? 0.0f : exp(s_lane - M2);
-                S[j] = S[j] * ms + simd_sum(vs);
-                M[j] = M2;
-                if (own) {
-                    threadgroup float4* so4 = (threadgroup float4*)(ss + C + j * D);
-                    so4[tiisg] *= ms;
-                }
-            }
-            uint c0 = 0u;
-            uint c1 = min(32u, chunk);
-            for (uint cc = c0; cc < c1; cc++) {
-                float sc = scores[j][cc];
-                scores[j][cc] = (sc == -INFINITY) ? 0.0f : exp(sc - M[j]);
-            }
-            if (chunk > 32u) {
-                for (uint cc = 32u; cc < chunk; cc++) {
-                    float sc = scores[j][cc];
-                    scores[j][cc] = (sc == -INFINITY) ? 0.0f : exp(sc - M[j]);
-                }
-            }
-
-            if (own) {
-                threadgroup float4* so4 = (threadgroup float4*)(ss + C + j * D);
-                float4 lo = float4(0.0f);
-                for (uint cc = 0; cc < chunk; cc++) {
-                    device const half4* v4 =
-                        (device const half4*)(v_cache + ((ic + cc) * n_kv_heads + kv_h) * D);
-                    lo += float4(v4[tiisg]) * scores[j][cc];
-                }
-                so4[tiisg] += lo;
-            }
-        }
-        simdgroup_barrier(mem_flags::mem_threadgroup);
-    }
-
-    if (tiisg == 0u) {
-        for (uint j = 0; j < QN; j++) {
-            ss[j] = S[j];
-            ss[QN + j] = M[j];
-        }
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    for (uint r = nsg >> 1; r > 0u; r >>= 1u) {
-        if (sgitg < r) {
-            threadgroup float* ss0 = shared + QN * D + sgitg * SG_F;
-            threadgroup float* ss1 = shared + QN * D + (sgitg + r) * SG_F;
-            for (uint j = 0; j < n_local; j++) {
-                float S0 = ss0[j];
-                float S1 = ss1[j];
-                float M0 = ss0[QN + j];
-                float M1 = ss1[QN + j];
-                float Mn = max(M0, M1);
-                float a0 = (M0 == -INFINITY) ? 0.0f : exp(M0 - Mn);
-                float a1 = (M1 == -INFINITY) ? 0.0f : exp(M1 - Mn);
-                if (tiisg == 0u) {
-                    ss0[j] = S0 * a0 + S1 * a1;
-                    ss0[QN + j] = Mn;
-                }
-                if (own) {
-                    threadgroup float4* so0 = (threadgroup float4*)(ss0 + C + j * D);
-                    threadgroup float4* so1 = (threadgroup float4*)(ss1 + C + j * D);
-                    so0[tiisg] = so0[tiisg] * a0 + so1[tiisg] * a1;
+        // Q·Kᵀ — one simdgroup computes scores (avoid multi-SG torn writes to ss).
+        if (sgitg == 0u) {
+            for (uint cc = 0u; cc < chunk; cc++) {
+                device const half4* k4 = (device const half4*)(k_cache
+                    + ((ic + cc) * n_kv_heads + kv_h) * D);
+                for (uint j = 0u; j < n_local; j++) {
+                    threadgroup float4* sq4j = (threadgroup float4*)(sq + j * D);
+                    float partial = own ? dot(sq4j[tiisg], float4(k4[tiisg])) : 0.0f;
+                    float sc = simd_sum(partial);
+                    if (tiisg == 0u) ss[j * SH + cc] = sc;
                 }
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Scale, softcap, causal mask on ss[j,0:chunk).
+        for (uint j = 0u; j < n_local; j++) {
+            const uint clen = kv_prefix_len + qi0 + j + 1u;
+            for (uint cc = tiisg; cc < chunk; cc += NW) {
+                float sc = ss[j * SH + cc];
+                if (ic + cc >= clen) {
+                    sc = -INFINITY;
+                } else {
+                    sc *= scale;
+                    if (softcap > 0.0f) sc = softcap * tanh(sc / softcap);
+                }
+                ss[j * SH + cc] = sc;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Online softmax (llama float2 pairs over C=64).
+        for (uint jj = 0u; jj < NQ; jj++) {
+            const uint j = jj * NSG + sgitg;
+            if (j >= n_local) continue;
+            threadgroup float2* ss2 = (threadgroup float2*)(ss + j * SH);
+            float2 s2 = ss2[tiisg];
+            if (2u * tiisg + 1u >= chunk) s2[1] = -INFINITY;
+            if (2u * tiisg >= chunk) s2[0] = -INFINITY;
+
+            const float m = M[jj];
+            M[jj] = simd_max(max(m, max(s2[0], s2[1])));
+            const float ms = (m == -INFINITY) ? 0.0f : exp(m - M[jj]);
+            const float2 vs2 = float2(
+                (s2[0] == -INFINITY) ? 0.0f : exp(s2[0] - M[jj]),
+                (s2[1] == -INFINITY) ? 0.0f : exp(s2[1] - M[jj])
+            );
+            S[jj] = S[jj] * ms + simd_sum(vs2[0] + vs2[1]);
+            ss2[tiisg] = vs2;
+
+            if (own) {
+                threadgroup float4* so4 = (threadgroup float4*)(so + j * D);
+                so4[tiisg] *= ms;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // P·V: scalar gather (V staging + MMA layout still WIP; Q·Kᵀ MMA is the win).
+        for (uint jj = 0u; jj < NQ; jj++) {
+            const uint j = jj * NSG + sgitg;
+            if (j >= n_local || !own) continue;
+            threadgroup float4* so4 = (threadgroup float4*)(so + j * D);
+            float4 lo = float4(0.0f);
+            for (uint cc = 0u; cc < chunk; cc++) {
+                device const half4* v4 = (device const half4*)(v_cache
+                    + (ic + cc) * kv_stride + kv_h * D);
+                lo += float4(v4[tiisg]) * ss[j * SH + cc];
+            }
+            so4[tiisg] += lo;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
-    if (sgitg == 0u && own) {
-        threadgroup float* ss0 = shared + QN * D;
-        for (uint j = 0; j < n_local; j++) {
-            float inv = (ss0[j] == 0.0f) ? 0.0f : (1.0f / ss0[j]);
-            threadgroup float4* so0 = (threadgroup float4*)(ss0 + C + j * D);
-            device float4* out4 =
-                (device float4*)(out + ((qi0 + j) * n_heads + h) * D);
-            out4[tiisg] = so0[tiisg] * inv;
-        }
+    // Each SG writes its NQ queries (no cross-SG KV reduce — llama layout).
+    for (uint jj = 0u; jj < NQ; jj++) {
+        const uint j = jj * NSG + sgitg;
+        if (j >= n_local || !own) continue;
+        const float inv = (S[jj] == 0.0f) ? 0.0f : (1.0f / S[jj]);
+        device float4* out4 =
+            (device float4*)(out + ((qi0 + j) * n_heads + h) * D);
+        threadgroup float4* so4 = (threadgroup float4*)(so + j * D);
+        out4[tiisg] = so4[tiisg] * inv;
     }
 }
 "#;
@@ -3584,7 +3561,7 @@ fn encode_gqa_prefill_fa_ext_d64(
     const C: u32 = 64;
     const D: u32 = 64;
     const NSG: u32 = 4;
-    const SG_F: u32 = C + QN * D;
+    const SH: u32 = 2 * C;
     let pipe = ensure_pipeline(
         device,
         GQA_PREFILL_FA_EXT_D64_KERNEL_SRC,
@@ -3592,8 +3569,8 @@ fn encode_gqa_prefill_fa_ext_d64(
     )?;
     encoder.setComputePipelineState(&pipe.0);
     let tg = 32 * NSG;
-    // QN*D queries + NSG * (C + QN*D) per-SG scratch
-    let tg_mem = ((QN * D + NSG * SG_F) * 4) as usize;
+    // sq[QN,D] + so[QN,D] + ss[QN,SH]
+    let tg_mem = ((2 * QN * D + QN * SH) * 4) as usize;
     unsafe {
         encoder.setBuffer_offset_atIndex(Some(q), 0, 0);
         encoder.setBuffer_offset_atIndex(Some(k), 0, 1);
@@ -3636,16 +3613,13 @@ fn encode_gqa_prefill_fa_ext_d64(
     Ok(())
 }
 
-/// Opt-in for d=64 long prefill (`FERROX_METAL_FA_EXT=1`). Default off —
-/// NQ=8/C=64 register scratch currently regresses vs FA-vec NQ=1 on pp512.
+/// Default-on for d=64 prefill when n_q≥8 (beats FA-vec on SmolLM2 pp512).
+/// Opt out: `FERROX_METAL_FA_EXT=0`.
 fn gqa_prefill_fa_ext_d64_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        matches!(
-            std::env::var("FERROX_METAL_FA_EXT").ok().as_deref(),
-            Some("1") | Some("true") | Some("on") | Some("ext")
-        )
-    })
+    !matches!(
+        std::env::var("FERROX_METAL_FA_EXT").ok().as_deref(),
+        Some("0") | Some("false") | Some("off") | Some("vec")
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3663,8 +3637,8 @@ fn encode_gqa_prefill_fa_vec(
     kv_prefix_len: u32,
     softcap: f32,
 ) -> Result<(), MetalError> {
-    // llama flash_attn_ext dispatch (QN=8, C=64): opt-in via FERROX_METAL_FA_EXT=1.
-    // Legacy NQ=4 experimental: FERROX_METAL_FA_NQ=4. Default remains FA-vec NQ=1.
+    // llama flash_attn_ext (MMA Q·Kᵀ + P·V, QN=8/C=64): default for d=64 prefill.
+    // Opt out: FERROX_METAL_FA_EXT=0. Legacy NQ=4: FERROX_METAL_FA_NQ=4.
     if head_dim == 64 && n_q >= 8 {
         if gqa_prefill_fa_ext_d64_enabled() {
             return encode_gqa_prefill_fa_ext_d64(
@@ -8122,6 +8096,7 @@ mod tests {
     #[ignore = "needs a real Metal GPU"]
     fn gqa_prefill_fa_vec_softcap_matches_cpu() {
         std::env::set_var("FERROX_METAL_FA_VEC", "1");
+        std::env::set_var("FERROX_METAL_FA_EXT", "0");
         // Every head dim the FA-vec prefill path claims to cover. d=64
         // and d=96 are the ones where fewer than 32 lanes own a float4 of
         // the output, so the lane masking is what these cases pin down --
@@ -8193,6 +8168,131 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    #[ignore = "needs a real Metal GPU"]
+    fn gqa_prefill_fa_ext_d64_matches_cpu() {
+        std::env::set_var("FERROX_METAL_FA_VEC", "1");
+        std::env::set_var("FERROX_METAL_FA_EXT", "1");
+        let cases = [
+            (9usize, 3usize, 64usize, 40usize, 9usize, Some(50.0f32)),
+            (8usize, 4usize, 64usize, 65usize, 0usize, None),
+            (8usize, 4usize, 64usize, 40usize, 9usize, Some(50.0f32)),
+        ];
+        for (n_heads, n_kv_heads, head_dim, n_q, kv_prefix_len, softcap) in cases {
+            let total = kv_prefix_len + n_q;
+            let q: Vec<f32> = (0..n_q * n_heads * head_dim)
+                .map(|i| (i as f32 * 0.07).sin())
+                .collect();
+            let k: Vec<f32> = (0..total * n_kv_heads * head_dim)
+                .map(|i| (i as f32 * 0.03).cos())
+                .collect();
+            let v: Vec<f32> = (0..total * n_kv_heads * head_dim)
+                .map(|i| (i as f32 * 0.05).sin())
+                .collect();
+            let q_width = n_heads * head_dim;
+            let mut cpu = vec![0f32; n_q * q_width];
+            for qi in 0..n_q {
+                let causal_len = kv_prefix_len + qi + 1;
+                let kv_elems = causal_len * n_kv_heads * head_dim;
+                let row = cpu_gqa_ex(
+                    &q[qi * q_width..(qi + 1) * q_width],
+                    &k[..kv_elems],
+                    &v[..kv_elems],
+                    n_heads,
+                    n_kv_heads,
+                    head_dim,
+                    causal_len,
+                    0,
+                    softcap,
+                );
+                cpu[qi * q_width..(qi + 1) * q_width].copy_from_slice(&row);
+            }
+            let gpu = launch_gqa_prefill_host_ex(
+                &q,
+                &k,
+                &v,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                n_q,
+                kv_prefix_len,
+                softcap,
+            )
+            .expect("fa_ext prefill");
+            let mut max_diff = 0f32;
+            let mut worst = (0usize, 0f32, 0f32);
+            for (i, (a, b)) in cpu.iter().zip(gpu.iter()).enumerate() {
+                let d = (a - b).abs();
+                if d > max_diff {
+                    max_diff = d;
+                    worst = (i, *a, *b);
+                }
+            }
+            let tol = 5e-3 * worst.1.abs().max(1.0);
+            assert!(
+                max_diff <= tol,
+                "hd={head_dim} n_q={n_q} pre={kv_prefix_len} sc={softcap:?} max_diff={max_diff} worst={worst:?} tol={tol}"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "needs a real Metal GPU"]
+    fn gqa_prefill_fa_ext_matches_fa_vec_d64() {
+        std::env::set_var("FERROX_METAL_FA_VEC", "1");
+        let (n_heads, n_kv_heads, head_dim, n_q, kv_prefix_len, softcap) =
+            (9usize, 3usize, 64usize, 40usize, 9usize, Some(50.0f32));
+        let total = kv_prefix_len + n_q;
+        let q: Vec<f32> = (0..n_q * n_heads * head_dim)
+            .map(|i| (i as f32 * 0.07).sin())
+            .collect();
+        let k: Vec<f32> = (0..total * n_kv_heads * head_dim)
+            .map(|i| (i as f32 * 0.03).cos())
+            .collect();
+        let v: Vec<f32> = (0..total * n_kv_heads * head_dim)
+            .map(|i| (i as f32 * 0.05).sin())
+            .collect();
+        std::env::set_var("FERROX_METAL_FA_EXT", "0");
+        let fa_vec = launch_gqa_prefill_host_ex(
+            &q,
+            &k,
+            &v,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            n_q,
+            kv_prefix_len,
+            softcap,
+        )
+        .expect("fa_vec");
+        std::env::set_var("FERROX_METAL_FA_EXT", "1");
+        let fa_ext = launch_gqa_prefill_host_ex(
+            &q,
+            &k,
+            &v,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            n_q,
+            kv_prefix_len,
+            softcap,
+        )
+        .expect("fa_ext");
+        let mut max_diff = 0f32;
+        let mut worst = (0usize, 0f32, 0f32);
+        for (i, (a, b)) in fa_vec.iter().zip(fa_ext.iter()).enumerate() {
+            let d = (a - b).abs();
+            if d > max_diff {
+                max_diff = d;
+                worst = (i, *a, *b);
+            }
+        }
+        assert!(
+            max_diff <= 1e-4,
+            "fa_ext vs fa_vec max_diff={max_diff} worst={worst:?}"
+        );
     }
 
     #[test]

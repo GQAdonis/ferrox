@@ -63,6 +63,7 @@ gap first**. Regenerate with `ferrox bench --suite` / `--render`.
 | Phi-4-mini-Instruct Q4_K_M | pp512 | **435.49** | **560.23** | 🔴 **1.29×** |
 | Gemma-3-1B-IT Q8_0 | pp512 | **2165.72** | **2746.16** | 🔴 **1.27×** |
 | Mistral-7B-Instruct-v0.2 Q4_K_M | pp512 | **228.59** | **277.28** | 🔴 **1.21×** |
+| Gemma-4-E2B-IT Q4_K_M | pp512 | **10.83** | — | — |
 | OLMoE-1B-7B-0924 Q4_0 | tg128 | **106.53** | **164.05** | 🔴 **1.54×** |
 | Llama-3.2-3B-Instruct Q4_K_M | tg128 | **57.68** | **63.90** | 🔴 **1.11×** |
 | Llama-3.2-1B-Instruct IQ4_XS | tg128 | **139.72** | **146.12** | ⚪ **1.05×** |
@@ -74,6 +75,7 @@ gap first**. Regenerate with `ferrox bench --suite` / `--render`.
 | Qwen3-0.6B Q8_0 | tg128 | **128.99** | **113.52** | 🟢 **0.88×** |
 | Qwen2.5-0.5B-Instruct Q8_0 | tg128 | **169.87** | **128.24** | 🟢 **0.75×** |
 | SmolLM2-135M-Instruct Q8_0 | tg128 | **305.97** | **223.34** | 🟢 **0.73×** |
+| Gemma-4-E2B-IT Q4_K_M | tg128 | **13.07** | — | — |
 
 ### CPU
 
@@ -87,6 +89,7 @@ gap first**. Regenerate with `ferrox bench --suite` / `--render`.
 | Qwen2.5-0.5B-Instruct Q8_0 | pp512 | **142.03** | **830.06** | 🔴 **5.84×** |
 | Gemma-3-1B-IT Q8_0 | pp512 | **96.86** | **498.24** | 🔴 **5.14×** |
 | TinyLlama-1.1B-Chat-v1.0 Q8_0 | pp512 | **81.04** | **284.93** | 🔴 **3.52×** |
+| Gemma-4-E2B-IT Q4_K_M | pp512 | **4.83** | — | — |
 | SmolLM2-135M-Instruct Q8_0 | tg128 | **93.39** | **309.98** | 🔴 **3.32×** |
 | Mistral-7B-Instruct-v0.2 Q4_K_M | tg128 | **6.50** | **19.15** | 🔴 **2.94×** |
 | Phi-4-mini-Instruct Q4_K_M | tg128 | **11.03** | **29.68** | 🔴 **2.69×** |
@@ -95,6 +98,7 @@ gap first**. Regenerate with `ferrox bench --suite` / `--render`.
 | Gemma-3-1B-IT Q8_0 | tg128 | **44.76** | **83.46** | 🔴 **1.86×** |
 | OLMoE-1B-7B-0924 Q4_0 | tg128 | **60.00** | **102.58** | 🔴 **1.71×** |
 | TinyLlama-1.1B-Chat-v1.0 Q8_0 | tg128 | **46.58** | **74.11** | 🔴 **1.59×** |
+| Gemma-4-E2B-IT Q4_K_M | tg128 | **6.20** | — | — |
 
 <!-- END ENGINE TABLE -->
 
@@ -104,6 +108,6 @@ gap first**. Regenerate with `ferrox bench --suite` / `--render`.
 2. **Metal decode is healthy** on many dense models (engine tg often ≤1× with answer parity).
 3. **CPU decode stays behind** (~1.3–2.6×): lower per-thread GEMV + rayon fork-join vs llama persistent pool. i8mm SMMLA still open.
 4. CUDA — no in-tree receipt; skipped on darwin via `--fit-host`.
-5. Gemma-4-E2B: SPM-style `gemma4` BPE + `<|turn>` chat wrap landed (2026-08-10). Homebrew llama may still lack `gemma4` arch.
+5. Gemma-4-E2B: `ferrox bench` uses `Gemma4Engine` (sequential `forward_token` for pp* until batched prefill lands). SPM `gemma4` BPE + `<|turn>` chat wrap landed. Homebrew `llama-bench` still lacks `gemma4` arch → llama column blank.
 6. DS4 / GLM / MLA MoE real-checkpoint e2e when feasible. Mixtral skipped by `--fit-host` on Host B.
 7. Run-to-run spread on this host is ~20%; claims tighter than that need interleaved A/B (still sequential per engine).

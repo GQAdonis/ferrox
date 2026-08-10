@@ -46,14 +46,14 @@
 //!
 //! `FERROX_CTK` selects KV dtype ([`MetalKvDtype`]); see [`is_implemented`].
 use crate::elem::{
-    encode_add_rms_norm, encode_argmax, encode_gelu_mul, encode_rms_norm, encode_rms_norm_at,
-    encode_rms_norm_per_head_batch, encode_silu_mul, encode_vec_add, encode_vec_add_at,
-    warm_prefill_elem_pipelines,
+    encode_add_rms_norm, encode_add_rms_norm_batch, encode_argmax, encode_f32_to_f16, encode_gelu_mul, encode_rms_norm_f32_to_f16_batch,
+    encode_rms_norm, encode_rms_norm_at, encode_rms_norm_batch, encode_rms_norm_per_head_batch,
+    encode_silu_mul, encode_vec_add, encode_vec_add_at, warm_prefill_elem_pipelines,
 };
 use crate::embd::{encode_get_rows, EmbdKind};
 use crate::gpu::{
     compute_encoder_concurrent, encode_matvec, encode_matvec_with_offsets, encode_moe_topk_softmax,
-    encode_mul_mm_sg, encode_q4_0_moe_gate_then_up_silu, encode_q4_0_moe_gate_up_id,
+    encode_mul_mm_sg_f16, encode_q4_0_moe_gate_then_up_silu, encode_q4_0_moe_gate_up_id,
     encode_q4_0_moe_gate_up_silu_fused, encode_q4_0_moe_id, encode_q4_0_moe_id_ex,
     encode_q4_0_moe_topk, encode_q4_0_mul_mm, ensure_pipeline, memory_barrier_buffers,
     memory_barrier_resources, resident_f32_buffer, resident_weight_buffer, shared_metal,
@@ -1431,6 +1431,398 @@ const GQA_PREFILL_FA_VEC_D64_KERNEL_SRC: &str =
 const GQA_PREFILL_FA_VEC_D96_KERNEL_SRC: &str =
     gqa_prefill_fa_vec_src!("gqa_prefill_fa_vec_d96", "96");
 
+/// Prefill FA with **4 queries per TG** (llama `OP_FLASH_ATTN_EXT_NQPSG`-lite).
+/// Shares K/V tile traffic across queries. d=64 only (SmolLM2 / Tiny / 1B).
+const GQA_PREFILL_FA_NQ4_D64_KERNEL_SRC: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+kernel void gqa_prefill_fa_nq4_d64(
+    device const float* q [[buffer(0)]],
+    device const half* k_cache [[buffer(1)]],
+    device const half* v_cache [[buffer(2)]],
+    device float* out [[buffer(3)]],
+    constant uint& n_heads [[buffer(4)]],
+    constant uint& n_kv_heads [[buffer(5)]],
+    constant uint& head_dim [[buffer(6)]],
+    constant uint& n_q [[buffer(7)]],
+    constant uint& kv_prefix_len [[buffer(8)]],
+    constant float& softcap [[buffer(9)]],
+    uint2 tgpig [[threadgroup_position_in_grid]],
+    uint2 tid_tg [[thread_position_in_threadgroup]],
+    uint2 tg_size [[threads_per_threadgroup]],
+    threadgroup float* shared [[threadgroup(0)]]
+) {
+    constexpr uint D = 64u;
+    constexpr uint D4 = 16u;
+    constexpr uint C = 32u;
+    constexpr uint NW = 32u;
+    constexpr uint QN = 4u;
+    // Per-SG scratch: C scores + QN*D output floats
+    constexpr uint SG_F = C + QN * D;
+
+    uint h = tgpig.x;
+    uint qi0 = tgpig.y * QN;
+    if (h >= n_heads || qi0 >= n_q || head_dim != D) return;
+
+    uint tid = tid_tg.x;
+    uint tg = tg_size.x;
+    const uint tiisg = tid % NW;
+    const uint sgitg = tid / NW;
+    const uint nsg = tg / NW;
+    const bool own = tiisg < D4;
+
+    uint group_size = n_heads / max(n_kv_heads, 1u);
+    uint kv_h = h / max(group_size, 1u);
+    float scale = 1.0f / sqrt(float(D));
+
+    // shared: [QN * D] queries, then NSG * SG_F scratch
+    threadgroup float4* sq4 = (threadgroup float4*)shared;
+    threadgroup float* ss = shared + QN * D + sgitg * SG_F;
+
+    uint n_local = min(QN, n_q - qi0);
+    for (uint j = 0; j < n_local; j++) {
+        device const float4* q4 =
+            (device const float4*)(q + ((qi0 + j) * n_heads + h) * D);
+        for (uint i = tid; i < D4; i += tg) {
+            sq4[j * D4 + i] = q4[i];
+        }
+    }
+    // Zero unused query slots' shared Q (keeps masked scores clean).
+    for (uint j = n_local; j < QN; j++) {
+        for (uint i = tid; i < D4; i += tg) {
+            sq4[j * D4 + i] = float4(0.0f);
+        }
+    }
+    if (own) {
+        for (uint j = 0; j < QN; j++) {
+            ((threadgroup float4*)(ss + C + j * D))[tiisg] = float4(0.0f);
+        }
+    }
+    ss[tiisg] = 0.0f;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float S[QN];
+    float M[QN];
+    uint causal[QN];
+    for (uint j = 0; j < QN; j++) {
+        S[j] = 0.0f;
+        M[j] = -INFINITY;
+        causal[j] = (j < n_local) ? (kv_prefix_len + qi0 + j + 1u) : 0u;
+    }
+    uint max_causal = 0u;
+    for (uint j = 0; j < n_local; j++) {
+        max_causal = max(max_causal, causal[j]);
+    }
+    if (max_causal == 0u) return;
+
+    for (uint ic0 = sgitg; ; ic0 += nsg) {
+        uint ic = ic0 * C;
+        if (ic >= max_causal) break;
+        uint chunk = min(C, max_causal - ic);
+
+        // scores[j][cc] staged in registers then written to ss for V pass
+        float scores[QN][C];
+        for (uint j = 0; j < QN; j++) {
+            for (uint cc = 0; cc < C; cc++) {
+                scores[j][cc] = -INFINITY;
+            }
+        }
+        for (uint cc = 0; cc < chunk; cc++) {
+            device const half4* k4 =
+                (device const half4*)(k_cache + ((ic + cc) * n_kv_heads + kv_h) * D);
+            for (uint j = 0; j < n_local; j++) {
+                if (ic + cc >= causal[j]) continue;
+                float partial = own ? dot(sq4[j * D4 + tiisg], float4(k4[tiisg])) : 0.0f;
+                float sc = simd_sum(partial) * scale;
+                if (softcap > 0.0f) {
+                    sc = softcap * tanh(sc / softcap);
+                }
+                scores[j][cc] = sc;
+            }
+        }
+
+        for (uint j = 0; j < n_local; j++) {
+            float s_lane = (tiisg < chunk) ? scores[j][tiisg] : -INFINITY;
+            float M2 = simd_max(max(M[j], s_lane));
+            float ms = (M[j] == -INFINITY) ? 0.0f : exp(M[j] - M2);
+            float vs = (s_lane == -INFINITY) ? 0.0f : exp(s_lane - M2);
+            S[j] = S[j] * ms + simd_sum(vs);
+            // stash per-query score weights into ss[j*C + tiisg] — reuse ss
+            // carefully: only C floats free at start of ss. Use so region
+            // temporarily? Keep scores in thread registers for V: rewrite
+            // scores[j][cc] as already-exp'd vs relative to M2.
+            float inv_broadcast = 0.0f; // silence
+            (void)inv_broadcast;
+            for (uint cc = 0; cc < chunk; cc++) {
+                float sc = scores[j][cc];
+                scores[j][cc] = (sc == -INFINITY) ? 0.0f : exp(sc - M2);
+            }
+            if (own) {
+                threadgroup float4* so4 = (threadgroup float4*)(ss + C + j * D);
+                so4[tiisg] *= ms;
+            }
+            M[j] = M2;
+
+            if (own) {
+                threadgroup float4* so4 = (threadgroup float4*)(ss + C + j * D);
+                float4 lo = float4(0.0f);
+                for (uint cc = 0; cc < chunk; cc++) {
+                    device const half4* v4 =
+                        (device const half4*)(v_cache + ((ic + cc) * n_kv_heads + kv_h) * D);
+                    lo += float4(v4[tiisg]) * scores[j][cc];
+                }
+                so4[tiisg] += lo;
+            }
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // Reduce across simdgroups: store S/M into ss[0]/ss[1] per query via
+    // a compact QN*2 header after scores region is free.
+    // Layout: ss[0..QN) = S, ss[QN..2*QN) = M for this SG (tiisg==0 writes).
+    if (tiisg == 0u) {
+        for (uint j = 0; j < QN; j++) {
+            ss[j] = S[j];
+            ss[QN + j] = M[j];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint r = nsg >> 1; r > 0u; r >>= 1) {
+        if (sgitg < r) {
+            threadgroup float* ss0 = shared + QN * D + sgitg * SG_F;
+            threadgroup float* ss1 = shared + QN * D + (sgitg + r) * SG_F;
+            for (uint j = 0; j < n_local; j++) {
+                float S0 = ss0[j];
+                float S1 = ss1[j];
+                float M0 = ss0[QN + j];
+                float M1 = ss1[QN + j];
+                float Mn = max(M0, M1);
+                float a0 = (M0 == -INFINITY) ? 0.0f : exp(M0 - Mn);
+                float a1 = (M1 == -INFINITY) ? 0.0f : exp(M1 - Mn);
+                if (tiisg == 0u) {
+                    ss0[j] = S0 * a0 + S1 * a1;
+                    ss0[QN + j] = Mn;
+                }
+                if (own) {
+                    threadgroup float4* so0 = (threadgroup float4*)(ss0 + C + j * D);
+                    threadgroup float4* so1 = (threadgroup float4*)(ss1 + C + j * D);
+                    so0[tiisg] = so0[tiisg] * a0 + so1[tiisg] * a1;
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (sgitg == 0u && own) {
+        threadgroup float* ss0 = shared + QN * D;
+        for (uint j = 0; j < n_local; j++) {
+            float inv = (ss0[j] == 0.0f) ? 0.0f : (1.0f / ss0[j]);
+            threadgroup float4* so0 = (threadgroup float4*)(ss0 + C + j * D);
+            device float4* out4 =
+                (device float4*)(out + ((qi0 + j) * n_heads + h) * D);
+            out4[tiisg] = so0[tiisg] * inv;
+        }
+    }
+}
+"#;
+
+/// llama `kernel_flash_attn_ext` dispatch shape for d=64: QN=8, C=64, NSG=4.
+/// Same FA-vec dot + online-softmax math as NQ4, scaled up (C=64, QN=8).
+const GQA_PREFILL_FA_EXT_D64_KERNEL_SRC: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+kernel void gqa_prefill_fa_ext_d64(
+    device const float* q [[buffer(0)]],
+    device const half* k_cache [[buffer(1)]],
+    device const half* v_cache [[buffer(2)]],
+    device float* out [[buffer(3)]],
+    constant uint& n_heads [[buffer(4)]],
+    constant uint& n_kv_heads [[buffer(5)]],
+    constant uint& head_dim [[buffer(6)]],
+    constant uint& n_q [[buffer(7)]],
+    constant uint& kv_prefix_len [[buffer(8)]],
+    constant float& softcap [[buffer(9)]],
+    uint2 tgpig [[threadgroup_position_in_grid]],
+    uint2 tid_tg [[thread_position_in_threadgroup]],
+    uint2 tg_size [[threads_per_threadgroup]],
+    threadgroup float* shared [[threadgroup(0)]]
+) {
+    constexpr uint D = 64u;
+    constexpr uint D4 = 16u;
+    constexpr uint C = 64u;
+    constexpr uint NW = 32u;
+    constexpr uint QN = 8u;
+    constexpr uint SG_F = C + QN * D;
+
+    uint h = tgpig.x;
+    uint qi0 = tgpig.y * QN;
+    if (h >= n_heads || qi0 >= n_q || head_dim != D) return;
+
+    uint tid = tid_tg.x;
+    uint tg = tg_size.x;
+    const uint tiisg = tid % NW;
+    const uint sgitg = tid / NW;
+    const uint nsg = tg / NW;
+    const bool own = tiisg < D4;
+
+    uint group_size = n_heads / max(n_kv_heads, 1u);
+    uint kv_h = h / max(group_size, 1u);
+    float scale = 1.0f / sqrt(float(D));
+
+    threadgroup float4* sq4 = (threadgroup float4*)shared;
+    threadgroup float* ss = shared + QN * D + sgitg * SG_F;
+
+    uint n_local = min(QN, n_q - qi0);
+    for (uint j = 0; j < n_local; j++) {
+        device const float4* q4 =
+            (device const float4*)(q + ((qi0 + j) * n_heads + h) * D);
+        for (uint i = tid; i < D4; i += tg) {
+            sq4[j * D4 + i] = q4[i];
+        }
+    }
+    for (uint j = n_local; j < QN; j++) {
+        for (uint i = tid; i < D4; i += tg) {
+            sq4[j * D4 + i] = float4(0.0f);
+        }
+    }
+    if (own) {
+        for (uint j = 0; j < QN; j++) {
+            ((threadgroup float4*)(ss + C + j * D))[tiisg] = float4(0.0f);
+        }
+    }
+    ss[tiisg] = 0.0f;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float S[QN];
+    float M[QN];
+    uint causal[QN];
+    for (uint j = 0; j < QN; j++) {
+        S[j] = 0.0f;
+        M[j] = -INFINITY;
+        causal[j] = (j < n_local) ? (kv_prefix_len + qi0 + j + 1u) : 0u;
+    }
+    uint max_causal = 0u;
+    for (uint j = 0; j < n_local; j++) {
+        max_causal = max(max_causal, causal[j]);
+    }
+    if (max_causal == 0u) return;
+
+    for (uint ic0 = sgitg; ; ic0 += nsg) {
+        uint ic = ic0 * C;
+        if (ic >= max_causal) break;
+        uint chunk = min(C, max_causal - ic);
+
+        float scores[QN][C];
+        for (uint j = 0; j < QN; j++) {
+            for (uint cc = 0; cc < C; cc++) {
+                scores[j][cc] = -INFINITY;
+            }
+        }
+        for (uint cc = 0; cc < chunk; cc++) {
+            device const half4* k4 =
+                (device const half4*)(k_cache + ((ic + cc) * n_kv_heads + kv_h) * D);
+            for (uint j = 0; j < n_local; j++) {
+                if (ic + cc >= causal[j]) continue;
+                float partial = own ? dot(sq4[j * D4 + tiisg], float4(k4[tiisg])) : 0.0f;
+                float sc = simd_sum(partial) * scale;
+                if (softcap > 0.0f) {
+                    sc = softcap * tanh(sc / softcap);
+                }
+                scores[j][cc] = sc;
+            }
+        }
+
+        for (uint j = 0; j < n_local; j++) {
+            for (uint hi = 0u; hi < 2u; hi++) {
+                uint idx = tiisg + hi * NW;
+                float s_lane = (idx < chunk) ? scores[j][idx] : -INFINITY;
+                float M2 = simd_max(max(M[j], s_lane));
+                float ms = (M[j] == -INFINITY) ? 0.0f : exp(M[j] - M2);
+                float vs = (s_lane == -INFINITY) ? 0.0f : exp(s_lane - M2);
+                S[j] = S[j] * ms + simd_sum(vs);
+                M[j] = M2;
+                if (own) {
+                    threadgroup float4* so4 = (threadgroup float4*)(ss + C + j * D);
+                    so4[tiisg] *= ms;
+                }
+            }
+            uint c0 = 0u;
+            uint c1 = min(32u, chunk);
+            for (uint cc = c0; cc < c1; cc++) {
+                float sc = scores[j][cc];
+                scores[j][cc] = (sc == -INFINITY) ? 0.0f : exp(sc - M[j]);
+            }
+            if (chunk > 32u) {
+                for (uint cc = 32u; cc < chunk; cc++) {
+                    float sc = scores[j][cc];
+                    scores[j][cc] = (sc == -INFINITY) ? 0.0f : exp(sc - M[j]);
+                }
+            }
+
+            if (own) {
+                threadgroup float4* so4 = (threadgroup float4*)(ss + C + j * D);
+                float4 lo = float4(0.0f);
+                for (uint cc = 0; cc < chunk; cc++) {
+                    device const half4* v4 =
+                        (device const half4*)(v_cache + ((ic + cc) * n_kv_heads + kv_h) * D);
+                    lo += float4(v4[tiisg]) * scores[j][cc];
+                }
+                so4[tiisg] += lo;
+            }
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (tiisg == 0u) {
+        for (uint j = 0; j < QN; j++) {
+            ss[j] = S[j];
+            ss[QN + j] = M[j];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint r = nsg >> 1; r > 0u; r >>= 1u) {
+        if (sgitg < r) {
+            threadgroup float* ss0 = shared + QN * D + sgitg * SG_F;
+            threadgroup float* ss1 = shared + QN * D + (sgitg + r) * SG_F;
+            for (uint j = 0; j < n_local; j++) {
+                float S0 = ss0[j];
+                float S1 = ss1[j];
+                float M0 = ss0[QN + j];
+                float M1 = ss1[QN + j];
+                float Mn = max(M0, M1);
+                float a0 = (M0 == -INFINITY) ? 0.0f : exp(M0 - Mn);
+                float a1 = (M1 == -INFINITY) ? 0.0f : exp(M1 - Mn);
+                if (tiisg == 0u) {
+                    ss0[j] = S0 * a0 + S1 * a1;
+                    ss0[QN + j] = Mn;
+                }
+                if (own) {
+                    threadgroup float4* so0 = (threadgroup float4*)(ss0 + C + j * D);
+                    threadgroup float4* so1 = (threadgroup float4*)(ss1 + C + j * D);
+                    so0[tiisg] = so0[tiisg] * a0 + so1[tiisg] * a1;
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (sgitg == 0u && own) {
+        threadgroup float* ss0 = shared + QN * D;
+        for (uint j = 0; j < n_local; j++) {
+            float inv = (ss0[j] == 0.0f) ? 0.0f : (1.0f / ss0[j]);
+            threadgroup float4* so0 = (threadgroup float4*)(ss0 + C + j * D);
+            device float4* out4 =
+                (device float4*)(out + ((qi0 + j) * n_heads + h) * D);
+            out4[tiisg] = so0[tiisg] * inv;
+        }
+    }
+}
+"#;
+
 const GQA_PREFILL_FA_VEC_D256_KERNEL_SRC: &str = r#"
 #include <metal_stdlib>
 using namespace metal;
@@ -2065,6 +2457,15 @@ fn alloc_f32_buffer(
         .ok_or(MetalError::BufferAllocFailed)
 }
 
+fn alloc_half_buffer(
+    device: &Retained<ProtocolObject<dyn MTLDevice>>,
+    n: usize,
+) -> Result<Retained<ProtocolObject<dyn MTLBuffer>>, MetalError> {
+    device
+        .newBufferWithLength_options(n * 2, MTLResourceOptions::StorageModeShared)
+        .ok_or(MetalError::BufferAllocFailed)
+}
+
 fn alloc_u32_buffer(
     device: &Retained<ProtocolObject<dyn MTLDevice>>,
     n: usize,
@@ -2166,6 +2567,9 @@ struct PrefillScratch {
     up: Retained<ProtocolObject<dyn MTLBuffer>>,
     act: Retained<ProtocolObject<dyn MTLBuffer>>,
     down: Retained<ProtocolObject<dyn MTLBuffer>>,
+    /// Reused f16 activation plane for `mul_mm_sg_f16` (max of hidden/q/gate).
+    half_act: Retained<ProtocolObject<dyn MTLBuffer>>,
+    half_act_cap: usize,
     batch_cap: usize,
     hidden_cap: usize,
     max_q_cap: usize,
@@ -2307,6 +2711,18 @@ impl MetalGraph {
         ] {
             warm_mul_mm_sg_pipeline(device, launch.fn_name)?;
             mark(launch.fn_name);
+            let f16_static: &'static str = match launch.fn_name {
+                "q4_k_mul_mm_sg" => "q4_k_mul_mm_sg_f16",
+                "q5_k_mul_mm_sg" => "q5_k_mul_mm_sg_f16",
+                "q6_k_mul_mm_sg" => "q6_k_mul_mm_sg_f16",
+                "q8_0_mul_mm_sg" => "q8_0_mul_mm_sg_f16",
+                "q4_0_mul_mm_sg" => "q4_0_mul_mm_sg_f16",
+                "q5_0_mul_mm_sg" => "q5_0_mul_mm_sg_f16",
+                "iq4_xs_mul_mm_sg" => "iq4_xs_mul_mm_sg_f16",
+                _ => continue,
+            };
+            warm_mul_mm_sg_pipeline(device, f16_static)?;
+            mark(f16_static);
         }
 
         let (rope_src, rope_name) = match params.rope_layout {
@@ -2469,11 +2885,15 @@ fn borrow_prefill_scratch(
                 && s.max_q_cap >= caps.max_q
                 && s.max_kv_cap >= caps.max_kv
                 && s.max_gate_cap >= caps.max_gate
+                && s.half_act_cap
+                    >= caps.batch * caps.hidden.max(caps.max_q).max(caps.max_gate)
         }
         None => false,
     };
     if !fits {
         let bh = caps.batch * caps.hidden;
+        let half_cap = caps.batch
+            * caps.hidden.max(caps.max_q).max(caps.max_gate);
         *guard = Some(PrefillScratch {
             h: alloc_f32_buffer(device, bh)?,
             x: alloc_f32_buffer(device, bh)?,
@@ -2487,6 +2907,8 @@ fn borrow_prefill_scratch(
             up: alloc_f32_buffer(device, caps.batch * caps.max_gate)?,
             act: alloc_f32_buffer(device, caps.batch * caps.max_gate)?,
             down: alloc_f32_buffer(device, bh)?,
+            half_act: alloc_half_buffer(device, half_cap)?,
+            half_act_cap: half_cap,
             batch_cap: caps.batch,
             hidden_cap: caps.hidden,
             max_q_cap: caps.max_q,
@@ -3033,6 +3455,19 @@ fn gqa_fa_vec_threadgroup_size(_head_dim: u32) -> u32 {
     256
 }
 
+/// Prefill FA-vec TG size. d=64 wastes half of each simdgroup on Q·K
+/// (`D4=16` of 32 lanes), so prefer fewer simdgroups → more concurrent
+/// TGs (one TG still owns one query). Measured on SmolLM2 Metal pp512.
+fn gqa_prefill_fa_vec_threadgroup_size(head_dim: u32) -> u32 {
+    match head_dim {
+        // d=64: D4=16 → half of each SG idle on Q·K. Prefer 2 SG (64
+        // threads) so more (head,query) TGs stay in flight on tiny pp512.
+        64 => 64,
+        96 => 128,
+        _ => 256,
+    }
+}
+
 /// Head dims the FA-vec decode kernels cover (dedicated specializations).
 fn gqa_fa_vec_supported(head_dim: u32) -> bool {
     matches!(head_dim, 64 | 96 | 128 | 256)
@@ -3062,6 +3497,158 @@ fn gqa_prefill_fa_vec_supported(head_dim: u32) -> bool {
 }
 
 #[allow(clippy::too_many_arguments)]
+fn encode_gqa_prefill_fa_nq4_d64(
+    encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+    device: &Retained<ProtocolObject<dyn MTLDevice>>,
+    q: &ProtocolObject<dyn MTLBuffer>,
+    k: &ProtocolObject<dyn MTLBuffer>,
+    v: &ProtocolObject<dyn MTLBuffer>,
+    out: &ProtocolObject<dyn MTLBuffer>,
+    n_heads: u32,
+    n_kv_heads: u32,
+    n_q: u32,
+    kv_prefix_len: u32,
+    softcap: f32,
+) -> Result<(), MetalError> {
+    const QN: u32 = 4;
+    const D: u32 = 64;
+    let pipe = ensure_pipeline(
+        device,
+        GQA_PREFILL_FA_NQ4_D64_KERNEL_SRC,
+        "gqa_prefill_fa_nq4_d64",
+    )?;
+    encoder.setComputePipelineState(&pipe.0);
+    let tg = 64u32; // 2 SG — same as d64 FA-vec
+    let nsg = tg / 32;
+    // QN*D queries + NSG * (C + QN*D)
+    let tg_mem = ((QN * D + nsg * (32 + QN * D)) * 4) as usize;
+    unsafe {
+        encoder.setBuffer_offset_atIndex(Some(q), 0, 0);
+        encoder.setBuffer_offset_atIndex(Some(k), 0, 1);
+        encoder.setBuffer_offset_atIndex(Some(v), 0, 2);
+        encoder.setBuffer_offset_atIndex(Some(out), 0, 3);
+        let mut nh = n_heads;
+        encoder.setBytes_length_atIndex(NonNull::new(&mut nh as *mut u32 as *mut _).unwrap(), 4, 4);
+        let mut nkv = n_kv_heads;
+        encoder.setBytes_length_atIndex(
+            NonNull::new(&mut nkv as *mut u32 as *mut _).unwrap(),
+            4,
+            5,
+        );
+        let mut hd = D;
+        encoder.setBytes_length_atIndex(NonNull::new(&mut hd as *mut u32 as *mut _).unwrap(), 4, 6);
+        let mut nq = n_q;
+        encoder.setBytes_length_atIndex(NonNull::new(&mut nq as *mut u32 as *mut _).unwrap(), 4, 7);
+        let mut prefix = kv_prefix_len;
+        encoder.setBytes_length_atIndex(
+            NonNull::new(&mut prefix as *mut u32 as *mut _).unwrap(),
+            4,
+            8,
+        );
+        let mut sc = softcap;
+        encoder.setBytes_length_atIndex(NonNull::new(&mut sc as *mut f32 as *mut _).unwrap(), 4, 9);
+        encoder.setThreadgroupMemoryLength_atIndex(tg_mem, 0);
+    }
+    let n_tg_y = n_q.div_ceil(QN) as usize;
+    encoder.dispatchThreadgroups_threadsPerThreadgroup(
+        MTLSize {
+            width: n_heads as usize,
+            height: n_tg_y,
+            depth: 1,
+        },
+        MTLSize {
+            width: tg as usize,
+            height: 1,
+            depth: 1,
+        },
+    );
+    Ok(())
+}
+
+/// llama `kernel_flash_attn_ext` dispatch: QN=8, C=64, NSG=4 (128 threads/TG).
+#[allow(clippy::too_many_arguments)]
+fn encode_gqa_prefill_fa_ext_d64(
+    encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+    device: &Retained<ProtocolObject<dyn MTLDevice>>,
+    q: &ProtocolObject<dyn MTLBuffer>,
+    k: &ProtocolObject<dyn MTLBuffer>,
+    v: &ProtocolObject<dyn MTLBuffer>,
+    out: &ProtocolObject<dyn MTLBuffer>,
+    n_heads: u32,
+    n_kv_heads: u32,
+    n_q: u32,
+    kv_prefix_len: u32,
+    softcap: f32,
+) -> Result<(), MetalError> {
+    const QN: u32 = 8;
+    const C: u32 = 64;
+    const D: u32 = 64;
+    const NSG: u32 = 4;
+    const SG_F: u32 = C + QN * D;
+    let pipe = ensure_pipeline(
+        device,
+        GQA_PREFILL_FA_EXT_D64_KERNEL_SRC,
+        "gqa_prefill_fa_ext_d64",
+    )?;
+    encoder.setComputePipelineState(&pipe.0);
+    let tg = 32 * NSG;
+    // QN*D queries + NSG * (C + QN*D) per-SG scratch
+    let tg_mem = ((QN * D + NSG * SG_F) * 4) as usize;
+    unsafe {
+        encoder.setBuffer_offset_atIndex(Some(q), 0, 0);
+        encoder.setBuffer_offset_atIndex(Some(k), 0, 1);
+        encoder.setBuffer_offset_atIndex(Some(v), 0, 2);
+        encoder.setBuffer_offset_atIndex(Some(out), 0, 3);
+        let mut nh = n_heads;
+        encoder.setBytes_length_atIndex(NonNull::new(&mut nh as *mut u32 as *mut _).unwrap(), 4, 4);
+        let mut nkv = n_kv_heads;
+        encoder.setBytes_length_atIndex(
+            NonNull::new(&mut nkv as *mut u32 as *mut _).unwrap(),
+            4,
+            5,
+        );
+        let mut hd = D;
+        encoder.setBytes_length_atIndex(NonNull::new(&mut hd as *mut u32 as *mut _).unwrap(), 4, 6);
+        let mut nq = n_q;
+        encoder.setBytes_length_atIndex(NonNull::new(&mut nq as *mut u32 as *mut _).unwrap(), 4, 7);
+        let mut prefix = kv_prefix_len;
+        encoder.setBytes_length_atIndex(
+            NonNull::new(&mut prefix as *mut u32 as *mut _).unwrap(),
+            4,
+            8,
+        );
+        let mut sc = softcap;
+        encoder.setBytes_length_atIndex(NonNull::new(&mut sc as *mut f32 as *mut _).unwrap(), 4, 9);
+        encoder.setThreadgroupMemoryLength_atIndex(tg_mem, 0);
+    }
+    encoder.dispatchThreadgroups_threadsPerThreadgroup(
+        MTLSize {
+            width: n_heads as usize,
+            height: n_q.div_ceil(QN) as usize,
+            depth: 1,
+        },
+        MTLSize {
+            width: tg as usize,
+            height: 1,
+            depth: 1,
+        },
+    );
+    Ok(())
+}
+
+/// Opt-in for d=64 long prefill (`FERROX_METAL_FA_EXT=1`). Default off —
+/// NQ=8/C=64 register scratch currently regresses vs FA-vec NQ=1 on pp512.
+fn gqa_prefill_fa_ext_d64_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        matches!(
+            std::env::var("FERROX_METAL_FA_EXT").ok().as_deref(),
+            Some("1") | Some("true") | Some("on") | Some("ext")
+        )
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
 fn encode_gqa_prefill_fa_vec(
     encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
     device: &Retained<ProtocolObject<dyn MTLDevice>>,
@@ -3076,6 +3663,44 @@ fn encode_gqa_prefill_fa_vec(
     kv_prefix_len: u32,
     softcap: f32,
 ) -> Result<(), MetalError> {
+    // llama flash_attn_ext dispatch (QN=8, C=64): opt-in via FERROX_METAL_FA_EXT=1.
+    // Legacy NQ=4 experimental: FERROX_METAL_FA_NQ=4. Default remains FA-vec NQ=1.
+    if head_dim == 64 && n_q >= 8 {
+        if gqa_prefill_fa_ext_d64_enabled() {
+            return encode_gqa_prefill_fa_ext_d64(
+                encoder,
+                device,
+                q,
+                k,
+                v,
+                out,
+                n_heads,
+                n_kv_heads,
+                n_q,
+                kv_prefix_len,
+                softcap,
+            );
+        }
+        let use_nq4 = matches!(
+            std::env::var("FERROX_METAL_FA_NQ").ok().as_deref(),
+            Some("4") | Some("nq4") | Some("on") | Some("true")
+        );
+        if use_nq4 {
+            return encode_gqa_prefill_fa_nq4_d64(
+                encoder,
+                device,
+                q,
+                k,
+                v,
+                out,
+                n_heads,
+                n_kv_heads,
+                n_q,
+                kv_prefix_len,
+                softcap,
+            );
+        }
+    }
     let pipe = match head_dim {
         64 => ensure_pipeline(
             device,
@@ -3096,7 +3721,7 @@ fn encode_gqa_prefill_fa_vec(
         _ => return Err(MetalError::CommandFailed),
     };
     encoder.setComputePipelineState(&pipe.0);
-    let tg = gqa_fa_vec_threadgroup_size(head_dim);
+    let tg = gqa_prefill_fa_vec_threadgroup_size(head_dim);
     let nsg = tg / 32;
     // Q[D] + NSG * (C=32 scores + D output)
     let tg_mem = ((head_dim + nsg * (32 + head_dim)) * 4) as usize;
@@ -5927,6 +6552,7 @@ struct PrefillScratchView<'a> {
     up: &'a ProtocolObject<dyn MTLBuffer>,
     act: &'a ProtocolObject<dyn MTLBuffer>,
     down: &'a ProtocolObject<dyn MTLBuffer>,
+    half_act: &'a ProtocolObject<dyn MTLBuffer>,
 }
 
 struct PrefillDenseLayerResident {
@@ -5999,7 +6625,7 @@ fn encode_prefill_dense_layer(
     let n_kv_heads = kv.n_kv_heads;
     let head_dim = kv.head_dim;
     let h_buf = scratch.h;
-    let x_buf = scratch.x;
+    let _x_buf = scratch.x;
     let x2_buf = scratch.x2;
     let q_buf = scratch.q;
     let k_buf = scratch.k;
@@ -6011,25 +6637,21 @@ fn encode_prefill_dense_layer(
     let act_buf = scratch.act;
     let down_buf = scratch.down;
 
-    for b in 0..batch {
-        let off = b * hidden_dim * 4;
-        encode_rms_norm_at(
-            encoder,
-            device,
-            h_buf,
-            off,
-            &resident.attn_nw.buffer,
-            x_buf,
-            off,
-            hidden_dim as u32,
-            rms_eps,
-        )?;
-    }
+    let half_act = scratch.half_act;
+    encode_rms_norm_f32_to_f16_batch(
+        encoder,
+        device,
+        h_buf,
+        &resident.attn_nw.buffer,
+        half_act,
+        hidden_dim as u32,
+        batch as u32,
+        rms_eps,
+    )?;
     memory_barrier_buffers(encoder);
-
-    encode_mul_mm_sg(encoder, device, &layer.q, &resident.q_w, x_buf, q_buf, batch)?;
-    encode_mul_mm_sg(encoder, device, &layer.k, &resident.k_w, x_buf, k_buf, batch)?;
-    encode_mul_mm_sg(encoder, device, &layer.v, &resident.v_w, x_buf, v_buf, batch)?;
+    encode_mul_mm_sg_f16(encoder, device, &layer.q, &resident.q_w, half_act, q_buf, batch)?;
+    encode_mul_mm_sg_f16(encoder, device, &layer.k, &resident.k_w, half_act, k_buf, batch)?;
+    encode_mul_mm_sg_f16(encoder, device, &layer.v, &resident.v_w, half_act, v_buf, batch)?;
     memory_barrier_buffers(encoder);
 
     encode_attn_extras_batch(
@@ -6099,47 +6721,58 @@ fn encode_prefill_dense_layer(
     )?;
     memory_barrier_buffers(encoder);
 
-    encode_mul_mm_sg(encoder, device, &layer.o, &resident.o_w, attn_buf, o_buf, batch)?;
+    encode_f32_to_f16(encoder, device, attn_buf, half_act, (batch * layer.q.rows) as u32)?;
+    memory_barrier_buffers(encoder);
+    encode_mul_mm_sg_f16(encoder, device, &layer.o, &resident.o_w, half_act, o_buf, batch)?;
     memory_barrier_buffers(encoder);
 
     if let Some(pw) = resident.post_attn_w.as_ref() {
-        for b in 0..batch {
-            let off = b * hidden_dim * 4;
-            encode_rms_norm_at(
-                encoder,
-                device,
-                o_buf,
-                off,
-                &pw.buffer,
-                o_buf,
-                off,
-                hidden_dim as u32,
-                rms_eps,
-            )?;
-        }
+        encode_rms_norm_batch(
+            encoder,
+            device,
+            o_buf,
+            &pw.buffer,
+            o_buf,
+            hidden_dim as u32,
+            batch as u32,
+            rms_eps,
+        )?;
         memory_barrier_buffers(encoder);
     }
 
-    encode_vec_add(encoder, device, h_buf, o_buf, (batch * hidden_dim) as u32)?;
-    memory_barrier_buffers(encoder);
-    for b in 0..batch {
-        let off = b * hidden_dim * 4;
-        encode_rms_norm_at(
+    // Fuse residual add + FFN RMSNorm into one dispatch when possible.
+    if resident.post_attn_w.is_none() {
+        encode_add_rms_norm_batch(
             encoder,
             device,
             h_buf,
-            off,
+            o_buf,
             &resident.ffn_nw.buffer,
             x2_buf,
-            off,
             hidden_dim as u32,
+            batch as u32,
+            rms_eps,
+        )?;
+    } else {
+        encode_vec_add(encoder, device, h_buf, o_buf, (batch * hidden_dim) as u32)?;
+        memory_barrier_buffers(encoder);
+        encode_rms_norm_batch(
+            encoder,
+            device,
+            h_buf,
+            &resident.ffn_nw.buffer,
+            x2_buf,
+            hidden_dim as u32,
+            batch as u32,
             rms_eps,
         )?;
     }
     memory_barrier_buffers(encoder);
 
-    encode_mul_mm_sg(encoder, device, &layer.gate, &resident.gate_w, x2_buf, gate_buf, batch)?;
-    encode_mul_mm_sg(encoder, device, &layer.up, &resident.up_w, x2_buf, up_buf, batch)?;
+    encode_f32_to_f16(encoder, device, x2_buf, half_act, (batch * hidden_dim) as u32)?;
+    memory_barrier_buffers(encoder);
+    encode_mul_mm_sg_f16(encoder, device, &layer.gate, &resident.gate_w, half_act, gate_buf, batch)?;
+    encode_mul_mm_sg_f16(encoder, device, &layer.up, &resident.up_w, half_act, up_buf, batch)?;
     memory_barrier_buffers(encoder);
     let ffn_elems = (batch * layer.gate.rows) as u32;
     if gelu_ffn {
@@ -6148,24 +6781,22 @@ fn encode_prefill_dense_layer(
         encode_silu_mul(encoder, device, gate_buf, up_buf, act_buf, ffn_elems)?;
     }
     memory_barrier_buffers(encoder);
-    encode_mul_mm_sg(encoder, device, &layer.down, &resident.down_w, act_buf, down_buf, batch)?;
+    encode_f32_to_f16(encoder, device, act_buf, half_act, (batch * layer.gate.rows) as u32)?;
+    memory_barrier_buffers(encoder);
+    encode_mul_mm_sg_f16(encoder, device, &layer.down, &resident.down_w, half_act, down_buf, batch)?;
     memory_barrier_buffers(encoder);
 
     if let Some(pw) = resident.post_ffn_w.as_ref() {
-        for b in 0..batch {
-            let off = b * hidden_dim * 4;
-            encode_rms_norm_at(
-                encoder,
-                device,
-                down_buf,
-                off,
-                &pw.buffer,
-                down_buf,
-                off,
-                hidden_dim as u32,
-                rms_eps,
-            )?;
-        }
+        encode_rms_norm_batch(
+            encoder,
+            device,
+            down_buf,
+            &pw.buffer,
+            down_buf,
+            hidden_dim as u32,
+            batch as u32,
+            rms_eps,
+        )?;
         memory_barrier_buffers(encoder);
     }
 
@@ -6276,6 +6907,7 @@ pub fn launch_prefill_dense_stack(
         up: &scratch.up,
         act: &scratch.act,
         down: &scratch.down,
+        half_act: &scratch.half_act,
     };
 
     let ff_resident = match freq_factors {

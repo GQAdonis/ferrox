@@ -6,7 +6,7 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 description = "Model loaders and decoder stacks for the Ferrox inference engine"
-readme = "../../README.md"
+readme = "README.md"
 
 [dependencies]
 ferrox-core = { workspace = true }

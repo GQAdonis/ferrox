@@ -6,7 +6,7 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 description = "Core tensor ops, RoPE, GQA, and KV cache for Ferrox"
-readme = "../../README.md"
+readme = "README.md"
 
 [dependencies]
 ferrox-gguf = { workspace = true }

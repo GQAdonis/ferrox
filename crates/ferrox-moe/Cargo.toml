@@ -6,7 +6,7 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 description = "Mixture-of-Experts routing and expert dispatch for Ferrox"
-readme = "../../README.md"
+readme = "README.md"
 
 [dependencies]
 ferrox-core = { workspace = true }

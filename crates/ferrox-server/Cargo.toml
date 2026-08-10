@@ -6,7 +6,7 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 description = "OpenAI-compatible HTTP server for the Ferrox inference engine"
-readme = "../../README.md"
+readme = "README.md"
 
 [[bin]]
 name = "ferrox-server"

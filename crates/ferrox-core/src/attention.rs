@@ -562,6 +562,56 @@ pub fn causal_gqa_attention_prefill(
     out
 }
 
+/// Prefill attention parallelized over `(query, head)` slots. Same math as
+/// calling [`causal_gqa_attention_softcap`] per query; used by the decoder
+/// CPU pp path so Rayon owns the full `[n_q × n_heads]` grid instead of
+/// only the query axis (better for large-head models like Phi-4).
+#[allow(clippy::too_many_arguments)]
+pub fn causal_gqa_attention_prefill_shared_kv(
+    q: &[f32],
+    k_cache: &[f32],
+    v_cache: &[f32],
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    n_q: usize,
+    kv_prefix: usize,
+    attn_softcap: Option<f32>,
+) -> Vec<f32> {
+    use rayon::prelude::*;
+    let q_stride = n_heads * head_dim;
+    let kv_stride = n_kv_heads * head_dim;
+    assert_eq!(q.len(), n_q * q_stride);
+    let kv_len = kv_prefix + n_q;
+    assert!(k_cache.len() >= kv_len * kv_stride);
+    assert!(v_cache.len() >= kv_len * kv_stride);
+
+    let group_size = n_heads / n_kv_heads.max(1);
+    let scale = 1.0 / (head_dim as f32).sqrt();
+    let mut out = vec![0f32; n_q * q_stride];
+
+    out.par_chunks_mut(head_dim)
+        .enumerate()
+        .for_each(|(slot, out_h)| {
+            let b = slot / n_heads;
+            let h = slot % n_heads;
+            let kv_h = h / group_size.max(1);
+            let q_h = &q[b * q_stride + h * head_dim..b * q_stride + (h + 1) * head_dim];
+            let causal_len = kv_prefix + b + 1;
+            online_attn_accumulate(q_h, scale, head_dim, out_h, attn_softcap, |visit| {
+                for t in 0..causal_len {
+                    let base = (t * n_kv_heads + kv_h) * head_dim;
+                    visit(
+                        &k_cache[base..base + head_dim],
+                        &v_cache[base..base + head_dim],
+                    );
+                }
+            });
+        });
+
+    out
+}
+
 /// Same math as `causal_gqa_attention`, but K/V positions are read
 /// through a `PagedKvStore` block table instead of one contiguous
 /// slice: position `t` lives in block `block_table[t / block_size]`

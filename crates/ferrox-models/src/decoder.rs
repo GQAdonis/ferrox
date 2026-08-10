@@ -16,11 +16,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use ferrox_core::attention::{
     apply_rope, apply_rope_interleaved, apply_rope_interleaved_with_freq_factors,
-    apply_rope_with_freq_factors, causal_gqa_attention_paged, causal_gqa_attention_softcap,
+    apply_rope_with_freq_factors, causal_gqa_attention_paged,
+    causal_gqa_attention_prefill_shared_kv, causal_gqa_attention_softcap,
     causal_gqa_attention_windowed_softcap,
 };
 use ferrox_core::cache::{KvCache, PagedKvCache, PagedKvStore, PagedStoreExhausted};
 use ferrox_core::matmul::{geglu, rms_norm, rms_norm_per_head, softcap_inplace};
+use rayon::prelude::*;
 
 /// Whether the CUDA `gqa_decode` kernel should serve the per-token GQA
 /// reduction (`FERROX_CUDA_GQA=1`). Off by default and only compiled with
@@ -3234,8 +3236,9 @@ impl Decoder {
 
             // --- attention block ---
             let normed_batch: Vec<f32> = hidden_batch
-                .chunks(hidden_dim)
-                .flat_map(|h| rms_norm(h, &layer.attn.norm_weight, self.config.rms_norm_eps))
+                .par_chunks(hidden_dim)
+                .map(|h| rms_norm(h, &layer.attn.norm_weight, self.config.rms_norm_eps))
+                .flatten()
                 .collect();
 
             let mut q_batch = layer.attn.q_proj.apply_batch(&normed_batch, batch_size);
@@ -3497,25 +3500,28 @@ impl Decoder {
                 }
             }
 
-            for b in 0..batch_size {
-                let pos = start_pos + b;
-                let q_row = &mut q_batch[b * q_width..(b + 1) * q_width];
-                for h in 0..n_heads {
-                    self.apply_rope_head_layer(
-                        &mut q_row[h * head_dim..(h + 1) * head_dim],
-                        pos,
-                        l,
-                    );
-                }
-                let k_row = &mut k_batch[b * kv_width..(b + 1) * kv_width];
-                for h in 0..n_kv_heads {
-                    self.apply_rope_head_layer(
-                        &mut k_row[h * head_dim..(h + 1) * head_dim],
-                        pos,
-                        l,
-                    );
-                }
-            }
+            // RoPE per token is independent; parallelize for CPU pp512.
+            q_batch
+                .par_chunks_mut(q_width)
+                .zip(k_batch.par_chunks_mut(kv_width))
+                .enumerate()
+                .for_each(|(b, (q_row, k_row))| {
+                    let pos = start_pos + b;
+                    for h in 0..n_heads {
+                        self.apply_rope_head_layer(
+                            &mut q_row[h * head_dim..(h + 1) * head_dim],
+                            pos,
+                            l,
+                        );
+                    }
+                    for h in 0..n_kv_heads {
+                        self.apply_rope_head_layer(
+                            &mut k_row[h * head_dim..(h + 1) * head_dim],
+                            pos,
+                            l,
+                        );
+                    }
+                });
 
             let base_seq_len = cache.seq_len;
             for b in 0..batch_size {
@@ -3527,35 +3533,51 @@ impl Decoder {
                     .expect("unbounded/planned KvCache growth is infallible");
             }
 
-            let mut attn_out_batch = vec![0f32; batch_size * q_width];
-            for b in 0..batch_size {
-                let seq_len_b = base_seq_len + b + 1;
-                let cache_elems = seq_len_b * kv_width;
-                let attn_out = match self.config.layer_sliding_window(l) {
-                    Some(window) => causal_gqa_attention_windowed_softcap(
-                        &q_batch[b * q_width..(b + 1) * q_width],
-                        &cache.k[..cache_elems],
-                        &cache.v[..cache_elems],
-                        n_heads,
-                        n_kv_heads,
-                        head_dim,
-                        seq_len_b,
-                        window,
-                        self.config.attn_logit_softcap,
-                    ),
-                    None => causal_gqa_attention_softcap(
-                        &q_batch[b * q_width..(b + 1) * q_width],
-                        &cache.k[..cache_elems],
-                        &cache.v[..cache_elems],
-                        n_heads,
-                        n_kv_heads,
-                        head_dim,
-                        seq_len_b,
-                        self.config.attn_logit_softcap,
-                    ),
-                };
-                attn_out_batch[b * q_width..(b + 1) * q_width].copy_from_slice(&attn_out);
-            }
+            // Prefill attention over the just-written KV prefix. Parallel
+            // over query positions — the serial loop was a dominant CPU
+            // pp512 bottleneck (each query still attends only its causal
+            // prefix; K/V slices are immutable after the pushes above).
+            let cache_k = &cache.k;
+            let cache_v = &cache.v;
+            let softcap = self.config.attn_logit_softcap;
+            let window = self.config.layer_sliding_window(l);
+            // Non-windowed: Rayon over `[n_q × n_heads]` against one shared
+            // KV buffer (Phi-4 CPU pp512). Windowed keeps per-query path.
+            let attn_out_batch = match window {
+                Some(window) => {
+                    let mut out = vec![0f32; batch_size * q_width];
+                    out.par_chunks_mut(q_width)
+                        .enumerate()
+                        .for_each(|(b, dest)| {
+                            let seq_len_b = base_seq_len + b + 1;
+                            let cache_elems = seq_len_b * kv_width;
+                            let attn_out = causal_gqa_attention_windowed_softcap(
+                                &q_batch[b * q_width..(b + 1) * q_width],
+                                &cache_k[..cache_elems],
+                                &cache_v[..cache_elems],
+                                n_heads,
+                                n_kv_heads,
+                                head_dim,
+                                seq_len_b,
+                                window,
+                                softcap,
+                            );
+                            dest.copy_from_slice(&attn_out);
+                        });
+                    out
+                }
+                None => causal_gqa_attention_prefill_shared_kv(
+                    &q_batch,
+                    cache_k,
+                    cache_v,
+                    n_heads,
+                    n_kv_heads,
+                    head_dim,
+                    batch_size,
+                    base_seq_len,
+                    softcap,
+                ),
+            };
 
             let projected_batch = layer.attn.o_proj.apply_batch(&attn_out_batch, batch_size);
             let projected_batch = if let Some(post) = &layer.attn.post_attn_norm {
@@ -3572,8 +3594,9 @@ impl Decoder {
 
             // --- MoE FFN block ---
             let normed2_batch: Vec<f32> = hidden_batch
-                .chunks(hidden_dim)
-                .flat_map(|h| rms_norm(h, &layer.moe.norm_weight, self.config.rms_norm_eps))
+                .par_chunks(hidden_dim)
+                .map(|h| rms_norm(h, &layer.moe.norm_weight, self.config.rms_norm_eps))
+                .flatten()
                 .collect();
             let dense = Self::is_dense_layer(layer);
             // Skip the batched router matmul entirely for a dense
@@ -3746,8 +3769,9 @@ impl Decoder {
         for (l, layer) in self.layers.iter().enumerate() {
             // --- attention block ---
             let normed_batch: Vec<f32> = hidden_batch
-                .chunks(hidden_dim)
-                .flat_map(|h| rms_norm(h, &layer.attn.norm_weight, self.config.rms_norm_eps))
+                .par_chunks(hidden_dim)
+                .map(|h| rms_norm(h, &layer.attn.norm_weight, self.config.rms_norm_eps))
+                .flatten()
                 .collect();
 
             let mut q_batch = layer.attn.q_proj.apply_batch(&normed_batch, batch_size);
@@ -3862,8 +3886,9 @@ impl Decoder {
 
             // --- MoE FFN block ---
             let normed2_batch: Vec<f32> = hidden_batch
-                .chunks(hidden_dim)
-                .flat_map(|h| rms_norm(h, &layer.moe.norm_weight, self.config.rms_norm_eps))
+                .par_chunks(hidden_dim)
+                .map(|h| rms_norm(h, &layer.moe.norm_weight, self.config.rms_norm_eps))
+                .flatten()
                 .collect();
             let dense = Self::is_dense_layer(layer);
             let router_logits_batch = if dense {
@@ -3906,8 +3931,9 @@ impl Decoder {
 
         let vocab_size = self.output_head.rows();
         let final_normed_batch: Vec<f32> = hidden_batch
-            .chunks(hidden_dim)
-            .flat_map(|h| rms_norm(h, &self.final_norm, self.config.rms_norm_eps))
+            .par_chunks(hidden_dim)
+            .map(|h| rms_norm(h, &self.final_norm, self.config.rms_norm_eps))
+            .flatten()
             .collect();
         let mut logits_batch = self
             .output_head

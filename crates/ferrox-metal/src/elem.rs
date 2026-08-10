@@ -45,6 +45,82 @@ kernel void rms_norm_f32(
         out[i] = x[i] * inv_rms * weight[i];
     }
 }
+
+// One threadgroup per row — avoids B separate dispatches on prefill.
+kernel void rms_norm_f32_batch(
+    device const float* x [[buffer(0)]],
+    device const float* weight [[buffer(1)]],
+    device float* out [[buffer(2)]],
+    constant uint& n [[buffer(3)]],
+    constant float& eps [[buffer(4)]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint tg [[threads_per_threadgroup]],
+    uint row [[threadgroup_position_in_grid]],
+    uint sgitg [[simdgroup_index_in_threadgroup]],
+    uint tiisg [[thread_index_in_simdgroup]],
+    threadgroup float* scratch [[threadgroup(0)]]
+) {
+    device const float* xr = x + row * n;
+    device float* orow = out + row * n;
+    float partial = 0.0f;
+    for (uint i = tid; i < n; i += tg) {
+        float v = xr[i];
+        partial += v * v;
+    }
+    partial = simd_sum(partial);
+    if (tiisg == 0u) {
+        scratch[sgitg] = partial;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float total = 0.0f;
+    const uint nsg = (tg + 31u) / 32u;
+    if (tiisg < nsg) {
+        total = scratch[tiisg];
+    }
+    total = simd_sum(total);
+    float inv_rms = rsqrt(total / float(n) + eps);
+    for (uint i = tid; i < n; i += tg) {
+        orow[i] = xr[i] * inv_rms * weight[i];
+    }
+}
+
+// RMSNorm writing half (skip separate f32→f16 before mul_mm_sg_f16).
+kernel void rms_norm_f32_to_f16_batch(
+    device const float* x [[buffer(0)]],
+    device const float* weight [[buffer(1)]],
+    device half* out [[buffer(2)]],
+    constant uint& n [[buffer(3)]],
+    constant float& eps [[buffer(4)]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint tg [[threads_per_threadgroup]],
+    uint row [[threadgroup_position_in_grid]],
+    uint sgitg [[simdgroup_index_in_threadgroup]],
+    uint tiisg [[thread_index_in_simdgroup]],
+    threadgroup float* scratch [[threadgroup(0)]]
+) {
+    device const float* xr = x + row * n;
+    device half* orow = out + row * n;
+    float partial = 0.0f;
+    for (uint i = tid; i < n; i += tg) {
+        float v = xr[i];
+        partial += v * v;
+    }
+    partial = simd_sum(partial);
+    if (tiisg == 0u) {
+        scratch[sgitg] = partial;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float total = 0.0f;
+    const uint nsg = (tg + 31u) / 32u;
+    if (tiisg < nsg) {
+        total = scratch[tiisg];
+    }
+    total = simd_sum(total);
+    float inv_rms = rsqrt(total / float(n) + eps);
+    for (uint i = tid; i < n; i += tg) {
+        orow[i] = half(xr[i] * inv_rms * weight[i]);
+    }
+}
 "#;
 
 const VEC_ADD_KERNEL_SRC: &str = r#"
@@ -59,6 +135,17 @@ kernel void vec_add_f32(
 ) {
     if (i < n) {
         a[i] += b[i];
+    }
+}
+
+kernel void f32_to_f16(
+    device const float* src [[buffer(0)]],
+    device half* dst [[buffer(1)]],
+    constant uint& n [[buffer(2)]],
+    uint i [[thread_position_in_grid]]
+) {
+    if (i < n) {
+        dst[i] = half(src[i]);
     }
 }
 "#;
@@ -104,6 +191,47 @@ kernel void add_rms_norm_f32(
     float inv_rms = rsqrt(total / float(n) + eps);
     for (uint i = tid; i < n; i += tg) {
         out[i] = h[i] * inv_rms * weight[i];
+    }
+}
+
+// One threadgroup per row (prefill B tokens).
+kernel void add_rms_norm_f32_batch(
+    device float* h [[buffer(0)]],
+    device const float* add [[buffer(1)]],
+    device const float* weight [[buffer(2)]],
+    device float* out [[buffer(3)]],
+    constant uint& n [[buffer(4)]],
+    constant float& eps [[buffer(5)]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint tg [[threads_per_threadgroup]],
+    uint row [[threadgroup_position_in_grid]],
+    uint sgitg [[simdgroup_index_in_threadgroup]],
+    uint tiisg [[thread_index_in_simdgroup]],
+    threadgroup float* scratch [[threadgroup(0)]]
+) {
+    device float* hr = h + row * n;
+    device const float* ar = add + row * n;
+    device float* orow = out + row * n;
+    float partial = 0.0f;
+    for (uint i = tid; i < n; i += tg) {
+        float v = hr[i] + ar[i];
+        hr[i] = v;
+        partial += v * v;
+    }
+    partial = simd_sum(partial);
+    if (tiisg == 0u) {
+        scratch[sgitg] = partial;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float total = 0.0f;
+    const uint nsg = (tg + 31u) / 32u;
+    if (tiisg < nsg) {
+        total = scratch[tiisg];
+    }
+    total = simd_sum(total);
+    float inv_rms = rsqrt(total / float(n) + eps);
+    for (uint i = tid; i < n; i += tg) {
+        orow[i] = hr[i] * inv_rms * weight[i];
     }
 }
 "#;
@@ -309,6 +437,111 @@ pub(crate) fn encode_rms_norm_at(
     Ok(())
 }
 
+/// Batched RMSNorm: one threadgroup per row of length `n` (`batch` rows).
+/// Contiguous layout `[batch][n]` in `x` / `out`. Replaces `batch` calls to
+/// [`encode_rms_norm_at`] (dominant dispatch storm on tiny-model pp512).
+pub(crate) fn encode_rms_norm_batch(
+    encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+    device: &Retained<ProtocolObject<dyn MTLDevice>>,
+    x: &ProtocolObject<dyn MTLBuffer>,
+    weight: &ProtocolObject<dyn MTLBuffer>,
+    out: &ProtocolObject<dyn MTLBuffer>,
+    n: u32,
+    batch: u32,
+    eps: f32,
+) -> Result<(), MetalError> {
+    if batch == 0 {
+        return Ok(());
+    }
+    if batch == 1 {
+        return encode_rms_norm(encoder, device, x, weight, out, n, eps);
+    }
+    let pipe = ensure_pipeline(device, RMS_NORM_KERNEL_SRC, "rms_norm_f32_batch")?;
+    encoder.setComputePipelineState(&pipe.0);
+    let tg = 256u32;
+    unsafe {
+        encoder.setBuffer_offset_atIndex(Some(x), 0, 0);
+        encoder.setBuffer_offset_atIndex(Some(weight), 0, 1);
+        encoder.setBuffer_offset_atIndex(Some(out), 0, 2);
+        let mut n_u = n;
+        encoder.setBytes_length_atIndex(
+            NonNull::new(&mut n_u as *mut u32 as *mut _).unwrap(),
+            4,
+            3,
+        );
+        let mut eps_f = eps;
+        encoder.setBytes_length_atIndex(
+            NonNull::new(&mut eps_f as *mut f32 as *mut _).unwrap(),
+            4,
+            4,
+        );
+        encoder.setThreadgroupMemoryLength_atIndex(((tg as usize) / 32) * 4, 0);
+    }
+    encoder.dispatchThreadgroups_threadsPerThreadgroup(
+        MTLSize {
+            width: batch as usize,
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width: tg as usize,
+            height: 1,
+            depth: 1,
+        },
+    );
+    Ok(())
+}
+
+/// Batched RMSNorm writing `half` rows (prefill → `mul_mm_sg_f16`).
+pub(crate) fn encode_rms_norm_f32_to_f16_batch(
+    encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+    device: &Retained<ProtocolObject<dyn MTLDevice>>,
+    x: &ProtocolObject<dyn MTLBuffer>,
+    weight: &ProtocolObject<dyn MTLBuffer>,
+    out_h: &ProtocolObject<dyn MTLBuffer>,
+    n: u32,
+    batch: u32,
+    eps: f32,
+) -> Result<(), MetalError> {
+    if batch == 0 {
+        return Ok(());
+    }
+    let pipe = ensure_pipeline(device, RMS_NORM_KERNEL_SRC, "rms_norm_f32_to_f16_batch")?;
+    encoder.setComputePipelineState(&pipe.0);
+    let tg = 256u32;
+    unsafe {
+        encoder.setBuffer_offset_atIndex(Some(x), 0, 0);
+        encoder.setBuffer_offset_atIndex(Some(weight), 0, 1);
+        encoder.setBuffer_offset_atIndex(Some(out_h), 0, 2);
+        let mut n_u = n;
+        encoder.setBytes_length_atIndex(
+            NonNull::new(&mut n_u as *mut u32 as *mut _).unwrap(),
+            4,
+            3,
+        );
+        let mut eps_f = eps;
+        encoder.setBytes_length_atIndex(
+            NonNull::new(&mut eps_f as *mut f32 as *mut _).unwrap(),
+            4,
+            4,
+        );
+        encoder.setThreadgroupMemoryLength_atIndex(((tg as usize) / 32) * 4, 0);
+    }
+    encoder.dispatchThreadgroups_threadsPerThreadgroup(
+        MTLSize {
+            width: batch as usize,
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width: tg as usize,
+            height: 1,
+            depth: 1,
+        },
+    );
+    Ok(())
+}
+
 pub(crate) fn encode_vec_add(
     encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
     device: &Retained<ProtocolObject<dyn MTLDevice>>,
@@ -317,6 +550,43 @@ pub(crate) fn encode_vec_add(
     n: u32,
 ) -> Result<(), MetalError> {
     encode_vec_add_at(encoder, device, a, 0, b, n)
+}
+
+/// Contiguous `float` → `half` (dense-prefill GEMM src1 / llama `*_f16`).
+pub(crate) fn encode_f32_to_f16(
+    encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+    device: &Retained<ProtocolObject<dyn MTLDevice>>,
+    src: &ProtocolObject<dyn MTLBuffer>,
+    dst: &ProtocolObject<dyn MTLBuffer>,
+    n: u32,
+) -> Result<(), MetalError> {
+    let pipe = ensure_pipeline(device, VEC_ADD_KERNEL_SRC, "f32_to_f16")?;
+    encoder.setComputePipelineState(&pipe.0);
+    unsafe {
+        encoder.setBuffer_offset_atIndex(Some(src), 0, 0);
+        encoder.setBuffer_offset_atIndex(Some(dst), 0, 1);
+        let mut n_u = n;
+        encoder.setBytes_length_atIndex(
+            NonNull::new(&mut n_u as *mut u32 as *mut _).unwrap(),
+            4,
+            2,
+        );
+    }
+    let tg = 256usize;
+    let n_tg = (n as usize).div_ceil(tg);
+    encoder.dispatchThreadgroups_threadsPerThreadgroup(
+        MTLSize {
+            width: n_tg,
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width: tg,
+            height: 1,
+            depth: 1,
+        },
+    );
+    Ok(())
 }
 
 /// `a[a_offset_bytes/4 ..] += b[0..n]` (in-place on `a`).
@@ -396,6 +666,63 @@ pub(crate) fn encode_add_rms_norm(
     encoder.dispatchThreadgroups_threadsPerThreadgroup(
         MTLSize {
             width: 1,
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width: tg as usize,
+            height: 1,
+            depth: 1,
+        },
+    );
+    Ok(())
+}
+
+/// Batched [`encode_add_rms_norm`]: `h[row] += add[row]`, then
+/// `out[row] = rms_norm(h[row]) * weight` for `batch` contiguous rows.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_add_rms_norm_batch(
+    encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+    device: &Retained<ProtocolObject<dyn MTLDevice>>,
+    h: &ProtocolObject<dyn MTLBuffer>,
+    add: &ProtocolObject<dyn MTLBuffer>,
+    weight: &ProtocolObject<dyn MTLBuffer>,
+    out: &ProtocolObject<dyn MTLBuffer>,
+    n: u32,
+    batch: u32,
+    eps: f32,
+) -> Result<(), MetalError> {
+    if batch == 0 {
+        return Ok(());
+    }
+    if batch == 1 {
+        return encode_add_rms_norm(encoder, device, h, add, weight, out, n, eps);
+    }
+    let pipe = ensure_pipeline(device, ADD_RMS_NORM_KERNEL_SRC, "add_rms_norm_f32_batch")?;
+    encoder.setComputePipelineState(&pipe.0);
+    let tg = 256u32;
+    unsafe {
+        encoder.setBuffer_offset_atIndex(Some(h), 0, 0);
+        encoder.setBuffer_offset_atIndex(Some(add), 0, 1);
+        encoder.setBuffer_offset_atIndex(Some(weight), 0, 2);
+        encoder.setBuffer_offset_atIndex(Some(out), 0, 3);
+        let mut n_u = n;
+        encoder.setBytes_length_atIndex(
+            NonNull::new(&mut n_u as *mut u32 as *mut _).unwrap(),
+            4,
+            4,
+        );
+        let mut eps_f = eps;
+        encoder.setBytes_length_atIndex(
+            NonNull::new(&mut eps_f as *mut f32 as *mut _).unwrap(),
+            4,
+            5,
+        );
+        encoder.setThreadgroupMemoryLength_atIndex(((tg as usize) / 32) * 4, 0);
+    }
+    encoder.dispatchThreadgroups_threadsPerThreadgroup(
+        MTLSize {
+            width: batch as usize,
             height: 1,
             depth: 1,
         },
@@ -633,7 +960,12 @@ pub(crate) fn warm_prefill_elem_pipelines(
     gelu_ffn: bool,
 ) -> Result<(), MetalError> {
     ensure_pipeline(device, RMS_NORM_KERNEL_SRC, "rms_norm_f32")?;
+    ensure_pipeline(device, RMS_NORM_KERNEL_SRC, "rms_norm_f32_batch")?;
+    ensure_pipeline(device, RMS_NORM_KERNEL_SRC, "rms_norm_f32_to_f16_batch")?;
+    ensure_pipeline(device, ADD_RMS_NORM_KERNEL_SRC, "add_rms_norm_f32")?;
+    ensure_pipeline(device, ADD_RMS_NORM_KERNEL_SRC, "add_rms_norm_f32_batch")?;
     ensure_pipeline(device, VEC_ADD_KERNEL_SRC, "vec_add_f32")?;
+    ensure_pipeline(device, VEC_ADD_KERNEL_SRC, "f32_to_f16")?;
     if gelu_ffn {
         ensure_pipeline(device, GELU_MUL_KERNEL_SRC, "gelu_mul_f32")?;
     } else {

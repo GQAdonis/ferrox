@@ -10,10 +10,18 @@
 //! Deliberately *not* here: HTTP, chat template, real tokenizer,
 //! sampling. Synthetic token ids exercise the same weights and the same
 //! KV growth without making the number depend on a tokenizer's behavior.
+//!
+//! Engines: generic [`Decoder`] (batched `forward_batch_last` for `pp*`)
+//! and dedicated [`Gemma4Engine`] (sequential `forward_token` for both
+//! `pp*` and `tg*` until a batched Gemma-4 prefill lands).
 
 use anyhow::Context;
 use ferrox_core::cache::KvCache;
-use ferrox_models::{Decoder, ModelConfig};
+use ferrox_models::engine::Engine;
+use ferrox_models::{
+    load_gemma4_engine_from_path, select_engine_kind, Decoder, Gemma4Engine, ModelConfig,
+    SelectedEngineKind, ServedEngine,
+};
 use std::path::Path;
 use std::time::Instant;
 
@@ -107,17 +115,7 @@ pub fn run(args: BenchArgs) -> anyhow::Result<()> {
         .metadata_str("general.architecture")
         .unwrap_or("unknown")
         .to_string();
-    let config = ModelConfig::from_gguf(&file)
-        .with_context(|| format!("reading model config for arch {arch}"))?;
-    ferrox_models::ensure_generic_decoder(&arch)
-        .map_err(|e| anyhow::anyhow!("{e}: `ferrox bench` covers the generic Decoder path only"))?;
-
-    let params_b = estimate_params(&config);
-    let size_bytes = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
-
-    let load_t = Instant::now();
-    let decoder = Decoder::from_gguf(path, config)?;
-    let load_s = load_t.elapsed().as_secs_f64();
+    let kind = select_engine_kind(&arch).map_err(|e| anyhow::anyhow!("{e}"))?;
 
     let ctx_needed = args.n_prompt.max(1) + args.n_gen + 2;
     if args.ctx_size > 0 && ctx_needed > args.ctx_size {
@@ -127,19 +125,39 @@ pub fn run(args: BenchArgs) -> anyhow::Result<()> {
         );
     }
 
-    let mut rows: Vec<Row> = Vec::new();
-    if args.n_prompt > 0 {
-        rows.push(Row {
-            test: format!("pp{}", args.n_prompt),
-            samples: bench_prefill(&decoder, args.n_prompt, args.reps)?,
-        });
-    }
-    if args.n_gen > 0 {
-        rows.push(Row {
-            test: format!("tg{}", args.n_gen),
-            samples: bench_decode(&decoder, args.n_gen, args.reps)?,
-        });
-    }
+    let size_bytes = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    let (params_b, load_s, rows) = match kind {
+        SelectedEngineKind::GenericDecoder => {
+            let config = ModelConfig::from_gguf(&file)
+                .with_context(|| format!("reading model config for arch {arch}"))?;
+            let params_b = estimate_params(&config);
+            let load_t = Instant::now();
+            let decoder = Decoder::from_gguf(path, config)?;
+            let load_s = load_t.elapsed().as_secs_f64();
+            (params_b, load_s, measure_decoder(&decoder, &args)?)
+        }
+        SelectedEngineKind::Gemma4 => {
+            let load_t = Instant::now();
+            let served = load_gemma4_engine_from_path(path).map_err(|e| anyhow::anyhow!("{e}"))?;
+            let ServedEngine::Gemma4(engine) = served else {
+                anyhow::bail!("expected ServedEngine::Gemma4 for arch {arch}");
+            };
+            let engine = *engine;
+            let load_s = load_t.elapsed().as_secs_f64();
+            let params_b = estimate_gemma4_params(&engine);
+            // Gemma-4 has no batched prefill yet: pp* is sequential
+            // forward_token (same as `ferrox run`). llama-bench still
+            // batches, so the pp gap is partly that asymmetry.
+            eprintln!(
+                "ferrox bench: gemma4 uses sequential prefill (no forward_batch_last yet)"
+            );
+            (params_b, load_s, measure_gemma4(&engine, &args)?)
+        }
+        other => anyhow::bail!(
+            "`ferrox bench` does not cover {other:?} yet (arch {arch}); \
+             use the dedicated engine path via `ferrox run` for inference"
+        ),
+    };
 
     let backend = active_backend();
     let threads = ferrox_core::threads::resolve_cpu_threads();
@@ -228,10 +246,46 @@ pub fn run(args: BenchArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `pp<N>` / `tg<N>` for the generic [`Decoder`].
+fn measure_decoder(decoder: &Decoder, args: &BenchArgs) -> anyhow::Result<Vec<Row>> {
+    let mut rows: Vec<Row> = Vec::new();
+    if args.n_prompt > 0 {
+        rows.push(Row {
+            test: format!("pp{}", args.n_prompt),
+            samples: bench_prefill(decoder, args.n_prompt, args.reps)?,
+        });
+    }
+    if args.n_gen > 0 {
+        rows.push(Row {
+            test: format!("tg{}", args.n_gen),
+            samples: bench_decode(decoder, args.n_gen, args.reps)?,
+        });
+    }
+    Ok(rows)
+}
+
+/// `pp<N>` / `tg<N>` for [`Gemma4Engine`] (sequential tokens only).
+fn measure_gemma4(engine: &Gemma4Engine, args: &BenchArgs) -> anyhow::Result<Vec<Row>> {
+    let mut rows: Vec<Row> = Vec::new();
+    if args.n_prompt > 0 {
+        rows.push(Row {
+            test: format!("pp{}", args.n_prompt),
+            samples: bench_prefill_gemma4(engine, args.n_prompt, args.reps)?,
+        });
+    }
+    if args.n_gen > 0 {
+        rows.push(Row {
+            test: format!("tg{}", args.n_gen),
+            samples: bench_decode_gemma4(engine, args.n_gen, args.reps)?,
+        });
+    }
+    Ok(rows)
+}
+
 /// `pp<N>`: one batched forward over N tokens into fresh KV caches.
 /// Reported as prompt tokens per second, as `llama-bench` does.
 fn bench_prefill(decoder: &Decoder, n_prompt: usize, reps: usize) -> anyhow::Result<Vec<f64>> {
-    let tokens = synthetic_tokens(decoder, n_prompt);
+    let tokens = synthetic_tokens(decoder.config.vocab_size, n_prompt);
     let mut out = Vec::with_capacity(reps);
     for rep in 0..reps + 1 {
         let mut caches = fresh_caches(decoder);
@@ -249,6 +303,35 @@ fn bench_prefill(decoder: &Decoder, n_prompt: usize, reps: usize) -> anyhow::Res
         // Rep 0 is the warmup: first touch of every weight page, and on
         // Metal the first pipeline compile. Timing it would measure the
         // OS and the shader cache, not the engine.
+        if rep > 0 {
+            out.push(n_prompt as f64 / dt);
+        }
+    }
+    Ok(out)
+}
+
+/// Gemma-4 `pp<N>`: sequential `forward_token` over N synthetic ids.
+/// Keeps only the final logits (same work llama-bench reports), but
+/// without batched matmuls — honest for today's engine.
+fn bench_prefill_gemma4(
+    engine: &Gemma4Engine,
+    n_prompt: usize,
+    reps: usize,
+) -> anyhow::Result<Vec<f64>> {
+    let tokens = synthetic_tokens(Engine::vocab_size(engine), n_prompt);
+    let mut out = Vec::with_capacity(reps);
+    for rep in 0..reps + 1 {
+        let mut state = Engine::new_state(engine);
+        let t = Instant::now();
+        let mut logits = Vec::new();
+        for (i, &tok) in tokens.iter().enumerate() {
+            logits = Engine::forward_token(engine, tok, i, &mut state);
+        }
+        let dt = t.elapsed().as_secs_f64();
+        anyhow::ensure!(
+            !logits.is_empty(),
+            "gemma4 prefill returned no logits for a {n_prompt}-token prompt"
+        );
         if rep > 0 {
             out.push(n_prompt as f64 / dt);
         }
@@ -277,6 +360,29 @@ fn bench_decode(decoder: &Decoder, n_gen: usize, reps: usize) -> anyhow::Result<
     Ok(out)
 }
 
+fn bench_decode_gemma4(
+    engine: &Gemma4Engine,
+    n_gen: usize,
+    reps: usize,
+) -> anyhow::Result<Vec<f64>> {
+    let vocab = Engine::vocab_size(engine).max(1);
+    let mut out = Vec::with_capacity(reps);
+    for rep in 0..reps + 1 {
+        let mut state = Engine::new_state(engine);
+        let _ = Engine::forward_token(engine, 0, 0, &mut state);
+        let t = Instant::now();
+        for i in 0..n_gen {
+            let tok = (i + 1) % vocab;
+            let _ = Engine::forward_token(engine, tok, i + 1, &mut state);
+        }
+        let dt = t.elapsed().as_secs_f64();
+        if rep > 0 {
+            out.push(n_gen as f64 / dt);
+        }
+    }
+    Ok(out)
+}
+
 fn fresh_caches(decoder: &Decoder) -> Vec<KvCache> {
     decoder
         .layers
@@ -288,8 +394,8 @@ fn fresh_caches(decoder: &Decoder) -> Vec<KvCache> {
 /// Token ids that exist in the vocabulary but carry no linguistic
 /// meaning: the point is to move the same bytes through the same
 /// kernels, not to generate text.
-fn synthetic_tokens(decoder: &Decoder, n: usize) -> Vec<usize> {
-    let vocab = decoder.config.vocab_size.max(1);
+fn synthetic_tokens(vocab: usize, n: usize) -> Vec<usize> {
+    let vocab = vocab.max(1);
     (0..n).map(|i| (i * 7 + 1) % vocab).collect()
 }
 
@@ -315,6 +421,27 @@ fn active_backend() -> &'static str {
 fn estimate_params(config: &ModelConfig) -> u64 {
     let embeddings = 2 * config.vocab_size as u64 * config.hidden_dim as u64;
     embeddings + config.approx_active_params_per_token() as u64
+}
+
+/// Display-only param estimate for Gemma-4 (emb + head + per-layer Q/O/FFN).
+fn estimate_gemma4_params(engine: &Gemma4Engine) -> u64 {
+    let hp = &engine.hp;
+    let v = Engine::vocab_size(engine) as u64;
+    let h = hp.hidden_dim as u64;
+    let mut n = 2 * v * h;
+    for (il, &ffn) in hp.ffn_dims.iter().enumerate() {
+        let hd = hp.head_dim(il) as u64;
+        let nh = hp.n_heads as u64;
+        let nkv = hp.n_kv_heads as u64;
+        n += nh * hd * h; // q
+        if hp.has_kv(il) {
+            n += 2 * nkv * hd * h; // k, v
+        }
+        n += nh * hd * h; // o
+        let f = ffn as u64;
+        n += 3 * f * h; // gate, up, down
+    }
+    n
 }
 
 fn quant_label(file: &ferrox_gguf::ShardedGguf) -> String {

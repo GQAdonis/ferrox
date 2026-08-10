@@ -6,7 +6,7 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 description = "Quantized weight formats and fused dequant kernels for Ferrox"
-readme = "../../README.md"
+readme = "README.md"
 
 [dependencies]
 half = { workspace = true }

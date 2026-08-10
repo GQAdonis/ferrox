@@ -2544,6 +2544,322 @@ static inline void mul_mm_sg_impl(
     }
 }
 
+// Same tile/simdgroup body as mul_mm_sg_impl but src1 is half (llama
+// kernel_mul_mm_*_f16). Cuts activation bandwidth ~2× on dense prefill.
+template<typename DQ>
+static inline void mul_mm_sg_impl_f16(
+    device const uchar* src0,
+    device const half* src1,
+    device float* dst,
+    uint n_rows,
+    uint n_cols,
+    uint batch,
+    uint row_bytes,
+    threadgroup char* shmem,
+    uint3 tgpig,
+    ushort tiitg,
+    ushort sgitg
+) {
+    threadgroup half* sa = (threadgroup half*)(shmem);
+    threadgroup half* sb = (threadgroup half*)(shmem + 4096);
+
+    constexpr short NR0 = 64;
+    constexpr short NR1 = 32;
+    constexpr short NK  = 32;
+    constexpr short NL0 = NK / 16;
+    constexpr short NL1 = NK / 8;
+    constexpr short NL  = DQ::NL;
+
+    const int r0 = int(tgpig.y) * NR0;
+    const int r1 = int(tgpig.x) * NR1;
+
+    const short nr0 = (int(n_rows) - r0 < NR0) ? short(int(n_rows) - r0) : NR0;
+    const short nr1 = (int(batch)  - r1 < NR1) ? short(int(batch)  - r1) : NR1;
+
+    const short lr0 = (short(tiitg) / NL0) < nr0 ? (short(tiitg) / NL0) : nr0 - 1;
+    const short lr1 = (short(tiitg) / NL1) < nr1 ? (short(tiitg) / NL1) : nr1 - 1;
+    const short il0 = short(tiitg) % NL0;
+
+    short il = il0;
+    device const uchar* x = src0 + (size_t)row_bytes * (r0 + lr0);
+
+    const short iy = 8 * (short(tiitg) % NL1);
+    device const half* y = src1 + (size_t)(r1 + lr1) * n_cols + iy;
+
+    simdgroup_half8x8 ma[4];
+    simdgroup_half8x8 mb[2];
+    simdgroup_float8x8 mc[8];
+    for (short i = 0; i < 8; i++) {
+        mc[i] = make_filled_simdgroup_matrix<float, 8>(0.f);
+    }
+
+    for (uint loop_k = 0; loop_k < n_cols; loop_k += NK) {
+        float4x4 temp_a;
+        DQ::get(x, il, temp_a);
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+#pragma clang loop unroll(full)
+        for (short i = 0; i < 16; i++) {
+            const short sx = 2 * il0 + i / 8;
+            const short sy = (short(tiitg) / NL0) / 8;
+            const short lx = (short(tiitg) / NL0) % 8;
+            const short ly = i % 8;
+            const short ib = 8 * sx + sy;
+            *(sa + 64 * ib + 8 * ly + lx) = half(temp_a[i / 4][i % 4]);
+        }
+
+        {
+            const short sx = short(tiitg) % NL1;
+            const short sy = (short(tiitg) / NL1) / 8;
+            const short ly = (short(tiitg) / NL1) % 8;
+            const short ib = 4 * sx + sy;
+            *(threadgroup half2x4*)(sb + 64 * ib + 8 * ly) =
+                *(device const half2x4*)y;
+        }
+
+        il = (il + 2 < NL) ? il + 2 : il % 2;
+        if (il < 2) {
+            x += DQ::BLOCK_BYTES;
+        }
+        y += NK;
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        threadgroup const half* lsma = sa + 4 * 64 * (sgitg % 2);
+        threadgroup const half* lsmb = sb + 2 * 64 * (sgitg / 2);
+
+#pragma clang loop unroll(full)
+        for (short ik = 0; ik < NK / 8; ik++) {
+            simdgroup_barrier(mem_flags::mem_none);
+#pragma clang loop unroll(full)
+            for (short i = 0; i < 4; i++) {
+                simdgroup_load(ma[i], lsma + 64 * i, 8, 0, false);
+            }
+            simdgroup_barrier(mem_flags::mem_none);
+#pragma clang loop unroll(full)
+            for (short i = 0; i < 2; i++) {
+                simdgroup_load(mb[i], lsmb + 64 * i, 8, 0, false);
+            }
+            simdgroup_barrier(mem_flags::mem_none);
+#pragma clang loop unroll(full)
+            for (short i = 0; i < 8; i++) {
+                simdgroup_multiply_accumulate(mc[i], mb[i / 4], ma[i % 4], mc[i]);
+            }
+            lsma += 8 * 64;
+            lsmb += 4 * 64;
+        }
+    }
+
+    if (r0 + NR0 <= int(n_rows) && r1 + NR1 <= int(batch)) {
+        device float* C = dst
+            + (r0 + 32 * (sgitg & 1))
+            + (size_t)(r1 + 16 * (sgitg >> 1)) * n_rows;
+        for (short i = 0; i < 8; i++) {
+            simdgroup_store(mc[i], C + 8 * (i % 4) + 8 * (size_t)n_rows * (i / 4), n_rows, 0, false);
+        }
+    } else {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        threadgroup float* temp = ((threadgroup float*)shmem)
+            + 32 * (sgitg & 1) + (16 * (sgitg >> 1)) * NR0;
+        for (short i = 0; i < 8; i++) {
+            simdgroup_store(mc[i], temp + 8 * (i % 4) + 8 * NR0 * (i / 4), NR0, 0, false);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sgitg == 0) {
+            for (short j = short(tiitg); j < nr1; j += NR1) {
+                device float* D = dst + r0 + (size_t)(r1 + j) * n_rows;
+                threadgroup const float* C = ((threadgroup float*)shmem) + j * NR0;
+                device float4* D4 = (device float4*)D;
+                threadgroup const float4* C4 = (threadgroup const float4*)C;
+                short i = 0;
+                for (; i < nr0 / 4; i++) {
+                    D4[i] = C4[i];
+                }
+                for (i *= 4; i < nr0; i++) {
+                    D[i] = C[i];
+                }
+            }
+        }
+    }
+}
+
+
+// llama `kernel_mul_mm_id`: simdgroup GEMM with indexed src1 rows and
+// scattered dst rows (MoE prefill). One z-slice per expert; `tpe[im]` is
+// the batch count for that expert; `ids[im*ids_stride + j]` encodes
+// `token*top_k + slot` for output layout `dst[id*rows + r]`.
+template<typename DQ>
+static inline void mul_mm_id_impl(
+    device const uchar* src0,
+    device const float* src1,
+    device float* dst,
+    device const int* ids,
+    device const uint* tpe,
+    uint expert_stride,
+    uint n_rows,
+    uint n_cols,
+    uint top_k,
+    uint ids_stride,
+    uint row_bytes,
+    uint src1_per_slot,
+    threadgroup char* shmem,
+    uint3 tgpig,
+    ushort tiitg,
+    ushort tiisg,
+    ushort sgitg
+) {
+    threadgroup half* sa = (threadgroup half*)(shmem);
+    threadgroup half* sb = (threadgroup half*)(shmem + 4096);
+
+    constexpr short NR0 = 64;
+    constexpr short NR1 = 32;
+    constexpr short NK  = 32;
+    constexpr short NL0 = NK / 16;
+    constexpr short NL1 = NK / 8;
+    constexpr short NL  = DQ::NL;
+
+    const uint im = tgpig.z;
+    const int r0 = int(tgpig.y) * NR0;
+    const int r1 = int(tgpig.x) * NR1;
+
+    const int neh1 = int(tpe[im]);
+    if (r1 >= neh1) {
+        return;
+    }
+
+    const short nr0 = (int(n_rows) - r0 < NR0) ? short(int(n_rows) - r0) : NR0;
+    const short nr1 = (neh1 - r1 < NR1) ? short(neh1 - r1) : NR1;
+
+    const short lr0 = (short(tiitg) / NL0) < nr0 ? (short(tiitg) / NL0) : nr0 - 1;
+    const short lr1 = (short(tiitg) / NL1) < nr1 ? (short(tiitg) / NL1) : nr1 - 1;
+
+    const short il0 = short(tiitg) % NL0;
+    short il = il0;
+
+    const int id = ids[im * ids_stride + r1 + lr1];
+    const int src1_row = src1_per_slot != 0u ? id : (id / int(top_k));
+
+    device const uchar* row_base = src0 + (size_t)im * expert_stride;
+    device const uchar* x = row_base + (size_t)row_bytes * (r0 + lr0);
+
+    const short iy = 8 * (short(tiitg) % NL1);
+    device const float* y = src1 + (size_t)src1_row * n_cols + iy;
+
+    simdgroup_half8x8 ma[4];
+    simdgroup_half8x8 mb[2];
+    simdgroup_float8x8 mc[8];
+    for (short i = 0; i < 8; i++) {
+        mc[i] = make_filled_simdgroup_matrix<float, 8>(0.f);
+    }
+
+    for (uint loop_k = 0; loop_k < n_cols; loop_k += NK) {
+        float4x4 temp_a;
+        DQ::get(x, il, temp_a);
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+#pragma clang loop unroll(full)
+        for (short i = 0; i < 16; i++) {
+            const short sx = 2 * il0 + i / 8;
+            const short sy = (short(tiitg) / NL0) / 8;
+            const short lx = (short(tiitg) / NL0) % 8;
+            const short ly = i % 8;
+            const short ib = 8 * sx + sy;
+            *(sa + 64 * ib + 8 * ly + lx) = half(temp_a[i / 4][i % 4]);
+        }
+
+        {
+            const short sx = short(tiitg) % NL1;
+            const short sy = (short(tiitg) / NL1) / 8;
+            const short ly = (short(tiitg) / NL1) % 8;
+            const short ib = 4 * sx + sy;
+            *(threadgroup half2x4*)(sb + 64 * ib + 8 * ly) =
+                half2x4(*(device const float2x4*)y);
+        }
+
+        il = (il + 2 < NL) ? il + 2 : il % 2;
+        if (il < 2) {
+            x += DQ::BLOCK_BYTES;
+        }
+        y += NK;
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        threadgroup const half* lsma = sa + 4 * 64 * (sgitg % 2);
+        threadgroup const half* lsmb = sb + 2 * 64 * (sgitg / 2);
+
+#pragma clang loop unroll(full)
+        for (short ik = 0; ik < NK / 8; ik++) {
+            simdgroup_barrier(mem_flags::mem_none);
+#pragma clang loop unroll(full)
+            for (short i = 0; i < 4; i++) {
+                simdgroup_load(ma[i], lsma + 64 * i, 8, 0, false);
+            }
+            simdgroup_barrier(mem_flags::mem_none);
+#pragma clang loop unroll(full)
+            for (short i = 0; i < 2; i++) {
+                simdgroup_load(mb[i], lsmb + 64 * i, 8, 0, false);
+            }
+            simdgroup_barrier(mem_flags::mem_none);
+#pragma clang loop unroll(full)
+            for (short i = 0; i < 8; i++) {
+                simdgroup_multiply_accumulate(mc[i], mb[i / 4], ma[i % 4], mc[i]);
+            }
+            lsma += 8 * 64;
+            lsmb += 4 * 64;
+        }
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    threadgroup float* temp_str = ((threadgroup float*)shmem)
+        + 32 * (sgitg & 1) + (16 * (sgitg >> 1)) * NR0;
+    for (short i = 0; i < 8; i++) {
+        simdgroup_store(mc[i], temp_str + 8 * (i % 4) + 8 * NR0 * (i / 4), NR0, 0, false);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (short j = sgitg; j < nr1; j += 4) {
+        const int sid = ids[im * ids_stride + r1 + j];
+        device float* D = dst + (size_t)sid * n_rows + r0;
+        device float4* D4 = (device float4*)D;
+        threadgroup float* C = ((threadgroup float*)shmem) + j * NR0;
+        threadgroup float4* C4 = (threadgroup float4*)C;
+        int i = int(tiisg);
+        for (; i < nr0 / 4; i += 32) {
+            D4[i] = C4[i];
+        }
+        i = (4 * (nr0 / 4)) + int(tiisg);
+        for (; i < nr0; i += 32) {
+            D[i] = C[i];
+        }
+    }
+}
+
+#define MUL_MM_ID_ENTRY(NAME, DQ)                                           \
+kernel void NAME(                                                           \
+    device const uchar* src0 [[buffer(0)]],                                 \
+    device const float* src1 [[buffer(1)]],                                 \
+    device float* dst [[buffer(2)]],                                        \
+    device const int* ids [[buffer(3)]],                                    \
+    device const uint* tpe [[buffer(4)]],                                   \
+    constant uint& n_rows [[buffer(5)]],                                    \
+    constant uint& n_cols [[buffer(6)]],                                    \
+    constant uint& top_k [[buffer(7)]],                                     \
+    constant uint& ids_stride [[buffer(8)]],                                \
+    constant uint& row_bytes [[buffer(9)]],                                 \
+    constant uint& expert_stride [[buffer(10)]],                            \
+    constant uint& src1_per_slot [[buffer(11)]],                            \
+    threadgroup char* shmem [[threadgroup(0)]],                             \
+    uint3 tgpig [[threadgroup_position_in_grid]],                           \
+    ushort tiitg [[thread_index_in_threadgroup]],                           \
+    ushort tiisg [[thread_index_in_simdgroup]],                             \
+    ushort sgitg [[simdgroup_index_in_threadgroup]]                         \
+) {                                                                         \
+    mul_mm_id_impl<DQ>(src0, src1, dst, ids, tpe, expert_stride, n_rows,   \
+                       n_cols, top_k, ids_stride, row_bytes, src1_per_slot,  \
+                       shmem, tgpig, tiitg, tiisg, sgitg);                  \
+}
 
 #define MUL_MM_SG_ENTRY(NAME, DQ)                                           \
 kernel void NAME(                                                           \
@@ -2563,6 +2879,24 @@ kernel void NAME(                                                           \
                        shmem, tgpig, tiitg, sgitg);                         \
 }
 
+#define MUL_MM_SG_F16_ENTRY(NAME, DQ)                                       \
+kernel void NAME(                                                           \
+    device const uchar* src0 [[buffer(0)]],                                 \
+    device const half* src1 [[buffer(1)]],                                  \
+    device float* dst [[buffer(2)]],                                        \
+    constant uint& n_rows [[buffer(3)]],                                    \
+    constant uint& n_cols [[buffer(4)]],                                    \
+    constant uint& batch [[buffer(5)]],                                     \
+    constant uint& row_bytes [[buffer(6)]],                                 \
+    threadgroup char* shmem [[threadgroup(0)]],                             \
+    uint3 tgpig [[threadgroup_position_in_grid]],                           \
+    ushort tiitg [[thread_index_in_threadgroup]],                           \
+    ushort sgitg [[simdgroup_index_in_threadgroup]]                         \
+) {                                                                         \
+    mul_mm_sg_impl_f16<DQ>(src0, src1, dst, n_rows, n_cols, batch,          \
+                           row_bytes, shmem, tgpig, tiitg, sgitg);          \
+}
+
 MUL_MM_SG_ENTRY(q4_k_mul_mm_sg, Q4KDequant)
 MUL_MM_SG_ENTRY(q6_k_mul_mm_sg, Q6KDequant)
 MUL_MM_SG_ENTRY(q5_k_mul_mm_sg, Q5KDequant)
@@ -2570,6 +2904,16 @@ MUL_MM_SG_ENTRY(q8_0_mul_mm_sg, Q8_0Dequant)
 MUL_MM_SG_ENTRY(q4_0_mul_mm_sg, Q4_0Dequant)
 MUL_MM_SG_ENTRY(q5_0_mul_mm_sg, Q5_0Dequant)
 MUL_MM_SG_ENTRY(iq4_xs_mul_mm_sg, IQ4XSDequant)
+MUL_MM_ID_ENTRY(q4_0_mul_mm_id, Q4_0Dequant)
+MUL_MM_ID_ENTRY(q4_k_mul_mm_id, Q4KDequant)
+MUL_MM_ID_ENTRY(q8_0_mul_mm_id, Q8_0Dequant)
+MUL_MM_SG_F16_ENTRY(q4_k_mul_mm_sg_f16, Q4KDequant)
+MUL_MM_SG_F16_ENTRY(q6_k_mul_mm_sg_f16, Q6KDequant)
+MUL_MM_SG_F16_ENTRY(q5_k_mul_mm_sg_f16, Q5KDequant)
+MUL_MM_SG_F16_ENTRY(q8_0_mul_mm_sg_f16, Q8_0Dequant)
+MUL_MM_SG_F16_ENTRY(q4_0_mul_mm_sg_f16, Q4_0Dequant)
+MUL_MM_SG_F16_ENTRY(q5_0_mul_mm_sg_f16, Q5_0Dequant)
+MUL_MM_SG_F16_ENTRY(iq4_xs_mul_mm_sg_f16, IQ4XSDequant)
 "#;
 
 /// Launches the simdgroup Q4_K GEMM ([`K_QUANT_MUL_MM_SG_KERNEL_SRC`]).
@@ -2840,6 +3184,75 @@ pub fn mul_mm_sg_meta(kind: &str) -> Option<(&'static str, usize, usize)> {
     }
 }
 
+/// MoE indexed simdgroup GEMM (`kernel_mul_mm_id_*`).
+pub fn mul_mm_id_meta(kind: &str) -> Option<(&'static str, usize, usize)> {
+    match kind {
+        "Q4_K" => Some(("q4_k_mul_mm_id", 144, 256)),
+        "Q8_0" => Some(("q8_0_mul_mm_id", 34, 32)),
+        "Q4_0" => Some(("q4_0_mul_mm_id", 18, 32)),
+        _ => None,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_mul_mm_id(
+    enc: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+    device: &Retained<ProtocolObject<dyn MTLDevice>>,
+    fn_name: &'static str,
+    w: &ResidentWeightBuffer,
+    expert_stride: u32,
+    x_buf: &ProtocolObject<dyn MTLBuffer>,
+    out_buf: &ProtocolObject<dyn MTLBuffer>,
+    ids_buf: &ProtocolObject<dyn MTLBuffer>,
+    tpe_buf: &ProtocolObject<dyn MTLBuffer>,
+    n_experts: u32,
+    n_tokens: u32,
+    top_k: u32,
+    rows: u32,
+    cols: u32,
+    row_bytes: u32,
+    src1_per_slot: u32,
+) -> Result<(), MetalError> {
+    let pipeline = ensure_pipeline(device, K_QUANT_MUL_MM_SG_KERNEL_SRC, fn_name)?;
+    unsafe {
+        enc.setComputePipelineState(&pipeline.0);
+        enc.setBuffer_offset_atIndex(Some(&w.buffer), w.weight_offset, 0);
+        enc.setBuffer_offset_atIndex(Some(x_buf), 0, 1);
+        enc.setBuffer_offset_atIndex(Some(out_buf), 0, 2);
+        enc.setBuffer_offset_atIndex(Some(ids_buf), 0, 3);
+        enc.setBuffer_offset_atIndex(Some(tpe_buf), 0, 4);
+        for (idx, mut v) in [
+            (5usize, rows),
+            (6, cols),
+            (7, top_k),
+            (8, n_tokens),
+            (9, row_bytes),
+            (10, expert_stride),
+            (11, src1_per_slot),
+        ] {
+            enc.setBytes_length_atIndex(
+                NonNull::new(&mut v as *mut u32 as *mut _).unwrap(),
+                4,
+                idx,
+            );
+        }
+        enc.setThreadgroupMemoryLength_atIndex(8192, 0);
+        enc.dispatchThreadgroups_threadsPerThreadgroup(
+            MTLSize {
+                width: (n_tokens as usize).div_ceil(32),
+                height: (rows as usize).div_ceil(64),
+                depth: n_experts as usize,
+            },
+            MTLSize {
+                width: 128,
+                height: 1,
+                depth: 1,
+            },
+        );
+    }
+    Ok(())
+}
+
 pub(crate) fn encode_mul_mm_sg(
     enc: &ProtocolObject<dyn MTLComputeCommandEncoder>,
     device: &Retained<ProtocolObject<dyn MTLDevice>>,
@@ -2852,6 +3265,62 @@ pub(crate) fn encode_mul_mm_sg(
     encode_mul_mm_sg_offset(enc, device, l, w, 0, x_buf, out_buf, batch_size)
 }
 
+/// Like [`encode_mul_mm_sg`] but `x_buf` holds half activations (llama
+/// `kernel_mul_mm_*_f16`). Prefill converts f32→f16 once per RMSNorm.
+pub(crate) fn encode_mul_mm_sg_f16(
+    enc: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+    device: &Retained<ProtocolObject<dyn MTLDevice>>,
+    l: &MulMmSgLaunch<'_>,
+    w: &ResidentWeightBuffer,
+    x_h: &ProtocolObject<dyn MTLBuffer>,
+    out_buf: &ProtocolObject<dyn MTLBuffer>,
+    batch_size: usize,
+) -> Result<(), MetalError> {
+    let fn_f16: &'static str = match l.fn_name {
+        "q4_k_mul_mm_sg" => "q4_k_mul_mm_sg_f16",
+        "q5_k_mul_mm_sg" => "q5_k_mul_mm_sg_f16",
+        "q6_k_mul_mm_sg" => "q6_k_mul_mm_sg_f16",
+        "q8_0_mul_mm_sg" => "q8_0_mul_mm_sg_f16",
+        "q4_0_mul_mm_sg" => "q4_0_mul_mm_sg_f16",
+        "q5_0_mul_mm_sg" => "q5_0_mul_mm_sg_f16",
+        "iq4_xs_mul_mm_sg" => "iq4_xs_mul_mm_sg_f16",
+        _ => return Err(MetalError::CommandFailed),
+    };
+    let pipeline = ensure_pipeline(device, K_QUANT_MUL_MM_SG_KERNEL_SRC, fn_f16)?;
+    unsafe {
+        enc.setComputePipelineState(&pipeline.0);
+        enc.setBuffer_offset_atIndex(Some(&w.buffer), w.weight_offset, 0);
+        enc.setBuffer_offset_atIndex(Some(x_h), 0, 1);
+        enc.setBuffer_offset_atIndex(Some(out_buf), 0, 2);
+        for (idx, mut v) in [
+            (3usize, l.rows as u32),
+            (4, l.cols() as u32),
+            (5, batch_size as u32),
+            (6, l.row_bytes as u32),
+        ] {
+            enc.setBytes_length_atIndex(
+                NonNull::new(&mut v as *mut u32 as *mut _).unwrap(),
+                4,
+                idx,
+            );
+        }
+        enc.setThreadgroupMemoryLength_atIndex(8192, 0);
+        enc.dispatchThreadgroups_threadsPerThreadgroup(
+            MTLSize {
+                width: batch_size.div_ceil(32),
+                height: l.rows.div_ceil(64),
+                depth: 1,
+            },
+            MTLSize {
+                width: 128,
+                height: 1,
+                depth: 1,
+            },
+        );
+    }
+    Ok(())
+}
+
 pub(crate) fn encode_mul_mm_sg_offset(
     enc: &ProtocolObject<dyn MTLComputeCommandEncoder>,
     device: &Retained<ProtocolObject<dyn MTLDevice>>,
@@ -2862,6 +3331,32 @@ pub(crate) fn encode_mul_mm_sg_offset(
     out_buf: &ProtocolObject<dyn MTLBuffer>,
     batch_size: usize,
 ) -> Result<(), MetalError> {
+    encode_mul_mm_sg_offset_ex(
+        enc,
+        device,
+        l,
+        w,
+        weight_byte_offset,
+        x_buf,
+        0,
+        out_buf,
+        0,
+        batch_size,
+    )
+}
+
+pub(crate) fn encode_mul_mm_sg_offset_ex(
+    enc: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+    device: &Retained<ProtocolObject<dyn MTLDevice>>,
+    l: &MulMmSgLaunch<'_>,
+    w: &ResidentWeightBuffer,
+    weight_byte_offset: usize,
+    x_buf: &ProtocolObject<dyn MTLBuffer>,
+    x_byte_offset: usize,
+    out_buf: &ProtocolObject<dyn MTLBuffer>,
+    out_byte_offset: usize,
+    batch_size: usize,
+) -> Result<(), MetalError> {
     let pipeline = ensure_pipeline(device, K_QUANT_MUL_MM_SG_KERNEL_SRC, l.fn_name)?;
     unsafe {
         enc.setComputePipelineState(&pipeline.0);
@@ -2870,8 +3365,8 @@ pub(crate) fn encode_mul_mm_sg_offset(
             w.weight_offset + weight_byte_offset,
             0,
         );
-        enc.setBuffer_offset_atIndex(Some(x_buf), 0, 1);
-        enc.setBuffer_offset_atIndex(Some(out_buf), 0, 2);
+        enc.setBuffer_offset_atIndex(Some(x_buf), x_byte_offset, 1);
+        enc.setBuffer_offset_atIndex(Some(out_buf), out_byte_offset, 2);
         for (idx, mut v) in [
             (3usize, l.rows as u32),
             (4, l.cols() as u32),
@@ -5040,7 +5535,7 @@ fn moe_mm_id_map0(
 
 /// llama.cpp `ne21_mm_id_min` — prefer `mul_mm_id` when tokens-per-expert
 /// (after map0) can be large; gate on total prompt tokens as a proxy.
-const MOE_MM_ID_TOKEN_MIN: usize = 32;
+const MOE_MM_ID_TOKEN_MIN: usize = 8;
 
 /// Reused MoE prefill scratch (avoids alloc+wait tax every layer).
 struct MoePrefillScratch {
@@ -5618,7 +6113,8 @@ pub(crate) fn encode_q4_0_moe_id_ex(
 /// `x_batch` is `[T, H]`, `ids`/`route` are `[T, top_k]` (host-routed).
 ///
 /// When some expert has ≥[`MOE_MM_ID_TOKEN_MIN`] gathered tokens (llama
-/// `ne21_mm_id_min`), uses `mul_mm_id`; otherwise slot-parallel `mul_mv_id`.
+/// `ne21_mm_id_min`), uses fused `mul_mm_id` (indexed GEMM, no gather/scatter);
+/// otherwise slot-parallel `mul_mv_id`.
 pub fn launch_moe_prefill_q4_0(
     x_batch: &[f32],
     n_tokens: usize,
@@ -5688,223 +6184,136 @@ pub fn launch_moe_prefill_q4_0(
 
         if use_mm_id {
             let bound = moe_packed_resident(device, packed)?;
+            let (gate_fn, gate_bb, gate_be) =
+                mul_mm_id_meta(packed.gate_kind).ok_or(MetalError::CommandFailed)?;
+            let (up_fn, up_bb, up_be) =
+                mul_mm_id_meta(packed.up_kind).ok_or(MetalError::CommandFailed)?;
+            let (down_fn, down_bb, down_be) =
+                mul_mm_id_meta(packed.down_kind).ok_or(MetalError::CommandFailed)?;
             let hidden_u = hidden as u32;
             let ffn_u = ffn as u32;
-            let (gate_fn, gate_bb, gate_be) =
-                mul_mm_sg_meta(packed.gate_kind).ok_or(MetalError::CommandFailed)?;
-            let (up_fn, up_bb, up_be) =
-                mul_mm_sg_meta(packed.up_kind).ok_or(MetalError::CommandFailed)?;
-            let (down_fn, down_bb, down_be) =
-                mul_mm_sg_meta(packed.down_kind).ok_or(MetalError::CommandFailed)?;
-            let gate_launch = MulMmSgLaunch {
-                weights: &[],
-                rows: ffn,
-                row_bytes: packed.gate_row_bytes,
-                fn_name: gate_fn,
-                block_bytes: gate_bb,
-                block_elems: gate_be,
-            };
-            let up_launch = MulMmSgLaunch {
-                weights: &[],
-                rows: ffn,
-                row_bytes: packed.up_stride / ffn,
-                fn_name: up_fn,
-                block_bytes: up_bb,
-                block_elems: up_be,
-            };
-            let down_launch = MulMmSgLaunch {
-                weights: &[],
-                rows: hidden,
-                row_bytes: packed.down_row_bytes,
-                fn_name: down_fn,
-                block_bytes: down_bb,
-                block_elems: down_be,
-            };
-            let contig_in = scratch.contig_in.as_ref();
-            let contig_out = scratch.contig_out.as_ref();
-            let mut flat_tok = Vec::new();
-            let mut flat_slot = Vec::new();
-            let mut offsets = Vec::with_capacity(packed.n_experts);
-            for list in &per_expert {
-                offsets.push(flat_tok.len());
-                for &(t, s) in list {
-                    flat_tok.push(t);
-                    flat_slot.push(s);
-                }
-            }
-            let tok_buf = if flat_tok.is_empty() {
-                None
-            } else {
-                Some(
-                    unsafe {
-                        device.newBufferWithBytes_length_options(
-                            NonNull::new(flat_tok.as_mut_ptr() as *mut _).unwrap(),
-                            flat_tok.len() * 4,
-                            MTLResourceOptions::StorageModeShared,
-                        )
-                    }
-                    .ok_or(MetalError::BufferAllocFailed)?,
-                )
-            };
-            let slot_map_buf = if flat_slot.is_empty() {
-                None
-            } else {
-                Some(
-                    unsafe {
-                        device.newBufferWithBytes_length_options(
-                            NonNull::new(flat_slot.as_mut_ptr() as *mut _).unwrap(),
-                            flat_slot.len() * 4,
-                            MTLResourceOptions::StorageModeShared,
-                        )
-                    }
-                    .ok_or(MetalError::BufferAllocFailed)?,
-                )
-            };
+            let top_k_u = top_k as u32;
+            let n_tokens_u = n_tokens as u32;
+            let n_experts_u = packed.n_experts as u32;
+            let gate_cols = ((packed.gate_row_bytes / gate_bb) * gate_be) as u32;
+            let up_row_bytes = packed.up_stride / ffn;
+            let up_cols = ((up_row_bytes / up_bb) * up_be) as u32;
+            let down_cols = ((packed.down_row_bytes / down_bb) * down_be) as u32;
 
-            if let (Some(tok_b), Some(slot_b)) = (tok_buf.as_ref(), slot_map_buf.as_ref()) {
-                for (eid, list) in per_expert.iter().enumerate() {
-                    let batch = list.len();
-                    if batch == 0 {
-                        continue;
-                    }
-                    let off = offsets[eid];
-                    let batch_u = batch as u32;
-                    encode_moe_gather_rows(
-                        &encoder,
-                        device,
-                        &x_buf,
-                        contig_in,
-                        tok_b,
-                        off,
-                        batch_u,
-                        hidden_u,
-                        hidden_u,
-                        hidden_u,
-                    )?;
-                    encode_mul_mm_sg_offset(
-                        &encoder,
-                        device,
-                        &gate_launch,
-                        &bound.gate,
-                        eid * packed.gate_stride,
-                        contig_in,
-                        contig_out,
-                        batch,
-                    )?;
-                    encode_moe_scatter_rows(
-                        &encoder,
-                        device,
-                        contig_out,
-                        gate_buf,
-                        slot_b,
-                        off,
-                        batch_u,
-                        ffn_u,
-                        ffn_u,
-                        ffn_u,
-                    )?;
-                    // Reuse gathered `contig_in` for up — same token rows as gate.
-                    memory_barrier_resources(&encoder, &[contig_in, contig_out]);
-                    encode_mul_mm_sg_offset(
-                        &encoder,
-                        device,
-                        &up_launch,
-                        &bound.up,
-                        eid * packed.up_stride,
-                        contig_in,
-                        contig_out,
-                        batch,
-                    )?;
-                    encode_moe_scatter_rows(
-                        &encoder,
-                        device,
-                        contig_out,
-                        up_buf,
-                        slot_b,
-                        off,
-                        batch_u,
-                        ffn_u,
-                        ffn_u,
-                        ffn_u,
-                    )?;
+            let mut tpe = vec![0u32; packed.n_experts];
+            let mut mm_ids = vec![0i32; packed.n_experts * n_tokens];
+            for (eid, list) in per_expert.iter().enumerate() {
+                tpe[eid] = list.len() as u32;
+                for (i, &(_token, slot)) in list.iter().enumerate() {
+                    mm_ids[eid * n_tokens + i] = slot;
                 }
-                memory_barrier_resources(&encoder, &[gate_buf, up_buf]);
-                crate::elem::encode_silu_mul(
-                    &encoder,
-                    device,
-                    gate_buf,
-                    up_buf,
-                    act_buf,
-                    (n_slots * ffn) as u32,
-                )?;
-                memory_barrier_resources(&encoder, &[act_buf]);
-                for (eid, list) in per_expert.iter().enumerate() {
-                    let batch = list.len();
-                    if batch == 0 {
-                        continue;
-                    }
-                    let off = offsets[eid];
-                    let batch_u = batch as u32;
-                    encode_moe_gather_rows(
-                        &encoder,
-                        device,
-                        act_buf,
-                        contig_in,
-                        slot_b,
-                        off,
-                        batch_u,
-                        ffn_u,
-                        ffn_u,
-                        ffn_u,
-                    )?;
-                    encode_mul_mm_sg_offset(
-                        &encoder,
-                        device,
-                        &down_launch,
-                        &bound.down,
-                        eid * packed.down_stride,
-                        contig_in,
-                        contig_out,
-                        batch,
-                    )?;
-                    encode_moe_scatter_rows(
-                        &encoder,
-                        device,
-                        contig_out,
-                        expert_out_buf,
-                        slot_b,
-                        off,
-                        batch_u,
-                        hidden_u,
-                        hidden_u,
-                        hidden_u,
-                    )?;
-                }
-                memory_barrier_resources(&encoder, &[expert_out_buf]);
-                encode_q4_0_moe_id_ex(
-                    &encoder,
-                    device,
-                    &x_buf,
-                    packed,
-                    &ids_buf,
-                    &route_buf,
-                    gate_buf,
-                    up_buf,
-                    act_buf,
-                    expert_out_buf,
-                    out_buf,
-                    top_k as u32,
-                    n_tokens as u32,
-                    false,
-                    true,
-                    true,
-                    true,
-                )?;
             }
+            let tpe_buf = unsafe {
+                device.newBufferWithBytes_length_options(
+                    NonNull::new(tpe.as_mut_ptr() as *mut _).unwrap(),
+                    tpe.len() * 4,
+                    MTLResourceOptions::StorageModeShared,
+                )
+            }
+            .ok_or(MetalError::BufferAllocFailed)?;
+            let mm_ids_buf = unsafe {
+                device.newBufferWithBytes_length_options(
+                    NonNull::new(mm_ids.as_mut_ptr() as *mut _).unwrap(),
+                    mm_ids.len() * 4,
+                    MTLResourceOptions::StorageModeShared,
+                )
+            }
+            .ok_or(MetalError::BufferAllocFailed)?;
+
+            encode_mul_mm_id(
+                &encoder,
+                device,
+                gate_fn,
+                &bound.gate,
+                packed.gate_stride as u32,
+                &x_buf,
+                gate_buf,
+                &mm_ids_buf,
+                &tpe_buf,
+                n_experts_u,
+                n_tokens_u,
+                top_k_u,
+                ffn_u,
+                gate_cols,
+                packed.gate_row_bytes as u32,
+                0,
+            )?;
+            memory_barrier_resources(&encoder, &[gate_buf]);
+            encode_mul_mm_id(
+                &encoder,
+                device,
+                up_fn,
+                &bound.up,
+                packed.up_stride as u32,
+                &x_buf,
+                up_buf,
+                &mm_ids_buf,
+                &tpe_buf,
+                n_experts_u,
+                n_tokens_u,
+                top_k_u,
+                ffn_u,
+                up_cols,
+                up_row_bytes as u32,
+                0,
+            )?;
+            memory_barrier_resources(&encoder, &[gate_buf, up_buf]);
+            crate::elem::encode_silu_mul(
+                &encoder,
+                device,
+                gate_buf,
+                up_buf,
+                act_buf,
+                (n_slots * ffn) as u32,
+            )?;
+            memory_barrier_resources(&encoder, &[act_buf]);
+            encode_mul_mm_id(
+                &encoder,
+                device,
+                down_fn,
+                &bound.down,
+                packed.down_stride as u32,
+                act_buf,
+                expert_out_buf,
+                &mm_ids_buf,
+                &tpe_buf,
+                n_experts_u,
+                n_tokens_u,
+                top_k_u,
+                hidden_u,
+                down_cols,
+                packed.down_row_bytes as u32,
+                1,
+            )?;
+            memory_barrier_resources(&encoder, &[expert_out_buf]);
+            encode_q4_0_moe_id_ex(
+                &encoder,
+                device,
+                &x_buf,
+                packed,
+                &ids_buf,
+                &route_buf,
+                gate_buf,
+                up_buf,
+                act_buf,
+                expert_out_buf,
+                out_buf,
+                top_k_u,
+                n_tokens_u,
+                false,
+                true,
+                true,
+                true,
+            )?;
             encoder.endEncoding();
             cmd_buf.commit();
             cmd_buf.waitUntilCompleted();
-            let _keep = (flat_tok, flat_slot);
+            let _keep = (tpe, mm_ids);
         } else {
             encode_q4_0_moe_id(
                 &encoder,
@@ -6882,7 +7291,8 @@ mod tests {
         let ffn = 96;
         let n_experts = 4;
         let top_k = 2;
-        let n_tokens = 3;
+        // ≥ MOE_MM_ID_TOKEN_MIN so this exercises fused `mul_mm_id`, not `mul_mv_id`.
+        let n_tokens = 16;
         let gu_row_bytes =
             (hidden / ferrox_quant::Q4_0_BLOCK_ELEMS) * ferrox_quant::Q4_0_BLOCK_BYTES;
         let down_row_bytes =

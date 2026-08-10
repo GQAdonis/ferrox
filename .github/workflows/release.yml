@@ -1,0 +1,156 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to create/upload (e.g. v0.3.0)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build ${{ matrix.asset_suffix }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            asset_suffix: darwin-arm64
+            features: metal
+            target: aarch64-apple-darwin
+          - os: ubuntu-latest
+            asset_suffix: linux-x86_64
+            features: ""
+            target: x86_64-unknown-linux-gnu
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.asset_suffix }}
+
+      - name: Build release binaries
+        shell: bash
+        run: |
+          set -euo pipefail
+          FEATURES=()
+          if [[ -n "${{ matrix.features }}" ]]; then
+            FEATURES=(--features "${{ matrix.features }}")
+          fi
+          cargo build --release --locked \
+            -p ferrox-cli -p ferrox-server \
+            --target "${{ matrix.target }}" \
+            "${FEATURES[@]}"
+
+      - name: Package tarball
+        id: package
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            TAG="${{ inputs.tag }}"
+          else
+            TAG="${GITHUB_REF_NAME}"
+          fi
+          # Strip leading v from versioned asset names only for display; keep tag as-is.
+          ASSET="ferrox-${TAG}-${{ matrix.asset_suffix }}"
+          STAGE="dist/${ASSET}"
+          mkdir -p "${STAGE}"
+          BIN_DIR="target/${{ matrix.target }}/release"
+          cp "${BIN_DIR}/ferrox" "${BIN_DIR}/ferrox-server" "${STAGE}/"
+          chmod +x "${STAGE}/ferrox" "${STAGE}/ferrox-server"
+          tar -C dist -czf "${ASSET}.tar.gz" "${ASSET}"
+          shasum -a 256 "${ASSET}.tar.gz" | tee "${ASSET}.tar.gz.sha256"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "asset=${ASSET}.tar.gz" >> "$GITHUB_OUTPUT"
+          echo "checksum=${ASSET}.tar.gz.sha256" >> "$GITHUB_OUTPUT"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.package.outputs.asset }}
+          path: |
+            ${{ steps.package.outputs.asset }}
+            ${{ steps.package.outputs.checksum }}
+
+  release:
+    name: publish GitHub release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve tag
+        id: tag
+        shell: bash
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            echo "tag=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Stage release assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release-assets
+          cp artifacts/*.tar.gz artifacts/*.sha256 release-assets/
+          cp scripts/install.sh release-assets/install.sh
+          chmod +x release-assets/install.sh
+          ls -la release-assets
+
+      - name: Create / update GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: Ferrox ${{ steps.tag.outputs.tag }}
+          generate_release_notes: true
+          files: |
+            release-assets/*
+          body: |
+            ## Install
+
+            ```bash
+            curl -fsSL https://raw.githubusercontent.com/antonellof/ferrox/main/scripts/install.sh | bash
+            ```
+
+            Or pin a version:
+
+            ```bash
+            FERROX_VERSION=${{ steps.tag.outputs.tag }} \
+              curl -fsSL https://raw.githubusercontent.com/antonellof/ferrox/main/scripts/install.sh | bash
+            ```
+
+            ## Prebuilt archives
+
+            | Asset | Notes |
+            | --- | --- |
+            | `ferrox-${{ steps.tag.outputs.tag }}-darwin-arm64.tar.gz` | macOS Apple Silicon, Metal |
+            | `ferrox-${{ steps.tag.outputs.tag }}-linux-x86_64.tar.gz` | Linux x86_64, CPU |
+
+            CUDA and other hosts: build from source (`--features cuda`).
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

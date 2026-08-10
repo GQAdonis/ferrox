@@ -1,6 +1,4 @@
-<p align="center">
-  <img src="docs/assets/ferrox-logo.png" alt="Ferrox — pure-Rust GGUF / MoE inference" width="520">
-</p>
+
 
 **Ferrox** is a pure-Rust inference engine for GGUF models. It runs dense
 and MoE checkpoints on CPU, Apple Metal, or CUDA, with a llama.cpp-style
@@ -8,30 +6,16 @@ CLI and an OpenAI-compatible HTTP server.
 
 ## Quick start
 
-### Install from a GitHub release (recommended)
-
-Prebuilt binaries are attached to each
-[GitHub release](https://github.com/antonellof/ferrox/releases).
-macOS Apple Silicon builds include Metal.
+### Install
 
 ```bash
-# Latest macOS arm64 (Metal) — adjust the tag if you pin a version
-TAG=v0.3.0
-curl -fsSL -o ferrox-darwin-arm64.tar.gz \
-  "https://github.com/antonellof/ferrox/releases/download/${TAG}/ferrox-${TAG}-darwin-arm64.tar.gz"
-tar xzf ferrox-darwin-arm64.tar.gz
-chmod +x ferrox ferrox-server
-
-# Or with the GitHub CLI:
-# gh release download v0.3.0 -p 'ferrox-*-darwin-arm64.tar.gz' --repo antonellof/ferrox
-# tar xzf ferrox-v0.3.0-darwin-arm64.tar.gz
+curl -fsSL https://raw.githubusercontent.com/antonellof/ferrox/main/scripts/install.sh | bash
 ```
 
-Put the binaries on your `PATH`, or run them from the extract directory
-(examples below use `./ferrox` / `./ferrox-server`).
-
-Linux / CUDA / other hosts: use **Build from source** below (or
-`cargo install ferrox-cli` / `ferrox-server` when published).
+Installs `ferrox` and `ferrox-server` into `~/.local/bin` (override with
+`FERROX_INSTALL_DIR`). Pins a release with `FERROX_VERSION=v0.3.0`.
+Prebuilts: macOS arm64 (Metal) and Linux x86_64 (CPU). CUDA / other
+hosts: build from source.
 
 ### Build from source
 
@@ -66,13 +50,15 @@ hf download unsloth/gemma-4-E2B-it-GGUF \
 
 Other useful GGUFs:
 
-| Model | Repo | File |
-| --- | --- | --- |
-| TinyLlama 1.1B Chat Q8_0 | [TheBloke/…](https://huggingface.co/TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF) | `tinyllama-1.1b-chat-v1.0.Q8_0.gguf` |
-| Gemma-4 E2B Instruct Q4_K_M | [unsloth/…](https://huggingface.co/unsloth/gemma-4-E2B-it-GGUF) | `gemma-4-E2B-it-Q4_K_M.gguf` |
-| Llama 3.2 1B Instruct Q4_K_M | [bartowski/…](https://huggingface.co/bartowski/Llama-3.2-1B-Instruct-GGUF) | `Llama-3.2-1B-Instruct-Q4_K_M.gguf` |
+
+| Model                        | Repo                                                                            | File                                     |
+| ---------------------------- | ------------------------------------------------------------------------------- | ---------------------------------------- |
+| TinyLlama 1.1B Chat Q8_0     | [TheBloke/…](https://huggingface.co/TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF)     | `tinyllama-1.1b-chat-v1.0.Q8_0.gguf`     |
+| Gemma-4 E2B Instruct Q4_K_M  | [unsloth/…](https://huggingface.co/unsloth/gemma-4-E2B-it-GGUF)                 | `gemma-4-E2B-it-Q4_K_M.gguf`             |
+| Llama 3.2 1B Instruct Q4_K_M | [bartowski/…](https://huggingface.co/bartowski/Llama-3.2-1B-Instruct-GGUF)      | `Llama-3.2-1B-Instruct-Q4_K_M.gguf`      |
 | Llama 3.1 8B Instruct Q4_K_M | [bartowski/…](https://huggingface.co/bartowski/Meta-Llama-3.1-8B-Instruct-GGUF) | `Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf` |
-| SmolLM2 135M Instruct Q8_0 | [bartowski/…](https://huggingface.co/bartowski/SmolLM2-135M-Instruct-GGUF) | `SmolLM2-135M-Instruct-Q8_0.gguf` |
+| SmolLM2 135M Instruct Q8_0   | [bartowski/…](https://huggingface.co/bartowski/SmolLM2-135M-Instruct-GGUF)      | `SmolLM2-135M-Instruct-Q8_0.gguf`        |
+
 
 Browse [llama.cpp-compatible models](https://huggingface.co/models?apps=llama.cpp&sort=trending)
 on Hugging Face. Prefer `Q4_K_M` for everyday use; `Q8_0` for tiny smokes.
@@ -80,7 +66,7 @@ See [docs/MODELS.md](docs/MODELS.md) for what Ferrox supports today.
 
 ### 2. Run the CLI
 
-Instruct / chat models (Gemma-4, Llama Instruct, …): **omit `--no-cnv`** so Ferrox
+Instruct / chat models (Gemma-4, Llama Instruct, …): **omit** `--no-cnv` so Ferrox
 applies the GGUF chat template. Use `--no-cnv` only for raw completion prompts.
 
 ```bash
@@ -116,18 +102,22 @@ Use `./target/release/ferrox-server` after a source build.
 
 ## Documentation
 
-| Doc | Description |
-| --- | --- |
-| [docs/FEATURES.md](docs/FEATURES.md) | Capabilities overview |
-| [docs/MODELS.md](docs/MODELS.md) | Supported models and benchmarks |
-| [docs/CLI.md](docs/CLI.md) | CLI flags and examples |
-| [docs/API.md](docs/API.md) | OpenAI-compatible API |
-| [docs/CONFIG.md](docs/CONFIG.md) | Environment variables |
-| [docs/AGENTS_COOKBOOK.md](docs/AGENTS_COOKBOOK.md) | Point IDEs / agents at the server |
-| [benchmarks/RESULTS.md](benchmarks/RESULTS.md) | Speed vs llama.cpp (engine + serving) |
-| [benchmarks/README.md](benchmarks/README.md) | How the two benchmark tracks are measured |
-| [docs/ROADMAP.md](docs/ROADMAP.md) | Planned work |
-| [CONTRIBUTING.md](CONTRIBUTING.md) | How to contribute |
+
+| Doc                                                | Description                               |
+| -------------------------------------------------- | ----------------------------------------- |
+| [docs/FEATURES.md](docs/FEATURES.md)               | Capabilities overview                     |
+| [docs/MODELS.md](docs/MODELS.md)                   | Supported models and benchmarks           |
+| [docs/CLI.md](docs/CLI.md)                         | CLI flags and examples                    |
+| [docs/API.md](docs/API.md)                         | OpenAI-compatible API                     |
+| [docs/CONFIG.md](docs/CONFIG.md)                   | Environment variables                     |
+| [docs/AGENTS_COOKBOOK.md](docs/AGENTS_COOKBOOK.md) | Point IDEs / agents at the server         |
+| [benchmarks/RESULTS.md](benchmarks/RESULTS.md)     | Speed vs llama.cpp (engine + serving)     |
+| [benchmarks/README.md](benchmarks/README.md)       | How the two benchmark tracks are measured |
+| [docs/ROADMAP.md](docs/ROADMAP.md)                 | Planned work                              |
+| [CONTRIBUTING.md](CONTRIBUTING.md)                 | How to contribute                         |
+
+
+
 
 ## AI full disclosure
 

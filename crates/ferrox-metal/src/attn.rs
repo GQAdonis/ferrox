@@ -5440,8 +5440,21 @@ pub fn launch_decode_dense_stack(
     let ff_buf = ff_resident.as_ref().map(|b| b.buffer.as_ref());
 
     let cmd_buf = queue.commandBuffer().ok_or(MetalError::CommandFailed)?;
-    // llama.cpp concurrent encode: gate∥up and Q∥K∥V overlap
-    let encoder = compute_encoder_concurrent(&cmd_buf)?;
+    // Sandwich (Gemma post-norms): use the default serial encoder. Concurrent
+    // dispatch + in-place RMSNorm/deferred residuals was measured to diverge
+    // from CPU on Gemma-2 B=1 decode while the serial prefill-shaped residual
+    // path stays coherent. Non-sandwich (SmolLM2) keeps Concurrent for Q∥K∥V.
+    let sandwich = layers
+        .iter()
+        .any(|l| l.post_attn_norm.is_some() || l.post_ffn_norm.is_some());
+    let encoder = if sandwich {
+        cmd_buf
+            .computeCommandEncoder()
+            .ok_or(MetalError::CommandFailed)?
+    } else {
+        // llama.cpp concurrent encode: gate∥up and Q∥K∥V overlap
+        compute_encoder_concurrent(&cmd_buf)?
+    };
 
     let embd_resident = if let Some(e) = embd {
         let w = resident_weight_buffer(device, e.weights)?;
@@ -5462,6 +5475,13 @@ pub fn launch_decode_dense_stack(
     };
     let _embd_resident = embd_resident;
 
+    // Gemma sandwich (post_attn / post_ffn) must apply residuals eagerly —
+    // same shape as the working prefill stack / CPU path. Deferred
+    // `h += down` fused into the next layer's attn_norm matches SmolLM2
+    // (no post-norms) but diverges for Gemma-2 Metal greedy (BOS loops /
+    // `*` spam) even when GQA unit tests pass.
+    // `sandwich` was computed above (also selects serial encoder).
+
     for (layer_idx, (layer, kv)) in layers.iter().zip(kvs.iter_mut()).enumerate() {
         assert_eq!(layer.attn_norm_w.len(), hidden_dim);
         assert_eq!(layer.ffn_norm_w.len(), hidden_dim);
@@ -5479,9 +5499,10 @@ pub fn launch_decode_dense_stack(
         let up_w = resident_weight_buffer(device, layer.up.weights)?;
         let down_w = resident_weight_buffer(device, layer.down.weights)?;
 
-        // Pre-LN: layer 0 norms raw hidden; later layers fuse the previous
-        // FFN residual (`down_buf` still holds prior down) into attn_norm.
-        if layer_idx == 0 {
+        // Pre-LN: layer 0 norms raw hidden; later layers either fuse the
+        // previous FFN residual into attn_norm (non-sandwich) or just
+        // RMSNorm (sandwich already applied `h += down` eagerly).
+        if layer_idx == 0 || sandwich {
             encode_rms_norm(
                 &encoder,
                 device,
@@ -5594,17 +5615,32 @@ pub fn launch_decode_dense_stack(
             )?;
             memory_barrier_buffers(&encoder);
         }
-        // Fuse attn residual + ffn_norm into one dispatch.
-        encode_add_rms_norm(
-            &encoder,
-            device,
-            h_buf,
-            o_buf,
-            &ffn_nw.buffer,
-            x2_buf,
-            hidden_dim as u32,
-            rms_eps,
-        )?;
+        if sandwich {
+            // Eager residual + separate ffn_norm (prefill / CPU parity).
+            encode_vec_add(&encoder, device, h_buf, o_buf, hidden_dim as u32)?;
+            memory_barrier_buffers(&encoder);
+            encode_rms_norm(
+                &encoder,
+                device,
+                h_buf,
+                &ffn_nw.buffer,
+                x2_buf,
+                hidden_dim as u32,
+                rms_eps,
+            )?;
+        } else {
+            // Fuse attn residual + ffn_norm into one dispatch.
+            encode_add_rms_norm(
+                &encoder,
+                device,
+                h_buf,
+                o_buf,
+                &ffn_nw.buffer,
+                x2_buf,
+                hidden_dim as u32,
+                rms_eps,
+            )?;
+        }
         memory_barrier_buffers(&encoder);
         // gate ∥ up (llama concurrent)
         encode_matvec(&encoder, device, &layer.gate, &gate_w, x2_buf, gate_buf)?;
@@ -5643,29 +5679,47 @@ pub fn launch_decode_dense_stack(
                 hidden_dim as u32,
                 rms_eps,
             )?;
+            memory_barrier_buffers(&encoder);
         }
-        // Next layer's fused attn_norm reads prior `down_buf`.
-        memory_barrier_buffers(&encoder);
-        // Defer `h += down` until the next layer's attn_norm (or final_norm)
-        // so it fuses with that RMSNorm. Last layer handled below.
+        if sandwich {
+            // Eager FFN residual — next layer attn_norm is plain RMSNorm.
+            encode_vec_add(&encoder, device, h_buf, down_buf, hidden_dim as u32)?;
+            memory_barrier_buffers(&encoder);
+        } else {
+            // Next layer's fused attn_norm reads prior `down_buf`.
+            memory_barrier_buffers(&encoder);
+            // Defer `h += down` until the next layer's attn_norm (or final_norm)
+            // so it fuses with that RMSNorm. Last layer handled below.
+        }
     }
 
-    // Apply the last layer's deferred FFN residual, fused with final_norm
-    // when present; otherwise a plain vec_add.
-    let last_down = down_buf;
+    // Final norm / lm_head. Sandwich already applied every FFN residual;
+    // non-sandwich still has a deferred last-layer `down` to fold in.
     let (download_n, norm_resident) = if let Some(fnw) = final_norm_w {
         assert_eq!(fnw.len(), hidden_dim);
         let fn_buf = resident_f32_buffer(device, fnw)?;
-        encode_add_rms_norm(
-            &encoder,
-            device,
-            h_buf,
-            last_down,
-            &fn_buf.buffer,
-            x_buf,
-            hidden_dim as u32,
-            rms_eps,
-        )?;
+        if sandwich {
+            encode_rms_norm(
+                &encoder,
+                device,
+                h_buf,
+                &fn_buf.buffer,
+                x_buf,
+                hidden_dim as u32,
+                rms_eps,
+            )?;
+        } else {
+            encode_add_rms_norm(
+                &encoder,
+                device,
+                h_buf,
+                down_buf,
+                &fn_buf.buffer,
+                x_buf,
+                hidden_dim as u32,
+                rms_eps,
+            )?;
+        }
         if let (Some(out_l), Some(logits)) = (output, logits_buf) {
             assert_eq!(out_l.rows, logits_rows.unwrap());
             // RAW: lm_head reads `x_buf` written by add_rms_norm. Without
@@ -5687,9 +5741,11 @@ pub fn launch_decode_dense_stack(
             // and mark x_buf resident for the next apply_gpu.
             (hidden_dim, true)
         }
+    } else if sandwich {
+        (hidden_dim, false)
     } else {
         // No final_norm: still apply the deferred last-layer FFN residual.
-        encode_vec_add(&encoder, device, h_buf, last_down, hidden_dim as u32)?;
+        encode_vec_add(&encoder, device, h_buf, down_buf, hidden_dim as u32)?;
         (hidden_dim, false)
     };
 

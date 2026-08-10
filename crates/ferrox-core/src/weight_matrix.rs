@@ -747,8 +747,6 @@ impl WeightMatrix {
                             }
                             return out;
                         }
-                        // Q4_K / Q5_K / Q6_K: keep on the f32 fused-dot path
-                        // even when FERROX_CPU_INT_DOT=1. The Q8_K activation
                         QuantKind::Q4K if x.len().is_multiple_of(256) => {
                             let act = ferrox_quant::quantize_activations_q8_k(x);
                             let n_groups = *rows / ferrox_quant::Q4_KX8_NROWS;

@@ -2905,6 +2905,19 @@ impl Decoder {
                 crate::config::FfnActivation::Swiglu
                 | crate::config::FfnActivation::SwigluFused => run_expert(normed2, ex),
                 crate::config::FfnActivation::Gelu => {
+                    // Share one Q8 act quant across gate+up when INT_DOT
+                    // can serve both (Q8_0 / Q4_0); else two `.apply`s.
+                    if ferrox_core::weight_matrix::cpu_int_dot_enabled()
+                        && normed2.len().is_multiple_of(32)
+                    {
+                        let act = ferrox_quant::quantize_activations_q8(normed2);
+                        if let (Some(gate), Some(up)) =
+                            (ex.gate.apply_cpu_q8(&act), ex.up.apply_cpu_q8(&act))
+                        {
+                            let activated = geglu(&gate, &up);
+                            return ex.down.apply(&activated);
+                        }
+                    }
                     let gate = ex.gate.apply(normed2);
                     let up = ex.up.apply(normed2);
                     let activated = geglu(&gate, &up);

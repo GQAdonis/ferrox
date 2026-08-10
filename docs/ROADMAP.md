@@ -6,7 +6,21 @@ tok/s on the same host, backend, and GGUF. Current speed numbers:
 
 What ships today: `[FEATURES.md](FEATURES.md)` · `[MODELS.md](MODELS.md)`.
 
+## Engine parity gaps (ledger)
 
+Closed since the last gap rewrite: bench last-token `lm_head` only;
+CPU Q4_K batch GEMM (`gemm_q4_kx8_group` in `weight_matrix`); SmolLM2 Metal
+greedy lm_head; OLMoE Metal gather + `mul_mm_sg` / Q4_0 `mul_mv_id`; Qwen
+shared-expert loader fallback; CPU MoE token→expert bucketing (`moe_ffn_batch`).
+
+Still open (see [`benchmarks/RESULTS.md`](../benchmarks/RESULTS.md) Open):
+
+- **Metal prefill** — sub-1.5B Q8_0 (~18–21×); Qwen1.5-MoE (~20×; fused
+  `kernel_mul_mm_id` not landed); dense 1–8B (~1.5–3×); compiled graph /
+  pre-encoded CB replay for sub-1.5B ≤1×.
+- **CPU prefill/decode** — Gemma-2 / Phi / Mistral Q4_K pp512 after GEMM
+  re-measure; i8mm SMMLA if still >1×; persistent decode threadpool.
+- **Correctness** — Gemma-2 Metal greedy Paris OK after sandwich-stack serial encode (2026-08-10).
 
 Where the project should go beyond closing the measured gaps.
 

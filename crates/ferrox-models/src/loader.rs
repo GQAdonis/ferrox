@@ -340,21 +340,30 @@ impl ModelConfig {
             .map(|v| v as usize)
             .filter(|&w| w > 0);
 
-        // Gemma 2+/3 alternating SWA period (`attention.sliding_window_pattern`).
-        // llama.cpp gemma3 defaults the period to 6 when SWA is active but
-        // the pattern key is absent; a missing key must NOT mean "all SWA".
+        // Gemma alternating SWA period (`attention.sliding_window_pattern`).
+        // llama.cpp: gemma2 defaults period=2, gemma3 defaults period=6 when
+        // the pattern key is absent. A missing key must NOT mean "all SWA".
         let swa_pattern = metadata_u64_any(file, &[key("attention.sliding_window_pattern")])
             .map(|v| v as usize)
             .filter(|&p| p > 1)
             .or_else(|| {
-                if matches!(
-                    arch_profile.family,
-                    crate::capability::DecoderFamily::GemmaFamily
-                ) && sliding_window.is_some()
-                {
-                    Some(6)
-                } else {
-                    None
+                if sliding_window.is_none() {
+                    return None;
+                }
+                match arch_profile.family {
+                    crate::capability::DecoderFamily::GemmaFamily => {
+                        // Prefer architecture string: gemma2 → 2, else gemma3+ → 6.
+                        let arch = file
+                            .metadata_str("general.architecture")
+                            .unwrap_or("")
+                            .to_ascii_lowercase();
+                        if arch == "gemma2" || arch.starts_with("gemma2") {
+                            Some(2)
+                        } else {
+                            Some(6)
+                        }
+                    }
+                    _ => None,
                 }
             });
 

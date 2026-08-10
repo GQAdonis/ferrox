@@ -33,8 +33,8 @@ pinning both to the same count does not make the comparison fairer.
 |---|---|---|---|---|---|
 | Gemma-2-2B-IT Q4_K_M | cpu | pp512 | **40.61** | **167.82** | 🔴 **4.13×** |
 | Gemma-2-2B-IT Q4_K_M | cpu | tg128 | **16.55** | **26.04** | 🔴 **1.57×** |
-| Gemma-2-2B-IT Q4_K_M | metal | pp512 | **136.10** | **547.17** | 🔴 **4.02×** |
-| Gemma-2-2B-IT Q4_K_M | metal | tg128 | **33.66** | **41.01** | 🔴 **1.22×** |
+| Gemma-2-2B-IT Q4_K_M | metal | pp512 | **753.75** | **914.24** | 🔴 **1.21×** |
+| Gemma-2-2B-IT Q4_K_M | metal | tg128 | **55.48** | **66.26** | 🔴 **1.19×** |
 | Gemma-3-1B-IT Q8_0 | cpu | pp512 | **101.71** | **339.51** | 🔴 **3.34×** |
 | Gemma-3-1B-IT Q8_0 | cpu | tg128 | **37.19** | **41.90** | 🔴 **1.13×** |
 | Gemma-3-1B-IT Q8_0 | metal | pp512 | **92.21** | **1920.51** | 🔴 **20.83×** |
@@ -162,9 +162,9 @@ Pins that used `llama-cli` or rejected options are omitted.
 ## Open
 
 1. **Prefill is the largest gap in the project.** Quiet-host re-measure (2026-08-08): SmolLM2 metal pp512 **2.97×** (was 8.13×; multi-layer prefill stack), OLMoE metal **2.65×** (was ~11–15×; gather/`mul_mm_sg` + Q4_0 `mul_mv_id`). Qwen1.5-MoE metal still **20.65×** (mixed Q4_K/Q8_0 `matvec_id` landed; still needs fused `kernel_mul_mm_id`). Tiny Q8_0 dense rows still multi-×. See `docs/ROADMAP.md`.
-2. **Metal decode is healthy** on dense models with answer parity (SmolLM2 / Llama / Qwen MoE / OLMoE greedy “Paris” OK). **Gemma-2 Metal greedy is non-claimable** until output is sane (2026-08-08: word salad / `*` spam at `-ngl 99`; do not close speed rows).
+2. **Metal decode is healthy** on dense models with answer parity (SmolLM2 / Llama / Gemma-2 / Qwen MoE / OLMoE greedy “Paris” OK). Gemma-2 Metal was fixed 2026-08-10: Concurrent encoder + sandwich post-norms in the dense decode stack caused BOS-loops / `*` spam; serial encode + eager residuals restore CPU-matched logits.
 3. **Qwen1.5-MoE metal tg128 ~2.70×** remains the worst decode row; answers OK after shexp + `norm_topk_prob=false` + `add_bos=false`.
-4. **CPU decode is behind everywhere** (1.33×–2.60×). Two distinct causes measured: ~2× lower per-thread GEMV throughput, and a parallel-scaling ceiling at ~1.9× total where llama keeps scaling (rayon fork-join per matvec vs llama's persistent spin-barrier pool).
+4. **CPU decode is behind everywhere** (1.33×–2.60×). Two distinct causes measured: ~2× lower per-thread GEMV throughput, and a parallel-scaling ceiling at ~1.9× total where llama keeps scaling (rayon fork-join per matvec vs llama's persistent spin-barrier pool). CPU Q4_K batch GEMM landed — re-measure Gemma-2/Phi/Mistral pp512; i8mm SMMLA still open if rows stay >1×.
 5. **Serving pins re-measured** with neither engine's threads forced. Every CPU row is now a loss (1.35×–2.57×); the five previous CPU "wins" were artifacts of the old `-t 10`. ferrox's own throughput rose slightly in every row — llama's roughly doubled. Metal barely moved, as expected at `-ngl 99`, except the 8B lead (0.92× → 1.05×).
 6. CUDA — no in-tree pin; skipped on darwin via `--fit-host`. Needs a GPU host.
 7. Gemma-4-E2B: `Gemma4Engine` loads; tokenizer `gemma4` still byte-fallback. **Metal now emits 2 garbage tokens instead of refusing** (pin `status=error`, `expect=refuse`) — worse than a clean refusal, since it looks like it works. CPU still refuses. Homebrew llama also reports unknown-arch.

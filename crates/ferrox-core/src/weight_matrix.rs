@@ -1556,20 +1556,44 @@ impl WeightMatrix {
                             if n_groups > 0 {
                                 let interleave = ferrox_quant::q5_kx8_interleave();
                                 let packed = get_or_repack_q5k(data.as_slice(), *rows, cols);
+                                let nc = ferrox_quant::Q5_KX8_GEMM_NC;
+                                // On the i8mm path, interleave each quad of
+                                // activations once per matmul; the kernel
+                                // consumes it for every row-group.
+                                let act_tiles: Vec<ferrox_quant::Q8KActsX4> =
+                                    if ferrox_quant::q5_kx8_gemm_uses_acts_x4(interleave) {
+                                        acts.par_chunks(nc)
+                                            .map(|chunk| {
+                                                ferrox_quant::prepare_q8_k_acts_x4(chunk, cols)
+                                            })
+                                            .collect()
+                                    } else {
+                                        Vec::new()
+                                    };
                                 (0..n_groups)
                                     .into_par_iter()
                                     .with_min_len(Self::min_rows_per_task(n_groups).max(1))
                                     .for_each(|g| {
-                                        let nc = ferrox_quant::Q5_KX8_GEMM_NC;
                                         let mut tile = [0f32;
                                             ferrox_quant::Q5_KX8_NROWS
                                                 * ferrox_quant::Q5_KX8_GEMM_NC];
                                         for (t, chunk) in acts.chunks(nc).enumerate() {
                                             let n = chunk.len();
                                             let tile = &mut tile[..ferrox_quant::Q5_KX8_NROWS * n];
-                                            ferrox_quant::gemm_q5_kx8_group(
-                                                &packed, g, chunk, cols, interleave, tile,
-                                            );
+                                            if act_tiles.is_empty() {
+                                                ferrox_quant::gemm_q5_kx8_group(
+                                                    &packed, g, chunk, cols, interleave, tile,
+                                                );
+                                            } else {
+                                                ferrox_quant::gemm_q5_kx8_group_x4(
+                                                    &packed,
+                                                    g,
+                                                    &act_tiles[t],
+                                                    cols,
+                                                    interleave,
+                                                    tile,
+                                                );
+                                            }
                                             for j in 0..n {
                                                 let col = (t * nc + j) * rows
                                                     + g * ferrox_quant::Q5_KX8_NROWS;
@@ -1633,30 +1657,43 @@ impl WeightMatrix {
                                     )
                                 })
                                 .collect();
-                            // Row NEON until Q6_Kx8 NEON lands (scalar Kx8
-                            // was slower than row NEON on Phi ffn_down).
-                            let use_kx8 = false;
+                            // Kx8 batch path only where the i8mm GEMM
+                            // exists (the scalar Kx8 GEMM measured slower
+                            // than the per-row NEON dot on Phi ffn_down,
+                            // so everything else keeps the row path).
+                            let interleave = ferrox_quant::q6_kx8_interleave();
+                            let use_kx8 = ferrox_quant::q6_kx8_gemm_uses_acts_x4(interleave);
                             let n_groups = if use_kx8 {
                                 *rows / ferrox_quant::Q6_KX8_NROWS
                             } else {
                                 0
                             };
                             if n_groups > 0 {
-                                let interleave = ferrox_quant::q6_kx8_interleave();
                                 let packed = get_or_repack_q6k(data.as_slice(), *rows, cols);
+                                // Quads of 4 (the i8mm tile shape), not
+                                // [`Q6_KX8_GEMM_NC`].
+                                let nc = ferrox_quant::Q8K_ACTS_X4_NC;
+                                let act_tiles: Vec<ferrox_quant::Q8KActsX4> = acts
+                                    .par_chunks(nc)
+                                    .map(|chunk| ferrox_quant::prepare_q8_k_acts_x4(chunk, cols))
+                                    .collect();
                                 (0..n_groups)
                                     .into_par_iter()
                                     .with_min_len(Self::min_rows_per_task(n_groups).max(1))
                                     .for_each(|g| {
-                                        let nc = ferrox_quant::Q6_KX8_GEMM_NC;
                                         let mut tile = [0f32;
                                             ferrox_quant::Q6_KX8_NROWS
-                                                * ferrox_quant::Q6_KX8_GEMM_NC];
+                                                * ferrox_quant::Q8K_ACTS_X4_NC];
                                         for (t, chunk) in acts.chunks(nc).enumerate() {
                                             let n = chunk.len();
                                             let tile = &mut tile[..ferrox_quant::Q6_KX8_NROWS * n];
-                                            ferrox_quant::gemm_q6_kx8_group(
-                                                &packed, g, chunk, cols, interleave, tile,
+                                            ferrox_quant::gemm_q6_kx8_group_x4(
+                                                &packed,
+                                                g,
+                                                &act_tiles[t],
+                                                cols,
+                                                interleave,
+                                                tile,
                                             );
                                             for j in 0..n {
                                                 let col = (t * nc + j) * rows

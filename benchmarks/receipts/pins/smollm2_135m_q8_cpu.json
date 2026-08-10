@@ -4,7 +4,7 @@
   "name": "SmolLM2-135M-Instruct Q8_0",
   "backend": "cpu",
   "expect": "ok",
-  "date": "2026-08-07",
+  "date": "2026-08-10",
   "host": "Host B (Apple M2 Pro, 6 performance + 4 efficiency cores, 32 GiB unified)",
   "model": "~/Desktop/Dev/ferrox/models/hf_test/SmolLM2-135M-Instruct-Q8_0.gguf",
   "max_tokens": 512,
@@ -14,36 +14,36 @@
   "workload": "greedy chat, warm then 3x 512-tok capitals list (median)",
   "notes": "engine_factory; d=64",
   "ferrox": {
-    "wall_s": 5.553,
-    "predicted_per_second": 93.557,
-    "prompt_per_second": 599.71,
+    "wall_s": 7.219,
+    "predicted_per_second": 73.332,
+    "prompt_per_second": 199.309,
     "completion_tokens": 512,
-    "wall_tok_s": 92.2,
+    "wall_tok_s": 70.921,
     "prefix": "1. Paris, France\n2. Rome, Italy\n3. London, United Kingdom\n4.",
-    "predicted_stddev": 4.604,
-    "prompt_stddev": 11.133,
-    "wall_tok_s_stddev": 4.494,
+    "predicted_stddev": 2.07,
+    "prompt_stddev": 6.116,
+    "wall_tok_s_stddev": 1.464,
     "reps": 3,
     "runs": [
       {
-        "predicted_per_second": 93.5570963110726,
-        "prompt_per_second": 595.8235356280163,
-        "wall_tok_s": 92.2,
-        "wall_s": 5.553,
+        "predicted_per_second": 73.33210197753395,
+        "prompt_per_second": 199.30934308683715,
+        "wall_tok_s": 70.921,
+        "wall_s": 7.219,
         "completion_tokens": 512
       },
       {
-        "predicted_per_second": 94.73236842759285,
-        "prompt_per_second": 616.7541258281209,
-        "wall_tok_s": 93.449,
-        "wall_s": 5.479,
-        "completion_tokens": 512
+        "predicted_per_second": 76.52924784202074,
+        "prompt_per_second": 189.35914792499938,
+        "wall_tok_s": 73.121,
+        "wall_s": 5.484,
+        "completion_tokens": 401
       },
       {
-        "predicted_per_second": 86.23551612335449,
-        "prompt_per_second": 599.7099229177192,
-        "wall_tok_s": 85.117,
-        "wall_s": 6.015,
+        "predicted_per_second": 72.65258668343976,
+        "prompt_per_second": 200.49408017692016,
+        "wall_tok_s": 70.349,
+        "wall_s": 7.278,
         "completion_tokens": 512
       }
     ],
@@ -51,37 +51,37 @@
     "engine": "ferrox"
   },
   "llama": {
-    "wall_s": 2.177,
-    "predicted_per_second": 240.213,
-    "prompt_per_second": 871.43,
-    "completion_tokens": 410,
-    "wall_tok_s": 235.195,
-    "prefix": "Here is a detailed numbered list of 80 European capital citi",
-    "predicted_stddev": 13.547,
-    "prompt_stddev": 250.69,
-    "wall_tok_s_stddev": 12.885,
+    "wall_s": 1.858,
+    "predicted_per_second": 278.671,
+    "prompt_per_second": 1119.731,
+    "completion_tokens": 512,
+    "wall_tok_s": 275.612,
+    "prefix": "1. Paris, France\n2. Amsterdam, Netherlands\n3. London, United",
+    "predicted_stddev": 11.303,
+    "prompt_stddev": 283.055,
+    "wall_tok_s_stddev": 11.493,
     "reps": 3,
     "runs": [
       {
-        "predicted_per_second": 240.212963805724,
-        "prompt_per_second": 1049.4931425163984,
-        "wall_tok_s": 235.195,
-        "wall_s": 2.177,
+        "predicted_per_second": 275.1157286133791,
+        "prompt_per_second": 1475.0745918401553,
+        "wall_tok_s": 270.384,
+        "wall_s": 1.894,
         "completion_tokens": 512
       },
       {
-        "predicted_per_second": 217.4669265509703,
-        "prompt_per_second": 554.5601911099735,
-        "wall_tok_s": 214.792,
-        "wall_s": 2.384,
-        "completion_tokens": 512
-      },
-      {
-        "predicted_per_second": 241.58702642313906,
-        "prompt_per_second": 871.4304866604102,
-        "wall_tok_s": 238.626,
-        "wall_s": 1.718,
+        "predicted_per_second": 296.22779194693913,
+        "prompt_per_second": 1119.7312644965207,
+        "wall_tok_s": 292.382,
+        "wall_s": 1.402,
         "completion_tokens": 410
+      },
+      {
+        "predicted_per_second": 278.6708489065163,
+        "prompt_per_second": 915.7509157509157,
+        "wall_tok_s": 275.612,
+        "wall_s": 1.858,
+        "completion_tokens": 512
       }
     ],
     "engine": "llama"

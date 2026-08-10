@@ -18,11 +18,12 @@ Still open (see [`benchmarks/RESULTS.md`](../benchmarks/RESULTS.md) Open):
 
 - **Metal prefill** — Qwen2.5 / Qwen3 / Gemma-3 Q8_0 dense stack now
   includes QKV bias + QK-norm (was ~18–21× hybrid CPU proj; now ~1.2–2.1×).
-  Remaining: Qwen1.5-MoE (~20×; fused `kernel_mul_mm_id`); dense 1–8B
-  (~1.5–3×); compiled graph / pre-encoded CB replay for sub-1.5B ≤1×.
-- **CPU prefill/decode** — Gemma-2 / Phi / Mistral Q4_K pp512 after GEMM
+  Remaining: OLMoE gather→`mul_mm_sg`→scatter vs fused `kernel_mul_mm_id`;
+  dense 1–3B (~1.5–3×); compiled graph / pre-encoded CB replay for sub-1.5B ≤1×.
+- **CPU prefill/decode** — Phi-4 / Mistral Q4_K pp512 after GEMM
   re-measure; i8mm SMMLA if still >1×; persistent decode threadpool.
-- **Correctness** — Gemma-2 Metal greedy Paris OK after sandwich-stack serial encode (2026-08-10).
+- **Correctness** — Gemma-4 fair-chat pin; older Gemma-2 Metal greedy gate
+  remains in-tree for regression only (not in published suite).
 
 Where the project should go beyond closing the measured gaps.
 

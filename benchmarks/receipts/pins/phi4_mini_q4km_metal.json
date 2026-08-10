@@ -4,7 +4,7 @@
   "name": "Phi-4-mini-Instruct Q4_K_M",
   "backend": "metal",
   "expect": "ok",
-  "date": "2026-08-07",
+  "date": "2026-08-10",
   "host": "Host B (Apple M2 Pro, 6 performance + 4 efficiency cores, 32 GiB unified)",
   "model": "~/Desktop/Dev/ferrox/models/Phi-4-mini-instruct-Q4_K_M.gguf",
   "max_tokens": 512,
@@ -14,73 +14,72 @@
   "workload": "greedy chat, warm then 3x 512-tok capitals list (median)",
   "notes": "P6 PhiFamily (phi4 fused QKV); Host B receipt",
   "ferrox": {
-    "wall_s": 11.415,
-    "predicted_per_second": 50.301,
-    "prompt_per_second": 33.983,
-    "completion_tokens": 512,
-    "wall_tok_s": 44.821,
-    "prefix": "1bedbedbedbedbedbedbedbedbedbedbedbedbedbedbedbedbedbedbedbe",
-    "predicted_stddev": 0.443,
-    "prompt_stddev": 1.2,
-    "wall_tok_s_stddev": 24.947,
+    "wall_s": 0.142,
+    "predicted_per_second": 50.75,
+    "prompt_per_second": 295.958,
+    "completion_tokens": 2,
+    "wall_tok_s": 3616.084,
+    "prefix": "1\n",
+    "prompt_stddev": 9.658,
+    "wall_tok_s_stddev": 2099.801,
     "reps": 3,
     "runs": [
       {
-        "predicted_per_second": 50.98929818763384,
-        "prompt_per_second": 35.37714864733762,
-        "wall_tok_s": 1.628,
-        "wall_s": 1.228,
+        "predicted_per_second": null,
+        "prompt_per_second": 295.95836371117355,
+        "wall_tok_s": 3616.084,
+        "wall_s": 0.142,
+        "completion_tokens": 512
+      },
+      {
+        "predicted_per_second": null,
+        "prompt_per_second": 291.8318994562063,
+        "wall_tok_s": 3679.699,
+        "wall_s": 0.139,
+        "completion_tokens": 512
+      },
+      {
+        "predicted_per_second": 50.75041981381651,
+        "prompt_per_second": 310.237752770087,
+        "wall_tok_s": 11.347,
+        "wall_s": 0.176,
         "completion_tokens": 2
-      },
-      {
-        "predicted_per_second": 50.30125654895748,
-        "prompt_per_second": 32.98860466743891,
-        "wall_tok_s": 44.821,
-        "wall_s": 11.423,
-        "completion_tokens": 512
-      },
-      {
-        "predicted_per_second": 50.1629082083198,
-        "prompt_per_second": 33.982914675221245,
-        "wall_tok_s": 44.853,
-        "wall_s": 11.415,
-        "completion_tokens": 512
       }
     ],
     "metal_fails": 0,
     "engine": "ferrox"
   },
   "llama": {
-    "wall_s": 10.231,
-    "predicted_per_second": 50.243,
-    "prompt_per_second": 2840.909,
+    "wall_s": 10.245,
+    "predicted_per_second": 50.167,
+    "prompt_per_second": 3274.088,
     "completion_tokens": 512,
-    "wall_tok_s": 50.044,
+    "wall_tok_s": 49.974,
     "prefix": "Sure, here is a list of 80 European capital cities with one ",
-    "predicted_stddev": 1.443,
-    "prompt_stddev": 6549.94,
-    "wall_tok_s_stddev": 1.485,
+    "predicted_stddev": 0.505,
+    "prompt_stddev": 4058.799,
+    "wall_tok_s_stddev": 0.475,
     "reps": 3,
     "runs": [
       {
-        "predicted_per_second": 52.365450707490986,
-        "prompt_per_second": 13407.821229050278,
-        "wall_tok_s": 52.228,
-        "wall_s": 9.803,
+        "predicted_per_second": 49.82561036372695,
+        "prompt_per_second": 9086.444007858547,
+        "wall_tok_s": 49.695,
+        "wall_s": 10.303,
         "completion_tokens": 512
       },
       {
-        "predicted_per_second": 50.24297680216995,
-        "prompt_per_second": 2840.909090909091,
-        "wall_tok_s": 50.044,
-        "wall_s": 10.231,
+        "predicted_per_second": 50.16713396241482,
+        "prompt_per_second": 1272.7272727272727,
+        "wall_tok_s": 49.974,
+        "wall_s": 10.245,
         "completion_tokens": 512
       },
       {
-        "predicted_per_second": 49.61087439359912,
-        "prompt_per_second": 1419.1106906338696,
-        "wall_tok_s": 49.393,
-        "wall_s": 10.366,
+        "predicted_per_second": 50.8192671325695,
+        "prompt_per_second": 3274.087932647334,
+        "wall_tok_s": 50.621,
+        "wall_s": 10.114,
         "completion_tokens": 512
       }
     ],

@@ -893,6 +893,7 @@ fn try_build_moe_packed_q4_planes(experts: &[ExpertWeights]) -> Option<MoePacked
             } => {
                 let kind_str = match kind {
                     QuantKind::Q4_0 => "Q4_0",
+                    QuantKind::Q5_0 => "Q5_0",
                     QuantKind::Q4K => "Q4_K",
                     QuantKind::Q5K => "Q5_K",
                     QuantKind::Q6K => "Q6_K",

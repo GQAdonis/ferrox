@@ -7,6 +7,11 @@ Architecture list: `ferrox archs` →
 
 **Gap** = `llama_pred / ferrox_pred`. Values below 1.0 mean Ferrox is faster.
 
+Suite policy: keep the **current** generation per family (e.g. Llama-3.2, not
+3.1; Gemma-3/4, not Gemma-2; Phi-4, not Phi-3). Older GGUFs still load when
+the architecture is supported — they are just not in the published bench
+ledger.
+
 ## Recommended starters
 
 | Model | Notes |
@@ -14,8 +19,8 @@ Architecture list: `ferrox archs` →
 | SmolLM2-135M-Instruct Q8_0 | Tiny; Metal ahead of llama, CPU well behind |
 | TinyLlama-1.1B-Chat Q8_0 | Smallest verified smoke |
 | Phi-4-mini-Instruct Q4_K_M | Metal ~parity |
-| Llama-3.2-3B-Instruct Q4_K_M | Metal ahead (~0.94×) |
-| Llama-3.1-8B-Instruct Q4_K_M | Metal ~parity (~1.05×) |
+| Llama-3.2-3B-Instruct Q4_K_M | Metal flagship in the suite |
+| Gemma-4-E2B-IT Q4_K_M | Dedicated engine + `gemma4` BPE |
 
 ```bash
 ./target/release/ferrox -m /path/to/model.gguf \
@@ -38,22 +43,19 @@ Architecture list: `ferrox archs` →
 | Llama-3.2-1B IQ4_XS | **0.83×** | **0.94×** | — |
 | Llama-3.2-1B Q4_K_M | **0.88×** | **0.95×** | — |
 | TinyLlama-1.1B Q8_0 | **0.89×** | **0.89×** | 1.33× |
-| Phi-3-mini-4k Q4 | **0.91×** | **0.93×** | 2.04× |
 | Llama-3.2-3B Q4_K_M | **0.94×** | **0.84×** | — |
 | Phi-4-mini Q4_K_M | 1.00× | **0.93×** | 1.92× |
 | Mistral-7B-v0.2 Q4_K_M | 1.04× | 0.99× | 1.62× |
-| Llama-3.1-8B Q4_K_M | 1.05× | 1.03× | — |
-| Gemma-2-2B-IT Q4_K_M | 1.14× | 1.14× | 2.36× |
 | OLMoE-1B-7B Q4_0 | 1.59× | 1.29× | 1.71× |
-| Qwen1.5-MoE-A2.7B Q4_K_M | 2.83× | 2.75× | 1.69× |
 
 Gap = `llama / ferrox`; **bold** = ferrox faster. *Serving* is over HTTP
 with template and sampler in the loop; *engine* is `ferrox bench` vs
 `llama-bench`, no HTTP. Neither engine's thread count is forced.
 
-**Prefill is not in this table because ferrox loses it everywhere** —
-`pp512` is 3.0–8.2× behind on CPU and 13.7–98.6× on Metal. See
-[`benchmarks/RESULTS.md`](../benchmarks/RESULTS.md).
+Numbers drift as receipts refresh — prefer
+[`benchmarks/RESULTS.md`](../benchmarks/RESULTS.md) for the latest table.
+Prefill (`pp512`) is still the main engine gap; read it off RESULTS, not
+this summary.
 
 ## Other support
 
@@ -61,7 +63,7 @@ with template and sampler in the loop; *engine* is `ferrox bench` vs
 |---|---|
 | Yi (text) | Works (GenericGqa, Neox RoPE) — no speed pin yet |
 | MiroThinker | Works via `qwen3moe` |
-| Qwen2-MoE | Loads; suite entry; GGUF not on Host B |
+| Qwen2-MoE / Qwen1.5-MoE | Loads; not in current suite (OLMoE is the MoE pin) |
 | Mixtral | Suite entry; skipped on 32 GiB Host B (`--fit-host`) |
 | MLA (`deepseek2` / `mistral4`) | Dense-lead + MoE-after-dense via `MlaEngine` |
 | GLM4 / glm4moe | Loads via GLM-5.2 path when tensors present; no e2e pin |

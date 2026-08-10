@@ -519,6 +519,7 @@ impl WeightMatrix {
         let kind_name = match kind {
             QuantKind::Q8_0 => "Q8_0",
             QuantKind::Q4_0 => "Q4_0",
+            QuantKind::Q5_0 => "Q5_0",
             QuantKind::Q4K => "Q4_K",
             QuantKind::Q5K => "Q5_K",
             QuantKind::Q6K => "Q6_K",

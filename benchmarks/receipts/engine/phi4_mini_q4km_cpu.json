@@ -3,36 +3,38 @@
   "arch": "phi3",
   "backend": "cpu",
   "backend_active": "CPU",
-  "ferrox_version": "0.2.0",
+  "ferrox_version": "0.3.0",
   "id": "phi4_mini_q4km",
   "kind": "engine",
-  "load_s": 0.077456458,
+  "load_s": 0.08026775,
   "model_path": "models/Phi-4-mini-instruct-Q4_K_M.gguf",
   "quant": "quantized",
-  "reps": 2,
+  "reps": 3,
   "schema": 1,
   "size_bytes": 2491874272,
   "tests": [
     {
       "ferrox_samples": [
-        15.265742702123372,
-        15.930021778937734
+        10.561954251237681,
+        10.498647828682916,
+        10.378742563546068
       ],
-      "ferrox_stddev": 0.3321395384071808,
-      "ferrox_tps": 15.597882240530552,
-      "gap": 4.711537045012354,
-      "llama_tps": 73.49,
+      "ferrox_stddev": 0.07597623769678832,
+      "ferrox_tps": 10.498647828682916,
+      "gap": 10.974746641678204,
+      "llama_tps": 115.22,
       "test": "pp512"
     },
     {
       "ferrox_samples": [
-        11.425255936611519,
-        11.016823076147464
+        11.032226303136966,
+        11.305575973001313,
+        10.798774221621684
       ],
-      "ferrox_stddev": 0.2042164302320275,
-      "ferrox_tps": 11.22103950637949,
-      "gap": 1.4214369346914746,
-      "llama_tps": 15.95,
+      "ferrox_stddev": 0.20711455004959703,
+      "ferrox_tps": 11.032226303136966,
+      "gap": 2.690300142915,
+      "llama_tps": 29.68,
       "test": "tg128"
     }
   ],

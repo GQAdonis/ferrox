@@ -3,8 +3,8 @@
   "id": "gemma4_e2b_q4km",
   "name": "Gemma-4-E2B-IT Q4_K_M",
   "backend": "metal",
-  "expect": "refuse",
-  "date": "2026-08-07",
+  "expect": "ok",
+  "date": "2026-08-10",
   "host": "Host B (Apple M2 Pro, 6 performance + 4 efficiency cores, 32 GiB unified)",
   "model": "~/Desktop/Dev/ferrox/models/gemma-4-E2B-it-Q4_K_M.gguf",
   "max_tokens": 512,
@@ -12,37 +12,37 @@
   "threads_forced": null,
   "mode": "server",
   "workload": "greedy chat, warm then 3x 512-tok capitals list (median)",
-  "notes": "Gemma4Engine loads real GGUF; tokenizer.ggml.model=gemma4 still byte-fallback; suite stays refuse until tokenizer + fair-chat pin; Homebrew llama unknown-arch",
+  "notes": "Gemma4Engine + SPM gemma4 BPE + <|turn> chat; Homebrew llama may still lack gemma4 arch (llama column may error)",
   "ferrox": {
-    "wall_s": 11.188,
+    "wall_s": 43.221,
     "predicted_per_second": null,
     "prompt_per_second": null,
-    "completion_tokens": 2,
-    "wall_tok_s": 0.179,
-    "prefix": "2\u0001",
-    "wall_tok_s_stddev": 26.343,
+    "completion_tokens": 512,
+    "wall_tok_s": 11.846,
+    "prefix": "Here is a detailed numbered list of 80 European capital citi",
+    "wall_tok_s_stddev": 0.104,
     "reps": 3,
     "runs": [
       {
         "predicted_per_second": null,
         "prompt_per_second": null,
-        "wall_tok_s": 45.762,
-        "wall_s": 11.188,
+        "wall_tok_s": 11.846,
+        "wall_s": 43.221,
         "completion_tokens": 512
       },
       {
         "predicted_per_second": null,
         "prompt_per_second": null,
-        "wall_tok_s": 0.089,
-        "wall_s": 11.256,
-        "completion_tokens": 1
+        "wall_tok_s": 11.842,
+        "wall_s": 43.235,
+        "completion_tokens": 512
       },
       {
         "predicted_per_second": null,
         "prompt_per_second": null,
-        "wall_tok_s": 0.179,
-        "wall_s": 11.18,
-        "completion_tokens": 2
+        "wall_tok_s": 12.024,
+        "wall_s": 42.582,
+        "completion_tokens": 512
       }
     ],
     "metal_fails": 0,

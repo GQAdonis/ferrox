@@ -150,7 +150,7 @@ Host B is Metal/CPU only. On a CUDA host:
 ```bash
 cargo build -p ferrox-server -p ferrox-cli --release --features cuda
 ./target/release/ferrox bench -m model.gguf --n-gpu-layers 99 --compare
-python3 benchmarks/run_suite.py --id llama31_8b_q4km --backend cuda \
+python3 benchmarks/run_suite.py --id llama32_3b_q4km --backend cuda \
   --host-label "Vast RTX4090 / driver XXX"
 ```
 

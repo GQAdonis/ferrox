@@ -2250,6 +2250,33 @@ struct Q4_0Dequant {
     }
 };
 
+// llama `dequantize_q5_0`. GGUF: half d, uint32 qh, 16 qs bytes (32 nibbles).
+// Byte-composed qs words — same alignment caveat as `Q4_0Dequant`.
+struct Q5_0Dequant {
+    static constexpr constant short NL = 2;
+    static constexpr constant short BLOCK_BYTES = 22;
+    static inline void get(device const uchar* xb, short il, thread float4x4& reg) {
+        const float d = float(*(device const half*)(xb));
+        const float md = -16.0f * d;
+        const uint qh = uint(xb[2]) | (uint(xb[3]) << 8) | (uint(xb[4]) << 16)
+            | (uint(xb[5]) << 24);
+        device const uchar* qs = xb + 6;
+        const ushort mask = il ? 0x00F0 : 0x000F;
+        const int x_mv = il ? 4 : 0;
+        const int gh_mv = il ? 12 : 0;
+        const int gh_bk = il ? 0 : 4;
+        for (short i = 0; i < 8; ++i) {
+            const ushort w = ushort(qs[2 * i]) | (ushort(qs[2 * i + 1]) << 8);
+            const uchar xh_0 = uchar(((qh >> (gh_mv + 2 * i)) << gh_bk) & 0x10);
+            const uchar xh_1 = uchar(((qh >> (gh_mv + 2 * i + 1)) << gh_bk) & 0x10);
+            const int x0 = int((((w) & mask) >> x_mv) | xh_0);
+            const int x1 = int((((w >> 8) & mask) >> x_mv) | xh_1);
+            reg[i / 2][2 * (i % 2) + 0] = d * float(x0) + md;
+            reg[i / 2][2 * (i % 2) + 1] = d * float(x1) + md;
+        }
+    }
+};
+
 // llama `dequantize_q5_K`. GGUF layout: half d, half dmin, scales[12],
 // qh[32], qs[128] -- the 5th bit of each quant lives in `qh`.
 struct Q5KDequant {
@@ -2541,6 +2568,7 @@ MUL_MM_SG_ENTRY(q6_k_mul_mm_sg, Q6KDequant)
 MUL_MM_SG_ENTRY(q5_k_mul_mm_sg, Q5KDequant)
 MUL_MM_SG_ENTRY(q8_0_mul_mm_sg, Q8_0Dequant)
 MUL_MM_SG_ENTRY(q4_0_mul_mm_sg, Q4_0Dequant)
+MUL_MM_SG_ENTRY(q5_0_mul_mm_sg, Q5_0Dequant)
 MUL_MM_SG_ENTRY(iq4_xs_mul_mm_sg, IQ4XSDequant)
 "#;
 
@@ -2806,6 +2834,7 @@ pub fn mul_mm_sg_meta(kind: &str) -> Option<(&'static str, usize, usize)> {
         "Q6_K" => Some(("q6_k_mul_mm_sg", 210, 256)),
         "Q8_0" => Some(("q8_0_mul_mm_sg", 34, 32)),
         "Q4_0" => Some(("q4_0_mul_mm_sg", 18, 32)),
+        "Q5_0" => Some(("q5_0_mul_mm_sg", 22, 32)),
         "IQ4_XS" => Some(("iq4_xs_mul_mm_sg", 136, 256)),
         _ => None,
     }
@@ -5462,7 +5491,6 @@ pub(crate) fn encode_q4_0_moe_id_ex(
     assert!(top_k >= 1);
     let bound = moe_packed_resident(device, packed)?;
     let down_w = &bound.down;
-    let down_blocks = moe_row_blocks(packed.down_row_bytes, packed.down_kind)?;
     let n_slots = (n_tokens as usize) * (top_k as usize);
 
     if !act_done {
@@ -5486,6 +5514,7 @@ pub(crate) fn encode_q4_0_moe_id_ex(
     let weighted_sum = ensure_pipeline(device, Q4_0_MOE_TOPK_KERNEL_SRC, "moe_weighted_sum")?;
 
     if !down_done {
+        let down_blocks = moe_row_blocks(packed.down_row_bytes, packed.down_kind)?;
         encode_moe_down_id(
             encoder,
             device,
@@ -5503,7 +5532,7 @@ pub(crate) fn encode_q4_0_moe_id_ex(
             n_tokens,
             n_slots,
         )?;
-    memory_barrier_resources(encoder, &[expert_out_buf]);
+        memory_barrier_resources(encoder, &[expert_out_buf]);
     } // !down_done
 
     const SUM_TG: usize = 256;
@@ -5774,18 +5803,8 @@ pub fn launch_moe_prefill_q4_0(
                         ffn_u,
                         ffn_u,
                     )?;
-                    encode_moe_gather_rows(
-                        &encoder,
-                        device,
-                        &x_buf,
-                        contig_in,
-                        tok_b,
-                        off,
-                        batch_u,
-                        hidden_u,
-                        hidden_u,
-                        hidden_u,
-                    )?;
+                    // Reuse gathered `contig_in` for up — same token rows as gate.
+                    memory_barrier_resources(&encoder, &[contig_in, contig_out]);
                     encode_mul_mm_sg_offset(
                         &encoder,
                         device,

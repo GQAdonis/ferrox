@@ -211,39 +211,40 @@ def main() -> None:
     else:
         stale_banner = ""
 
-    # Headline the *engine* number when one exists. The serving pin for the
-    # same model is currently 0.92x while the freshly measured engine decode
-    # is 1.03x — quoting the flattering one at the top of a file that
-    # contradicts it three tables down is exactly the trap this ledger is
-    # supposed to prevent.
-    engine8 = load_json(ENGINE / "llama31_8b_q4km_metal.json")
-    tg8 = None
-    if engine8:
-        tg8 = next(
-            (t for t in engine8.get("tests", []) if str(t.get("test", "")).startswith("tg")),
+    # Headline the *engine* number when one exists. Prefer Llama-3.2-3B
+    # Metal decode as the suite flagship (Llama-3.1 dropped once 3.2 landed).
+    engine_flag = load_json(ENGINE / "llama32_3b_q4km_metal.json")
+    tg_flag = None
+    if engine_flag:
+        tg_flag = next(
+            (
+                t
+                for t in engine_flag.get("tests", [])
+                if str(t.get("test", "")).startswith("tg")
+            ),
             None,
         )
-    metal8 = pins.get(("llama31_8b_q4km", "metal"))
-    if tg8 and tg8.get("ferrox_tps") and tg8.get("llama_tps"):
-        fp = tg8["ferrox_tps"]
-        lp = tg8["llama_tps"]
+    metal_flag = pins.get(("llama32_3b_q4km", "metal"))
+    if tg_flag and tg_flag.get("ferrox_tps") and tg_flag.get("llama_tps"):
+        fp = tg_flag["ferrox_tps"]
+        lp = tg_flag["llama_tps"]
         north = (
-            f"**8B Metal decode (engine):** {fmt_num(fp)} vs llama {fmt_num(lp)} "
-            f"{tg8.get('test', 'tg')} ({gap_str(fp, lp)}) — "
-            "[`engine/llama31_8b_q4km_metal.json`]"
-            "(receipts/engine/llama31_8b_q4km_metal.json). "
-            "Prefill is far behind; see the engine table.\n"
+            f"**Llama-3.2-3B Metal decode (engine):** {fmt_num(fp)} vs llama {fmt_num(lp)} "
+            f"{tg_flag.get('test', 'tg')} ({gap_str(fp, lp)}) — "
+            "[`engine/llama32_3b_q4km_metal.json`]"
+            "(receipts/engine/llama32_3b_q4km_metal.json). "
+            "Prefill is farther behind; see the engine table.\n"
         )
-    elif metal8 and pred(metal8.get("ferrox")) and pred(metal8.get("llama")):
-        fp = pred(metal8["ferrox"])
-        lp = pred(metal8["llama"])
+    elif metal_flag and pred(metal_flag.get("ferrox")) and pred(metal_flag.get("llama")):
+        fp = pred(metal_flag["ferrox"])
+        lp = pred(metal_flag["llama"])
         north = (
-            f"**8B Metal pin (serving, stale):** {fmt_num(fp)} vs llama "
+            f"**Llama-3.2-3B Metal pin (serving):** {fmt_num(fp)} vs llama "
             f"{fmt_num(lp)} pred ({gap_str(fp, lp)}) — "
-            f"[`pins/llama31_8b_q4km_metal.json`](receipts/pins/llama31_8b_q4km_metal.json).\n"
+            f"[`pins/llama32_3b_q4km_metal.json`](receipts/pins/llama32_3b_q4km_metal.json).\n"
         )
     else:
-        north = "**8B Metal pin:** not yet paired in `receipts/pins/`.\n"
+        north = "**Llama-3.2-3B Metal pin:** not yet paired in `receipts/pins/`.\n"
 
     lines: list[str] = [
         "# Results vs llama.cpp\n",
@@ -293,47 +294,103 @@ def main() -> None:
         "loop. The prompt is ~30 tokens, so `prompt_per_second` here is noise —\n"
         "read prefill off the engine table above.\n",
         "\n",
-        "| Model | Backend | ferrox pred (tok/s) | llama pred (tok/s) | Gap | Winner | Status | Pin |\n",
-        "|---|---|---|---|---|---|---|---|\n",
+        "Rows are grouped by backend (Metal → CUDA → CPU), then **worst gap\n"
+        "first** within each group. Regenerate with `python3 benchmarks/render_results.py`.\n",
+        "\n",
     ]
 
-    for entry in suite["models"]:
+    backend_ord = {"metal": 0, "cuda": 1, "cpu": 2}
+
+    def serving_row(entry: dict, backend: str) -> dict:
         mid = entry["id"]
         name = entry["name"]
         expect = entry.get("expect", "ok")
-        for backend in entry["backends"]:
-            pin = pins.get((mid, backend))
-            fp = pred(pin.get("ferrox") if pin else None)
-            lp = pred(pin.get("llama") if pin else None)
-            fsd = stddev(pin.get("ferrox") if pin else None)
-            lsd = stddev(pin.get("llama") if pin else None)
-            st = status_cell(pin, expect)
-            if st == "refuse":
-                fcell = "refused"
-            elif st == "missing":
-                fcell = "—"
-                lp = None
-            elif fp is not None:
-                fcell = fmt_num(fp, fsd)
-            else:
-                fcell = "—"
-            lcell = fmt_num(lp, lsd) if lp is not None else "—"
-            if backend == "cpu" and lp is not None:
-                lcell = f"{lcell} (−ngl 0)"
-            # Only link pins that exist on disk — never invent broken markdown links.
-            pin_name = f"{mid}_{backend}.json"
-            link = (
-                f"[`{mid}_{backend}`](receipts/pins/{pin_name})"
-                if pin and (PINS / pin_name).is_file()
-                else "—"
-            )
-            star = "\\*" if expect == "weak" else ""
-            lines.append(
-                f"| {name}{star} | {backend} | {fcell} | {lcell} | "
+        pin = pins.get((mid, backend))
+        fp = pred(pin.get("ferrox") if pin else None)
+        lp = pred(pin.get("llama") if pin else None)
+        fsd = stddev(pin.get("ferrox") if pin else None)
+        lsd = stddev(pin.get("llama") if pin else None)
+        st = status_cell(pin, expect)
+        if st == "refuse":
+            fcell = "refused"
+        elif st == "missing":
+            fcell = "—"
+            lp = None
+        elif fp is not None:
+            fcell = fmt_num(fp, fsd)
+        else:
+            fcell = "—"
+        lcell = fmt_num(lp, lsd) if lp is not None else "—"
+        if backend == "cpu" and lp is not None:
+            lcell = f"{lcell} (−ngl 0)"
+        pin_name = f"{mid}_{backend}.json"
+        link = (
+            f"[`{mid}_{backend}`](receipts/pins/{pin_name})"
+            if pin and (PINS / pin_name).is_file()
+            else "—"
+        )
+        star = "\\*" if expect == "weak" else ""
+        g = gap_ratio(fp, lp)
+        return {
+            "backend": backend,
+            "gap": g if g is not None else -1.0,
+            "line": (
+                f"| {name}{star} | {fcell} | {lcell} | "
                 f"{gap_str(fp, lp)} | {winner_str(fp, lp)} | {st} | {link} |\n"
-            )
+            ),
+            "summary": (name, backend, g, st),
+        }
 
-    lines.append("\n")
+    serving_rows: list[dict] = []
+    for entry in suite["models"]:
+        for backend in entry["backends"]:
+            serving_rows.append(serving_row(entry, backend))
+
+    serving_rows.sort(
+        key=lambda r: (
+            backend_ord.get(r["backend"], 9),
+            # Finite gaps first, worst first; missing/error (gap=-1) last.
+            r["gap"] < 0,
+            -(r["gap"] if r["gap"] >= 0 else 0.0),
+            r["line"],
+        )
+    )
+
+    worst_srv = [
+        r
+        for r in serving_rows
+        if isinstance(r["gap"], float) and r["gap"] > 1.05
+    ]
+    worst_srv.sort(key=lambda r: -r["gap"])
+    if worst_srv:
+        lines.append("**Largest serving decode gaps (gap > 1.05×):**\n\n")
+        for r in worst_srv[:8]:
+            name, backend, g, _st = r["summary"]
+            lines.append(f"- `{name}` / {backend}: {color_gap(g)}\n")
+        lines.append("\n")
+
+    def emit_serving_section(title: str, backend: str) -> None:
+        rows = [r for r in serving_rows if r["backend"] == backend]
+        if not rows:
+            return
+        lines.append(f"### {title}\n\n")
+        lines.append(
+            "| Model | ferrox pred (tok/s) | llama pred (tok/s) | Gap | Winner | Status | Pin |\n"
+        )
+        lines.append("|---|---|---|---|---|---|---|\n")
+        for r in rows:
+            lines.append(r["line"])
+        lines.append("\n")
+
+    emit_serving_section("Metal", "metal")
+    emit_serving_section("CUDA", "cuda")
+    emit_serving_section("CPU", "cpu")
+    other_backends = sorted(
+        {r["backend"] for r in serving_rows if r["backend"] not in backend_ord}
+    )
+    for b in other_backends:
+        emit_serving_section(b, b)
+
     for e in suite["models"]:
         if e.get("expect") == "weak":
             lines.append(f"\\*weak — {e['name']}: {e.get('notes', 'see suite.json')}\n")
@@ -405,43 +462,25 @@ def main() -> None:
 
     lines.append("\n## Open\n\n")
     lines.append(
-        "1. **Prefill is the largest gap in the project.** Quiet-host re-measure "
-        "(2026-08-08): SmolLM2 metal pp512 **2.97×** (was 8.13×; multi-layer "
-        "prefill stack), OLMoE metal **2.65×** (was ~11–15×; gather/`mul_mm_sg` + "
-        "Q4_0 `mul_mv_id`). Qwen1.5-MoE metal still **20.65×** (mixed Q4_K/Q8_0 "
-        "`matvec_id` landed; still needs fused `kernel_mul_mm_id`). Tiny Q8_0 "
-        "dense rows still multi-×. See `docs/ROADMAP.md`.\n"
-        "2. **Metal decode is healthy** on dense models with answer parity "
-        "(SmolLM2 / Llama / Qwen MoE / OLMoE greedy “Paris” OK). **Gemma-2 Metal "
-        "greedy is non-claimable** until output is sane (2026-08-08: word salad / "
-        "`*` spam at `-ngl 99`; do not close speed rows).\n"
-        "3. **Qwen1.5-MoE metal tg128 ~2.70×** remains the worst decode row; "
-        "answers OK after shexp + `norm_topk_prob=false` + `add_bos=false`.\n"
-        "4. **CPU decode is behind everywhere** (1.33×–2.60×). Two distinct "
-        "causes measured: ~2× lower per-thread GEMV throughput, and a "
-        "parallel-scaling ceiling at ~1.9× total where llama keeps scaling "
-        "(rayon fork-join per matvec vs llama's persistent spin-barrier pool). "
-        "CPU Q4_K batch GEMM landed — re-measure Gemma-2/Phi/Mistral pp512; "
-        "i8mm SMMLA still open if rows stay >1×.\n"
-        "5. **Serving pins re-measured** with neither engine's threads forced. "
-        "Every CPU row is now a loss (1.35\u00d7\u20132.57\u00d7); the five previous CPU "
-        "\"wins\" were artifacts of the old `-t 10`. ferrox's own throughput rose "
-        "slightly in every row \u2014 llama's roughly doubled. Metal barely moved, as "
-        "expected at `-ngl 99`, except the 8B lead (0.92\u00d7 \u2192 1.05\u00d7).\n"
-        "6. CUDA — no in-tree pin; skipped on darwin via `--fit-host`. Needs a "
-        "GPU host.\n"
-        "7. Gemma-4-E2B: `Gemma4Engine` loads; tokenizer `gemma4` still "
-        "byte-fallback. **Metal now emits 2 garbage tokens instead of refusing** "
-        "(pin `status=error`, `expect=refuse`) \u2014 worse than a clean refusal, "
-        "since it looks like it works. CPU still refuses. Homebrew llama also "
-        "reports unknown-arch.\n"
-        "8. Continuous-batching multi-request receipt "
-        "(`cb_throughput.py` exists; its output is not yet in this ledger).\n"
-        "9. DS4 / GLM / MLA MoE real-checkpoint e2e when feasible "
-        "(MoE-after-dense wired in `MlaEngine`). Mixtral still skipped by "
-        "`--fit-host` on Host B.\n"
-        "10. Run-to-run spread on this host is ~20%; anything claiming less "
-        "must be measured by interleaved A/B, not two batches of runs.\n"
+        "1. **Prefill gap narrowed hard (2026-08-10).** Dense Metal with "
+        "QKV bias / QK-norm rides the fused prefill stack (`AttnExtras`); "
+        "Qwen2.5 / Qwen3 / Gemma-3 metal pp512 ~1.2\u20132.1\u00d7. Phi-4 metal "
+        "pp512 ~1.3\u00d7. OLMoE metal residual is gather\u2192`mul_mm_sg`\u2192"
+        "scatter vs fused `kernel_mul_mm_id`. See `docs/ROADMAP.md`.\n"
+        "2. **Metal decode is healthy** on many dense models (engine tg often "
+        "\u22641\u00d7 with answer parity).\n"
+        "3. **CPU decode stays behind** (~1.3\u20132.6\u00d7): lower per-thread GEMV + "
+        "rayon fork-join vs llama persistent pool. i8mm SMMLA still open.\n"
+        "4. CUDA — no in-tree pin; skipped on darwin via `--fit-host`.\n"
+        "5. Gemma-4-E2B: SPM-style `gemma4` BPE + `<|turn>` chat wrap landed "
+        "(2026-08-10). Fair-chat pin should measure ferrox; Homebrew llama may "
+        "still lack `gemma4` arch (llama column \u2014 / error).\n"
+        "6. Continuous-batching multi-request receipt "
+        "(`cb_throughput.py` exists; not yet in this ledger).\n"
+        "7. DS4 / GLM / MLA MoE real-checkpoint e2e when feasible. Mixtral "
+        "skipped by `--fit-host` on Host B.\n"
+        "8. Run-to-run spread on this host is ~20%; claims tighter than that "
+        "need interleaved A/B (still sequential per engine).\n"
     )
 
     OUT.write_text("".join(lines))

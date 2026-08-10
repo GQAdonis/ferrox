@@ -9,22 +9,22 @@ Backends: CPU, Apple Metal, and CUDA.
 Verified against llama.cpp on the same host and GGUF (Gap =
 `llama_pred / ferrox_pred`; &lt;1 means Ferrox is faster):
 
-- **Dense GQA** — TinyLlama, Llama 3.1/3.2, Mistral-7B, SmolLM2,
-  Qwen2.5/Qwen3, Gemma-2/3, Phi-3/4. Metal decode leads on the small and
+- **Dense GQA** — TinyLlama, Llama 3.2, Mistral-7B, SmolLM2,
+  Qwen2.5/Qwen3, Gemma-3/4, Phi-4. Metal decode leads on the small and
   mid models (Qwen2.5-0.5B **~0.63×**, SmolLM2 **~0.76×**, Gemma-3-1B
-  **~0.74×**) and is ~parity at 7-8B (Llama-3.1-8B ~1.05×). **CPU decode
+  **~0.74×**) and is near parity on Llama-3.2-3B / Mistral-7B. **CPU decode
   is behind everywhere (1.3-2.6×), and prefill is behind on both
   backends.**
-- **MoE** — OLMoE-1B-7B; still behind on Metal decode (~1.3-1.6×), and
-  Qwen1.5-MoE is the worst row in the suite (~2.8×). (Metal Concurrent + fused encode groups +
+- **MoE** — OLMoE-1B-7B; still behind on Metal decode (~1.3-1.6×). (Metal Concurrent + fused encode groups +
   `MoeMemRanges` + `mul_mv_id` / prefill `mul_mm_id` + fused attn+O
   residual CB (`FERROX_METAL_PREFILL_FUSE_O=1`); CPU int-dot +
   interleaved Q4_K).
 - **MLA** — dense-lead and MoE-after-dense `deepseek2` / `mistral4`.
-- **Gemma-4** — dedicated engine (per-layer emb + shared KV + SWA/full);
-  tokenizer pin pending.
-- **Also loadable** — yi, qwen3moe (e.g. MiroThinker GGUFs), GLM4 when
-  tensors are present.
+- **Gemma-4** — dedicated engine (per-layer emb + shared KV + SWA/full)
+  + SPM-style `gemma4` BPE + `<|turn>` chat wrap.
+- **Also loadable** — yi, qwen2moe / qwen3moe (e.g. MiroThinker GGUFs),
+  Gemma-2, Phi-3, Llama-3.1, GLM4 when tensors are present (not in the
+  published suite).
 
 Full matrix and pins: [`MODELS.md`](MODELS.md) ·
 [`benchmarks/RESULTS.md`](../benchmarks/RESULTS.md).

@@ -56,7 +56,7 @@ Other useful GGUFs:
 | TinyLlama 1.1B Chat Q8_0     | [TheBloke/…](https://huggingface.co/TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF)     | `tinyllama-1.1b-chat-v1.0.Q8_0.gguf`     |
 | Gemma-4 E2B Instruct Q4_K_M  | [unsloth/…](https://huggingface.co/unsloth/gemma-4-E2B-it-GGUF)                 | `gemma-4-E2B-it-Q4_K_M.gguf`             |
 | Llama 3.2 1B Instruct Q4_K_M | [bartowski/…](https://huggingface.co/bartowski/Llama-3.2-1B-Instruct-GGUF)      | `Llama-3.2-1B-Instruct-Q4_K_M.gguf`      |
-| Llama 3.1 8B Instruct Q4_K_M | [bartowski/…](https://huggingface.co/bartowski/Meta-Llama-3.1-8B-Instruct-GGUF) | `Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf` |
+| Llama 3.2 3B Instruct Q4_K_M | [bartowski/…](https://huggingface.co/bartowski/Llama-3.2-3B-Instruct-GGUF)      | `Llama-3.2-3B-Instruct-Q4_K_M.gguf`      |
 | SmolLM2 135M Instruct Q8_0   | [bartowski/…](https://huggingface.co/bartowski/SmolLM2-135M-Instruct-GGUF)      | `SmolLM2-135M-Instruct-Q8_0.gguf`        |
 
 

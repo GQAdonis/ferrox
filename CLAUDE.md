@@ -53,10 +53,10 @@ FERROX_MODEL_PATH=model.gguf FERROX_ADDR=127.0.0.1:8383 ./target/debug/ferrox-se
 
 # Serving bench vs llama-server (HTTP, chat template, sampler)
 python3 benchmarks/run_suite.py --list
-python3 benchmarks/run_suite.py --id llama31_8b_q4km --backend metal
+python3 benchmarks/run_suite.py --id llama32_3b_q4km --backend metal
 # CUDA host (requires --features cuda binary + GPU):
-python3 benchmarks/run_suite.py --id llama31_8b_q4km --backend cuda \
-  --host-label "host / GPU / driver"
+python3 benchmarks/run_suite.py --id llama32_3b_q4km --backend cuda \
+ --host-label "host / GPU / driver"
 ```
 
 Fixtures and golden values were generated and cross-validated with

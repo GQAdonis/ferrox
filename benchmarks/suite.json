@@ -42,18 +42,6 @@
       "notes": "Verified MoE; Metal/CUDA expert placement when budget set"
     },
     {
-      "id": "llama31_8b_q4km",
-      "name": "Llama-3.1-8B-Instruct Q4_K_M",
-      "gguf": "models/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf",
-      "backends": [
-        "metal",
-        "cuda"
-      ],
-      "estimated_ram_gb": 10,
-      "expect": "ok",
-      "notes": "Host B Metal pin; FA-vec d=128; CUDA fair-chat when --backend cuda + --host-label"
-    },
-    {
       "id": "llama32_3b_q4km",
       "name": "Llama-3.2-3B-Instruct Q4_K_M",
       "gguf": "models/Llama-3.2-3B-Instruct-Q4_K_M.gguf",
@@ -63,18 +51,6 @@
       "estimated_ram_gb": 5,
       "expect": "ok",
       "notes": "head_dim=128; FA-vec d=128"
-    },
-    {
-      "id": "qwen2moe_05b_q4km",
-      "name": "Qwen1.5-MoE-A2.7B Q4_K_M",
-      "gguf": "models/Qwen1.5-MoE-A2.7B-Chat-Q4_K_M.gguf",
-      "backends": [
-        "cpu",
-        "metal"
-      ],
-      "estimated_ram_gb": 8,
-      "expect": "ok",
-      "notes": "Qwen2-MoE: QKV bias + shared_expert_gate; GGUF not on Host B disk"
     },
     {
       "id": "mistral_7b_q4km",
@@ -97,7 +73,7 @@
       ],
       "estimated_ram_gb": 48,
       "expect": "ok",
-      "notes": "Grouped MoE + SWA; needs \u226548 GiB host \u2014 skip on Host B via --fit-host"
+      "notes": "Grouped MoE + SWA; needs ≥48 GiB host — skip on Host B via --fit-host"
     },
     {
       "id": "iq4_xs",
@@ -109,18 +85,6 @@
       "estimated_ram_gb": 2,
       "expect": "ok",
       "notes": "IQ4_XS Metal matvec"
-    },
-    {
-      "id": "gemma2_2b_q4km",
-      "name": "Gemma-2-2B-IT Q4_K_M",
-      "gguf": "models/gemma-2-2b-it-Q4_K_M.gguf",
-      "backends": [
-        "metal",
-        "cpu"
-      ],
-      "estimated_ram_gb": 4,
-      "expect": "ok",
-      "notes": "Attn + final logit softcap + SWA; FA-vec softcap on decode/prefill d=256"
     },
     {
       "id": "smollm2_135m_q8",
@@ -171,18 +135,6 @@
       "notes": "full Metal stack; FA-vec d=256"
     },
     {
-      "id": "phi3_mini_q4",
-      "name": "Phi-3-mini-4k-Instruct Q4",
-      "gguf": "models/hf_test/Phi-3-mini-4k-instruct-q4.gguf",
-      "backends": [
-        "metal",
-        "cpu"
-      ],
-      "estimated_ram_gb": 5,
-      "expect": "ok",
-      "notes": "fused QKV/gate+up; FA-vec d=96"
-    },
-    {
       "id": "gemma4_e2b_q4km",
       "name": "Gemma-4-E2B-IT Q4_K_M",
       "gguf": "models/gemma-4-E2B-it-Q4_K_M.gguf",
@@ -191,8 +143,8 @@
         "cpu"
       ],
       "estimated_ram_gb": 6,
-      "expect": "refuse",
-      "notes": "Gemma4Engine loads real GGUF; tokenizer.ggml.model=gemma4 still byte-fallback; suite stays refuse until tokenizer + fair-chat pin; Homebrew llama unknown-arch"
+      "expect": "ok",
+      "notes": "Gemma4Engine + SPM gemma4 BPE + <|turn> chat; Homebrew llama may still lack gemma4 arch (llama column may error)"
     },
     {
       "id": "phi4_mini_q4km",

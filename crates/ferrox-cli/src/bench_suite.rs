@@ -223,6 +223,71 @@ pub fn render(bench_dir: &Path) -> anyhow::Result<()> {
             .unwrap_or_else(|| id.to_string())
     };
 
+    #[derive(Clone)]
+    struct Row {
+        model: String,
+        backend: String,
+        test: String,
+        ferrox: Option<f64>,
+        llama: Option<f64>,
+        gap: Option<f64>,
+    }
+
+    let mut rows: Vec<Row> = Vec::new();
+    for r in &receipts {
+        let id = r.get("id").and_then(|v| v.as_str()).unwrap_or("?");
+        let backend = r
+            .get("backend")
+            .and_then(|v| v.as_str())
+            .unwrap_or("?")
+            .to_string();
+        let Some(tests) = r.get("tests").and_then(|v| v.as_array()) else {
+            continue;
+        };
+        for t in tests {
+            rows.push(Row {
+                model: name_of(id),
+                backend: backend.clone(),
+                test: t
+                    .get("test")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("?")
+                    .to_string(),
+                ferrox: t.get("ferrox_tps").and_then(|v| v.as_f64()),
+                llama: t.get("llama_tps").and_then(|v| v.as_f64()),
+                gap: t.get("gap").and_then(|v| v.as_f64()),
+            });
+        }
+    }
+
+    // Worst-first within (backend, test): high gap = ferrox farther behind.
+    rows.sort_by(|a, b| {
+        let backend_ord = |s: &str| match s {
+            "metal" => 0,
+            "cuda" => 1,
+            "cpu" => 2,
+            _ => 3,
+        };
+        let test_ord = |s: &str| {
+            if s.starts_with("pp") {
+                0
+            } else if s.starts_with("tg") {
+                1
+            } else {
+                2
+            }
+        };
+        backend_ord(&a.backend)
+            .cmp(&backend_ord(&b.backend))
+            .then_with(|| test_ord(&a.test).cmp(&test_ord(&b.test)))
+            .then_with(|| {
+                b.gap
+                    .partial_cmp(&a.gap)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .then_with(|| a.model.cmp(&b.model))
+    });
+
     let mut table = String::new();
     table.push_str(BEGIN);
     table.push_str("\n\n## Engine (`ferrox bench` vs `llama-bench`)\n\n");
@@ -232,40 +297,76 @@ pub fn render(bench_dir: &Path) -> anyhow::Result<()> {
          thread count is forced**: each picks its own default, because llama.cpp\n\
          defaults to performance cores and loses 2–4× when pushed above them, so\n\
          pinning both to the same count does not make the comparison fairer.\n\n\
-         **Gap** = `llama / ferrox` (<1 ferrox faster). Regenerate with\n\
-         `ferrox bench --suite`.\n\n",
+         **Gap** = `llama / ferrox` (<1 ferrox faster). Rows are grouped by\n\
+         backend (Metal → CUDA → CPU), then test (`pp` then `tg`), then **worst\n\
+         gap first**. Regenerate with `ferrox bench --suite` / `--render`.\n\n",
     );
-    table.push_str("| Model | Backend | Test | ferrox tok/s | llama.cpp tok/s | Gap |\n");
-    table.push_str("|---|---|---|---|---|---|\n");
 
-    let mut any = false;
-    for r in &receipts {
-        let id = r.get("id").and_then(|v| v.as_str()).unwrap_or("?");
-        let backend = r.get("backend").and_then(|v| v.as_str()).unwrap_or("?");
-        let Some(tests) = r.get("tests").and_then(|v| v.as_array()) else {
-            continue;
-        };
-        for t in tests {
-            let test = t.get("test").and_then(|v| v.as_str()).unwrap_or("?");
-            let f = t.get("ferrox_tps").and_then(|v| v.as_f64());
-            let l = t.get("llama_tps").and_then(|v| v.as_f64());
-            let gap = t.get("gap").and_then(|v| v.as_f64());
-            any = true;
+    // Compact "at a glance" for the largest prefill losses.
+    let mut worst_pp: Vec<&Row> = rows
+        .iter()
+        .filter(|r| r.test.starts_with("pp") && r.gap.is_some_and(|g| g > 1.05))
+        .collect();
+    worst_pp.sort_by(|a, b| {
+        b.gap
+            .partial_cmp(&a.gap)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    if !worst_pp.is_empty() {
+        table.push_str("**Largest engine prefill gaps (pp\\*, gap > 1.05×):**\n\n");
+        for r in worst_pp.iter().take(8) {
             table.push_str(&format!(
-                "| {} | {backend} | {test} | {} | {} | {} |\n",
-                name_of(id),
-                f.map(|v| format!("**{v:.2}**"))
-                    .unwrap_or_else(|| "—".into()),
-                l.map(|v| format!("**{v:.2}**"))
-                    .unwrap_or_else(|| "—".into()),
-                gap.map(gap_cell).unwrap_or_else(|| "—".into()),
+                "- `{}` / {} / {}: {}\n",
+                r.model,
+                r.backend,
+                r.test,
+                r.gap.map(gap_cell).unwrap_or_else(|| "—".into()),
             ));
         }
+        table.push('\n');
     }
-    if !any {
-        table.push_str("| _no engine receipts yet_ | | | | | |\n");
+
+    fn push_section(table: &mut String, title: &str, rows: &[&Row]) {
+        if rows.is_empty() {
+            return;
+        }
+        table.push_str(&format!("### {title}\n\n"));
+        table.push_str("| Model | Test | ferrox tok/s | llama.cpp tok/s | Gap |\n");
+        table.push_str("|---|---|---|---|---|\n");
+        for r in rows {
+            table.push_str(&format!(
+                "| {} | {} | {} | {} | {} |\n",
+                r.model,
+                r.test,
+                r.ferrox
+                    .map(|v| format!("**{v:.2}**"))
+                    .unwrap_or_else(|| "—".into()),
+                r.llama
+                    .map(|v| format!("**{v:.2}**"))
+                    .unwrap_or_else(|| "—".into()),
+                r.gap.map(gap_cell).unwrap_or_else(|| "—".into()),
+            ));
+        }
+        table.push('\n');
     }
-    table.push('\n');
+
+    let metal: Vec<&Row> = rows.iter().filter(|r| r.backend == "metal").collect();
+    let cuda: Vec<&Row> = rows.iter().filter(|r| r.backend == "cuda").collect();
+    let cpu: Vec<&Row> = rows.iter().filter(|r| r.backend == "cpu").collect();
+    let other: Vec<&Row> = rows
+        .iter()
+        .filter(|r| !matches!(r.backend.as_str(), "metal" | "cuda" | "cpu"))
+        .collect();
+
+    if rows.is_empty() {
+        table.push_str("| _no engine receipts yet_ | | | | | |\n\n");
+    } else {
+        push_section(&mut table, "Metal", &metal);
+        push_section(&mut table, "CUDA", &cuda);
+        push_section(&mut table, "CPU", &cpu);
+        push_section(&mut table, "Other backends", &other);
+    }
+
     table.push_str(END);
 
     let results = bench_dir.join("RESULTS.md");

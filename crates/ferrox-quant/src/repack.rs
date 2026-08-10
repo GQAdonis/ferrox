@@ -583,8 +583,12 @@ pub fn gemm_q4_kx8_group(
     #[cfg(target_arch = "aarch64")]
     if acts.len() <= Q4_KX8_GEMM_NC {
         if interleave == 8 && std::arch::is_aarch64_feature_detected!("i8mm") {
+            // Compatibility entry: interleaves the quad here, once per call.
+            // Batch callers should prepare the quad once per matmul and use
+            // [`gemm_q4_kx8_group_x4`] for every row-group instead.
+            let tile = prepare_q8_k_acts_x4(acts, n_cols);
             unsafe {
-                neon::gemm_q4_kx8_q8_k_neon_i8mm(slice, acts, n_cols, out);
+                neon::gemm_q4_kx8_q8_k_neon_i8mm(slice, &tile, n_cols, out);
             }
             return;
         }
@@ -602,6 +606,193 @@ pub fn gemm_q4_kx8_group(
         gemv_q4_kx8_q8_k(slice, act, n_cols, 1, interleave, &mut tmp);
         for (r, v) in tmp.iter().enumerate() {
             out[r * acts.len() + j] = *v;
+        }
+    }
+}
+
+/// A quad of up to [`Q4_KX8_GEMM_NC`] Q8_K activations, pre-interleaved into
+/// the layout llama.cpp's `ggml_quantize_mat_q8_K_4x8` writes into
+/// `block_q8_Kx4` (`ggml-cpu/repack.cpp`): every super-block's qs, the folded
+/// `bsums` pairs, and the per-block per-row scales.
+///
+/// The i8mm GEMM consumes activations in this shape. Interleaving them once
+/// per matmul — instead of once per (row-group, block) inside the kernel —
+/// is the point: the old in-kernel repack was a scalar pass over
+/// `rows/8 · batch · cols` bytes with a div and a mod per element, roughly
+/// 4× the instruction count of the `vmmlaq_s32` math it fed.
+pub struct Q8KActsX4 {
+    /// Real activations in the quad (≤ 4); rows `na..4` are zero padding.
+    pub na: usize,
+    /// Q8_K super-blocks per activation (`n_cols / 256`).
+    pub n_blocks: usize,
+    /// Interleaved quants, `n_blocks * 1024` long. Block `b`, 8-element run
+    /// `c`, quad row `a`, lane `k` ↦
+    /// `qs[b*1024 + c*32 + a*8 + k] = acts[a].q[b*256 + c*8 + k]`.
+    pub qs: Vec<i8>,
+    /// Folded `bsums` pairs, `n_blocks * 4 * 8` long:
+    /// `bsums[(b*4 + a)*8 + i] = acts[a].bsums[b*16 + 2i] + acts[a].bsums[b*16 + 2i + 1]`.
+    pub bsums: Vec<i16>,
+    /// Activation scales, `n_blocks * 4` long: `d[b*4 + a] = acts[a].d[b]`.
+    pub d: Vec<f32>,
+}
+
+/// Interleave a quad of activations for [`gemm_q4_kx8_group_x4`]
+/// (llama.cpp `ggml_quantize_mat_q8_K_4x8`, minus the quantization we
+/// already did). Zero-pads when `acts.len() < 4`, matching what the kernel's
+/// in-loop repack used to emit. Available on every target so the portable
+/// GEMM below — and the tests pinning the NEON kernel to it — run anywhere.
+pub fn prepare_q8_k_acts_x4(acts: &[Q8KActivations], n_cols: usize) -> Q8KActsX4 {
+    assert!(acts.len() <= Q4_KX8_GEMM_NC);
+    assert!(n_cols.is_multiple_of(Q4_K_BLOCK_ELEMS));
+    let na = acts.len();
+    let nb = n_cols / Q4_K_BLOCK_ELEMS;
+    let mut qs = vec![0i8; nb * Q4_K_BLOCK_ELEMS * 4];
+    let mut bsums = vec![0i16; nb * 4 * 8];
+    let mut d = vec![0f32; nb * 4];
+    for (a, act) in acts.iter().enumerate() {
+        debug_assert_eq!(act.n_blocks(), nb);
+        for b in 0..nb {
+            let src = &act.q[b * Q4_K_BLOCK_ELEMS..(b + 1) * Q4_K_BLOCK_ELEMS];
+            let dst = &mut qs[b * Q4_K_BLOCK_ELEMS * 4..(b + 1) * Q4_K_BLOCK_ELEMS * 4];
+            for (c, run) in src.chunks_exact(8).enumerate() {
+                dst[c * 32 + a * 8..c * 32 + a * 8 + 8].copy_from_slice(run);
+            }
+            let src_bs = &act.bsums[b * 16..(b + 1) * 16];
+            let dst_bs = &mut bsums[(b * 4 + a) * 8..(b * 4 + a) * 8 + 8];
+            for (slot, pair) in dst_bs.iter_mut().zip(src_bs.chunks_exact(2)) {
+                *slot = pair[0] + pair[1];
+            }
+            d[b * 4 + a] = act.d[b];
+        }
+    }
+    Q8KActsX4 {
+        na,
+        n_blocks: nb,
+        qs,
+        bsums,
+        d,
+    }
+}
+
+/// Whether [`gemm_q4_kx8_group_x4`] is the fast Q4_K batch path on this CPU:
+/// ARM i8mm with the interleave-8 layout. Everywhere else preparing the quad
+/// buys nothing — x86 dispatches to AVX2 inside the per-activation GEMV — so
+/// callers should keep using [`gemm_q4_kx8_group`] and skip the tiles.
+#[inline]
+pub fn q4_kx8_gemm_uses_acts_x4(interleave: usize) -> bool {
+    #[cfg(target_arch = "aarch64")]
+    {
+        interleave == 8 && std::arch::is_aarch64_feature_detected!("i8mm")
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let _ = interleave;
+        false
+    }
+}
+
+/// [`gemm_q4_kx8_group`] against a pre-interleaved activation quad.
+///
+/// Callers build the quad once per matmul with [`prepare_q8_k_acts_x4`] and
+/// pass it to every row-group, hoisting what the i8mm kernel used to redo
+/// `rows/8` times. Only the interleave-8 layout has this kernel; gate call
+/// sites with [`q4_kx8_gemm_uses_acts_x4`].
+///
+/// `out` is `[row][act]` over the `tile.na` real activations:
+/// `out[r * tile.na + a]`, matching [`gemm_q4_kx8_group`].
+pub fn gemm_q4_kx8_group_x4(
+    packed: &[u8],
+    group: usize,
+    tile: &Q8KActsX4,
+    n_cols: usize,
+    interleave: usize,
+    out: &mut [f32],
+) {
+    assert_eq!(
+        interleave, 8,
+        "the x4 GEMM only exists for interleave-8 packing"
+    );
+    assert_eq!(out.len(), Q4_KX8_NROWS * tile.na);
+    assert!(n_cols.is_multiple_of(Q4_K_BLOCK_ELEMS));
+    debug_assert_eq!(tile.n_blocks, n_cols / Q4_K_BLOCK_ELEMS);
+    if tile.na == 0 {
+        return;
+    }
+    let nb = n_cols / Q4_K_BLOCK_ELEMS;
+    let off = group * nb * Q4_KX8_BLOCK_BYTES;
+    let slice = &packed[off..off + nb * Q4_KX8_BLOCK_BYTES];
+
+    #[cfg(target_arch = "aarch64")]
+    if std::arch::is_aarch64_feature_detected!("i8mm") {
+        unsafe {
+            neon::gemm_q4_kx8_q8_k_neon_i8mm(slice, tile, n_cols, out);
+        }
+        return;
+    }
+    gemm_q4_kx8_acts_x4_scalar_8(slice, tile, n_cols, out);
+}
+
+/// Portable reference for the ×4 GEMM: the same math as
+/// [`gemv_q4_kx8_q8_k_scalar_8`], per quad row, reading qs / folded bsums /
+/// d straight out of the pre-interleaved [`Q8KActsX4`]. Bit-identical to
+/// running that GEMV per activation, which is what the tests assert.
+fn gemm_q4_kx8_acts_x4_scalar_8(packed: &[u8], tile: &Q8KActsX4, n_cols: usize, out: &mut [f32]) {
+    let nb = n_cols / Q4_K_BLOCK_ELEMS;
+    let blocklen = 8;
+    let ncols_interleaved = Q4_KX8_NROWS;
+    let na = tile.na;
+    let mut sumf = [[0f32; Q4_KX8_NROWS]; Q4_KX8_GEMM_NC];
+    let mut sum_minf = [[0f32; Q4_KX8_NROWS]; Q4_KX8_GEMM_NC];
+    for l in 0..nb {
+        let blk = &packed[l * Q4_KX8_BLOCK_BYTES..][..Q4_KX8_BLOCK_BYTES];
+        let d = &blk[0..16];
+        let dmin = &blk[16..32];
+        let scales = &blk[32..128];
+        let qs = &blk[128..];
+        let q8 = &tile.qs[l * Q4_K_BLOCK_ELEMS * 4..][..Q4_K_BLOCK_ELEMS * 4];
+
+        let mut all_scales = [[0u8; 8]; 8];
+        let mut all_mins = [[0u8; 8]; 8];
+        for sb in 0..8 {
+            decode_scales_mins(&scales[sb * 12..], &mut all_scales[sb], &mut all_mins[sb]);
+        }
+
+        for a in 0..na {
+            let da = tile.d[l * 4 + a];
+            let n_k = Q4_K_BLOCK_ELEMS / (2 * blocklen); // 16
+            for k in 0..n_k {
+                let sb_pair = k / 4;
+                let sc0 = &all_scales[sb_pair * 2];
+                let sc1 = &all_scales[sb_pair * 2 + 1];
+                for j in 0..ncols_interleaved {
+                    let mut sumi = 0i32;
+                    for i in 0..blocklen {
+                        let qbyte = qs[k * ncols_interleaved * blocklen + j * blocklen + i];
+                        let v0 = (qbyte & 0x0F) as i32;
+                        let v1 = (qbyte >> 4) as i32;
+                        // Canonical q8 element `e` lives at run `e/8`, row
+                        // `a`, lane `e%8` of the interleaved block.
+                        let e0 = (k >> 2) * 64 + (k % 4) * blocklen + i;
+                        let e1 = e0 + 32;
+                        let a0 = q8[(e0 / 8) * 32 + a * 8 + (e0 % 8)] as i32;
+                        let a1 = q8[(e1 / 8) * 32 + a * 8 + (e1 % 8)] as i32;
+                        sumi += v0 * a0 * sc0[j] as i32 + v1 * a1 * sc1[j] as i32;
+                    }
+                    sumf[a][j] += sumi as f32 * f16_from_bytes(&d[j * 2..]) * da;
+                }
+            }
+            for (sb, mins) in all_mins.iter().enumerate() {
+                let bsum = tile.bsums[(l * 4 + a) * 8 + sb] as i32;
+                for j in 0..ncols_interleaved {
+                    sum_minf[a][j] +=
+                        mins[j] as f32 * bsum as f32 * f16_from_bytes(&dmin[j * 2..]) * da;
+                }
+            }
+        }
+    }
+    for j in 0..ncols_interleaved {
+        for (a, row) in sumf.iter().take(na).enumerate() {
+            out[j * na + a] = row[j] - sum_minf[a][j];
         }
     }
 }
@@ -2387,52 +2578,30 @@ mod neon {
         }
     }
 
-    /// Interleave up to four canonical Q8_K blocks into the qs layout expected
-    /// by llama.cpp `block_q8_Kx4` with 8-byte interleave (i8mm GEMM).
-    fn pack_q8_k_qs_x4_i8(acts: &[Q8KActivations], block: usize, out: &mut [i8; Q4_K_BLOCK_ELEMS * 4]) {
-        const BLCK: usize = 8;
-        let na = acts.len();
-        for j in 0..Q4_K_BLOCK_ELEMS * 4 {
-            let src_offset = (j / (4 * BLCK)) * BLCK + (j % BLCK);
-            let src_id = (j % (4 * BLCK)) / BLCK;
-            out[j] = if src_id < na {
-                acts[src_id].q[block * Q4_K_BLOCK_ELEMS + src_offset]
-            } else {
-                0
-            };
-        }
-    }
-
     /// NEON i8mm **GEMM** for interleave-8 packed Q4_K weights (llama.cpp
     /// `ggml_gemm_q4_K_8x8_q8_K` in `arch/arm/repack.cpp`). Uses `vmmlaq_s32`
-    /// on 2×8×8 tiles; activations are interleaved on the stack each block.
+    /// on 2×8×8 tiles; the activation quad arrives pre-interleaved as
+    /// [`Q8KActsX4`] (llama's `block_q8_Kx4` in `wdata`), so nothing here is
+    /// repacked per row-group.
     #[target_feature(enable = "neon,i8mm")]
     pub unsafe fn gemm_q4_kx8_q8_k_neon_i8mm(
         packed: &[u8],
-        acts: &[Q8KActivations],
+        tile: &Q8KActsX4,
         n_cols: usize,
         out: &mut [f32],
     ) {
-        let na = acts.len();
+        let na = tile.na;
         debug_assert!(na <= Q4_KX8_GEMM_NC);
         let nb = n_cols / Q4_K_BLOCK_ELEMS;
+        debug_assert_eq!(tile.n_blocks, nb);
         let m4b = vdupq_n_u8(0x0f);
         const Q8_K_BLOCKLEN: usize = 4;
 
         let mut acc_f32 = [vdupq_n_f32(0.0); Q4_KX8_GEMM_NC * 2];
-        let mut q8_packed = [0i8; Q4_K_BLOCK_ELEMS * 4];
 
         for b in 0..nb {
             let blk = packed.as_ptr().add(b * Q4_KX8_BLOCK_BYTES);
-            pack_q8_k_qs_x4_i8(acts, b, &mut q8_packed);
-
-            let mut bsums_arr = [[0i16; 8]; Q4_KX8_GEMM_NC];
-            for (row, act) in acts.iter().enumerate() {
-                let bsums_ptr = act.bsums.as_ptr().add(b * 16);
-                for (i, slot) in bsums_arr[row].iter_mut().enumerate() {
-                    *slot = *bsums_ptr.add(2 * i) + *bsums_ptr.add(2 * i + 1);
-                }
-            }
+            let bsums_base = tile.bsums.as_ptr().add(b * Q8_K_BLOCKLEN * 8);
 
             let mut acc = [vdupq_n_s32(0); 8];
             let mut bias_acc = [vdupq_n_s32(0); 8];
@@ -2443,7 +2612,7 @@ mod neon {
 
             let scales_base = blk.add(32);
             let qs_base = blk.add(128);
-            let q8_base = q8_packed.as_ptr();
+            let q8_base = tile.qs.as_ptr().add(b * Q4_K_BLOCK_ELEMS * 4);
 
             for sb in 0..4 {
                 let mut q4sb_scales = [[0i8; 8]; 2];
@@ -2527,8 +2696,8 @@ mod neon {
                 }
 
                 for q8_row in 0..Q8_K_BLOCKLEN {
-                    let bs_lo = vdup_n_s16(bsums_arr[q8_row][2 * sb]);
-                    let bs_hi = vdup_n_s16(bsums_arr[q8_row][2 * sb + 1]);
+                    let bs_lo = vdup_n_s16(*bsums_base.add(q8_row * 8 + 2 * sb));
+                    let bs_hi = vdup_n_s16(*bsums_base.add(q8_row * 8 + 2 * sb + 1));
                     bias_acc[2 * q8_row] =
                         vmlal_s16(bias_acc[2 * q8_row], bs_lo, vget_low_s16(q4sb_mins[0]));
                     bias_acc[2 * q8_row] =
@@ -2559,20 +2728,17 @@ mod neon {
             let mut dmin_arr = [0f32; 8];
             for j in 0..8 {
                 d_arr[j] = f16_from_bytes(std::slice::from_raw_parts(blk.add(j * 2), 2));
-                dmin_arr[j] =
-                    f16_from_bytes(std::slice::from_raw_parts(blk.add(16 + j * 2), 2));
+                dmin_arr[j] = f16_from_bytes(std::slice::from_raw_parts(blk.add(16 + j * 2), 2));
             }
 
             for i in 0..na {
                 for j in 0..2 {
-                    let q8_d = vdupq_n_f32(acts[i].d[b]);
+                    let q8_d = vdupq_n_f32(*tile.d.as_ptr().add(b * Q8_K_BLOCKLEN + i));
                     let dmins = vmulq_f32(vld1q_f32(dmin_arr.as_ptr().add(j * 4)), q8_d);
                     let scale = vmulq_f32(vld1q_f32(d_arr.as_ptr().add(j * 4)), q8_d);
                     let idx = 2 * i + j;
-                    acc_f32[idx] =
-                        vmlsq_f32(acc_f32[idx], vcvtq_f32_s32(bias_acc[idx]), dmins);
-                    acc_f32[idx] =
-                        vmlaq_f32(acc_f32[idx], vcvtq_f32_s32(reorder_acc[idx]), scale);
+                    acc_f32[idx] = vmlsq_f32(acc_f32[idx], vcvtq_f32_s32(bias_acc[idx]), dmins);
+                    acc_f32[idx] = vmlaq_f32(acc_f32[idx], vcvtq_f32_s32(reorder_acc[idx]), scale);
                 }
             }
         }
@@ -3279,6 +3445,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_arch = "aarch64")]
     fn q4_kx8_gemm_i8mm_matches_scalar_when_available() {
         if !std::arch::is_aarch64_feature_detected!("i8mm") {
             return;
@@ -3320,6 +3487,163 @@ mod tests {
                     err / scale < 1e-5 || err < 1e-3,
                     "row {r} act {j}: i8mm GEMM {got} vs scalar {want} (err={err})"
                 );
+            }
+        }
+    }
+
+    fn synth_q8_k_acts(n: usize, cols: usize) -> Vec<Q8KActivations> {
+        (0..n)
+            .map(|j| {
+                let x: Vec<f32> = (0..cols)
+                    .map(|i| (((i + j * 17) as f32) * 0.013 - 0.6).sin() * 1.9)
+                    .collect();
+                quantize_activations_q8_k(&x)
+            })
+            .collect()
+    }
+
+    /// The retired per-block interleave (`pack_q8_k_qs_x4_i8`), kept verbatim
+    /// as the reference `prepare_q8_k_acts_x4` must reproduce: llama.cpp's
+    /// `ggml_quantize_mat_q8_K_4x8` qs ordering with 8-byte runs.
+    fn reference_q8_kx4_block_qs(
+        acts: &[Q8KActivations],
+        block: usize,
+    ) -> [i8; Q4_K_BLOCK_ELEMS * 4] {
+        const BLCK: usize = 8;
+        let na = acts.len();
+        let mut out = [0i8; Q4_K_BLOCK_ELEMS * 4];
+        for (j, slot) in out.iter_mut().enumerate() {
+            let src_offset = (j / (4 * BLCK)) * BLCK + (j % BLCK);
+            let src_id = (j % (4 * BLCK)) / BLCK;
+            *slot = if src_id < na {
+                acts[src_id].q[block * Q4_K_BLOCK_ELEMS + src_offset]
+            } else {
+                0
+            };
+        }
+        out
+    }
+
+    #[test]
+    fn prepare_q8_k_acts_x4_matches_block_interleave_reference() {
+        let n_blocks = 3;
+        let cols = n_blocks * Q4_K_BLOCK_ELEMS;
+        for na in 1..=Q4_KX8_GEMM_NC {
+            let acts = synth_q8_k_acts(na, cols);
+            let tile = prepare_q8_k_acts_x4(&acts, cols);
+            assert_eq!(tile.na, na);
+            assert_eq!(tile.n_blocks, n_blocks);
+            for b in 0..n_blocks {
+                let want_qs = reference_q8_kx4_block_qs(&acts, b);
+                assert_eq!(
+                    &tile.qs[b * Q4_K_BLOCK_ELEMS * 4..][..Q4_K_BLOCK_ELEMS * 4],
+                    &want_qs[..],
+                    "qs mismatch, block {b} na {na}"
+                );
+                for a in 0..4 {
+                    let act = acts.get(a);
+                    for i in 0..8 {
+                        let want = act.map_or(0, |act| {
+                            act.bsums[b * 16 + 2 * i] + act.bsums[b * 16 + 2 * i + 1]
+                        });
+                        assert_eq!(
+                            tile.bsums[(b * 4 + a) * 8 + i],
+                            want,
+                            "bsums mismatch, block {b} row {a} pair {i} na {na}"
+                        );
+                    }
+                    let want_d = act.map_or(0.0, |act| act.d[b]);
+                    assert_eq!(tile.d[b * 4 + a], want_d, "d mismatch, block {b} row {a}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn q4_kx8_gemm_x4_portable_is_bit_exact_vs_scalar_gemv() {
+        let n_blocks = 3;
+        let cols = n_blocks * Q4_K_BLOCK_ELEMS;
+        let rows = Q4_KX8_NROWS;
+        let mut matrix = Vec::new();
+        for r in 0..rows {
+            matrix.extend_from_slice(&synth_q4_k_row(n_blocks, (r * 5 + 3) as u8));
+        }
+        let packed = pack_q4_k_matrix_x8(&matrix, rows, cols, 8);
+
+        for na in 1..=Q4_KX8_GEMM_NC {
+            let acts = synth_q8_k_acts(na, cols);
+            let tile = prepare_q8_k_acts_x4(&acts, cols);
+            let mut got = vec![0f32; Q4_KX8_NROWS * na];
+            gemm_q4_kx8_acts_x4_scalar_8(&packed, &tile, cols, &mut got);
+
+            for (j, act) in acts.iter().enumerate() {
+                let mut want = [0f32; Q4_KX8_NROWS];
+                gemv_q4_kx8_q8_k_scalar_8(&packed, act, cols, 1, &mut want);
+                for r in 0..Q4_KX8_NROWS {
+                    assert_eq!(
+                        got[r * na + j].to_bits(),
+                        want[r].to_bits(),
+                        "row {r} act {j} na {na}: x4 {} vs GEMV {}",
+                        got[r * na + j],
+                        want[r]
+                    );
+                }
+            }
+        }
+    }
+
+    /// The hoisted path must reproduce the in-kernel-interleave behavior it
+    /// replaced: `gemm_q4_kx8_group` (which now prepares the quad per call)
+    /// and `gemm_q4_kx8_group_x4` (quad prepared by the caller) share the
+    /// i8mm kernel, so their outputs must be bit-identical, and both must
+    /// match the scalar GEMV within the usual tolerance.
+    #[test]
+    #[cfg(target_arch = "aarch64")]
+    fn q4_kx8_gemm_x4_i8mm_matches_group_and_scalar() {
+        if !std::arch::is_aarch64_feature_detected!("i8mm") {
+            return;
+        }
+        let interleave = q4_kx8_interleave();
+        assert_eq!(interleave, 8, "i8mm host should pack with interleave 8");
+
+        let n_blocks = 3;
+        let cols = n_blocks * Q4_K_BLOCK_ELEMS;
+        let rows = Q4_KX8_NROWS;
+        let mut matrix = Vec::new();
+        for r in 0..rows {
+            matrix.extend_from_slice(&synth_q4_k_row(n_blocks, (r * 7 + 2) as u8));
+        }
+        let packed = pack_q4_k_matrix_x8(&matrix, rows, cols, interleave);
+
+        assert!(q4_kx8_gemm_uses_acts_x4(interleave));
+        for na in 1..=Q4_KX8_GEMM_NC {
+            let acts = synth_q8_k_acts(na, cols);
+            let tile = prepare_q8_k_acts_x4(&acts, cols);
+
+            let mut x4_out = vec![0f32; Q4_KX8_NROWS * na];
+            gemm_q4_kx8_group_x4(&packed, 0, &tile, cols, interleave, &mut x4_out);
+
+            let mut group_out = vec![0f32; Q4_KX8_NROWS * na];
+            gemm_q4_kx8_group(&packed, 0, &acts, cols, interleave, &mut group_out);
+            assert_eq!(
+                x4_out.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                group_out.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                "x4 entry diverged from the compat entry, na {na}"
+            );
+
+            for (j, act) in acts.iter().enumerate() {
+                let mut scalar_out = [0f32; Q4_KX8_NROWS];
+                gemv_q4_kx8_group(&packed, 0, act, cols, interleave, &mut scalar_out);
+                for r in 0..Q4_KX8_NROWS {
+                    let got = x4_out[r * na + j];
+                    let want = scalar_out[r];
+                    let err = (got - want).abs();
+                    let scale = want.abs().max(1.0);
+                    assert!(
+                        err / scale < 1e-5 || err < 1e-3,
+                        "row {r} act {j} na {na}: i8mm x4 GEMM {got} vs scalar {want} (err={err})"
+                    );
+                }
             }
         }
     }

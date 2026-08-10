@@ -1399,20 +1399,45 @@ impl WeightMatrix {
                             if n_groups > 0 {
                                 let interleave = ferrox_quant::q4_kx8_interleave();
                                 let packed = get_or_repack_q4k(data.as_slice(), *rows, cols);
+                                let nc = ferrox_quant::Q4_KX8_GEMM_NC;
+                                // On the i8mm path, interleave each quad of
+                                // activations once per matmul (llama.cpp
+                                // `ggml_quantize_mat_q8_K_4x8` into `wdata`);
+                                // the kernel used to redo it per row-group.
+                                let act_tiles: Vec<ferrox_quant::Q8KActsX4> =
+                                    if ferrox_quant::q4_kx8_gemm_uses_acts_x4(interleave) {
+                                        acts.par_chunks(nc)
+                                            .map(|chunk| {
+                                                ferrox_quant::prepare_q8_k_acts_x4(chunk, cols)
+                                            })
+                                            .collect()
+                                    } else {
+                                        Vec::new()
+                                    };
                                 let group_stride = ferrox_quant::Q4_KX8_NROWS * batch_size;
                                 by_row[..n_groups * group_stride]
                                     .par_chunks_mut(group_stride)
                                     .with_min_len(Self::min_rows_per_task(n_groups).max(1))
                                     .enumerate()
                                     .for_each(|(g, group_out)| {
-                                        let nc = ferrox_quant::Q4_KX8_GEMM_NC;
                                         let mut tile = vec![0f32; ferrox_quant::Q4_KX8_NROWS * nc];
                                         for (t, chunk) in acts.chunks(nc).enumerate() {
                                             let n = chunk.len();
                                             let tile = &mut tile[..ferrox_quant::Q4_KX8_NROWS * n];
-                                            ferrox_quant::gemm_q4_kx8_group(
-                                                &packed, g, chunk, cols, interleave, tile,
-                                            );
+                                            if act_tiles.is_empty() {
+                                                ferrox_quant::gemm_q4_kx8_group(
+                                                    &packed, g, chunk, cols, interleave, tile,
+                                                );
+                                            } else {
+                                                ferrox_quant::gemm_q4_kx8_group_x4(
+                                                    &packed,
+                                                    g,
+                                                    &act_tiles[t],
+                                                    cols,
+                                                    interleave,
+                                                    tile,
+                                                );
+                                            }
                                             for r in 0..ferrox_quant::Q4_KX8_NROWS {
                                                 for j in 0..n {
                                                     group_out[r * batch_size + t * nc + j] =

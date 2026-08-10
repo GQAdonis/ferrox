@@ -1067,8 +1067,13 @@ impl Decoder {
             #[cfg(not(feature = "metal"))]
             let down: Option<Vec<f32>> = None;
             let down = down.unwrap_or_else(|| {
-                let gate = shex.gate.apply_batch(normed2_batch, batch_size);
-                let up = shex.up.apply_batch(normed2_batch, batch_size);
+                let ffn_acts = shex.gate.quantize_batch_acts(normed2_batch, batch_size);
+                let gate =
+                    shex.gate
+                        .apply_batch_with_acts(normed2_batch, batch_size, ffn_acts.as_ref());
+                let up = shex
+                    .up
+                    .apply_batch_with_acts(normed2_batch, batch_size, ffn_acts.as_ref());
                 let activated = ferrox_core::matmul::swiglu(&gate, &up);
                 shex.down.apply_batch(&activated, batch_size)
             });
@@ -2769,8 +2774,13 @@ impl Decoder {
             }
         }
         Some(layer.moe.with_expert(0, |ex| {
-            let gate = ex.gate.apply_batch(normed2_batch, batch_size);
-            let up = ex.up.apply_batch(normed2_batch, batch_size);
+            let ffn_acts = ex.gate.quantize_batch_acts(normed2_batch, batch_size);
+            let gate = ex
+                .gate
+                .apply_batch_with_acts(normed2_batch, batch_size, ffn_acts.as_ref());
+            let up = ex
+                .up
+                .apply_batch_with_acts(normed2_batch, batch_size, ffn_acts.as_ref());
             let activated: Vec<f32> = match config.ffn_activation {
                 crate::config::FfnActivation::Swiglu
                 | crate::config::FfnActivation::SwigluFused => {
@@ -2865,8 +2875,9 @@ impl Decoder {
                     .copy_from_slice(&normed2_batch[tok * hidden_dim..(tok + 1) * hidden_dim]);
             }
             let ex = &experts[eid];
-            let gate = ex.gate.apply_batch(&gathered, n);
-            let up = ex.up.apply_batch(&gathered, n);
+            let ffn_acts = ex.gate.quantize_batch_acts(&gathered, n);
+            let gate = ex.gate.apply_batch_with_acts(&gathered, n, ffn_acts.as_ref());
+            let up = ex.up.apply_batch_with_acts(&gathered, n, ffn_acts.as_ref());
             let activated = ferrox_core::matmul::swiglu(&gate, &up);
             let down = ex.down.apply_batch(&activated, n);
             for (i, &(tok, w)) in toks.iter().enumerate() {
@@ -3241,9 +3252,27 @@ impl Decoder {
                 .flatten()
                 .collect();
 
-            let mut q_batch = layer.attn.q_proj.apply_batch(&normed_batch, batch_size);
-            let mut k_batch = layer.attn.k_proj.apply_batch(&normed_batch, batch_size);
-            let mut v_batch = layer.attn.v_proj.apply_batch(&normed_batch, batch_size);
+            // One shared activation-quant pass for q/k/v (plan 1e): the
+            // three projections read the same normed batch, so quantize it
+            // once instead of once per projection. A kind mismatch inside
+            // the group just re-quantizes locally.
+            let qkv_acts = layer.attn.q_proj.quantize_batch_acts(&normed_batch, batch_size);
+            let mut q_batch =
+                layer
+                    .attn
+                    .q_proj
+                    .apply_batch_with_acts(&normed_batch, batch_size, qkv_acts.as_ref());
+            let mut k_batch =
+                layer
+                    .attn
+                    .k_proj
+                    .apply_batch_with_acts(&normed_batch, batch_size, qkv_acts.as_ref());
+            let mut v_batch =
+                layer
+                    .attn
+                    .v_proj
+                    .apply_batch_with_acts(&normed_batch, batch_size, qkv_acts.as_ref());
+            drop(qkv_acts);
 
             if let Some(bias) = &layer.attn.q_bias {
                 for row in q_batch.chunks_mut(q_width) {
@@ -3774,9 +3803,27 @@ impl Decoder {
                 .flatten()
                 .collect();
 
-            let mut q_batch = layer.attn.q_proj.apply_batch(&normed_batch, batch_size);
-            let mut k_batch = layer.attn.k_proj.apply_batch(&normed_batch, batch_size);
-            let mut v_batch = layer.attn.v_proj.apply_batch(&normed_batch, batch_size);
+            // One shared activation-quant pass for q/k/v (plan 1e): the
+            // three projections read the same normed batch, so quantize it
+            // once instead of once per projection. A kind mismatch inside
+            // the group just re-quantizes locally.
+            let qkv_acts = layer.attn.q_proj.quantize_batch_acts(&normed_batch, batch_size);
+            let mut q_batch =
+                layer
+                    .attn
+                    .q_proj
+                    .apply_batch_with_acts(&normed_batch, batch_size, qkv_acts.as_ref());
+            let mut k_batch =
+                layer
+                    .attn
+                    .k_proj
+                    .apply_batch_with_acts(&normed_batch, batch_size, qkv_acts.as_ref());
+            let mut v_batch =
+                layer
+                    .attn
+                    .v_proj
+                    .apply_batch_with_acts(&normed_batch, batch_size, qkv_acts.as_ref());
+            drop(qkv_acts);
 
             let q_width = n_heads * head_dim;
             let kv_width = n_kv_heads * head_dim;

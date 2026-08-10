@@ -33,7 +33,6 @@ pub use repack::{
 };
 
 use half::f16;
-use rayon::prelude::*;
 
 /// Q8_0: 32 int8 values sharing one f16 scale. 34 bytes per block.
 pub const Q8_0_BLOCK_BYTES: usize = 34;
@@ -686,23 +685,18 @@ pub fn quantize_activations_q8_k(x: &[f32]) -> Q8KActivations {
             bsum_slot[g] = s as i16;
         }
     };
-    if n_blocks >= 4 {
-        q.par_chunks_mut(Q4_K_BLOCK_ELEMS)
-            .zip(d.par_iter_mut())
-            .zip(bsums.par_chunks_mut(16))
-            .zip(x.par_chunks_exact(Q4_K_BLOCK_ELEMS))
-            .for_each(|(((q_slot, d_slot), bsum_slot), chunk)| {
-                quant_one((q_slot, d_slot, bsum_slot, chunk));
-            });
-    } else {
-        for (b, chunk) in x.chunks_exact(Q4_K_BLOCK_ELEMS).enumerate() {
-            quant_one((
-                &mut q[b * Q4_K_BLOCK_ELEMS..(b + 1) * Q4_K_BLOCK_ELEMS],
-                &mut d[b],
-                &mut bsums[b * 16..(b + 1) * 16],
-                chunk,
-            ));
-        }
+    // Serial on purpose: every batch caller is already inside a Rayon
+    // region (one task per activation), so an inner region here nested
+    // ~batch_size fork-joins per matmul; and one row's blocks are far too
+    // little work to amortize one. llama quantizes serially per thread
+    // chunk too (`ggml_compute_forward_mul_mat`, `ggml-cpu.c`).
+    for (b, chunk) in x.chunks_exact(Q4_K_BLOCK_ELEMS).enumerate() {
+        quant_one((
+            &mut q[b * Q4_K_BLOCK_ELEMS..(b + 1) * Q4_K_BLOCK_ELEMS],
+            &mut d[b],
+            &mut bsums[b * 16..(b + 1) * 16],
+            chunk,
+        ));
     }
     Q8KActivations { q, d, bsums }
 }
@@ -726,19 +720,15 @@ pub fn quantize_activations_q8(x: &[f32]) -> Q8Activations {
             q_slot[i] = qi.clamp(-127.0, 127.0) as i8;
         }
     };
-    if n_blocks >= 4 {
-        q.par_chunks_mut(Q8_0_BLOCK_ELEMS)
-            .zip(d.par_iter_mut())
-            .zip(x.par_chunks_exact(Q8_0_BLOCK_ELEMS))
-            .for_each(|((q_slot, d_slot), chunk)| quant_one((q_slot, d_slot, chunk)));
-    } else {
-        for (b, chunk) in x.chunks_exact(Q8_0_BLOCK_ELEMS).enumerate() {
-            quant_one((
-                &mut q[b * Q8_0_BLOCK_ELEMS..(b + 1) * Q8_0_BLOCK_ELEMS],
-                &mut d[b],
-                chunk,
-            ));
-        }
+    // Serial on purpose — see `quantize_activations_q8_k`. The parallel
+    // split this replaces was also 32-byte `q` chunks (two per cache
+    // line) with adjacent `d` writes: false sharing on every store.
+    for (b, chunk) in x.chunks_exact(Q8_0_BLOCK_ELEMS).enumerate() {
+        quant_one((
+            &mut q[b * Q8_0_BLOCK_ELEMS..(b + 1) * Q8_0_BLOCK_ELEMS],
+            &mut d[b],
+            chunk,
+        ));
     }
     Q8Activations { q, d }
 }

@@ -319,6 +319,16 @@ pub unsafe fn default_cpu_int_dot_on() {
     }
 }
 
+/// A batch of activations quantized once for reuse across several
+/// [`WeightMatrix::apply_batch_with_acts`] calls that read the same input
+/// (q/k/v on one normed batch; gate/up on another). Build with
+/// [`WeightMatrix::quantize_batch_acts`]. Q8_0/Q4_0 matrices consume
+/// [`BatchActs::Q8`]; the K-quants consume [`BatchActs::Q8K`].
+pub enum BatchActs {
+    Q8(Vec<ferrox_quant::Q8Activations>),
+    Q8K(Vec<ferrox_quant::Q8KActivations>),
+}
+
 pub enum WeightMatrix {
     F32(Tensor),
     Quantized {
@@ -1217,6 +1227,76 @@ impl WeightMatrix {
     /// [`ferrox_metal::gpu::launch_matvec_batch`]. Falls back to
     /// per-row [`Self::apply`] if the batch launch fails.
     pub fn apply_batch(&self, x_batch: &[f32], batch_size: usize) -> Vec<f32> {
+        self.apply_batch_with_acts(x_batch, batch_size, None)
+    }
+
+    /// Quantize `x_batch` once, in the activation format this matrix's
+    /// INT_DOT batch path consumes, for sharing across every projection
+    /// that reads the same input (q/k/v on one normed batch; gate/up on
+    /// another). Returns `None` when [`Self::apply_batch`] would not use
+    /// quantized activations for this matrix — GPU dispatch, INT_DOT off,
+    /// unsupported kind or width — so callers can pass the result straight
+    /// to [`Self::apply_batch_with_acts`] unconditionally.
+    pub fn quantize_batch_acts(&self, x_batch: &[f32], batch_size: usize) -> Option<BatchActs> {
+        #[cfg(feature = "metal")]
+        {
+            if metal_dense_enabled()
+                && matches!(
+                    self,
+                    WeightMatrix::Quantized { kind, .. } if Self::metal_kind_supported(*kind)
+                )
+            {
+                return None;
+            }
+        }
+        #[cfg(feature = "cuda")]
+        {
+            if cuda_dense_enabled() && matches!(self, WeightMatrix::Quantized { .. }) {
+                return None;
+            }
+        }
+        let WeightMatrix::Quantized { cols, kind, .. } = self else {
+            return None;
+        };
+        if !cpu_int_dot_enabled() || x_batch.len() != batch_size * cols {
+            return None;
+        }
+        match kind {
+            QuantKind::Q8_0 | QuantKind::Q4_0 if cols.is_multiple_of(32) => Some(BatchActs::Q8(
+                (0..batch_size)
+                    .into_par_iter()
+                    .map(|b| {
+                        ferrox_quant::quantize_activations_q8(&x_batch[b * cols..(b + 1) * cols])
+                    })
+                    .collect(),
+            )),
+            QuantKind::Q4K | QuantKind::Q5K | QuantKind::Q6K if cols.is_multiple_of(256) => {
+                Some(BatchActs::Q8K(
+                    (0..batch_size)
+                        .into_par_iter()
+                        .map(|b| {
+                            ferrox_quant::quantize_activations_q8_k(
+                                &x_batch[b * cols..(b + 1) * cols],
+                            )
+                        })
+                        .collect(),
+                ))
+            }
+            _ => None,
+        }
+    }
+
+    /// [`Self::apply_batch`], optionally reusing a shared pre-quantized
+    /// activation batch from [`Self::quantize_batch_acts`]. A `shared`
+    /// value whose format or length does not match this matrix is simply
+    /// ignored (the activations are re-quantized locally), so mixed-kind
+    /// projection groups stay correct.
+    pub fn apply_batch_with_acts(
+        &self,
+        x_batch: &[f32],
+        batch_size: usize,
+        shared: Option<&BatchActs>,
+    ) -> Vec<f32> {
         let cols = self.cols();
         assert_eq!(
             x_batch.len(),
@@ -1325,14 +1405,21 @@ impl WeightMatrix {
                 if cpu_int_dot_enabled() {
                     match *kind {
                         QuantKind::Q8_0 if cols.is_multiple_of(32) => {
-                            let acts: Vec<_> = (0..batch_size)
-                                .into_par_iter()
-                                .map(|b| {
-                                    ferrox_quant::quantize_activations_q8(
-                                        &x_batch[b * cols..(b + 1) * cols],
-                                    )
-                                })
-                                .collect();
+                            let acts_owned: Vec<_>;
+                            let acts: &[ferrox_quant::Q8Activations] = match shared {
+                                Some(BatchActs::Q8(a)) if a.len() == batch_size => a,
+                                _ => {
+                                    acts_owned = (0..batch_size)
+                                        .into_par_iter()
+                                        .map(|b| {
+                                            ferrox_quant::quantize_activations_q8(
+                                                &x_batch[b * cols..(b + 1) * cols],
+                                            )
+                                        })
+                                        .collect();
+                                    &acts_owned
+                                }
+                            };
                             let n_groups = *rows / ferrox_quant::Q8_0X4_NROWS;
                             if n_groups > 0 {
                                 let packed = get_or_repack_q8x4(data.as_slice(), *rows, cols);
@@ -1441,14 +1528,21 @@ impl WeightMatrix {
                             return out;
                         }
                         QuantKind::Q4_0 if cols.is_multiple_of(32) => {
-                            let acts: Vec<_> = (0..batch_size)
-                                .into_par_iter()
-                                .map(|b| {
-                                    ferrox_quant::quantize_activations_q8(
-                                        &x_batch[b * cols..(b + 1) * cols],
-                                    )
-                                })
-                                .collect();
+                            let acts_owned: Vec<_>;
+                            let acts: &[ferrox_quant::Q8Activations] = match shared {
+                                Some(BatchActs::Q8(a)) if a.len() == batch_size => a,
+                                _ => {
+                                    acts_owned = (0..batch_size)
+                                        .into_par_iter()
+                                        .map(|b| {
+                                            ferrox_quant::quantize_activations_q8(
+                                                &x_batch[b * cols..(b + 1) * cols],
+                                            )
+                                        })
+                                        .collect();
+                                    &acts_owned
+                                }
+                            };
                             let n_groups = *rows / ferrox_quant::Q4_0X4_NROWS;
                             if n_groups > 0 {
                                 let packed = get_or_repack_q4_0x4(data.as_slice(), *rows, cols);
@@ -1547,14 +1641,21 @@ impl WeightMatrix {
                             return out;
                         }
                         QuantKind::Q4K if cols.is_multiple_of(256) => {
-                            let acts: Vec<_> = (0..batch_size)
-                                .into_par_iter()
-                                .map(|b| {
-                                    ferrox_quant::quantize_activations_q8_k(
-                                        &x_batch[b * cols..(b + 1) * cols],
-                                    )
-                                })
-                                .collect();
+                            let acts_owned: Vec<_>;
+                            let acts: &[ferrox_quant::Q8KActivations] = match shared {
+                                Some(BatchActs::Q8K(a)) if a.len() == batch_size => a,
+                                _ => {
+                                    acts_owned = (0..batch_size)
+                                        .into_par_iter()
+                                        .map(|b| {
+                                            ferrox_quant::quantize_activations_q8_k(
+                                                &x_batch[b * cols..(b + 1) * cols],
+                                            )
+                                        })
+                                        .collect();
+                                    &acts_owned
+                                }
+                            };
                             let n_groups = *rows / ferrox_quant::Q4_KX8_NROWS;
                             if n_groups > 0 {
                                 let interleave = ferrox_quant::q4_kx8_interleave();
@@ -1646,14 +1747,21 @@ impl WeightMatrix {
                             return out;
                         }
                         QuantKind::Q5K if cols.is_multiple_of(256) => {
-                            let acts: Vec<_> = (0..batch_size)
-                                .into_par_iter()
-                                .map(|b| {
-                                    ferrox_quant::quantize_activations_q8_k(
-                                        &x_batch[b * cols..(b + 1) * cols],
-                                    )
-                                })
-                                .collect();
+                            let acts_owned: Vec<_>;
+                            let acts: &[ferrox_quant::Q8KActivations] = match shared {
+                                Some(BatchActs::Q8K(a)) if a.len() == batch_size => a,
+                                _ => {
+                                    acts_owned = (0..batch_size)
+                                        .into_par_iter()
+                                        .map(|b| {
+                                            ferrox_quant::quantize_activations_q8_k(
+                                                &x_batch[b * cols..(b + 1) * cols],
+                                            )
+                                        })
+                                        .collect();
+                                    &acts_owned
+                                }
+                            };
                             // Q5_Kx8 multi-act NEON GEMM amortizes weight unpack.
                             let use_kx8 = cfg!(target_arch = "aarch64");
                             let n_groups = if use_kx8 {
@@ -1757,14 +1865,21 @@ impl WeightMatrix {
                             return out;
                         }
                         QuantKind::Q6K if cols.is_multiple_of(256) => {
-                            let acts: Vec<_> = (0..batch_size)
-                                .into_par_iter()
-                                .map(|b| {
-                                    ferrox_quant::quantize_activations_q8_k(
-                                        &x_batch[b * cols..(b + 1) * cols],
-                                    )
-                                })
-                                .collect();
+                            let acts_owned: Vec<_>;
+                            let acts: &[ferrox_quant::Q8KActivations] = match shared {
+                                Some(BatchActs::Q8K(a)) if a.len() == batch_size => a,
+                                _ => {
+                                    acts_owned = (0..batch_size)
+                                        .into_par_iter()
+                                        .map(|b| {
+                                            ferrox_quant::quantize_activations_q8_k(
+                                                &x_batch[b * cols..(b + 1) * cols],
+                                            )
+                                        })
+                                        .collect();
+                                    &acts_owned
+                                }
+                            };
                             // Kx8 batch path only where the i8mm GEMM
                             // exists (the scalar Kx8 GEMM measured slower
                             // than the per-row NEON dot on Phi ffn_down,
@@ -3041,6 +3156,38 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    /// Sharing one quantized activation batch across projections must be
+    /// invisible in the results: a matching `BatchActs` produces exactly
+    /// what `apply_batch` produces (same quantization, same kernels), and
+    /// a mismatched variant is ignored rather than misused.
+    #[test]
+    fn apply_batch_with_shared_acts_matches_apply_batch() {
+        let rows = 19;
+        let cols = 512;
+        let batch_size = 6;
+        let x_batch: Vec<f32> = (0..batch_size * cols)
+            .map(|i| (((i * 29 + 11) % 89) as f32) * 0.023 - 1.0)
+            .collect();
+        for kind in [QuantKind::Q8_0, QuantKind::Q4_0, QuantKind::Q4K, QuantKind::Q6K] {
+            let matrix = synth_quant_matrix(kind, rows, cols);
+            let baseline = matrix.apply_batch(&x_batch, batch_size);
+
+            let shared = matrix.quantize_batch_acts(&x_batch, batch_size);
+            let with_shared = matrix.apply_batch_with_acts(&x_batch, batch_size, shared.as_ref());
+            assert_eq!(baseline, with_shared, "{kind:?}: shared acts changed the result");
+
+            let wrong = match kind {
+                QuantKind::Q8_0 | QuantKind::Q4_0 => BatchActs::Q8K(Vec::new()),
+                _ => BatchActs::Q8(Vec::new()),
+            };
+            let with_wrong = matrix.apply_batch_with_acts(&x_batch, batch_size, Some(&wrong));
+            assert_eq!(
+                baseline, with_wrong,
+                "{kind:?}: mismatched shared acts were not ignored"
+            );
         }
     }
 

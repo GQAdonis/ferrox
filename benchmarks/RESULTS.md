@@ -37,8 +37,8 @@ pinning both to the same count does not make the comparison fairer.
 | Gemma-2-2B-IT Q4_K_M | metal | tg128 | **55.48** | **66.26** | 🔴 **1.19×** |
 | Gemma-3-1B-IT Q8_0 | cpu | pp512 | **101.71** | **339.51** | 🔴 **3.34×** |
 | Gemma-3-1B-IT Q8_0 | cpu | tg128 | **37.19** | **41.90** | 🔴 **1.13×** |
-| Gemma-3-1B-IT Q8_0 | metal | pp512 | **92.21** | **1920.51** | 🔴 **20.83×** |
-| Gemma-3-1B-IT Q8_0 | metal | tg128 | **58.26** | **52.78** | 🟢 **0.91×** |
+| Gemma-3-1B-IT Q8_0 | metal | pp512 | **2200.55** | **2622.27** | 🔴 **1.19×** |
+| Gemma-3-1B-IT Q8_0 | metal | tg128 | **92.92** | **76.35** | 🟢 **0.82×** |
 | Llama-3.2-1B-Instruct IQ4_XS | metal | pp512 | **676.99** | **1880.31** | 🔴 **2.78×** |
 | Llama-3.2-1B-Instruct IQ4_XS | metal | tg128 | **94.18** | **77.70** | 🟢 **0.83×** |
 | Llama-3.1-8B-Instruct Q4_K_M | metal | pp512 | **169.97** | **250.62** | 🔴 **1.47×** |
@@ -65,16 +65,16 @@ pinning both to the same count does not make the comparison fairer.
 | Phi-4-mini-Instruct Q4_K_M | metal | tg128 | **35.16** | **24.06** | 🟢 **0.68×** |
 | Qwen2.5-0.5B-Instruct Q8_0 | cpu | pp512 | **201.75** | **640.50** | 🔴 **3.17×** |
 | Qwen2.5-0.5B-Instruct Q8_0 | cpu | tg128 | **76.33** | **114.55** | 🔴 **1.50×** |
-| Qwen2.5-0.5B-Instruct Q8_0 | metal | pp512 | **129.47** | **2660.46** | 🔴 **20.55×** |
-| Qwen2.5-0.5B-Instruct Q8_0 | metal | tg128 | **94.97** | **65.09** | 🟢 **0.69×** |
+| Qwen2.5-0.5B-Instruct Q8_0 | metal | pp512 | **2359.93** | **4907.72** | 🔴 **2.08×** |
+| Qwen2.5-0.5B-Instruct Q8_0 | metal | tg128 | **197.64** | **124.52** | 🟢 **0.63×** |
 | Qwen1.5-MoE-A2.7B Q4_K_M | cpu | pp512 | **28.46** | **123.41** | 🔴 **4.34×** |
 | Qwen1.5-MoE-A2.7B Q4_K_M | cpu | tg128 | **21.45** | **46.75** | 🔴 **2.18×** |
 | Qwen1.5-MoE-A2.7B Q4_K_M | metal | pp512 | **35.95** | **742.49** | 🔴 **20.65×** |
 | Qwen1.5-MoE-A2.7B Q4_K_M | metal | tg128 | **23.21** | **62.60** | 🔴 **2.70×** |
 | Qwen3-0.6B Q8_0 | cpu | pp512 | **97.71** | **421.05** | 🔴 **4.31×** |
 | Qwen3-0.6B Q8_0 | cpu | tg128 | **52.84** | **69.97** | 🔴 **1.32×** |
-| Qwen3-0.6B Q8_0 | metal | pp512 | **107.14** | **1927.96** | 🔴 **18.00×** |
-| Qwen3-0.6B Q8_0 | metal | tg128 | **89.85** | **61.33** | 🟢 **0.68×** |
+| Qwen3-0.6B Q8_0 | metal | pp512 | **1836.82** | **3443.86** | 🔴 **1.87×** |
+| Qwen3-0.6B Q8_0 | metal | tg128 | **141.56** | **108.27** | 🟢 **0.76×** |
 | SmolLM2-135M-Instruct Q8_0 | cpu | pp512 | **283.69** | **1225.64** | 🔴 **4.32×** |
 | SmolLM2-135M-Instruct Q8_0 | cpu | tg128 | **120.68** | **158.93** | 🔴 **1.32×** |
 | SmolLM2-135M-Instruct Q8_0 | metal | pp512 | **4111.48** | **12219.05** | 🔴 **2.97×** |
@@ -161,13 +161,13 @@ Pins that used `llama-cli` or rejected options are omitted.
 
 ## Open
 
-1. **Prefill is the largest gap in the project.** Quiet-host re-measure (2026-08-08): SmolLM2 metal pp512 **2.97×** (was 8.13×; multi-layer prefill stack), OLMoE metal **2.65×** (was ~11–15×; gather/`mul_mm_sg` + Q4_0 `mul_mv_id`). Qwen1.5-MoE metal still **20.65×** (mixed Q4_K/Q8_0 `matvec_id` landed; still needs fused `kernel_mul_mm_id`). Tiny Q8_0 dense rows still multi-×. See `docs/ROADMAP.md`.
-2. **Metal decode is healthy** on dense models with answer parity (SmolLM2 / Llama / Gemma-2 / Qwen MoE / OLMoE greedy “Paris” OK). Gemma-2 Metal was fixed 2026-08-10: Concurrent encoder + sandwich post-norms in the dense decode stack caused BOS-loops / `*` spam; serial encode + eager residuals restore CPU-matched logits.
-3. **Qwen1.5-MoE metal tg128 ~2.70×** remains the worst decode row; answers OK after shexp + `norm_topk_prob=false` + `add_bos=false`.
+1. **Prefill is the largest gap in the project.** Quiet-host (2026-08-10): Qwen2.5-0.5B / Qwen3-0.6B / Gemma-3-1B Metal pp512 dropped from ~18–21× to **~2.1× / ~1.9× / ~1.2×** by teaching the dense prefill stack QKV bias + QK-norm (those models were stuck on CPU proj + Metal attn hybrid). SmolLM2 metal pp512 **2.97×**; OLMoE metal **2.65×**. Qwen1.5-MoE metal still **20.65×** (needs fused `kernel_mul_mm_id`). Remaining tiny-model headroom is Metal graph / CB replay for ≤1.0×.
+2. **Metal decode is healthy** on dense models with answer parity (SmolLM2 / Llama / Gemma-2 / Gemma-3 / Qwen / Qwen MoE / OLMoE greedy “Paris” OK). Gemma-2 Metal was fixed 2026-08-10: Concurrent encoder + sandwich post-norms in the dense decode stack caused BOS-loops / `*` spam; serial encode + eager residuals restore CPU-matched logits.
+3. **Qwen1.5-MoE metal tg128 ~2.70×** remains the worst decode row; answers OK after shexp + `norm_topk_prob=false` + `add_bos=false` (shexp loader + Paris smoke re-verified 2026-08-10).
 4. **CPU decode is behind everywhere** (1.33×–2.60×). Two distinct causes measured: ~2× lower per-thread GEMV throughput, and a parallel-scaling ceiling at ~1.9× total where llama keeps scaling (rayon fork-join per matvec vs llama's persistent spin-barrier pool). CPU Q4_K batch GEMM landed — re-measure Gemma-2/Phi/Mistral pp512; i8mm SMMLA still open if rows stay >1×.
 5. **Serving pins re-measured** with neither engine's threads forced. Every CPU row is now a loss (1.35×–2.57×); the five previous CPU "wins" were artifacts of the old `-t 10`. ferrox's own throughput rose slightly in every row — llama's roughly doubled. Metal barely moved, as expected at `-ngl 99`, except the 8B lead (0.92× → 1.05×).
 6. CUDA — no in-tree pin; skipped on darwin via `--fit-host`. Needs a GPU host.
-7. Gemma-4-E2B: `Gemma4Engine` loads; tokenizer `gemma4` still byte-fallback. **Metal now emits 2 garbage tokens instead of refusing** (pin `status=error`, `expect=refuse`) — worse than a clean refusal, since it looks like it works. CPU still refuses. Homebrew llama also reports unknown-arch.
+7. Gemma-4-E2B: `Gemma4Engine` + SPM-style `gemma4` BPE + `<|turn>` chat wrap (2026-08-10). Fair-chat serving pin still open; Homebrew llama may still lack `gemma4` arch.
 8. Continuous-batching multi-request receipt (`cb_throughput.py` exists; its output is not yet in this ledger).
 9. DS4 / GLM / MLA MoE real-checkpoint e2e when feasible (MoE-after-dense wired in `MlaEngine`). Mixtral still skipped by `--fit-host` on Host B.
 10. Run-to-run spread on this host is ~20%; anything claiming less must be measured by interleaved A/B, not two batches of runs.

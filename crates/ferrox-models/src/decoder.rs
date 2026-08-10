@@ -717,16 +717,12 @@ impl Decoder {
             })
     }
 
-    /// One-CB dense prefill (`mul_mm_sg` stack) when QKV bias / QK-norm
-    /// are absent — those need host proj or [`AttnExtras`].
+    /// Dense layer eligible for the one-CB `mul_mm_sg` prefill stack.
+    /// QKV bias / QK-norm are applied on-GPU via [`AttnExtras`] (same as
+    /// decode); SWA fit is checked separately.
     #[cfg(feature = "metal")]
     fn metal_prefill_dense_layer_eligible(layer: &LayerWeights) -> bool {
         Self::is_dense_layer(layer)
-            && layer.attn.q_bias.is_none()
-            && layer.attn.k_bias.is_none()
-            && layer.attn.v_bias.is_none()
-            && layer.attn.q_norm.is_none()
-            && layer.attn.k_norm.is_none()
     }
 
     #[cfg(feature = "metal")]
@@ -835,6 +831,7 @@ impl Decoder {
                 down,
                 post_attn_norm: layer.attn.post_attn_norm.as_deref(),
                 post_ffn_norm: layer.attn.post_ffn_norm.as_deref(),
+                extras: self.metal_attn_extras(layer),
                 layer_idx: li as u32,
             });
             rope_thetas.push(self.config.layer_rope_theta(li));
@@ -3202,6 +3199,7 @@ impl Decoder {
                                         down,
                                         post_attn_norm: layer.attn.post_attn_norm.as_deref(),
                                         post_ffn_norm: layer.attn.post_ffn_norm.as_deref(),
+                                        extras: self.metal_attn_extras(layer),
                                         layer_idx: l as u32,
                                     };
                                     ferrox_metal::attn::launch_prefill_dense_layer(

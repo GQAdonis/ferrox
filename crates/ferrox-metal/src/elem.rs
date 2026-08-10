@@ -316,10 +316,22 @@ pub(crate) fn encode_vec_add(
     b: &ProtocolObject<dyn MTLBuffer>,
     n: u32,
 ) -> Result<(), MetalError> {
+    encode_vec_add_at(encoder, device, a, 0, b, n)
+}
+
+/// `a[a_offset_bytes/4 ..] += b[0..n]` (in-place on `a`).
+pub(crate) fn encode_vec_add_at(
+    encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+    device: &Retained<ProtocolObject<dyn MTLDevice>>,
+    a: &ProtocolObject<dyn MTLBuffer>,
+    a_offset_bytes: usize,
+    b: &ProtocolObject<dyn MTLBuffer>,
+    n: u32,
+) -> Result<(), MetalError> {
     let pipe = ensure_pipeline(device, VEC_ADD_KERNEL_SRC, "vec_add_f32")?;
     encoder.setComputePipelineState(&pipe.0);
     unsafe {
-        encoder.setBuffer_offset_atIndex(Some(a), 0, 0);
+        encoder.setBuffer_offset_atIndex(Some(a), a_offset_bytes, 0);
         encoder.setBuffer_offset_atIndex(Some(b), 0, 1);
         let mut n_u = n;
         encoder.setBytes_length_atIndex(
@@ -396,7 +408,10 @@ pub(crate) fn encode_add_rms_norm(
     Ok(())
 }
 
-/// In-place per-head RMSNorm×γ over `n_heads * head_dim` values in `x`.
+/// In-place per-head RMSNorm×γ over `n_heads * head_dim` values in `x`
+/// (`batch == 1`). Tests and decode helpers may call this; prefill uses
+/// [`encode_rms_norm_per_head_batch`].
+#[allow(dead_code)]
 pub(crate) fn encode_rms_norm_per_head(
     encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
     device: &Retained<ProtocolObject<dyn MTLDevice>>,
@@ -404,6 +419,19 @@ pub(crate) fn encode_rms_norm_per_head(
     weight: &ProtocolObject<dyn MTLBuffer>,
     n_heads: u32,
     head_dim: u32,
+    eps: f32,
+) -> Result<(), MetalError> {
+    encode_rms_norm_per_head_batch(encoder, device, x, weight, n_heads, head_dim, 1, eps)
+}
+
+pub(crate) fn encode_rms_norm_per_head_batch(
+    encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+    device: &Retained<ProtocolObject<dyn MTLDevice>>,
+    x: &ProtocolObject<dyn MTLBuffer>,
+    weight: &ProtocolObject<dyn MTLBuffer>,
+    n_heads: u32,
+    head_dim: u32,
+    batch: u32,
     eps: f32,
 ) -> Result<(), MetalError> {
     let pipe = ensure_pipeline(
@@ -426,7 +454,7 @@ pub(crate) fn encode_rms_norm_per_head(
     }
     encoder.dispatchThreadgroups_threadsPerThreadgroup(
         MTLSize {
-            width: n_heads as usize,
+            width: (n_heads * batch) as usize,
             height: 1,
             depth: 1,
         },

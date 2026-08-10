@@ -25,7 +25,8 @@
 //! Scope:
 //! - `LLAMA_ROPE_TYPE_NORM` (interleaved) or `NEOX` ± Llama-3 freq factors
 //! - Full-causal GQA (no sliding window); online-softmax kernels
-//! - Caller must not need QKV bias / QK-norm on this path (fall back to CPU)
+//! - Prefill dense stack supports QKV bias + QK-norm via [`AttnExtras`]
+//!   (same order as CPU: bias → norm → RoPE)
 //!
 //! Enable with `FERROX_METAL_ATTN=1` (also requires dense Metal / `FERROX_METAL`).
 //! Optional `FERROX_METAL_LOGITS=1` folds final_norm + lm_head into the dense
@@ -46,7 +47,8 @@
 //! `FERROX_CTK` selects KV dtype ([`MetalKvDtype`]); see [`is_implemented`].
 use crate::elem::{
     encode_add_rms_norm, encode_argmax, encode_gelu_mul, encode_rms_norm, encode_rms_norm_at,
-    encode_rms_norm_per_head, encode_silu_mul, encode_vec_add, warm_prefill_elem_pipelines,
+    encode_rms_norm_per_head_batch, encode_silu_mul, encode_vec_add, encode_vec_add_at,
+    warm_prefill_elem_pipelines,
 };
 use crate::embd::{encode_get_rows, EmbdKind};
 use crate::gpu::{
@@ -3371,7 +3373,7 @@ fn encode_gqa_prefill(
 /// Encode the optional QKV bias adds + QK-RMSNorms (CPU-path order:
 /// bias → norm → RoPE). Per-head (`weight.len() == head_dim`) or
 /// whole-vector (`weight.len() == q_rows` / `k_rows`, OLMoE). No-ops
-/// when `extras` is empty.
+/// when `extras` is empty. Single-token path used by decode.
 #[allow(clippy::too_many_arguments)]
 fn encode_attn_extras(
     encoder: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputeCommandEncoder>,
@@ -3388,73 +3390,184 @@ fn encode_attn_extras(
     head_dim: usize,
     rms_eps: f32,
 ) -> Result<(), MetalError> {
-    if let Some(b) = extras.q_bias {
-        debug_assert_eq!(b.len(), q_rows);
-        let bb = resident_f32_buffer(device, b)?;
-        encode_vec_add(encoder, device, q_buf, &bb.buffer, q_rows as u32)?;
+    let resident = resident_attn_extras(device, extras)?;
+    encode_attn_extras_batch(
+        encoder,
+        device,
+        extras,
+        q_buf,
+        k_buf,
+        v_buf,
+        q_rows,
+        k_rows,
+        v_rows,
+        n_heads,
+        n_kv_heads,
+        head_dim,
+        1,
+        rms_eps,
+        &resident,
+    )
+}
+
+/// Prefill (`batch ≥ 1`) extras using already-resident bias/norm buffers.
+#[allow(clippy::too_many_arguments)]
+fn encode_attn_extras_batch(
+    encoder: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputeCommandEncoder>,
+    device: &objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLDevice>>,
+    extras: &AttnExtras<'_>,
+    q_buf: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>,
+    k_buf: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>,
+    v_buf: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>,
+    q_rows: usize,
+    k_rows: usize,
+    v_rows: usize,
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    batch: usize,
+    rms_eps: f32,
+    resident: &AttnExtrasResident,
+) -> Result<(), MetalError> {
+    if batch == 0 {
+        return Ok(());
     }
-    if let Some(b) = extras.k_bias {
-        debug_assert_eq!(b.len(), k_rows);
-        let bb = resident_f32_buffer(device, b)?;
-        encode_vec_add(encoder, device, k_buf, &bb.buffer, k_rows as u32)?;
+    if let Some(bb) = resident.q_bias.as_ref() {
+        debug_assert_eq!(extras.q_bias.map(|b| b.len()), Some(q_rows));
+        for t in 0..batch {
+            encode_vec_add_at(
+                encoder,
+                device,
+                q_buf,
+                t * q_rows * 4,
+                &bb.buffer,
+                q_rows as u32,
+            )?;
+        }
     }
-    if let Some(b) = extras.v_bias {
-        debug_assert_eq!(b.len(), v_rows);
-        let bb = resident_f32_buffer(device, b)?;
-        encode_vec_add(encoder, device, v_buf, &bb.buffer, v_rows as u32)?;
+    if let Some(bb) = resident.k_bias.as_ref() {
+        debug_assert_eq!(extras.k_bias.map(|b| b.len()), Some(k_rows));
+        for t in 0..batch {
+            encode_vec_add_at(
+                encoder,
+                device,
+                k_buf,
+                t * k_rows * 4,
+                &bb.buffer,
+                k_rows as u32,
+            )?;
+        }
     }
-    if let Some(w) = extras.q_norm {
-        let wb = resident_f32_buffer(device, w)?;
+    if let Some(bb) = resident.v_bias.as_ref() {
+        debug_assert_eq!(extras.v_bias.map(|b| b.len()), Some(v_rows));
+        for t in 0..batch {
+            encode_vec_add_at(
+                encoder,
+                device,
+                v_buf,
+                t * v_rows * 4,
+                &bb.buffer,
+                v_rows as u32,
+            )?;
+        }
+    }
+    if let (Some(w), Some(wb)) = (extras.q_norm, resident.q_norm.as_ref()) {
         if w.len() == head_dim {
-            encode_rms_norm_per_head(
+            encode_rms_norm_per_head_batch(
                 encoder,
                 device,
                 q_buf,
                 &wb.buffer,
                 n_heads as u32,
                 head_dim as u32,
+                batch as u32,
                 rms_eps,
             )?;
         } else {
             debug_assert_eq!(w.len(), q_rows, "Q norm weight must be head_dim or q_rows");
-            // Two-pass kernel: same buffer for x and out is safe.
-            encode_rms_norm(
-                encoder,
-                device,
-                q_buf,
-                &wb.buffer,
-                q_buf,
-                q_rows as u32,
-                rms_eps,
-            )?;
+            for t in 0..batch {
+                let off = t * q_rows * 4;
+                encode_rms_norm_at(
+                    encoder,
+                    device,
+                    q_buf,
+                    off,
+                    &wb.buffer,
+                    q_buf,
+                    off,
+                    q_rows as u32,
+                    rms_eps,
+                )?;
+            }
         }
     }
-    if let Some(w) = extras.k_norm {
-        let wb = resident_f32_buffer(device, w)?;
+    if let (Some(w), Some(wb)) = (extras.k_norm, resident.k_norm.as_ref()) {
         if w.len() == head_dim {
-            encode_rms_norm_per_head(
+            encode_rms_norm_per_head_batch(
                 encoder,
                 device,
                 k_buf,
                 &wb.buffer,
                 n_kv_heads as u32,
                 head_dim as u32,
+                batch as u32,
                 rms_eps,
             )?;
         } else {
             debug_assert_eq!(w.len(), k_rows, "K norm weight must be head_dim or k_rows");
-            encode_rms_norm(
-                encoder,
-                device,
-                k_buf,
-                &wb.buffer,
-                k_buf,
-                k_rows as u32,
-                rms_eps,
-            )?;
+            for t in 0..batch {
+                let off = t * k_rows * 4;
+                encode_rms_norm_at(
+                    encoder,
+                    device,
+                    k_buf,
+                    off,
+                    &wb.buffer,
+                    k_buf,
+                    off,
+                    k_rows as u32,
+                    rms_eps,
+                )?;
+            }
         }
     }
     Ok(())
+}
+
+struct AttnExtrasResident {
+    q_bias: Option<std::sync::Arc<ResidentF32Buffer>>,
+    k_bias: Option<std::sync::Arc<ResidentF32Buffer>>,
+    v_bias: Option<std::sync::Arc<ResidentF32Buffer>>,
+    q_norm: Option<std::sync::Arc<ResidentF32Buffer>>,
+    k_norm: Option<std::sync::Arc<ResidentF32Buffer>>,
+}
+
+fn resident_attn_extras(
+    device: &Retained<ProtocolObject<dyn MTLDevice>>,
+    extras: &AttnExtras<'_>,
+) -> Result<AttnExtrasResident, MetalError> {
+    Ok(AttnExtrasResident {
+        q_bias: extras
+            .q_bias
+            .map(|b| resident_f32_buffer(device, b))
+            .transpose()?,
+        k_bias: extras
+            .k_bias
+            .map(|b| resident_f32_buffer(device, b))
+            .transpose()?,
+        v_bias: extras
+            .v_bias
+            .map(|b| resident_f32_buffer(device, b))
+            .transpose()?,
+        q_norm: extras
+            .q_norm
+            .map(|b| resident_f32_buffer(device, b))
+            .transpose()?,
+        k_norm: extras
+            .k_norm
+            .map(|b| resident_f32_buffer(device, b))
+            .transpose()?,
+    })
 }
 
 /// Fused Q/K/V matvec → RoPE → KV append → GQA → O matvec.
@@ -5794,6 +5907,9 @@ pub struct PrefillDenseLayerMetal<'a> {
     pub down: MulMmSgLaunch<'a>,
     pub post_attn_norm: Option<&'a [f32]>,
     pub post_ffn_norm: Option<&'a [f32]>,
+    /// QKV bias / QK-norm (Qwen2.5, Qwen3, Gemma-3). Applied after GEMM,
+    /// before RoPE — same order as the CPU / decode paths.
+    pub extras: AttnExtras<'a>,
     /// Layer index for [`PrefillCbCache`] keying only.
     pub layer_idx: u32,
 }
@@ -5825,6 +5941,7 @@ struct PrefillDenseLayerResident {
     down_w: std::sync::Arc<ResidentWeightBuffer>,
     post_attn_w: Option<std::sync::Arc<ResidentF32Buffer>>,
     post_ffn_w: Option<std::sync::Arc<ResidentF32Buffer>>,
+    extras: AttnExtrasResident,
 }
 
 fn resident_prefill_dense_layer(
@@ -5856,6 +5973,7 @@ fn resident_prefill_dense_layer(
         down_w: resident_weight_buffer(device, layer.down.weights)?,
         post_attn_w,
         post_ffn_w,
+        extras: resident_attn_extras(device, &layer.extras)?,
     })
 }
 
@@ -5912,6 +6030,25 @@ fn encode_prefill_dense_layer(
     encode_mul_mm_sg(encoder, device, &layer.q, &resident.q_w, x_buf, q_buf, batch)?;
     encode_mul_mm_sg(encoder, device, &layer.k, &resident.k_w, x_buf, k_buf, batch)?;
     encode_mul_mm_sg(encoder, device, &layer.v, &resident.v_w, x_buf, v_buf, batch)?;
+    memory_barrier_buffers(encoder);
+
+    encode_attn_extras_batch(
+        encoder,
+        device,
+        &layer.extras,
+        q_buf,
+        k_buf,
+        v_buf,
+        layer.q.rows,
+        layer.k.rows,
+        layer.v.rows,
+        n_heads,
+        n_kv_heads,
+        head_dim,
+        batch,
+        rms_eps,
+        &resident.extras,
+    )?;
     memory_barrier_buffers(encoder);
 
     encode_rope_batch(

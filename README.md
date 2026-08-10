@@ -8,10 +8,40 @@ CLI and an OpenAI-compatible HTTP server.
 
 ## Quick start
 
+### Install from a GitHub release (recommended)
+
+Prebuilt binaries are attached to each
+[GitHub release](https://github.com/antonellof/ferrox/releases).
+macOS Apple Silicon builds include Metal.
+
+```bash
+# Latest macOS arm64 (Metal) — adjust the tag if you pin a version
+TAG=v0.3.0
+curl -fsSL -o ferrox-darwin-arm64.tar.gz \
+  "https://github.com/antonellof/ferrox/releases/download/${TAG}/ferrox-${TAG}-darwin-arm64.tar.gz"
+tar xzf ferrox-darwin-arm64.tar.gz
+chmod +x ferrox ferrox-server
+
+# Or with the GitHub CLI:
+# gh release download v0.3.0 -p 'ferrox-*-darwin-arm64.tar.gz' --repo antonellof/ferrox
+# tar xzf ferrox-v0.3.0-darwin-arm64.tar.gz
+```
+
+Put the binaries on your `PATH`, or run them from the extract directory
+(examples below use `./ferrox` / `./ferrox-server`).
+
+Linux / CUDA / other hosts: use **Build from source** below (or
+`cargo install ferrox-cli` / `ferrox-server` when published).
+
+### Build from source
+
 ```bash
 # macOS (Metal + CPU). Drop `--features metal` for CPU-only; use `--features cuda` on Linux+NVIDIA.
 cargo build --release -p ferrox-cli -p ferrox-server --features metal
 ```
+
+After a source build, binaries are `./target/release/ferrox` and
+`./target/release/ferrox-server`.
 
 ### 1. Download a model
 
@@ -55,22 +85,24 @@ applies the GGUF chat template. Use `--no-cnv` only for raw completion prompts.
 
 ```bash
 # Gemma-4 chat (Metal). Use -dev none -ngl 0 for CPU.
-./target/release/ferrox -m models/gemma-4-E2B-it-Q4_K_M.gguf \
+./ferrox -m models/gemma-4-E2B-it-Q4_K_M.gguf \
   -p "How are you?" -n 64 --temp 0 -dev metal -ngl all
 
 # TinyLlama / raw completion (no chat wrap)
-./target/release/ferrox -m models/tinyllama-1.1b-chat-v1.0.Q8_0.gguf \
+./ferrox -m models/tinyllama-1.1b-chat-v1.0.Q8_0.gguf \
   -p "The capital of France is" -n 32 --temp 0 --no-cnv
 
 # Llama 3.2 Instruct + Metal
-./target/release/ferrox -m models/Llama-3.2-1B-Instruct-Q4_K_M.gguf \
+./ferrox -m models/Llama-3.2-1B-Instruct-Q4_K_M.gguf \
   -p "What is 2+2?" -n 64 --temp 0 -dev metal -ngl all
 ```
+
+If you built from source, use `./target/release/ferrox` instead of `./ferrox`.
 
 ### 3. Start the server
 
 ```bash
-./target/release/ferrox-server \
+./ferrox-server \
   -m models/gemma-4-E2B-it-Q4_K_M.gguf \
   --host 127.0.0.1 --port 8383 -dev metal -ngl all &
 
@@ -80,6 +112,7 @@ curl -s -X POST http://127.0.0.1:8383/v1/chat/completions \
 ```
 
 Swap `-m` for TinyLlama or another GGUF if you prefer a smaller first server smoke.
+Use `./target/release/ferrox-server` after a source build.
 
 ## Documentation
 

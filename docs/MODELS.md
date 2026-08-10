@@ -65,7 +65,7 @@ with template and sampler in the loop; *engine* is `ferrox bench` vs
 | Mixtral | Suite entry; skipped on 32 GiB Host B (`--fit-host`) |
 | MLA (`deepseek2` / `mistral4`) | Dense-lead + MoE-after-dense via `MlaEngine` |
 | GLM4 / glm4moe | Loads via GLM-5.2 path when tensors present; no e2e pin |
-| Gemma-4-E2B | Dedicated `Gemma4Engine` loads (per-layer emb + shared KV + SWA/full head-dim). Tokenizer `gemma4` still falls back to byte; suite `expect=refuse` until fair-chat pin. GGUF: `models/gemma-4-E2B-it-Q4_K_M.gguf` |
+| Gemma-4-E2B | Dedicated `Gemma4Engine` + SPM-style `gemma4` BPE tokenizer + `<|turn>` chat wrap. GGUF: `models/gemma-4-E2B-it-Q4_K_M.gguf` (`unsloth/gemma-4-E2B-it-GGUF`). Fair-chat pin still open. |
 | Llama 4 / MiniMax | Refused (stubs) |
 | Hybrid GDN / Qwen3.5 | Scaffold only |
 | Kimi K3 / GLM-5.2 / DeepSeek V4 | Loaders/primitives; no frontier e2e pin |

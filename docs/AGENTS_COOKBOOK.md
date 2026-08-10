@@ -37,6 +37,5 @@ FERROX_CONTINUOUS_BATCHING=1 ./target/release/ferrox-server -m model.gguf …
 
 - Mutually exclusive with `FERROX_KV_POOL_BLOCKS` and `FERROX_PREFIX_CACHE_ENTRIES`
 - GGUF Decoder only (Kimi / MLA ignore CB)
-- Smoke: `python3 benchmarks/cb_throughput.py --url http://127.0.0.1:8383`
 
 Full API matrix: [API.md](API.md).

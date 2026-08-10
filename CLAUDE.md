@@ -7,7 +7,7 @@ Guidance for agents working in this repo.
 Pure-Rust GGUF / MoE inference engine: mmap loaders, quantized CPU +
 Metal + CUDA kernels, OpenAI-compatible `ferrox-server`.
 
-Capabilities: `docs/FEATURES.md`. Models & pins: `docs/MODELS.md`,
+Capabilities: `docs/FEATURES.md`. Models & speed ledger: `docs/MODELS.md`,
 `benchmarks/RESULTS.md`. Planned: `docs/ROADMAP.md`.
 
 | Doc | Role |
@@ -18,8 +18,8 @@ Capabilities: `docs/FEATURES.md`. Models & pins: `docs/MODELS.md`,
 | `docs/API.md` | OpenAI compatibility matrix |
 | `docs/AGENTS_COOKBOOK.md` | point IDEs at `ferrox-server` |
 | `docs/CONFIG.md` | env vars |
-| `benchmarks/RESULTS.md` | tok/s vs llama.cpp (Gap = llama/ferrox); engine + serving tables |
-| `benchmarks/README.md` | how the two benchmark tracks are measured |
+| `benchmarks/RESULTS.md` | tok/s vs llama.cpp (Gap = llama/ferrox); `ferrox bench` ledger |
+| `benchmarks/README.md` | how `ferrox bench` / `llama-bench` is measured |
 | `docs/ROADMAP.md` | planned work |
 
 ## Commands
@@ -46,17 +46,11 @@ cargo test -p ferrox-metal --features metal -- --ignored   # needs Metal
 
 FERROX_MODEL_PATH=model.gguf FERROX_ADDR=127.0.0.1:8383 ./target/debug/ferrox-server
 
-# Engine bench vs llama-bench (no HTTP). See benchmarks/README.md
+# Bench vs llama-bench (no HTTP). Models: benchmarks/suite.json
 ./target/release/ferrox bench -m model.gguf -p 512 -n 128 --compare
 ./target/release/ferrox bench --suite --fit-host --skip-missing
-./target/release/ferrox bench --render        # re-render engine table only
-
-# Serving bench vs llama-server (HTTP, chat template, sampler)
-python3 benchmarks/run_suite.py --list
-python3 benchmarks/run_suite.py --id llama32_3b_q4km --backend metal
-# CUDA host (requires --features cuda binary + GPU):
-python3 benchmarks/run_suite.py --id llama32_3b_q4km --backend cuda \
- --host-label "host / GPU / driver"
+./target/release/ferrox bench --suite --id llama32_3b_q4km --backend metal
+./target/release/ferrox bench --render
 ```
 
 Fixtures and golden values were generated and cross-validated with

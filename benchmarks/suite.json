@@ -1,8 +1,9 @@
 {
   "host_default": "Host B (Apple M2 Pro, 6 performance + 4 efficiency cores, 32 GiB unified)",
-  "max_tokens": 512,
   "reps": 3,
-  "workload": "greedy chat, warm then 3x 512-tok capitals list (median)",
+  "n_prompt": 512,
+  "n_gen": 128,
+  "workload": "ferrox bench vs llama-bench: pp512 + tg128 (median ± stddev, one warmup discarded)",
   "host_ram_gb": 32,
   "models": [
     {
@@ -159,5 +160,5 @@
       "notes": "P6 PhiFamily (phi4 fused QKV); Host B receipt"
     }
   ],
-  "threads_note": "Not forced. Each engine picks its own default; llama.cpp uses performance cores and degrades 2-4x above them, so pinning both to one count flatters ferrox. Override with run_suite.py --threads N."
+  "threads_note": "Not forced. Each engine picks its own default; llama.cpp uses performance cores and degrades 2-4x above them, so pinning both to one count flatters ferrox. Override with ferrox bench -t N / llama-bench -t N."
 }

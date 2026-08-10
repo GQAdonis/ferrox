@@ -1,23 +1,15 @@
 //! `ferrox bench -m model.gguf` — a `llama-bench` work-alike.
 //!
-//! Why this exists: the fair-chat suite measures two engines *through
-//! their HTTP servers*, with chat templating, tokenization, sampling and
-//! SSE in the loop. That is a legitimate number — it is what a user of
-//! `ferrox-server` actually gets — but it is not an engine number, and
-//! mixing the two makes a regression impossible to localize. `llama.cpp`
-//! draws the same line, which is why `llama-bench` exists next to
-//! `llama-server`.
-//!
-//! So: same workload definition as `llama-bench` (`pp<N>` = batched
-//! prefill of N synthetic tokens, `tg<N>` = N single-token decode steps
-//! after a one-token prime), same reporting (median ± population
-//! stddev over `-r` repetitions, after one discarded warmup), same flag
-//! names. Output is directly comparable to
+//! Same workload definition as `llama-bench` (`pp<N>` = batched prefill
+//! of N synthetic tokens, `tg<N>` = N single-token decode steps after a
+//! one-token prime), same reporting (median ± population stddev over
+//! `-r` repetitions, after one discarded warmup), same flag names.
+//! Output is directly comparable to
 //! `llama-bench -m <same gguf> -p <N> -n <N> -t <T> -ngl <L>`.
 //!
-//! Deliberately *not* here: chat template, real tokenizer, sampling.
-//! Synthetic token ids exercise the same weights and the same KV growth
-//! without making the number depend on a tokenizer's behavior.
+//! Deliberately *not* here: HTTP, chat template, real tokenizer,
+//! sampling. Synthetic token ids exercise the same weights and the same
+//! KV growth without making the number depend on a tokenizer's behavior.
 
 use anyhow::Context;
 use ferrox_core::cache::KvCache;

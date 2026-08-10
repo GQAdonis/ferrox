@@ -22,7 +22,7 @@ Still open (see [`benchmarks/RESULTS.md`](../benchmarks/RESULTS.md) Open):
   dense 1–3B (~1.5–3×); compiled graph / pre-encoded CB replay for sub-1.5B ≤1×.
 - **CPU prefill/decode** — Phi-4 / Mistral Q4_K pp512 after GEMM
   re-measure; i8mm SMMLA if still >1×; persistent decode threadpool.
-- **Correctness** — Gemma-4 fair-chat pin; older Gemma-2 Metal greedy gate
+- **Correctness** — Gemma-4 e2e chat smoke; older Gemma-2 Metal greedy gate
   remains in-tree for regression only (not in published suite).
 
 Where the project should go beyond closing the measured gaps.
@@ -48,7 +48,7 @@ Where the project should go beyond closing the measured gaps.
 
 **Models**
 
-- Gemma-4 tokenizer (`gemma4`) + fair-chat pin (engine loads today)
+- Gemma-4 tokenizer (`gemma4`) + e2e chat smoke (engine loads today)
 - HybridEngine + Qwen3.5
 - Llama 4 / MiniMax engines
 - Vision (projector + generate)
@@ -63,9 +63,8 @@ Where the project should go beyond closing the measured gaps.
 - MCP tool invocation; Anthropic streaming + tools
 - Full OpenAI API surface (see `[API.md](API.md)`)
 - Docker images (CPU / Metal / CUDA variants)
-- Continuous-batching multi-request throughput pin
+- Continuous-batching multi-request throughput measurement
 - Full KV layer offload; multi-GPU / tensor parallel / PD disaggregation
-- Serving pins: re-measure now that the harness no longer forces `-t`
 
 **KV cache / memory**
 

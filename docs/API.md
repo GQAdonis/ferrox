@@ -40,7 +40,6 @@ Unsupported multimodal input is rejected the same way.
 
 Set `FERROX_CONTINUOUS_BATCHING=1`. Mutually exclusive with
 `FERROX_KV_POOL_BLOCKS` and `FERROX_PREFIX_CACHE_ENTRIES`.
-Helper: [`benchmarks/cb_throughput.py`](../benchmarks/cb_throughput.py).
 
 ## MCP
 

@@ -165,11 +165,16 @@ same reporting (median ± population stddev over `-r` reps, one warmup
 discarded), same flag names — so the two outputs can be read side by side.
 
 ```bash
-# CPU (default). Prints the exact llama-bench command to compare against.
-./target/release/ferrox bench -m model.gguf -p 512 -n 128 -r 3
+# one GGUF (CPU). Prints the exact llama-bench command to compare against.
+./target/release/ferrox bench -m model.gguf -p 512 -n 128 -r 3 --compare
 
 # Metal
-./target/release/ferrox bench -m model.gguf --n-gpu-layers 99 -p 512 -n 128
+./target/release/ferrox bench -m model.gguf --n-gpu-layers 99 -p 512 -n 128 --compare
+
+# multi-model suite (same models list as benchmarks/suite.json)
+./target/release/ferrox bench --suite --fit-host --skip-missing
+./target/release/ferrox bench --suite --id tinyllama_q8 --backend metal
+./target/release/ferrox bench --render
 ```
 
 | Flag | Meaning |
@@ -181,15 +186,15 @@ discarded), same flag names — so the two outputs can be read side by side.
 | `-t/--threads` | CPU threads (`0` = performance-core default) |
 | `--n-gpu-layers` | `0` forces CPU; anything else offloads |
 | `--compare` | Also run `llama-bench` on the same GGUF and print the gap |
-| `--suite` | Run every [`benchmarks/suite.json`](../benchmarks/suite.json) entry (fresh process each), write receipts, re-render the engine table |
-| `--render` | Re-render the engine table from existing receipts, measuring nothing |
+| `--suite` | Run every [`benchmarks/suite.json`](../benchmarks/suite.json) entry (fresh process each), write receipts, re-render [`RESULTS.md`](../benchmarks/RESULTS.md) |
+| `--render` | Re-render the RESULTS table from existing receipts, measuring nothing |
 | `--id` / `--backend` | Restrict `--suite` to one entry / backend |
 | `--fit-host` / `--skip-missing` | Skip entries too large for the host / with no GGUF present |
 
-This is the **engine** number: no HTTP, no chat template, no tokenizer, no
-sampling. The **serving** number — what a `ferrox-server` user actually
-gets — is measured separately by
-[`benchmarks/run_suite.py`](../benchmarks/README.md). Do not mix them:
-a regression in one is not a regression in the other.
+Add or change models in [`benchmarks/suite.json`](../benchmarks/suite.json)
+(`id`, `name`, `gguf`, `backends`, `estimated_ram_gb`). No HTTP, chat
+template, tokenizer, or sampling — same line llama.cpp draws with
+`llama-bench` next to `llama-server`. Details:
+[`benchmarks/README.md`](../benchmarks/README.md).
 
 See also: [`FEATURES.md`](FEATURES.md) · [`MODELS.md`](MODELS.md) · [`API.md`](API.md).

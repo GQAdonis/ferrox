@@ -100,19 +100,43 @@ curl -s -X POST http://127.0.0.1:8383/v1/chat/completions \
 Swap `-m` for TinyLlama or another GGUF if you prefer a smaller first server smoke.
 Use `./target/release/ferrox-server` after a source build.
 
+### 4. Benchmark vs llama.cpp
+
+Same shape as [`llama-bench`](https://github.com/ggerganov/llama.cpp/tree/master/tools/llama-bench):
+`pp512` prefill / `tg128` decode, no HTTP. Models live in
+[`benchmarks/suite.json`](benchmarks/suite.json).
+
+```bash
+# one GGUF (+ optional side-by-side llama-bench)
+./target/release/ferrox bench -m models/tinyllama-1.1b-chat-v1.0.Q8_0.gguf \
+  -p 512 -n 128 -r 3 --compare
+
+# every suite entry that fits this host and has a GGUF on disk
+./target/release/ferrox bench --suite --fit-host --skip-missing
+
+# one suite id / backend
+./target/release/ferrox bench --suite --id llama32_3b_q4km --backend metal
+
+# rewrite RESULTS.md from existing receipts
+./target/release/ferrox bench --render
+```
+
+Ledger: [benchmarks/RESULTS.md](benchmarks/RESULTS.md). Details:
+[benchmarks/README.md](benchmarks/README.md) · [docs/CLI.md](docs/CLI.md).
+
 ## Documentation
 
 
 | Doc                                                | Description                               |
 | -------------------------------------------------- | ----------------------------------------- |
 | [docs/FEATURES.md](docs/FEATURES.md)               | Capabilities overview                     |
-| [docs/MODELS.md](docs/MODELS.md)                   | Supported models and benchmarks           |
+| [docs/MODELS.md](docs/MODELS.md)                   | Supported models and speed summary        |
 | [docs/CLI.md](docs/CLI.md)                         | CLI flags and examples                    |
 | [docs/API.md](docs/API.md)                         | OpenAI-compatible API                     |
 | [docs/CONFIG.md](docs/CONFIG.md)                   | Environment variables                     |
 | [docs/AGENTS_COOKBOOK.md](docs/AGENTS_COOKBOOK.md) | Point IDEs / agents at the server         |
-| [benchmarks/RESULTS.md](benchmarks/RESULTS.md)     | Speed vs llama.cpp (engine + serving)     |
-| [benchmarks/README.md](benchmarks/README.md)       | How the two benchmark tracks are measured |
+| [benchmarks/RESULTS.md](benchmarks/RESULTS.md)     | Speed vs llama.cpp (`ferrox bench`)       |
+| [benchmarks/README.md](benchmarks/README.md)       | How `ferrox bench` / `llama-bench` is run |
 | [docs/ROADMAP.md](docs/ROADMAP.md)                 | Planned work                              |
 | [CONTRIBUTING.md](CONTRIBUTING.md)                 | How to contribute                         |
 

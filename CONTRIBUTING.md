@@ -23,11 +23,11 @@ kernel tests stay `#[ignore]`d on hosted CI.
   `best_effort_fields`.
 - New quant kernels need independent goldens (not only self-parity).
 - Hardware claims state the machine, or say compile-tested only.
-- Two tracks, both driven from `benchmarks/suite.json`, both generated
-  into `benchmarks/RESULTS.md` (never hand-edited):
-  - **Engine** — `ferrox bench --suite` vs `llama-bench`, no HTTP.
-  - **Serving** — `run_suite.py` vs `llama-server`, over HTTP.
-  Do not quote one as the other.
+- Speed ledger is `ferrox bench --suite` vs `llama-bench` (no HTTP),
+  driven from `benchmarks/suite.json` into `benchmarks/RESULTS.md`
+  (never hand-edit the table). To measure a new model, add an entry to
+  `suite.json`, place the GGUF under `models/`, then
+  `ferrox bench --suite --id <id> --fit-host --skip-missing`.
 - Never force a thread count on either engine. llama.cpp defaults to
   performance cores and loses 2-4x above them, so pinning both to the
   same count flatters ferrox rather than making it fair.

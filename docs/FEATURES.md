@@ -6,16 +6,16 @@ Backends: CPU, Apple Metal, and CUDA.
 
 ## Models
 
-Verified against llama.cpp on the same host and GGUF (Gap =
-`llama_pred / ferrox_pred`; &lt;1 means Ferrox is faster):
+Verified against llama.cpp on the same host and GGUF via `ferrox bench`
+(Gap = `llama / ferrox`; &lt;1 means Ferrox is faster):
 
 - **Dense GQA** — TinyLlama, Llama 3.2, Mistral-7B, SmolLM2,
-  Qwen2.5/Qwen3, Gemma-3/4, Phi-4. Metal decode leads on the small and
-  mid models (Qwen2.5-0.5B **~0.63×**, SmolLM2 **~0.76×**, Gemma-3-1B
-  **~0.74×**) and is near parity on Llama-3.2-3B / Mistral-7B. **CPU decode
-  is behind everywhere (1.3-2.6×), and prefill is behind on both
-  backends.**
-- **MoE** — OLMoE-1B-7B; still behind on Metal decode (~1.3-1.6×). (Metal Concurrent + fused encode groups +
+  Qwen2.5/Qwen3, Gemma-3/4, Phi-4. Metal decode leads on several small
+  models (SmolLM2 **~0.73×**, Qwen2.5-0.5B **~0.75×**, Gemma-3-1B
+  **~0.95×**) and is near parity on Phi-4 / Mistral-7B; Llama-3.2-3B
+  Metal tg is ~1.11×. **CPU decode is behind everywhere (~1.6–3.3×), and
+  prefill is behind on both backends.**
+- **MoE** — OLMoE-1B-7B; still behind on Metal decode (~1.54×). (Metal Concurrent + fused encode groups +
   `MoeMemRanges` + `mul_mv_id` / prefill `mul_mm_id` + fused attn+O
   residual CB (`FERROX_METAL_PREFILL_FUSE_O=1`); CPU int-dot +
   interleaved Q4_K).
@@ -26,8 +26,9 @@ Verified against llama.cpp on the same host and GGUF (Gap =
   Gemma-2, Phi-3, Llama-3.1, GLM4 when tensors are present (not in the
   published suite).
 
-Full matrix and pins: [`MODELS.md`](MODELS.md) ·
-[`benchmarks/RESULTS.md`](../benchmarks/RESULTS.md).
+Full matrix: [`MODELS.md`](MODELS.md) ·
+[`benchmarks/RESULTS.md`](../benchmarks/RESULTS.md) ·
+[`benchmarks/suite.json`](../benchmarks/suite.json).
 
 ## Backends
 
@@ -46,10 +47,9 @@ and `presets`. See [`CLI.md`](CLI.md).
 `ferrox bench -m model.gguf` is a `llama-bench` work-alike (`pp512` /
 `tg128`, median ± stddev); `--compare` runs `llama-bench` alongside it
 and prints the gap, and `--suite` drives every entry in
-[`benchmarks/suite.json`](../benchmarks/suite.json) and regenerates the
-engine table in [`RESULTS.md`](../benchmarks/RESULTS.md). That is the
-*engine* number — the *serving* number comes from
-[`benchmarks/run_suite.py`](../benchmarks/README.md).
+[`benchmarks/suite.json`](../benchmarks/suite.json) and regenerates
+[`RESULTS.md`](../benchmarks/RESULTS.md). See
+[`benchmarks/README.md`](../benchmarks/README.md).
 
 ## Server
 

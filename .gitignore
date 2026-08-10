@@ -25,4 +25,5 @@ ferrox-journal.log*
 benchmarks/receipts/_tmp_*.log
 benchmarks/receipts/_suite_*.log
 models/
+data/
 .env

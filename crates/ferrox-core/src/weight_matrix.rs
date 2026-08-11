@@ -240,6 +240,28 @@ type CudaMatvecLaunchFn =
 #[cfg(feature = "metal")]
 type MetalMatvecLaunchFn =
     fn(&[u8], &[f32], usize, usize) -> Result<Vec<f32>, ferrox_metal::gpu::MetalError>;
+thread_local! {
+    /// Elements dotted per output row of the matrix currently being
+    /// applied. Set by [`WeightMatrix::with_row_work`] on the calling
+    /// thread before a parallel region is opened, and read there -- it is
+    /// never consulted from a rayon worker, so it does not need to
+    /// propagate into the pool.
+    static ROW_WORK: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Minimum multiply-accumulates a rayon task should carry before it is
+/// worth its own scheduling. Tunable for A/B; the default was chosen by
+/// measurement, not derivation.
+fn min_task_macs() -> usize {
+    use std::sync::OnceLock;
+    static V: OnceLock<usize> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("FERROX_MIN_TASK_MACS")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(1 << 16)
+    })
+}
 
 /// Whether dense [`WeightMatrix::apply`] / [`WeightMatrix::apply_batch`]
 /// should try Metal first (when built with `--features metal`).
@@ -481,9 +503,41 @@ impl WeightMatrix {
     ///
     /// Floor of 8 avoids Rayon thrash on tiny mats (SmolLM2 attn_kv
     /// has 192 rows → without a floor, ~48 one-row tasks on 10 cores).
+    ///
+    /// The floor is also **work-aware**, which matters for decode. A row
+    /// count alone says nothing about how much arithmetic a task carries:
+    /// SmolLM2's 576-wide projections split into ~24 tasks of ~14K MACs
+    /// each, far too little to pay for a fork-join. Measured on this host
+    /// (both engines back to back, thread count as the only variable):
+    /// ferrox scales 1.40x / 2.93x from 1 to 6 threads on TinyLlama /
+    /// Mistral-7B where llama.cpp scales 1.99x / 4.39x, and the deficit
+    /// grows as the model shrinks -- the signature of tasks too small to
+    /// amortise their own scheduling, not of slow kernels (ferrox is
+    /// *ahead* of llama at one thread on Mistral-7B).
+    ///
+    /// [`Self::with_row_work`] supplies the elements-per-row so a task
+    /// can be required to carry at least `FERROX_MIN_TASK_MACS`
+    /// multiply-accumulates. Zero (unset) keeps the old row-only
+    /// behaviour, so any call site that has not opted in is unchanged.
     fn min_rows_per_task(rows: usize) -> usize {
         let threads = rayon::current_num_threads().max(1);
-        (rows / (threads * 4)).max(8.min(rows.max(1)))
+        let by_threads = (rows / (threads * 4)).max(8.min(rows.max(1)));
+        let per_row = ROW_WORK.with(|c| c.get());
+        if per_row == 0 {
+            return by_threads;
+        }
+        let need = min_task_macs().div_ceil(per_row.max(1));
+        by_threads.max(need.min(rows.max(1)))
+    }
+
+    /// Runs `f` with the per-row work (elements dotted per output row)
+    /// published for [`Self::min_rows_per_task`]. Restores the previous
+    /// value, so nesting is safe.
+    fn with_row_work<R>(per_row: usize, f: impl FnOnce() -> R) -> R {
+        let prev = ROW_WORK.with(|c| c.replace(per_row));
+        let out = f();
+        ROW_WORK.with(|c| c.set(prev));
+        out
     }
 
     /// Run `body(g, t0, t1)` for every row-group `g` and activation-tile
@@ -732,6 +786,12 @@ impl WeightMatrix {
             self.cols(),
             "activation length must match matrix column count"
         );
+        // Decode: one activation, so a task's work is (rows in task) x cols.
+        // Publish `cols` so task sizing can be work-aware, not row-count-aware.
+        Self::with_row_work(x.len(), || self.apply_cpu_inner(x))
+    }
+
+    fn apply_cpu_inner(&self, x: &[f32]) -> Vec<f32> {
         match self {
             WeightMatrix::F32(t) => {
                 let xt = Tensor::new(x.to_vec(), vec![1, x.len()]);

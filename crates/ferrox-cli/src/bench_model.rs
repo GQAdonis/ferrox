@@ -148,9 +148,7 @@ pub fn run(args: BenchArgs) -> anyhow::Result<()> {
             // Gemma-4 has no batched prefill yet: pp* is sequential
             // forward_token (same as `ferrox run`). llama-bench still
             // batches, so the pp gap is partly that asymmetry.
-            eprintln!(
-                "ferrox bench: gemma4 uses sequential prefill (no forward_batch_last yet)"
-            );
+            eprintln!("ferrox bench: gemma4 uses sequential prefill (no forward_batch_last yet)");
             (params_b, load_s, measure_gemma4(&engine, &args)?)
         }
         other => anyhow::bail!(

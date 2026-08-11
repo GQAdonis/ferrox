@@ -445,10 +445,7 @@ impl GgufBpeTokenizer {
             }
         }
 
-        pieces
-            .iter()
-            .flat_map(|p| self.piece_to_ids(p))
-            .collect()
+        pieces.iter().flat_map(|p| self.piece_to_ids(p)).collect()
     }
 
     fn piece_to_ids(&self, piece: &str) -> Vec<u32> {

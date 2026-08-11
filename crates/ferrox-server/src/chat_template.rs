@@ -292,10 +292,7 @@ mod tests {
         let template = "{%- for message in messages -%}{{- '<|turn>' + message['role'] + '\\n' -}}{{- message['content'] -}}{{- '<turn|>\\n' -}}{%- endfor -%}{{- '<|turn>model\\n' -}}";
         assert_eq!(ChatTemplate::detect(Some(template)), ChatTemplate::Gemma4);
         let rendered = ChatTemplate::Gemma4.render(&[msg("user", "How are you?")]);
-        assert_eq!(
-            rendered,
-            "<|turn>user\nHow are you?<turn|>\n<|turn>model\n"
-        );
+        assert_eq!(rendered, "<|turn>user\nHow are you?<turn|>\n<|turn>model\n");
     }
 
     #[test]

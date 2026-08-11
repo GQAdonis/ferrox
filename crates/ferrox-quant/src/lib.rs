@@ -26,9 +26,9 @@ pub use repack::{
     prepare_q8_k_acts_x4, q4_0x4_gemm_uses_acts_x4, q4_0x4_interleave, q4_kx8_gemm_uses_acts_x4,
     q4_kx8_interleave, q5_kx8_gemm_uses_acts_x4, q5_kx8_interleave, q6_kx8_gemm_uses_acts_x4,
     q6_kx8_interleave, q8_0x4_gemm_uses_acts_x4, q8_0x4_interleave, Q8ActsX4, Q8KActsX4,
-    Q8K_ACTS_X4_NC, Q4_0X4_BLOCK_BYTES, Q4_0X4_GEMM_NC, Q4_0X4_INTERLEAVE, Q4_0X4_NROWS,
-    Q4_KX8_BLOCK_BYTES, Q4_KX8_GEMM_NC, Q4_KX8_NROWS, Q5_KX8_BLOCK_BYTES, Q5_KX8_GEMM_NC,
-    Q5_KX8_NROWS, Q6_KX8_BLOCK_BYTES, Q6_KX8_GEMM_NC, Q6_KX8_NROWS, Q8_0X4_BLOCK_BYTES,
+    Q4_0X4_BLOCK_BYTES, Q4_0X4_GEMM_NC, Q4_0X4_INTERLEAVE, Q4_0X4_NROWS, Q4_KX8_BLOCK_BYTES,
+    Q4_KX8_GEMM_NC, Q4_KX8_NROWS, Q5_KX8_BLOCK_BYTES, Q5_KX8_GEMM_NC, Q5_KX8_NROWS,
+    Q6_KX8_BLOCK_BYTES, Q6_KX8_GEMM_NC, Q6_KX8_NROWS, Q8K_ACTS_X4_NC, Q8_0X4_BLOCK_BYTES,
     Q8_0X4_GEMM_NC, Q8_0X4_INTERLEAVE, Q8_0X4_NROWS,
 };
 
@@ -662,29 +662,25 @@ pub fn quantize_activations_q8_k(x: &[f32]) -> Q8KActivations {
     let mut q = vec![0i8; n_blocks * Q4_K_BLOCK_ELEMS];
     let mut d = vec![0f32; n_blocks];
     let mut bsums = vec![0i16; n_blocks * 16];
-    let quant_one = |(q_slot, d_slot, bsum_slot, chunk): (
-        &mut [i8],
-        &mut f32,
-        &mut [i16],
-        &[f32],
-    )| {
-        let amax = chunk.iter().fold(0f32, |m, &v| m.max(v.abs()));
-        let scale = amax / 127.0;
-        let inv = if scale > 0.0 { 1.0 / scale } else { 0.0 };
-        *d_slot = scale;
-        for (i, &v) in chunk.iter().enumerate() {
-            let qi = (v * inv).round();
-            q_slot[i] = qi.clamp(-127.0, 127.0) as i8;
-        }
-        for g in 0..16 {
-            let mut s = 0i32;
-            let off = g * 16;
-            for i in 0..16 {
-                s += q_slot[off + i] as i32;
+    let quant_one =
+        |(q_slot, d_slot, bsum_slot, chunk): (&mut [i8], &mut f32, &mut [i16], &[f32])| {
+            let amax = chunk.iter().fold(0f32, |m, &v| m.max(v.abs()));
+            let scale = amax / 127.0;
+            let inv = if scale > 0.0 { 1.0 / scale } else { 0.0 };
+            *d_slot = scale;
+            for (i, &v) in chunk.iter().enumerate() {
+                let qi = (v * inv).round();
+                q_slot[i] = qi.clamp(-127.0, 127.0) as i8;
             }
-            bsum_slot[g] = s as i16;
-        }
-    };
+            for g in 0..16 {
+                let mut s = 0i32;
+                let off = g * 16;
+                for i in 0..16 {
+                    s += q_slot[off + i] as i32;
+                }
+                bsum_slot[g] = s as i16;
+            }
+        };
     // Serial on purpose: every batch caller is already inside a Rayon
     // region (one task per activation), so an inner region here nested
     // ~batch_size fork-joins per matmul; and one row's blocks are far too
@@ -3007,10 +3003,7 @@ mod simd_aarch64 {
                 let sc2 = *sc.add(6) as i32;
                 let sc3 = *sc.add(7) as i32;
                 for j in 0..n {
-                    let q8p = acts[j]
-                        .q
-                        .as_ptr()
-                        .add(b * Q6_K_BLOCK_ELEMS + act_off + 64);
+                    let q8p = acts[j].q.as_ptr().add(b * Q6_K_BLOCK_ELEMS + act_off + 64);
                     isums[j] += vaddvq_s32(neon_sdot(z, wb0, vld1q_s8(q8p))) * sc0
                         + vaddvq_s32(neon_sdot(z, wb1, vld1q_s8(q8p.add(16)))) * sc1
                         + vaddvq_s32(neon_sdot(z, wb2, vld1q_s8(q8p.add(32)))) * sc2
@@ -5353,7 +5346,10 @@ mod tests {
         let i8mm = unsafe { simd_aarch64::dot_q4_k_q8_neon_i8mm(&weights, &act) };
         assert_eq!(i8mm, scalar, "i8mm must match scalar");
         let dispatched = dot_q4_k_q8(&weights, &act);
-        assert_eq!(dispatched, scalar, "dispatch must match scalar on i8mm host");
+        assert_eq!(
+            dispatched, scalar,
+            "dispatch must match scalar on i8mm host"
+        );
     }
 
     #[test]
@@ -7226,13 +7222,13 @@ mod tests {
         let dispatched = dot_q5_k_q8(&packed, &act);
         let scalar = dot_q5_k_q8_scalar(&packed, &act);
         assert_eq!(
-            dispatched, scalar,
+            dispatched,
+            scalar,
             "Q5_K×Q8_K dispatch must match scalar (dotprod={})",
             std::arch::is_aarch64_feature_detected!("dotprod")
         );
         if std::arch::is_aarch64_feature_detected!("dotprod") {
-            let sdot =
-                unsafe { simd_aarch64::dot_q5_k_q8_neon_sdot(&packed, &act) };
+            let sdot = unsafe { simd_aarch64::dot_q5_k_q8_neon_sdot(&packed, &act) };
             assert_eq!(sdot, scalar, "NEON SDOT Q5_K×Q8_K diverged from scalar");
         }
         if std::arch::is_aarch64_feature_detected!("neon") {

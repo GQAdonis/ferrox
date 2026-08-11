@@ -260,6 +260,38 @@ pub fn metal_dense_enabled() -> bool {
     })
 }
 
+/// `FERROX_METAL_MATMUL=1` opts into the first-cut Q4/Q6 matmul kernels,
+/// which can lose to N x matvec for typical chat prompts.
+///
+/// Read once. These sit inside `apply_gpu_batch`, i.e. once per GEMM per
+/// layer per forward pass -- `std::env::var` allocates a `String` and
+/// takes the environment lock every time.
+#[cfg(feature = "metal")]
+fn metal_matmul_opt_in() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| {
+        matches!(
+            std::env::var("FERROX_METAL_MATMUL").ok().as_deref(),
+            Some("1") | Some("true") | Some("on")
+        )
+    })
+}
+
+/// Weight-reuse `mul_mm` for prefill. Default on; `FERROX_METAL_MUL_MM=0`
+/// forces the N x matvec batch. Read once, same reason as above.
+#[cfg(feature = "metal")]
+fn metal_mul_mm_enabled() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| {
+        !matches!(
+            std::env::var("FERROX_METAL_MUL_MM").ok().as_deref(),
+            Some("0") | Some("false") | Some("off")
+        )
+    })
+}
+
 /// Whether dense [`WeightMatrix::apply`] should try CUDA first (when
 /// built with `--features cuda`).
 ///
@@ -975,8 +1007,8 @@ impl WeightMatrix {
                                     .enumerate()
                                     .for_each(|(i, o)| {
                                         let r = n_groups * ferrox_quant::Q6_KX8_NROWS + i;
-                                        let row = &data.as_slice()
-                                            [r * row_bytes..(r + 1) * row_bytes];
+                                        let row =
+                                            &data.as_slice()[r * row_bytes..(r + 1) * row_bytes];
                                         *o = ferrox_quant::dot_q6_k_q8(row, &act);
                                     });
                                 return out;
@@ -1488,9 +1520,7 @@ impl WeightMatrix {
                                     let nc = ferrox_quant::Q8K_ACTS_X4_NC;
                                     let act_tiles: Vec<ferrox_quant::Q8ActsX4> = acts
                                         .par_chunks(nc)
-                                        .map(|chunk| {
-                                            ferrox_quant::prepare_q8_acts_x4(chunk, cols)
-                                        })
+                                        .map(|chunk| ferrox_quant::prepare_q8_acts_x4(chunk, cols))
                                         .collect();
                                     Self::par_chunked_groups(
                                         n_groups,
@@ -1501,9 +1531,7 @@ impl WeightMatrix {
                                             let mut tmp = [0f32;
                                                 ferrox_quant::Q8_0X4_NROWS
                                                     * ferrox_quant::Q8K_ACTS_X4_NC];
-                                            for (t, tile) in
-                                                act_tiles[t0..t1].iter().enumerate()
-                                            {
+                                            for (t, tile) in act_tiles[t0..t1].iter().enumerate() {
                                                 let t = t0 + t;
                                                 let n = tile.na;
                                                 let tmp = &mut tmp[..nrows_g * n];
@@ -1625,9 +1653,7 @@ impl WeightMatrix {
                                     let nc = ferrox_quant::Q8K_ACTS_X4_NC;
                                     let act_tiles: Vec<ferrox_quant::Q8ActsX4> = acts
                                         .par_chunks(nc)
-                                        .map(|chunk| {
-                                            ferrox_quant::prepare_q8_acts_x4(chunk, cols)
-                                        })
+                                        .map(|chunk| ferrox_quant::prepare_q8_acts_x4(chunk, cols))
                                         .collect();
                                     Self::par_chunked_groups(
                                         n_groups,
@@ -1638,9 +1664,7 @@ impl WeightMatrix {
                                             let mut tmp = [0f32;
                                                 ferrox_quant::Q4_0X4_NROWS
                                                     * ferrox_quant::Q8K_ACTS_X4_NC];
-                                            for (t, tile) in
-                                                act_tiles[t0..t1].iter().enumerate()
-                                            {
+                                            for (t, tile) in act_tiles[t0..t1].iter().enumerate() {
                                                 let t = t0 + t;
                                                 let n = tile.na;
                                                 let tmp = &mut tmp[..nrows_g * n];
@@ -2040,7 +2064,8 @@ impl WeightMatrix {
                                                 }
                                             }
                                         }
-                                    });
+                                    },
+                                );
                                 let data_slice = data.as_slice();
                                 let tail = *rows - n_groups * ferrox_quant::Q6_KX8_NROWS;
                                 (0..tail)
@@ -2542,20 +2567,12 @@ impl WeightMatrix {
         // First-cut Q4/Q6 matmul kernels can lose to N× matvec on Host B
         // for typical chat prompts (8B fair: ~17 vs ~21 prompt tok/s).
         // Opt in with FERROX_METAL_MATMUL=1 once tiling improves.
-        let use_matmul = batch_size >= 2
-            && matches!(
-                std::env::var("FERROX_METAL_MATMUL").ok().as_deref(),
-                Some("1") | Some("true") | Some("on")
-            );
+        let use_matmul = batch_size >= 2 && metal_matmul_opt_in();
         // Weight-reuse mul_mm for prefill batch ≥ 4 (Q4_0 / Q4_K / Q6_K).
         // Default **on**; `FERROX_METAL_MUL_MM=0` forces N× matvec batch.
         // Threshold 4 (was 8) covers shorter prompts without changing the
         // decode path (batch_size == 1 still uses matvec).
-        let use_mul_mm = batch_size >= 4
-            && !matches!(
-                std::env::var("FERROX_METAL_MUL_MM").ok().as_deref(),
-                Some("0") | Some("false") | Some("off")
-            );
+        let use_mul_mm = batch_size >= 4 && metal_mul_mm_enabled();
         if use_mul_mm {
             match kind {
                 QuantKind::Q4_0 => {
@@ -3206,7 +3223,11 @@ mod tests {
                 }
             }
             QuantKind::Q4K | QuantKind::Q5K => {
-                let body = if kind == QuantKind::Q4K { 12 + 128 } else { 12 + 32 + 128 };
+                let body = if kind == QuantKind::Q4K {
+                    12 + 128
+                } else {
+                    12 + 32 + 128
+                };
                 for _ in 0..rows * (cols / 256) {
                     data.extend_from_slice(&f16_le(0.01 + f32::from(next()) * 0.0002));
                     data.extend_from_slice(&f16_le(0.005 + f32::from(next()) * 0.0001));
@@ -3321,13 +3342,21 @@ mod tests {
         let x_batch: Vec<f32> = (0..batch_size * cols)
             .map(|i| (((i * 29 + 11) % 89) as f32) * 0.023 - 1.0)
             .collect();
-        for kind in [QuantKind::Q8_0, QuantKind::Q4_0, QuantKind::Q4K, QuantKind::Q6K] {
+        for kind in [
+            QuantKind::Q8_0,
+            QuantKind::Q4_0,
+            QuantKind::Q4K,
+            QuantKind::Q6K,
+        ] {
             let matrix = synth_quant_matrix(kind, rows, cols);
             let baseline = matrix.apply_batch(&x_batch, batch_size);
 
             let shared = matrix.quantize_batch_acts(&x_batch, batch_size);
             let with_shared = matrix.apply_batch_with_acts(&x_batch, batch_size, shared.as_ref());
-            assert_eq!(baseline, with_shared, "{kind:?}: shared acts changed the result");
+            assert_eq!(
+                baseline, with_shared,
+                "{kind:?}: shared acts changed the result"
+            );
 
             let wrong = match kind {
                 QuantKind::Q8_0 | QuantKind::Q4_0 => BatchActs::Q8K(Vec::new()),

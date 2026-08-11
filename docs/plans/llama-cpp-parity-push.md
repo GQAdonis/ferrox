@@ -125,8 +125,31 @@ The remaining work, in one place. Gap = `llama / ferrox`.
 
 Decode is one activation against the whole weight matrix, so it is bandwidth-
 and latency-bound, not FLOP-bound: none of the Phase 1 GEMM work touches it.
-Two candidate causes, and they are separable by measurement rather than
-argument — do that first:
+
+**MEASURED 2026-08-11 — it is scaling, not per-thread throughput.** Both
+engines run back-to-back, no forced `-t` except as the diagnostic variable:
+
+| Model | | ferrox | llama | gap | ferrox 1→6 | llama 1→6 |
+|---|---|---|---|---|---|---|
+| TinyLlama Q8_0 | t=1 | 38.25 | 43.47 | 1.14x | | |
+| | t=6 | 53.73 | 86.34 | 1.61x | **1.40x** | **1.99x** |
+| Mistral-7B Q4_K_M | t=1 | 5.87 | 4.75 | **0.81x** | | |
+| | t=6 | 17.19 | 20.85 | 1.21x | **2.93x** | **4.39x** |
+
+Per-thread throughput is not the problem — ferrox *beats* llama at one thread
+on Mistral-7B. The gap opens as threads are added, on both models. So
+**candidate 1 (fork-join overhead) is the cause and candidate 2 is closed**;
+the interleave-8 / i8mm decode kernels from PRs #4-#5 did their job.
+
+Headroom, if ferrox matched llama's scaling ratio: TinyLlama 38.25 x 1.99 =
+76.1 (gap 1.13x, from 1.61x), Mistral 5.87 x 4.39 = 25.8 — ahead of llama.
+
+Do **not** generalise from SmolLM2-135M. At that size both engines get *slower*
+with threads (ferrox 148.79 -> 105.46, llama 226.67 -> 166.78) and the gap is
+flat across thread counts, so it looks like a throughput problem and is not.
+It is the one row where a thread-count heuristic, not a faster pool, is the fix.
+
+Two candidate causes, now resolved by the measurement above:
 
 1. **Fork-join per matvec.** Decode does one rayon fork-join per weight
    matrix, ~200/token on SmolLM2, and `sample` previously showed workers
@@ -135,10 +158,9 @@ argument — do that first:
    This is the item 1f follow-up, now unconditional. Note the gap is largest
    on the *smallest* models, which is what a fixed per-matvec overhead looks
    like.
-2. **Per-thread GEMV throughput.** Previously measured ~2x off llama at equal
-   thread count. If the interleave-8 / i8mm decode kernels from PRs #4-#5 have
-   closed that, cause 1 is the whole remainder — check before building a
-   threadpool.
+2. ~~**Per-thread GEMV throughput.**~~ **Closed by measurement** — ferrox is
+   at 1.14x (TinyLlama) and 0.81x (Mistral) at equal thread count. PRs #4-#5
+   closed it. Cause 1 is the whole remainder.
 
 **CPU prefill (`pp512`) — 7 rows left, all under 1.7x.**
 

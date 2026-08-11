@@ -106,7 +106,57 @@ Two things the regenerated ledger surfaced that were not in the plan:
   (Qwen2.5-0.5B CPU `pp512` 614.59 vs 726.51). Only claim a row moved when it
   moved by more than that.
 
-## Every row still >1x, ranked (v0.4.0 ledger)
+## Ledger after the MMA port (2026-08-11, commit 356dce1)
+
+Metal `pp512` was the worst axis at 1.7-2.9x. The simdgroup-MMA d=64
+flash attention closed it:
+
+| Model | before | now | llama | gap |
+|---|---|---|---|---|
+| SmolLM2-135M Q8_0 | 4183 | **11729** | 12002 | **1.02x** |
+| TinyLlama-1.1B Q8_0 | 1177 | **1975** | 2000 | **1.01x** |
+| Qwen2.5-0.5B Q8_0 | 2456 | **4389** | 4904 | 1.12x |
+| Llama-3.2-1B Q4_K_M | 1227 | **1746** | 1892 | 1.08x |
+| Llama-3.2-1B IQ4_XS | 1228 | **1756** | 1896 | 1.08x |
+
+Confirmed by interleaved A/B on `FERROX_METAL_FA_MMA` before the suite
+run: SmolLM2 2.8x, TinyLlama 1.69x, Qwen2.5 1.78x over the scalar kernel.
+
+**Qwen3-0.6B metal is the odd one out at 1.81x** where every other
+sub-1.5B dense model moved to ~1.1x. Its head_dim is 128, so it never
+takes the new d=64 kernel. Extending MMA to d=128 is the next Metal
+target and it is a known-shaped job, not an open question. d=256
+(Gemma-3) follows.
+
+Worst remaining rows overall are now **MoE and CPU**, not dense Metal
+prefill: OLMoE metal pp512 2.48x, Qwen3-0.6B metal 1.81x (above),
+Gemma-3-1B cpu pp512 1.94x.
+
+### Rejected: the persistent-threadpool branch
+
+`wf/cpu-threadpool` was implemented and **not merged**. Adversarial review
+found a reproducible deadlock in its new public seam, contradicting the
+module's own safety argument; its A/B knob did not isolate the change it
+existed to measure; and its perf thesis was unverified by the author's own
+admission. The diagnosis it rests on is still correct (scaling, not
+throughput). Retry with the deadlock understood first — reason explicitly
+about `FERROX_CPU_THREADS=1` and rayon nesting before writing code.
+
+### Gaps in our own tooling, found by using it
+
+- **`ferrox verify` passes vacuously on prefill kernels.** Its prompt is
+  fixed at 7 tokens (`verify.rs`) and the d=64 fa_ext path is gated on
+  `n_q >= 8`, so the tool built to catch wrong prefill kernels never
+  reaches one. Needs a prompt-length flag. Until then a green `verify` says
+  nothing about prefill.
+- **CPU and Metal diverge on longer prompts, and it is not attention.**
+  With a 49-token prompt on TinyLlama all three attention kernels produce
+  byte-identical Metal output and all three differ from CPU at token 8, so
+  the cause is upstream — f16 KV or GEMM precision. Pre-existing, unowned,
+  and it means a length-aware `verify` would be red today for reasons
+  nobody has investigated.
+
+## Every row still >1x, ranked (superseded above; kept for the CPU rows)
 
 The remaining work, in one place. Gap = `llama / ferrox`.
 

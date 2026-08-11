@@ -780,6 +780,36 @@ impl WeightMatrix {
     /// CPU-only matvec (NEON/AVX/scalar via `ferrox-quant`). Used by
     /// [`Self::apply`] after Metal miss/disable, and by GPU parity tests
     /// that must not recurse into [`Self::apply_gpu`].
+    /// Applies three independent matrices to the same activation,
+    /// overlapping their parallel regions instead of running them one
+    /// after another.
+    ///
+    /// Decode opens one rayon fork-join per weight matrix -- roughly
+    /// seven per layer -- and the measured CPU decode deficit is
+    /// scheduling, not kernels (ferrox scales 1.40x/2.93x from 1 to 6
+    /// threads where llama.cpp scales 1.99x/4.39x, while *beating* llama
+    /// at one thread). q/k/v share an input and are independent, so
+    /// their regions can coexist and let rayon's work-stealing fill
+    /// threads that would otherwise idle at the tail of each one.
+    ///
+    /// CPU only. On a GPU backend each `apply` submits and waits on its
+    /// own command buffer, and Metal decode is already at or ahead of
+    /// parity -- there is nothing to win and a live path to disturb.
+    pub fn apply_three(a: &Self, b: &Self, c: &Self, x: &[f32]) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+        #[cfg(feature = "metal")]
+        let gpu = metal_dense_enabled();
+        #[cfg(not(feature = "metal"))]
+        let gpu = false;
+        #[cfg(feature = "cuda")]
+        let gpu = gpu || cuda_dense_enabled();
+        if gpu {
+            return (a.apply(x), b.apply(x), c.apply(x));
+        }
+        let (ra, (rb, rc)) =
+            rayon::join(|| a.apply(x), || rayon::join(|| b.apply(x), || c.apply(x)));
+        (ra, rb, rc)
+    }
+
     pub fn apply_cpu(&self, x: &[f32]) -> Vec<f32> {
         assert_eq!(
             x.len(),

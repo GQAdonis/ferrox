@@ -2069,19 +2069,21 @@ impl Decoder {
                             let q = outs.pop().unwrap();
                             (q, k, v)
                         } else {
-                            (
-                                layer.attn.q_proj.apply(&normed),
-                                layer.attn.k_proj.apply(&normed),
-                                layer.attn.v_proj.apply(&normed),
+                            ferrox_core::weight_matrix::WeightMatrix::apply_three(
+                                &layer.attn.q_proj,
+                                &layer.attn.k_proj,
+                                &layer.attn.v_proj,
+                                &normed,
                             )
                         }
                     }
                     #[cfg(not(any(feature = "cuda", feature = "metal")))]
                     {
-                        (
-                            layer.attn.q_proj.apply(&normed),
-                            layer.attn.k_proj.apply(&normed),
-                            layer.attn.v_proj.apply(&normed),
+                        ferrox_core::weight_matrix::WeightMatrix::apply_three(
+                            &layer.attn.q_proj,
+                            &layer.attn.k_proj,
+                            &layer.attn.v_proj,
+                            &normed,
                         )
                     }
                 };
@@ -2259,10 +2261,11 @@ impl Decoder {
                         let q = outs.pop().unwrap();
                         (q, k, v)
                     } else {
-                        (
-                            layer.attn.q_proj.apply(&normed),
-                            layer.attn.k_proj.apply(&normed),
-                            layer.attn.v_proj.apply(&normed),
+                        ferrox_core::weight_matrix::WeightMatrix::apply_three(
+                            &layer.attn.q_proj,
+                            &layer.attn.k_proj,
+                            &layer.attn.v_proj,
+                            &normed,
                         )
                     }
                 }

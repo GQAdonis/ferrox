@@ -132,6 +132,63 @@ pub struct Gemma4DecodeState {
 }
 
 impl Gemma4Engine {
+    /// See [`crate::decoder::Decoder::probe_kernels`]. Called at the end
+    /// of loading, before the registry is sealed.
+    ///
+    /// This engine implements [`Engine::forward_token`] and nothing
+    /// else: there is no batched path, so a 512-token prefill is 512
+    /// sequential single-token passes and every projection is a
+    /// `batch = 1` matvec. On Metal that is one command buffer, one
+    /// commit and one wait per projection per token, which is why
+    /// Gemma-4-E2B measures *slower* on Metal than on CPU while
+    /// producing correct output. The registry records that as a missing
+    /// engine capability rather than leaving it to be rediscovered from
+    /// a benchmark.
+    pub fn probe_kernels(&self) {
+        use ferrox_core::kernel_registry as reg;
+
+        if !reg::enabled() {
+            return;
+        }
+        let w = &self.weights;
+        w.token_embd.probe_kernels("token_embd");
+        w.output_head.probe_kernels("output_head");
+        if let Some(m) = &w.per_layer_token_embd {
+            m.probe_kernels("per_layer_token_embd");
+        }
+        if let Some(m) = &w.per_layer_model_proj {
+            m.probe_kernels("per_layer_model_proj");
+        }
+        for layer in &w.layers {
+            layer.attn.q_proj.probe_kernels("attn_q");
+            if let Some(m) = &layer.attn.k_proj {
+                m.probe_kernels("attn_k");
+            }
+            if let Some(m) = &layer.attn.v_proj {
+                m.probe_kernels("attn_v");
+            }
+            layer.attn.o_proj.probe_kernels("attn_o");
+            layer.ffn_gate.probe_kernels("ffn_gate");
+            layer.ffn_up.probe_kernels("ffn_up");
+            layer.ffn_down.probe_kernels("ffn_down");
+            if let Some(m) = &layer.per_layer_inp_gate {
+                m.probe_kernels("per_layer_inp_gate");
+            }
+            if let Some(m) = &layer.per_layer_proj {
+                m.probe_kernels("per_layer_proj");
+            }
+        }
+        reg::record_build(
+            reg::Lookup::new(
+                ferrox_core::weight_matrix::active_backend(),
+                reg::op::ENGINE_PREFILL_BATCH,
+                None,
+            )
+            .with_role("gemma4_engine"),
+            reg::Outcome::slow_path("sequential forward_token (batch=1 matvec per projection)"),
+        );
+    }
+
     pub fn new_state(&self) -> Gemma4DecodeState {
         let kv = (0..self.hp.n_layer)
             .map(|il| {

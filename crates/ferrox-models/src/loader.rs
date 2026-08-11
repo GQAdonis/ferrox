@@ -62,6 +62,13 @@ pub enum LoadError {
     /// Metadata advertises a feature the generic decoder does not implement.
     #[error("architecture '{0}' requires unimplemented feature: {1}")]
     UnsupportedFeature(String, String),
+    /// `FERROX_STRICT_KERNELS=1` and the model has weights with no
+    /// kernel on the selected accelerator, i.e. it would run, correctly,
+    /// on a silently slower path. Refusing is the point: a benchmark or
+    /// CI run must not be able to publish a number taken off the
+    /// backend it claims. See [`ferrox_core::kernel_registry`].
+    #[error("{0}")]
+    StrictKernels(String),
 }
 
 /// Architecture-family name strings (GGUF's `general.architecture` value)
@@ -1493,7 +1500,7 @@ impl Decoder {
             crate::execution_plan::ExecutionPlan::probe_metal_caps(),
         );
 
-        Ok(Decoder {
+        let decoder = Decoder {
             config,
             embedding,
             layers,
@@ -1504,7 +1511,14 @@ impl Decoder {
             metal_attn_kv: std::sync::Mutex::new(None),
             execution_plan,
             plan_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
-        })
+        };
+        // Resolve every kernel the model will need while we still have a
+        // load-time error path to report it on, then seal: from here a
+        // lookup that misses is an unpredicted slow path and says so.
+        decoder.probe_kernels();
+        ferrox_core::kernel_registry::seal_or_error()
+            .map_err(|e| LoadError::StrictKernels(e.to_string()))?;
+        Ok(decoder)
     }
 }
 

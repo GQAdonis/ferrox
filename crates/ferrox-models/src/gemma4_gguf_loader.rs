@@ -308,7 +308,7 @@ pub fn load_gemma4_engine(file: &impl TensorSource) -> Result<Gemma4Engine, Load
     for il in 0..hp.n_layer {
         layers.push(load_layer(file, &hp, il)?);
     }
-    Ok(Gemma4Engine {
+    let engine = Gemma4Engine {
         weights: Gemma4Weights {
             token_embd,
             per_layer_token_embd,
@@ -320,7 +320,14 @@ pub fn load_gemma4_engine(file: &impl TensorSource) -> Result<Gemma4Engine, Load
             rope_freqs,
         },
         hp,
-    })
+    };
+    // Same contract as the generic loader: resolve every kernel now,
+    // then seal. This engine has no batched prefill, which the probe
+    // records explicitly -- see `Gemma4Engine::probe_kernels`.
+    engine.probe_kernels();
+    ferrox_core::kernel_registry::seal_or_error()
+        .map_err(|e| LoadError::StrictKernels(e.to_string()))?;
+    Ok(engine)
 }
 
 #[cfg(test)]

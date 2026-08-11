@@ -78,6 +78,34 @@ isProject: false
 > (CPU prefill) and Phase 4 (coverage) are independent and can proceed in
 > parallel. The frontmatter `todos` list is the checklist.
 
+## Ledger as of v0.4.0 (2026-08-11, regenerated on Host B)
+
+Phase 1 is complete **and now measured** — it was written on x86, where every
+aarch64 kernel compiles out, and sat unmeasured until it ran here.
+
+| Axis | Before | Now | Worst row |
+|---|---|---|---|
+| Metal `pp512` | 2.33–35.06× | **1.17–2.89×** | SmolLM2 2.89× |
+| CPU `pp512` | 3.17–5.82× | **0.94–1.63×** | Gemma-3-1B 1.63× |
+| Metal `tg128` | 1.03–2.87× | **0.60–1.46×** (6 of 11 at/ahead) | OLMoE 1.46× |
+| CPU `tg128` | 1.13–2.60× | **1.20–1.71×** | OLMoE 1.71× |
+
+Prefill is no longer the headline deficit. **CPU decode is** — behind on every
+row, and the only axis with no row at parity. Re-rank accordingly: 2a still
+owns the sub-1.5B Metal rows, but the conditional threadpool item under 1f is
+now unconditional.
+
+Two things the regenerated ledger surfaced that were not in the plan:
+
+- **Gemma-4-E2B Q4_K_M is slower on Metal than on CPU** (12.86 vs 21.66
+  `pp512`). Output is correct, so nothing is broken — the `Gemma4` engine is a
+  separate stack that never reaches `launch_prefill_dense_stack`. It is a
+  coverage gap, and it is the only model in the suite with no llama comparison.
+- **Sub-20% differences in the table are not resolvable.** Suite numbers sit
+  below a quieter interleaved `--compare` sweep by up to 15% on the same rows
+  (Qwen2.5-0.5B CPU `pp512` 614.59 vs 726.51). Only claim a row moved when it
+  moved by more than that.
+
 ## Status of the previous plan
 
 Phases 0–3 of the prior plan are **done** and their rows moved: Metal dense

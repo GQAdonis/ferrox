@@ -185,6 +185,50 @@ IQ4_XS 1.60x, Llama-3.2-1B 1.53x. Owned by 2a, which is blocked on 2a-0.
 **Metal decode — 1 row**: OLMoE 1.46x. Everything else is at or ahead of
 parity.
 
+## What a survey of two peer Rust engines actually yielded
+
+Both were read at source level, not from their READMEs. The negatives
+matter more than the positives, because they close off shortcuts:
+
+- **Neither has a simdgroup-MMA Metal attention or GEMM to port.** Both
+  ship scalar "one thread per output cell" Metal kernels whose own header
+  comments describe the tiled MMA version as future work — exactly where
+  ferrox is. 2a must be written from llama.cpp's `kernel_flash_attn_ext`.
+- **Neither helps with CPU decode scaling.** One is GPU-only end to end
+  (no CPU backend implementor at all, only a validation oracle); the
+  other's kernels are CUDA FFI. There is no peer persistent-threadpool
+  design to study; llama.cpp's `ggml_barrier` remains the reference.
+- **One's "paged attention" is orchestration only** — the gather kernel
+  lives in an unvendored external crate. Portable part is the *contract*,
+  not an implementation.
+- Its scheduler is FIFO with alternating prefill-only / decode-only steps,
+  not true single-step interleaving. Simpler than advertised, and a
+  reasonable first target, but it carries no fairness policy to inherit.
+
+Portable and worth taking, in value order:
+
+1. **Sealed kernel-lookup registry** (see below) — smallest, highest hit
+   rate against bugs ferrox actually had.
+2. **Per-head magnitude-ratio std** as the divergence fingerprint (below).
+3. **Paged-KV metadata contract**: a flat block pool with a free-list, a
+   per-sequence `block_table: Vec<u32>`, and a `slot_mapping` array of
+   physical slots (`block_id * block_size + offset`) built per step, over
+   **one pre-sized allocation per layer** rather than OS paging. Page size
+   32 on Metal / 64 on CUDA. This is the shape that decouples the KV
+   budget from context reserved up front, and it needs no virtual-memory
+   tricks. ferrox would still write the gather itself.
+4. **Asymmetric K/V precision.** K dominates attention-score accuracy and
+   V tolerates far less; pairing a higher-precision K with a lower-
+   precision V (per-layer overridable) buys memory that uniform KV quant
+   cannot. Pairs with the `turbo3`/WHT work already on the roadmap.
+5. **Decode sparse-V gate**: skip V dequant+accumulate entirely where the
+   softmax weight is below ~1e-3. Bandwidth win at long context,
+   independent of any MMA work.
+
+ferrox already has a prefix cache; the peer implementation (parent-hash
+chained block hashing, ref-counted LRU eviction restricted to leaf blocks)
+is worth diffing against ours rather than adopting wholesale.
+
 ## Debuggability: per-layer divergence, not just per-output
 
 `ferrox verify` (landed) compares greedy token ids between the CPU
@@ -198,6 +242,14 @@ costs nothing when off.** The shape that works elsewhere:
 
 - A reference forward in f32 with per-layer hooks, run against the
   backend under test.
+- **Per-head magnitude ratio, and watch its standard deviation, not its
+  mean.** A mean near 1 with high across-head variance is the fingerprint
+  of a pointer/layout bug; precision noise keeps variance low. That single
+  distinction separates "wrong indexing" from "expected f16 drift"
+  immediately — the call that cost the most time on the d=64 kernel.
+  Companions: flat cosine, flat relative-L2, and a best-match-permutation
+  cosine, which catches heads computed correctly but written to the wrong
+  slot.
 - Per layer, per tensor of interest (prenorm hidden state, attention
   output, FFN output, residual sum): magnitude ratio and top-K overlap
   against the reference, not just max-abs-diff — a ratio catches a
@@ -219,6 +271,26 @@ visible immediately, and it went unnoticed until a code audit found it.
 Neither is a performance change. Both are prerequisites for doing the
 performance changes quickly and for not shipping another green row that
 computes the wrong thing.
+
+## Silent-fallback detection (cheap; we keep hitting this)
+
+ferrox's worst bug class this cycle was not a wrong kernel but a *missing*
+one, silently replaced by a slow path:
+
+- IQ4_XS batched prefill ran on the **CPU** because `metal_kind_supported`
+  and `apply_gpu`'s kind table disagreed — 13.7x on that row, and the only
+  symptom was a slow benchmark.
+- Gemma-4-E2B is slower on Metal than on CPU: same smell.
+- `ferrox-cli --features cuda` did not compile at all, so every CUDA claim
+  was untested.
+
+**Adopt an eager kernel-lookup registry, sealed after model build.** Record
+every kernel/dispatch lookup made while constructing the model, with
+`#[track_caller]` so each record carries its call site. Seal the registry
+once loaded; any later lookup that misses and takes a fallback is a silent
+slow path and should fail loudly, or at least warn once. That converts
+"why is this row slow" into a startup error. It would have caught all
+three of the above at load time instead of via a benchmark and an audit.
 
 ## Memory: what actually decides which models fit
 

@@ -8,6 +8,7 @@
 
 pub mod attention;
 pub mod cache;
+pub mod cpu_pool;
 pub mod csa_hca_compress;
 pub mod deepseek_v4_attention;
 pub mod expert_store;

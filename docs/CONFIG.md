@@ -33,7 +33,11 @@ library or overriding the CLI.
 | `FERROX_CHUNKED_PREFILL` | Split long prefills into N-token chunks |
 | `FERROX_CPU_KV_OFFLOAD` | `1` — sync Metal KV to host after each decode step |
 | `FERROX_TOKIO_WORKERS` | `ferrox-server` async worker threads (default `2`); keeps the HTTP runtime from oversubscribing the decode pool |
-| `FERROX_QOS_LOG` | `1` — log each rayon worker's macOS QoS class at pool start |
+| `FERROX_QOS_LOG` | `1` — log each worker's macOS QoS class at pool start (rayon, gemv and decode pools) |
+| `FERROX_CPU_POOL` | `0` — disable the persistent spin-barrier decode pool and go back to a Rayon fork-join per matvec. On by default; the A/B knob for CPU `tg128` |
+| `FERROX_CPU_POOL_SPIN` | Iterations a decode-pool worker spins before parking on a condvar (default `50000`). Lower = less idle burn, higher = fewer wakeups between matvecs |
+| `FERROX_MIN_PARALLEL_OPS` | `rows × cols` below which a matvec runs serially instead of opening any region (default `256000`). The small-model width knob — both engines get *slower* with threads on SmolLM2-135M |
+| `FERROX_MIN_TASK_MACS` | Minimum multiply-accumulates one task must carry (default `65536`); with the row count, this is what caps how many threads a small matvec actually uses |
 | `FERROX_UI` | `1` — serve chat UI at `/` and `/ui` |
 | `FERROX_KV_POOL_BLOCKS` | Paged-KV pool size (blocks) |
 | `FERROX_EXPERT_CACHE_BYTES` | MoE expert-streaming cache budget |

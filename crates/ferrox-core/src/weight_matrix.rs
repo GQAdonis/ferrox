@@ -454,6 +454,61 @@ impl WeightMatrix {
         (rows / (threads * 4)).max(8.min(rows.max(1)))
     }
 
+    /// Run `body(g, t0, t1)` for every row-group `g` and activation-tile
+    /// range `[t0, t1)` of a llama-style 2D chunk grid over
+    /// (row-groups × batch tiles).
+    ///
+    /// This is the port of `ggml_compute_forward_mul_mat`'s chunking
+    /// (`ggml-cpu.c`): ~16 rows / 16 batch positions per chunk, and if
+    /// that grid is smaller than `4 × threads`, re-chunk by thread along
+    /// the larger dimension. llama walks the grid with an atomic
+    /// `current_chunk` because its threadpool has no scheduler; Rayon
+    /// already work-steals, so handing it the same chunks (`min_len 1`)
+    /// gets the same load balancing. The point is the *batch* dimension:
+    /// splitting only by rows leaves a 192-row projection with ~3 tasks
+    /// no matter how many positions are in flight.
+    fn par_chunked_groups(
+        n_groups: usize,
+        group_rows: usize,
+        n_tiles: usize,
+        tile_batch: usize,
+        body: impl Fn(usize, usize, usize) + Sync,
+    ) {
+        if n_groups == 0 || n_tiles == 0 {
+            return;
+        }
+        let nth = rayon::current_num_threads().max(1);
+        const CHUNK_ELEMS: usize = 16;
+        let g_per_chunk = (CHUNK_ELEMS / group_rows).max(1);
+        let t_per_chunk = (CHUNK_ELEMS / tile_batch).max(1);
+        let mut nchunk_g = n_groups.div_ceil(g_per_chunk);
+        let mut nchunk_t = n_tiles.div_ceil(t_per_chunk);
+        if nchunk_g * nchunk_t < nth * 4 {
+            // llama's fallback: one chunk per thread along the larger dim.
+            if n_groups * group_rows > n_tiles * tile_batch {
+                nchunk_g = nth.min(n_groups);
+                nchunk_t = 1;
+            } else {
+                nchunk_g = 1;
+                nchunk_t = nth.min(n_tiles);
+            }
+        }
+        let dg = n_groups.div_ceil(nchunk_g);
+        let dt = n_tiles.div_ceil(nchunk_t);
+        (0..nchunk_g * nchunk_t)
+            .into_par_iter()
+            .with_min_len(1)
+            .for_each(|chunk| {
+                let g0 = (chunk % nchunk_g) * dg;
+                let g1 = (g0 + dg).min(n_groups);
+                let t0 = (chunk / nchunk_g) * dt;
+                let t1 = (t0 + dt).min(n_tiles);
+                for g in g0..g1 {
+                    body(g, t0, t1);
+                }
+            });
+    }
+
     /// Prefer serial when the mat is too small for fork-join to pay off.
     fn prefer_serial_matvec(rows: usize, cols: usize) -> bool {
         // ~256k f32-equivalent ops: below this, Rayon overhead dominates
@@ -1437,14 +1492,19 @@ impl WeightMatrix {
                                             ferrox_quant::prepare_q8_acts_x4(chunk, cols)
                                         })
                                         .collect();
-                                    (0..n_groups)
-                                        .into_par_iter()
-                                        .with_min_len(Self::min_rows_per_task(n_groups).max(1))
-                                        .for_each(|g| {
+                                    Self::par_chunked_groups(
+                                        n_groups,
+                                        nrows_g,
+                                        act_tiles.len(),
+                                        nc,
+                                        |g, t0, t1| {
                                             let mut tmp = [0f32;
                                                 ferrox_quant::Q8_0X4_NROWS
                                                     * ferrox_quant::Q8K_ACTS_X4_NC];
-                                            for (t, tile) in act_tiles.iter().enumerate() {
+                                            for (t, tile) in
+                                                act_tiles[t0..t1].iter().enumerate()
+                                            {
+                                                let t = t0 + t;
                                                 let n = tile.na;
                                                 let tmp = &mut tmp[..nrows_g * n];
                                                 ferrox_quant::gemm_q8_0x4_group_x4(
@@ -1459,37 +1519,48 @@ impl WeightMatrix {
                                                     }
                                                 }
                                             }
-                                        });
+                                        },
+                                    );
                                 } else {
-                                    (0..n_groups)
-                                        .into_par_iter()
-                                        .with_min_len(Self::min_rows_per_task(n_groups).max(1))
-                                        .for_each_init(
-                                            // GEMM, not a GEMV per position:
-                                            // the batched kernel writes a
-                                            // `[row][batch]` group, and the
-                                            // group's weight vectors stay in
-                                            // registers across a tile of
-                                            // activations. The group is then
-                                            // scattered into the [batch][rows]
-                                            // output right here, in parallel.
-                                            || vec![0f32; nrows_g * batch_size],
-                                            |group, g| {
-                                                ferrox_quant::gemm_q8_0x4_group(
-                                                    &packed, g, &acts, cols, interleave, group,
-                                                );
-                                                for b in 0..batch_size {
-                                                    for r in 0..nrows_g {
-                                                        unsafe {
-                                                            out_w.set(
-                                                                b * rows + g * nrows_g + r,
-                                                                group[r * batch_size + b],
-                                                            );
-                                                        }
+                                    // GEMM, not a GEMV per position: the
+                                    // batched kernel writes a `[row][batch]`
+                                    // span, and the group's weight vectors
+                                    // stay in registers across a tile of
+                                    // activations. The span is then scattered
+                                    // into the [batch][rows] output right
+                                    // here, in parallel.
+                                    let span = ferrox_quant::Q8_0X4_GEMM_NC;
+                                    let n_tiles = batch_size.div_ceil(span);
+                                    Self::par_chunked_groups(
+                                        n_groups,
+                                        nrows_g,
+                                        n_tiles,
+                                        span,
+                                        |g, t0, t1| {
+                                            let b0 = t0 * span;
+                                            let b1 = (t1 * span).min(batch_size);
+                                            let n = b1 - b0;
+                                            let mut group = vec![0f32; nrows_g * n];
+                                            ferrox_quant::gemm_q8_0x4_group(
+                                                &packed,
+                                                g,
+                                                &acts[b0..b1],
+                                                cols,
+                                                interleave,
+                                                &mut group,
+                                            );
+                                            for (bi, b) in (b0..b1).enumerate() {
+                                                for r in 0..nrows_g {
+                                                    unsafe {
+                                                        out_w.set(
+                                                            b * rows + g * nrows_g + r,
+                                                            group[r * n + bi],
+                                                        );
                                                     }
                                                 }
-                                            },
-                                        );
+                                            }
+                                        },
+                                    );
                                 }
                                 let data_slice = data.as_slice();
                                 let tail = *rows - n_groups * ferrox_quant::Q8_0X4_NROWS;
@@ -1558,14 +1629,19 @@ impl WeightMatrix {
                                             ferrox_quant::prepare_q8_acts_x4(chunk, cols)
                                         })
                                         .collect();
-                                    (0..n_groups)
-                                        .into_par_iter()
-                                        .with_min_len(Self::min_rows_per_task(n_groups).max(1))
-                                        .for_each(|g| {
+                                    Self::par_chunked_groups(
+                                        n_groups,
+                                        nrows_g,
+                                        act_tiles.len(),
+                                        nc,
+                                        |g, t0, t1| {
                                             let mut tmp = [0f32;
                                                 ferrox_quant::Q4_0X4_NROWS
                                                     * ferrox_quant::Q8K_ACTS_X4_NC];
-                                            for (t, tile) in act_tiles.iter().enumerate() {
+                                            for (t, tile) in
+                                                act_tiles[t0..t1].iter().enumerate()
+                                            {
+                                                let t = t0 + t;
                                                 let n = tile.na;
                                                 let tmp = &mut tmp[..nrows_g * n];
                                                 ferrox_quant::gemm_q4_0x4_group_x4(
@@ -1580,29 +1656,48 @@ impl WeightMatrix {
                                                     }
                                                 }
                                             }
-                                        });
+                                        },
+                                    );
                                 } else {
-                                    (0..n_groups)
-                                        .into_par_iter()
-                                        .with_min_len(Self::min_rows_per_task(n_groups).max(1))
-                                        .for_each_init(
-                                            || vec![0f32; nrows_g * batch_size],
-                                            |group, g| {
-                                                ferrox_quant::gemm_q4_0x4_group(
-                                                    &packed, g, &acts, cols, interleave, group,
-                                                );
-                                                for b in 0..batch_size {
-                                                    for r in 0..nrows_g {
-                                                        unsafe {
-                                                            out_w.set(
-                                                                b * rows + g * nrows_g + r,
-                                                                group[r * batch_size + b],
-                                                            );
-                                                        }
+                                    // GEMM, not a GEMV per position: the
+                                    // batched kernel writes a `[row][batch]`
+                                    // span, and the group's weight vectors
+                                    // stay in registers across a tile of
+                                    // activations. The span is then scattered
+                                    // into the [batch][rows] output right
+                                    // here, in parallel.
+                                    let span = ferrox_quant::Q8_0X4_GEMM_NC;
+                                    let n_tiles = batch_size.div_ceil(span);
+                                    Self::par_chunked_groups(
+                                        n_groups,
+                                        nrows_g,
+                                        n_tiles,
+                                        span,
+                                        |g, t0, t1| {
+                                            let b0 = t0 * span;
+                                            let b1 = (t1 * span).min(batch_size);
+                                            let n = b1 - b0;
+                                            let mut group = vec![0f32; nrows_g * n];
+                                            ferrox_quant::gemm_q4_0x4_group(
+                                                &packed,
+                                                g,
+                                                &acts[b0..b1],
+                                                cols,
+                                                interleave,
+                                                &mut group,
+                                            );
+                                            for (bi, b) in (b0..b1).enumerate() {
+                                                for r in 0..nrows_g {
+                                                    unsafe {
+                                                        out_w.set(
+                                                            b * rows + g * nrows_g + r,
+                                                            group[r * n + bi],
+                                                        );
                                                     }
                                                 }
-                                            },
-                                        );
+                                            }
+                                        },
+                                    );
                                 }
                                 let data_slice = data.as_slice();
                                 let tail = *rows - n_groups * ferrox_quant::Q4_0X4_NROWS;
@@ -1675,14 +1770,19 @@ impl WeightMatrix {
                                     } else {
                                         Vec::new()
                                     };
-                                (0..n_groups)
-                                    .into_par_iter()
-                                    .with_min_len(Self::min_rows_per_task(n_groups).max(1))
-                                    .for_each(|g| {
+                                let n_tiles = batch_size.div_ceil(nc);
+                                Self::par_chunked_groups(
+                                    n_groups,
+                                    ferrox_quant::Q4_KX8_NROWS,
+                                    n_tiles,
+                                    nc,
+                                    |g, t0, t1| {
                                         let mut tile = [0f32;
                                             ferrox_quant::Q4_KX8_NROWS
                                                 * ferrox_quant::Q4_KX8_GEMM_NC];
-                                        for (t, chunk) in acts.chunks(nc).enumerate() {
+                                        for t in t0..t1 {
+                                            let chunk =
+                                                &acts[t * nc..((t + 1) * nc).min(batch_size)];
                                             let n = chunk.len();
                                             let tile = &mut tile[..ferrox_quant::Q4_KX8_NROWS * n];
                                             if act_tiles.is_empty() {
@@ -1709,7 +1809,8 @@ impl WeightMatrix {
                                                 }
                                             }
                                         }
-                                    });
+                                    },
+                                );
                                 let data_slice = data.as_slice();
                                 let tail = *rows - n_groups * ferrox_quant::Q4_KX8_NROWS;
                                 (0..tail)
@@ -1786,14 +1887,19 @@ impl WeightMatrix {
                                     } else {
                                         Vec::new()
                                     };
-                                (0..n_groups)
-                                    .into_par_iter()
-                                    .with_min_len(Self::min_rows_per_task(n_groups).max(1))
-                                    .for_each(|g| {
+                                let n_tiles = batch_size.div_ceil(nc);
+                                Self::par_chunked_groups(
+                                    n_groups,
+                                    ferrox_quant::Q5_KX8_NROWS,
+                                    n_tiles,
+                                    nc,
+                                    |g, t0, t1| {
                                         let mut tile = [0f32;
                                             ferrox_quant::Q5_KX8_NROWS
                                                 * ferrox_quant::Q5_KX8_GEMM_NC];
-                                        for (t, chunk) in acts.chunks(nc).enumerate() {
+                                        for t in t0..t1 {
+                                            let chunk =
+                                                &acts[t * nc..((t + 1) * nc).min(batch_size)];
                                             let n = chunk.len();
                                             let tile = &mut tile[..ferrox_quant::Q5_KX8_NROWS * n];
                                             if act_tiles.is_empty() {
@@ -1820,7 +1926,8 @@ impl WeightMatrix {
                                                 }
                                             }
                                         }
-                                    });
+                                    },
+                                );
                                 let data_slice = data.as_slice();
                                 let tail = *rows - n_groups * ferrox_quant::Q5_KX8_NROWS;
                                 (0..tail)
@@ -1900,14 +2007,19 @@ impl WeightMatrix {
                                     .par_chunks(nc)
                                     .map(|chunk| ferrox_quant::prepare_q8_k_acts_x4(chunk, cols))
                                     .collect();
-                                (0..n_groups)
-                                    .into_par_iter()
-                                    .with_min_len(Self::min_rows_per_task(n_groups).max(1))
-                                    .for_each(|g| {
+                                let n_tiles = batch_size.div_ceil(nc);
+                                Self::par_chunked_groups(
+                                    n_groups,
+                                    ferrox_quant::Q6_KX8_NROWS,
+                                    n_tiles,
+                                    nc,
+                                    |g, t0, t1| {
                                         let mut tile = [0f32;
                                             ferrox_quant::Q6_KX8_NROWS
                                                 * ferrox_quant::Q8K_ACTS_X4_NC];
-                                        for (t, chunk) in acts.chunks(nc).enumerate() {
+                                        for t in t0..t1 {
+                                            let chunk =
+                                                &acts[t * nc..((t + 1) * nc).min(batch_size)];
                                             let n = chunk.len();
                                             let tile = &mut tile[..ferrox_quant::Q6_KX8_NROWS * n];
                                             ferrox_quant::gemm_q6_kx8_group_x4(
@@ -3145,6 +3257,44 @@ mod tests {
             let batched = matrix.apply_batch(&x_batch, batch_size);
             assert_eq!(batched.len(), batch_size * rows);
             for b in 0..batch_size {
+                let x = &x_batch[b * cols..(b + 1) * cols];
+                let sequential = matrix.apply(x);
+                let from_batch = &batched[b * rows..(b + 1) * rows];
+                for (r, (s, got)) in sequential.iter().zip(from_batch.iter()).enumerate() {
+                    let err = (s - got).abs();
+                    assert!(
+                        err / s.abs().max(1.0) < 1e-4,
+                        "{kind:?} batch {b} row {r}: apply()={s} apply_batch={got}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Large enough that `par_chunked_groups` builds a real 2D chunk grid
+    /// (32 row-groups × 17 activation tiles) instead of falling back to
+    /// one-chunk-per-thread — every (group, tile-range) seam in the
+    /// chunked scatter is crossed. The smaller cross-kind test above
+    /// covers the fallback path.
+    #[test]
+    fn apply_batch_chunked_grid_matches_apply() {
+        let rows = 259; // 32 groups of 8 + 3 tail (64 of 4 + 3 for Q8_0/Q4_0)
+        let cols = 512;
+        let batch_size = 66; // 16 full 4-activation tiles + a partial one
+        let x_batch: Vec<f32> = (0..batch_size * cols)
+            .map(|i| (((i * 37 + 5) % 101) as f32) * 0.019 - 0.95)
+            .collect();
+        for kind in [
+            QuantKind::Q8_0,
+            QuantKind::Q4_0,
+            QuantKind::Q4K,
+            QuantKind::Q5K,
+            QuantKind::Q6K,
+        ] {
+            let matrix = synth_quant_matrix(kind, rows, cols);
+            let batched = matrix.apply_batch(&x_batch, batch_size);
+            assert_eq!(batched.len(), batch_size * rows);
+            for b in [0, 1, 31, 32, 64, 65] {
                 let x = &x_batch[b * cols..(b + 1) * cols];
                 let sequential = matrix.apply(x);
                 let from_batch = &batched[b * rows..(b + 1) * rows];

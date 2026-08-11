@@ -645,15 +645,20 @@ pub fn run_expert(hidden: &[f32], expert: &ExpertWeights) -> Vec<f32> {
     // (OLMoE: avoids 2× quantize_activations_q8 per expert).
     if ferrox_core::weight_matrix::cpu_int_dot_enabled() && hidden.len().is_multiple_of(32) {
         let act = ferrox_quant::quantize_activations_q8(hidden);
-        if let (Some(gate), Some(up)) =
-            (expert.gate.apply_cpu_q8(&act), expert.up.apply_cpu_q8(&act))
-        {
+        // gate and up are independent over the same activation, so their
+        // parallel regions can overlap instead of running back to back.
+        // Decode's deficit is scheduling, not kernels -- see
+        // `WeightMatrix::apply_three`, which does this for q/k/v.
+        let (g, u) = rayon::join(
+            || expert.gate.apply_cpu_q8(&act),
+            || expert.up.apply_cpu_q8(&act),
+        );
+        if let (Some(gate), Some(up)) = (g, u) {
             let activated = swiglu(&gate, &up);
             return expert.down.apply(&activated);
         }
     }
-    let gate = expert.gate.apply(hidden);
-    let up = expert.up.apply(hidden);
+    let (gate, up) = rayon::join(|| expert.gate.apply(hidden), || expert.up.apply(hidden));
     let activated = swiglu(&gate, &up);
     expert.down.apply(&activated)
 }

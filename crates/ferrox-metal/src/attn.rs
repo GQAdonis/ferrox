@@ -1715,7 +1715,25 @@ kernel void gqa_prefill_fa_ext_d64(
         if (ic >= max_causal) break;
         const uint chunk = min(C, max_causal - ic);
 
-        // Q·Kᵀ — one simdgroup computes scores (avoid multi-SG torn writes to ss).
+        // Q·Kᵀ + scale/softcap/causal mask. Every ss slot is written exactly
+        // once, from a register, by a single thread.
+        //
+        // Scale/softcap/mask used to live in a *separate* loop after the
+        // barrier, run redundantly by all NSG simdgroups over the same
+        // `cc = tiisg; cc < chunk; cc += NW` slots. That made each ss slot a
+        // read-modify-write with no barrier between the four readers and the
+        // four writers, so a simdgroup could load a score another had already
+        // transformed and transform it a second time —
+        //   softcap*tanh(softcap*tanh(x*scale/softcap)*scale/softcap)
+        // instead of softcap*tanh(x*scale/softcap). Whether a given slot got
+        // hit depended on simdgroup skew, which is why the corruption was
+        // scattered over some (query, key) pairs and not others.
+        //
+        // The single-writer property is what the `sgitg == 0u` guard buys, and
+        // it is now enforced for the whole score pipeline rather than for the
+        // dot product alone. A future attempt to widen this phase across all
+        // four simdgroups must keep it: partition `cc` so the simdgroups touch
+        // disjoint ss slots, and keep the mask folded in here.
         if (sgitg == 0u) {
             for (uint cc = 0u; cc < chunk; cc++) {
                 device const half4* k4 = (device const half4*)(k_cache
@@ -1724,24 +1742,17 @@ kernel void gqa_prefill_fa_ext_d64(
                     threadgroup float4* sq4j = (threadgroup float4*)(sq + j * D);
                     float partial = own ? dot(sq4j[tiisg], float4(k4[tiisg])) : 0.0f;
                     float sc = simd_sum(partial);
-                    if (tiisg == 0u) ss[j * SH + cc] = sc;
+                    if (tiisg == 0u) {
+                        const uint clen = kv_prefix_len + qi0 + j + 1u;
+                        if (ic + cc >= clen) {
+                            sc = -INFINITY;
+                        } else {
+                            sc *= scale;
+                            if (softcap > 0.0f) sc = softcap * tanh(sc / softcap);
+                        }
+                        ss[j * SH + cc] = sc;
+                    }
                 }
-            }
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        // Scale, softcap, causal mask on ss[j,0:chunk).
-        for (uint j = 0u; j < n_local; j++) {
-            const uint clen = kv_prefix_len + qi0 + j + 1u;
-            for (uint cc = tiisg; cc < chunk; cc += NW) {
-                float sc = ss[j * SH + cc];
-                if (ic + cc >= clen) {
-                    sc = -INFINITY;
-                } else {
-                    sc *= scale;
-                    if (softcap > 0.0f) sc = softcap * tanh(sc / softcap);
-                }
-                ss[j * SH + cc] = sc;
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);

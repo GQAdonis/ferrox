@@ -181,7 +181,7 @@ impl WeightBytes {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum QuantKind {
     Q8_0,
     Q4_0,
@@ -226,6 +226,140 @@ pub enum QuantKind {
     /// safetensors form, though the math is identical. Scalar kernel
     /// only so far.
     Mxfp4Gguf,
+}
+
+impl QuantKind {
+    /// Every variant, so exhaustiveness can be *tested* rather than
+    /// trusted. The kernel-coverage tests below iterate this; adding a
+    /// variant without adding it here fails to compile (the match in
+    /// [`Self::name`] is exhaustive and this list is checked against it).
+    pub const ALL: &'static [QuantKind] = &[
+        QuantKind::Q8_0,
+        QuantKind::Q4_0,
+        QuantKind::Q4K,
+        QuantKind::Q5K,
+        QuantKind::Q6K,
+        QuantKind::Q2K,
+        QuantKind::Q3K,
+        QuantKind::Q4_1,
+        QuantKind::Q5_0,
+        QuantKind::Q5_1,
+        QuantKind::Q8_1,
+        QuantKind::IQ4NL,
+        QuantKind::IQ4XS,
+        QuantKind::IQ1S,
+        QuantKind::IQ2XXS,
+        QuantKind::IQ3XXS,
+        QuantKind::Mxfp4Gguf,
+    ];
+
+    /// The GGUF-facing name. Also the key
+    /// [`ferrox_metal::gpu::matvec_launch_meta`] is looked up by, which
+    /// is why it is one function and not a `Debug` impl.
+    pub fn name(self) -> &'static str {
+        match self {
+            QuantKind::Q8_0 => "Q8_0",
+            QuantKind::Q4_0 => "Q4_0",
+            QuantKind::Q4K => "Q4_K",
+            QuantKind::Q5K => "Q5_K",
+            QuantKind::Q6K => "Q6_K",
+            QuantKind::Q2K => "Q2_K",
+            QuantKind::Q3K => "Q3_K",
+            QuantKind::Q4_1 => "Q4_1",
+            QuantKind::Q5_0 => "Q5_0",
+            QuantKind::Q5_1 => "Q5_1",
+            QuantKind::Q8_1 => "Q8_1",
+            QuantKind::IQ4NL => "IQ4_NL",
+            QuantKind::IQ4XS => "IQ4_XS",
+            QuantKind::IQ1S => "IQ1_S",
+            QuantKind::IQ2XXS => "IQ2_XXS",
+            QuantKind::IQ3XXS => "IQ3_XXS",
+            QuantKind::Mxfp4Gguf => "MXFP4",
+        }
+    }
+}
+
+/// Which quant kinds have a **Metal matvec** kernel, as the kernel name
+/// [`ferrox_metal::gpu::matvec_launch_meta`] resolves.
+///
+/// This is the single source of truth for that question. It is *not*
+/// `#[cfg(feature = "metal")]`-gated deliberately: the table is a
+/// property of the kernel set, and gating it would make it untestable on
+/// the builds that run `cargo test --workspace`.
+///
+/// Duplicating this list is how IQ4_XS batched prefill silently ran on
+/// the CPU — `metal_kind_supported` and `apply_gpu_batch`'s kind table
+/// disagreed by exactly one entry, and the only symptom was a benchmark
+/// row 13.7x behind. Every Metal-kind question now routes through here.
+pub fn metal_matvec_kind_name(kind: QuantKind) -> Option<&'static str> {
+    match kind {
+        QuantKind::Q8_0
+        | QuantKind::Q4_0
+        | QuantKind::Q4K
+        | QuantKind::Q5K
+        | QuantKind::Q6K
+        | QuantKind::IQ4XS => Some(kind.name()),
+        _ => None,
+    }
+}
+
+/// Which quant kinds have a **Metal batched simdgroup GEMM**
+/// (`*_mul_mm_sg`), the prefill path. A kind with a matvec but no GEMM
+/// still runs on Metal — as `batch` separate matvecs over the same
+/// weights, which is the 13.7x shape.
+///
+/// The invariant that this set equals [`metal_matvec_kind_name`]'s is
+/// asserted by a test, so adding a matvec kernel without a GEMM fails
+/// the suite instead of a benchmark.
+pub fn metal_mul_mm_kind_supported(kind: QuantKind) -> bool {
+    matches!(
+        kind,
+        QuantKind::Q8_0
+            | QuantKind::Q4_0
+            | QuantKind::Q4K
+            | QuantKind::Q5K
+            | QuantKind::Q6K
+            | QuantKind::IQ4XS
+    )
+}
+
+/// Which quant kinds have a **CUDA matvec** kernel.
+pub fn cuda_matvec_kind_supported(kind: QuantKind) -> bool {
+    matches!(
+        kind,
+        QuantKind::Q8_0 | QuantKind::Q4_0 | QuantKind::Q4K | QuantKind::Q5K | QuantKind::Q6K
+    )
+}
+
+/// Which quant kinds take the CPU integer `vec_dot` path (activation
+/// quantized to Q8/Q8_K, int8xint8 dots) rather than the much slower f32
+/// dequant-dot. `cols` matters: the K-quant kernels need a whole number
+/// of 256-element super-blocks, the legacy ones 32-element blocks.
+pub fn cpu_int_dot_kind_supported(kind: QuantKind, cols: usize) -> bool {
+    match kind {
+        QuantKind::Q8_0 | QuantKind::Q4_0 => cols.is_multiple_of(32),
+        QuantKind::Q4K | QuantKind::Q5K | QuantKind::Q6K => cols.is_multiple_of(256),
+        _ => false,
+    }
+}
+
+/// The backend dense matmuls will actually use in this process, decided
+/// by the same cached env/probe reads dispatch uses. CUDA wins when both
+/// are compiled in, matching [`WeightMatrix::apply_gpu`]'s order.
+pub fn active_backend() -> crate::kernel_registry::Backend {
+    #[cfg(feature = "cuda")]
+    {
+        if cuda_dense_enabled() {
+            return crate::kernel_registry::Backend::Cuda;
+        }
+    }
+    #[cfg(feature = "metal")]
+    {
+        if metal_dense_enabled() {
+            return crate::kernel_registry::Backend::Metal;
+        }
+    }
+    crate::kernel_registry::Backend::Cpu
 }
 
 /// A `ferrox_cuda::gpu::launch_*_matvec` function pointer's signature
@@ -419,6 +553,16 @@ impl WeightMatrix {
             WeightMatrix::F32(t) => t.rows(),
             WeightMatrix::Quantized { rows, .. } => *rows,
             WeightMatrix::Mxfp4 { rows, .. } => *rows,
+        }
+    }
+
+    /// The block format, or `None` for the two non-block storages
+    /// (`F32`, safetensors-pair `Mxfp4`). This is the key every
+    /// kernel-availability table is indexed by.
+    pub fn quant_kind(&self) -> Option<QuantKind> {
+        match self {
+            WeightMatrix::Quantized { kind, .. } => Some(*kind),
+            WeightMatrix::F32(_) | WeightMatrix::Mxfp4 { .. } => None,
         }
     }
 
@@ -1520,6 +1664,18 @@ impl WeightMatrix {
                 if let Some(out) = self.apply_gpu_batch(x_batch, batch_size) {
                     return out;
                 }
+                // The kind is Metal-supported, so reaching here means a
+                // launch failed and the batch degrades to `batch_size`
+                // separate `apply` calls -- each its own command buffer,
+                // commit and wait.
+                crate::kernel_registry::miss(
+                    crate::kernel_registry::Lookup::new(
+                        crate::kernel_registry::Backend::Metal,
+                        crate::kernel_registry::op::GEMM_PREFILL,
+                        self.quant_kind(),
+                    ),
+                    "N x apply (one command buffer each)",
+                );
                 let rows = self.rows();
                 let mut out = vec![0f32; batch_size * rows];
                 for b in 0..batch_size {
@@ -1527,6 +1683,21 @@ impl WeightMatrix {
                     out[b * rows..(b + 1) * rows].copy_from_slice(&y);
                 }
                 return out;
+            } else if metal_dense_enabled() {
+                // Metal is on but this matrix has no Metal kernel at
+                // all, so the whole GEMM runs on the CPU. For a
+                // quantized weight that is the IQ4_XS shape exactly; for
+                // an F32 one it is the documented host GEMM.
+                let look = crate::kernel_registry::Lookup::new(
+                    crate::kernel_registry::Backend::Metal,
+                    crate::kernel_registry::op::GEMM_PREFILL,
+                    self.quant_kind(),
+                );
+                if self.quant_kind().is_some() {
+                    crate::kernel_registry::miss(look, "CPU apply_batch");
+                } else {
+                    crate::kernel_registry::miss_by_design(look, "CPU f32 GEMM");
+                }
             }
         }
 
@@ -2292,6 +2463,20 @@ impl WeightMatrix {
             kind,
         } = self
         else {
+            // Deliberate, and recorded rather than hidden: an MoE
+            // router is a lone small F32 matvec that costs more to ship
+            // to the GPU than to compute on the host.
+            let backend = active_backend();
+            if backend.is_accelerator() {
+                crate::kernel_registry::miss_by_design(
+                    crate::kernel_registry::Lookup::new(
+                        backend,
+                        crate::kernel_registry::op::MATVEC,
+                        None,
+                    ),
+                    "host GEMV",
+                );
+            }
             return None;
         };
         let row_bytes = self.block_bytes_per_row(*kind, *cols);
@@ -2330,6 +2515,15 @@ impl WeightMatrix {
                 QuantKind::IQ4XS => Some(ferrox_metal::gpu::launch_iq4_xs_matvec),
                 _ => None,
             };
+            // This table and `metal_matvec_kind_name` answer the same
+            // question and must never diverge; when they did, IQ4_XS
+            // prefill silently moved to the CPU.
+            debug_assert_eq!(
+                launch.is_some(),
+                metal_matvec_kind_name(*kind).is_some(),
+                "apply_gpu's Metal launch table disagrees with metal_matvec_kind_name for {:?}",
+                kind
+            );
             if let Some(launch) = launch {
                 match launch(data.as_slice(), x, *rows, row_bytes) {
                     Ok(out) => return Some(out),
@@ -2340,6 +2534,21 @@ impl WeightMatrix {
             }
         }
 
+        // Reached only on a miss or a launch error, i.e. only when the
+        // caller is about to run the whole matvec on the host anyway --
+        // so recording it here costs nothing measurable and is the only
+        // signal that a GPU run is quietly not one.
+        let backend = active_backend();
+        if backend.is_accelerator() {
+            crate::kernel_registry::miss(
+                crate::kernel_registry::Lookup::new(
+                    backend,
+                    crate::kernel_registry::op::MATVEC,
+                    Some(*kind),
+                ),
+                "CPU apply_cpu",
+            );
+        }
         None
     }
 
@@ -2642,14 +2851,16 @@ impl WeightMatrix {
         else {
             return None;
         };
-        let kind_name = match kind {
-            QuantKind::Q8_0 => "Q8_0",
-            QuantKind::Q4_0 => "Q4_0",
-            QuantKind::Q4K => "Q4_K",
-            QuantKind::Q5K => "Q5_K",
-            QuantKind::Q6K => "Q6_K",
-            QuantKind::IQ4XS => "IQ4_XS",
-            _ => return None,
+        let Some(kind_name) = metal_matvec_kind_name(*kind) else {
+            crate::kernel_registry::miss(
+                crate::kernel_registry::Lookup::new(
+                    crate::kernel_registry::Backend::Metal,
+                    crate::kernel_registry::op::GEMM_PREFILL,
+                    Some(*kind),
+                ),
+                "CPU apply_batch",
+            );
+            return None;
         };
         let (src, fn_name, block_bytes, block_elems, rows_per_tg) =
             ferrox_metal::gpu::matvec_launch_meta(kind_name)?;
@@ -2664,6 +2875,20 @@ impl WeightMatrix {
         // decode path (batch_size == 1 still uses matvec).
         let use_mul_mm = batch_size >= 4 && metal_mul_mm_enabled();
         if use_mul_mm {
+            // Observation only: a kind with a matvec kernel but no
+            // simdgroup GEMM still runs on Metal, as `batch` separate
+            // matvecs over the same weights. That is the shape that cost
+            // IQ4_XS 13.7x, and it is invisible in the output.
+            if !metal_mul_mm_kind_supported(*kind) {
+                crate::kernel_registry::miss(
+                    crate::kernel_registry::Lookup::new(
+                        crate::kernel_registry::Backend::Metal,
+                        crate::kernel_registry::op::GEMM_PREFILL,
+                        Some(*kind),
+                    ),
+                    "Metal N x matvec batch",
+                );
+            }
             match kind {
                 QuantKind::Q4_0 => {
                     match ferrox_metal::gpu::launch_q4_0_mul_mm_sg(
@@ -2873,17 +3098,143 @@ impl WeightMatrix {
         }
     }
 
+    /// Delegates to [`metal_matvec_kind_name`]. Kept as a method because
+    /// the call sites read better, but it must never grow a list of its
+    /// own again — a second copy of this list is what sent IQ4_XS
+    /// batched prefill to the CPU.
     #[cfg(feature = "metal")]
     fn metal_kind_supported(kind: QuantKind) -> bool {
-        matches!(
+        metal_matvec_kind_name(kind).is_some()
+    }
+
+    /// Eagerly resolve, and record, every kernel lookup this matrix's
+    /// dispatch paths will make later, without dispatching anything.
+    ///
+    /// Call once per weight while the model is being built, with `role`
+    /// naming the tensor (`"attn_q"`, `"ffn_down"`, ...). The predicates
+    /// consulted here are the *same functions* the hot path consults, so
+    /// the recorded prediction cannot drift from the decision. See
+    /// [`crate::kernel_registry`] for why this exists and
+    /// [`crate::kernel_registry::seal`] for what is done with it.
+    ///
+    /// Observation only: nothing here influences a later dispatch.
+    #[track_caller]
+    pub fn probe_kernels(&self, role: &'static str) {
+        if !crate::kernel_registry::enabled() {
+            return;
+        }
+        self.probe_kernels_into(
+            crate::kernel_registry::global(),
+            role,
+            std::panic::Location::caller(),
+        );
+    }
+
+    /// [`Self::probe_kernels`] against an explicit registry and call
+    /// site, so tests can probe into an instance of their own instead of
+    /// the process-wide one.
+    pub fn probe_kernels_into(
+        &self,
+        reg: &crate::kernel_registry::Registry,
+        role: &'static str,
+        loc: &'static std::panic::Location<'static>,
+    ) {
+        self.probe_kernels_for(reg, active_backend(), role, loc)
+    }
+
+    /// [`Self::probe_kernels_into`] against an explicit backend rather
+    /// than [`active_backend`]. Lets a test on a CPU-only build ask what
+    /// a Metal or CUDA run would resolve -- which is the only way the
+    /// kernel-coverage tests can run under plain
+    /// `cargo test --workspace`, where every GPU feature is off.
+    pub fn probe_kernels_for(
+        &self,
+        reg: &crate::kernel_registry::Registry,
+        backend: crate::kernel_registry::Backend,
+        role: &'static str,
+        loc: &'static std::panic::Location<'static>,
+    ) {
+        use crate::kernel_registry::{op, Backend, Lookup, Outcome};
+
+        let kind = self.quant_kind();
+        let cols = self.cols();
+        let look = |op: &'static str| Lookup {
+            backend,
+            op,
+            role,
             kind,
-            QuantKind::Q8_0
-                | QuantKind::Q4_0
-                | QuantKind::Q4K
-                | QuantKind::Q5K
-                | QuantKind::Q6K
-                | QuantKind::IQ4XS
-        )
+        };
+
+        // Whether the accelerator, if one is selected, can run this
+        // matrix at all -- and if so, whether prefill gets a real GEMM
+        // or `batch` matvecs over the same weights.
+        let (matvec, gemm) = match backend {
+            Backend::Metal => (
+                kind.is_some_and(|k| metal_matvec_kind_name(k).is_some()),
+                kind.is_some_and(metal_mul_mm_kind_supported),
+            ),
+            // CUDA has real matvec kernels and no batched GEMM: a
+            // batched prefill is a per-position matvec loop.
+            Backend::Cuda => (kind.is_some_and(cuda_matvec_kind_supported), false),
+            Backend::Cpu => (false, false),
+        };
+
+        if backend.is_accelerator() {
+            reg.record_build_at(
+                loc,
+                look(op::MATVEC),
+                match kind {
+                    // An accelerator kernel exists for this format.
+                    _ if matvec => Outcome::Hit,
+                    // No kernel: the whole matvec runs on the host.
+                    Some(_) => Outcome::slow_path("CPU apply_cpu"),
+                    // F32 has no quantized kernel by construction, and a
+                    // lone small F32 matvec (an MoE router) is host work
+                    // on purpose -- see `apply_gpu`.
+                    None => Outcome::by_design("host GEMV"),
+                },
+            );
+            reg.record_build_at(
+                loc,
+                look(op::GEMM_PREFILL),
+                match (gemm, backend, matvec, kind) {
+                    (true, ..) => Outcome::Hit,
+                    // Still on the GPU, but re-reading the whole weight
+                    // matrix once per position. This is the 13.7x shape.
+                    (false, Backend::Cuda, true, _) => {
+                        Outcome::slow_path("CUDA per-position matvec")
+                    }
+                    (false, _, true, _) => Outcome::slow_path("Metal N x matvec batch"),
+                    (false, _, false, Some(_)) => Outcome::slow_path("CPU apply_batch"),
+                    (false, _, false, None) => Outcome::by_design("CPU f32 GEMM"),
+                },
+            );
+        }
+
+        // The host path is what every accelerator miss lands on, so
+        // record its tier too: integer vec_dot, or the much slower f32
+        // dequant-dot.
+        if !matvec || !gemm {
+            let int_dot =
+                cpu_int_dot_enabled() && kind.is_some_and(|k| cpu_int_dot_kind_supported(k, cols));
+            reg.record_build_at(
+                loc,
+                Lookup {
+                    backend: Backend::Cpu,
+                    op: op::MATVEC,
+                    role,
+                    kind,
+                },
+                match kind {
+                    _ if int_dot => Outcome::Hit,
+                    // A quantized weight with no integer vec_dot kernel
+                    // dequantizes to f32 first: a much slower engine,
+                    // and invisible in the output.
+                    Some(_) => Outcome::slow_path("f32 dequant-dot"),
+                    None => Outcome::by_design("f32 GEMM"),
+                },
+            );
+        }
     }
 
     /// The block size (in bytes) for exactly the quant kinds
@@ -3535,5 +3886,191 @@ mod tests {
                 assert!((c - g).abs() < 1e-2, "cpu={c} gpu={g}");
             }
         }
+    }
+
+    // ---- kernel-lookup registry coverage -------------------------------
+    //
+    // These are the tests that would have caught the IQ4_XS silent CPU
+    // prefill at `cargo test` time instead of via a 13.7x benchmark row.
+
+    /// A quantized matrix of `kind` with `cols` columns, filled with
+    /// arbitrary bytes -- the probe reads only shape and kind, never the
+    /// weights, so the contents are irrelevant.
+    fn shaped(kind: QuantKind, rows: usize, cols: usize) -> WeightMatrix {
+        let per_row = match kind {
+            QuantKind::Q8_0 => cols / 32 * 34,
+            _ => cols,
+        };
+        WeightMatrix::Quantized {
+            data: WeightBytes::Owned(vec![0u8; rows * per_row.max(1)]),
+            rows,
+            cols,
+            kind,
+        }
+    }
+
+    /// `QuantKind::ALL` must actually list every variant. `name()` is
+    /// exhaustive by the compiler, so distinct names prove distinct
+    /// variants; the count pins that none was dropped from the list.
+    #[test]
+    fn quant_kind_all_lists_every_variant_exactly_once() {
+        let mut names: Vec<&str> = QuantKind::ALL.iter().map(|k| k.name()).collect();
+        let total = names.len();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), total, "QuantKind::ALL has a duplicate");
+        assert_eq!(
+            total, 17,
+            "a QuantKind variant was added without updating ALL"
+        );
+    }
+
+    /// The invariant that keeps prefill honest: every kind with a Metal
+    /// matvec also has a Metal batched GEMM. Break it and the kind still
+    /// "runs on Metal" -- as `batch` separate matvecs over the same
+    /// weights, which is exactly the shape that put IQ4_XS 13.7x behind
+    /// with no symptom other than a slow benchmark.
+    #[test]
+    fn every_metal_matvec_kind_also_has_a_metal_gemm() {
+        for &k in QuantKind::ALL {
+            assert_eq!(
+                metal_matvec_kind_name(k).is_some(),
+                metal_mul_mm_kind_supported(k),
+                "{}: matvec and mul_mm kernel tables disagree -- one of the two \
+                 is a silent slow path",
+                k.name()
+            );
+        }
+    }
+
+    /// The kind tables are pure lookups over the name, so a kind that
+    /// claims a kernel must name itself the way the Metal launch meta
+    /// table is keyed.
+    #[test]
+    fn metal_kind_names_match_the_quant_kind_names() {
+        for &k in QuantKind::ALL {
+            if let Some(name) = metal_matvec_kind_name(k) {
+                assert_eq!(name, k.name());
+            }
+        }
+    }
+
+    /// THE registry test: a kind with no accelerator kernel, probed
+    /// while the model is built, must be recorded as a miss and must be
+    /// a seal-time violation -- not silently absorbed by a fallback.
+    ///
+    /// Runs on any build: the backend is passed explicitly, so it does
+    /// not need `--features metal` to ask what Metal would resolve.
+    #[test]
+    fn a_deliberately_unsupported_kind_trips_the_registry() {
+        use crate::kernel_registry::{Backend, Outcome};
+
+        let reg = crate::kernel_registry::Registry::new();
+        let loc = std::panic::Location::caller();
+
+        // Supported: Q4_K has both a Metal matvec and a Metal GEMM.
+        shaped(QuantKind::Q4K, 64, 256).probe_kernels_for(&reg, Backend::Metal, "ffn_down", loc);
+        // Unsupported: no Metal kernel of any kind for IQ2_XXS.
+        shaped(QuantKind::IQ2XXS, 64, 256).probe_kernels_for(&reg, Backend::Metal, "ffn_up", loc);
+
+        let report = reg.seal();
+        let violations = &report.violations;
+        assert_eq!(
+            violations.len(),
+            2,
+            "expected matvec + gemm misses for IQ2_XXS only, got: {:?}",
+            report
+                .entries
+                .iter()
+                .map(|e| e.to_string())
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            violations
+                .iter()
+                .all(|v| v.key.kind == Some(QuantKind::IQ2XXS)),
+            "Q4_K must not be flagged"
+        );
+        assert!(
+            violations.iter().any(|v| matches!(
+                v.outcome,
+                Outcome::Miss { fallback, .. } if fallback == "CPU apply_batch"
+            )),
+            "the report must name the fallback that will actually run"
+        );
+        let rendered = report.render_violations();
+        assert!(rendered.contains("IQ2_XXS"), "{rendered}");
+        assert!(rendered.contains("weight_matrix.rs"), "{rendered}");
+
+        // And the host tier it lands on is recorded too: IQ2_XXS has no
+        // integer vec_dot either, so it is f32 dequant-dot.
+        assert!(
+            report.entries.iter().any(|e| e.key.backend == Backend::Cpu
+                && e.key.kind == Some(QuantKind::IQ2XXS)
+                && matches!(e.outcome, Outcome::Miss { fallback, .. } if fallback == "f32 dequant-dot")),
+            "{:?}",
+            report.entries.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+    }
+
+    /// A supported kind on a selected accelerator produces no violation
+    /// at all -- otherwise the signal is noise and gets ignored.
+    #[test]
+    fn a_fully_supported_model_seals_clean() {
+        use crate::kernel_registry::Backend;
+
+        let reg = crate::kernel_registry::Registry::new();
+        let loc = std::panic::Location::caller();
+        for kind in [QuantKind::Q4K, QuantKind::Q6K, QuantKind::Q8_0] {
+            shaped(kind, 64, 256).probe_kernels_for(&reg, Backend::Metal, "ffn_down", loc);
+        }
+        let report = reg.seal();
+        assert!(report.violations.is_empty(), "{}", report.render());
+    }
+
+    /// CUDA has matvec kernels and no batched GEMM, so a CUDA prefill is
+    /// a per-position matvec loop. That is a real, known slow path and
+    /// the registry must say so by name rather than leave it to a
+    /// comment in `apply_batch_with_acts`.
+    #[test]
+    fn cuda_prefill_is_recorded_as_a_per_position_matvec_loop() {
+        use crate::kernel_registry::{op, Backend, Outcome};
+
+        let reg = crate::kernel_registry::Registry::new();
+        let loc = std::panic::Location::caller();
+        shaped(QuantKind::Q4K, 64, 256).probe_kernels_for(&reg, Backend::Cuda, "ffn_down", loc);
+        let report = reg.seal();
+        assert!(report.entries.iter().any(|e| e.key.backend == Backend::Cuda
+            && e.key.op == op::MATVEC
+            && e.outcome == Outcome::Hit));
+        assert!(
+            report.entries.iter().any(|e| e.key.op == op::GEMM_PREFILL
+                && matches!(
+                    e.outcome,
+                    Outcome::Miss { fallback, .. } if fallback == "CUDA per-position matvec"
+                )),
+            "{}",
+            report.render()
+        );
+    }
+
+    /// An F32 weight has no quantized kernel by construction; the probe
+    /// records the host GEMV but must not call it a violation, or every
+    /// MoE router would fail a strict run.
+    #[test]
+    fn an_f32_weight_is_recorded_without_being_a_violation() {
+        use crate::kernel_registry::Backend;
+
+        let reg = crate::kernel_registry::Registry::new();
+        let m = WeightMatrix::F32(Tensor::new(vec![0.0; 64 * 32], vec![64, 32]));
+        m.probe_kernels_for(
+            &reg,
+            Backend::Metal,
+            "moe_router",
+            std::panic::Location::caller(),
+        );
+        let report = reg.seal();
+        assert!(!report.misses.is_empty());
+        assert!(report.violations.is_empty(), "{}", report.render());
     }
 }

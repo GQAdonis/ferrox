@@ -390,6 +390,64 @@ impl Lcg {
 }
 
 impl Decoder {
+    /// Eagerly resolve every kernel lookup this model's dispatch paths
+    /// will make, and record it in
+    /// [`ferrox_core::kernel_registry`] before anything runs.
+    ///
+    /// Call once, at the end of loading, immediately before
+    /// [`ferrox_core::kernel_registry::seal`]. Nothing here dispatches
+    /// or decides anything: it asks the same predicates the hot path
+    /// asks and writes the answers down, so a kernel that is missing
+    /// becomes a startup line instead of an unexplained benchmark row.
+    ///
+    /// Routed experts held in an [`ExpertBacking::Stored`] layer are not
+    /// probed -- they exist only as byte ranges until a token routes to
+    /// them, and materialising every expert here would defeat the
+    /// bounded expert store. Their kinds are the same as the resident
+    /// case, and a dispatch-site miss still trips the sealed registry.
+    pub fn probe_kernels(&self) {
+        use ferrox_core::kernel_registry as reg;
+
+        if !reg::enabled() {
+            return;
+        }
+        self.embedding.probe_kernels("token_embd");
+        self.output_head.probe_kernels("output_head");
+        for layer in &self.layers {
+            layer.attn.q_proj.probe_kernels("attn_q");
+            layer.attn.k_proj.probe_kernels("attn_k");
+            layer.attn.v_proj.probe_kernels("attn_v");
+            layer.attn.o_proj.probe_kernels("attn_o");
+            layer.moe.router.probe_kernels("moe_router");
+            for e in &layer.moe.shared_experts {
+                e.gate.probe_kernels("shexp_gate");
+                e.up.probe_kernels("shexp_up");
+                e.down.probe_kernels("shexp_down");
+            }
+            if let ExpertBacking::Resident(experts) = &layer.moe.experts {
+                for e in experts {
+                    e.gate.probe_kernels("ffn_gate");
+                    e.up.probe_kernels("ffn_up");
+                    e.down.probe_kernels("ffn_down");
+                }
+            }
+        }
+        // The generic decoder has a real batched prefill
+        // (`forward_hidden_batch`), so a `pp512` here is one GEMM per
+        // projection, not 512 matvecs. Recorded as a hit so that an
+        // engine which lacks it stands out as a miss rather than as an
+        // absence.
+        reg::record_build(
+            reg::Lookup::new(
+                ferrox_core::weight_matrix::active_backend(),
+                reg::op::ENGINE_PREFILL_BATCH,
+                None,
+            )
+            .with_role("generic_decoder"),
+            reg::Outcome::Hit,
+        );
+    }
+
     /// Builds a decoder with correctly-shaped, randomly initialized
     /// weights for `config`, but overrides `n_layers` and `vocab_size`
     /// with small test-scale numbers so it can actually be allocated and

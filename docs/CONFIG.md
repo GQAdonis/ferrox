@@ -40,5 +40,17 @@ library or overriding the CLI.
 | `FERROX_SSD_STREAMING` | `1` — stream MoE experts from disk |
 | `FERROX_GPU_VRAM_BUDGET_BYTES` | Cap GPU-resident MoE experts (`0` = CPU experts on Metal) |
 
+## Kernel-lookup registry
+
+Every kernel lookup the model will make is resolved once at load and
+recorded; the registry is then sealed, and a later lookup that misses and
+takes a fallback warns once with its call site. See
+`ferrox_core::kernel_registry`.
+
+| Variable | Purpose |
+|---|---|
+| `FERROX_KERNEL_REGISTRY` | `1` — print the whole load-time kernel table (one line per backend × op × quant kind, with the tensor role and the fallback). `0` — record nothing. Default: record, print only the misses that will run off the selected accelerator |
+| `FERROX_STRICT_KERNELS` | `1` — refuse to load a model whose weights have no kernel on the selected accelerator, instead of running it on a slower path. Set this in CI and in benchmark harnesses so a number cannot be published for a backend it was not taken on |
+
 Debug switches (`FERROX_METAL_FA_VEC`, `FERROX_METAL_LOGITS`, …) live next
 to the code and may change without notice.

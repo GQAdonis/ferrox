@@ -260,6 +260,38 @@ pub fn metal_dense_enabled() -> bool {
     })
 }
 
+/// `FERROX_METAL_MATMUL=1` opts into the first-cut Q4/Q6 matmul kernels,
+/// which can lose to N x matvec for typical chat prompts.
+///
+/// Read once. These sit inside `apply_gpu_batch`, i.e. once per GEMM per
+/// layer per forward pass -- `std::env::var` allocates a `String` and
+/// takes the environment lock every time.
+#[cfg(feature = "metal")]
+fn metal_matmul_opt_in() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| {
+        matches!(
+            std::env::var("FERROX_METAL_MATMUL").ok().as_deref(),
+            Some("1") | Some("true") | Some("on")
+        )
+    })
+}
+
+/// Weight-reuse `mul_mm` for prefill. Default on; `FERROX_METAL_MUL_MM=0`
+/// forces the N x matvec batch. Read once, same reason as above.
+#[cfg(feature = "metal")]
+fn metal_mul_mm_enabled() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| {
+        !matches!(
+            std::env::var("FERROX_METAL_MUL_MM").ok().as_deref(),
+            Some("0") | Some("false") | Some("off")
+        )
+    })
+}
+
 /// Whether dense [`WeightMatrix::apply`] should try CUDA first (when
 /// built with `--features cuda`).
 ///
@@ -2535,20 +2567,12 @@ impl WeightMatrix {
         // First-cut Q4/Q6 matmul kernels can lose to N× matvec on Host B
         // for typical chat prompts (8B fair: ~17 vs ~21 prompt tok/s).
         // Opt in with FERROX_METAL_MATMUL=1 once tiling improves.
-        let use_matmul = batch_size >= 2
-            && matches!(
-                std::env::var("FERROX_METAL_MATMUL").ok().as_deref(),
-                Some("1") | Some("true") | Some("on")
-            );
+        let use_matmul = batch_size >= 2 && metal_matmul_opt_in();
         // Weight-reuse mul_mm for prefill batch ≥ 4 (Q4_0 / Q4_K / Q6_K).
         // Default **on**; `FERROX_METAL_MUL_MM=0` forces N× matvec batch.
         // Threshold 4 (was 8) covers shorter prompts without changing the
         // decode path (batch_size == 1 still uses matvec).
-        let use_mul_mm = batch_size >= 4
-            && !matches!(
-                std::env::var("FERROX_METAL_MUL_MM").ok().as_deref(),
-                Some("0") | Some("false") | Some("off")
-            );
+        let use_mul_mm = batch_size >= 4 && metal_mul_mm_enabled();
         if use_mul_mm {
             match kind {
                 QuantKind::Q4_0 => {

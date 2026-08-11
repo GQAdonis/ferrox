@@ -4956,6 +4956,9 @@ pub(crate) struct ResidentWeightBuffer {
     /// mmap-backed weights never hit that, but owned `WeightBytes` and
     /// short-lived test fixtures do. Checked on every cache hit.
     fingerprint: u64,
+    /// True when this entry aliases a registered mmap (see the lazy
+    /// fingerprint note in `resident_weight_buffer`).
+    mmap_backed: bool,
     /// Keeps the registered mmap MTLBuffer entry alive for NoCopy aliases.
     _keepalive: Option<Arc<ResidentMmapFile>>,
 }
@@ -5016,9 +5019,19 @@ pub(crate) fn resident_weight_buffer(
     weights: &[u8],
 ) -> Result<Arc<ResidentWeightBuffer>, MetalError> {
     let key = (weights.as_ptr() as usize, weights.len());
-    let fingerprint = weight_fingerprint(weights);
+    // The fingerprint guards against an address being freed and reused
+    // by different bytes. That cannot happen to a registered mmap: the
+    // cached entry holds an `Arc<ResidentMmapFile>` keeping the mapping
+    // alive, so the range stays valid and unchanged for as long as the
+    // entry does. Every real GGUF weight takes that path, and computing
+    // the fingerprint touches 64 pages -- per weight, per call, on the
+    // hot side of the cache lookup. So compute it lazily, only for the
+    // owned/unregistered slices that can actually alias.
+    let fingerprint_of = |c: &ResidentWeightBuffer| -> bool {
+        c.mmap_backed || c.fingerprint == weight_fingerprint(weights)
+    };
     if let Some(cached) = TL_WEIGHT_CACHE.with(|c| c.borrow().get(&key).cloned()) {
-        if cached.fingerprint == fingerprint {
+        if fingerprint_of(&cached) {
             return Ok(cached);
         }
         // Address reused by different bytes: drop the stale alias and
@@ -5030,7 +5043,7 @@ pub(crate) fn resident_weight_buffer(
     let cached = {
         let mut guard = WEIGHT_CACHE.lock().unwrap();
         let cache = guard.get_or_insert_with(HashMap::new);
-        if let Some(cached) = cache.get(&key).filter(|c| c.fingerprint == fingerprint) {
+        if let Some(cached) = cache.get(&key).filter(|c| fingerprint_of(c)) {
             cached.clone()
         } else {
             let budget = weight_cache_budget_bytes();
@@ -5173,8 +5186,9 @@ fn build_resident_weight_buffer(
             return Ok(ResidentWeightBuffer {
                 buffer: file.buffer.clone(),
                 weight_offset: offset,
-                nbytes: 0, // aliased: no cache-budget cost
-                fingerprint: weight_fingerprint(weights),
+                nbytes: 0,      // aliased: no cache-budget cost
+                fingerprint: 0, // unused: mmap ranges cannot alias
+                mmap_backed: true,
                 _keepalive: Some(file),
             });
         }
@@ -5195,6 +5209,7 @@ fn build_resident_weight_buffer(
         weight_offset: 0,
         nbytes: weights.len(),
         fingerprint: weight_fingerprint(weights),
+        mmap_backed: false,
         _keepalive: None,
     })
 }

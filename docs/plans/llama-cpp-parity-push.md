@@ -185,6 +185,60 @@ IQ4_XS 1.60x, Llama-3.2-1B 1.53x. Owned by 2a, which is blocked on 2a-0.
 **Metal decode — 1 row**: OLMoE 1.46x. Everything else is at or ahead of
 parity.
 
+## Debuggability: per-layer divergence, not just per-output
+
+`ferrox verify` (landed) compares greedy token ids between the CPU
+reference and a GPU backend. It answers *whether* a backend is wrong. It
+does not answer *where*, and that is most of the work: the d=64 softcap
+race took a full investigation to localise even though the symptom was
+obvious, because the only observable was the final logits.
+
+**Adopt a layer-by-layer divergence comparator, environment-gated so it
+costs nothing when off.** The shape that works elsewhere:
+
+- A reference forward in f32 with per-layer hooks, run against the
+  backend under test.
+- Per layer, per tensor of interest (prenorm hidden state, attention
+  output, FFN output, residual sum): magnitude ratio and top-K overlap
+  against the reference, not just max-abs-diff — a ratio catches a
+  scale bug that an absolute threshold sized for the output tensor
+  misses at layer 2.
+- Print the first layer whose ratio leaves a band, then stop. That index
+  is the diagnosis.
+- Gate every dump behind an env var checked once, so the instrumentation
+  is not in the hot path when unset (the same `OnceLock` discipline the
+  Metal env reads now use).
+
+Also worth taking: **MoE routing dumps** — gate logits, chosen expert ids
+and per-expert output magnitudes per layer. MoE is ferrox's worst family
+on every axis, and today there is no way to see whether a bad row is a
+routing bug or a kernel bug. The Qwen shared-expert bug (40% of the
+active FFN silently skipped) is exactly the class of defect this makes
+visible immediately, and it went unnoticed until a code audit found it.
+
+Neither is a performance change. Both are prerequisites for doing the
+performance changes quickly and for not shipping another green row that
+computes the wrong thing.
+
+## Memory: what actually decides which models fit
+
+Roadmap item 1 ("run bigger models on the same hardware") has no concrete
+mechanism attached beyond the existing residency plan. Two that do:
+
+- **Per-layer precision mixing.** Keep boundary layers (embedding-adjacent
+  and final) at higher precision and quantize the middle harder, rather
+  than applying one format uniformly. This changes which models fit
+  without the quality cliff of dropping the whole model a tier — the
+  usual argument for it is that first and last layers are the most
+  sensitive to quantization error.
+- **Paged / block-sparse KV with page-index prefetch.** ferrox's KV is
+  contiguous per sequence. Paging it decouples the KV budget from the
+  context length reserved up front, which is the thing that currently
+  forces a smaller context or a smaller model.
+
+Both are large. They are recorded here because item 1 currently names a
+goal without naming a mechanism, and these are the two mechanisms.
+
 ## Status of the previous plan
 
 Phases 0–3 of the prior plan are **done** and their rows moved: Metal dense

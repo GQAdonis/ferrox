@@ -1629,8 +1629,13 @@ kernel void gqa_prefill_fa_nq4_d64(
 }
 "#;
 
-/// llama `kernel_flash_attn_ext` for d=64: QN=8, C=64, NSG=4, simdgroup MMA.
-/// K/V staged from Ferrox [seq,kv_head,dim] into [dim,seq] tiles (llama quant path).
+/// llama `kernel_flash_attn_ext` tiling for d=64 (QN=8, C=64, NSG=4) with a
+/// **scalar** `dot` + `simd_sum` score phase and a scalar P·V gather — despite
+/// the name there is no simdgroup MMA in here.
+///
+/// Superseded by [`GQA_PREFILL_FA_EXT_MMA_D64_KERNEL_SRC`], which is now the
+/// default. Kept reachable via `FERROX_METAL_FA_MMA=0`: it is the reference the
+/// MMA kernel is diffed against in `gqa_prefill_fa_ext_mma_matches_scalar_d64`.
 const GQA_PREFILL_FA_EXT_D64_KERNEL_SRC: &str = r#"
 #include <metal_stdlib>
 using namespace metal;
@@ -1795,6 +1800,277 @@ kernel void gqa_prefill_fa_ext_d64(
                 lo += float4(v4[tiisg]) * ss[j * SH + cc];
             }
             so4[tiisg] += lo;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // Each SG writes its NQ queries (no cross-SG KV reduce — llama layout).
+    for (uint jj = 0u; jj < NQ; jj++) {
+        const uint j = jj * NSG + sgitg;
+        if (j >= n_local || !own) continue;
+        const float inv = (S[jj] == 0.0f) ? 0.0f : (1.0f / S[jj]);
+        device float4* out4 =
+            (device float4*)(out + ((qi0 + j) * n_heads + h) * D);
+        threadgroup float4* so4 = (threadgroup float4*)(so + j * D);
+        out4[tiisg] = so4[tiisg] * inv;
+    }
+}
+"#;
+
+/// llama `kernel_flash_attn_ext` for d=64, ported with **real 8×8 simdgroup
+/// MMA** on both Q·Kᵀ and P·V (`ggml-metal.metal`, `kernel_flash_attn_ext_impl`
+/// — Q·Kᵀ at :6693-6729, P·V at :6841-6910; d=64 instantiation at :7126).
+///
+/// Shape is llama's: QN=8 queries and C=64 keys per threadgroup, NSG=4
+/// simdgroups, `ss[QN][2C]` scores, `so[QN][64]` accumulator. The predecessor
+/// [`GQA_PREFILL_FA_EXT_D64_KERNEL_SRC`] had the same *tiling* but computed
+/// scores with one `dot`+`simd_sum` per (query,key) inside a single simdgroup
+/// with 16 of 32 lanes live — 16 of 128 threads doing arithmetic. Here all
+/// four simdgroups run MMA over disjoint 8-key column blocks of `ss`, and P·V
+/// runs over disjoint 8-wide column blocks of `so`.
+///
+/// Two things differ from llama and are load-bearing:
+///
+/// 1. **Where scale/softcap/mask are applied.** llama has an explicit mask
+///    tensor and folds `scale`/`softcap`/`mask` into the online-softmax loop.
+///    The predecessor kernel had to fold them into the *score* loop instead,
+///    because an earlier version ran them as a separate all-simdgroups pass
+///    over shared `ss` slots: a read-modify-write with four readers and four
+///    writers and no barrier between them, which double-softcapped whichever
+///    slots lost the race (see the comment on the scalar kernel). MMA scores
+///    are written by `simdgroup_store`, so that fold is no longer possible —
+///    they move back into the softmax loop, which is safe for the reason
+///    llama's is: there each `ss` slot has exactly **one** owner
+///    (`j = jj*NSG + sgitg` picks disjoint rows per simdgroup, `tiisg` picks
+///    disjoint `float2` columns per lane), so the RMW has a single writer.
+///    Any future edit must preserve that ownership, not the `sgitg == 0` guard
+///    it replaces.
+///
+/// 2. **Tail handling.** `simdgroup_load` reads a full 8 rows of K/V, so the
+///    last partial group of a cache whose length is not a multiple of 8 would
+///    read past the end of the buffer. llama pre-pads its KV cache; Ferrox's
+///    is exactly `kv_prefix_len + n_q` rows, so instead the ≤7 leftover rows
+///    are staged once into a zero-filled `kpad`/`vpad` tile in threadgroup
+///    memory and the MMA reads that. Groups entirely past the cache are
+///    skipped: the causal mask forces their `ss` columns to `-INFINITY`
+///    (`ic + cc >= kv_valid >= clen`), hence P = 0, hence no P·V contribution.
+const GQA_PREFILL_FA_EXT_MMA_D64_KERNEL_SRC: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+kernel void gqa_prefill_fa_ext_mma_d64(
+    device const float* q [[buffer(0)]],
+    device const half* k_cache [[buffer(1)]],
+    device const half* v_cache [[buffer(2)]],
+    device float* out [[buffer(3)]],
+    constant uint& n_heads [[buffer(4)]],
+    constant uint& n_kv_heads [[buffer(5)]],
+    constant uint& head_dim [[buffer(6)]],
+    constant uint& n_q [[buffer(7)]],
+    constant uint& kv_prefix_len [[buffer(8)]],
+    constant float& softcap [[buffer(9)]],
+    uint2 tgpig [[threadgroup_position_in_grid]],
+    ushort tiisg [[thread_index_in_simdgroup]],
+    ushort sgitg [[simdgroup_index_in_threadgroup]],
+    threadgroup float* shared [[threadgroup(0)]]
+) {
+    constexpr uint D = 64u;          // DK == DV == PV
+    constexpr uint D4 = 16u;         // D / 4
+    constexpr uint D8 = 8u;          // D / 8: 8-wide MMA steps along the head
+    constexpr uint QN = 8u;          // queries per threadgroup
+    constexpr uint C = 64u;          // keys per threadgroup chunk
+    constexpr uint NW = 32u;
+    constexpr uint NSG = 4u;
+    constexpr uint NQ = QN / NSG;    // softmax rows per simdgroup
+    constexpr uint SH = 2u * C;      // ss row stride
+    constexpr uint CB = C / 8u;      // 8-key blocks per chunk
+    constexpr uint NC = CB / NSG;    // score blocks per simdgroup
+    constexpr uint NO = D8 / NSG;    // output column blocks per simdgroup
+
+    const uint h = tgpig.x;
+    const uint qi0 = tgpig.y * QN;
+    if (h >= n_heads || qi0 >= n_q || head_dim != D) return;
+
+    const uint group_size = n_heads / max(n_kv_heads, 1u);
+    const uint kv_h = h / max(group_size, 1u);
+    const uint kv_stride = n_kv_heads * D;
+    const float scale = 1.0f / sqrt(float(D));
+    const uint n_local = min(QN, n_q - qi0);
+    const bool own = tiisg < D4;
+
+    // sq[QN,D] f32 | so[QN,D] f32 | ss[QN,SH] f32 | kpad[8,D] f16 | vpad[8,D] f16
+    threadgroup float* sq = shared;
+    threadgroup float* so = shared + QN * D;
+    threadgroup float* ss = shared + 2u * QN * D;
+    threadgroup half* kpad = (threadgroup half*)(shared + 2u * QN * D + QN * SH);
+    threadgroup half* vpad = kpad + 8u * D;
+
+    // Rows of K/V that physically exist, and the 8-row-aligned prefix of them
+    // that `simdgroup_load` may read straight out of device memory.
+    const uint kv_valid = kv_prefix_len + n_q;
+    const uint kv_full = (kv_valid / 8u) * 8u;
+    const uint kv_rem = kv_valid - kv_full;
+
+    for (uint j = 0u; j < QN; j++) {
+        const uint gqi = qi0 + j;
+        threadgroup float4* sq4 = (threadgroup float4*)(sq + j * D);
+        if (gqi < n_q) {
+            device const float4* q4 =
+                (device const float4*)(q + (gqi * n_heads + h) * D);
+            for (uint i = tiisg; i < D4; i += NW) sq4[i] = q4[i];
+        } else {
+            // Zero query rows: their MMA scores are 0, the softmax skips them,
+            // and nothing reads their `so` rows back out.
+            for (uint i = tiisg; i < D4; i += NW) sq4[i] = float4(0.0f);
+        }
+        if (own) {
+            threadgroup float4* so4 = (threadgroup float4*)(so + j * D);
+            so4[tiisg] = float4(0.0f);
+        }
+    }
+
+    if (kv_rem > 0u) {
+        const uint tid = uint(sgitg) * NW + uint(tiisg);
+        for (uint idx = tid; idx < 8u * D; idx += NSG * NW) {
+            const uint r = idx / D;
+            const uint c = idx - r * D;
+            half kk = (half)0.0f;
+            half vv = (half)0.0f;
+            if (r < kv_rem) {
+                const uint base = (kv_full + r) * kv_stride + kv_h * D + c;
+                kk = k_cache[base];
+                vv = v_cache[base];
+            }
+            kpad[idx] = kk;
+            vpad[idx] = vv;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float S[NQ];
+    float M[NQ];
+    for (uint jj = 0u; jj < NQ; jj++) {
+        S[jj] = 0.0f;
+        M[jj] = -INFINITY;
+    }
+
+    uint max_causal = 0u;
+    for (uint j = 0u; j < n_local; j++) {
+        max_causal = max(max_causal, kv_prefix_len + qi0 + j + 1u);
+    }
+    if (max_causal == 0u) return;
+
+    for (uint ic0 = 0u; ; ic0++) {
+        const uint ic = ic0 * C;
+        if (ic >= max_causal) break;
+
+        // Q·Kᵀ — 8x8 MMA. Simdgroup `sgitg` owns key blocks
+        // {sgitg, sgitg + NSG}, i.e. ss columns [8g, 8g+8): disjoint, so
+        // `simdgroup_store` is a single writer per slot.
+        for (uint cb = 0u; cb < NC; cb++) {
+            const uint g = uint(sgitg) + cb * NSG;
+            const uint key0 = ic + 8u * g;
+            simdgroup_float8x8 mqk = make_filled_simdgroup_matrix<float, 8>(0.0f);
+            if (key0 + 8u <= kv_full) {
+                device const half* pk = k_cache + key0 * kv_stride + kv_h * D;
+                for (uint i = 0u; i < D8 / 2u; i++) {
+                    simdgroup_float8x8 mq0, mq1;
+                    simdgroup_half8x8 mk0, mk1;
+                    simdgroup_load(mq0, sq + 16u * i, D);
+                    simdgroup_load(mq1, sq + 16u * i + 8u, D);
+                    // transpose: [key,dim] -> [dim,key]
+                    simdgroup_load(mk0, pk + 16u * i, kv_stride, 0, true);
+                    simdgroup_load(mk1, pk + 16u * i + 8u, kv_stride, 0, true);
+                    simdgroup_multiply_accumulate(mqk, mq0, mk0, mqk);
+                    simdgroup_multiply_accumulate(mqk, mq1, mk1, mqk);
+                }
+            } else if (key0 == kv_full && kv_rem > 0u) {
+                threadgroup const half* pk = kpad;
+                for (uint i = 0u; i < D8 / 2u; i++) {
+                    simdgroup_float8x8 mq0, mq1;
+                    simdgroup_half8x8 mk0, mk1;
+                    simdgroup_load(mq0, sq + 16u * i, D);
+                    simdgroup_load(mq1, sq + 16u * i + 8u, D);
+                    simdgroup_load(mk0, pk + 16u * i, D, 0, true);
+                    simdgroup_load(mk1, pk + 16u * i + 8u, D, 0, true);
+                    simdgroup_multiply_accumulate(mqk, mq0, mk0, mqk);
+                    simdgroup_multiply_accumulate(mqk, mq1, mk1, mqk);
+                }
+            } else {
+                // Entirely past the cache: every column here is masked below.
+                continue;
+            }
+            simdgroup_store(mqk, ss + 8u * g, SH, 0, false);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Online softmax. Single-writer per ss slot: row j is owned by one
+        // simdgroup, column pair `tiisg` by one lane. scale/softcap/causal
+        // mask are applied here, on a value read once and written once.
+        for (uint jj = 0u; jj < NQ; jj++) {
+            const uint j = jj * NSG + sgitg;
+            if (j >= n_local) continue;
+            threadgroup float2* ss2 = (threadgroup float2*)(ss + j * SH);
+            float2 s2 = ss2[tiisg] * scale;
+            if (softcap > 0.0f) s2 = softcap * tanh(s2 / softcap);
+            const uint clen = kv_prefix_len + qi0 + j + 1u;
+            const uint c0 = ic + 2u * uint(tiisg);
+            // `cc >= chunk` is subsumed: it implies ic+cc >= max_causal >= clen.
+            if (c0 >= clen) s2[0] = -INFINITY;
+            if (c0 + 1u >= clen) s2[1] = -INFINITY;
+
+            const float m = M[jj];
+            M[jj] = simd_max(max(m, max(s2[0], s2[1])));
+            const float ms = (m == -INFINITY) ? 0.0f : exp(m - M[jj]);
+            const float2 vs2 = float2(
+                (s2[0] == -INFINITY) ? 0.0f : exp(s2[0] - M[jj]),
+                (s2[1] == -INFINITY) ? 0.0f : exp(s2[1] - M[jj])
+            );
+            S[jj] = S[jj] * ms + simd_sum(vs2[0] + vs2[1]);
+            ss2[tiisg] = vs2;
+
+            if (own) {
+                threadgroup float4* so4 = (threadgroup float4*)(so + j * D);
+                so4[tiisg] *= ms;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // O += P·V — 8x8 MMA. Simdgroup `sgitg` owns output columns
+        // {8*sgitg + 8*NSG*ii}, disjoint across simdgroups; every simdgroup
+        // walks all CB key blocks.
+        {
+            simdgroup_float8x8 lo[NO];
+            for (uint ii = 0u; ii < NO; ii++) {
+                simdgroup_load(lo[ii], so + 8u * sgitg + 8u * NSG * ii, D, 0, false);
+            }
+            for (uint cc = 0u; cc < CB; cc++) {
+                const uint key0 = ic + 8u * cc;
+                const bool fullblk = (key0 + 8u <= kv_full);
+                const bool padblk = (key0 == kv_full) && (kv_rem > 0u);
+                if (!fullblk && !padblk) continue;
+                simdgroup_float8x8 vs;
+                simdgroup_load(vs, ss + 8u * cc, SH, 0, false);
+                if (fullblk) {
+                    device const half* pv =
+                        v_cache + key0 * kv_stride + kv_h * D + 8u * sgitg;
+                    for (uint ii = 0u; ii < NO; ii++) {
+                        simdgroup_half8x8 mv;
+                        simdgroup_load(mv, pv + 8u * NSG * ii, kv_stride, 0, false);
+                        simdgroup_multiply_accumulate(lo[ii], vs, mv, lo[ii]);
+                    }
+                } else {
+                    threadgroup const half* pv = vpad + 8u * sgitg;
+                    for (uint ii = 0u; ii < NO; ii++) {
+                        simdgroup_half8x8 mv;
+                        simdgroup_load(mv, pv + 8u * NSG * ii, D, 0, false);
+                        simdgroup_multiply_accumulate(lo[ii], vs, mv, lo[ii]);
+                    }
+                }
+            }
+            for (uint ii = 0u; ii < NO; ii++) {
+                simdgroup_store(lo[ii], so + 8u * sgitg + 8u * NSG * ii, D, 0, false);
+            }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
@@ -3566,15 +3842,26 @@ fn encode_gqa_prefill_fa_ext_d64(
     const D: u32 = 64;
     const NSG: u32 = 4;
     const SH: u32 = 2 * C;
-    let pipe = ensure_pipeline(
-        device,
-        GQA_PREFILL_FA_EXT_D64_KERNEL_SRC,
-        "gqa_prefill_fa_ext_d64",
-    )?;
+    let mma = gqa_prefill_fa_mma_d64_enabled();
+    let pipe = if mma {
+        ensure_pipeline(
+            device,
+            GQA_PREFILL_FA_EXT_MMA_D64_KERNEL_SRC,
+            "gqa_prefill_fa_ext_mma_d64",
+        )?
+    } else {
+        ensure_pipeline(
+            device,
+            GQA_PREFILL_FA_EXT_D64_KERNEL_SRC,
+            "gqa_prefill_fa_ext_d64",
+        )?
+    };
     encoder.setComputePipelineState(&pipe.0);
     let tg = 32 * NSG;
-    // sq[QN,D] + so[QN,D] + ss[QN,SH]
-    let tg_mem = ((2 * QN * D + QN * SH) * 4) as usize;
+    // sq[QN,D] + so[QN,D] + ss[QN,SH], plus kpad[8,D]+vpad[8,D] as f16 for the
+    // MMA variant's ≤7-row cache tail.
+    let tg_mem =
+        ((2 * QN * D + QN * SH) * 4) as usize + if mma { (2 * 8 * D * 2) as usize } else { 0 };
     unsafe {
         encoder.setBuffer_offset_atIndex(Some(q), 0, 0);
         encoder.setBuffer_offset_atIndex(Some(k), 0, 1);
@@ -3623,6 +3910,17 @@ fn gqa_prefill_fa_ext_d64_enabled() -> bool {
     !matches!(
         std::env::var("FERROX_METAL_FA_EXT").ok().as_deref(),
         Some("0") | Some("false") | Some("off") | Some("vec")
+    )
+}
+
+/// Simdgroup-MMA score + P·V inside the d=64 `fa_ext` kernel. Default on.
+/// `FERROX_METAL_FA_MMA=0` selects the scalar `dot`+`simd_sum` predecessor,
+/// which computes the same thing and is the A/B reference for both the
+/// correctness diff and any timing comparison.
+fn gqa_prefill_fa_mma_d64_enabled() -> bool {
+    !matches!(
+        std::env::var("FERROX_METAL_FA_MMA").ok().as_deref(),
+        Some("0") | Some("false") | Some("off") | Some("scalar")
     )
 }
 
@@ -8236,10 +8534,21 @@ mod tests {
     fn gqa_prefill_fa_ext_d64_matches_cpu() {
         std::env::set_var("FERROX_METAL_FA_VEC", "1");
         std::env::set_var("FERROX_METAL_FA_EXT", "1");
+        // Shapes chosen around the MMA kernel's 8-row K/V granularity:
+        // kv_valid = kv_prefix_len + n_q is 49 / 65 / 49 / 128 / 137 / 8 /
+        // 128 / 64, covering both the padded tail (kv_valid % 8 != 0) and the
+        // exact fit, at 1, 2 and 3 chunks of C=64 keys. The last two are the
+        // prefix-cache shape: a long shared prefix with a short new batch, so
+        // whole key blocks sit past `max_causal` and must contribute nothing.
         let cases = [
             (9usize, 3usize, 64usize, 40usize, 9usize, Some(50.0f32)),
             (8usize, 4usize, 64usize, 65usize, 0usize, None),
             (8usize, 4usize, 64usize, 40usize, 9usize, Some(50.0f32)),
+            (8usize, 4usize, 64usize, 128usize, 0usize, None),
+            (6usize, 2usize, 64usize, 130usize, 7usize, Some(30.0f32)),
+            (4usize, 4usize, 64usize, 8usize, 0usize, None),
+            (8usize, 4usize, 64usize, 8usize, 120usize, None),
+            (8usize, 2usize, 64usize, 9usize, 55usize, Some(20.0f32)),
         ];
         for (n_heads, n_kv_heads, head_dim, n_q, kv_prefix_len, softcap) in cases {
             let total = kv_prefix_len + n_q;
@@ -8354,6 +8663,79 @@ mod tests {
             max_diff <= 1e-4,
             "fa_ext vs fa_vec max_diff={max_diff} worst={worst:?}"
         );
+    }
+
+    /// The MMA kernel against the scalar `dot`+`simd_sum` predecessor it
+    /// replaces, on the same inputs. Both are `fa_ext`, so this isolates the
+    /// MMA rewrite from every other difference (tiling, softmax, epilogue).
+    #[test]
+    #[ignore = "needs a real Metal GPU"]
+    fn gqa_prefill_fa_ext_mma_matches_scalar_d64() {
+        std::env::set_var("FERROX_METAL_FA_VEC", "1");
+        std::env::set_var("FERROX_METAL_FA_EXT", "1");
+        // The MMA pipeline must exist: a compile failure here would otherwise
+        // surface as a `.expect()` panic that reads like a device problem.
+        {
+            let shared = shared_metal().expect("metal device");
+            ensure_pipeline(
+                &shared.device,
+                GQA_PREFILL_FA_EXT_MMA_D64_KERNEL_SRC,
+                "gqa_prefill_fa_ext_mma_d64",
+            )
+            .expect("fa_ext MMA pipeline compiles");
+        }
+        let cases = [
+            (9usize, 3usize, 64usize, 40usize, 9usize, Some(50.0f32)),
+            (8usize, 4usize, 64usize, 128usize, 0usize, None),
+            (6usize, 2usize, 64usize, 130usize, 7usize, Some(30.0f32)),
+            (8usize, 8usize, 64usize, 65usize, 0usize, None),
+            (8usize, 4usize, 64usize, 8usize, 120usize, None),
+            (8usize, 2usize, 64usize, 9usize, 55usize, Some(20.0f32)),
+        ];
+        for (n_heads, n_kv_heads, head_dim, n_q, kv_prefix_len, softcap) in cases {
+            let total = kv_prefix_len + n_q;
+            let q: Vec<f32> = (0..n_q * n_heads * head_dim)
+                .map(|i| (i as f32 * 0.07).sin())
+                .collect();
+            let k: Vec<f32> = (0..total * n_kv_heads * head_dim)
+                .map(|i| (i as f32 * 0.03).cos())
+                .collect();
+            let v: Vec<f32> = (0..total * n_kv_heads * head_dim)
+                .map(|i| (i as f32 * 0.05).sin())
+                .collect();
+            let run = |mma: &str| {
+                std::env::set_var("FERROX_METAL_FA_MMA", mma);
+                launch_gqa_prefill_host_ex(
+                    &q,
+                    &k,
+                    &v,
+                    n_heads,
+                    n_kv_heads,
+                    head_dim,
+                    n_q,
+                    kv_prefix_len,
+                    softcap,
+                )
+                .expect("fa_ext")
+            };
+            let scalar = run("0");
+            let mma = run("1");
+            std::env::remove_var("FERROX_METAL_FA_MMA");
+            let mut max_diff = 0f32;
+            let mut worst = (0usize, 0f32, 0f32);
+            for (i, (a, b)) in scalar.iter().zip(mma.iter()).enumerate() {
+                let d = (a - b).abs();
+                if d > max_diff {
+                    max_diff = d;
+                    worst = (i, *a, *b);
+                }
+            }
+            assert!(
+                max_diff <= 1e-4,
+                "mma vs scalar hd={head_dim} n_q={n_q} pre={kv_prefix_len} \
+                 sc={softcap:?} max_diff={max_diff} worst={worst:?}"
+            );
+        }
     }
 
     #[test]

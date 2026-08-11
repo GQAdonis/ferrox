@@ -391,6 +391,16 @@ mod tests {
             engine_logits = Engine::forward_token(&decoder, tok, pos, &mut engine_state);
         }
 
-        assert_eq!(engine_logits, ground_truth);
+        // Tight tolerance, not bit equality: batched prefill runs the
+        // blocked three-pass softmax while per-token decode keeps the
+        // online accumulator, and the two round differently in the last
+        // ulp (they were bit-identical only while both were online).
+        assert_eq!(engine_logits.len(), ground_truth.len());
+        for (i, (e, g)) in engine_logits.iter().zip(ground_truth.iter()).enumerate() {
+            assert!(
+                (e - g).abs() < 1e-5,
+                "logit {i}: engine {e} vs forward_batch {g}"
+            );
+        }
     }
 }

@@ -145,6 +145,24 @@ regresses another has not made the engine faster — it has moved the gap. The
 `--render` diff is the artifact that proves otherwise, and it belongs in the
 commit that made the change.
 
+**Regenerating the ledger is not optional and is never deferred.** It is part
+of landing a change, not a follow-up to schedule or a question to ask. Two ways
+this has actually gone wrong:
+
+- Phase 1 (PRs #2–#8) landed eight kernel changes on x86, where every
+  aarch64-gated kernel is compiled out, so none of them could be measured and
+  none of them were. `RESULTS.md` then advertised CPU `pp512` at 3.2–5.8×
+  behind for days after the real figure had become 0.83–1.87×. Work that
+  cannot be measured on the host that wrote it is not landed; it is staged.
+- Spot-checking new ferrox numbers against the *stale* llama numbers already
+  in `RESULTS.md` produced a confident and wrong "ferrox is ahead" claim. Both
+  engines must be measured in the same session. `--compare` does this; reading
+  the old table does not.
+
+If the box is too loaded to measure (`uptime` above ~2.0), wait for it. Do not
+substitute a spot-check, and do not publish a number taken under load — known-
+good rows read 25–45% low, which is larger than most of the gaps being chased.
+
 ---
 
 ## Phase 1 — CPU prefill (largest gaps in the ledger: 3.5×–11×)

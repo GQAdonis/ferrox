@@ -3,10 +3,10 @@
   "arch": "gemma4",
   "backend": "cpu",
   "backend_active": "CPU",
-  "ferrox_version": "0.3.0",
+  "ferrox_version": "0.4.0",
   "id": "gemma4_e2b_q4km",
   "kind": "engine",
-  "load_s": 0.092784708,
+  "load_s": 0.094854708,
   "model_path": "models/gemma-4-E2B-it-Q4_K_M.gguf",
   "quant": "quantized",
   "reps": 3,
@@ -15,24 +15,24 @@
   "tests": [
     {
       "ferrox_samples": [
-        22.752806258132697,
-        16.875988621081735,
-        21.657070136261705
+        22.278892220376186,
+        22.51878079204781,
+        22.713194606721085
       ],
-      "ferrox_stddev": 2.551608722240447,
-      "ferrox_tps": 21.657070136261705,
+      "ferrox_stddev": 0.1776268939032167,
+      "ferrox_tps": 22.51878079204781,
       "gap": null,
       "llama_tps": null,
       "test": "pp512"
     },
     {
       "ferrox_samples": [
-        27.434032270673594,
-        26.27282560946911,
-        26.252422359978077
+        27.12792834263697,
+        26.721006109442612,
+        27.178526319057873
       ],
-      "ferrox_stddev": 0.552269980642452,
-      "ferrox_tps": 26.27282560946911,
+      "ferrox_stddev": 0.20479545385909267,
+      "ferrox_tps": 27.12792834263697,
       "gap": null,
       "llama_tps": null,
       "test": "tg128"

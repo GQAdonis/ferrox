@@ -341,9 +341,51 @@ one commit, one `waitUntilCompleted` for all layers
 (`ggml-metal-context.m:463-466`). Ferrox is ahead here; graph pre-encoding is
 now the *last* item, not a prerequisite.
 
+### 2a-0. First: `gqa_prefill_fa_ext_d64` is red (blocking 2a)
+
+Two `--ignored` GPU tests fail at the v0.4.0 tag, and have been failing
+unnoticed because `cargo test --workspace` does not run ignored tests:
+
+```
+gqa_prefill_fa_ext_d64_matches_cpu
+  hd=64 n_q=40 pre=9 sc=Some(50.0) max_diff=0.286
+  worst=(542, 0.37141415, 0.085109815) tol=0.005
+gqa_prefill_fa_ext_matches_fa_vec_d64
+  fa_ext vs fa_vec max_diff=0.286  (same element, same values)
+```
+
+0.371 vs 0.085 is a factor of 4.4 on one output element — wrong attention,
+not rounding, and the two tests agree on which element. The failing shape is
+d=64 **with softcap and a nonzero KV prefix**; no model in the suite hits it
+(Gemma uses softcap but d=256), and all three d=64 suite models — SmolLM2,
+TinyLlama, Llama-3.2-1B — generate correct text on Metal. So no published row
+is invalid. But the kernel is default-on for d=64 / n_q>=8, so the next d=64
+model with softcap would be silently wrong.
+
+Fix this before rewriting the kernel for MMA. Rewriting on top of a red test
+means never knowing which failure the rewrite introduced.
+
+**Also add `--ignored` GPU tests to a checked runbook.** They are the only
+tests that exercise Metal at all, and nothing in the normal test command runs
+them:
+
+```bash
+cargo test -p ferrox-metal --features metal -- --ignored --test-threads=1
+```
+
+(`--test-threads=1` matters: the resident weight cache is keyed by
+`(pointer, length)` plus a content fingerprint, and concurrent fixtures of
+equal size do collide on address reuse.)
+
 ### 2a. Port `kernel_flash_attn_ext` MMA (blocking for sub-1.5B ≤1×)
 
 `grep -c "simdgroup_multiply_accumulate\|simdgroup_half8x8" attn.rs` → **0**.
+
+**Measured note on the score phase:** naively widening it from
+`if (sgitg == 0u)` to all four simdgroups (partitioning keys by `cc`, whose
+`ss` columns are disjoint) does **not** work — it was tried and the d=64
+tests moved. The single-simdgroup guard is load-bearing for a reason its
+comment does not state; find that reason before restructuring.
 Every prefill attention kernel is a vector/`simd_sum` kernel. In the default
 d=64 path `gqa_prefill_fa_ext_d64` (default-on for d=64, n_q≥8 —
 `attn.rs:3616-3650`), despite the name:

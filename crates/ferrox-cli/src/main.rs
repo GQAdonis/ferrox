@@ -6,6 +6,8 @@ mod bench_suite;
 mod chat;
 mod pull;
 mod run;
+mod verify;
+mod verify_engine;
 
 use clap::{Parser, Subcommand};
 
@@ -100,6 +102,22 @@ enum Commands {
     /// time and resident memory. Also benchmarks end-to-end decode
     /// throughput (tokens/sec) for each preset at synthetic-but-full-
     /// scale-shape dimensions.
+    /// Check that a GPU backend agrees with the CPU reference.
+    ///
+    /// Greedy-decodes the same prompt on both and compares token ids.
+    /// The benchmark harness measures throughput and never inspects
+    /// output, which has let wrong-kernel bugs sit behind green rows.
+    Verify {
+        /// GGUF to check.
+        #[arg(short = 'm', long)]
+        model: String,
+        /// Backend to compare against the CPU reference.
+        #[arg(long, default_value = "metal")]
+        backend: String,
+        /// Internal: print token ids for one backend and exit.
+        #[arg(long, hide = true)]
+        emit: bool,
+    },
     Bench {
         /// Real GGUF to benchmark. With this set, `bench` becomes a
         /// `llama-bench` work-alike (pp/tg on real weights) and the
@@ -275,6 +293,7 @@ fn rewrite_llama_style_argv(args: Vec<String>) -> Vec<String> {
         "smoke",
         "run-real",
         "bench",
+        "verify",
         "speculative",
         "run-kimi",
         "help",
@@ -505,6 +524,17 @@ fn main() -> anyhow::Result<()> {
             for (i, v) in logits.iter().enumerate() {
                 println!("  [{i}] {v:.6}");
             }
+        }
+        Commands::Verify {
+            model,
+            backend,
+            emit,
+        } => {
+            return verify::run(verify::VerifyArgs {
+                model,
+                backend,
+                emit,
+            });
         }
         Commands::Bench {
             model,

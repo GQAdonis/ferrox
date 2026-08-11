@@ -106,6 +106,63 @@ Two things the regenerated ledger surfaced that were not in the plan:
   (Qwen2.5-0.5B CPU `pp512` 614.59 vs 726.51). Only claim a row moved when it
   moved by more than that.
 
+## Every row still >1x, ranked (v0.4.0 ledger)
+
+The remaining work, in one place. Gap = `llama / ferrox`.
+
+**CPU decode (`tg128`) — 8 rows, nothing at parity. Largest single block.**
+
+| Model | ferrox | llama | gap |
+|---|---|---|---|
+| OLMoE-1B-7B Q4_0 | 65.72 | 112.08 | 1.71x |
+| TinyLlama-1.1B Q8_0 | 53.26 | 87.50 | 1.64x |
+| SmolLM2-135M Q8_0 | 110.48 | 176.12 | 1.59x |
+| Gemma-3-1B Q8_0 | 45.00 | 61.92 | 1.38x |
+| Qwen3-0.6B Q8_0 | 55.47 | 75.08 | 1.35x |
+| Phi-4-mini Q4_K_M | 25.69 | 31.67 | 1.23x |
+| Qwen2.5-0.5B Q8_0 | 81.15 | 99.63 | 1.23x |
+| Mistral-7B Q4_K_M | 16.74 | 20.06 | 1.20x |
+
+Decode is one activation against the whole weight matrix, so it is bandwidth-
+and latency-bound, not FLOP-bound: none of the Phase 1 GEMM work touches it.
+Two candidate causes, and they are separable by measurement rather than
+argument — do that first:
+
+1. **Fork-join per matvec.** Decode does one rayon fork-join per weight
+   matrix, ~200/token on SmolLM2, and `sample` previously showed workers
+   parked in `wait_until_cold`. llama runs a persistent pool that spins on
+   `ggml_thread_cpu_relax` before parking (`ggml-cpu.c`, `ggml_barrier`).
+   This is the item 1f follow-up, now unconditional. Note the gap is largest
+   on the *smallest* models, which is what a fixed per-matvec overhead looks
+   like.
+2. **Per-thread GEMV throughput.** Previously measured ~2x off llama at equal
+   thread count. If the interleave-8 / i8mm decode kernels from PRs #4-#5 have
+   closed that, cause 1 is the whole remainder — check before building a
+   threadpool.
+
+**CPU prefill (`pp512`) — 7 rows left, all under 1.7x.**
+
+| Model | gap | note |
+|---|---|---|
+| Gemma-3-1B Q8_0 | 1.63x | worst remaining; no diagnosis yet |
+| OLMoE-1B-7B Q4_0 | 1.33x | MoE, see Phase 4 |
+| SmolLM2-135M Q8_0 | 1.25x | smallest model, fixed-overhead shaped |
+| Mistral-7B Q4_K_M | 1.14x | |
+| Qwen2.5-0.5B Q8_0 | 1.12x | |
+| Qwen3-0.6B Q8_0 | 1.08x | |
+| Phi-4-mini Q4_K_M | 1.07x | |
+
+TinyLlama is ahead at 0.94x. The four rows at 1.07-1.14x are within a
+generous reading of this host's spread and should not be chased individually;
+Gemma-3-1B at 1.63x is the one that needs a cause.
+
+**Metal prefill — 5 rows above 1.5x**, all sub-1.5B or MoE: SmolLM2 2.89x,
+OLMoE 2.30x, Qwen2.5-0.5B 1.99x, Qwen3-0.6B 1.80x, TinyLlama 1.70x,
+IQ4_XS 1.60x, Llama-3.2-1B 1.53x. Owned by 2a, which is blocked on 2a-0.
+
+**Metal decode — 1 row**: OLMoE 1.46x. Everything else is at or ahead of
+parity.
+
 ## Status of the previous plan
 
 Phases 0–3 of the prior plan are **done** and their rows moved: Metal dense

@@ -31,9 +31,9 @@ use std::sync::Arc;
 use thiserror::Error;
 
 use crate::config::ModelConfig;
-use crate::decoder::{AttnWeights, Decoder, ExpertBacking, LayerWeights, MoeWeights};
 #[cfg(feature = "metal")]
 use crate::decoder::MoePackedQ4Planes;
+use crate::decoder::{AttnWeights, Decoder, ExpertBacking, LayerWeights, MoeWeights};
 
 #[derive(Debug, Error)]
 pub enum LoadError {
@@ -274,8 +274,7 @@ impl ModelConfig {
         // is optional. llama.cpp `qwen2moe.cpp` uses
         // `n_ff_exp = n_ff_exp ? n_ff_exp : n_ff / n_expert_used` (1408 for
         // Qwen1.5-MoE); the shared expert keeps the full `n_ff` (5632).
-        let feed_forward_length =
-            metadata_u64_any(file, &[key("feed_forward_length")]);
+        let feed_forward_length = metadata_u64_any(file, &[key("feed_forward_length")]);
         let expert_ffn_dim = metadata_u64_any(file, &[key("expert_feed_forward_length")])
             .or_else(|| {
                 feed_forward_length.and_then(|ff| {

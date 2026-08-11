@@ -656,10 +656,23 @@ mod tests {
             caches[0].seq_len, fresh_caches[0].seq_len,
             "must not push any position beyond the real prompt length"
         );
-        assert_eq!(
-            logits, ground_truth_next_logits,
-            "logits predicting the first generated token must match forward_batch's independent computation exactly"
-        );
+        // Tolerance, not bit equality. `forward_token` goes through
+        // `WeightMatrix::apply` (one activation) and `forward_batch`
+        // through `apply_batch`, and since the CPU batch GEMM kernels
+        // landed those are different kernels with different f32
+        // accumulation orders -- on aarch64 the batched path uses the
+        // i8mm interleave-8 GEMM. So they agree to last-ulp, not
+        // bit-for-bit. llama.cpp has the same batch-vs-sequential
+        // property. The engine-side twin of this test was relaxed for
+        // the same reason; this one only shows up on a host where the
+        // aarch64 kernels actually run.
+        assert_eq!(logits.len(), ground_truth_next_logits.len());
+        for (i, (a, b)) in logits.iter().zip(&ground_truth_next_logits).enumerate() {
+            assert!(
+                (a - b).abs() <= 1e-5 * a.abs().max(1.0),
+                "logit {i} predicting the first generated token: sequential {a} vs forward_batch {b}"
+            );
+        }
     }
 
     /// End-to-end version of the same property: `generate`'s full

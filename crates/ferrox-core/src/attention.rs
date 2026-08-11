@@ -197,6 +197,68 @@ fn axpy_scale(out: &mut [f32], alpha: f32, v: &[f32], p: f32) {
     }
 }
 
+/// `out[i] += p * v[i]` (plain axpy; the blocked-softmax V accumulate,
+/// which never rescales what is already accumulated).
+#[inline]
+fn axpy(out: &mut [f32], v: &[f32], p: f32) {
+    debug_assert_eq!(out.len(), v.len());
+    #[cfg(target_arch = "aarch64")]
+    {
+        if std::arch::is_aarch64_feature_detected!("neon") {
+            unsafe { axpy_neon(out, v, p) };
+            return;
+        }
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {
+            unsafe { axpy_avx2(out, v, p) };
+            return;
+        }
+    }
+    for (o, &vv) in out.iter_mut().zip(v) {
+        *o += p * vv;
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn axpy_neon(out: &mut [f32], v: &[f32], p: f32) {
+    use std::arch::aarch64::*;
+    let n = out.len();
+    let vp = vdupq_n_f32(p);
+    let mut i = 0;
+    while i + 4 <= n {
+        let o = vld1q_f32(out.as_ptr().add(i));
+        let vv = vld1q_f32(v.as_ptr().add(i));
+        vst1q_f32(out.as_mut_ptr().add(i), vfmaq_f32(o, vv, vp));
+        i += 4;
+    }
+    while i < n {
+        out[i] += p * v[i];
+        i += 1;
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn axpy_avx2(out: &mut [f32], v: &[f32], p: f32) {
+    use std::arch::x86_64::*;
+    let n = out.len();
+    let vp = _mm256_set1_ps(p);
+    let mut i = 0;
+    while i + 8 <= n {
+        let o = _mm256_loadu_ps(out.as_ptr().add(i));
+        let vv = _mm256_loadu_ps(v.as_ptr().add(i));
+        _mm256_storeu_ps(out.as_mut_ptr().add(i), _mm256_fmadd_ps(vv, vp, o));
+        i += 8;
+    }
+    while i < n {
+        out[i] += p * v[i];
+        i += 1;
+    }
+}
+
 #[inline]
 fn scale_inplace(x: &mut [f32], s: f32) {
     #[cfg(target_arch = "aarch64")]
@@ -590,23 +652,77 @@ pub fn causal_gqa_attention_prefill_shared_kv(
     let scale = 1.0 / (head_dim as f32).sqrt();
     let mut out = vec![0f32; n_q * q_stride];
 
-    out.par_chunks_mut(head_dim)
-        .enumerate()
-        .for_each(|(slot, out_h)| {
-            let b = slot / n_heads;
-            let h = slot % n_heads;
+    // Blocked three-pass attention (llama.cpp's CPU shape: Q·Kᵀ as a real
+    // score pass, one vectorized softmax over the whole row, then V·P) in
+    // place of the online accumulator, which paid two scalar `exp`s and a
+    // full-width `out` rescale per KV position. Tasks own a block of
+    // queries for one head, so the K/V rows they stream stay hot across
+    // the block; the raw pointer only bridges Send/Sync — tasks write
+    // disjoint `(query, head)` slices.
+    struct OutPtr(*mut f32);
+    unsafe impl Send for OutPtr {}
+    unsafe impl Sync for OutPtr {}
+    impl OutPtr {
+        /// Safety: no two concurrent callers may overlap `[off, off+len)`.
+        #[inline]
+        unsafe fn write(&self, off: usize, src: &[f32]) {
+            std::ptr::copy_nonoverlapping(src.as_ptr(), self.0.add(off), src.len());
+        }
+    }
+    const Q_BLOCK: usize = 8;
+    let n_blocks = n_q.div_ceil(Q_BLOCK);
+    let out_w = OutPtr(out.as_mut_ptr());
+    let softcap = attn_softcap.filter(|&c| c > 0.0);
+
+    (0..n_blocks * n_heads)
+        .into_par_iter()
+        .with_min_len(1)
+        .for_each(|task| {
+            let blk = task / n_heads;
+            let h = task % n_heads;
             let kv_h = h / group_size.max(1);
-            let q_h = &q[b * q_stride + h * head_dim..b * q_stride + (h + 1) * head_dim];
-            let causal_len = kv_prefix + b + 1;
-            online_attn_accumulate(q_h, scale, head_dim, out_h, attn_softcap, |visit| {
-                for t in 0..causal_len {
+            let b_start = blk * Q_BLOCK;
+            let b_end = (b_start + Q_BLOCK).min(n_q);
+            let mut scores = vec![0f32; kv_prefix + b_end];
+            let mut acc = vec![0f32; head_dim];
+
+            for b in b_start..b_end {
+                let causal_len = kv_prefix + b + 1;
+                let q_h = &q[b * q_stride + h * head_dim..][..head_dim];
+                let scores = &mut scores[..causal_len];
+
+                // Pass 1: the Q·Kᵀ row.
+                for (t, s) in scores.iter_mut().enumerate() {
                     let base = (t * n_kv_heads + kv_h) * head_dim;
-                    visit(
-                        &k_cache[base..base + head_dim],
-                        &v_cache[base..base + head_dim],
-                    );
+                    let mut v = dot_f32(q_h, &k_cache[base..base + head_dim]) * scale;
+                    if let Some(sc) = softcap {
+                        v = sc * (v / sc).tanh();
+                    }
+                    *s = v;
                 }
-            });
+
+                // Pass 2: max-subtract softmax over the whole row — one
+                // `exp` per position, no rescale.
+                let m = scores.iter().fold(f32::NEG_INFINITY, |a, &s| a.max(s));
+                let mut l = 0f32;
+                for s in scores.iter_mut() {
+                    *s = (*s - m).exp();
+                    l += *s;
+                }
+
+                // Pass 3: weighted V accumulate, normalized once.
+                acc.fill(0.0);
+                for (t, &p) in scores.iter().enumerate() {
+                    let base = (t * n_kv_heads + kv_h) * head_dim;
+                    axpy(&mut acc, &v_cache[base..base + head_dim], p);
+                }
+                if l > 0.0 {
+                    scale_inplace(&mut acc, 1.0 / l);
+                }
+                unsafe {
+                    out_w.write(b * q_stride + h * head_dim, &acc);
+                }
+            }
         });
 
     out
@@ -844,6 +960,63 @@ pub fn causal_mla_attention_sparse(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn prefill_shared_kv_matches_per_query_reference() {
+        // Shapes chosen to cross the query-block boundary (n_q > 2 blocks,
+        // with a partial last block), with a nonzero decoded prefix and
+        // grouped KV heads; softcap both off and on. The blocked
+        // three-pass softmax must agree with the per-query online
+        // accumulator within float noise.
+        let n_heads = 6;
+        let n_kv_heads = 2;
+        let head_dim = 16;
+        let n_q = 19;
+        let kv_prefix = 5;
+        let kv_len = kv_prefix + n_q;
+        let q_stride = n_heads * head_dim;
+        let kv_stride = n_kv_heads * head_dim;
+
+        let q: Vec<f32> = (0..n_q * q_stride)
+            .map(|i| ((i as f32) * 0.013 - 0.7).sin() * 1.3)
+            .collect();
+        let k_cache: Vec<f32> = (0..kv_len * kv_stride)
+            .map(|i| ((i as f32) * 0.017 - 0.3).cos() * 1.1)
+            .collect();
+        let v_cache: Vec<f32> = (0..kv_len * kv_stride)
+            .map(|i| ((i as f32) * 0.011 + 0.2).sin() * 0.9)
+            .collect();
+
+        for softcap in [None, Some(30.0)] {
+            let got = super::causal_gqa_attention_prefill_shared_kv(
+                &q, &k_cache, &v_cache, n_heads, n_kv_heads, head_dim, n_q, kv_prefix, softcap,
+            );
+            assert_eq!(got.len(), n_q * q_stride);
+            for b in 0..n_q {
+                let causal_len = kv_prefix + b + 1;
+                let want = super::causal_gqa_attention_softcap(
+                    &q[b * q_stride..(b + 1) * q_stride],
+                    &k_cache[..causal_len * kv_stride],
+                    &v_cache[..causal_len * kv_stride],
+                    n_heads,
+                    n_kv_heads,
+                    head_dim,
+                    causal_len,
+                    softcap,
+                );
+                for (i, (g, w)) in got[b * q_stride..(b + 1) * q_stride]
+                    .iter()
+                    .zip(want.iter())
+                    .enumerate()
+                {
+                    assert!(
+                        (g - w).abs() < 1e-5,
+                        "softcap {softcap:?} query {b} slot {i}: blocked {g} vs online {w}"
+                    );
+                }
+            }
+        }
+    }
+
     use super::*;
 
     #[test]

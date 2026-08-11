@@ -38,4 +38,4 @@ pub use tensor::Tensor;
 pub use weight_matrix::cuda_dense_enabled;
 #[cfg(feature = "metal")]
 pub use weight_matrix::metal_dense_enabled;
-pub use weight_matrix::{QuantKind, WeightMatrix};
+pub use weight_matrix::{BatchActs, QuantKind, WeightMatrix};

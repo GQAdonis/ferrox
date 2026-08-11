@@ -103,7 +103,7 @@ fn get_or_repack_q8x4(data: &[u8], rows: usize, cols: usize) -> Arc<[u8]> {
         }
     }
     let packed =
-        ferrox_quant::pack_q8_0_matrix_x4(data, rows, cols, ferrox_quant::Q8_0X4_INTERLEAVE);
+        ferrox_quant::pack_q8_0_matrix_x4(data, rows, cols, ferrox_quant::q8_0x4_interleave());
     let arc: Arc<[u8]> = Arc::from(packed.into_boxed_slice());
     let mut cache = q8x4_repack_cache().lock().unwrap();
     Arc::clone(cache.entry(key).or_insert_with(|| Arc::clone(&arc)))
@@ -124,7 +124,7 @@ fn get_or_repack_q4_0x4(data: &[u8], rows: usize, cols: usize) -> Arc<[u8]> {
         }
     }
     let packed =
-        ferrox_quant::pack_q4_0_matrix_x4(data, rows, cols, ferrox_quant::Q4_0X4_INTERLEAVE);
+        ferrox_quant::pack_q4_0_matrix_x4(data, rows, cols, ferrox_quant::q4_0x4_interleave());
     let arc: Arc<[u8]> = Arc::from(packed.into_boxed_slice());
     let mut cache = q4x4_repack_cache().lock().unwrap();
     Arc::clone(cache.entry(key).or_insert_with(|| Arc::clone(&arc)))
@@ -319,6 +319,16 @@ pub unsafe fn default_cpu_int_dot_on() {
     }
 }
 
+/// A batch of activations quantized once for reuse across several
+/// [`WeightMatrix::apply_batch_with_acts`] calls that read the same input
+/// (q/k/v on one normed batch; gate/up on another). Build with
+/// [`WeightMatrix::quantize_batch_acts`]. Q8_0/Q4_0 matrices consume
+/// [`BatchActs::Q8`]; the K-quants consume [`BatchActs::Q8K`].
+pub enum BatchActs {
+    Q8(Vec<ferrox_quant::Q8Activations>),
+    Q8K(Vec<ferrox_quant::Q8KActivations>),
+}
+
 pub enum WeightMatrix {
     F32(Tensor),
     Quantized {
@@ -442,6 +452,61 @@ impl WeightMatrix {
     fn min_rows_per_task(rows: usize) -> usize {
         let threads = rayon::current_num_threads().max(1);
         (rows / (threads * 4)).max(8.min(rows.max(1)))
+    }
+
+    /// Run `body(g, t0, t1)` for every row-group `g` and activation-tile
+    /// range `[t0, t1)` of a llama-style 2D chunk grid over
+    /// (row-groups × batch tiles).
+    ///
+    /// This is the port of `ggml_compute_forward_mul_mat`'s chunking
+    /// (`ggml-cpu.c`): ~16 rows / 16 batch positions per chunk, and if
+    /// that grid is smaller than `4 × threads`, re-chunk by thread along
+    /// the larger dimension. llama walks the grid with an atomic
+    /// `current_chunk` because its threadpool has no scheduler; Rayon
+    /// already work-steals, so handing it the same chunks (`min_len 1`)
+    /// gets the same load balancing. The point is the *batch* dimension:
+    /// splitting only by rows leaves a 192-row projection with ~3 tasks
+    /// no matter how many positions are in flight.
+    fn par_chunked_groups(
+        n_groups: usize,
+        group_rows: usize,
+        n_tiles: usize,
+        tile_batch: usize,
+        body: impl Fn(usize, usize, usize) + Sync,
+    ) {
+        if n_groups == 0 || n_tiles == 0 {
+            return;
+        }
+        let nth = rayon::current_num_threads().max(1);
+        const CHUNK_ELEMS: usize = 16;
+        let g_per_chunk = (CHUNK_ELEMS / group_rows).max(1);
+        let t_per_chunk = (CHUNK_ELEMS / tile_batch).max(1);
+        let mut nchunk_g = n_groups.div_ceil(g_per_chunk);
+        let mut nchunk_t = n_tiles.div_ceil(t_per_chunk);
+        if nchunk_g * nchunk_t < nth * 4 {
+            // llama's fallback: one chunk per thread along the larger dim.
+            if n_groups * group_rows > n_tiles * tile_batch {
+                nchunk_g = nth.min(n_groups);
+                nchunk_t = 1;
+            } else {
+                nchunk_g = 1;
+                nchunk_t = nth.min(n_tiles);
+            }
+        }
+        let dg = n_groups.div_ceil(nchunk_g);
+        let dt = n_tiles.div_ceil(nchunk_t);
+        (0..nchunk_g * nchunk_t)
+            .into_par_iter()
+            .with_min_len(1)
+            .for_each(|chunk| {
+                let g0 = (chunk % nchunk_g) * dg;
+                let g1 = (g0 + dg).min(n_groups);
+                let t0 = (chunk / nchunk_g) * dt;
+                let t1 = (t0 + dt).min(n_tiles);
+                for g in g0..g1 {
+                    body(g, t0, t1);
+                }
+            });
     }
 
     /// Prefer serial when the mat is too small for fork-join to pay off.
@@ -665,7 +730,12 @@ impl WeightMatrix {
                                         .enumerate()
                                     {
                                         ferrox_quant::gemv_q8_0x4_group(
-                                            &packed, g, &act, *cols, chunk,
+                                            &packed,
+                                            g,
+                                            &act,
+                                            *cols,
+                                            ferrox_quant::q8_0x4_interleave(),
+                                            chunk,
                                         );
                                     }
                                 } else {
@@ -675,7 +745,12 @@ impl WeightMatrix {
                                         .enumerate()
                                         .for_each(|(g, chunk)| {
                                             ferrox_quant::gemv_q8_0x4_group(
-                                                &packed, g, &act, *cols, chunk,
+                                                &packed,
+                                                g,
+                                                &act,
+                                                *cols,
+                                                ferrox_quant::q8_0x4_interleave(),
+                                                chunk,
                                             );
                                         });
                                 }
@@ -734,7 +809,12 @@ impl WeightMatrix {
                                         .enumerate()
                                     {
                                         ferrox_quant::gemv_q4_0x4_group(
-                                            &packed, g, &act, *cols, chunk,
+                                            &packed,
+                                            g,
+                                            &act,
+                                            *cols,
+                                            ferrox_quant::q4_0x4_interleave(),
+                                            chunk,
                                         );
                                     }
                                 } else {
@@ -744,7 +824,12 @@ impl WeightMatrix {
                                         .enumerate()
                                         .for_each(|(g, chunk)| {
                                             ferrox_quant::gemv_q4_0x4_group(
-                                                &packed, g, &act, *cols, chunk,
+                                                &packed,
+                                                g,
+                                                &act,
+                                                *cols,
+                                                ferrox_quant::q4_0x4_interleave(),
+                                                chunk,
                                             );
                                         });
                                 }
@@ -890,8 +975,8 @@ impl WeightMatrix {
                                     .enumerate()
                                     .for_each(|(i, o)| {
                                         let r = n_groups * ferrox_quant::Q6_KX8_NROWS + i;
-                                        let row = &data.as_slice()
-                                            [r * row_bytes..(r + 1) * row_bytes];
+                                        let row =
+                                            &data.as_slice()[r * row_bytes..(r + 1) * row_bytes];
                                         *o = ferrox_quant::dot_q6_k_q8(row, &act);
                                     });
                                 return out;
@@ -970,7 +1055,14 @@ impl WeightMatrix {
                 let packed = get_or_repack_q8x4(data, *rows, *cols);
                 let serial = Self::prefer_serial_matvec(*rows, *cols);
                 let body = |g: usize, chunk: &mut [f32]| {
-                    ferrox_quant::gemv_q8_0x4_group(&packed, g, act, *cols, chunk);
+                    ferrox_quant::gemv_q8_0x4_group(
+                        &packed,
+                        g,
+                        act,
+                        *cols,
+                        ferrox_quant::q8_0x4_interleave(),
+                        chunk,
+                    );
                 };
                 if serial {
                     for (g, chunk) in out[..n_groups * ferrox_quant::Q8_0X4_NROWS]
@@ -1020,7 +1112,14 @@ impl WeightMatrix {
                 let packed = get_or_repack_q4_0x4(data, *rows, *cols);
                 let serial = Self::prefer_serial_matvec(*rows, *cols);
                 let body = |g: usize, chunk: &mut [f32]| {
-                    ferrox_quant::gemv_q4_0x4_group(&packed, g, act, *cols, chunk);
+                    ferrox_quant::gemv_q4_0x4_group(
+                        &packed,
+                        g,
+                        act,
+                        *cols,
+                        ferrox_quant::q4_0x4_interleave(),
+                        chunk,
+                    );
                 };
                 if serial {
                     for (g, chunk) in out[..n_groups * ferrox_quant::Q4_0X4_NROWS]
@@ -1183,6 +1282,76 @@ impl WeightMatrix {
     /// [`ferrox_metal::gpu::launch_matvec_batch`]. Falls back to
     /// per-row [`Self::apply`] if the batch launch fails.
     pub fn apply_batch(&self, x_batch: &[f32], batch_size: usize) -> Vec<f32> {
+        self.apply_batch_with_acts(x_batch, batch_size, None)
+    }
+
+    /// Quantize `x_batch` once, in the activation format this matrix's
+    /// INT_DOT batch path consumes, for sharing across every projection
+    /// that reads the same input (q/k/v on one normed batch; gate/up on
+    /// another). Returns `None` when [`Self::apply_batch`] would not use
+    /// quantized activations for this matrix — GPU dispatch, INT_DOT off,
+    /// unsupported kind or width — so callers can pass the result straight
+    /// to [`Self::apply_batch_with_acts`] unconditionally.
+    pub fn quantize_batch_acts(&self, x_batch: &[f32], batch_size: usize) -> Option<BatchActs> {
+        #[cfg(feature = "metal")]
+        {
+            if metal_dense_enabled()
+                && matches!(
+                    self,
+                    WeightMatrix::Quantized { kind, .. } if Self::metal_kind_supported(*kind)
+                )
+            {
+                return None;
+            }
+        }
+        #[cfg(feature = "cuda")]
+        {
+            if cuda_dense_enabled() && matches!(self, WeightMatrix::Quantized { .. }) {
+                return None;
+            }
+        }
+        let WeightMatrix::Quantized { cols, kind, .. } = self else {
+            return None;
+        };
+        if !cpu_int_dot_enabled() || x_batch.len() != batch_size * cols {
+            return None;
+        }
+        match kind {
+            QuantKind::Q8_0 | QuantKind::Q4_0 if cols.is_multiple_of(32) => Some(BatchActs::Q8(
+                (0..batch_size)
+                    .into_par_iter()
+                    .map(|b| {
+                        ferrox_quant::quantize_activations_q8(&x_batch[b * cols..(b + 1) * cols])
+                    })
+                    .collect(),
+            )),
+            QuantKind::Q4K | QuantKind::Q5K | QuantKind::Q6K if cols.is_multiple_of(256) => {
+                Some(BatchActs::Q8K(
+                    (0..batch_size)
+                        .into_par_iter()
+                        .map(|b| {
+                            ferrox_quant::quantize_activations_q8_k(
+                                &x_batch[b * cols..(b + 1) * cols],
+                            )
+                        })
+                        .collect(),
+                ))
+            }
+            _ => None,
+        }
+    }
+
+    /// [`Self::apply_batch`], optionally reusing a shared pre-quantized
+    /// activation batch from [`Self::quantize_batch_acts`]. A `shared`
+    /// value whose format or length does not match this matrix is simply
+    /// ignored (the activations are re-quantized locally), so mixed-kind
+    /// projection groups stay correct.
+    pub fn apply_batch_with_acts(
+        &self,
+        x_batch: &[f32],
+        batch_size: usize,
+        shared: Option<&BatchActs>,
+    ) -> Vec<f32> {
         let cols = self.cols();
         assert_eq!(
             x_batch.len(),
@@ -1191,6 +1360,31 @@ impl WeightMatrix {
         );
         if batch_size == 0 {
             return Vec::new();
+        }
+
+        /// Raw pointer to this function's `[batch][rows]` output, shared
+        /// across rayon tasks.
+        ///
+        /// Parallelism is over weight rows, but a row's `batch_size` output
+        /// slots (`out[b * rows + r]` for every `b`) interleave with every
+        /// other row's, so they cannot be handed out as disjoint `&mut`
+        /// chunks. Each task writes only the rows it owns, which keeps the
+        /// writes race-free; this wrapper just carries the pointer across
+        /// the `Send`/`Sync` boundary. Writing straight into the final
+        /// layout kills what used to be here: a `[rows][batch]` staging vec
+        /// (zeroed every call) plus a serial rows × batch transpose after
+        /// the parallel section had already finished.
+        #[derive(Clone, Copy)]
+        struct BatchOut(*mut f32);
+        unsafe impl Send for BatchOut {}
+        unsafe impl Sync for BatchOut {}
+        impl BatchOut {
+            /// Safety: `idx` in bounds, and concurrent tasks never pass
+            /// the same `idx` (they own disjoint row sets).
+            #[inline]
+            unsafe fn set(self, idx: usize, v: f32) {
+                *self.0.add(idx) = v;
+            }
         }
 
         #[cfg(feature = "metal")]
@@ -1254,217 +1448,413 @@ impl WeightMatrix {
                 kind,
             } => {
                 let row_bytes = self.block_bytes_per_row(*kind, cols);
-                // Laid out [rows, batch] during computation (each row
-                // is one parallel unit of work, written to a
-                // contiguous batch_size-sized chunk -- safe for
-                // par_chunks_mut, unlike the [batch, rows] layout the
-                // function returns), then transposed once at the end.
-                let mut by_row = vec![0f32; rows * batch_size];
+                // Written directly in the [batch, rows] layout the function
+                // returns: each parallel task owns a disjoint set of rows
+                // `r` and scatters `out[b * rows + r]` for every `b`
+                // through `BatchOut`.
+                let mut out = vec![0f32; batch_size * rows];
+                let out_w = BatchOut(out.as_mut_ptr());
 
                 // Prefill INT_DOT: quantize each activation once, then
                 // reuse Q8 packs across all weight rows (llama CPU path).
                 if cpu_int_dot_enabled() {
                     match *kind {
                         QuantKind::Q8_0 if cols.is_multiple_of(32) => {
-                            let acts: Vec<_> = (0..batch_size)
-                                .into_par_iter()
-                                .map(|b| {
-                                    ferrox_quant::quantize_activations_q8(
-                                        &x_batch[b * cols..(b + 1) * cols],
-                                    )
-                                })
-                                .collect();
+                            let acts_owned: Vec<_>;
+                            let acts: &[ferrox_quant::Q8Activations] = match shared {
+                                Some(BatchActs::Q8(a)) if a.len() == batch_size => a,
+                                _ => {
+                                    acts_owned = (0..batch_size)
+                                        .into_par_iter()
+                                        .map(|b| {
+                                            ferrox_quant::quantize_activations_q8(
+                                                &x_batch[b * cols..(b + 1) * cols],
+                                            )
+                                        })
+                                        .collect();
+                                    &acts_owned
+                                }
+                            };
                             let n_groups = *rows / ferrox_quant::Q8_0X4_NROWS;
                             if n_groups > 0 {
                                 let packed = get_or_repack_q8x4(data.as_slice(), *rows, cols);
-                                let group_stride = ferrox_quant::Q8_0X4_NROWS * batch_size;
-                                by_row[..n_groups * group_stride]
-                                    .par_chunks_mut(group_stride)
-                                    .with_min_len(Self::min_rows_per_task(n_groups).max(1))
-                                    .enumerate()
-                                    .for_each(|(g, group_out)| {
-                                        // GEMM, not a GEMV per position:
-                                        // `group_out` is already
-                                        // `[row][batch]`, which is the
-                                        // layout the batched kernel
-                                        // writes, and the group's weight
-                                        // vectors stay in registers
-                                        // across a tile of activations.
-                                        ferrox_quant::gemm_q8_0x4_group(
-                                            &packed, g, &acts, cols, group_out,
-                                        );
-                                    });
+                                let nrows_g = ferrox_quant::Q8_0X4_NROWS;
+                                let interleave = ferrox_quant::q8_0x4_interleave();
+                                if ferrox_quant::q8_0x4_gemm_uses_acts_x4(interleave) {
+                                    // i8mm: interleave each quad of
+                                    // activations once per matmul (llama.cpp
+                                    // `ggml_quantize_mat_q8_0_4x8` into
+                                    // `wdata`); every row-group reuses it.
+                                    let nc = ferrox_quant::Q8K_ACTS_X4_NC;
+                                    let act_tiles: Vec<ferrox_quant::Q8ActsX4> = acts
+                                        .par_chunks(nc)
+                                        .map(|chunk| ferrox_quant::prepare_q8_acts_x4(chunk, cols))
+                                        .collect();
+                                    Self::par_chunked_groups(
+                                        n_groups,
+                                        nrows_g,
+                                        act_tiles.len(),
+                                        nc,
+                                        |g, t0, t1| {
+                                            let mut tmp = [0f32;
+                                                ferrox_quant::Q8_0X4_NROWS
+                                                    * ferrox_quant::Q8K_ACTS_X4_NC];
+                                            for (t, tile) in act_tiles[t0..t1].iter().enumerate() {
+                                                let t = t0 + t;
+                                                let n = tile.na;
+                                                let tmp = &mut tmp[..nrows_g * n];
+                                                ferrox_quant::gemm_q8_0x4_group_x4(
+                                                    &packed, g, tile, cols, interleave, tmp,
+                                                );
+                                                for j in 0..n {
+                                                    let col = (t * nc + j) * rows + g * nrows_g;
+                                                    for r in 0..nrows_g {
+                                                        unsafe {
+                                                            out_w.set(col + r, tmp[r * n + j]);
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        },
+                                    );
+                                } else {
+                                    // GEMM, not a GEMV per position: the
+                                    // batched kernel writes a `[row][batch]`
+                                    // span, and the group's weight vectors
+                                    // stay in registers across a tile of
+                                    // activations. The span is then scattered
+                                    // into the [batch][rows] output right
+                                    // here, in parallel.
+                                    let span = ferrox_quant::Q8_0X4_GEMM_NC;
+                                    let n_tiles = batch_size.div_ceil(span);
+                                    Self::par_chunked_groups(
+                                        n_groups,
+                                        nrows_g,
+                                        n_tiles,
+                                        span,
+                                        |g, t0, t1| {
+                                            let b0 = t0 * span;
+                                            let b1 = (t1 * span).min(batch_size);
+                                            let n = b1 - b0;
+                                            let mut group = vec![0f32; nrows_g * n];
+                                            ferrox_quant::gemm_q8_0x4_group(
+                                                &packed,
+                                                g,
+                                                &acts[b0..b1],
+                                                cols,
+                                                interleave,
+                                                &mut group,
+                                            );
+                                            for (bi, b) in (b0..b1).enumerate() {
+                                                for r in 0..nrows_g {
+                                                    unsafe {
+                                                        out_w.set(
+                                                            b * rows + g * nrows_g + r,
+                                                            group[r * n + bi],
+                                                        );
+                                                    }
+                                                }
+                                            }
+                                        },
+                                    );
+                                }
                                 let data_slice = data.as_slice();
-                                by_row[n_groups * group_stride..]
-                                    .par_chunks_mut(batch_size)
-                                    .with_min_len(Self::min_rows_per_task(
-                                        *rows - n_groups * ferrox_quant::Q8_0X4_NROWS,
-                                    ))
-                                    .enumerate()
-                                    .for_each(|(i, out_row)| {
+                                let tail = *rows - n_groups * ferrox_quant::Q8_0X4_NROWS;
+                                (0..tail)
+                                    .into_par_iter()
+                                    .with_min_len(Self::min_rows_per_task(tail))
+                                    .for_each(|i| {
                                         let r = n_groups * ferrox_quant::Q8_0X4_NROWS + i;
                                         let row = &data_slice[r * row_bytes..(r + 1) * row_bytes];
                                         for (b, act) in acts.iter().enumerate() {
-                                            out_row[b] = ferrox_quant::dot_q8_0_q8(row, act);
+                                            unsafe {
+                                                out_w.set(
+                                                    b * rows + r,
+                                                    ferrox_quant::dot_q8_0_q8(row, act),
+                                                );
+                                            }
                                         }
                                     });
                             } else {
-                                by_row
-                                    .par_chunks_mut(batch_size)
+                                (0..*rows)
+                                    .into_par_iter()
                                     .with_min_len(Self::min_rows_per_task(*rows))
-                                    .enumerate()
-                                    .for_each(|(r, out_row)| {
+                                    .for_each(|r| {
                                         let row =
                                             &data.as_slice()[r * row_bytes..(r + 1) * row_bytes];
                                         for (b, act) in acts.iter().enumerate() {
-                                            out_row[b] = ferrox_quant::dot_q8_0_q8(row, act);
+                                            unsafe {
+                                                out_w.set(
+                                                    b * rows + r,
+                                                    ferrox_quant::dot_q8_0_q8(row, act),
+                                                );
+                                            }
                                         }
                                     });
-                            }
-                            let mut out = vec![0f32; batch_size * rows];
-                            for r in 0..*rows {
-                                for b in 0..batch_size {
-                                    out[b * rows + r] = by_row[r * batch_size + b];
-                                }
                             }
                             return out;
                         }
                         QuantKind::Q4_0 if cols.is_multiple_of(32) => {
-                            let acts: Vec<_> = (0..batch_size)
-                                .into_par_iter()
-                                .map(|b| {
-                                    ferrox_quant::quantize_activations_q8(
-                                        &x_batch[b * cols..(b + 1) * cols],
-                                    )
-                                })
-                                .collect();
+                            let acts_owned: Vec<_>;
+                            let acts: &[ferrox_quant::Q8Activations] = match shared {
+                                Some(BatchActs::Q8(a)) if a.len() == batch_size => a,
+                                _ => {
+                                    acts_owned = (0..batch_size)
+                                        .into_par_iter()
+                                        .map(|b| {
+                                            ferrox_quant::quantize_activations_q8(
+                                                &x_batch[b * cols..(b + 1) * cols],
+                                            )
+                                        })
+                                        .collect();
+                                    &acts_owned
+                                }
+                            };
                             let n_groups = *rows / ferrox_quant::Q4_0X4_NROWS;
                             if n_groups > 0 {
                                 let packed = get_or_repack_q4_0x4(data.as_slice(), *rows, cols);
-                                let group_stride = ferrox_quant::Q4_0X4_NROWS * batch_size;
-                                by_row[..n_groups * group_stride]
-                                    .par_chunks_mut(group_stride)
-                                    .with_min_len(Self::min_rows_per_task(n_groups).max(1))
-                                    .enumerate()
-                                    .for_each(|(g, group_out)| {
-                                        ferrox_quant::gemm_q4_0x4_group(
-                                            &packed, g, &acts, cols, group_out,
-                                        );
-                                    });
+                                let nrows_g = ferrox_quant::Q4_0X4_NROWS;
+                                let interleave = ferrox_quant::q4_0x4_interleave();
+                                if ferrox_quant::q4_0x4_gemm_uses_acts_x4(interleave) {
+                                    // i8mm: same once-per-matmul activation
+                                    // quad hoist as the Q8_0 arm above.
+                                    let nc = ferrox_quant::Q8K_ACTS_X4_NC;
+                                    let act_tiles: Vec<ferrox_quant::Q8ActsX4> = acts
+                                        .par_chunks(nc)
+                                        .map(|chunk| ferrox_quant::prepare_q8_acts_x4(chunk, cols))
+                                        .collect();
+                                    Self::par_chunked_groups(
+                                        n_groups,
+                                        nrows_g,
+                                        act_tiles.len(),
+                                        nc,
+                                        |g, t0, t1| {
+                                            let mut tmp = [0f32;
+                                                ferrox_quant::Q4_0X4_NROWS
+                                                    * ferrox_quant::Q8K_ACTS_X4_NC];
+                                            for (t, tile) in act_tiles[t0..t1].iter().enumerate() {
+                                                let t = t0 + t;
+                                                let n = tile.na;
+                                                let tmp = &mut tmp[..nrows_g * n];
+                                                ferrox_quant::gemm_q4_0x4_group_x4(
+                                                    &packed, g, tile, cols, interleave, tmp,
+                                                );
+                                                for j in 0..n {
+                                                    let col = (t * nc + j) * rows + g * nrows_g;
+                                                    for r in 0..nrows_g {
+                                                        unsafe {
+                                                            out_w.set(col + r, tmp[r * n + j]);
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        },
+                                    );
+                                } else {
+                                    // GEMM, not a GEMV per position: the
+                                    // batched kernel writes a `[row][batch]`
+                                    // span, and the group's weight vectors
+                                    // stay in registers across a tile of
+                                    // activations. The span is then scattered
+                                    // into the [batch][rows] output right
+                                    // here, in parallel.
+                                    let span = ferrox_quant::Q8_0X4_GEMM_NC;
+                                    let n_tiles = batch_size.div_ceil(span);
+                                    Self::par_chunked_groups(
+                                        n_groups,
+                                        nrows_g,
+                                        n_tiles,
+                                        span,
+                                        |g, t0, t1| {
+                                            let b0 = t0 * span;
+                                            let b1 = (t1 * span).min(batch_size);
+                                            let n = b1 - b0;
+                                            let mut group = vec![0f32; nrows_g * n];
+                                            ferrox_quant::gemm_q4_0x4_group(
+                                                &packed,
+                                                g,
+                                                &acts[b0..b1],
+                                                cols,
+                                                interleave,
+                                                &mut group,
+                                            );
+                                            for (bi, b) in (b0..b1).enumerate() {
+                                                for r in 0..nrows_g {
+                                                    unsafe {
+                                                        out_w.set(
+                                                            b * rows + g * nrows_g + r,
+                                                            group[r * n + bi],
+                                                        );
+                                                    }
+                                                }
+                                            }
+                                        },
+                                    );
+                                }
                                 let data_slice = data.as_slice();
-                                by_row[n_groups * group_stride..]
-                                    .par_chunks_mut(batch_size)
-                                    .with_min_len(Self::min_rows_per_task(
-                                        *rows - n_groups * ferrox_quant::Q4_0X4_NROWS,
-                                    ))
-                                    .enumerate()
-                                    .for_each(|(i, out_row)| {
+                                let tail = *rows - n_groups * ferrox_quant::Q4_0X4_NROWS;
+                                (0..tail)
+                                    .into_par_iter()
+                                    .with_min_len(Self::min_rows_per_task(tail))
+                                    .for_each(|i| {
                                         let r = n_groups * ferrox_quant::Q4_0X4_NROWS + i;
                                         let row = &data_slice[r * row_bytes..(r + 1) * row_bytes];
                                         for (b, act) in acts.iter().enumerate() {
-                                            out_row[b] = ferrox_quant::dot_q4_0_q8(row, act);
+                                            unsafe {
+                                                out_w.set(
+                                                    b * rows + r,
+                                                    ferrox_quant::dot_q4_0_q8(row, act),
+                                                );
+                                            }
                                         }
                                     });
                             } else {
-                                by_row
-                                    .par_chunks_mut(batch_size)
+                                (0..*rows)
+                                    .into_par_iter()
                                     .with_min_len(Self::min_rows_per_task(*rows))
-                                    .enumerate()
-                                    .for_each(|(r, out_row)| {
+                                    .for_each(|r| {
                                         let row =
                                             &data.as_slice()[r * row_bytes..(r + 1) * row_bytes];
                                         for (b, act) in acts.iter().enumerate() {
-                                            out_row[b] = ferrox_quant::dot_q4_0_q8(row, act);
+                                            unsafe {
+                                                out_w.set(
+                                                    b * rows + r,
+                                                    ferrox_quant::dot_q4_0_q8(row, act),
+                                                );
+                                            }
                                         }
                                     });
-                            }
-                            let mut out = vec![0f32; batch_size * rows];
-                            for r in 0..*rows {
-                                for b in 0..batch_size {
-                                    out[b * rows + r] = by_row[r * batch_size + b];
-                                }
                             }
                             return out;
                         }
                         QuantKind::Q4K if cols.is_multiple_of(256) => {
-                            let acts: Vec<_> = (0..batch_size)
-                                .into_par_iter()
-                                .map(|b| {
-                                    ferrox_quant::quantize_activations_q8_k(
-                                        &x_batch[b * cols..(b + 1) * cols],
-                                    )
-                                })
-                                .collect();
+                            let acts_owned: Vec<_>;
+                            let acts: &[ferrox_quant::Q8KActivations] = match shared {
+                                Some(BatchActs::Q8K(a)) if a.len() == batch_size => a,
+                                _ => {
+                                    acts_owned = (0..batch_size)
+                                        .into_par_iter()
+                                        .map(|b| {
+                                            ferrox_quant::quantize_activations_q8_k(
+                                                &x_batch[b * cols..(b + 1) * cols],
+                                            )
+                                        })
+                                        .collect();
+                                    &acts_owned
+                                }
+                            };
                             let n_groups = *rows / ferrox_quant::Q4_KX8_NROWS;
                             if n_groups > 0 {
                                 let interleave = ferrox_quant::q4_kx8_interleave();
                                 let packed = get_or_repack_q4k(data.as_slice(), *rows, cols);
-                                let group_stride = ferrox_quant::Q4_KX8_NROWS * batch_size;
-                                by_row[..n_groups * group_stride]
-                                    .par_chunks_mut(group_stride)
-                                    .with_min_len(Self::min_rows_per_task(n_groups).max(1))
-                                    .enumerate()
-                                    .for_each(|(g, group_out)| {
-                                        let nc = ferrox_quant::Q4_KX8_GEMM_NC;
-                                        let mut tile = vec![0f32; ferrox_quant::Q4_KX8_NROWS * nc];
-                                        for (t, chunk) in acts.chunks(nc).enumerate() {
+                                let nc = ferrox_quant::Q4_KX8_GEMM_NC;
+                                // On the i8mm path, interleave each quad of
+                                // activations once per matmul (llama.cpp
+                                // `ggml_quantize_mat_q8_K_4x8` into `wdata`);
+                                // the kernel used to redo it per row-group.
+                                let act_tiles: Vec<ferrox_quant::Q8KActsX4> =
+                                    if ferrox_quant::q4_kx8_gemm_uses_acts_x4(interleave) {
+                                        acts.par_chunks(nc)
+                                            .map(|chunk| {
+                                                ferrox_quant::prepare_q8_k_acts_x4(chunk, cols)
+                                            })
+                                            .collect()
+                                    } else {
+                                        Vec::new()
+                                    };
+                                let n_tiles = batch_size.div_ceil(nc);
+                                Self::par_chunked_groups(
+                                    n_groups,
+                                    ferrox_quant::Q4_KX8_NROWS,
+                                    n_tiles,
+                                    nc,
+                                    |g, t0, t1| {
+                                        let mut tile = [0f32;
+                                            ferrox_quant::Q4_KX8_NROWS
+                                                * ferrox_quant::Q4_KX8_GEMM_NC];
+                                        for t in t0..t1 {
+                                            let chunk =
+                                                &acts[t * nc..((t + 1) * nc).min(batch_size)];
                                             let n = chunk.len();
                                             let tile = &mut tile[..ferrox_quant::Q4_KX8_NROWS * n];
-                                            ferrox_quant::gemm_q4_kx8_group(
-                                                &packed, g, chunk, cols, interleave, tile,
-                                            );
-                                            for r in 0..ferrox_quant::Q4_KX8_NROWS {
-                                                for j in 0..n {
-                                                    group_out[r * batch_size + t * nc + j] =
-                                                        tile[r * n + j];
+                                            if act_tiles.is_empty() {
+                                                ferrox_quant::gemm_q4_kx8_group(
+                                                    &packed, g, chunk, cols, interleave, tile,
+                                                );
+                                            } else {
+                                                ferrox_quant::gemm_q4_kx8_group_x4(
+                                                    &packed,
+                                                    g,
+                                                    &act_tiles[t],
+                                                    cols,
+                                                    interleave,
+                                                    tile,
+                                                );
+                                            }
+                                            for j in 0..n {
+                                                let col = (t * nc + j) * rows
+                                                    + g * ferrox_quant::Q4_KX8_NROWS;
+                                                for r in 0..ferrox_quant::Q4_KX8_NROWS {
+                                                    unsafe {
+                                                        out_w.set(col + r, tile[r * n + j]);
+                                                    }
                                                 }
                                             }
                                         }
-                                    });
+                                    },
+                                );
                                 let data_slice = data.as_slice();
-                                by_row[n_groups * group_stride..]
-                                    .par_chunks_mut(batch_size)
-                                    .with_min_len(Self::min_rows_per_task(
-                                        *rows - n_groups * ferrox_quant::Q4_KX8_NROWS,
-                                    ))
-                                    .enumerate()
-                                    .for_each(|(i, out_row)| {
+                                let tail = *rows - n_groups * ferrox_quant::Q4_KX8_NROWS;
+                                (0..tail)
+                                    .into_par_iter()
+                                    .with_min_len(Self::min_rows_per_task(tail))
+                                    .for_each(|i| {
                                         let r = n_groups * ferrox_quant::Q4_KX8_NROWS + i;
                                         let row = &data_slice[r * row_bytes..(r + 1) * row_bytes];
                                         for (b, act) in acts.iter().enumerate() {
-                                            out_row[b] = ferrox_quant::dot_q4_k_q8(row, act);
+                                            unsafe {
+                                                out_w.set(
+                                                    b * rows + r,
+                                                    ferrox_quant::dot_q4_k_q8(row, act),
+                                                );
+                                            }
                                         }
                                     });
                             } else {
-                                by_row
-                                    .par_chunks_mut(batch_size)
+                                (0..*rows)
+                                    .into_par_iter()
                                     .with_min_len(Self::min_rows_per_task(*rows))
-                                    .enumerate()
-                                    .for_each(|(r, out_row)| {
+                                    .for_each(|r| {
                                         let row =
                                             &data.as_slice()[r * row_bytes..(r + 1) * row_bytes];
                                         for (b, act) in acts.iter().enumerate() {
-                                            out_row[b] = ferrox_quant::dot_q4_k_q8(row, act);
+                                            unsafe {
+                                                out_w.set(
+                                                    b * rows + r,
+                                                    ferrox_quant::dot_q4_k_q8(row, act),
+                                                );
+                                            }
                                         }
                                     });
-                            }
-                            let mut out = vec![0f32; batch_size * rows];
-                            for r in 0..*rows {
-                                for b in 0..batch_size {
-                                    out[b * rows + r] = by_row[r * batch_size + b];
-                                }
                             }
                             return out;
                         }
                         QuantKind::Q5K if cols.is_multiple_of(256) => {
-                            let acts: Vec<_> = (0..batch_size)
-                                .into_par_iter()
-                                .map(|b| {
-                                    ferrox_quant::quantize_activations_q8_k(
-                                        &x_batch[b * cols..(b + 1) * cols],
-                                    )
-                                })
-                                .collect();
+                            let acts_owned: Vec<_>;
+                            let acts: &[ferrox_quant::Q8KActivations] = match shared {
+                                Some(BatchActs::Q8K(a)) if a.len() == batch_size => a,
+                                _ => {
+                                    acts_owned = (0..batch_size)
+                                        .into_par_iter()
+                                        .map(|b| {
+                                            ferrox_quant::quantize_activations_q8_k(
+                                                &x_batch[b * cols..(b + 1) * cols],
+                                            )
+                                        })
+                                        .collect();
+                                    &acts_owned
+                                }
+                            };
                             // Q5_Kx8 multi-act NEON GEMM amortizes weight unpack.
                             let use_kx8 = cfg!(target_arch = "aarch64");
                             let n_groups = if use_kx8 {
@@ -1475,51 +1865,85 @@ impl WeightMatrix {
                             if n_groups > 0 {
                                 let interleave = ferrox_quant::q5_kx8_interleave();
                                 let packed = get_or_repack_q5k(data.as_slice(), *rows, cols);
-                                let group_stride = ferrox_quant::Q5_KX8_NROWS * batch_size;
-                                by_row[..n_groups * group_stride]
-                                    .par_chunks_mut(group_stride)
-                                    .with_min_len(Self::min_rows_per_task(n_groups).max(1))
-                                    .enumerate()
-                                    .for_each(|(g, group_out)| {
-                                        let nc = ferrox_quant::Q5_KX8_GEMM_NC;
-                                        let mut tile = vec![0f32; ferrox_quant::Q5_KX8_NROWS * nc];
-                                        for (t, chunk) in acts.chunks(nc).enumerate() {
+                                let nc = ferrox_quant::Q5_KX8_GEMM_NC;
+                                // On the i8mm path, interleave each quad of
+                                // activations once per matmul; the kernel
+                                // consumes it for every row-group.
+                                let act_tiles: Vec<ferrox_quant::Q8KActsX4> =
+                                    if ferrox_quant::q5_kx8_gemm_uses_acts_x4(interleave) {
+                                        acts.par_chunks(nc)
+                                            .map(|chunk| {
+                                                ferrox_quant::prepare_q8_k_acts_x4(chunk, cols)
+                                            })
+                                            .collect()
+                                    } else {
+                                        Vec::new()
+                                    };
+                                let n_tiles = batch_size.div_ceil(nc);
+                                Self::par_chunked_groups(
+                                    n_groups,
+                                    ferrox_quant::Q5_KX8_NROWS,
+                                    n_tiles,
+                                    nc,
+                                    |g, t0, t1| {
+                                        let mut tile = [0f32;
+                                            ferrox_quant::Q5_KX8_NROWS
+                                                * ferrox_quant::Q5_KX8_GEMM_NC];
+                                        for t in t0..t1 {
+                                            let chunk =
+                                                &acts[t * nc..((t + 1) * nc).min(batch_size)];
                                             let n = chunk.len();
                                             let tile = &mut tile[..ferrox_quant::Q5_KX8_NROWS * n];
-                                            ferrox_quant::gemm_q5_kx8_group(
-                                                &packed, g, chunk, cols, interleave, tile,
-                                            );
-                                            for r in 0..ferrox_quant::Q5_KX8_NROWS {
-                                                for j in 0..n {
-                                                    group_out[r * batch_size + t * nc + j] =
-                                                        tile[r * n + j];
+                                            if act_tiles.is_empty() {
+                                                ferrox_quant::gemm_q5_kx8_group(
+                                                    &packed, g, chunk, cols, interleave, tile,
+                                                );
+                                            } else {
+                                                ferrox_quant::gemm_q5_kx8_group_x4(
+                                                    &packed,
+                                                    g,
+                                                    &act_tiles[t],
+                                                    cols,
+                                                    interleave,
+                                                    tile,
+                                                );
+                                            }
+                                            for j in 0..n {
+                                                let col = (t * nc + j) * rows
+                                                    + g * ferrox_quant::Q5_KX8_NROWS;
+                                                for r in 0..ferrox_quant::Q5_KX8_NROWS {
+                                                    unsafe {
+                                                        out_w.set(col + r, tile[r * n + j]);
+                                                    }
                                                 }
                                             }
                                         }
-                                    });
+                                    },
+                                );
                                 let data_slice = data.as_slice();
-                                by_row[n_groups * group_stride..]
-                                    .par_chunks_mut(batch_size)
-                                    .with_min_len(Self::min_rows_per_task(
-                                        *rows - n_groups * ferrox_quant::Q5_KX8_NROWS,
-                                    ))
-                                    .enumerate()
-                                    .for_each(|(i, out_row)| {
+                                let tail = *rows - n_groups * ferrox_quant::Q5_KX8_NROWS;
+                                (0..tail)
+                                    .into_par_iter()
+                                    .with_min_len(Self::min_rows_per_task(tail))
+                                    .for_each(|i| {
                                         let r = n_groups * ferrox_quant::Q5_KX8_NROWS + i;
                                         let row = &data_slice[r * row_bytes..(r + 1) * row_bytes];
                                         for (b, act) in acts.iter().enumerate() {
-                                            out_row[b] = ferrox_quant::dot_q5_k_q8(row, act);
+                                            unsafe {
+                                                out_w.set(
+                                                    b * rows + r,
+                                                    ferrox_quant::dot_q5_k_q8(row, act),
+                                                );
+                                            }
                                         }
                                     });
                             } else {
                                 let data_slice = data.as_slice();
-                                by_row
-                                    .par_chunks_mut(batch_size)
+                                (0..*rows)
+                                    .into_par_iter()
                                     .with_min_len(Self::min_rows_per_task(*rows))
-                                    .enumerate()
-                                    .for_each(|(r, out_row)| {
-                                        let row =
-                                            &data_slice[r * row_bytes..(r + 1) * row_bytes];
+                                    .for_each(|r| {
+                                        let row = &data_slice[r * row_bytes..(r + 1) * row_bytes];
                                         let nc = ferrox_quant::Q5_K_GEMM_NC;
                                         for (t, chunk) in acts.chunks(nc).enumerate() {
                                             let n = chunk.len();
@@ -1529,83 +1953,111 @@ impl WeightMatrix {
                                                 chunk,
                                                 &mut tmp[..n],
                                             );
-                                            for j in 0..n {
-                                                out_row[t * nc + j] = tmp[j];
+                                            for (j, v) in tmp[..n].iter().enumerate() {
+                                                unsafe {
+                                                    out_w.set((t * nc + j) * rows + r, *v);
+                                                }
                                             }
                                         }
                                     });
                             }
-                            let mut out = vec![0f32; batch_size * rows];
-                            for r in 0..*rows {
-                                for b in 0..batch_size {
-                                    out[b * rows + r] = by_row[r * batch_size + b];
-                                }
-                            }
                             return out;
                         }
                         QuantKind::Q6K if cols.is_multiple_of(256) => {
-                            let acts: Vec<_> = (0..batch_size)
-                                .into_par_iter()
-                                .map(|b| {
-                                    ferrox_quant::quantize_activations_q8_k(
-                                        &x_batch[b * cols..(b + 1) * cols],
-                                    )
-                                })
-                                .collect();
-                            let use_kx8 = cfg!(target_arch = "aarch64");
+                            let acts_owned: Vec<_>;
+                            let acts: &[ferrox_quant::Q8KActivations] = match shared {
+                                Some(BatchActs::Q8K(a)) if a.len() == batch_size => a,
+                                _ => {
+                                    acts_owned = (0..batch_size)
+                                        .into_par_iter()
+                                        .map(|b| {
+                                            ferrox_quant::quantize_activations_q8_k(
+                                                &x_batch[b * cols..(b + 1) * cols],
+                                            )
+                                        })
+                                        .collect();
+                                    &acts_owned
+                                }
+                            };
+                            // Kx8 batch path only where the i8mm GEMM
+                            // exists (the scalar Kx8 GEMM measured slower
+                            // than the per-row NEON dot on Phi ffn_down,
+                            // so everything else keeps the row path).
+                            let interleave = ferrox_quant::q6_kx8_interleave();
+                            let use_kx8 = ferrox_quant::q6_kx8_gemm_uses_acts_x4(interleave);
                             let n_groups = if use_kx8 {
                                 *rows / ferrox_quant::Q6_KX8_NROWS
                             } else {
                                 0
                             };
                             if n_groups > 0 {
-                                let interleave = ferrox_quant::q6_kx8_interleave();
                                 let packed = get_or_repack_q6k(data.as_slice(), *rows, cols);
-                                let group_stride = ferrox_quant::Q6_KX8_NROWS * batch_size;
-                                by_row[..n_groups * group_stride]
-                                    .par_chunks_mut(group_stride)
-                                    .with_min_len(Self::min_rows_per_task(n_groups).max(1))
-                                    .enumerate()
-                                    .for_each(|(g, group_out)| {
-                                        let nc = ferrox_quant::Q6_KX8_GEMM_NC;
-                                        let mut tile = vec![0f32; ferrox_quant::Q6_KX8_NROWS * nc];
-                                        for (t, chunk) in acts.chunks(nc).enumerate() {
+                                // Quads of 4 (the i8mm tile shape), not
+                                // [`Q6_KX8_GEMM_NC`].
+                                let nc = ferrox_quant::Q8K_ACTS_X4_NC;
+                                let act_tiles: Vec<ferrox_quant::Q8KActsX4> = acts
+                                    .par_chunks(nc)
+                                    .map(|chunk| ferrox_quant::prepare_q8_k_acts_x4(chunk, cols))
+                                    .collect();
+                                let n_tiles = batch_size.div_ceil(nc);
+                                Self::par_chunked_groups(
+                                    n_groups,
+                                    ferrox_quant::Q6_KX8_NROWS,
+                                    n_tiles,
+                                    nc,
+                                    |g, t0, t1| {
+                                        let mut tile = [0f32;
+                                            ferrox_quant::Q6_KX8_NROWS
+                                                * ferrox_quant::Q8K_ACTS_X4_NC];
+                                        for t in t0..t1 {
+                                            let chunk =
+                                                &acts[t * nc..((t + 1) * nc).min(batch_size)];
                                             let n = chunk.len();
                                             let tile = &mut tile[..ferrox_quant::Q6_KX8_NROWS * n];
-                                            ferrox_quant::gemm_q6_kx8_group(
-                                                &packed, g, chunk, cols, interleave, tile,
+                                            ferrox_quant::gemm_q6_kx8_group_x4(
+                                                &packed,
+                                                g,
+                                                &act_tiles[t],
+                                                cols,
+                                                interleave,
+                                                tile,
                                             );
-                                            for r in 0..ferrox_quant::Q6_KX8_NROWS {
-                                                for j in 0..n {
-                                                    group_out[r * batch_size + t * nc + j] =
-                                                        tile[r * n + j];
+                                            for j in 0..n {
+                                                let col = (t * nc + j) * rows
+                                                    + g * ferrox_quant::Q6_KX8_NROWS;
+                                                for r in 0..ferrox_quant::Q6_KX8_NROWS {
+                                                    unsafe {
+                                                        out_w.set(col + r, tile[r * n + j]);
+                                                    }
                                                 }
                                             }
                                         }
-                                    });
+                                    },
+                                );
                                 let data_slice = data.as_slice();
-                                by_row[n_groups * group_stride..]
-                                    .par_chunks_mut(batch_size)
-                                    .with_min_len(Self::min_rows_per_task(
-                                        *rows - n_groups * ferrox_quant::Q6_KX8_NROWS,
-                                    ))
-                                    .enumerate()
-                                    .for_each(|(i, out_row)| {
+                                let tail = *rows - n_groups * ferrox_quant::Q6_KX8_NROWS;
+                                (0..tail)
+                                    .into_par_iter()
+                                    .with_min_len(Self::min_rows_per_task(tail))
+                                    .for_each(|i| {
                                         let r = n_groups * ferrox_quant::Q6_KX8_NROWS + i;
                                         let row = &data_slice[r * row_bytes..(r + 1) * row_bytes];
                                         for (b, act) in acts.iter().enumerate() {
-                                            out_row[b] = ferrox_quant::dot_q6_k_q8(row, act);
+                                            unsafe {
+                                                out_w.set(
+                                                    b * rows + r,
+                                                    ferrox_quant::dot_q6_k_q8(row, act),
+                                                );
+                                            }
                                         }
                                     });
                             } else {
                                 let data_slice = data.as_slice();
-                                by_row
-                                    .par_chunks_mut(batch_size)
+                                (0..*rows)
+                                    .into_par_iter()
                                     .with_min_len(Self::min_rows_per_task(*rows))
-                                    .enumerate()
-                                    .for_each(|(r, out_row)| {
-                                        let row =
-                                            &data_slice[r * row_bytes..(r + 1) * row_bytes];
+                                    .for_each(|r| {
+                                        let row = &data_slice[r * row_bytes..(r + 1) * row_bytes];
                                         let nc = ferrox_quant::Q6_K_GEMM_NC;
                                         for (t, chunk) in acts.chunks(nc).enumerate() {
                                             let mut tmp = [0f32; ferrox_quant::Q6_K_GEMM_NC];
@@ -1615,17 +2067,13 @@ impl WeightMatrix {
                                                 chunk,
                                                 &mut tmp[..n],
                                             );
-                                            for j in 0..n {
-                                                out_row[t * nc + j] = tmp[j];
+                                            for (j, v) in tmp[..n].iter().enumerate() {
+                                                unsafe {
+                                                    out_w.set((t * nc + j) * rows + r, *v);
+                                                }
                                             }
                                         }
                                     });
-                            }
-                            let mut out = vec![0f32; batch_size * rows];
-                            for r in 0..*rows {
-                                for b in 0..batch_size {
-                                    out[b * rows + r] = by_row[r * batch_size + b];
-                                }
                             }
                             return out;
                         }
@@ -1634,24 +2082,18 @@ impl WeightMatrix {
                     }
                 }
 
-                by_row
-                    .par_chunks_mut(batch_size)
+                (0..*rows)
+                    .into_par_iter()
                     .with_min_len(Self::min_rows_per_task(*rows))
-                    .enumerate()
-                    .for_each(|(r, out_row)| {
+                    .for_each(|r| {
                         let row = &data.as_slice()[r * row_bytes..(r + 1) * row_bytes];
                         for b in 0..batch_size {
                             let x = &x_batch[b * cols..(b + 1) * cols];
-                            out_row[b] = Self::dot(*kind, row, x);
+                            unsafe {
+                                out_w.set(b * rows + r, Self::dot(*kind, row, x));
+                            }
                         }
                     });
-
-                let mut out = vec![0f32; batch_size * rows];
-                for r in 0..*rows {
-                    for b in 0..batch_size {
-                        out[b * rows + r] = by_row[r * batch_size + b];
-                    }
-                }
                 out
             }
             WeightMatrix::Mxfp4 {
@@ -1662,28 +2104,26 @@ impl WeightMatrix {
             } => {
                 let packed_row_bytes = cols / 2;
                 let scale_row_bytes = cols / ferrox_quant::MXFP4_GROUP_SIZE;
-                let mut by_row = vec![0f32; rows * batch_size];
-                by_row
-                    .par_chunks_mut(batch_size)
+                let mut out = vec![0f32; batch_size * rows];
+                let out_w = BatchOut(out.as_mut_ptr());
+                (0..*rows)
+                    .into_par_iter()
                     .with_min_len(Self::min_rows_per_task(*rows))
-                    .enumerate()
-                    .for_each(|(r, out_row)| {
+                    .for_each(|r| {
                         let prow =
                             &packed.as_slice()[r * packed_row_bytes..(r + 1) * packed_row_bytes];
                         let srow =
                             &scale.as_slice()[r * scale_row_bytes..(r + 1) * scale_row_bytes];
                         for b in 0..batch_size {
                             let x = &x_batch[b * cols..(b + 1) * cols];
-                            out_row[b] = ferrox_quant::dot_mxfp4_row_f32(prow, srow, x);
+                            unsafe {
+                                out_w.set(
+                                    b * rows + r,
+                                    ferrox_quant::dot_mxfp4_row_f32(prow, srow, x),
+                                );
+                            }
                         }
                     });
-
-                let mut out = vec![0f32; batch_size * rows];
-                for r in 0..*rows {
-                    for b in 0..batch_size {
-                        out[b * rows + r] = by_row[r * batch_size + b];
-                    }
-                }
                 out
             }
         }
@@ -2728,6 +3168,181 @@ mod tests {
                     "batch row {b}: sequential={s} batched={fb}"
                 );
             }
+        }
+    }
+
+    /// Minimal f16 encode for small positive normals (test fixtures only).
+    fn f16_le(x: f32) -> [u8; 2] {
+        let bits = x.to_bits();
+        let exp = ((bits >> 23) & 0xff) as i32 - 127 + 15;
+        let mant = (bits >> 13) & 0x3ff;
+        (((exp as u16) << 10) | mant as u16).to_le_bytes()
+    }
+
+    /// Deterministic pseudo-random quantized matrix: every byte pattern is
+    /// a valid weight block, only the f16 scale fields need sane values.
+    fn synth_quant_matrix(kind: QuantKind, rows: usize, cols: usize) -> WeightMatrix {
+        let mut state = 0x1234_5678u32;
+        let mut next = move || {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (state >> 24) as u8
+        };
+        let mut data = Vec::new();
+        match kind {
+            QuantKind::Q8_0 | QuantKind::Q4_0 => {
+                let qs = if kind == QuantKind::Q8_0 { 32 } else { 16 };
+                for _ in 0..rows * (cols / 32) {
+                    data.extend_from_slice(&f16_le(0.02 + f32::from(next()) * 0.0004));
+                    for _ in 0..qs {
+                        data.push(next());
+                    }
+                }
+            }
+            QuantKind::Q4K | QuantKind::Q5K => {
+                let body = if kind == QuantKind::Q4K {
+                    12 + 128
+                } else {
+                    12 + 32 + 128
+                };
+                for _ in 0..rows * (cols / 256) {
+                    data.extend_from_slice(&f16_le(0.01 + f32::from(next()) * 0.0002));
+                    data.extend_from_slice(&f16_le(0.005 + f32::from(next()) * 0.0001));
+                    for _ in 0..body {
+                        data.push(next());
+                    }
+                }
+            }
+            QuantKind::Q6K => {
+                for _ in 0..rows * (cols / 256) {
+                    for _ in 0..128 + 64 + 16 {
+                        data.push(next());
+                    }
+                    data.extend_from_slice(&f16_le(0.01 + f32::from(next()) * 0.0002));
+                }
+            }
+            _ => unreachable!("synth_quant_matrix: unsupported kind"),
+        }
+        WeightMatrix::Quantized {
+            data: WeightBytes::Owned(data),
+            rows,
+            cols,
+            kind,
+        }
+    }
+
+    /// `apply_batch` writes straight into the `[batch][rows]` output from
+    /// parallel tasks (no staging transpose); the shapes here force every
+    /// write pattern: full row-groups, a tail of leftover rows, and both
+    /// full and partial activation tiles. Runs against whatever path
+    /// `FERROX_CPU_INT_DOT` selects, so exercise it both ways.
+    #[test]
+    fn apply_batch_matches_apply_across_kinds_with_groups_and_tail() {
+        let rows = 19; // 2x8-row groups + 3 tail (4x4-row groups + 3 for Q8_0/Q4_0)
+        let cols = 512;
+        let batch_size = 6; // one full 4-activation tile + a partial one
+        let x_batch: Vec<f32> = (0..batch_size * cols)
+            .map(|i| (((i * 31 + 7) % 97) as f32) * 0.021 - 1.0)
+            .collect();
+        for kind in [
+            QuantKind::Q8_0,
+            QuantKind::Q4_0,
+            QuantKind::Q4K,
+            QuantKind::Q5K,
+            QuantKind::Q6K,
+        ] {
+            let matrix = synth_quant_matrix(kind, rows, cols);
+            let batched = matrix.apply_batch(&x_batch, batch_size);
+            assert_eq!(batched.len(), batch_size * rows);
+            for b in 0..batch_size {
+                let x = &x_batch[b * cols..(b + 1) * cols];
+                let sequential = matrix.apply(x);
+                let from_batch = &batched[b * rows..(b + 1) * rows];
+                for (r, (s, got)) in sequential.iter().zip(from_batch.iter()).enumerate() {
+                    let err = (s - got).abs();
+                    assert!(
+                        err / s.abs().max(1.0) < 1e-4,
+                        "{kind:?} batch {b} row {r}: apply()={s} apply_batch={got}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Large enough that `par_chunked_groups` builds a real 2D chunk grid
+    /// (32 row-groups × 17 activation tiles) instead of falling back to
+    /// one-chunk-per-thread — every (group, tile-range) seam in the
+    /// chunked scatter is crossed. The smaller cross-kind test above
+    /// covers the fallback path.
+    #[test]
+    fn apply_batch_chunked_grid_matches_apply() {
+        let rows = 259; // 32 groups of 8 + 3 tail (64 of 4 + 3 for Q8_0/Q4_0)
+        let cols = 512;
+        let batch_size = 66; // 16 full 4-activation tiles + a partial one
+        let x_batch: Vec<f32> = (0..batch_size * cols)
+            .map(|i| (((i * 37 + 5) % 101) as f32) * 0.019 - 0.95)
+            .collect();
+        for kind in [
+            QuantKind::Q8_0,
+            QuantKind::Q4_0,
+            QuantKind::Q4K,
+            QuantKind::Q5K,
+            QuantKind::Q6K,
+        ] {
+            let matrix = synth_quant_matrix(kind, rows, cols);
+            let batched = matrix.apply_batch(&x_batch, batch_size);
+            assert_eq!(batched.len(), batch_size * rows);
+            for b in [0, 1, 31, 32, 64, 65] {
+                let x = &x_batch[b * cols..(b + 1) * cols];
+                let sequential = matrix.apply(x);
+                let from_batch = &batched[b * rows..(b + 1) * rows];
+                for (r, (s, got)) in sequential.iter().zip(from_batch.iter()).enumerate() {
+                    let err = (s - got).abs();
+                    assert!(
+                        err / s.abs().max(1.0) < 1e-4,
+                        "{kind:?} batch {b} row {r}: apply()={s} apply_batch={got}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Sharing one quantized activation batch across projections must be
+    /// invisible in the results: a matching `BatchActs` produces exactly
+    /// what `apply_batch` produces (same quantization, same kernels), and
+    /// a mismatched variant is ignored rather than misused.
+    #[test]
+    fn apply_batch_with_shared_acts_matches_apply_batch() {
+        let rows = 19;
+        let cols = 512;
+        let batch_size = 6;
+        let x_batch: Vec<f32> = (0..batch_size * cols)
+            .map(|i| (((i * 29 + 11) % 89) as f32) * 0.023 - 1.0)
+            .collect();
+        for kind in [
+            QuantKind::Q8_0,
+            QuantKind::Q4_0,
+            QuantKind::Q4K,
+            QuantKind::Q6K,
+        ] {
+            let matrix = synth_quant_matrix(kind, rows, cols);
+            let baseline = matrix.apply_batch(&x_batch, batch_size);
+
+            let shared = matrix.quantize_batch_acts(&x_batch, batch_size);
+            let with_shared = matrix.apply_batch_with_acts(&x_batch, batch_size, shared.as_ref());
+            assert_eq!(
+                baseline, with_shared,
+                "{kind:?}: shared acts changed the result"
+            );
+
+            let wrong = match kind {
+                QuantKind::Q8_0 | QuantKind::Q4_0 => BatchActs::Q8K(Vec::new()),
+                _ => BatchActs::Q8(Vec::new()),
+            };
+            let with_wrong = matrix.apply_batch_with_acts(&x_batch, batch_size, Some(&wrong));
+            assert_eq!(
+                baseline, with_wrong,
+                "{kind:?}: mismatched shared acts were not ignored"
+            );
         }
     }
 

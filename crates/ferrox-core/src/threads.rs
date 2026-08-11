@@ -154,8 +154,7 @@ fn gemv_pool_qos_start_handler(idx: usize) {
     {
         let log = std::env::var_os("FERROX_QOS_LOG").is_some();
         let before = unsafe { qos::qos_class_self() };
-        let rc =
-            unsafe { qos::pthread_set_qos_class_self_np(qos::QOS_CLASS_USER_INTERACTIVE, 0) };
+        let rc = unsafe { qos::pthread_set_qos_class_self_np(qos::QOS_CLASS_USER_INTERACTIVE, 0) };
         if log {
             eprintln!(
                 "ferrox: gemv worker {idx} qos {} -> {} (rc={rc})",

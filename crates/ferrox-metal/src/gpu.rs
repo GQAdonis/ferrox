@@ -3499,11 +3499,7 @@ pub(crate) fn encode_moe_mm_id_map0(
         enc.setBuffer_offset_atIndex(Some(tpe_buf), 0, 1);
         enc.setBuffer_offset_atIndex(Some(mm_ids_buf), 0, 2);
         let mut nt = n_tokens;
-        enc.setBytes_length_atIndex(
-            NonNull::new(&mut nt as *mut u32 as *mut _).unwrap(),
-            4,
-            3,
-        );
+        enc.setBytes_length_atIndex(NonNull::new(&mut nt as *mut u32 as *mut _).unwrap(), 4, 3);
         enc.setThreadgroupMemoryLength_atIndex(smem, 0);
     }
     enc.dispatchThreadgroups_threadsPerThreadgroup(
@@ -3599,23 +3595,11 @@ pub(crate) fn encode_moe_prefill_weighted_sum(
         encoder.setBuffer_offset_atIndex(Some(route_buf), 0, 1);
         encoder.setBuffer_offset_atIndex(Some(out_buf), 0, 2);
         let mut hr = hidden_rows;
-        encoder.setBytes_length_atIndex(
-            NonNull::new(&mut hr as *mut u32 as *mut _).unwrap(),
-            4,
-            3,
-        );
+        encoder.setBytes_length_atIndex(NonNull::new(&mut hr as *mut u32 as *mut _).unwrap(), 4, 3);
         let mut tk = top_k;
-        encoder.setBytes_length_atIndex(
-            NonNull::new(&mut tk as *mut u32 as *mut _).unwrap(),
-            4,
-            4,
-        );
+        encoder.setBytes_length_atIndex(NonNull::new(&mut tk as *mut u32 as *mut _).unwrap(), 4, 4);
         let mut nt = n_tokens;
-        encoder.setBytes_length_atIndex(
-            NonNull::new(&mut nt as *mut u32 as *mut _).unwrap(),
-            4,
-            5,
-        );
+        encoder.setBytes_length_atIndex(NonNull::new(&mut nt as *mut u32 as *mut _).unwrap(), 4, 5);
     }
     let sum_elems = (n_tokens as usize) * (hidden_rows as usize);
     encoder.dispatchThreadgroups_threadsPerThreadgroup(
@@ -3799,11 +3783,7 @@ pub(crate) fn encode_mul_mm_sg_offset_ex(
     let pipeline = ensure_pipeline(device, K_QUANT_MUL_MM_SG_KERNEL_SRC, l.fn_name)?;
     unsafe {
         enc.setComputePipelineState(&pipeline.0);
-        enc.setBuffer_offset_atIndex(
-            Some(&w.buffer),
-            w.weight_offset + weight_byte_offset,
-            0,
-        );
+        enc.setBuffer_offset_atIndex(Some(&w.buffer), w.weight_offset + weight_byte_offset, 0);
         enc.setBuffer_offset_atIndex(Some(x_buf), x_byte_offset, 1);
         enc.setBuffer_offset_atIndex(Some(out_buf), out_byte_offset, 2);
         for (idx, mut v) in [
@@ -5631,8 +5611,7 @@ fn moe_down_id_dispatch(kind: &str) -> Option<MoeMatvecIdDispatch> {
 }
 
 fn moe_row_blocks(row_bytes: usize, kind: &str) -> Result<u32, MetalError> {
-    let (_, _, block_bytes, _, _) =
-        matvec_launch_meta(kind).ok_or(MetalError::CommandFailed)?;
+    let (_, _, block_bytes, _, _) = matvec_launch_meta(kind).ok_or(MetalError::CommandFailed)?;
     Ok((row_bytes / block_bytes) as u32)
 }
 
@@ -5857,25 +5836,13 @@ fn encode_moe_gather_rows(
         encoder.setBuffer_offset_atIndex(Some(dst), 0, 1);
         encoder.setBuffer_offset_atIndex(Some(ids), id_byte, 2);
         let mut bs = batch_size;
-        encoder.setBytes_length_atIndex(
-            NonNull::new(&mut bs as *mut u32 as *mut _).unwrap(),
-            4,
-            3,
-        );
+        encoder.setBytes_length_atIndex(NonNull::new(&mut bs as *mut u32 as *mut _).unwrap(), 4, 3);
         let mut c = cols;
         encoder.setBytes_length_atIndex(NonNull::new(&mut c as *mut u32 as *mut _).unwrap(), 4, 4);
         let mut ss = src_stride;
-        encoder.setBytes_length_atIndex(
-            NonNull::new(&mut ss as *mut u32 as *mut _).unwrap(),
-            4,
-            5,
-        );
+        encoder.setBytes_length_atIndex(NonNull::new(&mut ss as *mut u32 as *mut _).unwrap(), 4, 5);
         let mut ds = dst_stride;
-        encoder.setBytes_length_atIndex(
-            NonNull::new(&mut ds as *mut u32 as *mut _).unwrap(),
-            4,
-            6,
-        );
+        encoder.setBytes_length_atIndex(NonNull::new(&mut ds as *mut u32 as *mut _).unwrap(), 4, 6);
     }
     encoder.dispatchThreadgroups_threadsPerThreadgroup(
         MTLSize {
@@ -5917,25 +5884,13 @@ fn encode_moe_scatter_rows(
         encoder.setBuffer_offset_atIndex(Some(dst), 0, 1);
         encoder.setBuffer_offset_atIndex(Some(ids), id_byte, 2);
         let mut bs = batch_size;
-        encoder.setBytes_length_atIndex(
-            NonNull::new(&mut bs as *mut u32 as *mut _).unwrap(),
-            4,
-            3,
-        );
+        encoder.setBytes_length_atIndex(NonNull::new(&mut bs as *mut u32 as *mut _).unwrap(), 4, 3);
         let mut c = cols;
         encoder.setBytes_length_atIndex(NonNull::new(&mut c as *mut u32 as *mut _).unwrap(), 4, 4);
         let mut ss = src_stride;
-        encoder.setBytes_length_atIndex(
-            NonNull::new(&mut ss as *mut u32 as *mut _).unwrap(),
-            4,
-            5,
-        );
+        encoder.setBytes_length_atIndex(NonNull::new(&mut ss as *mut u32 as *mut _).unwrap(), 4, 5);
         let mut ds = dst_stride;
-        encoder.setBytes_length_atIndex(
-            NonNull::new(&mut ds as *mut u32 as *mut _).unwrap(),
-            4,
-            6,
-        );
+        encoder.setBytes_length_atIndex(NonNull::new(&mut ds as *mut u32 as *mut _).unwrap(), 4, 6);
     }
     encoder.dispatchThreadgroups_threadsPerThreadgroup(
         MTLSize {
@@ -6647,8 +6602,8 @@ pub fn launch_moe_prefill_q4_0(
         let up_buf = scratch.up.as_ref();
         let expert_out_buf = scratch.expert_out.as_ref();
         let out_buf = scratch.out.as_ref();
-            let mm_id_tpe_buf: &ProtocolObject<dyn MTLBuffer> = scratch.mm_id_tpe.as_ref();
-            let mm_id_ids_buf: &ProtocolObject<dyn MTLBuffer> = scratch.mm_id_ids.as_ref();
+        let mm_id_tpe_buf: &ProtocolObject<dyn MTLBuffer> = scratch.mm_id_tpe.as_ref();
+        let mm_id_ids_buf: &ProtocolObject<dyn MTLBuffer> = scratch.mm_id_ids.as_ref();
 
         let cmd_buf = queue.commandBuffer().ok_or(MetalError::CommandFailed)?;
 

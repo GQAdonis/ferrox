@@ -22,7 +22,10 @@ fn gemma4_bpe_roundtrip_and_counts() {
 
     let how = tok.encode("How are you");
     let paris = tok.encode("The capital of France is");
-    assert!(how.len() >= 3, "expected multi-token for How are you, got {how:?}");
+    assert!(
+        how.len() >= 3,
+        "expected multi-token for How are you, got {how:?}"
+    );
     assert_eq!(tok.decode(&how), "How are you");
     assert_eq!(tok.decode(&paris), "The capital of France is");
     assert!(should_add_bos_token(&file));

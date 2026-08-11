@@ -46,9 +46,10 @@
 //!
 //! `FERROX_CTK` selects KV dtype ([`MetalKvDtype`]); see [`is_implemented`].
 use crate::elem::{
-    encode_add_rms_norm, encode_add_rms_norm_batch, encode_argmax, encode_f32_to_f16, encode_gelu_mul, encode_rms_norm_f32_to_f16_batch,
-    encode_rms_norm, encode_rms_norm_at, encode_rms_norm_batch, encode_rms_norm_per_head_batch,
-    encode_silu_mul, encode_vec_add, encode_vec_add_at, warm_prefill_elem_pipelines,
+    encode_add_rms_norm, encode_add_rms_norm_batch, encode_argmax, encode_f32_to_f16,
+    encode_gelu_mul, encode_rms_norm, encode_rms_norm_at, encode_rms_norm_batch,
+    encode_rms_norm_f32_to_f16_batch, encode_rms_norm_per_head_batch, encode_silu_mul,
+    encode_vec_add, encode_vec_add_at, warm_prefill_elem_pipelines,
 };
 use crate::embd::{encode_get_rows, EmbdKind};
 use crate::gpu::{
@@ -57,8 +58,8 @@ use crate::gpu::{
     encode_q4_0_moe_gate_up_silu_fused, encode_q4_0_moe_id, encode_q4_0_moe_id_ex,
     encode_q4_0_moe_topk, encode_q4_0_mul_mm, ensure_pipeline, memory_barrier_buffers,
     memory_barrier_resources, resident_f32_buffer, resident_weight_buffer, shared_metal,
-    warm_mul_mm_sg_pipeline, MatvecLaunch, MetalError, MoeExpertLaunch, MoePackedQ4,
-    MulMmSgLaunch, ResidentF32Buffer, ResidentWeightBuffer,
+    warm_mul_mm_sg_pipeline, MatvecLaunch, MetalError, MoeExpertLaunch, MoePackedQ4, MulMmSgLaunch,
+    ResidentF32Buffer, ResidentWeightBuffer,
 };
 use crate::moe_ranges::MoeMemRanges;
 use objc2::rc::Retained;
@@ -2750,14 +2751,8 @@ fn warm_gqa_prefill_pipeline(
 ) -> Result<(), MetalError> {
     if metal_fa_vec_enabled() && gqa_prefill_fa_vec_supported(head_dim) {
         let (src, name) = match head_dim {
-            64 => (
-                GQA_PREFILL_FA_VEC_D64_KERNEL_SRC,
-                "gqa_prefill_fa_vec_d64",
-            ),
-            96 => (
-                GQA_PREFILL_FA_VEC_D96_KERNEL_SRC,
-                "gqa_prefill_fa_vec_d96",
-            ),
+            64 => (GQA_PREFILL_FA_VEC_D64_KERNEL_SRC, "gqa_prefill_fa_vec_d64"),
+            96 => (GQA_PREFILL_FA_VEC_D96_KERNEL_SRC, "gqa_prefill_fa_vec_d96"),
             128 => (GQA_PREFILL_FA_VEC_KERNEL_SRC, "gqa_prefill_fa_vec"),
             256 => (
                 GQA_PREFILL_FA_VEC_D256_KERNEL_SRC,
@@ -2862,15 +2857,13 @@ fn borrow_prefill_scratch(
                 && s.max_q_cap >= caps.max_q
                 && s.max_kv_cap >= caps.max_kv
                 && s.max_gate_cap >= caps.max_gate
-                && s.half_act_cap
-                    >= caps.batch * caps.hidden.max(caps.max_q).max(caps.max_gate)
+                && s.half_act_cap >= caps.batch * caps.hidden.max(caps.max_q).max(caps.max_gate)
         }
         None => false,
     };
     if !fits {
         let bh = caps.batch * caps.hidden;
-        let half_cap = caps.batch
-            * caps.hidden.max(caps.max_q).max(caps.max_gate);
+        let half_cap = caps.batch * caps.hidden.max(caps.max_q).max(caps.max_gate);
         *guard = Some(PrefillScratch {
             h: alloc_f32_buffer(device, bh)?,
             x: alloc_f32_buffer(device, bh)?,
@@ -3991,21 +3984,8 @@ fn encode_attn_extras(
 ) -> Result<(), MetalError> {
     let resident = resident_attn_extras(device, extras)?;
     encode_attn_extras_batch(
-        encoder,
-        device,
-        extras,
-        q_buf,
-        k_buf,
-        v_buf,
-        q_rows,
-        k_rows,
-        v_rows,
-        n_heads,
-        n_kv_heads,
-        head_dim,
-        1,
-        rms_eps,
-        &resident,
+        encoder, device, extras, q_buf, k_buf, v_buf, q_rows, k_rows, v_rows, n_heads, n_kv_heads,
+        head_dim, 1, rms_eps, &resident,
     )
 }
 
@@ -6623,9 +6603,33 @@ fn encode_prefill_dense_layer(
         rms_eps,
     )?;
     memory_barrier_buffers(encoder);
-    encode_mul_mm_sg_f16(encoder, device, &layer.q, &resident.q_w, half_act, q_buf, batch)?;
-    encode_mul_mm_sg_f16(encoder, device, &layer.k, &resident.k_w, half_act, k_buf, batch)?;
-    encode_mul_mm_sg_f16(encoder, device, &layer.v, &resident.v_w, half_act, v_buf, batch)?;
+    encode_mul_mm_sg_f16(
+        encoder,
+        device,
+        &layer.q,
+        &resident.q_w,
+        half_act,
+        q_buf,
+        batch,
+    )?;
+    encode_mul_mm_sg_f16(
+        encoder,
+        device,
+        &layer.k,
+        &resident.k_w,
+        half_act,
+        k_buf,
+        batch,
+    )?;
+    encode_mul_mm_sg_f16(
+        encoder,
+        device,
+        &layer.v,
+        &resident.v_w,
+        half_act,
+        v_buf,
+        batch,
+    )?;
     memory_barrier_buffers(encoder);
 
     encode_attn_extras_batch(
@@ -6695,9 +6699,23 @@ fn encode_prefill_dense_layer(
     )?;
     memory_barrier_buffers(encoder);
 
-    encode_f32_to_f16(encoder, device, attn_buf, half_act, (batch * layer.q.rows) as u32)?;
+    encode_f32_to_f16(
+        encoder,
+        device,
+        attn_buf,
+        half_act,
+        (batch * layer.q.rows) as u32,
+    )?;
     memory_barrier_buffers(encoder);
-    encode_mul_mm_sg_f16(encoder, device, &layer.o, &resident.o_w, half_act, o_buf, batch)?;
+    encode_mul_mm_sg_f16(
+        encoder,
+        device,
+        &layer.o,
+        &resident.o_w,
+        half_act,
+        o_buf,
+        batch,
+    )?;
     memory_barrier_buffers(encoder);
 
     if let Some(pw) = resident.post_attn_w.as_ref() {
@@ -6743,10 +6761,32 @@ fn encode_prefill_dense_layer(
     }
     memory_barrier_buffers(encoder);
 
-    encode_f32_to_f16(encoder, device, x2_buf, half_act, (batch * hidden_dim) as u32)?;
+    encode_f32_to_f16(
+        encoder,
+        device,
+        x2_buf,
+        half_act,
+        (batch * hidden_dim) as u32,
+    )?;
     memory_barrier_buffers(encoder);
-    encode_mul_mm_sg_f16(encoder, device, &layer.gate, &resident.gate_w, half_act, gate_buf, batch)?;
-    encode_mul_mm_sg_f16(encoder, device, &layer.up, &resident.up_w, half_act, up_buf, batch)?;
+    encode_mul_mm_sg_f16(
+        encoder,
+        device,
+        &layer.gate,
+        &resident.gate_w,
+        half_act,
+        gate_buf,
+        batch,
+    )?;
+    encode_mul_mm_sg_f16(
+        encoder,
+        device,
+        &layer.up,
+        &resident.up_w,
+        half_act,
+        up_buf,
+        batch,
+    )?;
     memory_barrier_buffers(encoder);
     let ffn_elems = (batch * layer.gate.rows) as u32;
     if gelu_ffn {
@@ -6755,9 +6795,23 @@ fn encode_prefill_dense_layer(
         encode_silu_mul(encoder, device, gate_buf, up_buf, act_buf, ffn_elems)?;
     }
     memory_barrier_buffers(encoder);
-    encode_f32_to_f16(encoder, device, act_buf, half_act, (batch * layer.gate.rows) as u32)?;
+    encode_f32_to_f16(
+        encoder,
+        device,
+        act_buf,
+        half_act,
+        (batch * layer.gate.rows) as u32,
+    )?;
     memory_barrier_buffers(encoder);
-    encode_mul_mm_sg_f16(encoder, device, &layer.down, &resident.down_w, half_act, down_buf, batch)?;
+    encode_mul_mm_sg_f16(
+        encoder,
+        device,
+        &layer.down,
+        &resident.down_w,
+        half_act,
+        down_buf,
+        batch,
+    )?;
     memory_barrier_buffers(encoder);
 
     if let Some(pw) = resident.post_ffn_w.as_ref() {
@@ -6841,11 +6895,7 @@ pub fn launch_prefill_dense_stack(
     }
 
     let max_q = layers.iter().map(|l| l.q.rows).max().unwrap();
-    let max_kv = layers
-        .iter()
-        .map(|l| l.k.rows.max(l.v.rows))
-        .max()
-        .unwrap();
+    let max_kv = layers.iter().map(|l| l.k.rows.max(l.v.rows)).max().unwrap();
     let max_gate = layers.iter().map(|l| l.gate.rows).max().unwrap();
 
     let timing = std::env::var_os("FERROX_METAL_MM_TIMING").is_some();

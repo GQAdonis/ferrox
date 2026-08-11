@@ -10,5 +10,4 @@ readme = "README.md"
 
 [dependencies]
 half = { workspace = true }
-rayon = { workspace = true }
 thiserror = { workspace = true }

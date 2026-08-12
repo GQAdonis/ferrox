@@ -25,6 +25,12 @@ todos:
     status: pending
   - id: metal-fa-mma
     content: "Port kernel_flash_attn_ext MMA (Q.K^T AND P.V via simdgroup_half8x8) for d=64/128 — attn.rs has ZERO simdgroup MMA today, 16 of 128 lanes active. This is the sub-1.5B Metal prefill gap"
+    status: completed
+  - id: metal-fa-mma-d256
+    content: "Extend the MMA macro to d=256 (Gemma-3 metal pp512 1.17x). Blocked on the epilogue: `own` gives one float4 per lane, so D/4 <= 32 caps the macro at 128 — needs a lane loop"
+    status: pending
+  - id: suite-owed-d128
+    content: "OWED: full --suite + --render on a quiet host for the d=128 MMA (commit 0ee4d0b). Skipped at the user's call because Host B sat at load 2.4-3.5; RESULTS.md still shows the pre-d128 numbers"
     status: pending
   - id: metal-moe-stack
     content: "Move MoE layers onto the fused prefill stack: MoE PrefillDenseLayerMetal variant, GPU router+top-k, wire the already-written-but-uncalled encode_moe_mm_id_map0. Kills ~112 command buffers per pp512"
@@ -131,6 +137,35 @@ target and it is a known-shaped job, not an open question. d=256
 Worst remaining rows overall are now **MoE and CPU**, not dense Metal
 prefill: OLMoE metal pp512 2.48x, Qwen3-0.6B metal 1.81x (above),
 Gemma-3-1B cpu pp512 1.94x.
+
+## d=128 MMA (2026-08-12, commit 0ee4d0b) — every d=128 Metal row closed
+
+The d=64 kernel body is now parameterised over the head dim, so one macro
+emits both `gqa_prefill_fa_ext_mma_d64` and `_d128`. Interleaved A/B,
+`-p 512 -n 0 -r 3 --ngl 99`, two reps per arm:
+
+| Model | fa_vec | mma | speedup | llama | gap |
+|---|---|---|---|---|---|
+| Qwen3-0.6B Q8_0 | 1917 | **3277** | 1.71x | 3509.65 | 1.81x -> **1.07x** |
+| Phi-4-mini Q4_K_M | 450 | **540** | 1.20x | 561.98 | 1.24x -> **1.04x** |
+| Llama-3.2-3B Q4_K_M | 523 | **630** | 1.20x | 563.26 | 1.08x -> **0.89x** |
+| Mistral-7B Q4_K_M | 235 | **266** | 1.13x | 256.55 | 1.10x -> **0.97x** |
+
+Greedy output is byte-identical with MMA on and off on Qwen3-0.6B and
+Phi-4-mini at a 16-token prompt. `gqa_prefill_fa_ext_mma_d128_matches_cpu_and_fa_vec`
+covers padded tails, exact 8-row fits and long-prefix/short-batch.
+
+**Owed: a suite run.** Host B sat at load 2.4-3.5 for the whole session
+(user applications), above the 2.0 bar, so `RESULTS.md` was deliberately
+not regenerated and still advertises Qwen3-0.6B metal at 1.81x. The A/B
+above is interleaved and valid as a *relative* measurement only. Run
+`--suite --fit-host --skip-missing` + `--render` on the next quiet window
+before any further Metal change, so this and the next change are not
+measured together.
+
+Only d=256 (Gemma-3, metal pp512 1.17x) is left without an MMA kernel.
+It needs a lane loop in the epilogue: `own` gives each lane one `float4`
+of the output row, which caps the macro at D/4 <= 32.
 
 ### Rejected: the persistent-threadpool branch
 

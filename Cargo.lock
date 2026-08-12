@@ -411,7 +411,7 @@ dependencies = [
 
 [[package]]
 name = "ferrox-cli"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -431,7 +431,7 @@ dependencies = [
 
 [[package]]
 name = "ferrox-core"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "anyhow",
  "ferrox-cuda",
@@ -445,7 +445,7 @@ dependencies = [
 
 [[package]]
 name = "ferrox-cuda"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "cudarc",
  "ferrox-quant",
@@ -455,7 +455,7 @@ dependencies = [
 
 [[package]]
 name = "ferrox-gguf"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "anyhow",
  "byteorder",
@@ -465,7 +465,7 @@ dependencies = [
 
 [[package]]
 name = "ferrox-metal"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "ferrox-quant",
  "half",
@@ -478,7 +478,7 @@ dependencies = [
 
 [[package]]
 name = "ferrox-models"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "anyhow",
  "base64",
@@ -500,7 +500,7 @@ dependencies = [
 
 [[package]]
 name = "ferrox-moe"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "anyhow",
  "ferrox-core",
@@ -510,7 +510,7 @@ dependencies = [
 
 [[package]]
 name = "ferrox-quant"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "half",
  "thiserror",
@@ -518,7 +518,7 @@ dependencies = [
 
 [[package]]
 name = "ferrox-safetensors"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "byteorder",
  "memmap2",
@@ -529,7 +529,7 @@ dependencies = [
 
 [[package]]
 name = "ferrox-server"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "anyhow",
  "axum",

@@ -1854,11 +1854,23 @@ kernel void gqa_prefill_fa_ext_d64(
 ///    memory and the MMA reads that. Groups entirely past the cache are
 ///    skipped: the causal mask forces their `ss` columns to `-INFINITY`
 ///    (`ic + cc >= kv_valid >= clen`), hence P = 0, hence no P·V contribution.
-const GQA_PREFILL_FA_EXT_MMA_D64_KERNEL_SRC: &str = r#"
+///
+/// Parameterised over the head dim: every shape constant below is derived from
+/// `D`, so the same body serves d=64 and d=128. Two limits bound it. `own`
+/// assigns one `float4` of the output row per lane, so `D/4 <= 32`, i.e.
+/// `D <= 128` — d=256 (Gemma-3) needs a lane loop and is not instantiated here.
+/// And `D % 16 == 0`, because the Q·Kᵀ loop walks the head 16 columns at a
+/// time as a pair of 8×8 MMAs.
+macro_rules! gqa_prefill_fa_ext_mma_src {
+    ($name:literal, $d:literal) => {
+        concat!(
+            r#"
 #include <metal_stdlib>
 using namespace metal;
 
-kernel void gqa_prefill_fa_ext_mma_d64(
+kernel void "#,
+            $name,
+            r#"(
     device const float* q [[buffer(0)]],
     device const half* k_cache [[buffer(1)]],
     device const half* v_cache [[buffer(2)]],
@@ -1874,9 +1886,11 @@ kernel void gqa_prefill_fa_ext_mma_d64(
     ushort sgitg [[simdgroup_index_in_threadgroup]],
     threadgroup float* shared [[threadgroup(0)]]
 ) {
-    constexpr uint D = 64u;          // DK == DV == PV
-    constexpr uint D4 = 16u;         // D / 4
-    constexpr uint D8 = 8u;          // D / 8: 8-wide MMA steps along the head
+    constexpr uint D = "#,
+            $d,
+            r#"u;          // DK == DV == PV
+    constexpr uint D4 = D / 4u;      // output float4 columns == owning lanes
+    constexpr uint D8 = D / 8u;      // D / 8: 8-wide MMA steps along the head
     constexpr uint QN = 8u;          // queries per threadgroup
     constexpr uint C = 64u;          // keys per threadgroup chunk
     constexpr uint NW = 32u;
@@ -2086,7 +2100,18 @@ kernel void gqa_prefill_fa_ext_mma_d64(
         out4[tiisg] = so4[tiisg] * inv;
     }
 }
-"#;
+"#
+        )
+    };
+}
+
+const GQA_PREFILL_FA_EXT_MMA_D64_KERNEL_SRC: &str =
+    gqa_prefill_fa_ext_mma_src!("gqa_prefill_fa_ext_mma_d64", "64");
+/// Qwen3-0.6B / Phi-4-mini / Mistral shape: head_dim 128. There is no scalar
+/// `fa_ext` predecessor at this width (that kernel is d=64-only), so the A/B
+/// reference for both correctness and timing is `gqa_prefill_fa_vec`.
+const GQA_PREFILL_FA_EXT_MMA_D128_KERNEL_SRC: &str =
+    gqa_prefill_fa_ext_mma_src!("gqa_prefill_fa_ext_mma_d128", "128");
 
 const GQA_PREFILL_FA_VEC_D256_KERNEL_SRC: &str = r#"
 #include <metal_stdlib>
@@ -3823,8 +3848,13 @@ fn encode_gqa_prefill_fa_nq4_d64(
 }
 
 /// llama `kernel_flash_attn_ext` dispatch: QN=8, C=64, NSG=4 (128 threads/TG).
+///
+/// `head_dim` must be 64 or 128 — the two widths the MMA kernel is
+/// instantiated at. The scalar `fa_ext` predecessor only exists at d=64, so
+/// `FERROX_METAL_FA_MMA=0` is honoured there and the caller keeps d=128 off
+/// this path entirely when MMA is disabled.
 #[allow(clippy::too_many_arguments)]
-fn encode_gqa_prefill_fa_ext_d64(
+fn encode_gqa_prefill_fa_ext(
     encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
     device: &Retained<ProtocolObject<dyn MTLDevice>>,
     q: &ProtocolObject<dyn MTLBuffer>,
@@ -3833,35 +3863,41 @@ fn encode_gqa_prefill_fa_ext_d64(
     out: &ProtocolObject<dyn MTLBuffer>,
     n_heads: u32,
     n_kv_heads: u32,
+    head_dim: u32,
     n_q: u32,
     kv_prefix_len: u32,
     softcap: f32,
 ) -> Result<(), MetalError> {
     const QN: u32 = 8;
     const C: u32 = 64;
-    const D: u32 = 64;
     const NSG: u32 = 4;
     const SH: u32 = 2 * C;
-    let mma = gqa_prefill_fa_mma_d64_enabled();
-    let pipe = if mma {
-        ensure_pipeline(
+    let d = head_dim;
+    let mma = gqa_prefill_fa_mma_enabled();
+    let pipe = match (d, mma) {
+        (64, true) => ensure_pipeline(
             device,
             GQA_PREFILL_FA_EXT_MMA_D64_KERNEL_SRC,
             "gqa_prefill_fa_ext_mma_d64",
-        )?
-    } else {
-        ensure_pipeline(
+        )?,
+        (128, true) => ensure_pipeline(
+            device,
+            GQA_PREFILL_FA_EXT_MMA_D128_KERNEL_SRC,
+            "gqa_prefill_fa_ext_mma_d128",
+        )?,
+        (64, false) => ensure_pipeline(
             device,
             GQA_PREFILL_FA_EXT_D64_KERNEL_SRC,
             "gqa_prefill_fa_ext_d64",
-        )?
+        )?,
+        _ => return Err(MetalError::CommandFailed),
     };
     encoder.setComputePipelineState(&pipe.0);
     let tg = 32 * NSG;
     // sq[QN,D] + so[QN,D] + ss[QN,SH], plus kpad[8,D]+vpad[8,D] as f16 for the
-    // MMA variant's ≤7-row cache tail.
+    // MMA variant's ≤7-row cache tail. 10 KiB at d=64, 16 KiB at d=128.
     let tg_mem =
-        ((2 * QN * D + QN * SH) * 4) as usize + if mma { (2 * 8 * D * 2) as usize } else { 0 };
+        ((2 * QN * d + QN * SH) * 4) as usize + if mma { (2 * 8 * d * 2) as usize } else { 0 };
     unsafe {
         encoder.setBuffer_offset_atIndex(Some(q), 0, 0);
         encoder.setBuffer_offset_atIndex(Some(k), 0, 1);
@@ -3875,7 +3911,7 @@ fn encode_gqa_prefill_fa_ext_d64(
             4,
             5,
         );
-        let mut hd = D;
+        let mut hd = d;
         encoder.setBytes_length_atIndex(NonNull::new(&mut hd as *mut u32 as *mut _).unwrap(), 4, 6);
         let mut nq = n_q;
         encoder.setBytes_length_atIndex(NonNull::new(&mut nq as *mut u32 as *mut _).unwrap(), 4, 7);
@@ -3913,11 +3949,12 @@ fn gqa_prefill_fa_ext_d64_enabled() -> bool {
     )
 }
 
-/// Simdgroup-MMA score + P·V inside the d=64 `fa_ext` kernel. Default on.
-/// `FERROX_METAL_FA_MMA=0` selects the scalar `dot`+`simd_sum` predecessor,
-/// which computes the same thing and is the A/B reference for both the
-/// correctness diff and any timing comparison.
-fn gqa_prefill_fa_mma_d64_enabled() -> bool {
+/// Simdgroup-MMA score + P·V inside the `fa_ext` kernel. Default on.
+/// `FERROX_METAL_FA_MMA=0` selects the scalar `dot`+`simd_sum` predecessor at
+/// d=64, which computes the same thing and is the A/B reference for both the
+/// correctness diff and any timing comparison. At d=128 there is no scalar
+/// `fa_ext`, so the same knob sends that width back to FA-vec instead.
+fn gqa_prefill_fa_mma_enabled() -> bool {
     !matches!(
         std::env::var("FERROX_METAL_FA_MMA").ok().as_deref(),
         Some("0") | Some("false") | Some("off") | Some("scalar")
@@ -3939,11 +3976,15 @@ fn encode_gqa_prefill_fa_vec(
     kv_prefix_len: u32,
     softcap: f32,
 ) -> Result<(), MetalError> {
-    // llama flash_attn_ext (MMA Q·Kᵀ + P·V, QN=8/C=64): default for d=64 prefill.
-    // Opt out: FERROX_METAL_FA_EXT=0. Legacy NQ=4: FERROX_METAL_FA_NQ=4.
-    if head_dim == 64 && n_q >= 8 {
+    // llama flash_attn_ext (MMA Q·Kᵀ + P·V, QN=8/C=64): default for d=64 and
+    // d=128 prefill. Opt out: FERROX_METAL_FA_EXT=0. Legacy NQ=4:
+    // FERROX_METAL_FA_NQ=4 (d=64 only).
+    //
+    // d=128 has no scalar `fa_ext` kernel, so `FERROX_METAL_FA_MMA=0` sends it
+    // back to FA-vec rather than to a variant that does not exist.
+    if (head_dim == 64 || (head_dim == 128 && gqa_prefill_fa_mma_enabled())) && n_q >= 8 {
         if gqa_prefill_fa_ext_d64_enabled() {
-            return encode_gqa_prefill_fa_ext_d64(
+            return encode_gqa_prefill_fa_ext(
                 encoder,
                 device,
                 q,
@@ -3952,15 +3993,17 @@ fn encode_gqa_prefill_fa_vec(
                 out,
                 n_heads,
                 n_kv_heads,
+                head_dim,
                 n_q,
                 kv_prefix_len,
                 softcap,
             );
         }
-        let use_nq4 = matches!(
-            std::env::var("FERROX_METAL_FA_NQ").ok().as_deref(),
-            Some("4") | Some("nq4") | Some("on") | Some("true")
-        );
+        let use_nq4 = head_dim == 64
+            && matches!(
+                std::env::var("FERROX_METAL_FA_NQ").ok().as_deref(),
+                Some("4") | Some("nq4") | Some("on") | Some("true")
+            );
         if use_nq4 {
             return encode_gqa_prefill_fa_nq4_d64(
                 encoder,
@@ -8734,6 +8777,108 @@ mod tests {
                 max_diff <= 1e-4,
                 "mma vs scalar hd={head_dim} n_q={n_q} pre={kv_prefix_len} \
                  sc={softcap:?} max_diff={max_diff} worst={worst:?}"
+            );
+        }
+    }
+
+    /// The d=128 MMA kernel (Qwen3-0.6B / Phi-4-mini / Mistral shape) against
+    /// the f32 CPU reference **and** against FA-vec, which is the only other
+    /// kernel at this width and therefore the A/B baseline. Same shape sweep as
+    /// the d=64 test: padded cache tails, exact 8-row fits, and the long-prefix
+    /// / short-batch case where whole key blocks sit past `max_causal`.
+    #[test]
+    #[ignore = "needs a real Metal GPU"]
+    fn gqa_prefill_fa_ext_mma_d128_matches_cpu_and_fa_vec() {
+        std::env::set_var("FERROX_METAL_FA_VEC", "1");
+        std::env::set_var("FERROX_METAL_FA_EXT", "1");
+        {
+            let shared = shared_metal().expect("metal device");
+            ensure_pipeline(
+                &shared.device,
+                GQA_PREFILL_FA_EXT_MMA_D128_KERNEL_SRC,
+                "gqa_prefill_fa_ext_mma_d128",
+            )
+            .expect("d128 fa_ext MMA pipeline compiles");
+        }
+        let cases = [
+            (16usize, 8usize, 128usize, 40usize, 9usize, None),
+            (16usize, 8usize, 128usize, 65usize, 0usize, None),
+            (8usize, 4usize, 128usize, 128usize, 0usize, Some(50.0f32)),
+            (6usize, 2usize, 128usize, 130usize, 7usize, Some(30.0f32)),
+            (8usize, 4usize, 128usize, 8usize, 120usize, None),
+            (8usize, 2usize, 128usize, 9usize, 55usize, Some(20.0f32)),
+        ];
+        for (n_heads, n_kv_heads, head_dim, n_q, kv_prefix_len, softcap) in cases {
+            let total = kv_prefix_len + n_q;
+            let q: Vec<f32> = (0..n_q * n_heads * head_dim)
+                .map(|i| (i as f32 * 0.07).sin())
+                .collect();
+            let k: Vec<f32> = (0..total * n_kv_heads * head_dim)
+                .map(|i| (i as f32 * 0.03).cos())
+                .collect();
+            let v: Vec<f32> = (0..total * n_kv_heads * head_dim)
+                .map(|i| (i as f32 * 0.05).sin())
+                .collect();
+            let q_width = n_heads * head_dim;
+            let mut cpu = vec![0f32; n_q * q_width];
+            for qi in 0..n_q {
+                let causal_len = kv_prefix_len + qi + 1;
+                let kv_elems = causal_len * n_kv_heads * head_dim;
+                let row = cpu_gqa_ex(
+                    &q[qi * q_width..(qi + 1) * q_width],
+                    &k[..kv_elems],
+                    &v[..kv_elems],
+                    n_heads,
+                    n_kv_heads,
+                    head_dim,
+                    causal_len,
+                    0,
+                    softcap,
+                );
+                cpu[qi * q_width..(qi + 1) * q_width].copy_from_slice(&row);
+            }
+            let run = |mma: &str| {
+                std::env::set_var("FERROX_METAL_FA_MMA", mma);
+                launch_gqa_prefill_host_ex(
+                    &q,
+                    &k,
+                    &v,
+                    n_heads,
+                    n_kv_heads,
+                    head_dim,
+                    n_q,
+                    kv_prefix_len,
+                    softcap,
+                )
+                .expect("d128 prefill")
+            };
+            let fa_vec = run("0");
+            let mma = run("1");
+            std::env::remove_var("FERROX_METAL_FA_MMA");
+            let worst_of = |a: &[f32], b: &[f32]| {
+                let mut max_diff = 0f32;
+                let mut worst = (0usize, 0f32, 0f32);
+                for (i, (x, y)) in a.iter().zip(b.iter()).enumerate() {
+                    let d = (x - y).abs();
+                    if d > max_diff {
+                        max_diff = d;
+                        worst = (i, *x, *y);
+                    }
+                }
+                (max_diff, worst)
+            };
+            let (d_cpu, w_cpu) = worst_of(&cpu, &mma);
+            let tol = 5e-3 * w_cpu.1.abs().max(1.0);
+            assert!(
+                d_cpu <= tol,
+                "mma vs cpu hd={head_dim} n_q={n_q} pre={kv_prefix_len} \
+                 sc={softcap:?} max_diff={d_cpu} worst={w_cpu:?} tol={tol}"
+            );
+            let (d_vec, w_vec) = worst_of(&fa_vec, &mma);
+            assert!(
+                d_vec <= 1e-3,
+                "mma vs fa_vec hd={head_dim} n_q={n_q} pre={kv_prefix_len} \
+                 sc={softcap:?} max_diff={d_vec} worst={w_vec:?}"
             );
         }
     }

@@ -1,6 +1,6 @@
 ---
 name: llama.cpp parity push
-overview: "MAIN GOAL: fix every performance gap against llama.cpp — gap ≤ 1.0× on all 29 currently-red engine suite rows, with answer parity, plus honest model/weight coverage (no arch that silently computes the wrong graph). VALIDATION RULE: every improvement is validated by a full `--suite --fit-host --skip-missing` + `--render` run, not just the model it targeted — a change is not landed until the whole ledger is re-measured and no row regressed. Default method: read `.scratch/llama.cpp` and port kernels/glue to Ferrox Rust/MSL. Re-ranked 2026-08-10 from a four-way code audit: the CPU prefill gap is a scalar activation re-interleave inside the i8mm GEMM (not the arithmetic tier), and the Metal prefill gap is a 12.5%-lane-occupancy attention kernel (not command-buffer batching). Both prior diagnoses were wrong and are corrected below."
+overview: "MAIN GOAL: fix every performance gap against llama.cpp — gap ≤ 1.0× on every red engine suite row (29 at the start of the push, 25 as published on 2026-08-13), with answer parity, plus honest model/weight coverage (no arch that silently computes the wrong graph). VALIDATION RULE: every improvement is validated by a full `--suite --fit-host --skip-missing` + `--render` run, not just the model it targeted — a change is not landed until the whole ledger is re-measured and no row regressed. Default method: read `.scratch/llama.cpp` and port kernels/glue to Ferrox Rust/MSL. Re-ranked 2026-08-10 from a four-way code audit: the CPU prefill gap is a scalar activation re-interleave inside the i8mm GEMM (not the arithmetic tier), and the Metal prefill gap is a 12.5%-lane-occupancy attention kernel (not command-buffer batching). Both prior diagnoses were wrong and are corrected below."
 todos:
   - id: cpu-act-interleave-hoist
     content: "Hoist Q8_K activation interleave out of gemm_q4_kx8_q8_k_neon_i8mm into a Q8KActivationsX4 built once per apply_batch (llama block_q8_Kx4 / ggml_quantize_mat_q8_K_4x8)"
@@ -17,23 +17,29 @@ todos:
   - id: cpu-actquant-flat
     content: "De-nest activation quantization (serial internals, parallelize once at apply_batch over row-quads into one wdata buffer); share one quant pass across q/k/v and gate/up"
     status: pending
-  - id: cpu-threadpool-chunking
-    content: "Chunk matmuls over both row and batch dims with atomic work-stealing (llama current_chunk, nchunk0*nchunk1 >= nth*4); persistent spin-barrier pool if decode still >1x"
+  - id: cpu-decode-scaling
+    content: "CPU tg128 is the widest axis left (8 red rows, SmolLM2 2.45x). Cause is measured: fork-join scaling, not per-thread throughput. Retry the persistent pool with the wf/cpu-threadpool deadlock understood first (FERROX_CPU_THREADS=1 + rayon nesting)"
     status: pending
   - id: cpu-prefill-attn-block
     content: "Block prefill attention: QK^T tile GEMM + vectorized softmax + V GEMM, replacing the per-KV-position online_attn_accumulate with 2 scalar expf per position"
     status: pending
+  - id: cpu-gemma3-prefill
+    content: "Gemma-3-1B cpu pp512 1.94x is the worst CPU prefill row and has no diagnosis. Profile it before picking a lever — every other CPU pp row is 1.16-1.40x"
+    status: pending
   - id: metal-fa-mma
-    content: "Port kernel_flash_attn_ext MMA (Q.K^T AND P.V via simdgroup_half8x8) for d=64/128 — attn.rs has ZERO simdgroup MMA today, 16 of 128 lanes active. This is the sub-1.5B Metal prefill gap"
+    content: "Port kernel_flash_attn_ext MMA (Q.K^T AND P.V via simdgroup_half8x8) for d=64 — attn.rs had ZERO simdgroup MMA, 16 of 128 lanes active"
+    status: completed
+  - id: metal-fa-mma-d128
+    content: "Parameterise the MMA macro over head dim so it emits _d64 and _d128. A/B: Qwen3-0.6B 1.71x, Phi-4-mini 1.20x, Llama-3.2-3B 1.20x, Mistral-7B 1.13x (commit 0ee4d0b)"
     status: completed
   - id: metal-fa-mma-d256
     content: "Extend the MMA macro to d=256 (Gemma-3 metal pp512 1.17x). Blocked on the epilogue: `own` gives one float4 per lane, so D/4 <= 32 caps the macro at 128 — needs a lane loop"
     status: pending
   - id: suite-owed-d128
-    content: "OWED: full --suite + --render on a quiet host for the d=128 MMA (commit 0ee4d0b). Skipped at the user's call because Host B sat at load 2.4-3.5; RESULTS.md still shows the pre-d128 numbers"
+    content: "OWED: full --suite + --render for the d=128 MMA (commit 0ee4d0b). Blocked twice now on host load — 2.4-3.5 on 08-12, 3-6 on 08-13 (Chrome + a VM). RESULTS.md still shows the pre-d128 numbers"
     status: pending
   - id: metal-moe-stack
-    content: "Move MoE layers onto the fused prefill stack: MoE PrefillDenseLayerMetal variant, GPU router+top-k, wire the already-written-but-uncalled encode_moe_mm_id_map0. Kills ~112 command buffers per pp512"
+    content: "Worst row on any backend: OLMoE metal pp512 2.48x. Move MoE layers onto the fused prefill stack: MoE PrefillDenseLayerMetal variant, GPU router+top-k, wire the already-written-but-uncalled encode_moe_mm_id_map0. Kills ~112 command buffers per pp512"
     status: pending
   - id: metal-barrier-ranges
     content: "Replace 15 blanket per-layer buffer barriers with llama's mem-range overlap tracker; fuse rmsnorm+f32->f16 and silu_mul+f32->f16"
@@ -41,12 +47,24 @@ todos:
   - id: metal-mm-occupancy
     content: "Compile a bc_out=false mul_mm_sg variant needing 6144B threadgroup memory instead of always 8192B"
     status: pending
+  - id: tooling-verify-prompt-len
+    content: "`ferrox verify` passes vacuously on prefill kernels: its prompt is fixed at 7 tokens and the fa_ext paths gate on n_q >= 8, so it never reaches one. Needs a prompt-length flag"
+    status: pending
+  - id: tooling-cpu-metal-divergence
+    content: "CPU and Metal diverge at token 8 on a 49-token TinyLlama prompt with ALL THREE attention kernels byte-identical to each other — so it is upstream of attention (f16 KV or GEMM precision). Unowned, and it means a length-aware verify would be red today"
+    status: pending
+  - id: tooling-kernel-registry
+    content: "Sealed kernel-lookup registry: record every dispatch lookup at model build, seal, warn/fail on a later miss that takes a fallback. Landed 99a69ab (ferrox-core/src/kernel_registry.rs, docs/CONFIG.md)"
+    status: completed
+  - id: tooling-layer-divergence
+    content: "Per-layer divergence comparator (per-head magnitude-ratio std, not mean) + MoE routing dumps, env-gated. Prerequisite for diagnosing MoE and the CPU/Metal divergence above"
+    status: pending
   - id: coverage-fail-closed
     content: "BLOCKING CORRECTNESS: ~50 archs are admitted to the generic GQA path and emit wrong logits instead of refusing. Gate on required graph features; refuse what is not implemented"
     status: pending
   - id: coverage-f16
-    content: "F16 tensors do not load at all (GgmlType::F16 is parsed and sized but has no dequant arm anywhere) — every F16 GGUF is a hard UnsupportedDtype"
-    status: pending
+    content: "F16 tensors did not load at all (GgmlType::F16 parsed and sized, no dequant arm anywhere). dequant_f16 + shared widen_plain_float across all 7 loaders. Landed 7ef74f1"
+    status: completed
   - id: coverage-mxfp4-gptoss
     content: "MXFP4 Metal+CUDA kernels (CPU is scalar-only) + gpt-oss graph (attn sinks, swiglu_oai clamp, SWA)"
     status: pending
@@ -54,10 +72,10 @@ todos:
     content: "ffn_exp_probs_b in the generic MoE loader (unlocks 8 archs at once); granite/minicpm multipliers; cohere2 parallel residual; partial rotary + full bias"
     status: pending
   - id: hygiene-clippy
-    content: "HEAD already fails the documented `clippy --workspace -- -D warnings` gate (11 errors in ferrox-quant alone); restore the gate before adding kernels"
-    status: pending
+    content: "Restore the documented `clippy --workspace --all-targets -- -D warnings` gate. Was red at HEAD: 10 errors default-features + 25 more under --features metal. Landed c8a4cc6"
+    status: completed
   - id: legacy-cleanup
-    content: "Delete superseded paths as replacements land: dead encode_moe_mm_id_map0 duplication, per-call pack_q8_k_qs_x4_i8, by_row transposes, CUDA per-position batch arm"
+    content: "Delete superseded paths as replacements land: dead encode_moe_mm_id_map0 duplication (now #[allow(dead_code)] with a plan pointer), per-call pack_q8_k_qs_x4_i8, by_row transposes, CUDA per-position batch arm"
     status: pending
   - id: suite-validate-every-change
     content: "MANDATORY per improvement: full `bench --suite --fit-host --skip-missing` + `--render` on a quiet host after every landed change; compare against the previous ledger; revert or explain any regressed row"
@@ -66,7 +84,7 @@ todos:
     content: "Golden/kernel tests + answer-parity smoke; row closed only at gap <=1.0x AND answers match llama"
     status: pending
   - id: close-all-red-rows
-    content: "Definition of done: all 29 red rows (11 Metal pp512, 2 Metal tg128, 8 CPU pp512, 8 CPU tg128) at gap <=1.0x, and Gemma-4 given a real llama baseline so it stops being unmeasurable"
+    content: "Definition of done: all 25 currently-red rows (9 Metal pp512, 1 Metal tg128, 7 CPU pp512, 8 CPU tg128) at gap <=1.0x, and Gemma-4 given a real llama baseline so it stops being unmeasurable"
     status: pending
 isProject: false
 ---
@@ -83,6 +101,43 @@ isProject: false
 > Ordering is by measured gap × known cause, not by phase number. Phase 1
 > (CPU prefill) and Phase 4 (coverage) are independent and can proceed in
 > parallel. The frontmatter `todos` list is the checklist.
+
+## Where this stands (2026-08-13)
+
+Done and measured: **Phase 1 CPU prefill**, **Metal dense prefill**,
+**d=64 MMA**, **d=128 MMA** (A/B only — see the owed suite run).
+Done and unmeasurable-by-nature (correctness/tooling, no row moves):
+**sealed kernel registry** (`99a69ab`), **F16 loading** (`7ef74f1`),
+**the clippy gate** (`c8a4cc6`).
+
+Red rows in the published ledger: **25** (was 29). By axis, worst first —
+`RESULTS.md` is still pre-d128, so the four rows the d=128 MMA moves are
+marked with the A/B figure it is expected to publish:
+
+| Axis | Red | Worst | Owner |
+|---|---|---|---|
+| CPU `tg128` | 8 | SmolLM2 2.45× | `cpu-decode-scaling` |
+| CPU `pp512` | 7 | Gemma-3-1B 1.94× | `cpu-gemma3-prefill`, then 1a–1d |
+| Metal `pp512` | 9 (→5 after d128 publishes) | OLMoE 2.48× | `metal-moe-stack` |
+| Metal `tg128` | 1 | OLMoE 1.38× | `metal-moe-stack` |
+
+**Nothing further should be measured until the owed suite run happens.**
+It has now been blocked twice by host load — 2.4–3.5 on 08-12, and 3–6 on
+08-13 (Chrome, a VM, WindowServer). Every further Metal change stacks on
+top of an unmeasured one, and once two land together neither can be
+attributed. The three items landed today are deliberately chosen to be
+ones a loaded host cannot invalidate: they are correctness and hygiene,
+and none of them claims a number.
+
+Next levers, in order once the ledger is regenerated:
+
+1. `metal-moe-stack` — OLMoE owns both remaining Metal red rows (pp512
+   2.48×, tg128 1.38×) and is the single worst row on any backend.
+2. `cpu-decode-scaling` — 8 red rows, the only axis with nothing at
+   parity, and the cause is already measured (fork-join scaling; ferrox
+   *beats* llama at one thread on Mistral-7B).
+3. `cpu-gemma3-prefill` — the one CPU prefill row that is an outlier
+   rather than a trend, and it has no diagnosis yet.
 
 ## Ledger as of v0.4.0 (2026-08-11, regenerated on Host B)
 
@@ -369,7 +424,9 @@ one, silently replaced by a slow path:
 - `ferrox-cli --features cuda` did not compile at all, so every CUDA claim
   was untested.
 
-**Adopt an eager kernel-lookup registry, sealed after model build.** Record
+**LANDED (`99a69ab`, `ferrox-core/src/kernel_registry.rs`).** The design,
+kept here because the remaining work is to widen its coverage as new
+dispatch seams are added — an unrecorded seam is invisible to it. Record
 every kernel/dispatch lookup made while constructing the model, with
 `#[track_caller]` so each record carries its call site. Seal the registry
 once loaded; any later lookup that misses and takes a fallback is a silent
@@ -797,19 +854,23 @@ cohere2, exaone4 — pass the check and silently run full attention.
 on them, and refuse with a named-feature error otherwise. Add a test that
 every arch on the generic path declares only implemented features.
 
-### 4b. F16 does not load
+### 4b. F16 does not load — DONE (`7ef74f1`)
 
-`GgmlType::F16` is parsed (`ferrox-gguf/src/lib.rs:143`) and sized
-(`lib.rs:171`) but has **no dequant arm anywhere** — the only two references
+`GgmlType::F16` was parsed (`ferrox-gguf/src/lib.rs:143`) and sized
+(`lib.rs:171`) but had **no dequant arm anywhere** — the only two references
 in the whole workspace are those two lines. Every F16 tensor hits
-`UnsupportedDtype` (`loader.rs:735`). The BF16 arm at `loader.rs:776` is the
-template. Cost: XS. Value: every `*-f16.gguf`.
+`UnsupportedDtype` (`loader.rs:735`). The BF16 arm was the template.
+
+Fixed by `ferrox_quant::dequant_f16` (via `half::f16::to_f32`, not a bit
+shift — f16 subnormals do not widen by shifting the way bf16 does) plus
+a shared `loader::widen_plain_float` covering F32/F16/BF16 for all seven
+GGUF loaders, which previously each inlined their own two-way match.
 
 ### 4c. Ranked coverage additions
 
 | # | Addition | Why | Cost | Port from |
 |---|---|---|---|---|
-| 1 | F16 tensor loading | hard load error today | XS | mirror BF16 arm, `loader.rs:776` |
+| 1 | ~~F16 tensor loading~~ **DONE** (`7ef74f1`) | was a hard load error | XS | mirrored the BF16 arm |
 | 2 | MXFP4 Metal + CUDA | gpt-oss-20b/120b; CPU-scalar only now | M | `ggml-metal.metal` `kernel_mul_mv_mxfp4_f32`, `ggml-cuda/mmvq.cu` |
 | 3 | gpt-oss graph: attn sinks, swiglu_oai clamp, SWA | pairs with #2; silently wrong today | M | `src/models/openai-moe.cpp` |
 | 4 | `ffn_exp_probs_b` in generic MoE loader | unlocks dots1, ernie4_5-moe, bailingmoe2, exaone-moe, hunyuan-moe, afmoe in one change | S | `llama-graph.cpp` `build_moe_ffn` |
@@ -828,11 +889,13 @@ them — they cost more and hurt less than anything above.
 
 ## Phase 5 — Hygiene and legacy cleanup
 
-- **Restore the clippy gate.** `CLAUDE.md` documents
-  `cargo clippy --workspace --all-targets -- -D warnings`, but HEAD already
-  fails it: 11 errors in `ferrox-quant` alone (verified in a clean worktree at
-  HEAD), 14 with the uncommitted Q6_K work. Fix before adding kernels, or the
-  gate stops catching anything.
+- ~~**Restore the clippy gate.**~~ **DONE (`c8a4cc6`).** It was red on both
+  feature sets — 10 errors with default features (6 `ferrox-quant`,
+  4 `ferrox-models`) and 25 more under `--features metal`, which nothing in
+  CI or the documented command was covering. All mechanical. Note the metal
+  set is a *separate* gate: run
+  `cargo clippy -p ferrox-cli -p ferrox-server -p ferrox-metal --features metal
+  --all-targets -- -D warnings` too, or half the workspace stays unlinted.
 - `cpu_int_dot_enabled()` (`weight_matrix.rs:297-306`) is off unless a binary
   opts in. The bench, CLI and server all call `default_cpu_int_dot_on()`, so
   suite numbers are fine — but any embedder of `ferrox-core` silently falls
@@ -862,16 +925,23 @@ them — they cost more and hurt less than anything above.
 
 ## Definition of done
 
-The push is finished when **all 29 red rows** in
+The push is finished when **all red rows** in
 [`benchmarks/RESULTS.md`](../../benchmarks/RESULTS.md) read ≤ 1.0×, with
-answer parity. Tracked explicitly so "mostly done" is not a resting place:
+answer parity. Tracked explicitly so "mostly done" is not a resting place.
+**25 red as published** (29 at the start of the push); the Metal `pp512`
+count drops to 5 when the owed d=128 suite run publishes:
 
-| Backend / test | Rows still red | Worst | Owning phase |
+| Backend / test | Rows still red | Worst | Owning item |
 |---|---|---|---|
-| Metal `pp512` | 11 — SmolLM2 2.98, OLMoE 2.73, Qwen2.5-0.5B 2.06, Qwen3-0.6B 1.90, TinyLlama 1.84, Llama-3.2-1B IQ4_XS 1.65, Llama-3.2-1B Q4_K_M 1.62, Llama-3.2-3B 1.29, Phi-4 1.29, Gemma-3-1B 1.27, Mistral-7B 1.21 | 2.98× | 2a (+3 for OLMoE) |
-| Metal `tg128` | 2 — OLMoE 1.54, Llama-3.2-3B 1.11 | 1.54× | 3 |
-| CPU `pp512` | 8 — Phi-4 10.97, SmolLM2 10.68, Mistral 9.80, Qwen3-0.6B 6.57, OLMoE 6.24, Qwen2.5-0.5B 5.84, Gemma-3-1B 5.14, TinyLlama 3.52 | 10.97× | 1a–1d |
-| CPU `tg128` | 8 — SmolLM2 3.32, Mistral 2.94, Phi-4 2.69, Qwen2.5-0.5B 2.10, Qwen3-0.6B 2.07, Gemma-3-1B 1.86, OLMoE 1.71, TinyLlama 1.59 | 3.32× | 1e–1g |
+| CPU `tg128` | 8 — SmolLM2 2.45, Qwen3-0.6B 1.74, Qwen2.5-0.5B 1.67, Gemma-3-1B 1.66, Phi-4 1.23, Mistral 1.20, OLMoE 1.11, TinyLlama 1.08 | 2.45× | `cpu-decode-scaling` |
+| CPU `pp512` | 7 — Gemma-3-1B 1.94, SmolLM2 1.40, Mistral 1.31, Qwen2.5-0.5B 1.28, OLMoE 1.23, Phi-4 1.21, Qwen3-0.6B 1.16 | 1.94× | `cpu-gemma3-prefill`, 1a–1d |
+| Metal `pp512` | 9 — OLMoE 2.48, Qwen3-0.6B 1.81†, Phi-4 1.24†, Gemma-3-1B 1.17, Qwen2.5-0.5B 1.12, Mistral 1.10†, Llama-3.2-1B 1.08, IQ4_XS 1.08, Llama-3.2-3B 1.08† | 2.48× | `metal-moe-stack`, `metal-fa-mma-d256` |
+| Metal `tg128` | 1 — OLMoE 1.38 | 1.38× | `metal-moe-stack` |
+
+† already fixed by the d=128 MMA in an interleaved A/B (1.07×, 1.04×,
+0.97×, 0.89× respectively) but **not published** — the suite run is owed.
+TinyLlama (1.01×) and SmolLM2 (1.02×) Metal `pp512` count as closed, as
+do all 9 remaining Metal `tg128` rows.
 
 Plus one row that is **not measurable today**: Gemma-4-E2B has no llama column
 because Homebrew `llama-bench` lacks the `gemma4` arch, and ferrox's own

@@ -179,6 +179,7 @@ pub struct MoePackedQ4Planes {
 
 #[cfg(feature = "metal")]
 impl MoePackedQ4Planes {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         gate: ferrox_core::weight_matrix::WeightBytes,
         up: ferrox_core::weight_matrix::WeightBytes,
@@ -846,6 +847,7 @@ impl Decoder {
     /// `run_len` layers starting at `start`. Advances host + Metal KV
     /// on success.
     #[cfg(feature = "metal")]
+    #[allow(clippy::too_many_arguments)]
     fn try_metal_prefill_dense_stack(
         &self,
         start: usize,
@@ -1126,6 +1128,9 @@ impl Decoder {
             };
             #[cfg(not(feature = "metal"))]
             let down: Option<Vec<f32>> = None;
+            // Without `metal` the binding above is a literal `None`; the
+            // fallback is the only arm and clippy flags the unwrap.
+            #[cfg_attr(not(feature = "metal"), allow(clippy::unnecessary_literal_unwrap))]
             let down = down.unwrap_or_else(|| {
                 let ffn_acts = shex.gate.quantize_batch_acts(normed2_batch, batch_size);
                 let gate =
@@ -3393,7 +3398,7 @@ impl Decoder {
                             && start_pos == cache.seq_len
                             && swa_fits
                         {
-                            match {
+                            let prefill_res = {
                                 let o_launch = Self::metal_matvec_launch(&layer.attn.o_proj);
                                 // Prefill O fusion: opt-in. Default off until
                                 // fair-chat prompt_per_s proves a win without
@@ -3478,7 +3483,8 @@ impl Decoder {
                                         },
                                     )
                                 }
-                            } {
+                            };
+                            match prefill_res {
                                 Ok(true) => {
                                     did_metal_prefill = true;
                                 }

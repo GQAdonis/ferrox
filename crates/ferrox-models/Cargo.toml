@@ -27,6 +27,7 @@ rayon = { workspace = true }
 
 [dev-dependencies]
 byteorder = { workspace = true }
+half = { workspace = true }
 
 [features]
 default = []

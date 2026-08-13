@@ -6071,7 +6071,7 @@ pub fn launch_moe_decode_stack(
             let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
             let acc = GPU_NS.fetch_add((dt * 1e9) as u64, std::sync::atomic::Ordering::Relaxed)
                 + (dt * 1e9) as u64;
-            if n % 32 == 0 {
+            if n.is_multiple_of(32) {
                 eprintln!(
                     "ferrox: metal gpu {:.3} ms/tok avg over {} (last {:.3} ms)",
                     (acc as f64 / n as f64) / 1e6,

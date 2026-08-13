@@ -117,6 +117,15 @@ enum Commands {
         /// Internal: print token ids for one backend and exit.
         #[arg(long, hide = true)]
         emit: bool,
+        /// Stretch the prompt to this many tokens (repeating it) before
+        /// prefill. Under 8 tokens the batched-prefill attention kernels
+        /// never run, so the default prompt checks decode only.
+        #[arg(long)]
+        prompt_tokens: Option<usize>,
+        /// Prompt to compare on. Defaults to a fixed short one so runs
+        /// are comparable across models.
+        #[arg(short = 'p', long)]
+        prompt: Option<String>,
     },
     Bench {
         /// Real GGUF to benchmark. With this set, `bench` becomes a
@@ -529,11 +538,15 @@ fn main() -> anyhow::Result<()> {
             model,
             backend,
             emit,
+            prompt_tokens,
+            prompt,
         } => {
             return verify::run(verify::VerifyArgs {
                 model,
                 backend,
                 emit,
+                prompt_tokens,
+                prompt,
             });
         }
         Commands::Bench {

@@ -29,25 +29,53 @@ const N_TOKENS: usize = 24;
 /// Prompt is fixed so runs are comparable across invocations and models.
 const PROMPT: &str = "The capital of France is";
 
+/// Batch size at which the batched-prefill attention kernels turn on
+/// (`fa_ext` / the simdgroup-MMA variants gate on `n_q >= 8`). Below it
+/// the run only exercises single-token decode, so a green verdict says
+/// nothing about the prefill kernels this tool exists to catch — hence
+/// the warning rather than a silent pass.
+const PREFILL_MIN_TOKENS: usize = 8;
+
 pub struct VerifyArgs {
     pub model: String,
     /// Backend to check against the CPU reference: `metal` or `cuda`.
     pub backend: String,
     /// Emit the token ids rather than a verdict (used by the child).
     pub emit: bool,
+    /// Stretch the prompt to this many tokens before prefill, so the
+    /// batched-prefill kernels are actually reached.
+    pub prompt_tokens: Option<usize>,
+    /// Override the fixed prompt.
+    pub prompt: Option<String>,
 }
 
 /// Marker the child prints so the parent can find the payload even if the
 /// engine writes other things to stdout.
 const TAG: &str = "FERROX_VERIFY_TOKENS ";
 
+/// Second marker: how many tokens the prompt actually became. Only the
+/// child tokenizes, so this is the one number that says whether the run
+/// reached the batched-prefill kernels — `--prompt-tokens` is optional
+/// and a long `--prompt` is just as good a way to get there.
+const LEN_TAG: &str = "FERROX_VERIFY_PROMPT_LEN ";
+
 pub fn run(args: VerifyArgs) -> anyhow::Result<()> {
+    let prompt = args.prompt.clone().unwrap_or_else(|| PROMPT.to_string());
     if args.emit {
-        return emit_tokens(&args.model);
+        return emit_tokens(&args.model, &prompt, args.prompt_tokens);
     }
 
-    let reference = child_tokens(&args.model, "cpu")?;
-    let candidate = child_tokens(&args.model, &args.backend)?;
+    let (reference, prompt_len) = child_tokens(&args.model, "cpu", &prompt, args.prompt_tokens)?;
+    let (candidate, _) = child_tokens(&args.model, &args.backend, &prompt, args.prompt_tokens)?;
+
+    if prompt_len < PREFILL_MIN_TOKENS {
+        eprintln!(
+            "verify: prompt is {prompt_len} tokens, under the {PREFILL_MIN_TOKENS} at which the \
+             batched-prefill attention kernels turn on — this run checks decode only. \
+             Pass --prompt-tokens {PREFILL_MIN_TOKENS} or more (or a longer --prompt) to \
+             cover prefill."
+        );
+    }
 
     if reference.is_empty() {
         anyhow::bail!("CPU reference produced no tokens; cannot verify");
@@ -64,10 +92,11 @@ pub fn run(args: VerifyArgs) -> anyhow::Result<()> {
     match diverge {
         None => {
             println!(
-                "verify {}: OK — {} tokens identical on cpu and {}",
+                "verify {}: OK — {} tokens identical on cpu and {} ({})",
                 short(&args.model),
                 reference.len(),
-                args.backend
+                args.backend,
+                prompt_desc(prompt_len)
             );
             Ok(())
         }
@@ -77,8 +106,9 @@ pub fn run(args: VerifyArgs) -> anyhow::Result<()> {
             // (dense path) or drifts (accumulating / attention path),
             // which is the first thing anyone debugging this needs.
             println!(
-                "verify {}: DIVERGED at token {i} — cpu={:?} {}={:?}",
+                "verify {}: DIVERGED at token {i} ({}) — cpu={:?} {}={:?}",
                 short(&args.model),
+                prompt_desc(prompt_len),
                 &reference[i.saturating_sub(2)..reference.len().min(i + 3)],
                 args.backend,
                 &candidate[i.saturating_sub(2)..candidate.len().min(i + 3)],
@@ -91,6 +121,16 @@ pub fn run(args: VerifyArgs) -> anyhow::Result<()> {
     }
 }
 
+/// Says which path the verdict covers, so a decode-only pass is never
+/// read as a prefill pass.
+fn prompt_desc(prompt_len: usize) -> String {
+    if prompt_len >= PREFILL_MIN_TOKENS {
+        format!("{prompt_len}-token prompt, prefill covered")
+    } else {
+        format!("{prompt_len}-token prompt, decode only")
+    }
+}
+
 fn short(model: &str) -> String {
     Path::new(model)
         .file_stem()
@@ -99,13 +139,23 @@ fn short(model: &str) -> String {
 }
 
 /// Runs one backend in a child and parses back the token ids.
-fn child_tokens(model: &str, backend: &str) -> anyhow::Result<Vec<u32>> {
+fn child_tokens(
+    model: &str,
+    backend: &str,
+    prompt: &str,
+    prompt_tokens: Option<usize>,
+) -> anyhow::Result<(Vec<u32>, usize)> {
     let exe = std::env::current_exe()?;
-    let out = Command::new(&exe)
-        .arg("verify")
+    let mut cmd = Command::new(&exe);
+    cmd.arg("verify")
         .args(["-m", model])
         .args(["--backend", backend])
-        .arg("--emit")
+        .args(["--prompt", prompt])
+        .arg("--emit");
+    if let Some(n) = prompt_tokens {
+        cmd.args(["--prompt-tokens", &n.to_string()]);
+    }
+    let out = cmd
         // `-ngl` is what actually selects the backend for `run`; the env
         // var alone is overridden by the CLI default.
         .env("FERROX_METAL", if backend == "cpu" { "0" } else { "1" })
@@ -126,17 +176,26 @@ fn child_tokens(model: &str, backend: &str) -> anyhow::Result<Vec<u32>> {
         .lines()
         .find_map(|l| l.strip_prefix(TAG))
         .with_context(|| format!("verify child for {backend} printed no token line"))?;
-    Ok(line
-        .split_whitespace()
-        .filter_map(|t| t.parse::<u32>().ok())
-        .collect())
+    let prompt_len = text
+        .lines()
+        .find_map(|l| l.strip_prefix(LEN_TAG))
+        .and_then(|l| l.trim().parse::<usize>().ok())
+        .with_context(|| format!("verify child for {backend} printed no prompt-length line"))?;
+    Ok((
+        line.split_whitespace()
+            .filter_map(|t| t.parse::<u32>().ok())
+            .collect(),
+        prompt_len,
+    ))
 }
 
 /// Child side: greedy-decode `N_TOKENS` and print the ids.
-fn emit_tokens(model: &str) -> anyhow::Result<()> {
+fn emit_tokens(model: &str, prompt: &str, prompt_tokens: Option<usize>) -> anyhow::Result<()> {
     let path = crate::pull::resolve_model_path(model)?;
-    let ids = crate::verify_engine::greedy_token_ids(Path::new(&path), PROMPT, N_TOKENS)?;
+    let (ids, prompt_len) =
+        crate::verify_engine::greedy_token_ids(Path::new(&path), prompt, N_TOKENS, prompt_tokens)?;
     let joined: Vec<String> = ids.iter().map(|t| t.to_string()).collect();
+    println!("{LEN_TAG}{prompt_len}");
     println!("{TAG}{}", joined.join(" "));
     Ok(())
 }

@@ -491,6 +491,7 @@ dependencies = [
  "ferrox-moe",
  "ferrox-quant",
  "ferrox-safetensors",
+ "half",
  "rayon",
  "regex",
  "serde",

@@ -48,11 +48,11 @@ todos:
     content: "Compile a bc_out=false mul_mm_sg variant needing 6144B threadgroup memory instead of always 8192B"
     status: pending
   - id: tooling-verify-prompt-len
-    content: "`ferrox verify` passes vacuously on prefill kernels: its prompt is fixed at 7 tokens and the fa_ext paths gate on n_q >= 8, so it never reaches one. Needs a prompt-length flag"
-    status: pending
+    content: "`ferrox verify` passed vacuously on prefill kernels (fixed 6-token prompt vs the n_q >= 8 gate). Added --prompt-tokens/--prompt, and every verdict now states whether prefill was covered. Landed bfd1c1a"
+    status: completed
   - id: tooling-cpu-metal-divergence
-    content: "CPU and Metal diverge at token 8 on a 49-token TinyLlama prompt with ALL THREE attention kernels byte-identical to each other — so it is upstream of attention (f16 KV or GEMM precision). Unowned, and it means a length-aware verify would be red today"
-    status: pending
+    content: "DID NOT REPRODUCE (2026-08-13, bfd1c1a): with the new length-aware verify, greedy ids match cpu vs metal at 41/49/128/300-token prompts on TinyLlama and 49/300 on Phi-4-mini, and across 8 models at 40. Either the MMA work fixed it or the original was logit drift that never flipped an argmax. Reopen only with a reproducer"
+    status: completed
   - id: tooling-kernel-registry
     content: "Sealed kernel-lookup registry: record every dispatch lookup at model build, seal, warn/fail on a later miss that takes a fallback. Landed 99a69ab (ferrox-core/src/kernel_registry.rs, docs/CONFIG.md)"
     status: completed
@@ -234,17 +234,22 @@ about `FERROX_CPU_THREADS=1` and rayon nesting before writing code.
 
 ### Gaps in our own tooling, found by using it
 
-- **`ferrox verify` passes vacuously on prefill kernels.** Its prompt is
-  fixed at 7 tokens (`verify.rs`) and the d=64 fa_ext path is gated on
-  `n_q >= 8`, so the tool built to catch wrong prefill kernels never
-  reaches one. Needs a prompt-length flag. Until then a green `verify` says
-  nothing about prefill.
-- **CPU and Metal diverge on longer prompts, and it is not attention.**
-  With a 49-token prompt on TinyLlama all three attention kernels produce
-  byte-identical Metal output and all three differ from CPU at token 8, so
-  the cause is upstream — f16 KV or GEMM precision. Pre-existing, unowned,
-  and it means a length-aware `verify` would be red today for reasons
-  nobody has investigated.
+- ~~**`ferrox verify` passes vacuously on prefill kernels.**~~ **FIXED
+  (`bfd1c1a`).** The prompt was fixed at 6 tokens while every batched
+  prefill kernel gates on `n_q >= 8`. `--prompt-tokens N` stretches the
+  prompt by repeating its body (one BOS kept), `--prompt` overrides the
+  text, and the child reports the tokenized length back so every verdict
+  ends with `prefill covered` or `decode only`. A vacuous pass is now
+  visibly labelled as one.
+- ~~**CPU and Metal diverge on longer prompts.**~~ **Did not reproduce
+  (2026-08-13).** With the length-aware `verify`, greedy ids are identical
+  cpu vs metal at 41 (natural text), 49, 128 and 300 tokens on TinyLlama,
+  at 49 and 300 on Phi-4-mini, and at 40 tokens across TinyLlama,
+  Phi-4-mini, Llama-3.2-1B (Q4_K_M and IQ4_XS), Llama-3.2-3B, Mistral-7B,
+  OLMoE and Gemma-2-2B — the first real-weight coverage of both MMA
+  kernels. Either the MMA work fixed it or the original observation was
+  logit drift that never flipped an argmax. Not claimed as a fix; reopen
+  with a reproducer.
 
 ## Every row still >1x, ranked (superseded above; kept for the CPU rows)
 

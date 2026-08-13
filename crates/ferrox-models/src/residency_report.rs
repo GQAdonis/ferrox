@@ -14,10 +14,19 @@
 //! separately by `ResidencyPlan`), and Kimi's recurrent state (this
 //! report reads GGUF headers; the Kimi safetensors path has no
 //! header-only reporter yet).
+//!
+//! The KV line and the fits/does-not-fit verdict are the same
+//! arithmetic [`crate::kv_budget`] runs -- this module is the
+//! whole-checkpoint view of it (it is the one that knows what the
+//! weights cost), and [`ResidencyReport::kv_budget`] hands back the
+//! priced inequality so `--ctx auto` and the server's admission check
+//! cannot drift away from what `inspect-plan` prints.
 
 use ferrox_gguf::ShardedGguf;
 
 use crate::config::ModelConfig;
+use crate::device_budget::human;
+use crate::kv_budget::{ContextFit, KvBudget, KvElem, KvShape, CTX_AUTO_GRANULARITY};
 use crate::loader::LoadError;
 
 /// The inputs a plan is computed against. `expert_cache_bytes: None`
@@ -29,10 +38,33 @@ pub struct ResidencyAssumptions {
     pub context_tokens: usize,
     pub concurrent_requests: usize,
     pub expert_cache_bytes: Option<u64>,
-    /// Fraction of host RAM held back for everything this report does
+    /// Fraction of the budget held back for everything this report does
     /// not model (activations, allocator slack, OS). 0.2 is the
     /// default the CLI uses.
     pub headroom_fraction: f64,
+    /// Width of the KV store the run will actually keep -- f32 for the
+    /// host cache, f16 for Metal's device KV, and so on. Only this
+    /// module's caller knows which backend is selected.
+    pub kv_elem: KvElem,
+    /// Prefill chunk size, which widens a sliding-window layer's
+    /// resident positions to `window + chunk - 1`. Pass `1` for
+    /// token-at-a-time prefill.
+    pub prefill_chunk: usize,
+}
+
+impl Default for ResidencyAssumptions {
+    /// Single request, 4096 tokens, resident experts, host f32 KV,
+    /// token-at-a-time prefill -- the CLI's own defaults.
+    fn default() -> Self {
+        ResidencyAssumptions {
+            context_tokens: 4096,
+            concurrent_requests: 1,
+            expert_cache_bytes: None,
+            headroom_fraction: 0.2,
+            kv_elem: KvElem::F32,
+            prefill_chunk: 1,
+        }
+    }
 }
 
 /// One line of the plan, with the reason it costs what it costs.
@@ -47,20 +79,30 @@ pub struct ResidencyLine {
 pub struct ResidencyReport {
     pub lines: Vec<ResidencyLine>,
     pub required_bytes: u64,
-    pub host_ram_bytes: u64,
-    pub usable_ram_bytes: u64,
+    /// The ceiling this plan was priced against: a probed
+    /// [`crate::device_budget::DeviceBudget::usable_bytes`], or a
+    /// hypothetical machine's size for what-if planning.
+    pub budget_bytes: u64,
+    /// `budget_bytes` minus the headroom fraction.
+    pub usable_bytes: u64,
     pub assumptions: ResidencyAssumptions,
+    /// Weight bytes the plan charged (dense plus whatever the expert
+    /// line resolved to), kept separately from the KV term so
+    /// [`Self::kv_budget`] can rebuild the inequality exactly.
+    pub weights_bytes: u64,
+    /// The KV geometry this checkpoint runs on.
+    pub kv_shape: KvShape,
 }
 
 impl ResidencyReport {
     /// Computes the plan for the checkpoint at `path` (any shard of a
-    /// split set, or a single file) against `host_ram_bytes` (pass the
-    /// probed value, or a hypothetical machine's size for what-if
-    /// planning).
+    /// split set, or a single file) against `budget_bytes` (pass a
+    /// probed [`crate::device_budget::DeviceBudget::usable_bytes`], or
+    /// a hypothetical machine's size for what-if planning).
     pub fn from_gguf(
         path: impl AsRef<std::path::Path>,
         assumptions: ResidencyAssumptions,
-        host_ram_bytes: u64,
+        budget_bytes: u64,
     ) -> Result<Self, LoadError> {
         let file = ShardedGguf::open(path)?;
         let config = ModelConfig::from_gguf(&file)?;
@@ -111,81 +153,95 @@ impl ResidencyReport {
             },
         };
         lines.push(expert_line);
+        // Everything charged so far is weights; the KV line follows.
+        let weights_bytes = lines.iter().map(|l| l.bytes).sum();
 
-        // KV cache: keys + values, f32, per layer, per kv-head, at the
-        // stated context, per concurrent request.
-        let kv_per_request = (config.n_layers as u64)
-            * 2
-            * (config.n_kv_heads as u64)
-            * (config.head_dim as u64)
-            * 4
-            * (assumptions.context_tokens as u64);
+        // KV cache at the stated context, per concurrent request --
+        // `kv_budget`'s arithmetic, so a sliding-window or MLA
+        // checkpoint is priced the way it will really run rather than
+        // as if every layer kept the full history in f32.
+        let kv_shape =
+            KvShape::from_config(&config, assumptions.kv_elem, assumptions.prefill_chunk);
+        let kv_per_request = kv_shape.kv_bytes_for_tokens(assumptions.context_tokens);
         lines.push(ResidencyLine {
             label: "KV caches".to_string(),
             bytes: kv_per_request * assumptions.concurrent_requests as u64,
             reason: format!(
-                "{} layers x 2 (K+V) x {} kv-heads x {} head-dim x 4 bytes x {} context \
-                 tokens = {kv_per_request} bytes/request, x {} concurrent requests",
-                config.n_layers,
-                config.n_kv_heads,
-                config.head_dim,
+                "{} at {} context tokens = {kv_per_request} bytes/request, x {} concurrent \
+                 requests",
+                kv_shape.describe(),
                 assumptions.context_tokens,
                 assumptions.concurrent_requests
             ),
         });
 
         let required_bytes = lines.iter().map(|l| l.bytes).sum();
-        let usable_ram_bytes =
-            (host_ram_bytes as f64 * (1.0 - assumptions.headroom_fraction)) as u64;
+        let usable_bytes = (budget_bytes as f64 * (1.0 - assumptions.headroom_fraction)) as u64;
         Ok(ResidencyReport {
             lines,
             required_bytes,
-            host_ram_bytes,
-            usable_ram_bytes,
+            budget_bytes,
+            usable_bytes,
             assumptions,
+            weights_bytes,
+            kv_shape,
         })
     }
 
     pub fn fits(&self) -> bool {
-        self.required_bytes <= self.usable_ram_bytes
+        self.required_bytes <= self.usable_bytes
+    }
+
+    /// The same plan expressed as the priced inequality, so
+    /// `--ctx auto` and the server's admission check reuse this
+    /// report's terms instead of recomputing their own.
+    ///
+    /// The headroom fraction becomes the `activation_headroom_bytes`
+    /// term rather than shrinking the budget, which is what makes
+    /// `kv_budget().check(context_tokens).is_ok()` agree with
+    /// [`Self::fits`] exactly.
+    pub fn kv_budget(&self) -> KvBudget {
+        KvBudget {
+            weights_bytes: self.weights_bytes,
+            activation_headroom_bytes: self.budget_bytes - self.usable_bytes,
+            device_budget_bytes: self.budget_bytes,
+            shape: self.kv_shape,
+            concurrent_requests: self.assumptions.concurrent_requests,
+        }
+    }
+
+    /// Largest context that fits this plan, capped at `cap` (the
+    /// model's own trained context length).
+    pub fn auto_context(&self, cap: usize) -> ContextFit {
+        self.kv_budget().max_context(cap, CTX_AUTO_GRANULARITY)
     }
 
     /// Strict mode: an `Err` with the full plan text when the plan
-    /// overcommits usable RAM. Callers refuse to load on `Err`.
+    /// overcommits the usable budget. Callers refuse to load on `Err`.
     pub fn check_strict(&self) -> Result<(), String> {
         if self.fits() {
             Ok(())
         } else {
             Err(format!(
                 "residency plan overcommits: requires {} bytes but only {} usable \
-                 ({} host RAM minus {:.0}% headroom)\n{self}",
+                 ({} budget minus {:.0}% headroom)\n{self}",
                 self.required_bytes,
-                self.usable_ram_bytes,
-                self.host_ram_bytes,
+                self.usable_bytes,
+                self.budget_bytes,
                 self.assumptions.headroom_fraction * 100.0
             ))
         }
     }
 }
 
-fn human(bytes: u64) -> String {
-    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
-    let mut v = bytes as f64;
-    let mut u = 0;
-    while v >= 1024.0 && u < UNITS.len() - 1 {
-        v /= 1024.0;
-        u += 1;
-    }
-    format!("{v:.2} {}", UNITS[u])
-}
-
 impl std::fmt::Display for ResidencyReport {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         writeln!(
             f,
-            "residency plan (context={}, concurrency={}, headroom={:.0}%):",
+            "residency plan (context={}, concurrency={}, kv={}, headroom={:.0}%):",
             self.assumptions.context_tokens,
             self.assumptions.concurrent_requests,
+            self.assumptions.kv_elem.as_str(),
             self.assumptions.headroom_fraction * 100.0
         )?;
         for line in &self.lines {
@@ -205,10 +261,10 @@ impl std::fmt::Display for ResidencyReport {
         )?;
         writeln!(
             f,
-            "  {:<28} {:>12}  ({} host RAM minus headroom)",
-            "usable host RAM",
-            human(self.usable_ram_bytes),
-            human(self.host_ram_bytes)
+            "  {:<28} {:>12}  ({} device budget minus headroom)",
+            "usable budget",
+            human(self.usable_bytes),
+            human(self.budget_bytes)
         )?;
         write!(
             f,
@@ -235,7 +291,7 @@ mod tests {
             context_tokens: 128,
             concurrent_requests: 2,
             expert_cache_bytes: cache,
-            headroom_fraction: 0.2,
+            ..ResidencyAssumptions::default()
         }
     }
 
@@ -282,5 +338,69 @@ mod tests {
         let err = no_fit.check_strict().expect_err("must refuse");
         assert!(err.contains("overcommits"), "{err}");
         assert!(err.contains("DOES NOT FIT"), "{err}");
+    }
+
+    /// The report's verdict and the priced inequality must be the same
+    /// answer, or `inspect-plan` would print one thing and admission
+    /// would enforce another.
+    #[test]
+    fn kv_budget_view_agrees_with_the_reports_own_verdict() {
+        let path = fixture("ferrox_real_moe_test.gguf");
+        for budget in [1u64, 1 << 20, 1 << 30, u64::MAX / 4] {
+            let report = ResidencyReport::from_gguf(&path, assumptions(None), budget).unwrap();
+            let priced = report.kv_budget();
+            assert_eq!(
+                priced.check(report.assumptions.context_tokens).is_ok(),
+                report.fits(),
+                "budget {budget}: verdict and priced inequality disagree"
+            );
+            assert_eq!(
+                priced.estimated_bytes(report.assumptions.context_tokens),
+                report.required_bytes + (report.budget_bytes - report.usable_bytes),
+                "budget {budget}: the priced total must be the plan's total plus headroom"
+            );
+        }
+    }
+
+    /// `--ctx auto` on a real header: the chosen context must actually
+    /// pass the same check, and one granularity step further must not.
+    #[test]
+    fn auto_context_picks_a_context_that_really_fits() {
+        let path = fixture("ferrox_real_moe_test.gguf");
+        let report =
+            ResidencyReport::from_gguf(&path, assumptions(None), 64 * 1024 * 1024).unwrap();
+        let fit = report.auto_context(131_072);
+        let priced = report.kv_budget();
+        assert!(fit.tokens > 0, "64 MiB must fit some context: {fit}");
+        assert!(priced.check(fit.tokens).is_ok(), "{fit}");
+        if fit.capped_by == crate::kv_budget::ContextCap::DeviceBudget {
+            assert!(
+                priced.check(fit.tokens + fit.granularity).is_err(),
+                "auto context left a whole granularity step on the table: {fit}"
+            );
+        }
+    }
+
+    /// A checkpoint whose header declares a sliding window must be
+    /// priced against the window, not the full context -- the variant
+    /// the plan calls out and the one an unmodified formula gets wrong.
+    #[test]
+    fn a_sliding_window_config_is_priced_against_the_window_not_the_context() {
+        let mut cfg = crate::config::test_dense_fixture();
+        cfg.n_layers = 8;
+        cfg.n_kv_heads = 4;
+        cfg.head_dim = 64;
+        cfg.sliding_window = None;
+        cfg.swa_pattern = None;
+        let full = KvShape::from_config(&cfg, KvElem::F32, 1);
+
+        cfg.sliding_window = Some(512);
+        let windowed = KvShape::from_config(&cfg, KvElem::F32, 1);
+
+        assert_eq!(
+            full.kv_bytes_for_tokens(512),
+            windowed.kv_bytes_for_tokens(512)
+        );
+        assert!(windowed.kv_bytes_for_tokens(32_768) < full.kv_bytes_for_tokens(32_768) / 60);
     }
 }

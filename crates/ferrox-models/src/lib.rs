@@ -13,6 +13,7 @@ pub mod capability;
 pub mod config;
 pub mod decoder;
 pub mod deepseek_v4_decoder;
+pub mod device_budget;
 pub mod engine;
 pub mod engine_factory;
 pub mod execution_plan;
@@ -59,6 +60,7 @@ pub use capability::{
 };
 pub use config::{deepseek_v4_pro, glm_5_2, kimi_k3, FfnActivation, ModelConfig, RopeLayout};
 pub use decoder::Decoder;
+pub use device_budget::{BudgetBackend, DeviceBudget};
 pub use engine::{
     DeepseekV4Engine, Engine, Glm52Engine, KimiEngine, MlaDenseFfn, MlaEngine, MlaLayerFfn,
     MlaLayerWeights, MlaMoeFfn, MlaMoeRuntime, TextTokenizer,

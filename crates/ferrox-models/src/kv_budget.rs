@@ -84,6 +84,26 @@ impl KvElem {
             KvElem::Turbo4 => "turbo4",
         }
     }
+
+    /// Maps a `FERROX_CTK` / `--ctk` value onto the width the Metal KV
+    /// store really keeps. Mirrors
+    /// `ferrox_metal::attn::effective_metal_kv_dtype`: `turbo8` and
+    /// `fp8` share Q8_0's 34-byte wire, and anything unrecognised or
+    /// unimplemented (`turbo3`) falls back to f16 rather than being
+    /// budgeted at a width no kernel writes.
+    ///
+    /// Note this does *not* check the block alignment that function
+    /// also checks (`n_kv_heads * head_dim` divisible by 32), so a
+    /// misaligned shape is budgeted at the requested width while the
+    /// runtime silently uses f16 -- an under-estimate, called out here
+    /// rather than papered over.
+    pub fn from_ctk(value: &str) -> Self {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "q8_0" | "turbo8" | "fp8" => KvElem::Q8_0,
+            "turbo4" => KvElem::Turbo4,
+            _ => KvElem::F16,
+        }
+    }
 }
 
 /// How one layer's KV cache is shaped. Which variant applies is a
@@ -623,6 +643,19 @@ mod tests {
             .per_token_kv_bytes(),
             32 * (2 * 8 * 128 / 32) * 18
         );
+    }
+
+    #[test]
+    fn ctk_names_map_onto_the_widths_metal_really_writes() {
+        assert_eq!(KvElem::from_ctk("f16"), KvElem::F16);
+        assert_eq!(KvElem::from_ctk("Q8_0"), KvElem::Q8_0);
+        // turbo8 and fp8 share Q8_0's wire, per MetalKvDtype.
+        assert_eq!(KvElem::from_ctk("turbo8"), KvElem::Q8_0);
+        assert_eq!(KvElem::from_ctk("fp8"), KvElem::Q8_0);
+        assert_eq!(KvElem::from_ctk("turbo4"), KvElem::Turbo4);
+        // turbo3 is unimplemented and falls back to f16, as does junk.
+        assert_eq!(KvElem::from_ctk("turbo3"), KvElem::F16);
+        assert_eq!(KvElem::from_ctk("  nonsense "), KvElem::F16);
     }
 
     #[test]

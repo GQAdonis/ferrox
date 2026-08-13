@@ -1759,9 +1759,9 @@ pub fn pack_q6_k_matrix_x8(data: &[u8], rows: usize, cols: usize, interleave: us
     for g in 0..n_groups {
         for b in 0..n_blocks {
             let mut row_refs: [&[u8]; Q6_KX8_NROWS] = [&[]; Q6_KX8_NROWS];
-            for r in 0..Q6_KX8_NROWS {
+            for (r, slot) in row_refs.iter_mut().enumerate() {
                 let base = (g * Q6_KX8_NROWS + r) * row_bytes + b * Q6_K_BLOCK_BYTES;
-                row_refs[r] = &data[base..base + Q6_K_BLOCK_BYTES];
+                *slot = &data[base..base + Q6_K_BLOCK_BYTES];
             }
             out.extend_from_slice(&make_block_q6_kx8(row_refs, interleave));
         }
@@ -2808,9 +2808,9 @@ mod neon {
 
                 // qh[c][i]: 2 col-groups × 8 vectors; shift down 2 bits each sb.
                 let mut qh = [[vdupq_n_u8(0); 8]; 2];
-                for c in 0..2 {
-                    for i in 0..8 {
-                        qh[c][i] = vld1q_u8(qh_base.add(i * 32 + 16 * c));
+                for (c, qh_c) in qh.iter_mut().enumerate() {
+                    for (i, slot) in qh_c.iter_mut().enumerate() {
+                        *slot = vld1q_u8(qh_base.add(i * 32 + 16 * c));
                     }
                 }
 
@@ -3610,9 +3610,9 @@ mod neon {
             let qs_base = blk.add(384);
 
             let mut qh = [[vdupq_n_u8(0); 8]; 2];
-            for c in 0..2 {
-                for i in 0..8 {
-                    qh[c][i] = vld1q_u8(qh_base.add(i * 32 + 16 * c));
+            for (c, qh_c) in qh.iter_mut().enumerate() {
+                for (i, slot) in qh_c.iter_mut().enumerate() {
+                    *slot = vld1q_u8(qh_base.add(i * 32 + 16 * c));
                 }
             }
 

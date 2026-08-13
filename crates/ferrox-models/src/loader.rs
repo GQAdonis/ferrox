@@ -284,11 +284,11 @@ impl ModelConfig {
         let feed_forward_length = metadata_u64_any(file, &[key("feed_forward_length")]);
         let expert_ffn_dim = metadata_u64_any(file, &[key("expert_feed_forward_length")])
             .or_else(|| {
-                feed_forward_length.and_then(|ff| {
+                feed_forward_length.map(|ff| {
                     if is_moe && n_experts_active > 0 {
-                        Some(ff / n_experts_active as u64)
+                        ff / n_experts_active as u64
                     } else {
-                        Some(ff)
+                        ff
                     }
                 })
             })
@@ -353,9 +353,7 @@ impl ModelConfig {
             .map(|v| v as usize)
             .filter(|&p| p > 1)
             .or_else(|| {
-                if sliding_window.is_none() {
-                    return None;
-                }
+                sliding_window?;
                 match arch_profile.family {
                     crate::capability::DecoderFamily::GemmaFamily => {
                         // Prefer architecture string: gemma2 → 2, else gemma3+ → 6.

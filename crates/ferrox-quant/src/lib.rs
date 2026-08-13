@@ -672,13 +672,8 @@ pub fn quantize_activations_q8_k(x: &[f32]) -> Q8KActivations {
                 let qi = (v * inv).round();
                 q_slot[i] = qi.clamp(-127.0, 127.0) as i8;
             }
-            for g in 0..16 {
-                let mut s = 0i32;
-                let off = g * 16;
-                for i in 0..16 {
-                    s += q_slot[off + i] as i32;
-                }
-                bsum_slot[g] = s as i16;
+            for (slot, group) in bsum_slot.iter_mut().zip(q_slot.chunks_exact(16)) {
+                *slot = group.iter().map(|&q| q as i32).sum::<i32>() as i16;
             }
         };
     // Serial on purpose: every batch caller is already inside a Rayon

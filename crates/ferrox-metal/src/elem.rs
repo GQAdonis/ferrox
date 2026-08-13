@@ -440,6 +440,7 @@ pub(crate) fn encode_rms_norm_at(
 /// Batched RMSNorm: one threadgroup per row of length `n` (`batch` rows).
 /// Contiguous layout `[batch][n]` in `x` / `out`. Replaces `batch` calls to
 /// [`encode_rms_norm_at`] (dominant dispatch storm on tiny-model pp512).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_rms_norm_batch(
     encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
     device: &Retained<ProtocolObject<dyn MTLDevice>>,
@@ -493,6 +494,7 @@ pub(crate) fn encode_rms_norm_batch(
 }
 
 /// Batched RMSNorm writing `half` rows (prefill → `mul_mm_sg_f16`).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_rms_norm_f32_to_f16_batch(
     encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
     device: &Retained<ProtocolObject<dyn MTLDevice>>,
@@ -751,6 +753,7 @@ pub(crate) fn encode_rms_norm_per_head(
     encode_rms_norm_per_head_batch(encoder, device, x, weight, n_heads, head_dim, 1, eps)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_rms_norm_per_head_batch(
     encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
     device: &Retained<ProtocolObject<dyn MTLDevice>>,

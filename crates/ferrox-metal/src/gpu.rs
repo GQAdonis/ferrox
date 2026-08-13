@@ -1288,7 +1288,7 @@ pub fn launch_q4_0_mul_mm(
         device,
         &weights_buf,
         &x_buf,
-        &out_buf,
+        out_buf,
         row_bytes,
         n_blocks_per_row,
         rows,
@@ -3469,6 +3469,8 @@ pub fn mul_mm_id_f16_meta(kind: &str) -> Option<(&'static str, usize, usize)> {
     })
 }
 
+// Written ahead of the fused MoE prefill stack (plan: metal-moe-stack).
+#[allow(dead_code)]
 fn moe_mm_id_map0_fn(top_k: usize) -> Option<&'static str> {
     match top_k {
         2 => Some("moe_mm_id_map0_ne20_2"),
@@ -3480,6 +3482,7 @@ fn moe_mm_id_map0_fn(top_k: usize) -> Option<&'static str> {
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(dead_code)]
 pub(crate) fn encode_moe_mm_id_map0(
     enc: &ProtocolObject<dyn MTLComputeCommandEncoder>,
     device: &Retained<ProtocolObject<dyn MTLDevice>>,
@@ -3518,6 +3521,7 @@ pub(crate) fn encode_moe_mm_id_map0(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(dead_code)]
 pub(crate) fn encode_mul_mm_id_f16(
     enc: &ProtocolObject<dyn MTLComputeCommandEncoder>,
     device: &Retained<ProtocolObject<dyn MTLDevice>>,
@@ -3744,6 +3748,7 @@ pub(crate) fn encode_mul_mm_sg_f16(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_mul_mm_sg_offset(
     enc: &ProtocolObject<dyn MTLComputeCommandEncoder>,
     device: &Retained<ProtocolObject<dyn MTLDevice>>,
@@ -3768,6 +3773,7 @@ pub(crate) fn encode_mul_mm_sg_offset(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_mul_mm_sg_offset_ex(
     enc: &ProtocolObject<dyn MTLComputeCommandEncoder>,
     device: &Retained<ProtocolObject<dyn MTLDevice>>,
@@ -4037,7 +4043,7 @@ pub(crate) fn mm_timing_add(setup: u128, gpu: u128, read: u128) {
     MM_READ_US.fetch_add(read as u64, AtomOrd::Relaxed);
     let n = MM_CALLS.fetch_add(1, AtomOrd::Relaxed) + 1;
     // First call + every 224: stack prefill is often one timed launch.
-    if n == 1 || n % 224 == 0 {
+    if n == 1 || n.is_multiple_of(224) {
         eprintln!(
             "ferrox: mul_mm {n} calls -- setup {:.1} ms, gpu {:.1} ms, readback {:.1} ms",
             MM_SETUP_US.load(AtomOrd::Relaxed) as f64 / 1000.0,
@@ -5827,6 +5833,7 @@ fn encode_q4_0_moe_matvec_id(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(dead_code)]
 fn encode_moe_gather_rows(
     encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
     device: &Retained<ProtocolObject<dyn MTLDevice>>,
@@ -5875,6 +5882,7 @@ fn encode_moe_gather_rows(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(dead_code)]
 fn encode_moe_scatter_rows(
     encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
     device: &Retained<ProtocolObject<dyn MTLDevice>>,
@@ -5931,8 +5939,8 @@ fn moe_mm_id_map0(
 ) -> (Vec<Vec<(i32, i32)>>, usize) {
     let mut per: Vec<Vec<(i32, i32)>> = vec![Vec::new(); n_experts];
     let n_slots = n_tokens * top_k;
-    for slot in 0..n_slots {
-        let eid = ids[slot] as usize;
+    for (slot, &id) in ids.iter().take(n_slots).enumerate() {
+        let eid = id as usize;
         if eid < n_experts {
             let token = (slot / top_k) as i32;
             per[eid].push((token, slot as i32));
@@ -5963,8 +5971,11 @@ struct MoePrefillScratch {
     /// GPU map0: slot ids `[n_experts, n_tokens]`.
     mm_id_ids: Retained<ProtocolObject<dyn MTLBuffer>>,
     /// f16 activations for `mul_mm_id_f16` (size ≥ `n_slots * ffn`).
+    #[allow(dead_code)]
     half_in: Retained<ProtocolObject<dyn MTLBuffer>>,
+    #[allow(dead_code)]
     contig_in: Retained<ProtocolObject<dyn MTLBuffer>>,
+    #[allow(dead_code)]
     contig_out: Retained<ProtocolObject<dyn MTLBuffer>>,
 }
 
@@ -7634,15 +7645,15 @@ mod tests {
         let mut expected = vec![0f32; hidden];
         for e in 0..top_k {
             let mut act = vec![0f32; ffn];
-            for r in 0..ffn {
+            for (r, slot) in act.iter_mut().enumerate() {
                 let range = r * gu_row_bytes..(r + 1) * gu_row_bytes;
                 let g = ferrox_quant::dot_q4_0_f32_scalar(&gates[e][range.clone()], &x);
                 let u = ferrox_quant::dot_q4_0_f32_scalar(&ups[e][range], &x);
-                act[r] = ferrox_core_silu(g) * u;
+                *slot = ferrox_core_silu(g) * u;
             }
-            for r in 0..hidden {
+            for (r, slot) in expected.iter_mut().enumerate() {
                 let range = r * down_row_bytes..(r + 1) * down_row_bytes;
-                expected[r] += route[e] * ferrox_quant::dot_q4_0_f32_scalar(&downs[e][range], &act);
+                *slot += route[e] * ferrox_quant::dot_q4_0_f32_scalar(&downs[e][range], &act);
             }
         }
 
@@ -7786,9 +7797,9 @@ mod tests {
                     );
                     act[r] = ferrox_core_silu(g) * u;
                 }
-                for r in 0..hidden {
+                for (r, slot) in out_t.iter_mut().enumerate() {
                     let range = d_base + r * down_row_bytes..d_base + (r + 1) * down_row_bytes;
-                    out_t[r] += w * ferrox_quant::dot_q4_0_f32_scalar(&down[range], &act);
+                    *slot += w * ferrox_quant::dot_q4_0_f32_scalar(&down[range], &act);
                 }
             }
             expected.extend_from_slice(&out_t);
@@ -7892,9 +7903,9 @@ mod tests {
                     );
                     act[r] = ferrox_core_silu(g) * u;
                 }
-                for r in 0..hidden {
+                for (r, slot) in out_t.iter_mut().enumerate() {
                     let range = d_base + r * down_row_bytes..d_base + (r + 1) * down_row_bytes;
-                    out_t[r] += w * ferrox_quant::dot_q8_0_f32_scalar(&down[range], &act);
+                    *slot += w * ferrox_quant::dot_q8_0_f32_scalar(&down[range], &act);
                 }
             }
             expected.extend_from_slice(&out_t);
@@ -8360,6 +8371,7 @@ mod tests {
     /// ones that are not multiples of the 64x32 tile so the partial-tile
     /// store path is exercised: a kernel that only handles whole tiles
     /// corrupts the edges of a real prompt silently.
+    #[allow(clippy::too_many_arguments)]
     fn assert_mul_mm_sg_matches_matvec(
         label: &str,
         block_elems: usize,
@@ -8421,7 +8433,7 @@ mod tests {
             11,
             0.01,
             None,
-            |w, x, r, rb| launch_q8_0_matvec(w, x, r, rb),
+            launch_q8_0_matvec,
             launch_q8_0_mul_mm_sg,
         );
     }
@@ -8438,7 +8450,7 @@ mod tests {
             13,
             0.02,
             None,
-            |w, x, r, rb| launch_q4_0_matvec(w, x, r, rb),
+            launch_q4_0_matvec,
             launch_q4_0_mul_mm_sg,
         );
     }
@@ -8453,7 +8465,7 @@ mod tests {
             17,
             0.008,
             Some(0.003),
-            |w, x, r, rb| launch_q5_k_matvec(w, x, r, rb),
+            launch_q5_k_matvec,
             launch_q5_k_mul_mm_sg,
         );
     }
@@ -8470,7 +8482,7 @@ mod tests {
             19,
             0.0002,
             None,
-            |w, x, r, rb| launch_iq4_xs_matvec(w, x, r, rb),
+            launch_iq4_xs_matvec,
             launch_iq4_xs_mul_mm_sg,
         );
     }

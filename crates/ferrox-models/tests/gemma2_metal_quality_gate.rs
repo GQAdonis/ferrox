@@ -93,10 +93,7 @@ fn gemma2_cpu_greedy_contains_paris() {
 #[ignore = "needs Metal GPU + models/gemma-2-2b-it-Q4_K_M.gguf"]
 fn gemma2_metal_greedy_contains_paris() {
     #[cfg(not(feature = "metal"))]
-    {
-        eprintln!("skip: build with --features metal");
-        return;
-    }
+    eprintln!("skip: build with --features metal");
     #[cfg(feature = "metal")]
     {
         let path = gguf_path();

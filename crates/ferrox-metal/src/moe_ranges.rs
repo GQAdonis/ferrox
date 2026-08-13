@@ -124,7 +124,7 @@ impl MoeMemRanges {
             memory_barrier_resources(encoder, &refs);
             self.reset();
             let n = BARRIER_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
-            if std::env::var_os("FERROX_METAL_MOE_BARRIER_LOG").is_some() && n % 64 == 0 {
+            if std::env::var_os("FERROX_METAL_MOE_BARRIER_LOG").is_some() && n.is_multiple_of(64) {
                 let begins = BEGIN_OP_COUNT.load(Ordering::Relaxed);
                 eprintln!(
                     "ferrox: metal moe barriers={n} begin_ops={begins} (~{:.2} bar/op)",

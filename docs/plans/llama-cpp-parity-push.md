@@ -56,6 +56,15 @@ todos:
   - id: tooling-kernel-registry
     content: "Sealed kernel-lookup registry: record every dispatch lookup at model build, seal, warn/fail on a later miss that takes a fallback. Landed 99a69ab (ferrox-core/src/kernel_registry.rs, docs/CONFIG.md)"
     status: completed
+  - id: tooling-quant-sensitivity
+    content: "ADOPT (~120 lines, no new kernels): per-layer quantization sensitivity by quantize->dequantize round-trip — score relative_mse per block and PROPAGATE THE FLOAT OUTPUT forward so later layers do not look artificially sensitive from residual accumulation. Turns inspect-plan from static type rules into per-checkpoint measurement"
+    status: pending
+  - id: tooling-quality-eval
+    content: "Real gap: ferrox validates NUMERICS (NumPy goldens) but cannot answer 'did this quantization damage the model?', so no honest quality claim can go in docs/MODELS.md. Shape: fix the input, reference at full precision, sweep candidates, report a distortion metric (KL over logits), pick the smallest clearing a budget. Neither reference project has an LLM implementation to lift"
+    status: pending
+  - id: tooling-bench-discipline
+    content: "ADOPT into ferrox bench: warmup before any timing (shader/JIT compilation), temp=0 on timed runs, assert prompt length before AND after generation, assert zero cache hits, record thermal pressure with each result. ferrox is already AHEAD on repeat-and-median and on having a checked-in ledger at all"
+    status: pending
   - id: tooling-layer-divergence
     content: "Per-layer divergence comparator (per-head magnitude-ratio std, not mean) + MoE routing dumps, env-gated. Prerequisite for diagnosing MoE and the CPU/Metal divergence above"
     status: pending
@@ -65,8 +74,17 @@ todos:
   - id: coverage-f16
     content: "F16 tensors did not load at all (GgmlType::F16 parsed and sized, no dequant arm anywhere). dequant_f16 + shared widen_plain_float across all 7 loaders. Landed 7ef74f1"
     status: completed
+  - id: coverage-iq-tiers-published
+    content: "SUPPORT, highest coverage priority: ggml tags 17/21/22/29 (IQ2_XS, IQ3_S, IQ2_S, IQ1_M) fall to GgmlType::Other in ferrox-gguf, so 5 of the 16 published Unsloth UD-* variants cannot be decoded. IQ3_S is worst — it appears inside IQ3_M mixes and the low-bit UD recipes docs/MODELS.md already targets"
+    status: pending
+  - id: coverage-jinja-templates
+    content: "SUPPORT, structural: chat_template.rs is a 6-variant sniffed enum with hand-written renderers, so every new model family falls back to Plain and tool-calling formats are unreachable. Needs a real Jinja renderer (minijinja) + chat_template_kwargs passthrough. Verified: ChatTemplate::Gemma4 does not implement the real gemma-4 template (no thinking injection, no strip_thinking, no multimodal placeholders)"
+    status: pending
+  - id: coverage-stop-token-truth
+    content: "SUPPORT, cheap + high impact: gpt-oss `<|end|>` ends every non-final turn and is NOT a stop token (treating it as EOG truncates every reply); gemma-4 EOS is `<turn|>` not `<eos>`; tokenizer.ggml.token_type==CONTROL(3) is the authority for parseable specials; Unsloth strips `{{ bos_token }}` from exported templates so a loader that also auto-adds BOS double-BOSes"
+    status: pending
   - id: coverage-mxfp4-gptoss
-    content: "MXFP4 Metal+CUDA kernels (CPU is scalar-only) + gpt-oss graph (attn sinks, swiglu_oai clamp, SWA)"
+    content: "MXFP4 Metal+CUDA kernels (CPU is scalar-only) + gpt-oss graph (attn sinks, swiglu_oai clamp, SWA). URGENT per the 2026-08-13 study: ferrox DECODES MXFP4 (tag 39) and routes gpt-oss to generic-gqa with zero attention-sink code anywhere, and Unsloth publishes gpt-oss GGUFs as MXFP4-only — so a gpt-oss GGUF loads and silently emits wrong output. Exactly the coverage-fail-closed bug class, with a shipping model behind it"
     status: pending
   - id: coverage-cheap-archs
     content: "ffn_exp_probs_b in the generic MoE loader (unlocks 8 archs at once); granite/minicpm multipliers; cohere2 parallel residual; partial rotary + full bias"
@@ -141,6 +159,43 @@ happened twice in one session.
 One real regression: **OLMoE Metal `pp512` 626 → 587 (-6%)**, gap 2.48× →
 2.62×. Inside the ~20% host spread, so not conclusive on its own — but it
 is the wrong direction on the worst row in the ledger.
+
+### Coverage findings from the 2026-08-13 external study
+
+Two shipped products were read read-only under `.scratch/` (oMLX,
+Unsloth). Neither yields a kernel to port — oMLX's forward pass is
+mlx-lm's, and Unsloth does not write GGUF at all (it shells out to
+llama.cpp). What they yield is a **compatibility checklist against what
+is actually published**, and three items on it are correctness bugs:
+
+- **5 of 16 published `UD-*` variants are undecodable.** ggml tags 17,
+  21, 22, 29 (`IQ2_XS`, `IQ3_S`, `IQ2_S`, `IQ1_M`) hit
+  `GgmlType::Other` in `ferrox-gguf/src/lib.rs`. `IQ3_S` matters most:
+  it appears inside `IQ3_M` mixes and inside the low-bit recipes
+  `docs/MODELS.md` already claims as targets. Verified by hand against
+  the tag table, not taken on the study's word.
+- **gpt-oss loads and silently computes the wrong graph.** ferrox
+  decodes MXFP4 (tag 39) and routes `gpt-oss` to `generic-gqa`, and
+  there is no attention-sink code anywhere in `ferrox-models` or
+  `ferrox-core`. Unsloth publishes gpt-oss GGUFs as MXFP4-only. So the
+  file loads, runs fast, and is wrong — the `coverage-fail-closed` bug
+  class with a widely-distributed model behind it.
+- **Stop-token and BOS handling is model-specific in ways ferrox does
+  not encode.** gpt-oss `<|end|>` ends every non-final turn and is *not*
+  EOG (treating it as one truncates every reply); gemma-4's EOS is
+  `<turn|>`; `tokenizer.ggml.token_type == CONTROL(3)` is the authority
+  for parseable specials; and Unsloth deliberately strips
+  `{{ bos_token }}` from the template it bakes into the GGUF, so a
+  loader that renders the template *and* auto-adds BOS double-BOSes.
+
+One structural gap behind all of it: `chat_template.rs` is a six-variant
+sniffed enum with hand-written renderers. Every new family falls back to
+`Plain`, and the tool-call formats are unreachable without a real Jinja
+renderer. `ChatTemplate::Gemma4` was checked and does not implement the
+real gemma-4 template.
+
+Nothing here moves a benchmark row. All of it decides whether a model
+that loads produces the right tokens.
 
 ### Next levers, in order
 

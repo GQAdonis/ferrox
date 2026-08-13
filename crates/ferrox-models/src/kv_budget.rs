@@ -99,6 +99,9 @@ impl KvElem {
     /// rather than papered over.
     pub fn from_ctk(value: &str) -> Self {
         match value.trim().to_ascii_lowercase().as_str() {
+            // llama.cpp's `-ctk f32`, and the width of ferrox's own
+            // host `KvCache`.
+            "f32" => KvElem::F32,
             "q8_0" | "turbo8" | "fp8" => KvElem::Q8_0,
             "turbo4" => KvElem::Turbo4,
             _ => KvElem::F16,
@@ -511,7 +514,14 @@ impl KvBudget {
             (cap, ContextCap::ModelContextLength)
         } else {
             let raw = (for_full_layers / marginal) as usize;
-            let floored = (raw / granularity) * granularity;
+            // Flooring must never turn a real answer into "nothing
+            // fits": under one granularity step, report the exact
+            // number of tokens rather than rounding it away.
+            let floored = if raw >= granularity {
+                (raw / granularity) * granularity
+            } else {
+                raw
+            };
             if floored >= cap {
                 (cap, ContextCap::ModelContextLength)
             } else {
@@ -566,8 +576,9 @@ impl std::fmt::Display for ContextFit {
         write!(
             f,
             "ctx auto = {} tokens ({}): ({} device budget - {} weights - {} activation headroom) \
-             = {} for KV; / {} bytes/token/request / {} request(s) -> floored to {}-token steps, \
-             capped at the model's {} trained context. KV at the chosen context: {} bytes.",
+             = {} for KV; / {} bytes/token/request / {} request(s) -> rounded down to a multiple \
+             of {} (reported exactly below one step), capped at the model's {} trained context. \
+             KV at the chosen context: {} bytes.",
             self.tokens,
             match self.capped_by {
                 ContextCap::ModelContextLength => "limited by the model's context length",
@@ -648,6 +659,7 @@ mod tests {
     #[test]
     fn ctk_names_map_onto_the_widths_metal_really_writes() {
         assert_eq!(KvElem::from_ctk("f16"), KvElem::F16);
+        assert_eq!(KvElem::from_ctk("f32"), KvElem::F32);
         assert_eq!(KvElem::from_ctk("Q8_0"), KvElem::Q8_0);
         // turbo8 and fp8 share Q8_0's wire, per MetalKvDtype.
         assert_eq!(KvElem::from_ctk("turbo8"), KvElem::Q8_0);
@@ -891,6 +903,21 @@ mod tests {
         let fit = b.max_context(8192, 256);
         assert_eq!(fit.tokens, 8192);
         assert_eq!(fit.capped_by, ContextCap::ModelContextLength);
+    }
+
+    /// Flooring must not round a small-but-real answer down to "nothing
+    /// fits" -- found by running `--ctx-size auto` under a tight
+    /// `FERROX_DEVICE_BUDGET_BYTES`, where 227 tokens genuinely fitted
+    /// and the 256-token granularity reported 0.
+    #[test]
+    fn a_context_under_one_granularity_step_is_reported_exactly_not_floored_away() {
+        let shape = llama31_8b(); // 262144 bytes/token
+        let b = budget(1_000, 1_000 + 262_144 * 100, shape);
+        let fit = b.max_context(131_072, 256);
+        assert_eq!(fit.tokens, 100);
+        assert_eq!(fit.capped_by, ContextCap::DeviceBudget);
+        assert!(b.check(fit.tokens).is_ok());
+        assert!(b.check(fit.tokens + 1).is_err());
     }
 
     #[test]

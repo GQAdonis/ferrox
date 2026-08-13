@@ -39,6 +39,7 @@ library or overriding the CLI.
 | `FERROX_EXPERT_CACHE_BYTES` | MoE expert-streaming cache budget |
 | `FERROX_SSD_STREAMING` | `1` — stream MoE experts from disk |
 | `FERROX_GPU_VRAM_BUDGET_BYTES` | Cap GPU-resident MoE experts (`0` = CPU experts on Metal) |
+| `FERROX_DEVICE_BUDGET_BYTES` | Override the probed memory budget the pre-load KV check plans against (Metal `recommendedMaxWorkingSetSize` / free VRAM / host RAM minus a reserve). For container limits and shared GPUs |
 
 ## Kernel-lookup registry
 

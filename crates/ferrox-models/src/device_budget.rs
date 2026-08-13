@@ -58,6 +58,21 @@ impl std::fmt::Display for BudgetBackend {
     }
 }
 
+/// Lets a CLI flag take a backend name without this crate depending on
+/// clap: clap derives a value parser from `FromStr`.
+impl std::str::FromStr for BudgetBackend {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "cpu" | "host" => Ok(BudgetBackend::Cpu),
+            "metal" => Ok(BudgetBackend::Metal),
+            "cuda" => Ok(BudgetBackend::Cuda),
+            other => Err(format!("unknown backend `{other}` (cpu, metal, cuda)")),
+        }
+    }
+}
+
 /// Fraction of a *host RAM* budget held back for the OS and everything
 /// else running on the machine. Deliberately blunt: the alternative is
 /// modelling the OS, which the plan rules out.

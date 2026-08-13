@@ -76,6 +76,8 @@ fn load_f32_vec(file: &impl TensorSource, name: &str) -> Result<Vec<f32>, LoadEr
             }
             Ok(out)
         }
+        GgmlType::F16 => ferrox_quant::dequant_f16(raw)
+            .map_err(|_| LoadError::UnsupportedDtype(name.to_string(), GgmlType::F16)),
         GgmlType::BF16 => ferrox_quant::dequant_bf16(raw)
             .map_err(|_| LoadError::UnsupportedDtype(name.to_string(), GgmlType::BF16)),
         other => Err(LoadError::UnsupportedDtype(name.to_string(), other)),
@@ -100,7 +102,7 @@ fn load_weight_matrix(file: &impl TensorSource, name: &str) -> Result<WeightMatr
         }
     };
     match info.dtype {
-        GgmlType::F32 | GgmlType::BF16 => {
+        GgmlType::F32 | GgmlType::F16 | GgmlType::BF16 => {
             let data = load_f32_vec(file, name)?;
             Ok(WeightMatrix::F32(Tensor::new(data, shape)))
         }
@@ -169,7 +171,7 @@ fn load_wk_b_transposed(
             info.dtype,
         ));
     }
-    if !matches!(info.dtype, GgmlType::F32 | GgmlType::BF16) {
+    if !matches!(info.dtype, GgmlType::F32 | GgmlType::F16 | GgmlType::BF16) {
         return Err(LoadError::UnsupportedDtype(name.to_string(), info.dtype));
     }
     let all = load_f32_vec(file, name)?;
@@ -217,7 +219,7 @@ fn load_wv_b(
         ));
     }
     match info.dtype {
-        GgmlType::F32 | GgmlType::BF16 => {
+        GgmlType::F32 | GgmlType::F16 | GgmlType::BF16 => {
             let all = load_f32_vec(file, name)?;
             let per_head = kv_lora_rank * v_head_dim;
             Ok((0..n_head)
@@ -275,17 +277,8 @@ fn split_expert_tensor(
     let raw = file.tensor_bytes(name)?;
 
     match info.dtype {
-        GgmlType::F32 | GgmlType::BF16 => {
-            let all = if info.dtype == GgmlType::BF16 {
-                ferrox_quant::dequant_bf16(raw)
-                    .map_err(|_| LoadError::UnsupportedDtype(name.to_string(), GgmlType::BF16))?
-            } else {
-                let mut out = Vec::with_capacity(raw.len() / 4);
-                for chunk in raw.chunks_exact(4) {
-                    out.push(f32::from_le_bytes(chunk.try_into().unwrap()));
-                }
-                out
-            };
+        GgmlType::F32 | GgmlType::F16 | GgmlType::BF16 => {
+            let all = crate::loader::widen_plain_float(info.dtype, raw, name)?;
             let per_expert = out_dim * in_dim;
             Ok((0..n_experts)
                 .map(|e| {

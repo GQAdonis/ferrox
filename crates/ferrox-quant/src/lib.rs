@@ -207,6 +207,22 @@ pub fn dequant_bf16(src: &[u8]) -> Result<Vec<f32>, QuantError> {
         .collect())
 }
 
+/// F16 (IEEE-754 binary16) widened to f32. Like [`dequant_bf16`] this is
+/// a plain element type, not a block format: every f16 value is exactly
+/// representable in f32, so the widening is lossless. `GgmlType::F16` is
+/// what `llama-quantize --pure`-free conversions and every `*-f16.gguf`
+/// carry, and it is also the dtype ggml uses for `token_embd` in some
+/// mixed checkpoints.
+pub fn dequant_f16(src: &[u8]) -> Result<Vec<f32>, QuantError> {
+    if !src.len().is_multiple_of(2) {
+        return Err(QuantError::Misaligned(src.len(), 2));
+    }
+    Ok(src
+        .chunks_exact(2)
+        .map(|c| f16::from_le_bytes([c[0], c[1]]).to_f32())
+        .collect())
+}
+
 /// Dequantize a Q8_0 buffer into f32.
 pub fn dequant_q8_0(src: &[u8]) -> Result<Vec<f32>, QuantError> {
     if !src.len().is_multiple_of(Q8_0_BLOCK_BYTES) {
@@ -5714,6 +5730,36 @@ mod tests {
     fn bf16_rejects_odd_length_buffers() {
         let bad = vec![0u8; 3];
         assert!(dequant_bf16(&bad).is_err());
+    }
+
+    #[test]
+    fn f16_widening_is_exact_and_covers_the_special_values() {
+        // Every f16 is exactly representable in f32, so equality holds
+        // for all finite inputs -- including subnormals, which a naive
+        // shift-based widening gets wrong.
+        let subnormal = f16::from_bits(0x0001); // 2^-24, smallest f16 subnormal
+        let cases: Vec<f16> = [0.0f32, -0.0, 1.0, -1.0, 2.5, -0.5, 65504.0, -65504.0]
+            .iter()
+            .map(|&v| f16::from_f32(v))
+            .chain(std::iter::once(subnormal))
+            .collect();
+        let bytes: Vec<u8> = cases.iter().flat_map(|h| h.to_le_bytes()).collect();
+        let out = dequant_f16(&bytes).unwrap();
+        assert_eq!(out.len(), cases.len());
+        for (got, want) in out.iter().zip(cases.iter()) {
+            assert_eq!(got.to_bits(), want.to_f32().to_bits());
+        }
+        assert_eq!(out[8], 2f32.powi(-24));
+
+        // Infinity survives; f16 max (65504) is not clamped.
+        let inf = f16::INFINITY.to_le_bytes();
+        assert!(dequant_f16(&inf).unwrap()[0].is_infinite());
+    }
+
+    #[test]
+    fn f16_rejects_odd_length_buffers() {
+        let bad = vec![0u8; 5];
+        assert!(dequant_f16(&bad).is_err());
     }
 
     #[test]

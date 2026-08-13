@@ -183,6 +183,8 @@ fn load_f32_vec(file: &impl TensorSource, name: &str) -> Result<Vec<f32>, LoadEr
             }
             Ok(out)
         }
+        GgmlType::F16 => ferrox_quant::dequant_f16(raw)
+            .map_err(|_| LoadError::UnsupportedDtype(name.to_string(), GgmlType::F16)),
         GgmlType::BF16 => ferrox_quant::dequant_bf16(raw)
             .map_err(|_| LoadError::UnsupportedDtype(name.to_string(), GgmlType::BF16)),
         other => Err(LoadError::UnsupportedDtype(name.to_string(), other)),
@@ -235,7 +237,7 @@ fn load_weight_matrix(file: &impl TensorSource, name: &str) -> Result<WeightMatr
         }
     };
     match info.dtype {
-        GgmlType::F32 | GgmlType::BF16 => {
+        GgmlType::F32 | GgmlType::F16 | GgmlType::BF16 => {
             let data = load_f32_vec(file, name)?;
             Ok(WeightMatrix::F32(Tensor::new(data, shape)))
         }

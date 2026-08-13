@@ -697,10 +697,20 @@ fn load_dense_expert(
     })
 }
 
-fn load_f32_vec(file: &impl TensorSource, name: &str) -> Result<Vec<f32>, LoadError> {
-    let info = find_info(file, name)?;
-    let raw = file.tensor_bytes(name)?;
-    match info.dtype {
+/// Widen a raw plain-float tensor (`F32` / `F16` / `BF16`) to `f32`.
+///
+/// The three unquantized element types are handled identically at every
+/// call site (eager widening to an owned buffer -- none of them has a
+/// block structure a fused dot kernel could exploit), and each of the
+/// seven GGUF loaders used to inline the same two-way match. F16 had no
+/// arm in any of them, which made every `*-f16.gguf` a hard
+/// `UnsupportedDtype` even though the type was parsed and sized.
+pub(crate) fn widen_plain_float(
+    dtype: GgmlType,
+    raw: &[u8],
+    name: &str,
+) -> Result<Vec<f32>, LoadError> {
+    match dtype {
         GgmlType::F32 => {
             let mut out = Vec::with_capacity(raw.len() / 4);
             for chunk in raw.chunks_exact(4) {
@@ -708,8 +718,19 @@ fn load_f32_vec(file: &impl TensorSource, name: &str) -> Result<Vec<f32>, LoadEr
             }
             Ok(out)
         }
+        GgmlType::F16 => ferrox_quant::dequant_f16(raw)
+            .map_err(|_| LoadError::UnsupportedDtype(name.to_string(), GgmlType::F16)),
         GgmlType::BF16 => ferrox_quant::dequant_bf16(raw)
             .map_err(|_| LoadError::UnsupportedDtype(name.to_string(), GgmlType::BF16)),
+        other => Err(LoadError::UnsupportedDtype(name.to_string(), other)),
+    }
+}
+
+fn load_f32_vec(file: &impl TensorSource, name: &str) -> Result<Vec<f32>, LoadError> {
+    let info = find_info(file, name)?;
+    let raw = file.tensor_bytes(name)?;
+    match info.dtype {
+        GgmlType::F32 | GgmlType::F16 | GgmlType::BF16 => widen_plain_float(info.dtype, raw, name),
         GgmlType::Q8_0 => ferrox_quant::dequant_q8_0(raw)
             .map_err(|_| LoadError::UnsupportedDtype(name.to_string(), GgmlType::Q8_0)),
         GgmlType::Q4_0 => ferrox_quant::dequant_q4_0(raw)
@@ -777,7 +798,7 @@ fn load_weight_matrix(file: &impl TensorSource, name: &str) -> Result<WeightMatr
         // that would make sense for a plain narrowed float, so it's
         // eagerly widened to an owned f32 Tensor exactly like F32
         // tensors already are.
-        GgmlType::F32 | GgmlType::BF16 => {
+        GgmlType::F32 | GgmlType::F16 | GgmlType::BF16 => {
             let data = load_f32_vec(file, name)?;
             Ok(WeightMatrix::F32(Tensor::new(data, shape)))
         }
@@ -829,17 +850,8 @@ fn split_expert_tensor(
     let raw = file.tensor_bytes(name)?;
 
     match info.dtype {
-        GgmlType::F32 | GgmlType::BF16 => {
-            let all = if info.dtype == GgmlType::BF16 {
-                ferrox_quant::dequant_bf16(raw)
-                    .map_err(|_| LoadError::UnsupportedDtype(name.to_string(), GgmlType::BF16))?
-            } else {
-                let mut out = Vec::with_capacity(raw.len() / 4);
-                for chunk in raw.chunks_exact(4) {
-                    out.push(f32::from_le_bytes(chunk.try_into().unwrap()));
-                }
-                out
-            };
+        GgmlType::F32 | GgmlType::F16 | GgmlType::BF16 => {
+            let all = crate::loader::widen_plain_float(info.dtype, raw, name)?;
             let per_expert = out_dim * in_dim;
             Ok((0..n_experts)
                 .map(|e| {
@@ -1823,6 +1835,63 @@ mod tests {
             }
             _ => panic!("expected an F32 matrix for a BF16 tensor (no fused dot kernel for it)"),
         }
+    }
+
+    fn build_single_f16_tensor_gguf(rows: u64, cols: u64, values: &[f32]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.write_u32::<LittleEndian>(ferrox_gguf::GGUF_MAGIC)
+            .unwrap();
+        buf.write_u32::<LittleEndian>(3).unwrap(); // version
+        buf.write_u64::<LittleEndian>(1).unwrap(); // tensor_count
+        buf.write_u64::<LittleEndian>(1).unwrap(); // kv_count
+
+        write_kv_str(&mut buf, "general.architecture", "ferrox-f16-test");
+
+        write_string(&mut buf, "test.weight");
+        buf.write_u32::<LittleEndian>(2).unwrap(); // n_dims
+        buf.write_u64::<LittleEndian>(cols).unwrap();
+        buf.write_u64::<LittleEndian>(rows).unwrap();
+        buf.write_u32::<LittleEndian>(1).unwrap(); // dtype tag: F16
+        buf.write_u64::<LittleEndian>(0).unwrap(); // offset
+
+        while buf.len() % 32 != 0 {
+            buf.push(0);
+        }
+        for &v in values {
+            buf.extend_from_slice(&half::f16::from_f32(v).to_le_bytes());
+        }
+        buf
+    }
+
+    /// `GgmlType::F16` was parsed and sized but had no dequant arm in any
+    /// of the seven loaders, so every `*-f16.gguf` was a hard
+    /// `UnsupportedDtype`. Values are exactly representable in f16, so
+    /// this is an exact-equality check.
+    #[test]
+    fn load_weight_matrix_handles_a_real_on_disk_f16_tensor_end_to_end() {
+        let values: Vec<f32> = vec![1.0, -2.5, 0.0, 4.0, -8.0, 16.0];
+        let tmp = std::env::temp_dir().join("ferrox_test_f16_tensor.gguf");
+        std::fs::write(&tmp, build_single_f16_tensor_gguf(2, 3, &values)).unwrap();
+        let file = ferrox_gguf::GgufFile::open(&tmp).expect("real F16 GGUF file must parse");
+        std::fs::remove_file(&tmp).ok();
+
+        let matrix = load_weight_matrix(&file, "test.weight").expect("F16 tensor must load");
+        assert_eq!(matrix.rows(), 2);
+        assert_eq!(matrix.cols(), 3);
+        match &matrix {
+            WeightMatrix::F32(tensor) => {
+                assert_eq!(tensor.data, values, "F16 must widen to f32 exactly");
+            }
+            _ => panic!("expected an F32 matrix for an F16 tensor (no fused dot kernel for it)"),
+        }
+
+        // The same tensor read as a plain vector (norm weights, biases and
+        // the router all take this path, not `load_weight_matrix`).
+        let tmp = std::env::temp_dir().join("ferrox_test_f16_vec.gguf");
+        std::fs::write(&tmp, build_single_f16_tensor_gguf(2, 3, &values)).unwrap();
+        let file = ferrox_gguf::GgufFile::open(&tmp).expect("real F16 GGUF file must parse");
+        std::fs::remove_file(&tmp).ok();
+        assert_eq!(load_f32_vec(&file, "test.weight").unwrap(), values);
     }
 
     fn build_single_q5_1_tensor_gguf() -> Vec<u8> {

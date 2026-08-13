@@ -75,8 +75,8 @@ todos:
     content: "F16 tensors did not load at all (GgmlType::F16 parsed and sized, no dequant arm anywhere). dequant_f16 + shared widen_plain_float across all 7 loaders. Landed 7ef74f1"
     status: completed
   - id: coverage-iq-tiers-published
-    content: "SUPPORT, highest coverage priority: ggml tags 17/21/22/29 (IQ2_XS, IQ3_S, IQ2_S, IQ1_M) fall to GgmlType::Other in ferrox-gguf, so 5 of the 16 published Unsloth UD-* variants cannot be decoded. IQ3_S is worst — it appears inside IQ3_M mixes and the low-bit UD recipes docs/MODELS.md already targets"
-    status: pending
+    content: "SUPPORT, highest coverage priority: ggml tags 17/21/22/29 (IQ2_XS, IQ3_S, IQ2_S, IQ1_M) fall to GgmlType::Other in ferrox-gguf, so 5 of the 16 published Unsloth UD-* variants cannot be decoded. IQ3_S is worst — it appears inside IQ3_M mixes and the low-bit UD recipes docs/MODELS.md already targets. LANDED: all four decode on CPU (scalar, matching the sibling IQ formats' state — no NEON/GPU), wired through QuantKind + all six loader tables + dequant_any. Validated by linking llama.cpp's ggml-quants.c and asserting BIT-EXACT equality with dequantize_row_iq2_xs/_iq2_s/_iq3_s/_iq1_m on 4 blocks each, including the all-0xff maximum-grid-index/all-signs corner; mutation-checked non-vacuous. NOT validated on a real published UD-* checkpoint — none downloaded"
+    status: completed
   - id: coverage-jinja-templates
     content: "SUPPORT, structural: chat_template.rs is a 6-variant sniffed enum with hand-written renderers, so every new model family falls back to Plain and tool-calling formats are unreachable. Needs a real Jinja renderer (minijinja) + chat_template_kwargs passthrough. Verified: ChatTemplate::Gemma4 does not implement the real gemma-4 template (no thinking injection, no strip_thinking, no multimodal placeholders)"
     status: pending
@@ -168,12 +168,16 @@ mlx-lm's, and Unsloth does not write GGUF at all (it shells out to
 llama.cpp). What they yield is a **compatibility checklist against what
 is actually published**, and three items on it are correctness bugs:
 
-- **5 of 16 published `UD-*` variants are undecodable.** ggml tags 17,
-  21, 22, 29 (`IQ2_XS`, `IQ3_S`, `IQ2_S`, `IQ1_M`) hit
-  `GgmlType::Other` in `ferrox-gguf/src/lib.rs`. `IQ3_S` matters most:
-  it appears inside `IQ3_M` mixes and inside the low-bit recipes
-  `docs/MODELS.md` already claims as targets. Verified by hand against
-  the tag table, not taken on the study's word.
+- ~~**5 of 16 published `UD-*` variants are undecodable.**~~ **FIXED**
+  (`coverage-iq-tiers-published`). ggml tags 17, 21, 22, 29 (`IQ2_XS`,
+  `IQ3_S`, `IQ2_S`, `IQ1_M`) hit `GgmlType::Other` in
+  `ferrox-gguf/src/lib.rs`; `IQ3_S` mattered most, since it appears
+  inside `IQ3_M` mixes and inside the low-bit recipes `docs/MODELS.md`
+  already claims as targets. All four now decode on CPU (scalar only,
+  matching the sibling IQ formats). Validated by linking llama.cpp's
+  `ggml-quants.c` and asserting bit-exact equality with its own
+  `dequantize_row_*` output, not by re-reading the spec. Still
+  unvalidated end-to-end on a real published `UD-*` checkpoint.
 - **gpt-oss loads and silently computes the wrong graph.** ferrox
   decodes MXFP4 (tag 39) and routes `gpt-oss` to `generic-gqa`, and
   there is no attention-sink code anywhere in `ferrox-models` or
@@ -949,7 +953,7 @@ GGUF loaders, which previously each inlined their own two-way match.
 | 3 | gpt-oss graph: attn sinks, swiglu_oai clamp, SWA | pairs with #2; silently wrong today | M | `src/models/openai-moe.cpp` |
 | 4 | `ffn_exp_probs_b` in generic MoE loader | unlocks dots1, ernie4_5-moe, bailingmoe2, exaone-moe, hunyuan-moe, afmoe in one change | S | `llama-graph.cpp` `build_moe_ffn` |
 | 5 | Metal/CUDA Q2_K + Q3_K + IQ4_NL matvec | Q3_K_M/Q2_K standard for 30B+; CPU-only now | M | `ggml-metal.metal`, `ggml-cuda/vecdotq.cuh` |
-| 6 | IQ2_XS / IQ2_S / IQ3_S / IQ1_M | tiers Unsloth Dynamic ships; sibling grids already in `iq_tables.rs` | M | `ggml-quants.c` |
+| 6 | ~~IQ2_XS / IQ2_S / IQ3_S / IQ1_M~~ **DONE** | tiers Unsloth Dynamic ships; CPU scalar, goldens bit-exact vs linked `ggml-quants.c` | M | `ggml-quants.c` |
 | 7 | Granite / MiniCPM multipliers | ~3 scalars, widely quantized archs | XS | `src/models/granite.cpp`, `minicpm.cpp` |
 | 8 | Cohere2 / Command-R parallel residual + logit scale | common GGUFs, wrong today | S | `src/models/cohere2.cpp` |
 | 9 | Partial rotary (`n_rot`) + full bias | fixes stablelm, phi2, gptneox, starcoder2, gpt2 at once | S | `src/models/stablelm.cpp`, `starcoder2.cpp` |

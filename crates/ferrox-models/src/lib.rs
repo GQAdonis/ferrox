@@ -33,6 +33,7 @@ pub mod kimi_gguf_loader;
 pub mod kimi_loader;
 pub mod kimi_tokenizer;
 pub mod kimi_validate;
+pub mod kv_budget;
 pub mod latent_moe;
 pub mod llama4_engine;
 pub mod loader;
@@ -69,6 +70,10 @@ pub use engine_factory::{
 };
 pub use execution_plan::{ExecutionPlan, FusedOpCaps, MemoryPlan, PlanGeometry};
 pub use gemma4_engine::{Gemma4Engine, Gemma4Hparams, GEMMA4_ARCHES};
+pub use kv_budget::{
+    Ceiling, ContextCap, ContextFit, KvBudget, KvBudgetError, KvElem, KvLayout, KvShape,
+    SlidingWindow, CTX_AUTO_GRANULARITY,
+};
 pub use loader::LoadError;
 pub use output_projection::grouped_output_projection;
 pub use prefix_cache::{PrefixCache, PrefixCacheStats, PrefixMatch};

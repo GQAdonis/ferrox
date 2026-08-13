@@ -18,13 +18,13 @@ todos:
     content: "De-nest activation quantization (serial internals, parallelize once at apply_batch over row-quads into one wdata buffer); share one quant pass across q/k/v and gate/up"
     status: pending
   - id: cpu-decode-scaling
-    content: "CPU tg128 is the widest axis left (8 red rows, SmolLM2 2.45x). Cause is measured: fork-join scaling, not per-thread throughput. Retry the persistent pool with the wf/cpu-threadpool deadlock understood first (FERROX_CPU_THREADS=1 + rayon nesting)"
+    content: "CPU tg128 is the widest axis left (8 red rows, SmolLM2 2.44x, and the only axis with nothing at parity). Cause is measured: fork-join scaling, not per-thread throughput. Retry the persistent pool with the wf/cpu-threadpool deadlock understood first (FERROX_CPU_THREADS=1 + rayon nesting)"
     status: pending
   - id: cpu-prefill-attn-block
     content: "Block prefill attention: QK^T tile GEMM + vectorized softmax + V GEMM, replacing the per-KV-position online_attn_accumulate with 2 scalar expf per position"
     status: pending
   - id: cpu-gemma3-prefill
-    content: "Gemma-3-1B cpu pp512 1.94x is the worst CPU prefill row and has no diagnosis. Profile it before picking a lever — every other CPU pp row is 1.16-1.40x"
+    content: "Gemma-3-1B cpu pp512 1.65x (not the 1.94x previously recorded — llama's own number was 548 under load, 468 quiet) is still the worst CPU prefill row and has no diagnosis. SmolLM2 1.50x next"
     status: pending
   - id: metal-fa-mma
     content: "Port kernel_flash_attn_ext MMA (Q.K^T AND P.V via simdgroup_half8x8) for d=64 — attn.rs had ZERO simdgroup MMA, 16 of 128 lanes active"
@@ -36,10 +36,10 @@ todos:
     content: "Extend the MMA macro to d=256 (Gemma-3 metal pp512 1.17x). Blocked on the epilogue: `own` gives one float4 per lane, so D/4 <= 32 caps the macro at 128 — needs a lane loop"
     status: pending
   - id: suite-owed-d128
-    content: "OWED: full --suite + --render for the d=128 MMA (commit 0ee4d0b). Blocked twice now on host load — 2.4-3.5 on 08-12, 3-6 on 08-13 (Chrome + a VM). RESULTS.md still shows the pre-d128 numbers"
-    status: pending
+    content: "PAID (cb27b24, 2026-08-13, started at load 1.95): d=128 MMA published. Qwen3-0.6B 1.81->1.03x, Phi-4-mini 1.24->1.04x, Llama-3.2-3B 1.08->1.04x, Mistral-7B 1.10->1.05x. 25 red rows -> 21"
+    status: completed
   - id: metal-moe-stack
-    content: "Worst row on any backend: OLMoE metal pp512 2.48x. Move MoE layers onto the fused prefill stack: MoE PrefillDenseLayerMetal variant, GPU router+top-k, wire the already-written-but-uncalled encode_moe_mm_id_map0. Kills ~112 command buffers per pp512"
+    content: "Worst row on any backend: OLMoE metal pp512 2.62x (was 2.48x — ferrox 626->587, a real -6% inside host spread), and it owns the last Metal tg128 red row too (1.41x). Move MoE layers onto the fused prefill stack: MoE PrefillDenseLayerMetal variant, GPU router+top-k, wire the already-written-but-uncalled encode_moe_mm_id_map0. Kills ~112 command buffers per pp512"
     status: pending
   - id: metal-barrier-ranges
     content: "Replace 15 blanket per-layer buffer barriers with llama's mem-range overlap tracker; fuse rmsnorm+f32->f16 and silu_mul+f32->f16"
@@ -84,7 +84,7 @@ todos:
     content: "Golden/kernel tests + answer-parity smoke; row closed only at gap <=1.0x AND answers match llama"
     status: pending
   - id: close-all-red-rows
-    content: "Definition of done: all 25 currently-red rows (9 Metal pp512, 1 Metal tg128, 7 CPU pp512, 8 CPU tg128) at gap <=1.0x, and Gemma-4 given a real llama baseline so it stops being unmeasurable"
+    content: "Definition of done: all 21 currently-red rows (6 Metal pp512, 1 Metal tg128, 6 CPU pp512, 8 CPU tg128) at gap <=1.0x, and Gemma-4 given a real llama baseline so it stops being unmeasurable"
     status: pending
 isProject: false
 ---
@@ -102,42 +102,56 @@ isProject: false
 > (CPU prefill) and Phase 4 (coverage) are independent and can proceed in
 > parallel. The frontmatter `todos` list is the checklist.
 
-## Where this stands (2026-08-13)
+## Where this stands (2026-08-13, ledger regenerated)
 
-Done and measured: **Phase 1 CPU prefill**, **Metal dense prefill**,
-**d=64 MMA**, **d=128 MMA** (A/B only — see the owed suite run).
-Done and unmeasurable-by-nature (correctness/tooling, no row moves):
-**sealed kernel registry** (`99a69ab`), **F16 loading** (`7ef74f1`),
-**the clippy gate** (`c8a4cc6`).
+The owed suite run is **paid** (`cb27b24`, started at load 1.95). Done and
+published: **Phase 1 CPU prefill**, **Metal dense prefill**, **d=64 MMA**,
+**d=128 MMA**. Done as correctness/tooling (no row moves): **sealed kernel
+registry** (`99a69ab`), **F16 loading** (`7ef74f1`), **prefill-capable
+`ferrox verify`** (`bfd1c1a`), **the clippy gate** (`c8a4cc6`).
 
-Red rows in the published ledger: **25** (was 29). By axis, worst first —
-`RESULTS.md` is still pre-d128, so the four rows the d=128 MMA moves are
-marked with the A/B figure it is expected to publish:
+**21 red rows** (29 at the start of the push, 25 before this run):
 
 | Axis | Red | Worst | Owner |
 |---|---|---|---|
-| CPU `tg128` | 8 | SmolLM2 2.45× | `cpu-decode-scaling` |
-| CPU `pp512` | 7 | Gemma-3-1B 1.94× | `cpu-gemma3-prefill`, then 1a–1d |
-| Metal `pp512` | 9 (→5 after d128 publishes) | OLMoE 2.48× | `metal-moe-stack` |
-| Metal `tg128` | 1 | OLMoE 1.38× | `metal-moe-stack` |
+| CPU `tg128` | 8 | SmolLM2 2.44× | `cpu-decode-scaling` |
+| CPU `pp512` | 6 | Gemma-3-1B 1.65× | `cpu-gemma3-prefill`, then 1a–1d |
+| Metal `pp512` | 6 | OLMoE 2.62× | `metal-moe-stack`, `metal-fa-mma-d256` |
+| Metal `tg128` | 1 | OLMoE 1.41× | `metal-moe-stack` |
 
-**Nothing further should be measured until the owed suite run happens.**
-It has now been blocked twice by host load — 2.4–3.5 on 08-12, and 3–6 on
-08-13 (Chrome, a VM, WindowServer). Every further Metal change stacks on
-top of an unmeasured one, and once two land together neither can be
-attributed. The three items landed today are deliberately chosen to be
-ones a loaded host cannot invalidate: they are correctness and hygiene,
-and none of them claims a number.
+**Dense Metal prefill is finished as a workstream.** Every dense row is
+1.02–1.08×, and the d=128 kernel moved Qwen3-0.6B by 76% (1936 → 3400
+tok/s). What is left on Metal is MoE and one d=256 row.
 
-Next levers, in order once the ledger is regenerated:
+### What this run corrected
 
-1. `metal-moe-stack` — OLMoE owns both remaining Metal red rows (pp512
-   2.48×, tg128 1.38×) and is the single worst row on any backend.
+Both corrections are the same failure: reading the old table instead of
+measuring both engines together. The plan already forbids this; it still
+happened twice in one session.
+
+- **The pre-08-13 llama CPU column was measured under load and reads
+  low.** TinyLlama CPU `tg128`: llama 60.64 → 91.74 while ferrox rose
+  55.98 → 61.58 — the row went 1.08× → 1.49× with no ferrox regression.
+  Same on OLMoE CPU `tg128` (llama 65.71 → 107.57). Any "regression"
+  spanning that boundary needs re-deriving from same-session numbers.
+- **Gemma-3-1B CPU `pp512` is 1.65×, not 1.94×** — llama 548 → 468. It is
+  still the worst CPU prefill row, but the gap was never as wide as the
+  plan's framing assumed.
+
+One real regression: **OLMoE Metal `pp512` 626 → 587 (-6%)**, gap 2.48× →
+2.62×. Inside the ~20% host spread, so not conclusive on its own — but it
+is the wrong direction on the worst row in the ledger.
+
+### Next levers, in order
+
+1. `metal-moe-stack` — OLMoE owns **both** remaining Metal red rows
+   (pp512 2.62×, tg128 1.41×) and is the worst row on any backend.
 2. `cpu-decode-scaling` — 8 red rows, the only axis with nothing at
    parity, and the cause is already measured (fork-join scaling; ferrox
-   *beats* llama at one thread on Mistral-7B).
+   beats llama at one thread on Mistral-7B). Retry the persistent pool
+   with the `wf/cpu-threadpool` deadlock understood first.
 3. `cpu-gemma3-prefill` — the one CPU prefill row that is an outlier
-   rather than a trend, and it has no diagnosis yet.
+   rather than a trend, still undiagnosed.
 
 ## Ledger as of v0.4.0 (2026-08-11, regenerated on Host B)
 

@@ -221,6 +221,15 @@ pub enum QuantKind {
     IQ1S,
     IQ2XXS,
     IQ3XXS,
+    /// The second codebook-grid tier (ggml tags 17/21/22/29), which the
+    /// published `UD-*` recipes reach for when the `_XXS` tier is too
+    /// lossy -- IQ3_S especially, since it is most of what an `IQ3_M`
+    /// mix contains. Scalar kernels only; goldens are the real compiled
+    /// ggml dequantizers' own output, asserted bit-exactly.
+    IQ2XS,
+    IQ2S,
+    IQ3S,
+    IQ1M,
     /// GGUF *block*-MXFP4 (17-byte interleaved blocks, ggml tag 39) --
     /// not the same layout as `WeightMatrix::Mxfp4`'s two-buffer
     /// safetensors form, though the math is identical. Scalar kernel
@@ -250,6 +259,10 @@ impl QuantKind {
         QuantKind::IQ1S,
         QuantKind::IQ2XXS,
         QuantKind::IQ3XXS,
+        QuantKind::IQ2XS,
+        QuantKind::IQ2S,
+        QuantKind::IQ3S,
+        QuantKind::IQ1M,
         QuantKind::Mxfp4Gguf,
     ];
 
@@ -274,6 +287,10 @@ impl QuantKind {
             QuantKind::IQ1S => "IQ1_S",
             QuantKind::IQ2XXS => "IQ2_XXS",
             QuantKind::IQ3XXS => "IQ3_XXS",
+            QuantKind::IQ2XS => "IQ2_XS",
+            QuantKind::IQ2S => "IQ2_S",
+            QuantKind::IQ3S => "IQ3_S",
+            QuantKind::IQ1M => "IQ1_M",
             QuantKind::Mxfp4Gguf => "MXFP4",
         }
     }
@@ -624,6 +641,18 @@ impl WeightMatrix {
             QuantKind::IQ3XXS => {
                 (cols / ferrox_quant::IQ3_XXS_BLOCK_ELEMS) * ferrox_quant::IQ3_XXS_BLOCK_BYTES
             }
+            QuantKind::IQ2XS => {
+                (cols / ferrox_quant::IQ2_XS_BLOCK_ELEMS) * ferrox_quant::IQ2_XS_BLOCK_BYTES
+            }
+            QuantKind::IQ2S => {
+                (cols / ferrox_quant::IQ2_S_BLOCK_ELEMS) * ferrox_quant::IQ2_S_BLOCK_BYTES
+            }
+            QuantKind::IQ3S => {
+                (cols / ferrox_quant::IQ3_S_BLOCK_ELEMS) * ferrox_quant::IQ3_S_BLOCK_BYTES
+            }
+            QuantKind::IQ1M => {
+                (cols / ferrox_quant::IQ1_M_BLOCK_ELEMS) * ferrox_quant::IQ1_M_BLOCK_BYTES
+            }
             QuantKind::Mxfp4Gguf => {
                 (cols / ferrox_quant::MXFP4_GGUF_BLOCK_ELEMS) * ferrox_quant::MXFP4_GGUF_BLOCK_BYTES
             }
@@ -764,6 +793,10 @@ impl WeightMatrix {
             QuantKind::IQ1S => ferrox_quant::dot_iq1_s_f32(row, x),
             QuantKind::IQ2XXS => ferrox_quant::dot_iq2_xxs_f32(row, x),
             QuantKind::IQ3XXS => ferrox_quant::dot_iq3_xxs_f32(row, x),
+            QuantKind::IQ2XS => ferrox_quant::dot_iq2_xs_f32(row, x),
+            QuantKind::IQ2S => ferrox_quant::dot_iq2_s_f32(row, x),
+            QuantKind::IQ3S => ferrox_quant::dot_iq3_s_f32(row, x),
+            QuantKind::IQ1M => ferrox_quant::dot_iq1_m_f32(row, x),
             QuantKind::Mxfp4Gguf => ferrox_quant::dot_mxfp4_gguf_f32(row, x),
         }
     }
@@ -788,6 +821,10 @@ impl WeightMatrix {
             QuantKind::IQ1S => ferrox_quant::dequant_iq1_s(bytes),
             QuantKind::IQ2XXS => ferrox_quant::dequant_iq2_xxs(bytes),
             QuantKind::IQ3XXS => ferrox_quant::dequant_iq3_xxs(bytes),
+            QuantKind::IQ2XS => ferrox_quant::dequant_iq2_xs(bytes),
+            QuantKind::IQ2S => ferrox_quant::dequant_iq2_s(bytes),
+            QuantKind::IQ3S => ferrox_quant::dequant_iq3_s(bytes),
+            QuantKind::IQ1M => ferrox_quant::dequant_iq1_m(bytes),
             QuantKind::Mxfp4Gguf => ferrox_quant::dequant_mxfp4_gguf(bytes),
         };
         out.expect("row byte length is block-aligned by construction (block_bytes_per_row)")
@@ -880,7 +917,14 @@ impl WeightMatrix {
         !matches!(
             self,
             WeightMatrix::Quantized {
-                kind: QuantKind::IQ4NL | QuantKind::IQ1S | QuantKind::IQ2XXS | QuantKind::IQ3XXS,
+                kind: QuantKind::IQ4NL
+                    | QuantKind::IQ1S
+                    | QuantKind::IQ2XXS
+                    | QuantKind::IQ3XXS
+                    | QuantKind::IQ2XS
+                    | QuantKind::IQ2S
+                    | QuantKind::IQ3S
+                    | QuantKind::IQ1M,
                 ..
             }
         )
@@ -3920,7 +3964,7 @@ mod tests {
         names.dedup();
         assert_eq!(names.len(), total, "QuantKind::ALL has a duplicate");
         assert_eq!(
-            total, 17,
+            total, 21,
             "a QuantKind variant was added without updating ALL"
         );
     }

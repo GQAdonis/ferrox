@@ -506,6 +506,10 @@ fn quant_kind_for(dtype: GgmlType) -> Option<QuantKind> {
         GgmlType::Q8_1 => Some(QuantKind::Q8_1),
         GgmlType::IQ4NL => Some(QuantKind::IQ4NL),
         GgmlType::IQ4XS => Some(QuantKind::IQ4XS),
+        GgmlType::IQ2XS => Some(QuantKind::IQ2XS),
+        GgmlType::IQ2S => Some(QuantKind::IQ2S),
+        GgmlType::IQ3S => Some(QuantKind::IQ3S),
+        GgmlType::IQ1M => Some(QuantKind::IQ1M),
         GgmlType::IQ1S => Some(QuantKind::IQ1S),
         GgmlType::IQ2XXS => Some(QuantKind::IQ2XXS),
         GgmlType::IQ3XXS => Some(QuantKind::IQ3XXS),
@@ -757,6 +761,26 @@ fn load_f32_vec(file: &impl TensorSource, name: &str) -> Result<Vec<f32>, LoadEr
             .map_err(|_| LoadError::UnsupportedDtype(name.to_string(), GgmlType::IQ4NL)),
         GgmlType::IQ4XS => ferrox_quant::dequant_iq4_xs(raw)
             .map_err(|_| LoadError::UnsupportedDtype(name.to_string(), GgmlType::IQ4XS)),
+        // The codebook-grid tiers. Rare on the 1-D tensors this
+        // function widens (norms and biases are almost always F32),
+        // but a dtype ferrox can decode should never be rejected here
+        // just because the *other* dispatch table below knows it --
+        // that split is how a supported format turns into a load
+        // failure on the one checkpoint that uses it.
+        GgmlType::IQ1S => ferrox_quant::dequant_iq1_s(raw)
+            .map_err(|_| LoadError::UnsupportedDtype(name.to_string(), GgmlType::IQ1S)),
+        GgmlType::IQ1M => ferrox_quant::dequant_iq1_m(raw)
+            .map_err(|_| LoadError::UnsupportedDtype(name.to_string(), GgmlType::IQ1M)),
+        GgmlType::IQ2XXS => ferrox_quant::dequant_iq2_xxs(raw)
+            .map_err(|_| LoadError::UnsupportedDtype(name.to_string(), GgmlType::IQ2XXS)),
+        GgmlType::IQ2XS => ferrox_quant::dequant_iq2_xs(raw)
+            .map_err(|_| LoadError::UnsupportedDtype(name.to_string(), GgmlType::IQ2XS)),
+        GgmlType::IQ2S => ferrox_quant::dequant_iq2_s(raw)
+            .map_err(|_| LoadError::UnsupportedDtype(name.to_string(), GgmlType::IQ2S)),
+        GgmlType::IQ3XXS => ferrox_quant::dequant_iq3_xxs(raw)
+            .map_err(|_| LoadError::UnsupportedDtype(name.to_string(), GgmlType::IQ3XXS)),
+        GgmlType::IQ3S => ferrox_quant::dequant_iq3_s(raw)
+            .map_err(|_| LoadError::UnsupportedDtype(name.to_string(), GgmlType::IQ3S)),
         other => Err(LoadError::UnsupportedDtype(name.to_string(), other)),
     }
 }
@@ -2159,22 +2183,65 @@ mod tests {
         buf
     }
 
-    /// End-to-end load+apply for the three codebook-grid low-bit
-    /// formats the published Dynamic GGUFs are built from: a real
-    /// on-disk tensor of each type must load zero-copy as the right
-    /// `QuantKind` and produce the same matvec result as dequantizing
-    /// the block directly. Dtype tags (19/16/18) verified against
-    /// ggml.h's enum ggml_type.
+    /// A structurally valid block of `len` bytes for any of the
+    /// codebook-grid formats: every bit pattern is a legal code in all
+    /// of them (the grid indices are bounded by their own bit widths),
+    /// so a deterministic byte fill is a real block, not a fixture that
+    /// happens to avoid the interesting paths. Only the f16 scale needs
+    /// pinning, and only so the comparison below can't be NaN-vs-NaN.
+    fn pseudo_iq_block(len: usize, seed: u32) -> Vec<u8> {
+        let mut s = seed;
+        let mut out = Vec::with_capacity(len);
+        for _ in 0..len {
+            s ^= s << 13;
+            s ^= s >> 17;
+            s ^= s << 5;
+            out.push((s >> 24) as u8);
+        }
+        out
+    }
+
+    /// End-to-end load+apply for the codebook-grid low-bit formats the
+    /// published Dynamic GGUFs are built from: a real on-disk tensor of
+    /// each type must load zero-copy as the right `QuantKind` and
+    /// produce the same matvec result as dequantizing the block
+    /// directly. That is the property this test exists for -- the
+    /// *values* are pinned against real ggml in `ferrox-quant`; what
+    /// can only break here is the tag -> kind -> block-stride chain,
+    /// and a wrong stride silently reads the neighbouring row.
+    /// Dtype tags (19/29/16/17/22/18/21/39) verified against ggml.h's
+    /// enum ggml_type.
     #[test]
     fn load_weight_matrix_handles_real_on_disk_iq_lowbit_tensors_end_to_end() {
         type DequantFn = fn(&[u8]) -> Result<Vec<f32>, ferrox_quant::QuantError>;
-        let cases: [(&str, u32, &[u8], QuantKind, DequantFn); 4] = [
+        // IQ1_M carries no f16 scale field; its scale is reassembled
+        // from the four scale words' top nibbles, and the top nibble of
+        // the last one supplies the f16 sign + high exponent bits.
+        // Pinning it to 0x2 keeps the exponent out of the all-ones
+        // NaN/Inf pattern whatever the rest of the fill does. The other
+        // three do carry a leading f16 `d`, pinned for the same reason.
+        let mut iq1m = pseudo_iq_block(ferrox_quant::IQ1_M_BLOCK_BYTES, 0x2907_31A0);
+        iq1m[55] = (iq1m[55] & 0x0F) | 0x20;
+        let mut iq2xs = pseudo_iq_block(ferrox_quant::IQ2_XS_BLOCK_BYTES, 0x2107_31A1);
+        let mut iq2s = pseudo_iq_block(ferrox_quant::IQ2_S_BLOCK_BYTES, 0x2207_31A2);
+        let mut iq3s = pseudo_iq_block(ferrox_quant::IQ3_S_BLOCK_BYTES, 0x2307_31A3);
+        for blk in [&mut iq2xs, &mut iq2s, &mut iq3s] {
+            blk[0..2].copy_from_slice(&half::f16::from_f32(0.115).to_le_bytes());
+        }
+        let cases: [(&str, u32, &[u8], QuantKind, DequantFn); 8] = [
             (
                 "iq1s",
                 19,
                 &IQ1_S_TEST_BLOCK,
                 QuantKind::IQ1S,
                 ferrox_quant::dequant_iq1_s,
+            ),
+            (
+                "iq1m",
+                29,
+                &iq1m,
+                QuantKind::IQ1M,
+                ferrox_quant::dequant_iq1_m,
             ),
             (
                 "iq2xxs",
@@ -2184,11 +2251,32 @@ mod tests {
                 ferrox_quant::dequant_iq2_xxs,
             ),
             (
+                "iq2xs",
+                17,
+                &iq2xs,
+                QuantKind::IQ2XS,
+                ferrox_quant::dequant_iq2_xs,
+            ),
+            (
+                "iq2s",
+                22,
+                &iq2s,
+                QuantKind::IQ2S,
+                ferrox_quant::dequant_iq2_s,
+            ),
+            (
                 "iq3xxs",
                 18,
                 &IQ3_XXS_TEST_BLOCK,
                 QuantKind::IQ3XXS,
                 ferrox_quant::dequant_iq3_xxs,
+            ),
+            (
+                "iq3s",
+                21,
+                &iq3s,
+                QuantKind::IQ3S,
+                ferrox_quant::dequant_iq3_s,
             ),
             (
                 "mxfp4_gguf",

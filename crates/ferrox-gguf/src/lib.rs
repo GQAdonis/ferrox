@@ -124,6 +124,18 @@ pub enum GgmlType {
     IQ1S,
     IQ2XXS,
     IQ3XXS,
+    /// The second tier of codebook-grid formats: the ones the published
+    /// `UD-*` recipes reach for when `*_XXS` is too lossy. Same grid
+    /// machinery, but each stores its sign bits *literally* (a byte per
+    /// 8 elements) or in wider grid codes rather than as a 7-bit index
+    /// into `KSIGNS_IQ2XS`, which is why they need their own kernels
+    /// and their own grids rather than a parameter on the `_XXS` ones.
+    /// IQ3_S in particular is not optional coverage: it is what an
+    /// `IQ3_M` mix is largely made of.
+    IQ2XS,
+    IQ2S,
+    IQ3S,
+    IQ1M,
     /// GGUF block-MXFP4 (ggml tag 39): 17-byte blocks of 32 elements
     /// (1 E8M0 scale byte + 16 nibble bytes). Distinct from the
     /// safetensors two-buffer MXFP4 layout Kimi K3 uses -- same math,
@@ -153,11 +165,15 @@ impl GgmlType {
             13 => GgmlType::Q5K,
             14 => GgmlType::Q6K,
             16 => GgmlType::IQ2XXS,
+            17 => GgmlType::IQ2XS,
             18 => GgmlType::IQ3XXS,
             19 => GgmlType::IQ1S,
             20 => GgmlType::IQ4NL,
+            21 => GgmlType::IQ3S,
+            22 => GgmlType::IQ2S,
             23 => GgmlType::IQ4XS,
             26 => GgmlType::I32,
+            29 => GgmlType::IQ1M,
             39 => GgmlType::MXFP4,
             30 => GgmlType::BF16,
             other => GgmlType::Other(other),
@@ -183,16 +199,26 @@ impl GgmlType {
             GgmlType::Q6K => (210, 256),
             GgmlType::IQ4NL => (18, 32), // 1x f16 scale + 16 bytes of 4-bit codebook indices
             GgmlType::IQ4XS => (136, 256), // 1x f16 scale + split 6-bit sub-scales + 128 bytes of indices
-            // Block sizes for the three low-bit IQ formats are
-            // cross-checked against each format's published
-            // bits-per-weight figure, which the layout must reproduce
-            // exactly:
-            //   IQ1_S   50 bytes/256 elems * 8 = 1.5625 bpw
-            //   IQ2_XXS 66 bytes/256 elems * 8 = 2.0625 bpw
-            //   IQ3_XXS 98 bytes/256 elems * 8 = 3.0625 bpw
+            // Block sizes for the low-bit IQ formats are cross-checked
+            // against each format's published bits-per-weight figure,
+            // which the layout must reproduce exactly:
+            //   IQ1_S    50 bytes/256 elems * 8 = 1.5625 bpw
+            //   IQ1_M    56 bytes/256 elems * 8 = 1.75   bpw
+            //   IQ2_XXS  66 bytes/256 elems * 8 = 2.0625 bpw
+            //   IQ2_XS   74 bytes/256 elems * 8 = 2.3125 bpw
+            //   IQ2_S    82 bytes/256 elems * 8 = 2.5625 bpw
+            //   IQ3_XXS  98 bytes/256 elems * 8 = 3.0625 bpw
+            //   IQ3_S   110 bytes/256 elems * 8 = 3.4375 bpw
             GgmlType::IQ1S => (50, 256), // 1x f16 scale + 32 bytes grid indices + 16 bytes qh
             GgmlType::IQ2XXS => (66, 256), // 1x f16 scale + 64 bytes of u16 grid/sign codes
             GgmlType::IQ3XXS => (98, 256), // 1x f16 scale + 96 bytes of grid/sign codes
+            GgmlType::IQ2XS => (74, 256), // 1x f16 scale + 64 bytes of u16 grid/sign codes + 8 scale bytes
+            GgmlType::IQ2S => (82, 256),  // 1x f16 scale + 32 grid + 32 sign + 8 qh + 8 scale bytes
+            GgmlType::IQ3S => (110, 256), // 1x f16 scale + 64 grid + 8 qh + 32 sign + 4 scale bytes
+            // IQ1_M is the one IQ format with *no* f16 scale field: the
+            // block scale is reassembled from the four scale words' top
+            // nibbles (see `ferrox-quant`), so all 56 bytes are payload.
+            GgmlType::IQ1M => (56, 256), // 32 grid bytes + 16 qh + 8 scale bytes
             GgmlType::MXFP4 => (17, 32), // 1x E8M0 scale byte + 16 nibble bytes
             GgmlType::I32 => (4, 1),
             GgmlType::Other(_) => (0, 1),
@@ -529,14 +555,19 @@ mod tests {
 
     #[test]
     fn recognized_low_bit_types_match_their_published_bits_per_weight() {
-        // The IQ1_S/IQ2_XXS/IQ3_XXS block layouts are recognition-only
-        // (no kernels). Their block sizes must reproduce each format's
+        // Each low-bit IQ block size must reproduce that format's
         // published bits-per-weight exactly -- an arithmetic
-        // cross-check independent of this file's own table.
+        // cross-check independent of this file's own table, and the
+        // cheapest way to catch a transposed digit in a block size
+        // (which would otherwise silently mis-stride a whole tensor).
         for (ty, tag, bpw_x16) in [
             (GgmlType::IQ1S, 19u32, 25u32), // 1.5625 bpw * 16
+            (GgmlType::IQ1M, 29, 28),       // 1.75   bpw * 16
             (GgmlType::IQ2XXS, 16, 33),     // 2.0625 bpw * 16
+            (GgmlType::IQ2XS, 17, 37),      // 2.3125 bpw * 16
+            (GgmlType::IQ2S, 22, 41),       // 2.5625 bpw * 16
             (GgmlType::IQ3XXS, 18, 49),     // 3.0625 bpw * 16
+            (GgmlType::IQ3S, 21, 55),       // 3.4375 bpw * 16
         ] {
             assert_eq!(GgmlType::from_tag(tag), ty);
             let (bytes, elems) = ty.block_layout();

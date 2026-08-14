@@ -35,6 +35,7 @@ library or overriding the CLI.
 | `FERROX_TOKIO_WORKERS` | `ferrox-server` async worker threads (default `2`); keeps the HTTP runtime from oversubscribing the decode pool |
 | `FERROX_QOS_LOG` | `1` — log each rayon worker's macOS QoS class at pool start |
 | `FERROX_UI` | `1` — serve chat UI at `/` and `/ui` |
+| `FERROX_EXIT_ON_STDIN_CLOSE` | `1` — exit on stdin EOF (same as `--exit-on-stdin-close`); off by default so a `/dev/null` stdin does not stop the server |
 | `FERROX_KV_POOL_BLOCKS` | Paged-KV pool size (blocks) |
 | `FERROX_EXPERT_CACHE_BYTES` | MoE expert-streaming cache budget |
 | `FERROX_SSD_STREAMING` | `1` — stream MoE experts from disk |

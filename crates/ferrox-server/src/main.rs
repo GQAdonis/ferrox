@@ -86,7 +86,10 @@ struct ServerArgs {
     #[arg(long, value_name = "HOST")]
     host: Option<IpAddr>,
 
-    /// Port to listen on.
+    /// Port to listen on. `0` asks the kernel for a free one; the
+    /// actually-bound address is then announced on stdout (see
+    /// [`announce_ready`]), which is how a supervising process is meant
+    /// to learn it.
     #[arg(long, value_name = "PORT")]
     port: Option<u16>,
 
@@ -125,6 +128,16 @@ struct ServerArgs {
     /// MCP tool-server config JSON (stub: listed in `/v1/models` metadata).
     #[arg(long = "mcp-config", value_name = "PATH")]
     mcp_config: Option<PathBuf>,
+
+    /// Exit when stdin reaches EOF (for a supervising parent process).
+    ///
+    /// Opt-in on purpose: a server started with stdin redirected from
+    /// `/dev/null` -- systemd, cron, `nohup` -- sees EOF immediately,
+    /// and making this the default would turn those into a server that
+    /// exits the moment it starts. A parent that *wants* the guarantee
+    /// (the desktop shell) passes the flag and keeps the pipe open.
+    #[arg(long = "exit-on-stdin-close", default_value_t = false)]
+    exit_on_stdin_close: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -2013,6 +2026,64 @@ fn init_cpu_pool() {
     }
 }
 
+/// Prints the machine-readable ready line (see `ferrox_api::lifecycle`)
+/// on stdout and flushes it.
+///
+/// This one line is what makes `--port 0` usable, and it deletes a whole
+/// feature from any supervising process: no "is the port free" probe, no
+/// `lsof` to work out whether an existing listener is a stale copy of
+/// ourselves or a stranger's server, no dialog to explain the result.
+/// The kernel picks the port and the child says what it got.
+///
+/// Shares stdout with the tracing subscriber on purpose -- a parent
+/// reads stdout line by line and ignores anything that is not the ready
+/// event, which `ServerReady::from_line` does for it.
+fn announce_ready(addr: SocketAddr, scheme: &str) {
+    use std::io::Write;
+    let ready =
+        ferrox_api::ServerReady::new(addr, scheme, env!("CARGO_PKG_VERSION"), std::process::id());
+    let mut stdout = std::io::stdout().lock();
+    let _ = writeln!(stdout, "{}", ready.to_line());
+    let _ = stdout.flush();
+}
+
+/// Resolves when the server should stop serving.
+///
+/// Stdin-close is the one orphan-prevention mechanism that behaves
+/// identically on macOS, Windows and Linux and survives a parent that
+/// dies rather than exiting cleanly: the kernel closes the pipe either
+/// way. The POSIX alternative -- a signal handler plus an exit hook plus
+/// a reaper -- has no Windows equivalent at all, since there is no
+/// SIGTERM there.
+///
+/// When disabled this future never resolves, which is exactly the
+/// previous behaviour: serve until the process is stopped externally.
+async fn shutdown_signal(exit_on_stdin_close: bool) {
+    if !exit_on_stdin_close {
+        std::future::pending::<()>().await;
+        return;
+    }
+    let _ = tokio::task::spawn_blocking(|| {
+        use std::io::Read;
+        let mut sink = [0u8; 256];
+        let mut stdin = std::io::stdin().lock();
+        loop {
+            match stdin.read(&mut sink) {
+                // EOF: the parent is gone, or closed the pipe.
+                Ok(0) => break,
+                // Input on stdin is not a protocol here; drain it.
+                Ok(_) => continue,
+                Err(e) => {
+                    tracing::warn!("stdin read failed ({e}); treating it as closed");
+                    break;
+                }
+            }
+        }
+    })
+    .await;
+    tracing::info!("stdin closed; shutting down");
+}
+
 /// Tokio worker threads. The default is one per logical core, which on a
 /// 10-core M2 Pro means 10 async workers oversubscribing the same cores
 /// the rayon decode pool needs. Serving work here is almost entirely I/O
@@ -2052,6 +2123,10 @@ fn main() -> anyhow::Result<()> {
         || std::env::var("FERROX_UI")
             .map(|v| v == "1")
             .unwrap_or(false);
+    let exit_on_stdin_close = args.exit_on_stdin_close
+        || std::env::var("FERROX_EXIT_ON_STDIN_CLOSE")
+            .map(|v| v == "1")
+            .unwrap_or(false);
 
     // Before Tokio exists, so the decode pool's threads are not spawned
     // from (and do not inherit the QoS of) a blocking-pool thread.
@@ -2063,7 +2138,7 @@ fn main() -> anyhow::Result<()> {
         .worker_threads(tokio_worker_threads())
         .enable_all()
         .build()?;
-    let result = runtime.block_on(run(mcp_config_path, ui_server));
+    let result = runtime.block_on(run(mcp_config_path, ui_server, exit_on_stdin_close));
 
     let reason = match &result {
         Ok(()) => "normal".to_string(),
@@ -2071,10 +2146,20 @@ fn main() -> anyhow::Result<()> {
     };
     journal.append(&journal::Record::session_exit(reason));
 
+    // Dropping the runtime instead would wait for blocking tasks, and
+    // the stdin watcher parks in a blocking read that may never return
+    // (a terminal keeps stdin open forever). The serving future has
+    // already finished by here, so nothing useful is being abandoned.
+    runtime.shutdown_background();
+
     result
 }
 
-async fn run(mcp_config_path: Option<PathBuf>, ui_server: bool) -> anyhow::Result<()> {
+async fn run(
+    mcp_config_path: Option<PathBuf>,
+    ui_server: bool,
+    exit_on_stdin_close: bool,
+) -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
 
     // Fail-closed listener check, before anything else (including
@@ -2533,6 +2618,10 @@ async fn run(mcp_config_path: Option<PathBuf>, ui_server: bool) -> anyhow::Resul
     // `security::tls_paths_from_env`'s doc comment for why this can't
     // be meaningfully unit-tested here.
     let tls_paths = security::tls_paths_from_env().unwrap_or_else(|e| panic!("{e}"));
+    // Both arms bind first and read the address back off the socket
+    // rather than trusting the requested one: with `--port 0` the
+    // requested port is a lie by construction, and the ready line has
+    // to carry what the kernel actually handed out.
     match tls_paths {
         Some(paths) => {
             let config =
@@ -2548,15 +2637,30 @@ async fn run(mcp_config_path: Option<PathBuf>, ui_server: bool) -> anyhow::Resul
             let socket_addr: std::net::SocketAddr = addr
                 .parse()
                 .map_err(|e| anyhow::anyhow!("invalid FERROX_ADDR {addr:?} for TLS: {e}"))?;
-            tracing::info!("TLS enabled: ferrox-server listening on https://{addr}");
-            axum_server::bind_rustls(socket_addr, config)
+            let listener = std::net::TcpListener::bind(socket_addr)?;
+            let bound = listener.local_addr()?;
+            tracing::info!("TLS enabled: ferrox-server listening on https://{bound}");
+            announce_ready(bound, "https");
+
+            let handle = axum_server::Handle::new();
+            let shutdown_handle = handle.clone();
+            tokio::spawn(async move {
+                shutdown_signal(exit_on_stdin_close).await;
+                shutdown_handle.graceful_shutdown(Some(Duration::from_secs(5)));
+            });
+            axum_server::from_tcp_rustls(listener, config)?
+                .handle(handle)
                 .serve(app.into_make_service())
                 .await?;
         }
         None => {
-            tracing::info!("ferrox-server listening on {addr}");
             let listener = tokio::net::TcpListener::bind(&addr).await?;
-            axum::serve(listener, app).await?;
+            let bound = listener.local_addr()?;
+            tracing::info!("ferrox-server listening on {bound}");
+            announce_ready(bound, "http");
+            axum::serve(listener, app)
+                .with_graceful_shutdown(shutdown_signal(exit_on_stdin_close))
+                .await?;
         }
     }
     Ok(())
@@ -2599,6 +2703,51 @@ mod tests {
             cli_bind_addr(&args, Some("127.0.0.1:8383")).as_deref(),
             Some("[::1]:9000")
         );
+    }
+
+    #[test]
+    fn port_zero_survives_argument_parsing_as_a_real_request() {
+        // `--port 0` must reach the bind call intact: it is a request
+        // for a kernel-assigned port, not a missing value to default to
+        // 8383. The address it produces is deliberately provisional --
+        // the ready line reports what was actually bound.
+        let argv = ["ferrox-server", "--port", "0"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        let args = ServerArgs::try_parse_from(rewrite_llama_style_argv(argv)).unwrap();
+        assert_eq!(args.port, Some(0));
+        assert_eq!(
+            cli_bind_addr(&args, Some("127.0.0.1:8383")).as_deref(),
+            Some("127.0.0.1:0")
+        );
+    }
+
+    #[test]
+    fn stdin_close_exit_is_opt_in() {
+        // Default off: a server whose stdin is /dev/null (systemd, cron,
+        // nohup) would otherwise exit the instant it started.
+        let args =
+            ServerArgs::try_parse_from(["ferrox-server"].into_iter().map(String::from)).unwrap();
+        assert!(!args.exit_on_stdin_close);
+        let args = ServerArgs::try_parse_from(
+            ["ferrox-server", "--exit-on-stdin-close"]
+                .into_iter()
+                .map(String::from),
+        )
+        .unwrap();
+        assert!(args.exit_on_stdin_close);
+    }
+
+    #[test]
+    fn the_ready_line_round_trips_through_a_parent_reading_stdout() {
+        let addr: SocketAddr = "127.0.0.1:51999".parse().unwrap();
+        let ready = ferrox_api::ServerReady::new(addr, "http", "0.5.0", std::process::id());
+        let parsed = ferrox_api::ServerReady::from_line(&ready.to_line()).unwrap();
+        assert_eq!(parsed.port, 51999);
+        assert_eq!(parsed.base_url(), "http://127.0.0.1:51999");
+        // A parent reads stdout line by line; tracing shares the stream.
+        assert!(ferrox_api::ServerReady::from_line("INFO ferrox-server listening").is_none());
     }
 
     fn test_model() -> Model {

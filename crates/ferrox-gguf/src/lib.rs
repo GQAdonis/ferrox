@@ -15,6 +15,12 @@ use byteorder::{LittleEndian, ReadBytesExt};
 use std::sync::Arc;
 
 use memmap2::{Mmap, MmapOptions};
+
+/// Re-exported so downstream crates can name the type in a
+/// [`TensorSource`] implementation without taking their own `memmap2`
+/// dependency (which would then have to be kept version-compatible with
+/// this one for the trait to line up at all).
+pub use memmap2::Mmap as MmapHandle;
 use thiserror::Error;
 
 pub const GGUF_MAGIC: u32 = 0x4655_4747; // "GGUF" little-endian

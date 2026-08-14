@@ -559,6 +559,9 @@ pub fn run_infer(args: InferArgs) -> anyhow::Result<()> {
     let eos_id = file
         .metadata_u64("tokenizer.ggml.eos_token_id")
         .map(|v| v as usize);
+    // Not just `eos_token_id`: Llama-3 ends a turn with `<|eot_id|>` and
+    // gemma-4 with `<turn|>`, neither of which is the metadata EOS.
+    let eog_ids = ferrox_models::tokenizer::eog_token_ids(&file);
     let bos_id = file
         .metadata_u64("tokenizer.ggml.bos_token_id")
         .map(|v| v as usize);
@@ -687,7 +690,7 @@ pub fn run_infer(args: InferArgs) -> anyhow::Result<()> {
     let decode_t = Instant::now();
     for _ in 0..max_new {
         let next = sampler.sample(&logits, &sampling, &generated);
-        if !args.ignore_eos && Some(next) == eos_id {
+        if !args.ignore_eos && (Some(next) == eos_id || eog_ids.contains(&(next as u32))) {
             break;
         }
         generated.push(next);
@@ -736,6 +739,9 @@ fn run_mla_infer(args: InferArgs, path: &Path, file: &ShardedGguf) -> anyhow::Re
     let eos_id = file
         .metadata_u64("tokenizer.ggml.eos_token_id")
         .map(|v| v as usize);
+    // Not just `eos_token_id`: Llama-3 ends a turn with `<|eot_id|>` and
+    // gemma-4 with `<turn|>`, neither of which is the metadata EOS.
+    let eog_ids = ferrox_models::tokenizer::eog_token_ids(file);
     let bos_id = file
         .metadata_u64("tokenizer.ggml.bos_token_id")
         .map(|v| v as usize);
@@ -834,7 +840,7 @@ fn run_mla_infer(args: InferArgs, path: &Path, file: &ShardedGguf) -> anyhow::Re
     let decode_t = Instant::now();
     for _ in 0..max_new {
         let next = sampler.sample(&logits, &sampling, &generated);
-        if !args.ignore_eos && Some(next) == eos_id {
+        if !args.ignore_eos && (Some(next) == eos_id || eog_ids.contains(&(next as u32))) {
             break;
         }
         generated.push(next);
@@ -882,6 +888,9 @@ fn run_gemma4_infer(args: InferArgs, path: &Path, file: &ShardedGguf) -> anyhow:
     let eos_id = file
         .metadata_u64("tokenizer.ggml.eos_token_id")
         .map(|v| v as usize);
+    // Not just `eos_token_id`: Llama-3 ends a turn with `<|eot_id|>` and
+    // gemma-4 with `<turn|>`, neither of which is the metadata EOS.
+    let eog_ids = ferrox_models::tokenizer::eog_token_ids(file);
     let bos_id = file
         .metadata_u64("tokenizer.ggml.bos_token_id")
         .map(|v| v as usize);
@@ -981,7 +990,7 @@ fn run_gemma4_infer(args: InferArgs, path: &Path, file: &ShardedGguf) -> anyhow:
     let decode_t = Instant::now();
     for _ in 0..max_new {
         let next = sampler.sample(&logits, &sampling, &generated);
-        if !args.ignore_eos && Some(next) == eos_id {
+        if !args.ignore_eos && (Some(next) == eos_id || eog_ids.contains(&(next as u32))) {
             break;
         }
         generated.push(next);
@@ -1029,6 +1038,9 @@ fn run_glm52_infer(args: InferArgs, path: &Path, file: &ShardedGguf) -> anyhow::
     let eos_id = file
         .metadata_u64("tokenizer.ggml.eos_token_id")
         .map(|v| v as usize);
+    // Not just `eos_token_id`: Llama-3 ends a turn with `<|eot_id|>` and
+    // gemma-4 with `<turn|>`, neither of which is the metadata EOS.
+    let eog_ids = ferrox_models::tokenizer::eog_token_ids(file);
     let bos_id = file
         .metadata_u64("tokenizer.ggml.bos_token_id")
         .map(|v| v as usize);
@@ -1127,7 +1139,7 @@ fn run_glm52_infer(args: InferArgs, path: &Path, file: &ShardedGguf) -> anyhow::
     let decode_t = Instant::now();
     for _ in 0..max_new {
         let next = sampler.sample(&logits, &sampling, &generated);
-        if !args.ignore_eos && Some(next) == eos_id {
+        if !args.ignore_eos && (Some(next) == eos_id || eog_ids.contains(&(next as u32))) {
             break;
         }
         generated.push(next);

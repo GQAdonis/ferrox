@@ -18,7 +18,7 @@ todos:
     content: "De-nest activation quantization (serial internals, parallelize once at apply_batch over row-quads into one wdata buffer); share one quant pass across q/k/v and gate/up"
     status: pending
   - id: cpu-decode-scaling
-    content: "CPU tg128 is the widest axis left (8 red rows, SmolLM2 2.44x, and the only axis with nothing at parity). Cause is measured: fork-join scaling, not per-thread throughput. Retry the persistent pool with the wf/cpu-threadpool deadlock understood first (FERROX_CPU_THREADS=1 + rayon nesting)"
+    content: "CPU tg128 is the widest axis left (8 red rows, SmolLM2 2.44x, and the only axis with nothing at parity). Cause is measured: fork-join scaling, not per-thread throughput. DEADLOCK NOW UNDERSTOOD (2026-08-14, reproduced + sampled on the branch): pool worker blocked in a rayon latch (a pool task called rayon) -> rayon workers blocked on the pool submit mutex -> submitter holding it, spinning for done. Coexistence of two runtimes with a blocking lock between them, NOT the memory ordering the module argued about, and NOT specific to FERROX_CPU_THREADS=1. Retry rules in the body: try_lock never block, leaf-only tasks, flatten apply_three / run_expert / the MoE par_iter into one region, ship the hang as a test"
     status: pending
   - id: cpu-prefill-attn-block
     content: "Block prefill attention: QK^T tile GEMM + vectorized softmax + V GEMM, replacing the per-KV-position online_attn_accumulate with 2 scalar expf per position"
@@ -344,6 +344,45 @@ existed to measure; and its perf thesis was unverified by the author's own
 admission. The diagnosis it rests on is still correct (scaling, not
 throughput). Retry with the deadlock understood first — reason explicitly
 about `FERROX_CPU_THREADS=1` and rayon nesting before writing code.
+
+**Deadlock reproduced and diagnosed (2026-08-14).** Built the branch and
+ran a probe that submits pool regions from Rayon workers whose *tasks*
+call back into Rayon. It hangs, and `sample` gives the whole cycle:
+
+| threads | where they are |
+|---|---|
+| `ferrox-pool-0..4` | `run_tasks → trampoline → rayon bridge → in_worker → LockLatch::wait_and_reset` |
+| Rayon workers | `par_chunks_indexed → CpuPool::dispatch → Mutex::lock` (the submit lock) |
+| submitter | holds the submit lock, spinning for `done == n_workers` |
+
+pool worker → Rayon worker → submit lock → submitter → pool worker.
+
+So it is **not** a memory-ordering bug, and the module's ordering
+argument was never the problem. It is coexistence: two runtimes with a
+*blocking* lock between them, and a task body that can reach the other
+runtime. `FERROX_CPU_THREADS=1` is not needed to trigger it (a
+single-thread OLMoE decode on the branch completes fine); Rayon nesting
+alone is sufficient, and MoE decode nests by construction
+(`outs.par_iter_mut()` over experts, `rayon::join` in `run_expert`,
+`apply_three` for q/k/v).
+
+Rules the retry must satisfy, each one aimed at a specific edge of that
+cycle:
+
+1. **Never block on the pool.** `dispatch` takes the submit lock with
+   `try_lock`; a losing caller runs the Rayon path instead. That deletes
+   the `Rayon worker → submit lock` edge, which is the only edge that
+   needs another runtime to make progress.
+2. **Pool tasks are leaf kernels.** No task body may enter Rayon. That
+   deletes the `pool worker → Rayon worker` edge.
+3. **Flatten instead of nest.** The three sites that fan out with Rayon
+   during decode (`apply_three`, `run_expert`, the MoE `par_iter_mut`)
+   become *one* pool region over a fused task list, issued by the decode
+   thread — which is also the actual win, since it cuts regions per
+   layer rather than making each one cheaper.
+4. **The probe ships as a test.** The hang above is a two-runtime
+   regression test; it belongs in-tree so this cannot be re-landed
+   silently.
 
 ### Gaps in our own tooling, found by using it
 

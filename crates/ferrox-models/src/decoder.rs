@@ -583,6 +583,16 @@ impl Decoder {
     /// NeoX pairing to an architecture that needs Norm.
     fn apply_rope_head_theta(&self, slice: &mut [f32], pos: usize, theta: f32) {
         use crate::config::RopeLayout;
+        // Partial rotary (llama.cpp `hparams.n_rot` < `n_embd_head_k`,
+        // GGUF `<arch>.rope.dimension_count`): Phi-3/Phi-4 rotate only the
+        // first 96 of each 128-wide head and pass the remaining 32
+        // through untouched. Rotating the whole head instead is not a
+        // subtle error — it moves dimensions the model never trained to
+        // be position-dependent.
+        let slice = match self.config.rope_dim {
+            Some(rot) if rot < slice.len() => &mut slice[..rot],
+            _ => slice,
+        };
         match (self.config.rope_layout, &self.config.rope_freqs) {
             (RopeLayout::Norm, Some(freq_factors)) => {
                 apply_rope_interleaved_with_freq_factors(slice, pos, theta, freq_factors)
@@ -597,6 +607,30 @@ impl Decoder {
 
     fn apply_rope_head_layer(&self, slice: &mut [f32], pos: usize, layer_idx: usize) {
         self.apply_rope_head_theta(slice, pos, self.config.layer_rope_theta(layer_idx))
+    }
+
+    /// llama.cpp's RoPE `mscale` (ggml `rope_yarn`), applied where the
+    /// QKV biases and QK-norms are: multiplying `cos`/`sin` by a constant
+    /// is the same as scaling the vector RoPE rotates, and rotation is
+    /// linear, so pre-scaling q and k here is exactly what the kernel
+    /// would do post-hoc — without a new uniform on five backends' RoPE
+    /// kernels.
+    ///
+    /// Both q and k are scaled, so attention logits carry `m²`, which is
+    /// the whole observable effect (V is untouched, and k enters the
+    /// cache scaled exactly as llama.cpp's does).
+    #[inline]
+    fn apply_rope_attn_factor(&self, q: &mut [f32], k: &mut [f32]) {
+        let m = self.config.rope_attn_factor;
+        if m == 1.0 {
+            return;
+        }
+        for v in q.iter_mut() {
+            *v *= m;
+        }
+        for v in k.iter_mut() {
+            *v *= m;
+        }
     }
 
     /// Applies Q/K RMSNorm according to [`ModelConfig::qk_norm_style`].
@@ -703,6 +737,15 @@ impl Decoder {
         // legacy GQA (decode + prefill). attention_scale is compensated
         // by scaling Q on the host/Metal extras path.
         if self.config.head_dim > 256 {
+            return false;
+        }
+        // Partial rotary and LongRoPE's `mscale` are CPU-only today: the
+        // Metal RoPE kernels rotate the whole head and take no magnitude
+        // uniform, so admitting such a model here would make Metal and
+        // CPU compute different attention for the same weights. Refusing
+        // costs Phi-4-mini its Metal path until the kernels carry both;
+        // the alternative is two backends that disagree.
+        if self.config.rope_dim.is_some() || self.config.rope_attn_factor != 1.0 {
             return false;
         }
         Self::metal_matvec_launch(&layer.attn.q_proj).is_some()
@@ -2219,6 +2262,7 @@ impl Decoder {
                 if let Some(k_norm) = &layer.attn.k_norm {
                     k = self.apply_qk_norm(&k, k_norm);
                 }
+                self.apply_rope_attn_factor(&mut q, &mut k);
 
                 for h in 0..n_heads {
                     self.apply_rope_head_layer(&mut q[h * head_dim..(h + 1) * head_dim], pos, l);
@@ -2410,6 +2454,7 @@ impl Decoder {
             if let Some(k_norm) = &layer.attn.k_norm {
                 k = self.apply_qk_norm(&k, k_norm);
             }
+            self.apply_rope_attn_factor(&mut q, &mut k);
 
             for h in 0..n_heads {
                 self.apply_rope_head_layer(&mut q[h * head_dim..(h + 1) * head_dim], pos, l);
@@ -3426,6 +3471,7 @@ impl Decoder {
                     row.copy_from_slice(&normed);
                 }
             }
+            self.apply_rope_attn_factor(&mut q_batch, &mut k_batch);
 
             #[cfg(feature = "metal")]
             {
@@ -3984,6 +4030,7 @@ impl Decoder {
                     row.copy_from_slice(&normed);
                 }
             }
+            self.apply_rope_attn_factor(&mut q_batch, &mut k_batch);
 
             for b in 0..batch_size {
                 let pos = positions[b];
@@ -4115,6 +4162,79 @@ impl Decoder {
             .chunks(vocab_size)
             .map(|c| c.to_vec())
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod partial_rotary_tests {
+    use super::*;
+
+    /// Phi-3/Phi-4 rotate `rope.dimension_count` of each head and pass
+    /// the rest through. The tail staying bit-identical is the whole
+    /// property: rotating it would make dimensions position-dependent
+    /// that the model never trained that way.
+    #[test]
+    fn partial_rotary_leaves_the_tail_untouched() {
+        let mut cfg = crate::config::test_dense_fixture();
+        cfg.head_dim = 8;
+        cfg.rope_layout = crate::config::RopeLayout::Neox;
+        cfg.rope_freqs = None;
+        cfg.rope_dim = Some(4);
+        let decoder = Decoder::new_random_small(cfg, 1, 32);
+
+        let mut head: Vec<f32> = (0..8).map(|i| 1.0 + i as f32).collect();
+        let before = head.clone();
+        decoder.apply_rope_head_theta(&mut head, 3, 10000.0);
+
+        assert_eq!(
+            &head[4..],
+            &before[4..],
+            "dims at or past rope_dim must not rotate"
+        );
+        assert!(
+            head[..4] != before[..4],
+            "dims below rope_dim must rotate at a non-zero position"
+        );
+    }
+
+    /// The same call with no `rope_dim` must rotate everything, so the
+    /// narrow case cannot silently become the default.
+    #[test]
+    fn full_rotary_still_rotates_the_whole_head() {
+        let mut cfg = crate::config::test_dense_fixture();
+        cfg.head_dim = 8;
+        cfg.rope_layout = crate::config::RopeLayout::Neox;
+        cfg.rope_freqs = None;
+        cfg.rope_dim = None;
+        let decoder = Decoder::new_random_small(cfg, 1, 32);
+
+        let mut head: Vec<f32> = (0..8).map(|i| 1.0 + i as f32).collect();
+        let before = head.clone();
+        decoder.apply_rope_head_theta(&mut head, 3, 10000.0);
+        assert!(head[4..] != before[4..]);
+    }
+
+    /// `mscale` scales q and k and nothing else; `1.0` must be a literal
+    /// no-op so every other model pays nothing.
+    #[test]
+    fn rope_attn_factor_scales_q_and_k_only() {
+        let mut cfg = crate::config::test_dense_fixture();
+        cfg.rope_attn_factor = 2.0;
+        let decoder = Decoder::new_random_small(cfg, 1, 32);
+        let mut q = vec![1.0f32, -2.0, 3.0];
+        let mut k = vec![0.5f32, 4.0];
+        decoder.apply_rope_attn_factor(&mut q, &mut k);
+        assert_eq!(q, vec![2.0, -4.0, 6.0]);
+        assert_eq!(k, vec![1.0, 8.0]);
+
+        let mut cfg = crate::config::test_dense_fixture();
+        cfg.rope_attn_factor = 1.0;
+        let decoder = Decoder::new_random_small(cfg, 1, 32);
+        let mut q = vec![1.0f32, -2.0];
+        let mut k = vec![3.0f32];
+        decoder.apply_rope_attn_factor(&mut q, &mut k);
+        assert_eq!(q, vec![1.0, -2.0]);
+        assert_eq!(k, vec![3.0]);
     }
 }
 

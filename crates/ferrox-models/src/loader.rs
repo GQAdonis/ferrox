@@ -62,6 +62,15 @@ pub enum LoadError {
     /// Metadata advertises a feature the generic decoder does not implement.
     #[error("architecture '{0}' requires unimplemented feature: {1}")]
     UnsupportedFeature(String, String),
+    /// The checkpoint carries per-block tensors this build never reads,
+    /// i.e. weights that contribute to the real graph and would simply
+    /// be missing from ours. See [`assert_every_tensor_consumed`].
+    #[error(
+        "checkpoint carries {0} tensor(s) this build never reads, so its graph is not the one \
+         ferrox would run: {1}. This is a missing feature, not a corrupt file. Override with \
+         FERROX_ALLOW_UNKNOWN_TENSORS=1 to load anyway and accept wrong output."
+    )]
+    UnconsumedTensors(usize, String),
     /// `FERROX_STRICT_KERNELS=1` and the model has weights with no
     /// kernel on the selected accelerator, i.e. it would run, correctly,
     /// on a silently slower path. Refusing is the point: a benchmark or
@@ -427,6 +436,62 @@ impl ModelConfig {
         // comment for why this matters.
         let rope_freqs = load_f32_vec_optional(file, "rope_freqs.weight")?;
 
+        // Phi-3/Phi-4 LongRoPE: two per-band factor tensors instead of
+        // Llama's single `rope_freqs.weight`, selected by context size
+        // (llama.cpp `llama_model::get_rope_factors`: `rope_freqs` wins if
+        // present, else `rope_long` when the run's context exceeds
+        // `rope.scaling.original_context_length`, else `rope_short`).
+        //
+        // The selection here uses the checkpoint's own advertised context
+        // length, which is what llama.cpp defaults `n_ctx` to. A run that
+        // caps the context below `original_context_length` should use the
+        // short set; ferrox's config is built before the context size is
+        // known, so that case is not yet handled — recorded as a
+        // best-effort field rather than silently assumed correct.
+        let rope_orig_ctx = metadata_u64_any(file, &[key("rope.scaling.original_context_length")])
+            .map(|v| v as usize);
+        // `rope_freqs.weight` outranks the LongRoPE pair (llama.cpp
+        // `get_rope_factors` checks it first), so a checkpoint carrying
+        // it never populates these and the runtime re-pick below cannot
+        // overwrite a Llama-3 correction with a Phi one.
+        let (rope_freqs_long, rope_freqs_short) = if rope_freqs.is_some() {
+            (None, None)
+        } else {
+            (
+                load_f32_vec_optional(file, "rope_factors_long.weight")?,
+                load_f32_vec_optional(file, "rope_factors_short.weight")?,
+            )
+        };
+        // Provisional pick from the checkpoint's own advertised context;
+        // `ModelConfig::apply_runtime_context` re-picks once the run's
+        // `--ctx-size` is known, which is the number llama.cpp decides on.
+        let rope_freqs = match (rope_freqs, rope_orig_ctx) {
+            (Some(f), _) => Some(f),
+            (None, Some(orig)) => {
+                let model_ctx = metadata_u64_any(file, &[key("context_length")])
+                    .unwrap_or(orig as u64) as usize;
+                if model_ctx > orig {
+                    rope_freqs_long.clone().or_else(|| rope_freqs_short.clone())
+                } else {
+                    rope_freqs_short.clone().or_else(|| rope_freqs_long.clone())
+                }
+            }
+            (None, None) => None,
+        };
+
+        // Partial rotary: only when the file says the rotary width is
+        // narrower than a head. Equal values mean "whole head", which is
+        // the same thing as `None` and stays `None` so nothing downstream
+        // has to special-case it.
+        let rope_dim = metadata_u64_any(file, &[key("rope.dimension_count")])
+            .map(|d| d as usize)
+            .filter(|d| *d > 0 && *d < head_dim);
+
+        // See `ModelConfig::rope_attn_factor`.
+        let rope_attn_factor = metadata_f32_any(file, &[key("rope.scaling.attn_factor")])
+            .filter(|f| f.is_finite() && *f > 0.0)
+            .unwrap_or(1.0);
+
         // RoPE layout comes from the capability registry above (fail-
         // closed). Getting this wrong for `llama` (needs Norm) was the
         // real root cause of the Llama-3.1-8B early-stop/wrong-logits bug.
@@ -476,6 +541,11 @@ impl ModelConfig {
             final_logit_softcap,
             embedding_scale,
             attention_scale,
+            rope_attn_factor,
+            rope_dim,
+            rope_freqs_long,
+            rope_freqs_short,
+            rope_orig_ctx,
             rope_theta_swa,
             ffn_activation,
             best_effort_fields: Box::leak(best_effort_fields.into_boxed_slice()),
@@ -1552,8 +1622,77 @@ impl Decoder {
         decoder.probe_kernels();
         ferrox_core::kernel_registry::seal_or_error()
             .map_err(|e| LoadError::StrictKernels(e.to_string()))?;
+        // `ModelConfig` is parsed from a *different* handle on the same
+        // file (the CLI opens its own `GgufFile`, then hands the config
+        // here), so the model-level tensors it consumed were recorded on
+        // that handle, not this one. Replay them before the gate, or
+        // every Llama-3.x checkpoint reads as carrying an unread
+        // `rope_freqs.weight` it in fact uses on every RoPE call.
+        for name in crate::config::MODEL_LEVEL_TENSORS_READ_BY_CONFIG {
+            file.note_consumed(name);
+        }
+        assert_every_tensor_consumed(&file)?;
         Ok(decoder)
     }
+}
+
+/// Tensor-name prefixes a text-generation load legitimately never
+/// reads. Everything here is consumed by a *different* code path, not by
+/// nothing: multimodal projector planes belong to `mmproj`, and the
+/// per-shard split bookkeeping is metadata, not weights.
+const IGNORED_TENSOR_PREFIXES: &[&str] = &["mm.", "v.", "mmproj.", "resampler.", "audio."];
+
+/// Fails the load when the checkpoint carries tensors this build never
+/// looked at.
+///
+/// A tensor nobody reads is not a harmless extra: it is a term of the
+/// real graph that ours is missing. gpt-oss ships `blk.N.attn_sinks`
+/// and ferrox has no attention-sink code anywhere, so the file loads,
+/// runs at full speed, and emits a different distribution than the model
+/// it claims to be; the newer MoE recipes ship `ffn_exp_probs_b` the
+/// same way. Both are silent today, and both are exactly what the
+/// architecture registry cannot catch, because the architecture *string*
+/// is one ferrox does support — it is the checkpoint that carries more
+/// than the registry entry promises.
+///
+/// This is deliberately the last check in the load: by here every loader
+/// arm has had its chance to ask for what it needs, so what is left over
+/// is what nothing in this build knows about.
+///
+/// `FERROX_ALLOW_UNKNOWN_TENSORS=1` downgrades it to a warning, for the
+/// case where a human has decided the missing term does not matter (a
+/// bias tensor of zeros, an auxiliary head that never runs). The default
+/// is refusal: a wrong answer is worse than no answer.
+pub fn assert_every_tensor_consumed(file: &ShardedGguf) -> Result<(), LoadError> {
+    let mut left: Vec<String> = file
+        .unconsumed_tensors()
+        .into_iter()
+        .filter(|n| !IGNORED_TENSOR_PREFIXES.iter().any(|p| n.starts_with(p)))
+        .collect();
+    if left.is_empty() {
+        return Ok(());
+    }
+    left.sort();
+    let shown = left.iter().take(8).cloned().collect::<Vec<_>>().join(", ");
+    let listing = if left.len() > 8 {
+        format!("{shown}, … (+{} more)", left.len() - 8)
+    } else {
+        shown
+    };
+    if matches!(
+        std::env::var("FERROX_ALLOW_UNKNOWN_TENSORS")
+            .ok()
+            .as_deref(),
+        Some("1") | Some("true") | Some("on")
+    ) {
+        eprintln!(
+            "ferrox: WARNING — {} tensor(s) in this checkpoint are never read \
+             ({listing}); output may be wrong (FERROX_ALLOW_UNKNOWN_TENSORS=1)",
+            left.len()
+        );
+        return Ok(());
+    }
+    Err(LoadError::UnconsumedTensors(left.len(), listing))
 }
 
 #[cfg(test)]

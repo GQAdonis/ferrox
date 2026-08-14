@@ -4,6 +4,19 @@
 
 use ferrox_moe::{GatingFunction, MoeLayerConfig};
 
+/// Model-level (not per-layer) tensors `ModelConfig::from_gguf` reads.
+///
+/// The config is parsed from its own file handle, so these lookups are
+/// invisible to the handle the weight loader tracks consumption on.
+/// `loader::assert_every_tensor_consumed` replays them; anything added
+/// here must actually be *used*, not merely read, or the gate stops
+/// meaning what it says.
+pub const MODEL_LEVEL_TENSORS_READ_BY_CONFIG: &[&str] = &[
+    "rope_freqs.weight",
+    "rope_factors_long.weight",
+    "rope_factors_short.weight",
+];
+
 /// Which attention mechanism a model uses. `Gqa` (grouped-query
 /// attention + RoPE, uniform across every layer) is the only variant
 /// `ferrox-core`/`ferrox-models::decoder` actually implement today --
@@ -194,6 +207,39 @@ pub struct ModelConfig {
     /// eventually produces wrong logits (a spurious early EOS was the
     /// observed real symptom).
     pub rope_freqs: Option<Vec<f32>>,
+    /// LongRoPE's two candidate factor sets, kept so the choice between
+    /// them can be made when the *run's* context size is known rather
+    /// than at parse time. llama.cpp picks per request
+    /// (`llama_model::get_rope_factors` reads `cparams.n_ctx_seq`), and
+    /// the two sets are not interchangeable: Phi-4-mini's short set is
+    /// all ones (no correction at all) while its long set reaches 47.
+    /// Choosing from the checkpoint's advertised 131072 when the user
+    /// runs at 4096 is a different model.
+    pub rope_freqs_long: Option<Vec<f32>>,
+    pub rope_freqs_short: Option<Vec<f32>>,
+    /// `<arch>.rope.scaling.original_context_length` — the threshold the
+    /// choice above is made against.
+    pub rope_orig_ctx: Option<usize>,
+    /// Rotary width when it is narrower than `head_dim`
+    /// (`<arch>.rope.dimension_count`, llama.cpp `hparams.n_rot`).
+    /// `None` means the whole head rotates, which is the common case.
+    /// Phi-3/Phi-4 rotate 96 of 128.
+    pub rope_dim: Option<usize>,
+    /// LongRoPE/YaRN magnitude scaling (`<arch>.rope.scaling.attn_factor`,
+    /// llama.cpp `hparams.rope_attn_factor` folded into
+    /// `cparams.yarn_attn_factor` at `llama-context.cpp:231`, then applied
+    /// as ggml `rope_yarn`'s `mscale`, which multiplies *both* `cos` and
+    /// `sin` — so it scales the RoPE'd vector, at every position, whether
+    /// or not any frequency correction is active.
+    ///
+    /// Phi-4-mini ships `1.1902381`. Ignoring it does not merely change
+    /// long-context behaviour: q and k are both scaled, so every attention
+    /// logit is off by `attn_factor²` and the softmax is sharper than the
+    /// model's. Measured symptom: ferrox and llama.cpp diverge from the
+    /// eighth token of a greedy completion on the same GGUF.
+    ///
+    /// `1.0` for every architecture that does not set the key.
+    pub rope_attn_factor: f32,
     /// RoPE pairing convention for this architecture -- see
     /// `RopeLayout`. Independently of `rope_freqs`: a Llama checkpoint
     /// needs both `Norm` pairing *and* the per-band frequency factors.
@@ -242,6 +288,35 @@ pub enum FfnActivation {
 }
 
 impl ModelConfig {
+    /// Re-picks the LongRoPE factor set now that the run's context size
+    /// is known, matching llama.cpp `llama_model::get_rope_factors`:
+    /// `rope_freqs.weight` (Llama 3) always wins; otherwise the long set
+    /// applies only when the context exceeds
+    /// `rope.scaling.original_context_length`, and the short set
+    /// otherwise.
+    ///
+    /// A no-op for every checkpoint that ships neither set, which is all
+    /// of them except the Phi-3/Phi-4 family today.
+    pub fn apply_runtime_context(&mut self, ctx: usize) {
+        let (Some(orig), true) = (
+            self.rope_orig_ctx,
+            self.rope_freqs_long.is_some() || self.rope_freqs_short.is_some(),
+        ) else {
+            return;
+        };
+        let picked = if ctx > orig {
+            self.rope_freqs_long.as_ref()
+        } else {
+            self.rope_freqs_short.as_ref()
+        };
+        if let Some(f) = picked
+            .or(self.rope_freqs_long.as_ref())
+            .or(self.rope_freqs_short.as_ref())
+        {
+            self.rope_freqs = Some(f.clone());
+        }
+    }
+
     /// True if layer `layer_idx` (0-indexed) should be built as an
     /// ordinary dense FFN rather than this model's MoE topology.
     pub fn layer_is_dense(&self, layer_idx: usize) -> bool {
@@ -360,6 +435,11 @@ pub fn glm_5_2() -> ModelConfig {
         // applies here too.
         n_dense_leading_layers: 0,
         rope_freqs: None,
+        rope_attn_factor: 1.0,
+        rope_dim: None,
+        rope_freqs_long: None,
+        rope_freqs_short: None,
+        rope_orig_ctx: None,
         // Placeholder GQA path; real GLM-5.2 DSA uses interleaved RoPE
         // via `glm_dsa`/`mla`, not this preset's Decoder path.
         rope_layout: RopeLayout::Neox,
@@ -433,6 +513,11 @@ pub fn deepseek_v4_pro() -> ModelConfig {
         // not confirmed against V4 Pro's own config.json.
         n_dense_leading_layers: 3,
         rope_freqs: None,
+        rope_attn_factor: 1.0,
+        rope_dim: None,
+        rope_freqs_long: None,
+        rope_freqs_short: None,
+        rope_orig_ctx: None,
         // llama.cpp maps LLM_ARCH_DEEPSEEK4 -> LLAMA_ROPE_TYPE_NORM.
         rope_layout: RopeLayout::Norm,
         qk_norm_style: crate::capability::QkNormStyle::WholeVector,
@@ -536,6 +621,11 @@ pub fn kimi_k3() -> ModelConfig {
             },
         }),
         rope_freqs: None,
+        rope_attn_factor: 1.0,
+        rope_dim: None,
+        rope_freqs_long: None,
+        rope_freqs_short: None,
+        rope_orig_ctx: None,
         // GQA placeholder path only; real Kimi attention is rope-less MLA
         // or KDA and never reaches Decoder::apply_rope_head.
         rope_layout: RopeLayout::Neox,
@@ -587,6 +677,11 @@ pub fn test_dense_fixture() -> ModelConfig {
         },
         n_dense_leading_layers: 0,
         rope_freqs: None,
+        rope_attn_factor: 1.0,
+        rope_dim: None,
+        rope_freqs_long: None,
+        rope_freqs_short: None,
+        rope_orig_ctx: None,
         // Matches the independent reference's split-half apply_rope.
         rope_layout: RopeLayout::Neox,
         qk_norm_style: crate::capability::QkNormStyle::WholeVector,
@@ -633,6 +728,11 @@ pub fn test_moe_fixture() -> ModelConfig {
         },
         n_dense_leading_layers: 0,
         rope_freqs: None,
+        rope_attn_factor: 1.0,
+        rope_dim: None,
+        rope_freqs_long: None,
+        rope_freqs_short: None,
+        rope_orig_ctx: None,
         rope_layout: RopeLayout::Neox,
         qk_norm_style: crate::capability::QkNormStyle::WholeVector,
         swa_pattern: None,
@@ -681,6 +781,11 @@ pub fn test_mixed_fixture() -> ModelConfig {
         },
         n_dense_leading_layers: 1,
         rope_freqs: None,
+        rope_attn_factor: 1.0,
+        rope_dim: None,
+        rope_freqs_long: None,
+        rope_freqs_short: None,
+        rope_orig_ctx: None,
         rope_layout: RopeLayout::Neox,
         qk_norm_style: crate::capability::QkNormStyle::WholeVector,
         swa_pattern: None,
@@ -894,5 +999,68 @@ mod tests {
                 cfg.name
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod longrope_tests {
+    use super::*;
+
+    fn cfg_with_factors() -> ModelConfig {
+        let mut c = test_dense_fixture();
+        c.rope_orig_ctx = Some(4096);
+        c.rope_freqs_short = Some(vec![1.0; 48]);
+        c.rope_freqs_long = Some((0..48).map(|i| 1.0 + i as f32).collect());
+        c.rope_freqs = None;
+        c
+    }
+
+    /// llama.cpp `llama_model::get_rope_factors`: long only when the
+    /// run's context exceeds `original_context_length`. Phi-4-mini's
+    /// short set is all ones, so picking long at 4096 would apply a
+    /// correction the model never asked for at that length.
+    #[test]
+    fn long_set_only_above_the_original_context() {
+        let mut c = cfg_with_factors();
+        c.apply_runtime_context(4096);
+        assert_eq!(
+            c.rope_freqs.as_ref().unwrap()[1],
+            1.0,
+            "at the threshold, short"
+        );
+
+        let mut c = cfg_with_factors();
+        c.apply_runtime_context(4097);
+        assert_eq!(c.rope_freqs.as_ref().unwrap()[1], 2.0, "above it, long");
+
+        let mut c = cfg_with_factors();
+        c.apply_runtime_context(1024);
+        assert_eq!(c.rope_freqs.as_ref().unwrap()[1], 1.0, "below it, short");
+    }
+
+    /// `rope_freqs.weight` (Llama 3) is not a LongRoPE set and outranks
+    /// one, the same precedence llama.cpp gives it. The loader encodes
+    /// that by leaving the long/short pair empty whenever the explicit
+    /// tensor is present, so the runtime re-pick has nothing to apply.
+    #[test]
+    fn an_explicit_rope_freqs_tensor_is_never_overridden() {
+        let mut c = test_dense_fixture();
+        c.rope_freqs = Some(vec![7.0; 48]);
+        c.rope_orig_ctx = Some(4096);
+        c.rope_freqs_long = None;
+        c.rope_freqs_short = None;
+        c.apply_runtime_context(131072);
+        assert_eq!(c.rope_freqs.as_ref().unwrap()[0], 7.0);
+    }
+
+    /// A checkpoint with neither set must come back untouched, so the
+    /// call is free to sit on every load path.
+    #[test]
+    fn models_without_longrope_are_untouched() {
+        let mut c = test_dense_fixture();
+        c.rope_freqs = None;
+        c.apply_runtime_context(8192);
+        assert!(c.rope_freqs.is_none());
+        assert!(c.rope_orig_ctx.is_none());
     }
 }

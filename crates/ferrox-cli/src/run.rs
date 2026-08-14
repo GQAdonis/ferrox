@@ -600,6 +600,11 @@ pub fn run_infer(args: InferArgs) -> anyhow::Result<()> {
         tokenizer.kind()
     );
     let load_t = Instant::now();
+    // LongRoPE picks its factor set from the run's context size, not the
+    // checkpoint's advertised maximum (llama.cpp does the same, per
+    // request, from `cparams.n_ctx_seq`).
+    let mut config = config;
+    config.apply_runtime_context(ctx_size);
     let decoder = Decoder::from_gguf(path, config)?;
     eprintln!("ferrox: loaded in {:.2}s", load_t.elapsed().as_secs_f64());
 

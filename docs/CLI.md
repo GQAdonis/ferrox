@@ -151,8 +151,31 @@ curl -s -X POST http://127.0.0.1:8383/v1/chat/completions \
   -d '{"model":"m","messages":[{"role":"user","content":"Hi"}],"max_tokens":32,"temperature":0}'
 ```
 
+### Running under a supervisor
+
+```bash
+# Kernel picks the port; the bound address is announced on stdout
+./target/release/ferrox-server -m model.gguf --port 0 --exit-on-stdin-close
+{"event":"ferrox.server.ready","addr":"127.0.0.1:52091","port":52091,"scheme":"http","pid":4242,"version":"0.5.0"}
+```
+
+`--port 0` plus that one line removes the need for a parent process to
+probe whether a port is free, or to work out whether an existing
+listener is a stale copy of itself or a stranger's server. Read stdout
+line by line and ignore anything that is not the ready event — the
+tracing subscriber shares the stream.
+
+`--exit-on-stdin-close` (or `FERROX_EXIT_ON_STDIN_CLOSE=1`) exits when
+stdin reaches EOF, which is the one orphan-prevention mechanism that
+behaves identically on macOS, Windows and Linux and survives a parent
+that dies rather than exiting cleanly. It is **opt-in**: a server
+started with stdin redirected from `/dev/null` (systemd, cron, `nohup`)
+sees EOF immediately, so the parent that wants the guarantee is the one
+that asks for it and keeps the pipe open.
+
 The server accepts `-m/--model`, `--host`, `--port`, `-t/--threads`,
-`-dev/--device`, `-ngl/--n-gpu-layers`, and `--list-devices`. Existing
+`-dev/--device`, `-ngl/--n-gpu-layers`, `--exit-on-stdin-close`, and
+`--list-devices`. Existing
 `FERROX_MODEL_PATH`, `FERROX_ADDR`, and backend environment variables remain
 supported; command-line values take precedence. Keep secrets such as
 `FERROX_API_KEY` in the environment.

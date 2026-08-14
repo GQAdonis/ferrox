@@ -142,6 +142,9 @@ pub async fn messages(
     Json(req): Json<MessagesRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let _ = req.metadata;
+    // Same server-assigned id scheme as /v1/chat/completions, so one
+    // ring buffer keys both surfaces the same way.
+    let request_id = ferrox_api::next_request_id();
     if req.stream == Some(true) {
         return Err(unsupported_feature(
             "Anthropic Messages streaming is not implemented yet; omit stream or set stream=false",
@@ -160,8 +163,10 @@ pub async fn messages(
         ));
     }
 
+    let started = std::time::Instant::now();
+    let active = state.require_active()?;
     let history = to_chat_messages(&req)?;
-    let template = state.model.chat_template();
+    let template = active.model.chat_template();
     let prompt = prompt_from_messages(&history, template, &[]);
     let mut stop = req.stop_sequences.clone().unwrap_or_default();
     if matches!(
@@ -192,10 +197,10 @@ pub async fn messages(
         json_object: false,
     };
 
-    let model = Arc::clone(&state.model);
+    let model = Arc::clone(&active.model);
     let kv_pool = state.kv_pool.clone();
     let prefix_cache = state.prefix_cache.clone();
-    let batcher = state.continuous_batcher.clone();
+    let batcher = active.batcher.clone();
     let (chunks, finish, usage) = tokio::task::spawn_blocking(move || {
         run_generation(
             &model,
@@ -211,6 +216,14 @@ pub async fn messages(
     .map_err(decode_error_response)?;
 
     let text = chunks.concat();
+    state.record_request(
+        &request_id,
+        ferrox_api::routes::V1_MESSAGES,
+        200,
+        false,
+        started.elapsed().as_millis() as u64,
+        Some(&usage),
+    );
     Ok(Json(serde_json::json!({
         "id": "msg_ferrox_0",
         "type": "message",

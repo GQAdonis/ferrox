@@ -8,8 +8,18 @@ deployments and advanced tuning. Flags override env when both are set.
 | Variable | Purpose |
 |---|---|
 | `FERROX_MODEL_PATH` | GGUF path (or Kimi dir); same as `-m` |
+| `FERROX_MODEL_DIR` | Extra directory `GET /admin/models` scans, and the one `POST /admin/download` writes into. Without it, the directory holding `FERROX_MODEL_PATH` is used; with neither, downloads are refused (`412`) rather than guessing a location |
 | `FERROX_ADDR` | Bind address, e.g. `127.0.0.1:8383` |
-| `FERROX_API_KEY` | Require `Authorization: Bearer <key>` |
+| `FERROX_API_KEY` | Require `Authorization: Bearer <key>`. Also gates the whole `/admin` control surface, which can swap models and write files |
+
+## Hugging Face
+
+Read only by `POST /admin/download` (see [API.md](API.md)).
+
+| Variable | Purpose |
+|---|---|
+| `HF_TOKEN` · `HUGGING_FACE_HUB_TOKEN` | Bearer token for gated or private repos. First one set wins |
+| `HF_ENDPOINT` | Hub base URL for a mirror or an air-gapped cache. Default `https://huggingface.co` |
 
 ## Backends
 
@@ -35,6 +45,7 @@ library or overriding the CLI.
 | `FERROX_TOKIO_WORKERS` | `ferrox-server` async worker threads (default `2`); keeps the HTTP runtime from oversubscribing the decode pool |
 | `FERROX_QOS_LOG` | `1` — log each rayon worker's macOS QoS class at pool start |
 | `FERROX_UI` | `1` — serve chat UI at `/` and `/ui` |
+| `FERROX_EXIT_ON_STDIN_CLOSE` | `1` — exit on stdin EOF (same as `--exit-on-stdin-close`); off by default so a `/dev/null` stdin does not stop the server |
 | `FERROX_KV_POOL_BLOCKS` | Paged-KV pool size (blocks) |
 | `FERROX_EXPERT_CACHE_BYTES` | MoE expert-streaming cache budget |
 | `FERROX_SSD_STREAMING` | `1` — stream MoE experts from disk |

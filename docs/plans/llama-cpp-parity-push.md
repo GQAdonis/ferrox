@@ -72,7 +72,13 @@ todos:
     content: "Per-layer divergence comparator (per-head magnitude-ratio std, not mean) + MoE routing dumps, env-gated. Prerequisite for diagnosing MoE and the CPU/Metal divergence above"
     status: pending
   - id: coverage-fail-closed
-    content: "BLOCKING CORRECTNESS: ~50 archs are admitted to the generic GQA path and emit wrong logits instead of refusing. Gate on required graph features; refuse what is not implemented"
+    content: "BLOCKING CORRECTNESS: ~50 archs are admitted to the generic GQA path and emit wrong logits instead of refusing. Gate on required graph features; refuse what is not implemented. LANDED (c3db570) as a tensor-consumption gate rather than a feature list: ShardedGguf records every tensor name a loader looks up and the load refuses on leftovers, which catches gpt-oss attn_sinks and ffn_exp_probs_b by construction instead of by enumeration. Refused exactly 1 of the 13 local GGUFs — Phi-4-mini, correctly: partial rotary, LongRoPE factor sets, and rope.scaling.attn_factor were all unimplemented and are now implemented on CPU"
+    status: completed
+  - id: coverage-phi-metal-rope
+    content: "Phi-4-mini is CPU-only as of c3db570: the Metal RoPE kernels rotate the whole head and take no magnitude uniform, so partial rotary (n_rot < head_dim) and LongRoPE mscale cannot run there and the model is refused the Metal path rather than allowed to disagree with CPU. Needs a rot_dim uniform on rope_norm/rope_neox plus an mscale hook (AttnExtras is the natural place — it already carries QKV bias and QK-norm). Its published Metal pp512/tg128 rows were taken on the wrong graph and must be re-measured after, not before"
+    status: pending
+  - id: tooling-answer-parity-instrument
+    content: "There is NO instrument for answer parity against llama.cpp — `ferrox verify` compares ferrox-CPU against ferrox-Metal only. Attempting a greedy-text comparison showed why one is needed and why text is the wrong medium: ferrox and llama diverge after ~3 tokens on TinyLlama Q8_0 with matched tokenization (6 tokens both sides) and no exotic features, i.e. ordinary numeric drift flips one token and everything after it. Build a first-token top-k / logit-KL comparator instead, which is what quality-gates' 'answers match llama' clause actually requires"
     status: pending
   - id: coverage-f16
     content: "F16 tensors did not load at all (GgmlType::F16 parsed and sized, no dequant arm anywhere). dequant_f16 + shared widen_plain_float across all 7 loaders. Landed 7ef74f1"

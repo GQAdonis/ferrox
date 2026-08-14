@@ -160,6 +160,20 @@ pub struct ShardedGguf {
     paths: Vec<PathBuf>,
     /// tensor name -> (shard index, index into that shard's tensor table)
     index: HashMap<String, (usize, usize)>,
+    /// Every tensor name a loader has looked up on this set.
+    ///
+    /// A tensor a loader never asks for is a tensor whose contribution
+    /// to the graph is silently missing: `blk.N.attn_sinks.weight` on
+    /// gpt-oss, `blk.N.ffn_exp_probs_b` on the newer MoE recipes. The
+    /// file still loads, runs at full speed, and emits the wrong
+    /// distribution. Recording lookups here is what lets the loader
+    /// fail closed on that instead (see
+    /// `ferrox_models::loader::assert_every_tensor_consumed`).
+    ///
+    /// A lookup counts as consumption even when the caller only probes
+    /// for presence: that is deliberately conservative, since the point
+    /// is to catch tensors nothing in the code path knows about at all.
+    consumed: std::sync::Mutex<std::collections::HashSet<String>>,
 }
 
 impl ShardedGguf {
@@ -200,6 +214,7 @@ impl ShardedGguf {
             shards: vec![file],
             paths: vec![path],
             index,
+            consumed: std::sync::Mutex::new(std::collections::HashSet::new()),
         })
     }
 
@@ -301,6 +316,7 @@ impl ShardedGguf {
             shards,
             paths,
             index,
+            consumed: std::sync::Mutex::new(std::collections::HashSet::new()),
         })
     }
 
@@ -330,17 +346,44 @@ impl ShardedGguf {
     /// positional file I/O against the owning shard (e.g. the expert
     /// store's positional-read source).
     pub fn tensor_shard_index(&self, name: &str) -> Option<usize> {
+        self.note_consumed(name);
         self.index.get(name).map(|&(si, _)| si)
     }
 
     pub fn find_tensor(&self, name: &str) -> Option<&TensorInfo> {
+        self.note_consumed(name);
         let &(si, ti) = self.index.get(name)?;
         Some(&self.shards[si].tensors[ti])
+    }
+
+    /// Records `name` as consumed without reading it. For loaders that
+    /// resolve a tensor through their own index (or deliberately ignore
+    /// one) and still want it accounted for.
+    pub fn note_consumed(&self, name: &str) {
+        self.consumed
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(name.to_string());
+    }
+
+    /// Tensor names present in the file that no loader ever looked up.
+    /// Sorted, so an error message built from it is deterministic.
+    pub fn unconsumed_tensors(&self) -> Vec<String> {
+        let consumed = self.consumed.lock().unwrap_or_else(|e| e.into_inner());
+        let mut out: Vec<String> = self
+            .index
+            .keys()
+            .filter(|n| !consumed.contains(*n))
+            .cloned()
+            .collect();
+        out.sort();
+        out
     }
 
     /// Copy-free tensor byte access, delegating to the owning shard's
     /// mmap. Same contract as `GgufFile::tensor_bytes`.
     pub fn tensor_bytes(&self, name: &str) -> Result<&[u8], GgufError> {
+        self.note_consumed(name);
         let &(si, _) = self
             .index
             .get(name)
@@ -354,6 +397,7 @@ impl ShardedGguf {
         &self,
         name: &str,
     ) -> Result<(Arc<Mmap>, std::ops::Range<usize>), GgufError> {
+        self.note_consumed(name);
         let &(si, _) = self
             .index
             .get(name)

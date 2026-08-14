@@ -20,7 +20,7 @@ ledger. Add a suite entry (and a GGUF under `models/`) to measure a new model.
 |---|---|
 | SmolLM2-135M-Instruct Q8_0 | Tiny; Metal ahead of llama, CPU well behind |
 | TinyLlama-1.1B-Chat Q8_0 | Smallest verified smoke |
-| Phi-4-mini-Instruct Q4_K_M | Metal ~parity |
+| Phi-4-mini-Instruct Q4_K_M | **CPU only** since v0.5.0 — partial rotary (`n_rot` 96 of head_dim 128) and LongRoPE `attn_factor` are implemented on CPU but not in the Metal RoPE kernels, so Metal is refused rather than allowed to compute different attention. Its published Metal row predates the fix and was taken on the wrong graph |
 | Llama-3.2-3B-Instruct Q4_K_M | Metal flagship in the suite |
 | Gemma-4-E2B-IT Q4_K_M | Dedicated engine + `gemma4` BPE |
 

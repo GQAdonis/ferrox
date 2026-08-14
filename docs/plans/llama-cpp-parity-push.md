@@ -72,7 +72,13 @@ todos:
     content: "Per-layer divergence comparator (per-head magnitude-ratio std, not mean) + MoE routing dumps, env-gated. Prerequisite for diagnosing MoE and the CPU/Metal divergence above"
     status: pending
   - id: coverage-fail-closed
-    content: "BLOCKING CORRECTNESS: ~50 archs are admitted to the generic GQA path and emit wrong logits instead of refusing. Gate on required graph features; refuse what is not implemented"
+    content: "BLOCKING CORRECTNESS: ~50 archs are admitted to the generic GQA path and emit wrong logits instead of refusing. Gate on required graph features; refuse what is not implemented. LANDED (c3db570) as a tensor-consumption gate rather than a feature list: ShardedGguf records every tensor name a loader looks up and the load refuses on leftovers, which catches gpt-oss attn_sinks and ffn_exp_probs_b by construction instead of by enumeration. Refused exactly 1 of the 13 local GGUFs — Phi-4-mini, correctly: partial rotary, LongRoPE factor sets, and rope.scaling.attn_factor were all unimplemented and are now implemented on CPU"
+    status: completed
+  - id: coverage-phi-metal-rope
+    content: "Phi-4-mini is CPU-only as of c3db570: the Metal RoPE kernels rotate the whole head and take no magnitude uniform, so partial rotary (n_rot < head_dim) and LongRoPE mscale cannot run there and the model is refused the Metal path rather than allowed to disagree with CPU. Needs a rot_dim uniform on rope_norm/rope_neox plus an mscale hook (AttnExtras is the natural place — it already carries QKV bias and QK-norm). Its published Metal pp512/tg128 rows were taken on the wrong graph and must be re-measured after, not before"
+    status: pending
+  - id: tooling-answer-parity-instrument
+    content: "There is NO instrument for answer parity against llama.cpp — `ferrox verify` compares ferrox-CPU against ferrox-Metal only. Attempting a greedy-text comparison showed why one is needed and why text is the wrong medium: ferrox and llama diverge after ~3 tokens on TinyLlama Q8_0 with matched tokenization (6 tokens both sides) and no exotic features, i.e. ordinary numeric drift flips one token and everything after it. Build a first-token top-k / logit-KL comparator instead, which is what quality-gates' 'answers match llama' clause actually requires"
     status: pending
   - id: coverage-f16
     content: "F16 tensors did not load at all (GgmlType::F16 parsed and sized, no dequant arm anywhere). dequant_f16 + shared widen_plain_float across all 7 loaders. Landed 7ef74f1"
@@ -84,7 +90,7 @@ todos:
     content: "SUPPORT, structural: chat_template.rs is a 6-variant sniffed enum with hand-written renderers, so every new model family falls back to Plain and tool-calling formats are unreachable. Needs a real Jinja renderer (minijinja) + chat_template_kwargs passthrough. Verified: ChatTemplate::Gemma4 does not implement the real gemma-4 template (no thinking injection, no strip_thinking, no multimodal placeholders)"
     status: pending
   - id: coverage-stop-token-truth
-    content: "SUPPORT, cheap + high impact: gpt-oss `<|end|>` ends every non-final turn and is NOT a stop token (treating it as EOG truncates every reply); gemma-4 EOS is `<turn|>` not `<eos>`; tokenizer.ggml.token_type==CONTROL(3) is the authority for parseable specials; Unsloth strips `{{ bos_token }}` from exported templates so a loader that also auto-adds BOS double-BOSes"
+    content: "SUPPORT, cheap + high impact: stop on the whole EOG set, not `eos_token_id` alone. HALF LANDED (60f7435): tokenizer::eog_token_ids ports llama.cpp's literal name list plus the eos/eot/eom ids, and all four CLI loops use it — gemma-2 now stops at `<end_of_turn>` rather than running to -n. CORRECTION to this item's own text: llama.cpp DOES treat gpt-oss `<|end|>` as EOG (llama-vocab.cpp:2806), so the Unsloth-study claim that it must not be is contradicted by the reference and was not followed. STILL OPEN: ferrox-server stops on eos_id alone (five *Loaded structs + batch_scheduler thread that id); and the BOS half — Unsloth strips `{{ bos_token }}` from exported templates, so a loader that renders the template AND auto-adds BOS double-BOSes"
     status: pending
   - id: coverage-mxfp4-gptoss
     content: "MXFP4 Metal+CUDA kernels (CPU is scalar-only) + gpt-oss graph (attn sinks, swiglu_oai clamp, SWA). URGENT per the 2026-08-13 study: ferrox DECODES MXFP4 (tag 39) and routes gpt-oss to generic-gqa with zero attention-sink code anywhere, and Unsloth publishes gpt-oss GGUFs as MXFP4-only — so a gpt-oss GGUF loads and silently emits wrong output. Exactly the coverage-fail-closed bug class, with a shipping model behind it"

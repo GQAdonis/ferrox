@@ -6,7 +6,7 @@ todos:
     content: "Shared route-constant + DTO crate so app and server cannot drift (Unsloth has this implicitly; oMLX's Endpoints.swift is 106 lines and is the whole app-server contract). LANDED 2e8c214: `crates/ferrox-api` (serde-only) with routes / health / lifecycle / usage / request_id / progress. ferrox-server's router and Usage now come from it. Only implemented routes get a constant — a constant for a missing endpoint reads as a promise. The OpenAI request/response bodies deliberately stay in ferrox-server where they are validated"
     status: completed
   - id: ui-health-capability
-    content: "GET /health with THREE states: ready, unavailable+reason, and `detecting` while backends are probed. A guessed 'CPU only' on first paint is visually identical to a measured one. Hard 1s budget, then answer provisionally. LANDED 21a175c: `/health` returns the handshake instead of the string 'ok'. Probe runs once in the background, handler never blocks; before the 1s budget no GPU verdict is offered at all, after it the answer is filled in with reason `detection_timed_out`, and a late probe replaces that. Capabilities cpu/metal/cuda/real_weights/continuous_batching each carry a machine reason + a human sentence, so metal_unavailable / metal_not_built / disabled stay three different answers. `last_request_age_seconds` lets a saturated backend vouch for its own liveness. NOT DONE: `unavailable` is defined and returns 503 but is unreachable today — the server only binds after the model loads, so it needs ui-model-swap to occur"
+    content: "GET /health with THREE states: ready, unavailable+reason, and `detecting` while backends are probed. A guessed 'CPU only' on first paint is visually identical to a measured one. Hard 1s budget, then answer provisionally. LANDED 21a175c: `/health` returns the handshake instead of the string 'ok'. Probe runs once in the background, handler never blocks; before the 1s budget no GPU verdict is offered at all, after it the answer is filled in with reason `detection_timed_out`, and a late probe replaces that. Capabilities cpu/metal/cuda/real_weights/continuous_batching each carry a machine reason + a human sentence, so metal_unavailable / metal_not_built / disabled stay three different answers. `last_request_age_seconds` lets a saturated backend vouch for its own liveness. NOW REACHABLE (1a59c15): POST /admin/models/unload leaves nothing loaded, and /health answers 503 `unavailable` with reason `model_not_loaded` and a null model, instead of the 200 `ready` a supervisor would have acted on"
     status: completed
   - id: ui-server-lifecycle
     content: "`--port 0` + a structured stdout line carrying the bound addr/pid, and stdin-close => exit. Deletes the entire port-conflict UI and all OS-specific signal reaping. LANDED ff8f10d: both serve paths (plain + TLS) bind first and read the address back off the socket, then print the `ferrox.server.ready` JSON line (addr/port/scheme/pid/version). `--exit-on-stdin-close` / FERROX_EXIT_ON_STDIN_CLOSE=1 is OPT-IN — a /dev/null stdin (systemd, cron, nohup) is EOF at startup, so defaulting it on would make the server exit as it starts. Graceful shutdown added to both paths; runtime is shut down in the background since the stdin watcher parks in a blocking read. Verified end to end. NOT DONE: the preflight disposition (managed/owned/attached/external) is supervisor-side and belongs with ui-tauri-shell"
@@ -24,22 +24,22 @@ todos:
     content: "SSE with id:/retry:/Last-Event-ID replay, a stall timeout, and a polling fallback beside every stream — reverse proxies buffer text/event-stream. Both reference projects hit this in production"
     status: pending
   - id: ui-admin-models
-    content: "GET /admin/models: per model id, path, loaded/loading, on-disk + resident size, backend, context length, quant, and capability flags each PAIRED WITH A HUMAN-READABLE REASON so the UI never re-derives why a control is disabled"
-    status: pending
+    content: "GET /admin/models: per model id, path, loaded/loading, on-disk + resident size, backend, context length, quant, and capability flags each PAIRED WITH A HUMAN-READABLE REASON so the UI never re-derives why a control is disabled. LANDED 1a59c15: header-only discovery over FERROX_MODEL_DIR + the FERROX_MODEL_PATH directory (GgufFile::open parses metadata and tensor descriptors, never a weight), non-recursive, split checkpoints folded into one entry, safetensors-index directories included. Every optional field is null-not-absent, because an unknown context length and a zero one are different facts. quant prefers general.file_type (the only place the _M in Q4_K_M is stated) and falls back to the measured dominant tensor dtype rather than guessing from the filename. NOT DONE: resident_bytes is always null and says so — checkpoints are mmap-resident, so the true figure is a page-cache property this process cannot read and the file size would be a lie in both directions. NOT DONE: per-model capability flags; the reason-carrying capability list is on /health, which is where the UI already reads it"
+    status: completed
   - id: ui-model-swap
-    content: "Model load/unload/swap. ferrox-server's model.rs::load() is single-shot from env today; this is the real backend work behind the model manager"
-    status: pending
+    content: "Model load/unload/swap. ferrox-server's model.rs::load() is single-shot from env today; this is the real backend work behind the model manager. LANDED 1a59c15: AppState.active is an RwLock<Option<Arc<ActiveModel>>> and the rule is in its doc comment — a reader clones the Arc under the read lock and then runs, so the lock guards the POINTER and is never held across a decode. An in-flight request finishes against the weights it started on and the old model is freed when the last holder lets go; no attempt is made to migrate a running request, because half a completion from each of two checkpoints is worse than either. Tested: the old handle still decodes after a swap, and strong_count shows the swapped-out weights outliving the registry reference. ActiveModel bundles the continuous batcher with the model because the batcher thread holds one specific Arc<Decoder>. model.rs::load_from_path() is the env-free entry point; activate_loaded_model() is shared by startup and the load task so an engine variant cannot be wired into one and forgotten in the other. Load is by discovered id only — there is deliberately NO load-by-path endpoint. Unload makes /health reach the `unavailable` state Phase 1 defined but could not exercise. NOT DONE: the KV pool is still sized from the startup model, and no warmup prefill runs after a swap (ui-warmup is unclaimed)"
+    status: completed
   - id: ui-task-contract
-    content: "ONE long-running-task contract reused by download/convert/bench: POST start -> {task_id}, GET tasks, POST cancel/{id}, fields {status, progress, bytes_done, bytes_total, error, timestamps, retry_count}, plus a per-task event stream"
-    status: pending
+    content: "ONE long-running-task contract reused by download/convert/bench: POST start -> {task_id}, GET tasks, POST cancel/{id}, fields {status, progress, bytes_done, bytes_total, error, timestamps, retry_count}, plus a per-task event stream. LANDED 1a59c15: one TaskView shape for both job kinds (download, load). Terminal is terminal — a late update from a worker that has not noticed its cancellation is dropped, so a UI that stopped polling is never wrong. Progress comes from ferrox_api::progress::RateEstimator and nowhere else, so a warming window reports null rate and null ETA by construction (ui-transfer-stats finally has its consumer). Cancellation is cooperative and honest: a download stops within a chunk and keeps its .part file, a model load cannot be interrupted mid-mmap and so discards its finished result rather than pretending it stopped early, and a task only reaches `cancelled` when a worker acknowledges it. A TaskGuard rides with every worker so a panic cannot leave a task at `running` forever — nothing awaits a spawn_blocking handle. NOT DONE: no per-task event stream (polling only) and no retry_count — nothing retries yet, and a field that is always 0 is a promise, not a contract. convert/bench are not task kinds because neither job exists"
+    status: completed
   - id: ui-transfer-stats
-    content: "Rolling-window rate/ETA smoothing: >=3 samples over >=3s before reporting `stable`, reset on counter regression, ETA clamped. Prevents the '123 GB/s' flash on the first tick. Reimplement from the description — the reference is AGPL. LANDED 2e8c214: `ferrox_api::progress::RateEstimator`, written from this description only. A warming report carries NO number at all rather than an untrusted one, which makes the flash structurally impossible; window trims by age and drops from the middle on overflow so a fast-ticking job still reaches `stable`; ETA needs a known total and a positive rate. NO CONSUMER YET — it is waiting on ui-task-contract to have a job to measure"
+    content: "Rolling-window rate/ETA smoothing: >=3 samples over >=3s before reporting `stable`, reset on counter regression, ETA clamped. Prevents the '123 GB/s' flash on the first tick. Reimplement from the description — the reference is AGPL. LANDED 2e8c214: `ferrox_api::progress::RateEstimator`, written from this description only. A warming report carries NO number at all rather than an untrusted one, which makes the flash structurally impossible; window trims by age and drops from the middle on overflow so a fast-ticking job still reaches `stable`; ETA needs a known total and a positive rate. CONSUMER LANDED 1a59c15: ferrox_api::TaskProgress can only be built from a RateReport, so every /admin/tasks progress block inherits the refusal by construction — verified end to end on a real 396 MB Hub download, which reported no rate for the first four seconds and then a rate and an ETA"
     status: completed
   - id: ui-frontend-chat
     content: "Chat: streaming, markdown+code, reasoning blocks, sampling controls, model switch mid-conversation, conversation tree persisted SERVER-side (SQLite), not localStorage"
     status: pending
   - id: ui-api-monitor
-    content: "API Monitor screen: ring-buffered live request log. Keep duration_ms and decode_ms SEPARATE (duration carries queue wait + prefill; conflating them reads a 50 tok/s model as 5) and flag external-vs-UI traffic"
+    content: "API Monitor screen: ring-buffered live request log. Keep duration_ms and decode_ms SEPARATE (duration carries queue wait + prefill; conflating them reads a 50 tok/s model as 5) and flag external-vs-UI traffic. BACKEND LANDED 1a59c15: GET /admin/stats serves a 200-entry ring keyed by the request_id the response already carried, so a row joins its message by equality instead of the claiming heuristic oMLX needs. duration_ms and decode_ms are separate fields all the way to the wire, and decode_ms/ttft_ms are null rather than a copy of the total when the engine did not time itself. Recorded for /v1/chat/completions (streamed and not, including rejections), /v1/completions and /v1/messages. NOT DONE: the screen itself; via_api_key / external-vs-UI attribution (nothing records which key served a request); a queue gauge; /v1/embeddings, /v1/tokenize and /v1/detokenize are not recorded"
     status: pending
   - id: ui-embed-server
     content: "Embed the built frontend into the ferrox-server binary (rust-embed) and serve at `/` with an SPA fallback; replaces the 72-line static/ui.html stub"
@@ -130,9 +130,14 @@ next real backend work.
   which **oMLX has no equivalent of**), `/cache/stats`, `/health`,
   server-side `session.rs`, `batch_scheduler.rs` (continuous batching,
   opt-in), prefix cache, response cache.
-- Missing and load-bearing for the first cut: **model swap**.
-  `model.rs::load()` reads one model from env at startup. Everything in
-  the model-manager screen depends on fixing that.
+- ~~Missing and load-bearing for the first cut: **model swap**.~~
+  **Landed 1a59c15.** `model.rs::load()` still reads env at startup, but
+  `load_from_path()` beside it takes a path, and `AppState.active` is a
+  swappable `Arc` behind an `RwLock` held only long enough to clone a
+  handle. `/admin/models`, `/admin/models/load|unload`,
+  `/admin/download`, `/admin/tasks`, `/admin/tasks/{id}/cancel` and
+  `/admin/stats` exist and are documented in `docs/API.md`. Phase 2 is
+  unblocked.
 
 ## Architecture
 
@@ -328,7 +333,8 @@ README says only "works on Windows, Linux, WSL and macOS".
 Phase 1 is entirely backend and is independently useful — `request_id`,
 `usage` timings, two-tier cancel, task contract and `--port 0` improve
 `ferrox-server` for IDE users whether or not a frontend ever ships.
-Phase 2 depends on 1d (model swap) only. Phase 3 depends on 1b.
+Phase 2 depends on 1d (model swap) only — **1d has landed**, so Phase 2
+is unblocked. Phase 3 depends on 1b.
 
 Do Phase 1 first. It is the part that cannot be replaced later without
 breaking clients.

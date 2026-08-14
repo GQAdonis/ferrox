@@ -19,6 +19,7 @@ Unsupported multimodal input is rejected the same way.
 | `POST /v1/embeddings` | Supported for GGUF Decoder (mean/last pool of hidden states) |
 | `POST /v1/messages` | Anthropic-shaped; non-stream text |
 | `GET /cache/stats` · `GET /metrics` | Ferrox extensions |
+| `/admin/*` | Control surface (see below) |
 | Audio / images | Not supported |
 
 ## Chat completions fields
@@ -63,6 +64,9 @@ client should hold rather than render a verdict. Detection gets a hard
 `reason: "detection_timed_out"`. The handler itself never blocks.
 
 Status is 200 for `ready` and `detecting`, 503 for `unavailable`.
+`unavailable` is reachable: `POST /admin/models/unload` produces it,
+with `reason: "model_not_loaded"` and a null `model`. A supervisor that
+read 200 there would route traffic guaranteed to 503 on arrival.
 
 Every capability carries both a machine `reason` and a human `detail`,
 so a UI can grey a control and show the sentence without re-deriving
@@ -104,6 +108,162 @@ when it was not measured (a cached response, a batched decode). Note
 the cache was consulted and missed.
 
 Streamed requests get the same `usage` object on the final chunk.
+
+## Admin / control surface
+
+Everything under `/admin` either changes what the server serves or
+writes to disk, so it sits behind the same `FERROX_API_KEY` gate as
+`/v1/*` — never on the unauthenticated `/health` side. Paths and
+payload shapes are defined once in the `ferrox-api` crate, so the UI and
+the server cannot disagree about them.
+
+| Endpoint | Answer |
+|---|---|
+| `GET /admin/models` | inventory (below) |
+| `POST /admin/models/load` `{"id":"…"}` | `202 {"task_id":"…"}` |
+| `POST /admin/models/unload` | `200 {"ok":true,"active":null}` |
+| `POST /admin/download` `{"repo":"…","file":"*.gguf"}` | `202 {"task_id":"…"}` |
+| `GET /admin/tasks` | every job, newest last |
+| `POST /admin/tasks/{task_id}/cancel` | `200 {"ok":true}` |
+| `GET /admin/stats` | counters + recent-request ring |
+
+### Models
+
+```jsonc
+{
+  "model_dir": "/models",          // null when none is configured
+  "active": "Qwen3-0.6B-Q4_K_M",   // null when nothing is loaded
+  "models": [{
+    "id": "Qwen3-0.6B-Q4_K_M",     // file stem; the only way to name a model
+    "path": "/models/Qwen3-0.6B-Q4_K_M.gguf",
+    "size_bytes": 396705472,
+    "arch": "qwen3", "quant": "Q4_K_M",
+    "context_length": 40960, "param_count": 596049920,
+    "state": "available",          // loaded | loading | available | error
+    "error": null,                 // why the last load attempt failed
+    "resident_bytes": null
+  }]
+}
+```
+
+Read from **GGUF headers only** — metadata and tensor descriptors, never
+a weight — so listing a directory of checkpoints costs header parses,
+not loads. A field that cannot be established cheaply is `null` rather
+than guessed, and the key is always present: an unknown context length
+and a zero one are different facts. `quant` comes from
+`general.file_type` when that maps to a known name (the only place the
+`_M` in `Q4_K_M` is stated), otherwise from the measured dominant tensor
+dtype — coarser, never invented. `resident_bytes` is always `null`:
+ferrox keeps checkpoints mmap-resident, so the true figure is a
+page-cache property this process cannot read.
+
+Discovery scans `FERROX_MODEL_DIR` and the directory holding
+`FERROX_MODEL_PATH`, non-recursively, for `*.gguf` plus any
+safetensors-index checkpoint directory. Split checkpoints fold into one
+entry named for the shard prefix.
+
+### Model swap
+
+`POST /admin/models/load` answers immediately with a task id; the load
+runs on a blocking thread. Only ids from `GET /admin/models` are
+accepted — there is deliberately **no load-by-path endpoint**, so no
+request can make the server open an arbitrary file. A second load while
+one is running is rejected with `409`.
+
+**In-flight requests keep the model they started on.** A request clones
+its handle once, up front, and decodes against exactly those weights
+even if a different checkpoint is published mid-generation; the old
+model is freed when the last such request finishes. There is no attempt
+to migrate a running request — half a completion from one checkpoint and
+half from another is worse than either.
+
+After `POST /admin/models/unload`, generation endpoints answer `503`
+with `"type": "model_not_loaded"`, `GET /v1/models` returns an empty
+list, and `/health` reports `unavailable` (503).
+
+### Tasks
+
+One shape for every long-running job.
+
+```jsonc
+{"tasks": [{
+  "task_id": "dl-2", "kind": "download",      // download | load
+  "label": "Downloading *Q4_K_M.gguf from unsloth/Qwen3-0.6B-GGUF",
+  "status": "running",            // queued | running | done | error | cancelled
+  "error": null,
+  "started_at_ms": 1786717917646, "updated_at_ms": 1786717925031,
+  "progress": {
+    "fraction": 0.126, "bytes_done": 50198634, "bytes_total": 396705472,
+    "rate_bytes_per_s": 9802506.2, "eta_seconds": 35.3,
+    "state": "stable"             // warming | stable
+  }
+}]}
+```
+
+Timestamps are the server's Unix epoch milliseconds — the browser clock
+is not trusted for ordering. `done` / `error` / `cancelled` are terminal
+and never change, so a client can stop polling the moment it reads one.
+
+`rate_bytes_per_s` and `eta_seconds` are `null` while `state` is
+`warming`, which lasts until the rate window holds at least 3 samples
+spanning at least 3 s. Show "measuring", not a number: the first tick of
+any transfer divides out to gigabytes per second. `fraction` is
+available immediately — it is a ratio of two counters, not a derivative.
+
+Cancellation is cooperative. `POST …/cancel` raises a flag and returns;
+the task reaches `cancelled` only once a worker acknowledges it. A
+download stops within one chunk and keeps its `.part` file for a resume.
+A model load **cannot be interrupted** mid-mmap, so a cancel arriving
+during one discards the finished result rather than pretending the work
+stopped early. Cancelling a finished task is a `409`.
+
+### Download
+
+Fetches one `.gguf` from the Hugging Face Hub into the model directory.
+`file` may be a literal name or a `*` glob resolved against the repo's
+file list (sorted, first match, root-level names only). Resumable: bytes
+land in `<target>.part` and a restart sends `Range`, falling back to a
+clean restart if the server answers `200` instead of `206`.
+
+Security is a whitelist, not a filter: only bare `*.gguf` filenames, no
+separators of either kind, no leading dot, no `..`, no `:`; the joined
+path is re-checked to be a direct child of a model directory **fixed at
+startup**, never one named by the request. Two downloads of the same
+target are rejected with `409` — interleaved writes into one `.part`
+would produce a corrupt checkpoint of exactly the right size.
+
+Set `HF_TOKEN` (or `HUGGING_FACE_HUB_TOKEN`) for gated repos, and
+`HF_ENDPOINT` for a mirror.
+
+### Stats
+
+```jsonc
+{
+  "uptime_seconds": 43, "requests_total": 1, "errors_total": 0,
+  "cache_hits": 0, "cache_misses": 1,
+  "tokens_prompt_total": 17, "tokens_generated_total": 24,
+  "last_request_age_seconds": 0.02,
+  "recent": [{
+    "request_id": "chatcmpl-b28a1aeab8f8000000",
+    "at_ms": 1786718007013, "route": "/v1/chat/completions",
+    "status": 200, "prompt_tokens": 17, "completion_tokens": 24,
+    "ttft_ms": 6586.2, "duration_ms": 23603, "decode_ms": 17004.8,
+    "stream": false
+  }]
+}
+```
+
+`recent` is a 200-entry ring keyed by the same `request_id` the response
+carried, so a log row joins its message by equality rather than by a
+claiming heuristic. **`duration_ms` and `decode_ms` are separate and
+must stay separate**: the former carries queue wait plus prefill plus
+decode, and dividing completion tokens by it reads a 50 tok/s model as
+5. `decode_ms` and `ttft_ms` are `null` when the engine did not time
+itself or the answer came from cache.
+
+Recorded today for `/v1/chat/completions` (streamed and not, including
+rejections), `/v1/completions` and `/v1/messages`. Not yet recorded for
+`/v1/embeddings`, `/v1/tokenize` or `/v1/detokenize`.
 
 ## Continuous batching
 

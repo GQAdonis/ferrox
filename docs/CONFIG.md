@@ -8,8 +8,18 @@ deployments and advanced tuning. Flags override env when both are set.
 | Variable | Purpose |
 |---|---|
 | `FERROX_MODEL_PATH` | GGUF path (or Kimi dir); same as `-m` |
+| `FERROX_MODEL_DIR` | Extra directory `GET /admin/models` scans, and the one `POST /admin/download` writes into. Without it, the directory holding `FERROX_MODEL_PATH` is used; with neither, downloads are refused (`412`) rather than guessing a location |
 | `FERROX_ADDR` | Bind address, e.g. `127.0.0.1:8383` |
-| `FERROX_API_KEY` | Require `Authorization: Bearer <key>` |
+| `FERROX_API_KEY` | Require `Authorization: Bearer <key>`. Also gates the whole `/admin` control surface, which can swap models and write files |
+
+## Hugging Face
+
+Read only by `POST /admin/download` (see [API.md](API.md)).
+
+| Variable | Purpose |
+|---|---|
+| `HF_TOKEN` · `HUGGING_FACE_HUB_TOKEN` | Bearer token for gated or private repos. First one set wins |
+| `HF_ENDPOINT` | Hub base URL for a mirror or an air-gapped cache. Default `https://huggingface.co` |
 
 ## Backends
 

@@ -215,16 +215,30 @@ fn is_glm52_arch(arch: &str) -> bool {
     matches!(arch, "glm-dsa" | "glm4" | "glm4moe")
 }
 
+/// Loads one checkpoint by path, with no reference to the environment.
+///
+/// Split out of [`load`] for `/admin/models/load`: the admin surface
+/// has already resolved an id to a path it discovered itself, so
+/// re-reading `FERROX_MODEL_PATH` there would load the *startup* model
+/// no matter which one the user picked. A directory is a Kimi K3
+/// checkpoint and a file is a GGUF, exactly as at startup -- see the
+/// module docs.
+///
+/// Blocking and CPU-bound (it mmaps, and for a Kimi checkpoint touches
+/// every expert range). Callers on the Tokio runtime must put it on
+/// `spawn_blocking`.
+pub fn load_from_path(path: &str) -> anyhow::Result<LoadedModel> {
+    let path = ferrox_models::hf_pull::resolve_model_path(path)?;
+    if Path::new(&path).is_dir() {
+        load_real_kimi_checkpoint(&path).map(LoadedModel::Kimi)
+    } else {
+        load_gguf_file(&path)
+    }
+}
+
 pub fn load() -> anyhow::Result<LoadedModel> {
     match std::env::var("FERROX_MODEL_PATH") {
-        Ok(path) => {
-            let path = ferrox_models::hf_pull::resolve_model_path(&path)?;
-            if Path::new(&path).is_dir() {
-                load_real_kimi_checkpoint(&path).map(LoadedModel::Kimi)
-            } else {
-                load_gguf_file(&path)
-            }
-        }
+        Ok(path) => load_from_path(&path),
         Err(_) => {
             let preset = std::env::var("FERROX_PRESET").unwrap_or_else(|_| "glm-5.2".to_string());
             tracing::warn!(

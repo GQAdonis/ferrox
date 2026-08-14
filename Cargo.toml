@@ -35,6 +35,12 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal
 axum = "0.7"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+# The only outbound HTTP client in the workspace, used by
+# ferrox-server's /admin/download (see crates/ferrox-server/src/hub.rs).
+# Blocking by design -- it runs on spawn_blocking beside the file
+# writes it feeds -- and default-features = false so it brings rustls
+# and webpki-roots rather than a second async runtime.
+ureq = { version = "2.12", default-features = false, features = ["tls"] }
 
 # Internal crates — path for local builds, version for crates.io.
 ferrox-api = { version = "0.5.0", path = "crates/ferrox-api" }

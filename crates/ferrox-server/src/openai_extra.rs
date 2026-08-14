@@ -69,22 +69,25 @@ fn default_max_tokens() -> usize {
 pub async fn tokenize(
     State(state): State<Arc<AppState>>,
     Json(req): Json<TokenizeRequest>,
-) -> Json<serde_json::Value> {
+) -> Result<Json<serde_json::Value>, ApiError> {
     let _ = req.model;
-    let tokens = state.model.encode(&req.prompt);
+    // Tokenizing needs the loaded vocabulary, so this is a 503 like any
+    // other generation endpoint when nothing is loaded -- answering
+    // with byte-fallback ids would silently be the wrong vocabulary.
+    let tokens = state.require_model()?.encode(&req.prompt);
     let count = tokens.len();
-    Json(serde_json::json!({
+    Ok(Json(serde_json::json!({
         "tokens": tokens,
         "count": count,
-    }))
+    })))
 }
 
 pub async fn detokenize(
     State(state): State<Arc<AppState>>,
     Json(req): Json<DetokenizeRequest>,
-) -> Json<serde_json::Value> {
-    let text = state.model.decode(&req.tokens);
-    Json(serde_json::json!({ "text": text }))
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let text = state.require_model()?.decode(&req.tokens);
+    Ok(Json(serde_json::json!({ "text": text })))
 }
 
 fn pool_hidden(hiddens: &[Vec<f32>], pooling: &str) -> Result<Vec<f32>, ApiError> {
@@ -157,8 +160,9 @@ pub async fn embeddings(
         ));
     }
 
+    let active_model = state.require_model()?;
     // Fail fast for non-GGUF engines before paying encode cost.
-    if state.model.embed_tokens(&[]).is_none() {
+    if active_model.embed_tokens(&[]).is_none() {
         return Err(unsupported_feature(
             "embeddings engine not yet available for this model",
         ));
@@ -177,7 +181,7 @@ pub async fn embeddings(
         ));
     }
 
-    let model = Arc::clone(&state.model);
+    let model = Arc::clone(&active_model);
     let pooling = pooling.to_string();
     let (data, prompt_tokens) = tokio::task::spawn_blocking(move || {
         let mut out = Vec::with_capacity(inputs.len());
@@ -214,7 +218,7 @@ pub async fn embeddings(
     .await
     .map_err(join_error_response)??;
 
-    let model_name = req.model.unwrap_or_else(|| state.model.name().to_string());
+    let model_name = req.model.unwrap_or_else(|| active_model.name().to_string());
     Ok(Json(serde_json::json!({
         "object": "list",
         "data": data,
@@ -230,6 +234,9 @@ pub async fn completions(
     State(state): State<Arc<AppState>>,
     Json(req): Json<CompletionsRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    let started = std::time::Instant::now();
+    let request_id = ferrox_api::next_request_id();
+    let active = state.require_active()?;
     let params = GenerationParams {
         max_tokens: req.max_tokens,
         sampling: SamplingParams {
@@ -244,10 +251,10 @@ pub async fn completions(
         stop: Vec::new(),
         json_object: false,
     };
-    let model = Arc::clone(&state.model);
+    let model = Arc::clone(&active.model);
     let kv_pool = state.kv_pool.clone();
     let prefix_cache = state.prefix_cache.clone();
-    let batcher = state.continuous_batcher.clone();
+    let batcher = active.batcher.clone();
     let prompt = req.prompt;
 
     let (chunks, finish, usage) = tokio::task::spawn_blocking(move || {
@@ -269,10 +276,18 @@ pub async fn completions(
         FinishReason::Stop => "stop",
         FinishReason::Length => "length",
     };
-    let model_name = req.model.unwrap_or_else(|| state.model.name().to_string());
+    let model_name = req.model.unwrap_or_else(|| active.model.name().to_string());
+    state.record_request(
+        &request_id,
+        ferrox_api::routes::V1_COMPLETIONS,
+        200,
+        false,
+        started.elapsed().as_millis() as u64,
+        Some(&usage),
+    );
 
     Ok(Json(serde_json::json!({
-        "id": "ferrox-cmpl-0",
+        "id": request_id,
         "object": "text_completion",
         "model": model_name,
         "choices": [{

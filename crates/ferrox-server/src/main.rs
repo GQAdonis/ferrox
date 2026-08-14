@@ -12,7 +12,12 @@
 //! (`Model`) is immutable once loaded and shared via `Arc`, not locked
 //! behind a `Mutex` -- there is no shared mutable decoder state for
 //! concurrent requests to contend on or for one panicking request to
-//! poison. Each request builds its own KV cache (see `generate::generate`)
+//! poison. The *pointer* to it is swappable (`AppState::active`, behind
+//! an `RwLock` held only long enough to clone one `Arc`), which is what
+//! `/admin/models/load` swaps; a request that has already cloned its
+//! handle finishes against the exact weights it started on, and the old
+//! model is freed when the last such request lets go.
+//! Each request builds its own KV cache (see `generate::generate`)
 //! and runs its decode loop on tokio's blocking-thread pool via
 //! `spawn_blocking`, so CPU-bound generation no longer blocks the async
 //! reactor threads -- multiple requests can decode genuinely
@@ -29,12 +34,14 @@
 //! Continuous-batching streaming also buffers (batcher returns one
 //! string).
 
+mod admin;
 mod anthropic;
 mod batch_scheduler;
 mod cache;
 mod chat_template;
 mod generate;
 mod health;
+mod hub;
 mod journal;
 mod json_mode;
 mod limits;
@@ -43,6 +50,8 @@ mod model;
 mod openai_extra;
 mod security;
 mod session;
+mod stats;
+mod tasks;
 
 use std::convert::Infallible;
 use std::fmt;
@@ -499,8 +508,58 @@ impl Model {
     }
 }
 
-pub(crate) struct AppState {
+/// The model the server is serving *right now*, together with the
+/// pieces that are built from it and must be replaced with it.
+///
+/// The continuous batcher owns a worker thread holding an
+/// `Arc<Decoder>`, so it belongs to one specific model: keeping it in a
+/// separate field would let a swap leave a batcher decoding against the
+/// old weights while `Model` named the new ones. Bundling them means
+/// one `Arc` swap replaces a consistent pair.
+pub(crate) struct ActiveModel {
+    /// Admin-surface id (see `admin::discover`), or `None` for a model
+    /// that was not discovered through it -- the synthetic fallback, or
+    /// a `FERROX_MODEL_PATH` outside the scanned directory.
+    pub(crate) id: Option<String>,
     pub(crate) model: Arc<Model>,
+    /// Opt-in continuous-batching decode worker (`FERROX_CONTINUOUS_BATCHING=1`).
+    /// Shares `forward_multi_seq` across concurrent GGUF requests. Disabled
+    /// when a KV pool or prefix cache is configured (those keep the
+    /// private-loop `generate` path).
+    pub(crate) batcher: Option<batch_scheduler::ContinuousBatcher>,
+}
+
+pub(crate) struct AppState {
+    /// The swappable active model.
+    ///
+    /// **A reader clones the `Arc` under the read lock and then runs;
+    /// the lock is never held across a decode.** That is the whole
+    /// design: `RwLock` guards the *pointer*, not the model, so
+    /// `/admin/models/load` swapping in a new `Arc` cannot stall a
+    /// request that is already generating, and a request that started
+    /// against the old model keeps decoding against the exact weights
+    /// it began with until it finishes -- the old `ActiveModel` (and
+    /// its batcher thread) is dropped only when the last in-flight
+    /// holder releases it, not when the swap happens. Requests that
+    /// arrive after the swap see the new model. There is deliberately
+    /// no attempt to migrate an in-flight request: half a completion
+    /// from one checkpoint and half from another is worse than either.
+    ///
+    /// `None` means nothing is loaded (after `/admin/models/unload`, or
+    /// a failed startup load): generation endpoints answer 503 rather
+    /// than pretending, and `/health` reports `unavailable`.
+    active: std::sync::RwLock<Option<Arc<ActiveModel>>>,
+    /// Set while a load task is in flight, so a second load request is
+    /// rejected instead of racing the first. A load is not cheap and
+    /// two concurrent ones would fight for the same memory.
+    pub(crate) load_in_progress: std::sync::atomic::AtomicBool,
+    /// Long-running jobs (download, load) -- see the `tasks` module.
+    pub(crate) tasks: Arc<tasks::TaskRegistry>,
+    /// Recent-request ring buffer and the counters behind
+    /// `/admin/stats` -- see the `stats` module.
+    pub(crate) stats: stats::Stats,
+    /// The directory `/admin/models` scans, when one is configured.
+    pub(crate) model_dir: Option<PathBuf>,
     /// The only shared *mutable* state in the server. Locked only for
     /// the brief get/put around a cache lookup, never held across a
     /// decode -- see the module doc comment.
@@ -533,11 +592,6 @@ pub(crate) struct AppState {
     /// opt-in): a request that never sends `session_id` simply never
     /// touches it, at negligible cost (one empty `HashMap`).
     sessions: session::SessionStore,
-    /// Opt-in continuous-batching decode worker (`FERROX_CONTINUOUS_BATCHING=1`).
-    /// Shares `forward_multi_seq` across concurrent GGUF requests. Disabled
-    /// when a KV pool or prefix cache is configured (those keep the
-    /// private-loop `generate` path).
-    pub(crate) continuous_batcher: Option<batch_scheduler::ContinuousBatcher>,
     requests_total: std::sync::atomic::AtomicU64,
     request_errors_total: std::sync::atomic::AtomicU64,
     started_at: std::time::Instant,
@@ -550,9 +604,67 @@ pub(crate) struct AppState {
     detection: Arc<health::Detection>,
     /// Loaded MCP config (`--mcp-config`); tool invocation not wired yet.
     mcp: Option<mcp::LoadedMcpConfig>,
+    /// Whether a swapped-in GGUF model should get a continuous-batching
+    /// worker, decided once at startup from the same env var and
+    /// exclusions as the initial load.
+    pub(crate) continuous_batching_enabled: bool,
+    /// The model id a load task is currently working on, so
+    /// `/admin/models` can report `loading` for it. Separate from
+    /// `load_in_progress` because that is a gate and this is a label.
+    loading_model: Mutex<Option<String>>,
+    /// The last failed load, as `(model id, message)`. Sticky until the
+    /// next successful load so `/admin/models` can say *why* an entry
+    /// is in `error` without the user retrying to find out.
+    last_load_error: Mutex<Option<(String, String)>>,
 }
 
 impl AppState {
+    /// Clones the active model's `Arc` and releases the lock before
+    /// returning. Every caller then runs against its own handle, so no
+    /// decode ever holds this lock -- see [`AppState::active`].
+    pub(crate) fn active(&self) -> Option<Arc<ActiveModel>> {
+        self.active
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+    }
+
+    /// [`AppState::active`] for a request that cannot proceed without a
+    /// model. 503 with a `Retry-After`-shaped explanation is the honest
+    /// answer while nothing is loaded; the alternative -- keeping a
+    /// stale model around so the endpoint never fails -- would serve
+    /// tokens from a checkpoint the operator explicitly unloaded.
+    pub(crate) fn require_active(&self) -> Result<Arc<ActiveModel>, ApiError> {
+        self.active().ok_or_else(|| {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({"error": {
+                    "message": "no model is loaded; POST /admin/models/load with an id from \
+                                GET /admin/models",
+                    "type": "model_not_loaded"
+                }})),
+            )
+        })
+    }
+
+    /// [`AppState::active`]'s model only, for the many call sites that
+    /// do not care about the batcher.
+    pub(crate) fn require_model(&self) -> Result<Arc<Model>, ApiError> {
+        Ok(Arc::clone(&self.require_active()?.model))
+    }
+
+    /// Publishes a new active model (or `None` to unload) and returns
+    /// the previous one.
+    ///
+    /// The write lock is held only for the pointer swap. The returned
+    /// value is the caller's to drop *outside* the lock: dropping a
+    /// multi-gigabyte model can take a moment, and doing it under the
+    /// lock would block every reader for exactly as long.
+    pub(crate) fn swap_active(&self, next: Option<Arc<ActiveModel>>) -> Option<Arc<ActiveModel>> {
+        let mut guard = self.active.write().unwrap_or_else(|p| p.into_inner());
+        std::mem::replace(&mut *guard, next)
+    }
+
     /// Stamps "a request just finished" for `/health`'s liveness
     /// vouching. Relaxed: this is a freshness hint, not a
     /// synchronization point.
@@ -560,6 +672,80 @@ impl AppState {
         let ms = self.started_at.elapsed().as_millis().min(u64::MAX as u128) as u64;
         self.last_request_ms
             .store(ms, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub(crate) fn uptime(&self) -> Duration {
+        self.started_at.elapsed()
+    }
+
+    pub(crate) fn requests_total(&self) -> u64 {
+        self.requests_total
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub(crate) fn errors_total(&self) -> u64 {
+        self.request_errors_total
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub(crate) fn cache_stats(&self) -> cache::CacheStats {
+        lock_cache(&self.response_cache).stats()
+    }
+
+    /// Seconds since the last request finished, or `None` when none
+    /// has. Same derivation `/health` uses, so the two agree.
+    pub(crate) fn last_request_age_seconds(&self) -> Option<f64> {
+        let last = self
+            .last_request_ms
+            .load(std::sync::atomic::Ordering::Relaxed);
+        (last > 0)
+            .then(|| self.uptime().as_secs_f64() - (last as f64 / 1000.0))
+            .map(|age| age.max(0.0))
+    }
+
+    pub(crate) fn loading_model_id(&self) -> Option<String> {
+        self.loading_model
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+    }
+
+    pub(crate) fn set_loading_model(&self, id: Option<String>) {
+        *self.loading_model.lock().unwrap_or_else(|p| p.into_inner()) = id;
+    }
+
+    pub(crate) fn last_load_error(&self) -> Option<(String, String)> {
+        self.last_load_error
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+    }
+
+    pub(crate) fn set_last_load_error(&self, error: Option<(String, String)>) {
+        *self
+            .last_load_error
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = error;
+    }
+
+    /// Records one finished request in the `/admin/stats` ring buffer.
+    pub(crate) fn record_request(
+        &self,
+        request_id: &str,
+        route: &str,
+        status: u16,
+        stream: bool,
+        duration_ms: u64,
+        usage: Option<&ferrox_api::Usage>,
+    ) {
+        self.stats.record(stats::entry(
+            request_id,
+            route,
+            status,
+            stream,
+            duration_ms,
+            usage,
+        ));
     }
 }
 
@@ -1066,23 +1252,32 @@ struct ChatCompletionChunk {
 async fn health(State(state): State<Arc<AppState>>) -> Response {
     let snapshot = state.detection.snapshot();
     let mut capabilities = snapshot.capabilities;
+    let active = state.active();
 
     // Model-derived capabilities need no probing, so they are answered
     // even while backend detection is still running.
-    capabilities.push(if state.model.is_synthetic() {
-        ferrox_api::Capability::unavailable(
+    capabilities.push(match active.as_deref() {
+        // `unavailable` was defined in Phase 1 but unreachable, because
+        // the server only bound the port after a successful load. With
+        // `/admin/models/unload` it is a state a client can actually
+        // observe, and it must not read as "loaded but synthetic".
+        None => ferrox_api::Capability::unavailable(
+            ferrox_api::health::capability::REAL_WEIGHTS,
+            ferrox_api::health::reason::MODEL_NOT_LOADED,
+            "No model is loaded. POST /admin/models/load with an id from GET /admin/models.",
+        ),
+        Some(active) if active.model.is_synthetic() => ferrox_api::Capability::unavailable(
             ferrox_api::health::capability::REAL_WEIGHTS,
             ferrox_api::health::reason::MODEL_NOT_LOADED,
             "Serving synthetic random weights: set FERROX_MODEL_PATH (or -m) to a real \
              checkpoint. Output from this model is noise.",
-        )
-    } else {
-        ferrox_api::Capability::available(
+        ),
+        Some(active) => ferrox_api::Capability::available(
             ferrox_api::health::capability::REAL_WEIGHTS,
-            format!("Serving the real checkpoint '{}'.", state.model.name()),
-        )
+            format!("Serving the real checkpoint '{}'.", active.model.name()),
+        ),
     });
-    capabilities.push(if state.continuous_batcher.is_some() {
+    capabilities.push(if active.as_ref().is_some_and(|a| a.batcher.is_some()) {
         ferrox_api::Capability::available(
             ferrox_api::health::capability::CONTINUOUS_BATCHING,
             "Concurrent requests share one batched decode step.",
@@ -1109,11 +1304,13 @@ async fn health(State(state): State<Arc<AppState>>) -> Response {
             ferrox_api::HealthState::Ready => None,
             _ => Some("Probing available compute backends.".to_string()),
         },
-        model: Some(ferrox_api::health::ModelSummary {
-            id: state.model.name().to_string(),
-            tokenizer: state.model.tokenizer_kind().to_string(),
-            synthetic_weights: state.model.is_synthetic(),
-        }),
+        model: active
+            .as_deref()
+            .map(|active| ferrox_api::health::ModelSummary {
+                id: active.model.name().to_string(),
+                tokenizer: active.model.tokenizer_kind().to_string(),
+                synthetic_weights: active.model.is_synthetic(),
+            }),
         capabilities,
         version: env!("CARGO_PKG_VERSION").to_string(),
         pid: std::process::id(),
@@ -1133,11 +1330,17 @@ async fn health(State(state): State<Arc<AppState>>) -> Response {
 }
 
 async fn list_models(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+    // OpenAI's `/v1/models` lists what can be *used* right now, which
+    // after an unload is nothing. The inventory of what is on disk is a
+    // different question and lives at `/admin/models`.
+    let Some(active) = state.active() else {
+        return Json(serde_json::json!({ "object": "list", "data": [] }));
+    };
     let mut model_entry = serde_json::json!({
-        "id": state.model.name(),
+        "id": active.model.name(),
         "object": "model",
-        "ferrox_synthetic_weights": state.model.is_synthetic(),
-        "ferrox_tokenizer": state.model.tokenizer_kind(),
+        "ferrox_synthetic_weights": active.model.is_synthetic(),
+        "ferrox_tokenizer": active.model.tokenizer_kind(),
     });
     if let Some(mcp) = &state.mcp {
         model_entry["ferrox_mcp"] = mcp.models_metadata();
@@ -1182,6 +1385,7 @@ async fn metrics(State(state): State<Arc<AppState>>) -> Response {
     use std::sync::atomic::Ordering;
 
     let cache_stats = lock_cache(&state.response_cache).stats();
+    let active = state.active();
     let requests_total = state.requests_total.load(Ordering::Relaxed);
     let errors_total = state.request_errors_total.load(Ordering::Relaxed);
     let uptime = state.started_at.elapsed().as_secs_f64();
@@ -1211,13 +1415,22 @@ async fn metrics(State(state): State<Arc<AppState>>) -> Response {
         cache_stats.hits,
         cache_stats.misses,
         cache_stats.entries,
-        state.model.is_synthetic() as u8,
+        // With nothing loaded there are no weights at all, synthetic or
+        // otherwise; 0 is the reading that keeps the gauge meaning
+        // "serving noise" rather than "serving nothing".
+        active
+            .as_ref()
+            .map(|a| a.model.is_synthetic() as u8)
+            .unwrap_or(0),
     );
 
     // Expert-store counters, present only when the model streams
     // routed experts through the bounded cache
     // (FERROX_EXPERT_CACHE_BYTES).
-    let body = match state.model.expert_store_stats() {
+    let body = match active
+        .as_ref()
+        .and_then(|a| a.model.expert_store_stats())
+    {
         Some(es) => format!(
             "{body}\
              # HELP ferrox_expert_cache_hits_total Expert-store cache hits.\n\
@@ -1597,25 +1810,36 @@ async fn chat_completions(
     state
         .requests_total
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let started = std::time::Instant::now();
+
+    // One id per request, assigned before any work starts -- including
+    // before validation -- so the streaming and non-streaming paths
+    // agree and a rejected request is still nameable in the monitor.
+    let request_id = ferrox_api::next_request_id();
+    let stream = req.stream.unwrap_or(false);
 
     if let Err(err) = req.validate_supported_fields() {
         state
             .request_errors_total
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        return err.into_response();
+        let response = err.into_response();
+        state.record_request(
+            &request_id,
+            ferrox_api::routes::V1_CHAT_COMPLETIONS,
+            response.status().as_u16(),
+            stream,
+            started.elapsed().as_millis() as u64,
+            None,
+        );
+        return response;
     }
 
-    // One id per request, assigned before any work starts, so the
-    // streaming and non-streaming paths agree and the value is
-    // available to log even if generation fails.
-    let request_id = ferrox_api::next_request_id();
-
-    let response = if req.stream.unwrap_or(false) {
-        chat_completions_stream(Arc::clone(&state), req, request_id)
+    let response = if stream {
+        chat_completions_stream(Arc::clone(&state), req, request_id.clone(), started)
             .await
             .into_response()
     } else {
-        chat_completions_full(Arc::clone(&state), req, request_id)
+        chat_completions_full(Arc::clone(&state), req, request_id.clone(), started)
             .await
             .into_response()
     };
@@ -1624,6 +1848,17 @@ async fn chat_completions(
         state
             .request_errors_total
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // Only failures are recorded here. A success has already
+        // recorded itself from the path that knows the token counts --
+        // and, for a stream, that has not even happened yet.
+        state.record_request(
+            &request_id,
+            ferrox_api::routes::V1_CHAT_COMPLETIONS,
+            response.status().as_u16(),
+            stream,
+            started.elapsed().as_millis() as u64,
+            None,
+        );
     }
     state.mark_request_finished();
 
@@ -1634,10 +1869,15 @@ async fn chat_completions_full(
     state: Arc<AppState>,
     req: ChatCompletionRequest,
     request_id: String,
+    started: std::time::Instant,
 ) -> Result<Json<ChatCompletionResponse>, ApiError> {
     let tools_active = req.tools_active();
+    // Cloned once, up front: this request decodes against exactly this
+    // model even if `/admin/models/load` swaps a different one in
+    // halfway through (see `AppState::active`).
+    let active = state.require_active()?;
     let history = resolve_history(&state, &req);
-    let prompt = prompt_from_messages(&history, state.model.chat_template(), &req.tools);
+    let prompt = prompt_from_messages(&history, active.model.chat_template(), &req.tools);
     let key = req.is_cacheable().then(|| req.cache_key(&prompt));
 
     let (completion, cache_status) = if let Some(cached) = key
@@ -1647,11 +1887,11 @@ async fn chat_completions_full(
         tracing::debug!("cache hit for key {}", key.as_ref().unwrap().digest());
         (cached, "hit")
     } else {
-        let model = Arc::clone(&state.model);
+        let model = Arc::clone(&active.model);
         let kv_pool = state.kv_pool.clone();
         let prefix_cache = state.prefix_cache.clone();
-        let batcher = state.continuous_batcher.clone();
-        let params = req.generation_params_for_template(state.model.chat_template());
+        let batcher = active.batcher.clone();
+        let params = req.generation_params_for_template(active.model.chat_template());
         let prompt_for_task = prompt.clone();
         let (chunks, finish, usage) = tokio::task::spawn_blocking(move || {
             run_generation(
@@ -1705,6 +1945,15 @@ async fn chat_completions_full(
     let (message, finish_reason) =
         build_response_message(content, tools_active, completion.finish.as_str());
 
+    state.record_request(
+        &request_id,
+        ferrox_api::routes::V1_CHAT_COMPLETIONS,
+        200,
+        false,
+        started.elapsed().as_millis() as u64,
+        Some(&completion.usage),
+    );
+
     Ok(Json(ChatCompletionResponse {
         id: request_id.clone(),
         request_id,
@@ -1724,20 +1973,26 @@ async fn chat_completions_stream(
     state: Arc<AppState>,
     req: ChatCompletionRequest,
     request_id: String,
+    started: std::time::Instant,
 ) -> Result<Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>>, ApiError> {
     // Streaming requests are never served from or written to the response cache.
     let tools_active = req.tools_active();
+    // See `chat_completions_full`: the handle is taken once and the
+    // whole stream runs against it, so a mid-stream model swap cannot
+    // splice two checkpoints into one completion.
+    let active = state.require_active()?;
     let history = resolve_history(&state, &req);
-    let prompt = prompt_from_messages(&history, state.model.chat_template(), &req.tools);
+    let prompt = prompt_from_messages(&history, active.model.chat_template(), &req.tools);
     let model_name = req.model.clone();
     let session_id = req.session_id.clone();
     let sessions = state.sessions.clone();
 
-    let model = Arc::clone(&state.model);
+    let model = Arc::clone(&active.model);
     let kv_pool = state.kv_pool.clone();
     let prefix_cache = state.prefix_cache.clone();
-    let batcher = state.continuous_batcher.clone();
-    let params = req.generation_params_for_template(state.model.chat_template());
+    let batcher = active.batcher.clone();
+    let params = req.generation_params_for_template(active.model.chat_template());
+    let stats_state = Arc::clone(&state);
 
     // Tool-call detection needs the full stop-bounded text; continuous
     // batching returns one string. Both stay buffered. Otherwise each
@@ -1874,13 +2129,38 @@ async fn chat_completions_stream(
                         },
                         finish_reason: Some(final_finish_reason),
                     }],
-                    usage: Some(usage),
+                    usage: Some(usage.clone()),
                 };
                 let _ = tx.blocking_send(Ok(Event::default().json_data(final_payload).unwrap()));
                 let _ = tx.blocking_send(Ok(Event::default().data("[DONE]")));
+                // Recorded here rather than where the handler returned:
+                // the handler returns as soon as the SSE headers go out,
+                // which is before a single token exists, so timing it
+                // there would report every stream as instant.
+                stats_state.record_request(
+                    &request_id,
+                    ferrox_api::routes::V1_CHAT_COMPLETIONS,
+                    200,
+                    true,
+                    started.elapsed().as_millis() as u64,
+                    Some(&usage),
+                );
             }
             Err(e) => {
                 tracing::warn!("decode error on streamed request {request_id}: {e}");
+                // The socket carried 200 -- SSE headers precede the
+                // first token -- but the request produced no completion.
+                // The monitor records outcomes, and a 200 row with zero
+                // tokens would read as a successful empty answer, so the
+                // failure is stated as 500 here and only here.
+                stats_state.record_request(
+                    &request_id,
+                    ferrox_api::routes::V1_CHAT_COMPLETIONS,
+                    500,
+                    true,
+                    started.elapsed().as_millis() as u64,
+                    None,
+                );
                 let payload = ChatCompletionChunk {
                     id: request_id.clone(),
                     request_id: pending_request_id.take(),
@@ -1911,15 +2191,19 @@ async fn chat_completions_stream(
     Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
 }
 
-fn build_app_state(
+/// Turns a freshly loaded checkpoint into the pair that gets published
+/// as the active model.
+///
+/// Extracted from `build_app_state` so `/admin/models/load` builds its
+/// replacement exactly the way startup builds the first one -- a second
+/// copy of this match would be a second place for a new engine variant
+/// to be forgotten, and the difference would only show up as a model
+/// that silently loses continuous batching after a swap.
+pub(crate) fn activate_loaded_model(
     loaded: model::LoadedModel,
-    kv_pool: Option<generate::KvPoolConfig>,
-    prefix_cache: Option<Arc<Mutex<PrefixCache>>>,
     enable_continuous_batching: bool,
-    mcp: Option<mcp::LoadedMcpConfig>,
-    detection: Arc<health::Detection>,
-) -> AppState {
-    let (model, continuous_batcher) = match loaded {
+) -> (Model, Option<batch_scheduler::ContinuousBatcher>) {
+    match loaded {
         model::LoadedModel::Gguf(g) => {
             let decoder = Arc::new(g.decoder);
             let tokenizer = Arc::new(g.tokenizer);
@@ -1991,21 +2275,65 @@ fn build_app_state(
             }),
             None,
         ),
-    };
+    }
+}
+
+fn build_app_state(
+    loaded: model::LoadedModel,
+    kv_pool: Option<generate::KvPoolConfig>,
+    prefix_cache: Option<Arc<Mutex<PrefixCache>>>,
+    enable_continuous_batching: bool,
+    mcp: Option<mcp::LoadedMcpConfig>,
+    detection: Arc<health::Detection>,
+) -> AppState {
+    let (model, batcher) = activate_loaded_model(loaded, enable_continuous_batching);
+    // The startup model's admin id is whichever discovered entry sits
+    // at the configured path; `None` when it was not discovered (the
+    // synthetic fallback, or a path outside the scanned directories),
+    // in which case `/admin/models` reports nothing as active rather
+    // than inventing an id no `load` request could name.
+    let id = startup_model_id();
     AppState {
-        model: Arc::new(model),
+        active: std::sync::RwLock::new(Some(Arc::new(ActiveModel {
+            id,
+            model: Arc::new(model),
+            batcher,
+        }))),
+        load_in_progress: std::sync::atomic::AtomicBool::new(false),
+        tasks: Arc::new(tasks::TaskRegistry::new()),
+        stats: stats::Stats::new(),
+        model_dir: admin::model_dirs().into_iter().next(),
         response_cache: Mutex::new(ResponseCache::new(1000, Duration::from_secs(3600))),
         kv_pool,
         prefix_cache,
         sessions: session::SessionStore::new(),
-        continuous_batcher,
         requests_total: std::sync::atomic::AtomicU64::new(0),
         request_errors_total: std::sync::atomic::AtomicU64::new(0),
         started_at: std::time::Instant::now(),
         last_request_ms: std::sync::atomic::AtomicU64::new(0),
         detection,
         mcp,
+        continuous_batching_enabled: enable_continuous_batching,
+        loading_model: Mutex::new(None),
+        last_load_error: Mutex::new(None),
     }
+}
+
+/// The `/admin/models` id of the checkpoint `FERROX_MODEL_PATH` names,
+/// when discovery finds it. Matching on the resolved path rather than
+/// on the filename keeps two same-named files in different directories
+/// from claiming each other's id.
+fn startup_model_id() -> Option<String> {
+    let configured = std::env::var("FERROX_MODEL_PATH").ok()?;
+    let configured = std::fs::canonicalize(&configured).ok()?;
+    admin::discover(&admin::model_dirs())
+        .into_iter()
+        .find(|d| {
+            std::fs::canonicalize(&d.path)
+                .map(|p| p == configured)
+                .unwrap_or(false)
+        })
+        .map(|d| d.id)
 }
 
 /// Builds the global rayon pool up front, on the main thread, with an
@@ -2558,7 +2886,18 @@ async fn run(
         .route(routes::V1_DETOKENIZE, post(openai_extra::detokenize))
         .route(routes::V1_EMBEDDINGS, post(openai_extra::embeddings))
         .route(routes::CACHE_STATS, get(cache_stats))
-        .route(routes::METRICS, get(metrics));
+        .route(routes::METRICS, get(metrics))
+        // The control surface. Registered inside `protected` on
+        // purpose: these routes change what the server serves and write
+        // to disk, so they get the same FERROX_API_KEY gate as /v1/*
+        // and never the unauthenticated treatment /health has.
+        .route(routes::ADMIN_MODELS, get(admin::models))
+        .route(routes::ADMIN_MODELS_LOAD, post(admin::load_model))
+        .route(routes::ADMIN_MODELS_UNLOAD, post(admin::unload_model))
+        .route(routes::ADMIN_DOWNLOAD, post(admin::download))
+        .route(routes::ADMIN_TASKS, get(admin::tasks))
+        .route(&admin::cancel_route(), post(admin::cancel_task))
+        .route(routes::ADMIN_STATS, get(admin::stats));
 
     // Both off by default; set the corresponding env var to enable.
     // route_layer (not layer) so these apply only to the routes above,
@@ -2791,6 +3130,36 @@ mod tests {
         })
     }
 
+    /// One `AppState` for the HTTP-level tests, so a new field on the
+    /// struct is added in one place rather than in every test that
+    /// builds one.
+    fn test_state(model: Model, response_cache: ResponseCache) -> AppState {
+        AppState {
+            active: std::sync::RwLock::new(Some(Arc::new(ActiveModel {
+                id: None,
+                model: Arc::new(model),
+                batcher: None,
+            }))),
+            load_in_progress: std::sync::atomic::AtomicBool::new(false),
+            tasks: Arc::new(tasks::TaskRegistry::new()),
+            stats: stats::Stats::new(),
+            model_dir: None,
+            response_cache: Mutex::new(response_cache),
+            kv_pool: None,
+            prefix_cache: None,
+            sessions: session::SessionStore::new(),
+            requests_total: std::sync::atomic::AtomicU64::new(0),
+            request_errors_total: std::sync::atomic::AtomicU64::new(0),
+            started_at: std::time::Instant::now(),
+            last_request_ms: std::sync::atomic::AtomicU64::new(0),
+            detection: Arc::new(health::Detection::ready(health::probe_backends())),
+            mcp: None,
+            continuous_batching_enabled: false,
+            loading_model: Mutex::new(None),
+            last_load_error: Mutex::new(None),
+        }
+    }
+
     /// A real axum `Router` wired exactly like `main()`'s (minus auth/
     /// rate-limiting, which are orthogonal and already covered by
     /// `limits`'s own tests), backed by a fresh
@@ -2800,28 +3169,264 @@ mod tests {
     /// rendering) via `tower::ServiceExt::oneshot`, not just the inner
     /// functions directly.
     fn test_app() -> Router {
-        let state = Arc::new(AppState {
-            model: Arc::new(test_model_full_byte_vocab()),
-            response_cache: Mutex::new(ResponseCache::new(1000, Duration::from_secs(3600))),
-            kv_pool: None,
-            prefix_cache: None,
-            sessions: session::SessionStore::new(),
-            continuous_batcher: None,
-            requests_total: std::sync::atomic::AtomicU64::new(0),
-            request_errors_total: std::sync::atomic::AtomicU64::new(0),
-            started_at: std::time::Instant::now(),
-            last_request_ms: std::sync::atomic::AtomicU64::new(0),
-            detection: Arc::new(health::Detection::ready(health::probe_backends())),
-            mcp: None,
-        });
+        test_app_with_state(Arc::new(test_state(
+            test_model_full_byte_vocab(),
+            ResponseCache::new(1000, Duration::from_secs(3600)),
+        )))
+    }
+
+    /// [`test_app`] over a caller-owned state, so a test can reach in
+    /// and swap or unload the model behind a live router.
+    fn test_app_with_state(state: Arc<AppState>) -> Router {
         Router::new()
             .route(ferrox_api::routes::HEALTH, get(health))
+            .route(ferrox_api::routes::V1_MODELS, get(list_models))
             .route("/v1/chat/completions", post(chat_completions))
             .route("/v1/tokenize", post(openai_extra::tokenize))
             .route("/v1/detokenize", post(openai_extra::detokenize))
             .route("/v1/embeddings", post(openai_extra::embeddings))
             .route("/v1/completions", post(openai_extra::completions))
+            .route(
+                ferrox_api::routes::ADMIN_MODELS_UNLOAD,
+                post(admin::unload_model),
+            )
+            .route(ferrox_api::routes::ADMIN_TASKS, get(admin::tasks))
+            .route(ferrox_api::routes::ADMIN_STATS, get(admin::stats))
             .with_state(state)
+    }
+
+    fn named_test_model(name: &'static str, vocab_size: usize) -> Model {
+        let mut cfg = test_dense_fixture();
+        cfg.name = name;
+        cfg.vocab_size = vocab_size;
+        Model::Gguf(GgufModel {
+            decoder: Arc::new(Decoder::new_random_small(cfg, 2, 256)),
+            tokenizer: Arc::new(ServerTokenizer::Byte),
+            eos_id: None,
+            bos_id: None,
+            is_synthetic: true,
+            chat_template: chat_template::ChatTemplate::Plain,
+        })
+    }
+
+    fn active_model(state: &AppState, name: &'static str) -> Arc<ActiveModel> {
+        Arc::new(ActiveModel {
+            id: Some(name.to_string()),
+            model: Arc::new(named_test_model(name, 256)),
+            batcher: None,
+        })
+        .tap_into(state)
+    }
+
+    /// Small helper so the swap tests read as "publish this model".
+    trait TapInto {
+        fn tap_into(self, state: &AppState) -> Self;
+    }
+    impl TapInto for Arc<ActiveModel> {
+        fn tap_into(self, state: &AppState) -> Self {
+            state.swap_active(Some(Arc::clone(&self)));
+            self
+        }
+    }
+
+    /// The load-order guarantee the whole swap design exists to make:
+    /// a request that has already taken its handle finishes against the
+    /// weights it started on, even though a different model has since
+    /// been published. Anything else would splice two checkpoints into
+    /// one completion.
+    #[test]
+    fn an_in_flight_request_keeps_the_model_it_started_on() {
+        let state = test_state(
+            named_test_model("model-a", 256),
+            ResponseCache::new(4, Duration::from_secs(60)),
+        );
+
+        // A request that has begun: it has cloned the handle and is
+        // about to decode against it.
+        let in_flight = state.active().expect("a model is loaded");
+        assert_eq!(in_flight.model.name(), "model-a");
+
+        active_model(&state, "model-b");
+
+        // The swap is visible to anything that asks *now*...
+        assert_eq!(state.active().unwrap().model.name(), "model-b");
+        // ...and completely invisible to the request already running.
+        assert_eq!(in_flight.model.name(), "model-a");
+        let (_chunks, finish, _usage) =
+            run_generation(&in_flight.model, "hi", &greedy_params(3), None, None, None)
+                .expect("the old model must still decode after being swapped out");
+        assert!(matches!(finish, FinishReason::Length | FinishReason::Stop));
+    }
+
+    /// The other half of the same guarantee: the old model is not freed
+    /// at swap time, it is freed when the last holder lets go. A design
+    /// that dropped it eagerly would free weights out from under a
+    /// decode loop.
+    #[test]
+    fn a_swapped_out_model_lives_until_its_last_holder_releases_it() {
+        let state = test_state(
+            named_test_model("model-a", 256),
+            ResponseCache::new(4, Duration::from_secs(60)),
+        );
+        let in_flight = state.active().expect("a model is loaded");
+        let weights = Arc::clone(&in_flight.model);
+        assert!(Arc::strong_count(&weights) >= 2);
+
+        let previous = state.swap_active(Some(Arc::new(ActiveModel {
+            id: Some("model-b".to_string()),
+            model: Arc::new(named_test_model("model-b", 256)),
+            batcher: None,
+        })));
+        drop(previous);
+        // The registry has let go; the in-flight request has not.
+        assert!(Arc::strong_count(&weights) >= 2);
+        drop(in_flight);
+        assert_eq!(Arc::strong_count(&weights), 1);
+    }
+
+    /// Unload is not "keep serving the last thing loaded". A request
+    /// that arrives afterwards must be told there is no model, not
+    /// quietly served by a checkpoint the operator dropped.
+    #[tokio::test]
+    async fn unloading_answers_503_instead_of_serving_the_dropped_model() {
+        let state = Arc::new(test_state(
+            named_test_model("model-a", 256),
+            ResponseCache::new(4, Duration::from_secs(60)),
+        ));
+        let app = test_app_with_state(Arc::clone(&state));
+
+        let (status, body) = post_json_uri(
+            &app,
+            ferrox_api::routes::ADMIN_MODELS_UNLOAD,
+            serde_json::json!({}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["ok"], true);
+        assert!(body["active"].is_null());
+        assert!(state.active().is_none());
+
+        let (status, _) = get_json(&app, ferrox_api::routes::V1_MODELS).await;
+        assert_eq!(status, StatusCode::OK);
+        let (_, models) = get_json(&app, ferrox_api::routes::V1_MODELS).await;
+        assert_eq!(models["data"].as_array().unwrap().len(), 0);
+
+        let (status, body) = post_json_uri(
+            &app,
+            "/v1/chat/completions",
+            serde_json::json!({
+                "model": "x",
+                "messages": [{"role": "user", "content": "hi"}]
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["error"]["type"], "model_not_loaded");
+    }
+
+    /// `/health` must keep answering with nothing loaded -- a supervisor
+    /// polls it to decide whether to kill the process, and "no model"
+    /// is not "no server".
+    #[tokio::test]
+    async fn health_reports_the_unloaded_state_rather_than_going_silent() {
+        let state = Arc::new(test_state(
+            named_test_model("model-a", 256),
+            ResponseCache::new(4, Duration::from_secs(60)),
+        ));
+        let app = test_app_with_state(Arc::clone(&state));
+        state.swap_active(None);
+
+        let (status, body) = get_json(&app, ferrox_api::routes::HEALTH).await;
+        assert!(status.is_success() || status == StatusCode::SERVICE_UNAVAILABLE);
+        assert!(body["model"].is_null());
+        let real_weights = body["capabilities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["id"] == "real_weights")
+            .cloned()
+            .expect("real_weights is always reported");
+        assert_eq!(real_weights["available"], false);
+        assert_eq!(real_weights["reason"], "model_not_loaded");
+    }
+
+    /// The API-monitor contract: a finished request lands in the ring
+    /// buffer keyed by the id the response carried, with the two
+    /// durations reported separately.
+    #[tokio::test]
+    async fn a_finished_request_lands_in_the_stats_ring_with_both_durations() {
+        let app = test_app();
+
+        let (status, completion) = post_json_uri(
+            &app,
+            "/v1/chat/completions",
+            serde_json::json!({
+                "model": "x",
+                "messages": [{"role": "user", "content": "hi"}],
+                "max_tokens": 4
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let request_id = completion["request_id"].as_str().unwrap().to_string();
+
+        let (status, stats) = get_json(&app, ferrox_api::routes::ADMIN_STATS).await;
+        assert_eq!(status, StatusCode::OK);
+        let recent = stats["recent"].as_array().unwrap();
+        assert_eq!(recent.len(), 1);
+        let row = &recent[0];
+        assert_eq!(row["request_id"], request_id);
+        assert_eq!(row["route"], ferrox_api::routes::V1_CHAT_COMPLETIONS);
+        assert_eq!(row["status"], 200);
+        assert_eq!(row["stream"], false);
+        // Separate fields, and the decode phase is a real measurement
+        // rather than a copy of the total.
+        assert!(row["duration_ms"].is_number());
+        assert!(row["decode_ms"].is_number());
+        assert!(stats["tokens_generated_total"].as_u64().unwrap() > 0);
+        assert_eq!(
+            stats["tokens_prompt_total"].as_u64().unwrap(),
+            row["prompt_tokens"].as_u64().unwrap()
+        );
+    }
+
+    /// A rejected request is still a request the monitor should show;
+    /// otherwise the screen quietly omits exactly the traffic someone
+    /// is debugging.
+    #[tokio::test]
+    async fn a_rejected_request_is_recorded_too() {
+        let state = Arc::new(test_state(
+            named_test_model("model-a", 256),
+            ResponseCache::new(4, Duration::from_secs(60)),
+        ));
+        let app = test_app_with_state(Arc::clone(&state));
+        state.swap_active(None);
+
+        let (status, _) = post_json_uri(
+            &app,
+            "/v1/chat/completions",
+            serde_json::json!({"model": "x", "messages": [{"role": "user", "content": "hi"}]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+
+        let (_, stats) = get_json(&app, ferrox_api::routes::ADMIN_STATS).await;
+        let recent = stats["recent"].as_array().unwrap();
+        assert_eq!(recent.len(), 1);
+        assert_eq!(recent[0]["status"], 503);
+        assert_eq!(recent[0]["completion_tokens"], 0);
+        assert!(recent[0]["decode_ms"].is_null());
+        assert_eq!(stats["errors_total"], 1);
+    }
+
+    /// An empty task list is a list, not a missing key -- the UI renders
+    /// "no jobs" from it rather than from an error.
+    #[tokio::test]
+    async fn the_task_list_starts_empty_rather_than_absent() {
+        let app = test_app();
+        let (status, body) = get_json(&app, ferrox_api::routes::ADMIN_TASKS).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["tasks"].as_array().unwrap().len(), 0);
     }
 
     async fn post_json_uri(
@@ -2929,20 +3534,10 @@ mod tests {
             is_synthetic: false,
             chat_template: chat_template::ChatTemplate::Plain,
         });
-        let state = Arc::new(AppState {
-            model: Arc::new(model),
-            response_cache: Mutex::new(ResponseCache::new(16, Duration::from_secs(60))),
-            kv_pool: None,
-            prefix_cache: None,
-            sessions: session::SessionStore::new(),
-            continuous_batcher: None,
-            requests_total: std::sync::atomic::AtomicU64::new(0),
-            request_errors_total: std::sync::atomic::AtomicU64::new(0),
-            started_at: std::time::Instant::now(),
-            last_request_ms: std::sync::atomic::AtomicU64::new(0),
-            detection: Arc::new(health::Detection::ready(health::probe_backends())),
-            mcp: None,
-        });
+        let state = Arc::new(test_state(
+            model,
+            ResponseCache::new(16, Duration::from_secs(60)),
+        ));
         let app = Router::new()
             .route("/metrics", axum::routing::get(metrics))
             .route("/v1/chat/completions", post(chat_completions))
@@ -4019,11 +4614,12 @@ mod tests {
             None,
             Arc::new(health::Detection::ready(health::probe_backends())),
         );
-        assert_eq!(state.model.tokenizer_kind(), "kimi-tiktoken-bpe");
-        assert!(!state.model.is_synthetic());
+        let active = state.active().expect("a freshly built state has a model");
+        assert_eq!(active.model.tokenizer_kind(), "kimi-tiktoken-bpe");
+        assert!(!active.model.is_synthetic());
 
         let (_chunks, finish, _usage) =
-            run_generation(&state.model, "hi", &greedy_params(5), None, None, None)
+            run_generation(&active.model, "hi", &greedy_params(5), None, None, None)
                 .expect("a real Kimi checkpoint must generate without error");
         assert!(matches!(finish, FinishReason::Length | FinishReason::Stop));
     }
@@ -4057,7 +4653,10 @@ mod tests {
         let pc = Mutex::new(PrefixCache::new(4));
 
         run_generation(
-            &state.model,
+            &state
+                .active()
+                .expect("a freshly built state has a model")
+                .model,
             "hi",
             &greedy_params(5),
             Some(&kv_pool_config),

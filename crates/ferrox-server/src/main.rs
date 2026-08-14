@@ -34,6 +34,7 @@ mod batch_scheduler;
 mod cache;
 mod chat_template;
 mod generate;
+mod health;
 mod journal;
 mod json_mode;
 mod limits;
@@ -527,8 +528,26 @@ pub(crate) struct AppState {
     requests_total: std::sync::atomic::AtomicU64,
     request_errors_total: std::sync::atomic::AtomicU64,
     started_at: std::time::Instant,
+    /// Milliseconds after `started_at` at which the last request
+    /// finished; 0 means none has. Reported by `/health` as an age, so a
+    /// client that sees a slow health poll from a GPU-saturated server
+    /// has positive evidence of liveness instead of declaring it dead.
+    last_request_ms: std::sync::atomic::AtomicU64,
+    /// Backend capability probe behind `/health` (see `health` module).
+    detection: Arc<health::Detection>,
     /// Loaded MCP config (`--mcp-config`); tool invocation not wired yet.
     mcp: Option<mcp::LoadedMcpConfig>,
+}
+
+impl AppState {
+    /// Stamps "a request just finished" for `/health`'s liveness
+    /// vouching. Relaxed: this is a freshness hint, not a
+    /// synchronization point.
+    fn mark_request_finished(&self) {
+        let ms = self.started_at.elapsed().as_millis().min(u64::MAX as u128) as u64;
+        self.last_request_ms
+            .store(ms, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 /// Defense in depth: if a panic ever happened while this lock was held
@@ -1026,8 +1045,78 @@ struct ChatCompletionChunk {
     usage: Option<generate::Usage>,
 }
 
-async fn health() -> &'static str {
-    "ok"
+/// Liveness, readiness and capabilities in one cheap answer (see the
+/// `health` module for why detection is a visible state rather than a
+/// gap). Never behind auth or rate limiting, and never blocking: this is
+/// the endpoint a supervisor asks when it is deciding whether to kill
+/// the process.
+async fn health(State(state): State<Arc<AppState>>) -> Response {
+    let snapshot = state.detection.snapshot();
+    let mut capabilities = snapshot.capabilities;
+
+    // Model-derived capabilities need no probing, so they are answered
+    // even while backend detection is still running.
+    capabilities.push(if state.model.is_synthetic() {
+        ferrox_api::Capability::unavailable(
+            ferrox_api::health::capability::REAL_WEIGHTS,
+            ferrox_api::health::reason::MODEL_NOT_LOADED,
+            "Serving synthetic random weights: set FERROX_MODEL_PATH (or -m) to a real \
+             checkpoint. Output from this model is noise.",
+        )
+    } else {
+        ferrox_api::Capability::available(
+            ferrox_api::health::capability::REAL_WEIGHTS,
+            format!("Serving the real checkpoint '{}'.", state.model.name()),
+        )
+    });
+    capabilities.push(if state.continuous_batcher.is_some() {
+        ferrox_api::Capability::available(
+            ferrox_api::health::capability::CONTINUOUS_BATCHING,
+            "Concurrent requests share one batched decode step.",
+        )
+    } else {
+        ferrox_api::Capability::unavailable(
+            ferrox_api::health::capability::CONTINUOUS_BATCHING,
+            ferrox_api::health::reason::DISABLED,
+            "Off; set FERROX_CONTINUOUS_BATCHING=1 (incompatible with a KV pool or prefix cache).",
+        )
+    });
+
+    let last_request_ms = state
+        .last_request_ms
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let uptime = state.started_at.elapsed();
+    let body = ferrox_api::HealthResponse {
+        state: snapshot.state,
+        reason: match snapshot.state {
+            ferrox_api::HealthState::Ready => None,
+            _ => Some(ferrox_api::health::reason::DETECTING.to_string()),
+        },
+        detail: match snapshot.state {
+            ferrox_api::HealthState::Ready => None,
+            _ => Some("Probing available compute backends.".to_string()),
+        },
+        model: Some(ferrox_api::health::ModelSummary {
+            id: state.model.name().to_string(),
+            tokenizer: state.model.tokenizer_kind().to_string(),
+            synthetic_weights: state.model.is_synthetic(),
+        }),
+        capabilities,
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        pid: std::process::id(),
+        uptime_seconds: uptime.as_secs_f64(),
+        server_time_unix_ms: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis().min(u64::MAX as u128) as u64)
+            .unwrap_or(0),
+        last_request_age_seconds: (last_request_ms > 0)
+            .then(|| uptime.as_secs_f64() - (last_request_ms as f64 / 1000.0))
+            .map(|age| age.max(0.0)),
+    };
+
+    let status =
+        StatusCode::from_u16(body.state.http_status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    (status, Json(body)).into_response()
 }
 
 async fn list_models(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
@@ -1523,6 +1612,7 @@ async fn chat_completions(
             .request_errors_total
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
+    state.mark_request_finished();
 
     response
 }
@@ -1814,6 +1904,7 @@ fn build_app_state(
     prefix_cache: Option<Arc<Mutex<PrefixCache>>>,
     enable_continuous_batching: bool,
     mcp: Option<mcp::LoadedMcpConfig>,
+    detection: Arc<health::Detection>,
 ) -> AppState {
     let (model, continuous_batcher) = match loaded {
         model::LoadedModel::Gguf(g) => {
@@ -1898,6 +1989,8 @@ fn build_app_state(
         requests_total: std::sync::atomic::AtomicU64::new(0),
         request_errors_total: std::sync::atomic::AtomicU64::new(0),
         started_at: std::time::Instant::now(),
+        last_request_ms: std::sync::atomic::AtomicU64::new(0),
+        detection,
         mcp,
     }
 }
@@ -2344,30 +2437,43 @@ async fn run(mcp_config_path: Option<PathBuf>, ui_server: bool) -> anyhow::Resul
         None => None,
     };
 
+    // Started before the router is built so the probe overlaps with
+    // binding the port: by the time a client can ask, it has usually
+    // already landed.
+    let detection = health::Detection::spawn();
+
     let state = Arc::new(build_app_state(
         loaded,
         kv_pool,
         prefix_cache,
         enable_cb,
         mcp,
+        detection,
     ));
 
-    let mut public = Router::new().route("/health", get(health));
+    // Paths come from `ferrox_api::routes` rather than string literals
+    // so the UI, `ferrox chat` and this router cannot disagree about
+    // what the surface is.
+    use ferrox_api::routes;
+
+    let mut public = Router::new().route(routes::HEALTH, get(health));
     if ui_server {
-        tracing::info!("web UI enabled at / and /ui");
-        public = public.route("/", get(ui_page)).route("/ui", get(ui_page));
+        tracing::info!("web UI enabled at {} and {}", routes::ROOT, routes::UI);
+        public = public
+            .route(routes::ROOT, get(ui_page))
+            .route(routes::UI, get(ui_page));
     }
 
     let mut protected = Router::new()
-        .route("/v1/models", get(list_models))
-        .route("/v1/chat/completions", post(chat_completions))
-        .route("/v1/messages", post(anthropic::messages))
-        .route("/v1/completions", post(openai_extra::completions))
-        .route("/v1/tokenize", post(openai_extra::tokenize))
-        .route("/v1/detokenize", post(openai_extra::detokenize))
-        .route("/v1/embeddings", post(openai_extra::embeddings))
-        .route("/cache/stats", get(cache_stats))
-        .route("/metrics", get(metrics));
+        .route(routes::V1_MODELS, get(list_models))
+        .route(routes::V1_CHAT_COMPLETIONS, post(chat_completions))
+        .route(routes::V1_MESSAGES, post(anthropic::messages))
+        .route(routes::V1_COMPLETIONS, post(openai_extra::completions))
+        .route(routes::V1_TOKENIZE, post(openai_extra::tokenize))
+        .route(routes::V1_DETOKENIZE, post(openai_extra::detokenize))
+        .route(routes::V1_EMBEDDINGS, post(openai_extra::embeddings))
+        .route(routes::CACHE_STATS, get(cache_stats))
+        .route(routes::METRICS, get(metrics));
 
     // Both off by default; set the corresponding env var to enable.
     // route_layer (not layer) so these apply only to the routes above,
@@ -2555,9 +2661,12 @@ mod tests {
             requests_total: std::sync::atomic::AtomicU64::new(0),
             request_errors_total: std::sync::atomic::AtomicU64::new(0),
             started_at: std::time::Instant::now(),
+            last_request_ms: std::sync::atomic::AtomicU64::new(0),
+            detection: Arc::new(health::Detection::ready(health::probe_backends())),
             mcp: None,
         });
         Router::new()
+            .route(ferrox_api::routes::HEALTH, get(health))
             .route("/v1/chat/completions", post(chat_completions))
             .route("/v1/tokenize", post(openai_extra::tokenize))
             .route("/v1/detokenize", post(openai_extra::detokenize))
@@ -2681,6 +2790,8 @@ mod tests {
             requests_total: std::sync::atomic::AtomicU64::new(0),
             request_errors_total: std::sync::atomic::AtomicU64::new(0),
             started_at: std::time::Instant::now(),
+            last_request_ms: std::sync::atomic::AtomicU64::new(0),
+            detection: Arc::new(health::Detection::ready(health::probe_backends())),
             mcp: None,
         });
         let app = Router::new()
@@ -2853,6 +2964,87 @@ mod tests {
             resp["usage"]["total_tokens"],
             resp["usage"]["prompt_tokens"].as_u64().unwrap() + 4
         );
+    }
+
+    async fn get_json(app: &Router, uri: &str) -> (StatusCode, serde_json::Value) {
+        use http_body_util::BodyExt;
+        use tower::ServiceExt;
+
+        let response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("GET")
+                    .uri(uri)
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        (status, serde_json::from_slice(&bytes).unwrap())
+    }
+
+    #[tokio::test]
+    async fn health_answers_a_capability_handshake_not_a_boolean() {
+        let app = test_app();
+        let (status, body) = get_json(&app, ferrox_api::routes::HEALTH).await;
+        assert_eq!(status, StatusCode::OK);
+
+        let health: ferrox_api::HealthResponse = serde_json::from_value(body).unwrap();
+        assert_eq!(health.state, ferrox_api::HealthState::Ready);
+        assert!(health.pid > 0);
+        assert!(health.server_time_unix_ms > 0);
+        // Nothing has been served yet: the field is absent rather than
+        // claiming a request happened at time zero.
+        assert_eq!(health.last_request_age_seconds, None);
+
+        // Every control the UI might grey out has a code it can switch
+        // on and a sentence it can show.
+        for id in [
+            ferrox_api::health::capability::CPU,
+            ferrox_api::health::capability::METAL,
+            ferrox_api::health::capability::CUDA,
+            ferrox_api::health::capability::REAL_WEIGHTS,
+            ferrox_api::health::capability::CONTINUOUS_BATCHING,
+        ] {
+            let cap = health
+                .capability(id)
+                .unwrap_or_else(|| panic!("{id} missing"));
+            assert!(!cap.reason.is_empty(), "{cap:?}");
+            assert!(!cap.detail.is_empty(), "{cap:?}");
+        }
+        // The test app serves synthetic random weights, and health must
+        // say so: a UI that presents noise as a model invites a bug
+        // report about "quality".
+        let weights = health
+            .capability(ferrox_api::health::capability::REAL_WEIGHTS)
+            .unwrap();
+        assert!(!weights.available);
+        assert_eq!(weights.reason, ferrox_api::health::reason::MODEL_NOT_LOADED);
+        assert!(health.model.as_ref().unwrap().synthetic_weights);
+    }
+
+    #[tokio::test]
+    async fn health_vouches_for_liveness_after_a_request_has_been_served() {
+        let app = test_app();
+        let _ = post_json(
+            &app,
+            serde_json::json!({
+                "model": "m",
+                "messages": [{"role": "user", "content": "\u{1}"}],
+                "max_tokens": 1,
+                "temperature": 0,
+            }),
+        )
+        .await;
+        let (_status, body) = get_json(&app, ferrox_api::routes::HEALTH).await;
+        let health: ferrox_api::HealthResponse = serde_json::from_value(body).unwrap();
+        let age = health
+            .last_request_age_seconds
+            .expect("a served request is evidence of liveness");
+        assert!((0.0..5.0).contains(&age), "implausible age {age}");
     }
 
     /// Every `data:` payload of an SSE response body, `[DONE]` excluded.
@@ -3670,7 +3862,14 @@ mod tests {
     #[test]
     fn kimi_model_serves_real_text_end_to_end_via_run_generation() {
         let loaded = build_synthetic_kimi_loaded();
-        let state = build_app_state(model::LoadedModel::Kimi(loaded), None, None, false, None);
+        let state = build_app_state(
+            model::LoadedModel::Kimi(loaded),
+            None,
+            None,
+            false,
+            None,
+            Arc::new(health::Detection::ready(health::probe_backends())),
+        );
         assert_eq!(state.model.tokenizer_kind(), "kimi-tiktoken-bpe");
         assert!(!state.model.is_synthetic());
 
@@ -3692,7 +3891,14 @@ mod tests {
     #[test]
     fn kv_pool_and_prefix_cache_are_never_consulted_for_a_kimi_model() {
         let loaded = build_synthetic_kimi_loaded();
-        let state = build_app_state(model::LoadedModel::Kimi(loaded), None, None, false, None);
+        let state = build_app_state(
+            model::LoadedModel::Kimi(loaded),
+            None,
+            None,
+            false,
+            None,
+            Arc::new(health::Detection::ready(health::probe_backends())),
+        );
 
         let pool = Arc::new(Mutex::new(ferrox_core::cache::KvBlockPool::new(64, 4)));
         let kv_pool_config = generate::KvPoolConfig {

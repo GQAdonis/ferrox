@@ -9,7 +9,7 @@ Unsupported multimodal input is rejected the same way.
 
 | Endpoint | Status |
 |---|---|
-| `GET /health` | Supported |
+| `GET /health` | Supported (capability handshake, see below) |
 | `GET /` · `GET /ui` | Static chat UI (`--ui-server` or `FERROX_UI=1`) |
 | `GET /v1/models` | Supported |
 | `POST /v1/chat/completions` | Supported (JSON + SSE) |
@@ -35,6 +35,44 @@ Unsupported multimodal input is rejected the same way.
 | `response_format: json_object` | Supported (best-effort mask + validate) |
 | Other `response_format` types | **Reject** |
 | `session_id` | Ferrox extension (server-side history) |
+
+## Health
+
+`GET /health` returns JSON (it used to return the string `ok`) and is
+never behind auth or rate limiting.
+
+```jsonc
+{
+  "state": "ready",              // ready | detecting | unavailable
+  "model": { "id": "…", "tokenizer": "…", "synthetic_weights": false },
+  "capabilities": [
+    { "id": "metal", "available": false,
+      "reason": "metal_not_built",       // stable code, safe to switch on
+      "detail": "Apple M2 Pro is present but this binary was built without --features metal; rebuild to use it." }
+  ],
+  "version": "0.5.0", "pid": 4242, "uptime_seconds": 12.5,
+  "server_time_unix_ms": 1786000000000,
+  "last_request_age_seconds": 0.4    // absent until one is served
+}
+```
+
+Three states, not two. `detecting` means backend probing has not
+finished; capabilities in that response are not measurements and a
+client should hold rather than render a verdict. Detection gets a hard
+1s budget, after which the answer is filled in provisionally with
+`reason: "detection_timed_out"`. The handler itself never blocks.
+
+Status is 200 for `ready` and `detecting`, 503 for `unavailable`.
+
+Every capability carries both a machine `reason` and a human `detail`,
+so a UI can grey a control and show the sentence without re-deriving
+why. `metal_unavailable` (no device), `metal_not_built` (this binary),
+and `disabled` (a flag turned it off) are three different problems with
+three different fixes.
+
+`last_request_age_seconds` exists so a busy server is not read as a dead
+one: a saturated GPU can starve the health handler, and recent request
+activity is positive evidence of liveness.
 
 ## Request ids
 

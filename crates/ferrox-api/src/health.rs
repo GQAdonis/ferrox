@@ -31,9 +31,15 @@ pub mod reason {
     pub const CUDA_NOT_BUILT: &str = "cuda_not_built";
     /// No GPU backend is usable; work runs on CPU kernels.
     pub const CPU_ONLY: &str = "cpu_only";
+    /// Backend probing is still in flight; nothing beside this reason
+    /// is a measurement yet.
+    pub const DETECTING: &str = "detecting";
     /// Backend probing did not finish inside its budget, so the answer
     /// beside this reason is provisional and may improve.
     pub const DETECTION_TIMED_OUT: &str = "detection_timed_out";
+    /// Supported by this build and this host, but switched off by
+    /// configuration -- the fix is a flag, not new hardware.
+    pub const DISABLED: &str = "disabled";
     /// No model is loaded, so generation endpoints will fail.
     pub const MODEL_NOT_LOADED: &str = "model_not_loaded";
 }

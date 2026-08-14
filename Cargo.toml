@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "crates/ferrox-api",
     "crates/ferrox-gguf",
     "crates/ferrox-safetensors",
     "crates/ferrox-quant",
@@ -36,6 +37,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
 # Internal crates — path for local builds, version for crates.io.
+ferrox-api = { version = "0.5.0", path = "crates/ferrox-api" }
 ferrox-gguf = { version = "0.5.0", path = "crates/ferrox-gguf" }
 ferrox-quant = { version = "0.5.0", path = "crates/ferrox-quant" }
 ferrox-safetensors = { version = "0.5.0", path = "crates/ferrox-safetensors" }

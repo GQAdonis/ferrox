@@ -1,0 +1,52 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="color-scheme" content="light dark" />
+  <title>Ferrox Studio</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%23c2410c'/%3E%3Cpath d='M11 8h12v4h-8v4h7v4h-7v8h-4z' fill='%23fff'/%3E%3C/svg%3E" />
+  <link rel="stylesheet" href="/app.css" />
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to content</a>
+
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-mark" aria-hidden="true">Fe</span>
+      <span class="brand-name">Ferrox Studio</span>
+    </div>
+
+    <nav class="nav" id="nav" aria-label="Screens">
+      <a href="/ui/chat" data-screen="chat">Chat</a>
+      <a href="/ui/models" data-screen="models">Models</a>
+      <a href="/ui/activity" data-screen="activity">Activity</a>
+      <a href="/ui/connect" data-screen="connect">Connect</a>
+    </nav>
+
+    <button
+      type="button"
+      class="health-pill"
+      id="health-pill"
+      aria-live="polite"
+      aria-expanded="false"
+      title="Backend status — click for capability detail">
+      <span class="dot" id="health-dot" data-state="detecting" aria-hidden="true"></span>
+      <span id="health-text">connecting…</span>
+    </button>
+  </header>
+
+  <div class="health-detail" id="health-detail" hidden></div>
+
+  <main id="main" tabindex="-1"></main>
+
+  <noscript>
+    <p class="notice">
+      Ferrox Studio is a JavaScript application. Without it, use the HTTP API
+      directly — see <code>/v1/models</code> and <code>/v1/chat/completions</code>.
+    </p>
+  </noscript>
+
+  <script type="module" src="/app.js"></script>
+</body>
+</html>

@@ -39,7 +39,10 @@ todos:
     content: "PAID (cb27b24, 2026-08-13, started at load 1.95): d=128 MMA published. Qwen3-0.6B 1.81->1.03x, Phi-4-mini 1.24->1.04x, Llama-3.2-3B 1.08->1.04x, Mistral-7B 1.10->1.05x. 25 red rows -> 21"
     status: completed
   - id: metal-moe-stack
-    content: "Worst row on any backend: OLMoE metal pp512 2.62x (was 2.48x — ferrox 626->587, a real -6% inside host spread), and it owns the last Metal tg128 red row too (1.41x). Move MoE layers onto the fused prefill stack: MoE PrefillDenseLayerMetal variant, GPU router+top-k, wire the already-written-but-uncalled encode_moe_mm_id_map0. Kills ~112 command buffers per pp512"
+    content: "Worst row on any backend: OLMoE metal pp512 2.62x (was 2.48x — ferrox 626->587, a real -6% inside host spread), and it owns the last Metal tg128 red row too (1.41x). Move MoE layers onto the fused prefill stack: MoE PrefillDenseLayerMetal variant, GPU router+top-k, wire the already-written-but-uncalled encode_moe_mm_id_map0. Kills ~112 command buffers per pp512. LANDED (ee35372): PrefillFfnMetal enum (Dense | Moe), new moe_router_mm_f32 + moe_topk_softmax_batch kernels, map0 + mul_mm_id_f16 now on the hot path. Interleaved A/B pp512 1412/1398/1417 vs 711/724/715 = 1.98x; tg128 unchanged (decode never took this path); verify cpu-vs-metal identical with prefill covered, stack on and off"
+    status: completed
+  - id: suite-owed-moe-stack
+    content: "OWED: full --suite --fit-host --skip-missing + --render for metal-moe-stack. The A/B above is interleaved and valid only as a relative measurement; Host B sat at load ~6 (bar is 2.0) for the whole session, so RESULTS.md still advertises OLMoE metal pp512 at 2.62x. Run before any further Metal change so two changes are not measured together"
     status: pending
   - id: metal-barrier-ranges
     content: "Replace 15 blanket per-layer buffer barriers with llama's mem-range overlap tracker; fuse rmsnorm+f32->f16 and silu_mul+f32->f16"
@@ -201,16 +204,53 @@ real gemma-4 template.
 Nothing here moves a benchmark row. All of it decides whether a model
 that loads produces the right tokens.
 
+## MoE prefill stack (2026-08-14, commit ee35372)
+
+OLMoE's MoE layers could not join `launch_prefill_dense_stack`, so each
+layer paid host QKV/O projections, one command buffer for attention, a
+host round-trip to route on the CPU, and a second command buffer for
+`launch_moe_prefill_q4_0`. `PrefillDenseLayerMetal` now carries a
+`PrefillFfnMetal` enum (`Dense` | `Moe`); the MoE arm encodes router
+GEMM → top-k softmax → `mul_mm_id_map0` → indexed gate/up → SiLU mul →
+indexed down → weighted sum into the *same* encoder, so a MoE layer adds
+no command buffer at all.
+
+Two kernels were missing and are new: `moe_router_mm_f32` (every MoE
+GGUF ships `ffn_gate_inp` as F32 — no `mul_mm_sg` variant covers F32)
+and `moe_topk_softmax_batch` (one simdgroup per token; the existing
+kernel was single-token, dispatched 1×1). `encode_moe_mm_id_map0` and
+`encode_mul_mm_id_f16` had been written ahead of this work and sat
+`#[allow(dead_code)]`; they are now on the hot path.
+
+Interleaved A/B, `-p 512 -n 0 -r 2 --ngl 99`, three pairs, host load ~6:
+
+| `FERROX_METAL_MOE_STACK` | OLMoE metal pp512 |
+|---|---|
+| `1` | 1412 / 1398 / 1417 tok/s |
+| `0` | 711 / 724 / 715 tok/s |
+
+**1.98×.** `tg128` is unchanged (112–115 both arms): decode never took
+this path, so the Metal `tg128` red row is *not* closed by this change.
+`ferrox verify --backend metal --prompt-tokens 64` is identical cpu vs
+metal with the stack on and off.
+
+Owed: a quiet-host suite run (`suite-owed-moe-stack`). Published
+`RESULTS.md` still says 2.62×.
+
+One thing this cost: prefill routes on the GPU now, so it no longer
+feeds `record_activations`. Expert hotness for `inspect-plan` comes from
+decode only.
+
 ### Next levers, in order
 
-1. `metal-moe-stack` — OLMoE owns **both** remaining Metal red rows
-   (pp512 2.62×, tg128 1.41×) and is the worst row on any backend.
-2. `cpu-decode-scaling` — 8 red rows, the only axis with nothing at
+1. `cpu-decode-scaling` — 8 red rows, the only axis with nothing at
    parity, and the cause is already measured (fork-join scaling; ferrox
    beats llama at one thread on Mistral-7B). Retry the persistent pool
    with the `wf/cpu-threadpool` deadlock understood first.
-3. `cpu-gemma3-prefill` — the one CPU prefill row that is an outlier
+2. `cpu-gemma3-prefill` — the one CPU prefill row that is an outlier
    rather than a trend, still undiagnosed.
+3. `metal-fa-mma-d256` and the OLMoE Metal `tg128` row (1.41×), which
+   the prefill stack did not touch.
 
 ## Ledger as of v0.4.0 (2026-08-11, regenerated on Host B)
 

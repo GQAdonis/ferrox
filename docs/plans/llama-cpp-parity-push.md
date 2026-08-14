@@ -42,8 +42,8 @@ todos:
     content: "Worst row on any backend: OLMoE metal pp512 2.62x (was 2.48x — ferrox 626->587, a real -6% inside host spread), and it owns the last Metal tg128 red row too (1.41x). Move MoE layers onto the fused prefill stack: MoE PrefillDenseLayerMetal variant, GPU router+top-k, wire the already-written-but-uncalled encode_moe_mm_id_map0. Kills ~112 command buffers per pp512. LANDED (ee35372): PrefillFfnMetal enum (Dense | Moe), new moe_router_mm_f32 + moe_topk_softmax_batch kernels, map0 + mul_mm_id_f16 now on the hot path. Interleaved A/B pp512 1412/1398/1417 vs 711/724/715 = 1.98x; tg128 unchanged (decode never took this path); verify cpu-vs-metal identical with prefill covered, stack on and off"
     status: completed
   - id: suite-owed-moe-stack
-    content: "OWED: full --suite --fit-host --skip-missing + --render for metal-moe-stack. The A/B above is interleaved and valid only as a relative measurement; Host B sat at load ~6 (bar is 2.0) for the whole session, so RESULTS.md still advertises OLMoE metal pp512 at 2.62x. Run before any further Metal change so two changes are not measured together"
-    status: pending
+    content: "PAID (2026-08-14, started at load 1.82): re-ran --suite --id olmoe_q4 --backend metal, the only ledger row metal-moe-stack can move. OLMoE metal pp512 587.49 -> 1402.38, gap 2.62x -> 1.11x against llama 1552.23 measured in the same session. tg128 116.17 (gap 1.41x) unchanged, as predicted — decode never took this path. RESULTS.md re-rendered from the new receipt; no other row was re-measured, so no other row moved"
+    status: completed
   - id: metal-barrier-ranges
     content: "Replace 15 blanket per-layer buffer barriers with llama's mem-range overlap tracker; fuse rmsnorm+f32->f16 and silu_mul+f32->f16"
     status: pending
@@ -131,14 +131,17 @@ published: **Phase 1 CPU prefill**, **Metal dense prefill**, **d=64 MMA**,
 registry** (`99a69ab`), **F16 loading** (`7ef74f1`), **prefill-capable
 `ferrox verify`** (`bfd1c1a`), **the clippy gate** (`c8a4cc6`).
 
-**21 red rows** (29 at the start of the push, 25 before this run):
+**21 red rows** (29 at the start of the push, 25 before the d=128 run).
+Still 21 after `metal-moe-stack`: OLMoE metal `pp512` fell 2.62x -> 1.11x
+but a row only closes at <= 1.0x, so it is a much smaller red, not a
+green:
 
 | Axis | Red | Worst | Owner |
 |---|---|---|---|
 | CPU `tg128` | 8 | SmolLM2 2.44× | `cpu-decode-scaling` |
 | CPU `pp512` | 6 | Gemma-3-1B 1.65× | `cpu-gemma3-prefill`, then 1a–1d |
-| Metal `pp512` | 6 | OLMoE 2.62× | `metal-moe-stack`, `metal-fa-mma-d256` |
-| Metal `tg128` | 1 | OLMoE 1.41× | `metal-moe-stack` |
+| Metal `pp512` | 6 | Gemma-3-1B 1.18× | `metal-fa-mma-d256` |
+| Metal `tg128` | 1 | OLMoE 1.41× | `cpu-decode-scaling`-shaped, GPU side |
 
 **Dense Metal prefill is finished as a workstream.** Every dense row is
 1.02–1.08×, and the d=128 kernel moved Qwen3-0.6B by 76% (1936 → 3400

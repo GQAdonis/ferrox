@@ -297,7 +297,10 @@ where
         if n_tasks > 1 {
             let base = RowsPtr(out.as_mut_ptr());
             let body = &body;
-            pool.dispatch(n_tasks, move |task| {
+            // `false` = another thread owns the pool; fall through to
+            // Rayon rather than wait for it. `dispatch` never blocks, on
+            // purpose — see `cpu_pool::CpuPool::dispatch`.
+            let ran = pool.dispatch(n_tasks, move |task| {
                 let c0 = task * per_task;
                 let c1 = ((task + 1) * per_task).min(n_chunks);
                 for c in c0..c1 {
@@ -310,7 +313,9 @@ where
                     body(c, slice);
                 }
             });
-            return;
+            if ran {
+                return;
+            }
         }
     }
     out.par_chunks_mut(chunk_len)

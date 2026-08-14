@@ -31,10 +31,11 @@
 //!
 //! # Contract
 //!
-//! [`CpuPool::dispatch`] runs `f(0..n_tasks)` exactly once each, on the
-//! submitting thread plus the workers, and does not return until every
-//! task has completed. `f` may therefore borrow the submitter's stack —
-//! the barrier is what makes that sound.
+//! [`CpuPool::dispatch`] either runs `f(0..n_tasks)` exactly once each —
+//! on the submitting thread plus the workers, returning only after every
+//! task has completed, so `f` may borrow the submitter's stack — **or**
+//! runs nothing and returns `false` because another thread owns the
+//! pool. It never waits for another submitter.
 //!
 //! Nested dispatch (a task that itself dispatches) runs **serially** on
 //! the calling thread; the pool is one flat region, not a work-stealing
@@ -43,25 +44,31 @@
 //! # Living next to Rayon
 //!
 //! Rayon still owns prefill (`apply_batch`, prefill attention) and the
-//! two decode sites that deliberately overlap independent matrices:
+//! decode sites that overlap independent matrices:
 //! `WeightMatrix::apply_three` (q/k/v) and `ferrox_moe::run_expert`
 //! (gate/up), plus the MoE `outs.par_iter_mut()` in
 //! `ferrox_models::decoder`. Those call `apply*` from Rayon workers, so
-//! several threads can reach [`CpuPool::dispatch`] at once. They
-//! serialize on a submit lock, which gives each of them a full-width
-//! region back to back — no worse than running them in sequence, and no
-//! oversubscription, because a submitter waiting on the lock is parked
-//! rather than spinning.
+//! several threads can reach [`CpuPool::dispatch`] at once.
+//!
+//! **The first version of this module had them block on a submit mutex,
+//! and that was a deadlock.** A pool task that reaches Rayon parks its
+//! pool worker on a Rayon latch; the Rayon worker that would run that
+//! job is parked on the submit mutex; the submitter holding the mutex is
+//! spinning for the pool worker's acknowledgement. Reproduced under
+//! `sample`, with all three stacks, in
+//! `docs/plans/llama-cpp-parity-push.md`.
+//!
+//! So the lock is `try_lock`, and losing it is not an error: the caller
+//! runs the Rayon path it would have run anyway. One decode thread —
+//! the case this pool exists for — always wins it uncontended. Every
+//! thread is therefore always in exactly one runtime that can make
+//! progress on its own, which is the property the previous design
+//! asserted and did not have.
 //!
 //! The overlap those sites were landed for is still real where it pays:
 //! a projection too small for a parallel region (SmolLM2's 576×192 k/v)
 //! takes the serial path inside `apply` and never touches the pool at
 //! all, so it genuinely runs alongside the pooled region for `q`.
-//!
-//! What must **not** happen is a Rayon region and a pool region running
-//! the same work at the same time on the same cores. It cannot: a thread
-//! either dispatches to the pool (and blocks in the barrier) or runs the
-//! Rayon fallback, never both.
 //!
 //! # Environment
 //!
@@ -268,24 +275,54 @@ impl CpuPool {
     }
 
     /// Runs `f(0)..f(n_tasks - 1)` exactly once each and returns only
-    /// after all of them have finished.
+    /// after all of them have finished — **or** returns `false` without
+    /// running anything, when another thread already owns the pool.
     ///
-    /// Runs serially when there are no workers, when there is a single
-    /// task, or when the caller is already inside a pool region.
-    pub fn dispatch<F>(&self, n_tasks: usize, f: F)
+    /// Runs serially (returning `true`) when there are no workers, when
+    /// there is a single task, or when the caller is already inside a
+    /// pool region.
+    ///
+    /// # Why this never blocks
+    ///
+    /// The first version of this module took the submit lock with
+    /// `lock()`, and that is what got it rejected: a pool task that
+    /// reaches Rayon parks its pool worker on a Rayon latch, the Rayon
+    /// worker that would have run that job is parked on *this* mutex,
+    /// and the submitter holding the mutex is spinning for the pool
+    /// worker's ack. Reproduced and sampled — see
+    /// `docs/plans/llama-cpp-parity-push.md`.
+    ///
+    /// `try_lock` deletes the `Rayon worker → submit lock` edge, which
+    /// is the only edge in that cycle that needs another runtime to make
+    /// progress. A caller that loses the race runs the Rayon path
+    /// instead, which is exactly what it did before this module existed.
+    /// Serializing on the pool was never worth a deadlock class: the
+    /// pool exists to make *one* decode thread's regions cheap, not to
+    /// arbitrate between several.
+    #[must_use = "a false return means the caller must run the Rayon path itself"]
+    pub fn dispatch<F>(&self, n_tasks: usize, f: F) -> bool
     where
         F: Fn(usize) + Sync,
     {
         if n_tasks == 0 {
-            return;
+            return true;
         }
         if n_tasks == 1 || self.n_workers == 0 || IN_POOL.with(|c| c.get()) {
             for task in 0..n_tasks {
                 f(task);
             }
-            return;
+            return true;
         }
-        let _submit = self.submit.lock().unwrap_or_else(|e| e.into_inner());
+        let _submit = match self.submit.try_lock() {
+            Ok(guard) => guard,
+            // The guard protects no data — it is a `Mutex<()>` used only
+            // as a "one submitter at a time" token — and a task panic is
+            // already re-raised on its own submitter below. Treating
+            // poison as permanent contention would silently retire the
+            // pool for the rest of the process after the first panic.
+            Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return false,
+        };
         let s = &self.shared;
         s.n_tasks.store(n_tasks, Ordering::Relaxed);
         s.next_task.store(0, Ordering::Relaxed);
@@ -325,6 +362,7 @@ impl CpuPool {
         if s.panicked.swap(false, Ordering::AcqRel) {
             panic!("ferrox cpu pool: a parallel task panicked");
         }
+        true
     }
 }
 
@@ -368,6 +406,18 @@ pub fn pool_for_dispatch() -> Option<&'static CpuPool> {
     if IN_POOL.with(|c| c.get()) {
         return None;
     }
+    // Inside a Rayon worker the caller is *already* in a parallel
+    // region — decode fans out over q/k/v (`apply_three`), gate/up
+    // (`run_expert`) and routed experts. Opening a pool region from
+    // there puts pool workers and Rayon workers on the same cores at
+    // the same time; measured on OLMoE decode, that costs 21% (55.67
+    // against 70.09 tok/s with the pool off). Rayon nesting inside an
+    // existing region is cheap — it is the *top-level* fork-join this
+    // pool exists to replace — so the rule is one runtime per thread:
+    // the decode thread pools, Rayon workers stay on Rayon.
+    if rayon::current_thread_index().is_some() {
+        return None;
+    }
     pool().filter(|p| p.n_workers > 0)
 }
 
@@ -381,6 +431,24 @@ mod tests {
     use super::*;
     use std::sync::atomic::AtomicU32;
 
+    /// Tests share one pool and Cargo runs them concurrently, so a
+    /// `dispatch` can legitimately lose the `try_lock`. Retry until it
+    /// runs: the property under test is what the region *computes*, not
+    /// who won the race (that is
+    /// `concurrent_submitters_never_block_each_other`'s job).
+    fn dispatch_eventually<F>(pool: &CpuPool, n: usize, f: F)
+    where
+        F: Fn(usize) + Sync,
+    {
+        for _ in 0..10_000 {
+            if pool.dispatch(n, &f) {
+                return;
+            }
+            std::thread::yield_now();
+        }
+        panic!("pool stayed contended for 10k attempts");
+    }
+
     fn test_pool() -> &'static CpuPool {
         static P: OnceLock<CpuPool> = OnceLock::new();
         P.get_or_init(|| CpuPool::new(4, 2_000))
@@ -390,7 +458,7 @@ mod tests {
     fn every_task_runs_exactly_once() {
         let n = 1_000usize;
         let counts: Vec<AtomicU32> = (0..n).map(|_| AtomicU32::new(0)).collect();
-        test_pool().dispatch(n, |t| {
+        dispatch_eventually(test_pool(), n, |t| {
             counts[t].fetch_add(1, Ordering::Relaxed);
         });
         for (t, c) in counts.iter().enumerate() {
@@ -409,7 +477,7 @@ mod tests {
         for round in 0..200u32 {
             let n = 37usize;
             let sum = AtomicU32::new(0);
-            test_pool().dispatch(n, |t| {
+            dispatch_eventually(test_pool(), n, |t| {
                 sum.fetch_add(t as u32 + round, Ordering::Relaxed);
             });
             let expect = (0..n as u32).map(|t| t + round).sum::<u32>();
@@ -421,7 +489,7 @@ mod tests {
     fn dispatch_borrows_the_submitters_stack() {
         let data: Vec<usize> = (0..512).collect();
         let out: Vec<AtomicU32> = (0..512).map(|_| AtomicU32::new(0)).collect();
-        test_pool().dispatch(512, |t| {
+        dispatch_eventually(test_pool(), 512, |t| {
             out[t].store(data[t] as u32 * 3, Ordering::Relaxed);
         });
         for (t, slot) in out.iter().enumerate() {
@@ -434,10 +502,10 @@ mod tests {
         // Spin budget is small in tests, so a sleep longer than it
         // guarantees the workers are on the condvar, not spinning.
         let pool = test_pool();
-        pool.dispatch(8, |_| {});
+        dispatch_eventually(pool, 8, |_| {});
         std::thread::sleep(std::time::Duration::from_millis(50));
         let sum = AtomicU32::new(0);
-        pool.dispatch(64, |t| {
+        dispatch_eventually(pool, 64, |t| {
             sum.fetch_add(t as u32, Ordering::Relaxed);
         });
         assert_eq!(sum.load(Ordering::Relaxed), (0..64u32).sum::<u32>());
@@ -446,8 +514,8 @@ mod tests {
     #[test]
     fn nested_dispatch_runs_serially_instead_of_deadlocking() {
         let inner_total = AtomicU32::new(0);
-        test_pool().dispatch(16, |_| {
-            test_pool().dispatch(4, |t| {
+        dispatch_eventually(test_pool(), 16, |_| {
+            let _ = test_pool().dispatch(4, |t| {
                 inner_total.fetch_add(t as u32, Ordering::Relaxed);
             });
         });
@@ -455,21 +523,46 @@ mod tests {
     }
 
     #[test]
-    fn concurrent_submitters_are_serialized_not_interleaved() {
-        let pool = test_pool();
+    fn concurrent_submitters_never_block_each_other() {
+        // Two properties at once: a submitter that wins the pool
+        // computes the whole region, and a submitter that loses says so
+        // instead of waiting. Both outcomes are correct; what would be
+        // incorrect is a partially-run region, or a caller parked behind
+        // another runtime (the rejected design's deadlock).
+        // A private pool: the shared one is being hammered by the other
+        // tests' retry loops, and "did anyone win?" is only meaningful
+        // against a known set of contenders.
+        let pool = CpuPool::new(4, 2_000);
+        let pool = &pool;
+        let won = AtomicU32::new(0);
+        let lost = AtomicU32::new(0);
         std::thread::scope(|scope| {
             for _ in 0..4 {
                 scope.spawn(|| {
                     for _ in 0..25 {
                         let sum = AtomicU32::new(0);
-                        pool.dispatch(64, |t| {
+                        if pool.dispatch(64, |t| {
                             sum.fetch_add(t as u32, Ordering::Relaxed);
-                        });
-                        assert_eq!(sum.load(Ordering::Relaxed), (0..64u32).sum::<u32>());
+                        }) {
+                            assert_eq!(sum.load(Ordering::Relaxed), (0..64u32).sum::<u32>());
+                            won.fetch_add(1, Ordering::Relaxed);
+                        } else {
+                            assert_eq!(
+                                sum.load(Ordering::Relaxed),
+                                0,
+                                "a refused dispatch must not run any task"
+                            );
+                            lost.fetch_add(1, Ordering::Relaxed);
+                        }
                     }
                 });
             }
         });
+        assert_eq!(
+            won.load(Ordering::Relaxed) + lost.load(Ordering::Relaxed),
+            100
+        );
+        assert!(won.load(Ordering::Relaxed) > 0, "nobody ever got the pool");
     }
 
     #[test]
@@ -478,7 +571,7 @@ mod tests {
         let hook = std::panic::take_hook();
         std::panic::set_hook(Box::new(|_| {}));
         let caught = std::panic::catch_unwind(AssertUnwindSafe(|| {
-            pool.dispatch(64, |t| {
+            let _ = pool.dispatch(64, |t| {
                 if t == 63 {
                     panic!("boom");
                 }
@@ -488,20 +581,59 @@ mod tests {
         assert!(caught.is_err(), "a panicking task must not be swallowed");
 
         let sum = AtomicU32::new(0);
-        pool.dispatch(32, |t| {
+        dispatch_eventually(pool, 32, |t| {
             sum.fetch_add(t as u32, Ordering::Relaxed);
         });
         assert_eq!(sum.load(Ordering::Relaxed), (0..32u32).sum::<u32>());
     }
 
+    /// The regression test for the deadlock that got the first version
+    /// of this module rejected.
+    ///
+    /// Rayon workers submit pool regions while a pool task itself calls
+    /// back into Rayon. With a blocking submit lock this hangs forever:
+    /// pool worker parked on a Rayon latch -> Rayon worker parked on the
+    /// submit mutex -> submitter holding it, spinning for the pool
+    /// worker's ack. With `try_lock` the losing submitters run Rayon
+    /// instead, so every edge of that cycle still has somewhere to go.
+    ///
+    /// It is a *hang* test: it either finishes or the suite times out,
+    /// so it is deliberately small enough to be fast and repeated enough
+    /// to be reliable.
+    #[test]
+    fn two_runtimes_cannot_deadlock_each_other() {
+        use rayon::prelude::*;
+        let pool = test_pool();
+        for _ in 0..20 {
+            (0..16).into_par_iter().for_each(|outer| {
+                let acc = AtomicU32::new(0);
+                let ran = pool.dispatch(64, |t| {
+                    // A pool task reaching into Rayon: the edge that
+                    // parks a pool worker on a Rayon latch.
+                    let s: u32 = (0..64u32).into_par_iter().sum();
+                    acc.fetch_add(s + t as u32 + outer as u32, Ordering::Relaxed);
+                });
+                if !ran {
+                    // Lost the pool to another submitter: that is the
+                    // designed outcome, not a failure.
+                    (0..64).into_par_iter().for_each(|t| {
+                        let s: u32 = (0..64u32).into_par_iter().sum();
+                        acc.fetch_add(s + t as u32 + outer as u32, Ordering::Relaxed);
+                    });
+                }
+                assert!(acc.load(Ordering::Relaxed) > 0);
+            });
+        }
+    }
+
     #[test]
     fn a_single_task_or_no_tasks_is_a_no_op_region() {
         let hits = AtomicU32::new(0);
-        test_pool().dispatch(0, |_| {
+        let _ = test_pool().dispatch(0, |_| {
             hits.fetch_add(1, Ordering::Relaxed);
         });
         assert_eq!(hits.load(Ordering::Relaxed), 0);
-        test_pool().dispatch(1, |_| {
+        let _ = test_pool().dispatch(1, |_| {
             hits.fetch_add(1, Ordering::Relaxed);
         });
         assert_eq!(hits.load(Ordering::Relaxed), 1);

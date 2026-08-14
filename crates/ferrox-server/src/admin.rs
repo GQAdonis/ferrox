@@ -42,7 +42,7 @@ use ferrox_api::{
 };
 use ferrox_gguf::{GgmlType, GgufFile, ShardName};
 
-use crate::tasks::Task;
+use crate::tasks::{Task, TaskGuard};
 use crate::{ActiveModel, AppState};
 
 /// Hard ceiling on a `.gguf` filename accepted from a download request.
@@ -511,6 +511,10 @@ pub(crate) async fn load_model(
     let path = target.path.display().to_string();
     let model_id = target.id.clone();
     tokio::task::spawn_blocking(move || {
+        // The guard, not the function, is what guarantees a verdict:
+        // nothing awaits this handle, so a panic inside would otherwise
+        // leave the task at `running` forever.
+        let _guard = TaskGuard::new(Arc::clone(&task));
         run_load_task(state_for_task, task, model_id, path);
     });
 
@@ -802,6 +806,7 @@ pub(crate) async fn download(
     let task_id = task.task_id.clone();
     let pattern = req.file.clone();
     tokio::task::spawn_blocking(move || {
+        let _guard = TaskGuard::new(Arc::clone(&task));
         if let Err(e) = run_download_task(&task, &repo, &pattern, &dir) {
             if task.is_cancelled() {
                 task.acknowledge_cancel();

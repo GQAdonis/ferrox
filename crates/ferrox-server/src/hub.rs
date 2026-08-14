@@ -27,6 +27,7 @@
 //! the prefix onto the first.
 
 use std::io::Read;
+use std::net::{SocketAddr, ToSocketAddrs};
 use std::time::Duration;
 
 /// Hub base URL. `HF_ENDPOINT` is the same variable the official client
@@ -46,11 +47,39 @@ fn token() -> Option<String> {
         .filter(|t| !t.trim().is_empty())
 }
 
+/// Resolves a host and returns its addresses **IPv4 first**.
+///
+/// Not cosmetic. `huggingface.co` publishes eight AAAA records and four
+/// A records, and the client tries them in order with a *halving* share
+/// of the connect deadline each time. On a host with no IPv6 route --
+/// which is most laptops, most CI, and every container run without
+/// `--ipv6` -- every AAAA attempt burns until it times out, and the
+/// budget is exhausted before the first working A record is reached.
+/// The observable symptom is a download that sits at zero bytes and
+/// then fails with "connection timed out" on a host where `curl` to the
+/// same URL succeeds instantly, because curl does Happy Eyeballs and
+/// this client does not.
+///
+/// Ordering rather than filtering: an IPv6-only host still gets its
+/// AAAA records, just after the A records, and a connect to an
+/// unreachable IPv4 address fails immediately (`ENETUNREACH`) rather
+/// than hanging, so the cost of the wrong guess is bounded in the
+/// direction that matters.
+fn resolve_ipv4_first(netloc: &str) -> std::io::Result<Vec<SocketAddr>> {
+    let mut addrs: Vec<SocketAddr> = netloc.to_socket_addrs()?.collect();
+    // Stable sort: the resolver's own ordering is preserved inside each
+    // family, so DNS round-robin still spreads load.
+    addrs.sort_by_key(|addr| !addr.is_ipv4());
+    Ok(addrs)
+}
+
 fn agent() -> ureq::Agent {
     ureq::AgentBuilder::new()
-        // Generous: a cold CDN edge can take a while to answer, but a
-        // dead host must not hold a blocking thread forever.
-        .timeout_connect(Duration::from_secs(20))
+        // Enough for a cold CDN edge to answer, short enough that a
+        // black-holed address does not hold a blocking thread for
+        // anything like a user's patience.
+        .timeout_connect(Duration::from_secs(10))
+        .resolver(resolve_ipv4_first)
         .build()
 }
 
@@ -160,6 +189,22 @@ mod tests {
         assert_eq!(content_range_total(Some("bytes 0-99/*")), None);
         assert_eq!(content_range_total(None), None);
         assert_eq!(content_range_total(Some("garbage")), None);
+    }
+
+    #[test]
+    fn resolution_puts_every_ipv4_address_ahead_of_every_ipv6_one() {
+        // localhost resolves to both families on most hosts; the shape
+        // of the answer is what matters, not which addresses appear.
+        let addrs = resolve_ipv4_first("localhost:443").expect("localhost must resolve");
+        assert!(!addrs.is_empty());
+        let first_v6 = addrs.iter().position(|a| !a.is_ipv4());
+        let last_v4 = addrs.iter().rposition(|a| a.is_ipv4());
+        if let (Some(first_v6), Some(last_v4)) = (first_v6, last_v4) {
+            assert!(
+                last_v4 < first_v6,
+                "an IPv6 address was ordered ahead of an IPv4 one: {addrs:?}"
+            );
+        }
     }
 
     #[test]

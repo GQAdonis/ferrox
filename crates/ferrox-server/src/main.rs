@@ -1294,15 +1294,38 @@ async fn health(State(state): State<Arc<AppState>>) -> Response {
         .last_request_ms
         .load(std::sync::atomic::Ordering::Relaxed);
     let uptime = state.started_at.elapsed();
+    // Readiness is "can this server generate", and with nothing loaded
+    // it cannot -- so `unavailable` (503) wins over whatever the backend
+    // probe concluded. Phase 1 defined this state but nothing could
+    // reach it, because the process only bound the port after a
+    // successful load; `/admin/models/unload` makes it reachable, and a
+    // 200 `ready` here would tell a supervisor to send traffic that is
+    // guaranteed to 503.
+    let health_state = if active.is_none() {
+        ferrox_api::HealthState::Unavailable
+    } else {
+        snapshot.state
+    };
     let body = ferrox_api::HealthResponse {
-        state: snapshot.state,
-        reason: match snapshot.state {
+        state: health_state,
+        reason: match health_state {
             ferrox_api::HealthState::Ready => None,
-            _ => Some(ferrox_api::health::reason::DETECTING.to_string()),
+            ferrox_api::HealthState::Unavailable => {
+                Some(ferrox_api::health::reason::MODEL_NOT_LOADED.to_string())
+            }
+            ferrox_api::HealthState::Detecting => {
+                Some(ferrox_api::health::reason::DETECTING.to_string())
+            }
         },
-        detail: match snapshot.state {
+        detail: match health_state {
             ferrox_api::HealthState::Ready => None,
-            _ => Some("Probing available compute backends.".to_string()),
+            ferrox_api::HealthState::Unavailable => Some(
+                "No model is loaded. POST /admin/models/load with an id from GET /admin/models."
+                    .to_string(),
+            ),
+            ferrox_api::HealthState::Detecting => {
+                Some("Probing available compute backends.".to_string())
+            }
         },
         model: active
             .as_deref()
@@ -3337,7 +3360,11 @@ mod tests {
         state.swap_active(None);
 
         let (status, body) = get_json(&app, ferrox_api::routes::HEALTH).await;
-        assert!(status.is_success() || status == StatusCode::SERVICE_UNAVAILABLE);
+        // Not `ready`: a supervisor reading 200 here would route traffic
+        // that is guaranteed to 503 on arrival.
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["state"], "unavailable");
+        assert_eq!(body["reason"], "model_not_loaded");
         assert!(body["model"].is_null());
         let real_weights = body["capabilities"]
             .as_array()

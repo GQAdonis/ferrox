@@ -188,6 +188,37 @@ impl Task {
     }
 }
 
+/// Held by a worker for its whole life so a task cannot be abandoned
+/// mid-flight.
+///
+/// A `spawn_blocking` closure that panics is not observed by anyone:
+/// nothing awaits its `JoinHandle`, so without this the task would sit
+/// at `running` with zero progress for the rest of the process's life,
+/// and a UI would poll it forever. Dropping during unwind still records
+/// a verdict, and the mutex is poison-tolerant, so a panic *while
+/// holding the task lock* is handled too.
+pub(crate) struct TaskGuard(Arc<Task>);
+
+impl TaskGuard {
+    pub(crate) fn new(task: Arc<Task>) -> Self {
+        TaskGuard(task)
+    }
+}
+
+impl Drop for TaskGuard {
+    fn drop(&mut self) {
+        if self.0.status().is_terminal() {
+            return;
+        }
+        if self.0.is_cancelled() {
+            self.0.acknowledge_cancel();
+        } else {
+            self.0
+                .fail("the worker ended without reporting a result (it panicked)");
+        }
+    }
+}
+
 /// Every task this process has run, newest last, bounded.
 pub(crate) struct TaskRegistry {
     tasks: Mutex<VecDeque<Arc<Task>>>,
@@ -403,6 +434,47 @@ mod tests {
         }
         assert!(reg.get(&live.task_id).is_some());
         assert!(reg.views().len() <= MAX_TASKS + 1);
+    }
+
+    /// Nothing awaits a worker's `JoinHandle`, so a panic there is
+    /// invisible. Without the guard the task would poll as `running`
+    /// with zero progress for the life of the process.
+    #[test]
+    fn a_panicking_worker_still_leaves_the_task_in_a_terminal_state() {
+        let reg = TaskRegistry::new();
+        let task = reg.create(TaskKind::Download, "d");
+        let handle = {
+            let task = Arc::clone(&task);
+            std::thread::spawn(move || {
+                let _guard = TaskGuard::new(task);
+                panic!("worker exploded");
+            })
+        };
+        assert!(handle.join().is_err());
+        assert_eq!(task.status(), TaskStatus::Error);
+        assert!(task.view().error.is_some());
+    }
+
+    /// A worker that was asked to stop and then died still reads as
+    /// cancelled, not as a crash the user did not cause.
+    #[test]
+    fn a_cancelled_worker_that_dies_is_recorded_as_cancelled() {
+        let reg = TaskRegistry::new();
+        let task = reg.create(TaskKind::Download, "d");
+        task.request_cancel();
+        drop(TaskGuard::new(Arc::clone(&task)));
+        assert_eq!(task.status(), TaskStatus::Cancelled);
+    }
+
+    /// The guard must not overwrite a verdict the worker already gave.
+    #[test]
+    fn the_guard_leaves_a_finished_task_alone() {
+        let reg = TaskRegistry::new();
+        let task = reg.create(TaskKind::Load, "l");
+        task.succeed();
+        drop(TaskGuard::new(Arc::clone(&task)));
+        assert_eq!(task.status(), TaskStatus::Done);
+        assert_eq!(task.view().error, None);
     }
 
     #[test]

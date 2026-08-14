@@ -965,6 +965,12 @@ struct ToolCallFunctionOut {
 #[derive(Serialize)]
 struct ChatCompletionResponse {
     id: String,
+    /// Non-standard extension: the same value as `id`, stated under the
+    /// name the rest of ferrox keys by (metrics, logs, `POST /cancel`
+    /// once it exists). `id` is OpenAI's completion id and a client has
+    /// no way to know ferrox also uses it as the request key -- saying
+    /// so costs one field and removes the guess.
+    request_id: String,
     object: &'static str,
     model: String,
     choices: Vec<ChatCompletionChoice>,
@@ -1003,6 +1009,14 @@ struct ChatCompletionChunkChoice {
 #[derive(Serialize)]
 struct ChatCompletionChunk {
     id: String,
+    /// Present on the **first** chunk of a stream (see
+    /// `ChatCompletionResponse::request_id`). A client learns the key
+    /// for this generation before any content arrives, so a live view
+    /// can correlate metrics with the stream it is rendering instead of
+    /// guessing which in-flight request is "probably mine" -- a guess
+    /// that mis-attributes the moment two chats run at once.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    request_id: Option<String>,
     object: &'static str,
     model: String,
     choices: Vec<ChatCompletionChunkChoice>,
@@ -1489,12 +1503,17 @@ async fn chat_completions(
         return err.into_response();
     }
 
+    // One id per request, assigned before any work starts, so the
+    // streaming and non-streaming paths agree and the value is
+    // available to log even if generation fails.
+    let request_id = ferrox_api::next_request_id();
+
     let response = if req.stream.unwrap_or(false) {
-        chat_completions_stream(Arc::clone(&state), req)
+        chat_completions_stream(Arc::clone(&state), req, request_id)
             .await
             .into_response()
     } else {
-        chat_completions_full(Arc::clone(&state), req)
+        chat_completions_full(Arc::clone(&state), req, request_id)
             .await
             .into_response()
     };
@@ -1511,6 +1530,7 @@ async fn chat_completions(
 async fn chat_completions_full(
     state: Arc<AppState>,
     req: ChatCompletionRequest,
+    request_id: String,
 ) -> Result<Json<ChatCompletionResponse>, ApiError> {
     let tools_active = req.tools_active();
     let history = resolve_history(&state, &req);
@@ -1583,7 +1603,8 @@ async fn chat_completions_full(
         build_response_message(content, tools_active, completion.finish.as_str());
 
     Ok(Json(ChatCompletionResponse {
-        id: "ferrox-demo-0".to_string(),
+        id: request_id.clone(),
+        request_id,
         object: "chat.completion",
         model: req.model,
         choices: vec![ChatCompletionChoice {
@@ -1599,6 +1620,7 @@ async fn chat_completions_full(
 async fn chat_completions_stream(
     state: Arc<AppState>,
     req: ChatCompletionRequest,
+    request_id: String,
 ) -> Result<Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>>, ApiError> {
     // Streaming requests are never served from or written to the response cache.
     let tools_active = req.tools_active();
@@ -1624,6 +1646,7 @@ async fn chat_completions_stream(
     tokio::task::spawn_blocking(move || {
         let tx_chunks = tx.clone();
         let mut first = true;
+        let head_request_id = request_id.clone();
         let result = run_generation_emit(
             &model,
             &prompt,
@@ -1636,9 +1659,11 @@ async fn chat_completions_stream(
                     return;
                 }
                 let role = if first { Some("assistant") } else { None };
+                let request_id = first.then(|| head_request_id.clone());
                 first = false;
                 let payload = ChatCompletionChunk {
-                    id: "ferrox-demo-0".to_string(),
+                    id: head_request_id.clone(),
+                    request_id,
                     object: "chat.completion.chunk",
                     model: model_name.clone(),
                     choices: vec![ChatCompletionChunkChoice {
@@ -1655,6 +1680,13 @@ async fn chat_completions_stream(
                 let _ = tx_chunks.blocking_send(Ok(Event::default().json_data(payload).unwrap()));
             },
         );
+
+        // `first` is still true when nothing was streamed from the emit
+        // closure (the buffered tool-call/batching path, or an empty
+        // generation), so the id has not gone out yet. `take()` on the
+        // way into each payload below guarantees it is announced
+        // exactly once, on whichever chunk really is first.
+        let mut pending_request_id = first.then(|| request_id.clone());
 
         match result {
             Ok((finish, usage, full_text)) => {
@@ -1677,7 +1709,8 @@ async fn chat_completions_stream(
                 if !overlap {
                     if let Some((name, arguments)) = &tool_call {
                         let payload = ChatCompletionChunk {
-                            id: "ferrox-demo-0".to_string(),
+                            id: request_id.clone(),
+                            request_id: pending_request_id.take(),
                             object: "chat.completion.chunk",
                             model: model_name.clone(),
                             choices: vec![ChatCompletionChunkChoice {
@@ -1701,7 +1734,8 @@ async fn chat_completions_stream(
                         let _ = tx.blocking_send(Ok(Event::default().json_data(payload).unwrap()));
                     } else if !full_text.is_empty() {
                         let payload = ChatCompletionChunk {
-                            id: "ferrox-demo-0".to_string(),
+                            id: request_id.clone(),
+                            request_id: pending_request_id.take(),
                             object: "chat.completion.chunk",
                             model: model_name.clone(),
                             choices: vec![ChatCompletionChunkChoice {
@@ -1724,7 +1758,8 @@ async fn chat_completions_stream(
                     finish.as_str()
                 };
                 let final_payload = ChatCompletionChunk {
-                    id: "ferrox-demo-0".to_string(),
+                    id: request_id.clone(),
+                    request_id: pending_request_id.take(),
                     object: "chat.completion.chunk",
                     model: model_name,
                     choices: vec![ChatCompletionChunkChoice {
@@ -1742,9 +1777,10 @@ async fn chat_completions_stream(
                 let _ = tx.blocking_send(Ok(Event::default().data("[DONE]")));
             }
             Err(e) => {
-                tracing::warn!("decode error on streamed request: {e}");
+                tracing::warn!("decode error on streamed request {request_id}: {e}");
                 let payload = ChatCompletionChunk {
-                    id: "ferrox-demo-0".to_string(),
+                    id: request_id.clone(),
+                    request_id: pending_request_id.take(),
                     object: "chat.completion.chunk",
                     model: model_name,
                     choices: vec![ChatCompletionChunkChoice {
@@ -2817,6 +2853,130 @@ mod tests {
             resp["usage"]["total_tokens"],
             resp["usage"]["prompt_tokens"].as_u64().unwrap() + 4
         );
+    }
+
+    /// Every `data:` payload of an SSE response body, `[DONE]` excluded.
+    async fn post_sse_chunks(app: &Router, body: serde_json::Value) -> Vec<serde_json::Value> {
+        use http_body_util::BodyExt;
+        use tower::ServiceExt;
+
+        let response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        String::from_utf8(bytes.to_vec())
+            .unwrap()
+            .lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .filter(|payload| *payload != "[DONE]")
+            .map(|payload| serde_json::from_str(payload).unwrap())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_stream_states_its_request_id_once_in_the_first_chunk() {
+        let app = test_app();
+        let chunks = post_sse_chunks(
+            &app,
+            serde_json::json!({
+                "model": "m",
+                "messages": [{"role": "user", "content": "\u{1}\u{2}\u{3}"}],
+                "max_tokens": 4,
+                "temperature": 0,
+                "stream": true,
+            }),
+        )
+        .await;
+
+        assert!(!chunks.is_empty());
+        let request_id = chunks[0]["request_id"]
+            .as_str()
+            .expect("the first chunk names the request")
+            .to_string();
+        assert!(request_id.starts_with("chatcmpl-"), "{request_id}");
+        // Once, and before any content: a client that reads the id from
+        // chunk zero never has to correlate by heuristic.
+        for (i, chunk) in chunks.iter().enumerate().skip(1) {
+            assert!(
+                chunk.get("request_id").is_none(),
+                "chunk {i} repeats request_id"
+            );
+        }
+        // Every chunk of one stream carries the same `id`, and it is
+        // that request id -- not a shared constant.
+        for chunk in &chunks {
+            assert_eq!(chunk["id"], serde_json::json!(request_id));
+        }
+
+        let other = post_sse_chunks(
+            &app,
+            serde_json::json!({
+                "model": "m",
+                "messages": [{"role": "user", "content": "\u{1}\u{2}\u{3}"}],
+                "max_tokens": 4,
+                "temperature": 0,
+                "stream": true,
+            }),
+        )
+        .await;
+        assert_ne!(
+            other[0]["request_id"].as_str().unwrap(),
+            request_id,
+            "two concurrent chats must not share an id"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_non_streamed_response_names_the_same_request_id_as_its_completion_id() {
+        let app = test_app();
+        let resp = post_json(
+            &app,
+            serde_json::json!({
+                "model": "m",
+                "messages": [{"role": "user", "content": "\u{1}\u{2}\u{3}"}],
+                "max_tokens": 2,
+                "temperature": 0,
+            }),
+        )
+        .await;
+        assert_eq!(resp["id"], resp["request_id"]);
+        assert!(resp["request_id"]
+            .as_str()
+            .unwrap()
+            .starts_with("chatcmpl-"));
+    }
+
+    /// The whole point of server-reported timings: a client can tell
+    /// prefill from decode without a stopwatch (see `ferrox_api::usage`).
+    #[tokio::test]
+    async fn usage_carries_separate_prefill_and_decode_timings() {
+        let app = test_app();
+        let resp = post_json(
+            &app,
+            serde_json::json!({
+                "model": "m",
+                "messages": [{"role": "user", "content": "\u{1}\u{2}\u{3}"}],
+                "max_tokens": 4,
+                "temperature": 0,
+            }),
+        )
+        .await;
+        let usage = &resp["usage"];
+        assert!(usage["prompt_eval_duration_ms"].is_number(), "{usage}");
+        assert!(usage["generation_duration_ms"].is_number(), "{usage}");
+        assert!(usage["time_to_first_token_ms"].is_number(), "{usage}");
+        assert!(usage["predicted_per_second"].is_number(), "{usage}");
+        // No prefix cache in this app: the field must be absent, not 0.
+        assert!(usage.get("cached_tokens").is_none(), "{usage}");
     }
 
     /// A real, deterministic small model with random weights will not

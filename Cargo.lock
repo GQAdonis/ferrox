@@ -545,6 +545,7 @@ dependencies = [
  "axum-server",
  "base64",
  "clap",
+ "ferrox-api",
  "ferrox-core",
  "ferrox-cuda",
  "ferrox-gguf",

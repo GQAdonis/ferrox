@@ -98,44 +98,14 @@ impl FinishReason {
 /// OpenAI-convention token accounting, reported in the response's
 /// `usage` field. Counted from the exact token ids the generation loop
 /// processed (prompt after BOS insertion, and every generated id), not
-/// re-tokenized after the fact -- re-tokenizing decoded text is not
-/// guaranteed to round-trip to the same count.
-/// Token counts for a completed generation. Rates are optional llama.cpp-
-/// style fields filled when the caller timed prefill vs decode.
-#[derive(Debug, Clone, PartialEq, serde::Serialize)]
-pub struct Usage {
-    pub prompt_tokens: usize,
-    pub completion_tokens: usize,
-    pub total_tokens: usize,
-    /// Prefill throughput (prompt tokens / prefill seconds), when timed.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub prompt_per_second: Option<f64>,
-    /// Decode throughput (completion tokens / decode seconds), when timed.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub predicted_per_second: Option<f64>,
-}
-
-impl Usage {
-    pub fn new(prompt_tokens: usize, completion_tokens: usize) -> Self {
-        Usage {
-            prompt_tokens,
-            completion_tokens,
-            total_tokens: prompt_tokens + completion_tokens,
-            prompt_per_second: None,
-            predicted_per_second: None,
-        }
-    }
-
-    pub fn with_timings(mut self, prompt_secs: f64, predicted_secs: f64) -> Self {
-        if prompt_secs > 0.0 && self.prompt_tokens > 0 {
-            self.prompt_per_second = Some(self.prompt_tokens as f64 / prompt_secs);
-        }
-        if predicted_secs > 0.0 && self.completion_tokens > 0 {
-            self.predicted_per_second = Some(self.completion_tokens as f64 / predicted_secs);
-        }
-        self
-    }
-}
+/// re-tokenized after the fact.
+///
+/// Defined in `ferrox-api` rather than here because the shape is part
+/// of the public wire contract: the UI, `ferrox chat` and any external
+/// client read these fields, so exactly one definition may exist (see
+/// that crate's module docs for why the prefill and decode phases stay
+/// separate).
+pub use ferrox_api::Usage;
 
 #[derive(Clone)]
 pub struct GenerationParams {
@@ -283,6 +253,15 @@ pub fn generate(
         None
     };
 
+    // Prompt tokens this request will *not* have to recompute. Reported
+    // as `usage.cached_tokens` -- `Some(0)` when a prefix cache exists
+    // and missed, `None` when there is no prefix cache to consult, so a
+    // client can tell "no hit" from "no cache".
+    let cached_tokens = restored
+        .as_ref()
+        .map(|m| m.matched_len)
+        .or_else(|| (prefix_cache.is_some() && kv_pool.is_none()).then_some(0));
+
     let prefill_start = std::time::Instant::now();
     let mut pos;
     let mut logits: Vec<f32>;
@@ -368,6 +347,14 @@ pub fn generate(
     // corresponding cache entry via the `step` closure below, matching
     // `prefix_cache`'s `pending_logits` expectations regardless of
     // whether the loop goes on to hit a stop sequence or max_tokens.
+    // Time-to-first-token is stamped inside the `step` closure rather
+    // than approximated as "prefill time": `step` is called immediately
+    // after the first token is sampled, so this is the real moment the
+    // user could have seen something. Threading it through the closure
+    // instead of `sample_until_stop`'s signature keeps that function's
+    // (already long) argument list unchanged, and the closure's mutable
+    // borrow ends when it is dropped at the call's return.
+    let mut first_token_at: Option<std::time::Instant> = None;
     let (finish, generated_ids, final_logits) = sample_until_stop(
         logits,
         pos,
@@ -375,6 +362,9 @@ pub fn generate(
         params,
         |ids| tokenizer.decode(ids),
         |next, pos| {
+            if first_token_at.is_none() {
+                first_token_at = Some(std::time::Instant::now());
+            }
             let l = decoder.forward_token(next, pos, &mut caches);
             #[cfg(feature = "metal")]
             if kv_offload {
@@ -391,8 +381,14 @@ pub fn generate(
     );
     let decode_secs = decode_start.elapsed().as_secs_f64();
     logits = final_logits;
-    let usage =
+    let mut usage =
         Usage::new(prompt_tokens, generated_ids.len()).with_timings(prefill_secs, decode_secs);
+    if let Some(at) = first_token_at {
+        usage = usage.with_ttft(at.duration_since(prefill_start).as_secs_f64());
+    }
+    if let Some(cached) = cached_tokens {
+        usage = usage.with_cached_tokens(cached);
+    }
 
     // Store the full sequence this request actually processed (prompt
     // plus everything generated) so a future request sharing this
@@ -545,6 +541,7 @@ pub fn generate_engine<E: Engine, T: TextTokenizer>(
 
     let mut state = engine.new_state();
     let mut pos = 0;
+    let prefill_start = std::time::Instant::now();
     let logits = if tokens.is_empty() {
         let l = engine.forward_token(0, pos, &mut state);
         pos += 1;
@@ -557,19 +554,37 @@ pub fn generate_engine<E: Engine, T: TextTokenizer>(
         }
         l
     };
+    let prefill_secs = prefill_start.elapsed().as_secs_f64();
+    let decode_start = std::time::Instant::now();
 
+    // Timed for the same reason the `Decoder` path is: a UI that has to
+    // wall-clock these engines instead cannot separate prefill from
+    // decode, and Kimi/MLA prefill is sequential (one forward per prompt
+    // token), so the two phases differ by more here, not less.
+    let mut first_token_at: Option<std::time::Instant> = None;
     let (finish, generated_ids, _final_logits) = sample_until_stop(
         logits,
         pos,
         eos_id,
         params,
         |ids| tokenizer.decode(ids),
-        |next, pos| engine.forward_token(next, pos, &mut state),
+        |next, pos| {
+            if first_token_at.is_none() {
+                first_token_at = Some(std::time::Instant::now());
+            }
+            engine.forward_token(next, pos, &mut state)
+        },
         &mut emit,
         None,
     );
+    let decode_secs = decode_start.elapsed().as_secs_f64();
 
-    Ok((finish, Usage::new(prompt_tokens, generated_ids.len())))
+    let mut usage =
+        Usage::new(prompt_tokens, generated_ids.len()).with_timings(prefill_secs, decode_secs);
+    if let Some(at) = first_token_at {
+        usage = usage.with_ttft(at.duration_since(prefill_start).as_secs_f64());
+    }
+    Ok((finish, usage))
 }
 
 /// The earliest byte offset in `text` at which any of `stops` begins,
@@ -940,6 +955,89 @@ mod tests {
 
         assert_eq!(finish, FinishReason::Stop);
         assert_eq!(truncated, baseline[..cut]);
+    }
+
+    #[test]
+    fn usage_reports_both_phases_and_a_time_to_first_token() {
+        let decoder = small_decoder();
+        let prompt = String::from_utf8(vec![1u8, 2, 3]).unwrap();
+        let (_finish, usage) = generate(
+            &decoder,
+            &ServerTokenizer::Byte,
+            None,
+            None,
+            &prompt,
+            &greedy_params(5),
+            None,
+            None,
+            |_| {},
+        )
+        .unwrap();
+
+        assert_eq!(usage.prompt_tokens, 3);
+        assert_eq!(usage.completion_tokens, 5);
+        let prefill = usage.prompt_eval_duration_ms.expect("prefill timed");
+        let decode = usage.generation_duration_ms.expect("decode timed");
+        let ttft = usage.time_to_first_token_ms.expect("first token timed");
+        // TTFT is measured from the start of prefill, so it can never be
+        // shorter than prefill, and the first of five tokens must land
+        // before the decode loop finishes all five.
+        assert!(ttft >= prefill, "ttft {ttft} < prefill {prefill}");
+        assert!(
+            ttft <= prefill + decode + 1.0,
+            "ttft {ttft} exceeds the whole request"
+        );
+    }
+
+    #[test]
+    fn cached_tokens_distinguishes_a_miss_from_an_absent_prefix_cache() {
+        let decoder = small_decoder();
+        let prompt = String::from_utf8(vec![1u8, 2, 3]).unwrap();
+
+        let (_f, no_cache) = generate(
+            &decoder,
+            &ServerTokenizer::Byte,
+            None,
+            None,
+            &prompt,
+            &greedy_params(2),
+            None,
+            None,
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(no_cache.cached_tokens, None, "no prefix cache configured");
+
+        let pc = Mutex::new(PrefixCache::new(4));
+        let (_f, miss) = generate(
+            &decoder,
+            &ServerTokenizer::Byte,
+            None,
+            None,
+            &prompt,
+            &greedy_params(2),
+            None,
+            Some(&pc),
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(miss.cached_tokens, Some(0), "cache consulted, missed");
+
+        // Second turn extends the first: three prompt tokens are reused.
+        let longer = String::from_utf8(vec![1u8, 2, 3, 9]).unwrap();
+        let (_f, hit) = generate(
+            &decoder,
+            &ServerTokenizer::Byte,
+            None,
+            None,
+            &longer,
+            &greedy_params(2),
+            None,
+            Some(&pc),
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(hit.cached_tokens, Some(3));
     }
 
     #[test]

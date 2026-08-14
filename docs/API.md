@@ -36,6 +36,37 @@ Unsupported multimodal input is rejected the same way.
 | Other `response_format` types | **Reject** |
 | `session_id` | Ferrox extension (server-side history) |
 
+## Request ids
+
+Every `/v1/chat/completions` response carries a server-assigned
+`chatcmpl-…` id. It is the `id` field, and it is repeated once under
+`request_id` — in the JSON body for a non-streamed call, and in the
+**first** SSE chunk for a streamed one, before any content. That is the
+key ferrox logs and (in future) cancels by, so a client never has to
+guess which in-flight request is its own.
+
+## Usage timings
+
+`usage` extends the OpenAI shape with llama.cpp-style timings. Prefill
+and decode are reported separately, deliberately: dividing total tokens
+by total wall time reads a 50 tok/s model as 5 tok/s on a long prompt.
+
+| Field | Meaning |
+|---|---|
+| `prompt_tokens`, `completion_tokens`, `total_tokens` | OpenAI convention |
+| `prompt_eval_duration_ms` | wall time spent on the prompt |
+| `generation_duration_ms` | wall time spent in the decode loop |
+| `time_to_first_token_ms` | prefill start → first token produced |
+| `prompt_per_second`, `predicted_per_second` | per-phase throughput |
+| `cached_tokens` | prompt tokens reused from the KV prefix cache |
+
+Every timing is optional and **omitted** rather than nulled or zeroed
+when it was not measured (a cached response, a batched decode). Note
+`cached_tokens`: absent means no prefix cache is configured, `0` means
+the cache was consulted and missed.
+
+Streamed requests get the same `usage` object on the final chunk.
+
 ## Continuous batching
 
 Set `FERROX_CONTINUOUS_BATCHING=1`. Mutually exclusive with

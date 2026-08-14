@@ -13,6 +13,7 @@ name = "ferrox-server"
 path = "src/main.rs"
 
 [dependencies]
+ferrox-api = { workspace = true }
 ferrox-core = { workspace = true }
 ferrox-models = { workspace = true }
 ferrox-gguf = { workspace = true }

@@ -31,8 +31,53 @@ pub const V1_EMBEDDINGS: &str = "/v1/embeddings";
 /// Anthropic-compatible messages endpoint.
 pub const V1_MESSAGES: &str = "/v1/messages";
 
-/// Every route above, for clients that want to enumerate the surface
-/// (and for the round-trip test below).
+// ---------------------------------------------------------------------
+// Control surface.
+//
+// Everything under `/admin` either changes what the server serves or
+// writes to disk, so all of it sits behind the same `FERROX_API_KEY`
+// gate as `/v1/*` -- never on the unauthenticated `/health` side.
+// ---------------------------------------------------------------------
+
+/// Model inventory: what is on disk, what is loaded, what failed.
+pub const ADMIN_MODELS: &str = "/admin/models";
+
+/// Start loading a discovered model by its `id`. Answers `202` with a
+/// task id; the load itself runs off the request.
+pub const ADMIN_MODELS_LOAD: &str = "/admin/models/load";
+
+/// Drop the active model. Synchronous: unloading is releasing one
+/// `Arc`, and requests already decoding keep theirs.
+pub const ADMIN_MODELS_UNLOAD: &str = "/admin/models/unload";
+
+/// Fetch a `.gguf` from the Hugging Face Hub into the model directory.
+/// Answers `202` with a task id.
+pub const ADMIN_DOWNLOAD: &str = "/admin/download";
+
+/// Every long-running job this server knows about, newest first.
+pub const ADMIN_TASKS: &str = "/admin/tasks";
+
+/// Request cancellation of one task. **A template, not a literal**: the
+/// `{task_id}` placeholder is written in the OpenAPI style rather than
+/// any one web framework's, because this crate is imported by clients
+/// that have never heard of the server's router. Build a concrete path
+/// with [`admin_task_cancel`].
+pub const ADMIN_TASK_CANCEL: &str = "/admin/tasks/{task_id}/cancel";
+
+/// Counters, uptime, and the recent-request ring buffer.
+pub const ADMIN_STATS: &str = "/admin/stats";
+
+/// The concrete cancel path for one task id.
+pub fn admin_task_cancel(task_id: &str) -> String {
+    ADMIN_TASK_CANCEL.replace("{task_id}", task_id)
+}
+
+/// Every fixed route above, for clients that want to enumerate the
+/// surface (and for the round-trip test below).
+///
+/// [`ADMIN_TASK_CANCEL`] is deliberately absent: it is a template, and
+/// a caller iterating this list to probe paths would get a 404 for a
+/// literal `{task_id}`.
 pub const ALL: &[&str] = &[
     HEALTH,
     METRICS,
@@ -46,6 +91,12 @@ pub const ALL: &[&str] = &[
     V1_DETOKENIZE,
     V1_EMBEDDINGS,
     V1_MESSAGES,
+    ADMIN_MODELS,
+    ADMIN_MODELS_LOAD,
+    ADMIN_MODELS_UNLOAD,
+    ADMIN_DOWNLOAD,
+    ADMIN_TASKS,
+    ADMIN_STATS,
 ];
 
 #[cfg(test)]
@@ -63,5 +114,30 @@ mod tests {
             );
             assert!(seen.insert(*route), "{route} is listed twice");
         }
+    }
+
+    #[test]
+    fn the_admin_surface_is_namespaced() {
+        for route in ALL.iter().filter(|r| r.starts_with("/admin")) {
+            assert!(
+                route.starts_with("/admin/"),
+                "{route} would collide with the /admin prefix itself"
+            );
+        }
+    }
+
+    #[test]
+    fn the_cancel_template_is_not_enumerated_as_a_real_path() {
+        assert!(!ALL.contains(&ADMIN_TASK_CANCEL));
+        assert!(ADMIN_TASK_CANCEL.contains("{task_id}"));
+    }
+
+    #[test]
+    fn a_cancel_path_substitutes_the_only_placeholder() {
+        assert_eq!(
+            admin_task_cancel("task-7"),
+            "/admin/tasks/task-7/cancel".to_string()
+        );
+        assert!(!admin_task_cancel("task-7").contains('{'));
     }
 }

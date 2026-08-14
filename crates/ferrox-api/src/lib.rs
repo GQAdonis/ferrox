@@ -21,6 +21,7 @@
 //! Deliberately dependency-light (serde only): a desktop shell, a CLI
 //! and a WASM frontend may all link it.
 
+pub mod admin;
 pub mod health;
 pub mod lifecycle;
 pub mod progress;
@@ -28,6 +29,11 @@ pub mod request_id;
 pub mod routes;
 pub mod usage;
 
+pub use admin::{
+    CancelResponse, DownloadRequest, LoadModelRequest, ModelEntry, ModelState, ModelsResponse,
+    ProgressState, RecentRequest, StatsResponse, TaskAccepted, TaskKind, TaskProgress, TaskStatus,
+    TaskView, TasksResponse, UnloadResponse,
+};
 pub use health::{Capability, HealthResponse, HealthState};
 pub use lifecycle::{ServerReady, READY_EVENT};
 pub use progress::{RateEstimator, RateReport};

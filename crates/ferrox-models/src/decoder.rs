@@ -799,7 +799,68 @@ impl Decoder {
         }
     }
 
-    /// Length of a consecutive run of Metal dense-prefill layers from
+    /// Routed-expert FFN for the fused prefill stack, or `None` when this
+    /// layer must keep the host-routed path (`launch_moe_prefill_q4_0`).
+    ///
+    /// Note: routing happens on the GPU here, so prefill no longer feeds
+    /// `record_activations`. Expert hotness for `inspect-plan` comes from
+    /// decode, which still routes on the host.
+    #[cfg(feature = "metal")]
+    fn metal_prefill_moe<'a>(
+        layer: &'a LayerWeights,
+        config: &ModelConfig,
+    ) -> Option<ferrox_metal::gpu::PrefillMoeMetal<'a>> {
+        if !ferrox_metal::attn::metal_moe_stack_enabled()
+            || !ferrox_metal::attn::metal_moe_resident_enabled()
+            || Self::is_dense_layer(layer)
+            || !layer.moe.shared_experts.is_empty()
+            || !matches!(
+                config.ffn_activation,
+                crate::config::FfnActivation::Swiglu | crate::config::FfnActivation::SwigluFused
+            )
+            || !matches!(config.moe.gating, ferrox_moe::GatingFunction::Softmax)
+            || config.moe.expert_group_count.is_some()
+        {
+            return None;
+        }
+        let ferrox_core::weight_matrix::WeightMatrix::F32(router) = &layer.moe.router else {
+            return None;
+        };
+        let packed = Self::moe_packed_q4(&layer.moe)?;
+        let moe = ferrox_metal::gpu::PrefillMoeMetal {
+            router_w: &router.data,
+            top_k: config.moe.n_experts_active,
+            renormalize: config.moe.norm_topk_prob,
+            packed,
+        };
+        moe.is_supported().then_some(moe)
+    }
+
+    /// FFN half of a fused-prefill-stack layer: dense `mul_mm_sg` launches
+    /// or (MoE) the routed-expert description.
+    #[cfg(feature = "metal")]
+    fn metal_prefill_ffn<'a>(
+        layer: &'a LayerWeights,
+        config: &ModelConfig,
+    ) -> Option<ferrox_metal::attn::PrefillFfnMetal<'a>> {
+        if let Some(moe) = Self::metal_prefill_moe(layer, config) {
+            return Some(ferrox_metal::attn::PrefillFfnMetal::Moe(moe));
+        }
+        if !Self::is_dense_layer(layer) {
+            return None;
+        }
+        let ExpertBacking::Resident(experts) = &layer.moe.experts else {
+            return None;
+        };
+        let ex = experts.first()?;
+        Some(ferrox_metal::attn::PrefillFfnMetal::Dense {
+            gate: ex.gate.mul_mm_sg_launch()?,
+            up: ex.up.mul_mm_sg_launch()?,
+            down: ex.down.mul_mm_sg_launch()?,
+        })
+    }
+
+    /// Length of a consecutive run of Metal prefill-stack layers from
     /// `start`, or `None` when fewer than two layers qualify.
     #[cfg(feature = "metal")]
     fn metal_prefill_dense_stack_run_len(
@@ -815,26 +876,17 @@ impl Decoder {
         for li in start..self.layers.len() {
             let layer = &self.layers[li];
             let cache = &kv_caches[li];
-            if !Self::metal_prefill_dense_layer_eligible(layer) {
-                break;
-            }
             if !self.metal_prefill_dense_swa_fits(li, start_pos, batch_size) {
                 break;
             }
             if metal_kvs[li].seq_len != cache.seq_len || start_pos != cache.seq_len {
                 break;
             }
-            let ExpertBacking::Resident(experts) = &layer.moe.experts else {
-                break;
-            };
-            let ex = &experts[0];
             let ok = layer.attn.q_proj.mul_mm_sg_launch().is_some()
                 && layer.attn.k_proj.mul_mm_sg_launch().is_some()
                 && layer.attn.v_proj.mul_mm_sg_launch().is_some()
                 && layer.attn.o_proj.mul_mm_sg_launch().is_some()
-                && ex.gate.mul_mm_sg_launch().is_some()
-                && ex.up.mul_mm_sg_launch().is_some()
-                && ex.down.mul_mm_sg_launch().is_some();
+                && Self::metal_prefill_ffn(layer, &self.config).is_some();
             if !ok {
                 break;
             }
@@ -867,19 +919,15 @@ impl Decoder {
         let mut rope_thetas = Vec::with_capacity(run_len);
         for li in start..start + run_len {
             let layer = &self.layers[li];
-            layer.moe.record_activations(&[0]);
-            let ExpertBacking::Resident(experts) = &layer.moe.experts else {
-                return None;
-            };
-            let ex = &experts[0];
-            let (q, k, v, o, gate, up, down) = (
+            let ffn = Self::metal_prefill_ffn(layer, &self.config)?;
+            if matches!(ffn, ferrox_metal::attn::PrefillFfnMetal::Dense { .. }) {
+                layer.moe.record_activations(&[0]);
+            }
+            let (q, k, v, o) = (
                 layer.attn.q_proj.mul_mm_sg_launch()?,
                 layer.attn.k_proj.mul_mm_sg_launch()?,
                 layer.attn.v_proj.mul_mm_sg_launch()?,
                 layer.attn.o_proj.mul_mm_sg_launch()?,
-                ex.gate.mul_mm_sg_launch()?,
-                ex.up.mul_mm_sg_launch()?,
-                ex.down.mul_mm_sg_launch()?,
             );
             prefill_layers.push(ferrox_metal::attn::PrefillDenseLayerMetal {
                 attn_norm_w: &layer.attn.norm_weight,
@@ -888,9 +936,7 @@ impl Decoder {
                 k,
                 v,
                 o,
-                gate,
-                up,
-                down,
+                ffn,
                 post_attn_norm: layer.attn.post_attn_norm.as_deref(),
                 post_ffn_norm: layer.attn.post_ffn_norm.as_deref(),
                 extras: self.metal_attn_extras(layer),
@@ -3255,15 +3301,17 @@ impl Decoder {
                             if metal_kvs[l].seq_len == cache.seq_len && start_pos == cache.seq_len {
                                 layer.moe.record_activations(&[0]);
                                 let fused = layer.moe.with_expert(0, |ex| {
-                                    let (q, k, v, o, gate, up, down) = (
+                                    let (q, k, v, o) = (
                                         layer.attn.q_proj.mul_mm_sg_launch()?,
                                         layer.attn.k_proj.mul_mm_sg_launch()?,
                                         layer.attn.v_proj.mul_mm_sg_launch()?,
                                         layer.attn.o_proj.mul_mm_sg_launch()?,
-                                        ex.gate.mul_mm_sg_launch()?,
-                                        ex.up.mul_mm_sg_launch()?,
-                                        ex.down.mul_mm_sg_launch()?,
                                     );
+                                    let ffn = ferrox_metal::attn::PrefillFfnMetal::Dense {
+                                        gate: ex.gate.mul_mm_sg_launch()?,
+                                        up: ex.up.mul_mm_sg_launch()?,
+                                        down: ex.down.mul_mm_sg_launch()?,
+                                    };
                                     let gelu = matches!(
                                         self.config.ffn_activation,
                                         crate::config::FfnActivation::Gelu
@@ -3276,9 +3324,7 @@ impl Decoder {
                                             k,
                                             v,
                                             o,
-                                            gate,
-                                            up,
-                                            down,
+                                            ffn,
                                             post_attn_norm: layer.attn.post_attn_norm.as_deref(),
                                             post_ffn_norm: layer.attn.post_ffn_norm.as_deref(),
                                             extras: self.metal_attn_extras(layer),

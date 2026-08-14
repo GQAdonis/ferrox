@@ -567,7 +567,11 @@ mod tests {
 
     #[test]
     fn a_panicking_task_surfaces_on_the_submitter_and_leaves_the_pool_usable() {
-        let pool = test_pool();
+        // Private pool: a `try_lock` lost to another test's retry loop
+        // would skip the region entirely, and then there is no panic to
+        // catch — the test would be measuring contention, not panics.
+        let pool = CpuPool::new(4, 2_000);
+        let pool = &pool;
         let hook = std::panic::take_hook();
         std::panic::set_hook(Box::new(|_| {}));
         let caught = std::panic::catch_unwind(AssertUnwindSafe(|| {

@@ -3,20 +3,20 @@ name: ferrox UI — web, desktop, one frontend
 overview: "GOAL: one web frontend, embedded in ferrox-server and served at `/`, plus a Tauri 2 shell that wraps the same frontend into a native app for macOS/Windows/Linux. First cut: chat + model manager + live metrics. Every UI feature must be reachable through the public HTTP API — the UI calls `/v1/chat/completions` like any other client, so the API cannot rot without the UI breaking first. Sourced from a read-only study of oMLX (Python/MLX, Swift menubar) and Unsloth Studio (React + FastAPI + Tauri 2) under `.scratch/`; both were read for contracts only. LICENCE RULE: Unsloth `studio/` is AGPL-3.0 and ferrox is Apache-2.0 — read the shapes, copy no code."
 todos:
   - id: ui-api-contract-crate
-    content: "Shared route-constant + DTO crate so app and server cannot drift (Unsloth has this implicitly; oMLX's Endpoints.swift is 106 lines and is the whole app-server contract)"
-    status: pending
+    content: "Shared route-constant + DTO crate so app and server cannot drift (Unsloth has this implicitly; oMLX's Endpoints.swift is 106 lines and is the whole app-server contract). LANDED 2e8c214: `crates/ferrox-api` (serde-only) with routes / health / lifecycle / usage / request_id / progress. ferrox-server's router and Usage now come from it. Only implemented routes get a constant — a constant for a missing endpoint reads as a promise. The OpenAI request/response bodies deliberately stay in ferrox-server where they are validated"
+    status: completed
   - id: ui-health-capability
-    content: "GET /health with THREE states: ready, unavailable+reason, and `detecting` while backends are probed. A guessed 'CPU only' on first paint is visually identical to a measured one. Hard 1s budget, then answer provisionally"
-    status: pending
+    content: "GET /health with THREE states: ready, unavailable+reason, and `detecting` while backends are probed. A guessed 'CPU only' on first paint is visually identical to a measured one. Hard 1s budget, then answer provisionally. LANDED 21a175c: `/health` returns the handshake instead of the string 'ok'. Probe runs once in the background, handler never blocks; before the 1s budget no GPU verdict is offered at all, after it the answer is filled in with reason `detection_timed_out`, and a late probe replaces that. Capabilities cpu/metal/cuda/real_weights/continuous_batching each carry a machine reason + a human sentence, so metal_unavailable / metal_not_built / disabled stay three different answers. `last_request_age_seconds` lets a saturated backend vouch for its own liveness. NOT DONE: `unavailable` is defined and returns 503 but is unreachable today — the server only binds after the model loads, so it needs ui-model-swap to occur"
+    status: completed
   - id: ui-server-lifecycle
-    content: "`--port 0` + a structured stdout line carrying the bound addr/pid, and stdin-close => exit. Deletes the entire port-conflict UI and all OS-specific signal reaping"
-    status: pending
+    content: "`--port 0` + a structured stdout line carrying the bound addr/pid, and stdin-close => exit. Deletes the entire port-conflict UI and all OS-specific signal reaping. LANDED ff8f10d: both serve paths (plain + TLS) bind first and read the address back off the socket, then print the `ferrox.server.ready` JSON line (addr/port/scheme/pid/version). `--exit-on-stdin-close` / FERROX_EXIT_ON_STDIN_CLOSE=1 is OPT-IN — a /dev/null stdin (systemd, cron, nohup) is EOF at startup, so defaulting it on would make the server exit as it starts. Graceful shutdown added to both paths; runtime is shut down in the background since the stdin watcher parks in a blocking read. Verified end to end. NOT DONE: the preflight disposition (managed/owned/attached/external) is supervisor-side and belongs with ui-tauri-shell"
+    status: completed
   - id: ui-request-id-stream
-    content: "Emit `request_id` in the first SSE chunk and key metrics by the same id. oMLX's chat page reverse-engineers this with a claiming heuristic; ferrox can just say it"
-    status: pending
+    content: "Emit `request_id` in the first SSE chunk and key metrics by the same id. oMLX's chat page reverse-engineers this with a claiming heuristic; ferrox can just say it. LANDED 233328f: every /v1/chat/completions request gets a `chatcmpl-…` id (was the constant 'ferrox-demo-0' for everyone). Stated as `id` on every chunk and once as `request_id` on the first one, before any content. PARTIAL: metrics are not yet keyed by it — that needs ui-api-monitor's ring buffer"
+    status: completed
   - id: ui-usage-timings
-    content: "Extend `usage` with llama.cpp-style timings (ttft, prompt_eval_duration, generation_duration, tok/s both phases, cached_tokens) in both non-streaming and the include_usage final chunk. Server-reported beats client wall-clock"
-    status: pending
+    content: "Extend `usage` with llama.cpp-style timings (ttft, prompt_eval_duration, generation_duration, tok/s both phases, cached_tokens) in both non-streaming and the include_usage final chunk. Server-reported beats client wall-clock. LANDED 233328f: prompt_eval_duration_ms / generation_duration_ms / time_to_first_token_ms / cached_tokens beside the existing per-phase rates, on the Decoder path AND the Kimi/MLA engine path (which reported no timings at all). TTFT is stamped inside the decode step closure — the real moment a token existed — not approximated as prefill time. cached_tokens distinguishes a prefix-cache miss (Some(0)) from no prefix cache (absent). Untimed usage still serializes to exactly the three OpenAI fields"
+    status: completed
   - id: ui-cancel-two-tier
     content: "Cancellation: AbortSignal on the socket PLUS an explicit POST /cancel with keepalive. A dropped TCP connection does not reliably stop a decode loop"
     status: pending
@@ -33,8 +33,8 @@ todos:
     content: "ONE long-running-task contract reused by download/convert/bench: POST start -> {task_id}, GET tasks, POST cancel/{id}, fields {status, progress, bytes_done, bytes_total, error, timestamps, retry_count}, plus a per-task event stream"
     status: pending
   - id: ui-transfer-stats
-    content: "Rolling-window rate/ETA smoothing: >=3 samples over >=3s before reporting `stable`, reset on counter regression, ETA clamped. Prevents the '123 GB/s' flash on the first tick. Reimplement from the description — the reference is AGPL"
-    status: pending
+    content: "Rolling-window rate/ETA smoothing: >=3 samples over >=3s before reporting `stable`, reset on counter regression, ETA clamped. Prevents the '123 GB/s' flash on the first tick. Reimplement from the description — the reference is AGPL. LANDED 2e8c214: `ferrox_api::progress::RateEstimator`, written from this description only. A warming report carries NO number at all rather than an untrusted one, which makes the flash structurally impossible; window trims by age and drops from the middle on overflow so a fast-ticking job still reaches `stable`; ETA needs a known total and a positive rate. NO CONSUMER YET — it is waiting on ui-task-contract to have a job to measure"
+    status: completed
   - id: ui-frontend-chat
     content: "Chat: streaming, markdown+code, reasoning blocks, sampling controls, model switch mid-conversation, conversation tree persisted SERVER-side (SQLite), not localStorage"
     status: pending
@@ -51,8 +51,8 @@ todos:
     content: "Settings > Connect: copy-pasteable curl / Python-SDK / IDE snippets prefilled with the live base URL, key and loaded model. Highest-leverage screen for a server whose job is being someone's OpenAI endpoint"
     status: pending
   - id: ui-cross-platform-truth
-    content: "BLOCKING HONESTY: Windows/Linux GPU means CUDA, which the parity plan keeps only at 'must compile' — no receipts, no host pin. A desktop app shipping to Windows today is CPU-only in practice. State it, do not imply otherwise"
-    status: pending
+    content: "BLOCKING HONESTY: Windows/Linux GPU means CUDA, which the parity plan keeps only at 'must compile' — no receipts, no host pin. A desktop app shipping to Windows today is CPU-only in practice. State it, do not imply otherwise. LANDED: stated in docs/FEATURES.md beside the backend table, and /health now says the same per capability with a reason string instead of silently greying a control. Still to state on a download page if one ever ships (ui-tauri-shell)"
+    status: completed
 isProject: false
 ---
 
@@ -91,6 +91,33 @@ binary**. oMLX's packaging chapter — venvstacks, `PYTHONHOME` relocation,
 `install.sh` that provisions a Python interpreter at install time both
 exist to solve a problem ferrox does not have. Nothing in this plan may
 reintroduce it.
+
+## Landed so far (2026-08-14)
+
+Phase 1a, 1b and 1c are in, plus the contract crate they all write to.
+
+- **`crates/ferrox-api`** — routes, health/capability DTOs, the ready
+  line, `Usage`, request ids, the rate estimator. serde-only, so a CLI,
+  a desktop shell and a browser frontend can all link it. The server's
+  router and `Usage` come from it, so a path or payload has one
+  definition rather than one per end.
+- **`GET /health`** is the three-state handshake. Probing happens once
+  in the background under a 1s budget and the handler never blocks;
+  before the budget it offers *no* GPU verdict, after it answers
+  provisionally with `detection_timed_out`. `unavailable` is defined but
+  unreachable until model swap exists — the port only binds after a
+  model is loaded.
+- **`--port 0` + the `ferrox.server.ready` stdout line**, and opt-in
+  `--exit-on-stdin-close`. Verified end to end (kernel-assigned port,
+  requests served on it, exit 0 when the parent closes the pipe).
+- **`request_id`** and **per-phase `usage` timings** on chat
+  completions, including the Kimi/MLA engine path.
+- The **honesty clause** is stated in `docs/FEATURES.md`.
+
+Deliberately not started: cancellation, SSE hardening, the admin
+surface, model swap, the task contract, and everything in Phases 2 and
+3. Model swap is the gate on the whole model-manager screen and is the
+next real backend work.
 
 ## What exists today
 

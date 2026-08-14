@@ -68,6 +68,8 @@ ferrox-gguf + ferrox-quant
         → ferrox-moe
         → ferrox-models (loader, Decoder, Kimi/GLM/DS4 stacks)
         → ferrox-cli / ferrox-server
+
+ferrox-api (routes + wire DTOs, serde-only) → ferrox-server + clients
 ```
 
 Load path: GGUF mmap → keep quantized → fused dequant+dot →

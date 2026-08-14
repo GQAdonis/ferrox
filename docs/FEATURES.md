@@ -38,6 +38,14 @@ Full matrix: [`MODELS.md`](MODELS.md) ·
 | **Metal** | FA-vec attention (decode d=64/96/128/256, prefill d=128/256), concurrent FFN/QKV encode, MoE Concurrent + fused groups + `MoeMemRanges` + `mul_mm_id` prefill, quantized KV (`q8_0` / `turbo8` / `fp8` / `turbo4`) |
 | **CUDA** | Matvec, resident weights, FFN fuse (`--features cuda`) |
 
+**Platform honesty.** Every benchmarked number in this repo is CPU or
+Apple Metal. GPU acceleration on Windows and Linux means CUDA, and CUDA
+is held to "must compile" — there is no pinned benchmark host and no
+published receipts for it. Treat a Windows or Linux install as
+**CPU-only in practice** until that changes. `/health` says the same
+thing per capability, with a reason string, rather than silently
+greying a control out.
+
 ## CLI
 
 llama.cpp-style completion flags (`-m`, `-p`, `-n`, `-ngl`, `--ctk`, …),

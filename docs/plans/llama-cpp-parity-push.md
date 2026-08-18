@@ -45,7 +45,7 @@ todos:
     content: "PAID (2026-08-14, started at load 1.82): re-ran --suite --id olmoe_q4 --backend metal, the only ledger row metal-moe-stack can move. OLMoE metal pp512 587.49 -> 1402.38, gap 2.62x -> 1.11x against llama 1552.23 measured in the same session. tg128 116.17 (gap 1.41x) unchanged, as predicted — decode never took this path. RESULTS.md re-rendered from the new receipt; no other row was re-measured, so no other row moved"
     status: completed
   - id: metal-moe-decode
-    content: "Last red Metal decode row: OLMoE tg128 1.41x. DIAGNOSED on wf/metal-moe-decode (see 'MoE decode: where the 1.41x actually goes'). Decode already routes on the GPU, already uses one command buffer per token, and its expert mat-vec is already llama's mul_mv_id — none of those were the cause. Measured by stage ablation (new FERROX_METAL_MOE_ABLATE) against FERROX_METAL_GPU_TIMING: the ROUTER costs ~3.6 ms of ~8.5 ms GPU/tok (42%), more than the experts it selects (2.9 ms), split between two single-lane kernels — f32_matvec (gpu.rs:324, one thread per row, so a 64x2048 router is ONE threadgroup) and moe_topk_softmax (gpu.rs:665, `if (tid != 0u) return;`, private float[256], 1x1x1 dispatch). LANDED on wf/metal-moe-decode: f32_matvec rewritten as ggml's kernel_mul_mv_t_t_impl<float,float> (NR0=2, NSG=min(4,ceil(cols/128)), simd_sum + threadgroup fold, coalesced lanes), and decode's top-k switched to the existing simdgroup moe_topk_softmax_batch with n_tokens=1 (the single-lane kernel is deleted). PROVISIONAL interleaved A/B at host load 121-162, GPU ms/tok (wall tok/s unusable at that load): 8.36/8.12/8.59 -> 6.23/6.06/6.23, -2.1 ms/tok = -25%. Router 3.6 ms -> ~0.5 ms. verify --backend metal --prompt-tokens 64 identical cpu vs metal. OWED: quiet-host suite run (RESULTS.md still says 1.41x). What is left on this row is attention ~2.4 ms/tok at ~63 GB/s (metal-barrier-ranges, ~8 barrier points per layer) and the ~1.6 ms/tok host lm_head"
+    content: "Last red Metal decode row: OLMoE tg128 1.41x. DIAGNOSED on wf/metal-moe-decode (see 'MoE decode: where the 1.41x actually goes'). Decode already routes on the GPU, already uses one command buffer per token, and its expert mat-vec is already llama's mul_mv_id — none of those were the cause. Measured by stage ablation (new FERROX_METAL_MOE_ABLATE) against FERROX_METAL_GPU_TIMING: the ROUTER costs ~3.6 ms of ~8.5 ms GPU/tok (42%), more than the experts it selects (2.9 ms), split between two single-lane kernels — f32_matvec (gpu.rs:324, one thread per row, so a 64x2048 router is ONE threadgroup) and moe_topk_softmax (gpu.rs:665, `if (tid != 0u) return;`, private float[256], 1x1x1 dispatch). LANDED on wf/metal-moe-decode: f32_matvec rewritten as ggml's kernel_mul_mv_t_t_impl<float,float> (NR0=2, NSG=min(4,ceil(cols/128)), simd_sum + threadgroup fold, coalesced lanes), and decode's top-k switched to the existing simdgroup moe_topk_softmax_batch with n_tokens=1 (the single-lane kernel is deleted). PROVISIONAL interleaved A/B at host load 121-162, GPU ms/tok (wall tok/s unusable at that load): 8.36/8.12/8.59 -> 6.23/6.06/6.23, -2.1 ms/tok = -25%. A second A/B at load 14-16 (wall clock usable there): GPU 7.76/7.99/7.61 -> 5.55/5.32/5.28 and tg128 97.9/90.7/113.4 -> 118.9/152.3/145.7, i.e. ~1.13x against the published llama 164.23 — cross-session, so a reason to take the suite run, not a result. Router 3.6 ms -> ~0.5 ms. verify --backend metal --prompt-tokens 64 identical cpu vs metal. OWED: quiet-host suite run (RESULTS.md still says 1.41x). What is left on this row is attention ~2.4 ms/tok at ~63 GB/s (metal-barrier-ranges, ~8 barrier points per layer) and the ~1.6 ms/tok host lm_head"
     status: pending
   - id: metal-barrier-ranges
     content: "Replace 15 blanket per-layer buffer barriers with llama's mem-range overlap tracker; fuse rmsnorm+f32->f16 and silu_mul+f32->f16"
@@ -355,7 +355,21 @@ clock from `FERROX_METAL_GPU_TIMING` is the signal:
 | before | 8.36 / 8.12 / 8.59 |
 | after | 6.23 / 6.06 / 6.23 |
 
-**−2.1 ms/tok, −25 % of GPU time**, PROVISIONAL. Re-ablating the fixed
+**−2.1 ms/tok, −25 % of GPU time**, PROVISIONAL. A second three-pair
+A/B once the host dropped to **load 14–16** — still not quiet, still
+PROVISIONAL, but with usable wall clock:
+
+| | GPU ms/tok | wall tok/s |
+|---|---|---|
+| before | 7.76 / 7.99 / 7.61 | 97.9 / 90.7 / 113.4 |
+| after | 5.55 / 5.32 / 5.28 | 118.9 / 152.3 / 145.7 |
+
+Median 113.4 → 145.7 tok/s. Against the llama 164.23 in the published
+row that would be **1.41× → ~1.13×**, but that is a cross-session
+comparison against a number measured on a quiet host, so it is not a
+result — it is the reason to go take the suite run.
+
+Re-ablating the fixed
 build: router 3.6 ms → ~0.5 ms (`topk` ~0.06, `rmv` ~0.4). What is left
 is attention ~2.4 ms and experts ~2.4 ms; at ~483 MB of active expert
 weights the expert mat-vec is already running at roughly M2 Pro's peak

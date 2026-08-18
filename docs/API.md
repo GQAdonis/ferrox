@@ -302,6 +302,23 @@ completes, and a continuous-batching request decodes on the shared
 batcher thread rather than through this loop and is not covered.
 `/v1/completions` and `/v1/messages` are buffered and register no id.
 
+## Streaming behind a proxy
+
+Streamed completions carry `X-Accel-Buffering: no` beside axum's
+`Cache-Control: no-cache`. nginx — and the proxies that copied its
+convention — buffer `text/event-stream` by default, which turns a
+token-by-token stream into one silent wait followed by the whole answer,
+and that is indistinguishable at the client from a hung backend.
+
+A keep-alive comment goes out every 15 s, so an idle-but-healthy stream
+still puts bytes on the wire. A client's stall timeout should therefore
+be measured against bytes received, not tokens: that way a long prefill
+never trips it and a swallowed connection does.
+
+Not implemented: `id:` / `retry:` / `Last-Event-ID` replay, and a
+polling fallback. `id:` without a server-side replay buffer would be a
+promise the server cannot keep.
+
 ## Continuous batching
 
 Set `FERROX_CONTINUOUS_BATCHING=1`. Mutually exclusive with

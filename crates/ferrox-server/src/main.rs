@@ -1999,7 +1999,7 @@ async fn chat_completions_stream(
     req: ChatCompletionRequest,
     request_id: String,
     started: std::time::Instant,
-) -> Result<Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>>, ApiError> {
+) -> Result<Response, ApiError> {
     // Streaming requests are never served from or written to the response cache.
     let tools_active = req.tools_active();
     // See `chat_completions_full`: the handle is taken once and the
@@ -2236,7 +2236,26 @@ async fn chat_completions_stream(
             rx,
             |mut rx| async move { rx.recv().await.map(|ev| (ev, rx)) },
         );
-    Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
+    // `X-Accel-Buffering: no` is the one header that actually reaches
+    // the problem the plan names: nginx (and the proxies that copied
+    // its convention) buffer `text/event-stream` by default, which
+    // turns a token-by-token stream into one silent wait followed by
+    // the whole answer at once -- indistinguishable, from the browser,
+    // from a hung backend. axum already sets `Cache-Control: no-cache`
+    // on an `Sse` response, so that half is covered.
+    //
+    // The keep-alive comment every 15s is the other half: it gives an
+    // idle-but-healthy stream something to send, so a client's stall
+    // timeout measures the *connection* rather than the model's
+    // time-to-first-token on a long prompt.
+    Ok((
+        [(
+            axum::http::HeaderName::from_static("x-accel-buffering"),
+            axum::http::HeaderValue::from_static("no"),
+        )],
+        Sse::new(stream).keep_alive(KeepAlive::default()),
+    )
+        .into_response())
 }
 
 /// `POST /v1/cancel` -- the explicit half of two-tier cancellation.

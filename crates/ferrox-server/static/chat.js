@@ -305,6 +305,21 @@ export function mount(container) {
             reply.content += token;
             repaintBody();
           },
+          // A stream that has gone quiet is not the same as a slow
+          // model — the server sends a keep-alive comment every 15 s,
+          // so silence on the wire means the connection, not the
+          // decode. Said out loud rather than left as a spinner that
+          // never resolves; `null` means it recovered.
+          onStall: (ms) => {
+            if (disposed) return;
+            if (ms === null) clear(banner);
+            else
+              notice(
+                `No data for ${Math.round(ms / 1000)}s. The generation may still be running — `
+                  + 'a proxy between you and the server may be buffering text/event-stream. '
+                  + 'Stop cancels it on the server, not just here.',
+              );
+          },
         },
       );
       const line = statLine(result?.usage, result?.requestId || requestId);

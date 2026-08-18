@@ -155,6 +155,22 @@ export function cancelGeneration(requestId) {
 // --------------------------------------------------------------------
 
 /**
+ * How long a stream may go without delivering a single byte before the
+ * UI says so.
+ *
+ * Measured against *bytes*, not tokens, which is what makes the number
+ * safe to keep low-ish: the server sends an SSE keep-alive comment
+ * every 15 s, so a healthy stream resets this timer four times a minute
+ * even while a long prompt is still prefilling. A slow model therefore
+ * never trips it; a proxy that swallowed the connection does.
+ *
+ * It reports and never aborts. A stalled stream may still recover, and
+ * killing a generation the user is waiting on — after paying its
+ * prefill — to show a tidier error would be the worse outcome.
+ */
+const STALL_MS = 45000;
+
+/**
  * POST a chat completion with `stream: true` and drive the callbacks.
  *
  * Three things the server states that this reads rather than guesses:
@@ -170,7 +186,10 @@ export function cancelGeneration(requestId) {
  *
  * @returns {Promise<{requestId: string|null, usage: object|null, finishReason: string|null}>}
  */
-export async function streamChat(request, { signal, onToken, onRequestId } = {}) {
+export async function streamChat(
+  request,
+  { signal, onToken, onRequestId, onStall, stallMs = STALL_MS } = {},
+) {
   const response = await fetch(routes.chatCompletions, {
     method: 'POST',
     headers: headers({ 'Content-Type': 'application/json', Accept: 'text/event-stream' }),
@@ -213,21 +232,52 @@ export async function streamChat(request, { signal, onToken, onRequestId } = {})
     if (text) onToken?.(text);
   };
 
-  for (;;) {
-    const { value, done: streamDone } = await reader.read();
-    if (streamDone) break;
-    buffer += decoder.decode(value, { stream: true });
-    // SSE frames are separated by a blank line; a `data:` field may be
-    // split across reads, so only complete frames are consumed.
-    let boundary = buffer.indexOf('\n\n');
-    while (boundary !== -1) {
-      const frame = buffer.slice(0, boundary);
-      buffer = buffer.slice(boundary + 2);
-      for (const line of frame.split('\n')) {
-        if (line.startsWith('data:')) handle(line.slice(5).trimStart());
+  // Reports a stream that has gone quiet, once, and keeps waiting. The
+  // timer is armed against every read rather than every token, so the
+  // keep-alive comments disarm it on a healthy but slow stream.
+  let stalled = false;
+  let stallTimer = null;
+  const armStallTimer = () => {
+    clearTimeout(stallTimer);
+    if (!onStall) return;
+    stallTimer = setTimeout(() => {
+      stalled = true;
+      onStall(stallMs);
+    }, stallMs);
+  };
+  const disarmStallTimer = () => {
+    clearTimeout(stallTimer);
+    stallTimer = null;
+  };
+
+  try {
+    armStallTimer();
+    for (;;) {
+      const { value, done: streamDone } = await reader.read();
+      if (streamDone) break;
+      armStallTimer();
+      if (stalled) {
+        // It came back. Saying so matters as much as saying it stopped:
+        // a banner left up after recovery is a lie with a long tail.
+        stalled = false;
+        onStall?.(null);
       }
-      boundary = buffer.indexOf('\n\n');
+      buffer += decoder.decode(value, { stream: true });
+      // SSE frames are separated by a blank line; a `data:` field may be
+      // split across reads, so only complete frames are consumed.
+      let boundary = buffer.indexOf('\n\n');
+      while (boundary !== -1) {
+        const frame = buffer.slice(0, boundary);
+        buffer = buffer.slice(boundary + 2);
+        for (const line of frame.split('\n')) {
+          if (line.startsWith('data:')) handle(line.slice(5).trimStart());
+        }
+        boundary = buffer.indexOf('\n\n');
+      }
     }
+  } finally {
+    disarmStallTimer();
+    if (stalled) onStall?.(null);
   }
 
   if (!done && !finishReason) {

@@ -454,7 +454,7 @@ fn synthetic_tokens(vocab: usize, n: usize) -> Vec<usize> {
     (0..n).map(|i| (i * 7 + 1) % vocab).collect()
 }
 
-fn active_backend() -> &'static str {
+pub fn active_backend() -> &'static str {
     #[cfg(feature = "metal")]
     {
         if ferrox_core::weight_matrix::metal_dense_enabled() {

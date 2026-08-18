@@ -147,6 +147,13 @@ struct ServerArgs {
     /// (the desktop shell) passes the flag and keeps the pipe open.
     #[arg(long = "exit-on-stdin-close", default_value_t = false)]
     exit_on_stdin_close: bool,
+
+    /// Start even though another ferrox process is already holding a
+    /// model. Off by default: two models on one box do not share it,
+    /// they thrash it, and both serve slower than either would alone.
+    /// `FERROX_ALLOW_MULTIPLE_INSTANCES=1` does the same.
+    #[arg(long = "allow-multiple-instances", default_value_t = false)]
+    allow_multiple_instances: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -2457,6 +2464,26 @@ fn main() -> anyhow::Result<()> {
         return Ok(());
     }
     apply_cli_overrides(&args)?;
+
+    // Before the model is loaded and before the port is bound: refuse
+    // to be the second process holding weights on this host. Held for
+    // the life of the process -- dropping it deregisters us.
+    let _instance = {
+        use ferrox_core::instance::{register, InstancePolicy};
+        let policy = if args.allow_multiple_instances {
+            InstancePolicy::Multi
+        } else {
+            InstancePolicy::from_env_or(InstancePolicy::Single)
+        };
+        let model = std::env::var("FERROX_MODEL_PATH").ok();
+        register(
+            "server",
+            model.as_deref(),
+            ferrox_core::instance::current_backend(),
+            policy,
+        )
+        .map_err(|conflict| anyhow::anyhow!("{conflict}"))?
+    };
 
     let journal = journal::Journal::from_env();
     eprintln!(

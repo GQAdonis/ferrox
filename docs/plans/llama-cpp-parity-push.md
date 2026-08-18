@@ -33,8 +33,8 @@ todos:
     content: "Parameterise the MMA macro over head dim so it emits _d64 and _d128. A/B: Qwen3-0.6B 1.71x, Phi-4-mini 1.20x, Llama-3.2-3B 1.20x, Mistral-7B 1.13x (commit 0ee4d0b)"
     status: completed
   - id: metal-fa-mma-d256
-    content: "Extend the MMA macro to d=256 (Gemma-3 metal pp512 1.18x). Blocked on the epilogue: `own` gives one float4 per lane, so D/4 <= 32 caps the macro at 128 — needs a lane loop. HEAD DIM CONFIRMED 2026-08-18 on models/hf_test/gemma-3-1b-it-Q8_0.gguf: `inspect` shows attn_q_norm/attn_k_norm [256], attn_q [1152,1024] = 4 heads x 256, attn_k/attn_v [1152,256] = 1 kv head x 256; `inspect-plan` reports `1 kv-heads x 256 head-dim`. d=256 is the real width, so the kernel work is warranted"
-    status: pending
+    content: "Extend the MMA macro to d=256 (Gemma-3 metal pp512 1.18x). HEAD DIM CONFIRMED 2026-08-18 on models/hf_test/gemma-3-1b-it-Q8_0.gguf: attn_q [1152,1024] = 4 heads x 256, attn_k/attn_v [1152,256] = 1 kv head x 256, `inspect-plan` says `1 kv-heads x 256 head-dim` — d=256 is the real width. LANDED (branch wf/metal-fa-mma-d256): replaced the three `own = tiisg < D4` guards on the `so` accumulator (zero-init, softmax rescale, epilogue) with llama's lane loop `for (i = tiisg; i < D4; i += NW)` (ggml-metal.metal:6529-6535, :6826-6838, :7024-7034), which degenerates to the same single iteration on the same lanes when D4 <= NW, then instantiated gqa_prefill_fa_ext_mma_d256 and routed head_dim 256 to it. 28 KiB threadgroup at QN=8/C=64 — the last width under Apple's 32 KiB. PROVISIONAL interleaved A/B (host load 29-35, other agents building): Gemma-3-1B pp512 mma 2544.91/2564.22/2514.59 vs fa_vec 2245.59/2303.43/2201.85 = 1.13x. Guard A/B base-vs-new binaries in the same window: Qwen3-0.6B (d=128) 3226 -> 3320 mean, Llama-3.2-1B (d=64) 1907 -> 1936 mean — both inside noise, no regression. verify --backend metal identical cpu-vs-metal ids with prefill covered on Gemma-3-1B (64 and 300 tokens, MMA on and off), Qwen3-0.6B and Llama-3.2-1B. OWED: a suite run on a quiet host — RESULTS.md still advertises Gemma-3-1B metal pp512 2363.87 / 1.18x and was NOT touched"
+    status: completed
   - id: suite-owed-d128
     content: "PAID (cb27b24, 2026-08-13, started at load 1.95): d=128 MMA published. Qwen3-0.6B 1.81->1.03x, Phi-4-mini 1.24->1.04x, Llama-3.2-3B 1.08->1.04x, Mistral-7B 1.10->1.05x. 25 red rows -> 21"
     status: completed
@@ -146,7 +146,7 @@ green:
 |---|---|---|---|
 | CPU `tg128` | 8 | SmolLM2 2.44× | `cpu-decode-scaling` |
 | CPU `pp512` | 6 | Gemma-3-1B 1.65× | `cpu-gemma3-prefill`, then 1a–1d |
-| Metal `pp512` | 6 | Gemma-3-1B 1.18× | `metal-fa-mma-d256` |
+| Metal `pp512` | 6 | Gemma-3-1B 1.18× | `metal-fa-mma-d256` (kernel landed 2026-08-18; row awaits a quiet-host suite run) |
 | Metal `tg128` | 1 | OLMoE 1.41× | `cpu-decode-scaling`-shaped, GPU side |
 
 **Dense Metal prefill is finished as a workstream.** Every dense row is
@@ -342,7 +342,77 @@ measured together.
 
 Only d=256 (Gemma-3, metal pp512 1.17x) is left without an MMA kernel.
 It needs a lane loop in the epilogue: `own` gives each lane one `float4`
-of the output row, which caps the macro at D/4 <= 32.
+of the output row, which caps the macro at D/4 <= 32. **Done — see below.**
+
+## d=256 MMA (2026-08-18, branch `wf/metal-fa-mma-d256`)
+
+**Head dim confirmed first.** `ferrox inspect` on
+`models/hf_test/gemma-3-1b-it-Q8_0.gguf`: `attn_q [1152, 1024]` = 4 heads
+x 256, `attn_k`/`attn_v` `[1152, 256]` = 1 kv head x 256,
+`attn_q_norm`/`attn_k_norm` `[256]`; `inspect-plan` prints
+`1 kv-heads x 256 head-dim`. The 1.18x row really is a width the macro
+could not instantiate, so the kernel work was warranted.
+
+**What the cap actually was.** Three places touch the `so` accumulator a
+row at a time — zero-init, the online-softmax rescale, and the epilogue —
+and all three were written as `if (own) so4[tiisg] ...` with
+`own = tiisg < D4`. That assigns one `float4` per lane, hence `D/4 <= 32`.
+llama has no such cap (`kernel_flash_attn_ext_impl` reaches DV 576): it
+walks the same three points with `for (i = tiisg; i < DV4; i += NW)`
+(`ggml-metal.metal:6529-6535`, `:6826-6838`, `:7024-7034`). Ported that
+loop verbatim in shape. Below `D4 <= NW` it runs exactly one iteration on
+exactly the lanes `own` selected, at the same index, so d=64 and d=128
+compute the same values; at d=256 (`D4 == 64`) one lane carries two
+`float4` columns.
+
+Then `gqa_prefill_fa_ext_mma_d256` is instantiated from the same macro and
+head_dim 256 routes to it. At QN=8 / C=64 it needs 28 KiB of threadgroup
+memory — under Apple's 32 KiB, but the last width that fits at this
+tiling. As at d=128 there is no scalar `fa_ext` here, so
+`FERROX_METAL_FA_MMA=0` sends d=256 back to `gqa_prefill_fa_vec_d256`,
+which is therefore the A/B reference for both correctness and timing.
+Sliding-window layers are untouched: prefill has no `kv_start` at all, and
+`metal_prefill_dense_swa_fits` (`decoder.rs:833-843`) already keeps a
+windowed layer off the GPU prefill path unless the whole batch fits inside
+the window.
+
+**PROVISIONAL A/B — host load 29-35 (1-min), other agents building
+concurrently. Not publishable.** Interleaved, `-p 512 -n 0 -r 2 --ngl 99`,
+3 pairs, Gemma-3-1B-IT Q8_0 metal `pp512`:
+
+| arm | rep 1 | rep 2 | rep 3 | mean |
+|---|---|---|---|---|
+| `FERROX_METAL_FA_MMA=1` (new) | 2544.91 | 2564.22 | 2514.59 | **2541** |
+| `FERROX_METAL_FA_MMA=0` (fa_vec) | 2245.59 | 2303.43 | 2201.85 | 2250 |
+
+= **1.13x** over the kernel this replaces.
+
+**Guard A/B for the landed widths.** The lane loop touches the d=64 and
+d=128 kernels' source, so the pre-change binary was rebuilt from
+`b09aedb` and interleaved against the new one in the same window
+(load 29-30), 3 pairs each:
+
+| Model | head dim | base mean | new mean |
+|---|---|---|---|
+| Qwen3-0.6B Q8_0 | 128 | 3226 | 3320 |
+| Llama-3.2-1B-Instruct Q8_0 | 64 | 1907 | 1936 |
+
+Both inside run-to-run spread; no regression in either direction.
+
+**Correctness.** `cargo test -p ferrox-metal --features metal -- --ignored
+--test-threads=1`: 45 passed, 0 failed, including the new
+`gqa_prefill_fa_ext_mma_d256_matches_cpu_and_fa_vec` (Gemma-3-1B's own
+4-head / 1-kv-head / softcap shape, padded cache tails, exact 8-row fits,
+long-prefix / short-batch) and the unchanged d=64 / d=128 tests.
+`ferrox verify --backend metal` reports identical cpu-vs-metal ids **with
+prefill covered** on Gemma-3-1B at 64 and 300 tokens with MMA on *and*
+off, and on Qwen3-0.6B and Llama-3.2-1B at 300.
+
+**Owed: a suite run on a quiet host.** `RESULTS.md` was deliberately not
+touched and still advertises Gemma-3-1B metal `pp512` 2363.87 against
+llama 2786.02 = 1.18x. The A/B above is a relative measurement only, and
+the llama column must be re-measured in the same window as ferrox before
+any new gap is written down.
 
 ### Rejected: the persistent-threadpool branch
 

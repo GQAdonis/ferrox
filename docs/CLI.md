@@ -36,6 +36,10 @@ compiled in; pick at runtime with `-dev` / `-ngl`.
 # Threads + context
 ./target/release/ferrox -m model.gguf -p "Hi" -n 64 -t 8 -c 4096
 
+# Largest context that fits, chosen before the weights load; the
+# arithmetic behind the number is printed to stderr
+./target/release/ferrox -m model.gguf -p "Hi" -n 64 -c auto
+
 # List devices, then select Metal (requires a --features metal build)
 ./target/release/ferrox --list-devices
 ./target/release/ferrox -m models/Llama-3.2-1B-Instruct-Q4_K_M.gguf \
@@ -55,7 +59,8 @@ Same via explicit subcommand: `ferrox run -m …`.
 | `-p` / `--prompt` | Prompt string |
 | `-f` / `--file` | Prompt from file |
 | `-n` / `--n-predict` | `-1` = fill remaining context |
-| `-c` / `--ctx-size` | `0` = GGUF `{arch}.context_length` (else 4096) |
+| `-c` / `--ctx-size` | `auto` = largest that fits the device memory budget, `0` = GGUF `{arch}.context_length` (else 4096), or a token count |
+| `--strict-budget` | Refuse to load when the pre-load budget says the context will not fit (default: warn and continue) |
 | `-t` / `--threads` | Sets `RAYON_NUM_THREADS` |
 | `--temp` | `0` = greedy |
 | `--top-k` | `0` = off |
@@ -94,6 +99,10 @@ not available yet).
 ```bash
 ./target/release/ferrox inspect models/tinyllama-1.1b-chat-v1.0.Q8_0.gguf
 ./target/release/ferrox inspect-plan models/olmoe-1b-7b-0924-q4_0.gguf --strict
+# Plan against a backend's real memory budget (Metal
+# recommendedMaxWorkingSetSize / free VRAM / host RAM minus a reserve).
+# Always reports the largest context that fits and the arithmetic:
+./target/release/ferrox inspect-plan model.gguf --backend metal --ctk f16
 ./target/release/ferrox caps
 ./target/release/ferrox archs
 ./target/release/ferrox presets

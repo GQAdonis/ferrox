@@ -66,6 +66,21 @@ pub fn run(args: ParityArgs) -> anyhow::Result<()> {
         crate::verify_engine::prefill_logits(Path::new(&path), &prompt, args.prompt_tokens)
             .context("ferrox prefill")?;
 
+    // The reference is pinned to llama.cpp's CPU path (n_gpu_layers = 0),
+    // because ferrox's CPU path is the one cross-validated against NumPy.
+    // Say which side ferrox ran on rather than leaving it to the
+    // environment: a Metal-vs-llama-CPU verdict has two possible causes
+    // and must not be read as one.
+    let backend = ferrox_core::weight_matrix::active_backend();
+    if backend != ferrox_core::kernel_registry::Backend::Cpu {
+        eprintln!(
+            "parity: ferrox ran on {}, the reference on llama.cpp CPU — a non-MATCH verdict \
+             here could be either engine or the backend difference. Run with FERROX_METAL=0 \
+             FERROX_CUDA=0 to isolate the engines.",
+            backend.as_str()
+        );
+    }
+
     let dumper = dumper_path(args.dumper.as_deref())?;
     let ref_logits = reference_logits(&dumper, &path, &tokens)?;
 
@@ -82,7 +97,13 @@ pub fn run(args: ParityArgs) -> anyhow::Result<()> {
     }
 
     let report = compare(&ref_logits, &ferrox_logits, args.top_k);
-    print_report(&args.model, tokens.len(), args.top_k, &report);
+    print_report(
+        &args.model,
+        tokens.len(),
+        args.top_k,
+        backend.as_str(),
+        &report,
+    );
 
     if report.verdict == Verdict::Wrong {
         anyhow::bail!(
@@ -196,7 +217,7 @@ fn compare(ref_logits: &[f32], ferrox_logits: &[f32], k: usize) -> Report {
     }
 }
 
-fn print_report(model: &str, n_tokens: usize, k: usize, r: &Report) {
+fn print_report(model: &str, n_tokens: usize, k: usize, backend: &str, r: &Report) {
     let name = Path::new(model)
         .file_stem()
         .map(|s| s.to_string_lossy().into_owned())
@@ -207,7 +228,10 @@ fn print_report(model: &str, n_tokens: usize, k: usize, r: &Report) {
         Verdict::TieFlip => "TIE-FLIP",
         Verdict::Wrong => "WRONG",
     };
-    println!("parity {name}: {verdict} ({n_tokens}-token prompt, first-token distribution)");
+    println!(
+        "parity {name}: {verdict} ({n_tokens}-token prompt, first-token distribution, \
+         ferrox {backend} vs llama.cpp cpu)"
+    );
     println!(
         "  KL(llama||ferrox) {:.3e} nats   KL(ferrox||llama) {:.3e} nats",
         r.kl_ref_ferrox, r.kl_ferrox_ref

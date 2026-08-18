@@ -24,8 +24,8 @@ todos:
     content: "Block size must be a multiple of the sliding-window size for SWA models. Non-obvious, and it will bite silently whenever ferrox runs a Gemma/gpt-oss-shaped model through the block cache"
     status: pending
   - id: sched-chunked-prefill
-    content: "Resumable chunked prefill as a state machine (cache, tokens_remaining, tokens_processed) with `fn step_chunk(&mut self) -> bool done`. PREREQUISITE for everything else: it converts an unbounded prefill into a bounded unit of work. batch_scheduler.rs prefill is sequential forward_token today"
-    status: pending
+    content: "LANDED. `PrefillState` in batch_scheduler.rs is the resumable state machine (caches, tokens_processed, tokens_remaining) with `step_chunk(&mut self) -> bool /* done */`; the worker runs ONE chunk (round-robin over waiting prompts) plus ONE batched decode step per tick, so a long prompt costs an in-flight decode one chunk, not its whole length, and N long prompts still cost one chunk per tick (the oMLX flaw the plan says not to inherit). Chunk size from `FERROX_CB_PREFILL_CHUNK` (default 128) or `BatcherConfig` for tests; `FERROX_CB_MAX_SEQS` now counts prefilling prompts too, since each holds a full KV set. Counters (prefill_chunks / prefill_tokens / decode_steps) on `/metrics`. NOT DONE, deliberately: (a) a chunk is still a per-token `forward_token` loop, not `forward_batch` -- chunking here is a scheduling boundary and is asserted bit-identical to the sequential prefill it replaced, so no throughput claim is made and no benchmark row moves; (b) no time-debt gate, that is `sched-time-debt`; (c) the batcher still cannot use the prefix cache or KV pool, so a chunk boundary is not yet a cache-block boundary."
+    status: completed
   - id: sched-time-debt
     content: "Time-debt prefill/decode interleaving: GPUs cannot preempt a running kernel, so chunk DURATION is the scheduling quantum. Cap contended chunks in ms converted to tokens via measured prefill tok/s; each chunk accrues duration*share debt; decode wall-time repays it; the gate blocks the next chunk until debt clears"
     status: pending
@@ -90,10 +90,11 @@ this.**
 ## What ferrox already has
 
 - `batch_scheduler.rs` — continuous batching of *decode*, opt-in via
-  `FERROX_CONTINUOUS_BATCHING=1`, with prefill priority and a
-  `FERROX_CB_MAX_SEQS` cap. **Prefill is still sequential
-  `forward_token` per sequence**, which is the gap `sched-chunked-prefill`
-  closes.
+  `FERROX_CONTINUOUS_BATCHING=1`, with a `FERROX_CB_MAX_SEQS` cap.
+  Prefill **is** chunked now (`sched-chunked-prefill`, landed): one
+  bounded `PrefillState::step_chunk` plus one batched decode step per
+  tick. Each chunk is still a per-token `forward_token` loop, so this
+  bought fairness, not throughput.
 - An in-memory `PrefixCache`, a response cache, `session.rs`, a KV pool.
 - Exact knowledge of its own KV layout from the GGUF header — the thing
   oMLX lacks and works around everywhere.

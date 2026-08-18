@@ -2,27 +2,38 @@
 //! one `Decoder::forward_multi_seq` step per tick instead of each
 //! request owning a private `forward_token` loop.
 //!
-//! Prefill stays per-sequence (sequential `forward_token`) for this
-//! first wiring -- continuous batching's win is the decode phase, where
-//! membership can change every step. Opt-in via
-//! `FERROX_CONTINUOUS_BATCHING=1`; mutually exclusive with the KV pool
-//! and prefix cache (those paths keep the private-loop `generate`).
-//! Stop sequences use the same pending-buffer logic as
+//! Opt-in via `FERROX_CONTINUOUS_BATCHING=1`; mutually exclusive with
+//! the KV pool and prefix cache (those paths keep the private-loop
+//! `generate`). Stop sequences use the same pending-buffer logic as
 //! `generate::sample_until_stop` (decode each new token, hold back
 //! `longest_stop - 1` bytes, finish on match).
 //!
-//! **Prefill priority (Crane-inspired):** when the job channel has
-//! pending work and active decode slots already exist, the worker drains
-//! `try_recv` and runs prefill (`admit`) before the next batched decode
-//! step. If any pending job was admitted and no slot is finishing, one
-//! decode tick is skipped so new prompts are not starved behind an
-//! in-flight batch.
+//! **Chunked prefill.** A prompt is not prefilled in one uninterruptible
+//! `forward_token` loop. Each accepted job first becomes a
+//! [`PrefillState`] -- a resumable state machine over (`caches`,
+//! `tokens_processed`, `tokens_remaining`) whose `step_chunk` runs at
+//! most `prefill_chunk` tokens and reports whether the prompt is
+//! finished. That is what makes a prompt a *bounded* unit of work: the
+//! worker interleaves **one** prefill chunk with **one** batched decode
+//! step per tick, so a long prompt joining the batch delays in-flight
+//! decodes by one chunk rather than by its whole length. Chunks are
+//! taken round-robin from the waiting prompts, so N concurrent long
+//! prompts still cost decode one chunk per tick, not N.
 //!
-//! **`FERROX_CB_MAX_SEQS`:** optional cap on concurrent in-flight
-//! sequences (default: unlimited). At the cap, new jobs stay queued in
-//! the channel until a slot frees; only an empty worker blocks on
-//! `recv`.
+//! Chunking is a *scheduling* boundary, not a numerical one: a chunk is
+//! still the same per-token `forward_token` sequence at the same
+//! positions, so chunk size never changes the logits or the sampled
+//! tokens (asserted by `prefill_chunking_does_not_change_logits`).
+//!
+//! **Knobs.** `FERROX_CB_MAX_SEQS`: cap on concurrent in-flight
+//! sequences, counting prompts still prefilling (default: unlimited).
+//! At the cap, new jobs stay queued in the channel until a slot frees;
+//! only a completely idle worker blocks on `recv`.
+//! `FERROX_CB_PREFILL_CHUNK`: prompt tokens per prefill chunk (default
+//! [`DEFAULT_PREFILL_CHUNK`]).
 
+use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
@@ -42,6 +53,156 @@ type DecodeFn = Arc<dyn Fn(&[usize]) -> String + Send + Sync>;
 /// stop sequences may have cut the decoded string short of a full
 /// `decode(ids)`.
 type JobResult = Result<(FinishReason, Vec<usize>, String, Usage), DecodeError>;
+
+/// Prompt tokens run per prefill chunk when `FERROX_CB_PREFILL_CHUNK`
+/// is unset. Large enough that a short prompt still prefills in one
+/// tick, small enough that a long one cannot monopolize the worker.
+pub const DEFAULT_PREFILL_CHUNK: usize = 128;
+
+/// Scheduler knobs, read from the environment by `from_env` and passed
+/// explicitly by tests (which must not race each other over process
+/// environment).
+#[derive(Clone, Copy, Debug)]
+pub struct BatcherConfig {
+    /// Cap on in-flight sequences, counting prompts still prefilling.
+    pub max_seqs: usize,
+    /// Prompt tokens per `PrefillState::step_chunk` call.
+    pub prefill_chunk: usize,
+}
+
+impl Default for BatcherConfig {
+    fn default() -> Self {
+        BatcherConfig {
+            max_seqs: usize::MAX,
+            prefill_chunk: DEFAULT_PREFILL_CHUNK,
+        }
+    }
+}
+
+impl BatcherConfig {
+    pub fn from_env() -> Self {
+        BatcherConfig {
+            max_seqs: env_positive("FERROX_CB_MAX_SEQS").unwrap_or(usize::MAX),
+            prefill_chunk: env_positive("FERROX_CB_PREFILL_CHUNK").unwrap_or(DEFAULT_PREFILL_CHUNK),
+        }
+    }
+}
+
+fn env_positive(name: &str) -> Option<usize> {
+    let raw = std::env::var(name).ok()?;
+    let value: usize = raw
+        .parse()
+        .unwrap_or_else(|_| panic!("{name} must be a positive integer"));
+    assert!(value > 0, "{name} must be a positive integer");
+    Some(value)
+}
+
+/// Counters the worker keeps as it runs, exposed through
+/// `ContinuousBatcher::stats` so prefill/decode interleaving is
+/// *observable* rather than merely intended.
+#[derive(Default)]
+struct Counters {
+    prefill_chunks: AtomicU64,
+    prefill_tokens: AtomicU64,
+    decode_steps: AtomicU64,
+}
+
+/// A snapshot of the worker's counters.
+#[derive(Debug, Clone, Copy, Default, serde::Serialize)]
+pub struct BatcherStats {
+    /// `PrefillState::step_chunk` calls the worker has made.
+    pub prefill_chunks: u64,
+    /// Prompt tokens run through prefill.
+    pub prefill_tokens: u64,
+    /// Batched decode steps (one per tick that had an active row,
+    /// regardless of how many rows that step covered).
+    pub decode_steps: u64,
+}
+
+/// One request's prefill as a resumable state machine.
+///
+/// Holds the KV `caches` being built, how many prompt tokens have been
+/// processed, and the logits produced by the most recent token.
+/// `step_chunk` advances by at most `chunk_size` tokens and reports
+/// whether the prompt is finished, which converts an unbounded prefill
+/// into a bounded unit of work the scheduler can interleave with
+/// decode.
+pub struct PrefillState {
+    decoder: Arc<Decoder>,
+    caches: Vec<KvCache>,
+    /// The tokens this prefill must run. An *empty* prompt is stored as
+    /// a single token 0, matching the private `generate` loop: one
+    /// forward pass is still required to produce the logits the first
+    /// sampled token comes from.
+    tokens: Vec<usize>,
+    tokens_processed: usize,
+    logits: Vec<f32>,
+    chunk_size: usize,
+}
+
+impl PrefillState {
+    pub fn new(decoder: Arc<Decoder>, prompt_tokens: &[usize], chunk_size: usize) -> Self {
+        assert!(chunk_size > 0, "prefill chunk size must be positive");
+        let caches: Vec<KvCache> = decoder
+            .layers
+            .iter()
+            .map(|_| KvCache::new(decoder.config.n_kv_heads, decoder.config.head_dim))
+            .collect();
+        let tokens = if prompt_tokens.is_empty() {
+            vec![0]
+        } else {
+            prompt_tokens.to_vec()
+        };
+        PrefillState {
+            decoder,
+            caches,
+            tokens,
+            tokens_processed: 0,
+            logits: Vec::new(),
+            chunk_size,
+        }
+    }
+
+    /// Prompt tokens already through the model.
+    pub fn tokens_processed(&self) -> usize {
+        self.tokens_processed
+    }
+
+    /// Prompt tokens still to run.
+    pub fn tokens_remaining(&self) -> usize {
+        self.tokens.len() - self.tokens_processed
+    }
+
+    pub fn is_done(&self) -> bool {
+        self.tokens_remaining() == 0
+    }
+
+    /// Runs at most `chunk_size` further prompt tokens. Returns `true`
+    /// once the whole prompt has been processed. Calling it again after
+    /// that is a no-op that still returns `true`.
+    ///
+    /// The KV position of each token is its index in the prompt, so
+    /// resuming across chunk boundaries is exactly the sequential
+    /// `forward_token` loop it replaces, split at different points.
+    pub fn step_chunk(&mut self) -> bool {
+        let end = (self.tokens_processed + self.chunk_size).min(self.tokens.len());
+        for pos in self.tokens_processed..end {
+            self.logits = self
+                .decoder
+                .forward_token(self.tokens[pos], pos, &mut self.caches);
+        }
+        self.tokens_processed = end;
+        self.is_done()
+    }
+
+    /// Consumes a finished prefill into the pieces a decode row needs:
+    /// KV caches, the logits the first token is sampled from, and the
+    /// position the first generated token occupies.
+    fn into_decode_start(self) -> (Vec<KvCache>, Vec<f32>, usize) {
+        debug_assert!(self.is_done(), "prefill must finish before decoding");
+        (self.caches, self.logits, self.tokens_processed)
+    }
+}
 
 struct Job {
     prompt_tokens: Vec<usize>,
@@ -74,6 +235,7 @@ struct Slot {
 #[derive(Clone)]
 pub struct ContinuousBatcher {
     tx: Sender<Job>,
+    counters: Arc<Counters>,
 }
 
 struct WorkerGuard {
@@ -85,17 +247,40 @@ impl ContinuousBatcher {
     /// the worker's lifetime. Returns the shareable handle; the worker
     /// exits when the last `ContinuousBatcher` clone is dropped.
     pub fn spawn(decoder: Arc<Decoder>, decode: DecodeFn) -> Self {
+        Self::spawn_with_config(decoder, decode, BatcherConfig::from_env())
+    }
+
+    /// `spawn` with the scheduler knobs passed in rather than read from
+    /// the environment. Tests use this: two tests setting
+    /// `FERROX_CB_*` in one process would race each other.
+    pub fn spawn_with_config(
+        decoder: Arc<Decoder>,
+        decode: DecodeFn,
+        config: BatcherConfig,
+    ) -> Self {
         let (tx, rx) = mpsc::channel::<Job>();
+        let counters = Arc::new(Counters::default());
+        let worker_counters = Arc::clone(&counters);
         let _join = thread::Builder::new()
             .name("ferrox-continuous-batch".into())
-            .spawn(move || worker_loop(decoder, decode, rx))
+            .spawn(move || worker_loop(decoder, decode, rx, config, worker_counters))
             .expect("spawn continuous-batch worker");
         // Detach join handle intentionally: dropping the last Sender
         // closes `rx` and ends the loop. Keep a process-lifetime leak
         // of the JoinHandle via Box::leak so dropping batcher clones
         // does not join (callers may still be mid-generate).
         let _guard: &'static WorkerGuard = Box::leak(Box::new(WorkerGuard { _join }));
-        ContinuousBatcher { tx }
+        ContinuousBatcher { tx, counters }
+    }
+
+    /// Live scheduler counters. Cheap (three relaxed atomic loads) and
+    /// safe to call from any thread while the worker runs.
+    pub fn stats(&self) -> BatcherStats {
+        BatcherStats {
+            prefill_chunks: self.counters.prefill_chunks.load(Ordering::Relaxed),
+            prefill_tokens: self.counters.prefill_tokens.load(Ordering::Relaxed),
+            decode_steps: self.counters.decode_steps.load(Ordering::Relaxed),
+        }
     }
 
     /// Submit one generation job and block until it finishes. Safe to
@@ -120,63 +305,77 @@ impl ContinuousBatcher {
     }
 }
 
-fn max_concurrent_seqs() -> usize {
-    std::env::var("FERROX_CB_MAX_SEQS")
-        .ok()
-        .map(|v| {
-            v.parse()
-                .expect("FERROX_CB_MAX_SEQS must be a positive integer")
-        })
-        .unwrap_or(usize::MAX)
-}
-
+/// Accepts as many queued jobs as the in-flight cap allows, turning
+/// each into a waiting `Prefill`. The cap counts prompts that are still
+/// prefilling as well as rows already decoding: a prefilling prompt
+/// holds a full set of KV caches, so not counting it would let the
+/// worker exceed `max_seqs` by however many prompts happen to be in
+/// flight.
 fn drain_pending_jobs(
-    decoder: &Decoder,
+    decoder: &Arc<Decoder>,
     rx: &Receiver<Job>,
-    slots: &mut Vec<Slot>,
-    max_seqs: usize,
-) -> bool {
-    if slots.len() >= max_seqs {
-        return false;
-    }
-    let mut admitted = false;
-    while slots.len() < max_seqs {
+    prefills: &mut VecDeque<Prefill>,
+    decoding: usize,
+    config: &BatcherConfig,
+) {
+    while decoding + prefills.len() < config.max_seqs {
         match rx.try_recv() {
             Ok(job) => {
-                if let Some(slot) = admit(decoder, job) {
-                    slots.push(slot);
-                    admitted = true;
+                if let Some(prefill) = accept(decoder, job, config.prefill_chunk) {
+                    prefills.push_back(prefill);
                 }
             }
             Err(mpsc::TryRecvError::Empty) => break,
             Err(mpsc::TryRecvError::Disconnected) => break,
         }
     }
-    admitted
 }
 
-fn worker_loop(decoder: Arc<Decoder>, decode: DecodeFn, rx: Receiver<Job>) {
-    let max_seqs = max_concurrent_seqs();
+fn worker_loop(
+    decoder: Arc<Decoder>,
+    decode: DecodeFn,
+    rx: Receiver<Job>,
+    config: BatcherConfig,
+    counters: Arc<Counters>,
+) {
     let mut slots: Vec<Slot> = Vec::new();
+    let mut prefills: VecDeque<Prefill> = VecDeque::new();
     loop {
-        if slots.is_empty() {
+        // Only a completely idle worker blocks: with a prompt still
+        // chunking there is always work to do on the next tick.
+        if slots.is_empty() && prefills.is_empty() {
             match rx.recv() {
                 Ok(job) => {
-                    if let Some(slot) = admit(&decoder, job) {
-                        slots.push(slot);
+                    if let Some(prefill) = accept(&decoder, job, config.prefill_chunk) {
+                        prefills.push_back(prefill);
                     }
                 }
                 Err(_) => break,
             }
         }
-        let admitted_pending = drain_pending_jobs(&decoder, &rx, &mut slots, max_seqs);
-        if slots.is_empty() {
-            continue;
+        drain_pending_jobs(&decoder, &rx, &mut prefills, slots.len(), &config);
+
+        // One bounded prefill chunk per tick, round-robin across the
+        // waiting prompts. Round-robin rather than "finish the head
+        // first" so a long prompt cannot starve a short one behind it;
+        // one chunk rather than "advance every pending prefill" so N
+        // concurrent long prompts cost decode one chunk per tick, not N.
+        if let Some(mut prefill) = prefills.pop_front() {
+            let before = prefill.state.tokens_processed();
+            let done = prefill.state.step_chunk();
+            counters.prefill_chunks.fetch_add(1, Ordering::Relaxed);
+            counters.prefill_tokens.fetch_add(
+                (prefill.state.tokens_processed() - before) as u64,
+                Ordering::Relaxed,
+            );
+            if done {
+                slots.push(prefill.into_slot());
+            } else {
+                prefills.push_back(prefill);
+            }
         }
 
-        // Prefill-priority: defer one batched decode step when we just
-        // admitted queued work and every slot is still actively decoding.
-        if admitted_pending && slots.iter().all(|s| s.finish.is_none()) {
+        if slots.is_empty() {
             continue;
         }
 
@@ -228,6 +427,7 @@ fn worker_loop(decoder: Arc<Decoder>, decode: DecodeFn, rx: Receiver<Job>) {
                 .map(|&idx| std::mem::take(&mut slots[idx].caches))
                 .collect();
             let logits_batch = decoder.forward_multi_seq(&tokens, &positions, &mut cache_refs);
+            counters.decode_steps.fetch_add(1, Ordering::Relaxed);
             for (j, &idx) in active.iter().enumerate() {
                 slots[idx].caches = std::mem::take(&mut cache_refs[j]);
                 slots[idx].logits = logits_batch[j].clone();
@@ -268,7 +468,53 @@ fn apply_stop_buffer(slot: &mut Slot, piece: &str) -> bool {
     false
 }
 
-fn admit(decoder: &Decoder, job: Job) -> Option<Slot> {
+/// An accepted job whose prompt is still being prefilled: the
+/// resumable `PrefillState` plus everything the decode row will need
+/// once the prompt is through.
+struct Prefill {
+    state: PrefillState,
+    /// The *real* prompt length, for `Usage`. Deliberately not
+    /// `state.tokens.len()`, which is 1 for an empty prompt.
+    prompt_tokens: usize,
+    params: GenerationParams,
+    eos_id: Option<usize>,
+    reply: Sender<JobResult>,
+}
+
+impl Prefill {
+    fn into_slot(self) -> Slot {
+        let Prefill {
+            state,
+            prompt_tokens,
+            params,
+            eos_id,
+            reply,
+        } = self;
+        let (caches, logits, pos) = state.into_decode_start();
+        Slot {
+            caches,
+            pos,
+            logits,
+            sampler: Sampler::new(params.seed),
+            generated_ids: Vec::with_capacity(params.max_tokens),
+            visible: String::new(),
+            pending: String::new(),
+            prompt_tokens,
+            max_tokens: params.max_tokens,
+            eos_id,
+            params,
+            reply,
+            finish: None,
+        }
+    }
+}
+
+/// Validates a job and turns it into a waiting `Prefill`. No model work
+/// happens here -- every prompt token is run by `step_chunk` on the
+/// scheduler's own tick, which is the whole point of chunked prefill.
+/// Returns `None` (having replied with the error) for a prompt this
+/// model cannot accept at all.
+fn accept(decoder: &Arc<Decoder>, job: Job, chunk_size: usize) -> Option<Prefill> {
     let vocab_size = decoder.config.vocab_size;
     if let Some(&bad) = job.prompt_tokens.iter().find(|&&t| t >= vocab_size) {
         let _ = job.reply.send(Err(DecodeError::TokenOutOfVocab {
@@ -278,39 +524,12 @@ fn admit(decoder: &Decoder, job: Job) -> Option<Slot> {
         return None;
     }
 
-    let mut caches: Vec<KvCache> = decoder
-        .layers
-        .iter()
-        .map(|_| KvCache::new(decoder.config.n_kv_heads, decoder.config.head_dim))
-        .collect();
-    let mut pos = 0usize;
-    let logits = if job.prompt_tokens.is_empty() {
-        let l = decoder.forward_token(0, pos, &mut caches);
-        pos += 1;
-        l
-    } else {
-        let mut l = Vec::new();
-        for &tok in &job.prompt_tokens {
-            l = decoder.forward_token(tok, pos, &mut caches);
-            pos += 1;
-        }
-        l
-    };
-
-    Some(Slot {
-        caches,
-        pos,
-        logits,
-        sampler: Sampler::new(job.params.seed),
-        generated_ids: Vec::with_capacity(job.params.max_tokens),
-        visible: String::new(),
-        pending: String::new(),
+    Some(Prefill {
+        state: PrefillState::new(Arc::clone(decoder), &job.prompt_tokens, chunk_size),
         prompt_tokens: job.prompt_tokens.len(),
-        max_tokens: job.params.max_tokens,
-        eos_id: job.eos_id,
         params: job.params,
+        eos_id: job.eos_id,
         reply: job.reply,
-        finish: None,
     })
 }
 
@@ -412,7 +631,16 @@ mod tests {
             .map(|(p, par)| sequential_ids(&decoder, p, par))
             .collect();
 
-        let batcher = ContinuousBatcher::spawn(Arc::clone(&decoder), identity_decode());
+        let batcher = ContinuousBatcher::spawn_with_config(
+            Arc::clone(&decoder),
+            identity_decode(),
+            // Chunk 1: every prompt token is its own scheduling unit, the
+            // most aggressive split, and the sampled ids must not move.
+            BatcherConfig {
+                max_seqs: usize::MAX,
+                prefill_chunk: 1,
+            },
+        );
         let barrier = Arc::new(Barrier::new(3));
         let results = Arc::new(Mutex::new(vec![None, None]));
         let mut threads = Vec::new();
@@ -484,7 +712,14 @@ mod tests {
         let stop = full[2..4].to_string();
         params.stop = vec![stop.clone()];
 
-        let batcher = ContinuousBatcher::spawn(Arc::clone(&decoder), decode);
+        let batcher = ContinuousBatcher::spawn_with_config(
+            Arc::clone(&decoder),
+            decode,
+            BatcherConfig {
+                max_seqs: usize::MAX,
+                prefill_chunk: 2,
+            },
+        );
         let (finish, _ids, text, _usage) = batcher
             .generate(prompt, params, None)
             .expect("batch generate");
@@ -494,5 +729,199 @@ mod tests {
             "stop string must be trimmed from visible text: text={text:?} stop={stop:?}"
         );
         assert_eq!(&full[..full.find(&stop).unwrap()], text);
+    }
+    /// The state machine itself: each `step_chunk` is bounded by the
+    /// chunk size, is resumable, and reports done exactly once the
+    /// prompt is exhausted. This is the property the whole scheduler
+    /// rests on -- an unbounded prefill has no safe interleaving point.
+    #[test]
+    fn prefill_step_chunk_is_bounded_and_resumable() {
+        let decoder = tiny_decoder();
+        let prompt: Vec<usize> = (1..=7).collect();
+        let mut state = PrefillState::new(Arc::clone(&decoder), &prompt, 3);
+        assert_eq!(state.tokens_remaining(), 7);
+        assert_eq!(state.tokens_processed(), 0);
+
+        assert!(!state.step_chunk());
+        assert_eq!(state.tokens_processed(), 3, "a chunk may not overrun");
+        assert_eq!(state.tokens_remaining(), 4);
+
+        assert!(!state.step_chunk());
+        assert_eq!(state.tokens_processed(), 6);
+
+        assert!(state.step_chunk(), "final short chunk finishes the prompt");
+        assert_eq!(state.tokens_processed(), 7);
+        assert_eq!(state.tokens_remaining(), 0);
+        assert!(state.is_done());
+        assert!(state.step_chunk(), "stepping a finished prefill is a no-op");
+        assert_eq!(state.tokens_processed(), 7);
+    }
+
+    /// An empty prompt still needs one forward pass to have logits to
+    /// sample from -- the case the pre-chunking `admit` special-cased.
+    #[test]
+    fn empty_prompt_prefills_one_stand_in_token() {
+        let decoder = tiny_decoder();
+        let mut state = PrefillState::new(Arc::clone(&decoder), &[], 4);
+        assert_eq!(state.tokens_remaining(), 1);
+        assert!(state.step_chunk());
+        let (_caches, logits, pos) = state.into_decode_start();
+        assert_eq!(pos, 1);
+        assert_eq!(logits.len(), decoder.config.vocab_size);
+    }
+
+    /// Chunking is a scheduling boundary, not a numerical one: whatever
+    /// the chunk size, the prompt runs through the same `forward_token`
+    /// sequence at the same positions, so the logits are bit-identical
+    /// to the sequential prefill this replaced. If this ever fails,
+    /// every sampled token downstream is suspect.
+    #[test]
+    fn prefill_chunking_does_not_change_logits() {
+        let decoder = tiny_decoder();
+        let prompt: Vec<usize> = (0..11).map(|i| (i * 3 + 1) % 16).collect();
+
+        let mut sequential: Vec<f32> = Vec::new();
+        let mut caches: Vec<KvCache> = decoder
+            .layers
+            .iter()
+            .map(|_| KvCache::new(decoder.config.n_kv_heads, decoder.config.head_dim))
+            .collect();
+        for (pos, &tok) in prompt.iter().enumerate() {
+            sequential = decoder.forward_token(tok, pos, &mut caches);
+        }
+
+        for chunk in [1usize, 2, 5, 11, 64] {
+            let mut state = PrefillState::new(Arc::clone(&decoder), &prompt, chunk);
+            while !state.step_chunk() {}
+            let (_caches, logits, pos) = state.into_decode_start();
+            assert_eq!(pos, prompt.len());
+            assert_eq!(
+                logits, sequential,
+                "chunk size {chunk} changed the prefill logits"
+            );
+        }
+    }
+
+    /// The scheduling property chunking exists for, in two claims that
+    /// both fail under an unbounded prefill:
+    ///
+    /// 1. A long prompt is *observable in partial states* -- it is a
+    ///    sequence of bounded units, not one uninterruptible call. The
+    ///    pre-chunking scheduler ran the whole prompt inside `admit`,
+    ///    where `prefill_tokens` could only ever jump 0 -> len.
+    /// 2. Decode keeps stepping while those partial states go by. A
+    ///    prompt joining the batch costs an in-flight decode one chunk,
+    ///    not the whole prompt.
+    #[test]
+    fn long_prefill_does_not_freeze_an_in_flight_decode() {
+        let decoder = tiny_decoder();
+        let batcher = ContinuousBatcher::spawn_with_config(
+            Arc::clone(&decoder),
+            identity_decode(),
+            BatcherConfig {
+                max_seqs: usize::MAX,
+                prefill_chunk: 1,
+            },
+        );
+
+        // A long-running decode: enough tokens that it is still
+        // generating while the second job's prompt is chunked through.
+        let decode_job = {
+            let batcher = batcher.clone();
+            thread::spawn(move || batcher.generate(vec![1, 2], greedy_params(90, 5), None))
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while batcher.stats().decode_steps < 2 {
+            assert!(std::time::Instant::now() < deadline, "decode never started");
+            thread::yield_now();
+        }
+
+        let long_prompt: Vec<usize> = (0..40).map(|i| (i % 16) + 1).collect();
+        let total = long_prompt.len() as u64;
+        let prefill_at_submit = batcher.stats().prefill_tokens;
+        let prefill_job = {
+            let batcher = batcher.clone();
+            thread::spawn(move || batcher.generate(long_prompt, greedy_params(1, 9), None))
+        };
+
+        // Claim 1: catch the long prompt mid-prefill. An unbounded
+        // prefill is never observable here -- it goes straight to done.
+        let decode_before = loop {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "never observed the long prompt mid-prefill"
+            );
+            let st = batcher.stats();
+            let progressed = st.prefill_tokens - prefill_at_submit;
+            assert!(
+                progressed < total,
+                "the whole prompt was prefilled without ever being observed \
+                 partially done: prefill ran as one unbounded unit of work"
+            );
+            if progressed > 0 {
+                break st.decode_steps;
+            }
+            thread::yield_now();
+        };
+
+        // Claim 2: decode advances before that prefill finishes.
+        loop {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "decode stalled while a long prompt prefilled"
+            );
+            let st = batcher.stats();
+            if st.decode_steps > decode_before {
+                break;
+            }
+            assert!(
+                st.prefill_tokens - prefill_at_submit < total,
+                "the prompt finished prefilling before the in-flight decode \
+                 took a single step: prefill froze decode"
+            );
+            thread::yield_now();
+        }
+
+        let (_finish, ids, _text, _usage) = prefill_job.join().unwrap().expect("prefill job");
+        assert_eq!(ids.len(), 1);
+        let (_finish, ids, _text, _usage) = decode_job.join().unwrap().expect("decode job");
+        assert_eq!(ids.len(), 90);
+    }
+
+    /// The in-flight cap counts prompts that are still prefilling, not
+    /// just rows already decoding -- a prefilling prompt holds a full
+    /// set of KV caches. Two jobs under `max_seqs: 1` must both still
+    /// complete correctly (the second waits in the channel).
+    #[test]
+    fn max_seqs_cap_counts_prefilling_prompts_and_still_serves_both() {
+        let decoder = tiny_decoder();
+        let batcher = ContinuousBatcher::spawn_with_config(
+            Arc::clone(&decoder),
+            identity_decode(),
+            BatcherConfig {
+                max_seqs: 1,
+                prefill_chunk: 1,
+            },
+        );
+        let expected: Vec<Vec<usize>> = [(vec![1usize, 2, 3], 6u64), (vec![4usize, 5], 6)]
+            .iter()
+            .map(|(p, seed)| sequential_ids(&decoder, p, &greedy_params(6, *seed)))
+            .collect();
+
+        let handles: Vec<_> = [(vec![1usize, 2, 3], 6u64), (vec![4usize, 5], 6)]
+            .into_iter()
+            .map(|(prompt, seed)| {
+                let batcher = batcher.clone();
+                thread::spawn(move || {
+                    batcher
+                        .generate(prompt, greedy_params(6, seed), None)
+                        .expect("generate")
+                        .1
+                })
+            })
+            .collect();
+        let got: Vec<Vec<usize>> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        assert_eq!(got[0], expected[0]);
+        assert_eq!(got[1], expected[1]);
     }
 }

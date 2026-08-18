@@ -1479,6 +1479,30 @@ async fn metrics(State(state): State<Arc<AppState>>) -> Response {
         None => body,
     };
 
+    // Scheduler counters, present only under continuous batching
+    // (FERROX_CONTINUOUS_BATCHING=1). `prefill_chunks` next to
+    // `prefill_tokens` is what makes chunked prefill observable: their
+    // ratio is the effective chunk size the worker actually ran.
+    let body = match active.as_ref().and_then(|a| a.batcher.as_ref()) {
+        Some(batcher) => {
+            let sched = batcher.stats();
+            format!(
+                "{body}\
+                 # HELP ferrox_prefill_chunks_total Bounded prefill chunks the batch scheduler has run.\n\
+                 # TYPE ferrox_prefill_chunks_total counter\n\
+                 ferrox_prefill_chunks_total {}\n\
+                 # HELP ferrox_prefill_tokens_total Prompt tokens run through chunked prefill.\n\
+                 # TYPE ferrox_prefill_tokens_total counter\n\
+                 ferrox_prefill_tokens_total {}\n\
+                 # HELP ferrox_decode_steps_total Batched decode steps the batch scheduler has run.\n\
+                 # TYPE ferrox_decode_steps_total counter\n\
+                 ferrox_decode_steps_total {}\n",
+                sched.prefill_chunks, sched.prefill_tokens, sched.decode_steps,
+            )
+        }
+        None => body,
+    };
+
     (
         [(
             axum::http::header::CONTENT_TYPE,

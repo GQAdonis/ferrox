@@ -270,6 +270,15 @@ rejections), `/v1/completions` and `/v1/messages`. Not yet recorded for
 Set `FERROX_CONTINUOUS_BATCHING=1`. Mutually exclusive with
 `FERROX_KV_POOL_BLOCKS` and `FERROX_PREFIX_CACHE_ENTRIES`.
 
+Prefill is chunked: the scheduler runs one bounded prefill chunk
+(`FERROX_CB_PREFILL_CHUNK`, default 128 tokens, round-robin across
+waiting prompts) plus one batched decode step per tick, so a long prompt
+joining the batch costs an in-flight decode one chunk rather than the
+whole prompt. `FERROX_CB_MAX_SEQS` caps in-flight sequences, counting
+prompts still prefilling. `GET /metrics` reports
+`ferrox_prefill_chunks_total`, `ferrox_prefill_tokens_total` and
+`ferrox_decode_steps_total` while a batcher is active.
+
 ## MCP
 
 `--mcp-config PATH` loads server metadata under `ferrox_mcp` in

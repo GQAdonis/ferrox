@@ -25,6 +25,23 @@
 //! positions, so chunk size never changes the logits or the sampled
 //! tokens (asserted by `prefill_chunking_does_not_change_logits`).
 //!
+//! **Keyed row state.** In-flight rows live in a `HashMap<Uid, Slot>`
+//! with a separate admission-ordered `Vec<Uid>`, never in a `Vec<Slot>`
+//! addressed by batch position. Batch membership changes on almost
+//! every tick -- a row finishes on EOS, on a stop string, on its token
+//! budget -- and a positional table renumbers its survivors when that
+//! happens (`swap_remove` moves the last row into the removed slot). A
+//! `Uid` captured before a removal still names its own row afterwards,
+//! or nothing at all; a batch index captured before a removal quietly
+//! names a *different request*, whose sampler, stop strings and reply
+//! channel are not the ones the caller asked for. That is the bug class
+//! oMLX had to monkey-patch around, and it is silent: no panic, no
+//! error, just the wrong constraints applied to the wrong row.
+//!
+//! Per-request sampler state (`Slot::sampler`, seeded per request) lives
+//! in the row for the same reason -- a shared or global RNG would make
+//! one request's output depend on how many others were in flight.
+//!
 //! **Knobs.** `FERROX_CB_MAX_SEQS`: cap on concurrent in-flight
 //! sequences, counting prompts still prefilling (default: unlimited).
 //! At the cap, new jobs stay queued in the channel until a slot frees;
@@ -32,7 +49,7 @@
 //! `FERROX_CB_PREFILL_CHUNK`: prompt tokens per prefill chunk (default
 //! [`DEFAULT_PREFILL_CHUNK`]).
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
@@ -211,6 +228,88 @@ struct Job {
     reply: Sender<JobResult>,
 }
 
+/// Stable identity for one in-flight request, handed out once at
+/// admission and never reused. Unlike a batch index it does not move
+/// when another row leaves the batch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+struct Uid(u64);
+
+/// The in-flight rows: state keyed by [`Uid`], plus the admission order
+/// the batch is built in. Removing a row cannot renumber another one --
+/// see the keyed-row-state note in the module docs for what that
+/// prevents.
+#[derive(Default)]
+struct Rows {
+    state: HashMap<Uid, Slot>,
+    /// Admission order. Kept explicit so batch composition is
+    /// deterministic; `HashMap` iteration order is not.
+    order: Vec<Uid>,
+    next_uid: u64,
+}
+
+impl Rows {
+    fn insert(&mut self, slot: Slot) -> Uid {
+        let uid = Uid(self.next_uid);
+        self.next_uid += 1;
+        self.state.insert(uid, slot);
+        self.order.push(uid);
+        uid
+    }
+
+    fn len(&self) -> usize {
+        self.order.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.order.is_empty()
+    }
+
+    /// `None` for a uid that has already left the batch. A stale uid
+    /// resolves to nothing -- never to whichever row happens to sit
+    /// where it used to.
+    fn get(&self, uid: Uid) -> Option<&Slot> {
+        self.state.get(&uid)
+    }
+
+    fn get_mut(&mut self, uid: Uid) -> Option<&mut Slot> {
+        self.state.get_mut(&uid)
+    }
+
+    fn remove(&mut self, uid: Uid) -> Option<Slot> {
+        self.order.retain(|&u| u != uid);
+        self.state.remove(&uid)
+    }
+
+    /// Rows that should take a decode step this tick, in admission
+    /// order.
+    fn ready(&self) -> Vec<Uid> {
+        self.order
+            .iter()
+            .copied()
+            .filter(|uid| {
+                self.state
+                    .get(uid)
+                    .is_some_and(|s| s.finish.is_none() && s.generated_ids.len() < s.max_tokens)
+            })
+            .collect()
+    }
+
+    /// Replies to and removes every row that has finished.
+    fn flush_finished(&mut self) {
+        let finished: Vec<Uid> = self
+            .order
+            .iter()
+            .copied()
+            .filter(|uid| self.state.get(uid).is_some_and(|s| s.finish.is_some()))
+            .collect();
+        for uid in finished {
+            if let Some(slot) = self.remove(uid) {
+                reply_finished(slot);
+            }
+        }
+    }
+}
+
 struct Slot {
     caches: Vec<KvCache>,
     pos: usize,
@@ -338,12 +437,12 @@ fn worker_loop(
     config: BatcherConfig,
     counters: Arc<Counters>,
 ) {
-    let mut slots: Vec<Slot> = Vec::new();
+    let mut rows = Rows::default();
     let mut prefills: VecDeque<Prefill> = VecDeque::new();
     loop {
         // Only a completely idle worker blocks: with a prompt still
         // chunking there is always work to do on the next tick.
-        if slots.is_empty() && prefills.is_empty() {
+        if rows.is_empty() && prefills.is_empty() {
             match rx.recv() {
                 Ok(job) => {
                     if let Some(prefill) = accept(&decoder, job, config.prefill_chunk) {
@@ -353,7 +452,7 @@ fn worker_loop(
                 Err(_) => break,
             }
         }
-        drain_pending_jobs(&decoder, &rx, &mut prefills, slots.len(), &config);
+        drain_pending_jobs(&decoder, &rx, &mut prefills, rows.len(), &config);
 
         // One bounded prefill chunk per tick, round-robin across the
         // waiting prompts. Round-robin rather than "finish the head
@@ -369,76 +468,78 @@ fn worker_loop(
                 Ordering::Relaxed,
             );
             if done {
-                slots.push(prefill.into_slot());
+                rows.insert(prefill.into_slot());
             } else {
                 prefills.push_back(prefill);
             }
         }
 
-        if slots.is_empty() {
+        if rows.is_empty() {
             continue;
         }
 
-        let mut step_indices: Vec<usize> = Vec::new();
-        for (i, slot) in slots.iter().enumerate() {
-            if slot.finish.is_none() && slot.generated_ids.len() < slot.max_tokens {
-                step_indices.push(i);
-            }
-        }
-
-        if step_indices.is_empty() {
-            flush_finished(&mut slots);
+        let ready = rows.ready();
+        if ready.is_empty() {
+            rows.flush_finished();
             continue;
         }
 
-        let mut drop_mask = vec![false; step_indices.len()];
-        for (si, &idx) in step_indices.iter().enumerate() {
-            let slot = &mut slots[idx];
+        // Sample one token per ready row. A row that finishes here (EOS
+        // or a stop match) simply does not join `active`.
+        let mut active: Vec<Uid> = Vec::with_capacity(ready.len());
+        for uid in ready {
+            let Some(slot) = rows.get_mut(uid) else {
+                continue;
+            };
             let next =
                 slot.sampler
                     .sample(&slot.logits, &slot.params.sampling, &slot.generated_ids);
             if Some(next) == slot.eos_id {
                 slot.finish = Some(FinishReason::Stop);
-                drop_mask[si] = true;
                 continue;
             }
             slot.generated_ids.push(next);
             let piece = decode(&[next]);
             if apply_stop_buffer(slot, &piece) {
-                drop_mask[si] = true;
+                continue;
             }
+            active.push(uid);
         }
 
-        let active: Vec<usize> = step_indices
-            .iter()
-            .enumerate()
-            .filter(|(si, _)| !drop_mask[*si])
-            .map(|(_, &idx)| idx)
-            .collect();
-
         if !active.is_empty() {
+            // `active[j]` names the row that owns `logits_batch[j]`.
+            // The kernel takes slices, so the batch itself is
+            // positional -- but the position maps to a *uid*, so the
+            // scatter below cannot land on the wrong request even if
+            // the table changes shape between steps.
             let tokens: Vec<usize> = active
                 .iter()
-                .map(|&idx| *slots[idx].generated_ids.last().unwrap())
+                .map(|&uid| *rows.get(uid).unwrap().generated_ids.last().unwrap())
                 .collect();
-            let positions: Vec<usize> = active.iter().map(|&idx| slots[idx].pos).collect();
+            let positions: Vec<usize> = active
+                .iter()
+                .map(|&uid| rows.get(uid).unwrap().pos)
+                .collect();
             let mut cache_refs: Vec<Vec<KvCache>> = active
                 .iter()
-                .map(|&idx| std::mem::take(&mut slots[idx].caches))
+                .map(|&uid| std::mem::take(&mut rows.get_mut(uid).unwrap().caches))
                 .collect();
             let logits_batch = decoder.forward_multi_seq(&tokens, &positions, &mut cache_refs);
             counters.decode_steps.fetch_add(1, Ordering::Relaxed);
-            for (j, &idx) in active.iter().enumerate() {
-                slots[idx].caches = std::mem::take(&mut cache_refs[j]);
-                slots[idx].logits = logits_batch[j].clone();
-                slots[idx].pos += 1;
-                if slots[idx].generated_ids.len() >= slots[idx].max_tokens {
-                    slots[idx].finish = Some(FinishReason::Length);
+            for (j, &uid) in active.iter().enumerate() {
+                let slot = rows
+                    .get_mut(uid)
+                    .expect("an active row cannot vanish mid-step");
+                slot.caches = std::mem::take(&mut cache_refs[j]);
+                slot.logits = logits_batch[j].clone();
+                slot.pos += 1;
+                if slot.generated_ids.len() >= slot.max_tokens {
+                    slot.finish = Some(FinishReason::Length);
                 }
             }
         }
 
-        flush_finished(&mut slots);
+        rows.flush_finished();
     }
 }
 
@@ -533,24 +634,19 @@ fn accept(decoder: &Arc<Decoder>, job: Job, chunk_size: usize) -> Option<Prefill
     })
 }
 
-fn flush_finished(slots: &mut Vec<Slot>) {
-    let mut i = 0;
-    while i < slots.len() {
-        if slots[i].finish.is_some() {
-            let mut slot = slots.swap_remove(i);
-            let finish = slot.finish.unwrap();
-            if !slot.pending.is_empty() {
-                slot.visible.push_str(&slot.pending);
-                slot.pending.clear();
-            }
-            let usage = Usage::new(slot.prompt_tokens, slot.generated_ids.len());
-            let _ = slot
-                .reply
-                .send(Ok((finish, slot.generated_ids, slot.visible, usage)));
-        } else {
-            i += 1;
-        }
+/// Sends one finished row's result to its own waiting caller. Takes the
+/// `Slot` by value, so a row's reply channel travels with its state and
+/// cannot be paired with another row's output.
+fn reply_finished(mut slot: Slot) {
+    let finish = slot.finish.expect("only a finished row is replied to");
+    if !slot.pending.is_empty() {
+        slot.visible.push_str(&slot.pending);
+        slot.pending.clear();
     }
+    let usage = Usage::new(slot.prompt_tokens, slot.generated_ids.len());
+    let _ = slot
+        .reply
+        .send(Ok((finish, slot.generated_ids, slot.visible, usage)));
 }
 
 #[cfg(test)]
@@ -923,5 +1019,180 @@ mod tests {
         let got: Vec<Vec<usize>> = handles.into_iter().map(|h| h.join().unwrap()).collect();
         assert_eq!(got[0], expected[0]);
         assert_eq!(got[1], expected[1]);
+    }
+    fn test_slot(max_tokens: usize, seed: u64) -> (Slot, mpsc::Receiver<JobResult>) {
+        let (tx, rx) = mpsc::channel();
+        let params = greedy_params(max_tokens, seed);
+        (
+            Slot {
+                caches: Vec::new(),
+                pos: 0,
+                logits: Vec::new(),
+                sampler: Sampler::new(seed),
+                generated_ids: Vec::new(),
+                visible: String::new(),
+                pending: String::new(),
+                prompt_tokens: 0,
+                max_tokens,
+                eos_id: None,
+                params,
+                reply: tx,
+                finish: None,
+            },
+            rx,
+        )
+    }
+
+    /// The invariant behind keying rows by uid: a row leaving the batch
+    /// must not renumber the rows that stay. A stale id resolves to
+    /// nothing; a live id still resolves to its *own* state.
+    #[test]
+    fn removing_a_row_never_reassigns_another_rows_state() {
+        let mut rows = Rows::default();
+        let (a, _ra) = test_slot(3, 11);
+        let (b, _rb) = test_slot(5, 22);
+        let (c, _rc) = test_slot(7, 33);
+        let a = rows.insert(a);
+        let b = rows.insert(b);
+        let c = rows.insert(c);
+        assert_eq!(rows.order, vec![a, b, c]);
+
+        let removed = rows.remove(b).expect("b was present");
+        assert_eq!(removed.max_tokens, 5);
+
+        assert!(
+            rows.get(b).is_none(),
+            "a stale uid must resolve to nothing, never to another request's row"
+        );
+        assert_eq!(rows.get(a).expect("a still in flight").max_tokens, 3);
+        assert_eq!(
+            rows.get(c).expect("c still in flight").max_tokens,
+            7,
+            "c must still be c after b left"
+        );
+        assert_eq!(rows.order, vec![a, c], "admission order is preserved");
+        assert_eq!(rows.len(), 2);
+
+        // The positional equivalent, spelled out: `swap_remove` moves
+        // the last row into the removed slot, so an index captured for
+        // C before the removal now addresses B's old position -- or
+        // nothing. Same removal, silently wrong answer.
+        let mut positional = vec![3usize, 5, 7];
+        let c_index = 2;
+        positional.swap_remove(1);
+        assert_eq!(positional[1], 7, "C moved into B's index");
+        assert!(
+            positional.get(c_index).is_none(),
+            "C's index now names nothing"
+        );
+    }
+
+    /// A new row joining the table must not disturb the rows already in
+    /// it, and uids are never reused -- so a reply channel and a
+    /// sampler always travel with the request that owns them.
+    #[test]
+    fn uids_are_unique_and_insertion_does_not_disturb_existing_rows() {
+        let mut rows = Rows::default();
+        let (a, _ra) = test_slot(3, 11);
+        let a = rows.insert(a);
+        let (b, _rb) = test_slot(5, 22);
+        let b = rows.insert(b);
+        rows.remove(a);
+        let (c, _rc) = test_slot(7, 33);
+        let c = rows.insert(c);
+        assert_ne!(c, a, "a uid is never reused after its row leaves");
+        assert_ne!(c, b);
+        assert_eq!(rows.get(b).expect("b untouched").max_tokens, 5);
+        assert_eq!(rows.get(c).expect("c inserted").max_tokens, 7);
+    }
+
+    /// `ready` skips finished rows, and `flush_finished` replies to and
+    /// removes exactly those -- each on its own channel.
+    #[test]
+    fn flush_replies_on_each_rows_own_channel() {
+        let mut rows = Rows::default();
+        let (a, ra) = test_slot(3, 11);
+        let (mut b, rb) = test_slot(5, 22);
+        b.finish = Some(FinishReason::Stop);
+        b.visible.push_str("bee");
+        b.generated_ids.push(7);
+        let a = rows.insert(a);
+        let b = rows.insert(b);
+        let (c, _rc) = test_slot(7, 33);
+        let c = rows.insert(c);
+
+        assert_eq!(rows.ready(), vec![a, c], "a finished row takes no step");
+        rows.flush_finished();
+        assert!(rows.get(b).is_none());
+        assert_eq!(rows.order, vec![a, c]);
+
+        let (finish, ids, text, usage) =
+            rb.try_recv().expect("b's caller got a reply").expect("ok");
+        assert_eq!(finish, FinishReason::Stop);
+        assert_eq!(ids, vec![7]);
+        assert_eq!(text, "bee");
+        assert_eq!(usage.completion_tokens, 1);
+        assert!(
+            ra.try_recv().is_err(),
+            "an unfinished row's caller must not be replied to"
+        );
+    }
+
+    /// End to end, with the batch mutation that renumbers a positional
+    /// table: three concurrent rows, one of which trips a stop sequence
+    /// mid-batch and leaves while the other two keep decoding. In that
+    /// tick the batch is narrower than the row table, which is exactly
+    /// when a batch index stops meaning what a row id means. Each
+    /// caller must still get its own output.
+    #[test]
+    fn a_row_leaving_mid_batch_does_not_shift_its_neighbours_output() {
+        let decoder = tiny_decoder();
+        let prompts = [vec![1usize, 2, 3], vec![4usize, 5], vec![6usize]];
+        let budgets = [25usize, 25, 20];
+        let refs: Vec<Vec<usize>> = prompts
+            .iter()
+            .zip(budgets.iter())
+            .map(|(p, &n)| sequential_ids(&decoder, p, &greedy_params(n, 4)))
+            .collect();
+
+        // The middle row stops on a two-character run from its own
+        // stream, so it leaves the batch while its neighbours decode on.
+        let letter = |id: &usize| char::from_u32(65 + (*id as u32 % 26)).unwrap_or('?');
+        let middle_text: String = refs[1].iter().map(letter).collect();
+        assert!(middle_text.len() >= 4);
+        let stop = middle_text[2..4].to_string();
+
+        let batcher = ContinuousBatcher::spawn_with_config(
+            Arc::clone(&decoder),
+            identity_decode(),
+            BatcherConfig {
+                max_seqs: usize::MAX,
+                prefill_chunk: 1,
+            },
+        );
+        let barrier = Arc::new(Barrier::new(prompts.len()));
+        let handles: Vec<_> = (0..prompts.len())
+            .map(|i| {
+                let batcher = batcher.clone();
+                let barrier = Arc::clone(&barrier);
+                let prompt = prompts[i].clone();
+                let mut params = greedy_params(budgets[i], 4);
+                if i == 1 {
+                    params.stop = vec![stop.clone()];
+                }
+                thread::spawn(move || {
+                    barrier.wait();
+                    batcher.generate(prompt, params, None).expect("generate").1
+                })
+            })
+            .collect();
+        let got: Vec<Vec<usize>> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+
+        assert_eq!(got[0], refs[0], "row 0 received another row's output");
+        assert_eq!(got[2], refs[2], "row 2 received another row's output");
+        assert!(
+            got[1].len() < refs[1].len() && refs[1].starts_with(&got[1]),
+            "the stopped row must be a strict prefix of its own stream"
+        );
     }
 }

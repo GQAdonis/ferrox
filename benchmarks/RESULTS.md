@@ -39,7 +39,6 @@ gap first**. Regenerate with `ferrox bench --suite` / `--render`.
 
 **Largest engine prefill gaps (pp\*, gap > 1.05×):**
 
-- `OLMoE-1B-7B-0924 Q4_0` / metal / pp512: 🔴 **2.62×**
 - `Gemma-3-1B-IT Q8_0` / cpu / pp512: 🔴 **1.65×**
 - `SmolLM2-135M-Instruct Q8_0` / cpu / pp512: 🔴 **1.50×**
 - `OLMoE-1B-7B-0924 Q4_0` / cpu / pp512: 🔴 **1.38×**
@@ -47,14 +46,15 @@ gap first**. Regenerate with `ferrox bench --suite` / `--render`.
 - `Gemma-3-1B-IT Q8_0` / metal / pp512: 🔴 **1.18×**
 - `Qwen2.5-0.5B-Instruct Q8_0` / cpu / pp512: 🔴 **1.18×**
 - `Qwen2.5-0.5B-Instruct Q8_0` / metal / pp512: 🔴 **1.11×**
+- `Qwen3-0.6B Q8_0` / cpu / pp512: 🔴 **1.11×**
 
 ### Metal
 
 | Model | Test | ferrox tok/s | llama.cpp tok/s | Gap |
 |---|---|---|---|---|
-| OLMoE-1B-7B-0924 Q4_0 | pp512 | **587.49** | **1538.37** | 🔴 **2.62×** |
 | Gemma-3-1B-IT Q8_0 | pp512 | **2363.87** | **2786.02** | 🔴 **1.18×** |
 | Qwen2.5-0.5B-Instruct Q8_0 | pp512 | **4387.59** | **4864.48** | 🔴 **1.11×** |
+| OLMoE-1B-7B-0924 Q4_0 | pp512 | **1402.38** | **1552.23** | 🔴 **1.11×** |
 | Llama-3.2-1B-Instruct IQ4_XS | pp512 | **1759.20** | **1907.49** | 🔴 **1.08×** |
 | Llama-3.2-1B-Instruct Q4_K_M | pp512 | **1771.25** | **1893.38** | 🔴 **1.07×** |
 | Mistral-7B-Instruct-v0.2 Q4_K_M | pp512 | **266.56** | **279.91** | 🔴 **1.05×** |
@@ -64,7 +64,7 @@ gap first**. Regenerate with `ferrox bench --suite` / `--render`.
 | SmolLM2-135M-Instruct Q8_0 | pp512 | **11848.69** | **12234.55** | ⚪ **1.03×** |
 | TinyLlama-1.1B-Chat-v1.0 Q8_0 | pp512 | **1996.04** | **2034.84** | ⚪ **1.02×** |
 | Gemma-4-E2B-IT Q4_K_M | pp512 | **13.48** | — | — |
-| OLMoE-1B-7B-0924 Q4_0 | tg128 | **111.65** | **157.82** | 🔴 **1.41×** |
+| OLMoE-1B-7B-0924 Q4_0 | tg128 | **116.17** | **164.23** | 🔴 **1.41×** |
 | Llama-3.2-1B-Instruct Q4_K_M | tg128 | **149.43** | **149.61** | ⚪ **1.00×** |
 | Mistral-7B-Instruct-v0.2 Q4_K_M | tg128 | **32.57** | **32.47** | ⚪ **1.00×** |
 | Phi-4-mini-Instruct Q4_K_M | tg128 | **51.29** | **50.29** | ⚪ **0.98×** |

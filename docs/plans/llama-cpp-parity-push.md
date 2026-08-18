@@ -18,7 +18,7 @@ todos:
     content: "De-nest activation quantization (serial internals, parallelize once at apply_batch over row-quads into one wdata buffer); share one quant pass across q/k/v and gate/up"
     status: pending
   - id: cpu-decode-scaling
-    content: "CPU tg128 is the widest axis left (8 red rows, SmolLM2 2.44x, and the only axis with nothing at parity). Cause is measured: fork-join scaling, not per-thread throughput. Retry the persistent pool with the wf/cpu-threadpool deadlock understood first (FERROX_CPU_THREADS=1 + rayon nesting)"
+    content: "CPU tg128 is the widest axis left (8 red rows, SmolLM2 2.44x, and the only axis with nothing at parity). Cause is measured: fork-join scaling, not per-thread throughput. IMPLEMENTED ON wf/cpu-pool-retry (e2bf801, NOT merged): pool retried with try_lock, poison-as-ownership, and one-runtime-per-thread; the hang ships as a regression test. NOT MERGED ON PURPOSE — the perf thesis is still unmeasured, which is half of why the first attempt was rejected. Every A/B window this session was eaten by concurrent builds (host load 3-30 against a 2.0 bar); the one partial reading taken under load showed dense +7% and OLMoE -21%, and the -21% is what motivated the one-runtime-per-thread rule, so it must be re-taken after that rule, not before. Merge only behind a quiet-host A/B on TinyLlama + OLMoE + Qwen2.5. DEADLOCK UNDERSTOOD (2026-08-14, reproduced + sampled on the branch): pool worker blocked in a rayon latch (a pool task called rayon) -> rayon workers blocked on the pool submit mutex -> submitter holding it, spinning for done. Coexistence of two runtimes with a blocking lock between them, NOT the memory ordering the module argued about, and NOT specific to FERROX_CPU_THREADS=1. Retry rules in the body: try_lock never block, leaf-only tasks, flatten apply_three / run_expert / the MoE par_iter into one region, ship the hang as a test"
     status: pending
   - id: cpu-prefill-attn-block
     content: "Block prefill attention: QK^T tile GEMM + vectorized softmax + V GEMM, replacing the per-KV-position online_attn_accumulate with 2 scalar expf per position"
@@ -39,8 +39,11 @@ todos:
     content: "PAID (cb27b24, 2026-08-13, started at load 1.95): d=128 MMA published. Qwen3-0.6B 1.81->1.03x, Phi-4-mini 1.24->1.04x, Llama-3.2-3B 1.08->1.04x, Mistral-7B 1.10->1.05x. 25 red rows -> 21"
     status: completed
   - id: metal-moe-stack
-    content: "Worst row on any backend: OLMoE metal pp512 2.62x (was 2.48x — ferrox 626->587, a real -6% inside host spread), and it owns the last Metal tg128 red row too (1.41x). Move MoE layers onto the fused prefill stack: MoE PrefillDenseLayerMetal variant, GPU router+top-k, wire the already-written-but-uncalled encode_moe_mm_id_map0. Kills ~112 command buffers per pp512"
-    status: pending
+    content: "Worst row on any backend: OLMoE metal pp512 2.62x (was 2.48x — ferrox 626->587, a real -6% inside host spread), and it owns the last Metal tg128 red row too (1.41x). Move MoE layers onto the fused prefill stack: MoE PrefillDenseLayerMetal variant, GPU router+top-k, wire the already-written-but-uncalled encode_moe_mm_id_map0. Kills ~112 command buffers per pp512. LANDED (ee35372): PrefillFfnMetal enum (Dense | Moe), new moe_router_mm_f32 + moe_topk_softmax_batch kernels, map0 + mul_mm_id_f16 now on the hot path. Interleaved A/B pp512 1412/1398/1417 vs 711/724/715 = 1.98x; tg128 unchanged (decode never took this path); verify cpu-vs-metal identical with prefill covered, stack on and off"
+    status: completed
+  - id: suite-owed-moe-stack
+    content: "PAID (2026-08-14, started at load 1.82): re-ran --suite --id olmoe_q4 --backend metal, the only ledger row metal-moe-stack can move. OLMoE metal pp512 587.49 -> 1402.38, gap 2.62x -> 1.11x against llama 1552.23 measured in the same session. tg128 116.17 (gap 1.41x) unchanged, as predicted — decode never took this path. RESULTS.md re-rendered from the new receipt; no other row was re-measured, so no other row moved"
+    status: completed
   - id: metal-barrier-ranges
     content: "Replace 15 blanket per-layer buffer barriers with llama's mem-range overlap tracker; fuse rmsnorm+f32->f16 and silu_mul+f32->f16"
     status: pending
@@ -69,19 +72,25 @@ todos:
     content: "Per-layer divergence comparator (per-head magnitude-ratio std, not mean) + MoE routing dumps, env-gated. Prerequisite for diagnosing MoE and the CPU/Metal divergence above"
     status: pending
   - id: coverage-fail-closed
-    content: "BLOCKING CORRECTNESS: ~50 archs are admitted to the generic GQA path and emit wrong logits instead of refusing. Gate on required graph features; refuse what is not implemented"
+    content: "BLOCKING CORRECTNESS: ~50 archs are admitted to the generic GQA path and emit wrong logits instead of refusing. Gate on required graph features; refuse what is not implemented. LANDED (c3db570) as a tensor-consumption gate rather than a feature list: ShardedGguf records every tensor name a loader looks up and the load refuses on leftovers, which catches gpt-oss attn_sinks and ffn_exp_probs_b by construction instead of by enumeration. Refused exactly 1 of the 13 local GGUFs — Phi-4-mini, correctly: partial rotary, LongRoPE factor sets, and rope.scaling.attn_factor were all unimplemented and are now implemented on CPU"
+    status: completed
+  - id: coverage-phi-metal-rope
+    content: "Phi-4-mini is CPU-only as of c3db570: the Metal RoPE kernels rotate the whole head and take no magnitude uniform, so partial rotary (n_rot < head_dim) and LongRoPE mscale cannot run there and the model is refused the Metal path rather than allowed to disagree with CPU. Needs a rot_dim uniform on rope_norm/rope_neox plus an mscale hook (AttnExtras is the natural place — it already carries QKV bias and QK-norm). Its published Metal pp512/tg128 rows were taken on the wrong graph and must be re-measured after, not before"
+    status: pending
+  - id: tooling-answer-parity-instrument
+    content: "There is NO instrument for answer parity against llama.cpp — `ferrox verify` compares ferrox-CPU against ferrox-Metal only. Attempting a greedy-text comparison showed why one is needed and why text is the wrong medium: ferrox and llama diverge after ~3 tokens on TinyLlama Q8_0 with matched tokenization (6 tokens both sides) and no exotic features, i.e. ordinary numeric drift flips one token and everything after it. Build a first-token top-k / logit-KL comparator instead, which is what quality-gates' 'answers match llama' clause actually requires"
     status: pending
   - id: coverage-f16
     content: "F16 tensors did not load at all (GgmlType::F16 parsed and sized, no dequant arm anywhere). dequant_f16 + shared widen_plain_float across all 7 loaders. Landed 7ef74f1"
     status: completed
   - id: coverage-iq-tiers-published
-    content: "SUPPORT, highest coverage priority: ggml tags 17/21/22/29 (IQ2_XS, IQ3_S, IQ2_S, IQ1_M) fall to GgmlType::Other in ferrox-gguf, so 5 of the 16 published Unsloth UD-* variants cannot be decoded. IQ3_S is worst — it appears inside IQ3_M mixes and the low-bit UD recipes docs/MODELS.md already targets"
-    status: pending
+    content: "SUPPORT, highest coverage priority: ggml tags 17/21/22/29 (IQ2_XS, IQ3_S, IQ2_S, IQ1_M) fall to GgmlType::Other in ferrox-gguf, so 5 of the 16 published Unsloth UD-* variants cannot be decoded. IQ3_S is worst — it appears inside IQ3_M mixes and the low-bit UD recipes docs/MODELS.md already targets. LANDED: all four decode on CPU (scalar, matching the sibling IQ formats' state — no NEON/GPU), wired through QuantKind + all six loader tables + dequant_any. Validated by linking llama.cpp's ggml-quants.c and asserting BIT-EXACT equality with dequantize_row_iq2_xs/_iq2_s/_iq3_s/_iq1_m on 4 blocks each, including the all-0xff maximum-grid-index/all-signs corner; mutation-checked non-vacuous. NOT validated on a real published UD-* checkpoint — none downloaded"
+    status: completed
   - id: coverage-jinja-templates
     content: "SUPPORT, structural: chat_template.rs is a 6-variant sniffed enum with hand-written renderers, so every new model family falls back to Plain and tool-calling formats are unreachable. Needs a real Jinja renderer (minijinja) + chat_template_kwargs passthrough. Verified: ChatTemplate::Gemma4 does not implement the real gemma-4 template (no thinking injection, no strip_thinking, no multimodal placeholders)"
     status: pending
   - id: coverage-stop-token-truth
-    content: "SUPPORT, cheap + high impact: gpt-oss `<|end|>` ends every non-final turn and is NOT a stop token (treating it as EOG truncates every reply); gemma-4 EOS is `<turn|>` not `<eos>`; tokenizer.ggml.token_type==CONTROL(3) is the authority for parseable specials; Unsloth strips `{{ bos_token }}` from exported templates so a loader that also auto-adds BOS double-BOSes"
+    content: "SUPPORT, cheap + high impact: stop on the whole EOG set, not `eos_token_id` alone. HALF LANDED (60f7435): tokenizer::eog_token_ids ports llama.cpp's literal name list plus the eos/eot/eom ids, and all four CLI loops use it — gemma-2 now stops at `<end_of_turn>` rather than running to -n. CORRECTION to this item's own text: llama.cpp DOES treat gpt-oss `<|end|>` as EOG (llama-vocab.cpp:2806), so the Unsloth-study claim that it must not be is contradicted by the reference and was not followed. STILL OPEN: ferrox-server stops on eos_id alone (five *Loaded structs + batch_scheduler thread that id); and the BOS half — Unsloth strips `{{ bos_token }}` from exported templates, so a loader that renders the template AND auto-adds BOS double-BOSes"
     status: pending
   - id: coverage-mxfp4-gptoss
     content: "MXFP4 Metal+CUDA kernels (CPU is scalar-only) + gpt-oss graph (attn sinks, swiglu_oai clamp, SWA). URGENT per the 2026-08-13 study: ferrox DECODES MXFP4 (tag 39) and routes gpt-oss to generic-gqa with zero attention-sink code anywhere, and Unsloth publishes gpt-oss GGUFs as MXFP4-only — so a gpt-oss GGUF loads and silently emits wrong output. Exactly the coverage-fail-closed bug class, with a shipping model behind it"
@@ -128,14 +137,17 @@ published: **Phase 1 CPU prefill**, **Metal dense prefill**, **d=64 MMA**,
 registry** (`99a69ab`), **F16 loading** (`7ef74f1`), **prefill-capable
 `ferrox verify`** (`bfd1c1a`), **the clippy gate** (`c8a4cc6`).
 
-**21 red rows** (29 at the start of the push, 25 before this run):
+**21 red rows** (29 at the start of the push, 25 before the d=128 run).
+Still 21 after `metal-moe-stack`: OLMoE metal `pp512` fell 2.62x -> 1.11x
+but a row only closes at <= 1.0x, so it is a much smaller red, not a
+green:
 
 | Axis | Red | Worst | Owner |
 |---|---|---|---|
 | CPU `tg128` | 8 | SmolLM2 2.44× | `cpu-decode-scaling` |
 | CPU `pp512` | 6 | Gemma-3-1B 1.65× | `cpu-gemma3-prefill`, then 1a–1d |
-| Metal `pp512` | 6 | OLMoE 2.62× | `metal-moe-stack`, `metal-fa-mma-d256` |
-| Metal `tg128` | 1 | OLMoE 1.41× | `metal-moe-stack` |
+| Metal `pp512` | 6 | Gemma-3-1B 1.18× | `metal-fa-mma-d256` |
+| Metal `tg128` | 1 | OLMoE 1.41× | `cpu-decode-scaling`-shaped, GPU side |
 
 **Dense Metal prefill is finished as a workstream.** Every dense row is
 1.02–1.08×, and the d=128 kernel moved Qwen3-0.6B by 76% (1936 → 3400
@@ -168,12 +180,16 @@ mlx-lm's, and Unsloth does not write GGUF at all (it shells out to
 llama.cpp). What they yield is a **compatibility checklist against what
 is actually published**, and three items on it are correctness bugs:
 
-- **5 of 16 published `UD-*` variants are undecodable.** ggml tags 17,
-  21, 22, 29 (`IQ2_XS`, `IQ3_S`, `IQ2_S`, `IQ1_M`) hit
-  `GgmlType::Other` in `ferrox-gguf/src/lib.rs`. `IQ3_S` matters most:
-  it appears inside `IQ3_M` mixes and inside the low-bit recipes
-  `docs/MODELS.md` already claims as targets. Verified by hand against
-  the tag table, not taken on the study's word.
+- ~~**5 of 16 published `UD-*` variants are undecodable.**~~ **FIXED**
+  (`coverage-iq-tiers-published`). ggml tags 17, 21, 22, 29 (`IQ2_XS`,
+  `IQ3_S`, `IQ2_S`, `IQ1_M`) hit `GgmlType::Other` in
+  `ferrox-gguf/src/lib.rs`; `IQ3_S` mattered most, since it appears
+  inside `IQ3_M` mixes and inside the low-bit recipes `docs/MODELS.md`
+  already claims as targets. All four now decode on CPU (scalar only,
+  matching the sibling IQ formats). Validated by linking llama.cpp's
+  `ggml-quants.c` and asserting bit-exact equality with its own
+  `dequantize_row_*` output, not by re-reading the spec. Still
+  unvalidated end-to-end on a real published `UD-*` checkpoint.
 - **gpt-oss loads and silently computes the wrong graph.** ferrox
   decodes MXFP4 (tag 39) and routes `gpt-oss` to `generic-gqa`, and
   there is no attention-sink code anywhere in `ferrox-models` or
@@ -197,16 +213,53 @@ real gemma-4 template.
 Nothing here moves a benchmark row. All of it decides whether a model
 that loads produces the right tokens.
 
+## MoE prefill stack (2026-08-14, commit ee35372)
+
+OLMoE's MoE layers could not join `launch_prefill_dense_stack`, so each
+layer paid host QKV/O projections, one command buffer for attention, a
+host round-trip to route on the CPU, and a second command buffer for
+`launch_moe_prefill_q4_0`. `PrefillDenseLayerMetal` now carries a
+`PrefillFfnMetal` enum (`Dense` | `Moe`); the MoE arm encodes router
+GEMM → top-k softmax → `mul_mm_id_map0` → indexed gate/up → SiLU mul →
+indexed down → weighted sum into the *same* encoder, so a MoE layer adds
+no command buffer at all.
+
+Two kernels were missing and are new: `moe_router_mm_f32` (every MoE
+GGUF ships `ffn_gate_inp` as F32 — no `mul_mm_sg` variant covers F32)
+and `moe_topk_softmax_batch` (one simdgroup per token; the existing
+kernel was single-token, dispatched 1×1). `encode_moe_mm_id_map0` and
+`encode_mul_mm_id_f16` had been written ahead of this work and sat
+`#[allow(dead_code)]`; they are now on the hot path.
+
+Interleaved A/B, `-p 512 -n 0 -r 2 --ngl 99`, three pairs, host load ~6:
+
+| `FERROX_METAL_MOE_STACK` | OLMoE metal pp512 |
+|---|---|
+| `1` | 1412 / 1398 / 1417 tok/s |
+| `0` | 711 / 724 / 715 tok/s |
+
+**1.98×.** `tg128` is unchanged (112–115 both arms): decode never took
+this path, so the Metal `tg128` red row is *not* closed by this change.
+`ferrox verify --backend metal --prompt-tokens 64` is identical cpu vs
+metal with the stack on and off.
+
+Owed: a quiet-host suite run (`suite-owed-moe-stack`). Published
+`RESULTS.md` still says 2.62×.
+
+One thing this cost: prefill routes on the GPU now, so it no longer
+feeds `record_activations`. Expert hotness for `inspect-plan` comes from
+decode only.
+
 ### Next levers, in order
 
-1. `metal-moe-stack` — OLMoE owns **both** remaining Metal red rows
-   (pp512 2.62×, tg128 1.41×) and is the worst row on any backend.
-2. `cpu-decode-scaling` — 8 red rows, the only axis with nothing at
+1. `cpu-decode-scaling` — 8 red rows, the only axis with nothing at
    parity, and the cause is already measured (fork-join scaling; ferrox
    beats llama at one thread on Mistral-7B). Retry the persistent pool
    with the `wf/cpu-threadpool` deadlock understood first.
-3. `cpu-gemma3-prefill` — the one CPU prefill row that is an outlier
+2. `cpu-gemma3-prefill` — the one CPU prefill row that is an outlier
    rather than a trend, still undiagnosed.
+3. `metal-fa-mma-d256` and the OLMoE Metal `tg128` row (1.41×), which
+   the prefill stack did not touch.
 
 ## Ledger as of v0.4.0 (2026-08-11, regenerated on Host B)
 
@@ -300,6 +353,45 @@ existed to measure; and its perf thesis was unverified by the author's own
 admission. The diagnosis it rests on is still correct (scaling, not
 throughput). Retry with the deadlock understood first — reason explicitly
 about `FERROX_CPU_THREADS=1` and rayon nesting before writing code.
+
+**Deadlock reproduced and diagnosed (2026-08-14).** Built the branch and
+ran a probe that submits pool regions from Rayon workers whose *tasks*
+call back into Rayon. It hangs, and `sample` gives the whole cycle:
+
+| threads | where they are |
+|---|---|
+| `ferrox-pool-0..4` | `run_tasks → trampoline → rayon bridge → in_worker → LockLatch::wait_and_reset` |
+| Rayon workers | `par_chunks_indexed → CpuPool::dispatch → Mutex::lock` (the submit lock) |
+| submitter | holds the submit lock, spinning for `done == n_workers` |
+
+pool worker → Rayon worker → submit lock → submitter → pool worker.
+
+So it is **not** a memory-ordering bug, and the module's ordering
+argument was never the problem. It is coexistence: two runtimes with a
+*blocking* lock between them, and a task body that can reach the other
+runtime. `FERROX_CPU_THREADS=1` is not needed to trigger it (a
+single-thread OLMoE decode on the branch completes fine); Rayon nesting
+alone is sufficient, and MoE decode nests by construction
+(`outs.par_iter_mut()` over experts, `rayon::join` in `run_expert`,
+`apply_three` for q/k/v).
+
+Rules the retry must satisfy, each one aimed at a specific edge of that
+cycle:
+
+1. **Never block on the pool.** `dispatch` takes the submit lock with
+   `try_lock`; a losing caller runs the Rayon path instead. That deletes
+   the `Rayon worker → submit lock` edge, which is the only edge that
+   needs another runtime to make progress.
+2. **Pool tasks are leaf kernels.** No task body may enter Rayon. That
+   deletes the `pool worker → Rayon worker` edge.
+3. **Flatten instead of nest.** The three sites that fan out with Rayon
+   during decode (`apply_three`, `run_expert`, the MoE `par_iter_mut`)
+   become *one* pool region over a fused task list, issued by the decode
+   thread — which is also the actual win, since it cuts regions per
+   layer rather than making each one cheaper.
+4. **The probe ships as a test.** The hang above is a two-runtime
+   regression test; it belongs in-tree so this cannot be re-landed
+   silently.
 
 ### Gaps in our own tooling, found by using it
 
@@ -949,7 +1041,7 @@ GGUF loaders, which previously each inlined their own two-way match.
 | 3 | gpt-oss graph: attn sinks, swiglu_oai clamp, SWA | pairs with #2; silently wrong today | M | `src/models/openai-moe.cpp` |
 | 4 | `ffn_exp_probs_b` in generic MoE loader | unlocks dots1, ernie4_5-moe, bailingmoe2, exaone-moe, hunyuan-moe, afmoe in one change | S | `llama-graph.cpp` `build_moe_ffn` |
 | 5 | Metal/CUDA Q2_K + Q3_K + IQ4_NL matvec | Q3_K_M/Q2_K standard for 30B+; CPU-only now | M | `ggml-metal.metal`, `ggml-cuda/vecdotq.cuh` |
-| 6 | IQ2_XS / IQ2_S / IQ3_S / IQ1_M | tiers Unsloth Dynamic ships; sibling grids already in `iq_tables.rs` | M | `ggml-quants.c` |
+| 6 | ~~IQ2_XS / IQ2_S / IQ3_S / IQ1_M~~ **DONE** | tiers Unsloth Dynamic ships; CPU scalar, goldens bit-exact vs linked `ggml-quants.c` | M | `ggml-quants.c` |
 | 7 | Granite / MiniCPM multipliers | ~3 scalars, widely quantized archs | XS | `src/models/granite.cpp`, `minicpm.cpp` |
 | 8 | Cohere2 / Command-R parallel residual + logit scale | common GGUFs, wrong today | S | `src/models/cohere2.cpp` |
 | 9 | Partial rotary (`n_rot`) + full bias | fixes stablelm, phi2, gptneox, starcoder2, gpt2 at once | S | `src/models/stablelm.cpp`, `starcoder2.cpp` |

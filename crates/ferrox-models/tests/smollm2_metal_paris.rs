@@ -56,7 +56,7 @@ fn smollm2_metal_greedy_paris_regression() {
         return;
     }
 
-    if !ferrox_metal::gpu::probe().is_some() {
+    if ferrox_metal::gpu::probe().is_none() {
         eprintln!("skip: no Metal GPU detected");
         return;
     }

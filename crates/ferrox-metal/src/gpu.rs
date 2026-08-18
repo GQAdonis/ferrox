@@ -1133,6 +1133,115 @@ kernel void moe_scatter_rows(
         drow[j] = srow[j];
     }
 }
+
+/// Prefill router GEMM with **F32** weights (`ffn_gate_inp` ships F32 in
+/// every MoE GGUF we load): `out[t*n_experts + e] = dot(w[e], x[t])`.
+/// One simdgroup per (expert, token); `hidden` is the reduction length.
+/// Kept in f32 end to end — the top-k selection below is sensitive to
+/// near-ties, so this is the one prefill GEMM that does not go through
+/// the f16 activation plane.
+kernel void moe_router_mm_f32(
+    device const float* w [[buffer(0)]],
+    device const float* x [[buffer(1)]],
+    device float* out [[buffer(2)]],
+    constant uint& hidden [[buffer(3)]],
+    constant uint& n_experts [[buffer(4)]],
+    constant uint& n_tokens [[buffer(5)]],
+    uint2 tgpig [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    const uint e = tgpig.x;
+    const uint t = tgpig.y;
+    if (e >= n_experts || t >= n_tokens) {
+        return;
+    }
+    device const float* wr = w + (size_t)e * hidden;
+    device const float* xr = x + (size_t)t * hidden;
+    float acc = 0.0f;
+    for (uint i = lane; i < hidden; i += 32u) {
+        acc += wr[i] * xr[i];
+    }
+    acc = simd_sum(acc);
+    if (lane == 0u) {
+        out[(size_t)t * n_experts + e] = acc;
+    }
+}
+
+/// Batched twin of `moe_topk_softmax`: one simdgroup per token, probs in
+/// threadgroup memory (`n` floats) instead of a 256-float per-thread
+/// array. Writes `ids[t*k + j]` / `weights[t*k + j]`.
+///
+/// Tie policy matches the decode kernel: lowest expert index wins.
+kernel void moe_topk_softmax_batch(
+    device const float* logits [[buffer(0)]],
+    device int* ids [[buffer(1)]],
+    device float* weights [[buffer(2)]],
+    constant uint& n [[buffer(3)]],
+    constant uint& k [[buffer(4)]],
+    constant uint& renormalize [[buffer(5)]],
+    constant uint& n_tokens [[buffer(6)]],
+    uint tg [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]],
+    threadgroup float* probs [[threadgroup(0)]]
+) {
+    const uint t = tg;
+    if (t >= n_tokens) {
+        return;
+    }
+    device const float* row = logits + (size_t)t * n;
+
+    float lmax = -INFINITY;
+    for (uint i = lane; i < n; i += 32u) {
+        lmax = max(lmax, row[i]);
+    }
+    const float mx = simd_max(lmax);
+
+    float lsum = 0.0f;
+    for (uint i = lane; i < n; i += 32u) {
+        const float p = exp(row[i] - mx);
+        probs[i] = p;
+        lsum += p;
+    }
+    const float sum = simd_sum(lsum);
+    const float inv = 1.0f / sum;
+    for (uint i = lane; i < n; i += 32u) {
+        probs[i] *= inv;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint j = 0u; j < k; ++j) {
+        float best_p = -1.0f;
+        uint best_i = 0u;
+        for (uint i = lane; i < n; i += 32u) {
+            if (probs[i] > best_p) {
+                best_p = probs[i];
+                best_i = i;
+            }
+        }
+        const float m = simd_max(best_p);
+        const uint cand = (best_p == m) ? best_i : 0xffffffffu;
+        const uint sel = simd_min(cand);
+        if (lane == 0u) {
+            ids[(size_t)t * k + j] = int(sel);
+            weights[(size_t)t * k + j] = m;
+            probs[sel] = -1.0f;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (renormalize != 0u && lane == 0u) {
+        float s = 0.0f;
+        for (uint j = 0u; j < k; ++j) {
+            s += weights[(size_t)t * k + j];
+        }
+        if (s > 0.0f) {
+            const float invs = 1.0f / s;
+            for (uint j = 0u; j < k; ++j) {
+                weights[(size_t)t * k + j] *= invs;
+            }
+        }
+    }
+}
 "#;
 
 /// Launches the Q4_0 matvec kernel. Verified on a real Apple M2 Pro GPU
@@ -3469,8 +3578,6 @@ pub fn mul_mm_id_f16_meta(kind: &str) -> Option<(&'static str, usize, usize)> {
     })
 }
 
-// Written ahead of the fused MoE prefill stack (plan: metal-moe-stack).
-#[allow(dead_code)]
 fn moe_mm_id_map0_fn(top_k: usize) -> Option<&'static str> {
     match top_k {
         2 => Some("moe_mm_id_map0_ne20_2"),
@@ -3482,7 +3589,6 @@ fn moe_mm_id_map0_fn(top_k: usize) -> Option<&'static str> {
 }
 
 #[allow(clippy::too_many_arguments)]
-#[allow(dead_code)]
 pub(crate) fn encode_moe_mm_id_map0(
     enc: &ProtocolObject<dyn MTLComputeCommandEncoder>,
     device: &Retained<ProtocolObject<dyn MTLDevice>>,
@@ -3521,7 +3627,6 @@ pub(crate) fn encode_moe_mm_id_map0(
 }
 
 #[allow(clippy::too_many_arguments)]
-#[allow(dead_code)]
 pub(crate) fn encode_mul_mm_id_f16(
     enc: &ProtocolObject<dyn MTLComputeCommandEncoder>,
     device: &Retained<ProtocolObject<dyn MTLDevice>>,
@@ -3578,6 +3683,266 @@ pub(crate) fn encode_mul_mm_id_f16(
         );
     }
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_moe_router_mm_f32(
+    enc: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+    device: &Retained<ProtocolObject<dyn MTLDevice>>,
+    router_w: &ProtocolObject<dyn MTLBuffer>,
+    x_buf: &ProtocolObject<dyn MTLBuffer>,
+    logits_buf: &ProtocolObject<dyn MTLBuffer>,
+    hidden: u32,
+    n_experts: u32,
+    n_tokens: u32,
+) -> Result<(), MetalError> {
+    let pipe = ensure_pipeline(device, Q4_0_MOE_TOPK_KERNEL_SRC, "moe_router_mm_f32")?;
+    enc.setComputePipelineState(&pipe.0);
+    unsafe {
+        enc.setBuffer_offset_atIndex(Some(router_w), 0, 0);
+        enc.setBuffer_offset_atIndex(Some(x_buf), 0, 1);
+        enc.setBuffer_offset_atIndex(Some(logits_buf), 0, 2);
+        for (idx, mut v) in [(3usize, hidden), (4, n_experts), (5, n_tokens)] {
+            enc.setBytes_length_atIndex(
+                NonNull::new(&mut v as *mut u32 as *mut _).unwrap(),
+                4,
+                idx,
+            );
+        }
+    }
+    enc.dispatchThreadgroups_threadsPerThreadgroup(
+        MTLSize {
+            width: n_experts as usize,
+            height: n_tokens as usize,
+            depth: 1,
+        },
+        MTLSize {
+            width: 32,
+            height: 1,
+            depth: 1,
+        },
+    );
+    Ok(())
+}
+
+/// Batched softmax top-k routing (`n ≤ 256`, `k ≤ 8`), one simdgroup per
+/// token. Writes `ids [n_tokens, k]` and `weights [n_tokens, k]`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_moe_topk_softmax_batch(
+    enc: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+    device: &Retained<ProtocolObject<dyn MTLDevice>>,
+    logits: &ProtocolObject<dyn MTLBuffer>,
+    ids: &ProtocolObject<dyn MTLBuffer>,
+    weights: &ProtocolObject<dyn MTLBuffer>,
+    n: u32,
+    k: u32,
+    renormalize: bool,
+    n_tokens: u32,
+) -> Result<(), MetalError> {
+    let pipe = ensure_pipeline(device, Q4_0_MOE_TOPK_KERNEL_SRC, "moe_topk_softmax_batch")?;
+    enc.setComputePipelineState(&pipe.0);
+    unsafe {
+        enc.setBuffer_offset_atIndex(Some(logits), 0, 0);
+        enc.setBuffer_offset_atIndex(Some(ids), 0, 1);
+        enc.setBuffer_offset_atIndex(Some(weights), 0, 2);
+        for (idx, mut v) in [
+            (3usize, n),
+            (4, k),
+            (5, u32::from(renormalize)),
+            (6, n_tokens),
+        ] {
+            enc.setBytes_length_atIndex(
+                NonNull::new(&mut v as *mut u32 as *mut _).unwrap(),
+                4,
+                idx,
+            );
+        }
+        enc.setThreadgroupMemoryLength_atIndex((n as usize) * 4, 0);
+    }
+    enc.dispatchThreadgroups_threadsPerThreadgroup(
+        MTLSize {
+            width: n_tokens as usize,
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width: 32,
+            height: 1,
+            depth: 1,
+        },
+    );
+    Ok(())
+}
+
+/// Routed-expert FFN for one layer of the fused prefill stack: GPU router
+/// GEMM → top-k softmax → `mul_mm_id_map0` → indexed gate/up GEMM → SiLU
+/// mul → indexed down GEMM → weighted sum. Everything stays on device, so
+/// a MoE layer costs the same *zero* extra command buffers a dense layer
+/// does (llama.cpp `build_moe_ffn` shape).
+///
+/// `x_f32` is the FFN-normed activation `[T, H]` (router input, kept f32
+/// because top-k is tie-sensitive); `x_f16` is the same rows in f16 (the
+/// expert GEMM input). `out` receives `[T, H]`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_moe_prefill_ffn(
+    enc: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+    device: &Retained<ProtocolObject<dyn MTLDevice>>,
+    moe: &PrefillMoeMetal<'_>,
+    bound: &MoePackedResident,
+    router_w: &ResidentF32Buffer,
+    x_f32: &ProtocolObject<dyn MTLBuffer>,
+    x_f16: &ProtocolObject<dyn MTLBuffer>,
+    out: &ProtocolObject<dyn MTLBuffer>,
+    n_tokens: usize,
+) -> Result<(), MetalError> {
+    let packed = &moe.packed;
+    let top_k = moe.top_k;
+    let n_experts = packed.n_experts;
+    let hidden = packed.hidden_rows;
+    let ffn = packed.ffn_rows;
+    let n_slots = n_tokens * top_k;
+
+    let (gate_fn, gate_bb, gate_be) =
+        mul_mm_id_f16_meta(packed.gate_kind).ok_or(MetalError::CommandFailed)?;
+    let (up_fn, up_bb, up_be) =
+        mul_mm_id_f16_meta(packed.up_kind).ok_or(MetalError::CommandFailed)?;
+    let (down_fn, down_bb, down_be) =
+        mul_mm_id_f16_meta(packed.down_kind).ok_or(MetalError::CommandFailed)?;
+    let up_row_bytes = packed.up_stride / ffn;
+    let gate_cols = ((packed.gate_row_bytes / gate_bb) * gate_be) as u32;
+    let up_cols = ((up_row_bytes / up_bb) * up_be) as u32;
+    let down_cols = ((packed.down_row_bytes / down_bb) * down_be) as u32;
+
+    moe_prefill_scratch_ex(device, n_tokens, n_slots, ffn, hidden, n_experts, top_k)?;
+
+    TL_MOE_PREFILL.with(|cell| {
+        let scratch = cell.borrow();
+        let scratch = scratch.as_ref().ok_or(MetalError::CommandFailed)?;
+        let logits = scratch.router_logits.as_ref();
+        let route_ids = scratch.route_ids.as_ref();
+        let route_w = scratch.route_w.as_ref();
+        let tpe = scratch.mm_id_tpe.as_ref();
+        let mm_ids = scratch.mm_id_ids.as_ref();
+        let gate_buf = scratch.gate.as_ref();
+        let up_buf = scratch.up.as_ref();
+        let act_buf = scratch.act.as_ref();
+        let half_slots = scratch.half_in.as_ref();
+        let expert_out = scratch.expert_out.as_ref();
+
+        encode_moe_router_mm_f32(
+            enc,
+            device,
+            &router_w.buffer,
+            x_f32,
+            logits,
+            hidden as u32,
+            n_experts as u32,
+            n_tokens as u32,
+        )?;
+        memory_barrier_resources(enc, &[logits]);
+        encode_moe_topk_softmax_batch(
+            enc,
+            device,
+            logits,
+            route_ids,
+            route_w,
+            n_experts as u32,
+            top_k as u32,
+            moe.renormalize,
+            n_tokens as u32,
+        )?;
+        memory_barrier_resources(enc, &[route_ids, route_w]);
+        encode_moe_mm_id_map0(
+            enc,
+            device,
+            route_ids,
+            tpe,
+            mm_ids,
+            n_experts as u32,
+            n_tokens as u32,
+            top_k,
+        )?;
+        memory_barrier_resources(enc, &[tpe, mm_ids]);
+
+        encode_mul_mm_id_f16(
+            enc,
+            device,
+            gate_fn,
+            &bound.gate,
+            packed.gate_stride as u32,
+            x_f16,
+            gate_buf,
+            mm_ids,
+            tpe,
+            n_experts as u32,
+            n_tokens as u32,
+            top_k as u32,
+            ffn as u32,
+            gate_cols,
+            packed.gate_row_bytes as u32,
+            0,
+        )?;
+        encode_mul_mm_id_f16(
+            enc,
+            device,
+            up_fn,
+            &bound.up,
+            packed.up_stride as u32,
+            x_f16,
+            up_buf,
+            mm_ids,
+            tpe,
+            n_experts as u32,
+            n_tokens as u32,
+            top_k as u32,
+            ffn as u32,
+            up_cols,
+            up_row_bytes as u32,
+            0,
+        )?;
+        memory_barrier_resources(enc, &[gate_buf, up_buf]);
+        crate::elem::encode_silu_mul(
+            enc,
+            device,
+            gate_buf,
+            up_buf,
+            act_buf,
+            (n_slots * ffn) as u32,
+        )?;
+        memory_barrier_resources(enc, &[act_buf]);
+        crate::elem::encode_f32_to_f16(enc, device, act_buf, half_slots, (n_slots * ffn) as u32)?;
+        memory_barrier_resources(enc, &[half_slots]);
+        encode_mul_mm_id_f16(
+            enc,
+            device,
+            down_fn,
+            &bound.down,
+            packed.down_stride as u32,
+            half_slots,
+            expert_out,
+            mm_ids,
+            tpe,
+            n_experts as u32,
+            n_tokens as u32,
+            top_k as u32,
+            hidden as u32,
+            down_cols,
+            packed.down_row_bytes as u32,
+            1,
+        )?;
+        memory_barrier_resources(enc, &[expert_out]);
+        encode_moe_prefill_weighted_sum(
+            enc,
+            device,
+            expert_out,
+            route_w,
+            out,
+            hidden as u32,
+            top_k as u32,
+            n_tokens as u32,
+        )?;
+        Ok(())
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5517,6 +5882,32 @@ pub struct MoePackedQ4<'a> {
     pub down_kind: &'static str,
 }
 
+/// Routed-expert FFN description for one fused-prefill-stack layer
+/// (`PrefillFfnMetal::Moe`). `router_w` is the F32 `ffn_gate_inp` plane
+/// `[n_experts, hidden]`; the experts come from the same packed planes
+/// the host-routed `launch_moe_prefill_q4_0` path uses.
+pub struct PrefillMoeMetal<'a> {
+    pub router_w: &'a [f32],
+    pub top_k: usize,
+    /// `norm_topk_prob`: renormalize the selected probabilities.
+    pub renormalize: bool,
+    pub packed: MoePackedQ4<'a>,
+}
+
+impl PrefillMoeMetal<'_> {
+    /// `true` when every piece this layer needs has a Metal kernel and
+    /// the shapes are inside the routing kernels' limits.
+    pub fn is_supported(&self) -> bool {
+        self.top_k > 0
+            && moe_mm_id_map0_fn(self.top_k).is_some()
+            && self.packed.n_experts <= 256
+            && self.router_w.len() == self.packed.n_experts * self.packed.hidden_rows
+            && mul_mm_id_f16_meta(self.packed.gate_kind).is_some()
+            && mul_mm_id_f16_meta(self.packed.up_kind).is_some()
+            && mul_mm_id_f16_meta(self.packed.down_kind).is_some()
+    }
+}
+
 /// Encode softmax top-k routing (n≤256, k≤8) into an existing encoder.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_moe_topk_softmax(
@@ -5971,8 +6362,14 @@ struct MoePrefillScratch {
     /// GPU map0: slot ids `[n_experts, n_tokens]`.
     mm_id_ids: Retained<ProtocolObject<dyn MTLBuffer>>,
     /// f16 activations for `mul_mm_id_f16` (size ≥ `n_slots * ffn`).
-    #[allow(dead_code)]
     half_in: Retained<ProtocolObject<dyn MTLBuffer>>,
+    /// GPU router: logits `[n_tokens, n_experts]`.
+    router_logits: Retained<ProtocolObject<dyn MTLBuffer>>,
+    /// GPU routing: expert ids `[n_tokens, top_k]`.
+    route_ids: Retained<ProtocolObject<dyn MTLBuffer>>,
+    /// GPU routing: combine weights `[n_tokens, top_k]`.
+    route_w: Retained<ProtocolObject<dyn MTLBuffer>>,
+    top_k: usize,
     #[allow(dead_code)]
     contig_in: Retained<ProtocolObject<dyn MTLBuffer>>,
     #[allow(dead_code)]
@@ -5991,6 +6388,21 @@ fn moe_prefill_scratch(
     hidden: usize,
     n_experts: usize,
 ) -> Result<(), MetalError> {
+    moe_prefill_scratch_ex(device, n_tokens, n_slots, ffn, hidden, n_experts, 0)
+}
+
+/// [`moe_prefill_scratch`] plus the routing planes the fused stack needs
+/// (`top_k > 0`: router logits, ids, combine weights).
+#[allow(clippy::too_many_arguments)]
+fn moe_prefill_scratch_ex(
+    device: &Retained<ProtocolObject<dyn MTLDevice>>,
+    n_tokens: usize,
+    n_slots: usize,
+    ffn: usize,
+    hidden: usize,
+    n_experts: usize,
+    top_k: usize,
+) -> Result<(), MetalError> {
     TL_MOE_PREFILL.with(|cell| {
         let mut slot = cell.borrow_mut();
         let need = match slot.as_ref() {
@@ -6001,17 +6413,33 @@ fn moe_prefill_scratch(
                     || s.hidden < hidden
                     || s.n_tokens < n_tokens
                     || s.n_experts < n_experts
+                    || s.top_k < top_k
             }
         };
         if need {
+            // Never shrink: a top_k=0 (host-routed) grow must not drop the
+            // routing planes a previous fused-stack call allocated.
+            let (n_slots, ffn, hidden, n_tokens, n_experts, top_k) = match slot.as_ref() {
+                Some(s) => (
+                    n_slots.max(s.n_slots),
+                    ffn.max(s.ffn),
+                    hidden.max(s.hidden),
+                    n_tokens.max(s.n_tokens),
+                    n_experts.max(s.n_experts),
+                    top_k.max(s.top_k),
+                ),
+                None => (n_slots, ffn, hidden, n_tokens, n_experts, top_k),
+            };
             let contig_elems = n_slots * ffn.max(hidden);
             let half_elems = (n_tokens * hidden).max(n_slots * ffn);
+            let route_elems = (n_tokens * top_k).max(1);
             *slot = Some(MoePrefillScratch {
                 n_slots,
                 ffn,
                 hidden,
                 n_tokens,
                 n_experts,
+                top_k,
                 act: device
                     .newBufferWithLength_options(
                         n_slots * ffn * 4,
@@ -6057,6 +6485,24 @@ fn moe_prefill_scratch(
                 half_in: device
                     .newBufferWithLength_options(
                         half_elems * 2,
+                        MTLResourceOptions::StorageModeShared,
+                    )
+                    .ok_or(MetalError::BufferAllocFailed)?,
+                router_logits: device
+                    .newBufferWithLength_options(
+                        n_tokens * n_experts * 4,
+                        MTLResourceOptions::StorageModeShared,
+                    )
+                    .ok_or(MetalError::BufferAllocFailed)?,
+                route_ids: device
+                    .newBufferWithLength_options(
+                        route_elems * 4,
+                        MTLResourceOptions::StorageModeShared,
+                    )
+                    .ok_or(MetalError::BufferAllocFailed)?,
+                route_w: device
+                    .newBufferWithLength_options(
+                        route_elems * 4,
                         MTLResourceOptions::StorageModeShared,
                     )
                     .ok_or(MetalError::BufferAllocFailed)?,
@@ -7920,6 +8366,188 @@ mod tests {
 
     fn ferrox_core_silu(x: f32) -> f32 {
         x / (1.0 + (-x).exp())
+    }
+
+    /// The fused-prefill-stack MoE FFN (GPU router + top-k + `mul_mm_id`)
+    /// against a host reference that routes with the same softmax top-k.
+    /// Covers what the host-routed `launch_moe_prefill_q4_0` test cannot:
+    /// `moe_router_mm_f32`, `moe_topk_softmax_batch`, the GPU `map0`, and
+    /// the f16-src1 `mul_mm_id` twins.
+    #[test]
+    #[ignore = "needs a real Metal-capable GPU; run manually with --ignored on Apple Silicon"]
+    fn encode_moe_prefill_ffn_matches_cpu_routed_reference() {
+        fn q4_matrix(rows: usize, cols: usize, seed: u8) -> Vec<u8> {
+            let blocks = cols / ferrox_quant::Q4_0_BLOCK_ELEMS;
+            let mut out = Vec::with_capacity(rows * blocks * ferrox_quant::Q4_0_BLOCK_BYTES);
+            for r in 0..rows {
+                for b in 0..blocks {
+                    out.extend_from_slice(
+                        &half::f16::from_f32(
+                            0.01 + ((r * blocks + b + seed as usize) % 17) as f32 * 0.003,
+                        )
+                        .to_le_bytes(),
+                    );
+                    for i in 0..16u8 {
+                        let lo = i.wrapping_add(r as u8).wrapping_add(seed) & 15;
+                        let hi = (15u8.wrapping_sub(i))
+                            .wrapping_add(b as u8)
+                            .wrapping_add(seed)
+                            & 15;
+                        out.push(lo | (hi << 4));
+                    }
+                }
+            }
+            out
+        }
+
+        let hidden = 64;
+        let ffn = 96;
+        let n_experts = 8;
+        let top_k = 2;
+        let n_tokens = 24;
+        let gu_row_bytes =
+            (hidden / ferrox_quant::Q4_0_BLOCK_ELEMS) * ferrox_quant::Q4_0_BLOCK_BYTES;
+        let down_row_bytes =
+            (ffn / ferrox_quant::Q4_0_BLOCK_ELEMS) * ferrox_quant::Q4_0_BLOCK_BYTES;
+        let mut gate = Vec::new();
+        let mut up = Vec::new();
+        let mut down = Vec::new();
+        for e in 0..n_experts {
+            gate.extend(q4_matrix(ffn, hidden, (e * 3 + 1) as u8));
+            up.extend(q4_matrix(ffn, hidden, (e * 3 + 2) as u8));
+            down.extend(q4_matrix(hidden, ffn, (e * 3 + 3) as u8));
+        }
+        let gate_stride = ffn * gu_row_bytes;
+        let down_stride = hidden * down_row_bytes;
+        let packed = MoePackedQ4 {
+            gate: &gate,
+            up: &up,
+            down: &down,
+            gate_stride,
+            up_stride: gate_stride,
+            down_stride,
+            n_experts,
+            ffn_rows: ffn,
+            hidden_rows: hidden,
+            gate_row_bytes: gu_row_bytes,
+            down_row_bytes,
+            gate_kind: "Q4_0",
+            up_kind: "Q4_0",
+            down_kind: "Q4_0",
+        };
+        // Router rows are well separated so top-k never sits on a tie.
+        let router_w: Vec<f32> = (0..n_experts * hidden)
+            .map(|i| {
+                let e = i / hidden;
+                (((i % hidden) as f32 * 0.031).cos() + e as f32 * 0.17) * 0.5
+            })
+            .collect();
+        let x_batch: Vec<f32> = (0..n_tokens * hidden)
+            .map(|i| ((i as f32) * 0.0137).sin())
+            .collect();
+
+        let moe = PrefillMoeMetal {
+            router_w: &router_w,
+            top_k,
+            renormalize: false,
+            packed,
+        };
+        assert!(moe.is_supported());
+
+        // CPU reference: f32 router GEMM, softmax top-k, expert SwiGLU.
+        let mut expected = Vec::with_capacity(n_tokens * hidden);
+        for t in 0..n_tokens {
+            let x = &x_batch[t * hidden..(t + 1) * hidden];
+            let logits: Vec<f32> = (0..n_experts)
+                .map(|e| {
+                    router_w[e * hidden..(e + 1) * hidden]
+                        .iter()
+                        .zip(x)
+                        .map(|(w, v)| w * v)
+                        .sum::<f32>()
+                })
+                .collect();
+            let mx = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let exps: Vec<f32> = logits.iter().map(|l| (l - mx).exp()).collect();
+            let sum: f32 = exps.iter().sum();
+            let probs: Vec<f32> = exps.iter().map(|e| e / sum).collect();
+            let mut order: Vec<usize> = (0..n_experts).collect();
+            order.sort_by(|&a, &b| probs[b].partial_cmp(&probs[a]).unwrap());
+
+            let mut out_t = vec![0f32; hidden];
+            for &eid in &order[..top_k] {
+                let w = probs[eid];
+                let mut act = vec![0f32; ffn];
+                let g_base = eid * gate_stride;
+                let d_base = eid * down_stride;
+                for (r, slot) in act.iter_mut().enumerate() {
+                    let range = g_base + r * gu_row_bytes..g_base + (r + 1) * gu_row_bytes;
+                    let g = ferrox_quant::dot_q4_0_f32_scalar(&gate[range.clone()], x);
+                    let u = ferrox_quant::dot_q4_0_f32_scalar(&up[range], x);
+                    *slot = ferrox_core_silu(g) * u;
+                }
+                for (r, slot) in out_t.iter_mut().enumerate() {
+                    let range = d_base + r * down_row_bytes..d_base + (r + 1) * down_row_bytes;
+                    *slot += w * ferrox_quant::dot_q4_0_f32_scalar(&down[range], &act);
+                }
+            }
+            expected.extend_from_slice(&out_t);
+        }
+
+        let shared = shared_metal().expect("metal device");
+        let device = &shared.device;
+        let queue = &shared.queue;
+        let mut x_owned = x_batch.clone();
+        let x_buf = unsafe {
+            device.newBufferWithBytes_length_options(
+                NonNull::new(x_owned.as_mut_ptr() as *mut _).unwrap(),
+                x_owned.len() * 4,
+                MTLResourceOptions::StorageModeShared,
+            )
+        }
+        .expect("x buffer");
+        let xh_buf = device
+            .newBufferWithLength_options(
+                n_tokens * hidden * 2,
+                MTLResourceOptions::StorageModeShared,
+            )
+            .expect("x f16 buffer");
+        let out_buf = device
+            .newBufferWithLength_options(
+                n_tokens * hidden * 4,
+                MTLResourceOptions::StorageModeShared,
+            )
+            .expect("out buffer");
+        let bound = moe_packed_resident(device, &moe.packed).expect("packed resident");
+        let router = resident_f32_buffer(device, &router_w).expect("router resident");
+
+        let cmd_buf = queue.commandBuffer().expect("command buffer");
+        let encoder = compute_encoder_concurrent(&cmd_buf).expect("encoder");
+        crate::elem::encode_f32_to_f16(
+            &encoder,
+            device,
+            &x_buf,
+            &xh_buf,
+            (n_tokens * hidden) as u32,
+        )
+        .expect("f32->f16");
+        memory_barrier_buffers(&encoder);
+        encode_moe_prefill_ffn(
+            &encoder, device, &moe, &bound, &router, &x_buf, &xh_buf, &out_buf, n_tokens,
+        )
+        .expect("moe prefill ffn");
+        encoder.endEncoding();
+        cmd_buf.commit();
+        cmd_buf.waitUntilCompleted();
+
+        let got = unsafe {
+            std::slice::from_raw_parts(out_buf.contents().as_ptr() as *const f32, n_tokens * hidden)
+        };
+        for (i, (&g, &w)) in got.iter().zip(&expected).enumerate() {
+            // f16 expert activations: looser than the f32-src1 path.
+            let tol = 2e-2 * w.abs().max(1.0);
+            assert!((g - w).abs() <= tol, "elem {i}: gpu={g} cpu={w} tol={tol}");
+        }
     }
 
     /// Deterministic pseudo-random byte generator for building real,

@@ -62,6 +62,15 @@ pub enum LoadError {
     /// Metadata advertises a feature the generic decoder does not implement.
     #[error("architecture '{0}' requires unimplemented feature: {1}")]
     UnsupportedFeature(String, String),
+    /// The checkpoint carries per-block tensors this build never reads,
+    /// i.e. weights that contribute to the real graph and would simply
+    /// be missing from ours. See [`assert_every_tensor_consumed`].
+    #[error(
+        "checkpoint carries {0} tensor(s) this build never reads, so its graph is not the one \
+         ferrox would run: {1}. This is a missing feature, not a corrupt file. Override with \
+         FERROX_ALLOW_UNKNOWN_TENSORS=1 to load anyway and accept wrong output."
+    )]
+    UnconsumedTensors(usize, String),
     /// `FERROX_STRICT_KERNELS=1` and the model has weights with no
     /// kernel on the selected accelerator, i.e. it would run, correctly,
     /// on a silently slower path. Refusing is the point: a benchmark or
@@ -427,6 +436,62 @@ impl ModelConfig {
         // comment for why this matters.
         let rope_freqs = load_f32_vec_optional(file, "rope_freqs.weight")?;
 
+        // Phi-3/Phi-4 LongRoPE: two per-band factor tensors instead of
+        // Llama's single `rope_freqs.weight`, selected by context size
+        // (llama.cpp `llama_model::get_rope_factors`: `rope_freqs` wins if
+        // present, else `rope_long` when the run's context exceeds
+        // `rope.scaling.original_context_length`, else `rope_short`).
+        //
+        // The selection here uses the checkpoint's own advertised context
+        // length, which is what llama.cpp defaults `n_ctx` to. A run that
+        // caps the context below `original_context_length` should use the
+        // short set; ferrox's config is built before the context size is
+        // known, so that case is not yet handled — recorded as a
+        // best-effort field rather than silently assumed correct.
+        let rope_orig_ctx = metadata_u64_any(file, &[key("rope.scaling.original_context_length")])
+            .map(|v| v as usize);
+        // `rope_freqs.weight` outranks the LongRoPE pair (llama.cpp
+        // `get_rope_factors` checks it first), so a checkpoint carrying
+        // it never populates these and the runtime re-pick below cannot
+        // overwrite a Llama-3 correction with a Phi one.
+        let (rope_freqs_long, rope_freqs_short) = if rope_freqs.is_some() {
+            (None, None)
+        } else {
+            (
+                load_f32_vec_optional(file, "rope_factors_long.weight")?,
+                load_f32_vec_optional(file, "rope_factors_short.weight")?,
+            )
+        };
+        // Provisional pick from the checkpoint's own advertised context;
+        // `ModelConfig::apply_runtime_context` re-picks once the run's
+        // `--ctx-size` is known, which is the number llama.cpp decides on.
+        let rope_freqs = match (rope_freqs, rope_orig_ctx) {
+            (Some(f), _) => Some(f),
+            (None, Some(orig)) => {
+                let model_ctx = metadata_u64_any(file, &[key("context_length")])
+                    .unwrap_or(orig as u64) as usize;
+                if model_ctx > orig {
+                    rope_freqs_long.clone().or_else(|| rope_freqs_short.clone())
+                } else {
+                    rope_freqs_short.clone().or_else(|| rope_freqs_long.clone())
+                }
+            }
+            (None, None) => None,
+        };
+
+        // Partial rotary: only when the file says the rotary width is
+        // narrower than a head. Equal values mean "whole head", which is
+        // the same thing as `None` and stays `None` so nothing downstream
+        // has to special-case it.
+        let rope_dim = metadata_u64_any(file, &[key("rope.dimension_count")])
+            .map(|d| d as usize)
+            .filter(|d| *d > 0 && *d < head_dim);
+
+        // See `ModelConfig::rope_attn_factor`.
+        let rope_attn_factor = metadata_f32_any(file, &[key("rope.scaling.attn_factor")])
+            .filter(|f| f.is_finite() && *f > 0.0)
+            .unwrap_or(1.0);
+
         // RoPE layout comes from the capability registry above (fail-
         // closed). Getting this wrong for `llama` (needs Norm) was the
         // real root cause of the Llama-3.1-8B early-stop/wrong-logits bug.
@@ -476,6 +541,11 @@ impl ModelConfig {
             final_logit_softcap,
             embedding_scale,
             attention_scale,
+            rope_attn_factor,
+            rope_dim,
+            rope_freqs_long,
+            rope_freqs_short,
+            rope_orig_ctx,
             rope_theta_swa,
             ffn_activation,
             best_effort_fields: Box::leak(best_effort_fields.into_boxed_slice()),
@@ -506,6 +576,10 @@ fn quant_kind_for(dtype: GgmlType) -> Option<QuantKind> {
         GgmlType::Q8_1 => Some(QuantKind::Q8_1),
         GgmlType::IQ4NL => Some(QuantKind::IQ4NL),
         GgmlType::IQ4XS => Some(QuantKind::IQ4XS),
+        GgmlType::IQ2XS => Some(QuantKind::IQ2XS),
+        GgmlType::IQ2S => Some(QuantKind::IQ2S),
+        GgmlType::IQ3S => Some(QuantKind::IQ3S),
+        GgmlType::IQ1M => Some(QuantKind::IQ1M),
         GgmlType::IQ1S => Some(QuantKind::IQ1S),
         GgmlType::IQ2XXS => Some(QuantKind::IQ2XXS),
         GgmlType::IQ3XXS => Some(QuantKind::IQ3XXS),
@@ -757,6 +831,26 @@ fn load_f32_vec(file: &impl TensorSource, name: &str) -> Result<Vec<f32>, LoadEr
             .map_err(|_| LoadError::UnsupportedDtype(name.to_string(), GgmlType::IQ4NL)),
         GgmlType::IQ4XS => ferrox_quant::dequant_iq4_xs(raw)
             .map_err(|_| LoadError::UnsupportedDtype(name.to_string(), GgmlType::IQ4XS)),
+        // The codebook-grid tiers. Rare on the 1-D tensors this
+        // function widens (norms and biases are almost always F32),
+        // but a dtype ferrox can decode should never be rejected here
+        // just because the *other* dispatch table below knows it --
+        // that split is how a supported format turns into a load
+        // failure on the one checkpoint that uses it.
+        GgmlType::IQ1S => ferrox_quant::dequant_iq1_s(raw)
+            .map_err(|_| LoadError::UnsupportedDtype(name.to_string(), GgmlType::IQ1S)),
+        GgmlType::IQ1M => ferrox_quant::dequant_iq1_m(raw)
+            .map_err(|_| LoadError::UnsupportedDtype(name.to_string(), GgmlType::IQ1M)),
+        GgmlType::IQ2XXS => ferrox_quant::dequant_iq2_xxs(raw)
+            .map_err(|_| LoadError::UnsupportedDtype(name.to_string(), GgmlType::IQ2XXS)),
+        GgmlType::IQ2XS => ferrox_quant::dequant_iq2_xs(raw)
+            .map_err(|_| LoadError::UnsupportedDtype(name.to_string(), GgmlType::IQ2XS)),
+        GgmlType::IQ2S => ferrox_quant::dequant_iq2_s(raw)
+            .map_err(|_| LoadError::UnsupportedDtype(name.to_string(), GgmlType::IQ2S)),
+        GgmlType::IQ3XXS => ferrox_quant::dequant_iq3_xxs(raw)
+            .map_err(|_| LoadError::UnsupportedDtype(name.to_string(), GgmlType::IQ3XXS)),
+        GgmlType::IQ3S => ferrox_quant::dequant_iq3_s(raw)
+            .map_err(|_| LoadError::UnsupportedDtype(name.to_string(), GgmlType::IQ3S)),
         other => Err(LoadError::UnsupportedDtype(name.to_string(), other)),
     }
 }
@@ -1528,8 +1622,77 @@ impl Decoder {
         decoder.probe_kernels();
         ferrox_core::kernel_registry::seal_or_error()
             .map_err(|e| LoadError::StrictKernels(e.to_string()))?;
+        // `ModelConfig` is parsed from a *different* handle on the same
+        // file (the CLI opens its own `GgufFile`, then hands the config
+        // here), so the model-level tensors it consumed were recorded on
+        // that handle, not this one. Replay them before the gate, or
+        // every Llama-3.x checkpoint reads as carrying an unread
+        // `rope_freqs.weight` it in fact uses on every RoPE call.
+        for name in crate::config::MODEL_LEVEL_TENSORS_READ_BY_CONFIG {
+            file.note_consumed(name);
+        }
+        assert_every_tensor_consumed(&file)?;
         Ok(decoder)
     }
+}
+
+/// Tensor-name prefixes a text-generation load legitimately never
+/// reads. Everything here is consumed by a *different* code path, not by
+/// nothing: multimodal projector planes belong to `mmproj`, and the
+/// per-shard split bookkeeping is metadata, not weights.
+const IGNORED_TENSOR_PREFIXES: &[&str] = &["mm.", "v.", "mmproj.", "resampler.", "audio."];
+
+/// Fails the load when the checkpoint carries tensors this build never
+/// looked at.
+///
+/// A tensor nobody reads is not a harmless extra: it is a term of the
+/// real graph that ours is missing. gpt-oss ships `blk.N.attn_sinks`
+/// and ferrox has no attention-sink code anywhere, so the file loads,
+/// runs at full speed, and emits a different distribution than the model
+/// it claims to be; the newer MoE recipes ship `ffn_exp_probs_b` the
+/// same way. Both are silent today, and both are exactly what the
+/// architecture registry cannot catch, because the architecture *string*
+/// is one ferrox does support — it is the checkpoint that carries more
+/// than the registry entry promises.
+///
+/// This is deliberately the last check in the load: by here every loader
+/// arm has had its chance to ask for what it needs, so what is left over
+/// is what nothing in this build knows about.
+///
+/// `FERROX_ALLOW_UNKNOWN_TENSORS=1` downgrades it to a warning, for the
+/// case where a human has decided the missing term does not matter (a
+/// bias tensor of zeros, an auxiliary head that never runs). The default
+/// is refusal: a wrong answer is worse than no answer.
+pub fn assert_every_tensor_consumed(file: &ShardedGguf) -> Result<(), LoadError> {
+    let mut left: Vec<String> = file
+        .unconsumed_tensors()
+        .into_iter()
+        .filter(|n| !IGNORED_TENSOR_PREFIXES.iter().any(|p| n.starts_with(p)))
+        .collect();
+    if left.is_empty() {
+        return Ok(());
+    }
+    left.sort();
+    let shown = left.iter().take(8).cloned().collect::<Vec<_>>().join(", ");
+    let listing = if left.len() > 8 {
+        format!("{shown}, … (+{} more)", left.len() - 8)
+    } else {
+        shown
+    };
+    if matches!(
+        std::env::var("FERROX_ALLOW_UNKNOWN_TENSORS")
+            .ok()
+            .as_deref(),
+        Some("1") | Some("true") | Some("on")
+    ) {
+        eprintln!(
+            "ferrox: WARNING — {} tensor(s) in this checkpoint are never read \
+             ({listing}); output may be wrong (FERROX_ALLOW_UNKNOWN_TENSORS=1)",
+            left.len()
+        );
+        return Ok(());
+    }
+    Err(LoadError::UnconsumedTensors(left.len(), listing))
 }
 
 #[cfg(test)]
@@ -2159,22 +2322,65 @@ mod tests {
         buf
     }
 
-    /// End-to-end load+apply for the three codebook-grid low-bit
-    /// formats the published Dynamic GGUFs are built from: a real
-    /// on-disk tensor of each type must load zero-copy as the right
-    /// `QuantKind` and produce the same matvec result as dequantizing
-    /// the block directly. Dtype tags (19/16/18) verified against
-    /// ggml.h's enum ggml_type.
+    /// A structurally valid block of `len` bytes for any of the
+    /// codebook-grid formats: every bit pattern is a legal code in all
+    /// of them (the grid indices are bounded by their own bit widths),
+    /// so a deterministic byte fill is a real block, not a fixture that
+    /// happens to avoid the interesting paths. Only the f16 scale needs
+    /// pinning, and only so the comparison below can't be NaN-vs-NaN.
+    fn pseudo_iq_block(len: usize, seed: u32) -> Vec<u8> {
+        let mut s = seed;
+        let mut out = Vec::with_capacity(len);
+        for _ in 0..len {
+            s ^= s << 13;
+            s ^= s >> 17;
+            s ^= s << 5;
+            out.push((s >> 24) as u8);
+        }
+        out
+    }
+
+    /// End-to-end load+apply for the codebook-grid low-bit formats the
+    /// published Dynamic GGUFs are built from: a real on-disk tensor of
+    /// each type must load zero-copy as the right `QuantKind` and
+    /// produce the same matvec result as dequantizing the block
+    /// directly. That is the property this test exists for -- the
+    /// *values* are pinned against real ggml in `ferrox-quant`; what
+    /// can only break here is the tag -> kind -> block-stride chain,
+    /// and a wrong stride silently reads the neighbouring row.
+    /// Dtype tags (19/29/16/17/22/18/21/39) verified against ggml.h's
+    /// enum ggml_type.
     #[test]
     fn load_weight_matrix_handles_real_on_disk_iq_lowbit_tensors_end_to_end() {
         type DequantFn = fn(&[u8]) -> Result<Vec<f32>, ferrox_quant::QuantError>;
-        let cases: [(&str, u32, &[u8], QuantKind, DequantFn); 4] = [
+        // IQ1_M carries no f16 scale field; its scale is reassembled
+        // from the four scale words' top nibbles, and the top nibble of
+        // the last one supplies the f16 sign + high exponent bits.
+        // Pinning it to 0x2 keeps the exponent out of the all-ones
+        // NaN/Inf pattern whatever the rest of the fill does. The other
+        // three do carry a leading f16 `d`, pinned for the same reason.
+        let mut iq1m = pseudo_iq_block(ferrox_quant::IQ1_M_BLOCK_BYTES, 0x2907_31A0);
+        iq1m[55] = (iq1m[55] & 0x0F) | 0x20;
+        let mut iq2xs = pseudo_iq_block(ferrox_quant::IQ2_XS_BLOCK_BYTES, 0x2107_31A1);
+        let mut iq2s = pseudo_iq_block(ferrox_quant::IQ2_S_BLOCK_BYTES, 0x2207_31A2);
+        let mut iq3s = pseudo_iq_block(ferrox_quant::IQ3_S_BLOCK_BYTES, 0x2307_31A3);
+        for blk in [&mut iq2xs, &mut iq2s, &mut iq3s] {
+            blk[0..2].copy_from_slice(&half::f16::from_f32(0.115).to_le_bytes());
+        }
+        let cases: [(&str, u32, &[u8], QuantKind, DequantFn); 8] = [
             (
                 "iq1s",
                 19,
                 &IQ1_S_TEST_BLOCK,
                 QuantKind::IQ1S,
                 ferrox_quant::dequant_iq1_s,
+            ),
+            (
+                "iq1m",
+                29,
+                &iq1m,
+                QuantKind::IQ1M,
+                ferrox_quant::dequant_iq1_m,
             ),
             (
                 "iq2xxs",
@@ -2184,11 +2390,32 @@ mod tests {
                 ferrox_quant::dequant_iq2_xxs,
             ),
             (
+                "iq2xs",
+                17,
+                &iq2xs,
+                QuantKind::IQ2XS,
+                ferrox_quant::dequant_iq2_xs,
+            ),
+            (
+                "iq2s",
+                22,
+                &iq2s,
+                QuantKind::IQ2S,
+                ferrox_quant::dequant_iq2_s,
+            ),
+            (
                 "iq3xxs",
                 18,
                 &IQ3_XXS_TEST_BLOCK,
                 QuantKind::IQ3XXS,
                 ferrox_quant::dequant_iq3_xxs,
+            ),
+            (
+                "iq3s",
+                21,
+                &iq3s,
+                QuantKind::IQ3S,
+                ferrox_quant::dequant_iq3_s,
             ),
             (
                 "mxfp4_gguf",

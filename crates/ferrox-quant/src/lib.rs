@@ -13,6 +13,11 @@
 //! GGUF-roundtrip tests.
 
 pub mod iq_tables;
+/// ggml-produced golden vectors for the IQ2_XS/IQ2_S/IQ3_S/IQ1_M
+/// kernels. Test-only: a ~60 KB data blob has no business in a release
+/// build, and nothing outside the tests reads it.
+#[cfg(test)]
+mod iq_tier_goldens;
 pub mod repack;
 
 pub use repack::{
@@ -4921,35 +4926,81 @@ pub fn dot_mxfp4_row_f32_scalar(packed: &[u8], scales: &[u8], x: &[f32]) -> f32 
 }
 
 // ---------------------------------------------------------------------
-// IQ1_S / IQ2_XXS / IQ3_XXS: the codebook-grid low-bit formats used
-// throughout published "Dynamic" low-bit GGUFs of large MoE models.
+// IQ1_S / IQ1_M / IQ2_XXS / IQ2_XS / IQ2_S / IQ3_XXS / IQ3_S: the
+// codebook-grid low-bit formats used throughout published "Dynamic"
+// low-bit GGUFs of large MoE models.
 // Unlike every format above, an element's magnitude comes from a shared
 // grid table (`iq_tables`) indexed by packed code bits, with signs
-// applied from a shared 7-bit sign-pattern table -- not from an
+// applied from a shared 7-bit sign-pattern table (the `_XXS`/`IQ2_XS`
+// tier) or from literal sign bytes (the `_S` tier) -- not from an
 // arithmetic transform of the stored bits. Layouts and semantics
 // written against ggml's published dequant reference
-// (`dequantize_row_iq1_s`/`_iq2_xxs`/`_iq3_xxs`); cross-validated by
-// an independent Python reference whose own output is checked against
-// the real compiled ggml implementation (`ggml_get_type_traits(...)
-// ->to_float`) to float32 rounding error on random blocks.
+// (`dequantize_row_iq1_s`/`_iq1_m`/`_iq2_xxs`/`_iq2_xs`/`_iq2_s`/
+// `_iq3_xxs`/`_iq3_s` in `ggml/src/ggml-quants.c`); cross-validated
+// against the real compiled ggml implementation -- for the `_XXS` tier
+// via an independent Python reference checked against
+// `ggml_get_type_traits(...)->to_float`, and for IQ2_XS/IQ2_S/IQ3_S/
+// IQ1_M by linking ggml-quants.c directly and asserting bit-exact
+// equality with its output (see this module's tests).
+//
+// A wrong grid index or a wrong sign/scale unpack in these formats does
+// not produce obviously broken numbers -- it produces plausible ones
+// from the same codebook. So every one of them is pinned to ggml's own
+// bytes rather than to a self-consistent re-derivation, and the pinned
+// blocks deliberately include the all-ones pattern (maximum grid index,
+// every sign bit, maximum scale nibbles) and the all-zeros pattern.
 // ---------------------------------------------------------------------
 
 /// IQ1_S: d(f16) + 32 low-index bytes + 8 u16 (3 high index bits + 3
 /// scale bits + sign-of-delta per 32-element group). 1.5625 bpw.
 pub const IQ1_S_BLOCK_BYTES: usize = 50;
 pub const IQ1_S_BLOCK_ELEMS: usize = 256;
+/// IQ1_M: 32 low-index bytes + 16 qh bytes (3 high index bits + a
+/// sign-of-delta bit per 8-element group) + 8 scale bytes. 1.75 bpw.
+/// The only IQ format with no f16 scale field -- see `for_each_iq1_m`.
+pub const IQ1_M_BLOCK_BYTES: usize = 56;
+pub const IQ1_M_BLOCK_ELEMS: usize = 256;
 /// IQ2_XXS: d(f16) + 32 u16 codes (grid indices + packed scale/signs).
 /// 2.0625 bpw.
 pub const IQ2_XXS_BLOCK_BYTES: usize = 66;
 pub const IQ2_XXS_BLOCK_ELEMS: usize = 256;
+/// IQ2_XS: d(f16) + 32 u16 codes (9-bit grid index + 7-bit sign index)
+/// + 8 scale bytes (two 4-bit scales per 32-element group). 2.3125 bpw.
+pub const IQ2_XS_BLOCK_BYTES: usize = 74;
+pub const IQ2_XS_BLOCK_ELEMS: usize = 256;
+/// IQ2_S: d(f16) + 32 low-index bytes + 32 literal sign bytes + 8 qh
+/// bytes (2 high index bits per group of 8) + 8 scale bytes. 2.5625 bpw.
+pub const IQ2_S_BLOCK_BYTES: usize = 82;
+pub const IQ2_S_BLOCK_ELEMS: usize = 256;
 /// IQ3_XXS: d(f16) + 64 grid-index bytes + 8 u32 scale/sign words.
 /// 3.0625 bpw.
 pub const IQ3_XXS_BLOCK_BYTES: usize = 98;
 pub const IQ3_XXS_BLOCK_ELEMS: usize = 256;
+/// IQ3_S: d(f16) + 64 low-index bytes + 8 qh bytes (one 9th index bit
+/// per grid code) + 32 literal sign bytes + 4 scale bytes (two 4-bit
+/// scales per pair of 32-element groups). 3.4375 bpw.
+pub const IQ3_S_BLOCK_BYTES: usize = 110;
+pub const IQ3_S_BLOCK_ELEMS: usize = 256;
 
 /// ggml's IQ1S_DELTA: the constant additive shift applied to every
-/// IQ1_S grid value, signed per 32-element group.
+/// IQ1_S grid value, signed per 32-element group. IQ1_M's IQ1M_DELTA is
+/// the same 0.125 in ggml-common.h, applied per 8-element group; kept as
+/// one constant here because the two are defined equal upstream and a
+/// second name would only invite them to drift apart in this file.
 const IQ1S_DELTA: f32 = 0.125;
+
+/// `+1.0` when the matching bit in an IQ sign byte is clear, `-1.0` when
+/// it is set. Every IQ2/IQ3 format signs its grid magnitudes this way;
+/// only the provenance of `signs` differs (a `KSIGNS_IQ2XS` lookup for
+/// the `_XXS`/`IQ2_XS` tier, a literal stored byte for the `_S` tier).
+#[inline]
+fn iq_sign(signs: u8, j: usize) -> f32 {
+    if signs & iq_tables::KMASK_IQ2XS[j] != 0 {
+        -1.0
+    } else {
+        1.0
+    }
+}
 
 #[inline]
 fn read_f16(bytes: &[u8]) -> f32 {
@@ -5008,12 +5059,7 @@ fn for_each_iq2_xxs(block: &[u8], mut emit: impl FnMut(usize, f32)) {
             let signs = iq_tables::KSIGNS_IQ2XS[((aux32_1 >> (7 * l)) & 127) as usize];
             for j in 0..8 {
                 let mag = ((row >> (8 * j)) & 0xFF) as f32;
-                let s = if signs & iq_tables::KMASK_IQ2XS[j] != 0 {
-                    -1.0
-                } else {
-                    1.0
-                };
-                emit(idx, db * mag * s);
+                emit(idx, db * mag * iq_sign(signs, j));
                 idx += 1;
             }
         }
@@ -5040,22 +5086,217 @@ fn for_each_iq3_xxs(block: &[u8], mut emit: impl FnMut(usize, f32)) {
             let g1 = iq_tables::IQ3XXS_GRID[qs[8 * ib32 + 2 * l] as usize];
             let g2 = iq_tables::IQ3XXS_GRID[qs[8 * ib32 + 2 * l + 1] as usize];
             for j in 0..4 {
-                let s = if signs & iq_tables::KMASK_IQ2XS[j] != 0 {
-                    -1.0
-                } else {
-                    1.0
-                };
-                emit(idx + j, db * ((g1 >> (8 * j)) & 0xFF) as f32 * s);
+                emit(
+                    idx + j,
+                    db * ((g1 >> (8 * j)) & 0xFF) as f32 * iq_sign(signs, j),
+                );
             }
             for j in 0..4 {
-                let s = if signs & iq_tables::KMASK_IQ2XS[j + 4] != 0 {
-                    -1.0
-                } else {
-                    1.0
-                };
-                emit(idx + 4 + j, db * ((g2 >> (8 * j)) & 0xFF) as f32 * s);
+                emit(
+                    idx + 4 + j,
+                    db * ((g2 >> (8 * j)) & 0xFF) as f32 * iq_sign(signs, j + 4),
+                );
             }
             idx += 8;
+        }
+    }
+}
+
+/// Shared IQ2_XS per-block walk (same emit contract as IQ1_S above).
+///
+/// IQ2_XS is IQ2_XXS with the scales pulled out of the code words: each
+/// u16 code now spends all 16 bits on payload (9-bit grid index + 7-bit
+/// `KSIGNS_IQ2XS` index), and the per-group scales move into their own
+/// 8 trailing bytes, two 4-bit scales per 32-element group. The `l/2`
+/// split below is ggml's: within a group of 32, codes 0-1 take the low
+/// nibble's scale and codes 2-3 the high nibble's.
+#[inline]
+fn for_each_iq2_xs(block: &[u8], mut emit: impl FnMut(usize, f32)) {
+    let d = read_f16(block);
+    let qs = &block[2..66];
+    let scales = &block[66..74];
+    let mut idx = 0usize;
+    for ib32 in 0..8 {
+        let db = [
+            d * (0.5 + (scales[ib32] & 0xF) as f32) * 0.25,
+            d * (0.5 + (scales[ib32] >> 4) as f32) * 0.25,
+        ];
+        for l in 0..4 {
+            let code = u16::from_le_bytes([qs[8 * ib32 + 2 * l], qs[8 * ib32 + 2 * l + 1]]);
+            let row = iq_tables::IQ2XS_GRID[(code & 511) as usize];
+            let signs = iq_tables::KSIGNS_IQ2XS[(code >> 9) as usize];
+            for j in 0..8 {
+                let mag = ((row >> (8 * j)) & 0xFF) as f32;
+                emit(idx, db[l / 2] * mag * iq_sign(signs, j));
+                idx += 1;
+            }
+        }
+    }
+}
+
+/// Shared IQ2_S per-block walk (same emit contract as IQ1_S above).
+///
+/// IQ2_S spends its extra quarter-bit on *literal* signs: instead of a
+/// 7-bit index into `KSIGNS_IQ2XS` (which can only express the 128 sign
+/// patterns of even parity), each group of 8 elements gets a full sign
+/// byte. That frees the code word of sign bits entirely, so the grid
+/// index widens to 10 bits -- 8 from `qs` plus 2 pulled out of the
+/// group's `qh` byte, a different 2-bit field per code (`l` selects
+/// which). Note ggml declares `qs` as one 64-byte array and then aliases
+/// its second half as the sign bytes; the two halves are named
+/// separately here because they are unrelated payloads.
+#[inline]
+fn for_each_iq2_s(block: &[u8], mut emit: impl FnMut(usize, f32)) {
+    let d = read_f16(block);
+    let qs = &block[2..34];
+    let sign_bytes = &block[34..66];
+    let qh = &block[66..74];
+    let scales = &block[74..82];
+    let mut idx = 0usize;
+    for ib32 in 0..8 {
+        let db = [
+            d * (0.5 + (scales[ib32] & 0xF) as f32) * 0.25,
+            d * (0.5 + (scales[ib32] >> 4) as f32) * 0.25,
+        ];
+        for l in 0..4 {
+            let hi = ((qh[ib32] as usize) << (8 - 2 * l)) & 0x300;
+            let row = iq_tables::IQ2S_GRID[qs[4 * ib32 + l] as usize | hi];
+            let signs = sign_bytes[4 * ib32 + l];
+            for j in 0..8 {
+                let mag = ((row >> (8 * j)) & 0xFF) as f32;
+                emit(idx, db[l / 2] * mag * iq_sign(signs, j));
+                idx += 1;
+            }
+        }
+    }
+}
+
+/// Shared IQ3_S per-block walk (same emit contract as IQ1_S above).
+///
+/// IQ3_S is to IQ3_XXS what IQ2_S is to IQ2_XXS: literal sign bytes
+/// instead of `KSIGNS_IQ2XS` indices, and the freed bits spent widening
+/// the grid index to 9 bits (8 from `qs`, the 9th from the group's `qh`
+/// byte, one bit per code). Scales are the odd part: there are only 4
+/// scale bytes for 8 groups of 32, so one byte's two nibbles cover
+/// *two consecutive groups* -- low nibble for the even group, high
+/// nibble for the odd one -- and the scale is `1 + 2*nibble` (an odd
+/// integer multiplier), not the `(0.5 + nibble) * 0.25` of the IQ2 tier.
+///
+/// ggml writes this as a loop stepping `ib32` by 2 with pointer bumps
+/// inside; unrolled here to a plain per-group loop with explicit
+/// offsets, which is the same traversal with the aliasing spelled out.
+#[inline]
+fn for_each_iq3_s(block: &[u8], mut emit: impl FnMut(usize, f32)) {
+    let d = read_f16(block);
+    let qs = &block[2..66];
+    let qh = &block[66..74];
+    let sign_bytes = &block[74..106];
+    let scales = &block[106..110];
+    let mut idx = 0usize;
+    for ib32 in 0..8 {
+        let nibble = if ib32 % 2 == 0 {
+            scales[ib32 / 2] & 0xF
+        } else {
+            scales[ib32 / 2] >> 4
+        };
+        let db = d * (1.0 + 2.0 * nibble as f32);
+        for l in 0..4 {
+            // The 9th index bit for code `2l` is qh bit `2l`, and for
+            // code `2l+1` it is qh bit `2l+1` -- ggml expresses both as
+            // a left shift landing that bit on 256.
+            let h = qh[ib32] as usize;
+            let i1 = qs[8 * ib32 + 2 * l] as usize | ((h << (8 - 2 * l)) & 256);
+            let i2 = qs[8 * ib32 + 2 * l + 1] as usize | ((h << (7 - 2 * l)) & 256);
+            let g1 = iq_tables::IQ3S_GRID[i1];
+            let g2 = iq_tables::IQ3S_GRID[i2];
+            let signs = sign_bytes[4 * ib32 + l];
+            for j in 0..4 {
+                emit(
+                    idx + j,
+                    db * ((g1 >> (8 * j)) & 0xFF) as f32 * iq_sign(signs, j),
+                );
+            }
+            for j in 0..4 {
+                emit(
+                    idx + 4 + j,
+                    db * ((g2 >> (8 * j)) & 0xFF) as f32 * iq_sign(signs, j + 4),
+                );
+            }
+            idx += 8;
+        }
+    }
+}
+
+/// Shared IQ1_M per-block walk (same emit contract as IQ1_S above).
+///
+/// IQ1_M reuses IQ1_S's 2048-entry signed grid and its `+/-delta` shift,
+/// but restructures everything around it, and it is the one IQ format
+/// with **no f16 scale field**: the block's 16 scale bits are scattered
+/// as the top nibble of each of the four 16-bit scale words, and are
+/// reassembled here into an f16 bit pattern. The remaining 12 bits of
+/// each word carry four 3-bit sub-scales (two 32-element groups per
+/// word, two sub-scales per group covering 16 elements each), so the
+/// scale resolution is twice IQ1_S's.
+///
+/// The delta sign is also finer-grained than IQ1_S's: one bit per 8
+/// elements (`qh` bits 3 and 7) rather than one per 32.
+#[inline]
+fn for_each_iq1_m(block: &[u8], mut emit: impl FnMut(usize, f32)) {
+    let qs = &block[0..32];
+    let qh = &block[32..48];
+    let scales = &block[48..56];
+    let sc: [u16; 4] =
+        std::array::from_fn(|k| u16::from_le_bytes([scales[2 * k], scales[2 * k + 1]]));
+    // Top nibble of sc[0]..sc[3] -> f16 bits 0-3, 4-7, 8-11, 12-15.
+    let d = f16::from_bits(
+        (sc[0] >> 12) | ((sc[1] >> 8) & 0x00F0) | ((sc[2] >> 4) & 0x0F00) | (sc[3] & 0xF000),
+    )
+    .to_f32();
+    let mut idx = 0usize;
+    for ib in 0..8 {
+        let shift = 6 * (ib % 2);
+        let dl = [
+            d * (2.0 * ((sc[ib / 2] >> shift) & 7) as f32 + 1.0),
+            d * (2.0 * ((sc[ib / 2] >> (shift + 3)) & 7) as f32 + 1.0),
+        ];
+        let (h0, h1) = (qh[2 * ib] as usize, qh[2 * ib + 1] as usize);
+        // Grid index high bits: qh nibble bits 0-2 of each half-byte.
+        // Bits 3 and 7 of each qh byte are the delta signs instead.
+        let grid_idx = [
+            qs[4 * ib] as usize | ((h0 << 8) & 0x700),
+            qs[4 * ib + 1] as usize | ((h0 << 4) & 0x700),
+            qs[4 * ib + 2] as usize | ((h1 << 8) & 0x700),
+            qs[4 * ib + 3] as usize | ((h1 << 4) & 0x700),
+        ];
+        let delta = [
+            if h0 & 0x08 != 0 {
+                -IQ1S_DELTA
+            } else {
+                IQ1S_DELTA
+            },
+            if h0 & 0x80 != 0 {
+                -IQ1S_DELTA
+            } else {
+                IQ1S_DELTA
+            },
+            if h1 & 0x08 != 0 {
+                -IQ1S_DELTA
+            } else {
+                IQ1S_DELTA
+            },
+            if h1 & 0x80 != 0 {
+                -IQ1S_DELTA
+            } else {
+                IQ1S_DELTA
+            },
+        ];
+        for l in 0..4 {
+            let row = iq_tables::IQ1S_GRID[grid_idx[l]];
+            for j in 0..8 {
+                let v = ((row >> (8 * j)) & 0xFF) as u8 as i8;
+                emit(idx, dl[l / 2] * (v as f32 + delta[l]));
+                idx += 1;
+            }
         }
     }
 }
@@ -5119,6 +5360,29 @@ iq_dispatch!(
     dot_iq3_xxs_f32_avx2
 );
 
+/// IQ2_XS / IQ2_S / IQ3_S / IQ1_M dispatch: scalar only. These landed
+/// for *coverage* -- before them, tags 17/21/22/29 fell to
+/// `GgmlType::Other` and the tensor could not be decoded at all, which
+/// silently ruled out 5 of the 16 published Unsloth `UD-*` variants.
+/// They deliberately match the state of their older siblings' NEON/GPU
+/// story (none), rather than growing a vectorized path that no golden
+/// vector would then be able to distinguish from the scalar one.
+pub fn dot_iq2_xs_f32(row_bytes: &[u8], x: &[f32]) -> f32 {
+    dot_iq2_xs_f32_scalar(row_bytes, x)
+}
+
+pub fn dot_iq2_s_f32(row_bytes: &[u8], x: &[f32]) -> f32 {
+    dot_iq2_s_f32_scalar(row_bytes, x)
+}
+
+pub fn dot_iq3_s_f32(row_bytes: &[u8], x: &[f32]) -> f32 {
+    dot_iq3_s_f32_scalar(row_bytes, x)
+}
+
+pub fn dot_iq1_m_f32(row_bytes: &[u8], x: &[f32]) -> f32 {
+    dot_iq1_m_f32_scalar(row_bytes, x)
+}
+
 /// GGUF block-MXFP4 dispatch: scalar only so far (the two-buffer
 /// safetensors MXFP4 form has AVX2/NEON kernels above; this block form
 /// hasn't needed one yet).
@@ -5146,6 +5410,34 @@ iq_dequant_and_dot!(
     for_each_iq3_xxs,
     IQ3_XXS_BLOCK_BYTES,
     IQ3_XXS_BLOCK_ELEMS
+);
+iq_dequant_and_dot!(
+    dequant_iq2_xs,
+    dot_iq2_xs_f32_scalar,
+    for_each_iq2_xs,
+    IQ2_XS_BLOCK_BYTES,
+    IQ2_XS_BLOCK_ELEMS
+);
+iq_dequant_and_dot!(
+    dequant_iq2_s,
+    dot_iq2_s_f32_scalar,
+    for_each_iq2_s,
+    IQ2_S_BLOCK_BYTES,
+    IQ2_S_BLOCK_ELEMS
+);
+iq_dequant_and_dot!(
+    dequant_iq3_s,
+    dot_iq3_s_f32_scalar,
+    for_each_iq3_s,
+    IQ3_S_BLOCK_BYTES,
+    IQ3_S_BLOCK_ELEMS
+);
+iq_dequant_and_dot!(
+    dequant_iq1_m,
+    dot_iq1_m_f32_scalar,
+    for_each_iq1_m,
+    IQ1_M_BLOCK_BYTES,
+    IQ1_M_BLOCK_ELEMS
 );
 
 /// GGUF block-MXFP4 (ggml type tag 39): one 17-byte block = 1 E8M0
@@ -6508,6 +6800,184 @@ mod tests {
         assert!(dequant_iq1_s(&bad).is_err());
         assert!(dequant_iq2_xxs(&bad).is_err());
         assert!(dequant_iq3_xxs(&bad).is_err());
+        assert!(dequant_iq2_xs(&bad).is_err());
+        assert!(dequant_iq2_s(&bad).is_err());
+        assert!(dequant_iq3_s(&bad).is_err());
+        assert!(dequant_iq1_m(&bad).is_err());
+    }
+
+    /// IQ2_XS / IQ2_S / IQ3_S / IQ1_M against the **real compiled ggml
+    /// dequantizers**, not a second reading of the spec.
+    ///
+    /// This is the whole job for these four formats. They are codebook
+    /// formats: a wrong grid index, a swapped scale nibble or an
+    /// off-by-one in the sign unpack does not produce obviously broken
+    /// numbers, it produces other plausible numbers out of the same
+    /// codebook. So the goldens in `iq_tier_goldens` are ggml's own
+    /// output (see that module's header for how they were produced and
+    /// why those particular blocks), and the comparison is **exact** --
+    /// every arithmetic step here is expressible in f32 without
+    /// reassociation, so any difference at all is a decode bug, not
+    /// rounding.
+    #[test]
+    fn iq_tier_dequant_matches_real_ggml_exactly() {
+        type DequantFn = fn(&[u8]) -> Result<Vec<f32>, QuantError>;
+        let cases: [(&str, &[u8], &[f32], DequantFn); 4] = [
+            (
+                "IQ2_XS",
+                &iq_tier_goldens::IQ2_XS_TEST_BLOCKS,
+                &iq_tier_goldens::IQ2_XS_GOLDEN,
+                dequant_iq2_xs,
+            ),
+            (
+                "IQ2_S",
+                &iq_tier_goldens::IQ2_S_TEST_BLOCKS,
+                &iq_tier_goldens::IQ2_S_GOLDEN,
+                dequant_iq2_s,
+            ),
+            (
+                "IQ3_S",
+                &iq_tier_goldens::IQ3_S_TEST_BLOCKS,
+                &iq_tier_goldens::IQ3_S_GOLDEN,
+                dequant_iq3_s,
+            ),
+            (
+                "IQ1_M",
+                &iq_tier_goldens::IQ1_M_TEST_BLOCKS,
+                &iq_tier_goldens::IQ1_M_GOLDEN,
+                dequant_iq1_m,
+            ),
+        ];
+        for (name, blocks, golden, dequant) in cases {
+            let got = dequant(blocks).unwrap();
+            assert_eq!(got.len(), golden.len(), "{name}: element count");
+            for (i, (a, b)) in got.iter().zip(golden.iter()).enumerate() {
+                assert_eq!(
+                    a.to_bits(),
+                    b.to_bits(),
+                    "{name} element {i} (block {}, offset {}): rust={a} ggml={b}",
+                    i / 256,
+                    i % 256
+                );
+            }
+        }
+    }
+
+    /// The saturated first block of each fixture is the one that pins
+    /// the *high* end of every packed field, so spell out what it is
+    /// asserting: with every byte 0xff, each format must reach its
+    /// maximum grid index -- the single most likely thing to get wrong
+    /// when a format widens its index by stealing bits from `qh`.
+    ///
+    /// Derived here from the grid tables directly, so this test fails
+    /// even if the golden fixture were regenerated from a broken
+    /// harness.
+    #[test]
+    fn iq_tier_all_ones_block_reaches_the_maximum_grid_index() {
+        // IQ2_XS: code = 0xffff -> grid index 511 (the top of a 512-row
+        // grid), sign index 127 -> ksigns 255 -> every element negative.
+        // Scale nibble 15 -> db = d * (0.5 + 15) * 0.25.
+        let d = f16::from_le_bytes([
+            iq_tier_goldens::IQ2_XS_TEST_BLOCKS[0],
+            iq_tier_goldens::IQ2_XS_TEST_BLOCKS[1],
+        ])
+        .to_f32();
+        let mag = (iq_tables::IQ2XS_GRID[511] & 0xFF) as f32;
+        assert_eq!(
+            iq_tier_goldens::IQ2_XS_GOLDEN[0],
+            -(d * (0.5 + 15.0) * 0.25) * mag
+        );
+
+        // IQ2_S: qs byte 0xff plus 2 high bits from qh -> grid index
+        // 1023, the top of a 1024-row grid; sign byte 0xff.
+        let d = f16::from_le_bytes([
+            iq_tier_goldens::IQ2_S_TEST_BLOCKS[0],
+            iq_tier_goldens::IQ2_S_TEST_BLOCKS[1],
+        ])
+        .to_f32();
+        let mag = (iq_tables::IQ2S_GRID[1023] & 0xFF) as f32;
+        assert_eq!(
+            iq_tier_goldens::IQ2_S_GOLDEN[0],
+            -(d * (0.5 + 15.0) * 0.25) * mag
+        );
+
+        // IQ3_S: qs byte 0xff plus the 9th bit from qh -> grid index
+        // 511; scale nibble 15 -> db = d * (1 + 2*15) = 31*d.
+        let d = f16::from_le_bytes([
+            iq_tier_goldens::IQ3_S_TEST_BLOCKS[0],
+            iq_tier_goldens::IQ3_S_TEST_BLOCKS[1],
+        ])
+        .to_f32();
+        let mag = (iq_tables::IQ3S_GRID[511] & 0xFF) as f32;
+        assert_eq!(iq_tier_goldens::IQ3_S_GOLDEN[0], -(d * 31.0) * mag);
+
+        // IQ1_M: qs byte 0xff plus 3 high bits from qh -> grid index
+        // 2047, the top of the shared 2048-row IQ1 grid. Its scale is
+        // the f16 reassembled from the scale words' top nibbles, and
+        // its sub-scale nibble is 7 -> 2*7+1 = 15. The grid values are
+        // *signed*, and qh bit 3 is set so delta is negative.
+        let sc: [u16; 4] = std::array::from_fn(|k| {
+            u16::from_le_bytes([
+                iq_tier_goldens::IQ1_M_TEST_BLOCKS[48 + 2 * k],
+                iq_tier_goldens::IQ1_M_TEST_BLOCKS[48 + 2 * k + 1],
+            ])
+        });
+        let d = f16::from_bits(
+            (sc[0] >> 12) | ((sc[1] >> 8) & 0x00F0) | ((sc[2] >> 4) & 0x0F00) | (sc[3] & 0xF000),
+        )
+        .to_f32();
+        let v = (iq_tables::IQ1S_GRID[2047] & 0xFF) as u8 as i8;
+        assert_eq!(
+            iq_tier_goldens::IQ1_M_GOLDEN[0],
+            d * 15.0 * (v as f32 - IQ1S_DELTA)
+        );
+    }
+
+    /// The fused dots for the new tier must agree with dequant-then-dot
+    /// on the same bytes -- the same invariant
+    /// `iq_lowbit_fused_dots_match_dequant_then_dot` pins for the older
+    /// formats, restated here because these four share only the macro,
+    /// not the walk.
+    #[test]
+    fn iq_tier_fused_dots_match_dequant_then_dot() {
+        type DequantFn = fn(&[u8]) -> Result<Vec<f32>, QuantError>;
+        type DotFn = fn(&[u8], &[f32]) -> f32;
+        let x: Vec<f32> = (0..1024).map(|i| ((i as f32) * 0.031).cos()).collect();
+        let cases: [(&str, &[u8], DequantFn, DotFn); 4] = [
+            (
+                "IQ2_XS",
+                &iq_tier_goldens::IQ2_XS_TEST_BLOCKS,
+                dequant_iq2_xs,
+                dot_iq2_xs_f32,
+            ),
+            (
+                "IQ2_S",
+                &iq_tier_goldens::IQ2_S_TEST_BLOCKS,
+                dequant_iq2_s,
+                dot_iq2_s_f32,
+            ),
+            (
+                "IQ3_S",
+                &iq_tier_goldens::IQ3_S_TEST_BLOCKS,
+                dequant_iq3_s,
+                dot_iq3_s_f32,
+            ),
+            (
+                "IQ1_M",
+                &iq_tier_goldens::IQ1_M_TEST_BLOCKS,
+                dequant_iq1_m,
+                dot_iq1_m_f32,
+            ),
+        ];
+        for (name, blocks, dequant, dot) in cases {
+            let dequanted = dequant(blocks).unwrap();
+            let expected: f32 = dequanted.iter().zip(x.iter()).map(|(a, b)| a * b).sum();
+            let fused = dot(blocks, &x[..dequanted.len()]);
+            assert!(
+                (fused - expected).abs() <= expected.abs() * 1e-5 + 1e-3,
+                "{name}: fused={fused} expected={expected}"
+            );
+        }
     }
 
     // Generated by an independent Python reference -- do not hand-edit.

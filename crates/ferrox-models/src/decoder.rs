@@ -583,6 +583,16 @@ impl Decoder {
     /// NeoX pairing to an architecture that needs Norm.
     fn apply_rope_head_theta(&self, slice: &mut [f32], pos: usize, theta: f32) {
         use crate::config::RopeLayout;
+        // Partial rotary (llama.cpp `hparams.n_rot` < `n_embd_head_k`,
+        // GGUF `<arch>.rope.dimension_count`): Phi-3/Phi-4 rotate only the
+        // first 96 of each 128-wide head and pass the remaining 32
+        // through untouched. Rotating the whole head instead is not a
+        // subtle error — it moves dimensions the model never trained to
+        // be position-dependent.
+        let slice = match self.config.rope_dim {
+            Some(rot) if rot < slice.len() => &mut slice[..rot],
+            _ => slice,
+        };
         match (self.config.rope_layout, &self.config.rope_freqs) {
             (RopeLayout::Norm, Some(freq_factors)) => {
                 apply_rope_interleaved_with_freq_factors(slice, pos, theta, freq_factors)
@@ -597,6 +607,30 @@ impl Decoder {
 
     fn apply_rope_head_layer(&self, slice: &mut [f32], pos: usize, layer_idx: usize) {
         self.apply_rope_head_theta(slice, pos, self.config.layer_rope_theta(layer_idx))
+    }
+
+    /// llama.cpp's RoPE `mscale` (ggml `rope_yarn`), applied where the
+    /// QKV biases and QK-norms are: multiplying `cos`/`sin` by a constant
+    /// is the same as scaling the vector RoPE rotates, and rotation is
+    /// linear, so pre-scaling q and k here is exactly what the kernel
+    /// would do post-hoc — without a new uniform on five backends' RoPE
+    /// kernels.
+    ///
+    /// Both q and k are scaled, so attention logits carry `m²`, which is
+    /// the whole observable effect (V is untouched, and k enters the
+    /// cache scaled exactly as llama.cpp's does).
+    #[inline]
+    fn apply_rope_attn_factor(&self, q: &mut [f32], k: &mut [f32]) {
+        let m = self.config.rope_attn_factor;
+        if m == 1.0 {
+            return;
+        }
+        for v in q.iter_mut() {
+            *v *= m;
+        }
+        for v in k.iter_mut() {
+            *v *= m;
+        }
     }
 
     /// Applies Q/K RMSNorm according to [`ModelConfig::qk_norm_style`].
@@ -705,6 +739,15 @@ impl Decoder {
         if self.config.head_dim > 256 {
             return false;
         }
+        // Partial rotary and LongRoPE's `mscale` are CPU-only today: the
+        // Metal RoPE kernels rotate the whole head and take no magnitude
+        // uniform, so admitting such a model here would make Metal and
+        // CPU compute different attention for the same weights. Refusing
+        // costs Phi-4-mini its Metal path until the kernels carry both;
+        // the alternative is two backends that disagree.
+        if self.config.rope_dim.is_some() || self.config.rope_attn_factor != 1.0 {
+            return false;
+        }
         Self::metal_matvec_launch(&layer.attn.q_proj).is_some()
             && Self::metal_matvec_launch(&layer.attn.k_proj).is_some()
             && Self::metal_matvec_launch(&layer.attn.v_proj).is_some()
@@ -799,7 +842,68 @@ impl Decoder {
         }
     }
 
-    /// Length of a consecutive run of Metal dense-prefill layers from
+    /// Routed-expert FFN for the fused prefill stack, or `None` when this
+    /// layer must keep the host-routed path (`launch_moe_prefill_q4_0`).
+    ///
+    /// Note: routing happens on the GPU here, so prefill no longer feeds
+    /// `record_activations`. Expert hotness for `inspect-plan` comes from
+    /// decode, which still routes on the host.
+    #[cfg(feature = "metal")]
+    fn metal_prefill_moe<'a>(
+        layer: &'a LayerWeights,
+        config: &ModelConfig,
+    ) -> Option<ferrox_metal::gpu::PrefillMoeMetal<'a>> {
+        if !ferrox_metal::attn::metal_moe_stack_enabled()
+            || !ferrox_metal::attn::metal_moe_resident_enabled()
+            || Self::is_dense_layer(layer)
+            || !layer.moe.shared_experts.is_empty()
+            || !matches!(
+                config.ffn_activation,
+                crate::config::FfnActivation::Swiglu | crate::config::FfnActivation::SwigluFused
+            )
+            || !matches!(config.moe.gating, ferrox_moe::GatingFunction::Softmax)
+            || config.moe.expert_group_count.is_some()
+        {
+            return None;
+        }
+        let ferrox_core::weight_matrix::WeightMatrix::F32(router) = &layer.moe.router else {
+            return None;
+        };
+        let packed = Self::moe_packed_q4(&layer.moe)?;
+        let moe = ferrox_metal::gpu::PrefillMoeMetal {
+            router_w: &router.data,
+            top_k: config.moe.n_experts_active,
+            renormalize: config.moe.norm_topk_prob,
+            packed,
+        };
+        moe.is_supported().then_some(moe)
+    }
+
+    /// FFN half of a fused-prefill-stack layer: dense `mul_mm_sg` launches
+    /// or (MoE) the routed-expert description.
+    #[cfg(feature = "metal")]
+    fn metal_prefill_ffn<'a>(
+        layer: &'a LayerWeights,
+        config: &ModelConfig,
+    ) -> Option<ferrox_metal::attn::PrefillFfnMetal<'a>> {
+        if let Some(moe) = Self::metal_prefill_moe(layer, config) {
+            return Some(ferrox_metal::attn::PrefillFfnMetal::Moe(moe));
+        }
+        if !Self::is_dense_layer(layer) {
+            return None;
+        }
+        let ExpertBacking::Resident(experts) = &layer.moe.experts else {
+            return None;
+        };
+        let ex = experts.first()?;
+        Some(ferrox_metal::attn::PrefillFfnMetal::Dense {
+            gate: ex.gate.mul_mm_sg_launch()?,
+            up: ex.up.mul_mm_sg_launch()?,
+            down: ex.down.mul_mm_sg_launch()?,
+        })
+    }
+
+    /// Length of a consecutive run of Metal prefill-stack layers from
     /// `start`, or `None` when fewer than two layers qualify.
     #[cfg(feature = "metal")]
     fn metal_prefill_dense_stack_run_len(
@@ -815,26 +919,17 @@ impl Decoder {
         for li in start..self.layers.len() {
             let layer = &self.layers[li];
             let cache = &kv_caches[li];
-            if !Self::metal_prefill_dense_layer_eligible(layer) {
-                break;
-            }
             if !self.metal_prefill_dense_swa_fits(li, start_pos, batch_size) {
                 break;
             }
             if metal_kvs[li].seq_len != cache.seq_len || start_pos != cache.seq_len {
                 break;
             }
-            let ExpertBacking::Resident(experts) = &layer.moe.experts else {
-                break;
-            };
-            let ex = &experts[0];
             let ok = layer.attn.q_proj.mul_mm_sg_launch().is_some()
                 && layer.attn.k_proj.mul_mm_sg_launch().is_some()
                 && layer.attn.v_proj.mul_mm_sg_launch().is_some()
                 && layer.attn.o_proj.mul_mm_sg_launch().is_some()
-                && ex.gate.mul_mm_sg_launch().is_some()
-                && ex.up.mul_mm_sg_launch().is_some()
-                && ex.down.mul_mm_sg_launch().is_some();
+                && Self::metal_prefill_ffn(layer, &self.config).is_some();
             if !ok {
                 break;
             }
@@ -867,19 +962,15 @@ impl Decoder {
         let mut rope_thetas = Vec::with_capacity(run_len);
         for li in start..start + run_len {
             let layer = &self.layers[li];
-            layer.moe.record_activations(&[0]);
-            let ExpertBacking::Resident(experts) = &layer.moe.experts else {
-                return None;
-            };
-            let ex = &experts[0];
-            let (q, k, v, o, gate, up, down) = (
+            let ffn = Self::metal_prefill_ffn(layer, &self.config)?;
+            if matches!(ffn, ferrox_metal::attn::PrefillFfnMetal::Dense { .. }) {
+                layer.moe.record_activations(&[0]);
+            }
+            let (q, k, v, o) = (
                 layer.attn.q_proj.mul_mm_sg_launch()?,
                 layer.attn.k_proj.mul_mm_sg_launch()?,
                 layer.attn.v_proj.mul_mm_sg_launch()?,
                 layer.attn.o_proj.mul_mm_sg_launch()?,
-                ex.gate.mul_mm_sg_launch()?,
-                ex.up.mul_mm_sg_launch()?,
-                ex.down.mul_mm_sg_launch()?,
             );
             prefill_layers.push(ferrox_metal::attn::PrefillDenseLayerMetal {
                 attn_norm_w: &layer.attn.norm_weight,
@@ -888,9 +979,7 @@ impl Decoder {
                 k,
                 v,
                 o,
-                gate,
-                up,
-                down,
+                ffn,
                 post_attn_norm: layer.attn.post_attn_norm.as_deref(),
                 post_ffn_norm: layer.attn.post_ffn_norm.as_deref(),
                 extras: self.metal_attn_extras(layer),
@@ -2173,6 +2262,7 @@ impl Decoder {
                 if let Some(k_norm) = &layer.attn.k_norm {
                     k = self.apply_qk_norm(&k, k_norm);
                 }
+                self.apply_rope_attn_factor(&mut q, &mut k);
 
                 for h in 0..n_heads {
                     self.apply_rope_head_layer(&mut q[h * head_dim..(h + 1) * head_dim], pos, l);
@@ -2364,6 +2454,7 @@ impl Decoder {
             if let Some(k_norm) = &layer.attn.k_norm {
                 k = self.apply_qk_norm(&k, k_norm);
             }
+            self.apply_rope_attn_factor(&mut q, &mut k);
 
             for h in 0..n_heads {
                 self.apply_rope_head_layer(&mut q[h * head_dim..(h + 1) * head_dim], pos, l);
@@ -3255,15 +3346,17 @@ impl Decoder {
                             if metal_kvs[l].seq_len == cache.seq_len && start_pos == cache.seq_len {
                                 layer.moe.record_activations(&[0]);
                                 let fused = layer.moe.with_expert(0, |ex| {
-                                    let (q, k, v, o, gate, up, down) = (
+                                    let (q, k, v, o) = (
                                         layer.attn.q_proj.mul_mm_sg_launch()?,
                                         layer.attn.k_proj.mul_mm_sg_launch()?,
                                         layer.attn.v_proj.mul_mm_sg_launch()?,
                                         layer.attn.o_proj.mul_mm_sg_launch()?,
-                                        ex.gate.mul_mm_sg_launch()?,
-                                        ex.up.mul_mm_sg_launch()?,
-                                        ex.down.mul_mm_sg_launch()?,
                                     );
+                                    let ffn = ferrox_metal::attn::PrefillFfnMetal::Dense {
+                                        gate: ex.gate.mul_mm_sg_launch()?,
+                                        up: ex.up.mul_mm_sg_launch()?,
+                                        down: ex.down.mul_mm_sg_launch()?,
+                                    };
                                     let gelu = matches!(
                                         self.config.ffn_activation,
                                         crate::config::FfnActivation::Gelu
@@ -3276,9 +3369,7 @@ impl Decoder {
                                             k,
                                             v,
                                             o,
-                                            gate,
-                                            up,
-                                            down,
+                                            ffn,
                                             post_attn_norm: layer.attn.post_attn_norm.as_deref(),
                                             post_ffn_norm: layer.attn.post_ffn_norm.as_deref(),
                                             extras: self.metal_attn_extras(layer),
@@ -3380,6 +3471,7 @@ impl Decoder {
                     row.copy_from_slice(&normed);
                 }
             }
+            self.apply_rope_attn_factor(&mut q_batch, &mut k_batch);
 
             #[cfg(feature = "metal")]
             {
@@ -3938,6 +4030,7 @@ impl Decoder {
                     row.copy_from_slice(&normed);
                 }
             }
+            self.apply_rope_attn_factor(&mut q_batch, &mut k_batch);
 
             for b in 0..batch_size {
                 let pos = positions[b];
@@ -4069,6 +4162,79 @@ impl Decoder {
             .chunks(vocab_size)
             .map(|c| c.to_vec())
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod partial_rotary_tests {
+    use super::*;
+
+    /// Phi-3/Phi-4 rotate `rope.dimension_count` of each head and pass
+    /// the rest through. The tail staying bit-identical is the whole
+    /// property: rotating it would make dimensions position-dependent
+    /// that the model never trained that way.
+    #[test]
+    fn partial_rotary_leaves_the_tail_untouched() {
+        let mut cfg = crate::config::test_dense_fixture();
+        cfg.head_dim = 8;
+        cfg.rope_layout = crate::config::RopeLayout::Neox;
+        cfg.rope_freqs = None;
+        cfg.rope_dim = Some(4);
+        let decoder = Decoder::new_random_small(cfg, 1, 32);
+
+        let mut head: Vec<f32> = (0..8).map(|i| 1.0 + i as f32).collect();
+        let before = head.clone();
+        decoder.apply_rope_head_theta(&mut head, 3, 10000.0);
+
+        assert_eq!(
+            &head[4..],
+            &before[4..],
+            "dims at or past rope_dim must not rotate"
+        );
+        assert!(
+            head[..4] != before[..4],
+            "dims below rope_dim must rotate at a non-zero position"
+        );
+    }
+
+    /// The same call with no `rope_dim` must rotate everything, so the
+    /// narrow case cannot silently become the default.
+    #[test]
+    fn full_rotary_still_rotates_the_whole_head() {
+        let mut cfg = crate::config::test_dense_fixture();
+        cfg.head_dim = 8;
+        cfg.rope_layout = crate::config::RopeLayout::Neox;
+        cfg.rope_freqs = None;
+        cfg.rope_dim = None;
+        let decoder = Decoder::new_random_small(cfg, 1, 32);
+
+        let mut head: Vec<f32> = (0..8).map(|i| 1.0 + i as f32).collect();
+        let before = head.clone();
+        decoder.apply_rope_head_theta(&mut head, 3, 10000.0);
+        assert!(head[4..] != before[4..]);
+    }
+
+    /// `mscale` scales q and k and nothing else; `1.0` must be a literal
+    /// no-op so every other model pays nothing.
+    #[test]
+    fn rope_attn_factor_scales_q_and_k_only() {
+        let mut cfg = crate::config::test_dense_fixture();
+        cfg.rope_attn_factor = 2.0;
+        let decoder = Decoder::new_random_small(cfg, 1, 32);
+        let mut q = vec![1.0f32, -2.0, 3.0];
+        let mut k = vec![0.5f32, 4.0];
+        decoder.apply_rope_attn_factor(&mut q, &mut k);
+        assert_eq!(q, vec![2.0, -4.0, 6.0]);
+        assert_eq!(k, vec![1.0, 8.0]);
+
+        let mut cfg = crate::config::test_dense_fixture();
+        cfg.rope_attn_factor = 1.0;
+        let decoder = Decoder::new_random_small(cfg, 1, 32);
+        let mut q = vec![1.0f32, -2.0];
+        let mut k = vec![3.0f32];
+        decoder.apply_rope_attn_factor(&mut q, &mut k);
+        assert_eq!(q, vec![1.0, -2.0]);
+        assert_eq!(k, vec![3.0]);
     }
 }
 

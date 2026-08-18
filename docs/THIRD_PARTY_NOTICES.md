@@ -51,23 +51,26 @@ the public layout used throughout the ggml/llama.cpp ecosystem. The
 dequantization routines here are written independently against that
 public layout description.
 
-## IQ1_S / IQ2_XXS / IQ3_XXS codebook tables
+## IQ1_S / IQ1_M / IQ2_XXS / IQ2_XS / IQ2_S / IQ3_XXS / IQ3_S codebook tables
 
 The low-bit IQ quantization formats are defined not only by a block
-layout but by fixed numeric codebook grids (`iq1s_grid`,
-`iq2xxs_grid`, `iq3xxs_grid`, `ksigns_iq2xs`, `kmask_iq2xs`). These
-tables are part of the format itself -- a file quantized with them
-cannot be decoded without these exact values, and they cannot be
-independently re-derived. `crates/ferrox-quant/src/iq_tables.rs`
-reproduces them from the MIT-licensed ggml project's `ggml-common.h`:
+layout but by fixed numeric codebook grids (`iq1s_grid`, `iq2xxs_grid`,
+`iq2xs_grid`, `iq2s_grid`, `iq3xxs_grid`, `iq3s_grid`, `ksigns_iq2xs`,
+`kmask_iq2xs`). These tables are part of the format itself -- a file
+quantized with them cannot be decoded without these exact values, and
+they cannot be independently re-derived.
+`crates/ferrox-quant/src/iq_tables.rs` reproduces them from the
+MIT-licensed ggml project's `ggml-common.h`:
 
   Copyright (c) 2023-2026 The ggml authors / Georgi Gerganov and
   contributors (llama.cpp)
 
 The dequantization *code* using those tables is written independently
 against ggml's published dequant semantics, and is cross-validated
-against the real compiled ggml implementation through an independent
-Python reference.
+against the real compiled ggml implementation -- for IQ1_S/IQ2_XXS/
+IQ3_XXS through an independent Python reference, and for IQ2_XS/IQ2_S/
+IQ3_S/IQ1_M by linking `ggml-quants.c` and asserting bit-exact equality
+with its own output (`crates/ferrox-quant/src/iq_tier_goldens.rs`).
 
 ## Speculative decoding design
 

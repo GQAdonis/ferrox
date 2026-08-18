@@ -143,12 +143,31 @@ unsafe fn dot_f32_avx2(a: &[f32], b: &[f32]) -> f32 {
 /// When `attn_softcap` is `Some(sc)` with `sc > 0`, each score is remapped
 /// with Gemma-2-style `sc * tanh(score / sc)` before the online softmax
 /// (llama.cpp `attention.logit_softcapping`).
+///
+/// When `sink` is `Some(s)`, one extra virtual key participates in the
+/// softmax denominator with logit `s` and a **zero** value vector, so it
+/// bleeds probability mass away from the real keys without contributing
+/// anything to the output. That is gpt-oss's attention sink, and this is
+/// exactly llama.cpp's own online form
+/// (`ggml/src/ggml-cpu/ops.cpp`, `ggml_compute_forward_flash_attn_ext_f16`,
+/// the `// sinks - apply only on the first kv-chunk` block):
+///
+/// ```text
+/// if (s > M) { ms = expf(M - s); M = s; scale VKQ by ms; } else { vs = expf(s - M); }
+/// S = S*ms + vs;
+/// ```
+///
+/// The sink logit is *not* multiplied by `scale` — it is a learned logit
+/// already in score space, matching both the flash-attention path above
+/// and `ggml_compute_forward_soft_max_f32`, which applies `scale` to the
+/// KQ row before taking `MAX(max, sk[head])`.
 fn online_attn_accumulate(
     q_h: &[f32],
     scale: f32,
     head_dim: usize,
     out_h: &mut [f32],
     attn_softcap: Option<f32>,
+    sink: Option<f32>,
     mut for_each_kv: impl FnMut(&mut dyn FnMut(&[f32], &[f32])),
 ) {
     debug_assert_eq!(q_h.len(), head_dim);
@@ -168,6 +187,12 @@ fn online_attn_accumulate(
         axpy_scale(out_h, alpha, v_t, p);
         m = m_new;
     });
+    if let Some(s) = sink {
+        let m_new = m.max(s);
+        let alpha = (m - m_new).exp();
+        l = l * alpha + (s - m_new).exp();
+        scale_inplace(out_h, alpha);
+    }
     if l > 0.0 {
         let inv = 1.0 / l;
         scale_inplace(out_h, inv);
@@ -499,7 +524,7 @@ pub fn causal_gqa_attention_softcap(
         let kv_h = h / group_size.max(1);
         let q_h = &q[h * head_dim..(h + 1) * head_dim];
         let out_h = &mut out[h * head_dim..(h + 1) * head_dim];
-        online_attn_accumulate(q_h, scale, head_dim, out_h, attn_softcap, |visit| {
+        online_attn_accumulate(q_h, scale, head_dim, out_h, attn_softcap, None, |visit| {
             for t in 0..seq_len {
                 let k_t = &k_cache
                     [(t * n_kv_heads + kv_h) * head_dim..(t * n_kv_heads + kv_h + 1) * head_dim];
@@ -571,8 +596,81 @@ pub fn causal_gqa_attention_windowed_softcap(
         let kv_h = h / group_size.max(1);
         let q_h = &q[h * head_dim..(h + 1) * head_dim];
         let out_h = &mut out[h * head_dim..(h + 1) * head_dim];
-        online_attn_accumulate(q_h, scale, head_dim, out_h, attn_softcap, |visit| {
+        online_attn_accumulate(q_h, scale, head_dim, out_h, attn_softcap, None, |visit| {
             for t in window_start..seq_len {
+                let k_t = &k_cache
+                    [(t * n_kv_heads + kv_h) * head_dim..(t * n_kv_heads + kv_h + 1) * head_dim];
+                let v_t = &v_cache
+                    [(t * n_kv_heads + kv_h) * head_dim..(t * n_kv_heads + kv_h + 1) * head_dim];
+                visit(k_t, v_t);
+            }
+        });
+    }
+
+    out
+}
+
+/// Single-query causal GQA with per-head **attention sinks**, optionally
+/// windowed.
+///
+/// `sinks` is one learned logit per *query* head (gpt-oss ships it as
+/// `blk.N.attn_sinks.weight`, length `n_heads`). It joins the softmax
+/// denominator without contributing a value vector, which lets a head
+/// attend to "nothing" instead of being forced to spend its whole
+/// probability mass on real tokens — see [`online_attn_accumulate`] for
+/// the exact llama.cpp form this reproduces.
+///
+/// `window` is `Some(w)` for a sliding-window layer (the query sees only
+/// the last `w` cached positions, itself included, exactly as
+/// [`causal_gqa_attention_windowed`]) and `None` for full causal
+/// attention. gpt-oss alternates the two per layer.
+///
+/// Deliberately one function covering both, and deliberately the
+/// single-query shape: prefill drives it once per query position. That
+/// is slower than the blocked prefill kernel and is the honest trade —
+/// one code path whose numerics are checked against llama.cpp beats
+/// three that are not.
+#[allow(clippy::too_many_arguments)]
+pub fn causal_gqa_attention_sinks(
+    q: &[f32],
+    k_cache: &[f32],
+    v_cache: &[f32],
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    seq_len: usize,
+    window: Option<usize>,
+    sinks: &[f32],
+) -> Vec<f32> {
+    assert_eq!(q.len(), n_heads * head_dim);
+    assert_eq!(k_cache.len(), seq_len * n_kv_heads * head_dim);
+    assert_eq!(v_cache.len(), seq_len * n_kv_heads * head_dim);
+    assert_eq!(
+        sinks.len(),
+        n_heads,
+        "attention sinks are per query head (llama.cpp `attn_sinks` is {{n_head}})"
+    );
+
+    let group_size = n_heads / n_kv_heads.max(1);
+    let scale = 1.0 / (head_dim as f32).sqrt();
+    let mut out = vec![0f32; n_heads * head_dim];
+    // The query is the last cached position; a windowed layer sees only
+    // the most recent `window` positions including its own.
+    let start = match window {
+        Some(w) => {
+            assert!(w > 0, "window must be positive");
+            seq_len.saturating_sub(w)
+        }
+        None => 0,
+    };
+
+    for h in 0..n_heads {
+        let kv_h = h / group_size.max(1);
+        let q_h = &q[h * head_dim..(h + 1) * head_dim];
+        let sink = sinks[h];
+        let out_h = &mut out[h * head_dim..(h + 1) * head_dim];
+        online_attn_accumulate(q_h, scale, head_dim, out_h, None, Some(sink), |visit| {
+            for t in start..seq_len {
                 let k_t = &k_cache
                     [(t * n_kv_heads + kv_h) * head_dim..(t * n_kv_heads + kv_h + 1) * head_dim];
                 let v_t = &v_cache
@@ -759,7 +857,7 @@ pub fn causal_gqa_attention_paged(
         let kv_h = h / group_size.max(1);
         let q_h = &q[h * head_dim..(h + 1) * head_dim];
         let out_h = &mut out[h * head_dim..(h + 1) * head_dim];
-        online_attn_accumulate(q_h, scale, head_dim, out_h, None, |visit| {
+        online_attn_accumulate(q_h, scale, head_dim, out_h, None, None, |visit| {
             for t in 0..seq_len {
                 let block_id = block_table[t / block_size];
                 let offset = t % block_size;

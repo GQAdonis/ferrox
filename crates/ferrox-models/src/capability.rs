@@ -239,7 +239,6 @@ pub fn architecture_catalog() -> &'static [ArchProfile] {
             "hunyuan-moe",
             "afmoe",
             "grovemoe",
-            "gpt-oss",
             "smallthinker",
             "plamo",
             "plamo3",
@@ -253,6 +252,12 @@ pub fn architecture_catalog() -> &'static [ArchProfile] {
             "olmoe", "qwen", "qwen2", "qwen2moe", "falcon", "gptneox", "stablelm", "mistral",
             "mixtral", "olmo2", "gpt2", "bloom", "mpt", "refact", "bitnet", "jais", "jais2",
             "grok", "dbrx", "exaone4", "yi",
+            // llama-model.cpp `llama_model_rope_type`: LLM_ARCH_OPENAI_MOE
+            // falls in the `return LLAMA_ROPE_TYPE_NEOX` group, and a live
+            // load of a gpt-oss GGUF prints `rope type = 2` (= NEOX).
+            // ferrox had it on the interleaved (NORM) list, which rotates
+            // the wrong pairs of every Q/K head.
+            "gpt-oss",
         ] {
             v.push(gqa_neox(n));
         }
@@ -608,6 +613,67 @@ pub fn resolve_profile(arch: &str) -> Option<&'static ArchProfile> {
 /// is not in the registry — callers must fail closed rather than guess.
 pub fn resolve_architecture(arch: &str) -> Option<ArchPath> {
     resolve_profile(arch).map(|p| p.path)
+}
+
+/// The alternating sliding-window period an architecture uses when its
+/// GGUF carries `{arch}.attention.sliding_window` but *not*
+/// `{arch}.attention.sliding_window_pattern`.
+///
+/// The period is not in the file for these families — llama.cpp
+/// hardcodes it per architecture and only lets the metadata key override
+/// it (`ml.get_key_or_arr(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN,
+/// swa_period, false)` after seeding `swa_period` with the literal
+/// below). A missing key therefore does **not** mean "every layer is
+/// windowed", which is what ferrox assumed: `layer_sliding_window`
+/// returns the window for all layers when `swa_pattern` is `None`, so a
+/// gpt-oss or cohere2 checkpoint ran its full-attention layers through a
+/// 128-token window and answered from a truncated history.
+///
+/// Values transcribed from each arch's `load_arch_hparams`
+/// (`src/models/*.cpp`); `None` means "no per-arch default", i.e. the
+/// window applies uniformly when one is declared.
+pub fn default_swa_pattern(arch: &str) -> Option<usize> {
+    match arch {
+        // src/models/openai-moe.cpp:10
+        "gpt-oss" => Some(2),
+        // src/models/gemma2.cpp:8
+        "gemma2" => Some(2),
+        // src/models/gemma3.cpp:7, gemma3n.cpp:6
+        "gemma3" | "gemma3n" => Some(6),
+        // src/models/cohere2.cpp:5, exaone4.cpp:7, olmo2.cpp:9
+        "cohere2" | "exaone4" | "olmo2" => Some(4),
+        _ => None,
+    }
+}
+
+/// True when this architecture's SWA layers use the model's own RoPE
+/// base rather than llama.cpp's `rope_freq_base_train_swa` default of
+/// `10000`.
+///
+/// `llama_hparams` defaults that field to `10000.0f`
+/// (`src/llama-hparams.h:127`) and the Gemma-3 lineage relies on the
+/// default; the architectures listed here instead open with
+/// `hparams.rope_freq_base_train_swa = hparams.rope_freq_base_train;`
+/// before letting `rope.freq_base_swa` override it. ferrox applied the
+/// Gemma default to everything, which rotates a gpt-oss SWA layer at
+/// theta 10000 instead of its real 150000.
+pub fn swa_rope_base_follows_model(arch: &str) -> bool {
+    matches!(
+        arch,
+        "afmoe"
+            | "cohere2"
+            | "cohere2moe"
+            | "dflash"
+            | "exaone-moe"
+            | "exaone4"
+            | "gemma2"
+            | "laguna"
+            | "llama4"
+            | "mellum"
+            | "olmo2"
+            | "gpt-oss"
+            | "smallthinker"
+    )
 }
 
 /// Metadata keys that, when present with a nonzero value, require math

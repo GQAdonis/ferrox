@@ -33,7 +33,7 @@ todos:
     content: "Parameterise the MMA macro over head dim so it emits _d64 and _d128. A/B: Qwen3-0.6B 1.71x, Phi-4-mini 1.20x, Llama-3.2-3B 1.20x, Mistral-7B 1.13x (commit 0ee4d0b)"
     status: completed
   - id: metal-fa-mma-d256
-    content: "Extend the MMA macro to d=256 (Gemma-3 metal pp512 1.17x). Blocked on the epilogue: `own` gives one float4 per lane, so D/4 <= 32 caps the macro at 128 — needs a lane loop"
+    content: "Extend the MMA macro to d=256 (Gemma-3 metal pp512 1.18x). Blocked on the epilogue: `own` gives one float4 per lane, so D/4 <= 32 caps the macro at 128 — needs a lane loop. HEAD DIM CONFIRMED 2026-08-18 on models/hf_test/gemma-3-1b-it-Q8_0.gguf: `inspect` shows attn_q_norm/attn_k_norm [256], attn_q [1152,1024] = 4 heads x 256, attn_k/attn_v [1152,256] = 1 kv head x 256; `inspect-plan` reports `1 kv-heads x 256 head-dim`. d=256 is the real width, so the kernel work is warranted"
     status: pending
   - id: suite-owed-d128
     content: "PAID (cb27b24, 2026-08-13, started at load 1.95): d=128 MMA published. Qwen3-0.6B 1.81->1.03x, Phi-4-mini 1.24->1.04x, Llama-3.2-3B 1.08->1.04x, Mistral-7B 1.10->1.05x. 25 red rows -> 21"

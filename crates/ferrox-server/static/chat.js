@@ -12,7 +12,7 @@
 // as 5 whenever the prompt is long.
 
 import { el, mount as fill, clear, setText, copyButton, fmtMs, fmtNum, fmtInt, isNum } from './dom.js';
-import { streamChat, getJson, routes, ApiError } from './api.js';
+import { streamChat, getJson, cancelGeneration, routes, ApiError } from './api.js';
 import { renderMarkdown } from './md.js';
 
 export const title = 'Chat';
@@ -78,6 +78,27 @@ export function mount(container) {
   let modelId = null;
   let controller = null;
   let disposed = false;
+  /** The id of the generation currently on the wire, or null. */
+  let liveRequestId = null;
+
+  // Two tiers, because one is not enough. Aborting the fetch closes the
+  // socket — which the server now notices — but a proxy can swallow
+  // that, and an unloading page may never send it at all. The explicit
+  // POST carries `keepalive`, so it survives the unload that killed the
+  // stream. Both end at the same server-side flag, so doing both is
+  // never worse than doing either.
+  function stopGenerating() {
+    const id = liveRequestId;
+    controller?.abort();
+    cancelGeneration(id);
+  }
+
+  // The tab closing mid-answer is precisely the case an AbortSignal
+  // cannot cover: the page is gone before the abort is delivered.
+  const onPageHide = () => {
+    if (controller) cancelGeneration(liveRequestId);
+  };
+  window.addEventListener('pagehide', onPageHide);
 
   const list = el('div', { class: 'messages', id: 'messages' });
   const banner = el('div');
@@ -103,7 +124,7 @@ export function mount(container) {
     type: 'button',
     text: 'Stop',
     hidden: true,
-    onclick: () => controller?.abort(),
+    onclick: () => stopGenerating(),
   });
 
   const field = (label, attrs) => {
@@ -151,7 +172,7 @@ export function mount(container) {
         type: 'button',
         text: 'New chat',
         onclick: () => {
-          controller?.abort();
+          stopGenerating();
           messages = [];
           save(CHAT_KEY, messages);
           paint();
@@ -275,6 +296,10 @@ export function mount(container) {
           signal: controller.signal,
           onRequestId: (id) => {
             requestId = id;
+            // Named on the first chunk, which is what makes an explicit
+            // cancel possible at all — there is nothing to cancel by
+            // before the server has said what this generation is called.
+            liveRequestId = id;
           },
           onToken: (token) => {
             reply.content += token;
@@ -282,7 +307,13 @@ export function mount(container) {
           },
         },
       );
-      reply.stats = statLine(result?.usage, result?.requestId || requestId);
+      const line = statLine(result?.usage, result?.requestId || requestId);
+      // The server won the race: it noticed the cancel and closed the
+      // stream cleanly, so this arrives as a finished response rather
+      // than as an AbortError. Saying so is the difference between a
+      // short answer and a truncated one, which look identical.
+      reply.stats =
+        result?.finishReason === 'cancelled' ? `stopped  ·  ${line}` : line;
     } catch (error) {
       if (error?.name === 'AbortError') {
         // A stopped generation is not a failure: the tokens that did
@@ -298,6 +329,7 @@ export function mount(container) {
       }
     } finally {
       controller = null;
+      liveRequestId = null;
       if (!disposed) {
         setBusy(false);
         save(CHAT_KEY, messages);
@@ -335,6 +367,11 @@ export function mount(container) {
 
   return () => {
     disposed = true;
-    controller?.abort();
+    // Navigating away from Chat is a cancel too: the tokens have
+    // nowhere left to land, and letting the backend keep decoding for
+    // a screen nobody is looking at is the exact waste this feature
+    // exists to end.
+    stopGenerating();
+    window.removeEventListener('pagehide', onPageHide);
   };
 }

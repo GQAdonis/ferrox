@@ -67,6 +67,12 @@ export function mount(container) {
         counter('prompt tokens', fmtInt(stats.tokens_prompt_total)),
         counter('generated tokens', fmtInt(stats.tokens_generated_total)),
         counter(
+          'generating now',
+          isNum(stats.generating_now) ? fmtInt(stats.generating_now) : '—',
+          'Streamed generations decoding at this instant — the ones POST /v1/cancel could stop. '
+            + 'Work in progress, not a queue depth: nothing waits in front of a decode here.',
+        ),
+        counter(
           'last request',
           isNum(stats.last_request_age_seconds) ? `${fmtDuration(stats.last_request_age_seconds)} ago` : '—',
           'Recent activity is positive evidence of liveness even when /health is slow to answer.',

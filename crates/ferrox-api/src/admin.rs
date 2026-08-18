@@ -281,6 +281,13 @@ pub struct StatsResponse {
     pub tokens_generated_total: u64,
     /// Seconds since the last request finished; `null` when none has.
     pub last_request_age_seconds: Option<f64>,
+    /// Streamed generations decoding right now -- the ones that could
+    /// be stopped by `POST /v1/cancel` at this instant.
+    ///
+    /// Not a queue depth: nothing is queued in front of a decode here,
+    /// so this counts work in progress, not work waiting. Named for
+    /// what it is so no one reads a backlog into it.
+    pub generating_now: usize,
     /// Newest last, capped server-side. See [`RecentRequest`].
     pub recent: Vec<RecentRequest>,
 }

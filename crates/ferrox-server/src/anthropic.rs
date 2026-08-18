@@ -134,6 +134,12 @@ fn stop_reason(finish: FinishReason) -> &'static str {
     match finish {
         FinishReason::Stop => "end_turn",
         FinishReason::Length => "max_tokens",
+        // Anthropic's own vocabulary has no cancelled state, and this
+        // path passes `cancel: None` so it cannot be produced. Named
+        // rather than wildcarded: if cancellation is ever wired in
+        // here, this line must be revisited, and a `_ =>` arm would let
+        // it be forgotten.
+        FinishReason::Cancelled => "stop_sequence",
     }
 }
 
@@ -195,6 +201,9 @@ pub async fn messages(
         seed: 0,
         stop,
         json_object: false,
+        // The Anthropic surface has no cancel path of its own yet; see
+        // the `cancel` module for what `/v1/cancel` currently covers.
+        cancel: None,
     };
 
     let model = Arc::clone(&active.model);

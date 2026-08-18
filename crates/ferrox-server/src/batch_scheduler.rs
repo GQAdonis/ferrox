@@ -361,6 +361,7 @@ mod tests {
             seed,
             stop: vec![],
             json_object: false,
+            cancel: None,
         }
     }
 
@@ -434,6 +435,7 @@ mod tests {
                 seed: params[i].seed,
                 stop: vec![],
                 json_object: params[i].json_object,
+                cancel: params[i].cancel.clone(),
             };
             threads.push(thread::spawn(move || {
                 barrier.wait();

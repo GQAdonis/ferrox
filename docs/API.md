@@ -18,6 +18,7 @@ Unsupported multimodal input is rejected the same way.
 | `POST /v1/detokenize` | Supported |
 | `POST /v1/embeddings` | Supported for GGUF Decoder (mean/last pool of hidden states) |
 | `POST /v1/messages` | Anthropic-shaped; non-stream text |
+| `POST /v1/cancel` | Stop a streamed generation by `request_id` (see below) |
 | `GET /cache/stats` · `GET /metrics` | Ferrox extensions |
 | `/admin/*` | Control surface (see below) |
 | Audio / images | Not supported |
@@ -243,6 +244,7 @@ Set `HF_TOKEN` (or `HUGGING_FACE_HUB_TOKEN`) for gated repos, and
   "cache_hits": 0, "cache_misses": 1,
   "tokens_prompt_total": 17, "tokens_generated_total": 24,
   "last_request_age_seconds": 0.02,
+  "generating_now": 0,               // decoding right now; NOT a queue depth
   "recent": [{
     "request_id": "chatcmpl-b28a1aeab8f8000000",
     "at_ms": 1786718007013, "route": "/v1/chat/completions",
@@ -264,6 +266,41 @@ itself or the answer came from cache.
 Recorded today for `/v1/chat/completions` (streamed and not, including
 rejections), `/v1/completions` and `/v1/messages`. Not yet recorded for
 `/v1/embeddings`, `/v1/tokenize` or `/v1/detokenize`.
+
+## Cancellation
+
+Two tiers, both ending at the same server-side flag.
+
+1. **Drop the connection.** The streaming path now notices that its SSE
+   receiver is gone and stops at the next token. Before this it ignored
+   the failed send and generated the rest of the answer into nothing.
+2. **`POST /v1/cancel`** with the `request_id` the first SSE chunk
+   states. Behind `FERROX_API_KEY` like the endpoint that started the
+   work. A browser should send it with `keepalive: true` so it survives
+   the page unload that killed the stream — the case tier 1 is worst at.
+
+```bash
+curl -s http://127.0.0.1:8383/v1/cancel \
+  -H 'Content-Type: application/json' \
+  -d '{"request_id":"chatcmpl-…"}'
+```
+
+`200 {"request_id":"…","cancelled":true,"detail":"…"}` when a live
+generation was signalled, `404` with `"cancelled": false` when the id
+names nothing that is running. The two are different facts: only one of
+them saved any work, and a client told `ok` for both would claim it
+stopped something it did not.
+
+A cancelled stream ends with `finish_reason: "cancelled"` — not an
+OpenAI-defined value, because OpenAI has no cancel endpoint, but *a*
+finish reason, so the stream is not read as truncation. Tokens already
+decoded are kept and reported in `usage`.
+
+Cooperative and honest about its edges: the flag is read between
+decoded tokens, so a prefill already inside a forward pass still
+completes, and a continuous-batching request decodes on the shared
+batcher thread rather than through this loop and is not covered.
+`/v1/completions` and `/v1/messages` are buffered and register no id.
 
 ## Continuous batching
 

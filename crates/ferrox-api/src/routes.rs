@@ -31,6 +31,23 @@ pub const V1_EMBEDDINGS: &str = "/v1/embeddings";
 /// Anthropic-compatible messages endpoint.
 pub const V1_MESSAGES: &str = "/v1/messages";
 
+/// Explicit cancellation of one in-flight generation, by the
+/// `request_id` the server states on the first streamed chunk.
+///
+/// Under `/v1` rather than at the root the plan sketched it at, for two
+/// reasons that both matter: it acts on inference and so belongs behind
+/// the same `FERROX_API_KEY` gate as the endpoint that started the
+/// work, and a root-level `/cancel` would sit inside the namespace the
+/// embedded UI's SPA fallback owns, where a mistyped path is answered
+/// with HTML rather than a JSON 404.
+///
+/// This is the second tier of cancellation, not the only one -- a
+/// client that simply drops the connection is also honoured. It exists
+/// because the first tier is unreliable: proxies buffer, and a page
+/// unload races the abort it is supposed to send. `keepalive: true`
+/// makes this one survive that.
+pub const V1_CANCEL: &str = "/v1/cancel";
+
 // ---------------------------------------------------------------------
 // Control surface.
 //
@@ -91,6 +108,7 @@ pub const ALL: &[&str] = &[
     V1_DETOKENIZE,
     V1_EMBEDDINGS,
     V1_MESSAGES,
+    V1_CANCEL,
     ADMIN_MODELS,
     ADMIN_MODELS_LOAD,
     ADMIN_MODELS_UNLOAD,

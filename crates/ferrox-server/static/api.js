@@ -15,6 +15,7 @@ export const routes = {
   cacheStats: '/cache/stats',
   models: '/v1/models',
   chatCompletions: '/v1/chat/completions',
+  cancel: '/v1/cancel',
   adminModels: '/admin/models',
   adminModelsLoad: '/admin/models/load',
   adminModelsUnload: '/admin/models/unload',
@@ -119,6 +120,34 @@ export async function postJson(path, payload, { signal } = {}) {
     throw new ApiError(0, `cannot reach ${baseUrl()}: ${cause.message}`, null);
   }
   return parse(response);
+}
+
+/**
+ * Ask the server to stop the generation behind `requestId`.
+ *
+ * The second tier of cancellation. Aborting the fetch closes the socket
+ * and the server now notices that too, but a socket is not a reliable
+ * signal: a reverse proxy can hold the connection open on the backend
+ * side, and a page unload races the abort it is supposed to send.
+ * `keepalive: true` is what makes this one outlive the page, which is
+ * exactly the case the socket tier is worst at.
+ *
+ * Deliberately not awaited by callers and deliberately silent: it is
+ * best-effort cleanup, and a 404 here only means the answer finished
+ * first. Nothing the user did went wrong, so nothing is shown.
+ */
+export function cancelGeneration(requestId) {
+  if (!requestId) return;
+  try {
+    fetch(routes.cancel, {
+      method: 'POST',
+      headers: headers({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify({ request_id: requestId }),
+      keepalive: true,
+    }).catch(() => {});
+  } catch {
+    /* the stream is already being torn down; there is nothing to report */
+  }
 }
 
 // --------------------------------------------------------------------

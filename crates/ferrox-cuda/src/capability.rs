@@ -80,6 +80,12 @@ pub struct HardwareProfile {
     pub cuda_device_count: usize,
     pub cuda_device_name: Option<String>,
     pub cuda_vram_total_bytes: u64,
+    /// Free device memory at probe time (`cuMemGetInfo`'s first half).
+    /// Zero without `--features cuda` or without a device, exactly like
+    /// the other CUDA fields. A memory budget should be drawn against
+    /// this rather than the total -- see
+    /// `ferrox_models::device_budget`.
+    pub cuda_vram_free_bytes: u64,
 }
 
 impl HardwareProfile {
@@ -96,20 +102,32 @@ impl HardwareProfile {
         let simd = SimdCaps::detect();
 
         #[cfg(feature = "cuda")]
-        let (cuda_available, cuda_device_count, cuda_device_name, cuda_vram_total_bytes) = {
+        let (
+            cuda_available,
+            cuda_device_count,
+            cuda_device_name,
+            cuda_vram_total_bytes,
+            cuda_vram_free_bytes,
+        ) = {
             match crate::gpu::probe() {
                 Some(info) => (
                     true,
                     info.device_count,
                     info.first_device_name,
                     info.total_vram_bytes,
+                    info.free_vram_bytes,
                 ),
-                None => (false, 0, None, 0),
+                None => (false, 0, None, 0, 0),
             }
         };
         #[cfg(not(feature = "cuda"))]
-        let (cuda_available, cuda_device_count, cuda_device_name, cuda_vram_total_bytes) =
-            (false, 0, None, 0);
+        let (
+            cuda_available,
+            cuda_device_count,
+            cuda_device_name,
+            cuda_vram_total_bytes,
+            cuda_vram_free_bytes,
+        ) = (false, 0, None, 0, 0);
 
         HardwareProfile {
             cpu_logical_cores,
@@ -119,6 +137,7 @@ impl HardwareProfile {
             cuda_device_count,
             cuda_device_name,
             cuda_vram_total_bytes,
+            cuda_vram_free_bytes,
         }
     }
 }
@@ -204,5 +223,6 @@ mod tests {
         assert!(!profile.cuda_available);
         assert_eq!(profile.cuda_device_count, 0);
         assert_eq!(profile.cuda_device_name, None);
+        assert_eq!(profile.cuda_vram_free_bytes, 0);
     }
 }

@@ -33,8 +33,8 @@ todos:
     content: "Parameterise the MMA macro over head dim so it emits _d64 and _d128. A/B: Qwen3-0.6B 1.71x, Phi-4-mini 1.20x, Llama-3.2-3B 1.20x, Mistral-7B 1.13x (commit 0ee4d0b)"
     status: completed
   - id: metal-fa-mma-d256
-    content: "Extend the MMA macro to d=256 (Gemma-3 metal pp512 1.17x). Blocked on the epilogue: `own` gives one float4 per lane, so D/4 <= 32 caps the macro at 128 — needs a lane loop"
-    status: pending
+    content: "Extend the MMA macro to d=256 (Gemma-3 metal pp512 1.18x). HEAD DIM CONFIRMED 2026-08-18 on models/hf_test/gemma-3-1b-it-Q8_0.gguf: attn_q [1152,1024] = 4 heads x 256, attn_k/attn_v [1152,256] = 1 kv head x 256, `inspect-plan` says `1 kv-heads x 256 head-dim` — d=256 is the real width. LANDED (branch wf/metal-fa-mma-d256): replaced the three `own = tiisg < D4` guards on the `so` accumulator (zero-init, softmax rescale, epilogue) with llama's lane loop `for (i = tiisg; i < D4; i += NW)` (ggml-metal.metal:6529-6535, :6826-6838, :7024-7034), which degenerates to the same single iteration on the same lanes when D4 <= NW, then instantiated gqa_prefill_fa_ext_mma_d256 and routed head_dim 256 to it. 28 KiB threadgroup at QN=8/C=64 — the last width under Apple's 32 KiB. PROVISIONAL interleaved A/B (host load 29-35, other agents building): Gemma-3-1B pp512 mma 2544.91/2564.22/2514.59 vs fa_vec 2245.59/2303.43/2201.85 = 1.13x. Guard A/B base-vs-new binaries in the same window: Qwen3-0.6B (d=128) 3226 -> 3320 mean, Llama-3.2-1B (d=64) 1907 -> 1936 mean — both inside noise, no regression. verify --backend metal identical cpu-vs-metal ids with prefill covered on Gemma-3-1B (64 and 300 tokens, MMA on and off), Qwen3-0.6B and Llama-3.2-1B. OWED: a suite run on a quiet host — RESULTS.md still advertises Gemma-3-1B metal pp512 2363.87 / 1.18x and was NOT touched"
+    status: completed
   - id: suite-owed-d128
     content: "PAID (cb27b24, 2026-08-13, started at load 1.95): d=128 MMA published. Qwen3-0.6B 1.81->1.03x, Phi-4-mini 1.24->1.04x, Llama-3.2-3B 1.08->1.04x, Mistral-7B 1.10->1.05x. 25 red rows -> 21"
     status: completed
@@ -44,6 +44,9 @@ todos:
   - id: suite-owed-moe-stack
     content: "PAID (2026-08-14, started at load 1.82): re-ran --suite --id olmoe_q4 --backend metal, the only ledger row metal-moe-stack can move. OLMoE metal pp512 587.49 -> 1402.38, gap 2.62x -> 1.11x against llama 1552.23 measured in the same session. tg128 116.17 (gap 1.41x) unchanged, as predicted — decode never took this path. RESULTS.md re-rendered from the new receipt; no other row was re-measured, so no other row moved"
     status: completed
+  - id: metal-moe-decode
+    content: "Last red Metal decode row: OLMoE tg128 1.41x. DIAGNOSED on wf/metal-moe-decode (see 'MoE decode: where the 1.41x actually goes'). Decode already routes on the GPU, already uses one command buffer per token, and its expert mat-vec is already llama's mul_mv_id — none of those were the cause. Measured by stage ablation (new FERROX_METAL_MOE_ABLATE) against FERROX_METAL_GPU_TIMING: the ROUTER costs ~3.6 ms of ~8.5 ms GPU/tok (42%), more than the experts it selects (2.9 ms), split between two single-lane kernels — f32_matvec (gpu.rs:324, one thread per row, so a 64x2048 router is ONE threadgroup) and moe_topk_softmax (gpu.rs:665, `if (tid != 0u) return;`, private float[256], 1x1x1 dispatch). LANDED on wf/metal-moe-decode: f32_matvec rewritten as ggml's kernel_mul_mv_t_t_impl<float,float> (NR0=2, NSG=min(4,ceil(cols/128)), simd_sum + threadgroup fold, coalesced lanes), and decode's top-k switched to the existing simdgroup moe_topk_softmax_batch with n_tokens=1 (the single-lane kernel is deleted). PROVISIONAL interleaved A/B at host load 121-162, GPU ms/tok (wall tok/s unusable at that load): 8.36/8.12/8.59 -> 6.23/6.06/6.23, -2.1 ms/tok = -25%. A second A/B at load 14-16 (wall clock usable there): GPU 7.76/7.99/7.61 -> 5.55/5.32/5.28 and tg128 97.9/90.7/113.4 -> 118.9/152.3/145.7, i.e. ~1.13x against the published llama 164.23 — cross-session, so a reason to take the suite run, not a result. Router 3.6 ms -> ~0.5 ms. verify --backend metal --prompt-tokens 64 identical cpu vs metal. OWED: quiet-host suite run (RESULTS.md still says 1.41x). What is left on this row is attention ~2.4 ms/tok at ~63 GB/s (metal-barrier-ranges, ~8 barrier points per layer) and the ~1.6 ms/tok host lm_head"
+    status: pending
   - id: metal-barrier-ranges
     content: "Replace 15 blanket per-layer buffer barriers with llama's mem-range overlap tracker; fuse rmsnorm+f32->f16 and silu_mul+f32->f16"
     status: pending
@@ -75,11 +78,11 @@ todos:
     content: "BLOCKING CORRECTNESS: ~50 archs are admitted to the generic GQA path and emit wrong logits instead of refusing. Gate on required graph features; refuse what is not implemented. LANDED (c3db570) as a tensor-consumption gate rather than a feature list: ShardedGguf records every tensor name a loader looks up and the load refuses on leftovers, which catches gpt-oss attn_sinks and ffn_exp_probs_b by construction instead of by enumeration. Refused exactly 1 of the 13 local GGUFs — Phi-4-mini, correctly: partial rotary, LongRoPE factor sets, and rope.scaling.attn_factor were all unimplemented and are now implemented on CPU"
     status: completed
   - id: coverage-phi-metal-rope
-    content: "Phi-4-mini is CPU-only as of c3db570: the Metal RoPE kernels rotate the whole head and take no magnitude uniform, so partial rotary (n_rot < head_dim) and LongRoPE mscale cannot run there and the model is refused the Metal path rather than allowed to disagree with CPU. Needs a rot_dim uniform on rope_norm/rope_neox plus an mscale hook (AttnExtras is the natural place — it already carries QKV bias and QK-norm). Its published Metal pp512/tg128 rows were taken on the wrong graph and must be re-measured after, not before"
+    content: "Phi-4-mini is CPU-only as of c3db570: the Metal RoPE kernels rotate the whole head and take no magnitude uniform, so partial rotary (n_rot < head_dim) and LongRoPE mscale cannot run there and the model is refused the Metal path rather than allowed to disagree with CPU. Needs a rot_dim uniform on rope_norm/rope_neox plus an mscale hook (AttnExtras is the natural place — it already carries QKV bias and QK-norm). Its published Metal pp512/tg128 rows were taken on the wrong graph and must be re-measured after, not before. WHEN THE MSCALE HOOK IS WRITTEN: apply it to the ROTATED CHANNELS ONLY. ggml folds attn_factor into cos/sin inside rope_yarn and copies [n_rot, head_dim) through untouched; the CPU side scaled the whole head until `ferrox parity` caught it, and a Metal kernel that takes a magnitude uniform is the obvious place to make the same mistake a second time"
     status: pending
   - id: tooling-answer-parity-instrument
-    content: "There is NO instrument for answer parity against llama.cpp — `ferrox verify` compares ferrox-CPU against ferrox-Metal only. Attempting a greedy-text comparison showed why one is needed and why text is the wrong medium: ferrox and llama diverge after ~3 tokens on TinyLlama Q8_0 with matched tokenization (6 tokens both sides) and no exotic features, i.e. ordinary numeric drift flips one token and everything after it. Build a first-token top-k / logit-KL comparator instead, which is what quality-gates' 'answers match llama' clause actually requires"
-    status: pending
+    content: "LANDED as `ferrox parity` (0165504 + 8d7e664, branch wf/answer-parity). `.local-scripts/llama_logits.c` links the installed libllama and dumps the last-position logits for an EXPLICIT token-id sequence — same spirit as the IQ-tier goldens linking ggml's own ggml-quants.c, since a reference you re-implemented is not a reference. ferrox tokenizes and hands llama.cpp the ids, so the tokenizer is removed from the experiment rather than trusted. Reports KL both ways, total variation, max |delta p|, top-k overlap, and where llama's top-1 ranks for ferrox, plus WHICH ferrox backend ran (the reference is pinned to llama CPU, so a Metal-side run is a compound comparison and says so). Four verdicts because three are not failures: MATCH (within f32 accumulation-order noise), DRIFT (same top-1, distributions moved further than reordering explains), TIE-FLIP (top-1 differs but llama's own top-2 margin is under the observed noise), WRONG. FIRST RESULT, and it settles this item's own premise: TinyLlama Q8_0 cpu-vs-cpu is MATCH — KL(llama||ferrox) 8.4e-5 nats, top-10 overlap 10/10, same top-1 — at 8 and at 32 tokens. So the greedy-text divergence recorded above was drift amplification, NOT a wrong graph, exactly as the tie-flip hypothesis predicted. SWEEP DONE (17 local checkpoints, cpu-vs-cpu, 32-token prompts): 16 MATCH, 1 DRIFT. The DRIFT was Phi-4-mini — the one model whose RoPE code was newest — and it was a REAL BUG, not a tolerance question: ggml folds attn_factor into cos/sin inside rope_yarn so it reaches only the rotated channels, and ggml-cpu/ops.cpp then copies [n_rot, head_dim) through untouched, while ferrox scaled the whole head. Phi rotates 96 of 128 dims with attn_factor 1.1902, so 32 dims per head were scaled that llama.cpp leaves alone. Fixed; the same instrument confirms it (KL 1.808e-3 -> 2.358e-4 nats, top-10 7/10 -> 9/10, DRIFT -> MATCH). So the instrument paid for itself on its first sweep, and the 'answers match llama' half of quality-gates now has an oracle behind it for every local checkpoint"
+    status: completed
   - id: coverage-f16
     content: "F16 tensors did not load at all (GgmlType::F16 parsed and sized, no dequant arm anywhere). dequant_f16 + shared widen_plain_float across all 7 loaders. Landed 7ef74f1"
     status: completed
@@ -146,7 +149,7 @@ green:
 |---|---|---|---|
 | CPU `tg128` | 8 | SmolLM2 2.44× | `cpu-decode-scaling` |
 | CPU `pp512` | 6 | Gemma-3-1B 1.65× | `cpu-gemma3-prefill`, then 1a–1d |
-| Metal `pp512` | 6 | Gemma-3-1B 1.18× | `metal-fa-mma-d256` |
+| Metal `pp512` | 6 | Gemma-3-1B 1.18× | `metal-fa-mma-d256` (kernel landed 2026-08-18; row awaits a quiet-host suite run) |
 | Metal `tg128` | 1 | OLMoE 1.41× | `cpu-decode-scaling`-shaped, GPU side |
 
 **Dense Metal prefill is finished as a workstream.** Every dense row is
@@ -250,6 +253,138 @@ One thing this cost: prefill routes on the GPU now, so it no longer
 feeds `record_activations`. Expert hotness for `inspect-plan` comes from
 decode only.
 
+## MoE decode: where the 1.41× actually goes (2026-08-18)
+
+The prefill stack's A/B already proved decode does not take that path.
+What decode *does* take is `Decoder::forward_token` →
+`launch_moe_decode_stack` (`crates/ferrox-models/src/decoder.rs:1644`),
+and none of the guessed shapes were true:
+
+- Routing is **not** on the host. `encode_moe_layer_fused`
+  (`crates/ferrox-metal/src/attn.rs:5415`) encodes router GEMM → top-k →
+  experts on the GPU.
+- There is **one command buffer for the whole token**, not one per layer:
+  `launch_moe_decode_stack` opens a single Concurrent encoder for all 16
+  layers (`crates/ferrox-metal/src/attn.rs:5975`).
+- The expert mat-vec is **not** a per-expert loop and does have a
+  simdgroup variant: `q4_0_moe_matvec_id`
+  (`crates/ferrox-metal/src/gpu.rs:714`) is a faithful port of llama's
+  `mul_vec_q_n_f32_impl` (`NR0=4`, `NSG=2`, grid `(rows/8, 1, n_slots)`),
+  identical to `kernel_mul_mv_id_q4_0_f32`.
+
+### Method
+
+`FERROX_METAL_GPU_TIMING=1` gives GPU ms/tok for the one command buffer.
+A new `FERROX_METAL_MOE_ABLATE` (`crates/ferrox-metal/src/attn.rs`,
+`MoeAblate`) drops whole stages from the encoded graph — output is
+garbage, timing is not — so each stage's share is read off by
+subtraction. This is the only way to attribute time inside a single
+Concurrent encoder short of a Metal capture.
+
+`ferrox bench -m models/olmoe-1b-7b-0924-q4_0.gguf -p 0 -n 128 -r 1
+--n-gpu-layers 99`, Host B, **host load 8–200 (other agents building)**,
+so treat every number as PROVISIONAL and the *shares* as the finding:
+
+| dropped stage | GPU ms/tok | Δ vs baseline |
+|---|---|---|
+| — (baseline) | 7.7–8.6 | — |
+| `topk` (`moe_topk_softmax`) | 6.3–6.6 | **−1.3 to −2.2** |
+| `rmv` (F32 router mat-vec) | 6.7–6.8 | **−1.1 to −1.8** |
+| `router` (both) | 4.9 | **−3.6** |
+| `attn` (QKV+RoPE+KV+GQA+O) | 6.3–6.5 | −1.6 to −2.0 |
+| `ffn` (gate/up/silu/down/sum) | 5.1–5.6 | −2.8 to −2.9 |
+| `gateup` only | 6.8 | −1.7 |
+| `down` only | 7.4 | −1.1 |
+| everything | 0.64 | — |
+
+**Measured cause: the router, not the experts.** Selecting 8 of 64
+experts costs ~3.6 ms of ~8.5 ms GPU (≈ 42 %) — *more* than reading the
+50 M active expert weights it selects (2.9 ms). Two single-lane kernels:
+
+1. **`f32_matvec` (`crates/ferrox-metal/src/gpu.rs:324`)** is one thread
+   per output row, walking `cols` serially, dispatched
+   `rows.div_ceil(64)` threadgroups of 64
+   (`crates/ferrox-metal/src/gpu.rs:7748`). `ffn_gate_inp` is
+   `64 × 2048` F32, so the whole router GEMM is **one threadgroup on one
+   GPU core**, with each lane striding a different 8 KB row — no
+   coalescing, no simdgroup reduction. llama runs the same tensor through
+   `kernel_mul_mv_f32_f32_4` (`nsg=min(4,(ne00+127)/128)=4`, `nr0=2`,
+   float4 loads, `helper_mv_reduce_and_write`) — 32 threadgroups × 128
+   threads. ~1.1–1.8 ms/tok.
+2. **`moe_topk_softmax` (`crates/ferrox-metal/src/gpu.rs:665`)** opens
+   with `if (tid != 0u) return;`, is dispatched `1×1×1`
+   (`crates/ferrox-metal/src/gpu.rs:5948`), holds `float probs[256]` in
+   *private* address space (spills), and selection-sorts `k·n = 512`
+   comparisons on that one lane — 16 times per token, each behind a
+   barrier with the rest of the GPU idle. ~1.3–2.2 ms/tok. The batched
+   simdgroup version `moe_topk_softmax_batch`
+   (`crates/ferrox-metal/src/gpu.rs:1175`) already exists — the prefill
+   stack added it — and decode simply never calls it.
+
+Secondary, not MoE-specific: wall 9.4 ms/tok vs GPU 7.75 ms/tok. The
+~1.6 ms host remainder is `lm_head` (50304 × 2048 Q4_0, ~58 MB) run on
+the **CPU** every step, because `out_launch` is `None` unless
+`metal_greedy_argmax_active()` (server-only thread-local) or
+`FERROX_METAL_LOGITS` is set (`crates/ferrox-models/src/decoder.rs:1601`).
+`FERROX_METAL_LOGITS=1` is worse (91 vs 106 tok/s) because it downloads
+the full vocab; the fix is a GPU argmax path that `bench` can take, which
+is a separate change from this one.
+
+### The fix
+
+Both are ports, not inventions:
+
+1. `f32_matvec` is now `kernel_mul_mv_t_t_impl<float,float>`: `NR0 = 2`
+   rows per threadgroup, `NSG = min(4, ceil(cols/128))` simdgroups
+   splitting the reduction axis, `simd_sum` then a threadgroup fold
+   (`helper_mv_reduce_and_write`). Consecutive lanes read consecutive
+   columns. Dispatch goes from `ceil(rows/64)` threadgroups of 64 (one
+   thread per row) to `ceil(rows/2)` of `32*nsg` — for the router,
+   1 threadgroup → 32.
+2. Decode's top-k now calls the existing simdgroup
+   `moe_topk_softmax_batch` with `n_tokens = 1`. The single-lane
+   `moe_topk_softmax` kernel and its encoder are deleted — that was its
+   only caller.
+
+Interleaved A/B, `-p 0 -n 128 -r 2 --ngl 99`, three pairs, **host load
+121–162** — so wall `tok/s` is unusable (± 20 on some reps) and the GPU
+clock from `FERROX_METAL_GPU_TIMING` is the signal:
+
+| | GPU ms/tok |
+|---|---|
+| before | 8.36 / 8.12 / 8.59 |
+| after | 6.23 / 6.06 / 6.23 |
+
+**−2.1 ms/tok, −25 % of GPU time**, PROVISIONAL. A second three-pair
+A/B once the host dropped to **load 14–16** — still not quiet, still
+PROVISIONAL, but with usable wall clock:
+
+| | GPU ms/tok | wall tok/s |
+|---|---|---|
+| before | 7.76 / 7.99 / 7.61 | 97.9 / 90.7 / 113.4 |
+| after | 5.55 / 5.32 / 5.28 | 118.9 / 152.3 / 145.7 |
+
+Median 113.4 → 145.7 tok/s. Against the llama 164.23 in the published
+row that would be **1.41× → ~1.13×**, but that is a cross-session
+comparison against a number measured on a quiet host, so it is not a
+result — it is the reason to go take the suite run.
+
+Re-ablating the fixed
+build: router 3.6 ms → ~0.5 ms (`topk` ~0.06, `rmv` ~0.4). What is left
+is attention ~2.4 ms and experts ~2.4 ms; at ~483 MB of active expert
+weights the expert mat-vec is already running at roughly M2 Pro's peak
+bandwidth, so **attention is now the slack** — 151 MB in 2.4 ms is
+~63 GB/s, and the likely cause is the ~8 barrier points per layer
+(`metal-barrier-ranges`), not the `q4_0_matvec` kernel.
+
+`ferrox verify --backend metal --prompt-tokens 64` on OLMoE: 24 tokens
+identical cpu vs metal.
+
+Owed: a quiet-host suite run. `RESULTS.md` still says 1.41× and must not
+be edited until then. Not fixed here, and each worth ~1 ms/tok:
+`metal-barrier-ranges` on the decode attention chain, and the host-side
+`lm_head`.
+
 ### Next levers, in order
 
 1. `cpu-decode-scaling` — 8 red rows, the only axis with nothing at
@@ -342,7 +477,77 @@ measured together.
 
 Only d=256 (Gemma-3, metal pp512 1.17x) is left without an MMA kernel.
 It needs a lane loop in the epilogue: `own` gives each lane one `float4`
-of the output row, which caps the macro at D/4 <= 32.
+of the output row, which caps the macro at D/4 <= 32. **Done — see below.**
+
+## d=256 MMA (2026-08-18, branch `wf/metal-fa-mma-d256`)
+
+**Head dim confirmed first.** `ferrox inspect` on
+`models/hf_test/gemma-3-1b-it-Q8_0.gguf`: `attn_q [1152, 1024]` = 4 heads
+x 256, `attn_k`/`attn_v` `[1152, 256]` = 1 kv head x 256,
+`attn_q_norm`/`attn_k_norm` `[256]`; `inspect-plan` prints
+`1 kv-heads x 256 head-dim`. The 1.18x row really is a width the macro
+could not instantiate, so the kernel work was warranted.
+
+**What the cap actually was.** Three places touch the `so` accumulator a
+row at a time — zero-init, the online-softmax rescale, and the epilogue —
+and all three were written as `if (own) so4[tiisg] ...` with
+`own = tiisg < D4`. That assigns one `float4` per lane, hence `D/4 <= 32`.
+llama has no such cap (`kernel_flash_attn_ext_impl` reaches DV 576): it
+walks the same three points with `for (i = tiisg; i < DV4; i += NW)`
+(`ggml-metal.metal:6529-6535`, `:6826-6838`, `:7024-7034`). Ported that
+loop verbatim in shape. Below `D4 <= NW` it runs exactly one iteration on
+exactly the lanes `own` selected, at the same index, so d=64 and d=128
+compute the same values; at d=256 (`D4 == 64`) one lane carries two
+`float4` columns.
+
+Then `gqa_prefill_fa_ext_mma_d256` is instantiated from the same macro and
+head_dim 256 routes to it. At QN=8 / C=64 it needs 28 KiB of threadgroup
+memory — under Apple's 32 KiB, but the last width that fits at this
+tiling. As at d=128 there is no scalar `fa_ext` here, so
+`FERROX_METAL_FA_MMA=0` sends d=256 back to `gqa_prefill_fa_vec_d256`,
+which is therefore the A/B reference for both correctness and timing.
+Sliding-window layers are untouched: prefill has no `kv_start` at all, and
+`metal_prefill_dense_swa_fits` (`decoder.rs:833-843`) already keeps a
+windowed layer off the GPU prefill path unless the whole batch fits inside
+the window.
+
+**PROVISIONAL A/B — host load 29-35 (1-min), other agents building
+concurrently. Not publishable.** Interleaved, `-p 512 -n 0 -r 2 --ngl 99`,
+3 pairs, Gemma-3-1B-IT Q8_0 metal `pp512`:
+
+| arm | rep 1 | rep 2 | rep 3 | mean |
+|---|---|---|---|---|
+| `FERROX_METAL_FA_MMA=1` (new) | 2544.91 | 2564.22 | 2514.59 | **2541** |
+| `FERROX_METAL_FA_MMA=0` (fa_vec) | 2245.59 | 2303.43 | 2201.85 | 2250 |
+
+= **1.13x** over the kernel this replaces.
+
+**Guard A/B for the landed widths.** The lane loop touches the d=64 and
+d=128 kernels' source, so the pre-change binary was rebuilt from
+`b09aedb` and interleaved against the new one in the same window
+(load 29-30), 3 pairs each:
+
+| Model | head dim | base mean | new mean |
+|---|---|---|---|
+| Qwen3-0.6B Q8_0 | 128 | 3226 | 3320 |
+| Llama-3.2-1B-Instruct Q8_0 | 64 | 1907 | 1936 |
+
+Both inside run-to-run spread; no regression in either direction.
+
+**Correctness.** `cargo test -p ferrox-metal --features metal -- --ignored
+--test-threads=1`: 45 passed, 0 failed, including the new
+`gqa_prefill_fa_ext_mma_d256_matches_cpu_and_fa_vec` (Gemma-3-1B's own
+4-head / 1-kv-head / softcap shape, padded cache tails, exact 8-row fits,
+long-prefix / short-batch) and the unchanged d=64 / d=128 tests.
+`ferrox verify --backend metal` reports identical cpu-vs-metal ids **with
+prefill covered** on Gemma-3-1B at 64 and 300 tokens with MMA on *and*
+off, and on Qwen3-0.6B and Llama-3.2-1B at 300.
+
+**Owed: a suite run on a quiet host.** `RESULTS.md` was deliberately not
+touched and still advertises Gemma-3-1B metal `pp512` 2363.87 against
+llama 2786.02 = 1.18x. The A/B above is a relative measurement only, and
+the llama column must be re-measured in the same window as ferrox before
+any new gap is written down.
 
 ### Rejected: the persistent-threadpool branch
 

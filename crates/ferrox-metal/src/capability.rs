@@ -11,6 +11,13 @@
 pub struct MetalProfile {
     pub available: bool,
     pub device_name: Option<String>,
+    /// `MTLDevice.recommendedMaxWorkingSetSize` -- Apple's own answer
+    /// for how many GPU-resident bytes this process should hold. `0`
+    /// when no device was found (or when built without `metal`), same
+    /// convention as the fields above. See
+    /// `crate::gpu::probe_recommended_working_set_bytes` for what it
+    /// does and does not promise.
+    pub recommended_working_set_bytes: u64,
 }
 
 impl MetalProfile {
@@ -23,6 +30,9 @@ impl MetalProfile {
                 Some(name) => MetalProfile {
                     available: true,
                     device_name: Some(name),
+                    recommended_working_set_bytes: crate::gpu::probe_recommended_working_set_bytes(
+                    )
+                    .unwrap_or(0),
                 },
                 None => MetalProfile::default(),
             }
@@ -43,11 +53,30 @@ mod tests {
         let _ = MetalProfile::detect();
     }
 
+    /// Runs in both worlds: a host with no Metal device must report a
+    /// zero working set, and a host with one must report a plausible
+    /// non-zero ceiling. Asserting only one of those would be testing
+    /// the machine, not the probe.
+    #[test]
+    fn working_set_is_zero_without_a_device_and_plausible_with_one() {
+        let profile = MetalProfile::detect();
+        if profile.available {
+            assert!(
+                profile.recommended_working_set_bytes > 128 * 1024 * 1024,
+                "a real Metal device recommends more than 128 MiB, got {}",
+                profile.recommended_working_set_bytes
+            );
+        } else {
+            assert_eq!(profile.recommended_working_set_bytes, 0);
+        }
+    }
+
     #[test]
     #[cfg(not(feature = "metal"))]
     fn without_metal_feature_profile_always_reports_unavailable() {
         let profile = MetalProfile::detect();
         assert!(!profile.available);
         assert_eq!(profile.device_name, None);
+        assert_eq!(profile.recommended_working_set_bytes, 0);
     }
 }

@@ -188,6 +188,23 @@ pub fn probe() -> Option<String> {
     Some(device.name().to_string())
 }
 
+/// Apple's own answer to "how many bytes should this process keep
+/// resident on the GPU": `MTLDevice.recommendedMaxWorkingSetSize`.
+///
+/// This is the real device query, not a guess derived from installed
+/// RAM -- on unified-memory Apple Silicon it is the share of physical
+/// memory the driver is willing to let one process hold in GPU-resident
+/// allocations, and Metal starts paging (or failing allocations) past
+/// it. `None` when there is no Metal device.
+///
+/// It is a *recommendation* and a snapshot: nothing reserves it, and
+/// other processes draw from the same pool. Treat it as a ceiling to
+/// plan against, never as a guarantee.
+pub fn probe_recommended_working_set_bytes() -> Option<u64> {
+    let device = MTLCreateSystemDefaultDevice()?;
+    Some(device.recommendedMaxWorkingSetSize())
+}
+
 /// ggml-metal `kernel_mul_mv_q8_0_f32` port: `N_R0=2` rows per
 /// threadgroup, `NSG=4` simdgroups (128 threads) cooperating on the
 /// same two rows, each thread owning `NQ=8` contiguous int8 quants of a
@@ -315,8 +332,23 @@ pub fn launch_q8_0_matvec(
 /// blocks (2-byte `half` scale + 16 bytes of packed 4-bit nibbles, low
 /// nibble = element `i`, high nibble = element `i+16`, both biased by
 /// -8) to mirror `ferrox_quant::dot_q4_0_f32_scalar`'s exact math and
-/// Dense f32 matvec (OLMoE router `ffn_gate_inp` is F32 in GGUF).
-/// float4 body matches ggml `kernel_mul_mv_f32_f32_4` when `cols%4==0`.
+/// Dense f32 matvec (every MoE GGUF ships the router `ffn_gate_inp` as
+/// F32, so this is on the decode hot path 16-plus times per token).
+///
+/// ggml-metal `kernel_mul_mv_t_t_impl<float, float>` port: `NR0 = 2`
+/// output rows per threadgroup, `NSG` simdgroups splitting the reduction
+/// axis between them, per-lane partials folded by `simd_sum` and then
+/// across simdgroups through threadgroup memory
+/// (`helper_mv_reduce_and_write`). Consecutive lanes read consecutive
+/// columns, so every load coalesces.
+///
+/// It replaces a one-thread-per-row kernel, which for a `64 x 2048`
+/// router meant the entire GEMM ran as a *single* 64-thread threadgroup
+/// on one GPU core with each lane striding its own 8 KB row: ~1.1-1.8
+/// ms/tok on OLMoE (see the MoE decode diagnosis in
+/// `docs/plans/llama-cpp-parity-push.md`).
+///
+/// Host dispatches `ceil(rows/2)` threadgroups of `32 * nsg` threads.
 pub const F32_MATVEC_KERNEL_SRC: &str = r#"
 #include <metal_stdlib>
 using namespace metal;
@@ -327,23 +359,54 @@ kernel void f32_matvec(
     device float* out [[buffer(2)]],
     constant uint& cols [[buffer(3)]],
     constant uint& rows [[buffer(4)]],
-    uint row [[thread_position_in_grid]]
+    uint3 tgpig [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint nsg [[simdgroups_per_threadgroup]]
 ) {
-    if (row >= rows) return;
-    device const float* w = weights + (size_t)row * cols;
-    float sum = 0.0f;
-    uint i = 0u;
-    const uint n4 = cols & ~3u;
-    for (; i < n4; i += 4u) {
-        sum += dot(
-            float4(w[i], w[i + 1u], w[i + 2u], w[i + 3u]),
-            float4(x[i], x[i + 1u], x[i + 2u], x[i + 3u])
-        );
+    // ggml N_R0 for f32 x f32. NSG comes from the dispatch (<= 8).
+    constexpr uint NR0 = 2u;
+    constexpr uint NW = 32u;
+    constexpr uint MAX_NSG = 8u;
+    threadgroup float part[NR0 * MAX_NSG];
+
+    if (rows == 0u) return;
+    const uint r0 = tgpig.x * NR0;
+    if (r0 >= rows) return;
+
+    const uint tid = sg * NW + lane;
+    const uint nth = nsg * NW;
+
+    // Clamp so the hot loop is branch-free; drop OOB rows at the write.
+    uint rr[NR0];
+    for (uint r = 0u; r < NR0; ++r) {
+        rr[r] = min(r0 + r, rows - 1u);
     }
-    for (; i < cols; ++i) {
-        sum += w[i] * x[i];
+
+    float sumf[NR0] = { 0.0f };
+    for (uint i = tid; i < cols; i += nth) {
+        const float xv = x[i];
+        for (uint r = 0u; r < NR0; ++r) {
+            sumf[r] += weights[(size_t)rr[r] * cols + i] * xv;
+        }
     }
-    out[row] = sum;
+
+    for (uint r = 0u; r < NR0; ++r) {
+        const float s = simd_sum(sumf[r]);
+        if (lane == 0u) {
+            part[r * MAX_NSG + sg] = s;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sg == 0u && lane < NR0) {
+        float tot = 0.0f;
+        for (uint g = 0u; g < nsg; ++g) {
+            tot += part[lane * MAX_NSG + g];
+        }
+        if (r0 + lane < rows) {
+            out[r0 + lane] = tot;
+        }
+    }
 }
 "#;
 
@@ -657,54 +720,6 @@ kernel void moe_weighted_sum_residual(
         sum += route[e] * expert_out[(size_t)e * hidden_rows + i];
     }
     h[i] += sum;
-}
-
-/// Softmax over `n` logits (n≤256), write top-`k` ids + probs.
-/// `renormalize!=0` divides selected probs by their sum (Mixtral);
-/// OLMoE leaves them as global softmax mass (`renormalize==0`).
-kernel void moe_topk_softmax(
-    device const float* logits [[buffer(0)]],
-    device int* ids [[buffer(1)]],
-    device float* weights [[buffer(2)]],
-    constant uint& n [[buffer(3)]],
-    constant uint& k [[buffer(4)]],
-    constant uint& renormalize [[buffer(5)]],
-    uint tid [[thread_position_in_grid]]
-) {
-    if (tid != 0u) return;
-    float mx = -INFINITY;
-    for (uint i = 0u; i < n; ++i) mx = max(mx, logits[i]);
-    float sum = 0.0f;
-    float probs[256];
-    for (uint i = 0u; i < n; ++i) {
-        probs[i] = exp(logits[i] - mx);
-        sum += probs[i];
-    }
-    const float inv = 1.0f / sum;
-    for (uint i = 0u; i < n; ++i) probs[i] *= inv;
-
-    // Selection sort top-k (k≤8, n≤256 — decode routing only).
-    for (uint t = 0u; t < k; ++t) {
-        uint best = 0u;
-        float best_p = -1.0f;
-        for (uint i = 0u; i < n; ++i) {
-            if (probs[i] > best_p) {
-                best_p = probs[i];
-                best = i;
-            }
-        }
-        ids[t] = int(best);
-        weights[t] = best_p;
-        probs[best] = -1.0f;
-    }
-    if (renormalize != 0u) {
-        float s = 0.0f;
-        for (uint t = 0u; t < k; ++t) s += weights[t];
-        if (s > 0.0f) {
-            const float invs = 1.0f / s;
-            for (uint t = 0u; t < k; ++t) weights[t] *= invs;
-        }
-    }
 }
 
 /// llama.cpp `mul_mv_id` style: packed Q4_0 plane, `ids[slot]` selects
@@ -1167,11 +1182,17 @@ kernel void moe_router_mm_f32(
     }
 }
 
-/// Batched twin of `moe_topk_softmax`: one simdgroup per token, probs in
+/// Softmax over `n` logits (`n<=256`) per token, writing top-`k` ids +
+/// probs. `renormalize!=0` divides selected probs by their sum (Mixtral);
+/// OLMoE leaves them as global softmax mass (`renormalize==0`).
+///
+/// One simdgroup per token, probs in
 /// threadgroup memory (`n` floats) instead of a 256-float per-thread
 /// array. Writes `ids[t*k + j]` / `weights[t*k + j]`.
 ///
-/// Tie policy matches the decode kernel: lowest expert index wins.
+/// Tie policy: lowest expert index wins. Decode calls this with
+/// `n_tokens == 1`; the single-lane kernel it replaced cost ~1.3-2.2
+/// ms/tok across OLMoE's 16 layers.
 kernel void moe_topk_softmax_batch(
     device const float* logits [[buffer(0)]],
     device int* ids [[buffer(1)]],
@@ -5908,58 +5929,6 @@ impl PrefillMoeMetal<'_> {
     }
 }
 
-/// Encode softmax top-k routing (n≤256, k≤8) into an existing encoder.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn encode_moe_topk_softmax(
-    encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
-    device: &Retained<ProtocolObject<dyn MTLDevice>>,
-    logits: &ProtocolObject<dyn MTLBuffer>,
-    ids: &ProtocolObject<dyn MTLBuffer>,
-    weights: &ProtocolObject<dyn MTLBuffer>,
-    n: u32,
-    k: u32,
-    renormalize: bool,
-) -> Result<(), MetalError> {
-    let pipe = ensure_pipeline(device, Q4_0_MOE_TOPK_KERNEL_SRC, "moe_topk_softmax")?;
-    encoder.setComputePipelineState(&pipe.0);
-    unsafe {
-        encoder.setBuffer_offset_atIndex(Some(logits), 0, 0);
-        encoder.setBuffer_offset_atIndex(Some(ids), 0, 1);
-        encoder.setBuffer_offset_atIndex(Some(weights), 0, 2);
-        let mut n_u = n;
-        encoder.setBytes_length_atIndex(
-            NonNull::new(&mut n_u as *mut u32 as *mut _).unwrap(),
-            4,
-            3,
-        );
-        let mut k_u = k;
-        encoder.setBytes_length_atIndex(
-            NonNull::new(&mut k_u as *mut u32 as *mut _).unwrap(),
-            4,
-            4,
-        );
-        let mut renorm = u32::from(renormalize);
-        encoder.setBytes_length_atIndex(
-            NonNull::new(&mut renorm as *mut u32 as *mut _).unwrap(),
-            4,
-            5,
-        );
-    }
-    encoder.dispatchThreadgroups_threadsPerThreadgroup(
-        MTLSize {
-            width: 1,
-            height: 1,
-            depth: 1,
-        },
-        MTLSize {
-            width: 1,
-            height: 1,
-            depth: 1,
-        },
-    );
-    Ok(())
-}
-
 struct MoeMatvecIdDispatch {
     kernel_src: &'static str,
     fn_name: &'static str,
@@ -7745,16 +7714,19 @@ pub(crate) fn encode_matvec_with_offsets(
                 4,
             );
         }
-        let tg = 64usize;
+        // ggml `get_pipeline_mul_mv` for f32 x f32: NR0=2 rows per
+        // threadgroup, NSG = min(4, ceil(ne00/128)) simdgroups sharing the
+        // reduction axis. `MAX_NSG` in the kernel is 8.
+        let nsg = cols.div_ceil(128).clamp(1, 4);
         encoder.dispatchThreadgroups_threadsPerThreadgroup(
             MTLSize {
-                width: launch.rows.div_ceil(tg),
+                width: launch.rows.div_ceil(2),
                 height: 1,
                 depth: 1,
             },
             MTLSize {
-                width: tg,
-                height: 1,
+                width: 32,
+                height: nsg,
                 depth: 1,
             },
         );
@@ -7993,6 +7965,52 @@ mod tests {
     fn probe_finds_a_real_device_name() {
         let name = probe().expect("this dev machine has a real Metal GPU");
         assert!(!name.is_empty());
+    }
+
+    #[test]
+    #[ignore = "needs a real Metal-capable GPU; run manually with --ignored on Apple Silicon"]
+    fn f32_matvec_matches_cpu_reference() {
+        // Shapes that exercise the simdgroup port's edges: an odd row
+        // count (the last threadgroup's second row is clamped and must be
+        // dropped at the write), a column count that is neither a multiple
+        // of the 32-lane simdgroup nor of 128 (so `nsg` clamps and the
+        // strided loop leaves a ragged tail), a router-shaped case, and a
+        // single row.
+        for (rows, cols) in [(64usize, 2048usize), (7, 200), (1, 33), (2, 4096)] {
+            let x: Vec<f32> = (0..cols).map(|i| (i as f32 * 0.037).sin()).collect();
+            let mut weights_f32 = Vec::with_capacity(rows * cols);
+            let mut expected = Vec::with_capacity(rows);
+            for r in 0..rows {
+                let mut acc = 0.0f64;
+                for (i, xv) in x.iter().enumerate() {
+                    let w = ((r * 7 + i) as f32 * 0.013).cos();
+                    weights_f32.push(w);
+                    acc += (w * xv) as f64;
+                }
+                expected.push(acc as f32);
+            }
+            let weights: Vec<u8> = weights_f32.iter().flat_map(|w| w.to_le_bytes()).collect();
+
+            let got = launch_matvec(
+                F32_MATVEC_KERNEL_SRC,
+                "f32_matvec",
+                4,
+                1,
+                &weights,
+                &x,
+                rows,
+                cols * 4,
+            )
+            .expect("kernel launch");
+
+            assert_eq!(got.len(), rows, "rows={rows} cols={cols}");
+            for (i, (g, w)) in got.iter().zip(expected.iter()).enumerate() {
+                assert!(
+                    (g - w).abs() <= 1e-3 * w.abs().max(1.0),
+                    "rows={rows} cols={cols} row {i}: got {g}, want {w}"
+                );
+            }
+        }
     }
 
     #[test]

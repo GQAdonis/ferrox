@@ -14,8 +14,12 @@ ferrox-moe = { workspace = true }
 ferrox-gguf = { workspace = true }
 ferrox-quant = { workspace = true }
 ferrox-safetensors = { workspace = true }
-ferrox-metal = { workspace = true, optional = true }
-ferrox-cuda = { workspace = true, optional = true }
+# Not optional: `device_budget` asks both crates what the host offers
+# on every build, and both compile to plain capability structs (with
+# every GPU field honestly zeroed) when their own kernel feature is
+# off. Only the *kernels* are feature-gated, and still are below.
+ferrox-metal = { workspace = true }
+ferrox-cuda = { workspace = true }
 serde = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
@@ -31,5 +35,5 @@ half = { workspace = true }
 
 [features]
 default = []
-cuda = ["ferrox-moe/cuda", "dep:ferrox-cuda", "ferrox-cuda/cuda"]
-metal = ["ferrox-moe/metal", "dep:ferrox-metal", "ferrox-metal/metal"]
+cuda = ["ferrox-moe/cuda", "ferrox-cuda/cuda"]
+metal = ["ferrox-moe/metal", "ferrox-metal/metal"]

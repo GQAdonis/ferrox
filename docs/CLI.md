@@ -36,6 +36,10 @@ compiled in; pick at runtime with `-dev` / `-ngl`.
 # Threads + context
 ./target/release/ferrox -m model.gguf -p "Hi" -n 64 -t 8 -c 4096
 
+# Largest context that fits, chosen before the weights load; the
+# arithmetic behind the number is printed to stderr
+./target/release/ferrox -m model.gguf -p "Hi" -n 64 -c auto
+
 # List devices, then select Metal (requires a --features metal build)
 ./target/release/ferrox --list-devices
 ./target/release/ferrox -m models/Llama-3.2-1B-Instruct-Q4_K_M.gguf \
@@ -55,7 +59,8 @@ Same via explicit subcommand: `ferrox run -m …`.
 | `-p` / `--prompt` | Prompt string |
 | `-f` / `--file` | Prompt from file |
 | `-n` / `--n-predict` | `-1` = fill remaining context |
-| `-c` / `--ctx-size` | `0` = GGUF `{arch}.context_length` (else 4096) |
+| `-c` / `--ctx-size` | `auto` = largest that fits the device memory budget, `0` = GGUF `{arch}.context_length` (else 4096), or a token count |
+| `--strict-budget` | Refuse to load when the pre-load budget says the context will not fit (default: warn and continue) |
 | `-t` / `--threads` | Sets `RAYON_NUM_THREADS` |
 | `--temp` | `0` = greedy |
 | `--top-k` | `0` = off |
@@ -94,6 +99,10 @@ not available yet).
 ```bash
 ./target/release/ferrox inspect models/tinyllama-1.1b-chat-v1.0.Q8_0.gguf
 ./target/release/ferrox inspect-plan models/olmoe-1b-7b-0924-q4_0.gguf --strict
+# Plan against a backend's real memory budget (Metal
+# recommendedMaxWorkingSetSize / free VRAM / host RAM minus a reserve).
+# Always reports the largest context that fits and the arithmetic:
+./target/release/ferrox inspect-plan model.gguf --backend metal --ctk f16
 ./target/release/ferrox caps
 ./target/release/ferrox archs
 ./target/release/ferrox presets
@@ -102,6 +111,52 @@ not available yet).
 # Kimi K3 safetensors directory (large checkpoint; see MODELS.md)
 ./target/release/ferrox run-kimi /path/to/kimi --prompt "Hi" --max-new-tokens 32
 ```
+
+## Correctness (`verify`, `parity`)
+
+Two different questions, and only the second one involves llama.cpp.
+
+```bash
+# Do ferrox's own backends agree? (CPU reference vs Metal/CUDA)
+./target/release/ferrox verify -m models/tinyllama-1.1b-chat-v1.0.Q8_0.gguf \
+  --backend metal --prompt-tokens 64
+
+# Does ferrox agree with llama.cpp? (first-token distribution, CPU vs CPU)
+./target/release/ferrox parity -m models/tinyllama-1.1b-chat-v1.0.Q8_0.gguf \
+  --prompt-tokens 64
+```
+
+`verify` greedy-decodes the same prompt on two ferrox backends and diffs
+the token ids. It cannot catch a bug both backends share.
+
+`parity` compares the logit distribution at the last prompt position
+against llama.cpp's, feeding **the same token ids to both** so the
+tokenizer is not part of the experiment. It reports KL in both
+directions, total variation, max |delta p|, top-k overlap, and where
+llama's top-1 ranks for ferrox, then gives one of four verdicts:
+
+| Verdict | Meaning |
+|---|---|
+| `MATCH` | same distribution to within f32 accumulation-order noise |
+| `DRIFT` | same top-1, distributions moved further than reordering explains |
+| `TIE-FLIP` | top-1 differs, but llama's own top-2 margin is under the observed noise — a tie swapped, not a wrong graph |
+| `WRONG` | the graphs disagree; exits non-zero |
+
+Greedy *text* is deliberately not the medium: a chain of argmaxes turns
+one last-bit difference into a different sentence, so a text diff cannot
+tell `TIE-FLIP` from `WRONG`.
+
+`parity` needs the reference dumper built once. It is C, not Rust, and
+lives outside the cargo workspace on purpose — it exists to be
+llama.cpp's own answer, so it links llama.cpp's own library:
+
+```bash
+./tools/build_llama_logits.sh          # -> target/llama_logits
+LLAMA_CPP_PREFIX=/path/to/llama.cpp ./tools/build_llama_logits.sh
+```
+
+Point `--dumper` or `FERROX_LLAMA_LOGITS` at it if you build it
+elsewhere.
 
 ## Hugging Face Hub (`pull`)
 

@@ -625,11 +625,24 @@ impl Decoder {
         if m == 1.0 {
             return;
         }
-        for v in q.iter_mut() {
-            *v *= m;
-        }
-        for v in k.iter_mut() {
-            *v *= m;
+        // ggml folds `attn_factor` into cos_theta/sin_theta inside
+        // `rope_yarn` (ops.cpp), so it reaches ONLY the rotated channels;
+        // `[n_rot, head_dim)` is then copied through untouched by the
+        // "fill the remain channels with data from src tensor" loop.
+        // Scaling the pass-through tail as well is a different graph, and
+        // `ferrox parity` caught it as the one DRIFT verdict in a
+        // 17-model sweep: Phi-4-mini rotates 96 of 128 dims with
+        // attn_factor 1.1902, so 32 dims per head were scaled that
+        // llama.cpp leaves alone.
+        let head_dim = self.config.head_dim;
+        let rot = self.config.rope_dim.unwrap_or(head_dim).min(head_dim);
+        for buf in [q, k] {
+            for head in buf.chunks_mut(head_dim) {
+                let n = rot.min(head.len());
+                for v in head[..n].iter_mut() {
+                    *v *= m;
+                }
+            }
         }
     }
 
@@ -4195,6 +4208,70 @@ mod partial_rotary_tests {
             head[..4] != before[..4],
             "dims below rope_dim must rotate at a non-zero position"
         );
+    }
+
+    /// `attn_factor` is a magnitude scale folded into cos/sin inside
+    /// ggml's `rope_yarn`, so it can only ever touch the rotated
+    /// channels. The pass-through tail must come out bit-identical —
+    /// scaling it is a different graph, and it was one, until
+    /// `ferrox parity` reported Phi-4-mini as the single DRIFT in a
+    /// 17-model sweep against llama.cpp.
+    #[test]
+    fn attn_factor_scales_only_the_rotated_channels() {
+        let mut cfg = crate::config::test_dense_fixture();
+        cfg.head_dim = 8;
+        cfg.n_heads = 2;
+        cfg.n_kv_heads = 2;
+        cfg.rope_dim = Some(4);
+        cfg.rope_attn_factor = 2.0;
+        let decoder = Decoder::new_random_small(cfg, 1, 32);
+
+        // Two heads, so a per-head slice bug cannot hide behind a single
+        // head that happens to span the whole buffer.
+        let mut q: Vec<f32> = (0..16).map(|i| 1.0 + i as f32).collect();
+        let mut k: Vec<f32> = (0..16).map(|i| 1.0 + i as f32).collect();
+        let before = q.clone();
+        decoder.apply_rope_attn_factor(&mut q, &mut k);
+
+        for h in 0..2 {
+            let base = h * 8;
+            for i in 0..4 {
+                assert_eq!(
+                    q[base + i],
+                    before[base + i] * 2.0,
+                    "rotated channel {i} of head {h} must be scaled"
+                );
+            }
+            for i in 4..8 {
+                assert_eq!(
+                    q[base + i],
+                    before[base + i],
+                    "pass-through channel {i} of head {h} must be untouched"
+                );
+            }
+        }
+        assert_eq!(q, k, "q and k take the same magnitude scale");
+    }
+
+    /// With no partial rotary the whole head is rotated, so the whole
+    /// head takes the scale — the narrow case must not become the rule.
+    #[test]
+    fn attn_factor_scales_the_whole_head_without_partial_rotary() {
+        let mut cfg = crate::config::test_dense_fixture();
+        cfg.head_dim = 8;
+        cfg.n_heads = 1;
+        cfg.n_kv_heads = 1;
+        cfg.rope_dim = None;
+        cfg.rope_attn_factor = 3.0;
+        let decoder = Decoder::new_random_small(cfg, 1, 32);
+
+        let mut q: Vec<f32> = (0..8).map(|i| 1.0 + i as f32).collect();
+        let mut k = q.clone();
+        let before = q.clone();
+        decoder.apply_rope_attn_factor(&mut q, &mut k);
+        for i in 0..8 {
+            assert_eq!(q[i], before[i] * 3.0);
+        }
     }
 
     /// The same call with no `rope_dim` must rotate everything, so the

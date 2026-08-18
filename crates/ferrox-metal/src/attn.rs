@@ -53,13 +53,13 @@ use crate::elem::{
 };
 use crate::embd::{encode_get_rows, EmbdKind};
 use crate::gpu::{
-    compute_encoder_concurrent, encode_matvec, encode_matvec_with_offsets, encode_moe_topk_softmax,
-    encode_mul_mm_sg_f16, encode_q4_0_moe_gate_then_up_silu, encode_q4_0_moe_gate_up_id,
-    encode_q4_0_moe_gate_up_silu_fused, encode_q4_0_moe_id, encode_q4_0_moe_id_ex,
-    encode_q4_0_moe_topk, encode_q4_0_mul_mm, ensure_pipeline, memory_barrier_buffers,
-    memory_barrier_resources, resident_f32_buffer, resident_weight_buffer, shared_metal,
-    warm_mul_mm_sg_pipeline, MatvecLaunch, MetalError, MoeExpertLaunch, MoePackedQ4, MulMmSgLaunch,
-    ResidentF32Buffer, ResidentWeightBuffer,
+    compute_encoder_concurrent, encode_matvec, encode_matvec_with_offsets,
+    encode_moe_topk_softmax_batch, encode_mul_mm_sg_f16, encode_q4_0_moe_gate_then_up_silu,
+    encode_q4_0_moe_gate_up_id, encode_q4_0_moe_gate_up_silu_fused, encode_q4_0_moe_id,
+    encode_q4_0_moe_id_ex, encode_q4_0_moe_topk, encode_q4_0_mul_mm, ensure_pipeline,
+    memory_barrier_buffers, memory_barrier_resources, resident_f32_buffer, resident_weight_buffer,
+    shared_metal, warm_mul_mm_sg_pipeline, MatvecLaunch, MetalError, MoeExpertLaunch, MoePackedQ4,
+    MulMmSgLaunch, ResidentF32Buffer, ResidentWeightBuffer,
 };
 use crate::moe_ranges::MoeMemRanges;
 use objc2::rc::Retained;
@@ -1869,11 +1869,21 @@ kernel void gqa_prefill_fa_ext_d64(
 ///    (`ic + cc >= kv_valid >= clen`), hence P = 0, hence no P·V contribution.
 ///
 /// Parameterised over the head dim: every shape constant below is derived from
-/// `D`, so the same body serves d=64 and d=128. Two limits bound it. `own`
-/// assigns one `float4` of the output row per lane, so `D/4 <= 32`, i.e.
-/// `D <= 128` — d=256 (Gemma-3) needs a lane loop and is not instantiated here.
-/// And `D % 16 == 0`, because the Q·Kᵀ loop walks the head 16 columns at a
-/// time as a pair of 8×8 MMAs.
+/// `D`, so the same body serves d=64, d=128 and d=256.
+///
+/// The three places that touch the `so` accumulator row-wise — zero-init,
+/// the online-softmax rescale, and the epilogue — walk it with llama's lane
+/// loop `for (i = tiisg; i < D4; i += NW)` (`ggml-metal.metal:6529-6535`,
+/// `:6826-6838`, `:7024-7034`). Below `D4 <= NW` that loop runs exactly one
+/// iteration on exactly the lanes the previous `own = tiisg < D4` guard
+/// selected, with the same index, so d=64 and d=128 are unchanged; at d=256
+/// (`D4 == 64`) it is what lets one lane carry two `float4` columns.
+///
+/// Remaining shape constraints: `D % 16 == 0`, because the Q·Kᵀ loop walks the
+/// head 16 columns at a time as a pair of 8×8 MMAs; `(D/8) % NSG == 0`, so the
+/// P·V output blocks partition evenly across simdgroups; and threadgroup
+/// memory `(2·QN·D + QN·SH)·4 + 4·8·D` bytes, which is 28 KiB at d=256 and so
+/// the last width that fits Apple's 32 KiB limit at this tiling.
 macro_rules! gqa_prefill_fa_ext_mma_src {
     ($name:literal, $d:literal) => {
         concat!(
@@ -1923,7 +1933,6 @@ kernel void "#,
     const uint kv_stride = n_kv_heads * D;
     const float scale = 1.0f / sqrt(float(D));
     const uint n_local = min(QN, n_q - qi0);
-    const bool own = tiisg < D4;
 
     // sq[QN,D] f32 | so[QN,D] f32 | ss[QN,SH] f32 | kpad[8,D] f16 | vpad[8,D] f16
     threadgroup float* sq = shared;
@@ -1950,10 +1959,8 @@ kernel void "#,
             // and nothing reads their `so` rows back out.
             for (uint i = tiisg; i < D4; i += NW) sq4[i] = float4(0.0f);
         }
-        if (own) {
-            threadgroup float4* so4 = (threadgroup float4*)(so + j * D);
-            so4[tiisg] = float4(0.0f);
-        }
+        threadgroup float4* so4 = (threadgroup float4*)(so + j * D);
+        for (uint i = tiisg; i < D4; i += NW) so4[i] = float4(0.0f);
     }
 
     if (kv_rem > 0u) {
@@ -2056,10 +2063,8 @@ kernel void "#,
             S[jj] = S[jj] * ms + simd_sum(vs2[0] + vs2[1]);
             ss2[tiisg] = vs2;
 
-            if (own) {
-                threadgroup float4* so4 = (threadgroup float4*)(so + j * D);
-                so4[tiisg] *= ms;
-            }
+            threadgroup float4* so4 = (threadgroup float4*)(so + j * D);
+            for (uint i = tiisg; i < D4; i += NW) so4[i] *= ms;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -2105,12 +2110,12 @@ kernel void "#,
     // Each SG writes its NQ queries (no cross-SG KV reduce — llama layout).
     for (uint jj = 0u; jj < NQ; jj++) {
         const uint j = jj * NSG + sgitg;
-        if (j >= n_local || !own) continue;
+        if (j >= n_local) continue;
         const float inv = (S[jj] == 0.0f) ? 0.0f : (1.0f / S[jj]);
         device float4* out4 =
             (device float4*)(out + ((qi0 + j) * n_heads + h) * D);
         threadgroup float4* so4 = (threadgroup float4*)(so + j * D);
-        out4[tiisg] = so4[tiisg] * inv;
+        for (uint i = tiisg; i < D4; i += NW) out4[i] = so4[i] * inv;
     }
 }
 "#
@@ -2125,6 +2130,13 @@ const GQA_PREFILL_FA_EXT_MMA_D64_KERNEL_SRC: &str =
 /// reference for both correctness and timing is `gqa_prefill_fa_vec`.
 const GQA_PREFILL_FA_EXT_MMA_D128_KERNEL_SRC: &str =
     gqa_prefill_fa_ext_mma_src!("gqa_prefill_fa_ext_mma_d128", "128");
+/// Gemma-2 / Gemma-3 shape: head_dim 256, the width the `own`-guarded epilogue
+/// could not reach. `D4 == 64` means each lane carries two `float4` output
+/// columns and `NO == 8` accumulator matrices per simdgroup; threadgroup memory
+/// is 28 KiB. Like d=128 there is no scalar `fa_ext` at this width, so the A/B
+/// reference for correctness and timing is `gqa_prefill_fa_vec_d256`.
+const GQA_PREFILL_FA_EXT_MMA_D256_KERNEL_SRC: &str =
+    gqa_prefill_fa_ext_mma_src!("gqa_prefill_fa_ext_mma_d256", "256");
 
 const GQA_PREFILL_FA_VEC_D256_KERNEL_SRC: &str = r#"
 #include <metal_stdlib>
@@ -3864,10 +3876,10 @@ fn encode_gqa_prefill_fa_nq4_d64(
 
 /// llama `kernel_flash_attn_ext` dispatch: QN=8, C=64, NSG=4 (128 threads/TG).
 ///
-/// `head_dim` must be 64 or 128 — the two widths the MMA kernel is
+/// `head_dim` must be 64, 128 or 256 — the three widths the MMA kernel is
 /// instantiated at. The scalar `fa_ext` predecessor only exists at d=64, so
-/// `FERROX_METAL_FA_MMA=0` is honoured there and the caller keeps d=128 off
-/// this path entirely when MMA is disabled.
+/// `FERROX_METAL_FA_MMA=0` is honoured there and the caller keeps d=128 / d=256
+/// off this path entirely when MMA is disabled.
 #[allow(clippy::too_many_arguments)]
 fn encode_gqa_prefill_fa_ext(
     encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
@@ -3900,6 +3912,11 @@ fn encode_gqa_prefill_fa_ext(
             GQA_PREFILL_FA_EXT_MMA_D128_KERNEL_SRC,
             "gqa_prefill_fa_ext_mma_d128",
         )?,
+        (256, true) => ensure_pipeline(
+            device,
+            GQA_PREFILL_FA_EXT_MMA_D256_KERNEL_SRC,
+            "gqa_prefill_fa_ext_mma_d256",
+        )?,
         (64, false) => ensure_pipeline(
             device,
             GQA_PREFILL_FA_EXT_D64_KERNEL_SRC,
@@ -3910,7 +3927,8 @@ fn encode_gqa_prefill_fa_ext(
     encoder.setComputePipelineState(&pipe.0);
     let tg = 32 * NSG;
     // sq[QN,D] + so[QN,D] + ss[QN,SH], plus kpad[8,D]+vpad[8,D] as f16 for the
-    // MMA variant's ≤7-row cache tail. 10 KiB at d=64, 16 KiB at d=128.
+    // MMA variant's ≤7-row cache tail. 10 KiB at d=64, 16 KiB at d=128,
+    // 28 KiB at d=256 — the last width under Apple's 32 KiB threadgroup limit.
     let tg_mem =
         ((2 * QN * d + QN * SH) * 4) as usize + if mma { (2 * 8 * d * 2) as usize } else { 0 };
     unsafe {
@@ -3991,13 +4009,15 @@ fn encode_gqa_prefill_fa_vec(
     kv_prefix_len: u32,
     softcap: f32,
 ) -> Result<(), MetalError> {
-    // llama flash_attn_ext (MMA Q·Kᵀ + P·V, QN=8/C=64): default for d=64 and
-    // d=128 prefill. Opt out: FERROX_METAL_FA_EXT=0. Legacy NQ=4:
+    // llama flash_attn_ext (MMA Q·Kᵀ + P·V, QN=8/C=64): default for d=64,
+    // d=128 and d=256 prefill. Opt out: FERROX_METAL_FA_EXT=0. Legacy NQ=4:
     // FERROX_METAL_FA_NQ=4 (d=64 only).
     //
-    // d=128 has no scalar `fa_ext` kernel, so `FERROX_METAL_FA_MMA=0` sends it
-    // back to FA-vec rather than to a variant that does not exist.
-    if (head_dim == 64 || (head_dim == 128 && gqa_prefill_fa_mma_enabled())) && n_q >= 8 {
+    // d=128 and d=256 have no scalar `fa_ext` kernel, so `FERROX_METAL_FA_MMA=0`
+    // sends them back to FA-vec rather than to a variant that does not exist.
+    if (head_dim == 64 || ((head_dim == 128 || head_dim == 256) && gqa_prefill_fa_mma_enabled()))
+        && n_q >= 8
+    {
         if gqa_prefill_fa_ext_d64_enabled() {
             return encode_gqa_prefill_fa_ext(
                 encoder,
@@ -5353,6 +5373,51 @@ thread_local! {
         const { RefCell::new(Vec::new()) };
 }
 
+/// Which stages of the fused MoE decode layer to *drop*, from
+/// `FERROX_METAL_MOE_ABLATE` (comma list of `attn`, `gqa`, `rmv`, `topk`,
+/// `router`, `gateup`, `down`, `ffn`).
+///
+/// Output is garbage while any stage is dropped — this exists only so the
+/// per-stage share of `FERROX_METAL_GPU_TIMING`'s ms/tok can be read off by
+/// subtraction. There is no other way to attribute GPU time inside a single
+/// Concurrent encoder without a Metal capture. See
+/// `docs/plans/llama-cpp-parity-push.md`.
+#[derive(Clone, Copy, Default)]
+struct MoeAblate {
+    attn: bool,
+    gqa: bool,
+    router_mv: bool,
+    topk: bool,
+    gate_up: bool,
+    down: bool,
+    ffn: bool,
+}
+
+fn moe_ablate() -> MoeAblate {
+    static A: std::sync::OnceLock<MoeAblate> = std::sync::OnceLock::new();
+    *A.get_or_init(|| {
+        let spec = std::env::var("FERROX_METAL_MOE_ABLATE").unwrap_or_default();
+        let mut a = MoeAblate::default();
+        for part in spec.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+            match part {
+                "attn" => a.attn = true,
+                "gqa" => a.gqa = true,
+                "rmv" => a.router_mv = true,
+                "topk" => a.topk = true,
+                "router" => {
+                    a.router_mv = true;
+                    a.topk = true;
+                }
+                "gateup" => a.gate_up = true,
+                "down" => a.down = true,
+                "ffn" => a.ffn = true,
+                other => eprintln!("ferrox: unknown FERROX_METAL_MOE_ABLATE stage {other:?}"),
+            }
+        }
+        a
+    })
+}
+
 fn moe_layer_resident(
     device: &Retained<ProtocolObject<dyn MTLDevice>>,
     layer_idx: usize,
@@ -5432,6 +5497,7 @@ fn encode_moe_layer_fused(
     pos: usize,
     rms_eps: f32,
 ) -> Result<(), MetalError> {
+    let ablate = moe_ablate();
     let bound = moe_layer_resident(device, layer_idx, layer)?;
     let attn_nw = &bound.attn_nw;
     let ffn_nw = &bound.ffn_nw;
@@ -5458,7 +5524,7 @@ fn encode_moe_layer_fused(
         mrs.end_op(&srcs, &dsts);
     }
     // Q∥K∥V — one Concurrent set (shared src, disjoint dsts).
-    {
+    if !ablate.attn {
         let srcs = [scratch.x_attn.as_ref()];
         let dsts = [scratch.q.as_ref(), scratch.k.as_ref(), scratch.v.as_ref()];
         mrs.begin_op(encoder, &srcs, &dsts);
@@ -5468,7 +5534,7 @@ fn encode_moe_layer_fused(
         mrs.end_op(&srcs, &dsts);
     }
     // extras + RoPE on q/k — fused group (one barrier before in-place chain).
-    {
+    if !ablate.attn {
         let srcs = [scratch.q.as_ref(), scratch.k.as_ref(), scratch.v.as_ref()];
         let dsts = [scratch.q.as_ref(), scratch.k.as_ref(), scratch.v.as_ref()];
         mrs.begin_op(encoder, &srcs, &dsts);
@@ -5518,7 +5584,7 @@ fn encode_moe_layer_fused(
     }
     let token_elems = (n_kv_heads * head_dim) as u32;
     let offset = (pos * n_kv_heads * head_dim) as u32;
-    {
+    if !ablate.attn {
         let srcs = [scratch.k.as_ref(), scratch.v.as_ref()];
         let dsts = [kv.k.as_ref(), kv.v.as_ref()];
         mrs.begin_op(encoder, &srcs, &dsts);
@@ -5543,7 +5609,7 @@ fn encode_moe_layer_fused(
         )?;
         mrs.end_op(&srcs, &dsts);
     }
-    {
+    if !ablate.attn && !ablate.gqa {
         let srcs = [scratch.q.as_ref(), kv.k.as_ref(), kv.v.as_ref()];
         let dsts = [scratch.attn.as_ref()];
         mrs.begin_op(encoder, &srcs, &dsts);
@@ -5562,7 +5628,7 @@ fn encode_moe_layer_fused(
         )?;
         mrs.end_op(&srcs, &dsts);
     }
-    {
+    if !ablate.attn {
         let srcs = [scratch.attn.as_ref()];
         let dsts = [scratch.o.as_ref()];
         mrs.begin_op(encoder, &srcs, &dsts);
@@ -5585,7 +5651,7 @@ fn encode_moe_layer_fused(
         )?;
         mrs.end_op(&srcs, &dsts);
     }
-    {
+    if !ablate.router_mv {
         let srcs = [scratch.x2.as_ref()];
         let dsts = [scratch.router.as_ref()];
         mrs.begin_op(encoder, &srcs, &dsts);
@@ -5599,11 +5665,16 @@ fn encode_moe_layer_fused(
         )?;
         mrs.end_op(&srcs, &dsts);
     }
-    {
+    if !ablate.topk {
         let srcs = [scratch.router.as_ref()];
         let dsts = [scratch.ids.as_ref(), scratch.route.as_ref()];
         mrs.begin_op(encoder, &srcs, &dsts);
-        encode_moe_topk_softmax(
+        // One token, but the *batch* kernel: it spreads the softmax and
+        // each of the k selection passes over a simdgroup and keeps `probs`
+        // in threadgroup memory. Its single-token twin ran the whole thing
+        // on lane 0 out of a private `float[256]` and cost ~1.3-2.2 ms/tok
+        // across 16 layers (see the plan's MoE decode diagnosis).
+        encode_moe_topk_softmax_batch(
             encoder,
             device,
             &scratch.router,
@@ -5612,8 +5683,12 @@ fn encode_moe_layer_fused(
             layer.router.rows as u32,
             top_k as u32,
             norm_topk_prob,
+            1,
         )?;
         mrs.end_op(&srcs, &dsts);
+    }
+    if ablate.ffn {
+        return Ok(());
     }
     let fused_gate_up = matches!(
         std::env::var("FERROX_METAL_MOE_FUSED_GATE_UP")
@@ -5721,21 +5796,26 @@ fn encode_moe_layer_fused(
         )?;
         mrs.end_op(&srcs, &dsts);
     } else {
-        let srcs = [scratch.x2.as_ref(), scratch.ids.as_ref()];
-        let dsts = [scratch.gate.as_ref(), scratch.up.as_ref()];
-        mrs.begin_op(encoder, &srcs, &dsts);
-        encode_q4_0_moe_gate_up_id(
-            encoder,
-            device,
-            &scratch.x2,
-            &layer.packed,
-            &scratch.ids,
-            &scratch.gate,
-            &scratch.up,
-            top_k as u32,
-            1,
-        )?;
-        mrs.end_op(&srcs, &dsts);
+        if !ablate.gate_up {
+            let srcs = [scratch.x2.as_ref(), scratch.ids.as_ref()];
+            let dsts = [scratch.gate.as_ref(), scratch.up.as_ref()];
+            mrs.begin_op(encoder, &srcs, &dsts);
+            encode_q4_0_moe_gate_up_id(
+                encoder,
+                device,
+                &scratch.x2,
+                &layer.packed,
+                &scratch.ids,
+                &scratch.gate,
+                &scratch.up,
+                top_k as u32,
+                1,
+            )?;
+            mrs.end_op(&srcs, &dsts);
+        }
+        if ablate.down {
+            return Ok(());
+        }
         let srcs = [
             scratch.x2.as_ref(),
             scratch.ids.as_ref(),
@@ -8917,6 +8997,111 @@ mod tests {
                     softcap,
                 )
                 .expect("d128 prefill")
+            };
+            let fa_vec = run("0");
+            let mma = run("1");
+            std::env::remove_var("FERROX_METAL_FA_MMA");
+            let worst_of = |a: &[f32], b: &[f32]| {
+                let mut max_diff = 0f32;
+                let mut worst = (0usize, 0f32, 0f32);
+                for (i, (x, y)) in a.iter().zip(b.iter()).enumerate() {
+                    let d = (x - y).abs();
+                    if d > max_diff {
+                        max_diff = d;
+                        worst = (i, *x, *y);
+                    }
+                }
+                (max_diff, worst)
+            };
+            let (d_cpu, w_cpu) = worst_of(&cpu, &mma);
+            let tol = 5e-3 * w_cpu.1.abs().max(1.0);
+            assert!(
+                d_cpu <= tol,
+                "mma vs cpu hd={head_dim} n_q={n_q} pre={kv_prefix_len} \
+                 sc={softcap:?} max_diff={d_cpu} worst={w_cpu:?} tol={tol}"
+            );
+            let (d_vec, w_vec) = worst_of(&fa_vec, &mma);
+            assert!(
+                d_vec <= 1e-3,
+                "mma vs fa_vec hd={head_dim} n_q={n_q} pre={kv_prefix_len} \
+                 sc={softcap:?} max_diff={d_vec} worst={w_vec:?}"
+            );
+        }
+    }
+
+    /// The d=256 MMA kernel (Gemma-2 / Gemma-3 shape) against the f32 CPU
+    /// reference **and** against FA-vec, the only other kernel at this width.
+    /// This is the width the old `own = tiisg < D4` epilogue could not reach:
+    /// `D4 == 64` needs two `float4` columns per lane, so the cases below
+    /// deliberately include Gemma-3-1B's own 4-head / 1-kv-head / softcap
+    /// shape alongside padded cache tails, exact 8-row fits, and a long-prefix
+    /// / short-batch case where whole key blocks sit past `max_causal`.
+    #[test]
+    #[ignore = "needs a real Metal GPU"]
+    fn gqa_prefill_fa_ext_mma_d256_matches_cpu_and_fa_vec() {
+        std::env::set_var("FERROX_METAL_FA_VEC", "1");
+        std::env::set_var("FERROX_METAL_FA_EXT", "1");
+        {
+            let shared = shared_metal().expect("metal device");
+            ensure_pipeline(
+                &shared.device,
+                GQA_PREFILL_FA_EXT_MMA_D256_KERNEL_SRC,
+                "gqa_prefill_fa_ext_mma_d256",
+            )
+            .expect("d256 fa_ext MMA pipeline compiles");
+        }
+        let cases = [
+            // Gemma-3-1B: 4 heads, 1 kv head, softcap.
+            (4usize, 1usize, 256usize, 40usize, 9usize, Some(50.0f32)),
+            (4usize, 1usize, 256usize, 64usize, 0usize, None),
+            (8usize, 4usize, 256usize, 65usize, 0usize, None),
+            (6usize, 2usize, 256usize, 130usize, 7usize, Some(30.0f32)),
+            (4usize, 1usize, 256usize, 8usize, 120usize, None),
+            (8usize, 2usize, 256usize, 9usize, 55usize, Some(20.0f32)),
+        ];
+        for (n_heads, n_kv_heads, head_dim, n_q, kv_prefix_len, softcap) in cases {
+            let total = kv_prefix_len + n_q;
+            let q: Vec<f32> = (0..n_q * n_heads * head_dim)
+                .map(|i| (i as f32 * 0.07).sin())
+                .collect();
+            let k: Vec<f32> = (0..total * n_kv_heads * head_dim)
+                .map(|i| (i as f32 * 0.03).cos())
+                .collect();
+            let v: Vec<f32> = (0..total * n_kv_heads * head_dim)
+                .map(|i| (i as f32 * 0.05).sin())
+                .collect();
+            let q_width = n_heads * head_dim;
+            let mut cpu = vec![0f32; n_q * q_width];
+            for qi in 0..n_q {
+                let causal_len = kv_prefix_len + qi + 1;
+                let kv_elems = causal_len * n_kv_heads * head_dim;
+                let row = cpu_gqa_ex(
+                    &q[qi * q_width..(qi + 1) * q_width],
+                    &k[..kv_elems],
+                    &v[..kv_elems],
+                    n_heads,
+                    n_kv_heads,
+                    head_dim,
+                    causal_len,
+                    0,
+                    softcap,
+                );
+                cpu[qi * q_width..(qi + 1) * q_width].copy_from_slice(&row);
+            }
+            let run = |mma: &str| {
+                std::env::set_var("FERROX_METAL_FA_MMA", mma);
+                launch_gqa_prefill_host_ex(
+                    &q,
+                    &k,
+                    &v,
+                    n_heads,
+                    n_kv_heads,
+                    head_dim,
+                    n_q,
+                    kv_prefix_len,
+                    softcap,
+                )
+                .expect("d256 prefill")
             };
             let fa_vec = run("0");
             let mma = run("1");

@@ -45,8 +45,8 @@ todos:
     content: "Two-layer stop sequences: a token-level matcher PLUS output-suffix buffering that withholds any tail which is a prefix of a stop string, so a partial match never reaches the wire. ferrox likely has only the text-level scan"
     status: pending
   - id: sched-queue-cap
-    content: "Queue depth cap -> 503 + Retry-After, so client retry storms cannot grow memory without bound"
-    status: pending
+    content: "LANDED. `QueueGate` in batch_scheduler.rs bounds jobs WAITING for admission (in-flight sequences remain `FERROX_CB_MAX_SEQS`'s business); default 512 via `FERROX_CB_MAX_QUEUE`. Over the cap, `generate` returns `DecodeError::QueueFull { queued, cap }` -> 503, with `retry_after_seconds` in the body and a `Retry-After` header stamped by `limits::retry_after`, a layer that marks any 503 lacking one (a 503 is by definition temporary, so this also fixes the pre-existing KV-pool and no-model-loaded 503s). Reservation is a CAS loop, not check-then-act; `queue_gate_never_exceeds_its_cap_under_concurrent_submitters` (32 threads x 64 rounds) was confirmed to FAIL with a load-then-fetch_add gate. `queue_depth` / `queue_rejected` on `/metrics`. DELIBERATELY NOT DONE: the Retry-After value is a fixed 1s, not queue depth divided by measured throughput -- the honest computation needs a drain-rate estimate this scheduler does not keep yet; the cap only guards the continuous-batching path, since the private `generate` path has no queue to cap; and the cap counts jobs, not tokens or bytes, so one huge prompt still counts as one."
+    status: completed
   - id: mem-preload-kv-budget
     content: "Compute the KV budget BEFORE load, not after: weights + n_ctx * per_token_kv + headroom <= device budget. oMLX admits models on weights-only cost and spends ~4300 lines compensating downstream"
     status: pending

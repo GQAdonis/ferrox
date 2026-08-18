@@ -21,6 +21,24 @@ pub enum DecodeError {
     TokenOutOfVocab { token: usize, vocab_size: usize },
     #[error("server is at capacity: the shared KV cache block pool has no free blocks for a new request; retry shortly")]
     KvPoolExhausted,
+    /// The batch scheduler's admission queue is full. Distinct from
+    /// `KvPoolExhausted`: nothing is exhausted, the server is simply
+    /// further behind than it is willing to queue. Naming the depth and
+    /// the cap keeps a retry storm diagnosable -- an operator can tell
+    /// "too many clients" from "one request too big".
+    #[error("server is at capacity: {queued} requests are already queued for the batch scheduler (limit {cap}); retry shortly")]
+    QueueFull { queued: usize, cap: usize },
+}
+
+impl DecodeError {
+    /// Seconds to advise a client to wait before retrying, or `None`
+    /// for an error retrying cannot fix.
+    pub fn retry_after_secs(&self) -> Option<u64> {
+        match self {
+            DecodeError::TokenOutOfVocab { .. } => None,
+            DecodeError::KvPoolExhausted | DecodeError::QueueFull { .. } => Some(1),
+        }
+    }
 }
 
 /// A shared `KvBlockPool` plus this server's admission-control wait

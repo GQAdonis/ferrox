@@ -1496,8 +1496,18 @@ async fn metrics(State(state): State<Arc<AppState>>) -> Response {
                  ferrox_prefill_tokens_total {}\n\
                  # HELP ferrox_decode_steps_total Batched decode steps the batch scheduler has run.\n\
                  # TYPE ferrox_decode_steps_total counter\n\
-                 ferrox_decode_steps_total {}\n",
-                sched.prefill_chunks, sched.prefill_tokens, sched.decode_steps,
+                 ferrox_decode_steps_total {}\n\
+                 # HELP ferrox_scheduler_queue_depth Requests waiting for admission to the batch scheduler.\n\
+                 # TYPE ferrox_scheduler_queue_depth gauge\n\
+                 ferrox_scheduler_queue_depth {}\n\
+                 # HELP ferrox_scheduler_queue_rejected_total Requests refused with 503 because the admission queue was full.\n\
+                 # TYPE ferrox_scheduler_queue_rejected_total counter\n\
+                 ferrox_scheduler_queue_rejected_total {}\n",
+                sched.prefill_chunks,
+                sched.prefill_tokens,
+                sched.decode_steps,
+                sched.queue_depth,
+                sched.queue_rejected,
             )
         }
         None => body,
@@ -1526,14 +1536,23 @@ pub(crate) fn decode_error_response(e: generate::DecodeError) -> ApiError {
     let status = match e {
         generate::DecodeError::TokenOutOfVocab { .. } => StatusCode::BAD_REQUEST,
         // Not the client's fault, and true of the exact same request a
-        // moment later once capacity frees up -- 503, not 400.
-        generate::DecodeError::KvPoolExhausted => StatusCode::SERVICE_UNAVAILABLE,
+        // moment later once capacity frees up -- 503, not 400. The
+        // `Retry-After` header these need is stamped centrally by
+        // `limits::retry_after`; see that function for why it lives in a
+        // layer rather than here.
+        generate::DecodeError::KvPoolExhausted | generate::DecodeError::QueueFull { .. } => {
+            StatusCode::SERVICE_UNAVAILABLE
+        }
     };
     tracing::warn!("decode error: {e}");
-    (
-        status,
-        Json(serde_json::json!({"error": {"message": e.to_string()}})),
-    )
+    let mut body = serde_json::json!({"error": {"message": e.to_string()}});
+    // The header carries the same hint (stamped by `limits::retry_after`);
+    // repeating it in the body is for clients that read JSON and never
+    // look at headers, which is most of them.
+    if let Some(secs) = e.retry_after_secs() {
+        body["error"]["retry_after_seconds"] = serde_json::json!(secs);
+    }
+    (status, Json(body))
 }
 
 pub(crate) fn join_error_response(e: tokio::task::JoinError) -> ApiError {
@@ -2996,7 +3015,13 @@ async fn run(
         protected = protected.route_layer(cors);
     }
 
-    let app = public.merge(protected).with_state(state);
+    // Outermost on purpose: every 503 this server can emit -- from a
+    // handler, from `require_active`, or from the batch scheduler's
+    // queue cap -- leaves with a `Retry-After` a client can act on.
+    let app = public
+        .merge(protected)
+        .layer(axum::middleware::from_fn(limits::retry_after))
+        .with_state(state);
 
     // TLS is off by default -- set FERROX_TLS_CERT and FERROX_TLS_KEY
     // together to serve HTTPS instead of plain HTTP; unset (either or
@@ -4214,6 +4239,35 @@ mod tests {
 
         let (status, _body) = decode_error_response(result.unwrap_err());
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    /// A full admission queue is the server being behind, not the
+    /// client being wrong: 503, with the wait hint in the body (and the
+    /// `Retry-After` header stamped by `limits::retry_after`) and the
+    /// depth and cap named so an operator can tell a retry storm from a
+    /// single oversized request.
+    #[test]
+    fn decode_error_response_maps_a_full_queue_to_a_retryable_503() {
+        let (status, Json(body)) = decode_error_response(generate::DecodeError::QueueFull {
+            queued: 512,
+            cap: 512,
+        });
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["error"]["retry_after_seconds"], 1);
+        let message = body["error"]["message"].as_str().expect("message");
+        assert!(message.contains("512"), "{message}");
+    }
+
+    #[test]
+    fn decode_error_response_omits_a_retry_hint_for_an_unretryable_error() {
+        let (_status, Json(body)) = decode_error_response(generate::DecodeError::TokenOutOfVocab {
+            token: 99,
+            vocab_size: 32,
+        });
+        assert!(
+            body["error"]["retry_after_seconds"].is_null(),
+            "retrying a prompt this model cannot tokenize never helps"
+        );
     }
 
     #[test]

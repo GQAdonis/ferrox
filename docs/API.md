@@ -275,9 +275,17 @@ Prefill is chunked: the scheduler runs one bounded prefill chunk
 waiting prompts) plus one batched decode step per tick, so a long prompt
 joining the batch costs an in-flight decode one chunk rather than the
 whole prompt. `FERROX_CB_MAX_SEQS` caps in-flight sequences, counting
-prompts still prefilling. `GET /metrics` reports
-`ferrox_prefill_chunks_total`, `ferrox_prefill_tokens_total` and
-`ferrox_decode_steps_total` while a batcher is active.
+prompts still prefilling. `FERROX_CB_MAX_QUEUE` (default 512) caps how many requests may wait for
+admission; past it a request is refused with `503` and a `Retry-After`
+header rather than queued without bound, and the JSON body names the
+queue depth, the cap and `retry_after_seconds`. `GET /metrics` reports
+`ferrox_prefill_chunks_total`, `ferrox_prefill_tokens_total`,
+`ferrox_decode_steps_total`, `ferrox_scheduler_queue_depth` and
+`ferrox_scheduler_queue_rejected_total` while a batcher is active.
+
+Every `503` this server returns carries `Retry-After` (1 second), a
+fixed hint rather than a computed one -- an honest estimate would need a
+caller's throughput, which the server does not know.
 
 ## MCP
 

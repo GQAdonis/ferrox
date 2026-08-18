@@ -47,10 +47,20 @@
 //! At the cap, new jobs stay queued in the channel until a slot frees;
 //! only a completely idle worker blocks on `recv`.
 //! `FERROX_CB_PREFILL_CHUNK`: prompt tokens per prefill chunk (default
-//! [`DEFAULT_PREFILL_CHUNK`]).
+//! [`DEFAULT_PREFILL_CHUNK`]). `FERROX_CB_MAX_QUEUE`: how many jobs may
+//! wait for admission before new ones are refused with
+//! [`DecodeError::QueueFull`] (default [`DEFAULT_MAX_QUEUE`]).
+//!
+//! **Queue cap.** The job channel is unbounded, so without a cap a
+//! client retry storm turns straight into unbounded memory: every
+//! retry parks another prompt (and its reply channel) in the queue,
+//! and the server's only signal that it is drowning is the RSS graph.
+//! [`QueueGate`] bounds the *waiting* jobs -- in-flight sequences are
+//! `FERROX_CB_MAX_SEQS`'s business -- and a refusal is a fast, cheap
+//! 503 with `Retry-After` rather than a slow, expensive timeout.
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
@@ -76,6 +86,12 @@ type JobResult = Result<(FinishReason, Vec<usize>, String, Usage), DecodeError>;
 /// tick, small enough that a long one cannot monopolize the worker.
 pub const DEFAULT_PREFILL_CHUNK: usize = 128;
 
+/// Jobs allowed to wait for admission when `FERROX_CB_MAX_QUEUE` is
+/// unset. Deep enough that a normal burst queues instead of failing,
+/// shallow enough that a retry storm is refused while the server can
+/// still refuse cheaply.
+pub const DEFAULT_MAX_QUEUE: usize = 512;
+
 /// Scheduler knobs, read from the environment by `from_env` and passed
 /// explicitly by tests (which must not race each other over process
 /// environment).
@@ -85,6 +101,8 @@ pub struct BatcherConfig {
     pub max_seqs: usize,
     /// Prompt tokens per `PrefillState::step_chunk` call.
     pub prefill_chunk: usize,
+    /// Jobs that may wait for admission before new ones are refused.
+    pub max_queue: usize,
 }
 
 impl Default for BatcherConfig {
@@ -92,6 +110,7 @@ impl Default for BatcherConfig {
         BatcherConfig {
             max_seqs: usize::MAX,
             prefill_chunk: DEFAULT_PREFILL_CHUNK,
+            max_queue: DEFAULT_MAX_QUEUE,
         }
     }
 }
@@ -101,7 +120,65 @@ impl BatcherConfig {
         BatcherConfig {
             max_seqs: env_positive("FERROX_CB_MAX_SEQS").unwrap_or(usize::MAX),
             prefill_chunk: env_positive("FERROX_CB_PREFILL_CHUNK").unwrap_or(DEFAULT_PREFILL_CHUNK),
+            max_queue: env_positive("FERROX_CB_MAX_QUEUE").unwrap_or(DEFAULT_MAX_QUEUE),
         }
+    }
+}
+
+/// Bounds the number of jobs waiting for admission.
+///
+/// The reservation is a compare-and-swap loop, not a load followed by a
+/// fetch_add: with N threads submitting at once, "read the depth, then
+/// increment it" admits every thread that read a value below the cap,
+/// which is precisely the retry storm the cap exists to stop.
+struct QueueGate {
+    depth: AtomicUsize,
+    cap: usize,
+    rejected: AtomicU64,
+}
+
+impl QueueGate {
+    fn new(cap: usize) -> Self {
+        QueueGate {
+            depth: AtomicUsize::new(0),
+            cap,
+            rejected: AtomicU64::new(0),
+        }
+    }
+
+    /// Claims one queue slot, or reports the depth that refused it.
+    fn try_reserve(&self) -> Result<(), usize> {
+        let mut current = self.depth.load(Ordering::Acquire);
+        loop {
+            if current >= self.cap {
+                self.rejected.fetch_add(1, Ordering::Relaxed);
+                return Err(current);
+            }
+            match self.depth.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Ok(()),
+                Err(actual) => current = actual,
+            }
+        }
+    }
+
+    /// Frees a slot: the worker has taken the job off the channel, or
+    /// the send failed and the job never joined the queue at all.
+    fn release(&self) {
+        let previous = self.depth.fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(previous > 0, "queue depth underflow");
+    }
+
+    fn depth(&self) -> usize {
+        self.depth.load(Ordering::Relaxed)
+    }
+
+    fn rejected(&self) -> u64 {
+        self.rejected.load(Ordering::Relaxed)
     }
 }
 
@@ -134,6 +211,10 @@ pub struct BatcherStats {
     /// Batched decode steps (one per tick that had an active row,
     /// regardless of how many rows that step covered).
     pub decode_steps: u64,
+    /// Jobs currently waiting for admission.
+    pub queue_depth: usize,
+    /// Jobs refused because the queue was full.
+    pub queue_rejected: u64,
 }
 
 /// One request's prefill as a resumable state machine.
@@ -335,6 +416,7 @@ struct Slot {
 pub struct ContinuousBatcher {
     tx: Sender<Job>,
     counters: Arc<Counters>,
+    queue: Arc<QueueGate>,
 }
 
 struct WorkerGuard {
@@ -359,26 +441,34 @@ impl ContinuousBatcher {
     ) -> Self {
         let (tx, rx) = mpsc::channel::<Job>();
         let counters = Arc::new(Counters::default());
+        let queue = Arc::new(QueueGate::new(config.max_queue));
         let worker_counters = Arc::clone(&counters);
+        let worker_queue = Arc::clone(&queue);
         let _join = thread::Builder::new()
             .name("ferrox-continuous-batch".into())
-            .spawn(move || worker_loop(decoder, decode, rx, config, worker_counters))
+            .spawn(move || worker_loop(decoder, decode, rx, config, worker_counters, worker_queue))
             .expect("spawn continuous-batch worker");
         // Detach join handle intentionally: dropping the last Sender
         // closes `rx` and ends the loop. Keep a process-lifetime leak
         // of the JoinHandle via Box::leak so dropping batcher clones
         // does not join (callers may still be mid-generate).
         let _guard: &'static WorkerGuard = Box::leak(Box::new(WorkerGuard { _join }));
-        ContinuousBatcher { tx, counters }
+        ContinuousBatcher {
+            tx,
+            counters,
+            queue,
+        }
     }
 
-    /// Live scheduler counters. Cheap (three relaxed atomic loads) and
-    /// safe to call from any thread while the worker runs.
+    /// Live scheduler counters. Cheap (a handful of relaxed atomic
+    /// loads) and safe to call from any thread while the worker runs.
     pub fn stats(&self) -> BatcherStats {
         BatcherStats {
             prefill_chunks: self.counters.prefill_chunks.load(Ordering::Relaxed),
             prefill_tokens: self.counters.prefill_tokens.load(Ordering::Relaxed),
             decode_steps: self.counters.decode_steps.load(Ordering::Relaxed),
+            queue_depth: self.queue.depth(),
+            queue_rejected: self.queue.rejected(),
         }
     }
 
@@ -391,15 +481,30 @@ impl ContinuousBatcher {
         params: GenerationParams,
         eos_id: Option<usize>,
     ) -> Result<(FinishReason, Vec<usize>, String, Usage), DecodeError> {
+        // Refuse before allocating a queue slot for the prompt, so a
+        // retry storm costs a rejection rather than memory.
+        self.queue
+            .try_reserve()
+            .map_err(|queued| DecodeError::QueueFull {
+                queued,
+                cap: self.queue.cap,
+            })?;
         let (reply_tx, reply_rx) = mpsc::channel();
-        self.tx
+        if self
+            .tx
             .send(Job {
                 prompt_tokens,
                 params,
                 eos_id,
                 reply: reply_tx,
             })
-            .map_err(|_| DecodeError::KvPoolExhausted)?;
+            .is_err()
+        {
+            // The worker is gone, so nothing will ever dequeue this
+            // reservation: release it here or the gate leaks a slot.
+            self.queue.release();
+            return Err(DecodeError::KvPoolExhausted);
+        }
         reply_rx.recv().unwrap_or(Err(DecodeError::KvPoolExhausted))
     }
 }
@@ -416,10 +521,12 @@ fn drain_pending_jobs(
     prefills: &mut VecDeque<Prefill>,
     decoding: usize,
     config: &BatcherConfig,
+    queue: &QueueGate,
 ) {
     while decoding + prefills.len() < config.max_seqs {
         match rx.try_recv() {
             Ok(job) => {
+                queue.release();
                 if let Some(prefill) = accept(decoder, job, config.prefill_chunk) {
                     prefills.push_back(prefill);
                 }
@@ -436,6 +543,7 @@ fn worker_loop(
     rx: Receiver<Job>,
     config: BatcherConfig,
     counters: Arc<Counters>,
+    queue: Arc<QueueGate>,
 ) {
     let mut rows = Rows::default();
     let mut prefills: VecDeque<Prefill> = VecDeque::new();
@@ -445,6 +553,9 @@ fn worker_loop(
         if rows.is_empty() && prefills.is_empty() {
             match rx.recv() {
                 Ok(job) => {
+                    // Off the queue and into the scheduler: free the
+                    // slot the submitter reserved.
+                    queue.release();
                     if let Some(prefill) = accept(&decoder, job, config.prefill_chunk) {
                         prefills.push_back(prefill);
                     }
@@ -452,7 +563,7 @@ fn worker_loop(
                 Err(_) => break,
             }
         }
-        drain_pending_jobs(&decoder, &rx, &mut prefills, rows.len(), &config);
+        drain_pending_jobs(&decoder, &rx, &mut prefills, rows.len(), &config, &queue);
 
         // One bounded prefill chunk per tick, round-robin across the
         // waiting prompts. Round-robin rather than "finish the head
@@ -733,8 +844,8 @@ mod tests {
             // Chunk 1: every prompt token is its own scheduling unit, the
             // most aggressive split, and the sampled ids must not move.
             BatcherConfig {
-                max_seqs: usize::MAX,
                 prefill_chunk: 1,
+                ..BatcherConfig::default()
             },
         );
         let barrier = Arc::new(Barrier::new(3));
@@ -812,8 +923,8 @@ mod tests {
             Arc::clone(&decoder),
             decode,
             BatcherConfig {
-                max_seqs: usize::MAX,
                 prefill_chunk: 2,
+                ..BatcherConfig::default()
             },
         );
         let (finish, _ids, text, _usage) = batcher
@@ -915,8 +1026,8 @@ mod tests {
             Arc::clone(&decoder),
             identity_decode(),
             BatcherConfig {
-                max_seqs: usize::MAX,
                 prefill_chunk: 1,
+                ..BatcherConfig::default()
             },
         );
 
@@ -997,6 +1108,7 @@ mod tests {
             BatcherConfig {
                 max_seqs: 1,
                 prefill_chunk: 1,
+                ..BatcherConfig::default()
             },
         );
         let expected: Vec<Vec<usize>> = [(vec![1usize, 2, 3], 6u64), (vec![4usize, 5], 6)]
@@ -1166,8 +1278,8 @@ mod tests {
             Arc::clone(&decoder),
             identity_decode(),
             BatcherConfig {
-                max_seqs: usize::MAX,
                 prefill_chunk: 1,
+                ..BatcherConfig::default()
             },
         );
         let barrier = Arc::new(Barrier::new(prompts.len()));
@@ -1194,5 +1306,117 @@ mod tests {
             got[1].len() < refs[1].len() && refs[1].starts_with(&got[1]),
             "the stopped row must be a strict prefix of its own stream"
         );
+    }
+    #[test]
+    fn queue_gate_admits_up_to_its_cap_and_frees_slots_on_release() {
+        let gate = QueueGate::new(2);
+        assert!(gate.try_reserve().is_ok());
+        assert!(gate.try_reserve().is_ok());
+        assert_eq!(gate.depth(), 2);
+        assert_eq!(gate.try_reserve(), Err(2), "the refusal reports the depth");
+        assert_eq!(gate.rejected(), 1);
+        gate.release();
+        assert_eq!(gate.depth(), 1);
+        assert!(
+            gate.try_reserve().is_ok(),
+            "a released slot must be reusable"
+        );
+        assert_eq!(gate.depth(), 2);
+    }
+
+    /// The cap is only a cap if it holds under the exact condition it
+    /// exists for: many clients submitting at once. A check-then-act
+    /// gate ("read the depth, then increment") lets every thread that
+    /// read a value below the cap through, which is how a retry storm
+    /// gets past a limit that looks correct when read in isolation.
+    ///
+    /// Repeated rounds because a lost race is probabilistic: one round
+    /// can get lucky, sixty-four rounds of thirty-two racing threads do
+    /// not.
+    #[test]
+    fn queue_gate_never_exceeds_its_cap_under_concurrent_submitters() {
+        const THREADS: usize = 32;
+        const CAP: usize = 4;
+        for round in 0..64 {
+            let gate = Arc::new(QueueGate::new(CAP));
+            let barrier = Arc::new(Barrier::new(THREADS));
+            let admitted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let handles: Vec<_> = (0..THREADS)
+                .map(|_| {
+                    let gate = Arc::clone(&gate);
+                    let barrier = Arc::clone(&barrier);
+                    let admitted = Arc::clone(&admitted);
+                    thread::spawn(move || {
+                        barrier.wait();
+                        if gate.try_reserve().is_ok() {
+                            admitted.fetch_add(1, Ordering::Relaxed);
+                        }
+                    })
+                })
+                .collect();
+            for h in handles {
+                h.join().unwrap();
+            }
+            assert_eq!(
+                admitted.load(Ordering::Relaxed),
+                CAP,
+                "round {round}: exactly the cap may be admitted"
+            );
+            assert_eq!(gate.depth(), CAP, "round {round}: depth matches admissions");
+            assert_eq!(gate.rejected(), (THREADS - CAP) as u64);
+        }
+    }
+
+    /// End to end: a full queue is refused with a typed error naming
+    /// the depth and the cap, and the refusal costs nothing -- no
+    /// prompt is queued, no reply channel is parked.
+    #[test]
+    fn a_full_queue_refuses_new_jobs_with_queue_full() {
+        let decoder = tiny_decoder();
+        // cap 0 is degenerate on purpose: it makes "the queue is full"
+        // deterministic in a test, where a real cap would be drained by
+        // the worker before a second submission could ever see it.
+        let batcher = ContinuousBatcher::spawn_with_config(
+            Arc::clone(&decoder),
+            identity_decode(),
+            BatcherConfig {
+                max_queue: 0,
+                ..BatcherConfig::default()
+            },
+        );
+        let err = batcher
+            .generate(vec![1, 2, 3], greedy_params(4, 1), None)
+            .expect_err("a full queue must refuse");
+        assert!(
+            matches!(err, DecodeError::QueueFull { queued: 0, cap: 0 }),
+            "expected QueueFull, got {err:?}"
+        );
+        assert_eq!(err.retry_after_secs(), Some(1), "a queue drains; say so");
+        let stats = batcher.stats();
+        assert_eq!(stats.queue_rejected, 1);
+        assert_eq!(stats.queue_depth, 0, "a refused job holds nothing");
+    }
+
+    /// The gate must not leak slots: a job that is accepted, queued,
+    /// dequeued and served leaves the queue empty again.
+    #[test]
+    fn queue_depth_returns_to_zero_after_a_served_request() {
+        let decoder = tiny_decoder();
+        let batcher = ContinuousBatcher::spawn_with_config(
+            Arc::clone(&decoder),
+            identity_decode(),
+            BatcherConfig {
+                max_queue: 1,
+                prefill_chunk: 1,
+                ..BatcherConfig::default()
+            },
+        );
+        for _ in 0..3 {
+            batcher
+                .generate(vec![1, 2, 3], greedy_params(2, 1), None)
+                .expect("a cap of 1 still serves requests one after another");
+        }
+        assert_eq!(batcher.stats().queue_depth, 0);
+        assert_eq!(batcher.stats().queue_rejected, 0);
     }
 }

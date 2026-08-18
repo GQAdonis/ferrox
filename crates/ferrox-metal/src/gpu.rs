@@ -188,6 +188,23 @@ pub fn probe() -> Option<String> {
     Some(device.name().to_string())
 }
 
+/// Apple's own answer to "how many bytes should this process keep
+/// resident on the GPU": `MTLDevice.recommendedMaxWorkingSetSize`.
+///
+/// This is the real device query, not a guess derived from installed
+/// RAM -- on unified-memory Apple Silicon it is the share of physical
+/// memory the driver is willing to let one process hold in GPU-resident
+/// allocations, and Metal starts paging (or failing allocations) past
+/// it. `None` when there is no Metal device.
+///
+/// It is a *recommendation* and a snapshot: nothing reserves it, and
+/// other processes draw from the same pool. Treat it as a ceiling to
+/// plan against, never as a guarantee.
+pub fn probe_recommended_working_set_bytes() -> Option<u64> {
+    let device = MTLCreateSystemDefaultDevice()?;
+    Some(device.recommendedMaxWorkingSetSize())
+}
+
 /// ggml-metal `kernel_mul_mv_q8_0_f32` port: `N_R0=2` rows per
 /// threadgroup, `NSG=4` simdgroups (128 threads) cooperating on the
 /// same two rows, each thread owning `NQ=8` contiguous int8 quants of a

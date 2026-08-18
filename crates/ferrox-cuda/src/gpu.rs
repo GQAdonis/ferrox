@@ -69,6 +69,12 @@ pub struct CudaInfo {
     pub device_count: usize,
     pub first_device_name: Option<String>,
     pub total_vram_bytes: u64,
+    /// Currently *free* device memory, the second half of
+    /// `cuMemGetInfo`. This is what an admission check should divide
+    /// up, not `total_vram_bytes`: another process (or another
+    /// framework in this one) may already hold most of the card. It is
+    /// a snapshot -- true when probed, not a reservation.
+    pub free_vram_bytes: u64,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -110,11 +116,12 @@ pub fn probe() -> Option<CudaInfo> {
     let result = std::panic::catch_unwind(|| {
         let dev = cudarc::driver::CudaDevice::new(0).ok()?;
         let name = dev.name().ok();
-        let (_free, total) = cudarc::driver::result::mem_get_info().ok()?;
+        let (free, total) = cudarc::driver::result::mem_get_info().ok()?;
         Some(CudaInfo {
             device_count: 1,
             first_device_name: name,
             total_vram_bytes: total as u64,
+            free_vram_bytes: free as u64,
         })
     });
     std::panic::set_hook(previous_hook);
@@ -1278,6 +1285,12 @@ mod tests {
                 assert!(
                     info.total_vram_bytes > 0,
                     "reported a device but total_vram_bytes=0"
+                );
+                assert!(
+                    info.free_vram_bytes <= info.total_vram_bytes,
+                    "free VRAM ({}) cannot exceed total ({})",
+                    info.free_vram_bytes,
+                    info.total_vram_bytes
                 );
             }
         }

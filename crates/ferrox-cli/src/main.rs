@@ -41,14 +41,16 @@ enum Commands {
     Inspect { path: String },
     /// Dry-run residency plan for a GGUF checkpoint: what it would
     /// cost to run (dense weights, routed experts resident vs.
-    /// streamed, KV caches) against this host's RAM -- computed from
-    /// the header alone, nothing loaded. --strict exits non-zero when
-    /// the plan overcommits.
+    /// streamed, KV caches) against the selected backend's memory
+    /// budget -- computed from the header alone, nothing loaded. Always
+    /// reports the largest context that fits and the arithmetic behind
+    /// it. --strict exits non-zero when the plan overcommits.
     InspectPlan {
         path: String,
         /// Context length each request's KV cache is sized for.
-        #[arg(long, default_value_t = 4096)]
-        context: usize,
+        /// Omit to price the model's own `{arch}.context_length`.
+        #[arg(long)]
+        context: Option<usize>,
         /// Concurrent requests to budget KV caches for.
         #[arg(long, default_value_t = 1)]
         concurrency: usize,
@@ -56,7 +58,15 @@ enum Commands {
         /// bytes instead of counting them fully resident.
         #[arg(long)]
         expert_cache_bytes: Option<u64>,
-        /// Refuse (exit 1) when the plan exceeds usable host RAM.
+        /// Which backend's memory budget to plan against.
+        #[arg(long, default_value = "cpu")]
+        backend: ferrox_models::BudgetBackend,
+        /// KV cache dtype the plan should price (`--ctk` analogue).
+        /// Only the Metal path has a device KV whose dtype this
+        /// selects; on CPU the host cache is always f32.
+        #[arg(long, default_value = "f32")]
+        ctk: String,
+        /// Refuse (exit 1) when the plan exceeds the usable budget.
         #[arg(long)]
         strict: bool,
     },
@@ -357,20 +367,38 @@ fn main() -> anyhow::Result<()> {
             context,
             concurrency,
             expert_cache_bytes,
+            backend,
+            ctk,
             strict,
         } => {
-            let hw = ferrox_cuda::HardwareProfile::detect();
+            let budget = ferrox_models::DeviceBudget::detect(backend);
+            let ctx_cap = ferrox_gguf::ShardedGguf::open(&path)
+                .ok()
+                .and_then(|f| {
+                    let arch = f.metadata_str("general.architecture")?.to_string();
+                    f.metadata_u64(&format!("{arch}.context_length"))
+                })
+                .unwrap_or(4096) as usize;
+            let assumptions = ferrox_models::residency_report::ResidencyAssumptions {
+                // `auto` still needs *a* context to price the plan's KV
+                // line; the model's own is the honest placeholder, and
+                // the chosen number is reported separately below.
+                context_tokens: context.unwrap_or(ctx_cap),
+                concurrent_requests: concurrency,
+                expert_cache_bytes,
+                kv_elem: ferrox_models::KvElem::from_ctk(&ctk),
+                ..Default::default()
+            };
             let report = ferrox_models::residency_report::ResidencyReport::from_gguf(
                 &path,
-                ferrox_models::residency_report::ResidencyAssumptions {
-                    context_tokens: context,
-                    concurrent_requests: concurrency,
-                    expert_cache_bytes,
-                    headroom_fraction: 0.2,
-                },
-                hw.host_ram_total_bytes,
+                assumptions,
+                budget.usable_bytes,
             )?;
+            println!("{budget}");
             println!("{report}");
+            let fit = report.auto_context(ctx_cap);
+            println!("  {fit}");
+            println!("  {}", budget.caveat());
             if strict {
                 if let Err(e) = report.check_strict() {
                     eprintln!("{e}");

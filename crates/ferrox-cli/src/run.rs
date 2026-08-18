@@ -40,9 +40,19 @@ pub struct InferArgs {
     #[arg(short = 'n', long = "n-predict", default_value_t = 128)]
     pub n_predict: i64,
 
-    /// Context size (0 = use GGUF `{arch}.context_length`, else 4096).
-    #[arg(short = 'c', long = "ctx-size", default_value_t = 0)]
-    pub ctx_size: usize,
+    /// Context size: `auto` = largest that fits the device memory
+    /// budget, `0` = the GGUF's own `{arch}.context_length` (else
+    /// 4096), or an explicit token count.
+    #[arg(short = 'c', long = "ctx-size", default_value_t = ContextSize::FromModel)]
+    pub ctx_size: ContextSize,
+
+    /// Refuse to load (exit 1) when the pre-load budget says the
+    /// requested context will not fit, instead of warning and trying
+    /// anyway. Off by default because ferrox mmaps its weights: an
+    /// over-budget model really can run, page-faulting, so the check
+    /// is advisory unless you say otherwise.
+    #[arg(long = "strict-budget", default_value_t = false)]
+    pub strict_budget: bool,
 
     /// CPU threads (0 = leave rayon / env defaults). Sets `RAYON_NUM_THREADS`.
     #[arg(short = 't', long = "threads", default_value_t = 0)]
@@ -169,6 +179,195 @@ impl fmt::Display for GpuLayers {
             Self::Count(value) => value.fmt(f),
         }
     }
+}
+
+/// What `-c` / `--ctx-size` was asked for, before any model is opened.
+/// Same shape as [`GpuLayers`]: a symbolic value alongside the literal
+/// one, resolved once the header and the device budget are known.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContextSize {
+    /// Largest context that fits the device memory budget.
+    Auto,
+    /// llama.cpp's `-c 0`: whatever the GGUF says it was trained for.
+    FromModel,
+    Tokens(usize),
+}
+
+impl FromStr for ContextSize {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim() {
+            "auto" => Ok(Self::Auto),
+            "0" => Ok(Self::FromModel),
+            other => other
+                .parse::<usize>()
+                .map(Self::Tokens)
+                .map_err(|_| "expected 'auto', 0, or a positive token count".into()),
+        }
+    }
+}
+
+impl fmt::Display for ContextSize {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Auto => f.write_str("auto"),
+            Self::FromModel => f.write_str("0"),
+            Self::Tokens(n) => n.fmt(f),
+        }
+    }
+}
+
+/// Which memory pool the resolved backend draws from, so the budget is
+/// probed against the device that will actually hold the KV cache.
+/// `Auto` is reported as CPU: without a `--device`/`--ngl` choice the
+/// generic decoder keeps its host `KvCache`, and claiming a GPU budget
+/// we may never use would be the wrong kind of optimism.
+fn budget_backend_for(args: &InferArgs) -> ferrox_models::BudgetBackend {
+    use ferrox_models::BudgetBackend;
+    let offload = args.n_gpu_layers.offload_enabled();
+    match args.device {
+        Some(OffloadDevice::Metal) => BudgetBackend::Metal,
+        Some(OffloadDevice::Cuda) => BudgetBackend::Cuda,
+        None | Some(OffloadDevice::Auto) if offload && cfg!(feature = "metal") => {
+            BudgetBackend::Metal
+        }
+        None | Some(OffloadDevice::Auto) if offload && cfg!(feature = "cuda") => {
+            BudgetBackend::Cuda
+        }
+        _ => BudgetBackend::Cpu,
+    }
+}
+
+/// Width of the KV store the selected backend will really keep. The
+/// host `ferrox_core::cache::KvCache` is `Vec<f32>`; only the Metal
+/// path has a device KV whose dtype `--ctk` selects.
+fn kv_elem_for(args: &InferArgs) -> ferrox_models::KvElem {
+    use ferrox_models::{BudgetBackend, KvElem};
+    match budget_backend_for(args) {
+        BudgetBackend::Metal => KvElem::from_ctk(&args.ctk),
+        // CUDA has no device KV store of its own yet, and CPU is the
+        // f32 host cache.
+        BudgetBackend::Cuda | BudgetBackend::Cpu => KvElem::F32,
+    }
+}
+
+/// Resolves `-c/--ctx-size` against the pre-load budget, printing the
+/// arithmetic behind the answer.
+///
+/// This is the whole point of Phase 2: the terms are exact in the GGUF
+/// header, so the check happens *before* the weights load rather than
+/// being discovered as an allocation failure later. `auto` picks the
+/// largest fitting context; an explicit context that does not fit is
+/// reported as a typed rejection naming the estimate, the limit and
+/// which ceiling binds -- fatal under `--strict-budget`, a warning
+/// otherwise (see that flag's doc comment for why the default is
+/// advisory).
+fn resolve_ctx_size(args: &InferArgs, path: &Path, gguf_ctx: usize) -> anyhow::Result<usize> {
+    use ferrox_models::residency_report::{ResidencyAssumptions, ResidencyReport};
+    use ferrox_models::DeviceBudget;
+
+    let backend = budget_backend_for(args);
+    let budget = DeviceBudget::detect(backend);
+    let assumptions = ResidencyAssumptions {
+        context_tokens: gguf_ctx,
+        concurrent_requests: 1,
+        expert_cache_bytes: expert_cache_bytes_from_env(),
+        kv_elem: kv_elem_for(args),
+        prefill_chunk: prefill_chunk_from_env(),
+        ..ResidencyAssumptions::default()
+    };
+
+    // No probe, no ceiling: fall back to the requested context rather
+    // than refusing on the strength of a number we do not have.
+    if budget.is_unknown() {
+        let requested = match args.ctx_size {
+            ContextSize::Tokens(n) => n,
+            ContextSize::Auto | ContextSize::FromModel => gguf_ctx,
+        };
+        eprintln!("ferrox: {budget}; using ctx={requested} unchecked");
+        return Ok(requested);
+    }
+
+    let report = match ResidencyReport::from_gguf(path, assumptions, budget.usable_bytes) {
+        Ok(r) => r,
+        // A header this planner cannot read is not a reason to refuse
+        // a run the loader may well handle (MLA/Gemma4/GLM stacks have
+        // their own hparams and do not go through `ModelConfig`).
+        Err(e) => {
+            let requested = match args.ctx_size {
+                ContextSize::Tokens(n) => n,
+                ContextSize::Auto | ContextSize::FromModel => gguf_ctx,
+            };
+            eprintln!("ferrox: KV budget not computed for this checkpoint ({e}); ctx={requested}");
+            return Ok(requested);
+        }
+    };
+    let priced = report.kv_budget();
+
+    let tokens = match args.ctx_size {
+        ContextSize::Auto => {
+            let fit = report.auto_context(gguf_ctx);
+            eprintln!("ferrox: {budget}");
+            eprintln!("ferrox: {fit}");
+            eprintln!("ferrox: {}", budget.caveat());
+            if fit.tokens == 0 {
+                anyhow::bail!(
+                    "{}: no context fits -- {} of weights leave nothing for KV inside the \
+                     {} budget. Quantize further, stream experts \
+                     (FERROX_EXPERT_CACHE_BYTES), or raise FERROX_DEVICE_BUDGET_BYTES.",
+                    ferrox_models::Ceiling::DeviceMemory.code(),
+                    report.weights_bytes,
+                    budget.usable_bytes,
+                );
+            }
+            fit.tokens
+        }
+        ContextSize::FromModel => gguf_ctx,
+        ContextSize::Tokens(n) => n,
+    };
+
+    if let Err(e) = priced.check(tokens) {
+        let fit = report.auto_context(gguf_ctx);
+        let message = format!(
+            "{}: {} bytes estimated at ctx={tokens} against a {} byte {} budget ({}); \
+             {} bytes over. `--ctx-size auto` would pick {}. {}",
+            e.code(),
+            e.estimated_bytes,
+            e.limit_bytes,
+            backend,
+            budget.source,
+            e.overage_bytes(),
+            fit.tokens,
+            budget.caveat(),
+        );
+        if args.strict_budget {
+            anyhow::bail!("{message}");
+        }
+        eprintln!("ferrox: WARNING {message}");
+        eprintln!("ferrox: continuing anyway (pass --strict-budget to refuse instead)");
+    }
+    Ok(tokens)
+}
+
+/// `FERROX_EXPERT_CACHE_BYTES`, so the plan charges streamed routed
+/// experts at their cache budget rather than fully resident.
+fn expert_cache_bytes_from_env() -> Option<u64> {
+    std::env::var("FERROX_EXPERT_CACHE_BYTES")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|v| *v > 0)
+}
+
+/// `FERROX_CHUNKED_PREFILL`; `1` (token-at-a-time) when unset. Only
+/// affects sliding-window layers, whose resident positions are
+/// `window + chunk - 1`.
+fn prefill_chunk_from_env() -> usize {
+    std::env::var("FERROX_CHUNKED_PREFILL")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(1)
 }
 
 enum CliTokenizer {
@@ -573,11 +772,7 @@ pub fn run_infer(args: InferArgs) -> anyhow::Result<()> {
         .metadata_u64(&format!("{arch}.context_length"))
         .map(|v| v as usize)
         .unwrap_or(4096);
-    let ctx_size = if args.ctx_size > 0 {
-        args.ctx_size
-    } else {
-        gguf_ctx
-    };
+    let ctx_size = resolve_ctx_size(&args, path, gguf_ctx)?;
 
     let chat = ChatKind::detect_for_gguf(
         file.metadata_str("tokenizer.chat_template"),
@@ -752,11 +947,7 @@ fn run_mla_infer(args: InferArgs, path: &Path, file: &ShardedGguf) -> anyhow::Re
         .metadata_u64(&format!("{arch}.context_length"))
         .map(|v| v as usize)
         .unwrap_or(4096);
-    let ctx_size = if args.ctx_size > 0 {
-        args.ctx_size
-    } else {
-        gguf_ctx
-    };
+    let ctx_size = resolve_ctx_size(&args, path, gguf_ctx)?;
 
     let chat = ChatKind::detect_for_gguf(
         file.metadata_str("tokenizer.chat_template"),
@@ -901,11 +1092,7 @@ fn run_gemma4_infer(args: InferArgs, path: &Path, file: &ShardedGguf) -> anyhow:
         .metadata_u64(&format!("{arch}.context_length"))
         .map(|v| v as usize)
         .unwrap_or(4096);
-    let ctx_size = if args.ctx_size > 0 {
-        args.ctx_size
-    } else {
-        gguf_ctx
-    };
+    let ctx_size = resolve_ctx_size(&args, path, gguf_ctx)?;
 
     let chat = ChatKind::detect_for_gguf(
         file.metadata_str("tokenizer.chat_template"),
@@ -1051,11 +1238,7 @@ fn run_glm52_infer(args: InferArgs, path: &Path, file: &ShardedGguf) -> anyhow::
         .metadata_u64(&format!("{arch}.context_length"))
         .map(|v| v as usize)
         .unwrap_or(4096);
-    let ctx_size = if args.ctx_size > 0 {
-        args.ctx_size
-    } else {
-        gguf_ctx
-    };
+    let ctx_size = resolve_ctx_size(&args, path, gguf_ctx)?;
 
     let chat = ChatKind::detect_for_gguf(
         file.metadata_str("tokenizer.chat_template"),

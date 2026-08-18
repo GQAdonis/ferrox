@@ -4,6 +4,7 @@
 mod bench_model;
 mod bench_suite;
 mod chat;
+mod host_state;
 mod pull;
 mod run;
 mod verify;
@@ -202,6 +203,11 @@ enum Commands {
         /// Write a JSON receipt to this path.
         #[arg(long)]
         receipt: Option<String>,
+        /// Refuse to start a timed run when the host's 1-minute load
+        /// average is at or above this. `0` disables the check and
+        /// marks the receipt as not quiet-host.
+        #[arg(long, default_value_t = host_state::DEFAULT_MAX_LOAD)]
+        max_load: f64,
     },
     /// Demonstrate prompt-lookup speculative decoding on a repetitive
     /// prompt, reporting forward_batch call count vs. tokens produced.
@@ -599,6 +605,7 @@ fn main() -> anyhow::Result<()> {
             suite_id,
             backend_label,
             receipt,
+            max_load,
         } => {
             if render {
                 return bench_suite::render(std::path::Path::new(&bench_dir));
@@ -613,6 +620,7 @@ fn main() -> anyhow::Result<()> {
                     only_backend: backend,
                     fit_host,
                     skip_missing,
+                    max_load,
                 });
             }
             if let Some(model) = model {
@@ -627,6 +635,7 @@ fn main() -> anyhow::Result<()> {
                     backend: backend_label,
                     receipt: receipt.map(Into::into),
                     id: suite_id,
+                    max_load,
                 });
             }
             use ferrox_core::weight_matrix::{QuantKind, WeightBytes, WeightMatrix};

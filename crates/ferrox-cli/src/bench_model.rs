@@ -15,6 +15,7 @@
 //! and dedicated [`Gemma4Engine`] (sequential `forward_token` for both
 //! `pp*` and `tg*` until a batched Gemma-4 prefill lands).
 
+use crate::host_state;
 use anyhow::Context;
 use ferrox_core::cache::KvCache;
 use ferrox_models::engine::Engine;
@@ -101,9 +102,15 @@ pub struct BenchArgs {
     pub receipt: Option<std::path::PathBuf>,
     /// Suite id this run belongs to, for the receipt.
     pub id: Option<String>,
+    /// 1-minute load average above which the run refuses to start.
+    /// `0.0` disables the check. See `host_state`.
+    pub max_load: f64,
 }
 
 pub fn run(args: BenchArgs) -> anyhow::Result<()> {
+    // Before anything is loaded: a timed run on a busy host produces a
+    // number that looks like a measurement and is not one.
+    let load_start = crate::host_state::ensure_quiet_enough(args.max_load)?;
     let model = crate::pull::resolve_model_path(&args.model)?;
     let path = Path::new(&model);
     if !path.exists() {
@@ -180,9 +187,21 @@ pub fn run(args: BenchArgs) -> anyhow::Result<()> {
             row.stddev(),
         );
     }
+    let load_end = crate::host_state::load_average_1min();
+    let thermal = crate::host_state::thermal_speed_limit_percent();
     eprintln!(
         "\nferrox bench: load {load_s:.2}s, {} reps + 1 discarded warmup each",
         args.reps
+    );
+    eprintln!(
+        "ferrox bench: host 1-min load {} -> {}{}",
+        fmt_load(load_start),
+        fmt_load(load_end),
+        match thermal {
+            Some(p) if p < 100 => format!(", THROTTLED to {p}% CPU speed"),
+            Some(p) => format!(", thermal {p}%"),
+            None => String::new(),
+        }
     );
 
     let ngl = if backend == "CPU" { 0 } else { 99 };
@@ -238,6 +257,11 @@ pub fn run(args: BenchArgs) -> anyhow::Result<()> {
             &rows,
             llama.as_ref(),
             load_s,
+            HostState {
+                load_start,
+                load_end,
+                thermal,
+            },
         )?;
         eprintln!("ferrox bench: receipt written to {}", dest.display());
     }
@@ -287,6 +311,15 @@ fn bench_prefill(decoder: &Decoder, n_prompt: usize, reps: usize) -> anyhow::Res
     let mut out = Vec::with_capacity(reps);
     for rep in 0..reps + 1 {
         let mut caches = fresh_caches(decoder);
+        // Every rep starts from an empty KV: a prefill that reused a
+        // warm cache would report the engine's speed at work it did
+        // not do. Asserted rather than assumed, so a later change to
+        // `fresh_caches` cannot silently turn this into a cache-hit
+        // benchmark.
+        anyhow::ensure!(
+            caches.iter().all(|c| c.seq_len == 0),
+            "prefill rep {rep} started with a non-empty KV cache"
+        );
         let t = Instant::now();
         // `forward_batch_last`, not `forward_batch`: llama-bench's
         // `pp512` asks for logits at the final position only, so
@@ -298,6 +331,17 @@ fn bench_prefill(decoder: &Decoder, n_prompt: usize, reps: usize) -> anyhow::Res
             !logits.is_empty(),
             "forward_batch_last returned no logits for a {n_prompt}-token prompt"
         );
+        // The prompt length is asserted AFTER the run too, not only
+        // before: an engine that silently truncated the batch would
+        // otherwise divide the full token count by a partial run's
+        // time and report a speedup for doing less work.
+        if let Some(c) = caches.iter().find(|c| c.seq_len != n_prompt) {
+            anyhow::bail!(
+                "prefill consumed {} of {n_prompt} prompt tokens -- \
+                 the reported rate would be for work the engine skipped",
+                c.seq_len
+            );
+        }
         // Rep 0 is the warmup: first touch of every weight page, and on
         // Metal the first pipeline compile. Timing it would measure the
         // OS and the shader cache, not the engine.
@@ -344,6 +388,10 @@ fn bench_decode(decoder: &Decoder, n_gen: usize, reps: usize) -> anyhow::Result<
     let mut out = Vec::with_capacity(reps);
     for rep in 0..reps + 1 {
         let mut caches = fresh_caches(decoder);
+        anyhow::ensure!(
+            caches.iter().all(|c| c.seq_len == 0),
+            "decode rep {rep} started with a non-empty KV cache"
+        );
         let _ = decoder.forward_token(0, 0, &mut caches);
         let t = Instant::now();
         for i in 0..n_gen {
@@ -351,6 +399,15 @@ fn bench_decode(decoder: &Decoder, n_gen: usize, reps: usize) -> anyhow::Result<
             let _ = decoder.forward_token(tok, i + 1, &mut caches);
         }
         let dt = t.elapsed().as_secs_f64();
+        // One priming token plus n_gen decode steps. A short cache
+        // means steps were skipped, which would inflate the rate.
+        if let Some(c) = caches.iter().find(|c| c.seq_len != n_gen + 1) {
+            anyhow::bail!(
+                "decode advanced the KV cache to {} positions, expected {}",
+                c.seq_len,
+                n_gen + 1
+            );
+        }
         if rep > 0 {
             out.push(n_gen as f64 / dt);
         }
@@ -539,6 +596,20 @@ fn parse_llama_bench_table(text: &str) -> std::collections::BTreeMap<String, f64
     out
 }
 
+/// What the host was doing around this run, for the receipt.
+#[derive(Clone, Copy)]
+pub struct HostState {
+    pub load_start: Option<f64>,
+    pub load_end: Option<f64>,
+    pub thermal: Option<u32>,
+}
+
+/// A load average we could not read prints as `?`, never as `0.00`.
+fn fmt_load(l: Option<f64>) -> String {
+    l.map(|l| format!("{l:.2}"))
+        .unwrap_or_else(|| "?".to_string())
+}
+
 #[allow(clippy::too_many_arguments)] // one call site; every field is reported
 fn write_receipt(
     dest: &Path,
@@ -553,6 +624,7 @@ fn write_receipt(
     rows: &[Row],
     llama: Option<&std::collections::BTreeMap<String, f64>>,
     load_s: f64,
+    host: HostState,
 ) -> anyhow::Result<()> {
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent)?;
@@ -583,6 +655,13 @@ fn write_receipt(
         "threads": threads,
         "reps": args.reps,
         "load_s": load_s,
+        // Null, not zero, when the platform would not say -- see host_state.
+        "host_load_1min_start": host.load_start,
+        "host_load_1min_end": host.load_end,
+        "host_thermal_speed_limit_percent": host.thermal,
+        // The single field an auditor reads first: was this row taken
+        // under the measurement contract's quiet-host bar at all?
+        "quiet_host": host.load_start.map(|l| l < host_state::DEFAULT_MAX_LOAD),
         "ferrox_version": env!("CARGO_PKG_VERSION"),
         "tests": tests,
     });

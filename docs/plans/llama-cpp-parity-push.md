@@ -12,7 +12,7 @@ todos:
     content: "Port ggml_gemm_q5_K_8x8_q8_K + ggml_gemm_q6_K_8x8_q8_K; flip q5_kx8_interleave/q6_kx8_interleave to 8 under i8mm. Upstream DOES have these — the in-tree 'until it lands' comments are wrong"
     status: pending
   - id: cpu-i8mm-q8_0-q4_0
-    content: "Un-pin Q8_0X4_INTERLEAVE/Q4_0X4_INTERLEAVE from 4; port ggml_gemm_q8_0_4x8_q8_0 + ggml_gemm_q4_0_4x8_q8_0 (SMMLA) + ggml_quantize_mat_q8_0_4x8"
+    content: "Un-pin Q8_0X4_INTERLEAVE/Q4_0X4_INTERLEAVE from 4; port ggml_gemm_q8_0_4x8_q8_0 + ggml_gemm_q4_0_4x8_q8_0 (SMMLA) + ggml_quantize_mat_q8_0_4x8. STALE FOR Q8_0 (2026-08-18, wf/cpu-prefill-gemma3): a `sample` of Gemma-3-1B Q8_0 cpu pp512 shows ferrox_quant::repack::neon::gemm_q8_0x4_q8_0_neon_i8mm as the top non-idle symbol (57.0%), i.e. the SMMLA Q8_0 GEMM already exists and is on the hot path. Whatever is left of the Q8_0 rows is NOT the arithmetic tier. Re-scope to Q4_0 only, or close"
     status: pending
   - id: cpu-actquant-flat
     content: "De-nest activation quantization (serial internals, parallelize once at apply_batch over row-quads into one wdata buffer); share one quant pass across q/k/v and gate/up"
@@ -21,10 +21,10 @@ todos:
     content: "CPU tg128 is the widest axis left (8 red rows, SmolLM2 2.44x, and the only axis with nothing at parity). Cause is measured: fork-join scaling, not per-thread throughput. IMPLEMENTED ON wf/cpu-pool-retry (e2bf801, NOT merged): pool retried with try_lock, poison-as-ownership, and one-runtime-per-thread; the hang ships as a regression test. NOT MERGED ON PURPOSE — the perf thesis is still unmeasured, which is half of why the first attempt was rejected. Every A/B window this session was eaten by concurrent builds (host load 3-30 against a 2.0 bar); the one partial reading taken under load showed dense +7% and OLMoE -21%, and the -21% is what motivated the one-runtime-per-thread rule, so it must be re-taken after that rule, not before. Merge only behind a quiet-host A/B on TinyLlama + OLMoE + Qwen2.5. DEADLOCK UNDERSTOOD (2026-08-14, reproduced + sampled on the branch): pool worker blocked in a rayon latch (a pool task called rayon) -> rayon workers blocked on the pool submit mutex -> submitter holding it, spinning for done. Coexistence of two runtimes with a blocking lock between them, NOT the memory ordering the module argued about, and NOT specific to FERROX_CPU_THREADS=1. Retry rules in the body: try_lock never block, leaf-only tasks, flatten apply_three / run_expert / the MoE par_iter into one region, ship the hang as a test"
     status: pending
   - id: cpu-prefill-attn-block
-    content: "Block prefill attention: QK^T tile GEMM + vectorized softmax + V GEMM, replacing the per-KV-position online_attn_accumulate with 2 scalar expf per position"
+    content: "Block prefill attention: QK^T tile GEMM + vectorized softmax + V GEMM, replacing the per-KV-position online_attn_accumulate with 2 scalar expf per position. PARTIALLY DONE: causal_gqa_attention_prefill_shared_kv (attention.rs:632) is already the three-pass blocked form, but only the non-windowed decoder arm reaches it — see cpu-gemma3-prefill. Still owed after that: the blocked form is itself the dominant CPU cost on small models. `sample` of SmolLM2-135M Q8_0 cpu pp512 (2026-08-18, host load 41 so timing is junk, symbol shares are not) puts the inlined per-(query-block, head) closure of causal_gqa_attention_prefill_shared_kv at 8265/15700 = 53% of non-idle vs 30% for the Q8_0 GEMM, against ~8% of the model's FLOPs. Cause: pass 1 is a dot_f32 per (query, KV position) with head_dim=64 and no K reuse across the query block. Real fix is a K-tile x Q-tile register GEMM as llama does (KQ via ggml_mul_mat), not the current row-at-a-time loop"
     status: pending
   - id: cpu-gemma3-prefill
-    content: "Gemma-3-1B cpu pp512 1.65x (not the 1.94x previously recorded — llama's own number was 548 under load, 468 quiet) is still the worst CPU prefill row and has no diagnosis. SmolLM2 1.50x next"
+    content: "Gemma-3-1B cpu pp512 1.65x (not the 1.94x previously recorded — llama's own number was 548 under load, 468 quiet) is the worst CPU prefill row. DIAGNOSED 2026-08-18 on wf/cpu-prefill-gemma3 by `sample` over `ferrox bench -p 512 -n 0 -ngl 0` (15s, 1ms). Two Gemma-3-specific costs, neither shared with the TinyLlama 1.01x control: (1) SWA layers never reach the blocked attention. decoder.rs:3741 branches on layer_sliding_window(l); Gemma-3 is swa_pattern=6 so 22 of 26 layers take the Some(window) arm, which is a per-query causal_gqa_attention_windowed_softcap (attention.rs:546) built on online_attn_accumulate (attention.rs:146) — 2 scalar expf plus a head_dim-wide rescale per KV position, Rayon over 512 query rows only, not query x head. The None arm is the already-blocked causal_gqa_attention_prefill_shared_kv (attention.rs:632). TinyLlama and SmolLM2 have no sliding_window so they never enter it. Measured 7167/36476 = 19.6% of non-idle samples. At pp512 the window (512) covers the whole prompt, so this arm does the identical KV work as the fast arm — it is pure code cost. (2) geglu (matmul.rs:233) calls libm tanhf per element: tanhf 3688 + stub 218 = 10.7% of non-idle, entered from dense_ffn_batch. Gemma uses GeGLU; TinyLlama/SmolLM2 use SiLU. GEMM itself is fine — gemm_q8_0x4_q8_0_neon_i8mm is already the i8mm 4x8 kernel and is 57.0%, so cpu-i8mm-q8_0-q4_0 as written in this plan is stale for Q8_0"
     status: pending
   - id: metal-fa-mma
     content: "Port kernel_flash_attn_ext MMA (Q.K^T AND P.V via simdgroup_half8x8) for d=64 — attn.rs had ZERO simdgroup MMA, 16 of 128 lanes active"
@@ -257,7 +257,9 @@ decode only.
    beats llama at one thread on Mistral-7B). Retry the persistent pool
    with the `wf/cpu-threadpool` deadlock understood first.
 2. `cpu-gemma3-prefill` — the one CPU prefill row that is an outlier
-   rather than a trend, still undiagnosed.
+   rather than a trend. Diagnosed 2026-08-18, see §1h: 19.6% in the
+   windowed (SWA) prefill attention arm that never reaches the blocked
+   kernel, 10.7% in libm `tanhf` under GeGLU.
 3. `metal-fa-mma-d256` and the OLMoE Metal `tg128` row (1.41×), which
    the prefill stack did not touch.
 
@@ -831,6 +833,71 @@ over `n_q × n_heads`, but each task walks KV one position at a time through
 and a full-width rescale **per KV position**, with no K-tile reuse across
 queries. Port llama's shape — `QKᵀ` as a real GEMM, vectorized softmax over
 the whole row, `V·P` as a second GEMM.
+
+### 1h. Gemma-3-1B CPU `pp512` — measured diagnosis (2026-08-18)
+
+`sample` over `ferrox bench -m models/hf_test/gemma-3-1b-it-Q8_0.gguf -p 512
+-n 0 -r 6 --n-gpu-layers 0`, 15 s at 1 ms, on `wf/cpu-prefill-gemma3`. Host
+load 16.5 → 13.9 across the run, so the **wall-clock number from that run is
+worthless** (212.86 t/s against a published 284.54) — only the symbol shares
+below are used. Non-idle top-of-stack total ≈ 36 476 samples
+(`__psynch_cvwait` 33 636 and `swtch_pri` 1 648 excluded as idle):
+
+| symbol | samples | share |
+|---|---|---|
+| `ferrox_quant::repack::neon::gemm_q8_0x4_q8_0_neon_i8mm` | 20 782 | 57.0% |
+| `ferrox_core::attention::causal_gqa_attention_windowed_softcap` | 7 167 | 19.6% |
+| `tanhf` (libsystem_m, + its DYLD stub) | 3 906 | 10.7% |
+| everything else | ≈ 4 600 | 12.7% |
+
+**Finding 1 — SWA layers never reach the blocked attention.** The CPU prefill
+attention dispatch at `decoder.rs:3741` branches on
+`self.config.layer_sliding_window(l)`:
+
+- `None` → `causal_gqa_attention_prefill_shared_kv` (`attention.rs:632`), the
+  three-pass blocked form: `Q·Kᵀ` row, one vectorised softmax, then `V·P`,
+  Rayon over `(query-block of 8) × head`.
+- `Some(window)` → a per-query-row loop calling
+  `causal_gqa_attention_windowed_softcap` (`attention.rs:546`), which is
+  `online_attn_accumulate` (`attention.rs:146`): **two scalar `expf` and a
+  full `head_dim`-wide rescale of the accumulator per KV position**, with
+  Rayon over the 512 query rows only — the head axis stays serial inside each
+  task.
+
+Gemma-3 is `swa_pattern = 6`, so `layer_sliding_window` (`config.rs:328`)
+returns `Some(512)` for 22 of its 26 layers. TinyLlama (the 1.01× control)
+and SmolLM2 both have no `sliding_window` at all, so neither ever enters this
+arm. That is the whole reason Gemma-3 is an outlier rather than part of the
+trend.
+
+The work is not even different: at `pp512` with `window = 512`,
+`window_start = seq_len.saturating_sub(512)` is 0 for every position, so the
+windowed arm visits exactly the same KV range as the full-causal arm. It is
+19.6% of the process spent on a slower way of computing the same thing.
+
+**Finding 2 — GeGLU pays a libm `tanhf` per element.** The `tanhf` samples
+are entered from `dense_ffn_batch` → `ferrox_core::matmul::geglu`
+(`matmul.rs:233`), which maps `gelu()` (`matmul.rs:225`) elementwise; `gelu`
+is the tanh approximation and calls `f32::tanh`, i.e. `libsystem_m`'s scalar
+`tanhf`, once per FFN element. Gemma-3 runs `26 × 512 × 6912 ≈ 92 M` of them
+per `pp512`. TinyLlama and SmolLM2 are SwiGLU and never call it. llama.cpp
+does not pay this either: `ggml_vec_geglu_f32`
+(`ggml/src/ggml-cpu/vec.h:1414`) under `GGML_GELU_FP16` reads a 65 536-entry
+`ggml_table_gelu_f16` lookup instead of evaluating `tanhf`.
+
+**Not a finding — the Q8_0 GEMM tier.** `gemm_q8_0x4_q8_0_neon_i8mm` is the
+top symbol, i.e. the SMMLA Q8_0 kernel `cpu-i8mm-q8_0-q4_0` proposes to write
+already exists and is already on the hot path. That todo is stale for Q8_0.
+
+**SmolLM2-135M is a different problem.** A `sample` of its `pp512` (same
+session, host load 41 — timing junk, shares still usable) puts the inlined
+per-task closure of `causal_gqa_attention_prefill_shared_kv` at 8 265 / 15 700
+= 53% of non-idle against 30% for the Q8_0 GEMM, while attention is only ~8%
+of the model's FLOPs. So the *blocked* form is itself ~12× off the GEMM's
+efficiency: pass 1 is a `dot_f32` per `(query, KV position)` at `head_dim`
+64, with no K reuse across the 8-query block. Fixing Gemma-3 does not fix
+SmolLM2; SmolLM2 needs the real K-tile × Q-tile GEMM under
+`cpu-prefill-attn-block`.
 
 ### CPU order and expected movement
 

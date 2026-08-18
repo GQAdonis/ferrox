@@ -17,7 +17,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use ferrox_core::attention::{
     apply_rope, apply_rope_interleaved, apply_rope_interleaved_with_freq_factors,
     apply_rope_with_freq_factors, causal_gqa_attention_paged,
-    causal_gqa_attention_prefill_shared_kv, causal_gqa_attention_softcap,
+    causal_gqa_attention_prefill_shared_kv_windowed, causal_gqa_attention_softcap,
     causal_gqa_attention_windowed_softcap,
 };
 use ferrox_core::cache::{KvCache, PagedKvCache, PagedKvStore, PagedStoreExhausted};
@@ -3735,43 +3735,27 @@ impl Decoder {
             let cache_v = &cache.v;
             let softcap = self.config.attn_logit_softcap;
             let window = self.config.layer_sliding_window(l);
-            // Non-windowed: Rayon over `[n_q × n_heads]` against one shared
-            // KV buffer (Phi-4 CPU pp512). Windowed keeps per-query path.
-            let attn_out_batch = match window {
-                Some(window) => {
-                    let mut out = vec![0f32; batch_size * q_width];
-                    out.par_chunks_mut(q_width)
-                        .enumerate()
-                        .for_each(|(b, dest)| {
-                            let seq_len_b = base_seq_len + b + 1;
-                            let cache_elems = seq_len_b * kv_width;
-                            let attn_out = causal_gqa_attention_windowed_softcap(
-                                &q_batch[b * q_width..(b + 1) * q_width],
-                                &cache_k[..cache_elems],
-                                &cache_v[..cache_elems],
-                                n_heads,
-                                n_kv_heads,
-                                head_dim,
-                                seq_len_b,
-                                window,
-                                softcap,
-                            );
-                            dest.copy_from_slice(&attn_out);
-                        });
-                    out
-                }
-                None => causal_gqa_attention_prefill_shared_kv(
-                    &q_batch,
-                    cache_k,
-                    cache_v,
-                    n_heads,
-                    n_kv_heads,
-                    head_dim,
-                    batch_size,
-                    base_seq_len,
-                    softcap,
-                ),
-            };
+            // Rayon over `[query-block × head]` against one shared KV
+            // buffer, windowed or not. SWA layers used to take a
+            // per-query `causal_gqa_attention_windowed_softcap` instead,
+            // which is `online_attn_accumulate`: two scalar `exp` and a
+            // head_dim-wide rescale per KV position, with the head axis
+            // serial inside each task. On Gemma-3-1B (22 of 26 layers
+            // are SWA) that arm was 19.6% of non-idle CPU `pp512`
+            // samples while doing the *same* KV work as this one — at
+            // `pp512` the 512-wide window covers the whole prompt.
+            let attn_out_batch = causal_gqa_attention_prefill_shared_kv_windowed(
+                &q_batch,
+                cache_k,
+                cache_v,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                batch_size,
+                base_seq_len,
+                softcap,
+                window,
+            );
 
             let projected_batch = layer.attn.o_proj.apply_batch(&attn_out_batch, batch_size);
             let projected_batch = if let Some(post) = &layer.attn.post_attn_norm {

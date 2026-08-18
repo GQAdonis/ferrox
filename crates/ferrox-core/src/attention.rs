@@ -640,6 +640,44 @@ pub fn causal_gqa_attention_prefill_shared_kv(
     kv_prefix: usize,
     attn_softcap: Option<f32>,
 ) -> Vec<f32> {
+    causal_gqa_attention_prefill_shared_kv_windowed(
+        q,
+        k_cache,
+        v_cache,
+        n_heads,
+        n_kv_heads,
+        head_dim,
+        n_q,
+        kv_prefix,
+        attn_softcap,
+        None,
+    )
+}
+
+/// [`causal_gqa_attention_prefill_shared_kv`] with an optional sliding
+/// window, so SWA models (Gemma-2/3, Mistral, Qwen2-MoE) get the same
+/// blocked kernel instead of the per-query
+/// [`causal_gqa_attention_windowed_softcap`] fallback.
+///
+/// `window = Some(w)` restricts the query at absolute position `p`
+/// (`p = kv_prefix + b`) to keys `p + 1 - w ..= p`, matching
+/// [`causal_gqa_attention_windowed_softcap`]'s
+/// `window_start = seq_len.saturating_sub(window)` exactly — the
+/// per-query function is called with `seq_len = p + 1`. `None` is
+/// full causal.
+#[allow(clippy::too_many_arguments)]
+pub fn causal_gqa_attention_prefill_shared_kv_windowed(
+    q: &[f32],
+    k_cache: &[f32],
+    v_cache: &[f32],
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    n_q: usize,
+    kv_prefix: usize,
+    attn_softcap: Option<f32>,
+    window: Option<usize>,
+) -> Vec<f32> {
     use rayon::prelude::*;
     let q_stride = n_heads * head_dim;
     let kv_stride = n_kv_heads * head_dim;
@@ -688,12 +726,18 @@ pub fn causal_gqa_attention_prefill_shared_kv(
 
             for b in b_start..b_end {
                 let causal_len = kv_prefix + b + 1;
+                // Same visible range as `causal_gqa_attention_windowed_softcap`
+                // called with `seq_len = causal_len`.
+                let t_start = match window {
+                    Some(w) => causal_len.saturating_sub(w),
+                    None => 0,
+                };
                 let q_h = &q[b * q_stride + h * head_dim..][..head_dim];
-                let scores = &mut scores[..causal_len];
+                let scores = &mut scores[..causal_len - t_start];
 
                 // Pass 1: the Q·Kᵀ row.
-                for (t, s) in scores.iter_mut().enumerate() {
-                    let base = (t * n_kv_heads + kv_h) * head_dim;
+                for (i, s) in scores.iter_mut().enumerate() {
+                    let base = ((t_start + i) * n_kv_heads + kv_h) * head_dim;
                     let mut v = dot_f32(q_h, &k_cache[base..base + head_dim]) * scale;
                     if let Some(sc) = softcap {
                         v = sc * (v / sc).tanh();
@@ -712,8 +756,8 @@ pub fn causal_gqa_attention_prefill_shared_kv(
 
                 // Pass 3: weighted V accumulate, normalized once.
                 acc.fill(0.0);
-                for (t, &p) in scores.iter().enumerate() {
-                    let base = (t * n_kv_heads + kv_h) * head_dim;
+                for (i, &p) in scores.iter().enumerate() {
+                    let base = ((t_start + i) * n_kv_heads + kv_h) * head_dim;
                     axpy(&mut acc, &v_cache[base..base + head_dim], p);
                 }
                 if l > 0.0 {
@@ -1015,6 +1059,96 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn windowed_prefill_shared_kv_matches_the_per_query_windowed_reference() {
+        // Same shapes as `prefill_shared_kv_matches_per_query_reference`,
+        // now against `causal_gqa_attention_windowed_softcap` — the
+        // per-query path the decoder's SWA arm used to call. Windows are
+        // chosen to sit below, across and above the causal prefix so the
+        // `saturating_sub` boundary is exercised on both sides; the last
+        // one degenerates to full causal and must match the unwindowed
+        // kernel too.
+        let n_heads = 6;
+        let n_kv_heads = 2;
+        let head_dim = 16;
+        let n_q = 19;
+        let kv_prefix = 5;
+        let kv_len = kv_prefix + n_q;
+        let q_stride = n_heads * head_dim;
+        let kv_stride = n_kv_heads * head_dim;
+
+        let q: Vec<f32> = (0..n_q * q_stride)
+            .map(|i| ((i as f32) * 0.013 - 0.7).sin() * 1.3)
+            .collect();
+        let k_cache: Vec<f32> = (0..kv_len * kv_stride)
+            .map(|i| ((i as f32) * 0.017 - 0.3).cos() * 1.1)
+            .collect();
+        let v_cache: Vec<f32> = (0..kv_len * kv_stride)
+            .map(|i| ((i as f32) * 0.011 + 0.2).sin() * 0.9)
+            .collect();
+
+        for window in [1usize, 3, 7, kv_prefix, kv_len, kv_len + 8] {
+            for softcap in [None, Some(30.0)] {
+                let got = super::causal_gqa_attention_prefill_shared_kv_windowed(
+                    &q,
+                    &k_cache,
+                    &v_cache,
+                    n_heads,
+                    n_kv_heads,
+                    head_dim,
+                    n_q,
+                    kv_prefix,
+                    softcap,
+                    Some(window),
+                );
+                assert_eq!(got.len(), n_q * q_stride);
+                for b in 0..n_q {
+                    let causal_len = kv_prefix + b + 1;
+                    let want = super::causal_gqa_attention_windowed_softcap(
+                        &q[b * q_stride..(b + 1) * q_stride],
+                        &k_cache[..causal_len * kv_stride],
+                        &v_cache[..causal_len * kv_stride],
+                        n_heads,
+                        n_kv_heads,
+                        head_dim,
+                        causal_len,
+                        window,
+                        softcap,
+                    );
+                    for (i, (g, w)) in got[b * q_stride..(b + 1) * q_stride]
+                        .iter()
+                        .zip(want.iter())
+                        .enumerate()
+                    {
+                        assert!(
+                            (g - w).abs() < 1e-5,
+                            "window {window} softcap {softcap:?} query {b} slot {i}: \
+                             blocked {g} vs per-query {w}"
+                        );
+                    }
+                }
+            }
+        }
+
+        // `window >= kv_len` is full causal: identical to `None`.
+        let windowed = super::causal_gqa_attention_prefill_shared_kv_windowed(
+            &q,
+            &k_cache,
+            &v_cache,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            n_q,
+            kv_prefix,
+            None,
+            Some(kv_len + 8),
+        );
+        let full = super::causal_gqa_attention_prefill_shared_kv(
+            &q, &k_cache, &v_cache, n_heads, n_kv_heads, head_dim, n_q, kv_prefix, None,
+        );
+        assert_eq!(windowed, full);
     }
 
     use super::*;

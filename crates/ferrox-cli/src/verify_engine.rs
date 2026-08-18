@@ -47,6 +47,59 @@ pub fn greedy_token_ids(
     n: usize,
     prompt_tokens: Option<usize>,
 ) -> anyhow::Result<(Vec<u32>, usize)> {
+    let (decoder, tokens, eos) = load_and_tokenize(path, prompt, prompt_tokens)?;
+
+    let mut caches: Vec<KvCache> = (0..decoder.layers.len())
+        .map(|_| KvCache::new(decoder.config.n_kv_heads, decoder.config.head_dim))
+        .collect();
+
+    let prompt_len = tokens.len();
+    let mut logits = decoder.forward_batch_last(&tokens, 0, &mut caches);
+    let mut pos = tokens.len();
+    let mut out = Vec::with_capacity(n);
+    for _ in 0..n {
+        let next = argmax(&logits);
+        out.push(next as u32);
+        if Some(next) == eos {
+            break;
+        }
+        logits = decoder.forward_token(next, pos, &mut caches);
+        pos += 1;
+    }
+    Ok((out, prompt_len))
+}
+
+/// The prompt token ids and the logit vector at the LAST prompt position
+/// — i.e. the distribution the model would sample the first generated
+/// token from, before anything is sampled.
+///
+/// Separate from [`greedy_token_ids`] because the question is different:
+/// that one asks "do two backends produce the same text", this one hands
+/// out the distribution itself so it can be compared against another
+/// engine's. The token ids come back too, because any cross-engine
+/// comparison must feed the *same* ids to both sides — otherwise it is
+/// measuring the two tokenizers.
+pub fn prefill_logits(
+    path: &Path,
+    prompt: &str,
+    prompt_tokens: Option<usize>,
+) -> anyhow::Result<(Vec<u32>, Vec<f32>)> {
+    let (decoder, tokens, _eos) = load_and_tokenize(path, prompt, prompt_tokens)?;
+    let mut caches: Vec<KvCache> = (0..decoder.layers.len())
+        .map(|_| KvCache::new(decoder.config.n_kv_heads, decoder.config.head_dim))
+        .collect();
+    let logits = decoder.forward_batch_last(&tokens, 0, &mut caches);
+    Ok((tokens.into_iter().map(|t| t as u32).collect(), logits))
+}
+
+/// Shared setup: open the GGUF, build the tokenizer the header names,
+/// encode the prompt (adding BOS only when the checkpoint says to),
+/// stretch it if asked, and build the decoder.
+fn load_and_tokenize(
+    path: &Path,
+    prompt: &str,
+    prompt_tokens: Option<usize>,
+) -> anyhow::Result<(Decoder, Vec<usize>, Option<usize>)> {
     let file = ShardedGguf::open(path)?;
     let config = ModelConfig::from_gguf(&file).context("reading model config")?;
     let tokenizer = match file.metadata_str("tokenizer.ggml.model") {
@@ -79,24 +132,7 @@ pub fn greedy_token_ids(
         tokens = stretch_prompt(tokens, want, bos)?;
     }
 
-    let mut caches: Vec<KvCache> = (0..decoder.layers.len())
-        .map(|_| KvCache::new(decoder.config.n_kv_heads, decoder.config.head_dim))
-        .collect();
-
-    let prompt_len = tokens.len();
-    let mut logits = decoder.forward_batch_last(&tokens, 0, &mut caches);
-    let mut pos = tokens.len();
-    let mut out = Vec::with_capacity(n);
-    for _ in 0..n {
-        let next = argmax(&logits);
-        out.push(next as u32);
-        if Some(next) == eos {
-            break;
-        }
-        logits = decoder.forward_token(next, pos, &mut caches);
-        pos += 1;
-    }
-    Ok((out, prompt_len))
+    Ok((decoder, tokens, eos))
 }
 
 /// Repeat `tokens` until it is exactly `want` long, keeping at most one

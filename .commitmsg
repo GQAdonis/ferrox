@@ -1,0 +1,33 @@
+feat(metal): instantiate the MMA flash-attention macro at d=256
+
+The `fa_ext` MMA macro was capped at d=128 by three `own = tiisg < D4`
+guards that give each lane exactly one `float4` of the output row, so
+`D/4 <= 32`. llama does not have that cap: `kernel_flash_attn_ext_impl`
+walks the `so` accumulator with a lane loop at every one of those three
+points -- zero-init (`ggml-metal.metal:6529-6535`), the online-softmax
+rescale (`:6826-6838`), and the store to global memory (`:7024-7034`) --
+which is how it reaches DV up to 576.
+
+Port that loop. For `D4 <= NW` it runs exactly one iteration on exactly
+the lanes `own` selected, at the same index, so d=64 and d=128 compute
+the same values as before; at d=256 it lets one lane carry two `float4`
+columns. Then instantiate `gqa_prefill_fa_ext_mma_d256` and route
+head_dim 256 to it, which is Gemma-2 / Gemma-3's width (Gemma-3-1B:
+4 heads, 1 kv head, head_dim 256, confirmed by `ferrox inspect`).
+
+d=256 needs 28 KiB of threadgroup memory at this tiling (QN=8, C=64),
+under Apple's 32 KiB limit but the last width that fits. As at d=128
+there is no scalar `fa_ext` at this width, so `FERROX_METAL_FA_MMA=0`
+sends d=256 back to `gqa_prefill_fa_vec_d256` rather than to a kernel
+that does not exist -- which also makes FA-vec the A/B reference.
+
+Sliding-window layers are unaffected: prefill has no `kv_start`, and
+`metal_prefill_dense_swa_fits` already keeps a windowed layer off the
+GPU prefill path unless the whole batch fits inside the window.
+
+New `gqa_prefill_fa_ext_mma_d256_matches_cpu_and_fa_vec` covers the
+Gemma-3-1B shape plus padded cache tails, exact 8-row fits, and the
+long-prefix / short-batch case; the d=64 and d=128 tests still pass
+unchanged.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>

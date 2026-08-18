@@ -53,13 +53,13 @@ use crate::elem::{
 };
 use crate::embd::{encode_get_rows, EmbdKind};
 use crate::gpu::{
-    compute_encoder_concurrent, encode_matvec, encode_matvec_with_offsets, encode_moe_topk_softmax,
-    encode_mul_mm_sg_f16, encode_q4_0_moe_gate_then_up_silu, encode_q4_0_moe_gate_up_id,
-    encode_q4_0_moe_gate_up_silu_fused, encode_q4_0_moe_id, encode_q4_0_moe_id_ex,
-    encode_q4_0_moe_topk, encode_q4_0_mul_mm, ensure_pipeline, memory_barrier_buffers,
-    memory_barrier_resources, resident_f32_buffer, resident_weight_buffer, shared_metal,
-    warm_mul_mm_sg_pipeline, MatvecLaunch, MetalError, MoeExpertLaunch, MoePackedQ4, MulMmSgLaunch,
-    ResidentF32Buffer, ResidentWeightBuffer,
+    compute_encoder_concurrent, encode_matvec, encode_matvec_with_offsets,
+    encode_moe_topk_softmax_batch, encode_mul_mm_sg_f16, encode_q4_0_moe_gate_then_up_silu,
+    encode_q4_0_moe_gate_up_id, encode_q4_0_moe_gate_up_silu_fused, encode_q4_0_moe_id,
+    encode_q4_0_moe_id_ex, encode_q4_0_moe_topk, encode_q4_0_mul_mm, ensure_pipeline,
+    memory_barrier_buffers, memory_barrier_resources, resident_f32_buffer, resident_weight_buffer,
+    shared_metal, warm_mul_mm_sg_pipeline, MatvecLaunch, MetalError, MoeExpertLaunch, MoePackedQ4,
+    MulMmSgLaunch, ResidentF32Buffer, ResidentWeightBuffer,
 };
 use crate::moe_ranges::MoeMemRanges;
 use objc2::rc::Retained;
@@ -5373,6 +5373,51 @@ thread_local! {
         const { RefCell::new(Vec::new()) };
 }
 
+/// Which stages of the fused MoE decode layer to *drop*, from
+/// `FERROX_METAL_MOE_ABLATE` (comma list of `attn`, `gqa`, `rmv`, `topk`,
+/// `router`, `gateup`, `down`, `ffn`).
+///
+/// Output is garbage while any stage is dropped — this exists only so the
+/// per-stage share of `FERROX_METAL_GPU_TIMING`'s ms/tok can be read off by
+/// subtraction. There is no other way to attribute GPU time inside a single
+/// Concurrent encoder without a Metal capture. See
+/// `docs/plans/llama-cpp-parity-push.md`.
+#[derive(Clone, Copy, Default)]
+struct MoeAblate {
+    attn: bool,
+    gqa: bool,
+    router_mv: bool,
+    topk: bool,
+    gate_up: bool,
+    down: bool,
+    ffn: bool,
+}
+
+fn moe_ablate() -> MoeAblate {
+    static A: std::sync::OnceLock<MoeAblate> = std::sync::OnceLock::new();
+    *A.get_or_init(|| {
+        let spec = std::env::var("FERROX_METAL_MOE_ABLATE").unwrap_or_default();
+        let mut a = MoeAblate::default();
+        for part in spec.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+            match part {
+                "attn" => a.attn = true,
+                "gqa" => a.gqa = true,
+                "rmv" => a.router_mv = true,
+                "topk" => a.topk = true,
+                "router" => {
+                    a.router_mv = true;
+                    a.topk = true;
+                }
+                "gateup" => a.gate_up = true,
+                "down" => a.down = true,
+                "ffn" => a.ffn = true,
+                other => eprintln!("ferrox: unknown FERROX_METAL_MOE_ABLATE stage {other:?}"),
+            }
+        }
+        a
+    })
+}
+
 fn moe_layer_resident(
     device: &Retained<ProtocolObject<dyn MTLDevice>>,
     layer_idx: usize,
@@ -5452,6 +5497,7 @@ fn encode_moe_layer_fused(
     pos: usize,
     rms_eps: f32,
 ) -> Result<(), MetalError> {
+    let ablate = moe_ablate();
     let bound = moe_layer_resident(device, layer_idx, layer)?;
     let attn_nw = &bound.attn_nw;
     let ffn_nw = &bound.ffn_nw;
@@ -5478,7 +5524,7 @@ fn encode_moe_layer_fused(
         mrs.end_op(&srcs, &dsts);
     }
     // Q∥K∥V — one Concurrent set (shared src, disjoint dsts).
-    {
+    if !ablate.attn {
         let srcs = [scratch.x_attn.as_ref()];
         let dsts = [scratch.q.as_ref(), scratch.k.as_ref(), scratch.v.as_ref()];
         mrs.begin_op(encoder, &srcs, &dsts);
@@ -5488,7 +5534,7 @@ fn encode_moe_layer_fused(
         mrs.end_op(&srcs, &dsts);
     }
     // extras + RoPE on q/k — fused group (one barrier before in-place chain).
-    {
+    if !ablate.attn {
         let srcs = [scratch.q.as_ref(), scratch.k.as_ref(), scratch.v.as_ref()];
         let dsts = [scratch.q.as_ref(), scratch.k.as_ref(), scratch.v.as_ref()];
         mrs.begin_op(encoder, &srcs, &dsts);
@@ -5538,7 +5584,7 @@ fn encode_moe_layer_fused(
     }
     let token_elems = (n_kv_heads * head_dim) as u32;
     let offset = (pos * n_kv_heads * head_dim) as u32;
-    {
+    if !ablate.attn {
         let srcs = [scratch.k.as_ref(), scratch.v.as_ref()];
         let dsts = [kv.k.as_ref(), kv.v.as_ref()];
         mrs.begin_op(encoder, &srcs, &dsts);
@@ -5563,7 +5609,7 @@ fn encode_moe_layer_fused(
         )?;
         mrs.end_op(&srcs, &dsts);
     }
-    {
+    if !ablate.attn && !ablate.gqa {
         let srcs = [scratch.q.as_ref(), kv.k.as_ref(), kv.v.as_ref()];
         let dsts = [scratch.attn.as_ref()];
         mrs.begin_op(encoder, &srcs, &dsts);
@@ -5582,7 +5628,7 @@ fn encode_moe_layer_fused(
         )?;
         mrs.end_op(&srcs, &dsts);
     }
-    {
+    if !ablate.attn {
         let srcs = [scratch.attn.as_ref()];
         let dsts = [scratch.o.as_ref()];
         mrs.begin_op(encoder, &srcs, &dsts);
@@ -5605,7 +5651,7 @@ fn encode_moe_layer_fused(
         )?;
         mrs.end_op(&srcs, &dsts);
     }
-    {
+    if !ablate.router_mv {
         let srcs = [scratch.x2.as_ref()];
         let dsts = [scratch.router.as_ref()];
         mrs.begin_op(encoder, &srcs, &dsts);
@@ -5619,11 +5665,16 @@ fn encode_moe_layer_fused(
         )?;
         mrs.end_op(&srcs, &dsts);
     }
-    {
+    if !ablate.topk {
         let srcs = [scratch.router.as_ref()];
         let dsts = [scratch.ids.as_ref(), scratch.route.as_ref()];
         mrs.begin_op(encoder, &srcs, &dsts);
-        encode_moe_topk_softmax(
+        // One token, but the *batch* kernel: it spreads the softmax and
+        // each of the k selection passes over a simdgroup and keeps `probs`
+        // in threadgroup memory. Its single-token twin ran the whole thing
+        // on lane 0 out of a private `float[256]` and cost ~1.3-2.2 ms/tok
+        // across 16 layers (see the plan's MoE decode diagnosis).
+        encode_moe_topk_softmax_batch(
             encoder,
             device,
             &scratch.router,
@@ -5632,8 +5683,12 @@ fn encode_moe_layer_fused(
             layer.router.rows as u32,
             top_k as u32,
             norm_topk_prob,
+            1,
         )?;
         mrs.end_op(&srcs, &dsts);
+    }
+    if ablate.ffn {
+        return Ok(());
     }
     let fused_gate_up = matches!(
         std::env::var("FERROX_METAL_MOE_FUSED_GATE_UP")
@@ -5741,21 +5796,26 @@ fn encode_moe_layer_fused(
         )?;
         mrs.end_op(&srcs, &dsts);
     } else {
-        let srcs = [scratch.x2.as_ref(), scratch.ids.as_ref()];
-        let dsts = [scratch.gate.as_ref(), scratch.up.as_ref()];
-        mrs.begin_op(encoder, &srcs, &dsts);
-        encode_q4_0_moe_gate_up_id(
-            encoder,
-            device,
-            &scratch.x2,
-            &layer.packed,
-            &scratch.ids,
-            &scratch.gate,
-            &scratch.up,
-            top_k as u32,
-            1,
-        )?;
-        mrs.end_op(&srcs, &dsts);
+        if !ablate.gate_up {
+            let srcs = [scratch.x2.as_ref(), scratch.ids.as_ref()];
+            let dsts = [scratch.gate.as_ref(), scratch.up.as_ref()];
+            mrs.begin_op(encoder, &srcs, &dsts);
+            encode_q4_0_moe_gate_up_id(
+                encoder,
+                device,
+                &scratch.x2,
+                &layer.packed,
+                &scratch.ids,
+                &scratch.gate,
+                &scratch.up,
+                top_k as u32,
+                1,
+            )?;
+            mrs.end_op(&srcs, &dsts);
+        }
+        if ablate.down {
+            return Ok(());
+        }
         let srcs = [
             scratch.x2.as_ref(),
             scratch.ids.as_ref(),

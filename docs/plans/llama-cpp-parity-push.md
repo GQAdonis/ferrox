@@ -44,6 +44,9 @@ todos:
   - id: suite-owed-moe-stack
     content: "PAID (2026-08-14, started at load 1.82): re-ran --suite --id olmoe_q4 --backend metal, the only ledger row metal-moe-stack can move. OLMoE metal pp512 587.49 -> 1402.38, gap 2.62x -> 1.11x against llama 1552.23 measured in the same session. tg128 116.17 (gap 1.41x) unchanged, as predicted — decode never took this path. RESULTS.md re-rendered from the new receipt; no other row was re-measured, so no other row moved"
     status: completed
+  - id: metal-moe-decode
+    content: "Last red Metal decode row: OLMoE tg128 1.41x. DIAGNOSED on wf/metal-moe-decode (see 'MoE decode: where the 1.41x actually goes'). Decode already routes on the GPU, already uses one command buffer per token, and its expert mat-vec is already llama's mul_mv_id — none of those were the cause. Measured by stage ablation (new FERROX_METAL_MOE_ABLATE) against FERROX_METAL_GPU_TIMING: the ROUTER costs ~3.6 ms of ~8.5 ms GPU/tok (42%), more than the experts it selects (2.9 ms), split between two single-lane kernels — f32_matvec (gpu.rs:324, one thread per row, so a 64x2048 router is ONE threadgroup) and moe_topk_softmax (gpu.rs:665, `if (tid != 0u) return;`, private float[256], 1x1x1 dispatch). LANDED on wf/metal-moe-decode: f32_matvec rewritten as ggml's kernel_mul_mv_t_t_impl<float,float> (NR0=2, NSG=min(4,ceil(cols/128)), simd_sum + threadgroup fold, coalesced lanes), and decode's top-k switched to the existing simdgroup moe_topk_softmax_batch with n_tokens=1 (the single-lane kernel is deleted). PROVISIONAL interleaved A/B at host load 121-162, GPU ms/tok (wall tok/s unusable at that load): 8.36/8.12/8.59 -> 6.23/6.06/6.23, -2.1 ms/tok = -25%. A second A/B at load 14-16 (wall clock usable there): GPU 7.76/7.99/7.61 -> 5.55/5.32/5.28 and tg128 97.9/90.7/113.4 -> 118.9/152.3/145.7, i.e. ~1.13x against the published llama 164.23 — cross-session, so a reason to take the suite run, not a result. Router 3.6 ms -> ~0.5 ms. verify --backend metal --prompt-tokens 64 identical cpu vs metal. OWED: quiet-host suite run (RESULTS.md still says 1.41x). What is left on this row is attention ~2.4 ms/tok at ~63 GB/s (metal-barrier-ranges, ~8 barrier points per layer) and the ~1.6 ms/tok host lm_head"
+    status: pending
   - id: metal-barrier-ranges
     content: "Replace 15 blanket per-layer buffer barriers with llama's mem-range overlap tracker; fuse rmsnorm+f32->f16 and silu_mul+f32->f16"
     status: pending
@@ -249,6 +252,138 @@ Owed: a quiet-host suite run (`suite-owed-moe-stack`). Published
 One thing this cost: prefill routes on the GPU now, so it no longer
 feeds `record_activations`. Expert hotness for `inspect-plan` comes from
 decode only.
+
+## MoE decode: where the 1.41× actually goes (2026-08-18)
+
+The prefill stack's A/B already proved decode does not take that path.
+What decode *does* take is `Decoder::forward_token` →
+`launch_moe_decode_stack` (`crates/ferrox-models/src/decoder.rs:1644`),
+and none of the guessed shapes were true:
+
+- Routing is **not** on the host. `encode_moe_layer_fused`
+  (`crates/ferrox-metal/src/attn.rs:5415`) encodes router GEMM → top-k →
+  experts on the GPU.
+- There is **one command buffer for the whole token**, not one per layer:
+  `launch_moe_decode_stack` opens a single Concurrent encoder for all 16
+  layers (`crates/ferrox-metal/src/attn.rs:5975`).
+- The expert mat-vec is **not** a per-expert loop and does have a
+  simdgroup variant: `q4_0_moe_matvec_id`
+  (`crates/ferrox-metal/src/gpu.rs:714`) is a faithful port of llama's
+  `mul_vec_q_n_f32_impl` (`NR0=4`, `NSG=2`, grid `(rows/8, 1, n_slots)`),
+  identical to `kernel_mul_mv_id_q4_0_f32`.
+
+### Method
+
+`FERROX_METAL_GPU_TIMING=1` gives GPU ms/tok for the one command buffer.
+A new `FERROX_METAL_MOE_ABLATE` (`crates/ferrox-metal/src/attn.rs`,
+`MoeAblate`) drops whole stages from the encoded graph — output is
+garbage, timing is not — so each stage's share is read off by
+subtraction. This is the only way to attribute time inside a single
+Concurrent encoder short of a Metal capture.
+
+`ferrox bench -m models/olmoe-1b-7b-0924-q4_0.gguf -p 0 -n 128 -r 1
+--n-gpu-layers 99`, Host B, **host load 8–200 (other agents building)**,
+so treat every number as PROVISIONAL and the *shares* as the finding:
+
+| dropped stage | GPU ms/tok | Δ vs baseline |
+|---|---|---|
+| — (baseline) | 7.7–8.6 | — |
+| `topk` (`moe_topk_softmax`) | 6.3–6.6 | **−1.3 to −2.2** |
+| `rmv` (F32 router mat-vec) | 6.7–6.8 | **−1.1 to −1.8** |
+| `router` (both) | 4.9 | **−3.6** |
+| `attn` (QKV+RoPE+KV+GQA+O) | 6.3–6.5 | −1.6 to −2.0 |
+| `ffn` (gate/up/silu/down/sum) | 5.1–5.6 | −2.8 to −2.9 |
+| `gateup` only | 6.8 | −1.7 |
+| `down` only | 7.4 | −1.1 |
+| everything | 0.64 | — |
+
+**Measured cause: the router, not the experts.** Selecting 8 of 64
+experts costs ~3.6 ms of ~8.5 ms GPU (≈ 42 %) — *more* than reading the
+50 M active expert weights it selects (2.9 ms). Two single-lane kernels:
+
+1. **`f32_matvec` (`crates/ferrox-metal/src/gpu.rs:324`)** is one thread
+   per output row, walking `cols` serially, dispatched
+   `rows.div_ceil(64)` threadgroups of 64
+   (`crates/ferrox-metal/src/gpu.rs:7748`). `ffn_gate_inp` is
+   `64 × 2048` F32, so the whole router GEMM is **one threadgroup on one
+   GPU core**, with each lane striding a different 8 KB row — no
+   coalescing, no simdgroup reduction. llama runs the same tensor through
+   `kernel_mul_mv_f32_f32_4` (`nsg=min(4,(ne00+127)/128)=4`, `nr0=2`,
+   float4 loads, `helper_mv_reduce_and_write`) — 32 threadgroups × 128
+   threads. ~1.1–1.8 ms/tok.
+2. **`moe_topk_softmax` (`crates/ferrox-metal/src/gpu.rs:665`)** opens
+   with `if (tid != 0u) return;`, is dispatched `1×1×1`
+   (`crates/ferrox-metal/src/gpu.rs:5948`), holds `float probs[256]` in
+   *private* address space (spills), and selection-sorts `k·n = 512`
+   comparisons on that one lane — 16 times per token, each behind a
+   barrier with the rest of the GPU idle. ~1.3–2.2 ms/tok. The batched
+   simdgroup version `moe_topk_softmax_batch`
+   (`crates/ferrox-metal/src/gpu.rs:1175`) already exists — the prefill
+   stack added it — and decode simply never calls it.
+
+Secondary, not MoE-specific: wall 9.4 ms/tok vs GPU 7.75 ms/tok. The
+~1.6 ms host remainder is `lm_head` (50304 × 2048 Q4_0, ~58 MB) run on
+the **CPU** every step, because `out_launch` is `None` unless
+`metal_greedy_argmax_active()` (server-only thread-local) or
+`FERROX_METAL_LOGITS` is set (`crates/ferrox-models/src/decoder.rs:1601`).
+`FERROX_METAL_LOGITS=1` is worse (91 vs 106 tok/s) because it downloads
+the full vocab; the fix is a GPU argmax path that `bench` can take, which
+is a separate change from this one.
+
+### The fix
+
+Both are ports, not inventions:
+
+1. `f32_matvec` is now `kernel_mul_mv_t_t_impl<float,float>`: `NR0 = 2`
+   rows per threadgroup, `NSG = min(4, ceil(cols/128))` simdgroups
+   splitting the reduction axis, `simd_sum` then a threadgroup fold
+   (`helper_mv_reduce_and_write`). Consecutive lanes read consecutive
+   columns. Dispatch goes from `ceil(rows/64)` threadgroups of 64 (one
+   thread per row) to `ceil(rows/2)` of `32*nsg` — for the router,
+   1 threadgroup → 32.
+2. Decode's top-k now calls the existing simdgroup
+   `moe_topk_softmax_batch` with `n_tokens = 1`. The single-lane
+   `moe_topk_softmax` kernel and its encoder are deleted — that was its
+   only caller.
+
+Interleaved A/B, `-p 0 -n 128 -r 2 --ngl 99`, three pairs, **host load
+121–162** — so wall `tok/s` is unusable (± 20 on some reps) and the GPU
+clock from `FERROX_METAL_GPU_TIMING` is the signal:
+
+| | GPU ms/tok |
+|---|---|
+| before | 8.36 / 8.12 / 8.59 |
+| after | 6.23 / 6.06 / 6.23 |
+
+**−2.1 ms/tok, −25 % of GPU time**, PROVISIONAL. A second three-pair
+A/B once the host dropped to **load 14–16** — still not quiet, still
+PROVISIONAL, but with usable wall clock:
+
+| | GPU ms/tok | wall tok/s |
+|---|---|---|
+| before | 7.76 / 7.99 / 7.61 | 97.9 / 90.7 / 113.4 |
+| after | 5.55 / 5.32 / 5.28 | 118.9 / 152.3 / 145.7 |
+
+Median 113.4 → 145.7 tok/s. Against the llama 164.23 in the published
+row that would be **1.41× → ~1.13×**, but that is a cross-session
+comparison against a number measured on a quiet host, so it is not a
+result — it is the reason to go take the suite run.
+
+Re-ablating the fixed
+build: router 3.6 ms → ~0.5 ms (`topk` ~0.06, `rmv` ~0.4). What is left
+is attention ~2.4 ms and experts ~2.4 ms; at ~483 MB of active expert
+weights the expert mat-vec is already running at roughly M2 Pro's peak
+bandwidth, so **attention is now the slack** — 151 MB in 2.4 ms is
+~63 GB/s, and the likely cause is the ~8 barrier points per layer
+(`metal-barrier-ranges`), not the `q4_0_matvec` kernel.
+
+`ferrox verify --backend metal --prompt-tokens 64` on OLMoE: 24 tokens
+identical cpu vs metal.
+
+Owed: a quiet-host suite run. `RESULTS.md` still says 1.41× and must not
+be edited until then. Not fixed here, and each worth ~1 ms/tok:
+`metal-barrier-ranges` on the decode attention chain, and the host-side
+`lm_head`.
 
 ### Next levers, in order
 

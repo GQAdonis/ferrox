@@ -22,18 +22,24 @@
 //! from the experiment — ferrox tokenizes, and llama.cpp is handed the
 //! resulting ids.
 //!
-//! The reference side is a small C program (`.local-scripts/llama_logits.c`)
+//! The reference side is a small C program (`tools/llama_logits.c`)
 //! linked against the installed `libllama`, in the same spirit as the
 //! IQ-tier goldens, which link ggml's own `ggml-quants.c` rather than
 //! re-reading the format spec. A reference you re-implemented is not a
-//! reference.
+//! reference. Build it with `tools/build_llama_logits.sh`.
 
 use anyhow::Context;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// Default reference dumper location, relative to the repo root.
-const DEFAULT_DUMPER: &str = ".local-scripts/llama_logits";
+/// Where the reference dumper is looked for, in order. `target/` is
+/// where `tools/build_llama_logits.sh` puts it; the second entry keeps
+/// working for anyone who built it by hand before it moved into the
+/// tracked tree.
+const DUMPER_CANDIDATES: &[&str] = &["target/llama_logits", ".local-scripts/llama_logits"];
+
+/// Environment override, for a dumper built somewhere else entirely.
+const DUMPER_ENV: &str = "FERROX_LLAMA_LOGITS";
 
 /// Prompt held fixed so runs are comparable across models and sessions.
 const PROMPT: &str = "The capital of France is";
@@ -287,16 +293,37 @@ fn order_desc(p: &[f64]) -> Vec<usize> {
 }
 
 fn dumper_path(explicit: Option<&str>) -> anyhow::Result<PathBuf> {
-    let p = PathBuf::from(explicit.unwrap_or(DEFAULT_DUMPER));
-    if p.exists() {
-        return Ok(p);
+    if let Some(e) = explicit {
+        let p = PathBuf::from(e);
+        if p.exists() {
+            return Ok(p);
+        }
+        // An explicit path that does not exist is a typo, not a reason to
+        // silently fall back to some other binary and report its answer
+        // as the reference.
+        anyhow::bail!("--dumper {} does not exist", p.display());
+    }
+    if let Some(e) = std::env::var_os(DUMPER_ENV) {
+        let p = PathBuf::from(e);
+        if p.exists() {
+            return Ok(p);
+        }
+        anyhow::bail!(
+            "{DUMPER_ENV} points at {}, which does not exist",
+            p.display()
+        );
+    }
+    for c in DUMPER_CANDIDATES {
+        let p = PathBuf::from(c);
+        if p.exists() {
+            return Ok(p);
+        }
     }
     anyhow::bail!(
-        "reference dumper not found at {}. Build it against the installed libllama:\n\
-         \n  P=$(brew --prefix llama.cpp)\n  \
-         cc -std=c11 -O2 -I\"$P/include\" -L\"$P/lib\" -lllama -Wl,-rpath,\"$P/lib\" \\\n    \
-         .local-scripts/llama_logits.c -o .local-scripts/llama_logits\n",
-        p.display()
+        "reference dumper not built. It links llama.cpp's own library, so it is built \
+         separately from the cargo workspace:\n\n  ./tools/build_llama_logits.sh\n\n\
+         (set LLAMA_CPP_PREFIX if llama.cpp is not a Homebrew install, or --dumper / \
+         {DUMPER_ENV} to point at a binary elsewhere)"
     )
 }
 

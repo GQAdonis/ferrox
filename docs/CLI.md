@@ -146,14 +146,17 @@ Greedy *text* is deliberately not the medium: a chain of argmaxes turns
 one last-bit difference into a different sentence, so a text diff cannot
 tell `TIE-FLIP` from `WRONG`.
 
-`parity` needs the reference dumper built once against the installed
-`libllama`:
+`parity` needs the reference dumper built once. It is C, not Rust, and
+lives outside the cargo workspace on purpose — it exists to be
+llama.cpp's own answer, so it links llama.cpp's own library:
 
 ```bash
-P=$(brew --prefix llama.cpp)
-cc -std=c11 -O2 -I"$P/include" -L"$P/lib" -lllama -Wl,-rpath,"$P/lib" \
-  .local-scripts/llama_logits.c -o .local-scripts/llama_logits
+./tools/build_llama_logits.sh          # -> target/llama_logits
+LLAMA_CPP_PREFIX=/path/to/llama.cpp ./tools/build_llama_logits.sh
 ```
+
+Point `--dumper` or `FERROX_LLAMA_LOGITS` at it if you build it
+elsewhere.
 
 ## Hugging Face Hub (`pull`)
 

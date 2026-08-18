@@ -5353,6 +5353,51 @@ thread_local! {
         const { RefCell::new(Vec::new()) };
 }
 
+/// Which stages of the fused MoE decode layer to *drop*, from
+/// `FERROX_METAL_MOE_ABLATE` (comma list of `attn`, `gqa`, `rmv`, `topk`,
+/// `router`, `gateup`, `down`, `ffn`).
+///
+/// Output is garbage while any stage is dropped — this exists only so the
+/// per-stage share of `FERROX_METAL_GPU_TIMING`'s ms/tok can be read off by
+/// subtraction. There is no other way to attribute GPU time inside a single
+/// Concurrent encoder without a Metal capture. See
+/// `docs/plans/llama-cpp-parity-push.md`.
+#[derive(Clone, Copy, Default)]
+struct MoeAblate {
+    attn: bool,
+    gqa: bool,
+    router_mv: bool,
+    topk: bool,
+    gate_up: bool,
+    down: bool,
+    ffn: bool,
+}
+
+fn moe_ablate() -> MoeAblate {
+    static A: std::sync::OnceLock<MoeAblate> = std::sync::OnceLock::new();
+    *A.get_or_init(|| {
+        let spec = std::env::var("FERROX_METAL_MOE_ABLATE").unwrap_or_default();
+        let mut a = MoeAblate::default();
+        for part in spec.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+            match part {
+                "attn" => a.attn = true,
+                "gqa" => a.gqa = true,
+                "rmv" => a.router_mv = true,
+                "topk" => a.topk = true,
+                "router" => {
+                    a.router_mv = true;
+                    a.topk = true;
+                }
+                "gateup" => a.gate_up = true,
+                "down" => a.down = true,
+                "ffn" => a.ffn = true,
+                other => eprintln!("ferrox: unknown FERROX_METAL_MOE_ABLATE stage {other:?}"),
+            }
+        }
+        a
+    })
+}
+
 fn moe_layer_resident(
     device: &Retained<ProtocolObject<dyn MTLDevice>>,
     layer_idx: usize,
@@ -5432,6 +5477,7 @@ fn encode_moe_layer_fused(
     pos: usize,
     rms_eps: f32,
 ) -> Result<(), MetalError> {
+    let ablate = moe_ablate();
     let bound = moe_layer_resident(device, layer_idx, layer)?;
     let attn_nw = &bound.attn_nw;
     let ffn_nw = &bound.ffn_nw;
@@ -5458,7 +5504,7 @@ fn encode_moe_layer_fused(
         mrs.end_op(&srcs, &dsts);
     }
     // Q∥K∥V — one Concurrent set (shared src, disjoint dsts).
-    {
+    if !ablate.attn {
         let srcs = [scratch.x_attn.as_ref()];
         let dsts = [scratch.q.as_ref(), scratch.k.as_ref(), scratch.v.as_ref()];
         mrs.begin_op(encoder, &srcs, &dsts);
@@ -5468,7 +5514,7 @@ fn encode_moe_layer_fused(
         mrs.end_op(&srcs, &dsts);
     }
     // extras + RoPE on q/k — fused group (one barrier before in-place chain).
-    {
+    if !ablate.attn {
         let srcs = [scratch.q.as_ref(), scratch.k.as_ref(), scratch.v.as_ref()];
         let dsts = [scratch.q.as_ref(), scratch.k.as_ref(), scratch.v.as_ref()];
         mrs.begin_op(encoder, &srcs, &dsts);
@@ -5518,7 +5564,7 @@ fn encode_moe_layer_fused(
     }
     let token_elems = (n_kv_heads * head_dim) as u32;
     let offset = (pos * n_kv_heads * head_dim) as u32;
-    {
+    if !ablate.attn {
         let srcs = [scratch.k.as_ref(), scratch.v.as_ref()];
         let dsts = [kv.k.as_ref(), kv.v.as_ref()];
         mrs.begin_op(encoder, &srcs, &dsts);
@@ -5543,7 +5589,7 @@ fn encode_moe_layer_fused(
         )?;
         mrs.end_op(&srcs, &dsts);
     }
-    {
+    if !ablate.attn && !ablate.gqa {
         let srcs = [scratch.q.as_ref(), kv.k.as_ref(), kv.v.as_ref()];
         let dsts = [scratch.attn.as_ref()];
         mrs.begin_op(encoder, &srcs, &dsts);
@@ -5562,7 +5608,7 @@ fn encode_moe_layer_fused(
         )?;
         mrs.end_op(&srcs, &dsts);
     }
-    {
+    if !ablate.attn {
         let srcs = [scratch.attn.as_ref()];
         let dsts = [scratch.o.as_ref()];
         mrs.begin_op(encoder, &srcs, &dsts);
@@ -5585,7 +5631,7 @@ fn encode_moe_layer_fused(
         )?;
         mrs.end_op(&srcs, &dsts);
     }
-    {
+    if !ablate.router_mv {
         let srcs = [scratch.x2.as_ref()];
         let dsts = [scratch.router.as_ref()];
         mrs.begin_op(encoder, &srcs, &dsts);
@@ -5599,7 +5645,7 @@ fn encode_moe_layer_fused(
         )?;
         mrs.end_op(&srcs, &dsts);
     }
-    {
+    if !ablate.topk {
         let srcs = [scratch.router.as_ref()];
         let dsts = [scratch.ids.as_ref(), scratch.route.as_ref()];
         mrs.begin_op(encoder, &srcs, &dsts);
@@ -5614,6 +5660,9 @@ fn encode_moe_layer_fused(
             norm_topk_prob,
         )?;
         mrs.end_op(&srcs, &dsts);
+    }
+    if ablate.ffn {
+        return Ok(());
     }
     let fused_gate_up = matches!(
         std::env::var("FERROX_METAL_MOE_FUSED_GATE_UP")
@@ -5721,21 +5770,26 @@ fn encode_moe_layer_fused(
         )?;
         mrs.end_op(&srcs, &dsts);
     } else {
-        let srcs = [scratch.x2.as_ref(), scratch.ids.as_ref()];
-        let dsts = [scratch.gate.as_ref(), scratch.up.as_ref()];
-        mrs.begin_op(encoder, &srcs, &dsts);
-        encode_q4_0_moe_gate_up_id(
-            encoder,
-            device,
-            &scratch.x2,
-            &layer.packed,
-            &scratch.ids,
-            &scratch.gate,
-            &scratch.up,
-            top_k as u32,
-            1,
-        )?;
-        mrs.end_op(&srcs, &dsts);
+        if !ablate.gate_up {
+            let srcs = [scratch.x2.as_ref(), scratch.ids.as_ref()];
+            let dsts = [scratch.gate.as_ref(), scratch.up.as_ref()];
+            mrs.begin_op(encoder, &srcs, &dsts);
+            encode_q4_0_moe_gate_up_id(
+                encoder,
+                device,
+                &scratch.x2,
+                &layer.packed,
+                &scratch.ids,
+                &scratch.gate,
+                &scratch.up,
+                top_k as u32,
+                1,
+            )?;
+            mrs.end_op(&srcs, &dsts);
+        }
+        if ablate.down {
+            return Ok(());
+        }
         let srcs = [
             scratch.x2.as_ref(),
             scratch.ids.as_ref(),

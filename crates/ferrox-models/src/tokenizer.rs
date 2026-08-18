@@ -37,6 +37,77 @@ pub fn should_add_bos_token(file: &impl ferrox_gguf::TensorSource) -> bool {
     matches!(pre, "tekken" | "chameleon")
 }
 
+/// Token texts llama.cpp treats as end-of-generation regardless of what
+/// the metadata ids say (`llama-vocab.cpp`, the literal list right above
+/// its "sanity checks" block). Copied verbatim, including the comments
+/// naming which family each entry exists for, because the set is not
+/// derivable: it is a hand-maintained list of what real checkpoints ship.
+///
+/// Note `<|end|>` *is* here. The Unsloth study recorded in
+/// `docs/plans/llama-cpp-parity-push.md` claimed gpt-oss's `<|end|>` must
+/// not be EOG or every reply truncates; llama.cpp's own source says
+/// otherwise, and llama.cpp serves gpt-oss. Following the reference
+/// implementation, and flagging the claim as contradicted.
+const EOG_TOKEN_TEXTS: &[&str] = &[
+    "<|eot_id|>",
+    "<|im_end|>",
+    "<|end|>",
+    "<|return|>", // o200k_harmony
+    "<|call|>",   // o200k_harmony
+    "<|flush|>",  // solar-open
+    "<|calls|>",  // solar-open
+    "<end_of_turn>",
+    "<|endoftext|>",
+    "</s>", // paddleocr
+    "<|eom_id|>",
+    "<EOT>",
+    "_<EOT>",
+    "[EOT]", // Kimi-K2
+    "[EOS]", // Kimi-K2
+    "<|end_of_text|>",
+    "<end_of_utterance>",    // smoldocling
+    "<eos>",                 // gemma4
+    "<turn|>",               // gemma4
+    "<|tool_response>",      // gemma4
+    "<｜end▁of▁sentence｜>", // deepseek-ocr
+    "[e~[",                  // minimax-m2/m3
+];
+
+/// Every token id that ends generation, not just `eos_token_id`.
+///
+/// A single EOS id is wrong for most modern chat checkpoints: Llama-3
+/// ends turns with `<|eot_id|>` while its `eos_token_id` is
+/// `<|end_of_text|>`, and gemma-4 ends with `<turn|>`. Stopping only on
+/// the metadata EOS means the model keeps generating past the end of its
+/// turn and starts a new one — the "it answers, then interviews itself"
+/// failure.
+///
+/// Mirrors llama.cpp: the literal-name list above, plus the
+/// `eos`/`eot`/`eom` metadata ids, which it folds in with a warning when
+/// they were not already caught by name.
+pub fn eog_token_ids(file: &impl ferrox_gguf::TensorSource) -> std::collections::HashSet<u32> {
+    let mut out = std::collections::HashSet::new();
+    for key in [
+        "tokenizer.ggml.eos_token_id",
+        "tokenizer.ggml.eot_token_id",
+        "tokenizer.ggml.eom_token_id",
+    ] {
+        if let Some(id) = file.metadata_u64(key) {
+            out.insert(id as u32);
+        }
+    }
+    if let Some(ferrox_gguf::GgufValue::Array(items)) = file.metadata("tokenizer.ggml.tokens") {
+        for (id, v) in items.iter().enumerate() {
+            if let ferrox_gguf::GgufValue::String(text) = v {
+                if EOG_TOKEN_TEXTS.contains(&text.as_str()) {
+                    out.insert(id as u32);
+                }
+            }
+        }
+    }
+    out
+}
+
 pub struct ByteTokenizer;
 
 impl ByteTokenizer {
@@ -1644,5 +1715,108 @@ mod tests {
         // rather than panicking or wrapping into a wrong byte.
         let decoded = ByteTokenizer::decode(&[104, 105, 300, 33]); // "hi" + garbage + "!"
         assert_eq!(decoded, "hi!");
+    }
+}
+
+#[cfg(test)]
+mod eog_tests {
+    use super::*;
+    use ferrox_gguf::{GgufValue, TensorInfo, TensorSource};
+    use std::collections::HashMap;
+
+    struct MetaOnly(HashMap<String, GgufValue>);
+
+    impl TensorSource for MetaOnly {
+        fn metadata(&self, key: &str) -> Option<&GgufValue> {
+            self.0.get(key)
+        }
+        fn find_tensor(&self, _name: &str) -> Option<&TensorInfo> {
+            None
+        }
+        fn tensor_bytes(&self, name: &str) -> Result<&[u8], ferrox_gguf::GgufError> {
+            Err(ferrox_gguf::GgufError::TensorNotFound(name.to_string()))
+        }
+        fn tensor_mapped_range(
+            &self,
+            name: &str,
+        ) -> Result<
+            (
+                std::sync::Arc<ferrox_gguf::MmapHandle>,
+                std::ops::Range<usize>,
+            ),
+            ferrox_gguf::GgufError,
+        > {
+            Err(ferrox_gguf::GgufError::TensorNotFound(name.to_string()))
+        }
+    }
+
+    fn source(tokens: &[&str], kv: &[(&str, u64)]) -> MetaOnly {
+        let mut m = HashMap::new();
+        m.insert(
+            "tokenizer.ggml.tokens".to_string(),
+            GgufValue::Array(
+                tokens
+                    .iter()
+                    .map(|t| GgufValue::String((*t).to_string()))
+                    .collect(),
+            ),
+        );
+        for (k, v) in kv {
+            m.insert((*k).to_string(), GgufValue::U32(*v as u32));
+        }
+        MetaOnly(m)
+    }
+
+    /// The failure this exists to stop: a Llama-3 chat checkpoint whose
+    /// `eos_token_id` is `<|end_of_text|>` while turns actually end with
+    /// `<|eot_id|>`. Stopping only on the metadata id runs the model past
+    /// its own turn and it starts interviewing itself.
+    #[test]
+    fn turn_enders_count_even_when_they_are_not_the_metadata_eos() {
+        let src = source(
+            &["hello", "<|end_of_text|>", "<|eot_id|>", "world"],
+            &[("tokenizer.ggml.eos_token_id", 1)],
+        );
+        let eog = eog_token_ids(&src);
+        assert!(eog.contains(&1), "metadata eos");
+        assert!(eog.contains(&2), "<|eot_id|> ends the turn");
+        assert!(
+            !eog.contains(&0) && !eog.contains(&3),
+            "ordinary tokens are not EOG"
+        );
+    }
+
+    /// gemma-4 ends on `<turn|>`; both it and `<eos>` are in llama.cpp's
+    /// list, so a gemma checkpoint must stop on either.
+    #[test]
+    fn gemma_style_turn_and_eos_are_both_end_of_generation() {
+        let src = source(&["<eos>", "<turn|>", "x"], &[]);
+        let eog = eog_token_ids(&src);
+        assert!(eog.contains(&0) && eog.contains(&1));
+        assert!(!eog.contains(&2));
+    }
+
+    /// `eot`/`eom` ids are folded in even when the vocabulary spells them
+    /// something llama.cpp's literal list does not know.
+    #[test]
+    fn eot_and_eom_metadata_ids_are_included() {
+        let src = source(
+            &["a", "b", "c"],
+            &[
+                ("tokenizer.ggml.eot_token_id", 1),
+                ("tokenizer.ggml.eom_token_id", 2),
+            ],
+        );
+        let eog = eog_token_ids(&src);
+        assert!(eog.contains(&1) && eog.contains(&2));
+    }
+
+    /// A file with neither the ids nor any known name yields an empty
+    /// set, so callers keep their previous `eos_id`-only behaviour rather
+    /// than stopping on something arbitrary.
+    #[test]
+    fn a_file_with_nothing_to_go_on_yields_no_stop_tokens() {
+        let src = source(&["a", "b"], &[]);
+        assert!(eog_token_ids(&src).is_empty());
     }
 }

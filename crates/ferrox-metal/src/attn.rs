@@ -108,6 +108,19 @@ pub fn metal_moe_resident_enabled() -> bool {
     })
 }
 
+/// Run MoE layers inside the fused prefill stack (GPU router + top-k +
+/// `mul_mm_id`) instead of host routing plus a per-layer command buffer.
+/// `FERROX_METAL_MOE_STACK=0` restores the host-routed path for A/B.
+pub fn metal_moe_stack_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !matches!(
+            std::env::var("FERROX_METAL_MOE_STACK").ok().as_deref(),
+            Some("0") | Some("false") | Some("off")
+        )
+    })
+}
+
 /// Fold final RMSNorm + lm_head into the Metal dense stack (return vocab
 /// logits). Default **off** — host lm_head after hidden download recovered
 /// ~20 predicted tok/s vs ~10 with logits-in-stack on Llama-3.1-8B Q4_K_M.
@@ -2990,15 +3003,17 @@ impl MetalGraph {
             "silu_mul_f32"
         });
 
-        for launch in [
+        let mut launches = vec![
             &params.layer.q,
             &params.layer.k,
             &params.layer.v,
             &params.layer.o,
-            &params.layer.gate,
-            &params.layer.up,
-            &params.layer.down,
-        ] {
+        ];
+        // MoE layers take `mul_mm_id`, which compiles on first encode.
+        if let Some((gate, up, down)) = params.layer.ffn.dense() {
+            launches.extend([gate, up, down]);
+        }
+        for launch in launches {
             warm_mul_mm_sg_pipeline(device, launch.fn_name)?;
             mark(launch.fn_name);
             let f16_static: &'static str = match launch.fn_name {
@@ -6833,9 +6848,9 @@ pub struct PrefillDenseLayerMetal<'a> {
     pub k: MulMmSgLaunch<'a>,
     pub v: MulMmSgLaunch<'a>,
     pub o: MulMmSgLaunch<'a>,
-    pub gate: MulMmSgLaunch<'a>,
-    pub up: MulMmSgLaunch<'a>,
-    pub down: MulMmSgLaunch<'a>,
+    /// Dense SwiGLU/GeGLU FFN, or a routed-expert MoE FFN. The attention
+    /// half of the layer is identical either way.
+    pub ffn: PrefillFfnMetal<'a>,
     pub post_attn_norm: Option<&'a [f32]>,
     pub post_ffn_norm: Option<&'a [f32]>,
     /// QKV bias / QK-norm (Qwen2.5, Qwen3, Gemma-3). Applied after GEMM,
@@ -6843,6 +6858,42 @@ pub struct PrefillDenseLayerMetal<'a> {
     pub extras: AttnExtras<'a>,
     /// Layer index for [`PrefillCbCache`] keying only.
     pub layer_idx: u32,
+}
+
+/// FFN half of a fused-prefill-stack layer.
+pub enum PrefillFfnMetal<'a> {
+    Dense {
+        gate: MulMmSgLaunch<'a>,
+        up: MulMmSgLaunch<'a>,
+        down: MulMmSgLaunch<'a>,
+    },
+    /// Routed experts through `mul_mm_id` with the router and top-k run
+    /// on the GPU, so the layer still adds no command buffer of its own.
+    Moe(crate::gpu::PrefillMoeMetal<'a>),
+}
+
+impl<'a> PrefillFfnMetal<'a> {
+    /// Intermediate FFN width (dense rows, or one expert's rows).
+    fn ffn_rows(&self) -> usize {
+        match self {
+            Self::Dense { gate, .. } => gate.rows,
+            Self::Moe(moe) => moe.packed.ffn_rows,
+        }
+    }
+
+    fn hidden_out_rows(&self) -> usize {
+        match self {
+            Self::Dense { down, .. } => down.rows,
+            Self::Moe(moe) => moe.packed.hidden_rows,
+        }
+    }
+
+    fn dense(&self) -> Option<(&MulMmSgLaunch<'a>, &MulMmSgLaunch<'a>, &MulMmSgLaunch<'a>)> {
+        match self {
+            Self::Dense { gate, up, down } => Some((gate, up, down)),
+            Self::Moe(_) => None,
+        }
+    }
 }
 
 struct PrefillScratchView<'a> {
@@ -6868,12 +6919,22 @@ struct PrefillDenseLayerResident {
     k_w: std::sync::Arc<ResidentWeightBuffer>,
     v_w: std::sync::Arc<ResidentWeightBuffer>,
     o_w: std::sync::Arc<ResidentWeightBuffer>,
-    gate_w: std::sync::Arc<ResidentWeightBuffer>,
-    up_w: std::sync::Arc<ResidentWeightBuffer>,
-    down_w: std::sync::Arc<ResidentWeightBuffer>,
+    ffn_w: PrefillFfnResident,
     post_attn_w: Option<std::sync::Arc<ResidentF32Buffer>>,
     post_ffn_w: Option<std::sync::Arc<ResidentF32Buffer>>,
     extras: AttnExtrasResident,
+}
+
+enum PrefillFfnResident {
+    Dense {
+        gate_w: std::sync::Arc<ResidentWeightBuffer>,
+        up_w: std::sync::Arc<ResidentWeightBuffer>,
+        down_w: std::sync::Arc<ResidentWeightBuffer>,
+    },
+    Moe {
+        packed: crate::gpu::MoePackedResident,
+        router_w: std::sync::Arc<ResidentF32Buffer>,
+    },
 }
 
 fn resident_prefill_dense_layer(
@@ -6893,6 +6954,17 @@ fn resident_prefill_dense_layer(
     } else {
         None
     };
+    let ffn_w = match &layer.ffn {
+        PrefillFfnMetal::Dense { gate, up, down } => PrefillFfnResident::Dense {
+            gate_w: resident_weight_buffer(device, gate.weights)?,
+            up_w: resident_weight_buffer(device, up.weights)?,
+            down_w: resident_weight_buffer(device, down.weights)?,
+        },
+        PrefillFfnMetal::Moe(moe) => PrefillFfnResident::Moe {
+            packed: crate::gpu::moe_packed_resident(device, &moe.packed)?,
+            router_w: resident_f32_buffer(device, moe.router_w)?,
+        },
+    };
     Ok(PrefillDenseLayerResident {
         attn_nw: resident_f32_buffer(device, layer.attn_norm_w)?,
         ffn_nw: resident_f32_buffer(device, layer.ffn_norm_w)?,
@@ -6900,9 +6972,7 @@ fn resident_prefill_dense_layer(
         k_w: resident_weight_buffer(device, layer.k.weights)?,
         v_w: resident_weight_buffer(device, layer.v.weights)?,
         o_w: resident_weight_buffer(device, layer.o.weights)?,
-        gate_w: resident_weight_buffer(device, layer.gate.weights)?,
-        up_w: resident_weight_buffer(device, layer.up.weights)?,
-        down_w: resident_weight_buffer(device, layer.down.weights)?,
+        ffn_w,
         post_attn_w,
         post_ffn_w,
         extras: resident_attn_extras(device, &layer.extras)?,
@@ -7121,49 +7191,38 @@ fn encode_prefill_dense_layer(
         (batch * hidden_dim) as u32,
     )?;
     memory_barrier_buffers(encoder);
-    encode_mul_mm_sg_f16(
-        encoder,
-        device,
-        &layer.gate,
-        &resident.gate_w,
-        half_act,
-        gate_buf,
-        batch,
-    )?;
-    encode_mul_mm_sg_f16(
-        encoder,
-        device,
-        &layer.up,
-        &resident.up_w,
-        half_act,
-        up_buf,
-        batch,
-    )?;
-    memory_barrier_buffers(encoder);
-    let ffn_elems = (batch * layer.gate.rows) as u32;
-    if gelu_ffn {
-        encode_gelu_mul(encoder, device, gate_buf, up_buf, act_buf, ffn_elems)?;
-    } else {
-        encode_silu_mul(encoder, device, gate_buf, up_buf, act_buf, ffn_elems)?;
+    match (&layer.ffn, &resident.ffn_w) {
+        (
+            PrefillFfnMetal::Dense { gate, up, down },
+            PrefillFfnResident::Dense {
+                gate_w,
+                up_w,
+                down_w,
+            },
+        ) => {
+            encode_mul_mm_sg_f16(encoder, device, gate, gate_w, half_act, gate_buf, batch)?;
+            encode_mul_mm_sg_f16(encoder, device, up, up_w, half_act, up_buf, batch)?;
+            memory_barrier_buffers(encoder);
+            let ffn_elems = (batch * gate.rows) as u32;
+            if gelu_ffn {
+                encode_gelu_mul(encoder, device, gate_buf, up_buf, act_buf, ffn_elems)?;
+            } else {
+                encode_silu_mul(encoder, device, gate_buf, up_buf, act_buf, ffn_elems)?;
+            }
+            memory_barrier_buffers(encoder);
+            encode_f32_to_f16(encoder, device, act_buf, half_act, ffn_elems)?;
+            memory_barrier_buffers(encoder);
+            encode_mul_mm_sg_f16(encoder, device, down, down_w, half_act, down_buf, batch)?;
+        }
+        (PrefillFfnMetal::Moe(moe), PrefillFfnResident::Moe { packed, router_w }) => {
+            crate::gpu::encode_moe_prefill_ffn(
+                encoder, device, moe, packed, router_w, x2_buf, half_act, down_buf, batch,
+            )?;
+        }
+        // resident_prefill_dense_layer builds the resident half from the
+        // same enum, so the mixed arms are unreachable.
+        _ => return Err(MetalError::CommandFailed),
     }
-    memory_barrier_buffers(encoder);
-    encode_f32_to_f16(
-        encoder,
-        device,
-        act_buf,
-        half_act,
-        (batch * layer.gate.rows) as u32,
-    )?;
-    memory_barrier_buffers(encoder);
-    encode_mul_mm_sg_f16(
-        encoder,
-        device,
-        &layer.down,
-        &resident.down_w,
-        half_act,
-        down_buf,
-        batch,
-    )?;
     memory_barrier_buffers(encoder);
 
     if let Some(pw) = resident.post_ffn_w.as_ref() {
@@ -7233,8 +7292,15 @@ pub fn launch_prefill_dense_stack(
         assert_eq!(layer.k.rows, n_kv_heads * head_dim);
         assert_eq!(layer.v.rows, n_kv_heads * head_dim);
         assert_eq!(layer.o.rows, hidden_dim);
-        assert_eq!(layer.down.rows, hidden_dim);
-        assert_eq!(layer.gate.rows, layer.up.rows);
+        assert_eq!(layer.ffn.hidden_out_rows(), hidden_dim);
+        if let PrefillFfnMetal::Dense { gate, up, .. } = &layer.ffn {
+            assert_eq!(gate.rows, up.rows);
+        }
+        if let PrefillFfnMetal::Moe(moe) = &layer.ffn {
+            if !moe.is_supported() {
+                return Err(MetalError::CommandFailed);
+            }
+        }
         assert_eq!(start_pos, kv.seq_len);
         if kv.seq_len + batch > kv.capacity {
             return Err(MetalError::CommandFailed);
@@ -7248,7 +7314,7 @@ pub fn launch_prefill_dense_stack(
 
     let max_q = layers.iter().map(|l| l.q.rows).max().unwrap();
     let max_kv = layers.iter().map(|l| l.k.rows.max(l.v.rows)).max().unwrap();
-    let max_gate = layers.iter().map(|l| l.gate.rows).max().unwrap();
+    let max_gate = layers.iter().map(|l| l.ffn.ffn_rows()).max().unwrap();
 
     let timing = std::env::var_os("FERROX_METAL_MM_TIMING").is_some();
     let t_setup = std::time::Instant::now();
@@ -7317,7 +7383,7 @@ pub fn launch_prefill_dense_stack(
                 layer: layer.layer_idx,
                 batch: batch as u32,
                 hidden: hidden_dim as u32,
-                ffn: layer.gate.rows as u32,
+                ffn: layer.ffn.ffn_rows() as u32,
                 q_rows: layer.q.rows as u32,
             });
         }

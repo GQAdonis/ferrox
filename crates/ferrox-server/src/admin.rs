@@ -157,6 +157,12 @@ fn ggml_type_name(t: GgmlType) -> Option<&'static str> {
         GgmlType::IQ1S => "IQ1_S",
         GgmlType::IQ2XXS => "IQ2_XXS",
         GgmlType::IQ3XXS => "IQ3_XXS",
+        // Landed on main while this file was on a branch: the decode
+        // tiers from `coverage-iq-tiers-published`.
+        GgmlType::IQ2XS => "IQ2_XS",
+        GgmlType::IQ2S => "IQ2_S",
+        GgmlType::IQ3S => "IQ3_S",
+        GgmlType::IQ1M => "IQ1_M",
         GgmlType::MXFP4 => "MXFP4",
         // I32 is a routing table, not a weight format, and `Other` is
         // a tag this build does not recognize. Neither names the

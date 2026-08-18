@@ -220,6 +220,10 @@ fn quant_kind_for(dtype: GgmlType) -> Option<QuantKind> {
         GgmlType::Q8_1 => Some(QuantKind::Q8_1),
         GgmlType::IQ4NL => Some(QuantKind::IQ4NL),
         GgmlType::IQ4XS => Some(QuantKind::IQ4XS),
+        GgmlType::IQ2XS => Some(QuantKind::IQ2XS),
+        GgmlType::IQ2S => Some(QuantKind::IQ2S),
+        GgmlType::IQ3S => Some(QuantKind::IQ3S),
+        GgmlType::IQ1M => Some(QuantKind::IQ1M),
         _ => None,
     }
 }

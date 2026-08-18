@@ -112,6 +112,52 @@ not available yet).
 ./target/release/ferrox run-kimi /path/to/kimi --prompt "Hi" --max-new-tokens 32
 ```
 
+## Correctness (`verify`, `parity`)
+
+Two different questions, and only the second one involves llama.cpp.
+
+```bash
+# Do ferrox's own backends agree? (CPU reference vs Metal/CUDA)
+./target/release/ferrox verify -m models/tinyllama-1.1b-chat-v1.0.Q8_0.gguf \
+  --backend metal --prompt-tokens 64
+
+# Does ferrox agree with llama.cpp? (first-token distribution, CPU vs CPU)
+./target/release/ferrox parity -m models/tinyllama-1.1b-chat-v1.0.Q8_0.gguf \
+  --prompt-tokens 64
+```
+
+`verify` greedy-decodes the same prompt on two ferrox backends and diffs
+the token ids. It cannot catch a bug both backends share.
+
+`parity` compares the logit distribution at the last prompt position
+against llama.cpp's, feeding **the same token ids to both** so the
+tokenizer is not part of the experiment. It reports KL in both
+directions, total variation, max |delta p|, top-k overlap, and where
+llama's top-1 ranks for ferrox, then gives one of four verdicts:
+
+| Verdict | Meaning |
+|---|---|
+| `MATCH` | same distribution to within f32 accumulation-order noise |
+| `DRIFT` | same top-1, distributions moved further than reordering explains |
+| `TIE-FLIP` | top-1 differs, but llama's own top-2 margin is under the observed noise — a tie swapped, not a wrong graph |
+| `WRONG` | the graphs disagree; exits non-zero |
+
+Greedy *text* is deliberately not the medium: a chain of argmaxes turns
+one last-bit difference into a different sentence, so a text diff cannot
+tell `TIE-FLIP` from `WRONG`.
+
+`parity` needs the reference dumper built once. It is C, not Rust, and
+lives outside the cargo workspace on purpose — it exists to be
+llama.cpp's own answer, so it links llama.cpp's own library:
+
+```bash
+./tools/build_llama_logits.sh          # -> target/llama_logits
+LLAMA_CPP_PREFIX=/path/to/llama.cpp ./tools/build_llama_logits.sh
+```
+
+Point `--dumper` or `FERROX_LLAMA_LOGITS` at it if you build it
+elsewhere.
+
 ## Hugging Face Hub (`pull`)
 
 Download a GGUF via the [`hf` CLI](https://huggingface.co/docs/huggingface_hub/guides/cli) (install: `pip install huggingface_hub`):

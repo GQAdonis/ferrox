@@ -4,6 +4,7 @@
 mod bench_model;
 mod bench_suite;
 mod chat;
+mod parity;
 mod pull;
 mod run;
 mod verify;
@@ -136,6 +137,33 @@ enum Commands {
         /// are comparable across models.
         #[arg(short = 'p', long)]
         prompt: Option<String>,
+    },
+    /// Check that ferrox agrees with llama.cpp on the first-token
+    /// distribution.
+    ///
+    /// `verify` compares ferrox-CPU against ferrox-Metal, so both can be
+    /// wrong together. This feeds the same token ids to llama.cpp's own
+    /// library and compares the logit distributions — not greedy text,
+    /// which cannot separate a wrong graph from two near-tied logits
+    /// swapping.
+    Parity {
+        /// GGUF to check.
+        #[arg(short = 'm', long)]
+        model: String,
+        /// Prompt to compare on. Defaults to a fixed short one so runs
+        /// are comparable across models and sessions.
+        #[arg(short = 'p', long)]
+        prompt: Option<String>,
+        /// Stretch the prompt to this many tokens before prefill, so the
+        /// batched-prefill kernels are actually reached.
+        #[arg(long)]
+        prompt_tokens: Option<usize>,
+        /// How many top tokens to intersect between the two engines.
+        #[arg(long, default_value_t = 10)]
+        top_k: usize,
+        /// Compiled reference dumper (see .local-scripts/llama_logits.c).
+        #[arg(long)]
+        dumper: Option<String>,
     },
     Bench {
         /// Real GGUF to benchmark. With this set, `bench` becomes a
@@ -313,6 +341,7 @@ fn rewrite_llama_style_argv(args: Vec<String>) -> Vec<String> {
         "run-real",
         "bench",
         "verify",
+        "parity",
         "speculative",
         "run-kimi",
         "help",
@@ -575,6 +604,21 @@ fn main() -> anyhow::Result<()> {
                 emit,
                 prompt_tokens,
                 prompt,
+            });
+        }
+        Commands::Parity {
+            model,
+            prompt,
+            prompt_tokens,
+            top_k,
+            dumper,
+        } => {
+            return parity::run(parity::ParityArgs {
+                model,
+                prompt,
+                prompt_tokens,
+                top_k,
+                dumper,
             });
         }
         Commands::Bench {

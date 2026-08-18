@@ -221,7 +221,16 @@ button.primary {
   color: var(--accent-fg);
   font-weight: 600;
 }
-button.primary:hover:not(:disabled) { filter: brightness(1.08); }
+/* The generic hover rule above is `button:hover:not(:disabled)` --
+   two pseudo-classes, so it outranks the plain `button.primary` and
+   would repaint an accent button with the sunken background while its
+   text stayed `--accent-fg`. White on near-white: the label of the
+   focused Send button simply disappeared under the cursor. Restating
+   the background here at equal-or-higher specificity is the fix. */
+button.primary:hover:not(:disabled) {
+  background: var(--accent);
+  filter: brightness(1.08);
+}
 button.danger { color: var(--err); }
 button.small { padding: 0.2rem 0.5rem; font-size: 0.8rem; }
 

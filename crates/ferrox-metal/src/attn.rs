@@ -53,13 +53,13 @@ use crate::elem::{
 };
 use crate::embd::{encode_get_rows, EmbdKind};
 use crate::gpu::{
-    compute_encoder_concurrent, encode_matvec, encode_matvec_with_offsets, encode_moe_topk_softmax,
-    encode_mul_mm_sg_f16, encode_q4_0_moe_gate_then_up_silu, encode_q4_0_moe_gate_up_id,
-    encode_q4_0_moe_gate_up_silu_fused, encode_q4_0_moe_id, encode_q4_0_moe_id_ex,
-    encode_q4_0_moe_topk, encode_q4_0_mul_mm, ensure_pipeline, memory_barrier_buffers,
-    memory_barrier_resources, resident_f32_buffer, resident_weight_buffer, shared_metal,
-    warm_mul_mm_sg_pipeline, MatvecLaunch, MetalError, MoeExpertLaunch, MoePackedQ4, MulMmSgLaunch,
-    ResidentF32Buffer, ResidentWeightBuffer,
+    compute_encoder_concurrent, encode_matvec, encode_matvec_with_offsets,
+    encode_moe_topk_softmax_batch, encode_mul_mm_sg_f16, encode_q4_0_moe_gate_then_up_silu,
+    encode_q4_0_moe_gate_up_id, encode_q4_0_moe_gate_up_silu_fused, encode_q4_0_moe_id,
+    encode_q4_0_moe_id_ex, encode_q4_0_moe_topk, encode_q4_0_mul_mm, ensure_pipeline,
+    memory_barrier_buffers, memory_barrier_resources, resident_f32_buffer, resident_weight_buffer,
+    shared_metal, warm_mul_mm_sg_pipeline, MatvecLaunch, MetalError, MoeExpertLaunch, MoePackedQ4,
+    MulMmSgLaunch, ResidentF32Buffer, ResidentWeightBuffer,
 };
 use crate::moe_ranges::MoeMemRanges;
 use objc2::rc::Retained;
@@ -5649,7 +5649,12 @@ fn encode_moe_layer_fused(
         let srcs = [scratch.router.as_ref()];
         let dsts = [scratch.ids.as_ref(), scratch.route.as_ref()];
         mrs.begin_op(encoder, &srcs, &dsts);
-        encode_moe_topk_softmax(
+        // One token, but the *batch* kernel: it spreads the softmax and
+        // each of the k selection passes over a simdgroup and keeps `probs`
+        // in threadgroup memory. Its single-token twin ran the whole thing
+        // on lane 0 out of a private `float[256]` and cost ~1.3-2.2 ms/tok
+        // across 16 layers (see the plan's MoE decode diagnosis).
+        encode_moe_topk_softmax_batch(
             encoder,
             device,
             &scratch.router,
@@ -5658,6 +5663,7 @@ fn encode_moe_layer_fused(
             layer.router.rows as u32,
             top_k as u32,
             norm_topk_prob,
+            1,
         )?;
         mrs.end_op(&srcs, &dsts);
     }

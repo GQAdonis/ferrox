@@ -122,18 +122,28 @@ unsafe fn dot_f32_avx2(a: &[f32], b: &[f32]) -> f32 {
         acc = _mm256_fmadd_ps(va, vb, acc);
         i += 8;
     }
-    // horizontal sum of the 8 lanes
-    let lo = _mm256_castps256_ps128(acc);
-    let hi = _mm256_extractf128_ps(acc, 1);
-    let mut s128 = _mm_add_ps(lo, hi);
-    s128 = _mm_add_ps(s128, _mm_movehl_ps(s128, s128));
-    s128 = _mm_add_ss(s128, _mm_shuffle_ps(s128, s128, 0x55));
-    let mut sum = _mm_cvtss_f32(s128);
+    let mut sum = hsum256_ps(acc);
     while i < n {
         sum += a[i] * b[i];
         i += 1;
     }
     sum
+}
+
+/// Horizontal sum of an AVX2 f32 vector. Factored out of
+/// [`dot_f32_avx2`] so [`qk_tile_avx2`] can close its register tile with
+/// the *same* reduction, which is what keeps the tiled scores
+/// bit-identical to the row-at-a-time ones.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn hsum256_ps(acc: std::arch::x86_64::__m256) -> f32 {
+    use std::arch::x86_64::*;
+    let lo = _mm256_castps256_ps128(acc);
+    let hi = _mm256_extractf128_ps(acc, 1);
+    let mut s128 = _mm_add_ps(lo, hi);
+    s128 = _mm_add_ps(s128, _mm_movehl_ps(s128, s128));
+    s128 = _mm_add_ss(s128, _mm_shuffle_ps(s128, s128, 0x55));
+    _mm_cvtss_f32(s128)
 }
 
 /// Online (flash-style) softmax·V accumulate for one head: one pass over
@@ -788,12 +798,11 @@ pub fn causal_gqa_attention_prefill_shared_kv_windowed(
     let scale = 1.0 / (head_dim as f32).sqrt();
     let mut out = vec![0f32; n_q * q_stride];
 
-    // Blocked three-pass attention (llama.cpp's CPU shape: Q·Kᵀ as a real
-    // score pass, one vectorized softmax over the whole row, then V·P) in
-    // place of the online accumulator, which paid two scalar `exp`s and a
-    // full-width `out` rescale per KV position. Tasks own a block of
+    // Blocked three-pass attention in llama.cpp's CPU shape: `KQ` as one
+    // real `ggml_mul_mat`, one vectorized softmax over each score row,
+    // then `KQV` as a second `ggml_mul_mat`. Tasks own a block of
     // queries for one head, so the K/V rows they stream stay hot across
-    // the block; the raw pointer only bridges Send/Sync — tasks write
+    // the block; the raw pointer only bridges Send/Sync -- tasks write
     // disjoint `(query, head)` slices.
     struct OutPtr(*mut f32);
     unsafe impl Send for OutPtr {}
@@ -805,6 +814,19 @@ pub fn causal_gqa_attention_prefill_shared_kv_windowed(
             std::ptr::copy_nonoverlapping(src.as_ptr(), self.0.add(off), src.len());
         }
     }
+
+    /// Per-worker scratch, reused across every task a Rayon worker
+    /// runs: a packed Q tile, the `[Q_BLOCK, span]` score tile and the
+    /// `[Q_BLOCK, head_dim]` output accumulator. Allocating these per
+    /// task cost a malloc/free pair and a memset per `(query-block,
+    /// head)`, of which a `pp512` layer has `n_q/8 * n_heads`.
+    #[derive(Default)]
+    struct Scratch {
+        q_tile: Vec<f32>,
+        scores: Vec<f32>,
+        acc: Vec<f32>,
+    }
+
     const Q_BLOCK: usize = 8;
     let n_blocks = n_q.div_ceil(Q_BLOCK);
     let out_w = OutPtr(out.as_mut_ptr());
@@ -813,7 +835,12 @@ pub fn causal_gqa_attention_prefill_shared_kv_windowed(
     (0..n_blocks * n_heads)
         .into_par_iter()
         .with_min_len(1)
-        .for_each(|task| {
+        .for_each_init(Scratch::default, |scratch, task| {
+            let Scratch {
+                q_tile,
+                scores,
+                acc,
+            } = scratch;
             let blk = task / n_heads;
             let h = task % n_heads;
             let kv_h = h / group_size.max(1);
@@ -830,48 +857,35 @@ pub fn causal_gqa_attention_prefill_shared_kv_windowed(
                 None => 0,
             };
             let span = t_hi - t_lo;
+            let kv_off = t_lo * kv_stride + kv_h * head_dim;
 
-            // Score tile `[Q_BLOCK, span]` and accumulator tile
-            // `[Q_BLOCK, head_dim]`, both held for the whole block so K
-            // and V rows are streamed **once** per block instead of once
-            // per query. At Q_BLOCK = 8 that is an 8× cut in K/V traffic
-            // for passes 1 and 3, which is where this kernel lives: on
-            // SmolLM2-135M CPU pp512 its inner closure was 53% of
-            // non-idle samples against ~8% of the model's FLOPs, because
-            // every query re-streamed the same `seq_len × head_dim` K
-            // slab out of L2.
-            let mut scores = vec![0f32; n_b * span];
-            let mut acc = vec![0f32; n_b * head_dim];
-
-            // Pass 1: Q·Kᵀ with the KV position **outer**, so one K row
-            // load feeds every query in the block that can see it. The
-            // per-(query, position) dot itself is unchanged, so this is
-            // bit-identical to the query-outer order.
-            for t in t_lo..t_hi {
-                // Queries that can see `t`: causal gives `b >= t -
-                // kv_prefix`, the window gives `b < t + w - kv_prefix`.
-                let lo = b_start.max(t.saturating_sub(kv_prefix));
-                let hi = match window {
-                    Some(w) => b_end.min((t + w).saturating_sub(kv_prefix)),
-                    None => b_end,
-                };
-                if lo >= hi {
-                    continue;
-                }
-                let base = (t * n_kv_heads + kv_h) * head_dim;
-                let k_t = &k_cache[base..base + head_dim];
-                for b in lo..hi {
-                    let q_h = &q[b * q_stride + h * head_dim..][..head_dim];
-                    let mut v = dot_f32(q_h, k_t) * scale;
-                    if let Some(sc) = softcap {
-                        v = sc * (v / sc).tanh();
-                    }
-                    scores[(b - b_start) * span + (t - t_lo)] = v;
-                }
+            // Pack the block's Q rows for this head contiguously. The
+            // GEMM then reads them with `lda = head_dim` instead of
+            // `n_heads * head_dim`, which for a 32-head model is the
+            // difference between one tile living in L1 and touching 32
+            // cache lines per step.
+            q_tile.clear();
+            for b in b_start..b_end {
+                q_tile.extend_from_slice(&q[b * q_stride + h * head_dim..][..head_dim]);
             }
 
-            // Pass 2: max-subtract softmax per query row, over exactly
-            // that query's visible range.
+            // Pass 1: `scores[n_b, span] = scale * Q_tile * Kᵀ` as a
+            // register-tiled GEMM, computed over the **full** rectangle
+            // with no mask. Pass 2 zeroes every entry outside a query's
+            // visible range before pass 3 reads it, so the masked-out
+            // corners are dead values, never wrong ones: at most
+            // `Q_BLOCK-1` extra columns per row (0.7% of a 512-wide
+            // span) bought in exchange for a dense inner loop.
+            scores.resize(n_b * span, 0.0);
+            qk_tile(
+                q_tile, n_b, head_dim, k_cache, kv_off, kv_stride, span, scale, scores,
+            );
+
+            // Pass 2: softcap, then max-subtract softmax, over exactly
+            // each query's visible range -- and an explicit zero
+            // everywhere else, which is what turns pass 3 into a dense
+            // GEMM (llama.cpp reaches the same state by adding a `-INF`
+            // mask row before `ggml_soft_max_ext`).
             let mut norms = [0f32; Q_BLOCK];
             for b in b_start..b_end {
                 let causal_len = kv_prefix + b + 1;
@@ -881,36 +895,33 @@ pub fn causal_gqa_attention_prefill_shared_kv_windowed(
                     Some(w) => causal_len.saturating_sub(w),
                     None => 0,
                 };
-                let row = &mut scores[(b - b_start) * span..][t_start - t_lo..causal_len - t_lo];
-                let m = row.iter().fold(f32::NEG_INFINITY, |a, &s| a.max(s));
+                let row = &mut scores[(b - b_start) * span..][..span];
+                let lo = t_start - t_lo;
+                let hi = causal_len - t_lo;
+                row[..lo].fill(0.0);
+                row[hi..].fill(0.0);
+                let live = &mut row[lo..hi];
+                if let Some(sc) = softcap {
+                    for s in live.iter_mut() {
+                        *s = sc * (*s / sc).tanh();
+                    }
+                }
+                let m = live.iter().fold(f32::NEG_INFINITY, |a, &s| a.max(s));
                 let mut l = 0f32;
-                for s in row.iter_mut() {
+                for s in live.iter_mut() {
                     *s = (*s - m).exp();
                     l += *s;
                 }
                 norms[b - b_start] = l;
             }
 
-            // Pass 3: V·P, again position-outer — one V row load per
-            // block, accumulating into the L1-resident `acc` tile. Each
-            // query's accumulation still walks `t` ascending, so this is
-            // bit-identical to the query-outer order too.
-            for t in t_lo..t_hi {
-                let lo = b_start.max(t.saturating_sub(kv_prefix));
-                let hi = match window {
-                    Some(w) => b_end.min((t + w).saturating_sub(kv_prefix)),
-                    None => b_end,
-                };
-                if lo >= hi {
-                    continue;
-                }
-                let base = (t * n_kv_heads + kv_h) * head_dim;
-                let v_t = &v_cache[base..base + head_dim];
-                for b in lo..hi {
-                    let p = scores[(b - b_start) * span + (t - t_lo)];
-                    axpy(&mut acc[(b - b_start) * head_dim..][..head_dim], v_t, p);
-                }
-            }
+            // Pass 3: `acc[n_b, head_dim] += P * V`, the second GEMM.
+            // Zero probabilities contribute `fma(v, 0, acc) == acc`
+            // exactly, so dropping the mask here is bit-identical to
+            // skipping those positions.
+            acc.resize(n_b * head_dim, 0.0);
+            acc.fill(0.0);
+            pv_tile(scores, n_b, span, v_cache, kv_off, kv_stride, head_dim, acc);
 
             for b in b_start..b_end {
                 let out_h = &mut acc[(b - b_start) * head_dim..][..head_dim];
@@ -925,6 +936,632 @@ pub fn causal_gqa_attention_prefill_shared_kv_windowed(
         });
 
     out
+}
+
+/// `scores[b][t] = scale · Σ_d q_tile[b][d]·k[t][d]` for one query block
+/// against one head's K rows: the `KQ` matmul that llama.cpp expresses as
+/// a plain `ggml_mul_mat` and dispatches into tinyBLAS.
+///
+/// `q_tile` is packed contiguous `[n_b, head_dim]`; K row `t` lives at
+/// `k[k_off + t*k_stride ..][..head_dim]`, so the caller's
+/// `[pos, kv_head, dim]` cache needs no repack.
+///
+/// The port is of tinyBLAS's `gemm_bloc_<RM>x<RN>`
+/// (`ggml/src/ggml-cpu/llamafile/sgemm.cpp`): hold an `RM × RN` register
+/// tile of vector accumulators, load `RM` A-vectors and `RN` B-vectors per
+/// step along `k`, and horizontally sum once at the end. What it replaces
+/// was a `dot_f32` per `(query, KV position)`, i.e. a whole K row re-read
+/// per query -- two loads for every FMA. The 4×4 NEON tile issues eight
+/// loads for sixteen FMAs, and each K row is read once per query block
+/// rather than once per query.
+///
+/// The reduction order is deliberately the same as [`dot_f32`]'s on each
+/// backend (4-wide + `vaddvq` under NEON, 8-wide + the same horizontal sum
+/// under AVX2, scalar tail after the horizontal sum), so this is
+/// bit-identical to the row-at-a-time loop rather than merely close.
+// Kept out of line: one call per `(query-block, head)` costs nothing
+// against a 512x64x64 tile of FMAs, and it keeps this kernel a named
+// symbol in a `sample` profile instead of vanishing into the Rayon
+// closure -- which is how its cost was found in the first place.
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn qk_tile(
+    q_tile: &[f32],
+    n_b: usize,
+    head_dim: usize,
+    k: &[f32],
+    k_off: usize,
+    k_stride: usize,
+    span: usize,
+    scale: f32,
+    scores: &mut [f32],
+) {
+    debug_assert_eq!(q_tile.len(), n_b * head_dim);
+    debug_assert_eq!(scores.len(), n_b * span);
+    #[cfg(target_arch = "aarch64")]
+    {
+        if std::arch::is_aarch64_feature_detected!("neon") {
+            unsafe {
+                qk_tile_neon(
+                    q_tile, n_b, head_dim, k, k_off, k_stride, span, scale, scores,
+                )
+            };
+            return;
+        }
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {
+            unsafe {
+                qk_tile_avx2(
+                    q_tile, n_b, head_dim, k, k_off, k_stride, span, scale, scores,
+                )
+            };
+            return;
+        }
+    }
+    qk_rows(
+        q_tile,
+        head_dim,
+        k,
+        k_off,
+        k_stride,
+        span,
+        scale,
+        scores,
+        0..n_b,
+        0..span,
+    );
+}
+
+/// Row-at-a-time `Q·Kᵀ` over a sub-rectangle of the score tile: the
+/// edges the register tile does not cover, and the whole tile on hosts
+/// with neither NEON nor AVX2.
+#[allow(clippy::too_many_arguments)]
+fn qk_rows(
+    q_tile: &[f32],
+    head_dim: usize,
+    k: &[f32],
+    k_off: usize,
+    k_stride: usize,
+    span: usize,
+    scale: f32,
+    scores: &mut [f32],
+    rows: std::ops::Range<usize>,
+    cols: std::ops::Range<usize>,
+) {
+    for b in rows {
+        let q_b = &q_tile[b * head_dim..][..head_dim];
+        for t in cols.clone() {
+            let k_t = &k[k_off + t * k_stride..][..head_dim];
+            scores[b * span + t] = dot_f32(q_b, k_t) * scale;
+        }
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn qk_tile_neon(
+    q_tile: &[f32],
+    n_b: usize,
+    head_dim: usize,
+    k: &[f32],
+    k_off: usize,
+    k_stride: usize,
+    span: usize,
+    scale: f32,
+    scores: &mut [f32],
+) {
+    use std::arch::aarch64::*;
+    let qp = q_tile.as_ptr();
+    let kp = k.as_ptr().add(k_off);
+    let sp = scores.as_mut_ptr();
+    // Rows/columns the 4×4 tile covers, and the 4-wide part of `head_dim`
+    // -- the same boundary `dot_f32_neon` uses, which is what keeps the
+    // scalar leftovers bit-identical.
+    let bt = n_b & !3;
+    let tt = span & !3;
+    let dv = head_dim & !3;
+
+    // KV position outer, query block inner: the four K rows of a tile are
+    // loaded once and reused by every query tile, so one pass over this
+    // head's K slab serves the whole query block.
+    let mut t0 = 0;
+    while t0 < tt {
+        let k0 = kp.add(t0 * k_stride);
+        let k1 = k0.add(k_stride);
+        let k2 = k1.add(k_stride);
+        let k3 = k2.add(k_stride);
+        let mut b0 = 0;
+        while b0 < bt {
+            let a0 = qp.add(b0 * head_dim);
+            let a1 = a0.add(head_dim);
+            let a2 = a1.add(head_dim);
+            let a3 = a2.add(head_dim);
+            let z = vdupq_n_f32(0.0);
+            // `cIJ` accumulates query `b0+I` against key `t0+J`.
+            let (mut c00, mut c01, mut c02, mut c03) = (z, z, z, z);
+            let (mut c10, mut c11, mut c12, mut c13) = (z, z, z, z);
+            let (mut c20, mut c21, mut c22, mut c23) = (z, z, z, z);
+            let (mut c30, mut c31, mut c32, mut c33) = (z, z, z, z);
+            let mut d = 0;
+            while d < dv {
+                let av0 = vld1q_f32(a0.add(d));
+                let av1 = vld1q_f32(a1.add(d));
+                let av2 = vld1q_f32(a2.add(d));
+                let av3 = vld1q_f32(a3.add(d));
+                let kv0 = vld1q_f32(k0.add(d));
+                c00 = vfmaq_f32(c00, av0, kv0);
+                c10 = vfmaq_f32(c10, av1, kv0);
+                c20 = vfmaq_f32(c20, av2, kv0);
+                c30 = vfmaq_f32(c30, av3, kv0);
+                let kv1 = vld1q_f32(k1.add(d));
+                c01 = vfmaq_f32(c01, av0, kv1);
+                c11 = vfmaq_f32(c11, av1, kv1);
+                c21 = vfmaq_f32(c21, av2, kv1);
+                c31 = vfmaq_f32(c31, av3, kv1);
+                let kv2 = vld1q_f32(k2.add(d));
+                c02 = vfmaq_f32(c02, av0, kv2);
+                c12 = vfmaq_f32(c12, av1, kv2);
+                c22 = vfmaq_f32(c22, av2, kv2);
+                c32 = vfmaq_f32(c32, av3, kv2);
+                let kv3 = vld1q_f32(k3.add(d));
+                c03 = vfmaq_f32(c03, av0, kv3);
+                c13 = vfmaq_f32(c13, av1, kv3);
+                c23 = vfmaq_f32(c23, av2, kv3);
+                c33 = vfmaq_f32(c33, av3, kv3);
+                d += 4;
+            }
+            let mut r = [
+                [
+                    vaddvq_f32(c00),
+                    vaddvq_f32(c01),
+                    vaddvq_f32(c02),
+                    vaddvq_f32(c03),
+                ],
+                [
+                    vaddvq_f32(c10),
+                    vaddvq_f32(c11),
+                    vaddvq_f32(c12),
+                    vaddvq_f32(c13),
+                ],
+                [
+                    vaddvq_f32(c20),
+                    vaddvq_f32(c21),
+                    vaddvq_f32(c22),
+                    vaddvq_f32(c23),
+                ],
+                [
+                    vaddvq_f32(c30),
+                    vaddvq_f32(c31),
+                    vaddvq_f32(c32),
+                    vaddvq_f32(c33),
+                ],
+            ];
+            // Leftover dims after the horizontal sum, exactly where
+            // `dot_f32_neon` adds them.
+            let arow = [a0, a1, a2, a3];
+            let krow = [k0, k1, k2, k3];
+            for d in dv..head_dim {
+                for (i, ai) in arow.iter().enumerate() {
+                    let av = *ai.add(d);
+                    for (j, kj) in krow.iter().enumerate() {
+                        r[i][j] += av * *kj.add(d);
+                    }
+                }
+            }
+            for (i, ri) in r.iter().enumerate() {
+                for (j, v) in ri.iter().enumerate() {
+                    *sp.add((b0 + i) * span + t0 + j) = v * scale;
+                }
+            }
+            b0 += 4;
+        }
+        t0 += 4;
+    }
+    qk_rows(
+        q_tile,
+        head_dim,
+        k,
+        k_off,
+        k_stride,
+        span,
+        scale,
+        scores,
+        0..bt,
+        tt..span,
+    );
+    qk_rows(
+        q_tile,
+        head_dim,
+        k,
+        k_off,
+        k_stride,
+        span,
+        scale,
+        scores,
+        bt..n_b,
+        0..span,
+    );
+}
+
+/// AVX2 sibling of [`qk_tile_neon`]. The register file is half as wide
+/// (16 YMM), so the tile is 4 queries × 2 keys -- 8 accumulators plus 4
+/// A-vectors and a B-vector -- instead of 4×4.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn qk_tile_avx2(
+    q_tile: &[f32],
+    n_b: usize,
+    head_dim: usize,
+    k: &[f32],
+    k_off: usize,
+    k_stride: usize,
+    span: usize,
+    scale: f32,
+    scores: &mut [f32],
+) {
+    use std::arch::x86_64::*;
+    let qp = q_tile.as_ptr();
+    let kp = k.as_ptr().add(k_off);
+    let sp = scores.as_mut_ptr();
+    let bt = n_b & !3;
+    let tt = span & !1;
+    let dv = head_dim & !7;
+
+    let mut t0 = 0;
+    while t0 < tt {
+        let k0 = kp.add(t0 * k_stride);
+        let k1 = k0.add(k_stride);
+        let mut b0 = 0;
+        while b0 < bt {
+            let a0 = qp.add(b0 * head_dim);
+            let a1 = a0.add(head_dim);
+            let a2 = a1.add(head_dim);
+            let a3 = a2.add(head_dim);
+            let z = _mm256_setzero_ps();
+            let (mut c00, mut c01) = (z, z);
+            let (mut c10, mut c11) = (z, z);
+            let (mut c20, mut c21) = (z, z);
+            let (mut c30, mut c31) = (z, z);
+            let mut d = 0;
+            while d < dv {
+                let av0 = _mm256_loadu_ps(a0.add(d));
+                let av1 = _mm256_loadu_ps(a1.add(d));
+                let av2 = _mm256_loadu_ps(a2.add(d));
+                let av3 = _mm256_loadu_ps(a3.add(d));
+                let kv0 = _mm256_loadu_ps(k0.add(d));
+                c00 = _mm256_fmadd_ps(av0, kv0, c00);
+                c10 = _mm256_fmadd_ps(av1, kv0, c10);
+                c20 = _mm256_fmadd_ps(av2, kv0, c20);
+                c30 = _mm256_fmadd_ps(av3, kv0, c30);
+                let kv1 = _mm256_loadu_ps(k1.add(d));
+                c01 = _mm256_fmadd_ps(av0, kv1, c01);
+                c11 = _mm256_fmadd_ps(av1, kv1, c11);
+                c21 = _mm256_fmadd_ps(av2, kv1, c21);
+                c31 = _mm256_fmadd_ps(av3, kv1, c31);
+                d += 8;
+            }
+            let mut r = [
+                [hsum256_ps(c00), hsum256_ps(c01)],
+                [hsum256_ps(c10), hsum256_ps(c11)],
+                [hsum256_ps(c20), hsum256_ps(c21)],
+                [hsum256_ps(c30), hsum256_ps(c31)],
+            ];
+            let arow = [a0, a1, a2, a3];
+            let krow = [k0, k1];
+            for d in dv..head_dim {
+                for (i, ai) in arow.iter().enumerate() {
+                    let av = *ai.add(d);
+                    for (j, kj) in krow.iter().enumerate() {
+                        r[i][j] += av * *kj.add(d);
+                    }
+                }
+            }
+            for (i, ri) in r.iter().enumerate() {
+                for (j, v) in ri.iter().enumerate() {
+                    *sp.add((b0 + i) * span + t0 + j) = v * scale;
+                }
+            }
+            b0 += 4;
+        }
+        t0 += 2;
+    }
+    qk_rows(
+        q_tile,
+        head_dim,
+        k,
+        k_off,
+        k_stride,
+        span,
+        scale,
+        scores,
+        0..bt,
+        tt..span,
+    );
+    qk_rows(
+        q_tile,
+        head_dim,
+        k,
+        k_off,
+        k_stride,
+        span,
+        scale,
+        scores,
+        bt..n_b,
+        0..span,
+    );
+}
+
+/// `acc[b][d] += Σ_t p[b][t]·v[t][d]` for one query block against one
+/// head's V rows: the `KQV` matmul, the second of llama.cpp's two
+/// attention `ggml_mul_mat`s.
+///
+/// V row `t` lives at `v[v_off + t*v_stride ..][..head_dim]`. `p` is the
+/// `[n_b, span]` probability tile pass 2 produced, already zeroed outside
+/// each query's visible range, so no mask is needed here.
+///
+/// Register-tiled the other way round from [`qk_tile`]: the output tile
+/// (8 queries × 8 dims) lives in the accumulators and `t` is the
+/// reduction axis, so a V row is loaded once and feeds all eight
+/// queries. What it replaces was an `axpy` per `(KV position, query)`,
+/// which re-loaded and re-stored the whole `head_dim`-wide accumulator
+/// row for every position -- three L1 accesses per FMA against this
+/// version's ten loads per sixteen vector FMAs.
+///
+/// Accumulation order along `t` is unchanged (ascending, one `fma` per
+/// position), and the vector/scalar boundary matches [`axpy`]'s on each
+/// backend, so this is bit-identical to the row-at-a-time loop.
+// Out of line for the same reason as [`qk_tile`].
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn pv_tile(
+    p: &[f32],
+    n_b: usize,
+    span: usize,
+    v: &[f32],
+    v_off: usize,
+    v_stride: usize,
+    head_dim: usize,
+    acc: &mut [f32],
+) {
+    debug_assert_eq!(p.len(), n_b * span);
+    debug_assert_eq!(acc.len(), n_b * head_dim);
+    #[cfg(target_arch = "aarch64")]
+    {
+        if std::arch::is_aarch64_feature_detected!("neon") {
+            unsafe { pv_tile_neon(p, n_b, span, v, v_off, v_stride, head_dim, acc) };
+            return;
+        }
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {
+            unsafe { pv_tile_avx2(p, n_b, span, v, v_off, v_stride, head_dim, acc) };
+            return;
+        }
+    }
+    pv_rows(p, span, v, v_off, v_stride, head_dim, acc, 0..n_b);
+}
+
+/// Row-at-a-time `P·V` for the query rows the register tile does not
+/// cover, and for hosts with neither NEON nor AVX2. Zero probabilities
+/// are skipped rather than accumulated -- `acc + v*0` is exactly `acc`
+/// for finite `v`, so this is a pure work saving on the masked padding.
+#[allow(clippy::too_many_arguments)]
+fn pv_rows(
+    p: &[f32],
+    span: usize,
+    v: &[f32],
+    v_off: usize,
+    v_stride: usize,
+    head_dim: usize,
+    acc: &mut [f32],
+    rows: std::ops::Range<usize>,
+) {
+    for b in rows {
+        let out_b = &mut acc[b * head_dim..][..head_dim];
+        for t in 0..span {
+            let w = p[b * span + t];
+            if w == 0.0 {
+                continue;
+            }
+            axpy(out_b, &v[v_off + t * v_stride..][..head_dim], w);
+        }
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn pv_tile_neon(
+    p: &[f32],
+    n_b: usize,
+    span: usize,
+    v: &[f32],
+    v_off: usize,
+    v_stride: usize,
+    head_dim: usize,
+    acc: &mut [f32],
+) {
+    use std::arch::aarch64::*;
+    let vp = v.as_ptr().add(v_off);
+    let pp = p.as_ptr();
+    let ap = acc.as_mut_ptr();
+    let bt = n_b & !7;
+    let dv = head_dim & !7;
+    // `axpy_neon` vectorizes up to `head_dim & !3` and goes scalar after;
+    // matching both boundaries is what makes the leftovers bit-identical.
+    let dv4 = head_dim & !3;
+
+    let mut b0 = 0;
+    while b0 < bt {
+        let mut d0 = 0;
+        while d0 < dv {
+            let mut c0l = vld1q_f32(ap.add(b0 * head_dim + d0));
+            let mut c0h = vld1q_f32(ap.add(b0 * head_dim + d0 + 4));
+            let mut c1l = vld1q_f32(ap.add((b0 + 1) * head_dim + d0));
+            let mut c1h = vld1q_f32(ap.add((b0 + 1) * head_dim + d0 + 4));
+            let mut c2l = vld1q_f32(ap.add((b0 + 2) * head_dim + d0));
+            let mut c2h = vld1q_f32(ap.add((b0 + 2) * head_dim + d0 + 4));
+            let mut c3l = vld1q_f32(ap.add((b0 + 3) * head_dim + d0));
+            let mut c3h = vld1q_f32(ap.add((b0 + 3) * head_dim + d0 + 4));
+            let mut c4l = vld1q_f32(ap.add((b0 + 4) * head_dim + d0));
+            let mut c4h = vld1q_f32(ap.add((b0 + 4) * head_dim + d0 + 4));
+            let mut c5l = vld1q_f32(ap.add((b0 + 5) * head_dim + d0));
+            let mut c5h = vld1q_f32(ap.add((b0 + 5) * head_dim + d0 + 4));
+            let mut c6l = vld1q_f32(ap.add((b0 + 6) * head_dim + d0));
+            let mut c6h = vld1q_f32(ap.add((b0 + 6) * head_dim + d0 + 4));
+            let mut c7l = vld1q_f32(ap.add((b0 + 7) * head_dim + d0));
+            let mut c7h = vld1q_f32(ap.add((b0 + 7) * head_dim + d0 + 4));
+            for t in 0..span {
+                let vr = vp.add(t * v_stride + d0);
+                let v0 = vld1q_f32(vr);
+                let v1 = vld1q_f32(vr.add(4));
+                let s0 = vdupq_n_f32(*pp.add(b0 * span + t));
+                c0l = vfmaq_f32(c0l, v0, s0);
+                c0h = vfmaq_f32(c0h, v1, s0);
+                let s1 = vdupq_n_f32(*pp.add((b0 + 1) * span + t));
+                c1l = vfmaq_f32(c1l, v0, s1);
+                c1h = vfmaq_f32(c1h, v1, s1);
+                let s2 = vdupq_n_f32(*pp.add((b0 + 2) * span + t));
+                c2l = vfmaq_f32(c2l, v0, s2);
+                c2h = vfmaq_f32(c2h, v1, s2);
+                let s3 = vdupq_n_f32(*pp.add((b0 + 3) * span + t));
+                c3l = vfmaq_f32(c3l, v0, s3);
+                c3h = vfmaq_f32(c3h, v1, s3);
+                let s4 = vdupq_n_f32(*pp.add((b0 + 4) * span + t));
+                c4l = vfmaq_f32(c4l, v0, s4);
+                c4h = vfmaq_f32(c4h, v1, s4);
+                let s5 = vdupq_n_f32(*pp.add((b0 + 5) * span + t));
+                c5l = vfmaq_f32(c5l, v0, s5);
+                c5h = vfmaq_f32(c5h, v1, s5);
+                let s6 = vdupq_n_f32(*pp.add((b0 + 6) * span + t));
+                c6l = vfmaq_f32(c6l, v0, s6);
+                c6h = vfmaq_f32(c6h, v1, s6);
+                let s7 = vdupq_n_f32(*pp.add((b0 + 7) * span + t));
+                c7l = vfmaq_f32(c7l, v0, s7);
+                c7h = vfmaq_f32(c7h, v1, s7);
+            }
+            vst1q_f32(ap.add(b0 * head_dim + d0), c0l);
+            vst1q_f32(ap.add(b0 * head_dim + d0 + 4), c0h);
+            vst1q_f32(ap.add((b0 + 1) * head_dim + d0), c1l);
+            vst1q_f32(ap.add((b0 + 1) * head_dim + d0 + 4), c1h);
+            vst1q_f32(ap.add((b0 + 2) * head_dim + d0), c2l);
+            vst1q_f32(ap.add((b0 + 2) * head_dim + d0 + 4), c2h);
+            vst1q_f32(ap.add((b0 + 3) * head_dim + d0), c3l);
+            vst1q_f32(ap.add((b0 + 3) * head_dim + d0 + 4), c3h);
+            vst1q_f32(ap.add((b0 + 4) * head_dim + d0), c4l);
+            vst1q_f32(ap.add((b0 + 4) * head_dim + d0 + 4), c4h);
+            vst1q_f32(ap.add((b0 + 5) * head_dim + d0), c5l);
+            vst1q_f32(ap.add((b0 + 5) * head_dim + d0 + 4), c5h);
+            vst1q_f32(ap.add((b0 + 6) * head_dim + d0), c6l);
+            vst1q_f32(ap.add((b0 + 6) * head_dim + d0 + 4), c6h);
+            vst1q_f32(ap.add((b0 + 7) * head_dim + d0), c7l);
+            vst1q_f32(ap.add((b0 + 7) * head_dim + d0 + 4), c7h);
+            d0 += 8;
+        }
+        // Leftover dims, still `t`-ascending per `(query, dim)`: fused
+        // below `head_dim & !3` and plain below `head_dim`, which is
+        // where `axpy_neon`'s own vector/scalar split falls.
+        if dv < head_dim {
+            for t in 0..span {
+                for i in 0..8 {
+                    let w = *pp.add((b0 + i) * span + t);
+                    if w == 0.0 {
+                        continue;
+                    }
+                    let row = ap.add((b0 + i) * head_dim);
+                    for d in dv..dv4 {
+                        *row.add(d) = f32::mul_add(w, *vp.add(t * v_stride + d), *row.add(d));
+                    }
+                    for d in dv4..head_dim {
+                        *row.add(d) += w * *vp.add(t * v_stride + d);
+                    }
+                }
+            }
+        }
+        b0 += 8;
+    }
+    pv_rows(p, span, v, v_off, v_stride, head_dim, acc, bt..n_b);
+}
+
+/// AVX2 sibling of [`pv_tile_neon`]: same 8-query × 8-dim output tile,
+/// but one YMM accumulator per query instead of two NEON quads.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn pv_tile_avx2(
+    p: &[f32],
+    n_b: usize,
+    span: usize,
+    v: &[f32],
+    v_off: usize,
+    v_stride: usize,
+    head_dim: usize,
+    acc: &mut [f32],
+) {
+    use std::arch::x86_64::*;
+    let vp = v.as_ptr().add(v_off);
+    let pp = p.as_ptr();
+    let ap = acc.as_mut_ptr();
+    let bt = n_b & !7;
+    // `axpy_avx2` vectorizes up to `head_dim & !7`, so its scalar tail
+    // and this kernel's are the same elements.
+    let dv = head_dim & !7;
+
+    let mut b0 = 0;
+    while b0 < bt {
+        let mut d0 = 0;
+        while d0 < dv {
+            let mut c0 = _mm256_loadu_ps(ap.add(b0 * head_dim + d0));
+            let mut c1 = _mm256_loadu_ps(ap.add((b0 + 1) * head_dim + d0));
+            let mut c2 = _mm256_loadu_ps(ap.add((b0 + 2) * head_dim + d0));
+            let mut c3 = _mm256_loadu_ps(ap.add((b0 + 3) * head_dim + d0));
+            let mut c4 = _mm256_loadu_ps(ap.add((b0 + 4) * head_dim + d0));
+            let mut c5 = _mm256_loadu_ps(ap.add((b0 + 5) * head_dim + d0));
+            let mut c6 = _mm256_loadu_ps(ap.add((b0 + 6) * head_dim + d0));
+            let mut c7 = _mm256_loadu_ps(ap.add((b0 + 7) * head_dim + d0));
+            for t in 0..span {
+                let vv = _mm256_loadu_ps(vp.add(t * v_stride + d0));
+                c0 = _mm256_fmadd_ps(vv, _mm256_set1_ps(*pp.add(b0 * span + t)), c0);
+                c1 = _mm256_fmadd_ps(vv, _mm256_set1_ps(*pp.add((b0 + 1) * span + t)), c1);
+                c2 = _mm256_fmadd_ps(vv, _mm256_set1_ps(*pp.add((b0 + 2) * span + t)), c2);
+                c3 = _mm256_fmadd_ps(vv, _mm256_set1_ps(*pp.add((b0 + 3) * span + t)), c3);
+                c4 = _mm256_fmadd_ps(vv, _mm256_set1_ps(*pp.add((b0 + 4) * span + t)), c4);
+                c5 = _mm256_fmadd_ps(vv, _mm256_set1_ps(*pp.add((b0 + 5) * span + t)), c5);
+                c6 = _mm256_fmadd_ps(vv, _mm256_set1_ps(*pp.add((b0 + 6) * span + t)), c6);
+                c7 = _mm256_fmadd_ps(vv, _mm256_set1_ps(*pp.add((b0 + 7) * span + t)), c7);
+            }
+            _mm256_storeu_ps(ap.add(b0 * head_dim + d0), c0);
+            _mm256_storeu_ps(ap.add((b0 + 1) * head_dim + d0), c1);
+            _mm256_storeu_ps(ap.add((b0 + 2) * head_dim + d0), c2);
+            _mm256_storeu_ps(ap.add((b0 + 3) * head_dim + d0), c3);
+            _mm256_storeu_ps(ap.add((b0 + 4) * head_dim + d0), c4);
+            _mm256_storeu_ps(ap.add((b0 + 5) * head_dim + d0), c5);
+            _mm256_storeu_ps(ap.add((b0 + 6) * head_dim + d0), c6);
+            _mm256_storeu_ps(ap.add((b0 + 7) * head_dim + d0), c7);
+            d0 += 8;
+        }
+        if dv < head_dim {
+            for t in 0..span {
+                for i in 0..8 {
+                    let w = *pp.add((b0 + i) * span + t);
+                    if w == 0.0 {
+                        continue;
+                    }
+                    let row = ap.add((b0 + i) * head_dim);
+                    for d in dv..head_dim {
+                        *row.add(d) += w * *vp.add(t * v_stride + d);
+                    }
+                }
+            }
+        }
+        b0 += 8;
+    }
+    pv_rows(p, span, v, v_off, v_stride, head_dim, acc, bt..n_b);
 }
 
 /// Same math as `causal_gqa_attention`, but K/V positions are read
@@ -1406,6 +2043,65 @@ mod tests {
                     window,
                 );
                 assert_eq!(got, want, "window {window:?} softcap {softcap:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn tiled_prefill_gemm_is_bit_identical_across_awkward_shapes() {
+        // `qk_tile` works a 4-query × 4-key register tile and `pv_tile`
+        // an 8-query × 8-dim one, each with a row-at-a-time edge path
+        // for what the tile does not cover. Every one of those edges,
+        // and every `head_dim` width a real checkpoint uses, has to land
+        // on the *same* arithmetic as the row-at-a-time form — so this
+        // asserts bit equality against `prefill_query_outer_reference`,
+        // not a tolerance.
+        //
+        // Swept: head_dim 64 (Llama/SmolLM2/Qwen3), 80 (Phi-4-mini), 128
+        // (Qwen2.5/Mistral), 256 (Gemma-3); head counts that are not a
+        // multiple of the tile; `n_q` below, on and off both tile
+        // boundaries; GQA and MQA grouping; windows narrower than the
+        // prompt (so the visible span is narrower than a query block);
+        // and softcap on and off.
+        let shapes = [
+            (4usize, 4usize, 64usize),
+            (6, 2, 64),
+            (5, 1, 80),
+            (3, 3, 128),
+            (2, 1, 256),
+        ];
+        let batches = [(19usize, 5usize), (8, 0), (3, 7), (16, 1), (7, 0)];
+        for &(n_heads, n_kv_heads, head_dim) in &shapes {
+            let q_stride = n_heads * head_dim;
+            let kv_stride = n_kv_heads * head_dim;
+            for &(n_q, kv_prefix) in &batches {
+                let kv_len = kv_prefix + n_q;
+                let q: Vec<f32> = (0..n_q * q_stride)
+                    .map(|i| ((i as f32) * 0.013 - 0.7).sin() * 1.3)
+                    .collect();
+                let k_cache: Vec<f32> = (0..kv_len * kv_stride)
+                    .map(|i| ((i as f32) * 0.017 - 0.3).cos() * 1.1)
+                    .collect();
+                let v_cache: Vec<f32> = (0..kv_len * kv_stride)
+                    .map(|i| ((i as f32) * 0.011 + 0.2).sin() * 0.9)
+                    .collect();
+                for window in [None, Some(2), Some(5), Some(9), Some(kv_len + 3)] {
+                    for softcap in [None, Some(30.0)] {
+                        let got = super::causal_gqa_attention_prefill_shared_kv_windowed(
+                            &q, &k_cache, &v_cache, n_heads, n_kv_heads, head_dim, n_q, kv_prefix,
+                            softcap, window,
+                        );
+                        let want = prefill_query_outer_reference(
+                            &q, &k_cache, &v_cache, n_heads, n_kv_heads, head_dim, n_q, kv_prefix,
+                            softcap, window,
+                        );
+                        assert_eq!(
+                            got, want,
+                            "heads {n_heads}/{n_kv_heads} head_dim {head_dim} n_q {n_q} \
+                             kv_prefix {kv_prefix} window {window:?} softcap {softcap:?}"
+                        );
+                    }
+                }
             }
         }
     }

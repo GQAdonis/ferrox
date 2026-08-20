@@ -4,6 +4,13 @@
 and MoE checkpoints on CPU, Apple Metal, or CUDA, with a llama.cpp-style
 CLI and an OpenAI-compatible HTTP server.
 
+CPU and Metal are the measured backends — every speed claim is pinned
+against llama.cpp on the same host and GGUF, in
+[`benchmarks/RESULTS.md`](benchmarks/RESULTS.md). CUDA builds and runs
+but is held to "must compile": no pinned benchmark host, no published
+receipts. Treat a Windows or Linux install as CPU-only in practice
+([`docs/FEATURES.md`](docs/FEATURES.md)).
+
 ## Quick start
 
 ### Install
@@ -13,9 +20,31 @@ curl -fsSL https://raw.githubusercontent.com/antonellof/ferrox/main/scripts/inst
 ```
 
 Installs `ferrox` and `ferrox-server` into `~/.local/bin` (override with
-`FERROX_INSTALL_DIR`). Pins a release with `FERROX_VERSION=v0.3.0`.
+`FERROX_INSTALL_DIR`). Pins a release with `FERROX_VERSION=v0.8.0`.
 Prebuilts: macOS arm64 (Metal) and Linux x86_64 (CPU). CUDA / other
 hosts: build from source.
+
+### Install from crates.io
+
+```bash
+cargo install ferrox-cli      # the `ferrox` binary
+cargo install ferrox-server   # the OpenAI-compatible server
+```
+
+The library is published as
+[`ferrox-inference`](https://crates.io/crates/ferrox-inference) — the
+name `ferrox` belongs to an unrelated crate. It is a facade that
+re-exports the workspace, so a dependent writes one line:
+
+```toml
+[dependencies]
+ferrox-inference = "0.8"
+```
+
+It deliberately ships no binary: `ferrox-cli` already installs one
+called `ferrox`, and two crates writing the same path in
+`~/.cargo/bin` would fight over it. GPU features are opt-in
+(`metal`, `cuda`) because neither is safe to assume.
 
 ### Build from source
 

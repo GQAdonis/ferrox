@@ -52,7 +52,7 @@ never behind auth or rate limiting.
       "reason": "metal_not_built",       // stable code, safe to switch on
       "detail": "Apple M2 Pro is present but this binary was built without --features metal; rebuild to use it." }
   ],
-  "version": "0.5.0", "pid": 4242, "uptime_seconds": 12.5,
+  "version": "0.8.0", "pid": 4242, "uptime_seconds": 12.5,
   "server_time_unix_ms": 1786000000000,
   "last_request_age_seconds": 0.4    // absent until one is served
 }

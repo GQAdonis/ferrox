@@ -10,12 +10,17 @@ Verified against llama.cpp on the same host and GGUF via `ferrox bench`
 (Gap = `llama / ferrox`; &lt;1 means Ferrox is faster):
 
 - **Dense GQA** — TinyLlama, Llama 3.2, Mistral-7B, SmolLM2,
-  Qwen2.5/Qwen3, Gemma-3/4, Phi-4. Metal decode leads on several small
-  models (SmolLM2 **~0.73×**, Qwen2.5-0.5B **~0.75×**, Gemma-3-1B
-  **~0.95×**) and is near parity on Phi-4 / Mistral-7B; Llama-3.2-3B
-  Metal tg is ~1.11×. **CPU decode is behind everywhere (~1.6–3.3×), and
-  prefill is behind on both backends.**
-- **MoE** — OLMoE-1B-7B; still behind on Metal decode (~1.54×). (Metal Concurrent + fused encode groups +
+  Qwen2.5/Qwen3, Gemma-3/4. Metal decode leads on several small models
+  (SmolLM2 **~0.67×**, Qwen2.5-0.5B **~0.70×**, Qwen3-0.6B **~0.71×**,
+  Gemma-3-1B **~0.88×**), and Llama-3.2-3B is **~0.96×** — ahead, not
+  behind. Mistral-7B and Llama-3.2-1B Q4_K_M sit at 1.00×. Dense Metal
+  prefill is closed (every dense `pp512` row is 1.02–1.08×).
+  **CPU decode is still behind everywhere (~1.17–2.44×), and CPU
+  prefill is behind on 6 of 8 rows.**
+- **Phi-4** — CPU only. Partial rotary (`n_rot < head_dim`) and
+  LongRoPE `attn_factor` have no Metal RoPE kernel, so the Metal path is
+  refused rather than allowed to disagree with CPU.
+- **MoE** — OLMoE-1B-7B; still behind on Metal decode (~1.41×). (Metal Concurrent + fused encode groups +
   `MoeMemRanges` + `mul_mv_id` / prefill `mul_mm_id` + fused attn+O
   residual CB (`FERROX_METAL_PREFILL_FUSE_O=1`); CPU int-dot +
   interleaved Q4_K).

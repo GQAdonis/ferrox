@@ -211,7 +211,7 @@ curl -s -X POST http://127.0.0.1:8383/v1/chat/completions \
 ```bash
 # Kernel picks the port; the bound address is announced on stdout
 ./target/release/ferrox-server -m model.gguf --port 0 --exit-on-stdin-close
-{"event":"ferrox.server.ready","addr":"127.0.0.1:52091","port":52091,"scheme":"http","pid":4242,"version":"0.5.0"}
+{"event":"ferrox.server.ready","addr":"127.0.0.1:52091","port":52091,"scheme":"http","pid":4242,"version":"0.8.0"}
 ```
 
 `--port 0` plus that one line removes the need for a parent process to

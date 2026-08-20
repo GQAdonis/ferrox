@@ -44,6 +44,9 @@ ureq = { version = "2.12", default-features = false, features = ["tls"] }
 # SHA-256 for KV-block content addressing (ferrox-core::kv_block). Pure
 # Rust, no C toolchain; used for cache identity, not for security.
 sha2 = { version = "0.10", default-features = false }
+# Jinja2 evaluator for `tokenizer.chat_template` (crates/ferrox-models/src/chat_template.rs).
+# `loop_controls` for `{% break %}`/`{% continue %}`, which real templates use.
+minijinja = { version = "2.21", features = ["loop_controls", "json"] }
 
 # Internal crates — path for local builds, version for crates.io.
 ferrox-api = { version = "0.7.0", path = "crates/ferrox-api" }

@@ -10,6 +10,7 @@
 
 pub mod block_residual;
 pub mod capability;
+pub mod chat_template;
 pub mod config;
 pub mod decoder;
 pub mod deepseek_v4_decoder;

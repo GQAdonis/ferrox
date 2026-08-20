@@ -27,6 +27,7 @@ regex = "1.13.1"
 fancy-regex = "0.18.0"
 base64 = "0.23.0"
 serde_json.workspace = true
+minijinja = { workspace = true }
 rayon = { workspace = true }
 
 [dev-dependencies]

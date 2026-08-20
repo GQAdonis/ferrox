@@ -31,6 +31,9 @@ pub struct SuiteArgs {
     pub only_backend: Option<String>,
     pub fit_host: bool,
     pub skip_missing: bool,
+    /// Forwarded to every child `bench` run: the 1-minute load average
+    /// above which a timed run refuses to start.
+    pub max_load: f64,
 }
 
 fn suite_path(bench_dir: &Path) -> PathBuf {
@@ -106,6 +109,11 @@ fn host_ram_gb() -> f64 {
 }
 
 pub fn run_suite(args: SuiteArgs) -> anyhow::Result<()> {
+    // The suite is the unit of truth for RESULTS.md, so check the host
+    // once up front rather than discovering at model 9 of 13 that the
+    // first eight rows were measured on a busy box. Children re-check
+    // individually -- load can rise mid-suite.
+    crate::host_state::ensure_quiet_enough(args.max_load)?;
     let entries = load_suite(&args.bench_dir)?;
     let exe = std::env::current_exe()?;
     let ram = host_ram_gb();
@@ -165,6 +173,7 @@ pub fn run_suite(args: SuiteArgs) -> anyhow::Result<()> {
                 .args(["--suite-id", &entry.id])
                 .args(["--backend-label", backend])
                 .args(["--receipt", receipt.to_str().unwrap()])
+                .args(["--max-load", &args.max_load.to_string()])
                 .status()?;
             if !status.success() {
                 eprintln!(

@@ -4,6 +4,7 @@
 mod bench_model;
 mod bench_suite;
 mod chat;
+mod host_state;
 mod parity;
 mod pull;
 mod run;
@@ -23,6 +24,13 @@ use ferrox_models::{
 struct Cli {
     #[command(subcommand)]
     command: Commands,
+
+    /// Start even though another ferrox process is already holding a
+    /// model. Off by default: two models on one box do not share it,
+    /// they thrash it, and every timing either reports becomes noise.
+    /// `FERROX_ALLOW_MULTIPLE_INSTANCES=1` does the same.
+    #[arg(long, global = true)]
+    allow_multiple_instances: bool,
 }
 
 #[derive(Subcommand)]
@@ -230,6 +238,11 @@ enum Commands {
         /// Write a JSON receipt to this path.
         #[arg(long)]
         receipt: Option<String>,
+        /// Refuse to start a timed run when the host's 1-minute load
+        /// average is at or above this. `0` disables the check and
+        /// marks the receipt as not quiet-host.
+        #[arg(long, default_value_t = host_state::DEFAULT_MAX_LOAD)]
+        max_load: f64,
     },
     /// Demonstrate prompt-lookup speculative decoding on a repetitive
     /// prompt, reporting forward_batch call count vs. tokens produced.
@@ -362,10 +375,60 @@ fn rewrite_llama_style_argv(args: Vec<String>) -> Vec<String> {
     out
 }
 
+/// Registers this process in the instance registry when the command is
+/// about to load a model, and refuses to start if another live ferrox
+/// already holds one.
+///
+/// Header-only commands (`inspect`, `inspect-plan`, `presets`, `archs`,
+/// `caps`), the HTTP client (`chat`), the downloader (`pull`) and
+/// `bench --suite` / `--render` are deliberately exempt: none of them
+/// puts weights in memory, and `--suite` is a supervisor whose children
+/// each register on their own.
+fn claim_instance(cli: &Cli) -> anyhow::Result<Option<ferrox_core::instance::InstanceGuard>> {
+    use ferrox_core::instance::{register, InstancePolicy};
+    let (command, model): (&str, Option<String>) = match &cli.command {
+        Commands::Run(a) => ("run", a.model.clone()),
+        Commands::Verify { model, .. } => ("verify", Some(model.clone())),
+        Commands::Bench {
+            model,
+            suite,
+            render,
+            ..
+        } => {
+            if *suite || *render || model.is_none() {
+                return Ok(None);
+            }
+            ("bench", model.clone())
+        }
+        Commands::Smoke { preset, .. } => ("smoke", Some(preset.clone())),
+        Commands::RunKimi { checkpoint_dir, .. } => ("run-kimi", Some(checkpoint_dir.clone())),
+        _ => return Ok(None),
+    };
+    // The flag is an explicit opt-in, so it wins outright; the env var
+    // only decides when the flag was not passed.
+    let policy = if cli.allow_multiple_instances {
+        InstancePolicy::Multi
+    } else {
+        InstancePolicy::from_env_or(InstancePolicy::Single)
+    };
+    match register(
+        command,
+        model.as_deref(),
+        bench_model::active_backend(),
+        policy,
+    ) {
+        Ok(guard) => Ok(Some(guard)),
+        Err(conflict) => Err(anyhow::anyhow!("{conflict}")),
+    }
+}
+
 fn main() -> anyhow::Result<()> {
     init_rayon_threads();
     tracing_subscriber::fmt::init();
     let cli = Cli::parse_from(rewrite_llama_style_argv(std::env::args().collect()));
+
+    // Held for the whole run: dropping it deregisters this process.
+    let _instance = claim_instance(&cli)?;
 
     match cli.command {
         Commands::Run(args) => run::run_infer(args)?,
@@ -643,6 +706,7 @@ fn main() -> anyhow::Result<()> {
             suite_id,
             backend_label,
             receipt,
+            max_load,
         } => {
             if render {
                 return bench_suite::render(std::path::Path::new(&bench_dir));
@@ -657,6 +721,7 @@ fn main() -> anyhow::Result<()> {
                     only_backend: backend,
                     fit_host,
                     skip_missing,
+                    max_load,
                 });
             }
             if let Some(model) = model {
@@ -671,6 +736,7 @@ fn main() -> anyhow::Result<()> {
                     backend: backend_label,
                     receipt: receipt.map(Into::into),
                     id: suite_id,
+                    max_load,
                 });
             }
             use ferrox_core::weight_matrix::{QuantKind, WeightBytes, WeightMatrix};

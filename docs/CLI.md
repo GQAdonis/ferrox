@@ -268,6 +268,41 @@ discarded), same flag names — so the two outputs can be read side by side.
 | `--render` | Re-render the RESULTS table from existing receipts, measuring nothing |
 | `--id` / `--backend` | Restrict `--suite` to one entry / backend |
 | `--fit-host` / `--skip-missing` | Skip entries too large for the host / with no GGUF present |
+| `--max-load` | Refuse to time a run when the host's 1-minute load average is at or above this (default `2.0`; `0` disables). `--suite` checks once up front and forwards the bar to every child |
+
+### One model at a time
+
+Every command that loads weights — `run`, `bench`, `verify`, `smoke`,
+`run-kimi`, and `ferrox-server` — registers itself and **refuses to start
+while another ferrox process is already holding a model**:
+
+```
+$ ferrox -m model.gguf -p "hi"
+Error: 1 ferrox instance(s) are already running a model on this host:
+  - server pid 59667, metal, models/SmolLM2-135M-Instruct-Q8_0.gguf
+Running several models at once does not share the machine -- it thrashes
+it, and any timing either process reports is noise. Stop the other
+instance, or pass --allow-multiple-instances (or set
+FERROX_ALLOW_MULTIPLE_INSTANCES=1) to start anyway.
+```
+
+Prefill is a dense GEMM across every core and the decode pool spins, so
+two instances do not run at half speed each — they contend. Pass
+`--allow-multiple-instances` (or set `FERROX_ALLOW_MULTIPLE_INSTANCES=1`)
+when you want them anyway.
+
+Header-only commands (`inspect`, `inspect-plan`, `presets`, `archs`,
+`caps`), the HTTP client (`chat`), the downloader (`pull`) and
+`bench --suite` / `--render` are exempt: none of them puts weights in
+memory, and `--suite` is a supervisor whose children each register on
+their own.
+
+The registry is a directory of one small file per live process
+(`$FERROX_INSTANCE_DIR`, default `~/.cache/ferrox/instances`). An entry
+whose process is gone — a `kill -9`, a crash — is pruned by the next run
+rather than blocking it. It is **advisory, not a lock**: two processes
+starting in the same instant can each see the other and both refuse,
+which is the safe direction, but nothing here stops a determined caller.
 
 Add or change models in [`benchmarks/suite.json`](../benchmarks/suite.json)
 (`id`, `name`, `gguf`, `backends`, `estimated_ram_gb`). No HTTP, chat

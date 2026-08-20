@@ -11,6 +11,7 @@ pub mod cache;
 pub mod csa_hca_compress;
 pub mod deepseek_v4_attention;
 pub mod expert_store;
+pub mod instance;
 pub mod kernel_registry;
 pub mod matmul;
 pub mod tensor;

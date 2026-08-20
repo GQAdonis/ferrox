@@ -39,7 +39,7 @@ pub use kernel_registry::Registry as KernelRegistry;
 pub use kv_block::{full_blocks, BlockHash, BlockHasher};
 pub use kv_disk::{
     decode_block, encode_block, encoded_len, BlockFormatError, DiskConfig, DiskKvStore, DiskStats,
-    StoreError,
+    ReadHandle, ReadOutcome, StoreError,
 };
 pub use kv_signature::{
     CacheSignature, KvBlock, KvDtype, SignatureError, UnverifiedBlock, BLOCK_FORMAT_VERSION,

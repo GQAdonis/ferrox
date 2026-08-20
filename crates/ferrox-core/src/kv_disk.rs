@@ -445,6 +445,16 @@ pub struct DiskConfig {
     /// Background writer threads. `0` is legitimate and means every
     /// write happens on the thread that asked for it.
     pub writer_threads: usize,
+    /// Background reader threads, serving prefetches and any demand
+    /// read that does not want to block its own thread. `0` means every
+    /// read happens on the thread that asked for it, and a prefetch is
+    /// a no-op.
+    pub reader_threads: usize,
+    /// Blocks that may sit in the prefetch staging area at once. A
+    /// prefetch is a hint, so this is a hard refusal rather than
+    /// backpressure: reading ahead must never be the thing that runs
+    /// the process out of memory.
+    pub prefetch_capacity: usize,
 }
 
 impl DiskConfig {
@@ -455,6 +465,8 @@ impl DiskConfig {
             shard_chars: 2,
             queue_capacity: 64,
             writer_threads: 1,
+            reader_threads: 2,
+            prefetch_capacity: 64,
         }
     }
 
@@ -475,6 +487,16 @@ impl DiskConfig {
 
     pub fn with_writer_threads(mut self, writer_threads: usize) -> Self {
         self.writer_threads = writer_threads;
+        self
+    }
+
+    pub fn with_reader_threads(mut self, reader_threads: usize) -> Self {
+        self.reader_threads = reader_threads;
+        self
+    }
+
+    pub fn with_prefetch_capacity(mut self, prefetch_capacity: usize) -> Self {
+        self.prefetch_capacity = prefetch_capacity;
         self
     }
 }
@@ -510,6 +532,20 @@ struct Stats {
     read_nanos: AtomicU64,
     evictions: AtomicU64,
     evicted_bytes: AtomicU64,
+    /// Reads handed to a reader thread by [`DiskKvStore::prefetch`].
+    prefetch_issued: AtomicU64,
+    /// Prefetches refused: staging full, no reader threads, or the
+    /// block was already staged or in flight.
+    prefetch_dropped: AtomicU64,
+    /// Demand reads that found a prefetch already *finished*. This is
+    /// the one that says the read-ahead paid for itself: the request
+    /// did no I/O at all.
+    prefetch_hits: AtomicU64,
+    /// Demand reads that found a prefetch still running and waited for
+    /// it instead of issuing a second read of the same file.
+    prefetch_waits: AtomicU64,
+    /// Reads that ran on a reader thread rather than the caller's.
+    async_reads: AtomicU64,
 }
 
 /// A snapshot of the tier's behaviour. Note the two time-valued fields:
@@ -536,6 +572,12 @@ pub struct DiskStats {
     pub read_nanos: u64,
     pub evictions: u64,
     pub evicted_bytes: u64,
+    pub prefetch_issued: u64,
+    pub prefetch_dropped: u64,
+    pub prefetch_hits: u64,
+    pub prefetch_waits: u64,
+    pub async_reads: u64,
+    pub staged_blocks: usize,
 }
 
 struct Entry {
@@ -563,6 +605,12 @@ impl Index {
         self.clock += 1;
         self.clock
     }
+}
+
+/// Where a block's payload is, once the index has been consulted.
+enum Source {
+    Disk(PathBuf),
+    Buffer(Arc<KvBlock>),
 }
 
 /// A block that has been accepted but whose file is not on disk yet.
@@ -666,6 +714,192 @@ impl WriteQueue {
     }
 }
 
+/// What a read produced. `Ok(None)` is a miss (absent, corrupt, or
+/// incompatible); `Err` is I/O, or the write-ordering invariant
+/// breaking.
+pub type ReadOutcome = Result<Option<Arc<KvBlock>>, StoreError>;
+
+/// A read in progress, or one that has finished and is waiting to be
+/// claimed. Shared between the thread that asked for it, the thread
+/// that runs it, and any later request for the same block.
+struct ReadSlot {
+    /// The signature this read was issued for. A staged result is only
+    /// reusable by a reader that wants the *same* shape -- otherwise a
+    /// prefetch issued under one config would hand its answer to a
+    /// request under another.
+    expected: CacheSignature,
+    outcome: Mutex<Option<ReadOutcome>>,
+    done: Condvar,
+}
+
+impl ReadSlot {
+    fn pending(expected: CacheSignature) -> Arc<Self> {
+        Arc::new(ReadSlot {
+            expected,
+            outcome: Mutex::new(None),
+            done: Condvar::new(),
+        })
+    }
+
+    fn ready(expected: CacheSignature, outcome: ReadOutcome) -> Arc<Self> {
+        Arc::new(ReadSlot {
+            expected,
+            outcome: Mutex::new(Some(outcome)),
+            done: Condvar::new(),
+        })
+    }
+
+    fn is_ready(&self) -> bool {
+        self.outcome
+            .lock()
+            .expect("kv disk read slot poisoned")
+            .is_some()
+    }
+
+    fn fulfil(&self, outcome: ReadOutcome) {
+        let mut slot = self.outcome.lock().expect("kv disk read slot poisoned");
+        *slot = Some(outcome);
+        self.done.notify_all();
+    }
+
+    fn wait(&self) -> ReadOutcome {
+        let mut slot = self.outcome.lock().expect("kv disk read slot poisoned");
+        loop {
+            if let Some(outcome) = slot.as_ref() {
+                return outcome.clone();
+            }
+            slot = self.done.wait(slot).expect("kv disk read slot poisoned");
+        }
+    }
+}
+
+struct ReadJob {
+    hash: BlockHash,
+    path: PathBuf,
+    slot: Arc<ReadSlot>,
+}
+
+struct ReadQueueState {
+    jobs: VecDeque<ReadJob>,
+    shutdown: bool,
+}
+
+/// Pending disk reads. Unlike the write queue this one *is* allowed to
+/// refuse work -- a prefetch is a hint, and a refused hint costs a
+/// later request one read. A refused *demand* read is not dropped
+/// either: it runs on the calling thread.
+struct ReadQueue {
+    state: Mutex<ReadQueueState>,
+    ready: Condvar,
+    capacity: usize,
+}
+
+impl ReadQueue {
+    fn new(capacity: usize) -> Self {
+        ReadQueue {
+            state: Mutex::new(ReadQueueState {
+                jobs: VecDeque::new(),
+                shutdown: false,
+            }),
+            ready: Condvar::new(),
+            capacity: capacity.max(1),
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, ReadQueueState> {
+        self.state.lock().expect("kv disk read queue poisoned")
+    }
+
+    /// `demand` jumps the queue: a request that is waiting must not sit
+    /// behind speculative read-ahead.
+    fn try_push(&self, job: ReadJob, demand: bool) -> bool {
+        let mut state = self.lock();
+        if state.shutdown || state.jobs.len() >= self.capacity {
+            return false;
+        }
+        if demand {
+            state.jobs.push_front(job);
+        } else {
+            state.jobs.push_back(job);
+        }
+        self.ready.notify_one();
+        true
+    }
+
+    fn pop_blocking(&self) -> Option<ReadJob> {
+        let mut state = self.lock();
+        loop {
+            if let Some(job) = state.jobs.pop_front() {
+                return Some(job);
+            }
+            if state.shutdown {
+                return None;
+            }
+            state = self.ready.wait(state).expect("kv disk read queue poisoned");
+        }
+    }
+
+    fn shutdown(&self) {
+        let mut state = self.lock();
+        state.shutdown = true;
+        self.ready.notify_all();
+    }
+}
+
+/// A read that may not have finished yet.
+///
+/// The disk tier is asynchronous **by construction**, not as a later
+/// retrofit: [`DiskKvStore::get`] is this handle plus a `wait`, so
+/// there is no synchronous read path that a prefetch has to work
+/// around.
+pub struct ReadHandle {
+    shared: Arc<Shared>,
+    hash: BlockHash,
+    slot: Arc<ReadSlot>,
+    /// Whether this handle's slot is registered in the staging map and
+    /// should be removed once claimed.
+    staged: bool,
+}
+
+impl ReadHandle {
+    /// True if the block is already in hand -- a memory hit, a miss, or
+    /// a prefetch that has landed.
+    pub fn is_ready(&self) -> bool {
+        self.slot.is_ready()
+    }
+
+    /// The result, without blocking. Returns `None` if the read is
+    /// still running.
+    pub fn try_claim(&self) -> Option<ReadOutcome> {
+        if !self.slot.is_ready() {
+            return None;
+        }
+        Some(self.claim())
+    }
+
+    /// Blocks until the read finishes.
+    pub fn wait(self) -> ReadOutcome {
+        self.claim()
+    }
+
+    fn claim(&self) -> ReadOutcome {
+        let outcome = self.slot.wait();
+        if self.staged {
+            self.shared.unstage(&self.hash, &self.slot);
+        }
+        outcome
+    }
+}
+
+impl std::fmt::Debug for ReadHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ReadHandle")
+            .field("hash", &self.hash)
+            .field("ready", &self.is_ready())
+            .finish()
+    }
+}
+
 #[cfg(test)]
 type Hook = Arc<dyn Fn(&BlockHash) + Send + Sync>;
 
@@ -730,6 +964,13 @@ struct Shared {
     /// reader would find nothing.
     buffer: Mutex<HashMap<BlockHash, Buffered>>,
     queue: WriteQueue,
+    reads: ReadQueue,
+    /// Reads in flight or finished and unclaimed, keyed by block. One
+    /// slot per block, so a demand read that arrives while a prefetch
+    /// is running joins it instead of reading the same file twice.
+    staging: Mutex<HashMap<BlockHash, Arc<ReadSlot>>>,
+    prefetch_capacity: usize,
+    has_readers: bool,
     stats: Stats,
     seq: AtomicU64,
     generation: AtomicU64,
@@ -746,18 +987,23 @@ struct Shared {
 pub struct DiskKvStore {
     shared: Arc<Shared>,
     writers: Vec<std::thread::JoinHandle<()>>,
+    readers: Vec<std::thread::JoinHandle<()>>,
 }
 
 impl Drop for DiskKvStore {
-    /// Stops accepting queued work and joins the writer threads. Blocks
+    /// Stops accepting queued work and joins the worker threads. Blocks
     /// already queued but not started are **not** written: they were
     /// never durable, and a shutdown that waits for an arbitrarily deep
     /// queue is worse than a cold cache. Call [`Self::flush`] first if
     /// they matter.
     fn drop(&mut self) {
         self.shared.queue.shutdown();
+        self.shared.reads.shutdown();
         for writer in self.writers.drain(..) {
             let _ = writer.join();
+        }
+        for reader in self.readers.drain(..) {
+            let _ = reader.join();
         }
     }
 }
@@ -784,6 +1030,10 @@ impl DiskKvStore {
             }),
             buffer: Mutex::new(HashMap::new()),
             queue: WriteQueue::new(config.queue_capacity),
+            reads: ReadQueue::new(config.queue_capacity),
+            staging: Mutex::new(HashMap::new()),
+            prefetch_capacity: config.prefetch_capacity,
+            has_readers: config.reader_threads > 0,
             stats: Stats::default(),
             seq: AtomicU64::new(0),
             generation: AtomicU64::new(0),
@@ -804,7 +1054,26 @@ impl DiskKvStore {
                 .map_err(|e| io_err("spawn writer for", &config.root, e))?;
             writers.push(handle);
         }
-        Ok(DiskKvStore { shared, writers })
+        let mut readers = Vec::with_capacity(config.reader_threads);
+        for n in 0..config.reader_threads {
+            let shared = Arc::clone(&shared);
+            let handle = std::thread::Builder::new()
+                .name(format!("ferrox-kv-read-{n}"))
+                .spawn(move || {
+                    while let Some(job) = shared.reads.pop_blocking() {
+                        shared.stats.async_reads.fetch_add(1, Ordering::Relaxed);
+                        let outcome = shared.read_timed(&job.path, &job.hash, &job.slot.expected);
+                        job.slot.fulfil(outcome);
+                    }
+                })
+                .map_err(|e| io_err("spawn reader for", &config.root, e))?;
+            readers.push(handle);
+        }
+        Ok(DiskKvStore {
+            shared,
+            writers,
+            readers,
+        })
     }
 
     pub fn root(&self) -> &Path {
@@ -851,13 +1120,43 @@ impl DiskKvStore {
     }
 
     /// Looks a block up, verifying it against `expected` before
-    /// returning it. See [`Shared::get`] for what `Ok(None)` covers.
-    pub fn get(
-        &self,
-        hash: &BlockHash,
-        expected: &CacheSignature,
-    ) -> Result<Option<Arc<KvBlock>>, StoreError> {
-        self.shared.get(hash, expected)
+    /// returning it. Blocks until the answer is in hand.
+    ///
+    /// This is exactly [`Self::read_async`] plus a wait -- the disk
+    /// tier has no separate synchronous read path for a prefetch to
+    /// have to work around later.
+    pub fn get(&self, hash: &BlockHash, expected: &CacheSignature) -> ReadOutcome {
+        self.shared.read_async(hash, expected, true).wait()
+    }
+
+    /// Starts a read and returns immediately. The handle can be polled
+    /// with [`ReadHandle::try_claim`] or waited on.
+    pub fn read_async(&self, hash: &BlockHash, expected: &CacheSignature) -> ReadHandle {
+        self.shared.read_async(hash, expected, true)
+    }
+
+    /// Reads `hashes` ahead of anyone asking for them, on the reader
+    /// threads, and returns without waiting.
+    ///
+    /// Intended for a prefix chain the moment its hashes are known:
+    /// every block the request is about to want, read while the tokens
+    /// before it are still being processed. Blocks already staged, in
+    /// flight, or in memory are skipped; so is everything past
+    /// `prefetch_capacity`, because reading ahead must never be the
+    /// thing that exhausts memory.
+    pub fn prefetch(&self, hashes: &[BlockHash], expected: &CacheSignature) {
+        self.shared.prefetch(hashes, expected);
+    }
+
+    /// Drops any staged read-ahead results. A caller that abandons a
+    /// request it prefetched for should say so rather than leave the
+    /// blocks occupying staging until something else needs the room.
+    pub fn clear_prefetch(&self) {
+        self.shared
+            .staging
+            .lock()
+            .expect("kv disk staging poisoned")
+            .clear();
     }
 
     /// Adopts the blocks already under `root`, as a restart would.
@@ -1125,70 +1424,186 @@ impl Shared {
         }
     }
 
-    /// Looks a block up, verifying it against `expected` before
-    /// returning it.
+    /// Where a block's payload currently is, decided under the index
+    /// lock. `Ok(None)` is an outright miss.
+    fn source(&self, hash: &BlockHash) -> Result<Option<Source>, StoreError> {
+        let mut index = self.index.lock().expect("kv disk index poisoned");
+        let clock = index.clock + 1;
+        let Some(entry) = index.entries.get_mut(hash) else {
+            return Ok(None);
+        };
+        entry.last_used = clock;
+        let published = entry.published;
+        index.clock = clock;
+        if published {
+            return Ok(Some(Source::Disk(self.block_path(hash))));
+        }
+        // The index lock is deliberately still held: "not published"
+        // and "here is the buffered payload" must be one decision. Two
+        // decisions leave a gap for the writer to publish and release
+        // in between.
+        let buffered = self
+            .buffer
+            .lock()
+            .expect("kv disk buffer poisoned")
+            .get(hash)
+            .map(|b| Arc::clone(&b.block));
+        match buffered {
+            Some(block) => Ok(Some(Source::Buffer(block))),
+            None => Err(StoreError::MissingPayload { hash: *hash }),
+        }
+    }
+
+    /// Begins a read.
     ///
-    /// `Ok(None)` covers every "you will have to recompute this"
-    /// outcome -- absent, corrupt on disk, or built for a different
-    /// config -- because they are the same answer to the caller. The
-    /// counters in [`DiskStats`] tell them apart. `Err` is I/O that
-    /// failed, or the write-ordering invariant breaking.
-    fn get(
-        &self,
+    /// `Ok(None)` in the eventual outcome covers every "you will have
+    /// to recompute this" case -- absent, corrupt on disk, or built for
+    /// a different config -- because they are the same answer to the
+    /// caller. The counters in [`DiskStats`] tell them apart. `Err` is
+    /// I/O that failed, or the write-ordering invariant breaking.
+    ///
+    /// Anything answerable from memory (a miss, or a block still in the
+    /// write buffer) is answered here and comes back already ready; no
+    /// thread is involved. Only a real file read is dispatched, and a
+    /// `demand` read jumps ahead of queued prefetches -- or, if the
+    /// queue is full, runs on this thread rather than queueing behind
+    /// speculative work.
+    fn read_async(
+        self: &Arc<Self>,
         hash: &BlockHash,
         expected: &CacheSignature,
-    ) -> Result<Option<Arc<KvBlock>>, StoreError> {
-        enum Source {
-            Disk(PathBuf),
-            Buffer(Arc<KvBlock>),
-        }
-        let source = {
-            let mut index = self.index.lock().expect("kv disk index poisoned");
-            let clock = index.clock + 1;
-            let Some(entry) = index.entries.get_mut(hash) else {
-                self.stats.misses.fetch_add(1, Ordering::Relaxed);
-                return Ok(None);
-            };
-            entry.last_used = clock;
-            let published = entry.published;
-            index.clock = clock;
-            if published {
-                Source::Disk(self.block_path(hash))
-            } else {
-                // The index lock is deliberately still held: "not
-                // published" and "here is the buffered payload" must be
-                // one decision. Two decisions leave a gap for the
-                // writer to publish and release in between.
-                let buffered = self
-                    .buffer
-                    .lock()
-                    .expect("kv disk buffer poisoned")
-                    .get(hash)
-                    .map(|b| Arc::clone(&b.block));
-                match buffered {
-                    Some(block) => Source::Buffer(block),
-                    None => return Err(StoreError::MissingPayload { hash: *hash }),
-                }
-            }
+        demand: bool,
+    ) -> ReadHandle {
+        // An in-flight or finished read for the same block and the same
+        // expectation is the answer -- never a second read of the same
+        // file.
+        let staged = {
+            let staging = self.staging.lock().expect("kv disk staging poisoned");
+            staging
+                .get(hash)
+                .filter(|slot| &slot.expected == expected)
+                .map(Arc::clone)
         };
-        match source {
-            Source::Buffer(block) => {
+        if let Some(slot) = staged {
+            if demand {
+                let counter = if slot.is_ready() {
+                    &self.stats.prefetch_hits
+                } else {
+                    &self.stats.prefetch_waits
+                };
+                counter.fetch_add(1, Ordering::Relaxed);
+            }
+            return self.handle(*hash, slot, true);
+        }
+
+        let ready = |outcome: ReadOutcome| ReadHandle {
+            shared: Arc::clone(self),
+            hash: *hash,
+            slot: ReadSlot::ready(expected.clone(), outcome),
+            staged: false,
+        };
+
+        let path = match self.source(hash) {
+            Err(err) => return ready(Err(err)),
+            Ok(None) => {
+                self.stats.misses.fetch_add(1, Ordering::Relaxed);
+                return ready(Ok(None));
+            }
+            Ok(Some(Source::Buffer(block))) => {
                 if block.signature() != expected {
                     self.stats.incompatible.fetch_add(1, Ordering::Relaxed);
-                    return Ok(None);
+                    return ready(Ok(None));
                 }
                 self.stats.buffer_hits.fetch_add(1, Ordering::Relaxed);
-                Ok(Some(block))
+                return ready(Ok(Some(block)));
             }
-            Source::Disk(path) => {
-                let started = Instant::now();
-                let outcome = self.read_verified(&path, hash, expected);
-                self.stats
-                    .read_nanos
-                    .fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
-                outcome
+            Ok(Some(Source::Disk(path))) => path,
+        };
+
+        let slot = ReadSlot::pending(expected.clone());
+        let dispatched = self.has_readers && {
+            self.staging
+                .lock()
+                .expect("kv disk staging poisoned")
+                .insert(*hash, Arc::clone(&slot));
+            let job = ReadJob {
+                hash: *hash,
+                path: path.clone(),
+                slot: Arc::clone(&slot),
+            };
+            let pushed = self.reads.try_push(job, demand);
+            if !pushed {
+                self.unstage(hash, &slot);
             }
+            pushed
+        };
+        if dispatched {
+            return self.handle(*hash, slot, true);
         }
+        slot.fulfil(self.read_timed(&path, hash, expected));
+        self.handle(*hash, slot, false)
+    }
+
+    fn handle(self: &Arc<Self>, hash: BlockHash, slot: Arc<ReadSlot>, staged: bool) -> ReadHandle {
+        ReadHandle {
+            shared: Arc::clone(self),
+            hash,
+            slot,
+            staged,
+        }
+    }
+
+    /// Removes a staging entry, but only if it is still the slot the
+    /// claimant was holding -- a newer read for the same block owns the
+    /// entry now.
+    fn unstage(&self, hash: &BlockHash, slot: &Arc<ReadSlot>) {
+        let mut staging = self.staging.lock().expect("kv disk staging poisoned");
+        if staging.get(hash).is_some_and(|s| Arc::ptr_eq(s, slot)) {
+            staging.remove(hash);
+        }
+    }
+
+    fn prefetch(self: &Arc<Self>, hashes: &[BlockHash], expected: &CacheSignature) {
+        if !self.has_readers {
+            self.stats
+                .prefetch_dropped
+                .fetch_add(hashes.len() as u64, Ordering::Relaxed);
+            return;
+        }
+        for hash in hashes {
+            let room = {
+                let staging = self.staging.lock().expect("kv disk staging poisoned");
+                !staging.contains_key(hash) && staging.len() < self.prefetch_capacity
+            };
+            if !room {
+                self.stats.prefetch_dropped.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
+            let handle = self.read_async(hash, expected, false);
+            if handle.staged {
+                self.stats.prefetch_issued.fetch_add(1, Ordering::Relaxed);
+            } else {
+                // Answered from memory, or the read queue was full and
+                // it ran here. Either way there is nothing staged to
+                // claim later, so drop the answer: a prefetch is a
+                // hint, and re-reading is cheaper than holding blocks
+                // nobody asked for.
+                self.stats.prefetch_dropped.fetch_add(1, Ordering::Relaxed);
+            }
+            // Dropped unclaimed on purpose: a staged slot stays in
+            // staging for whoever asks for the block next, which is the
+            // entire point of reading it early.
+            drop(handle);
+        }
+    }
+
+    fn read_timed(&self, path: &Path, hash: &BlockHash, expected: &CacheSignature) -> ReadOutcome {
+        let started = Instant::now();
+        let outcome = self.read_verified(path, hash, expected);
+        self.stats
+            .read_nanos
+            .fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        outcome
     }
 
     fn read_verified(
@@ -1389,6 +1804,12 @@ impl Shared {
             read_nanos: stats.read_nanos.load(Ordering::Relaxed),
             evictions: stats.evictions.load(Ordering::Relaxed),
             evicted_bytes: stats.evicted_bytes.load(Ordering::Relaxed),
+            prefetch_issued: stats.prefetch_issued.load(Ordering::Relaxed),
+            prefetch_dropped: stats.prefetch_dropped.load(Ordering::Relaxed),
+            prefetch_hits: stats.prefetch_hits.load(Ordering::Relaxed),
+            prefetch_waits: stats.prefetch_waits.load(Ordering::Relaxed),
+            async_reads: stats.async_reads.load(Ordering::Relaxed),
+            staged_blocks: self.staging.lock().expect("kv disk staging poisoned").len(),
         }
     }
 
@@ -1933,7 +2354,10 @@ mod tests {
         let v = Arc::clone(&violations);
         let s = Arc::clone(&served);
         let hook: Hook = Arc::new(move |hash: &BlockHash| {
-            match reader.get(hash, &expected("model-a", 1, 4)) {
+            match reader
+                .read_async(hash, &expected("model-a", 1, 4), true)
+                .wait()
+            {
                 Ok(Some(_)) => {
                     s.fetch_add(1, Ordering::Relaxed);
                 }
@@ -2193,5 +2617,261 @@ mod tests {
         );
         assert_eq!(store.stats().write_skipped, 1);
         assert_eq!(store.stats().blocks, 1);
+    }
+
+    // ---------------------------------------------------------------
+    // Asynchronous and prefetched reads
+    // ---------------------------------------------------------------
+
+    /// A store that reads on its own threads, writes on the caller's
+    /// (so a test's writes are done when `put_blocking` returns).
+    fn reading_store(dir: &TempDir, readers: usize) -> DiskKvStore {
+        DiskKvStore::open(
+            DiskConfig::new(dir.path())
+                .with_writer_threads(0)
+                .with_reader_threads(readers),
+        )
+        .expect("open")
+    }
+
+    /// Blocks until a prefetch for `hash` has landed in staging.
+    fn wait_staged(store: &DiskKvStore, hash: &BlockHash) {
+        for _ in 0..2000 {
+            let ready = store
+                .shared
+                .staging
+                .lock()
+                .unwrap()
+                .get(hash)
+                .map(|slot| slot.is_ready())
+                .unwrap_or(false);
+            if ready {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        panic!("prefetch never completed");
+    }
+
+    /// The point of prefetching, proved the only way it can be: the
+    /// block file is **deleted** after the prefetch and before the
+    /// request. The request still gets its block, so the read
+    /// demonstrably happened before it was asked for -- not on its
+    /// thread, not on its clock.
+    #[test]
+    fn a_prefetched_block_is_already_read_when_the_request_arrives() {
+        let dir = TempDir::new("prefetch");
+        let store = reading_store(&dir, 1);
+        let h = hash(800);
+        put_now(&store, h, block("model-a", 2, 4, 5.0));
+        let want = expected("model-a", 2, 4);
+
+        store.prefetch(&[h], &want);
+        wait_staged(&store, &h);
+        fs::remove_file(store.block_path(&h)).expect("remove");
+
+        let got = store
+            .get(&h, &want)
+            .expect("get")
+            .expect("the prefetch already had it");
+        assert_eq!(got.tokens(), 4);
+        assert_eq!(got.layers()[0].k[0], 5.0);
+
+        let stats = store.stats();
+        assert_eq!(
+            stats.prefetch_hits, 1,
+            "the request must have found it ready"
+        );
+        assert_eq!(
+            stats.hits, 1,
+            "and the file must have been read exactly once"
+        );
+        assert_eq!(stats.async_reads, 1, "on a reader thread, not the caller's");
+        assert_eq!(stats.staged_blocks, 0, "a claimed read leaves staging");
+    }
+
+    /// A whole prefix chain read ahead in one call, which is how a
+    /// prefix cache would use this: the request's blocks are known
+    /// before the request needs them.
+    #[test]
+    fn a_whole_chain_can_be_read_ahead_in_one_call() {
+        let dir = TempDir::new("chain");
+        let store = reading_store(&dir, 2);
+        let hashes: Vec<BlockHash> = (0..4).map(|i| hash(810 + i)).collect();
+        for (i, h) in hashes.iter().enumerate() {
+            put_now(&store, *h, block("model-a", 1, 4, i as f32));
+        }
+        let want = expected("model-a", 1, 4);
+
+        store.prefetch(&hashes, &want);
+        for h in &hashes {
+            wait_staged(&store, h);
+            fs::remove_file(store.block_path(h)).expect("remove");
+        }
+        for (i, h) in hashes.iter().enumerate() {
+            let got = store.get(h, &want).expect("get").expect("read ahead");
+            assert_eq!(got.layers()[0].k[0], i as f32);
+        }
+        let stats = store.stats();
+        assert_eq!(stats.prefetch_issued, 4);
+        assert_eq!(stats.prefetch_hits, 4);
+        assert_eq!(stats.hits, 4, "four blocks, four reads, none repeated");
+    }
+
+    /// Whether or not the prefetch has landed, the request never reads
+    /// the same file twice: it joins the read in flight.
+    #[test]
+    fn a_request_joins_a_read_already_running_rather_than_repeating_it() {
+        let dir = TempDir::new("join");
+        let store = reading_store(&dir, 1);
+        let h = hash(820);
+        put_now(&store, h, block("model-a", 1, 4, 1.0));
+        let want = expected("model-a", 1, 4);
+
+        store.prefetch(&[h], &want);
+        // Deliberately no wait: this races the reader thread, and the
+        // assertion holds either way.
+        let got = store.get(&h, &want).expect("get").expect("hit");
+        assert_eq!(got.tokens(), 4);
+        let stats = store.stats();
+        assert_eq!(
+            stats.prefetch_hits + stats.prefetch_waits,
+            1,
+            "the request either found the read done or waited for it"
+        );
+        assert_eq!(stats.hits, 1, "one physical read, whichever way it went");
+    }
+
+    /// A staged read belongs to the shape it was issued for. Handing a
+    /// prefetch's answer to a request that wants a different layout
+    /// would defeat the whole signature discipline, so the staged slot
+    /// is only reused on an exact match.
+    #[test]
+    fn a_staged_read_is_not_reused_by_a_reader_that_wants_another_shape() {
+        let dir = TempDir::new("staged-shape");
+        let store = reading_store(&dir, 1);
+        let h = hash(830);
+        put_now(&store, h, block("model-a", 1, 4, 1.0));
+
+        store.prefetch(&[h], &expected("model-a", 1, 4));
+        wait_staged(&store, &h);
+
+        let got = store.get(&h, &expected("model-b", 1, 4)).expect("get");
+        assert!(got.is_none(), "a different model must not be served");
+        assert_eq!(store.stats().incompatible, 1);
+        assert_eq!(
+            store.stats().prefetch_hits,
+            0,
+            "the staged answer was for another expectation and must not be claimed"
+        );
+    }
+
+    /// Reading ahead is a hint and must never be the thing that
+    /// exhausts memory: past the staging cap, prefetches are refused
+    /// and counted rather than queued.
+    #[test]
+    fn prefetching_is_bounded() {
+        let dir = TempDir::new("prefetch-bound");
+        let store = DiskKvStore::open(
+            DiskConfig::new(dir.path())
+                .with_writer_threads(0)
+                .with_reader_threads(1)
+                .with_prefetch_capacity(2),
+        )
+        .expect("open");
+        let hashes: Vec<BlockHash> = (0..6).map(|i| hash(840 + i)).collect();
+        for (i, h) in hashes.iter().enumerate() {
+            put_now(&store, *h, block("model-a", 1, 4, i as f32));
+        }
+
+        store.prefetch(&hashes, &expected("model-a", 1, 4));
+        let stats = store.stats();
+        assert!(
+            stats.staged_blocks <= 2,
+            "staging must respect its cap, got {}",
+            stats.staged_blocks
+        );
+        assert!(
+            stats.prefetch_dropped >= 4,
+            "the refusals must be visible, got {}",
+            stats.prefetch_dropped
+        );
+
+        // Refusing a hint costs a read, never an answer.
+        let want = expected("model-a", 1, 4);
+        for (i, h) in hashes.iter().enumerate() {
+            let got = store.get(h, &want).expect("get").expect("hit");
+            assert_eq!(got.layers()[0].k[0], i as f32);
+        }
+    }
+
+    /// With no reader threads every read happens on the calling thread
+    /// and a prefetch is an honest no-op -- counted, not pretended.
+    #[test]
+    fn without_reader_threads_reads_run_on_the_caller() {
+        let dir = TempDir::new("no-readers");
+        let store = reading_store(&dir, 0);
+        let h = hash(850);
+        put_now(&store, h, block("model-a", 1, 4, 1.0));
+        let want = expected("model-a", 1, 4);
+
+        store.prefetch(&[h], &want);
+        assert_eq!(store.stats().prefetch_dropped, 1);
+        assert_eq!(store.stats().staged_blocks, 0);
+
+        assert!(store.get(&h, &want).expect("get").is_some());
+        let stats = store.stats();
+        assert_eq!(stats.hits, 1);
+        assert_eq!(stats.async_reads, 0);
+    }
+
+    /// The handle is pollable: a caller that has other work to do can
+    /// start the read, do the work, and collect it.
+    #[test]
+    fn a_read_handle_can_be_polled_to_completion() {
+        let dir = TempDir::new("handle");
+        let store = reading_store(&dir, 1);
+        let h = hash(860);
+        put_now(&store, h, block("model-a", 1, 4, 2.0));
+        let want = expected("model-a", 1, 4);
+
+        let handle = store.read_async(&h, &want);
+        for _ in 0..2000 {
+            if let Some(outcome) = handle.try_claim() {
+                let got = outcome.expect("read").expect("hit");
+                assert_eq!(got.layers()[0].k[0], 2.0);
+                assert_eq!(store.stats().staged_blocks, 0);
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        panic!("read never completed");
+    }
+
+    /// A miss needs no thread at all: it is decided under the index
+    /// lock and comes back already answered.
+    #[test]
+    fn a_miss_is_answered_without_dispatching_a_read() {
+        let dir = TempDir::new("ready-miss");
+        let store = reading_store(&dir, 1);
+        let handle = store.read_async(&hash(870), &expected("model-a", 1, 4));
+        assert!(handle.is_ready(), "a miss must not cost a thread hop");
+        assert!(handle.wait().expect("read").is_none());
+        assert_eq!(store.stats().async_reads, 0);
+    }
+
+    /// Abandoning a request drops what was read for it, rather than
+    /// leaving the blocks parked in staging.
+    #[test]
+    fn clearing_the_prefetch_releases_staged_blocks() {
+        let dir = TempDir::new("clear");
+        let store = reading_store(&dir, 1);
+        let h = hash(880);
+        put_now(&store, h, block("model-a", 1, 4, 1.0));
+        store.prefetch(&[h], &expected("model-a", 1, 4));
+        wait_staged(&store, &h);
+        assert_eq!(store.stats().staged_blocks, 1);
+        store.clear_prefetch();
+        assert_eq!(store.stats().staged_blocks, 0);
     }
 }

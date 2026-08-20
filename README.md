@@ -31,20 +31,91 @@ cargo install ferrox-cli      # the `ferrox` binary
 cargo install ferrox-server   # the OpenAI-compatible server
 ```
 
+`cargo install ferrox-cli` gives you the same `ferrox` binary the
+install script does; `ferrox-server` is the HTTP server. Neither pulls
+in a GPU backend unless you ask:
+
+```bash
+cargo install ferrox-cli --features metal   # Apple Silicon
+cargo install ferrox-cli --features cuda    # Linux + NVIDIA, needs a CUDA toolkit
+```
+
+## Use it as a library
+
 The library is published as
 [`ferrox-inference`](https://crates.io/crates/ferrox-inference) — the
 name `ferrox` belongs to an unrelated crate. It is a facade that
-re-exports the workspace, so a dependent writes one line:
+re-exports the whole workspace, so one dependency line gets you the
+whole stack:
 
 ```toml
 [dependencies]
 ferrox-inference = "0.8"
 ```
 
-It deliberately ships no binary: `ferrox-cli` already installs one
-called `ferrox`, and two crates writing the same path in
-`~/.cargo/bin` would fight over it. GPU features are opt-in
-(`metal`, `cuda`) because neither is safe to assume.
+```rust
+use ferrox_inference::gguf::ShardedGguf;
+use ferrox_inference::models::{Decoder, ModelConfig};
+use ferrox_inference::core::cache::KvCache;
+
+let path = "models/Llama-3.2-1B-Instruct-Q4_K_M.gguf";
+
+// Inspect a checkpoint without loading a single weight: GGUF metadata
+// and tensor descriptors come from the header.
+let file = ShardedGguf::open(path)?;
+println!(
+    "{} tensors, arch {:?}",
+    file.tensor_count(),
+    file.metadata_str("general.architecture"),
+);
+
+// Hyperparameters are derived from the file, not hand-written. Fields
+// that had to be guessed are listed in `config.best_effort_fields`.
+let config = ModelConfig::from_gguf(&file)?;
+
+// Load. Weights stay quantized and mmap-resident; dequant happens
+// inside the matmul. This REFUSES a checkpoint carrying tensors this
+// build never reads, rather than computing a different graph.
+let decoder = Decoder::from_gguf(path, config)?;
+
+// Prefill a prompt and read the logits at its last position.
+let mut caches: Vec<KvCache> = (0..decoder.layers.len())
+    .map(|_| KvCache::new(decoder.config.n_kv_heads, decoder.config.head_dim))
+    .collect();
+let logits = decoder.forward_batch_last(&[1, 2, 3], 0, &mut caches);
+```
+
+Feature flags, none on by default:
+
+| Feature | Effect |
+|---|---|
+| `metal` | Apple Metal kernels. Apple Silicon only |
+| `cuda` | CUDA/NVRTC kernels. Needs a CUDA toolkit at build time |
+| `api` | Re-export `ferrox-api` (route constants + wire DTOs) for writing a client without depending on the server |
+
+`ferrox-inference` deliberately ships no binary: `ferrox-cli` already
+installs one called `ferrox`, and two crates writing the same path in
+`~/.cargo/bin` would fight over it.
+
+### The individual crates
+
+Depend on these directly if you want one layer rather than the stack.
+All share one version number.
+
+| Crate | What it is |
+|---|---|
+| [`ferrox-inference`](https://crates.io/crates/ferrox-inference) | Facade over everything below |
+| [`ferrox-gguf`](https://crates.io/crates/ferrox-gguf) | GGUF mmap reader, sharded checkpoints |
+| [`ferrox-quant`](https://crates.io/crates/ferrox-quant) | Block layouts, fused dequant+dot (K-quants, IQ tiers, MXFP4) |
+| [`ferrox-safetensors`](https://crates.io/crates/ferrox-safetensors) | SafeTensors mmap reader |
+| [`ferrox-core`](https://crates.io/crates/ferrox-core) | Tensor ops, RoPE, GQA, KV cache |
+| [`ferrox-moe`](https://crates.io/crates/ferrox-moe) | Expert routing, dispatch, residency planning |
+| [`ferrox-models`](https://crates.io/crates/ferrox-models) | Loaders and decoder stacks |
+| [`ferrox-api`](https://crates.io/crates/ferrox-api) | Route constants + wire DTOs, serde only |
+| [`ferrox-metal`](https://crates.io/crates/ferrox-metal) | Apple Metal kernels |
+| [`ferrox-cuda`](https://crates.io/crates/ferrox-cuda) | CUDA/NVRTC kernels |
+| [`ferrox-cli`](https://crates.io/crates/ferrox-cli) | The `ferrox` binary |
+| [`ferrox-server`](https://crates.io/crates/ferrox-server) | The OpenAI-compatible server |
 
 ### Build from source
 

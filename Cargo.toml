@@ -44,6 +44,12 @@ ureq = { version = "2.12", default-features = false, features = ["tls"] }
 # SHA-256 for KV-block content addressing (ferrox-core::kv_block). Pure
 # Rust, no C toolchain; used for cache identity, not for security.
 sha2 = { version = "0.10", default-features = false }
+# `statvfs` only, for the KV disk tier's free-space budget
+# (ferrox-core::kv_disk). std has no portable free-space call, and the
+# alternative -- letting the filesystem be the thing that says "full" --
+# is exactly what that budget exists to avoid. Already in the tree via
+# memmap2/rayon; the probe is injectable, so nothing else depends on it.
+libc = "0.2"
 
 # Internal crates — path for local builds, version for crates.io.
 ferrox-api = { version = "0.7.0", path = "crates/ferrox-api" }

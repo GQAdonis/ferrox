@@ -425,9 +425,56 @@ fn io_err(op: &'static str, path: &Path, err: io::Error) -> StoreError {
     }
 }
 
+/// Asks how many bytes are still free on the filesystem holding a
+/// path. `None` means "cannot tell", and the store then trusts only its
+/// configured byte budget.
+///
+/// Injectable so the budget's behaviour under a nearly-full disk is
+/// testable without actually filling one.
+pub type FreeSpaceProbe = Arc<dyn Fn(&Path) -> Option<u64> + Send + Sync>;
+
+/// Free space via `statvfs`. `f_bavail` (blocks available to an
+/// unprivileged process), not `f_bfree`, because the reserved blocks a
+/// filesystem keeps back are not ours to spend.
+#[cfg(unix)]
+#[allow(clippy::unnecessary_cast)] // field widths differ across unixes
+fn platform_free_bytes(path: &Path) -> Option<u64> {
+    use std::os::unix::ffi::OsStrExt;
+    let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+    // SAFETY: `c_path` is a NUL-terminated path that outlives the call,
+    // and `stat` is a correctly sized, writable `statvfs`.
+    let stat = unsafe {
+        let mut stat: libc::statvfs = std::mem::zeroed();
+        if libc::statvfs(c_path.as_ptr(), &mut stat) != 0 {
+            return None;
+        }
+        stat
+    };
+    let block = if stat.f_frsize > 0 {
+        stat.f_frsize as u64
+    } else {
+        stat.f_bsize as u64
+    };
+    Some((stat.f_bavail as u64).saturating_mul(block))
+}
+
+#[cfg(not(unix))]
+fn platform_free_bytes(_path: &Path) -> Option<u64> {
+    None
+}
+
+/// A free-space reading and when it was taken. `statvfs` is a syscall
+/// per call and the answer changes slowly, so it is cached -- but only
+/// for a TTL, and any `ENOSPC` throws it away immediately, because at
+/// that moment the cached number is known to be a lie.
+struct FreeSpace {
+    checked_at: Option<Instant>,
+    bytes: Option<u64>,
+}
+
 /// How the store is sized, laid out, and how much writing it will do
 /// off the calling thread.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct DiskConfig {
     /// Directory the store owns. Created if absent.
     pub root: PathBuf,
@@ -455,6 +502,32 @@ pub struct DiskConfig {
     /// backpressure: reading ahead must never be the thing that runs
     /// the process out of memory.
     pub prefetch_capacity: usize,
+    /// Bytes to leave free on the filesystem. The store evicts to stay
+    /// this far away from a full disk, rather than letting `ENOSPC` be
+    /// the mechanism that tells it to stop.
+    pub reserve_bytes: u64,
+    /// How long a free-space reading is trusted before it is taken
+    /// again.
+    pub free_space_ttl: std::time::Duration,
+    /// How free space is measured. Defaults to `statvfs` on unix, and
+    /// to "cannot tell" elsewhere.
+    pub free_space_probe: FreeSpaceProbe,
+}
+
+impl std::fmt::Debug for DiskConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DiskConfig")
+            .field("root", &self.root)
+            .field("max_bytes", &self.max_bytes)
+            .field("shard_chars", &self.shard_chars)
+            .field("queue_capacity", &self.queue_capacity)
+            .field("writer_threads", &self.writer_threads)
+            .field("reader_threads", &self.reader_threads)
+            .field("prefetch_capacity", &self.prefetch_capacity)
+            .field("reserve_bytes", &self.reserve_bytes)
+            .field("free_space_ttl", &self.free_space_ttl)
+            .finish_non_exhaustive()
+    }
 }
 
 impl DiskConfig {
@@ -467,6 +540,9 @@ impl DiskConfig {
             writer_threads: 1,
             reader_threads: 2,
             prefetch_capacity: 64,
+            reserve_bytes: 1 << 30,
+            free_space_ttl: std::time::Duration::from_secs(2),
+            free_space_probe: Arc::new(platform_free_bytes),
         }
     }
 
@@ -497,6 +573,21 @@ impl DiskConfig {
 
     pub fn with_prefetch_capacity(mut self, prefetch_capacity: usize) -> Self {
         self.prefetch_capacity = prefetch_capacity;
+        self
+    }
+
+    pub fn with_reserve_bytes(mut self, reserve_bytes: u64) -> Self {
+        self.reserve_bytes = reserve_bytes;
+        self
+    }
+
+    pub fn with_free_space_ttl(mut self, free_space_ttl: std::time::Duration) -> Self {
+        self.free_space_ttl = free_space_ttl;
+        self
+    }
+
+    pub fn with_free_space_probe(mut self, probe: FreeSpaceProbe) -> Self {
+        self.free_space_probe = probe;
         self
     }
 }
@@ -546,6 +637,12 @@ struct Stats {
     prefetch_waits: AtomicU64,
     /// Reads that ran on a reader thread rather than the caller's.
     async_reads: AtomicU64,
+    /// Writes that failed because the filesystem was full. Non-zero
+    /// means the budget lost the race it exists to win.
+    enospc: AtomicU64,
+    /// Eviction passes whose ceiling came from free disk rather than
+    /// from `max_bytes`.
+    space_clamped: AtomicU64,
 }
 
 /// A snapshot of the tier's behaviour. Note the two time-valued fields:
@@ -555,7 +652,10 @@ struct Stats {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct DiskStats {
     pub blocks: usize,
+    /// Everything the store has accepted, published or still buffered.
     pub bytes: u64,
+    /// The subset that has actually reached the filesystem.
+    pub disk_bytes: u64,
     pub queue_depth: usize,
     pub writes: u64,
     pub queued_writes: u64,
@@ -578,6 +678,11 @@ pub struct DiskStats {
     pub prefetch_waits: u64,
     pub async_reads: u64,
     pub staged_blocks: usize,
+    pub enospc: u64,
+    pub space_clamped: u64,
+    /// The ceiling eviction is currently working to: `max_bytes`, or
+    /// less when free disk says so.
+    pub effective_capacity: u64,
 }
 
 struct Entry {
@@ -596,7 +701,14 @@ struct Entry {
 
 struct Index {
     entries: HashMap<BlockHash, Entry>,
+    /// Everything the store has accepted, published or still buffered.
     bytes: u64,
+    /// The subset that is actually occupying filesystem space. The
+    /// free-space budget reasons about this one: a block that has been
+    /// accepted but not written has not taken any disk yet, and
+    /// charging it twice (once here, once as space the device has
+    /// already lost) makes the ceiling oscillate.
+    disk_bytes: u64,
     clock: u64,
 }
 
@@ -604,6 +716,27 @@ impl Index {
     fn touch(&mut self) -> u64 {
         self.clock += 1;
         self.clock
+    }
+
+    fn insert_entry(&mut self, hash: BlockHash, entry: Entry) {
+        let bytes = entry.bytes;
+        if let Some(previous) = self.entries.insert(hash, entry) {
+            self.uncharge(&previous);
+        }
+        self.bytes += bytes;
+    }
+
+    fn remove_entry(&mut self, hash: &BlockHash) -> Option<Entry> {
+        let entry = self.entries.remove(hash)?;
+        self.uncharge(&entry);
+        Some(entry)
+    }
+
+    fn uncharge(&mut self, entry: &Entry) {
+        self.bytes -= entry.bytes;
+        if entry.published {
+            self.disk_bytes -= entry.bytes;
+        }
     }
 }
 
@@ -932,6 +1065,10 @@ struct Hooks {
     in_put_window: Mutex<Option<Hook>>,
     /// Called inside the window between the two steps of publication.
     in_publish_window: Mutex<Option<Hook>>,
+    /// Makes the next write fail as though the filesystem were full,
+    /// which is the one failure that cannot be arranged for real
+    /// without filling a real disk.
+    fail_with_enospc: std::sync::atomic::AtomicBool,
 }
 
 #[cfg(test)]
@@ -971,6 +1108,12 @@ struct Shared {
     staging: Mutex<HashMap<BlockHash, Arc<ReadSlot>>>,
     prefetch_capacity: usize,
     has_readers: bool,
+    reserve_bytes: u64,
+    free_space_ttl: std::time::Duration,
+    free_space_probe: FreeSpaceProbe,
+    /// **Lock order: `index`, then `free_space`.** Eviction reads the
+    /// budget while holding the index.
+    free_space: Mutex<FreeSpace>,
     stats: Stats,
     seq: AtomicU64,
     generation: AtomicU64,
@@ -1026,6 +1169,7 @@ impl DiskKvStore {
             index: Mutex::new(Index {
                 entries: HashMap::new(),
                 bytes: 0,
+                disk_bytes: 0,
                 clock: 0,
             }),
             buffer: Mutex::new(HashMap::new()),
@@ -1034,6 +1178,13 @@ impl DiskKvStore {
             staging: Mutex::new(HashMap::new()),
             prefetch_capacity: config.prefetch_capacity,
             has_readers: config.reader_threads > 0,
+            reserve_bytes: config.reserve_bytes,
+            free_space_ttl: config.free_space_ttl,
+            free_space_probe: Arc::clone(&config.free_space_probe),
+            free_space: Mutex::new(FreeSpace {
+                checked_at: None,
+                bytes: None,
+            }),
             stats: Stats::default(),
             seq: AtomicU64::new(0),
             generation: AtomicU64::new(0),
@@ -1176,9 +1327,19 @@ impl DiskKvStore {
         index.entries.contains_key(hash)
     }
 
-    /// Byte ceiling the store evicts against.
+    /// Byte ceiling an operator configured.
     pub fn capacity(&self) -> u64 {
         self.shared.max_bytes
+    }
+
+    /// The ceiling eviction is actually working to right now: the
+    /// configured one, or less when free disk says so.
+    pub fn effective_capacity(&self) -> u64 {
+        let used = {
+            let index = self.shared.index.lock().expect("kv disk index poisoned");
+            index.bytes
+        };
+        self.shared.effective_capacity(used)
     }
 
     /// Where a block's file lives (or would). Useful to an operator
@@ -1306,7 +1467,7 @@ impl Shared {
     fn reserve(&self, hash: BlockHash, bytes: u64, generation: u64) {
         let mut index = self.index.lock().expect("kv disk index poisoned");
         let last_used = index.touch();
-        if let Some(previous) = index.entries.insert(
+        index.insert_entry(
             hash,
             Entry {
                 bytes,
@@ -1314,10 +1475,7 @@ impl Shared {
                 published: false,
                 generation,
             },
-        ) {
-            index.bytes -= previous.bytes;
-        }
-        index.bytes += bytes;
+        );
         let victims = self.collect_victims(&mut index, Some(&hash));
         drop(index);
         self.discard(victims);
@@ -1335,9 +1493,7 @@ impl Shared {
                 .get(hash)
                 .is_some_and(|e| e.generation == generation)
             {
-                if let Some(entry) = index.entries.remove(hash) {
-                    index.bytes -= entry.bytes;
-                }
+                index.remove_entry(hash);
             }
         }
         self.release_buffer(hash, generation);
@@ -1357,8 +1513,17 @@ impl Shared {
         {
             let mut file =
                 fs::File::create(&tmp_path).map_err(|e| io_err("create", &tmp_path, e))?;
-            if let Err(e) = file.write_all(&bytes) {
+            #[cfg(test)]
+            let written = if self.hooks.fail_with_enospc.load(Ordering::Relaxed) {
+                Err(io::Error::from(io::ErrorKind::StorageFull))
+            } else {
+                file.write_all(&bytes)
+            };
+            #[cfg(not(test))]
+            let written = file.write_all(&bytes);
+            if let Err(e) = written {
                 let _ = fs::remove_file(&tmp_path);
+                self.note_if_enospc(&e);
                 return Err(io_err("write", &tmp_path, e));
             }
             // Without this the rename can be durable while the contents
@@ -1366,6 +1531,7 @@ impl Shared {
             // block file appears after a power loss.
             if let Err(e) = file.sync_all() {
                 let _ = fs::remove_file(&tmp_path);
+                self.note_if_enospc(&e);
                 return Err(io_err("sync", &tmp_path, e));
             }
         }
@@ -1417,7 +1583,11 @@ impl Shared {
         let mut index = self.index.lock().expect("kv disk index poisoned");
         match index.entries.get_mut(hash) {
             Some(entry) if entry.generation == generation => {
-                entry.published = true;
+                if !entry.published {
+                    entry.published = true;
+                    let bytes = entry.bytes;
+                    index.disk_bytes += bytes;
+                }
                 true
             }
             _ => false,
@@ -1597,6 +1767,76 @@ impl Shared {
         }
     }
 
+    /// The ceiling eviction works to, given how many bytes the store
+    /// currently holds.
+    ///
+    /// `max_bytes` is what an operator asked for; free disk is what the
+    /// machine can actually give. The store may occupy what it already
+    /// occupies plus whatever the filesystem still has, less a reserve:
+    ///
+    /// ```text
+    /// effective = min(max_bytes, used + free - reserve)
+    /// ```
+    ///
+    /// As free space falls below the reserve the ceiling drops below
+    /// `used`, so the next write evicts instead of pushing the
+    /// filesystem to `ENOSPC`. That is the whole point: the cache
+    /// should give the disk back before the disk takes it back.
+    fn effective_capacity(&self, used: u64) -> u64 {
+        let Some(free) = self.free_bytes() else {
+            return self.max_bytes;
+        };
+        // `free - reserve` is deliberately signed. Clamping it at zero
+        // would make the ceiling equal `used` exactly when the disk is
+        // fullest -- the store would sit still and let the filesystem
+        // do the refusing, which is the failure this whole budget
+        // exists to avoid.
+        let headroom = free as i128 - self.reserve_bytes as i128;
+        let allowed = (used as i128 + headroom).max(0) as u64;
+        self.max_bytes.min(allowed)
+    }
+
+    /// Free space, re-measured at most once per TTL. A `statvfs` per
+    /// block write would be a syscall on the write path for a number
+    /// that moves slowly.
+    fn free_bytes(&self) -> Option<u64> {
+        let mut cache = self.free_space.lock().expect("kv disk free space poisoned");
+        if let Some(checked_at) = cache.checked_at {
+            if checked_at.elapsed() < self.free_space_ttl {
+                return cache.bytes;
+            }
+        }
+        let bytes = (self.free_space_probe)(&self.root);
+        cache.checked_at = Some(Instant::now());
+        cache.bytes = bytes;
+        bytes
+    }
+
+    /// The filesystem said "full". Whatever the cached free-space
+    /// reading says, it is wrong *now*, so it is thrown away rather
+    /// than left to expire -- and an eviction pass runs immediately, so
+    /// the next write has somewhere to go.
+    fn note_enospc(&self) {
+        self.stats.enospc.fetch_add(1, Ordering::Relaxed);
+        {
+            let mut cache = self.free_space.lock().expect("kv disk free space poisoned");
+            cache.checked_at = None;
+            cache.bytes = None;
+        }
+        let victims = {
+            let mut index = self.index.lock().expect("kv disk index poisoned");
+            self.collect_victims(&mut index, None)
+        };
+        self.discard(victims);
+    }
+
+    /// Recognises the one I/O error the budget exists to prevent.
+    fn note_if_enospc(&self, err: &io::Error) {
+        if err.kind() == io::ErrorKind::StorageFull {
+            self.note_enospc();
+        }
+    }
+
     fn read_timed(&self, path: &Path, hash: &BlockHash, expected: &CacheSignature) -> ReadOutcome {
         let started = Instant::now();
         let outcome = self.read_verified(path, hash, expected);
@@ -1661,9 +1901,7 @@ impl Shared {
 
     fn drop_entry(&self, hash: &BlockHash) {
         let mut index = self.index.lock().expect("kv disk index poisoned");
-        if let Some(entry) = index.entries.remove(hash) {
-            index.bytes -= entry.bytes;
-        }
+        index.remove_entry(hash);
     }
 
     fn reindex(&self) -> Result<usize, StoreError> {
@@ -1708,7 +1946,7 @@ impl Shared {
                 continue;
             }
             let last_used = index.touch();
-            index.entries.insert(
+            index.insert_entry(
                 hash,
                 Entry {
                     bytes,
@@ -1717,7 +1955,7 @@ impl Shared {
                     generation: self.next_generation(),
                 },
             );
-            index.bytes += bytes;
+            index.disk_bytes += bytes;
             adopted += 1;
         }
         let victims = self.collect_victims(&mut index, None);
@@ -1732,7 +1970,14 @@ impl Shared {
     /// from the index is unreachable, whereas a file deleted while the
     /// index still points at it would be a hit that fails to open.
     fn collect_victims(&self, index: &mut Index, protect: Option<&BlockHash>) -> Vec<Victim> {
-        let budget = self.max_bytes;
+        // Computed once per pass, against the pre-eviction size. It has
+        // to be: the ceiling is a function of how much the store
+        // already occupies, so re-evaluating it as blocks leave would
+        // make eviction chase its own tail down to empty.
+        let budget = self.effective_capacity(index.disk_bytes);
+        if budget < self.max_bytes {
+            self.stats.space_clamped.fetch_add(1, Ordering::Relaxed);
+        }
         if index.bytes <= budget {
             return Vec::new();
         }
@@ -1748,8 +1993,7 @@ impl Shared {
             if index.bytes <= budget {
                 break;
             }
-            if let Some(entry) = index.entries.remove(&hash) {
-                index.bytes -= entry.bytes;
+            if let Some(entry) = index.remove_entry(&hash) {
                 self.stats.evictions.fetch_add(1, Ordering::Relaxed);
                 self.stats
                     .evicted_bytes
@@ -1810,6 +2054,10 @@ impl Shared {
             prefetch_waits: stats.prefetch_waits.load(Ordering::Relaxed),
             async_reads: stats.async_reads.load(Ordering::Relaxed),
             staged_blocks: self.staging.lock().expect("kv disk staging poisoned").len(),
+            enospc: stats.enospc.load(Ordering::Relaxed),
+            space_clamped: stats.space_clamped.load(Ordering::Relaxed),
+            effective_capacity: self.effective_capacity(index.disk_bytes),
+            disk_bytes: index.disk_bytes,
         }
     }
 
@@ -1910,13 +2158,22 @@ mod tests {
         BlockHasher::new("model-a", &[] as &[&str]).chain(&[n, n + 1], 2)[0]
     }
 
+    /// A free-space probe that reports a terabyte. Tests must not
+    /// depend on how full the machine's real disk happens to be -- that
+    /// is exactly the variable the budget tests below control on
+    /// purpose.
+    fn plenty() -> FreeSpaceProbe {
+        Arc::new(|_: &Path| Some(1 << 40))
+    }
+
     /// Default test store: everything on the calling thread, so a test
     /// that does not care about the writer pool never races it.
     fn store(dir: &TempDir, max_bytes: u64) -> DiskKvStore {
         DiskKvStore::open(
             DiskConfig::new(dir.path())
                 .with_max_bytes(max_bytes)
-                .with_writer_threads(0),
+                .with_writer_threads(0)
+                .with_free_space_probe(plenty()),
         )
         .expect("open")
     }
@@ -1974,7 +2231,8 @@ mod tests {
         let store = DiskKvStore::open(
             DiskConfig::new(dir.path())
                 .with_shard_chars(2)
-                .with_writer_threads(0),
+                .with_writer_threads(0)
+                .with_free_space_probe(plenty()),
         )
         .expect("open");
         let h = hash(3);
@@ -2442,7 +2700,8 @@ mod tests {
                     // Tight enough that eviction runs constantly.
                     .with_max_bytes(one * 8)
                     .with_queue_capacity(4)
-                    .with_writer_threads(2),
+                    .with_writer_threads(2)
+                    .with_free_space_probe(plenty()),
             )
             .expect("open"),
         );
@@ -2543,7 +2802,8 @@ mod tests {
             DiskConfig::new(dir.path())
                 .with_queue_capacity(2)
                 // Nothing drains the queue, so it stays full.
-                .with_writer_threads(0),
+                .with_writer_threads(0)
+                .with_free_space_probe(plenty()),
         )
         .expect("open");
 
@@ -2629,7 +2889,8 @@ mod tests {
         DiskKvStore::open(
             DiskConfig::new(dir.path())
                 .with_writer_threads(0)
-                .with_reader_threads(readers),
+                .with_reader_threads(readers)
+                .with_free_space_probe(plenty()),
         )
         .expect("open")
     }
@@ -2776,7 +3037,8 @@ mod tests {
             DiskConfig::new(dir.path())
                 .with_writer_threads(0)
                 .with_reader_threads(1)
-                .with_prefetch_capacity(2),
+                .with_prefetch_capacity(2)
+                .with_free_space_probe(plenty()),
         )
         .expect("open");
         let hashes: Vec<BlockHash> = (0..6).map(|i| hash(840 + i)).collect();
@@ -2873,5 +3135,263 @@ mod tests {
         assert_eq!(store.stats().staged_blocks, 1);
         store.clear_prefetch();
         assert_eq!(store.stats().staged_blocks, 0);
+    }
+
+    // ---------------------------------------------------------------
+    // The disk budget
+    // ---------------------------------------------------------------
+
+    /// A store whose free-space reading the test controls.
+    fn budgeted_store(
+        dir: &TempDir,
+        max_bytes: u64,
+        reserve: u64,
+        ttl: std::time::Duration,
+        probe: FreeSpaceProbe,
+    ) -> DiskKvStore {
+        DiskKvStore::open(
+            DiskConfig::new(dir.path())
+                .with_max_bytes(max_bytes)
+                .with_reserve_bytes(reserve)
+                .with_free_space_ttl(ttl)
+                .with_free_space_probe(probe)
+                .with_writer_threads(0)
+                .with_reader_threads(0),
+        )
+        .expect("open")
+    }
+
+    /// Bytes really occupying the store's directory. The device model
+    /// below is driven by this rather than by the store's own
+    /// accounting, so the test cannot pass by agreeing with itself.
+    fn dir_bytes(root: &Path) -> u64 {
+        let mut total = 0;
+        let Ok(entries) = fs::read_dir(root) else {
+            return 0;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                total += dir_bytes(&path);
+            } else if let Ok(meta) = entry.metadata() {
+                total += meta.len();
+            }
+        }
+        total
+    }
+
+    /// The budget the plan asks for: the configured ceiling is an upper
+    /// bound, and real free disk can lower it. When the filesystem
+    /// fills up under a store that is nowhere near its byte budget,
+    /// eviction is what fires -- not `ENOSPC`.
+    ///
+    /// The probe models a real device: free space is what the modelled
+    /// device has left after the store's actual files, so evicting
+    /// really does give space back and the ceiling has a fixed point
+    /// instead of chasing itself down to empty.
+    #[test]
+    fn the_ceiling_falls_when_the_filesystem_fills_up() {
+        let dir = TempDir::new("budget");
+        let one = encoded_len(block("model-a", 1, 4, 1.0).signature());
+        let device = Arc::new(AtomicU64::new(1 << 40));
+        let probe: FreeSpaceProbe = {
+            let device = Arc::clone(&device);
+            let root = dir.path().to_path_buf();
+            Arc::new(move |_: &Path| {
+                Some(
+                    device
+                        .load(Ordering::Relaxed)
+                        .saturating_sub(dir_bytes(&root)),
+                )
+            })
+        };
+        // Room for a hundred blocks by byte budget; two blocks' worth
+        // of headroom demanded on the device.
+        let reserve = one * 2;
+        let store = budgeted_store(&dir, one * 100, reserve, std::time::Duration::ZERO, probe);
+
+        for i in 0..4 {
+            put_now(&store, hash(900 + i), block("model-a", 1, 4, i as f32));
+        }
+        assert_eq!(store.stats().blocks, 4);
+        assert_eq!(store.stats().evictions, 0, "nothing binds yet");
+        assert_eq!(
+            store.effective_capacity(),
+            store.capacity(),
+            "with a terabyte free the configured budget is the ceiling"
+        );
+
+        // The device turns out to be small -- or something else on it
+        // grew. Six blocks total, of which two must stay free.
+        device.store(one * 6, Ordering::Relaxed);
+        assert_eq!(
+            store.effective_capacity(),
+            one * 4,
+            "the ceiling must follow the device down to total - reserve"
+        );
+
+        for i in 0..6 {
+            put_now(&store, hash(910 + i), block("model-a", 1, 4, i as f32));
+            let on_disk = dir_bytes(dir.path());
+            assert!(
+                on_disk + reserve <= one * 6,
+                "the store must hand the device its reserve back before the \
+                 filesystem has to: {on_disk} bytes used of {}, {reserve} reserved",
+                one * 6
+            );
+        }
+
+        let stats = store.stats();
+        assert_eq!(stats.blocks, 4, "settled at total - reserve");
+        assert!(stats.evictions >= 6, "got {}", stats.evictions);
+        assert!(stats.space_clamped > 0, "the clamp must be visible");
+        assert!(
+            stats.bytes < one * 100,
+            "far under the configured budget it never reached"
+        );
+        assert_eq!(
+            stats.disk_bytes,
+            dir_bytes(dir.path()),
+            "the store's idea of its disk footprint must be the real one"
+        );
+    }
+
+    /// `statvfs` is a syscall, and free space moves slowly. It is read
+    /// at most once per TTL rather than once per block written.
+    #[test]
+    fn the_free_space_reading_is_cached_for_its_ttl() {
+        let dir = TempDir::new("ttl");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let probe: FreeSpaceProbe = {
+            let calls = Arc::clone(&calls);
+            Arc::new(move |_: &Path| {
+                calls.fetch_add(1, Ordering::Relaxed);
+                Some(1 << 40)
+            })
+        };
+        let store = budgeted_store(&dir, 1 << 20, 0, std::time::Duration::from_secs(60), probe);
+
+        for _ in 0..5 {
+            store.effective_capacity();
+        }
+        for i in 0..3 {
+            put_now(&store, hash(920 + i), block("model-a", 1, 4, i as f32));
+        }
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            1,
+            "a TTL'd reading must not be re-taken per operation"
+        );
+    }
+
+    /// The invalidation that matters: at the moment the filesystem says
+    /// "full", the cached reading is known to be wrong, so it is thrown
+    /// away rather than left to expire. And the store does not keep an
+    /// index entry for a block it could not write.
+    #[test]
+    fn enospc_throws_away_the_cached_free_space() {
+        let dir = TempDir::new("enospc");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let probe: FreeSpaceProbe = {
+            let calls = Arc::clone(&calls);
+            Arc::new(move |_: &Path| {
+                calls.fetch_add(1, Ordering::Relaxed);
+                Some(1 << 40)
+            })
+        };
+        let store = budgeted_store(
+            &dir,
+            1 << 20,
+            0,
+            // Long enough that nothing but the ENOSPC can re-take it.
+            std::time::Duration::from_secs(3600),
+            probe,
+        );
+        let h = hash(930);
+        put_now(&store, h, block("model-a", 1, 4, 1.0));
+        store.effective_capacity();
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+
+        store
+            .shared
+            .hooks
+            .fail_with_enospc
+            .store(true, Ordering::Relaxed);
+        let full = hash(931);
+        let err = store
+            .put_blocking(full, block("model-a", 1, 4, 2.0))
+            .expect_err("a full filesystem must be reported, not swallowed");
+        assert!(matches!(err, StoreError::Io { .. }), "{err}");
+
+        let stats = store.stats();
+        assert_eq!(stats.enospc, 1);
+        assert!(
+            calls.load(Ordering::Relaxed) > 1,
+            "ENOSPC must invalidate the cached reading immediately"
+        );
+        assert!(
+            !store.contains(&full),
+            "a block that could not be written must not be indexed"
+        );
+        assert_eq!(stats.write_failures, 1);
+        let leftovers: Vec<_> = fs::read_dir(dir.path().join(TMP_DIR))
+            .expect("tmp dir")
+            .flatten()
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "a failed write must clean up after itself: {leftovers:?}"
+        );
+
+        // The block written before the failure is untouched.
+        assert!(store
+            .get(&h, &expected("model-a", 1, 4))
+            .expect("get")
+            .is_some());
+
+        // And once there is room again, writing resumes.
+        store
+            .shared
+            .hooks
+            .fail_with_enospc
+            .store(false, Ordering::Relaxed);
+        put_now(&store, full, block("model-a", 1, 4, 2.0));
+        assert!(store.contains(&full));
+    }
+
+    /// A filesystem that cannot be measured is not treated as full, and
+    /// not treated as infinite either: the configured budget is simply
+    /// the only ceiling.
+    #[test]
+    fn an_unmeasurable_filesystem_falls_back_to_the_configured_budget() {
+        let dir = TempDir::new("unknowable");
+        let store = budgeted_store(
+            &dir,
+            1 << 20,
+            1 << 30,
+            std::time::Duration::ZERO,
+            Arc::new(|_: &Path| None),
+        );
+        assert_eq!(store.effective_capacity(), 1 << 20);
+        for i in 0..3 {
+            put_now(&store, hash(940 + i), block("model-a", 1, 4, i as f32));
+        }
+        assert_eq!(store.stats().blocks, 3);
+        assert_eq!(store.stats().evictions, 0);
+    }
+
+    /// The real probe, exercised: it is `unsafe` FFI, and a binding
+    /// that silently returned nonsense would disable the whole budget
+    /// without failing anything else.
+    #[test]
+    #[cfg(unix)]
+    fn the_platform_probe_measures_a_real_filesystem() {
+        let dir = TempDir::new("statvfs");
+        let free = platform_free_bytes(dir.path()).expect("statvfs on a directory that exists");
+        assert!(free > 0, "a writable temp dir with zero bytes free?");
+        assert!(
+            platform_free_bytes(&dir.path().join("no-such-dir")).is_none(),
+            "a path that does not exist cannot report free space"
+        );
     }
 }

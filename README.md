@@ -4,13 +4,6 @@
 and MoE checkpoints on CPU, Apple Metal, or CUDA, with a llama.cpp-style
 CLI and an OpenAI-compatible HTTP server.
 
-CPU and Metal are the measured backends — every speed claim is pinned
-against llama.cpp on the same host and GGUF, in
-[`benchmarks/RESULTS.md`](benchmarks/RESULTS.md). CUDA builds and runs
-but is held to "must compile": no pinned benchmark host, no published
-receipts. Treat a Windows or Linux install as CPU-only in practice
-([`docs/FEATURES.md`](docs/FEATURES.md)).
-
 ## Quick start
 
 ### Install

@@ -545,6 +545,7 @@ dependencies = [
  "ferrox-gguf",
  "ferrox-metal",
  "ferrox-quant",
+ "libc",
  "memmap2",
  "rayon",
  "sha2 0.10.9",

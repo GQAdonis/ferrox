@@ -21,6 +21,12 @@ sha2 = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
 
+# `statvfs` for kv_disk's free-space budget. Unix only; elsewhere the
+# probe reports "unknown" and the configured byte budget is the only
+# ceiling.
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
 [features]
 default = []
 # Propagates to ferrox-cuda's own `cuda` feature (real NVRTC-compiled

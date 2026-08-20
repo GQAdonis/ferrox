@@ -102,6 +102,12 @@ fn acquire_pooled_caches(
 pub enum FinishReason {
     Stop,
     Length,
+    /// A canceller asked for this generation to stop; see the `cancel`
+    /// module. Deliberately not folded into `Stop`: the tokens that did
+    /// arrive are a partial answer, and a client that cannot tell a
+    /// completed answer from an interrupted one will show the second as
+    /// the first.
+    Cancelled,
 }
 
 impl FinishReason {
@@ -109,6 +115,11 @@ impl FinishReason {
         match self {
             FinishReason::Stop => "stop",
             FinishReason::Length => "length",
+            // Not an OpenAI-defined value -- OpenAI has no cancel
+            // endpoint to produce one. A client that does not know the
+            // string still sees a terminated stream with *a* finish
+            // reason, which is what stops it being read as truncation.
+            FinishReason::Cancelled => "cancelled",
         }
     }
 }
@@ -135,6 +146,26 @@ pub struct GenerationParams {
     /// validate the emitted text is a JSON object (best-effort; see
     /// `json_mode` module).
     pub json_object: bool,
+    /// Cooperative stop flag, polled once per decoded token.
+    ///
+    /// It rides on the params rather than being a separate argument
+    /// because every path that already threads params through -- the
+    /// streaming and non-streaming chat handlers, `/v1/completions`,
+    /// the Anthropic surface -- then gets cancellation without a new
+    /// parameter each, and a caller that has no cancellation to offer
+    /// leaves it `None`. See the `cancel` module for the two tiers that
+    /// set it.
+    pub cancel: Option<crate::cancel::CancelToken>,
+}
+
+impl GenerationParams {
+    /// Whether a canceller has asked this generation to stop.
+    ///
+    /// `None` -- no cancellation wired up -- is never cancelled, so a
+    /// caller that does not care pays one branch and no atomic.
+    pub(crate) fn is_cancelled(&self) -> bool {
+        self.cancel.as_ref().is_some_and(|c| c.is_cancelled())
+    }
 }
 
 fn chunked_prefill_tokens() -> Option<usize> {
@@ -474,6 +505,15 @@ fn sample_until_stop(
     let mut finish = FinishReason::Length;
 
     for _ in 0..params.max_tokens {
+        // The one place cancellation is honoured, shared by `generate`
+        // and `generate_engine`. Checked before sampling so a cancel
+        // that lands between two tokens costs no further work, and
+        // whatever `pending` already holds is still flushed below --
+        // an interrupted answer keeps the tokens it earned.
+        if params.is_cancelled() {
+            finish = FinishReason::Cancelled;
+            break;
+        }
         let next = if params.json_object {
             if let Some(decode_token) = decode_token {
                 let mut mask_fn = |scores: &mut [f32]| {
@@ -642,6 +682,7 @@ mod tests {
             seed: 1,
             stop: Vec::new(),
             json_object: false,
+            cancel: None,
         }
     }
 
@@ -807,6 +848,79 @@ mod tests {
         assert_eq!(finish, FinishReason::Length);
     }
 
+    /// A cancel raised while the loop is running must actually stop it,
+    /// keep whatever was already decoded, and say `Cancelled` -- not
+    /// `Stop`, which a client would render as a finished answer.
+    #[test]
+    fn a_cancelled_generation_stops_early_and_keeps_its_tokens() {
+        let decoder = small_decoder();
+        let prompt = String::from_utf8(vec![1u8, 2, 3]).unwrap();
+        let cancel = crate::cancel::CancelToken::new();
+
+        let mut params = greedy_params(200);
+        params.cancel = Some(cancel.clone());
+
+        let mut chunks = String::new();
+        let mut emitted = 0usize;
+        let (finish, usage) = generate(
+            &decoder,
+            &ServerTokenizer::Byte,
+            None,
+            None,
+            &prompt,
+            &params,
+            None,
+            None,
+            |s| {
+                chunks.push_str(s);
+                emitted += 1;
+                // Stands in for the socket dropping (or `/v1/cancel`
+                // arriving) a few tokens into the answer.
+                if emitted == 3 {
+                    cancel.cancel();
+                }
+            },
+        )
+        .unwrap();
+
+        assert_eq!(finish, FinishReason::Cancelled);
+        assert!(
+            usage.completion_tokens < 200,
+            "cancelling did not shorten the decode: {} tokens",
+            usage.completion_tokens
+        );
+        assert!(
+            !chunks.is_empty(),
+            "the tokens decoded before the cancel must survive it"
+        );
+    }
+
+    /// A generation nobody cancelled must be untouched by the machinery
+    /// -- the flag is polled every token, so a bug here would shorten
+    /// every answer on the server.
+    #[test]
+    fn an_uncancelled_generation_runs_to_its_normal_end() {
+        let decoder = small_decoder();
+        let prompt = String::from_utf8(vec![1u8, 2, 3]).unwrap();
+        let mut params = greedy_params(5);
+        params.cancel = Some(crate::cancel::CancelToken::new());
+
+        let (finish, usage) = generate(
+            &decoder,
+            &ServerTokenizer::Byte,
+            None,
+            None,
+            &prompt,
+            &params,
+            None,
+            None,
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(finish, FinishReason::Length);
+        assert_eq!(usage.completion_tokens, 5);
+    }
+
     /// Discovers the real greedy-argmax next-token id after `prompt_ids`
     /// via `forward_batch` (ground truth: its last returned row predicts
     /// the token immediately after the full prompt, exactly what
@@ -905,6 +1019,7 @@ mod tests {
                 seed: 1,
                 stop: vec!["ZZ_NEVER_MATCHES_ZZ".to_string()],
                 json_object: false,
+                cancel: None,
             },
             None,
             None,
@@ -962,6 +1077,7 @@ mod tests {
                 seed: 1,
                 stop: vec![stop_str],
                 json_object: false,
+                cancel: None,
             },
             None,
             None,

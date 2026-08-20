@@ -38,6 +38,7 @@ mod admin;
 mod anthropic;
 mod batch_scheduler;
 mod cache;
+mod cancel;
 mod chat_template;
 mod generate;
 mod health;
@@ -565,6 +566,10 @@ pub(crate) struct AppState {
     pub(crate) load_in_progress: std::sync::atomic::AtomicBool,
     /// Long-running jobs (download, load) -- see the `tasks` module.
     pub(crate) tasks: Arc<tasks::TaskRegistry>,
+    /// Generations that can currently be stopped by `POST /v1/cancel`
+    /// -- see the `cancel` module for why a dropped socket alone is not
+    /// enough.
+    pub(crate) cancels: Arc<cancel::CancelRegistry>,
     /// Recent-request ring buffer and the counters behind
     /// `/admin/stats` -- see the `stats` module.
     pub(crate) stats: stats::Stats,
@@ -1093,6 +1098,9 @@ impl ChatCompletionRequest {
             seed: self.resolved_seed(),
             stop: self.effective_stop_sequences(),
             json_object: self.json_object_mode(),
+            // Filled in by the handler that owns the request id --
+            // the request body cannot name its own cancel token.
+            cancel: None,
         }
     }
 
@@ -2041,7 +2049,7 @@ async fn chat_completions_stream(
     req: ChatCompletionRequest,
     request_id: String,
     started: std::time::Instant,
-) -> Result<Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>>, ApiError> {
+) -> Result<Response, ApiError> {
     // Streaming requests are never served from or written to the response cache.
     let tools_active = req.tools_active();
     // See `chat_completions_full`: the handle is taken once and the
@@ -2058,8 +2066,15 @@ async fn chat_completions_stream(
     let kv_pool = state.kv_pool.clone();
     let prefix_cache = state.prefix_cache.clone();
     let batcher = active.batcher.clone();
-    let params = req.generation_params_for_template(active.model.chat_template());
+    let mut params = req.generation_params_for_template(active.model.chat_template());
     let stats_state = Arc::clone(&state);
+
+    // Tier two of cancellation: the id is already on the wire, so the
+    // client can name it. The guard rides with the generation task and
+    // deregisters however that task ends, panic included -- see the
+    // `cancel` module.
+    let (cancel_token, cancel_guard) = state.cancels.register(&request_id);
+    params.cancel = Some(cancel_token.clone());
 
     // Tool-call detection needs the full stop-bounded text; continuous
     // batching returns one string. Both stay buffered. Otherwise each
@@ -2069,6 +2084,9 @@ async fn chat_completions_stream(
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Event, Infallible>>(64);
 
     tokio::task::spawn_blocking(move || {
+        // Held for the whole generation; dropping it is what takes the
+        // id back out of the cancel registry.
+        let _cancel_guard = cancel_guard;
         let tx_chunks = tx.clone();
         let mut first = true;
         let head_request_id = request_id.clone();
@@ -2102,7 +2120,20 @@ async fn chat_completions_stream(
                     }],
                     usage: None,
                 };
-                let _ = tx_chunks.blocking_send(Ok(Event::default().json_data(payload).unwrap()));
+                // Tier one of cancellation. A failed send means the SSE
+                // receiver is gone -- the browser tab closed, the
+                // client aborted, the connection dropped -- and until
+                // this was checked the return value was discarded and
+                // the decode loop happily generated the remaining
+                // hundreds of tokens into nothing. Flipping the same
+                // flag `/v1/cancel` sets means there is one stop path,
+                // not two.
+                if tx_chunks
+                    .blocking_send(Ok(Event::default().json_data(payload).unwrap()))
+                    .is_err()
+                {
+                    cancel_token.cancel();
+                }
             },
         );
 
@@ -2255,7 +2286,63 @@ async fn chat_completions_stream(
             rx,
             |mut rx| async move { rx.recv().await.map(|ev| (ev, rx)) },
         );
-    Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
+    // `X-Accel-Buffering: no` is the one header that actually reaches
+    // the problem the plan names: nginx (and the proxies that copied
+    // its convention) buffer `text/event-stream` by default, which
+    // turns a token-by-token stream into one silent wait followed by
+    // the whole answer at once -- indistinguishable, from the browser,
+    // from a hung backend. axum already sets `Cache-Control: no-cache`
+    // on an `Sse` response, so that half is covered.
+    //
+    // The keep-alive comment every 15s is the other half: it gives an
+    // idle-but-healthy stream something to send, so a client's stall
+    // timeout measures the *connection* rather than the model's
+    // time-to-first-token on a long prompt.
+    Ok((
+        [(
+            axum::http::HeaderName::from_static("x-accel-buffering"),
+            axum::http::HeaderValue::from_static("no"),
+        )],
+        Sse::new(stream).keep_alive(KeepAlive::default()),
+    )
+        .into_response())
+}
+
+/// `POST /v1/cancel` -- the explicit half of two-tier cancellation.
+///
+/// Answers `200` when a live generation was signalled and `404` when
+/// the id names nothing that is running. That difference is the whole
+/// point of the endpoint returning a body at all: "already finished"
+/// and "stopped it" are both fine outcomes, but only one of them saved
+/// any work, and a UI told `ok: true` for both will claim it stopped
+/// something it did not.
+async fn cancel_generation(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<ferrox_api::CancelGenerationRequest>,
+) -> Response {
+    let cancelled = state.cancels.cancel(&req.request_id);
+    let status = if cancelled {
+        StatusCode::OK
+    } else {
+        StatusCode::NOT_FOUND
+    };
+    let detail = if cancelled {
+        "the generation was asked to stop; it ends at its next token".to_string()
+    } else {
+        "no generation with that request_id is running -- it has already \
+         finished, was never issued, or was served by a path that does \
+         not register for cancellation"
+            .to_string()
+    };
+    (
+        status,
+        Json(ferrox_api::CancelGenerationResponse {
+            request_id: req.request_id,
+            cancelled,
+            detail,
+        }),
+    )
+        .into_response()
 }
 
 /// Turns a freshly loaded checkpoint into the pair that gets published
@@ -2368,6 +2455,7 @@ fn build_app_state(
         }))),
         load_in_progress: std::sync::atomic::AtomicBool::new(false),
         tasks: Arc::new(tasks::TaskRegistry::new()),
+        cancels: Arc::new(cancel::CancelRegistry::new()),
         stats: stats::Stats::new(),
         model_dir: admin::model_dirs().into_iter().next(),
         response_cache: Mutex::new(ResponseCache::new(1000, Duration::from_secs(3600))),
@@ -2970,6 +3058,10 @@ async fn run(
     let mut protected = Router::new()
         .route(routes::V1_MODELS, get(list_models))
         .route(routes::V1_CHAT_COMPLETIONS, post(chat_completions))
+        // Behind the same key as the endpoint that started the work:
+        // an unauthenticated caller must not be able to stop someone
+        // else's generation by guessing at request ids.
+        .route(routes::V1_CANCEL, post(cancel_generation))
         .route(routes::V1_MESSAGES, post(anthropic::messages))
         .route(routes::V1_COMPLETIONS, post(openai_extra::completions))
         .route(routes::V1_TOKENIZE, post(openai_extra::tokenize))
@@ -3207,6 +3299,7 @@ mod tests {
             seed: 1,
             stop: Vec::new(),
             json_object: false,
+            cancel: None,
         }
     }
 
@@ -3238,6 +3331,7 @@ mod tests {
             }))),
             load_in_progress: std::sync::atomic::AtomicBool::new(false),
             tasks: Arc::new(tasks::TaskRegistry::new()),
+            cancels: Arc::new(cancel::CancelRegistry::new()),
             stats: stats::Stats::new(),
             model_dir: None,
             response_cache: Mutex::new(response_cache),
@@ -3288,6 +3382,7 @@ mod tests {
             )
             .route(ferrox_api::routes::ADMIN_TASKS, get(admin::tasks))
             .route(ferrox_api::routes::ADMIN_STATS, get(admin::stats))
+            .route(ferrox_api::routes::V1_CANCEL, post(cancel_generation))
             .with_state(state)
     }
 
@@ -3557,6 +3652,58 @@ mod tests {
 
     async fn post_json(app: &Router, body: serde_json::Value) -> serde_json::Value {
         post_json_uri(app, "/v1/chat/completions", body).await.1
+    }
+
+    /// Cancelling an id that is not generating must not answer `200`.
+    /// A UI told "ok" for an already-finished request would report that
+    /// it stopped work it did not stop, and the two outcomes are the
+    /// only thing this endpoint exists to distinguish.
+    #[tokio::test]
+    async fn cancelling_an_id_that_is_not_generating_is_a_404_that_says_so() {
+        let app = test_app();
+        let (status, body) = post_json_uri(
+            &app,
+            ferrox_api::routes::V1_CANCEL,
+            serde_json::json!({ "request_id": "chatcmpl-never-issued" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["cancelled"], serde_json::json!(false));
+        assert_eq!(body["request_id"], "chatcmpl-never-issued");
+        assert!(
+            body["detail"].as_str().is_some_and(|d| !d.is_empty()),
+            "the verdict must carry a human reason: {body}"
+        );
+    }
+
+    /// The endpoint reaches the registry the streaming path registers
+    /// into -- not a second, parallel one. Registered by hand here
+    /// because a `oneshot` router cannot hold a stream open.
+    #[tokio::test]
+    async fn cancelling_a_live_generation_signals_its_token_and_answers_200() {
+        let state = Arc::new(test_state(
+            test_model_full_byte_vocab(),
+            ResponseCache::new(1000, Duration::from_secs(3600)),
+        ));
+        let app = test_app_with_state(Arc::clone(&state));
+        let (token, _guard) = state.cancels.register("chatcmpl-live");
+
+        let (status, before) = get_json(&app, ferrox_api::routes::ADMIN_STATS).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(before["generating_now"], serde_json::json!(1));
+
+        let (status, body) = post_json_uri(
+            &app,
+            ferrox_api::routes::V1_CANCEL,
+            serde_json::json!({ "request_id": "chatcmpl-live" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["cancelled"], serde_json::json!(true));
+        assert!(
+            token.is_cancelled(),
+            "the endpoint answered ok without setting the flag the decode loop reads"
+        );
     }
 
     #[tokio::test]

@@ -250,6 +250,10 @@ pub async fn completions(
         seed: req.seed.unwrap_or(0),
         stop: Vec::new(),
         json_object: false,
+        // `/v1/completions` is buffered rather than streamed here, so
+        // there is no first chunk on which to state a request id and
+        // nothing for a client to name in a cancel.
+        cancel: None,
     };
     let model = Arc::clone(&active.model);
     let kv_pool = state.kv_pool.clone();
@@ -275,6 +279,11 @@ pub async fn completions(
     let finish_reason = match finish {
         FinishReason::Stop => "stop",
         FinishReason::Length => "length",
+        // Unreachable today -- this path passes `cancel: None` -- but
+        // written out rather than defaulted so that wiring cancellation
+        // into `/v1/completions` later is a compile error here first,
+        // instead of a completion silently reported as finished.
+        FinishReason::Cancelled => "cancelled",
     };
     let model_name = req.model.unwrap_or_else(|| active.model.name().to_string());
     state.record_request(

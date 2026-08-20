@@ -22,6 +22,7 @@
 //! and a WASM frontend may all link it.
 
 pub mod admin;
+pub mod cancel;
 pub mod health;
 pub mod lifecycle;
 pub mod progress;
@@ -34,6 +35,7 @@ pub use admin::{
     ProgressState, RecentRequest, StatsResponse, TaskAccepted, TaskKind, TaskProgress, TaskStatus,
     TaskView, TasksResponse, UnloadResponse,
 };
+pub use cancel::{CancelGenerationRequest, CancelGenerationResponse};
 pub use health::{Capability, HealthResponse, HealthState};
 pub use lifecycle::{ServerReady, READY_EVENT};
 pub use progress::{RateEstimator, RateReport};

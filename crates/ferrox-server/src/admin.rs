@@ -637,6 +637,7 @@ pub(crate) async fn stats(State(state): State<Arc<AppState>>) -> Response {
         tokens_prompt_total: state.stats.tokens_prompt_total(),
         tokens_generated_total: state.stats.tokens_generated_total(),
         last_request_age_seconds: state.last_request_age_seconds(),
+        generating_now: state.cancels.live_count(),
         recent: state.stats.recent(),
     })
     .into_response()

@@ -52,6 +52,7 @@ mod security;
 mod session;
 mod stats;
 mod tasks;
+mod ui;
 
 use std::convert::Infallible;
 use std::fmt;
@@ -130,7 +131,9 @@ struct ServerArgs {
     )]
     n_gpu_layers: Option<GpuLayers>,
 
-    /// Serve a minimal static chat UI at `/` and `/ui`.
+    /// Serve the embedded Ferrox Studio UI at `/` and `/ui` (chat,
+    /// models, activity and connect screens, all driven by the same
+    /// public HTTP API any other client uses).
     #[arg(long = "ui-server", default_value_t = false)]
     ui_server: bool,
 
@@ -1379,15 +1382,6 @@ async fn list_models(State(state): State<Arc<AppState>>) -> Json<serde_json::Val
         "object": "list",
         "data": [model_entry]
     }))
-}
-
-const UI_HTML: &str = include_str!("../static/ui.html");
-
-async fn ui_page() -> impl IntoResponse {
-    (
-        [(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8")],
-        UI_HTML,
-    )
 }
 
 #[derive(Serialize)]
@@ -2965,9 +2959,12 @@ async fn run(
     let mut public = Router::new().route(routes::HEALTH, get(health));
     if ui_server {
         tracing::info!("web UI enabled at {} and {}", routes::ROOT, routes::UI);
-        public = public
-            .route(routes::ROOT, get(ui_page))
-            .route(routes::UI, get(ui_page));
+        // The shell and its assets are static and carry no data, so
+        // they sit on the unauthenticated side beside /health: the
+        // screen a user needs in order to *enter* an API key cannot
+        // itself be behind that key. Every call the frontend then makes
+        // goes through the same gate as any other client's.
+        public = ui::attach(public);
     }
 
     let mut protected = Router::new()

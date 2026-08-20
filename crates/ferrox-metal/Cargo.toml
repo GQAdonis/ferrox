@@ -7,6 +7,8 @@ repository.workspace = true
 homepage.workspace = true
 description = "Apple Metal kernels for the Ferrox inference engine"
 readme = "README.md"
+keywords = ["metal", "gpu", "llm", "apple", "ferrox"]
+categories = ["hardware-support", "science"]
 
 [dependencies]
 thiserror = { workspace = true }

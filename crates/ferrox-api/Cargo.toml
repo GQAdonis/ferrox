@@ -7,6 +7,8 @@ repository.workspace = true
 homepage.workspace = true
 description = "Shared route constants and wire DTOs for the Ferrox HTTP surface and its clients"
 readme = "README.md"
+keywords = ["llm", "openai", "api", "dto", "ferrox"]
+categories = ["api-bindings", "web-programming"]
 
 [dependencies]
 serde = { workspace = true }

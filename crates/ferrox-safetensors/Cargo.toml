@@ -7,6 +7,8 @@ repository.workspace = true
 homepage.workspace = true
 description = "SafeTensors mmap loader for the Ferrox inference engine"
 readme = "README.md"
+keywords = ["safetensors", "mmap", "llm", "parser", "ferrox"]
+categories = ["parser-implementations", "encoding"]
 
 [dependencies]
 thiserror = { workspace = true }

@@ -7,6 +7,8 @@ repository.workspace = true
 homepage.workspace = true
 description = "Model loaders and decoder stacks for the Ferrox inference engine"
 readme = "README.md"
+keywords = ["llm", "inference", "gguf", "transformer", "ferrox"]
+categories = ["science", "algorithms"]
 
 [dependencies]
 ferrox-core = { workspace = true }

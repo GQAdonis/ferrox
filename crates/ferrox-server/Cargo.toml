@@ -7,6 +7,8 @@ repository.workspace = true
 homepage.workspace = true
 description = "OpenAI-compatible HTTP server for the Ferrox inference engine"
 readme = "README.md"
+keywords = ["llm", "openai", "server", "inference", "ferrox"]
+categories = ["web-programming::http-server", "science"]
 
 [[bin]]
 name = "ferrox-server"

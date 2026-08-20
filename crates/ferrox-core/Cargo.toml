@@ -7,6 +7,8 @@ repository.workspace = true
 homepage.workspace = true
 description = "Core tensor ops, RoPE, GQA, and KV cache for Ferrox"
 readme = "README.md"
+keywords = ["llm", "inference", "attention", "kv-cache", "ferrox"]
+categories = ["algorithms", "science"]
 
 [dependencies]
 ferrox-gguf = { workspace = true }

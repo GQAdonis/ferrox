@@ -7,6 +7,8 @@ repository.workspace = true
 homepage.workspace = true
 description = "GGUF mmap loader for the Ferrox inference engine"
 readme = "README.md"
+keywords = ["gguf", "llm", "mmap", "parser", "ferrox"]
+categories = ["parser-implementations", "encoding"]
 
 [dependencies]
 anyhow = { workspace = true }

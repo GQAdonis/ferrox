@@ -572,6 +572,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "ferrox-inference"
+version = "0.7.0"
+dependencies = [
+ "ferrox-api",
+ "ferrox-core",
+ "ferrox-gguf",
+ "ferrox-models",
+ "ferrox-moe",
+ "ferrox-quant",
+ "ferrox-safetensors",
+]
+
+[[package]]
 name = "ferrox-metal"
 version = "0.7.0"
 dependencies = [

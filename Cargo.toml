@@ -11,6 +11,7 @@ members = [
     "crates/ferrox-server",
     "crates/ferrox-cuda",
     "crates/ferrox-metal",
+    "crates/ferrox-inference",
 ]
 resolver = "2"
 
@@ -55,3 +56,4 @@ ferrox-metal = { version = "0.7.0", path = "crates/ferrox-metal" }
 ferrox-core = { version = "0.7.0", path = "crates/ferrox-core" }
 ferrox-moe = { version = "0.7.0", path = "crates/ferrox-moe" }
 ferrox-models = { version = "0.7.0", path = "crates/ferrox-models" }
+ferrox-inference = { version = "0.7.0", path = "crates/ferrox-inference" }

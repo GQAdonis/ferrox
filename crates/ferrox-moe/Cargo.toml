@@ -7,6 +7,8 @@ repository.workspace = true
 homepage.workspace = true
 description = "Mixture-of-Experts routing and expert dispatch for Ferrox"
 readme = "README.md"
+keywords = ["moe", "llm", "inference", "routing", "ferrox"]
+categories = ["algorithms", "science"]
 
 [dependencies]
 ferrox-core = { workspace = true }

@@ -23,8 +23,9 @@ pub use attention::{
     apply_rope_back, apply_rope_interleaved, apply_rope_interleaved_back,
     apply_rope_interleaved_with_freq_factors, apply_rope_with_freq_factors, causal_gqa_attention,
     causal_gqa_attention_paged, causal_gqa_attention_prefill,
-    causal_gqa_attention_prefill_shared_kv, causal_gqa_attention_softcap,
-    causal_gqa_attention_windowed, causal_gqa_attention_windowed_softcap, lightning_indexer_topk,
+    causal_gqa_attention_prefill_shared_kv, causal_gqa_attention_sinks,
+    causal_gqa_attention_softcap, causal_gqa_attention_windowed,
+    causal_gqa_attention_windowed_softcap, lightning_indexer_topk,
 };
 pub use cache::{
     KvBlockPool, KvCache, KvPoolExhausted, PagedKvCache, PagedKvStore, PagedStoreExhausted,

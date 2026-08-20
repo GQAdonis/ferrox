@@ -316,6 +316,37 @@ pub struct LayerWeights {
     pub moe: MoeWeights,
 }
 
+/// The per-layer weights the gpt-oss graph carries and the generic GQA
+/// layer structs do not.
+///
+/// Held as a side table on [`Decoder`] rather than as new `Option`
+/// fields on [`AttnWeights`]/[`MoeWeights`] for two reasons. The first
+/// is mechanical: those two structs have thirty construction sites
+/// across seven loaders and every dedicated engine, and none of them
+/// will ever set these. The second is the point of the exercise — a
+/// checkpoint either has the whole gpt-oss graph or none of it, so
+/// `Decoder::gpt_oss.is_some()` is a single, checkable predicate for
+/// "this model needs the gpt-oss path", which is what the CPU-only and
+/// paged-attention refusals below key off. Scattering five independent
+/// `Option`s would make "half the graph is wired" representable, and
+/// that state is precisely the silent-wrong-answer bug this work exists
+/// to remove.
+pub struct GptOssLayer {
+    /// `blk.N.attn_sinks.weight`, one learned logit per query head.
+    pub attn_sinks: Vec<f32>,
+    /// `blk.N.attn_output.bias`, added after the output projection.
+    pub o_bias: Vec<f32>,
+    /// `blk.N.ffn_gate_inp.bias`, added to the router logits.
+    pub router_bias: Vec<f32>,
+    /// `blk.N.ffn_{gate,up,down}_exps.bias`, one entry per expert.
+    pub expert_bias: Vec<ferrox_moe::ExpertBias>,
+}
+
+/// gpt-oss side table: one entry per layer, in layer order.
+pub struct GptOssWeights {
+    pub layers: Vec<GptOssLayer>,
+}
+
 pub struct Decoder {
     pub config: ModelConfig,
     /// `[vocab_size, hidden_dim]`. A `WeightMatrix` rather than an
@@ -348,6 +379,13 @@ pub struct Decoder {
     /// performance-tuned; a real, disclosed limit, not a correctness
     /// gap.
     pub gpu_vram_budget_bytes: Option<u64>,
+    /// `Some` only for the gpt-oss family. See [`GptOssWeights`]. When
+    /// set, every layer runs the gpt-oss CPU graph (attention sinks,
+    /// alternating SWA, biased router + experts, `swiglu_oai`), GPU
+    /// offload is refused at load time, and the paged-KV decode path is
+    /// refused at call time — neither implements sinks, and answering
+    /// with a different distribution is the failure this replaces.
+    pub gpt_oss: Option<GptOssWeights>,
     /// Per-layer Metal-resident KV for fused decode/prefill attention
     /// (`FERROX_METAL_ATTN`). Lazily allocated. After
     /// [`ferrox_metal::attn::launch_decode_dense_stack`], Metal KV is
@@ -567,6 +605,8 @@ impl Decoder {
             final_norm,
             output_head,
             gpu_vram_budget_bytes: None,
+            // Synthetic-weights constructor: no checkpoint, no gpt-oss.
+            gpt_oss: None,
             #[cfg(feature = "metal")]
             metal_attn_kv: std::sync::Mutex::new(None),
             execution_plan,
@@ -725,6 +765,13 @@ impl Decoder {
     #[cfg(feature = "metal")]
     fn layer_supports_metal_attn(&self, layer: &LayerWeights) -> bool {
         use crate::config::RopeLayout;
+        // gpt-oss: no Metal kernel implements attention sinks, so the
+        // fused stacks would compute a *different* attention than the
+        // CPU path for the same weights. Keep this family on CPU rather
+        // than letting the two backends disagree. See `Decoder::gpt_oss`.
+        if self.gpt_oss.is_some() {
+            return false;
+        }
         if !matches!(self.config.rope_layout, RopeLayout::Norm | RopeLayout::Neox) {
             return false;
         }
@@ -927,6 +974,10 @@ impl Decoder {
         kv_caches: &[KvCache],
         metal_kvs: Option<&[ferrox_metal::attn::MetalKvBuffers]>,
     ) -> Option<usize> {
+        // See `layer_supports_metal_attn`: gpt-oss stays on CPU.
+        if self.gpt_oss.is_some() {
+            return None;
+        }
         let metal_kvs = metal_kvs?;
         let mut run = 0usize;
         for li in start..self.layers.len() {
@@ -2298,8 +2349,20 @@ impl Decoder {
                     .push(&k, &v)
                     .expect("unbounded/planned KvCache growth is infallible");
 
-                let attn_out = match self.config.layer_sliding_window(l) {
-                    Some(window) => causal_gqa_attention_windowed_softcap(
+                let oai = self.gpt_oss.as_ref().map(|g| &g.layers[l]);
+                let attn_out = match (oai, self.config.layer_sliding_window(l)) {
+                    (Some(oai), window) => ferrox_core::causal_gqa_attention_sinks(
+                        &q,
+                        &cache.k,
+                        &cache.v,
+                        n_heads,
+                        n_kv_heads,
+                        head_dim,
+                        cache.seq_len,
+                        window,
+                        &oai.attn_sinks,
+                    ),
+                    (None, Some(window)) => causal_gqa_attention_windowed_softcap(
                         &q,
                         &cache.k,
                         &cache.v,
@@ -2310,7 +2373,7 @@ impl Decoder {
                         window,
                         self.config.attn_logit_softcap,
                     ),
-                    None => self.gqa_attention(
+                    (None, None) => self.gqa_attention(
                         l,
                         &q,
                         &cache.k,
@@ -2322,6 +2385,11 @@ impl Decoder {
                     ),
                 };
                 let mut projected = layer.attn.o_proj.apply(&attn_out);
+                if let Some(oai) = oai {
+                    for (x, b) in projected.iter_mut().zip(oai.o_bias.iter()) {
+                        *x += b;
+                    }
+                }
                 if let Some(post) = &layer.attn.post_attn_norm {
                     projected = rms_norm(&projected, post, self.config.rms_norm_eps);
                 }
@@ -2332,13 +2400,16 @@ impl Decoder {
 
                 // --- MoE FFN block ---
                 let normed2 = rms_norm(&hidden, &layer.moe.norm_weight, self.config.rms_norm_eps);
-                let mut ffn_out = Self::run_ffn_block(
-                    layer,
-                    &normed2,
-                    &self.config,
-                    hidden_dim,
-                    residency.as_ref().map(|p| p.layer_plan(l)),
-                );
+                let mut ffn_out = match oai {
+                    Some(oai) => Self::gpt_oss_ffn(layer, oai, &normed2, &self.config, hidden_dim),
+                    None => Self::run_ffn_block(
+                        layer,
+                        &normed2,
+                        &self.config,
+                        hidden_dim,
+                        residency.as_ref().map(|p| p.layer_plan(l)),
+                    ),
+                };
                 if let Some(post) = &layer.attn.post_ffn_norm {
                     ffn_out = rms_norm(&ffn_out, post, self.config.rms_norm_eps);
                 }
@@ -2397,6 +2468,16 @@ impl Decoder {
     ) -> Result<Vec<f32>, PagedStoreExhausted> {
         assert_eq!(kv_caches.len(), self.layers.len());
         assert_eq!(stores.len(), self.layers.len());
+        // The paged kernel has no attention-sink term and no
+        // sliding-window arm, so running gpt-oss here would produce a
+        // different distribution than the contiguous path for the same
+        // input -- silently, and only for callers who happened to
+        // configure a KV pool. Refuse instead. See `Decoder::gpt_oss`.
+        assert!(
+            self.gpt_oss.is_none(),
+            "gpt-oss requires attention sinks; the paged-KV decode path does not implement them. \
+             Run this model without a KV pool (FERROX_KV_POOL_BLOCKS unset)."
+        );
         let hidden_dim = self.config.hidden_dim;
         let head_dim = self.config.head_dim;
         let n_heads = self.config.n_heads;
@@ -3071,6 +3152,58 @@ impl Decoder {
             &mut acc,
         );
         Some(acc)
+    }
+
+    /// gpt-oss's MoE FFN for one position.
+    ///
+    /// A separate function rather than another branch inside
+    /// `combine_ffn_outputs_for_position` on purpose: that path carries
+    /// expert-store prefetch, residency placement, a Metal top-k fusion
+    /// and a batched parallel-slot kernel, and every one of them would
+    /// need its own gpt-oss variant to stay honest. This is the whole
+    /// gpt-oss FFN in one readable block, checked end-to-end against
+    /// llama.cpp, and slow — routed experts run serially. It is the
+    /// correct-first shape; making it fast is a separate change with its
+    /// own A/B, not something to smuggle in under a correctness fix.
+    ///
+    /// Ported from `llama-graph.cpp::build_moe_ffn` with
+    /// `gating_op = LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX_WEIGHT`,
+    /// `type_op = LLM_FFN_SWIGLU_OAI_MOE`, `norm_w = false`,
+    /// `w_scale = 1`, all four bias tensors present.
+    fn gpt_oss_ffn(
+        layer: &LayerWeights,
+        oai: &GptOssLayer,
+        normed2: &[f32],
+        config: &ModelConfig,
+        hidden_dim: usize,
+    ) -> Vec<f32> {
+        let mut router_logits = layer.moe.router.apply(normed2);
+        for (x, b) in router_logits.iter_mut().zip(oai.router_bias.iter()) {
+            *x += b;
+        }
+        // Selection on the raw biased logits, softmax over the winners
+        // only -- see `route_top_k_softmax_weight`.
+        let decision =
+            ferrox_moe::route_top_k_softmax_weight(&router_logits, config.moe.n_experts_active);
+        layer.moe.record_activations(&decision.expert_ids);
+
+        let mut out = vec![0f32; hidden_dim];
+        for (slot, &eid) in decision.expert_ids.iter().enumerate() {
+            let w = decision.weights[slot];
+            let expert_out = layer.moe.with_expert(eid, |ex| {
+                ferrox_moe::run_expert_oai(
+                    normed2,
+                    ex,
+                    &oai.expert_bias[eid],
+                    ferrox_moe::SWIGLU_OAI_ALPHA,
+                    ferrox_moe::SWIGLU_OAI_LIMIT,
+                )
+            });
+            for (o, e) in out.iter_mut().zip(expert_out.iter()) {
+                *o += w * e;
+            }
+        }
+        out
     }
 
     /// `forward_token`'s MoE FFN block for one position: the dense
@@ -3748,45 +3881,78 @@ impl Decoder {
             let cache_v = &cache.v;
             let softcap = self.config.attn_logit_softcap;
             let window = self.config.layer_sliding_window(l);
+            let oai = self.gpt_oss.as_ref().map(|g| &g.layers[l]);
             // Non-windowed: Rayon over `[n_q × n_heads]` against one shared
             // KV buffer (Phi-4 CPU pp512). Windowed keeps per-query path.
-            let attn_out_batch = match window {
-                Some(window) => {
-                    let mut out = vec![0f32; batch_size * q_width];
-                    out.par_chunks_mut(q_width)
-                        .enumerate()
-                        .for_each(|(b, dest)| {
-                            let seq_len_b = base_seq_len + b + 1;
-                            let cache_elems = seq_len_b * kv_width;
-                            let attn_out = causal_gqa_attention_windowed_softcap(
-                                &q_batch[b * q_width..(b + 1) * q_width],
-                                &cache_k[..cache_elems],
-                                &cache_v[..cache_elems],
-                                n_heads,
-                                n_kv_heads,
-                                head_dim,
-                                seq_len_b,
-                                window,
-                                softcap,
-                            );
-                            dest.copy_from_slice(&attn_out);
-                        });
-                    out
+            // gpt-oss takes the per-query path on every layer, windowed or
+            // not: the blocked kernel has no sink term.
+            let attn_out_batch = if let Some(oai) = oai {
+                let mut out = vec![0f32; batch_size * q_width];
+                out.par_chunks_mut(q_width)
+                    .enumerate()
+                    .for_each(|(b, dest)| {
+                        let seq_len_b = base_seq_len + b + 1;
+                        let cache_elems = seq_len_b * kv_width;
+                        let attn_out = ferrox_core::causal_gqa_attention_sinks(
+                            &q_batch[b * q_width..(b + 1) * q_width],
+                            &cache_k[..cache_elems],
+                            &cache_v[..cache_elems],
+                            n_heads,
+                            n_kv_heads,
+                            head_dim,
+                            seq_len_b,
+                            window,
+                            &oai.attn_sinks,
+                        );
+                        dest.copy_from_slice(&attn_out);
+                    });
+                out
+            } else {
+                match window {
+                    Some(window) => {
+                        let mut out = vec![0f32; batch_size * q_width];
+                        out.par_chunks_mut(q_width)
+                            .enumerate()
+                            .for_each(|(b, dest)| {
+                                let seq_len_b = base_seq_len + b + 1;
+                                let cache_elems = seq_len_b * kv_width;
+                                let attn_out = causal_gqa_attention_windowed_softcap(
+                                    &q_batch[b * q_width..(b + 1) * q_width],
+                                    &cache_k[..cache_elems],
+                                    &cache_v[..cache_elems],
+                                    n_heads,
+                                    n_kv_heads,
+                                    head_dim,
+                                    seq_len_b,
+                                    window,
+                                    softcap,
+                                );
+                                dest.copy_from_slice(&attn_out);
+                            });
+                        out
+                    }
+                    None => causal_gqa_attention_prefill_shared_kv(
+                        &q_batch,
+                        cache_k,
+                        cache_v,
+                        n_heads,
+                        n_kv_heads,
+                        head_dim,
+                        batch_size,
+                        base_seq_len,
+                        softcap,
+                    ),
                 }
-                None => causal_gqa_attention_prefill_shared_kv(
-                    &q_batch,
-                    cache_k,
-                    cache_v,
-                    n_heads,
-                    n_kv_heads,
-                    head_dim,
-                    batch_size,
-                    base_seq_len,
-                    softcap,
-                ),
             };
 
-            let projected_batch = layer.attn.o_proj.apply_batch(&attn_out_batch, batch_size);
+            let mut projected_batch = layer.attn.o_proj.apply_batch(&attn_out_batch, batch_size);
+            if let Some(oai) = oai {
+                for row in projected_batch.chunks_mut(hidden_dim) {
+                    for (x, b) in row.iter_mut().zip(oai.o_bias.iter()) {
+                        *x += b;
+                    }
+                }
+            }
             let projected_batch = if let Some(post) = &layer.attn.post_attn_norm {
                 projected_batch
                     .chunks(hidden_dim)
@@ -3805,6 +3971,21 @@ impl Decoder {
                 .map(|h| rms_norm(h, &layer.moe.norm_weight, self.config.rms_norm_eps))
                 .flatten()
                 .collect();
+            if let Some(oai) = oai {
+                // gpt-oss: one position at a time through the single
+                // validated FFN. None of the batched fast paths below
+                // knows about router bias, expert bias or swiglu_oai.
+                for b in 0..batch_size {
+                    let normed2 = &normed2_batch[b * hidden_dim..(b + 1) * hidden_dim];
+                    let ffn_out = Self::gpt_oss_ffn(layer, oai, normed2, &self.config, hidden_dim);
+                    let hidden_row = &mut hidden_batch[b * hidden_dim..(b + 1) * hidden_dim];
+                    for (h, f) in hidden_row.iter_mut().zip(ffn_out.iter()) {
+                        *h += f;
+                    }
+                }
+                l += 1;
+                continue;
+            }
             let dense = Self::is_dense_layer(layer);
             // Skip the batched router matmul entirely for a dense
             // layer -- there's nothing to route (see
@@ -4065,6 +4246,7 @@ impl Decoder {
                 }
             }
 
+            let oai = self.gpt_oss.as_ref().map(|g| &g.layers[l]);
             let mut attn_out_batch = vec![0f32; batch_size * q_width];
             for b in 0..batch_size {
                 let cache = &mut kv_caches[b][l];
@@ -4074,6 +4256,21 @@ impl Decoder {
                         &v_batch[b * kv_width..(b + 1) * kv_width],
                     )
                     .expect("unbounded/planned KvCache growth is infallible");
+                if let Some(oai) = oai {
+                    let attn_out = ferrox_core::causal_gqa_attention_sinks(
+                        &q_batch[b * q_width..(b + 1) * q_width],
+                        &cache.k,
+                        &cache.v,
+                        n_heads,
+                        n_kv_heads,
+                        head_dim,
+                        cache.seq_len,
+                        self.config.layer_sliding_window(l),
+                        &oai.attn_sinks,
+                    );
+                    attn_out_batch[b * q_width..(b + 1) * q_width].copy_from_slice(&attn_out);
+                    continue;
+                }
                 let attn_out = match self.config.layer_sliding_window(l) {
                     Some(window) => causal_gqa_attention_windowed_softcap(
                         &q_batch[b * q_width..(b + 1) * q_width],
@@ -4100,7 +4297,14 @@ impl Decoder {
                 attn_out_batch[b * q_width..(b + 1) * q_width].copy_from_slice(&attn_out);
             }
 
-            let projected_batch = layer.attn.o_proj.apply_batch(&attn_out_batch, batch_size);
+            let mut projected_batch = layer.attn.o_proj.apply_batch(&attn_out_batch, batch_size);
+            if let Some(oai) = oai {
+                for row in projected_batch.chunks_mut(hidden_dim) {
+                    for (x, b) in row.iter_mut().zip(oai.o_bias.iter()) {
+                        *x += b;
+                    }
+                }
+            }
             let projected_batch = if let Some(post) = &layer.attn.post_attn_norm {
                 projected_batch
                     .chunks(hidden_dim)
@@ -4120,7 +4324,7 @@ impl Decoder {
                 .flatten()
                 .collect();
             let dense = Self::is_dense_layer(layer);
-            let router_logits_batch = if dense {
+            let router_logits_batch = if dense || oai.is_some() {
                 Vec::new()
             } else {
                 layer.moe.router.apply_batch(&normed2_batch, batch_size)
@@ -4129,7 +4333,9 @@ impl Decoder {
 
             for b in 0..batch_size {
                 let normed2 = &normed2_batch[b * hidden_dim..(b + 1) * hidden_dim];
-                let mut ffn_out = if dense {
+                let mut ffn_out = if let Some(oai) = oai {
+                    Self::gpt_oss_ffn(layer, oai, normed2, &self.config, hidden_dim)
+                } else if dense {
                     Self::run_ffn_block(
                         layer,
                         normed2,

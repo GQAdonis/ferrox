@@ -363,21 +363,18 @@ impl ModelConfig {
             .filter(|&p| p > 1)
             .or_else(|| {
                 sliding_window?;
-                match arch_profile.family {
-                    crate::capability::DecoderFamily::GemmaFamily => {
-                        // Prefer architecture string: gemma2 → 2, else gemma3+ → 6.
-                        let arch = file
-                            .metadata_str("general.architecture")
-                            .unwrap_or("")
-                            .to_ascii_lowercase();
-                        if arch == "gemma2" || arch.starts_with("gemma2") {
-                            Some(2)
-                        } else {
-                            Some(6)
-                        }
-                    }
-                    _ => None,
-                }
+                // llama.cpp hardcodes the period per architecture and
+                // only lets the metadata key override it, so a missing
+                // key is *not* "every layer windowed" — see
+                // `capability::default_swa_pattern`.
+                crate::capability::default_swa_pattern(&arch).or(
+                    // Any Gemma variant not named in the table keeps the
+                    // gemma3+ period rather than going uniform.
+                    match arch_profile.family {
+                        crate::capability::DecoderFamily::GemmaFamily => Some(6),
+                        _ => None,
+                    },
+                )
             });
 
         let attn_logit_softcap = metadata_f32_any(
@@ -407,14 +404,22 @@ impl ModelConfig {
         // `build_attn(..., 1.0f)` after an explicit Q scale).
         let attention_scale = None;
 
-        // SWA-layer RoPE base (llama.cpp default 10000 when key absent).
+        // SWA-layer RoPE base. `llama_hparams` defaults it to 10000 and
+        // the Gemma-3 lineage relies on that default; the architectures
+        // in `swa_rope_base_follows_model` instead seed it from the
+        // model's own base before the key can override.
         let rope_theta_swa = if sliding_window.is_some() {
+            let fallback = if crate::capability::swa_rope_base_follows_model(&arch) {
+                rope_theta
+            } else {
+                10_000.0
+            };
             Some(
                 metadata_f32_any(
                     file,
                     &[key("rope.freq_base_swa"), key("rope_freq_base_swa")],
                 )
-                .unwrap_or(10_000.0),
+                .unwrap_or(fallback),
             )
         } else {
             None
@@ -597,6 +602,95 @@ fn quant_kind_for(dtype: GgmlType) -> Option<QuantKind> {
 /// width, not per-head). Absent for every other preset/fixture this
 /// loader already handles -- `None` there is correct, not a missing
 /// feature.
+/// Loads the five gpt-oss-only tensors for one layer.
+///
+/// Every one of them is **required**: a gpt-oss checkpoint that is
+/// missing any of these is not a gpt-oss checkpoint ferrox can run, and
+/// quietly substituting zeros would reintroduce exactly the
+/// silently-wrong-graph failure this path exists to remove. The lengths
+/// are asserted against the config for the same reason — a bias of the
+/// wrong width would otherwise be applied to a `zip`-truncated prefix
+/// and produce a plausible, wrong answer.
+///
+/// Shapes follow `src/models/openai-moe.cpp::load_arch_tensors`:
+/// `attn_sinks {n_head}`, `attn_output.bias {n_embd}`,
+/// `ffn_gate_inp.bias {n_expert}`, `ffn_{gate,up}_exps.bias
+/// {n_ff_exp, n_expert}`, `ffn_down_exps.bias {n_embd, n_expert}`.
+/// GGUF stores the fastest dimension first, so the 2-D bias tensors
+/// arrive expert-major and split by simple chunking.
+fn load_gpt_oss_layer(
+    file: &impl TensorSource,
+    l: usize,
+    config: &ModelConfig,
+) -> Result<crate::decoder::GptOssLayer, LoadError> {
+    let n_experts = config.moe.n_experts;
+    let ff = config.moe.expert_ffn_dim;
+
+    let want = |name: &str, got: usize, expect: usize| -> Result<(), LoadError> {
+        if got == expect {
+            Ok(())
+        } else {
+            Err(LoadError::UnsupportedFeature(
+                config.name.to_string(),
+                format!("{name} has {got} elements, expected {expect}"),
+            ))
+        }
+    };
+
+    let attn_sinks = load_f32_vec(file, &format!("blk.{l}.attn_sinks.weight"))?;
+    want(
+        &format!("blk.{l}.attn_sinks.weight"),
+        attn_sinks.len(),
+        config.n_heads,
+    )?;
+    let o_bias = load_f32_vec(file, &format!("blk.{l}.attn_output.bias"))?;
+    want(
+        &format!("blk.{l}.attn_output.bias"),
+        o_bias.len(),
+        config.hidden_dim,
+    )?;
+    let router_bias = load_f32_vec(file, &format!("blk.{l}.ffn_gate_inp.bias"))?;
+    want(
+        &format!("blk.{l}.ffn_gate_inp.bias"),
+        router_bias.len(),
+        n_experts,
+    )?;
+
+    let gate_b = load_f32_vec(file, &format!("blk.{l}.ffn_gate_exps.bias"))?;
+    want(
+        &format!("blk.{l}.ffn_gate_exps.bias"),
+        gate_b.len(),
+        n_experts * ff,
+    )?;
+    let up_b = load_f32_vec(file, &format!("blk.{l}.ffn_up_exps.bias"))?;
+    want(
+        &format!("blk.{l}.ffn_up_exps.bias"),
+        up_b.len(),
+        n_experts * ff,
+    )?;
+    let down_b = load_f32_vec(file, &format!("blk.{l}.ffn_down_exps.bias"))?;
+    want(
+        &format!("blk.{l}.ffn_down_exps.bias"),
+        down_b.len(),
+        n_experts * config.hidden_dim,
+    )?;
+
+    let expert_bias = (0..n_experts)
+        .map(|e| ferrox_moe::ExpertBias {
+            gate: gate_b[e * ff..(e + 1) * ff].to_vec(),
+            up: up_b[e * ff..(e + 1) * ff].to_vec(),
+            down: down_b[e * config.hidden_dim..(e + 1) * config.hidden_dim].to_vec(),
+        })
+        .collect();
+
+    Ok(crate::decoder::GptOssLayer {
+        attn_sinks,
+        o_bias,
+        router_bias,
+        expert_bias,
+    })
+}
+
 fn load_f32_vec_optional(
     file: &impl TensorSource,
     name: &str,
@@ -1320,6 +1414,18 @@ impl Decoder {
         let path = path.as_ref();
         let file = ShardedGguf::open(path)?;
 
+        // gpt-oss carries five per-layer tensors the generic GQA layer
+        // structs have no home for, and reuses `post_attention_norm` for
+        // a *different* norm slot than Gemma does. Both are decided by
+        // the architecture string, so resolve it once here. See
+        // `crate::decoder::GptOssWeights`.
+        let arch = file
+            .metadata_str("general.architecture")
+            .unwrap_or_default()
+            .to_string();
+        let is_gpt_oss = arch == "gpt-oss";
+        let mut gpt_oss_layers: Vec<crate::decoder::GptOssLayer> = Vec::new();
+
         // One store for the whole model (keys are (layer, expert)),
         // built up-front with every stored expert's segments; created
         // only when the cache is enabled AND some layer can use it.
@@ -1372,10 +1478,16 @@ impl Decoder {
                 q_bias: load_f32_vec_optional(&file, &format!("blk.{l}.attn_q.bias"))?,
                 k_bias: load_f32_vec_optional(&file, &format!("blk.{l}.attn_k.bias"))?,
                 v_bias: load_f32_vec_optional(&file, &format!("blk.{l}.attn_v.bias"))?,
-                post_attn_norm: load_f32_vec_optional(
-                    &file,
-                    &format!("blk.{l}.post_attention_norm.weight"),
-                )?,
+                // gpt-oss ships `post_attention_norm` but applies it in
+                // Gemma's *other* slot: llama.cpp's openai-moe graph
+                // norms `ffn_inp` with it after the attention residual,
+                // i.e. it is the pre-FFN norm, not a post-attention one.
+                // It is read below into `MoeWeights::norm_weight`.
+                post_attn_norm: if is_gpt_oss {
+                    None
+                } else {
+                    load_f32_vec_optional(&file, &format!("blk.{l}.post_attention_norm.weight"))?
+                },
                 post_ffn_norm: load_f32_vec_optional(
                     &file,
                     &format!("blk.{l}.post_ffw_norm.weight"),
@@ -1536,11 +1648,19 @@ impl Decoder {
                 experts,
                 shared_experts,
                 shared_expert_gate,
-                norm_weight: load_f32_vec(&file, &format!("blk.{l}.ffn_norm.weight"))?,
+                norm_weight: if is_gpt_oss {
+                    load_f32_vec(&file, &format!("blk.{l}.post_attention_norm.weight"))?
+                } else {
+                    load_f32_vec(&file, &format!("blk.{l}.ffn_norm.weight"))?
+                },
                 activation_counts,
                 #[cfg(feature = "metal")]
                 packed_q4,
             };
+
+            if is_gpt_oss {
+                gpt_oss_layers.push(load_gpt_oss_layer(&file, l, &config)?);
+            }
 
             layers.push(LayerWeights { attn, moe });
         }
@@ -1611,6 +1731,13 @@ impl Decoder {
             final_norm,
             output_head,
             gpu_vram_budget_bytes: None,
+            gpt_oss: if is_gpt_oss {
+                Some(crate::decoder::GptOssWeights {
+                    layers: gpt_oss_layers,
+                })
+            } else {
+                None
+            },
             #[cfg(feature = "metal")]
             metal_attn_kv: std::sync::Mutex::new(None),
             execution_plan,

@@ -615,6 +615,120 @@ pub struct ExpertWeights {
     pub down: WeightMatrix,
 }
 
+/// One expert's gate/up/down bias vectors.
+///
+/// Kept separate from [`ExpertWeights`] because only the gpt-oss family
+/// ships them: every other MoE checkpoint ferrox loads has bias-free
+/// experts, and threading three `Option`s through the thirty
+/// `ExpertWeights` construction sites would pay for a feature one
+/// architecture uses.
+///
+/// Lengths are `expert_ffn_dim` for `gate`/`up` and `hidden_dim` for
+/// `down`, matching llama.cpp's `ffn_{gate,up}_exps_b` `{n_ff_exp,
+/// n_expert}` and `ffn_down_exps_b` `{n_embd, n_expert}`.
+#[derive(Debug, Clone, Default)]
+pub struct ExpertBias {
+    pub gate: Vec<f32>,
+    pub up: Vec<f32>,
+    pub down: Vec<f32>,
+}
+
+/// gpt-oss's SwiGLU sigmoid steepness (`llama-graph.cpp`,
+/// `LLM_FFN_SWIGLU_OAI_MOE`: `constexpr float alpha = 1.702f`).
+pub const SWIGLU_OAI_ALPHA: f32 = 1.702;
+/// gpt-oss's SwiGLU clamp (`constexpr float limit = 7.0f`, same site).
+pub const SWIGLU_OAI_LIMIT: f32 = 7.0;
+
+/// gpt-oss's clamped SwiGLU.
+///
+/// Transcribed from `ggml/src/ggml-cpu/ops.cpp`
+/// `ggml_compute_forward_swiglu_oai_f32`:
+///
+/// ```text
+/// x = min(gate, limit);
+/// y = clamp(up, -limit, limit);
+/// out_glu = x / (1 + expf(alpha * -x));
+/// dst = out_glu * (y + 1);
+/// ```
+///
+/// Three things differ from ordinary SwiGLU and all three matter: the
+/// gate is clamped from *above only*, the sigmoid is scaled by `alpha`
+/// rather than being plain `silu`, and the up branch carries a `+1`
+/// offset so a zero `up` passes the gate through instead of killing it.
+pub fn swiglu_oai(gate: &[f32], up: &[f32], alpha: f32, limit: f32) -> Vec<f32> {
+    debug_assert_eq!(gate.len(), up.len());
+    gate.iter()
+        .zip(up.iter())
+        .map(|(&g, &u)| {
+            let x = g.min(limit);
+            let y = u.clamp(-limit, limit);
+            let out_glu = x / (1.0 + (alpha * -x).exp());
+            out_glu * (y + 1.0)
+        })
+        .collect()
+}
+
+/// gpt-oss routing: pick the top-`k` experts by their **raw** router
+/// logits, then softmax over just those `k`.
+///
+/// This is llama.cpp's `LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX_WEIGHT`
+/// (`llama-graph.cpp::build_moe_ffn`), and it is *not* the same as
+/// [`route_top_k_softmax`]: there the softmax runs over all `n_expert`
+/// logits before selection, so the surviving weights are a slice of the
+/// full distribution and sum to less than one; here the normalization
+/// happens after selection, so the `k` weights sum to exactly one.
+/// Feeding a gpt-oss checkpoint through the ordinary softmax gating
+/// picks the same experts but weights them wrong.
+pub fn route_top_k_softmax_weight(logits: &[f32], k: usize) -> RoutingDecision {
+    let mut idx: Vec<usize> = (0..logits.len()).collect();
+    idx.sort_unstable_by(|&a, &b| logits[b].partial_cmp(&logits[a]).unwrap());
+    let top = &idx[..k.min(idx.len())];
+
+    let selected: Vec<f32> = top.iter().map(|&i| logits[i]).collect();
+    let max = selected.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let exps: Vec<f32> = selected.iter().map(|&l| (l - max).exp()).collect();
+    let sum: f32 = exps.iter().sum();
+    let weights = if sum > 0.0 {
+        exps.iter().map(|&e| e / sum).collect()
+    } else {
+        exps
+    };
+
+    RoutingDecision {
+        expert_ids: top.to_vec(),
+        weights,
+    }
+}
+
+/// [`run_expert`] for gpt-oss: per-expert biases on all three matmuls
+/// and [`swiglu_oai`] in place of SwiGLU.
+///
+/// Deliberately plain CPU with no GPU or shared-activation fast path.
+/// gpt-oss is admitted to the CPU graph only, so a fast path here would
+/// be a second, unvalidated copy of the math.
+pub fn run_expert_oai(
+    hidden: &[f32],
+    expert: &ExpertWeights,
+    bias: &ExpertBias,
+    alpha: f32,
+    limit: f32,
+) -> Vec<f32> {
+    let mut gate = expert.gate.apply(hidden);
+    let mut up = expert.up.apply(hidden);
+    for (x, b) in gate.iter_mut().zip(bias.gate.iter()) {
+        *x += b;
+    }
+    for (x, b) in up.iter_mut().zip(bias.up.iter()) {
+        *x += b;
+    }
+    let activated = swiglu_oai(&gate, &up, alpha, limit);
+    let mut out = expert.down.apply(&activated);
+    for (x, b) in out.iter_mut().zip(bias.down.iter()) {
+        *x += b;
+    }
+    out
+}
+
 /// Runs one token's hidden state through a single expert's SwiGLU FFN.
 pub fn run_expert(hidden: &[f32], expert: &ExpertWeights) -> Vec<f32> {
     #[cfg(any(feature = "cuda", feature = "metal"))]

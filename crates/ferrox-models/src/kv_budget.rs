@@ -508,24 +508,33 @@ impl KvBudget {
 
         let (tokens, capped_by) = if available == 0 || for_full_layers == 0 && marginal > 0 {
             (0, ContextCap::DeviceBudget)
-        } else if marginal == 0 {
-            // Every layer slides: KV is bounded, so only the model's
-            // own context length limits us.
-            (cap, ContextCap::ModelContextLength)
         } else {
-            let raw = (for_full_layers / marginal) as usize;
-            // Flooring must never turn a real answer into "nothing
-            // fits": under one granularity step, report the exact
-            // number of tokens rather than rounding it away.
-            let floored = if raw >= granularity {
-                (raw / granularity) * granularity
-            } else {
-                raw
-            };
-            if floored >= cap {
-                (cap, ContextCap::ModelContextLength)
-            } else {
-                (floored, ContextCap::DeviceBudget)
+            // `checked_div` rather than a `marginal == 0` guard around
+            // a bare `/`: the zero case is not an error here, it is a
+            // real configuration -- every layer slides, so KV is
+            // bounded and only the model's own context length limits
+            // us -- and expressing it as `None` keeps that meaning in
+            // one place instead of splitting it across a check and a
+            // division that clippy then has to re-associate.
+            match for_full_layers.checked_div(marginal) {
+                None => (cap, ContextCap::ModelContextLength),
+                Some(raw) => {
+                    let raw = raw as usize;
+                    // Flooring must never turn a real answer into
+                    // "nothing fits": under one granularity step,
+                    // report the exact number of tokens rather than
+                    // rounding it away.
+                    let floored = if raw >= granularity {
+                        (raw / granularity) * granularity
+                    } else {
+                        raw
+                    };
+                    if floored >= cap {
+                        (cap, ContextCap::ModelContextLength)
+                    } else {
+                        (floored, ContextCap::DeviceBudget)
+                    }
+                }
             }
         };
 

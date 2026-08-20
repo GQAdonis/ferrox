@@ -740,9 +740,8 @@ mod tests {
             .forward_batch(&prompt_ids, 0, &mut caches)
             .pop()
             .unwrap();
-        let mut pos = prompt_ids.len();
         let mut expected_text = String::new();
-        for _ in 0..max_tokens {
+        for pos in (prompt_ids.len()..).take(max_tokens) {
             let next = logits
                 .iter()
                 .enumerate()
@@ -751,7 +750,6 @@ mod tests {
                 .unwrap();
             expected_text.push_str(&ServerTokenizer::Byte.decode(&[next]));
             logits = decoder.forward_token(next, pos, &mut caches);
-            pos += 1;
         }
 
         let mut actual_text = String::new();

@@ -739,11 +739,11 @@ impl Decoder {
                 };
                 let (src, fn_name, block_bytes, block_elems, rows_per_tg) =
                     ferrox_metal::gpu::matvec_launch_meta(kind_name)?;
-                let row_bytes = if *rows == 0 {
-                    0
-                } else {
-                    data.as_slice().len() / *rows
-                };
+                // A zero-row matrix has no rows to stride over, so
+                // there is no meaningful row size; `checked_div`
+                // says that once instead of splitting it across a
+                // guard and a bare division.
+                let row_bytes = data.as_slice().len().checked_div(*rows).unwrap_or(0);
                 Some(ferrox_metal::gpu::MatvecLaunch {
                     kernel_src: src,
                     fn_name,
@@ -4918,11 +4918,7 @@ mod tests {
                 .map(|&s| std::mem::take(&mut per_seq_caches[s]))
                 .collect();
             let step_logits = decoder_b.forward_multi_seq(&tokens, &positions, &mut active_caches);
-            for ((&s, caches), logits) in active
-                .iter()
-                .zip(active_caches.into_iter())
-                .zip(step_logits.into_iter())
-            {
+            for ((&s, caches), logits) in active.iter().zip(active_caches).zip(step_logits) {
                 per_seq_caches[s] = caches;
                 batched_logits[s] = logits;
             }

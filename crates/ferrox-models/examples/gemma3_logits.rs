@@ -39,9 +39,8 @@ fn main() {
         print!(" {v:.6}");
     }
     println!();
-    let mut pos = tokens.len();
     print!("GEN");
-    for _ in 0..n_gen {
+    for pos in (tokens.len()..).take(n_gen) {
         let next = logits
             .iter()
             .enumerate()
@@ -50,7 +49,6 @@ fn main() {
             .unwrap();
         print!(" {next}");
         logits = decoder.forward_token(next, pos, &mut caches);
-        pos += 1;
     }
     println!();
 }

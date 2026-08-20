@@ -55,16 +55,14 @@ pub fn greedy_token_ids(
 
     let prompt_len = tokens.len();
     let mut logits = decoder.forward_batch_last(&tokens, 0, &mut caches);
-    let mut pos = tokens.len();
     let mut out = Vec::with_capacity(n);
-    for _ in 0..n {
+    for pos in (prompt_len..).take(n) {
         let next = argmax(&logits);
         out.push(next as u32);
         if Some(next) == eos {
             break;
         }
         logits = decoder.forward_token(next, pos, &mut caches);
-        pos += 1;
     }
     Ok((out, prompt_len))
 }

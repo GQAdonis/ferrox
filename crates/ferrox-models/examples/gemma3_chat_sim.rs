@@ -25,8 +25,7 @@ fn main() {
         logits = decoder.forward_token(t, i, &mut caches);
     }
     let mut out = Vec::new();
-    let mut pos = tokens.len();
-    for _ in 0..16 {
+    for pos in (tokens.len()..).take(16) {
         let next = logits
             .iter()
             .enumerate()
@@ -38,7 +37,6 @@ fn main() {
             break;
         }
         logits = decoder.forward_token(next, pos, &mut caches);
-        pos += 1;
     }
     println!("gen={out:?}");
     let decoded = tok.decode(&out.iter().map(|x| *x as u32).collect::<Vec<_>>());

@@ -16,7 +16,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.7.0"
+version = "0.8.0"
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/antonellof/ferrox"
@@ -56,13 +56,13 @@ minijinja = { version = "2.21", features = ["loop_controls", "json"] }
 libc = "0.2"
 
 # Internal crates — path for local builds, version for crates.io.
-ferrox-api = { version = "0.7.0", path = "crates/ferrox-api" }
-ferrox-gguf = { version = "0.7.0", path = "crates/ferrox-gguf" }
-ferrox-quant = { version = "0.7.0", path = "crates/ferrox-quant" }
-ferrox-safetensors = { version = "0.7.0", path = "crates/ferrox-safetensors" }
-ferrox-cuda = { version = "0.7.0", path = "crates/ferrox-cuda" }
-ferrox-metal = { version = "0.7.0", path = "crates/ferrox-metal" }
-ferrox-core = { version = "0.7.0", path = "crates/ferrox-core" }
-ferrox-moe = { version = "0.7.0", path = "crates/ferrox-moe" }
-ferrox-models = { version = "0.7.0", path = "crates/ferrox-models" }
-ferrox-inference = { version = "0.7.0", path = "crates/ferrox-inference" }
+ferrox-api = { version = "0.8.0", path = "crates/ferrox-api" }
+ferrox-gguf = { version = "0.8.0", path = "crates/ferrox-gguf" }
+ferrox-quant = { version = "0.8.0", path = "crates/ferrox-quant" }
+ferrox-safetensors = { version = "0.8.0", path = "crates/ferrox-safetensors" }
+ferrox-cuda = { version = "0.8.0", path = "crates/ferrox-cuda" }
+ferrox-metal = { version = "0.8.0", path = "crates/ferrox-metal" }
+ferrox-core = { version = "0.8.0", path = "crates/ferrox-core" }
+ferrox-moe = { version = "0.8.0", path = "crates/ferrox-moe" }
+ferrox-models = { version = "0.8.0", path = "crates/ferrox-models" }
+ferrox-inference = { version = "0.8.0", path = "crates/ferrox-inference" }

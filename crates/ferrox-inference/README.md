@@ -11,7 +11,7 @@ crate.
 
 ```toml
 [dependencies]
-ferrox-inference = "0.7"
+ferrox-inference = "0.8"
 ```
 
 ```rust

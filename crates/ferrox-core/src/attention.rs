@@ -738,6 +738,44 @@ pub fn causal_gqa_attention_prefill_shared_kv(
     kv_prefix: usize,
     attn_softcap: Option<f32>,
 ) -> Vec<f32> {
+    causal_gqa_attention_prefill_shared_kv_windowed(
+        q,
+        k_cache,
+        v_cache,
+        n_heads,
+        n_kv_heads,
+        head_dim,
+        n_q,
+        kv_prefix,
+        attn_softcap,
+        None,
+    )
+}
+
+/// [`causal_gqa_attention_prefill_shared_kv`] with an optional sliding
+/// window, so SWA models (Gemma-2/3, Mistral, Qwen2-MoE) get the same
+/// blocked kernel instead of the per-query
+/// [`causal_gqa_attention_windowed_softcap`] fallback.
+///
+/// `window = Some(w)` restricts the query at absolute position `p`
+/// (`p = kv_prefix + b`) to keys `p + 1 - w ..= p`, matching
+/// [`causal_gqa_attention_windowed_softcap`]'s
+/// `window_start = seq_len.saturating_sub(window)` exactly — the
+/// per-query function is called with `seq_len = p + 1`. `None` is
+/// full causal.
+#[allow(clippy::too_many_arguments)]
+pub fn causal_gqa_attention_prefill_shared_kv_windowed(
+    q: &[f32],
+    k_cache: &[f32],
+    v_cache: &[f32],
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    n_q: usize,
+    kv_prefix: usize,
+    attn_softcap: Option<f32>,
+    window: Option<usize>,
+) -> Vec<f32> {
     use rayon::prelude::*;
     let q_stride = n_heads * head_dim;
     let kv_stride = n_kv_heads * head_dim;
@@ -781,44 +819,107 @@ pub fn causal_gqa_attention_prefill_shared_kv(
             let kv_h = h / group_size.max(1);
             let b_start = blk * Q_BLOCK;
             let b_end = (b_start + Q_BLOCK).min(n_q);
-            let mut scores = vec![0f32; kv_prefix + b_end];
-            let mut acc = vec![0f32; head_dim];
+            let n_b = b_end - b_start;
 
-            for b in b_start..b_end {
-                let causal_len = kv_prefix + b + 1;
-                let q_h = &q[b * q_stride + h * head_dim..][..head_dim];
-                let scores = &mut scores[..causal_len];
+            // The block's visible KV span. `t_hi` is the widest causal
+            // length in the block; `t_lo` is the earliest position its
+            // first query can still see under the window.
+            let t_hi = kv_prefix + b_end;
+            let t_lo = match window {
+                Some(w) => (kv_prefix + b_start + 1).saturating_sub(w),
+                None => 0,
+            };
+            let span = t_hi - t_lo;
 
-                // Pass 1: the Q·Kᵀ row.
-                for (t, s) in scores.iter_mut().enumerate() {
-                    let base = (t * n_kv_heads + kv_h) * head_dim;
-                    let mut v = dot_f32(q_h, &k_cache[base..base + head_dim]) * scale;
+            // Score tile `[Q_BLOCK, span]` and accumulator tile
+            // `[Q_BLOCK, head_dim]`, both held for the whole block so K
+            // and V rows are streamed **once** per block instead of once
+            // per query. At Q_BLOCK = 8 that is an 8× cut in K/V traffic
+            // for passes 1 and 3, which is where this kernel lives: on
+            // SmolLM2-135M CPU pp512 its inner closure was 53% of
+            // non-idle samples against ~8% of the model's FLOPs, because
+            // every query re-streamed the same `seq_len × head_dim` K
+            // slab out of L2.
+            let mut scores = vec![0f32; n_b * span];
+            let mut acc = vec![0f32; n_b * head_dim];
+
+            // Pass 1: Q·Kᵀ with the KV position **outer**, so one K row
+            // load feeds every query in the block that can see it. The
+            // per-(query, position) dot itself is unchanged, so this is
+            // bit-identical to the query-outer order.
+            for t in t_lo..t_hi {
+                // Queries that can see `t`: causal gives `b >= t -
+                // kv_prefix`, the window gives `b < t + w - kv_prefix`.
+                let lo = b_start.max(t.saturating_sub(kv_prefix));
+                let hi = match window {
+                    Some(w) => b_end.min((t + w).saturating_sub(kv_prefix)),
+                    None => b_end,
+                };
+                if lo >= hi {
+                    continue;
+                }
+                let base = (t * n_kv_heads + kv_h) * head_dim;
+                let k_t = &k_cache[base..base + head_dim];
+                for b in lo..hi {
+                    let q_h = &q[b * q_stride + h * head_dim..][..head_dim];
+                    let mut v = dot_f32(q_h, k_t) * scale;
                     if let Some(sc) = softcap {
                         v = sc * (v / sc).tanh();
                     }
-                    *s = v;
+                    scores[(b - b_start) * span + (t - t_lo)] = v;
                 }
+            }
 
-                // Pass 2: max-subtract softmax over the whole row — one
-                // `exp` per position, no rescale.
-                let m = scores.iter().fold(f32::NEG_INFINITY, |a, &s| a.max(s));
+            // Pass 2: max-subtract softmax per query row, over exactly
+            // that query's visible range.
+            let mut norms = [0f32; Q_BLOCK];
+            for b in b_start..b_end {
+                let causal_len = kv_prefix + b + 1;
+                // Same visible range as `causal_gqa_attention_windowed_softcap`
+                // called with `seq_len = causal_len`.
+                let t_start = match window {
+                    Some(w) => causal_len.saturating_sub(w),
+                    None => 0,
+                };
+                let row = &mut scores[(b - b_start) * span..][t_start - t_lo..causal_len - t_lo];
+                let m = row.iter().fold(f32::NEG_INFINITY, |a, &s| a.max(s));
                 let mut l = 0f32;
-                for s in scores.iter_mut() {
+                for s in row.iter_mut() {
                     *s = (*s - m).exp();
                     l += *s;
                 }
+                norms[b - b_start] = l;
+            }
 
-                // Pass 3: weighted V accumulate, normalized once.
-                acc.fill(0.0);
-                for (t, &p) in scores.iter().enumerate() {
-                    let base = (t * n_kv_heads + kv_h) * head_dim;
-                    axpy(&mut acc, &v_cache[base..base + head_dim], p);
+            // Pass 3: V·P, again position-outer — one V row load per
+            // block, accumulating into the L1-resident `acc` tile. Each
+            // query's accumulation still walks `t` ascending, so this is
+            // bit-identical to the query-outer order too.
+            for t in t_lo..t_hi {
+                let lo = b_start.max(t.saturating_sub(kv_prefix));
+                let hi = match window {
+                    Some(w) => b_end.min((t + w).saturating_sub(kv_prefix)),
+                    None => b_end,
+                };
+                if lo >= hi {
+                    continue;
                 }
+                let base = (t * n_kv_heads + kv_h) * head_dim;
+                let v_t = &v_cache[base..base + head_dim];
+                for b in lo..hi {
+                    let p = scores[(b - b_start) * span + (t - t_lo)];
+                    axpy(&mut acc[(b - b_start) * head_dim..][..head_dim], v_t, p);
+                }
+            }
+
+            for b in b_start..b_end {
+                let out_h = &mut acc[(b - b_start) * head_dim..][..head_dim];
+                let l = norms[b - b_start];
                 if l > 0.0 {
-                    scale_inplace(&mut acc, 1.0 / l);
+                    scale_inplace(out_h, 1.0 / l);
                 }
                 unsafe {
-                    out_w.write(b * q_stride + h * head_dim, &acc);
+                    out_w.write(b * q_stride + h * head_dim, out_h);
                 }
             }
         });
@@ -1111,6 +1212,200 @@ mod tests {
                         "softcap {softcap:?} query {b} slot {i}: blocked {g} vs online {w}"
                     );
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn windowed_prefill_shared_kv_matches_the_per_query_windowed_reference() {
+        // Same shapes as `prefill_shared_kv_matches_per_query_reference`,
+        // now against `causal_gqa_attention_windowed_softcap` — the
+        // per-query path the decoder's SWA arm used to call. Windows are
+        // chosen to sit below, across and above the causal prefix so the
+        // `saturating_sub` boundary is exercised on both sides; the last
+        // one degenerates to full causal and must match the unwindowed
+        // kernel too.
+        let n_heads = 6;
+        let n_kv_heads = 2;
+        let head_dim = 16;
+        let n_q = 19;
+        let kv_prefix = 5;
+        let kv_len = kv_prefix + n_q;
+        let q_stride = n_heads * head_dim;
+        let kv_stride = n_kv_heads * head_dim;
+
+        let q: Vec<f32> = (0..n_q * q_stride)
+            .map(|i| ((i as f32) * 0.013 - 0.7).sin() * 1.3)
+            .collect();
+        let k_cache: Vec<f32> = (0..kv_len * kv_stride)
+            .map(|i| ((i as f32) * 0.017 - 0.3).cos() * 1.1)
+            .collect();
+        let v_cache: Vec<f32> = (0..kv_len * kv_stride)
+            .map(|i| ((i as f32) * 0.011 + 0.2).sin() * 0.9)
+            .collect();
+
+        for window in [1usize, 3, 7, kv_prefix, kv_len, kv_len + 8] {
+            for softcap in [None, Some(30.0)] {
+                let got = super::causal_gqa_attention_prefill_shared_kv_windowed(
+                    &q,
+                    &k_cache,
+                    &v_cache,
+                    n_heads,
+                    n_kv_heads,
+                    head_dim,
+                    n_q,
+                    kv_prefix,
+                    softcap,
+                    Some(window),
+                );
+                assert_eq!(got.len(), n_q * q_stride);
+                for b in 0..n_q {
+                    let causal_len = kv_prefix + b + 1;
+                    let want = super::causal_gqa_attention_windowed_softcap(
+                        &q[b * q_stride..(b + 1) * q_stride],
+                        &k_cache[..causal_len * kv_stride],
+                        &v_cache[..causal_len * kv_stride],
+                        n_heads,
+                        n_kv_heads,
+                        head_dim,
+                        causal_len,
+                        window,
+                        softcap,
+                    );
+                    for (i, (g, w)) in got[b * q_stride..(b + 1) * q_stride]
+                        .iter()
+                        .zip(want.iter())
+                        .enumerate()
+                    {
+                        assert!(
+                            (g - w).abs() < 1e-5,
+                            "window {window} softcap {softcap:?} query {b} slot {i}: \
+                             blocked {g} vs per-query {w}"
+                        );
+                    }
+                }
+            }
+        }
+
+        // `window >= kv_len` is full causal: identical to `None`.
+        let windowed = super::causal_gqa_attention_prefill_shared_kv_windowed(
+            &q,
+            &k_cache,
+            &v_cache,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            n_q,
+            kv_prefix,
+            None,
+            Some(kv_len + 8),
+        );
+        let full = super::causal_gqa_attention_prefill_shared_kv(
+            &q, &k_cache, &v_cache, n_heads, n_kv_heads, head_dim, n_q, kv_prefix, None,
+        );
+        assert_eq!(windowed, full);
+    }
+
+    /// The query-outer form the blocked kernel had before the K/V rows
+    /// were hoisted to the outer loop: one query at a time, streaming
+    /// the whole visible K slab and then the whole visible V slab.
+    /// Built from the same `dot_f32` / `axpy` / `scale_inplace`
+    /// primitives, so the kernel must match it **bit for bit**, not
+    /// within a tolerance — reordering which rows are loaded when must
+    /// not reorder any arithmetic.
+    #[allow(clippy::too_many_arguments)]
+    fn prefill_query_outer_reference(
+        q: &[f32],
+        k_cache: &[f32],
+        v_cache: &[f32],
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        n_q: usize,
+        kv_prefix: usize,
+        attn_softcap: Option<f32>,
+        window: Option<usize>,
+    ) -> Vec<f32> {
+        let q_stride = n_heads * head_dim;
+        let group_size = n_heads / n_kv_heads.max(1);
+        let scale = 1.0 / (head_dim as f32).sqrt();
+        let softcap = attn_softcap.filter(|&c| c > 0.0);
+        let mut out = vec![0f32; n_q * q_stride];
+        let mut acc = vec![0f32; head_dim];
+        for h in 0..n_heads {
+            let kv_h = h / group_size.max(1);
+            for b in 0..n_q {
+                let causal_len = kv_prefix + b + 1;
+                let t_start = match window {
+                    Some(w) => causal_len.saturating_sub(w),
+                    None => 0,
+                };
+                let q_h = &q[b * q_stride + h * head_dim..][..head_dim];
+                let mut scores = vec![0f32; causal_len - t_start];
+                for (i, s) in scores.iter_mut().enumerate() {
+                    let base = ((t_start + i) * n_kv_heads + kv_h) * head_dim;
+                    let mut v = super::dot_f32(q_h, &k_cache[base..base + head_dim]) * scale;
+                    if let Some(sc) = softcap {
+                        v = sc * (v / sc).tanh();
+                    }
+                    *s = v;
+                }
+                let m = scores.iter().fold(f32::NEG_INFINITY, |a, &s| a.max(s));
+                let mut l = 0f32;
+                for s in scores.iter_mut() {
+                    *s = (*s - m).exp();
+                    l += *s;
+                }
+                acc.fill(0.0);
+                for (i, &p) in scores.iter().enumerate() {
+                    let base = ((t_start + i) * n_kv_heads + kv_h) * head_dim;
+                    super::axpy(&mut acc, &v_cache[base..base + head_dim], p);
+                }
+                if l > 0.0 {
+                    super::scale_inplace(&mut acc, 1.0 / l);
+                }
+                out[b * q_stride + h * head_dim..][..head_dim].copy_from_slice(&acc);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn position_outer_prefill_is_bit_identical_to_the_query_outer_form() {
+        // Shapes cross the query-block boundary with a partial last
+        // block, a nonzero decoded prefix and grouped KV heads. Windows
+        // are chosen so the visible span is narrower than, equal to and
+        // wider than the block, plus the unwindowed case.
+        let n_heads = 6;
+        let n_kv_heads = 2;
+        let head_dim = 16;
+        let n_q = 19;
+        let kv_prefix = 5;
+        let kv_len = kv_prefix + n_q;
+        let q_stride = n_heads * head_dim;
+        let kv_stride = n_kv_heads * head_dim;
+
+        let q: Vec<f32> = (0..n_q * q_stride)
+            .map(|i| ((i as f32) * 0.013 - 0.7).sin() * 1.3)
+            .collect();
+        let k_cache: Vec<f32> = (0..kv_len * kv_stride)
+            .map(|i| ((i as f32) * 0.017 - 0.3).cos() * 1.1)
+            .collect();
+        let v_cache: Vec<f32> = (0..kv_len * kv_stride)
+            .map(|i| ((i as f32) * 0.011 + 0.2).sin() * 0.9)
+            .collect();
+
+        for window in [None, Some(1), Some(3), Some(8), Some(9), Some(kv_len + 4)] {
+            for softcap in [None, Some(30.0)] {
+                let got = super::causal_gqa_attention_prefill_shared_kv_windowed(
+                    &q, &k_cache, &v_cache, n_heads, n_kv_heads, head_dim, n_q, kv_prefix, softcap,
+                    window,
+                );
+                let want = prefill_query_outer_reference(
+                    &q, &k_cache, &v_cache, n_heads, n_kv_heads, head_dim, n_q, kv_prefix, softcap,
+                    window,
+                );
+                assert_eq!(got, want, "window {window:?} softcap {softcap:?}");
             }
         }
     }

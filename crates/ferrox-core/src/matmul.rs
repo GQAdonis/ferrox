@@ -232,10 +232,45 @@ pub fn gelu(x: f32) -> f32 {
 /// Elementwise gated FFN combine: gelu(gate) * up (Gemma GeGLU).
 pub fn geglu(gate: &[f32], up: &[f32]) -> Vec<f32> {
     assert_eq!(gate.len(), up.len());
-    gate.iter()
-        .zip(up.iter())
-        .map(|(g, u)| gelu(*g) * u)
-        .collect()
+    par_gated(gate, up, |g, u| gelu(g) * u)
+}
+
+/// Threshold above which the elementwise FFN activations fork to Rayon.
+/// Decode passes one row (`ffn_dim`, a few thousand elements) and would
+/// only pay fork-join; prefill passes `batch × ffn_dim`, which on
+/// Gemma-3-1B is 3.5 M elements per layer.
+const GATED_PAR_MIN: usize = 1 << 15;
+
+/// Elementwise `f(gate[i], up[i])` over the whole pair, forked to Rayon
+/// past [`GATED_PAR_MIN`].
+///
+/// Prefill ran these serially on the calling thread while every other
+/// core sat in the FFN's fork-join: on Gemma-3-1B CPU `pp512`, `tanhf`
+/// under `geglu` was 10.7% of *all* non-idle samples in the process and
+/// 3682 of its 3688 samples were on the main thread alone. Chunking is
+/// bit-exact — no reduction, each output element depends only on its
+/// own inputs.
+#[inline]
+fn par_gated<F>(gate: &[f32], up: &[f32], f: F) -> Vec<f32>
+where
+    F: Fn(f32, f32) -> f32 + Sync + Send,
+{
+    let n = gate.len();
+    if n < GATED_PAR_MIN {
+        return gate.iter().zip(up.iter()).map(|(g, u)| f(*g, *u)).collect();
+    }
+    let mut out = vec![0f32; n];
+    // Cache-line-aligned chunks so no two tasks share a 64-byte line.
+    let chunk = (n.div_ceil(rayon::current_num_threads() * 4)).next_multiple_of(16);
+    out.par_chunks_mut(chunk)
+        .zip(gate.par_chunks(chunk))
+        .zip(up.par_chunks(chunk))
+        .for_each(|((o, g), u)| {
+            for ((o, g), u) in o.iter_mut().zip(g.iter()).zip(u.iter()) {
+                *o = f(*g, *u);
+            }
+        });
+    out
 }
 
 /// Plain (non-RMS) LayerNorm -- ggml's `LLM_NORM` (as opposed to
@@ -273,10 +308,7 @@ pub fn silu(x: f32) -> f32 {
 /// pairing used inside both dense and MoE-expert feed-forward blocks.
 pub fn swiglu(gate: &[f32], up: &[f32]) -> Vec<f32> {
     assert_eq!(gate.len(), up.len());
-    gate.iter()
-        .zip(up.iter())
-        .map(|(g, u)| silu(*g) * u)
-        .collect()
+    par_gated(gate, up, |g, u| silu(g) * u)
 }
 
 /// Kimi K3's `situ` activation (`hidden_act: "situ"` in its real
@@ -302,6 +334,37 @@ pub fn situ_and_mul(gate: &[f32], up: &[f32], beta: f32, linear_beta: f32) -> Ve
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parallel_gated_activations_are_bit_identical_to_the_serial_form() {
+        // Straddle GATED_PAR_MIN so both arms are covered, and use a
+        // length that is not a multiple of the chunk size. Elementwise
+        // with no reduction, so "close enough" is not the bar: every
+        // bit must match, or prefill and decode disagree on the same
+        // model.
+        for n in [7usize, GATED_PAR_MIN - 1, GATED_PAR_MIN, 300_007] {
+            let gate: Vec<f32> = (0..n)
+                .map(|i| ((i as f32) * 0.0037 - 4.0).sin() * 6.0)
+                .collect();
+            let up: Vec<f32> = (0..n)
+                .map(|i| ((i as f32) * 0.0041 + 1.0).cos() * 2.5)
+                .collect();
+
+            let want_swi: Vec<f32> = gate
+                .iter()
+                .zip(up.iter())
+                .map(|(g, u)| silu(*g) * u)
+                .collect();
+            assert_eq!(swiglu(&gate, &up), want_swi, "swiglu at n = {n}");
+
+            let want_ge: Vec<f32> = gate
+                .iter()
+                .zip(up.iter())
+                .map(|(g, u)| gelu(*g) * u)
+                .collect();
+            assert_eq!(geglu(&gate, &up), want_ge, "geglu at n = {n}");
+        }
+    }
 
     #[test]
     fn layer_norm_zero_mean_unit_var_input_is_unchanged_by_weight_one_bias_zero() {

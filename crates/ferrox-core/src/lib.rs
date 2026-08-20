@@ -13,6 +13,8 @@ pub mod deepseek_v4_attention;
 pub mod expert_store;
 pub mod instance;
 pub mod kernel_registry;
+pub mod kv_block;
+pub mod kv_signature;
 pub mod matmul;
 pub mod tensor;
 pub mod threads;
@@ -33,6 +35,11 @@ pub use cache::{
 pub use csa_hca_compress::{channel_gated_pool, compress_block};
 pub use deepseek_v4_attention::{csa_attention, hca_attention};
 pub use kernel_registry::Registry as KernelRegistry;
+pub use kv_block::{full_blocks, BlockHash, BlockHasher};
+pub use kv_signature::{
+    CacheSignature, KvBlock, KvDtype, SignatureError, UnverifiedBlock, BLOCK_FORMAT_VERSION,
+    READABLE_FORMAT_VERSIONS,
+};
 pub use matmul::{
     geglu, gelu, matmul_f32, rms_norm, rms_norm_per_head, silu, situ_and_mul, softcap_inplace,
     swiglu,

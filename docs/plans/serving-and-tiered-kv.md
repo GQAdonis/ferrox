@@ -3,11 +3,11 @@ name: serving — tiered KV, prefill/decode fairness, admission
 overview: "GOAL: make ferrox-server behave well under real concurrent load and across restarts — a disk-backed prefix cache that survives a process restart, chunked prefill that does not stall in-flight decodes, and an admission gate that answers 'will this fit' before accepting rather than OOMing later. Sourced from a read-only study of oMLX (.scratch/omlx) whose paged/SSD KV cache and time-debt scheduler are its two genuinely mature subsystems. KEY CORRECTION: oMLX's 'paged KV cache' is NOT paged attention — CacheBlock holds no tensor data — so all of it sits on top of a contiguous per-sequence KV, which is exactly what ferrox already has."
 todos:
   - id: kv-block-hashing
-    content: "Parent-chained SHA-256 block hashing: sha256(model || parent_hash || token_ids || extra_keys), root-seeded, with extra_keys as the salt slot for LoRA/multimodal identity. ~40 lines, the foundation for everything else"
-    status: pending
+    content: "LANDED as `ferrox-core::kv_block` (`BlockHasher`, `BlockHash`). Parent-chained SHA-256, root-seeded at H(domain,\"root\",model,extra_keys); each block is H(domain,\"block\",model,extra_keys,parent,token_ids). Every field is length-prefixed, so `[\"ab\",\"c\"]` and `[\"a\",\"bc\"]` cannot collide; the domain tag is versioned so an encoding change orphans old blocks instead of misreading them. `chain()` hashes WHOLE blocks only -- a growing tail has no stable identity. Sampling params are excluded on purpose (KV is sampling-independent). Golden digests cross-validated against an independent Python hashlib reference, per this repo's fixture convention. NOT DONE: nothing consumes it yet -- `PrefixCache` still does a linear longest-common-prefix scan over whole sequences, and no block STORE exists (that is `kv-ssd-tier`); `extra_keys` is a slot with no LoRA/multimodal producer wired to it."
+    status: completed
   - id: kv-cache-signature
-    content: "cache_signature stamped FROM THE BLOCK'S OWN PAYLOAD, never from the manager's expectation; reject unmarked blocks rather than trusting them. This is the line between a persistent cache and silent corruption after a config change"
-    status: pending
+    content: "LANDED as `ferrox-core::kv_signature`. `CacheSignature::from_payload` MEASURES the tensors (layers, kv heads, head dim, dtype, token depth) and takes no expected-shape argument to fill a gap from; `seq_len` is treated as a claim and checked against `k.len()`. `UnverifiedBlock::verify` runs three ordered checks: unmarked -> refuse (absence is never agreement); recorded stamp vs measured payload -> `PayloadMismatch` (a stamp may not vouch for a width the payload lacks); only then measured vs reader expectation -> `Incompatible`, naming the field that changed. Format version has an explicit readable-set. Confirmed the central test FAILS when `verify` is patched to trust the stamp instead of the payload. NOT DONE: nothing stores or reads blocks yet, so no signature is written to disk (that is `kv-ssd-tier`); `KvDtype` has one variant (F32) because `KvCache` is `Vec<f32>` -- the enum exists so an f16/quantized KV tier invalidates old blocks instead of reinterpreting their bytes; the signature is not yet bound to a `BlockHash`, since nothing yet holds the two together."
+    status: completed
   - id: kv-ssd-tier
     content: "Disk tier for the prefix cache: one file per block, sharded by hash prefix, per-layer flattened, dtype passthrough, format-versioned, temp-file+rename publish with a post-rename eviction re-check"
     status: pending
@@ -24,14 +24,14 @@ todos:
     content: "Block size must be a multiple of the sliding-window size for SWA models. Non-obvious, and it will bite silently whenever ferrox runs a Gemma/gpt-oss-shaped model through the block cache"
     status: pending
   - id: sched-chunked-prefill
-    content: "Resumable chunked prefill as a state machine (cache, tokens_remaining, tokens_processed) with `fn step_chunk(&mut self) -> bool done`. PREREQUISITE for everything else: it converts an unbounded prefill into a bounded unit of work. batch_scheduler.rs prefill is sequential forward_token today"
-    status: pending
+    content: "LANDED. `PrefillState` in batch_scheduler.rs is the resumable state machine (caches, tokens_processed, tokens_remaining) with `step_chunk(&mut self) -> bool /* done */`; the worker runs ONE chunk (round-robin over waiting prompts) plus ONE batched decode step per tick, so a long prompt costs an in-flight decode one chunk, not its whole length, and N long prompts still cost one chunk per tick (the oMLX flaw the plan says not to inherit). Chunk size from `FERROX_CB_PREFILL_CHUNK` (default 128) or `BatcherConfig` for tests; `FERROX_CB_MAX_SEQS` now counts prefilling prompts too, since each holds a full KV set. Counters (prefill_chunks / prefill_tokens / decode_steps) on `/metrics`. NOT DONE, deliberately: (a) a chunk is still a per-token `forward_token` loop, not `forward_batch` -- chunking here is a scheduling boundary and is asserted bit-identical to the sequential prefill it replaced, so no throughput claim is made and no benchmark row moves; (b) no time-debt gate, that is `sched-time-debt`; (c) the batcher still cannot use the prefix cache or KV pool, so a chunk boundary is not yet a cache-block boundary."
+    status: completed
   - id: sched-time-debt
     content: "Time-debt prefill/decode interleaving: GPUs cannot preempt a running kernel, so chunk DURATION is the scheduling quantum. Cap contended chunks in ms converted to tokens via measured prefill tok/s; each chunk accrues duration*share debt; decode wall-time repays it; the gate blocks the next chunk until debt clears"
     status: pending
   - id: sched-keyed-row-state
-    content: "Per-row state keyed by uid (HashMap<Uid, RowState>), never a Vec parallel to the batch. oMLX had to monkey-patch its way out of exactly this: a plain request joining a json_schema batch collapsed all processor slots and silently applied the wrong constraints to the wrong row"
-    status: pending
+    content: "LANDED. `batch_scheduler.rs` keeps in-flight rows in `Rows { state: HashMap<Uid, Slot>, order: Vec<Uid> }` -- keyed state plus an explicit admission order (HashMap iteration order is not deterministic, batch composition must be). `swap_remove` on a `Vec<Slot>` is gone: a stale `Uid` resolves to `None`, never to whichever row moved into the vacated position. The per-step batch is still a slice for the kernel, but `active[j]` holds a `Uid`, so the scatter after `forward_multi_seq` cannot land on the wrong request. Per-request sampler state already lived in the row (not a global RNG) and is documented as deliberate. Tests: `removing_a_row_never_reassigns_another_rows_state` (with the positional `swap_remove` failure spelled out beside it), `flush_replies_on_each_rows_own_channel`, and `a_row_leaving_mid_batch_does_not_shift_its_neighbours_output` -- three concurrent rows where one trips a stop mid-batch, so the batch is narrower than the row table on that tick; confirmed to FAIL when the scatter is patched to address rows by batch position. NOT DONE: no per-row logits processor / constrained-decoding state exists yet (json_object is a whole-request flag), so the specific oMLX json_schema collapse has no ferrox analogue to regress -- the table is simply built so it cannot happen."
+    status: completed
   - id: sched-deferred-abort
     content: "Cancellation enqueues an id; the inference thread drains it at a step boundary and does the batch mutation, syncing the GPU before touching in-flight buffers. ferrox-metal has the same command-buffer lifetime hazard"
     status: pending
@@ -45,8 +45,8 @@ todos:
     content: "Two-layer stop sequences: a token-level matcher PLUS output-suffix buffering that withholds any tail which is a prefix of a stop string, so a partial match never reaches the wire. ferrox likely has only the text-level scan"
     status: pending
   - id: sched-queue-cap
-    content: "Queue depth cap -> 503 + Retry-After, so client retry storms cannot grow memory without bound"
-    status: pending
+    content: "LANDED. `QueueGate` in batch_scheduler.rs bounds jobs WAITING for admission (in-flight sequences remain `FERROX_CB_MAX_SEQS`'s business); default 512 via `FERROX_CB_MAX_QUEUE`. Over the cap, `generate` returns `DecodeError::QueueFull { queued, cap }` -> 503, with `retry_after_seconds` in the body and a `Retry-After` header stamped by `limits::retry_after`, a layer that marks any 503 lacking one (a 503 is by definition temporary, so this also fixes the pre-existing KV-pool and no-model-loaded 503s). Reservation is a CAS loop, not check-then-act; `queue_gate_never_exceeds_its_cap_under_concurrent_submitters` (32 threads x 64 rounds) was confirmed to FAIL with a load-then-fetch_add gate. `queue_depth` / `queue_rejected` on `/metrics`. DELIBERATELY NOT DONE: the Retry-After value is a fixed 1s, not queue depth divided by measured throughput -- the honest computation needs a drain-rate estimate this scheduler does not keep yet; the cap only guards the continuous-batching path, since the private `generate` path has no queue to cap; and the cap counts jobs, not tokens or bytes, so one huge prompt still counts as one."
+    status: completed
   - id: mem-preload-kv-budget
     content: "Compute the KV budget BEFORE load, not after: weights + n_ctx * per_token_kv + headroom <= device budget. oMLX admits models on weights-only cost and spends ~4300 lines compensating downstream"
     status: pending
@@ -90,10 +90,11 @@ this.**
 ## What ferrox already has
 
 - `batch_scheduler.rs` — continuous batching of *decode*, opt-in via
-  `FERROX_CONTINUOUS_BATCHING=1`, with prefill priority and a
-  `FERROX_CB_MAX_SEQS` cap. **Prefill is still sequential
-  `forward_token` per sequence**, which is the gap `sched-chunked-prefill`
-  closes.
+  `FERROX_CONTINUOUS_BATCHING=1`, with a `FERROX_CB_MAX_SEQS` cap.
+  Prefill **is** chunked now (`sched-chunked-prefill`, landed): one
+  bounded `PrefillState::step_chunk` plus one batched decode step per
+  tick. Each chunk is still a per-token `forward_token` loop, so this
+  bought fairness, not throughput.
 - An in-memory `PrefixCache`, a response cache, `session.rs`, a KV pool.
 - Exact knowledge of its own KV layout from the GGUF header — the thing
   oMLX lacks and works around everywhere.

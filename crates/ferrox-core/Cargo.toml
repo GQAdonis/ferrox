@@ -15,6 +15,7 @@ ferrox-cuda = { workspace = true, optional = true }
 ferrox-metal = { workspace = true, optional = true }
 memmap2 = { workspace = true }
 rayon = { workspace = true }
+sha2 = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
 

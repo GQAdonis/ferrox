@@ -270,6 +270,23 @@ rejections), `/v1/completions` and `/v1/messages`. Not yet recorded for
 Set `FERROX_CONTINUOUS_BATCHING=1`. Mutually exclusive with
 `FERROX_KV_POOL_BLOCKS` and `FERROX_PREFIX_CACHE_ENTRIES`.
 
+Prefill is chunked: the scheduler runs one bounded prefill chunk
+(`FERROX_CB_PREFILL_CHUNK`, default 128 tokens, round-robin across
+waiting prompts) plus one batched decode step per tick, so a long prompt
+joining the batch costs an in-flight decode one chunk rather than the
+whole prompt. `FERROX_CB_MAX_SEQS` caps in-flight sequences, counting
+prompts still prefilling. `FERROX_CB_MAX_QUEUE` (default 512) caps how many requests may wait for
+admission; past it a request is refused with `503` and a `Retry-After`
+header rather than queued without bound, and the JSON body names the
+queue depth, the cap and `retry_after_seconds`. `GET /metrics` reports
+`ferrox_prefill_chunks_total`, `ferrox_prefill_tokens_total`,
+`ferrox_decode_steps_total`, `ferrox_scheduler_queue_depth` and
+`ferrox_scheduler_queue_rejected_total` while a batcher is active.
+
+Every `503` this server returns carries `Retry-After` (1 second), a
+fixed hint rather than a computed one -- an honest estimate would need a
+caller's throughput, which the server does not know.
+
 ## MCP
 
 `--mcp-config PATH` loads server metadata under `ferrox_mcp` in

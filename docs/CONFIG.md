@@ -40,7 +40,10 @@ library or overriding the CLI.
 | Variable | Purpose |
 |---|---|
 | `FERROX_CONTINUOUS_BATCHING` | `1` — share decode across concurrent requests |
-| `FERROX_CHUNKED_PREFILL` | Split long prefills into N-token chunks |
+| `FERROX_CB_MAX_SEQS` | Continuous batching: cap on in-flight sequences, counting prompts still prefilling (default: unlimited) |
+| `FERROX_CB_PREFILL_CHUNK` | Continuous batching: prompt tokens per prefill chunk (default `128`). The scheduler runs one chunk plus one batched decode step per tick, so this is the granularity at which a long prompt yields to in-flight decodes |
+| `FERROX_CB_MAX_QUEUE` | Continuous batching: requests allowed to wait for admission (default `512`). Past it, new requests get `503` + `Retry-After` instead of queueing without bound |
+| `FERROX_CHUNKED_PREFILL` | Private (non-batched) generate path only: split a long prefill into N-token `forward_batch` chunks. Unrelated to `FERROX_CB_PREFILL_CHUNK`, which is a *scheduling* quantum, not a batch-shape one |
 | `FERROX_CPU_KV_OFFLOAD` | `1` — sync Metal KV to host after each decode step |
 | `FERROX_TOKIO_WORKERS` | `ferrox-server` async worker threads (default `2`); keeps the HTTP runtime from oversubscribing the decode pool |
 | `FERROX_QOS_LOG` | `1` — log each rayon worker's macOS QoS class at pool start |

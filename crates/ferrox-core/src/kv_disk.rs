@@ -33,6 +33,32 @@
 //!   [`UnverifiedBlock::verify`] against the reader's own expectation
 //!   produces a usable [`KvBlock`].
 //!
+//! # The write-ordering invariant
+//!
+//! A write is accepted on one thread and finished on another, so for a
+//! while a block is "in the store" without being on disk. The rule that
+//! makes that safe, and the one every step below is ordered around:
+//!
+//! > **buffer -> index -> queue.** A concurrent reader must never see
+//! > an index hit for a block that has neither a file nor a buffered
+//! > payload.
+//!
+//! So the payload is reachable *before* anything claims the block
+//! exists, and on the way out the file is published *before* the
+//! buffered copy is released. A reader holds the index lock while it
+//! consults the buffer, because "this block is not on disk yet" and
+//! "here is its payload" have to be one decision -- as two, the writer
+//! can publish and release in between and the reader finds nothing.
+//! When that invariant does break, the reader gets
+//! [`StoreError::MissingPayload`] rather than a quiet miss: a
+//! correctness bug that degrades into a cache miss is a bug nobody ever
+//! finds.
+//!
+//! The queue is bounded and **never drops**: a full queue makes the
+//! caller write the block itself ([`DiskStats::inline_writes`] counts
+//! it). Dropping writes silently would be indistinguishable from a cold
+//! cache later.
+//!
 //! # Layout
 //!
 //! ```text
@@ -57,12 +83,12 @@
 //! hashed or parsed -- a 4 GB `body_len` on a 200-byte file is rejected
 //! by arithmetic, not by allocating.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Instant;
 
 use sha2::{Digest, Sha256};
@@ -355,13 +381,19 @@ fn read_f32(bytes: &[u8]) -> Vec<f32> {
 /// incompatibility are **not** here: those are misses, reported through
 /// [`DiskStats`], because a caller's only sane response to either is to
 /// recompute the prefix.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum StoreError {
     Io {
         op: &'static str,
         path: PathBuf,
         message: String,
     },
+    /// The index named a block whose payload is nowhere: not on disk,
+    /// not in the write buffer. This is not a cache miss -- it is the
+    /// write-ordering invariant (buffer -> index -> queue) having been
+    /// violated, i.e. a bug in this module, and it is surfaced rather
+    /// than smoothed into a miss so a test can fail on it.
+    MissingPayload { hash: BlockHash },
 }
 
 impl std::fmt::Display for StoreError {
@@ -374,6 +406,11 @@ impl std::fmt::Display for StoreError {
                     path.display()
                 )
             }
+            StoreError::MissingPayload { hash } => write!(
+                f,
+                "KV block store index names {hash:?} but it has neither a file nor a buffered \
+                 payload; the write-ordering invariant was violated"
+            ),
         }
     }
 }
@@ -388,18 +425,26 @@ fn io_err(op: &'static str, path: &Path, err: io::Error) -> StoreError {
     }
 }
 
-/// How the store is sized and laid out.
+/// How the store is sized, laid out, and how much writing it will do
+/// off the calling thread.
 #[derive(Clone, Debug)]
 pub struct DiskConfig {
     /// Directory the store owns. Created if absent.
     pub root: PathBuf,
-    /// Byte budget for published blocks. Eviction keeps the store at or
-    /// under this.
+    /// Byte budget for blocks the store is accounting for. Eviction
+    /// keeps the store at or under this.
     pub max_bytes: u64,
     /// Hex characters of the hash used as the shard subdirectory name.
     /// 2 gives 256 shards, which keeps directory sizes sane well past a
     /// million blocks.
     pub shard_chars: usize,
+    /// Writes that may be waiting for a writer thread at once. When it
+    /// is full, [`DiskKvStore::put`] writes on the calling thread
+    /// instead of dropping the block -- backpressure, not loss.
+    pub queue_capacity: usize,
+    /// Background writer threads. `0` is legitimate and means every
+    /// write happens on the thread that asked for it.
+    pub writer_threads: usize,
 }
 
 impl DiskConfig {
@@ -408,6 +453,8 @@ impl DiskConfig {
             root: root.into(),
             max_bytes: 1 << 30,
             shard_chars: 2,
+            queue_capacity: 64,
+            writer_threads: 1,
         }
     }
 
@@ -420,20 +467,41 @@ impl DiskConfig {
         self.shard_chars = shard_chars.clamp(1, 8);
         self
     }
+
+    pub fn with_queue_capacity(mut self, queue_capacity: usize) -> Self {
+        self.queue_capacity = queue_capacity;
+        self
+    }
+
+    pub fn with_writer_threads(mut self, writer_threads: usize) -> Self {
+        self.writer_threads = writer_threads;
+        self
+    }
 }
 
 #[derive(Default)]
 struct Stats {
     writes: AtomicU64,
+    queued_writes: AtomicU64,
+    /// Writes that ran on the calling thread because the queue was
+    /// full. The plan's "count the fallbacks": a store that is
+    /// permanently inline is a store whose queue is too small or whose
+    /// disk is too slow, and that is invisible without this.
+    inline_writes: AtomicU64,
     write_failures: AtomicU64,
+    /// Queued writes whose block was evicted (or superseded) before a
+    /// writer thread reached it.
+    write_skipped: AtomicU64,
     write_nanos: AtomicU64,
     /// Writes whose block was evicted while it was being written, so
     /// the published file was withdrawn again.
     write_raced_eviction: AtomicU64,
     hits: AtomicU64,
+    /// Reads served from the write buffer, before the block reached
+    /// disk. These are what make the write path asynchronous *and*
+    /// immediately visible.
+    buffer_hits: AtomicU64,
     misses: AtomicU64,
-    /// Index hits for a block whose file has not been published yet.
-    pending_misses: AtomicU64,
     /// Files that failed [`decode_block`] and were quarantined.
     corrupt: AtomicU64,
     /// Blocks that decoded cleanly but do not match this reader's
@@ -452,13 +520,17 @@ struct Stats {
 pub struct DiskStats {
     pub blocks: usize,
     pub bytes: u64,
+    pub queue_depth: usize,
     pub writes: u64,
+    pub queued_writes: u64,
+    pub inline_writes: u64,
     pub write_failures: u64,
+    pub write_skipped: u64,
     pub write_raced_eviction: u64,
     pub write_nanos: u64,
     pub hits: u64,
+    pub buffer_hits: u64,
     pub misses: u64,
-    pub pending_misses: u64,
     pub corrupt: u64,
     pub incompatible: u64,
     pub read_nanos: u64,
@@ -469,13 +541,14 @@ pub struct DiskStats {
 struct Entry {
     bytes: u64,
     last_used: u64,
-    /// False between reserving the entry and the file landing under its
-    /// final name. A reader treats it as a miss rather than opening a
-    /// path that may not exist yet.
+    /// False between admitting the block and its file landing under its
+    /// final name. While it is false the payload lives in the write
+    /// buffer, and a reader is served from there.
     published: bool,
-    /// Bumped every time this hash is re-reserved, so a write that
+    /// Bumped every time this hash is admitted, so a write that
     /// finishes after its entry was evicted and re-created cannot mark
-    /// the *new* entry published.
+    /// the *new* entry published, and a queued job whose block has been
+    /// superseded can tell.
     generation: u64,
 }
 
@@ -483,7 +556,6 @@ struct Index {
     entries: HashMap<BlockHash, Entry>,
     bytes: u64,
     clock: u64,
-    generation: u64,
 }
 
 impl Index {
@@ -493,189 +565,448 @@ impl Index {
     }
 }
 
+/// A block that has been accepted but whose file is not on disk yet.
+struct Buffered {
+    generation: u64,
+    block: Arc<KvBlock>,
+}
+
+#[derive(Clone, Copy)]
+struct WriteJob {
+    hash: BlockHash,
+    generation: u64,
+}
+
+struct QueueState {
+    jobs: VecDeque<WriteJob>,
+    running: usize,
+    shutdown: bool,
+}
+
+/// A bounded queue of pending block writes.
+///
+/// Bounded, and **never lossy**: `try_push` refusing is the caller's
+/// signal to write the block itself, not to drop it. A dropped write is
+/// indistinguishable from a cache miss later, which is exactly the kind
+/// of silent degradation that makes a cache tier impossible to trust.
+struct WriteQueue {
+    state: Mutex<QueueState>,
+    ready: Condvar,
+    idle: Condvar,
+    capacity: usize,
+}
+
+impl WriteQueue {
+    fn new(capacity: usize) -> Self {
+        WriteQueue {
+            state: Mutex::new(QueueState {
+                jobs: VecDeque::new(),
+                running: 0,
+                shutdown: false,
+            }),
+            ready: Condvar::new(),
+            idle: Condvar::new(),
+            capacity: capacity.max(1),
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, QueueState> {
+        self.state.lock().expect("kv disk write queue poisoned")
+    }
+
+    /// `false` means "full, or shutting down" -- write it yourself.
+    fn try_push(&self, job: WriteJob) -> bool {
+        let mut state = self.lock();
+        if state.shutdown || state.jobs.len() >= self.capacity {
+            return false;
+        }
+        state.jobs.push_back(job);
+        self.ready.notify_one();
+        true
+    }
+
+    fn pop_blocking(&self) -> Option<WriteJob> {
+        let mut state = self.lock();
+        loop {
+            if let Some(job) = state.jobs.pop_front() {
+                state.running += 1;
+                return Some(job);
+            }
+            if state.shutdown {
+                return None;
+            }
+            state = self
+                .ready
+                .wait(state)
+                .expect("kv disk write queue poisoned");
+        }
+    }
+
+    fn pop_now(&self) -> Option<WriteJob> {
+        let mut state = self.lock();
+        let job = state.jobs.pop_front()?;
+        state.running += 1;
+        Some(job)
+    }
+
+    fn finish(&self) {
+        let mut state = self.lock();
+        state.running -= 1;
+        self.idle.notify_all();
+    }
+
+    fn shutdown(&self) {
+        let mut state = self.lock();
+        state.shutdown = true;
+        self.ready.notify_all();
+    }
+
+    fn depth(&self) -> usize {
+        self.lock().jobs.len()
+    }
+}
+
 #[cfg(test)]
-type Hook = Box<dyn Fn(&BlockHash) + Send + Sync>;
+type Hook = Arc<dyn Fn(&BlockHash) + Send + Sync>;
+
+/// Which order the write path uses. Production is
+/// `BufferThenIndex`; the other two exist so a test can prove the
+/// invariant test is not vacuous -- a concurrency test that passes on
+/// broken code proves nothing.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum WriteOrder {
+    #[default]
+    BufferThenIndex,
+    /// Index the block before buffering it: a reader can then hit the
+    /// index for a block with no file and no payload.
+    IndexBeforeBuffer,
+    /// Release the buffered payload before marking the file published:
+    /// same hole, at the other end of the write.
+    DropBufferBeforeMarking,
+}
 
 #[cfg(test)]
 #[derive(Default)]
 struct Hooks {
+    order: Mutex<WriteOrder>,
     /// Called after the rename and before the post-publish eviction
     /// re-check, so a test can evict the block in exactly the window
     /// the re-check exists to cover.
     after_rename: Mutex<Option<Hook>>,
+    /// Called inside the window between the two steps of admission.
+    in_put_window: Mutex<Option<Hook>>,
+    /// Called inside the window between the two steps of publication.
+    in_publish_window: Mutex<Option<Hook>>,
 }
 
-struct StoreInner {
+#[cfg(test)]
+impl Hooks {
+    fn fire(slot: &Mutex<Option<Hook>>, hash: &BlockHash) {
+        // Cloned out before calling, so a hook that re-enters the store
+        // cannot deadlock on the hook slot itself.
+        let hook = slot.lock().expect("kv disk hook poisoned").clone();
+        if let Some(hook) = hook {
+            hook(hash);
+        }
+    }
+}
+
+/// Everything the store's threads share. Deliberately holds no join
+/// handles: the writer threads hold an `Arc<Shared>`, so a `Drop` here
+/// that joined them could run *on* a writer thread and deadlock. The
+/// handles live in [`DiskKvStore`], which is not `Clone`.
+struct Shared {
     root: PathBuf,
     shard_chars: usize,
     max_bytes: u64,
     index: Mutex<Index>,
+    /// Blocks accepted but not yet on disk.
+    ///
+    /// **Lock order: `index`, then `buffer`, never the reverse.** A
+    /// reader decides "the index says this block exists" and "here is
+    /// its payload" as one atomic act; otherwise the writer could mark
+    /// a block published and drop its buffered copy in between, and the
+    /// reader would find nothing.
+    buffer: Mutex<HashMap<BlockHash, Buffered>>,
+    queue: WriteQueue,
     stats: Stats,
     seq: AtomicU64,
+    generation: AtomicU64,
     #[cfg(test)]
     hooks: Hooks,
 }
 
-/// A content-addressed block store on disk.
+/// A content-addressed block store on disk, with its own writer
+/// threads.
 ///
-/// Cheap to clone (it is an `Arc` inside), so the store can be shared
-/// by the request threads that read from it and whatever writes into
-/// it.
-#[derive(Clone)]
+/// Not `Clone` on purpose -- it owns the writer threads and joins them
+/// when it drops. Share it as an `Arc<DiskKvStore>`; every method takes
+/// `&self`.
 pub struct DiskKvStore {
-    inner: Arc<StoreInner>,
+    shared: Arc<Shared>,
+    writers: Vec<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for DiskKvStore {
+    /// Stops accepting queued work and joins the writer threads. Blocks
+    /// already queued but not started are **not** written: they were
+    /// never durable, and a shutdown that waits for an arbitrarily deep
+    /// queue is worse than a cold cache. Call [`Self::flush`] first if
+    /// they matter.
+    fn drop(&mut self) {
+        self.shared.queue.shutdown();
+        for writer in self.writers.drain(..) {
+            let _ = writer.join();
+        }
+    }
 }
 
 impl DiskKvStore {
-    /// Creates the store's directories. Does **not** scan `root` for
-    /// pre-existing blocks: reattaching to a store left by a previous
-    /// process is [`Self::reindex`], an explicit step, because it costs
-    /// a directory walk and a caller may prefer to start cold.
+    /// Creates the store's directories and starts its writer threads.
+    /// Does **not** scan `root` for pre-existing blocks: reattaching to
+    /// a store left by a previous process is [`Self::reindex`], an
+    /// explicit step, because it costs a directory walk and a caller
+    /// may prefer to start cold.
     pub fn open(config: DiskConfig) -> Result<Self, StoreError> {
         let root = config.root.clone();
         fs::create_dir_all(&root).map_err(|e| io_err("create", &root, e))?;
         let tmp = root.join(TMP_DIR);
         fs::create_dir_all(&tmp).map_err(|e| io_err("create", &tmp, e))?;
-        Ok(DiskKvStore {
-            inner: Arc::new(StoreInner {
-                root,
-                shard_chars: config.shard_chars.clamp(1, 8),
-                max_bytes: config.max_bytes,
-                index: Mutex::new(Index {
-                    entries: HashMap::new(),
-                    bytes: 0,
-                    clock: 0,
-                    generation: 0,
-                }),
-                stats: Stats::default(),
-                seq: AtomicU64::new(0),
-                #[cfg(test)]
-                hooks: Hooks::default(),
+        let shared = Arc::new(Shared {
+            root,
+            shard_chars: config.shard_chars.clamp(1, 8),
+            max_bytes: config.max_bytes,
+            index: Mutex::new(Index {
+                entries: HashMap::new(),
+                bytes: 0,
+                clock: 0,
             }),
-        })
+            buffer: Mutex::new(HashMap::new()),
+            queue: WriteQueue::new(config.queue_capacity),
+            stats: Stats::default(),
+            seq: AtomicU64::new(0),
+            generation: AtomicU64::new(0),
+            #[cfg(test)]
+            hooks: Hooks::default(),
+        });
+        let mut writers = Vec::with_capacity(config.writer_threads);
+        for n in 0..config.writer_threads {
+            let shared = Arc::clone(&shared);
+            let handle = std::thread::Builder::new()
+                .name(format!("ferrox-kv-write-{n}"))
+                .spawn(move || {
+                    while let Some(job) = shared.queue.pop_blocking() {
+                        shared.run_job(job);
+                        shared.queue.finish();
+                    }
+                })
+                .map_err(|e| io_err("spawn writer for", &config.root, e))?;
+            writers.push(handle);
+        }
+        Ok(DiskKvStore { shared, writers })
     }
 
     pub fn root(&self) -> &Path {
-        &self.inner.root
+        &self.shared.root
+    }
+
+    /// Accepts a block: buffered, indexed, then queued. Returns as soon
+    /// as the block is *visible* -- a reader can have it immediately,
+    /// whether or not it has reached disk.
+    ///
+    /// If the write queue is full the block is written on this thread
+    /// rather than dropped, and the fallback is counted.
+    pub fn put(&self, hash: BlockHash, block: KvBlock) -> Result<(), StoreError> {
+        self.shared.put(hash, block, false)
+    }
+
+    /// Like [`Self::put`], but always writes on the calling thread.
+    pub fn put_blocking(&self, hash: BlockHash, block: KvBlock) -> Result<(), StoreError> {
+        self.shared.put(hash, block, true)
+    }
+
+    /// Runs every pending write to completion, on this thread if no
+    /// writer thread gets there first. Returns once the queue is empty
+    /// and nothing is in flight.
+    pub fn flush(&self) {
+        loop {
+            if let Some(job) = self.shared.queue.pop_now() {
+                self.shared.run_job(job);
+                self.shared.queue.finish();
+                continue;
+            }
+            let state = self.shared.queue.lock();
+            if state.jobs.is_empty() && state.running == 0 {
+                return;
+            }
+            // Timed, so a store with no writer threads and a job pushed
+            // by another thread cannot park here forever.
+            let _ = self
+                .shared
+                .queue
+                .idle
+                .wait_timeout(state, std::time::Duration::from_millis(1));
+        }
+    }
+
+    /// Looks a block up, verifying it against `expected` before
+    /// returning it. See [`Shared::get`] for what `Ok(None)` covers.
+    pub fn get(
+        &self,
+        hash: &BlockHash,
+        expected: &CacheSignature,
+    ) -> Result<Option<Arc<KvBlock>>, StoreError> {
+        self.shared.get(hash, expected)
     }
 
     /// Adopts the blocks already under `root`, as a restart would.
-    /// Every file is admitted on its *name and size* only -- the
-    /// contents are checked when the block is read, which is the only
-    /// place a check can be trusted anyway, and walking a 100k-block
-    /// store to hash every file would make a restart cost a full read
-    /// of the tier.
-    ///
-    /// Leftover temp files are deleted: a temp file that still exists
-    /// is by definition a write that never published.
     pub fn reindex(&self) -> Result<usize, StoreError> {
-        let tmp = self.inner.root.join(TMP_DIR);
-        if let Ok(entries) = fs::read_dir(&tmp) {
-            for entry in entries.flatten() {
-                let _ = fs::remove_file(entry.path());
-            }
-        }
-        let mut found = Vec::new();
-        let shards =
-            fs::read_dir(&self.inner.root).map_err(|e| io_err("read", &self.inner.root, e))?;
-        for shard in shards.flatten() {
-            if !shard.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-                continue;
-            }
-            if shard.file_name() == TMP_DIR {
-                continue;
-            }
-            let Ok(files) = fs::read_dir(shard.path()) else {
-                continue;
-            };
-            for file in files.flatten() {
-                let path = file.path();
-                if path.extension().and_then(|e| e.to_str()) != Some(BLOCK_FILE_EXT) {
-                    continue;
-                }
-                let Some(hash) = path
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .and_then(parse_hex_hash)
-                else {
-                    continue;
-                };
-                let Ok(meta) = file.metadata() else { continue };
-                found.push((hash, meta.len()));
-            }
-        }
-        let mut index = self.inner.index.lock().expect("kv disk index poisoned");
-        let mut adopted = 0;
-        for (hash, bytes) in found {
-            if index.entries.contains_key(&hash) {
-                continue;
-            }
-            let last_used = index.touch();
-            let generation = {
-                index.generation += 1;
-                index.generation
-            };
-            index.entries.insert(
-                hash,
-                Entry {
-                    bytes,
-                    last_used,
-                    published: true,
-                    generation,
-                },
-            );
-            index.bytes += bytes;
-            adopted += 1;
-        }
-        let victims = self.collect_victims(&mut index, None);
-        drop(index);
-        self.delete(victims);
-        Ok(adopted)
+        self.shared.reindex()
     }
 
-    /// Writes a block and publishes it, on the calling thread.
+    /// Removes a block from the index, the write buffer, and the disk.
+    pub fn remove(&self, hash: &BlockHash) {
+        self.shared.quarantine(hash);
+    }
+
+    /// True if the index holds an entry for `hash` -- on disk or still
+    /// buffered. Says nothing about whether its contents will verify.
+    pub fn contains(&self, hash: &BlockHash) -> bool {
+        let index = self.shared.index.lock().expect("kv disk index poisoned");
+        index.entries.contains_key(hash)
+    }
+
+    /// Byte ceiling the store evicts against.
+    pub fn capacity(&self) -> u64 {
+        self.shared.max_bytes
+    }
+
+    /// Where a block's file lives (or would). Useful to an operator
+    /// tracing one block; the file may not exist yet, or at all.
+    pub fn block_path(&self, hash: &BlockHash) -> PathBuf {
+        self.shared.block_path(hash)
+    }
+
+    pub fn stats(&self) -> DiskStats {
+        self.shared.stats()
+    }
+}
+
+impl Shared {
+    fn next_generation(&self) -> u64 {
+        self.generation.fetch_add(1, Ordering::SeqCst) + 1
+    }
+
+    /// The write path, in the order the plan requires:
     ///
-    /// Ordering: the index entry is reserved **first**, so the block is
-    /// subject to eviction for the whole duration of the write; then
-    /// the file is written to a temp path, `fsync`ed, and renamed into
-    /// place; then the index is re-checked. If the entry was evicted
-    /// while the write was in flight, the just-renamed file is deleted
-    /// -- otherwise an eviction would silently fail to free the bytes
-    /// it accounted for, and the store would drift over budget one
-    /// raced write at a time.
-    pub fn put_blocking(&self, hash: BlockHash, block: &KvBlock) -> Result<(), StoreError> {
-        let started = Instant::now();
+    /// 1. **buffer** -- the payload is reachable before anything claims
+    ///    it exists;
+    /// 2. **index** -- now it is claimed to exist, and is subject to
+    ///    eviction and budget accounting;
+    /// 3. **queue** -- only now does the write get scheduled.
+    ///
+    /// Reversing 1 and 2 lets a reader hit the index for a block with
+    /// no file and no payload. Reversing 2 and 3 would be harmless but
+    /// pointless: a queued write whose block is not indexed cannot be
+    /// evicted or accounted for.
+    fn put(&self, hash: BlockHash, block: KvBlock, inline: bool) -> Result<(), StoreError> {
         let bytes = encoded_len(block.signature());
-        let generation = self.reserve(hash, bytes);
-        let result = self.write_and_publish(&hash, block, generation);
-        self.inner
-            .stats
+        let block = Arc::new(block);
+        let generation = self.next_generation();
+
+        #[cfg(test)]
+        let index_first = *self.hooks.order.lock().expect("kv disk hook poisoned")
+            == WriteOrder::IndexBeforeBuffer;
+        #[cfg(not(test))]
+        let index_first = false;
+
+        if index_first {
+            self.reserve(hash, bytes, generation);
+            #[cfg(test)]
+            Hooks::fire(&self.hooks.in_put_window, &hash);
+            self.buffer_block(hash, generation, Arc::clone(&block));
+        } else {
+            self.buffer_block(hash, generation, Arc::clone(&block));
+            #[cfg(test)]
+            Hooks::fire(&self.hooks.in_put_window, &hash);
+            self.reserve(hash, bytes, generation);
+        }
+
+        let job = WriteJob { hash, generation };
+        if !inline && self.queue.try_push(job) {
+            self.stats.queued_writes.fetch_add(1, Ordering::Relaxed);
+            return Ok(());
+        }
+        if !inline {
+            self.stats.inline_writes.fetch_add(1, Ordering::Relaxed);
+        }
+        self.run_write(job, block)
+    }
+
+    fn buffer_block(&self, hash: BlockHash, generation: u64, block: Arc<KvBlock>) {
+        self.buffer
+            .lock()
+            .expect("kv disk buffer poisoned")
+            .insert(hash, Buffered { generation, block });
+    }
+
+    /// Drops a buffered payload, but only if it is still the one this
+    /// generation put there -- a newer `put` for the same hash owns the
+    /// slot now.
+    fn release_buffer(&self, hash: &BlockHash, generation: u64) {
+        let mut buffer = self.buffer.lock().expect("kv disk buffer poisoned");
+        if buffer.get(hash).is_some_and(|b| b.generation == generation) {
+            buffer.remove(hash);
+        }
+    }
+
+    fn buffered(&self, hash: &BlockHash, generation: u64) -> Option<Arc<KvBlock>> {
+        let buffer = self.buffer.lock().expect("kv disk buffer poisoned");
+        buffer
+            .get(hash)
+            .filter(|b| b.generation == generation)
+            .map(|b| Arc::clone(&b.block))
+    }
+
+    /// Runs a queued write. A block whose buffered payload is gone was
+    /// evicted or superseded while it waited, and is skipped rather
+    /// than resurrected.
+    fn run_job(&self, job: WriteJob) {
+        match self.buffered(&job.hash, job.generation) {
+            Some(block) => {
+                let _ = self.run_write(job, block);
+            }
+            None => {
+                self.stats.write_skipped.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    fn run_write(&self, job: WriteJob, block: Arc<KvBlock>) -> Result<(), StoreError> {
+        let started = Instant::now();
+        let result = self.write_and_publish(&job.hash, &block, job.generation);
+        self.stats
             .write_nanos
             .fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
         match result {
             Ok(()) => {
-                self.inner.stats.writes.fetch_add(1, Ordering::Relaxed);
+                self.stats.writes.fetch_add(1, Ordering::Relaxed);
                 Ok(())
             }
             Err(err) => {
-                self.inner
-                    .stats
-                    .write_failures
-                    .fetch_add(1, Ordering::Relaxed);
-                self.forget(&hash, generation);
+                self.stats.write_failures.fetch_add(1, Ordering::Relaxed);
+                self.abandon(&job.hash, job.generation);
                 Err(err)
             }
         }
     }
 
     /// Reserves (or re-reserves) an index entry, charges its bytes, and
-    /// evicts whatever that pushes over budget. Returns the entry's
-    /// generation.
-    fn reserve(&self, hash: BlockHash, bytes: u64) -> u64 {
-        let mut index = self.inner.index.lock().expect("kv disk index poisoned");
+    /// evicts whatever that pushes over budget.
+    fn reserve(&self, hash: BlockHash, bytes: u64, generation: u64) {
+        let mut index = self.index.lock().expect("kv disk index poisoned");
         let last_used = index.touch();
-        index.generation += 1;
-        let generation = index.generation;
         if let Some(previous) = index.entries.insert(
             hash,
             Entry {
@@ -690,22 +1021,27 @@ impl DiskKvStore {
         index.bytes += bytes;
         let victims = self.collect_victims(&mut index, Some(&hash));
         drop(index);
-        self.delete(victims);
-        generation
+        self.discard(victims);
     }
 
     /// Drops an entry that will never be published (a failed write).
-    fn forget(&self, hash: &BlockHash, generation: u64) {
-        let mut index = self.inner.index.lock().expect("kv disk index poisoned");
-        if index
-            .entries
-            .get(hash)
-            .is_some_and(|e| e.generation == generation)
+    /// Index first, then the buffer: an entry that is gone from the
+    /// index is unreachable, so no reader can be looking for the
+    /// payload we are about to free.
+    fn abandon(&self, hash: &BlockHash, generation: u64) {
         {
-            if let Some(entry) = index.entries.remove(hash) {
-                index.bytes -= entry.bytes;
+            let mut index = self.index.lock().expect("kv disk index poisoned");
+            if index
+                .entries
+                .get(hash)
+                .is_some_and(|e| e.generation == generation)
+            {
+                if let Some(entry) = index.entries.remove(hash) {
+                    index.bytes -= entry.bytes;
+                }
             }
         }
+        self.release_buffer(hash, generation);
     }
 
     fn write_and_publish(
@@ -740,37 +1076,52 @@ impl DiskKvStore {
         })?;
 
         #[cfg(test)]
-        {
-            let hook = self
-                .inner
-                .hooks
-                .after_rename
-                .lock()
-                .expect("hook lock poisoned");
-            if let Some(hook) = hook.as_ref() {
-                hook(hash);
-            }
-        }
+        Hooks::fire(&self.hooks.after_rename, hash);
 
-        let mut index = self.inner.index.lock().expect("kv disk index poisoned");
+        #[cfg(test)]
+        let drop_buffer_first = *self.hooks.order.lock().expect("kv disk hook poisoned")
+            == WriteOrder::DropBufferBeforeMarking;
+        #[cfg(not(test))]
+        let drop_buffer_first = false;
+
+        // Mark published, *then* release the buffered payload. In
+        // between, a reader either sees "published" and reads the file
+        // (which exists) or sees "buffered" and reads the buffer (which
+        // still holds it). Releasing first opens a window where neither
+        // is true.
+        let survived = if drop_buffer_first {
+            self.release_buffer(hash, generation);
+            #[cfg(test)]
+            Hooks::fire(&self.hooks.in_publish_window, hash);
+            self.mark_published(hash, generation)
+        } else {
+            let survived = self.mark_published(hash, generation);
+            #[cfg(test)]
+            Hooks::fire(&self.hooks.in_publish_window, hash);
+            self.release_buffer(hash, generation);
+            survived
+        };
+
+        if !survived {
+            // Evicted (or superseded) mid-write. The eviction already
+            // released this entry's bytes and could not delete a file
+            // that did not exist yet, so the file is ours to withdraw.
+            let _ = fs::remove_file(&final_path);
+            self.stats
+                .write_raced_eviction
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(())
+    }
+
+    fn mark_published(&self, hash: &BlockHash, generation: u64) -> bool {
+        let mut index = self.index.lock().expect("kv disk index poisoned");
         match index.entries.get_mut(hash) {
             Some(entry) if entry.generation == generation => {
                 entry.published = true;
-                Ok(())
+                true
             }
-            _ => {
-                // Evicted (or superseded) mid-write. The eviction
-                // already released this entry's bytes and could not
-                // delete a file that did not exist yet, so the file is
-                // ours to withdraw.
-                drop(index);
-                let _ = fs::remove_file(&final_path);
-                self.inner
-                    .stats
-                    .write_raced_eviction
-                    .fetch_add(1, Ordering::Relaxed);
-                Ok(())
-            }
+            _ => false,
         }
     }
 
@@ -778,44 +1129,66 @@ impl DiskKvStore {
     /// returning it.
     ///
     /// `Ok(None)` covers every "you will have to recompute this"
-    /// outcome -- absent, not yet published, corrupt on disk, or built
-    /// for a different config -- because they are the same answer to
-    /// the caller. The counters in [`DiskStats`] tell them apart.
-    /// `Err` is reserved for I/O that failed in a way worth surfacing.
-    pub fn get(
+    /// outcome -- absent, corrupt on disk, or built for a different
+    /// config -- because they are the same answer to the caller. The
+    /// counters in [`DiskStats`] tell them apart. `Err` is I/O that
+    /// failed, or the write-ordering invariant breaking.
+    fn get(
         &self,
         hash: &BlockHash,
         expected: &CacheSignature,
     ) -> Result<Option<Arc<KvBlock>>, StoreError> {
-        let path = {
-            let mut index = self.inner.index.lock().expect("kv disk index poisoned");
+        enum Source {
+            Disk(PathBuf),
+            Buffer(Arc<KvBlock>),
+        }
+        let source = {
+            let mut index = self.index.lock().expect("kv disk index poisoned");
             let clock = index.clock + 1;
-            match index.entries.get_mut(hash) {
-                None => {
-                    self.inner.stats.misses.fetch_add(1, Ordering::Relaxed);
-                    return Ok(None);
-                }
-                Some(entry) if !entry.published => {
-                    self.inner
-                        .stats
-                        .pending_misses
-                        .fetch_add(1, Ordering::Relaxed);
-                    return Ok(None);
-                }
-                Some(entry) => {
-                    entry.last_used = clock;
-                    index.clock = clock;
-                    self.block_path(hash)
+            let Some(entry) = index.entries.get_mut(hash) else {
+                self.stats.misses.fetch_add(1, Ordering::Relaxed);
+                return Ok(None);
+            };
+            entry.last_used = clock;
+            let published = entry.published;
+            index.clock = clock;
+            if published {
+                Source::Disk(self.block_path(hash))
+            } else {
+                // The index lock is deliberately still held: "not
+                // published" and "here is the buffered payload" must be
+                // one decision. Two decisions leave a gap for the
+                // writer to publish and release in between.
+                let buffered = self
+                    .buffer
+                    .lock()
+                    .expect("kv disk buffer poisoned")
+                    .get(hash)
+                    .map(|b| Arc::clone(&b.block));
+                match buffered {
+                    Some(block) => Source::Buffer(block),
+                    None => return Err(StoreError::MissingPayload { hash: *hash }),
                 }
             }
         };
-        let started = Instant::now();
-        let outcome = self.read_verified(&path, hash, expected);
-        self.inner
-            .stats
-            .read_nanos
-            .fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
-        outcome
+        match source {
+            Source::Buffer(block) => {
+                if block.signature() != expected {
+                    self.stats.incompatible.fetch_add(1, Ordering::Relaxed);
+                    return Ok(None);
+                }
+                self.stats.buffer_hits.fetch_add(1, Ordering::Relaxed);
+                Ok(Some(block))
+            }
+            Source::Disk(path) => {
+                let started = Instant::now();
+                let outcome = self.read_verified(&path, hash, expected);
+                self.stats
+                    .read_nanos
+                    .fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                outcome
+            }
+        }
     }
 
     fn read_verified(
@@ -829,7 +1202,7 @@ impl DiskKvStore {
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
                 // The file vanished under us -- an eviction between the
                 // index lookup and the open, or an external cleaner.
-                self.inner.stats.misses.fetch_add(1, Ordering::Relaxed);
+                self.stats.misses.fetch_add(1, Ordering::Relaxed);
                 self.drop_entry(hash);
                 return Ok(None);
             }
@@ -838,7 +1211,7 @@ impl DiskKvStore {
         let decoded = match decode_block(&bytes) {
             Ok(decoded) => decoded,
             Err(_) => {
-                self.inner.stats.corrupt.fetch_add(1, Ordering::Relaxed);
+                self.stats.corrupt.fetch_add(1, Ordering::Relaxed);
                 self.quarantine(hash);
                 return Ok(None);
             }
@@ -846,82 +1219,105 @@ impl DiskKvStore {
         if &decoded.hash != hash {
             // The file under this name is some other block. Treat it
             // exactly like corruption: the name is the identity.
-            self.inner.stats.corrupt.fetch_add(1, Ordering::Relaxed);
+            self.stats.corrupt.fetch_add(1, Ordering::Relaxed);
             self.quarantine(hash);
             return Ok(None);
         }
         match decoded.block.verify(expected) {
             Ok(block) => {
-                self.inner.stats.hits.fetch_add(1, Ordering::Relaxed);
+                self.stats.hits.fetch_add(1, Ordering::Relaxed);
                 Ok(Some(Arc::new(block)))
             }
             Err(_) => {
-                self.inner
-                    .stats
-                    .incompatible
-                    .fetch_add(1, Ordering::Relaxed);
+                self.stats.incompatible.fetch_add(1, Ordering::Relaxed);
                 Ok(None)
             }
         }
     }
 
-    /// Removes a block from the index and deletes its file.
-    pub fn remove(&self, hash: &BlockHash) {
-        self.quarantine(hash);
-    }
-
     fn quarantine(&self, hash: &BlockHash) {
         self.drop_entry(hash);
+        self.buffer
+            .lock()
+            .expect("kv disk buffer poisoned")
+            .remove(hash);
         let _ = fs::remove_file(self.block_path(hash));
     }
 
     fn drop_entry(&self, hash: &BlockHash) {
-        let mut index = self.inner.index.lock().expect("kv disk index poisoned");
+        let mut index = self.index.lock().expect("kv disk index poisoned");
         if let Some(entry) = index.entries.remove(hash) {
             index.bytes -= entry.bytes;
         }
     }
 
-    /// True if the index holds a published entry for `hash`. Says
-    /// nothing about whether its contents will verify.
-    pub fn contains(&self, hash: &BlockHash) -> bool {
-        let index = self.inner.index.lock().expect("kv disk index poisoned");
-        index.entries.get(hash).is_some_and(|e| e.published)
-    }
-
-    /// Byte ceiling the store evicts against.
-    pub fn capacity(&self) -> u64 {
-        self.inner.max_bytes
-    }
-
-    pub fn stats(&self) -> DiskStats {
-        let index = self.inner.index.lock().expect("kv disk index poisoned");
-        let stats = &self.inner.stats;
-        DiskStats {
-            blocks: index.entries.len(),
-            bytes: index.bytes,
-            writes: stats.writes.load(Ordering::Relaxed),
-            write_failures: stats.write_failures.load(Ordering::Relaxed),
-            write_raced_eviction: stats.write_raced_eviction.load(Ordering::Relaxed),
-            write_nanos: stats.write_nanos.load(Ordering::Relaxed),
-            hits: stats.hits.load(Ordering::Relaxed),
-            misses: stats.misses.load(Ordering::Relaxed),
-            pending_misses: stats.pending_misses.load(Ordering::Relaxed),
-            corrupt: stats.corrupt.load(Ordering::Relaxed),
-            incompatible: stats.incompatible.load(Ordering::Relaxed),
-            read_nanos: stats.read_nanos.load(Ordering::Relaxed),
-            evictions: stats.evictions.load(Ordering::Relaxed),
-            evicted_bytes: stats.evicted_bytes.load(Ordering::Relaxed),
+    fn reindex(&self) -> Result<usize, StoreError> {
+        let tmp = self.root.join(TMP_DIR);
+        if let Ok(entries) = fs::read_dir(&tmp) {
+            for entry in entries.flatten() {
+                let _ = fs::remove_file(entry.path());
+            }
         }
+        let mut found = Vec::new();
+        let shards = fs::read_dir(&self.root).map_err(|e| io_err("read", &self.root, e))?;
+        for shard in shards.flatten() {
+            if !shard.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                continue;
+            }
+            if shard.file_name() == TMP_DIR {
+                continue;
+            }
+            let Ok(files) = fs::read_dir(shard.path()) else {
+                continue;
+            };
+            for file in files.flatten() {
+                let path = file.path();
+                if path.extension().and_then(|e| e.to_str()) != Some(BLOCK_FILE_EXT) {
+                    continue;
+                }
+                let Some(hash) = path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .and_then(parse_hex_hash)
+                else {
+                    continue;
+                };
+                let Ok(meta) = file.metadata() else { continue };
+                found.push((hash, meta.len()));
+            }
+        }
+        let mut adopted = 0;
+        let mut index = self.index.lock().expect("kv disk index poisoned");
+        for (hash, bytes) in found {
+            if index.entries.contains_key(&hash) {
+                continue;
+            }
+            let last_used = index.touch();
+            index.entries.insert(
+                hash,
+                Entry {
+                    bytes,
+                    last_used,
+                    published: true,
+                    generation: self.next_generation(),
+                },
+            );
+            index.bytes += bytes;
+            adopted += 1;
+        }
+        let victims = self.collect_victims(&mut index, None);
+        drop(index);
+        self.discard(victims);
+        Ok(adopted)
     }
 
     /// Picks least-recently-used entries until the store fits its
-    /// budget, removing them from the index and returning their paths
-    /// for deletion. Index first, file second -- an entry that is gone
+    /// budget, removing them from the index and returning them for
+    /// disposal. Index first, payload second -- an entry that is gone
     /// from the index is unreachable, whereas a file deleted while the
     /// index still points at it would be a hit that fails to open.
-    fn collect_victims(&self, index: &mut Index, protect: Option<&BlockHash>) -> Vec<PathBuf> {
-        let budget = self.inner.max_bytes;
+    fn collect_victims(&self, index: &mut Index, protect: Option<&BlockHash>) -> Vec<Victim> {
+        let budget = self.max_bytes;
         if index.bytes <= budget {
             return Vec::new();
         }
@@ -939,40 +1335,84 @@ impl DiskKvStore {
             }
             if let Some(entry) = index.entries.remove(&hash) {
                 index.bytes -= entry.bytes;
-                self.inner.stats.evictions.fetch_add(1, Ordering::Relaxed);
-                self.inner
-                    .stats
+                self.stats.evictions.fetch_add(1, Ordering::Relaxed);
+                self.stats
                     .evicted_bytes
                     .fetch_add(entry.bytes, Ordering::Relaxed);
-                if entry.published {
-                    victims.push(self.block_path(&hash));
-                }
+                victims.push(Victim {
+                    hash,
+                    published: entry.published,
+                });
             }
         }
         victims
     }
 
-    fn delete(&self, paths: Vec<PathBuf>) {
-        for path in paths {
-            let _ = fs::remove_file(path);
+    /// Frees what eviction removed from the index: the buffered payload
+    /// and, if it got that far, the file.
+    fn discard(&self, victims: Vec<Victim>) {
+        if victims.is_empty() {
+            return;
+        }
+        {
+            let mut buffer = self.buffer.lock().expect("kv disk buffer poisoned");
+            for victim in &victims {
+                buffer.remove(&victim.hash);
+            }
+        }
+        for victim in victims {
+            if victim.published {
+                let _ = fs::remove_file(self.block_path(&victim.hash));
+            }
+        }
+    }
+
+    fn stats(&self) -> DiskStats {
+        let index = self.index.lock().expect("kv disk index poisoned");
+        let stats = &self.stats;
+        DiskStats {
+            blocks: index.entries.len(),
+            bytes: index.bytes,
+            queue_depth: self.queue.depth(),
+            writes: stats.writes.load(Ordering::Relaxed),
+            queued_writes: stats.queued_writes.load(Ordering::Relaxed),
+            inline_writes: stats.inline_writes.load(Ordering::Relaxed),
+            write_failures: stats.write_failures.load(Ordering::Relaxed),
+            write_skipped: stats.write_skipped.load(Ordering::Relaxed),
+            write_raced_eviction: stats.write_raced_eviction.load(Ordering::Relaxed),
+            write_nanos: stats.write_nanos.load(Ordering::Relaxed),
+            hits: stats.hits.load(Ordering::Relaxed),
+            buffer_hits: stats.buffer_hits.load(Ordering::Relaxed),
+            misses: stats.misses.load(Ordering::Relaxed),
+            corrupt: stats.corrupt.load(Ordering::Relaxed),
+            incompatible: stats.incompatible.load(Ordering::Relaxed),
+            read_nanos: stats.read_nanos.load(Ordering::Relaxed),
+            evictions: stats.evictions.load(Ordering::Relaxed),
+            evicted_bytes: stats.evicted_bytes.load(Ordering::Relaxed),
         }
     }
 
     fn block_path(&self, hash: &BlockHash) -> PathBuf {
-        self.inner
-            .root
-            .join(hash.shard_prefix(self.inner.shard_chars))
+        self.root
+            .join(hash.shard_prefix(self.shard_chars))
             .join(format!("{}.{BLOCK_FILE_EXT}", hash.to_hex()))
     }
 
     fn tmp_path(&self, hash: &BlockHash) -> PathBuf {
-        let n = self.inner.seq.fetch_add(1, Ordering::Relaxed);
-        self.inner.root.join(TMP_DIR).join(format!(
+        let n = self.seq.fetch_add(1, Ordering::Relaxed);
+        self.root.join(TMP_DIR).join(format!(
             "{}.{}.{n}.tmp",
             hash.shard_prefix(16),
             std::process::id()
         ))
     }
+}
+
+/// An entry eviction has already removed from the index, awaiting
+/// disposal of its payload.
+struct Victim {
+    hash: BlockHash,
+    published: bool,
 }
 
 fn parse_hex_hash(text: &str) -> Option<BlockHash> {
@@ -992,6 +1432,7 @@ fn parse_hex_hash(text: &str) -> Option<BlockHash> {
 mod tests {
     use super::*;
     use crate::kv_block::BlockHasher;
+    use std::sync::atomic::AtomicUsize;
 
     /// A throwaway directory that removes itself, so a failing test
     /// does not leave block files behind. `std::env::temp_dir` plus the
@@ -1048,8 +1489,19 @@ mod tests {
         BlockHasher::new("model-a", &[] as &[&str]).chain(&[n, n + 1], 2)[0]
     }
 
+    /// Default test store: everything on the calling thread, so a test
+    /// that does not care about the writer pool never races it.
     fn store(dir: &TempDir, max_bytes: u64) -> DiskKvStore {
-        DiskKvStore::open(DiskConfig::new(dir.path()).with_max_bytes(max_bytes)).expect("open")
+        DiskKvStore::open(
+            DiskConfig::new(dir.path())
+                .with_max_bytes(max_bytes)
+                .with_writer_threads(0),
+        )
+        .expect("open")
+    }
+
+    fn put_now(store: &DiskKvStore, hash: BlockHash, block: KvBlock) {
+        store.put_blocking(hash, block).expect("put");
     }
 
     #[test]
@@ -1058,14 +1510,15 @@ mod tests {
         let store = store(&dir, 1 << 20);
         let h = hash(1);
         let written = block("model-a", 3, 4, 1.0);
-        store.put_blocking(h, &written).expect("put");
+        let copy = block("model-a", 3, 4, 1.0);
+        put_now(&store, h, written);
 
         let read = store
             .get(&h, &expected("model-a", 3, 4))
             .expect("get")
             .expect("the block just written must be found");
         assert_eq!(read.layers().len(), 3);
-        for (a, b) in read.layers().iter().zip(written.layers()) {
+        for (a, b) in read.layers().iter().zip(copy.layers()) {
             assert_eq!(a.k, b.k);
             assert_eq!(a.v, b.v);
             assert_eq!(a.seq_len, b.seq_len);
@@ -1085,7 +1538,7 @@ mod tests {
         let h = hash(2);
         let written = block("model-a", 2, 8, 0.25);
         let predicted = encoded_len(written.signature());
-        store.put_blocking(h, &written).expect("put");
+        put_now(&store, h, written);
         let on_disk = fs::metadata(store.block_path(&h)).expect("stat").len();
         assert_eq!(
             predicted, on_disk,
@@ -1097,10 +1550,14 @@ mod tests {
     #[test]
     fn blocks_are_sharded_by_hash_prefix() {
         let dir = TempDir::new("shard");
-        let store =
-            DiskKvStore::open(DiskConfig::new(dir.path()).with_shard_chars(2)).expect("open");
+        let store = DiskKvStore::open(
+            DiskConfig::new(dir.path())
+                .with_shard_chars(2)
+                .with_writer_threads(0),
+        )
+        .expect("open");
         let h = hash(3);
-        store.put_blocking(h, &block("model-a", 1, 2, 1.0)).unwrap();
+        put_now(&store, h, block("model-a", 1, 2, 1.0));
         let path = store.block_path(&h);
         assert_eq!(
             path.parent()
@@ -1171,7 +1628,7 @@ mod tests {
         let dir = TempDir::new("torn");
         let store = store(&dir, 1 << 20);
         let h = hash(5);
-        store.put_blocking(h, &block("model-a", 2, 4, 1.0)).unwrap();
+        put_now(&store, h, block("model-a", 2, 4, 1.0));
         let path = store.block_path(&h);
 
         // Simulate a write that died half way.
@@ -1212,7 +1669,7 @@ mod tests {
         let dir = TempDir::new("config");
         let store = store(&dir, 1 << 20);
         let h = hash(7);
-        store.put_blocking(h, &block("model-a", 2, 4, 1.0)).unwrap();
+        put_now(&store, h, block("model-a", 2, 4, 1.0));
 
         assert!(store
             .get(&h, &expected("model-b", 2, 4))
@@ -1242,8 +1699,8 @@ mod tests {
         let dir = TempDir::new("misfiled");
         let store = store(&dir, 1 << 20);
         let (a, b) = (hash(8), hash(9));
-        store.put_blocking(a, &block("model-a", 1, 2, 1.0)).unwrap();
-        store.put_blocking(b, &block("model-a", 1, 2, 2.0)).unwrap();
+        put_now(&store, a, block("model-a", 1, 2, 1.0));
+        put_now(&store, b, block("model-a", 1, 2, 2.0));
         // Put b's bytes under a's name.
         let bytes = fs::read(store.block_path(&b)).expect("read b");
         fs::write(store.block_path(&a), bytes).expect("misfile");
@@ -1263,9 +1720,7 @@ mod tests {
         let store = store(&dir, one * 2 + 8);
         let hashes: Vec<BlockHash> = (0..4).map(|i| hash(20 + i)).collect();
         for (i, h) in hashes.iter().enumerate() {
-            store
-                .put_blocking(*h, &block("model-a", 1, 4, i as f32))
-                .expect("put");
+            put_now(&store, *h, block("model-a", 1, 4, i as f32));
             assert!(
                 store.stats().bytes <= store.capacity(),
                 "the store must never sit over budget"
@@ -1294,11 +1749,11 @@ mod tests {
         let one = encoded_len(block("model-a", 1, 4, 1.0).signature());
         let store = store(&dir, one * 2 + 8);
         let (a, b, c) = (hash(30), hash(31), hash(32));
-        store.put_blocking(a, &block("model-a", 1, 4, 1.0)).unwrap();
-        store.put_blocking(b, &block("model-a", 1, 4, 2.0)).unwrap();
+        put_now(&store, a, block("model-a", 1, 4, 1.0));
+        put_now(&store, b, block("model-a", 1, 4, 2.0));
         // Touch `a`, so `b` is now the oldest.
         assert!(store.get(&a, &expected("model-a", 1, 4)).unwrap().is_some());
-        store.put_blocking(c, &block("model-a", 1, 4, 3.0)).unwrap();
+        put_now(&store, c, block("model-a", 1, 4, 3.0));
 
         assert!(store.contains(&a), "a recently read block must survive");
         assert!(!store.contains(&b));
@@ -1316,22 +1771,20 @@ mod tests {
         let store = store(&dir, 1 << 20);
         let h = hash(40);
         {
-            let evicting = store.clone();
+            let evicting = Arc::clone(&store.shared);
             let mut hook = store
-                .inner
+                .shared
                 .hooks
                 .after_rename
                 .lock()
                 .expect("hook lock poisoned");
-            *hook = Some(Box::new(move |hash| {
+            *hook = Some(Arc::new(move |hash: &BlockHash| {
                 // Whoever evicts cannot delete a file that does not
                 // exist yet; the writer must notice and withdraw it.
                 evicting.drop_entry(hash);
             }));
         }
-        store
-            .put_blocking(h, &block("model-a", 1, 4, 1.0))
-            .expect("put");
+        put_now(&store, h, block("model-a", 1, 4, 1.0));
 
         assert!(
             !store.block_path(&h).exists(),
@@ -1348,9 +1801,7 @@ mod tests {
         let dir = TempDir::new("tmp");
         let store = store(&dir, 1 << 20);
         for i in 0..4 {
-            store
-                .put_blocking(hash(50 + i), &block("model-a", 1, 2, i as f32))
-                .expect("put");
+            put_now(&store, hash(50 + i), block("model-a", 1, 2, i as f32));
         }
         let leftovers: Vec<_> = fs::read_dir(dir.path().join(TMP_DIR))
             .expect("tmp dir")
@@ -1371,7 +1822,7 @@ mod tests {
         let h = hash(60);
         {
             let store = store(&dir, 1 << 20);
-            store.put_blocking(h, &block("model-a", 2, 4, 7.0)).unwrap();
+            put_now(&store, h, block("model-a", 2, 4, 7.0));
         }
         // A write that died before publishing.
         let orphan = dir.path().join(TMP_DIR).join("dead.tmp");
@@ -1400,9 +1851,7 @@ mod tests {
         {
             let store = store(&dir, 1 << 20);
             for i in 0..4 {
-                store
-                    .put_blocking(hash(70 + i), &block("model-a", 1, 4, i as f32))
-                    .unwrap();
+                put_now(&store, hash(70 + i), block("model-a", 1, 4, i as f32));
             }
         }
         let small = store(&dir, one * 2 + 8);
@@ -1432,7 +1881,7 @@ mod tests {
         let dir = TempDir::new("vanished");
         let store = store(&dir, 1 << 20);
         let h = hash(90);
-        store.put_blocking(h, &block("model-a", 1, 2, 1.0)).unwrap();
+        put_now(&store, h, block("model-a", 1, 2, 1.0));
         fs::remove_file(store.block_path(&h)).expect("remove");
         assert!(store
             .get(&h, &expected("model-a", 1, 2))
@@ -1447,9 +1896,9 @@ mod tests {
         let dir = TempDir::new("rewrite");
         let store = store(&dir, 1 << 20);
         let h = hash(100);
-        store.put_blocking(h, &block("model-a", 1, 4, 1.0)).unwrap();
+        put_now(&store, h, block("model-a", 1, 4, 1.0));
         let once = store.stats().bytes;
-        store.put_blocking(h, &block("model-a", 1, 4, 1.0)).unwrap();
+        put_now(&store, h, block("model-a", 1, 4, 1.0));
         assert_eq!(store.stats().bytes, once);
         assert_eq!(store.stats().blocks, 1);
     }
@@ -1460,5 +1909,289 @@ mod tests {
         assert_eq!(parse_hex_hash(&h.to_hex()), Some(h));
         assert_eq!(parse_hex_hash("nothex"), None);
         assert_eq!(parse_hex_hash(&"z".repeat(64)), None);
+    }
+
+    // ---------------------------------------------------------------
+    // Write ordering: buffer -> index -> queue
+    // ---------------------------------------------------------------
+
+    /// Runs one `put` with a reader firing inside the window between
+    /// the two ordered steps of the write path, and reports what the
+    /// reader saw. Deterministic on purpose: a sleep-and-hope
+    /// concurrency test that passes tells you nothing about a window it
+    /// may simply have missed.
+    ///
+    /// Returns `(missing_payload_errors, served)`.
+    fn probe_window(order: WriteOrder, publish_window: bool) -> (usize, usize) {
+        let dir = TempDir::new("ordering");
+        let store = store(&dir, 1 << 20);
+        *store.shared.hooks.order.lock().unwrap() = order;
+
+        let violations = Arc::new(AtomicUsize::new(0));
+        let served = Arc::new(AtomicUsize::new(0));
+        let reader = Arc::clone(&store.shared);
+        let v = Arc::clone(&violations);
+        let s = Arc::clone(&served);
+        let hook: Hook = Arc::new(move |hash: &BlockHash| {
+            match reader.get(hash, &expected("model-a", 1, 4)) {
+                Ok(Some(_)) => {
+                    s.fetch_add(1, Ordering::Relaxed);
+                }
+                // Not indexed yet: an honest miss, the reader simply
+                // recomputes.
+                Ok(None) => {}
+                Err(StoreError::MissingPayload { .. }) => {
+                    v.fetch_add(1, Ordering::Relaxed);
+                }
+                Err(other) => panic!("unexpected store error: {other}"),
+            }
+        });
+        let slot = if publish_window {
+            &store.shared.hooks.in_publish_window
+        } else {
+            &store.shared.hooks.in_put_window
+        };
+        *slot.lock().unwrap() = Some(hook);
+
+        put_now(&store, hash(200), block("model-a", 1, 4, 1.0));
+        (
+            violations.load(Ordering::Relaxed),
+            served.load(Ordering::Relaxed),
+        )
+    }
+
+    /// The invariant. A reader that looks inside either window -- after
+    /// the block is buffered but before it is indexed, and after it is
+    /// published but before the buffer is released -- either misses
+    /// cleanly or gets the block. It never gets an index hit with
+    /// nothing behind it.
+    #[test]
+    fn a_reader_never_sees_an_index_hit_with_no_payload() {
+        let (violations, _) = probe_window(WriteOrder::BufferThenIndex, false);
+        assert_eq!(violations, 0, "admission window must be safe");
+
+        let (violations, served) = probe_window(WriteOrder::BufferThenIndex, true);
+        assert_eq!(violations, 0, "publication window must be safe");
+        assert_eq!(
+            served, 1,
+            "the reader must actually have reached the block, or this test proves nothing"
+        );
+    }
+
+    /// The proof that the test above is not vacuous: with the two steps
+    /// of admission reversed -- index first, buffer second, which is
+    /// the natural way to write it -- the very same reader hits an
+    /// index entry for a block with no file and no payload.
+    #[test]
+    fn indexing_before_buffering_is_caught() {
+        let (violations, _) = probe_window(WriteOrder::IndexBeforeBuffer, false);
+        assert_eq!(
+            violations, 1,
+            "index-then-buffer must be detected as an invariant violation"
+        );
+    }
+
+    /// The other end of the write, and the subtler half: releasing the
+    /// buffered payload before marking the file published leaves the
+    /// same gap.
+    #[test]
+    fn releasing_the_buffer_before_publishing_is_caught() {
+        let (violations, _) = probe_window(WriteOrder::DropBufferBeforeMarking, true);
+        assert_eq!(
+            violations, 1,
+            "release-then-mark must be detected as an invariant violation"
+        );
+    }
+
+    /// The same invariant under real concurrency rather than a hook:
+    /// writers queueing blocks while readers hammer them. This one can
+    /// only ever *sample* the windows, which is why the deterministic
+    /// probes above exist -- but it also exercises the writer threads,
+    /// the queue, and eviction all at once.
+    #[test]
+    fn concurrent_readers_never_see_an_index_hit_with_no_payload() {
+        let dir = TempDir::new("concurrent");
+        let one = encoded_len(block("model-a", 1, 4, 1.0).signature());
+        let store = Arc::new(
+            DiskKvStore::open(
+                DiskConfig::new(dir.path())
+                    // Tight enough that eviction runs constantly.
+                    .with_max_bytes(one * 8)
+                    .with_queue_capacity(4)
+                    .with_writer_threads(2),
+            )
+            .expect("open"),
+        );
+        let hashes: Vec<BlockHash> = (0..16).map(|i| hash(300 + i)).collect();
+        let violations = Arc::new(AtomicUsize::new(0));
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let readers: Vec<_> = (0..4)
+            .map(|_| {
+                let store = Arc::clone(&store);
+                let hashes = hashes.clone();
+                let violations = Arc::clone(&violations);
+                let stop = Arc::clone(&stop);
+                std::thread::spawn(move || {
+                    let want = expected("model-a", 1, 4);
+                    while !stop.load(Ordering::Relaxed) {
+                        for h in &hashes {
+                            match store.get(h, &want) {
+                                Ok(_) => {}
+                                Err(StoreError::MissingPayload { .. }) => {
+                                    violations.fetch_add(1, Ordering::Relaxed);
+                                }
+                                Err(other) => panic!("unexpected store error: {other}"),
+                            }
+                        }
+                    }
+                })
+            })
+            .collect();
+
+        for round in 0..4 {
+            for (i, h) in hashes.iter().enumerate() {
+                store
+                    .put(*h, block("model-a", 1, 4, (round * 16 + i) as f32))
+                    .expect("put");
+            }
+        }
+        store.flush();
+        stop.store(true, Ordering::Relaxed);
+        for reader in readers {
+            reader.join().expect("reader thread");
+        }
+
+        assert_eq!(
+            violations.load(Ordering::Relaxed),
+            0,
+            "no reader may ever see an index hit with no payload"
+        );
+        let stats = store.stats();
+        assert!(
+            stats.buffer_hits > 0,
+            "readers must have caught blocks still in the write buffer, \
+             or this test never entered the window"
+        );
+        assert!(stats.evictions > 0, "the budget must have bound");
+        assert!(stats.bytes <= store.capacity());
+    }
+
+    /// A block is readable the instant `put` returns, before any writer
+    /// thread has touched it. This is what makes the queue safe to use
+    /// on the request path.
+    #[test]
+    fn a_queued_block_is_readable_before_it_reaches_disk() {
+        let dir = TempDir::new("buffered");
+        // No writer threads: nothing can publish until we flush.
+        let store = store(&dir, 1 << 20);
+        let h = hash(400);
+        store.put(h, block("model-a", 1, 4, 1.0)).expect("put");
+
+        assert!(
+            !store.block_path(&h).exists(),
+            "nothing has been written yet"
+        );
+        let got = store
+            .get(&h, &expected("model-a", 1, 4))
+            .expect("get")
+            .expect("a queued block must be readable immediately");
+        assert_eq!(got.tokens(), 4);
+        assert_eq!(store.stats().buffer_hits, 1);
+
+        store.flush();
+        assert!(store.block_path(&h).exists(), "flush must publish it");
+        assert!(store
+            .get(&h, &expected("model-a", 1, 4))
+            .expect("get")
+            .is_some());
+        assert_eq!(store.stats().hits, 1, "and now it comes off the disk");
+    }
+
+    /// Backpressure, not loss: when the queue is full the block is
+    /// written on the calling thread. Nothing is dropped, and the
+    /// fallback is counted so an operator can see a queue that is too
+    /// small.
+    #[test]
+    fn a_full_queue_writes_inline_rather_than_dropping_the_block() {
+        let dir = TempDir::new("backpressure");
+        let store = DiskKvStore::open(
+            DiskConfig::new(dir.path())
+                .with_queue_capacity(2)
+                // Nothing drains the queue, so it stays full.
+                .with_writer_threads(0),
+        )
+        .expect("open");
+
+        let hashes: Vec<BlockHash> = (0..5).map(|i| hash(500 + i)).collect();
+        for (i, h) in hashes.iter().enumerate() {
+            store
+                .put(*h, block("model-a", 1, 4, i as f32))
+                .expect("put");
+        }
+        let stats = store.stats();
+        assert_eq!(stats.queued_writes, 2, "the queue holds exactly its cap");
+        assert_eq!(stats.inline_writes, 3, "the rest fall back to this thread");
+        assert_eq!(stats.writes, 3, "and the fallbacks really wrote");
+
+        // Every block is readable regardless of which path it took --
+        // the point of "fall back" instead of "drop".
+        let want = expected("model-a", 1, 4);
+        for h in &hashes {
+            assert!(
+                store.get(h, &want).expect("get").is_some(),
+                "no block may be lost to a full queue"
+            );
+        }
+        store.flush();
+        for h in &hashes {
+            assert!(store.block_path(h).exists(), "flush publishes the rest");
+        }
+    }
+
+    /// A queued write whose block was evicted before a writer reached
+    /// it is skipped, not resurrected: eviction has already released
+    /// its bytes, so writing it would put the store over budget with a
+    /// file nothing accounts for.
+    #[test]
+    fn a_queued_write_evicted_before_it_runs_is_skipped() {
+        let dir = TempDir::new("skipped");
+        let store = store(&dir, 1 << 20);
+        let h = hash(600);
+        store.put(h, block("model-a", 1, 4, 1.0)).expect("put");
+        store.remove(&h);
+        store.flush();
+
+        let stats = store.stats();
+        assert_eq!(stats.write_skipped, 1);
+        assert_eq!(stats.writes, 0);
+        assert!(!store.block_path(&h).exists());
+        assert_eq!(stats.bytes, 0);
+    }
+
+    /// A second `put` for the same hash supersedes the first: the
+    /// queued job for the older generation finds a payload that is no
+    /// longer its own and skips, rather than overwriting the newer
+    /// block with the older one.
+    #[test]
+    fn a_superseded_queued_write_does_not_overwrite_the_newer_block() {
+        let dir = TempDir::new("superseded");
+        let store = store(&dir, 1 << 20);
+        let h = hash(700);
+        store.put(h, block("model-a", 1, 4, 1.0)).expect("put");
+        store.put(h, block("model-a", 1, 4, 9.0)).expect("put");
+        store.flush();
+
+        let got = store
+            .get(&h, &expected("model-a", 1, 4))
+            .expect("get")
+            .expect("hit");
+        assert_eq!(
+            got.layers()[0].k[0],
+            9.0,
+            "the newer block must win, not whichever write ran last"
+        );
+        assert_eq!(store.stats().write_skipped, 1);
+        assert_eq!(store.stats().blocks, 1);
     }
 }

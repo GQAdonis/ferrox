@@ -1,8 +1,28 @@
+<div align="center">
 
+<img src="docs/assets/ferrox-logo.webp" alt="Ferrox" width="220" />
 
-**Ferrox** is a pure-Rust inference engine for GGUF models. It runs dense
-and MoE checkpoints on CPU, Apple Metal, or CUDA, with a llama.cpp-style
-CLI, an OpenAI-compatible HTTP server, and a built-in web UI.
+# Ferrox
+
+**A pure-Rust GGUF inference engine — dense and MoE, on CPU, Apple Metal, or CUDA.**
+
+Every speed claim is pinned against llama.cpp on the same host, same GGUF, same backend.
+
+[![CI][ci-badge]][ci-workflow]
+[![Latest release][release-badge]][latest-release]
+[![crates.io][crates-badge]][crates-url]
+[![docs.rs][docs-badge]][docs-url]
+[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+[![Rust](https://img.shields.io/badge/built_with-Rust-dea584.svg)](https://www.rust-lang.org/)
+[![Backends](https://img.shields.io/badge/backends-CPU%20%7C%20Metal%20%7C%20CUDA-64748b.svg)](docs/FEATURES.md)
+
+[Install](#install) · [Web UI](#web-ui) · [Models](docs/MODELS.md) · [Benchmarks](benchmarks/RESULTS.md) · [API](docs/API.md) · [Contributing](CONTRIBUTING.md)
+
+</div>
+
+It ships a llama.cpp-style CLI, an OpenAI-compatible HTTP server, and a
+web UI. Weights stay quantized on mmap and dequantization happens inside
+the matmul, so an 8B model fits on a laptop.
 
 ## Install
 
@@ -182,3 +202,12 @@ we are genuinely grateful, we keep the GGML authors' copyright notice in
 
 Apache-2.0 — see [LICENSE](LICENSE) and
 [docs/THIRD_PARTY_NOTICES.md](docs/THIRD_PARTY_NOTICES.md).
+
+[ci-badge]: https://github.com/antonellof/ferrox/actions/workflows/ci.yml/badge.svg
+[ci-workflow]: https://github.com/antonellof/ferrox/actions/workflows/ci.yml
+[release-badge]: https://img.shields.io/github/v/release/antonellof/ferrox?display_name=tag
+[latest-release]: https://github.com/antonellof/ferrox/releases/latest
+[crates-badge]: https://img.shields.io/crates/v/ferrox-inference.svg
+[crates-url]: https://crates.io/crates/ferrox-inference
+[docs-badge]: https://docs.rs/ferrox-inference/badge.svg
+[docs-url]: https://docs.rs/ferrox-inference

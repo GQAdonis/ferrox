@@ -31,18 +31,44 @@
 //! Step 2 is the one that is easy to skip and expensive to skip: without
 //! it, "the stamp says 32 heads" and "there are 32 heads" are different
 //! claims that a cache would be treating as one.
+//!
+//! # The block layout is part of the signature
+//!
+//! A signature also carries the [`BlockLayout`] the block was cut
+//! under: its block size, and the sliding window that block size had to
+//! divide (see [`kv_swa`](crate::kv_swa) for why it must). Both are
+//! here rather than checked once at startup because a *durable* cache
+//! outlives the configuration that filled it. A block written by a
+//! build running gpt-oss at window 128 must not be handed to a build
+//! running it at window 256, and the failure mode if it were is not a
+//! crash -- it is an attention mask silently wider or narrower than the
+//! model's.
+//!
+//! `block_size` is payload-checkable and is checked: a stored block is
+//! exactly one whole block (`kv_block::chain` refuses to name a partial
+//! tail), so a stamp claiming `block_size = 64` over a 48-token payload
+//! is refused the same way a stamp claiming 32 heads over 16 is. The
+//! window is not provable from tensors -- like `model` -- so it is
+//! carried and compared against the reader's expectation.
 
 use crate::cache::KvCache;
+use crate::kv_swa::{BlockLayout, BlockLayoutError};
 
 /// Layout version of a stored block payload. A reader accepts only the
 /// versions in [`READABLE_FORMAT_VERSIONS`]; anything else is rejected
 /// rather than guessed at.
-pub const BLOCK_FORMAT_VERSION: u32 = 1;
+pub const BLOCK_FORMAT_VERSION: u32 = 2;
 
 /// Versions this build can read. Kept explicit (rather than `<=
 /// BLOCK_FORMAT_VERSION`) so dropping support for an old layout is a
 /// deliberate edit and not an accident of arithmetic.
-pub const READABLE_FORMAT_VERSIONS: &[u32] = &[1];
+///
+/// Version 1 is deliberately **not** readable. Its header had no block
+/// size and no sliding window, so a v1 block cannot say what layout it
+/// was cut under -- and this module's rule is that absence is never
+/// agreement. Reading one would mean assuming it happened to be
+/// aligned, which is the exact assumption `kv_swa` exists to refuse.
+pub const READABLE_FORMAT_VERSIONS: &[u32] = &[2];
 
 /// Element type of the stored K/V tensors.
 ///
@@ -77,19 +103,31 @@ pub struct CacheSignature {
     pub n_kv_heads: usize,
     pub head_dim: usize,
     pub dtype: KvDtype,
-    /// Token positions actually stored, per layer.
+    /// Token positions actually stored, per layer. Equal to
+    /// `layout.block_size()` for any block this module will stamp or
+    /// verify.
     pub tokens: usize,
+    /// How the sequence was cut into blocks, and the sliding window
+    /// that cut had to line up with. See the module note.
+    pub layout: BlockLayout,
 }
 
 impl CacheSignature {
     /// Derives a signature by *measuring* `layers`. There is
-    /// deliberately no parameter to fill a gap from: every field except
-    /// `model` comes from the tensors themselves.
+    /// deliberately no parameter to fill a gap from: every shape field
+    /// except `model` and the sliding window comes from the tensors
+    /// themselves, and even the declared `layout`'s block size is
+    /// checked against the depth the tensors actually have.
     ///
     /// Fails if the payload cannot describe itself coherently: no
-    /// layers at all, layers that disagree with each other, or a layer
-    /// whose buffers do not match its own declared shape.
-    pub fn from_payload(model: &str, layers: &[KvCache]) -> Result<Self, SignatureError> {
+    /// layers at all, layers that disagree with each other, a layer
+    /// whose buffers do not match its own declared shape, or a token
+    /// depth that is not the block size the layout claims.
+    pub fn from_payload(
+        model: &str,
+        layout: BlockLayout,
+        layers: &[KvCache],
+    ) -> Result<Self, SignatureError> {
         let first = layers.first().ok_or(SignatureError::EmptyPayload)?;
         let n_kv_heads = first.n_kv_heads;
         let head_dim = first.head_dim;
@@ -123,6 +161,15 @@ impl CacheSignature {
             }
         }
 
+        // The block size is a claim like any other, and this one the
+        // payload can settle: a stored block is one whole block.
+        if tokens != layout.block_size() {
+            return Err(SignatureError::BlockSizeMismatch {
+                block_size: layout.block_size(),
+                tokens,
+            });
+        }
+
         Ok(CacheSignature {
             format_version: BLOCK_FORMAT_VERSION,
             model: model.to_string(),
@@ -131,6 +178,7 @@ impl CacheSignature {
             head_dim,
             dtype: KvDtype::F32,
             tokens,
+            layout,
         })
     }
 
@@ -138,6 +186,7 @@ impl CacheSignature {
     /// itself. Never stamped onto a block -- only compared against one.
     pub fn expected(
         model: &str,
+        layout: BlockLayout,
         n_layers: usize,
         n_kv_heads: usize,
         head_dim: usize,
@@ -151,6 +200,7 @@ impl CacheSignature {
             head_dim,
             dtype: KvDtype::F32,
             tokens,
+            layout,
         }
     }
 
@@ -206,7 +256,31 @@ impl CacheSignature {
                 other.tokens.to_string(),
             ));
         }
+        if self.layout.block_size() != other.layout.block_size() {
+            return Err(mismatch(
+                "block_size",
+                self.layout.block_size().to_string(),
+                other.layout.block_size().to_string(),
+            ));
+        }
+        if self.layout.sliding_window() != other.layout.sliding_window() {
+            return Err(mismatch(
+                "sliding_window",
+                describe_window(self.layout.sliding_window()),
+                describe_window(other.layout.sliding_window()),
+            ));
+        }
         Ok(())
+    }
+}
+
+/// Renders a window for an error message. `None` is spelled out rather
+/// than printed as an empty string: "this build uses no sliding window"
+/// and "this build did not say" must not look the same in a log.
+fn describe_window(window: Option<usize>) -> String {
+    match window {
+        Some(w) => w.to_string(),
+        None => "none (full causal)".to_string(),
     }
 }
 
@@ -283,11 +357,25 @@ pub enum SignatureError {
         expected: String,
         found: String,
     },
+    /// The stamp claims a block size the payload's token depth is not.
+    /// A stored block is exactly one whole block, so these are the same
+    /// number or the stamp is wrong.
+    BlockSizeMismatch { block_size: usize, tokens: usize },
+    /// The block layout itself is not usable -- most importantly, a
+    /// block size that does not divide the sliding window. See
+    /// [`kv_swa`](crate::kv_swa).
+    BadLayout(BlockLayoutError),
     /// Written by a build whose payload layout this one cannot read.
     UnsupportedFormat {
         found: u32,
         readable: &'static [u32],
     },
+}
+
+impl From<BlockLayoutError> for SignatureError {
+    fn from(err: BlockLayoutError) -> Self {
+        SignatureError::BadLayout(err)
+    }
 }
 
 impl std::fmt::Display for SignatureError {
@@ -333,6 +421,12 @@ impl std::fmt::Display for SignatureError {
                 f,
                 "KV block is incompatible: {field} is {found}, this server needs {expected}"
             ),
+            SignatureError::BlockSizeMismatch { block_size, tokens } => write!(
+                f,
+                "KV block signature declares a block size of {block_size} but its payload holds \
+                 {tokens} token positions; a stored block is exactly one whole block"
+            ),
+            SignatureError::BadLayout(err) => write!(f, "KV block layout is unusable: {err}"),
             SignatureError::UnsupportedFormat { found, readable } => write!(
                 f,
                 "KV block format version {found} is not readable by this build (readable: {readable:?})"
@@ -374,11 +468,22 @@ impl std::fmt::Debug for UnverifiedBlock {
 }
 
 impl KvBlock {
-    /// Stamps a block from its own payload. The caller supplies only
-    /// the model identity; every shape field is measured.
-    pub fn stamp(model: &str, layers: Vec<KvCache>) -> Result<Self, SignatureError> {
-        let signature = CacheSignature::from_payload(model, &layers)?;
+    /// Stamps a block from its own payload. The caller supplies the
+    /// model identity and the layout the block was cut under; every
+    /// shape field is measured, and the layout's block size is checked
+    /// against the depth measured.
+    pub fn stamp(
+        model: &str,
+        layout: BlockLayout,
+        layers: Vec<KvCache>,
+    ) -> Result<Self, SignatureError> {
+        let signature = CacheSignature::from_payload(model, layout, &layers)?;
         Ok(KvBlock { signature, layers })
+    }
+
+    /// The layout this block was cut under.
+    pub fn layout(&self) -> BlockLayout {
+        self.signature.layout
     }
 
     pub fn signature(&self) -> &CacheSignature {
@@ -428,7 +533,13 @@ impl UnverifiedBlock {
         // because no payload can prove which weights produced it; the
         // model check happens against `expected` below, where a wrong
         // model is caught as an incompatibility.
-        let actual = CacheSignature::from_payload(&recorded.model, &self.layers)?;
+        // `recorded.layout` is carried over for the same reason
+        // `recorded.model` is: the reader's expectation must not get a
+        // vote before the payload has been checked against the stamp.
+        // Carrying it is not trusting it -- `from_payload` rejects a
+        // block size the token depth contradicts, and the window is
+        // settled against `expected` below.
+        let actual = CacheSignature::from_payload(&recorded.model, recorded.layout, &self.layers)?;
         recorded.compare(&actual, |field, recorded, actual| {
             SignatureError::PayloadMismatch {
                 field,
@@ -469,11 +580,17 @@ mod tests {
             .collect()
     }
 
+    /// A full-causal layout whose block size is the payload depth --
+    /// what every test that is not about SWA wants.
+    fn flat(block_size: usize) -> BlockLayout {
+        BlockLayout::full_attention(block_size).expect("positive block size")
+    }
+
     /// The core rule, in its positive form: every shape field comes
     /// from the tensors. `stamp` is given a model name and nothing else.
     #[test]
     fn signature_is_measured_from_the_payload() {
-        let block = KvBlock::stamp("model-a", payload(3, 2, 8, 4)).expect("stamp");
+        let block = KvBlock::stamp("model-a", flat(4), payload(3, 2, 8, 4)).expect("stamp");
         let sig = block.signature();
         assert_eq!(sig.n_layers, 3);
         assert_eq!(sig.n_kv_heads, 2);
@@ -488,8 +605,9 @@ mod tests {
     #[test]
     fn a_stamped_block_round_trips_through_verification() {
         let layers = payload(3, 2, 8, 4);
-        let signature = CacheSignature::from_payload("model-a", &layers).expect("signature");
-        let expected = CacheSignature::expected("model-a", 3, 2, 8, 4);
+        let signature =
+            CacheSignature::from_payload("model-a", flat(4), &layers).expect("signature");
+        let expected = CacheSignature::expected("model-a", flat(4), 3, 2, 8, 4);
         let block = UnverifiedBlock::new(Some(signature), layers)
             .verify(&expected)
             .expect("a block that is what it says it is must verify");
@@ -503,7 +621,7 @@ mod tests {
     /// unknown by definition.
     #[test]
     fn an_unmarked_block_is_rejected_not_trusted() {
-        let expected = CacheSignature::expected("model-a", 3, 2, 8, 4);
+        let expected = CacheSignature::expected("model-a", flat(4), 3, 2, 8, 4);
         let err = UnverifiedBlock::new(None, payload(3, 2, 8, 4))
             .verify(&expected)
             .expect_err("an unmarked block must be refused");
@@ -518,7 +636,7 @@ mod tests {
     /// produce confident wrong tokens.
     #[test]
     fn a_signature_that_overstates_its_payload_is_rejected() {
-        let expected = CacheSignature::expected("model-a", 3, 2, 16, 4);
+        let expected = CacheSignature::expected("model-a", flat(4), 3, 2, 16, 4);
         let mut lying = expected.clone();
         assert_eq!(lying.head_dim, 16);
         let err = UnverifiedBlock::new(Some(lying.clone()), payload(3, 2, 8, 4))
@@ -537,7 +655,7 @@ mod tests {
         // a 4-position payload.
         lying.head_dim = 8;
         lying.tokens = 8;
-        let expected = CacheSignature::expected("model-a", 3, 2, 8, 8);
+        let expected = CacheSignature::expected("model-a", flat(8), 3, 2, 8, 8);
         let err = UnverifiedBlock::new(Some(lying.clone()), payload(3, 2, 8, 4))
             .verify(&expected)
             .expect_err("stamp claims 8 tokens over a 4-token payload");
@@ -553,7 +671,7 @@ mod tests {
         // And overstated layer count.
         lying.tokens = 4;
         lying.n_layers = 4;
-        let expected = CacheSignature::expected("model-a", 4, 2, 8, 4);
+        let expected = CacheSignature::expected("model-a", flat(4), 4, 2, 8, 4);
         let err = UnverifiedBlock::new(Some(lying), payload(3, 2, 8, 4))
             .verify(&expected)
             .expect_err("stamp claims 4 layers over a 3-layer payload");
@@ -573,7 +691,7 @@ mod tests {
     fn a_layer_whose_seq_len_contradicts_its_buffers_is_rejected() {
         let mut layers = payload(2, 2, 8, 4);
         layers[1].seq_len = 7;
-        let err = CacheSignature::from_payload("model-a", &layers)
+        let err = CacheSignature::from_payload("model-a", flat(4), &layers)
             .expect_err("seq_len must be verified, not believed");
         assert_eq!(
             err,
@@ -590,7 +708,8 @@ mod tests {
     fn a_ragged_payload_is_rejected() {
         let mut layers = payload(3, 2, 8, 4);
         layers[2] = layer(2, 4, 4);
-        let err = CacheSignature::from_payload("model-a", &layers).expect_err("shape disagreement");
+        let err = CacheSignature::from_payload("model-a", flat(4), &layers)
+            .expect_err("shape disagreement");
         assert!(matches!(
             err,
             SignatureError::RaggedPayload {
@@ -602,7 +721,8 @@ mod tests {
 
         let mut layers = payload(3, 2, 8, 4);
         layers[1] = layer(2, 8, 3);
-        let err = CacheSignature::from_payload("model-a", &layers).expect_err("depth disagreement");
+        let err = CacheSignature::from_payload("model-a", flat(4), &layers)
+            .expect_err("depth disagreement");
         assert!(matches!(
             err,
             SignatureError::RaggedPayload {
@@ -614,7 +734,8 @@ mod tests {
 
         let mut layers = payload(2, 2, 8, 4);
         layers[0].v.truncate(8);
-        let err = CacheSignature::from_payload("model-a", &layers).expect_err("k/v disagreement");
+        let err = CacheSignature::from_payload("model-a", flat(4), &layers)
+            .expect_err("k/v disagreement");
         assert!(matches!(
             err,
             SignatureError::RaggedPayload {
@@ -628,7 +749,8 @@ mod tests {
     #[test]
     fn an_empty_payload_is_rejected() {
         assert_eq!(
-            CacheSignature::from_payload("model-a", &[]).expect_err("nothing to vouch for"),
+            CacheSignature::from_payload("model-a", flat(4), &[])
+                .expect_err("nothing to vouch for"),
             SignatureError::EmptyPayload
         );
     }
@@ -639,9 +761,10 @@ mod tests {
     #[test]
     fn an_honest_block_from_a_different_config_is_incompatible() {
         let layers = payload(3, 2, 8, 4);
-        let signature = CacheSignature::from_payload("model-a", &layers).expect("signature");
+        let signature =
+            CacheSignature::from_payload("model-a", flat(4), &layers).expect("signature");
         let err = UnverifiedBlock::new(Some(signature.clone()), layers)
-            .verify(&CacheSignature::expected("model-b", 3, 2, 8, 4))
+            .verify(&CacheSignature::expected("model-b", flat(4), 3, 2, 8, 4))
             .expect_err("a different model must not share KV state");
         assert_eq!(
             err,
@@ -654,7 +777,7 @@ mod tests {
 
         let layers = payload(3, 2, 8, 4);
         let err = UnverifiedBlock::new(Some(signature), layers)
-            .verify(&CacheSignature::expected("model-a", 3, 4, 8, 4))
+            .verify(&CacheSignature::expected("model-a", flat(4), 3, 4, 8, 4))
             .expect_err("a different KV head count must not be reused");
         assert_eq!(
             err,
@@ -669,15 +792,149 @@ mod tests {
     #[test]
     fn an_unreadable_format_version_is_rejected() {
         let layers = payload(2, 2, 8, 4);
-        let mut signature = CacheSignature::from_payload("model-a", &layers).expect("signature");
+        let mut signature =
+            CacheSignature::from_payload("model-a", flat(4), &layers).expect("signature");
         signature.format_version = 99;
         let err = UnverifiedBlock::new(Some(signature), layers)
-            .verify(&CacheSignature::expected("model-a", 2, 2, 8, 4))
+            .verify(&CacheSignature::expected("model-a", flat(4), 2, 2, 8, 4))
             .expect_err("an unknown layout must not be guessed at");
         assert_eq!(
             err,
             SignatureError::UnsupportedFormat {
                 found: 99,
+                readable: READABLE_FORMAT_VERSIONS,
+            }
+        );
+    }
+
+    /// The `kv-swa-block-alignment` invariant at the signature layer.
+    ///
+    /// Two builds of the same model, same tensors, same block size --
+    /// one configured with a 128-token sliding window and one with 256.
+    /// The payload cannot tell them apart, which is precisely why the
+    /// window is stamped: without this check the second build reads the
+    /// first build's blocks back and runs a mask the model never had.
+    #[test]
+    fn a_block_written_under_a_different_window_is_refused_not_reused() {
+        let layout_128 = BlockLayout::new(4, Some(128)).expect("4 divides 128");
+        let layout_256 = BlockLayout::new(4, Some(256)).expect("4 divides 256");
+        let layers = payload(3, 2, 8, 4);
+        let signature =
+            CacheSignature::from_payload("model-a", layout_128, &layers).expect("signature");
+
+        let err = UnverifiedBlock::new(Some(signature.clone()), layers)
+            .verify(&CacheSignature::expected("model-a", layout_256, 3, 2, 8, 4))
+            .expect_err("a window change must invalidate the block, not be ignored");
+        assert_eq!(
+            err,
+            SignatureError::Incompatible {
+                field: "sliding_window",
+                expected: "256".into(),
+                found: "128".into(),
+            }
+        );
+
+        // And the same block under the same window still verifies --
+        // the check must invalidate on change, not on principle.
+        let layers = payload(3, 2, 8, 4);
+        UnverifiedBlock::new(Some(signature), layers)
+            .verify(&CacheSignature::expected("model-a", layout_128, 3, 2, 8, 4))
+            .expect("unchanged config must still hit");
+    }
+
+    /// Turning SWA off (or on) is a config change of exactly the same
+    /// kind, and `None` must not read as "matches anything".
+    #[test]
+    fn a_full_causal_reader_will_not_take_a_sliding_window_block() {
+        let sliding = BlockLayout::new(4, Some(128)).expect("aligned");
+        let layers = payload(2, 2, 8, 4);
+        let signature =
+            CacheSignature::from_payload("model-a", sliding, &layers).expect("signature");
+        let err = UnverifiedBlock::new(Some(signature), layers)
+            .verify(&CacheSignature::expected("model-a", flat(4), 2, 2, 8, 4))
+            .expect_err("no window and a 128 window are different configurations");
+        assert_eq!(
+            err,
+            SignatureError::Incompatible {
+                field: "sliding_window",
+                expected: "none (full causal)".into(),
+                found: "128".into(),
+            }
+        );
+    }
+
+    /// A block cut at a different block size cannot be spliced into a
+    /// sequence cut at this one: the hash chain would not line up and
+    /// the eviction unit would not either.
+    #[test]
+    fn a_block_cut_at_a_different_block_size_is_incompatible() {
+        let layers = payload(2, 2, 8, 4);
+        let signature =
+            CacheSignature::from_payload("model-a", flat(4), &layers).expect("signature");
+        let err = UnverifiedBlock::new(Some(signature), layers)
+            .verify(&CacheSignature::expected("model-a", flat(2), 2, 2, 8, 4))
+            .expect_err("a 4-token block is not a 2-token block");
+        assert_eq!(
+            err,
+            SignatureError::Incompatible {
+                field: "block_size",
+                expected: "2".into(),
+                found: "4".into(),
+            }
+        );
+    }
+
+    /// `block_size` is the one new field the payload can settle, so it
+    /// is settled: a stamp claiming 8-token blocks over a 4-token
+    /// payload is a lying stamp, exactly like an overstated head_dim.
+    #[test]
+    fn a_stamp_may_not_claim_a_block_size_the_payload_lacks() {
+        let err = KvBlock::stamp("model-a", flat(8), payload(2, 2, 8, 4))
+            .expect_err("8-token blocks over a 4-token payload");
+        assert_eq!(
+            err,
+            SignatureError::BlockSizeMismatch {
+                block_size: 8,
+                tokens: 4,
+            }
+        );
+
+        // Same on the read path, where the stamp comes from a file
+        // rather than from this process.
+        let honest =
+            CacheSignature::from_payload("model-a", flat(4), &payload(2, 2, 8, 4)).expect("sig");
+        let mut lying = honest.clone();
+        lying.layout = flat(8);
+        lying.tokens = 8;
+        let err = UnverifiedBlock::new(Some(lying), payload(2, 2, 8, 4))
+            .verify(&CacheSignature::expected("model-a", flat(8), 2, 2, 8, 8))
+            .expect_err("the payload settles the block size, not the stamp");
+        assert_eq!(
+            err,
+            SignatureError::BlockSizeMismatch {
+                block_size: 8,
+                tokens: 4,
+            }
+        );
+    }
+
+    /// v1 blocks recorded no window at all. Reading one would mean
+    /// assuming it was aligned -- the assumption this whole item
+    /// exists to refuse -- so the readable-set drops it.
+    #[test]
+    fn blocks_from_the_pre_layout_format_are_not_readable() {
+        assert!(!READABLE_FORMAT_VERSIONS.contains(&1));
+        let layers = payload(2, 2, 8, 4);
+        let mut signature =
+            CacheSignature::from_payload("model-a", flat(4), &layers).expect("signature");
+        signature.format_version = 1;
+        let err = UnverifiedBlock::new(Some(signature), layers)
+            .verify(&CacheSignature::expected("model-a", flat(4), 2, 2, 8, 4))
+            .expect_err("a v1 block cannot say what layout it was cut under");
+        assert_eq!(
+            err,
+            SignatureError::UnsupportedFormat {
+                found: 1,
                 readable: READABLE_FORMAT_VERSIONS,
             }
         );

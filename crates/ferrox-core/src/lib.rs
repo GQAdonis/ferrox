@@ -16,6 +16,7 @@ pub mod kernel_registry;
 pub mod kv_block;
 pub mod kv_disk;
 pub mod kv_signature;
+pub mod kv_swa;
 pub mod matmul;
 pub mod tensor;
 pub mod threads;
@@ -45,6 +46,7 @@ pub use kv_signature::{
     CacheSignature, KvBlock, KvDtype, SignatureError, UnverifiedBlock, BLOCK_FORMAT_VERSION,
     READABLE_FORMAT_VERSIONS,
 };
+pub use kv_swa::{aligned_block_size, BlockLayout, BlockLayoutError};
 pub use matmul::{
     geglu, gelu, matmul_f32, rms_norm, rms_norm_per_head, silu, situ_and_mul, softcap_inplace,
     swiglu,

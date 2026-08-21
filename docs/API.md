@@ -267,6 +267,31 @@ Recorded today for `/v1/chat/completions` (streamed and not, including
 rejections), `/v1/completions` and `/v1/messages`. Not yet recorded for
 `/v1/embeddings`, `/v1/tokenize` or `/v1/detokenize`.
 
+## Stop sequences
+
+Two layers, because a stop sequence promises something about what
+reaches the client and streaming makes that promise hard to keep.
+
+1. **Token level.** A stop string that is exactly one token in this
+   model's vocabulary — the usual case for `<|im_end|>`,
+   `<end_of_turn>`, `<|eot_id|>` — is matched on the token id, before
+   the token is detokenized. That catches control tokens whose rendered
+   form is not the string the client asked for, which the text scan
+   cannot see at all, and the token never becomes part of the answer
+   (the same treatment the EOS token already gets, and it is not
+   counted in `usage` either).
+2. **Text level.** Everything else is matched on the emitted text, with
+   the output buffered so that no tail which could still become a stop
+   string is ever sent. Only the real partial match is withheld, not a
+   fixed number of bytes, so ordinary text goes out the moment it is
+   provably safe rather than permanently trailing the model by the
+   length of the longest stop string.
+
+A partial match therefore never appears on the wire and is never taken
+back — SSE has no mechanism for taking anything back. Text withheld
+against a match that never arrives is released when the answer ends,
+so nothing is lost.
+
 ## Cancellation
 
 Two tiers, both ending at the same server-side flag.

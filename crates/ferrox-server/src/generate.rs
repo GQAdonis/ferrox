@@ -159,6 +159,14 @@ pub struct GenerationParams {
     pub sampling: SamplingParams,
     pub seed: u64,
     pub stop: Vec<String>,
+    /// Stop strings that are exactly one token in this model's
+    /// vocabulary, resolved once by whoever holds the tokenizer.
+    ///
+    /// Layer 1 of [`crate::stop`]: matched on the id, before the token
+    /// is detokenized, so a control token stops the answer whatever it
+    /// renders as. Empty when no stop string is a single token, or when
+    /// the caller has no tokenizer to resolve them with.
+    pub stop_token_ids: Vec<usize>,
     /// When true, constrain sampling toward JSON-safe token pieces and
     /// validate the emitted text is a JSON object (best-effort; see
     /// `json_mode` module).
@@ -515,10 +523,9 @@ fn sample_until_stop(
     mut emit: impl FnMut(&str),
     decode_token: Option<&dyn Fn(usize) -> String>,
 ) -> (FinishReason, Vec<usize>, Vec<f32>) {
-    let max_stop_len = params.stop.iter().map(|s| s.len()).max().unwrap_or(0);
+    let mut matcher = crate::stop::StopMatcher::new(&params.stop, &params.stop_token_ids);
     let mut sampler = Sampler::new(params.seed);
     let mut generated_ids: Vec<usize> = Vec::with_capacity(params.max_tokens);
-    let mut pending = String::new();
     let mut finish = FinishReason::Length;
 
     for _ in 0..params.max_tokens {
@@ -552,31 +559,41 @@ fn sample_until_stop(
             finish = FinishReason::Stop;
             break;
         }
+        // Layer 1: before the token is detokenized or counted. A
+        // control token the client asked to stop on is not part of the
+        // answer, so it contributes neither an id nor a character --
+        // exactly how `eos_id` is treated one line above.
+        if matcher.is_stop_token(next) {
+            finish = FinishReason::Stop;
+            break;
+        }
         generated_ids.push(next);
         logits = step(next, pos);
         pos += 1;
 
-        pending.push_str(&decode_one(&[next]));
-
-        if let Some(cut) = earliest_stop_match(&pending, &params.stop) {
-            emit(&pending[..cut]);
-            finish = FinishReason::Stop;
-            pending.clear();
-            break;
-        }
-
-        let hold_back = max_stop_len.saturating_sub(1);
-        if pending.len() > hold_back {
-            let boundary = floor_char_boundary(&pending, pending.len() - hold_back);
-            if boundary > 0 {
-                emit(&pending[..boundary]);
-                pending.drain(..boundary);
+        // Layer 2: only text that can no longer become part of a stop
+        // string leaves here.
+        match matcher.push(&decode_one(&[next])) {
+            crate::stop::StopStep::Emit(text) => {
+                if !text.is_empty() {
+                    emit(&text);
+                }
+            }
+            crate::stop::StopStep::Matched(text) => {
+                if !text.is_empty() {
+                    emit(&text);
+                }
+                finish = FinishReason::Stop;
+                break;
             }
         }
     }
 
-    if !pending.is_empty() {
-        emit(&pending);
+    // Ended for some other reason (length, EOS, a cancel): whatever is
+    // still withheld was output that no stop ever claimed.
+    let tail = matcher.flush();
+    if !tail.is_empty() {
+        emit(&tail);
     }
 
     (finish, generated_ids, logits)
@@ -698,6 +715,7 @@ mod tests {
             sampling: SamplingParams::default(),
             seed: 1,
             stop: Vec::new(),
+            stop_token_ids: Vec::new(),
             json_object: false,
             cancel: None,
         }
@@ -1035,6 +1053,7 @@ mod tests {
                 sampling: SamplingParams::default(),
                 seed: 1,
                 stop: vec!["ZZ_NEVER_MATCHES_ZZ".to_string()],
+                stop_token_ids: Vec::new(),
                 json_object: false,
                 cancel: None,
             },
@@ -1047,6 +1066,209 @@ mod tests {
         assert_eq!(baseline_finish, FinishReason::Length);
         assert_eq!(stop_finish, FinishReason::Length);
         assert_eq!(with_unmatchable_stop, baseline);
+    }
+
+    /// A decode loop whose next token is scripted, so the two stop
+    /// layers can be exercised on exactly the token sequence they are
+    /// meant to react to rather than on whatever a random decoder
+    /// happens to emit.
+    ///
+    /// `script` is the token id produced at each step; `render` is how
+    /// each id detokenizes.
+    fn run_scripted(
+        script: &[usize],
+        render: impl Fn(usize) -> String,
+        params: &GenerationParams,
+    ) -> (FinishReason, Vec<usize>, Vec<String>) {
+        let vocab = script.iter().copied().max().unwrap_or(0) + 2;
+        let logits_for = |id: usize| {
+            let mut v = vec![0.0f32; vocab];
+            v[id] = 10.0;
+            v
+        };
+        let mut next = 0usize;
+        let mut take = || {
+            let id = script
+                .get(next)
+                .copied()
+                .unwrap_or(script[script.len() - 1]);
+            next += 1;
+            id
+        };
+        let first = logits_for(take());
+        let mut chunks: Vec<String> = Vec::new();
+        let (finish, ids, _) = sample_until_stop(
+            first,
+            0,
+            None,
+            params,
+            |ids| ids.iter().copied().map(&render).collect::<String>(),
+            |_tok, _pos| logits_for(take()),
+            |chunk| chunks.push(chunk.to_string()),
+            None,
+        );
+        (finish, ids, chunks)
+    }
+
+    fn scripted_params(max_tokens: usize) -> GenerationParams {
+        GenerationParams {
+            max_tokens,
+            sampling: SamplingParams {
+                temperature: 0.0,
+                ..SamplingParams::default()
+            },
+            seed: 1,
+            stop: Vec::new(),
+            stop_token_ids: Vec::new(),
+            json_object: false,
+            cancel: None,
+        }
+    }
+
+    /// Layer 1: a stop *token* ends the answer, and the token itself
+    /// never appears in it -- the same treatment EOS already gets,
+    /// which is the point. A control token the client named is no more
+    /// part of the output than the end-of-sequence token is.
+    ///
+    /// Confirmed to FAIL (runs to all 6 tokens, emitting "aabaab") when
+    /// the `is_stop_token` check is removed from `sample_until_stop`.
+    #[test]
+    fn a_token_level_stop_ends_generation_and_never_reaches_the_output() {
+        let render = |id: usize| char::from(b'a' + id as u8).to_string();
+        let script = [0usize, 0, 1, 0, 0, 1];
+
+        let (finish, ids, chunks) = run_scripted(&script, render, &scripted_params(6));
+        assert_eq!(finish, FinishReason::Length);
+        assert_eq!(ids, script.to_vec());
+        assert_eq!(chunks.concat(), "aabaab");
+
+        let (finish, ids, chunks) = run_scripted(
+            &script,
+            render,
+            &GenerationParams {
+                stop_token_ids: vec![1],
+                ..scripted_params(6)
+            },
+        );
+        assert_eq!(finish, FinishReason::Stop);
+        assert_eq!(ids, vec![0, 0], "the stop token is not part of the answer");
+        assert_eq!(
+            chunks.concat(),
+            "aa",
+            "the stop token must not be rendered into the output"
+        );
+    }
+
+    /// The case layer 2 provably cannot cover: a control token that
+    /// renders as the empty string. The text scan has nothing to match
+    /// on, so only matching the id ends the answer.
+    #[test]
+    fn a_stop_token_that_renders_as_nothing_is_still_a_stop() {
+        // Token 1 detokenizes to "", as real special tokens can.
+        let render = |id: usize| {
+            if id == 1 {
+                String::new()
+            } else {
+                char::from(b'a' + id as u8).to_string()
+            }
+        };
+        let script = [0usize, 1, 0, 0];
+
+        // The text layer alone: the stop string never appears, so
+        // generation runs to its limit.
+        let (finish, _, chunks) = run_scripted(
+            &script,
+            render,
+            &GenerationParams {
+                stop: vec!["<|end|>".to_string()],
+                ..scripted_params(4)
+            },
+        );
+        assert_eq!(finish, FinishReason::Length);
+        assert_eq!(chunks.concat(), "aaa");
+
+        // With the id resolved, it stops where it should.
+        let (finish, ids, chunks) = run_scripted(
+            &script,
+            render,
+            &GenerationParams {
+                stop: vec!["<|end|>".to_string()],
+                stop_token_ids: vec![1],
+                ..scripted_params(4)
+            },
+        );
+        assert_eq!(finish, FinishReason::Stop);
+        assert_eq!(ids, vec![0]);
+        assert_eq!(chunks.concat(), "a");
+    }
+
+    /// Layer 2: nothing that turns out to be part of the stop string
+    /// is ever emitted. `emit` is append-only -- SSE has no way to take
+    /// a chunk back -- so over-emitting is not a display glitch, it is
+    /// the stop sequence failing to do the one thing it promises.
+    ///
+    /// The script spells "ab" (a partial match that is disproved) and
+    /// then "abc" (the real one), so the buffer has to hold, release,
+    /// and hold again.
+    #[test]
+    fn nothing_that_becomes_part_of_the_stop_is_ever_emitted() {
+        let render = |id: usize| char::from(b'a' + id as u8).to_string();
+        let script = [0usize, 1, 0, 1, 2, 0];
+        let params = GenerationParams {
+            stop: vec!["abc".to_string()],
+            ..scripted_params(6)
+        };
+
+        let (finish, _, chunks) = run_scripted(&script, render, &params);
+        assert_eq!(finish, FinishReason::Stop);
+        assert_eq!(
+            chunks.concat(),
+            "ab",
+            "the answer is everything before the stop, and nothing after it"
+        );
+
+        // Append-only means every intermediate state must already be a
+        // prefix of that: emitting one character too many can never be
+        // undone.
+        let mut seen = String::new();
+        for chunk in &chunks {
+            seen.push_str(chunk);
+            assert!(
+                "ab".starts_with(&seen),
+                "the stream ran ahead of the answer: {seen:?} (chunks: {chunks:?})"
+            );
+        }
+    }
+
+    /// A partial match that is disproved is released with the very
+    /// token that disproves it, not carried to the end of the answer.
+    ///
+    /// The conservative alternative -- always withhold
+    /// `longest_stop - 1` bytes -- is equally safe and permanently
+    /// leaves the stream that many bytes behind the model, for a match
+    /// that in most chunks is not even beginning.
+    ///
+    /// Confirmed to FAIL (first chunk is "a", not "abd") when
+    /// `partial_suffix_len` is replaced by that fixed hold-back.
+    #[test]
+    fn a_disproved_partial_is_released_by_the_token_that_disproves_it() {
+        let render = |id: usize| char::from(b'a' + id as u8).to_string();
+        // "a", "b" are held as a possible "abc"; "d" settles it.
+        let script = [0usize, 1, 3, 0];
+        let (_, _, chunks) = run_scripted(
+            &script,
+            render,
+            &GenerationParams {
+                stop: vec!["abc".to_string()],
+                ..scripted_params(4)
+            },
+        );
+        assert_eq!(chunks.concat(), "abda", "no output is lost");
+        assert_eq!(
+            chunks.first().map(String::as_str),
+            Some("abd"),
+            "the whole disproved partial goes out at once: {chunks:?}"
+        );
     }
 
     #[test]
@@ -1093,6 +1315,7 @@ mod tests {
                 sampling: SamplingParams::default(),
                 seed: 1,
                 stop: vec![stop_str],
+                stop_token_ids: Vec::new(),
                 json_object: false,
                 cancel: None,
             },

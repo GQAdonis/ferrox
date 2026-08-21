@@ -253,6 +253,7 @@ pub async fn completions(
         // `/v1/completions` is buffered rather than streamed here, so
         // there is no first chunk on which to state a request id and
         // nothing for a client to name in a cancel.
+        stop_token_ids: Vec::new(),
         cancel: None,
     };
     let model = Arc::clone(&active.model);

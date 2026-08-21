@@ -52,6 +52,7 @@ mod openai_extra;
 mod security;
 mod session;
 mod stats;
+mod stop;
 mod tasks;
 mod ui;
 
@@ -1097,6 +1098,10 @@ impl ChatCompletionRequest {
             sampling: self.sampling_params(),
             seed: self.resolved_seed(),
             stop: self.effective_stop_sequences(),
+            // Resolved by `run_generation_emit`, the layer that holds a
+            // tokenizer: a request body names stop strings, and only
+            // the model can say which of them are single tokens.
+            stop_token_ids: Vec::new(),
             json_object: self.json_object_mode(),
             // Filled in by the handler that owns the request id --
             // the request body cannot name its own cancel token.
@@ -1612,6 +1617,17 @@ fn run_generation_emit(
 ) -> Result<(FinishReason, generate::Usage, String), generate::DecodeError> {
     let synthetic = model.is_synthetic();
     let mut chunks = Vec::new();
+    // Layer 1 of the stop machinery is resolved exactly here, because
+    // this is the one place that has both the request's stop strings
+    // and the model's tokenizer. Both the batched and the private
+    // decode paths below read the result off the params, so there is
+    // one answer rather than two that can drift.
+    let params = &{
+        let mut resolved = params.clone();
+        resolved.stop_token_ids =
+            crate::stop::resolve_stop_tokens(&resolved.stop, |text| model.encode(text));
+        resolved
+    };
     let used_batcher = matches!((model, continuous_batcher), (Model::Gguf(_), Some(_)));
     let (finish, usage) = match model {
         Model::Gguf(m) => {
@@ -3323,6 +3339,7 @@ mod tests {
             sampling: SamplingParams::default(),
             seed: 1,
             stop: Vec::new(),
+            stop_token_ids: Vec::new(),
             json_object: false,
             cancel: None,
         }

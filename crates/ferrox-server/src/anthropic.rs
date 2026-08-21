@@ -203,6 +203,7 @@ pub async fn messages(
         json_object: false,
         // The Anthropic surface has no cancel path of its own yet; see
         // the `cancel` module for what `/v1/cancel` currently covers.
+        stop_token_ids: Vec::new(),
         cancel: None,
     };
 

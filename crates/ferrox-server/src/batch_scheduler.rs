@@ -4,9 +4,13 @@
 //!
 //! Opt-in via `FERROX_CONTINUOUS_BATCHING=1`; mutually exclusive with
 //! the KV pool and prefix cache (those paths keep the private-loop
-//! `generate`). Stop sequences use the same pending-buffer logic as
-//! `generate::sample_until_stop` (decode each new token, hold back
-//! `longest_stop - 1` bytes, finish on match).
+//! `generate`). Stop sequences go through the same
+//! [`StopMatcher`](crate::stop::StopMatcher) as
+//! `generate::sample_until_stop`: a token-level match on the id before
+//! the token is detokenized, plus output-suffix buffering that
+//! withholds any tail that could still complete a stop string. One
+//! implementation, so a row in a batch and a row on its own cannot
+//! disagree about where an answer ends.
 //!
 //! **Chunked prefill.** A prompt is not prefilled in one uninterruptible
 //! `forward_token` loop. Each accepted job first becomes a
@@ -136,9 +140,8 @@ use ferrox_core::cache::KvCache;
 use ferrox_models::sampling::Sampler;
 use ferrox_models::Decoder;
 
-use crate::generate::{
-    earliest_stop_match, floor_char_boundary, DecodeError, FinishReason, GenerationParams, Usage,
-};
+use crate::generate::{DecodeError, FinishReason, GenerationParams, Usage};
+use crate::stop::{StopMatcher, StopStep};
 
 type DecodeFn = Arc<dyn Fn(&[usize]) -> String + Send + Sync>;
 
@@ -660,10 +663,11 @@ struct Slot {
     logits: Vec<f32>,
     sampler: Sampler,
     generated_ids: Vec<usize>,
-    /// Detokenized text already safe to expose (past the stop hold-back).
+    /// Detokenized text already safe to expose (past the stop
+    /// hold-back).
     visible: String,
-    /// Tail that might still complete a stop match.
-    pending: String,
+    /// Both stop layers for this row.
+    stops: StopMatcher,
     prompt_tokens: usize,
     max_tokens: usize,
     eos_id: Option<usize>,
@@ -1065,7 +1069,9 @@ fn worker_loop(
             let next =
                 slot.sampler
                     .sample(&slot.logits, &slot.params.sampling, &slot.generated_ids);
-            if Some(next) == slot.eos_id {
+            // EOS and a token-level stop are the same fact: this token
+            // ends the answer and is not part of it.
+            if Some(next) == slot.eos_id || slot.stops.is_stop_token(next) {
                 slot.finish = Some(FinishReason::Stop);
                 continue;
             }
@@ -1114,30 +1120,20 @@ fn worker_loop(
     }
 }
 
-/// Appends `piece` into the stop-sequence pending buffer. Returns true
-/// when a stop matched and the slot should leave the active batch.
+/// Feeds `piece` through this row's stop matcher. Returns true when a
+/// stop matched and the row should leave the active batch.
 fn apply_stop_buffer(slot: &mut Slot, piece: &str) -> bool {
-    if slot.params.stop.is_empty() {
-        slot.visible.push_str(piece);
-        return false;
-    }
-    slot.pending.push_str(piece);
-    if let Some(cut) = earliest_stop_match(&slot.pending, &slot.params.stop) {
-        slot.visible.push_str(&slot.pending[..cut]);
-        slot.pending.clear();
-        slot.finish = Some(FinishReason::Stop);
-        return true;
-    }
-    let max_stop_len = slot.params.stop.iter().map(|s| s.len()).max().unwrap_or(0);
-    let hold_back = max_stop_len.saturating_sub(1);
-    if slot.pending.len() > hold_back {
-        let boundary = floor_char_boundary(&slot.pending, slot.pending.len() - hold_back);
-        if boundary > 0 {
-            slot.visible.push_str(&slot.pending[..boundary]);
-            slot.pending.drain(..boundary);
+    match slot.stops.push(piece) {
+        StopStep::Emit(text) => {
+            slot.visible.push_str(&text);
+            false
+        }
+        StopStep::Matched(text) => {
+            slot.visible.push_str(&text);
+            slot.finish = Some(FinishReason::Stop);
+            true
         }
     }
-    false
 }
 
 /// An accepted job whose prompt is still being prefilled: the
@@ -1176,7 +1172,7 @@ impl Prefill {
             sampler: Sampler::new(params.seed),
             generated_ids: Vec::with_capacity(params.max_tokens),
             visible: String::new(),
-            pending: String::new(),
+            stops: StopMatcher::new(&params.stop, &params.stop_token_ids),
             prompt_tokens,
             max_tokens: params.max_tokens,
             eos_id,
@@ -1220,10 +1216,11 @@ fn accept(decoder: &Arc<Decoder>, job: Job, chunk_size: usize) -> Option<Prefill
 /// cannot be paired with another row's output.
 fn reply_finished(mut slot: Slot) {
     let finish = slot.finish.expect("only a finished row is replied to");
-    if !slot.pending.is_empty() {
-        slot.visible.push_str(&slot.pending);
-        slot.pending.clear();
-    }
+    // Text withheld against a stop that never arrived is ordinary
+    // output; dropping it would truncate every answer whose tail looks
+    // like the start of a stop string.
+    let tail = slot.stops.flush();
+    slot.visible.push_str(&tail);
     let usage = Usage::new(slot.prompt_tokens, slot.generated_ids.len());
     let _ = slot
         .reply
@@ -1257,6 +1254,7 @@ mod tests {
             },
             seed,
             stop: vec![],
+            stop_token_ids: Vec::new(),
             json_object: false,
             cancel: None,
         }
@@ -1340,6 +1338,7 @@ mod tests {
                 },
                 seed: params[i].seed,
                 stop: vec![],
+                stop_token_ids: Vec::new(),
                 json_object: params[i].json_object,
                 cancel: params[i].cancel.clone(),
             };
@@ -1622,7 +1621,7 @@ mod tests {
                 sampler: Sampler::new(seed),
                 generated_ids: Vec::new(),
                 visible: String::new(),
-                pending: String::new(),
+                stops: StopMatcher::new(&params.stop, &params.stop_token_ids),
                 prompt_tokens: 0,
                 max_tokens,
                 eos_id: None,
@@ -2487,6 +2486,131 @@ mod tests {
         assert_eq!(
             ids, expected,
             "an uncancelled request must produce exactly what it would have alone"
+        );
+    }
+
+    // ----------------------------------------------------------------
+    // Stop sequences (`sched-stop-buffering`)
+    // ----------------------------------------------------------------
+
+    /// Layer 1 in the batched path. A batched row and a row decoding on
+    /// its own must agree about where an answer ends, so both go
+    /// through the same `StopMatcher`.
+    ///
+    /// Confirmed to FAIL (runs to all 8 tokens) when the
+    /// `stops.is_stop_token` check is removed from the worker's
+    /// sampling step.
+    #[test]
+    fn a_token_level_stop_ends_a_batched_row() {
+        let decoder = tiny_decoder();
+        let batcher = ContinuousBatcher::spawn_with_config(
+            Arc::clone(&decoder),
+            identity_decode(),
+            BatcherConfig {
+                prefill_chunk: 1,
+                ..BatcherConfig::default()
+            },
+        );
+        let baseline = sequential_ids(&decoder, &[1, 2, 3], &greedy_params(8, 4));
+        assert!(baseline.len() > 1, "need something to stop before the end");
+        let stop_token = baseline[1];
+
+        let (finish, ids, _text, usage) = batcher
+            .generate(
+                vec![1, 2, 3],
+                GenerationParams {
+                    stop_token_ids: vec![stop_token],
+                    ..greedy_params(8, 4)
+                },
+                None,
+            )
+            .expect("generate");
+
+        assert_eq!(finish, FinishReason::Stop);
+        assert_eq!(
+            ids,
+            baseline[..1].to_vec(),
+            "the stop token itself is not part of the answer"
+        );
+        assert_eq!(usage.completion_tokens, 1);
+    }
+
+    /// Layer 2 in the batched path: a stop string spanning several
+    /// tokens is matched, and nothing past it is reported.
+    #[test]
+    fn a_multi_token_stop_string_truncates_a_batched_row() {
+        let decoder = tiny_decoder();
+        let batcher = ContinuousBatcher::spawn_with_config(
+            Arc::clone(&decoder),
+            identity_decode(),
+            BatcherConfig {
+                prefill_chunk: 1,
+                ..BatcherConfig::default()
+            },
+        );
+        let baseline = sequential_ids(&decoder, &[1, 2, 3], &greedy_params(8, 4));
+        let decode = identity_decode();
+        let full = decode(&baseline);
+        if full.chars().count() < 4 {
+            return;
+        }
+        // Two characters out of the middle, so the match spans a token
+        // boundary and the first character is a partial for a while.
+        let cut: Vec<char> = full.chars().collect();
+        let stop_str: String = cut[1..3].iter().collect();
+        let expected: String = cut[..1].iter().collect();
+
+        let (finish, _ids, text, _usage) = batcher
+            .generate(
+                vec![1, 2, 3],
+                GenerationParams {
+                    stop: vec![stop_str.clone()],
+                    ..greedy_params(8, 4)
+                },
+                None,
+            )
+            .expect("generate");
+
+        assert_eq!(finish, FinishReason::Stop);
+        assert_eq!(
+            text, expected,
+            "a stop spanning two tokens must cut where it starts"
+        );
+        assert!(!text.contains(&stop_str));
+    }
+
+    /// Text withheld against a stop that never arrives is ordinary
+    /// output. Dropping it would truncate every answer whose tail looks
+    /// like the start of a stop string.
+    #[test]
+    fn a_batched_row_that_never_matches_loses_no_output() {
+        let decoder = tiny_decoder();
+        let batcher = ContinuousBatcher::spawn_with_config(
+            Arc::clone(&decoder),
+            identity_decode(),
+            BatcherConfig {
+                prefill_chunk: 1,
+                ..BatcherConfig::default()
+            },
+        );
+        let baseline = sequential_ids(&decoder, &[1, 2, 3], &greedy_params(8, 4));
+        let expected = identity_decode()(&baseline);
+
+        let (finish, ids, text, _usage) = batcher
+            .generate(
+                vec![1, 2, 3],
+                GenerationParams {
+                    stop: vec!["ZZ_NEVER_MATCHES_ZZ".to_string()],
+                    ..greedy_params(8, 4)
+                },
+                None,
+            )
+            .expect("generate");
+        assert_eq!(finish, FinishReason::Length);
+        assert_eq!(ids, baseline);
+        assert_eq!(
+            text, expected,
+            "buffering is about when text is released, never whether"
         );
     }
 

@@ -53,7 +53,6 @@ mod security;
 mod session;
 mod stats;
 mod tasks;
-mod ui;
 
 use std::convert::Infallible;
 use std::fmt;
@@ -131,12 +130,6 @@ struct ServerArgs {
         value_name = "N"
     )]
     n_gpu_layers: Option<GpuLayers>,
-
-    /// Serve the embedded Ferrox Studio UI at `/` and `/ui` (chat,
-    /// models, activity and connect screens, all driven by the same
-    /// public HTTP API any other client uses).
-    #[arg(long = "ui-server", default_value_t = false)]
-    ui_server: bool,
 
     /// MCP tool-server config JSON (stub: listed in `/v1/models` metadata).
     #[arg(long = "mcp-config", value_name = "PATH")]
@@ -339,11 +332,6 @@ fn apply_cli_overrides(args: &ServerArgs) -> anyhow::Result<()> {
                 }
             }
         }
-    }
-
-    if args.ui_server {
-        // SAFETY: called before the runtime starts worker threads.
-        unsafe { std::env::set_var("FERROX_UI", "1") };
     }
 
     Ok(())
@@ -2622,10 +2610,6 @@ fn main() -> anyhow::Result<()> {
     journal::install_panic_hook(journal.clone());
 
     let mcp_config_path = args.mcp_config.clone();
-    let ui_server = args.ui_server
-        || std::env::var("FERROX_UI")
-            .map(|v| v == "1")
-            .unwrap_or(false);
     let exit_on_stdin_close = args.exit_on_stdin_close
         || std::env::var("FERROX_EXIT_ON_STDIN_CLOSE")
             .map(|v| v == "1")
@@ -2641,7 +2625,7 @@ fn main() -> anyhow::Result<()> {
         .worker_threads(tokio_worker_threads())
         .enable_all()
         .build()?;
-    let result = runtime.block_on(run(mcp_config_path, ui_server, exit_on_stdin_close));
+    let result = runtime.block_on(run(mcp_config_path, exit_on_stdin_close));
 
     let reason = match &result {
         Ok(()) => "normal".to_string(),
@@ -2658,11 +2642,7 @@ fn main() -> anyhow::Result<()> {
     result
 }
 
-async fn run(
-    mcp_config_path: Option<PathBuf>,
-    ui_server: bool,
-    exit_on_stdin_close: bool,
-) -> anyhow::Result<()> {
+async fn run(mcp_config_path: Option<PathBuf>, exit_on_stdin_close: bool) -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
 
     // Fail-closed listener check, before anything else (including
@@ -3044,16 +3024,11 @@ async fn run(
     // what the surface is.
     use ferrox_api::routes;
 
-    let mut public = Router::new().route(routes::HEALTH, get(health));
-    if ui_server {
-        tracing::info!("web UI enabled at {} and {}", routes::ROOT, routes::UI);
-        // The shell and its assets are static and carry no data, so
-        // they sit on the unauthenticated side beside /health: the
-        // screen a user needs in order to *enter* an API key cannot
-        // itself be behind that key. Every call the frontend then makes
-        // goes through the same gate as any other client's.
-        public = ui::attach(public);
-    }
+    // Ferrox Studio is a separate app served by its own dev/static
+    // server (see `ui/` at the repository root); it reaches this
+    // process over the public HTTP API like any other client, so there
+    // is nothing to mount here and `/` stays a 404.
+    let public = Router::new().route(routes::HEALTH, get(health));
 
     let mut protected = Router::new()
         .route(routes::V1_MODELS, get(list_models))

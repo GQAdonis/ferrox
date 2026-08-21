@@ -1,6 +1,7 @@
 //! ferrox CLI — llama.cpp-style GGUF completion (`-m`/`-p`/`-n`/…) plus
 //! inspect / presets / smoke / Kimi helpers. See `docs/CLI.md`.
 
+mod bench_guard;
 mod bench_model;
 mod bench_suite;
 mod chat;

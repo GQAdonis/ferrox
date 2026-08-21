@@ -84,6 +84,57 @@ pub enum MetalRopeLayout {
     Neox,
 }
 
+/// Everything the Metal RoPE kernels need beyond the base frequency:
+/// the pairing convention, the rotary width, and ggml `rope_yarn`'s
+/// magnitude scale.
+///
+/// Threaded as one value because all three are properties of the same
+/// `ggml_rope_ext` call. `rot_dim` is ggml `n_dims` (`hparams.n_rot`,
+/// GGUF `<arch>.rope.dimension_count`): channels `[n_rot, head_dim)` are
+/// copied through untouched, exactly as `kernel_rope_norm`'s else-branch
+/// does. `attn_factor` is ggml's `mscale`, folded into `cos`/`sin`
+/// inside `rope_yarn`, so it *cannot* reach the pass-through channels —
+/// scaling the whole head instead is a different graph, and was one on
+/// the CPU side until `ferrox parity` caught it (Phi-4-mini, 96 of 128
+/// dims rotated at `attn_factor` 1.1902).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MetalRope {
+    pub layout: MetalRopeLayout,
+    /// Rotary width when narrower than `head_dim`; `None` = whole head.
+    pub rot_dim: Option<usize>,
+    /// ggml `rope_yarn` `mscale` / llama.cpp `yarn_attn_factor`.
+    /// `1.0` for every architecture that does not set the key.
+    pub attn_factor: f32,
+}
+
+impl MetalRope {
+    /// Whole-head rotation with no magnitude scale — what every
+    /// architecture except the Phi-3/Phi-4 family wants.
+    pub fn new(layout: MetalRopeLayout) -> Self {
+        Self {
+            layout,
+            rot_dim: None,
+            attn_factor: 1.0,
+        }
+    }
+
+    /// Same rotation, but `attn_factor` already multiplied into q/k by
+    /// the caller. Rotation is linear, so pre-scaling the rotated
+    /// channels host-side is identical to folding `mscale` into
+    /// `cos`/`sin` here — but doing both would square it.
+    pub fn attn_factor_applied_by_caller(self) -> Self {
+        Self {
+            attn_factor: 1.0,
+            ..self
+        }
+    }
+
+    /// `n_dims` as the kernels want it: `0` means "whole head".
+    fn rot_dim_uniform(&self) -> u32 {
+        self.rot_dim.unwrap_or(0) as u32
+    }
+}
+
 /// Whether the fused Metal attention block should run (in addition to
 /// dense Metal matvecs). Default off until measured; `1|true|on` enables.
 pub fn metal_attn_enabled() -> bool {
@@ -185,19 +236,28 @@ kernel void rope_interleaved_heads(
     constant uint& pos [[buffer(4)]],
     device const float* freq_factors [[buffer(5)]],
     constant uint& use_freq_factors [[buffer(6)]],
+    constant uint& rot_dim [[buffer(7)]],
+    constant float& mscale [[buffer(8)]],
     uint h [[thread_position_in_grid]]
 ) {
     if (h >= n_heads) return;
     device float* vec = vecs + h * head_dim;
-    uint half_dim = head_dim / 2u;
+    // ggml `n_dims`: the rotary width. `kernel_rope_norm` rotates
+    // `[0, n_dims)` and copies `[n_dims, ne0)` straight through, and the
+    // frequency exponent is `-i0/n_dims`, not `-i0/head_dim`.
+    uint rot = (rot_dim == 0u || rot_dim > head_dim) ? head_dim : rot_dim;
+    uint half_dim = rot / 2u;
     for (uint i = 0; i < half_dim; i++) {
-        float freq = 1.0f / pow(theta, (2.0f * float(i)) / float(head_dim));
+        float freq = 1.0f / pow(theta, (2.0f * float(i)) / float(rot));
         float angle = float(pos) * freq;
         if (use_freq_factors != 0u) {
             angle /= freq_factors[i];
         }
-        float s = sin(angle);
-        float c = cos(angle);
+        // ggml folds `attn_factor` into cos/sin inside `rope_yarn`, so
+        // it reaches the ROTATED channels only; the pass-through tail
+        // above must come out bit-identical.
+        float s = sin(angle) * mscale;
+        float c = cos(angle) * mscale;
         float a = vec[2u * i];
         float b = vec[2u * i + 1u];
         vec[2u * i] = a * c - b * s;
@@ -218,19 +278,27 @@ kernel void rope_neox_heads(
     constant uint& pos [[buffer(4)]],
     device const float* freq_factors [[buffer(5)]],
     constant uint& use_freq_factors [[buffer(6)]],
+    constant uint& rot_dim [[buffer(7)]],
+    constant float& mscale [[buffer(8)]],
     uint h [[thread_position_in_grid]]
 ) {
     if (h >= n_heads) return;
     device float* vec = vecs + h * head_dim;
-    uint half_dim = head_dim / 2u;
+    // `kernel_rope_neox` pairs `ic` with `ic + n_dims/2` — the split is
+    // over the ROTARY width, not the head, so partial rotary changes
+    // which channel each one is paired with, not just how many rotate.
+    uint rot = (rot_dim == 0u || rot_dim > head_dim) ? head_dim : rot_dim;
+    uint half_dim = rot / 2u;
     for (uint i = 0; i < half_dim; i++) {
-        float freq = 1.0f / pow(theta, (2.0f * float(i)) / float(head_dim));
+        float freq = 1.0f / pow(theta, (2.0f * float(i)) / float(rot));
         float angle = float(pos) * freq;
         if (use_freq_factors != 0u) {
             angle /= freq_factors[i];
         }
-        float s = sin(angle);
-        float c = cos(angle);
+        // `mscale` folded into cos/sin (ggml `rope_yarn`): rotated
+        // channels only, never the `[n_rot, head_dim)` tail.
+        float s = sin(angle) * mscale;
+        float c = cos(angle) * mscale;
         float a = vec[i];
         float b = vec[i + half_dim];
         vec[i] = a * c - b * s;
@@ -2411,6 +2479,8 @@ kernel void rope_interleaved_heads_batch(
     device const float* freq_factors [[buffer(5)]],
     constant uint& use_freq_factors [[buffer(6)]],
     constant uint& n_tokens [[buffer(7)]],
+    constant uint& rot_dim [[buffer(8)]],
+    constant float& mscale [[buffer(9)]],
     uint2 gid [[thread_position_in_grid]]
 ) {
     uint h = gid.x;
@@ -2418,15 +2488,18 @@ kernel void rope_interleaved_heads_batch(
     if (h >= n_heads || t >= n_tokens) return;
     uint pos = base_pos + t;
     device float* vec = vecs + (t * n_heads + h) * head_dim;
-    uint half_dim = head_dim / 2u;
+    // See `rope_interleaved_heads`: ggml `n_dims` scopes both the loop
+    // and the frequency exponent; `mscale` never leaves it.
+    uint rot = (rot_dim == 0u || rot_dim > head_dim) ? head_dim : rot_dim;
+    uint half_dim = rot / 2u;
     for (uint i = 0; i < half_dim; i++) {
-        float freq = 1.0f / pow(theta, (2.0f * float(i)) / float(head_dim));
+        float freq = 1.0f / pow(theta, (2.0f * float(i)) / float(rot));
         float angle = float(pos) * freq;
         if (use_freq_factors != 0u) {
             angle /= freq_factors[i];
         }
-        float s = sin(angle);
-        float c = cos(angle);
+        float s = sin(angle) * mscale;
+        float c = cos(angle) * mscale;
         float a = vec[2u * i];
         float b = vec[2u * i + 1u];
         vec[2u * i] = a * c - b * s;
@@ -2448,6 +2521,8 @@ kernel void rope_neox_heads_batch(
     device const float* freq_factors [[buffer(5)]],
     constant uint& use_freq_factors [[buffer(6)]],
     constant uint& n_tokens [[buffer(7)]],
+    constant uint& rot_dim [[buffer(8)]],
+    constant float& mscale [[buffer(9)]],
     uint2 gid [[thread_position_in_grid]]
 ) {
     uint h = gid.x;
@@ -2455,15 +2530,17 @@ kernel void rope_neox_heads_batch(
     if (h >= n_heads || t >= n_tokens) return;
     uint pos = base_pos + t;
     device float* vec = vecs + (t * n_heads + h) * head_dim;
-    uint half_dim = head_dim / 2u;
+    // See `rope_neox_heads`: the split-half pairing is over `n_dims`.
+    uint rot = (rot_dim == 0u || rot_dim > head_dim) ? head_dim : rot_dim;
+    uint half_dim = rot / 2u;
     for (uint i = 0; i < half_dim; i++) {
-        float freq = 1.0f / pow(theta, (2.0f * float(i)) / float(head_dim));
+        float freq = 1.0f / pow(theta, (2.0f * float(i)) / float(rot));
         float angle = float(pos) * freq;
         if (use_freq_factors != 0u) {
             angle /= freq_factors[i];
         }
-        float s = sin(angle);
-        float c = cos(angle);
+        float s = sin(angle) * mscale;
+        float c = cos(angle) * mscale;
         float a = vec[i];
         float b = vec[i + half_dim];
         vec[i] = a * c - b * s;
@@ -2973,7 +3050,7 @@ impl PrefillCbCache {
 /// Parameters for [`MetalGraph::warm_prefill_pipelines`].
 pub struct PrefillWarmParams<'a> {
     pub layer: &'a PrefillDenseLayerMetal<'a>,
-    pub rope_layout: MetalRopeLayout,
+    pub rope_layout: MetalRope,
     pub head_dim: u32,
     pub gelu_ffn: bool,
     pub kv_dtype: MetalKvDtype,
@@ -3042,7 +3119,7 @@ impl MetalGraph {
             mark(f16_static);
         }
 
-        let (rope_src, rope_name) = match params.rope_layout {
+        let (rope_src, rope_name) = match params.rope_layout.layout {
             MetalRopeLayout::Norm => (ROPE_NORM_BATCH_KERNEL_SRC, "rope_interleaved_heads_batch"),
             MetalRopeLayout::Neox => (ROPE_NEOX_BATCH_KERNEL_SRC, "rope_neox_heads_batch"),
         };
@@ -3232,7 +3309,7 @@ fn borrow_prefill_scratch(
 fn encode_rope(
     encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
     device: &Retained<ProtocolObject<dyn MTLDevice>>,
-    layout: MetalRopeLayout,
+    rope: MetalRope,
     vecs: &ProtocolObject<dyn MTLBuffer>,
     n_heads: u32,
     head_dim: u32,
@@ -3240,7 +3317,7 @@ fn encode_rope(
     pos: u32,
     freq_factors: Option<&ProtocolObject<dyn MTLBuffer>>,
 ) -> Result<(), MetalError> {
-    let (src, name) = match layout {
+    let (src, name) = match rope.layout {
         MetalRopeLayout::Norm => (ROPE_NORM_KERNEL_SRC, "rope_interleaved_heads"),
         MetalRopeLayout::Neox => (ROPE_NEOX_KERNEL_SRC, "rope_neox_heads"),
     };
@@ -3295,6 +3372,18 @@ fn encode_rope(
                 6,
             );
         }
+        let mut rot_dim_u = rope.rot_dim_uniform();
+        encoder.setBytes_length_atIndex(
+            NonNull::new(&mut rot_dim_u as *mut u32 as *mut _).unwrap(),
+            4,
+            7,
+        );
+        let mut mscale_f = rope.attn_factor;
+        encoder.setBytes_length_atIndex(
+            NonNull::new(&mut mscale_f as *mut f32 as *mut _).unwrap(),
+            4,
+            8,
+        );
     }
     encoder.dispatchThreadgroups_threadsPerThreadgroup(
         MTLSize {
@@ -3315,7 +3404,7 @@ fn encode_rope(
 fn encode_rope_batch(
     encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
     device: &Retained<ProtocolObject<dyn MTLDevice>>,
-    layout: MetalRopeLayout,
+    rope: MetalRope,
     vecs: &ProtocolObject<dyn MTLBuffer>,
     n_heads: u32,
     head_dim: u32,
@@ -3327,7 +3416,7 @@ fn encode_rope_batch(
     if n_tokens == 0 {
         return Ok(());
     }
-    let (src, name) = match layout {
+    let (src, name) = match rope.layout {
         MetalRopeLayout::Norm => (ROPE_NORM_BATCH_KERNEL_SRC, "rope_interleaved_heads_batch"),
         MetalRopeLayout::Neox => (ROPE_NEOX_BATCH_KERNEL_SRC, "rope_neox_heads_batch"),
     };
@@ -3386,6 +3475,18 @@ fn encode_rope_batch(
             NonNull::new(&mut n_tok as *mut u32 as *mut _).unwrap(),
             4,
             7,
+        );
+        let mut rot_dim_u = rope.rot_dim_uniform();
+        encoder.setBytes_length_atIndex(
+            NonNull::new(&mut rot_dim_u as *mut u32 as *mut _).unwrap(),
+            4,
+            8,
+        );
+        let mut mscale_f = rope.attn_factor;
+        encoder.setBytes_length_atIndex(
+            NonNull::new(&mut mscale_f as *mut f32 as *mut _).unwrap(),
+            4,
+            9,
         );
     }
     encoder.dispatchThreadgroups_threadsPerThreadgroup(
@@ -4547,7 +4648,7 @@ pub fn launch_decode_attn_block(
     o_launch: &MatvecLaunch<'_>,
     kv: &mut MetalKvBuffers,
     n_heads: usize,
-    rope_layout: MetalRopeLayout,
+    rope_layout: MetalRope,
     rope_theta: f32,
     freq_factors: Option<&[f32]>,
     pos: usize,
@@ -4705,7 +4806,7 @@ pub fn launch_decode_moe_attn_ffn_pre(
     kv: &mut MetalKvBuffers,
     ffn_norm_w: &[f32],
     n_heads: usize,
-    rope_layout: MetalRopeLayout,
+    rope_layout: MetalRope,
     rope_theta: f32,
     freq_factors: Option<&[f32]>,
     pos: usize,
@@ -5055,7 +5156,7 @@ pub fn launch_moe_decode_pre(
     ffn_norm_w: &[f32],
     router_launch: &MatvecLaunch<'_>,
     n_heads: usize,
-    rope_layout: MetalRopeLayout,
+    rope_layout: MetalRope,
     rope_theta: f32,
     freq_factors: Option<&[f32]>,
     pos: usize,
@@ -5491,7 +5592,7 @@ fn encode_moe_layer_fused(
     n_kv_heads: usize,
     head_dim: usize,
     hidden_dim: usize,
-    rope_layout: MetalRopeLayout,
+    rope_layout: MetalRope,
     rope_theta: f32,
     ff_buf: Option<&ProtocolObject<dyn MTLBuffer>>,
     pos: usize,
@@ -5869,7 +5970,7 @@ pub fn launch_moe_decode_layer_fused(
     top_k: usize,
     norm_topk_prob: bool,
     n_heads: usize,
-    rope_layout: MetalRopeLayout,
+    rope_layout: MetalRope,
     rope_theta: f32,
     freq_factors: Option<&[f32]>,
     pos: usize,
@@ -5991,7 +6092,7 @@ pub fn launch_moe_decode_stack(
     top_k: usize,
     norm_topk_prob: bool,
     n_heads: usize,
-    rope_layout: MetalRopeLayout,
+    rope_layout: MetalRope,
     rope_theta: f32,
     freq_factors: Option<&[f32]>,
     pos: usize,
@@ -6230,7 +6331,7 @@ pub fn launch_decode_dense_layer(
     up_launch: &MatvecLaunch<'_>,
     down_launch: &MatvecLaunch<'_>,
     n_heads: usize,
-    rope_layout: MetalRopeLayout,
+    rope_layout: MetalRope,
     rope_theta: f32,
     freq_factors: Option<&[f32]>,
     pos: usize,
@@ -6494,7 +6595,7 @@ pub fn launch_decode_dense_stack(
     layers: &[DenseLayerMetal<'_>],
     kvs: &mut [MetalKvBuffers],
     n_heads: usize,
-    rope_layout: MetalRopeLayout,
+    rope_layout: MetalRope,
     rope_theta: f32,
     freq_factors: Option<&[f32]>,
     pos: usize,
@@ -7070,7 +7171,7 @@ fn encode_prefill_dense_layer(
     n_heads: usize,
     batch: usize,
     hidden_dim: usize,
-    rope_layout: MetalRopeLayout,
+    rope_layout: MetalRope,
     rope_theta: f32,
     ff_buf: Option<&ProtocolObject<dyn MTLBuffer>>,
     start_pos: usize,
@@ -7346,7 +7447,7 @@ pub fn launch_prefill_dense_stack(
     kvs: &mut [MetalKvBuffers],
     n_heads: usize,
     batch: usize,
-    rope_layout: MetalRopeLayout,
+    rope_layout: MetalRope,
     rope_thetas: &[f32],
     freq_factors: Option<&[f32]>,
     start_pos: usize,
@@ -7536,7 +7637,7 @@ pub fn launch_prefill_dense_layer(
     kv: &mut MetalKvBuffers,
     n_heads: usize,
     batch: usize,
-    rope_layout: MetalRopeLayout,
+    rope_layout: MetalRope,
     rope_theta: f32,
     freq_factors: Option<&[f32]>,
     start_pos: usize,
@@ -7566,14 +7667,16 @@ pub fn launch_rope_heads_host(
     vecs: &mut [f32],
     n_heads: usize,
     head_dim: usize,
-    layout: MetalRopeLayout,
+    layout: MetalRope,
     theta: f32,
     pos: usize,
     freq_factors: Option<&[f32]>,
 ) -> Result<(), MetalError> {
     assert_eq!(vecs.len(), n_heads * head_dim);
     if let Some(ff) = freq_factors {
-        assert_eq!(ff.len(), head_dim / 2);
+        // ggml sizes `rope_freqs` by the ROTARY width (`n_rot/2`), which
+        // is narrower than the head under partial rotary.
+        assert_eq!(ff.len(), layout.rot_dim.unwrap_or(head_dim) / 2);
     }
     let shared = shared_metal()?;
     let device = &shared.device;
@@ -7695,7 +7798,7 @@ pub fn launch_prefill_attn_block(
     kv: &mut MetalKvBuffers,
     n_heads: usize,
     n_q: usize,
-    rope_layout: MetalRopeLayout,
+    rope_layout: MetalRope,
     rope_theta: f32,
     freq_factors: Option<&[f32]>,
     start_pos: usize,
@@ -7837,7 +7940,7 @@ pub fn launch_prefill_attn_o_residual(
     kv: &mut MetalKvBuffers,
     n_heads: usize,
     n_q: usize,
-    rope_layout: MetalRopeLayout,
+    rope_layout: MetalRope,
     rope_theta: f32,
     freq_factors: Option<&[f32]>,
     start_pos: usize,
@@ -8004,14 +8107,14 @@ pub fn launch_rope_heads_batch_host(
     n_heads: usize,
     head_dim: usize,
     n_tokens: usize,
-    layout: MetalRopeLayout,
+    layout: MetalRope,
     theta: f32,
     base_pos: usize,
     freq_factors: Option<&[f32]>,
 ) -> Result<(), MetalError> {
     assert_eq!(vecs.len(), n_tokens * n_heads * head_dim);
     if let Some(ff) = freq_factors {
-        assert_eq!(ff.len(), head_dim / 2);
+        assert_eq!(ff.len(), layout.rot_dim.unwrap_or(head_dim) / 2);
     }
     if n_tokens == 0 {
         return Ok(());
@@ -8444,44 +8547,70 @@ mod tests {
         }
     }
 
-    fn assert_rope_parity(layout: MetalRopeLayout, with_ff: bool) {
+    /// One head, exactly as `ferrox_models::Decoder` composes it on the
+    /// CPU: `apply_rope_attn_factor` scales the rotated channels, then
+    /// `apply_rope_head_theta` rotates `[0, n_rot)` and leaves the tail
+    /// alone. Pre-scaling and folding `mscale` into cos/sin are the same
+    /// thing (rotation is linear) — which is the property the Metal
+    /// kernel has to reproduce.
+    fn cpu_rope_head(vec: &mut [f32], rope: MetalRope, pos: usize, theta: f32, ff: Option<&[f32]>) {
+        let head_dim = vec.len();
+        let rot = rope.rot_dim.unwrap_or(head_dim).min(head_dim);
+        for v in vec[..rot].iter_mut() {
+            *v *= rope.attn_factor;
+        }
+        let slice = &mut vec[..rot];
+        match rope.layout {
+            MetalRopeLayout::Norm => cpu_rope_norm(slice, pos, theta, ff),
+            MetalRopeLayout::Neox => cpu_rope_neox(slice, pos, theta, ff),
+        }
+    }
+
+    fn assert_rope_parity_with(rope: MetalRope, head_dim: usize, with_ff: bool) {
         let n_heads = 3;
-        let head_dim = 8;
         let pos = 5usize;
         let theta = 10000.0f32;
+        let rot = rope.rot_dim.unwrap_or(head_dim);
         let ff: Option<Vec<f32>> = if with_ff {
-            Some((0..head_dim / 2).map(|i| 0.8 + i as f32 * 0.15).collect())
+            Some((0..rot / 2).map(|i| 0.8 + i as f32 * 0.15).collect())
         } else {
             None
         };
-        let mut cpu: Vec<f32> = (0..n_heads * head_dim)
+        let src: Vec<f32> = (0..n_heads * head_dim)
             .map(|i| (i as f32 * 0.11).sin())
             .collect();
-        let mut gpu = cpu.clone();
+        let mut cpu = src.clone();
+        let mut gpu = src.clone();
         for h in 0..n_heads {
             let slice = &mut cpu[h * head_dim..(h + 1) * head_dim];
-            match layout {
-                MetalRopeLayout::Norm => cpu_rope_norm(slice, pos, theta, ff.as_deref()),
-                MetalRopeLayout::Neox => cpu_rope_neox(slice, pos, theta, ff.as_deref()),
-            }
+            cpu_rope_head(slice, rope, pos, theta, ff.as_deref());
         }
-        launch_rope_heads_host(
-            &mut gpu,
-            n_heads,
-            head_dim,
-            layout,
-            theta,
-            pos,
-            ff.as_deref(),
-        )
-        .expect("metal rope");
+        launch_rope_heads_host(&mut gpu, n_heads, head_dim, rope, theta, pos, ff.as_deref())
+            .expect("metal rope");
         for (i, (a, b)) in cpu.iter().zip(gpu.iter()).enumerate() {
             let tol = 1e-4 * a.abs().max(1.0);
             assert!(
                 (a - b).abs() <= tol,
-                "{layout:?} ff={with_ff} elem {i}: cpu={a} gpu={b} tol={tol}"
+                "{rope:?} hd={head_dim} ff={with_ff} elem {i}: cpu={a} gpu={b} tol={tol}"
             );
         }
+        // The pass-through tail is not "close to" the input, it IS the
+        // input: ggml copies `[n_rot, ne0)` and `mscale` cannot reach it.
+        if rot < head_dim {
+            for h in 0..n_heads {
+                for d in rot..head_dim {
+                    let i = h * head_dim + d;
+                    assert_eq!(
+                        gpu[i], src[i],
+                        "{rope:?} pass-through channel {d} of head {h} must be untouched"
+                    );
+                }
+            }
+        }
+    }
+
+    fn assert_rope_parity(layout: MetalRopeLayout, with_ff: bool) {
+        assert_rope_parity_with(MetalRope::new(layout), 8, with_ff);
     }
 
     #[test]
@@ -8496,6 +8625,104 @@ mod tests {
     fn rope_neox_matches_cpu() {
         assert_rope_parity(MetalRopeLayout::Neox, false);
         assert_rope_parity(MetalRopeLayout::Neox, true);
+    }
+
+    /// Partial rotary (`n_rot < head_dim`, Phi-3/Phi-4's 96 of 128): the
+    /// rotated prefix must match the CPU decoder and the tail must come
+    /// back bit-identical. Both layouts, because NeoX's split-half
+    /// pairing is over `n_rot`, so getting the width wrong there
+    /// re-pairs channels rather than merely rotating too many.
+    #[test]
+    #[ignore = "needs a real Metal GPU"]
+    fn rope_partial_rotary_matches_cpu() {
+        for layout in [MetalRopeLayout::Norm, MetalRopeLayout::Neox] {
+            for with_ff in [false, true] {
+                let rope = MetalRope {
+                    rot_dim: Some(6),
+                    ..MetalRope::new(layout)
+                };
+                assert_rope_parity_with(rope, 8, with_ff);
+            }
+        }
+    }
+
+    /// `rot_dim == head_dim` must be the same graph as `None`, so a
+    /// checkpoint whose `rope.dimension_count` equals the head width
+    /// cannot take a different path from one that omits the key.
+    #[test]
+    #[ignore = "needs a real Metal GPU"]
+    fn rope_rot_dim_equal_to_head_dim_is_whole_head() {
+        for layout in [MetalRopeLayout::Norm, MetalRopeLayout::Neox] {
+            assert_rope_parity_with(
+                MetalRope {
+                    rot_dim: Some(8),
+                    ..MetalRope::new(layout)
+                },
+                8,
+                false,
+            );
+        }
+    }
+
+    /// The bug the CPU side shipped once and `ferrox parity` caught:
+    /// `attn_factor` is ggml's `mscale`, folded into cos/sin inside
+    /// `rope_yarn`, so it can only reach the ROTATED channels. A kernel
+    /// that scales the whole head is a different model.
+    #[test]
+    #[ignore = "needs a real Metal GPU"]
+    fn rope_mscale_scales_only_the_rotated_channels() {
+        let head_dim = 8;
+        let rot = 4;
+        let n_heads = 2;
+        let src: Vec<f32> = (0..n_heads * head_dim).map(|i| 1.0 + i as f32).collect();
+
+        for layout in [MetalRopeLayout::Norm, MetalRopeLayout::Neox] {
+            let rope = MetalRope {
+                layout,
+                rot_dim: Some(rot),
+                attn_factor: 1.1902381,
+            };
+            // Position 0: cos = 1, sin = 0, so the rotated channels come
+            // out as exactly `x * mscale` and the magnitude scale is
+            // readable straight off the output.
+            let mut gpu = src.clone();
+            launch_rope_heads_host(&mut gpu, n_heads, head_dim, rope, 10000.0, 0, None)
+                .expect("metal rope");
+            for h in 0..n_heads {
+                for d in 0..rot {
+                    let i = h * head_dim + d;
+                    let want = src[i] * rope.attn_factor;
+                    assert!(
+                        (gpu[i] - want).abs() <= 1e-4 * want.abs(),
+                        "{layout:?} rotated channel {d} of head {h}: got {} want {want}",
+                        gpu[i]
+                    );
+                }
+                for d in rot..head_dim {
+                    let i = h * head_dim + d;
+                    assert_eq!(
+                        gpu[i], src[i],
+                        "{layout:?} pass-through channel {d} of head {h} must NOT take mscale"
+                    );
+                }
+            }
+            // And with no partial rotary the whole head takes it, so the
+            // narrow case cannot quietly become the rule.
+            let whole = MetalRope {
+                rot_dim: None,
+                ..rope
+            };
+            let mut gpu = src.clone();
+            launch_rope_heads_host(&mut gpu, n_heads, head_dim, whole, 10000.0, 0, None)
+                .expect("metal rope");
+            for (i, (g, s)) in gpu.iter().zip(src.iter()).enumerate() {
+                let want = s * whole.attn_factor;
+                assert!(
+                    (g - want).abs() <= 1e-4 * want.abs(),
+                    "{layout:?} elem {i}: got {g} want {want}"
+                );
+            }
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -9182,30 +9409,28 @@ mod tests {
         }
     }
 
-    fn assert_rope_batch_parity(layout: MetalRopeLayout, with_ff: bool) {
+    fn assert_rope_batch_parity_with(rope: MetalRope, head_dim: usize, with_ff: bool) {
         let n_heads = 3;
-        let head_dim = 8;
         let n_tokens = 4;
         let base_pos = 2usize;
         let theta = 10000.0f32;
+        let rot = rope.rot_dim.unwrap_or(head_dim);
         let ff: Option<Vec<f32>> = if with_ff {
-            Some((0..head_dim / 2).map(|i| 0.8 + i as f32 * 0.15).collect())
+            Some((0..rot / 2).map(|i| 0.8 + i as f32 * 0.15).collect())
         } else {
             None
         };
-        let mut cpu: Vec<f32> = (0..n_tokens * n_heads * head_dim)
+        let src: Vec<f32> = (0..n_tokens * n_heads * head_dim)
             .map(|i| (i as f32 * 0.11).sin())
             .collect();
-        let mut gpu = cpu.clone();
+        let mut cpu = src.clone();
+        let mut gpu = src.clone();
         for t in 0..n_tokens {
             let pos = base_pos + t;
             for h in 0..n_heads {
                 let off = (t * n_heads + h) * head_dim;
                 let slice = &mut cpu[off..off + head_dim];
-                match layout {
-                    MetalRopeLayout::Norm => cpu_rope_norm(slice, pos, theta, ff.as_deref()),
-                    MetalRopeLayout::Neox => cpu_rope_neox(slice, pos, theta, ff.as_deref()),
-                }
+                cpu_rope_head(slice, rope, pos, theta, ff.as_deref());
             }
         }
         launch_rope_heads_batch_host(
@@ -9213,7 +9438,7 @@ mod tests {
             n_heads,
             head_dim,
             n_tokens,
-            layout,
+            rope,
             theta,
             base_pos,
             ff.as_deref(),
@@ -9223,9 +9448,26 @@ mod tests {
             let tol = 1e-4 * a.abs().max(1.0);
             assert!(
                 (a - b).abs() <= tol,
-                "{layout:?} batch ff={with_ff} elem {i}: cpu={a} gpu={b} tol={tol}"
+                "{rope:?} batch hd={head_dim} ff={with_ff} elem {i}: cpu={a} gpu={b} tol={tol}"
             );
         }
+        if rot < head_dim {
+            for t in 0..n_tokens {
+                for h in 0..n_heads {
+                    for d in rot..head_dim {
+                        let i = (t * n_heads + h) * head_dim + d;
+                        assert_eq!(
+                            gpu[i], src[i],
+                            "{rope:?} batch pass-through channel {d} (tok {t}, head {h})"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    fn assert_rope_batch_parity(layout: MetalRopeLayout, with_ff: bool) {
+        assert_rope_batch_parity_with(MetalRope::new(layout), 8, with_ff);
     }
 
     #[test]
@@ -9240,6 +9482,24 @@ mod tests {
     fn rope_batch_neox_matches_cpu() {
         assert_rope_batch_parity(MetalRopeLayout::Neox, false);
         assert_rope_batch_parity(MetalRopeLayout::Neox, true);
+    }
+
+    /// Prefill's batched kernel carries the same two uniforms as the
+    /// decode one; a `rot_dim`/`mscale` that only reached decode would
+    /// give Metal prefill and Metal decode different RoPE.
+    #[test]
+    #[ignore = "needs a real Metal GPU"]
+    fn rope_batch_partial_rotary_and_mscale_match_cpu() {
+        for layout in [MetalRopeLayout::Norm, MetalRopeLayout::Neox] {
+            for with_ff in [false, true] {
+                let rope = MetalRope {
+                    layout,
+                    rot_dim: Some(6),
+                    attn_factor: 1.1902381,
+                };
+                assert_rope_batch_parity_with(rope, 8, with_ff);
+            }
+        }
     }
 
     #[test]
@@ -9268,7 +9528,7 @@ mod tests {
             &mut kv,
             n_heads,
             n_q,
-            MetalRopeLayout::Norm,
+            MetalRope::new(MetalRopeLayout::Norm),
             10000.0,
             None,
             start_pos,
@@ -9352,7 +9612,7 @@ mod tests {
             &mut kv_f16,
             n_heads,
             n_q,
-            MetalRopeLayout::Norm,
+            MetalRope::new(MetalRopeLayout::Norm),
             10000.0,
             None,
             0,
@@ -9367,7 +9627,7 @@ mod tests {
             &mut kv_q8,
             n_heads,
             n_q,
-            MetalRopeLayout::Norm,
+            MetalRope::new(MetalRopeLayout::Norm),
             10000.0,
             None,
             0,

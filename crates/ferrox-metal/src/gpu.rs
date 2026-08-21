@@ -3807,6 +3807,7 @@ pub(crate) fn encode_moe_topk_softmax_batch(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_moe_prefill_ffn(
     enc: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+    mrs: &mut crate::mem_ranges::MemRanges,
     device: &Retained<ProtocolObject<dyn MTLDevice>>,
     moe: &PrefillMoeMetal<'_>,
     bound: &MoePackedResident,
@@ -3846,10 +3847,10 @@ pub(crate) fn encode_moe_prefill_ffn(
         let mm_ids = scratch.mm_id_ids.as_ref();
         let gate_buf = scratch.gate.as_ref();
         let up_buf = scratch.up.as_ref();
-        let act_buf = scratch.act.as_ref();
         let half_slots = scratch.half_in.as_ref();
         let expert_out = scratch.expert_out.as_ref();
 
+        mrs.begin_op(enc, &[x_f32], &[logits]);
         encode_moe_router_mm_f32(
             enc,
             device,
@@ -3860,7 +3861,8 @@ pub(crate) fn encode_moe_prefill_ffn(
             n_experts as u32,
             n_tokens as u32,
         )?;
-        memory_barrier_resources(enc, &[logits]);
+        mrs.end_op(&[x_f32], &[logits]);
+        mrs.begin_op(enc, &[logits], &[route_ids, route_w]);
         encode_moe_topk_softmax_batch(
             enc,
             device,
@@ -3872,7 +3874,8 @@ pub(crate) fn encode_moe_prefill_ffn(
             moe.renormalize,
             n_tokens as u32,
         )?;
-        memory_barrier_resources(enc, &[route_ids, route_w]);
+        mrs.end_op(&[logits], &[route_ids, route_w]);
+        mrs.begin_op(enc, &[route_ids], &[tpe, mm_ids]);
         encode_moe_mm_id_map0(
             enc,
             device,
@@ -3883,8 +3886,9 @@ pub(crate) fn encode_moe_prefill_ffn(
             n_tokens as u32,
             top_k,
         )?;
-        memory_barrier_resources(enc, &[tpe, mm_ids]);
+        mrs.end_op(&[route_ids], &[tpe, mm_ids]);
 
+        mrs.begin_op(enc, &[x_f16, mm_ids, tpe], &[gate_buf, up_buf]);
         encode_mul_mm_id_f16(
             enc,
             device,
@@ -3921,18 +3925,20 @@ pub(crate) fn encode_moe_prefill_ffn(
             up_row_bytes as u32,
             0,
         )?;
-        memory_barrier_resources(enc, &[gate_buf, up_buf]);
-        crate::elem::encode_silu_mul(
+        mrs.end_op(&[x_f16, mm_ids, tpe], &[gate_buf, up_buf]);
+        // SwiGLU straight to f16 — the staging convert is folded in.
+        mrs.begin_op(enc, &[gate_buf, up_buf], &[half_slots]);
+        crate::elem::encode_act_mul_f32_to_f16(
             enc,
             device,
             gate_buf,
             up_buf,
-            act_buf,
+            half_slots,
             (n_slots * ffn) as u32,
+            false,
         )?;
-        memory_barrier_resources(enc, &[act_buf]);
-        crate::elem::encode_f32_to_f16(enc, device, act_buf, half_slots, (n_slots * ffn) as u32)?;
-        memory_barrier_resources(enc, &[half_slots]);
+        mrs.end_op(&[gate_buf, up_buf], &[half_slots]);
+        mrs.begin_op(enc, &[half_slots, mm_ids, tpe], &[expert_out]);
         encode_mul_mm_id_f16(
             enc,
             device,
@@ -3951,7 +3957,8 @@ pub(crate) fn encode_moe_prefill_ffn(
             packed.down_row_bytes as u32,
             1,
         )?;
-        memory_barrier_resources(enc, &[expert_out]);
+        mrs.end_op(&[half_slots, mm_ids, tpe], &[expert_out]);
+        mrs.begin_op(enc, &[expert_out, route_w], &[out]);
         encode_moe_prefill_weighted_sum(
             enc,
             device,
@@ -3962,6 +3969,7 @@ pub(crate) fn encode_moe_prefill_ffn(
             top_k as u32,
             n_tokens as u32,
         )?;
+        mrs.end_op(&[expert_out, route_w], &[out]);
         Ok(())
     })
 }
@@ -7087,9 +7095,9 @@ pub fn launch_moe_prefill_q4_0(
     let result = TL_MOE_PREFILL.with(|cell| {
         let scratch = cell.borrow();
         let scratch = scratch.as_ref().ok_or(MetalError::CommandFailed)?;
-        let act_buf = scratch.act.as_ref();
         let gate_buf = scratch.gate.as_ref();
         let up_buf = scratch.up.as_ref();
+        let act_buf = scratch.act.as_ref();
         let expert_out_buf = scratch.expert_out.as_ref();
         let out_buf = scratch.out.as_ref();
         let mm_id_tpe_buf: &ProtocolObject<dyn MTLBuffer> = scratch.mm_id_tpe.as_ref();
@@ -8600,7 +8608,16 @@ mod tests {
         .expect("f32->f16");
         memory_barrier_buffers(&encoder);
         encode_moe_prefill_ffn(
-            &encoder, device, &moe, &bound, &router, &x_buf, &xh_buf, &out_buf, n_tokens,
+            &encoder,
+            &mut crate::mem_ranges::MemRanges::new(),
+            device,
+            &moe,
+            &bound,
+            &router,
+            &x_buf,
+            &xh_buf,
+            &out_buf,
+            n_tokens,
         )
         .expect("moe prefill ffn");
         encoder.endEncoding();

@@ -21,10 +21,10 @@ pub mod gpu;
 pub mod attn;
 
 #[cfg(feature = "metal")]
-mod moe_ranges;
+mod mem_ranges;
 
 #[cfg(feature = "metal")]
-pub use moe_ranges::{moe_barrier_stats, moe_barrier_stats_reset};
+pub use mem_ranges::{metal_barrier_stats, metal_barrier_stats_reset};
 
 #[cfg(feature = "metal")]
 pub mod elem;

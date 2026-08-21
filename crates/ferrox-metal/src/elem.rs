@@ -234,6 +234,49 @@ kernel void add_rms_norm_f32_batch(
         orow[i] = hr[i] * inv_rms * weight[i];
     }
 }
+
+// Same, writing half — folds the f32→f16 staging convert that used to sit
+// between this norm and `mul_mm_sg_f16` into the norm's own store loop.
+// Saves one dispatch and, more importantly, one barrier per layer.
+kernel void add_rms_norm_f32_to_f16_batch(
+    device float* h [[buffer(0)]],
+    device const float* add [[buffer(1)]],
+    device const float* weight [[buffer(2)]],
+    device half* out [[buffer(3)]],
+    constant uint& n [[buffer(4)]],
+    constant float& eps [[buffer(5)]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint tg [[threads_per_threadgroup]],
+    uint row [[threadgroup_position_in_grid]],
+    uint sgitg [[simdgroup_index_in_threadgroup]],
+    uint tiisg [[thread_index_in_simdgroup]],
+    threadgroup float* scratch [[threadgroup(0)]]
+) {
+    device float* hr = h + row * n;
+    device const float* ar = add + row * n;
+    device half* orow = out + row * n;
+    float partial = 0.0f;
+    for (uint i = tid; i < n; i += tg) {
+        float v = hr[i] + ar[i];
+        hr[i] = v;
+        partial += v * v;
+    }
+    partial = simd_sum(partial);
+    if (tiisg == 0u) {
+        scratch[sgitg] = partial;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float total = 0.0f;
+    const uint nsg = (tg + 31u) / 32u;
+    if (tiisg < nsg) {
+        total = scratch[tiisg];
+    }
+    total = simd_sum(total);
+    float inv_rms = rsqrt(total / float(n) + eps);
+    for (uint i = tid; i < n; i += tg) {
+        orow[i] = half(hr[i] * inv_rms * weight[i]);
+    }
+}
 "#;
 
 /// In-place per-head RMSNorm×γ (Qwen3 / Gemma-3 QK-norm): each head of
@@ -282,6 +325,23 @@ kernel void silu_mul_f32(
         out[i] = (g / (1.0f + exp(-g))) * up[i];
     }
 }
+
+// Same activation, half store — folds the f32→f16 staging convert that
+// used to sit between SwiGLU and the down `mul_mm_sg_f16`. The product is
+// still formed in f32 and rounded once, exactly as the two-dispatch pair
+// did, so this is bit-identical to silu_mul_f32 + f32_to_f16.
+kernel void silu_mul_f32_to_f16(
+    device const float* gate [[buffer(0)]],
+    device const float* up [[buffer(1)]],
+    device half* out [[buffer(2)]],
+    constant uint& n [[buffer(3)]],
+    uint i [[thread_position_in_grid]]
+) {
+    if (i < n) {
+        float g = gate[i];
+        out[i] = half((g / (1.0f + exp(-g))) * up[i]);
+    }
+}
 "#;
 
 /// `y[i] += a * x[i]` — MoE weighted expert accumulate.
@@ -321,6 +381,23 @@ kernel void gelu_mul_f32(
         const float C = 0.044715f;
         float gelu = 0.5f * g * (1.0f + precise::tanh(K * (g + C * g * g * g)));
         out[i] = gelu * up[i];
+    }
+}
+
+// Half store — see `silu_mul_f32_to_f16`.
+kernel void gelu_mul_f32_to_f16(
+    device const float* gate [[buffer(0)]],
+    device const float* up [[buffer(1)]],
+    device half* out [[buffer(2)]],
+    constant uint& n [[buffer(3)]],
+    uint i [[thread_position_in_grid]]
+) {
+    if (i < n) {
+        float g = gate[i];
+        const float K = 0.7978845608028654f; // sqrt(2/pi)
+        const float C = 0.044715f;
+        float gelu = 0.5f * g * (1.0f + precise::tanh(K * (g + C * g * g * g)));
+        out[i] = half(gelu * up[i]);
     }
 }
 "#;
@@ -737,6 +814,70 @@ pub(crate) fn encode_add_rms_norm_batch(
     Ok(())
 }
 
+/// [`encode_add_rms_norm_batch`] storing `half` — the fused residual add +
+/// FFN RMSNorm + f32→f16 staging convert the dense prefill layer needs
+/// before `mul_mm_sg_f16`. `h` is still updated in f32 (it is the residual
+/// stream); only `out` is half. Saves one dispatch and one barrier/layer.
+///
+/// Unlike [`encode_add_rms_norm_batch`] there is no `batch == 1` fallback:
+/// the one-threadgroup-per-row kernel is correct at any batch and the only
+/// caller (the prefill stack) rejects `batch < 4` anyway.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_add_rms_norm_f32_to_f16_batch(
+    encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+    device: &Retained<ProtocolObject<dyn MTLDevice>>,
+    h: &ProtocolObject<dyn MTLBuffer>,
+    add: &ProtocolObject<dyn MTLBuffer>,
+    weight: &ProtocolObject<dyn MTLBuffer>,
+    out: &ProtocolObject<dyn MTLBuffer>,
+    n: u32,
+    batch: u32,
+    eps: f32,
+) -> Result<(), MetalError> {
+    if batch == 0 {
+        return Ok(());
+    }
+    let pipe = ensure_pipeline(
+        device,
+        ADD_RMS_NORM_KERNEL_SRC,
+        "add_rms_norm_f32_to_f16_batch",
+    )?;
+    encoder.setComputePipelineState(&pipe.0);
+    let tg = 256u32;
+    unsafe {
+        encoder.setBuffer_offset_atIndex(Some(h), 0, 0);
+        encoder.setBuffer_offset_atIndex(Some(add), 0, 1);
+        encoder.setBuffer_offset_atIndex(Some(weight), 0, 2);
+        encoder.setBuffer_offset_atIndex(Some(out), 0, 3);
+        let mut n_u = n;
+        encoder.setBytes_length_atIndex(
+            NonNull::new(&mut n_u as *mut u32 as *mut _).unwrap(),
+            4,
+            4,
+        );
+        let mut eps_f = eps;
+        encoder.setBytes_length_atIndex(
+            NonNull::new(&mut eps_f as *mut f32 as *mut _).unwrap(),
+            4,
+            5,
+        );
+        encoder.setThreadgroupMemoryLength_atIndex(((tg as usize) / 32) * 4, 0);
+    }
+    encoder.dispatchThreadgroups_threadsPerThreadgroup(
+        MTLSize {
+            width: batch as usize,
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width: tg as usize,
+            height: 1,
+            depth: 1,
+        },
+    );
+    Ok(())
+}
+
 /// In-place per-head RMSNorm×γ over `n_heads * head_dim` values in `x`
 /// (`batch == 1`). Tests and decode helpers may call this; prefill uses
 /// [`encode_rms_norm_per_head_batch`].
@@ -880,6 +1021,54 @@ pub(crate) fn encode_axpy(
 }
 
 /// `out = gelu(gate) * up` (Gemma GeGLU; tanh-approx gelu).
+/// SwiGLU / GeGLU writing `half` — [`encode_silu_mul`] / [`encode_gelu_mul`]
+/// with the following f32→f16 staging convert folded in. Bit-identical to
+/// the two-dispatch pair (the product is still formed in f32 and rounded
+/// once); saves one dispatch and one barrier per layer.
+pub(crate) fn encode_act_mul_f32_to_f16(
+    encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+    device: &Retained<ProtocolObject<dyn MTLDevice>>,
+    gate: &ProtocolObject<dyn MTLBuffer>,
+    up: &ProtocolObject<dyn MTLBuffer>,
+    out: &ProtocolObject<dyn MTLBuffer>,
+    n: u32,
+    gelu: bool,
+) -> Result<(), MetalError> {
+    let (src, name) = if gelu {
+        (GELU_MUL_KERNEL_SRC, "gelu_mul_f32_to_f16")
+    } else {
+        (SILU_MUL_KERNEL_SRC, "silu_mul_f32_to_f16")
+    };
+    let pipe = ensure_pipeline(device, src, name)?;
+    encoder.setComputePipelineState(&pipe.0);
+    unsafe {
+        encoder.setBuffer_offset_atIndex(Some(gate), 0, 0);
+        encoder.setBuffer_offset_atIndex(Some(up), 0, 1);
+        encoder.setBuffer_offset_atIndex(Some(out), 0, 2);
+        let mut n_u = n;
+        encoder.setBytes_length_atIndex(
+            NonNull::new(&mut n_u as *mut u32 as *mut _).unwrap(),
+            4,
+            3,
+        );
+    }
+    let tg = 256usize;
+    let n_tg = (n as usize).div_ceil(tg);
+    encoder.dispatchThreadgroups_threadsPerThreadgroup(
+        MTLSize {
+            width: n_tg,
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width: tg,
+            height: 1,
+            depth: 1,
+        },
+    );
+    Ok(())
+}
+
 pub(crate) fn encode_gelu_mul(
     encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
     device: &Retained<ProtocolObject<dyn MTLDevice>>,
@@ -967,12 +1156,19 @@ pub(crate) fn warm_prefill_elem_pipelines(
     ensure_pipeline(device, RMS_NORM_KERNEL_SRC, "rms_norm_f32_to_f16_batch")?;
     ensure_pipeline(device, ADD_RMS_NORM_KERNEL_SRC, "add_rms_norm_f32")?;
     ensure_pipeline(device, ADD_RMS_NORM_KERNEL_SRC, "add_rms_norm_f32_batch")?;
+    ensure_pipeline(
+        device,
+        ADD_RMS_NORM_KERNEL_SRC,
+        "add_rms_norm_f32_to_f16_batch",
+    )?;
     ensure_pipeline(device, VEC_ADD_KERNEL_SRC, "vec_add_f32")?;
     ensure_pipeline(device, VEC_ADD_KERNEL_SRC, "f32_to_f16")?;
     if gelu_ffn {
         ensure_pipeline(device, GELU_MUL_KERNEL_SRC, "gelu_mul_f32")?;
+        ensure_pipeline(device, GELU_MUL_KERNEL_SRC, "gelu_mul_f32_to_f16")?;
     } else {
         ensure_pipeline(device, SILU_MUL_KERNEL_SRC, "silu_mul_f32")?;
+        ensure_pipeline(device, SILU_MUL_KERNEL_SRC, "silu_mul_f32_to_f16")?;
     }
     Ok(())
 }

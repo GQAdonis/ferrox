@@ -172,6 +172,21 @@ impl ModelConfig {
                 }
             }
         }
+        // Metadata-declared multipliers the generic decoder does not
+        // apply. Unlike the tensor-consumption gate, nothing about these
+        // is visible in the weights, so a Granite checkpoint would load
+        // and answer at the wrong scale. See
+        // `capability::unsupported_scaling_keys`.
+        for (meta_key, feature, no_op) in crate::capability::unsupported_scaling_keys(&arch) {
+            if let Some(v) = metadata_f32_any(file, std::slice::from_ref(&meta_key)) {
+                if (v - no_op).abs() > 1e-6 {
+                    return Err(LoadError::UnsupportedFeature(
+                        arch.clone(),
+                        format!("{feature} (metadata {meta_key}={v})"),
+                    ));
+                }
+            }
+        }
         let key = |suffix: &str| format!("{arch}.{suffix}");
 
         let name: &'static str = Box::leak(
@@ -1950,6 +1965,81 @@ mod tests {
             other => panic!(
                 "expected LoadError::UnsupportedArchitecture for an unregistered arch, got {other:?}"
             ),
+        }
+    }
+
+    fn write_kv_f32(buf: &mut Vec<u8>, key: &str, val: f32) {
+        write_string(buf, key);
+        buf.write_u32::<LittleEndian>(6).unwrap(); // type = float32
+        buf.write_f32::<LittleEndian>(val).unwrap();
+    }
+
+    /// `arch` plus one f32 hparam, so a metadata-only feature gate can be
+    /// exercised without building a whole checkpoint.
+    fn build_arch_plus_f32_gguf(arch: &str, key: &str, val: f32) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.write_u32::<LittleEndian>(ferrox_gguf::GGUF_MAGIC)
+            .unwrap();
+        buf.write_u32::<LittleEndian>(3).unwrap(); // version
+        buf.write_u64::<LittleEndian>(0).unwrap(); // tensor_count
+        buf.write_u64::<LittleEndian>(2).unwrap(); // kv_count
+        write_kv_str(&mut buf, "general.architecture", arch);
+        write_kv_f32(&mut buf, key, val);
+        buf
+    }
+
+    fn config_error_for(arch: &str, key: &str, val: f32, tag: &str) -> LoadError {
+        let tmp = std::env::temp_dir().join(format!("ferrox_test_scale_{tag}.gguf"));
+        std::fs::write(&tmp, build_arch_plus_f32_gguf(arch, key, val)).unwrap();
+        let file = ferrox_gguf::GgufFile::open(&tmp).expect("minimal header must still parse");
+        std::fs::remove_file(&tmp).ok();
+        ModelConfig::from_gguf(&file).expect_err("must not succeed")
+    }
+
+    /// Granite / MiniCPM / Command-R multipliers are hparams, not
+    /// tensors, so `assert_every_tensor_consumed` cannot see them: a
+    /// checkpoint declaring one loads, runs at full speed, and computes
+    /// a differently-scaled graph than it was trained as. Refuse by name
+    /// until the math lands.
+    #[test]
+    fn a_declared_multiplier_this_decoder_does_not_apply_is_refused_by_name() {
+        for (key, val) in [
+            ("granite.logit_scale", 6.0f32),
+            ("granite.residual_scale", 0.22),
+            ("granite.embedding_scale", 12.0),
+            ("granite.attention.scale", 0.015_625),
+        ] {
+            let tag = key.replace('.', "_");
+            match config_error_for("granite", key, val, &tag) {
+                LoadError::UnsupportedFeature(arch, msg) => {
+                    assert_eq!(arch, "granite");
+                    assert!(msg.contains(key), "error must name the key: {msg}");
+                }
+                other => panic!("expected UnsupportedFeature for {key}, got {other:?}"),
+            }
+        }
+    }
+
+    /// The gate must not fire on a multiplier that is a no-op. A file
+    /// writing `residual_scale = 1.0` describes the graph ferrox already
+    /// computes, and refusing it would be a false alarm. llama.cpp's
+    /// `f_attention_scale` uses `0.0` rather than `1.0` as its "unset"
+    /// sentinel, so the two are checked against their own no-op values.
+    #[test]
+    fn a_multiplier_that_is_a_no_op_is_not_refused() {
+        for (key, val) in [
+            ("granite.logit_scale", 1.0f32),
+            ("granite.residual_scale", 1.0),
+            ("granite.embedding_scale", 1.0),
+            ("granite.attention.scale", 0.0),
+        ] {
+            let tag = format!("noop_{}", key.replace('.', "_"));
+            // The file carries no `block_count`, so the load still fails
+            // -- but on the *missing hparam*, having passed this gate.
+            match config_error_for("granite", key, val, &tag) {
+                LoadError::MissingHparam(k) => assert_eq!(k, "granite.block_count"),
+                other => panic!("no-op {key}={val} must pass the scaling gate, got {other:?}"),
+            }
         }
     }
 

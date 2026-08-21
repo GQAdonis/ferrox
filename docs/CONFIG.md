@@ -84,7 +84,7 @@ takes a fallback warns once with its call site. See
 | Variable | Purpose |
 |---|---|
 | `FERROX_KERNEL_REGISTRY` | `1` — print the whole load-time kernel table (one line per backend × op × quant kind, with the tensor role and the fallback). `0` — record nothing. Default: record, print only the misses that will run off the selected accelerator |
-| `FERROX_ALLOW_UNKNOWN_TENSORS` | `1` — load a checkpoint that carries tensors this build never reads, with a warning, instead of refusing. An unread tensor is a missing term of the graph (gpt-oss attention sinks, `ffn_exp_probs_b`), so the default is refusal: a wrong answer is worse than no answer |
+| `FERROX_ALLOW_UNKNOWN_TENSORS` | `1` — load a checkpoint that carries tensors this build never reads, with a warning, instead of refusing. An unread tensor is a missing term of the graph (gpt-oss attention sinks, `exp_probs_b`), so the default is refusal: a wrong answer is worse than no answer |
 | `FERROX_ALLOW_MULTIPLE_INSTANCES` | `1` — start even though another ferrox process is already holding a model. Default is refusal: two models on one box do not share it, they thrash it, and every timing either reports becomes noise. `--allow-multiple-instances` on `ferrox` / `ferrox-server` does the same for one run |
 | `FERROX_INSTANCE_DIR` | Where the running-instance registry lives (default `$XDG_CACHE_HOME/ferrox/instances`, else `~/.cache/ferrox/instances`). One small file per live process, pruned when its pid is gone |
 | `FERROX_STRICT_KERNELS` | `1` — refuse to load a model whose weights have no kernel on the selected accelerator, instead of running it on a slower path. Set this in CI and in benchmark harnesses so a number cannot be published for a backend it was not taken on |

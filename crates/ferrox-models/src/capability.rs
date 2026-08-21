@@ -715,6 +715,64 @@ pub fn unsupported_feature_keys(arch: &str) -> Vec<(String, &'static str)> {
     ]
 }
 
+/// Scalar multipliers a checkpoint can declare in **metadata** that the
+/// generic decoder does not apply, with the value that means "no-op".
+///
+/// These are the blind spot left by
+/// [`crate::loader::assert_every_tensor_consumed`]: that gate catches a
+/// missing *tensor*, but Granite / MiniCPM / Command-R style multipliers
+/// are hparams, not weights, so a checkpoint carrying them loads
+/// cleanly, runs at full speed, and computes a graph scaled differently
+/// from the one the checkpoint was trained as. Nothing says so.
+///
+/// llama.cpp key names (`llama-arch.cpp`):
+/// `%s.logit_scale` (`LLM_KV_LOGIT_SCALE`), `%s.residual_scale`,
+/// `%s.embedding_scale`, `%s.attention.scale`. Granite reads all four
+/// (`src/models/granite.cpp::load_arch_hparams`); MiniCPM and
+/// Command-R/Cohere2 read the subset they use.
+///
+/// **This is a refusal, not an implementation.** `residual_scale` in
+/// particular multiplies the attention and FFN branch outputs before
+/// every residual add, which in ferrox means every CPU decode/prefill/
+/// multi-seq path *and* the fused Metal kernels that fold the residual
+/// in — landing it half-way would be exactly the silent divergence this
+/// list exists to stop. Until the math is there, a checkpoint that
+/// declares one of these is refused by name.
+///
+/// The no-op value differs by key: the three `*_scale` multipliers are
+/// `1.0`, while llama.cpp's `f_attention_scale` uses `0.0` as its
+/// "unset, use 1/sqrt(head_dim)" sentinel.
+pub fn unsupported_scaling_keys(arch: &str) -> Vec<(String, &'static str, f32)> {
+    let profile = resolve_profile(arch);
+    // Gemma implements its own embedding scale and attention scale.
+    if matches!(profile.map(|p| p.family), Some(DecoderFamily::GemmaFamily)) {
+        return Vec::new();
+    }
+    let key = |suffix: &str| format!("{arch}.{suffix}");
+    vec![
+        (
+            key("logit_scale"),
+            "logit multiplier (Granite / Command-R `logits_scaling`); not applied by the generic decoder",
+            1.0,
+        ),
+        (
+            key("residual_scale"),
+            "residual multiplier (Granite `residual_multiplier`); not applied by the generic decoder",
+            1.0,
+        ),
+        (
+            key("embedding_scale"),
+            "embedding multiplier (Granite / MiniCPM `embedding_multiplier`); the generic decoder only scales embeddings for the Gemma family",
+            1.0,
+        ),
+        (
+            key("attention.scale"),
+            "explicit attention score scale (Granite `attention_multiplier`); the generic decoder always uses 1/sqrt(head_dim)",
+            0.0,
+        ),
+    ]
+}
+
 /// Markdown coverage table for docs / CI drift checks.
 pub fn coverage_report_markdown() -> String {
     let mut lines = vec![

@@ -95,9 +95,20 @@ else and returns confident, wrong tokens. Three ways that happens:
    *"checkpoint carries N tensor(s) this build never reads, so its
    graph is not the one this build computes."*
    This is what catches a missing graph term by construction rather
-   than by enumeration — `attn_sinks` and `ffn_exp_probs_b` were both
+   than by enumeration — `attn_sinks` and `exp_probs_b` were both
    found this way. Tensor prefixes for parts ferrox does not claim to
    run (`mm.`, `v.`, `mmproj.`, `resampler.`, `audio.`) are ignored.
+4. **Any checkpoint declaring a scalar multiplier this build does not
+   apply.** The tensor gate above cannot see these — they are hparams,
+   not weights — so a Granite / MiniCPM / Command-R checkpoint would
+   otherwise load cleanly and compute a differently-scaled graph than it
+   was trained as. `{arch}.logit_scale`, `{arch}.residual_scale`,
+   `{arch}.embedding_scale` and `{arch}.attention.scale` are refused by
+   name unless they hold their no-op value. **This is a refusal, not an
+   implementation**: `residual_scale` multiplies both branch outputs
+   before every residual add, which in ferrox means every CPU path plus
+   the fused Metal kernels that fold the residual in, and half of that
+   would be exactly the silent divergence the gate exists to stop.
 
 `FERROX_ALLOW_UNKNOWN_TENSORS=1` loads anyway and accepts wrong output.
 It exists for debugging; it is not a workaround.

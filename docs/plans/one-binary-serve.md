@@ -15,8 +15,8 @@ todos:
     content: "`ferrox` rewrites llama.cpp-style argv before clap sees it, against a hardcoded `SUBCOMMANDS` list (crates/ferrox-cli/src/main.rs:344-361). `serve` must be added to that list or `ferrox serve -m model.gguf` will be rewritten as an implicit `run`. This is a silent failure — it would START A COMPLETION instead of a server — so it needs a test asserting `serve` survives the rewriter, in both the feature-on and feature-off builds"
     status: pending
   - id: tls-backend-cost
-    content: "Worth doing whether or not the merge lands. `aws-lc-sys` is the single most expensive thing the server drags in: C and assembly, needs a C toolchain, slow to compile. Chain: aws-lc-sys <- aws-lc-rs <- rustls <- {axum-server, tokio-rustls} and separately <- ureq. Either switch both to rustls's `ring` backend, or put TLS behind its own `tls` feature so a plain-HTTP server (the common local case) does not compile a crypto library at all. Measure the crate count and binary size before and after; do not claim an improvement without both numbers"
-    status: pending
+    content: "DONE, and it was one feature flag. `aws-lc-sys` (C + assembly) had exactly one source: axum-server's `tls-rustls`, which is defined as `[\"tls-rustls-no-provider\", \"rustls/aws-lc-rs\"]`. ureq was innocent — it already asks rustls for `ring` with default-features off — but cargo FEATURE UNIFICATION meant axum-server's choice was imposed on ureq's rustls too, which is why `cargo tree -i aws-lc-sys` listed ureq as a parent and made it look like two independent sources. Switched to `tls-rustls-no-provider` + an explicit `rustls` dep on `ring`, and `install_ring_crypto_provider()` runs unconditionally at startup because `no-provider` moves the failure to ACCEPT time. Measured on Host B: 175 -> 173 crates, release binary 14 MB -> 13 MB, aws-lc-rs/aws-lc-sys gone entirely (`cargo tree -i aws-lc-sys` now errors with no match). aws-lc-rs alone took 18.0s to compile. FOUND AND FIXED A SEPARATE PRE-EXISTING BUG while smoke-testing this: the TLS arm passed a BLOCKING `std::net::TcpListener` to `axum_server::from_tcp_rustls`, and tokio panics on registering one. TLS was therefore completely broken on main — it bound, printed its `ferrox.server.ready` line, then panicked on first accept, so it looked like a healthy start followed by a server that answered nothing. `set_nonblocking(true)` before handover. Verified end to end: `GET /health` over HTTPS returns 200 on TLS 1.3 with AEAD-CHACHA20-POLY1305, which is a ring suite and so also proves the provider is live"
+    status: completed
   - id: server-shim-crate
     content: "Keep `ferrox-server` as a published binary crate, now a thin shim over `ferrox_server::run()` — or over `ferrox-cli --features serve` — so `cargo install ferrox-server` keeps working. It went to crates.io at v0.8.0 today, and README, docs/AGENTS_COOKBOOK.md, docs/API.md, docs/CLI.md, docs/CONFIG.md, docs/MODELS.md, scripts/install.sh and all three GitHub workflows name it. Deleting it is a breaking change for every one of those; deprecate in the description and keep publishing for at least two minor versions"
     status: pending
@@ -30,8 +30,8 @@ todos:
     content: "Rewrite the install and usage surface once the shape is decided: README, docs/CLI.md (the flag list above), docs/API.md, docs/AGENTS_COOKBOOK.md, docs/CONFIG.md, crates/ferrox-cli/README.md, crates/ferrox-server/README.md. State the feature explicitly — a reader who runs `cargo install ferrox-cli` and finds no `serve` subcommand has hit exactly the confusion this plan exists to remove, and the error for the missing subcommand should say `rebuild with --features serve`, not `unrecognized subcommand`"
     status: pending
   - id: hygiene-generate-tmp
-    content: "`crates/ferrox-server/src/generate.rs.tmp` is a 7-byte stray file that is checked in and would be moved by server-lib-target. Delete it rather than carrying it across"
-    status: pending
+    content: "DONE. `crates/ferrox-server/src/generate.rs.tmp`, a 7-byte checked-in stray, deleted"
+    status: completed
 isProject: false
 ---
 

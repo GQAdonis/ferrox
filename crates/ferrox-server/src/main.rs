@@ -2582,6 +2582,23 @@ fn tokio_worker_threads() -> usize {
 /// Parses llama-server-style options and applies their environment
 /// overrides before creating Tokio or Rayon worker threads. It then
 /// brackets the async server lifecycle with journal records.
+/// Install rustls' `ring` crypto provider as the process default.
+///
+/// `axum-server` is built with `tls-rustls-no-provider`, which
+/// deliberately does NOT pick a backend -- see the comment on the
+/// dependency in `Cargo.toml`. rustls then has no default provider, and
+/// building a `ServerConfig` without one fails at ACCEPT time rather
+/// than at compile time, which is the worst place for it to surface: a
+/// server that started cleanly and refuses every TLS connection.
+///
+/// So this runs unconditionally at startup, not lazily in the TLS arm.
+/// `install_default` returns `Err` if a provider is already installed,
+/// which is not a failure -- it means something else got there first
+/// and the invariant we care about (there IS a provider) already holds.
+fn install_ring_crypto_provider() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+}
+
 fn main() -> anyhow::Result<()> {
     let args = ServerArgs::parse_from(rewrite_llama_style_argv(std::env::args().collect()));
     if args.list_devices {
@@ -3145,6 +3162,7 @@ async fn run(
     // `security::tls_paths_from_env`'s doc comment for why this can't
     // be meaningfully unit-tested here.
     let tls_paths = security::tls_paths_from_env().unwrap_or_else(|e| panic!("{e}"));
+    install_ring_crypto_provider();
     // Both arms bind first and read the address back off the socket
     // rather than trusting the requested one: with `--port 0` the
     // requested port is a lie by construction, and the ready line has
@@ -3165,6 +3183,14 @@ async fn run(
                 .parse()
                 .map_err(|e| anyhow::anyhow!("invalid FERROX_ADDR {addr:?} for TLS: {e}"))?;
             let listener = std::net::TcpListener::bind(socket_addr)?;
+            // Tokio panics outright when handed a BLOCKING socket
+            // ("Registering a blocking socket with the tokio runtime is
+            // unsupported"), and axum-server registers this one
+            // internally. Without this the TLS arm binds, prints its
+            // ready line, and then panics on the first accept -- so the
+            // failure looks like a healthy start followed by a server
+            // that answers nothing.
+            listener.set_nonblocking(true)?;
             let bound = listener.local_addr()?;
             tracing::info!("TLS enabled: ferrox-server listening on https://{bound}");
             announce_ready(bound, "https");

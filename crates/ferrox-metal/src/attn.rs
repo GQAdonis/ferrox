@@ -3305,6 +3305,17 @@ fn borrow_prefill_scratch(
     Ok(guard)
 }
 
+/// ggml sizes `rope_freqs` (`src2` in `kernel_rope_norm`) by the ROTARY
+/// width: it is indexed `[i0/2]` for `i0 < n_dims`, so it carries
+/// `n_rot/2` entries, which is narrower than `head_dim/2` under partial
+/// rotary. Checking it against the head width instead rejects every
+/// Phi-3/Phi-4 checkpoint at the door.
+fn assert_freq_factors_len(freq_factors: Option<&[f32]>, rope: MetalRope, head_dim: usize) {
+    if let Some(ff) = freq_factors {
+        assert_eq!(ff.len(), rope.rot_dim.unwrap_or(head_dim) / 2);
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn encode_rope(
     encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
@@ -4668,9 +4679,7 @@ pub fn launch_decode_attn_block(
     if kv.seq_len >= kv.capacity {
         return Err(MetalError::CommandFailed);
     }
-    if let Some(ff) = freq_factors {
-        assert_eq!(ff.len(), head_dim / 2);
-    }
+    assert_freq_factors_len(freq_factors, rope_layout, head_dim);
 
     let shared = shared_metal()?;
     let device = &shared.device;
@@ -4826,9 +4835,7 @@ pub fn launch_decode_moe_attn_ffn_pre(
     if kv.seq_len >= kv.capacity {
         return Err(MetalError::CommandFailed);
     }
-    if let Some(ff) = freq_factors {
-        assert_eq!(ff.len(), head_dim / 2);
-    }
+    assert_freq_factors_len(freq_factors, rope_layout, head_dim);
 
     let shared = shared_metal()?;
     let device = &shared.device;
@@ -5175,9 +5182,7 @@ pub fn launch_moe_decode_pre(
     if kv.seq_len >= kv.capacity {
         return Err(MetalError::CommandFailed);
     }
-    if let Some(ff) = freq_factors {
-        assert_eq!(ff.len(), head_dim / 2);
-    }
+    assert_freq_factors_len(freq_factors, rope_layout, head_dim);
 
     let shared = shared_metal()?;
     let device = &shared.device;
@@ -6356,9 +6361,7 @@ pub fn launch_decode_dense_layer(
     if kv.seq_len >= kv.capacity {
         return Err(MetalError::CommandFailed);
     }
-    if let Some(ff) = freq_factors {
-        assert_eq!(ff.len(), head_dim / 2);
-    }
+    assert_freq_factors_len(freq_factors, rope_layout, head_dim);
 
     let shared = shared_metal()?;
     let device = &shared.device;
@@ -6623,9 +6626,7 @@ pub fn launch_decode_dense_stack(
             return Err(MetalError::CommandFailed);
         }
     }
-    if let Some(ff) = freq_factors {
-        assert_eq!(ff.len(), head_dim / 2);
-    }
+    assert_freq_factors_len(freq_factors, rope_layout, head_dim);
 
     let max_q = layers.iter().map(|l| l.q.rows).max().unwrap();
     let max_kv = layers.iter().map(|l| l.k.rows).max().unwrap();
@@ -7489,9 +7490,7 @@ pub fn launch_prefill_dense_stack(
         assert_eq!(kv.head_dim, head_dim);
         assert_eq!(kv.n_kv_heads, n_kv_heads);
     }
-    if let Some(ff) = freq_factors {
-        assert_eq!(ff.len(), head_dim / 2);
-    }
+    assert_freq_factors_len(freq_factors, rope_layout, head_dim);
 
     let max_q = layers.iter().map(|l| l.q.rows).max().unwrap();
     let max_kv = layers.iter().map(|l| l.k.rows.max(l.v.rows)).max().unwrap();
@@ -7673,11 +7672,7 @@ pub fn launch_rope_heads_host(
     freq_factors: Option<&[f32]>,
 ) -> Result<(), MetalError> {
     assert_eq!(vecs.len(), n_heads * head_dim);
-    if let Some(ff) = freq_factors {
-        // ggml sizes `rope_freqs` by the ROTARY width (`n_rot/2`), which
-        // is narrower than the head under partial rotary.
-        assert_eq!(ff.len(), layout.rot_dim.unwrap_or(head_dim) / 2);
-    }
+    assert_freq_factors_len(freq_factors, layout, head_dim);
     let shared = shared_metal()?;
     let device = &shared.device;
     let buf = upload_f32(device, vecs)?;
@@ -7819,9 +7814,7 @@ pub fn launch_prefill_attn_block(
     if kv.seq_len + n_q > kv.capacity {
         return Err(MetalError::CommandFailed);
     }
-    if let Some(ff) = freq_factors {
-        assert_eq!(ff.len(), head_dim / 2);
-    }
+    assert_freq_factors_len(freq_factors, rope_layout, head_dim);
     if n_q == 0 {
         return Ok((Vec::new(), Vec::new(), Vec::new()));
     }
@@ -7962,9 +7955,7 @@ pub fn launch_prefill_attn_o_residual(
     if kv.seq_len + n_q > kv.capacity {
         return Err(MetalError::CommandFailed);
     }
-    if let Some(ff) = freq_factors {
-        assert_eq!(ff.len(), head_dim / 2);
-    }
+    assert_freq_factors_len(freq_factors, rope_layout, head_dim);
     if n_q == 0 {
         return Ok(Vec::new());
     }
@@ -8113,9 +8104,7 @@ pub fn launch_rope_heads_batch_host(
     freq_factors: Option<&[f32]>,
 ) -> Result<(), MetalError> {
     assert_eq!(vecs.len(), n_tokens * n_heads * head_dim);
-    if let Some(ff) = freq_factors {
-        assert_eq!(ff.len(), layout.rot_dim.unwrap_or(head_dim) / 2);
-    }
+    assert_freq_factors_len(freq_factors, layout, head_dim);
     if n_tokens == 0 {
         return Ok(());
     }

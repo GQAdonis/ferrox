@@ -38,6 +38,24 @@ Unsupported multimodal input is rejected the same way.
 | Other `response_format` types | **Reject** |
 | `session_id` | Ferrox extension (server-side history) |
 
+### Where a completion stops
+
+Besides `max_tokens` and the request's own `stop` strings, generation ends
+on any token in the checkpoint's **end-of-generation set**: the
+`eos`/`eot`/`eom` metadata ids plus every vocabulary entry whose text is on
+llama.cpp's literal EOG list (`<|eot_id|>`, `<end_of_turn>`, `<|im_end|>`,
+`<turn|>`, …). Stopping on `tokenizer.ggml.eos_token_id` alone — which the
+server did until `StopTokens` landed — runs a Llama-3 or gemma checkpoint
+past the end of its own turn, because neither one's turn ender *is* the
+metadata EOS. Both decode paths (`generate` and the continuous batcher)
+use the same set. A Kimi K3 checkpoint, whose vocabulary is
+`tokenizer_config.json` rather than GGUF metadata, derives the set from its
+special-token names, so `[EOT]` ends a turn there as well.
+
+BOS follows the rule in [CLI.md](CLI.md#who-adds-bos): the chat template
+owns it when it prints one, the loader otherwise, added idempotently so a
+template that already emitted BOS never gets a second one.
+
 ## Health
 
 `GET /health` returns JSON (it used to return the string `ok`) and is

@@ -91,8 +91,46 @@ not available yet).
 
 - **Default:** if the GGUF has a recognized `tokenizer.chat_template`, the user
   prompt is wrapped (ChatML / Llama 3 / Gemma / TinyLlama-style markers).
-- **`--no-cnv`:** raw prompt (classic completion), BOS still prepended when the
-  GGUF defines `bos_token_id`.
+- **`--no-cnv`:** raw prompt (classic completion). BOS is still added under the
+  same rule.
+
+### Who adds BOS
+
+**The chat template owns BOS when it prints one; the loader owns it
+otherwise.** Which of the two applies is a property of the individual
+checkpoint, not of the model family, so ferrox adds the id
+*idempotently* (`ferrox_models::tokenizer::prepend_bos`) rather than
+picking a side:
+
+- Most upstream templates open with `{{ bos_token }}` — gemma-2/3/4
+  (`<bos>`), Mistral-Instruct and Phi-3 (`<s>`), Llama-3
+  (`<|begin_of_text|>`), DeepSeek-R1-Distill. Rendering one puts BOS in the
+  *text*, and encoding splits on special-token text, so it comes back as
+  the BOS *id* in position 0.
+- Unsloth deliberately **strips** `{{ bos_token }}` from the templates it
+  bakes into its GGUF exports, so that a runtime adding BOS itself does not
+  double it. TinyLlama's checked-in template is the local example.
+
+Whether BOS is added at all is llama.cpp's `add_bos` rule
+(`tokenizer.ggml.add_bos_token` if present, else SPM → yes / BPE → no):
+Qwen2 ships a `bos_token_id` of `<|endoftext|>` that it never prepends, and
+prepending it poisons greedy decode.
+
+Measured over every local checkpoint by
+`cargo test -p ferrox-models --test bos_policy -- --ignored --nocapture`,
+which renders each GGUF's own template, encodes it with that GGUF's own
+tokenizer, and asserts at most one leading BOS id.
+
+### When generation stops
+
+On the whole end-of-generation set, not `tokenizer.ggml.eos_token_id`
+alone: the `eos`/`eot`/`eom` metadata ids plus every vocabulary entry whose
+text is on llama.cpp's literal EOG list (`<|eot_id|>`, `<end_of_turn>`,
+`<|im_end|>`, `<turn|>`, …). A Llama-3 checkpoint's `eos_token_id` is
+`<|end_of_text|>` while its turns end with `<|eot_id|>`; stopping on the
+metadata EOS alone runs the model past its own turn and it starts
+interviewing itself. `--ignore-eos` disables all of it. The same set is
+used by `ferrox-server`.
 
 ## Other commands
 

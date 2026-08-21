@@ -3352,6 +3352,44 @@ impl Decoder {
             .collect()
     }
 
+    /// [`Self::forward_batch`], but keeping the last-layer hidden states
+    /// instead of discarding them: returns `(logits, hidden)`, both one
+    /// row per input token.
+    ///
+    /// `forward_batch` computes the hidden states and throws them away.
+    /// A conditioned drafter (EAGLE, MTP, dFlash) wants exactly those
+    /// states — it predicts the next tokens from the target's own
+    /// representation of the last verified one — so speculative
+    /// decoding calls this instead and hands `hidden` to the
+    /// [`crate::speculative::Drafter`]. The only extra cost over
+    /// `forward_batch` is one copy of `[batch x hidden]`, which is
+    /// negligible next to the `[batch x hidden] x [hidden x vocab]`
+    /// projection both do; `forward_batch` keeps its move-based path so
+    /// prefill pays nothing for a feature it does not use.
+    pub fn forward_batch_with_hidden(
+        &self,
+        tokens: &[usize],
+        start_pos: usize,
+        kv_caches: &mut [KvCache],
+    ) -> (Vec<Vec<f32>>, Vec<Vec<f32>>) {
+        let hiddens = self.forward_hidden_batch(tokens, start_pos, kv_caches);
+        if hiddens.is_empty() {
+            return (Vec::new(), Vec::new());
+        }
+        let batch_size = hiddens.len();
+        let vocab_size = self.output_head.rows();
+        let flat: Vec<f32> = hiddens.iter().flatten().copied().collect();
+        let mut logits_batch = self.output_head.apply_batch(&flat, batch_size);
+        if let Some(sc) = self.config.final_logit_softcap {
+            softcap_inplace(&mut logits_batch, sc);
+        }
+        let logits = logits_batch
+            .chunks(vocab_size)
+            .map(|c| c.to_vec())
+            .collect();
+        (logits, hiddens)
+    }
+
     /// [`Self::forward_batch`] for the common case where only the final
     /// position's logits are wanted: prefill a prompt, then sample the
     /// next token. Runs `output_head` on **one** row instead of all
@@ -4592,6 +4630,51 @@ mod tests {
             logits.iter().all(|v| v.is_finite()),
             "logits must not contain NaN/Inf"
         );
+    }
+
+    #[test]
+    fn forward_batch_with_hidden_returns_exactly_both_halves() {
+        // The speculative path reads the drafter's conditioning tensor
+        // out of this call instead of paying for a second forward. It is
+        // only a saving if both halves are bit-identical to what the two
+        // separate calls produce.
+        let vocab = 10;
+        let tokens = [3usize, 1, 4, 1];
+        let decoder = Decoder::new_random_small(tiny_test_config(), 2, vocab);
+
+        let mut caches_a: Vec<KvCache> = (0..2)
+            .map(|_| KvCache::new(decoder.config.n_kv_heads, decoder.config.head_dim))
+            .collect();
+        let (logits, hidden) = decoder.forward_batch_with_hidden(&tokens, 0, &mut caches_a);
+
+        let mut caches_b: Vec<KvCache> = (0..2)
+            .map(|_| KvCache::new(decoder.config.n_kv_heads, decoder.config.head_dim))
+            .collect();
+        let want_logits = decoder.forward_batch(&tokens, 0, &mut caches_b);
+
+        let mut caches_c: Vec<KvCache> = (0..2)
+            .map(|_| KvCache::new(decoder.config.n_kv_heads, decoder.config.head_dim))
+            .collect();
+        let want_hidden = decoder.forward_hidden_batch(&tokens, 0, &mut caches_c);
+
+        assert_eq!(logits, want_logits, "logits half must match forward_batch");
+        assert_eq!(
+            hidden, want_hidden,
+            "hidden half must match forward_hidden_batch"
+        );
+        assert_eq!(hidden.len(), tokens.len());
+        assert_eq!(hidden[0].len(), decoder.config.hidden_dim);
+        assert_eq!(caches_a[0].seq_len, caches_b[0].seq_len);
+    }
+
+    #[test]
+    fn forward_batch_with_hidden_on_an_empty_batch_is_two_empty_halves() {
+        let decoder = Decoder::new_random_small(tiny_test_config(), 2, 10);
+        let mut caches: Vec<KvCache> = (0..2)
+            .map(|_| KvCache::new(decoder.config.n_kv_heads, decoder.config.head_dim))
+            .collect();
+        let (logits, hidden) = decoder.forward_batch_with_hidden(&[], 0, &mut caches);
+        assert!(logits.is_empty() && hidden.is_empty());
     }
 
     /// `gpu_vram_budget_bytes` must be a real zero-behavior-change

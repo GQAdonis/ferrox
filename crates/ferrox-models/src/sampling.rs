@@ -103,15 +103,61 @@ impl Sampler {
         history: &[usize],
         mut mask: Option<LogitMask<'_>>,
     ) -> usize {
-        if params.temperature <= 0.0 && mask.is_none() {
-            if logits.len() == 1 {
+        // A length-1 logits vector is a precomputed greedy token id, not
+        // a one-token vocabulary, so it can never go through the
+        // distribution path at temperature 0.
+        if params.temperature <= 0.0 && logits.len() == 1 {
+            if mask.is_none() {
                 return logits[0] as usize;
             }
             let mut scores = logits.to_vec();
             apply_history_penalties(&mut scores, params, history);
-            return argmax(&scores);
+            if let Some(m) = mask.as_mut() {
+                m(&mut scores);
+            }
+            return scores[0] as usize;
         }
 
+        let probs = Self::distribution_with_mask(logits, params, history, mask);
+
+        // Greedy stays literally greedy: the distribution is already a
+        // one-hot, so taking its argmax avoids consuming a random draw
+        // and keeps temperature-0 decoding bit-identical to what it was
+        // before this function had a distribution to hand out.
+        if params.temperature <= 0.0 {
+            return argmax(&probs);
+        }
+
+        self.sample_from_probs(&probs)
+    }
+
+    /// The normalised probability distribution [`Self::sample`] would
+    /// draw from, for exactly these `logits`, `params` and `history`.
+    ///
+    /// Split out of `sample` because speculative decoding needs the
+    /// target model's *distribution*, not just the token it happened to
+    /// draw: the speculative-sampling rejection rule compares
+    /// `p_target(x)` against `p_draft(x)` and, on rejection, resamples
+    /// from the normalised residual `max(0, p_target - p_draft)`. Any
+    /// divergence between this and what `sample` actually uses would
+    /// make speculative decoding silently non-lossless, so they are the
+    /// same code rather than two implementations that agree today.
+    ///
+    /// At `temperature <= 0.0` the distribution is the one-hot at the
+    /// greedy argmax, which is the honest description of what greedy
+    /// decoding samples from.
+    pub fn distribution(logits: &[f32], params: &SamplingParams, history: &[usize]) -> Vec<f32> {
+        Self::distribution_with_mask(logits, params, history, None)
+    }
+
+    /// [`Self::distribution`] with the same optional logit mask
+    /// [`Self::sample_with_mask`] applies.
+    pub fn distribution_with_mask(
+        logits: &[f32],
+        params: &SamplingParams,
+        history: &[usize],
+        mut mask: Option<LogitMask<'_>>,
+    ) -> Vec<f32> {
         let mut scores: Vec<f32> = logits.to_vec();
         apply_history_penalties(&mut scores, params, history);
 
@@ -120,10 +166,7 @@ impl Sampler {
         }
 
         if params.temperature <= 0.0 {
-            if scores.len() == 1 {
-                return scores[0] as usize;
-            }
-            return argmax(&scores);
+            return one_hot(scores.len(), argmax(&scores));
         }
 
         for s in scores.iter_mut() {
@@ -161,12 +204,18 @@ impl Sampler {
         if total <= 0.0 {
             // Every candidate got filtered to zero (degenerate params);
             // fall back to greedy rather than sampling from nothing.
-            return argmax(logits);
+            return one_hot(probs.len(), argmax(logits));
         }
         for p in probs.iter_mut() {
             *p /= total;
         }
+        probs
+    }
 
+    /// Draws one index from an already-normalised distribution.
+    /// Consumes exactly one random value, so callers that want a
+    /// reproducible stream can reason about how many draws happened.
+    pub fn sample_from_probs(&mut self, probs: &[f32]) -> usize {
         let draw = self.next_f32();
         let mut cumulative = 0.0f32;
         for (i, &p) in probs.iter().enumerate() {
@@ -186,6 +235,20 @@ impl Sampler {
             .map(|(i, _)| i)
             .unwrap_or(0)
     }
+
+    /// A uniform draw in `[0.0, 1.0)`, for callers implementing their
+    /// own Bernoulli trial (speculative decoding's accept test).
+    pub fn uniform(&mut self) -> f32 {
+        self.next_f32()
+    }
+}
+
+fn one_hot(len: usize, index: usize) -> Vec<f32> {
+    let mut probs = vec![0.0f32; len];
+    if let Some(slot) = probs.get_mut(index) {
+        *slot = 1.0;
+    }
+    probs
 }
 
 fn apply_history_penalties(scores: &mut [f32], params: &SamplingParams, history: &[usize]) {
@@ -377,5 +440,82 @@ mod tests {
         };
         let mut sampler = Sampler::new(1);
         assert_eq!(sampler.sample(&logits, &params, &[]), 1);
+    }
+
+    #[test]
+    fn the_published_distribution_is_the_one_sampling_actually_draws_from() {
+        // The whole point of exposing `distribution`: speculative
+        // decoding's accept/reject arithmetic is only lossless if the
+        // probabilities it reasons about are the ones the plain sampler
+        // would have used. Draw a lot from `sample` and check the
+        // empirical frequencies match `distribution` term by term.
+        let logits = vec![1.5f32, 0.2, -0.7, 0.9, 0.0];
+        let params = SamplingParams {
+            temperature: 0.9,
+            top_k: 4,
+            top_p: 0.95,
+            ..SamplingParams::default()
+        };
+        let expected = Sampler::distribution(&logits, &params, &[]);
+        let total: f32 = expected.iter().sum();
+        assert!(
+            (total - 1.0).abs() < 1e-5,
+            "distribution must be normalised, summed to {total}"
+        );
+
+        let trials = 60_000;
+        let mut counts = vec![0usize; logits.len()];
+        let mut sampler = Sampler::new(0xC0FFEE);
+        for _ in 0..trials {
+            counts[sampler.sample(&logits, &params, &[])] += 1;
+        }
+        for (i, &want) in expected.iter().enumerate() {
+            let got = counts[i] as f32 / trials as f32;
+            assert!(
+                (got - want).abs() < 0.01,
+                "token {i}: sampled {got:.4} but distribution says {want:.4} (counts={counts:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn top_k_filtered_tokens_have_exactly_zero_probability() {
+        // Not "small": zero. Speculative decoding divides by the draft
+        // probability, so a filtered token that kept a tiny residual
+        // mass would turn into a huge acceptance ratio.
+        let logits = vec![1.5f32, 0.2, -0.7, 0.9, 0.0];
+        let params = SamplingParams {
+            temperature: 1.0,
+            top_k: 2,
+            ..SamplingParams::default()
+        };
+        let probs = Sampler::distribution(&logits, &params, &[]);
+        // Top 2 logits are indices 0 (1.5) and 3 (0.9).
+        assert!(probs[0] > 0.0 && probs[3] > 0.0);
+        assert_eq!(probs[1], 0.0);
+        assert_eq!(probs[2], 0.0);
+        assert_eq!(probs[4], 0.0);
+        assert!((probs.iter().sum::<f32>() - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn greedy_distribution_is_the_one_hot_at_the_argmax() {
+        let logits = vec![0.1f32, 0.9, 0.3, -0.2];
+        let probs = Sampler::distribution(&logits, &SamplingParams::default(), &[]);
+        assert_eq!(probs, vec![0.0, 1.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn greedy_distribution_respects_history_penalties() {
+        // Token 1 wins on raw logits; a hard repetition penalty must
+        // move the one-hot, or greedy speculative verification would
+        // accept a token plain greedy decoding would have refused.
+        let logits = vec![0.1f32, 0.9, 0.3, -0.2];
+        let params = SamplingParams {
+            repetition_penalty: 100.0,
+            ..SamplingParams::default()
+        };
+        let probs = Sampler::distribution(&logits, &params, &[1]);
+        assert_eq!(probs, vec![0.0, 0.0, 1.0, 0.0]);
     }
 }

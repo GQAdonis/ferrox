@@ -6159,22 +6159,7 @@ pub fn launch_moe_decode_stack(
         encoder.endEncoding();
         cmd_buf.commit();
         cmd_buf.waitUntilCompleted();
-        if std::env::var_os("FERROX_METAL_GPU_TIMING").is_some() {
-            static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-            static GPU_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-            let dt = cmd_buf.GPUEndTime() - cmd_buf.GPUStartTime();
-            let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-            let acc = GPU_NS.fetch_add((dt * 1e9) as u64, std::sync::atomic::Ordering::Relaxed)
-                + (dt * 1e9) as u64;
-            if n.is_multiple_of(32) {
-                eprintln!(
-                    "ferrox: metal gpu {:.3} ms/tok avg over {} (last {:.3} ms)",
-                    (acc as f64 / n as f64) / 1e6,
-                    n,
-                    dt * 1e3
-                );
-            }
-        }
+        crate::gpu::gpu_timing_note(&cmd_buf, "moe-decode/tok", 32);
 
         for kv in kvs.iter_mut() {
             kv.seq_len = pos + 1;
@@ -6891,6 +6876,7 @@ pub fn launch_decode_dense_stack(
     encoder.endEncoding();
     cmd_buf.commit();
     cmd_buf.waitUntilCompleted();
+    crate::gpu::gpu_timing_note(&cmd_buf, "dense-decode/tok", 32);
 
     for kv in kvs.iter_mut() {
         kv.seq_len = pos + 1;
@@ -7500,6 +7486,7 @@ pub fn launch_prefill_dense_stack(
     cmd_buf.commit();
     cmd_buf.waitUntilCompleted();
     let gpu_us = t_gpu.elapsed().as_micros();
+    crate::gpu::gpu_timing_note(&cmd_buf, "prefill-dense-stack", 1);
 
     for kv in kvs.iter_mut() {
         kv.seq_len += batch;

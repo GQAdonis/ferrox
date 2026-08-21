@@ -4439,6 +4439,55 @@ pub(crate) fn mm_timing_add(setup: u128, gpu: u128, read: u128) {
     }
 }
 
+/// GPU-clock accumulators for `FERROX_METAL_GPU_TIMING`, keyed by tag.
+///
+/// Wall-clock (`FERROX_METAL_MM_TIMING`) measures how long the host waited,
+/// which on a loaded host is mostly scheduler noise. `MTLCommandBuffer`'s
+/// `GPUStartTime`/`GPUEndTime` measure the command buffer's own occupancy
+/// and stay usable while the machine is busy, so A/B evidence in
+/// `docs/plans/llama-cpp-parity-push.md` is taken from these.
+static GPU_TIMING: std::sync::Mutex<Vec<(&'static str, u64, u64)>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// True when `FERROX_METAL_GPU_TIMING` is set (cached; read once).
+pub(crate) fn gpu_timing_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FERROX_METAL_GPU_TIMING").is_some())
+}
+
+/// Accumulate one command buffer's GPU-side duration under `tag` and log a
+/// running mean every `every` submissions. No-op unless timing is enabled.
+pub(crate) fn gpu_timing_note(
+    cmd_buf: &ProtocolObject<dyn MTLCommandBuffer>,
+    tag: &'static str,
+    every: u64,
+) {
+    if !gpu_timing_enabled() {
+        return;
+    }
+    let dt_ns = ((cmd_buf.GPUEndTime() - cmd_buf.GPUStartTime()) * 1e9).max(0.0) as u64;
+    let Ok(mut slots) = GPU_TIMING.lock() else {
+        return;
+    };
+    let slot = match slots.iter_mut().find(|(t, _, _)| *t == tag) {
+        Some(s) => s,
+        None => {
+            slots.push((tag, 0, 0));
+            slots.last_mut().expect("just pushed")
+        }
+    };
+    slot.1 += 1;
+    slot.2 += dt_ns;
+    let (n, acc) = (slot.1, slot.2);
+    if n.is_multiple_of(every.max(1)) {
+        eprintln!(
+            "ferrox: metal gpu[{tag}] {:.3} ms avg over {n} (last {:.3} ms)",
+            (acc as f64 / n as f64) / 1e6,
+            dt_ns as f64 / 1e6,
+        );
+    }
+}
+
 /// Launches Q4_K multi-activation matmul (see [`Q4_K_MUL_MM_KERNEL_SRC`]).
 ///
 /// Dequant matches [`Q4_K_MATVEC_KERNEL_SRC`] /

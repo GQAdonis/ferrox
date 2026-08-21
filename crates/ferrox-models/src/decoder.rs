@@ -5414,3 +5414,73 @@ mod tests {
         );
     }
 }
+
+/// The Metal side of Phi-3/Phi-4's RoPE: partial rotary and LongRoPE's
+/// `attn_factor` used to be a refusal in `layer_supports_metal_attn`
+/// and are now two uniforms on [`ferrox_metal::attn::MetalRope`].
+#[cfg(all(test, feature = "metal"))]
+mod metal_rope_tests {
+    use super::*;
+
+    fn phi_like_config() -> ModelConfig {
+        let mut cfg = crate::config::test_dense_fixture();
+        cfg.head_dim = 128;
+        cfg.rope_layout = crate::config::RopeLayout::Neox;
+        cfg.rope_dim = Some(96);
+        cfg.rope_attn_factor = 1.1902381;
+        cfg
+    }
+
+    /// Both values must reach the kernels, and they must be the same two
+    /// the CPU path reads — otherwise the backends compute different
+    /// attention for the same weights, which is the whole reason the
+    /// model was refused Metal in the first place.
+    #[test]
+    fn metal_rope_carries_partial_rotary_and_mscale() {
+        let decoder = Decoder::new_random_small(phi_like_config(), 1, 32);
+        let rope = decoder.metal_rope();
+        assert_eq!(rope.layout, ferrox_metal::attn::MetalRopeLayout::Neox);
+        assert_eq!(rope.rot_dim, Some(96));
+        assert_eq!(rope.attn_factor, 1.1902381);
+    }
+
+    /// `rope.dimension_count == head_dim` is "the whole head rotates",
+    /// which must reach the kernel as `None` rather than as a width —
+    /// same graph, one code path.
+    #[test]
+    fn rot_dim_equal_to_head_dim_becomes_none() {
+        let mut cfg = phi_like_config();
+        cfg.rope_dim = Some(cfg.head_dim);
+        let decoder = Decoder::new_random_small(cfg, 1, 32);
+        assert_eq!(decoder.metal_rope().rot_dim, None);
+    }
+
+    /// A non-unit `attn_factor` is no longer a reason to refuse Metal;
+    /// an odd `n_rot` still is, because ggml's `ggml_rope_impl` asserts
+    /// an even width and the split-half pairing is otherwise undefined
+    /// for the last channel.
+    #[test]
+    fn odd_rot_dim_is_still_refused_but_mscale_is_not() {
+        let supported = |cfg: ModelConfig| {
+            let d = Decoder::new_random_small(cfg, 1, 32);
+            d.layer_supports_metal_attn(&d.layers[0])
+        };
+
+        // The control: with no rope oddity the fixture is admitted, so
+        // the two assertions below are about the rope config and not
+        // about the fixture failing some other check.
+        let mut plain = phi_like_config();
+        plain.rope_dim = None;
+        plain.rope_attn_factor = 1.0;
+        assert!(supported(plain), "fixture must be Metal-eligible to start");
+
+        assert!(
+            supported(phi_like_config()),
+            "partial rotary + a non-unit attn_factor must no longer refuse Metal"
+        );
+
+        let mut odd = phi_like_config();
+        odd.rope_dim = Some(95);
+        assert!(!supported(odd), "odd n_rot must keep the model off Metal");
+    }
+}

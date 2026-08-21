@@ -20,7 +20,7 @@ ledger. Add a suite entry (and a GGUF under `models/`) to measure a new model.
 |---|---|
 | SmolLM2-135M-Instruct Q8_0 | Tiny; Metal ahead of llama, CPU well behind |
 | TinyLlama-1.1B-Chat Q8_0 | Smallest verified smoke |
-| Phi-4-mini-Instruct Q4_K_M | **CPU only** since v0.5.0 — partial rotary (`n_rot` 96 of head_dim 128) and LongRoPE `attn_factor` are implemented on CPU but not in the Metal RoPE kernels, so Metal is refused rather than allowed to compute different attention. Its published Metal row predates the fix and was taken on the wrong graph |
+| Phi-4-mini-Instruct Q4_K_M | Metal restored — the RoPE kernels now carry `n_rot` (96 of head_dim 128) and LongRoPE's `attn_factor`, and `verify --backend metal` gives identical cpu/metal ids with prefill covered. The Metal rows in `benchmarks/RESULTS.md` still predate that and were taken on the wrong graph: they are **owed a re-measurement**, not to be quoted |
 | Llama-3.2-3B-Instruct Q4_K_M | Metal flagship in the suite |
 | Gemma-4-E2B-IT Q4_K_M | Dedicated engine + `gemma4` BPE |
 
@@ -49,7 +49,7 @@ noted). **Bold** = ferrox faster. Neither engine's thread count is forced.
 | Llama-3.2-1B Q4_K_M | 1.00× | — |
 | TinyLlama-1.1B Q8_0 | **0.85×** | 1.49× |
 | Llama-3.2-3B Q4_K_M | **0.96×** | — |
-| Phi-4-mini Q4_K_M | — (refused, see above) | 1.22× |
+| Phi-4-mini Q4_K_M | — (owed, see above) | 1.22× |
 | Mistral-7B-v0.2 Q4_K_M | 1.00× | 1.17× |
 | OLMoE-1B-7B Q4_0 | 1.41× | 1.50× |
 

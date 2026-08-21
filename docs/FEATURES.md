@@ -17,9 +17,11 @@ Verified against llama.cpp on the same host and GGUF via `ferrox bench`
   prefill is closed (every dense `pp512` row is 1.02–1.08×).
   **CPU decode is still behind everywhere (~1.17–2.44×), and CPU
   prefill is behind on 6 of 8 rows.**
-- **Phi-4** — CPU only. Partial rotary (`n_rot < head_dim`) and
-  LongRoPE `attn_factor` have no Metal RoPE kernel, so the Metal path is
-  refused rather than allowed to disagree with CPU.
+- **Phi-4** — CPU **and** Metal. Partial rotary (`n_rot < head_dim`) and
+  LongRoPE `attn_factor` ride the Metal RoPE kernels as `rot_dim` /
+  `mscale` uniforms, matching ggml's `rope_yarn` (the magnitude scale
+  reaches the rotated channels only). The published Metal speed rows
+  predate this and are owed a re-measurement.
 - **MoE** — OLMoE-1B-7B; still behind on Metal decode (~1.41×). (Metal Concurrent + fused encode groups +
   `MoeMemRanges` + `mul_mv_id` / prefill `mul_mm_id` + fused attn+O
   residual CB (`FERROX_METAL_PREFILL_FUSE_O=1`); CPU int-dot +

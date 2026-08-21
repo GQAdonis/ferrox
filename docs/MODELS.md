@@ -89,6 +89,14 @@ else and returns confident, wrong tokens. Three ways that happens:
 1. **Unregistered architecture** — not in the capability registry.
 2. **Registered but explicitly unsupported** — `llama4`, `minimax-m2`,
    `minimax-m3` refuse with a reason naming the missing graph feature.
+   So do the architectures whose *residual topology* differs from the
+   `x + attn(norm(x))` then `y + ffn(norm(y))` shape the generic decoder
+   computes: `command-r`, `cohere2`, `cohere2moe`, `falcon`, `gptneox`,
+   `phi2` and `plamo` feed both branches the same normed input and sum
+   once, and `minicpm` scales its embeddings, residuals and logits by
+   multipliers llama.cpp applies *even when the GGUF omits every key*.
+   None of that is visible in a tensor or (for MiniCPM) in metadata, so
+   these are refused by name rather than caught by a gate.
 3. **Any checkpoint carrying a tensor this build never reads.** The
    GGUF reader records every tensor name a loader looks up, and the
    load fails on leftovers:

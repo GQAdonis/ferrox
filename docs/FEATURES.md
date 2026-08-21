@@ -40,7 +40,14 @@ Verified against llama.cpp on the same host and GGUF via `ferrox bench`
   implemented.** `logit_scale`, `residual_scale`, `embedding_scale` and
   `attention.scale` are hparams rather than tensors, so the
   tensor-consumption gate cannot see them; a checkpoint declaring a
-  non-no-op value is refused by name.
+  non-no-op value is refused by name. `minicpm` is refused outright,
+  since llama.cpp applies its three multipliers even when the file
+  carries no key at all.
+- **Parallel-residual architectures are refused, not implemented** —
+  `command-r`, `cohere2`, `cohere2moe`, `falcon`, `gptneox`, `phi2`,
+  `plamo`. They sum `inpL + attn_out + ffn_out` once instead of taking
+  two sequential residuals, which is a different graph and is invisible
+  in the tensor list.
 
 Full matrix: [`MODELS.md`](MODELS.md) ·
 [`benchmarks/RESULTS.md`](../benchmarks/RESULTS.md) ·

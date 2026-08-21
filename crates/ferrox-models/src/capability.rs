@@ -200,11 +200,7 @@ pub fn architecture_catalog() -> &'static [ArchProfile] {
             "baichuan",
             "starcoder",
             "internlm2",
-            "minicpm",
             "xverse",
-            "command-r",
-            "cohere2",
-            "cohere2moe",
             "olmo",
             "arctic",
             "deepseek",
@@ -225,7 +221,7 @@ pub fn architecture_catalog() -> &'static [ArchProfile] {
             v.push(gqa_norm(n));
         }
         for n in [
-            "olmoe", "qwen", "qwen2", "qwen2moe", "falcon", "gptneox", "stablelm", "mistral",
+            "olmoe", "qwen", "qwen2", "qwen2moe", "stablelm", "mistral",
             "mixtral", "olmo2", "gpt2", "bloom", "mpt", "refact", "bitnet", "jais", "jais2",
             "grok", "dbrx", "exaone4", "yi",
             // llama-model.cpp `llama_model_rope_type`: LLM_ARCH_OPENAI_MOE
@@ -260,7 +256,6 @@ pub fn architecture_catalog() -> &'static [ArchProfile] {
             "nemotron",
             "openelm",
             "orion",
-            "plamo",
             "plamo3",
             "seed_oss",
             "smallthinker",
@@ -331,7 +326,68 @@ pub fn architecture_catalog() -> &'static [ArchProfile] {
                 PerHead,
             ));
         }
-        for (n, fam) in [("phi2", PhiFamily), ("phi3", PhiFamily), ("phimoe", PhiFamily)] {
+        // Refused, not implemented: the generic decoder computes
+        // `x + attn(norm(x))` then `y + ffn(norm(y))`, and every arch
+        // here computes something else that no tensor and (for MiniCPM)
+        // no metadata key makes visible. See
+        // `unsupported_scaling_keys` for the metadata-visible half of
+        // the same class.
+        const PARALLEL_RESIDUAL: &str =
+            "parallel attention+FFN residual -- llama.cpp feeds both branches the *same* \
+             normed input and sums `inpL + attn_out + ffn_out` once; the generic decoder \
+             computes the sequential form, which is a different graph";
+        for (n, rope, fam) in [
+            // src/models/cohere2.cpp:120-134, cohere2moe.cpp:222-266,
+            // command-r.cpp:106-119. All three also carry a
+            // `logit_scale` the generic decoder does not apply.
+            ("command-r", Norm, StandardGqa),
+            ("cohere2", Norm, StandardGqa),
+            ("cohere2moe", Norm, StandardGqa),
+            // src/models/falcon.cpp:121-135 (and an `attn_norm_2` the
+            // generic decoder has no slot for).
+            ("falcon", Neox, StandardGqa),
+            // src/models/gptneox.cpp:147-195 -- parallel or sequential
+            // per `use_par_res`, and the generic decoder implements
+            // neither branch of that choice.
+            ("gptneox", Neox, StandardGqa),
+            // src/models/phi2.cpp:116-117, plamo.cpp:97-112.
+            ("phi2", Neox, PhiFamily),
+            ("plamo", Neox, StandardGqa),
+        ] {
+            v.push(prof(
+                n,
+                TextGeneration,
+                fam,
+                KvGqa,
+                rope,
+                ArchPath::DedicatedOnly {
+                    reason: PARALLEL_RESIDUAL,
+                },
+                WholeVector,
+            ));
+        }
+        // MiniCPM is the case `unsupported_scaling_keys` cannot catch:
+        // `src/models/minicpm.cpp:4-14` *hardcodes* an embedding
+        // multiplier of 12.0, a residual multiplier of
+        // `1.4/sqrt(n_layer)` and a logit multiplier of `256/n_embd`,
+        // and only then lets the GGUF override them. An older MiniCPM
+        // export carrying none of the three keys is still scaled by all
+        // three, so a key-presence gate sees nothing and the generic
+        // decoder computes an unscaled graph.
+        v.push(prof(
+            "minicpm",
+            TextGeneration,
+            StandardGqa,
+            KvGqa,
+            Norm,
+            ArchPath::DedicatedOnly {
+                reason: "unconditional embedding/residual/logit multipliers that llama.cpp \
+                         applies even when the GGUF omits every key; not applied by the \
+                         generic decoder",
+            },
+            WholeVector,
+        ));
+        for (n, fam) in [("phi3", PhiFamily), ("phimoe", PhiFamily)] {
             v.push(prof(
                 n,
                 TextGeneration,
@@ -971,5 +1027,53 @@ mod tests {
     fn gemma_family_does_not_fail_closed_on_softcap_keys() {
         assert!(unsupported_feature_keys("gemma3").is_empty());
         assert!(!unsupported_feature_keys("llama").is_empty());
+    }
+
+    /// Parallel attention+FFN residual is not a tensor and, for MiniCPM,
+    /// not even a metadata key -- llama.cpp hardcodes MiniCPM's three
+    /// multipliers. Neither the tensor-consumption gate nor
+    /// `unsupported_scaling_keys` can see the difference, so these
+    /// architectures must not be admitted to the generic decoder at all.
+    #[test]
+    fn architectures_with_a_different_residual_topology_are_refused() {
+        for arch in [
+            "command-r",
+            "cohere2",
+            "cohere2moe",
+            "falcon",
+            "gptneox",
+            "phi2",
+            "plamo",
+            "minicpm",
+        ] {
+            match resolve_architecture(arch) {
+                Some(ArchPath::DedicatedOnly { reason }) => {
+                    assert!(!reason.is_empty(), "{arch} must say why");
+                }
+                other => panic!("{arch} must be refused, got {other:?}"),
+            }
+        }
+        // The sequential-residual siblings stay on the generic path --
+        // this is a named list, not a family-wide ban.
+        for arch in ["phi3", "phimoe", "plamo3", "starcoder2", "nemotron"] {
+            assert!(
+                matches!(
+                    resolve_architecture(arch),
+                    Some(ArchPath::GenericGqa { .. })
+                ),
+                "{arch} must stay generic"
+            );
+        }
+    }
+
+    /// Every architecture appears exactly once, so a refusal added next
+    /// to an existing entry cannot be shadowed by whichever the lookup
+    /// happens to find first.
+    #[test]
+    fn no_architecture_is_listed_twice() {
+        let mut seen = std::collections::HashSet::new();
+        for p in architecture_catalog() {
+            assert!(seen.insert(p.gguf_name), "{} listed twice", p.gguf_name);
+        }
     }
 }

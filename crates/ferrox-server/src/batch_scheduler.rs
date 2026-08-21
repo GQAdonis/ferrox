@@ -72,14 +72,26 @@
 //! has an exact integer answer, and an exact answer does not need a
 //! watermark, a hysteresis band, or a background pressure enforcer.
 //!
-//! Two refusals fall out of it, and they are deliberately different
-//! errors, because they send an operator to different knobs:
+//! Refusals are typed and split, because they send an operator to
+//! different knobs -- an OOM, or a single "server busy", sends them to
+//! the wrong one:
 //!
-//! - **Never fits.** `blocks_needed > blocks_total`: no amount of
-//!   waiting helps. [`DecodeError::KvBudgetExceeded`] -> 400, with the
-//!   numbers in it, refused before a queue slot is even reserved.
-//! - **Does not fit right now.** The job waits at the head of the
-//!   admission queue until enough blocks come back.
+//! - **Longer than any one request may be.** `FERROX_CB_MAX_CONTEXT`
+//!   positions, if set. `context_length_exceeded` -> 400. The
+//!   request's own size is the problem.
+//! - **Bigger than the whole KV budget.** `blocks_needed >
+//!   blocks_total`: an idle server refuses it identically.
+//!   `device_memory_budget_exceeded` -> 400.
+//! - **Does not fit right now.** Not an error at all: the job waits at
+//!   the head of the admission queue until enough blocks come back.
+//! - **Too many already waiting.** [`DecodeError::QueueFull`] -> 503
+//!   with `Retry-After`, because that one really does clear.
+//!
+//! Both 400s name `estimated_bytes` and `limit_bytes` -- the KV cost of
+//! the request and of the ceiling it hit, priced from the model's own
+//! `KvShape`, so the arithmetic is checkable rather than asserted --
+//! and carry separate counters, so "one request too big" and "too many
+//! requests" are never read as the same event.
 //!
 //! Admission is strict FIFO. A skip-ahead policy ("admit the next job
 //! that fits") raises utilization and can starve a large request
@@ -139,6 +151,7 @@ use std::thread::{self, JoinHandle};
 use ferrox_core::cache::KvCache;
 use ferrox_models::sampling::Sampler;
 use ferrox_models::Decoder;
+use ferrox_models::{Ceiling, KvElem, KvShape};
 
 use crate::generate::{DecodeError, FinishReason, GenerationParams, Usage};
 use crate::stop::{StopMatcher, StopStep};
@@ -183,6 +196,9 @@ pub struct BatcherConfig {
     /// Total KV blocks the scheduler may hand out, or `None` for no
     /// block budget (sequence count alone, the pre-budget behaviour).
     pub kv_blocks: Option<usize>,
+    /// Token positions (prompt + `max_tokens`) any single request may
+    /// ask for, or `None` for no per-request ceiling.
+    pub max_context: Option<usize>,
 }
 
 impl Default for BatcherConfig {
@@ -193,6 +209,7 @@ impl Default for BatcherConfig {
             max_queue: DEFAULT_MAX_QUEUE,
             kv_block_size: DEFAULT_KV_BLOCK_SIZE,
             kv_blocks: None,
+            max_context: None,
         }
     }
 }
@@ -205,6 +222,7 @@ impl BatcherConfig {
             max_queue: env_positive("FERROX_CB_MAX_QUEUE").unwrap_or(DEFAULT_MAX_QUEUE),
             kv_block_size: env_positive("FERROX_CB_KV_BLOCK_SIZE").unwrap_or(DEFAULT_KV_BLOCK_SIZE),
             kv_blocks: env_positive("FERROX_CB_KV_BLOCKS"),
+            max_context: env_positive("FERROX_CB_MAX_CONTEXT"),
         }
     }
 }
@@ -318,40 +336,103 @@ impl AbortInbox {
 /// gauge without taking a lock, not to make reservation concurrent.
 struct BlockBudget {
     block_size: usize,
+    /// Positions any one request may ask for, or `None`.
+    max_context: Option<usize>,
+    /// What this model's KV really costs, so a refusal can state bytes
+    /// rather than an opaque block count. Priced from the GGUF header
+    /// via `KvShape`, sliding-window cap included.
+    shape: KvShape,
     /// `None` means no block budget is configured -- every request is
     /// admissible as far as this ledger is concerned.
     total: Option<usize>,
     free: AtomicUsize,
-    /// Requests refused because they could never fit, however empty the
-    /// server got. Split from `QueueGate::rejected` on purpose: one
-    /// says "come back later", the other says "this will never work",
-    /// and an operator sent to the wrong one of those tunes the wrong
-    /// knob.
+    /// Requests refused because they exceed the whole server's KV
+    /// budget. Split from `QueueGate::rejected` on purpose: one says
+    /// "come back later", the other says "this will never work", and an
+    /// operator sent to the wrong one of those tunes the wrong knob.
     rejected_too_large: AtomicU64,
+    /// Requests refused for asking for more context than any single
+    /// request may have. Split again from the above, because the fix is
+    /// in the request rather than on the machine.
+    rejected_context_length: AtomicU64,
 }
 
 impl BlockBudget {
-    fn new(block_size: usize, total: Option<usize>) -> Self {
+    fn new(
+        block_size: usize,
+        total: Option<usize>,
+        max_context: Option<usize>,
+        shape: KvShape,
+    ) -> Self {
         assert!(block_size > 0, "kv block size must be positive");
         BlockBudget {
             block_size,
+            max_context,
+            shape,
             total,
             free: AtomicUsize::new(total.unwrap_or(0)),
             rejected_too_large: AtomicU64::new(0),
+            rejected_context_length: AtomicU64::new(0),
         }
+    }
+
+    /// Prices `positions` of context in real KV bytes, sliding-window
+    /// cap included.
+    fn bytes_for(&self, positions: usize) -> u64 {
+        self.shape.kv_bytes_for_tokens(positions)
+    }
+
+    /// The typed refusal for a request of `positions` tokens, or `None`
+    /// when no immovable ceiling binds.
+    ///
+    /// Order matters: the context ceiling is checked first because it
+    /// is the request's own size, and telling a client "the machine is
+    /// too small" when the real answer is "your prompt is too long"
+    /// sends it to a knob it does not have.
+    fn immovable_refusal(&self, positions: usize) -> Option<DecodeError> {
+        if let Some(limit) = self.max_context {
+            if positions > limit {
+                self.rejected_context_length.fetch_add(1, Ordering::Relaxed);
+                return Some(DecodeError::KvBudgetExceeded {
+                    binding: Ceiling::ContextLength.code(),
+                    estimated_bytes: self.bytes_for(positions),
+                    limit_bytes: self.bytes_for(limit),
+                    positions,
+                    positions_limit: limit,
+                    detail: format!(
+                        "request asks for {positions} token positions (prompt + max_tokens) \
+                         but this deployment admits {limit} per request; shorten the prompt \
+                         or lower max_tokens"
+                    ),
+                });
+            }
+        }
+        let total = self.total?;
+        let blocks = self.blocks_for(positions);
+        if blocks <= total {
+            return None;
+        }
+        self.rejected_too_large.fetch_add(1, Ordering::Relaxed);
+        let limit_positions = total * self.block_size;
+        Some(DecodeError::KvBudgetExceeded {
+            binding: Ceiling::DeviceMemory.code(),
+            estimated_bytes: self.bytes_for(positions),
+            limit_bytes: self.bytes_for(limit_positions),
+            positions,
+            positions_limit: limit_positions,
+            detail: format!(
+                "request needs {blocks} KV blocks ({positions} token positions at {} per \
+                 block) but this server's whole KV budget is {total} blocks; an idle server \
+                 would refuse it identically",
+                self.block_size
+            ),
+        })
     }
 
     /// Blocks a sequence of `positions` tokens occupies. At least one:
     /// even a single-token request holds a block.
     fn blocks_for(&self, positions: usize) -> usize {
         positions.div_ceil(self.block_size).max(1)
-    }
-
-    /// Whether a request of this size could *ever* be admitted. False
-    /// means no amount of waiting helps, which is a 400 rather than a
-    /// 503.
-    fn could_ever_fit(&self, blocks: usize) -> bool {
-        self.total.is_none_or(|total| blocks <= total)
     }
 
     /// Takes `blocks` if they are there. Worker thread only.
@@ -436,9 +517,12 @@ pub struct BatcherStats {
     pub kv_blocks_free: usize,
     /// Token positions per KV block.
     pub kv_block_size: usize,
-    /// Jobs refused because they could never fit the block budget.
+    /// Jobs refused because they exceed the whole KV block budget.
     /// Distinct from `queue_rejected`, which is momentary pressure.
     pub kv_rejected_too_large: u64,
+    /// Jobs refused for asking for more context than one request may
+    /// have. Distinct again: the fix is in the request, not the box.
+    pub kv_rejected_context_length: u64,
     /// Most KV blocks ever held by in-flight work at one moment,
     /// counted from the rows themselves.
     pub kv_blocks_peak: usize,
@@ -714,7 +798,14 @@ impl ContinuousBatcher {
         let (tx, rx) = mpsc::channel::<Job>();
         let counters = Arc::new(Counters::default());
         let queue = Arc::new(QueueGate::new(config.max_queue));
-        let budget = Arc::new(BlockBudget::new(config.kv_block_size, config.kv_blocks));
+        let budget = Arc::new(BlockBudget::new(
+            config.kv_block_size,
+            config.kv_blocks,
+            config.max_context,
+            // Prefill runs one token at a time here, so a sliding layer
+            // needs `window + 1 - 1` positions live: chunk = 1.
+            KvShape::from_config(&decoder.config, KvElem::F32, 1),
+        ));
         let aborts = Arc::new(AbortInbox::default());
         let worker_counters = Arc::clone(&counters);
         let worker_queue = Arc::clone(&queue);
@@ -762,6 +853,7 @@ impl ContinuousBatcher {
             kv_blocks_free: self.budget.free(),
             kv_block_size: self.budget.block_size,
             kv_rejected_too_large: self.budget.rejected_too_large.load(Ordering::Relaxed),
+            kv_rejected_context_length: self.budget.rejected_context_length.load(Ordering::Relaxed),
             kv_blocks_peak: self.counters.peak_blocks.load(Ordering::Relaxed),
             aborted: self.aborts.aborted(),
         }
@@ -777,21 +869,13 @@ impl ContinuousBatcher {
         eos_id: Option<usize>,
     ) -> Result<(FinishReason, Vec<usize>, String, Usage), DecodeError> {
         // A request that could never fit is refused first, and refused
-        // differently: queueing it would only make it wait for capacity
-        // that will never be enough. This is the "too big" half of the
-        // rejection split -- 400, not 503.
+        // with the ceiling named: queueing it would only make it wait
+        // for capacity that will never be enough. This is the
+        // immovable half of the rejection split -- 400, not 503.
         let positions = prompt_tokens.len().saturating_add(params.max_tokens);
         let blocks = self.budget.blocks_for(positions);
-        if !self.budget.could_ever_fit(blocks) {
-            self.budget
-                .rejected_too_large
-                .fetch_add(1, Ordering::Relaxed);
-            return Err(DecodeError::KvBudgetExceeded {
-                blocks_needed: blocks,
-                blocks_total: self.budget.total.unwrap_or(0),
-                block_size: self.budget.block_size,
-                positions,
-            });
+        if let Some(refusal) = self.budget.immovable_refusal(positions) {
+            return Err(refusal);
         }
         // Refuse before allocating a queue slot for the prompt, so a
         // retry storm costs a rejection rather than memory.
@@ -1604,10 +1688,19 @@ mod tests {
         assert_eq!(got[0], expected[0]);
         assert_eq!(got[1], expected[1]);
     }
+    /// The KV shape of `tiny_decoder`, for pricing a refusal in bytes.
+    fn test_shape() -> KvShape {
+        KvShape::from_config(&test_dense_fixture(), KvElem::F32, 1)
+    }
+
     /// A ledger with no budget configured, for tests that are not
     /// about admission.
     fn no_budget() -> BlockBudget {
-        BlockBudget::new(DEFAULT_KV_BLOCK_SIZE, None)
+        BlockBudget::new(DEFAULT_KV_BLOCK_SIZE, None, None, test_shape())
+    }
+
+    fn budget(block_size: usize, total: Option<usize>) -> BlockBudget {
+        BlockBudget::new(block_size, total, None, test_shape())
     }
 
     fn test_slot(max_tokens: usize, seed: u64) -> (Slot, mpsc::Receiver<JobResult>) {
@@ -1915,7 +2008,7 @@ mod tests {
 
     #[test]
     fn blocks_are_counted_in_positions_and_always_round_up() {
-        let budget = BlockBudget::new(4, Some(10));
+        let budget = budget(4, Some(10));
         // A single-token request still holds a block.
         assert_eq!(budget.blocks_for(0), 1);
         assert_eq!(budget.blocks_for(1), 1);
@@ -1928,8 +2021,8 @@ mod tests {
 
     #[test]
     fn an_unconfigured_budget_admits_everything() {
-        let budget = BlockBudget::new(4, None);
-        assert!(budget.could_ever_fit(usize::MAX));
+        let budget = budget(4, None);
+        assert!(budget.immovable_refusal(usize::MAX).is_none());
         assert!(budget.try_reserve(1_000_000));
         budget.release(1_000_000);
     }
@@ -1951,17 +2044,26 @@ mod tests {
         let err = batcher
             .generate(vec![1, 2, 3, 4, 5, 6], greedy_params(8, 1), None)
             .expect_err("14 positions cannot fit an 8-position server");
-        match err {
+        let shape = test_shape();
+        match &err {
             DecodeError::KvBudgetExceeded {
-                blocks_needed,
-                blocks_total,
-                block_size,
+                binding,
+                estimated_bytes,
+                limit_bytes,
                 positions,
+                positions_limit,
+                detail,
             } => {
-                assert_eq!(positions, 14);
-                assert_eq!(block_size, 4);
-                assert_eq!(blocks_needed, 4);
-                assert_eq!(blocks_total, 2);
+                assert_eq!(*binding, "device_memory_budget_exceeded");
+                assert_eq!(*positions, 14);
+                assert_eq!(*positions_limit, 8, "2 blocks x 4 positions");
+                // The bytes are the model's real KV cost, not a
+                // restatement of the block count: an operator has to be
+                // able to check the arithmetic against `inspect-plan`.
+                assert_eq!(*estimated_bytes, shape.kv_bytes_for_tokens(14));
+                assert_eq!(*limit_bytes, shape.kv_bytes_for_tokens(8));
+                assert!(estimated_bytes > limit_bytes);
+                assert!(detail.contains("14"), "{detail}");
             }
             other => panic!("expected KvBudgetExceeded, got {other:?}"),
         }
@@ -1970,6 +2072,10 @@ mod tests {
 
         let stats = batcher.stats();
         assert_eq!(stats.kv_rejected_too_large, 1);
+        assert_eq!(
+            stats.kv_rejected_context_length, 0,
+            "no per-request context ceiling is configured here"
+        );
         assert_eq!(
             stats.queue_rejected, 0,
             "too-big and under-pressure are different counters"
@@ -1984,6 +2090,112 @@ mod tests {
         batcher
             .generate(vec![1, 2], greedy_params(2, 1), None)
             .expect("4 positions fit");
+    }
+
+    /// The other immovable ceiling, and the reason there are two: this
+    /// request is not too big for the machine, it is too big for what
+    /// any one request is allowed to be. An operator reading
+    /// `device_memory_budget_exceeded` here would go looking for a
+    /// bigger box for a problem a shorter prompt solves.
+    ///
+    /// Confirmed to FAIL when the `max_context` branch is removed from
+    /// `immovable_refusal` (the request is admitted and runs).
+    #[test]
+    fn a_request_longer_than_the_context_ceiling_names_that_ceiling() {
+        let decoder = tiny_decoder();
+        let batcher = ContinuousBatcher::spawn_with_config(
+            Arc::clone(&decoder),
+            identity_decode(),
+            BatcherConfig {
+                prefill_chunk: 1,
+                max_context: Some(6),
+                // A generous block budget, so the *only* thing that can
+                // bind is the per-request context ceiling.
+                kv_block_size: 4,
+                kv_blocks: Some(1024),
+                ..BatcherConfig::default()
+            },
+        );
+
+        let err = batcher
+            .generate(vec![1, 2, 3, 4], greedy_params(4, 1), None)
+            .expect_err("8 positions against a 6-position ceiling");
+        let shape = test_shape();
+        match &err {
+            DecodeError::KvBudgetExceeded {
+                binding,
+                estimated_bytes,
+                limit_bytes,
+                positions,
+                positions_limit,
+                detail,
+            } => {
+                assert_eq!(*binding, "context_length_exceeded");
+                assert_eq!(*positions, 8);
+                assert_eq!(*positions_limit, 6);
+                assert_eq!(*estimated_bytes, shape.kv_bytes_for_tokens(8));
+                assert_eq!(*limit_bytes, shape.kv_bytes_for_tokens(6));
+                assert!(detail.contains("max_tokens"), "{detail}");
+            }
+            other => panic!("expected KvBudgetExceeded, got {other:?}"),
+        }
+        assert_eq!(err.retry_after_secs(), None);
+
+        let stats = batcher.stats();
+        assert_eq!(stats.kv_rejected_context_length, 1);
+        assert_eq!(
+            stats.kv_rejected_too_large, 0,
+            "the machine's budget was never the binding ceiling"
+        );
+        assert_eq!(stats.queue_rejected, 0);
+
+        // Exactly at the ceiling is admitted: the check is `>`, not
+        // `>=`, or the advertised limit would be off by one.
+        batcher
+            .generate(vec![1, 2, 3, 4], greedy_params(2, 1), None)
+            .expect("6 positions is 6 positions");
+    }
+
+    /// With both ceilings configured and both exceeded, the request's
+    /// own size is reported -- it is the one the client can act on.
+    #[test]
+    fn the_context_ceiling_is_reported_before_the_device_ceiling() {
+        let decoder = tiny_decoder();
+        let batcher = ContinuousBatcher::spawn_with_config(
+            Arc::clone(&decoder),
+            identity_decode(),
+            BatcherConfig {
+                prefill_chunk: 1,
+                max_context: Some(6),
+                kv_block_size: 4,
+                kv_blocks: Some(2),
+                ..BatcherConfig::default()
+            },
+        );
+        let err = batcher
+            .generate(vec![1, 2, 3, 4, 5, 6], greedy_params(8, 1), None)
+            .expect_err("14 positions breaks both ceilings");
+        assert!(
+            matches!(
+                &err,
+                DecodeError::KvBudgetExceeded { binding, .. }
+                    if *binding == "context_length_exceeded"
+            ),
+            "got {err:?}"
+        );
+        let stats = batcher.stats();
+        assert_eq!(stats.kv_rejected_context_length, 1);
+        assert_eq!(stats.kv_rejected_too_large, 0);
+    }
+
+    /// No ceilings configured is the default, and it must refuse
+    /// nothing.
+    #[test]
+    fn without_ceilings_nothing_is_refused_as_too_large() {
+        let budget = BlockBudget::new(4, None, None, test_shape());
+        assert!(budget.immovable_refusal(1_000_000).is_none());
+        assert_eq!(budget.rejected_too_large.load(Ordering::Relaxed), 0);
+        assert_eq!(budget.rejected_context_length.load(Ordering::Relaxed), 0);
     }
 
     /// The invariant, under real contention: however many requests are
@@ -2104,7 +2316,12 @@ mod tests {
     fn a_head_job_that_does_not_fit_holds_the_line() {
         let decoder = tiny_decoder();
         let config = budget_config(4, 4);
-        let budget = BlockBudget::new(config.kv_block_size, config.kv_blocks);
+        let budget = BlockBudget::new(
+            config.kv_block_size,
+            config.kv_blocks,
+            config.max_context,
+            test_shape(),
+        );
         let queue = QueueGate::new(config.max_queue);
         // Two blocks already out to an in-flight request.
         assert!(budget.try_reserve(2));
@@ -2178,7 +2395,12 @@ mod tests {
             max_seqs: 1,
             ..budget_config(4, 8)
         };
-        let budget = BlockBudget::new(config.kv_block_size, config.kv_blocks);
+        let budget = BlockBudget::new(
+            config.kv_block_size,
+            config.kv_blocks,
+            config.max_context,
+            test_shape(),
+        );
         let queue = QueueGate::new(config.max_queue);
         let mut waiting: VecDeque<Job> = VecDeque::new();
         // The receivers stay alive for the test: a dropped receiver
@@ -2300,7 +2522,7 @@ mod tests {
     #[test]
     fn a_cancelled_row_leaves_through_the_one_exit_every_row_uses() {
         let mut rows = Rows::default();
-        let budget = BlockBudget::new(4, Some(4));
+        let budget = budget(4, Some(4));
         assert!(budget.try_reserve(2));
 
         let (mut a, ra) = test_slot(9, 11);
@@ -2353,7 +2575,12 @@ mod tests {
         let config = budget_config(4, 4);
         let inbox = AbortInbox::default();
         let queue = QueueGate::new(config.max_queue);
-        let budget = BlockBudget::new(config.kv_block_size, config.kv_blocks);
+        let budget = BlockBudget::new(
+            config.kv_block_size,
+            config.kv_blocks,
+            config.max_context,
+            test_shape(),
+        );
         let mut carried = HashSet::new();
         let mut waiting = VecDeque::new();
         let mut prefills = VecDeque::new();
@@ -2404,7 +2631,12 @@ mod tests {
         let config = budget_config(4, 4);
         let inbox = AbortInbox::default();
         let queue = QueueGate::new(config.max_queue);
-        let budget = BlockBudget::new(config.kv_block_size, config.kv_blocks);
+        let budget = BlockBudget::new(
+            config.kv_block_size,
+            config.kv_blocks,
+            config.max_context,
+            test_shape(),
+        );
         let mut carried = HashSet::new();
         let mut waiting = VecDeque::new();
         let mut prefills = VecDeque::new();

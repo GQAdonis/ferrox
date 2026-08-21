@@ -1529,6 +1529,9 @@ async fn metrics(State(state): State<Arc<AppState>>) -> Response {
                  # HELP ferrox_kv_rejected_too_large_total Requests refused with 400 because they exceed the whole KV block budget.\n\
                  # TYPE ferrox_kv_rejected_too_large_total counter\n\
                  ferrox_kv_rejected_too_large_total {}\n\
+                 # HELP ferrox_kv_rejected_context_length_total Requests refused with 400 for exceeding the per-request context ceiling.\n\
+                 # TYPE ferrox_kv_rejected_context_length_total counter\n\
+                 ferrox_kv_rejected_context_length_total {}\n\
                  # HELP ferrox_scheduler_aborted_total Requests the batch scheduler stopped because they were cancelled.\n\
                  # TYPE ferrox_scheduler_aborted_total counter\n\
                  ferrox_scheduler_aborted_total {}\n",
@@ -1541,6 +1544,7 @@ async fn metrics(State(state): State<Arc<AppState>>) -> Response {
                 sched.kv_blocks_free,
                 sched.kv_block_size,
                 sched.kv_rejected_too_large,
+                sched.kv_rejected_context_length,
                 sched.aborted,
             )
         }
@@ -1585,6 +1589,28 @@ pub(crate) fn decode_error_response(e: generate::DecodeError) -> ApiError {
     };
     tracing::warn!("decode error: {e}");
     let mut body = serde_json::json!({"error": {"message": e.to_string()}});
+    // A refusal against a ceiling names the ceiling and both sides of
+    // the arithmetic. "Out of memory" (or a bare 400) tells a caller
+    // that something did not fit; it does not tell them whether to
+    // shorten the prompt or to run a bigger box, and those are the only
+    // two actions available.
+    if let generate::DecodeError::KvBudgetExceeded {
+        binding,
+        estimated_bytes,
+        limit_bytes,
+        positions,
+        positions_limit,
+        ..
+    } = &e
+    {
+        body["error"]["type"] = serde_json::json!("invalid_request_error");
+        body["error"]["code"] = serde_json::json!(binding);
+        body["error"]["binding"] = serde_json::json!(binding);
+        body["error"]["estimated_bytes"] = serde_json::json!(estimated_bytes);
+        body["error"]["limit_bytes"] = serde_json::json!(limit_bytes);
+        body["error"]["positions"] = serde_json::json!(positions);
+        body["error"]["positions_limit"] = serde_json::json!(positions_limit);
+    }
     // The header carries the same hint (stamped by `limits::retry_after`);
     // repeating it in the body is for clients that read JSON and never
     // look at headers, which is most of them.

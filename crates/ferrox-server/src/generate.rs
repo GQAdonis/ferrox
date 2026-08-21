@@ -28,19 +28,33 @@ pub enum DecodeError {
     /// "too many clients" from "one request too big".
     #[error("server is at capacity: {queued} requests are already queued for the batch scheduler (limit {cap}); retry shortly")]
     QueueFull { queued: usize, cap: usize },
-    /// The request needs more KV blocks than the server owns in total.
-    /// Deliberately *not* a 503: an empty server would refuse it too,
-    /// so "retry shortly" would be a lie. The numbers are in the error
-    /// because the fix is on the client's side (a shorter prompt or a
-    /// smaller `max_tokens`) or in the server's configuration
-    /// (`FERROX_CB_KV_BLOCKS`), and an operator cannot tell which
-    /// without them.
-    #[error("request needs {blocks_needed} KV blocks ({positions} token positions at {block_size} positions per block) but this server has only {blocks_total}; shorten the prompt or lower max_tokens")]
+    /// The request cannot fit a ceiling that will not move: a typed
+    /// refusal rather than an out-of-memory kill somewhere downstream.
+    ///
+    /// `binding` names *which* ceiling, because the two send an
+    /// operator to different knobs -- `context_length_exceeded` is the
+    /// request's size against what this deployment admits per request,
+    /// `device_memory_budget_exceeded` is the whole server's KV budget.
+    /// `estimated_bytes` and `limit_bytes` are the KV cost of the
+    /// request and of the ceiling, so the arithmetic is checkable
+    /// rather than asserted.
+    ///
+    /// Deliberately not a 503: an idle server refuses this identically,
+    /// so "retry shortly" would be a lie.
+    #[error("{binding}: {detail}")]
     KvBudgetExceeded {
-        blocks_needed: usize,
-        blocks_total: usize,
-        block_size: usize,
+        /// Machine-readable ceiling code from
+        /// [`ferrox_models::Ceiling::code`].
+        binding: &'static str,
+        /// KV bytes this request would cost at its full length.
+        estimated_bytes: u64,
+        /// KV bytes the binding ceiling allows.
+        limit_bytes: u64,
+        /// Token positions the request asked for (prompt + max_tokens).
         positions: usize,
+        /// Token positions the binding ceiling allows.
+        positions_limit: usize,
+        detail: String,
     },
 }
 

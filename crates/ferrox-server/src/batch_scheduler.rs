@@ -2088,7 +2088,11 @@ mod tests {
         );
 
         let err = batcher
-            .generate(vec![1, 2, 3, 4, 5, 6], greedy_params(8, 1), None)
+            .generate(
+                vec![1, 2, 3, 4, 5, 6],
+                greedy_params(8, 1),
+                StopTokens::from_eos(None),
+            )
             .expect_err("14 positions cannot fit an 8-position server");
         let shape = test_shape();
         match &err {
@@ -2134,7 +2138,7 @@ mod tests {
 
         // A request that does fit still works on the same server.
         batcher
-            .generate(vec![1, 2], greedy_params(2, 1), None)
+            .generate(vec![1, 2], greedy_params(2, 1), StopTokens::from_eos(None))
             .expect("4 positions fit");
     }
 
@@ -2164,7 +2168,11 @@ mod tests {
         );
 
         let err = batcher
-            .generate(vec![1, 2, 3, 4], greedy_params(4, 1), None)
+            .generate(
+                vec![1, 2, 3, 4],
+                greedy_params(4, 1),
+                StopTokens::from_eos(None),
+            )
             .expect_err("8 positions against a 6-position ceiling");
         let shape = test_shape();
         match &err {
@@ -2198,7 +2206,11 @@ mod tests {
         // Exactly at the ceiling is admitted: the check is `>`, not
         // `>=`, or the advertised limit would be off by one.
         batcher
-            .generate(vec![1, 2, 3, 4], greedy_params(2, 1), None)
+            .generate(
+                vec![1, 2, 3, 4],
+                greedy_params(2, 1),
+                StopTokens::from_eos(None),
+            )
             .expect("6 positions is 6 positions");
     }
 
@@ -2219,7 +2231,11 @@ mod tests {
             },
         );
         let err = batcher
-            .generate(vec![1, 2, 3, 4, 5, 6], greedy_params(8, 1), None)
+            .generate(
+                vec![1, 2, 3, 4, 5, 6],
+                greedy_params(8, 1),
+                StopTokens::from_eos(None),
+            )
             .expect_err("14 positions breaks both ceilings");
         assert!(
             matches!(
@@ -2270,7 +2286,11 @@ mod tests {
                 thread::spawn(move || {
                     start.wait();
                     batcher
-                        .generate(vec![1, 2, 3], greedy_params(5, i as u64), None)
+                        .generate(
+                            vec![1, 2, 3],
+                            greedy_params(5, i as u64),
+                            StopTokens::from_eos(None),
+                        )
                         .expect("every request fits the budget on its own")
                 })
             })
@@ -2306,7 +2326,11 @@ mod tests {
         );
         for i in 0..8 {
             batcher
-                .generate(vec![1, 2, 3], greedy_params(4, i), None)
+                .generate(
+                    vec![1, 2, 3],
+                    greedy_params(4, i),
+                    StopTokens::from_eos(None),
+                )
                 .expect("generate");
         }
         // The last reply is sent before the row is removed, so give the
@@ -2338,7 +2362,11 @@ mod tests {
             budget_config(4, 4),
         );
         assert!(matches!(
-            batcher.generate(vec![vocab + 1], greedy_params(2, 1), None),
+            batcher.generate(
+                vec![vocab + 1],
+                greedy_params(2, 1),
+                StopTokens::from_eos(None)
+            ),
             Err(DecodeError::TokenOutOfVocab { .. })
         ));
         for _ in 0..200 {
@@ -2350,7 +2378,7 @@ mod tests {
         assert_eq!(batcher.stats().kv_blocks_free, 4);
         // And the server still works afterwards.
         batcher
-            .generate(vec![1, 2], greedy_params(2, 1), None)
+            .generate(vec![1, 2], greedy_params(2, 1), StopTokens::from_eos(None))
             .expect("a bad request must not poison the budget");
     }
 
@@ -2378,7 +2406,7 @@ mod tests {
         waiting.push_back(Job {
             prompt_tokens: vec![1, 2, 3],
             params: greedy_params(2, 1),
-            eos_id: None,
+            stop_tokens: StopTokens::from_eos(None),
             reply: big_tx,
             abort: AbortId(0),
             blocks: 3,
@@ -2386,7 +2414,7 @@ mod tests {
         waiting.push_back(Job {
             prompt_tokens: vec![1],
             params: greedy_params(2, 2),
-            eos_id: None,
+            stop_tokens: StopTokens::from_eos(None),
             reply: small_tx,
             abort: AbortId(1),
             blocks: 1,
@@ -2459,7 +2487,7 @@ mod tests {
             waiting.push_back(Job {
                 prompt_tokens: vec![1, 2],
                 params: greedy_params(2, i),
-                eos_id: None,
+                stop_tokens: StopTokens::from_eos(None),
                 reply: tx,
                 abort: AbortId(i),
                 blocks: 1,
@@ -2498,7 +2526,7 @@ mod tests {
             Job {
                 prompt_tokens: prompt,
                 params: greedy_params(4, 1),
-                eos_id: None,
+                stop_tokens: StopTokens::from_eos(None),
                 reply: tx,
                 abort,
                 blocks: 1,
@@ -2527,7 +2555,9 @@ mod tests {
         let (params, token) = cancellable_params(4000, 9);
         let worker = {
             let batcher = batcher.clone();
-            thread::spawn(move || batcher.generate(vec![1, 2, 3], params, None))
+            thread::spawn(move || {
+                batcher.generate(vec![1, 2, 3], params, StopTokens::from_eos(None))
+            })
         };
 
         // Wait until it is genuinely decoding, so the cancel exercises
@@ -2740,11 +2770,15 @@ mod tests {
         let (doomed_params, token) = cancellable_params(4000, 9);
         let doomed = {
             let batcher = batcher.clone();
-            thread::spawn(move || batcher.generate(vec![1, 2, 3], doomed_params, None))
+            thread::spawn(move || {
+                batcher.generate(vec![1, 2, 3], doomed_params, StopTokens::from_eos(None))
+            })
         };
         let survivor = {
             let batcher = batcher.clone();
-            thread::spawn(move || batcher.generate(vec![4, 5], greedy_params(6, 3), None))
+            thread::spawn(move || {
+                batcher.generate(vec![4, 5], greedy_params(6, 3), StopTokens::from_eos(None))
+            })
         };
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
@@ -2800,7 +2834,7 @@ mod tests {
                     stop_token_ids: vec![stop_token],
                     ..greedy_params(8, 4)
                 },
-                None,
+                StopTokens::from_eos(None),
             )
             .expect("generate");
 
@@ -2845,7 +2879,7 @@ mod tests {
                     stop: vec![stop_str.clone()],
                     ..greedy_params(8, 4)
                 },
-                None,
+                StopTokens::from_eos(None),
             )
             .expect("generate");
 
@@ -2881,7 +2915,7 @@ mod tests {
                     stop: vec!["ZZ_NEVER_MATCHES_ZZ".to_string()],
                     ..greedy_params(8, 4)
                 },
-                None,
+                StopTokens::from_eos(None),
             )
             .expect("generate");
         assert_eq!(finish, FinishReason::Length);
@@ -2907,7 +2941,7 @@ mod tests {
         );
         let (params, _token) = cancellable_params(6, 3);
         let (finish, ids, _, _) = batcher
-            .generate(vec![4, 5], params, None)
+            .generate(vec![4, 5], params, StopTokens::from_eos(None))
             .expect("generate");
         assert_eq!(finish, FinishReason::Length);
         assert_eq!(ids, sequential_ids(&decoder, &[4, 5], &greedy_params(6, 3)));

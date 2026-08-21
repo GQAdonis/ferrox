@@ -1143,7 +1143,7 @@ mod tests {
         let (finish, ids, _) = sample_until_stop(
             first,
             0,
-            None,
+            &StopTokens::from_eos(None),
             params,
             |ids| ids.iter().copied().map(&render).collect::<String>(),
             |_tok, _pos| logits_for(take()),

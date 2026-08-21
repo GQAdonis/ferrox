@@ -67,6 +67,32 @@ jobs:
       - run: cargo build -p ferrox-metal -p ferrox-cli -p ferrox-server --features metal --verbose
       - run: cargo clippy -p ferrox-metal -p ferrox-cli -p ferrox-server --features metal -- -D warnings
 
+  # Ferrox Studio (ui/) is a standalone app: nothing it builds is
+  # committed and nothing ships inside a Rust crate, so there is no
+  # stale-artefact check to run. What CI does owe this directory is the
+  # three gates a Rust reviewer cannot run by reading the diff -- does
+  # it typecheck, does it lint, does it build -- plus the licence sweep,
+  # which is not a formality: the bundle is DISTRIBUTED, so a copyleft
+  # dependency would ship to every viewer, and ferrox is Apache-2.0.
+  ui:
+    name: ui typecheck + lint + build
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ui
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+      - run: npm ci
+      - run: npm run licenses
+      - run: npm run typecheck
+      - run: npm run lint
+      - run: npm run build
+
   clippy:
     name: cargo clippy
     runs-on: ubuntu-latest

@@ -13,7 +13,7 @@ cargo build -p ferrox-server --release --features metal
 Optional browser UI:
 
 ```bash
-./target/release/ferrox-server -m model.gguf --ui-server
+./target/release/ferrox-server -m model.gguf
 # open http://127.0.0.1:8383/ or /ui
 ```
 

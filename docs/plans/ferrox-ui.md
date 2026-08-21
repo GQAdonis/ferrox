@@ -36,19 +36,19 @@ todos:
     content: "Rolling-window rate/ETA smoothing: >=3 samples over >=3s before reporting `stable`, reset on counter regression, ETA clamped. Prevents the '123 GB/s' flash on the first tick. Reimplement from the description — the reference is AGPL. LANDED 2e8c214: `ferrox_api::progress::RateEstimator`, written from this description only. A warming report carries NO number at all rather than an untrusted one, which makes the flash structurally impossible; window trims by age and drops from the middle on overflow so a fast-ticking job still reaches `stable`; ETA needs a known total and a positive rate. CONSUMER LANDED 1a59c15: ferrox_api::TaskProgress can only be built from a RateReport, so every /admin/tasks progress block inherits the refusal by construction — verified end to end on a real 396 MB Hub download, which reported no rate for the first four seconds and then a rate and an ETA"
     status: completed
   - id: ui-frontend-chat
-    content: "Chat: streaming, markdown+code, reasoning blocks, sampling controls, model switch mid-conversation, conversation tree persisted SERVER-side (SQLite), not localStorage. LANDED 5b784fa, VERIFIED in a real browser against a real checkpoint (SmolLM2-135M-Q8_0): the screen paints, tokens stream, markdown lists render, and the stat line under the answer is the server's `usage` — TTFT, prefill tok/s and decode tok/s as three separate numbers, no client stopwatch anywhere. Untrusted text never becomes markup: md.js builds DOM nodes and returns a DocumentFragment, so there is no HTML-string stage a model's `<script>` could reach. NOT DONE and not stubbed, simply absent: reasoning blocks, math, and a model switcher inside Chat (the model id is read once from /v1/models at mount, so a swap made on the Models screen is not picked up until the screen is remounted). NOT DONE: the server-side SQLite conversation tree the plan asks for — this server has no conversation API, so the transcript lives in memory + localStorage and the screen says so on its face rather than faking a sync against endpoints that do not exist. That means no parent_id, so no edit/regenerate branching"
+    content: "Chat: streaming, markdown+code, reasoning blocks, sampling controls, model switch mid-conversation, conversation tree persisted SERVER-side (SQLite), not localStorage. REBUILT on a real component stack (React 19 + Vite + Tailwind v4 + Radix, with `@assistant-ui/react` owning the transcript, composer, autoscroll and branching) and VERIFIED in a browser against a real checkpoint: tokens stream, markdown lists and fenced code render with a copy button, and the line under each answer is the server's `usage` -- TTFT, prefill tok/s and decode tok/s as separate numbers. There is still NO client stopwatch: assistant-ui offers a `useMessageTiming()` that measures the stream in the browser and it is deliberately unused, because it cannot separate prefill from decode. Untrusted text still never becomes markup, and this was verified rather than assumed -- a seeded answer containing `<script>`, `<img onerror>` and a `javascript:` link produced zero script and img elements, no globals, and an anchor whose href react-markdown had already emptied; the literal characters showed as text. NOW DONE that was not before: a model switcher inside Chat, honest that a swap is a server-side load affecting every client rather than a per-request parameter; edit/regenerate branching, which comes with assistant-ui's message repository; prompt starters on the empty state (they fill the composer rather than auto-sending, because one click should not spend a minute of CPU decode). STILL NOT DONE and not stubbed: reasoning blocks, math, and the server-side SQLite conversation tree -- this server has no conversation API, so the transcript is assistant-ui's exported repository (messages plus parent ids, so branches survive) in localStorage, and the screen says so on its face"
     status: pending
   - id: ui-api-monitor
-    content: "API Monitor screen: ring-buffered live request log. Keep duration_ms and decode_ms SEPARATE (duration carries queue wait + prefill; conflating them reads a 50 tok/s model as 5) and flag external-vs-UI traffic. BACKEND LANDED 1a59c15: GET /admin/stats serves a 200-entry ring keyed by the request_id the response already carried, so a row joins its message by equality instead of the claiming heuristic oMLX needs. duration_ms and decode_ms are separate fields all the way to the wire, and decode_ms/ttft_ms are null rather than a copy of the total when the engine did not time itself. Recorded for /v1/chat/completions (streamed and not, including rejections), /v1/completions and /v1/messages. SCREEN LANDED 5b784fa, VERIFIED in a browser: counters plus a newest-first table with duration and decode in their own columns, never added, with the reason printed under the table; a 404 from /admin/stats renders as 'not available in this build' on this screen alone. A transient failure keeps the last good table and says the numbers are stale rather than blanking it. QUEUE GAUGE, sort of: /admin/stats now carries `generating_now` — streamed generations decoding at this instant, i.e. the ones POST /v1/cancel could stop — and the screen shows it. It is named for what it is: work in progress, NOT a queue depth, because nothing queues in front of a decode here. NOT DONE: via_api_key / external-vs-UI attribution (nothing records which key served a request); no `model` column, because the ring does not record one; /v1/embeddings, /v1/tokenize and /v1/detokenize are still not recorded"
+    content: "API Monitor screen: ring-buffered live request log. Keep duration_ms and decode_ms SEPARATE (duration carries queue wait + prefill; conflating them reads a 50 tok/s model as 5) and flag external-vs-UI traffic. BACKEND LANDED 1a59c15: GET /admin/stats serves a 200-entry ring keyed by the request_id the response already carried, so a row joins its message by equality instead of the claiming heuristic oMLX needs. duration_ms and decode_ms are separate fields all the way to the wire, and decode_ms/ttft_ms are null rather than a copy of the total when the engine did not time itself. SCREEN REBUILT on TanStack Table and VERIFIED in a browser: every column sorts, duration and decode stay in their own columns and are never added, and a new tok/s column is `completion_tokens / decode_ms` and nothing else -- dividing by duration is the exact mistake the two columns exist to prevent. Three sparklines (TTFT, decode ms, decode tok/s) are plain inline SVG with no chart library, and they DROP null samples rather than plotting them as zero, because a line that dips to the axis for an untimed request reads as `it got fast`. A 404 from /admin/stats still renders as `not available in this build` on this screen alone, and a transient failure keeps the last good table and says the numbers are stale. `generating_now` is still shown and still named for what it is: work in progress, not a queue depth. NOT DONE: via_api_key / external-vs-UI attribution; no `model` column, because the ring does not record one; /v1/embeddings, /v1/tokenize and /v1/detokenize are still not recorded"
     status: pending
   - id: ui-embed-server
-    content: "Embed the built frontend into the ferrox-server binary (rust-embed) and serve at `/` with an SPA fallback; replaces the 72-line static/ui.html stub. LANDED 4fbfe62, VERIFIED with curl against a running server: `/` and `/ui` serve the shell (200 text/html), `/ui/models` and `/models` return byte-identical shells rather than 404, `/app.js` comes back as text/javascript, and `/v1/rerank` stays a JSON 404 instead of becoming an HTML 200 a client would report as a parse error. Three rules keep the fallback honest — a real asset beats the shell, nothing under an API prefix is ever HTML, and a path whose last segment looks like a file stays a 404 (so a missing /app.css gives the missing-file error, not a MIME-type error). A test asserts the prefix list still covers routes::ALL, and it earned its keep: adding /v1/cancel was checked by it. The frontend is plain ES modules with NO npm, no bundler and no CDN — there is no frontend build step to run, deliberately, because a 60 KB app is not worth putting a second toolchain in the release path. STILL OPT-IN: the studio is registered only under --ui-server / FERROX_UI=1; without the flag the router is byte-for-byte what it was, and `/` is a 404"
+    content: "Embed the built frontend into the ferrox-server binary (rust-embed) and serve at `/` with an SPA fallback. LANDED 4fbfe62, then DELIBERATELY REVERSED: the studio is a standalone app again and ferrox-server serves the API only. `src/ui.rs`, the `static/` folder, the rust-embed dependency, `--ui-server`, `FERROX_UI` and `routes::{ROOT, UI}` are all gone, and `/` is a 404 like any other unknown path -- which is what it already was without the flag, so no reachable behaviour was removed. What the embedding bought was one binary with no JS toolchain in the release path; what it cost was a committed build output inside a published crate and a SPA fallback that had to be prevented, by rule and by test, from ever answering an API path with HTML. Neither cost is worth paying for a frontend that is a static bundle any file server can host. THE CONSEQUENCE, and it is real: two origins where there was one, so CORS now applies. `ui/`'s dev server proxies /v1, /admin, /health, /metrics and /cache to 127.0.0.1:8383, which keeps the browser on one origin in development and needs no server-side configuration at all; a deployment that serves the built bundle from elsewhere sets FERROX_CORS_ORIGINS to that exact origin, which security.rs already refuses to widen to `*`. The UI carries a base-URL setting and a bearer-key field on the Connect screen for exactly that case, because it can no longer assume the page's own origin is the API's"
     status: completed
   - id: ui-tauri-shell
     content: "Tauri 2 shell: bundles the same frontend, spawns ferrox-server as a child, targets app/dmg/deb/nsis. Backend state machine incl. `unresponsive` as distinct from `failed` — a hung server must not trigger a restart"
     status: pending
   - id: ui-settings-snippets
-    content: "Settings > Connect: copy-pasteable curl / Python-SDK / IDE snippets prefilled with the live base URL, key and loaded model. Highest-leverage screen for a server whose job is being someone's OpenAI endpoint. LANDED 5b784fa, VERIFIED in a browser: four snippets (curl streaming, the official Python OpenAI SDK, an OPENAI_BASE_URL/OPENAI_API_KEY env block, and a probe trio) each filled from window.location.origin and the model id /v1/models reports right now, each with a copy button. Nothing ships with a placeholder still in it — a snippet containing YOUR_MODEL_HERE is a snippet that gets pasted containing YOUR_MODEL_HERE. The API key is entered here, stored in localStorage and sent as an Authorization header, never in a URL. NOT DONE: per-IDE config files (docs/AGENTS_COOKBOOK.md is linked instead of emitted), and the `ferrox launch <tool>` writer the plan calls better still"
+    content: "Settings > Connect: copy-pasteable curl / Python-SDK / IDE snippets prefilled with the live base URL, key and loaded model. LANDED 5b784fa, REBUILT and re-VERIFIED in a browser: four snippets (curl streaming, the official Python OpenAI SDK, an OPENAI_BASE_URL/OPENAI_API_KEY env block, and a probe trio), each with a copy button, each filled from the model id /v1/models reports right now. The API key is entered here, stored in localStorage and sent as an Authorization header, never in a URL. CHANGED by the standalone split, and it was a real bug caught in the browser rather than in review: the snippets used to read `window.location.origin`, which is now the Vite dev server or a static host and NOT the API. A curl line saying `http://localhost:5173/v1/...` works only in the tab it was copied from, which is the same failure as shipping YOUR_MODEL_HERE. Snippets now use the configured base URL, falling back to ferrox's default bind address, and the screen states which one it used. The screen also carries the base-URL setting itself and spells out that another origin means FERROX_CORS_ORIGINS on the server. NOT DONE: per-IDE config files (docs/AGENTS_COOKBOOK.md is linked instead of emitted), and the `ferrox launch <tool>` writer the plan calls better still"
     status: completed
   - id: ui-cross-platform-truth
     content: "BLOCKING HONESTY: Windows/Linux GPU means CUDA, which the parity plan keeps only at 'must compile' — no receipts, no host pin. A desktop app shipping to Windows today is CPU-only in practice. State it, do not imply otherwise. LANDED: stated in docs/FEATURES.md beside the backend table, and /health now says the same per capability with a reason string instead of silently greying a control. Still to state on a download page if one ever ships (ui-tauri-shell)"
@@ -119,27 +119,43 @@ surface, model swap, the task contract, and everything in Phases 2 and
 3. Model swap is the gate on the whole model-manager screen and is the
 next real backend work.
 
-## Phase 2 status (2026-08-18)
+## Phase 2 status (2026-08-21)
 
 All four first-cut screens are in and were **verified in a browser
 against a real checkpoint**, not by reading the diff: the chat streams,
-the Activity table fills from `/admin/stats`, the Models inventory lists
-and loads, and the Connect snippets carry the live origin and model id.
-The frontend is plain ES modules — **no npm, no bundler, no build
-step** — embedded with `rust-embed`, so the binary is still one file.
+the Activity table fills from `/admin/stats`, the Models inventory lists,
+loads and downloads, and the Connect snippets carry the live model id.
 
-Still opt-in: the studio is registered only under `--ui-server` /
-`FERROX_UI=1`. Without the flag `/` is a 404, exactly as before.
+**The frontend moved twice, and both moves are worth stating.** The
+first cut was plain ES modules with no build step, embedded with
+`rust-embed`. It was rebuilt on React 19 + Vite + Tailwind v4 + Radix
+(the shadcn/ui foundation) with `@assistant-ui/react` owning the chat
+transcript and TanStack Table the request log — a real component stack,
+so the screens stop being a hand-rolled stylesheet's worth of work each.
+Then the embedding was **removed**: `ferrox-server` serves the API only,
+`/` is a 404, and the studio lives at `ui/` as a standalone app.
+
+That split is the interesting one. It deletes a committed build output
+inside a published crate and an SPA fallback that had to be stopped, by
+rule and by test, from answering an API path with HTML. It adds exactly
+one problem: **two origins, so CORS**. The dev server proxies every API
+prefix, which keeps the browser same-origin in development with no
+server configuration; a bundle served from elsewhere needs
+`FERROX_CORS_ORIGINS` set to that exact origin, and `*` stays refused.
 
 Real gaps, stated rather than implied away: no reasoning blocks, no
-math, no model switcher inside Chat, and no server-side conversation
-tree — the transcript is `localStorage` and the screen says so.
+math, and no server-side conversation tree — the transcript is
+`localStorage` and the screen says so. A model switcher inside Chat,
+edit/regenerate branching, sortable Activity columns and download
+progress with real cancellation are all in.
 
 ## What exists today
 
 - ~~`ferrox-server` serves `/` and `/ui` from
   `crates/ferrox-server/static/ui.html` — **72 lines**.~~ **Replaced
-  4fbfe62** by the embedded studio and its SPA fallback.
+  4fbfe62** by the embedded studio and its SPA fallback, then **removed
+  entirely**: the studio is a standalone app in `ui/` and this server
+  serves the API only.
 - Already present and reusable: `/v1/chat/completions` (SSE),
   `/v1/models`, `/v1/completions`, `/v1/embeddings`, `/v1/tokenize`,
   `/v1/detokenize`, Anthropic `/v1/messages`, `/metrics` (Prometheus —
@@ -158,14 +174,15 @@ tree — the transcript is `localStorage` and the screen says so.
 ## Architecture
 
 ```
-ferrox-server (one Rust binary)
-  ├─ /v1/*        OpenAI + Anthropic API   (exists)
-  ├─ /admin/*     control API              (new)
-  ├─ /metrics     Prometheus               (exists)
-  └─ /            embedded SPA, rust-embed (new)
+ferrox-server (one Rust binary)          ui/  (React + Vite bundle)
+  ├─ /v1/*        OpenAI + Anthropic API    Chat · Models · Activity · Connect
+  ├─ /admin/*     control API          ←──  every screen, over the public API
+  ├─ /metrics     Prometheus
+  └─ /            404 — the UI is not served from here
 
-Web     = open http://127.0.0.1:8383
-Desktop = Tauri 2 shell → bundled SPA → spawns ferrox-server as a child
+Web     = `npm run dev` (proxies the API, one origin) or any static host
+          serving `ui/dist` with FERROX_CORS_ORIGINS set to its origin
+Desktop = Tauri 2 shell → bundles the same `ui/dist` → spawns the server
 Both    = one frontend codebase, one streaming path
 ```
 
@@ -274,10 +291,13 @@ do a warmup prefill as part of `finalizing`, not as a user's first token.
 
 ## Phase 2 — the frontend
 
-Stack decision deferred to implementation, but constrained: it must build
-to static assets embeddable via `rust-embed`, and it must run under a
-CSP with no inline script (both reference apps hit this — one loads a
-theme bootstrap as an external file purely to satisfy `script-src 'self'`).
+**Stack, decided and shipped**: React 19 + Vite, Tailwind v4, Radix UI
+primitives with shadcn-style wrappers, `@assistant-ui/react` +
+`@assistant-ui/react-markdown` for the chat, TanStack Table for the
+request log, lucide-react icons. Every dependency is MIT / Apache-2.0 /
+ISC / BSD, and `npm run licenses` fails the build on anything else —
+the bundle is distributed, so a copyleft dependency is not a lockfile
+detail. It builds to static assets any file server can host.
 
 Screens, first cut:
 

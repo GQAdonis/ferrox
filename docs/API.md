@@ -10,7 +10,6 @@ Unsupported multimodal input is rejected the same way.
 | Endpoint | Status |
 |---|---|
 | `GET /health` | Supported (capability handshake, see below) |
-| `GET /` · `GET /ui` | Static chat UI (`--ui-server` or `FERROX_UI=1`) |
 | `GET /v1/models` | Supported |
 | `POST /v1/chat/completions` | Supported (JSON + SSE) |
 | `POST /v1/completions` | Supported (`prompt`, `max_tokens`, sampling subset) |

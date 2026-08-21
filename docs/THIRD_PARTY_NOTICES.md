@@ -203,6 +203,45 @@ line-for-line from candle's source, but the two algorithms and their
 real GGUF tensor mapping were confirmed via candle as the reference,
 under the same Apache-2.0 license as ferrox itself.
 
+## Ferrox Studio frontend (`ui/`)
+
+The web UI is a separate React application under [`ui/`](../ui). It is
+distributed as built JavaScript, so every dependency's licence travels
+with the bundle rather than staying a lockfile detail. **All of them are
+permissive — MIT, Apache-2.0 or ISC.** No AGPL or GPL dependency is
+permitted, and `npm run licenses` (`ui/scripts/check-licenses.mjs`)
+walks the whole installed tree on every CI run and fails the build on
+anything that is not.
+
+Runtime dependencies, which is to say the code that ends up in the
+shipped bundle:
+
+| Package | Licence |
+|---|---|
+| `react`, `react-dom` | MIT |
+| `react-router` | MIT |
+| `@assistant-ui/react`, `@assistant-ui/react-markdown`, `assistant-stream` | MIT |
+| `remark-gfm` (and the `react-markdown` / unified tree under it) | MIT |
+| `@radix-ui/react-*` (dialog, label, popover, separator, slider, slot, tabs, tooltip) | MIT |
+| `@tanstack/react-table` | MIT |
+| `tailwindcss`, `@tailwindcss/vite`, `tw-animate-css` | MIT |
+| `clsx`, `tailwind-merge` | MIT |
+| `class-variance-authority` | Apache-2.0 |
+| `lucide-react` | ISC |
+
+Build-time only (Vite, TypeScript, ESLint and their trees) is MIT and
+Apache-2.0, with two exceptions that contribute no code to the bundle
+and are allow-listed by name in the licence checker: `lightningcss`
+(MPL-2.0), Tailwind's CSS transformer, and `caniuse-lite` (CC-BY-4.0),
+a browser-support data table read during the build and discarded.
+
+No component source, stylesheet, class-name string or design-token value
+was copied from any of the products studied while designing this UI. In
+particular **Unsloth Studio is AGPL-3.0** and ferrox is Apache-2.0: it
+was read for information architecture and for which libraries a shipped
+product of this kind chooses, and nothing else. Camelid (MIT) was read
+the same way, for feature and layout ideas only.
+
 ## Design inspiration, not code reuse
 
 The following projects informed ferrox's architecture and are credited

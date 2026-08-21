@@ -72,6 +72,7 @@ OpenAI-compatible HTTP API:
 - Decoder embeddings (mean/last pool)
 - Anthropic-shaped `POST /v1/messages` (non-stream text)
 - Presence / frequency penalties, best-effort `json_object`
-- Optional web UI (`--ui-server`), continuous batching, chunked prefill
+- Web UI (Ferrox Studio, `ui/`, a separate app on the same HTTP API),
+  continuous batching, chunked prefill
 
 See [`API.md`](API.md) and [`AGENTS_COOKBOOK.md`](AGENTS_COOKBOOK.md).

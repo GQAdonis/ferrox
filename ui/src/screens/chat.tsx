@@ -10,7 +10,7 @@ import {
   type AssistantRuntime,
 } from "@assistant-ui/react";
 import * as Popover from "@radix-ui/react-popover";
-import { Link } from "react-router";
+import { Link, useOutletContext } from "react-router";
 import { Check, ChevronDown, Loader2, SlidersHorizontal, SquarePen } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Field, Input, Textarea } from "@/components/ui/field";
@@ -23,6 +23,7 @@ import {
   routes,
   type Inventory,
 } from "@/lib/api";
+import type { HealthState } from "@/lib/use-health";
 import { fmtBytes } from "@/lib/format";
 import { useLatest } from "@/lib/use-latest";
 import { cn } from "@/lib/utils";
@@ -61,8 +62,18 @@ type Loaded = {
   error: string | null;
 };
 
-/** What `/v1/models` says is serving right now. */
-function useServingModel(): [Loaded, () => void] {
+/**
+ * What `/v1/models` says is serving right now, kept current.
+ *
+ * Re-read whenever `/health` reports a different model, which the shell
+ * already polls every five seconds — so no second poller is added, and
+ * a model loaded from the Models screen (or by anything else talking to
+ * this server) un-gates the composer on its own. Reading it once at
+ * mount was survivable when the id was only a label; now that an empty
+ * one blocks Send, a stale "no model loaded" would strand the user on a
+ * server that is ready.
+ */
+function useServingModel(healthModelId: string | null): [Loaded, () => void] {
   const [state, setState] = useState<Loaded>({
     modelId: null,
     synthetic: false,
@@ -91,7 +102,7 @@ function useServingModel(): [Loaded, () => void] {
     return () => {
       cancelled = true;
     };
-  }, [nonce]);
+  }, [nonce, healthModelId]);
 
   return [state, useCallback(() => setNonce((n) => n + 1), [])];
 }
@@ -397,8 +408,11 @@ function useFerroxRuntimeContext(): AssistantRuntime {
 }
 
 export function ChatScreen() {
+  const health = useOutletContext<HealthState>();
   const [sampling, setSamplingState] = useState<Sampling>(loadSampling);
-  const [serving, refreshServing] = useServingModel();
+  const [serving, refreshServing] = useServingModel(
+    health?.health?.model?.id ?? null,
+  );
   const [stall, setStall] = useState<string | null>(null);
 
   const samplingRef = useLatest(sampling);

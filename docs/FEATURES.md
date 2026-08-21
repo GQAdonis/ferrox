@@ -58,7 +58,7 @@ Full matrix: [`MODELS.md`](MODELS.md) ·
 | Backend | Capabilities |
 |---|---|
 | **CPU** | Dense + MoE; int8×int8 matvec on by default (`FERROX_CPU_INT_DOT=0` opts out) + interleaved Q4_Kx8 / Q8_0x4 GEMV, Q8_0x4 batch GEMM for prefill, Q5/Q6 int-dot; pool sized to performance cores |
-| **Metal** | FA-vec attention (decode d=64/96/128/256, prefill d=128/256), concurrent FFN/QKV encode, MoE Concurrent + fused groups + `MemRanges` + `mul_mm_id` prefill, quantized KV (`q8_0` / `turbo8` / `fp8` / `turbo4`) |
+| **Metal** | FA-vec attention (decode d=64/96/128/256, prefill d=128/256), concurrent FFN/QKV encode, `MemRanges` hazard tracking on every dense + MoE encode pass (no blanket buffer barriers), fused RMSNorm/SwiGLU->f16, exact-tile `mul_mm_sg`, MoE Concurrent + fused groups + `mul_mm_id` prefill, quantized KV (`q8_0` / `turbo8` / `fp8` / `turbo4`) |
 | **CUDA** | Matvec, resident weights, FFN fuse (`--features cuda`) |
 
 **Platform honesty.** Every benchmarked number in this repo is CPU or

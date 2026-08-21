@@ -212,11 +212,13 @@ function Empty({ disabledReason }: { disabledReason: string | null }) {
         {disabledReason ? null : (
           <div className="flex flex-wrap justify-center gap-2">
             {STARTERS.map((prompt) => (
+              // Fills the composer rather than sending: a starter that
+              // fires a generation on one click can spend a minute of a
+              // CPU decode before the user has read what it asked.
               <ThreadPrimitive.Suggestion
                 key={prompt}
                 prompt={prompt}
                 method="replace"
-                autoSend
                 asChild
               >
                 <Button variant="default" size="sm" className="max-w-xs">

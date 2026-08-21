@@ -1,10 +1,14 @@
 // Connect: the snippets that point something else at this server.
 //
-// Everything here is filled from what is live right now — the origin
-// this page was served from and the model id `/v1/models` reports —
+// Everything here is filled from what is live right now — the model id
+// `/v1/models` reports and the base URL this app is configured with —
 // rather than from a placeholder the reader has to remember to edit.
 // A snippet with `YOUR_MODEL_HERE` in it is a snippet that gets pasted
 // with `YOUR_MODEL_HERE` still in it.
+//
+// One thing NOT taken from the live page: its own origin. Studio is a
+// separate app now, so `window.location.origin` is usually a dev server
+// or a static host, not the API. See `snippetBase()`.
 
 import { useEffect, useMemo, useState } from "react";
 import { KeyRound } from "lucide-react";
@@ -22,11 +26,12 @@ import { Page, PageHeader } from "@/components/page";
 import {
   apiBase,
   apiKey,
-  baseUrl,
+  DEFAULT_SERVER_ORIGIN,
   getJson,
   routes,
   setApiBase,
   setApiKey,
+  snippetBase,
 } from "@/lib/api";
 
 function Snippet({
@@ -62,7 +67,7 @@ export function ConnectScreen() {
   const [savedOrigin, setSavedOrigin] = useState(apiBase);
   const [modelId, setModelId] = useState<string | null>(null);
   const [status, setStatus] = useState("reading /v1/models…");
-  const base = baseUrl();
+  const base = snippetBase();
 
   useEffect(() => {
     let cancelled = false;
@@ -153,7 +158,7 @@ curl -s ${base}${routes.adminStats} | jq '.recent[-1]'`,
     <Page>
       <PageHeader
         title="Connect"
-        description="Copy-pasteable snippets, filled from the live origin and the model id this server reports right now."
+        description="Copy-pasteable snippets, filled from the base URL below and the model id this server reports right now."
       />
 
       <Card>
@@ -183,7 +188,7 @@ curl -s ${base}${routes.adminStats} | jq '.recent[-1]'`,
               hint={
                 origin
                   ? "Cross-origin: the server needs FERROX_CORS_ORIGINS set to this app's origin."
-                  : `Empty — requests go to this page's origin (${window.location.origin}), which the dev server proxies to ferrox-server.`
+                  : `Empty — this app's own requests go to ${window.location.origin} and the dev server proxies them. Snippets below assume the server is at its default ${DEFAULT_SERVER_ORIGIN}.`
               }
             >
               <Input

@@ -100,13 +100,26 @@ export function setApiKey(value: string): void {
   }
 }
 
+/** Where `ferrox-server` binds unless told otherwise. */
+export const DEFAULT_SERVER_ORIGIN = "http://127.0.0.1:8383";
+
 /**
- * The origin snippets on the Connect screen should tell a tool to use.
+ * The origin a snippet should tell some *other* tool to call.
  *
- * The configured base when there is one; otherwise this page's origin,
- * which is right in dev (the proxy is transparent) and is at worst a
- * sensible starting point the user can correct in one field.
+ * Deliberately NOT this page's origin. With the base URL unset, this
+ * app's own requests go same-origin and the dev server proxies them --
+ * which is right for the app and wrong for a snippet, because the thing
+ * pasting it is an editor on the other side of the machine, and
+ * `http://localhost:5173/v1/...` is a path only this browser can reach.
+ * A snippet that works where it was copied and nowhere else is the same
+ * failure as one that still says YOUR_MODEL_HERE.
+ *
+ * So: the configured base when there is one, and ferrox's default bind
+ * address when there is not. The Connect screen says which it used.
  */
+export const snippetBase = () => apiBase() || DEFAULT_SERVER_ORIGIN;
+
+/** The origin THIS app's own requests reach, for error messages. */
 export const baseUrl = () => apiBase() || window.location.origin;
 
 function headers(extra: Record<string, string> = {}): Record<string, string> {

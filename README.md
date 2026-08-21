@@ -63,7 +63,7 @@ use, `Q8_0` for small smokes. Good starters: `unsloth/gemma-4-E2B-it-GGUF`,
 
 ## Web UI — Ferrox Studio
 
-The UI lives in `ui/` and is a **separate app**: `ferrox-server`
+The UI lives in [`ui/`](ui/) and is a **separate app**: `ferrox-server`
 serves the API, nothing else. Run the server, then run the UI against it.
 
 ```bash

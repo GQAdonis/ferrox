@@ -23,7 +23,7 @@ Verified against llama.cpp on the same host and GGUF via `ferrox bench`
   reaches the rotated channels only). The published Metal speed rows
   predate this and are owed a re-measurement.
 - **MoE** — OLMoE-1B-7B; still behind on Metal decode (~1.41×). (Metal Concurrent + fused encode groups +
-  `MoeMemRanges` + `mul_mv_id` / prefill `mul_mm_id` + fused attn+O
+  `MemRanges` + `mul_mv_id` / prefill `mul_mm_id` + fused attn+O
   residual CB (`FERROX_METAL_PREFILL_FUSE_O=1`); CPU int-dot +
   interleaved Q4_K).
 - **MLA** — dense-lead and MoE-after-dense `deepseek2` / `mistral4`.
@@ -60,7 +60,7 @@ Full matrix: [`MODELS.md`](MODELS.md) ·
 | Backend | Capabilities |
 |---|---|
 | **CPU** | Dense + MoE; int8×int8 matvec on by default (`FERROX_CPU_INT_DOT=0` opts out) + interleaved Q4_Kx8 / Q8_0x4 GEMV, Q8_0x4 batch GEMM for prefill, Q5/Q6 int-dot; pool sized to performance cores |
-| **Metal** | FA-vec attention (decode d=64/96/128/256, prefill d=128/256), concurrent FFN/QKV encode, MoE Concurrent + fused groups + `MoeMemRanges` + `mul_mm_id` prefill, quantized KV (`q8_0` / `turbo8` / `fp8` / `turbo4`) |
+| **Metal** | FA-vec attention (decode d=64/96/128/256, prefill d=128/256), concurrent FFN/QKV encode, MoE Concurrent + fused groups + `MemRanges` + `mul_mm_id` prefill, quantized KV (`q8_0` / `turbo8` / `fp8` / `turbo4`) |
 | **CUDA** | Matvec, resident weights, FFN fuse (`--features cuda`) |
 
 **Platform honesty.** Every benchmarked number in this repo is CPU or

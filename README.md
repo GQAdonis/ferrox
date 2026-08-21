@@ -2,11 +2,10 @@
 
 <img src="docs/assets/ferrox-logo.webp" alt="Ferrox" width="220" />
 
-# Ferrox
 
-**A pure-Rust GGUF inference engine — dense and MoE, on CPU, Apple Metal, or CUDA.**
+**Ferrox: a pure-Rust GGUF inference engine — dense and MoE, on CPU, Apple Metal, or CUDA.**
 
-Every speed claim is pinned against llama.cpp on the same host, same GGUF, same backend.
+
 
 [![CI][ci-badge]][ci-workflow]
 [![Latest release][release-badge]][latest-release]

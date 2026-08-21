@@ -78,6 +78,7 @@ use cache::{CacheKey, ResponseCache};
 use ferrox_core::cache::KvBlockPool;
 use ferrox_models::kimi_tokenizer::KimiTokenizer;
 use ferrox_models::sampling::SamplingParams;
+use ferrox_models::tokenizer::StopTokens;
 use ferrox_models::{Decoder, Gemma4Engine, KimiEngine, MlaEngine, PrefixCache};
 use generate::{FinishReason, GenerationParams};
 use model::ServerTokenizer;
@@ -368,7 +369,7 @@ pub(crate) enum Model {
 pub(crate) struct GgufModel {
     decoder: Arc<Decoder>,
     tokenizer: Arc<ServerTokenizer>,
-    eos_id: Option<usize>,
+    stop_tokens: StopTokens,
     bos_id: Option<usize>,
     is_synthetic: bool,
     chat_template: chat_template::ChatTemplate,
@@ -377,14 +378,14 @@ pub(crate) struct GgufModel {
 pub(crate) struct KimiModel {
     engine: KimiEngine,
     tokenizer: KimiTokenizer,
-    eos_id: Option<usize>,
+    stop_tokens: StopTokens,
     chat_template: chat_template::ChatTemplate,
 }
 
 pub(crate) struct MlaModel {
     engine: MlaEngine,
     tokenizer: ServerTokenizer,
-    eos_id: Option<usize>,
+    stop_tokens: StopTokens,
     bos_id: Option<usize>,
     name: String,
     chat_template: chat_template::ChatTemplate,
@@ -393,7 +394,7 @@ pub(crate) struct MlaModel {
 pub(crate) struct Gemma4Model {
     engine: Gemma4Engine,
     tokenizer: ServerTokenizer,
-    eos_id: Option<usize>,
+    stop_tokens: StopTokens,
     bos_id: Option<usize>,
     name: String,
     chat_template: chat_template::ChatTemplate,
@@ -402,7 +403,7 @@ pub(crate) struct Gemma4Model {
 pub(crate) struct Glm52Model {
     engine: ferrox_models::Glm52Engine,
     tokenizer: ServerTokenizer,
-    eos_id: Option<usize>,
+    stop_tokens: StopTokens,
     bos_id: Option<usize>,
     name: String,
     chat_template: chat_template::ChatTemplate,
@@ -1592,13 +1593,9 @@ fn run_generation_emit(
         Model::Gguf(m) => {
             if let Some(batcher) = continuous_batcher {
                 let mut tokens = m.tokenizer.encode(prompt);
-                if let Some(bos) = m.bos_id {
-                    if tokens.first() != Some(&bos) {
-                        tokens.insert(0, bos);
-                    }
-                }
+                ferrox_models::tokenizer::prepend_bos(&mut tokens, m.bos_id);
                 let (finish, _generated_ids, text, usage) =
-                    batcher.generate(tokens, params.clone(), m.eos_id)?;
+                    batcher.generate(tokens, params.clone(), m.stop_tokens.clone())?;
                 if !text.is_empty() {
                     chunks.push(text);
                 }
@@ -1607,7 +1604,7 @@ fn run_generation_emit(
                 generate::generate(
                     &m.decoder,
                     m.tokenizer.as_ref(),
-                    m.eos_id,
+                    &m.stop_tokens,
                     m.bos_id,
                     prompt,
                     params,
@@ -1625,7 +1622,7 @@ fn run_generation_emit(
         Model::Kimi(m) => generate::generate_engine(
             &m.engine,
             &m.tokenizer,
-            m.eos_id,
+            &m.stop_tokens,
             None,
             prompt,
             params,
@@ -1639,7 +1636,7 @@ fn run_generation_emit(
         Model::Mla(m) => generate::generate_engine(
             &m.engine,
             &m.tokenizer,
-            m.eos_id,
+            &m.stop_tokens,
             m.bos_id,
             prompt,
             params,
@@ -1653,7 +1650,7 @@ fn run_generation_emit(
         Model::Gemma4(m) => generate::generate_engine(
             &m.engine,
             &m.tokenizer,
-            m.eos_id,
+            &m.stop_tokens,
             m.bos_id,
             prompt,
             params,
@@ -1667,7 +1664,7 @@ fn run_generation_emit(
         Model::Glm52(m) => generate::generate_engine(
             &m.engine,
             &m.tokenizer,
-            m.eos_id,
+            &m.stop_tokens,
             m.bos_id,
             prompt,
             params,
@@ -2379,7 +2376,7 @@ pub(crate) fn activate_loaded_model(
                 Model::Gguf(GgufModel {
                     decoder,
                     tokenizer,
-                    eos_id: g.eos_id,
+                    stop_tokens: g.stop_tokens,
                     bos_id: g.bos_id,
                     is_synthetic: g.is_synthetic,
                     chat_template: g.chat_template,
@@ -2391,7 +2388,7 @@ pub(crate) fn activate_loaded_model(
             Model::Kimi(KimiModel {
                 engine: k.engine,
                 tokenizer: k.tokenizer,
-                eos_id: k.eos_id,
+                stop_tokens: k.stop_tokens,
                 chat_template: k.chat_template,
             }),
             None,
@@ -2400,7 +2397,7 @@ pub(crate) fn activate_loaded_model(
             Model::Mla(MlaModel {
                 engine: m.engine,
                 tokenizer: m.tokenizer,
-                eos_id: m.eos_id,
+                stop_tokens: m.stop_tokens,
                 bos_id: m.bos_id,
                 name: m.name,
                 chat_template: m.chat_template,
@@ -2411,7 +2408,7 @@ pub(crate) fn activate_loaded_model(
             Model::Gemma4(Gemma4Model {
                 engine: m.engine,
                 tokenizer: m.tokenizer,
-                eos_id: m.eos_id,
+                stop_tokens: m.stop_tokens,
                 bos_id: m.bos_id,
                 name: m.name,
                 chat_template: m.chat_template,
@@ -2422,7 +2419,7 @@ pub(crate) fn activate_loaded_model(
             Model::Glm52(Glm52Model {
                 engine: g.engine,
                 tokenizer: g.tokenizer,
-                eos_id: g.eos_id,
+                stop_tokens: g.stop_tokens,
                 bos_id: g.bos_id,
                 name: g.name,
                 chat_template: g.chat_template,
@@ -3285,7 +3282,7 @@ mod tests {
         Model::Gguf(GgufModel {
             decoder: Arc::new(Decoder::new_random_small(cfg, 2, 32)),
             tokenizer: Arc::new(ServerTokenizer::Byte),
-            eos_id: None,
+            stop_tokens: StopTokens::default(),
             bos_id: None,
             is_synthetic: true,
             chat_template: chat_template::ChatTemplate::Plain,
@@ -3312,7 +3309,7 @@ mod tests {
         Model::Gguf(GgufModel {
             decoder: Arc::new(Decoder::new_random_small(cfg, 2, 256)),
             tokenizer: Arc::new(ServerTokenizer::Byte),
-            eos_id: None,
+            stop_tokens: StopTokens::default(),
             bos_id: None,
             is_synthetic: true,
             chat_template: chat_template::ChatTemplate::Plain,
@@ -3393,7 +3390,7 @@ mod tests {
         Model::Gguf(GgufModel {
             decoder: Arc::new(Decoder::new_random_small(cfg, 2, 256)),
             tokenizer: Arc::new(ServerTokenizer::Byte),
-            eos_id: None,
+            stop_tokens: StopTokens::default(),
             bos_id: None,
             is_synthetic: true,
             chat_template: chat_template::ChatTemplate::Plain,
@@ -3776,7 +3773,7 @@ mod tests {
         let model = Model::Gguf(GgufModel {
             decoder: Arc::new(decoder),
             tokenizer: Arc::new(ServerTokenizer::Byte),
-            eos_id: None,
+            stop_tokens: StopTokens::default(),
             bos_id: None,
             is_synthetic: false,
             chat_template: chat_template::ChatTemplate::Plain,

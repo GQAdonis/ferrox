@@ -31,7 +31,7 @@ curl -fsSL https://raw.githubusercontent.com/antonellof/ferrox/main/scripts/inst
 ```
 
 Installs `ferrox` and `ferrox-server` into `~/.local/bin` (override with
-`FERROX_INSTALL_DIR`, pin with `FERROX_VERSION=v0.8.0`). Prebuilts:
+`FERROX_INSTALL_DIR`, pin with `FERROX_VERSION=v0.9.0`). Prebuilts:
 macOS arm64 (Metal) and Linux x86_64 (CPU).
 
 Or from crates.io / source:
@@ -133,7 +133,7 @@ re-exports the whole workspace:
 
 ```toml
 [dependencies]
-ferrox-inference = "0.8"
+ferrox-inference = "0.9"
 ```
 
 ```rust

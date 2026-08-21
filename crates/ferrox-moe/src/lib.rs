@@ -66,6 +66,17 @@ pub struct MoeLayerConfig {
     /// selected at load time; the hot path reads these fields as data.
     pub expert_group_count: Option<usize>,
     pub expert_group_used_count: Option<usize>,
+    /// llama.cpp's `expert_weights_scale` hparam (GGUF
+    /// `{arch}.expert_weights_scale`, `LLM_KV_EXPERT_WEIGHTS_SCALE`): a
+    /// constant every routed expert's combine weight is multiplied by
+    /// *after* the optional top-k renormalisation
+    /// (`build_moe_ffn`: `weights = ggml_scale(ctx0, weights, w_scale)`).
+    /// `1.0` when the checkpoint does not carry the key, which is a real
+    /// no-op rather than a guess -- llama.cpp skips the scale for both
+    /// `0.0` and `1.0`. DeepSeek-V3-lineage MoE recipes (dots1,
+    /// bailingmoe2, hunyuan-moe, …) set it to values like 2.5, and
+    /// ignoring it scales every routed contribution wrong.
+    pub expert_weights_scale: f32,
 }
 
 /// Router output for one token: which experts fire, and their
@@ -147,6 +158,83 @@ pub fn route_top_k(
         GatingFunction::Softmax => route_top_k_softmax(logits, k, norm_topk_prob),
         GatingFunction::Sigmoid => route_top_k_sigmoid(logits, k),
         GatingFunction::SqrtSoftplus => route_top_k_sqrtsoftplus(logits, k, norm_topk_prob),
+    }
+}
+
+/// llama.cpp's `build_moe_ffn` selection, with the DeepSeek-V3
+/// aux-loss-free bias applied to the **selection score only**.
+///
+/// Port of `llm_graph_context::build_moe_ffn` (`src/llama-graph.cpp`),
+/// which is where every architecture carrying `exp_probs_b` routes:
+///
+/// 1. `probs = gating(logits)`;
+/// 2. `selection_probs = probs + exp_probs_b` -- the comment in the
+///    reference reads "leave probs unbiased as it's later used to get
+///    expert weights", which is the whole point: the bias steers *which*
+///    experts fire, never *how much* each one counts;
+/// 3. top-k over `selection_probs`, weights gathered from `probs`;
+/// 4. optional renormalisation of the selected weights (`norm_w`,
+///    i.e. `{arch}.expert_weights_norm`);
+/// 5. optional constant scale (`w_scale`,
+///    i.e. `{arch}.expert_weights_scale`).
+///
+/// With `bias = None` this is the unbiased routing plus the scale, so a
+/// caller does not need a second code path for layers that happen not to
+/// carry the tensor.
+pub fn route_top_k_biased(
+    logits: &[f32],
+    bias: Option<&[f32]>,
+    k: usize,
+    gating: GatingFunction,
+    norm_w: bool,
+    w_scale: f32,
+) -> RoutingDecision {
+    let probs: Vec<f32> = match gating {
+        GatingFunction::Softmax => {
+            let max = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let exps: Vec<f32> = logits.iter().map(|&l| (l - max).exp()).collect();
+            let sum: f32 = exps.iter().sum();
+            exps.iter().map(|e| e / sum).collect()
+        }
+        GatingFunction::Sigmoid => logits.iter().map(|&l| sigmoid(l)).collect(),
+        GatingFunction::SqrtSoftplus => logits.iter().map(|&l| sqrt_softplus(l)).collect(),
+    };
+
+    let selection: Vec<f32> = match bias {
+        Some(b) => {
+            assert_eq!(
+                b.len(),
+                probs.len(),
+                "exp_probs_b must have one entry per expert"
+            );
+            probs.iter().zip(b.iter()).map(|(p, b)| p + b).collect()
+        }
+        None => probs.clone(),
+    };
+
+    let mut idx: Vec<usize> = (0..selection.len()).collect();
+    idx.sort_unstable_by(|&a, &b| selection[b].partial_cmp(&selection[a]).unwrap());
+    let top = &idx[..k.min(idx.len())];
+
+    let mut weights: Vec<f32> = top.iter().map(|&i| probs[i]).collect();
+    if norm_w {
+        // ggml clamps the divisor to the smallest normal f16 rather than
+        // testing for zero (`ggml_clamp(..., 6.103515625e-5, INFINITY)`),
+        // so a degenerate all-zero row yields zeros, not a uniform split.
+        let sum = weights.iter().sum::<f32>().max(6.103_515_6e-5);
+        for w in weights.iter_mut() {
+            *w /= sum;
+        }
+    }
+    if w_scale != 0.0 && w_scale != 1.0 {
+        for w in weights.iter_mut() {
+            *w *= w_scale;
+        }
+    }
+
+    RoutingDecision {
+        expert_ids: top.to_vec(),
+        weights,
     }
 }
 

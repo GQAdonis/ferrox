@@ -413,6 +413,7 @@ pub fn glm_5_2() -> ModelConfig {
         rope_theta: 1_000_000.0,
         rms_norm_eps: 1e-5,
         moe: MoeLayerConfig {
+            expert_weights_scale: 1.0,
             n_experts: 256,
             n_experts_active: 8,
             n_shared_experts: 1,
@@ -484,6 +485,7 @@ pub fn deepseek_v4_pro() -> ModelConfig {
         rope_theta: 1_000_000.0,
         rms_norm_eps: 1e-6,
         moe: MoeLayerConfig {
+            expert_weights_scale: 1.0,
             n_experts: 385,
             n_experts_active: 6,
             n_shared_experts: 1,
@@ -569,6 +571,7 @@ pub fn kimi_k3() -> ModelConfig {
         rope_theta: 1_000_000.0,
         rms_norm_eps: 1e-5,
         moe: MoeLayerConfig {
+            expert_weights_scale: 1.0,
             n_experts: 896,
             n_experts_active: 16,
             n_shared_experts: 2,
@@ -665,6 +668,7 @@ pub fn test_dense_fixture() -> ModelConfig {
         rope_theta: 10000.0,
         rms_norm_eps: 1e-5,
         moe: MoeLayerConfig {
+            expert_weights_scale: 1.0,
             n_experts: 1,
             n_experts_active: 1,
             n_shared_experts: 0,
@@ -716,6 +720,7 @@ pub fn test_moe_fixture() -> ModelConfig {
         rope_theta: 10000.0,
         rms_norm_eps: 1e-5,
         moe: MoeLayerConfig {
+            expert_weights_scale: 1.0,
             n_experts: 4,
             n_experts_active: 2,
             n_shared_experts: 1,
@@ -769,6 +774,7 @@ pub fn test_mixed_fixture() -> ModelConfig {
         rope_theta: 10000.0,
         rms_norm_eps: 1e-5,
         moe: MoeLayerConfig {
+            expert_weights_scale: 1.0,
             n_experts: 3,
             n_experts_active: 1,
             n_shared_experts: 1,

@@ -332,15 +332,33 @@ impl ModelConfig {
             }
         };
 
-        // See `NO_TOPK_RENORMALIZE_ARCHITECTURES`'s doc comment: no GGUF
-        // metadata key exists for this, so it's an architecture-name
-        // lookup, the same convention `gating`'s fallback above uses.
-        let norm_topk_prob = !NO_TOPK_RENORMALIZE_ARCHITECTURES.contains(&arch.as_str());
-        if is_moe && matches!(gating, GatingFunction::Softmax) {
-            best_effort_fields.push(
-                "moe.norm_topk_prob (no GGUF metadata key exists for this; defaulted by architecture-name lookup against NO_TOPK_RENORMALIZE_ARCHITECTURES)",
-            );
-        }
+        // `{arch}.expert_weights_norm` (llama.cpp
+        // `LLM_KV_EXPERT_WEIGHTS_NORM`) is the real metadata key for
+        // whether the selected experts' weights are renormalised. Most
+        // checkpoints do not carry it, which is why the fallback below
+        // exists at all -- but when one does, the file's own answer wins
+        // over an architecture-name guess.
+        let norm_topk_prob = match file.metadata_bool(&key("expert_weights_norm")) {
+            Some(v) => v,
+            None => {
+                // See `NO_TOPK_RENORMALIZE_ARCHITECTURES`'s doc comment:
+                // an architecture-name lookup, the same convention
+                // `gating`'s fallback above uses.
+                if is_moe && matches!(gating, GatingFunction::Softmax) {
+                    best_effort_fields.push(
+                        "moe.norm_topk_prob (no expert_weights_norm key; defaulted by architecture-name lookup against NO_TOPK_RENORMALIZE_ARCHITECTURES)",
+                    );
+                }
+                !NO_TOPK_RENORMALIZE_ARCHITECTURES.contains(&arch.as_str())
+            }
+        };
+
+        // `{arch}.expert_weights_scale` (`LLM_KV_EXPERT_WEIGHTS_SCALE`).
+        // llama.cpp's `build_moe_ffn` skips the multiply for both 0.0 and
+        // 1.0, so both mean "no scaling" and both land on 1.0 here.
+        let expert_weights_scale = metadata_f32_any(file, &[key("expert_weights_scale")])
+            .filter(|s| *s != 0.0)
+            .unwrap_or(1.0);
 
         // Real GGUF key (`{arch}.attention.sliding_window`, confirmed
         // against `gguf-py/gguf/constants.py`'s real
@@ -537,6 +555,7 @@ impl ModelConfig {
                 expert_group_used_count: metadata_u64_any(file, &[key("expert_group_used_count")])
                     .map(|v| v as usize)
                     .filter(|&c| c > 0),
+                expert_weights_scale,
             },
             n_dense_leading_layers,
             rope_freqs,
@@ -1643,11 +1662,54 @@ impl Decoder {
                 ExpertBacking::Resident(v) if !v.is_empty() => try_build_moe_packed_q4_planes(v),
                 _ => None,
             };
+            // DeepSeek-V3's aux-loss-free selection bias. The on-disk
+            // name carries no `ffn_` prefix -- llama.cpp's
+            // `LLM_TENSOR_FFN_EXP_PROBS_B` maps to `blk.%d.exp_probs_b`
+            // (`llama-arch.cpp:416`, `gguf-py/gguf/constants.py:1240`).
+            // Optional: only the DeepSeek-V3-lineage MoE recipes carry
+            // it, and this same generic loader serves OLMoE / Qwen2-MoE /
+            // Mixtral, which do not.
+            let exp_probs_bias = if is_dense_layer {
+                None
+            } else {
+                load_f32_vec_optional(&file, &format!("blk.{l}.exp_probs_b.bias"))?
+            };
+            if let Some(bias) = &exp_probs_bias {
+                if bias.len() != config.moe.n_experts {
+                    return Err(LoadError::UnsupportedFeature(
+                        arch.clone(),
+                        format!(
+                            "blk.{l}.exp_probs_b.bias has {} entries but the model has {} experts",
+                            bias.len(),
+                            config.moe.n_experts
+                        ),
+                    ));
+                }
+                // Grouped selection masks the *biased* scores before the
+                // global top-k (`build_moe_ffn`, the `n_expert_groups > 1`
+                // block). ferrox's `route_top_k_grouped` takes a fixed
+                // count from every group instead, which is a different
+                // algorithm, so combining the two here would be a guess.
+                // Refuse rather than route wrongly.
+                if config.moe.expert_group_count.is_some() {
+                    return Err(LoadError::UnsupportedFeature(
+                        arch.clone(),
+                        format!(
+                            "blk.{l}.exp_probs_b.bias together with expert groups \
+                             ({:?}): llama.cpp masks the biased scores per group \
+                             before a global top-k, which is not the per-group \
+                             top-k ferrox implements",
+                            config.moe.expert_group_count
+                        ),
+                    ));
+                }
+            }
             let moe = MoeWeights {
                 router,
                 experts,
                 shared_experts,
                 shared_expert_gate,
+                exp_probs_bias,
                 norm_weight: if is_gpt_oss {
                     load_f32_vec(&file, &format!("blk.{l}.post_attention_norm.weight"))?
                 } else {

@@ -4591,6 +4591,7 @@ mod tests {
             rms_norm_eps: 1e-5,
             sliding_window: None,
             moe: MoeLayerConfig {
+                expert_weights_scale: 1.0,
                 n_experts: 1,
                 n_experts_active: 1,
                 n_shared_experts: 0,

@@ -218,32 +218,8 @@ pub fn architecture_catalog() -> &'static [ArchProfile] {
             "arcee",
             "ernie4_5",
             "ernie4_5-moe",
-            "seed_oss",
-            "dots1",
             "bailingmoe",
-            "bailingmoe2",
-            "orion",
-            "codeshell",
-            "openelm",
-            "nemotron",
-            "exaone",
-            "exaone-moe",
-            "apertus",
-            "laguna",
             "nanbeige",
-            "talkie",
-            "step35",
-            "mimo2",
-            "mellum",
-            "hunyuan-dense",
-            "hunyuan-moe",
-            "afmoe",
-            "grovemoe",
-            "smallthinker",
-            "plamo",
-            "plamo3",
-            "minicpm3",
-            "starcoder2",
             "plm",
         ] {
             v.push(gqa_norm(n));
@@ -258,6 +234,39 @@ pub fn architecture_catalog() -> &'static [ArchProfile] {
             // ferrox had it on the interleaved (NORM) list, which rotates
             // the wrong pairs of every Q/K head.
             "gpt-oss",
+            // Same audit, run over every arch at once against
+            // `llama_model_rope_type`'s NEOX group
+            // (llama-model.cpp:2613-2683). These 24 were on ferrox's
+            // interleaved (NORM) list and reach the generic GQA decoder,
+            // so every one of them rotated the wrong pairs of every Q/K
+            // head and answered fluently and wrongly. Pinned by
+            // `rope_layout_matches_llama_cpp` below; dots1 additionally
+            // checked end-to-end against llama.cpp's own logits in
+            // `tests/moe_routing_bias.rs`.
+            "afmoe",
+            "apertus",
+            "bailingmoe2",
+            "codeshell",
+            "dots1",
+            "exaone",
+            "exaone-moe",
+            "grovemoe",
+            "hunyuan-dense",
+            "hunyuan-moe",
+            "laguna",
+            "mellum",
+            "mimo2",
+            "minicpm3",
+            "nemotron",
+            "openelm",
+            "orion",
+            "plamo",
+            "plamo3",
+            "seed_oss",
+            "smallthinker",
+            "starcoder2",
+            "step35",
+            "talkie",
         ] {
             v.push(gqa_neox(n));
         }
@@ -366,7 +375,11 @@ pub fn architecture_catalog() -> &'static [ArchProfile] {
                 TextGeneration,
                 Dedicated,
                 KvGqa,
-                Norm,
+                // llama-model.cpp puts both in the NEOX group. Inert
+                // today (minimax_engine.rs carries its own RoPE and
+                // never reads this field), but the table advertises
+                // itself as a mirror of llama.cpp's, so it says NEOX.
+                Neox,
                 ArchPath::DedicatedOnly {
                     reason: "MiniMax 256-expert sigmoid MoE + MTP — see minimax_engine.rs",
                 },

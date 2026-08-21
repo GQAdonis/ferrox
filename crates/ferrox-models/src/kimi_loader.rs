@@ -1909,6 +1909,7 @@ mod tests {
             rms_norm_eps: 1e-5,
             sliding_window: None,
             moe: ferrox_moe::MoeLayerConfig {
+                expert_weights_scale: 1.0,
                 n_experts: d.n_experts,
                 n_experts_active: d.n_experts,
                 n_shared_experts: d.num_shared_experts,

@@ -64,6 +64,11 @@ pub(crate) struct MemRanges {
     bufs: Vec<*const ProtocolObject<dyn MTLBuffer>>,
     srcs: Vec<usize>,
     dsts: Vec<usize>,
+    /// Encoder was created `MTLDispatchTypeSerial`, so Metal already orders
+    /// dispatches and no barrier is needed. llama does the same: with a
+    /// null `mem_ranges`, `ggml_metal_op_concurrency_reset` returns before
+    /// `ggml_metal_encoder_memory_barrier`.
+    serial: bool,
 }
 
 #[inline]
@@ -74,6 +79,17 @@ fn buf_key(b: &ProtocolObject<dyn MTLBuffer>) -> usize {
 impl MemRanges {
     pub(crate) fn new() -> Self {
         Self::default()
+    }
+
+    /// Tracker for a `MTLDispatchTypeSerial` encoder: every `begin_op` is a
+    /// no-op, because Metal already orders one dispatch after the next and
+    /// `memoryBarrierWithScope:` is only meaningful under concurrent
+    /// dispatch. Keeps call sites identical between the two encoder kinds.
+    pub(crate) fn serial() -> Self {
+        Self {
+            serial: true,
+            ..Self::default()
+        }
     }
 
     pub(crate) fn reset(&mut self) {
@@ -137,6 +153,9 @@ impl MemRanges {
         srcs: &[&ProtocolObject<dyn MTLBuffer>],
         dsts: &[&ProtocolObject<dyn MTLBuffer>],
     ) {
+        if self.serial {
+            return;
+        }
         BEGIN_OP_COUNT.fetch_add(1, Ordering::Relaxed);
         if !self.check(srcs, dsts) {
             // SAFETY: pointers were taken from live encoder-bound scratch /
@@ -161,6 +180,9 @@ impl MemRanges {
         srcs: &[&ProtocolObject<dyn MTLBuffer>],
         dsts: &[&ProtocolObject<dyn MTLBuffer>],
     ) {
+        if self.serial {
+            return;
+        }
         self.add(srcs, dsts);
     }
 }

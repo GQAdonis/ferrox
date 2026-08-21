@@ -3040,6 +3040,15 @@ impl MetalGraph {
             };
             warm_mul_mm_sg_pipeline(device, f16_static)?;
             mark(f16_static);
+            // The exact-tile (`bc_out=false`) siblings: compiled here too,
+            // so a prefill whose rows/batch happen to tile exactly does not
+            // pay a pipeline build inside its first command buffer.
+            for base in [launch.fn_name, f16_static] {
+                if let Some(a) = crate::gpu::mul_mm_sg_aligned_fn(base) {
+                    warm_mul_mm_sg_pipeline(device, a)?;
+                    mark(a);
+                }
+            }
         }
 
         let (rope_src, rope_name) = match params.rope_layout {

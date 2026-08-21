@@ -2598,7 +2598,7 @@ struct Q6KDequant {
     }
 };
 
-template<typename DQ>
+template<typename DQ, bool BC_OUT>
 static inline void mul_mm_sg_impl(
     device const uchar* src0,
     device const float* src1,
@@ -2719,14 +2719,20 @@ static inline void mul_mm_sg_impl(
         }
     }
 
-    if (r0 + NR0 <= int(n_rows) && r1 + NR1 <= int(batch)) {
+    // BC_OUT=false is compiled only for dispatches whose dst tile grid is
+    // exact (n_rows % 64 == 0 && batch % 32 == 0). Dropping the staging
+    // branch drops the threadgroup allocation from 8192 to 4096+2048 =
+    // 6144 bytes, which is what buys the extra resident threadgroup per
+    // core. llama picks the same two pipelines: ggml-metal-device.cpp
+    // `res.smem = bc_out ? 8192 : (4096 + 2048)`.
+    if (!BC_OUT || (r0 + NR0 <= int(n_rows) && r1 + NR1 <= int(batch))) {
         device float* C = dst
             + (r0 + 32 * (sgitg & 1))
             + (size_t)(r1 + 16 * (sgitg >> 1)) * n_rows;
         for (short i = 0; i < 8; i++) {
             simdgroup_store(mc[i], C + 8 * (i % 4) + 8 * (size_t)n_rows * (i / 4), n_rows, 0, false);
         }
-    } else {
+    } else if (BC_OUT) {
         // Partial tile: stage through threadgroup memory and copy only
         // the rows/columns that exist, so we never write past the matrix.
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -2760,7 +2766,7 @@ static inline void mul_mm_sg_impl(
 
 // Same tile/simdgroup body as mul_mm_sg_impl but src1 is half (llama
 // kernel_mul_mm_*_f16). Cuts activation bandwidth ~2× on dense prefill.
-template<typename DQ>
+template<typename DQ, bool BC_OUT>
 static inline void mul_mm_sg_impl_f16(
     device const uchar* src0,
     device const half* src1,
@@ -2865,14 +2871,20 @@ static inline void mul_mm_sg_impl_f16(
         }
     }
 
-    if (r0 + NR0 <= int(n_rows) && r1 + NR1 <= int(batch)) {
+    // BC_OUT=false is compiled only for dispatches whose dst tile grid is
+    // exact (n_rows % 64 == 0 && batch % 32 == 0). Dropping the staging
+    // branch drops the threadgroup allocation from 8192 to 4096+2048 =
+    // 6144 bytes, which is what buys the extra resident threadgroup per
+    // core. llama picks the same two pipelines: ggml-metal-device.cpp
+    // `res.smem = bc_out ? 8192 : (4096 + 2048)`.
+    if (!BC_OUT || (r0 + NR0 <= int(n_rows) && r1 + NR1 <= int(batch))) {
         device float* C = dst
             + (r0 + 32 * (sgitg & 1))
             + (size_t)(r1 + 16 * (sgitg >> 1)) * n_rows;
         for (short i = 0; i < 8; i++) {
             simdgroup_store(mc[i], C + 8 * (i % 4) + 8 * (size_t)n_rows * (i / 4), n_rows, 0, false);
         }
-    } else {
+    } else if (BC_OUT) {
         threadgroup_barrier(mem_flags::mem_threadgroup);
         threadgroup float* temp = ((threadgroup float*)shmem)
             + 32 * (sgitg & 1) + (16 * (sgitg >> 1)) * NR0;
@@ -3262,8 +3274,24 @@ kernel void NAME(                                                           \
     ushort tiitg [[thread_index_in_threadgroup]],                           \
     ushort sgitg [[simdgroup_index_in_threadgroup]]                         \
 ) {                                                                         \
-    mul_mm_sg_impl<DQ>(src0, src1, dst, n_rows, n_cols, batch, row_bytes,   \
-                       shmem, tgpig, tiitg, sgitg);                         \
+    mul_mm_sg_impl<DQ, true>(src0, src1, dst, n_rows, n_cols, batch,        \
+                             row_bytes, shmem, tgpig, tiitg, sgitg);        \
+}                                                                           \
+kernel void NAME##_a(                                                       \
+    device const uchar* src0 [[buffer(0)]],                                 \
+    device const float* src1 [[buffer(1)]],                                 \
+    device float* dst [[buffer(2)]],                                        \
+    constant uint& n_rows [[buffer(3)]],                                    \
+    constant uint& n_cols [[buffer(4)]],                                    \
+    constant uint& batch [[buffer(5)]],                                     \
+    constant uint& row_bytes [[buffer(6)]],                                 \
+    threadgroup char* shmem [[threadgroup(0)]],                             \
+    uint3 tgpig [[threadgroup_position_in_grid]],                           \
+    ushort tiitg [[thread_index_in_threadgroup]],                           \
+    ushort sgitg [[simdgroup_index_in_threadgroup]]                         \
+) {                                                                         \
+    mul_mm_sg_impl<DQ, false>(src0, src1, dst, n_rows, n_cols, batch,       \
+                              row_bytes, shmem, tgpig, tiitg, sgitg);       \
 }
 
 #define MUL_MM_SG_F16_ENTRY(NAME, DQ)                                       \
@@ -3280,8 +3308,24 @@ kernel void NAME(                                                           \
     ushort tiitg [[thread_index_in_threadgroup]],                           \
     ushort sgitg [[simdgroup_index_in_threadgroup]]                         \
 ) {                                                                         \
-    mul_mm_sg_impl_f16<DQ>(src0, src1, dst, n_rows, n_cols, batch,          \
-                           row_bytes, shmem, tgpig, tiitg, sgitg);          \
+    mul_mm_sg_impl_f16<DQ, true>(src0, src1, dst, n_rows, n_cols, batch,    \
+                                 row_bytes, shmem, tgpig, tiitg, sgitg);    \
+}                                                                           \
+kernel void NAME##_a(                                                       \
+    device const uchar* src0 [[buffer(0)]],                                 \
+    device const half* src1 [[buffer(1)]],                                  \
+    device float* dst [[buffer(2)]],                                        \
+    constant uint& n_rows [[buffer(3)]],                                    \
+    constant uint& n_cols [[buffer(4)]],                                    \
+    constant uint& batch [[buffer(5)]],                                     \
+    constant uint& row_bytes [[buffer(6)]],                                 \
+    threadgroup char* shmem [[threadgroup(0)]],                             \
+    uint3 tgpig [[threadgroup_position_in_grid]],                           \
+    ushort tiitg [[thread_index_in_threadgroup]],                           \
+    ushort sgitg [[simdgroup_index_in_threadgroup]]                         \
+) {                                                                         \
+    mul_mm_sg_impl_f16<DQ, false>(src0, src1, dst, n_rows, n_cols, batch,   \
+                                  row_bytes, shmem, tgpig, tiitg, sgitg);   \
 }
 
 MUL_MM_SG_ENTRY(q4_k_mul_mm_sg, Q4KDequant)
@@ -4074,6 +4118,56 @@ pub(crate) fn encode_mul_mm_id(
     Ok(())
 }
 
+/// llama's `bc_out`, as a pipeline choice.
+///
+/// The `mul_mm_sg` epilogue has two arms: a fast one that `simdgroup_store`s
+/// straight to `dst`, and a staging arm for the ragged edge tile that goes
+/// through a 64x32 f32 threadgroup buffer. That staging buffer is what forces
+/// the 8192-byte threadgroup allocation — the GEMM's own `sa`/`sb` tiles only
+/// need 4096 + 2048 = 6144.
+///
+/// When the dst tile grid is exact (`rows % 64 == 0 && batch % 32 == 0`) the
+/// staging arm is unreachable, so the `_a` pipeline compiles it out and asks
+/// for 6144 bytes. On a 32 KiB per-core threadgroup budget that is 5 resident
+/// threadgroups instead of 4. Same split llama makes in
+/// `ggml-metal-device.cpp`: `res.smem = bc_out ? 8192 : (4096 + 2048)`.
+pub(crate) const MUL_MM_SG_SMEM_BC: usize = 8192;
+pub(crate) const MUL_MM_SG_SMEM_ALIGNED: usize = 4096 + 2048;
+
+pub(crate) fn mul_mm_sg_aligned_fn(fn_name: &str) -> Option<&'static str> {
+    Some(match fn_name {
+        "q4_k_mul_mm_sg" => "q4_k_mul_mm_sg_a",
+        "q5_k_mul_mm_sg" => "q5_k_mul_mm_sg_a",
+        "q6_k_mul_mm_sg" => "q6_k_mul_mm_sg_a",
+        "q8_0_mul_mm_sg" => "q8_0_mul_mm_sg_a",
+        "q4_0_mul_mm_sg" => "q4_0_mul_mm_sg_a",
+        "q5_0_mul_mm_sg" => "q5_0_mul_mm_sg_a",
+        "iq4_xs_mul_mm_sg" => "iq4_xs_mul_mm_sg_a",
+        "q4_k_mul_mm_sg_f16" => "q4_k_mul_mm_sg_f16_a",
+        "q5_k_mul_mm_sg_f16" => "q5_k_mul_mm_sg_f16_a",
+        "q6_k_mul_mm_sg_f16" => "q6_k_mul_mm_sg_f16_a",
+        "q8_0_mul_mm_sg_f16" => "q8_0_mul_mm_sg_f16_a",
+        "q4_0_mul_mm_sg_f16" => "q4_0_mul_mm_sg_f16_a",
+        "q5_0_mul_mm_sg_f16" => "q5_0_mul_mm_sg_f16_a",
+        "iq4_xs_mul_mm_sg_f16" => "iq4_xs_mul_mm_sg_f16_a",
+        _ => return None,
+    })
+}
+
+/// Pipeline name + threadgroup allocation for one `mul_mm_sg` dispatch.
+pub(crate) fn mul_mm_sg_variant(
+    fn_name: &'static str,
+    rows: usize,
+    batch: usize,
+) -> (&'static str, usize) {
+    if rows.is_multiple_of(64) && batch.is_multiple_of(32) {
+        if let Some(a) = mul_mm_sg_aligned_fn(fn_name) {
+            return (a, MUL_MM_SG_SMEM_ALIGNED);
+        }
+    }
+    (fn_name, MUL_MM_SG_SMEM_BC)
+}
+
 pub(crate) fn encode_mul_mm_sg(
     enc: &ProtocolObject<dyn MTLComputeCommandEncoder>,
     device: &Retained<ProtocolObject<dyn MTLDevice>>,
@@ -4107,7 +4201,8 @@ pub(crate) fn encode_mul_mm_sg_f16(
         "iq4_xs_mul_mm_sg" => "iq4_xs_mul_mm_sg_f16",
         _ => return Err(MetalError::CommandFailed),
     };
-    let pipeline = ensure_pipeline(device, K_QUANT_MUL_MM_SG_KERNEL_SRC, fn_f16)?;
+    let (fn_pick, smem) = mul_mm_sg_variant(fn_f16, l.rows, batch_size);
+    let pipeline = ensure_pipeline(device, K_QUANT_MUL_MM_SG_KERNEL_SRC, fn_pick)?;
     unsafe {
         enc.setComputePipelineState(&pipeline.0);
         enc.setBuffer_offset_atIndex(Some(&w.buffer), w.weight_offset, 0);
@@ -4125,7 +4220,7 @@ pub(crate) fn encode_mul_mm_sg_f16(
                 idx,
             );
         }
-        enc.setThreadgroupMemoryLength_atIndex(8192, 0);
+        enc.setThreadgroupMemoryLength_atIndex(smem, 0);
         enc.dispatchThreadgroups_threadsPerThreadgroup(
             MTLSize {
                 width: batch_size.div_ceil(32),
@@ -4180,7 +4275,8 @@ pub(crate) fn encode_mul_mm_sg_offset_ex(
     out_byte_offset: usize,
     batch_size: usize,
 ) -> Result<(), MetalError> {
-    let pipeline = ensure_pipeline(device, K_QUANT_MUL_MM_SG_KERNEL_SRC, l.fn_name)?;
+    let (fn_pick, smem) = mul_mm_sg_variant(l.fn_name, l.rows, batch_size);
+    let pipeline = ensure_pipeline(device, K_QUANT_MUL_MM_SG_KERNEL_SRC, fn_pick)?;
     unsafe {
         enc.setComputePipelineState(&pipeline.0);
         enc.setBuffer_offset_atIndex(Some(&w.buffer), w.weight_offset + weight_byte_offset, 0);
@@ -4198,7 +4294,7 @@ pub(crate) fn encode_mul_mm_sg_offset_ex(
                 idx,
             );
         }
-        enc.setThreadgroupMemoryLength_atIndex(8192, 0);
+        enc.setThreadgroupMemoryLength_atIndex(smem, 0);
         enc.dispatchThreadgroups_threadsPerThreadgroup(
             MTLSize {
                 width: batch_size.div_ceil(32),
@@ -4365,7 +4461,8 @@ fn launch_k_quant_mul_mm_sg(
     let out_scratch = borrow_scratch(device, out_elems * 4, MTLResourceOptions::StorageModeShared)?;
     let out_buf = out_scratch.get();
 
-    let pipeline = ensure_pipeline(device, K_QUANT_MUL_MM_SG_KERNEL_SRC, fn_name)?;
+    let (fn_pick, smem) = mul_mm_sg_variant(fn_name, rows, batch_size);
+    let pipeline = ensure_pipeline(device, K_QUANT_MUL_MM_SG_KERNEL_SRC, fn_pick)?;
     let setup_us = t_setup.elapsed().as_micros();
 
     let cmd_buf = queue.commandBuffer().ok_or(MetalError::CommandFailed)?;
@@ -4390,10 +4487,11 @@ fn launch_k_quant_mul_mm_sg(
                 idx,
             );
         }
-        // 4096 B for the dequantized A tile + 2048 B for B, but the
+        // 4096 B for the dequantized A tile + 2048 B for B; the
         // partial-tile store path reuses the same allocation as a
-        // 64x32 f32 staging buffer, which needs 8192.
-        enc.setThreadgroupMemoryLength_atIndex(8192, 0);
+        // 64x32 f32 staging buffer, which needs 8192. `mul_mm_sg_variant`
+        // picks the exact-tile pipeline (no staging arm) when it can.
+        enc.setThreadgroupMemoryLength_atIndex(smem, 0);
 
         let grid = MTLSize {
             width: batch_size.div_ceil(32),
@@ -8999,11 +9097,46 @@ mod tests {
     /// Dimensions are deliberately *not* multiples of the 64x32 tile, so
     /// the partial-tile store path is exercised too; a kernel that only
     /// handles whole tiles silently corrupts the edges of a real prompt.
+    /// The exact-tile pipeline may only be picked when *both* dst dims tile
+    /// exactly: it has no ragged-edge store path, so choosing it for a
+    /// ragged shape writes past the matrix. Pure selection logic, no GPU.
+    #[test]
+    fn mul_mm_sg_variant_picks_the_small_threadgroup_only_on_exact_tiles() {
+        assert_eq!(
+            mul_mm_sg_variant("q4_k_mul_mm_sg", 2048, 512),
+            ("q4_k_mul_mm_sg_a", MUL_MM_SG_SMEM_ALIGNED)
+        );
+        assert_eq!(
+            mul_mm_sg_variant("q4_k_mul_mm_sg_f16", 8192, 64),
+            ("q4_k_mul_mm_sg_f16_a", MUL_MM_SG_SMEM_ALIGNED)
+        );
+        // Ragged in exactly one dim is still ragged.
+        for (rows, batch) in [(2048usize, 513usize), (2050, 512), (70, 33), (0, 0)] {
+            let (name, smem) = mul_mm_sg_variant("q4_k_mul_mm_sg", rows, batch);
+            if rows.is_multiple_of(64) && batch.is_multiple_of(32) {
+                continue;
+            }
+            assert_eq!(name, "q4_k_mul_mm_sg", "{rows}x{batch}");
+            assert_eq!(smem, MUL_MM_SG_SMEM_BC, "{rows}x{batch}");
+        }
+        // A kernel with no `_a` sibling must fall back, not be renamed.
+        assert_eq!(
+            mul_mm_sg_variant("q4_k_mul_mm_id", 2048, 512),
+            ("q4_k_mul_mm_id", MUL_MM_SG_SMEM_BC)
+        );
+    }
+
     #[test]
     #[ignore = "needs a real Metal-capable GPU; run manually with --ignored on Apple Silicon"]
     fn launch_q4_k_mul_mm_sg_matches_the_matvec_it_replaces() {
         for &(rows, cols, batch_size) in &[
+            // Exact tile grids take the `_a` (bc_out=false) pipeline, which
+            // compiles the ragged-edge staging arm out and drops the
+            // threadgroup allocation to 6144 -- so these two shapes are the
+            // only coverage that kernel gets. 128x64 gives it more than one
+            // tile in both dims, where a wrong epilogue guard would show.
             (64usize, 512usize, 32usize), // exactly one tile
+            (128, 512, 64),               // exact grid, 2x2 tiles
             (9, 512, 7),                  // smaller than a tile in both dims
             (70, 768, 33),                // one full tile plus a ragged edge
         ] {
@@ -9095,7 +9228,13 @@ mod tests {
         gemm: impl Fn(&[u8], &[f32], usize, usize, usize) -> Result<Vec<f32>, MetalError>,
     ) {
         for &(rows, cols, batch_size) in &[
+            // Exact tile grids take the `_a` (bc_out=false) pipeline, which
+            // compiles the ragged-edge staging arm out and drops the
+            // threadgroup allocation to 6144 -- so these two shapes are the
+            // only coverage that kernel gets. 128x64 gives it more than one
+            // tile in both dims, where a wrong epilogue guard would show.
             (64usize, 512usize, 32usize), // exactly one tile
+            (128, 512, 64),               // exact grid, 2x2 tiles
             (9, 512, 7),                  // smaller than a tile in both dims
             (70, 768, 33),                // one full tile plus a ragged edge
         ] {

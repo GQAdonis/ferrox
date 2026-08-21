@@ -1511,12 +1511,28 @@ async fn metrics(State(state): State<Arc<AppState>>) -> Response {
                  ferrox_scheduler_queue_depth {}\n\
                  # HELP ferrox_scheduler_queue_rejected_total Requests refused with 503 because the admission queue was full.\n\
                  # TYPE ferrox_scheduler_queue_rejected_total counter\n\
-                 ferrox_scheduler_queue_rejected_total {}\n",
+                 ferrox_scheduler_queue_rejected_total {}\n\
+                 # HELP ferrox_kv_blocks_total KV blocks in the scheduler's admission budget (0 when unconfigured).\n\
+                 # TYPE ferrox_kv_blocks_total gauge\n\
+                 ferrox_kv_blocks_total {}\n\
+                 # HELP ferrox_kv_blocks_free KV blocks not reserved by an in-flight request.\n\
+                 # TYPE ferrox_kv_blocks_free gauge\n\
+                 ferrox_kv_blocks_free {}\n\
+                 # HELP ferrox_kv_block_size Token positions per KV block.\n\
+                 # TYPE ferrox_kv_block_size gauge\n\
+                 ferrox_kv_block_size {}\n\
+                 # HELP ferrox_kv_rejected_too_large_total Requests refused with 400 because they exceed the whole KV block budget.\n\
+                 # TYPE ferrox_kv_rejected_too_large_total counter\n\
+                 ferrox_kv_rejected_too_large_total {}\n",
                 sched.prefill_chunks,
                 sched.prefill_tokens,
                 sched.decode_steps,
                 sched.queue_depth,
                 sched.queue_rejected,
+                sched.kv_blocks_total,
+                sched.kv_blocks_free,
+                sched.kv_block_size,
+                sched.kv_rejected_too_large,
             )
         }
         None => body,
@@ -1544,6 +1560,11 @@ pub(crate) fn unsupported_feature(message: &str) -> ApiError {
 pub(crate) fn decode_error_response(e: generate::DecodeError) -> ApiError {
     let status = match e {
         generate::DecodeError::TokenOutOfVocab { .. } => StatusCode::BAD_REQUEST,
+        // The request is bigger than the server can ever serve. That
+        // is a property of the request, so it is the client's 400 --
+        // answering 503 would send it into a retry loop that cannot
+        // succeed.
+        generate::DecodeError::KvBudgetExceeded { .. } => StatusCode::BAD_REQUEST,
         // Not the client's fault, and true of the exact same request a
         // moment later once capacity frees up -- 503, not 400. The
         // `Retry-After` header these need is stamped centrally by

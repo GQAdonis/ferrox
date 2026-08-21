@@ -28,6 +28,20 @@ pub enum DecodeError {
     /// "too many clients" from "one request too big".
     #[error("server is at capacity: {queued} requests are already queued for the batch scheduler (limit {cap}); retry shortly")]
     QueueFull { queued: usize, cap: usize },
+    /// The request needs more KV blocks than the server owns in total.
+    /// Deliberately *not* a 503: an empty server would refuse it too,
+    /// so "retry shortly" would be a lie. The numbers are in the error
+    /// because the fix is on the client's side (a shorter prompt or a
+    /// smaller `max_tokens`) or in the server's configuration
+    /// (`FERROX_CB_KV_BLOCKS`), and an operator cannot tell which
+    /// without them.
+    #[error("request needs {blocks_needed} KV blocks ({positions} token positions at {block_size} positions per block) but this server has only {blocks_total}; shorten the prompt or lower max_tokens")]
+    KvBudgetExceeded {
+        blocks_needed: usize,
+        blocks_total: usize,
+        block_size: usize,
+        positions: usize,
+    },
 }
 
 impl DecodeError {
@@ -36,6 +50,9 @@ impl DecodeError {
     pub fn retry_after_secs(&self) -> Option<u64> {
         match self {
             DecodeError::TokenOutOfVocab { .. } => None,
+            // Retrying an over-budget request changes nothing: the
+            // ceiling it hit is the whole server, not the current load.
+            DecodeError::KvBudgetExceeded { .. } => None,
             DecodeError::KvPoolExhausted | DecodeError::QueueFull { .. } => Some(1),
         }
     }

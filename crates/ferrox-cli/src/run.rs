@@ -755,12 +755,9 @@ pub fn run_infer(args: InferArgs) -> anyhow::Result<()> {
             CliTokenizer::Byte
         }
     };
-    let eos_id = file
-        .metadata_u64("tokenizer.ggml.eos_token_id")
-        .map(|v| v as usize);
     // Not just `eos_token_id`: Llama-3 ends a turn with `<|eot_id|>` and
     // gemma-4 with `<turn|>`, neither of which is the metadata EOS.
-    let eog_ids = ferrox_models::tokenizer::eog_token_ids(&file);
+    let stop_tokens = ferrox_models::tokenizer::StopTokens::from_gguf(&file);
     let bos_id = file
         .metadata_u64("tokenizer.ggml.bos_token_id")
         .map(|v| v as usize);
@@ -809,13 +806,10 @@ pub fn run_infer(args: InferArgs) -> anyhow::Result<()> {
     let mut tokens = tokenizer.encode(&prompt);
     // Match llama.cpp vocab add_bos (qwen2/BPE default false). Blindly
     // prepending bos_token_id poisons Qwen2-MoE (`<|endoftext|>`).
-    if ferrox_models::tokenizer::should_add_bos_token(&file) {
-        if let Some(bos) = bos_id {
-            if tokens.first() != Some(&bos) {
-                tokens.insert(0, bos);
-            }
-        }
-    }
+    ferrox_models::tokenizer::prepend_bos(
+        &mut tokens,
+        bos_id.filter(|_| ferrox_models::tokenizer::should_add_bos_token(&file)),
+    );
     let vocab_size = decoder.config.vocab_size;
     if let Some(&bad) = tokens.iter().find(|&&t| t >= vocab_size) {
         anyhow::bail!("prompt token {bad} outside vocab_size {vocab_size}");
@@ -885,7 +879,7 @@ pub fn run_infer(args: InferArgs) -> anyhow::Result<()> {
     let decode_t = Instant::now();
     for _ in 0..max_new {
         let next = sampler.sample(&logits, &sampling, &generated);
-        if !args.ignore_eos && (Some(next) == eos_id || eog_ids.contains(&(next as u32))) {
+        if !args.ignore_eos && stop_tokens.contains(next) {
             break;
         }
         generated.push(next);
@@ -931,12 +925,9 @@ fn run_mla_infer(args: InferArgs, path: &Path, file: &ShardedGguf) -> anyhow::Re
             CliTokenizer::Byte
         }
     };
-    let eos_id = file
-        .metadata_u64("tokenizer.ggml.eos_token_id")
-        .map(|v| v as usize);
     // Not just `eos_token_id`: Llama-3 ends a turn with `<|eot_id|>` and
     // gemma-4 with `<turn|>`, neither of which is the metadata EOS.
-    let eog_ids = ferrox_models::tokenizer::eog_token_ids(file);
+    let stop_tokens = ferrox_models::tokenizer::StopTokens::from_gguf(file);
     let bos_id = file
         .metadata_u64("tokenizer.ggml.bos_token_id")
         .map(|v| v as usize);
@@ -974,13 +965,10 @@ fn run_mla_infer(args: InferArgs, path: &Path, file: &ShardedGguf) -> anyhow::Re
     eprintln!("ferrox: loaded in {:.2}s", load_t.elapsed().as_secs_f64());
 
     let mut tokens = tokenizer.encode(&prompt);
-    if ferrox_models::tokenizer::should_add_bos_token(file) {
-        if let Some(bos) = bos_id {
-            if tokens.first() != Some(&bos) {
-                tokens.insert(0, bos);
-            }
-        }
-    }
+    ferrox_models::tokenizer::prepend_bos(
+        &mut tokens,
+        bos_id.filter(|_| ferrox_models::tokenizer::should_add_bos_token(file)),
+    );
     let vocab_size = Engine::vocab_size(&engine);
     if let Some(&bad) = tokens.iter().find(|&&t| t >= vocab_size) {
         anyhow::bail!("prompt token {bad} outside vocab_size {vocab_size}");
@@ -1031,7 +1019,7 @@ fn run_mla_infer(args: InferArgs, path: &Path, file: &ShardedGguf) -> anyhow::Re
     let decode_t = Instant::now();
     for _ in 0..max_new {
         let next = sampler.sample(&logits, &sampling, &generated);
-        if !args.ignore_eos && (Some(next) == eos_id || eog_ids.contains(&(next as u32))) {
+        if !args.ignore_eos && stop_tokens.contains(next) {
             break;
         }
         generated.push(next);
@@ -1076,12 +1064,9 @@ fn run_gemma4_infer(args: InferArgs, path: &Path, file: &ShardedGguf) -> anyhow:
             CliTokenizer::Byte
         }
     };
-    let eos_id = file
-        .metadata_u64("tokenizer.ggml.eos_token_id")
-        .map(|v| v as usize);
     // Not just `eos_token_id`: Llama-3 ends a turn with `<|eot_id|>` and
     // gemma-4 with `<turn|>`, neither of which is the metadata EOS.
-    let eog_ids = ferrox_models::tokenizer::eog_token_ids(file);
+    let stop_tokens = ferrox_models::tokenizer::StopTokens::from_gguf(file);
     let bos_id = file
         .metadata_u64("tokenizer.ggml.bos_token_id")
         .map(|v| v as usize);
@@ -1120,13 +1105,10 @@ fn run_gemma4_infer(args: InferArgs, path: &Path, file: &ShardedGguf) -> anyhow:
     eprintln!("ferrox: loaded in {:.2}s", load_t.elapsed().as_secs_f64());
 
     let mut tokens = tokenizer.encode(&prompt);
-    if ferrox_models::tokenizer::should_add_bos_token(file) {
-        if let Some(bos) = bos_id {
-            if tokens.first() != Some(&bos) {
-                tokens.insert(0, bos);
-            }
-        }
-    }
+    ferrox_models::tokenizer::prepend_bos(
+        &mut tokens,
+        bos_id.filter(|_| ferrox_models::tokenizer::should_add_bos_token(file)),
+    );
     let vocab_size = Engine::vocab_size(&engine);
     if let Some(&bad) = tokens.iter().find(|&&t| t >= vocab_size) {
         anyhow::bail!("prompt token {bad} outside vocab_size {vocab_size}");
@@ -1177,7 +1159,7 @@ fn run_gemma4_infer(args: InferArgs, path: &Path, file: &ShardedGguf) -> anyhow:
     let decode_t = Instant::now();
     for _ in 0..max_new {
         let next = sampler.sample(&logits, &sampling, &generated);
-        if !args.ignore_eos && (Some(next) == eos_id || eog_ids.contains(&(next as u32))) {
+        if !args.ignore_eos && stop_tokens.contains(next) {
             break;
         }
         generated.push(next);
@@ -1222,12 +1204,9 @@ fn run_glm52_infer(args: InferArgs, path: &Path, file: &ShardedGguf) -> anyhow::
             CliTokenizer::Byte
         }
     };
-    let eos_id = file
-        .metadata_u64("tokenizer.ggml.eos_token_id")
-        .map(|v| v as usize);
     // Not just `eos_token_id`: Llama-3 ends a turn with `<|eot_id|>` and
     // gemma-4 with `<turn|>`, neither of which is the metadata EOS.
-    let eog_ids = ferrox_models::tokenizer::eog_token_ids(file);
+    let stop_tokens = ferrox_models::tokenizer::StopTokens::from_gguf(file);
     let bos_id = file
         .metadata_u64("tokenizer.ggml.bos_token_id")
         .map(|v| v as usize);
@@ -1265,13 +1244,10 @@ fn run_glm52_infer(args: InferArgs, path: &Path, file: &ShardedGguf) -> anyhow::
     eprintln!("ferrox: loaded in {:.2}s", load_t.elapsed().as_secs_f64());
 
     let mut tokens = tokenizer.encode(&prompt);
-    if ferrox_models::tokenizer::should_add_bos_token(file) {
-        if let Some(bos) = bos_id {
-            if tokens.first() != Some(&bos) {
-                tokens.insert(0, bos);
-            }
-        }
-    }
+    ferrox_models::tokenizer::prepend_bos(
+        &mut tokens,
+        bos_id.filter(|_| ferrox_models::tokenizer::should_add_bos_token(file)),
+    );
     let vocab_size = Engine::vocab_size(&engine);
     if let Some(&bad) = tokens.iter().find(|&&t| t >= vocab_size) {
         anyhow::bail!("prompt token {bad} outside vocab_size {vocab_size}");
@@ -1322,7 +1298,7 @@ fn run_glm52_infer(args: InferArgs, path: &Path, file: &ShardedGguf) -> anyhow::
     let decode_t = Instant::now();
     for _ in 0..max_new {
         let next = sampler.sample(&logits, &sampling, &generated);
-        if !args.ignore_eos && (Some(next) == eos_id || eog_ids.contains(&(next as u32))) {
+        if !args.ignore_eos && stop_tokens.contains(next) {
             break;
         }
         generated.push(next);

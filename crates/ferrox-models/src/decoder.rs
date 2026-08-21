@@ -141,6 +141,20 @@ pub struct MoeWeights {
     /// add unconditionally with no gate at all).
     pub shared_expert_gate: Option<Vec<f32>>,
     pub norm_weight: Vec<f32>,
+    /// DeepSeek-V3's aux-loss-free expert-selection bias, on disk as
+    /// `blk.{N}.exp_probs_b.bias` (llama.cpp's `LLM_TENSOR_FFN_EXP_PROBS_B`
+    /// -- note the on-disk name has no `ffn_` prefix, `llama-arch.cpp:416`).
+    /// It is added to the *selection* score only: the top-k is taken over
+    /// `gating(logit) + bias[expert]`, while each winner's combine weight
+    /// comes from the unbiased `gating(logit)`
+    /// (`build_moe_ffn`: "leave probs unbiased as it's later used to get
+    /// expert weights"). Biasing the weight too would silently skew every
+    /// routed contribution away from what the router learned.
+    ///
+    /// `None` for every checkpoint that does not ship the tensor. When it
+    /// *is* present, the GPU MoE fast paths refuse the layer rather than
+    /// route without it -- their kernels have no bias input.
+    pub exp_probs_bias: Option<Vec<f32>>,
     /// How many times each routed expert (index into `experts`) has been
     /// selected by `route_top_k` across every `forward_token`/
     /// `forward_batch` call so far. Real observed hotness, not a
@@ -576,6 +590,7 @@ impl Decoder {
             let activation_counts = (0..experts.len()).map(|_| AtomicU64::new(0)).collect();
 
             let moe = MoeWeights {
+                exp_probs_bias: None,
                 router: wm(rng.vec(n_experts * hidden), vec![n_experts, hidden]),
                 experts: ExpertBacking::Resident(experts),
                 shared_experts,
@@ -923,6 +938,12 @@ impl Decoder {
             )
             || !matches!(config.moe.gating, ferrox_moe::GatingFunction::Softmax)
             || config.moe.expert_group_count.is_some()
+            // The GPU router kernels take router weights and nothing
+            // else: no `exp_probs_b` input, no `expert_weights_scale`
+            // uniform. A layer carrying either must stay on the CPU
+            // router rather than be routed without them.
+            || layer.moe.exp_probs_bias.is_some()
+            || config.moe.expert_weights_scale != 1.0
         {
             return None;
         }
@@ -1194,6 +1215,12 @@ impl Decoder {
             )
             || !matches!(config.moe.gating, ferrox_moe::GatingFunction::Softmax)
             || config.moe.expert_group_count.is_some()
+            // The GPU router kernels take router weights and nothing
+            // else: no `exp_probs_b` input, no `expert_weights_scale`
+            // uniform. A layer carrying either must stay on the CPU
+            // router rather than be routed without them.
+            || layer.moe.exp_probs_bias.is_some()
+            || config.moe.expert_weights_scale != 1.0
         {
             return None;
         }
@@ -2070,15 +2097,27 @@ impl Decoder {
                                             };
                                             if seed_ok {
                                                 // Prefer one-CB fused path (GPU top-k + packed experts).
+                                                // See
+                                                // `layer_supports_metal_moe_resident`:
+                                                // the fused decode kernel
+                                                // routes on the GPU and
+                                                // has no `exp_probs_b` /
+                                                // `expert_weights_scale`
+                                                // input either.
                                                 let fused_ok = matches!(
                                                     self.config.moe.gating,
                                                     ferrox_moe::GatingFunction::Softmax
-                                                ) && match &layer.moe.experts {
-                                                    ExpertBacking::Resident(_) => {
-                                                        if let Some(packed) =
-                                                            Self::moe_packed_q4(&layer.moe)
-                                                        {
-                                                            match ferrox_metal::attn::launch_moe_decode_layer_fused(
+                                                ) && layer
+                                                    .moe
+                                                    .exp_probs_bias
+                                                    .is_none()
+                                                    && self.config.moe.expert_weights_scale == 1.0
+                                                    && match &layer.moe.experts {
+                                                        ExpertBacking::Resident(_) => {
+                                                            if let Some(packed) =
+                                                                Self::moe_packed_q4(&layer.moe)
+                                                            {
+                                                                match ferrox_metal::attn::launch_moe_decode_layer_fused(
                                                                 &layer.attn.norm_weight,
                                                                 &q_l,
                                                                 &k_l,
@@ -2111,12 +2150,12 @@ impl Decoder {
                                                                     false
                                                                 }
                                                             }
-                                                        } else {
-                                                            false
+                                                            } else {
+                                                                false
+                                                            }
                                                         }
-                                                    }
-                                                    _ => false,
-                                                };
+                                                        _ => false,
+                                                    };
 
                                                 if !fused_ok {
                                                     match ferrox_metal::attn::launch_moe_decode_pre(
@@ -2821,15 +2860,25 @@ impl Decoder {
     /// `run_expert_placed` with `ExpertPlacement::Cpu`, which is
     /// exactly `run_expert`'s own behavior, so this is a real
     /// zero-behavior-change default, not just "probably fine."
-    fn combine_ffn_outputs_for_position(
+    /// One token's routing decision for one MoE layer.
+    ///
+    /// Three shapes, in the order llama.cpp's `build_moe_ffn` decides
+    /// them: grouped selection when the checkpoint declares expert
+    /// groups; the biased/scaled port when the layer carries
+    /// `exp_probs_b` or the model carries a non-unit
+    /// `expert_weights_scale`; otherwise the plain top-k this decoder has
+    /// always used. The last arm is kept rather than folded into
+    /// `route_top_k_biased` so that every checkpoint without those two
+    /// features routes through byte-identical code to before.
+    ///
+    /// `exp_probs_b` together with expert groups is refused at load
+    /// (`loader.rs`), so that combination cannot reach here.
+    fn route_for_layer(
         layer: &LayerWeights,
-        normed2: &[f32],
         router_logits: &[f32],
         config: &ModelConfig,
-        hidden_dim: usize,
-        plan: Option<&PlacementPlan>,
-    ) -> Vec<f32> {
-        let decision = match (
+    ) -> ferrox_moe::RoutingDecision {
+        match (
             config.moe.expert_group_count,
             config.moe.expert_group_used_count,
         ) {
@@ -2843,13 +2892,34 @@ impl Decoder {
                     config.moe.norm_topk_prob,
                 )
             }
+            _ if layer.moe.exp_probs_bias.is_some() || config.moe.expert_weights_scale != 1.0 => {
+                ferrox_moe::route_top_k_biased(
+                    router_logits,
+                    layer.moe.exp_probs_bias.as_deref(),
+                    config.moe.n_experts_active,
+                    config.moe.gating,
+                    config.moe.norm_topk_prob,
+                    config.moe.expert_weights_scale,
+                )
+            }
             _ => route_top_k(
                 router_logits,
                 config.moe.n_experts_active,
                 config.moe.gating,
                 config.moe.norm_topk_prob,
             ),
-        };
+        }
+    }
+
+    fn combine_ffn_outputs_for_position(
+        layer: &LayerWeights,
+        normed2: &[f32],
+        router_logits: &[f32],
+        config: &ModelConfig,
+        hidden_dim: usize,
+        plan: Option<&PlacementPlan>,
+    ) -> Vec<f32> {
+        let decision = Self::route_for_layer(layer, router_logits, config);
         layer.moe.record_activations(&decision.expert_ids);
         // Best-effort warm of the routed experts for this layer into
         // the store cache (SSD streaming overlap). Resident-backed
@@ -3089,27 +3159,7 @@ impl Decoder {
         let mut buckets: Vec<Vec<(usize, f32)>> = vec![Vec::new(); n_experts];
         for b in 0..batch_size {
             let logits = &router_logits_batch[b * n_experts..(b + 1) * n_experts];
-            let decision = match (
-                config.moe.expert_group_count,
-                config.moe.expert_group_used_count,
-            ) {
-                (Some(n_groups), Some(k_per_group)) if n_groups > 1 && k_per_group > 0 => {
-                    ferrox_moe::route_top_k_grouped(
-                        logits,
-                        n_groups,
-                        k_per_group,
-                        config.moe.n_experts_active,
-                        config.moe.gating,
-                        config.moe.norm_topk_prob,
-                    )
-                }
-                _ => route_top_k(
-                    logits,
-                    config.moe.n_experts_active,
-                    config.moe.gating,
-                    config.moe.norm_topk_prob,
-                ),
-            };
+            let decision = Self::route_for_layer(layer, logits, config);
             layer.moe.record_activations(&decision.expert_ids);
             for (&eid, &w) in decision.expert_ids.iter().zip(decision.weights.iter()) {
                 buckets[eid].push((b, w));

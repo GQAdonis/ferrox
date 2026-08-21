@@ -200,11 +200,7 @@ pub fn architecture_catalog() -> &'static [ArchProfile] {
             "baichuan",
             "starcoder",
             "internlm2",
-            "minicpm",
             "xverse",
-            "command-r",
-            "cohere2",
-            "cohere2moe",
             "olmo",
             "arctic",
             "deepseek",
@@ -218,38 +214,14 @@ pub fn architecture_catalog() -> &'static [ArchProfile] {
             "arcee",
             "ernie4_5",
             "ernie4_5-moe",
-            "seed_oss",
-            "dots1",
             "bailingmoe",
-            "bailingmoe2",
-            "orion",
-            "codeshell",
-            "openelm",
-            "nemotron",
-            "exaone",
-            "exaone-moe",
-            "apertus",
-            "laguna",
             "nanbeige",
-            "talkie",
-            "step35",
-            "mimo2",
-            "mellum",
-            "hunyuan-dense",
-            "hunyuan-moe",
-            "afmoe",
-            "grovemoe",
-            "smallthinker",
-            "plamo",
-            "plamo3",
-            "minicpm3",
-            "starcoder2",
             "plm",
         ] {
             v.push(gqa_norm(n));
         }
         for n in [
-            "olmoe", "qwen", "qwen2", "qwen2moe", "falcon", "gptneox", "stablelm", "mistral",
+            "olmoe", "qwen", "qwen2", "qwen2moe", "stablelm", "mistral",
             "mixtral", "olmo2", "gpt2", "bloom", "mpt", "refact", "bitnet", "jais", "jais2",
             "grok", "dbrx", "exaone4", "yi",
             // llama-model.cpp `llama_model_rope_type`: LLM_ARCH_OPENAI_MOE
@@ -258,6 +230,38 @@ pub fn architecture_catalog() -> &'static [ArchProfile] {
             // ferrox had it on the interleaved (NORM) list, which rotates
             // the wrong pairs of every Q/K head.
             "gpt-oss",
+            // Same audit, run over every arch at once against
+            // `llama_model_rope_type`'s NEOX group
+            // (llama-model.cpp:2613-2683). These 24 were on ferrox's
+            // interleaved (NORM) list and reach the generic GQA decoder,
+            // so every one of them rotated the wrong pairs of every Q/K
+            // head and answered fluently and wrongly. Pinned by
+            // `rope_layout_matches_llama_cpp` below; dots1 additionally
+            // checked end-to-end against llama.cpp's own logits in
+            // `tests/moe_routing_bias.rs`.
+            "afmoe",
+            "apertus",
+            "bailingmoe2",
+            "codeshell",
+            "dots1",
+            "exaone",
+            "exaone-moe",
+            "grovemoe",
+            "hunyuan-dense",
+            "hunyuan-moe",
+            "laguna",
+            "mellum",
+            "mimo2",
+            "minicpm3",
+            "nemotron",
+            "openelm",
+            "orion",
+            "plamo3",
+            "seed_oss",
+            "smallthinker",
+            "starcoder2",
+            "step35",
+            "talkie",
         ] {
             v.push(gqa_neox(n));
         }
@@ -322,7 +326,68 @@ pub fn architecture_catalog() -> &'static [ArchProfile] {
                 PerHead,
             ));
         }
-        for (n, fam) in [("phi2", PhiFamily), ("phi3", PhiFamily), ("phimoe", PhiFamily)] {
+        // Refused, not implemented: the generic decoder computes
+        // `x + attn(norm(x))` then `y + ffn(norm(y))`, and every arch
+        // here computes something else that no tensor and (for MiniCPM)
+        // no metadata key makes visible. See
+        // `unsupported_scaling_keys` for the metadata-visible half of
+        // the same class.
+        const PARALLEL_RESIDUAL: &str =
+            "parallel attention+FFN residual -- llama.cpp feeds both branches the *same* \
+             normed input and sums `inpL + attn_out + ffn_out` once; the generic decoder \
+             computes the sequential form, which is a different graph";
+        for (n, rope, fam) in [
+            // src/models/cohere2.cpp:120-134, cohere2moe.cpp:222-266,
+            // command-r.cpp:106-119. All three also carry a
+            // `logit_scale` the generic decoder does not apply.
+            ("command-r", Norm, StandardGqa),
+            ("cohere2", Norm, StandardGqa),
+            ("cohere2moe", Norm, StandardGqa),
+            // src/models/falcon.cpp:121-135 (and an `attn_norm_2` the
+            // generic decoder has no slot for).
+            ("falcon", Neox, StandardGqa),
+            // src/models/gptneox.cpp:147-195 -- parallel or sequential
+            // per `use_par_res`, and the generic decoder implements
+            // neither branch of that choice.
+            ("gptneox", Neox, StandardGqa),
+            // src/models/phi2.cpp:116-117, plamo.cpp:97-112.
+            ("phi2", Neox, PhiFamily),
+            ("plamo", Neox, StandardGqa),
+        ] {
+            v.push(prof(
+                n,
+                TextGeneration,
+                fam,
+                KvGqa,
+                rope,
+                ArchPath::DedicatedOnly {
+                    reason: PARALLEL_RESIDUAL,
+                },
+                WholeVector,
+            ));
+        }
+        // MiniCPM is the case `unsupported_scaling_keys` cannot catch:
+        // `src/models/minicpm.cpp:4-14` *hardcodes* an embedding
+        // multiplier of 12.0, a residual multiplier of
+        // `1.4/sqrt(n_layer)` and a logit multiplier of `256/n_embd`,
+        // and only then lets the GGUF override them. An older MiniCPM
+        // export carrying none of the three keys is still scaled by all
+        // three, so a key-presence gate sees nothing and the generic
+        // decoder computes an unscaled graph.
+        v.push(prof(
+            "minicpm",
+            TextGeneration,
+            StandardGqa,
+            KvGqa,
+            Norm,
+            ArchPath::DedicatedOnly {
+                reason: "unconditional embedding/residual/logit multipliers that llama.cpp \
+                         applies even when the GGUF omits every key; not applied by the \
+                         generic decoder",
+            },
+            WholeVector,
+        ));
+        for (n, fam) in [("phi3", PhiFamily), ("phimoe", PhiFamily)] {
             v.push(prof(
                 n,
                 TextGeneration,
@@ -366,7 +431,11 @@ pub fn architecture_catalog() -> &'static [ArchProfile] {
                 TextGeneration,
                 Dedicated,
                 KvGqa,
-                Norm,
+                // llama-model.cpp puts both in the NEOX group. Inert
+                // today (minimax_engine.rs carries its own RoPE and
+                // never reads this field), but the table advertises
+                // itself as a mirror of llama.cpp's, so it says NEOX.
+                Neox,
                 ArchPath::DedicatedOnly {
                     reason: "MiniMax 256-expert sigmoid MoE + MTP — see minimax_engine.rs",
                 },
@@ -702,6 +771,64 @@ pub fn unsupported_feature_keys(arch: &str) -> Vec<(String, &'static str)> {
     ]
 }
 
+/// Scalar multipliers a checkpoint can declare in **metadata** that the
+/// generic decoder does not apply, with the value that means "no-op".
+///
+/// These are the blind spot left by
+/// [`crate::loader::assert_every_tensor_consumed`]: that gate catches a
+/// missing *tensor*, but Granite / MiniCPM / Command-R style multipliers
+/// are hparams, not weights, so a checkpoint carrying them loads
+/// cleanly, runs at full speed, and computes a graph scaled differently
+/// from the one the checkpoint was trained as. Nothing says so.
+///
+/// llama.cpp key names (`llama-arch.cpp`):
+/// `%s.logit_scale` (`LLM_KV_LOGIT_SCALE`), `%s.residual_scale`,
+/// `%s.embedding_scale`, `%s.attention.scale`. Granite reads all four
+/// (`src/models/granite.cpp::load_arch_hparams`); MiniCPM and
+/// Command-R/Cohere2 read the subset they use.
+///
+/// **This is a refusal, not an implementation.** `residual_scale` in
+/// particular multiplies the attention and FFN branch outputs before
+/// every residual add, which in ferrox means every CPU decode/prefill/
+/// multi-seq path *and* the fused Metal kernels that fold the residual
+/// in — landing it half-way would be exactly the silent divergence this
+/// list exists to stop. Until the math is there, a checkpoint that
+/// declares one of these is refused by name.
+///
+/// The no-op value differs by key: the three `*_scale` multipliers are
+/// `1.0`, while llama.cpp's `f_attention_scale` uses `0.0` as its
+/// "unset, use 1/sqrt(head_dim)" sentinel.
+pub fn unsupported_scaling_keys(arch: &str) -> Vec<(String, &'static str, f32)> {
+    let profile = resolve_profile(arch);
+    // Gemma implements its own embedding scale and attention scale.
+    if matches!(profile.map(|p| p.family), Some(DecoderFamily::GemmaFamily)) {
+        return Vec::new();
+    }
+    let key = |suffix: &str| format!("{arch}.{suffix}");
+    vec![
+        (
+            key("logit_scale"),
+            "logit multiplier (Granite / Command-R `logits_scaling`); not applied by the generic decoder",
+            1.0,
+        ),
+        (
+            key("residual_scale"),
+            "residual multiplier (Granite `residual_multiplier`); not applied by the generic decoder",
+            1.0,
+        ),
+        (
+            key("embedding_scale"),
+            "embedding multiplier (Granite / MiniCPM `embedding_multiplier`); the generic decoder only scales embeddings for the Gemma family",
+            1.0,
+        ),
+        (
+            key("attention.scale"),
+            "explicit attention score scale (Granite `attention_multiplier`); the generic decoder always uses 1/sqrt(head_dim)",
+            0.0,
+        ),
+    ]
+}
+
 /// Markdown coverage table for docs / CI drift checks.
 pub fn coverage_report_markdown() -> String {
     let mut lines = vec![
@@ -900,5 +1027,53 @@ mod tests {
     fn gemma_family_does_not_fail_closed_on_softcap_keys() {
         assert!(unsupported_feature_keys("gemma3").is_empty());
         assert!(!unsupported_feature_keys("llama").is_empty());
+    }
+
+    /// Parallel attention+FFN residual is not a tensor and, for MiniCPM,
+    /// not even a metadata key -- llama.cpp hardcodes MiniCPM's three
+    /// multipliers. Neither the tensor-consumption gate nor
+    /// `unsupported_scaling_keys` can see the difference, so these
+    /// architectures must not be admitted to the generic decoder at all.
+    #[test]
+    fn architectures_with_a_different_residual_topology_are_refused() {
+        for arch in [
+            "command-r",
+            "cohere2",
+            "cohere2moe",
+            "falcon",
+            "gptneox",
+            "phi2",
+            "plamo",
+            "minicpm",
+        ] {
+            match resolve_architecture(arch) {
+                Some(ArchPath::DedicatedOnly { reason }) => {
+                    assert!(!reason.is_empty(), "{arch} must say why");
+                }
+                other => panic!("{arch} must be refused, got {other:?}"),
+            }
+        }
+        // The sequential-residual siblings stay on the generic path --
+        // this is a named list, not a family-wide ban.
+        for arch in ["phi3", "phimoe", "plamo3", "starcoder2", "nemotron"] {
+            assert!(
+                matches!(
+                    resolve_architecture(arch),
+                    Some(ArchPath::GenericGqa { .. })
+                ),
+                "{arch} must stay generic"
+            );
+        }
+    }
+
+    /// Every architecture appears exactly once, so a refusal added next
+    /// to an existing entry cannot be shadowed by whichever the lookup
+    /// happens to find first.
+    #[test]
+    fn no_architecture_is_listed_twice() {
+        let mut seen = std::collections::HashSet::new();
+        for p in architecture_catalog() {
+            assert!(seen.insert(p.gguf_name), "{} listed twice", p.gguf_name);
+        }
     }
 }

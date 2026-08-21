@@ -30,6 +30,24 @@ Verified against llama.cpp on the same host and GGUF via `ferrox bench`
 - **Also loadable** — yi, qwen2moe / qwen3moe (e.g. MiroThinker GGUFs),
   Gemma-2, Phi-3, Llama-3.1, GLM4 when tensors are present (not in the
   published suite).
+- **MoE routing bias** (`exp_probs_b`, DeepSeek-V3's aux-loss-free
+  selection bias) plus `expert_weights_scale` / `expert_weights_norm`, on
+  the generic path — the tensor is what the fail-closed gate used to
+  refuse on dots1, ernie4_5-moe, bailingmoe2, exaone-moe, hunyuan-moe and
+  afmoe. Checked against llama.cpp's own dots1 implementation reading the
+  same synthetic checkpoint; not validated on a published one.
+- **Granite / MiniCPM / Command-R scalar multipliers are refused, not
+  implemented.** `logit_scale`, `residual_scale`, `embedding_scale` and
+  `attention.scale` are hparams rather than tensors, so the
+  tensor-consumption gate cannot see them; a checkpoint declaring a
+  non-no-op value is refused by name. `minicpm` is refused outright,
+  since llama.cpp applies its three multipliers even when the file
+  carries no key at all.
+- **Parallel-residual architectures are refused, not implemented** —
+  `command-r`, `cohere2`, `cohere2moe`, `falcon`, `gptneox`, `phi2`,
+  `plamo`. They sum `inpL + attn_out + ffn_out` once instead of taking
+  two sequential residuals, which is a different graph and is invisible
+  in the tensor list.
 
 Full matrix: [`MODELS.md`](MODELS.md) ·
 [`benchmarks/RESULTS.md`](../benchmarks/RESULTS.md) ·

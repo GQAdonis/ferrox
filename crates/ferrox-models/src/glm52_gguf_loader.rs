@@ -529,7 +529,12 @@ pub fn load_glm52_moe_ffn(
 
     Ok(Glm52MoeFfnWeights {
         router_weight: load_weight_matrix(file, &format!("blk.{l}.ffn_gate_inp.weight"))?,
-        e_score_correction_bias: load_f32_vec(file, &format!("blk.{l}.ffn_exp_probs_b.bias"))?,
+        // `LLM_TENSOR_FFN_EXP_PROBS_B` is spelled `blk.%d.exp_probs_b`
+        // on disk -- no `ffn_` prefix (llama-arch.cpp:416,
+        // gguf-py/gguf/constants.py:1240). This asked for a name no real
+        // checkpoint carries, and the synthetic fixture below wrote the
+        // same wrong name, so the tests agreed with the bug.
+        e_score_correction_bias: load_f32_vec(file, &format!("blk.{l}.exp_probs_b.bias"))?,
         experts,
         shared_expert,
     })
@@ -946,7 +951,7 @@ mod tests {
                 vec![0.02; n * h],
             ));
             tensors.push(f32_tensor(
-                format!("blk.{l}.ffn_exp_probs_b.bias"),
+                format!("blk.{l}.exp_probs_b.bias"),
                 vec![n as u64],
                 vec![0.0; n],
             ));

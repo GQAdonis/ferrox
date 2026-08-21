@@ -150,6 +150,7 @@ use std::thread::{self, JoinHandle};
 
 use ferrox_core::cache::KvCache;
 use ferrox_models::sampling::Sampler;
+use ferrox_models::tokenizer::StopTokens;
 use ferrox_models::Decoder;
 use ferrox_models::{Ceiling, KvElem, KvShape};
 
@@ -619,7 +620,7 @@ impl PrefillState {
 struct Job {
     prompt_tokens: Vec<usize>,
     params: GenerationParams,
-    eos_id: Option<usize>,
+    stop_tokens: StopTokens,
     reply: Sender<JobResult>,
     /// Cancellation handle for this job, from submission onwards.
     abort: AbortId,
@@ -754,7 +755,7 @@ struct Slot {
     stops: StopMatcher,
     prompt_tokens: usize,
     max_tokens: usize,
-    eos_id: Option<usize>,
+    stop_tokens: StopTokens,
     params: GenerationParams,
     reply: Sender<JobResult>,
     finish: Option<FinishReason>,
@@ -866,7 +867,7 @@ impl ContinuousBatcher {
         &self,
         prompt_tokens: Vec<usize>,
         params: GenerationParams,
-        eos_id: Option<usize>,
+        stop_tokens: StopTokens,
     ) -> Result<(FinishReason, Vec<usize>, String, Usage), DecodeError> {
         // A request that could never fit is refused first, and refused
         // with the ceiling named: queueing it would only make it wait
@@ -893,7 +894,7 @@ impl ContinuousBatcher {
             .send(Job {
                 prompt_tokens,
                 params,
-                eos_id,
+                stop_tokens,
                 reply: reply_tx,
                 abort,
                 blocks,
@@ -1153,9 +1154,12 @@ fn worker_loop(
             let next =
                 slot.sampler
                     .sample(&slot.logits, &slot.params.sampling, &slot.generated_ids);
-            // EOS and a token-level stop are the same fact: this token
-            // ends the answer and is not part of it.
-            if Some(next) == slot.eos_id || slot.stops.is_stop_token(next) {
+            // Three ways this token ends the answer, and they compose:
+            // the model's own end-of-generation set (not `eos_id`
+            // alone -- gemma-2 ends on `<end_of_turn>`), and a
+            // single-token stop the caller asked for. All of them mean
+            // the token is a terminator and not part of the output.
+            if slot.stop_tokens.contains(next) || slot.stops.is_stop_token(next) {
                 slot.finish = Some(FinishReason::Stop);
                 continue;
             }
@@ -1229,7 +1233,7 @@ struct Prefill {
     /// `state.tokens.len()`, which is 1 for an empty prompt.
     prompt_tokens: usize,
     params: GenerationParams,
-    eos_id: Option<usize>,
+    stop_tokens: StopTokens,
     reply: Sender<JobResult>,
     abort: AbortId,
     /// Blocks reserved at admission; carried into the `Slot` so the
@@ -1243,7 +1247,7 @@ impl Prefill {
             state,
             prompt_tokens,
             params,
-            eos_id,
+            stop_tokens,
             reply,
             abort,
             blocks,
@@ -1259,7 +1263,7 @@ impl Prefill {
             stops: StopMatcher::new(&params.stop, &params.stop_token_ids),
             prompt_tokens,
             max_tokens: params.max_tokens,
-            eos_id,
+            stop_tokens,
             params,
             reply,
             finish: None,
@@ -1288,7 +1292,7 @@ fn accept(decoder: &Arc<Decoder>, job: Job, chunk_size: usize) -> Option<Prefill
         state: PrefillState::new(Arc::clone(decoder), &job.prompt_tokens, chunk_size),
         prompt_tokens: job.prompt_tokens.len(),
         params: job.params,
-        eos_id: job.eos_id,
+        stop_tokens: job.stop_tokens,
         reply: job.reply,
         abort: job.abort,
         blocks: job.blocks,
@@ -1428,7 +1432,9 @@ mod tests {
             };
             threads.push(thread::spawn(move || {
                 barrier.wait();
-                let out = batcher.generate(prompt, par, None).expect("batch generate");
+                let out = batcher
+                    .generate(prompt, par, StopTokens::default())
+                    .expect("batch generate");
                 results.lock().unwrap()[i] = Some(out.1);
             }));
         }
@@ -1484,7 +1490,7 @@ mod tests {
             },
         );
         let (finish, _ids, text, _usage) = batcher
-            .generate(prompt, params, None)
+            .generate(prompt, params, StopTokens::default())
             .expect("batch generate");
         assert_eq!(finish, FinishReason::Stop);
         assert!(
@@ -1493,6 +1499,39 @@ mod tests {
         );
         assert_eq!(&full[..full.find(&stop).unwrap()], text);
     }
+    /// The continuous batcher carried the same single `eos_id` every
+    /// other server decode loop did, so a Llama-3 or gemma checkpoint
+    /// served through it ran past its own turn ender to `max_tokens`.
+    /// Here the stop set holds the third token this prompt would
+    /// otherwise generate and nothing else: a loop honouring the set
+    /// stops with exactly two tokens, one comparing against a lone
+    /// metadata EOS runs all 32.
+    #[test]
+    fn continuous_batch_stops_on_any_member_of_the_stop_set() {
+        let decoder = tiny_decoder();
+        let decode: DecodeFn = Arc::new(|_: &[usize]| String::new());
+        let prompt = vec![1usize, 2, 3];
+        let params = greedy_params(32, 3);
+        let ids = sequential_ids(&decoder, &prompt, &params);
+        assert!(ids.len() > 3, "need a mid-stream token to stop on");
+        let turn_ender = ids[2];
+
+        let batcher = ContinuousBatcher::spawn_with_config(
+            Arc::clone(&decoder),
+            decode,
+            BatcherConfig {
+                prefill_chunk: 2,
+                ..BatcherConfig::default()
+            },
+        );
+        let (finish, got, _text, usage) = batcher
+            .generate(prompt, params, StopTokens::from_eos(Some(turn_ender)))
+            .expect("batch generate");
+        assert_eq!(finish, FinishReason::Stop);
+        assert_eq!(got, ids[..2].to_vec());
+        assert_eq!(usage.completion_tokens, 2);
+    }
+
     /// The state machine itself: each `step_chunk` is bounded by the
     /// chunk size, is resumable, and reports done exactly once the
     /// prompt is exhausted. This is the property the whole scheduler
@@ -1591,7 +1630,9 @@ mod tests {
         // generating while the second job's prompt is chunked through.
         let decode_job = {
             let batcher = batcher.clone();
-            thread::spawn(move || batcher.generate(vec![1, 2], greedy_params(90, 5), None))
+            thread::spawn(move || {
+                batcher.generate(vec![1, 2], greedy_params(90, 5), StopTokens::default())
+            })
         };
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
         while batcher.stats().decode_steps < 2 {
@@ -1604,7 +1645,9 @@ mod tests {
         let prefill_at_submit = batcher.stats().prefill_tokens;
         let prefill_job = {
             let batcher = batcher.clone();
-            thread::spawn(move || batcher.generate(long_prompt, greedy_params(1, 9), None))
+            thread::spawn(move || {
+                batcher.generate(long_prompt, greedy_params(1, 9), StopTokens::default())
+            })
         };
 
         // Claim 1: catch the long prompt mid-prefill. An unbounded
@@ -1678,7 +1721,7 @@ mod tests {
                 let batcher = batcher.clone();
                 thread::spawn(move || {
                     batcher
-                        .generate(prompt, greedy_params(6, seed), None)
+                        .generate(prompt, greedy_params(6, seed), StopTokens::default())
                         .expect("generate")
                         .1
                 })
@@ -1717,7 +1760,7 @@ mod tests {
                 stops: StopMatcher::new(&params.stop, &params.stop_token_ids),
                 prompt_tokens: 0,
                 max_tokens,
-                eos_id: None,
+                stop_tokens: StopTokens::default(),
                 params,
                 reply: tx,
                 abort: AbortId(0),
@@ -1867,7 +1910,10 @@ mod tests {
                 }
                 thread::spawn(move || {
                     barrier.wait();
-                    batcher.generate(prompt, params, None).expect("generate").1
+                    batcher
+                        .generate(prompt, params, StopTokens::default())
+                        .expect("generate")
+                        .1
                 })
             })
             .collect();
@@ -1958,7 +2004,7 @@ mod tests {
             },
         );
         let err = batcher
-            .generate(vec![1, 2, 3], greedy_params(4, 1), None)
+            .generate(vec![1, 2, 3], greedy_params(4, 1), StopTokens::default())
             .expect_err("a full queue must refuse");
         assert!(
             matches!(err, DecodeError::QueueFull { queued: 0, cap: 0 }),
@@ -1986,7 +2032,7 @@ mod tests {
         );
         for _ in 0..3 {
             batcher
-                .generate(vec![1, 2, 3], greedy_params(2, 1), None)
+                .generate(vec![1, 2, 3], greedy_params(2, 1), StopTokens::default())
                 .expect("a cap of 1 still serves requests one after another");
         }
         assert_eq!(batcher.stats().queue_depth, 0);

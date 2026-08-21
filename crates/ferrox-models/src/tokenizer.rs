@@ -37,6 +37,46 @@ pub fn should_add_bos_token(file: &impl ferrox_gguf::TensorSource) -> bool {
     matches!(pre, "tekken" | "chameleon")
 }
 
+/// Prepends the checkpoint's BOS id to an already-encoded prompt, unless
+/// the prompt already starts with it.
+///
+/// # The rule, stated once
+///
+/// **The chat template owns BOS when it prints one; the loader owns it
+/// otherwise.** Which of the two happens is a property of the individual
+/// checkpoint, not of the family:
+///
+/// * Many upstream templates open with `{{ bos_token }}` — gemma-2/3
+///   (`<bos>`), Mistral-Instruct and TinyLlama (`<s>`), Llama-3
+///   (`<|begin_of_text|>`). Rendering one of those already puts BOS in
+///   the *text*, and both [`GgufBpeTokenizer::encode`] and
+///   [`GgufSpmTokenizer::encode`] split on special-token text first, so
+///   it comes back as the BOS *id* in position 0.
+/// * Unsloth deliberately **strips** `{{ bos_token }}` out of the
+///   templates it bakes into its GGUF exports, precisely so that a
+///   runtime which adds BOS itself does not double it. On those
+///   checkpoints the render carries no BOS and the loader must add it.
+///
+/// So neither "always add" nor "never add" is right, and a renderer
+/// cannot be sniffed for which case it is. This function implements the
+/// only rule that is correct for both: add the id, **idempotently**.
+/// `bos` is already the gated value — pass `None` when
+/// [`should_add_bos_token`] says this vocabulary does not take one
+/// (BPE/qwen2 ship a `bos_token_id` they never prepend).
+///
+/// Note this is *stricter* than llama.cpp, whose `add_special` path
+/// pushes BOS unconditionally and leaves the duplicate to a warning.
+/// Ferrox has no user-visible "you asked for two BOS tokens" surface, so
+/// it dedupes instead of warning.
+/// Generic over the id width because the CLI and server carry prompts as
+/// `Vec<usize>` and the tokenizers emit `Vec<u32>`.
+pub fn prepend_bos<T: Copy + PartialEq>(tokens: &mut Vec<T>, bos: Option<T>) {
+    let Some(bos) = bos else { return };
+    if tokens.first() != Some(&bos) {
+        tokens.insert(0, bos);
+    }
+}
+
 /// Token texts llama.cpp treats as end-of-generation regardless of what
 /// the metadata ids say (`llama-vocab.cpp`, the literal list right above
 /// its "sanity checks" block). Copied verbatim, including the comments
@@ -106,6 +146,77 @@ pub fn eog_token_ids(file: &impl ferrox_gguf::TensorSource) -> std::collections:
         }
     }
     out
+}
+
+/// The set of token ids a decode loop must stop on, carried as one value
+/// so a caller cannot accidentally carry only half of it.
+///
+/// This type exists because `Option<usize>` was the shape of a real bug:
+/// every `ferrox-server` decode loop threaded a single `eos_id` from the
+/// loader to the sampler, so a Llama-3 or gemma checkpoint served over
+/// HTTP ran past `<|eot_id|>` / `<end_of_turn>` to `max_tokens` even
+/// after [`eog_token_ids`] landed for the CLI. Passing a `StopTokens`
+/// makes "I only have the metadata EOS" an explicit choice
+/// ([`StopTokens::from_eos`], for the synthetic-weights and Kimi paths
+/// that have no GGUF metadata to read) rather than the default.
+#[derive(Clone, Debug, Default)]
+pub struct StopTokens {
+    ids: std::collections::HashSet<u32>,
+}
+
+impl StopTokens {
+    /// Everything [`eog_token_ids`] finds in this checkpoint: the
+    /// `eos`/`eot`/`eom` metadata ids plus every vocabulary entry whose
+    /// text is on llama.cpp's literal EOG list.
+    pub fn from_gguf(file: &impl ferrox_gguf::TensorSource) -> Self {
+        Self {
+            ids: eog_token_ids(file),
+        }
+    }
+
+    /// Just the one id. For callers with no GGUF metadata behind them —
+    /// the synthetic random-weights demo model, and the Kimi checkpoint
+    /// directory whose tokenizer is a separate file format.
+    pub fn from_eos(eos: Option<usize>) -> Self {
+        Self {
+            ids: eos.map(|e| e as u32).into_iter().collect(),
+        }
+    }
+
+    /// For checkpoints whose vocabulary is not GGUF metadata — Kimi K3
+    /// ships a `tokenizer_config.json` with a name→id special-token map.
+    /// Folds in every entry whose *text* is on llama.cpp's EOG list, so
+    /// `[EOT]` stops a turn there exactly as it does in a GGUF.
+    pub fn from_special_tokens<'a>(specials: impl IntoIterator<Item = (&'a str, u32)>) -> Self {
+        Self {
+            ids: specials
+                .into_iter()
+                .filter(|(name, _)| EOG_TOKEN_TEXTS.contains(name))
+                .map(|(_, id)| id)
+                .collect(),
+        }
+    }
+
+    /// Folds one more id in — used to keep a metadata `eos_token_id` that
+    /// a vocabulary spells in a way the literal list does not know.
+    pub fn with_id(mut self, id: Option<usize>) -> Self {
+        if let Some(id) = id {
+            self.ids.insert(id as u32);
+        }
+        self
+    }
+
+    pub fn contains(&self, id: usize) -> bool {
+        u32::try_from(id).is_ok_and(|id| self.ids.contains(&id))
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.ids.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.ids.len()
+    }
 }
 
 pub struct ByteTokenizer;
@@ -1818,5 +1929,40 @@ mod eog_tests {
     fn a_file_with_nothing_to_go_on_yields_no_stop_tokens() {
         let src = source(&["a", "b"], &[]);
         assert!(eog_token_ids(&src).is_empty());
+    }
+
+    /// The case a template-evaluating loader creates: gemma-3, Mistral,
+    /// Phi-3 and DeepSeek-R1-Distill all open their real
+    /// `tokenizer.chat_template` with `{{ bos_token }}`, so the encoded
+    /// prompt already starts with the BOS id before the loader gets a
+    /// look. Measured on the local corpus by
+    /// `tests/bos_policy.rs::sweep_local_gguf_bos_policy`: 6 of 26
+    /// checkpoints double their BOS if this is an unconditional insert.
+    #[test]
+    fn a_template_that_already_emitted_bos_is_not_given_a_second_one() {
+        let mut ids = vec![2u32, 105, 2364];
+        prepend_bos(&mut ids, Some(2));
+        assert_eq!(ids, vec![2, 105, 2364]);
+    }
+
+    /// The other half of the same rule: Unsloth strips `{{ bos_token }}`
+    /// out of the templates it exports (TinyLlama's checked-in template
+    /// is the local example), so on those checkpoints nobody adds BOS
+    /// unless the loader does.
+    #[test]
+    fn a_template_that_stripped_bos_gets_one_from_the_loader() {
+        let mut ids = vec![529u32, 29989];
+        prepend_bos(&mut ids, Some(1));
+        assert_eq!(ids, vec![1, 529, 29989]);
+    }
+
+    /// `None` is the `should_add_bos_token` gate having said no — BPE
+    /// vocabularies ship a `bos_token_id` they never prepend, and
+    /// Qwen2-MoE's is `<|endoftext|>`.
+    #[test]
+    fn a_vocabulary_that_does_not_take_bos_gets_nothing() {
+        let mut ids = vec![151644u32, 872];
+        prepend_bos(&mut ids, None);
+        assert_eq!(ids, vec![151644, 872]);
     }
 }

@@ -28,6 +28,7 @@
 use std::path::Path;
 
 use ferrox_gguf::ShardedGguf;
+use ferrox_models::tokenizer::StopTokens;
 use ferrox_models::{
     deepseek_v4_pro, glm_5_2, kimi_k3, load_gemma4_engine_from_path, load_glm52_engine_from_path,
     load_mla_engine_from_path, select_engine_kind, ByteTokenizer, Decoder, Gemma4Engine,
@@ -154,7 +155,7 @@ fn tokenizer_from_gguf(file: &ShardedGguf) -> anyhow::Result<ServerTokenizer> {
 pub struct GgufLoaded {
     pub decoder: Decoder,
     pub tokenizer: ServerTokenizer,
-    pub eos_id: Option<usize>,
+    pub stop_tokens: StopTokens,
     pub bos_id: Option<usize>,
     /// True when this is the synthetic-random-weights fallback rather
     /// than a real checkpoint -- surfaced in `/v1/models` and logged so
@@ -169,14 +170,14 @@ pub struct GgufLoaded {
 pub struct KimiLoaded {
     pub engine: KimiEngine,
     pub tokenizer: ferrox_models::kimi_tokenizer::KimiTokenizer,
-    pub eos_id: Option<usize>,
+    pub stop_tokens: StopTokens,
     pub chat_template: crate::chat_template::ChatTemplate,
 }
 
 pub struct MlaLoaded {
     pub engine: MlaEngine,
     pub tokenizer: ServerTokenizer,
-    pub eos_id: Option<usize>,
+    pub stop_tokens: StopTokens,
     pub bos_id: Option<usize>,
     pub name: String,
     pub chat_template: crate::chat_template::ChatTemplate,
@@ -185,7 +186,7 @@ pub struct MlaLoaded {
 pub struct Gemma4Loaded {
     pub engine: Gemma4Engine,
     pub tokenizer: ServerTokenizer,
-    pub eos_id: Option<usize>,
+    pub stop_tokens: StopTokens,
     pub bos_id: Option<usize>,
     pub name: String,
     pub chat_template: crate::chat_template::ChatTemplate,
@@ -194,7 +195,7 @@ pub struct Gemma4Loaded {
 pub struct Glm52Loaded {
     pub engine: Glm52Engine,
     pub tokenizer: ServerTokenizer,
-    pub eos_id: Option<usize>,
+    pub stop_tokens: StopTokens,
     pub bos_id: Option<usize>,
     pub name: String,
     pub chat_template: crate::chat_template::ChatTemplate,
@@ -250,7 +251,7 @@ pub fn load() -> anyhow::Result<LoadedModel> {
             Ok(LoadedModel::Gguf(GgufLoaded {
                 decoder: build_synthetic_decoder(&preset)?,
                 tokenizer: ServerTokenizer::Byte,
-                eos_id: None,
+                stop_tokens: StopTokens::default(),
                 bos_id: None,
                 is_synthetic: true,
                 chat_template: crate::chat_template::ChatTemplate::Plain,
@@ -301,9 +302,9 @@ fn load_glm52_checkpoint(path: &str, file: &ShardedGguf) -> anyhow::Result<Glm52
     };
 
     let tokenizer = tokenizer_from_gguf(file)?;
-    let eos_id = file
-        .metadata_u64("tokenizer.ggml.eos_token_id")
-        .map(|v| v as usize);
+    // The whole EOG set, not `eos_token_id` alone: see
+    // `ferrox_models::tokenizer::StopTokens`.
+    let stop_tokens = StopTokens::from_gguf(file);
     // Only surface BOS when llama.cpp would add it (see
     // `ferrox_models::tokenizer::should_add_bos_token`). Qwen2/BPE leave
     // add_bos=false; prepending `<|endoftext|>` poisons decode.
@@ -324,7 +325,7 @@ fn load_glm52_checkpoint(path: &str, file: &ShardedGguf) -> anyhow::Result<Glm52
     Ok(Glm52Loaded {
         engine,
         tokenizer,
-        eos_id,
+        stop_tokens,
         bos_id,
         name,
         chat_template,
@@ -347,9 +348,9 @@ fn load_mla_checkpoint(path: &str, file: &ShardedGguf) -> anyhow::Result<MlaLoad
     };
 
     let tokenizer = tokenizer_from_gguf(file)?;
-    let eos_id = file
-        .metadata_u64("tokenizer.ggml.eos_token_id")
-        .map(|v| v as usize);
+    // The whole EOG set, not `eos_token_id` alone: see
+    // `ferrox_models::tokenizer::StopTokens`.
+    let stop_tokens = StopTokens::from_gguf(file);
     // Only surface BOS when llama.cpp would add it (see
     // `ferrox_models::tokenizer::should_add_bos_token`). Qwen2/BPE leave
     // add_bos=false; prepending `<|endoftext|>` poisons decode.
@@ -370,7 +371,7 @@ fn load_mla_checkpoint(path: &str, file: &ShardedGguf) -> anyhow::Result<MlaLoad
     Ok(MlaLoaded {
         engine,
         tokenizer,
-        eos_id,
+        stop_tokens,
         bos_id,
         name,
         chat_template,
@@ -394,9 +395,9 @@ fn load_gemma4_checkpoint(path: &str, file: &ShardedGguf) -> anyhow::Result<Gemm
     let engine = *engine;
 
     let tokenizer = tokenizer_from_gguf(file)?;
-    let eos_id = file
-        .metadata_u64("tokenizer.ggml.eos_token_id")
-        .map(|v| v as usize);
+    // The whole EOG set, not `eos_token_id` alone: see
+    // `ferrox_models::tokenizer::StopTokens`.
+    let stop_tokens = StopTokens::from_gguf(file);
     // Only surface BOS when llama.cpp would add it (see
     // `ferrox_models::tokenizer::should_add_bos_token`). Qwen2/BPE leave
     // add_bos=false; prepending `<|endoftext|>` poisons decode.
@@ -417,7 +418,7 @@ fn load_gemma4_checkpoint(path: &str, file: &ShardedGguf) -> anyhow::Result<Gemm
     Ok(Gemma4Loaded {
         engine,
         tokenizer,
-        eos_id,
+        stop_tokens,
         bos_id,
         name,
         chat_template,
@@ -441,9 +442,9 @@ fn load_real_gguf_checkpoint(path: &str, file: &ShardedGguf) -> anyhow::Result<G
 
     let tokenizer = tokenizer_from_gguf(file)?;
 
-    let eos_id = file
-        .metadata_u64("tokenizer.ggml.eos_token_id")
-        .map(|v| v as usize);
+    // The whole EOG set, not `eos_token_id` alone: see
+    // `ferrox_models::tokenizer::StopTokens`.
+    let stop_tokens = StopTokens::from_gguf(file);
     // Only surface BOS when llama.cpp would add it (see
     // `ferrox_models::tokenizer::should_add_bos_token`). Qwen2/BPE leave
     // add_bos=false; prepending `<|endoftext|>` poisons decode.
@@ -475,7 +476,7 @@ fn load_real_gguf_checkpoint(path: &str, file: &ShardedGguf) -> anyhow::Result<G
     Ok(GgufLoaded {
         decoder,
         tokenizer,
-        eos_id,
+        stop_tokens,
         bos_id,
         is_synthetic: false,
         chat_template,
@@ -549,12 +550,19 @@ pub(crate) fn load_kimi_checkpoint_with_config(
         Some(text) => ferrox_models::kimi_tokenizer::parse_special_tokens(text)?,
         None => std::collections::HashMap::new(),
     };
-    let eos_id = special_tokens.get("[EOS]").copied().map(|v| v as usize);
+    // Kimi K3's vocabulary is `tokenizer_config.json`, not GGUF
+    // metadata, so the EOG set is derived from the special-token names:
+    // `[EOT]` ends a turn there and `[EOS]` ends the sequence, and
+    // stopping only on the latter runs the model past its own turn.
+    let stop_tokens = StopTokens::from_special_tokens(
+        special_tokens.iter().map(|(name, id)| (name.as_str(), *id)),
+    );
     let tokenizer =
         ferrox_models::kimi_tokenizer::KimiTokenizer::new(ranks, special_tokens.clone())?;
     tracing::info!(
-        "loaded real tokenizer: {} base tokens, eos_id={eos_id:?}",
-        tokenizer.vocab_size()
+        "loaded real tokenizer: {} base tokens, {} stop tokens",
+        tokenizer.vocab_size(),
+        stop_tokens.len()
     );
 
     // Kimi K3's checkpoint carries its chat template as a top-level
@@ -596,7 +604,7 @@ pub(crate) fn load_kimi_checkpoint_with_config(
     Ok(KimiLoaded {
         engine,
         tokenizer,
-        eos_id,
+        stop_tokens,
         chat_template,
     })
 }

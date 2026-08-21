@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 
 use ferrox_core::cache::{KvBlockPool, KvCache, KvPoolExhausted as CacheKvPoolExhausted};
 use ferrox_models::sampling::{Sampler, SamplingParams};
+use ferrox_models::tokenizer::{prepend_bos, StopTokens};
 use ferrox_models::{Decoder, Engine, PrefixCache, TextTokenizer};
 
 use crate::json_mode::mask_logits_for_json;
@@ -260,13 +261,13 @@ fn forward_prompt_batch(
 /// inference servers use for this exact reason.
 #[allow(clippy::too_many_arguments)] // one clear parameter per concern; a
                                      // bundling struct here would just be GenerationParams's fields plus
-                                     // decoder/tokenizer/eos_id/bos_id/prompt/kv_pool/prefix_cache/emit
+                                     // decoder/tokenizer/stop_tokens/bos_id/prompt/kv_pool/prefix_cache/emit
                                      // re-wrapped for no real benefit at this call depth (two call sites,
                                      // both in this crate).
 pub fn generate(
     decoder: &Decoder,
     tokenizer: &ServerTokenizer,
-    eos_id: Option<usize>,
+    stop_tokens: &StopTokens,
     bos_id: Option<usize>,
     prompt: &str,
     params: &GenerationParams,
@@ -296,11 +297,7 @@ pub fn generate(
     };
 
     let mut tokens = tokenizer.encode(prompt);
-    if let Some(bos) = bos_id {
-        if tokens.first() != Some(&bos) {
-            tokens.insert(0, bos);
-        }
-    }
+    prepend_bos(&mut tokens, bos_id);
     let prompt_tokens = tokens.len();
     if let Some(&bad) = tokens.iter().find(|&&t| t >= vocab_size) {
         return Err(DecodeError::TokenOutOfVocab {
@@ -446,7 +443,7 @@ pub fn generate(
     let (finish, generated_ids, final_logits) = sample_until_stop(
         logits,
         pos,
-        eos_id,
+        stop_tokens,
         params,
         |ids| tokenizer.decode(ids),
         |next, pos| {
@@ -530,7 +527,7 @@ pub fn generate(
 fn sample_until_stop(
     mut logits: Vec<f32>,
     mut pos: usize,
-    eos_id: Option<usize>,
+    stop_tokens: &StopTokens,
     params: &GenerationParams,
     mut decode_one: impl FnMut(&[usize]) -> String,
     mut step: impl FnMut(usize, usize) -> Vec<f32>,
@@ -569,7 +566,7 @@ fn sample_until_stop(
         } else {
             sampler.sample(&logits, &params.sampling, &generated_ids)
         };
-        if Some(next) == eos_id {
+        if stop_tokens.contains(next) {
             finish = FinishReason::Stop;
             break;
         }
@@ -624,7 +621,7 @@ fn sample_until_stop(
 pub fn generate_engine<E: Engine, T: TextTokenizer>(
     engine: &E,
     tokenizer: &T,
-    eos_id: Option<usize>,
+    stop_tokens: &StopTokens,
     bos_id: Option<usize>,
     prompt: &str,
     params: &GenerationParams,
@@ -632,11 +629,7 @@ pub fn generate_engine<E: Engine, T: TextTokenizer>(
 ) -> Result<(FinishReason, Usage), DecodeError> {
     let vocab_size = engine.vocab_size();
     let mut tokens = tokenizer.encode(prompt);
-    if let Some(bos) = bos_id {
-        if tokens.first() != Some(&bos) {
-            tokens.insert(0, bos);
-        }
-    }
+    prepend_bos(&mut tokens, bos_id);
     let prompt_tokens = tokens.len();
     if let Some(&bad) = tokens.iter().find(|&&t| t >= vocab_size) {
         return Err(DecodeError::TokenOutOfVocab {
@@ -671,7 +664,7 @@ pub fn generate_engine<E: Engine, T: TextTokenizer>(
     let (finish, generated_ids, _final_logits) = sample_until_stop(
         logits,
         pos,
-        eos_id,
+        stop_tokens,
         params,
         |ids| tokenizer.decode(ids),
         |next, pos| {
@@ -846,7 +839,7 @@ mod tests {
         generate(
             &decoder,
             &ServerTokenizer::Byte,
-            None,
+            &StopTokens::default(),
             None,
             &prompt,
             &greedy_params(max_tokens),
@@ -866,7 +859,7 @@ mod tests {
         let result = generate(
             &decoder,
             &ServerTokenizer::Byte,
-            None,
+            &StopTokens::default(),
             None,
             "hello",
             &greedy_params(4),
@@ -885,7 +878,7 @@ mod tests {
         let (finish, _usage) = generate(
             &decoder,
             &ServerTokenizer::Byte,
-            None,
+            &StopTokens::default(),
             None,
             &prompt,
             &greedy_params(5),
@@ -914,7 +907,7 @@ mod tests {
         let (finish, usage) = generate(
             &decoder,
             &ServerTokenizer::Byte,
-            None,
+            &StopTokens::default(),
             None,
             &prompt,
             &params,
@@ -957,7 +950,7 @@ mod tests {
         let (finish, usage) = generate(
             &decoder,
             &ServerTokenizer::Byte,
-            None,
+            &StopTokens::default(),
             None,
             &prompt,
             &params,
@@ -1013,7 +1006,7 @@ mod tests {
         let (finish, _usage) = generate(
             &decoder,
             &ServerTokenizer::Byte,
-            Some(eos),
+            &StopTokens::from_eos(Some(eos)),
             None,
             &prompt,
             &greedy_params(50),
@@ -1026,6 +1019,42 @@ mod tests {
             finish,
             FinishReason::Stop,
             "generation must stop as soon as the greedy-chosen token matches eos_id, not run to max_tokens"
+        );
+    }
+
+    /// The bug this replaced: every server decode loop carried a single
+    /// `eos_id`, so a Llama-3 checkpoint (whose `eos_token_id` is
+    /// `<|end_of_text|>` while turns end with `<|eot_id|>`) or a gemma-2
+    /// one (`<end_of_turn>`) ran past the end of its own turn to
+    /// `max_tokens` over HTTP even after `eog_token_ids` landed for the
+    /// CLI. Here the metadata EOS is deliberately a token the model will
+    /// never pick, and the *turn ender* is the greedy next token: only a
+    /// loop that consults the whole set stops.
+    #[test]
+    fn a_turn_ender_that_is_not_the_metadata_eos_still_stops_generation() {
+        let decoder = small_decoder();
+        let prompt_ids = vec![1usize, 2];
+        let prompt = String::from_utf8(prompt_ids.iter().map(|&b| b as u8).collect()).unwrap();
+        let turn_ender = greedy_next_token_after(&decoder, &prompt_ids);
+        let never_sampled = (turn_ender + 1) % decoder.config.vocab_size;
+
+        let stop = StopTokens::from_eos(Some(never_sampled)).with_id(Some(turn_ender));
+        let (finish, usage) = generate(
+            &decoder,
+            &ServerTokenizer::Byte,
+            &stop,
+            None,
+            &prompt,
+            &greedy_params(50),
+            None,
+            None,
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(finish, FinishReason::Stop);
+        assert_eq!(
+            usage.completion_tokens, 0,
+            "the very first sampled token was the turn ender"
         );
     }
 
@@ -1045,7 +1074,7 @@ mod tests {
         let (baseline_finish, _usage) = generate(
             &decoder,
             &ServerTokenizer::Byte,
-            None,
+            &StopTokens::default(),
             None,
             &prompt,
             &greedy_params(20),
@@ -1059,7 +1088,7 @@ mod tests {
         let (stop_finish, _usage2) = generate(
             &decoder,
             &ServerTokenizer::Byte,
-            None,
+            &StopTokens::default(),
             None,
             &prompt,
             &GenerationParams {
@@ -1298,7 +1327,7 @@ mod tests {
         generate(
             &decoder,
             &ServerTokenizer::Byte,
-            None,
+            &StopTokens::default(),
             None,
             &prompt,
             &greedy_params(20),
@@ -1321,7 +1350,7 @@ mod tests {
         let (finish, _usage) = generate(
             &decoder,
             &ServerTokenizer::Byte,
-            None,
+            &StopTokens::default(),
             None,
             &prompt,
             &GenerationParams {
@@ -1350,7 +1379,7 @@ mod tests {
         let (_finish, usage) = generate(
             &decoder,
             &ServerTokenizer::Byte,
-            None,
+            &StopTokens::default(),
             None,
             &prompt,
             &greedy_params(5),
@@ -1383,7 +1412,7 @@ mod tests {
         let (_f, no_cache) = generate(
             &decoder,
             &ServerTokenizer::Byte,
-            None,
+            &StopTokens::default(),
             None,
             &prompt,
             &greedy_params(2),
@@ -1398,7 +1427,7 @@ mod tests {
         let (_f, miss) = generate(
             &decoder,
             &ServerTokenizer::Byte,
-            None,
+            &StopTokens::default(),
             None,
             &prompt,
             &greedy_params(2),
@@ -1414,7 +1443,7 @@ mod tests {
         let (_f, hit) = generate(
             &decoder,
             &ServerTokenizer::Byte,
-            None,
+            &StopTokens::default(),
             None,
             &longer,
             &greedy_params(2),
@@ -1436,7 +1465,7 @@ mod tests {
         generate(
             &decoder,
             &ServerTokenizer::Byte,
-            None,
+            &StopTokens::default(),
             None,
             &prompt1,
             &greedy_params(5),
@@ -1455,7 +1484,7 @@ mod tests {
         generate(
             &decoder,
             &ServerTokenizer::Byte,
-            None,
+            &StopTokens::default(),
             None,
             &prompt2,
             &greedy_params(5),
@@ -1472,7 +1501,7 @@ mod tests {
         generate(
             &decoder,
             &ServerTokenizer::Byte,
-            None,
+            &StopTokens::default(),
             None,
             &prompt2,
             &greedy_params(5),
@@ -1498,7 +1527,7 @@ mod tests {
         generate(
             &decoder,
             &ServerTokenizer::Byte,
-            None,
+            &StopTokens::default(),
             None,
             &prompt,
             &greedy_params(5),
@@ -1519,7 +1548,7 @@ mod tests {
         generate(
             &decoder,
             &ServerTokenizer::Byte,
-            None,
+            &StopTokens::default(),
             None,
             &prompt,
             &greedy_params(5),
@@ -1533,7 +1562,7 @@ mod tests {
         generate(
             &decoder,
             &ServerTokenizer::Byte,
-            None,
+            &StopTokens::default(),
             None,
             &prompt,
             &greedy_params(5),
@@ -1557,7 +1586,7 @@ mod tests {
         generate(
             &decoder,
             &ServerTokenizer::Byte,
-            None,
+            &StopTokens::default(),
             None,
             &prompt,
             &greedy_params(5),
@@ -1569,7 +1598,7 @@ mod tests {
         generate(
             &decoder,
             &ServerTokenizer::Byte,
-            None,
+            &StopTokens::default(),
             None,
             &prompt,
             &greedy_params(5),
@@ -1602,7 +1631,7 @@ mod tests {
         let (finish, _usage) = generate(
             &decoder,
             &ServerTokenizer::Byte,
-            None,
+            &StopTokens::default(),
             None,
             &prompt,
             &greedy_params(5),
@@ -1643,7 +1672,7 @@ mod tests {
         let (finish, _usage) = generate(
             &decoder,
             &ServerTokenizer::Byte,
-            None,
+            &StopTokens::default(),
             None,
             &prompt,
             &greedy_params(max_tokens),
@@ -1670,7 +1699,7 @@ mod tests {
         let result = generate(
             &decoder,
             &ServerTokenizer::Byte,
-            None,
+            &StopTokens::default(),
             None,
             &prompt,
             &greedy_params(max_tokens),
@@ -1696,7 +1725,7 @@ mod tests {
         let result = generate(
             &decoder,
             &ServerTokenizer::Byte,
-            None,
+            &StopTokens::default(),
             None,
             &prompt,
             &greedy_params(5),
@@ -1727,7 +1756,7 @@ mod tests {
             let (finish, _usage) = generate(
                 &decoder,
                 &ServerTokenizer::Byte,
-                None,
+                &StopTokens::default(),
                 None,
                 &prompt,
                 &greedy_params(5),
@@ -1752,7 +1781,7 @@ mod tests {
         let result = generate(
             &decoder,
             &ServerTokenizer::Byte,
-            None,
+            &StopTokens::default(),
             None,
             &prompt,
             &greedy_params(5),
@@ -1791,7 +1820,7 @@ mod tests {
         let (finish, _usage) = generate(
             &decoder,
             &ServerTokenizer::Byte,
-            None,
+            &StopTokens::default(),
             None,
             &prompt,
             &greedy_params(5),

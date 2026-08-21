@@ -6192,104 +6192,6 @@ fn encode_q4_0_moe_matvec_id(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
-#[allow(dead_code)]
-fn encode_moe_gather_rows(
-    encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
-    device: &Retained<ProtocolObject<dyn MTLDevice>>,
-    src: &ProtocolObject<dyn MTLBuffer>,
-    dst: &ProtocolObject<dyn MTLBuffer>,
-    ids: &ProtocolObject<dyn MTLBuffer>,
-    id_offset_elems: usize,
-    batch_size: u32,
-    cols: u32,
-    src_stride: u32,
-    dst_stride: u32,
-) -> Result<(), MetalError> {
-    if batch_size == 0 {
-        return Ok(());
-    }
-    const TG: usize = 256;
-    let pipe = ensure_pipeline(device, Q4_0_MOE_TOPK_KERNEL_SRC, "moe_gather_rows")?;
-    encoder.setComputePipelineState(&pipe.0);
-    let id_byte = id_offset_elems * 4;
-    unsafe {
-        encoder.setBuffer_offset_atIndex(Some(src), 0, 0);
-        encoder.setBuffer_offset_atIndex(Some(dst), 0, 1);
-        encoder.setBuffer_offset_atIndex(Some(ids), id_byte, 2);
-        let mut bs = batch_size;
-        encoder.setBytes_length_atIndex(NonNull::new(&mut bs as *mut u32 as *mut _).unwrap(), 4, 3);
-        let mut c = cols;
-        encoder.setBytes_length_atIndex(NonNull::new(&mut c as *mut u32 as *mut _).unwrap(), 4, 4);
-        let mut ss = src_stride;
-        encoder.setBytes_length_atIndex(NonNull::new(&mut ss as *mut u32 as *mut _).unwrap(), 4, 5);
-        let mut ds = dst_stride;
-        encoder.setBytes_length_atIndex(NonNull::new(&mut ds as *mut u32 as *mut _).unwrap(), 4, 6);
-    }
-    encoder.dispatchThreadgroups_threadsPerThreadgroup(
-        MTLSize {
-            width: batch_size as usize,
-            height: 1,
-            depth: 1,
-        },
-        MTLSize {
-            width: TG,
-            height: 1,
-            depth: 1,
-        },
-    );
-    Ok(())
-}
-
-#[allow(clippy::too_many_arguments)]
-#[allow(dead_code)]
-fn encode_moe_scatter_rows(
-    encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
-    device: &Retained<ProtocolObject<dyn MTLDevice>>,
-    src: &ProtocolObject<dyn MTLBuffer>,
-    dst: &ProtocolObject<dyn MTLBuffer>,
-    ids: &ProtocolObject<dyn MTLBuffer>,
-    id_offset_elems: usize,
-    batch_size: u32,
-    cols: u32,
-    src_stride: u32,
-    dst_stride: u32,
-) -> Result<(), MetalError> {
-    if batch_size == 0 {
-        return Ok(());
-    }
-    const TG: usize = 256;
-    let pipe = ensure_pipeline(device, Q4_0_MOE_TOPK_KERNEL_SRC, "moe_scatter_rows")?;
-    encoder.setComputePipelineState(&pipe.0);
-    let id_byte = id_offset_elems * 4;
-    unsafe {
-        encoder.setBuffer_offset_atIndex(Some(src), 0, 0);
-        encoder.setBuffer_offset_atIndex(Some(dst), 0, 1);
-        encoder.setBuffer_offset_atIndex(Some(ids), id_byte, 2);
-        let mut bs = batch_size;
-        encoder.setBytes_length_atIndex(NonNull::new(&mut bs as *mut u32 as *mut _).unwrap(), 4, 3);
-        let mut c = cols;
-        encoder.setBytes_length_atIndex(NonNull::new(&mut c as *mut u32 as *mut _).unwrap(), 4, 4);
-        let mut ss = src_stride;
-        encoder.setBytes_length_atIndex(NonNull::new(&mut ss as *mut u32 as *mut _).unwrap(), 4, 5);
-        let mut ds = dst_stride;
-        encoder.setBytes_length_atIndex(NonNull::new(&mut ds as *mut u32 as *mut _).unwrap(), 4, 6);
-    }
-    encoder.dispatchThreadgroups_threadsPerThreadgroup(
-        MTLSize {
-            width: batch_size as usize,
-            height: 1,
-            depth: 1,
-        },
-        MTLSize {
-            width: TG,
-            height: 1,
-            depth: 1,
-        },
-    );
-    Ok(())
-}
-
 /// Prefill map0: per-expert token/slot lists (llama `kernel_mul_mm_id_map0`).
 fn moe_mm_id_map0(
     ids: &[i32],
@@ -6339,10 +6241,6 @@ struct MoePrefillScratch {
     /// GPU routing: combine weights `[n_tokens, top_k]`.
     route_w: Retained<ProtocolObject<dyn MTLBuffer>>,
     top_k: usize,
-    #[allow(dead_code)]
-    contig_in: Retained<ProtocolObject<dyn MTLBuffer>>,
-    #[allow(dead_code)]
-    contig_out: Retained<ProtocolObject<dyn MTLBuffer>>,
 }
 
 thread_local! {
@@ -6399,7 +6297,6 @@ fn moe_prefill_scratch_ex(
                 ),
                 None => (n_slots, ffn, hidden, n_tokens, n_experts, top_k),
             };
-            let contig_elems = n_slots * ffn.max(hidden);
             let half_elems = (n_tokens * hidden).max(n_slots * ffn);
             let route_elems = (n_tokens * top_k).max(1);
             *slot = Some(MoePrefillScratch {
@@ -6472,18 +6369,6 @@ fn moe_prefill_scratch_ex(
                 route_w: device
                     .newBufferWithLength_options(
                         route_elems * 4,
-                        MTLResourceOptions::StorageModeShared,
-                    )
-                    .ok_or(MetalError::BufferAllocFailed)?,
-                contig_in: device
-                    .newBufferWithLength_options(
-                        contig_elems * 4,
-                        MTLResourceOptions::StorageModeShared,
-                    )
-                    .ok_or(MetalError::BufferAllocFailed)?,
-                contig_out: device
-                    .newBufferWithLength_options(
-                        contig_elems * 4,
                         MTLResourceOptions::StorageModeShared,
                     )
                     .ok_or(MetalError::BufferAllocFailed)?,

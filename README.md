@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="docs/assets/ferrox-logo.webp" alt="Ferrox" width="220" />
+<img src="docs/assets/ferrox-logo.webp" alt="Ferrox" width="70%" />
 
 
 **Ferrox: a pure-Rust GGUF inference engine — dense and MoE, on CPU, Apple Metal, or CUDA.**

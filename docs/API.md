@@ -296,11 +296,18 @@ OpenAI-defined value, because OpenAI has no cancel endpoint, but *a*
 finish reason, so the stream is not read as truncation. Tokens already
 decoded are kept and reported in `usage`.
 
+Continuous-batching requests are covered too, by a different route:
+the cancel enqueues an id, and the scheduler thread drains that queue
+between steps and drops the sequence itself. Removing a sequence means
+touching KV buffers a forward pass may be reading, so the mutation
+happens on the thread that owns the step rather than wherever the
+cancel arrived. A request is stopped wherever it has got to — still
+queued, mid-prefill, or decoding — and keeps whatever it produced.
+
 Cooperative and honest about its edges: the flag is read between
 decoded tokens, so a prefill already inside a forward pass still
-completes, and a continuous-batching request decodes on the shared
-batcher thread rather than through this loop and is not covered.
-`/v1/completions` and `/v1/messages` are buffered and register no id.
+completes. `/v1/completions` and `/v1/messages` are buffered and
+register no id.
 
 ## Streaming behind a proxy
 

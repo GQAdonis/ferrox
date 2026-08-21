@@ -88,6 +88,32 @@
 //! today's behaviour: `max_seqs` alone. The two caps compose -- a job
 //! must satisfy both.
 //!
+//! **Deferred abort.** A cancellation never mutates the batch from the
+//! canceller's thread. `CancelToken::on_cancel` gives the scheduler a
+//! callback that does one thing -- push an [`AbortId`] into
+//! [`AbortInbox`] -- and the worker drains that inbox at the top of a
+//! tick, *between* forward passes, and does the removal itself.
+//!
+//! The indirection is the point. Dropping a sequence means dropping the
+//! KV buffers a forward pass may be mid-way through reading, and the
+//! `std::mem::take` that lifts a row's caches into the batch leaves the
+//! row holding empty vectors for the duration of the step -- so a
+//! removal landing inside that window would either free live buffers or
+//! scatter results back into a row that is no longer there. ferrox-metal
+//! has the same hazard in its own terms: its kernels
+//! `waitUntilCompleted` per dispatch, so no command buffer outlives a
+//! `forward_multi_seq` call, and the step boundary really is a point
+//! where nothing is in flight -- but only for the thread that owns the
+//! step. That is why the mutation is deferred onto it rather than done
+//! wherever the cancel arrived.
+//!
+//! A cancel is honoured wherever the request has got to: still queued
+//! (never prefilled at all), mid-prefill (the remaining chunks are
+//! never run), or decoding (it stops at the next step). All three reply
+//! [`FinishReason::Cancelled`] with the tokens produced so far, because
+//! a cancelled generation has partial output and throwing it away
+//! serves nobody.
+//!
 //! **Queue cap.** The job channel is unbounded, so without a cap a
 //! client retry storm turns straight into unbounded memory: every
 //! retry parks another prompt (and its reply channel) in the queue,
@@ -100,10 +126,10 @@
 //! worker's own admission queue for a while, and a cap that stopped
 //! counting it there would stop bounding anything.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
 use ferrox_core::cache::KvCache;
@@ -234,6 +260,49 @@ impl QueueGate {
 
     fn rejected(&self) -> u64 {
         self.rejected.load(Ordering::Relaxed)
+    }
+}
+
+/// Identifies one submitted job for cancellation. Handed out by
+/// [`ContinuousBatcher::generate`] before the job is sent, so a cancel
+/// racing the submission has something to name.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+struct AbortId(u64);
+
+/// Ids whose requests have been asked to stop, waiting for the worker
+/// to act on them at a step boundary.
+///
+/// A set rather than a channel: cancelling twice is the same fact
+/// stated twice, and the worker should do the work once.
+#[derive(Default)]
+struct AbortInbox {
+    pending: Mutex<HashSet<AbortId>>,
+    next_id: AtomicU64,
+    /// Requests actually stopped by a cancellation.
+    aborted: AtomicU64,
+}
+
+impl AbortInbox {
+    fn next_id(&self) -> AbortId {
+        AbortId(self.next_id.fetch_add(1, Ordering::Relaxed))
+    }
+
+    /// Called from whichever thread cancelled -- an HTTP handler,
+    /// usually. Deliberately does nothing but record the id.
+    fn enqueue(&self, id: AbortId) {
+        self.pending
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(id);
+    }
+
+    /// Takes everything pending. Worker thread, at a step boundary.
+    fn drain(&self) -> HashSet<AbortId> {
+        std::mem::take(&mut *self.pending.lock().unwrap_or_else(|p| p.into_inner()))
+    }
+
+    fn aborted(&self) -> u64 {
+        self.aborted.load(Ordering::Relaxed)
     }
 }
 
@@ -370,6 +439,9 @@ pub struct BatcherStats {
     /// Most KV blocks ever held by in-flight work at one moment,
     /// counted from the rows themselves.
     pub kv_blocks_peak: usize,
+    /// Requests the scheduler actually stopped because they were
+    /// cancelled.
+    pub aborted: u64,
 }
 
 /// One request's prefill as a resumable state machine.
@@ -462,6 +534,8 @@ struct Job {
     params: GenerationParams,
     eos_id: Option<usize>,
     reply: Sender<JobResult>,
+    /// Cancellation handle for this job, from submission onwards.
+    abort: AbortId,
     /// KV blocks this job will need for its whole lifetime, computed
     /// once by the submitter (which already knows the prompt length and
     /// `max_tokens`) so the worker's admission check is a comparison
@@ -504,6 +578,26 @@ impl Rows {
     /// KV blocks the rows in this table are holding right now.
     fn blocks_held(&self) -> usize {
         self.state.values().map(|slot| slot.blocks).sum()
+    }
+
+    /// Marks any row whose abort id is in `ids` as cancelled, and
+    /// reports which ids were consumed.
+    ///
+    /// Marking, not removing: the row leaves through the same
+    /// `flush_finished` path as every other finished row, so its blocks
+    /// are released and its caller is replied to exactly once. A second
+    /// removal path is a second place to forget one of those.
+    fn mark_cancelled(&mut self, ids: &HashSet<AbortId>) -> Vec<AbortId> {
+        let mut consumed = Vec::new();
+        for uid in &self.order {
+            if let Some(slot) = self.state.get_mut(uid) {
+                if ids.contains(&slot.abort) && slot.finish.is_none() {
+                    slot.finish = Some(FinishReason::Cancelled);
+                    consumed.push(slot.abort);
+                }
+            }
+        }
+        consumed
     }
 
     fn is_empty(&self) -> bool {
@@ -576,6 +670,7 @@ struct Slot {
     params: GenerationParams,
     reply: Sender<JobResult>,
     finish: Option<FinishReason>,
+    abort: AbortId,
     /// KV blocks this row reserved at admission, returned when it ends.
     blocks: usize,
 }
@@ -589,6 +684,7 @@ pub struct ContinuousBatcher {
     counters: Arc<Counters>,
     queue: Arc<QueueGate>,
     budget: Arc<BlockBudget>,
+    aborts: Arc<AbortInbox>,
 }
 
 struct WorkerGuard {
@@ -615,9 +711,11 @@ impl ContinuousBatcher {
         let counters = Arc::new(Counters::default());
         let queue = Arc::new(QueueGate::new(config.max_queue));
         let budget = Arc::new(BlockBudget::new(config.kv_block_size, config.kv_blocks));
+        let aborts = Arc::new(AbortInbox::default());
         let worker_counters = Arc::clone(&counters);
         let worker_queue = Arc::clone(&queue);
         let worker_budget = Arc::clone(&budget);
+        let worker_aborts = Arc::clone(&aborts);
         let _join = thread::Builder::new()
             .name("ferrox-continuous-batch".into())
             .spawn(move || {
@@ -629,6 +727,7 @@ impl ContinuousBatcher {
                     worker_counters,
                     worker_queue,
                     worker_budget,
+                    worker_aborts,
                 )
             })
             .expect("spawn continuous-batch worker");
@@ -642,6 +741,7 @@ impl ContinuousBatcher {
             counters,
             queue,
             budget,
+            aborts,
         }
     }
 
@@ -659,6 +759,7 @@ impl ContinuousBatcher {
             kv_block_size: self.budget.block_size,
             kv_rejected_too_large: self.budget.rejected_too_large.load(Ordering::Relaxed),
             kv_blocks_peak: self.counters.peak_blocks.load(Ordering::Relaxed),
+            aborted: self.aborts.aborted(),
         }
     }
 
@@ -697,6 +798,8 @@ impl ContinuousBatcher {
                 cap: self.queue.cap,
             })?;
         let (reply_tx, reply_rx) = mpsc::channel();
+        let abort = self.aborts.next_id();
+        let cancel = params.cancel.clone();
         if self
             .tx
             .send(Job {
@@ -704,6 +807,7 @@ impl ContinuousBatcher {
                 params,
                 eos_id,
                 reply: reply_tx,
+                abort,
                 blocks,
             })
             .is_err()
@@ -712,6 +816,14 @@ impl ContinuousBatcher {
             // reservation: release it here or the gate leaks a slot.
             self.queue.release();
             return Err(DecodeError::KvPoolExhausted);
+        }
+        // Registered after the send, so an id only ever reaches the
+        // inbox for a job the worker will actually see. `on_cancel`
+        // fires immediately if the token is already cancelled, so the
+        // window between the send and this line loses nothing.
+        if let Some(token) = cancel {
+            let inbox = Arc::clone(&self.aborts);
+            token.on_cancel(move || inbox.enqueue(abort));
         }
         reply_rx.recv().unwrap_or(Err(DecodeError::KvPoolExhausted))
     }
@@ -772,6 +884,87 @@ fn admit(
     }
 }
 
+/// Applies every pending cancellation, at a step boundary, on the
+/// worker thread.
+///
+/// `carried` holds ids that arrived before their job did -- a cancel
+/// can beat its own submission through the channel -- so they are kept
+/// and retried rather than dropped, which would leave a request running
+/// after the client asked it to stop.
+///
+/// The three states a cancelled request can be in are handled where
+/// they live, because they cost different things to abandon:
+///
+/// - **waiting**: no KV, no reservation, no work done. Replied to and
+///   dropped; its queue slot goes back.
+/// - **prefilling**: holds KV and a reservation but has produced no
+///   tokens. Dropped, reservation released.
+/// - **decoding**: marked finished, and left to leave through
+///   `flush_finished` like any other completed row, so there is exactly
+///   one path that releases blocks and replies.
+fn apply_aborts(
+    inbox: &AbortInbox,
+    carried: &mut HashSet<AbortId>,
+    waiting: &mut VecDeque<Job>,
+    prefills: &mut VecDeque<Prefill>,
+    rows: &mut Rows,
+    queue: &QueueGate,
+    budget: &BlockBudget,
+) {
+    carried.extend(inbox.drain());
+    if carried.is_empty() {
+        return;
+    }
+
+    let mut stopped = 0u64;
+
+    // Queued, never started.
+    let mut still_waiting = VecDeque::with_capacity(waiting.len());
+    while let Some(job) = waiting.pop_front() {
+        if carried.remove(&job.abort) {
+            queue.release();
+            let _ = job.reply.send(Ok((
+                FinishReason::Cancelled,
+                Vec::new(),
+                String::new(),
+                Usage::new(job.prompt_tokens.len(), 0),
+            )));
+            stopped += 1;
+        } else {
+            still_waiting.push_back(job);
+        }
+    }
+    *waiting = still_waiting;
+
+    // Mid-prefill: the remaining chunks are never run.
+    let mut still_prefilling = VecDeque::with_capacity(prefills.len());
+    while let Some(prefill) = prefills.pop_front() {
+        if carried.remove(&prefill.abort) {
+            budget.release(prefill.blocks);
+            let _ = prefill.reply.send(Ok((
+                FinishReason::Cancelled,
+                Vec::new(),
+                String::new(),
+                Usage::new(prefill.prompt_tokens, 0),
+            )));
+            stopped += 1;
+        } else {
+            still_prefilling.push_back(prefill);
+        }
+    }
+    *prefills = still_prefilling;
+
+    // Decoding: marked here, removed by `flush_finished` below.
+    for id in rows.mark_cancelled(carried) {
+        carried.remove(&id);
+        stopped += 1;
+    }
+
+    if stopped > 0 {
+        inbox.aborted.fetch_add(stopped, Ordering::Relaxed);
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn worker_loop(
     decoder: Arc<Decoder>,
@@ -781,10 +974,13 @@ fn worker_loop(
     counters: Arc<Counters>,
     queue: Arc<QueueGate>,
     budget: Arc<BlockBudget>,
+    aborts: Arc<AbortInbox>,
 ) {
     let mut rows = Rows::default();
     let mut prefills: VecDeque<Prefill> = VecDeque::new();
     let mut waiting: VecDeque<Job> = VecDeque::new();
+    // Cancellations that arrived before the job they name.
+    let mut carried_aborts: HashSet<AbortId> = HashSet::new();
     loop {
         // Only a completely idle worker blocks: with a prompt still
         // chunking, or a job waiting for capacity that an in-flight row
@@ -796,6 +992,18 @@ fn worker_loop(
             }
         }
         drain_channel(&rx, &mut waiting);
+        // Before anything else this tick, and before any forward pass:
+        // the one window in which mutating the batch is safe.
+        apply_aborts(
+            &aborts,
+            &mut carried_aborts,
+            &mut waiting,
+            &mut prefills,
+            &mut rows,
+            &queue,
+            &budget,
+        );
+        rows.flush_finished(&budget);
         admit(
             &decoder,
             &mut waiting,
@@ -943,6 +1151,7 @@ struct Prefill {
     params: GenerationParams,
     eos_id: Option<usize>,
     reply: Sender<JobResult>,
+    abort: AbortId,
     /// Blocks reserved at admission; carried into the `Slot` so the
     /// reservation survives the prefill-to-decode handover.
     blocks: usize,
@@ -956,6 +1165,7 @@ impl Prefill {
             params,
             eos_id,
             reply,
+            abort,
             blocks,
         } = self;
         let (caches, logits, pos) = state.into_decode_start();
@@ -973,6 +1183,7 @@ impl Prefill {
             params,
             reply,
             finish: None,
+            abort,
             blocks,
         }
     }
@@ -999,6 +1210,7 @@ fn accept(decoder: &Arc<Decoder>, job: Job, chunk_size: usize) -> Option<Prefill
         params: job.params,
         eos_id: job.eos_id,
         reply: job.reply,
+        abort: job.abort,
         blocks: job.blocks,
     })
 }
@@ -1021,6 +1233,7 @@ fn reply_finished(mut slot: Slot) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cancel::CancelToken;
     use ferrox_models::config::test_dense_fixture;
     use ferrox_models::sampling::SamplingParams;
     use std::sync::{Barrier, Mutex};
@@ -1415,6 +1628,7 @@ mod tests {
                 eos_id: None,
                 params,
                 reply: tx,
+                abort: AbortId(0),
                 blocks: 1,
                 finish: None,
             },
@@ -1904,6 +2118,7 @@ mod tests {
             params: greedy_params(2, 1),
             eos_id: None,
             reply: big_tx,
+            abort: AbortId(0),
             blocks: 3,
         });
         waiting.push_back(Job {
@@ -1911,6 +2126,7 @@ mod tests {
             params: greedy_params(2, 2),
             eos_id: None,
             reply: small_tx,
+            abort: AbortId(1),
             blocks: 1,
         });
         // The gate is counting both of them.
@@ -1978,6 +2194,7 @@ mod tests {
                 params: greedy_params(2, i),
                 eos_id: None,
                 reply: tx,
+                abort: AbortId(i),
                 blocks: 1,
             });
             queue.try_reserve().expect("cap 512");
@@ -1995,5 +2212,303 @@ mod tests {
         assert_eq!(prefills.len(), 1, "max_seqs still binds");
         assert_eq!(budget.free(), 7, "only the admitted job reserved");
         assert_eq!(receivers.len(), 3);
+    }
+
+    // ----------------------------------------------------------------
+    // Deferred abort (`sched-deferred-abort`)
+    // ----------------------------------------------------------------
+
+    fn cancellable_params(max_tokens: usize, seed: u64) -> (GenerationParams, CancelToken) {
+        let token = CancelToken::new();
+        let mut params = greedy_params(max_tokens, seed);
+        params.cancel = Some(token.clone());
+        (params, token)
+    }
+
+    fn abortable_job(abort: AbortId, prompt: Vec<usize>) -> (Job, mpsc::Receiver<JobResult>) {
+        let (tx, rx) = mpsc::channel();
+        (
+            Job {
+                prompt_tokens: prompt,
+                params: greedy_params(4, 1),
+                eos_id: None,
+                reply: tx,
+                abort,
+                blocks: 1,
+            },
+            rx,
+        )
+    }
+
+    /// The end-to-end fact the item exists for, and the gap the
+    /// `cancel` module used to state as unfixable: a request decoding
+    /// on the shared batcher thread stops when the client cancels it.
+    ///
+    /// Confirmed to FAIL (finishes with `Length` after all 4000 tokens)
+    /// when the `apply_aborts` call is removed from the worker loop.
+    #[test]
+    fn a_decoding_request_stops_when_it_is_cancelled() {
+        let decoder = tiny_decoder();
+        let batcher = ContinuousBatcher::spawn_with_config(
+            Arc::clone(&decoder),
+            identity_decode(),
+            BatcherConfig {
+                prefill_chunk: 1,
+                ..BatcherConfig::default()
+            },
+        );
+        let (params, token) = cancellable_params(4000, 9);
+        let worker = {
+            let batcher = batcher.clone();
+            thread::spawn(move || batcher.generate(vec![1, 2, 3], params, None))
+        };
+
+        // Wait until it is genuinely decoding, so the cancel exercises
+        // the decode path rather than racing the prefill.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while batcher.stats().decode_steps < 3 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "never started decoding"
+            );
+            thread::sleep(std::time::Duration::from_millis(1));
+        }
+        token.cancel();
+
+        let (finish, ids, _text, usage) = worker.join().expect("no panic").expect("generate");
+        assert_eq!(finish, FinishReason::Cancelled);
+        assert!(
+            ids.len() < 4000,
+            "cancelling did not shorten the decode: {} tokens",
+            ids.len()
+        );
+        assert!(
+            !ids.is_empty(),
+            "the tokens produced before the cancel must survive it"
+        );
+        assert_eq!(usage.completion_tokens, ids.len());
+        assert_eq!(batcher.stats().aborted, 1);
+    }
+
+    /// A cancelled request must leave the batch through the same exit
+    /// every finished row uses -- marked at the step boundary, removed
+    /// by `flush_finished` -- so its blocks are released once and its
+    /// caller is replied to once.
+    ///
+    /// Removing the row inside `apply_aborts` instead would be a second
+    /// exit path, and the reply this asserts arrives exactly once would
+    /// arrive twice.
+    #[test]
+    fn a_cancelled_row_leaves_through_the_one_exit_every_row_uses() {
+        let mut rows = Rows::default();
+        let budget = BlockBudget::new(4, Some(4));
+        assert!(budget.try_reserve(2));
+
+        let (mut a, ra) = test_slot(9, 11);
+        a.abort = AbortId(7);
+        a.blocks = 2;
+        a.generated_ids.push(3);
+        a.visible.push_str("hi");
+        let (b, rb) = test_slot(9, 22);
+        let a_uid = rows.insert(a);
+        let b_uid = rows.insert(b);
+
+        let consumed = rows.mark_cancelled(&HashSet::from([AbortId(7)]));
+        assert_eq!(consumed, vec![AbortId(7)]);
+        assert!(
+            rows.get(a_uid).is_some(),
+            "the row must still be in the table until the flush: its KV \
+             buffers are what the batch is built from"
+        );
+        assert_eq!(
+            budget.free(),
+            2,
+            "marking must not release blocks -- the flush does"
+        );
+        assert!(ra.try_recv().is_err(), "no reply until the row leaves");
+
+        rows.flush_finished(&budget);
+        assert!(rows.get(a_uid).is_none());
+        assert!(rows.get(b_uid).is_some(), "only the cancelled row left");
+        assert_eq!(budget.free(), 4, "blocks came back exactly once");
+
+        let (finish, ids, text, _usage) = ra.try_recv().expect("one reply").expect("ok");
+        assert_eq!(finish, FinishReason::Cancelled);
+        assert_eq!(ids, vec![3], "partial output survives the cancel");
+        assert_eq!(text, "hi");
+        assert!(
+            ra.try_recv().is_err(),
+            "a cancelled row must be replied to exactly once"
+        );
+        assert!(rb.try_recv().is_err(), "the other row is untouched");
+    }
+
+    /// A cancel can beat its own job through the channel. Dropping the
+    /// id because nothing matches it yet would leave the request
+    /// running after the client asked it to stop.
+    ///
+    /// Confirmed to FAIL when `apply_aborts` drops unmatched ids
+    /// instead of carrying them.
+    #[test]
+    fn a_cancel_that_arrives_before_its_job_is_not_lost() {
+        let config = budget_config(4, 4);
+        let inbox = AbortInbox::default();
+        let queue = QueueGate::new(config.max_queue);
+        let budget = BlockBudget::new(config.kv_block_size, config.kv_blocks);
+        let mut carried = HashSet::new();
+        let mut waiting = VecDeque::new();
+        let mut prefills = VecDeque::new();
+        let mut rows = Rows::default();
+
+        // The cancel lands first, naming nothing.
+        inbox.enqueue(AbortId(42));
+        apply_aborts(
+            &inbox,
+            &mut carried,
+            &mut waiting,
+            &mut prefills,
+            &mut rows,
+            &queue,
+            &budget,
+        );
+        assert_eq!(inbox.aborted(), 0, "nothing to stop yet");
+
+        // Now the job it names shows up.
+        let (job, rx) = abortable_job(AbortId(42), vec![1, 2]);
+        waiting.push_back(job);
+        queue.try_reserve().expect("cap");
+        apply_aborts(
+            &inbox,
+            &mut carried,
+            &mut waiting,
+            &mut prefills,
+            &mut rows,
+            &queue,
+            &budget,
+        );
+
+        assert!(waiting.is_empty(), "the late job must still be cancelled");
+        assert_eq!(inbox.aborted(), 1);
+        assert_eq!(queue.depth(), 0, "its queue slot came back");
+        let (finish, ids, _, usage) = rx.try_recv().expect("reply").expect("ok");
+        assert_eq!(finish, FinishReason::Cancelled);
+        assert!(ids.is_empty(), "it never ran a token");
+        assert_eq!(usage.prompt_tokens, 2);
+    }
+
+    /// A cancelled prompt must not be prefilled: that is the cheapest
+    /// possible moment to stop, and the whole point of checking before
+    /// the chunk rather than after it.
+    #[test]
+    fn a_cancelled_prefill_is_abandoned_and_gives_its_blocks_back() {
+        let decoder = tiny_decoder();
+        let config = budget_config(4, 4);
+        let inbox = AbortInbox::default();
+        let queue = QueueGate::new(config.max_queue);
+        let budget = BlockBudget::new(config.kv_block_size, config.kv_blocks);
+        let mut carried = HashSet::new();
+        let mut waiting = VecDeque::new();
+        let mut prefills = VecDeque::new();
+        let mut rows = Rows::default();
+
+        let (job, rx) = abortable_job(AbortId(5), vec![1, 2, 3, 4]);
+        waiting.push_back(job);
+        queue.try_reserve().expect("cap");
+        admit(
+            &decoder,
+            &mut waiting,
+            &mut prefills,
+            0,
+            &config,
+            &queue,
+            &budget,
+        );
+        assert_eq!(prefills.len(), 1);
+        assert_eq!(budget.free(), 3, "the prefill holds its reservation");
+
+        inbox.enqueue(AbortId(5));
+        apply_aborts(
+            &inbox,
+            &mut carried,
+            &mut waiting,
+            &mut prefills,
+            &mut rows,
+            &queue,
+            &budget,
+        );
+        assert!(prefills.is_empty(), "the remaining chunks never run");
+        assert_eq!(budget.free(), 4, "an abandoned prefill releases its blocks");
+        assert_eq!(inbox.aborted(), 1);
+        assert_eq!(
+            rx.try_recv().expect("reply").expect("ok").0,
+            FinishReason::Cancelled
+        );
+    }
+
+    /// Cancelling one request must not disturb any other -- the failure
+    /// mode a positional row table would make easy.
+    #[test]
+    fn cancelling_one_request_leaves_its_neighbours_running() {
+        let decoder = tiny_decoder();
+        let batcher = ContinuousBatcher::spawn_with_config(
+            Arc::clone(&decoder),
+            identity_decode(),
+            BatcherConfig {
+                prefill_chunk: 1,
+                ..BatcherConfig::default()
+            },
+        );
+        let expected = sequential_ids(&decoder, &[4, 5], &greedy_params(6, 3));
+
+        let (doomed_params, token) = cancellable_params(4000, 9);
+        let doomed = {
+            let batcher = batcher.clone();
+            thread::spawn(move || batcher.generate(vec![1, 2, 3], doomed_params, None))
+        };
+        let survivor = {
+            let batcher = batcher.clone();
+            thread::spawn(move || batcher.generate(vec![4, 5], greedy_params(6, 3), None))
+        };
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while batcher.stats().decode_steps < 3 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "never started decoding"
+            );
+            thread::sleep(std::time::Duration::from_millis(1));
+        }
+        token.cancel();
+
+        let (finish, _, _, _) = doomed.join().expect("no panic").expect("generate");
+        assert_eq!(finish, FinishReason::Cancelled);
+        let (finish, ids, _, _) = survivor.join().expect("no panic").expect("generate");
+        assert_eq!(finish, FinishReason::Length);
+        assert_eq!(
+            ids, expected,
+            "an uncancelled request must produce exactly what it would have alone"
+        );
+    }
+
+    /// A request nobody cancels must be untouched by the machinery that
+    /// exists for the ones that are.
+    #[test]
+    fn an_uncancelled_request_is_unaffected_by_the_abort_path() {
+        let decoder = tiny_decoder();
+        let batcher = ContinuousBatcher::spawn_with_config(
+            Arc::clone(&decoder),
+            identity_decode(),
+            BatcherConfig {
+                prefill_chunk: 1,
+                ..BatcherConfig::default()
+            },
+        );
+        let (params, _token) = cancellable_params(6, 3);
+        let (finish, ids, _, _) = batcher
+            .generate(vec![4, 5], params, None)
+            .expect("generate");
+        assert_eq!(finish, FinishReason::Length);
+        assert_eq!(ids, sequential_ids(&decoder, &[4, 5], &greedy_params(6, 3)));
+        assert_eq!(batcher.stats().aborted, 0);
     }
 }

@@ -1523,7 +1523,10 @@ async fn metrics(State(state): State<Arc<AppState>>) -> Response {
                  ferrox_kv_block_size {}\n\
                  # HELP ferrox_kv_rejected_too_large_total Requests refused with 400 because they exceed the whole KV block budget.\n\
                  # TYPE ferrox_kv_rejected_too_large_total counter\n\
-                 ferrox_kv_rejected_too_large_total {}\n",
+                 ferrox_kv_rejected_too_large_total {}\n\
+                 # HELP ferrox_scheduler_aborted_total Requests the batch scheduler stopped because they were cancelled.\n\
+                 # TYPE ferrox_scheduler_aborted_total counter\n\
+                 ferrox_scheduler_aborted_total {}\n",
                 sched.prefill_chunks,
                 sched.prefill_tokens,
                 sched.decode_steps,
@@ -1533,6 +1536,7 @@ async fn metrics(State(state): State<Arc<AppState>>) -> Response {
                 sched.kv_blocks_free,
                 sched.kv_block_size,
                 sched.kv_rejected_too_large,
+                sched.aborted,
             )
         }
         None => body,

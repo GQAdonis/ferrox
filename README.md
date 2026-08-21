@@ -16,12 +16,13 @@ Every speed claim is pinned against llama.cpp on the same host, same GGUF, same 
 [![Rust](https://img.shields.io/badge/built_with-Rust-dea584.svg)](https://www.rust-lang.org/)
 [![Backends](https://img.shields.io/badge/backends-CPU%20%7C%20Metal%20%7C%20CUDA-64748b.svg)](docs/FEATURES.md)
 
-[Install](#install) · [Web UI](#web-ui) · [Models](docs/MODELS.md) · [Benchmarks](benchmarks/RESULTS.md) · [API](docs/API.md) · [Contributing](CONTRIBUTING.md)
+[Install](#install) · [Web UI](#web-ui--ferrox-studio) · [Models](docs/MODELS.md) · [Benchmarks](benchmarks/RESULTS.md) · [API](docs/API.md) · [Contributing](CONTRIBUTING.md)
 
 </div>
 
-It ships a llama.cpp-style CLI, an OpenAI-compatible HTTP server, and a
-web UI. Weights stay quantized on mmap and dequantization happens inside
+It ships a llama.cpp-style CLI and an OpenAI-compatible HTTP server; a
+separate web UI, Ferrox Studio, talks to that server like any other
+client. Weights stay quantized on mmap and dequantization happens inside
 the matmul, so an 8B model fits on a laptop.
 
 ## Install
@@ -61,27 +62,35 @@ use, `Q8_0` for small smokes. Good starters: `unsloth/gemma-4-E2B-it-GGUF`,
 `bartowski/SmolLM2-135M-Instruct-GGUF`. What actually works today:
 [docs/MODELS.md](docs/MODELS.md).
 
-## Web UI
+## Web UI — Ferrox Studio
+
+The UI lives in `ui/` and is a **separate app**: `ferrox-server`
+serves the API, nothing else. Run the server, then run the UI against it.
 
 ```bash
-ferrox-server -m models/tinyllama-1.1b-chat-v1.0.Q8_0.gguf --ui-server
+# 1. the API
+ferrox-server -m models/tinyllama-1.1b-chat-v1.0.Q8_0.gguf
+
+# 2. the UI (proxies /v1, /admin and /health to 127.0.0.1:8383)
+cd ui && npm install && npm run dev
 ```
-
-Then open **<http://127.0.0.1:8383/>**.
-
-The UI is compiled into the binary — no Node, no build step, no separate
-process. It is **off by default**: without `--ui-server` (or
-`FERROX_UI=1`) `/` returns 404 rather than an empty page.
 
 | Screen | What it does |
 |---|---|
 | **Chat** | Streaming chat with markdown, and the server's own `usage` under each answer: TTFT, prefill tok/s, decode tok/s — measured server-side, not with a client stopwatch |
 | **Models** | Everything in your model directory: load, unload, swap the active model, download from Hugging Face with live progress |
 | **Activity** | Live request log, keyed by `request_id`. `duration_ms` and `decode_ms` stay separate columns, because conflating them reads a 50 tok/s model as 5 |
-| **Connect** | Copy-pasteable curl / Python-SDK / IDE snippets, filled from the live base URL and the model id `/v1/models` currently reports |
+| **Connect** | Copy-pasteable curl / Python-SDK / IDE snippets, filled from the base URL and the model id `/v1/models` reports |
 
 Every screen goes through the public HTTP API, so the API cannot rot
-without the UI breaking first.
+without the UI breaking first — and because the UI is just another
+client, nothing it does is unavailable to yours.
+
+`npm run build` produces static files in `ui/dist/` for hosting anywhere.
+Served from an origin other than the API's, the browser applies CORS, so
+the server needs `FERROX_CORS_ORIGINS` set to that exact origin — `*` is
+rejected on purpose, since a wildcard alongside a bearer token is a
+credential-leak shape. The dev server sidesteps this by proxying.
 
 ## CLI and server
 

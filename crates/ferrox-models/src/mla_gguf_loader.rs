@@ -376,7 +376,13 @@ fn load_moe_ffn(
         up: load_weight_matrix(file, &format!("blk.{l}.ffn_up_shexp.weight"))?,
         down: load_weight_matrix(file, &format!("blk.{l}.ffn_down_shexp.weight"))?,
     };
-    let exp_probs_bias = load_f32_vec_optional(file, &format!("blk.{l}.ffn_exp_probs_b.bias"))?;
+    // See the note in `glm52_gguf_loader`: the on-disk name has no
+    // `ffn_` prefix. Optional here on purpose -- llama.cpp declares it
+    // TENSOR_NOT_REQUIRED for `deepseek2`, which also covers V2-era
+    // checkpoints with no routing bias at all -- which is exactly why the
+    // wrong name was silent rather than a load error, and a real
+    // DeepSeek-V3 checkpoint routed with its bias dropped.
+    let exp_probs_bias = load_f32_vec_optional(file, &format!("blk.{l}.exp_probs_b.bias"))?;
     Ok(MlaMoeFfn {
         router: load_weight_matrix(file, &format!("blk.{l}.ffn_gate_inp.weight"))?,
         experts,

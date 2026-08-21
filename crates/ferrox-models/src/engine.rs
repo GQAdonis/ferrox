@@ -168,7 +168,7 @@ pub struct MlaMoeFfn {
     pub router: WeightMatrix,
     pub experts: Vec<ferrox_moe::ExpertWeights>,
     pub shared_expert: ferrox_moe::ExpertWeights,
-    /// Optional aux-loss-free bias (`ffn_exp_probs_b.bias`).
+    /// Optional aux-loss-free bias (`blk.N.exp_probs_b.bias`).
     pub exp_probs_bias: Option<Vec<f32>>,
 }
 

@@ -155,10 +155,23 @@ fn child_tokens(
     if let Some(n) = prompt_tokens {
         cmd.args(["--prompt-tokens", &n.to_string()]);
     }
+    // `FERROX_METAL` alone only turns on the Metal *matvecs*: the fused
+    // attention block, its RoPE kernels and the resident KV are behind
+    // `FERROX_METAL_ATTN`, which `run --ngl 99` sets and this harness
+    // did not. A `verify --backend metal` that leaves it unset checks a
+    // graph nobody runs, and reports OK for kernels it never reached.
+    // Match `run`: default it on for the accelerated child, but honour a
+    // pre-set value so `FERROX_METAL_ATTN=0 ferrox verify …` still
+    // ablates.
+    let metal_attn = std::env::var("FERROX_METAL_ATTN").unwrap_or_else(|_| "1".to_string());
     let out = cmd
         // `-ngl` is what actually selects the backend for `run`; the env
         // var alone is overridden by the CLI default.
         .env("FERROX_METAL", if backend == "cpu" { "0" } else { "1" })
+        .env(
+            "FERROX_METAL_ATTN",
+            if backend == "cpu" { "0" } else { &metal_attn },
+        )
         .env("FERROX_CUDA", if backend == "cuda" { "1" } else { "0" })
         .output()
         .with_context(|| format!("spawning verify child for {backend}"))?;

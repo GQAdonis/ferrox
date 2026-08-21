@@ -9491,6 +9491,89 @@ mod tests {
         }
     }
 
+    /// Phi-4-mini's real RoPE shape, at positions that cross its
+    /// `rope.scaling.original_context_length` (4096) — the boundary
+    /// where `ModelConfig::apply_runtime_context` switches LongRoPE from
+    /// the short factor set to the long one. The long set is the harder
+    /// case *and* the one every default-context run picks, so it is what
+    /// this pins: 128-wide heads with 96 rotated, `attn_factor`
+    /// 1.1902381, and a 48-entry factor vector rising to ~47.8 exactly
+    /// as `rope_factors_long.weight` does.
+    ///
+    /// Tolerance is absolute, not relative to 1e-4: at position ~4100
+    /// the lowest band's angle is ~4100 radians, where an f32 mantissa
+    /// already costs ~2.4e-4 rad of argument-reduction error, and Metal
+    /// and Rust do not reduce identically. Anything the `rot_dim` /
+    /// `mscale` wiring could get wrong is orders of magnitude larger —
+    /// the mutation check moves these elements by whole units.
+    #[test]
+    #[ignore = "needs a real Metal GPU"]
+    fn rope_phi_long_context_factors_match_cpu_past_orig_ctx() {
+        let head_dim = 128usize;
+        let rot = 96usize;
+        let n_heads = 2usize;
+        let n_tokens = 16usize;
+        // Straddles 4096: the run this stands in for is one whose
+        // context exceeds `original_context_length`.
+        let base_pos = 4090usize;
+        let theta = 10000.0f32;
+        let rope = MetalRope {
+            layout: MetalRopeLayout::Neox,
+            rot_dim: Some(rot),
+            attn_factor: 1.1902381,
+        };
+        let ff: Vec<f32> = (0..rot / 2)
+            .map(|i| 1.0 + (i as f32 / ((rot / 2 - 1) as f32)).powf(3.0) * 46.77)
+            .collect();
+
+        let src: Vec<f32> = (0..n_tokens * n_heads * head_dim)
+            .map(|i| (i as f32 * 0.037).sin())
+            .collect();
+        let mut cpu = src.clone();
+        let mut gpu = src.clone();
+        for t in 0..n_tokens {
+            for h in 0..n_heads {
+                let off = (t * n_heads + h) * head_dim;
+                cpu_rope_head(
+                    &mut cpu[off..off + head_dim],
+                    rope,
+                    base_pos + t,
+                    theta,
+                    Some(&ff),
+                );
+            }
+        }
+        launch_rope_heads_batch_host(
+            &mut gpu,
+            n_heads,
+            head_dim,
+            n_tokens,
+            rope,
+            theta,
+            base_pos,
+            Some(&ff),
+        )
+        .expect("metal rope batch");
+
+        for (i, (a, b)) in cpu.iter().zip(gpu.iter()).enumerate() {
+            assert!(
+                (a - b).abs() <= 3e-3,
+                "long-context elem {i}: cpu={a} gpu={b}"
+            );
+        }
+        for t in 0..n_tokens {
+            for h in 0..n_heads {
+                for d in rot..head_dim {
+                    let i = (t * n_heads + h) * head_dim + d;
+                    assert_eq!(
+                        gpu[i], src[i],
+                        "long-context pass-through channel {d} (tok {t}, head {h})"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     #[ignore = "needs a real Metal GPU"]
     fn prefill_attn_block_matches_cpu_and_updates_kv() {

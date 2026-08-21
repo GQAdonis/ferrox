@@ -1,0 +1,406 @@
+// Activity: the live request log.
+//
+// `duration_ms` and `decode_ms` get their own columns and are never
+// added, averaged or collapsed into one "latency". `duration_ms` is
+// wall time for the whole request — queue wait, prefill and decode —
+// while `decode_ms` is the decode loop alone. A screen that showed only
+// the first would read a 50 tok/s model as 5 whenever the prompt is
+// long, and every throughput number a user quoted from it would be
+// wrong in the same direction.
+//
+// Rows are keyed by `request_id`, which the server states in the first
+// SSE chunk of the response that produced them, so a chat message and
+// its log line can be joined exactly rather than by a timing heuristic.
+
+import { useCallback, useEffect, useMemo, useState } from "react";
+import {
+  createColumnHelper,
+  flexRender,
+  getCoreRowModel,
+  getSortedRowModel,
+  useReactTable,
+  type SortingState,
+} from "@tanstack/react-table";
+import { ArrowDown, ArrowUp, Inbox, ChevronsUpDown } from "lucide-react";
+import { Badge } from "@/components/ui/badge";
+import {
+  Card,
+  CardBody,
+  CardFooter,
+  CardHeader,
+  CardTitle,
+} from "@/components/ui/card";
+import { EmptyState, Notice, Skeleton } from "@/components/ui/feedback";
+import { Sparkline } from "@/components/ui/sparkline";
+import { Table, TableScroll, Td, Tr } from "@/components/ui/table";
+import { Page, PageHeader } from "@/components/page";
+import { ApiError, getJson, routes, type Stats, type StatsRow } from "@/lib/api";
+import { fmtClock, fmtDuration, fmtInt, fmtMs, fmtNum, isNum } from "@/lib/format";
+import { cn } from "@/lib/utils";
+
+const POLL_MS = 2000;
+
+function Counter({
+  label,
+  value,
+  hint,
+}: {
+  label: string;
+  value: string;
+  hint?: string;
+}) {
+  return (
+    <div
+      className="rounded-lg border border-line bg-inset/40 px-3 py-2"
+      title={hint}
+    >
+      <p className="text-[0.6875rem] tracking-wide text-faint uppercase">
+        {label}
+      </p>
+      <p className="mt-0.5 font-mono text-lg tabular-nums">{value}</p>
+    </div>
+  );
+}
+
+const column = createColumnHelper<StatsRow>();
+
+/**
+ * Decode throughput for one row, or null.
+ *
+ * Computed from `completion_tokens / decode_ms` and from nothing else.
+ * `duration_ms` carries queue wait and prefill; dividing by it is
+ * exactly the mistake this screen keeps two columns to avoid.
+ */
+function decodeRate(row: StatsRow): number | null {
+  if (!isNum(row.decode_ms) || row.decode_ms <= 0) return null;
+  if (!isNum(row.completion_tokens) || row.completion_tokens <= 0) return null;
+  return (row.completion_tokens / row.decode_ms) * 1000;
+}
+
+const columns = [
+  column.accessor("at_ms", {
+    header: "at",
+    cell: (c) => <span className="font-mono">{fmtClock(c.getValue())}</span>,
+  }),
+  column.accessor("request_id", {
+    header: "request_id",
+    cell: (c) => (
+      <span
+        className="block max-w-[16rem] truncate font-mono"
+        title={c.getValue()}
+      >
+        {c.getValue()}
+      </span>
+    ),
+  }),
+  column.accessor("route", { header: "route" }),
+  column.accessor("status", {
+    header: "status",
+    cell: (c) => (
+      <Badge tone={c.getValue() >= 400 ? "err" : "ok"}>{c.getValue()}</Badge>
+    ),
+  }),
+  column.accessor((r) => (r.stream ? "stream" : "once"), {
+    id: "mode",
+    header: "mode",
+    cell: (c) => <span className="text-faint">{c.getValue()}</span>,
+  }),
+  column.accessor("prompt_tokens", {
+    header: "prompt",
+    cell: (c) => fmtInt(c.getValue()),
+    meta: { numeric: true },
+  }),
+  column.accessor("completion_tokens", {
+    header: "gen",
+    cell: (c) => fmtInt(c.getValue()),
+    meta: { numeric: true },
+  }),
+  column.accessor("ttft_ms", {
+    header: "ttft",
+    cell: (c) => (isNum(c.getValue()) ? fmtMs(c.getValue()) : "—"),
+    meta: { numeric: true },
+  }),
+  column.accessor("duration_ms", {
+    header: "duration",
+    cell: (c) => fmtMs(c.getValue()),
+    meta: { numeric: true },
+  }),
+  column.accessor("decode_ms", {
+    header: "decode",
+    cell: (c) => (isNum(c.getValue()) ? fmtMs(c.getValue()) : "—"),
+    meta: { numeric: true },
+  }),
+  column.accessor(decodeRate, {
+    id: "decode_rate",
+    header: "tok/s",
+    cell: (c) => (isNum(c.getValue()) ? fmtNum(c.getValue()) : "—"),
+    meta: { numeric: true },
+  }),
+];
+
+export function ActivityScreen() {
+  const [stats, setStats] = useState<Stats | null>(null);
+  const [unsupported, setUnsupported] = useState(false);
+  const [stale, setStale] = useState<string | null>(null);
+  const [sorting, setSorting] = useState<SortingState>([]);
+  const refresh = useCallback(async () => {
+    try {
+      const body = await getJson<Stats>(routes.adminStats);
+      setStats(body);
+      setStale(null);
+    } catch (error) {
+      if (error instanceof ApiError && error.isMissingEndpoint) {
+        setUnsupported(true);
+        return;
+      }
+      // A transient failure must not wipe the last good table: keep it
+      // and say the numbers are stale.
+      setStale((error as Error).message);
+    }
+  }, []);
+
+  useEffect(() => {
+    void refresh();
+    if (unsupported) return;
+    const id = setInterval(refresh, POLL_MS);
+    return () => clearInterval(id);
+  }, [refresh, unsupported]);
+
+  // The ring buffer arrives newest-last; a log reads newest-first.
+  const recent = useMemo(
+    () => [...(stats?.recent ?? [])].reverse(),
+    [stats?.recent],
+  );
+
+  // The React Compiler cannot see through TanStack Table's builder, so
+  // this one call opts out rather than the whole file carrying a
+  // suppression it does not need.
+  // eslint-disable-next-line react-hooks/incompatible-library
+  const table = useReactTable({
+    data: recent,
+    columns,
+    state: { sorting },
+    onSortingChange: setSorting,
+    getCoreRowModel: getCoreRowModel(),
+    getSortedRowModel: getSortedRowModel(),
+  });
+
+  if (unsupported) {
+    return (
+      <Page>
+        <PageHeader title="Activity" description="The server's request ring." />
+        <Card>
+          <CardBody>
+            <Notice tone="warn">
+              Not available in this build.{" "}
+              <code className="font-mono">{routes.adminStats}</code> answered
+              404, so there is no request log to show.{" "}
+              <code className="font-mono">/metrics</code> may still carry
+              Prometheus counters.
+            </Notice>
+          </CardBody>
+        </Card>
+      </Page>
+    );
+  }
+
+  // Sparklines read the ring oldest-first, which is the order it arrived.
+  const trend = stats?.recent ?? [];
+
+  return (
+    <Page>
+      <PageHeader
+        title="Activity"
+        description="Every request this process served, keyed by the request_id the response carried."
+      />
+
+      {stale ? <Notice tone="err">Stale: {stale}</Notice> : null}
+
+      <Card>
+        <CardHeader>
+          <CardTitle>Server counters</CardTitle>
+        </CardHeader>
+        <CardBody>
+          {!stats ? (
+            <div className="grid grid-cols-2 gap-2 sm:grid-cols-3 lg:grid-cols-5">
+              {Array.from({ length: 9 }, (_, i) => (
+                <Skeleton key={i} className="h-14" />
+              ))}
+            </div>
+          ) : (
+            <div className="grid grid-cols-2 gap-2 sm:grid-cols-3 lg:grid-cols-5">
+              <Counter
+                label="uptime"
+                value={fmtDuration(stats.uptime_seconds)}
+              />
+              <Counter label="requests" value={fmtInt(stats.requests_total)} />
+              <Counter label="errors" value={fmtInt(stats.errors_total)} />
+              <Counter label="cache hits" value={fmtInt(stats.cache_hits)} />
+              <Counter
+                label="cache misses"
+                value={fmtInt(stats.cache_misses)}
+              />
+              <Counter
+                label="prompt tokens"
+                value={fmtInt(stats.tokens_prompt_total)}
+              />
+              <Counter
+                label="generated tokens"
+                value={fmtInt(stats.tokens_generated_total)}
+              />
+              <Counter
+                label="generating now"
+                value={
+                  isNum(stats.generating_now)
+                    ? fmtInt(stats.generating_now)
+                    : "—"
+                }
+                hint="Streamed generations decoding at this instant — the ones POST /v1/cancel could stop. Work in progress, not a queue depth: nothing waits in front of a decode here."
+              />
+              <Counter
+                label="last request"
+                value={
+                  isNum(stats.last_request_age_seconds)
+                    ? `${fmtDuration(stats.last_request_age_seconds)} ago`
+                    : "—"
+                }
+                hint="Recent activity is positive evidence of liveness even when /health is slow to answer."
+              />
+            </div>
+          )}
+        </CardBody>
+      </Card>
+
+      {trend.length >= 2 ? (
+        <div className="grid gap-3 sm:grid-cols-3">
+          {(
+            [
+              ["TTFT (ms)", trend.map((r) => (isNum(r.ttft_ms) ? r.ttft_ms : null))],
+              [
+                "decode (ms)",
+                trend.map((r) => (isNum(r.decode_ms) ? r.decode_ms : null)),
+              ],
+              ["decode tok/s", trend.map(decodeRate)],
+            ] as const
+          ).map(([label, values]) => (
+            <Card key={label}>
+              <CardBody className="space-y-2 p-3">
+                <p className="text-[0.6875rem] tracking-wide text-faint uppercase">
+                  {label}
+                </p>
+                <Sparkline label={label} values={[...values]} />
+              </CardBody>
+            </Card>
+          ))}
+        </div>
+      ) : null}
+
+      <Card>
+        <CardHeader>
+          <CardTitle>Recent requests</CardTitle>
+          <Badge>{recent.length}</Badge>
+        </CardHeader>
+
+        {!stats ? (
+          <CardBody className="space-y-2">
+            {[0, 1, 2, 3].map((i) => (
+              <Skeleton key={i} className="h-8 w-full" />
+            ))}
+          </CardBody>
+        ) : !recent.length ? (
+          <EmptyState icon={Inbox} title="No requests yet">
+            Send a message on the Chat screen, or point an editor at this
+            server — external traffic lands here too.
+          </EmptyState>
+        ) : (
+          <TableScroll className="max-h-[32rem] overflow-y-auto">
+            <Table>
+              <thead>
+                {table.getHeaderGroups().map((group) => (
+                  <Tr key={group.id} className="hover:bg-transparent">
+                    {group.headers.map((header) => {
+                      const numeric = (
+                        header.column.columnDef.meta as
+                          | { numeric?: boolean }
+                          | undefined
+                      )?.numeric;
+                      const sorted = header.column.getIsSorted();
+                      const Icon =
+                        sorted === "asc"
+                          ? ArrowUp
+                          : sorted === "desc"
+                            ? ArrowDown
+                            : ChevronsUpDown;
+                      return (
+                        <th
+                          key={header.id}
+                          scope="col"
+                          className="sticky top-0 z-10 border-b border-line bg-raised p-0 text-left"
+                        >
+                          <button
+                            type="button"
+                            onClick={header.column.getToggleSortingHandler()}
+                            className={cn(
+                              "flex w-full items-center gap-1 px-3 py-2 text-[0.6875rem] font-semibold tracking-wide text-faint uppercase hover:text-fg",
+                              numeric && "justify-end",
+                            )}
+                          >
+                            {flexRender(
+                              header.column.columnDef.header,
+                              header.getContext(),
+                            )}
+                            <Icon
+                              className={cn(
+                                "size-3",
+                                sorted ? "text-accent" : "opacity-40",
+                              )}
+                            />
+                          </button>
+                        </th>
+                      );
+                    })}
+                  </Tr>
+                ))}
+              </thead>
+              <tbody>
+                {table.getRowModel().rows.map((row) => (
+                  <Tr key={row.id}>
+                    {row.getVisibleCells().map((cell) => (
+                      <Td
+                        key={cell.id}
+                        numeric={
+                          (
+                            cell.column.columnDef.meta as
+                              | { numeric?: boolean }
+                              | undefined
+                          )?.numeric
+                        }
+                      >
+                        {flexRender(
+                          cell.column.columnDef.cell,
+                          cell.getContext(),
+                        )}
+                      </Td>
+                    ))}
+                  </Tr>
+                ))}
+              </tbody>
+            </Table>
+          </TableScroll>
+        )}
+
+        <CardFooter>
+          <strong className="font-semibold text-muted">duration</strong> is the
+          whole request — queue wait, prefill and decode.{" "}
+          <strong className="font-semibold text-muted">decode</strong> is the
+          decode loop alone; it is “—” when the engine did not time itself or
+          the answer came from cache. The{" "}
+          <strong className="font-semibold text-muted">tok/s</strong> column is{" "}
+          <code className="font-mono">completion_tokens / decode_ms</code> and
+          nothing else — dividing by duration is how a fast model gets reported
+          as a slow one, so the two are never combined here.
+        </CardFooter>
+      </Card>
+    </Page>
+  );
+}

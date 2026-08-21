@@ -50,7 +50,6 @@ library or overriding the CLI.
 | `FERROX_CPU_KV_OFFLOAD` | `1` — sync Metal KV to host after each decode step |
 | `FERROX_TOKIO_WORKERS` | `ferrox-server` async worker threads (default `2`); keeps the HTTP runtime from oversubscribing the decode pool |
 | `FERROX_QOS_LOG` | `1` — log each rayon worker's macOS QoS class at pool start |
-| `FERROX_UI` | `1` — serve the embedded Ferrox Studio at `/` and `/ui` (same as `--ui-server`). **Off by default: without it `/` and every deep link return 404**, not an empty page |
 | `FERROX_EXIT_ON_STDIN_CLOSE` | `1` — exit on stdin EOF (same as `--exit-on-stdin-close`); off by default so a `/dev/null` stdin does not stop the server |
 | `FERROX_KV_POOL_BLOCKS` | Paged-KV pool size (blocks) |
 | `FERROX_KV_POOL_BLOCK_SIZE` | Tokens per paged-KV block |
@@ -73,7 +72,7 @@ scraper pointed at a keyed server gets a `401`.
 | `FERROX_API_KEY` | Bearer token required by every route except `/health` |
 | `FERROX_ALLOW_UNAUTHENTICATED_REMOTE` | `1` — permit binding a non-loopback address with no API key. Without it the server **refuses to start** in that configuration, which is deliberate: an unauthenticated model endpoint on a LAN address is an open proxy |
 | `FERROX_TLS_CERT` / `FERROX_TLS_KEY` | PEM cert and key. **Both or neither** — setting one alone is a startup error. Unset means plain HTTP |
-| `FERROX_CORS_ORIGINS` | Comma-separated **exact** origins. `*` is rejected on purpose, because a wildcard plus a bearer token is a credential-leak shape |
+| `FERROX_CORS_ORIGINS` | Comma-separated **exact** origins. `*` is rejected on purpose, because a wildcard plus a bearer token is a credential-leak shape. **Required to serve Ferrox Studio (`ui/`) from another origin** — set it to that origin exactly. `ui/`'s dev server proxies the API instead, so `npm run dev` needs none of this |
 | `FERROX_RATE_LIMIT_PER_MINUTE` | Global request cap. A non-integer value is a startup error, not a silent default |
 | `FERROX_JOURNAL_PATH` | Where the process-lifecycle journal is written |
 

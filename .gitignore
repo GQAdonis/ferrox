@@ -27,3 +27,12 @@ benchmarks/receipts/_suite_*.log
 models/
 data/
 .env
+
+# Ferrox Studio frontend (source in ui/, standalone app).
+# `npm run build` output is NOT committed: the server no longer embeds
+# the UI, so nothing here ships inside a Rust crate.
+/ui/node_modules/
+/ui/dist/
+/ui/.vite/
+/ui/node_modules/.vite/
+/ui/*.tsbuildinfo

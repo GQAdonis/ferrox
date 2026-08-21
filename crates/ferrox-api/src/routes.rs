@@ -15,12 +15,6 @@ pub const METRICS: &str = "/metrics";
 /// Response- and prefix-cache counters.
 pub const CACHE_STATS: &str = "/cache/stats";
 
-/// The embedded UI. Served at both `/` and `/ui` only when the server
-/// is started with `--ui-server` / `FERROX_UI=1`.
-pub const ROOT: &str = "/";
-/// See [`ROOT`].
-pub const UI: &str = "/ui";
-
 pub const V1_MODELS: &str = "/v1/models";
 pub const V1_CHAT_COMPLETIONS: &str = "/v1/chat/completions";
 pub const V1_COMPLETIONS: &str = "/v1/completions";
@@ -37,9 +31,8 @@ pub const V1_MESSAGES: &str = "/v1/messages";
 /// Under `/v1` rather than at the root the plan sketched it at, for two
 /// reasons that both matter: it acts on inference and so belongs behind
 /// the same `FERROX_API_KEY` gate as the endpoint that started the
-/// work, and a root-level `/cancel` would sit inside the namespace the
-/// embedded UI's SPA fallback owns, where a mistyped path is answered
-/// with HTML rather than a JSON 404.
+/// work, and `/v1` is where every other inference path already lives,
+/// so a client configured with one base URL reaches all of them.
 ///
 /// This is the second tier of cancellation, not the only one -- a
 /// client that simply drops the connection is also honoured. It exists
@@ -99,8 +92,6 @@ pub const ALL: &[&str] = &[
     HEALTH,
     METRICS,
     CACHE_STATS,
-    ROOT,
-    UI,
     V1_MODELS,
     V1_CHAT_COMPLETIONS,
     V1_COMPLETIONS,
@@ -126,10 +117,7 @@ mod tests {
         let mut seen = std::collections::BTreeSet::new();
         for route in ALL {
             assert!(route.starts_with('/'), "{route} is not an absolute path");
-            assert!(
-                !route.ends_with('/') || *route == ROOT,
-                "{route} has a trailing slash"
-            );
+            assert!(!route.ends_with('/'), "{route} has a trailing slash");
             assert!(seen.insert(*route), "{route} is listed twice");
         }
     }

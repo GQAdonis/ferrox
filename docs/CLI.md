@@ -234,7 +234,7 @@ OpenAI-compatible HTTP API:
   --host 127.0.0.1 --port 8383 -dev metal -ngl all
 
 # Optional browser UI at / and /ui
-./target/release/ferrox-server -m model.gguf --ui-server
+./target/release/ferrox-server -m model.gguf
 
 # MCP config (metadata in GET /v1/models; invoke not wired)
 ./target/release/ferrox-server -m model.gguf --mcp-config mcp.json

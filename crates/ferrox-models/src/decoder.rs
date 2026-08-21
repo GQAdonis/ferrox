@@ -814,13 +814,17 @@ impl Decoder {
         if self.config.head_dim > 256 {
             return false;
         }
-        // Partial rotary and LongRoPE's `mscale` are CPU-only today: the
-        // Metal RoPE kernels rotate the whole head and take no magnitude
-        // uniform, so admitting such a model here would make Metal and
-        // CPU compute different attention for the same weights. Refusing
-        // costs Phi-4-mini its Metal path until the kernels carry both;
-        // the alternative is two backends that disagree.
-        if self.config.rope_dim.is_some() || self.config.rope_attn_factor != 1.0 {
+        // Partial rotary (`n_rot < head_dim`) and LongRoPE's `mscale`
+        // now ride the Metal RoPE kernels as the `rot_dim` / `mscale`
+        // uniforms on [`ferrox_metal::attn::MetalRope`], so Phi-3/Phi-4
+        // are admitted here. `n_rot` must still be even — ggml's
+        // `ggml_rope_impl` asserts it, and an odd width would leave one
+        // channel's pairing undefined rather than merely unrotated.
+        if self
+            .config
+            .rope_dim
+            .is_some_and(|rot| rot == 0 || rot % 2 != 0 || rot > self.config.head_dim)
+        {
             return false;
         }
         Self::metal_matvec_launch(&layer.attn.q_proj).is_some()
@@ -875,13 +879,26 @@ impl Decoder {
         self.gpu_vram_budget_bytes.map(|b| self.residency_plan(b))
     }
 
-    /// Map config RoPE layout onto the Metal kernel selector.
+    /// Map this checkpoint's RoPE onto the Metal kernel uniforms:
+    /// pairing convention, rotary width (`n_rot`), and ggml `rope_yarn`'s
+    /// `mscale`. The last two are what
+    /// [`Decoder::apply_rope_head_theta`] and
+    /// [`Decoder::apply_rope_attn_factor`] do on the CPU side, so the
+    /// two backends stay one graph.
     #[cfg(feature = "metal")]
-    fn metal_rope_layout(&self) -> ferrox_metal::attn::MetalRopeLayout {
+    fn metal_rope(&self) -> ferrox_metal::attn::MetalRope {
         use crate::config::RopeLayout;
-        match self.config.rope_layout {
+        let layout = match self.config.rope_layout {
             RopeLayout::Norm => ferrox_metal::attn::MetalRopeLayout::Norm,
             RopeLayout::Neox => ferrox_metal::attn::MetalRopeLayout::Neox,
+        };
+        ferrox_metal::attn::MetalRope {
+            layout,
+            rot_dim: self
+                .config
+                .rope_dim
+                .filter(|rot| *rot < self.config.head_dim),
+            attn_factor: self.config.rope_attn_factor,
         }
     }
 
@@ -1079,7 +1096,7 @@ impl Decoder {
             kvs,
             n_heads,
             batch_size,
-            self.metal_rope_layout(),
+            self.metal_rope(),
             &rope_thetas,
             self.config.rope_freqs.as_deref(),
             start_pos,
@@ -1739,7 +1756,7 @@ impl Decoder {
                                     self.config.moe.n_experts_active,
                                     self.config.moe.norm_topk_prob,
                                     n_heads,
-                                    self.metal_rope_layout(),
+                                    self.metal_rope(),
                                     self.config.rope_theta,
                                     self.config.rope_freqs.as_deref(),
                                     pos,
@@ -1891,7 +1908,7 @@ impl Decoder {
                                 &dense_layers,
                                 metal_kvs,
                                 n_heads,
-                                self.metal_rope_layout(),
+                                self.metal_rope(),
                                 self.config.rope_theta,
                                 self.config.rope_freqs.as_deref(),
                                 pos,
@@ -2031,7 +2048,7 @@ impl Decoder {
                                             &u_l,
                                             &d_l,
                                             n_heads,
-                                            self.metal_rope_layout(),
+                                            self.metal_rope(),
                                             self.config.rope_theta,
                                             self.config.rope_freqs.as_deref(),
                                             pos,
@@ -2130,7 +2147,7 @@ impl Decoder {
                                                                 self.config.moe.n_experts_active,
                                                                 self.config.moe.norm_topk_prob,
                                                                 n_heads,
-                                                                self.metal_rope_layout(),
+                                                                self.metal_rope(),
                                                                 self.config.rope_theta,
                                                                 self.config.rope_freqs.as_deref(),
                                                                 pos,
@@ -2168,7 +2185,7 @@ impl Decoder {
                                                         &layer.moe.norm_weight,
                                                         &router_l,
                                                         n_heads,
-                                                        self.metal_rope_layout(),
+                                                        self.metal_rope(),
                                                         self.config.rope_theta,
                                                         self.config.rope_freqs.as_deref(),
                                                         pos,
@@ -2253,7 +2270,7 @@ impl Decoder {
                                             &o_l,
                                             &mut metal_kvs[l],
                                             n_heads,
-                                            self.metal_rope_layout(),
+                                            self.metal_rope(),
                                             self.config.rope_theta,
                                             self.config.rope_freqs.as_deref(),
                                             pos,
@@ -3577,7 +3594,7 @@ impl Decoder {
                                         &mut metal_kvs[l],
                                         n_heads,
                                         batch_size,
-                                        self.metal_rope_layout(),
+                                        self.metal_rope(),
                                         self.config.layer_rope_theta(l),
                                         self.config.rope_freqs.as_deref(),
                                         start_pos,
@@ -3667,6 +3684,10 @@ impl Decoder {
                     row.copy_from_slice(&normed);
                 }
             }
+            // Host-side `mscale`, applied before either backend ropes.
+            // The Metal branch below therefore hands its kernels
+            // `attn_factor_applied_by_caller()` — folding it into cos/sin
+            // there as well would square it.
             self.apply_rope_attn_factor(&mut q_batch, &mut k_batch);
 
             #[cfg(feature = "metal")]
@@ -3710,7 +3731,7 @@ impl Decoder {
                                         &mut metal_kvs[l],
                                         n_heads,
                                         batch_size,
-                                        self.metal_rope_layout(),
+                                        self.metal_rope().attn_factor_applied_by_caller(),
                                         self.config.layer_rope_theta(l),
                                         self.config.rope_freqs.as_deref(),
                                         start_pos,
@@ -3731,7 +3752,7 @@ impl Decoder {
                                         &mut metal_kvs[l],
                                         n_heads,
                                         batch_size,
-                                        self.metal_rope_layout(),
+                                        self.metal_rope().attn_factor_applied_by_caller(),
                                         self.config.layer_rope_theta(l),
                                         self.config.rope_freqs.as_deref(),
                                         start_pos,

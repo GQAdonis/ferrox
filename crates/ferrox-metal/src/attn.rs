@@ -46,10 +46,11 @@
 //!
 //! `FERROX_CTK` selects KV dtype ([`MetalKvDtype`]); see [`is_implemented`].
 use crate::elem::{
-    encode_add_rms_norm, encode_add_rms_norm_batch, encode_argmax, encode_f32_to_f16,
-    encode_gelu_mul, encode_rms_norm, encode_rms_norm_at, encode_rms_norm_batch,
-    encode_rms_norm_f32_to_f16_batch, encode_rms_norm_per_head_batch, encode_silu_mul,
-    encode_vec_add, encode_vec_add_at, warm_prefill_elem_pipelines,
+    encode_act_mul_f32_to_f16, encode_add_rms_norm, encode_add_rms_norm_batch,
+    encode_add_rms_norm_f32_to_f16_batch, encode_argmax, encode_f32_to_f16, encode_gelu_mul,
+    encode_rms_norm, encode_rms_norm_at, encode_rms_norm_batch, encode_rms_norm_f32_to_f16_batch,
+    encode_rms_norm_per_head_batch, encode_silu_mul, encode_vec_add, encode_vec_add_at,
+    warm_prefill_elem_pipelines,
 };
 use crate::embd::{encode_get_rows, EmbdKind};
 use crate::gpu::{
@@ -61,7 +62,7 @@ use crate::gpu::{
     shared_metal, warm_mul_mm_sg_pipeline, MatvecLaunch, MetalError, MoeExpertLaunch, MoePackedQ4,
     MulMmSgLaunch, ResidentF32Buffer, ResidentWeightBuffer,
 };
-use crate::moe_ranges::MoeMemRanges;
+use crate::mem_ranges::MemRanges;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{
@@ -2880,7 +2881,6 @@ struct PrefillScratch {
     o: Retained<ProtocolObject<dyn MTLBuffer>>,
     gate: Retained<ProtocolObject<dyn MTLBuffer>>,
     up: Retained<ProtocolObject<dyn MTLBuffer>>,
-    act: Retained<ProtocolObject<dyn MTLBuffer>>,
     down: Retained<ProtocolObject<dyn MTLBuffer>>,
     /// Reused f16 activation plane for `mul_mm_sg_f16` (max of hidden/q/gate).
     half_act: Retained<ProtocolObject<dyn MTLBuffer>>,
@@ -3214,7 +3214,9 @@ fn borrow_prefill_scratch(
             o: alloc_f32_buffer(device, bh)?,
             gate: alloc_f32_buffer(device, caps.batch * caps.max_gate)?,
             up: alloc_f32_buffer(device, caps.batch * caps.max_gate)?,
-            act: alloc_f32_buffer(device, caps.batch * caps.max_gate)?,
+            // No f32 `act` plane: SwiGLU/GeGLU writes straight into
+            // `half_act` for the down `mul_mm_sg_f16`, which also saves
+            // `batch * max_gate * 4` bytes of scratch.
             down: alloc_f32_buffer(device, bh)?,
             half_act: alloc_half_buffer(device, half_cap)?,
             half_act_cap: half_cap,
@@ -3684,9 +3686,17 @@ fn encode_gqa_with_kv(
     }
 }
 
+/// Prefill GQA against the layer's KV cache, hazard-tracked through `mrs`.
+///
+/// A quantized KV cache is dequantized into a *shared, process-wide* f16
+/// scratch first. That scratch is the one buffer in the prefill layer that
+/// is not visible to the caller, so the tracking has to happen in here:
+/// the next layer's dequant writes it again (WAR against this layer's GQA
+/// read) and nothing outside would know to order those.
 #[allow(clippy::too_many_arguments)]
 fn encode_gqa_prefill_with_kv(
     encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+    mrs: &mut MemRanges,
     device: &Retained<ProtocolObject<dyn MTLDevice>>,
     q: &ProtocolObject<dyn MTLBuffer>,
     kv: &MetalKvBuffers,
@@ -3703,11 +3713,15 @@ fn encode_gqa_prefill_with_kv(
         let elems = (total_seq as usize) * kv.elems_per_token();
         let mut guard = borrow_q8_attn_scratch(device, elems)?;
         let scratch = guard.as_mut().unwrap();
+        let (sk, sv) = (scratch.k.as_ref(), scratch.v.as_ref());
+        let (kk, vv) = (kv.k.as_ref(), kv.v.as_ref());
+        mrs.begin_op(encoder, &[kk, vv], &[sk, sv]);
         encode_kv_dequant_to_f16(encoder, device, kv.dtype, &kv.k, &scratch.k, elems as u32)?;
         encode_kv_dequant_to_f16(encoder, device, kv.dtype, &kv.v, &scratch.v, elems as u32)?;
-        // Concurrent encode: GQA must not race the dequant writes.
-        memory_barrier_buffers(encoder);
-        encode_gqa_prefill(
+        mrs.end_op(&[kk, vv], &[sk, sv]);
+        // GQA must not race the dequant writes it just queued.
+        mrs.begin_op(encoder, &[q, sk, sv], &[out]);
+        let res = encode_gqa_prefill(
             encoder,
             device,
             q,
@@ -3720,9 +3734,13 @@ fn encode_gqa_prefill_with_kv(
             n_q,
             kv_prefix_len,
             attn_softcap,
-        )
+        );
+        mrs.end_op(&[q, sk, sv], &[out]);
+        res
     } else {
-        encode_gqa_prefill(
+        let (kk, vv) = (kv.k.as_ref(), kv.v.as_ref());
+        mrs.begin_op(encoder, &[q, kk, vv], &[out]);
+        let res = encode_gqa_prefill(
             encoder,
             device,
             q,
@@ -3735,7 +3753,9 @@ fn encode_gqa_prefill_with_kv(
             n_q,
             kv_prefix_len,
             attn_softcap,
-        )
+        );
+        mrs.end_op(&[q, kk, vv], &[out]);
+        res
     }
 }
 
@@ -5471,7 +5491,7 @@ fn moe_layer_resident(
     Ok(bound)
 }
 
-/// One MoE layer into a Concurrent encoder using llama-style [`MoeMemRanges`]
+/// One MoE layer into a Concurrent encoder using llama-style [`MemRanges`]
 /// barriers (only on SRC↔DST / DST↔DST conflicts). Same shape as dense
 /// [`launch_decode_dense_stack`] and llama `ggml_metal_op` + `mem_ranges`.
 ///
@@ -5479,7 +5499,7 @@ fn moe_layer_resident(
 #[allow(clippy::too_many_arguments)]
 fn encode_moe_layer_fused(
     encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
-    mrs: &mut MoeMemRanges,
+    mrs: &mut MemRanges,
     device: &Retained<ProtocolObject<dyn MTLDevice>>,
     scratch: &MoeDecodeScratch,
     layer_idx: usize,
@@ -6052,9 +6072,9 @@ pub fn launch_moe_decode_stack(
 
         let cmd_buf = queue.commandBuffer().ok_or(MetalError::CommandFailed)?;
         // llama.cpp / dense-stack: one Concurrent encoder for the full graph,
-        // barriers only via MoeMemRanges (ggml_mem_ranges).
+        // barriers only via MemRanges (ggml_mem_ranges).
         let encoder = compute_encoder_concurrent(&cmd_buf)?;
-        let mut mrs = MoeMemRanges::new();
+        let mut mrs = MemRanges::new();
 
         let _embd_w = if let Some(e) = embd {
             let w = resident_weight_buffer(device, e.weights)?;
@@ -6973,7 +6993,6 @@ struct PrefillScratchView<'a> {
     o: &'a ProtocolObject<dyn MTLBuffer>,
     gate: &'a ProtocolObject<dyn MTLBuffer>,
     up: &'a ProtocolObject<dyn MTLBuffer>,
-    act: &'a ProtocolObject<dyn MTLBuffer>,
     down: &'a ProtocolObject<dyn MTLBuffer>,
     half_act: &'a ProtocolObject<dyn MTLBuffer>,
 }
@@ -7048,6 +7067,7 @@ fn resident_prefill_dense_layer(
 #[allow(clippy::too_many_arguments)]
 fn encode_prefill_dense_layer(
     encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+    mrs: &mut MemRanges,
     device: &Retained<ProtocolObject<dyn MTLDevice>>,
     layer: &PrefillDenseLayerMetal<'_>,
     resident: &PrefillDenseLayerResident,
@@ -7076,10 +7096,13 @@ fn encode_prefill_dense_layer(
     let o_buf = scratch.o;
     let gate_buf = scratch.gate;
     let up_buf = scratch.up;
-    let act_buf = scratch.act;
     let down_buf = scratch.down;
-
     let half_act = scratch.half_act;
+    let kv_k = kv.k.as_ref();
+    let kv_v = kv.v.as_ref();
+
+    // attn_norm: h → half_act (f32→f16 already folded into the norm).
+    mrs.begin_op(encoder, &[h_buf], &[half_act]);
     encode_rms_norm_f32_to_f16_batch(
         encoder,
         device,
@@ -7090,7 +7113,10 @@ fn encode_prefill_dense_layer(
         batch as u32,
         rms_eps,
     )?;
-    memory_barrier_buffers(encoder);
+    mrs.end_op(&[h_buf], &[half_act]);
+
+    // Q ∥ K ∥ V — one Concurrent set (shared src, disjoint dsts).
+    mrs.begin_op(encoder, &[half_act], &[q_buf, k_buf, v_buf]);
     encode_mul_mm_sg_f16(
         encoder,
         device,
@@ -7118,8 +7144,10 @@ fn encode_prefill_dense_layer(
         v_buf,
         batch,
     )?;
-    memory_barrier_buffers(encoder);
+    mrs.end_op(&[half_act], &[q_buf, k_buf, v_buf]);
 
+    // QKV bias / QK-norm, in place on q/k/v.
+    mrs.begin_op(encoder, &[q_buf, k_buf, v_buf], &[q_buf, k_buf, v_buf]);
     encode_attn_extras_batch(
         encoder,
         device,
@@ -7137,8 +7165,10 @@ fn encode_prefill_dense_layer(
         rms_eps,
         &resident.extras,
     )?;
-    memory_barrier_buffers(encoder);
+    mrs.end_op(&[q_buf, k_buf, v_buf], &[q_buf, k_buf, v_buf]);
 
+    // RoPE q ∥ RoPE k, in place (disjoint buffers, so they overlap).
+    mrs.begin_op(encoder, &[q_buf, k_buf], &[q_buf, k_buf]);
     encode_rope_batch(
         encoder,
         device,
@@ -7163,17 +7193,19 @@ fn encode_prefill_dense_layer(
         batch as u32,
         ff_buf,
     )?;
-    memory_barrier_buffers(encoder);
+    mrs.end_op(&[q_buf, k_buf], &[q_buf, k_buf]);
 
     let kv_width = n_kv_heads * head_dim;
     let token_elems = (batch * kv_width) as u32;
     let offset = (kv.seq_len * kv_width) as u32;
+    mrs.begin_op(encoder, &[k_buf, v_buf], &[kv_k, kv_v]);
     encode_kv_store_append(encoder, device, k_buf, kv, KvPlane::K, offset, token_elems)?;
     encode_kv_store_append(encoder, device, v_buf, kv, KvPlane::V, offset, token_elems)?;
-    memory_barrier_buffers(encoder);
+    mrs.end_op(&[k_buf, v_buf], &[kv_k, kv_v]);
 
     encode_gqa_prefill_with_kv(
         encoder,
+        mrs,
         device,
         q_buf,
         kv,
@@ -7185,8 +7217,8 @@ fn encode_prefill_dense_layer(
         start_pos as u32,
         attn_softcap,
     )?;
-    memory_barrier_buffers(encoder);
 
+    mrs.begin_op(encoder, &[attn_buf], &[half_act]);
     encode_f32_to_f16(
         encoder,
         device,
@@ -7194,7 +7226,9 @@ fn encode_prefill_dense_layer(
         half_act,
         (batch * layer.q.rows) as u32,
     )?;
-    memory_barrier_buffers(encoder);
+    mrs.end_op(&[attn_buf], &[half_act]);
+
+    mrs.begin_op(encoder, &[half_act], &[o_buf]);
     encode_mul_mm_sg_f16(
         encoder,
         device,
@@ -7204,9 +7238,10 @@ fn encode_prefill_dense_layer(
         o_buf,
         batch,
     )?;
-    memory_barrier_buffers(encoder);
+    mrs.end_op(&[half_act], &[o_buf]);
 
     if let Some(pw) = resident.post_attn_w.as_ref() {
+        mrs.begin_op(encoder, &[o_buf], &[o_buf]);
         encode_rms_norm_batch(
             encoder,
             device,
@@ -7217,46 +7252,88 @@ fn encode_prefill_dense_layer(
             batch as u32,
             rms_eps,
         )?;
-        memory_barrier_buffers(encoder);
+        mrs.end_op(&[o_buf], &[o_buf]);
     }
 
-    // Fuse residual add + FFN RMSNorm into one dispatch when possible.
-    if resident.post_attn_w.is_none() {
-        encode_add_rms_norm_batch(
+    // FFN input staging. The dense FFN only wants f16, so residual-add +
+    // RMSNorm + the f32→f16 convert collapse into one dispatch. The MoE FFN
+    // also routes on the f32 activations, so it keeps the f32 `x2` write and
+    // converts separately.
+    let ffn_is_moe = matches!(layer.ffn, PrefillFfnMetal::Moe(_));
+    if resident.post_attn_w.is_none() && !ffn_is_moe {
+        mrs.begin_op(encoder, &[h_buf, o_buf], &[h_buf, half_act]);
+        encode_add_rms_norm_f32_to_f16_batch(
             encoder,
             device,
             h_buf,
             o_buf,
             &resident.ffn_nw.buffer,
-            x2_buf,
+            half_act,
             hidden_dim as u32,
             batch as u32,
             rms_eps,
         )?;
+        mrs.end_op(&[h_buf, o_buf], &[h_buf, half_act]);
     } else {
-        encode_vec_add(encoder, device, h_buf, o_buf, (batch * hidden_dim) as u32)?;
-        memory_barrier_buffers(encoder);
-        encode_rms_norm_batch(
-            encoder,
-            device,
-            h_buf,
-            &resident.ffn_nw.buffer,
-            x2_buf,
-            hidden_dim as u32,
-            batch as u32,
-            rms_eps,
-        )?;
+        if resident.post_attn_w.is_none() {
+            mrs.begin_op(encoder, &[h_buf, o_buf], &[h_buf, x2_buf]);
+            encode_add_rms_norm_batch(
+                encoder,
+                device,
+                h_buf,
+                o_buf,
+                &resident.ffn_nw.buffer,
+                x2_buf,
+                hidden_dim as u32,
+                batch as u32,
+                rms_eps,
+            )?;
+            mrs.end_op(&[h_buf, o_buf], &[h_buf, x2_buf]);
+        } else {
+            mrs.begin_op(encoder, &[h_buf, o_buf], &[h_buf]);
+            encode_vec_add(encoder, device, h_buf, o_buf, (batch * hidden_dim) as u32)?;
+            mrs.end_op(&[h_buf, o_buf], &[h_buf]);
+            if ffn_is_moe {
+                mrs.begin_op(encoder, &[h_buf], &[x2_buf]);
+                encode_rms_norm_batch(
+                    encoder,
+                    device,
+                    h_buf,
+                    &resident.ffn_nw.buffer,
+                    x2_buf,
+                    hidden_dim as u32,
+                    batch as u32,
+                    rms_eps,
+                )?;
+                mrs.end_op(&[h_buf], &[x2_buf]);
+            } else {
+                mrs.begin_op(encoder, &[h_buf], &[half_act]);
+                encode_rms_norm_f32_to_f16_batch(
+                    encoder,
+                    device,
+                    h_buf,
+                    &resident.ffn_nw.buffer,
+                    half_act,
+                    hidden_dim as u32,
+                    batch as u32,
+                    rms_eps,
+                )?;
+                mrs.end_op(&[h_buf], &[half_act]);
+            }
+        }
+        if ffn_is_moe {
+            mrs.begin_op(encoder, &[x2_buf], &[half_act]);
+            encode_f32_to_f16(
+                encoder,
+                device,
+                x2_buf,
+                half_act,
+                (batch * hidden_dim) as u32,
+            )?;
+            mrs.end_op(&[x2_buf], &[half_act]);
+        }
     }
-    memory_barrier_buffers(encoder);
 
-    encode_f32_to_f16(
-        encoder,
-        device,
-        x2_buf,
-        half_act,
-        (batch * hidden_dim) as u32,
-    )?;
-    memory_barrier_buffers(encoder);
     match (&layer.ffn, &resident.ffn_w) {
         (
             PrefillFfnMetal::Dense { gate, up, down },
@@ -7266,32 +7343,35 @@ fn encode_prefill_dense_layer(
                 down_w,
             },
         ) => {
+            // gate ∥ up
+            mrs.begin_op(encoder, &[half_act], &[gate_buf, up_buf]);
             encode_mul_mm_sg_f16(encoder, device, gate, gate_w, half_act, gate_buf, batch)?;
             encode_mul_mm_sg_f16(encoder, device, up, up_w, half_act, up_buf, batch)?;
-            memory_barrier_buffers(encoder);
+            mrs.end_op(&[half_act], &[gate_buf, up_buf]);
+
+            // SwiGLU/GeGLU straight to f16 — the staging convert is folded in.
             let ffn_elems = (batch * gate.rows) as u32;
-            if gelu_ffn {
-                encode_gelu_mul(encoder, device, gate_buf, up_buf, act_buf, ffn_elems)?;
-            } else {
-                encode_silu_mul(encoder, device, gate_buf, up_buf, act_buf, ffn_elems)?;
-            }
-            memory_barrier_buffers(encoder);
-            encode_f32_to_f16(encoder, device, act_buf, half_act, ffn_elems)?;
-            memory_barrier_buffers(encoder);
+            mrs.begin_op(encoder, &[gate_buf, up_buf], &[half_act]);
+            encode_act_mul_f32_to_f16(
+                encoder, device, gate_buf, up_buf, half_act, ffn_elems, gelu_ffn,
+            )?;
+            mrs.end_op(&[gate_buf, up_buf], &[half_act]);
+
+            mrs.begin_op(encoder, &[half_act], &[down_buf]);
             encode_mul_mm_sg_f16(encoder, device, down, down_w, half_act, down_buf, batch)?;
+            mrs.end_op(&[half_act], &[down_buf]);
         }
         (PrefillFfnMetal::Moe(moe), PrefillFfnResident::Moe { packed, router_w }) => {
             crate::gpu::encode_moe_prefill_ffn(
-                encoder, device, moe, packed, router_w, x2_buf, half_act, down_buf, batch,
+                encoder, mrs, device, moe, packed, router_w, x2_buf, half_act, down_buf, batch,
             )?;
         }
         // resident_prefill_dense_layer builds the resident half from the
         // same enum, so the mixed arms are unreachable.
         _ => return Err(MetalError::CommandFailed),
     }
-    memory_barrier_buffers(encoder);
-
     if let Some(pw) = resident.post_ffn_w.as_ref() {
+        mrs.begin_op(encoder, &[down_buf], &[down_buf]);
         encode_rms_norm_batch(
             encoder,
             device,
@@ -7302,9 +7382,10 @@ fn encode_prefill_dense_layer(
             batch as u32,
             rms_eps,
         )?;
-        memory_barrier_buffers(encoder);
+        mrs.end_op(&[down_buf], &[down_buf]);
     }
 
+    mrs.begin_op(encoder, &[h_buf, down_buf], &[h_buf]);
     encode_vec_add(
         encoder,
         device,
@@ -7312,7 +7393,7 @@ fn encode_prefill_dense_layer(
         down_buf,
         (batch * hidden_dim) as u32,
     )?;
-    memory_barrier_buffers(encoder);
+    mrs.end_op(&[h_buf, down_buf], &[h_buf]);
     Ok(())
 }
 
@@ -7413,7 +7494,6 @@ pub fn launch_prefill_dense_stack(
         o: &scratch.o,
         gate: &scratch.gate,
         up: &scratch.up,
-        act: &scratch.act,
         down: &scratch.down,
         half_act: &scratch.half_act,
     };
@@ -7458,11 +7538,15 @@ pub fn launch_prefill_dense_stack(
     let setup_us = t_setup.elapsed().as_micros();
     let cmd_buf = queue.commandBuffer().ok_or(MetalError::CommandFailed)?;
     let encoder = compute_encoder_concurrent(&cmd_buf)?;
+    // One tracker for the whole stack: layer N+1's first dispatch only
+    // barriers when it actually touches something layer N left dirty.
+    let mut mrs = MemRanges::new();
 
     for (layer_idx, (layer, kv)) in layers.iter().zip(kvs.iter()).enumerate() {
         let resident = resident_prefill_dense_layer(device, layer, hidden_dim)?;
         encode_prefill_dense_layer(
             &encoder,
+            &mut mrs,
             device,
             layer,
             &resident,
@@ -7776,6 +7860,7 @@ pub fn launch_prefill_attn_block(
 
     let prefill_result = encode_gqa_prefill_with_kv(
         &encoder,
+        &mut MemRanges::new(),
         device,
         &q_buf,
         kv,
@@ -7930,6 +8015,7 @@ pub fn launch_prefill_attn_o_residual(
 
     encode_gqa_prefill_with_kv(
         &encoder,
+        &mut MemRanges::new(),
         device,
         &q_buf,
         kv,

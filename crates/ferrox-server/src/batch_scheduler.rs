@@ -4,9 +4,13 @@
 //!
 //! Opt-in via `FERROX_CONTINUOUS_BATCHING=1`; mutually exclusive with
 //! the KV pool and prefix cache (those paths keep the private-loop
-//! `generate`). Stop sequences use the same pending-buffer logic as
-//! `generate::sample_until_stop` (decode each new token, hold back
-//! `longest_stop - 1` bytes, finish on match).
+//! `generate`). Stop sequences go through the same
+//! [`StopMatcher`](crate::stop::StopMatcher) as
+//! `generate::sample_until_stop`: a token-level match on the id before
+//! the token is detokenized, plus output-suffix buffering that
+//! withholds any tail that could still complete a stop string. One
+//! implementation, so a row in a batch and a row on its own cannot
+//! disagree about where an answer ends.
 //!
 //! **Chunked prefill.** A prompt is not prefilled in one uninterruptible
 //! `forward_token` loop. Each accepted job first becomes a
@@ -51,27 +55,106 @@
 //! wait for admission before new ones are refused with
 //! [`DecodeError::QueueFull`] (default [`DEFAULT_MAX_QUEUE`]).
 //!
+//! **Block admission.** A sequence count is not a memory budget: 8
+//! concurrent 200-token chats and 8 concurrent 100k-token documents
+//! are both "8 sequences" and are three orders of magnitude apart in
+//! KV. So admission is on an *integer block budget* --
+//! `blocks_needed <= blocks_free`, where a block is a fixed run of
+//! `FERROX_CB_KV_BLOCK_SIZE` token positions and a request needs
+//! `ceil((prompt + max_tokens) / block_size)` of them, reserved for its
+//! whole lifetime at admission and released when it finishes.
+//!
+//! Integer blocks rather than a byte watermark, and this is the one
+//! place the source study is deliberately *not* copied: oMLX charges
+//! admission against sampled process footprint because MLX's allocator
+//! will not tell it what a cache costs. ferrox reads its own KV layout
+//! out of the GGUF header, so the exact question -- will this fit --
+//! has an exact integer answer, and an exact answer does not need a
+//! watermark, a hysteresis band, or a background pressure enforcer.
+//!
+//! Refusals are typed and split, because they send an operator to
+//! different knobs -- an OOM, or a single "server busy", sends them to
+//! the wrong one:
+//!
+//! - **Longer than any one request may be.** `FERROX_CB_MAX_CONTEXT`
+//!   positions, if set. `context_length_exceeded` -> 400. The
+//!   request's own size is the problem.
+//! - **Bigger than the whole KV budget.** `blocks_needed >
+//!   blocks_total`: an idle server refuses it identically.
+//!   `device_memory_budget_exceeded` -> 400.
+//! - **Does not fit right now.** Not an error at all: the job waits at
+//!   the head of the admission queue until enough blocks come back.
+//! - **Too many already waiting.** [`DecodeError::QueueFull`] -> 503
+//!   with `Retry-After`, because that one really does clear.
+//!
+//! Both 400s name `estimated_bytes` and `limit_bytes` -- the KV cost of
+//! the request and of the ceiling it hit, priced from the model's own
+//! `KvShape`, so the arithmetic is checkable rather than asserted --
+//! and carry separate counters, so "one request too big" and "too many
+//! requests" are never read as the same event.
+//!
+//! Admission is strict FIFO. A skip-ahead policy ("admit the next job
+//! that fits") raises utilization and can starve a large request
+//! indefinitely behind a stream of small ones -- a queue that reorders
+//! by size systematically punishes exactly the requests that already
+//! wait longest. FIFO cannot starve, so FIFO it is until there is a
+//! measured reason to change it.
+//!
+//! `FERROX_CB_KV_BLOCKS` unset means no block budget at all, which is
+//! today's behaviour: `max_seqs` alone. The two caps compose -- a job
+//! must satisfy both.
+//!
+//! **Deferred abort.** A cancellation never mutates the batch from the
+//! canceller's thread. `CancelToken::on_cancel` gives the scheduler a
+//! callback that does one thing -- push an [`AbortId`] into
+//! [`AbortInbox`] -- and the worker drains that inbox at the top of a
+//! tick, *between* forward passes, and does the removal itself.
+//!
+//! The indirection is the point. Dropping a sequence means dropping the
+//! KV buffers a forward pass may be mid-way through reading, and the
+//! `std::mem::take` that lifts a row's caches into the batch leaves the
+//! row holding empty vectors for the duration of the step -- so a
+//! removal landing inside that window would either free live buffers or
+//! scatter results back into a row that is no longer there. ferrox-metal
+//! has the same hazard in its own terms: its kernels
+//! `waitUntilCompleted` per dispatch, so no command buffer outlives a
+//! `forward_multi_seq` call, and the step boundary really is a point
+//! where nothing is in flight -- but only for the thread that owns the
+//! step. That is why the mutation is deferred onto it rather than done
+//! wherever the cancel arrived.
+//!
+//! A cancel is honoured wherever the request has got to: still queued
+//! (never prefilled at all), mid-prefill (the remaining chunks are
+//! never run), or decoding (it stops at the next step). All three reply
+//! [`FinishReason::Cancelled`] with the tokens produced so far, because
+//! a cancelled generation has partial output and throwing it away
+//! serves nobody.
+//!
 //! **Queue cap.** The job channel is unbounded, so without a cap a
 //! client retry storm turns straight into unbounded memory: every
 //! retry parks another prompt (and its reply channel) in the queue,
 //! and the server's only signal that it is drowning is the RSS graph.
 //! [`QueueGate`] bounds the *waiting* jobs -- in-flight sequences are
 //! `FERROX_CB_MAX_SEQS`'s business -- and a refusal is a fast, cheap
-//! 503 with `Retry-After` rather than a slow, expensive timeout.
+//! 503 with `Retry-After` rather than a slow, expensive timeout. A job
+//! holds its queue slot until it is *admitted*, not until the worker
+//! pulls it off the channel: with a block budget a job can sit in the
+//! worker's own admission queue for a while, and a cap that stopped
+//! counting it there would stop bounding anything.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
 use ferrox_core::cache::KvCache;
 use ferrox_models::sampling::Sampler;
 use ferrox_models::Decoder;
+use ferrox_models::{Ceiling, KvElem, KvShape};
 
-use crate::generate::{
-    earliest_stop_match, floor_char_boundary, DecodeError, FinishReason, GenerationParams, Usage,
-};
+use crate::generate::{DecodeError, FinishReason, GenerationParams, Usage};
+use crate::stop::{StopMatcher, StopStep};
 
 type DecodeFn = Arc<dyn Fn(&[usize]) -> String + Send + Sync>;
 
@@ -85,6 +168,11 @@ type JobResult = Result<(FinishReason, Vec<usize>, String, Usage), DecodeError>;
 /// is unset. Large enough that a short prompt still prefills in one
 /// tick, small enough that a long one cannot monopolize the worker.
 pub const DEFAULT_PREFILL_CHUNK: usize = 128;
+
+/// Token positions per KV block when `FERROX_CB_KV_BLOCK_SIZE` is
+/// unset. The block is the admission quantum: smaller wastes less on
+/// the rounding-up of each request, larger keeps the ledger cheap.
+pub const DEFAULT_KV_BLOCK_SIZE: usize = 256;
 
 /// Jobs allowed to wait for admission when `FERROX_CB_MAX_QUEUE` is
 /// unset. Deep enough that a normal burst queues instead of failing,
@@ -103,6 +191,14 @@ pub struct BatcherConfig {
     pub prefill_chunk: usize,
     /// Jobs that may wait for admission before new ones are refused.
     pub max_queue: usize,
+    /// Token positions per KV block, the admission quantum.
+    pub kv_block_size: usize,
+    /// Total KV blocks the scheduler may hand out, or `None` for no
+    /// block budget (sequence count alone, the pre-budget behaviour).
+    pub kv_blocks: Option<usize>,
+    /// Token positions (prompt + `max_tokens`) any single request may
+    /// ask for, or `None` for no per-request ceiling.
+    pub max_context: Option<usize>,
 }
 
 impl Default for BatcherConfig {
@@ -111,6 +207,9 @@ impl Default for BatcherConfig {
             max_seqs: usize::MAX,
             prefill_chunk: DEFAULT_PREFILL_CHUNK,
             max_queue: DEFAULT_MAX_QUEUE,
+            kv_block_size: DEFAULT_KV_BLOCK_SIZE,
+            kv_blocks: None,
+            max_context: None,
         }
     }
 }
@@ -121,6 +220,9 @@ impl BatcherConfig {
             max_seqs: env_positive("FERROX_CB_MAX_SEQS").unwrap_or(usize::MAX),
             prefill_chunk: env_positive("FERROX_CB_PREFILL_CHUNK").unwrap_or(DEFAULT_PREFILL_CHUNK),
             max_queue: env_positive("FERROX_CB_MAX_QUEUE").unwrap_or(DEFAULT_MAX_QUEUE),
+            kv_block_size: env_positive("FERROX_CB_KV_BLOCK_SIZE").unwrap_or(DEFAULT_KV_BLOCK_SIZE),
+            kv_blocks: env_positive("FERROX_CB_KV_BLOCKS"),
+            max_context: env_positive("FERROX_CB_MAX_CONTEXT"),
         }
     }
 }
@@ -182,6 +284,192 @@ impl QueueGate {
     }
 }
 
+/// Identifies one submitted job for cancellation. Handed out by
+/// [`ContinuousBatcher::generate`] before the job is sent, so a cancel
+/// racing the submission has something to name.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+struct AbortId(u64);
+
+/// Ids whose requests have been asked to stop, waiting for the worker
+/// to act on them at a step boundary.
+///
+/// A set rather than a channel: cancelling twice is the same fact
+/// stated twice, and the worker should do the work once.
+#[derive(Default)]
+struct AbortInbox {
+    pending: Mutex<HashSet<AbortId>>,
+    next_id: AtomicU64,
+    /// Requests actually stopped by a cancellation.
+    aborted: AtomicU64,
+}
+
+impl AbortInbox {
+    fn next_id(&self) -> AbortId {
+        AbortId(self.next_id.fetch_add(1, Ordering::Relaxed))
+    }
+
+    /// Called from whichever thread cancelled -- an HTTP handler,
+    /// usually. Deliberately does nothing but record the id.
+    fn enqueue(&self, id: AbortId) {
+        self.pending
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(id);
+    }
+
+    /// Takes everything pending. Worker thread, at a step boundary.
+    fn drain(&self) -> HashSet<AbortId> {
+        std::mem::take(&mut *self.pending.lock().unwrap_or_else(|p| p.into_inner()))
+    }
+
+    fn aborted(&self) -> u64 {
+        self.aborted.load(Ordering::Relaxed)
+    }
+}
+
+/// The integer KV-block ledger admission is decided on.
+///
+/// Blocks are *positions*, not bytes: the scheduler knows its own KV
+/// layout, so `blocks_free` is an exact statement about capacity rather
+/// than an estimate that needs a safety margin. All mutation happens on
+/// the worker thread; the atomics exist so `/metrics` can read the
+/// gauge without taking a lock, not to make reservation concurrent.
+struct BlockBudget {
+    block_size: usize,
+    /// Positions any one request may ask for, or `None`.
+    max_context: Option<usize>,
+    /// What this model's KV really costs, so a refusal can state bytes
+    /// rather than an opaque block count. Priced from the GGUF header
+    /// via `KvShape`, sliding-window cap included.
+    shape: KvShape,
+    /// `None` means no block budget is configured -- every request is
+    /// admissible as far as this ledger is concerned.
+    total: Option<usize>,
+    free: AtomicUsize,
+    /// Requests refused because they exceed the whole server's KV
+    /// budget. Split from `QueueGate::rejected` on purpose: one says
+    /// "come back later", the other says "this will never work", and an
+    /// operator sent to the wrong one of those tunes the wrong knob.
+    rejected_too_large: AtomicU64,
+    /// Requests refused for asking for more context than any single
+    /// request may have. Split again from the above, because the fix is
+    /// in the request rather than on the machine.
+    rejected_context_length: AtomicU64,
+}
+
+impl BlockBudget {
+    fn new(
+        block_size: usize,
+        total: Option<usize>,
+        max_context: Option<usize>,
+        shape: KvShape,
+    ) -> Self {
+        assert!(block_size > 0, "kv block size must be positive");
+        BlockBudget {
+            block_size,
+            max_context,
+            shape,
+            total,
+            free: AtomicUsize::new(total.unwrap_or(0)),
+            rejected_too_large: AtomicU64::new(0),
+            rejected_context_length: AtomicU64::new(0),
+        }
+    }
+
+    /// Prices `positions` of context in real KV bytes, sliding-window
+    /// cap included.
+    fn bytes_for(&self, positions: usize) -> u64 {
+        self.shape.kv_bytes_for_tokens(positions)
+    }
+
+    /// The typed refusal for a request of `positions` tokens, or `None`
+    /// when no immovable ceiling binds.
+    ///
+    /// Order matters: the context ceiling is checked first because it
+    /// is the request's own size, and telling a client "the machine is
+    /// too small" when the real answer is "your prompt is too long"
+    /// sends it to a knob it does not have.
+    fn immovable_refusal(&self, positions: usize) -> Option<DecodeError> {
+        if let Some(limit) = self.max_context {
+            if positions > limit {
+                self.rejected_context_length.fetch_add(1, Ordering::Relaxed);
+                return Some(DecodeError::KvBudgetExceeded {
+                    binding: Ceiling::ContextLength.code(),
+                    estimated_bytes: self.bytes_for(positions),
+                    limit_bytes: self.bytes_for(limit),
+                    positions,
+                    positions_limit: limit,
+                    detail: format!(
+                        "request asks for {positions} token positions (prompt + max_tokens) \
+                         but this deployment admits {limit} per request; shorten the prompt \
+                         or lower max_tokens"
+                    ),
+                });
+            }
+        }
+        let total = self.total?;
+        let blocks = self.blocks_for(positions);
+        if blocks <= total {
+            return None;
+        }
+        self.rejected_too_large.fetch_add(1, Ordering::Relaxed);
+        let limit_positions = total * self.block_size;
+        Some(DecodeError::KvBudgetExceeded {
+            binding: Ceiling::DeviceMemory.code(),
+            estimated_bytes: self.bytes_for(positions),
+            limit_bytes: self.bytes_for(limit_positions),
+            positions,
+            positions_limit: limit_positions,
+            detail: format!(
+                "request needs {blocks} KV blocks ({positions} token positions at {} per \
+                 block) but this server's whole KV budget is {total} blocks; an idle server \
+                 would refuse it identically",
+                self.block_size
+            ),
+        })
+    }
+
+    /// Blocks a sequence of `positions` tokens occupies. At least one:
+    /// even a single-token request holds a block.
+    fn blocks_for(&self, positions: usize) -> usize {
+        positions.div_ceil(self.block_size).max(1)
+    }
+
+    /// Takes `blocks` if they are there. Worker thread only.
+    fn try_reserve(&self, blocks: usize) -> bool {
+        if self.total.is_none() {
+            return true;
+        }
+        let free = self.free.load(Ordering::Relaxed);
+        if blocks > free {
+            return false;
+        }
+        self.free.store(free - blocks, Ordering::Relaxed);
+        true
+    }
+
+    /// Gives `blocks` back when a request ends, however it ends. Worker
+    /// thread only.
+    fn release(&self, blocks: usize) {
+        let Some(total) = self.total else {
+            return;
+        };
+        let free = self.free.load(Ordering::Relaxed);
+        debug_assert!(
+            free + blocks <= total,
+            "released more blocks than were ever reserved"
+        );
+        self.free
+            .store((free + blocks).min(total), Ordering::Relaxed);
+    }
+
+    fn free(&self) -> usize {
+        self.total
+            .map(|_| self.free.load(Ordering::Relaxed))
+            .unwrap_or(0)
+    }
+}
+
 fn env_positive(name: &str) -> Option<usize> {
     let raw = std::env::var(name).ok()?;
     let value: usize = raw
@@ -199,6 +487,14 @@ struct Counters {
     prefill_chunks: AtomicU64,
     prefill_tokens: AtomicU64,
     decode_steps: AtomicU64,
+    /// High-water mark of KV blocks actually held by in-flight work.
+    ///
+    /// Deliberately measured from the rows and prefills themselves
+    /// rather than derived from `BlockBudget::free`: a ledger-derived
+    /// peak cannot exceed the budget however broken admission is, so it
+    /// would be a gauge that reports the invariant instead of checking
+    /// it.
+    peak_blocks: AtomicUsize,
 }
 
 /// A snapshot of the worker's counters.
@@ -215,6 +511,24 @@ pub struct BatcherStats {
     pub queue_depth: usize,
     /// Jobs refused because the queue was full.
     pub queue_rejected: u64,
+    /// Total KV blocks in the budget; 0 when none is configured.
+    pub kv_blocks_total: usize,
+    /// KV blocks not currently reserved by an in-flight request.
+    pub kv_blocks_free: usize,
+    /// Token positions per KV block.
+    pub kv_block_size: usize,
+    /// Jobs refused because they exceed the whole KV block budget.
+    /// Distinct from `queue_rejected`, which is momentary pressure.
+    pub kv_rejected_too_large: u64,
+    /// Jobs refused for asking for more context than one request may
+    /// have. Distinct again: the fix is in the request, not the box.
+    pub kv_rejected_context_length: u64,
+    /// Most KV blocks ever held by in-flight work at one moment,
+    /// counted from the rows themselves.
+    pub kv_blocks_peak: usize,
+    /// Requests the scheduler actually stopped because they were
+    /// cancelled.
+    pub aborted: u64,
 }
 
 /// One request's prefill as a resumable state machine.
@@ -307,6 +621,13 @@ struct Job {
     params: GenerationParams,
     eos_id: Option<usize>,
     reply: Sender<JobResult>,
+    /// Cancellation handle for this job, from submission onwards.
+    abort: AbortId,
+    /// KV blocks this job will need for its whole lifetime, computed
+    /// once by the submitter (which already knows the prompt length and
+    /// `max_tokens`) so the worker's admission check is a comparison
+    /// rather than arithmetic.
+    blocks: usize,
 }
 
 /// Stable identity for one in-flight request, handed out once at
@@ -339,6 +660,31 @@ impl Rows {
 
     fn len(&self) -> usize {
         self.order.len()
+    }
+
+    /// KV blocks the rows in this table are holding right now.
+    fn blocks_held(&self) -> usize {
+        self.state.values().map(|slot| slot.blocks).sum()
+    }
+
+    /// Marks any row whose abort id is in `ids` as cancelled, and
+    /// reports which ids were consumed.
+    ///
+    /// Marking, not removing: the row leaves through the same
+    /// `flush_finished` path as every other finished row, so its blocks
+    /// are released and its caller is replied to exactly once. A second
+    /// removal path is a second place to forget one of those.
+    fn mark_cancelled(&mut self, ids: &HashSet<AbortId>) -> Vec<AbortId> {
+        let mut consumed = Vec::new();
+        for uid in &self.order {
+            if let Some(slot) = self.state.get_mut(uid) {
+                if ids.contains(&slot.abort) && slot.finish.is_none() {
+                    slot.finish = Some(FinishReason::Cancelled);
+                    consumed.push(slot.abort);
+                }
+            }
+        }
+        consumed
     }
 
     fn is_empty(&self) -> bool {
@@ -375,8 +721,11 @@ impl Rows {
             .collect()
     }
 
-    /// Replies to and removes every row that has finished.
-    fn flush_finished(&mut self) {
+    /// Replies to and removes every row that has finished, returning
+    /// each row's KV blocks to the budget as it goes. Release happens
+    /// here, on the one path every finished row takes, so a row cannot
+    /// leave the table without giving its capacity back.
+    fn flush_finished(&mut self, budget: &BlockBudget) {
         let finished: Vec<Uid> = self
             .order
             .iter()
@@ -385,6 +734,7 @@ impl Rows {
             .collect();
         for uid in finished {
             if let Some(slot) = self.remove(uid) {
+                budget.release(slot.blocks);
                 reply_finished(slot);
             }
         }
@@ -397,16 +747,20 @@ struct Slot {
     logits: Vec<f32>,
     sampler: Sampler,
     generated_ids: Vec<usize>,
-    /// Detokenized text already safe to expose (past the stop hold-back).
+    /// Detokenized text already safe to expose (past the stop
+    /// hold-back).
     visible: String,
-    /// Tail that might still complete a stop match.
-    pending: String,
+    /// Both stop layers for this row.
+    stops: StopMatcher,
     prompt_tokens: usize,
     max_tokens: usize,
     eos_id: Option<usize>,
     params: GenerationParams,
     reply: Sender<JobResult>,
     finish: Option<FinishReason>,
+    abort: AbortId,
+    /// KV blocks this row reserved at admission, returned when it ends.
+    blocks: usize,
 }
 
 /// Owns a dedicated worker thread that batches decode steps. Cheap to
@@ -417,6 +771,8 @@ pub struct ContinuousBatcher {
     tx: Sender<Job>,
     counters: Arc<Counters>,
     queue: Arc<QueueGate>,
+    budget: Arc<BlockBudget>,
+    aborts: Arc<AbortInbox>,
 }
 
 struct WorkerGuard {
@@ -442,11 +798,33 @@ impl ContinuousBatcher {
         let (tx, rx) = mpsc::channel::<Job>();
         let counters = Arc::new(Counters::default());
         let queue = Arc::new(QueueGate::new(config.max_queue));
+        let budget = Arc::new(BlockBudget::new(
+            config.kv_block_size,
+            config.kv_blocks,
+            config.max_context,
+            // Prefill runs one token at a time here, so a sliding layer
+            // needs `window + 1 - 1` positions live: chunk = 1.
+            KvShape::from_config(&decoder.config, KvElem::F32, 1),
+        ));
+        let aborts = Arc::new(AbortInbox::default());
         let worker_counters = Arc::clone(&counters);
         let worker_queue = Arc::clone(&queue);
+        let worker_budget = Arc::clone(&budget);
+        let worker_aborts = Arc::clone(&aborts);
         let _join = thread::Builder::new()
             .name("ferrox-continuous-batch".into())
-            .spawn(move || worker_loop(decoder, decode, rx, config, worker_counters, worker_queue))
+            .spawn(move || {
+                worker_loop(
+                    decoder,
+                    decode,
+                    rx,
+                    config,
+                    worker_counters,
+                    worker_queue,
+                    worker_budget,
+                    worker_aborts,
+                )
+            })
             .expect("spawn continuous-batch worker");
         // Detach join handle intentionally: dropping the last Sender
         // closes `rx` and ends the loop. Keep a process-lifetime leak
@@ -457,6 +835,8 @@ impl ContinuousBatcher {
             tx,
             counters,
             queue,
+            budget,
+            aborts,
         }
     }
 
@@ -469,6 +849,13 @@ impl ContinuousBatcher {
             decode_steps: self.counters.decode_steps.load(Ordering::Relaxed),
             queue_depth: self.queue.depth(),
             queue_rejected: self.queue.rejected(),
+            kv_blocks_total: self.budget.total.unwrap_or(0),
+            kv_blocks_free: self.budget.free(),
+            kv_block_size: self.budget.block_size,
+            kv_rejected_too_large: self.budget.rejected_too_large.load(Ordering::Relaxed),
+            kv_rejected_context_length: self.budget.rejected_context_length.load(Ordering::Relaxed),
+            kv_blocks_peak: self.counters.peak_blocks.load(Ordering::Relaxed),
+            aborted: self.aborts.aborted(),
         }
     }
 
@@ -481,6 +868,15 @@ impl ContinuousBatcher {
         params: GenerationParams,
         eos_id: Option<usize>,
     ) -> Result<(FinishReason, Vec<usize>, String, Usage), DecodeError> {
+        // A request that could never fit is refused first, and refused
+        // with the ceiling named: queueing it would only make it wait
+        // for capacity that will never be enough. This is the
+        // immovable half of the rejection split -- 400, not 503.
+        let positions = prompt_tokens.len().saturating_add(params.max_tokens);
+        let blocks = self.budget.blocks_for(positions);
+        if let Some(refusal) = self.budget.immovable_refusal(positions) {
+            return Err(refusal);
+        }
         // Refuse before allocating a queue slot for the prompt, so a
         // retry storm costs a rejection rather than memory.
         self.queue
@@ -490,6 +886,8 @@ impl ContinuousBatcher {
                 cap: self.queue.cap,
             })?;
         let (reply_tx, reply_rx) = mpsc::channel();
+        let abort = self.aborts.next_id();
+        let cancel = params.cancel.clone();
         if self
             .tx
             .send(Job {
@@ -497,6 +895,8 @@ impl ContinuousBatcher {
                 params,
                 eos_id,
                 reply: reply_tx,
+                abort,
+                blocks,
             })
             .is_err()
         {
@@ -505,38 +905,155 @@ impl ContinuousBatcher {
             self.queue.release();
             return Err(DecodeError::KvPoolExhausted);
         }
+        // Registered after the send, so an id only ever reaches the
+        // inbox for a job the worker will actually see. `on_cancel`
+        // fires immediately if the token is already cancelled, so the
+        // window between the send and this line loses nothing.
+        if let Some(token) = cancel {
+            let inbox = Arc::clone(&self.aborts);
+            token.on_cancel(move || inbox.enqueue(abort));
+        }
         reply_rx.recv().unwrap_or(Err(DecodeError::KvPoolExhausted))
     }
 }
 
-/// Accepts as many queued jobs as the in-flight cap allows, turning
-/// each into a waiting `Prefill`. The cap counts prompts that are still
-/// prefilling as well as rows already decoding: a prefilling prompt
-/// holds a full set of KV caches, so not counting it would let the
-/// worker exceed `max_seqs` by however many prompts happen to be in
-/// flight.
-fn drain_pending_jobs(
+/// Moves everything currently on the channel into the worker's own
+/// admission queue. Both are "waiting for admission" as far as
+/// [`QueueGate`] is concerned, so nothing is released here.
+fn drain_channel(rx: &Receiver<Job>, waiting: &mut VecDeque<Job>) {
+    while let Ok(job) = rx.try_recv() {
+        waiting.push_back(job);
+    }
+}
+
+/// Admits as many waiting jobs as *both* caps allow, turning each into
+/// a `Prefill`.
+///
+/// The sequence cap counts prompts that are still prefilling as well as
+/// rows already decoding: a prefilling prompt holds a full set of KV
+/// caches, so not counting it would let the worker exceed `max_seqs` by
+/// however many prompts happen to be in flight.
+///
+/// The block cap is the real memory statement:
+/// `blocks_needed <= blocks_free`, reserved here for the request's
+/// whole lifetime and released in `Rows::flush_finished`.
+///
+/// Strict FIFO: a head job that does not fit stops the line rather than
+/// being skipped over. See the module note on why the skip-ahead
+/// alternative is a starvation bug, not an optimization.
+fn admit(
     decoder: &Arc<Decoder>,
-    rx: &Receiver<Job>,
+    waiting: &mut VecDeque<Job>,
     prefills: &mut VecDeque<Prefill>,
     decoding: usize,
     config: &BatcherConfig,
     queue: &QueueGate,
+    budget: &BlockBudget,
 ) {
-    while decoding + prefills.len() < config.max_seqs {
-        match rx.try_recv() {
-            Ok(job) => {
-                queue.release();
-                if let Some(prefill) = accept(decoder, job, config.prefill_chunk) {
-                    prefills.push_back(prefill);
-                }
-            }
-            Err(mpsc::TryRecvError::Empty) => break,
-            Err(mpsc::TryRecvError::Disconnected) => break,
+    while let Some(job) = waiting.front() {
+        if decoding + prefills.len() >= config.max_seqs {
+            break;
+        }
+        let blocks = job.blocks;
+        if !budget.try_reserve(blocks) {
+            break;
+        }
+        let job = waiting.pop_front().expect("front() just succeeded");
+        // Admitted: the job has stopped waiting, so its queue slot goes
+        // back now rather than when it was pulled off the channel.
+        queue.release();
+        match accept(decoder, job, config.prefill_chunk) {
+            Some(prefill) => prefills.push_back(prefill),
+            // Rejected at validation (a token outside the vocabulary):
+            // it never becomes a row, so nothing else would ever give
+            // its reservation back.
+            None => budget.release(blocks),
         }
     }
 }
 
+/// Applies every pending cancellation, at a step boundary, on the
+/// worker thread.
+///
+/// `carried` holds ids that arrived before their job did -- a cancel
+/// can beat its own submission through the channel -- so they are kept
+/// and retried rather than dropped, which would leave a request running
+/// after the client asked it to stop.
+///
+/// The three states a cancelled request can be in are handled where
+/// they live, because they cost different things to abandon:
+///
+/// - **waiting**: no KV, no reservation, no work done. Replied to and
+///   dropped; its queue slot goes back.
+/// - **prefilling**: holds KV and a reservation but has produced no
+///   tokens. Dropped, reservation released.
+/// - **decoding**: marked finished, and left to leave through
+///   `flush_finished` like any other completed row, so there is exactly
+///   one path that releases blocks and replies.
+fn apply_aborts(
+    inbox: &AbortInbox,
+    carried: &mut HashSet<AbortId>,
+    waiting: &mut VecDeque<Job>,
+    prefills: &mut VecDeque<Prefill>,
+    rows: &mut Rows,
+    queue: &QueueGate,
+    budget: &BlockBudget,
+) {
+    carried.extend(inbox.drain());
+    if carried.is_empty() {
+        return;
+    }
+
+    let mut stopped = 0u64;
+
+    // Queued, never started.
+    let mut still_waiting = VecDeque::with_capacity(waiting.len());
+    while let Some(job) = waiting.pop_front() {
+        if carried.remove(&job.abort) {
+            queue.release();
+            let _ = job.reply.send(Ok((
+                FinishReason::Cancelled,
+                Vec::new(),
+                String::new(),
+                Usage::new(job.prompt_tokens.len(), 0),
+            )));
+            stopped += 1;
+        } else {
+            still_waiting.push_back(job);
+        }
+    }
+    *waiting = still_waiting;
+
+    // Mid-prefill: the remaining chunks are never run.
+    let mut still_prefilling = VecDeque::with_capacity(prefills.len());
+    while let Some(prefill) = prefills.pop_front() {
+        if carried.remove(&prefill.abort) {
+            budget.release(prefill.blocks);
+            let _ = prefill.reply.send(Ok((
+                FinishReason::Cancelled,
+                Vec::new(),
+                String::new(),
+                Usage::new(prefill.prompt_tokens, 0),
+            )));
+            stopped += 1;
+        } else {
+            still_prefilling.push_back(prefill);
+        }
+    }
+    *prefills = still_prefilling;
+
+    // Decoding: marked here, removed by `flush_finished` below.
+    for id in rows.mark_cancelled(carried) {
+        carried.remove(&id);
+        stopped += 1;
+    }
+
+    if stopped > 0 {
+        inbox.aborted.fetch_add(stopped, Ordering::Relaxed);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn worker_loop(
     decoder: Arc<Decoder>,
     decode: DecodeFn,
@@ -544,26 +1061,57 @@ fn worker_loop(
     config: BatcherConfig,
     counters: Arc<Counters>,
     queue: Arc<QueueGate>,
+    budget: Arc<BlockBudget>,
+    aborts: Arc<AbortInbox>,
 ) {
     let mut rows = Rows::default();
     let mut prefills: VecDeque<Prefill> = VecDeque::new();
+    let mut waiting: VecDeque<Job> = VecDeque::new();
+    // Cancellations that arrived before the job they name.
+    let mut carried_aborts: HashSet<AbortId> = HashSet::new();
     loop {
         // Only a completely idle worker blocks: with a prompt still
-        // chunking there is always work to do on the next tick.
-        if rows.is_empty() && prefills.is_empty() {
+        // chunking, or a job waiting for capacity that an in-flight row
+        // will return, there is always work to do on the next tick.
+        if rows.is_empty() && prefills.is_empty() && waiting.is_empty() {
             match rx.recv() {
-                Ok(job) => {
-                    // Off the queue and into the scheduler: free the
-                    // slot the submitter reserved.
-                    queue.release();
-                    if let Some(prefill) = accept(&decoder, job, config.prefill_chunk) {
-                        prefills.push_back(prefill);
-                    }
-                }
+                Ok(job) => waiting.push_back(job),
                 Err(_) => break,
             }
         }
-        drain_pending_jobs(&decoder, &rx, &mut prefills, rows.len(), &config, &queue);
+        drain_channel(&rx, &mut waiting);
+        // Before anything else this tick, and before any forward pass:
+        // the one window in which mutating the batch is safe.
+        apply_aborts(
+            &aborts,
+            &mut carried_aborts,
+            &mut waiting,
+            &mut prefills,
+            &mut rows,
+            &queue,
+            &budget,
+        );
+        rows.flush_finished(&budget);
+        admit(
+            &decoder,
+            &mut waiting,
+            &mut prefills,
+            rows.len(),
+            &config,
+            &queue,
+            &budget,
+        );
+        let held = rows.blocks_held() + prefills.iter().map(|p| p.blocks).sum::<usize>();
+        counters.peak_blocks.fetch_max(held, Ordering::Relaxed);
+        // With nothing in flight the whole budget is free, and a job
+        // that could not fit an empty server was refused at submission
+        // -- so an idle worker with a non-empty queue would be a spin,
+        // and this is where it would show up.
+        debug_assert!(
+            !(rows.is_empty() && prefills.is_empty() && !waiting.is_empty()),
+            "idle worker cannot admit its queue: {} jobs stuck",
+            waiting.len()
+        );
 
         // One bounded prefill chunk per tick, round-robin across the
         // waiting prompts. Round-robin rather than "finish the head
@@ -591,7 +1139,7 @@ fn worker_loop(
 
         let ready = rows.ready();
         if ready.is_empty() {
-            rows.flush_finished();
+            rows.flush_finished(&budget);
             continue;
         }
 
@@ -605,7 +1153,9 @@ fn worker_loop(
             let next =
                 slot.sampler
                     .sample(&slot.logits, &slot.params.sampling, &slot.generated_ids);
-            if Some(next) == slot.eos_id {
+            // EOS and a token-level stop are the same fact: this token
+            // ends the answer and is not part of it.
+            if Some(next) == slot.eos_id || slot.stops.is_stop_token(next) {
                 slot.finish = Some(FinishReason::Stop);
                 continue;
             }
@@ -650,34 +1200,24 @@ fn worker_loop(
             }
         }
 
-        rows.flush_finished();
+        rows.flush_finished(&budget);
     }
 }
 
-/// Appends `piece` into the stop-sequence pending buffer. Returns true
-/// when a stop matched and the slot should leave the active batch.
+/// Feeds `piece` through this row's stop matcher. Returns true when a
+/// stop matched and the row should leave the active batch.
 fn apply_stop_buffer(slot: &mut Slot, piece: &str) -> bool {
-    if slot.params.stop.is_empty() {
-        slot.visible.push_str(piece);
-        return false;
-    }
-    slot.pending.push_str(piece);
-    if let Some(cut) = earliest_stop_match(&slot.pending, &slot.params.stop) {
-        slot.visible.push_str(&slot.pending[..cut]);
-        slot.pending.clear();
-        slot.finish = Some(FinishReason::Stop);
-        return true;
-    }
-    let max_stop_len = slot.params.stop.iter().map(|s| s.len()).max().unwrap_or(0);
-    let hold_back = max_stop_len.saturating_sub(1);
-    if slot.pending.len() > hold_back {
-        let boundary = floor_char_boundary(&slot.pending, slot.pending.len() - hold_back);
-        if boundary > 0 {
-            slot.visible.push_str(&slot.pending[..boundary]);
-            slot.pending.drain(..boundary);
+    match slot.stops.push(piece) {
+        StopStep::Emit(text) => {
+            slot.visible.push_str(&text);
+            false
+        }
+        StopStep::Matched(text) => {
+            slot.visible.push_str(&text);
+            slot.finish = Some(FinishReason::Stop);
+            true
         }
     }
-    false
 }
 
 /// An accepted job whose prompt is still being prefilled: the
@@ -691,6 +1231,10 @@ struct Prefill {
     params: GenerationParams,
     eos_id: Option<usize>,
     reply: Sender<JobResult>,
+    abort: AbortId,
+    /// Blocks reserved at admission; carried into the `Slot` so the
+    /// reservation survives the prefill-to-decode handover.
+    blocks: usize,
 }
 
 impl Prefill {
@@ -701,6 +1245,8 @@ impl Prefill {
             params,
             eos_id,
             reply,
+            abort,
+            blocks,
         } = self;
         let (caches, logits, pos) = state.into_decode_start();
         Slot {
@@ -710,13 +1256,15 @@ impl Prefill {
             sampler: Sampler::new(params.seed),
             generated_ids: Vec::with_capacity(params.max_tokens),
             visible: String::new(),
-            pending: String::new(),
+            stops: StopMatcher::new(&params.stop, &params.stop_token_ids),
             prompt_tokens,
             max_tokens: params.max_tokens,
             eos_id,
             params,
             reply,
             finish: None,
+            abort,
+            blocks,
         }
     }
 }
@@ -742,6 +1290,8 @@ fn accept(decoder: &Arc<Decoder>, job: Job, chunk_size: usize) -> Option<Prefill
         params: job.params,
         eos_id: job.eos_id,
         reply: job.reply,
+        abort: job.abort,
+        blocks: job.blocks,
     })
 }
 
@@ -750,10 +1300,11 @@ fn accept(decoder: &Arc<Decoder>, job: Job, chunk_size: usize) -> Option<Prefill
 /// cannot be paired with another row's output.
 fn reply_finished(mut slot: Slot) {
     let finish = slot.finish.expect("only a finished row is replied to");
-    if !slot.pending.is_empty() {
-        slot.visible.push_str(&slot.pending);
-        slot.pending.clear();
-    }
+    // Text withheld against a stop that never arrived is ordinary
+    // output; dropping it would truncate every answer whose tail looks
+    // like the start of a stop string.
+    let tail = slot.stops.flush();
+    slot.visible.push_str(&tail);
     let usage = Usage::new(slot.prompt_tokens, slot.generated_ids.len());
     let _ = slot
         .reply
@@ -763,6 +1314,7 @@ fn reply_finished(mut slot: Slot) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cancel::CancelToken;
     use ferrox_models::config::test_dense_fixture;
     use ferrox_models::sampling::SamplingParams;
     use std::sync::{Barrier, Mutex};
@@ -786,6 +1338,7 @@ mod tests {
             },
             seed,
             stop: vec![],
+            stop_token_ids: Vec::new(),
             json_object: false,
             cancel: None,
         }
@@ -869,6 +1422,7 @@ mod tests {
                 },
                 seed: params[i].seed,
                 stop: vec![],
+                stop_token_ids: Vec::new(),
                 json_object: params[i].json_object,
                 cancel: params[i].cancel.clone(),
             };
@@ -1134,6 +1688,21 @@ mod tests {
         assert_eq!(got[0], expected[0]);
         assert_eq!(got[1], expected[1]);
     }
+    /// The KV shape of `tiny_decoder`, for pricing a refusal in bytes.
+    fn test_shape() -> KvShape {
+        KvShape::from_config(&test_dense_fixture(), KvElem::F32, 1)
+    }
+
+    /// A ledger with no budget configured, for tests that are not
+    /// about admission.
+    fn no_budget() -> BlockBudget {
+        BlockBudget::new(DEFAULT_KV_BLOCK_SIZE, None, None, test_shape())
+    }
+
+    fn budget(block_size: usize, total: Option<usize>) -> BlockBudget {
+        BlockBudget::new(block_size, total, None, test_shape())
+    }
+
     fn test_slot(max_tokens: usize, seed: u64) -> (Slot, mpsc::Receiver<JobResult>) {
         let (tx, rx) = mpsc::channel();
         let params = greedy_params(max_tokens, seed);
@@ -1145,12 +1714,14 @@ mod tests {
                 sampler: Sampler::new(seed),
                 generated_ids: Vec::new(),
                 visible: String::new(),
-                pending: String::new(),
+                stops: StopMatcher::new(&params.stop, &params.stop_token_ids),
                 prompt_tokens: 0,
                 max_tokens,
                 eos_id: None,
                 params,
                 reply: tx,
+                abort: AbortId(0),
+                blocks: 1,
                 finish: None,
             },
             rx,
@@ -1236,7 +1807,7 @@ mod tests {
         let c = rows.insert(c);
 
         assert_eq!(rows.ready(), vec![a, c], "a finished row takes no step");
-        rows.flush_finished();
+        rows.flush_finished(&no_budget());
         assert!(rows.get(b).is_none());
         assert_eq!(rows.order, vec![a, c]);
 
@@ -1420,5 +1991,880 @@ mod tests {
         }
         assert_eq!(batcher.stats().queue_depth, 0);
         assert_eq!(batcher.stats().queue_rejected, 0);
+    }
+
+    // ----------------------------------------------------------------
+    // Block admission (`sched-block-admission`)
+    // ----------------------------------------------------------------
+
+    fn budget_config(block_size: usize, blocks: usize) -> BatcherConfig {
+        BatcherConfig {
+            prefill_chunk: 1,
+            kv_block_size: block_size,
+            kv_blocks: Some(blocks),
+            ..BatcherConfig::default()
+        }
+    }
+
+    #[test]
+    fn blocks_are_counted_in_positions_and_always_round_up() {
+        let budget = budget(4, Some(10));
+        // A single-token request still holds a block.
+        assert_eq!(budget.blocks_for(0), 1);
+        assert_eq!(budget.blocks_for(1), 1);
+        assert_eq!(budget.blocks_for(4), 1);
+        // Rounding up, not down: 5 positions do not fit in one block.
+        assert_eq!(budget.blocks_for(5), 2);
+        assert_eq!(budget.blocks_for(8), 2);
+        assert_eq!(budget.blocks_for(9), 3);
+    }
+
+    #[test]
+    fn an_unconfigured_budget_admits_everything() {
+        let budget = budget(4, None);
+        assert!(budget.immovable_refusal(usize::MAX).is_none());
+        assert!(budget.try_reserve(1_000_000));
+        budget.release(1_000_000);
+    }
+
+    /// The whole point of an integer budget: a request that needs more
+    /// blocks than the server owns is refused as a *request* problem,
+    /// before it is allowed to occupy a queue slot. Answering 503 here
+    /// would send a client into a retry loop that cannot ever succeed.
+    #[test]
+    fn a_request_larger_than_the_whole_budget_is_refused_rather_than_queued() {
+        let decoder = tiny_decoder();
+        // 2 blocks of 4 positions = 8 positions in the entire server.
+        let batcher = ContinuousBatcher::spawn_with_config(
+            Arc::clone(&decoder),
+            identity_decode(),
+            budget_config(4, 2),
+        );
+
+        let err = batcher
+            .generate(vec![1, 2, 3, 4, 5, 6], greedy_params(8, 1), None)
+            .expect_err("14 positions cannot fit an 8-position server");
+        let shape = test_shape();
+        match &err {
+            DecodeError::KvBudgetExceeded {
+                binding,
+                estimated_bytes,
+                limit_bytes,
+                positions,
+                positions_limit,
+                detail,
+            } => {
+                assert_eq!(*binding, "device_memory_budget_exceeded");
+                assert_eq!(*positions, 14);
+                assert_eq!(*positions_limit, 8, "2 blocks x 4 positions");
+                // The bytes are the model's real KV cost, not a
+                // restatement of the block count: an operator has to be
+                // able to check the arithmetic against `inspect-plan`.
+                assert_eq!(*estimated_bytes, shape.kv_bytes_for_tokens(14));
+                assert_eq!(*limit_bytes, shape.kv_bytes_for_tokens(8));
+                assert!(estimated_bytes > limit_bytes);
+                assert!(detail.contains("14"), "{detail}");
+            }
+            other => panic!("expected KvBudgetExceeded, got {other:?}"),
+        }
+        // Retrying it is pointless, and the error says so.
+        assert_eq!(err.retry_after_secs(), None);
+
+        let stats = batcher.stats();
+        assert_eq!(stats.kv_rejected_too_large, 1);
+        assert_eq!(
+            stats.kv_rejected_context_length, 0,
+            "no per-request context ceiling is configured here"
+        );
+        assert_eq!(
+            stats.queue_rejected, 0,
+            "too-big and under-pressure are different counters"
+        );
+        assert_eq!(
+            stats.queue_depth, 0,
+            "an impossible request must not occupy a queue slot"
+        );
+        assert_eq!(stats.kv_blocks_free, 2, "nothing was reserved");
+
+        // A request that does fit still works on the same server.
+        batcher
+            .generate(vec![1, 2], greedy_params(2, 1), None)
+            .expect("4 positions fit");
+    }
+
+    /// The other immovable ceiling, and the reason there are two: this
+    /// request is not too big for the machine, it is too big for what
+    /// any one request is allowed to be. An operator reading
+    /// `device_memory_budget_exceeded` here would go looking for a
+    /// bigger box for a problem a shorter prompt solves.
+    ///
+    /// Confirmed to FAIL when the `max_context` branch is removed from
+    /// `immovable_refusal` (the request is admitted and runs).
+    #[test]
+    fn a_request_longer_than_the_context_ceiling_names_that_ceiling() {
+        let decoder = tiny_decoder();
+        let batcher = ContinuousBatcher::spawn_with_config(
+            Arc::clone(&decoder),
+            identity_decode(),
+            BatcherConfig {
+                prefill_chunk: 1,
+                max_context: Some(6),
+                // A generous block budget, so the *only* thing that can
+                // bind is the per-request context ceiling.
+                kv_block_size: 4,
+                kv_blocks: Some(1024),
+                ..BatcherConfig::default()
+            },
+        );
+
+        let err = batcher
+            .generate(vec![1, 2, 3, 4], greedy_params(4, 1), None)
+            .expect_err("8 positions against a 6-position ceiling");
+        let shape = test_shape();
+        match &err {
+            DecodeError::KvBudgetExceeded {
+                binding,
+                estimated_bytes,
+                limit_bytes,
+                positions,
+                positions_limit,
+                detail,
+            } => {
+                assert_eq!(*binding, "context_length_exceeded");
+                assert_eq!(*positions, 8);
+                assert_eq!(*positions_limit, 6);
+                assert_eq!(*estimated_bytes, shape.kv_bytes_for_tokens(8));
+                assert_eq!(*limit_bytes, shape.kv_bytes_for_tokens(6));
+                assert!(detail.contains("max_tokens"), "{detail}");
+            }
+            other => panic!("expected KvBudgetExceeded, got {other:?}"),
+        }
+        assert_eq!(err.retry_after_secs(), None);
+
+        let stats = batcher.stats();
+        assert_eq!(stats.kv_rejected_context_length, 1);
+        assert_eq!(
+            stats.kv_rejected_too_large, 0,
+            "the machine's budget was never the binding ceiling"
+        );
+        assert_eq!(stats.queue_rejected, 0);
+
+        // Exactly at the ceiling is admitted: the check is `>`, not
+        // `>=`, or the advertised limit would be off by one.
+        batcher
+            .generate(vec![1, 2, 3, 4], greedy_params(2, 1), None)
+            .expect("6 positions is 6 positions");
+    }
+
+    /// With both ceilings configured and both exceeded, the request's
+    /// own size is reported -- it is the one the client can act on.
+    #[test]
+    fn the_context_ceiling_is_reported_before_the_device_ceiling() {
+        let decoder = tiny_decoder();
+        let batcher = ContinuousBatcher::spawn_with_config(
+            Arc::clone(&decoder),
+            identity_decode(),
+            BatcherConfig {
+                prefill_chunk: 1,
+                max_context: Some(6),
+                kv_block_size: 4,
+                kv_blocks: Some(2),
+                ..BatcherConfig::default()
+            },
+        );
+        let err = batcher
+            .generate(vec![1, 2, 3, 4, 5, 6], greedy_params(8, 1), None)
+            .expect_err("14 positions breaks both ceilings");
+        assert!(
+            matches!(
+                &err,
+                DecodeError::KvBudgetExceeded { binding, .. }
+                    if *binding == "context_length_exceeded"
+            ),
+            "got {err:?}"
+        );
+        let stats = batcher.stats();
+        assert_eq!(stats.kv_rejected_context_length, 1);
+        assert_eq!(stats.kv_rejected_too_large, 0);
+    }
+
+    /// No ceilings configured is the default, and it must refuse
+    /// nothing.
+    #[test]
+    fn without_ceilings_nothing_is_refused_as_too_large() {
+        let budget = BlockBudget::new(4, None, None, test_shape());
+        assert!(budget.immovable_refusal(1_000_000).is_none());
+        assert_eq!(budget.rejected_too_large.load(Ordering::Relaxed), 0);
+        assert_eq!(budget.rejected_context_length.load(Ordering::Relaxed), 0);
+    }
+
+    /// The invariant, under real contention: however many requests are
+    /// in flight, the blocks they hold together never exceed the
+    /// budget. Six requests each needing two blocks against a
+    /// four-block server can be at most two at a time.
+    ///
+    /// Confirmed to FAIL when `admit` reserves unconditionally (peak
+    /// climbs to 12 -- every request admitted at once).
+    #[test]
+    fn concurrent_requests_never_hold_more_blocks_than_the_budget() {
+        let decoder = tiny_decoder();
+        let batcher = ContinuousBatcher::spawn_with_config(
+            Arc::clone(&decoder),
+            identity_decode(),
+            // 4 positions per block, 4 blocks. Each request below is
+            // 3 prompt + 5 generated = 8 positions = 2 blocks.
+            budget_config(4, 4),
+        );
+
+        let start = Arc::new(Barrier::new(6));
+        let handles: Vec<_> = (0..6)
+            .map(|i| {
+                let batcher = batcher.clone();
+                let start = Arc::clone(&start);
+                thread::spawn(move || {
+                    start.wait();
+                    batcher
+                        .generate(vec![1, 2, 3], greedy_params(5, i as u64), None)
+                        .expect("every request fits the budget on its own")
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().expect("no submitter panicked");
+        }
+
+        let stats = batcher.stats();
+        assert!(
+            stats.kv_blocks_peak <= stats.kv_blocks_total,
+            "admission handed out {} blocks from a budget of {}",
+            stats.kv_blocks_peak,
+            stats.kv_blocks_total
+        );
+        assert_eq!(stats.kv_rejected_too_large, 0, "all six fit individually");
+    }
+
+    /// Every reservation comes back. A row that leaves without
+    /// releasing is a leak that shows up as a server which slowly stops
+    /// admitting anything, with no error anywhere -- so the ledger must
+    /// be exactly restored once the work is done.
+    ///
+    /// Confirmed to FAIL when the `budget.release` in
+    /// `Rows::flush_finished` is removed.
+    #[test]
+    fn every_admitted_request_gives_its_blocks_back() {
+        let decoder = tiny_decoder();
+        let batcher = ContinuousBatcher::spawn_with_config(
+            Arc::clone(&decoder),
+            identity_decode(),
+            budget_config(4, 4),
+        );
+        for i in 0..8 {
+            batcher
+                .generate(vec![1, 2, 3], greedy_params(4, i), None)
+                .expect("generate");
+        }
+        // The last reply is sent before the row is removed, so give the
+        // worker its moment to finish the release.
+        for _ in 0..200 {
+            if batcher.stats().kv_blocks_free == 4 {
+                break;
+            }
+            thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let stats = batcher.stats();
+        assert_eq!(
+            stats.kv_blocks_free, stats.kv_blocks_total,
+            "an idle server must own its whole budget again"
+        );
+        assert!(stats.kv_blocks_peak > 0, "something was actually reserved");
+    }
+
+    /// A rejected job must not leak its reservation either: `accept`
+    /// refuses a prompt this model cannot tokenize, and that job never
+    /// becomes a row, so nothing downstream would ever release it.
+    #[test]
+    fn a_job_rejected_at_validation_gives_its_blocks_back() {
+        let decoder = tiny_decoder();
+        let vocab = decoder.config.vocab_size;
+        let batcher = ContinuousBatcher::spawn_with_config(
+            Arc::clone(&decoder),
+            identity_decode(),
+            budget_config(4, 4),
+        );
+        assert!(matches!(
+            batcher.generate(vec![vocab + 1], greedy_params(2, 1), None),
+            Err(DecodeError::TokenOutOfVocab { .. })
+        ));
+        for _ in 0..200 {
+            if batcher.stats().kv_blocks_free == 4 {
+                break;
+            }
+            thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(batcher.stats().kv_blocks_free, 4);
+        // And the server still works afterwards.
+        batcher
+            .generate(vec![1, 2], greedy_params(2, 1), None)
+            .expect("a bad request must not poison the budget");
+    }
+
+    /// Admission is strict FIFO: a head job that does not fit stops the
+    /// line rather than being skipped over by a smaller one behind it.
+    /// Skip-ahead would raise utilization and let a stream of small
+    /// requests starve a large one indefinitely.
+    #[test]
+    fn a_head_job_that_does_not_fit_holds_the_line() {
+        let decoder = tiny_decoder();
+        let config = budget_config(4, 4);
+        let budget = BlockBudget::new(
+            config.kv_block_size,
+            config.kv_blocks,
+            config.max_context,
+            test_shape(),
+        );
+        let queue = QueueGate::new(config.max_queue);
+        // Two blocks already out to an in-flight request.
+        assert!(budget.try_reserve(2));
+
+        let mut waiting: VecDeque<Job> = VecDeque::new();
+        let (big_tx, _big_rx) = mpsc::channel();
+        let (small_tx, _small_rx) = mpsc::channel();
+        waiting.push_back(Job {
+            prompt_tokens: vec![1, 2, 3],
+            params: greedy_params(2, 1),
+            eos_id: None,
+            reply: big_tx,
+            abort: AbortId(0),
+            blocks: 3,
+        });
+        waiting.push_back(Job {
+            prompt_tokens: vec![1],
+            params: greedy_params(2, 2),
+            eos_id: None,
+            reply: small_tx,
+            abort: AbortId(1),
+            blocks: 1,
+        });
+        // The gate is counting both of them.
+        queue.try_reserve().expect("cap 512");
+        queue.try_reserve().expect("cap 512");
+
+        let mut prefills: VecDeque<Prefill> = VecDeque::new();
+        admit(
+            &decoder,
+            &mut waiting,
+            &mut prefills,
+            0,
+            &config,
+            &queue,
+            &budget,
+        );
+
+        assert!(
+            prefills.is_empty(),
+            "the 1-block job must not jump the 3-block job that cannot fit"
+        );
+        assert_eq!(waiting.len(), 2);
+        assert_eq!(queue.depth(), 2, "neither job has stopped waiting");
+
+        // Once the in-flight request finishes, the line moves -- both,
+        // in order.
+        budget.release(2);
+        admit(
+            &decoder,
+            &mut waiting,
+            &mut prefills,
+            0,
+            &config,
+            &queue,
+            &budget,
+        );
+        assert_eq!(prefills.len(), 2);
+        assert!(waiting.is_empty());
+        assert_eq!(queue.depth(), 0);
+        assert_eq!(budget.free(), 0, "3 + 1 blocks are now out");
+    }
+
+    /// The sequence cap and the block cap are separate statements and
+    /// both must hold. A budget with room for four requests does not
+    /// override `max_seqs = 1`.
+    #[test]
+    fn the_sequence_cap_and_the_block_cap_compose() {
+        let decoder = tiny_decoder();
+        let config = BatcherConfig {
+            max_seqs: 1,
+            ..budget_config(4, 8)
+        };
+        let budget = BlockBudget::new(
+            config.kv_block_size,
+            config.kv_blocks,
+            config.max_context,
+            test_shape(),
+        );
+        let queue = QueueGate::new(config.max_queue);
+        let mut waiting: VecDeque<Job> = VecDeque::new();
+        // The receivers stay alive for the test: a dropped receiver
+        // would make the reply channel closed, which is a different
+        // situation from the one under test.
+        let mut receivers = Vec::new();
+        for i in 0..3 {
+            let (tx, rx) = mpsc::channel();
+            receivers.push(rx);
+            waiting.push_back(Job {
+                prompt_tokens: vec![1, 2],
+                params: greedy_params(2, i),
+                eos_id: None,
+                reply: tx,
+                abort: AbortId(i),
+                blocks: 1,
+            });
+            queue.try_reserve().expect("cap 512");
+        }
+        let mut prefills: VecDeque<Prefill> = VecDeque::new();
+        admit(
+            &decoder,
+            &mut waiting,
+            &mut prefills,
+            0,
+            &config,
+            &queue,
+            &budget,
+        );
+        assert_eq!(prefills.len(), 1, "max_seqs still binds");
+        assert_eq!(budget.free(), 7, "only the admitted job reserved");
+        assert_eq!(receivers.len(), 3);
+    }
+
+    // ----------------------------------------------------------------
+    // Deferred abort (`sched-deferred-abort`)
+    // ----------------------------------------------------------------
+
+    fn cancellable_params(max_tokens: usize, seed: u64) -> (GenerationParams, CancelToken) {
+        let token = CancelToken::new();
+        let mut params = greedy_params(max_tokens, seed);
+        params.cancel = Some(token.clone());
+        (params, token)
+    }
+
+    fn abortable_job(abort: AbortId, prompt: Vec<usize>) -> (Job, mpsc::Receiver<JobResult>) {
+        let (tx, rx) = mpsc::channel();
+        (
+            Job {
+                prompt_tokens: prompt,
+                params: greedy_params(4, 1),
+                eos_id: None,
+                reply: tx,
+                abort,
+                blocks: 1,
+            },
+            rx,
+        )
+    }
+
+    /// The end-to-end fact the item exists for, and the gap the
+    /// `cancel` module used to state as unfixable: a request decoding
+    /// on the shared batcher thread stops when the client cancels it.
+    ///
+    /// Confirmed to FAIL (finishes with `Length` after all 4000 tokens)
+    /// when the `apply_aborts` call is removed from the worker loop.
+    #[test]
+    fn a_decoding_request_stops_when_it_is_cancelled() {
+        let decoder = tiny_decoder();
+        let batcher = ContinuousBatcher::spawn_with_config(
+            Arc::clone(&decoder),
+            identity_decode(),
+            BatcherConfig {
+                prefill_chunk: 1,
+                ..BatcherConfig::default()
+            },
+        );
+        let (params, token) = cancellable_params(4000, 9);
+        let worker = {
+            let batcher = batcher.clone();
+            thread::spawn(move || batcher.generate(vec![1, 2, 3], params, None))
+        };
+
+        // Wait until it is genuinely decoding, so the cancel exercises
+        // the decode path rather than racing the prefill.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while batcher.stats().decode_steps < 3 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "never started decoding"
+            );
+            thread::sleep(std::time::Duration::from_millis(1));
+        }
+        token.cancel();
+
+        let (finish, ids, _text, usage) = worker.join().expect("no panic").expect("generate");
+        assert_eq!(finish, FinishReason::Cancelled);
+        assert!(
+            ids.len() < 4000,
+            "cancelling did not shorten the decode: {} tokens",
+            ids.len()
+        );
+        assert!(
+            !ids.is_empty(),
+            "the tokens produced before the cancel must survive it"
+        );
+        assert_eq!(usage.completion_tokens, ids.len());
+        assert_eq!(batcher.stats().aborted, 1);
+    }
+
+    /// A cancelled request must leave the batch through the same exit
+    /// every finished row uses -- marked at the step boundary, removed
+    /// by `flush_finished` -- so its blocks are released once and its
+    /// caller is replied to once.
+    ///
+    /// Removing the row inside `apply_aborts` instead would be a second
+    /// exit path, and the reply this asserts arrives exactly once would
+    /// arrive twice.
+    #[test]
+    fn a_cancelled_row_leaves_through_the_one_exit_every_row_uses() {
+        let mut rows = Rows::default();
+        let budget = budget(4, Some(4));
+        assert!(budget.try_reserve(2));
+
+        let (mut a, ra) = test_slot(9, 11);
+        a.abort = AbortId(7);
+        a.blocks = 2;
+        a.generated_ids.push(3);
+        a.visible.push_str("hi");
+        let (b, rb) = test_slot(9, 22);
+        let a_uid = rows.insert(a);
+        let b_uid = rows.insert(b);
+
+        let consumed = rows.mark_cancelled(&HashSet::from([AbortId(7)]));
+        assert_eq!(consumed, vec![AbortId(7)]);
+        assert!(
+            rows.get(a_uid).is_some(),
+            "the row must still be in the table until the flush: its KV \
+             buffers are what the batch is built from"
+        );
+        assert_eq!(
+            budget.free(),
+            2,
+            "marking must not release blocks -- the flush does"
+        );
+        assert!(ra.try_recv().is_err(), "no reply until the row leaves");
+
+        rows.flush_finished(&budget);
+        assert!(rows.get(a_uid).is_none());
+        assert!(rows.get(b_uid).is_some(), "only the cancelled row left");
+        assert_eq!(budget.free(), 4, "blocks came back exactly once");
+
+        let (finish, ids, text, _usage) = ra.try_recv().expect("one reply").expect("ok");
+        assert_eq!(finish, FinishReason::Cancelled);
+        assert_eq!(ids, vec![3], "partial output survives the cancel");
+        assert_eq!(text, "hi");
+        assert!(
+            ra.try_recv().is_err(),
+            "a cancelled row must be replied to exactly once"
+        );
+        assert!(rb.try_recv().is_err(), "the other row is untouched");
+    }
+
+    /// A cancel can beat its own job through the channel. Dropping the
+    /// id because nothing matches it yet would leave the request
+    /// running after the client asked it to stop.
+    ///
+    /// Confirmed to FAIL when `apply_aborts` drops unmatched ids
+    /// instead of carrying them.
+    #[test]
+    fn a_cancel_that_arrives_before_its_job_is_not_lost() {
+        let config = budget_config(4, 4);
+        let inbox = AbortInbox::default();
+        let queue = QueueGate::new(config.max_queue);
+        let budget = BlockBudget::new(
+            config.kv_block_size,
+            config.kv_blocks,
+            config.max_context,
+            test_shape(),
+        );
+        let mut carried = HashSet::new();
+        let mut waiting = VecDeque::new();
+        let mut prefills = VecDeque::new();
+        let mut rows = Rows::default();
+
+        // The cancel lands first, naming nothing.
+        inbox.enqueue(AbortId(42));
+        apply_aborts(
+            &inbox,
+            &mut carried,
+            &mut waiting,
+            &mut prefills,
+            &mut rows,
+            &queue,
+            &budget,
+        );
+        assert_eq!(inbox.aborted(), 0, "nothing to stop yet");
+
+        // Now the job it names shows up.
+        let (job, rx) = abortable_job(AbortId(42), vec![1, 2]);
+        waiting.push_back(job);
+        queue.try_reserve().expect("cap");
+        apply_aborts(
+            &inbox,
+            &mut carried,
+            &mut waiting,
+            &mut prefills,
+            &mut rows,
+            &queue,
+            &budget,
+        );
+
+        assert!(waiting.is_empty(), "the late job must still be cancelled");
+        assert_eq!(inbox.aborted(), 1);
+        assert_eq!(queue.depth(), 0, "its queue slot came back");
+        let (finish, ids, _, usage) = rx.try_recv().expect("reply").expect("ok");
+        assert_eq!(finish, FinishReason::Cancelled);
+        assert!(ids.is_empty(), "it never ran a token");
+        assert_eq!(usage.prompt_tokens, 2);
+    }
+
+    /// A cancelled prompt must not be prefilled: that is the cheapest
+    /// possible moment to stop, and the whole point of checking before
+    /// the chunk rather than after it.
+    #[test]
+    fn a_cancelled_prefill_is_abandoned_and_gives_its_blocks_back() {
+        let decoder = tiny_decoder();
+        let config = budget_config(4, 4);
+        let inbox = AbortInbox::default();
+        let queue = QueueGate::new(config.max_queue);
+        let budget = BlockBudget::new(
+            config.kv_block_size,
+            config.kv_blocks,
+            config.max_context,
+            test_shape(),
+        );
+        let mut carried = HashSet::new();
+        let mut waiting = VecDeque::new();
+        let mut prefills = VecDeque::new();
+        let mut rows = Rows::default();
+
+        let (job, rx) = abortable_job(AbortId(5), vec![1, 2, 3, 4]);
+        waiting.push_back(job);
+        queue.try_reserve().expect("cap");
+        admit(
+            &decoder,
+            &mut waiting,
+            &mut prefills,
+            0,
+            &config,
+            &queue,
+            &budget,
+        );
+        assert_eq!(prefills.len(), 1);
+        assert_eq!(budget.free(), 3, "the prefill holds its reservation");
+
+        inbox.enqueue(AbortId(5));
+        apply_aborts(
+            &inbox,
+            &mut carried,
+            &mut waiting,
+            &mut prefills,
+            &mut rows,
+            &queue,
+            &budget,
+        );
+        assert!(prefills.is_empty(), "the remaining chunks never run");
+        assert_eq!(budget.free(), 4, "an abandoned prefill releases its blocks");
+        assert_eq!(inbox.aborted(), 1);
+        assert_eq!(
+            rx.try_recv().expect("reply").expect("ok").0,
+            FinishReason::Cancelled
+        );
+    }
+
+    /// Cancelling one request must not disturb any other -- the failure
+    /// mode a positional row table would make easy.
+    #[test]
+    fn cancelling_one_request_leaves_its_neighbours_running() {
+        let decoder = tiny_decoder();
+        let batcher = ContinuousBatcher::spawn_with_config(
+            Arc::clone(&decoder),
+            identity_decode(),
+            BatcherConfig {
+                prefill_chunk: 1,
+                ..BatcherConfig::default()
+            },
+        );
+        let expected = sequential_ids(&decoder, &[4, 5], &greedy_params(6, 3));
+
+        let (doomed_params, token) = cancellable_params(4000, 9);
+        let doomed = {
+            let batcher = batcher.clone();
+            thread::spawn(move || batcher.generate(vec![1, 2, 3], doomed_params, None))
+        };
+        let survivor = {
+            let batcher = batcher.clone();
+            thread::spawn(move || batcher.generate(vec![4, 5], greedy_params(6, 3), None))
+        };
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while batcher.stats().decode_steps < 3 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "never started decoding"
+            );
+            thread::sleep(std::time::Duration::from_millis(1));
+        }
+        token.cancel();
+
+        let (finish, _, _, _) = doomed.join().expect("no panic").expect("generate");
+        assert_eq!(finish, FinishReason::Cancelled);
+        let (finish, ids, _, _) = survivor.join().expect("no panic").expect("generate");
+        assert_eq!(finish, FinishReason::Length);
+        assert_eq!(
+            ids, expected,
+            "an uncancelled request must produce exactly what it would have alone"
+        );
+    }
+
+    // ----------------------------------------------------------------
+    // Stop sequences (`sched-stop-buffering`)
+    // ----------------------------------------------------------------
+
+    /// Layer 1 in the batched path. A batched row and a row decoding on
+    /// its own must agree about where an answer ends, so both go
+    /// through the same `StopMatcher`.
+    ///
+    /// Confirmed to FAIL (runs to all 8 tokens) when the
+    /// `stops.is_stop_token` check is removed from the worker's
+    /// sampling step.
+    #[test]
+    fn a_token_level_stop_ends_a_batched_row() {
+        let decoder = tiny_decoder();
+        let batcher = ContinuousBatcher::spawn_with_config(
+            Arc::clone(&decoder),
+            identity_decode(),
+            BatcherConfig {
+                prefill_chunk: 1,
+                ..BatcherConfig::default()
+            },
+        );
+        let baseline = sequential_ids(&decoder, &[1, 2, 3], &greedy_params(8, 4));
+        assert!(baseline.len() > 1, "need something to stop before the end");
+        let stop_token = baseline[1];
+
+        let (finish, ids, _text, usage) = batcher
+            .generate(
+                vec![1, 2, 3],
+                GenerationParams {
+                    stop_token_ids: vec![stop_token],
+                    ..greedy_params(8, 4)
+                },
+                None,
+            )
+            .expect("generate");
+
+        assert_eq!(finish, FinishReason::Stop);
+        assert_eq!(
+            ids,
+            baseline[..1].to_vec(),
+            "the stop token itself is not part of the answer"
+        );
+        assert_eq!(usage.completion_tokens, 1);
+    }
+
+    /// Layer 2 in the batched path: a stop string spanning several
+    /// tokens is matched, and nothing past it is reported.
+    #[test]
+    fn a_multi_token_stop_string_truncates_a_batched_row() {
+        let decoder = tiny_decoder();
+        let batcher = ContinuousBatcher::spawn_with_config(
+            Arc::clone(&decoder),
+            identity_decode(),
+            BatcherConfig {
+                prefill_chunk: 1,
+                ..BatcherConfig::default()
+            },
+        );
+        let baseline = sequential_ids(&decoder, &[1, 2, 3], &greedy_params(8, 4));
+        let decode = identity_decode();
+        let full = decode(&baseline);
+        if full.chars().count() < 4 {
+            return;
+        }
+        // Two characters out of the middle, so the match spans a token
+        // boundary and the first character is a partial for a while.
+        let cut: Vec<char> = full.chars().collect();
+        let stop_str: String = cut[1..3].iter().collect();
+        let expected: String = cut[..1].iter().collect();
+
+        let (finish, _ids, text, _usage) = batcher
+            .generate(
+                vec![1, 2, 3],
+                GenerationParams {
+                    stop: vec![stop_str.clone()],
+                    ..greedy_params(8, 4)
+                },
+                None,
+            )
+            .expect("generate");
+
+        assert_eq!(finish, FinishReason::Stop);
+        assert_eq!(
+            text, expected,
+            "a stop spanning two tokens must cut where it starts"
+        );
+        assert!(!text.contains(&stop_str));
+    }
+
+    /// Text withheld against a stop that never arrives is ordinary
+    /// output. Dropping it would truncate every answer whose tail looks
+    /// like the start of a stop string.
+    #[test]
+    fn a_batched_row_that_never_matches_loses_no_output() {
+        let decoder = tiny_decoder();
+        let batcher = ContinuousBatcher::spawn_with_config(
+            Arc::clone(&decoder),
+            identity_decode(),
+            BatcherConfig {
+                prefill_chunk: 1,
+                ..BatcherConfig::default()
+            },
+        );
+        let baseline = sequential_ids(&decoder, &[1, 2, 3], &greedy_params(8, 4));
+        let expected = identity_decode()(&baseline);
+
+        let (finish, ids, text, _usage) = batcher
+            .generate(
+                vec![1, 2, 3],
+                GenerationParams {
+                    stop: vec!["ZZ_NEVER_MATCHES_ZZ".to_string()],
+                    ..greedy_params(8, 4)
+                },
+                None,
+            )
+            .expect("generate");
+        assert_eq!(finish, FinishReason::Length);
+        assert_eq!(ids, baseline);
+        assert_eq!(
+            text, expected,
+            "buffering is about when text is released, never whether"
+        );
+    }
+
+    /// A request nobody cancels must be untouched by the machinery that
+    /// exists for the ones that are.
+    #[test]
+    fn an_uncancelled_request_is_unaffected_by_the_abort_path() {
+        let decoder = tiny_decoder();
+        let batcher = ContinuousBatcher::spawn_with_config(
+            Arc::clone(&decoder),
+            identity_decode(),
+            BatcherConfig {
+                prefill_chunk: 1,
+                ..BatcherConfig::default()
+            },
+        );
+        let (params, _token) = cancellable_params(6, 3);
+        let (finish, ids, _, _) = batcher
+            .generate(vec![4, 5], params, None)
+            .expect("generate");
+        assert_eq!(finish, FinishReason::Length);
+        assert_eq!(ids, sequential_ids(&decoder, &[4, 5], &greedy_params(6, 3)));
+        assert_eq!(batcher.stats().aborted, 0);
     }
 }

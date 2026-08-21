@@ -267,6 +267,68 @@ Recorded today for `/v1/chat/completions` (streamed and not, including
 rejections), `/v1/completions` and `/v1/messages`. Not yet recorded for
 `/v1/embeddings`, `/v1/tokenize` or `/v1/detokenize`.
 
+## Refusals that will not clear
+
+Two ceilings do not move with load, so a request that hits one is
+refused with `400` and never with `503`: an idle server would refuse it
+identically, and `Retry-After` would be a lie that turns into a retry
+loop.
+
+```json
+{"error": {
+  "message": "context_length_exceeded: request asks for 9000 token positions …",
+  "type": "invalid_request_error",
+  "code": "context_length_exceeded",
+  "estimated_bytes": 4718592000,
+  "limit_bytes": 4194304000,
+  "positions": 9000,
+  "positions_limit": 8000
+}}
+```
+
+`code` names **which** ceiling is binding, because the two have
+different fixes and only one of them is available to a client:
+
+| `code` | Meaning | Fix |
+|---|---|---|
+| `context_length_exceeded` | Longer than any one request may be (`FERROX_CB_MAX_CONTEXT`) | Shorter prompt, lower `max_tokens` |
+| `device_memory_budget_exceeded` | Bigger than the server's whole KV budget (`FERROX_CB_KV_BLOCKS`) | More KV blocks, or a smaller model |
+
+`estimated_bytes` and `limit_bytes` are the KV cost of the request and
+of the ceiling, priced from the model's own layout — the same
+arithmetic `ferrox inspect-plan` prints, so it can be checked rather
+than taken on trust. When both ceilings are exceeded, the per-request
+one is reported: it is the one the caller can act on.
+
+Momentary pressure is a different answer entirely — `503` with
+`Retry-After` — and is counted separately, so an operator reading
+`/metrics` can tell "one request too big" from "too many requests".
+
+## Stop sequences
+
+Two layers, because a stop sequence promises something about what
+reaches the client and streaming makes that promise hard to keep.
+
+1. **Token level.** A stop string that is exactly one token in this
+   model's vocabulary — the usual case for `<|im_end|>`,
+   `<end_of_turn>`, `<|eot_id|>` — is matched on the token id, before
+   the token is detokenized. That catches control tokens whose rendered
+   form is not the string the client asked for, which the text scan
+   cannot see at all, and the token never becomes part of the answer
+   (the same treatment the EOS token already gets, and it is not
+   counted in `usage` either).
+2. **Text level.** Everything else is matched on the emitted text, with
+   the output buffered so that no tail which could still become a stop
+   string is ever sent. Only the real partial match is withheld, not a
+   fixed number of bytes, so ordinary text goes out the moment it is
+   provably safe rather than permanently trailing the model by the
+   length of the longest stop string.
+
+A partial match therefore never appears on the wire and is never taken
+back — SSE has no mechanism for taking anything back. Text withheld
+against a match that never arrives is released when the answer ends,
+so nothing is lost.
+
 ## Cancellation
 
 Two tiers, both ending at the same server-side flag.
@@ -296,11 +358,18 @@ OpenAI-defined value, because OpenAI has no cancel endpoint, but *a*
 finish reason, so the stream is not read as truncation. Tokens already
 decoded are kept and reported in `usage`.
 
+Continuous-batching requests are covered too, by a different route:
+the cancel enqueues an id, and the scheduler thread drains that queue
+between steps and drops the sequence itself. Removing a sequence means
+touching KV buffers a forward pass may be reading, so the mutation
+happens on the thread that owns the step rather than wherever the
+cancel arrived. A request is stopped wherever it has got to — still
+queued, mid-prefill, or decoding — and keeps whatever it produced.
+
 Cooperative and honest about its edges: the flag is read between
 decoded tokens, so a prefill already inside a forward pass still
-completes, and a continuous-batching request decodes on the shared
-batcher thread rather than through this loop and is not covered.
-`/v1/completions` and `/v1/messages` are buffered and register no id.
+completes. `/v1/completions` and `/v1/messages` are buffered and
+register no id.
 
 ## Streaming behind a proxy
 

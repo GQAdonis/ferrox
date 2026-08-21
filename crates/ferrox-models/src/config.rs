@@ -343,6 +343,33 @@ impl ModelConfig {
         }
     }
 
+    /// The narrowest sliding window any layer of this model uses, or
+    /// `None` if every layer is full-causal.
+    ///
+    /// For an alternating-SWA model (gpt-oss, Gemma-3) the
+    /// full-attention layers impose no constraint on the KV block
+    /// layout and the sliding ones impose the window -- so the model's
+    /// constraint is simply the window, present as soon as *any* layer
+    /// slides. A model that is 5/6 full-attention is not 5/6 exempt:
+    /// one mis-aligned sliding layer corrupts the answer.
+    pub fn kv_block_window(&self) -> Option<usize> {
+        (0..self.n_layers).find_map(|il| self.layer_sliding_window(il))
+    }
+
+    /// The KV cache block layout to use for this model, given the block
+    /// size an operator asked for.
+    ///
+    /// The requested size is rounded *down* to something that divides
+    /// the window (see [`ferrox_core::kv_swa`]), so a config that would
+    /// straddle the window boundary becomes a smaller block rather than
+    /// a startup failure or -- much worse -- a silently wrong mask.
+    pub fn kv_block_layout(&self, desired_block_size: usize) -> ferrox_core::BlockLayout {
+        let window = self.kv_block_window();
+        let block_size = ferrox_core::aligned_block_size(desired_block_size, window);
+        ferrox_core::BlockLayout::new(block_size, window)
+            .expect("aligned_block_size returns a size BlockLayout accepts")
+    }
+
     /// RoPE frequency base for layer `il` (SWA layers may differ).
     pub fn layer_rope_theta(&self, layer_idx: usize) -> f32 {
         match (self.layer_sliding_window(layer_idx), self.rope_theta_swa) {
@@ -835,6 +862,58 @@ mod tests {
             RopeLayout::for_gguf_architecture("totally-unknown-arch"),
             RopeLayout::Neox
         );
+    }
+
+    /// gpt-oss's real shape: a 128-token window on every other layer.
+    /// A KV block size of 128 or any divisor of it is fine; 48 or 256
+    /// are not, and the config layer must round down rather than hand
+    /// the cache something it will refuse (or, worse, accept).
+    #[test]
+    fn an_alternating_swa_model_constrains_the_block_layout() {
+        let mut cfg = test_dense_fixture();
+        cfg.n_layers = 24;
+        cfg.sliding_window = Some(128);
+        cfg.swa_pattern = Some(2);
+
+        // Half the layers are full-attention, but the model is still
+        // constrained: one mis-aligned sliding layer is enough.
+        assert!(cfg.layer_sliding_window(1).is_none() || cfg.layer_sliding_window(0).is_none());
+        assert_eq!(cfg.kv_block_window(), Some(128));
+
+        let layout = cfg.kv_block_layout(256);
+        assert_eq!(layout.block_size(), 128, "256 must round down, not up");
+        assert_eq!(layout.sliding_window(), Some(128));
+        assert_eq!(layout.blocks_per_window(), Some(1));
+
+        assert_eq!(cfg.kv_block_layout(48).block_size(), 32);
+        assert_eq!(cfg.kv_block_layout(32).block_size(), 32);
+    }
+
+    /// Gemma-3: window 512, every 6th layer full-attention.
+    #[test]
+    fn a_gemma3_shaped_model_takes_its_window_from_the_sliding_layers() {
+        let mut cfg = test_dense_fixture();
+        cfg.n_layers = 30;
+        cfg.sliding_window = Some(512);
+        cfg.swa_pattern = Some(6);
+        assert!(
+            cfg.layer_sliding_window(5).is_none(),
+            "every 6th layer is full-attention"
+        );
+        assert_eq!(cfg.kv_block_window(), Some(512));
+        assert_eq!(cfg.kv_block_layout(100).block_size(), 64);
+        assert_eq!(cfg.kv_block_layout(64).blocks_per_window(), Some(8));
+    }
+
+    #[test]
+    fn a_full_causal_model_keeps_the_block_size_it_was_given() {
+        let mut cfg = test_dense_fixture();
+        cfg.sliding_window = None;
+        cfg.swa_pattern = None;
+        assert_eq!(cfg.kv_block_window(), None);
+        let layout = cfg.kv_block_layout(48);
+        assert_eq!(layout.block_size(), 48);
+        assert_eq!(layout.sliding_window(), None);
     }
 
     #[test]

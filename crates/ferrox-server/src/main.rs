@@ -52,6 +52,7 @@ mod openai_extra;
 mod security;
 mod session;
 mod stats;
+mod stop;
 mod tasks;
 mod ui;
 
@@ -1097,6 +1098,10 @@ impl ChatCompletionRequest {
             sampling: self.sampling_params(),
             seed: self.resolved_seed(),
             stop: self.effective_stop_sequences(),
+            // Resolved by `run_generation_emit`, the layer that holds a
+            // tokenizer: a request body names stop strings, and only
+            // the model can say which of them are single tokens.
+            stop_token_ids: Vec::new(),
             json_object: self.json_object_mode(),
             // Filled in by the handler that owns the request id --
             // the request body cannot name its own cancel token.
@@ -1511,12 +1516,36 @@ async fn metrics(State(state): State<Arc<AppState>>) -> Response {
                  ferrox_scheduler_queue_depth {}\n\
                  # HELP ferrox_scheduler_queue_rejected_total Requests refused with 503 because the admission queue was full.\n\
                  # TYPE ferrox_scheduler_queue_rejected_total counter\n\
-                 ferrox_scheduler_queue_rejected_total {}\n",
+                 ferrox_scheduler_queue_rejected_total {}\n\
+                 # HELP ferrox_kv_blocks_total KV blocks in the scheduler's admission budget (0 when unconfigured).\n\
+                 # TYPE ferrox_kv_blocks_total gauge\n\
+                 ferrox_kv_blocks_total {}\n\
+                 # HELP ferrox_kv_blocks_free KV blocks not reserved by an in-flight request.\n\
+                 # TYPE ferrox_kv_blocks_free gauge\n\
+                 ferrox_kv_blocks_free {}\n\
+                 # HELP ferrox_kv_block_size Token positions per KV block.\n\
+                 # TYPE ferrox_kv_block_size gauge\n\
+                 ferrox_kv_block_size {}\n\
+                 # HELP ferrox_kv_rejected_too_large_total Requests refused with 400 because they exceed the whole KV block budget.\n\
+                 # TYPE ferrox_kv_rejected_too_large_total counter\n\
+                 ferrox_kv_rejected_too_large_total {}\n\
+                 # HELP ferrox_kv_rejected_context_length_total Requests refused with 400 for exceeding the per-request context ceiling.\n\
+                 # TYPE ferrox_kv_rejected_context_length_total counter\n\
+                 ferrox_kv_rejected_context_length_total {}\n\
+                 # HELP ferrox_scheduler_aborted_total Requests the batch scheduler stopped because they were cancelled.\n\
+                 # TYPE ferrox_scheduler_aborted_total counter\n\
+                 ferrox_scheduler_aborted_total {}\n",
                 sched.prefill_chunks,
                 sched.prefill_tokens,
                 sched.decode_steps,
                 sched.queue_depth,
                 sched.queue_rejected,
+                sched.kv_blocks_total,
+                sched.kv_blocks_free,
+                sched.kv_block_size,
+                sched.kv_rejected_too_large,
+                sched.kv_rejected_context_length,
+                sched.aborted,
             )
         }
         None => body,
@@ -1544,6 +1573,11 @@ pub(crate) fn unsupported_feature(message: &str) -> ApiError {
 pub(crate) fn decode_error_response(e: generate::DecodeError) -> ApiError {
     let status = match e {
         generate::DecodeError::TokenOutOfVocab { .. } => StatusCode::BAD_REQUEST,
+        // The request is bigger than the server can ever serve. That
+        // is a property of the request, so it is the client's 400 --
+        // answering 503 would send it into a retry loop that cannot
+        // succeed.
+        generate::DecodeError::KvBudgetExceeded { .. } => StatusCode::BAD_REQUEST,
         // Not the client's fault, and true of the exact same request a
         // moment later once capacity frees up -- 503, not 400. The
         // `Retry-After` header these need is stamped centrally by
@@ -1555,6 +1589,28 @@ pub(crate) fn decode_error_response(e: generate::DecodeError) -> ApiError {
     };
     tracing::warn!("decode error: {e}");
     let mut body = serde_json::json!({"error": {"message": e.to_string()}});
+    // A refusal against a ceiling names the ceiling and both sides of
+    // the arithmetic. "Out of memory" (or a bare 400) tells a caller
+    // that something did not fit; it does not tell them whether to
+    // shorten the prompt or to run a bigger box, and those are the only
+    // two actions available.
+    if let generate::DecodeError::KvBudgetExceeded {
+        binding,
+        estimated_bytes,
+        limit_bytes,
+        positions,
+        positions_limit,
+        ..
+    } = &e
+    {
+        body["error"]["type"] = serde_json::json!("invalid_request_error");
+        body["error"]["code"] = serde_json::json!(binding);
+        body["error"]["binding"] = serde_json::json!(binding);
+        body["error"]["estimated_bytes"] = serde_json::json!(estimated_bytes);
+        body["error"]["limit_bytes"] = serde_json::json!(limit_bytes);
+        body["error"]["positions"] = serde_json::json!(positions);
+        body["error"]["positions_limit"] = serde_json::json!(positions_limit);
+    }
     // The header carries the same hint (stamped by `limits::retry_after`);
     // repeating it in the body is for clients that read JSON and never
     // look at headers, which is most of them.
@@ -1587,6 +1643,17 @@ fn run_generation_emit(
 ) -> Result<(FinishReason, generate::Usage, String), generate::DecodeError> {
     let synthetic = model.is_synthetic();
     let mut chunks = Vec::new();
+    // Layer 1 of the stop machinery is resolved exactly here, because
+    // this is the one place that has both the request's stop strings
+    // and the model's tokenizer. Both the batched and the private
+    // decode paths below read the result off the params, so there is
+    // one answer rather than two that can drift.
+    let params = &{
+        let mut resolved = params.clone();
+        resolved.stop_token_ids =
+            crate::stop::resolve_stop_tokens(&resolved.stop, |text| model.encode(text));
+        resolved
+    };
     let used_batcher = matches!((model, continuous_batcher), (Model::Gguf(_), Some(_)));
     let (finish, usage) = match model {
         Model::Gguf(m) => {
@@ -3324,6 +3391,7 @@ mod tests {
             sampling: SamplingParams::default(),
             seed: 1,
             stop: Vec::new(),
+            stop_token_ids: Vec::new(),
             json_object: false,
             cancel: None,
         }

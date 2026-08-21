@@ -66,7 +66,7 @@
 //! <root>/<hh>/<full-hex>.kvb           published blocks (hh = shard prefix)
 //! ```
 //!
-//! # File format (version 1)
+//! # File format (version 2)
 //!
 //! ```text
 //! magic           8   b"FRXKVBLK"
@@ -74,9 +74,18 @@
 //! header_len      4   u32 LE
 //! body_len        8   u64 LE
 //! digest         32   SHA-256 over header || body
-//! header  header_len  block hash, dims, dtype, model identity
+//! header  header_len  block hash, dims, dtype, block layout, model identity
 //! body      body_len  per layer: all K elements, then all V elements
 //! ```
+//!
+//! Version 2 added the two block-layout fields -- block size and
+//! sliding window -- and version 1 was dropped from the readable set
+//! rather than being read with the window assumed absent. A v1 file
+//! cannot say what window it was cut under, and "it did not say" is not
+//! "there was none": see [`kv_swa`](crate::kv_swa) for what a
+//! mis-aligned block does to an answer. A restart onto this build
+//! therefore starts from a cold cache once, and the old files are
+//! evicted as unreadable rather than reinterpreted.
 //!
 //! The digest covers header and body but not the fixed prefix, so the
 //! lengths are checked against the real file size *before* anything is
@@ -99,8 +108,13 @@ use crate::kv_signature::{
     CacheSignature, KvBlock, KvDtype, UnverifiedBlock, BLOCK_FORMAT_VERSION,
     READABLE_FORMAT_VERSIONS,
 };
+use crate::kv_swa::{BlockLayout, BlockLayoutError};
 
 const MAGIC: &[u8; 8] = b"FRXKVBLK";
+/// Fixed u32 fields in a block header, after the 32-byte hash:
+/// n_layers, n_kv_heads, head_dim, tokens, dtype, block_size,
+/// sliding_window, model_len.
+const HEADER_FIELDS: usize = 8;
 /// magic + version + header_len + body_len + digest.
 const PREFIX_LEN: usize = 8 + 4 + 4 + 8 + 32;
 /// Extension of a published block file.
@@ -122,6 +136,21 @@ fn dtype_from_code(code: u32) -> Option<KvDtype> {
     match code {
         DTYPE_F32 => Some(KvDtype::F32),
         _ => None,
+    }
+}
+
+/// Encodes a sliding window as a u32, with 0 meaning "no window".
+/// `BlockLayout` refuses a zero window, so the two cases cannot
+/// collide.
+fn window_code(window: Option<usize>) -> u32 {
+    window.unwrap_or(0) as u32
+}
+
+fn window_from_code(code: u32) -> Option<usize> {
+    if code == 0 {
+        None
+    } else {
+        Some(code as usize)
     }
 }
 
@@ -157,6 +186,10 @@ pub enum BlockFormatError {
     Malformed(&'static str),
     /// A dtype code this build has no reader for.
     UnknownDtype(u32),
+    /// The recorded block layout is not one any correct writer could
+    /// have produced -- a block size that does not divide the sliding
+    /// window it was cut against.
+    BadLayout(BlockLayoutError),
 }
 
 impl std::fmt::Display for BlockFormatError {
@@ -184,6 +217,9 @@ impl std::fmt::Display for BlockFormatError {
             BlockFormatError::UnknownDtype(code) => {
                 write!(f, "KV block file has unknown dtype code {code}")
             }
+            BlockFormatError::BadLayout(err) => {
+                write!(f, "KV block file records an impossible block layout: {err}")
+            }
         }
     }
 }
@@ -202,6 +238,11 @@ pub fn encode_block(hash: &BlockHash, block: &KvBlock) -> Vec<u8> {
     header.extend_from_slice(&(sig.head_dim as u32).to_le_bytes());
     header.extend_from_slice(&(sig.tokens as u32).to_le_bytes());
     header.extend_from_slice(&dtype_code(sig.dtype).to_le_bytes());
+    header.extend_from_slice(&(sig.layout.block_size() as u32).to_le_bytes());
+    // 0 encodes "no sliding window". A real window is never 0 --
+    // `BlockLayout` refuses `Some(0)` precisely so this encoding is
+    // unambiguous.
+    header.extend_from_slice(&(window_code(sig.layout.sliding_window())).to_le_bytes());
     header.extend_from_slice(&(sig.model.len() as u32).to_le_bytes());
     header.extend_from_slice(sig.model.as_bytes());
 
@@ -245,7 +286,7 @@ fn body_len(sig: &CacheSignature) -> u64 {
 
 /// Total on-disk size of a block with this signature, header included.
 pub fn encoded_len(sig: &CacheSignature) -> u64 {
-    let header = 32 + 4 * 6 + sig.model.len() as u64;
+    let header = 32 + 4 * HEADER_FIELDS as u64 + sig.model.len() as u64;
     PREFIX_LEN as u64 + header + body_len(sig)
 }
 
@@ -297,7 +338,7 @@ pub fn decode_block(bytes: &[u8]) -> Result<DecodedBlock, BlockFormatError> {
 
     let header = &bytes[PREFIX_LEN..PREFIX_LEN + header_len as usize];
     let body = &bytes[PREFIX_LEN + header_len as usize..];
-    if header.len() < 32 + 4 * 6 {
+    if header.len() < 32 + 4 * HEADER_FIELDS {
         return Err(BlockFormatError::Malformed(
             "header shorter than its fields",
         ));
@@ -311,14 +352,16 @@ pub fn decode_block(bytes: &[u8]) -> Result<DecodedBlock, BlockFormatError> {
     let head_dim = field(2) as usize;
     let tokens = field(3) as usize;
     let dtype_code = field(4);
-    let model_len = field(5) as usize;
+    let block_size = field(5) as usize;
+    let window_code = field(6);
+    let model_len = field(7) as usize;
     let dtype = dtype_from_code(dtype_code).ok_or(BlockFormatError::UnknownDtype(dtype_code))?;
-    if header.len() != 32 + 4 * 6 + model_len {
+    if header.len() != 32 + 4 * HEADER_FIELDS + model_len {
         return Err(BlockFormatError::Malformed(
             "model name length disagrees with header",
         ));
     }
-    let model = std::str::from_utf8(&header[32 + 4 * 6..])
+    let model = std::str::from_utf8(&header[32 + 4 * HEADER_FIELDS..])
         .map_err(|_| BlockFormatError::Malformed("model name is not UTF-8"))?
         .to_string();
     if n_layers == 0 || n_kv_heads == 0 || head_dim == 0 {
@@ -326,6 +369,12 @@ pub fn decode_block(bytes: &[u8]) -> Result<DecodedBlock, BlockFormatError> {
             "zero layers, heads, or head dim",
         ));
     }
+    // A file whose recorded layout is not a layout at all -- a block
+    // size that does not divide its window -- is refused here rather
+    // than reconstructed into a `BlockLayout` that could not have been
+    // built by any correct writer.
+    let layout = BlockLayout::new(block_size, window_from_code(window_code))
+        .map_err(BlockFormatError::BadLayout)?;
 
     let per_layer_elems = tokens
         .checked_mul(n_kv_heads)
@@ -363,6 +412,7 @@ pub fn decode_block(bytes: &[u8]) -> Result<DecodedBlock, BlockFormatError> {
         head_dim,
         dtype,
         tokens,
+        layout,
     };
     Ok(DecodedBlock {
         hash,
@@ -2143,15 +2193,31 @@ mod tests {
         cache
     }
 
+    /// A full-causal layout whose block size is the block's own token
+    /// depth -- the default for every test that is not about SWA.
+    fn flat(tokens: usize) -> BlockLayout {
+        BlockLayout::full_attention(tokens).expect("positive block size")
+    }
+
     fn block(model: &str, n_layers: usize, tokens: usize, fill: f32) -> KvBlock {
+        block_with_layout(model, n_layers, tokens, fill, flat(tokens))
+    }
+
+    fn block_with_layout(
+        model: &str,
+        n_layers: usize,
+        tokens: usize,
+        fill: f32,
+        layout: BlockLayout,
+    ) -> KvBlock {
         let layers = (0..n_layers)
             .map(|l| layer(2, 4, tokens, fill + l as f32 * 100.0))
             .collect();
-        KvBlock::stamp(model, layers).expect("stamp")
+        KvBlock::stamp(model, layout, layers).expect("stamp")
     }
 
     fn expected(model: &str, n_layers: usize, tokens: usize) -> CacheSignature {
-        CacheSignature::expected(model, n_layers, 2, 4, tokens)
+        CacheSignature::expected(model, flat(tokens), n_layers, 2, 4, tokens)
     }
 
     fn hash(n: usize) -> BlockHash {
@@ -2355,7 +2421,10 @@ mod tests {
             .expect("get")
             .is_none());
         assert!(store
-            .get(&h, &CacheSignature::expected("model-a", 2, 8, 4, 4))
+            .get(
+                &h,
+                &CacheSignature::expected("model-a", flat(4), 2, 8, 4, 4)
+            )
             .expect("get")
             .is_none());
         assert_eq!(store.stats().incompatible, 2);
@@ -2521,6 +2590,113 @@ mod tests {
             .expect("get")
             .expect("a block written before the restart must still be readable");
         assert_eq!(read.tokens(), 4);
+    }
+
+    /// `kv-swa-block-alignment`, at the layer that makes it dangerous.
+    ///
+    /// The disk tier is the thing that carries a block past the death
+    /// of the process that computed it, so a window change between two
+    /// runs is not a hypothetical: run 1 fills the cache at window 128,
+    /// somebody edits the config, run 2 reindexes the same directory
+    /// and asks for the same prefix. The tokens match, the hash matches,
+    /// the tensors are the right shape -- everything except the mask the
+    /// state was computed under. The block must be refused, and counted
+    /// as incompatible so an operator can see why their hit rate went
+    /// to zero.
+    #[test]
+    fn a_block_written_under_one_window_is_not_served_to_a_reader_expecting_another() {
+        let dir = TempDir::new("swa-window-restart");
+        let h = hash(90);
+        let window_128 = BlockLayout::new(4, Some(128)).expect("4 divides 128");
+        let window_256 = BlockLayout::new(4, Some(256)).expect("4 divides 256");
+        {
+            let store = store(&dir, 1 << 20);
+            put_now(
+                &store,
+                h,
+                block_with_layout("model-a", 2, 4, 7.0, window_128),
+            );
+        }
+
+        let reopened = store(&dir, 1 << 20);
+        assert_eq!(reopened.reindex().expect("reindex"), 1);
+        assert!(reopened.contains(&h), "the file is there");
+
+        let after_window_change = reopened
+            .get(
+                &h,
+                &CacheSignature::expected("model-a", window_256, 2, 2, 4, 4),
+            )
+            .expect("a config change is a miss, not an I/O error");
+        assert!(
+            after_window_change.is_none(),
+            "a block cut against a 128 window must not be handed to a 256-window reader"
+        );
+        assert_eq!(reopened.stats().incompatible, 1);
+        assert_eq!(reopened.stats().hits, 0);
+
+        // Unchanged config still hits: the guard invalidates on change,
+        // not on principle.
+        let same = reopened
+            .get(
+                &h,
+                &CacheSignature::expected("model-a", window_128, 2, 2, 4, 4),
+            )
+            .expect("get")
+            .expect("the same window must still hit");
+        assert_eq!(same.tokens(), 4);
+        assert_eq!(same.layout(), window_128);
+    }
+
+    /// The window survives the round trip through the file at all --
+    /// without this, the test above would pass for the wrong reason
+    /// (every decoded block reporting "no window" and every reader
+    /// expecting one missing).
+    #[test]
+    fn the_block_layout_round_trips_through_the_file_format() {
+        let sliding = BlockLayout::new(4, Some(512)).expect("4 divides 512");
+        let h = hash(91);
+        let bytes = encode_block(&h, &block_with_layout("model-a", 2, 4, 1.0, sliding));
+        let decoded = decode_block(&bytes).expect("decode");
+        let sig = decoded.block.signature.as_ref().expect("signature");
+        assert_eq!(sig.layout, sliding);
+        assert_eq!(sig.layout.sliding_window(), Some(512));
+        assert_eq!(sig.layout.block_size(), 4);
+
+        // And a full-causal block round-trips as full-causal, not as
+        // "window 0".
+        let bytes = encode_block(&h, &block("model-a", 2, 4, 1.0));
+        let decoded = decode_block(&bytes).expect("decode");
+        let sig = decoded.block.signature.as_ref().expect("signature");
+        assert_eq!(sig.layout.sliding_window(), None);
+    }
+
+    /// A file whose header records a block size that does not divide
+    /// its window could not have been written by any correct build, so
+    /// it is refused at parse time rather than reconstructed into a
+    /// layout and checked later.
+    #[test]
+    fn a_file_recording_a_mis_aligned_layout_is_refused_at_parse_time() {
+        let h = hash(92);
+        let mut bytes = encode_block(&h, &block("model-a", 2, 4, 1.0));
+        // Header sits after the fixed prefix; the window is the 7th u32
+        // after the 32-byte hash. Block size is 4, so 6 is not a
+        // multiple of it.
+        let window_at = PREFIX_LEN + 32 + 4 * 6;
+        bytes[window_at..window_at + 4].copy_from_slice(&6u32.to_le_bytes());
+        // Re-checksum, so the file fails on its layout rather than on
+        // its digest -- the point is that a *valid* file with an
+        // impossible layout is still refused.
+        let mut digest = Sha256::new();
+        digest.update(&bytes[PREFIX_LEN..]);
+        let digest: [u8; 32] = digest.finalize().into();
+        bytes[24..PREFIX_LEN].copy_from_slice(&digest);
+
+        let err = decode_block(&bytes).expect_err("6 is not a multiple of 4");
+        assert!(
+            matches!(err, BlockFormatError::BadLayout(_)),
+            "expected a layout refusal, got {err}"
+        );
     }
 
     #[test]

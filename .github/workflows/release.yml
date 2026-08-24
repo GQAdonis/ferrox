@@ -49,14 +49,29 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          FEATURES=()
+          # The downloaded `ferrox` is built WITH `serve`, so the tarball
+          # is one binary that both runs completions and serves the API.
+          # `serve` is default-off for `cargo install`, where a CLI-only
+          # user should not compile 98 extra crates and a C crypto
+          # library; someone who downloaded the release already has them.
+          CLI_FEATURES="serve"
+          SERVER_FEATURES=""
           if [[ -n "${{ matrix.features }}" ]]; then
-            FEATURES=(--features "${{ matrix.features }}")
+            CLI_FEATURES="serve ${{ matrix.features }}"
+            SERVER_FEATURES="${{ matrix.features }}"
           fi
-          cargo build --release --locked \
-            -p ferrox-cli -p ferrox-server \
+          cargo build --release --locked -p ferrox-cli \
             --target "${{ matrix.target }}" \
-            "${FEATURES[@]}"
+            --features "${CLI_FEATURES}"
+          SERVER_ARGS=()
+          if [[ -n "${SERVER_FEATURES}" ]]; then
+            SERVER_ARGS=(--features "${SERVER_FEATURES}")
+          fi
+          # Still shipped so an existing `ferrox-server` on someone's
+          # PATH keeps working after an upgrade.
+          cargo build --release --locked -p ferrox-server \
+            --target "${{ matrix.target }}" \
+            "${SERVER_ARGS[@]}"
 
       - name: Package tarball
         id: package

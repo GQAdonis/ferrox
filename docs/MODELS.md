@@ -1,7 +1,7 @@
 # Models
 
-What Ferrox can run, and how it compares to llama.cpp on the same host.
-Speed ledger: [`benchmarks/RESULTS.md`](../benchmarks/RESULTS.md)
+What Ferrox runs, and how it compares to llama.cpp on the same host.
+Speed table: [`benchmarks/RESULTS.md`](../benchmarks/RESULTS.md)
 (`ferrox bench` vs `llama-bench`). Suite list:
 [`benchmarks/suite.json`](../benchmarks/suite.json). Architecture list:
 `ferrox archs` →
@@ -9,18 +9,19 @@ Speed ledger: [`benchmarks/RESULTS.md`](../benchmarks/RESULTS.md)
 
 **Gap** = `llama / ferrox`. Values below 1.0 mean Ferrox is faster.
 
-Suite policy: keep the **current** generation per family (e.g. Llama-3.2, not
-3.1; Gemma-3/4, not Gemma-2; Phi-4, not Phi-3). Older GGUFs still load when
-the architecture is supported, they are just not in the published bench
-ledger. Add a suite entry (and a GGUF under `models/`) to measure a new model.
+Suite policy: keep the **current** generation per family. Llama-3.2, not
+3.1. Gemma-3/4, not Gemma-2. Phi-4, not Phi-3. Older GGUFs still load
+when the architecture is supported, they are simply not measured in the
+published table. To measure a new model, add a suite entry and put the
+GGUF under `models/`.
 
 ## Recommended starters
 
 | Model | Notes |
 |---|---|
-| SmolLM2-135M-Instruct Q8_0 | Tiny; Metal ahead of llama, CPU well behind |
+| SmolLM2-135M-Instruct Q8_0 | Tiny. Metal ahead of llama, CPU well behind |
 | TinyLlama-1.1B-Chat Q8_0 | Smallest verified smoke |
-| Phi-4-mini-Instruct Q4_K_M | Metal restored, the RoPE kernels now carry `n_rot` (96 of head_dim 128) and LongRoPE's `attn_factor`, and `verify --backend metal` gives identical cpu/metal ids with prefill covered. The Metal rows in `benchmarks/RESULTS.md` still predate that and were taken on the wrong graph: they are **owed a re-measurement**, not to be quoted |
+| Phi-4-mini-Instruct Q4_K_M | Metal works again. The RoPE kernels now carry `n_rot` (96 of head_dim 128) and LongRoPE's `attn_factor`, and `verify --backend metal` returns identical CPU and Metal token ids with prefill covered. The Metal rows in `benchmarks/RESULTS.md` predate that fix and were taken on the wrong graph. **Do not quote them until Phi-4 is measured again.** |
 | Llama-3.2-3B-Instruct Q4_K_M | Metal flagship in the suite |
 | Gemma-4-E2B-IT Q4_K_M | Dedicated engine + `gemma4` BPE |
 
@@ -53,9 +54,10 @@ noted). **Bold** = ferrox faster. Neither engine's thread count is forced.
 | Mistral-7B-v0.2 Q4_K_M | 1.00× | 1.17× |
 | OLMoE-1B-7B Q4_0 | 1.41× | 1.50× |
 
-Numbers drift as receipts refresh, prefer
-[`benchmarks/RESULTS.md`](../benchmarks/RESULTS.md), which is generated
-from the receipts, over this hand-written summary.
+These numbers drift as runs are refreshed.
+[`benchmarks/RESULTS.md`](../benchmarks/RESULTS.md) is generated
+straight from the raw timing files, so trust it over this hand-written
+summary.
 
 Prefill is **closed on Metal for dense models** (every dense `pp512` row
 is 1.02–1.08×). What is left on `pp512` is CPU across the board, plus
@@ -67,16 +69,16 @@ OLMoE (1.11×) and Gemma-3-1B (1.18×) on Metal.
 |---|---|
 | Yi (text) | Works (GenericGqa, Neox RoPE), not in suite yet |
 | MiroThinker | Works via `qwen3moe` |
-| Qwen2-MoE / Qwen1.5-MoE | Loads; not in current suite (OLMoE is the MoE entry) |
-| Mixtral | Suite entry; skipped on 32 GiB Host B (`--fit-host`) |
+| Qwen2-MoE / Qwen1.5-MoE | Loads. Not in the current suite (OLMoE is the MoE entry) |
+| Mixtral | In the suite, skipped on 32 GiB Host B (`--fit-host`) |
 | MLA (`deepseek2` / `mistral4`) | Dense-lead + MoE-after-dense via `MlaEngine` |
-| GLM4 / glm4moe | Loads via GLM-5.2 path when tensors present; no suite receipt |
+| GLM4 / glm4moe | Loads via the GLM-5.2 path when the tensors are there. Never measured in the suite |
 | Gemma-4-E2B | Dedicated `Gemma4Engine` + SPM-style `gemma4` BPE tokenizer + `<|turn>` chat wrap. GGUF: `models/gemma-4-E2B-it-Q4_K_M.gguf` (`unsloth/gemma-4-E2B-it-GGUF`). Suite id `gemma4_e2b_q4km`, Homebrew llama may still lack `gemma4` arch. |
-| gpt-oss | **CPU only.** Attention sinks, alternating sliding-window attention, biased router and the `swiglu_oai` clamp, checked against llama.cpp's own reference logits. Metal and the paged-KV decode path both decline it rather than compute different attention |
+| gpt-oss | **CPU only.** Attention sinks, alternating sliding-window attention, biased router and the `swiglu_oai` clamp, checked against llama.cpp's own reference logits. Metal and the paged-KV decode path both stop with an error on it, because neither computes that attention shape |
 | Llama 4 / MiniMax | **Will not load**, with the reason stated: `llama4 MoE + non-GQA attn` and `MiniMax 256-expert sigmoid MoE + MTP` |
 | Hybrid GDN / Qwen3.5 | Scaffold only |
-| Kimi K3 / GLM-5.2 / DeepSeek V4 | Loaders/primitives; no frontier e2e receipt |
-| Vision | mmproj discover + warn; `image_url` rejected |
+| Kimi K3 / GLM-5.2 / DeepSeek V4 | Loaders and primitives only. Nothing has been run end to end on a real checkpoint |
+| Vision | Finds an mmproj file and warns about it. An `image_url` in a request returns an error |
 | MTP / speculative | `--mtp` errors by design. `ferrox speculative` is prompt-lookup only (an n-gram match over the history, no draft model) and runs on **synthetic random weights**, so the hit rate it prints is not representative of a real drafter. Plan for a real one: [`docs/plans/dflash-speculative-decoding.md`](plans/dflash-speculative-decoding.md) |
 | Embeddings | `/v1/embeddings` for GGUF Decoder (mean/last pool) |
 
@@ -123,11 +125,13 @@ The error always names the reason. Four things cause it:
    unless they hold a value that changes nothing. Implementing
    `residual_scale` properly means touching every CPU residual add plus
    the fused Metal kernels that fold the residual in, and getting half
-   of that right produces exactly the silent divergence this check
-   exists to prevent.
+   of that right gives you a model that loads, runs, and returns wrong
+   answers with nothing in the output to say so. That is the outcome
+   this check exists to prevent.
 
-`FERROX_ALLOW_UNKNOWN_TENSORS=1` loads anyway and accepts wrong output.
-Use it to debug, not to work around a refusal.
+`FERROX_ALLOW_UNKNOWN_TENSORS=1` loads the checkpoint anyway and accepts
+whatever comes out. Use it while you debug, not to get past the error
+and carry on.
 
 ## Quantization support
 
@@ -139,10 +143,11 @@ Parsed and executable on CPU: `F32`, `F16`, `BF16`, `Q4_0`, `Q4_1`,
 Two caveats that matter in practice:
 
 - **The IQ codebook formats and MXFP4 are CPU-only** (scalar + AVX2, no
-  NEON and no GPU kernels). They load and produce correct output; they
-  do not go fast, and they do not run on Metal or CUDA.
-- **`I32` is recognized and sized but has no execution path.** A
-  checkpoint that needs it is refused, not silently skipped.
+  NEON and no GPU kernels). They load and produce correct output. They
+  are slow, and they do not run on Metal or CUDA at all.
+- **`I32` is recognized and sized, but nothing executes it.** A
+  checkpoint that needs it stops with an error rather than being
+  quietly skipped.
 
 `IQ2_XS`, `IQ2_S`, `IQ3_S` and `IQ1_M` were validated bit-exact against
 llama.cpp's own `dequantize_row_*` by linking `ggml-quants.c`, not by
@@ -153,8 +158,8 @@ published `UD-*` checkpoint.
 
 | Backend | What it covers |
 |---|---|
-| CPU | Dense + MoE; `FERROX_CPU_INT_DOT=1` (Q4_Kx8 / Q8_0x4 / Q5·Q6 int-dot) on suite runs |
-| Metal | Dense + MoE + FA-vec; fused MoE encode groups; `mul_mm_id` prefill; quantized KV |
+| CPU | Dense and MoE. `FERROX_CPU_INT_DOT=1` (Q4_Kx8 / Q8_0x4 / Q5·Q6 int-dot) on suite runs |
+| Metal | Dense, MoE, FA-vec, fused MoE encode groups, `mul_mm_id` prefill, quantized KV |
 | CUDA | Matvec + resident weights + FFN fuse |
 
 Capabilities overview: [`FEATURES.md`](FEATURES.md).

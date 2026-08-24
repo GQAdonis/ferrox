@@ -39,12 +39,12 @@ a binary called `ferrox` would fight over the same path in
 | `cuda` | CUDA/NVRTC kernels. Needs a CUDA toolkit at build time. |
 | `api` | Re-export `ferrox-api` (route constants + wire DTOs). |
 
-Neither GPU feature is on by default: `metal` does not build off Apple
+Neither GPU feature is on by default. `metal` does not build off Apple
 Silicon, and `cuda` needs a toolkit most machines do not have.
 
-CUDA is held to "must compile", there is no pinned benchmark host and
-no published receipts for it. Treat a Windows or Linux install as
-CPU-only in practice. See
+The bar CUDA is held to is "must compile". There is no pinned benchmark
+host for it and no published timings, so treat a Windows or Linux
+install as CPU-only in practice. See
 [`docs/FEATURES.md`](https://github.com/antonellof/ferrox/blob/main/docs/FEATURES.md).
 
 ## The rest of the workspace
@@ -63,7 +63,8 @@ CPU-only in practice. See
 
 Speed claims live in
 [`benchmarks/RESULTS.md`](https://github.com/antonellof/ferrox/blob/main/benchmarks/RESULTS.md),
-measured against llama.cpp on the same host and GGUF. If there is no
-receipt, the table says so.
+measured against llama.cpp on the same host and the same GGUF. That
+table is generated from the raw timing files each run writes, and it
+says so wherever nothing has been measured.
 
 Apache-2.0.

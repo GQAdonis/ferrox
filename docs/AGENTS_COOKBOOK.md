@@ -10,13 +10,6 @@ cargo build -p ferrox-server --release --features metal
 
 **OpenAI-compatible base URL:** `http://127.0.0.1:8383/v1`
 
-Optional browser UI:
-
-```bash
-./target/release/ferrox-server -m model.gguf
-# open http://127.0.0.1:8383/ or /ui
-```
-
 | Client | Setting |
 |---|---|
 | Cursor / OpenAI SDK | `baseURL` → `http://127.0.0.1:8383/v1` |
@@ -28,6 +21,10 @@ If `FERROX_API_KEY` is set, send `Authorization: Bearer …`.
 
 Also available: `POST /v1/tokenize`, `/v1/detokenize`, `/v1/embeddings`
 (Decoder pool), `/v1/messages` (non-stream text).
+
+For a browser client, Ferrox Studio lives in [`ui/`](../ui) as a
+separate app. This server does not serve it, and `GET /` here is a 404.
+Run `npm run dev` from that directory.
 
 ## Continuous batching
 

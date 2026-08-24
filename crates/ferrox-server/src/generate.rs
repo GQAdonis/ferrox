@@ -11,7 +11,9 @@ use std::time::{Duration, Instant};
 use ferrox_core::cache::{KvBlockPool, KvCache, KvPoolExhausted as CacheKvPoolExhausted};
 use ferrox_models::sampling::{Sampler, SamplingParams};
 use ferrox_models::tokenizer::{prepend_bos, StopTokens};
-use ferrox_models::{Decoder, Engine, PrefixCache, TextTokenizer};
+use ferrox_models::{Ceiling, Decoder, Engine, KvElem, KvShape, PrefixCache, TextTokenizer};
+
+use crate::budget::ContextCeiling;
 
 use crate::json_mode::mask_logits_for_json;
 use crate::model::ServerTokenizer;
@@ -102,6 +104,63 @@ pub struct KvPoolConfig {
 /// pool's remaining capacity in the meantime) would panic mid-decode
 /// instead of failing this request cleanly at admission time -- caught
 /// by a real panic during live testing before this fix.
+/// The typed refusal for a request the KV pool can *never* satisfy, or
+/// `None` when the pool could serve it once enough blocks come back.
+///
+/// A request holds one `KvCache` per layer and each reserves
+/// `ceil(max_seq_len / block_size)` blocks up front (see
+/// [`acquire_pooled_caches`]), so its whole-pool cost is
+/// `n_layers * blocks_per_layer`. When that exceeds
+/// `KvBlockPool::total_blocks` the request is refused by arithmetic
+/// rather than by exhaustion: an *empty* pool would refuse it
+/// identically, which is precisely the test for whether "retry shortly"
+/// is a true statement. Before this existed, such a request slept
+/// through `FERROX_KV_POOL_QUEUE_TIMEOUT_MS` and then got a 503 with a
+/// `Retry-After` that could never come good.
+///
+/// Priced in real KV bytes through `ceiling`'s `KvShape` when one is
+/// available, so the refusal names bytes rather than an opaque block
+/// count. Positions, not bytes, decide it: the pool's own ledger is in
+/// positions and this must agree with the acquisition it is predicting.
+fn pool_immovable_refusal(
+    decoder: &Decoder,
+    config: &KvPoolConfig,
+    max_seq_len: usize,
+) -> Option<DecodeError> {
+    let (block_size, total_blocks) = {
+        let pool = config.pool.lock().unwrap_or_else(|p| p.into_inner());
+        (pool.block_size(), pool.total_blocks())
+    };
+    if block_size == 0 || decoder.layers.is_empty() {
+        return None;
+    }
+    let blocks_per_layer = max_seq_len.div_ceil(block_size).max(1);
+    let needed = blocks_per_layer.saturating_mul(decoder.layers.len());
+    if needed <= total_blocks {
+        return None;
+    }
+    // The largest per-layer reservation the whole pool could cover, and
+    // therefore the longest sequence it can ever hold. Floors to zero
+    // for a pool too small for even one block per layer, which is an
+    // honest answer: such a pool serves nothing.
+    let blocks_per_layer_limit = total_blocks / decoder.layers.len();
+    let positions_limit = blocks_per_layer_limit * block_size;
+    let shape = KvShape::from_config(&decoder.config, KvElem::F32, 1);
+    Some(DecodeError::KvBudgetExceeded {
+        binding: Ceiling::DeviceMemory.code(),
+        estimated_bytes: shape.kv_bytes_for_tokens(max_seq_len),
+        limit_bytes: shape.kv_bytes_for_tokens(positions_limit),
+        positions: max_seq_len,
+        positions_limit,
+        detail: format!(
+            "request needs {needed} KV pool blocks ({max_seq_len} token positions at \
+             {block_size} per block, across {} layers) but the whole pool is {total_blocks} \
+             blocks; an idle server would refuse it identically",
+            decoder.layers.len()
+        ),
+    })
+}
+
 fn acquire_pooled_caches(
     decoder: &Decoder,
     config: &KvPoolConfig,
@@ -273,6 +332,7 @@ pub fn generate(
     params: &GenerationParams,
     kv_pool: Option<&KvPoolConfig>,
     prefix_cache: Option<&Mutex<PrefixCache>>,
+    ceiling: Option<&ContextCeiling>,
     mut emit: impl FnMut(&str),
 ) -> Result<(FinishReason, Usage), DecodeError> {
     let vocab_size = decoder.config.vocab_size;
@@ -326,6 +386,34 @@ pub fn generate(
     // silently bypass the pool's bounded-memory guarantee. Not
     // supported together yet.
     let max_seq_len = tokens.len() + params.max_tokens;
+
+    // The per-request context ceiling, checked before any KV is
+    // acquired and before a single forward pass runs. This path used to
+    // have no context ceiling at all: an oversized request either ran
+    // until something else killed it, or -- with a pool configured --
+    // waited out `queue_wait` and left with a 503 "retry shortly" about
+    // a request an idle server would refuse identically. The ceiling is
+    // the same `ContextCeiling` the batch scheduler admits on (see
+    // `crate::budget`), so the two paths cannot disagree.
+    if let Some(ceiling) = ceiling {
+        if let Some(err) = ceiling.refusal(max_seq_len) {
+            return Err(err);
+        }
+    }
+
+    // A request whose worst case exceeds the *whole* pool is not a
+    // request to retry: no amount of waiting frees blocks that do not
+    // exist. Separated from `KvPoolExhausted` (503) for exactly the
+    // reason the batch scheduler separates `kv_rejected_too_large` from
+    // `queue_rejected` -- one says "come back later", the other says
+    // "this will never work", and an operator sent to the wrong one
+    // tunes the wrong knob.
+    if let Some(config) = kv_pool {
+        if let Some(err) = pool_immovable_refusal(decoder, config, max_seq_len) {
+            return Err(err);
+        }
+    }
+
     let restored = if kv_pool.is_none() {
         prefix_cache.and_then(|pc| {
             let m = pc
@@ -845,6 +933,7 @@ mod tests {
             &greedy_params(max_tokens),
             None,
             None,
+            None,
             |s| actual_text.push_str(s),
         )
         .unwrap();
@@ -865,6 +954,7 @@ mod tests {
             &greedy_params(4),
             None,
             None,
+            None,
             |_| {},
         );
         assert!(matches!(result, Err(DecodeError::TokenOutOfVocab { .. })));
@@ -882,6 +972,7 @@ mod tests {
             None,
             &prompt,
             &greedy_params(5),
+            None,
             None,
             None,
             |s| chunks.push_str(s),
@@ -911,6 +1002,7 @@ mod tests {
             None,
             &prompt,
             &params,
+            None,
             None,
             None,
             |s| {
@@ -954,6 +1046,7 @@ mod tests {
             None,
             &prompt,
             &params,
+            None,
             None,
             None,
             |_| {},
@@ -1012,6 +1105,7 @@ mod tests {
             &greedy_params(50),
             None,
             None,
+            None,
             |_| {},
         )
         .unwrap();
@@ -1048,6 +1142,7 @@ mod tests {
             &greedy_params(50),
             None,
             None,
+            None,
             |_| {},
         )
         .unwrap();
@@ -1080,6 +1175,7 @@ mod tests {
             &greedy_params(20),
             None,
             None,
+            None,
             |s| baseline.push_str(s),
         )
         .unwrap();
@@ -1100,6 +1196,7 @@ mod tests {
                 json_object: false,
                 cancel: None,
             },
+            None,
             None,
             None,
             |s| with_unmatchable_stop.push_str(s),
@@ -1333,6 +1430,7 @@ mod tests {
             &greedy_params(20),
             None,
             None,
+            None,
             |s| baseline.push_str(s),
         )
         .unwrap();
@@ -1364,6 +1462,7 @@ mod tests {
             },
             None,
             None,
+            None,
             |s| truncated.push_str(s),
         )
         .unwrap();
@@ -1383,6 +1482,7 @@ mod tests {
             None,
             &prompt,
             &greedy_params(5),
+            None,
             None,
             None,
             |_| {},
@@ -1418,6 +1518,7 @@ mod tests {
             &greedy_params(2),
             None,
             None,
+            None,
             |_| {},
         )
         .unwrap();
@@ -1433,6 +1534,7 @@ mod tests {
             &greedy_params(2),
             None,
             Some(&pc),
+            None,
             |_| {},
         )
         .unwrap();
@@ -1449,6 +1551,7 @@ mod tests {
             &greedy_params(2),
             None,
             Some(&pc),
+            None,
             |_| {},
         )
         .unwrap();
@@ -1471,6 +1574,7 @@ mod tests {
             &greedy_params(5),
             None,
             Some(&pc),
+            None,
             |s| out1.push_str(s),
         )
         .unwrap();
@@ -1490,6 +1594,7 @@ mod tests {
             &greedy_params(5),
             None,
             Some(&pc),
+            None,
             |s| out2_with_cache.push_str(s),
         )
         .unwrap();
@@ -1505,6 +1610,7 @@ mod tests {
             None,
             &prompt2,
             &greedy_params(5),
+            None,
             None,
             None,
             |s| out2_fresh.push_str(s),
@@ -1533,6 +1639,7 @@ mod tests {
             &greedy_params(5),
             None,
             Some(&pc),
+            None,
             |s| out1.push_str(s),
         )
         .unwrap();
@@ -1554,6 +1661,7 @@ mod tests {
             &greedy_params(5),
             None,
             Some(&pc),
+            None,
             |s| out2_with_cache.push_str(s),
         )
         .unwrap();
@@ -1566,6 +1674,7 @@ mod tests {
             None,
             &prompt,
             &greedy_params(5),
+            None,
             None,
             None,
             |s| out2_fresh.push_str(s),
@@ -1592,6 +1701,7 @@ mod tests {
             &greedy_params(5),
             Some(&config),
             Some(&pc),
+            None,
             |_| {},
         )
         .unwrap();
@@ -1604,6 +1714,7 @@ mod tests {
             &greedy_params(5),
             Some(&config),
             Some(&pc),
+            None,
             |_| {},
         )
         .unwrap();
@@ -1636,6 +1747,7 @@ mod tests {
             &prompt,
             &greedy_params(5),
             Some(&config),
+            None,
             None,
             |s| out.push_str(s),
         )
@@ -1678,6 +1790,7 @@ mod tests {
             &greedy_params(max_tokens),
             Some(&config),
             None,
+            None,
             |_| {},
         )
         .unwrap();
@@ -1685,6 +1798,15 @@ mod tests {
         assert_eq!(pool.lock().unwrap().free_blocks(), 12);
     }
 
+    /// One block short of the worst case means the pool can *never*
+    /// serve this request, so the refusal is the immovable one -- a 400
+    /// naming `device_memory_budget_exceeded`, not a 503 inviting a
+    /// retry that an empty pool would refuse identically.
+    ///
+    /// Confirmed to FAIL when `pool_immovable_refusal` is removed from
+    /// `generate` (the request falls through to the acquisition and
+    /// comes back as the retryable `KvPoolExhausted`), and when its
+    /// `needed <= total_blocks` comparison is loosened to `<`.
     #[test]
     fn generate_fails_at_admission_not_mid_decode_when_the_pool_cannot_cover_the_worst_case() {
         let decoder = small_decoder(); // 2 layers
@@ -1705,9 +1827,24 @@ mod tests {
             &greedy_params(max_tokens),
             Some(&config),
             None,
+            None,
             |_| {},
         );
-        assert!(matches!(result, Err(DecodeError::KvPoolExhausted)));
+        let err = result.expect_err("11 blocks cannot cover a 12-block worst case");
+        assert!(
+            matches!(
+                &err,
+                DecodeError::KvBudgetExceeded { binding, positions, .. }
+                    if *binding == ferrox_models::Ceiling::DeviceMemory.code()
+                        && *positions == 12
+            ),
+            "expected an immovable device-memory refusal, got {err:?}"
+        );
+        assert_eq!(
+            err.retry_after_secs(),
+            None,
+            "no wait frees blocks that do not exist"
+        );
         assert_eq!(
             pool.lock().unwrap().free_blocks(),
             11,
@@ -1715,6 +1852,8 @@ mod tests {
         );
     }
 
+    /// A one-block pool cannot hold a two-layer model's caches under any
+    /// schedule, so this is the immovable refusal too.
     #[test]
     fn generate_rejects_the_request_without_leaking_blocks_when_the_pool_is_too_small() {
         let decoder = small_decoder(); // 2 layers -> needs 2 blocks, one per layer's cache
@@ -1731,9 +1870,18 @@ mod tests {
             &greedy_params(5),
             Some(&config),
             None,
+            None,
             |_| {},
         );
-        assert!(matches!(result, Err(DecodeError::KvPoolExhausted)));
+        let err = result.expect_err("one block cannot hold two layers' caches");
+        assert!(
+            matches!(
+                &err,
+                DecodeError::KvBudgetExceeded { binding, .. }
+                    if *binding == ferrox_models::Ceiling::DeviceMemory.code()
+            ),
+            "expected an immovable device-memory refusal, got {err:?}"
+        );
         assert_eq!(
             pool.lock().unwrap().free_blocks(),
             1,
@@ -1762,6 +1910,7 @@ mod tests {
                 &greedy_params(5),
                 Some(&config),
                 None,
+                None,
                 |_| {},
             )
             .unwrap();
@@ -1770,13 +1919,32 @@ mod tests {
         assert_eq!(pool.lock().unwrap().free_blocks(), 2);
     }
 
+    /// `queue_wait = 0` must reject on the first failed attempt rather
+    /// than retry.
+    ///
+    /// The pool here is big enough for the request and *momentarily*
+    /// held by someone else, which is the only situation in which
+    /// `KvPoolExhausted` is an honest answer: a pool permanently too
+    /// small is refused earlier, by `pool_immovable_refusal`, and would
+    /// make the timing assertion below vacuous.
     #[test]
     fn generate_with_zero_queue_wait_rejects_immediately() {
         let decoder = small_decoder(); // 2 layers -> needs 2 blocks
         let prompt = String::from_utf8(vec![1u8, 2]).unwrap();
-        let pool = Arc::new(Mutex::new(KvBlockPool::new(64, 1))); // too small for 2 layers
-        let config = pool_config(pool, Duration::ZERO);
+        let pool = Arc::new(Mutex::new(KvBlockPool::new(64, 2)));
 
+        // Another in-flight request holding both blocks for longer than
+        // this request is willing to wait for them.
+        let holder_pool = pool.clone();
+        let holder = std::thread::spawn(move || {
+            let mut held = KvCache::with_pool(1, 1, holder_pool, 0).unwrap();
+            held.push(&[0.0], &[0.0]).unwrap(); // crosses into the second block
+            std::thread::sleep(Duration::from_millis(200));
+            drop(held);
+        });
+        std::thread::sleep(Duration::from_millis(15));
+
+        let config = pool_config(pool, Duration::ZERO);
         let started = Instant::now();
         let result = generate(
             &decoder,
@@ -1787,14 +1955,123 @@ mod tests {
             &greedy_params(5),
             Some(&config),
             None,
+            None,
             |_| {},
         );
-        assert!(matches!(result, Err(DecodeError::KvPoolExhausted)));
+        assert!(
+            matches!(result, Err(DecodeError::KvPoolExhausted)),
+            "a pool that could serve this request once its holder lets go is momentary \
+             exhaustion, which is retryable"
+        );
         assert!(
             started.elapsed() < Duration::from_millis(50),
             "queue_wait=0 must reject on the first attempt, not retry: took {:?}",
             started.elapsed()
         );
+        holder.join().unwrap();
+    }
+
+    /// The private path's context ceiling, and the property that makes
+    /// it worth having: the refusal happens before any KV is acquired
+    /// and before a single forward pass runs.
+    ///
+    /// Confirmed to FAIL when the `ceiling.refusal` block is removed
+    /// from `generate` -- the request then runs to completion and
+    /// returns `Ok`.
+    #[test]
+    fn a_request_past_the_context_ceiling_is_refused_before_any_kv_is_acquired() {
+        let decoder = small_decoder();
+        let prompt = String::from_utf8(vec![1u8, 2]).unwrap();
+        let pool = Arc::new(Mutex::new(KvBlockPool::new(64, 64)));
+        let config = pool_config(pool.clone(), Duration::ZERO);
+        let shape = KvShape::from_config(&decoder.config, KvElem::F32, 1);
+        // Prompt is 2 tokens, max_tokens is 5, so the request asks for
+        // 7 positions against a ceiling of 4.
+        let ceiling = ContextCeiling::new(Some(4), shape);
+
+        let err = generate(
+            &decoder,
+            &ServerTokenizer::Byte,
+            &StopTokens::default(),
+            None,
+            &prompt,
+            &greedy_params(5),
+            Some(&config),
+            None,
+            Some(&ceiling),
+            |_| panic!("no token may be emitted by a refused request"),
+        )
+        .expect_err("7 positions must not be admitted under a 4-position ceiling");
+        match &err {
+            DecodeError::KvBudgetExceeded {
+                binding,
+                positions,
+                positions_limit,
+                estimated_bytes,
+                limit_bytes,
+                ..
+            } => {
+                assert_eq!(*binding, ferrox_models::Ceiling::ContextLength.code());
+                assert_eq!(*positions, 7);
+                assert_eq!(*positions_limit, 4);
+                assert_eq!(*estimated_bytes, shape.kv_bytes_for_tokens(7));
+                assert_eq!(*limit_bytes, shape.kv_bytes_for_tokens(4));
+            }
+            other => panic!("expected a context-length refusal, got {other:?}"),
+        }
+        assert_eq!(err.retry_after_secs(), None, "a 400, not a retryable 503");
+        assert_eq!(
+            pool.lock().unwrap().free_blocks(),
+            64,
+            "the refusal must land before any block is taken"
+        );
+        assert_eq!(ceiling.refused(), 1);
+    }
+
+    /// A request that fits the ceiling is untouched by it: the same
+    /// request that runs without a ceiling runs with one.
+    ///
+    /// Without this, a ceiling that refused everything would still pass
+    /// the test above.
+    #[test]
+    fn a_request_inside_the_ceiling_is_admitted_unchanged() {
+        let decoder = small_decoder();
+        let prompt = String::from_utf8(vec![1u8, 2]).unwrap();
+        let shape = KvShape::from_config(&decoder.config, KvElem::F32, 1);
+        let ceiling = ContextCeiling::new(Some(7), shape);
+
+        let mut with = String::new();
+        let (finish, _usage) = generate(
+            &decoder,
+            &ServerTokenizer::Byte,
+            &StopTokens::default(),
+            None,
+            &prompt,
+            &greedy_params(5),
+            None,
+            None,
+            Some(&ceiling),
+            |s| with.push_str(s),
+        )
+        .expect("7 positions fits a 7-position ceiling exactly");
+        assert_eq!(finish, FinishReason::Length);
+
+        let mut without = String::new();
+        generate(
+            &decoder,
+            &ServerTokenizer::Byte,
+            &StopTokens::default(),
+            None,
+            &prompt,
+            &greedy_params(5),
+            None,
+            None,
+            None,
+            |s| without.push_str(s),
+        )
+        .unwrap();
+        assert_eq!(with, without, "an unbinding ceiling must change nothing");
+        assert_eq!(ceiling.refused(), 0);
     }
 
     #[test]
@@ -1825,6 +2102,7 @@ mod tests {
             &prompt,
             &greedy_params(5),
             Some(&config),
+            None,
             None,
             |_| {},
         )

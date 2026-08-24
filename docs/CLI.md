@@ -80,7 +80,7 @@ Same via explicit subcommand: `ferrox run -m …`.
 
 Stderr prints load and throughput timings. Generated text goes to stdout.
 
-**Speculative decoding:** prompt-lookup demo via `ferrox speculative` (no draft model). `--mtp` is reserved for future MiniMax/GLM MTP draft heads (`num_nextn_predict_layers`) and currently errors.
+**Speculative decoding:** prompt-lookup demo via `ferrox speculative` (no draft model), which reports acceptance length and the per-position accept rate alongside the call counts. Verification uses the speculative-sampling rejection rule, so it is lossless at any temperature, not only at `--temp 0`. Drafters plug in through the `Drafter` trait (`ferrox_models::speculative`); `--mtp` is reserved for future MiniMax/GLM MTP draft heads (`num_nextn_predict_layers`) and currently errors.
 
 `--device none` (or `cpu`) and `-ngl 0` force CPU. Default is
 `--device auto -ngl auto`. Any positive `-ngl`, `auto`, or `all` enables

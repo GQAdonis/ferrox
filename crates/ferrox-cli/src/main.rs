@@ -388,6 +388,10 @@ const SUBCOMMANDS: &[&str] = &[
     "help",
 ];
 
+/// Root flags that take no value and may legally appear *before* a
+/// subcommand, because clap declares them `global = true`.
+const GLOBAL_FLAGS: &[&str] = &["--allow-multiple-instances"];
+
 /// Rewrite `ferrox -m …` into `ferrox run -m …` so llama.cpp-style
 /// top-level flags work without typing the `run` subcommand.
 fn rewrite_llama_style_argv(args: Vec<String>) -> Vec<String> {
@@ -402,7 +406,21 @@ fn rewrite_llama_style_argv(args: Vec<String>) -> Vec<String> {
     if args.len() < 2 {
         return args;
     }
-    let first = args[1].as_str();
+    // A `global = true` flag is allowed to precede the subcommand it
+    // applies to, so `ferrox --allow-multiple-instances serve` has to
+    // find `serve` at position 2. Without this skip the rewriter sees a
+    // flag, assumes llama.cpp style, and produces `ferrox run
+    // --allow-multiple-instances serve …`, which dies on "unexpected
+    // argument 'serve'". Only value-less root flags belong in this list
+    // -- one that took a value would make position 2 its value, not a
+    // subcommand.
+    let first_word = args
+        .iter()
+        .skip(1)
+        .position(|a| !GLOBAL_FLAGS.contains(&a.as_str()))
+        .map(|offset| offset + 1)
+        .unwrap_or(1);
+    let first = args[first_word].as_str();
     if SUBCOMMANDS.contains(&first)
         || first == "-h"
         || first == "--help"
@@ -1392,6 +1410,100 @@ mod cli_tests {
         };
 
         assert_eq!(via_cli, standalone);
+    }
+
+    /// `--allow-multiple-instances` is declared `global = true`, so both
+    /// sides of the subcommand are legal places to type it and both have
+    /// to reach the server -- if the leading form silently did nothing,
+    /// the server would refuse to start on a host where the operator
+    /// had already said a second instance was fine.
+    ///
+    /// Two mechanisms make it work, one of them not ours: the argv
+    /// rewriter must not mistake the leading flag for llama.cpp-style
+    /// argv (it used to, see the test below), and clap propagates the
+    /// root global's *value* into the subcommand's own flag because both
+    /// carry the id `allow_multiple_instances`. That second half is
+    /// clap's behaviour, not a guarantee we wrote, which is exactly why
+    /// it is pinned here: rename either side and this test fails while
+    /// nothing else would.
+    #[cfg(feature = "serve")]
+    #[test]
+    fn allow_multiple_instances_reaches_serve_from_either_side_of_the_subcommand() {
+        use clap::Parser;
+        let expected = ferrox_server::ServerArgs::try_parse_from([
+            "ferrox-server",
+            "-m",
+            "model.gguf",
+            "--allow-multiple-instances",
+        ])
+        .unwrap();
+
+        for argv in [
+            &[
+                "ferrox",
+                "serve",
+                "-m",
+                "model.gguf",
+                "--allow-multiple-instances",
+            ][..],
+            &[
+                "ferrox",
+                "--allow-multiple-instances",
+                "serve",
+                "-m",
+                "model.gguf",
+            ][..],
+        ] {
+            let cli = parse_cli(rewrite(argv));
+            assert!(
+                cli.allow_multiple_instances,
+                "`{}` did not set the root flag",
+                argv.join(" ")
+            );
+            let super::Commands::Serve(args) = cli.command else {
+                panic!("`{}` did not parse as the serve subcommand", argv.join(" "));
+            };
+            assert_eq!(
+                args,
+                expected,
+                "`{}` did not reach the server as an opt-in",
+                argv.join(" ")
+            );
+        }
+    }
+
+    /// The rewriter half of the above, stated on its own: a global flag
+    /// before the subcommand must not turn the subcommand into an
+    /// argument of an implicit `run`.
+    #[test]
+    fn a_global_flag_before_a_subcommand_does_not_trigger_the_run_rewrite() {
+        assert_eq!(
+            rewrite(&[
+                "ferrox",
+                "--allow-multiple-instances",
+                "serve",
+                "-m",
+                "x.gguf"
+            ]),
+            [
+                "ferrox",
+                "--allow-multiple-instances",
+                "serve",
+                "-m",
+                "x.gguf"
+            ]
+        );
+        // …and llama.cpp-style argv behind the same flag still gets it.
+        assert_eq!(
+            rewrite(&["ferrox", "--allow-multiple-instances", "-m", "x.gguf"]),
+            [
+                "ferrox",
+                "run",
+                "--allow-multiple-instances",
+                "-m",
+                "x.gguf"
+            ]
+        );
     }
 
     /// `--list-devices` is the flag that is easiest to lose, because it

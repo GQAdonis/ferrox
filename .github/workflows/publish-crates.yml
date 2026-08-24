@@ -89,7 +89,14 @@ jobs:
           #   core                            <- gguf, quant, (cuda, metal)
           #   moe                             <- core, quant
           #   models                          <- core, moe, gguf, quant, safetensors
-          #   cli, server, inference          <- the above
+          #   server                          <- the above
+          #   cli                             <- server, for the optional
+          #                                      `serve` feature. Publishing
+          #                                      cli first fails to resolve
+          #                                      ferrox-server at the new
+          #                                      version, which is exactly
+          #                                      how v0.11.0 broke.
+          #   inference                       <- the whole stack
           CRATES=(
             ferrox-api
             ferrox-gguf
@@ -100,13 +107,13 @@ jobs:
             ferrox-core
             ferrox-moe
             ferrox-models
-            ferrox-cli
             ferrox-server
+            ferrox-cli
             ferrox-inference
           )
 
           if [[ "${DRY_RUN}" == "1" ]]; then
-            echo "DRY RUN — packaging, uploading nothing"
+            echo "DRY RUN, packaging, uploading nothing"
             blocked=0
             for c in "${CRATES[@]}"; do
               echo "::group::dry-run ${c}"
@@ -124,7 +131,7 @@ jobs:
               # treated as a failure. Anything else is a real failure.
               if ! out="$(cargo publish -p "${c}" --dry-run --locked --no-verify 2>&1)"; then
                 if grep -q 'no matching package named `ferrox-' <<<"${out}"; then
-                  echo "${c}: cannot be packaged until its ferrox-* deps are on crates.io at this version — expected on a first publish"
+                  echo "${c}: cannot be packaged until its ferrox-* deps are on crates.io at this version, expected on a first publish"
                   blocked=$((blocked + 1))
                 else
                   echo "${out}"
@@ -159,7 +166,7 @@ jobs:
             # finished, because the first crate always 403s.
             if curl -sf -H "User-Agent: ferrox-ci" \
                  "https://crates.io/api/v1/crates/${c}/${version}" >/dev/null; then
-              echo "${c} ${version} is already published — skipping"
+              echo "${c} ${version} is already published, skipping"
               echo "::endgroup::"
               continue
             fi

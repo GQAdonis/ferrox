@@ -52,6 +52,7 @@ mod model;
 mod openai_extra;
 mod security;
 mod session;
+mod sse;
 mod stats;
 mod stop;
 mod tasks;
@@ -2163,6 +2164,11 @@ async fn chat_completions_stream(
         // id back out of the cancel registry.
         let _cancel_guard = cancel_guard;
         let tx_chunks = tx.clone();
+        // The orphan deadline (see `crate::sse`): a client that is
+        // neither reading nor disconnected must not park this blocking
+        // thread -- and the model handle and cancel guard it holds --
+        // for the life of the process.
+        let orphan_timeout = sse::orphan_timeout_from_env();
         let mut first = true;
         let head_request_id = request_id.clone();
         let result = run_generation_emit(
@@ -2204,10 +2210,17 @@ async fn chat_completions_stream(
                 // hundreds of tokens into nothing. Flipping the same
                 // flag `/v1/cancel` sets means there is one stop path,
                 // not two.
-                if tx_chunks
-                    .blocking_send(Ok(Event::default().json_data(payload).unwrap()))
-                    .is_err()
-                {
+                if let Err(why) = sse::send_or_orphan(
+                    &tx_chunks,
+                    Ok(Event::default().json_data(payload).unwrap()),
+                    orphan_timeout,
+                ) {
+                    if why == sse::SendFailure::Orphaned {
+                        tracing::warn!(
+                            "SSE stream {head_request_id} accepted nothing for the orphan \
+                             deadline; treating it as abandoned and cancelling the generation"
+                        );
+                    }
                     cancel_token.cancel();
                 }
             },
@@ -2263,7 +2276,11 @@ async fn chat_completions_stream(
                             }],
                             usage: None,
                         };
-                        let _ = tx.blocking_send(Ok(Event::default().json_data(payload).unwrap()));
+                        let _ = sse::send_or_orphan(
+                            &tx,
+                            Ok(Event::default().json_data(payload).unwrap()),
+                            orphan_timeout,
+                        );
                     } else if !full_text.is_empty() {
                         let payload = ChatCompletionChunk {
                             id: request_id.clone(),
@@ -2281,7 +2298,11 @@ async fn chat_completions_stream(
                             }],
                             usage: None,
                         };
-                        let _ = tx.blocking_send(Ok(Event::default().json_data(payload).unwrap()));
+                        let _ = sse::send_or_orphan(
+                            &tx,
+                            Ok(Event::default().json_data(payload).unwrap()),
+                            orphan_timeout,
+                        );
                     }
                 }
                 let final_finish_reason = if tool_call.is_some() {
@@ -2305,8 +2326,13 @@ async fn chat_completions_stream(
                     }],
                     usage: Some(usage.clone()),
                 };
-                let _ = tx.blocking_send(Ok(Event::default().json_data(final_payload).unwrap()));
-                let _ = tx.blocking_send(Ok(Event::default().data("[DONE]")));
+                let _ = sse::send_or_orphan(
+                    &tx,
+                    Ok(Event::default().json_data(final_payload).unwrap()),
+                    orphan_timeout,
+                );
+                let _ =
+                    sse::send_or_orphan(&tx, Ok(Event::default().data("[DONE]")), orphan_timeout);
                 // Recorded here rather than where the handler returned:
                 // the handler returns as soon as the SSE headers go out,
                 // which is before a single token exists, so timing it
@@ -2351,8 +2377,13 @@ async fn chat_completions_stream(
                     }],
                     usage: None,
                 };
-                let _ = tx.blocking_send(Ok(Event::default().json_data(payload).unwrap()));
-                let _ = tx.blocking_send(Ok(Event::default().data("[DONE]")));
+                let _ = sse::send_or_orphan(
+                    &tx,
+                    Ok(Event::default().json_data(payload).unwrap()),
+                    orphan_timeout,
+                );
+                let _ =
+                    sse::send_or_orphan(&tx, Ok(Event::default().data("[DONE]")), orphan_timeout);
             }
         }
     });

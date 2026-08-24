@@ -36,6 +36,7 @@
 
 mod admin;
 mod anthropic;
+mod attribution;
 mod batch_scheduler;
 mod cache;
 mod cancel;
@@ -734,23 +735,13 @@ impl AppState {
     }
 
     /// Records one finished request in the `/admin/stats` ring buffer.
-    pub(crate) fn record_request(
-        &self,
-        request_id: &str,
-        route: &str,
-        status: u16,
-        stream: bool,
-        duration_ms: u64,
-        usage: Option<&ferrox_api::Usage>,
-    ) {
-        self.stats.record(stats::entry(
-            request_id,
-            route,
-            status,
-            stream,
-            duration_ms,
-            usage,
-        ));
+    ///
+    /// `attribution` is threaded from the request's own headers rather
+    /// than looked up here: by the time a generation task finishes, the
+    /// request parts are long gone, and reconstructing "who was that"
+    /// afterwards is exactly the guessing the monitor exists to avoid.
+    pub(crate) fn record_request(&self, record: stats::Record<'_>) {
+        self.stats.record(stats::entry(record));
     }
 }
 
@@ -1932,8 +1923,10 @@ fn inject_json_object_system_hint(messages: &mut Vec<ChatMessage>) {
 
 async fn chat_completions(
     State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
     Json(req): Json<ChatCompletionRequest>,
 ) -> Response {
+    let attribution = attribution::Attribution::from_headers(&headers);
     state
         .requests_total
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1950,25 +1943,38 @@ async fn chat_completions(
             .request_errors_total
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let response = err.into_response();
-        state.record_request(
-            &request_id,
-            ferrox_api::routes::V1_CHAT_COMPLETIONS,
-            response.status().as_u16(),
+        state.record_request(stats::Record {
+            request_id: &request_id,
+            route: ferrox_api::routes::V1_CHAT_COMPLETIONS,
+            status: response.status().as_u16(),
             stream,
-            started.elapsed().as_millis() as u64,
-            None,
-        );
+            duration_ms: started.elapsed().as_millis() as u64,
+            usage: None,
+            attribution: &attribution,
+        });
         return response;
     }
 
     let response = if stream {
-        chat_completions_stream(Arc::clone(&state), req, request_id.clone(), started)
-            .await
-            .into_response()
+        chat_completions_stream(
+            Arc::clone(&state),
+            req,
+            request_id.clone(),
+            started,
+            attribution.clone(),
+        )
+        .await
+        .into_response()
     } else {
-        chat_completions_full(Arc::clone(&state), req, request_id.clone(), started)
-            .await
-            .into_response()
+        chat_completions_full(
+            Arc::clone(&state),
+            req,
+            request_id.clone(),
+            started,
+            attribution.clone(),
+        )
+        .await
+        .into_response()
     };
 
     if response.status().is_client_error() || response.status().is_server_error() {
@@ -1978,14 +1984,15 @@ async fn chat_completions(
         // Only failures are recorded here. A success has already
         // recorded itself from the path that knows the token counts --
         // and, for a stream, that has not even happened yet.
-        state.record_request(
-            &request_id,
-            ferrox_api::routes::V1_CHAT_COMPLETIONS,
-            response.status().as_u16(),
+        state.record_request(stats::Record {
+            request_id: &request_id,
+            route: ferrox_api::routes::V1_CHAT_COMPLETIONS,
+            status: response.status().as_u16(),
             stream,
-            started.elapsed().as_millis() as u64,
-            None,
-        );
+            duration_ms: started.elapsed().as_millis() as u64,
+            usage: None,
+            attribution: &attribution,
+        });
     }
     state.mark_request_finished();
 
@@ -1997,6 +2004,7 @@ async fn chat_completions_full(
     req: ChatCompletionRequest,
     request_id: String,
     started: std::time::Instant,
+    attribution: attribution::Attribution,
 ) -> Result<Json<ChatCompletionResponse>, ApiError> {
     let tools_active = req.tools_active();
     // Cloned once, up front: this request decodes against exactly this
@@ -2072,14 +2080,15 @@ async fn chat_completions_full(
     let (message, finish_reason) =
         build_response_message(content, tools_active, completion.finish.as_str());
 
-    state.record_request(
-        &request_id,
-        ferrox_api::routes::V1_CHAT_COMPLETIONS,
-        200,
-        false,
-        started.elapsed().as_millis() as u64,
-        Some(&completion.usage),
-    );
+    state.record_request(stats::Record {
+        request_id: &request_id,
+        route: ferrox_api::routes::V1_CHAT_COMPLETIONS,
+        status: 200,
+        stream: false,
+        duration_ms: started.elapsed().as_millis() as u64,
+        usage: Some(&completion.usage),
+        attribution: &attribution,
+    });
 
     Ok(Json(ChatCompletionResponse {
         id: request_id.clone(),
@@ -2101,6 +2110,7 @@ async fn chat_completions_stream(
     req: ChatCompletionRequest,
     request_id: String,
     started: std::time::Instant,
+    attribution: attribution::Attribution,
 ) -> Result<Response, ApiError> {
     // Streaming requests are never served from or written to the response cache.
     let tools_active = req.tools_active();
@@ -2287,14 +2297,15 @@ async fn chat_completions_stream(
                 // the handler returns as soon as the SSE headers go out,
                 // which is before a single token exists, so timing it
                 // there would report every stream as instant.
-                stats_state.record_request(
-                    &request_id,
-                    ferrox_api::routes::V1_CHAT_COMPLETIONS,
-                    200,
-                    true,
-                    started.elapsed().as_millis() as u64,
-                    Some(&usage),
-                );
+                stats_state.record_request(stats::Record {
+                    request_id: &request_id,
+                    route: ferrox_api::routes::V1_CHAT_COMPLETIONS,
+                    status: 200,
+                    stream: true,
+                    duration_ms: started.elapsed().as_millis() as u64,
+                    usage: Some(&usage),
+                    attribution: &attribution,
+                });
             }
             Err(e) => {
                 tracing::warn!("decode error on streamed request {request_id}: {e}");
@@ -2303,14 +2314,15 @@ async fn chat_completions_stream(
                 // The monitor records outcomes, and a 200 row with zero
                 // tokens would read as a successful empty answer, so the
                 // failure is stated as 500 here and only here.
-                stats_state.record_request(
-                    &request_id,
-                    ferrox_api::routes::V1_CHAT_COMPLETIONS,
-                    500,
-                    true,
-                    started.elapsed().as_millis() as u64,
-                    None,
-                );
+                stats_state.record_request(stats::Record {
+                    request_id: &request_id,
+                    route: ferrox_api::routes::V1_CHAT_COMPLETIONS,
+                    status: 500,
+                    stream: true,
+                    duration_ms: started.elapsed().as_millis() as u64,
+                    usage: None,
+                    attribution: &attribution,
+                });
                 let payload = ChatCompletionChunk {
                     id: request_id.clone(),
                     request_id: pending_request_id.take(),
@@ -3183,6 +3195,16 @@ async fn run(mcp_config_path: Option<PathBuf>, exit_on_stdin_close: bool) -> any
             .allow_headers([
                 axum::http::header::CONTENT_TYPE,
                 axum::http::header::AUTHORIZATION,
+                // The self-declared client label the monitor records
+                // (see `attribution`). A custom header makes every
+                // cross-origin call preflighted, so omitting it here
+                // would not merely drop the label -- it would fail the
+                // request outright.
+                axum::http::HeaderName::from_static(attribution::CLIENT_HEADER),
+                // Set by hand rather than by `EventSource`, because
+                // this API needs POST and a bearer token. Same
+                // consequence if it is missing.
+                axum::http::HeaderName::from_static("last-event-id"),
             ]);
         protected = protected.route_layer(cors);
     }
@@ -3678,6 +3700,226 @@ mod tests {
         assert_eq!(recent[0]["completion_tokens"], 0);
         assert!(recent[0]["decode_ms"].is_null());
         assert_eq!(stats["errors_total"], 1);
+    }
+
+    /// POSTs with caller-supplied headers, so the attribution tests
+    /// exercise the same header parsing a real client's request goes
+    /// through rather than calling `Attribution::from_headers` twice.
+    async fn post_json_with_headers(
+        app: &Router,
+        uri: &str,
+        body: serde_json::Value,
+        headers: &[(&str, &str)],
+    ) -> (StatusCode, serde_json::Value) {
+        use http_body_util::BodyExt;
+        use tower::ServiceExt;
+
+        let mut builder = axum::http::Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("content-type", "application/json");
+        for (name, value) in headers {
+            builder = builder.header(*name, *value);
+        }
+        let response = app
+            .clone()
+            .oneshot(
+                builder
+                    .body(axum::body::Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let json = serde_json::from_slice(&bytes).unwrap_or(serde_json::json!({}));
+        (status, json)
+    }
+
+    /// The three small endpoints used to be served and never recorded,
+    /// which made the monitor wrong rather than incomplete: an editor
+    /// hammering `/v1/embeddings` showed up as an idle server.
+    #[tokio::test]
+    async fn tokenize_detokenize_and_embeddings_all_land_in_the_ring() {
+        let app = test_app();
+
+        let (status, _) = post_json_uri(
+            &app,
+            ferrox_api::routes::V1_TOKENIZE,
+            serde_json::json!({"prompt": "hello"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, _) = post_json_uri(
+            &app,
+            ferrox_api::routes::V1_DETOKENIZE,
+            serde_json::json!({"tokens": [104, 105]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, _) = post_json_uri(
+            &app,
+            ferrox_api::routes::V1_EMBEDDINGS,
+            serde_json::json!({"input": "hello"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let (_, stats) = get_json(&app, ferrox_api::routes::ADMIN_STATS).await;
+        let routes: Vec<&str> = stats["recent"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["route"].as_str().unwrap())
+            .collect();
+        for expected in [
+            ferrox_api::routes::V1_TOKENIZE,
+            ferrox_api::routes::V1_DETOKENIZE,
+            ferrox_api::routes::V1_EMBEDDINGS,
+        ] {
+            assert!(
+                routes.contains(&expected),
+                "{expected} is missing: {routes:?}"
+            );
+        }
+
+        let row = |route: &str| {
+            stats["recent"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|r| r["route"] == route)
+                .cloned()
+                .unwrap()
+        };
+        // Embeddings run a forward pass, so their prompt tokens are
+        // real prompt tokens. There is no decode loop, so `decode_ms`
+        // stays null instead of borrowing the total.
+        let embed = row(ferrox_api::routes::V1_EMBEDDINGS);
+        assert!(embed["prompt_tokens"].as_u64().unwrap() > 0);
+        assert!(embed["decode_ms"].is_null());
+        assert_eq!(embed["completion_tokens"], 0);
+        // Tokenizing runs the tokenizer and not the model, so it
+        // contributes nothing to the token counters those counters
+        // claim to measure.
+        assert_eq!(row(ferrox_api::routes::V1_TOKENIZE)["prompt_tokens"], 0);
+        assert_eq!(
+            stats["tokens_prompt_total"].as_u64().unwrap(),
+            embed["prompt_tokens"].as_u64().unwrap(),
+            "only the forward pass counted"
+        );
+    }
+
+    /// A failed small-endpoint call is still traffic. A 400 that leaves
+    /// no row is indistinguishable from a request that was never sent.
+    #[tokio::test]
+    async fn a_rejected_embeddings_request_is_recorded_with_its_status() {
+        let app = test_app();
+        let (status, _) = post_json_uri(
+            &app,
+            ferrox_api::routes::V1_EMBEDDINGS,
+            serde_json::json!({"input": "hi", "encoding_format": "base64"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        let (_, stats) = get_json(&app, ferrox_api::routes::ADMIN_STATS).await;
+        let recent = stats["recent"].as_array().unwrap();
+        assert_eq!(recent.len(), 1);
+        assert_eq!(recent[0]["route"], ferrox_api::routes::V1_EMBEDDINGS);
+        assert_eq!(recent[0]["status"], 400);
+        assert_eq!(
+            recent[0]["prompt_tokens"], 0,
+            "a rejected call embedded nothing"
+        );
+    }
+
+    /// Attribution: which key served a request, and what the caller
+    /// says it is. The key itself must never appear.
+    #[tokio::test]
+    async fn a_row_names_the_key_that_served_it_without_carrying_the_key() {
+        let app = test_app();
+        let key = "sk-monitor-secret";
+        let (status, _) = post_json_with_headers(
+            &app,
+            "/v1/chat/completions",
+            serde_json::json!({
+                "model": "x",
+                "messages": [{"role": "user", "content": "hi"}],
+                "max_tokens": 2
+            }),
+            &[
+                ("authorization", &format!("Bearer {key}")),
+                ("x-ferrox-client", "ferrox-studio"),
+            ],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let (_, stats) = get_json(&app, ferrox_api::routes::ADMIN_STATS).await;
+        let row = stats["recent"].as_array().unwrap()[0].clone();
+        let fingerprint = row["via_api_key"]
+            .as_str()
+            .expect("the row names the key that served it")
+            .to_string();
+        assert_eq!(fingerprint, attribution::key_fingerprint(key));
+        assert!(!fingerprint.contains(key));
+        assert!(
+            !serde_json::to_string(&stats).unwrap().contains(key),
+            "the stats payload must not carry the key in any form"
+        );
+        assert_eq!(row["client"], "ferrox-studio");
+    }
+
+    /// Two different keys are two different callers, and no key at all
+    /// is a third answer -- not a copy of either.
+    #[tokio::test]
+    async fn different_keys_are_different_callers_and_no_key_is_null() {
+        let app = test_app();
+        let body = serde_json::json!({
+            "model": "x",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 1
+        });
+        for headers in [
+            vec![("authorization", "Bearer key-one")],
+            vec![("authorization", "Bearer key-two")],
+            vec![],
+        ] {
+            let (status, _) =
+                post_json_with_headers(&app, "/v1/chat/completions", body.clone(), &headers).await;
+            assert_eq!(status, StatusCode::OK);
+        }
+
+        let (_, stats) = get_json(&app, ferrox_api::routes::ADMIN_STATS).await;
+        let recent = stats["recent"].as_array().unwrap();
+        assert_eq!(recent.len(), 3);
+        let one = recent[0]["via_api_key"].as_str().unwrap();
+        let two = recent[1]["via_api_key"].as_str().unwrap();
+        assert_ne!(one, two, "two keys must not collapse into one caller");
+        assert!(
+            recent[2]["via_api_key"].is_null(),
+            "an unauthenticated call is null, not a fingerprint of nothing"
+        );
+        assert!(recent[2]["client"].is_null());
+    }
+
+    /// The queue gauge reports a queue that exists or says there is
+    /// none. `0` would claim an empty queue was measured.
+    #[tokio::test]
+    async fn the_queue_gauge_is_null_when_nothing_can_queue() {
+        let app = test_app();
+        let (status, stats) = get_json(&app, ferrox_api::routes::ADMIN_STATS).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            stats["queue_depth"].is_null(),
+            "without continuous batching nothing queues, so there is nothing to measure"
+        );
+        assert!(stats["queue_rejected_total"].is_null());
+        assert_eq!(
+            stats["generating_now"], 0,
+            "work in progress is measured and really is zero here"
+        );
     }
 
     /// An empty task list is a list, not a missing key -- the UI renders

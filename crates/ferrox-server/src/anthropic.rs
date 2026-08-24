@@ -145,8 +145,10 @@ fn stop_reason(finish: FinishReason) -> &'static str {
 
 pub async fn messages(
     State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
     Json(req): Json<MessagesRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    let attribution = crate::attribution::Attribution::from_headers(&headers);
     let _ = req.metadata;
     // Same server-assigned id scheme as /v1/chat/completions, so one
     // ring buffer keys both surfaces the same way.
@@ -226,14 +228,15 @@ pub async fn messages(
     .map_err(decode_error_response)?;
 
     let text = chunks.concat();
-    state.record_request(
-        &request_id,
-        ferrox_api::routes::V1_MESSAGES,
-        200,
-        false,
-        started.elapsed().as_millis() as u64,
-        Some(&usage),
-    );
+    state.record_request(crate::stats::Record {
+        request_id: &request_id,
+        route: ferrox_api::routes::V1_MESSAGES,
+        status: 200,
+        stream: false,
+        duration_ms: started.elapsed().as_millis() as u64,
+        usage: Some(&usage),
+        attribution: &attribution,
+    });
     Ok(Json(serde_json::json!({
         "id": "msg_ferrox_0",
         "type": "message",

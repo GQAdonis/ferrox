@@ -9,11 +9,44 @@ use axum::Json;
 use ferrox_models::sampling::SamplingParams;
 use serde::Deserialize;
 
+use crate::attribution::Attribution;
 use crate::generate::{FinishReason, GenerationParams};
 use crate::{
     decode_error_response, join_error_response, run_generation, unsupported_feature, ApiError,
     AppState,
 };
+
+/// Records one of the small endpoints in the `/admin/stats` ring, with
+/// the status the caller actually saw.
+///
+/// These three used not to be recorded at all, which made the monitor
+/// quietly wrong rather than merely incomplete: an editor hammering
+/// `/v1/embeddings` showed up as an idle server. A failure is recorded
+/// with its own status for the same reason -- a 400 that leaves no
+/// trace is indistinguishable from a request that was never sent.
+fn record_outcome<T>(
+    state: &AppState,
+    request_id: &str,
+    route: &str,
+    started: std::time::Instant,
+    result: &Result<T, ApiError>,
+    usage: Option<&ferrox_api::Usage>,
+    attribution: &Attribution,
+) {
+    let status = match result {
+        Ok(_) => 200,
+        Err((code, _)) => code.as_u16(),
+    };
+    state.record_request(crate::stats::Record {
+        request_id,
+        route,
+        status,
+        stream: false,
+        duration_ms: started.elapsed().as_millis() as u64,
+        usage: result.is_ok().then_some(usage).flatten(),
+        attribution,
+    });
+}
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct TokenizeRequest {
@@ -68,7 +101,33 @@ fn default_max_tokens() -> usize {
 
 pub async fn tokenize(
     State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
     Json(req): Json<TokenizeRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let attribution = Attribution::from_headers(&headers);
+    let started = std::time::Instant::now();
+    let request_id = ferrox_api::next_request_id();
+    let result = tokenize_inner(&state, req);
+    // No `usage`, deliberately. Tokenizing runs the tokenizer and not
+    // the model, and `prompt_tokens` here feeds `tokens_prompt_total`,
+    // which means "tokens this server put through a forward pass".
+    // Counting a tokenize call into it would inflate every throughput
+    // number derived from it.
+    record_outcome(
+        &state,
+        &request_id,
+        ferrox_api::routes::V1_TOKENIZE,
+        started,
+        &result,
+        None,
+        &attribution,
+    );
+    result
+}
+
+fn tokenize_inner(
+    state: &AppState,
+    req: TokenizeRequest,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let _ = req.model;
     // Tokenizing needs the loaded vocabulary, so this is a 503 like any
@@ -84,7 +143,29 @@ pub async fn tokenize(
 
 pub async fn detokenize(
     State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
     Json(req): Json<DetokenizeRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let attribution = Attribution::from_headers(&headers);
+    let started = std::time::Instant::now();
+    let request_id = ferrox_api::next_request_id();
+    let result = detokenize_inner(&state, req);
+    // Same reasoning as `tokenize`: no forward pass, so no usage.
+    record_outcome(
+        &state,
+        &request_id,
+        ferrox_api::routes::V1_DETOKENIZE,
+        started,
+        &result,
+        None,
+        &attribution,
+    );
+    result
+}
+
+fn detokenize_inner(
+    state: &AppState,
+    req: DetokenizeRequest,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let text = state.require_model()?.decode(&req.tokens);
     Ok(Json(serde_json::json!({ "text": text })))
@@ -130,8 +211,37 @@ fn pool_hidden(hiddens: &[Vec<f32>], pooling: &str) -> Result<Vec<f32>, ApiError
 
 pub async fn embeddings(
     State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
     Json(req): Json<EmbeddingsRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    let attribution = Attribution::from_headers(&headers);
+    let started = std::time::Instant::now();
+    let request_id = ferrox_api::next_request_id();
+    let result = embeddings_inner(&state, req).await;
+    // Embeddings *do* run the model, so the prompt tokens they paid for
+    // are real prompt tokens and are recorded as such. There is no
+    // decode loop, so `decode_ms` stays null rather than borrowing the
+    // total -- the same rule the two duration columns exist for.
+    let usage = result
+        .as_ref()
+        .ok()
+        .map(|(_, prompt_tokens)| ferrox_api::Usage::new(*prompt_tokens, 0));
+    record_outcome(
+        &state,
+        &request_id,
+        ferrox_api::routes::V1_EMBEDDINGS,
+        started,
+        &result,
+        usage.as_ref(),
+        &attribution,
+    );
+    result.map(|(body, _)| Json(body))
+}
+
+async fn embeddings_inner(
+    state: &AppState,
+    req: EmbeddingsRequest,
+) -> Result<(serde_json::Value, usize), ApiError> {
     if let Some(fmt) = req.encoding_format.as_deref() {
         if fmt != "float" {
             return Err((
@@ -219,21 +329,26 @@ pub async fn embeddings(
     .map_err(join_error_response)??;
 
     let model_name = req.model.unwrap_or_else(|| active_model.name().to_string());
-    Ok(Json(serde_json::json!({
-        "object": "list",
-        "data": data,
-        "model": model_name,
-        "usage": {
-            "prompt_tokens": prompt_tokens,
-            "total_tokens": prompt_tokens,
-        }
-    })))
+    Ok((
+        serde_json::json!({
+            "object": "list",
+            "data": data,
+            "model": model_name,
+            "usage": {
+                "prompt_tokens": prompt_tokens,
+                "total_tokens": prompt_tokens,
+            }
+        }),
+        prompt_tokens,
+    ))
 }
 
 pub async fn completions(
     State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
     Json(req): Json<CompletionsRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    let attribution = Attribution::from_headers(&headers);
     let started = std::time::Instant::now();
     let request_id = ferrox_api::next_request_id();
     let active = state.require_active()?;
@@ -287,14 +402,15 @@ pub async fn completions(
         FinishReason::Cancelled => "cancelled",
     };
     let model_name = req.model.unwrap_or_else(|| active.model.name().to_string());
-    state.record_request(
-        &request_id,
-        ferrox_api::routes::V1_COMPLETIONS,
-        200,
-        false,
-        started.elapsed().as_millis() as u64,
-        Some(&usage),
-    );
+    state.record_request(crate::stats::Record {
+        request_id: &request_id,
+        route: ferrox_api::routes::V1_COMPLETIONS,
+        status: 200,
+        stream: false,
+        duration_ms: started.elapsed().as_millis() as u64,
+        usage: Some(&usage),
+        attribution: &attribution,
+    });
 
     Ok(Json(serde_json::json!({
         "id": request_id,

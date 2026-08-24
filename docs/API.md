@@ -262,12 +262,16 @@ Set `HF_TOKEN` (or `HUGGING_FACE_HUB_TOKEN`) for gated repos, and
   "tokens_prompt_total": 17, "tokens_generated_total": 24,
   "last_request_age_seconds": 0.02,
   "generating_now": 0,               // decoding right now; NOT a queue depth
+  "queue_depth": null,               // null unless continuous batching is on
+  "queue_rejected_total": null,      // turned away by the queue cap, since start
   "recent": [{
     "request_id": "chatcmpl-b28a1aeab8f8000000",
     "at_ms": 1786718007013, "route": "/v1/chat/completions",
     "status": 200, "prompt_tokens": 17, "completion_tokens": 24,
     "ttft_ms": 6586.2, "duration_ms": 23603, "decode_ms": 17004.8,
-    "stream": false
+    "stream": false,
+    "via_api_key": "key-4f21a0c3",   // fingerprint, never the key; null if none
+    "client": "ferrox-studio"        // SELF-DECLARED (X-Ferrox-Client); null if absent
   }]
 }
 ```
@@ -281,8 +285,30 @@ decode, and dividing completion tokens by it reads a 50 tok/s model as
 itself or the answer came from cache.
 
 Recorded today for `/v1/chat/completions` (streamed and not, including
-rejections), `/v1/completions` and `/v1/messages`. Not yet recorded for
-`/v1/embeddings`, `/v1/tokenize` or `/v1/detokenize`.
+rejections), `/v1/completions`, `/v1/messages`, `/v1/embeddings`,
+`/v1/tokenize` and `/v1/detokenize` — the last three with their status,
+success or failure. `/v1/tokenize` and `/v1/detokenize` carry no token
+counts on purpose: they run the tokenizer and not the model, and
+`prompt_tokens` here feeds `tokens_prompt_total`, which means "tokens
+this server put through a forward pass". `/v1/embeddings` does run one,
+so its prompt tokens are counted and its `decode_ms` is `null` — there
+is no decode loop to time.
+
+`queue_depth` and `queue_rejected_total` come from the continuous-batching
+scheduler's queue and are `null` — not `0` — when batching is off, because
+then nothing queues at all: every request gets its own blocking thread. A
+gauge reading `0` claims an empty queue was measured.
+
+**Attribution.** `via_api_key` is a short fingerprint of the bearer key
+that served the request, never the key and never anything the key can be
+recovered from; it is salted per process, so it is stable within one
+server run, meaningless across a restart, and useless for testing key
+guesses offline. `null` means no `Authorization: Bearer` header was
+presented, which on a server started without `FERROX_API_KEY` is every
+request. `client` is the caller's own `X-Ferrox-Client` header, kept to
+32 label characters — **a claim, not proof**: Ferrox Studio sends
+`ferrox-studio` and so could anything else. Nothing authenticates it, and
+a UI that shows it must say so.
 
 ## Refusals that will not clear
 

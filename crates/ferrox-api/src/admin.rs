@@ -268,6 +268,33 @@ pub struct RecentRequest {
     /// time itself, or the answer came from cache.
     pub decode_ms: Option<f64>,
     pub stream: bool,
+    /// Which bearer key served this request, as a short fingerprint --
+    /// never the key itself, and never reversible into it.
+    ///
+    /// `null` means the request carried no `Authorization: Bearer`
+    /// header at all, which on a server started without
+    /// `FERROX_API_KEY` is every request. Two rows with the same
+    /// fingerprint were authenticated with the same key; two rows with
+    /// different fingerprints were not. That is the whole of what this
+    /// field claims.
+    ///
+    /// The fingerprint is salted per process, so it is stable within
+    /// one server run and deliberately meaningless across restarts: a
+    /// captured `/admin/stats` payload cannot be used offline to test
+    /// guesses at the key.
+    pub via_api_key: Option<String>,
+    /// The caller's self-declared label, from the `X-Ferrox-Client`
+    /// request header, truncated and stripped of anything that is not a
+    /// plain label character.
+    ///
+    /// **A claim, not proof.** Ferrox Studio sends `ferrox-studio`, and
+    /// so could any other client; nothing here authenticates it. It is
+    /// recorded because a self-declared label plus a key fingerprint is
+    /// still the difference between "an editor is hammering this
+    /// server" and "that was me in the other tab", and because
+    /// inventing the distinction from timing would be worse. A UI that
+    /// shows it must say it is self-declared.
+    pub client: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -288,6 +315,18 @@ pub struct StatsResponse {
     /// so this counts work in progress, not work waiting. Named for
     /// what it is so no one reads a backlog into it.
     pub generating_now: usize,
+    /// Requests waiting for a decode slot, from the continuous-batching
+    /// scheduler's own queue.
+    ///
+    /// `null` -- not `0` -- when continuous batching is off, because
+    /// then there is no queue at all: every request goes straight onto
+    /// its own blocking thread. A gauge reading `0` claims an empty
+    /// queue was measured; `null` says there was nothing to measure,
+    /// and a UI must be able to tell those apart.
+    pub queue_depth: Option<usize>,
+    /// Requests the queue turned away because it was full, since start.
+    /// `null` under the same condition as [`Self::queue_depth`].
+    pub queue_rejected_total: Option<u64>,
     /// Newest last, capped server-side. See [`RecentRequest`].
     pub recent: Vec<RecentRequest>,
 }
@@ -418,9 +457,61 @@ mod tests {
             duration_ms: 1_100,
             decode_ms: Some(100.0),
             stream: true,
+            via_api_key: None,
+            client: None,
         };
         let json = serde_json::to_value(&recent).unwrap();
         assert_eq!(json["duration_ms"], 1_100);
         assert_eq!(json["decode_ms"], 100.0);
+    }
+
+    /// An absent attribution has to survive the wire as `null` rather
+    /// than vanishing: "no key was presented" is a fact the monitor
+    /// shows, and a missing key would read as a UI bug instead.
+    #[test]
+    fn absent_attribution_serializes_as_null_rather_than_vanishing() {
+        let recent = RecentRequest {
+            request_id: "chatcmpl-1".into(),
+            at_ms: 10,
+            route: "/v1/tokenize".into(),
+            status: 200,
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            ttft_ms: None,
+            duration_ms: 1,
+            decode_ms: None,
+            stream: false,
+            via_api_key: None,
+            client: None,
+        };
+        let json = serde_json::to_value(&recent).unwrap();
+        for key in ["via_api_key", "client"] {
+            assert!(json.get(key).is_some(), "{key} was omitted entirely");
+            assert!(json[key].is_null(), "{key} was not null");
+        }
+    }
+
+    /// The queue gauge is `null` when there is no queue, and a UI must
+    /// be able to tell that from a measured empty one.
+    #[test]
+    fn an_absent_queue_gauge_is_null_not_zero() {
+        let stats = StatsResponse {
+            uptime_seconds: 1,
+            requests_total: 0,
+            errors_total: 0,
+            cache_hits: 0,
+            cache_misses: 0,
+            tokens_prompt_total: 0,
+            tokens_generated_total: 0,
+            last_request_age_seconds: None,
+            generating_now: 0,
+            queue_depth: None,
+            queue_rejected_total: None,
+            recent: Vec::new(),
+        };
+        let json = serde_json::to_value(&stats).unwrap();
+        assert!(json["queue_depth"].is_null());
+        assert!(json["queue_rejected_total"].is_null());
+        assert_eq!(json["generating_now"], 0);
     }
 }

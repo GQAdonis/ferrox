@@ -20,6 +20,8 @@ use std::sync::Mutex;
 
 use ferrox_api::RecentRequest;
 
+use crate::attribution::Attribution;
+
 /// Requests remembered. The contract says the last 200.
 pub(crate) const RING_CAPACITY: usize = 200;
 
@@ -72,30 +74,48 @@ impl Stats {
     }
 }
 
+/// Everything a finished request knows about itself, named at the call
+/// site.
+///
+/// A struct rather than a parameter list because the two durations and
+/// the two attribution fields are individually easy to swap by accident
+/// and impossible to catch by type -- `duration_ms` and a decode time
+/// are both `u64`-ish, `via_api_key` and `client` are both
+/// `Option<String>`. Naming them at every call site is the cheapest
+/// guard there is.
+pub(crate) struct Record<'a> {
+    pub(crate) request_id: &'a str,
+    pub(crate) route: &'a str,
+    pub(crate) status: u16,
+    pub(crate) stream: bool,
+    /// Whole server-side wall time: queue wait, prefill and decode.
+    pub(crate) duration_ms: u64,
+    /// `None` from a path that cannot time itself. Never a stand-in
+    /// built out of `duration_ms`.
+    pub(crate) usage: Option<&'a ferrox_api::Usage>,
+    pub(crate) attribution: &'a Attribution,
+}
+
 /// Builds one ring-buffer entry from what a finished request knows.
 ///
-/// Takes the two durations separately and never derives one from the
-/// other; a caller that cannot time the decode loop passes `None`
-/// rather than reusing `duration_ms`.
-pub(crate) fn entry(
-    request_id: &str,
-    route: &str,
-    status: u16,
-    stream: bool,
-    duration_ms: u64,
-    usage: Option<&ferrox_api::Usage>,
-) -> RecentRequest {
+/// Keeps the two durations separate and never derives one from the
+/// other; a caller that cannot time the decode loop passes `usage:
+/// None` rather than reusing `duration_ms`.
+pub(crate) fn entry(record: Record<'_>) -> RecentRequest {
+    let usage = record.usage;
     RecentRequest {
-        request_id: request_id.to_string(),
+        request_id: record.request_id.to_string(),
         at_ms: crate::tasks::now_ms(),
-        route: route.to_string(),
-        status,
+        route: record.route.to_string(),
+        status: record.status,
         prompt_tokens: usage.map(|u| u.prompt_tokens).unwrap_or(0),
         completion_tokens: usage.map(|u| u.completion_tokens).unwrap_or(0),
         ttft_ms: usage.and_then(|u| u.time_to_first_token_ms),
-        duration_ms,
+        duration_ms: record.duration_ms,
         decode_ms: usage.and_then(|u| u.generation_duration_ms),
-        stream,
+        stream: record.stream,
+        via_api_key: record.attribution.via_api_key.clone(),
+        client: record.attribution.client.clone(),
     }
 }
 
@@ -111,14 +131,15 @@ mod tests {
 
     #[test]
     fn an_entry_keeps_the_two_durations_apart() {
-        let e = entry(
-            "chatcmpl-1",
-            ferrox_api::routes::V1_CHAT_COMPLETIONS,
-            200,
-            true,
-            1_100,
-            Some(&usage()),
-        );
+        let e = entry(Record {
+            request_id: "chatcmpl-1",
+            route: ferrox_api::routes::V1_CHAT_COMPLETIONS,
+            status: 200,
+            stream: true,
+            duration_ms: 1_100,
+            usage: Some(&usage()),
+            attribution: &Attribution::default(),
+        });
         assert_eq!(e.duration_ms, 1_100);
         assert_eq!(e.decode_ms, Some(100.0));
         assert_eq!(e.ttft_ms, Some(900.0));
@@ -128,7 +149,15 @@ mod tests {
 
     #[test]
     fn an_untimed_request_reports_null_rather_than_reusing_the_total() {
-        let e = entry("chatcmpl-2", "/v1/completions", 200, false, 42, None);
+        let e = entry(Record {
+            request_id: "chatcmpl-2",
+            route: "/v1/completions",
+            status: 200,
+            stream: false,
+            duration_ms: 42,
+            usage: None,
+            attribution: &Attribution::default(),
+        });
         assert_eq!(e.decode_ms, None);
         assert_eq!(e.ttft_ms, None);
         assert_eq!(e.duration_ms, 42);
@@ -139,7 +168,15 @@ mod tests {
     fn token_totals_accumulate_across_requests() {
         let stats = Stats::new();
         for _ in 0..3 {
-            stats.record(entry("id", "/r", 200, false, 1, Some(&usage())));
+            stats.record(entry(Record {
+                request_id: "id",
+                route: "/r",
+                status: 200,
+                stream: false,
+                duration_ms: 1,
+                usage: Some(&usage()),
+                attribution: &Attribution::default(),
+            }));
         }
         assert_eq!(stats.tokens_prompt_total(), 300);
         assert_eq!(stats.tokens_generated_total(), 30);
@@ -149,7 +186,15 @@ mod tests {
     fn the_ring_keeps_the_newest_entries_and_drops_the_oldest() {
         let stats = Stats::new();
         for i in 0..RING_CAPACITY + 25 {
-            stats.record(entry(&format!("id-{i}"), "/r", 200, false, 1, None));
+            stats.record(entry(Record {
+                request_id: &format!("id-{i}"),
+                route: "/r",
+                status: 200,
+                stream: false,
+                duration_ms: 1,
+                usage: None,
+                attribution: &Attribution::default(),
+            }));
         }
         let recent = stats.recent();
         assert_eq!(recent.len(), RING_CAPACITY);
@@ -163,7 +208,49 @@ mod tests {
     #[test]
     fn an_error_response_is_recorded_with_its_status() {
         let stats = Stats::new();
-        stats.record(entry("id-e", "/v1/chat/completions", 503, false, 3, None));
+        stats.record(entry(Record {
+            request_id: "id-e",
+            route: "/v1/chat/completions",
+            status: 503,
+            stream: false,
+            duration_ms: 3,
+            usage: None,
+            attribution: &Attribution::default(),
+        }));
         assert_eq!(stats.recent()[0].status, 503);
+    }
+
+    /// Attribution is carried, not re-derived: the entry states the key
+    /// fingerprint and the self-declared label the request arrived
+    /// with, and nothing else.
+    #[test]
+    fn an_entry_carries_the_attribution_it_was_given() {
+        let attribution = Attribution {
+            via_api_key: Some("key-deadbeef".to_string()),
+            client: Some("ferrox-studio".to_string()),
+        };
+        let e = entry(Record {
+            request_id: "id",
+            route: "/r",
+            status: 200,
+            stream: false,
+            duration_ms: 1,
+            usage: None,
+            attribution: &attribution,
+        });
+        assert_eq!(e.via_api_key.as_deref(), Some("key-deadbeef"));
+        assert_eq!(e.client.as_deref(), Some("ferrox-studio"));
+
+        let anonymous = entry(Record {
+            request_id: "id",
+            route: "/r",
+            status: 200,
+            stream: false,
+            duration_ms: 1,
+            usage: None,
+            attribution: &Attribution::default(),
+        });
+        assert_eq!(anonymous.via_api_key, None);
+        assert_eq!(anonymous.client, None);
     }
 }

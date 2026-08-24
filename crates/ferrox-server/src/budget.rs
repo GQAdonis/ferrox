@@ -172,6 +172,41 @@ pub fn derive_limits(
     })
 }
 
+/// Fills the ceilings an operator did not set from `derived`, and
+/// leaves the ones they did set exactly alone.
+///
+/// Split out as a pure function because the precedence *is* the
+/// contract: an operator who names a number has information this
+/// arithmetic does not, so a derived value may only ever occupy an
+/// empty slot. Returns what changed, so the caller logs the numbers it
+/// actually adopted rather than the ones it computed.
+pub fn apply_derived(
+    config: &mut crate::batch_scheduler::BatcherConfig,
+    derived: &DerivedLimits,
+) -> Adopted {
+    let mut adopted = Adopted::default();
+    if config.max_context.is_none() {
+        config.max_context = Some(derived.max_context);
+        adopted.max_context = true;
+    }
+    // A zero-block ledger would refuse every request, which is the
+    // "ceiling of zero" this module refuses to invent -- see the module
+    // doc. Leave the ledger absent and let the context ceiling, which
+    // is a real number here, do the refusing.
+    if config.kv_blocks.is_none() && derived.kv_blocks > 0 {
+        config.kv_blocks = Some(derived.kv_blocks);
+        adopted.kv_blocks = true;
+    }
+    adopted
+}
+
+/// Which ceilings [`apply_derived`] actually filled in.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct Adopted {
+    pub max_context: bool,
+    pub kv_blocks: bool,
+}
+
 /// Prices the GGUF at `path` against the machine, best effort.
 ///
 /// Returns `None` -- and logs why -- for every reason the CLI treats as
@@ -364,6 +399,88 @@ mod tests {
     fn a_model_that_leaves_no_room_derives_no_ceiling_at_all() {
         assert!(derive_limits(&budget(4096, 4096), 100_000, 16).is_none());
         assert!(derive_limits(&budget(4096, 8192), 100_000, 16).is_none());
+    }
+
+    fn derived(max_context: usize, kv_blocks: usize) -> DerivedLimits {
+        DerivedLimits {
+            max_context,
+            kv_blocks,
+            fit: budget(1 << 30, 0).max_context(max_context.max(1), 1),
+        }
+    }
+
+    /// The precedence contract: an operator who set a number keeps it.
+    ///
+    /// Confirmed to FAIL when `apply_derived` assigns unconditionally
+    /// instead of only into an empty slot.
+    #[test]
+    fn a_configured_ceiling_is_never_overridden_by_a_derived_one() {
+        let mut config = crate::batch_scheduler::BatcherConfig {
+            max_context: Some(999),
+            kv_blocks: Some(7),
+            ..Default::default()
+        };
+        let adopted = apply_derived(&mut config, &derived(4096, 16));
+        assert_eq!(config.max_context, Some(999));
+        assert_eq!(config.kv_blocks, Some(7));
+        assert_eq!(adopted, Adopted::default(), "nothing was adopted");
+    }
+
+    /// An absent ceiling is the slot derivation exists to fill, and the
+    /// two slots are independent: setting one by hand must not suppress
+    /// the other's derivation.
+    #[test]
+    fn an_absent_ceiling_is_filled_and_the_two_slots_are_independent() {
+        let mut both = crate::batch_scheduler::BatcherConfig {
+            max_context: None,
+            kv_blocks: None,
+            ..Default::default()
+        };
+        let adopted = apply_derived(&mut both, &derived(4096, 16));
+        assert_eq!(both.max_context, Some(4096));
+        assert_eq!(both.kv_blocks, Some(16));
+        assert_eq!(
+            adopted,
+            Adopted {
+                max_context: true,
+                kv_blocks: true
+            }
+        );
+
+        let mut half = crate::batch_scheduler::BatcherConfig {
+            max_context: Some(512),
+            kv_blocks: None,
+            ..Default::default()
+        };
+        let adopted = apply_derived(&mut half, &derived(4096, 16));
+        assert_eq!(half.max_context, Some(512), "the set one survives");
+        assert_eq!(half.kv_blocks, Some(16), "the unset one is still derived");
+        assert_eq!(
+            adopted,
+            Adopted {
+                max_context: false,
+                kv_blocks: true
+            }
+        );
+    }
+
+    /// A fit that yields no whole block leaves the ledger absent rather
+    /// than installing a zero-block budget that refuses everything --
+    /// the context ceiling, which is a real number here, does the
+    /// refusing instead.
+    ///
+    /// Confirmed to FAIL when the `derived.kv_blocks > 0` guard is
+    /// dropped: `kv_blocks` becomes `Some(0)`.
+    #[test]
+    fn a_fit_smaller_than_one_block_leaves_the_ledger_absent() {
+        let mut config = crate::batch_scheduler::BatcherConfig {
+            max_context: None,
+            kv_blocks: None,
+            ..Default::default()
+        };
+        apply_derived(&mut config, &derived(100, 0));
+        assert_eq!(config.max_context, Some(100));
+        assert_eq!(config.kv_blocks, None);
     }
 
     /// A model whose every layer slides has a bounded KV no matter how

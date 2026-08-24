@@ -2447,10 +2447,7 @@ type Activated = (
 ///
 /// `path` is `None` for the synthetic-weights fallback, which has no
 /// checkpoint on disk to price.
-fn price_batcher_config(
-    path: Option<&str>,
-    config: &ferrox_models::ModelConfig,
-) -> batch_scheduler::BatcherConfig {
+fn price_batcher_config(path: Option<&str>) -> batch_scheduler::BatcherConfig {
     let mut batcher = batch_scheduler::BatcherConfig::from_env();
     if batcher.max_context.is_some() && batcher.kv_blocks.is_some() {
         // Nothing left to derive, and pricing the checkpoint would only
@@ -2474,29 +2471,31 @@ fn price_batcher_config(
         // ceiling of zero, it is an estimate saying this model should
         // not have loaded -- and it did. Say so and admit as before.
         tracing::warn!(
-            "this checkpoint's weights leave no room for KV inside the {source}: {} weight bytes              against a {} byte budget. Serving with no derived context ceiling -- set              FERROX_DEVICE_BUDGET_BYTES if the probe is wrong, or FERROX_CB_MAX_CONTEXT to admit              on a number you choose.",
+            "this checkpoint's weights leave no room for KV inside the {source}: {} weight \
+             bytes against a {} byte budget. Serving with no derived context ceiling -- set \
+             FERROX_DEVICE_BUDGET_BYTES if the probe is wrong, or FERROX_CB_MAX_CONTEXT to \
+             admit on a number you choose.",
             priced.weights_bytes,
             priced.device_budget_bytes,
         );
-        let _ = config;
         return batcher;
     };
     tracing::info!("{source}");
     tracing::info!("{}", derived.fit);
-    if batcher.max_context.is_none() {
+    let adopted = budget::apply_derived(&mut batcher, &derived);
+    if adopted.max_context {
         tracing::info!(
-            "derived per-request context ceiling: {} token positions (prompt + max_tokens);              override with FERROX_CB_MAX_CONTEXT",
+            "derived per-request context ceiling: {} token positions (prompt + max_tokens); \
+             override with FERROX_CB_MAX_CONTEXT",
             derived.max_context
         );
-        batcher.max_context = Some(derived.max_context);
     }
-    if batcher.kv_blocks.is_none() && derived.kv_blocks > 0 {
+    if adopted.kv_blocks {
         tracing::info!(
             "derived KV block budget: {} blocks x {} positions; override with FERROX_CB_KV_BLOCKS",
             derived.kv_blocks,
             batcher.kv_block_size
         );
-        batcher.kv_blocks = Some(derived.kv_blocks);
     }
     batcher
 }
@@ -2518,7 +2517,7 @@ pub(crate) fn activate_loaded_model(
         model::LoadedModel::Gguf(g) => {
             let decoder = Arc::new(g.decoder);
             let tokenizer = Arc::new(g.tokenizer);
-            let config = price_batcher_config(path, &decoder.config);
+            let config = price_batcher_config(path);
             // Prefill is still a per-token `forward_token` loop on both
             // paths (see `sched-chunked-prefill`: chunking bought
             // fairness, not a batched prefill kernel), so a sliding

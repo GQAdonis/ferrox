@@ -1,10 +1,12 @@
 # Agents & IDEs
 
-Point coding agents at a running `ferrox-server`.
+Point coding agents at a running Ferrox server. Start it either way:
+`ferrox serve` from the main binary (needs `--features serve` at build
+time) or the standalone `ferrox-server`. Both take the same flags.
 
 ```bash
-cargo build -p ferrox-server --release --features metal
-./target/release/ferrox-server -m /path/to/model.gguf \
+cargo build -p ferrox-cli --release --features "serve metal"
+./target/release/ferrox serve -m /path/to/model.gguf \
   --host 127.0.0.1 --port 8383
 ```
 

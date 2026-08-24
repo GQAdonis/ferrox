@@ -73,10 +73,17 @@ macOS arm64 with Metal and Linux x86_64 with CPU.
 From crates.io or source instead:
 
 ```bash
-cargo install ferrox-cli --features metal      # the `ferrox` binary. Use --features cuda on Linux+NVIDIA
-cargo install ferrox-server --features metal   # the HTTP server
+# The `ferrox` binary. Use --features cuda on Linux+NVIDIA.
+cargo install ferrox-cli --features metal
 
-cargo build --release -p ferrox-cli -p ferrox-server --features metal
+# Same binary, plus `ferrox serve` for the HTTP API.
+cargo install ferrox-cli --features "serve metal"
+
+# Or the server on its own, unchanged.
+cargo install ferrox-server --features metal
+
+# From source.
+cargo build --release -p ferrox-cli --features "serve metal"
 ```
 
 Neither install pulls in a GPU backend unless you ask for it. `serve` is

@@ -3,10 +3,10 @@
 The web frontend for `ferrox-server`: Chat, Models, Activity, Connect.
 
 It is a **standalone app**. `ferrox-server` serves the HTTP API and
-nothing else, `GET /` on it is a 404, and this app reaches that API
-the same way an editor would. That rule is load-bearing rather than
-tidy: every screen here goes through the public surface, so the API
-cannot rot without the UI breaking first.
+nothing else, `GET /` on it is a 404, and this app reaches that API the
+same way an editor would. That rule earns its keep. Every screen here
+goes through the public API, so the API cannot rot without a screen
+breaking first and showing you.
 
 ## Working on it
 
@@ -30,19 +30,19 @@ FERROX_BACKEND=http://127.0.0.1:9001 npm run dev
 ```bash
 npm run typecheck   # tsc, no emit
 npm run lint        # eslint
-npm run licenses    # refuses any non-permissive dependency
+npm run licenses    # fails on any non-permissive dependency
 npm run build       # -> dist/, gitignored
 npm run check       # typecheck + lint
 ```
 
 `dist/` is **not committed**. Nothing built here ships inside a Rust
-crate, so there is no artefact to keep in sync, serve `dist/` with any
+crate, so there is no artefact to keep in sync. Serve `dist/` with any
 static file server, or bundle it into a desktop shell.
 
 ## CORS, and how to not need it
 
-Two origins now exist where there used to be one, so the browser's
-cross-origin rules apply. There are exactly two supported answers:
+The app and the server are two origins, so the browser's cross-origin
+rules apply. Two answers are supported:
 
 - **Development, and the default.** The dev server proxies `/v1`,
   `/admin`, `/health`, `/metrics` and `/cache` to the backend. The
@@ -51,9 +51,10 @@ cross-origin rules apply. There are exactly two supported answers:
   request goes out as a same-origin path.
 - **A different origin.** Set the API base URL on the **Connect**
   screen (or `VITE_FERROX_BASE_URL` at build time), and start the server
-  with `FERROX_CORS_ORIGINS` set to **this app's exact origin**. The
-  `*` wildcard is refused by `crates/ferrox-server/src/security.rs` on
-  purpose: a wildcard beside a bearer token is a credential-leak shape.
+  with `FERROX_CORS_ORIGINS` set to **this app's exact origin**. A `*`
+  wildcard is a startup error, enforced in
+  `crates/ferrox-server/src/security.rs`, because a wildcard beside a
+  bearer token is a credential-leak shape.
 
 The Connect screen also holds the `FERROX_API_KEY` bearer token, stored
 in `localStorage` and sent as an `Authorization` header, never in a
@@ -73,7 +74,7 @@ copyleft dependency is not a lockfile detail.
 
 ```
 src/
-  main.tsx              router; /, /ui and /ui/<screen> all resolve here
+  main.tsx              router: /, /ui and /ui/<screen> all resolve here
   index.css             design tokens + Tailwind theme (one light block,
                         one prefers-color-scheme block, nothing else)
   lib/api.ts            the ONLY place that talks HTTP
@@ -85,17 +86,18 @@ src/
 
 ## Three things not to undo
 
-- **No client stopwatch.** Every number under an answer is the server's
-  `usage` block. assistant-ui offers a `useMessageTiming()` that
-  measures the stream in the browser; it is deliberately unused, because
-  it cannot separate prefill from decode and reads a 50 tok/s model as 5
-  on a long prompt.
+- **No client stopwatch.** Every number under an answer comes from the
+  server's `usage` block. assistant-ui offers a `useMessageTiming()`
+  that measures the stream in the browser. It is deliberately unused. It
+  has no way to separate prefill from decode, so it reads a 50 tok/s
+  model as 5 on a long prompt.
 - **Model output never becomes markup.** `react-markdown` builds a React
   element tree and has no raw-HTML path unless `rehype-raw` is added to
-  the pipeline. Do not add it. A lint rule refuses `innerHTML` and
-  `dangerouslySetInnerHTML` so the property is enforced, not remembered.
+  the pipeline. Do not add it. A lint rule fails the build on
+  `innerHTML` and `dangerouslySetInnerHTML`, so nobody has to remember
+  the rule.
 - **`duration_ms` and `decode_ms` are never combined.** Duration carries
-  queue wait and prefill; the `tok/s` column divides by `decode_ms`
-  alone. Nothing here computes a download rate either, the server's
-  estimator reports `null` until it is confident, and that null is
-  rendered as words, not as a number.
+  queue wait and prefill, so the `tok/s` column divides by `decode_ms`
+  alone. Nothing here computes a download rate either. The server's
+  estimator reports `null` until it is confident, and that null renders
+  as words rather than a number.

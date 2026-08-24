@@ -15,7 +15,8 @@
 //! and dedicated [`Gemma4Engine`] (sequential `forward_token` for both
 //! `pp*` and `tg*` until a batched Gemma-4 prefill lands).
 
-use crate::host_state;
+use crate::bench_guard::{self, CacheProbe, WorkloadDigest};
+use crate::host_state::{self, ThermalReading};
 use anyhow::Context;
 use ferrox_core::cache::KvCache;
 use ferrox_models::engine::Engine;
@@ -30,6 +31,10 @@ use std::time::Instant;
 struct Row {
     test: String,
     samples: Vec<f64>,
+    /// Digest of the token stream every timed repetition fed. Written
+    /// into the receipt so two rows for the same workload can be shown
+    /// to have measured the same work, across sessions.
+    digest: WorkloadDigest,
 }
 
 impl Row {
@@ -108,9 +113,15 @@ pub struct BenchArgs {
 }
 
 pub fn run(args: BenchArgs) -> anyhow::Result<()> {
-    // Before anything is loaded: a timed run on a busy host produces a
-    // number that looks like a measurement and is not one.
+    // Before anything is loaded: a timed run on a busy or hot host
+    // produces a number that looks like a measurement and is not one.
+    bench_guard::check_repetitions(args.reps)?;
     let load_start = crate::host_state::ensure_quiet_enough(args.max_load)?;
+    let thermal_start = crate::host_state::thermal_reading();
+    // `--max-load 0` is already the documented "measure anyway, not
+    // publishable" escape; the thermal bar shares it rather than
+    // growing a second flag that has to be remembered separately.
+    crate::host_state::ensure_cool_enough(&thermal_start, args.max_load > 0.0)?;
     let model = crate::pull::resolve_model_path(&args.model)?;
     let path = Path::new(&model);
     if !path.exists() {
@@ -188,21 +199,40 @@ pub fn run(args: BenchArgs) -> anyhow::Result<()> {
         );
     }
     let load_end = crate::host_state::load_average_1min();
-    let thermal = crate::host_state::thermal_speed_limit_percent();
+    let thermal_end = crate::host_state::thermal_reading();
     eprintln!(
-        "\nferrox bench: load {load_s:.2}s, {} reps + 1 discarded warmup each",
-        args.reps
+        "\nferrox bench: load {load_s:.2}s, {} reps + {} discarded warmup each",
+        args.reps,
+        bench_guard::WARMUP_REPS
     );
     eprintln!(
-        "ferrox bench: host 1-min load {} -> {}{}",
+        "ferrox bench: host 1-min load {} -> {}, {} -> {}",
         fmt_load(load_start),
         fmt_load(load_end),
-        match thermal {
-            Some(p) if p < 100 => format!(", THROTTLED to {p}% CPU speed"),
-            Some(p) => format!(", thermal {p}%"),
-            None => String::new(),
-        }
+        thermal_start.describe(),
+        thermal_end.describe(),
     );
+    // A run that started cool and finished hot produced its later
+    // repetitions under different physics than its first ones.
+    if !thermal_start.is_degraded() && thermal_end.is_degraded() {
+        eprintln!(
+            "ferrox bench: WARNING -- the host became thermally limited during this \
+             run ({}); the later repetitions did not run under the same conditions \
+             as the first",
+            thermal_end.describe()
+        );
+    }
+    let engine_env = bench_guard::nondefault_engine_env(std::env::vars());
+    if !engine_env.is_empty() {
+        eprintln!(
+            "ferrox bench: non-default engine env in effect: {}",
+            engine_env
+                .iter()
+                .map(|(k, v)| format!("{k}={v}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+    }
 
     let ngl = if backend == "CPU" { 0 } else { 99 };
     let llama = if args.compare {
@@ -260,8 +290,10 @@ pub fn run(args: BenchArgs) -> anyhow::Result<()> {
             HostState {
                 load_start,
                 load_end,
-                thermal,
+                thermal_start,
+                thermal_end,
             },
+            &engine_env,
         )?;
         eprintln!("ferrox bench: receipt written to {}", dest.display());
     }
@@ -272,16 +304,14 @@ pub fn run(args: BenchArgs) -> anyhow::Result<()> {
 fn measure_decoder(decoder: &Decoder, args: &BenchArgs) -> anyhow::Result<Vec<Row>> {
     let mut rows: Vec<Row> = Vec::new();
     if args.n_prompt > 0 {
-        rows.push(Row {
-            test: format!("pp{}", args.n_prompt),
-            samples: bench_prefill(decoder, args.n_prompt, args.reps)?,
-        });
+        rows.push(bench_prefill(decoder, args.n_prompt, args.reps)?);
     }
     if args.n_gen > 0 {
-        rows.push(Row {
-            test: format!("tg{}", args.n_gen),
-            samples: bench_decode(decoder, args.n_gen, args.reps)?,
-        });
+        rows.push(bench_decode(decoder, args.n_gen, args.reps)?);
+    }
+    for row in &rows {
+        bench_guard::check_timed_samples(&row.test, args.reps, row.samples.len())?;
+        bench_guard::check_sample_rates(&row.test, &row.samples)?;
     }
     Ok(rows)
 }
@@ -290,36 +320,88 @@ fn measure_decoder(decoder: &Decoder, args: &BenchArgs) -> anyhow::Result<Vec<Ro
 fn measure_gemma4(engine: &Gemma4Engine, args: &BenchArgs) -> anyhow::Result<Vec<Row>> {
     let mut rows: Vec<Row> = Vec::new();
     if args.n_prompt > 0 {
-        rows.push(Row {
-            test: format!("pp{}", args.n_prompt),
-            samples: bench_prefill_gemma4(engine, args.n_prompt, args.reps)?,
-        });
+        rows.push(bench_prefill_gemma4(engine, args.n_prompt, args.reps)?);
     }
     if args.n_gen > 0 {
-        rows.push(Row {
-            test: format!("tg{}", args.n_gen),
-            samples: bench_decode_gemma4(engine, args.n_gen, args.reps)?,
-        });
+        rows.push(bench_decode_gemma4(engine, args.n_gen, args.reps)?);
+    }
+    for row in &rows {
+        bench_guard::check_timed_samples(&row.test, args.reps, row.samples.len())?;
+        bench_guard::check_sample_rates(&row.test, &row.samples)?;
     }
     Ok(rows)
 }
 
+/// The engine-side half of the determinism assertion, threaded through
+/// one row's repetitions.
+///
+/// Also where an empty logit vector is caught: a forward pass that
+/// returned nothing cannot be shown to have computed anything, so the
+/// duration it took is not a throughput.
+fn check_result(
+    test: &str,
+    rep: usize,
+    logits: &[f32],
+    first: &mut Option<(usize, f32)>,
+) -> anyhow::Result<()> {
+    let pick = bench_guard::greedy_pick(logits)?.ok_or_else(|| {
+        anyhow::anyhow!(
+            "{test} rep {rep}: the forward pass returned no logits, so it cannot be \
+             shown to have computed anything and its duration is not a throughput"
+        )
+    })?;
+    let seen = *first.get_or_insert(pick);
+    bench_guard::check_same_result(test, rep, seen, pick)
+}
+
+/// Snapshots every layer's KV cache for the guards in `bench_guard`.
+fn probe(caches: &[KvCache]) -> Vec<CacheProbe> {
+    caches
+        .iter()
+        .map(|c| CacheProbe {
+            seq_len: c.seq_len,
+            k_len: c.k.len(),
+            v_len: c.v.len(),
+        })
+        .collect()
+}
+
+/// Same, for Gemma-4's sparse `Vec<Option<KvCache>>` (shared-KV layers
+/// leave holes, which are not caches and are not checked).
+fn probe_gemma4(state: &ferrox_models::gemma4_engine::Gemma4DecodeState) -> Vec<CacheProbe> {
+    state
+        .kv
+        .iter()
+        .flatten()
+        .map(|c| CacheProbe {
+            seq_len: c.seq_len,
+            k_len: c.k.len(),
+            v_len: c.v.len(),
+        })
+        .collect()
+}
+
 /// `pp<N>`: one batched forward over N tokens into fresh KV caches.
 /// Reported as prompt tokens per second, as `llama-bench` does.
-fn bench_prefill(decoder: &Decoder, n_prompt: usize, reps: usize) -> anyhow::Result<Vec<f64>> {
+fn bench_prefill(decoder: &Decoder, n_prompt: usize, reps: usize) -> anyhow::Result<Row> {
+    let test = format!("pp{n_prompt}");
     let tokens = synthetic_tokens(decoder.config.vocab_size, n_prompt);
+    // Asserted BEFORE the run: the stream about to be fed is exactly as
+    // long as the row's label promises, and every id is in vocabulary.
+    bench_guard::check_prompt_before(&test, n_prompt, &tokens, decoder.config.vocab_size)?;
     let mut out = Vec::with_capacity(reps);
-    for rep in 0..reps + 1 {
+    let mut first_digest: Option<WorkloadDigest> = None;
+    let mut first_result: Option<(usize, f32)> = None;
+    for rep in 0..reps + bench_guard::WARMUP_REPS {
         let mut caches = fresh_caches(decoder);
         // Every rep starts from an empty KV: a prefill that reused a
         // warm cache would report the engine's speed at work it did
         // not do. Asserted rather than assumed, so a later change to
         // `fresh_caches` cannot silently turn this into a cache-hit
         // benchmark.
-        anyhow::ensure!(
-            caches.iter().all(|c| c.seq_len == 0),
-            "prefill rep {rep} started with a non-empty KV cache"
-        );
+        bench_guard::check_caches_cold(&test, rep, &probe(&caches))?;
+        let mut digest = WorkloadDigest::new();
+        digest.feed_all(&tokens);
         let t = Instant::now();
         // `forward_batch_last`, not `forward_batch`: llama-bench's
         // `pp512` asks for logits at the final position only, so
@@ -327,29 +409,26 @@ fn bench_prefill(decoder: &Decoder, n_prompt: usize, reps: usize) -> anyhow::Res
         // the reference engine never does.
         let logits = decoder.forward_batch_last(&tokens, 0, &mut caches);
         let dt = t.elapsed().as_secs_f64();
-        anyhow::ensure!(
-            !logits.is_empty(),
-            "forward_batch_last returned no logits for a {n_prompt}-token prompt"
-        );
         // The prompt length is asserted AFTER the run too, not only
         // before: an engine that silently truncated the batch would
         // otherwise divide the full token count by a partial run's
         // time and report a speedup for doing less work.
-        if let Some(c) = caches.iter().find(|c| c.seq_len != n_prompt) {
-            anyhow::bail!(
-                "prefill consumed {} of {n_prompt} prompt tokens -- \
-                 the reported rate would be for work the engine skipped",
-                c.seq_len
-            );
-        }
+        bench_guard::check_prefill_after(&test, n_prompt, &probe(&caches))?;
+        let first = *first_digest.get_or_insert(digest);
+        bench_guard::check_same_workload(&test, rep, first, digest)?;
+        check_result(&test, rep, &logits, &mut first_result)?;
         // Rep 0 is the warmup: first touch of every weight page, and on
         // Metal the first pipeline compile. Timing it would measure the
         // OS and the shader cache, not the engine.
-        if rep > 0 {
+        if rep >= bench_guard::WARMUP_REPS {
             out.push(n_prompt as f64 / dt);
         }
     }
-    Ok(out)
+    Ok(Row {
+        test,
+        samples: out,
+        digest: first_digest.unwrap_or_default(),
+    })
 }
 
 /// Gemma-4 `pp<N>`: sequential `forward_token` over N synthetic ids.
@@ -359,83 +438,116 @@ fn bench_prefill_gemma4(
     engine: &Gemma4Engine,
     n_prompt: usize,
     reps: usize,
-) -> anyhow::Result<Vec<f64>> {
-    let tokens = synthetic_tokens(Engine::vocab_size(engine), n_prompt);
+) -> anyhow::Result<Row> {
+    let test = format!("pp{n_prompt}");
+    let vocab = Engine::vocab_size(engine);
+    let tokens = synthetic_tokens(vocab, n_prompt);
+    bench_guard::check_prompt_before(&test, n_prompt, &tokens, vocab)?;
     let mut out = Vec::with_capacity(reps);
-    for rep in 0..reps + 1 {
+    let mut first_digest: Option<WorkloadDigest> = None;
+    let mut first_result: Option<(usize, f32)> = None;
+    for rep in 0..reps + bench_guard::WARMUP_REPS {
         let mut state = Engine::new_state(engine);
+        bench_guard::check_caches_cold(&test, rep, &probe_gemma4(&state))?;
+        let mut digest = WorkloadDigest::new();
         let t = Instant::now();
         let mut logits = Vec::new();
         for (i, &tok) in tokens.iter().enumerate() {
+            digest.feed(tok);
             logits = Engine::forward_token(engine, tok, i, &mut state);
         }
         let dt = t.elapsed().as_secs_f64();
-        anyhow::ensure!(
-            !logits.is_empty(),
-            "gemma4 prefill returned no logits for a {n_prompt}-token prompt"
-        );
-        if rep > 0 {
+        bench_guard::check_prefill_after(&test, n_prompt, &probe_gemma4(&state))?;
+        let first = *first_digest.get_or_insert(digest);
+        bench_guard::check_same_workload(&test, rep, first, digest)?;
+        check_result(&test, rep, &logits, &mut first_result)?;
+        if rep >= bench_guard::WARMUP_REPS {
             out.push(n_prompt as f64 / dt);
         }
     }
-    Ok(out)
+    Ok(Row {
+        test,
+        samples: out,
+        digest: first_digest.unwrap_or_default(),
+    })
 }
 
 /// `tg<N>`: N single-token decode steps after a one-token prime, so KV
 /// length grows exactly as it does in real generation.
-fn bench_decode(decoder: &Decoder, n_gen: usize, reps: usize) -> anyhow::Result<Vec<f64>> {
+fn bench_decode(decoder: &Decoder, n_gen: usize, reps: usize) -> anyhow::Result<Row> {
+    let test = format!("tg{n_gen}");
     let vocab = decoder.config.vocab_size;
+    let tokens = decode_tokens(vocab, n_gen);
+    // The decode stream gets the same BEFORE check the prompt does. It
+    // is built up front for exactly that reason: a stream generated
+    // inside the timed loop can only be checked once it is too late to
+    // refuse.
+    bench_guard::check_prompt_before(&test, n_gen, &tokens, vocab)?;
     let mut out = Vec::with_capacity(reps);
-    for rep in 0..reps + 1 {
+    let mut first_digest: Option<WorkloadDigest> = None;
+    let mut first_result: Option<(usize, f32)> = None;
+    for rep in 0..reps + bench_guard::WARMUP_REPS {
         let mut caches = fresh_caches(decoder);
-        anyhow::ensure!(
-            caches.iter().all(|c| c.seq_len == 0),
-            "decode rep {rep} started with a non-empty KV cache"
-        );
+        bench_guard::check_caches_cold(&test, rep, &probe(&caches))?;
         let _ = decoder.forward_token(0, 0, &mut caches);
+        let mut digest = WorkloadDigest::new();
         let t = Instant::now();
-        for i in 0..n_gen {
-            let tok = (i + 1) % vocab;
-            let _ = decoder.forward_token(tok, i + 1, &mut caches);
+        let mut logits = Vec::new();
+        for (i, &tok) in tokens.iter().enumerate() {
+            digest.feed(tok);
+            logits = decoder.forward_token(tok, i + 1, &mut caches);
         }
         let dt = t.elapsed().as_secs_f64();
         // One priming token plus n_gen decode steps. A short cache
         // means steps were skipped, which would inflate the rate.
-        if let Some(c) = caches.iter().find(|c| c.seq_len != n_gen + 1) {
-            anyhow::bail!(
-                "decode advanced the KV cache to {} positions, expected {}",
-                c.seq_len,
-                n_gen + 1
-            );
-        }
-        if rep > 0 {
+        bench_guard::check_decode_after(&test, n_gen, &probe(&caches))?;
+        let first = *first_digest.get_or_insert(digest);
+        bench_guard::check_same_workload(&test, rep, first, digest)?;
+        check_result(&test, rep, &logits, &mut first_result)?;
+        if rep >= bench_guard::WARMUP_REPS {
             out.push(n_gen as f64 / dt);
         }
     }
-    Ok(out)
+    Ok(Row {
+        test,
+        samples: out,
+        digest: first_digest.unwrap_or_default(),
+    })
 }
 
-fn bench_decode_gemma4(
-    engine: &Gemma4Engine,
-    n_gen: usize,
-    reps: usize,
-) -> anyhow::Result<Vec<f64>> {
-    let vocab = Engine::vocab_size(engine).max(1);
+fn bench_decode_gemma4(engine: &Gemma4Engine, n_gen: usize, reps: usize) -> anyhow::Result<Row> {
+    let test = format!("tg{n_gen}");
+    let vocab = Engine::vocab_size(engine);
+    let tokens = decode_tokens(vocab, n_gen);
+    bench_guard::check_prompt_before(&test, n_gen, &tokens, vocab)?;
     let mut out = Vec::with_capacity(reps);
-    for rep in 0..reps + 1 {
+    let mut first_digest: Option<WorkloadDigest> = None;
+    let mut first_result: Option<(usize, f32)> = None;
+    for rep in 0..reps + bench_guard::WARMUP_REPS {
         let mut state = Engine::new_state(engine);
+        bench_guard::check_caches_cold(&test, rep, &probe_gemma4(&state))?;
         let _ = Engine::forward_token(engine, 0, 0, &mut state);
+        let mut digest = WorkloadDigest::new();
         let t = Instant::now();
-        for i in 0..n_gen {
-            let tok = (i + 1) % vocab;
-            let _ = Engine::forward_token(engine, tok, i + 1, &mut state);
+        let mut logits = Vec::new();
+        for (i, &tok) in tokens.iter().enumerate() {
+            digest.feed(tok);
+            logits = Engine::forward_token(engine, tok, i + 1, &mut state);
         }
         let dt = t.elapsed().as_secs_f64();
-        if rep > 0 {
+        bench_guard::check_decode_after(&test, n_gen, &probe_gemma4(&state))?;
+        let first = *first_digest.get_or_insert(digest);
+        bench_guard::check_same_workload(&test, rep, first, digest)?;
+        check_result(&test, rep, &logits, &mut first_result)?;
+        if rep >= bench_guard::WARMUP_REPS {
             out.push(n_gen as f64 / dt);
         }
     }
-    Ok(out)
+    Ok(Row {
+        test,
+        samples: out,
+        digest: first_digest.unwrap_or_default(),
+    })
 }
 
 fn fresh_caches(decoder: &Decoder) -> Vec<KvCache> {
@@ -452,6 +564,14 @@ fn fresh_caches(decoder: &Decoder) -> Vec<KvCache> {
 fn synthetic_tokens(vocab: usize, n: usize) -> Vec<usize> {
     let vocab = vocab.max(1);
     (0..n).map(|i| (i * 7 + 1) % vocab).collect()
+}
+
+/// The token stream a `tg<N>` row feeds after its priming token, built
+/// before the clock starts so its length can be asserted BEFORE the run
+/// rather than only reconstructed from the KV cache afterwards.
+fn decode_tokens(vocab: usize, n_gen: usize) -> Vec<usize> {
+    let vocab = vocab.max(1);
+    (0..n_gen).map(|i| (i + 1) % vocab).collect()
 }
 
 pub fn active_backend() -> &'static str {
@@ -601,7 +721,24 @@ fn parse_llama_bench_table(text: &str) -> std::collections::BTreeMap<String, f64
 pub struct HostState {
     pub load_start: Option<f64>,
     pub load_end: Option<f64>,
-    pub thermal: Option<u32>,
+    pub thermal_start: ThermalReading,
+    pub thermal_end: ThermalReading,
+}
+
+/// Serializes a thermal reading so that "we did not measure" and
+/// "we measured, and it was nominal" can never be read as the same
+/// thing. `measured` is stated outright rather than left to be
+/// inferred from a null, because a field that is always null while
+/// implying it was measured is exactly the lie this receipt exists to
+/// prevent.
+fn thermal_json(r: &ThermalReading) -> serde_json::Value {
+    serde_json::json!({
+        "measured": r.measured(),
+        "pressure": r.pressure.map(|p| p.as_str()),
+        "source": r.source,
+        "cpu_speed_limit_percent": r.cpu_speed_limit_percent,
+        "degraded": r.measured().then(|| r.is_degraded()),
+    })
 }
 
 /// A load average we could not read prints as `?`, never as `0.00`.
@@ -625,6 +762,7 @@ fn write_receipt(
     llama: Option<&std::collections::BTreeMap<String, f64>>,
     load_s: f64,
     host: HostState,
+    engine_env: &[(String, String)],
 ) -> anyhow::Result<()> {
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent)?;
@@ -639,10 +777,15 @@ fn write_receipt(
             "ferrox_samples": row.samples,
             "llama_tps": l,
             "gap": l.map(|l| l / row.median()),
+            // Same workload, same digest -- across models, sessions and
+            // machines. Two rows that claim to measure `pp512` on the
+            // same checkpoint and disagree here did not measure the
+            // same work.
+            "workload_digest": row.digest.hex(),
         }));
     }
     let receipt = serde_json::json!({
-        "schema": 1,
+        "schema": 2,
         "kind": "engine",
         "id": args.id,
         "model_path": model,
@@ -654,14 +797,24 @@ fn write_receipt(
         "backend_active": backend,
         "threads": threads,
         "reps": args.reps,
+        "warmup_reps": bench_guard::WARMUP_REPS,
         "load_s": load_s,
         // Null, not zero, when the platform would not say -- see host_state.
         "host_load_1min_start": host.load_start,
         "host_load_1min_end": host.load_end,
-        "host_thermal_speed_limit_percent": host.thermal,
+        "host_thermal_start": thermal_json(&host.thermal_start),
+        "host_thermal_end": thermal_json(&host.thermal_end),
         // The single field an auditor reads first: was this row taken
         // under the measurement contract's quiet-host bar at all?
         "quiet_host": host.load_start.map(|l| l < host_state::DEFAULT_MAX_LOAD),
+        // Non-default `FERROX_*` knobs in effect. Some of them (MoE
+        // stage ablation, the fail-closed loader override) change how
+        // much work the engine does, so a row taken under one is not
+        // comparable to a row taken without it.
+        "engine_env": engine_env
+            .iter()
+            .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
+            .collect::<serde_json::Map<_, _>>(),
         "ferrox_version": env!("CARGO_PKG_VERSION"),
         "tests": tests,
     });
@@ -677,6 +830,7 @@ mod tests {
         Row {
             test: "tg128".to_string(),
             samples: samples.to_vec(),
+            digest: WorkloadDigest::new(),
         }
     }
 
@@ -707,6 +861,48 @@ mod tests {
             (got - (200.0f64 / 3.0).sqrt()).abs() < 1e-9,
             "population stddev expected, got {got}"
         );
+    }
+
+    #[test]
+    fn both_token_streams_satisfy_the_before_check_they_are_handed_to() {
+        // The generators and the guard have to agree, or the BEFORE
+        // check would be a refusal of every run rather than of a bad
+        // one. `vocab` deliberately includes values smaller than the
+        // stream, where the modulo wraps.
+        for &(vocab, n) in &[(49152usize, 512usize), (7, 512), (2, 4), (49152, 1)] {
+            bench_guard::check_prompt_before("pp", n, &synthetic_tokens(vocab, n), vocab).unwrap();
+            bench_guard::check_prompt_before("tg", n, &decode_tokens(vocab, n), vocab).unwrap();
+        }
+    }
+
+    #[test]
+    fn the_decode_stream_is_the_one_the_loop_used_to_generate_inline() {
+        // Hoisting it out of the timed loop must not have changed the
+        // workload: same ids, same order, so digests published before
+        // and after this change still describe the same work.
+        let vocab = 32000;
+        let inline: Vec<usize> = (0..128).map(|i| (i + 1) % vocab).collect();
+        assert_eq!(decode_tokens(vocab, 128), inline);
+    }
+
+    #[test]
+    fn a_repetition_that_returned_no_logits_is_refused_rather_than_timed() {
+        let mut first = None;
+        let err = check_result("pp512", 1, &[], &mut first)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("returned no logits"), "{err}");
+    }
+
+    #[test]
+    fn the_first_repetitions_answer_becomes_the_one_the_rest_must_match() {
+        let mut first = None;
+        check_result("pp512", 0, &[0.1, 0.9, 0.2], &mut first).unwrap();
+        assert_eq!(first, Some((1, 0.9)));
+        // Same answer, different magnitudes: still the same work.
+        check_result("pp512", 1, &[0.2, 0.7, 0.1], &mut first).unwrap();
+        // A different answer from the same token stream is not.
+        assert!(check_result("pp512", 2, &[0.9, 0.1, 0.2], &mut first).is_err());
     }
 
     #[test]

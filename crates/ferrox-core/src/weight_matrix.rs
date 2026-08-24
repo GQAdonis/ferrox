@@ -4382,6 +4382,89 @@ mod tests {
         }
     }
 
+    /// `apply_batch` under int-dot against an f32 dequantize-and-dot
+    /// reference that never touches the packed buffer.
+    ///
+    /// Every other batch test compares `apply_batch` against `apply`,
+    /// which under int-dot is the packed **GEMV** against the packed
+    /// **GEMM** -- two kernels reading the *same* interleaved bytes. That
+    /// catches a bad kernel but is structurally blind to a bad
+    /// `pack_q*_matrix_x*`: both sides read the same wrong bytes and
+    /// agree. `dequant_row` is the only reference in the tree that
+    /// re-derives the weights from the canonical GGUF blocks, so it is
+    /// the only one that can see a mis-interleave.
+    ///
+    /// The bound is the Q8/Q8_K *activation* quantization floor, not the
+    /// kernel's, and it is scaled by the RMS of the reference outputs
+    /// rather than per element: these synthetic weights are uniform
+    /// random bytes, so individual dots cancel to near zero and a
+    /// per-element relative bound would be meaningless. Worst deviation
+    /// measured across every shape below, on an M2 Pro (i8mm), is 0.016 x
+    /// RMS; 0.12 keeps a 7x margin. Coarse on purpose -- a mis-pack
+    /// decorrelates the output from the reference entirely (measured at
+    /// 2.07 x RMS for a one-row shift in the Q5_K `qh` interleave), an
+    /// order of magnitude past this bound.
+    #[test]
+    fn int_dot_batch_matches_dequant_dot_reference() {
+        let _g = ForceIntDot::new(true);
+        assert!(cpu_int_dot_enabled(), "this test needs the packed path");
+        for kind in BATCH_SHAPE_KINDS {
+            // Rows straddle both tile widths: below the tile, one short
+            // of it, exactly it, one past it, and multi-group with a
+            // tail. Batch straddles the 4-wide activation quad. cols 256
+            // is the minimum K for a K-quant (one super-block).
+            for rows in [1, 3, 5, 7, 8, 9, 19] {
+                for cols in [256, 512] {
+                    for batch_size in [1, 3, 4, 9] {
+                        assert_int_dot_matches_dequant_dot(kind, rows, cols, batch_size, 23);
+                    }
+                }
+            }
+        }
+        // Q8_0/Q4_0 alone can go down to a single 32-element block.
+        for kind in [QuantKind::Q8_0, QuantKind::Q4_0] {
+            for rows in [1, 3, 4, 5, 11] {
+                for batch_size in [1, 3, 4, 9] {
+                    assert_int_dot_matches_dequant_dot(kind, rows, 32, batch_size, 29);
+                }
+            }
+        }
+    }
+
+    fn assert_int_dot_matches_dequant_dot(
+        kind: QuantKind,
+        rows: usize,
+        cols: usize,
+        batch_size: usize,
+        seed: usize,
+    ) {
+        let x_batch: Vec<f32> = (0..batch_size * cols)
+            .map(|i| (((i * 37 + seed) % 89) as f32) * 0.019 - 0.8)
+            .collect();
+        let matrix = synth_quant_matrix(kind, rows, cols);
+        let got = matrix.apply_batch(&x_batch, batch_size);
+        assert_eq!(got.len(), batch_size * rows);
+
+        let mut want = vec![0f32; batch_size * rows];
+        for r in 0..rows {
+            let w = matrix.dequant_row(r);
+            assert_eq!(w.len(), cols);
+            for b in 0..batch_size {
+                let x = &x_batch[b * cols..(b + 1) * cols];
+                want[b * rows + r] = w.iter().zip(x.iter()).map(|(a, b)| a * b).sum();
+            }
+        }
+        let rms = (want.iter().map(|v| v * v).sum::<f32>() / want.len() as f32).sqrt();
+        for (i, (g, w)) in got.iter().zip(want.iter()).enumerate() {
+            let err = (g - w).abs();
+            assert!(
+                err < 0.12 * rms.max(1e-3),
+                "{kind:?} rows {rows} cols {cols} batch_size {batch_size} [flat {i}]: \
+                 int-dot={g} dequant-dot={w} (err {err}, rms {rms})"
+            );
+        }
+    }
+
     /// Large enough that `par_chunked_groups` builds a real 2D chunk grid
     /// (32 row-groups × 17 activation tiles) instead of falling back to
     /// one-chunk-per-thread — every (group, tile-range) seam in the

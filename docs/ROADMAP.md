@@ -1,84 +1,95 @@
 # Roadmap
 
-Goal: match or beat [llama.cpp](https://github.com/ggerganov/llama.cpp)
-tok/s on the same host, backend, and GGUF. Current speed numbers:
-`[benchmarks/RESULTS.md](../benchmarks/RESULTS.md)`.
+The goal is to match or beat [llama.cpp](https://github.com/ggerganov/llama.cpp)
+tok/s on the same host, the same backend and the same GGUF. Current
+numbers: [`benchmarks/RESULTS.md`](../benchmarks/RESULTS.md).
 
-What ships today: `[FEATURES.md](FEATURES.md)` · `[MODELS.md](MODELS.md)`.
+What ships today: [`FEATURES.md`](FEATURES.md) ·
+[`MODELS.md`](MODELS.md).
 
-## Engine parity gaps (ledger)
+## Speed gaps against llama.cpp
 
-Closed since the last gap rewrite: bench last-token `lm_head` only;
-CPU Q4_K batch GEMM (`gemm_q4_kx8_group` in `weight_matrix`); SmolLM2 Metal
-greedy lm_head; OLMoE Metal gather + `mul_mm_sg` / Q4_0 `mul_mv_id`; Qwen
-shared-expert loader fallback; CPU MoE token→expert bucketing (`moe_ffn_batch`);
-dense Metal prefill stack QKV bias + QK-norm (Qwen2.5 / Qwen3 / Gemma-3).
+Closed since the last pass over this list: bench last-token `lm_head`
+only, CPU Q4_K batch GEMM (`gemm_q4_kx8_group` in `weight_matrix`),
+SmolLM2 Metal greedy lm_head, OLMoE Metal gather plus `mul_mm_sg` and
+Q4_0 `mul_mv_id`, the Qwen shared-expert loader fallback, CPU MoE
+token-to-expert bucketing (`moe_ffn_batch`), and dense Metal prefill
+stack QKV bias with QK-norm (Qwen2.5 / Qwen3 / Gemma-3).
 
-Still open (see [`benchmarks/RESULTS.md`](../benchmarks/RESULTS.md) Open):
+Still open (see the Open section of
+[`benchmarks/RESULTS.md`](../benchmarks/RESULTS.md)):
 
-- **Metal prefill** — Qwen2.5 / Qwen3 / Gemma-3 Q8_0 dense stack now
-  includes QKV bias + QK-norm (was ~18–21× hybrid CPU proj; now ~1.2–2.1×).
-  Remaining: OLMoE gather→`mul_mm_sg`→scatter vs fused `kernel_mul_mm_id`;
-  dense 1–3B (~1.5–3×); compiled graph / pre-encoded CB replay for sub-1.5B ≤1×.
-- **CPU prefill/decode** — Phi-4 / Mistral Q4_K pp512 after GEMM
-  re-measure; i8mm SMMLA if still >1×; persistent decode threadpool.
-- **Correctness** — Gemma-4 e2e chat smoke; older Gemma-2 Metal greedy gate
-  remains in-tree for regression only (not in published suite).
+- **Metal prefill.** The Qwen2.5 / Qwen3 / Gemma-3 Q8_0 dense stack now
+  includes QKV bias and QK-norm, which took it from roughly 18–21×
+  hybrid CPU projection down to 1.2–2.1×. What remains: OLMoE
+  gather → `mul_mm_sg` → scatter against a fused `kernel_mul_mm_id`,
+  dense 1–3B (~1.5–3×), and a compiled graph or pre-encoded command
+  buffer replay to get sub-1.5B models to 1× or better.
+- **CPU prefill and decode.** Phi-4 and Mistral Q4_K `pp512` need
+  measuring again after the GEMM change. i8mm SMMLA if the gap is still
+  above 1×. A persistent decode threadpool.
+- **Correctness.** Gemma-4 end-to-end chat smoke test. The older
+  Gemma-2 Metal greedy check stays in the tree for regressions only,
+  and is not part of the published suite.
 
-Where the project should go beyond closing the measured gaps.
+## Where the project goes next
+
+Beyond closing the measured gaps.
 
 1. **Run bigger models on the same hardware.** Make Qwen3 35B-A3B Q5
-  usable on a box that today only sensibly runs Q4, or an 8B. Most items
-   below serve this.
-2. **RAM / VRAM optimization.** Residency planning exists
-  (`ferrox inspect-plan`); what is missing is acting on it hard enough to
-   change which models fit — tighter KV (`turbo3`, quantized CTK),
-   streaming expert residency, not materializing activations we do not
-   need.
-3. **Hybrid CPU/GPU, especially MoE.** Routed experts are the natural
-  split: hot experts resident on GPU, cold ones streamed or run on CPU.
-   `PlacementPlan` and `ExpertStore` are the groundwork.
-4. **CUDA performance.** The kernels now build and run on real hardware
-  but have had no tuning pass.
-5. **Tool calling** and **full OpenAI API compatibility** — see
-  `[API.md](API.md)`. Grammar/JSON-schema constrained decoding and MCP
-   invocation are the gaps.
-6. **Docker images**, so none of the above requires a Rust toolchain to
-  evaluate.
+   usable on a box that today handles Q4, or an 8B. Most of what
+   follows serves this.
+2. **RAM and VRAM optimization.** Residency planning already exists
+   (`ferrox inspect-plan`). What is missing is acting on it hard enough
+   to change which models fit: tighter KV (`turbo3`, quantized CTK),
+   streaming expert residency, and not materializing activations
+   nothing reads.
+3. **Hybrid CPU/GPU, especially for MoE.** Routed experts are the
+   natural split. Hot experts stay resident on the GPU, cold ones get
+   streamed or run on CPU. `PlacementPlan` and `ExpertStore` are the
+   groundwork.
+4. **CUDA performance.** The kernels build and run on real hardware.
+   Nobody has tuned them.
+5. **Tool calling and full OpenAI API compatibility.** See
+   [`API.md`](API.md). Grammar and JSON-schema constrained decoding,
+   plus MCP invocation, are the gaps.
+6. **Docker images**, so evaluating any of this stops requiring a Rust
+   toolchain.
 
 **Models**
 
-- Gemma-4 tokenizer (`gemma4`) + e2e chat smoke (engine loads today)
-- HybridEngine + Qwen3.5
-- Llama 4 / MiniMax engines
-- Vision (projector + generate)
-- Real GLM-5.2 / DeepSeek V4 / full Kimi e2e
+- Gemma-4 tokenizer (`gemma4`) plus an end-to-end chat smoke test (the
+  engine loads today)
+- HybridEngine and Qwen3.5
+- Llama 4 and MiniMax engines
+- Vision (projector plus generate)
+- Real GLM-5.2, DeepSeek V4 and full Kimi, run end to end
 - MTP draft heads
-- Qwen2-MoE / Mixtral pins when GGUF fits Host B
+- Qwen2-MoE and Mixtral pins, once the GGUF fits Host B
 
 **Serving**
 
-- Tool calling: OpenAI `tools` / `tool_choice` request + response shape
-- Full grammar / JSON schema constrained decoding
-- MCP tool invocation; Anthropic streaming + tools
-- Full OpenAI API surface (see `[API.md](API.md)`)
-- Docker images (CPU / Metal / CUDA variants)
-- Continuous-batching multi-request throughput measurement
-- Full KV layer offload; multi-GPU / tensor parallel / PD disaggregation
+- Tool calling: the OpenAI `tools` / `tool_choice` request and response
+  shape
+- Full grammar and JSON-schema constrained decoding
+- MCP tool invocation, plus Anthropic streaming and tools
+- The rest of the OpenAI API surface (see [`API.md`](API.md))
+- Docker images (CPU, Metal and CUDA variants)
+- Throughput measurement for concurrent continuous-batching requests
+- Full KV layer offload, multi-GPU, tensor parallel, PD disaggregation
 
-**KV cache / memory**
+**KV cache and memory**
 
-- `turbo3` dtype; Metal WHT on the CTK path
-- Act on `inspect-plan`'s residency plan: stream cold experts, bound the
-KV budget, report what a host can actually fit
-- Hybrid CPU/GPU expert placement for MoE — the main lever for running a
-larger model or a higher quant on unchanged hardware
+- The `turbo3` dtype, and Metal WHT on the CTK path
+- Act on the residency plan `inspect-plan` produces: stream cold
+  experts, bound the KV budget, report what a host really fits
+- Hybrid CPU/GPU expert placement for MoE, the main lever for running a
+  larger model or a higher quant on unchanged hardware
 
 **Engineering practice worth taking from llama.cpp**
 
-- A `test-backend-ops` equivalent: every kernel checked against a CPU
-reference across shapes and quant kinds, so a backend can never be
-merged that merely runs fast.
-- Build the CUDA feature combination in CI, even without a GPU to run it
-on. The break above was a compile error, not a runtime one.
-
+- Something equivalent to `test-backend-ops`: every kernel checked
+  against a CPU reference across shapes and quant kinds, so no backend
+  gets merged on the strength of running fast alone.
+- Build the CUDA feature combination in CI, even with no GPU to run it
+  on. The last break there was a compile error, not a runtime one.

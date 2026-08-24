@@ -10,7 +10,7 @@ cargo build --release -p ferrox-cli                    # CPU only
 ```
 
 Binary: `./target/release/ferrox`. One executable covers every backend
-compiled in; pick at runtime with `-dev` / `-ngl`.
+compiled into it. Pick one at runtime with `-dev` / `-ngl`.
 
 ## Completion (`run`)
 
@@ -36,8 +36,8 @@ compiled in; pick at runtime with `-dev` / `-ngl`.
 # Threads + context
 ./target/release/ferrox -m model.gguf -p "Hi" -n 64 -t 8 -c 4096
 
-# Largest context that fits, chosen before the weights load; the
-# arithmetic behind the number is printed to stderr
+# Largest context that fits, chosen before the weights load. The
+# arithmetic behind the number is printed to stderr.
 ./target/release/ferrox -m model.gguf -p "Hi" -n 64 -c auto
 
 # List devices, then select Metal (requires a --features metal build)
@@ -60,7 +60,7 @@ Same via explicit subcommand: `ferrox run -m …`.
 | `-f` / `--file` | Prompt from file |
 | `-n` / `--n-predict` | `-1` = fill remaining context |
 | `-c` / `--ctx-size` | `auto` = largest that fits the device memory budget, `0` = GGUF `{arch}.context_length` (else 4096), or a token count |
-| `--strict-budget` | Refuse to load when the pre-load budget says the context will not fit (default: warn and continue) |
+| `--strict-budget` | Stop with an error when the pre-load budget says the context will not fit (default: warn and continue) |
 | `-t` / `--threads` | Sets `RAYON_NUM_THREADS` |
 | `--temp` | `0` = greedy |
 | `--top-k` | `0` = off |
@@ -70,7 +70,7 @@ Same via explicit subcommand: `ferrox run -m …`.
 | `-dev` / `--device` | `auto`, `none`, `cpu`, `metal`, or `cuda` |
 | `--list-devices` | Print compiled, detected devices and exit |
 | `-ngl` / `--gpu-layers` / `--n-gpu-layers` | `0`, a number, `auto`, or `all` |
-| `--ctk` | KV dtype: `f16` (default), `q8_0`/`turbo8`/`fp8`/`turbo4` (Metal), `turbo3` (falls back) — sets `FERROX_CTK` |
+| `--ctk` | KV dtype: `f16` (default), `q8_0`/`turbo8`/`fp8`/`turbo4` (Metal), `turbo3` (falls back). Sets `FERROX_CTK` |
 | `--system` | Chat mode only |
 | `--no-cnv` | Skip chat-template wrap |
 | `-e` / `--escape` | `\n` `\t` `\r` `\\` in `-p` |
@@ -80,7 +80,11 @@ Same via explicit subcommand: `ferrox run -m …`.
 
 Stderr prints load and throughput timings. Generated text goes to stdout.
 
-**Speculative decoding:** prompt-lookup demo via `ferrox speculative` (no draft model). `--mtp` is reserved for future MiniMax/GLM MTP draft heads (`num_nextn_predict_layers`) and currently errors.
+**Speculative decoding:** `ferrox speculative` is a prompt-lookup demo.
+It matches n-grams against the history, there is no draft model, and it
+runs on synthetic random weights, so the hit rate it prints tells you
+nothing about a real drafter. `--mtp` is reserved for MiniMax/GLM MTP
+draft heads (`num_nextn_predict_layers`) and errors today.
 
 `--device none` (or `cpu`) and `-ngl 0` force CPU. Default is
 `--device auto -ngl auto`. Any positive `-ngl`, `auto`, or `all` enables
@@ -96,13 +100,13 @@ not available yet).
 
 ### Who adds BOS
 
-**The chat template owns BOS when it prints one; the loader owns it
-otherwise.** Which of the two applies is a property of the individual
+**The chat template owns BOS when it prints one. Otherwise the loader
+owns it.** Which of the two applies is a property of the individual
 checkpoint, not of the model family, so ferrox adds the id
 *idempotently* (`ferrox_models::tokenizer::prepend_bos`) rather than
 picking a side:
 
-- Most upstream templates open with `{{ bos_token }}` — gemma-2/3/4
+- Most upstream templates open with `{{ bos_token }}`: gemma-2/3/4
   (`<bos>`), Mistral-Instruct and Phi-3 (`<s>`), Llama-3
   (`<|begin_of_text|>`), DeepSeek-R1-Distill. Rendering one puts BOS in the
   *text*, and encoding splits on special-token text, so it comes back as
@@ -127,10 +131,10 @@ On the whole end-of-generation set, not `tokenizer.ggml.eos_token_id`
 alone: the `eos`/`eot`/`eom` metadata ids plus every vocabulary entry whose
 text is on llama.cpp's literal EOG list (`<|eot_id|>`, `<end_of_turn>`,
 `<|im_end|>`, `<turn|>`, …). A Llama-3 checkpoint's `eos_token_id` is
-`<|end_of_text|>` while its turns end with `<|eot_id|>`; stopping on the
-metadata EOS alone runs the model past its own turn and it starts
-interviewing itself. `--ignore-eos` disables all of it. The same set is
-used by `ferrox-server`.
+`<|end_of_text|>` while its turns end with `<|eot_id|>`. Stop on the
+metadata EOS alone and the model runs past its own turn, then starts
+interviewing itself. `--ignore-eos` disables all of it. `ferrox-server`
+uses the same set.
 
 ## Other commands
 
@@ -146,7 +150,7 @@ used by `ferrox-server`.
 ./target/release/ferrox presets
 ./target/release/ferrox smoke glm-5.2
 
-# Kimi K3 safetensors directory (large checkpoint; see MODELS.md)
+# Kimi K3 safetensors directory (large checkpoint, see MODELS.md)
 ./target/release/ferrox run-kimi /path/to/kimi --prompt "Hi" --max-new-tokens 32
 ```
 
@@ -177,15 +181,15 @@ llama's top-1 ranks for ferrox, then gives one of four verdicts:
 |---|---|
 | `MATCH` | same distribution to within f32 accumulation-order noise |
 | `DRIFT` | same top-1, distributions moved further than reordering explains |
-| `TIE-FLIP` | top-1 differs, but llama's own top-2 margin is under the observed noise — a tie swapped, not a wrong graph |
-| `WRONG` | the graphs disagree; exits non-zero |
+| `TIE-FLIP` | top-1 differs, but llama's own top-2 margin is under the observed noise, so a tie swapped rather than the graph being wrong |
+| `WRONG` | the graphs disagree, and the command exits non-zero |
 
-Greedy *text* is deliberately not the medium: a chain of argmaxes turns
+Comparing greedy *text* would not work here. A chain of argmaxes turns
 one last-bit difference into a different sentence, so a text diff cannot
 tell `TIE-FLIP` from `WRONG`.
 
 `parity` needs the reference dumper built once. It is C, not Rust, and
-lives outside the cargo workspace on purpose — it exists to be
+it lives outside the cargo workspace on purpose. It exists to give
 llama.cpp's own answer, so it links llama.cpp's own library:
 
 ```bash
@@ -202,7 +206,7 @@ Download a GGUF via the [`hf` CLI](https://huggingface.co/docs/huggingface_hub/g
 
 ```bash
 ./target/release/ferrox pull org/model --file '*.gguf'
-# Prints local path; also works as: ferrox -m org/model (auto-download when path missing)
+# Prints the local path. Also works as: ferrox -m org/model (downloads when the path is missing)
 ```
 
 Cache default: `~/.cache/ferrox/hf/<org--model>/`.
@@ -233,10 +237,7 @@ OpenAI-compatible HTTP API:
   -m models/tinyllama-1.1b-chat-v1.0.Q8_0.gguf \
   --host 127.0.0.1 --port 8383 -dev metal -ngl all
 
-# Optional browser UI at / and /ui
-./target/release/ferrox-server -m model.gguf
-
-# MCP config (metadata in GET /v1/models; invoke not wired)
+# MCP config (metadata under GET /v1/models, invocation is not wired up)
 ./target/release/ferrox-server -m model.gguf --mcp-config mcp.json
 
 curl -s -X POST http://127.0.0.1:8383/v1/chat/completions \
@@ -247,16 +248,16 @@ curl -s -X POST http://127.0.0.1:8383/v1/chat/completions \
 ### Running under a supervisor
 
 ```bash
-# Kernel picks the port; the bound address is announced on stdout
+# The kernel picks the port. The bound address is announced on stdout.
 ./target/release/ferrox-server -m model.gguf --port 0 --exit-on-stdin-close
-{"event":"ferrox.server.ready","addr":"127.0.0.1:52091","port":52091,"scheme":"http","pid":4242,"version":"0.8.0"}
+{"event":"ferrox.server.ready","addr":"127.0.0.1:52091","port":52091,"scheme":"http","pid":4242,"version":"0.9.1"}
 ```
 
-`--port 0` plus that one line removes the need for a parent process to
-probe whether a port is free, or to work out whether an existing
-listener is a stale copy of itself or a stranger's server. Read stdout
-line by line and ignore anything that is not the ready event — the
-tracing subscriber shares the stream.
+`--port 0` plus that one line saves a parent process from probing
+whether a port is free, or working out whether an existing listener is
+a stale copy of itself or a stranger's server. Read stdout line by line
+and ignore anything that is not the ready event. The tracing subscriber
+shares the stream.
 
 `--exit-on-stdin-close` (or `FERROX_EXIT_ON_STDIN_CLOSE=1`) exits when
 stdin reaches EOF, which is the one orphan-prevention mechanism that
@@ -269,16 +270,21 @@ that asks for it and keeps the pipe open.
 The server accepts `-m/--model`, `--host`, `--port`, `-t/--threads`,
 `-dev/--device`, `-ngl/--n-gpu-layers`, `--exit-on-stdin-close`, and
 `--list-devices`. Existing
-`FERROX_MODEL_PATH`, `FERROX_ADDR`, and backend environment variables remain
-supported; command-line values take precedence. Keep secrets such as
-`FERROX_API_KEY` in the environment.
+`FERROX_MODEL_PATH`, `FERROX_ADDR`, and the backend environment
+variables all still work. Command-line values win over them. Keep
+secrets such as `FERROX_API_KEY` in the environment.
+
+The web UI is a separate app. See [`ui/`](../ui) and
+[`crates/ferrox-server/README.md`](../crates/ferrox-server/README.md).
+`GET /` on this server is a 404 like any other unknown path.
 
 ## Benchmark (`ferrox bench`)
 
-With `-m`, `bench` is a [`llama-bench`](https://github.com/ggerganov/llama.cpp/tree/master/tools/llama-bench)
-work-alike: same workload names (`pp<N>` batched prefill, `tg<N>` decode),
-same reporting (median ± population stddev over `-r` reps, one warmup
-discarded), same flag names — so the two outputs can be read side by side.
+With `-m`, `bench` works like [`llama-bench`](https://github.com/ggerganov/llama.cpp/tree/master/tools/llama-bench).
+Same workload names (`pp<N>` batched prefill, `tg<N>` decode), same
+reporting (median ± population stddev over `-r` reps, one warmup
+discarded), same flag names. Put the two outputs side by side and they
+line up.
 
 ```bash
 # one GGUF (CPU). Prints the exact llama-bench command to compare against.
@@ -295,24 +301,24 @@ discarded), same flag names — so the two outputs can be read side by side.
 
 | Flag | Meaning |
 |---|---|
-| `-m/--model` | GGUF to benchmark; without it, `bench` runs the synthetic matvec microbenchmark instead |
-| `-p/--n-prompt` | Prefill tokens (default 512; `0` skips the `pp` row) |
-| `-n/--n-gen` | Decode steps (default 128; `0` skips the `tg` row) |
+| `-m/--model` | GGUF to benchmark. Without it, `bench` runs the synthetic matvec microbenchmark instead |
+| `-p/--n-prompt` | Prefill tokens (default 512, `0` skips the `pp` row) |
+| `-n/--n-gen` | Decode steps (default 128, `0` skips the `tg` row) |
 | `-r/--repetitions` | Timed reps (default 3), plus one discarded warmup |
 | `-t/--threads` | CPU threads (`0` = performance-core default) |
-| `--n-gpu-layers` | `0` forces CPU; anything else offloads |
+| `--n-gpu-layers` | `0` forces CPU, anything else offloads |
 | `--compare` | Also run `llama-bench` on the same GGUF and print the gap |
-| `--suite` | Run every [`benchmarks/suite.json`](../benchmarks/suite.json) entry (fresh process each), write receipts, re-render [`RESULTS.md`](../benchmarks/RESULTS.md) |
-| `--render` | Re-render the RESULTS table from existing receipts, measuring nothing |
+| `--suite` | Run every [`benchmarks/suite.json`](../benchmarks/suite.json) entry in its own process, write a timing file per run, re-render [`RESULTS.md`](../benchmarks/RESULTS.md) |
+| `--render` | Re-render the RESULTS table from the timing files already on disk, measuring nothing |
 | `--id` / `--backend` | Restrict `--suite` to one entry / backend |
 | `--fit-host` / `--skip-missing` | Skip entries too large for the host / with no GGUF present |
-| `--max-load` | Refuse to time a run when the host's 1-minute load average is at or above this (default `2.0`; `0` disables). `--suite` checks once up front and forwards the bar to every child |
+| `--max-load` | Stop instead of timing when the host's 1-minute load average is at or above this (default `2.0`, `0` disables). `--suite` checks once up front and forwards the bar to every child |
 
 ### One model at a time
 
-Every command that loads weights — `run`, `bench`, `verify`, `smoke`,
-`run-kimi`, and `ferrox-server` — registers itself and **refuses to start
-while another ferrox process is already holding a model**:
+Every command that loads weights (`run`, `bench`, `verify`, `smoke`,
+`run-kimi`, and `ferrox-server`) registers itself, and **stops with an
+error when another ferrox process is already holding a model**:
 
 ```
 $ ferrox -m model.gguf -p "hi"
@@ -324,28 +330,29 @@ instance, or pass --allow-multiple-instances (or set
 FERROX_ALLOW_MULTIPLE_INSTANCES=1) to start anyway.
 ```
 
-Prefill is a dense GEMM across every core and the decode pool spins, so
-two instances do not run at half speed each — they contend. Pass
-`--allow-multiple-instances` (or set `FERROX_ALLOW_MULTIPLE_INSTANCES=1`)
-when you want them anyway.
+Prefill is a dense GEMM across every core, and the decode pool spins.
+Two instances do not run at half speed each. They fight over the same
+cores. Pass `--allow-multiple-instances` (or set
+`FERROX_ALLOW_MULTIPLE_INSTANCES=1`) when you want them anyway.
 
 Header-only commands (`inspect`, `inspect-plan`, `presets`, `archs`,
 `caps`), the HTTP client (`chat`), the downloader (`pull`) and
-`bench --suite` / `--render` are exempt: none of them puts weights in
+`bench --suite` / `--render` are exempt. None of them puts weights in
 memory, and `--suite` is a supervisor whose children each register on
 their own.
 
 The registry is a directory of one small file per live process
-(`$FERROX_INSTANCE_DIR`, default `~/.cache/ferrox/instances`). An entry
-whose process is gone — a `kill -9`, a crash — is pruned by the next run
-rather than blocking it. It is **advisory, not a lock**: two processes
-starting in the same instant can each see the other and both refuse,
-which is the safe direction, but nothing here stops a determined caller.
+(`$FERROX_INSTANCE_DIR`, default `~/.cache/ferrox/instances`). When a
+process is gone, after a `kill -9` or a crash, the next run prunes its
+entry instead of being blocked by it. This is **advisory, not a lock**.
+Two processes starting in the same instant each see the other and both
+stop, which is the safe direction, and nothing here holds back a
+determined caller.
 
 Add or change models in [`benchmarks/suite.json`](../benchmarks/suite.json)
-(`id`, `name`, `gguf`, `backends`, `estimated_ram_gb`). No HTTP, chat
-template, tokenizer, or sampling — same line llama.cpp draws with
-`llama-bench` next to `llama-server`. Details:
+(`id`, `name`, `gguf`, `backends`, `estimated_ram_gb`). No HTTP, no
+chat template, no tokenizer, no sampling. That is the same line
+llama.cpp draws between `llama-bench` and `llama-server`. Details:
 [`benchmarks/README.md`](../benchmarks/README.md).
 
 See also: [`FEATURES.md`](FEATURES.md) · [`MODELS.md`](MODELS.md) · [`API.md`](API.md).

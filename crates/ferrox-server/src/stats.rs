@@ -86,6 +86,9 @@ impl Stats {
 pub(crate) struct Record<'a> {
     pub(crate) request_id: &'a str,
     pub(crate) route: &'a str,
+    /// The model that served it, not the one the request named. See
+    /// [`ferrox_api::RecentRequest::model`].
+    pub(crate) model: Option<String>,
     pub(crate) status: u16,
     pub(crate) stream: bool,
     /// Whole server-side wall time: queue wait, prefill and decode.
@@ -107,6 +110,7 @@ pub(crate) fn entry(record: Record<'_>) -> RecentRequest {
         request_id: record.request_id.to_string(),
         at_ms: crate::tasks::now_ms(),
         route: record.route.to_string(),
+        model: record.model,
         status: record.status,
         prompt_tokens: usage.map(|u| u.prompt_tokens).unwrap_or(0),
         completion_tokens: usage.map(|u| u.completion_tokens).unwrap_or(0),
@@ -134,6 +138,7 @@ mod tests {
         let e = entry(Record {
             request_id: "chatcmpl-1",
             route: ferrox_api::routes::V1_CHAT_COMPLETIONS,
+            model: Some("served-model".to_string()),
             status: 200,
             stream: true,
             duration_ms: 1_100,
@@ -152,6 +157,7 @@ mod tests {
         let e = entry(Record {
             request_id: "chatcmpl-2",
             route: "/v1/completions",
+            model: None,
             status: 200,
             stream: false,
             duration_ms: 42,
@@ -171,6 +177,7 @@ mod tests {
             stats.record(entry(Record {
                 request_id: "id",
                 route: "/r",
+                model: None,
                 status: 200,
                 stream: false,
                 duration_ms: 1,
@@ -189,6 +196,7 @@ mod tests {
             stats.record(entry(Record {
                 request_id: &format!("id-{i}"),
                 route: "/r",
+                model: None,
                 status: 200,
                 stream: false,
                 duration_ms: 1,
@@ -211,6 +219,7 @@ mod tests {
         stats.record(entry(Record {
             request_id: "id-e",
             route: "/v1/chat/completions",
+            model: None,
             status: 503,
             stream: false,
             duration_ms: 3,
@@ -232,6 +241,7 @@ mod tests {
         let e = entry(Record {
             request_id: "id",
             route: "/r",
+            model: None,
             status: 200,
             stream: false,
             duration_ms: 1,
@@ -244,6 +254,7 @@ mod tests {
         let anonymous = entry(Record {
             request_id: "id",
             route: "/r",
+            model: None,
             status: 200,
             stream: false,
             duration_ms: 1,

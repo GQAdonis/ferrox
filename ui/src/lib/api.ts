@@ -804,6 +804,12 @@ export type StatsRow = {
   at_ms: number;
   request_id: string;
   route: string;
+  /**
+   * The model that SERVED this request, as /v1/models names it — not
+   * the `model` field the request carried, which this server ignores.
+   * Null when nothing was loaded.
+   */
+  model?: string | null;
   status: number;
   stream: boolean;
   prompt_tokens?: number | null;

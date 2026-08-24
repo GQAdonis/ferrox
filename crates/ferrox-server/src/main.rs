@@ -744,6 +744,12 @@ impl AppState {
     /// than looked up here: by the time a generation task finishes, the
     /// request parts are long gone, and reconstructing "who was that"
     /// afterwards is exactly the guessing the monitor exists to avoid.
+    /// The model that would serve a request right now, as `/v1/models`
+    /// names it. `None` when nothing is loaded.
+    pub(crate) fn active_model_name(&self) -> Option<String> {
+        self.active().map(|a| a.model.name().to_string())
+    }
+
     pub(crate) fn record_request(&self, record: stats::Record<'_>) {
         self.stats.record(stats::entry(record));
     }
@@ -1964,6 +1970,7 @@ async fn chat_completions(
         state.record_request(stats::Record {
             request_id: &request_id,
             route: ferrox_api::routes::V1_CHAT_COMPLETIONS,
+            model: state.active_model_name(),
             status: response.status().as_u16(),
             stream,
             duration_ms: started.elapsed().as_millis() as u64,
@@ -2005,6 +2012,9 @@ async fn chat_completions(
         state.record_request(stats::Record {
             request_id: &request_id,
             route: ferrox_api::routes::V1_CHAT_COMPLETIONS,
+            // `None` here is the 503 case and says so: nothing was
+            // loaded, so nothing served it.
+            model: state.active_model_name(),
             status: response.status().as_u16(),
             stream,
             duration_ms: started.elapsed().as_millis() as u64,
@@ -2101,6 +2111,9 @@ async fn chat_completions_full(
     state.record_request(stats::Record {
         request_id: &request_id,
         route: ferrox_api::routes::V1_CHAT_COMPLETIONS,
+        // The handle this request decoded against, not `req.model`: a
+        // swap mid-flight does not change which weights answered.
+        model: Some(active.model.name().to_string()),
         status: 200,
         stream: false,
         duration_ms: started.elapsed().as_millis() as u64,
@@ -2148,6 +2161,9 @@ async fn chat_completions_stream(
     let batcher = active.batcher.clone();
     let mut params = req.generation_params_for_template(active.model.chat_template());
     let stats_state = Arc::clone(&state);
+    // Read now, off the handle this stream will decode against. Read
+    // later it would name whatever a swap had made current by then.
+    let served_model = active.model.name().to_string();
 
     // Tier two of cancellation: the id is already on the wire, so the
     // client can name it. The guard rides with the generation task and
@@ -2335,6 +2351,7 @@ async fn chat_completions_stream(
                 stats_state.record_request(stats::Record {
                     request_id: &request_id,
                     route: ferrox_api::routes::V1_CHAT_COMPLETIONS,
+                    model: Some(served_model.clone()),
                     status: 200,
                     stream: true,
                     duration_ms: started.elapsed().as_millis() as u64,
@@ -2352,6 +2369,7 @@ async fn chat_completions_stream(
                 stats_state.record_request(stats::Record {
                     request_id: &request_id,
                     route: ferrox_api::routes::V1_CHAT_COMPLETIONS,
+                    model: Some(served_model.clone()),
                     status: 500,
                     stream: true,
                     duration_ms: started.elapsed().as_millis() as u64,
@@ -3968,6 +3986,69 @@ mod tests {
             "an unauthenticated call is null, not a fingerprint of nothing"
         );
         assert!(recent[2]["client"].is_null());
+    }
+
+    /// The row names the model that SERVED the request. `req.model` is
+    /// ignored by this server -- it decodes against whatever is loaded
+    /// -- so echoing that string back would make the log agree with the
+    /// caller's belief instead of with what happened.
+    #[tokio::test]
+    async fn a_row_names_the_model_that_served_it_not_the_one_requested() {
+        let state = Arc::new(test_state(
+            named_test_model("really-loaded", 256),
+            ResponseCache::new(4, Duration::from_secs(60)),
+        ));
+        let app = test_app_with_state(Arc::clone(&state));
+
+        let (status, _) = post_json_uri(
+            &app,
+            "/v1/chat/completions",
+            serde_json::json!({
+                "model": "gpt-4-turbo-that-is-not-here",
+                "messages": [{"role": "user", "content": "hi"}],
+                "max_tokens": 2
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let (_, stats) = get_json(&app, ferrox_api::routes::ADMIN_STATS).await;
+        assert_eq!(stats["recent"][0]["model"], "really-loaded");
+
+        // Nothing loaded: nothing served it, and the row says so rather
+        // than repeating what the request asked for.
+        state.swap_active(None);
+        let (status, _) = post_json_uri(
+            &app,
+            "/v1/chat/completions",
+            serde_json::json!({
+                "model": "gpt-4-turbo-that-is-not-here",
+                "messages": [{"role": "user", "content": "hi"}]
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        let (_, stats) = get_json(&app, ferrox_api::routes::ADMIN_STATS).await;
+        let recent = stats["recent"].as_array().unwrap();
+        assert!(recent[recent.len() - 1]["model"].is_null());
+    }
+
+    /// A streamed request names its model too, and names the handle it
+    /// decoded against rather than whatever a swap made current while it
+    /// was running.
+    #[tokio::test]
+    async fn a_streamed_row_names_the_model_it_decoded_against() {
+        let state = Arc::new(test_state(
+            named_test_model("model-before", 256),
+            ResponseCache::new(4, Duration::from_secs(60)),
+        ));
+        let app = test_app_with_state(Arc::clone(&state));
+        let _ = post_sse_raw(&app, resumable_request()).await;
+        // The stream has finished; a swap now must not rewrite history.
+        active_model(&state, "model-after");
+
+        let (_, stats) = get_json(&app, ferrox_api::routes::ADMIN_STATS).await;
+        assert_eq!(stats["recent"][0]["model"], "model-before");
     }
 
     /// The queue gauge reports a queue that exists or says there is

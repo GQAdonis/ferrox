@@ -258,6 +258,14 @@ pub struct RecentRequest {
     /// Unix epoch milliseconds when the request finished.
     pub at_ms: u64,
     pub route: String,
+    /// The model that **served** this request, as `/v1/models` names it.
+    ///
+    /// Not the `model` field the client sent. ferrox serves whatever is
+    /// loaded and ignores that string, so echoing it back would make
+    /// the log agree with the caller's belief rather than with what
+    /// happened -- and after a model swap those are different answers.
+    /// `null` when nothing was loaded, which is what a 503 row means.
+    pub model: Option<String>,
     pub status: u16,
     pub prompt_tokens: usize,
     pub completion_tokens: usize,
@@ -450,6 +458,7 @@ mod tests {
             request_id: "chatcmpl-1".into(),
             at_ms: 10,
             route: "/v1/chat/completions".into(),
+            model: Some("Qwen3-0.6B-Q4_K_M".into()),
             status: 200,
             prompt_tokens: 100,
             completion_tokens: 10,
@@ -474,6 +483,7 @@ mod tests {
             request_id: "chatcmpl-1".into(),
             at_ms: 10,
             route: "/v1/tokenize".into(),
+            model: None,
             status: 200,
             prompt_tokens: 0,
             completion_tokens: 0,
@@ -485,7 +495,7 @@ mod tests {
             client: None,
         };
         let json = serde_json::to_value(&recent).unwrap();
-        for key in ["via_api_key", "client"] {
+        for key in ["via_api_key", "client", "model"] {
             assert!(json.get(key).is_some(), "{key} was omitted entirely");
             assert!(json[key].is_null(), "{key} was not null");
         }

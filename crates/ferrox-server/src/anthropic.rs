@@ -231,6 +231,7 @@ pub async fn messages(
     state.record_request(crate::stats::Record {
         request_id: &request_id,
         route: ferrox_api::routes::V1_MESSAGES,
+        model: Some(active.model.name().to_string()),
         status: 200,
         stream: false,
         duration_ms: started.elapsed().as_millis() as u64,

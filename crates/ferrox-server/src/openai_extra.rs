@@ -16,36 +16,72 @@ use crate::{
     AppState,
 };
 
-/// Records one of the small endpoints in the `/admin/stats` ring, with
-/// the status the caller actually saw.
+/// What one of the small endpoints knows before it does any work.
 ///
-/// These three used not to be recorded at all, which made the monitor
-/// quietly wrong rather than merely incomplete: an editor hammering
-/// `/v1/embeddings` showed up as an idle server. A failure is recorded
-/// with its own status for the same reason -- a 400 that leaves no
-/// trace is indistinguishable from a request that was never sent.
-fn record_outcome<T>(
-    state: &AppState,
-    request_id: &str,
-    route: &str,
+/// Captured at entry so the ring entry can be written from the same
+/// facts however the handler ends -- and so the three of them travel
+/// together instead of as three positional arguments that are each
+/// easy to pass in the wrong order.
+struct Call {
+    request_id: String,
     started: std::time::Instant,
-    result: &Result<T, ApiError>,
-    usage: Option<&ferrox_api::Usage>,
-    attribution: &Attribution,
-) {
-    let status = match result {
-        Ok(_) => 200,
-        Err((code, _)) => code.as_u16(),
-    };
-    state.record_request(crate::stats::Record {
-        request_id,
-        route,
-        status,
-        stream: false,
-        duration_ms: started.elapsed().as_millis() as u64,
-        usage: result.is_ok().then_some(usage).flatten(),
-        attribution,
-    });
+    attribution: Attribution,
+}
+
+impl Call {
+    fn new(headers: &axum::http::HeaderMap) -> Self {
+        Call {
+            request_id: ferrox_api::next_request_id(),
+            started: std::time::Instant::now(),
+            attribution: Attribution::from_headers(headers),
+        }
+    }
+
+    /// Records a call that reached a response. Spelled out rather than
+    /// left as a `&Ok(())` at the call site, which reads like a
+    /// mistake.
+    fn record_success(
+        &self,
+        state: &AppState,
+        route: &str,
+        model: Option<String>,
+        usage: Option<&ferrox_api::Usage>,
+    ) {
+        self.record(state, route, model, &Ok::<(), ApiError>(()), usage);
+    }
+
+    /// Records this call in the `/admin/stats` ring, with the status
+    /// the caller actually saw.
+    ///
+    /// These endpoints used not to be recorded at all, which made the
+    /// monitor quietly wrong rather than merely incomplete: an editor
+    /// hammering `/v1/embeddings` showed up as an idle server. A
+    /// failure is recorded with its own status for the same reason -- a
+    /// 400 that leaves no trace is indistinguishable from a request
+    /// that was never sent.
+    fn record<T>(
+        &self,
+        state: &AppState,
+        route: &str,
+        model: Option<String>,
+        result: &Result<T, ApiError>,
+        usage: Option<&ferrox_api::Usage>,
+    ) {
+        let status = match result {
+            Ok(_) => 200,
+            Err((code, _)) => code.as_u16(),
+        };
+        state.record_request(crate::stats::Record {
+            request_id: &self.request_id,
+            route,
+            model,
+            status,
+            stream: false,
+            duration_ms: self.started.elapsed().as_millis() as u64,
+            usage: result.is_ok().then_some(usage).flatten(),
+            attribution: &self.attribution,
+        });
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -104,23 +140,19 @@ pub async fn tokenize(
     headers: axum::http::HeaderMap,
     Json(req): Json<TokenizeRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let attribution = Attribution::from_headers(&headers);
-    let started = std::time::Instant::now();
-    let request_id = ferrox_api::next_request_id();
+    let call = Call::new(&headers);
     let result = tokenize_inner(&state, req);
     // No `usage`, deliberately. Tokenizing runs the tokenizer and not
     // the model, and `prompt_tokens` here feeds `tokens_prompt_total`,
     // which means "tokens this server put through a forward pass".
     // Counting a tokenize call into it would inflate every throughput
     // number derived from it.
-    record_outcome(
+    call.record(
         &state,
-        &request_id,
         ferrox_api::routes::V1_TOKENIZE,
-        started,
+        state.active_model_name(),
         &result,
         None,
-        &attribution,
     );
     result
 }
@@ -146,19 +178,15 @@ pub async fn detokenize(
     headers: axum::http::HeaderMap,
     Json(req): Json<DetokenizeRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let attribution = Attribution::from_headers(&headers);
-    let started = std::time::Instant::now();
-    let request_id = ferrox_api::next_request_id();
+    let call = Call::new(&headers);
     let result = detokenize_inner(&state, req);
     // Same reasoning as `tokenize`: no forward pass, so no usage.
-    record_outcome(
+    call.record(
         &state,
-        &request_id,
         ferrox_api::routes::V1_DETOKENIZE,
-        started,
+        state.active_model_name(),
         &result,
         None,
-        &attribution,
     );
     result
 }
@@ -214,9 +242,7 @@ pub async fn embeddings(
     headers: axum::http::HeaderMap,
     Json(req): Json<EmbeddingsRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let attribution = Attribution::from_headers(&headers);
-    let started = std::time::Instant::now();
-    let request_id = ferrox_api::next_request_id();
+    let call = Call::new(&headers);
     let result = embeddings_inner(&state, req).await;
     // Embeddings *do* run the model, so the prompt tokens they paid for
     // are real prompt tokens and are recorded as such. There is no
@@ -226,14 +252,12 @@ pub async fn embeddings(
         .as_ref()
         .ok()
         .map(|(_, prompt_tokens)| ferrox_api::Usage::new(*prompt_tokens, 0));
-    record_outcome(
+    call.record(
         &state,
-        &request_id,
         ferrox_api::routes::V1_EMBEDDINGS,
-        started,
+        state.active_model_name(),
         &result,
         usage.as_ref(),
-        &attribution,
     );
     result.map(|(body, _)| Json(body))
 }
@@ -348,9 +372,7 @@ pub async fn completions(
     headers: axum::http::HeaderMap,
     Json(req): Json<CompletionsRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let attribution = Attribution::from_headers(&headers);
-    let started = std::time::Instant::now();
-    let request_id = ferrox_api::next_request_id();
+    let call = Call::new(&headers);
     let active = state.require_active()?;
     let params = GenerationParams {
         max_tokens: req.max_tokens,
@@ -402,18 +424,15 @@ pub async fn completions(
         FinishReason::Cancelled => "cancelled",
     };
     let model_name = req.model.unwrap_or_else(|| active.model.name().to_string());
-    state.record_request(crate::stats::Record {
-        request_id: &request_id,
-        route: ferrox_api::routes::V1_COMPLETIONS,
-        status: 200,
-        stream: false,
-        duration_ms: started.elapsed().as_millis() as u64,
-        usage: Some(&usage),
-        attribution: &attribution,
-    });
+    call.record_success(
+        &state,
+        ferrox_api::routes::V1_COMPLETIONS,
+        Some(active.model.name().to_string()),
+        Some(&usage),
+    );
 
     Ok(Json(serde_json::json!({
-        "id": request_id,
+        "id": call.request_id,
         "object": "text_completion",
         "model": model_name,
         "choices": [{

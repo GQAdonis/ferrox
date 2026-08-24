@@ -272,6 +272,7 @@ Set `HF_TOKEN` (or `HUGGING_FACE_HUB_TOKEN`) for gated repos, and
   "recent": [{
     "request_id": "chatcmpl-b28a1aeab8f8000000",
     "at_ms": 1786718007013, "route": "/v1/chat/completions",
+    "model": "Qwen3-0.6B-Q4_K_M",   // what SERVED it, not what it asked for
     "status": 200, "prompt_tokens": 17, "completion_tokens": 24,
     "ttft_ms": 6586.2, "duration_ms": 23603, "decode_ms": 17004.8,
     "stream": false,
@@ -303,6 +304,12 @@ is no decode loop to time.
 scheduler's queue and are `null` — not `0` — when batching is off, because
 then nothing queues at all: every request gets its own blocking thread. A
 gauge reading `0` claims an empty queue was measured.
+
+`model` names the model that answered, as `/v1/models` reports it, and
+never the `model` field the request carried — this server decodes
+against whatever is loaded and ignores that string, so echoing it back
+would make the log agree with the caller's belief rather than with what
+happened. `null` means nothing was loaded, which is what a 503 row is.
 
 **Attribution.** `via_api_key` is a short fingerprint of the bearer key
 that served the request, never the key and never anything the key can be

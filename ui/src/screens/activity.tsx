@@ -102,6 +102,26 @@ const columns = [
     ),
   }),
   column.accessor("route", { header: "route" }),
+  column.accessor((r) => r.model ?? "", {
+    id: "model",
+    header: "model",
+    cell: (c) =>
+      c.getValue() ? (
+        <span
+          className="block max-w-[12rem] truncate font-mono"
+          title={`Served by ${c.getValue()} — not necessarily the model the request asked for.`}
+        >
+          {c.getValue()}
+        </span>
+      ) : (
+        <span
+          className="text-faint"
+          title="Nothing was loaded, so nothing served it."
+        >
+          —
+        </span>
+      ),
+  }),
   column.accessor("status", {
     header: "status",
     cell: (c) => (
@@ -461,6 +481,10 @@ export function ActivityScreen() {
           <code className="font-mono">completion_tokens / decode_ms</code> and
           nothing else — dividing by duration is how a fast model gets reported
           as a slow one, so the two are never combined here.{" "}
+          <strong className="font-semibold text-muted">model</strong> is the
+          model that answered, not the one the request named — this server
+          decodes against whatever is loaded, so the two differ whenever a
+          client is configured for someone else’s model id.{" "}
           <strong className="font-semibold text-muted">key</strong> is a
           fingerprint of the bearer token that served the request — never the
           token, and comparable only between rows of this server run.{" "}

@@ -23,6 +23,8 @@ half = { workspace = true }
 ferrox-core = { workspace = true }
 ferrox-models = { workspace = true }
 ferrox-safetensors = { workspace = true }
+# Optional, and off by default -- see the `serve` feature below.
+ferrox-server = { workspace = true, optional = true }
 clap = { workspace = true }
 anyhow = { workspace = true }
 serde_json = { workspace = true }
@@ -37,6 +39,23 @@ default = []
 # no `apply_gpu` CUDA arm -- and `cargo build -p ferrox-cli --features
 # cuda` does not compile at all. Only ever caught on a real CUDA host,
 # because CI has none.
-cuda = ["ferrox-cuda/cuda", "ferrox-models/cuda"]
+cuda = ["ferrox-cuda/cuda", "ferrox-models/cuda", "ferrox-server?/cuda"]
 # Caps detection + Metal apply_gpu dispatch through ferrox-models.
-metal = ["ferrox-metal/metal", "ferrox-models/metal"]
+metal = ["ferrox-metal/metal", "ferrox-models/metal", "ferrox-server?/metal"]
+# `ferrox serve`: the OpenAI-compatible HTTP server, linked in from the
+# ferrox-server library rather than reimplemented, so both front ends
+# share one `ServerArgs` and one code path.
+#
+# OFF BY DEFAULT, and that is deliberate. The server pulls ~98 crates
+# the CLI does not (axum, tokio, hyper, rustls, ureq), which is a C
+# toolchain and several minutes of build time for somebody who typed
+# `cargo install ferrox-cli` to run one prompt. Worse, a default-on
+# feature is what every *dependent* crate gets unless it remembers
+# `default-features = false`, so defaulting it on would push a TLS stack
+# onto builds that never asked for one. The prebuilt release artifacts
+# are built with `--features serve`, so the download path -- which is
+# how most people get ferrox -- still gets one binary that does both.
+#
+# The `?` in the cuda/metal features above matters: they must forward to
+# ferrox-server *only if it is already in the graph*, never enable it.
+serve = ["dep:ferrox-server"]

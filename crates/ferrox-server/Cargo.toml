@@ -10,6 +10,14 @@ readme = "README.md"
 keywords = ["llm", "openai", "server", "inference", "ferrox"]
 categories = ["web-programming::http-server", "science"]
 
+# The server is a library with a two-line binary in front of it, not a
+# binary with everything inside `fn main`. ferrox-cli's optional `serve`
+# feature links this lib, so `ferrox serve` and `ferrox-server` run the
+# same code from the same `ServerArgs`.
+[lib]
+name = "ferrox_server"
+path = "src/lib.rs"
+
 [[bin]]
 name = "ferrox-server"
 path = "src/main.rs"

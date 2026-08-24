@@ -79,7 +79,9 @@ cargo install ferrox-server --features metal   # the HTTP server
 cargo build --release -p ferrox-cli -p ferrox-server --features metal
 ```
 
-Neither install pulls in a GPU backend unless you ask for it.
+Neither install pulls in a GPU backend unless you ask for it. `serve` is
+off by default too: it pulls in 98 crates the CLI does not otherwise
+need, including a C crypto library, so a CLI-only install stays small.
 
 ## Quick start
 
@@ -95,7 +97,8 @@ ferrox -m models/Llama-3.2-3B-Instruct-Q4_K_M.gguf \
   -p "Explain quantization in two sentences" -n 128 -dev metal -ngl all
 
 # 3. Or serve it on 127.0.0.1:8383 and point any OpenAI client at /v1.
-ferrox-server -m models/Llama-3.2-3B-Instruct-Q4_K_M.gguf -dev metal -ngl all &
+#    `ferrox serve` needs --features serve. `ferrox-server` is the same server standalone.
+ferrox serve -m models/Llama-3.2-3B-Instruct-Q4_K_M.gguf -dev metal -ngl all &
 curl -s -X POST http://127.0.0.1:8383/v1/chat/completions \
   -H 'content-type: application/json' \
   -d '{"model":"m","messages":[{"role":"user","content":"Hi"}],"max_tokens":64}'

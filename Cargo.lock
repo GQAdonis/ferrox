@@ -445,6 +445,7 @@ dependencies = [
  "ferrox-models",
  "ferrox-quant",
  "ferrox-safetensors",
+ "ferrox-server",
  "half",
  "rayon",
  "serde_json",

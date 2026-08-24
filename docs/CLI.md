@@ -236,7 +236,26 @@ FERROX_MODEL_PATH=model.gguf FERROX_ADDR=127.0.0.1:8383 ./target/release/ferrox-
 
 ## Server
 
-OpenAI-compatible HTTP API:
+Two ways to start the same server. `ferrox serve` is a subcommand of the
+main binary and needs the optional `serve` feature at build time.
+`ferrox-server` is that same server as its own executable, and both
+parse identical arguments through the same code.
+
+Build the CLI with `--features serve` to get the subcommand:
+
+```bash
+cargo build --release -p ferrox-cli --features "serve metal"
+
+./target/release/ferrox serve \
+  -m models/tinyllama-1.1b-chat-v1.0.Q8_0.gguf \
+  --host 127.0.0.1 --port 8383 -dev metal -ngl all
+```
+
+Without the feature, `ferrox serve` still exists and explains itself
+rather than reporting an unknown subcommand, since a compiled-out
+feature and a missing one look identical from the outside otherwise.
+
+The standalone binary takes the same flags:
 
 ```bash
 ./target/release/ferrox-server \

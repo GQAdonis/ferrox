@@ -1,4 +1,4 @@
-//! ferrox CLI — llama.cpp-style GGUF completion (`-m`/`-p`/`-n`/…) plus
+//! ferrox CLI, llama.cpp-style GGUF completion (`-m`/`-p`/`-n`/…) plus
 //! inspect / presets / smoke / Kimi helpers. See `docs/CLI.md`.
 
 mod bench_guard;
@@ -42,9 +42,28 @@ enum Commands {
     Run(run::InferArgs),
     /// Multi-turn chat REPL against a running `ferrox-server` (HTTP).
     ///
-    /// Reuses the server's chat-template + streaming path — start the
+    /// Reuses the server's chat-template + streaming path, start the
     /// server first (`FERROX_MODEL_PATH=… ferrox-server`).
     Chat(chat::ChatArgs),
+    /// Serve the OpenAI-compatible HTTP API (needs `--features serve`).
+    ///
+    /// Identical to the standalone `ferrox-server` binary: same flags,
+    /// same routes, same `ferrox.server.ready` line on stdout, it links
+    /// the same library rather than reimplementing it.
+    #[cfg(feature = "serve")]
+    Serve(ferrox_server::ServerArgs),
+    /// Serve the OpenAI-compatible HTTP API. NOT BUILT INTO THIS BINARY.
+    ///
+    /// Present so the failure is a sentence instead of clap's
+    /// "unrecognized subcommand", which reads like the feature does not
+    /// exist rather than like it was compiled out.
+    #[cfg(not(feature = "serve"))]
+    Serve {
+        /// Swallowed so `ferrox serve -m model.gguf` reaches the
+        /// explanation below instead of dying on an unexpected flag.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, hide = true)]
+        args: Vec<String>,
+    },
     /// Download a GGUF from Hugging Face Hub (`hf download`).
     Pull(pull::PullArgs),
     /// Print GGUF header metadata and tensor list for a model file.
@@ -152,7 +171,7 @@ enum Commands {
     ///
     /// `verify` compares ferrox-CPU against ferrox-Metal, so both can be
     /// wrong together. This feeds the same token ids to llama.cpp's own
-    /// library and compares the logit distributions — not greedy text,
+    /// library and compares the logit distributions, not greedy text,
     /// which cannot separate a wrong graph from two near-tied logits
     /// swapping.
     Parity {
@@ -328,6 +347,71 @@ fn init_rayon_threads() {
     }
 }
 
+/// What `ferrox serve` says when the binary was built without the
+/// `serve` feature.
+///
+/// Names the fix rather than the symptom: the subcommand is real, the
+/// server is simply not linked into this build, and "unrecognized
+/// subcommand" would send the reader looking for a version that has it.
+#[cfg(not(feature = "serve"))]
+const SERVE_FEATURE_MISSING: &str = "\
+this ferrox was built without the `serve` feature, so it has no HTTP server.
+Rebuild with it:  cargo install ferrox-cli --features serve
+Or run the standalone binary:  ferrox-server -m model.gguf
+(The prebuilt release binaries are built with --features serve.)";
+
+/// Every subcommand `Commands` declares, as clap will name it.
+///
+/// This list is what tells [`rewrite_llama_style_argv`] that `ferrox
+/// serve …` is a subcommand and not llama.cpp-style top-level flags.
+/// A subcommand missing from here does not fail loudly -- it is silently
+/// rewritten into `ferrox run …` and starts a *completion*. Adding a
+/// variant to `Commands` therefore means adding it here too, which
+/// `every_clap_subcommand_survives_the_argv_rewriter` enforces against
+/// clap's own subcommand list.
+const SUBCOMMANDS: &[&str] = &[
+    "run",
+    "pull",
+    "chat",
+    "serve",
+    "inspect",
+    "inspect-plan",
+    "presets",
+    "archs",
+    "caps",
+    "smoke",
+    "run-real",
+    "bench",
+    "verify",
+    "parity",
+    "speculative",
+    "run-kimi",
+    "help",
+];
+
+// A backend feature on `ferrox` has to reach the server it links, or one
+// binary answers two different ways: `ferrox run --device metal` uses the
+// GPU and `ferrox serve --device metal` refuses with "built without
+// --features metal". The forwarding is one `ferrox-server?/metal` in
+// Cargo.toml and dropping it still compiles, so it is asserted here
+// instead of being rechecked by hand at release time.
+#[cfg(all(feature = "serve", feature = "metal"))]
+const _: () = assert!(
+    ferrox_server::BUILT_WITH_METAL,
+    "ferrox-cli's `metal` feature must forward to ferrox-server: \
+     metal = [.., \"ferrox-server?/metal\"]"
+);
+#[cfg(all(feature = "serve", feature = "cuda"))]
+const _: () = assert!(
+    ferrox_server::BUILT_WITH_CUDA,
+    "ferrox-cli's `cuda` feature must forward to ferrox-server: \
+     cuda = [.., \"ferrox-server?/cuda\"]"
+);
+
+/// Root flags that take no value and may legally appear *before* a
+/// subcommand, because clap declares them `global = true`.
+const GLOBAL_FLAGS: &[&str] = &["--allow-multiple-instances"];
+
 /// Rewrite `ferrox -m …` into `ferrox run -m …` so llama.cpp-style
 /// top-level flags work without typing the `run` subcommand.
 fn rewrite_llama_style_argv(args: Vec<String>) -> Vec<String> {
@@ -342,25 +426,21 @@ fn rewrite_llama_style_argv(args: Vec<String>) -> Vec<String> {
     if args.len() < 2 {
         return args;
     }
-    const SUBCOMMANDS: &[&str] = &[
-        "run",
-        "pull",
-        "chat",
-        "inspect",
-        "inspect-plan",
-        "presets",
-        "archs",
-        "caps",
-        "smoke",
-        "run-real",
-        "bench",
-        "verify",
-        "parity",
-        "speculative",
-        "run-kimi",
-        "help",
-    ];
-    let first = args[1].as_str();
+    // A `global = true` flag is allowed to precede the subcommand it
+    // applies to, so `ferrox --allow-multiple-instances serve` has to
+    // find `serve` at position 2. Without this skip the rewriter sees a
+    // flag, assumes llama.cpp style, and produces `ferrox run
+    // --allow-multiple-instances serve …`, which dies on "unexpected
+    // argument 'serve'". Only value-less root flags belong in this list
+    // -- one that took a value would make position 2 its value, not a
+    // subcommand.
+    let first_word = args
+        .iter()
+        .skip(1)
+        .position(|a| !GLOBAL_FLAGS.contains(&a.as_str()))
+        .map(|offset| offset + 1)
+        .unwrap_or(1);
+    let first = args[first_word].as_str();
     if SUBCOMMANDS.contains(&first)
         || first == "-h"
         || first == "--help"
@@ -385,11 +465,19 @@ fn rewrite_llama_style_argv(args: Vec<String>) -> Vec<String> {
 /// `bench --suite` / `--render` are deliberately exempt: none of them
 /// puts weights in memory, and `--suite` is a supervisor whose children
 /// each register on their own.
-fn claim_instance(cli: &Cli) -> anyhow::Result<Option<ferrox_core::instance::InstanceGuard>> {
-    use ferrox_core::instance::{register, InstancePolicy};
-    let (command, model): (&str, Option<String>) = match &cli.command {
-        Commands::Run(a) => ("run", a.model.clone()),
-        Commands::Verify { model, .. } => ("verify", Some(model.clone())),
+/// How this command should identify itself in the instance registry, or
+/// `None` when it must not register at all.
+///
+/// `serve` is the interesting `None`: it *does* load a model, but
+/// `ferrox_server::run_server` registers itself as `"server"` before it
+/// binds. Registering here too would put two guards on one pid, and
+/// since both name the same registry file, the inner one's `Drop` would
+/// delete the entry while the server was still holding the weights,
+/// making a live server invisible to the next `ferrox run`.
+fn instance_target(command: &Commands) -> Option<(&'static str, Option<String>)> {
+    match command {
+        Commands::Run(a) => Some(("run", a.model.clone())),
+        Commands::Verify { model, .. } => Some(("verify", Some(model.clone()))),
         Commands::Bench {
             model,
             suite,
@@ -397,13 +485,22 @@ fn claim_instance(cli: &Cli) -> anyhow::Result<Option<ferrox_core::instance::Ins
             ..
         } => {
             if *suite || *render || model.is_none() {
-                return Ok(None);
+                return None;
             }
-            ("bench", model.clone())
+            Some(("bench", model.clone()))
         }
-        Commands::Smoke { preset, .. } => ("smoke", Some(preset.clone())),
-        Commands::RunKimi { checkpoint_dir, .. } => ("run-kimi", Some(checkpoint_dir.clone())),
-        _ => return Ok(None),
+        Commands::Smoke { preset, .. } => Some(("smoke", Some(preset.clone()))),
+        Commands::RunKimi { checkpoint_dir, .. } => {
+            Some(("run-kimi", Some(checkpoint_dir.clone())))
+        }
+        _ => None,
+    }
+}
+
+fn claim_instance(cli: &Cli) -> anyhow::Result<Option<ferrox_core::instance::InstanceGuard>> {
+    use ferrox_core::instance::{register, InstancePolicy};
+    let Some((command, model)) = instance_target(&cli.command) else {
+        return Ok(None);
     };
     // The flag is an explicit opt-in, so it wins outright; the env var
     // only decides when the flag was not passed.
@@ -434,6 +531,14 @@ fn main() -> anyhow::Result<()> {
     match cli.command {
         Commands::Run(args) => run::run_infer(args)?,
         Commands::Chat(args) => chat::run_chat(args)?,
+        // Blocking, and it builds its own Tokio runtime: nothing above
+        // this point has started one. It also claims the instance
+        // registry itself (as `server`), which is why `instance_target`
+        // deliberately leaves `serve` alone.
+        #[cfg(feature = "serve")]
+        Commands::Serve(args) => ferrox_server::run_server(args)?,
+        #[cfg(not(feature = "serve"))]
+        Commands::Serve { .. } => anyhow::bail!(SERVE_FEATURE_MISSING),
         Commands::Pull(args) => pull::run_pull(args)?,
         Commands::Inspect { path } => {
             let file = ShardedGguf::open(&path)?;
@@ -1200,7 +1305,289 @@ fn main() -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod cli_tests {
-    use super::rewrite_llama_style_argv;
+    use super::{rewrite_llama_style_argv, SUBCOMMANDS};
+
+    fn rewrite(argv: &[&str]) -> Vec<String> {
+        rewrite_llama_style_argv(argv.iter().copied().map(String::from).collect())
+    }
+
+    /// `try_parse_from`, not `parse_from`: clap's non-`try` parser exits
+    /// the *process* on a parse error, which takes the whole test binary
+    /// down with it and reports as "test exited abnormally" instead of
+    /// naming the test that broke.
+    fn parse_cli(argv: Vec<String>) -> super::Cli {
+        use clap::Parser;
+        super::Cli::try_parse_from(&argv)
+            .unwrap_or_else(|e| panic!("`{}` did not parse: {e}", argv.join(" ")))
+    }
+
+    /// Every subcommand clap knows about has to be in `SUBCOMMANDS`, or
+    /// the rewriter turns it into an implicit `run` and the user gets a
+    /// completion instead of the command they typed. This is a silent
+    /// failure -- no error, no clue -- so it is asserted structurally
+    /// against clap's own list rather than against a second hand-written
+    /// one that can drift the same way.
+    #[test]
+    fn every_clap_subcommand_survives_the_argv_rewriter() {
+        use clap::CommandFactory;
+        for sub in super::Cli::command().get_subcommands() {
+            let name = sub.get_name().to_string();
+            assert!(
+                SUBCOMMANDS.contains(&name.as_str()),
+                "subcommand `{name}` is missing from SUBCOMMANDS: `ferrox {name} …` would be \
+                 rewritten into an implicit `run`"
+            );
+            let rewritten = rewrite(&["ferrox", &name, "-m", "model.gguf"]);
+            assert_eq!(
+                rewritten[1], name,
+                "`ferrox {name}` must reach clap as `{name}`, not as `{}`",
+                rewritten[1]
+            );
+        }
+    }
+
+    /// The named case of the above, kept explicit because `serve` is the
+    /// one that would start a *completion* while the user waited for an
+    /// HTTP server: it prints tokens and exits 0, so a supervisor
+    /// watching for the `ferrox.server.ready` line just hangs.
+    #[test]
+    fn serve_is_not_rewritten_into_an_implicit_run() {
+        assert_eq!(
+            rewrite(&["ferrox", "serve", "-m", "model.gguf", "--port", "0"]),
+            ["ferrox", "serve", "-m", "model.gguf", "--port", "0"]
+        );
+    }
+
+    /// The rewriter still has to translate llama.cpp's multi-character
+    /// short options *inside* a `serve` invocation -- `ferrox-server`
+    /// accepted `-ngl`/`-dev`, so `ferrox serve` has to as well.
+    #[test]
+    fn serve_keeps_the_llama_style_short_options() {
+        assert_eq!(
+            rewrite(&["ferrox", "serve", "-ngl", "all", "-dev", "metal"]),
+            [
+                "ferrox",
+                "serve",
+                "--n-gpu-layers",
+                "all",
+                "--device",
+                "metal"
+            ]
+        );
+    }
+
+    /// `serve` must not claim a registry slot from here: the server
+    /// claims its own as `"server"`, and a second guard on the same pid
+    /// would deregister the live server when it dropped.
+    #[test]
+    fn serve_does_not_claim_the_instance_registry_from_the_cli_side() {
+        let cli = parse_cli(rewrite(&["ferrox", "serve", "-m", "model.gguf"]));
+        assert!(
+            super::instance_target(&cli.command).is_none(),
+            "`ferrox serve` must leave the registry to ferrox_server::run_server"
+        );
+
+        // The other half of the invariant: a completion run still
+        // registers, so this test fails if `instance_target` were
+        // "fixed" by making it return None for everything.
+        let cli = parse_cli(rewrite(&["ferrox", "-m", "model.gguf"]));
+        assert_eq!(
+            super::instance_target(&cli.command).map(|(c, _)| c),
+            Some("run")
+        );
+    }
+
+    /// Flag parity with the standalone binary, asserted against
+    /// `ServerArgs` itself rather than against the documented subset:
+    /// `docs/CLI.md` lists eight of the eleven flags and reads as
+    /// exhaustive, so a `serve` written from the docs would ship a
+    /// downgrade nobody noticed.
+    #[cfg(feature = "serve")]
+    #[test]
+    fn serve_exposes_every_flag_ferrox_server_has() {
+        use clap::CommandFactory;
+        let ids = |cmd: &clap::Command| -> std::collections::BTreeSet<String> {
+            cmd.get_arguments()
+                .map(|a| a.get_id().to_string())
+                .filter(|id| id != "help" && id != "version")
+                .collect()
+        };
+        let standalone = ids(&ferrox_server::ServerArgs::command());
+        let root = super::Cli::command();
+        let serve = ids(root.find_subcommand("serve").expect("serve subcommand"));
+        assert!(
+            standalone.is_subset(&serve),
+            "`ferrox serve` is missing flags `ferrox-server` accepts: {:?}",
+            standalone.difference(&serve).collect::<Vec<_>>()
+        );
+    }
+
+    /// Parity of *values*, not just of flag names: every flag has to
+    /// land in the same field with the same value it would have reached
+    /// through `ferrox-server`'s own argv path. `--port 0` is in here on
+    /// purpose -- it is a request for a kernel-assigned port, and a
+    /// front end that dropped it would silently serve on 8383.
+    #[cfg(feature = "serve")]
+    #[test]
+    fn serve_parses_the_same_command_line_as_ferrox_server() {
+        use clap::Parser;
+        let flags = [
+            "-m",
+            "model.gguf",
+            "--host",
+            "0.0.0.0",
+            "--port",
+            "0",
+            "-t",
+            "4",
+            "--device",
+            "metal",
+            "--n-gpu-layers",
+            "all",
+            "--mcp-config",
+            "mcp.json",
+            "--exit-on-stdin-close",
+            "--allow-multiple-instances",
+        ];
+
+        let standalone = ferrox_server::ServerArgs::try_parse_from(
+            std::iter::once("ferrox-server").chain(flags),
+        )
+        .expect("ferrox-server accepts this command line");
+
+        let mut argv = vec!["ferrox".to_string(), "serve".to_string()];
+        argv.extend(flags.iter().map(|f| f.to_string()));
+        let cli = parse_cli(rewrite_llama_style_argv(argv));
+        let super::Commands::Serve(via_cli) = cli.command else {
+            panic!("`ferrox serve …` did not parse as the serve subcommand");
+        };
+
+        assert_eq!(via_cli, standalone);
+    }
+
+    /// `--allow-multiple-instances` is declared `global = true`, so both
+    /// sides of the subcommand are legal places to type it and both have
+    /// to reach the server -- if the leading form silently did nothing,
+    /// the server would refuse to start on a host where the operator
+    /// had already said a second instance was fine.
+    ///
+    /// Two mechanisms make it work, one of them not ours: the argv
+    /// rewriter must not mistake the leading flag for llama.cpp-style
+    /// argv (it used to, see the test below), and clap propagates the
+    /// root global's *value* into the subcommand's own flag because both
+    /// carry the id `allow_multiple_instances`. That second half is
+    /// clap's behaviour, not a guarantee we wrote, which is exactly why
+    /// it is pinned here: rename either side and this test fails while
+    /// nothing else would.
+    #[cfg(feature = "serve")]
+    #[test]
+    fn allow_multiple_instances_reaches_serve_from_either_side_of_the_subcommand() {
+        use clap::Parser;
+        let expected = ferrox_server::ServerArgs::try_parse_from([
+            "ferrox-server",
+            "-m",
+            "model.gguf",
+            "--allow-multiple-instances",
+        ])
+        .unwrap();
+
+        for argv in [
+            &[
+                "ferrox",
+                "serve",
+                "-m",
+                "model.gguf",
+                "--allow-multiple-instances",
+            ][..],
+            &[
+                "ferrox",
+                "--allow-multiple-instances",
+                "serve",
+                "-m",
+                "model.gguf",
+            ][..],
+        ] {
+            let cli = parse_cli(rewrite(argv));
+            assert!(
+                cli.allow_multiple_instances,
+                "`{}` did not set the root flag",
+                argv.join(" ")
+            );
+            let super::Commands::Serve(args) = cli.command else {
+                panic!("`{}` did not parse as the serve subcommand", argv.join(" "));
+            };
+            assert_eq!(
+                args,
+                expected,
+                "`{}` did not reach the server as an opt-in",
+                argv.join(" ")
+            );
+        }
+    }
+
+    /// The rewriter half of the above, stated on its own: a global flag
+    /// before the subcommand must not turn the subcommand into an
+    /// argument of an implicit `run`.
+    #[test]
+    fn a_global_flag_before_a_subcommand_does_not_trigger_the_run_rewrite() {
+        assert_eq!(
+            rewrite(&[
+                "ferrox",
+                "--allow-multiple-instances",
+                "serve",
+                "-m",
+                "x.gguf"
+            ]),
+            [
+                "ferrox",
+                "--allow-multiple-instances",
+                "serve",
+                "-m",
+                "x.gguf"
+            ]
+        );
+        // …and llama.cpp-style argv behind the same flag still gets it.
+        assert_eq!(
+            rewrite(&["ferrox", "--allow-multiple-instances", "-m", "x.gguf"]),
+            [
+                "ferrox",
+                "run",
+                "--allow-multiple-instances",
+                "-m",
+                "x.gguf"
+            ]
+        );
+    }
+
+    /// `--list-devices` is the flag that is easiest to lose, because it
+    /// exits before anything is served and so no smoke test covers it.
+    #[cfg(feature = "serve")]
+    #[test]
+    fn serve_accepts_list_devices_on_its_own() {
+        use clap::Parser;
+        let cli = parse_cli(rewrite(&["ferrox", "serve", "--list-devices"]));
+        let super::Commands::Serve(args) = cli.command else {
+            panic!("not the serve subcommand");
+        };
+        assert_eq!(
+            args,
+            ferrox_server::ServerArgs::try_parse_from(["ferrox-server", "--list-devices"]).unwrap()
+        );
+    }
+
+    /// Without the feature the subcommand still exists and still
+    /// swallows the server's flags, so the user gets the sentence that
+    /// names the fix instead of clap's "unrecognized subcommand".
+    #[cfg(not(feature = "serve"))]
+    #[test]
+    fn serve_without_the_feature_explains_itself_instead_of_erroring_out_of_clap() {
+        let cli = parse_cli(rewrite(&["ferrox", "serve", "-m", "model.gguf"]));
+        let super::Commands::Serve { args } = cli.command else {
+            panic!("`ferrox serve …` did not parse as the serve subcommand");
+        };
+        assert_eq!(args, ["-m", "model.gguf"]);
+        assert!(super::SERVE_FEATURE_MISSING.contains("--features serve"));
+    }
 
     #[test]
     fn rewrites_llama_multi_character_short_options() {

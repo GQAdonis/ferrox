@@ -79,10 +79,6 @@ export function AppShell() {
       <Nav onNavigate={() => setDrawer(false)} />
       <div className="mt-auto space-y-2">
         <HealthPill state={health} />
-        <p className="px-1 text-[0.6875rem] leading-snug text-faint">
-          Every screen here talks to the public HTTP API — the same one an
-          editor would use.
-        </p>
       </div>
     </div>
   );

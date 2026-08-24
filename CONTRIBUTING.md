@@ -19,23 +19,25 @@ kernel tests stay `#[ignore]`d on hosted CI.
 
 ## Benchmarks & presets
 
-- Preset fields: confirm against a primary source, or list in
-  `best_effort_fields`.
-- New quant kernels need independent goldens (not only self-parity).
-- Hardware claims state the machine, or say compile-tested only.
-- Speed ledger is `ferrox bench --suite` vs `llama-bench` (no HTTP),
-  driven from `benchmarks/suite.json` into `benchmarks/RESULTS.md`
-  (never hand-edit the table). To measure a new model, add an entry to
-  `suite.json`, place the GGUF under `models/`, then
+- Preset fields: confirm each one against a primary source, or list it
+  in `best_effort_fields`.
+- New quant kernels need independent goldens, not only self-parity.
+- A hardware claim names the machine it was measured on, or says
+  compile-tested only.
+- Speed numbers come from `ferrox bench --suite` against `llama-bench`,
+  with no HTTP in the loop. `benchmarks/suite.json` drives the runs and
+  `benchmarks/RESULTS.md` is generated from them, so never edit that
+  table by hand. To measure a new model, add an entry to `suite.json`,
+  put the GGUF under `models/`, then run
   `ferrox bench --suite --id <id> --fit-host --skip-missing`.
 - Never force a thread count on either engine. llama.cpp defaults to
   performance cores and loses 2-4x above them, so pinning both to the
-  same count flatters ferrox rather than making it fair.
-- Run-to-run spread on Apple Silicon is ~20%. Any claim under that needs
-  interleaved A/B (alternate the two binaries round by round in one
-  session and count rounds won), not two batches of runs.
-- Negative results get committed too. `.scratch/NOTES_LLAMA_*.md` is the
-  record of what was tried and did not work; it is as useful as the wins.
+  same count flatters ferrox instead of making the comparison fair.
+- Run-to-run spread on Apple Silicon is around 20%. A claim under that
+  needs an interleaved A/B: alternate the two binaries round by round in
+  one session and count rounds won. Two batches of runs will not do it.
+- Commit the negative results too. `.scratch/NOTES_LLAMA_*.md` records
+  what was tried and did not work, which is as useful as the wins.
 
 ## Documentation
 
@@ -45,8 +47,11 @@ kernel tests stay `#[ignore]`d on hosted CI.
 | `docs/CLI.md` | CLI flags and examples |
 | `docs/MODELS.md` | Supported models |
 | `docs/API.md` | HTTP API matrix |
-| `benchmarks/RESULTS.md` | Speed vs llama.cpp |
+| `docs/CONFIG.md` | Environment variables |
+| `benchmarks/RESULTS.md` | Speed vs llama.cpp (generated) |
+| `benchmarks/README.md` | How those numbers are measured |
 | `docs/ROADMAP.md` | Planned work |
 
-Don’t duplicate those. Plans belong in `ROADMAP.md`; git holds history.
-Don’t commit fast-staling counts (test totals, etc.) into prose.
+Do not duplicate those. Plans belong in `ROADMAP.md`, and git holds the
+history. Keep counts that go stale fast (test totals and the like) out
+of prose.

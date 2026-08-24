@@ -67,7 +67,7 @@ macOS arm64 with Metal and Linux x86_64 with CPU.
 From crates.io or source instead:
 
 ```bash
-cargo install ferrox-cli --features metal      # `ferrox`; --features cuda on Linux+NVIDIA
+cargo install ferrox-cli --features metal      # the `ferrox` binary. Use --features cuda on Linux+NVIDIA
 cargo install ferrox-server --features metal   # the HTTP server
 
 cargo build --release -p ferrox-cli -p ferrox-server --features metal

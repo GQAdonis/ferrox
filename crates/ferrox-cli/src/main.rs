@@ -1240,6 +1240,16 @@ mod cli_tests {
         rewrite_llama_style_argv(argv.iter().copied().map(String::from).collect())
     }
 
+    /// `try_parse_from`, not `parse_from`: clap's non-`try` parser exits
+    /// the *process* on a parse error, which takes the whole test binary
+    /// down with it and reports as "test exited abnormally" instead of
+    /// naming the test that broke.
+    fn parse_cli(argv: Vec<String>) -> super::Cli {
+        use clap::Parser;
+        super::Cli::try_parse_from(&argv)
+            .unwrap_or_else(|e| panic!("`{}` did not parse: {e}", argv.join(" ")))
+    }
+
     /// Every subcommand clap knows about has to be in `SUBCOMMANDS`, or
     /// the rewriter turns it into an implicit `run` and the user gets a
     /// completion instead of the command they typed. This is a silent
@@ -1300,8 +1310,7 @@ mod cli_tests {
     /// would deregister the live server when it dropped.
     #[test]
     fn serve_does_not_claim_the_instance_registry_from_the_cli_side() {
-        use clap::Parser;
-        let cli = super::Cli::parse_from(rewrite(&["ferrox", "serve", "-m", "model.gguf"]));
+        let cli = parse_cli(rewrite(&["ferrox", "serve", "-m", "model.gguf"]));
         assert!(
             super::instance_target(&cli.command).is_none(),
             "`ferrox serve` must leave the registry to ferrox_server::run_server"
@@ -1310,7 +1319,7 @@ mod cli_tests {
         // The other half of the invariant: a completion run still
         // registers, so this test fails if `instance_target` were
         // "fixed" by making it return None for everything.
-        let cli = super::Cli::parse_from(rewrite(&["ferrox", "-m", "model.gguf"]));
+        let cli = parse_cli(rewrite(&["ferrox", "-m", "model.gguf"]));
         assert_eq!(
             super::instance_target(&cli.command).map(|(c, _)| c),
             Some("run")
@@ -1377,7 +1386,7 @@ mod cli_tests {
 
         let mut argv = vec!["ferrox".to_string(), "serve".to_string()];
         argv.extend(flags.iter().map(|f| f.to_string()));
-        let cli = super::Cli::parse_from(rewrite_llama_style_argv(argv));
+        let cli = parse_cli(rewrite_llama_style_argv(argv));
         let super::Commands::Serve(via_cli) = cli.command else {
             panic!("`ferrox serve …` did not parse as the serve subcommand");
         };
@@ -1391,7 +1400,7 @@ mod cli_tests {
     #[test]
     fn serve_accepts_list_devices_on_its_own() {
         use clap::Parser;
-        let cli = super::Cli::parse_from(rewrite(&["ferrox", "serve", "--list-devices"]));
+        let cli = parse_cli(rewrite(&["ferrox", "serve", "--list-devices"]));
         let super::Commands::Serve(args) = cli.command else {
             panic!("not the serve subcommand");
         };
@@ -1407,8 +1416,7 @@ mod cli_tests {
     #[cfg(not(feature = "serve"))]
     #[test]
     fn serve_without_the_feature_explains_itself_instead_of_erroring_out_of_clap() {
-        use clap::Parser;
-        let cli = super::Cli::parse_from(rewrite(&["ferrox", "serve", "-m", "model.gguf"]));
+        let cli = parse_cli(rewrite(&["ferrox", "serve", "-m", "model.gguf"]));
         let super::Commands::Serve { args } = cli.command else {
             panic!("`ferrox serve …` did not parse as the serve subcommand");
         };

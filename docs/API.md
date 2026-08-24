@@ -164,6 +164,11 @@ server cannot disagree about them.
 | `POST /admin/tasks/{task_id}/cancel` | `200 {"ok":true}` |
 | `GET /admin/stats` | counters + recent-request ring |
 
+| Stream recovery | |
+|---|---|
+| `GET /v1/stream/{request_id}` | reconnect into a resumable stream (SSE) |
+| `GET /v1/stream/{request_id}/poll` | the same replay buffer over JSON |
+
 ### Models
 
 ```jsonc
@@ -286,12 +291,18 @@ Set `HF_TOKEN` (or `HUGGING_FACE_HUB_TOKEN`) for gated repos, and
   "tokens_prompt_total": 17, "tokens_generated_total": 24,
   "last_request_age_seconds": 0.02,
   "generating_now": 0,               // decoding right now, NOT a queue depth
+  "generating_now": 0,               // decoding right now; NOT a queue depth
+  "queue_depth": null,               // null unless continuous batching is on
+  "queue_rejected_total": null,      // turned away by the queue cap, since start
   "recent": [{
     "request_id": "chatcmpl-b28a1aeab8f8000000",
     "at_ms": 1786718007013, "route": "/v1/chat/completions",
+    "model": "Qwen3-0.6B-Q4_K_M",   // what SERVED it, not what it asked for
     "status": 200, "prompt_tokens": 17, "completion_tokens": 24,
     "ttft_ms": 6586.2, "duration_ms": 23603, "decode_ms": 17004.8,
-    "stream": false
+    "stream": false,
+    "via_api_key": "key-4f21a0c3",   // fingerprint, never the key; null if none
+    "client": "ferrox-studio"        // SELF-DECLARED (X-Ferrox-Client); null if absent
   }]
 }
 ```
@@ -305,8 +316,36 @@ dividing completion tokens by it reads a 50 tok/s model as 5.
 or the answer came from cache.
 
 Recorded today for `/v1/chat/completions` (streamed and not, including
-rejections), `/v1/completions` and `/v1/messages`. Not yet recorded for
-`/v1/embeddings`, `/v1/tokenize` or `/v1/detokenize`.
+rejections), `/v1/completions`, `/v1/messages`, `/v1/embeddings`,
+`/v1/tokenize` and `/v1/detokenize`, the last three with their status,
+success or failure. `/v1/tokenize` and `/v1/detokenize` carry no token
+counts on purpose: they run the tokenizer and not the model, and
+`prompt_tokens` here feeds `tokens_prompt_total`, which means "tokens
+this server put through a forward pass". `/v1/embeddings` does run one,
+so its prompt tokens are counted and its `decode_ms` is `null`, there
+is no decode loop to time.
+
+`queue_depth` and `queue_rejected_total` come from the continuous-batching
+scheduler's queue and are `null`, not `0`, when batching is off, because
+then nothing queues at all: every request gets its own blocking thread. A
+gauge reading `0` claims an empty queue was measured.
+
+`model` names the model that answered, as `/v1/models` reports it, and
+never the `model` field the request carried, this server decodes
+against whatever is loaded and ignores that string, so echoing it back
+would make the log agree with the caller's belief rather than with what
+happened. `null` means nothing was loaded, which is what a 503 row is.
+
+**Attribution.** `via_api_key` is a short fingerprint of the bearer key
+that served the request, never the key and never anything the key can be
+recovered from; it is salted per process, so it is stable within one
+server run, meaningless across a restart, and useless for testing key
+guesses offline. `null` means no `Authorization: Bearer` header was
+presented, which on a server started without `FERROX_API_KEY` is every
+request. `client` is the caller's own `X-Ferrox-Client` header, kept to
+32 label characters, **a claim, not proof**: Ferrox Studio sends
+`ferrox-studio` and so could anything else. Nothing authenticates it, and
+a UI that shows it must say so.
 
 ## Errors that retrying will not fix
 
@@ -428,6 +467,57 @@ swallowed connection does.
 Not implemented: `id:`, `retry:` and `Last-Event-ID` replay, plus a
 polling fallback. Sending `id:` without a server-side replay buffer
 would be a promise this server cannot keep.
+### Resumable streams
+
+`id:` is a promise that a reconnect can pick up where the connection
+stopped, so it is emitted **only** where a replay buffer exists. Ask for
+one per request:
+
+```jsonc
+{"model": "...", "messages": [...], "stream": true, "stream_resumable": true}
+```
+
+Then every event carries `id: {request_id}:{n}` and the first one also
+carries `retry: 1500`. Two ways back in, both behind `FERROX_API_KEY`
+like the request that filled the buffer:
+
+```bash
+# Reconnect over SSE, continuing after the last event seen
+curl -N http://127.0.0.1:8383/v1/stream/chatcmpl-… \
+  -H 'Last-Event-ID: chatcmpl-…:41'
+
+# Or drain the same buffer over plain JSON
+curl "http://127.0.0.1:8383/v1/stream/chatcmpl-…/poll?from=42"
+# {"request_id":"…","events":[{"index":42,"data":"{…}"}],
+#  "next_index":43,"done":false}
+```
+
+`data` is the exact payload the stream sent, `[DONE]` included, so a
+client feeds replayed events to the same parser as live ones. `done` is
+`true` only once the generation has ended *and* the buffer is drained,
+so a client that stops on it never discards events it was not given.
+A poll parks for up to 10 s waiting for the next event, which keeps it
+reading like a stream while staying a short JSON response, the thing a
+buffering proxy cannot hold back, which is the whole point of the
+fallback.
+
+**`stream_resumable` also changes what a dropped socket means.** Without
+it, the connection closing cancels the generation (tier 1 above). With
+it, the generation keeps running into the replay buffer, that is the
+point of asking for one, and `POST /v1/cancel` is its stop path. The
+caller decides because neither answer suits both: a tab that navigated
+away wants the CPU back, and a tab whose proxy dropped a 90-second
+answer wants the answer.
+
+Both bounds fail closed rather than quietly. The replay window is 1 MiB
+per stream; past it the oldest events are dropped and asking for an
+evicted position answers `410 replay_window_lost` rather than a stream
+with a hole in it. A finished stream stays reconnectable for 120 s and
+at most 64 streams are remembered, oldest finished evicted first, a
+live stream is never evicted out from under its reader. A `Last-Event-ID`
+naming a different request is `400 bad_last_event_id`, not silently
+rounded down to a full replay of the wrong answer. An unknown or
+forgotten id is `404 stream_not_found`.
 
 ## Continuous batching
 

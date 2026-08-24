@@ -636,6 +636,15 @@ pub(crate) async fn cancel_task(
 }
 
 pub(crate) async fn stats(State(state): State<Arc<AppState>>) -> Response {
+    // The queue gauge exists only where a queue exists. Continuous
+    // batching is the one path that makes requests wait for a decode
+    // slot; without it every request gets its own blocking thread and
+    // nothing is queued in front of anything. Reporting `0` in that
+    // case would claim an empty queue was measured, and a UI cannot
+    // tell that apart from "there is no queue here".
+    let queue = state
+        .active()
+        .and_then(|a| a.batcher.as_ref().map(|b| b.stats()));
     Json(StatsResponse {
         uptime_seconds: state.uptime().as_secs(),
         requests_total: state.requests_total(),
@@ -646,6 +655,8 @@ pub(crate) async fn stats(State(state): State<Arc<AppState>>) -> Response {
         tokens_generated_total: state.stats.tokens_generated_total(),
         last_request_age_seconds: state.last_request_age_seconds(),
         generating_now: state.cancels.live_count(),
+        queue_depth: queue.as_ref().map(|q| q.queue_depth),
+        queue_rejected_total: queue.as_ref().map(|q| q.queue_rejected),
         recent: state.stats.recent(),
     })
     .into_response()

@@ -14,7 +14,8 @@
     "preview": "vite preview",
     "typecheck": "tsc --noEmit --pretty false",
     "lint": "eslint .",
-    "check": "npm run typecheck && npm run lint",
+    "test": "node --test src/lib/*.test.ts",
+    "check": "npm run typecheck && npm run lint && npm run test",
     "licenses": "node scripts/check-licenses.mjs"
   },
   "dependencies": {

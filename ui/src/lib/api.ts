@@ -30,6 +30,9 @@ export const routes = {
   models: "/v1/models",
   chatCompletions: "/v1/chat/completions",
   cancel: "/v1/cancel",
+  stream: (requestId: string) => `/v1/stream/${encodeURIComponent(requestId)}`,
+  streamPoll: (requestId: string) =>
+    `/v1/stream/${encodeURIComponent(requestId)}/poll`,
   adminModels: "/admin/models",
   adminModelsLoad: "/admin/models/load",
   adminModelsUnload: "/admin/models/unload",
@@ -43,9 +46,15 @@ export const routes = {
 const KEY_STORAGE = "ferrox.studio.apiKey";
 const BASE_STORAGE = "ferrox.studio.baseUrl";
 
-/** Build-time default, for a deployment that ships pre-pointed. */
+/**
+ * Build-time default, for a deployment that ships pre-pointed.
+ *
+ * Read defensively: `import.meta.env` is Vite's, and this module is
+ * also imported outside a bundle by the test runner, where it does not
+ * exist at all.
+ */
 const BUILT_IN_BASE = (
-  import.meta.env.VITE_FERROX_BASE_URL ?? ""
+  import.meta.env?.VITE_FERROX_BASE_URL ?? ""
 ).replace(/\/+$/, "");
 
 /**
@@ -122,8 +131,23 @@ export const snippetBase = () => apiBase() || DEFAULT_SERVER_ORIGIN;
 /** The origin THIS app's own requests reach, for error messages. */
 export const baseUrl = () => apiBase() || window.location.origin;
 
+/**
+ * What this app calls itself on every request it makes.
+ *
+ * The server records it on the Activity row (`client`) so a request the
+ * UI made is distinguishable from one an editor made. It is a CLAIM and
+ * nothing else — any client can send this header, nothing authenticates
+ * it, and the Activity screen says so on its face. It is still better
+ * than the alternative, which is inferring "that must have been the UI"
+ * from timing.
+ */
+export const CLIENT_LABEL = "ferrox-studio";
+
 function headers(extra: Record<string, string> = {}): Record<string, string> {
-  const h = { ...extra };
+  const h: Record<string, string> = {
+    ...extra,
+    "X-Ferrox-Client": CLIENT_LABEL,
+  };
   const key = apiKey();
   if (key) h.Authorization = `Bearer ${key}`;
   return h;
@@ -269,11 +293,22 @@ export function cancelGeneration(requestId: string | null | undefined): void {
  * even while a long prompt is still prefilling. A slow model therefore
  * never trips it; a proxy that swallowed the connection does.
  *
- * It reports and never aborts. A stalled stream may still recover, and
- * killing a generation the user is waiting on — after paying its
- * prefill — to show a tidier error would be the worse outcome.
+ * It never aborts a generation to show a tidier error. What it does do,
+ * when the request was resumable, is stop *reading this socket* and
+ * drain the same answer over the polling fallback instead — the
+ * generation is untouched on the server and the tokens already paid for
+ * are still delivered. See `recover`.
  */
 const STALL_MS = 45000;
+
+/** Reconnect delay used when the server's `retry:` was never seen. */
+const DEFAULT_RETRY_MS = 1500;
+
+/** SSE reconnects tried before falling back to polling. */
+const SSE_RECONNECTS = 2;
+
+/** Consecutive polling failures tolerated before giving up. */
+const POLL_RETRIES = 3;
 
 /** The per-phase timings the server states in `usage`. */
 export type Usage = {
@@ -314,102 +349,138 @@ export type StreamResult = {
   finishReason: string | null;
 };
 
+/**
+ * How the answer is currently arriving.
+ *
+ * Worth reporting rather than hiding: "still streaming" and "the
+ * original connection died and this is a reconnect" are different
+ * facts, and a UI that shows neither leaves the user watching a
+ * progress indicator that means nothing.
+ */
+export type Transport = "stream" | "resumed" | "polling";
+
 export type StreamHandlers = {
   signal?: AbortSignal;
   onToken?: (text: string) => void;
   onRequestId?: (id: string) => void;
   onStall?: (ms: number | null) => void;
+  onTransport?: (transport: Transport) => void;
   stallMs?: number;
+  /**
+   * Ask the server for a replay buffer (`stream_resumable`).
+   *
+   * Default on, and that is a real trade rather than a free win: a
+   * resumable request is NOT cancelled by its socket closing, so the
+   * explicit `POST /v1/cancel` becomes the only stop path. This app
+   * always sends that — on Stop, on New chat, on leaving the screen and
+   * on `pagehide` with `keepalive` — which is exactly the set of cases
+   * a socket close was standing in for.
+   */
+  resumable?: boolean;
 };
 
-/**
- * POST a chat completion with `stream: true` and drive the callbacks.
- *
- * Three things the server states that this reads rather than guesses:
- *
- * - `request_id` arrives on the **first** chunk only, so it is captured
- *   once and never re-derived. A UI that instead claimed an id out of a
- *   stats snapshot would mis-attribute the moment two chats overlap.
- * - `usage` arrives on the **final** chunk and carries per-phase
- *   timings. Client wall-clock is never substituted for them.
- * - A stream that ends without `[DONE]` and without a `finish_reason`
- *   was truncated. That is surfaced as an error, not as a finished
- *   message, because the two are indistinguishable on screen otherwise.
- */
-export async function streamChat(
-  request: ChatRequest,
-  {
-    signal,
-    onToken,
-    onRequestId,
-    onStall,
-    stallMs = STALL_MS,
-  }: StreamHandlers = {},
-): Promise<StreamResult> {
-  const response = await fetch(url(routes.chatCompletions), {
-    method: "POST",
-    headers: headers({
-      "Content-Type": "application/json",
-      Accept: "text/event-stream",
-    }),
-    body: JSON.stringify({ ...request, stream: true }),
-    signal,
-  });
+/** Everything one logical answer accumulates, across reconnects. */
+type StreamState = {
+  requestId: string | null;
+  usage: Usage | null;
+  finishReason: string | null;
+  /** `[DONE]` was seen. */
+  done: boolean;
+  /** Index of the first event NOT yet consumed, from the `id:` fields. */
+  nextIndex: number;
+  /** The most recent `id:` value, sent verbatim on a reconnect. */
+  lastEventId: string | null;
+  /** The server's `retry:`, when it stated one. */
+  retryMs: number;
+};
 
-  if (!response.ok || !response.body) {
-    // An error answer is JSON, not SSE — parse it as such. `parse`
-    // throws for anything non-2xx, so control only continues past here
-    // on the pathological "200 with no body", which is not a completion
-    // either and is reported the same way.
-    return parse<StreamResult>(response);
+function newState(): StreamState {
+  return {
+    requestId: null,
+    usage: null,
+    finishReason: null,
+    done: false,
+    nextIndex: 0,
+    lastEventId: null,
+    retryMs: DEFAULT_RETRY_MS,
+  };
+}
+
+/** A completed answer: `[DONE]` or a finish reason. Anything else is not. */
+function complete(state: StreamState): boolean {
+  return state.done || state.finishReason !== null;
+}
+
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+function truncated(detail: string): ApiError {
+  return new ApiError(
+    0,
+    `the stream ended without a finish reason — the response was truncated, not completed (${detail})`,
+    null,
+  );
+}
+
+/** Applies one `data:` payload. Shared by live, resumed and polled events. */
+function applyEvent(
+  state: StreamState,
+  payload: string,
+  handlers: StreamHandlers,
+): void {
+  if (payload === "[DONE]") {
+    state.done = true;
+    return;
   }
+  let chunk: StreamChunk;
+  try {
+    chunk = JSON.parse(payload) as StreamChunk;
+  } catch {
+    return; // a keep-alive comment or a partial frame; not fatal
+  }
+  if (chunk.request_id && !state.requestId) {
+    state.requestId = chunk.request_id;
+    handlers.onRequestId?.(chunk.request_id);
+  }
+  if (chunk.usage) state.usage = chunk.usage;
+  const choice = chunk.choices?.[0];
+  if (choice?.finish_reason) state.finishReason = choice.finish_reason;
+  const text = choice?.delta?.content;
+  if (text) handlers.onToken?.(text);
+}
 
-  const reader = response.body.getReader();
+/**
+ * Drains one SSE body into `state`.
+ *
+ * Reads `id:` as well as `data:`. The id is what makes a reconnect
+ * resume rather than restart, and it is qualified by the request id
+ * server-side precisely so it cannot be mistaken for a position in some
+ * other stream.
+ *
+ * `onStall` reports a stream that has gone quiet and, when the caller
+ * can fall back, `stallSwitch` is called so the reader can be abandoned
+ * in favour of polling. Nothing here ever cancels the generation.
+ */
+async function readSse(
+  body: ReadableStream<Uint8Array>,
+  state: StreamState,
+  handlers: StreamHandlers,
+  stallMs: number,
+  stallSwitch?: () => void,
+): Promise<void> {
+  const reader = body.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
-  let done = false;
-  let requestId: string | null = null;
-  let usage: Usage | null = null;
-  let finishReason: string | null = null;
 
-  const handle = (payload: string) => {
-    if (payload === "[DONE]") {
-      done = true;
-      return;
-    }
-    let chunk: StreamChunk;
-    try {
-      chunk = JSON.parse(payload) as StreamChunk;
-    } catch {
-      return; // a keep-alive comment or a partial frame; not fatal
-    }
-    if (chunk.request_id && !requestId) {
-      requestId = chunk.request_id;
-      onRequestId?.(chunk.request_id);
-    }
-    if (chunk.usage) usage = chunk.usage;
-    const choice = chunk.choices?.[0];
-    if (choice?.finish_reason) finishReason = choice.finish_reason;
-    const text = choice?.delta?.content;
-    if (text) onToken?.(text);
-  };
-
-  // Reports a stream that has gone quiet, once, and keeps waiting. The
-  // timer is armed against every read rather than every token, so the
-  // keep-alive comments disarm it on a healthy but slow stream.
   let stalled = false;
   let stallTimer: ReturnType<typeof setTimeout> | undefined;
   const armStallTimer = () => {
     clearTimeout(stallTimer);
-    if (!onStall) return;
+    if (!handlers.onStall && !stallSwitch) return;
     stallTimer = setTimeout(() => {
       stalled = true;
-      onStall(stallMs);
+      handlers.onStall?.(stallMs);
+      stallSwitch?.();
     }, stallMs);
-  };
-  const disarmStallTimer = () => {
-    clearTimeout(stallTimer);
-    stallTimer = undefined;
   };
 
   try {
@@ -422,35 +493,249 @@ export async function streamChat(
         // It came back. Saying so matters as much as saying it stopped:
         // a banner left up after recovery is a lie with a long tail.
         stalled = false;
-        onStall?.(null);
+        handlers.onStall?.(null);
       }
       buffer += decoder.decode(value, { stream: true });
-      // SSE frames are separated by a blank line; a `data:` field may be
-      // split across reads, so only complete frames are consumed.
+      // SSE frames are separated by a blank line; a field may be split
+      // across reads, so only complete frames are consumed.
       let boundary = buffer.indexOf("\n\n");
       while (boundary !== -1) {
         const frame = buffer.slice(0, boundary);
         buffer = buffer.slice(boundary + 2);
         for (const line of frame.split("\n")) {
-          if (line.startsWith("data:")) handle(line.slice(5).trimStart());
+          if (line.startsWith("data:")) {
+            applyEvent(state, line.slice(5).trimStart(), handlers);
+          } else if (line.startsWith("id:")) {
+            const id = line.slice(3).trim();
+            state.lastEventId = id;
+            const index = Number(id.slice(id.lastIndexOf(":") + 1));
+            if (Number.isFinite(index)) state.nextIndex = index + 1;
+          } else if (line.startsWith("retry:")) {
+            const ms = Number(line.slice(6).trim());
+            if (Number.isFinite(ms) && ms > 0) state.retryMs = ms;
+          }
         }
         boundary = buffer.indexOf("\n\n");
       }
     }
   } finally {
-    disarmStallTimer();
-    if (stalled) onStall?.(null);
+    clearTimeout(stallTimer);
+    if (stalled) handlers.onStall?.(null);
+  }
+}
+
+type PollBody = {
+  events?: { index: number; data: string }[];
+  next_index?: number;
+  done?: boolean;
+};
+
+/**
+ * Drains the rest of the answer over `GET /v1/stream/{id}/poll`.
+ *
+ * The fallback the whole feature exists for. A reverse proxy that
+ * buffers `text/event-stream` — nginx's default and that of everything
+ * that copied it — turns a token-by-token stream into one long silence,
+ * which from here is indistinguishable from a hung backend. It cannot
+ * do that to a short JSON response that has already ended.
+ *
+ * `done` from the server is trusted over any local guess: it is `true`
+ * only once the generation has ended AND the buffer is drained, so this
+ * never stops holding events it has not been given.
+ */
+async function drainByPolling(
+  requestId: string,
+  state: StreamState,
+  handlers: StreamHandlers,
+): Promise<void> {
+  handlers.onTransport?.("polling");
+  let failures = 0;
+  for (;;) {
+    if (handlers.signal?.aborted) {
+      throw new DOMException("aborted", "AbortError");
+    }
+    let body: PollBody;
+    try {
+      body = await getJson<PollBody>(
+        `${routes.streamPoll(requestId)}?from=${state.nextIndex}`,
+        { signal: handlers.signal },
+      );
+      failures = 0;
+    } catch (cause) {
+      if (isAbort(cause)) throw cause;
+      if (cause instanceof ApiError && cause.status >= 400) {
+        // 404 (forgotten), 410 (replay window passed), 400 (bad
+        // cursor). All three mean the rest of this answer is
+        // unreachable, and a partial answer must not be presented as a
+        // whole one.
+        throw truncated(cause.message);
+      }
+      if (++failures > POLL_RETRIES) throw truncated(cause instanceof Error ? cause.message : String(cause));
+      await sleep(state.retryMs);
+      continue;
+    }
+    for (const event of body.events ?? []) {
+      applyEvent(state, event.data, handlers);
+    }
+    if (typeof body.next_index === "number") state.nextIndex = body.next_index;
+    if (body.done || complete(state)) return;
+  }
+}
+
+/** One reconnect attempt over SSE, continuing after the last id seen. */
+async function resumeOverSse(
+  requestId: string,
+  state: StreamState,
+  handlers: StreamHandlers,
+  stallMs: number,
+): Promise<boolean> {
+  const extra: Record<string, string> = { Accept: "text/event-stream" };
+  if (state.lastEventId) extra["Last-Event-ID"] = state.lastEventId;
+  let response: Response;
+  try {
+    response = await fetch(url(routes.stream(requestId)), {
+      headers: headers(extra),
+      signal: handlers.signal,
+    });
+  } catch (cause) {
+    if (isAbort(cause)) throw cause;
+    return false; // the network refused; the caller tries polling next
+  }
+  if (response.status >= 400) {
+    // The server refusing by status is a decided answer, not a hiccup:
+    // 410 means the replay window has passed this position and resuming
+    // would skip part of the answer without either end being able to
+    // tell. Fail closed rather than retrying into it.
+    await parse(response).catch((error: unknown) => {
+      throw truncated(error instanceof Error ? error.message : String(error));
+    });
+    return false;
+  }
+  if (!response.body) return false;
+  handlers.onTransport?.("resumed");
+  await readSse(response.body, state, handlers, stallMs);
+  return true;
+}
+
+/**
+ * Finishes an answer whose live connection did not.
+ *
+ * Order is deliberate. A stall means the bytes stopped arriving while
+ * the connection stayed open, which is the signature of a buffering
+ * proxy — and a second SSE connection would go through the same proxy,
+ * so that case skips straight to polling. Anything else gets SSE
+ * reconnects first (cheaper, and it keeps streaming) before falling
+ * back.
+ */
+async function recover(
+  state: StreamState,
+  handlers: StreamHandlers,
+  stallMs: number,
+  preferPolling: boolean,
+): Promise<void> {
+  const requestId = state.requestId;
+  if (!requestId) return;
+  if (!preferPolling) {
+    for (let attempt = 0; attempt < SSE_RECONNECTS; attempt++) {
+      if (complete(state)) return;
+      await sleep(state.retryMs);
+      await resumeOverSse(requestId, state, handlers, stallMs);
+    }
+  }
+  if (complete(state)) return;
+  await drainByPolling(requestId, state, handlers);
+}
+
+/**
+ * POST a chat completion with `stream: true` and drive the callbacks.
+ *
+ * Four things the server states that this reads rather than guesses:
+ *
+ * - `request_id` arrives on the **first** chunk only, so it is captured
+ *   once and never re-derived. A UI that instead claimed an id out of a
+ *   stats snapshot would mis-attribute the moment two chats overlap.
+ * - `usage` arrives on the **final** chunk and carries per-phase
+ *   timings. Client wall-clock is never substituted for them.
+ * - `id:` names the position of every event, so a reconnect resumes
+ *   instead of restarting, and `retry:` says how long to wait first.
+ * - A stream that ends without `[DONE]` and without a `finish_reason`
+ *   was truncated. Recovery is attempted — reconnect, then poll — and
+ *   only if that also fails is it surfaced as an error, never as a
+ *   finished message.
+ */
+export async function streamChat(
+  request: ChatRequest,
+  handlers: StreamHandlers = {},
+): Promise<StreamResult> {
+  const { signal, stallMs = STALL_MS, resumable = true } = handlers;
+  const state = newState();
+
+  // A private controller, so the stall fallback can stop reading this
+  // socket without touching the caller's signal — and so a caller
+  // abort still reads as an abort.
+  const controller = new AbortController();
+  let userAborted = false;
+  const onUserAbort = () => {
+    userAborted = true;
+    controller.abort(new DOMException("aborted", "AbortError"));
+  };
+  if (signal?.aborted) onUserAbort();
+  signal?.addEventListener("abort", onUserAbort, { once: true });
+
+  let switchedToPolling = false;
+  const inner: StreamHandlers = { ...handlers, signal };
+
+  try {
+    const response = await fetch(url(routes.chatCompletions), {
+      method: "POST",
+      headers: headers({
+        "Content-Type": "application/json",
+        Accept: "text/event-stream",
+      }),
+      body: JSON.stringify({
+        ...request,
+        stream: true,
+        stream_resumable: resumable,
+      }),
+      signal: controller.signal,
+    });
+
+    if (!response.ok || !response.body) {
+      // An error answer is JSON, not SSE — parse it as such. `parse`
+      // throws for anything non-2xx, so control only continues past
+      // here on the pathological "200 with no body", which is not a
+      // completion either and is reported the same way.
+      return parse<StreamResult>(response);
+    }
+
+    handlers.onTransport?.("stream");
+    try {
+      await readSse(response.body, state, inner, stallMs, () => {
+        // Only worth abandoning the socket if there is another way in.
+        if (!resumable || !state.requestId) return;
+        switchedToPolling = true;
+        controller.abort();
+      });
+    } catch (cause) {
+      if (!switchedToPolling) throw cause;
+    }
+
+    if (!complete(state) && resumable && !userAborted) {
+      await recover(state, inner, stallMs, switchedToPolling);
+    }
+  } finally {
+    signal?.removeEventListener("abort", onUserAbort);
   }
 
-  if (!done && !finishReason) {
-    throw new ApiError(
-      0,
-      "the stream ended without a finish reason — the response was truncated, not completed",
-      null,
-    );
+  if (!complete(state)) {
+    throw truncated("no reconnect or poll could finish it");
   }
 
-  return { requestId, usage, finishReason };
+  return {
+    requestId: state.requestId,
+    usage: state.usage,
+    finishReason: state.finishReason,
+  };
 }
 
 // --------------------------------------------------------------------
@@ -519,6 +804,12 @@ export type StatsRow = {
   at_ms: number;
   request_id: string;
   route: string;
+  /**
+   * The model that SERVED this request, as /v1/models names it — not
+   * the `model` field the request carried, which this server ignores.
+   * Null when nothing was loaded.
+   */
+  model?: string | null;
   status: number;
   stream: boolean;
   prompt_tokens?: number | null;
@@ -526,6 +817,15 @@ export type StatsRow = {
   ttft_ms?: number | null;
   duration_ms?: number | null;
   decode_ms?: number | null;
+  /**
+   * Fingerprint of the bearer key that served this request, or null
+   * when none was presented. Never the key itself — the server salts it
+   * per process, so it is comparable between rows of one server run and
+   * meaningless anywhere else.
+   */
+  via_api_key?: string | null;
+  /** The caller's SELF-DECLARED label. Not authenticated. */
+  client?: string | null;
 };
 
 export type Stats = {
@@ -537,6 +837,12 @@ export type Stats = {
   tokens_prompt_total?: number | null;
   tokens_generated_total?: number | null;
   generating_now?: number | null;
+  /**
+   * Requests waiting for a decode slot. `null` — not 0 — when continuous
+   * batching is off, because then there is no queue to measure.
+   */
+  queue_depth?: number | null;
+  queue_rejected_total?: number | null;
   last_request_age_seconds?: number | null;
   recent?: StatsRow[];
 };

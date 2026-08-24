@@ -31,9 +31,21 @@ FERROX_BACKEND=http://127.0.0.1:9001 npm run dev
 npm run typecheck   # tsc, no emit
 npm run lint        # eslint
 npm run licenses    # fails on any non-permissive dependency
+npm test            # node's own test runner, no framework installed
+npm run licenses    # refuses any non-permissive dependency
 npm run build       # -> dist/, gitignored
-npm run check       # typecheck + lint
+npm run check       # typecheck + lint + test
 ```
+
+`npm test` runs `node --test` over `src/lib/*.test.ts`, node strips the
+types itself, so there is no test framework in the dependency tree and
+nothing for the licence check to weigh. It covers the stream recovery
+paths in `lib/api.ts`, which are the half of SSE hardening that cannot
+be proven from the server: that a reconnect resumes from the last `id:`
+without repeating a token, that a lost replay window fails closed
+instead of presenting a partial answer as a whole one, and that a
+non-resumable stream never tries to reconnect into a buffer that does
+not exist.
 
 `dist/` is **not committed**. Nothing built here ships inside a Rust
 crate, so there is no artefact to keep in sync. Serve `dist/` with any
@@ -78,11 +90,39 @@ src/
   index.css             design tokens + Tailwind theme (one light block,
                         one prefers-color-scheme block, nothing else)
   lib/api.ts            the ONLY place that talks HTTP
+  lib/api.test.ts       stream recovery, against a stubbed fetch
   lib/format.ts         "unknown" is an em dash, never a zero
   components/           app shell, health pill, shadcn-style primitives
   screens/chat/         assistant-ui runtime, markdown, thread
   screens/{models,activity,connect}.tsx
 ```
+
+## Streams that survive a proxy
+
+Chat asks for a resumable stream (`stream_resumable: true`), so every
+event carries an `id:` and the server keeps a replay buffer. Three
+consequences, all deliberate:
+
+- A connection that dies mid-answer is **reconnected** with
+  `Last-Event-ID`, continuing rather than restarting. The banner says so;
+  a reconnect that silently replaced the original connection would leave
+  the user watching an indicator that stopped meaning anything.
+- A stream that goes quiet for 45 s while the socket stays open is the
+  signature of a proxy buffering `text/event-stream`. A second SSE
+  connection would go through the same proxy, so that case **skips
+  straight to polling** `GET /v1/stream/{id}/poll`, a short JSON
+  response nothing can hold back.
+- A resumable request is **not cancelled by its socket closing**. That
+  is the point of asking for one, and it means `POST /v1/cancel` is the
+  only stop path. This app already sends it on Stop, on New chat, on
+  leaving the screen, and on `pagehide` with `keepalive`, which is
+  exactly the set of cases the socket close was standing in for. If you
+  ever remove one of those, remove `stream_resumable` in the same
+  change.
+
+Nothing here ever presents a partial answer as a finished one: if the
+reconnect and the poll both fail, or the replay window has moved past
+where the client stopped, it surfaces as a truncation error.
 
 ## Three things not to undo
 

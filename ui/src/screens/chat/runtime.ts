@@ -21,6 +21,7 @@ import {
   streamChat,
   type ChatMessage,
   type StreamResult,
+  type Transport,
   type Usage,
 } from "@/lib/api";
 import { fmtInt, fmtMs, fmtNum, isNum } from "@/lib/format";
@@ -136,6 +137,13 @@ export type ChatDeps = {
   sampling: () => Sampling;
   /** `ms` when the stream has gone quiet, `null` when it came back. */
   onStall: (ms: number | null) => void;
+  /**
+   * How the answer is arriving right now: live, over a reconnect, or
+   * over the polling fallback. Reported rather than hidden — a
+   * reconnect that silently replaces the original connection leaves the
+   * user watching an indicator that has stopped meaning anything.
+   */
+  onTransport: (transport: Transport) => void;
 };
 
 function makeAdapter(deps: ChatDeps): ChatModelAdapter {
@@ -179,6 +187,7 @@ function makeAdapter(deps: ChatDeps): ChatModelAdapter {
           },
           onToken: (token) => tokens.push(token),
           onStall: deps.onStall,
+          onTransport: deps.onTransport,
         },
       )
         .then((r) => {
@@ -294,6 +303,7 @@ export function useFerroxRuntime(deps: ChatDeps) {
       modelId: () => ref.current.modelId(),
       sampling: () => ref.current.sampling(),
       onStall: (ms) => ref.current.onStall(ms),
+      onTransport: (transport) => ref.current.onTransport(transport),
     }),
   );
 

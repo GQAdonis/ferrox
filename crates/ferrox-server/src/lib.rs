@@ -2580,6 +2580,38 @@ fn startup_model_id() -> Option<String> {
         .map(|d| d.id)
 }
 
+/// Claims this process's slot in the instance registry, as `server`.
+///
+/// The command name is what tells a refused `ferrox run` *who* is
+/// holding the machine, and it stays `"server"` whether the server was
+/// started as `ferrox-server` or as `ferrox serve` -- under one binary
+/// those are the same executable, and a registry that called both "run"
+/// would report "another run is in progress" at somebody looking for a
+/// server.
+///
+/// Claimed here and nowhere else: ferrox-cli deliberately does not
+/// register for `serve` (see its `instance_target`), because both guards
+/// would name the same per-pid file and the inner one's `Drop` would
+/// deregister the still-running server.
+fn claim_instance(args: &ServerArgs) -> anyhow::Result<ferrox_core::instance::InstanceGuard> {
+    use ferrox_core::instance::{register, InstancePolicy};
+    // The flag is an explicit opt-in, so it wins outright; the env var
+    // only decides when the flag was not passed.
+    let policy = if args.allow_multiple_instances {
+        InstancePolicy::Multi
+    } else {
+        InstancePolicy::from_env_or(InstancePolicy::Single)
+    };
+    let model = std::env::var("FERROX_MODEL_PATH").ok();
+    register(
+        "server",
+        model.as_deref(),
+        ferrox_core::instance::current_backend(),
+        policy,
+    )
+    .map_err(|conflict| anyhow::anyhow!("{conflict}"))
+}
+
 /// Installs the log subscriber, tolerating one that is already there.
 ///
 /// `tracing_subscriber::fmt::init()` PANICS when a global subscriber is
@@ -2722,22 +2754,7 @@ pub fn run_server(args: ServerArgs) -> anyhow::Result<()> {
     // Before the model is loaded and before the port is bound: refuse
     // to be the second process holding weights on this host. Held for
     // the life of the process -- dropping it deregisters us.
-    let _instance = {
-        use ferrox_core::instance::{register, InstancePolicy};
-        let policy = if args.allow_multiple_instances {
-            InstancePolicy::Multi
-        } else {
-            InstancePolicy::from_env_or(InstancePolicy::Single)
-        };
-        let model = std::env::var("FERROX_MODEL_PATH").ok();
-        register(
-            "server",
-            model.as_deref(),
-            ferrox_core::instance::current_backend(),
-            policy,
-        )
-        .map_err(|conflict| anyhow::anyhow!("{conflict}"))?
-    };
+    let _instance = claim_instance(&args)?;
 
     let journal = journal::Journal::from_env();
     eprintln!(
@@ -3364,6 +3381,45 @@ mod tests {
     fn installing_the_log_subscriber_twice_does_not_panic() {
         init_tracing();
         init_tracing();
+    }
+
+    /// The server registers itself as `server`, not as whatever
+    /// front end launched it. `ferrox serve` and `ferrox-server` are the
+    /// same executable now, and the command name is the only thing in a
+    /// refusal message that tells the reader which process to go and
+    /// stop.
+    #[test]
+    fn the_server_claims_its_registry_slot_as_server() {
+        let dir = std::env::temp_dir().join(format!(
+            "ferrox-server-instance-test-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        // SAFETY: the only test that touches this variable, and the
+        // registry reads it on each call rather than caching it.
+        unsafe { std::env::set_var("FERROX_INSTANCE_DIR", &dir) };
+
+        // `Multi`: another ferrox may well be running on the machine
+        // this test runs on, and that is not what is under test here.
+        let args = ServerArgs {
+            allow_multiple_instances: true,
+            ..ServerArgs::default()
+        };
+        let guard = claim_instance(&args).expect("registration with Multi cannot conflict");
+
+        let record = std::fs::read_to_string(dir.join(std::process::id().to_string()))
+            .expect("the registry file for this pid");
+        let command = record.split('\t').nth(1).expect("command field");
+        assert_eq!(command, "server", "registry record was {record:?}");
+
+        // Dropping deregisters: a stale entry would refuse the next
+        // ferrox on this host for as long as the pid stayed unused.
+        drop(guard);
+        assert!(!dir.join(std::process::id().to_string()).exists());
+
+        unsafe { std::env::remove_var("FERROX_INSTANCE_DIR") };
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

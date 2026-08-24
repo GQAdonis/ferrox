@@ -145,6 +145,11 @@ the server cannot disagree about them.
 | `POST /admin/tasks/{task_id}/cancel` | `200 {"ok":true}` |
 | `GET /admin/stats` | counters + recent-request ring |
 
+| Stream recovery | |
+|---|---|
+| `GET /v1/stream/{request_id}` | reconnect into a resumable stream (SSE) |
+| `GET /v1/stream/{request_id}/poll` | the same replay buffer over JSON |
+
 ### Models
 
 ```jsonc
@@ -427,9 +432,57 @@ still puts bytes on the wire. A client's stall timeout should therefore
 be measured against bytes received, not tokens: that way a long prefill
 never trips it and a swallowed connection does.
 
-Not implemented: `id:` / `retry:` / `Last-Event-ID` replay, and a
-polling fallback. `id:` without a server-side replay buffer would be a
-promise the server cannot keep.
+### Resumable streams
+
+`id:` is a promise that a reconnect can pick up where the connection
+stopped, so it is emitted **only** where a replay buffer exists. Ask for
+one per request:
+
+```jsonc
+{"model": "...", "messages": [...], "stream": true, "stream_resumable": true}
+```
+
+Then every event carries `id: {request_id}:{n}` and the first one also
+carries `retry: 1500`. Two ways back in, both behind `FERROX_API_KEY`
+like the request that filled the buffer:
+
+```bash
+# Reconnect over SSE, continuing after the last event seen
+curl -N http://127.0.0.1:8383/v1/stream/chatcmpl-… \
+  -H 'Last-Event-ID: chatcmpl-…:41'
+
+# Or drain the same buffer over plain JSON
+curl "http://127.0.0.1:8383/v1/stream/chatcmpl-…/poll?from=42"
+# {"request_id":"…","events":[{"index":42,"data":"{…}"}],
+#  "next_index":43,"done":false}
+```
+
+`data` is the exact payload the stream sent, `[DONE]` included, so a
+client feeds replayed events to the same parser as live ones. `done` is
+`true` only once the generation has ended *and* the buffer is drained,
+so a client that stops on it never discards events it was not given.
+A poll parks for up to 10 s waiting for the next event, which keeps it
+reading like a stream while staying a short JSON response — the thing a
+buffering proxy cannot hold back, which is the whole point of the
+fallback.
+
+**`stream_resumable` also changes what a dropped socket means.** Without
+it, the connection closing cancels the generation (tier 1 above). With
+it, the generation keeps running into the replay buffer — that is the
+point of asking for one — and `POST /v1/cancel` is its stop path. The
+caller decides because neither answer suits both: a tab that navigated
+away wants the CPU back, and a tab whose proxy dropped a 90-second
+answer wants the answer.
+
+Both bounds fail closed rather than quietly. The replay window is 1 MiB
+per stream; past it the oldest events are dropped and asking for an
+evicted position answers `410 replay_window_lost` rather than a stream
+with a hole in it. A finished stream stays reconnectable for 120 s and
+at most 64 streams are remembered, oldest finished evicted first — a
+live stream is never evicted out from under its reader. A `Last-Event-ID`
+naming a different request is `400 bad_last_event_id`, not silently
+rounded down to a full replay of the wrong answer. An unknown or
+forgotten id is `404 stream_not_found`.
 
 ## Continuous batching
 

@@ -41,6 +41,25 @@ pub const V1_MESSAGES: &str = "/v1/messages";
 /// makes this one survive that.
 pub const V1_CANCEL: &str = "/v1/cancel";
 
+/// Reconnect into a stream started with `stream_resumable: true`,
+/// resuming after the `Last-Event-ID` the client last saw.
+///
+/// **A template, not a literal** -- see [`ADMIN_TASK_CANCEL`] for why
+/// this crate writes placeholders in the OpenAPI style. Build a
+/// concrete path with [`v1_stream`].
+///
+/// Behind the same key as the endpoint that started the work: the
+/// replay buffer holds the model's output, so reading it must cost
+/// exactly what producing it cost.
+pub const V1_STREAM: &str = "/v1/stream/{request_id}";
+
+/// The same replay buffer over plain JSON, for the case SSE cannot
+/// survive: a reverse proxy that buffers `text/event-stream` turns a
+/// stream into one long silence, and cannot do that to a short response
+/// that has already ended. Build a concrete path with
+/// [`v1_stream_poll`].
+pub const V1_STREAM_POLL: &str = "/v1/stream/{request_id}/poll";
+
 // ---------------------------------------------------------------------
 // Control surface.
 //
@@ -82,12 +101,22 @@ pub fn admin_task_cancel(task_id: &str) -> String {
     ADMIN_TASK_CANCEL.replace("{task_id}", task_id)
 }
 
+/// The concrete resume path for one request id.
+pub fn v1_stream(request_id: &str) -> String {
+    V1_STREAM.replace("{request_id}", request_id)
+}
+
+/// The concrete polling-fallback path for one request id.
+pub fn v1_stream_poll(request_id: &str) -> String {
+    V1_STREAM_POLL.replace("{request_id}", request_id)
+}
+
 /// Every fixed route above, for clients that want to enumerate the
 /// surface (and for the round-trip test below).
 ///
-/// [`ADMIN_TASK_CANCEL`] is deliberately absent: it is a template, and
-/// a caller iterating this list to probe paths would get a 404 for a
-/// literal `{task_id}`.
+/// [`ADMIN_TASK_CANCEL`], [`V1_STREAM`] and [`V1_STREAM_POLL`] are
+/// deliberately absent: they are templates, and a caller iterating this
+/// list to probe paths would get a 404 for a literal `{task_id}`.
 pub const ALL: &[&str] = &[
     HEALTH,
     METRICS,
@@ -136,6 +165,31 @@ mod tests {
     fn the_cancel_template_is_not_enumerated_as_a_real_path() {
         assert!(!ALL.contains(&ADMIN_TASK_CANCEL));
         assert!(ADMIN_TASK_CANCEL.contains("{task_id}"));
+    }
+
+    /// Same rule for the stream templates: a client that probed this
+    /// list would ask for a literal `{request_id}` and get a 404 with
+    /// the contract crate's blessing.
+    #[test]
+    fn the_stream_templates_are_not_enumerated_as_real_paths() {
+        for template in [V1_STREAM, V1_STREAM_POLL] {
+            assert!(!ALL.contains(&template));
+            assert!(template.contains("{request_id}"));
+        }
+        assert_eq!(v1_stream("chatcmpl-7"), "/v1/stream/chatcmpl-7");
+        assert_eq!(
+            v1_stream_poll("chatcmpl-7"),
+            "/v1/stream/chatcmpl-7/poll".to_string()
+        );
+        assert!(!v1_stream("chatcmpl-7").contains('{'));
+    }
+
+    /// The polling fallback must sit under the stream it falls back
+    /// from, so one base URL and one key reach both.
+    #[test]
+    fn the_poll_route_is_nested_under_the_resume_route() {
+        assert!(V1_STREAM_POLL.starts_with(V1_STREAM));
+        assert!(V1_STREAM.starts_with("/v1/"));
     }
 
     #[test]

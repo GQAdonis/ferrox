@@ -50,6 +50,7 @@ mod limits;
 mod mcp;
 mod model;
 mod openai_extra;
+mod resume;
 mod security;
 mod session;
 mod stats;
@@ -564,6 +565,9 @@ pub(crate) struct AppState {
     /// Recent-request ring buffer and the counters behind
     /// `/admin/stats` -- see the `stats` module.
     pub(crate) stats: stats::Stats,
+    /// Replay buffers for streams started with `stream_resumable`.
+    /// See the `resume` module.
+    pub(crate) streams: resume::StreamRegistry,
     /// The directory `/admin/models` scans, when one is configured.
     pub(crate) model_dir: Option<PathBuf>,
     /// The only shared *mutable* state in the server. Locked only for
@@ -927,6 +931,20 @@ struct ChatCompletionRequest {
     stop: Option<StopParam>,
     #[serde(default)]
     stream: Option<bool>,
+    /// Ferrox extension. `true` asks the server to keep a replay buffer
+    /// for this stream so a dropped connection can be resumed from the
+    /// last `id:` seen, or drained over the JSON polling fallback.
+    ///
+    /// It also changes what a dropped socket *means*. Without it, the
+    /// connection closing cancels the generation (see the `cancel`
+    /// module). With it, the generation keeps running into the replay
+    /// buffer -- which is the entire point, and the reason this is the
+    /// caller's decision rather than the server's: a tab that navigated
+    /// away wants the CPU back, and a tab whose proxy dropped a
+    /// 90-second answer wants the answer. `POST /v1/cancel` stops a
+    /// resumable stream either way.
+    #[serde(default)]
+    stream_resumable: Option<bool>,
     #[serde(default)]
     tools: Vec<ToolDef>,
     #[serde(default)]
@@ -2143,6 +2161,15 @@ async fn chat_completions_stream(
     // decoded chunk is pushed on a channel for overlapped SSE delivery.
     let overlap = !tools_active && batcher.is_none();
 
+    // Opt-in replay. Registering a buffer is also what decides whether a
+    // dropped socket cancels this generation -- see `resume`'s module
+    // doc for why that is the caller's call and not the server's.
+    let slot = req
+        .stream_resumable
+        .unwrap_or(false)
+        .then(|| state.streams.register(&request_id));
+    let emitter = resume::Emitter::new(slot);
+
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Event, Infallible>>(64);
 
     tokio::task::spawn_blocking(move || {
@@ -2191,10 +2218,18 @@ async fn chat_completions_stream(
                 // flag `/v1/cancel` sets means there is one stop path,
                 // not two.
                 if tx_chunks
-                    .blocking_send(Ok(Event::default().json_data(payload).unwrap()))
+                    .blocking_send(Ok(emitter.event(&payload)))
                     .is_err()
                 {
-                    cancel_token.cancel();
+                    // A resumable stream is exactly the case where a
+                    // gone receiver must NOT stop the work: the client
+                    // said it may come back, the buffer is still being
+                    // filled for it, and cancelling here would make
+                    // every reconnect resume into a truncated answer.
+                    // `POST /v1/cancel` remains its stop path.
+                    if !emitter.is_resumable() {
+                        cancel_token.cancel();
+                    }
                 }
             },
         );
@@ -2249,7 +2284,7 @@ async fn chat_completions_stream(
                             }],
                             usage: None,
                         };
-                        let _ = tx.blocking_send(Ok(Event::default().json_data(payload).unwrap()));
+                        let _ = tx.blocking_send(Ok(emitter.event(&payload)));
                     } else if !full_text.is_empty() {
                         let payload = ChatCompletionChunk {
                             id: request_id.clone(),
@@ -2267,7 +2302,7 @@ async fn chat_completions_stream(
                             }],
                             usage: None,
                         };
-                        let _ = tx.blocking_send(Ok(Event::default().json_data(payload).unwrap()));
+                        let _ = tx.blocking_send(Ok(emitter.event(&payload)));
                     }
                 }
                 let final_finish_reason = if tool_call.is_some() {
@@ -2291,8 +2326,8 @@ async fn chat_completions_stream(
                     }],
                     usage: Some(usage.clone()),
                 };
-                let _ = tx.blocking_send(Ok(Event::default().json_data(final_payload).unwrap()));
-                let _ = tx.blocking_send(Ok(Event::default().data("[DONE]")));
+                let _ = tx.blocking_send(Ok(emitter.event(&final_payload)));
+                let _ = tx.blocking_send(Ok(emitter.done()));
                 // Recorded here rather than where the handler returned:
                 // the handler returns as soon as the SSE headers go out,
                 // which is before a single token exists, so timing it
@@ -2339,10 +2374,14 @@ async fn chat_completions_stream(
                     }],
                     usage: None,
                 };
-                let _ = tx.blocking_send(Ok(Event::default().json_data(payload).unwrap()));
-                let _ = tx.blocking_send(Ok(Event::default().data("[DONE]")));
+                let _ = tx.blocking_send(Ok(emitter.event(&payload)));
+                let _ = tx.blocking_send(Ok(emitter.done()));
             }
         }
+        // Whichever way the generation ended, the buffer is closed: a
+        // reader that has caught up stops instead of parking for an
+        // event that will never come.
+        emitter.finish();
     });
 
     let stream =
@@ -2370,6 +2409,17 @@ async fn chat_completions_stream(
         Sse::new(stream).keep_alive(KeepAlive::default()),
     )
         .into_response())
+}
+
+/// The axum pattern for one of the published stream templates.
+///
+/// `ferrox_api::routes` writes placeholders in the OpenAPI style
+/// because it is imported by clients that have never heard of this
+/// server's router; axum 0.7 wants `:name`. Converting here keeps one
+/// published spelling and one router spelling, and the test below fails
+/// if they ever stop describing the same path.
+fn resume_route(template: &str) -> String {
+    template.replace("{request_id}", ":request_id")
 }
 
 /// `POST /v1/cancel` -- the explicit half of two-tier cancellation.
@@ -2521,6 +2571,7 @@ fn build_app_state(
         tasks: Arc::new(tasks::TaskRegistry::new()),
         cancels: Arc::new(cancel::CancelRegistry::new()),
         stats: stats::Stats::new(),
+        streams: resume::StreamRegistry::new(),
         model_dir: admin::model_dirs().into_iter().next(),
         response_cache: Mutex::new(ResponseCache::new(1000, Duration::from_secs(3600))),
         kv_pool,
@@ -3130,6 +3181,12 @@ async fn run(mcp_config_path: Option<PathBuf>, exit_on_stdin_close: bool) -> any
         // an unauthenticated caller must not be able to stop someone
         // else's generation by guessing at request ids.
         .route(routes::V1_CANCEL, post(cancel_generation))
+        // Reconnect and the polling fallback, both behind the same key
+        // as the request that filled the buffer: the replay window holds
+        // the model's output, so reading it must cost what producing it
+        // cost.
+        .route(&resume_route(routes::V1_STREAM), get(resume::resume))
+        .route(&resume_route(routes::V1_STREAM_POLL), get(resume::poll))
         .route(routes::V1_MESSAGES, post(anthropic::messages))
         .route(routes::V1_COMPLETIONS, post(openai_extra::completions))
         .route(routes::V1_TOKENIZE, post(openai_extra::tokenize))
@@ -3421,6 +3478,7 @@ mod tests {
             tasks: Arc::new(tasks::TaskRegistry::new()),
             cancels: Arc::new(cancel::CancelRegistry::new()),
             stats: stats::Stats::new(),
+            streams: resume::StreamRegistry::new(),
             model_dir: None,
             response_cache: Mutex::new(response_cache),
             kv_pool: None,
@@ -3471,6 +3529,14 @@ mod tests {
             .route(ferrox_api::routes::ADMIN_TASKS, get(admin::tasks))
             .route(ferrox_api::routes::ADMIN_STATS, get(admin::stats))
             .route(ferrox_api::routes::V1_CANCEL, post(cancel_generation))
+            .route(
+                &resume_route(ferrox_api::routes::V1_STREAM),
+                get(resume::resume),
+            )
+            .route(
+                &resume_route(ferrox_api::routes::V1_STREAM_POLL),
+                get(resume::poll),
+            )
             .with_state(state)
     }
 
@@ -3919,6 +3985,341 @@ mod tests {
         assert_eq!(
             stats["generating_now"], 0,
             "work in progress is measured and really is zero here"
+        );
+    }
+
+    /// The raw SSE body, so the tests below can assert on the `id:` and
+    /// `retry:` fields themselves rather than only on the JSON inside
+    /// `data:`. Those two fields are the whole of the replay contract
+    /// on the wire.
+    async fn post_sse_raw(app: &Router, body: serde_json::Value) -> String {
+        use http_body_util::BodyExt;
+        use tower::ServiceExt;
+
+        let response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        String::from_utf8(bytes.to_vec()).unwrap()
+    }
+
+    async fn get_json_with_headers(
+        app: &Router,
+        uri: &str,
+        headers: &[(&str, &str)],
+    ) -> (StatusCode, serde_json::Value) {
+        use http_body_util::BodyExt;
+        use tower::ServiceExt;
+
+        let mut builder = axum::http::Request::builder().method("GET").uri(uri);
+        for (name, value) in headers {
+            builder = builder.header(*name, *value);
+        }
+        let response = app
+            .clone()
+            .oneshot(builder.body(axum::body::Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        (
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(serde_json::json!({})),
+        )
+    }
+
+    fn sse_field<'a>(body: &'a str, field: &str) -> Vec<&'a str> {
+        body.lines()
+            .filter_map(|line| line.strip_prefix(field))
+            .map(str::trim)
+            .collect()
+    }
+
+    fn resumable_request() -> serde_json::Value {
+        serde_json::json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "\u{1}\u{2}\u{3}"}],
+            "max_tokens": 4,
+            "temperature": 0,
+            "stream": true,
+            "stream_resumable": true,
+        })
+    }
+
+    /// The wire half of the replay contract: every event is numbered,
+    /// the numbers are qualified by the request so a `Last-Event-ID`
+    /// cannot be mistaken for a position in another stream, and the
+    /// reconnect delay is stated once.
+    #[tokio::test]
+    async fn a_resumable_stream_numbers_every_event_and_states_retry_once() {
+        let app = test_app();
+        let body = post_sse_raw(&app, resumable_request()).await;
+
+        let request_id = body
+            .lines()
+            .find_map(|l| l.strip_prefix("data: "))
+            .and_then(|d| serde_json::from_str::<serde_json::Value>(d).ok())
+            .and_then(|v| v["request_id"].as_str().map(str::to_string))
+            .expect("the first chunk names the request");
+
+        let ids = sse_field(&body, "id:");
+        let datas = sse_field(&body, "data:");
+        assert_eq!(
+            ids.len(),
+            datas.len(),
+            "every event carries an id, or a reconnect cannot name where it stopped"
+        );
+        for (i, id) in ids.iter().enumerate() {
+            assert_eq!(*id, format!("{request_id}:{i}"));
+        }
+        let retries = sse_field(&body, "retry:");
+        assert_eq!(
+            retries.len(),
+            1,
+            "the reconnect delay is stated once, not on every event"
+        );
+        assert_eq!(retries[0], "1500");
+        assert!(
+            body.contains("data: [DONE]"),
+            "the end of stream is still stated"
+        );
+    }
+
+    /// The refusal this feature was written around: an `id:` with no
+    /// replay buffer behind it tells a client it may reconnect into
+    /// something that does not exist.
+    #[tokio::test]
+    async fn a_plain_stream_carries_no_id_because_nothing_could_replay_it() {
+        let app = test_app();
+        let mut request = resumable_request();
+        request["stream_resumable"] = serde_json::json!(false);
+        let body = post_sse_raw(&app, request).await;
+        assert!(!sse_field(&body, "data:").is_empty(), "it still streams");
+        assert!(
+            sse_field(&body, "id:").is_empty(),
+            "an id promises a replay this stream cannot serve"
+        );
+        assert!(sse_field(&body, "retry:").is_empty());
+    }
+
+    /// The polling fallback, which is the answer to the proxy that
+    /// buffers `text/event-stream`: the same events, over a short JSON
+    /// response nothing can hold back.
+    #[tokio::test]
+    async fn the_polling_fallback_serves_exactly_what_the_stream_delivered() {
+        let app = test_app();
+        let body = post_sse_raw(&app, resumable_request()).await;
+        let request_id = sse_field(&body, "id:")[0]
+            .rsplit_once(':')
+            .unwrap()
+            .0
+            .to_string();
+        let streamed: Vec<String> = sse_field(&body, "data:")
+            .iter()
+            .map(|d| d.to_string())
+            .collect();
+
+        let (status, polled) = get_json(
+            &app,
+            &format!("{}?from=0", ferrox_api::routes::v1_stream_poll(&request_id)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let events: Vec<String> = polled["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["data"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(
+            events, streamed,
+            "the fallback must deliver the same answer, not a re-run of it"
+        );
+        assert_eq!(polled["request_id"], request_id);
+        assert_eq!(
+            polled["done"], false,
+            "events were still being handed out, so the client must ask again"
+        );
+
+        // Drained: only now is it done, so a client that stops on
+        // `done` never discards events it was not given.
+        let next = polled["next_index"].as_u64().unwrap();
+        let (_, drained) = get_json(
+            &app,
+            &format!(
+                "{}?from={next}",
+                ferrox_api::routes::v1_stream_poll(&request_id)
+            ),
+        )
+        .await;
+        assert_eq!(drained["done"], true);
+        assert_eq!(drained["events"].as_array().unwrap().len(), 0);
+    }
+
+    /// A resume returns what was missed and not what was already
+    /// rendered -- repeating delivered tokens would make replay worse
+    /// than starting over.
+    #[tokio::test]
+    async fn a_resume_continues_after_the_last_event_id_rather_than_repeating() {
+        let app = test_app();
+        let body = post_sse_raw(&app, resumable_request()).await;
+        let ids = sse_field(&body, "id:");
+        let datas: Vec<String> = sse_field(&body, "data:")
+            .iter()
+            .map(|d| d.to_string())
+            .collect();
+        assert!(
+            ids.len() >= 3,
+            "need a few events to resume into the middle"
+        );
+        let request_id = ids[0].rsplit_once(':').unwrap().0.to_string();
+
+        let (status, resumed) = get_json_with_headers(
+            &app,
+            &format!("{}/poll", ferrox_api::routes::v1_stream(&request_id)),
+            &[],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(resumed["events"].as_array().unwrap().len(), datas.len());
+
+        // Now from the middle, the way a reconnect would.
+        let (_, tail) = get_json(
+            &app,
+            &format!("{}?from=2", ferrox_api::routes::v1_stream_poll(&request_id)),
+        )
+        .await;
+        let tail_events: Vec<String> = tail["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["data"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(tail_events, datas[2..].to_vec());
+    }
+
+    /// Reconnecting over SSE picks up where the last id left off, with
+    /// the ids still attached so a second drop can be resumed too.
+    #[tokio::test]
+    async fn an_sse_reconnect_resumes_from_the_last_event_id() {
+        use http_body_util::BodyExt;
+        use tower::ServiceExt;
+
+        let app = test_app();
+        let body = post_sse_raw(&app, resumable_request()).await;
+        let ids = sse_field(&body, "id:");
+        let datas: Vec<String> = sse_field(&body, "data:")
+            .iter()
+            .map(|d| d.to_string())
+            .collect();
+        let request_id = ids[0].rsplit_once(':').unwrap().0.to_string();
+
+        let response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("GET")
+                    .uri(ferrox_api::routes::v1_stream(&request_id))
+                    .header("last-event-id", format!("{request_id}:0"))
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get("x-accel-buffering")
+                .and_then(|v| v.to_str().ok()),
+            Some("no"),
+            "the reconnect needs the same anti-buffering header as the stream"
+        );
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let resumed = String::from_utf8(bytes.to_vec()).unwrap();
+        assert_eq!(
+            sse_field(&resumed, "data:")
+                .iter()
+                .map(|d| d.to_string())
+                .collect::<Vec<_>>(),
+            datas[1..].to_vec()
+        );
+        assert_eq!(sse_field(&resumed, "id:")[0], format!("{request_id}:1"));
+    }
+
+    /// A `Last-Event-ID` from another stream is refused rather than
+    /// rounded down to zero: replaying a whole different answer would
+    /// be a silent, confident lie.
+    #[tokio::test]
+    async fn a_last_event_id_from_another_stream_is_refused() {
+        let app = test_app();
+        let body = post_sse_raw(&app, resumable_request()).await;
+        let request_id = sse_field(&body, "id:")[0]
+            .rsplit_once(':')
+            .unwrap()
+            .0
+            .to_string();
+
+        let (status, err) = get_json_with_headers(
+            &app,
+            &ferrox_api::routes::v1_stream(&request_id),
+            &[("last-event-id", "chatcmpl-someone-else:3")],
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(err["error"]["code"], "bad_last_event_id");
+    }
+
+    /// A stream that was never resumable, or has been forgotten, is a
+    /// 404 that says which -- not an empty stream that reads as an
+    /// answer with no tokens in it.
+    #[tokio::test]
+    async fn resuming_a_stream_that_was_never_resumable_is_a_404_that_says_why() {
+        let app = test_app();
+        let mut request = resumable_request();
+        request["stream_resumable"] = serde_json::json!(false);
+        let body = post_sse_raw(&app, request).await;
+        let request_id = body
+            .lines()
+            .find_map(|l| l.strip_prefix("data: "))
+            .and_then(|d| serde_json::from_str::<serde_json::Value>(d).ok())
+            .and_then(|v| v["request_id"].as_str().map(str::to_string))
+            .unwrap();
+
+        let (status, err) = get_json(&app, &ferrox_api::routes::v1_stream_poll(&request_id)).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(err["error"]["code"], "stream_not_found");
+        assert!(err["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("stream_resumable"));
+    }
+
+    /// The published template and the router's pattern must describe
+    /// the same path, or a client built from `ferrox_api::routes` asks
+    /// for something this server does not serve.
+    #[test]
+    fn the_axum_stream_patterns_match_the_published_templates() {
+        assert_eq!(
+            resume_route(ferrox_api::routes::V1_STREAM),
+            "/v1/stream/:request_id"
+        );
+        assert_eq!(
+            resume_route(ferrox_api::routes::V1_STREAM_POLL),
+            "/v1/stream/:request_id/poll"
+        );
+        assert_eq!(
+            ferrox_api::routes::v1_stream("abc"),
+            resume_route(ferrox_api::routes::V1_STREAM).replace(":request_id", "abc")
         );
     }
 

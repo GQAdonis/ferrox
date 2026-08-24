@@ -44,8 +44,9 @@ attention and expert routing are all implemented here.
 - **Validated against the reference.** Quant kernels are checked
   bit-exact against llama.cpp's own dequantization, and `ferrox parity`
   compares first-token logit distributions with llama.cpp on the same
-  prompt. If a checkpoint needs something Ferrox has not implemented,
-  loading it fails with a reason instead of producing wrong output.
+  prompt. A model whose maths Ferrox only partly implements stops with
+  an error naming what is missing, rather than loading and returning
+  fluent text computed the wrong way.
 - **OpenAI-compatible server** with continuous batching, a prefix cache
   that survives restarts, runtime model swap, and a `/admin` control
   surface. Point your existing client at it.
@@ -93,8 +94,9 @@ curl -s -X POST http://127.0.0.1:8383/v1/chat/completions \
 ferrox bench -m models/Llama-3.2-3B-Instruct-Q4_K_M.gguf -p 512 -n 128 -r 3 --compare
 ```
 
-Prefer `Q4_K_M` day to day and `Q8_0` for small smoke tests. What runs
-today, and what gets refused, is in [docs/MODELS.md](docs/MODELS.md).
+Prefer `Q4_K_M` day to day and `Q8_0` for small smoke tests.
+[docs/MODELS.md](docs/MODELS.md) lists what runs today, and which
+checkpoints stop with an error instead.
 
 ## Use it as a library
 

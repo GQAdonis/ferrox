@@ -72,54 +72,62 @@ OLMoE (1.11×) and Gemma-3-1B (1.18×) on Metal.
 | MLA (`deepseek2` / `mistral4`) | Dense-lead + MoE-after-dense via `MlaEngine` |
 | GLM4 / glm4moe | Loads via GLM-5.2 path when tensors present; no suite receipt |
 | Gemma-4-E2B | Dedicated `Gemma4Engine` + SPM-style `gemma4` BPE tokenizer + `<|turn>` chat wrap. GGUF: `models/gemma-4-E2B-it-Q4_K_M.gguf` (`unsloth/gemma-4-E2B-it-GGUF`). Suite id `gemma4_e2b_q4km`, Homebrew llama may still lack `gemma4` arch. |
-| gpt-oss | **CPU only.** Attention sinks, alternating sliding-window attention, biased router and the `swiglu_oai` clamp, checked against llama.cpp's own reference logits. Metal and the paged-KV decode path both refuse rather than compute different attention |
-| Llama 4 / MiniMax | **Refused**, with the reason stated at load: `llama4 MoE + non-GQA attn` and `MiniMax 256-expert sigmoid MoE + MTP` |
+| gpt-oss | **CPU only.** Attention sinks, alternating sliding-window attention, biased router and the `swiglu_oai` clamp, checked against llama.cpp's own reference logits. Metal and the paged-KV decode path both decline it rather than compute different attention |
+| Llama 4 / MiniMax | **Will not load**, with the reason stated: `llama4 MoE + non-GQA attn` and `MiniMax 256-expert sigmoid MoE + MTP` |
 | Hybrid GDN / Qwen3.5 | Scaffold only |
 | Kimi K3 / GLM-5.2 / DeepSeek V4 | Loaders/primitives; no frontier e2e receipt |
 | Vision | mmproj discover + warn; `image_url` rejected |
 | MTP / speculative | `--mtp` errors by design. `ferrox speculative` is prompt-lookup only (an n-gram match over the history, no draft model) and runs on **synthetic random weights**, so the hit rate it prints is not representative of a real drafter. Plan for a real one: [`docs/plans/dflash-speculative-decoding.md`](plans/dflash-speculative-decoding.md) |
 | Embeddings | `/v1/embeddings` for GGUF Decoder (mean/last pool) |
 
-## Refused checkpoints
+## When a model will not load
 
-Ferrox fails closed. A checkpoint it cannot compute correctly is
-refused at load rather than admitted to a path that computes something
-else and returns confident, wrong tokens. Three ways that happens:
+Some checkpoints stop with an error instead of running. That is
+deliberate. The alternative is worse: a model whose graph Ferrox only
+partly implements will load, run fast, and return fluent text computed
+by the wrong maths, and nothing in the output tells you. An error you
+can read beats output you cannot trust.
 
-1. **Unregistered architecture**, not in the capability registry.
-2. **Registered but explicitly unsupported**, `llama4`, `minimax-m2`,
-   `minimax-m3` refuse with a reason naming the missing graph feature.
-   So do the architectures whose *residual topology* differs from the
+The error always names the reason. Four things cause it:
+
+1. **Ferrox does not know the architecture.** It is not in the
+   capability registry.
+
+2. **Ferrox knows it and has not implemented it.** `llama4`,
+   `minimax-m2` and `minimax-m3` stop with the missing feature named.
+   So do architectures whose residual wiring differs from the
    `x + attn(norm(x))` then `y + ffn(norm(y))` shape the generic decoder
    computes: `command-r`, `cohere2`, `cohere2moe`, `falcon`, `gptneox`,
    `phi2` and `plamo` feed both branches the same normed input and sum
-   once, and `minicpm` scales its embeddings, residuals and logits by
-   multipliers llama.cpp applies *even when the GGUF omits every key*.
-   None of that is visible in a tensor or (for MiniCPM) in metadata, so
-   these are refused by name rather than caught by a gate.
-3. **Any checkpoint carrying a tensor this build never reads.** The
-   GGUF reader records every tensor name a loader looks up, and the
-   load fails on leftovers:
-   *"checkpoint carries N tensor(s) this build never reads, so its
-   graph is not the one this build computes."*
-   This is what catches a missing graph term by construction rather
-   than by enumeration, `attn_sinks` and `exp_probs_b` were both
-   found this way. Tensor prefixes for parts ferrox does not claim to
-   run (`mm.`, `v.`, `mmproj.`, `resampler.`, `audio.`) are ignored.
-4. **Any checkpoint declaring a scalar multiplier this build does not
-   apply.** The tensor gate above cannot see these, they are hparams,
-   not weights, so a Granite / MiniCPM / Command-R checkpoint would
-   otherwise load cleanly and compute a differently-scaled graph than it
-   was trained as. `{arch}.logit_scale`, `{arch}.residual_scale`,
-   `{arch}.embedding_scale` and `{arch}.attention.scale` are refused by
-   name unless they hold their no-op value. **This is a refusal, not an
-   implementation**: `residual_scale` multiplies both branch outputs
-   before every residual add, which in ferrox means every CPU path plus
-   the fused Metal kernels that fold the residual in, and half of that
-   would be exactly the silent divergence the gate exists to stop.
+   once. `minicpm` scales its embeddings, residuals and logits by
+   multipliers llama.cpp applies even when the GGUF omits every key.
+   None of that shows up in a tensor or, for MiniCPM, in metadata, so
+   these are listed by name rather than detected.
+
+3. **The file contains weights Ferrox never reads.** The GGUF reader
+   records every tensor name a loader looks up and stops if any are left
+   over: *"checkpoint carries N tensor(s) this build never reads, so its
+   graph is not the one this build computes."* Unread weights mean the
+   file describes a model Ferrox is not computing. This catches missing
+   graph features automatically rather than one at a time, which is how
+   `attn_sinks` and `exp_probs_b` were both found. Tensors for parts
+   Ferrox does not claim to run (`mm.`, `v.`, `mmproj.`, `resampler.`,
+   `audio.`) are ignored.
+
+4. **The file declares a scale factor Ferrox does not apply.** These are
+   hyperparameters rather than weights, so the check above cannot see
+   them, and a Granite, MiniCPM or Command-R checkpoint would otherwise
+   load cleanly while computing a differently-scaled graph than it was
+   trained as. `{arch}.logit_scale`, `{arch}.residual_scale`,
+   `{arch}.embedding_scale` and `{arch}.attention.scale` stop the load
+   unless they hold a value that changes nothing. Implementing
+   `residual_scale` properly means touching every CPU residual add plus
+   the fused Metal kernels that fold the residual in, and getting half
+   of that right produces exactly the silent divergence this check
+   exists to prevent.
 
 `FERROX_ALLOW_UNKNOWN_TENSORS=1` loads anyway and accepts wrong output.
-It exists for debugging; it is not a workaround.
+Use it to debug, not to work around a refusal.
 
 ## Quantization support
 

@@ -55,7 +55,7 @@ curl -fsSL https://raw.githubusercontent.com/antonellof/ferrox/main/scripts/inst
 ```
 
 Installs `ferrox` and `ferrox-server` into `~/.local/bin` (override with
-`FERROX_INSTALL_DIR`, pin with `FERROX_VERSION=v0.9.0`). Prebuilts are
+`FERROX_INSTALL_DIR`, pin with `FERROX_VERSION=v0.9.1`). Prebuilts are
 macOS arm64 with Metal and Linux x86_64 with CPU.
 
 From crates.io or source instead:

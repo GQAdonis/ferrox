@@ -2,10 +2,7 @@
 
 <img src="docs/assets/ferrox-logo.webp" alt="Ferrox" width="70%" />
 
-
-**Ferrox: a pure-Rust GGUF inference engine — dense and MoE, on CPU, Apple Metal, or CUDA.**
-
-
+**A pure-Rust GGUF inference engine — dense and MoE, on CPU, Apple Metal, or CUDA.**
 
 [![CI][ci-badge]][ci-workflow]
 [![Latest release][release-badge]][latest-release]
@@ -15,14 +12,41 @@
 [![Rust](https://img.shields.io/badge/built_with-Rust-dea584.svg)](https://www.rust-lang.org/)
 [![Backends](https://img.shields.io/badge/backends-CPU%20%7C%20Metal%20%7C%20CUDA-64748b.svg)](docs/FEATURES.md)
 
-[Install](#install) · [Web UI](#web-ui--ferrox-studio) · [Models](docs/MODELS.md) · [Benchmarks](benchmarks/RESULTS.md) · [API](docs/API.md) · [Contributing](CONTRIBUTING.md)
+**[Features](docs/FEATURES.md)** ·
+**[Models](docs/MODELS.md)** ·
+**[CLI](docs/CLI.md)** ·
+**[API](docs/API.md)** ·
+**[Config](docs/CONFIG.md)** ·
+**[Benchmarks](benchmarks/RESULTS.md)** ·
+**[Studio UI](ui/)** ·
+**[Agents](docs/AGENTS_COOKBOOK.md)** ·
+**[Roadmap](docs/ROADMAP.md)** ·
+**[Contributing](CONTRIBUTING.md)**
 
 </div>
 
-It ships a llama.cpp-style CLI and an OpenAI-compatible HTTP server; a
-separate web UI, Ferrox Studio, talks to that server like any other
-client. Weights stay quantized on mmap and dequantization happens inside
-the matmul, so an 8B model fits on a laptop.
+---
+
+Ferrox loads GGUF checkpoints and runs inference on your hardware. No
+bindings to llama.cpp, no ggml wrapper — the loader, quantized kernels,
+attention and expert routing are all implemented here.
+
+- **Quantized end to end.** Weights stay quantized on mmap and
+  dequantization happens inside the matmul, so an 8B model fits on a
+  laptop. K-quants, the IQ tiers, MXFP4, F16 and BF16.
+- **Mixture-of-experts as a first-class path**, not a dense engine in a
+  costume: GPU routing, indexed expert GEMMs, and residency planning for
+  models larger than VRAM.
+- **Measured, not asserted.** Every speed claim is pinned against
+  llama.cpp on the same host, same file, same backend, with a checked-in
+  receipt. `ferrox bench` refuses to time a run on a machine too busy for
+  the number to mean anything.
+- **Refuses what it cannot compute.** A checkpoint needing a graph
+  feature Ferrox lacks is rejected at load rather than run as a
+  different model that returns confident, wrong tokens.
+- **OpenAI-compatible server** with continuous batching, a prefix cache
+  that survives restarts, runtime model swap, and a `/admin` control
+  surface. Point your existing client at it.
 
 ## Install
 
@@ -31,10 +55,10 @@ curl -fsSL https://raw.githubusercontent.com/antonellof/ferrox/main/scripts/inst
 ```
 
 Installs `ferrox` and `ferrox-server` into `~/.local/bin` (override with
-`FERROX_INSTALL_DIR`, pin with `FERROX_VERSION=v0.9.0`). Prebuilts:
-macOS arm64 (Metal) and Linux x86_64 (CPU).
+`FERROX_INSTALL_DIR`, pin with `FERROX_VERSION=v0.9.0`). Prebuilts are
+macOS arm64 with Metal and Linux x86_64 with CPU.
 
-Or from crates.io / source:
+From crates.io or source instead:
 
 ```bash
 cargo install ferrox-cli --features metal      # `ferrox`; --features cuda on Linux+NVIDIA
@@ -43,93 +67,38 @@ cargo install ferrox-server --features metal   # the HTTP server
 cargo build --release -p ferrox-cli -p ferrox-server --features metal
 ```
 
-Neither install pulls in a GPU backend unless you ask for it. After a
-source build the binaries are under `./target/release/`.
+Neither install pulls in a GPU backend unless you ask for it.
 
-## Get a model
+## Quick start
 
 ```bash
+# 1. Get a model (needs `pip install -U "huggingface_hub[cli]"`).
 mkdir -p models
-hf download TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF \
-  tinyllama-1.1b-chat-v1.0.Q8_0.gguf --local-dir models
-```
+hf download bartowski/Llama-3.2-3B-Instruct-GGUF \
+  Llama-3.2-3B-Instruct-Q4_K_M.gguf --local-dir models
 
-Needs the [Hugging Face CLI](https://huggingface.co/docs/huggingface_hub/guides/cli)
-(`pip install -U "huggingface_hub[cli]"`). Prefer `Q4_K_M` for everyday
-use, `Q8_0` for small smokes. Good starters: `unsloth/gemma-4-E2B-it-GGUF`,
-`bartowski/Llama-3.2-{1B,3B}-Instruct-GGUF`,
-`bartowski/SmolLM2-135M-Instruct-GGUF`. What actually works today:
-[docs/MODELS.md](docs/MODELS.md).
+# 2. Run it. The GGUF's own chat template is applied; add --no-cnv for raw completion.
+ferrox -m models/Llama-3.2-3B-Instruct-Q4_K_M.gguf \
+  -p "Explain quantization in two sentences" -n 128 -dev metal -ngl all
 
-## Web UI — Ferrox Studio
-
-The UI lives in [`ui/`](ui/) and is a **separate app**: `ferrox-server`
-serves the API, nothing else. Run the server, then run the UI against it.
-
-```bash
-# 1. the API
-ferrox-server -m models/tinyllama-1.1b-chat-v1.0.Q8_0.gguf
-
-# 2. the UI (proxies /v1, /admin and /health to 127.0.0.1:8383)
-cd ui && npm install && npm run dev
-```
-
-| Screen | What it does |
-|---|---|
-| **Chat** | Streaming chat with markdown, and the server's own `usage` under each answer: TTFT, prefill tok/s, decode tok/s — measured server-side, not with a client stopwatch |
-| **Models** | Everything in your model directory: load, unload, swap the active model, download from Hugging Face with live progress |
-| **Activity** | Live request log, keyed by `request_id`. `duration_ms` and `decode_ms` stay separate columns, because conflating them reads a 50 tok/s model as 5 |
-| **Connect** | Copy-pasteable curl / Python-SDK / IDE snippets, filled from the base URL and the model id `/v1/models` reports |
-
-Every screen goes through the public HTTP API, so the API cannot rot
-without the UI breaking first — and because the UI is just another
-client, nothing it does is unavailable to yours.
-
-`npm run build` produces static files in `ui/dist/` for hosting anywhere.
-Served from an origin other than the API's, the browser applies CORS, so
-the server needs `FERROX_CORS_ORIGINS` set to that exact origin — `*` is
-rejected on purpose, since a wildcard alongside a bearer token is a
-credential-leak shape. The dev server sidesteps this by proxying.
-
-## CLI and server
-
-```bash
-# Chat model: omit --no-cnv so the GGUF chat template is applied.
-ferrox -m models/gemma-4-E2B-it-Q4_K_M.gguf \
-  -p "How are you?" -n 64 --temp 0 -dev metal -ngl all
-
-# Raw completion, no chat wrap.
-ferrox -m models/tinyllama-1.1b-chat-v1.0.Q8_0.gguf \
-  -p "The capital of France is" -n 32 --temp 0 --no-cnv
-
-# OpenAI-compatible server (default 127.0.0.1:8383).
-ferrox-server -m models/tinyllama-1.1b-chat-v1.0.Q8_0.gguf -dev metal -ngl all &
+# 3. Or serve it on 127.0.0.1:8383 and point any OpenAI client at /v1.
+ferrox-server -m models/Llama-3.2-3B-Instruct-Q4_K_M.gguf -dev metal -ngl all &
 curl -s -X POST http://127.0.0.1:8383/v1/chat/completions \
   -H 'content-type: application/json' \
   -d '{"model":"m","messages":[{"role":"user","content":"Hi"}],"max_tokens":64}'
+
+# 4. Check it against llama.cpp on your own machine.
+ferrox bench -m models/Llama-3.2-3B-Instruct-Q4_K_M.gguf -p 512 -n 128 -r 3 --compare
 ```
 
-Flags: [docs/CLI.md](docs/CLI.md). API surface: [docs/API.md](docs/API.md).
-
-## Benchmark vs llama.cpp
-
-Same shape as `llama-bench` — `pp512` prefill, `tg128` decode, no HTTP.
-Every published number has a receipt, and a run **refuses to start** on a
-host too busy for the number to mean anything.
-
-```bash
-ferrox bench -m models/tinyllama-1.1b-chat-v1.0.Q8_0.gguf -p 512 -n 128 -r 3 --compare
-ferrox bench --suite --fit-host --skip-missing
-```
-
-Ledger: [benchmarks/RESULTS.md](benchmarks/RESULTS.md) ·
-method: [benchmarks/README.md](benchmarks/README.md).
+Prefer `Q4_K_M` day to day and `Q8_0` for small smoke tests. What runs
+today, and what gets refused, is in [docs/MODELS.md](docs/MODELS.md).
 
 ## Use it as a library
 
-Published as [`ferrox-inference`](https://crates.io/crates/ferrox-inference)
-(the name `ferrox` belongs to an unrelated crate) — a facade that
-re-exports the whole workspace:
+Published as [`ferrox-inference`](https://crates.io/crates/ferrox-inference),
+a facade re-exporting the workspace. The name `ferrox` on crates.io
+belongs to an unrelated crate.
 
 ```toml
 [dependencies]
@@ -140,51 +109,29 @@ ferrox-inference = "0.9"
 use ferrox_inference::gguf::ShardedGguf;
 use ferrox_inference::models::{Decoder, ModelConfig};
 
-let path = "models/Llama-3.2-1B-Instruct-Q4_K_M.gguf";
+let path = "models/Llama-3.2-3B-Instruct-Q4_K_M.gguf";
 
 // Read metadata without loading a single weight.
 let file = ShardedGguf::open(path)?;
 println!("{} tensors", file.tensor_count());
 
-// Hyperparameters come from the file. Anything that had to be guessed
-// is listed in `config.best_effort_fields`.
+// Hyperparameters come from the file. Anything guessed is listed in
+// `config.best_effort_fields`.
 let config = ModelConfig::from_gguf(&file)?;
-
-// Weights stay quantized and mmap-resident; dequant happens inside the
-// matmul. This REFUSES a checkpoint carrying tensors this build never
-// reads, rather than quietly computing a different graph.
 let decoder = Decoder::from_gguf(path, config)?;
 ```
 
-Features, none on by default: `metal`, `cuda`, `api` (route constants +
-wire DTOs, for a client that should not depend on the server).
-
-The individual layers are published too, if you want one rather than the
-stack: [`ferrox-gguf`](https://crates.io/crates/ferrox-gguf),
-[`ferrox-quant`](https://crates.io/crates/ferrox-quant),
-[`ferrox-safetensors`](https://crates.io/crates/ferrox-safetensors),
-[`ferrox-core`](https://crates.io/crates/ferrox-core),
-[`ferrox-moe`](https://crates.io/crates/ferrox-moe),
-[`ferrox-models`](https://crates.io/crates/ferrox-models),
-[`ferrox-api`](https://crates.io/crates/ferrox-api),
-[`ferrox-metal`](https://crates.io/crates/ferrox-metal),
-[`ferrox-cuda`](https://crates.io/crates/ferrox-cuda). All share one
-version number.
-
-## Documentation
-
-| Doc | Description |
-| --- | --- |
-| [docs/FEATURES.md](docs/FEATURES.md) | Capabilities overview |
-| [docs/MODELS.md](docs/MODELS.md) | Supported models, quant coverage, what gets refused |
-| [docs/CLI.md](docs/CLI.md) | CLI flags and examples |
-| [docs/API.md](docs/API.md) | OpenAI-compatible API |
-| [docs/CONFIG.md](docs/CONFIG.md) | Environment variables |
-| [docs/AGENTS_COOKBOOK.md](docs/AGENTS_COOKBOOK.md) | Point IDEs / agents at the server |
-| [benchmarks/RESULTS.md](benchmarks/RESULTS.md) | Speed vs llama.cpp |
-| [benchmarks/README.md](benchmarks/README.md) | How it is measured |
-| [docs/ROADMAP.md](docs/ROADMAP.md) | Planned work |
-| [CONTRIBUTING.md](CONTRIBUTING.md) | How to contribute |
+Features, none on by default: `metal`, `cuda`, `api`. Every layer is
+published separately if you want one rather than the stack —
+[gguf](https://crates.io/crates/ferrox-gguf),
+[quant](https://crates.io/crates/ferrox-quant),
+[safetensors](https://crates.io/crates/ferrox-safetensors),
+[core](https://crates.io/crates/ferrox-core),
+[moe](https://crates.io/crates/ferrox-moe),
+[models](https://crates.io/crates/ferrox-models),
+[api](https://crates.io/crates/ferrox-api),
+[metal](https://crates.io/crates/ferrox-metal),
+[cuda](https://crates.io/crates/ferrox-cuda). All share one version.
 
 ## AI full disclosure
 

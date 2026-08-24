@@ -1,7 +1,7 @@
 # Third-party notices
 
 Thanks to the projects whose public designs, file formats, and CLI
-conventions shaped ferrox's architecture — llama.cpp, candle, and
+conventions shaped ferrox's architecture: llama.cpp, candle, and
 others credited below. This file records that influence, plus the
 license and copyright notices required wherever real upstream source
 was read or adapted.
@@ -208,7 +208,7 @@ under the same Apache-2.0 license as ferrox itself.
 The web UI is a separate React application under [`ui/`](../ui). It is
 distributed as built JavaScript, so every dependency's licence travels
 with the bundle rather than staying a lockfile detail. **All of them are
-permissive — MIT, Apache-2.0 or ISC.** No AGPL or GPL dependency is
+permissive: MIT, Apache-2.0 or ISC.** No AGPL or GPL dependency is
 permitted, and `npm run licenses` (`ui/scripts/check-licenses.mjs`)
 walks the whole installed tree on every CI run and fails the build on
 anything that is not.

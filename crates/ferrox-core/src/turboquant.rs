@@ -60,7 +60,7 @@ pub fn quantize_turbo4_groups(x: &[f32], group: usize) -> (Vec<u8>, Vec<f32>) {
         let scale = if amax > 0.0 { amax / 7.0 } else { 1.0 };
         scales.push(scale);
         let inv = 1.0 / scale;
-        for pair in chunk.chunks_exact(2) {
+        for pair in chunk.as_chunks::<2>().0 {
             let q0 = (pair[0] * inv).round().clamp(-8.0, 7.0) as i8;
             let q1 = (pair[1] * inv).round().clamp(-8.0, 7.0) as i8;
             let n0 = (q0 as u8) & 0x0f;

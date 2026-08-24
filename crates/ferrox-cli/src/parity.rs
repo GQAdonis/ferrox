@@ -353,7 +353,9 @@ fn reference_logits(dumper: &Path, model: &str, tokens: &[u32]) -> anyhow::Resul
         anyhow::bail!("reference logits file is not a whole number of f32");
     }
     Ok(bytes
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect())
 }

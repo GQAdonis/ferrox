@@ -76,8 +76,8 @@ pub fn load_f32_vec(shard: &ShardedSafetensors, name: &str) -> Result<Vec<f32>, 
     match info.dtype {
         SafetensorsDtype::F32 => {
             let mut out = Vec::with_capacity(raw.len() / 4);
-            for chunk in raw.chunks_exact(4) {
-                out.push(f32::from_le_bytes(chunk.try_into().unwrap()));
+            for chunk in raw.as_chunks::<4>().0 {
+                out.push(f32::from_le_bytes(*chunk));
             }
             Ok(out)
         }

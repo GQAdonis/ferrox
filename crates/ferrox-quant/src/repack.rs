@@ -647,7 +647,7 @@ pub fn prepare_q8_acts_x4(acts: &[Q8Activations], n_cols: usize) -> Q8ActsX4 {
         for b in 0..nb {
             let src = &act.q[b * Q8_0_BLOCK_ELEMS..(b + 1) * Q8_0_BLOCK_ELEMS];
             let dst = &mut qs[b * Q8_0_BLOCK_ELEMS * 4..(b + 1) * Q8_0_BLOCK_ELEMS * 4];
-            for (c, run) in src.chunks_exact(8).enumerate() {
+            for (c, run) in src.as_chunks::<8>().0.iter().enumerate() {
                 dst[c * 32 + a * 8..c * 32 + a * 8 + 8].copy_from_slice(run);
             }
             d[b * 4 + a] = act.d[b];
@@ -863,12 +863,12 @@ pub fn prepare_q8_k_acts_x4(acts: &[Q8KActivations], n_cols: usize) -> Q8KActsX4
         for b in 0..nb {
             let src = &act.q[b * Q4_K_BLOCK_ELEMS..(b + 1) * Q4_K_BLOCK_ELEMS];
             let dst = &mut qs[b * Q4_K_BLOCK_ELEMS * 4..(b + 1) * Q4_K_BLOCK_ELEMS * 4];
-            for (c, run) in src.chunks_exact(8).enumerate() {
+            for (c, run) in src.as_chunks::<8>().0.iter().enumerate() {
                 dst[c * 32 + a * 8..c * 32 + a * 8 + 8].copy_from_slice(run);
             }
             let src_bs = &act.bsums[b * 16..(b + 1) * 16];
             let dst_bs = &mut bsums[(b * 4 + a) * 8..(b * 4 + a) * 8 + 8];
-            for (slot, pair) in dst_bs.iter_mut().zip(src_bs.chunks_exact(2)) {
+            for (slot, pair) in dst_bs.iter_mut().zip(src_bs.as_chunks::<2>().0) {
                 *slot = pair[0] + pair[1];
             }
             d[b * 4 + a] = act.d[b];

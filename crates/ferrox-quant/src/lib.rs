@@ -207,7 +207,9 @@ pub fn dequant_bf16(src: &[u8]) -> Result<Vec<f32>, QuantError> {
         return Err(QuantError::Misaligned(src.len(), 2));
     }
     Ok(src
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|c| f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16))
         .collect())
 }
@@ -223,7 +225,9 @@ pub fn dequant_f16(src: &[u8]) -> Result<Vec<f32>, QuantError> {
         return Err(QuantError::Misaligned(src.len(), 2));
     }
     Ok(src
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|c| f16::from_le_bytes([c[0], c[1]]).to_f32())
         .collect())
 }
@@ -298,7 +302,7 @@ pub fn dequant_q4_k(src: &[u8]) -> Result<Vec<f32>, QuantError> {
     }
     let n_blocks = src.len() / Q4_K_BLOCK_BYTES;
     let mut out = Vec::with_capacity(n_blocks * Q4_K_BLOCK_ELEMS);
-    for block in src.chunks_exact(Q4_K_BLOCK_BYTES) {
+    for block in src.as_chunks::<Q4_K_BLOCK_BYTES>().0 {
         let d = f16::from_le_bytes([block[0], block[1]]).to_f32();
         let dmin = f16::from_le_bytes([block[2], block[3]]).to_f32();
         let scales: [u8; Q4_K_SCALE_BYTES] = block[4..16].try_into().unwrap();
@@ -348,7 +352,7 @@ pub fn dot_q4_k_f32_scalar(row_bytes: &[u8], x: &[f32]) -> f32 {
     debug_assert_eq!(row_bytes.len() % Q4_K_BLOCK_BYTES, 0);
     let mut acc = 0f32;
     let mut base = 0usize;
-    for block in row_bytes.chunks_exact(Q4_K_BLOCK_BYTES) {
+    for block in row_bytes.as_chunks::<Q4_K_BLOCK_BYTES>().0 {
         let d = f16::from_le_bytes([block[0], block[1]]).to_f32();
         let dmin = f16::from_le_bytes([block[2], block[3]]).to_f32();
         let scales: [u8; Q4_K_SCALE_BYTES] = block[4..16].try_into().unwrap();
@@ -388,7 +392,7 @@ pub fn dequant_q5_k(src: &[u8]) -> Result<Vec<f32>, QuantError> {
     }
     let n_blocks = src.len() / Q5_K_BLOCK_BYTES;
     let mut out = Vec::with_capacity(n_blocks * Q5_K_BLOCK_ELEMS);
-    for block in src.chunks_exact(Q5_K_BLOCK_BYTES) {
+    for block in src.as_chunks::<Q5_K_BLOCK_BYTES>().0 {
         let d = f16::from_le_bytes([block[0], block[1]]).to_f32();
         let dmin = f16::from_le_bytes([block[2], block[3]]).to_f32();
         let scales: [u8; Q4_K_SCALE_BYTES] = block[4..16].try_into().unwrap();
@@ -443,7 +447,7 @@ pub fn dot_q5_k_f32_scalar(row_bytes: &[u8], x: &[f32]) -> f32 {
     debug_assert_eq!(row_bytes.len() % Q5_K_BLOCK_BYTES, 0);
     let mut acc = 0f32;
     let mut base = 0usize;
-    for block in row_bytes.chunks_exact(Q5_K_BLOCK_BYTES) {
+    for block in row_bytes.as_chunks::<Q5_K_BLOCK_BYTES>().0 {
         let d = f16::from_le_bytes([block[0], block[1]]).to_f32();
         let dmin = f16::from_le_bytes([block[2], block[3]]).to_f32();
         let scales: [u8; Q4_K_SCALE_BYTES] = block[4..16].try_into().unwrap();
@@ -483,7 +487,7 @@ pub fn dequant_q6_k(src: &[u8]) -> Result<Vec<f32>, QuantError> {
     }
     let n_blocks = src.len() / Q6_K_BLOCK_BYTES;
     let mut out = vec![0f32; n_blocks * Q6_K_BLOCK_ELEMS];
-    for (b, block) in src.chunks_exact(Q6_K_BLOCK_BYTES).enumerate() {
+    for (b, block) in src.as_chunks::<Q6_K_BLOCK_BYTES>().0.iter().enumerate() {
         let ql_full = &block[0..128];
         let qh_full = &block[128..192];
         let sc_full = &block[192..208];
@@ -536,7 +540,7 @@ pub fn dot_q6_k_f32_scalar(row_bytes: &[u8], x: &[f32]) -> f32 {
     debug_assert_eq!(row_bytes.len() % Q6_K_BLOCK_BYTES, 0);
     let mut acc = 0f32;
     let mut x_base = 0usize;
-    for block in row_bytes.chunks_exact(Q6_K_BLOCK_BYTES) {
+    for block in row_bytes.as_chunks::<Q6_K_BLOCK_BYTES>().0 {
         let ql_full = &block[0..128];
         let qh_full = &block[128..192];
         let sc_full = &block[192..208];
@@ -623,7 +627,12 @@ pub fn dot_q8_0_f32_scalar(row_bytes: &[u8], x: &[f32]) -> f32 {
         x.len()
     );
     let mut acc = 0f32;
-    for (b, block) in row_bytes.chunks_exact(Q8_0_BLOCK_BYTES).enumerate() {
+    for (b, block) in row_bytes
+        .as_chunks::<Q8_0_BLOCK_BYTES>()
+        .0
+        .iter()
+        .enumerate()
+    {
         let scale = f16::from_le_bytes([block[0], block[1]]).to_f32();
         let base = b * Q8_0_BLOCK_ELEMS;
         let mut block_acc = 0f32;
@@ -693,7 +702,7 @@ pub fn quantize_activations_q8_k(x: &[f32]) -> Q8KActivations {
                 let qi = (v * inv).round();
                 q_slot[i] = qi.clamp(-127.0, 127.0) as i8;
             }
-            for (slot, group) in bsum_slot.iter_mut().zip(q_slot.chunks_exact(16)) {
+            for (slot, group) in bsum_slot.iter_mut().zip(q_slot.as_chunks::<16>().0) {
                 *slot = group.iter().map(|&q| q as i32).sum::<i32>() as i16;
             }
         };
@@ -702,7 +711,7 @@ pub fn quantize_activations_q8_k(x: &[f32]) -> Q8KActivations {
     // ~batch_size fork-joins per matmul; and one row's blocks are far too
     // little work to amortize one. llama quantizes serially per thread
     // chunk too (`ggml_compute_forward_mul_mat`, `ggml-cpu.c`).
-    for (b, chunk) in x.chunks_exact(Q4_K_BLOCK_ELEMS).enumerate() {
+    for (b, chunk) in x.as_chunks::<Q4_K_BLOCK_ELEMS>().0.iter().enumerate() {
         quant_one((
             &mut q[b * Q4_K_BLOCK_ELEMS..(b + 1) * Q4_K_BLOCK_ELEMS],
             &mut d[b],
@@ -735,7 +744,7 @@ pub fn quantize_activations_q8(x: &[f32]) -> Q8Activations {
     // Serial on purpose — see `quantize_activations_q8_k`. The parallel
     // split this replaces was also 32-byte `q` chunks (two per cache
     // line) with adjacent `d` writes: false sharing on every store.
-    for (b, chunk) in x.chunks_exact(Q8_0_BLOCK_ELEMS).enumerate() {
+    for (b, chunk) in x.as_chunks::<Q8_0_BLOCK_ELEMS>().0.iter().enumerate() {
         quant_one((
             &mut q[b * Q8_0_BLOCK_ELEMS..(b + 1) * Q8_0_BLOCK_ELEMS],
             &mut d[b],
@@ -773,7 +782,12 @@ pub fn dot_q8_0_q8_scalar(row_bytes: &[u8], act: &Q8Activations) -> f32 {
     let n_blocks = row_bytes.len() / Q8_0_BLOCK_BYTES;
     debug_assert_eq!(n_blocks, act.n_blocks());
     let mut acc = 0f32;
-    for (b, block) in row_bytes.chunks_exact(Q8_0_BLOCK_BYTES).enumerate() {
+    for (b, block) in row_bytes
+        .as_chunks::<Q8_0_BLOCK_BYTES>()
+        .0
+        .iter()
+        .enumerate()
+    {
         let dw = f16::from_le_bytes([block[0], block[1]]).to_f32();
         let base = b * Q8_0_BLOCK_ELEMS;
         let mut isum = 0i32;
@@ -829,7 +843,12 @@ pub fn dot_q4_0_q8_scalar(row_bytes: &[u8], act: &Q8Activations) -> f32 {
     let n_blocks = row_bytes.len() / Q4_0_BLOCK_BYTES;
     debug_assert_eq!(n_blocks, act.n_blocks());
     let mut acc = 0f32;
-    for (b, block) in row_bytes.chunks_exact(Q4_0_BLOCK_BYTES).enumerate() {
+    for (b, block) in row_bytes
+        .as_chunks::<Q4_0_BLOCK_BYTES>()
+        .0
+        .iter()
+        .enumerate()
+    {
         let dw = f16::from_le_bytes([block[0], block[1]]).to_f32();
         let base = b * Q4_0_BLOCK_ELEMS;
         let mut isum = 0i32;
@@ -874,7 +893,12 @@ pub fn dot_q4_k_q8_scalar(row_bytes: &[u8], act: &Q8KActivations) -> f32 {
     let n_blocks = row_bytes.len() / Q4_K_BLOCK_BYTES;
     debug_assert_eq!(n_blocks, act.n_blocks());
     let mut acc = 0f32;
-    for (b, block) in row_bytes.chunks_exact(Q4_K_BLOCK_BYTES).enumerate() {
+    for (b, block) in row_bytes
+        .as_chunks::<Q4_K_BLOCK_BYTES>()
+        .0
+        .iter()
+        .enumerate()
+    {
         let d = f16::from_le_bytes([block[0], block[1]]).to_f32();
         let dmin = f16::from_le_bytes([block[2], block[3]]).to_f32();
         let scales: [u8; Q4_K_SCALE_BYTES] = block[4..16].try_into().unwrap();
@@ -933,7 +957,12 @@ pub fn dot_q5_k_q8_scalar(row_bytes: &[u8], act: &Q8KActivations) -> f32 {
     let n_blocks = row_bytes.len() / Q5_K_BLOCK_BYTES;
     debug_assert_eq!(n_blocks, act.n_blocks());
     let mut acc = 0f32;
-    for (b, block) in row_bytes.chunks_exact(Q5_K_BLOCK_BYTES).enumerate() {
+    for (b, block) in row_bytes
+        .as_chunks::<Q5_K_BLOCK_BYTES>()
+        .0
+        .iter()
+        .enumerate()
+    {
         let d = f16::from_le_bytes([block[0], block[1]]).to_f32();
         let dmin = f16::from_le_bytes([block[2], block[3]]).to_f32();
         let scales: [u8; Q4_K_SCALE_BYTES] = block[4..16].try_into().unwrap();
@@ -1013,7 +1042,12 @@ pub fn gemm_q5_k_q8_row_scalar(row_bytes: &[u8], acts: &[Q8KActivations], out: &
     for act in acts {
         debug_assert_eq!(n_blocks, act.n_blocks());
     }
-    for (b, block) in row_bytes.chunks_exact(Q5_K_BLOCK_BYTES).enumerate() {
+    for (b, block) in row_bytes
+        .as_chunks::<Q5_K_BLOCK_BYTES>()
+        .0
+        .iter()
+        .enumerate()
+    {
         let d = f16::from_le_bytes([block[0], block[1]]).to_f32();
         let dmin = f16::from_le_bytes([block[2], block[3]]).to_f32();
         let scales: [u8; Q4_K_SCALE_BYTES] = block[4..16].try_into().unwrap();
@@ -1108,7 +1142,12 @@ pub fn dot_q6_k_q8_scalar(row_bytes: &[u8], act: &Q8KActivations) -> f32 {
     // Q6_K uses 256-elem super-blocks; Q8_K acts share that width.
     debug_assert_eq!(Q6_K_BLOCK_ELEMS, Q4_K_BLOCK_ELEMS);
     let mut acc = 0f32;
-    for (b, block) in row_bytes.chunks_exact(Q6_K_BLOCK_BYTES).enumerate() {
+    for (b, block) in row_bytes
+        .as_chunks::<Q6_K_BLOCK_BYTES>()
+        .0
+        .iter()
+        .enumerate()
+    {
         let ql_full = &block[0..128];
         let qh_full = &block[128..192];
         let sc_full = &block[192..208];
@@ -1170,7 +1209,7 @@ mod simd_x86 {
             x.len()
         );
         let mut acc = 0f32;
-        for (b, block) in row_bytes.chunks_exact(Q8_0_BLOCK_BYTES).enumerate() {
+        for (b, block) in row_bytes.as_chunks::<Q8_0_BLOCK_BYTES>().0.enumerate() {
             let scale = f16::from_le_bytes([block[0], block[1]]).to_f32();
             let base = b * Q8_0_BLOCK_ELEMS;
             let qs = &block[2..34];
@@ -1198,7 +1237,7 @@ mod simd_x86 {
         debug_assert_eq!(row_bytes.len() % Q8_0_BLOCK_BYTES, 0);
         debug_assert_eq!(row_bytes.len() / Q8_0_BLOCK_BYTES, act.n_blocks());
         let mut acc = 0f32;
-        for (b, block) in row_bytes.chunks_exact(Q8_0_BLOCK_BYTES).enumerate() {
+        for (b, block) in row_bytes.as_chunks::<Q8_0_BLOCK_BYTES>().0.enumerate() {
             let dw = f16::from_le_bytes([block[0], block[1]]).to_f32();
             let base = b * Q8_0_BLOCK_ELEMS;
             let w = _mm256_loadu_si256(block.as_ptr().add(2) as *const __m256i);
@@ -1231,7 +1270,7 @@ mod simd_x86 {
         let low_mask = _mm_set1_epi8(0x0F);
         let bias = _mm_set1_epi8(8);
         let mut acc = 0f32;
-        for (b, block) in row_bytes.chunks_exact(Q4_0_BLOCK_BYTES).enumerate() {
+        for (b, block) in row_bytes.as_chunks::<Q4_0_BLOCK_BYTES>().0.enumerate() {
             let dw = f16::from_le_bytes([block[0], block[1]]).to_f32();
             let base = b * Q4_0_BLOCK_ELEMS;
             let qs = _mm_loadu_si128(block.as_ptr().add(2) as *const __m128i);
@@ -1264,7 +1303,7 @@ mod simd_x86 {
         debug_assert_eq!(row_bytes.len() / Q4_K_BLOCK_BYTES, act.n_blocks());
         let low_mask = _mm256_set1_epi8(0x0F_u8 as i8);
         let mut acc = 0f32;
-        for (b, block) in row_bytes.chunks_exact(Q4_K_BLOCK_BYTES).enumerate() {
+        for (b, block) in row_bytes.as_chunks::<Q4_K_BLOCK_BYTES>().0.enumerate() {
             let d = f16::from_le_bytes([block[0], block[1]]).to_f32();
             let dmin = f16::from_le_bytes([block[2], block[3]]).to_f32();
             let scales: [u8; Q4_K_SCALE_BYTES] = block[4..16].try_into().unwrap();
@@ -1332,7 +1371,7 @@ mod simd_x86 {
         let low_mask = _mm_set1_epi8(0x0F);
 
         let mut acc = 0f32;
-        for (b, block) in row_bytes.chunks_exact(Q4_0_BLOCK_BYTES).enumerate() {
+        for (b, block) in row_bytes.as_chunks::<Q4_0_BLOCK_BYTES>().0.enumerate() {
             let scale = f16::from_le_bytes([block[0], block[1]]).to_f32();
             let base = b * Q4_0_BLOCK_ELEMS;
             let nibbles = _mm_loadu_si128(block.as_ptr().add(2) as *const __m128i);
@@ -1419,7 +1458,7 @@ mod simd_x86 {
         let low_mask = _mm_set1_epi8(0x0F);
         let mut acc = 0f32;
         let mut x_base = 0usize;
-        for block in row_bytes.chunks_exact(Q4_K_BLOCK_BYTES) {
+        for block in row_bytes.as_chunks::<Q4_K_BLOCK_BYTES>().0 {
             let d = f16::from_le_bytes([block[0], block[1]]).to_f32();
             let dmin = f16::from_le_bytes([block[2], block[3]]).to_f32();
             let scales: [u8; Q4_K_SCALE_BYTES] = block[4..16].try_into().unwrap();
@@ -1490,7 +1529,7 @@ mod simd_x86 {
         let sixteen = _mm_set1_epi8(16);
         let mut acc = 0f32;
         let mut x_base = 0usize;
-        for block in row_bytes.chunks_exact(Q5_K_BLOCK_BYTES) {
+        for block in row_bytes.as_chunks::<Q5_K_BLOCK_BYTES>().0 {
             let d = f16::from_le_bytes([block[0], block[1]]).to_f32();
             let dmin = f16::from_le_bytes([block[2], block[3]]).to_f32();
             let scales: [u8; Q4_K_SCALE_BYTES] = block[4..16].try_into().unwrap();
@@ -1640,7 +1679,7 @@ mod simd_x86 {
 
         let mut acc = 0f32;
         let mut x_base = 0usize;
-        for block in row_bytes.chunks_exact(Q6_K_BLOCK_BYTES) {
+        for block in row_bytes.as_chunks::<Q6_K_BLOCK_BYTES>().0 {
             let ql_full = &block[0..128];
             let qh_full = &block[128..192];
             let sc_full = &block[192..208];
@@ -1793,7 +1832,7 @@ mod simd_x86 {
     pub unsafe fn dot_q8_1_f32_avx2(row_bytes: &[u8], x: &[f32]) -> f32 {
         debug_assert_eq!(row_bytes.len() % Q8_1_BLOCK_BYTES, 0);
         let mut acc = 0f32;
-        for (b, block) in row_bytes.chunks_exact(Q8_1_BLOCK_BYTES).enumerate() {
+        for (b, block) in row_bytes.as_chunks::<Q8_1_BLOCK_BYTES>().0.enumerate() {
             let d = f16::from_le_bytes([block[0], block[1]]).to_f32();
             let base = b * Q8_1_BLOCK_ELEMS;
             let qs = &block[4..36];
@@ -1821,7 +1860,7 @@ mod simd_x86 {
         debug_assert_eq!(row_bytes.len() % Q4_1_BLOCK_BYTES, 0);
         let low_mask = _mm_set1_epi8(0x0F);
         let mut acc = 0f32;
-        for (b, block) in row_bytes.chunks_exact(Q4_1_BLOCK_BYTES).enumerate() {
+        for (b, block) in row_bytes.as_chunks::<Q4_1_BLOCK_BYTES>().0.enumerate() {
             let d = f16::from_le_bytes([block[0], block[1]]).to_f32();
             let m = f16::from_le_bytes([block[2], block[3]]).to_f32();
             let base = b * Q4_1_BLOCK_ELEMS;
@@ -1864,7 +1903,7 @@ mod simd_x86 {
     pub unsafe fn dot_q5_0_f32_avx2(row_bytes: &[u8], x: &[f32]) -> f32 {
         debug_assert_eq!(row_bytes.len() % Q5_0_BLOCK_BYTES, 0);
         let mut acc = 0f32;
-        for (b, block) in row_bytes.chunks_exact(Q5_0_BLOCK_BYTES).enumerate() {
+        for (b, block) in row_bytes.as_chunks::<Q5_0_BLOCK_BYTES>().0.enumerate() {
             let d = f16::from_le_bytes([block[0], block[1]]).to_f32();
             let qh = u32::from_le_bytes(block[2..6].try_into().unwrap());
             let qs = &block[6..22];
@@ -1899,7 +1938,7 @@ mod simd_x86 {
     pub unsafe fn dot_q5_1_f32_avx2(row_bytes: &[u8], x: &[f32]) -> f32 {
         debug_assert_eq!(row_bytes.len() % Q5_1_BLOCK_BYTES, 0);
         let mut acc = 0f32;
-        for (b, block) in row_bytes.chunks_exact(Q5_1_BLOCK_BYTES).enumerate() {
+        for (b, block) in row_bytes.as_chunks::<Q5_1_BLOCK_BYTES>().0.enumerate() {
             let d = f16::from_le_bytes([block[0], block[1]]).to_f32();
             let m = f16::from_le_bytes([block[2], block[3]]).to_f32();
             let qh = u32::from_le_bytes(block[4..8].try_into().unwrap());
@@ -1978,7 +2017,7 @@ mod simd_x86 {
             }};
         }
 
-        for block in row_bytes.chunks_exact(Q2_K_BLOCK_BYTES) {
+        for block in row_bytes.as_chunks::<Q2_K_BLOCK_BYTES>().0 {
             let scales: &[u8; Q2_K_SCALE_BYTES] = block[0..16].try_into().unwrap();
             let qs = &block[16..80];
             let d = f16::from_le_bytes([block[80], block[81]]).to_f32();
@@ -2059,7 +2098,7 @@ mod simd_x86 {
             }};
         }
 
-        for block in row_bytes.chunks_exact(Q3_K_BLOCK_BYTES) {
+        for block in row_bytes.as_chunks::<Q3_K_BLOCK_BYTES>().0 {
             let hmask = &block[0..32];
             let qs = &block[32..96];
             let scales_raw: &[u8; Q3_K_SCALE_BYTES] = block[96..108].try_into().unwrap();
@@ -2103,7 +2142,7 @@ mod simd_x86 {
         let codebook = _mm_loadu_si128(KVALUES_IQ4NL.as_ptr() as *const __m128i);
         let mut acc = 0f32;
         let mut x_base = 0usize;
-        for block in row_bytes.chunks_exact(IQ4_NL_BLOCK_BYTES) {
+        for block in row_bytes.as_chunks::<IQ4_NL_BLOCK_BYTES>().0 {
             let d = f16::from_le_bytes([block[0], block[1]]).to_f32();
             let qs = &block[2..18];
             let bytes = _mm_loadu_si128(qs.as_ptr() as *const __m128i);
@@ -2142,7 +2181,7 @@ mod simd_x86 {
         let codebook = _mm_loadu_si128(KVALUES_IQ4NL.as_ptr() as *const __m128i);
         let mut acc = 0f32;
         let mut x_base = 0usize;
-        for block in row_bytes.chunks_exact(IQ4_XS_BLOCK_BYTES) {
+        for block in row_bytes.as_chunks::<IQ4_XS_BLOCK_BYTES>().0 {
             let d = f16::from_le_bytes([block[0], block[1]]).to_f32();
             let scales_h = u16::from_le_bytes([block[2], block[3]]);
             let scales_l = &block[4..8];
@@ -2355,7 +2394,12 @@ mod simd_aarch64 {
             x.len()
         );
         let mut acc = 0f32;
-        for (b, block) in row_bytes.chunks_exact(Q8_0_BLOCK_BYTES).enumerate() {
+        for (b, block) in row_bytes
+            .as_chunks::<Q8_0_BLOCK_BYTES>()
+            .0
+            .iter()
+            .enumerate()
+        {
             let scale = f16::from_le_bytes([block[0], block[1]]).to_f32();
             let base = b * Q8_0_BLOCK_ELEMS;
             let qs = &block[2..34];
@@ -2389,7 +2433,12 @@ mod simd_aarch64 {
         debug_assert_eq!(row_bytes.len() % Q8_0_BLOCK_BYTES, 0);
         debug_assert_eq!(row_bytes.len() / Q8_0_BLOCK_BYTES, act.n_blocks());
         let mut acc = 0f32;
-        for (b, block) in row_bytes.chunks_exact(Q8_0_BLOCK_BYTES).enumerate() {
+        for (b, block) in row_bytes
+            .as_chunks::<Q8_0_BLOCK_BYTES>()
+            .0
+            .iter()
+            .enumerate()
+        {
             let dw = f16::from_le_bytes([block[0], block[1]]).to_f32();
             let base = b * Q8_0_BLOCK_ELEMS;
             let mut isum = vdupq_n_s32(0);
@@ -2476,7 +2525,12 @@ mod simd_aarch64 {
         let bias = vdupq_n_s8(8);
         let low_mask = vdupq_n_u8(0x0F);
         let mut acc = 0f32;
-        for (b, block) in row_bytes.chunks_exact(Q4_0_BLOCK_BYTES).enumerate() {
+        for (b, block) in row_bytes
+            .as_chunks::<Q4_0_BLOCK_BYTES>()
+            .0
+            .iter()
+            .enumerate()
+        {
             let dw = f16::from_le_bytes([block[0], block[1]]).to_f32();
             let base = b * Q4_0_BLOCK_ELEMS;
             let nibbles = vld1q_u8(block.as_ptr().add(2));
@@ -2600,7 +2654,12 @@ mod simd_aarch64 {
         debug_assert_eq!(row_bytes.len() / Q4_K_BLOCK_BYTES, act.n_blocks());
         let low_mask = vdupq_n_u8(0x0F);
         let mut acc = 0f32;
-        for (b, block) in row_bytes.chunks_exact(Q4_K_BLOCK_BYTES).enumerate() {
+        for (b, block) in row_bytes
+            .as_chunks::<Q4_K_BLOCK_BYTES>()
+            .0
+            .iter()
+            .enumerate()
+        {
             let d = f16::from_le_bytes([block[0], block[1]]).to_f32();
             let dmin = f16::from_le_bytes([block[2], block[3]]).to_f32();
             let scales: [u8; Q4_K_SCALE_BYTES] = block[4..16].try_into().unwrap();
@@ -2662,7 +2721,12 @@ mod simd_aarch64 {
         debug_assert_eq!(row_bytes.len() / Q4_K_BLOCK_BYTES, act.n_blocks());
         let low_mask = vdupq_n_u8(0x0F);
         let mut acc = 0f32;
-        for (b, block) in row_bytes.chunks_exact(Q4_K_BLOCK_BYTES).enumerate() {
+        for (b, block) in row_bytes
+            .as_chunks::<Q4_K_BLOCK_BYTES>()
+            .0
+            .iter()
+            .enumerate()
+        {
             let d = f16::from_le_bytes([block[0], block[1]]).to_f32();
             let dmin = f16::from_le_bytes([block[2], block[3]]).to_f32();
             let scales: [u8; Q4_K_SCALE_BYTES] = block[4..16].try_into().unwrap();
@@ -2715,7 +2779,12 @@ mod simd_aarch64 {
         let low_mask = vdupq_n_u8(0x0F);
         let sixteen = vdupq_n_u8(16);
         let mut acc = 0f32;
-        for (b, block) in row_bytes.chunks_exact(Q5_K_BLOCK_BYTES).enumerate() {
+        for (b, block) in row_bytes
+            .as_chunks::<Q5_K_BLOCK_BYTES>()
+            .0
+            .iter()
+            .enumerate()
+        {
             let d = f16::from_le_bytes([block[0], block[1]]).to_f32();
             let dmin = f16::from_le_bytes([block[2], block[3]]).to_f32();
             let scales: [u8; Q4_K_SCALE_BYTES] = block[4..16].try_into().unwrap();
@@ -2779,7 +2848,12 @@ mod simd_aarch64 {
         let low_mask = vdupq_n_u8(0x0F);
         let sixteen = vdupq_n_u8(16);
         let mut acc = 0f32;
-        for (b, block) in row_bytes.chunks_exact(Q5_K_BLOCK_BYTES).enumerate() {
+        for (b, block) in row_bytes
+            .as_chunks::<Q5_K_BLOCK_BYTES>()
+            .0
+            .iter()
+            .enumerate()
+        {
             let d = f16::from_le_bytes([block[0], block[1]]).to_f32();
             let dmin = f16::from_le_bytes([block[2], block[3]]).to_f32();
             let scales: [u8; Q4_K_SCALE_BYTES] = block[4..16].try_into().unwrap();
@@ -2851,7 +2925,12 @@ mod simd_aarch64 {
         let low_mask = vdupq_n_u8(0x0F);
         let sixteen = vdupq_n_u8(16);
         let n = acts.len();
-        for (b, block) in row_bytes.chunks_exact(Q5_K_BLOCK_BYTES).enumerate() {
+        for (b, block) in row_bytes
+            .as_chunks::<Q5_K_BLOCK_BYTES>()
+            .0
+            .iter()
+            .enumerate()
+        {
             let d = f16::from_le_bytes([block[0], block[1]]).to_f32();
             let dmin = f16::from_le_bytes([block[2], block[3]]).to_f32();
             let scales: [u8; Q4_K_SCALE_BYTES] = block[4..16].try_into().unwrap();
@@ -2938,7 +3017,12 @@ mod simd_aarch64 {
         }
         let m4b = vdupq_n_u8(0x0F);
         let mone = vdupq_n_u8(3);
-        for (b, block) in row_bytes.chunks_exact(Q6_K_BLOCK_BYTES).enumerate() {
+        for (b, block) in row_bytes
+            .as_chunks::<Q6_K_BLOCK_BYTES>()
+            .0
+            .iter()
+            .enumerate()
+        {
             let d_all = f16::from_le_bytes([block[208], block[209]]).to_f32();
             let ql = block.as_ptr();
             let qh = block.as_ptr().add(128);
@@ -3042,7 +3126,12 @@ mod simd_aarch64 {
         let m4b = vdupq_n_u8(0x0F);
         let mone = vdupq_n_u8(3);
         let mut acc = 0f32;
-        for (b, block) in row_bytes.chunks_exact(Q6_K_BLOCK_BYTES).enumerate() {
+        for (b, block) in row_bytes
+            .as_chunks::<Q6_K_BLOCK_BYTES>()
+            .0
+            .iter()
+            .enumerate()
+        {
             let d_all = f16::from_le_bytes([block[208], block[209]]).to_f32();
             let da = act.d[b];
             let ql = block.as_ptr();
@@ -3148,7 +3237,12 @@ mod simd_aarch64 {
         let low_mask = vdupq_n_u8(0x0F);
 
         let mut acc = 0f32;
-        for (b, block) in row_bytes.chunks_exact(Q4_0_BLOCK_BYTES).enumerate() {
+        for (b, block) in row_bytes
+            .as_chunks::<Q4_0_BLOCK_BYTES>()
+            .0
+            .iter()
+            .enumerate()
+        {
             let scale = f16::from_le_bytes([block[0], block[1]]).to_f32();
             let base = b * Q4_0_BLOCK_ELEMS;
             let nibbles = vld1q_u8(block.as_ptr().add(2));
@@ -3238,7 +3332,7 @@ mod simd_aarch64 {
         let low_mask = vdupq_n_u8(0x0F);
         let mut acc = 0f32;
         let mut x_base = 0usize;
-        for block in row_bytes.chunks_exact(Q4_K_BLOCK_BYTES) {
+        for block in row_bytes.as_chunks::<Q4_K_BLOCK_BYTES>().0 {
             let d = f16::from_le_bytes([block[0], block[1]]).to_f32();
             let dmin = f16::from_le_bytes([block[2], block[3]]).to_f32();
             let scales: [u8; Q4_K_SCALE_BYTES] = block[4..16].try_into().unwrap();
@@ -3303,7 +3397,7 @@ mod simd_aarch64 {
         let sixteen = vdupq_n_u8(16);
         let mut acc = 0f32;
         let mut x_base = 0usize;
-        for block in row_bytes.chunks_exact(Q5_K_BLOCK_BYTES) {
+        for block in row_bytes.as_chunks::<Q5_K_BLOCK_BYTES>().0 {
             let d = f16::from_le_bytes([block[0], block[1]]).to_f32();
             let dmin = f16::from_le_bytes([block[2], block[3]]).to_f32();
             let scales: [u8; Q4_K_SCALE_BYTES] = block[4..16].try_into().unwrap();
@@ -3531,7 +3625,7 @@ mod simd_aarch64 {
 
         let mut acc = 0f32;
         let mut x_base = 0usize;
-        for block in row_bytes.chunks_exact(Q6_K_BLOCK_BYTES) {
+        for block in row_bytes.as_chunks::<Q6_K_BLOCK_BYTES>().0 {
             let ql_full = &block[0..128];
             let qh_full = &block[128..192];
             let sc_full = &block[192..208];
@@ -3693,7 +3787,12 @@ mod simd_aarch64 {
     pub unsafe fn dot_q8_1_f32_neon(row_bytes: &[u8], x: &[f32]) -> f32 {
         debug_assert_eq!(row_bytes.len() % Q8_1_BLOCK_BYTES, 0);
         let mut acc = 0f32;
-        for (b, block) in row_bytes.chunks_exact(Q8_1_BLOCK_BYTES).enumerate() {
+        for (b, block) in row_bytes
+            .as_chunks::<Q8_1_BLOCK_BYTES>()
+            .0
+            .iter()
+            .enumerate()
+        {
             let scale = f16::from_le_bytes([block[0], block[1]]).to_f32();
             let base = b * Q8_1_BLOCK_ELEMS;
             let qs = &block[4..36];
@@ -3731,7 +3830,12 @@ mod simd_aarch64 {
         let low_mask = vdupq_n_u8(0x0F);
 
         let mut acc = 0f32;
-        for (b, block) in row_bytes.chunks_exact(Q4_1_BLOCK_BYTES).enumerate() {
+        for (b, block) in row_bytes
+            .as_chunks::<Q4_1_BLOCK_BYTES>()
+            .0
+            .iter()
+            .enumerate()
+        {
             let d = f16::from_le_bytes([block[0], block[1]]).to_f32();
             let m = f16::from_le_bytes([block[2], block[3]]).to_f32();
             let base = b * Q4_1_BLOCK_ELEMS;
@@ -3770,7 +3874,12 @@ mod simd_aarch64 {
     pub unsafe fn dot_q5_0_f32_neon(row_bytes: &[u8], x: &[f32]) -> f32 {
         debug_assert_eq!(row_bytes.len() % Q5_0_BLOCK_BYTES, 0);
         let mut acc = 0f32;
-        for (b, block) in row_bytes.chunks_exact(Q5_0_BLOCK_BYTES).enumerate() {
+        for (b, block) in row_bytes
+            .as_chunks::<Q5_0_BLOCK_BYTES>()
+            .0
+            .iter()
+            .enumerate()
+        {
             let d = f16::from_le_bytes([block[0], block[1]]).to_f32();
             let qh = u32::from_le_bytes(block[2..6].try_into().unwrap());
             let qs = &block[6..22];
@@ -3810,7 +3919,12 @@ mod simd_aarch64 {
     pub unsafe fn dot_q5_1_f32_neon(row_bytes: &[u8], x: &[f32]) -> f32 {
         debug_assert_eq!(row_bytes.len() % Q5_1_BLOCK_BYTES, 0);
         let mut acc = 0f32;
-        for (b, block) in row_bytes.chunks_exact(Q5_1_BLOCK_BYTES).enumerate() {
+        for (b, block) in row_bytes
+            .as_chunks::<Q5_1_BLOCK_BYTES>()
+            .0
+            .iter()
+            .enumerate()
+        {
             let d = f16::from_le_bytes([block[0], block[1]]).to_f32();
             let m = f16::from_le_bytes([block[2], block[3]]).to_f32();
             let qh = u32::from_le_bytes(block[4..8].try_into().unwrap());
@@ -3913,7 +4027,7 @@ mod simd_aarch64 {
             }};
         }
 
-        for block in row_bytes.chunks_exact(Q2_K_BLOCK_BYTES) {
+        for block in row_bytes.as_chunks::<Q2_K_BLOCK_BYTES>().0 {
             let scales: &[u8; Q2_K_SCALE_BYTES] = block[0..16].try_into().unwrap();
             let qs = &block[16..80];
             let d = f16::from_le_bytes([block[80], block[81]]).to_f32();
@@ -4017,7 +4131,7 @@ mod simd_aarch64 {
             }};
         }
 
-        for block in row_bytes.chunks_exact(Q3_K_BLOCK_BYTES) {
+        for block in row_bytes.as_chunks::<Q3_K_BLOCK_BYTES>().0 {
             let hmask = &block[0..32];
             let qs = &block[32..96];
             let scales_raw: &[u8; Q3_K_SCALE_BYTES] = block[96..108].try_into().unwrap();
@@ -4062,7 +4176,7 @@ mod simd_aarch64 {
         let codebook = vld1q_s8(KVALUES_IQ4NL.as_ptr());
         let mut acc = 0f32;
         let mut x_base = 0usize;
-        for block in row_bytes.chunks_exact(IQ4_NL_BLOCK_BYTES) {
+        for block in row_bytes.as_chunks::<IQ4_NL_BLOCK_BYTES>().0 {
             let d = f16::from_le_bytes([block[0], block[1]]).to_f32();
             let qs = &block[2..18];
             let bytes = vld1q_u8(qs.as_ptr());
@@ -4102,7 +4216,7 @@ mod simd_aarch64 {
         let codebook = vld1q_s8(KVALUES_IQ4NL.as_ptr());
         let mut acc = 0f32;
         let mut x_base = 0usize;
-        for block in row_bytes.chunks_exact(IQ4_XS_BLOCK_BYTES) {
+        for block in row_bytes.as_chunks::<IQ4_XS_BLOCK_BYTES>().0 {
             let d = f16::from_le_bytes([block[0], block[1]]).to_f32();
             let scales_h = u16::from_le_bytes([block[2], block[3]]);
             let scales_l = &block[4..8];
@@ -4163,7 +4277,12 @@ pub fn dot_q4_0_f32(row_bytes: &[u8], x: &[f32]) -> f32 {
 pub fn dot_q4_0_f32_scalar(row_bytes: &[u8], x: &[f32]) -> f32 {
     debug_assert_eq!(row_bytes.len() % Q4_0_BLOCK_BYTES, 0);
     let mut acc = 0f32;
-    for (b, block) in row_bytes.chunks_exact(Q4_0_BLOCK_BYTES).enumerate() {
+    for (b, block) in row_bytes
+        .as_chunks::<Q4_0_BLOCK_BYTES>()
+        .0
+        .iter()
+        .enumerate()
+    {
         let scale = f16::from_le_bytes([block[0], block[1]]).to_f32();
         let nibbles = &block[2..18];
         let base = b * Q4_0_BLOCK_ELEMS;
@@ -4189,7 +4308,7 @@ pub fn dequant_q4_1(src: &[u8]) -> Result<Vec<f32>, QuantError> {
     }
     let n_blocks = src.len() / Q4_1_BLOCK_BYTES;
     let mut out = vec![0f32; n_blocks * Q4_1_BLOCK_ELEMS];
-    for (b, block) in src.chunks_exact(Q4_1_BLOCK_BYTES).enumerate() {
+    for (b, block) in src.as_chunks::<Q4_1_BLOCK_BYTES>().0.iter().enumerate() {
         let d = f16::from_le_bytes([block[0], block[1]]).to_f32();
         let m = f16::from_le_bytes([block[2], block[3]]).to_f32();
         let nibbles = &block[4..20];
@@ -4224,7 +4343,12 @@ pub fn dot_q4_1_f32(row_bytes: &[u8], x: &[f32]) -> f32 {
 pub fn dot_q4_1_f32_scalar(row_bytes: &[u8], x: &[f32]) -> f32 {
     debug_assert_eq!(row_bytes.len() % Q4_1_BLOCK_BYTES, 0);
     let mut acc = 0f32;
-    for (b, block) in row_bytes.chunks_exact(Q4_1_BLOCK_BYTES).enumerate() {
+    for (b, block) in row_bytes
+        .as_chunks::<Q4_1_BLOCK_BYTES>()
+        .0
+        .iter()
+        .enumerate()
+    {
         let d = f16::from_le_bytes([block[0], block[1]]).to_f32();
         let m = f16::from_le_bytes([block[2], block[3]]).to_f32();
         let nibbles = &block[4..20];
@@ -4259,7 +4383,7 @@ pub fn dequant_q5_0(src: &[u8]) -> Result<Vec<f32>, QuantError> {
     }
     let n_blocks = src.len() / Q5_0_BLOCK_BYTES;
     let mut out = vec![0f32; n_blocks * Q5_0_BLOCK_ELEMS];
-    for (b, block) in src.chunks_exact(Q5_0_BLOCK_BYTES).enumerate() {
+    for (b, block) in src.as_chunks::<Q5_0_BLOCK_BYTES>().0.iter().enumerate() {
         let d = f16::from_le_bytes([block[0], block[1]]).to_f32();
         let qh = u32::from_le_bytes(block[2..6].try_into().unwrap());
         let qs = &block[6..22];
@@ -4296,7 +4420,12 @@ pub fn dot_q5_0_f32(row_bytes: &[u8], x: &[f32]) -> f32 {
 pub fn dot_q5_0_f32_scalar(row_bytes: &[u8], x: &[f32]) -> f32 {
     debug_assert_eq!(row_bytes.len() % Q5_0_BLOCK_BYTES, 0);
     let mut acc = 0f32;
-    for (b, block) in row_bytes.chunks_exact(Q5_0_BLOCK_BYTES).enumerate() {
+    for (b, block) in row_bytes
+        .as_chunks::<Q5_0_BLOCK_BYTES>()
+        .0
+        .iter()
+        .enumerate()
+    {
         let d = f16::from_le_bytes([block[0], block[1]]).to_f32();
         let qh = u32::from_le_bytes(block[2..6].try_into().unwrap());
         let qs = &block[6..22];
@@ -4321,7 +4450,7 @@ pub fn dequant_q5_1(src: &[u8]) -> Result<Vec<f32>, QuantError> {
     }
     let n_blocks = src.len() / Q5_1_BLOCK_BYTES;
     let mut out = vec![0f32; n_blocks * Q5_1_BLOCK_ELEMS];
-    for (b, block) in src.chunks_exact(Q5_1_BLOCK_BYTES).enumerate() {
+    for (b, block) in src.as_chunks::<Q5_1_BLOCK_BYTES>().0.iter().enumerate() {
         let d = f16::from_le_bytes([block[0], block[1]]).to_f32();
         let m = f16::from_le_bytes([block[2], block[3]]).to_f32();
         let qh = u32::from_le_bytes(block[4..8].try_into().unwrap());
@@ -4359,7 +4488,12 @@ pub fn dot_q5_1_f32(row_bytes: &[u8], x: &[f32]) -> f32 {
 pub fn dot_q5_1_f32_scalar(row_bytes: &[u8], x: &[f32]) -> f32 {
     debug_assert_eq!(row_bytes.len() % Q5_1_BLOCK_BYTES, 0);
     let mut acc = 0f32;
-    for (b, block) in row_bytes.chunks_exact(Q5_1_BLOCK_BYTES).enumerate() {
+    for (b, block) in row_bytes
+        .as_chunks::<Q5_1_BLOCK_BYTES>()
+        .0
+        .iter()
+        .enumerate()
+    {
         let d = f16::from_le_bytes([block[0], block[1]]).to_f32();
         let m = f16::from_le_bytes([block[2], block[3]]).to_f32();
         let qh = u32::from_le_bytes(block[4..8].try_into().unwrap());
@@ -4387,7 +4521,7 @@ pub fn dequant_q8_1(src: &[u8]) -> Result<Vec<f32>, QuantError> {
     }
     let n_blocks = src.len() / Q8_1_BLOCK_BYTES;
     let mut out = Vec::with_capacity(n_blocks * Q8_1_BLOCK_ELEMS);
-    for block in src.chunks_exact(Q8_1_BLOCK_BYTES) {
+    for block in src.as_chunks::<Q8_1_BLOCK_BYTES>().0 {
         let d = f16::from_le_bytes([block[0], block[1]]).to_f32();
         for i in 0..Q8_1_BLOCK_ELEMS {
             let q = block[4 + i] as i8;
@@ -4421,7 +4555,12 @@ pub fn dot_q8_1_f32(row_bytes: &[u8], x: &[f32]) -> f32 {
 pub fn dot_q8_1_f32_scalar(row_bytes: &[u8], x: &[f32]) -> f32 {
     debug_assert_eq!(row_bytes.len() % Q8_1_BLOCK_BYTES, 0);
     let mut acc = 0f32;
-    for (b, block) in row_bytes.chunks_exact(Q8_1_BLOCK_BYTES).enumerate() {
+    for (b, block) in row_bytes
+        .as_chunks::<Q8_1_BLOCK_BYTES>()
+        .0
+        .iter()
+        .enumerate()
+    {
         let d = f16::from_le_bytes([block[0], block[1]]).to_f32();
         let base = b * Q8_1_BLOCK_ELEMS;
         let mut block_acc = 0f32;
@@ -4447,7 +4586,7 @@ pub fn dequant_q2_k(src: &[u8]) -> Result<Vec<f32>, QuantError> {
     }
     let n_blocks = src.len() / Q2_K_BLOCK_BYTES;
     let mut out = Vec::with_capacity(n_blocks * Q2_K_BLOCK_ELEMS);
-    for block in src.chunks_exact(Q2_K_BLOCK_BYTES) {
+    for block in src.as_chunks::<Q2_K_BLOCK_BYTES>().0 {
         let scales: &[u8; Q2_K_SCALE_BYTES] = block[0..16].try_into().unwrap();
         let qs = &block[16..80];
         let d = f16::from_le_bytes([block[80], block[81]]).to_f32();
@@ -4502,7 +4641,7 @@ pub fn dot_q2_k_f32_scalar(row_bytes: &[u8], x: &[f32]) -> f32 {
     debug_assert_eq!(row_bytes.len() % Q2_K_BLOCK_BYTES, 0);
     let mut acc = 0f32;
     let mut x_base = 0usize;
-    for block in row_bytes.chunks_exact(Q2_K_BLOCK_BYTES) {
+    for block in row_bytes.as_chunks::<Q2_K_BLOCK_BYTES>().0 {
         let scales: &[u8; Q2_K_SCALE_BYTES] = block[0..16].try_into().unwrap();
         let qs = &block[16..80];
         let d = f16::from_le_bytes([block[80], block[81]]).to_f32();
@@ -4579,7 +4718,7 @@ pub fn dequant_q3_k(src: &[u8]) -> Result<Vec<f32>, QuantError> {
     }
     let n_blocks = src.len() / Q3_K_BLOCK_BYTES;
     let mut out = Vec::with_capacity(n_blocks * Q3_K_BLOCK_ELEMS);
-    for block in src.chunks_exact(Q3_K_BLOCK_BYTES) {
+    for block in src.as_chunks::<Q3_K_BLOCK_BYTES>().0 {
         let hmask = &block[0..32];
         let qs = &block[32..96];
         let scales_raw: &[u8; Q3_K_SCALE_BYTES] = block[96..108].try_into().unwrap();
@@ -4637,7 +4776,7 @@ pub fn dot_q3_k_f32_scalar(row_bytes: &[u8], x: &[f32]) -> f32 {
     debug_assert_eq!(row_bytes.len() % Q3_K_BLOCK_BYTES, 0);
     let mut acc = 0f32;
     let mut x_base = 0usize;
-    for block in row_bytes.chunks_exact(Q3_K_BLOCK_BYTES) {
+    for block in row_bytes.as_chunks::<Q3_K_BLOCK_BYTES>().0 {
         let hmask = &block[0..32];
         let qs = &block[32..96];
         let scales_raw: &[u8; Q3_K_SCALE_BYTES] = block[96..108].try_into().unwrap();
@@ -4693,7 +4832,7 @@ pub fn dequant_iq4_nl(src: &[u8]) -> Result<Vec<f32>, QuantError> {
     }
     let n_blocks = src.len() / IQ4_NL_BLOCK_BYTES;
     let mut out = Vec::with_capacity(n_blocks * IQ4_NL_BLOCK_ELEMS);
-    for block in src.chunks_exact(IQ4_NL_BLOCK_BYTES) {
+    for block in src.as_chunks::<IQ4_NL_BLOCK_BYTES>().0 {
         let d = f16::from_le_bytes([block[0], block[1]]).to_f32();
         let qs = &block[2..18];
         let mut lo = [0f32; 16];
@@ -4730,7 +4869,7 @@ pub fn dot_iq4_nl_f32_scalar(row_bytes: &[u8], x: &[f32]) -> f32 {
     debug_assert_eq!(row_bytes.len() % IQ4_NL_BLOCK_BYTES, 0);
     let mut acc = 0f32;
     let mut x_base = 0usize;
-    for block in row_bytes.chunks_exact(IQ4_NL_BLOCK_BYTES) {
+    for block in row_bytes.as_chunks::<IQ4_NL_BLOCK_BYTES>().0 {
         let d = f16::from_le_bytes([block[0], block[1]]).to_f32();
         let qs = &block[2..18];
         for (j, &byte) in qs.iter().enumerate() {
@@ -4748,7 +4887,7 @@ pub fn dequant_iq4_xs(src: &[u8]) -> Result<Vec<f32>, QuantError> {
     }
     let n_blocks = src.len() / IQ4_XS_BLOCK_BYTES;
     let mut out = Vec::with_capacity(n_blocks * IQ4_XS_BLOCK_ELEMS);
-    for block in src.chunks_exact(IQ4_XS_BLOCK_BYTES) {
+    for block in src.as_chunks::<IQ4_XS_BLOCK_BYTES>().0 {
         let d = f16::from_le_bytes([block[0], block[1]]).to_f32();
         let scales_h = u16::from_le_bytes([block[2], block[3]]);
         let scales_l = &block[4..8];
@@ -4794,7 +4933,7 @@ pub fn dot_iq4_xs_f32_scalar(row_bytes: &[u8], x: &[f32]) -> f32 {
     debug_assert_eq!(row_bytes.len() % IQ4_XS_BLOCK_BYTES, 0);
     let mut acc = 0f32;
     let mut x_base = 0usize;
-    for block in row_bytes.chunks_exact(IQ4_XS_BLOCK_BYTES) {
+    for block in row_bytes.as_chunks::<IQ4_XS_BLOCK_BYTES>().0 {
         let d = f16::from_le_bytes([block[0], block[1]]).to_f32();
         let scales_h = u16::from_le_bytes([block[2], block[3]]);
         let scales_l = &block[4..8];
@@ -5040,7 +5179,9 @@ fn for_each_iq1_s(block: &[u8], mut emit: impl FnMut(usize, f32)) {
 fn for_each_iq2_xxs(block: &[u8], mut emit: impl FnMut(usize, f32)) {
     let d = read_f16(block);
     let qs: Vec<u16> = block[2..66]
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|c| u16::from_le_bytes([c[0], c[1]]))
         .collect();
     let mut idx = 0usize;
@@ -5511,7 +5652,7 @@ mod tests {
         let act = quantize_activations_q8(&x);
         assert_eq!(act.n_blocks(), 2);
         assert_eq!(act.q.len(), 64);
-        for (b, chunk) in x.chunks_exact(32).enumerate() {
+        for (b, chunk) in x.as_chunks::<32>().0.iter().enumerate() {
             let amax = chunk.iter().fold(0f32, |m, &v| m.max(v.abs()));
             let tol = amax / 127.0 + 1e-6;
             for (i, &v) in chunk.iter().enumerate() {
@@ -5537,7 +5678,7 @@ mod tests {
         let n_blocks = x.len() / Q8_0_BLOCK_ELEMS;
         let mut q = vec![0i8; n_blocks * Q8_0_BLOCK_ELEMS];
         let mut d = vec![0f32; n_blocks];
-        for (b, chunk) in x.chunks_exact(Q8_0_BLOCK_ELEMS).enumerate() {
+        for (b, chunk) in x.as_chunks::<Q8_0_BLOCK_ELEMS>().0.iter().enumerate() {
             let amax = chunk.iter().fold(0f32, |m, &v| m.max(v.abs()));
             let scale = amax / 127.0;
             let inv = if scale > 0.0 { 1.0 / scale } else { 0.0 };
@@ -5562,7 +5703,7 @@ mod tests {
         let mut q = vec![0i8; n_blocks * Q4_K_BLOCK_ELEMS];
         let mut d = vec![0f32; n_blocks];
         let mut bsums = vec![0i16; n_blocks * 16];
-        for (b, chunk) in x.chunks_exact(Q4_K_BLOCK_ELEMS).enumerate() {
+        for (b, chunk) in x.as_chunks::<Q4_K_BLOCK_ELEMS>().0.iter().enumerate() {
             let amax = chunk.iter().fold(0f32, |m, &v| m.max(v.abs()));
             let scale = amax / 127.0;
             let inv = if scale > 0.0 { 1.0 / scale } else { 0.0 };
@@ -7040,7 +7181,10 @@ mod tests {
     fn mxfp4_gguf_block_form_agrees_with_two_buffer_form() {
         let mut packed = Vec::new();
         let mut scales = Vec::new();
-        for block in MXFP4_GGUF_TEST_BLOCKS.chunks_exact(MXFP4_GGUF_BLOCK_BYTES) {
+        for block in MXFP4_GGUF_TEST_BLOCKS
+            .as_chunks::<MXFP4_GGUF_BLOCK_BYTES>()
+            .0
+        {
             scales.push(block[0]);
             packed.extend_from_slice(&block[1..17]);
         }

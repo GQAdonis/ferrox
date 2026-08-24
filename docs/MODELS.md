@@ -11,7 +11,7 @@ Speed ledger: [`benchmarks/RESULTS.md`](../benchmarks/RESULTS.md)
 
 Suite policy: keep the **current** generation per family (e.g. Llama-3.2, not
 3.1; Gemma-3/4, not Gemma-2; Phi-4, not Phi-3). Older GGUFs still load when
-the architecture is supported — they are just not in the published bench
+the architecture is supported, they are just not in the published bench
 ledger. Add a suite entry (and a GGUF under `models/`) to measure a new model.
 
 ## Recommended starters
@@ -20,7 +20,7 @@ ledger. Add a suite entry (and a GGUF under `models/`) to measure a new model.
 |---|---|
 | SmolLM2-135M-Instruct Q8_0 | Tiny; Metal ahead of llama, CPU well behind |
 | TinyLlama-1.1B-Chat Q8_0 | Smallest verified smoke |
-| Phi-4-mini-Instruct Q4_K_M | Metal restored — the RoPE kernels now carry `n_rot` (96 of head_dim 128) and LongRoPE's `attn_factor`, and `verify --backend metal` gives identical cpu/metal ids with prefill covered. The Metal rows in `benchmarks/RESULTS.md` still predate that and were taken on the wrong graph: they are **owed a re-measurement**, not to be quoted |
+| Phi-4-mini-Instruct Q4_K_M | Metal restored, the RoPE kernels now carry `n_rot` (96 of head_dim 128) and LongRoPE's `attn_factor`, and `verify --backend metal` gives identical cpu/metal ids with prefill covered. The Metal rows in `benchmarks/RESULTS.md` still predate that and were taken on the wrong graph: they are **owed a re-measurement**, not to be quoted |
 | Llama-3.2-3B-Instruct Q4_K_M | Metal flagship in the suite |
 | Gemma-4-E2B-IT Q4_K_M | Dedicated engine + `gemma4` BPE |
 
@@ -45,15 +45,15 @@ noted). **Bold** = ferrox faster. Neither engine's thread count is forced.
 | Qwen2.5-0.5B Q8_0 | **0.70×** | 1.66× |
 | Qwen3-0.6B Q8_0 | **0.71×** | 1.63× |
 | Gemma-3-1B-IT Q8_0 | **0.88×** | 1.31× |
-| Llama-3.2-1B IQ4_XS | **0.94×** | — |
-| Llama-3.2-1B Q4_K_M | 1.00× | — |
+| Llama-3.2-1B IQ4_XS | **0.94×** |, |
+| Llama-3.2-1B Q4_K_M | 1.00× |, |
 | TinyLlama-1.1B Q8_0 | **0.85×** | 1.49× |
-| Llama-3.2-3B Q4_K_M | **0.96×** | — |
-| Phi-4-mini Q4_K_M | — (owed, see above) | 1.22× |
+| Llama-3.2-3B Q4_K_M | **0.96×** |, |
+| Phi-4-mini Q4_K_M |, (owed, see above) | 1.22× |
 | Mistral-7B-v0.2 Q4_K_M | 1.00× | 1.17× |
 | OLMoE-1B-7B Q4_0 | 1.41× | 1.50× |
 
-Numbers drift as receipts refresh — prefer
+Numbers drift as receipts refresh, prefer
 [`benchmarks/RESULTS.md`](../benchmarks/RESULTS.md), which is generated
 from the receipts, over this hand-written summary.
 
@@ -65,13 +65,13 @@ OLMoE (1.11×) and Gemma-3-1B (1.18×) on Metal.
 
 | Model / family | Status |
 |---|---|
-| Yi (text) | Works (GenericGqa, Neox RoPE) — not in suite yet |
+| Yi (text) | Works (GenericGqa, Neox RoPE), not in suite yet |
 | MiroThinker | Works via `qwen3moe` |
 | Qwen2-MoE / Qwen1.5-MoE | Loads; not in current suite (OLMoE is the MoE entry) |
 | Mixtral | Suite entry; skipped on 32 GiB Host B (`--fit-host`) |
 | MLA (`deepseek2` / `mistral4`) | Dense-lead + MoE-after-dense via `MlaEngine` |
 | GLM4 / glm4moe | Loads via GLM-5.2 path when tensors present; no suite receipt |
-| Gemma-4-E2B | Dedicated `Gemma4Engine` + SPM-style `gemma4` BPE tokenizer + `<|turn>` chat wrap. GGUF: `models/gemma-4-E2B-it-Q4_K_M.gguf` (`unsloth/gemma-4-E2B-it-GGUF`). Suite id `gemma4_e2b_q4km` — Homebrew llama may still lack `gemma4` arch. |
+| Gemma-4-E2B | Dedicated `Gemma4Engine` + SPM-style `gemma4` BPE tokenizer + `<|turn>` chat wrap. GGUF: `models/gemma-4-E2B-it-Q4_K_M.gguf` (`unsloth/gemma-4-E2B-it-GGUF`). Suite id `gemma4_e2b_q4km`, Homebrew llama may still lack `gemma4` arch. |
 | gpt-oss | **CPU only.** Attention sinks, alternating sliding-window attention, biased router and the `swiglu_oai` clamp, checked against llama.cpp's own reference logits. Metal and the paged-KV decode path both refuse rather than compute different attention |
 | Llama 4 / MiniMax | **Refused**, with the reason stated at load: `llama4 MoE + non-GQA attn` and `MiniMax 256-expert sigmoid MoE + MTP` |
 | Hybrid GDN / Qwen3.5 | Scaffold only |
@@ -86,8 +86,8 @@ Ferrox fails closed. A checkpoint it cannot compute correctly is
 refused at load rather than admitted to a path that computes something
 else and returns confident, wrong tokens. Three ways that happens:
 
-1. **Unregistered architecture** — not in the capability registry.
-2. **Registered but explicitly unsupported** — `llama4`, `minimax-m2`,
+1. **Unregistered architecture**, not in the capability registry.
+2. **Registered but explicitly unsupported**, `llama4`, `minimax-m2`,
    `minimax-m3` refuse with a reason naming the missing graph feature.
    So do the architectures whose *residual topology* differs from the
    `x + attn(norm(x))` then `y + ffn(norm(y))` shape the generic decoder
@@ -103,12 +103,12 @@ else and returns confident, wrong tokens. Three ways that happens:
    *"checkpoint carries N tensor(s) this build never reads, so its
    graph is not the one this build computes."*
    This is what catches a missing graph term by construction rather
-   than by enumeration — `attn_sinks` and `exp_probs_b` were both
+   than by enumeration, `attn_sinks` and `exp_probs_b` were both
    found this way. Tensor prefixes for parts ferrox does not claim to
    run (`mm.`, `v.`, `mmproj.`, `resampler.`, `audio.`) are ignored.
 4. **Any checkpoint declaring a scalar multiplier this build does not
-   apply.** The tensor gate above cannot see these — they are hparams,
-   not weights — so a Granite / MiniCPM / Command-R checkpoint would
+   apply.** The tensor gate above cannot see these, they are hparams,
+   not weights, so a Granite / MiniCPM / Command-R checkpoint would
    otherwise load cleanly and compute a differently-scaled graph than it
    was trained as. `{arch}.logit_scale`, `{arch}.residual_scale`,
    `{arch}.embedding_scale` and `{arch}.attention.scale` are refused by

@@ -5,7 +5,7 @@ pure-Rust GGUF / MoE inference engine: mmap loaders, quantized CPU +
 Apple Metal + CUDA kernels, and an OpenAI-compatible server.
 
 It contains no logic. It re-exports the workspace under one name, so a
-dependent writes one line instead of six — and so the project is
+dependent writes one line instead of six, and so the project is
 findable on crates.io, since the name `ferrox` belongs to an unrelated
 crate.
 
@@ -42,7 +42,7 @@ a binary called `ferrox` would fight over the same path in
 Neither GPU feature is on by default: `metal` does not build off Apple
 Silicon, and `cuda` needs a toolkit most machines do not have.
 
-CUDA is held to "must compile" — there is no pinned benchmark host and
+CUDA is held to "must compile", there is no pinned benchmark host and
 no published receipts for it. Treat a Windows or Linux install as
 CPU-only in practice. See
 [`docs/FEATURES.md`](https://github.com/antonellof/ferrox/blob/main/docs/FEATURES.md).

@@ -2,7 +2,7 @@
 
 <img src="docs/assets/ferrox-logo.webp" alt="Ferrox" width="70%" />
 
-**A pure-Rust GGUF inference engine — dense and MoE, on CPU, Apple Metal, or CUDA.**
+**A pure-Rust GGUF inference engine. Dense and MoE, on CPU, Apple Metal, or CUDA.**
 
 [![CI][ci-badge]][ci-workflow]
 [![Latest release][release-badge]][latest-release]
@@ -28,7 +28,7 @@
 ---
 
 Ferrox loads GGUF checkpoints and runs inference on your hardware. No
-bindings to llama.cpp, no ggml wrapper — the loader, quantized kernels,
+bindings to llama.cpp, no ggml wrapper. The loader, quantized kernels,
 attention and expert routing are all implemented here.
 
 - **Quantized end to end.** Weights stay quantized on mmap and
@@ -122,7 +122,7 @@ let decoder = Decoder::from_gguf(path, config)?;
 ```
 
 Features, none on by default: `metal`, `cuda`, `api`. Every layer is
-published separately if you want one rather than the stack —
+published separately if you want one rather than the stack:
 [gguf](https://crates.io/crates/ferrox-gguf),
 [quant](https://crates.io/crates/ferrox-quant),
 [safetensors](https://crates.io/crates/ferrox-safetensors),
@@ -146,8 +146,8 @@ GGUF ecosystem, and hard-won engineering knowledge developed there. We
 are thankful and indebted to llama.cpp and its contributors. Their
 implementation, kernels, tests, and design choices were an essential
 reference while building this pure-Rust GGUF / MoE inference path. Some
-source-level pieces are retained or adapted here under the MIT license —
-notably IQ quantization codebook tables — and many other pieces (GGUF
+source-level pieces are retained or adapted here under the MIT license,
+notably IQ quantization codebook tables, and many other pieces (GGUF
 layouts, quant/dot semantics, CLI and server conventions) were written
 independently against that public design. For this reason, and because
 we are genuinely grateful, we keep the GGML authors' copyright notice in
@@ -155,7 +155,7 @@ we are genuinely grateful, we keep the GGML authors' copyright notice in
 
 ## License
 
-Apache-2.0 — see [LICENSE](LICENSE) and
+Apache-2.0. See [LICENSE](LICENSE) and
 [docs/THIRD_PARTY_NOTICES.md](docs/THIRD_PARTY_NOTICES.md).
 
 [ci-badge]: https://github.com/antonellof/ferrox/actions/workflows/ci.yml/badge.svg

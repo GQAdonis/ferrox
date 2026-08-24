@@ -3,7 +3,7 @@
 The web frontend for `ferrox-server`: Chat, Models, Activity, Connect.
 
 It is a **standalone app**. `ferrox-server` serves the HTTP API and
-nothing else — `GET /` on it is a 404 — and this app reaches that API
+nothing else, `GET /` on it is a 404, and this app reaches that API
 the same way an editor would. That rule is load-bearing rather than
 tidy: every screen here goes through the public surface, so the API
 cannot rot without the UI breaking first.
@@ -13,10 +13,10 @@ cannot rot without the UI breaking first.
 ```bash
 npm install
 
-# Terminal 1 — the real backend, no UI flag, nothing special
+# Terminal 1, the real backend, no UI flag, nothing special
 cargo run -p ferrox-server -- -m models/some-model.gguf
 
-# Terminal 2 — Vite on :5173
+# Terminal 2, Vite on :5173
 npm run dev
 ```
 
@@ -36,7 +36,7 @@ npm run check       # typecheck + lint
 ```
 
 `dist/` is **not committed**. Nothing built here ships inside a Rust
-crate, so there is no artefact to keep in sync — serve `dist/` with any
+crate, so there is no artefact to keep in sync, serve `dist/` with any
 static file server, or bundle it into a desktop shell.
 
 ## CORS, and how to not need it
@@ -56,7 +56,7 @@ cross-origin rules apply. There are exactly two supported answers:
   purpose: a wildcard beside a bearer token is a credential-leak shape.
 
 The Connect screen also holds the `FERROX_API_KEY` bearer token, stored
-in `localStorage` and sent as an `Authorization` header — never in a
+in `localStorage` and sent as an `Authorization` header, never in a
 URL.
 
 ## Stack
@@ -64,7 +64,7 @@ URL.
 React 19 · Vite · Tailwind v4 · Radix UI primitives (the shadcn/ui
 foundation) · `@assistant-ui/react` for the chat transcript ·
 TanStack Table for the Activity log · lucide-react icons. Every runtime
-dependency is MIT / Apache-2.0 / ISC / BSD — see
+dependency is MIT / Apache-2.0 / ISC / BSD, see
 [`docs/THIRD_PARTY_NOTICES.md`](../docs/THIRD_PARTY_NOTICES.md), and
 `npm run licenses` enforces it in CI. The bundle is distributed, so a
 copyleft dependency is not a lockfile detail.
@@ -96,6 +96,6 @@ src/
   `dangerouslySetInnerHTML` so the property is enforced, not remembered.
 - **`duration_ms` and `decode_ms` are never combined.** Duration carries
   queue wait and prefill; the `tok/s` column divides by `decode_ms`
-  alone. Nothing here computes a download rate either — the server's
+  alone. Nothing here computes a download rate either, the server's
   estimator reports `null` until it is confident, and that null is
   rendered as words, not as a number.

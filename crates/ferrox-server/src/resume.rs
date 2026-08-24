@@ -345,10 +345,25 @@ impl Emitter {
     }
 
     /// Closes the replay buffer. A no-op for a non-resumable stream.
-    pub(crate) fn finish(&self) {
+    fn finish(&self) {
         if let Some(slot) = &self.slot {
             slot.finish();
         }
+    }
+}
+
+/// The buffer is closed by dropping the emitter, not by remembering to
+/// call `finish()`.
+///
+/// A generation thread that panics would otherwise leave a slot marked
+/// live forever: readers would park on it until their timeouts, and the
+/// registry only ever evicts *finished* slots, so it could never be
+/// reclaimed. Same reasoning as the `TaskGuard` in `tasks` and the
+/// cancel guard in `cancel` -- nothing awaits a `spawn_blocking` handle,
+/// so a panic has to be survivable by construction.
+impl Drop for Emitter {
+    fn drop(&mut self) {
+        self.finish();
     }
 }
 
@@ -754,6 +769,24 @@ mod tests {
             "the end of stream is replayable too, or a resumed reader never stops"
         );
         assert!(result.finished);
+    }
+
+    /// A decode thread that panics must not leave a slot live forever:
+    /// readers would park on it and the registry only evicts finished
+    /// slots, so it could never be reclaimed.
+    #[test]
+    fn dropping_an_emitter_closes_its_buffer_even_when_nothing_finished_it() {
+        let registry = StreamRegistry::new();
+        let slot = registry.register("chatcmpl-panic");
+        {
+            let emitter = Emitter::new(Some(Arc::clone(&slot)));
+            let _ = emitter.event(&serde_json::json!({"n": 1}));
+            // No `finish()` call: the thread "panicked" here.
+        }
+        assert!(
+            slot.read_now(0).finished,
+            "a dropped emitter must close its buffer"
+        );
     }
 
     #[test]

@@ -2396,10 +2396,10 @@ async fn chat_completions_stream(
                 let _ = tx.blocking_send(Ok(emitter.done()));
             }
         }
-        // Whichever way the generation ended, the buffer is closed: a
-        // reader that has caught up stops instead of parking for an
-        // event that will never come.
-        emitter.finish();
+        // The buffer is closed by dropping `emitter` here -- including
+        // on a panic, which is the case an explicit call would miss.
+        // See `resume::Emitter`'s `Drop`.
+        drop(emitter);
     });
 
     let stream =

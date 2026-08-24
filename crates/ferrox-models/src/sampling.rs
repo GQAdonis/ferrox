@@ -1,9 +1,12 @@
 //! Token sampling from a decoder's output logits: temperature, top-k,
 //! top-p (nucleus), and repetition penalty, on top of the greedy argmax
-//! ferrox previously always used unconditionally (see
-//! `crate::speculative`, which still uses plain greedy argmax directly
-//! since its quality-neutrality proof depends on exactly matching
-//! greedy decode -- sampling is a deliberately separate, opt-in path).
+//! ferrox previously always used unconditionally.
+//!
+//! `crate::speculative` verifies draft tokens against
+//! [`sampling_distribution`] -- the exact distribution [`Sampler`]
+//! draws from for a given `SamplingParams` -- so speculation is
+//! lossless with respect to whatever sampling configuration the caller
+//! asked for, rather than only at temperature 0.
 //!
 //! No external `rand` dependency: a small xorshift64* generator (the
 //! same algorithm `Decoder::new_random_small`'s test-only `Lcg` already
@@ -75,7 +78,15 @@ impl Sampler {
         self.state ^= self.state << 13;
         self.state ^= self.state >> 7;
         self.state ^= self.state << 17;
-        self.state
+        // The `*` in xorshift64*. Without it this is plain xorshift64,
+        // whose state IS its output, and a small seed's first output is
+        // therefore still small: for every seed below ~4000 the first
+        // draw landed in the bottom eighth of [0, 1), so a request that
+        // asked for `seed: 42` always got its first token from the
+        // bottom of the CDF. The multiply is what decorrelates the
+        // output from a low-entropy state; see
+        // `low_seeds_do_not_bias_the_first_draw`.
+        self.state.wrapping_mul(0x2545F491_4F6CDD1D)
     }
 
     /// Uniform float in [0.0, 1.0).
@@ -126,47 +137,30 @@ impl Sampler {
             return argmax(&scores);
         }
 
-        for s in scores.iter_mut() {
-            *s /= params.temperature;
-        }
+        let probs = filtered_distribution(scores, logits, params);
+        self.sample_from(&probs)
+    }
 
-        let mut probs = softmax(&scores);
+    /// A uniform draw in `[0.0, 1.0)`.
+    ///
+    /// Exposed because speculative decoding's accept test is a coin
+    /// flip against `p_target(x) / p_draft(x)` rather than a draw from
+    /// a distribution, and it must come off the same seeded stream as
+    /// every other draw in the run or a "reproducible given a seed"
+    /// generation stops being reproducible.
+    pub fn uniform(&mut self) -> f32 {
+        self.next_f32()
+    }
 
-        if params.top_k > 0 && params.top_k < probs.len() {
-            let mut idx: Vec<usize> = (0..probs.len()).collect();
-            idx.sort_unstable_by(|&a, &b| probs[b].partial_cmp(&probs[a]).unwrap());
-            for &i in idx.iter().skip(params.top_k) {
-                probs[i] = 0.0;
-            }
-        }
-
-        if params.top_p < 1.0 {
-            let mut idx: Vec<usize> = (0..probs.len()).collect();
-            idx.sort_unstable_by(|&a, &b| probs[b].partial_cmp(&probs[a]).unwrap());
-            let mut cumulative = 0.0f32;
-            let mut cutoff = idx.len();
-            for (rank, &i) in idx.iter().enumerate() {
-                cumulative += probs[i];
-                if cumulative >= params.top_p {
-                    cutoff = rank + 1;
-                    break;
-                }
-            }
-            for &i in idx.iter().skip(cutoff) {
-                probs[i] = 0.0;
-            }
-        }
-
-        let total: f32 = probs.iter().sum();
-        if total <= 0.0 {
-            // Every candidate got filtered to zero (degenerate params);
-            // fall back to greedy rather than sampling from nothing.
-            return argmax(logits);
-        }
-        for p in probs.iter_mut() {
-            *p /= total;
-        }
-
+    /// Draws one index from an already-normalised distribution.
+    ///
+    /// Split out of [`Self::sample_with_mask`] so speculative decoding
+    /// can sample from a distribution it had to compute anyway (the
+    /// rejection rule needs `p_target` itself, not just a draw from it)
+    /// and still go through *exactly* the same draw as ordinary
+    /// sampling. Two separate copies of this loop would be two chances
+    /// to be subtly non-lossless.
+    pub fn sample_from(&mut self, probs: &[f32]) -> usize {
         let draw = self.next_f32();
         let mut cumulative = 0.0f32;
         for (i, &p) in probs.iter().enumerate() {
@@ -186,6 +180,99 @@ impl Sampler {
             .map(|(i, _)| i)
             .unwrap_or(0)
     }
+}
+
+/// The **exact** distribution [`Sampler::sample`] draws from for these
+/// logits, params and history: penalties applied, temperature divided
+/// in, top-k and top-p filtered, renormalised to sum to 1.
+///
+/// This is what makes lossless speculative verification possible. The
+/// speculative-sampling rejection rule compares `p_target(x)` against
+/// the draft's `q(x)`, and "the target's probability" is meaningless
+/// unless it is the probability the *configured sampler* would actually
+/// have used -- a rule that compared against the raw softmax while the
+/// server sampled with `top_p = 0.9` would be lossless with respect to
+/// a model nobody is running.
+///
+/// Greedy (`temperature <= 0.0`) is a distribution too: the point mass
+/// on the argmax. Returning it as one rather than as a special case is
+/// why the same verification code is correct at every temperature.
+pub fn sampling_distribution(
+    logits: &[f32],
+    params: &SamplingParams,
+    history: &[usize],
+) -> Vec<f32> {
+    let mut scores = logits.to_vec();
+    apply_history_penalties(&mut scores, params, history);
+    if params.temperature <= 0.0 {
+        let mut probs = vec![0.0f32; scores.len()];
+        if let Some(p) = probs.get_mut(argmax(&scores)) {
+            *p = 1.0;
+        }
+        return probs;
+    }
+    filtered_distribution(scores, logits, params)
+}
+
+/// Shared tail of [`Sampler::sample_with_mask`] and
+/// [`sampling_distribution`]: divide the already-penalised `scores` by
+/// the temperature, softmax, apply top-k and top-p, and renormalise.
+/// `raw_logits` is only consulted for the degenerate
+/// everything-filtered-to-zero fallback.
+///
+/// Both callers go through here rather than each doing their own
+/// temperature-then-filter, because a difference between the two is
+/// exactly the kind of silent non-losslessness speculative
+/// verification is supposed to rule out.
+fn filtered_distribution(
+    mut scores: Vec<f32>,
+    raw_logits: &[f32],
+    params: &SamplingParams,
+) -> Vec<f32> {
+    for s in scores.iter_mut() {
+        *s /= params.temperature;
+    }
+    let mut probs = softmax(&scores);
+
+    if params.top_k > 0 && params.top_k < probs.len() {
+        let mut idx: Vec<usize> = (0..probs.len()).collect();
+        idx.sort_unstable_by(|&a, &b| probs[b].partial_cmp(&probs[a]).unwrap());
+        for &i in idx.iter().skip(params.top_k) {
+            probs[i] = 0.0;
+        }
+    }
+
+    if params.top_p < 1.0 {
+        let mut idx: Vec<usize> = (0..probs.len()).collect();
+        idx.sort_unstable_by(|&a, &b| probs[b].partial_cmp(&probs[a]).unwrap());
+        let mut cumulative = 0.0f32;
+        let mut cutoff = idx.len();
+        for (rank, &i) in idx.iter().enumerate() {
+            cumulative += probs[i];
+            if cumulative >= params.top_p {
+                cutoff = rank + 1;
+                break;
+            }
+        }
+        for &i in idx.iter().skip(cutoff) {
+            probs[i] = 0.0;
+        }
+    }
+
+    let total: f32 = probs.iter().sum();
+    if total <= 0.0 {
+        // Every candidate got filtered to zero (degenerate params);
+        // fall back to greedy rather than sampling from nothing.
+        let mut point = vec![0.0f32; probs.len()];
+        if let Some(p) = point.get_mut(argmax(raw_logits)) {
+            *p = 1.0;
+        }
+        return point;
+    }
+    for p in probs.iter_mut() {
+        *p /= total;
+    }
+    probs
 }
 
 fn apply_history_penalties(scores: &mut [f32], params: &SamplingParams, history: &[usize]) {
@@ -361,6 +448,92 @@ mod tests {
             counts[1] < 250,
             "heavily penalizing token 1 (already in history) should make it far less likely than its raw logit alone would suggest; got counts={counts:?}"
         );
+    }
+
+    #[test]
+    fn low_seeds_do_not_bias_the_first_draw() {
+        // Every generation seeds a fresh `Sampler` (the server does it
+        // per request, from the caller's `seed`), so the FIRST draw off
+        // a freshly seeded generator is the one users actually see.
+        // Plain xorshift64 returns its own state, so seeds 1..4000 all
+        // produced a first draw in the bottom eighth of [0, 1) -- the
+        // first sampled token of every seeded request came off the
+        // bottom of the CDF.
+        let vocab = 8;
+        let logits = vec![0.0f32; vocab];
+        let params = SamplingParams {
+            temperature: 1.0,
+            ..SamplingParams::default()
+        };
+        let seeds = 4_000u64;
+        let mut counts = vec![0usize; vocab];
+        for seed in 1..=seeds {
+            counts[Sampler::new(seed).sample(&logits, &params, &[])] += 1;
+        }
+        let expected = seeds as f64 / vocab as f64;
+        for (token, &c) in counts.iter().enumerate() {
+            assert!(
+                (c as f64 - expected).abs() < expected * 0.25,
+                "uniform logits: token {token} came up {c} times across {seeds} seeds, \
+                 expected about {expected:.0} (counts={counts:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn the_published_distribution_is_the_one_sample_actually_draws_from() {
+        // `sampling_distribution` is load-bearing for lossless
+        // speculative verification: if it disagreed with what `sample`
+        // draws from, every accept/reject decision would be measured
+        // against the wrong target. Check them against each other
+        // empirically, with filters on so the two code paths have
+        // something to disagree about.
+        let logits = vec![0.4, 2.0, -1.0, 1.2, 0.9, -0.3];
+        let params = SamplingParams {
+            temperature: 0.8,
+            top_p: 0.9,
+            top_k: 4,
+            repetition_penalty: 1.3,
+            ..SamplingParams::default()
+        };
+        let history = [1usize, 4];
+        let claimed = sampling_distribution(&logits, &params, &history);
+        assert!((claimed.iter().sum::<f32>() - 1.0).abs() < 1e-5);
+
+        let draws = 100_000;
+        let mut counts = vec![0usize; logits.len()];
+        let mut sampler = Sampler::new(0xC0FFEE);
+        for _ in 0..draws {
+            counts[sampler.sample(&logits, &params, &history)] += 1;
+        }
+        for (i, &c) in counts.iter().enumerate() {
+            let empirical = c as f64 / draws as f64;
+            assert!(
+                (empirical - claimed[i] as f64).abs() < 0.01,
+                "token {i}: sample() draws it {empirical:.4} of the time but \
+                 sampling_distribution claims {:.4}",
+                claimed[i]
+            );
+        }
+    }
+
+    #[test]
+    fn greedy_is_published_as_a_point_mass_not_a_special_case() {
+        let logits = vec![0.1, 0.9, 0.3, -0.2];
+        let probs = sampling_distribution(&logits, &SamplingParams::default(), &[]);
+        assert_eq!(probs, vec![0.0, 1.0, 0.0, 0.0]);
+        // Penalties still apply at temperature 0, so the point mass
+        // moves with them.
+        let penalized = sampling_distribution(
+            &logits,
+            &SamplingParams {
+                repetition_penalty: 100.0,
+                ..SamplingParams::default()
+            },
+            &[1],
+        );
+        assert_eq!(penalized[1], 0.0);
+        assert_eq!(penalized.iter().sum::<f32>(), 1.0);
     }
 
     #[test]

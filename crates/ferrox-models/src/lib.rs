@@ -80,8 +80,11 @@ pub use kv_budget::{
 pub use loader::LoadError;
 pub use output_projection::grouped_output_projection;
 pub use prefix_cache::{PrefixCache, PrefixCacheStats, PrefixMatch};
-pub use sampling::{Sampler, SamplingParams};
-pub use speculative::{speculative_decode, PromptLookupSpeculator, SpeculativeDecodeResult};
+pub use sampling::{sampling_distribution, Sampler, SamplingParams};
+pub use speculative::{
+    accept_or_resample, speculative_decode, speculative_decode_with, DraftBlock, DraftDist,
+    Drafter, PromptLookupSpeculator, SpeculativeDecodeResult, SpeculativeOptions,
+};
 pub use tensor_role::TensorRole;
 pub use tokenizer::{
     ByteTokenizer, GgufBpeTokenizer, GgufSpmTokenizer, GgufUnigramTokenizer, TokenizerLoadError,

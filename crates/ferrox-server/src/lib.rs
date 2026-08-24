@@ -239,6 +239,20 @@ impl ServerArgs {
     }
 }
 
+/// Whether this build of the server has the Metal kernels compiled in.
+///
+/// Exists for the front ends that link this library: ferrox-cli's
+/// `metal` feature has to forward into ferrox-server (`ferrox-server?/metal`)
+/// or `ferrox serve --device metal` refuses on a Metal host while
+/// `ferrox run` on the same binary uses it. That mismatch is a Cargo
+/// manifest edit away and compiles cleanly, so ferrox-cli asserts on
+/// this constant at compile time.
+pub const BUILT_WITH_METAL: bool = cfg!(feature = "metal");
+
+/// Whether this build of the server has the CUDA kernels compiled in.
+/// See [`BUILT_WITH_METAL`].
+pub const BUILT_WITH_CUDA: bool = cfg!(feature = "cuda");
+
 fn rewrite_llama_style_argv(args: Vec<String>) -> Vec<String> {
     args.into_iter()
         .map(|arg| match arg.as_str() {

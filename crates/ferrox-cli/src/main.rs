@@ -388,6 +388,25 @@ const SUBCOMMANDS: &[&str] = &[
     "help",
 ];
 
+// A backend feature on `ferrox` has to reach the server it links, or one
+// binary answers two different ways: `ferrox run --device metal` uses the
+// GPU and `ferrox serve --device metal` refuses with "built without
+// --features metal". The forwarding is one `ferrox-server?/metal` in
+// Cargo.toml and dropping it still compiles, so it is asserted here
+// instead of being rechecked by hand at release time.
+#[cfg(all(feature = "serve", feature = "metal"))]
+const _: () = assert!(
+    ferrox_server::BUILT_WITH_METAL,
+    "ferrox-cli's `metal` feature must forward to ferrox-server: \
+     metal = [.., \"ferrox-server?/metal\"]"
+);
+#[cfg(all(feature = "serve", feature = "cuda"))]
+const _: () = assert!(
+    ferrox_server::BUILT_WITH_CUDA,
+    "ferrox-cli's `cuda` feature must forward to ferrox-server: \
+     cuda = [.., \"ferrox-server?/cuda\"]"
+);
+
 /// Root flags that take no value and may legally appear *before* a
 /// subcommand, because clap declares them `global = true`.
 const GLOBAL_FLAGS: &[&str] = &["--allow-multiple-instances"];

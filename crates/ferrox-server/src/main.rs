@@ -37,6 +37,7 @@
 mod admin;
 mod anthropic;
 mod batch_scheduler;
+mod budget;
 mod cache;
 mod cancel;
 mod chat_template;
@@ -51,6 +52,7 @@ mod model;
 mod openai_extra;
 mod security;
 mod session;
+mod sse;
 mod stats;
 mod stop;
 mod tasks;
@@ -528,6 +530,16 @@ pub(crate) struct ActiveModel {
     /// when a KV pool or prefix cache is configured (those keep the
     /// private-loop `generate` path).
     pub(crate) batcher: Option<batch_scheduler::ContinuousBatcher>,
+    /// The per-request context ceiling this model was priced for, or
+    /// `None` when it could not be priced (see `crate::budget`).
+    ///
+    /// Lives on the *model* rather than on `AppState` because it is a
+    /// property of the checkpoint plus the machine: `/admin/models/load`
+    /// swapping in a different model must swap in its ceiling too,
+    /// never keep the old model's arithmetic. The same `Arc` is inside
+    /// this model's `batcher`, so the batched and private decode paths
+    /// admit on one object.
+    pub(crate) ceiling: Option<Arc<budget::ContextCeiling>>,
 }
 
 pub(crate) struct AppState {
@@ -1621,6 +1633,11 @@ pub(crate) fn join_error_response(e: tokio::task::JoinError) -> ApiError {
 /// decoded text chunk. Returns finish reason, usage, and the concatenated
 /// text (for sessions / tool-call detection). Pure CPU-bound work with
 /// no I/O and no shared lock: safe to run on `spawn_blocking`.
+#[allow(clippy::too_many_arguments)] // one clear parameter per concern:
+                                     // model + prompt + params, then the three optional shared
+                                     // facilities (KV pool, prefix cache, batcher), the context
+                                     // ceiling, and the sink. Bundling them would only move the
+                                     // same list behind a struct at two call sites.
 fn run_generation_emit(
     model: &Model,
     prompt: &str,
@@ -1628,6 +1645,7 @@ fn run_generation_emit(
     kv_pool: Option<&generate::KvPoolConfig>,
     prefix_cache: Option<&Mutex<PrefixCache>>,
     continuous_batcher: Option<&batch_scheduler::ContinuousBatcher>,
+    ceiling: Option<&budget::ContextCeiling>,
     mut emit: impl FnMut(&str),
 ) -> Result<(FinishReason, generate::Usage, String), generate::DecodeError> {
     let synthetic = model.is_synthetic();
@@ -1665,6 +1683,7 @@ fn run_generation_emit(
                     params,
                     kv_pool,
                     prefix_cache,
+                    ceiling,
                     |chunk| {
                         chunks.push(chunk.to_string());
                         if !synthetic {
@@ -1755,6 +1774,7 @@ pub(crate) fn run_generation(
     kv_pool: Option<&generate::KvPoolConfig>,
     prefix_cache: Option<&Mutex<PrefixCache>>,
     continuous_batcher: Option<&batch_scheduler::ContinuousBatcher>,
+    ceiling: Option<&budget::ContextCeiling>,
 ) -> Result<(Vec<String>, FinishReason, generate::Usage), generate::DecodeError> {
     let (finish, usage, full) = run_generation_emit(
         model,
@@ -1763,6 +1783,7 @@ pub(crate) fn run_generation(
         kv_pool,
         prefix_cache,
         continuous_batcher,
+        ceiling,
         |_| {},
     )?;
     Ok((
@@ -2018,6 +2039,7 @@ async fn chat_completions_full(
         let kv_pool = state.kv_pool.clone();
         let prefix_cache = state.prefix_cache.clone();
         let batcher = active.batcher.clone();
+        let ceiling = active.ceiling.clone();
         let params = req.generation_params_for_template(active.model.chat_template());
         let prompt_for_task = prompt.clone();
         let (chunks, finish, usage) = tokio::task::spawn_blocking(move || {
@@ -2028,6 +2050,7 @@ async fn chat_completions_full(
                 kv_pool.as_ref(),
                 prefix_cache.as_deref(),
                 batcher.as_ref(),
+                ceiling.as_deref(),
             )
         })
         .await
@@ -2118,6 +2141,7 @@ async fn chat_completions_stream(
     let kv_pool = state.kv_pool.clone();
     let prefix_cache = state.prefix_cache.clone();
     let batcher = active.batcher.clone();
+    let ceiling = active.ceiling.clone();
     let mut params = req.generation_params_for_template(active.model.chat_template());
     let stats_state = Arc::clone(&state);
 
@@ -2140,6 +2164,11 @@ async fn chat_completions_stream(
         // id back out of the cancel registry.
         let _cancel_guard = cancel_guard;
         let tx_chunks = tx.clone();
+        // The orphan deadline (see `crate::sse`): a client that is
+        // neither reading nor disconnected must not park this blocking
+        // thread -- and the model handle and cancel guard it holds --
+        // for the life of the process.
+        let orphan_timeout = sse::orphan_timeout_from_env();
         let mut first = true;
         let head_request_id = request_id.clone();
         let result = run_generation_emit(
@@ -2149,6 +2178,7 @@ async fn chat_completions_stream(
             kv_pool.as_ref(),
             prefix_cache.as_deref(),
             batcher.as_ref(),
+            ceiling.as_deref(),
             |chunk| {
                 if !overlap || chunk.is_empty() {
                     return;
@@ -2180,10 +2210,17 @@ async fn chat_completions_stream(
                 // hundreds of tokens into nothing. Flipping the same
                 // flag `/v1/cancel` sets means there is one stop path,
                 // not two.
-                if tx_chunks
-                    .blocking_send(Ok(Event::default().json_data(payload).unwrap()))
-                    .is_err()
-                {
+                if let Err(why) = sse::send_or_orphan(
+                    &tx_chunks,
+                    Ok(Event::default().json_data(payload).unwrap()),
+                    orphan_timeout,
+                ) {
+                    if why == sse::SendFailure::Orphaned {
+                        tracing::warn!(
+                            "SSE stream {head_request_id} accepted nothing for the orphan \
+                             deadline; treating it as abandoned and cancelling the generation"
+                        );
+                    }
                     cancel_token.cancel();
                 }
             },
@@ -2239,7 +2276,11 @@ async fn chat_completions_stream(
                             }],
                             usage: None,
                         };
-                        let _ = tx.blocking_send(Ok(Event::default().json_data(payload).unwrap()));
+                        let _ = sse::send_or_orphan(
+                            &tx,
+                            Ok(Event::default().json_data(payload).unwrap()),
+                            orphan_timeout,
+                        );
                     } else if !full_text.is_empty() {
                         let payload = ChatCompletionChunk {
                             id: request_id.clone(),
@@ -2257,7 +2298,11 @@ async fn chat_completions_stream(
                             }],
                             usage: None,
                         };
-                        let _ = tx.blocking_send(Ok(Event::default().json_data(payload).unwrap()));
+                        let _ = sse::send_or_orphan(
+                            &tx,
+                            Ok(Event::default().json_data(payload).unwrap()),
+                            orphan_timeout,
+                        );
                     }
                 }
                 let final_finish_reason = if tool_call.is_some() {
@@ -2281,8 +2326,13 @@ async fn chat_completions_stream(
                     }],
                     usage: Some(usage.clone()),
                 };
-                let _ = tx.blocking_send(Ok(Event::default().json_data(final_payload).unwrap()));
-                let _ = tx.blocking_send(Ok(Event::default().data("[DONE]")));
+                let _ = sse::send_or_orphan(
+                    &tx,
+                    Ok(Event::default().json_data(final_payload).unwrap()),
+                    orphan_timeout,
+                );
+                let _ =
+                    sse::send_or_orphan(&tx, Ok(Event::default().data("[DONE]")), orphan_timeout);
                 // Recorded here rather than where the handler returned:
                 // the handler returns as soon as the SSE headers go out,
                 // which is before a single token exists, so timing it
@@ -2327,8 +2377,13 @@ async fn chat_completions_stream(
                     }],
                     usage: None,
                 };
-                let _ = tx.blocking_send(Ok(Event::default().json_data(payload).unwrap()));
-                let _ = tx.blocking_send(Ok(Event::default().data("[DONE]")));
+                let _ = sse::send_or_orphan(
+                    &tx,
+                    Ok(Event::default().json_data(payload).unwrap()),
+                    orphan_timeout,
+                );
+                let _ =
+                    sse::send_or_orphan(&tx, Ok(Event::default().data("[DONE]")), orphan_timeout);
             }
         }
     });
@@ -2397,7 +2452,86 @@ async fn cancel_generation(
         .into_response()
 }
 
-/// Turns a freshly loaded checkpoint into the pair that gets published
+/// What a freshly loaded checkpoint becomes when it is published as the
+/// active model: the model itself, its optional continuous-batching
+/// worker, and the context ceiling both decode paths admit on.
+type Activated = (
+    Model,
+    Option<batch_scheduler::ContinuousBatcher>,
+    Option<Arc<budget::ContextCeiling>>,
+);
+
+/// The scheduler config for a freshly loaded GGUF, with the ceilings an
+/// operator did not configure *derived* from the checkpoint instead of
+/// left absent.
+///
+/// This is the server half of `mem-preload-kv-budget`: `ferrox run`
+/// already priced weights + `n_ctx * per_token_kv` + headroom against
+/// the device budget before loading, while `ferrox-server` admitted on
+/// whatever `FERROX_CB_*` happened to be set and otherwise on nothing.
+///
+/// Precedence is one-directional and deliberate: an explicit
+/// `FERROX_CB_MAX_CONTEXT` / `FERROX_CB_KV_BLOCKS` is never overridden,
+/// because an operator who names a number has information this
+/// arithmetic does not. Derivation only ever fills an *absent* ceiling,
+/// where the alternative is no ceiling at all.
+///
+/// `path` is `None` for the synthetic-weights fallback, which has no
+/// checkpoint on disk to price.
+fn price_batcher_config(path: Option<&str>) -> batch_scheduler::BatcherConfig {
+    let mut batcher = batch_scheduler::BatcherConfig::from_env();
+    if batcher.max_context.is_some() && batcher.kv_blocks.is_some() {
+        // Nothing left to derive, and pricing the checkpoint would only
+        // print arithmetic that decides nothing.
+        return batcher;
+    }
+    let Some(path) = path else {
+        return batcher;
+    };
+    // `ferrox_core::cache::KvCache` is `Vec<f32>` on both decode paths,
+    // so f32 is the width really kept, even under Metal attention where
+    // the *device* also holds an f16 copy. Budgeting the host store is
+    // the conservative reading: it over-charges KV and therefore
+    // under-states the context that fits.
+    let priced = budget::price_gguf(path, ferrox_models::KvElem::F32, 1, 1);
+    let Some((priced, gguf_ctx, source)) = priced else {
+        return batcher;
+    };
+    let Some(derived) = budget::derive_limits(&priced, gguf_ctx, batcher.kv_block_size) else {
+        // See `budget`'s module doc: a fit of zero tokens is not a
+        // ceiling of zero, it is an estimate saying this model should
+        // not have loaded -- and it did. Say so and admit as before.
+        tracing::warn!(
+            "this checkpoint's weights leave no room for KV inside the {source}: {} weight \
+             bytes against a {} byte budget. Serving with no derived context ceiling -- set \
+             FERROX_DEVICE_BUDGET_BYTES if the probe is wrong, or FERROX_CB_MAX_CONTEXT to \
+             admit on a number you choose.",
+            priced.weights_bytes,
+            priced.device_budget_bytes,
+        );
+        return batcher;
+    };
+    tracing::info!("{source}");
+    tracing::info!("{}", derived.fit);
+    let adopted = budget::apply_derived(&mut batcher, &derived);
+    if adopted.max_context {
+        tracing::info!(
+            "derived per-request context ceiling: {} token positions (prompt + max_tokens); \
+             override with FERROX_CB_MAX_CONTEXT",
+            derived.max_context
+        );
+    }
+    if adopted.kv_blocks {
+        tracing::info!(
+            "derived KV block budget: {} blocks x {} positions; override with FERROX_CB_KV_BLOCKS",
+            derived.kv_blocks,
+            batcher.kv_block_size
+        );
+    }
+    batcher
+}
+
+/// Turns a freshly loaded checkpoint into the parts that get published
 /// as the active model.
 ///
 /// Extracted from `build_app_state` so `/admin/models/load` builds its
@@ -2408,11 +2542,21 @@ async fn cancel_generation(
 pub(crate) fn activate_loaded_model(
     loaded: model::LoadedModel,
     enable_continuous_batching: bool,
-) -> (Model, Option<batch_scheduler::ContinuousBatcher>) {
+    path: Option<&str>,
+) -> Activated {
     match loaded {
         model::LoadedModel::Gguf(g) => {
             let decoder = Arc::new(g.decoder);
             let tokenizer = Arc::new(g.tokenizer);
+            let config = price_batcher_config(path);
+            // Prefill is still a per-token `forward_token` loop on both
+            // paths (see `sched-chunked-prefill`: chunking bought
+            // fairness, not a batched prefill kernel), so a sliding
+            // layer really does need only `window + 1 - 1` positions
+            // live. `chunk = 1` here is the truth, not a simplification.
+            let shape =
+                ferrox_models::KvShape::from_config(&decoder.config, ferrox_models::KvElem::F32, 1);
+            let ceiling = Arc::new(budget::ContextCeiling::new(config.max_context, shape));
             let batcher = if enable_continuous_batching {
                 tracing::info!(
                     "continuous batching enabled: decode steps share Decoder::forward_multi_seq \
@@ -2420,9 +2564,11 @@ pub(crate) fn activate_loaded_model(
                 );
                 let tok = Arc::clone(&tokenizer);
                 let decode = Arc::new(move |ids: &[usize]| tok.decode(ids));
-                Some(batch_scheduler::ContinuousBatcher::spawn(
+                Some(batch_scheduler::ContinuousBatcher::spawn_with_ceiling(
                     Arc::clone(&decoder),
                     decode,
+                    config,
+                    Arc::clone(&ceiling),
                 ))
             } else {
                 None
@@ -2437,6 +2583,7 @@ pub(crate) fn activate_loaded_model(
                     chat_template: g.chat_template,
                 }),
                 batcher,
+                Some(ceiling),
             )
         }
         model::LoadedModel::Kimi(k) => (
@@ -2446,6 +2593,7 @@ pub(crate) fn activate_loaded_model(
                 stop_tokens: k.stop_tokens,
                 chat_template: k.chat_template,
             }),
+            None,
             None,
         ),
         model::LoadedModel::Mla(m) => (
@@ -2458,6 +2606,7 @@ pub(crate) fn activate_loaded_model(
                 chat_template: m.chat_template,
             }),
             None,
+            None,
         ),
         model::LoadedModel::Gemma4(m) => (
             Model::Gemma4(Gemma4Model {
@@ -2469,6 +2618,7 @@ pub(crate) fn activate_loaded_model(
                 chat_template: m.chat_template,
             }),
             None,
+            None,
         ),
         model::LoadedModel::Glm52(g) => (
             Model::Glm52(Glm52Model {
@@ -2479,6 +2629,7 @@ pub(crate) fn activate_loaded_model(
                 name: g.name,
                 chat_template: g.chat_template,
             }),
+            None,
             None,
         ),
     }
@@ -2492,7 +2643,11 @@ fn build_app_state(
     mcp: Option<mcp::LoadedMcpConfig>,
     detection: Arc<health::Detection>,
 ) -> AppState {
-    let (model, batcher) = activate_loaded_model(loaded, enable_continuous_batching);
+    let (model, batcher, ceiling) = activate_loaded_model(
+        loaded,
+        enable_continuous_batching,
+        std::env::var("FERROX_MODEL_PATH").ok().as_deref(),
+    );
     // The startup model's admin id is whichever discovered entry sits
     // at the configured path; `None` when it was not discovered (the
     // synthetic fallback, or a path outside the scanned directories),
@@ -2504,6 +2659,7 @@ fn build_app_state(
             id,
             model: Arc::new(model),
             batcher,
+            ceiling,
         }))),
         load_in_progress: std::sync::atomic::AtomicBool::new(false),
         tasks: Arc::new(tasks::TaskRegistry::new()),
@@ -3394,6 +3550,7 @@ mod tests {
                 id: None,
                 model: Arc::new(model),
                 batcher: None,
+                ceiling: None,
             }))),
             load_in_progress: std::sync::atomic::AtomicBool::new(false),
             tasks: Arc::new(tasks::TaskRegistry::new()),
@@ -3471,6 +3628,7 @@ mod tests {
             id: Some(name.to_string()),
             model: Arc::new(named_test_model(name, 256)),
             batcher: None,
+            ceiling: None,
         })
         .tap_into(state)
     }
@@ -3509,9 +3667,16 @@ mod tests {
         assert_eq!(state.active().unwrap().model.name(), "model-b");
         // ...and completely invisible to the request already running.
         assert_eq!(in_flight.model.name(), "model-a");
-        let (_chunks, finish, _usage) =
-            run_generation(&in_flight.model, "hi", &greedy_params(3), None, None, None)
-                .expect("the old model must still decode after being swapped out");
+        let (_chunks, finish, _usage) = run_generation(
+            &in_flight.model,
+            "hi",
+            &greedy_params(3),
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("the old model must still decode after being swapped out");
         assert!(matches!(finish, FinishReason::Length | FinishReason::Stop));
     }
 
@@ -3533,6 +3698,7 @@ mod tests {
             id: Some("model-b".to_string()),
             model: Arc::new(named_test_model("model-b", 256)),
             batcher: None,
+            ceiling: None,
         })));
         drop(previous);
         // The registry has let go; the in-flight request has not.
@@ -4444,17 +4610,66 @@ mod tests {
     #[test]
     fn run_generation_rejects_out_of_vocab_tokens_instead_of_panicking() {
         let model = test_model();
-        let result = run_generation(&model, "hello", &greedy_params(4), None, None, None);
+        let result = run_generation(&model, "hello", &greedy_params(4), None, None, None, None);
         assert!(matches!(
             result,
             Err(generate::DecodeError::TokenOutOfVocab { .. })
         ));
     }
 
+    /// A pool that *could* serve this request but is momentarily fully
+    /// held is the server being behind: 503, and retrying is honest
+    /// advice because the blocks really do come back.
     #[test]
     fn run_generation_honors_an_exhausted_kv_pool_and_maps_it_to_a_503() {
+        let model = test_model(); // 2 layers -> 2 blocks
+        let prompt = String::from_utf8(vec![1u8, 2]).unwrap();
+        let pool = Arc::new(Mutex::new(ferrox_core::cache::KvBlockPool::new(64, 2)));
+
+        let holder_pool = Arc::clone(&pool);
+        let holder = std::thread::spawn(move || {
+            let mut held = ferrox_core::cache::KvCache::with_pool(1, 1, holder_pool, 0).unwrap();
+            held.push(&[0.0], &[0.0]).unwrap(); // crosses into the second block
+            std::thread::sleep(Duration::from_millis(200));
+            drop(held);
+        });
+        std::thread::sleep(Duration::from_millis(15));
+
+        let config = generate::KvPoolConfig {
+            pool,
+            queue_wait: Duration::ZERO,
+        };
+        let result = run_generation(
+            &model,
+            &prompt,
+            &greedy_params(4),
+            Some(&config),
+            None,
+            None,
+            None,
+        );
+        assert!(matches!(
+            result,
+            Err(generate::DecodeError::KvPoolExhausted)
+        ));
+
+        let (status, _body) = decode_error_response(result.unwrap_err());
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        holder.join().unwrap();
+    }
+
+    /// The same endpoint, the same pool size, a request too big for the
+    /// *whole* pool: a 400 rather than a 503, because an idle server
+    /// refuses it identically and `Retry-After` would be a promise
+    /// nothing can keep.
+    ///
+    /// Confirmed to FAIL when `generate`'s `pool_immovable_refusal`
+    /// check is removed: the status comes back 503.
+    #[test]
+    fn a_request_too_big_for_the_whole_pool_is_a_400_not_a_retryable_503() {
         let model = test_model(); // 2 layers
         let prompt = String::from_utf8(vec![1u8, 2]).unwrap();
+        // One block, two layers: no schedule ever serves this.
         let pool = Arc::new(Mutex::new(ferrox_core::cache::KvBlockPool::new(64, 1)));
         let config = generate::KvPoolConfig {
             pool,
@@ -4468,14 +4683,19 @@ mod tests {
             Some(&config),
             None,
             None,
+            None,
         );
-        assert!(matches!(
-            result,
-            Err(generate::DecodeError::KvPoolExhausted)
-        ));
-
-        let (status, _body) = decode_error_response(result.unwrap_err());
-        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        let err = result.expect_err("one block cannot hold two layers' caches");
+        assert!(
+            matches!(
+                &err,
+                generate::DecodeError::KvBudgetExceeded { binding, .. }
+                    if *binding == ferrox_models::Ceiling::DeviceMemory.code()
+            ),
+            "expected an immovable device-memory refusal, got {err:?}"
+        );
+        let (status, _body) = decode_error_response(err);
+        assert_eq!(status, StatusCode::BAD_REQUEST);
     }
 
     /// A full admission queue is the server being behind, not the
@@ -4533,6 +4753,7 @@ mod tests {
             Some(&config),
             None,
             None,
+            None,
         )
         .unwrap();
         assert_eq!(finish, FinishReason::Length);
@@ -4557,7 +4778,7 @@ mod tests {
             let model = Arc::clone(&model);
             let prompt = prompt.clone();
             handles.push(tokio::task::spawn_blocking(move || {
-                run_generation(&model, &prompt, &greedy_params(6), None, None, None).unwrap()
+                run_generation(&model, &prompt, &greedy_params(6), None, None, None, None).unwrap()
             }));
         }
 
@@ -4966,9 +5187,16 @@ mod tests {
         assert_eq!(active.model.tokenizer_kind(), "kimi-tiktoken-bpe");
         assert!(!active.model.is_synthetic());
 
-        let (_chunks, finish, _usage) =
-            run_generation(&active.model, "hi", &greedy_params(5), None, None, None)
-                .expect("a real Kimi checkpoint must generate without error");
+        let (_chunks, finish, _usage) = run_generation(
+            &active.model,
+            "hi",
+            &greedy_params(5),
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("a real Kimi checkpoint must generate without error");
         assert!(matches!(finish, FinishReason::Length | FinishReason::Stop));
     }
 
@@ -5009,6 +5237,7 @@ mod tests {
             &greedy_params(5),
             Some(&kv_pool_config),
             Some(&pc),
+            None,
             None,
         )
         .expect("a real Kimi checkpoint must generate without error");

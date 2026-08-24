@@ -151,8 +151,10 @@ use std::thread::{self, JoinHandle};
 use ferrox_core::cache::KvCache;
 use ferrox_models::sampling::Sampler;
 use ferrox_models::tokenizer::StopTokens;
+use ferrox_models::Ceiling;
 use ferrox_models::Decoder;
-use ferrox_models::{Ceiling, KvElem, KvShape};
+
+use crate::budget::ContextCeiling;
 
 use crate::generate::{DecodeError, FinishReason, GenerationParams, Usage};
 use crate::stop::{StopMatcher, StopStep};
@@ -337,12 +339,12 @@ impl AbortInbox {
 /// gauge without taking a lock, not to make reservation concurrent.
 struct BlockBudget {
     block_size: usize,
-    /// Positions any one request may ask for, or `None`.
-    max_context: Option<usize>,
-    /// What this model's KV really costs, so a refusal can state bytes
-    /// rather than an opaque block count. Priced from the GGUF header
-    /// via `KvShape`, sliding-window cap included.
-    shape: KvShape,
+    /// The per-request context ceiling, *shared* with the private
+    /// `generate` path (see `crate::budget`). Held as an `Arc` rather
+    /// than as a plain limit + shape so the two decode paths cannot
+    /// disagree about where the ceiling is or what a position costs --
+    /// there is one object, one limit, one counter.
+    ceiling: Arc<ContextCeiling>,
     /// `None` means no block budget is configured -- every request is
     /// admissible as far as this ledger is concerned.
     total: Option<usize>,
@@ -352,35 +354,24 @@ struct BlockBudget {
     /// "come back later", the other says "this will never work", and an
     /// operator sent to the wrong one of those tunes the wrong knob.
     rejected_too_large: AtomicU64,
-    /// Requests refused for asking for more context than any single
-    /// request may have. Split again from the above, because the fix is
-    /// in the request rather than on the machine.
-    rejected_context_length: AtomicU64,
 }
 
 impl BlockBudget {
-    fn new(
-        block_size: usize,
-        total: Option<usize>,
-        max_context: Option<usize>,
-        shape: KvShape,
-    ) -> Self {
+    fn new(block_size: usize, total: Option<usize>, ceiling: Arc<ContextCeiling>) -> Self {
         assert!(block_size > 0, "kv block size must be positive");
         BlockBudget {
             block_size,
-            max_context,
-            shape,
+            ceiling,
             total,
             free: AtomicUsize::new(total.unwrap_or(0)),
             rejected_too_large: AtomicU64::new(0),
-            rejected_context_length: AtomicU64::new(0),
         }
     }
 
     /// Prices `positions` of context in real KV bytes, sliding-window
     /// cap included.
     fn bytes_for(&self, positions: usize) -> u64 {
-        self.shape.kv_bytes_for_tokens(positions)
+        self.ceiling.bytes_for(positions)
     }
 
     /// The typed refusal for a request of `positions` tokens, or `None`
@@ -391,22 +382,8 @@ impl BlockBudget {
     /// too small" when the real answer is "your prompt is too long"
     /// sends it to a knob it does not have.
     fn immovable_refusal(&self, positions: usize) -> Option<DecodeError> {
-        if let Some(limit) = self.max_context {
-            if positions > limit {
-                self.rejected_context_length.fetch_add(1, Ordering::Relaxed);
-                return Some(DecodeError::KvBudgetExceeded {
-                    binding: Ceiling::ContextLength.code(),
-                    estimated_bytes: self.bytes_for(positions),
-                    limit_bytes: self.bytes_for(limit),
-                    positions,
-                    positions_limit: limit,
-                    detail: format!(
-                        "request asks for {positions} token positions (prompt + max_tokens) \
-                         but this deployment admits {limit} per request; shorten the prompt \
-                         or lower max_tokens"
-                    ),
-                });
-            }
+        if let Some(err) = self.ceiling.refusal(positions) {
+            return Some(err);
         }
         let total = self.total?;
         let blocks = self.blocks_for(positions);
@@ -784,17 +761,43 @@ impl ContinuousBatcher {
     /// Spawns the worker. Holds `decoder` and a detokenize callback for
     /// the worker's lifetime. Returns the shareable handle; the worker
     /// exits when the last `ContinuousBatcher` clone is dropped.
-    pub fn spawn(decoder: Arc<Decoder>, decode: DecodeFn) -> Self {
-        Self::spawn_with_config(decoder, decode, BatcherConfig::from_env())
-    }
-
-    /// `spawn` with the scheduler knobs passed in rather than read from
-    /// the environment. Tests use this: two tests setting
-    /// `FERROX_CB_*` in one process would race each other.
+    /// Spawns the worker with the scheduler knobs passed in rather than
+    /// read from the environment, building the ceiling from
+    /// `config.max_context` and the decoder's own shape.
+    ///
+    /// Tests use this: two tests setting `FERROX_CB_*` in one process
+    /// would race each other. Production goes through
+    /// [`Self::spawn_with_ceiling`], so the ceiling the batched path
+    /// enforces is the same *object* the private path enforces rather
+    /// than a second copy of the same arithmetic.
+    #[cfg(test)]
     pub fn spawn_with_config(
         decoder: Arc<Decoder>,
         decode: DecodeFn,
         config: BatcherConfig,
+    ) -> Self {
+        let ceiling = Arc::new(ContextCeiling::new(
+            config.max_context,
+            // Prefill runs one token at a time here, so a sliding layer
+            // needs `window + 1 - 1` positions live: chunk = 1.
+            ferrox_models::KvShape::from_config(&decoder.config, ferrox_models::KvElem::F32, 1),
+        ));
+        Self::spawn_with_ceiling(decoder, decode, config, ceiling)
+    }
+
+    /// `spawn_with_config` with the per-request context ceiling handed
+    /// in rather than rebuilt from `config.max_context`.
+    ///
+    /// This is the production entry point. The point of passing the
+    /// `Arc` is that `crate::main` builds exactly one `ContextCeiling`
+    /// for the loaded model and gives it to both the batcher and the
+    /// private `generate` path: a request refused by one is refused by
+    /// the other, priced identically, counted once.
+    pub fn spawn_with_ceiling(
+        decoder: Arc<Decoder>,
+        decode: DecodeFn,
+        config: BatcherConfig,
+        ceiling: Arc<ContextCeiling>,
     ) -> Self {
         let (tx, rx) = mpsc::channel::<Job>();
         let counters = Arc::new(Counters::default());
@@ -802,10 +805,7 @@ impl ContinuousBatcher {
         let budget = Arc::new(BlockBudget::new(
             config.kv_block_size,
             config.kv_blocks,
-            config.max_context,
-            // Prefill runs one token at a time here, so a sliding layer
-            // needs `window + 1 - 1` positions live: chunk = 1.
-            KvShape::from_config(&decoder.config, KvElem::F32, 1),
+            ceiling,
         ));
         let aborts = Arc::new(AbortInbox::default());
         let worker_counters = Arc::clone(&counters);
@@ -854,7 +854,7 @@ impl ContinuousBatcher {
             kv_blocks_free: self.budget.free(),
             kv_block_size: self.budget.block_size,
             kv_rejected_too_large: self.budget.rejected_too_large.load(Ordering::Relaxed),
-            kv_rejected_context_length: self.budget.rejected_context_length.load(Ordering::Relaxed),
+            kv_rejected_context_length: self.budget.ceiling.refused(),
             kv_blocks_peak: self.counters.peak_blocks.load(Ordering::Relaxed),
             aborted: self.aborts.aborted(),
         }
@@ -1732,18 +1732,26 @@ mod tests {
         assert_eq!(got[1], expected[1]);
     }
     /// The KV shape of `tiny_decoder`, for pricing a refusal in bytes.
-    fn test_shape() -> KvShape {
-        KvShape::from_config(&test_dense_fixture(), KvElem::F32, 1)
+    fn test_shape() -> ferrox_models::KvShape {
+        ferrox_models::KvShape::from_config(&test_dense_fixture(), ferrox_models::KvElem::F32, 1)
     }
 
     /// A ledger with no budget configured, for tests that are not
     /// about admission.
     fn no_budget() -> BlockBudget {
-        BlockBudget::new(DEFAULT_KV_BLOCK_SIZE, None, None, test_shape())
+        BlockBudget::new(
+            DEFAULT_KV_BLOCK_SIZE,
+            None,
+            Arc::new(ContextCeiling::new(None, test_shape())),
+        )
     }
 
     fn budget(block_size: usize, total: Option<usize>) -> BlockBudget {
-        BlockBudget::new(block_size, total, None, test_shape())
+        BlockBudget::new(
+            block_size,
+            total,
+            Arc::new(ContextCeiling::new(None, test_shape())),
+        )
     }
 
     fn test_slot(max_tokens: usize, seed: u64) -> (Slot, mpsc::Receiver<JobResult>) {
@@ -2254,10 +2262,10 @@ mod tests {
     /// nothing.
     #[test]
     fn without_ceilings_nothing_is_refused_as_too_large() {
-        let budget = BlockBudget::new(4, None, None, test_shape());
+        let budget = BlockBudget::new(4, None, Arc::new(ContextCeiling::new(None, test_shape())));
         assert!(budget.immovable_refusal(1_000_000).is_none());
         assert_eq!(budget.rejected_too_large.load(Ordering::Relaxed), 0);
-        assert_eq!(budget.rejected_context_length.load(Ordering::Relaxed), 0);
+        assert_eq!(budget.ceiling.refused(), 0);
     }
 
     /// The invariant, under real contention: however many requests are
@@ -2393,8 +2401,7 @@ mod tests {
         let budget = BlockBudget::new(
             config.kv_block_size,
             config.kv_blocks,
-            config.max_context,
-            test_shape(),
+            Arc::new(ContextCeiling::new(config.max_context, test_shape())),
         );
         let queue = QueueGate::new(config.max_queue);
         // Two blocks already out to an in-flight request.
@@ -2472,8 +2479,7 @@ mod tests {
         let budget = BlockBudget::new(
             config.kv_block_size,
             config.kv_blocks,
-            config.max_context,
-            test_shape(),
+            Arc::new(ContextCeiling::new(config.max_context, test_shape())),
         );
         let queue = QueueGate::new(config.max_queue);
         let mut waiting: VecDeque<Job> = VecDeque::new();
@@ -2654,8 +2660,7 @@ mod tests {
         let budget = BlockBudget::new(
             config.kv_block_size,
             config.kv_blocks,
-            config.max_context,
-            test_shape(),
+            Arc::new(ContextCeiling::new(config.max_context, test_shape())),
         );
         let mut carried = HashSet::new();
         let mut waiting = VecDeque::new();
@@ -2710,8 +2715,7 @@ mod tests {
         let budget = BlockBudget::new(
             config.kv_block_size,
             config.kv_blocks,
-            config.max_context,
-            test_shape(),
+            Arc::new(ContextCeiling::new(config.max_context, test_shape())),
         );
         let mut carried = HashSet::new();
         let mut waiting = VecDeque::new();

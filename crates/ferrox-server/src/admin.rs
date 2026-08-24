@@ -568,11 +568,19 @@ fn run_load_task(state: Arc<AppState>, task: Arc<Task>, id: String, path: String
         return;
     }
 
-    let (model, batcher) = crate::activate_loaded_model(loaded, state.continuous_batching_enabled);
+    // The path this task resolved, not `FERROX_MODEL_PATH`: a swapped-in
+    // model must be priced against its own weights, or the new model
+    // would admit on the startup model's arithmetic.
+    let (model, batcher, ceiling) = crate::activate_loaded_model(
+        loaded,
+        state.continuous_batching_enabled,
+        Some(path.as_str()),
+    );
     let previous = state.swap_active(Some(Arc::new(ActiveModel {
         id: Some(id.clone()),
         model: Arc::new(model),
         batcher,
+        ceiling,
     })));
     state.set_last_load_error(None);
     // Dropped here, outside the swap's write lock and after it: any

@@ -311,6 +311,7 @@ fn measure_decoder(decoder: &Decoder, args: &BenchArgs) -> anyhow::Result<Vec<Ro
     }
     for row in &rows {
         bench_guard::check_timed_samples(&row.test, args.reps, row.samples.len())?;
+        bench_guard::check_sample_rates(&row.test, &row.samples)?;
     }
     Ok(rows)
 }
@@ -326,8 +327,31 @@ fn measure_gemma4(engine: &Gemma4Engine, args: &BenchArgs) -> anyhow::Result<Vec
     }
     for row in &rows {
         bench_guard::check_timed_samples(&row.test, args.reps, row.samples.len())?;
+        bench_guard::check_sample_rates(&row.test, &row.samples)?;
     }
     Ok(rows)
+}
+
+/// The engine-side half of the determinism assertion, threaded through
+/// one row's repetitions.
+///
+/// Also where an empty logit vector is caught: a forward pass that
+/// returned nothing cannot be shown to have computed anything, so the
+/// duration it took is not a throughput.
+fn check_result(
+    test: &str,
+    rep: usize,
+    logits: &[f32],
+    first: &mut Option<(usize, f32)>,
+) -> anyhow::Result<()> {
+    let pick = bench_guard::greedy_pick(logits)?.ok_or_else(|| {
+        anyhow::anyhow!(
+            "{test} rep {rep}: the forward pass returned no logits, so it cannot be \
+             shown to have computed anything and its duration is not a throughput"
+        )
+    })?;
+    let seen = *first.get_or_insert(pick);
+    bench_guard::check_same_result(test, rep, seen, pick)
 }
 
 /// Snapshots every layer's KV cache for the guards in `bench_guard`.
@@ -367,6 +391,7 @@ fn bench_prefill(decoder: &Decoder, n_prompt: usize, reps: usize) -> anyhow::Res
     bench_guard::check_prompt_before(&test, n_prompt, &tokens, decoder.config.vocab_size)?;
     let mut out = Vec::with_capacity(reps);
     let mut first_digest: Option<WorkloadDigest> = None;
+    let mut first_result: Option<(usize, f32)> = None;
     for rep in 0..reps + bench_guard::WARMUP_REPS {
         let mut caches = fresh_caches(decoder);
         // Every rep starts from an empty KV: a prefill that reused a
@@ -384,10 +409,6 @@ fn bench_prefill(decoder: &Decoder, n_prompt: usize, reps: usize) -> anyhow::Res
         // the reference engine never does.
         let logits = decoder.forward_batch_last(&tokens, 0, &mut caches);
         let dt = t.elapsed().as_secs_f64();
-        anyhow::ensure!(
-            !logits.is_empty(),
-            "{test}: forward_batch_last returned no logits for a {n_prompt}-token prompt"
-        );
         // The prompt length is asserted AFTER the run too, not only
         // before: an engine that silently truncated the batch would
         // otherwise divide the full token count by a partial run's
@@ -395,6 +416,7 @@ fn bench_prefill(decoder: &Decoder, n_prompt: usize, reps: usize) -> anyhow::Res
         bench_guard::check_prefill_after(&test, n_prompt, &probe(&caches))?;
         let first = *first_digest.get_or_insert(digest);
         bench_guard::check_same_workload(&test, rep, first, digest)?;
+        check_result(&test, rep, &logits, &mut first_result)?;
         // Rep 0 is the warmup: first touch of every weight page, and on
         // Metal the first pipeline compile. Timing it would measure the
         // OS and the shader cache, not the engine.
@@ -423,6 +445,7 @@ fn bench_prefill_gemma4(
     bench_guard::check_prompt_before(&test, n_prompt, &tokens, vocab)?;
     let mut out = Vec::with_capacity(reps);
     let mut first_digest: Option<WorkloadDigest> = None;
+    let mut first_result: Option<(usize, f32)> = None;
     for rep in 0..reps + bench_guard::WARMUP_REPS {
         let mut state = Engine::new_state(engine);
         bench_guard::check_caches_cold(&test, rep, &probe_gemma4(&state))?;
@@ -434,13 +457,10 @@ fn bench_prefill_gemma4(
             logits = Engine::forward_token(engine, tok, i, &mut state);
         }
         let dt = t.elapsed().as_secs_f64();
-        anyhow::ensure!(
-            !logits.is_empty(),
-            "{test}: gemma4 prefill returned no logits for a {n_prompt}-token prompt"
-        );
         bench_guard::check_prefill_after(&test, n_prompt, &probe_gemma4(&state))?;
         let first = *first_digest.get_or_insert(digest);
         bench_guard::check_same_workload(&test, rep, first, digest)?;
+        check_result(&test, rep, &logits, &mut first_result)?;
         if rep >= bench_guard::WARMUP_REPS {
             out.push(n_prompt as f64 / dt);
         }
@@ -457,19 +477,25 @@ fn bench_prefill_gemma4(
 fn bench_decode(decoder: &Decoder, n_gen: usize, reps: usize) -> anyhow::Result<Row> {
     let test = format!("tg{n_gen}");
     let vocab = decoder.config.vocab_size;
-    anyhow::ensure!(vocab > 0, "{test}: model reports a zero-sized vocabulary");
+    let tokens = decode_tokens(vocab, n_gen);
+    // The decode stream gets the same BEFORE check the prompt does. It
+    // is built up front for exactly that reason: a stream generated
+    // inside the timed loop can only be checked once it is too late to
+    // refuse.
+    bench_guard::check_prompt_before(&test, n_gen, &tokens, vocab)?;
     let mut out = Vec::with_capacity(reps);
     let mut first_digest: Option<WorkloadDigest> = None;
+    let mut first_result: Option<(usize, f32)> = None;
     for rep in 0..reps + bench_guard::WARMUP_REPS {
         let mut caches = fresh_caches(decoder);
         bench_guard::check_caches_cold(&test, rep, &probe(&caches))?;
         let _ = decoder.forward_token(0, 0, &mut caches);
         let mut digest = WorkloadDigest::new();
         let t = Instant::now();
-        for i in 0..n_gen {
-            let tok = (i + 1) % vocab;
+        let mut logits = Vec::new();
+        for (i, &tok) in tokens.iter().enumerate() {
             digest.feed(tok);
-            let _ = decoder.forward_token(tok, i + 1, &mut caches);
+            logits = decoder.forward_token(tok, i + 1, &mut caches);
         }
         let dt = t.elapsed().as_secs_f64();
         // One priming token plus n_gen decode steps. A short cache
@@ -477,6 +503,7 @@ fn bench_decode(decoder: &Decoder, n_gen: usize, reps: usize) -> anyhow::Result<
         bench_guard::check_decode_after(&test, n_gen, &probe(&caches))?;
         let first = *first_digest.get_or_insert(digest);
         bench_guard::check_same_workload(&test, rep, first, digest)?;
+        check_result(&test, rep, &logits, &mut first_result)?;
         if rep >= bench_guard::WARMUP_REPS {
             out.push(n_gen as f64 / dt);
         }
@@ -491,24 +518,27 @@ fn bench_decode(decoder: &Decoder, n_gen: usize, reps: usize) -> anyhow::Result<
 fn bench_decode_gemma4(engine: &Gemma4Engine, n_gen: usize, reps: usize) -> anyhow::Result<Row> {
     let test = format!("tg{n_gen}");
     let vocab = Engine::vocab_size(engine);
-    anyhow::ensure!(vocab > 0, "{test}: model reports a zero-sized vocabulary");
+    let tokens = decode_tokens(vocab, n_gen);
+    bench_guard::check_prompt_before(&test, n_gen, &tokens, vocab)?;
     let mut out = Vec::with_capacity(reps);
     let mut first_digest: Option<WorkloadDigest> = None;
+    let mut first_result: Option<(usize, f32)> = None;
     for rep in 0..reps + bench_guard::WARMUP_REPS {
         let mut state = Engine::new_state(engine);
         bench_guard::check_caches_cold(&test, rep, &probe_gemma4(&state))?;
         let _ = Engine::forward_token(engine, 0, 0, &mut state);
         let mut digest = WorkloadDigest::new();
         let t = Instant::now();
-        for i in 0..n_gen {
-            let tok = (i + 1) % vocab;
+        let mut logits = Vec::new();
+        for (i, &tok) in tokens.iter().enumerate() {
             digest.feed(tok);
-            let _ = Engine::forward_token(engine, tok, i + 1, &mut state);
+            logits = Engine::forward_token(engine, tok, i + 1, &mut state);
         }
         let dt = t.elapsed().as_secs_f64();
         bench_guard::check_decode_after(&test, n_gen, &probe_gemma4(&state))?;
         let first = *first_digest.get_or_insert(digest);
         bench_guard::check_same_workload(&test, rep, first, digest)?;
+        check_result(&test, rep, &logits, &mut first_result)?;
         if rep >= bench_guard::WARMUP_REPS {
             out.push(n_gen as f64 / dt);
         }
@@ -534,6 +564,14 @@ fn fresh_caches(decoder: &Decoder) -> Vec<KvCache> {
 fn synthetic_tokens(vocab: usize, n: usize) -> Vec<usize> {
     let vocab = vocab.max(1);
     (0..n).map(|i| (i * 7 + 1) % vocab).collect()
+}
+
+/// The token stream a `tg<N>` row feeds after its priming token, built
+/// before the clock starts so its length can be asserted BEFORE the run
+/// rather than only reconstructed from the KV cache afterwards.
+fn decode_tokens(vocab: usize, n_gen: usize) -> Vec<usize> {
+    let vocab = vocab.max(1);
+    (0..n_gen).map(|i| (i + 1) % vocab).collect()
 }
 
 pub fn active_backend() -> &'static str {
@@ -823,6 +861,48 @@ mod tests {
             (got - (200.0f64 / 3.0).sqrt()).abs() < 1e-9,
             "population stddev expected, got {got}"
         );
+    }
+
+    #[test]
+    fn both_token_streams_satisfy_the_before_check_they_are_handed_to() {
+        // The generators and the guard have to agree, or the BEFORE
+        // check would be a refusal of every run rather than of a bad
+        // one. `vocab` deliberately includes values smaller than the
+        // stream, where the modulo wraps.
+        for &(vocab, n) in &[(49152usize, 512usize), (7, 512), (2, 4), (49152, 1)] {
+            bench_guard::check_prompt_before("pp", n, &synthetic_tokens(vocab, n), vocab).unwrap();
+            bench_guard::check_prompt_before("tg", n, &decode_tokens(vocab, n), vocab).unwrap();
+        }
+    }
+
+    #[test]
+    fn the_decode_stream_is_the_one_the_loop_used_to_generate_inline() {
+        // Hoisting it out of the timed loop must not have changed the
+        // workload: same ids, same order, so digests published before
+        // and after this change still describe the same work.
+        let vocab = 32000;
+        let inline: Vec<usize> = (0..128).map(|i| (i + 1) % vocab).collect();
+        assert_eq!(decode_tokens(vocab, 128), inline);
+    }
+
+    #[test]
+    fn a_repetition_that_returned_no_logits_is_refused_rather_than_timed() {
+        let mut first = None;
+        let err = check_result("pp512", 1, &[], &mut first)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("returned no logits"), "{err}");
+    }
+
+    #[test]
+    fn the_first_repetitions_answer_becomes_the_one_the_rest_must_match() {
+        let mut first = None;
+        check_result("pp512", 0, &[0.1, 0.9, 0.2], &mut first).unwrap();
+        assert_eq!(first, Some((1, 0.9)));
+        // Same answer, different magnitudes: still the same work.
+        check_result("pp512", 1, &[0.2, 0.7, 0.1], &mut first).unwrap();
+        // A different answer from the same token stream is not.
+        assert!(check_result("pp512", 2, &[0.9, 0.1, 0.2], &mut first).is_err());
     }
 
     #[test]

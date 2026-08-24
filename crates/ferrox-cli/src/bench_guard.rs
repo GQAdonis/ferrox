@@ -70,11 +70,33 @@ pub fn check_timed_samples(test: &str, reps: usize, samples: usize) -> anyhow::R
     Ok(())
 }
 
+/// Every timed sample has to be a usable rate.
+///
+/// A repetition whose duration rounded to zero yields `inf` tok/s, and
+/// `inf` sorts to one end of the sample vector, so a single one moves
+/// the median of an even sample count and *is* the median of an odd
+/// one. It would print as `inf` in the same column as measured rows and
+/// render into the ledger as a win.
+pub fn check_sample_rates(test: &str, samples: &[f64]) -> anyhow::Result<()> {
+    if let Some((i, &v)) = samples
+        .iter()
+        .enumerate()
+        .find(|(_, &v)| !v.is_finite() || v <= 0.0)
+    {
+        anyhow::bail!(
+            "{test} rep {i} produced a rate of {v}: the timer measured no elapsed \
+             time, so this is not a throughput. It would still sort into the \
+             median and be published as one."
+        );
+    }
+    Ok(())
+}
+
 /// The prompt length asserted BEFORE the run: the token stream about to
-/// be fed must be exactly as long as the `pp<N>` label promises, and
-/// every id must exist in the vocabulary. An id past the end of the
-/// embedding table is either a panic or a garbage row -- neither is the
-/// workload the row claims to measure.
+/// be fed must be exactly as long as the `pp<N>` (or `tg<N>`) label
+/// promises, and every id must exist in the vocabulary. An id past the
+/// end of the embedding table is either a panic or a garbage row --
+/// neither is the workload the row claims to measure.
 pub fn check_prompt_before(
     test: &str,
     n_prompt: usize,
@@ -228,6 +250,65 @@ pub fn check_same_workload(
          temperature 0, no sampling, no data-dependent token feedback.",
         current.hex(),
         first.hex()
+    );
+    Ok(())
+}
+
+/// The greedy (`temp 0`) next-token pick of a repetition's final
+/// logits: `(id, logit)`.
+///
+/// `None` for an empty slice, so "the engine returned nothing" is
+/// reported as its own failure rather than as a disagreement. A NaN
+/// logit is an error, because it makes "the argmax" a property of the
+/// comparison order rather than of the model.
+pub fn greedy_pick(logits: &[f32]) -> anyhow::Result<Option<(usize, f32)>> {
+    let mut best: Option<(usize, f32)> = None;
+    for (i, &v) in logits.iter().enumerate() {
+        anyhow::ensure!(
+            !v.is_nan(),
+            "logit {i} is NaN: the forward pass did not produce a usable result, \
+             so the time it took is not a throughput"
+        );
+        match best {
+            Some((_, b)) if v <= b => {}
+            _ => best = Some((i, v)),
+        }
+    }
+    Ok(best)
+}
+
+/// The other half of the determinism assertion: identical *input*
+/// leaving the engine is not the same claim as identical *output*
+/// coming back.
+///
+/// [`check_same_workload`] catches a sampler or a data-dependent feed
+/// putting different tokens into repetition 2. It cannot catch the
+/// engine itself computing something different from the same tokens --
+/// a routing decision that depends on a warmed expert cache, a
+/// reduction whose order varies with how work happened to be split, a
+/// kernel that races. Those change what the repetition *did* while
+/// leaving the digest identical, and the median once again averages
+/// unlike things.
+///
+/// Compared on the greedy token id rather than on exact logit bits:
+/// last-bit float differences between two runs of the same kernel are
+/// not the failure being hunted, a different answer is.
+pub fn check_same_result(
+    test: &str,
+    rep: usize,
+    first: (usize, f32),
+    current: (usize, f32),
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        first.0 == current.0,
+        "{test} rep {rep} computed a different answer than the first repetition \
+         from the identical token stream: greedy token {} (logit {}) vs {} (logit \
+         {}). The engine is not deterministic here, so these repetitions measured \
+         different work and their median is not a measurement of either.",
+        current.0,
+        current.1,
+        first.0,
+        first.1
     );
     Ok(())
 }
@@ -469,6 +550,75 @@ mod tests {
         again.feed_all(&[1, 8, 15, 22]);
         assert_eq!(d.hex(), again.hex());
         assert_eq!(d.hex().len(), 16);
+    }
+
+    #[test]
+    fn an_infinite_rate_is_refused_because_it_would_sort_into_the_median() {
+        assert!(check_sample_rates("pp512", &[10.0, 11.0, 12.0]).is_ok());
+        // dt rounded to zero. `inf` is not caught by any length or
+        // cache check -- the work really was done, the clock just did
+        // not see it -- so it needs its own guard.
+        let err = check_sample_rates("pp512", &[10.0, f64::INFINITY])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("rep 1"), "{err}");
+        assert!(err.contains("no elapsed time"), "{err}");
+        assert!(check_sample_rates("pp512", &[10.0, f64::NAN]).is_err());
+        assert!(check_sample_rates("pp512", &[0.0]).is_err());
+        assert!(check_sample_rates("pp512", &[-1.0]).is_err());
+    }
+
+    #[test]
+    fn an_empty_sample_set_is_left_to_the_warmup_accounting() {
+        // check_timed_samples is the guard that owns "a row must have
+        // samples"; this one must not duplicate a worse message for it.
+        assert!(check_sample_rates("pp512", &[]).is_ok());
+        assert!(check_timed_samples("pp512", 3, 0).is_err());
+    }
+
+    #[test]
+    fn greedy_pick_is_the_first_maximum_and_refuses_nan() {
+        assert_eq!(greedy_pick(&[0.1, 0.9, 0.3]).unwrap(), Some((1, 0.9)));
+        assert_eq!(
+            greedy_pick(&[0.9, 0.9]).unwrap(),
+            Some((0, 0.9)),
+            "a tie resolves to the lowest id, as greedy sampling does"
+        );
+        assert_eq!(greedy_pick(&[]).unwrap(), None);
+        let err = greedy_pick(&[0.1, f32::NAN]).unwrap_err().to_string();
+        assert!(err.contains("NaN"), "{err}");
+    }
+
+    #[test]
+    fn an_engine_that_answered_differently_from_the_same_tokens_is_refused() {
+        // The case check_same_workload structurally cannot see: the
+        // token stream is identical, so the digests match, and the
+        // engine still computed something else.
+        let mut a = WorkloadDigest::new();
+        a.feed_all(&[1, 2, 3]);
+        let mut b = WorkloadDigest::new();
+        b.feed_all(&[1, 2, 3]);
+        assert!(check_same_workload("pp512", 2, a, b).is_ok());
+
+        let first = greedy_pick(&[0.1, 0.9, 0.2]).unwrap().unwrap();
+        let second = greedy_pick(&[0.9, 0.1, 0.2]).unwrap().unwrap();
+        let err = check_same_result("pp512", 2, first, second)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("identical token stream"), "{err}");
+        assert!(err.contains("greedy token 0"), "{err}");
+        assert!(err.contains("not deterministic"), "{err}");
+    }
+
+    #[test]
+    fn last_bit_logit_noise_is_not_treated_as_nondeterminism() {
+        // Two runs of the same kernel differing in the last mantissa
+        // bit are not the failure being hunted; a different answer is.
+        // If this ever starts failing, the check has become a source of
+        // false refusals on GPU backends.
+        let first = greedy_pick(&[0.1, 0.9]).unwrap().unwrap();
+        let jittered = greedy_pick(&[0.1, 0.9 + f32::EPSILON]).unwrap().unwrap();
+        assert!(check_same_result("pp512", 2, first, jittered).is_ok());
     }
 
     #[test]

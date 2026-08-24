@@ -1273,11 +1273,29 @@ mod tests {
         let result = speculative_decode(&decoder, &[1usize, 2, 3], 6, &mut kv, &drafter);
 
         let evaluated = &result.evaluated_at_position;
-        for w in evaluated.windows(2) {
+        let accepted = &result.accepted_at_position;
+        assert!(
+            result.drafted_tokens > result.accepted_tokens,
+            "the scenario is pointless unless something was actually rejected \
+             (drafted {}, accepted {})",
+            result.drafted_tokens,
+            result.accepted_tokens
+        );
+        // The sharp invariant: position i+1 is only reached when
+        // position i was accepted, so it can never have been evaluated
+        // more often. Merely checking that the counts are
+        // non-increasing is not enough -- crediting every position of
+        // every proposed block, rejected or not, keeps them
+        // non-increasing (it makes them equal) while reporting an
+        // accept rate that decays with the block size rather than with
+        // the drafter.
+        for (i, &seen) in evaluated.iter().enumerate().skip(1) {
             assert!(
-                w[1] <= w[0],
-                "a later drafted position cannot be evaluated more often than an \
-                 earlier one: {evaluated:?}"
+                seen <= accepted[i - 1],
+                "position {i} was evaluated {seen} times but position {} was only \
+                 accepted {} times: evaluated={evaluated:?} accepted={accepted:?}",
+                i - 1,
+                accepted[i - 1]
             );
         }
         assert_eq!(

@@ -268,6 +268,17 @@ pub struct RecentRequest {
     /// time itself, or the answer came from cache.
     pub decode_ms: Option<f64>,
     pub stream: bool,
+    /// Completion tokens per verification step when this request used
+    /// speculative decoding; `null` when it did not. See
+    /// [`crate::Usage::acceptance_length`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acceptance_length: Option<f64>,
+    /// Accept rate at each position within the draft block. Kept in the
+    /// ring rather than only in the response body because suffix decay
+    /// is a property of the *drafter over time*, and a single request's
+    /// numbers are too few to read it off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub draft_accept_rate_per_position: Option<Vec<f64>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -418,6 +429,8 @@ mod tests {
             duration_ms: 1_100,
             decode_ms: Some(100.0),
             stream: true,
+            acceptance_length: None,
+            draft_accept_rate_per_position: None,
         };
         let json = serde_json::to_value(&recent).unwrap();
         assert_eq!(json["duration_ms"], 1_100);

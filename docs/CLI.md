@@ -83,8 +83,14 @@ Stderr prints load and throughput timings. Generated text goes to stdout.
 **Speculative decoding:** `ferrox speculative` is a prompt-lookup demo.
 It matches n-grams against the history, there is no draft model, and it
 runs on synthetic random weights, so the hit rate it prints tells you
-nothing about a real drafter. `--mtp` is reserved for MiniMax/GLM MTP
-draft heads (`num_nextn_predict_layers`) and errors today.
+nothing about a real drafter. What it does report honestly is acceptance
+length and the per-position accept rate alongside the call counts.
+
+Verification uses the speculative-sampling rejection rule, so it stays
+lossless at any temperature rather than only at `--temp 0`. Real drafters
+plug in through the `Drafter` trait in `ferrox_models::speculative`.
+`--mtp` is reserved for MiniMax/GLM MTP draft heads
+(`num_nextn_predict_layers`) and errors today.
 
 `--device none` (or `cpu`) and `-ngl 0` force CPU. Default is
 `--device auto -ngl auto`. Any positive `-ngl`, `auto`, or `all` enables

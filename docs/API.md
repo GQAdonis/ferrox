@@ -121,11 +121,28 @@ by total wall time reads a 50 tok/s model as 5 tok/s on a long prompt.
 | `time_to_first_token_ms` | prefill start → first token produced |
 | `prompt_per_second`, `predicted_per_second` | per-phase throughput |
 | `cached_tokens` | prompt tokens reused from the KV prefix cache |
+| `acceptance_length` | completion tokens per speculative verification step |
+| `draft_tokens`, `accepted_draft_tokens` | draft tokens evaluated / kept |
+| `draft_accept_rate_per_position` | accept rate at each position in the draft block |
 
 Every timing is optional and **omitted** rather than nulled or zeroed
 when it was not measured (a cached response, a batched decode). Note
 `cached_tokens`: absent means no prefix cache is configured, `0` means
 the cache was consulted and missed.
+
+The four speculation fields are absent unless speculative decoding ran,
+which is not the same statement as `acceptance_length: 1.0` ("it ran and
+never helped"). `draft_accept_rate_per_position` is reported beside the
+mean rather than folded into it: a drafter that is right at the first
+drafted position and useless at the last has the same mean as a
+uniformly mediocre one, and the two call for opposite block sizes.
+`/admin/stats` rows carry `acceptance_length` and
+`draft_accept_rate_per_position` for the same reason.
+
+**Today these fields are always absent**: `ferrox-server` has no
+speculative decode path yet (`ferrox speculative` is a CLI-only demo),
+so nothing populates them. They are the wire contract the engine's
+metrics land on, not evidence that the server speculates.
 
 Streamed requests get the same `usage` object on the final chunk.
 

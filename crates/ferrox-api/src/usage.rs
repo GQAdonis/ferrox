@@ -51,6 +51,29 @@ pub struct Usage {
     /// UI needs to decide whether to show the row at all.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cached_tokens: Option<usize>,
+    /// Completion tokens per verification step when speculative
+    /// decoding ran: the published *acceptance length*. `None` means
+    /// speculation did not run, which is not the same as an acceptance
+    /// length of 1.0 (speculation ran and never helped).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub acceptance_length: Option<f64>,
+    /// Draft tokens the target actually evaluated. Positions after a
+    /// rejection are not counted, so the ratio below tracks the
+    /// drafter's accuracy rather than its block size.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub draft_tokens: Option<usize>,
+    /// Draft tokens accepted.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub accepted_draft_tokens: Option<usize>,
+    /// Accept rate at each position within the draft block, each
+    /// conditional on that position having been reached.
+    ///
+    /// Reported alongside the mean and not folded into it: a drafter
+    /// that is right at position 0 and useless by position 7 has the
+    /// same mean as one that is uniformly mediocre, and the two want
+    /// opposite block sizes. Suffix decay is only visible per position.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub draft_accept_rate_per_position: Option<Vec<f64>>,
 }
 
 impl Usage {
@@ -65,6 +88,10 @@ impl Usage {
             generation_duration_ms: None,
             time_to_first_token_ms: None,
             cached_tokens: None,
+            acceptance_length: None,
+            draft_tokens: None,
+            accepted_draft_tokens: None,
+            draft_accept_rate_per_position: None,
         }
     }
 
@@ -96,6 +123,32 @@ impl Usage {
     /// when a prefix cache actually exists (see `cached_tokens`).
     pub fn with_cached_tokens(mut self, cached: usize) -> Self {
         self.cached_tokens = Some(cached);
+        self
+    }
+
+    /// Records what speculative decoding actually achieved for this
+    /// request. Call this only when speculation ran: leaving the fields
+    /// unset is how a non-speculative request says so, and a zero would
+    /// read as "speculation ran and failed".
+    ///
+    /// `accepted` and `drafted` are token counts, `per_position` the
+    /// accept rate at each position inside the draft block. A zero
+    /// `verification_steps` leaves `acceptance_length` unset rather
+    /// than dividing by zero.
+    pub fn with_speculation(
+        mut self,
+        verification_steps: usize,
+        accepted: usize,
+        drafted: usize,
+        per_position: Vec<f64>,
+    ) -> Self {
+        if verification_steps > 0 {
+            self.acceptance_length =
+                Some(self.completion_tokens as f64 / verification_steps as f64);
+        }
+        self.accepted_draft_tokens = Some(accepted);
+        self.draft_tokens = Some(drafted);
+        self.draft_accept_rate_per_position = Some(per_position);
         self
     }
 }
@@ -147,6 +200,45 @@ mod tests {
             json,
             "{\"prompt_tokens\":2,\"completion_tokens\":3,\"total_tokens\":5}"
         );
+    }
+
+    #[test]
+    fn a_non_speculative_request_reports_no_acceptance_length_at_all() {
+        // `None` and `1.0` mean different things: "speculation did not
+        // run" and "speculation ran and never helped". A UI that saw a
+        // zero or a one on every plain request would report a
+        // speculative decoder that does not exist.
+        let plain = Usage::new(10, 5);
+        assert_eq!(plain.acceptance_length, None);
+        assert_eq!(plain.draft_tokens, None);
+        let json = serde_json::to_value(&plain).unwrap();
+        assert!(json.get("acceptance_length").is_none());
+        assert!(json.get("draft_accept_rate_per_position").is_none());
+    }
+
+    #[test]
+    fn acceptance_length_is_completion_tokens_per_verification_step() {
+        // 12 tokens out of 5 verification steps is an acceptance length
+        // of 2.4 -- the published metric. Dividing by forward passes
+        // including prefill, or by drafted tokens, gives a different
+        // and incomparable number.
+        let usage = Usage::new(20, 12).with_speculation(5, 7, 10, vec![0.9, 0.6, 0.2]);
+        assert_eq!(usage.acceptance_length, Some(2.4));
+        assert_eq!(usage.accepted_draft_tokens, Some(7));
+        assert_eq!(usage.draft_tokens, Some(10));
+        assert_eq!(
+            usage.draft_accept_rate_per_position,
+            Some(vec![0.9, 0.6, 0.2])
+        );
+    }
+
+    #[test]
+    fn speculation_that_verified_nothing_reports_no_length_rather_than_infinity() {
+        let usage = Usage::new(20, 0).with_speculation(0, 0, 0, Vec::new());
+        assert_eq!(usage.acceptance_length, None);
+        // The counters are still reported: speculation was configured,
+        // it just never got to verify anything.
+        assert_eq!(usage.draft_tokens, Some(0));
     }
 
     #[test]

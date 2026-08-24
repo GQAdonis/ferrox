@@ -1060,9 +1060,42 @@ fn main() -> anyhow::Result<()> {
                 result.tokens_per_call()
             );
             println!(
+                "Acceptance length : {} (completion tokens per verification step -- the \
+                 published metric, prefill excluded)",
+                result
+                    .acceptance_length()
+                    .map(|a| format!("{a:.2}"))
+                    .unwrap_or_else(|| "n/a".to_string())
+            );
+            println!(
+                "Draft accept rate : {} ({} accepted / {} evaluated)",
+                result
+                    .accept_rate()
+                    .map(|r| format!("{:.1}%", r * 100.0))
+                    .unwrap_or_else(|| "n/a".to_string()),
+                result.accepted_tokens,
+                result.drafted_tokens
+            );
+            let per_position = result.accept_rate_per_position();
+            if !per_position.is_empty() {
+                // A single mean cannot tell a uniformly mediocre drafter
+                // from one that is right at position 0 and useless by
+                // position k; those want opposite block sizes.
+                let cells: Vec<String> = per_position
+                    .iter()
+                    .zip(result.evaluated_at_position.iter())
+                    .enumerate()
+                    .map(|(i, (rate, seen))| format!("  [{i}] {:.1}% of {seen}", rate * 100.0))
+                    .collect();
+                println!("Per-position accept rate (conditional on reaching the position):");
+                for cell in cells {
+                    println!("{cell}");
+                }
+            }
+            println!(
                 "Calls saved vs. sequential decode: {} (sequential would need exactly {} calls)",
-                max_new_tokens as i64 - result.forward_calls as i64 + 1,
-                max_new_tokens + 1
+                max_new_tokens as i64 - result.forward_calls as i64,
+                max_new_tokens
             );
         }
         Commands::RunKimi {

@@ -3357,8 +3357,44 @@ impl Decoder {
             return Vec::new();
         }
         let batch_size = hiddens.len();
-        let vocab_size = self.output_head.rows();
         let flat: Vec<f32> = hiddens.into_iter().flatten().collect();
+        self.logits_from_flat_hidden(flat, batch_size)
+    }
+
+    /// [`Self::forward_batch`] that also hands back the final-layer
+    /// hidden state for every position instead of dropping it.
+    ///
+    /// `forward_batch` computes these and throws them away; a
+    /// hidden-state-conditioned drafter (EAGLE, MTP, dFlash) needs
+    /// exactly the vector for the last *verified* position, so
+    /// recomputing it would mean running the target model twice for
+    /// something the first pass already had in hand. The extra cost
+    /// here is one copy of `[batch x hidden]`, which is why
+    /// `forward_batch` keeps its move-only path for the prefill case
+    /// that does not want them.
+    ///
+    /// Returns `(logits_per_position, hidden_per_position)`, both
+    /// indexed by position in `tokens`.
+    pub fn forward_batch_with_hidden(
+        &self,
+        tokens: &[usize],
+        start_pos: usize,
+        kv_caches: &mut [KvCache],
+    ) -> (Vec<Vec<f32>>, Vec<Vec<f32>>) {
+        let hiddens = self.forward_hidden_batch(tokens, start_pos, kv_caches);
+        if hiddens.is_empty() {
+            return (Vec::new(), Vec::new());
+        }
+        let batch_size = hiddens.len();
+        let flat: Vec<f32> = hiddens.iter().flatten().copied().collect();
+        (self.logits_from_flat_hidden(flat, batch_size), hiddens)
+    }
+
+    /// The `output_head` half of [`Self::forward_batch`], split out so
+    /// the hidden-state-returning variant cannot drift from it (a
+    /// second copy of the softcap would be a silent quality bug).
+    fn logits_from_flat_hidden(&self, flat: Vec<f32>, batch_size: usize) -> Vec<Vec<f32>> {
+        let vocab_size = self.output_head.rows();
         let mut logits_batch = self.output_head.apply_batch(&flat, batch_size);
         if let Some(sc) = self.config.final_logit_softcap {
             softcap_inplace(&mut logits_batch, sc);

@@ -1009,9 +1009,13 @@ mod tests {
         let result = speculative_decode(&decoder, &prompt, max_new, &mut kv, &speculator);
 
         assert_eq!(result.tokens_generated, max_new);
+        // Plain sequential decode needs exactly `max_new` calls here:
+        // one prefill plus one per token except the last, whose KV is
+        // never needed. Speculation must never need more.
         assert!(
-            result.forward_calls <= max_new + 1,
-            "speculative decode must never need MORE forward_batch calls than plain sequential decode would (calls={}, tokens={})",
+            result.forward_calls <= max_new,
+            "speculative decode must never need MORE forward_batch calls than plain \
+             sequential decode would (calls={}, tokens={})",
             result.forward_calls,
             max_new
         );

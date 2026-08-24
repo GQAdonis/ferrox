@@ -51,8 +51,14 @@ attention and expert routing are all implemented here.
   an error naming what is missing, rather than loading and returning
   fluent text computed the wrong way.
 - **OpenAI-compatible server** with continuous batching, a prefix cache
-  that survives restarts, runtime model swap, and a `/admin` control
-  surface. Point your existing client at it.
+  that survives restarts, runtime model swap, resumable streams that
+  survive a dropped connection, and a `/admin` control surface. Point
+  your existing client at it.
+- **Speculative decoding that stays lossless** at any temperature, not
+  only at `--temp 0`, using the speculative-sampling rejection rule.
+  Acceptance length and the per-position accept rate are reported, so a
+  drafter that decays toward the end of a block is visible rather than
+  averaged away.
 
 ## Install
 

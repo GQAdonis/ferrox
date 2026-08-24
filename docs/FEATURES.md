@@ -88,7 +88,9 @@ and prints the gap, and `--suite` drives every entry in
 
 OpenAI-compatible HTTP API:
 
-- Chat completions (SSE), completions, tokenize / detokenize
+- Chat completions (SSE, optionally resumable: `id:` + `retry:` +
+  `Last-Event-ID` replay and a JSON polling fallback), completions,
+  tokenize / detokenize
 - Decoder embeddings (mean/last pool)
 - Anthropic-shaped `POST /v1/messages` (non-stream text)
 - Presence / frequency penalties, best-effort `json_object`

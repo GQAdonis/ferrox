@@ -97,7 +97,12 @@ use model::ServerTokenizer;
 // `long_about = None`: the rustdoc above is for the library consumer,
 // not for `--help`. Without this clap promotes it to the long help and
 // `ferrox-server --help` opens with a paragraph about clap.
-#[derive(Parser, Debug, Default, Clone)]
+// `PartialEq`/`Eq` are load-bearing, not decoration: ferrox-cli's
+// `serve_parses_the_same_command_line_as_ferrox_server` compares the
+// struct this crate's own argv parser produces against the one clap
+// builds inside `ferrox serve`, which is how flag parity between the
+// two front ends is asserted rather than assumed.
+#[derive(Parser, Debug, Default, Clone, PartialEq, Eq)]
 #[command(
     version,
     about = "OpenAI-compatible Ferrox inference server",
@@ -2575,6 +2580,19 @@ fn startup_model_id() -> Option<String> {
         .map(|d| d.id)
 }
 
+/// Installs the log subscriber, tolerating one that is already there.
+///
+/// `tracing_subscriber::fmt::init()` PANICS when a global subscriber is
+/// already set, and since this became a library that is no longer a
+/// hypothetical: `ferrox serve` runs inside ferrox-cli, whose `main`
+/// installs a subscriber before it has parsed argv and therefore before
+/// it can know the subcommand is `serve`. The standalone binary is
+/// unaffected -- nothing has installed one there, so this still
+/// installs ours.
+fn init_tracing() {
+    let _ = tracing_subscriber::fmt::try_init();
+}
+
 /// Builds the global rayon pool up front, on the main thread, with an
 /// explicit width and QoS (see [`ferrox_core::threads`]).
 ///
@@ -2766,7 +2784,7 @@ pub fn run_server(args: ServerArgs) -> anyhow::Result<()> {
 }
 
 async fn run(mcp_config_path: Option<PathBuf>, exit_on_stdin_close: bool) -> anyhow::Result<()> {
-    tracing_subscriber::fmt::init();
+    init_tracing();
 
     // Fail-closed listener check, before anything else (including
     // loading the model, so a misconfigured bind fails fast rather than
@@ -3334,6 +3352,18 @@ mod tests {
     fn server_args_command_is_internally_consistent() {
         use clap::CommandFactory;
         ServerArgs::command().debug_assert();
+    }
+
+    /// Installing the subscriber has to be idempotent now that this is a
+    /// library: `ferrox serve` runs inside ferrox-cli, which installs
+    /// one before it knows which subcommand it is running, and
+    /// `tracing_subscriber::fmt::init()` panics on the second install.
+    /// A panic there would take down the server *after* the CLI had
+    /// already accepted the command line.
+    #[test]
+    fn installing_the_log_subscriber_twice_does_not_panic() {
+        init_tracing();
+        init_tracing();
     }
 
     #[test]

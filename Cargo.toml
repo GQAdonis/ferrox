@@ -66,3 +66,8 @@ ferrox-core = { version = "0.9.1", path = "crates/ferrox-core" }
 ferrox-moe = { version = "0.9.1", path = "crates/ferrox-moe" }
 ferrox-models = { version = "0.9.1", path = "crates/ferrox-models" }
 ferrox-inference = { version = "0.9.1", path = "crates/ferrox-inference" }
+# Only ferrox-cli depends on this, and only behind its optional `serve`
+# feature. The server's dependency set is a strict superset of the CLI's
+# (+98 crates, +6 MB), so an unconditional dependency would make
+# `cargo install ferrox-cli` compile an HTTP and TLS stack it never runs.
+ferrox-server = { version = "0.9.1", path = "crates/ferrox-server" }

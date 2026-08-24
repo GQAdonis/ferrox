@@ -96,6 +96,9 @@ pub(crate) fn entry(
         duration_ms,
         decode_ms: usage.and_then(|u| u.generation_duration_ms),
         stream,
+        acceptance_length: usage.and_then(|u| u.acceptance_length),
+        draft_accept_rate_per_position: usage
+            .and_then(|u| u.draft_accept_rate_per_position.clone()),
     }
 }
 
@@ -133,6 +136,45 @@ mod tests {
         assert_eq!(e.ttft_ms, None);
         assert_eq!(e.duration_ms, 42);
         assert_eq!(e.prompt_tokens, 0);
+    }
+
+    #[test]
+    fn speculation_metrics_reach_the_admin_ring() {
+        // /admin/stats is where a drafter's behaviour over many
+        // requests is visible; per-position accept rates only mean
+        // something in aggregate, so they have to survive the hop from
+        // the response body into the ring.
+        let usage = ferrox_api::Usage::new(100, 12)
+            .with_timings(1.0, 0.1)
+            .with_speculation(5, 7, 10, vec![0.95, 0.7, 0.4]);
+        let e = entry(
+            "chatcmpl-3",
+            ferrox_api::routes::V1_CHAT_COMPLETIONS,
+            200,
+            false,
+            1_100,
+            Some(&usage),
+        );
+        assert_eq!(e.acceptance_length, Some(2.4));
+        assert_eq!(
+            e.draft_accept_rate_per_position,
+            Some(vec![0.95, 0.7, 0.4]),
+            "the per-position curve is the only way suffix decay shows up"
+        );
+    }
+
+    #[test]
+    fn a_non_speculative_request_leaves_the_acceptance_columns_empty() {
+        let e = entry(
+            "chatcmpl-4",
+            ferrox_api::routes::V1_CHAT_COMPLETIONS,
+            200,
+            false,
+            42,
+            Some(&usage()),
+        );
+        assert_eq!(e.acceptance_length, None);
+        assert_eq!(e.draft_accept_rate_per_position, None);
     }
 
     #[test]

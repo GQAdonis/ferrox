@@ -1209,7 +1209,12 @@ mod simd_x86 {
             x.len()
         );
         let mut acc = 0f32;
-        for (b, block) in row_bytes.as_chunks::<Q8_0_BLOCK_BYTES>().0.enumerate() {
+        for (b, block) in row_bytes
+            .as_chunks::<Q8_0_BLOCK_BYTES>()
+            .0
+            .iter()
+            .enumerate()
+        {
             let scale = f16::from_le_bytes([block[0], block[1]]).to_f32();
             let base = b * Q8_0_BLOCK_ELEMS;
             let qs = &block[2..34];
@@ -1237,7 +1242,12 @@ mod simd_x86 {
         debug_assert_eq!(row_bytes.len() % Q8_0_BLOCK_BYTES, 0);
         debug_assert_eq!(row_bytes.len() / Q8_0_BLOCK_BYTES, act.n_blocks());
         let mut acc = 0f32;
-        for (b, block) in row_bytes.as_chunks::<Q8_0_BLOCK_BYTES>().0.enumerate() {
+        for (b, block) in row_bytes
+            .as_chunks::<Q8_0_BLOCK_BYTES>()
+            .0
+            .iter()
+            .enumerate()
+        {
             let dw = f16::from_le_bytes([block[0], block[1]]).to_f32();
             let base = b * Q8_0_BLOCK_ELEMS;
             let w = _mm256_loadu_si256(block.as_ptr().add(2) as *const __m256i);
@@ -1270,7 +1280,12 @@ mod simd_x86 {
         let low_mask = _mm_set1_epi8(0x0F);
         let bias = _mm_set1_epi8(8);
         let mut acc = 0f32;
-        for (b, block) in row_bytes.as_chunks::<Q4_0_BLOCK_BYTES>().0.enumerate() {
+        for (b, block) in row_bytes
+            .as_chunks::<Q4_0_BLOCK_BYTES>()
+            .0
+            .iter()
+            .enumerate()
+        {
             let dw = f16::from_le_bytes([block[0], block[1]]).to_f32();
             let base = b * Q4_0_BLOCK_ELEMS;
             let qs = _mm_loadu_si128(block.as_ptr().add(2) as *const __m128i);
@@ -1303,7 +1318,12 @@ mod simd_x86 {
         debug_assert_eq!(row_bytes.len() / Q4_K_BLOCK_BYTES, act.n_blocks());
         let low_mask = _mm256_set1_epi8(0x0F_u8 as i8);
         let mut acc = 0f32;
-        for (b, block) in row_bytes.as_chunks::<Q4_K_BLOCK_BYTES>().0.enumerate() {
+        for (b, block) in row_bytes
+            .as_chunks::<Q4_K_BLOCK_BYTES>()
+            .0
+            .iter()
+            .enumerate()
+        {
             let d = f16::from_le_bytes([block[0], block[1]]).to_f32();
             let dmin = f16::from_le_bytes([block[2], block[3]]).to_f32();
             let scales: [u8; Q4_K_SCALE_BYTES] = block[4..16].try_into().unwrap();
@@ -1371,7 +1391,12 @@ mod simd_x86 {
         let low_mask = _mm_set1_epi8(0x0F);
 
         let mut acc = 0f32;
-        for (b, block) in row_bytes.as_chunks::<Q4_0_BLOCK_BYTES>().0.enumerate() {
+        for (b, block) in row_bytes
+            .as_chunks::<Q4_0_BLOCK_BYTES>()
+            .0
+            .iter()
+            .enumerate()
+        {
             let scale = f16::from_le_bytes([block[0], block[1]]).to_f32();
             let base = b * Q4_0_BLOCK_ELEMS;
             let nibbles = _mm_loadu_si128(block.as_ptr().add(2) as *const __m128i);
@@ -1832,7 +1857,12 @@ mod simd_x86 {
     pub unsafe fn dot_q8_1_f32_avx2(row_bytes: &[u8], x: &[f32]) -> f32 {
         debug_assert_eq!(row_bytes.len() % Q8_1_BLOCK_BYTES, 0);
         let mut acc = 0f32;
-        for (b, block) in row_bytes.as_chunks::<Q8_1_BLOCK_BYTES>().0.enumerate() {
+        for (b, block) in row_bytes
+            .as_chunks::<Q8_1_BLOCK_BYTES>()
+            .0
+            .iter()
+            .enumerate()
+        {
             let d = f16::from_le_bytes([block[0], block[1]]).to_f32();
             let base = b * Q8_1_BLOCK_ELEMS;
             let qs = &block[4..36];
@@ -1860,7 +1890,12 @@ mod simd_x86 {
         debug_assert_eq!(row_bytes.len() % Q4_1_BLOCK_BYTES, 0);
         let low_mask = _mm_set1_epi8(0x0F);
         let mut acc = 0f32;
-        for (b, block) in row_bytes.as_chunks::<Q4_1_BLOCK_BYTES>().0.enumerate() {
+        for (b, block) in row_bytes
+            .as_chunks::<Q4_1_BLOCK_BYTES>()
+            .0
+            .iter()
+            .enumerate()
+        {
             let d = f16::from_le_bytes([block[0], block[1]]).to_f32();
             let m = f16::from_le_bytes([block[2], block[3]]).to_f32();
             let base = b * Q4_1_BLOCK_ELEMS;
@@ -1903,7 +1938,12 @@ mod simd_x86 {
     pub unsafe fn dot_q5_0_f32_avx2(row_bytes: &[u8], x: &[f32]) -> f32 {
         debug_assert_eq!(row_bytes.len() % Q5_0_BLOCK_BYTES, 0);
         let mut acc = 0f32;
-        for (b, block) in row_bytes.as_chunks::<Q5_0_BLOCK_BYTES>().0.enumerate() {
+        for (b, block) in row_bytes
+            .as_chunks::<Q5_0_BLOCK_BYTES>()
+            .0
+            .iter()
+            .enumerate()
+        {
             let d = f16::from_le_bytes([block[0], block[1]]).to_f32();
             let qh = u32::from_le_bytes(block[2..6].try_into().unwrap());
             let qs = &block[6..22];
@@ -1938,7 +1978,12 @@ mod simd_x86 {
     pub unsafe fn dot_q5_1_f32_avx2(row_bytes: &[u8], x: &[f32]) -> f32 {
         debug_assert_eq!(row_bytes.len() % Q5_1_BLOCK_BYTES, 0);
         let mut acc = 0f32;
-        for (b, block) in row_bytes.as_chunks::<Q5_1_BLOCK_BYTES>().0.enumerate() {
+        for (b, block) in row_bytes
+            .as_chunks::<Q5_1_BLOCK_BYTES>()
+            .0
+            .iter()
+            .enumerate()
+        {
             let d = f16::from_le_bytes([block[0], block[1]]).to_f32();
             let m = f16::from_le_bytes([block[2], block[3]]).to_f32();
             let qh = u32::from_le_bytes(block[4..8].try_into().unwrap());
@@ -2246,7 +2291,7 @@ mod simd_x86 {
         debug_assert_eq!(row_bytes.len() % crate::IQ1_S_BLOCK_BYTES, 0);
         let mut acc = _mm256_setzero_ps();
         let mut x_base = 0usize;
-        for block in row_bytes.chunks_exact(crate::IQ1_S_BLOCK_BYTES) {
+        for block in row_bytes.as_chunks::<{ crate::IQ1_S_BLOCK_BYTES }>().0 {
             let d = f16::from_le_bytes([block[0], block[1]]).to_f32();
             let qs = &block[2..34];
             let qh = &block[34..50];
@@ -2283,7 +2328,7 @@ mod simd_x86 {
         debug_assert_eq!(row_bytes.len() % crate::IQ2_XXS_BLOCK_BYTES, 0);
         let mut acc = _mm256_setzero_ps();
         let mut x_base = 0usize;
-        for block in row_bytes.chunks_exact(crate::IQ2_XXS_BLOCK_BYTES) {
+        for block in row_bytes.as_chunks::<{ crate::IQ2_XXS_BLOCK_BYTES }>().0 {
             let d = f16::from_le_bytes([block[0], block[1]]).to_f32();
             for ib32 in 0..8 {
                 let g0 = u16::from_le_bytes([block[2 + 8 * ib32], block[3 + 8 * ib32]]);
@@ -2320,7 +2365,7 @@ mod simd_x86 {
         debug_assert_eq!(row_bytes.len() % crate::IQ3_XXS_BLOCK_BYTES, 0);
         let mut acc = _mm256_setzero_ps();
         let mut x_base = 0usize;
-        for block in row_bytes.chunks_exact(crate::IQ3_XXS_BLOCK_BYTES) {
+        for block in row_bytes.as_chunks::<{ crate::IQ3_XXS_BLOCK_BYTES }>().0 {
             let d = f16::from_le_bytes([block[0], block[1]]).to_f32();
             let qs = &block[2..66];
             let sas = &block[66..98];

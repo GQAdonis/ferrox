@@ -11,6 +11,14 @@
 // Rows are keyed by `request_id`, which the server states in the first
 // SSE chunk of the response that produced them, so a chat message and
 // its log line can be joined exactly rather than by a timing heuristic.
+//
+// Two attribution columns, and they are worth different amounts. `key`
+// is a fingerprint of the bearer token that actually authenticated the
+// request — real, checked, and never the token itself. `client` is what
+// the caller SAID it was; this app sends `ferrox-studio` and so could
+// anything else. The screen labels the second one as self-declared
+// rather than dressing it up as identity, because a monitor that
+// overstates what it knows is worse than one that shows less.
 
 import { useCallback, useEffect, useMemo, useState } from "react";
 import {
@@ -136,6 +144,46 @@ const columns = [
     cell: (c) => (isNum(c.getValue()) ? fmtNum(c.getValue()) : "—"),
     meta: { numeric: true },
   }),
+  column.accessor((r) => r.client ?? "", {
+    id: "client",
+    header: "client",
+    cell: (c) =>
+      c.getValue() ? (
+        <span
+          className="font-mono"
+          title="Self-declared by the caller (X-Ferrox-Client). Nothing authenticates it."
+        >
+          {c.getValue()}
+        </span>
+      ) : (
+        <span
+          className="text-faint"
+          title="This caller did not name itself. Ferrox Studio always does, so this request came from something else."
+        >
+          —
+        </span>
+      ),
+  }),
+  column.accessor((r) => r.via_api_key ?? "", {
+    id: "via_api_key",
+    header: "key",
+    cell: (c) =>
+      c.getValue() ? (
+        <span
+          className="font-mono"
+          title="Fingerprint of the key that served this request — not the key, and only comparable within this server run."
+        >
+          {c.getValue()}
+        </span>
+      ) : (
+        <span
+          className="text-faint"
+          title="No Authorization header was presented. On a server started without FERROX_API_KEY that is every request."
+        >
+          —
+        </span>
+      ),
+  }),
 ];
 
 export function ActivityScreen() {
@@ -256,6 +304,20 @@ export function ActivityScreen() {
                     : "—"
                 }
                 hint="Streamed generations decoding at this instant — the ones POST /v1/cancel could stop. Work in progress, not a queue depth: nothing waits in front of a decode here."
+              />
+              <Counter
+                label="queued"
+                value={isNum(stats.queue_depth) ? fmtInt(stats.queue_depth) : "—"}
+                hint="Requests waiting for a decode slot in the continuous-batching scheduler. “—” means there is no queue to measure: without batching every request gets its own thread and nothing waits in front of anything."
+              />
+              <Counter
+                label="queue rejected"
+                value={
+                  isNum(stats.queue_rejected_total)
+                    ? fmtInt(stats.queue_rejected_total)
+                    : "—"
+                }
+                hint="Requests the scheduler's queue turned away because it was full, since this process started."
               />
               <Counter
                 label="last request"
@@ -398,7 +460,14 @@ export function ActivityScreen() {
           <strong className="font-semibold text-muted">tok/s</strong> column is{" "}
           <code className="font-mono">completion_tokens / decode_ms</code> and
           nothing else — dividing by duration is how a fast model gets reported
-          as a slow one, so the two are never combined here.
+          as a slow one, so the two are never combined here.{" "}
+          <strong className="font-semibold text-muted">key</strong> is a
+          fingerprint of the bearer token that served the request — never the
+          token, and comparable only between rows of this server run.{" "}
+          <strong className="font-semibold text-muted">client</strong> is{" "}
+          <em>self-declared</em>: this app sends{" "}
+          <code className="font-mono">ferrox-studio</code> and any other caller
+          could send the same thing, so read it as a label, not as identity.
         </CardFooter>
       </Card>
     </Page>

@@ -122,8 +122,23 @@ export const snippetBase = () => apiBase() || DEFAULT_SERVER_ORIGIN;
 /** The origin THIS app's own requests reach, for error messages. */
 export const baseUrl = () => apiBase() || window.location.origin;
 
+/**
+ * What this app calls itself on every request it makes.
+ *
+ * The server records it on the Activity row (`client`) so a request the
+ * UI made is distinguishable from one an editor made. It is a CLAIM and
+ * nothing else — any client can send this header, nothing authenticates
+ * it, and the Activity screen says so on its face. It is still better
+ * than the alternative, which is inferring "that must have been the UI"
+ * from timing.
+ */
+export const CLIENT_LABEL = "ferrox-studio";
+
 function headers(extra: Record<string, string> = {}): Record<string, string> {
-  const h = { ...extra };
+  const h: Record<string, string> = {
+    ...extra,
+    "X-Ferrox-Client": CLIENT_LABEL,
+  };
   const key = apiKey();
   if (key) h.Authorization = `Bearer ${key}`;
   return h;
@@ -526,6 +541,15 @@ export type StatsRow = {
   ttft_ms?: number | null;
   duration_ms?: number | null;
   decode_ms?: number | null;
+  /**
+   * Fingerprint of the bearer key that served this request, or null
+   * when none was presented. Never the key itself — the server salts it
+   * per process, so it is comparable between rows of one server run and
+   * meaningless anywhere else.
+   */
+  via_api_key?: string | null;
+  /** The caller's SELF-DECLARED label. Not authenticated. */
+  client?: string | null;
 };
 
 export type Stats = {
@@ -537,6 +561,12 @@ export type Stats = {
   tokens_prompt_total?: number | null;
   tokens_generated_total?: number | null;
   generating_now?: number | null;
+  /**
+   * Requests waiting for a decode slot. `null` — not 0 — when continuous
+   * batching is off, because then there is no queue to measure.
+   */
+  queue_depth?: number | null;
+  queue_rejected_total?: number | null;
   last_request_age_seconds?: number | null;
   recent?: StatsRow[];
 };

@@ -41,9 +41,11 @@ attention and expert routing are all implemented here.
   llama.cpp on the same host, same file, same backend, with a checked-in
   receipt. `ferrox bench` refuses to time a run on a machine too busy for
   the number to mean anything.
-- **Refuses what it cannot compute.** A checkpoint needing a graph
-  feature Ferrox lacks is rejected at load rather than run as a
-  different model that returns confident, wrong tokens.
+- **Validated against the reference.** Quant kernels are checked
+  bit-exact against llama.cpp's own dequantization, and `ferrox parity`
+  compares first-token logit distributions with llama.cpp on the same
+  prompt. If a checkpoint needs something Ferrox has not implemented,
+  loading it fails with a reason instead of producing wrong output.
 - **OpenAI-compatible server** with continuous batching, a prefix cache
   that survives restarts, runtime model swap, and a `/admin` control
   surface. Point your existing client at it.

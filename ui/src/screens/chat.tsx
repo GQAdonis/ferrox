@@ -321,12 +321,14 @@ function ChatInner({
   serving,
   refreshServing,
   stall,
+  transport,
 }: {
   sampling: Sampling;
   setSampling: (next: Sampling) => void;
   serving: Loaded;
   refreshServing: () => void;
   stall: string | null;
+  transport: string | null;
 }) {
   const runtime = useFerroxRuntimeContext();
   usePersistedThread(runtime);
@@ -361,7 +363,7 @@ function ChatInner({
         </Button>
       </header>
 
-      {stall || serving.synthetic || disabledReason ? (
+      {stall || transport || serving.synthetic || disabledReason ? (
         <div className="shrink-0 space-y-2 border-b border-line bg-raised/40 px-4 py-2.5">
           {disabledReason ? (
             <Notice tone="warn">
@@ -378,6 +380,7 @@ function ChatInner({
             </Notice>
           ) : null}
           {stall ? <Notice tone="warn">{stall}</Notice> : null}
+          {transport ? <Notice>{transport}</Notice> : null}
         </div>
       ) : null}
 
@@ -414,6 +417,7 @@ export function ChatScreen() {
     health?.health?.model?.id ?? null,
   );
   const [stall, setStall] = useState<string | null>(null);
+  const [transport, setTransport] = useState<string | null>(null);
 
   const samplingRef = useLatest(sampling);
   const servingRef = useLatest(serving);
@@ -439,6 +443,19 @@ export function ChatScreen() {
               "a proxy between you and the server may be buffering text/event-stream. " +
               "Stop cancels it on the server, not just here.",
       ),
+    // Recovery is visible rather than silent. The answer is the same
+    // one either way — the server kept generating into its replay
+    // buffer — but "this is a reconnect" and "this is still the
+    // original connection" are different facts about what just
+    // happened, and only one of them explains a pause.
+    onTransport: (mode) =>
+      setTransport(
+        mode === "stream"
+          ? null
+          : mode === "resumed"
+            ? "The connection dropped. Reconnected and resumed from the last event received — no tokens repeated, none lost."
+            : "Streaming is not getting through, so the rest of this answer is being polled from the server's replay buffer. The generation itself was never interrupted.",
+      ),
   });
 
   return (
@@ -450,6 +467,7 @@ export function ChatScreen() {
           serving={serving}
           refreshServing={refreshServing}
           stall={stall}
+          transport={transport}
         />
       </AssistantRuntimeProvider>
     </RuntimeContext.Provider>

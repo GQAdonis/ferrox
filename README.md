@@ -34,13 +34,16 @@ attention and expert routing are all implemented here.
 - **Quantized end to end.** Weights stay quantized on mmap and
   dequantization happens inside the matmul, so an 8B model fits on a
   laptop. K-quants, the IQ tiers, MXFP4, F16 and BF16.
-- **Mixture-of-experts as a first-class path**, not a dense engine in a
-  costume: GPU routing, indexed expert GEMMs, and residency planning for
-  models larger than VRAM.
-- **Measured, not asserted.** Every speed claim is pinned against
-  llama.cpp on the same host, same file, same backend, with a checked-in
-  receipt. `ferrox bench` refuses to time a run on a machine too busy for
-  the number to mean anything.
+- **Mixture-of-experts gets its own path.** GPU routing, indexed expert
+  GEMMs, and residency planning, so a model larger than your VRAM still
+  runs.
+- **Every speed number is measured.** Each claim comes from a run
+  against llama.cpp on the same host, the same file and the same
+  backend. Every run writes a small JSON file of raw timings, and those
+  files are checked into `benchmarks/receipts/engine/`. The table in
+  [benchmarks/RESULTS.md](benchmarks/RESULTS.md) is generated from them,
+  never typed in by hand. When the machine is too busy for a timing to
+  mean anything, `ferrox bench` stops instead of printing a number.
 - **Validated against the reference.** Quant kernels are checked
   bit-exact against llama.cpp's own dequantization, and `ferrox parity`
   compares first-token logit distributions with llama.cpp on the same
@@ -80,7 +83,8 @@ mkdir -p models
 hf download bartowski/Llama-3.2-3B-Instruct-GGUF \
   Llama-3.2-3B-Instruct-Q4_K_M.gguf --local-dir models
 
-# 2. Run it. The GGUF's own chat template is applied; add --no-cnv for raw completion.
+# 2. Run it. Ferrox matches the GGUF's chat template to a known family and
+#    wraps your prompt in it. Add --no-cnv for a raw completion.
 ferrox -m models/Llama-3.2-3B-Instruct-Q4_K_M.gguf \
   -p "Explain quantization in two sentences" -n 128 -dev metal -ngl all
 
@@ -139,21 +143,26 @@ published separately if you want one rather than the stack:
 
 ## AI full disclosure
 
-This software is developed with strong assistance from Cursor, Grok 4.5, GPT 5.6, and Claude Fable 5, with humans leading the ideas, testing, and debugging. We say this openly because it shaped how the project was built. If you are not happy with AI-developed code, this software is not for you. The acknowledgement below is equally important: this would not exist without [llama.cpp](https://github.com/ggerganov/llama.cpp) and
+This software is developed with strong assistance from Cursor, Grok 4.5,
+GPT 5.6, and Claude Fable 5. Humans lead the ideas, the testing, and the
+debugging. We say this openly because it shaped how the project was
+built. If you are not happy with AI-developed code, this software is not
+for you. The acknowledgement below matters as much: none of this would
+exist without [llama.cpp](https://github.com/ggerganov/llama.cpp) and
 GGML, largely written by hand.
 
 ## Acknowledgements to llama.cpp and GGML
 
-Ferrox does not link against GGML, but it exists thanks to the path
-opened by the llama.cpp project and the kernels, quantization formats,
-GGUF ecosystem, and hard-won engineering knowledge developed there. We
-are thankful and indebted to llama.cpp and its contributors. Their
+Ferrox does not link against GGML. It exists because llama.cpp opened
+the path: the kernels, the quantization formats, the GGUF ecosystem, and
+years of engineering knowledge worked out there in the open. We are
+thankful and indebted to llama.cpp and its contributors. Their
 implementation, kernels, tests, and design choices were an essential
-reference while building this pure-Rust GGUF / MoE inference path. Some
+reference while this pure-Rust GGUF / MoE inference path was built. Some
 source-level pieces are retained or adapted here under the MIT license,
-notably IQ quantization codebook tables, and many other pieces (GGUF
+notably the IQ quantization codebook tables. Many other pieces (GGUF
 layouts, quant/dot semantics, CLI and server conventions) were written
-independently against that public design. For this reason, and because
+independently against that public design. For that reason, and because
 we are genuinely grateful, we keep the GGML authors' copyright notice in
 [docs/THIRD_PARTY_NOTICES.md](docs/THIRD_PARTY_NOTICES.md).
 

@@ -20,6 +20,7 @@
 //! | [`expert_cache`] | which experts stay resident in the GPU expert cache |
 //! | [`radix`] | which prefix of a new prompt is already computed, and what may be evicted |
 //! | [`anchor`] | which position an agentic turn will come back to, and what to keep for it |
+//! | [`window_pool`] | which window-pool slot holds a given position's sliding-window KV |
 //! | [`pool`] | how VRAM is split between the expert cache and the KV pools, and how it is re-split live |
 //! | [`scheduler`] | which requests run this step, how much prefill they get, and who is retracted |
 //! | [`parser`] | where a model's reasoning ends and its answer begins, and which tool it called |
@@ -44,6 +45,7 @@ pub mod pool;
 pub mod qstar;
 pub mod radix;
 pub mod scheduler;
+pub mod window_pool;
 
 pub use anchor::{
     decode_slide, prefill_slide, resolve_anchor_token, snapshot_at_anchor, AnchorSnapshot,
@@ -64,6 +66,8 @@ pub use pool::{plan_cache_budget, validate_rebuild, PoolSizes, RebuildRequest};
 pub use qstar::{
     balanced_fetch, recommend_backend, BandwidthProfile, MoeBackend, QStarPolicy, QStarSplit,
 };
+
+pub use window_pool::{WindowPoolExhausted, WindowSlotPool, NO_SLOT};
 
 pub use scheduler::{
     finish_reason, AdmittedChunk, Capacity, DecodeSet, FinishReason, Geometry, NotAdmitted,

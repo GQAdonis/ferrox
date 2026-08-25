@@ -161,17 +161,17 @@ pub struct GgufLoaded {
     /// than a real checkpoint -- surfaced in `/v1/models` and logged so
     /// nobody mistakes demo output for a real completion.
     pub is_synthetic: bool,
-    /// Detected from the GGUF's own `tokenizer.chat_template` metadata
-    /// (see `crate::chat_template`); `Plain` for the synthetic fallback,
-    /// since there's no real checkpoint to carry one.
-    pub chat_template: crate::chat_template::ChatTemplate,
+    /// Compiled from the GGUF's own `tokenizer.chat_template` metadata
+    /// (see `crate::chat_template`); the role-labeled builtin for the
+    /// synthetic fallback, since there's no real checkpoint to carry one.
+    pub chat_template: crate::chat_template::PromptTemplate,
 }
 
 pub struct KimiLoaded {
     pub engine: KimiEngine,
     pub tokenizer: ferrox_models::kimi_tokenizer::KimiTokenizer,
     pub stop_tokens: StopTokens,
-    pub chat_template: crate::chat_template::ChatTemplate,
+    pub chat_template: crate::chat_template::PromptTemplate,
 }
 
 pub struct MlaLoaded {
@@ -180,7 +180,7 @@ pub struct MlaLoaded {
     pub stop_tokens: StopTokens,
     pub bos_id: Option<usize>,
     pub name: String,
-    pub chat_template: crate::chat_template::ChatTemplate,
+    pub chat_template: crate::chat_template::PromptTemplate,
 }
 
 pub struct Gemma4Loaded {
@@ -189,7 +189,7 @@ pub struct Gemma4Loaded {
     pub stop_tokens: StopTokens,
     pub bos_id: Option<usize>,
     pub name: String,
-    pub chat_template: crate::chat_template::ChatTemplate,
+    pub chat_template: crate::chat_template::PromptTemplate,
 }
 
 pub struct Glm52Loaded {
@@ -198,7 +198,7 @@ pub struct Glm52Loaded {
     pub stop_tokens: StopTokens,
     pub bos_id: Option<usize>,
     pub name: String,
-    pub chat_template: crate::chat_template::ChatTemplate,
+    pub chat_template: crate::chat_template::PromptTemplate,
 }
 
 /// Either real checkpoint shape this server can serve. See this
@@ -254,9 +254,28 @@ pub fn load() -> anyhow::Result<LoadedModel> {
                 stop_tokens: StopTokens::default(),
                 bos_id: None,
                 is_synthetic: true,
-                chat_template: crate::chat_template::ChatTemplate::Plain,
+                chat_template: crate::chat_template::PromptTemplate::plain(),
             }))
         }
+    }
+}
+
+/// The *text* of a token named by an id-valued metadata key.
+///
+/// A chat template prints `{{ bos_token }}` / `{{ eos_token }}` as
+/// strings, and GGUF records those two as ids into
+/// `tokenizer.ggml.tokens` -- so the id has to be resolved back through
+/// the vocabulary before a template can print it. A checkpoint that
+/// names neither simply renders without them, which is what a template
+/// that never prints them expects anyway.
+fn token_text(file: &ShardedGguf, key: &str) -> Option<String> {
+    let id = file.metadata_u64(key)? as usize;
+    let ferrox_gguf::GgufValue::Array(items) = file.metadata("tokenizer.ggml.tokens")? else {
+        return None;
+    };
+    match items.get(id)? {
+        ferrox_gguf::GgufValue::String(s) => Some(s.clone()),
+        _ => None,
     }
 }
 
@@ -315,12 +334,14 @@ fn load_glm52_checkpoint(path: &str, file: &ShardedGguf) -> anyhow::Result<Glm52
         None
     };
     let byte_tokenizer = matches!(tokenizer, ServerTokenizer::Byte);
-    let chat_template = crate::chat_template::ChatTemplate::detect_for_gguf(
+    let chat_template = crate::chat_template::PromptTemplate::from_gguf_metadata(
         file.metadata_str("tokenizer.chat_template"),
         Some(arch.as_str()),
         byte_tokenizer,
+        token_text(file, "tokenizer.ggml.bos_token_id"),
+        token_text(file, "tokenizer.ggml.eos_token_id"),
     );
-    tracing::info!("detected chat template: {chat_template:?}");
+    tracing::info!("chat template: {}", chat_template.describe());
 
     Ok(Glm52Loaded {
         engine,
@@ -361,12 +382,14 @@ fn load_mla_checkpoint(path: &str, file: &ShardedGguf) -> anyhow::Result<MlaLoad
         None
     };
     let byte_tokenizer = matches!(tokenizer, ServerTokenizer::Byte);
-    let chat_template = crate::chat_template::ChatTemplate::detect_for_gguf(
+    let chat_template = crate::chat_template::PromptTemplate::from_gguf_metadata(
         file.metadata_str("tokenizer.chat_template"),
         Some(arch.as_str()),
         byte_tokenizer,
+        token_text(file, "tokenizer.ggml.bos_token_id"),
+        token_text(file, "tokenizer.ggml.eos_token_id"),
     );
-    tracing::info!("detected chat template: {chat_template:?}");
+    tracing::info!("chat template: {}", chat_template.describe());
 
     Ok(MlaLoaded {
         engine,
@@ -408,12 +431,14 @@ fn load_gemma4_checkpoint(path: &str, file: &ShardedGguf) -> anyhow::Result<Gemm
         None
     };
     let byte_tokenizer = matches!(tokenizer, ServerTokenizer::Byte);
-    let chat_template = crate::chat_template::ChatTemplate::detect_for_gguf(
+    let chat_template = crate::chat_template::PromptTemplate::from_gguf_metadata(
         file.metadata_str("tokenizer.chat_template"),
         Some(arch.as_str()),
         byte_tokenizer,
+        token_text(file, "tokenizer.ggml.bos_token_id"),
+        token_text(file, "tokenizer.ggml.eos_token_id"),
     );
-    tracing::info!("detected chat template: {chat_template:?}");
+    tracing::info!("chat template: {}", chat_template.describe());
 
     Ok(Gemma4Loaded {
         engine,
@@ -456,12 +481,14 @@ fn load_real_gguf_checkpoint(path: &str, file: &ShardedGguf) -> anyhow::Result<G
     };
 
     let byte_tokenizer = matches!(tokenizer, ServerTokenizer::Byte);
-    let chat_template = crate::chat_template::ChatTemplate::detect_for_gguf(
+    let chat_template = crate::chat_template::PromptTemplate::from_gguf_metadata(
         file.metadata_str("tokenizer.chat_template"),
         file.metadata_str("general.architecture"),
         byte_tokenizer,
+        token_text(file, "tokenizer.ggml.bos_token_id"),
+        token_text(file, "tokenizer.ggml.eos_token_id"),
     );
-    tracing::info!("detected chat template: {chat_template:?}");
+    tracing::info!("chat template: {}", chat_template.describe());
 
     // Opt-in expert streaming: with FERROX_EXPERT_CACHE_BYTES set (or
     // FERROX_SSD_STREAMING=1, which defaults the cache to 2 GiB),
@@ -568,14 +595,15 @@ pub(crate) fn load_kimi_checkpoint_with_config(
     // Kimi K3's checkpoint carries its chat template as a top-level
     // string field in `tokenizer_config.json` (the real HuggingFace
     // convention), not GGUF metadata -- read it the same way, then
-    // reuse the exact same `ChatTemplate::detect` sniffing logic.
+    // compile it with the same evaluator every other checkpoint uses.
     let chat_template_str = tokenizer_config_text.as_deref().and_then(|text| {
         serde_json::from_str::<serde_json::Value>(text)
             .ok()
             .and_then(|v| v.get("chat_template")?.as_str().map(str::to_string))
     });
-    let chat_template = crate::chat_template::ChatTemplate::detect(chat_template_str.as_deref());
-    tracing::info!("detected chat template: {chat_template:?}");
+    let chat_template =
+        crate::chat_template::PromptTemplate::from_source(chat_template_str.as_deref(), None, None);
+    tracing::info!("chat template: {}", chat_template.describe());
 
     let ferrox_models::config::AttentionKind::KimiHybrid(hybrid) = &model_cfg.attention else {
         anyhow::bail!("kimi_k3() preset must use AttentionKind::KimiHybrid");

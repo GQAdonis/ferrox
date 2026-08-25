@@ -27,9 +27,9 @@
 //! **Some templates open the block in the prompt.** A model whose
 //! prompt already ends in `<think>` never emits the opening marker, so
 //! the parser has to start *inside* the block. That is
-//! `force_reasoning`, and it is derived from the request
-//! ([`crate::effort::resolve_thinking_mode`]) rather than from the
-//! model name, because the same checkpoint does it or does not
+//! `force_reasoning`, and it is read off the rendered prompt
+//! ([`ReasoningFormat::prompt_opens_reasoning`]) rather than guessed
+//! from the model name, because the same checkpoint does it or does not
 //! depending on how the request was rendered.
 //!
 //! Ported 1:1 from FreeToken's `server/reasoning_parser.py`
@@ -121,6 +121,34 @@ impl ReasoningFormat {
             return Some(ReasoningFormat::Gemma4);
         }
         None
+    }
+
+    /// Does a rendered prompt leave the model *inside* a reasoning
+    /// block?
+    ///
+    /// This is the honest way to decide `force_reasoning`: some
+    /// templates open the block in the prompt when thinking is enabled,
+    /// so the model's first token is already reasoning and no opening
+    /// marker will ever arrive. Which templates do that is not
+    /// derivable from the family (Qwen3 does it on one revision and not
+    /// the next) -- but it is plainly *observable* in the text that was
+    /// actually rendered, so this reads that instead of assuming.
+    ///
+    /// A family whose block is always open needs no evidence, and the
+    /// harmony format is not marker-delimited at all, so neither
+    /// consults the prompt.
+    pub fn prompt_opens_reasoning(self, prompt: &str) -> bool {
+        let m = self.markers();
+        if m.always_open {
+            return true;
+        }
+        if m.start.is_empty() {
+            return false;
+        }
+        match prompt.rfind(m.start) {
+            None => false,
+            Some(start) => prompt.rfind(m.end).is_none_or(|end| end < start),
+        }
     }
 
     fn markers(self) -> Markers {
@@ -824,5 +852,26 @@ mod tests {
         let split = parser.parse_complete("<|channel>thought\nmulling<channel|>the answer");
         assert_eq!(split.reasoning, "mulling");
         assert_eq!(split.content, "the answer");
+    }
+
+    /// The whole point of reading the prompt rather than the family:
+    /// the SAME format answers differently depending on what the
+    /// template actually rendered.
+    #[test]
+    fn a_prompt_that_ends_inside_a_think_block_forces_reasoning() {
+        let f = ReasoningFormat::Think;
+        assert!(f.prompt_opens_reasoning("<|im_start|>assistant\n<think>\n"));
+        assert!(!f.prompt_opens_reasoning("<|im_start|>assistant\n"));
+        // A block opened and closed earlier in the conversation is a
+        // replayed turn, not an open one.
+        assert!(
+            !f.prompt_opens_reasoning("<think>past</think>answer<|im_end|><|im_start|>assistant\n")
+        );
+    }
+
+    #[test]
+    fn an_always_open_family_needs_no_evidence_and_harmony_takes_none() {
+        assert!(ReasoningFormat::ThinkAlwaysOpen.prompt_opens_reasoning("anything"));
+        assert!(!ReasoningFormat::GptOss.prompt_opens_reasoning("<think>"));
     }
 }

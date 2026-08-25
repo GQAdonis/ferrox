@@ -405,14 +405,14 @@ pub(crate) struct GgufModel {
     stop_tokens: StopTokens,
     bos_id: Option<usize>,
     is_synthetic: bool,
-    chat_template: chat_template::ChatTemplate,
+    chat_template: chat_template::PromptTemplate,
 }
 
 pub(crate) struct KimiModel {
     engine: KimiEngine,
     tokenizer: KimiTokenizer,
     stop_tokens: StopTokens,
-    chat_template: chat_template::ChatTemplate,
+    chat_template: chat_template::PromptTemplate,
 }
 
 pub(crate) struct MlaModel {
@@ -421,7 +421,7 @@ pub(crate) struct MlaModel {
     stop_tokens: StopTokens,
     bos_id: Option<usize>,
     name: String,
-    chat_template: chat_template::ChatTemplate,
+    chat_template: chat_template::PromptTemplate,
 }
 
 pub(crate) struct Gemma4Model {
@@ -430,7 +430,7 @@ pub(crate) struct Gemma4Model {
     stop_tokens: StopTokens,
     bos_id: Option<usize>,
     name: String,
-    chat_template: chat_template::ChatTemplate,
+    chat_template: chat_template::PromptTemplate,
 }
 
 pub(crate) struct Glm52Model {
@@ -439,17 +439,17 @@ pub(crate) struct Glm52Model {
     stop_tokens: StopTokens,
     bos_id: Option<usize>,
     name: String,
-    chat_template: chat_template::ChatTemplate,
+    chat_template: chat_template::PromptTemplate,
 }
 
 impl Model {
-    pub(crate) fn chat_template(&self) -> chat_template::ChatTemplate {
+    pub(crate) fn chat_template(&self) -> chat_template::PromptTemplate {
         match self {
-            Model::Gguf(m) => m.chat_template,
-            Model::Kimi(m) => m.chat_template,
-            Model::Mla(m) => m.chat_template,
-            Model::Gemma4(m) => m.chat_template,
-            Model::Glm52(m) => m.chat_template,
+            Model::Gguf(m) => m.chat_template.clone(),
+            Model::Kimi(m) => m.chat_template.clone(),
+            Model::Mla(m) => m.chat_template.clone(),
+            Model::Gemma4(m) => m.chat_template.clone(),
+            Model::Glm52(m) => m.chat_template.clone(),
         }
     }
 
@@ -1007,6 +1007,20 @@ struct ChatCompletionRequest {
     tools: Vec<ToolDef>,
     #[serde(default)]
     tool_choice: Option<ToolChoice>,
+    /// The OpenAI extension every reasoning-model deployment actually
+    /// uses: whatever is in here becomes a top-level variable in the
+    /// checkpoint's own chat template, which is how `enable_thinking`
+    /// (Qwen3, gemma-4), `thinking` (DeepSeek) and `reasoning_effort`
+    /// are really driven. Values here can never shadow the structural
+    /// variables (`messages`, `tools`, `add_generation_prompt`) -- see
+    /// `ferrox_models::chat_template::RenderOptions`.
+    #[serde(default)]
+    chat_template_kwargs: Option<serde_json::Map<String, serde_json::Value>>,
+    /// OpenAI's own spelling of the same knob. It is folded into
+    /// `chat_template_kwargs` before rendering, and loses to an explicit
+    /// entry there: a caller who wrote both meant the specific one.
+    #[serde(default)]
+    reasoning_effort: Option<String>,
     /// Server-side conversation history key (see the `session`
     /// module): when set, `messages` is treated as
     /// *only the new turn(s)* to append to this session's stored
@@ -1061,6 +1075,66 @@ impl ChatCompletionRequest {
     fn tools_active(&self) -> bool {
         !self.tools.is_empty()
             && !matches!(&self.tool_choice, Some(ToolChoice::Mode(m)) if m == "none")
+    }
+
+    /// The `chat_template_kwargs` this request actually renders with.
+    ///
+    /// Three rules, all of them from `ferrox-edge`:
+    ///
+    /// * **Thinking follows the tools.** Offering tools turns thinking
+    ///   on even when the caller said nothing, because some encoders
+    ///   emit well-formed tool calls only in thinking mode
+    ///   ([`ferrox_edge::resolve_thinking_mode`]).
+    /// * **Effort is quantized onto what this checkpoint grades.** A
+    ///   template that accepts only the OpenAI triple must not be sent
+    ///   `minimal`; it is mapped to the nearest gear, or dropped when no
+    ///   gear is close enough, rather than interpolated verbatim into
+    ///   the prompt ([`ferrox_edge::sanitize_effort`], against the
+    ///   profile probed at load).
+    /// * **One value, every spelling.** The graded-strength dialect
+    ///   reads `reasoning_strength`; a Jinja template ignores variables
+    ///   it does not declare, so broadcasting costs nothing and removes
+    ///   a per-family routing table
+    ///   ([`ferrox_edge::broadcast_effort_spellings`]).
+    ///
+    /// Every render path has to do this identically -- a request that
+    /// validates against one prompt and generates from another is the
+    /// failure this returns a single value to prevent.
+    fn resolve_template_kwargs(
+        &self,
+        template: &chat_template::PromptTemplate,
+    ) -> serde_json::Map<String, serde_json::Value> {
+        let mut kwargs = self.chat_template_kwargs.clone().unwrap_or_default();
+        if let Some(effort) = &self.reasoning_effort {
+            kwargs
+                .entry("reasoning_effort".to_string())
+                .or_insert_with(|| serde_json::json!(effort));
+        }
+        let offered: Vec<serde_json::Value> = if self.tools_active() {
+            self.tools.iter().map(chat_template::tool_json).collect()
+        } else {
+            Vec::new()
+        };
+        let thinking = ferrox_edge::resolve_thinking_mode(Some(&kwargs), Some(&offered));
+        if thinking == ferrox_edge::ThinkingMode::Thinking {
+            for (k, v) in ferrox_edge::effort::thinking_on_kwargs() {
+                kwargs.entry(k).or_insert(v);
+            }
+        }
+        match ferrox_edge::sanitize_effort(&mut kwargs, template.efforts()) {
+            ferrox_edge::EffortMapping::Mapped(to) => {
+                tracing::debug!("reasoning_effort quantized to {}", to.as_str());
+            }
+            ferrox_edge::EffortMapping::Dropped => {
+                tracing::debug!(
+                    "reasoning_effort dropped: this checkpoint's template grades no gear close \
+                     enough, so its own default applies"
+                );
+            }
+            ferrox_edge::EffortMapping::Unchanged => {}
+        }
+        ferrox_edge::broadcast_effort_spellings(&mut kwargs);
+        kwargs
     }
 
     /// Reject OpenAI fields we do not implement, and `tool_choice`
@@ -1169,18 +1243,10 @@ impl ChatCompletionRequest {
     /// strings (Gemma IT emits `<end_of_turn>` before `<eos>`).
     fn generation_params_for_template(
         &self,
-        template: chat_template::ChatTemplate,
+        template: &chat_template::PromptTemplate,
     ) -> GenerationParams {
         let mut params = self.generation_params();
-        if matches!(
-            template,
-            chat_template::ChatTemplate::Gemma | chat_template::ChatTemplate::Gemma4
-        ) {
-            let stop = match template {
-                chat_template::ChatTemplate::Gemma => "<end_of_turn>",
-                chat_template::ChatTemplate::Gemma4 => "<turn|>",
-                _ => unreachable!(),
-            };
+        if let Some(stop) = template.end_of_turn() {
             if !params.stop.iter().any(|s| s == stop) {
                 params.stop.push(stop.to_string());
             }
@@ -1928,13 +1994,24 @@ pub(crate) fn run_generation(
     ))
 }
 
+/// Render a conversation into the prompt the served checkpoint expects.
+///
+/// Who describes the tools depends on the template: one that reads
+/// `tools` is handed them structurally and owns the whole grammar, and
+/// one that does not gets [`tool_preamble`] as an extra leading system
+/// turn -- this server's original answer, and still the only one
+/// available for a checkpoint whose template never mentions tools.
+///
+/// `extra` is the request's already-sanitized `chat_template_kwargs`
+/// (see [`resolve_template_kwargs`]).
 pub(crate) fn prompt_from_messages(
     messages: &[ChatMessage],
-    template: chat_template::ChatTemplate,
+    template: &chat_template::PromptTemplate,
     tools: &[ToolDef],
-) -> String {
-    if tools.is_empty() {
-        template.render(messages)
+    extra: serde_json::Map<String, serde_json::Value>,
+) -> Result<String, ApiError> {
+    let rendered = if tools.is_empty() || template.handles_tools() {
+        template.render(messages, tools, extra)
     } else {
         let mut with_preamble = Vec::with_capacity(messages.len() + 1);
         with_preamble.push(ChatMessage {
@@ -1944,8 +2021,27 @@ pub(crate) fn prompt_from_messages(
             tool_call_id: None,
         });
         with_preamble.extend_from_slice(messages);
-        template.render(&with_preamble)
-    }
+        template.render(&with_preamble, &[], extra)
+    };
+    rendered.map_err(template_error_response)
+}
+
+/// A template that will not render is a request failure, never a
+/// fallback to a guessed one: serving a checkpoint framing it has never
+/// seen is the exact bug `chat_template` exists to delete, so the
+/// compiler's own message goes back to the caller instead.
+fn template_error_response(err: ferrox_models::chat_template::TemplateError) -> ApiError {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(serde_json::json!({
+            "error": {
+                "message": format!("chat template failed to render: {err}"),
+                "type": "invalid_request_error",
+                "param": "messages",
+                "code": null,
+            }
+        })),
+    )
 }
 
 /// Real, disclosed approach for tool-calling without grammar-
@@ -2029,10 +2125,10 @@ fn tool_call_deltas(
 fn build_response_message(
     text: String,
     tools: &[ToolDef],
-    model_name: &str,
+    posture: output::OutputPosture,
     base_finish: &'static str,
 ) -> (ChatCompletionResponseMessage, &'static str) {
-    let parsed = output::parse_output(&text, tools, model_name);
+    let parsed = output::parse_output(&text, tools, posture);
     let calls: Vec<ToolCallOut> = parsed
         .calls
         .into_iter()
@@ -2205,7 +2301,9 @@ async fn chat_completions_full(
     // halfway through (see `AppState::active`).
     let active = state.require_active()?;
     let history = resolve_history(&state, &req);
-    let prompt = prompt_from_messages(&history, active.model.chat_template(), &req.tools);
+    let template = active.model.chat_template();
+    let kwargs = req.resolve_template_kwargs(&template);
+    let prompt = prompt_from_messages(&history, &template, &req.tools, kwargs)?;
     let key = req.is_cacheable().then(|| req.cache_key(&prompt));
 
     let (completion, cache_status) = if let Some(cached) = key
@@ -2220,7 +2318,7 @@ async fn chat_completions_full(
         let prefix_cache = state.prefix_cache.clone();
         let batcher = active.batcher.clone();
         let ceiling = active.ceiling.clone();
-        let params = req.generation_params_for_template(active.model.chat_template());
+        let params = req.generation_params_for_template(&template);
         let prompt_for_task = prompt.clone();
         let (chunks, finish, usage) = tokio::task::spawn_blocking(move || {
             run_generation(
@@ -2275,7 +2373,7 @@ async fn chat_completions_full(
     let (message, finish_reason) = build_response_message(
         content,
         if tools_active { &req.tools } else { &[] },
-        active.model.name(),
+        output::OutputPosture::resolve(active.model.name(), &prompt),
         completion.finish.as_str(),
     );
 
@@ -2321,7 +2419,9 @@ async fn chat_completions_stream(
     // splice two checkpoints into one completion.
     let active = state.require_active()?;
     let history = resolve_history(&state, &req);
-    let prompt = prompt_from_messages(&history, active.model.chat_template(), &req.tools);
+    let template = active.model.chat_template();
+    let kwargs = req.resolve_template_kwargs(&template);
+    let prompt = prompt_from_messages(&history, &template, &req.tools, kwargs)?;
     let model_name = req.model.clone();
     let session_id = req.session_id.clone();
     let sessions = state.sessions.clone();
@@ -2331,11 +2431,15 @@ async fn chat_completions_stream(
     let prefix_cache = state.prefix_cache.clone();
     let batcher = active.batcher.clone();
     let ceiling = active.ceiling.clone();
-    let mut params = req.generation_params_for_template(active.model.chat_template());
+    let mut params = req.generation_params_for_template(&template);
     let stats_state = Arc::clone(&state);
     // Read now, off the handle this stream will decode against. Read
     // later it would name whatever a swap had made current by then.
     let served_model = active.model.name().to_string();
+    // How to read this stream, fixed before the first token: the family
+    // from the served checkpoint, and whether the prompt that was
+    // actually rendered left the model inside a reasoning block.
+    let posture = output::OutputPosture::resolve(&served_model, &prompt);
     // The offered tools, captured for the terminal parse: the request
     // itself does not outlive the closure that consumes it.
     let offered_tools: Vec<ToolDef> = if tools_active {
@@ -2394,21 +2498,14 @@ async fn chat_completions_stream(
         // terminal flush below, which releases whatever the parser is
         // still withholding against a marker that never arrived.
         let stream_reasoning: Rc<RefCell<Option<ferrox_edge::ReasoningParser>>> =
-            Rc::new(RefCell::new(
-                ferrox_edge::ReasoningFormat::infer(&served_model)
-                    .map(|format| ferrox_edge::ReasoningParser::new(format, false, true)),
-            ));
+            Rc::new(RefCell::new(posture.reasoning_parser()));
         let emit_reasoning = Rc::clone(&stream_reasoning);
         // The tool-call parser, fed whatever the reasoning parser
         // classified as content. Absent when the request offered no
         // tools, in which case marker-looking text is just text.
-        let stream_tools: Rc<RefCell<Option<ferrox_edge::ToolCallParser>>> =
-            Rc::new(RefCell::new(tools_active.then(|| {
-                ferrox_edge::ToolCallParser::new(
-                    ferrox_edge::ToolCallFormat::infer(&served_model),
-                    output::tool_schemas(&offered_tools),
-                )
-            })));
+        let stream_tools: Rc<RefCell<Option<ferrox_edge::ToolCallParser>>> = Rc::new(RefCell::new(
+            tools_active.then(|| posture.tool_call_parser(&offered_tools)),
+        ));
         let emit_tools = Rc::clone(&stream_tools);
         // How many calls have been opened on the wire, so the terminal
         // chunk knows whether to say `tool_calls` and does not repeat
@@ -2573,7 +2670,7 @@ async fn chat_completions_stream(
                 } else {
                     // The batched path had no incremental stream to
                     // ride on, so the whole answer goes out at once.
-                    let parsed = output::parse_output(&full_text, &offered_tools, &served_model);
+                    let parsed = output::parse_output(&full_text, &offered_tools, posture);
                     let tool_calls: Vec<ToolCallDelta> = parsed
                         .calls
                         .iter()
@@ -3854,7 +3951,7 @@ mod tests {
             stop_tokens: StopTokens::default(),
             bos_id: None,
             is_synthetic: true,
-            chat_template: chat_template::ChatTemplate::Plain,
+            chat_template: chat_template::PromptTemplate::plain(),
         })
     }
 
@@ -3882,7 +3979,7 @@ mod tests {
             stop_tokens: StopTokens::default(),
             bos_id: None,
             is_synthetic: true,
-            chat_template: chat_template::ChatTemplate::Plain,
+            chat_template: chat_template::PromptTemplate::plain(),
         })
     }
 
@@ -3973,7 +4070,7 @@ mod tests {
             stop_tokens: StopTokens::default(),
             bos_id: None,
             is_synthetic: true,
-            chat_template: chat_template::ChatTemplate::Plain,
+            chat_template: chat_template::PromptTemplate::plain(),
         })
     }
 
@@ -4983,7 +5080,7 @@ mod tests {
             stop_tokens: StopTokens::default(),
             bos_id: None,
             is_synthetic: false,
-            chat_template: chat_template::ChatTemplate::Plain,
+            chat_template: chat_template::PromptTemplate::plain(),
         });
         let state = Arc::new(test_state(
             model,
@@ -5071,7 +5168,7 @@ mod tests {
         let (message, finish) = build_response_message(
             text.to_string(),
             &[weather_tool_def()],
-            "test-model",
+            output::OutputPosture::for_model("test-model"),
             "stop",
         );
         assert_eq!(finish, "tool_calls");
@@ -5086,7 +5183,7 @@ mod tests {
         let (message, finish) = build_response_message(
             "just an answer".to_string(),
             &[weather_tool_def()],
-            "test-model",
+            output::OutputPosture::for_model("test-model"),
             "stop",
         );
         assert_eq!(finish, "stop");
@@ -5101,7 +5198,7 @@ mod tests {
         let (message, finish) = build_response_message(
             "<tool_call>not valid json at all</tool_call>".to_string(),
             &[weather_tool_def()],
-            "test-model",
+            output::OutputPosture::for_model("test-model"),
             "stop",
         );
         assert_eq!(finish, "stop");
@@ -5115,7 +5212,7 @@ mod tests {
         let (message, finish) = build_response_message(
             "<tool_call>{\"name\": \"ping\", \"arguments\": {}}</tool_call>".to_string(),
             &[weather_tool_def()],
-            "test-model",
+            output::OutputPosture::for_model("test-model"),
             "stop",
         );
         assert_eq!(finish, "stop");
@@ -5128,7 +5225,7 @@ mod tests {
         let (message, finish) = build_response_message(
             "<tool_call>{\"name\": \"get_weather\", \"arguments\": {}}</tool_call>".to_string(),
             &[],
-            "test-model",
+            output::OutputPosture::for_model("test-model"),
             "stop",
         );
         assert_eq!(finish, "stop");
@@ -5233,7 +5330,7 @@ mod tests {
         let (message, finish) = build_response_message(
             "<think>weighing it up</think>The answer is 4.".to_string(),
             &[],
-            "Qwen3-8B",
+            output::OutputPosture::for_model("Qwen3-8B"),
             "stop",
         );
         assert_eq!(finish, "stop");
@@ -5248,7 +5345,7 @@ mod tests {
         let (message, _) = build_response_message(
             "Use the <think> tag like this.".to_string(),
             &[],
-            "llama-3.1-8b",
+            output::OutputPosture::for_model("llama-3.1-8b"),
             "stop",
         );
         assert_eq!(
@@ -5683,6 +5780,152 @@ mod tests {
             req.is_cacheable(),
             "sampling with an explicit seed is deterministic and must be cacheable"
         );
+    }
+
+    /// A template that grades only the OpenAI triple. `raise_exception`
+    /// is how a real one rejects a value it does not know, which is what
+    /// makes the load-time probe able to learn the vocabulary at all.
+    const GRADED: &str = "{% if reasoning_effort %}\
+         {% if reasoning_effort not in ['low','medium','high'] %}\
+           {{ raise_exception('unsupported effort') }}\
+         {% endif %}E:{{ reasoning_effort }}|{% endif %}\
+         {% if enable_thinking %}THINK|{% endif %}{{ messages[0].content }}";
+
+    fn graded_template() -> chat_template::PromptTemplate {
+        chat_template::PromptTemplate::from_gguf_metadata(
+            Some(GRADED),
+            Some("qwen3"),
+            false,
+            None,
+            None,
+        )
+    }
+
+    fn chat_request(value: serde_json::Value) -> ChatCompletionRequest {
+        serde_json::from_value(value).expect("request")
+    }
+
+    /// The acceptance criterion for effort plumbing: an off-vocabulary
+    /// value is quantized onto the nearest gear the checkpoint really
+    /// grades, and the request renders instead of failing.
+    #[test]
+    fn an_off_vocabulary_reasoning_effort_is_quantized_rather_than_interpolated() {
+        let template = graded_template();
+        let req = chat_request(serde_json::json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "reasoning_effort": "minimal",
+        }));
+        let kwargs = req.resolve_template_kwargs(&template);
+        assert_eq!(kwargs["reasoning_effort"], serde_json::json!("low"));
+        let prompt = prompt_from_messages(&req.messages, &template, &[], kwargs).expect("renders");
+        assert!(prompt.starts_with("E:low|"), "{prompt}");
+    }
+
+    /// The other half of the same rule: a value no gear is close enough
+    /// to is dropped, so the checkpoint's own default applies rather
+    /// than an unknown string reaching the prompt.
+    #[test]
+    fn an_effort_with_no_near_gear_is_dropped_so_the_template_default_applies() {
+        let template = graded_template();
+        let req = chat_request(serde_json::json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "chat_template_kwargs": {"reasoning_effort": "none"},
+        }));
+        let kwargs = req.resolve_template_kwargs(&template);
+        assert!(!kwargs.contains_key("reasoning_effort"));
+        let prompt = prompt_from_messages(&req.messages, &template, &[], kwargs).expect("renders");
+        assert_eq!(prompt, "hi");
+    }
+
+    /// `chat_template_kwargs` is the specific spelling and wins over the
+    /// top-level one, which is what a caller who wrote both meant.
+    #[test]
+    fn chat_template_kwargs_wins_over_the_top_level_reasoning_effort() {
+        let template = graded_template();
+        let req = chat_request(serde_json::json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "reasoning_effort": "low",
+            "chat_template_kwargs": {"reasoning_effort": "high"},
+        }));
+        assert_eq!(
+            req.resolve_template_kwargs(&template)["reasoning_effort"],
+            serde_json::json!("high")
+        );
+    }
+
+    /// Offering tools turns thinking on even when the caller asked for
+    /// nothing: some encoders emit well-formed calls only in thinking
+    /// mode.
+    #[test]
+    fn offering_tools_turns_thinking_on_by_itself() {
+        let template = graded_template();
+        let quiet = chat_request(serde_json::json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+        }));
+        assert!(!quiet
+            .resolve_template_kwargs(&template)
+            .contains_key("enable_thinking"));
+
+        let with_tools = chat_request(serde_json::json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{"type": "function", "function": {"name": "get_weather"}}],
+        }));
+        let kwargs = with_tools.resolve_template_kwargs(&template);
+        assert_eq!(kwargs["enable_thinking"], serde_json::json!(true));
+        let prompt =
+            prompt_from_messages(&with_tools.messages, &template, &[], kwargs).expect("renders");
+        assert!(prompt.starts_with("THINK|"), "{prompt}");
+    }
+
+    /// The reason `force_reasoning` could only ever be `false` before:
+    /// no template could open a block in the prompt, because no kwargs
+    /// reached one. Now that they do, the parser has to start inside it
+    /// -- and the evidence is the rendered prompt, not the model name.
+    #[test]
+    fn a_prompt_that_opens_the_reasoning_block_makes_the_first_token_reasoning() {
+        let opener = chat_template::PromptTemplate::from_gguf_metadata(
+            Some("{{ messages[0].content }}{% if enable_thinking %}<think>{% endif %}"),
+            Some("qwen3"),
+            false,
+            None,
+            None,
+        );
+        let req = chat_request(serde_json::json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "chat_template_kwargs": {"enable_thinking": true},
+        }));
+        let kwargs = req.resolve_template_kwargs(&opener);
+        let prompt = prompt_from_messages(&req.messages, &opener, &[], kwargs).expect("renders");
+        assert!(prompt.ends_with("<think>"), "{prompt}");
+
+        // No opening marker will ever arrive, so unparsed this whole
+        // deliberation would have been served as the answer.
+        let posture = output::OutputPosture::resolve("Qwen3-8B", &prompt);
+        let (message, _) = build_response_message(
+            "weighing it up</think>Paris.".to_string(),
+            &[],
+            posture,
+            "stop",
+        );
+        assert_eq!(message.reasoning_content.as_deref(), Some("weighing it up"));
+        assert_eq!(message.content.as_deref(), Some("Paris."));
+
+        // Same text, a prompt that did not open the block: the model
+        // wrote a stray closer and it stays content.
+        let closed = output::OutputPosture::resolve("Qwen3-8B", "<|im_start|>assistant\n");
+        let (message, _) = build_response_message(
+            "weighing it up</think>Paris.".to_string(),
+            &[],
+            closed,
+            "stop",
+        );
+        assert_eq!(message.reasoning_content, None);
     }
 
     #[test]

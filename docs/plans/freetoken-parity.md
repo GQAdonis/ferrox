@@ -24,8 +24,8 @@ todos:
     content: "Remove the exclusivity. Continuous batching is refused today when a KV pool or prefix cache is configured -- 'incompatible with a KV pool or prefix cache' (crates/ferrox-server/src/lib.rs:1376), and the overlap path is disabled for the same reason (:572). That is the current design's honest answer to a real hazard, but it means the two features a serving deployment most wants are mutually exclusive: concurrency OR prefix reuse, never both. Page-granular block sharing is what removes the hazard, which is why this is gated on wire-radix-prefix-cache rather than being its own design. Acceptance: `FERROX_CONTINUOUS_BATCHING=1` with a prefix cache configured starts, serves, and passes the conservation test under concurrency; the refusal string and the two doc comments that explain it are deleted rather than reworded"
     status: pending
   - id: chat-template-kwargs-plumbing
-    content: "The template layer already accepts it: `extra` is documented as 'the OpenAI-extension chat_template_kwargs passthrough' (crates/ferrox-models/src/chat_template.rs:142) with a test that it reaches the template (:1008). The SERVER never sends it -- `crates/ferrox-server/src/output.rs:91` notes the consequence, that no template can open a reasoning block in the prompt, so the reasoning parser can only ever see a block the model opened itself. Plumb `chat_template_kwargs` and `reasoning_effort` from the request, then use the three ferrox-edge pieces that exist for it: `resolve_thinking_mode` (tools force thinking), `sanitize_effort` (quantize onto what the checkpoint accepts), `broadcast_effort_spellings`. Acceptance: a request with `reasoning_effort: minimal` against a checkpoint that grades only the OpenAI triple renders with `low` and does not fail, and `force_reasoning` is derived from the resolved mode rather than hardcoded false"
-    status: pending
+    content: "DONE, and it was bigger than this entry said. The premise was that the template layer already accepted the passthrough and only the server never sent it. Half true: `ferrox_models::chat_template` compiles and evaluates the checkpoint's real Jinja source, and it HAD NO CALLER AT ALL. `ferrox-server` and `ferrox-cli` were each still running their own copy of the marker sniffer -- six hand-written renderers picked by which literal marker the template string happened to contain -- which is why a Mistral checkpoint was being served `user: hi`, `[INST] … [/INST]` matching none of them. So there was nothing to pass kwargs TO. Both binaries now render through the evaluator, and both hand-written copies are deleted rather than deprecated. On top of that: `chat_template_kwargs` and `reasoning_effort` on the request; tools described BY the template when it really consumes them -- established by rendering with and without a tool, not by looking for the word, because a false positive there silently skips the preamble and offers the model tools nobody described (structurally, with a replayed call's `arguments` parsed back to an object, because a template written against HuggingFace's apply_chat_template gets a dict and `| tojson` on the wire string would double-encode it) and by the text preamble when it does not; the effort vocabulary probed ONCE at load rather than per request. `force_reasoning` is no longer hardcoded false -- and it is not derived from the resolved thinking mode either, which would have been a guess: `ReasoningFormat::prompt_opens_reasoning` reads it off the prompt that was actually rendered, because the same checkpoint opens the block or does not depending on what the kwargs rendered. A template that will not compile now FAILS THE REQUEST with the compiler's message instead of falling back to a guessed framing, which is the models module's stated design and the whole point. Acceptance met: `an_off_vocabulary_reasoning_effort_is_quantized_rather_than_interpolated` (minimal against a low/medium/high grader renders `E:low`), plus the drop case, the precedence case, tools-force-thinking, and a prompt-opens-the-block case that reads the same generated text two ways depending on the prompt behind it"
+    status: completed
   - id: think-gears-on-models
     content: "`derive_think_gears` is not ported: `/v1/models` says nothing about whether a checkpoint reasons, at what gears, or which is its default, so a client has to guess. The build order is significant and test-pinned upstream: off (if toggleable), then adaptive (if it has one), then either the effort ladder ascending by scale or a bare 'on'; the default is off/adaptive when the bare render matches one, else the probed effort default, else medium, else the last gear. `ferrox_edge::effort::probe_thinking_profile` already produces the profile this reads. Acceptance: `/v1/models` advertises `supported_reasoning_efforts` and `default_reasoning_effort`, and a checkpoint that grades nothing advertises neither rather than an empty list"
     status: pending
@@ -159,12 +159,15 @@ does not exist.
 ## Phase B — the agent-facing API (no GPU)
 
 Smaller, independent, and each item is worth doing alone. The one with
-the widest blast radius is `chat-template-kwargs-plumbing`: the template
-layer already accepts the passthrough
-(`crates/ferrox-models/src/chat_template.rs:142`, tested at `:1008`) and
-the server never sends it, which is why
-`crates/ferrox-server/src/output.rs:91` has to note that the reasoning
-parser can only ever see a block the model opened itself.
+the widest blast radius was `chat-template-kwargs-plumbing`, and it hit
+wider than expected: the Jinja evaluator in
+`crates/ferrox-models/src/chat_template.rs` had no caller, so both
+`ferrox-server` and `ferrox-cli` were still sniffing the template for
+literal markers and serving every unrecognised family
+(Mistral, Phi, Yi, DeepSeek-R1) a framing it has never seen. Fixing the
+passthrough meant fixing that first; both hand-written copies are now
+deleted. `think-gears-on-models` is the natural next item, because the
+effort profile it needs is already probed at load by the work above.
 
 `radix-on-the-batcher` sits in Phase A but is felt here: continuous
 batching is refused whenever a prefix cache is configured

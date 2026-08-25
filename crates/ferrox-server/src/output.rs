@@ -64,17 +64,63 @@ pub(crate) fn tool_schemas(tools: &[ToolDef]) -> Vec<ToolSchema> {
         .collect()
 }
 
-/// Split generated text.
+/// How this request's output has to be read, resolved once.
 ///
-/// `model_name` is the served checkpoint's name, which is all there is
-/// to infer a family from -- ferrox does not carry a per-checkpoint
-/// parser declaration. A name that implies nothing simply gets no
-/// reasoning parser, which is the right answer for a model that does
-/// not reason: an unconditional `<think>` splitter would silently eat a
-/// literal `<think>` a non-reasoning model wrote in a code block.
-pub(crate) fn parse_output(text: &str, tools: &[ToolDef], model_name: &str) -> ParsedOutput {
-    let (reasoning, remainder) = split_reasoning(text, model_name);
-    let (content, calls) = extract_tool_calls(&remainder, tools, model_name);
+/// Two facts, and they come from different places.
+///
+/// The *format* comes from the served checkpoint's name, which is all
+/// there is to infer a family from -- ferrox does not carry a
+/// per-checkpoint parser declaration. A name that implies nothing simply
+/// gets no reasoning parser, which is the right answer for a model that
+/// does not reason: an unconditional `<think>` splitter would silently
+/// eat a literal `<think>` a non-reasoning model wrote in a code block.
+///
+/// Whether the block is *already open* comes from the prompt that was
+/// actually rendered. Now that `chat_template_kwargs` reaches the
+/// template, a template asked to think can open the reasoning block in
+/// the prompt -- and then the model's first token is reasoning and no
+/// opening marker will ever arrive. Reading it off the rendered text
+/// (`ReasoningFormat::prompt_opens_reasoning`) is the only way to know
+/// that is not a guess about a family.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct OutputPosture {
+    reasoning: Option<ReasoningFormat>,
+    reasoning_open: bool,
+    tools: ToolCallFormat,
+}
+
+impl OutputPosture {
+    pub(crate) fn resolve(model_name: &str, prompt: &str) -> Self {
+        let reasoning = ReasoningFormat::infer(model_name);
+        OutputPosture {
+            reasoning,
+            reasoning_open: reasoning.is_some_and(|f| f.prompt_opens_reasoning(prompt)),
+            tools: ToolCallFormat::infer(model_name),
+        }
+    }
+
+    /// The posture for text with no prompt behind it: a checkpoint's own
+    /// output read on its own terms.
+    #[cfg(test)]
+    pub(crate) fn for_model(model_name: &str) -> Self {
+        Self::resolve(model_name, "")
+    }
+
+    /// A parser positioned where this request's prompt left the model.
+    pub(crate) fn reasoning_parser(&self) -> Option<ReasoningParser> {
+        self.reasoning
+            .map(|format| ReasoningParser::new(format, self.reasoning_open, true))
+    }
+
+    pub(crate) fn tool_call_parser(&self, tools: &[ToolDef]) -> ToolCallParser {
+        ToolCallParser::new(self.tools, tool_schemas(tools))
+    }
+}
+
+/// Split generated text.
+pub(crate) fn parse_output(text: &str, tools: &[ToolDef], posture: OutputPosture) -> ParsedOutput {
+    let (reasoning, remainder) = split_reasoning(text, posture);
+    let (content, calls) = extract_tool_calls(&remainder, tools, posture);
     ParsedOutput {
         reasoning,
         content,
@@ -83,14 +129,10 @@ pub(crate) fn parse_output(text: &str, tools: &[ToolDef], model_name: &str) -> P
 }
 
 /// Cut the chain of thought off the front of the answer.
-fn split_reasoning(text: &str, model_name: &str) -> (Option<String>, String) {
-    let Some(format) = ReasoningFormat::infer(model_name) else {
+fn split_reasoning(text: &str, posture: OutputPosture) -> (Option<String>, String) {
+    let Some(parser) = posture.reasoning_parser() else {
         return (None, text.to_string());
     };
-    // A block the model opened itself is the only kind this server can
-    // see: it does not pass `chat_template_kwargs`, so no template
-    // opens one in the prompt.
-    let parser = ReasoningParser::new(format, false, true);
     let split = parser.parse_complete(text);
     if split.reasoning.is_empty() {
         return (None, split.content);
@@ -109,13 +151,13 @@ fn split_reasoning(text: &str, model_name: &str) -> (Option<String>, String) {
 fn extract_tool_calls(
     text: &str,
     tools: &[ToolDef],
-    model_name: &str,
+    posture: OutputPosture,
 ) -> (String, Vec<ParsedToolCall>) {
     if tools.is_empty() || !ToolCallParser::text_may_contain_call(text) {
         return (text.to_string(), Vec::new());
     }
     let schemas = tool_schemas(tools);
-    let native = ToolCallFormat::infer(model_name);
+    let native = posture.tools;
     let mut formats = vec![native];
     if native != ToolCallFormat::Qwen25 {
         formats.push(ToolCallFormat::Qwen25);
@@ -165,7 +207,7 @@ mod tests {
         let parsed = parse_output(
             "<tool_call>{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Rome\"}}</tool_call>",
             &tools(),
-            "some-random-7b",
+            OutputPosture::for_model("some-random-7b"),
         );
         assert_eq!(parsed.calls.len(), 1);
         assert_eq!(parsed.calls[0].name, "get_weather");
@@ -180,7 +222,7 @@ mod tests {
             "<tool_call><function=get_weather><parameter=city>\nRome\n</parameter>\
              </function></tool_call>",
             &tools(),
-            "Qwen3-Coder-30B",
+            OutputPosture::for_model("Qwen3-Coder-30B"),
         );
         assert_eq!(parsed.calls.len(), 1);
         assert_eq!(parsed.calls[0].name, "get_weather");
@@ -194,7 +236,7 @@ mod tests {
         let parsed = parse_output(
             "<tool_call>{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Oslo\"}}</tool_call>",
             &tools(),
-            "Qwen3-Coder-30B",
+            OutputPosture::for_model("Qwen3-Coder-30B"),
         );
         assert_eq!(parsed.calls.len(), 1);
         assert_eq!(parsed.calls[0].arguments, r#"{"city":"Oslo"}"#);
@@ -209,7 +251,7 @@ mod tests {
              <minimax:tool_call><invoke name=\"get_weather\">\
              <parameter name=\"city\">Rome</parameter></invoke></minimax:tool_call>",
             &tools(),
-            "MiniMax-M2",
+            OutputPosture::for_model("MiniMax-M2"),
         );
         assert_eq!(parsed.reasoning.as_deref(), Some("I need the weather."));
         assert_eq!(parsed.calls.len(), 1);
@@ -224,7 +266,7 @@ mod tests {
             "<tool_call>{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Rome\"}}</tool_call>\n\
              <tool_call>{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Oslo\"}}</tool_call>",
             &tools(),
-            "qwen2.5-7b",
+            OutputPosture::for_model("qwen2.5-7b"),
         );
         assert_eq!(parsed.calls.len(), 2);
         assert_eq!(parsed.calls[1].arguments, r#"{"city":"Oslo"}"#);
@@ -232,7 +274,11 @@ mod tests {
 
     #[test]
     fn a_plain_answer_with_tools_offered_stays_a_plain_answer() {
-        let parsed = parse_output("The weather is fine.", &tools(), "qwen2.5-7b");
+        let parsed = parse_output(
+            "The weather is fine.",
+            &tools(),
+            OutputPosture::for_model("qwen2.5-7b"),
+        );
         assert!(parsed.calls.is_empty());
         assert_eq!(parsed.content, "The weather is fine.");
         assert_eq!(parsed.reasoning, None);
@@ -245,7 +291,7 @@ mod tests {
         let parsed = parse_output(
             "<think>The user wants weather. I should just say it.</think>It is sunny.",
             &[],
-            "Qwen3-8B",
+            OutputPosture::for_model("Qwen3-8B"),
         );
         assert_eq!(
             parsed.reasoning.as_deref(),
@@ -261,7 +307,7 @@ mod tests {
         let parsed = parse_output(
             "Use the tag <think> like this.",
             &[],
-            "llama-3.1-8b-instruct",
+            OutputPosture::for_model("llama-3.1-8b-instruct"),
         );
         assert_eq!(parsed.reasoning, None);
         assert_eq!(parsed.content, "Use the tag <think> like this.");
@@ -275,7 +321,7 @@ mod tests {
             "<think>I need the weather.</think>\
              <tool_call>{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Rome\"}}</tool_call>",
             &tools(),
-            "Qwen3-8B",
+            OutputPosture::for_model("Qwen3-8B"),
         );
         assert_eq!(parsed.reasoning.as_deref(), Some("I need the weather."));
         assert_eq!(parsed.calls.len(), 1);
@@ -287,7 +333,7 @@ mod tests {
         let parsed = parse_output(
             "<tool_call>{\"name\": \"rm_rf\", \"arguments\": {}}</tool_call>",
             &tools(),
-            "qwen2.5-7b",
+            OutputPosture::for_model("qwen2.5-7b"),
         );
         assert!(parsed.calls.is_empty());
     }

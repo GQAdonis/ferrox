@@ -1,374 +1,591 @@
-//! Real chat-template rendering, replacing a naive newline-join of
-//! message contents that ignored `role` entirely (see this module's use
-//! in `main.rs::prompt_from_messages`).
+//! The served checkpoint's own chat template, evaluated.
 //!
-//! GGUF files commonly carry a `tokenizer.chat_template` metadata string
-//! -- the same Jinja2 template a real HuggingFace `tokenizer_config.json`
-//! ships, describing exactly how a chat-tuned model expects its
-//! conversation history formatted. Implementing a full Jinja2 evaluator
-//! is out of scope here (a real, disclosed scope decision, not an
-//! oversight): instead, this recognizes the
-//! template string's real, distinctive markers and renders using a
-//! small set of hand-written templates for the conventions those
-//! markers actually correspond to, falling back to ChatML for real GGUF
-//! checkpoints whose `tokenizer.chat_template` metadata is missing or
-//! empty (matching llama.cpp `--jinja`), or plain role-labeled format for
-//! byte/synthetic tokenizers and unrecognized custom templates.
+//! # What this replaced
 //!
-//! This directly closes a real, verified root cause of degenerate
-//! chat-model output (found serving TinyLlama-1.1B-Chat end to end):
-//! without correct role structure, a chat-tuned model never sees input
-//! shaped anything like what it was trained on.
+//! This module used to *sniff* `tokenizer.chat_template` for literal
+//! markers -- `<|im_start|>`, `<|start_header_id|>`, `<start_of_turn>`
+//! -- and pick one of six hand-written renderers. That was a disclosed
+//! scope decision when there was no Jinja evaluator in the workspace.
+//! There is one now (`ferrox_models::chat_template`, which compiles the
+//! checkpoint's real template with minijinja), and it had no caller, so
+//! the server was still serving Mistral-Instruct `user: hi` because
+//! `[INST] … [/INST]` matches none of those markers. The sniffer's three
+//! silent failure modes are written up in that module's doc comment; all
+//! three are gone here by construction, because the template is now
+//! evaluated rather than recognised.
 //!
-//! Per-message rendering goes through `ChatMessage::rendered_content`
-//! (`main.rs`), not the raw `content` field directly: an assistant
-//! message replayed from tool-calling conversation history (see
-//! `main.rs`'s tool-calling support) carries its past tool calls in
-//! `tool_calls`, not `content`, and needs re-rendering as the same
-//! `<tool_call>{...}</tool_call>` marker text a model is asked to
-//! produce for a *new* call, so a multi-turn tool conversation looks
-//! consistent to the model regardless of which turn it's replaying.
+//! # What this adds on top of it
+//!
+//! Three things the evaluator deliberately leaves to its caller:
+//!
+//! 1. **Message shape.** [`PromptTemplate::render`] converts the
+//!    server's `ChatMessage` into the OpenAI-shaped JSON a real template
+//!    reads (`message.role`, `message.content`, `message.tool_calls`,
+//!    `message.tool_call_id`).
+//! 2. **Who describes the tools.** A template that really consumes
+//!    `tools` -- established by rendering with and without one, not by
+//!    looking for the word -- gets them as structured JSON and owns the
+//!    whole tool grammar. A template that does not gets the text
+//!    preamble this server has always used (`tool_preamble` in
+//!    `lib.rs`), and replayed calls are folded back into `content` as
+//!    the same `<tool_call>{…}</tool_call>` marker text the preamble
+//!    asks for -- so a conversation looks consistent to the model on
+//!    every turn regardless of which half of that split it lands in.
+//! 3. **The effort vocabulary.** Probed once at load
+//!    ([`ferrox_edge::probe_effort_profile`]) rather than per request,
+//!    because it costs ~30 renders and never changes for a checkpoint.
+//!
+//! Both probes run once, at load, which is what lets them be renders
+//! rather than guesses.
+//!
+//! # End of turn
+//!
+//! [`PromptTemplate::end_of_turn`] survives the sniffer, and only that.
+//! Gemma IT emits `<end_of_turn>` before `<eos>`, so a served Gemma
+//! needs that string in its stop set no matter how the prompt was
+//! rendered. It is a property of the *family*, not of the render, which
+//! is why one literal marker test is all that is left of the six.
 
-use crate::ChatMessage;
+use std::sync::Arc;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ChatTemplate {
-    /// `<|im_start|>{role}\n{content}<|im_end|>\n`, repeated per
-    /// message, ending with `<|im_start|>assistant\n` -- the ChatML
-    /// convention (Qwen, and many other chat-tuned models).
-    ChatMl,
-    /// `<|{role}|>\n{content}\n`, repeated per message, ending with
-    /// `<|assistant|>\n` -- TinyLlama-Chat's and Zephyr's real
-    /// convention (no closing/end-of-turn marker per message).
-    GenericRoleMarkers,
-    /// `<|start_header_id|>{role}<|end_header_id|>\n\n{content}<|eot_id|>`,
-    /// repeated per message, ending with
-    /// `<|start_header_id|>assistant<|end_header_id|>\n\n` -- the real
-    /// Llama 3/3.1/3.2-Instruct convention. Found via a real gap: a real
-    /// Llama-3.1-8B-Instruct GGUF's `tokenizer.chat_template` metadata
-    /// (fetched directly from the file, not guessed) uses this exact
-    /// convention, but neither `<|im_start|>` nor bare `<|user|>`/
-    /// `<|assistant|>` markers appear in it, so it silently fell through
-    /// to `Plain` -- the real, verified root cause of a real end-to-end
-    /// test producing degenerate repetition even though a real chat
-    /// template was present in the file the whole time. This
-    /// implementation skips the real template's auto-injected system
-    /// preamble (knowledge-cutoff/today's-date boilerplate, tool-calling
-    /// scaffolding) -- a disclosed simplification, not a silent one --
-    /// and renders only the structurally-important per-turn
-    /// header/eot_id framing that actually determines output quality.
-    Llama3,
-    /// Gemma 1/2/3 Instruct: `<start_of_turn>user\n{content}<end_of_turn>\n`
-    /// (assistant role rendered as `model`), ending with
-    /// `<start_of_turn>model\n`. BOS is *not* emitted here -- the
-    /// server's `bos_id` prepending in `generate` owns that, matching
-    /// the GGUF template's leading `{{ bos_token }}`.
-    Gemma,
-    /// Gemma-4 Instruct: `<|turn>{role}\n{content}<turn|>\n`, with
-    /// `assistant` rendered as `model`, ending with `<|turn>model\n`.
-    /// GGUF `eos_token_id` is `<turn|>` (end-of-turn), so chat stop
-    /// aligns with that id once the generation prompt is correct.
-    Gemma4,
-    /// `{role}: {content}`, one per line, no special tokens at all --
-    /// used when the GGUF carries no `tokenizer.chat_template` (or an
-    /// unrecognized one), matching the plain completion-style behavior
-    /// this server has always had for such checkpoints.
-    Plain,
+use ferrox_edge::{probe_effort_profile, EffortProfile};
+use ferrox_models::chat_template::{
+    BuiltinTemplate, ChatTemplate as JinjaTemplate, RenderOptions, TemplateError,
+};
+use serde_json::{json, Map, Value};
+
+use crate::{ChatMessage, ToolDef};
+
+/// Everything the server needs to turn a conversation into a prompt.
+///
+/// Cheap to clone: every `*Loaded` struct carries one and hands it to
+/// each request.
+#[derive(Clone)]
+pub(crate) struct PromptTemplate {
+    inner: Arc<Inner>,
 }
 
-impl ChatTemplate {
-    /// Sniffs a GGUF's real `tokenizer.chat_template` Jinja2 string for
-    /// distinctive literal markers, rather than evaluating it as Jinja2.
-    /// Unrecognized non-empty templates yield `Plain`.
-    pub fn detect(chat_template: Option<&str>) -> Self {
-        match chat_template {
-            Some(t) if t.contains("<|im_start|>") => ChatTemplate::ChatMl,
-            Some(t) if t.contains("<|start_header_id|>") => ChatTemplate::Llama3,
-            Some(t) if t.contains("<|user|>") || t.contains("<|assistant|>") => {
-                ChatTemplate::GenericRoleMarkers
-            }
-            Some(t) if t.contains("<start_of_turn>") => ChatTemplate::Gemma,
-            Some(t) if t.contains("<|turn>") || t.contains("<turn|>") => ChatTemplate::Gemma4,
-            _ => ChatTemplate::Plain,
-        }
-    }
+struct Inner {
+    template: JinjaTemplate,
+    end_of_turn: Option<&'static str>,
+    bos_token: Option<String>,
+    eos_token: Option<String>,
+    efforts: EffortProfile,
+    handles_tools: bool,
+}
 
-    /// Like [`Self::detect`], but when `tokenizer.chat_template` is missing
-    /// or empty, match llama.cpp `--jinja` / `common/chat.cpp`: real GGUF
-    /// checkpoints default to ChatML (`CHATML_TEMPLATE_SRC`). Keep
-    /// [`Plain`] for byte tokenizers and synthetic server fallbacks.
-    pub fn detect_for_gguf(
-        chat_template: Option<&str>,
+impl std::fmt::Debug for PromptTemplate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "PromptTemplate({})", self.inner.template.describe())
+    }
+}
+
+impl PromptTemplate {
+    /// The load-time entry point for a GGUF: compile whatever
+    /// `tokenizer.chat_template` holds, or fall back to a builtin when
+    /// the checkpoint ships none at all (llama.cpp `--jinja` defaults to
+    /// ChatML the same way).
+    pub(crate) fn from_gguf_metadata(
+        source: Option<&str>,
         arch: Option<&str>,
         byte_tokenizer: bool,
+        bos_token: Option<String>,
+        eos_token: Option<String>,
     ) -> Self {
-        match chat_template.filter(|t| !t.is_empty()) {
-            Some(t) => Self::detect(Some(t)),
-            None if byte_tokenizer || arch.is_none() => Self::Plain,
-            None => Self::ChatMl,
+        Self::build(
+            JinjaTemplate::from_gguf_metadata(source, arch, byte_tokenizer),
+            source,
+            bos_token,
+            eos_token,
+        )
+    }
+
+    /// For checkpoints that carry their template outside GGUF metadata
+    /// -- Kimi K3 keeps it as a top-level string in
+    /// `tokenizer_config.json`, the real HuggingFace convention.
+    pub(crate) fn from_source(
+        source: Option<&str>,
+        bos_token: Option<String>,
+        eos_token: Option<String>,
+    ) -> Self {
+        Self::build(
+            JinjaTemplate::from_gguf_metadata(source, None, false),
+            source,
+            bos_token,
+            eos_token,
+        )
+    }
+
+    /// Role-labeled lines, no special tokens: the synthetic-weights demo
+    /// path, where there is no real vocabulary for markers to live in.
+    pub(crate) fn plain() -> Self {
+        Self::build(
+            JinjaTemplate::builtin(BuiltinTemplate::Plain),
+            None,
+            None,
+            None,
+        )
+    }
+
+    fn build(
+        template: JinjaTemplate,
+        source: Option<&str>,
+        bos_token: Option<String>,
+        eos_token: Option<String>,
+    ) -> Self {
+        let (bos, eos) = (bos_token.as_deref(), eos_token.as_deref());
+        let efforts = probe_efforts(&template, bos, eos);
+        let handles_tools = probe_tools_consumed(&template, bos, eos);
+        Self {
+            inner: Arc::new(Inner {
+                end_of_turn: end_of_turn_marker(source),
+                template,
+                bos_token,
+                eos_token,
+                efforts,
+                handles_tools,
+            }),
         }
     }
 
-    /// Renders `messages` into a single prompt string, ending with
-    /// whatever marker tells the model it's now the assistant's turn to
-    /// generate (the real "generation prompt" convention every one of
-    /// these template families uses).
-    pub fn render(&self, messages: &[ChatMessage]) -> String {
-        let mut out = String::new();
-        match self {
-            ChatTemplate::ChatMl => {
-                for m in messages {
-                    out.push_str("<|im_start|>");
-                    out.push_str(&m.role);
-                    out.push('\n');
-                    out.push_str(&m.rendered_content());
-                    out.push_str("<|im_end|>\n");
-                }
-                out.push_str("<|im_start|>assistant\n");
-            }
-            ChatTemplate::GenericRoleMarkers => {
-                for m in messages {
-                    out.push_str("<|");
-                    out.push_str(&m.role);
-                    out.push_str("|>\n");
-                    out.push_str(&m.rendered_content());
-                    // The real template every known user of this
-                    // convention ships (TinyLlama-Chat, Zephyr) appends
-                    // the real EOS token *string* right after each
-                    // turn's content, not just a newline -- confirmed
-                    // directly against TinyLlama-Chat's own real
-                    // `tokenizer.chat_template`:
-                    // `'<|role|>\n' + content + eos_token`. Both of
-                    // those models are real SentencePiece-family
-                    // tokenizers whose EOS token text is `</s>`, and
-                    // (now that `GgufSpmTokenizer`/`GgufBpeTokenizer`
-                    // recognize control tokens atomically) this
-                    // literal text is recognized as the real EOS token
-                    // id, not shattered into byte-fallback pieces. A
-                    // model using this exact template convention with a
-                    // different real EOS string is a known, disclosed
-                    // gap.
-                    out.push_str("</s>\n");
-                }
-                out.push_str("<|assistant|>\n");
-            }
-            ChatTemplate::Llama3 => {
-                for m in messages {
-                    out.push_str("<|start_header_id|>");
-                    out.push_str(&m.role);
-                    out.push_str("<|end_header_id|>\n\n");
-                    out.push_str(&m.rendered_content());
-                    out.push_str("<|eot_id|>");
-                }
-                out.push_str("<|start_header_id|>assistant<|end_header_id|>\n\n");
-            }
-            ChatTemplate::Gemma => {
-                // Match the structural Gemma IT framing. System content is
-                // prepended to the first user turn (as the real Jinja does).
-                let mut system_prefix = String::new();
-                let mut turns: Vec<&ChatMessage> = Vec::new();
-                for m in messages {
-                    match m.role.as_str() {
-                        "system" if turns.is_empty() && system_prefix.is_empty() => {
-                            system_prefix = m.rendered_content();
-                            if !system_prefix.ends_with('\n') {
-                                system_prefix.push_str("\n\n");
-                            }
-                        }
-                        _ => turns.push(m),
-                    }
-                }
-                for m in turns {
-                    let role = match m.role.as_str() {
-                        "assistant" | "model" => "model",
-                        _ => "user",
-                    };
-                    out.push_str("<start_of_turn>");
-                    out.push_str(role);
-                    out.push('\n');
-                    if role == "user" && !system_prefix.is_empty() {
-                        out.push_str(&system_prefix);
-                        system_prefix.clear();
-                    }
-                    out.push_str(&m.rendered_content());
-                    out.push_str("<end_of_turn>\n");
-                }
-                out.push_str("<start_of_turn>model\n");
-            }
-            ChatTemplate::Gemma4 => {
-                for m in messages {
-                    let role = match m.role.as_str() {
-                        "assistant" | "model" => "model",
-                        other => other,
-                    };
-                    out.push_str("<|turn>");
-                    out.push_str(role);
-                    out.push('\n');
-                    out.push_str(&m.rendered_content());
-                    out.push_str("<turn|>\n");
-                }
-                out.push_str("<|turn>model\n");
-            }
-            ChatTemplate::Plain => {
-                let lines: Vec<String> = messages
-                    .iter()
-                    .map(|m| format!("{}: {}", m.role, m.rendered_content()))
-                    .collect();
-                out.push_str(&lines.join("\n"));
-            }
+    /// Short human-readable identity, for the load-time log line.
+    pub(crate) fn describe(&self) -> String {
+        self.inner.template.describe()
+    }
+
+    /// The end-of-turn string this family emits before EOS, if it has
+    /// one worth adding to the stop set.
+    pub(crate) fn end_of_turn(&self) -> Option<&'static str> {
+        self.inner.end_of_turn
+    }
+
+    /// Whether the template consumes `tools` itself. When it does not,
+    /// the caller owes the model a text preamble describing them.
+    pub(crate) fn handles_tools(&self) -> bool {
+        self.inner.handles_tools
+    }
+
+    /// The effort vocabulary this checkpoint's template actually grades,
+    /// probed at load.
+    pub(crate) fn efforts(&self) -> &EffortProfile {
+        &self.inner.efforts
+    }
+
+    /// Render a conversation into a prompt.
+    ///
+    /// `extra` is the request's `chat_template_kwargs` -- already
+    /// sanitized by the caller, since every render path has to quantize
+    /// effort identically or a request validates against one prompt and
+    /// generates from another.
+    pub(crate) fn render(
+        &self,
+        messages: &[ChatMessage],
+        tools: &[ToolDef],
+        extra: Map<String, Value>,
+    ) -> Result<String, TemplateError> {
+        let structured = self.handles_tools() && !tools.is_empty();
+        let json: Vec<Value> = messages
+            .iter()
+            .map(|m| message_json(m, structured))
+            .collect();
+        let opts = RenderOptions {
+            add_generation_prompt: true,
+            bos_token: self.inner.bos_token.clone(),
+            eos_token: self.inner.eos_token.clone(),
+            tools: if structured {
+                tools.iter().map(tool_json).collect()
+            } else {
+                Vec::new()
+            },
+            extra,
+        };
+        self.inner.template.render(&json, &opts)
+    }
+}
+
+/// One OpenAI-shaped message, as a template reads it.
+///
+/// `structured` says whether the template is going to iterate
+/// `message.tool_calls` itself. When it is not, a replayed assistant
+/// turn's calls are folded back into `content` as the marker text the
+/// text preamble asked the model to produce -- otherwise a multi-turn
+/// tool conversation would show the model its own past calls in a shape
+/// it was never asked for.
+fn message_json(m: &ChatMessage, structured: bool) -> Value {
+    let mut obj = Map::new();
+    obj.insert("role".into(), json!(m.role));
+    let text = m
+        .content
+        .as_ref()
+        .map(crate::MessageContent::as_text)
+        .unwrap_or_default();
+    match (&m.tool_calls, structured) {
+        (Some(calls), true) => {
+            obj.insert("content".into(), json!(text));
+            obj.insert(
+                "tool_calls".into(),
+                Value::Array(calls.iter().map(tool_call_json).collect()),
+            );
         }
-        out
+        (Some(_), false) => {
+            obj.insert("content".into(), json!(m.rendered_content()));
+        }
+        (None, _) => {
+            obj.insert("content".into(), json!(text));
+        }
+    }
+    if let Some(id) = &m.tool_call_id {
+        obj.insert("tool_call_id".into(), json!(id));
+    }
+    Value::Object(obj)
+}
+
+/// A replayed tool call.
+///
+/// `arguments` arrives on the wire as a JSON *string*, and templates
+/// disagree about what they expect: HuggingFace's own
+/// `apply_chat_template` hands the model a dict, so a template that
+/// writes `{{ call.function.arguments | tojson }}` would emit a
+/// double-encoded string if the wire form were passed through. Parsing
+/// it back to an object when it is one gives every template the shape it
+/// was written against; a value that is not a JSON object stays a
+/// string, because that is all that can honestly be said about it.
+fn tool_call_json(call: &crate::ToolCallIn) -> Value {
+    let raw = call.function.arguments.as_str();
+    let args = match serde_json::from_str::<Value>(raw) {
+        Ok(v @ Value::Object(_)) => v,
+        _ => json!(raw),
+    };
+    json!({
+        "type": "function",
+        "id": call.id,
+        "function": {"name": call.function.name, "arguments": args},
+    })
+}
+
+pub(crate) fn tool_json(t: &ToolDef) -> Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": t.function.name,
+            "description": t.function.description.as_deref().unwrap_or(""),
+            "parameters": t.function.parameters.clone().unwrap_or_else(|| json!({
+                "type": "object",
+                "properties": {},
+            })),
+        },
+    })
+}
+
+/// Does this template actually *consume* the tools it is handed?
+///
+/// `ferrox_models`'s own `handles_tools` is a substring check on the
+/// template source, and its doc comment says as much -- llama.cpp
+/// probes by rendering and keeps the source check only because it is
+/// cheap enough to run per call. This runs once, at load, so it can
+/// afford the real answer: render the same conversation with and
+/// without a tool and see whether the template did anything with it.
+///
+/// The difference is not cosmetic. A template that merely *mentions*
+/// the word (in a comment, or in prose it prints) would claim to handle
+/// tools, the text preamble would be skipped on that basis, and the
+/// model would be offered tools nobody ever described to it -- a
+/// request that silently cannot call anything. A template that errors
+/// when handed tools has not handled them either.
+fn probe_tools_consumed(
+    template: &JinjaTemplate,
+    bos_token: Option<&str>,
+    eos_token: Option<&str>,
+) -> bool {
+    let messages = vec![json!({"role": "user", "content": "probe"})];
+    let render = |tools: Vec<Value>| {
+        template.render(
+            &messages,
+            &RenderOptions {
+                add_generation_prompt: true,
+                bos_token: bos_token.map(str::to_string),
+                eos_token: eos_token.map(str::to_string),
+                tools,
+                extra: Map::new(),
+            },
+        )
+    };
+    let probe = json!({
+        "type": "function",
+        "function": {
+            "name": "ferrox_probe_tool",
+            "description": "No-op probe tool.",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    });
+    match (render(Vec::new()), render(vec![probe])) {
+        // It did something with them, or it did not.
+        (Ok(without), Ok(with)) => with != without,
+        // Handed tools, it failed: it cannot express them.
+        (_, Err(_)) => false,
+        // It renders *only* when tools are present, which is as strong
+        // a statement of dependence as a template can make.
+        (Err(_), Ok(_)) => true,
+    }
+}
+
+/// Learn the effort vocabulary by rendering probes through the template.
+///
+/// One fixed one-turn conversation, so the only thing that varies
+/// between probes is what the probe itself varies. A template that
+/// rejects the probe shape entirely is reported inert by
+/// [`ferrox_edge::probe_effort_profile`], which is the safe answer:
+/// send no effort at all.
+fn probe_efforts(
+    template: &JinjaTemplate,
+    bos_token: Option<&str>,
+    eos_token: Option<&str>,
+) -> EffortProfile {
+    let messages = vec![json!({"role": "user", "content": "probe"})];
+    probe_effort_profile(|kwargs, tools| {
+        let opts = RenderOptions {
+            add_generation_prompt: true,
+            bos_token: bos_token.map(str::to_string),
+            eos_token: eos_token.map(str::to_string),
+            tools: tools.map(<[Value]>::to_vec).unwrap_or_default(),
+            extra: kwargs.clone(),
+        };
+        template.render(&messages, &opts)
+    })
+}
+
+/// The one thing the marker sniffer was still right about: Gemma IT
+/// ends a turn with a string that is not EOS, so a served Gemma needs
+/// it in the stop set however the prompt was rendered.
+fn end_of_turn_marker(source: Option<&str>) -> Option<&'static str> {
+    let src = source?;
+    if src.contains("<|turn>") || src.contains("<turn|>") {
+        Some("<turn|>")
+    } else if src.contains("<start_of_turn>") {
+        Some("<end_of_turn>")
+    } else {
+        None
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::MessageContent;
+
+    fn tool_def(name: &str) -> ToolDef {
+        serde_json::from_value(json!({
+            "type": "function",
+            "function": {
+                "name": name,
+                "description": "a tool",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        }))
+        .expect("tool def")
+    }
+
+    fn tool_call_in(name: &str, arguments: &str) -> crate::ToolCallIn {
+        serde_json::from_value(json!({
+            "id": "call_0",
+            "type": "function",
+            "function": {"name": name, "arguments": arguments},
+        }))
+        .expect("tool call")
+    }
 
     fn msg(role: &str, content: &str) -> ChatMessage {
         ChatMessage {
             role: role.to_string(),
-            content: Some(crate::MessageContent::Text(content.to_string())),
+            content: Some(MessageContent::Text(content.to_string())),
             tool_calls: None,
             tool_call_id: None,
         }
     }
 
+    const CHATML: &str = "{% for m in messages %}<|im_start|>{{ m.role }}\n{{ m.content }}<|im_end|>\n{% endfor %}{% if add_generation_prompt %}<|im_start|>assistant\n{% endif %}";
+
+    /// The whole reason this module was rewritten: `[INST] … [/INST]`
+    /// matches none of the old sniffer's markers, so a real Mistral
+    /// checkpoint was served role-labeled lines it has never seen.
     #[test]
-    fn detects_chatml_from_a_real_template_string() {
-        let template =
-            "{% for m in messages %}<|im_start|>{{m.role}}\n{{m.content}}<|im_end|>\n{% endfor %}";
-        assert_eq!(ChatTemplate::detect(Some(template)), ChatTemplate::ChatMl);
+    fn a_template_the_old_sniffer_could_not_recognise_now_renders_correctly() {
+        let mistral = "{% for m in messages %}{% if m.role == 'user' %}[INST] {{ m.content }} [/INST]{% else %}{{ m.content }}</s>{% endif %}{% endfor %}";
+        let tmpl =
+            PromptTemplate::from_gguf_metadata(Some(mistral), Some("llama"), false, None, None);
+        let rendered = tmpl
+            .render(&[msg("user", "hi")], &[], Map::new())
+            .expect("renders");
+        assert_eq!(rendered, "[INST] hi [/INST]");
     }
 
     #[test]
-    fn detects_generic_role_markers_from_a_real_tinyllama_style_template() {
-        let template =
-            "{% for m in messages %}<|{{m.role}}|>\n{{m.content}}\n{% endfor %}<|assistant|>\n";
-        assert_eq!(
-            ChatTemplate::detect(Some(template)),
-            ChatTemplate::GenericRoleMarkers
-        );
-    }
-
-    #[test]
-    fn detects_llama3_from_the_real_template_string() {
-        // Fetched directly from a real Meta-Llama-3.1-8B-Instruct GGUF's
-        // tokenizer.chat_template metadata (lmstudio-community's Q4_K_M
-        // conversion) -- the exact real template, not a hand-shortened
-        // paraphrase.
-        let template = r#"{{- bos_token }}
-{%- if messages[0]['role'] == 'system' %}
-    {%- set system_message = messages[0]['content']|trim %}
-{%- endif %}
-{{- "<|start_header_id|>system<|end_header_id|>\n\n" }}
-{%- for message in messages %}
-    {{- '<|start_header_id|>' + message['role'] + '<|end_header_id|>\n\n'+ message['content'] | trim + '<|eot_id|>' }}
-{%- endfor %}
-{%- if add_generation_prompt %}
-    {{- '<|start_header_id|>assistant<|end_header_id|>\n\n' }}
-{%- endif %}"#;
-        assert_eq!(ChatTemplate::detect(Some(template)), ChatTemplate::Llama3);
-    }
-
-    #[test]
-    fn llama3_renders_real_markers_and_a_trailing_generation_prompt() {
-        let messages = vec![msg("system", "be helpful"), msg("user", "hi")];
-        let rendered = ChatTemplate::Llama3.render(&messages);
+    fn a_checkpoint_with_no_template_falls_back_to_chatml_like_llama_cpp() {
+        let tmpl = PromptTemplate::from_gguf_metadata(None, Some("olmoe"), false, None, None);
+        let rendered = tmpl
+            .render(&[msg("user", "hi")], &[], Map::new())
+            .expect("renders");
         assert_eq!(
             rendered,
-            "<|start_header_id|>system<|end_header_id|>\n\nbe helpful<|eot_id|><|start_header_id|>user<|end_header_id|>\n\nhi<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
+            "<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n"
         );
     }
 
     #[test]
-    fn detects_gemma_from_start_of_turn_marker() {
-        let template = "{{ bos_token }}{% for message in messages %}<start_of_turn>{{ message['role'] }}\n{{ message['content'] }}<end_of_turn>\n{% endfor %}";
-        assert_eq!(ChatTemplate::detect(Some(template)), ChatTemplate::Gemma);
-    }
-
-    #[test]
-    fn detects_gemma4_from_turn_markers() {
-        let template = "{%- for message in messages -%}{{- '<|turn>' + message['role'] + '\\n' -}}{{- message['content'] -}}{{- '<turn|>\\n' -}}{%- endfor -%}{{- '<|turn>model\\n' -}}";
-        assert_eq!(ChatTemplate::detect(Some(template)), ChatTemplate::Gemma4);
-        let rendered = ChatTemplate::Gemma4.render(&[msg("user", "How are you?")]);
-        assert_eq!(rendered, "<|turn>user\nHow are you?<turn|>\n<|turn>model\n");
-    }
-
-    #[test]
-    fn gemma_renders_user_model_turns_and_generation_prompt() {
-        let messages = vec![msg("user", "Capital of France?")];
-        let rendered = ChatTemplate::Gemma.render(&messages);
-        assert_eq!(
-            rendered,
-            "<start_of_turn>user\nCapital of France?<end_of_turn>\n<start_of_turn>model\n"
-        );
-    }
-
-    #[test]
-    fn gemma_folds_system_into_first_user_turn() {
-        let messages = vec![msg("system", "be brief"), msg("user", "hi")];
-        let rendered = ChatTemplate::Gemma.render(&messages);
-        assert_eq!(
-            rendered,
-            "<start_of_turn>user\nbe brief\n\nhi<end_of_turn>\n<start_of_turn>model\n"
-        );
-    }
-
-    #[test]
-    fn falls_back_to_plain_when_no_template_or_unrecognized() {
-        assert_eq!(ChatTemplate::detect(None), ChatTemplate::Plain);
-        assert_eq!(
-            ChatTemplate::detect(Some("some unrecognized custom format")),
-            ChatTemplate::Plain
-        );
-    }
-
-    #[test]
-    fn gguf_without_template_defaults_to_chatml_for_real_architectures() {
-        assert_eq!(
-            ChatTemplate::detect_for_gguf(None, Some("olmoe"), false),
-            ChatTemplate::ChatMl
-        );
-        assert_eq!(
-            ChatTemplate::detect_for_gguf(Some(""), Some("olmoe"), false),
-            ChatTemplate::ChatMl
-        );
-        assert_eq!(
-            ChatTemplate::detect_for_gguf(None, Some("olmoe"), true),
-            ChatTemplate::Plain
-        );
-        assert_eq!(
-            ChatTemplate::detect_for_gguf(
-                Some("some unrecognized custom format"),
-                Some("olmoe"),
-                false
-            ),
-            ChatTemplate::Plain
-        );
-    }
-
-    #[test]
-    fn chatml_renders_real_markers_and_a_trailing_generation_prompt() {
-        let messages = vec![msg("system", "be helpful"), msg("user", "hi")];
-        let rendered = ChatTemplate::ChatMl.render(&messages);
-        assert_eq!(
-            rendered,
-            "<|im_start|>system\nbe helpful<|im_end|>\n<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n"
-        );
-    }
-
-    #[test]
-    fn generic_role_markers_renders_real_markers_and_a_trailing_generation_prompt() {
-        let messages = vec![msg("user", "hello there")];
-        let rendered = ChatTemplate::GenericRoleMarkers.render(&messages);
-        assert_eq!(rendered, "<|user|>\nhello there</s>\n<|assistant|>\n");
-    }
-
-    #[test]
-    fn plain_renders_role_labeled_lines_with_no_special_tokens() {
-        let messages = vec![msg("user", "hello"), msg("assistant", "hi back")];
-        let rendered = ChatTemplate::Plain.render(&messages);
+    fn a_byte_tokenizer_checkpoint_falls_back_to_role_labeled_lines() {
+        let tmpl = PromptTemplate::from_gguf_metadata(None, Some("olmoe"), true, None, None);
+        let rendered = tmpl
+            .render(
+                &[msg("user", "hello"), msg("assistant", "hi back")],
+                &[],
+                Map::new(),
+            )
+            .expect("renders");
         assert_eq!(rendered, "user: hello\nassistant: hi back");
+    }
+
+    #[test]
+    fn chat_template_kwargs_reach_the_template() {
+        let src = "{% if enable_thinking %}THINK{% endif %}{{ messages[0].content }}";
+        let tmpl = PromptTemplate::from_gguf_metadata(Some(src), Some("qwen3"), false, None, None);
+        let mut extra = Map::new();
+        extra.insert("enable_thinking".into(), json!(true));
+        assert_eq!(
+            tmpl.render(&[msg("user", "hi")], &[], extra)
+                .expect("renders"),
+            "THINKhi"
+        );
+        assert_eq!(
+            tmpl.render(&[msg("user", "hi")], &[], Map::new())
+                .expect("renders"),
+            "hi"
+        );
+    }
+
+    #[test]
+    fn a_template_that_reads_tools_is_given_them_structurally() {
+        let src =
+            "{% for t in tools %}TOOL:{{ t.function.name }}{% endfor %}{{ messages[0].content }}";
+        let tmpl = PromptTemplate::from_gguf_metadata(Some(src), Some("qwen3"), false, None, None);
+        assert!(tmpl.handles_tools());
+        let tools = vec![tool_def("get_weather")];
+        assert_eq!(
+            tmpl.render(&[msg("user", "hi")], &tools, Map::new())
+                .expect("renders"),
+            "TOOL:get_weatherhi"
+        );
+    }
+
+    /// A source check says this template handles tools; rendering it
+    /// says otherwise. The preamble is what the model would lose.
+    #[test]
+    fn a_template_that_only_mentions_tools_does_not_count_as_handling_them() {
+        let mentions = "{# tools are described by the system prompt #}\
+             {% for m in messages %}{{ m.role }}: {{ m.content }}\n{% endfor %}";
+        let tmpl =
+            PromptTemplate::from_gguf_metadata(Some(mentions), Some("qwen2"), false, None, None);
+        assert!(
+            !tmpl.handles_tools(),
+            "the word alone must not skip the preamble"
+        );
+    }
+
+    /// A template that never mentions `tools` cannot describe them, so
+    /// the caller keeps the text preamble -- and a replayed call has to
+    /// come back as the marker text that preamble asked for.
+    #[test]
+    fn a_template_that_ignores_tools_sees_replayed_calls_as_marker_text() {
+        let tmpl =
+            PromptTemplate::from_gguf_metadata(Some(CHATML), Some("qwen2"), false, None, None);
+        assert!(!tmpl.handles_tools());
+        let replayed = ChatMessage {
+            role: "assistant".to_string(),
+            content: None,
+            tool_calls: Some(vec![tool_call_in("get_weather", r#"{"city":"Paris"}"#)]),
+            tool_call_id: None,
+        };
+        let rendered = tmpl.render(&[replayed], &[], Map::new()).expect("renders");
+        assert!(
+            rendered.contains(
+                r#"<tool_call>{"name": "get_weather", "arguments": {"city":"Paris"}}</tool_call>"#
+            ),
+            "{rendered}"
+        );
+    }
+
+    /// The wire form of `arguments` is a string; a template written
+    /// against HuggingFace's `apply_chat_template` expects the parsed
+    /// object, and `| tojson` on the string form would double-encode it.
+    #[test]
+    fn replayed_call_arguments_reach_a_structural_template_as_an_object() {
+        let src = "{% for m in messages %}{% for c in m.tool_calls %}{{ c.function.arguments.city }}{% endfor %}{% endfor %}tools:{{ tools | length }}";
+        let tmpl = PromptTemplate::from_gguf_metadata(Some(src), Some("qwen3"), false, None, None);
+        let replayed = ChatMessage {
+            role: "assistant".to_string(),
+            content: None,
+            tool_calls: Some(vec![tool_call_in("get_weather", r#"{"city":"Paris"}"#)]),
+            tool_call_id: None,
+        };
+        let tools = vec![tool_def("get_weather")];
+        assert_eq!(
+            tmpl.render(&[replayed], &tools, Map::new())
+                .expect("renders"),
+            "Paristools:1"
+        );
+    }
+
+    #[test]
+    fn a_broken_template_fails_the_request_instead_of_guessing() {
+        let tmpl = PromptTemplate::from_gguf_metadata(
+            Some("{% for m in messages %}"),
+            None,
+            false,
+            None,
+            None,
+        );
+        assert!(tmpl.render(&[msg("user", "hi")], &[], Map::new()).is_err());
+    }
+
+    #[test]
+    fn gemma_families_contribute_their_end_of_turn_marker_to_the_stop_set() {
+        assert_eq!(
+            end_of_turn_marker(Some("{{ bos_token }}<start_of_turn>user\n")),
+            Some("<end_of_turn>")
+        );
+        assert_eq!(
+            end_of_turn_marker(Some("{{- '<|turn>' + m.role -}}")),
+            Some("<turn|>")
+        );
+        assert_eq!(end_of_turn_marker(Some(CHATML)), None);
+        assert_eq!(end_of_turn_marker(None), None);
+    }
+
+    /// The probe is what makes `reasoning_effort` mean anything: a
+    /// template that grades only the OpenAI triple must not be sent
+    /// `minimal`.
+    #[test]
+    fn the_effort_vocabulary_is_probed_at_load() {
+        let graded = "{% set allowed = ['low','medium','high'] %}\
+             {% if reasoning_effort %}\
+               {% if reasoning_effort not in allowed %}{{ raise_exception('bad effort') }}{% endif %}\
+               E:{{ reasoning_effort }}\
+             {% endif %}{{ messages[0].content }}";
+        let tmpl =
+            PromptTemplate::from_gguf_metadata(Some(graded), Some("qwen3"), false, None, None);
+        let profile = tmpl.efforts();
+        assert!(profile.consumes_effort);
+        assert!(profile.validates);
+        assert_eq!(
+            profile
+                .supported
+                .iter()
+                .map(|e| e.as_str())
+                .collect::<Vec<_>>(),
+            vec!["low", "medium", "high"]
+        );
+
+        let inert =
+            PromptTemplate::from_gguf_metadata(Some(CHATML), Some("qwen2"), false, None, None);
+        assert!(!inert.efforts().consumes_effort);
     }
 }

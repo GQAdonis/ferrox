@@ -37,6 +37,8 @@ comes back the same way.
 | `response_format: json_object` | Supported (best-effort mask + validate) |
 | Other `response_format` types | **Reject** |
 | `session_id` | Ferrox extension (server-side history) |
+| `chat_template_kwargs` | Supported (see [Chat templates](#chat-templates)) |
+| `reasoning_effort` | Supported, quantized onto what the checkpoint grades |
 | `reasoning_content` (response) | Ferrox extension: a reasoning model's chain of thought, split out of `content` |
 
 ### Where a completion stops
@@ -56,6 +58,47 @@ from its special-token names and `[EOT]` ends a turn there too.
 BOS follows the rule in [CLI.md](CLI.md#who-adds-bos): the chat template
 owns it when it prints one, the loader otherwise, added idempotently so a
 template that already emitted BOS never gets a second one.
+
+## Chat templates
+
+The prompt is rendered by evaluating the checkpoint's own
+`tokenizer.chat_template` — the real Jinja2 source shipped in the GGUF —
+not by recognising it. A checkpoint that ships no template at all falls
+back to ChatML (matching llama.cpp `--jinja`), or to role-labeled lines
+for a byte/synthetic tokenizer. A template that does not compile, or that
+uses a construct this evaluator does not provide, fails the chat request
+with the compiler's own message; it does **not** quietly fall back to a
+guessed framing, which is the failure it exists to remove.
+
+`chat_template_kwargs` is passed through: whatever a client puts there
+becomes a top-level template variable, which is how `enable_thinking`
+(Qwen3, gemma-4), `thinking` (DeepSeek) and `preserve_thinking` are
+really driven. It can never shadow `messages`, `tools`, or
+`add_generation_prompt`.
+
+Three rules are applied to it before rendering:
+
+* **Offering tools turns thinking on.** Some encoders emit well-formed
+  tool calls only in thinking mode, so `tools` implies
+  `enable_thinking` unless the request said otherwise.
+* **Effort is quantized onto what this checkpoint grades.** The
+  template's real effort vocabulary is probed once at load; a request
+  asking for a gear outside it is mapped to the nearest one, or dropped
+  (so the template's own default applies) when nothing is close enough.
+  `reasoning_effort: "minimal"` against a checkpoint that grades only
+  `low`/`medium`/`high` renders as `low` rather than failing or
+  interpolating an unknown word into the prompt. Top-level
+  `reasoning_effort` loses to an explicit `chat_template_kwargs` entry.
+* **One value, every spelling.** The graded-strength dialect reads
+  `reasoning_strength`; the value is broadcast to both, and a Jinja
+  template ignores variables it does not declare.
+
+Whether the *tools* are described by the template or by a text preamble
+depends on the template, established at load by rendering it with and
+without a tool rather than by looking for the word: one that really
+consumes `tools` is handed them as structured JSON and owns the whole
+grammar; one that does not gets the preamble described under
+[Tool-call formats](#tool-call-formats).
 
 ## Health
 
@@ -566,6 +609,13 @@ all there is: ferrox carries no per-checkpoint parser declaration. A
 name that implies nothing gets no reasoning parser at all — the right
 answer for a model that does not reason, since an unconditional
 splitter would eat a literal `<think>` written in a code block.
+
+Whether the block is *already open* is read off the rendered prompt, not
+guessed from the family: a template asked to think can open the block in
+the prompt itself, and then the model's first token is reasoning and no
+opening marker ever arrives. Same checkpoint, same request text,
+different answer depending on what `chat_template_kwargs` rendered — so
+the prompt is what gets consulted.
 
 ## Tool-call formats
 

@@ -175,17 +175,11 @@ pub async fn messages(
     let active = state.require_active()?;
     let history = to_chat_messages(&req)?;
     let template = active.model.chat_template();
-    let prompt = prompt_from_messages(&history, template, &[]);
+    // The Anthropic surface has no `chat_template_kwargs` of its own, so
+    // it renders with the template's own defaults.
+    let prompt = prompt_from_messages(&history, &template, &[], serde_json::Map::new())?;
     let mut stop = req.stop_sequences.clone().unwrap_or_default();
-    if matches!(
-        template,
-        crate::chat_template::ChatTemplate::Gemma | crate::chat_template::ChatTemplate::Gemma4
-    ) {
-        let marker = match template {
-            crate::chat_template::ChatTemplate::Gemma => "<end_of_turn>",
-            crate::chat_template::ChatTemplate::Gemma4 => "<turn|>",
-            _ => unreachable!(),
-        };
+    if let Some(marker) = template.end_of_turn() {
         if !stop.iter().any(|s| s == marker) {
             stop.push(marker.to_string());
         }

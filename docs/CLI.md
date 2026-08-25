@@ -99,8 +99,13 @@ not available yet).
 
 ### Chat vs completion
 
-- **Default:** if the GGUF has a recognized `tokenizer.chat_template`, the user
-  prompt is wrapped (ChatML / Llama 3 / Gemma / TinyLlama-style markers).
+- **Default:** the prompt is rendered through the GGUF's own
+  `tokenizer.chat_template`, evaluated as Jinja2 — the same evaluator
+  `ferrox-server` uses, so the CLI and `/v1/chat/completions` frame a
+  conversation identically. A checkpoint that ships no template falls
+  back to ChatML (matching llama.cpp `--jinja`), or to role-labeled
+  lines for a byte tokenizer. A template that does not compile is an
+  error, not a fallback to a guessed framing.
 - **`--no-cnv`:** raw prompt (classic completion). BOS is still added under the
   same rule.
 

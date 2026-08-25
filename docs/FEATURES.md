@@ -105,6 +105,10 @@ OpenAI-compatible HTTP API:
 - Tool calls in nine wire formats, not one — the format the served
   checkpoint's family emits, then the prompt-engineered one — and every
   call in a response, not the first
+- Prompts rendered by *evaluating* the checkpoint's own
+  `tokenizer.chat_template`, with `chat_template_kwargs` and
+  `reasoning_effort` passed through (the effort quantized onto what that
+  checkpoint's template really grades)
 
 ## Serving policy (`ferrox-edge`)
 
@@ -127,8 +131,10 @@ returns a decision.
 | `effort` | which reasoning-effort dialect a checkpoint speaks, probed from its own template |
 
 Wired in today: the two parsers (chat completions, streaming and
-buffered) and the stop-string withhold rule, which `ferrox-server`'s
-`StopMatcher` now delegates to so there is one implementation of it.
+buffered), the stop-string withhold rule, which `ferrox-server`'s
+`StopMatcher` now delegates to so there is one implementation of it, and
+`effort` — probed once per checkpoint at load, then applied to every
+request's `chat_template_kwargs`.
 The cache and placement policies are complete and tested but are not
 yet driving the decoder — see [`ROADMAP.md`](ROADMAP.md).
 

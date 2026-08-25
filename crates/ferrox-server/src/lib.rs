@@ -3942,6 +3942,15 @@ async fn run(mcp_config_path: Option<PathBuf>, exit_on_stdin_close: bool) -> any
 
     let mut protected = Router::new()
         .route(routes::V1_MODELS, get(list_models))
+        // The Responses surface decodes tokens, so it sits behind the
+        // same key as `/v1/chat/completions`: it must cost what
+        // decoding tokens costs.
+        .route(routes::V1_RESPONSES, post(responses::responses))
+        .route(routes::V1_RESPONSE, get(responses::responses_get))
+        .route(
+            routes::V1_RESPONSE_CANCEL,
+            post(responses::responses_cancel),
+        )
         .route(routes::V1_STATS, get(serving_stats))
         .route(routes::V1_REQUESTS, get(recent_requests))
         .route(routes::V1_CHAT_COMPLETIONS, post(chat_completions))
@@ -4288,6 +4297,15 @@ mod tests {
         Router::new()
             .route(ferrox_api::routes::HEALTH, get(health))
             .route(ferrox_api::routes::V1_MODELS, get(list_models))
+            .route(ferrox_api::routes::V1_RESPONSES, post(responses::responses))
+            .route(
+                ferrox_api::routes::V1_RESPONSE,
+                get(responses::responses_get),
+            )
+            .route(
+                ferrox_api::routes::V1_RESPONSE_CANCEL,
+                post(responses::responses_cancel),
+            )
             .route(ferrox_api::routes::V1_STATS, get(serving_stats))
             .route(ferrox_api::routes::V1_REQUESTS, get(recent_requests))
             .route("/v1/chat/completions", post(chat_completions))

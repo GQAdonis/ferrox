@@ -18,6 +18,8 @@ comes back the same way.
 | `POST /v1/detokenize` | Supported |
 | `POST /v1/embeddings` | Supported for GGUF Decoder (mean/last pool of hidden states) |
 | `POST /v1/messages` | Anthropic-shaped, non-stream text |
+| `POST /v1/responses` | OpenAI Responses surface (what `codex` speaks), streaming and buffered |
+| `GET /v1/stats` · `GET /v1/requests` | Live serving telemetry and the request ring |
 | `POST /v1/cancel` | Stop a streamed generation by `request_id` (see below) |
 | `GET /cache/stats` · `GET /metrics` | Ferrox extensions |
 | `/admin/*` | Control surface (see below) |

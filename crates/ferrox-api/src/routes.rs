@@ -96,6 +96,21 @@ pub const ADMIN_TASK_CANCEL: &str = "/admin/tasks/{task_id}/cancel";
 /// Counters, uptime, and the recent-request ring buffer.
 pub const ADMIN_STATS: &str = "/admin/stats";
 
+/// The OpenAI **Responses** surface -- what `codex` speaks. A different
+/// request/response shaping over the same generation path, not a second
+/// engine.
+pub const V1_RESPONSES: &str = "/v1/responses";
+
+/// One stored response. This server is stateless, so it answers 404 --
+/// deliberately, rather than 404-ing from the router, because the two
+/// say different things: the route EXISTS and keeps nothing, which
+/// tells a client to stop polling rather than to check its base URL.
+pub const V1_RESPONSE: &str = "/v1/responses/{response_id}";
+
+/// Cancel one stored response. Same stateless answer; a live generation
+/// is stopped through [`V1_CANCEL`] with its `request_id`.
+pub const V1_RESPONSE_CANCEL: &str = "/v1/responses/{response_id}/cancel";
+
 /// Live serving telemetry: throughput over a trailing window, request
 /// latency percentile, and the cache pools' occupancy. Distinct from
 /// [`ADMIN_STATS`], which is this server's own operational ring; this
@@ -159,6 +174,7 @@ pub const ALL: &[&str] = &[
     ADMIN_DOWNLOAD,
     ADMIN_TASKS,
     ADMIN_STATS,
+    V1_RESPONSES,
     V1_STATS,
     V1_REQUESTS,
     V1_CACHE_STATUS,

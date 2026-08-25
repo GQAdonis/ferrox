@@ -7241,10 +7241,23 @@ mod tests {
             hidden_dim,
         );
 
+        // Unique per CALL, not per (pid, vocab_size). Both callers of
+        // this helper use the same `vocab_size`, so keying on it gave
+        // the two tests one directory -- and `fs::write` opens with
+        // `O_TRUNC`, so one test rewriting the shard truncated it to
+        // zero while the other's `ferrox-safetensors` MMAP of that
+        // exact file was live. Touching a mapping past the end of its
+        // file is SIGBUS, which kills the whole test binary rather than
+        // failing one test, and only when the two happen to overlap --
+        // so it showed up as an occasional unexplained CI crash.
+        //
+        // A counter and not a thread id: the harness reuses threads
+        // across tests, so two sequential tests can share one.
+        static FIXTURE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let dir = std::env::temp_dir().join(format!(
             "ferrox_server_kimi_e2e_test_{}_{}",
             std::process::id(),
-            vocab_size
+            FIXTURE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
         std::fs::create_dir_all(&dir).unwrap();
         let shard_bytes = write_safetensors_shard(&tensors);

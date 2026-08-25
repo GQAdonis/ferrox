@@ -27,7 +27,8 @@ comes back the same way.
 
 | Field | Status |
 |---|---|
-| `model`, `messages`, `max_tokens` | Supported |
+| `model`, `messages` | Supported |
+| `max_tokens` | Supported; **defaults to 32768**, not OpenAI's legacy 16. An explicit `0` is a 400 |
 | `temperature`, `top_p`, `top_k`, `repetition_penalty`, `seed`, `stop` | Supported |
 | `presence_penalty`, `frequency_penalty` | Supported |
 | `stream` | Supported (overlapped SSE when tools off and CB off) |
@@ -38,7 +39,8 @@ comes back the same way.
 | Other `response_format` types | **Reject** |
 | `session_id` | Ferrox extension (server-side history) |
 | `chat_template_kwargs` | Supported (see [Chat templates](#chat-templates)) |
-| `reasoning_effort` | Supported, quantized onto what the checkpoint grades |
+| `reasoning_effort` | Supported, quantized onto what the checkpoint grades; `none`/`off` turn thinking off |
+| `thinking: {"type": …}` | Supported (DeepSeek wire): `enabled`/`disabled`, anything else is a 400 |
 | `reasoning_content` (response) | Ferrox extension: a reasoning model's chain of thought, split out of `content` |
 
 ### Where a completion stops
@@ -59,6 +61,18 @@ BOS follows the rule in [CLI.md](CLI.md#who-adds-bos): the chat template
 owns it when it prints one, the loader otherwise, added idempotently so a
 template that already emitted BOS never gets a second one.
 
+### When a request does not fit the context
+
+Two outcomes, not one. A **prompt** at or past the deployment's
+per-request position ceiling is refused with a 400 whose message reads
+`prompt is too long: N tokens > M maximum` — wording that Claude Code
+and OpenClaw match on, because the Anthropic wire carries no error code
+for it. A prompt that *fits* is **served**, with `max_tokens` clamped
+down to the room that remains; refusing that case would turn a servable
+long-prompt request into an error over a `max_tokens` the caller most
+likely never set. The clamp is also what makes the 32768 default output
+budget safe.
+
 ## Chat templates
 
 The prompt is rendered by evaluating the checkpoint's own
@@ -76,7 +90,20 @@ becomes a top-level template variable, which is how `enable_thinking`
 really driven. It can never shadow `messages`, `tools`, or
 `add_generation_prompt`.
 
-Three rules are applied to it before rendering:
+Five rules are applied to it before rendering:
+
+* **An explicit knob wins wholesale.** A caller who already set any of
+  `enable_thinking`, `thinking`, `thinking_mode` or `reasoning_effort`
+  *inside* `chat_template_kwargs` has said what they want; the
+  protocol-level knobs then stand down entirely rather than merging, so
+  a default can never contradict an explicit request.
+* **`none` and `off` are not gears.** `reasoning_effort: "none"` means
+  *turn thinking off*, and is broadcast as such — it is not quantized
+  onto the nearest gear, which would turn "do not think" into "think a
+  little". The DeepSeek-wire `thinking: {"type": "disabled"}` does the
+  same and beats any effort in the same request, because the switch is
+  what the caller reached for last and the gear is what they would have
+  used had thinking been on.
 
 * **Offering tools turns thinking on.** Some encoders emit well-formed
   tool calls only in thinking mode, so `tools` implies

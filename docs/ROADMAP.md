@@ -94,9 +94,11 @@ Beyond closing the measured gaps.
 **Wiring `ferrox-edge`**
 
 The ported FreeToken serving policy (`crates/ferrox-edge`, see
-[`FEATURES.md`](FEATURES.md)) is complete and tested but only its two
-output parsers and its withhold rule are driving anything yet. The rest
-is groundwork waiting on a consumer:
+[`FEATURES.md`](FEATURES.md)) is complete and tested. Driving something
+today: the two output parsers, the withhold rule, the effort/thinking
+probe behind `chat_template_kwargs` and `/v1/models`'s advertised gears,
+and the request ring behind `/admin/stats`. The rest is groundwork
+waiting on a consumer:
 
 - Replace `ferrox-models::prefix_cache`'s flat snapshot list with
   `ferrox-edge::radix`, so a thousand requests off one system prompt
@@ -114,6 +116,14 @@ is groundwork waiting on a consumer:
 - Size the pools with `ferrox-edge::pool` at load, and expose the live
   re-split (`POST /v1/cache/rebuild`) so VRAM can move between the
   expert cache and KV without a restart
+
+A full recursive re-read of the reference (six readers over its 435
+files, checked against every ferrox crate rather than against the port's
+own scope) found 34 further items, now tracked individually in the plan
+below. One of them is a correctness bug in shipped code rather than an
+omission: `route_top_k_grouped` implements "k from every group" where
+the DeepSeek-V3/GLM rule scores each group by the sum of its top-2
+biased scores and then runs one global top-k. That one is first.
 
 Staged plan, including what the port left behind entirely (semantic
 anchor checkpoints, the cache manager, the window slide) and what a

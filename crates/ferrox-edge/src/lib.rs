@@ -22,6 +22,7 @@
 //! | [`radix`] | which prefix of a new prompt is already computed, and what may be evicted |
 //! | [`anchor`] | which position an agentic turn will come back to, and what to keep for it |
 //! | [`window_pool`] | which window-pool slot holds a given position's sliding-window KV |
+//! | [`state_pool`] | which recurrent-state slot a request holds, and where a prefill freezes one |
 //! | [`cache_manager`] | who owns which KV page, and what a request hands back when it commits |
 //! | [`pool`] | how VRAM is split between the expert cache and the KV pools, and how it is re-split live |
 //! | [`scheduler`] | which requests run this step, how much prefill they get, and who is retracted |
@@ -84,6 +85,11 @@ pub use qstar::{
 };
 
 pub use window_pool::{WindowPoolExhausted, WindowSlotPool, NO_SLOT};
+
+pub use state_pool::{
+    chunk_row_bases, track_checkpoint, StateCopy, StatePoolExhausted, StateSlotPool,
+    TrackCheckpoint, TrackRequest, PADDING_SLOT,
+};
 
 pub use maintenance::{
     AdmissionClosed, MaintenanceGate, MaintenanceState, RebuildRefused, SealedAccounting,

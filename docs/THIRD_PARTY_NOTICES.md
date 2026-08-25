@@ -274,6 +274,13 @@ What was ported, and from where:
 | `effort` | `python/freetoken/tokenizer/effort.py`, part of `tokenizer/tokenize.py` |
 | `detokenize` | `python/freetoken/tokenizer/detokenize.py` |
 | `cache_report` | `python/freetoken/cache_report.py` |
+| `anchor` | `python/freetoken/scheduler/cache.py` (tool-call anchor, window slide), `attention/linear.py` |
+| `window_pool` | `python/freetoken/kvcache/hybrid_swa_pool.py` |
+| `state_pool` | `python/freetoken/kvcache/linear_state_pool.py`, `attention/linear.py` |
+| `cache_manager` | `python/freetoken/scheduler/cache.py` |
+| `stats` | `python/freetoken/server/request_ring.py`, `server/stats.py` |
+| `maintenance` | `python/freetoken/server/accounting.py`, the gate in `server/api_server.py` |
+| `bench_profile` | `python/freetoken/moe/bench_profile.py` (path resolution) |
 
 FreeToken itself credits SGLang, vLLM, FlashInfer,
 flash-linear-attention, LightLLM and llama.cpp; in particular its radix
@@ -289,6 +296,17 @@ host-bank allocator and the CUDA-graph capture ordering are all
 torch/CUDA-bound, and ferrox has its own equivalents or its own plans
 for them. `ferrox-edge` is deliberately tensor-free: every module takes
 measured numbers and returns a decision.
+
+A full recursive re-read of the reference in August 2026 -- six readers
+over its 435 files, checked against every ferrox crate rather than
+against the port's own scope -- found 34 further pieces the first pass
+had missed. They are tracked individually in
+[`docs/plans/freetoken-parity.md`](plans/freetoken-parity.md) rather
+than summarised here, because each closes on its own. That review also
+found one place where the port had got a *shipped* rule wrong rather
+than merely omitted it: `route_top_k_grouped` implemented "k from every
+group" instead of the DeepSeek-V3/GLM `noaux_tc` rule. It is recorded in
+that plan as `noaux-tc-group-limited-routing`.
 
 Two *decision*-side pieces are also absent, and are absent because they
 are single-family grammars for checkpoints ferrox does not run, not

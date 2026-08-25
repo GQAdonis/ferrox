@@ -99,6 +99,39 @@ impl ContextCeiling {
         self.refused.load(Ordering::Relaxed)
     }
 
+    /// The per-request position ceiling, when this deployment has one.
+    pub fn limit(&self) -> Option<usize> {
+        self.limit
+    }
+
+    /// The refusal for a prompt that does not fit the ceiling *by
+    /// itself*, which is a different answer from one whose prompt plus
+    /// budget does not.
+    ///
+    /// A prompt shorter than the ceiling is servable -- with a smaller
+    /// output budget -- so it is clamped rather than refused (see
+    /// `generate`). A prompt at or past the ceiling has no budget left
+    /// to clamp to, so it is the one case that must fail.
+    ///
+    /// The wording is load-bearing and copied verbatim: Claude Code and
+    /// OpenClaw match on this text to recognise a blown context window,
+    /// because the Anthropic wire carries no error code for it.
+    pub fn prompt_refusal(&self, prompt_tokens: usize) -> Option<DecodeError> {
+        let limit = self.limit?;
+        if prompt_tokens < limit {
+            return None;
+        }
+        self.refused.fetch_add(1, Ordering::Relaxed);
+        Some(DecodeError::KvBudgetExceeded {
+            binding: Ceiling::ContextLength.code(),
+            estimated_bytes: self.bytes_for(prompt_tokens),
+            limit_bytes: self.bytes_for(limit),
+            positions: prompt_tokens,
+            positions_limit: limit,
+            detail: format!("prompt is too long: {prompt_tokens} tokens > {limit} maximum"),
+        })
+    }
+
     /// The typed refusal for a request of `positions` positions, or
     /// `None` when it fits.
     ///

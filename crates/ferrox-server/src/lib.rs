@@ -1030,8 +1030,17 @@ struct ChatCompletionRequest {
     /// OpenAI's own spelling of the same knob. It is folded into
     /// `chat_template_kwargs` before rendering, and loses to an explicit
     /// entry there: a caller who wrote both meant the specific one.
+    ///
+    /// `"none"` and `"off"` are not gears -- they mean *do not think*,
+    /// and are handled by [`ChatCompletionRequest::thinking_direction`]
+    /// before any quantization can round them onto a real one.
     #[serde(default)]
     reasoning_effort: Option<String>,
+    /// The DeepSeek wire's thinking switch: `{"type": "enabled"}` or
+    /// `{"type": "disabled"}`. It decides the direction outright, and
+    /// `disabled` beats any effort the same request also carries.
+    #[serde(default)]
+    thinking: Option<ThinkingSwitch>,
     /// Server-side conversation history key (see the `session`
     /// module): when set, `messages` is treated as
     /// *only the new turn(s)* to append to this session's stored
@@ -1053,8 +1062,43 @@ struct ChatCompletionRequest {
     response_format: Option<serde_json::Value>,
 }
 
+/// The output budget a chat request gets when it names none.
+///
+/// Not OpenAI's legacy 16 -- that floor belongs to `/v1/completions`,
+/// where a caller asking for a completion of a fragment usually wants a
+/// fragment back. A chat client that omits `max_tokens` wants an
+/// answer, and 16 tokens of one reads as a truncated server.
+///
+/// It is safe to be this large only because the context ceiling CLAMPS
+/// rather than refuses (see `generate`): a request whose prompt leaves
+/// less than this much room is served with what remains, not rejected
+/// over a number the caller never set.
+const DEFAULT_CHAT_MAX_TOKENS: usize = 32_768;
+
+/// The DeepSeek-wire thinking switch.
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct ThinkingSwitch {
+    #[serde(rename = "type")]
+    pub(crate) kind: String,
+}
+
+/// Every spelling a caller can use to steer the template's thinking
+/// themselves. If any of these is already present in
+/// `chat_template_kwargs`, the protocol-level knobs stand down.
+const THINKING_KWARG_KEYS: [&str; 4] = [
+    "enable_thinking",
+    "thinking",
+    "thinking_mode",
+    "reasoning_effort",
+];
+
+/// The efforts that mean "do not think" rather than naming a gear.
+/// Compared after trimming and lowercasing, because a client that sends
+/// `"None"` means the same thing.
+const DISABLE_EFFORTS: [&str; 2] = ["none", "off"];
+
 fn default_max_tokens() -> usize {
-    16
+    DEFAULT_CHAT_MAX_TOKENS
 }
 
 impl ChatCompletionRequest {
@@ -1090,7 +1134,19 @@ impl ChatCompletionRequest {
 
     /// The `chat_template_kwargs` this request actually renders with.
     ///
-    /// Three rules, all of them from `ferrox-edge`:
+    /// Five rules, all of them from `ferrox-edge`:
+    ///
+    /// * **An explicit knob wins wholesale.** A caller who already set
+    ///   any of `enable_thinking` / `thinking` / `thinking_mode` /
+    ///   `reasoning_effort` inside `chat_template_kwargs` has said what
+    ///   they want; the protocol-level knobs are then ignored entirely
+    ///   rather than merged, because a merge would let a default
+    ///   contradict an explicit request.
+    /// * **`none` and `off` are not gears.** `reasoning_effort: "none"`
+    ///   means *turn thinking off* and broadcasts the off pair; it must
+    ///   not be quantized onto the nearest gear, which would turn "do
+    ///   not think" into "think a little". Same for the DeepSeek-wire
+    ///   `thinking: {"type": "disabled"}`, which beats any effort.
     ///
     /// * **Thinking follows the tools.** Offering tools turns thinking
     ///   on even when the caller said nothing, because some encoders
@@ -1111,16 +1167,63 @@ impl ChatCompletionRequest {
     /// Every render path has to do this identically -- a request that
     /// validates against one prompt and generates from another is the
     /// failure this returns a single value to prevent.
+    /// Which way this request steers thinking, before any template is
+    /// consulted: `Some(false)` off, `Some(true)` on, `None` unstated.
+    ///
+    /// `thinking: {"type": …}` decides outright and `disabled` wins over
+    /// any effort, because a client that sent both a switch and a gear
+    /// meant the switch -- the gear is what it would use *if* thinking
+    /// were on.
+    fn thinking_direction(&self) -> Option<bool> {
+        if let Some(switch) = &self.thinking {
+            return match switch.kind.trim().to_ascii_lowercase().as_str() {
+                "disabled" => Some(false),
+                "enabled" => Some(true),
+                // An unrecognized type is not a silent default -- see
+                // `validate_supported_fields`, which rejects it.
+                _ => None,
+            };
+        }
+        let effort = self.reasoning_effort.as_ref()?;
+        DISABLE_EFFORTS
+            .contains(&effort.trim().to_ascii_lowercase().as_str())
+            .then_some(false)
+    }
+
     fn resolve_template_kwargs(
         &self,
         template: &chat_template::PromptTemplate,
     ) -> serde_json::Map<String, serde_json::Value> {
         let mut kwargs = self.chat_template_kwargs.clone().unwrap_or_default();
-        if let Some(effort) = &self.reasoning_effort {
-            kwargs
-                .entry("reasoning_effort".to_string())
-                .or_insert_with(|| serde_json::json!(effort));
+        // Whether the caller steered the template themselves. Read
+        // BEFORE anything is added, or every request looks explicit
+        // from the second statement on.
+        let caller_steered = THINKING_KWARG_KEYS.iter().any(|k| kwargs.contains_key(*k));
+
+        if !caller_steered {
+            match self.thinking_direction() {
+                Some(false) => {
+                    for (k, v) in ferrox_edge::effort::thinking_off_kwargs() {
+                        kwargs.insert(k, v);
+                    }
+                    // Nothing below applies: an effort would re-enter a
+                    // block this request just closed.
+                    return kwargs;
+                }
+                Some(true) => {
+                    for (k, v) in ferrox_edge::effort::thinking_on_kwargs() {
+                        kwargs.insert(k, v);
+                    }
+                }
+                None => {}
+            }
+            if let Some(effort) = &self.reasoning_effort {
+                kwargs
+                    .entry("reasoning_effort".to_string())
+                    .or_insert_with(|| serde_json::json!(effort));
+            }
         }
+
         let offered: Vec<serde_json::Value> = if self.tools_active() {
             self.tools.iter().map(chat_template::tool_json).collect()
         } else {
@@ -1151,6 +1254,31 @@ impl ChatCompletionRequest {
     /// Reject OpenAI fields we do not implement, and `tool_choice`
     /// values that would silently lie (required / named function).
     fn validate_supported_fields(&self) -> Result<(), ApiError> {
+        // An explicit zero is a client error, not "unset". Serde already
+        // told them apart -- an absent field became
+        // `DEFAULT_CHAT_MAX_TOKENS` -- so a 0 here is one the caller
+        // wrote, and the engine cannot serve a zero-token budget: the
+        // request would never become decodable and the client would wait
+        // for an answer that cannot arrive.
+        if self.max_tokens == 0 {
+            return Err(invalid_request(
+                "max_tokens must be at least 1",
+                "max_tokens",
+            ));
+        }
+        // An unrecognized switch is refused rather than read as "on":
+        // a client that misspells `disabled` and is served a thinking
+        // model anyway has been silently given the opposite of what it
+        // asked for.
+        if let Some(switch) = &self.thinking {
+            let kind = switch.kind.trim().to_ascii_lowercase();
+            if kind != "enabled" && kind != "disabled" {
+                return Err(invalid_request(
+                    "thinking.type must be \"enabled\" or \"disabled\"",
+                    "thinking.type",
+                ));
+            }
+        }
         for msg in &self.messages {
             if msg.content.as_ref().is_some_and(MessageContent::has_image) {
                 return Err(unsupported_feature(
@@ -1783,6 +1911,23 @@ async fn metrics(State(state): State<Arc<AppState>>) -> Response {
 }
 
 pub(crate) type ApiError = (StatusCode, Json<serde_json::Value>);
+
+/// A field the server understands but this value of which it cannot
+/// serve. Distinct from [`unsupported_feature`] (501, "ferrox does not
+/// implement this") -- a 400 says the request itself is wrong, which is
+/// the difference between a client retrying elsewhere and a client
+/// fixing its own body.
+pub(crate) fn invalid_request(message: &str, param: &str) -> ApiError {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(serde_json::json!({"error": {
+            "message": message,
+            "type": "invalid_request_error",
+            "param": param,
+            "code": null,
+        }})),
+    )
+}
 
 pub(crate) fn unsupported_feature(message: &str) -> ApiError {
     (
@@ -4040,8 +4185,6 @@ mod tests {
             last_load_error: Mutex::new(None),
             serving: Mutex::new(ferrox_edge::ServingStats::default()),
             maintenance: Mutex::new(ferrox_edge::MaintenanceGate::new()),
-            serving: Mutex::new(ferrox_edge::ServingStats::default()),
-            maintenance: Mutex::new(ferrox_edge::MaintenanceGate::new()),
         }
     }
 
@@ -5892,6 +6035,102 @@ mod tests {
 
     fn chat_request(value: serde_json::Value) -> ChatCompletionRequest {
         serde_json::from_value(value).expect("request")
+    }
+
+    /// A chat client that omits `max_tokens` wants an answer, not
+    /// OpenAI's legacy 16-token completion fragment.
+    #[test]
+    fn an_omitted_output_budget_is_a_whole_answer_not_sixteen_tokens() {
+        let req = chat_request(serde_json::json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+        }));
+        assert_eq!(req.max_tokens, DEFAULT_CHAT_MAX_TOKENS);
+    }
+
+    /// Serde already tells absent from zero -- an absent field became
+    /// the default -- so a 0 here is one the caller wrote, and a
+    /// zero-token budget is a request that can never become decodable.
+    #[test]
+    fn an_explicit_zero_output_budget_is_a_client_error() {
+        let req = chat_request(serde_json::json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 0,
+        }));
+        let (status, body) = req.validate_supported_fields().expect_err("rejected");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"]["param"], serde_json::json!("max_tokens"));
+    }
+
+    /// The direction that had no wire path at all before: every request
+    /// rendered in thinking mode because only the ON branch existed.
+    #[test]
+    fn a_request_can_turn_thinking_off() {
+        let template = graded_template();
+        for body in [
+            serde_json::json!({
+                "model": "m",
+                "messages": [{"role": "user", "content": "hi"}],
+                "reasoning_effort": "none",
+            }),
+            serde_json::json!({
+                "model": "m",
+                "messages": [{"role": "user", "content": "hi"}],
+                "thinking": {"type": "disabled"},
+            }),
+        ] {
+            let kwargs = chat_request(body).resolve_template_kwargs(&template);
+            assert_eq!(kwargs["enable_thinking"], serde_json::json!(false));
+            assert_eq!(kwargs["thinking_mode"], serde_json::json!("disabled"));
+            // And `none` must not have been rounded onto a real gear on
+            // the way: "do not think" is not "think a little".
+            assert!(!kwargs.contains_key("reasoning_effort"));
+        }
+    }
+
+    /// The switch is what the caller reached for last; the gear is what
+    /// they would have used had thinking been on.
+    #[test]
+    fn a_disabled_switch_beats_an_effort_in_the_same_request() {
+        let template = graded_template();
+        let kwargs = chat_request(serde_json::json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "reasoning_effort": "high",
+            "thinking": {"type": "disabled"},
+        }))
+        .resolve_template_kwargs(&template);
+        assert_eq!(kwargs["enable_thinking"], serde_json::json!(false));
+        assert!(!kwargs.contains_key("reasoning_effort"));
+    }
+
+    /// Read as "on", a misspelled switch silently serves the opposite
+    /// of what was asked for.
+    #[test]
+    fn an_unrecognized_thinking_switch_is_refused_rather_than_read_as_on() {
+        let req = chat_request(serde_json::json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "thinking": {"type": "disable"},
+        }));
+        let (status, _) = req.validate_supported_fields().expect_err("rejected");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    /// A caller who steered the template themselves has said what they
+    /// want; merging a protocol default in would let it contradict them.
+    #[test]
+    fn an_explicit_template_kwarg_stands_the_protocol_knobs_down() {
+        let template = graded_template();
+        let kwargs = chat_request(serde_json::json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "reasoning_effort": "none",
+            "chat_template_kwargs": {"enable_thinking": true},
+        }))
+        .resolve_template_kwargs(&template);
+        assert_eq!(kwargs["enable_thinking"], serde_json::json!(true));
     }
 
     /// The acceptance criterion for effort plumbing: an off-vocabulary

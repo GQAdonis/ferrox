@@ -40,6 +40,7 @@
 //! instead of shadowing it. Each module's docs say which.
 
 pub mod anchor;
+pub mod bench_client;
 pub mod bench_profile;
 pub mod cache_manager;
 pub mod cache_report;
@@ -62,6 +63,10 @@ pub mod window_pool;
 pub use anchor::{
     decode_slide, prefill_slide, resolve_anchor_token, snapshot_at_anchor, AnchorSnapshot,
     AnchorState, PingPong, RecurrentState, SlideDecision, SlidingRequest, WindowPolicy,
+};
+pub use bench_client::{
+    is_token_chunk, prompt_of_exact_length, replay_offsets, BenchReport, BenchSampling, Latency,
+    PromptLengthNotReached, RequestTiming, MAX_PROMPT_FIXED_POINT_STEPS,
 };
 pub use bench_profile::{
     load_backend_recommendation, load_hybrid_fetch_fraction, load_policy, usable_profile,

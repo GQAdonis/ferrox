@@ -102,6 +102,9 @@ OpenAI-compatible HTTP API:
   `POST /v1/messages/count_tokens`
 - Presence and frequency penalties, best-effort `json_object`
 - Continuous batching and chunked prefill
+- `ferrox serve-bench`: concurrency, TTFT, TPOT and queueing numbers
+  for a live server, with the methodology (positional split, pooled
+  nearest-rank percentiles, whole-run throughput) tested socket-free
 - Live serving telemetry (`GET /v1/stats`, `GET /v1/requests`) and an
   elastic KV/expert split that can be reported and re-sized without a
   restart (`GET /v1/cache/status`, `POST /v1/cache/rebuild`), behind a

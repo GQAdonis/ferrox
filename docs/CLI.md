@@ -165,6 +165,47 @@ uses the same set.
 ./target/release/ferrox run-kimi /path/to/kimi --prompt "Hi" --max-new-tokens 32
 ```
 
+## Serving benchmark (`serve-bench`)
+
+`ferrox bench` is single-stream and HTTP-free: it measures kernels
+against `llama-bench`. `ferrox serve-bench` answers the other question —
+what a running `ferrox-server` does under concurrency.
+
+```bash
+# Start the server first.
+FERROX_MODEL_PATH=model.gguf ./target/release/ferrox-server &
+
+./target/release/ferrox serve-bench --requests 64 --concurrency 8 --output-len 128
+./target/release/ferrox serve-bench --concurrency 16 --json
+```
+
+Four rules decide whether the numbers mean anything, and all four are
+in `ferrox_edge::bench_client` with no socket in them, so each is
+covered by a test rather than inferred from a live run:
+
+- **Every request does exactly the requested work.** Temperature 0,
+  top-k 1, `ignore_eos`, and an exact output length. Without
+  `ignore_eos` the requests finish at different lengths and the slowest
+  percentile is whichever prompt happened to run longest — a fact about
+  the prompts, reported as a fact about the server.
+- **The TTFT/TPOT split is positional.** The first token-bearing chunk
+  is time-to-first-token; every later one is an inter-token sample.
+  Keepalives and the terminal `finish_reason` frame are excluded: a
+  keepalive arrives during exactly the window TTFT measures, and the
+  terminal frame carries no token.
+- **Percentiles are nearest-rank over samples pooled across requests**,
+  never per-request means percentiled afterwards — one request that
+  stalled mid-answer must reach the p99, and inside its own mean it
+  never does.
+- **Throughput is total tokens over the whole run's span**, not the sum
+  of per-request rates, which gets *better* the worse the queueing is.
+
+Token counts come from the server's own `usage.completion_tokens`, not
+from the chunk count: a buffered answer arrives as one chunk and was
+still N tokens of work. A buffered stream therefore reports TTFT and
+end-to-end but no TPOT — that detail does not exist, and it is left
+blank rather than invented.
+
 ## Correctness (`verify`, `parity`)
 
 Two different questions, and only the second one involves llama.cpp.

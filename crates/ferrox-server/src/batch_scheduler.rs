@@ -1233,7 +1233,13 @@ fn worker_loop(
             // alone -- gemma-2 ends on `<end_of_turn>`), and a
             // single-token stop the caller asked for. All of them mean
             // the token is a terminator and not part of the output.
-            if slot.stop_tokens.contains(next) || slot.stops.is_stop_token(next) {
+            //
+            // `ignore_eos` suppresses the MODEL's set and only that, so
+            // both decode paths agree: a benchmark asking to run past
+            // EOS is not withdrawing its own fence, and the private
+            // `generate` loop makes the same distinction.
+            let model_eos = !slot.params.ignore_eos && slot.stop_tokens.contains(next);
+            if model_eos || slot.stops.is_stop_token(next) {
                 slot.finish = Some(FinishReason::Stop);
                 continue;
             }
@@ -1432,6 +1438,7 @@ mod tests {
             stop_token_ids: Vec::new(),
             json_object: false,
             cancel: None,
+            ignore_eos: false,
         }
     }
 
@@ -1516,6 +1523,7 @@ mod tests {
                 stop_token_ids: Vec::new(),
                 json_object: params[i].json_object,
                 cancel: params[i].cancel.clone(),
+                ignore_eos: false,
             };
             threads.push(thread::spawn(move || {
                 barrier.wait();

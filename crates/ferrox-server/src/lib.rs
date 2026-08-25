@@ -1032,6 +1032,17 @@ struct ChatCompletionRequest {
     /// resumable stream either way.
     #[serde(default)]
     stream_resumable: Option<bool>,
+    /// Run past the model's own end-of-generation tokens, so this
+    /// request produces exactly `max_tokens`.
+    ///
+    /// A serving-benchmark knob, and the vLLM/SGLang spelling of it. It
+    /// exists because a benchmark whose requests stop at their own EOS
+    /// finishes them at different lengths, and the slowest percentile
+    /// is then whichever request happened to be asked for the most
+    /// tokens -- a fact about the prompts, reported as a fact about the
+    /// server. It does NOT withdraw the caller's own `stop` strings.
+    #[serde(default)]
+    ignore_eos: Option<bool>,
     #[serde(default)]
     tools: Vec<ToolDef>,
     #[serde(default)]
@@ -1393,6 +1404,7 @@ impl ChatCompletionRequest {
             // Filled in by the handler that owns the request id --
             // the request body cannot name its own cancel token.
             cancel: None,
+            ignore_eos: self.ignore_eos.unwrap_or(false),
         }
     }
 
@@ -4291,6 +4303,7 @@ mod tests {
             stop_token_ids: Vec::new(),
             json_object: false,
             cancel: None,
+            ignore_eos: false,
         }
     }
 

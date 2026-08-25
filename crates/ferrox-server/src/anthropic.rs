@@ -668,6 +668,9 @@ fn prepare_prompt(prompt: &PromptFields, model: String, max_tokens: usize) -> Pr
         presence_penalty: None,
         frequency_penalty: None,
         response_format: None,
+        // A serving-benchmark knob on the OpenAI surface only; this
+        // protocol has no spelling for it.
+        ignore_eos: None,
     };
     Prepared { chat, parser_tools }
 }

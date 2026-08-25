@@ -440,6 +440,7 @@ dependencies = [
  "clap",
  "ferrox-core",
  "ferrox-cuda",
+ "ferrox-edge",
  "ferrox-gguf",
  "ferrox-metal",
  "ferrox-models",

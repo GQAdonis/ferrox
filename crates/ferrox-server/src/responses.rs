@@ -627,6 +627,9 @@ fn to_chat_request(req: &ResponsesRequest) -> Result<ChatCompletionRequest, ApiE
         // Replay is a ferrox extension on the chat surface with no
         // Responses spelling; codex reconnects by resending `input`.
         stream_resumable: None,
+        // A serving-benchmark knob on the OpenAI surface only; this
+        // protocol has no spelling for it.
+        ignore_eos: None,
         tools: convert_tools(req.tools.as_ref()),
         tool_choice: req.tool_choice.clone().map(|choice| match choice {
             Value::String(mode) => ToolChoice::Mode(mode),

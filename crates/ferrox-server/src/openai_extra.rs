@@ -142,6 +142,10 @@ pub(crate) struct CompletionsRequest {
     /// full budget of text past it.
     #[serde(default)]
     stop: Option<StopParam>,
+    /// Run past the model's own end-of-generation tokens. See
+    /// `ChatCompletionRequest::ignore_eos`.
+    #[serde(default)]
+    ignore_eos: Option<bool>,
     // Fields this server does not implement. Deserialized ONLY so they
     // can be refused by name -- serde would otherwise drop each one
     // silently, which is indistinguishable from having honoured it.
@@ -482,6 +486,7 @@ pub async fn completions(
         // nothing for a client to name in a cancel.
         stop_token_ids: Vec::new(),
         cancel: None,
+        ignore_eos: req.ignore_eos.unwrap_or(false),
     };
     let model = Arc::clone(&active.model);
     let kv_pool = state.kv_pool.clone();

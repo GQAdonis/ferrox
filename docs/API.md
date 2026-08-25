@@ -519,6 +519,28 @@ names nothing that is running. The two are different facts: only one of
 them saved any work, and a client told `ok` for both would claim it
 stopped something it did not.
 
+### Stop strings
+
+A generation that runs into one of the caller's `stop` strings reports
+`finish_reason: "stop"` here — OpenAI's vocabulary has no other value,
+and inventing one would make a completed answer look like a failure to
+a client checking against the documented set. The stop string itself is
+trimmed from the answer.
+
+`/v1/messages` says more, because Anthropic's protocol has room for it:
+a caller's stop string that fires reports `stop_reason: "stop_sequence"`
+with `stop_sequence: "<the string>"` beside it, on the buffered body and
+in the terminal `message_delta` alike. The two are only ever reported
+together. Two things are deliberately *not* reported that way:
+
+- A stop the **server** added — the served template's own end-of-turn
+  marker — reports the ordinary `end_turn`. Telling an agent it hit a
+  fence it never put up is worse than telling it nothing.
+- A **truncated** generation reports `max_tokens` even if a stop
+  matched, and a generation that produced tool calls reports
+  `tool_use`. What the client does next is decided by those, not by the
+  fence.
+
 A cancelled stream ends with `finish_reason: "cancelled"`. OpenAI does
 not define that value, because OpenAI has no cancel endpoint, but it is
 *a* finish reason, so no client reads the stream as truncation. Tokens

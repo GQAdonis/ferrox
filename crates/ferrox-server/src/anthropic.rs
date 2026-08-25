@@ -773,18 +773,12 @@ fn body_error(err: serde_json::Error) -> ApiError {
 /// outside its map, and the only value that does not claim something
 /// untrue.
 ///
-/// **`stop_sequence` is never produced**, and that is a real gap rather
-/// than an oversight. It is only honest alongside `stop_sequence: "<the
-/// string that matched>"`, and this server cannot say which string
-/// matched: `stop::StopMatcher::push` answers `StopStep::Matched(text)`
-/// carrying only the text *preceding* the match, and
-/// [`crate::generate::FinishReason`] has no room for the matched
-/// string, so by the time a finish reason reaches this module that
-/// identity is gone. Reporting `stop_reason: "stop_sequence"` with a
-/// null `stop_sequence`, or guessing the first entry of
-/// `stop_sequences`, would both hand an agent a fabrication to branch
-/// on. A stop-string hit therefore arrives as an ordinary `end_turn`
-/// until `FinishReason` carries the string that fired.
+/// `stop_sequence` is produced only when a CALLER's stop string
+/// matched, and never on its own: it is honest only beside
+/// `stop_sequence: "<the string that matched>"`, so both come from the
+/// one `matched_stop` value or neither is reported. See
+/// [`terminal_stop`], which is where that decision is made -- this
+/// function maps the finish reason alone.
 fn stop_reason(finish: &str) -> Option<&'static str> {
     match finish {
         "stop" => Some("end_turn"),
@@ -792,6 +786,52 @@ fn stop_reason(finish: &str) -> Option<&'static str> {
         "tool_calls" => Some("tool_use"),
         _ => None,
     }
+}
+
+/// The `stop_reason` / `stop_sequence` pair for one ended generation.
+///
+/// Three rules, in this order:
+///
+/// 1. A truncated generation is `max_tokens` even if it parsed a call
+///    and even if a stop matched -- a client must not execute a call
+///    whose arguments may have been cut off mid-write.
+/// 2. A generation that produced calls is `tool_use`.
+/// 3. A caller's stop string that fired is `stop_sequence`, WITH the
+///    string beside it. `matched_stop` is already filtered to what the
+///    client asked for, so a template's own end-of-turn marker lands
+///    here as `None` and reports the ordinary `end_turn`.
+fn terminal_stop(
+    finish: &str,
+    calls: bool,
+    matched_stop: Option<&str>,
+) -> (Option<&'static str>, Value) {
+    if finish == "length" {
+        return (stop_reason(finish), Value::Null);
+    }
+    if calls {
+        return (stop_reason("tool_calls"), Value::Null);
+    }
+    match matched_stop {
+        Some(stop) => (Some("stop_sequence"), json!(stop)),
+        None => (stop_reason(finish), Value::Null),
+    }
+}
+
+/// The caller's own stop string, if that is what ended this
+/// generation.
+///
+/// `FinishReason` names whichever stop the matcher hit, and the served
+/// template contributes stops of its own -- a family's end-of-turn
+/// marker among them. Reporting one of THOSE as `stop_sequence` would
+/// tell an agent it ran into a fence it never put up, so the match is
+/// kept only when it is a string the client actually sent in
+/// `stop_sequences`.
+fn caller_stop(finish: &crate::generate::FinishReason, caller: &[String]) -> Option<String> {
+    let matched = finish.matched_stop()?;
+    caller
+        .iter()
+        .any(|s| s == matched)
+        .then(|| matched.to_string())
 }
 
 /// Rule 6. `input_tokens` excludes what the prefix cache served and
@@ -829,7 +869,14 @@ fn parse_json_args(arguments: &str) -> Value {
 /// The text block is emitted even when it is empty, as the reference
 /// does: `content` is a list a client indexes, and a turn that only
 /// called tools still has a (blank) assistant utterance in it.
-fn message_body(parsed: ParsedOutput, finish: &str, usage: &Usage, id: &str, model: &str) -> Value {
+fn message_body(
+    parsed: ParsedOutput,
+    finish: &str,
+    matched_stop: Option<&str>,
+    usage: &Usage,
+    id: &str,
+    model: &str,
+) -> Value {
     let mut content: Vec<Value> = Vec::new();
     if let Some(reasoning) = parsed.reasoning.filter(|r| !r.is_empty()) {
         // `signature: ""`: this server has no signing key and never
@@ -846,14 +893,7 @@ fn message_body(parsed: ParsedOutput, finish: &str, usage: &Usage, id: &str, mod
             "input": parse_json_args(&call.arguments),
         }));
     }
-    // A truncated generation is `max_tokens` even if it managed to
-    // parse a call: a client must not execute a call whose arguments
-    // may have been cut off mid-write.
-    let reason = if !parsed.calls.is_empty() && finish != "length" {
-        stop_reason("tool_calls")
-    } else {
-        stop_reason(finish)
-    };
+    let (reason, sequence) = terminal_stop(finish, !parsed.calls.is_empty(), matched_stop);
     json!({
         "id": id,
         "type": "message",
@@ -861,7 +901,7 @@ fn message_body(parsed: ParsedOutput, finish: &str, usage: &Usage, id: &str, mod
         "content": content,
         "model": model,
         "stop_reason": reason,
-        "stop_sequence": Value::Null,
+        "stop_sequence": sequence,
         "usage": usage_json(usage),
     })
 }
@@ -899,6 +939,14 @@ pub(crate) enum GenEvent {
     },
     Done {
         finish: &'static str,
+        /// The caller's own stop string, when generation ran into one.
+        ///
+        /// Filtered to the strings the CLIENT sent in
+        /// `stop_sequences`: the served template adds stops of its own
+        /// (a family's end-of-turn marker), and reporting one of those
+        /// as `stop_sequence` would tell an agent it hit a fence it
+        /// never put up.
+        matched_stop: Option<String>,
         usage: Usage,
     },
     Failed {
@@ -1160,16 +1208,24 @@ impl MessagesStream {
                 frames.extend(self.close_open());
                 frames
             }
-            GenEvent::Done { finish, usage } => {
+            GenEvent::Done {
+                finish,
+                matched_stop,
+                usage,
+            } => {
                 let mut frames = self.close_open();
-                let reason = if self.calls_opened > 0 && finish != "length" {
-                    stop_reason("tool_calls")
-                } else {
-                    stop_reason(finish)
-                };
+                let (reason, sequence) =
+                    terminal_stop(finish, self.calls_opened > 0, matched_stop.as_deref());
                 let mut delta = json!({});
                 if let Some(reason) = reason {
                     delta["stop_reason"] = json!(reason);
+                }
+                // Only beside a `stop_sequence` reason. A null here on
+                // every other ending is noise a client has to ignore,
+                // and the buffered body carries it because its shape is
+                // fixed; a delta's is not.
+                if !sequence.is_null() {
+                    delta["stop_sequence"] = sequence;
                 }
                 let usage = usage_json(&usage);
                 frames.push(self.frame("message_delta", json!({"delta": delta, "usage": usage})));
@@ -1350,6 +1406,9 @@ async fn messages_full(
     let prompt = prompt_from_messages(&chat.messages, &template, &chat.tools, kwargs)
         .map_err(anthropic_shape)?;
     let posture = OutputPosture::resolve(active.model.name(), &prompt);
+    // The client's own list, kept apart from `params.stop`, which the
+    // template adds its end-of-turn marker to. See `caller_stop`.
+    let caller_stops = chat.stop_sequences();
     let params = chat.generation_params_for_template(&template);
 
     let model = Arc::clone(&active.model);
@@ -1387,9 +1446,11 @@ async fn messages_full(
         usage: Some(&usage),
         attribution: &attribution,
     });
+    let matched_stop = caller_stop(&finish, &caller_stops);
     Ok(Json(message_body(
         parsed,
         finish.as_str(),
+        matched_stop.as_deref(),
         &usage,
         &new_id("msg_"),
         &chat.model,
@@ -1415,6 +1476,8 @@ async fn messages_stream(
         .map_err(anthropic_shape)?;
     let served_model = active.model.name().to_string();
     let posture = OutputPosture::resolve(&served_model, &prompt);
+    // See `messages_full`: the client's list, not the template's.
+    let caller_stops = chat.stop_sequences();
     let mut params = chat.generation_params_for_template(&template);
 
     // The same two-tier cancellation the chat stream has: the guard
@@ -1537,6 +1600,7 @@ async fn messages_stream(
                 });
                 send(GenEvent::Done {
                     finish: finish.as_str(),
+                    matched_stop: caller_stop(&finish, &caller_stops),
                     usage,
                 });
             }
@@ -2271,6 +2335,7 @@ mod tests {
             GenEvent::Content("hi".into()),
             GenEvent::Done {
                 finish: "stop",
+                matched_stop: None,
                 usage: usage(5, 1),
             },
         ]);
@@ -2297,6 +2362,7 @@ mod tests {
             GenEvent::Content("llo".into()),
             GenEvent::Done {
                 finish: "stop",
+                matched_stop: None,
                 usage: usage(5, 2),
             },
         ]);
@@ -2338,6 +2404,7 @@ mod tests {
             },
             GenEvent::Done {
                 finish: "stop",
+                matched_stop: None,
                 usage: usage(5, 3),
             },
         ]);
@@ -2366,6 +2433,7 @@ mod tests {
             GenEvent::Content("answer".into()),
             GenEvent::Done {
                 finish: "stop",
+                matched_stop: None,
                 usage: usage(5, 4),
             },
         ]);
@@ -2408,6 +2476,7 @@ mod tests {
             },
             GenEvent::Done {
                 finish: "stop",
+                matched_stop: None,
                 usage: usage(5, 5),
             },
         ]);
@@ -2497,6 +2566,7 @@ mod tests {
             },
             GenEvent::Done {
                 finish: "stop",
+                matched_stop: None,
                 usage: usage(5, 6),
             },
         ]);
@@ -2519,6 +2589,7 @@ mod tests {
             },
             GenEvent::Done {
                 finish: "length",
+                matched_stop: None,
                 usage: usage(5, 7),
             },
         ]);
@@ -2537,6 +2608,7 @@ mod tests {
     fn a_cancelled_generation_reports_no_stop_reason() {
         let frames = run(vec![GenEvent::Done {
             finish: "cancelled",
+            matched_stop: None,
             usage: usage(5, 8),
         }]);
         let delta = &only(&frames, "message_delta")[0]["delta"];
@@ -2552,6 +2624,7 @@ mod tests {
     fn the_terminal_message_delta_carries_the_cache_split_usage() {
         let frames = run(vec![GenEvent::Done {
             finish: "stop",
+            matched_stop: None,
             usage: usage(100, 9).with_cached_tokens(40),
         }]);
         assert_eq!(
@@ -2568,6 +2641,7 @@ mod tests {
             GenEvent::Content("half a sen".into()),
             GenEvent::Done {
                 finish: "length",
+                matched_stop: None,
                 usage: usage(5, 10),
             },
         ]);
@@ -2667,7 +2741,7 @@ mod tests {
                 arguments: r#"{"path":"a"}"#.into(),
             }],
         };
-        let body = message_body(parsed, "stop", &usage(11, 3), "msg_1", "m");
+        let body = message_body(parsed, "stop", None, &usage(11, 3), "msg_1", "m");
         let kinds: Vec<&str> = body["content"]
             .as_array()
             .unwrap()
@@ -2696,7 +2770,7 @@ mod tests {
                 arguments: "not json".into(),
             }],
         };
-        let body = message_body(parsed, "stop", &usage(1, 1), "msg_1", "m");
+        let body = message_body(parsed, "stop", None, &usage(1, 1), "msg_1", "m");
         assert_eq!(body["content"][1]["input"], json!({}));
     }
 
@@ -2862,5 +2936,131 @@ mod tests {
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(body["type"], json!("error"));
         assert_eq!(body["error"]["type"], json!("invalid_request_error"));
+    }
+
+    // -----------------------------------------------------------------
+    // stop_reason / stop_sequence
+    // -----------------------------------------------------------------
+
+    /// The whole point of carrying the matched string: an agent that put
+    /// up its own fence needs to tell "I hit my fence" from "the model
+    /// finished". Anthropic says that with `stop_reason:
+    /// "stop_sequence"` and the string beside it, and the two are only
+    /// ever reported together -- a `stop_sequence` reason with a null
+    /// string is a fabrication to branch on.
+    #[test]
+    fn a_callers_own_stop_string_is_reported_as_a_stop_sequence_with_the_string() {
+        let parsed = ParsedOutput {
+            reasoning: None,
+            content: "up to here".into(),
+            calls: Vec::new(),
+        };
+        let body = message_body(parsed, "stop", Some("END"), &usage(4, 2), "msg_1", "m");
+        assert_eq!(body["stop_reason"], "stop_sequence");
+        assert_eq!(body["stop_sequence"], "END");
+    }
+
+    /// The model ending its own turn is `end_turn` with a null
+    /// sequence, unchanged. A stop the SERVER added -- the served
+    /// template's end-of-turn marker -- arrives here as `None` (see
+    /// `caller_stop`) and lands in exactly this branch, because telling
+    /// an agent it hit a fence it never put up is worse than telling it
+    /// nothing.
+    #[test]
+    fn a_turn_the_model_ended_itself_stays_end_turn_with_no_sequence() {
+        let parsed = ParsedOutput {
+            reasoning: None,
+            content: "done".into(),
+            calls: Vec::new(),
+        };
+        let body = message_body(parsed, "stop", None, &usage(4, 2), "msg_1", "m");
+        assert_eq!(body["stop_reason"], "end_turn");
+        assert!(body["stop_sequence"].is_null());
+    }
+
+    /// Precedence, and it is not arbitrary. Truncation outranks
+    /// everything: a client must not execute a call whose arguments may
+    /// have been cut off mid-write, and must not be told the answer
+    /// ended on a fence when it ended on the budget. Calls outrank a
+    /// stop for the same reason the OpenAI surface reports
+    /// `tool_calls`: what the client does next is run the call.
+    #[test]
+    fn truncation_outranks_a_stop_string_and_calls_outrank_it_too() {
+        let call = || crate::output::ParsedToolCall {
+            name: "read".into(),
+            arguments: "{}".into(),
+        };
+
+        let truncated = ParsedOutput {
+            reasoning: None,
+            content: "half".into(),
+            calls: vec![call()],
+        };
+        let body = message_body(truncated, "length", Some("END"), &usage(4, 2), "i", "m");
+        assert_eq!(body["stop_reason"], "max_tokens");
+        assert!(body["stop_sequence"].is_null());
+
+        let with_call = ParsedOutput {
+            reasoning: None,
+            content: String::new(),
+            calls: vec![call()],
+        };
+        let body = message_body(with_call, "stop", Some("END"), &usage(4, 2), "i", "m");
+        assert_eq!(body["stop_reason"], "tool_use");
+        assert!(body["stop_sequence"].is_null());
+    }
+
+    /// The stream says the same thing as the buffered body, which is
+    /// the invariant that keeps a client from having to implement two
+    /// readings of one generation. `stop_sequence` appears in the
+    /// terminal `message_delta` ONLY beside its reason -- a null on
+    /// every other ending is noise the client has to ignore.
+    #[test]
+    fn the_terminal_delta_carries_the_stop_sequence_only_when_there_is_one() {
+        let frames = run(vec![GenEvent::Done {
+            finish: "stop",
+            matched_stop: Some("END".to_string()),
+            usage: usage(4, 2),
+        }]);
+        let delta = &only(&frames, "message_delta")[0];
+        assert_eq!(delta["delta"]["stop_reason"], "stop_sequence");
+        assert_eq!(delta["delta"]["stop_sequence"], "END");
+
+        let frames = run(vec![GenEvent::Done {
+            finish: "stop",
+            matched_stop: None,
+            usage: usage(4, 2),
+        }]);
+        let delta = &only(&frames, "message_delta")[0];
+        assert_eq!(delta["delta"]["stop_reason"], "end_turn");
+        assert!(delta["delta"].get("stop_sequence").is_none());
+    }
+
+    /// A stop the client never sent must not be reported as one, and
+    /// the served template really does add its own -- a family's
+    /// end-of-turn marker goes into `params.stop` beside the caller's
+    /// list. This is the filter that keeps the two apart.
+    #[test]
+    fn only_a_stop_the_client_asked_for_can_become_a_stop_sequence() {
+        let caller = vec!["END".to_string()];
+        assert_eq!(
+            caller_stop(
+                &crate::generate::FinishReason::StopSequence("END".into()),
+                &caller
+            ),
+            Some("END".to_string())
+        );
+        assert_eq!(
+            caller_stop(
+                &crate::generate::FinishReason::StopSequence("<|im_end|>".into()),
+                &caller
+            ),
+            None,
+            "a template's own marker is not the caller's fence"
+        );
+        assert_eq!(
+            caller_stop(&crate::generate::FinishReason::Stop, &caller),
+            None
+        );
     }
 }

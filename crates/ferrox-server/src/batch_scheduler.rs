@@ -1216,9 +1216,9 @@ fn apply_stop_buffer(slot: &mut Slot, piece: &str) -> bool {
             slot.visible.push_str(&text);
             false
         }
-        StopStep::Matched(text) => {
+        StopStep::Matched { text, stop } => {
             slot.visible.push_str(&text);
-            slot.finish = Some(FinishReason::Stop);
+            slot.finish = Some(FinishReason::StopSequence(stop));
             true
         }
     }
@@ -1492,7 +1492,11 @@ mod tests {
         let (finish, _ids, text, _usage) = batcher
             .generate(prompt, params, StopTokens::default())
             .expect("batch generate");
-        assert_eq!(finish, FinishReason::Stop);
+        assert_eq!(
+            finish,
+            FinishReason::StopSequence(stop.clone()),
+            "a batched row must name the stop it hit, like an unbatched one"
+        );
         assert!(
             !text.contains(&stop),
             "stop string must be trimmed from visible text: text={text:?} stop={stop:?}"
@@ -2887,7 +2891,7 @@ mod tests {
             )
             .expect("generate");
 
-        assert_eq!(finish, FinishReason::Stop);
+        assert_eq!(finish, FinishReason::StopSequence(stop_str.clone()));
         assert_eq!(
             text, expected,
             "a stop spanning two tokens must cut where it starts"

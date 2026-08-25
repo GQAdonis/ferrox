@@ -188,10 +188,25 @@ fn acquire_pooled_caches(
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FinishReason {
     Stop,
+    /// A caller-supplied stop STRING matched, and this is the one that
+    /// did.
+    ///
+    /// Separate from [`Stop`](FinishReason::Stop), which is the model
+    /// ending its own turn, because two protocols ask which it was:
+    /// Anthropic reports `stop_reason: "stop_sequence"` with the text
+    /// beside it, and an agent branches on that to tell "I hit the
+    /// fence I put up" from "the model was done". Both still answer
+    /// `"stop"` on the OpenAI surface, which has no field for the
+    /// distinction.
+    ///
+    /// The string is the stop as the CALLER spelled it, not the text
+    /// that matched it -- they are the same today and the caller's
+    /// spelling is the one it can compare against.
+    StopSequence(String),
     Length,
     /// A canceller asked for this generation to stop; see the `cancel`
     /// module. Deliberately not folded into `Stop`: the tokens that did
@@ -204,13 +219,32 @@ pub enum FinishReason {
 impl FinishReason {
     pub fn as_str(&self) -> &'static str {
         match self {
-            FinishReason::Stop => "stop",
+            // A caller's stop string is still "stop" here: OpenAI's
+            // vocabulary has no other value for it, and inventing one
+            // would make a completed answer look like a failure to a
+            // client that checks against the documented set. The
+            // surfaces that CAN say more read the variant instead.
+            FinishReason::Stop | FinishReason::StopSequence(_) => "stop",
             FinishReason::Length => "length",
             // Not an OpenAI-defined value -- OpenAI has no cancel
             // endpoint to produce one. A client that does not know the
             // string still sees a terminated stream with *a* finish
             // reason, which is what stops it being read as truncation.
             FinishReason::Cancelled => "cancelled",
+        }
+    }
+
+    /// The caller-supplied stop string this generation ran into, if it
+    /// ran into one.
+    ///
+    /// `None` covers every other ending, a stop TOKEN included: a
+    /// control token in the caller's stop set is not a string the
+    /// caller can compare its own `stop` list against, so naming one
+    /// here would report a match the caller never asked for.
+    pub fn matched_stop(&self) -> Option<&str> {
+        match self {
+            FinishReason::StopSequence(stop) => Some(stop),
+            _ => None,
         }
     }
 }
@@ -702,11 +736,11 @@ fn sample_until_stop(
                     emit(&text);
                 }
             }
-            crate::stop::StopStep::Matched(text) => {
+            crate::stop::StopStep::Matched { text, stop } => {
                 if !text.is_empty() {
                     emit(&text);
                 }
-                finish = FinishReason::Stop;
+                finish = FinishReason::StopSequence(stop);
                 break;
             }
         }
@@ -800,12 +834,19 @@ pub fn generate_engine<E: Engine, T: TextTokenizer>(
 
 /// The earliest byte offset in `text` at which any of `stops` begins,
 /// or `None` if none match yet.
-pub(crate) fn earliest_stop_match(text: &str, stops: &[String]) -> Option<usize> {
+pub(crate) fn earliest_stop_match<'a>(text: &str, stops: &'a [String]) -> Option<(usize, &'a str)> {
     stops
         .iter()
         .filter(|s| !s.is_empty())
-        .filter_map(|s| text.find(s.as_str()))
-        .min()
+        .filter_map(|s| text.find(s.as_str()).map(|at| (at, s.as_str())))
+        // Leftmost wins, because that is where the answer is cut. Two
+        // stops starting at the same place cut identically, so the tie
+        // is broken on LENGTH, longest first: `"</tool_call>"` and
+        // `"</tool"` both match at the same index and the longer one is
+        // the more specific claim about what the model produced. Some
+        // rule is needed either way -- without one the reported stop
+        // would depend on the order the caller happened to list them.
+        .min_by_key(|(at, s)| (*at, std::cmp::Reverse(s.len())))
 }
 
 /// The largest char boundary `<= idx`. `str::floor_char_boundary` is
@@ -1382,7 +1423,11 @@ mod tests {
         };
 
         let (finish, _, chunks) = run_scripted(&script, render, &params);
-        assert_eq!(finish, FinishReason::Stop);
+        assert_eq!(
+            finish,
+            FinishReason::StopSequence("abc".to_string()),
+            "the reason names the stop that fired, not merely that one did"
+        );
         assert_eq!(
             chunks.concat(),
             "ab",
@@ -1477,7 +1522,7 @@ mod tests {
                 max_tokens: 20,
                 sampling: SamplingParams::default(),
                 seed: 1,
-                stop: vec![stop_str],
+                stop: vec![stop_str.clone()],
                 stop_token_ids: Vec::new(),
                 json_object: false,
                 cancel: None,
@@ -1489,7 +1534,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(finish, FinishReason::Stop);
+        assert_eq!(finish, FinishReason::StopSequence(stop_str));
         assert_eq!(truncated, baseline[..cut]);
     }
 
@@ -2184,7 +2229,8 @@ mod tests {
     fn earliest_stop_match_finds_the_leftmost_match_across_multiple_stops() {
         assert_eq!(
             earliest_stop_match("hello world", &["world".to_string(), "hello".to_string()]),
-            Some(0)
+            Some((0, "hello")),
+            "the leftmost match wins, not the caller's first entry"
         );
         assert_eq!(
             earliest_stop_match("hello world", &["nope".to_string()]),

@@ -62,9 +62,15 @@ pub(crate) enum StopStep {
     /// Text that is provably safe to send. May be empty when the whole
     /// piece is still a possible partial match.
     Emit(String),
-    /// A stop string matched. This much (possibly empty) is the last
-    /// text of the answer; generation should end.
-    Matched(String),
+    /// A stop string matched. `text` (possibly empty) is the last text
+    /// of the answer; generation should end.
+    ///
+    /// `stop` is WHICH string matched, kept because two protocols ask:
+    /// Anthropic reports it as `stop_sequence`, and an agent branches
+    /// on it to tell its own fence from the model ending its turn. It
+    /// is the stop as the caller spelled it, which is the form the
+    /// caller can compare against its own list.
+    Matched { text: String, stop: String },
 }
 
 /// Resolves which stop strings are single tokens in this vocabulary.
@@ -128,10 +134,13 @@ impl StopMatcher {
         }
         self.pending.push_str(piece);
 
-        if let Some(cut) = earliest_stop_match(&self.pending, &self.stops) {
-            let out = self.pending[..cut].to_string();
+        if let Some((cut, stop)) = earliest_stop_match(&self.pending, &self.stops) {
+            let matched = StopStep::Matched {
+                text: self.pending[..cut].to_string(),
+                stop: stop.to_string(),
+            };
             self.pending.clear();
-            return StopStep::Matched(out);
+            return matched;
         }
 
         let keep = partial_suffix_len(&self.pending, &self.stops);
@@ -199,7 +208,13 @@ mod tests {
                 "a growing partial match escaped at {piece:?}"
             );
         }
-        assert_eq!(m.push("ll>"), StopStep::Matched(String::new()));
+        assert_eq!(
+            m.push("ll>"),
+            StopStep::Matched {
+                text: String::new(),
+                stop: "</tool_call>".into()
+            }
+        );
     }
 
     /// The precision half: text that cannot possibly be part of a stop
@@ -234,7 +249,10 @@ mod tests {
         let mut m = matcher(&["STOP"]);
         assert_eq!(
             m.push("keep thisSTOPdrop this"),
-            StopStep::Matched("keep this".into())
+            StopStep::Matched {
+                text: "keep this".into(),
+                stop: "STOP".into()
+            }
         );
         assert_eq!(m.flush(), "", "everything after the stop is gone");
     }
@@ -242,7 +260,16 @@ mod tests {
     #[test]
     fn the_leftmost_stop_wins_when_several_could_match() {
         let mut m = matcher(&["world", "hello"]);
-        assert_eq!(m.push("say hello world"), StopStep::Matched("say ".into()));
+        assert_eq!(
+            m.push("say hello world"),
+            StopStep::Matched {
+                text: "say ".into(),
+                // The leftmost match is "hello", and that is the stop
+                // reported -- not "world", which the caller listed
+                // first and which the text never reached.
+                stop: "hello".into()
+            }
+        );
     }
 
     /// Withheld text is output that was never disproved, so it must be
@@ -283,7 +310,13 @@ mod tests {
 
         let mut m = matcher(&["ありがとう"]);
         assert_eq!(m.push("あり"), StopStep::Emit(String::new()));
-        assert_eq!(m.push("がとう"), StopStep::Matched(String::new()));
+        assert_eq!(
+            m.push("がとう"),
+            StopStep::Matched {
+                text: String::new(),
+                stop: "ありがとう".into()
+            }
+        );
     }
 
     #[test]

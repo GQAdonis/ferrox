@@ -506,7 +506,7 @@ pub async fn completions(
 
     let text = chunks.concat();
     let finish_reason = match finish {
-        FinishReason::Stop => "stop",
+        FinishReason::Stop | FinishReason::StopSequence(_) => "stop",
         FinishReason::Length => "length",
         // Unreachable today -- this path passes `cancel: None` -- but
         // written out rather than defaulted so that wiring cancellation

@@ -334,6 +334,26 @@ mod tests {
     }
 
     #[test]
+    fn temp_capture_golden() {
+        let weights = make_weights();
+        let cfg = cfg();
+        let mut state = GdnState::new(&cfg);
+        let hidden = [0.2f32, -0.1, 0.3, -0.4];
+        let out0 = gdn_forward_token(&weights, &cfg, &hidden, &mut state);
+        let out1 = gdn_forward_token(&weights, &cfg, &hidden, &mut state);
+        println!(
+            "OUT0 {:?}",
+            out0.iter().map(|x| x.to_bits()).collect::<Vec<_>>()
+        );
+        println!("OUT0F {out0:?}");
+        println!(
+            "OUT1 {:?}",
+            out1.iter().map(|x| x.to_bits()).collect::<Vec<_>>()
+        );
+        println!("OUT1F {out1:?}");
+    }
+
+    #[test]
     fn softplus_matches_closed_form_at_zero() {
         assert!((softplus(0.0) - (2.0f32).ln()).abs() < 1e-6);
     }

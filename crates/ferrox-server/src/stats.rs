@@ -14,29 +14,44 @@
 //! is then wrong in the same direction -- which is exactly why the plan
 //! calls conflating them out by name.
 
-use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
 use ferrox_api::RecentRequest;
+use ferrox_edge::{mean_of_present, percentile, RequestRing};
 
 use crate::attribution::Attribution;
 
 /// Requests remembered. The contract says the last 200.
 pub(crate) const RING_CAPACITY: usize = 200;
 
+/// The most rows one `/v1/requests` poll will return, however large a
+/// `limit` it asks for. A page bigger than the ring cannot exist, and a
+/// caller who wants more history than the ring holds needs a longer
+/// ring, not a longer page.
+pub(crate) const MAX_PAGE: usize = RING_CAPACITY;
+
 /// Everything `/admin/stats` reports that is not already an
 /// `AppState` counter.
-#[derive(Default)]
 pub(crate) struct Stats {
-    recent: Mutex<VecDeque<RecentRequest>>,
+    recent: Mutex<RequestRing<RecentRequest>>,
     tokens_prompt_total: AtomicU64,
     tokens_generated_total: AtomicU64,
 }
 
+impl Default for Stats {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Stats {
     pub(crate) fn new() -> Self {
-        Self::default()
+        Stats {
+            recent: Mutex::new(RequestRing::new(RING_CAPACITY)),
+            tokens_prompt_total: AtomicU64::new(0),
+            tokens_generated_total: AtomicU64::new(0),
+        }
     }
 
     /// Records one finished request. Called after the response has been
@@ -49,20 +64,60 @@ impl Stats {
             .fetch_add(entry.prompt_tokens as u64, Ordering::Relaxed);
         self.tokens_generated_total
             .fetch_add(entry.completion_tokens as u64, Ordering::Relaxed);
-        let mut ring = self.recent.lock().unwrap_or_else(|p| p.into_inner());
-        if ring.len() == RING_CAPACITY {
-            ring.pop_front();
-        }
-        ring.push_back(entry);
+        self.recent
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push(entry);
     }
 
     pub(crate) fn recent(&self) -> Vec<RecentRequest> {
         self.recent
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .iter()
+            .rows()
             .cloned()
             .collect()
+    }
+
+    /// One incremental page for `/v1/requests`, plus the cursor to poll
+    /// with next and how many rows fell out of the ring before this
+    /// poll could see them.
+    pub(crate) fn page(&self, since: u64, limit: usize) -> (Vec<RecentRequest>, u64, u64) {
+        let ring = self.recent.lock().unwrap_or_else(|p| p.into_inner());
+        let page = ring.since(since, limit.clamp(1, MAX_PAGE));
+        (
+            page.rows.into_iter().cloned().collect(),
+            page.cursor,
+            page.missed,
+        )
+    }
+
+    /// How many requests this process has recorded in total, retained
+    /// in the ring or long since evicted.
+    pub(crate) fn recorded_total(&self) -> u64 {
+        self.recent
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .recorded_total()
+    }
+
+    /// The 95th-percentile whole-request latency over the ring,
+    /// nearest-rank -- so it names a request that really took that
+    /// long. `None` before anything has been served.
+    pub(crate) fn p95_duration_ms(&self) -> Option<f64> {
+        let ring = self.recent.lock().unwrap_or_else(|p| p.into_inner());
+        let durations: Vec<f64> = ring.rows().map(|r| r.duration_ms as f64).collect();
+        percentile(&durations, 95.0)
+    }
+
+    /// Mean time-to-first-token over the rows that HAVE one.
+    ///
+    /// A non-streamed request has no TTFT; counting those as zero would
+    /// make the server look faster the fewer clients stream.
+    pub(crate) fn ttft_mean_ms(&self) -> Option<f64> {
+        let ring = self.recent.lock().unwrap_or_else(|p| p.into_inner());
+        let ttfts: Vec<Option<f64>> = ring.rows().map(|r| r.ttft_ms).collect();
+        mean_of_present(ttfts)
     }
 
     pub(crate) fn tokens_prompt_total(&self) -> u64 {

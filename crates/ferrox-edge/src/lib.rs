@@ -17,6 +17,7 @@
 //! | module | decides |
 //! |---|---|
 //! | [`qstar`] | how many of a step's expert-cache misses to fetch over PCIe vs. run on the CPU |
+//! | [`bench_profile`] | where this machine's measured bandwidth profile lives, and when it may be trusted |
 //! | [`expert_cache`] | which experts stay resident in the GPU expert cache |
 //! | [`radix`] | which prefix of a new prompt is already computed, and what may be evicted |
 //! | [`anchor`] | which position an agentic turn will come back to, and what to keep for it |
@@ -38,9 +39,11 @@
 //! instead of shadowing it. Each module's docs say which.
 
 pub mod anchor;
+pub mod bench_profile;
 pub mod cache_manager;
 pub mod cache_report;
 pub mod detokenize;
+pub mod dsv4;
 pub mod effort;
 pub mod expert_cache;
 pub mod maintenance;
@@ -49,13 +52,18 @@ pub mod placement;
 pub mod pool;
 pub mod qstar;
 pub mod radix;
+pub mod residency;
 pub mod scheduler;
+pub mod state_pool;
 pub mod stats;
 pub mod window_pool;
 
 pub use anchor::{
     decode_slide, prefill_slide, resolve_anchor_token, snapshot_at_anchor, AnchorSnapshot,
     AnchorState, PingPong, RecurrentState, SlideDecision, SlidingRequest, WindowPolicy,
+};
+pub use bench_profile::{
+    load_backend_recommendation, load_hybrid_fetch_fraction, load_policy, usable_profile,
 };
 pub use cache_manager::{CacheManager, CommitOutcome, OutOfMemory, SequenceState};
 pub use cache_report::{CacheGeometry, CachePools};
@@ -70,6 +78,7 @@ pub use parser::{
 };
 pub use placement::{auto_cpu_layers, parse_cpu_layers_spec};
 pub use pool::{plan_cache_budget, validate_rebuild, PoolSizes, RebuildRequest};
+
 pub use qstar::{
     balanced_fetch, recommend_backend, BandwidthProfile, MoeBackend, QStarPolicy, QStarSplit,
 };

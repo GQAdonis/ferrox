@@ -52,6 +52,7 @@ mod mcp;
 mod model;
 mod openai_extra;
 mod output;
+pub(crate) mod responses;
 mod resume;
 mod security;
 mod session;
@@ -678,6 +679,16 @@ pub(crate) struct AppState {
     /// next successful load so `/admin/models` can say *why* an entry
     /// is in `error` without the user retrying to find out.
     last_load_error: Mutex<Option<(String, String)>>,
+    /// Live serving counters and the two sliding-window rates behind
+    /// `/v1/stats` -- see `ferrox_edge::ServingStats`. Distinct from
+    /// `stats`, which is the historical ring: this is what is happening
+    /// *now*, and it decays to zero when nothing is.
+    pub(crate) serving: Mutex<ferrox_edge::ServingStats>,
+    /// The gate every request, cache rebuild and shutdown passes
+    /// through -- see `ferrox_edge::MaintenanceGate`. Held across none
+    /// of them: each operation takes it, reads or moves the state, and
+    /// releases before doing any work.
+    pub(crate) maintenance: Mutex<ferrox_edge::MaintenanceGate>,
 }
 
 impl AppState {
@@ -3108,6 +3119,8 @@ fn build_app_state(
         continuous_batching_enabled: enable_continuous_batching,
         loading_model: Mutex::new(None),
         last_load_error: Mutex::new(None),
+        serving: Mutex::new(ferrox_edge::ServingStats::default()),
+        maintenance: Mutex::new(ferrox_edge::MaintenanceGate::new()),
     }
 }
 
@@ -4025,6 +4038,10 @@ mod tests {
             continuous_batching_enabled: false,
             loading_model: Mutex::new(None),
             last_load_error: Mutex::new(None),
+            serving: Mutex::new(ferrox_edge::ServingStats::default()),
+            maintenance: Mutex::new(ferrox_edge::MaintenanceGate::new()),
+            serving: Mutex::new(ferrox_edge::ServingStats::default()),
+            maintenance: Mutex::new(ferrox_edge::MaintenanceGate::new()),
         }
     }
 

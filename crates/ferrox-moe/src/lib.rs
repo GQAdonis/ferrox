@@ -60,10 +60,20 @@ pub struct MoeLayerConfig {
     /// "Paris" for "the capital of France is"; ferrox, with this bug,
     /// answered something else entirely).
     pub norm_topk_prob: bool,
-    /// Optional Mixtral-style expert grouping (`expert_group_count` /
-    /// `expert_group_used_count` in GGUF). `None` means flat top-k over
-    /// all experts (Llama / OLMoE / Qwen2-MoE). Grouped routing is
-    /// selected at load time; the hot path reads these fields as data.
+    /// Optional DeepSeek-V3 / GLM-family expert grouping
+    /// (`expert_group_count` / `expert_group_used_count` in GGUF, i.e.
+    /// `n_group` / `topk_group` in the HF configs). `None` means flat
+    /// top-k over all experts (Llama / OLMoE / Qwen2-MoE). Grouped
+    /// routing is selected at load time; the hot path reads these fields
+    /// as data.
+    ///
+    /// `expert_group_used_count` is the number of *groups* that survive
+    /// the group filter -- it is **not** a per-group expert quota. All
+    /// `n_experts_active` experts are then chosen by one global top-k
+    /// over the surviving groups, so a token may (and normally does) put
+    /// several experts in the same group. See
+    /// [`route_top_k_grouped_biased`] for the exact rule and for what
+    /// reading this field as "experts per group" silently does instead.
     pub expert_group_count: Option<usize>,
     pub expert_group_used_count: Option<usize>,
     /// llama.cpp's `expert_weights_scale` hparam (GGUF
@@ -181,9 +191,121 @@ pub fn route_top_k(
 /// With `bias = None` this is the unbiased routing plus the scale, so a
 /// caller does not need a second code path for layers that happen not to
 /// carry the tensor.
+///
+/// This is exactly [`route_top_k_grouped_biased`] with a single expert
+/// group, i.e. no group filter at all -- the two share one body so that
+/// a checkpoint carrying `exp_probs_b` *and* expert groups cannot end up
+/// routed by a second, differently-behaving copy of the same rule.
 pub fn route_top_k_biased(
     logits: &[f32],
     bias: Option<&[f32]>,
+    k: usize,
+    gating: GatingFunction,
+    norm_w: bool,
+    w_scale: f32,
+) -> RoutingDecision {
+    route_top_k_grouped_biased(logits, bias, 1, 1, k, gating, norm_w, w_scale)
+}
+
+/// Scores each expert group as the **sum of its top two** member
+/// scores, keeps the `topk_group` highest-scoring groups, and masks
+/// every expert of every other group to `-inf` in place.
+///
+/// Transcribed from the reference's `_group_limited` (FreeToken
+/// `models/glm4_moe/moe.py`, identical copy in `models/glm_moe_dsa/`),
+/// which is itself HF's `Glm4MoeMoE` / DeepSeek-V3 group filter:
+///
+/// ```text
+/// group_scores = scores_for_choice.view(m, g, e // g).topk(2, -1)[0].sum(-1)
+/// group_idx    = topk(group_scores, topk_group)[1]
+/// scores_for_choice.masked_fill(~group_mask, -inf)
+/// ```
+///
+/// Two details are load-bearing. The group score is the top-**two**
+/// sum, not the group max: a group holding two good experts must be
+/// able to beat a group holding one great expert and nothing else,
+/// which is the entire reason the filter exists. And the masking runs
+/// on the **biased** selection scores (`probs + exp_probs_b`), so the
+/// aux-loss-free bias steers which *groups* survive, not only which
+/// experts win inside them.
+///
+/// `topk_group` is clamped to `1..=n_groups`: a stored zero would mask
+/// every expert to `-inf` and leave the following top-k picking experts
+/// out of an all-`-inf` array, which is a silently arbitrary routing
+/// rather than a loud failure.
+///
+/// Groups smaller than two experts sum whatever the group has (the
+/// reference cannot express this case at all -- `topk(2)` on a
+/// one-element group raises -- and no real checkpoint ships it).
+fn mask_unselected_groups(selection: &mut [f32], n_groups: usize, topk_group: usize) {
+    let group_size = selection.len() / n_groups;
+    let topk_group = topk_group.clamp(1, n_groups);
+
+    let mut group_scores: Vec<(usize, f32)> = (0..n_groups)
+        .map(|g| {
+            let mut members: Vec<f32> = selection[g * group_size..(g + 1) * group_size].to_vec();
+            members.sort_unstable_by(|a, b| b.partial_cmp(a).unwrap());
+            (g, members.iter().take(2).sum::<f32>())
+        })
+        .collect();
+    // Descending by score, ties broken by group index so the choice is
+    // reproducible run to run (`torch.topk(..., sorted=False)` makes no
+    // ordering promise, but a router must not be nondeterministic).
+    group_scores.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap().then(a.0.cmp(&b.0)));
+
+    let mut keep = vec![false; n_groups];
+    for &(g, _) in group_scores.iter().take(topk_group) {
+        keep[g] = true;
+    }
+    for (g, kept) in keep.iter().enumerate() {
+        if !kept {
+            for s in selection[g * group_size..(g + 1) * group_size].iter_mut() {
+                *s = f32::NEG_INFINITY;
+            }
+        }
+    }
+}
+
+/// The real DeepSeek-V3 / GLM-family `n_group` / `topk_group` router:
+/// group-limited **selection**, followed by ONE GLOBAL top-k.
+///
+/// Port of the reference's `Glm4MoeSparseBlock._route` (FreeToken
+/// `models/glm4_moe/moe.py:63`, identical in `models/glm_moe_dsa/`),
+/// which matches HF `Glm4MoeMoE.route_tokens_to_experts` and
+/// llama.cpp's `build_moe_ffn` `n_expert_groups > 1` block:
+///
+/// 1. `probs = gating(logits)`;
+/// 2. `selection = probs + exp_probs_b` (bias steers selection only);
+/// 3. if `n_groups > 1`, [`mask_unselected_groups`] masks every expert
+///    outside the `topk_group` best groups to `-inf`;
+/// 4. **one global** top-`k` over the surviving `selection` scores --
+///    the groups constrain *where* experts may come from, they do not
+///    hand out per-group quotas;
+/// 5. weights gathered from the **unbiased** `probs` at the chosen ids;
+/// 6. optional renormalisation (`norm_w`) and constant scale
+///    (`w_scale`).
+///
+/// The invariant that makes this a different algorithm from "take a
+/// fixed number of experts from every group": the number of experts a
+/// surviving group contributes is decided by the scores, not by the
+/// config. A token whose eight active experts all belong to two hot
+/// groups must fire exactly those eight. Taking a quota per group
+/// instead spreads the same token's experts one-per-group across all
+/// eight groups -- eight *different* experts, a different FFN output,
+/// and no error anywhere: the wrong routing is only visible as degraded
+/// generation quality. That was ferrox's real behaviour before this
+/// function existed (see the `grouped_routing_concentrates_*` test).
+///
+/// `n_groups <= 1`, or an expert count that is not a multiple of
+/// `n_groups`, skips the group filter entirely and leaves plain flat
+/// biased routing -- the shape [`route_top_k_biased`] delegates here
+/// with.
+#[allow(clippy::too_many_arguments)]
+pub fn route_top_k_grouped_biased(
+    logits: &[f32],
+    bias: Option<&[f32]>,
+    n_groups: usize,
+    topk_group: usize,
     k: usize,
     gating: GatingFunction,
     norm_w: bool,
@@ -200,7 +322,7 @@ pub fn route_top_k_biased(
         GatingFunction::SqrtSoftplus => logits.iter().map(|&l| sqrt_softplus(l)).collect(),
     };
 
-    let selection: Vec<f32> = match bias {
+    let mut selection: Vec<f32> = match bias {
         Some(b) => {
             assert_eq!(
                 b.len(),
@@ -212,8 +334,21 @@ pub fn route_top_k_biased(
         None => probs.clone(),
     };
 
+    if n_groups > 1 && !selection.is_empty() && selection.len().is_multiple_of(n_groups) {
+        mask_unselected_groups(&mut selection, n_groups, topk_group);
+    }
+
     let mut idx: Vec<usize> = (0..selection.len()).collect();
-    idx.sort_unstable_by(|&a, &b| selection[b].partial_cmp(&selection[a]).unwrap());
+    // Ties break by expert index: without the group filter exact ties
+    // essentially never happen, but every masked-out expert is exactly
+    // `-inf`, so a `k` larger than the surviving population would
+    // otherwise pick arbitrary losers in unspecified order.
+    idx.sort_unstable_by(|&a, &b| {
+        selection[b]
+            .partial_cmp(&selection[a])
+            .unwrap()
+            .then(a.cmp(&b))
+    });
     let top = &idx[..k.min(idx.len())];
 
     let mut weights: Vec<f32> = top.iter().map(|&i| probs[i]).collect();
@@ -238,18 +373,25 @@ pub fn route_top_k_biased(
     }
 }
 
-/// Mixtral-/DeepSeek-style grouped top-k: split `logits` into
-/// `n_groups` contiguous expert groups, pick the `k_per_group` highest
-/// within each group (by the same score as flat [`route_top_k`]), then
-/// optionally keep only the global top-`total_k` across groups.
+/// Bias-free grouped routing: [`route_top_k_grouped_biased`] for the
+/// checkpoints that declare `expert_group_count` /
+/// `expert_group_used_count` but carry no `exp_probs_b` tensor and no
+/// expert-weight scale.
 ///
-/// When `n_groups <= 1` this is identical to flat routing with `k =
-/// total_k`. Used when GGUF carries `expert_group_count` /
-/// `expert_group_used_count`.
+/// `topk_group` is GGUF's `expert_group_used_count`, i.e. how many
+/// **groups** survive the filter -- not how many experts to take from
+/// each group. Reading it the second way is the routing bug this
+/// function used to have: see [`route_top_k_grouped_biased`]'s doc
+/// comment for the exact failure it produces.
+///
+/// When `n_groups <= 1`, or when the expert count is not a multiple of
+/// `n_groups`, this falls back to flat [`route_top_k`] -- including that
+/// function's per-gating conventions (notably `Sigmoid`'s
+/// always-renormalize rule, see [`route_top_k_sigmoid`]).
 pub fn route_top_k_grouped(
     logits: &[f32],
     n_groups: usize,
-    k_per_group: usize,
+    topk_group: usize,
     total_k: usize,
     gating: GatingFunction,
     norm_topk_prob: bool,
@@ -257,31 +399,16 @@ pub fn route_top_k_grouped(
     if n_groups <= 1 || !logits.len().is_multiple_of(n_groups) {
         return route_top_k(logits, total_k, gating, norm_topk_prob);
     }
-    let group_size = logits.len() / n_groups;
-    let mut selected: Vec<(usize, f32)> = Vec::new();
-    for g in 0..n_groups {
-        let start = g * group_size;
-        let slice = &logits[start..start + group_size];
-        let local = route_top_k(slice, k_per_group.min(group_size), gating, false);
-        for (i, &expert) in local.expert_ids.iter().enumerate() {
-            selected.push((start + expert, local.weights[i]));
-        }
-    }
-    selected.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-    selected.truncate(total_k.min(selected.len()));
-    let mut weights: Vec<f32> = selected.iter().map(|(_, w)| *w).collect();
-    if norm_topk_prob {
-        let sum: f32 = weights.iter().sum();
-        if sum > 0.0 {
-            for w in weights.iter_mut() {
-                *w /= sum;
-            }
-        }
-    }
-    RoutingDecision {
-        expert_ids: selected.into_iter().map(|(i, _)| i).collect(),
-        weights,
-    }
+    route_top_k_grouped_biased(
+        logits,
+        None,
+        n_groups,
+        topk_group,
+        total_k,
+        gating,
+        norm_topk_prob,
+        1.0,
+    )
 }
 
 /// sqrt-softplus top-k routing, DeepSeek V4's real non-hash-routed MoE

@@ -33,6 +33,32 @@
 //! [`None`], meaning "compute this one on the CPU". Every route is
 //! assigned exactly once, to exactly one device.
 //!
+//! # Reading the cache back
+//!
+//! [`ExpertCache::stats`] answers "is the cache big enough?" for the
+//! model as a whole. [`ExpertCache::layer_stats`] answers it per MoE
+//! layer, which is the only form that can tell *one layer thrashing*
+//! from *every layer uniformly a little over budget*: both show the
+//! same global miss rate and they have opposite fixes -- rebalance
+//! versus grow. [`ExpertCache::routing_skew`] goes one level below the
+//! cache and reports what the routing distribution itself allows; a
+//! layer whose `oracle_hit_at_slots` is already low cannot be helped by
+//! any cache size, because no policy could do better on that traffic.
+//!
+//! # The prefill double buffers
+//!
+//! A prefill chunk walks the layers in order, so it can stage layer
+//! `L + 1`'s experts while layer `L` computes. The two staging buffers
+//! **borrow** slots `[0, 2 * num_experts)` of this very cache and
+//! rotate by `layer % 2`. Borrowed is not owned: the bytes in those
+//! slots are rewritten every other layer within a chunk, so a slot at
+//! or below `2 * num_experts` can never be read as residency, and the
+//! buffers' contents are never registered in the residency map.
+//! [`ExpertCache::prefetch_prefill_layer`] is the whole portable half
+//! of that -- which expert rows are already on the device, which have
+//! to cross the link, and what the borrowed slots do to the LRU. No
+//! streams, no events and no copies live here.
+//!
 //! Ported 1:1 from FreeToken's `moe/offload_cache.py` and
 //! `moe/offload_kernels.py`, whose LRU is the `lru_ensure` kernel from
 //! `flashlib` (both Apache-2.0); see `docs/THIRD_PARTY_NOTICES.md`.
@@ -139,10 +165,189 @@ impl ExpertCacheStats {
         }
         self.active as f64 / self.calls as f64
     }
+
+    /// Misses per call, before the cap. Quoted beside
+    /// [`active_per_call`](Self::active_per_call) because the pair is
+    /// what sizes a link budget: `missing_per_call * bytes_per_expert`
+    /// is what one step wants to move.
+    pub fn missing_per_call(&self) -> f64 {
+        if self.calls == 0 {
+            return 0.0;
+        }
+        self.missing as f64 / self.calls as f64
+    }
+
+    /// Misses per call that actually crossed the link. Under the `q*`
+    /// split this is the one the link sees; `missing_per_call` minus
+    /// this is what the CPU absorbed.
+    pub fn fetched_per_call(&self) -> f64 {
+        if self.calls == 0 {
+            return 0.0;
+        }
+        self.fetched as f64 / self.calls as f64
+    }
 }
+
+/// One MoE layer's routing concentration over the observed decode
+/// histogram.
+///
+/// Every field is derived from that layer's histogram row alone, so a
+/// layer that was never routed to has no entry at all rather than a row
+/// of zeros -- a zero working set and a zero oracle hit rate would read
+/// as "this layer is unservable" when the truth is "no data".
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LayerRoutingSkew {
+    pub layer: u32,
+    /// Total routes observed for this layer, counting duplicates.
+    pub routed: u64,
+    /// Distinct experts that were routed to at least once.
+    pub working_set: usize,
+    /// How many of the hottest experts it takes to cover 90% of this
+    /// layer's routing mass.
+    pub experts_for_90pct: usize,
+    /// Routing entropy over `ln(num_experts)`. `1.0` is a perfectly
+    /// flat router, `0.0` a layer that always picks the same expert.
+    pub norm_entropy: f64,
+    /// The top-`oracle_slots` share of this layer's routing mass: the
+    /// best hit rate *any* per-layer policy could reach on the observed
+    /// distribution, with no LRU/LFU dynamics in it at all.
+    ///
+    /// This is the number that separates the two diagnoses. A high
+    /// oracle hit rate next to a low realized one
+    /// ([`ExpertCacheStats::miss_rate`]) means the policy is losing
+    /// residency it could have kept; a low oracle hit rate means the
+    /// layer's routing is flat and no cache size will help it.
+    pub oracle_hit_at_slots: f64,
+}
+
+/// The routing-skew report: per layer, plus the means over the layers
+/// that were actually routed to.
+///
+/// The means deliberately exclude un-routed layers, matching the
+/// per-layer list. Averaging zeros for layers that produced no traffic
+/// would drag every aggregate toward zero in proportion to how much of
+/// the model the window happened to touch, which makes two windows of
+/// the same model incomparable.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RoutingSkewReport {
+    /// `cache_size / num_layers`, unrounded -- the fair share a
+    /// per-layer cache would get.
+    pub slots_per_layer: f64,
+    /// The fair share as a usable slot count, `max(1, round(share))`.
+    /// The oracle is quoted at this many slots.
+    pub oracle_slots: usize,
+    pub working_set_mean: f64,
+    pub working_set_max: usize,
+    pub experts_for_90pct: f64,
+    pub oracle_hit_at_slots: f64,
+    pub norm_entropy: f64,
+    /// One entry per layer that was routed to, in layer order.
+    pub per_layer: Vec<LayerRoutingSkew>,
+}
+
+/// The share of routing mass [`LayerRoutingSkew::experts_for_90pct`]
+/// covers.
+const COVERAGE_FRACTION: f64 = 0.9;
+
+/// Per-expert row size below which a host bank ships its whole layer as
+/// one transfer entry.
+///
+/// A batched host-to-device copy silently degrades to a *synchronous*
+/// transfer when one batch mixes large entries with sub-256 KiB ones.
+/// The bytes still move at full link rate, but the host stalls for the
+/// whole transfer, which un-hides the GEMM that the prefetch was
+/// supposed to overlap with. Banks whose per-expert row is smaller than
+/// this ship as a single whole-layer entry -- their entire layer is
+/// tiny -- so every per-run entry a batch sees stays above the floor.
+pub const SMALL_BANK_FEAT_BYTES: u64 = 256 * 1024;
 
 /// Marks a slot as unevictable for this step.
 const UNEVICTABLE: i64 = i64::MAX;
+
+/// A contiguous run of expert ids, `[start, start + len)`.
+///
+/// Misses are coalesced into runs because one transfer entry per run is
+/// one descriptor and one large copy, where one entry per expert is
+/// `num_experts` descriptors of one row each -- the same bytes at a
+/// fraction of the achievable rate, and enough small entries to trip
+/// the [`SMALL_BANK_FEAT_BYTES`] floor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MissRun {
+    pub start: u32,
+    pub len: u32,
+}
+
+/// Device-to-device rows: what the prefill buffer can take from the
+/// cache instead of from the host.
+///
+/// `dst_slots[i]` is an absolute cache slot inside the buffer's borrowed
+/// range; `src_slots[i]` is the absolute cache slot the expert is
+/// already resident in. Both are slots -- unlike [`CopyPlan`], nothing
+/// here indexes a host bank.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GatherPlan {
+    pub dst_slots: Vec<u32>,
+    pub src_slots: Vec<u32>,
+}
+
+impl GatherPlan {
+    pub fn len(&self) -> usize {
+        self.dst_slots.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.dst_slots.is_empty()
+    }
+}
+
+/// One host-to-device transfer entry: `rows` consecutive expert rows of
+/// one bank.
+///
+/// `dst_slot` is the absolute cache slot the run lands on (inside the
+/// buffer's borrowed range) and `src_row` is the **layer-local** expert
+/// row it comes from, the same convention as [`CopyPlan::src_rows`], so
+/// each layer's bank can live in its own allocation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BankEntry {
+    /// Index into the `bank_feat_bytes` the caller passed, in that
+    /// order.
+    pub bank: usize,
+    pub dst_slot: u32,
+    pub src_row: u32,
+    pub rows: u32,
+    pub bytes: u64,
+    /// Set when this entry is the whole layer because the bank is
+    /// small ([`SMALL_BANK_FEAT_BYTES`]) rather than because the whole
+    /// layer missed.
+    pub whole_layer: bool,
+}
+
+/// What staging one layer into a prefill double buffer costs.
+///
+/// The two row sets are disjoint by construction -- an expert is either
+/// gathered device-side or shipped from the host, never both -- which is
+/// what lets the gather and the host transfer run without ordering
+/// against each other.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PrefillPlan {
+    pub layer: u32,
+    /// `layer % 2`.
+    pub buffer_id: u32,
+    /// The buffer already held this layer, so nothing moves. Every
+    /// other field is empty.
+    pub already_loaded: bool,
+    /// Resident rows, cache -> buffer, device-side.
+    pub gather: GatherPlan,
+    /// Non-resident rows, coalesced.
+    pub miss_runs: Vec<MissRun>,
+    /// The host transfer batch, grouped by bank in the caller's order.
+    pub entries: Vec<BankEntry>,
+    /// Banks the gather serves -- those at or above
+    /// [`SMALL_BANK_FEAT_BYTES`]. A small bank's rows are covered by its
+    /// whole-layer entry instead, so gathering them too would move the
+    /// same bytes twice.
+    pub gather_banks: Vec<usize>,
+}
 
 /// The GPU expert cache's residency map.
 #[derive(Debug)]
@@ -162,6 +367,21 @@ pub struct ExpertCache {
     recency: Vec<i64>,
     fetch_order: FetchOrder,
     stats: ExpertCacheStats,
+    /// The same counters as `stats`, attributed to the layer that
+    /// produced them. Indexed by MoE layer id.
+    layer_stats: Vec<ExpertCacheStats>,
+    collect_routing: bool,
+    /// Flat id -> how many times it was routed to, duplicates counted.
+    routing_freq: Vec<u64>,
+    /// Which layer each prefill buffer currently stages, if any.
+    prefill_layer: [Option<u32>; 2],
+    /// Whether the consumer is done reading each buffer.
+    prefill_released: [bool; 2],
+    /// `slot_for_id` as it stood when the chunk opened. See
+    /// [`ExpertCache::begin_prefill`].
+    prefill_snapshot: Option<Vec<i64>>,
+    prefill_hit_rows: u64,
+    prefill_total_rows: u64,
 }
 
 impl ExpertCache {
@@ -192,6 +412,14 @@ impl ExpertCache {
             recency: vec![-1; total_ids],
             fetch_order: FetchOrder::default(),
             stats: ExpertCacheStats::default(),
+            layer_stats: vec![ExpertCacheStats::default(); num_layers],
+            collect_routing: false,
+            routing_freq: vec![0; total_ids],
+            prefill_layer: [None, None],
+            prefill_released: [true, true],
+            prefill_snapshot: None,
+            prefill_hit_rows: 0,
+            prefill_total_rows: 0,
         }
     }
 
@@ -216,8 +444,39 @@ impl ExpertCache {
         self.stats
     }
 
+    /// The same counters as [`stats`](Self::stats), attributed to one
+    /// MoE layer over the current `reset_stats`-delimited window.
+    ///
+    /// A single global miss rate cannot distinguish one layer thrashing
+    /// from every layer being uniformly a little over budget: the two
+    /// average out to the same number and want opposite fixes -- move
+    /// slots between layers, versus give the pool more slots. This is
+    /// the breakdown that tells them apart. Sums over every layer equal
+    /// [`stats`](Self::stats) exactly.
+    pub fn layer_stats(&self, layer: u32) -> ExpertCacheStats {
+        self.layer_stats[layer as usize]
+    }
+
+    /// Every layer's counters at once, indexed by MoE layer id.
+    pub fn per_layer_stats(&self) -> &[ExpertCacheStats] {
+        &self.layer_stats
+    }
+
+    /// Close the current stats window and open a new one.
+    ///
+    /// The routing histogram is deliberately *not* cleared here: it
+    /// estimates a distribution, and its value grows with the number of
+    /// steps behind it, so a `/metrics` scrape that resets the rate
+    /// counters must not also destroy it. Use
+    /// [`reset_routing`](Self::reset_routing) when the distribution
+    /// itself is what went stale.
     pub fn reset_stats(&mut self) {
         self.stats = ExpertCacheStats::default();
+        for layer in &mut self.layer_stats {
+            *layer = ExpertCacheStats::default();
+        }
+        self.prefill_hit_rows = 0;
+        self.prefill_total_rows = 0;
     }
 
     /// Total routed experts across the model -- the denominator the
@@ -263,7 +522,9 @@ impl ExpertCache {
         self.usage.fill(0);
         self.recency.fill(-1);
         self.step = 0;
-        self.stats = ExpertCacheStats::default();
+        self.reset_stats();
+        self.reset_routing();
+        self.forget_prefill_buffers();
     }
 
     /// Resize the pool, keeping the model geometry.

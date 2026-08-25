@@ -455,10 +455,54 @@ pub(crate) async fn cache_rebuild(
         );
     }
 
-    // 3. The pool, which can still refuse -- and says by how much.
+    // 3. The pool, inside a transaction -- which can still refuse, and
+    //    says by how much.
+    //
+    // `RebuildTxn` exists for the destructive case: free the old pools,
+    // allocate the new, and a failure on either side of that line means
+    // something different (see `ferrox_edge::rebuild`). Ferrox has no
+    // such line YET -- `KvBlockPool::resize` moves counters and frees
+    // nothing, so it either succeeds or refuses atomically, and the
+    // closure below never marks a teardown. The transaction is wired
+    // anyway rather than added later: the day a device-side pool really
+    // is torn down, the caller marks the teardown and the rollback arm
+    // is already here and already tested, instead of being written
+    // under the pressure of the first engine that 503s forever.
     let before = pool.total_blocks() as u64;
-    match pool.resize(pages as usize) {
-        Ok(()) => {
+    let current = ferrox_edge::PoolSizes {
+        moe_cache_slots: 0,
+        kv_pages: before,
+        prefill_overlap: false,
+    };
+    let target = ferrox_edge::PoolSizes {
+        kv_pages: pages,
+        ..current
+    };
+    let txn = ferrox_edge::RebuildTxn::open(
+        &ferrox_edge::RebuildRequest {
+            moe_cache_slots: None,
+            kv_pages: Some(pages),
+            mamba_slots: None,
+            swa_pages: None,
+        },
+        &current,
+    );
+
+    let mut refused_floor: Option<usize> = None;
+    let outcome = txn.run(
+        target,
+        |_mark_teardown, target| {
+            // No `mark_teardown()`: nothing is freed here. See above.
+            pool.resize(target.kv_pages as usize).map_err(|held| {
+                refused_floor = Some(held);
+                format!("{held} page(s) are held by in-flight requests")
+            })
+        },
+        |_old, _touched| unreachable!("nothing was torn down, so nothing can be restored"),
+    );
+
+    match outcome {
+        ferrox_edge::RebuildOutcome::Applied(_) => {
             let after = pool.total_blocks() as u64;
             drop(pool);
             // Any KV-side resize invalidates the prefix cache: a cached
@@ -485,9 +529,10 @@ pub(crate) async fn cache_rebuild(
             }))
             .into_response()
         }
-        Err(held) => {
+        ferrox_edge::RebuildOutcome::RejectedIntact { .. } => {
             drop(pool);
             reopen(true);
+            let held = refused_floor.unwrap_or(0);
             refusal(
                 StatusCode::CONFLICT,
                 "busy",
@@ -497,6 +542,33 @@ pub(crate) async fn cache_rebuild(
                      Retry when they finish, or ask for at least {} tokens",
                     held as u64 * page_size
                 ),
+            )
+        }
+        // Unreachable while the resize frees nothing, and written out
+        // rather than defaulted so that making it destructive is a
+        // compile error here first instead of a silent 503-forever.
+        ferrox_edge::RebuildOutcome::RolledBack { reason, .. } => {
+            drop(pool);
+            reopen(true);
+            refusal(StatusCode::CONFLICT, "busy", reason)
+        }
+        ferrox_edge::RebuildOutcome::Latched {
+            reason,
+            rollback_error,
+        } => {
+            drop(pool);
+            // The one outcome that does NOT reopen the gate: there are
+            // no pools and no way back, so the engine must stop
+            // pretending it can serve.
+            state
+                .maintenance
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .latch_failed();
+            refusal(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed",
+                format!("{reason}; and the rollback failed too: {rollback_error}"),
             )
         }
     }

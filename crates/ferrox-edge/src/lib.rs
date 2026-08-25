@@ -56,6 +56,7 @@ pub mod placement;
 pub mod pool;
 pub mod qstar;
 pub mod radix;
+pub mod rebuild;
 pub mod residency;
 pub mod scheduler;
 pub mod state_pool;
@@ -103,6 +104,8 @@ pub use footprint::{
 };
 
 pub use outbox::{finish_stop, receipt_id, Receipt, ReceiptStatus, StopFailure};
+
+pub use rebuild::{EngineActivity, RebuildOutcome, RebuildTxn, TouchedPools};
 
 pub use maintenance::{
     AdmissionClosed, MaintenanceGate, MaintenanceState, RebuildRefused, SealedAccounting,

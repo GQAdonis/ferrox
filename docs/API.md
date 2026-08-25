@@ -23,7 +23,7 @@ comes back the same way.
 | `GET /v1/stats` · `GET /v1/requests` | Live serving telemetry, pool gauges, memory footprint, and the request ring |
 | `POST /v1/cancel` | Stop a streamed generation by `request_id` (see below) |
 | `GET /v1/cache/status` · `POST /v1/cache/rebuild` | KV pool geometry and re-split (see below) |
-| `POST /admin/prepare_stop` | Close admission and seal the accounting (see below) |
+| `POST /v1/admin/prepare-stop` | Close admission, seal the accounting, and make the receipt durable (see below) |
 | `GET /cache/stats` · `GET /metrics` | Ferrox extensions |
 | `/admin/*` | Control surface (see below) |
 | Audio / images | Not supported |

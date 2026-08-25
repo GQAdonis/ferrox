@@ -696,6 +696,16 @@ pub(crate) struct AppState {
     /// because holding it across the probe is what collapses concurrent
     /// pollers onto ONE VMA walk.
     pub(crate) footprint: Mutex<ferrox_edge::ProbeCache<ferrox_edge::Footprint>>,
+    /// Wall-clock second this process started serving.
+    ///
+    /// Distinct from `started_at`, which is an `Instant` and has no
+    /// wall clock at all. This exists so an accounting receipt's id can
+    /// be derived from something stable for the life of THIS process
+    /// and different in the next one: a pid alone is reused across
+    /// restarts, and a restarted engine reusing a previous
+    /// generation's receipt id would have its own receipt silently
+    /// skipped as already written.
+    pub(crate) started_unix: u64,
 }
 
 /// How long a memory reading is served before it is taken again.
@@ -3434,7 +3444,19 @@ fn build_app_state(
         serving: Mutex::new(ferrox_edge::ServingStats::default()),
         maintenance: Mutex::new(ferrox_edge::MaintenanceGate::serving()),
         footprint: Mutex::new(ferrox_edge::ProbeCache::new(FOOTPRINT_TTL_MS)),
+        started_unix: unix_now(),
     }
+}
+
+/// Seconds since the epoch, or zero on a machine whose clock is set
+/// before it. Only ever used to make an id distinct between process
+/// generations, so a nonsense clock costs distinctness and nothing
+/// else.
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 /// The `/admin/models` id of the checkpoint `FERROX_MODEL_PATH` names,
@@ -4373,6 +4395,7 @@ mod tests {
             serving: Mutex::new(ferrox_edge::ServingStats::default()),
             maintenance: Mutex::new(ferrox_edge::MaintenanceGate::serving()),
             footprint: Mutex::new(ferrox_edge::ProbeCache::new(FOOTPRINT_TTL_MS)),
+            started_unix: unix_now(),
         }
     }
 

@@ -50,6 +50,7 @@ pub mod effort;
 pub mod expert_cache;
 pub mod footprint;
 pub mod maintenance;
+pub mod outbox;
 pub mod parser;
 pub mod placement;
 pub mod pool;
@@ -100,6 +101,8 @@ pub use state_pool::{
 pub use footprint::{
     parse_smaps_rollup_pss, parse_status_rss, sum_footprints, Footprint, FootprintKind, ProbeCache,
 };
+
+pub use outbox::{finish_stop, receipt_id, Receipt, ReceiptStatus, StopFailure};
 
 pub use maintenance::{
     AdmissionClosed, MaintenanceGate, MaintenanceState, RebuildRefused, SealedAccounting,

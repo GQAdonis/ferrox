@@ -64,6 +64,8 @@ library or overriding the CLI.
 | `FERROX_PIN_BUDGET_GB` | Override the page-locking budget expert-bank placement plans against. Unset means no cap on plain Linux; on WSL, where WDDM-backed CUDA caps pinning near half of RAM *shared across processes*, it defaults to 40% of physical RAM |
 | `FERROX_BENCHBW_PATH` | Explicit path to this host's measured bandwidth profile. Otherwise one file per GPU uuid under `$XDG_CACHE_HOME/ferrox/benchbw/`, then the legacy `benchbw.json`. A file that exists but does not parse yields **no** profile rather than falling through, so a corrupt per-card profile never silently borrows another card's numbers |
 | `FERROX_DECODE_LOG_INTERVAL` | Decode forwards between two batch status lines (default 40). `0` logs every forward. An unparseable value takes the default rather than failing a server to start over a log setting |
+| `FERROX_ACCOUNTING_OUTBOX` | Directory accounting receipts are written to, atomically and idempotently by receipt id, before `POST /v1/admin/prepare-stop` answers. Unset means no outbox and no persistence step |
+| `FERROX_INSTANCE_ID` | Names this engine generation for the receipt id. Unset falls back to the pid plus the process's wall-clock start, which is stable for the life of the process and different in the next one |
 
 ## Security and transport
 

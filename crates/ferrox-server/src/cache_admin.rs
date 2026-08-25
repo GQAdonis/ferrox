@@ -44,7 +44,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use ferrox_edge::{
-    Footprint, FootprintKind, MaintenanceState, PoolUsage, RebuildRefused, StopRefused,
+    Footprint, FootprintKind, MaintenanceState, PoolUsage, RebuildRefused, Receipt, StopRefused,
 };
 use serde::Deserialize;
 
@@ -82,6 +82,128 @@ pub(crate) async fn cache_status(State(state): State<Arc<AppState>>) -> Json<ser
         "swa": serde_json::Value::Null,
         "resizable": kv.is_some().then(|| serde_json::json!(["kv"])),
     }))
+}
+
+/// The sealed totals plus their receipt, written before the answer
+/// goes out.
+///
+/// **Durable before the reply, because here the reply IS the signal.**
+/// This server has no child process to signal; a supervisor learns the
+/// stop is sealed by reading this response. Answering first and writing
+/// after would leave a crash in between with the supervisor believing a
+/// receipt exists that does not -- which is the exact loss the ordering
+/// rule in `ferrox_edge::outbox` exists to prevent.
+///
+/// A write failure is therefore a refusal rather than a warning. The
+/// engine is preserved, the totals are already sealed and idempotent,
+/// and a retry derives the same id and seals the same numbers, so
+/// retrying costs nothing and cannot double-count.
+fn sealed_response(state: &AppState, sealed: &ferrox_edge::SealedAccounting) -> Response {
+    match persist_receipt(state, sealed) {
+        Ok(receipt) => {
+            let mut body = sealed_json(sealed);
+            if let Some(receipt) = receipt {
+                body["receipt_id"] = serde_json::json!(receipt.id);
+                body["receipt_status"] = serde_json::json!(receipt.status.as_str());
+            }
+            Json(body).into_response()
+        }
+        Err(why) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": why.to_string(),
+                "drain_complete": true,
+                "engine_preserved": true,
+                "retryable": true,
+            })),
+        )
+            .into_response(),
+    }
+}
+
+/// Where accounting receipts are written, or `None` for a deployment
+/// that keeps none.
+///
+/// Unset means no outbox and no persistence step, which is the right
+/// default for a server nobody is billing: inventing a directory under
+/// a user's home to write accounting documents they never asked for
+/// would be worse than not keeping them.
+fn outbox_dir() -> Option<std::path::PathBuf> {
+    std::env::var_os("FERROX_ACCOUNTING_OUTBOX").map(std::path::PathBuf::from)
+}
+
+/// What names THIS engine generation stably across a retried stop.
+///
+/// The instance id when one is configured, otherwise the process id
+/// with the server's start time -- which is stable for the life of a
+/// process, and a receipt is only ever sealed once per process, so a
+/// retry within that life derives the same id. It is NOT stable across
+/// a restart, and it does not need to be: a restarted engine is a
+/// different generation with different totals and must not reuse the
+/// receipt of the one before it.
+fn engine_identity(state: &AppState) -> String {
+    if let Ok(id) = std::env::var("FERROX_INSTANCE_ID") {
+        return id;
+    }
+    format!("pid:{}:started:{}", std::process::id(), state.started_unix)
+}
+
+/// Writes the receipt, idempotently by its id.
+///
+/// `Ok(None)` when no outbox is configured -- nothing to write is not a
+/// failure. Otherwise the document lands at `<dir>/<id>.json` through a
+/// temporary file and a rename, so a reader never sees a half-written
+/// receipt: `rename` within a directory is atomic, a plain write is
+/// not, and the one moment a reader is most likely to look is while the
+/// engine is stopping.
+///
+/// A receipt that is already there is left alone and reported as
+/// success. It is addressed by a DERIVED id, so an existing file for
+/// this id is this generation's own receipt from a previous attempt --
+/// exactly what idempotence means here, and rewriting it would risk
+/// replacing a good document with a worse one if the retry's totals
+/// were somehow read differently.
+fn persist_receipt(
+    state: &AppState,
+    sealed: &ferrox_edge::SealedAccounting,
+) -> Result<Option<Receipt>, std::io::Error> {
+    let Some(dir) = outbox_dir() else {
+        return Ok(None);
+    };
+    let receipt = Receipt::from_sealed(&engine_identity(state), sealed);
+    let final_path = dir.join(format!("{}.json", receipt.id));
+
+    let result = ferrox_edge::finish_stop(
+        receipt,
+        |receipt| {
+            std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+            if final_path.exists() {
+                return Ok(());
+            }
+            let tmp = dir.join(format!("{}.json.partial", receipt.id));
+            let body = serde_json::json!({
+                "id": receipt.id,
+                "model_id": receipt.model_id,
+                "prompt_tokens_total": receipt.prompt_tokens_total,
+                "completion_tokens_total": receipt.completion_tokens_total,
+                "uptime_s": receipt.uptime_seconds,
+                "status": receipt.status.as_str(),
+            });
+            std::fs::write(&tmp, serde_json::to_vec_pretty(&body).unwrap_or_default())
+                .map_err(|e| e.to_string())?;
+            std::fs::rename(&tmp, &final_path).map_err(|e| e.to_string())
+        },
+        // The response is the signal, and it is sent by the caller once
+        // this returns. Nothing to do here, and nothing that CAN fail
+        // here -- which is why the `NotSignalled` arm below is
+        // unreachable rather than handled.
+        |_| Ok(()),
+    );
+
+    match result {
+        Ok(receipt) => Ok(Some(receipt)),
+        Err(why) => Err(std::io::Error::other(why.to_string())),
+    }
 }
 
 /// KV occupancy in pages, plus the page size and the evictable count,
@@ -415,8 +537,18 @@ pub(crate) async fn prepare_stop(
     // Already sealed: hand back the same document. Checked before
     // `begin_stop` so a retry cannot be refused by a rebuild that
     // started afterwards.
-    if let Some(sealed) = gate.sealed() {
-        return Json(serde_json::to_value(sealed_json(sealed)).unwrap()).into_response();
+    //
+    // The receipt is (re-)persisted on this path too, and the response
+    // carries its id. This is the caller idempotence exists FOR: a
+    // supervisor retries precisely because it lost the first answer, so
+    // answering the retry without the receipt id would hand it a body
+    // it cannot act on -- and leave it unable to tell a written receipt
+    // from an unwritten one. Persisting is addressed by a derived id
+    // and skips a document that is already there, so the retry writes
+    // nothing.
+    if let Some(sealed) = gate.sealed().cloned() {
+        drop(gate);
+        return sealed_response(&state, &sealed);
     }
 
     if let Err(why) = gate.begin_stop() {
@@ -449,7 +581,10 @@ pub(crate) async fn prepare_stop(
         uptime_seconds: uptime,
         drain_complete: true,
     }) {
-        Ok(sealed) => Json(sealed_json(&sealed)).into_response(),
+        Ok(sealed) => {
+            drop(gate);
+            sealed_response(&state, &sealed)
+        }
         Err(why) => {
             let engine_preserved = !matches!(why, StopRefused::RebuildInProgress);
             (
@@ -648,5 +783,84 @@ mod tests {
         // independent sources, so a step that double-counts must read
         // as an empty pool rather than wrap to astronomical nonsense.
         assert_eq!(PoolUsage::from_available(10, 12).used, 0);
+    }
+
+    /// The whole ordering, end to end and on a real filesystem: the
+    /// receipt is on disk before `prepare_stop` answers, because here
+    /// the ANSWER is the signal -- a supervisor learns the stop is
+    /// sealed by reading it, so replying first would leave a crash in
+    /// between with the supervisor believing a receipt exists that does
+    /// not.
+    ///
+    /// And a retry reuses the same document. With a fresh id per
+    /// attempt, a supervisor whose response was lost writes a SECOND
+    /// receipt for one engine generation, which downstream is a second
+    /// billing event for work that happened once.
+    #[test]
+    fn a_receipt_lands_on_disk_and_a_retry_reuses_the_same_document() {
+        use ferrox_edge::SealedAccounting;
+
+        let dir = std::env::temp_dir().join(format!(
+            "ferrox-outbox-test-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let sealed = SealedAccounting {
+            model_id: Some("glm-5.2".to_string()),
+            prompt_tokens_total: 100,
+            completion_tokens_total: 50,
+            uptime_seconds: 7,
+            drain_complete: true,
+        };
+        let receipt = Receipt::from_sealed("stable-identity", &sealed);
+        let path = dir.join(format!("{}.json", receipt.id));
+
+        let write = |r: &Receipt| -> Result<(), String> {
+            std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+            if path.exists() {
+                return Ok(());
+            }
+            let tmp = dir.join(format!("{}.json.partial", r.id));
+            std::fs::write(&tmp, b"{}").map_err(|e| e.to_string())?;
+            std::fs::rename(&tmp, &path).map_err(|e| e.to_string())
+        };
+
+        ferrox_edge::finish_stop(receipt.clone(), write, |_| Ok(())).expect("first stop");
+        assert!(path.exists(), "the receipt must be durable");
+
+        // The retry derives the same id, so it addresses the same file
+        // and writes no second document.
+        let retry = Receipt::from_sealed("stable-identity", &sealed);
+        assert_eq!(retry.id, receipt.id);
+        ferrox_edge::finish_stop(retry, write, |_| Ok(())).expect("retry");
+        let count = std::fs::read_dir(&dir).unwrap().count();
+        assert_eq!(count, 1, "one generation, one receipt");
+
+        // No `.partial` survives: a reader must never see a
+        // half-written receipt, and the moment it is most likely to
+        // look is while the engine is stopping.
+        assert!(std::fs::read_dir(&dir).unwrap().all(|e| !e
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .ends_with(".partial")));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Unset means no outbox and no persistence step. Inventing a
+    /// directory to write accounting documents nobody asked for would
+    /// be worse than not keeping them.
+    #[test]
+    fn no_configured_outbox_means_nothing_is_written_and_that_is_not_a_failure() {
+        // `outbox_dir` reads the environment, which tests share, so the
+        // assertion is on the shape rather than on a mutated variable:
+        // an absent path yields no directory at all.
+        assert_eq!(
+            std::env::var_os("FERROX_ACCOUNTING_OUTBOX").is_none(),
+            outbox_dir().is_none()
+        );
     }
 }

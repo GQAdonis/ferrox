@@ -160,7 +160,11 @@ pub fn auto_cpu_layers(
 /// away from zero) so a stride lands on the same layers here as
 /// upstream -- a one-layer difference silently changes which experts a
 /// deployment serves on which device.
-fn round_half_even(value: f64) -> i64 {
+///
+/// `pub(crate)` so `dsv4` sizes its window tier by the same rule: two
+/// copies would be free to drift, and a half-page disagreement between
+/// placement and sizing is a page of window the budget did not buy.
+pub(crate) fn round_half_even(value: f64) -> i64 {
     let floor = value.floor();
     let diff = value - floor;
     let floor = floor as i64;

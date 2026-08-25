@@ -18,7 +18,7 @@
 //! Ported 1:1 from FreeToken's `python/freetoken/tokenizer/effort.py`
 //! (Apache-2.0); see `docs/THIRD_PARTY_NOTICES.md`.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::{json, Map, Value};
 
@@ -533,6 +533,12 @@ pub fn sanitize_effort(
 /// a control does not care whether "off" is a toggle and "high" is a
 /// gear -- both are things it may send, and sending either is one
 /// string in `reasoning_effort`.
+///
+/// `kwargs` is what makes the list usable without per-family knowledge:
+/// it says, for each gear, exactly what `chat_template_kwargs` selects
+/// it. A UI that has only the names still has to know that "off" means
+/// broadcasting two booleans and "high" means a string, which is the
+/// family knowledge this whole module exists to remove.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ThinkGears {
     /// In the order a UI would show them: least thinking first.
@@ -540,6 +546,9 @@ pub struct ThinkGears {
     /// Which one the checkpoint is already in when asked for nothing.
     /// Always a member of `supported`.
     pub default: Option<String>,
+    /// Per gear, the `chat_template_kwargs` that select it. Keyed by the
+    /// same strings as `supported`.
+    pub kwargs: BTreeMap<String, Map<String, Value>>,
 }
 
 impl ThinkGears {
@@ -548,6 +557,11 @@ impl ThinkGears {
     /// the difference between "no gears" and "not a reasoning model".
     pub fn is_empty(&self) -> bool {
         self.supported.is_empty()
+    }
+
+    /// The kwargs that select `gear`, if it is on offer.
+    pub fn kwargs_for(&self, gear: &str) -> Option<&Map<String, Value>> {
+        self.kwargs.get(gear)
     }
 }
 
@@ -559,10 +573,17 @@ impl ThinkGears {
 /// ascending by scale -- or a bare `on` when there is a toggle but no
 /// ladder, since `off` needs a counterpart to be worth offering.
 ///
-/// A template with no toggle, no adaptive state, and no graded effort
-/// gets an EMPTY list. It is not a reasoning model with zero gears; it
-/// is a model that was asked and had nothing to say, and a client
-/// should see no such field rather than an empty one.
+/// `parser_configured` covers the one case the template cannot speak
+/// for: an always-thinking family whose template has no observable knob
+/// at all, but which really does reason and whose output really is
+/// being split. It advertises a single `on` gear with EMPTY kwargs --
+/// there is nothing to send, and the point is only to let a client
+/// label the state rather than show a reasoning model as having none.
+///
+/// A template with no toggle, no adaptive state, no graded effort and
+/// no parser gets an EMPTY list. It is not a reasoning model with zero
+/// gears; it is a model that was asked and had nothing to say, and a
+/// client should see no such field rather than an empty one.
 ///
 /// The default is what the bare render already matches -- `off` or
 /// `adaptive` when the probe found the template sitting in one of them
@@ -570,19 +591,40 @@ impl ThinkGears {
 /// if it is on offer (the ecosystem's neutral gear) and otherwise the
 /// last gear, because a ladder with no stated default is one whose top
 /// is its normal operating point.
-pub fn derive_think_gears(profile: &ThinkingProfile) -> ThinkGears {
+pub fn derive_think_gears(profile: &ThinkingProfile, parser_configured: bool) -> ThinkGears {
     let mut supported: Vec<String> = Vec::new();
+    let mut kwargs: BTreeMap<String, Map<String, Value>> = BTreeMap::new();
+    let mut offer = |gear: &str, k: Map<String, Value>, list: &mut Vec<String>| {
+        list.push(gear.to_string());
+        kwargs.insert(gear.to_string(), k);
+    };
+
     if profile.toggleable {
-        supported.push("off".to_string());
+        offer("off", thinking_off_kwargs(), &mut supported);
     }
     if profile.has_adaptive {
-        supported.push("adaptive".to_string());
+        offer("adaptive", thinking_adaptive_kwargs(), &mut supported);
     }
+
     let efforts = effective_efforts(&profile.efforts);
     if !efforts.is_empty() {
-        supported.extend(efforts.iter().map(|e| e.as_str().to_string()));
-    } else if !supported.is_empty() {
-        supported.push("on".to_string());
+        for effort in efforts.iter().copied() {
+            // The toggle and the gear are separate knobs: a template
+            // that can be turned off needs to be told it is ON as well
+            // as how hard, or selecting a gear on a defaults-off
+            // checkpoint renders with no reasoning block at all.
+            let mut k = if profile.toggleable {
+                thinking_on_kwargs()
+            } else {
+                Map::new()
+            };
+            k.insert("reasoning_effort".into(), json!(effort.as_str()));
+            offer(effort.as_str(), k, &mut supported);
+        }
+    } else if profile.toggleable {
+        offer("on", thinking_on_kwargs(), &mut supported);
+    } else if parser_configured {
+        offer("on", Map::new(), &mut supported);
     }
 
     let has = |gear: &str| supported.iter().any(|g| g == gear);
@@ -592,18 +634,23 @@ pub fn derive_think_gears(profile: &ThinkingProfile) -> ThinkGears {
         _ => None,
     }
     .or_else(|| {
+        if efforts.is_empty() {
+            return None;
+        }
         profile
             .efforts
             .default
             .map(|e| e.as_str().to_string())
             .filter(|e| has(e))
+            .or_else(|| has("medium").then(|| "medium".to_string()))
     })
-    .or_else(|| has("medium").then(|| "medium".to_string()))
+    .or_else(|| has("on").then(|| "on".to_string()))
     .or_else(|| supported.last().cloned());
 
     ThinkGears {
         default: default.filter(|_| !supported.is_empty()),
         supported,
+        kwargs,
     }
 }
 
@@ -901,7 +948,7 @@ mod tests {
         assert_eq!(p.default_state, ThinkingState::On);
     }
 
-    fn thinking(
+    fn thinking_profile(
         toggleable: bool,
         has_adaptive: bool,
         default_state: ThinkingState,
@@ -919,12 +966,15 @@ mod tests {
     /// an equality on the whole list rather than a membership check.
     #[test]
     fn gears_are_built_least_thinking_first() {
-        let gears = derive_think_gears(&thinking(
-            true,
-            true,
-            ThinkingState::Off,
-            profile(&[Effort::Low, Effort::Medium, Effort::High], None),
-        ));
+        let gears = derive_think_gears(
+            &thinking_profile(
+                true,
+                true,
+                ThinkingState::Off,
+                profile(&[Effort::Low, Effort::Medium, Effort::High], None),
+            ),
+            false,
+        );
         assert_eq!(
             gears.supported,
             ["off", "adaptive", "low", "medium", "high"]
@@ -936,12 +986,10 @@ mod tests {
     /// ladder still needs something to name the other position.
     #[test]
     fn a_toggle_with_no_ladder_offers_a_bare_on() {
-        let gears = derive_think_gears(&thinking(
-            true,
+        let gears = derive_think_gears(
+            &thinking_profile(true, false, ThinkingState::On, EffortProfile::inert()),
             false,
-            ThinkingState::On,
-            EffortProfile::inert(),
-        ));
+        );
         assert_eq!(gears.supported, ["off", "on"]);
         assert_eq!(gears.default.as_deref(), Some("on"));
     }
@@ -951,27 +999,28 @@ mod tests {
     /// empty list, which would read as "asked, and it has no gears".
     #[test]
     fn a_checkpoint_that_grades_nothing_advertises_nothing() {
-        let gears = derive_think_gears(&thinking(
+        let gears = derive_think_gears(
+            &thinking_profile(false, false, ThinkingState::On, EffortProfile::inert()),
             false,
-            false,
-            ThinkingState::On,
-            EffortProfile::inert(),
-        ));
+        );
         assert!(gears.is_empty());
         assert_eq!(gears.default, None);
     }
 
     #[test]
     fn the_probed_effort_default_wins_when_the_bare_render_is_thinking() {
-        let gears = derive_think_gears(&thinking(
-            false,
-            false,
-            ThinkingState::On,
-            profile(
-                &[Effort::Low, Effort::Medium, Effort::High],
-                Some(Effort::High),
+        let gears = derive_think_gears(
+            &thinking_profile(
+                false,
+                false,
+                ThinkingState::On,
+                profile(
+                    &[Effort::Low, Effort::Medium, Effort::High],
+                    Some(Effort::High),
+                ),
             ),
-        ));
+            false,
+        );
         assert_eq!(gears.supported, ["low", "medium", "high"]);
         assert_eq!(gears.default.as_deref(), Some("high"));
     }
@@ -980,21 +1029,94 @@ mod tests {
     /// the top of the ladder.
     #[test]
     fn a_ladder_with_no_stated_default_falls_back_to_medium_then_to_its_top() {
-        let with_medium = derive_think_gears(&thinking(
+        let with_medium = derive_think_gears(
+            &thinking_profile(
+                false,
+                false,
+                ThinkingState::On,
+                profile(&[Effort::Low, Effort::Medium, Effort::High], None),
+            ),
             false,
-            false,
-            ThinkingState::On,
-            profile(&[Effort::Low, Effort::Medium, Effort::High], None),
-        ));
+        );
         assert_eq!(with_medium.default.as_deref(), Some("medium"));
 
-        let without = derive_think_gears(&thinking(
+        let without = derive_think_gears(
+            &thinking_profile(
+                false,
+                false,
+                ThinkingState::On,
+                profile(&[Effort::Low, Effort::XHigh], None),
+            ),
             false,
-            false,
-            ThinkingState::On,
-            profile(&[Effort::Low, Effort::XHigh], None),
-        ));
+        );
         assert_eq!(without.default.as_deref(), Some("xhigh"));
+    }
+
+    /// The half a client cannot derive: what to SEND to select a gear.
+    /// Without it a UI still has to know that "off" is two booleans and
+    /// "high" is a string, which is the family knowledge this module
+    /// exists to remove.
+    #[test]
+    fn every_advertised_gear_carries_the_kwargs_that_select_it() {
+        let gears = derive_think_gears(
+            &thinking_profile(
+                true,
+                true,
+                ThinkingState::Off,
+                profile(&[Effort::Low, Effort::High], None),
+            ),
+            false,
+        );
+        assert_eq!(gears.supported, ["off", "adaptive", "low", "high"]);
+        for gear in &gears.supported {
+            assert!(gears.kwargs_for(gear).is_some(), "{gear} has no kwargs");
+        }
+        assert_eq!(
+            gears.kwargs_for("off").unwrap()["enable_thinking"],
+            json!(false)
+        );
+        // A gear on a toggleable template must also say "and turn it
+        // on": selecting `high` on a defaults-off checkpoint otherwise
+        // renders with no reasoning block at all.
+        let high = gears.kwargs_for("high").unwrap();
+        assert_eq!(high["reasoning_effort"], json!("high"));
+        assert_eq!(high["enable_thinking"], json!(true));
+    }
+
+    /// A template with no toggle does not need to be told it is on --
+    /// it always is -- so the gear carries the effort alone.
+    #[test]
+    fn a_gear_on_an_untoggleable_template_carries_only_the_effort() {
+        let gears = derive_think_gears(
+            &thinking_profile(
+                false,
+                false,
+                ThinkingState::On,
+                profile(&[Effort::Low, Effort::High], None),
+            ),
+            false,
+        );
+        let low = gears.kwargs_for("low").unwrap();
+        assert_eq!(low.len(), 1);
+        assert_eq!(low["reasoning_effort"], json!("low"));
+    }
+
+    /// The case the template cannot speak for. An always-thinking
+    /// family really does reason and its output really is being split;
+    /// advertising nothing would show it as a model with no gears.
+    #[test]
+    fn an_always_thinking_family_with_no_knob_still_advertises_its_state() {
+        let profile = thinking_profile(false, false, ThinkingState::On, EffortProfile::inert());
+
+        let unparsed = derive_think_gears(&profile, false);
+        assert!(unparsed.is_empty(), "nothing reasons and nothing is parsed");
+
+        let parsed = derive_think_gears(&profile, true);
+        assert_eq!(parsed.supported, ["on"]);
+        assert_eq!(parsed.default.as_deref(), Some("on"));
+        // Empty, deliberately: there is nothing to send. The gear
+        // exists so a client can LABEL the state, not select it.
+        assert!(parsed.kwargs_for("on").unwrap().is_empty());
     }
 
     /// A default that names a gear outside the advertised list would
@@ -1002,12 +1124,15 @@ mod tests {
     /// actually offered.
     #[test]
     fn the_default_is_always_a_member_of_the_advertised_list() {
-        let gears = derive_think_gears(&thinking(
+        let gears = derive_think_gears(
+            &thinking_profile(
+                false,
+                false,
+                ThinkingState::Adaptive,
+                profile(&[Effort::Low, Effort::Medium], None),
+            ),
             false,
-            false,
-            ThinkingState::Adaptive,
-            profile(&[Effort::Low, Effort::Medium], None),
-        ));
+        );
         assert!(!gears.supported.contains(&"adaptive".to_string()));
         assert_eq!(gears.default.as_deref(), Some("medium"));
         assert!(gears

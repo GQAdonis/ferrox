@@ -9,6 +9,7 @@ mod host_state;
 mod parity;
 mod pull;
 mod run;
+mod serve_bench;
 mod verify;
 mod verify_engine;
 
@@ -64,6 +65,13 @@ enum Commands {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, hide = true)]
         args: Vec<String>,
     },
+    /// Concurrency, TTFT and queueing numbers for a running
+    /// `ferrox-server` (HTTP).
+    ///
+    /// Distinct from `ferrox bench`, which is single-stream and
+    /// HTTP-free and measures kernels against `llama-bench`. This one
+    /// answers what the SERVER does under load. Start the server first.
+    ServeBench(serve_bench::ServeBenchArgs),
     /// Download a GGUF from Hugging Face Hub (`hf download`).
     Pull(pull::PullArgs),
     /// Print GGUF header metadata and tensor list for a model file.
@@ -374,6 +382,7 @@ const SUBCOMMANDS: &[&str] = &[
     "pull",
     "chat",
     "serve",
+    "serve-bench",
     "inspect",
     "inspect-plan",
     "presets",
@@ -531,6 +540,7 @@ fn main() -> anyhow::Result<()> {
     match cli.command {
         Commands::Run(args) => run::run_infer(args)?,
         Commands::Chat(args) => chat::run_chat(args)?,
+        Commands::ServeBench(args) => serve_bench::run_serve_bench(args)?,
         // Blocking, and it builds its own Tokio runtime: nothing above
         // this point has started one. It also claims the instance
         // registry itself (as `server`), which is why `instance_target`

@@ -40,6 +40,7 @@ mod attribution;
 mod batch_scheduler;
 mod budget;
 mod cache;
+mod cache_admin;
 mod cancel;
 mod chat_template;
 mod generate;
@@ -74,7 +75,7 @@ use std::time::Duration;
 use axum::{
     extract::State,
     http::StatusCode,
-    response::sse::{Event, KeepAlive, Sse},
+    response::sse::{Event, Sse},
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
@@ -689,7 +690,30 @@ pub(crate) struct AppState {
     /// of them: each operation takes it, reads or moves the state, and
     /// releases before doing any work.
     pub(crate) maintenance: Mutex<ferrox_edge::MaintenanceGate>,
+    /// The live memory reading behind `/v1/stats`, re-probed at most
+    /// once per [`FOOTPRINT_TTL_MS`] -- see
+    /// `cache_admin::footprint_json`. A `Mutex` and not an atomic
+    /// because holding it across the probe is what collapses concurrent
+    /// pollers onto ONE VMA walk.
+    pub(crate) footprint: Mutex<ferrox_edge::ProbeCache<ferrox_edge::Footprint>>,
+    /// Wall-clock second this process started serving.
+    ///
+    /// Distinct from `started_at`, which is an `Instant` and has no
+    /// wall clock at all. This exists so an accounting receipt's id can
+    /// be derived from something stable for the life of THIS process
+    /// and different in the next one: a pid alone is reused across
+    /// restarts, and a restarted engine reusing a previous
+    /// generation's receipt id would have its own receipt silently
+    /// skipped as already written.
+    pub(crate) started_unix: u64,
 }
+
+/// How long a memory reading is served before it is taken again.
+///
+/// Two seconds: long enough that a dashboard polling once a second
+/// costs one probe rather than one per poll, short enough that an
+/// operator watching a load ramp sees it move.
+pub(crate) const FOOTPRINT_TTL_MS: u64 = 2_000;
 
 impl AppState {
     /// Clones the active model's `Arc` and releases the lock before
@@ -887,6 +911,23 @@ pub(crate) struct ChatMessage {
     #[serde(default)]
     #[allow(dead_code)]
     pub(crate) tool_call_id: Option<String>,
+    /// A replayed assistant turn's chain of thought, kept out of
+    /// `content` on the way in and handed back to the template on the
+    /// way out.
+    ///
+    /// It has to be a field of its own rather than prose folded into
+    /// `content`, because a template that knows about reasoning wraps
+    /// it in the family's own markers -- and a template that does not
+    /// must be able to drop it. Concatenating it into `content` would
+    /// show a model its own scratchpad as if it had said it out loud,
+    /// which is exactly what the markers exist to prevent.
+    ///
+    /// Accepted under both spellings clients use: `reasoning_content`
+    /// (the vLLM/DeepSeek convention ferrox emits) and `reasoning`
+    /// (what the OpenAI Responses and Anthropic surfaces call it), so a
+    /// client can replay a turn shaped the way it received it.
+    #[serde(default, alias = "reasoning")]
+    pub(crate) reasoning_content: Option<String>,
 }
 
 impl ChatMessage {
@@ -1014,6 +1055,17 @@ struct ChatCompletionRequest {
     /// resumable stream either way.
     #[serde(default)]
     stream_resumable: Option<bool>,
+    /// Run past the model's own end-of-generation tokens, so this
+    /// request produces exactly `max_tokens`.
+    ///
+    /// A serving-benchmark knob, and the vLLM/SGLang spelling of it. It
+    /// exists because a benchmark whose requests stop at their own EOS
+    /// finishes them at different lengths, and the slowest percentile
+    /// is then whichever request happened to be asked for the most
+    /// tokens -- a fact about the prompts, reported as a fact about the
+    /// server. It does NOT withdraw the caller's own `stop` strings.
+    #[serde(default)]
+    ignore_eos: Option<bool>,
     #[serde(default)]
     tools: Vec<ToolDef>,
     #[serde(default)]
@@ -1375,6 +1427,7 @@ impl ChatCompletionRequest {
             // Filled in by the handler that owns the request id --
             // the request body cannot name its own cancel token.
             cancel: None,
+            ignore_eos: self.ignore_eos.unwrap_or(false),
         }
     }
 
@@ -1730,12 +1783,16 @@ async fn list_models(State(state): State<Arc<AppState>>) -> Json<serde_json::Val
     // about thinking carries NEITHER field rather than an empty list:
     // an empty list reads as "asked, and it has no gears", which is a
     // different claim from "this is not a reasoning model".
-    let gears = active.model.chat_template().think_gears().clone();
+    let parser_configured = ferrox_edge::ReasoningFormat::infer(active.model.name()).is_some();
+    let gears = active.model.chat_template().think_gears(parser_configured);
     if !gears.is_empty() {
         model_entry["supported_reasoning_efforts"] = serde_json::json!(gears.supported);
-        if let Some(default) = gears.default {
+        if let Some(default) = &gears.default {
             model_entry["default_reasoning_effort"] = serde_json::json!(default);
         }
+        // What to SEND for each gear, so a client selects one without
+        // knowing that "off" is two booleans and "high" is a string.
+        model_entry["reasoning_effort_kwargs"] = serde_json::json!(gears.kwargs);
     }
     if let Some(mcp) = &state.mcp {
         model_entry["ferrox_mcp"] = mcp.models_metadata();
@@ -1743,6 +1800,88 @@ async fn list_models(State(state): State<Arc<AppState>>) -> Json<serde_json::Val
     Json(serde_json::json!({
         "object": "list",
         "data": [model_entry]
+    }))
+}
+
+/// `GET /v1/stats`: what is happening *now*.
+///
+/// Distinct from `/admin/stats`, which is the historical ring. The two
+/// throughput figures come from sliding windows, so an idle server
+/// reports 0 rather than the rate it managed while it was busy -- a
+/// cumulative average never comes back down, and a status bar showing
+/// one is reporting the past as the present.
+///
+/// Latency is the ring's p95, nearest-rank, so it names a request that
+/// really took that long. Both it and the mean time-to-first-token are
+/// `null` rather than `0` when nothing can be said: a non-streamed
+/// request has no TTFT, and averaging those in as zero would make the
+/// server look faster the fewer clients stream.
+async fn serving_stats(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+    let now_ms = state.uptime().as_millis().min(u64::MAX as u128) as u64;
+    let mut serving = state.serving.lock().unwrap_or_else(|p| p.into_inner());
+    let active = state.active();
+    Json(serde_json::json!({
+        "model": active.as_ref().map(|a| a.model.name()),
+        "state": state
+            .maintenance
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .state()
+            .as_str(),
+        "uptime_s": state.uptime().as_secs(),
+        "throughput": {
+            "decode_tps": (serving.decode_tokens_per_second(now_ms) * 10.0).round() / 10.0,
+            "prefill_tps": (serving.prefill_tokens_per_second(now_ms) * 10.0).round() / 10.0,
+        },
+        "requests": {
+            "active": state.cancels.live_count(),
+            "completed": state.stats.recorded_total(),
+            "p95_ms": state.stats.p95_duration_ms(),
+            "ttft_mean_ms": state.stats.ttft_mean_ms(),
+            "prompt_tokens_total": state.stats.tokens_prompt_total(),
+            "completion_tokens_total": state.stats.tokens_generated_total(),
+        },
+        // Served here so a status bar tracking throughput and pressure
+        // makes ONE request rather than two. Upstream stamps the same
+        // gauges on every reply of the batch; ferrox does not, because
+        // the reply shapes here are OpenAI's and Anthropic's and a pool
+        // gauge on a `chat.completion` is a field no client asked for.
+        "pools": cache_admin::pool_gauges(&state),
+        // What the engine is REALLY using, beside the budget it was
+        // sized against. `null` when no live figure can be read.
+        "memory": cache_admin::footprint_json(&state),
+    }))
+}
+
+#[derive(Deserialize)]
+struct RequestsQuery {
+    #[serde(default)]
+    since: u64,
+    #[serde(default = "default_requests_limit")]
+    limit: usize,
+}
+
+fn default_requests_limit() -> usize {
+    stats::MAX_PAGE
+}
+
+/// `GET /v1/requests?since=&limit=`: an incremental page of the ring.
+///
+/// The cursor is all-time, so a poller that keeps up reads each row
+/// exactly once and never re-reads. `missed` is the honest half: rows
+/// that existed and were evicted before this poll could see them. A
+/// client polling slower than the server finishes requests needs to
+/// know that, rather than have it hidden by a shorter page.
+async fn recent_requests(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Query(q): axum::extract::Query<RequestsQuery>,
+) -> Json<serde_json::Value> {
+    let (rows, cursor, missed) = state.stats.page(q.since, q.limit);
+    Json(serde_json::json!({
+        "requests": rows,
+        "next_cursor": cursor,
+        "missed": missed,
+        "total": state.stats.recorded_total(),
     }))
 }
 
@@ -2187,6 +2326,7 @@ pub(crate) fn prompt_from_messages(
             content: Some(MessageContent::Text(tool_preamble(tools))),
             tool_calls: None,
             tool_call_id: None,
+            reasoning_content: None,
         });
         with_preamble.extend_from_slice(messages);
         template.render(&with_preamble, &[], extra)
@@ -2369,6 +2509,7 @@ fn inject_json_object_system_hint(messages: &mut Vec<ChatMessage>) {
                 content: Some(MessageContent::Text(HINT.to_string())),
                 tool_calls: None,
                 tool_call_id: None,
+                reasoning_content: None,
             },
         );
     }
@@ -2391,7 +2532,15 @@ async fn chat_completions(
     let request_id = ferrox_api::next_request_id();
     let stream = req.stream.unwrap_or(false);
 
-    if let Err(err) = req.validate_supported_fields() {
+    // The maintenance gate comes before validation: while the cache is
+    // being resized or the server is draining, the honest answer is
+    // "not now" whichever fields the body carries, and admitting a
+    // request into a pool that is being rebuilt under it is worse than
+    // refusing one that would have 400'd anyway.
+    let refusal = cache_admin::check_admission(&state)
+        .err()
+        .or_else(|| req.validate_supported_fields().err());
+    if let Some(err) = refusal {
         state
             .request_errors_total
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -2534,6 +2683,7 @@ async fn chat_completions_full(
                 content: Some(MessageContent::Text(content.clone())),
                 tool_calls: None,
                 tool_call_id: None,
+                reasoning_content: None,
             },
         );
     }
@@ -2643,6 +2793,26 @@ async fn chat_completions_stream(
     let emitter = resume::Emitter::new(slot);
 
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Event, Infallible>>(64);
+    // Built here, where the id and model name are still owned by this
+    // frame: the generation task takes both. Serialized once, because
+    // it is byte-identical every time it goes out.
+    let keepalive = sse::keepalive_event(&ChatCompletionChunk {
+        id: request_id.clone(),
+        request_id: None,
+        object: "chat.completion.chunk",
+        model: model_name.clone(),
+        choices: vec![ChatCompletionChunkChoice {
+            index: 0,
+            delta: ChatCompletionChunkDelta {
+                role: None,
+                content: None,
+                reasoning_content: None,
+                tool_calls: None,
+            },
+            finish_reason: None,
+        }],
+        usage: None,
+    });
 
     tokio::task::spawn_blocking(move || {
         // Held for the whole generation; dropping it is what takes the
@@ -2787,6 +2957,7 @@ async fn chat_completions_stream(
                             content: Some(MessageContent::Text(full_text.clone())),
                             tool_calls: None,
                             tool_call_id: None,
+                            reasoning_content: None,
                         },
                     );
                 }
@@ -2961,11 +3132,7 @@ async fn chat_completions_stream(
         drop(emitter);
     });
 
-    let stream =
-        futures_util::stream::unfold(
-            rx,
-            |mut rx| async move { rx.recv().await.map(|ev| (ev, rx)) },
-        );
+    let stream = sse::with_keepalive(rx, keepalive, sse::KEEPALIVE_INTERVAL);
     // `X-Accel-Buffering: no` is the one header that actually reaches
     // the problem the plan names: nginx (and the proxies that copied
     // its convention) buffer `text/event-stream` by default, which
@@ -2974,16 +3141,26 @@ async fn chat_completions_stream(
     // from a hung backend. axum already sets `Cache-Control: no-cache`
     // on an `Sse` response, so that half is covered.
     //
-    // The keep-alive comment every 15s is the other half: it gives an
+    // The keepalive every 15s is the other half: it gives an
     // idle-but-healthy stream something to send, so a client's stall
     // timeout measures the *connection* rather than the model's
     // time-to-first-token on a long prompt.
+    //
+    // **Not `Sse::keep_alive`.** axum's keepalive is an SSE COMMENT,
+    // and a comment does not reach a client's event handler -- codex's
+    // 300s stream-idle timeout only resets on a data frame, so a
+    // comment-kept stream is reconnected mid-answer on a long prefill.
+    // `sse::with_keepalive` sends a real `chat.completion.chunk` with
+    // an empty delta instead: a concatenating client adds nothing, and
+    // the transport sees traffic. It also covers the silence BEFORE
+    // the first token, which is exactly the queue-wait and long-prefill
+    // window where this matters most.
     Ok((
         [(
             axum::http::HeaderName::from_static("x-accel-buffering"),
             axum::http::HeaderValue::from_static("no"),
         )],
-        Sse::new(stream).keep_alive(KeepAlive::default()),
+        Sse::new(stream),
     )
         .into_response())
 }
@@ -3265,8 +3442,21 @@ fn build_app_state(
         loading_model: Mutex::new(None),
         last_load_error: Mutex::new(None),
         serving: Mutex::new(ferrox_edge::ServingStats::default()),
-        maintenance: Mutex::new(ferrox_edge::MaintenanceGate::new()),
+        maintenance: Mutex::new(ferrox_edge::MaintenanceGate::serving()),
+        footprint: Mutex::new(ferrox_edge::ProbeCache::new(FOOTPRINT_TTL_MS)),
+        started_unix: unix_now(),
     }
+}
+
+/// Seconds since the epoch, or zero on a machine whose clock is set
+/// before it. Only ever used to make an id distinct between process
+/// generations, so a nonsense clock costs distinctness and nothing
+/// else.
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 /// The `/admin/models` id of the checkpoint `FERROX_MODEL_PATH` names,
@@ -3865,6 +4055,20 @@ async fn run(mcp_config_path: Option<PathBuf>, exit_on_stdin_close: bool) -> any
 
     let mut protected = Router::new()
         .route(routes::V1_MODELS, get(list_models))
+        // The Responses surface decodes tokens, so it sits behind the
+        // same key as `/v1/chat/completions`: it must cost what
+        // decoding tokens costs.
+        .route(routes::V1_RESPONSES, post(responses::responses))
+        .route(routes::V1_RESPONSE, get(responses::responses_get))
+        .route(
+            routes::V1_RESPONSE_CANCEL,
+            post(responses::responses_cancel),
+        )
+        .route(routes::V1_STATS, get(serving_stats))
+        .route(routes::V1_REQUESTS, get(recent_requests))
+        .route(routes::V1_CACHE_STATUS, get(cache_admin::cache_status))
+        .route(routes::V1_CACHE_REBUILD, post(cache_admin::cache_rebuild))
+        .route(routes::ADMIN_PREPARE_STOP, post(cache_admin::prepare_stop))
         .route(routes::V1_CHAT_COMPLETIONS, post(chat_completions))
         // Behind the same key as the endpoint that started the work:
         // an unauthenticated caller must not be able to stop someone
@@ -3877,6 +4081,10 @@ async fn run(mcp_config_path: Option<PathBuf>, exit_on_stdin_close: bool) -> any
         .route(&resume_route(routes::V1_STREAM), get(resume::resume))
         .route(&resume_route(routes::V1_STREAM_POLL), get(resume::poll))
         .route(routes::V1_MESSAGES, post(anthropic::messages))
+        .route(
+            routes::V1_MESSAGES_COUNT_TOKENS,
+            post(anthropic::count_tokens),
+        )
         .route(routes::V1_COMPLETIONS, post(openai_extra::completions))
         .route(routes::V1_TOKENIZE, post(openai_extra::tokenize))
         .route(routes::V1_DETOKENIZE, post(openai_extra::detokenize))
@@ -4134,6 +4342,7 @@ mod tests {
             stop_token_ids: Vec::new(),
             json_object: false,
             cancel: None,
+            ignore_eos: false,
         }
     }
 
@@ -4184,7 +4393,9 @@ mod tests {
             loading_model: Mutex::new(None),
             last_load_error: Mutex::new(None),
             serving: Mutex::new(ferrox_edge::ServingStats::default()),
-            maintenance: Mutex::new(ferrox_edge::MaintenanceGate::new()),
+            maintenance: Mutex::new(ferrox_edge::MaintenanceGate::serving()),
+            footprint: Mutex::new(ferrox_edge::ProbeCache::new(FOOTPRINT_TTL_MS)),
+            started_unix: unix_now(),
         }
     }
 
@@ -4209,7 +4420,35 @@ mod tests {
         Router::new()
             .route(ferrox_api::routes::HEALTH, get(health))
             .route(ferrox_api::routes::V1_MODELS, get(list_models))
+            .route(ferrox_api::routes::V1_RESPONSES, post(responses::responses))
+            .route(
+                ferrox_api::routes::V1_RESPONSE,
+                get(responses::responses_get),
+            )
+            .route(
+                ferrox_api::routes::V1_RESPONSE_CANCEL,
+                post(responses::responses_cancel),
+            )
+            .route(ferrox_api::routes::V1_STATS, get(serving_stats))
+            .route(ferrox_api::routes::V1_REQUESTS, get(recent_requests))
+            .route(
+                ferrox_api::routes::V1_CACHE_STATUS,
+                get(cache_admin::cache_status),
+            )
+            .route(
+                ferrox_api::routes::V1_CACHE_REBUILD,
+                post(cache_admin::cache_rebuild),
+            )
+            .route(
+                ferrox_api::routes::ADMIN_PREPARE_STOP,
+                post(cache_admin::prepare_stop),
+            )
             .route("/v1/chat/completions", post(chat_completions))
+            .route(ferrox_api::routes::V1_MESSAGES, post(anthropic::messages))
+            .route(
+                ferrox_api::routes::V1_MESSAGES_COUNT_TOKENS,
+                post(anthropic::count_tokens),
+            )
             .route("/v1/tokenize", post(openai_extra::tokenize))
             .route("/v1/detokenize", post(openai_extra::detokenize))
             .route("/v1/embeddings", post(openai_extra::embeddings))
@@ -4267,6 +4506,65 @@ mod tests {
                 None,
             ),
         })
+    }
+
+    /// Once a `200` and `text/event-stream` are on the wire, a
+    /// rejection can only ride *in* the stream, where several agents
+    /// render it as an empty response. So the prompt is rendered before
+    /// the stream is committed, and a template that rejects this
+    /// particular conversation is an ordinary 400 with a body.
+    ///
+    /// Fails if `prompt_from_messages` moves back inside the spawned
+    /// generation task.
+    #[tokio::test]
+    async fn a_template_that_rejects_the_conversation_is_a_400_on_the_streaming_path() {
+        // Raises on a second user turn, the way a real strict template
+        // rejects an ordering it was never trained on.
+        let strict = "{% if messages | length > 1 %}\
+             {{ raise_exception('this template takes one turn') }}\
+             {% endif %}{{ messages[0].content }}";
+        let state = Arc::new(test_state(
+            model_with_template("strict", strict),
+            ResponseCache::new(4, Duration::from_secs(60)),
+        ));
+        let app = test_app_with_state(state);
+
+        let (status, body) = post_json_uri(
+            &app,
+            "/v1/chat/completions",
+            serde_json::json!({
+                "model": "strict",
+                "stream": true,
+                "messages": [
+                    {"role": "user", "content": "one"},
+                    {"role": "user", "content": "two"},
+                ],
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"]["param"], serde_json::json!("messages"));
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("one turn"),
+            "the template's own message must reach the caller: {body}"
+        );
+
+        // And the same template serves a conversation it accepts.
+        let (status, _) = post_json_uri(
+            &app,
+            "/v1/chat/completions",
+            serde_json::json!({
+                "model": "strict",
+                "stream": true,
+                "max_tokens": 1,
+                "messages": [{"role": "user", "content": "one"}],
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
     }
 
     /// A client should not have to guess which gears a checkpoint has.
@@ -5185,6 +5483,149 @@ mod tests {
 
     async fn post_json(app: &Router, body: serde_json::Value) -> serde_json::Value {
         post_json_uri(app, "/v1/chat/completions", body).await.1
+    }
+
+    /// The engine's live footprint, beside the budget it was sized
+    /// against. Two things are asserted rather than the number itself,
+    /// which is a property of the host: it is never a ZERO (an engine
+    /// using no memory is not a thing that happens, so a zero would be
+    /// a failed read presented as a fact), and it always says WHICH
+    /// quantity it is -- a caller comparing a PSS figure with an RSS
+    /// one is comparing two different things and will read the
+    /// difference as a leak.
+    #[tokio::test]
+    async fn stats_says_what_the_engine_is_using_and_which_quantity_that_is() {
+        let app = test_app();
+        let (status, body) = get_json(&app, ferrox_api::routes::V1_STATS).await;
+        assert_eq!(status, StatusCode::OK);
+
+        let memory = &body["memory"];
+        if memory.is_null() {
+            // No `/proc`: absent is the honest answer, and the point of
+            // this branch is that it is absent rather than zero.
+            return;
+        }
+        assert!(
+            memory["bytes"].as_u64().is_some_and(|b| b > 0),
+            "a read that produced a zero is a broken read, not an idle \
+             engine: {memory}"
+        );
+        assert!(
+            ["pss", "rss"].contains(&memory["kind"].as_str().unwrap_or("")),
+            "the quantity must travel with the number: {memory}"
+        );
+    }
+
+    /// A pool this deployment does not have is reported `null`, never
+    /// as a zero row. "No window pool" and "a window pool with nothing
+    /// in it" are different facts, and an operator shown the second for
+    /// the first sizes against a pool that does not exist. The test
+    /// state runs with no shared KV pool, so all three are absent here.
+    #[tokio::test]
+    async fn stats_reports_a_pool_it_does_not_have_as_absent_and_not_as_zero() {
+        let app = test_app();
+        let (status, body) = get_json(&app, ferrox_api::routes::V1_STATS).await;
+        assert_eq!(status, StatusCode::OK);
+        for pool in ["kv_pages", "window_slots", "state_slots"] {
+            assert!(
+                body["pools"][pool].is_null(),
+                "{pool} must be null rather than a zero row: {}",
+                body["pools"]
+            );
+        }
+    }
+
+    /// A streamed `/v1/messages` can be cancelled only if the client
+    /// can learn the id, and the Anthropic protocol has no field for
+    /// it -- the `message_start` `msg_...` is a different identifier
+    /// the cancel registry has never seen. So the header carries it,
+    /// on the success path and on the error path alike, because a
+    /// client that logs one id per call should not lose it exactly
+    /// when something went wrong.
+    #[tokio::test]
+    async fn a_messages_response_states_the_id_that_v1_cancel_takes() {
+        use http_body_util::BodyExt;
+        use tower::ServiceExt;
+
+        let app = test_app();
+        let send = |body: serde_json::Value| {
+            let app = app.clone();
+            async move {
+                app.oneshot(
+                    axum::http::Request::builder()
+                        .method("POST")
+                        .uri(ferrox_api::routes::V1_MESSAGES)
+                        .header("content-type", "application/json")
+                        .body(axum::body::Body::from(serde_json::to_vec(&body).unwrap()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+            }
+        };
+
+        let ok = send(serde_json::json!({
+            "model": "test",
+            "max_tokens": 1,
+            "messages": [{"role": "user", "content": "hi"}],
+        }))
+        .await;
+        assert_eq!(ok.status(), StatusCode::OK);
+        let id = ok
+            .headers()
+            .get("request-id")
+            .expect("a served message names its id")
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(!id.is_empty());
+
+        // A rejected body still gets one, and a different one: two calls
+        // must never collide in the ring.
+        let bad = send(serde_json::json!({"model": "test"})).await;
+        assert!(bad.status().is_client_error());
+        let other = bad.headers().get("request-id").expect("errors too");
+        assert_ne!(other.to_str().unwrap(), id);
+        let _ = bad.into_body().collect().await.unwrap();
+    }
+
+    /// The gate is the point of the rebuild endpoint: a request that
+    /// arrives while the KV pool is being re-split must be refused,
+    /// because admitting it would let a decode allocate out of a pool
+    /// whose block count is about to change under it. `503` and not
+    /// `500` -- the caller should retry in a moment, and the body says
+    /// which of the four closed states it hit so a client can tell
+    /// "not yet" from "not ever".
+    #[tokio::test]
+    async fn a_request_that_arrives_mid_rebuild_is_refused_and_admitted_again_after() {
+        let state = Arc::new(test_state(
+            test_model_full_byte_vocab(),
+            ResponseCache::new(1000, Duration::from_secs(3600)),
+        ));
+        let app = test_app_with_state(Arc::clone(&state));
+        let body = serde_json::json!({
+            "model": "test",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 1,
+        });
+
+        state
+            .maintenance
+            .lock()
+            .unwrap()
+            .begin_rebuild()
+            .expect("a fresh server is serving, so the rebuild starts");
+        let (status, refused) = post_json_uri(&app, "/v1/chat/completions", body.clone()).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(refused["error"]["type"], "cache_rebuilding");
+
+        state.maintenance.lock().unwrap().finish_rebuild(true);
+        let (status, _) = post_json_uri(&app, "/v1/chat/completions", body).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "the gate reopens; a rebuild is not a latch"
+        );
     }
 
     /// Cancelling an id that is not generating must not answer `200`.
@@ -6800,10 +7241,23 @@ mod tests {
             hidden_dim,
         );
 
+        // Unique per CALL, not per (pid, vocab_size). Both callers of
+        // this helper use the same `vocab_size`, so keying on it gave
+        // the two tests one directory -- and `fs::write` opens with
+        // `O_TRUNC`, so one test rewriting the shard truncated it to
+        // zero while the other's `ferrox-safetensors` MMAP of that
+        // exact file was live. Touching a mapping past the end of its
+        // file is SIGBUS, which kills the whole test binary rather than
+        // failing one test, and only when the two happen to overlap --
+        // so it showed up as an occasional unexplained CI crash.
+        //
+        // A counter and not a thread id: the harness reuses threads
+        // across tests, so two sequential tests can share one.
+        static FIXTURE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let dir = std::env::temp_dir().join(format!(
             "ferrox_server_kimi_e2e_test_{}_{}",
             std::process::id(),
-            vocab_size
+            FIXTURE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
         std::fs::create_dir_all(&dir).unwrap();
         let shard_bytes = write_safetensors_shard(&tensors);

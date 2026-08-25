@@ -531,7 +531,8 @@ mod tests {
     #[test]
     fn parses_header_and_metadata() {
         let bytes = build_synthetic_gguf();
-        let tmp = std::env::temp_dir().join("ferrox_test_synthetic.gguf");
+        let tmp =
+            std::env::temp_dir().join(format!("ferrox_test_synthetic_{}.gguf", std::process::id()));
         std::fs::write(&tmp, &bytes).unwrap();
         let f = GgufFile::open(&tmp).unwrap();
         assert_eq!(f.version, 3);
@@ -544,7 +545,10 @@ mod tests {
     #[test]
     fn reads_tensor_bytes_correctly() {
         let bytes = build_synthetic_gguf();
-        let tmp = std::env::temp_dir().join("ferrox_test_synthetic2.gguf");
+        let tmp = std::env::temp_dir().join(format!(
+            "ferrox_test_synthetic2_{}.gguf",
+            std::process::id()
+        ));
         std::fs::write(&tmp, &bytes).unwrap();
         let f = GgufFile::open(&tmp).unwrap();
         let info = f.find_tensor("tok_embd.weight").unwrap();
@@ -591,7 +595,7 @@ mod tests {
 
     #[test]
     fn rejects_bad_magic() {
-        let tmp = std::env::temp_dir().join("ferrox_test_bad.gguf");
+        let tmp = std::env::temp_dir().join(format!("ferrox_test_bad_{}.gguf", std::process::id()));
         std::fs::write(&tmp, b"NOPE0000").unwrap();
         match GgufFile::open(&tmp) {
             Err(GgufError::BadMagic(_)) => {}

@@ -488,6 +488,215 @@ pub fn apply_rope_interleaved_with_freq_factors(
     }
 }
 
+/// YaRN RoPE scaling exactly as a checkpoint declares it, in the shape
+/// the reference reads out of `rope_scaling` (FreeToken
+/// `python/freetoken/layers/rotary.py:139`, the `"yarn"` arm of
+/// `_get_rope`). `beta_fast` / `beta_slow` / `truncate` carry that arm's
+/// own defaults, because a real YaRN checkpoint usually declares only
+/// `factor` and `original_max_position_embeddings`.
+///
+/// This type is only the declaration. The frequency rewrite it implies
+/// is [`yarn_freq_factors`], whose output feeds
+/// [`apply_rope_with_freq_factors`] /
+/// [`apply_rope_interleaved_with_freq_factors`] like any other per-band
+/// correction.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct YarnScaling {
+    /// `rope_scaling["factor"]`: how much longer the served context is
+    /// than the context the checkpoint was trained at. `1.0` makes the
+    /// whole rewrite a no-op (every band's divisor is `1.0`).
+    pub factor: f32,
+    /// `rope_scaling["beta_fast"]`, the number of full rotations that
+    /// marks the *high*-frequency end of the correction ramp -- bands
+    /// faster than this are left extrapolated. Reference default `32.0`.
+    pub beta_fast: f32,
+    /// `rope_scaling["beta_slow"]`, the rotation count marking the
+    /// *low*-frequency end -- bands slower than this are fully
+    /// interpolated. Reference default `1.0`.
+    pub beta_slow: f32,
+    /// `rope_scaling["original_max_position_embeddings"]`: the context
+    /// the checkpoint was actually trained at, which is the length the
+    /// rotation counts above are counted against.
+    pub orig_max_pos: usize,
+    /// `rope_scaling["truncate"]`, reference default `true`: floor the
+    /// low end and ceil the high end of the correction range to whole
+    /// band indices. `false` keeps the fractional range, which is the
+    /// case the `low == high` nudge in [`yarn_correction_range`] exists
+    /// for.
+    pub truncate: bool,
+}
+
+impl YarnScaling {
+    /// The reference's defaults for everything a checkpoint may omit
+    /// (`rope_scaling.get("beta_fast", 32.0)`,
+    /// `.get("beta_slow", 1.0)`, `.get("truncate", True)`). Using
+    /// anything else here silently moves the correction range and
+    /// therefore which dims extrapolate.
+    pub fn new(factor: f32, orig_max_pos: usize) -> Self {
+        YarnScaling {
+            factor,
+            beta_fast: 32.0,
+            beta_slow: 1.0,
+            orig_max_pos,
+            truncate: true,
+        }
+    }
+}
+
+/// The (fractional) band index at which a frequency completes exactly
+/// `num_rotations` full rotations over the checkpoint's *original*
+/// trained context -- the reference's `_find_correction_dim`
+/// (`rotary.py:161`):
+/// `rotary_dim * ln(orig_max_pos / (num_rotations * 2π)) / (2 * ln(base))`.
+///
+/// Computed in `f64`: `ln` of a 128k context over `2 * ln(base)` is a
+/// ratio of two large logs, and doing it in `f32` moves the floored /
+/// ceiled band index by a whole band often enough to matter.
+fn yarn_correction_dim(
+    num_rotations: f64,
+    rotary_dim: usize,
+    base: f64,
+    orig_max_pos: usize,
+) -> f64 {
+    rotary_dim as f64 * (orig_max_pos as f64 / (num_rotations * 2.0 * std::f64::consts::PI)).ln()
+        / (2.0 * base.ln())
+}
+
+/// The `[low, high]` band range the YaRN ramp interpolates across, as
+/// the reference computes it (`rotary.py:167-179`): both ends from
+/// [`yarn_correction_dim`], floored / ceiled when `truncate`, `low`
+/// clamped up to `0`, and -- the load-bearing detail, called out in the
+/// reference's own comment at `rotary.py:176` -- `high` clamped to
+/// **`rotary_dim - 1`, not `rotary_dim / 2 - 1`**.
+///
+/// The ramp only has `rotary_dim / 2` entries, so a `high` above
+/// `rotary_dim / 2 - 1` means the ramp never reaches `1.0`: the
+/// longest-wavelength dims stay *partly* extrapolated. Clamping to the
+/// ramp's own last index instead (the naive reading) forces the ramp to
+/// hit `1.0` at the last band and fully interpolates dims the reference
+/// deliberately leaves partly extrapolated -- a checkpoint-wide change
+/// to the lowest frequencies, i.e. exactly the dims long-context
+/// behaviour rides on. Pinned by
+/// `yarn_high_is_clamped_to_rotary_dim_minus_one_not_half_minus_one`.
+///
+/// Returned as `f64` because `high` may be fractional: when the range
+/// collapses (`low == high`, which is what `truncate: false` with
+/// `beta_fast == beta_slow` produces) the reference nudges `high` by
+/// `+0.001` rather than flooring the gap at `1`, and that nudge is what
+/// makes the ramp a step at `low` instead of a division by zero.
+pub fn yarn_correction_range(scaling: YarnScaling, rotary_dim: usize, base: f32) -> (f64, f64) {
+    let base = base as f64;
+    let mut low = yarn_correction_dim(
+        scaling.beta_fast as f64,
+        rotary_dim,
+        base,
+        scaling.orig_max_pos,
+    );
+    let mut high = yarn_correction_dim(
+        scaling.beta_slow as f64,
+        rotary_dim,
+        base,
+        scaling.orig_max_pos,
+    );
+    if scaling.truncate {
+        low = low.floor();
+        high = high.ceil();
+    }
+    low = low.max(0.0);
+    high = high.min(rotary_dim as f64 - 1.0);
+    if low == high {
+        high += 0.001;
+    }
+    (low, high)
+}
+
+/// YaRN's frequency rewrite, expressed as the per-band **divisors**
+/// [`apply_rope_with_freq_factors`] already consumes: one entry per
+/// rotation band (`rotary_dim / 2`), each the number the band's RoPE
+/// angle is divided by.
+///
+/// The reference rewrites the frequencies themselves
+/// (`rotary.py:181-187`):
+/// `inv_freq_new = (inv_freq / factor) * ramp + inv_freq * (1 - ramp)`
+/// with `ramp = clamp((band - low) / (high - low), 0, 1)` over
+/// `rotary_dim / 2` bands. Dividing an angle by `d` is scaling its
+/// frequency by `1/d`, so the identical rewrite in divisor form is
+/// `d = 1 / (ramp / factor + (1 - ramp))` -- exactly `1.0` on the
+/// extrapolated (fast) bands and exactly `factor` on any fully
+/// interpolated one. Keeping it in this form is what lets a YaRN
+/// checkpoint ride the *existing* CPU and Metal RoPE paths (llama.cpp's
+/// `rope_freqs` semantics: `theta / freq_factors[i]`) instead of needing
+/// a second rotation kernel; it also composes with a checkpoint's own
+/// per-band factors by multiplication.
+///
+/// Skipping this rewrite entirely -- what ferrox did before this
+/// existed, since it read neither `rope.scaling.type` nor
+/// `rope.scaling.factor` -- ropes a long-context YaRN checkpoint as if
+/// it declared no scaling at all: correct near position 0 and
+/// progressively wrong with position, which is the failure that looks
+/// like quality "degrading over long prompts" rather than like a bug.
+///
+/// # Panics
+/// If `rotary_dim` is odd or zero (a band would have no partner
+/// channel), or `factor` is not positive (the divisor would be
+/// non-finite and every angle with it).
+pub fn yarn_freq_factors(scaling: YarnScaling, rotary_dim: usize, base: f32) -> Vec<f32> {
+    assert!(
+        rotary_dim > 0 && rotary_dim.is_multiple_of(2),
+        "rotary_dim must be a positive even number of channels, got {rotary_dim}"
+    );
+    assert!(
+        scaling.factor > 0.0,
+        "YaRN factor must be positive, got {}",
+        scaling.factor
+    );
+    let (low, high) = yarn_correction_range(scaling, rotary_dim, base);
+    let factor = scaling.factor as f64;
+    (0..rotary_dim / 2)
+        .map(|band| {
+            let ramp = ((band as f64 - low) / (high - low)).clamp(0.0, 1.0);
+            // Reference form: inv_freq * (ramp / factor + (1 - ramp)).
+            let freq_scale = ramp / factor + (1.0 - ramp);
+            (1.0 / freq_scale) as f32
+        })
+        .collect()
+}
+
+/// The reference's `"proportional"` arm (`rotary.py:103`), in the same
+/// per-band divisor form as [`yarn_freq_factors`].
+///
+/// Partial rope normally spaces its frequencies over the *rotated*
+/// width (`base^(2i / rotary_dim)`, what [`apply_rope`] and friends
+/// compute from the slice they are handed). The proportional arm spaces
+/// them over the **full head** instead (`base^(2i / head_size)`) and
+/// zeroes every band past `rotary_dim / 2` -- i.e. the untouched tail of
+/// the head is exactly the tail this crate already leaves unrotated, so
+/// only the spacing differs. The returned divisor,
+/// `base^(2i/head_size - 2i/rotary_dim)`, converts one spacing into the
+/// other and is all-`1.0` when `rotary_dim == head_size` (full rope,
+/// where the two spacings coincide).
+///
+/// Using the wrong spacing for a checkpoint that declares this is not a
+/// long-context-only error: every rotated band below the last is turned
+/// at the wrong rate from position 1 onward.
+///
+/// # Panics
+/// If `rotary_dim` is odd, zero, or wider than `head_size`.
+pub fn proportional_freq_factors(head_size: usize, rotary_dim: usize, base: f32) -> Vec<f32> {
+    assert!(
+        rotary_dim > 0 && rotary_dim.is_multiple_of(2) && rotary_dim <= head_size,
+        "rotary_dim {rotary_dim} must be positive, even, and no wider than head_size {head_size}"
+    );
+    let base = base as f64;
+    (0..rotary_dim / 2)
+        .map(|band| {
+            let exponent =
+                (2 * band) as f64 / head_size as f64 - (2 * band) as f64 / rotary_dim as f64;
+            base.powf(exponent) as f32
+        })
+        .collect()
+}
+
 /// Single-token causal attention for one query against all cached
 /// key/value positions (0..=pos), grouped-query style: `n_kv_heads` may
 /// be fewer than `n_heads`, with each KV head shared by
@@ -2200,6 +2409,191 @@ mod tests {
         apply_rope_with_freq_factors(&mut v, 5, 10000.0, &[0.8, 1.3]);
         let norm_after: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
         assert!((norm_before - norm_after).abs() < 1e-4);
+    }
+
+    /// The correction range's high end is clamped to `rotary_dim - 1`,
+    /// which is *above* the ramp's own last index (`rotary_dim/2 - 1`),
+    /// so the ramp never reaches `1.0` and the longest-wavelength bands
+    /// stay partly extrapolated.
+    ///
+    /// **This test fails if `high` is clamped the naive way** (to
+    /// `rotary_dim / 2 - 1`): that makes `ramp == 1.0` at the last band,
+    /// whose divisor then becomes the full scaling factor `8.0` instead
+    /// of the reference's `2.5366`. Numbers below are computed by hand
+    /// from `_find_correction_dim` (`rotary.py:161`), not from this
+    /// implementation: for `rotary_dim` 64, base 10000, original context
+    /// 131072, `low = floor(22.5134) = 22` and
+    /// `high = ceil(34.5546) = 35`.
+    #[test]
+    fn yarn_high_is_clamped_to_rotary_dim_minus_one_not_half_minus_one() {
+        let scaling = YarnScaling::new(8.0, 131_072);
+        let (low, high) = yarn_correction_range(scaling, 64, 10_000.0);
+        assert!((low - 22.0).abs() < 1e-9, "low was {low}");
+        assert!((high - 35.0).abs() < 1e-9, "high was {high}");
+
+        let factors = yarn_freq_factors(scaling, 64, 10_000.0);
+        let last = factors[31];
+        let ramp = (31.0 - 22.0) / (35.0 - 22.0);
+        let want = 1.0 / (ramp / 8.0 + (1.0 - ramp));
+        assert!(
+            (last - want).abs() < 1e-4,
+            "last band divisor {last} must be the reference's {want}"
+        );
+        assert!(
+            (last - 8.0).abs() > 1.0,
+            "clamping high to rotary_dim/2 - 1 would fully interpolate this band \
+             (divisor 8.0, the whole factor); got {last}"
+        );
+    }
+
+    /// Band-by-band against the reference ramp
+    /// (`rotary.py:181-187`), with `low`/`high` computed by hand as in
+    /// the test above: bands at or below `low` are pure extrapolation
+    /// (divisor exactly 1.0) and each band past it interpolates by
+    /// `1 / (ramp/factor + 1 - ramp)`.
+    #[test]
+    fn yarn_freq_factors_match_the_reference_ramp_formula_band_by_band() {
+        let scaling = YarnScaling::new(8.0, 131_072);
+        let factors = yarn_freq_factors(scaling, 64, 10_000.0);
+        assert_eq!(factors.len(), 32, "one divisor per rotation band");
+        for band in [0usize, 10, 22] {
+            assert!(
+                (factors[band] - 1.0).abs() < 1e-6,
+                "band {band} is at or below low=22 and must be left extrapolated, \
+                 got {}",
+                factors[band]
+            );
+        }
+        for band in [23usize, 27, 31] {
+            let ramp = (band as f32 - 22.0) / (35.0 - 22.0);
+            let want = 1.0 / (ramp / 8.0 + (1.0 - ramp));
+            assert!(
+                (factors[band] - want).abs() < 1e-4,
+                "band {band}: got {}, reference {want}",
+                factors[band]
+            );
+        }
+    }
+
+    /// A collapsed correction range (`low == high`, which
+    /// `truncate: false` with `beta_fast == beta_slow` produces) is
+    /// nudged by `+0.001`, making the ramp a step at `low`: the band
+    /// below stays fully extrapolated and the band above is fully
+    /// interpolated at the whole factor.
+    ///
+    /// **This test fails if the collapse is handled by flooring the gap
+    /// at 1** (`high = low + 1`), the other obvious repair: band 23 is
+    /// then only `0.4866` of the way up the ramp and its divisor is
+    /// `1.7414`, not `8.0`.
+    #[test]
+    fn yarn_nudges_a_collapsed_correction_range_instead_of_flooring_the_gap_at_one() {
+        let scaling = YarnScaling {
+            beta_slow: 32.0,
+            truncate: false,
+            ..YarnScaling::new(8.0, 131_072)
+        };
+        let (low, high) = yarn_correction_range(scaling, 64, 10_000.0);
+        // Hand-computed: _find_correction_dim(32) = 22.513440...
+        assert!((low - 22.513_44).abs() < 1e-4, "low was {low}");
+        assert!(
+            (high - low - 0.001).abs() < 1e-9,
+            "high must be low + 0.001, got {high}"
+        );
+
+        let factors = yarn_freq_factors(scaling, 64, 10_000.0);
+        assert!(
+            (factors[22] - 1.0).abs() < 1e-6,
+            "band below the step must be untouched, got {}",
+            factors[22]
+        );
+        assert!(
+            (factors[23] - 8.0).abs() < 1e-4,
+            "band above the step must take the whole factor (a gap of 1 would \
+             give 1.7414); got {}",
+            factors[23]
+        );
+    }
+
+    /// `factor = 1.0` means "the served context is the trained context":
+    /// every band's divisor must be exactly 1.0, i.e. mathematically the
+    /// same rotation as no scaling at all. A checkpoint that declares
+    /// YaRN with a no-op factor must not have its RoPE moved.
+    #[test]
+    fn yarn_with_a_factor_of_one_leaves_every_band_untouched() {
+        let factors = yarn_freq_factors(YarnScaling::new(1.0, 4096), 32, 10_000.0);
+        for (band, f) in factors.iter().enumerate() {
+            assert!((f - 1.0).abs() < 1e-6, "band {band} moved to {f}");
+        }
+    }
+
+    /// The divisors are only a re-expression of the reference's
+    /// rewritten `inv_freq`, so rotating through
+    /// [`apply_rope_with_freq_factors`] must land on exactly the angle
+    /// the reference's `inv_freq_new` implies. Checked against the
+    /// reference formula (`inv_freq * (ramp/factor + 1 - ramp)`)
+    /// evaluated here, not against this module's own divisor.
+    #[test]
+    fn yarn_divisors_reproduce_the_references_rewritten_frequencies() {
+        let scaling = YarnScaling::new(8.0, 131_072);
+        let factors = yarn_freq_factors(scaling, 64, 10_000.0);
+
+        let band = 31usize;
+        let pos = 1024usize;
+        let mut v = vec![0.0f32; 64];
+        v[band] = 1.0;
+        apply_rope_with_freq_factors(&mut v, pos, 10_000.0, &factors);
+
+        let ramp = (band as f64 - 22.0) / (35.0 - 22.0);
+        let inv_freq = 1.0 / 10_000f64.powf((2 * band) as f64 / 64.0);
+        let inv_freq_new = inv_freq * (ramp / 8.0 + (1.0 - ramp));
+        let angle = pos as f64 * inv_freq_new;
+        assert!(
+            (v[band] as f64 - angle.cos()).abs() < 1e-5,
+            "cos: {} vs {}",
+            v[band],
+            angle.cos()
+        );
+        assert!(
+            (v[band + 32] as f64 - angle.sin()).abs() < 1e-5,
+            "sin: {} vs {}",
+            v[band + 32],
+            angle.sin()
+        );
+    }
+
+    /// The proportional arm spaces frequencies over the *full* head
+    /// while only the first `rotary_dim` channels rotate. Values are
+    /// hand-computed from `rotary.py:103`'s
+    /// `base ** (arange(0, head_size, 2) / head_size)` against this
+    /// crate's own `base ** (2i / rotary_dim)` spacing: the divisor is
+    /// their ratio.
+    #[test]
+    fn proportional_freq_factors_respace_frequencies_over_the_full_head() {
+        let factors = proportional_freq_factors(128, 96, 10_000.0);
+        assert_eq!(factors.len(), 48, "one divisor per rotated band");
+        assert!((factors[0] - 1.0).abs() < 1e-6, "band 0 is 1/1");
+        // 10000^(2/128 - 2/96) = 0.95316188...
+        assert!(
+            (factors[1] - 0.953_161_9).abs() < 1e-5,
+            "band 1 was {}",
+            factors[1]
+        );
+        // 10000^(94/128 - 94/96) = 0.10491397...
+        assert!(
+            (factors[47] - 0.104_913_97).abs() < 1e-5,
+            "last band was {}",
+            factors[47]
+        );
+    }
+
+    /// Full-width rope is the case where both spacings coincide, so the
+    /// arm must be a no-op there rather than quietly re-scaling every
+    /// band of an ordinary checkpoint.
+    #[test]
+    fn proportional_freq_factors_are_all_ones_when_the_whole_head_rotates() {
+        for f in proportional_freq_factors(128, 128, 500_000.0) {
+            assert!((f - 1.0).abs() < 1e-6, "full-width band moved to {f}");
+        }
     }
 
     #[test]

@@ -97,9 +97,18 @@ OpenAI-compatible HTTP API:
   `Last-Event-ID` replay and a JSON polling fallback), completions,
   tokenize / detokenize
 - Decoder embeddings (mean/last pool)
-- Anthropic-shaped `POST /v1/messages` (non-stream text)
+- Anthropic Messages: `POST /v1/messages` streaming and buffered
+  (thinking and tool blocks, protocol-native `ping` keepalive) plus
+  `POST /v1/messages/count_tokens`
 - Presence and frequency penalties, best-effort `json_object`
 - Continuous batching and chunked prefill
+- `ferrox serve-bench`: concurrency, TTFT, TPOT and queueing numbers
+  for a live server, with the methodology (positional split, pooled
+  nearest-rank percentiles, whole-run throughput) tested socket-free
+- Live serving telemetry (`GET /v1/stats`, `GET /v1/requests`) and an
+  elastic KV/expert split that can be reported and re-sized without a
+  restart (`GET /v1/cache/status`, `POST /v1/cache/rebuild`), behind a
+  maintenance gate that refuses rather than queues while it happens
 - `reasoning_content`: a reasoning model's chain of thought is split
   out of `content`, streamed as it arrives rather than at the end
 - Tool calls in nine wire formats, not one — the format the served
@@ -129,6 +138,11 @@ returns a decision.
 | `scheduler` | admission, chunked-prefill sizing, and what a chunk reserves |
 | `parser` | where reasoning ends and the answer begins; which tool was called, in which format |
 | `effort` | which reasoning-effort dialect a checkpoint speaks, probed from its own template |
+| `stats` | what a server may honestly claim about its own throughput and latency |
+| `maintenance` | whether a request, a cache rebuild or a stop may proceed right now |
+| `residency` | which class a layer's expert bank settles into, and what that then forbids |
+| `state_pool` | which recurrent-state slot a request holds, and where a prefill freezes one |
+| `bench_profile` | where this machine's measured bandwidth profile lives, and when it may be trusted |
 
 Wired in today: the two parsers (chat completions, streaming and
 buffered), the stop-string withhold rule, which `ferrox-server`'s

@@ -206,6 +206,17 @@ pub struct ModelConfig {
     /// slightly wrong, an error that compounds with position and
     /// eventually produces wrong logits (a spurious early EOS was the
     /// observed real symptom).
+    ///
+    /// Not only a tensor: this is the *resolved* per-band divisor array,
+    /// so a checkpoint declaring `rope.scaling.type = "yarn"` gets its
+    /// YaRN frequency rewrite folded in here too (see
+    /// `ferrox_core::attention::yarn_freq_factors`, and
+    /// `loader::yarn_scaling_from_gguf` for what the file has to declare
+    /// before that happens). A file carrying both a tensor and a YaRN
+    /// declaration composes them by multiplication, as llama.cpp does
+    /// (`ggml_rope_cache_init` divides by `freq_factors` and *then*
+    /// runs `rope_yarn`). Consumers must therefore treat this as "the
+    /// correction to apply", not as "the tensor this file shipped".
     pub rope_freqs: Option<Vec<f32>>,
     /// LongRoPE's two candidate factor sets, kept so the choice between
     /// them can be made when the *run's* context size is known rather
@@ -297,6 +308,13 @@ impl ModelConfig {
     ///
     /// A no-op for every checkpoint that ships neither set, which is all
     /// of them except the Phi-3/Phi-4 family today.
+    ///
+    /// Because it re-picks `rope_freqs` wholesale it would also discard
+    /// a YaRN rewrite folded into that field at parse time (see
+    /// [`Self::rope_freqs`]). No real checkpoint hits that: LongRoPE
+    /// files declare `rope.scaling.type = "longrope"`, which the loader's
+    /// YaRN arm deliberately does not claim, so the two never populate
+    /// the field on the same file.
     pub fn apply_runtime_context(&mut self, ctx: usize) {
         let (Some(orig), true) = (
             self.rope_orig_ctx,

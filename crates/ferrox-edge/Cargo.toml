@@ -13,6 +13,10 @@ categories = ["algorithms", "science"]
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }
+# For the deterministic receipt id in `outbox`: a retried stop must
+# derive the same id, or it writes a second billing event for work that
+# happened once.
+sha2 = { workspace = true }
 
 [features]
 default = []

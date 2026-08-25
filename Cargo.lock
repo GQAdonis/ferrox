@@ -440,6 +440,7 @@ dependencies = [
  "clap",
  "ferrox-core",
  "ferrox-cuda",
+ "ferrox-edge",
  "ferrox-gguf",
  "ferrox-metal",
  "ferrox-models",
@@ -485,6 +486,7 @@ version = "0.11.1"
 dependencies = [
  "serde",
  "serde_json",
+ "sha2",
 ]
 
 [[package]]

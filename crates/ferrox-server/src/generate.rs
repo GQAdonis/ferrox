@@ -188,10 +188,25 @@ fn acquire_pooled_caches(
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FinishReason {
     Stop,
+    /// A caller-supplied stop STRING matched, and this is the one that
+    /// did.
+    ///
+    /// Separate from [`Stop`](FinishReason::Stop), which is the model
+    /// ending its own turn, because two protocols ask which it was:
+    /// Anthropic reports `stop_reason: "stop_sequence"` with the text
+    /// beside it, and an agent branches on that to tell "I hit the
+    /// fence I put up" from "the model was done". Both still answer
+    /// `"stop"` on the OpenAI surface, which has no field for the
+    /// distinction.
+    ///
+    /// The string is the stop as the CALLER spelled it, not the text
+    /// that matched it -- they are the same today and the caller's
+    /// spelling is the one it can compare against.
+    StopSequence(String),
     Length,
     /// A canceller asked for this generation to stop; see the `cancel`
     /// module. Deliberately not folded into `Stop`: the tokens that did
@@ -204,13 +219,32 @@ pub enum FinishReason {
 impl FinishReason {
     pub fn as_str(&self) -> &'static str {
         match self {
-            FinishReason::Stop => "stop",
+            // A caller's stop string is still "stop" here: OpenAI's
+            // vocabulary has no other value for it, and inventing one
+            // would make a completed answer look like a failure to a
+            // client that checks against the documented set. The
+            // surfaces that CAN say more read the variant instead.
+            FinishReason::Stop | FinishReason::StopSequence(_) => "stop",
             FinishReason::Length => "length",
             // Not an OpenAI-defined value -- OpenAI has no cancel
             // endpoint to produce one. A client that does not know the
             // string still sees a terminated stream with *a* finish
             // reason, which is what stops it being read as truncation.
             FinishReason::Cancelled => "cancelled",
+        }
+    }
+
+    /// The caller-supplied stop string this generation ran into, if it
+    /// ran into one.
+    ///
+    /// `None` covers every other ending, a stop TOKEN included: a
+    /// control token in the caller's stop set is not a string the
+    /// caller can compare its own `stop` list against, so naming one
+    /// here would report a match the caller never asked for.
+    pub fn matched_stop(&self) -> Option<&str> {
+        match self {
+            FinishReason::StopSequence(stop) => Some(stop),
+            _ => None,
         }
     }
 }
@@ -255,6 +289,19 @@ pub struct GenerationParams {
     /// leaves it `None`. See the `cancel` module for the two tiers that
     /// set it.
     pub cancel: Option<crate::cancel::CancelToken>,
+    /// Run past the model's own end-of-generation tokens.
+    ///
+    /// For benchmarking, and for nothing else. A serving run needs every
+    /// request to produce EXACTLY `max_tokens`, or the slowest
+    /// percentile is whichever request happened to be asked for the
+    /// most tokens -- a fact about the prompts, reported as a fact about
+    /// the server.
+    ///
+    /// Suppresses the MODEL's set only. A stop string or stop token the
+    /// caller supplied still ends the answer: the caller asking to
+    /// ignore the model's opinion about length is not the caller
+    /// withdrawing their own fence.
+    pub ignore_eos: bool,
 }
 
 impl GenerationParams {
@@ -678,7 +725,7 @@ fn sample_until_stop(
         } else {
             sampler.sample(&logits, &params.sampling, &generated_ids)
         };
-        if stop_tokens.contains(next) {
+        if !params.ignore_eos && stop_tokens.contains(next) {
             finish = FinishReason::Stop;
             break;
         }
@@ -702,11 +749,11 @@ fn sample_until_stop(
                     emit(&text);
                 }
             }
-            crate::stop::StopStep::Matched(text) => {
+            crate::stop::StopStep::Matched { text, stop } => {
                 if !text.is_empty() {
                     emit(&text);
                 }
-                finish = FinishReason::Stop;
+                finish = FinishReason::StopSequence(stop);
                 break;
             }
         }
@@ -800,12 +847,19 @@ pub fn generate_engine<E: Engine, T: TextTokenizer>(
 
 /// The earliest byte offset in `text` at which any of `stops` begins,
 /// or `None` if none match yet.
-pub(crate) fn earliest_stop_match(text: &str, stops: &[String]) -> Option<usize> {
+pub(crate) fn earliest_stop_match<'a>(text: &str, stops: &'a [String]) -> Option<(usize, &'a str)> {
     stops
         .iter()
         .filter(|s| !s.is_empty())
-        .filter_map(|s| text.find(s.as_str()))
-        .min()
+        .filter_map(|s| text.find(s.as_str()).map(|at| (at, s.as_str())))
+        // Leftmost wins, because that is where the answer is cut. Two
+        // stops starting at the same place cut identically, so the tie
+        // is broken on LENGTH, longest first: `"</tool_call>"` and
+        // `"</tool"` both match at the same index and the longer one is
+        // the more specific claim about what the model produced. Some
+        // rule is needed either way -- without one the reported stop
+        // would depend on the order the caller happened to list them.
+        .min_by_key(|(at, s)| (*at, std::cmp::Reverse(s.len())))
 }
 
 /// The largest char boundary `<= idx`. `str::floor_char_boundary` is
@@ -835,6 +889,7 @@ mod tests {
             stop_token_ids: Vec::new(),
             json_object: false,
             cancel: None,
+            ignore_eos: false,
         }
     }
 
@@ -1217,6 +1272,7 @@ mod tests {
                 stop_token_ids: Vec::new(),
                 json_object: false,
                 cancel: None,
+                ignore_eos: false,
             },
             None,
             None,
@@ -1242,6 +1298,15 @@ mod tests {
         render: impl Fn(usize) -> String,
         params: &GenerationParams,
     ) -> (FinishReason, Vec<usize>, Vec<String>) {
+        run_scripted_with_stops(script, render, params, StopTokens::from_eos(None))
+    }
+
+    fn run_scripted_with_stops(
+        script: &[usize],
+        render: impl Fn(usize) -> String,
+        params: &GenerationParams,
+        stop_tokens: StopTokens,
+    ) -> (FinishReason, Vec<usize>, Vec<String>) {
         let vocab = script.iter().copied().max().unwrap_or(0) + 2;
         let logits_for = |id: usize| {
             let mut v = vec![0.0f32; vocab];
@@ -1262,7 +1327,7 @@ mod tests {
         let (finish, ids, _) = sample_until_stop(
             first,
             0,
-            &StopTokens::from_eos(None),
+            &stop_tokens,
             params,
             |ids| ids.iter().copied().map(&render).collect::<String>(),
             |_tok, _pos| logits_for(take()),
@@ -1284,6 +1349,7 @@ mod tests {
             stop_token_ids: Vec::new(),
             json_object: false,
             cancel: None,
+            ignore_eos: false,
         }
     }
 
@@ -1382,7 +1448,11 @@ mod tests {
         };
 
         let (finish, _, chunks) = run_scripted(&script, render, &params);
-        assert_eq!(finish, FinishReason::Stop);
+        assert_eq!(
+            finish,
+            FinishReason::StopSequence("abc".to_string()),
+            "the reason names the stop that fired, not merely that one did"
+        );
         assert_eq!(
             chunks.concat(),
             "ab",
@@ -1477,10 +1547,11 @@ mod tests {
                 max_tokens: 20,
                 sampling: SamplingParams::default(),
                 seed: 1,
-                stop: vec![stop_str],
+                stop: vec![stop_str.clone()],
                 stop_token_ids: Vec::new(),
                 json_object: false,
                 cancel: None,
+                ignore_eos: false,
             },
             None,
             None,
@@ -1489,7 +1560,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(finish, FinishReason::Stop);
+        assert_eq!(finish, FinishReason::StopSequence(stop_str));
         assert_eq!(truncated, baseline[..cut]);
     }
 
@@ -2184,11 +2255,70 @@ mod tests {
     fn earliest_stop_match_finds_the_leftmost_match_across_multiple_stops() {
         assert_eq!(
             earliest_stop_match("hello world", &["world".to_string(), "hello".to_string()]),
-            Some(0)
+            Some((0, "hello")),
+            "the leftmost match wins, not the caller's first entry"
         );
         assert_eq!(
             earliest_stop_match("hello world", &["nope".to_string()]),
             None
         );
+    }
+
+    /// `ignore_eos` is what makes a serving benchmark's requests do the
+    /// same amount of work as each other. Without it they finish at
+    /// different lengths and the slowest percentile is whichever
+    /// request happened to be asked for the most tokens -- a fact about
+    /// the prompts, reported as a fact about the server.
+    #[test]
+    fn ignore_eos_runs_a_request_out_to_its_full_budget() {
+        let render = |id: usize| char::from(b'a' + id as u8).to_string();
+        // The model tries to end its turn on its third token.
+        let script = [0usize, 1, 7, 2, 3, 4];
+        let eos = StopTokens::from_eos(Some(7));
+
+        let stops_early =
+            run_scripted_with_stops(&script, render, &scripted_params(6), eos.clone());
+        assert_eq!(stops_early.0, FinishReason::Stop);
+        assert_eq!(stops_early.1.len(), 2, "the model ended its own turn");
+
+        let runs_on = run_scripted_with_stops(
+            &script,
+            render,
+            &GenerationParams {
+                ignore_eos: true,
+                ..scripted_params(6)
+            },
+            eos,
+        );
+        assert_eq!(runs_on.0, FinishReason::Length);
+        assert_eq!(
+            runs_on.1.len(),
+            6,
+            "exactly the budget, which is the whole point"
+        );
+    }
+
+    /// `ignore_eos` suppresses the MODEL's set and only that. A caller
+    /// asking to run past the model's opinion about length is not a
+    /// caller withdrawing their own fence, and a benchmark that could
+    /// not be stopped by its own sentinel would be a footgun rather
+    /// than a knob.
+    #[test]
+    fn ignore_eos_does_not_withdraw_the_callers_own_stop() {
+        let render = |id: usize| char::from(b'a' + id as u8).to_string();
+        let script = [0usize, 1, 2, 3, 4, 5];
+
+        let (finish, ids, _) = run_scripted_with_stops(
+            &script,
+            render,
+            &GenerationParams {
+                ignore_eos: true,
+                stop_token_ids: vec![2],
+                ..scripted_params(6)
+            },
+            StopTokens::from_eos(Some(7)),
+        );
+        assert_eq!(finish, FinishReason::Stop);
+        assert_eq!(ids.len(), 2, "the caller's stop token still ends it");
     }
 }

@@ -17,8 +17,13 @@ comes back the same way.
 | `POST /v1/tokenize` | Supported |
 | `POST /v1/detokenize` | Supported |
 | `POST /v1/embeddings` | Supported for GGUF Decoder (mean/last pool of hidden states) |
-| `POST /v1/messages` | Anthropic-shaped, non-stream text |
+| `POST /v1/messages` | Anthropic Messages, streaming and buffered |
+| `POST /v1/messages/count_tokens` | Anthropic prompt sizing, no generation |
+| `POST /v1/responses` | OpenAI Responses surface (what `codex` speaks), streaming and buffered |
+| `GET /v1/stats` · `GET /v1/requests` | Live serving telemetry, pool gauges, memory footprint, and the request ring |
 | `POST /v1/cancel` | Stop a streamed generation by `request_id` (see below) |
+| `GET /v1/cache/status` · `POST /v1/cache/rebuild` | KV pool geometry and re-split (see below) |
+| `POST /v1/admin/prepare-stop` | Close admission, seal the accounting, and make the receipt durable (see below) |
 | `GET /cache/stats` · `GET /metrics` | Ferrox extensions |
 | `/admin/*` | Control surface (see below) |
 | Audio / images | Not supported |
@@ -41,7 +46,8 @@ comes back the same way.
 | `chat_template_kwargs` | Supported (see [Chat templates](#chat-templates)) |
 | `reasoning_effort` | Supported, quantized onto what the checkpoint grades; `none`/`off` turn thinking off |
 | `thinking: {"type": …}` | Supported (DeepSeek wire): `enabled`/`disabled`, anything else is a 400 |
-| `reasoning_content` (response) | Ferrox extension: a reasoning model's chain of thought, split out of `content` |
+| `ignore_eos` | Ferrox extension: run past the model's own end-of-generation tokens so the request produces exactly `max_tokens`. A serving-benchmark knob. Suppresses the model's set only — a caller's own `stop` strings still end the answer |
+| `reasoning_content` (both ways) | Ferrox extension: a reasoning model's chain of thought, split out of `content` on the way out and replayable on the way in (`reasoning` is accepted as an alias) |
 
 ### Where a completion stops
 
@@ -514,6 +520,28 @@ names nothing that is running. The two are different facts: only one of
 them saved any work, and a client told `ok` for both would claim it
 stopped something it did not.
 
+### Stop strings
+
+A generation that runs into one of the caller's `stop` strings reports
+`finish_reason: "stop"` here — OpenAI's vocabulary has no other value,
+and inventing one would make a completed answer look like a failure to
+a client checking against the documented set. The stop string itself is
+trimmed from the answer.
+
+`/v1/messages` says more, because Anthropic's protocol has room for it:
+a caller's stop string that fires reports `stop_reason: "stop_sequence"`
+with `stop_sequence: "<the string>"` beside it, on the buffered body and
+in the terminal `message_delta` alike. The two are only ever reported
+together. Two things are deliberately *not* reported that way:
+
+- A stop the **server** added — the served template's own end-of-turn
+  marker — reports the ordinary `end_turn`. Telling an agent it hit a
+  fence it never put up is worse than telling it nothing.
+- A **truncated** generation reports `max_tokens` even if a stop
+  matched, and a generation that produced tool calls reports
+  `tool_use`. What the client does next is decided by those, not by the
+  fence.
+
 A cancelled stream ends with `finish_reason: "cancelled"`. OpenAI does
 not define that value, because OpenAI has no cancel endpoint, but it is
 *a* finish reason, so no client reads the stream as truncation. Tokens
@@ -529,7 +557,37 @@ mid-prefill, or decoding, and keeps whatever it produced.
 
 The mechanism has one honest edge: the flag is read between decoded
 tokens, so a prefill already inside a forward pass runs to completion.
-`/v1/completions` and `/v1/messages` are buffered and register no id.
+`/v1/completions` is buffered and registers no id. `/v1/messages` does
+register one, but the Anthropic protocol has no field to state it in --
+the `message_start` id is a per-message `msg_...` the cancel registry
+does not know -- so the server puts it in a `request-id` response
+header, spelled as the upstream API spells it. Cancel a streamed
+`/v1/messages` with that value.
+
+## Keepalives
+
+Every streamed endpoint sends a keepalive after 15 seconds of silence,
+and every one of them is a **data frame**, never an SSE comment. axum's
+own `Sse::keep_alive` writes `: ping`, which a proxy sees but a client's
+event handler never does — and a client's stream-idle timeout is armed
+on received events, so a comment-kept stream gets torn down and
+reconnected in the middle of a long prefill, which is exactly when a
+keepalive was supposed to help.
+
+| Endpoint | Keepalive frame |
+|---|---|
+| `/v1/chat/completions` | a `chat.completion.chunk` with an empty delta |
+| `/v1/stream/{id}` (replay) | an id-less chunk with `choices: []` |
+| `/v1/responses` | `response.in_progress` |
+| `/v1/messages` | `ping` |
+
+The silence *before* the first token counts: that window is the queue
+wait plus the prefill, and on a long prompt it is the longest quiet
+stretch of the request.
+
+A replayed stream never re-delivers keepalives, and the replay
+keepalive carries no `id:`, so it does not enter the sequence a
+`Last-Event-ID` resumes from.
 
 ## Streaming behind a proxy
 
@@ -646,6 +704,24 @@ name that implies nothing gets no reasoning parser at all — the right
 answer for a model that does not reason, since an unconditional
 splitter would eat a literal `<think>` written in a code block.
 
+### Replaying it
+
+`reasoning_content` is accepted on a request's assistant messages, not
+only returned on responses, and `reasoning` is accepted as an alias so a
+turn can be replayed in the shape `/v1/responses` or `/v1/messages`
+handed it back. It is passed to the template on its own key — under
+*both* spellings, since the DeepSeek and GLM lineages iterate
+`message.reasoning_content` while Qwen and gpt-oss read
+`message.reasoning`, and a template treats the key it does not know as
+undefined. An empty string is dropped rather than passed, so a template
+that opens its thinking markers on `if message.reasoning_content` does
+not wrap them around nothing.
+
+It is never folded into `content`. A past chain of thought shown as
+content is something the model believes it said out loud, which is the
+whole reason the family markers exist. A template that knows nothing
+about reasoning ignores the key and renders exactly what it did before.
+
 Whether the block is *already open* is read off the rendered prompt, not
 guessed from the family: a template asked to think can open the block in
 the prompt itself, and then the model's first token is reasoning and no
@@ -699,6 +775,20 @@ The XML-ish formats state no types, so a parameter's value is typed
 from the tool's own `parameters` schema: a declared `string` is handed
 over verbatim, which is what keeps a zero-padded id like `"018956"`
 from arriving as a number.
+
+## Legacy completions
+
+`/v1/completions` honours `stop`, `max_tokens` (default 16 — the legacy
+floor is right *here*, where a caller completing a fragment usually
+wants a fragment back), `temperature`, `top_p` and `seed`.
+
+Everything it does not implement is refused **by name** rather than
+dropped: token-id prompts (`[int]` / `[[int]]`), `logprobs`, `echo`,
+`suffix`, `logit_bias`, and any `response_format` other than
+`{"type": "text"}`. Serde drops an undeclared field silently, and a
+caller cannot tell that apart from having had it honoured — which for
+`stop` in particular means believing generation will halt at a sentinel
+and instead getting the full budget of text past it.
 
 ## Not yet
 

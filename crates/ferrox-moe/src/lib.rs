@@ -1315,17 +1315,48 @@ mod tests {
         assert!((sqrt_softplus(20.0) - 20.0_f32.sqrt()).abs() < 1e-3);
     }
 
+    /// Group-limited routing CONCENTRATES; it does not spread.
+    ///
+    /// This test replaces one that asserted the opposite -- that
+    /// `total_k = 2` over two groups keeps "both group winners" -- which
+    /// was the shape of the bug, not a property of the rule. The real
+    /// DeepSeek-V3 / GLM `n_group`/`topk_group` router scores each group
+    /// by the sum of its top-2 members, keeps the `topk_group` best
+    /// groups, masks every expert in the rest to `-inf`, and then runs
+    /// ONE GLOBAL top-k over what survives. With `topk_group = 1` only
+    /// group 0 survives, so both selected experts must come from it and
+    /// expert 3 must NOT fire.
+    ///
+    /// It therefore fails against the previous implementation, which
+    /// took `k_per_group` from every group and truncated afterwards.
     #[test]
-    fn grouped_routing_picks_within_each_group_then_global_top_k() {
-        // 4 experts, 2 groups of 2. Scores favor expert 1 in group0 and
-        // expert 3 in group1; total_k=2 should keep both group winners.
-        let logits = vec![0.1, 5.0, 0.2, 4.0];
+    fn group_limited_routing_concentrates_into_the_surviving_groups() {
+        // 4 experts, 2 groups of 2. Group 0 holds the two best scores.
+        let logits = vec![5.0, 4.5, 0.2, 0.1];
         let d = route_top_k_grouped(&logits, 2, 1, 2, GatingFunction::Softmax, true);
         assert_eq!(d.expert_ids.len(), 2);
-        assert!(d.expert_ids.contains(&1));
-        assert!(d.expert_ids.contains(&3));
+        let mut ids = d.expert_ids.clone();
+        ids.sort_unstable();
+        assert_eq!(ids, vec![0, 1], "both experts must come from group 0");
         let sum: f32 = d.weights.iter().sum();
         assert!((sum - 1.0).abs() < 1e-4);
+    }
+
+    /// The group score is the sum of a group's top TWO, not its best
+    /// single member. A group with one spike and nothing behind it loses
+    /// to a group with two strong members.
+    #[test]
+    fn a_group_is_scored_by_its_top_two_not_by_its_best_member() {
+        // Group 0: one spike and a dead expert, carrying 0.426 of the
+        // softmax mass between them. Group 1: two solid members
+        // carrying 0.574 together, neither of which beats the spike on
+        // its own. Scoring by best member picks group 0; scoring by
+        // top-2 sum picks group 1, which is the reference rule.
+        let logits = vec![1.0, -20.0, 0.7, 0.5];
+        let d = route_top_k_grouped(&logits, 2, 1, 2, GatingFunction::Softmax, true);
+        let mut ids = d.expert_ids.clone();
+        ids.sort_unstable();
+        assert_eq!(ids, vec![2, 3], "the two-strong-members group wins");
     }
 
     #[test]

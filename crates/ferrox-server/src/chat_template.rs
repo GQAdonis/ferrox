@@ -21,7 +21,8 @@
 //! 1. **Message shape.** [`PromptTemplate::render`] converts the
 //!    server's `ChatMessage` into the OpenAI-shaped JSON a real template
 //!    reads (`message.role`, `message.content`, `message.tool_calls`,
-//!    `message.tool_call_id`).
+//!    `message.tool_call_id`, and a replayed chain of thought under all
+//!    three spellings families use for it).
 //! 2. **Who describes the tools.** A template that really consumes
 //!    `tools` -- established by rendering with and without one, not by
 //!    looking for the word -- gets them as structured JSON and owns the
@@ -73,7 +74,6 @@ struct Inner {
     bos_token: Option<String>,
     eos_token: Option<String>,
     thinking: ferrox_edge::ThinkingProfile,
-    gears: ThinkGears,
     handles_tools: bool,
 }
 
@@ -145,7 +145,6 @@ impl PromptTemplate {
         Self {
             inner: Arc::new(Inner {
                 end_of_turn: end_of_turn_marker(source),
-                gears: derive_think_gears(&thinking),
                 template,
                 bos_token,
                 eos_token,
@@ -180,8 +179,15 @@ impl PromptTemplate {
 
     /// The thinking controls to advertise on `/v1/models`, so a client
     /// picks a gear instead of guessing one.
-    pub(crate) fn think_gears(&self) -> &ThinkGears {
-        &self.inner.gears
+    ///
+    /// `parser_configured` covers the one case the template cannot
+    /// speak for: an always-thinking family whose template has no
+    /// observable knob, but whose output really is being split into
+    /// `reasoning_content`. Such a checkpoint advertises a single `on`
+    /// gear with no kwargs -- there is nothing to send, and the point is
+    /// only to stop a reasoning model looking like one with no gears.
+    pub(crate) fn think_gears(&self, parser_configured: bool) -> ThinkGears {
+        derive_think_gears(&self.inner.thinking, parser_configured)
     }
 
     /// Render a conversation into a prompt.
@@ -249,6 +255,32 @@ fn message_json(m: &ChatMessage, structured: bool) -> Value {
     }
     if let Some(id) = &m.tool_call_id {
         obj.insert("tool_call_id".into(), json!(id));
+    }
+    // Under every spelling, because templates disagree and a template
+    // reads a key it does not know as undefined rather than erroring:
+    // the DeepSeek/GLM family iterates `message.reasoning_content`, the
+    // Qwen lineage `message.reasoning`, harmony `message.thinking`.
+    // Emitting all three costs two keys and means a replayed chain of
+    // thought reaches whichever one the served checkpoint was written
+    // against, instead of being silently dropped by the others.
+    //
+    // Empty is not the same as absent and is skipped: a template that
+    // tests `if message.reasoning_content` would otherwise open the
+    // family's thinking markers around nothing.
+    if let Some(reasoning) = m.reasoning_content.as_deref().filter(|r| !r.is_empty()) {
+        obj.insert("reasoning_content".into(), json!(reasoning));
+        obj.insert("reasoning".into(), json!(reasoning));
+        // `thinking` has ONE exception, and it is a raise rather than a
+        // wrong render: gpt-oss's harmony template rejects an assistant
+        // turn that makes tool calls while carrying both visible text
+        // and thinking, because harmony puts those on channels that
+        // cannot both be final. Visible text wins -- it is what the
+        // user was actually shown -- and the other two spellings still
+        // carry the reasoning for every family that reads them.
+        let harmony_would_raise = m.tool_calls.is_some() && !text.is_empty();
+        if !harmony_would_raise {
+            obj.insert("thinking".into(), json!(reasoning));
+        }
     }
     Value::Object(obj)
 }
@@ -425,6 +457,7 @@ mod tests {
             content: Some(MessageContent::Text(content.to_string())),
             tool_calls: None,
             tool_call_id: None,
+            reasoning_content: None,
         }
     }
 
@@ -528,6 +561,7 @@ mod tests {
             content: None,
             tool_calls: Some(vec![tool_call_in("get_weather", r#"{"city":"Paris"}"#)]),
             tool_call_id: None,
+            reasoning_content: None,
         };
         let rendered = tmpl.render(&[replayed], &[], Map::new()).expect("renders");
         assert!(
@@ -550,6 +584,7 @@ mod tests {
             content: None,
             tool_calls: Some(vec![tool_call_in("get_weather", r#"{"city":"Paris"}"#)]),
             tool_call_id: None,
+            reasoning_content: None,
         };
         let tools = vec![tool_def("get_weather")];
         assert_eq!(
@@ -612,5 +647,87 @@ mod tests {
         let inert =
             PromptTemplate::from_gguf_metadata(Some(CHATML), Some("qwen2"), false, None, None);
         assert!(!inert.efforts().consumes_effort);
+    }
+
+    /// Templates disagree about the key, so both are emitted. The
+    /// DeepSeek/GLM lineage iterates `message.reasoning_content`, Qwen
+    /// and gpt-oss `message.reasoning`; a template reads the one it
+    /// does not know as undefined, so emitting both costs a key and
+    /// loses nothing, while emitting one drops a replayed chain of
+    /// thought on every checkpoint written against the other.
+    #[test]
+    fn a_replayed_chain_of_thought_reaches_a_template_under_both_spellings() {
+        let mut m = msg("assistant", "the answer is 4");
+        m.reasoning_content = Some("2 + 2".to_string());
+
+        let json = message_json(&m, false);
+        assert_eq!(json["reasoning_content"], "2 + 2");
+        assert_eq!(json["reasoning"], "2 + 2");
+        assert_eq!(json["thinking"], "2 + 2");
+        assert_eq!(
+            json["content"], "the answer is 4",
+            "reasoning must never be folded into what the model said"
+        );
+    }
+
+    /// The one case where a key is deliberately withheld. gpt-oss's
+    /// harmony template RAISES on an assistant turn that makes tool
+    /// calls while carrying both visible text and `thinking` -- the two
+    /// land on channels that cannot both be final -- so a replayed
+    /// agent turn would 500 the whole request rather than render
+    /// oddly. Visible text wins, and the other two spellings still
+    /// carry the reasoning for the families that read them.
+    #[test]
+    fn a_tool_call_turn_with_visible_text_withholds_only_the_harmony_spelling() {
+        let mut m = msg("assistant", "checking the weather");
+        m.reasoning_content = Some("I should call the tool".to_string());
+        m.tool_calls = Some(vec![tool_call_in("get_weather", "{}")]);
+
+        let json = message_json(&m, true);
+        assert!(
+            json.get("thinking").is_none(),
+            "harmony would raise on this turn"
+        );
+        assert_eq!(json["reasoning_content"], "I should call the tool");
+        assert_eq!(json["reasoning"], "I should call the tool");
+
+        // A tool-call turn with NO visible text is the ordinary harmony
+        // shape and keeps all three.
+        m.content = None;
+        assert_eq!(message_json(&m, true)["thinking"], "I should call the tool");
+    }
+
+    /// Empty is not absent. A template that opens the family's thinking
+    /// markers on `if message.reasoning_content` would wrap them around
+    /// nothing, so an empty string is skipped exactly like `None` --
+    /// which also keeps a plain message's rendering byte-identical to
+    /// what it was before the field existed.
+    #[test]
+    fn an_empty_or_absent_chain_of_thought_puts_no_key_in_front_of_a_template() {
+        for empty in [None, Some(String::new())] {
+            let mut m = msg("assistant", "hi");
+            m.reasoning_content = empty;
+            let json = message_json(&m, false);
+            assert!(json.get("reasoning_content").is_none());
+            assert!(json.get("reasoning").is_none());
+            assert!(json.get("thinking").is_none());
+        }
+    }
+
+    /// Both spellings are accepted on the way in, too. A client that
+    /// received `reasoning` from `/v1/responses` or `/v1/messages` and
+    /// replays the turn verbatim must not have it silently ignored
+    /// because the chat surface spells the key the other way.
+    #[test]
+    fn a_replayed_turn_is_accepted_under_either_spelling_of_the_key() {
+        for key in ["reasoning_content", "reasoning"] {
+            let m: ChatMessage = serde_json::from_value(json!({
+                "role": "assistant",
+                "content": "4",
+                key: "2 + 2",
+            }))
+            .expect("deserializes");
+            assert_eq!(m.reasoning_content.as_deref(), Some("2 + 2"), "{key}");
+        }
     }
 }

@@ -73,6 +73,34 @@ impl KvBlockPool {
         self.free_blocks
     }
 
+    /// Re-budget the pool.
+    ///
+    /// The pool is an *accounting* budget, not an allocator: each
+    /// `KvCache` owns its own buffer and this counts how many blocks
+    /// the deployment has promised. So a resize is arithmetic, with one
+    /// rule that is not.
+    ///
+    /// Shrinking below what is currently held is REFUSED and the pool
+    /// is left exactly as it was. `free_blocks` would have to go
+    /// negative to represent it, and the alternative -- clamping it to
+    /// zero -- silently over-promises: the caches already holding those
+    /// blocks do not give them back, so every later `try_acquire`
+    /// would be deciding against a budget that does not describe the
+    /// memory in use.
+    ///
+    /// Returns the number of blocks currently held when it refuses, so
+    /// the caller can say what the floor actually is rather than making
+    /// the operator find it by being rejected.
+    pub fn resize(&mut self, total_blocks: usize) -> Result<(), usize> {
+        let in_use = self.total_blocks - self.free_blocks;
+        if total_blocks < in_use {
+            return Err(in_use);
+        }
+        self.free_blocks = total_blocks - in_use;
+        self.total_blocks = total_blocks;
+        Ok(())
+    }
+
     fn try_acquire(&mut self, n: usize) -> bool {
         if n <= self.free_blocks {
             self.free_blocks -= n;
@@ -765,5 +793,51 @@ mod tests {
             3,
             "dropping the original must release its blocks exactly once"
         );
+    }
+
+    /// A resize is arithmetic, and the one rule that is not: shrinking
+    /// past what is held is refused, and the pool is left exactly as it
+    /// was.
+    ///
+    /// Clamping to zero instead would silently over-promise -- the
+    /// caches holding those blocks do not give them back, so every
+    /// later acquire would decide against a budget that does not
+    /// describe the memory in use. This test fails under that clamp.
+    #[test]
+    fn a_pool_refuses_to_shrink_below_what_is_already_held() {
+        let pool = Arc::new(Mutex::new(KvBlockPool::new(4, 10)));
+        let held = KvCache::with_pool(2, 4, Arc::clone(&pool), 24).expect("blocks");
+        let in_use = {
+            let p = pool.lock().unwrap();
+            p.total_blocks() - p.free_blocks()
+        };
+        assert!(in_use > 0, "the fixture must actually hold blocks");
+
+        let mut p = pool.lock().unwrap();
+        assert_eq!(p.resize(in_use - 1), Err(in_use));
+        assert_eq!(p.total_blocks(), 10, "a refused resize changes nothing");
+        assert_eq!(p.free_blocks(), 10 - in_use);
+
+        // Down to exactly what is held is legal, and leaves nothing free.
+        assert_eq!(p.resize(in_use), Ok(()));
+        assert_eq!(p.free_blocks(), 0);
+        drop(p);
+        drop(held);
+    }
+
+    /// Growing hands the new blocks to the free list without disturbing
+    /// what is held, which is the whole point of a live re-split.
+    #[test]
+    fn growing_a_pool_adds_to_what_is_free_and_not_to_what_is_held() {
+        let pool = Arc::new(Mutex::new(KvBlockPool::new(4, 8)));
+        let held = KvCache::with_pool(2, 4, Arc::clone(&pool), 16).expect("blocks");
+        let mut p = pool.lock().unwrap();
+        let in_use = p.total_blocks() - p.free_blocks();
+
+        assert_eq!(p.resize(32), Ok(()));
+        assert_eq!(p.total_blocks(), 32);
+        assert_eq!(p.free_blocks(), 32 - in_use);
+        drop(p);
+        drop(held);
     }
 }

@@ -49,7 +49,7 @@ use std::time::{Duration, Instant};
 
 use axum::extract::{Path as AxumPath, Query, State};
 use axum::http::{HeaderMap, StatusCode};
-use axum::response::sse::{Event, KeepAlive, Sse};
+use axum::response::sse::{Event, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::{Deserialize, Serialize};
@@ -85,6 +85,14 @@ const POLL_WAIT: Duration = Duration::from_secs(10);
 /// Longest a resumed SSE connection waits for the next event before
 /// yielding to the keep-alive.
 const RESUME_WAIT: Duration = Duration::from_secs(5);
+
+/// Empty polls before a replay stream sends a keepalive.
+///
+/// Three of them at [`RESUME_WAIT`] is the same 15s of silence
+/// [`crate::sse::KEEPALIVE_INTERVAL`] allows on a live stream, counted
+/// in polls rather than off a clock so it is deterministic and
+/// testable.
+const RESUME_KEEPALIVE_POLLS: u32 = 3;
 
 /// One stored event: the `data:` payload exactly as it went out.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -521,44 +529,64 @@ pub(crate) async fn resume(
         return replay_window_lost(&request_id, first.next_index);
     }
 
+    let keepalive_id = request_id.clone();
     let stream = futures_util::stream::unfold(
-        (slot, cursor, true),
-        |(slot, cursor, is_first)| async move {
-            let result = slot.read_from(cursor, RESUME_WAIT).await;
-            if result.lost {
-                // Ends the response with no `[DONE]` and no finish
-                // reason. The client's truncation rule is what surfaces
-                // it -- the same rule that catches a proxy cutting the
-                // connection, and for the same reason: the answer is
-                // incomplete and nothing may pretend otherwise.
-                return None;
-            }
-            if result.events.is_empty() {
-                if result.finished {
+        (slot, cursor, true, 0u32),
+        move |(slot, cursor, is_first, quiet)| {
+            let keepalive_id = keepalive_id.clone();
+            async move {
+                let result = slot.read_from(cursor, RESUME_WAIT).await;
+                if result.lost {
+                    // Ends the response with no `[DONE]` and no finish
+                    // reason. The client's truncation rule is what surfaces
+                    // it -- the same rule that catches a proxy cutting the
+                    // connection, and for the same reason: the answer is
+                    // incomplete and nothing may pretend otherwise.
                     return None;
                 }
-                // Nothing yet, still running: keep the connection with an
-                // empty batch rather than closing it.
-                return Some((
-                    Vec::<Result<Event, std::convert::Infallible>>::new(),
-                    (slot, cursor, is_first),
-                ));
+                if result.events.is_empty() {
+                    if result.finished {
+                        return None;
+                    }
+                    // Nothing yet, still running. Keep the connection, and
+                    // after three quiet polls send a DATA frame rather than
+                    // nothing at all: a client's stream-idle timeout is
+                    // armed on received events, and an empty batch is not
+                    // one -- see `crate::sse::with_keepalive` for why an
+                    // SSE comment does not do here either.
+                    //
+                    // No `id:`, so it does not enter the replay sequence a
+                    // `Last-Event-ID` resumes from. `choices: []` is the
+                    // usage-only chunk's own shape and asserts nothing
+                    // about an answer that has not started.
+                    let quiet = quiet + 1;
+                    let events = if quiet % RESUME_KEEPALIVE_POLLS == 0 {
+                        vec![Ok(crate::sse::keepalive_event(&serde_json::json!({
+                            "id": keepalive_id,
+                            "object": "chat.completion.chunk",
+                            "choices": [],
+                        })))]
+                    } else {
+                        Vec::new()
+                    };
+                    return Some((events, (slot, cursor, is_first, quiet)));
+                }
+                let next = result.next_index;
+                let request_id = slot.request_id().to_string();
+                let events: Vec<Result<Event, std::convert::Infallible>> = result
+                    .events
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, e)| {
+                        Ok(sse_event(
+                            e.data,
+                            Some(event_id(&request_id, e.index)),
+                            is_first && i == 0,
+                        ))
+                    })
+                    .collect();
+                Some((events, (slot, next, false, 0)))
             }
-            let next = result.next_index;
-            let request_id = slot.request_id().to_string();
-            let events: Vec<Result<Event, std::convert::Infallible>> = result
-                .events
-                .into_iter()
-                .enumerate()
-                .map(|(i, e)| {
-                    Ok(sse_event(
-                        e.data,
-                        Some(event_id(&request_id, e.index)),
-                        is_first && i == 0,
-                    ))
-                })
-                .collect();
-            Some((events, (slot, next, false)))
         },
     );
 
@@ -570,8 +598,7 @@ pub(crate) async fn resume(
         Sse::new(futures_util::StreamExt::flat_map(
             stream,
             futures_util::stream::iter,
-        ))
-        .keep_alive(KeepAlive::default()),
+        )),
     )
         .into_response()
 }

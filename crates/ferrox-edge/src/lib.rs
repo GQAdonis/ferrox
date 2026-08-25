@@ -40,6 +40,7 @@
 //! instead of shadowing it. Each module's docs say which.
 
 pub mod anchor;
+pub mod bench_client;
 pub mod bench_profile;
 pub mod cache_manager;
 pub mod cache_report;
@@ -47,12 +48,15 @@ pub mod detokenize;
 pub mod dsv4;
 pub mod effort;
 pub mod expert_cache;
+pub mod footprint;
 pub mod maintenance;
+pub mod outbox;
 pub mod parser;
 pub mod placement;
 pub mod pool;
 pub mod qstar;
 pub mod radix;
+pub mod rebuild;
 pub mod residency;
 pub mod scheduler;
 pub mod state_pool;
@@ -62,6 +66,10 @@ pub mod window_pool;
 pub use anchor::{
     decode_slide, prefill_slide, resolve_anchor_token, snapshot_at_anchor, AnchorSnapshot,
     AnchorState, PingPong, RecurrentState, SlideDecision, SlidingRequest, WindowPolicy,
+};
+pub use bench_client::{
+    is_token_chunk, prompt_of_exact_length, replay_offsets, BenchReport, BenchSampling, Latency,
+    PromptLengthNotReached, RequestTiming, MAX_PROMPT_FIXED_POINT_STEPS,
 };
 pub use bench_profile::{
     load_backend_recommendation, load_hybrid_fetch_fraction, load_policy, usable_profile,
@@ -91,6 +99,14 @@ pub use state_pool::{
     TrackCheckpoint, TrackRequest, PADDING_SLOT,
 };
 
+pub use footprint::{
+    parse_smaps_rollup_pss, parse_status_rss, sum_footprints, Footprint, FootprintKind, ProbeCache,
+};
+
+pub use outbox::{finish_stop, receipt_id, Receipt, ReceiptStatus, StopFailure};
+
+pub use rebuild::{EngineActivity, RebuildOutcome, RebuildTxn, TouchedPools};
+
 pub use maintenance::{
     AdmissionClosed, MaintenanceGate, MaintenanceState, RebuildRefused, SealedAccounting,
     StopRefused,
@@ -101,8 +117,14 @@ pub use stats::{
 };
 
 pub use scheduler::{
-    finish_reason, AdmittedChunk, Capacity, DecodeSet, FinishReason, Geometry, NotAdmitted,
-    PendingRequest, PrefillPass, SlotTable,
+    finish_reason, state_pool_usage, window_pool_usage, AdmittedChunk, BatchStatus, Capacity,
+    DecodeSet, FinishReason, Geometry, NotAdmitted, PendingRequest, PoolUsage, PrefillPass,
+    PrefillSnapshot, SlotTable, StatusReporter, DEFAULT_DECODE_LOG_INTERVAL,
+};
+
+pub use residency::{
+    host_pin_budget_bytes, pin_budget_bytes, requested_labels, BankResidency, CopyRoute,
+    HostResidency, ResidencyError, ResidencyPlan, SettleAction,
 };
 
 pub use radix::{
@@ -114,4 +136,13 @@ pub use effort::{
     broadcast_effort_spellings, derive_think_gears, effective_efforts, probe_effort_profile,
     probe_thinking_profile, quantize_effort, resolve_thinking_mode, sanitize_effort, Effort,
     EffortMapping, EffortProfile, ThinkGears, ThinkingMode, ThinkingProfile, ThinkingState,
+};
+
+pub use dsv4::{
+    dsv4_auto_cost_model, dsv4_cache_per_page, dsv4_kv_unit_bytes, dsv4_pool_bytes,
+    dsv4_pool_sizes, dsv4_reserved_window_pages, dsv4_solve_num_pages, dsv4_window_floor_pages,
+    dsv4_window_unit_bytes, ring_size_for_ratio, window_ring_position, Dsv4Args, Dsv4AutoCost,
+    Dsv4BudgetTooSmall, Dsv4LayerSizes, Dsv4PoolSizes, Dsv4WindowCtx, Dsv4WindowPool,
+    FreeListAllocator, FreeListExhausted, AUTO_KV_SLACK_BYTES, BF16_BYTES, DEFAULT_WINDOW_PAGE,
+    FP32_BYTES, INT64_BYTES, NO_WINDOW_SLOT,
 };

@@ -1806,6 +1806,12 @@ async fn serving_stats(State(state): State<Arc<AppState>>) -> Json<serde_json::V
             "prompt_tokens_total": state.stats.tokens_prompt_total(),
             "completion_tokens_total": state.stats.tokens_generated_total(),
         },
+        // Served here so a status bar tracking throughput and pressure
+        // makes ONE request rather than two. Upstream stamps the same
+        // gauges on every reply of the batch; ferrox does not, because
+        // the reply shapes here are OpenAI's and Anthropic's and a pool
+        // gauge on a `chat.completion` is a field no client asked for.
+        "pools": cache_admin::pool_gauges(&state),
     }))
 }
 
@@ -5423,6 +5429,25 @@ mod tests {
 
     async fn post_json(app: &Router, body: serde_json::Value) -> serde_json::Value {
         post_json_uri(app, "/v1/chat/completions", body).await.1
+    }
+
+    /// A pool this deployment does not have is reported `null`, never
+    /// as a zero row. "No window pool" and "a window pool with nothing
+    /// in it" are different facts, and an operator shown the second for
+    /// the first sizes against a pool that does not exist. The test
+    /// state runs with no shared KV pool, so all three are absent here.
+    #[tokio::test]
+    async fn stats_reports_a_pool_it_does_not_have_as_absent_and_not_as_zero() {
+        let app = test_app();
+        let (status, body) = get_json(&app, ferrox_api::routes::V1_STATS).await;
+        assert_eq!(status, StatusCode::OK);
+        for pool in ["kv_pages", "window_slots", "state_slots"] {
+            assert!(
+                body["pools"][pool].is_null(),
+                "{pool} must be null rather than a zero row: {}",
+                body["pools"]
+            );
+        }
     }
 
     /// A streamed `/v1/messages` can be cancelled only if the client

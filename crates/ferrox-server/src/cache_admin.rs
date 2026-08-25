@@ -43,7 +43,7 @@ use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
-use ferrox_edge::{MaintenanceState, RebuildRefused, StopRefused};
+use ferrox_edge::{MaintenanceState, PoolUsage, RebuildRefused, StopRefused};
 use serde::Deserialize;
 
 use crate::AppState;
@@ -60,20 +60,18 @@ pub(crate) async fn cache_status(State(state): State<Arc<AppState>>) -> Json<ser
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .state();
-    let kv = state.kv_pool.as_ref().map(|cfg| {
-        let pool = cfg.pool.lock().unwrap_or_else(|p| p.into_inner());
-        (pool.total_blocks(), pool.free_blocks(), pool.block_size())
-    });
+    let kv = kv_pages(&state);
     Json(serde_json::json!({
         "state": gate.as_str(),
         // `null`, not `{}`: a deployment with no shared KV pool has
         // every request allocating privately, which is a different
         // thing from a pool of size zero.
-        "kv": kv.map(|(total, free, page_size)| serde_json::json!({
-            "num_pages": total,
-            "used_pages": total - free,
+        "kv": kv.map(|(usage, page_size, evictable)| serde_json::json!({
+            "num_pages": usage.total,
+            "used_pages": usage.used,
+            "evictable_pages": evictable,
             "page_size": page_size,
-            "num_tokens": total * page_size,
+            "num_tokens": usage.total * page_size,
         })),
         // The pools ferrox does not have. Named so a client can see
         // they were considered and are absent, rather than guess.
@@ -82,6 +80,56 @@ pub(crate) async fn cache_status(State(state): State<Arc<AppState>>) -> Json<ser
         "swa": serde_json::Value::Null,
         "resizable": kv.is_some().then(|| serde_json::json!(["kv"])),
     }))
+}
+
+/// KV occupancy in pages, plus the page size and the evictable count,
+/// or `None` when this deployment allocates privately per request.
+///
+/// **`used` excludes evictable pages**, which is the convention the
+/// three gauges have to share or an operator is sized against a lie:
+/// a healthy idle server FILLS its caches with reusable prefixes, so
+/// counting those as occupied puts every gauge near 100% while the
+/// machine is doing nothing -- and admission, which is happily seating
+/// requests into that memory, disagrees with the number the operator is
+/// reading. `ferrox_edge::PoolUsage::from_available` is where the rule
+/// lives, so it is stated once rather than re-derived per endpoint.
+///
+/// Evictable is **zero today, and structurally so**: `generate` stores
+/// a prefix only `if kv_pool.is_none()`, so a shared pool and the
+/// prefix cache never coexist and nothing evictable can be holding a
+/// page. Computed through `PoolUsage` anyway rather than as
+/// `total - free`, so that when the two are allowed to coexist the
+/// gauge is already right instead of quietly wrong.
+fn kv_pages(state: &AppState) -> Option<(PoolUsage, usize, usize)> {
+    let cfg = state.kv_pool.as_ref()?;
+    let pool = cfg.pool.lock().unwrap_or_else(|p| p.into_inner());
+    let evictable = 0;
+    Some((
+        PoolUsage::from_available(pool.total_blocks(), pool.free_blocks() + evictable),
+        pool.block_size(),
+        evictable,
+    ))
+}
+
+/// The pool gauges for `GET /v1/stats`, in the shape a status bar
+/// renders without a second round trip.
+///
+/// A pool this deployment does not have is `null`, never a zero row:
+/// "no window pool" and "a window pool with nothing in it" are
+/// different facts, and an operator shown the second for the first
+/// sizes against a pool that does not exist.
+pub(crate) fn pool_gauges(state: &AppState) -> serde_json::Value {
+    let kv = kv_pages(state);
+    serde_json::json!({
+        "kv_pages": kv.map(|(usage, page_size, evictable)| serde_json::json!({
+            "used": usage.used,
+            "total": usage.total,
+            "evictable": evictable,
+            "page_size": page_size,
+        })),
+        "window_slots": serde_json::Value::Null,
+        "state_slots": serde_json::Value::Null,
+    })
 }
 
 /// What a client may ask a rebuild for.
@@ -505,5 +553,29 @@ mod tests {
         assert_eq!(gate.state(), MaintenanceState::Stopping);
         assert!(gate.check_admission().is_err());
         assert!(gate.sealed().is_none());
+    }
+
+    /// The convention the three gauges have to share, asserted on
+    /// `PoolUsage` directly because ferrox cannot yet produce a
+    /// non-zero evictable count (a shared KV pool and the prefix cache
+    /// never coexist -- see `kv_pages`).
+    ///
+    /// A healthy idle server FILLS its caches with reusable prefixes.
+    /// Counting those as occupied puts every gauge near 100% while the
+    /// machine is doing nothing, and admission -- which is happily
+    /// seating requests into that memory -- then disagrees with the
+    /// number the operator is reading and sizes a pool that was never
+    /// full.
+    #[test]
+    fn an_evictable_page_is_memory_and_not_occupancy() {
+        // 40 free, 20 evictable, 40 really held.
+        let usage = PoolUsage::from_available(100, 40 + 20);
+        assert_eq!(usage.used, 40, "evictable pages are not occupancy");
+        assert_eq!(usage.total, 100);
+
+        // The saturating half: `available` is summed from two
+        // independent sources, so a step that double-counts must read
+        // as an empty pool rather than wrap to astronomical nonsense.
+        assert_eq!(PoolUsage::from_available(10, 12).used, 0);
     }
 }

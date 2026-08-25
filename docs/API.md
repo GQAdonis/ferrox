@@ -591,7 +591,20 @@ family implies, then the one the preamble asked for:
 
 Every call in a response is returned, not just the first, with ids
 `call_0`, `call_1`, … — nothing in these formats carries an id, and a
-client correlates by index. A call naming a tool the request never
+client correlates by index.
+
+**Streaming.** On the non-batched path the four invoke/parameter
+families stream their arguments as OpenAI-shaped deltas: the first
+delta of a call carries `index`, `id`, `type` and `function.name` with
+empty arguments, and every delta after it carries only more
+`function.arguments` text. The fragments are literal continuations, so
+a client concatenates them in `index` order and parses the result —
+which is what lets a coding agent watch a file argument arrive instead
+of waiting for it. The JSON-payload families (Hermes, Llama 3, Mistral,
+gpt-oss, Gemma) still arrive whole, because a half-written JSON object
+is not a fragment anyone can use. A generation truncated mid-call
+reports `length`, not `tool_calls`: a half-written call must not be
+executed. A call naming a tool the request never
 offered is dropped rather than forwarded; a namespaced name
 (`skills:read`) is forwarded, because the client is what resolves the
 namespace.
@@ -605,7 +618,7 @@ from arriving as a number.
 
 Anthropic streaming/tools/images · full JSON schema / grammar ·
 `tool_choice=required` · dedicated embedding models · multi-GPU / TP / PD ·
-incremental `tool_calls[].index` argument deltas (calls are emitted
-whole, on completion).
+streamed argument deltas for the JSON-payload families (they arrive
+whole) · streamed tool calls on the continuous-batching path.
 
 See [`ROADMAP.md`](ROADMAP.md).

@@ -1255,6 +1255,74 @@ struct ToolCallOut {
     function: ToolCallFunctionOut,
 }
 
+/// One tool call as a **streamed delta**.
+///
+/// OpenAI's incremental shape: `index` correlates the pieces, and every
+/// other field is optional because the first delta of a call carries
+/// its identity and the ones after it carry only more argument text. A
+/// buffered path expresses a whole call as a delta with every field
+/// set, so there is one type on the wire rather than two.
+#[derive(Serialize, Clone)]
+struct ToolCallDelta {
+    index: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    id: Option<String>,
+    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+    kind: Option<&'static str>,
+    function: ToolCallFunctionDelta,
+}
+
+#[derive(Serialize, Clone, Default)]
+struct ToolCallFunctionDelta {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
+    /// A literal continuation of this call's arguments JSON. A client
+    /// concatenates them in `index` order and parses the result.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    arguments: Option<String>,
+}
+
+impl ToolCallDelta {
+    /// The whole call in one delta, for a path that had it all along.
+    fn whole(index: usize, name: String, arguments: String) -> Self {
+        ToolCallDelta {
+            index,
+            id: Some(format!("call_{index}")),
+            kind: Some("function"),
+            function: ToolCallFunctionDelta {
+                name: Some(name),
+                arguments: Some(arguments),
+            },
+        }
+    }
+
+    /// The opening delta: identity, and no arguments yet.
+    fn opening(index: usize, name: String) -> Self {
+        ToolCallDelta {
+            index,
+            id: Some(format!("call_{index}")),
+            kind: Some("function"),
+            function: ToolCallFunctionDelta {
+                name: Some(name),
+                arguments: Some(String::new()),
+            },
+        }
+    }
+
+    /// A continuation: more argument text for a call already opened.
+    fn arguments(index: usize, fragment: String) -> Self {
+        ToolCallDelta {
+            index,
+            id: None,
+            kind: None,
+            function: ToolCallFunctionDelta {
+                name: None,
+                arguments: Some(fragment),
+            },
+        }
+    }
+}
+
 #[derive(Serialize, Clone)]
 struct ToolCallFunctionOut {
     name: String,
@@ -1301,7 +1369,7 @@ struct ChatCompletionChunkDelta {
     #[serde(skip_serializing_if = "Option::is_none")]
     reasoning_content: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    tool_calls: Option<Vec<ToolCallOut>>,
+    tool_calls: Option<Vec<ToolCallDelta>>,
 }
 
 #[derive(Serialize)]
@@ -1915,6 +1983,39 @@ fn tool_preamble(tools: &[ToolDef]) -> String {
     out
 }
 
+/// Fold one batch of parser events into the text to stream and the
+/// tool-call deltas to stream beside it.
+///
+/// `opened` counts calls that have gone out, which is both the wire
+/// `index` and how the terminal chunk knows whether this generation
+/// ended in a tool call. `CallEnd` deliberately emits nothing: every
+/// byte of the arguments has already gone out as a fragment, and
+/// repeating them would make a client that concatenates deltas produce
+/// the arguments twice.
+fn tool_call_deltas(
+    events: Vec<ferrox_edge::ToolCallEvent>,
+    opened: &std::cell::Cell<usize>,
+) -> (String, Vec<ToolCallDelta>) {
+    let mut text = String::new();
+    let mut deltas = Vec::new();
+    for event in events {
+        match event {
+            ferrox_edge::ToolCallEvent::Text(chunk) => text.push_str(&chunk),
+            ferrox_edge::ToolCallEvent::CallStart { index, name } => {
+                opened.set(opened.get().max(index + 1));
+                deltas.push(ToolCallDelta::opening(index, name));
+            }
+            ferrox_edge::ToolCallEvent::CallArguments { index, fragment } => {
+                if !fragment.is_empty() {
+                    deltas.push(ToolCallDelta::arguments(index, fragment));
+                }
+            }
+            ferrox_edge::ToolCallEvent::CallEnd { .. } => {}
+        }
+    }
+    (text, deltas)
+}
+
 /// Builds the final response message + finish reason from raw
 /// generated text.
 ///
@@ -2253,7 +2354,12 @@ async fn chat_completions_stream(
     // Tool-call detection needs the full stop-bounded text; continuous
     // batching returns one string. Both stay buffered. Otherwise each
     // decoded chunk is pushed on a channel for overlapped SSE delivery.
-    let overlap = !tools_active && batcher.is_none();
+    // Incremental streaming, including when tools are offered. It used
+    // to be `!tools_active && ...`: finding a tool call needed the
+    // whole text. `ferrox_edge::ToolCallParser` streams prefix-stable
+    // argument fragments, so that reason is gone, and a coding agent
+    // now watches an argument arrive instead of waiting for it.
+    let overlap = batcher.is_none();
 
     // Opt-in replay. Registering a buffer is also what decides whether a
     // dropped socket cancels this generation -- see `resume`'s module
@@ -2293,6 +2399,22 @@ async fn chat_completions_stream(
                     .map(|format| ferrox_edge::ReasoningParser::new(format, false, true)),
             ));
         let emit_reasoning = Rc::clone(&stream_reasoning);
+        // The tool-call parser, fed whatever the reasoning parser
+        // classified as content. Absent when the request offered no
+        // tools, in which case marker-looking text is just text.
+        let stream_tools: Rc<RefCell<Option<ferrox_edge::ToolCallParser>>> =
+            Rc::new(RefCell::new(tools_active.then(|| {
+                ferrox_edge::ToolCallParser::new(
+                    ferrox_edge::ToolCallFormat::infer(&served_model),
+                    output::tool_schemas(&offered_tools),
+                )
+            })));
+        let emit_tools = Rc::clone(&stream_tools);
+        // How many calls have been opened on the wire, so the terminal
+        // chunk knows whether to say `tool_calls` and does not repeat
+        // what already went out.
+        let streamed_calls = Rc::new(std::cell::Cell::new(0usize));
+        let emit_streamed_calls = Rc::clone(&streamed_calls);
         let result = run_generation_emit(
             &model,
             &prompt,
@@ -2312,9 +2434,20 @@ async fn chat_completions_stream(
                     }
                     None => (String::new(), chunk.to_string()),
                 };
-                // The parser withholds a partial marker, so a chunk can
+                // Content goes through the tool parser, which holds
+                // back anything that could still become a marker and
+                // turns a recognized call into wire deltas.
+                let (content, tool_calls) = match emit_tools.borrow_mut().as_mut() {
+                    Some(parser) => {
+                        let (text, calls) =
+                            tool_call_deltas(parser.push(&content), &emit_streamed_calls);
+                        (text, calls)
+                    }
+                    None => (content, Vec::new()),
+                };
+                // Both parsers withhold partial markers, so a chunk can
                 // legitimately produce nothing at all this time round.
-                if reasoning.is_empty() && content.is_empty() {
+                if reasoning.is_empty() && content.is_empty() && tool_calls.is_empty() {
                     return;
                 }
                 let role = if first { Some("assistant") } else { None };
@@ -2331,7 +2464,7 @@ async fn chat_completions_stream(
                             role,
                             content: (!content.is_empty()).then_some(content),
                             reasoning_content: (!reasoning.is_empty()).then_some(reasoning),
-                            tool_calls: None,
+                            tool_calls: (!tool_calls.is_empty()).then_some(tool_calls),
                         },
                         finish_reason: None,
                     }],
@@ -2392,18 +2525,27 @@ async fn chat_completions_stream(
                         },
                     );
                 }
-                // An overlapped stream may still be holding a run that
-                // could have become a marker and did not. It is
-                // ordinary output; dropping it would truncate every
-                // answer whose tail happens to look like the start of
-                // a `</think>`.
+                // Both parsers may still be holding a run that could
+                // have become a marker and did not. It is ordinary
+                // output; dropping it would truncate every answer whose
+                // tail happens to look like the start of a `</think>`
+                // or a `<tool_call>`.
+                let mut streamed_finish: Option<&'static str> = None;
                 if overlap {
                     let tail = stream_reasoning
                         .borrow_mut()
                         .as_mut()
                         .map(|parser| parser.flush())
                         .unwrap_or_default();
-                    if !tail.is_empty() {
+                    let (mut content, mut tool_calls) = (tail.content, Vec::new());
+                    if let Some(parser) = stream_tools.borrow_mut().as_mut() {
+                        let mut events = parser.push(&content);
+                        events.extend(parser.finish());
+                        let (text, calls) = tool_call_deltas(events, &streamed_calls);
+                        content = text;
+                        tool_calls = calls;
+                    }
+                    if !content.is_empty() || !tail.reasoning.is_empty() || !tool_calls.is_empty() {
                         let payload = ChatCompletionChunk {
                             id: request_id.clone(),
                             request_id: pending_request_id.take(),
@@ -2413,10 +2555,10 @@ async fn chat_completions_stream(
                                 index: 0,
                                 delta: ChatCompletionChunkDelta {
                                     role: None,
-                                    content: (!tail.content.is_empty()).then_some(tail.content),
+                                    content: (!content.is_empty()).then_some(content),
                                     reasoning_content: (!tail.reasoning.is_empty())
                                         .then_some(tail.reasoning),
-                                    tool_calls: None,
+                                    tool_calls: (!tool_calls.is_empty()).then_some(tool_calls),
                                 },
                                 finish_reason: None,
                             }],
@@ -2425,23 +2567,28 @@ async fn chat_completions_stream(
                         let _ =
                             sse::send_or_orphan(&tx, Ok(emitter.event(&payload)), orphan_timeout);
                     }
-                }
-                let parsed = output::parse_output(&full_text, &offered_tools, &served_model);
-                let tool_calls: Vec<ToolCallOut> = parsed
-                    .calls
-                    .iter()
-                    .enumerate()
-                    .map(|(index, call)| ToolCallOut {
-                        id: format!("call_{index}"),
-                        kind: "function",
-                        function: ToolCallFunctionOut {
-                            name: call.name.clone(),
-                            arguments: call.arguments.clone(),
-                        },
-                    })
-                    .collect();
-                if !overlap {
+                    if streamed_calls.get() > 0 {
+                        streamed_finish = Some("tool_calls");
+                    }
+                } else {
+                    // The batched path had no incremental stream to
+                    // ride on, so the whole answer goes out at once.
+                    let parsed = output::parse_output(&full_text, &offered_tools, &served_model);
+                    let tool_calls: Vec<ToolCallDelta> = parsed
+                        .calls
+                        .iter()
+                        .enumerate()
+                        .map(|(index, call)| {
+                            ToolCallDelta::whole(index, call.name.clone(), call.arguments.clone())
+                        })
+                        .collect();
                     if !tool_calls.is_empty() {
+                        streamed_finish = Some("tool_calls");
+                    }
+                    if !tool_calls.is_empty()
+                        || !parsed.content.is_empty()
+                        || parsed.reasoning.is_some()
+                    {
                         let payload = ChatCompletionChunk {
                             id: request_id.clone(),
                             request_id: pending_request_id.take(),
@@ -2451,30 +2598,10 @@ async fn chat_completions_stream(
                                 index: 0,
                                 delta: ChatCompletionChunkDelta {
                                     role: Some("assistant"),
-                                    content: None,
-                                    reasoning_content: parsed.reasoning.clone(),
-                                    tool_calls: Some(tool_calls.clone()),
-                                },
-                                finish_reason: None,
-                            }],
-                            usage: None,
-                        };
-                        let _ =
-                            sse::send_or_orphan(&tx, Ok(emitter.event(&payload)), orphan_timeout);
-                    } else if !parsed.content.is_empty() || parsed.reasoning.is_some() {
-                        let payload = ChatCompletionChunk {
-                            id: request_id.clone(),
-                            request_id: pending_request_id.take(),
-                            object: "chat.completion.chunk",
-                            model: model_name.clone(),
-                            choices: vec![ChatCompletionChunkChoice {
-                                index: 0,
-                                delta: ChatCompletionChunkDelta {
-                                    role: Some("assistant"),
-                                    content: (!parsed.content.is_empty())
+                                    content: (!parsed.content.is_empty() && tool_calls.is_empty())
                                         .then(|| parsed.content.clone()),
                                     reasoning_content: parsed.reasoning.clone(),
-                                    tool_calls: None,
+                                    tool_calls: (!tool_calls.is_empty()).then_some(tool_calls),
                                 },
                                 finish_reason: None,
                             }],
@@ -2484,10 +2611,12 @@ async fn chat_completions_stream(
                             sse::send_or_orphan(&tx, Ok(emitter.event(&payload)), orphan_timeout);
                     }
                 }
-                let final_finish_reason = if !tool_calls.is_empty() {
-                    "tool_calls"
-                } else {
-                    finish.as_str()
+                // A truncated generation is `length` even if it managed
+                // to open a call: the client must not treat a
+                // half-written call as one it should execute.
+                let final_finish_reason = match streamed_finish {
+                    Some(reason) if finish.as_str() != "length" => reason,
+                    _ => finish.as_str(),
                 };
                 let final_payload = ChatCompletionChunk {
                     id: request_id.clone(),
@@ -5005,6 +5134,96 @@ mod tests {
         assert_eq!(finish, "stop");
         assert!(message.tool_calls.is_none());
         assert!(message.content.is_some());
+    }
+
+    /// The streaming contract a coding agent depends on: the call's
+    /// identity arrives first, then its arguments in pieces, and the
+    /// pieces concatenate to exactly the final arguments.
+    #[test]
+    fn a_streamed_call_opens_then_delivers_its_arguments_in_pieces() {
+        let opened = std::cell::Cell::new(0usize);
+        let mut parser = ferrox_edge::ToolCallParser::new(
+            ferrox_edge::ToolCallFormat::Qwen3Coder,
+            vec![ferrox_edge::parser::tool_call::ToolSchema::with_parameters(
+                "write_file",
+                serde_json::json!({"type": "object", "properties": {
+                    "path": {"type": "string"},
+                    "contents": {"type": "string"}
+                }}),
+            )],
+        );
+        let wire = "<tool_call><function=write_file>\
+                    <parameter=path>\n/tmp/x\n</parameter>\
+                    <parameter=contents>\nhello world\n</parameter>\
+                    </function></tool_call>";
+
+        let mut deltas = Vec::new();
+        let mut text = String::new();
+        for piece in wire.as_bytes().chunks(7) {
+            let chunk = String::from_utf8_lossy(piece).into_owned();
+            let (more_text, more) = tool_call_deltas(parser.push(&chunk), &opened);
+            text.push_str(&more_text);
+            deltas.extend(more);
+        }
+        let (more_text, more) = tool_call_deltas(parser.finish(), &opened);
+        text.push_str(&more_text);
+        deltas.extend(more);
+
+        assert_eq!(opened.get(), 1, "one call opened");
+        assert!(text.is_empty(), "the markers are not content: {text:?}");
+
+        let first = &deltas[0];
+        assert_eq!(first.index, 0);
+        assert_eq!(first.id.as_deref(), Some("call_0"));
+        assert_eq!(first.kind, Some("function"));
+        assert_eq!(first.function.name.as_deref(), Some("write_file"));
+
+        // Everything after the opening delta is argument text only,
+        // and it parses once concatenated.
+        let joined: String = deltas
+            .iter()
+            .filter_map(|d| d.function.arguments.clone())
+            .collect();
+        let parsed: serde_json::Value =
+            serde_json::from_str(&joined).expect("the fragments concatenate to valid JSON");
+        assert_eq!(parsed["path"], serde_json::json!("/tmp/x"));
+        assert_eq!(parsed["contents"], serde_json::json!("hello world"));
+        assert!(
+            deltas.len() >= 3,
+            "the arguments arrived in pieces, not whole: {}",
+            deltas.len()
+        );
+        assert!(
+            deltas[1..].iter().all(|d| d.function.name.is_none()),
+            "only the opening delta carries identity"
+        );
+    }
+
+    /// Text either side of a call still streams as content, in order.
+    #[test]
+    fn text_around_a_streamed_call_is_still_content() {
+        let opened = std::cell::Cell::new(0usize);
+        let mut parser = ferrox_edge::ToolCallParser::new(
+            ferrox_edge::ToolCallFormat::Qwen25,
+            vec![ferrox_edge::parser::tool_call::ToolSchema::new(
+                "get_weather",
+            )],
+        );
+        let wire = "let me check. <tool_call>{\"name\": \"get_weather\", \
+                    \"arguments\": {}}</tool_call> done";
+        let mut text = String::new();
+        for piece in wire.as_bytes().chunks(5) {
+            let chunk = String::from_utf8_lossy(piece).into_owned();
+            let (more, _) = tool_call_deltas(parser.push(&chunk), &opened);
+            text.push_str(&more);
+        }
+        let (more, _) = tool_call_deltas(parser.finish(), &opened);
+        text.push_str(&more);
+
+        assert_eq!(opened.get(), 1);
+        assert!(text.starts_with("let me check. "), "{text:?}");
+        assert!(text.ends_with(" done"), "{text:?}");
+        assert!(!text.contains("<tool_call>"), "markers leaked: {text:?}");
     }
 
     /// A reasoning model's thinking must not be returned as its

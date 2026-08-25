@@ -493,7 +493,7 @@ impl ToolCallParser {
             return events;
         }
         if !self.has_tool_call(&rest) {
-            events.push(ToolCallEvent::Text(rest));
+            self.emit_text(rest, &mut events);
             return events;
         }
         // Llama 3 and Mistral have no closing marker, so their payload
@@ -542,7 +542,7 @@ impl ToolCallParser {
             Some(index) => {
                 if index > 0 {
                     let text: String = self.buffer.drain(..index).collect();
-                    events.push(ToolCallEvent::Text(text));
+                    self.emit_text(text, events);
                 }
                 if self.format.streams_arguments() {
                     self.start_streamed_block(events)
@@ -552,10 +552,16 @@ impl ToolCallParser {
             }
             None => {
                 // Withhold any trailing run that could still grow into
-                // the opening marker.
+                // a marker -- opening OR closing. The closing ones
+                // matter because a streamed invoke grammar leaves its
+                // block close behind after the call is consumed, and at
+                // one character per chunk it would otherwise dribble
+                // out as `<`, `/`, `t`, ... before anything could
+                // recognize it as structure.
                 let markers: Vec<String> = TOOL_MARKERS
                     .iter()
                     .map(|marker| marker.to_string())
+                    .chain(self.closing_markers().into_iter().map(str::to_string))
                     .collect();
                 let hold = stop_prefix_holdback(&self.buffer, &markers);
                 let split = floor_char_boundary(&self.buffer, self.buffer.len() - hold);
@@ -563,10 +569,44 @@ impl ToolCallParser {
                     return false;
                 }
                 let text: String = self.buffer.drain(..split).collect();
-                events.push(ToolCallEvent::Text(text));
+                self.emit_text(text, events);
                 false
             }
         }
+    }
+
+    /// Release text, minus any structure that outlived its call.
+    ///
+    /// A streamed call is consumed marker by marker as it is
+    /// recognized, and the *block* close can be left over -- an invoke
+    /// grammar closes `</function>` and then `</tool_call>`, and only
+    /// the first belongs to the call. Emitting the remainder as content
+    /// would print raw markup into an answer, which is exactly what a
+    /// client renders verbatim.
+    fn emit_text(&self, text: String, events: &mut Vec<ToolCallEvent>) {
+        let mut text = text;
+        for marker in self.closing_markers() {
+            if text.contains(marker) {
+                text = text.replace(marker, "");
+            }
+        }
+        if !text.is_empty() {
+            events.push(ToolCallEvent::Text(text));
+        }
+    }
+
+    /// This format's closing markers: structure that can outlive the
+    /// call it closed.
+    fn closing_markers(&self) -> Vec<&'static str> {
+        [
+            Some(self.markers.close),
+            self.markers.invoke.map(|tag| tag.close),
+            self.markers.param.map(|tag| tag.close),
+        ]
+        .into_iter()
+        .flatten()
+        .filter(|marker| !marker.is_empty())
+        .collect()
     }
 
     /// A non-streaming format: wait for the whole block, then emit the
@@ -1581,6 +1621,26 @@ mod tests {
             parser.push("_call>{\"name\": \"get_weather\", \"arguments\": {}}</tool_call>");
         assert_eq!(text_of(&events), "");
         assert_eq!(calls_of(&events).len(), 1);
+    }
+
+    /// A streamed invoke grammar closes twice -- the call, then the
+    /// block -- and only the first belongs to the call. The leftover
+    /// must not be printed into the answer.
+    #[test]
+    fn a_block_close_left_over_from_a_call_is_not_content() {
+        let wire = "<tool_call><function=get_weather>\
+                    <parameter=city>\nRome\n</parameter>\
+                    </function></tool_call>";
+        for width in [1usize, 6, 4096] {
+            let mut parser = parser(ToolCallFormat::Qwen3Coder);
+            let events = stream(&mut parser, wire, width);
+            assert_eq!(calls_of(&events).len(), 1, "width {width}");
+            assert_eq!(
+                text_of(&events),
+                "",
+                "width {width}: structure leaked as content"
+            );
+        }
     }
 
     /// A held partial that turns out to be ordinary text is released,

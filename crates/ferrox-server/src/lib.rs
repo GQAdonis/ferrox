@@ -690,7 +690,20 @@ pub(crate) struct AppState {
     /// of them: each operation takes it, reads or moves the state, and
     /// releases before doing any work.
     pub(crate) maintenance: Mutex<ferrox_edge::MaintenanceGate>,
+    /// The live memory reading behind `/v1/stats`, re-probed at most
+    /// once per [`FOOTPRINT_TTL_MS`] -- see
+    /// `cache_admin::footprint_json`. A `Mutex` and not an atomic
+    /// because holding it across the probe is what collapses concurrent
+    /// pollers onto ONE VMA walk.
+    pub(crate) footprint: Mutex<ferrox_edge::ProbeCache<ferrox_edge::Footprint>>,
 }
+
+/// How long a memory reading is served before it is taken again.
+///
+/// Two seconds: long enough that a dashboard polling once a second
+/// costs one probe rather than one per poll, short enough that an
+/// operator watching a load ramp sees it move.
+pub(crate) const FOOTPRINT_TTL_MS: u64 = 2_000;
 
 impl AppState {
     /// Clones the active model's `Arc` and releases the lock before
@@ -1824,6 +1837,9 @@ async fn serving_stats(State(state): State<Arc<AppState>>) -> Json<serde_json::V
         // the reply shapes here are OpenAI's and Anthropic's and a pool
         // gauge on a `chat.completion` is a field no client asked for.
         "pools": cache_admin::pool_gauges(&state),
+        // What the engine is REALLY using, beside the budget it was
+        // sized against. `null` when no live figure can be read.
+        "memory": cache_admin::footprint_json(&state),
     }))
 }
 
@@ -3417,6 +3433,7 @@ fn build_app_state(
         last_load_error: Mutex::new(None),
         serving: Mutex::new(ferrox_edge::ServingStats::default()),
         maintenance: Mutex::new(ferrox_edge::MaintenanceGate::serving()),
+        footprint: Mutex::new(ferrox_edge::ProbeCache::new(FOOTPRINT_TTL_MS)),
     }
 }
 
@@ -4355,6 +4372,7 @@ mod tests {
             last_load_error: Mutex::new(None),
             serving: Mutex::new(ferrox_edge::ServingStats::default()),
             maintenance: Mutex::new(ferrox_edge::MaintenanceGate::serving()),
+            footprint: Mutex::new(ferrox_edge::ProbeCache::new(FOOTPRINT_TTL_MS)),
         }
     }
 
@@ -5442,6 +5460,37 @@ mod tests {
 
     async fn post_json(app: &Router, body: serde_json::Value) -> serde_json::Value {
         post_json_uri(app, "/v1/chat/completions", body).await.1
+    }
+
+    /// The engine's live footprint, beside the budget it was sized
+    /// against. Two things are asserted rather than the number itself,
+    /// which is a property of the host: it is never a ZERO (an engine
+    /// using no memory is not a thing that happens, so a zero would be
+    /// a failed read presented as a fact), and it always says WHICH
+    /// quantity it is -- a caller comparing a PSS figure with an RSS
+    /// one is comparing two different things and will read the
+    /// difference as a leak.
+    #[tokio::test]
+    async fn stats_says_what_the_engine_is_using_and_which_quantity_that_is() {
+        let app = test_app();
+        let (status, body) = get_json(&app, ferrox_api::routes::V1_STATS).await;
+        assert_eq!(status, StatusCode::OK);
+
+        let memory = &body["memory"];
+        if memory.is_null() {
+            // No `/proc`: absent is the honest answer, and the point of
+            // this branch is that it is absent rather than zero.
+            return;
+        }
+        assert!(
+            memory["bytes"].as_u64().is_some_and(|b| b > 0),
+            "a read that produced a zero is a broken read, not an idle \
+             engine: {memory}"
+        );
+        assert!(
+            ["pss", "rss"].contains(&memory["kind"].as_str().unwrap_or("")),
+            "the quantity must travel with the number: {memory}"
+        );
     }
 
     /// A pool this deployment does not have is reported `null`, never

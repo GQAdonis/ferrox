@@ -43,7 +43,9 @@ use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
-use ferrox_edge::{MaintenanceState, PoolUsage, RebuildRefused, StopRefused};
+use ferrox_edge::{
+    Footprint, FootprintKind, MaintenanceState, PoolUsage, RebuildRefused, StopRefused,
+};
 use serde::Deserialize;
 
 use crate::AppState;
@@ -130,6 +132,75 @@ pub(crate) fn pool_gauges(state: &AppState) -> serde_json::Value {
         "window_slots": serde_json::Value::Null,
         "state_slots": serde_json::Value::Null,
     })
+}
+
+/// This process's live memory footprint, read from `/proc`.
+///
+/// PSS first: it divides each shared page by the number of processes
+/// sharing it, which is what makes a figure summable across a process
+/// group. RSS is the fallback for a kernel without `smaps_rollup`
+/// (before 4.14), and it OVERCOUNTS the moment anything is shared -- so
+/// which one was read travels with the number. See
+/// `ferrox_edge::footprint`.
+///
+/// `None` on a platform with no `/proc` at all, which is macOS and
+/// Windows: absent is the honest answer, and a zero would say the
+/// engine is using no memory.
+#[cfg(target_os = "linux")]
+fn read_footprint() -> Option<Footprint> {
+    if let Some(bytes) = std::fs::read_to_string("/proc/self/smaps_rollup")
+        .ok()
+        .as_deref()
+        .and_then(ferrox_edge::parse_smaps_rollup_pss)
+    {
+        return Some(Footprint {
+            bytes,
+            kind: FootprintKind::Pss,
+        });
+    }
+    let bytes = std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .as_deref()
+        .and_then(ferrox_edge::parse_status_rss)?;
+    Some(Footprint {
+        bytes,
+        kind: FootprintKind::Rss,
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn read_footprint() -> Option<Footprint> {
+    None
+}
+
+/// The footprint block for `GET /v1/stats`.
+///
+/// Behind a TTL cache because reading `smaps_rollup` walks the whole
+/// VMA list, which on a process mapping tens of gigabytes takes long
+/// enough that four dashboards polling this endpoint would produce four
+/// concurrent walks -- each slower for the others being there, so the
+/// endpoint would end up measuring its own instrumentation.
+///
+/// `null` rather than a zero when nothing could be read: an engine
+/// using no memory is not a thing that happens, so a zero here would be
+/// a failed read presented as a fact.
+pub(crate) fn footprint_json(state: &AppState) -> serde_json::Value {
+    let now_ms = state.uptime().as_millis().min(u64::MAX as u128) as u64;
+    let reading = state
+        .footprint
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get_or_probe(now_ms, read_footprint);
+    match reading {
+        Some(f) => serde_json::json!({
+            "bytes": f.bytes,
+            // Which quantity this is, never assumed: a caller comparing
+            // a PSS figure with an RSS one is comparing two different
+            // things and will read the difference as a leak.
+            "kind": f.kind.as_str(),
+        }),
+        None => serde_json::Value::Null,
+    }
 }
 
 /// What a client may ask a rebuild for.

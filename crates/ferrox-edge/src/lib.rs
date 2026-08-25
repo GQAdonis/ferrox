@@ -48,6 +48,7 @@ pub mod detokenize;
 pub mod dsv4;
 pub mod effort;
 pub mod expert_cache;
+pub mod footprint;
 pub mod maintenance;
 pub mod parser;
 pub mod placement;
@@ -94,6 +95,10 @@ pub use window_pool::{WindowPoolExhausted, WindowSlotPool, NO_SLOT};
 pub use state_pool::{
     chunk_row_bases, track_checkpoint, StateCopy, StatePoolExhausted, StateSlotPool,
     TrackCheckpoint, TrackRequest, PADDING_SLOT,
+};
+
+pub use footprint::{
+    parse_smaps_rollup_pss, parse_status_rss, sum_footprints, Footprint, FootprintKind, ProbeCache,
 };
 
 pub use maintenance::{

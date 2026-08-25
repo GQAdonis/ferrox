@@ -36,10 +36,12 @@ pub mod cache_report;
 pub mod detokenize;
 pub mod effort;
 pub mod expert_cache;
+pub mod parser;
 pub mod placement;
 pub mod pool;
 pub mod qstar;
 pub mod radix;
+pub mod scheduler;
 
 pub use cache_report::{CacheGeometry, CachePools};
 pub use detokenize::{
@@ -47,10 +49,19 @@ pub use detokenize::{
     DetokenizeMsg, Detokenizer,
 };
 pub use expert_cache::{CopyPlan, EnsurePlan, ExpertCache, ExpertCacheStats, ExpertId};
+pub use parser::{
+    ReasoningDelta, ReasoningFormat, ReasoningParser, ToolCall, ToolCallEvent, ToolCallFormat,
+    ToolCallParser,
+};
 pub use placement::{auto_cpu_layers, parse_cpu_layers_spec};
 pub use pool::{plan_cache_budget, validate_rebuild, PoolSizes, RebuildRequest};
 pub use qstar::{
     balanced_fetch, recommend_backend, BandwidthProfile, MoeBackend, QStarPolicy, QStarSplit,
+};
+
+pub use scheduler::{
+    finish_reason, AdmittedChunk, Capacity, DecodeSet, FinishReason, Geometry, NotAdmitted,
+    PendingRequest, PrefillPass, SlotTable,
 };
 
 pub use radix::{

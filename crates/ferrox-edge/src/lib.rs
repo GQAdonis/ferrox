@@ -35,6 +35,10 @@
 pub mod cache_report;
 pub mod detokenize;
 pub mod effort;
+pub mod expert_cache;
+pub mod placement;
+pub mod pool;
+pub mod qstar;
 pub mod radix;
 
 pub use cache_report::{CacheGeometry, CachePools};
@@ -42,6 +46,13 @@ pub use detokenize::{
     find_printable_text, floor_char_boundary, stop_prefix_holdback, DetokenizeManager,
     DetokenizeMsg, Detokenizer,
 };
+pub use expert_cache::{CopyPlan, EnsurePlan, ExpertCache, ExpertCacheStats, ExpertId};
+pub use placement::{auto_cpu_layers, parse_cpu_layers_spec};
+pub use pool::{plan_cache_budget, validate_rebuild, PoolSizes, RebuildRequest};
+pub use qstar::{
+    balanced_fetch, recommend_backend, BandwidthProfile, MoeBackend, QStarPolicy, QStarSplit,
+};
+
 pub use radix::{
     HybridMatch, HybridRadixCache, InsertResult, MatchResult, NodeId, RadixCache, SwaMatch,
     SwaRadixCache,

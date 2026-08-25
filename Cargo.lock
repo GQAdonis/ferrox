@@ -448,6 +448,7 @@ dependencies = [
  "ferrox-safetensors",
  "ferrox-server",
  "half",
+ "libc",
  "rayon",
  "serde_json",
  "tracing",

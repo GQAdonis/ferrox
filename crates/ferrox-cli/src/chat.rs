@@ -51,7 +51,8 @@ pub fn run_chat(args: ChatArgs) -> Result<()> {
     if !(200..300).contains(&health.status) {
         anyhow::bail!("server /health returned HTTP {}", health.status);
     }
-    eprintln!("ferrox chat → {base}  (/help for commands, /quit to leave)");
+    install_sigint_handler();
+    eprintln!("ferrox chat → {base}  (/help for commands, Ctrl-C stops a turn, /quit to leave)");
     if let Some(sys) = &args.system {
         eprintln!("system: {sys}");
     }
@@ -159,6 +160,76 @@ pub fn run_chat(args: ChatArgs) -> Result<()> {
         messages.push(json!({"role": "assistant", "content": reply}));
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------
+// Ctrl-C: cancel the turn, not the session
+// ---------------------------------------------------------------------
+
+/// Set while a generation is streaming.
+static GENERATING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Set by the signal handler when a turn should stop.
+static INTERRUPTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Marks a generation in flight, and clears the mark however the
+/// generation ends -- a `?` return or a panic included, which is why it
+/// is a guard and not two calls.
+struct Generating;
+
+impl Generating {
+    fn begin() -> Self {
+        INTERRUPTED.store(false, std::sync::atomic::Ordering::SeqCst);
+        GENERATING.store(true, std::sync::atomic::Ordering::SeqCst);
+        Generating
+    }
+}
+
+impl Drop for Generating {
+    fn drop(&mut self) {
+        GENERATING.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+fn interrupted() -> bool {
+    INTERRUPTED.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// What SIGINT does, and it depends on what the REPL is doing.
+///
+/// **Mid-generation**: set a flag and return. The stream loop notices
+/// between chunks, cancels the generation server-side and hands back
+/// what arrived, so Ctrl-C costs the turn rather than the session --
+/// which is the whole point, since the alternative is losing a
+/// conversation to stop one answer.
+///
+/// **At the prompt**: exit, because that is what Ctrl-C means at a
+/// shell prompt and a REPL that cannot be quit with it is worse than
+/// one with no handler at all.
+///
+/// Only two things happen in here, and both are async-signal-safe: an
+/// atomic store and `_exit`. Anything else -- a `println!`, an
+/// allocation, unwinding -- is undefined behaviour in a signal handler,
+/// and the failure mode is a deadlock inside the allocator that looks
+/// like a hang rather than a crash.
+extern "C" fn on_sigint(_sig: libc::c_int) {
+    if GENERATING.load(std::sync::atomic::Ordering::SeqCst) {
+        INTERRUPTED.store(true, std::sync::atomic::Ordering::SeqCst);
+    } else {
+        // 130 is the shell convention for "killed by SIGINT".
+        unsafe { libc::_exit(130) };
+    }
+}
+
+/// Installs [`on_sigint`]. Best-effort: a platform that refuses simply
+/// keeps the default behaviour, which is the one we started with.
+fn install_sigint_handler() {
+    unsafe {
+        // Through a pointer rather than casting the function item
+        // straight to an integer, which clippy rightly refuses: the
+        // direct cast is a lint-level trap for the case where the
+        // integer width and the pointer width differ.
+        libc::signal(libc::SIGINT, on_sigint as *const () as libc::sighandler_t);
+    }
 }
 
 /// What `/help` prints.
@@ -477,6 +548,11 @@ fn print_streamed_completion(base: &str, body: &Value, out: &mut impl Write) -> 
 
     let mut render = StreamRender::default();
     let mut line = String::new();
+    // The id `/v1/cancel` takes, stated by the server on the first
+    // chunk. Captured rather than invented: a client cannot name a
+    // generation the server has not told it about.
+    let mut request_id: Option<String> = None;
+    let _generating = Generating::begin();
     while reader.read_line(&mut line)? > 0 {
         let trimmed = line.trim_end();
         if let Some(data) = trimmed.strip_prefix("data: ") {
@@ -484,13 +560,58 @@ fn print_streamed_completion(base: &str, body: &Value, out: &mut impl Write) -> 
                 break;
             }
             if let Ok(v) = serde_json::from_str::<Value>(data) {
+                if request_id.is_none() {
+                    request_id = stated_request_id(&v);
+                }
                 render.push_chunk(&v, out)?;
             }
+        }
+        // Checked between chunks, which is the only place it can be:
+        // the read above blocks, so an interrupt arriving mid-read is
+        // noticed when the next chunk lands or the socket closes.
+        if interrupted() {
+            render.finish(out)?;
+            match &request_id {
+                Some(id) => match cancel_generation(base, id) {
+                    Ok(()) => eprintln!("(interrupted; the server stopped generating)"),
+                    // Worth saying: the local stream is over either
+                    // way, but a server still decoding is burning the
+                    // machine for an answer nobody will read.
+                    Err(e) => eprintln!("(interrupted locally, but the cancel failed: {e:#})"),
+                },
+                // Before the first chunk there is no id to cancel with,
+                // so dropping the socket is all there is -- which the
+                // server treats as a disconnect and stops on.
+                None => eprintln!("(interrupted before the server named the request)"),
+            }
+            return Ok(render.assembled);
         }
         line.clear();
     }
     render.finish(out)?;
     Ok(render.assembled)
+}
+
+/// The request id a streamed chunk states, if this is the chunk that
+/// states it.
+fn stated_request_id(chunk: &Value) -> Option<String> {
+    chunk
+        .get("request_id")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
+fn cancel_generation(base: &str, request_id: &str) -> Result<()> {
+    let body = serde_json::to_vec(&json!({"request_id": request_id}))?;
+    let resp = http_exchange("POST", &format!("{base}/v1/cancel"), Some(&body))?;
+    if !(200..300).contains(&resp.status) {
+        anyhow::bail!(
+            "HTTP {}: {}",
+            resp.status,
+            String::from_utf8_lossy(&resp.body)
+        );
+    }
+    Ok(())
 }
 
 /// Turns one SSE chunk into terminal output, and keeps the answer.
@@ -770,5 +891,48 @@ mod tests {
         }));
         assert!(rendered.contains("4/64 pages of 256 tokens"), "{rendered}");
         assert!(rendered.contains("2.00 GiB (pss)"), "{rendered}");
+    }
+
+    /// A client cannot cancel a generation the server has not named,
+    /// so the id is taken from the stream rather than invented. Only
+    /// the FIRST chunk carries it, which is why it is captured once and
+    /// kept.
+    #[test]
+    fn the_request_id_is_read_from_the_chunk_that_states_it() {
+        let first = json!({
+            "id": "chatcmpl-1",
+            "request_id": "chatcmpl-1",
+            "choices": [{"delta": {"role": "assistant"}}],
+        });
+        assert_eq!(stated_request_id(&first).as_deref(), Some("chatcmpl-1"));
+
+        // Later chunks carry no `request_id`, and must not be mistaken
+        // for stating one -- `id` is the completion id, not the cancel
+        // handle.
+        let later = json!({"id": "chatcmpl-1", "choices": [{"delta": {"content": "hi"}}]});
+        assert_eq!(stated_request_id(&later), None);
+    }
+
+    /// The guard exists so the flag clears however a turn ends -- an
+    /// error return or a panic included. Left set, the next turn would
+    /// cancel itself the moment it started.
+    #[test]
+    fn a_finished_turn_stops_being_interruptible_however_it_ended() {
+        assert!(!GENERATING.load(std::sync::atomic::Ordering::SeqCst));
+        {
+            let _g = Generating::begin();
+            assert!(GENERATING.load(std::sync::atomic::Ordering::SeqCst));
+            INTERRUPTED.store(true, std::sync::atomic::Ordering::SeqCst);
+            assert!(interrupted());
+        }
+        assert!(
+            !GENERATING.load(std::sync::atomic::Ordering::SeqCst),
+            "the guard must clear the mark on drop"
+        );
+
+        // And beginning the next turn clears a flag the last one left,
+        // so it cannot cancel itself before its first chunk.
+        let _g = Generating::begin();
+        assert!(!interrupted());
     }
 }

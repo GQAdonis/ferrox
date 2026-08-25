@@ -159,28 +159,14 @@ impl StopMatcher {
 /// checked, so a suffix equal to a whole stop string is not what this
 /// looks for.
 ///
-/// Byte comparison rather than character comparison is deliberate --
-/// the answer is used as a split point and is passed through
-/// `floor_char_boundary` afterwards, so an answer that lands mid-
-/// character withholds slightly more rather than slicing a `str`
-/// invalidly.
+/// The rule itself lives in `ferrox_edge::stop_prefix_holdback`, which
+/// the streaming detokenizer and both output parsers also withhold
+/// against. One implementation, because three copies of a rule this
+/// exact would disagree eventually, and the disagreement would show up
+/// as a partial stop string reaching a client on one code path and not
+/// another.
 fn partial_suffix_len(pending: &str, stops: &[String]) -> usize {
-    let bytes = pending.as_bytes();
-    let longest = stops
-        .iter()
-        .map(|s| s.len().saturating_sub(1))
-        .max()
-        .unwrap_or(0);
-    let max_k = longest.min(bytes.len());
-    (1..=max_k)
-        .rev()
-        .find(|&k| {
-            let tail = &bytes[bytes.len() - k..];
-            stops
-                .iter()
-                .any(|s| s.len() > k && s.as_bytes().starts_with(tail))
-        })
-        .unwrap_or(0)
+    ferrox_edge::stop_prefix_holdback(pending, stops)
 }
 
 #[cfg(test)]

@@ -70,7 +70,12 @@ Beyond closing the measured gaps.
 **Serving**
 
 - Tool calling: the OpenAI `tools` / `tool_choice` request and response
-  shape
+  shape. *Nine wire formats now parse* (`ferrox-edge::parser::tool_call`),
+  every call in a response rather than the first, and a reasoning
+  model's chain of thought comes back as `reasoning_content`. What is
+  left here is `tool_choice: required`/named, which needs constrained
+  decoding, and incremental `tool_calls[].index` argument deltas on the
+  streaming path
 - Full grammar and JSON-schema constrained decoding
 - MCP tool invocation, plus Anthropic streaming and tools
 - The rest of the OpenAI API surface (see [`API.md`](API.md))
@@ -85,6 +90,30 @@ Beyond closing the measured gaps.
   experts, bound the KV budget, report what a host really fits
 - Hybrid CPU/GPU expert placement for MoE, the main lever for running a
   larger model or a higher quant on unchanged hardware
+
+**Wiring `ferrox-edge`**
+
+The ported FreeToken serving policy (`crates/ferrox-edge`, see
+[`FEATURES.md`](FEATURES.md)) is complete and tested but only its two
+output parsers and its withhold rule are driving anything yet. The rest
+is groundwork waiting on a consumer:
+
+- Replace `ferrox-models::prefix_cache`'s flat snapshot list with
+  `ferrox-edge::radix`, so a thousand requests off one system prompt
+  share its nodes instead of cloning its KV, and so prefix reuse works
+  on the continuous-batching path (today the two are mutually
+  exclusive)
+- Drive expert residency from `ferrox-edge::expert_cache` and the `q*`
+  split, which needs the other half FreeToken has and ferrox does not:
+  a *persistent* GPU expert cache (`ferrox-moe::run_expert_placed`
+  re-uploads every weight matrix per call) and a CPU MoE path that can
+  run concurrently with a device copy
+- `ferrox bench bw` — measure this host's CPU-MoE and PCIe bandwidths so
+  `qstar::BandwidthProfile` has real numbers to read, instead of the
+  unbenchmarked one-fetch-per-step default
+- Size the pools with `ferrox-edge::pool` at load, and expose the live
+  re-split (`POST /v1/cache/rebuild`) so VRAM can move between the
+  expert cache and KV without a restart
 
 **Engineering practice worth taking from llama.cpp**
 

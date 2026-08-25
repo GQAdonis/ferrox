@@ -51,6 +51,7 @@ mod limits;
 mod mcp;
 mod model;
 mod openai_extra;
+mod output;
 mod resume;
 mod security;
 mod session;
@@ -59,10 +60,12 @@ mod stats;
 mod stop;
 mod tasks;
 
+use std::cell::RefCell;
 use std::convert::Infallible;
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
@@ -1235,6 +1238,11 @@ struct ChatCompletionResponseMessage {
     role: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     content: Option<String>,
+    /// A reasoning model's chain of thought, split out of `content`.
+    /// Absent for a model that emitted none, which is also what a
+    /// client that does not know the field sees.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_content: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_calls: Option<Vec<ToolCallOut>>,
 }
@@ -1289,6 +1297,9 @@ struct ChatCompletionChunkDelta {
     role: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     content: Option<String>,
+    /// See `ChatCompletionResponseMessage::reasoning_content`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_content: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_calls: Option<Vec<ToolCallOut>>,
 }
@@ -1876,7 +1887,9 @@ pub(crate) fn prompt_from_messages(
 /// marker, then reuse the existing stop-sequence machinery (see
 /// `ChatCompletionRequest::effective_stop_sequences`) to end
 /// generation right after it, and parse the captured text for that
-/// marker afterward (`extract_tool_call`). This is stop-bounded,
+/// marker afterward (`output::parse_output`, which also accepts the
+/// format the served checkpoint's own family emits). This is
+/// stop-bounded,
 /// prompt-engineered JSON extraction, not enforced-valid-JSON output --
 /// a real limitation, not overclaimed.
 fn tool_preamble(tools: &[ToolDef]) -> String {
@@ -1902,59 +1915,52 @@ fn tool_preamble(tools: &[ToolDef]) -> String {
     out
 }
 
-/// Looks for a `<tool_call>{...}</tool_call>` marker (see
-/// `tool_preamble`) and parses its JSON body into a `(name,
-/// arguments)` pair -- `arguments` kept as a JSON-encoded *string*,
-/// matching OpenAI's real `tool_calls[].function.arguments`
-/// convention (a string, even though the model itself writes it as
-/// literal JSON).
-fn extract_tool_call(text: &str) -> Option<(String, String)> {
-    const START: &str = "<tool_call>";
-    const END: &str = "</tool_call>";
-    let start = text.find(START)? + START.len();
-    let end = start + text[start..].find(END)?;
-    let body = text[start..end].trim();
-    let value: serde_json::Value = serde_json::from_str(body).ok()?;
-    let name = value.get("name")?.as_str()?.to_string();
-    let arguments = value
-        .get("arguments")
-        .cloned()
-        .unwrap_or_else(|| serde_json::json!({}));
-    Some((name, arguments.to_string()))
-}
-
 /// Builds the final response message + finish reason from raw
-/// generated text: promotes `base_finish` to `"tool_calls"` (moving
-/// the text into a structured `tool_calls` entry instead of `content`)
-/// when tool-calling was active and the text actually contains a real
-/// `<tool_call>{...}</tool_call>` marker -- a model can still just
-/// answer in plain text despite tools being offered, which must fall
-/// through to an ordinary text response, not an error.
+/// generated text.
+///
+/// Three things come out of the text: a reasoning block, when the
+/// served checkpoint's family emits one; every tool call it made, in
+/// whichever format it used; and whatever prose is left. `base_finish`
+/// is promoted to `"tool_calls"` only when a call was actually found --
+/// a model can answer in plain text despite tools being offered, and
+/// that must fall through to an ordinary text response rather than an
+/// error.
 fn build_response_message(
-    content: String,
-    tools_active: bool,
+    text: String,
+    tools: &[ToolDef],
+    model_name: &str,
     base_finish: &'static str,
 ) -> (ChatCompletionResponseMessage, &'static str) {
-    if tools_active {
-        if let Some((name, arguments)) = extract_tool_call(&content) {
-            return (
-                ChatCompletionResponseMessage {
-                    role: "assistant",
-                    content: None,
-                    tool_calls: Some(vec![ToolCallOut {
-                        id: "call_0".to_string(),
-                        kind: "function",
-                        function: ToolCallFunctionOut { name, arguments },
-                    }]),
-                },
-                "tool_calls",
-            );
-        }
+    let parsed = output::parse_output(&text, tools, model_name);
+    let calls: Vec<ToolCallOut> = parsed
+        .calls
+        .into_iter()
+        .enumerate()
+        .map(|(index, call)| ToolCallOut {
+            id: format!("call_{index}"),
+            kind: "function",
+            function: ToolCallFunctionOut {
+                name: call.name,
+                arguments: call.arguments,
+            },
+        })
+        .collect();
+    if !calls.is_empty() {
+        return (
+            ChatCompletionResponseMessage {
+                role: "assistant",
+                content: None,
+                reasoning_content: parsed.reasoning,
+                tool_calls: Some(calls),
+            },
+            "tool_calls",
+        );
     }
     (
         ChatCompletionResponseMessage {
             role: "assistant",
-            content: Some(content),
+            content: Some(parsed.content),
+            reasoning_content: parsed.reasoning,
             tool_calls: None,
         },
         base_finish,
@@ -2165,8 +2171,12 @@ async fn chat_completions_full(
         );
     }
 
-    let (message, finish_reason) =
-        build_response_message(content, tools_active, completion.finish.as_str());
+    let (message, finish_reason) = build_response_message(
+        content,
+        if tools_active { &req.tools } else { &[] },
+        active.model.name(),
+        completion.finish.as_str(),
+    );
 
     state.record_request(stats::Record {
         request_id: &request_id,
@@ -2225,6 +2235,13 @@ async fn chat_completions_stream(
     // Read now, off the handle this stream will decode against. Read
     // later it would name whatever a swap had made current by then.
     let served_model = active.model.name().to_string();
+    // The offered tools, captured for the terminal parse: the request
+    // itself does not outlive the closure that consumes it.
+    let offered_tools: Vec<ToolDef> = if tools_active {
+        req.tools.clone()
+    } else {
+        Vec::new()
+    };
 
     // Tier two of cancellation: the id is already on the wire, so the
     // client can name it. The guard rides with the generation task and
@@ -2261,6 +2278,21 @@ async fn chat_completions_stream(
         let orphan_timeout = sse::orphan_timeout_from_env();
         let mut first = true;
         let head_request_id = request_id.clone();
+        // The chain-of-thought split, applied as the tokens arrive
+        // rather than at the end. Without this an overlapped stream --
+        // which is the default for a reasoning model with no tools --
+        // would deliver the whole thinking block as `content` and then
+        // the buffered path would deliver the same request's thinking
+        // as `reasoning_content`, so the same question would answer
+        // differently depending on a transport detail. Shared with the
+        // terminal flush below, which releases whatever the parser is
+        // still withholding against a marker that never arrived.
+        let stream_reasoning: Rc<RefCell<Option<ferrox_edge::ReasoningParser>>> =
+            Rc::new(RefCell::new(
+                ferrox_edge::ReasoningFormat::infer(&served_model)
+                    .map(|format| ferrox_edge::ReasoningParser::new(format, false, true)),
+            ));
+        let emit_reasoning = Rc::clone(&stream_reasoning);
         let result = run_generation_emit(
             &model,
             &prompt,
@@ -2271,6 +2303,18 @@ async fn chat_completions_stream(
             ceiling.as_deref(),
             |chunk| {
                 if !overlap || chunk.is_empty() {
+                    return;
+                }
+                let (reasoning, content) = match emit_reasoning.borrow_mut().as_mut() {
+                    Some(parser) => {
+                        let delta = parser.push(chunk);
+                        (delta.reasoning, delta.content)
+                    }
+                    None => (String::new(), chunk.to_string()),
+                };
+                // The parser withholds a partial marker, so a chunk can
+                // legitimately produce nothing at all this time round.
+                if reasoning.is_empty() && content.is_empty() {
                     return;
                 }
                 let role = if first { Some("assistant") } else { None };
@@ -2285,7 +2329,8 @@ async fn chat_completions_stream(
                         index: 0,
                         delta: ChatCompletionChunkDelta {
                             role,
-                            content: Some(chunk.to_string()),
+                            content: (!content.is_empty()).then_some(content),
+                            reasoning_content: (!reasoning.is_empty()).then_some(reasoning),
                             tool_calls: None,
                         },
                         finish_reason: None,
@@ -2347,13 +2392,18 @@ async fn chat_completions_stream(
                         },
                     );
                 }
-                let tool_call = if tools_active {
-                    extract_tool_call(&full_text)
-                } else {
-                    None
-                };
-                if !overlap {
-                    if let Some((name, arguments)) = &tool_call {
+                // An overlapped stream may still be holding a run that
+                // could have become a marker and did not. It is
+                // ordinary output; dropping it would truncate every
+                // answer whose tail happens to look like the start of
+                // a `</think>`.
+                if overlap {
+                    let tail = stream_reasoning
+                        .borrow_mut()
+                        .as_mut()
+                        .map(|parser| parser.flush())
+                        .unwrap_or_default();
+                    if !tail.is_empty() {
                         let payload = ChatCompletionChunk {
                             id: request_id.clone(),
                             request_id: pending_request_id.take(),
@@ -2362,34 +2412,10 @@ async fn chat_completions_stream(
                             choices: vec![ChatCompletionChunkChoice {
                                 index: 0,
                                 delta: ChatCompletionChunkDelta {
-                                    role: Some("assistant"),
-                                    content: None,
-                                    tool_calls: Some(vec![ToolCallOut {
-                                        id: "call_0".to_string(),
-                                        kind: "function",
-                                        function: ToolCallFunctionOut {
-                                            name: name.clone(),
-                                            arguments: arguments.clone(),
-                                        },
-                                    }]),
-                                },
-                                finish_reason: None,
-                            }],
-                            usage: None,
-                        };
-                        let _ =
-                            sse::send_or_orphan(&tx, Ok(emitter.event(&payload)), orphan_timeout);
-                    } else if !full_text.is_empty() {
-                        let payload = ChatCompletionChunk {
-                            id: request_id.clone(),
-                            request_id: pending_request_id.take(),
-                            object: "chat.completion.chunk",
-                            model: model_name.clone(),
-                            choices: vec![ChatCompletionChunkChoice {
-                                index: 0,
-                                delta: ChatCompletionChunkDelta {
-                                    role: Some("assistant"),
-                                    content: Some(full_text),
+                                    role: None,
+                                    content: (!tail.content.is_empty()).then_some(tail.content),
+                                    reasoning_content: (!tail.reasoning.is_empty())
+                                        .then_some(tail.reasoning),
                                     tool_calls: None,
                                 },
                                 finish_reason: None,
@@ -2400,7 +2426,65 @@ async fn chat_completions_stream(
                             sse::send_or_orphan(&tx, Ok(emitter.event(&payload)), orphan_timeout);
                     }
                 }
-                let final_finish_reason = if tool_call.is_some() {
+                let parsed = output::parse_output(&full_text, &offered_tools, &served_model);
+                let tool_calls: Vec<ToolCallOut> = parsed
+                    .calls
+                    .iter()
+                    .enumerate()
+                    .map(|(index, call)| ToolCallOut {
+                        id: format!("call_{index}"),
+                        kind: "function",
+                        function: ToolCallFunctionOut {
+                            name: call.name.clone(),
+                            arguments: call.arguments.clone(),
+                        },
+                    })
+                    .collect();
+                if !overlap {
+                    if !tool_calls.is_empty() {
+                        let payload = ChatCompletionChunk {
+                            id: request_id.clone(),
+                            request_id: pending_request_id.take(),
+                            object: "chat.completion.chunk",
+                            model: model_name.clone(),
+                            choices: vec![ChatCompletionChunkChoice {
+                                index: 0,
+                                delta: ChatCompletionChunkDelta {
+                                    role: Some("assistant"),
+                                    content: None,
+                                    reasoning_content: parsed.reasoning.clone(),
+                                    tool_calls: Some(tool_calls.clone()),
+                                },
+                                finish_reason: None,
+                            }],
+                            usage: None,
+                        };
+                        let _ =
+                            sse::send_or_orphan(&tx, Ok(emitter.event(&payload)), orphan_timeout);
+                    } else if !parsed.content.is_empty() || parsed.reasoning.is_some() {
+                        let payload = ChatCompletionChunk {
+                            id: request_id.clone(),
+                            request_id: pending_request_id.take(),
+                            object: "chat.completion.chunk",
+                            model: model_name.clone(),
+                            choices: vec![ChatCompletionChunkChoice {
+                                index: 0,
+                                delta: ChatCompletionChunkDelta {
+                                    role: Some("assistant"),
+                                    content: (!parsed.content.is_empty())
+                                        .then(|| parsed.content.clone()),
+                                    reasoning_content: parsed.reasoning.clone(),
+                                    tool_calls: None,
+                                },
+                                finish_reason: None,
+                            }],
+                            usage: None,
+                        };
+                        let _ =
+                            sse::send_or_orphan(&tx, Ok(emitter.event(&payload)), orphan_timeout);
+                    }
+                }
+                let final_finish_reason = if !tool_calls.is_empty() {
                     "tool_calls"
                 } else {
                     finish.as_str()
@@ -2415,6 +2499,7 @@ async fn chat_completions_stream(
                         delta: ChatCompletionChunkDelta {
                             role: None,
                             content: None,
+                            reasoning_content: None,
                             tool_calls: None,
                         },
                         finish_reason: Some(final_finish_reason),
@@ -2465,6 +2550,7 @@ async fn chat_completions_stream(
                         delta: ChatCompletionChunkDelta {
                             role: Some("assistant"),
                             content: Some(format!("[error: {e}]")),
+                            reasoning_content: None,
                             tool_calls: None,
                         },
                         finish_reason: Some("stop"),
@@ -4851,58 +4937,69 @@ mod tests {
     }
 
     #[test]
-    fn extract_tool_call_parses_a_real_marker() {
+    fn a_real_marker_becomes_a_structured_tool_call() {
         let text = "sure, let me check.<tool_call>{\"name\": \"get_weather\", \"arguments\": {\"location\": \"Paris\"}}</tool_call>";
-        let (name, arguments) = extract_tool_call(text).expect("must find the marker");
-        assert_eq!(name, "get_weather");
-        let parsed: serde_json::Value = serde_json::from_str(&arguments).unwrap();
+        let (message, finish) = build_response_message(
+            text.to_string(),
+            &[weather_tool_def()],
+            "test-model",
+            "stop",
+        );
+        assert_eq!(finish, "tool_calls");
+        let calls = message.tool_calls.expect("must carry a tool call");
+        assert_eq!(calls[0].function.name, "get_weather");
+        let parsed: serde_json::Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
         assert_eq!(parsed["location"], "Paris");
     }
 
     #[test]
-    fn extract_tool_call_returns_none_when_no_marker_present() {
-        assert_eq!(
-            extract_tool_call("just a plain answer, no markers here"),
-            None
-        );
-    }
-
-    #[test]
-    fn extract_tool_call_returns_none_on_malformed_json_inside_the_marker() {
-        assert_eq!(
-            extract_tool_call("<tool_call>not valid json at all</tool_call>"),
-            None
-        );
-    }
-
-    #[test]
-    fn extract_tool_call_defaults_to_empty_arguments_when_the_field_is_absent() {
-        let (name, arguments) =
-            extract_tool_call("<tool_call>{\"name\": \"ping\"}</tool_call>").unwrap();
-        assert_eq!(name, "ping");
-        assert_eq!(arguments, "{}");
-    }
-
-    #[test]
-    fn build_response_message_promotes_a_real_tool_call_to_tool_calls() {
+    fn a_plain_answer_is_not_promoted_to_a_tool_call() {
         let (message, finish) = build_response_message(
-            "<tool_call>{\"name\": \"get_weather\", \"arguments\": {\"location\": \"Rome\"}}</tool_call>"
-                .to_string(),
-            true,
+            "just an answer".to_string(),
+            &[weather_tool_def()],
+            "test-model",
             "stop",
         );
-        assert_eq!(finish, "tool_calls");
-        assert!(message.content.is_none());
-        let calls = message.tool_calls.expect("must carry a tool call");
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].function.name, "get_weather");
+        assert_eq!(finish, "stop");
+        assert!(message.tool_calls.is_none());
+        assert_eq!(message.content.as_deref(), Some("just an answer"));
     }
 
+    /// Malformed JSON inside the marker is not a call. Returning it as
+    /// one would hand a client arguments it cannot parse.
     #[test]
-    fn build_response_message_falls_back_to_plain_text_when_tools_are_inactive() {
+    fn a_malformed_payload_is_not_a_tool_call() {
+        let (message, finish) = build_response_message(
+            "<tool_call>not valid json at all</tool_call>".to_string(),
+            &[weather_tool_def()],
+            "test-model",
+            "stop",
+        );
+        assert_eq!(finish, "stop");
+        assert!(message.tool_calls.is_none());
+    }
+
+    /// A call to something the request never offered is refused: the
+    /// client would be asked to execute a tool it does not have.
+    #[test]
+    fn a_tool_that_was_never_offered_is_not_returned() {
+        let (message, finish) = build_response_message(
+            "<tool_call>{\"name\": \"ping\", \"arguments\": {}}</tool_call>".to_string(),
+            &[weather_tool_def()],
+            "test-model",
+            "stop",
+        );
+        assert_eq!(finish, "stop");
+        assert!(message.tool_calls.is_none());
+    }
+
+    /// With no tools offered at all, marker text is just text.
+    #[test]
+    fn marker_text_with_no_tools_offered_stays_content() {
         let (message, finish) = build_response_message(
             "<tool_call>{\"name\": \"get_weather\", \"arguments\": {}}</tool_call>".to_string(),
-            false,
+            &[],
+            "test-model",
             "stop",
         );
         assert_eq!(finish, "stop");
@@ -4910,12 +5007,36 @@ mod tests {
         assert!(message.content.is_some());
     }
 
+    /// A reasoning model's thinking must not be returned as its
+    /// answer.
     #[test]
-    fn build_response_message_falls_back_to_plain_text_when_no_marker_is_present() {
-        let (message, finish) = build_response_message("just an answer".to_string(), true, "stop");
+    fn a_reasoning_block_is_split_out_of_the_answer() {
+        let (message, finish) = build_response_message(
+            "<think>weighing it up</think>The answer is 4.".to_string(),
+            &[],
+            "Qwen3-8B",
+            "stop",
+        );
         assert_eq!(finish, "stop");
-        assert!(message.tool_calls.is_none());
-        assert_eq!(message.content.as_deref(), Some("just an answer"));
+        assert_eq!(message.content.as_deref(), Some("The answer is 4."));
+        assert_eq!(message.reasoning_content.as_deref(), Some("weighing it up"));
+    }
+
+    /// ... and a model with no reasoning format keeps its text intact,
+    /// markers and all.
+    #[test]
+    fn a_non_reasoning_model_keeps_a_literal_marker_in_its_answer() {
+        let (message, _) = build_response_message(
+            "Use the <think> tag like this.".to_string(),
+            &[],
+            "llama-3.1-8b",
+            "stop",
+        );
+        assert_eq!(
+            message.content.as_deref(),
+            Some("Use the <think> tag like this.")
+        );
+        assert!(message.reasoning_content.is_none());
     }
 
     /// Zero-regression proof: an ordinary request with no `tools`/

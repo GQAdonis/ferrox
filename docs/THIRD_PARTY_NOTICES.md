@@ -242,6 +242,61 @@ was read for information architecture and for which libraries a shipped
 product of this kind chooses, and nothing else. Camelid (MIT) was read
 the same way, for feature and layout ideas only.
 
+## FreeToken — edge-native MoE serving policy (`ferrox-edge`)
+
+`crates/ferrox-edge` is a Rust port of the host-side decision logic in
+[FreeToken](https://github.com/FlashML-org/FreeToken), the edge-native
+MoE serving engine described in *FreeToken: Efficient Edge-Native MoE
+Serving with Bandwidth-Adaptive Execution*
+([arXiv:2608.16157](https://arxiv.org/abs/2608.16157), Yang, Fan, Pan,
+Xi, Wang, Sun, Keutzer, Han, Zaharia, Xu and Stoica, 2026). This is a
+real port, not independent design work: the algorithms, the constants,
+the tie-breaking rules and the module boundaries follow FreeToken's
+Python source directly, and each Rust module names the file it came
+from. FreeToken is Apache-2.0 licensed, the same license as ferrox:
+
+  Copyright (c) 2026 FlashML and the FreeToken contributors
+
+What was ported, and from where:
+
+| ferrox-edge module | FreeToken source |
+|---|---|
+| `radix::{tree,plain}` | `python/freetoken/kvcache/radix_cache.py` |
+| `radix::swa` | `python/freetoken/kvcache/swa_radix_cache.py` |
+| `radix::hybrid` | `python/freetoken/kvcache/hybrid_radix_cache.py` |
+| `qstar` | `python/freetoken/moe/bench_profile.py`, the split in `moe/offload_kernels.py` |
+| `expert_cache` | `python/freetoken/moe/offload_cache.py`, `moe/offload_kernels.py` |
+| `pool` | `python/freetoken/engine/cache_budget.py`, `kvcache/hybrid_swa_pool.py`, `kvcache/base.py` |
+| `placement` | `python/freetoken/engine/engine.py` (CPU-layer selection) |
+| `scheduler` | `python/freetoken/scheduler/{prefill,decode,table,status}.py` |
+| `parser::reasoning` | `python/freetoken/server/reasoning_parser.py` |
+| `parser::tool_call` | `python/freetoken/server/function_call_parser.py` |
+| `effort` | `python/freetoken/tokenizer/effort.py`, part of `tokenizer/tokenize.py` |
+| `detokenize` | `python/freetoken/tokenizer/detokenize.py` |
+| `cache_report` | `python/freetoken/cache_report.py` |
+
+FreeToken itself credits SGLang, vLLM, FlashInfer,
+flash-linear-attention, LightLLM and llama.cpp; in particular its radix
+prefix cache follows SGLang's `RadixCache` / `SWARadixCache` design and
+its incremental detokenization borrows the printable-text heuristic from
+SGLang and `transformers`' `TextStreamer`. Those lineages carry through
+this port.
+
+What was **not** ported, and why: everything in FreeToken that computes
+rather than decides. The Triton and CUDA kernels, the C++ CPU MoE
+executor, the FTW weight loader's O_DIRECT/mmap machinery, the pinned
+host-bank allocator and the CUDA-graph capture ordering are all
+torch/CUDA-bound, and ferrox has its own equivalents or its own plans
+for them. `ferrox-edge` is deliberately tensor-free: every module takes
+measured numbers and returns a decision.
+
+Where ferrox already had a mechanism the port would have duplicated, the
+port plugs into it rather than shadowing it — `ferrox-core::kv_block`
+(content-addressed KV blocks), `ferrox-core::expert_store` (the SSD
+expert tier), `ferrox-server::batch_scheduler` (continuous batching),
+`ferrox-server::stop` (which now delegates its withhold rule to
+`ferrox-edge` so there is one implementation of it in the workspace).
+
 ## Design inspiration, not code reuse
 
 The following projects informed ferrox's architecture and are credited

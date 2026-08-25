@@ -31,12 +31,13 @@ comes back the same way.
 | `temperature`, `top_p`, `top_k`, `repetition_penalty`, `seed`, `stop` | Supported |
 | `presence_penalty`, `frequency_penalty` | Supported |
 | `stream` | Supported (overlapped SSE when tools off and CB off) |
-| `tools` / `tool_choice: none\|auto` | Supported (prompt-engineered) |
+| `tools` / `tool_choice: none\|auto` | Supported (prompt-engineered, parsed in nine wire formats) |
 | `tool_choice: required` / named function | **Reject** |
 | `logprobs` / `top_logprobs` / `n` (>1) | **Reject** |
 | `response_format: json_object` | Supported (best-effort mask + validate) |
 | Other `response_format` types | **Reject** |
 | `session_id` | Ferrox extension (server-side history) |
+| `reasoning_content` (response) | Ferrox extension: a reasoning model's chain of thought, split out of `content` |
 
 ### Where a completion stops
 
@@ -550,9 +551,61 @@ throughput, and the server does not know it.
 `--mcp-config PATH` loads server metadata under `ferrox_mcp` in
 `GET /v1/models`. Tool invocation is not wired yet.
 
+## Reasoning content
+
+A checkpoint whose family reasons inside markers (`<think>`, DeepSeek's
+DSML variant, Gemma's channels, MiniMax-M3's namespaced pair, the
+gpt-oss harmony `analysis` channel) has that block split out of
+`content` and returned as `reasoning_content`, on the message and on
+each streamed delta. The split runs *as tokens arrive*, so an
+overlapped SSE stream and a buffered one report the same fields for the
+same request rather than differing by transport.
+
+Which family applies is inferred from the served model's name, which is
+all there is: ferrox carries no per-checkpoint parser declaration. A
+name that implies nothing gets no reasoning parser at all — the right
+answer for a model that does not reason, since an unconditional
+splitter would eat a literal `<think>` written in a code block.
+
+## Tool-call formats
+
+`tools` is still prompt-engineered (there is no grammar-constrained
+decoding here — see the `tool_choice` rejections above), and the
+preamble asks for a Hermes-style
+`<tool_call>{"name": …, "arguments": {…}}</tool_call>`. But a model
+trained on a different format frequently answers in its own, correctly
+and in its own terms. Parsing tries the format the served checkpoint's
+family implies, then the one the preamble asked for:
+
+| Family | Shape |
+|---|---|
+| Hermes / Qwen2.5 | `<tool_call>{"name": …, "arguments": {…}}</tool_call>` |
+| Llama 3 | `<\|python_tag\|>{"name": …, "parameters": {…}}` |
+| Mistral | `[TOOL_CALLS] [{…}]` |
+| Qwen3-Coder | `<function=name><parameter=key>value</parameter></function>` |
+| GLM-4.7 | `<arg_key>k</arg_key><arg_value>v</arg_value>` |
+| DeepSeek | `<｜DSML｜invoke name="…"><｜DSML｜parameter name="…">…` |
+| MiniMax | `<minimax:tool_call><invoke name="…"><parameter name="…">…` |
+| gpt-oss | `<\|channel\|>commentary to=functions.name<\|message\|>{…}<\|call\|>` |
+| Gemma 4 | `<\|tool_call>call:name{k: v}<tool_call\|>` |
+
+Every call in a response is returned, not just the first, with ids
+`call_0`, `call_1`, … — nothing in these formats carries an id, and a
+client correlates by index. A call naming a tool the request never
+offered is dropped rather than forwarded; a namespaced name
+(`skills:read`) is forwarded, because the client is what resolves the
+namespace.
+
+The XML-ish formats state no types, so a parameter's value is typed
+from the tool's own `parameters` schema: a declared `string` is handed
+over verbatim, which is what keeps a zero-padded id like `"018956"`
+from arriving as a number.
+
 ## Not yet
 
 Anthropic streaming/tools/images · full JSON schema / grammar ·
-`tool_choice=required` · dedicated embedding models · multi-GPU / TP / PD.
+`tool_choice=required` · dedicated embedding models · multi-GPU / TP / PD ·
+incremental `tool_calls[].index` argument deltas (calls are emitted
+whole, on completion).
 
 See [`ROADMAP.md`](ROADMAP.md).

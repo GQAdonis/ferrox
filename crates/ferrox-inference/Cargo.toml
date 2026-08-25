@@ -22,6 +22,7 @@ categories = ["science", "algorithms"]
 ferrox-gguf = { workspace = true }
 ferrox-quant = { workspace = true }
 ferrox-core = { workspace = true }
+ferrox-edge = { workspace = true }
 ferrox-moe = { workspace = true }
 ferrox-models = { workspace = true }
 ferrox-safetensors = { workspace = true }

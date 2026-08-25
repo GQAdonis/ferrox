@@ -100,6 +100,37 @@ OpenAI-compatible HTTP API:
 - Anthropic-shaped `POST /v1/messages` (non-stream text)
 - Presence and frequency penalties, best-effort `json_object`
 - Continuous batching and chunked prefill
+- `reasoning_content`: a reasoning model's chain of thought is split
+  out of `content`, streamed as it arrives rather than at the end
+- Tool calls in nine wire formats, not one — the format the served
+  checkpoint's family emits, then the prompt-engineered one — and every
+  call in a response, not the first
+
+## Serving policy (`ferrox-edge`)
+
+A Rust port of the host-side decision logic in
+[FreeToken](https://github.com/FlashML-org/FreeToken)
+([arXiv:2608.16157](https://arxiv.org/abs/2608.16157)): the parts of an
+edge-native MoE engine that *decide* rather than compute. Tensor-free
+and testable without a GPU — each module takes measured numbers and
+returns a decision.
+
+| Module | Decides |
+|---|---|
+| `qstar` | how many of a step's expert-cache misses to fetch over PCIe vs. run on the CPU, from measured bandwidths |
+| `expert_cache` | which experts stay resident, as one global LRU over a flat `(layer, expert)` id space |
+| `radix` | which prefix of a prompt is already computed — page-keyed, node-sharing, with sliding-window and recurrent-state variants |
+| `pool` | how VRAM splits between the expert cache and KV, and how it is re-split live |
+| `placement` | which layers decode on the CPU when the expert banks exceed the host's page-locking budget |
+| `scheduler` | admission, chunked-prefill sizing, and what a chunk reserves |
+| `parser` | where reasoning ends and the answer begins; which tool was called, in which format |
+| `effort` | which reasoning-effort dialect a checkpoint speaks, probed from its own template |
+
+Wired in today: the two parsers (chat completions, streaming and
+buffered) and the stop-string withhold rule, which `ferrox-server`'s
+`StopMatcher` now delegates to so there is one implementation of it.
+The cache and placement policies are complete and tested but are not
+yet driving the decoder — see [`ROADMAP.md`](ROADMAP.md).
 
 Ferrox Studio, the web UI in [`ui/`](../ui), is a separate app that
 talks to this API over HTTP. `ferrox-server` does not serve it.

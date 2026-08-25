@@ -785,14 +785,12 @@ pub(crate) fn earliest_stop_match(text: &str, stops: &[String]) -> Option<usize>
 }
 
 /// The largest char boundary `<= idx`. `str::floor_char_boundary` is
-/// still nightly-only in stable Rust as of this writing; this is the
-/// same walk-backward-to-a-boundary logic on stable.
+/// still nightly-only in stable Rust as of this writing; the
+/// walk-backward-to-a-boundary logic lives in `ferrox-edge`, next to
+/// the byte-length withhold rules that produce the indices it is
+/// applied to.
 pub(crate) fn floor_char_boundary(s: &str, idx: usize) -> usize {
-    let mut i = idx.min(s.len());
-    while i > 0 && !s.is_char_boundary(i) {
-        i -= 1;
-    }
-    i
+    ferrox_edge::floor_char_boundary(s, idx)
 }
 
 #[cfg(test)]

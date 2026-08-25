@@ -149,6 +149,9 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
 use ferrox_core::cache::KvCache;
+use ferrox_edge::{
+    BatchStatus, PoolUsage, PrefillSnapshot, StatusReporter, DEFAULT_DECODE_LOG_INTERVAL,
+};
 use ferrox_models::sampling::Sampler;
 use ferrox_models::tokenizer::StopTokens;
 use ferrox_models::Ceiling;
@@ -950,7 +953,15 @@ fn admit(
     config: &BatcherConfig,
     queue: &QueueGate,
     budget: &BlockBudget,
-) {
+) -> PrefillSnapshot {
+    // Counted HERE, as each prompt is accepted, and not read back off
+    // the live requests afterwards. By the time this tick's forward has
+    // run, every admitted prompt's processed-token count has advanced
+    // to its device length -- so a line built from the live rows would
+    // report `#new-token` as one per request and `#cached-token` as the
+    // whole prompt, which is the upstream test's planted-wrong-values
+    // case exactly.
+    let mut snapshot = PrefillSnapshot::default();
     while let Some(job) = waiting.front() {
         if decoding + prefills.len() >= config.max_seqs {
             break;
@@ -964,13 +975,18 @@ fn admit(
         // back now rather than when it was pulled off the channel.
         queue.release();
         match accept(decoder, job, config.prefill_chunk) {
-            Some(prefill) => prefills.push_back(prefill),
+            Some(prefill) => {
+                snapshot.new_seqs += 1;
+                snapshot.new_tokens += prefill.prompt_tokens;
+                prefills.push_back(prefill);
+            }
             // Rejected at validation (a token outside the vocabulary):
             // it never becomes a row, so nothing else would ever give
             // its reservation back.
             None => budget.release(blocks),
         }
     }
+    snapshot
 }
 
 /// Applies every pending cancellation, at a step boundary, on the
@@ -1054,6 +1070,49 @@ fn apply_aborts(
     }
 }
 
+/// How many decode forwards pass between two status lines.
+///
+/// `FERROX_DECODE_LOG_INTERVAL=0` means "every forward", which the
+/// reporter clamps to one rather than dividing by zero. An unparseable
+/// value takes the default rather than failing a server to start over a
+/// log setting.
+fn decode_log_interval_from_env() -> usize {
+    std::env::var("FERROX_DECODE_LOG_INTERVAL")
+        .ok()
+        .and_then(|raw| raw.parse().ok())
+        .unwrap_or(DEFAULT_DECODE_LOG_INTERVAL)
+}
+
+/// The gauges both status lines carry.
+///
+/// `window` and `recurrent` are `None` and not zero: ferrox serves no
+/// windowed or recurrent model through this batcher, and the reporter
+/// omits a pool it is given `None` for entirely rather than printing a
+/// row of zeros an operator would size against.
+///
+/// With no block budget configured there is no pool to report, so the
+/// KV gauge is an empty one -- `used` and `total` both zero, which
+/// `ratio()` reads as an idle pool rather than a full one.
+fn batch_status(
+    rows: &Rows,
+    prefills: &VecDeque<Prefill>,
+    waiting: &VecDeque<Job>,
+    budget: &BlockBudget,
+) -> BatchStatus {
+    let kv_pages = match budget.total {
+        Some(total) => PoolUsage::from_available(total, budget.free.load(Ordering::Relaxed)),
+        None => PoolUsage::default(),
+    };
+    BatchStatus {
+        running_reqs: rows.len() + prefills.len(),
+        queue_reqs: waiting.len(),
+        kv_pages,
+        page_size: budget.block_size,
+        window: None,
+        recurrent: None,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn worker_loop(
     decoder: Arc<Decoder>,
@@ -1070,6 +1129,14 @@ fn worker_loop(
     let mut waiting: VecDeque<Job> = VecDeque::new();
     // Cancellations that arrived before the job they name.
     let mut carried_aborts: HashSet<AbortId> = HashSet::new();
+    // The operator-facing batch log. `ferrox-edge` holds no clock, so
+    // the clock is here: one `Instant` per worker, read as seconds,
+    // which is all the reporter's throughput arithmetic needs.
+    let started = std::time::Instant::now();
+    let mut reporter = StatusReporter::new(
+        decode_log_interval_from_env(),
+        started.elapsed().as_secs_f64(),
+    );
     loop {
         // Only a completely idle worker blocks: with a prompt still
         // chunking, or a job waiting for capacity that an in-flight row
@@ -1093,7 +1160,7 @@ fn worker_loop(
             &budget,
         );
         rows.flush_finished(&budget);
-        admit(
+        let admitted = admit(
             &decoder,
             &mut waiting,
             &mut prefills,
@@ -1102,6 +1169,13 @@ fn worker_loop(
             &queue,
             &budget,
         );
+        if admitted.new_seqs > 0 {
+            let status = batch_status(&rows, &prefills, &waiting, &budget);
+            tracing::info!(
+                "{}",
+                reporter.report_prefill(started.elapsed().as_secs_f64(), &admitted, &status)
+            );
+        }
         let held = rows.blocks_held() + prefills.iter().map(|p| p.blocks).sum::<usize>();
         counters.peak_blocks.fetch_max(held, Ordering::Relaxed);
         // With nothing in flight the whole budget is free, and a job
@@ -1191,6 +1265,19 @@ fn worker_loop(
                 .collect();
             let logits_batch = decoder.forward_multi_seq(&tokens, &positions, &mut cache_refs);
             counters.decode_steps.fetch_add(1, Ordering::Relaxed);
+            // Every forward counts; only every Nth emits. The silent
+            // ones are exactly what the emitted line's throughput is
+            // measuring, and it measures the gap since the LAST EMITTED
+            // line rather than the whole run -- what an operator reads
+            // a decode log for is a change, and a lifetime mean is the
+            // one statistic that cannot show one.
+            if let Some(line) = reporter.report_decode(
+                started.elapsed().as_secs_f64(),
+                active.len(),
+                &batch_status(&rows, &prefills, &waiting, &budget),
+            ) {
+                tracing::info!("{line}");
+            }
             for (j, &uid) in active.iter().enumerate() {
                 let slot = rows
                     .get_mut(uid)
@@ -2954,5 +3041,87 @@ mod tests {
         assert_eq!(finish, FinishReason::Length);
         assert_eq!(ids, sequential_ids(&decoder, &[4, 5], &greedy_params(6, 3)));
         assert_eq!(batcher.stats().aborted, 0);
+    }
+
+    /// The timing rule the snapshot type exists for, asserted where it
+    /// is actually produced.
+    ///
+    /// `#new-token` must be the prompt tokens this batch is about to
+    /// compute, counted AT ADMISSION. Read back off the live rows after
+    /// the forward, every admitted prompt's processed length has caught
+    /// up to its device length, so the same line would report one token
+    /// per request -- the decode state of a prefill batch -- and a
+    /// prefill log becomes useless for the one thing it is read for.
+    #[test]
+    fn a_prefill_line_counts_the_tokens_the_batch_is_about_to_compute() {
+        let decoder = tiny_decoder();
+        let mut waiting: VecDeque<Job> = VecDeque::new();
+        let mut prefills: VecDeque<Prefill> = VecDeque::new();
+        let queue = QueueGate::new(8);
+        let budget = no_budget();
+        let mut replies = Vec::new();
+
+        for prompt in [vec![1usize, 2, 3, 4], vec![5usize, 6]] {
+            let (tx, rx) = mpsc::channel();
+            replies.push(rx);
+            queue.try_reserve().expect("room in the queue");
+            waiting.push_back(Job {
+                prompt_tokens: prompt.clone(),
+                params: greedy_params(4, 1),
+                stop_tokens: StopTokens::default(),
+                reply: tx,
+                abort: AbortId(0),
+                blocks: 1,
+            });
+        }
+
+        let snapshot = admit(
+            &decoder,
+            &mut waiting,
+            &mut prefills,
+            0,
+            &BatcherConfig::default(),
+            &queue,
+            &budget,
+        );
+        assert_eq!(snapshot.new_seqs, 2);
+        assert_eq!(
+            snapshot.new_tokens, 6,
+            "4 + 2 prompt tokens, not one per request"
+        );
+
+        // And a tick with nothing to admit reports nothing, rather than
+        // an all-zero prefill line on every idle pass.
+        let idle = admit(
+            &decoder,
+            &mut waiting,
+            &mut prefills,
+            0,
+            &BatcherConfig::default(),
+            &queue,
+            &budget,
+        );
+        assert_eq!(idle, PrefillSnapshot::default());
+    }
+
+    /// A pool the deployment does not have is `None`, so the reporter
+    /// omits it entirely. Printed as a row of zeros instead, an
+    /// operator sizes a window pool this server never had.
+    #[test]
+    fn a_status_line_omits_the_pools_this_model_does_not_have() {
+        let rows = Rows::default();
+        let prefills = VecDeque::new();
+        let waiting = VecDeque::new();
+
+        let status = batch_status(&rows, &prefills, &waiting, &budget(16, Some(64)));
+        assert!(status.window.is_none());
+        assert!(status.recurrent.is_none());
+        assert_eq!(status.kv_pages.total, 64);
+        assert_eq!(status.kv_pages.used, 0, "an untouched budget holds nothing");
+
+        // With no block budget at all there is no pool to report, and
+        // an empty gauge reads as idle rather than as full.
+        let status = batch_status(&rows, &prefills, &waiting, &no_budget());
+        assert_eq!(status.kv_pages, PoolUsage::default());
     }
 }

@@ -115,6 +115,11 @@ is groundwork waiting on a consumer:
   re-split (`POST /v1/cache/rebuild`) so VRAM can move between the
   expert cache and KV without a restart
 
+Staged plan, including what the port left behind entirely (semantic
+anchor checkpoints, the cache manager, the window slide) and what a
+CUDA-side parity would actually cost:
+[`plans/freetoken-parity.md`](plans/freetoken-parity.md).
+
 **Engineering practice worth taking from llama.cpp**
 
 - Something equivalent to `test-backend-ops`: every kernel checked

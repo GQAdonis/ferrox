@@ -1,0 +1,18 @@
+[package]
+name = "ferrox-edge"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Edge-native MoE serving policy for Ferrox: bandwidth-adaptive CPU/GPU expert execution, radix prefix cache, elastic pool sizing, and agent-facing output parsers"
+readme = "README.md"
+keywords = ["moe", "llm", "inference", "kv-cache", "ferrox"]
+categories = ["algorithms", "science"]
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[features]
+default = []

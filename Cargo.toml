@@ -5,6 +5,7 @@ members = [
     "crates/ferrox-safetensors",
     "crates/ferrox-quant",
     "crates/ferrox-core",
+    "crates/ferrox-edge",
     "crates/ferrox-moe",
     "crates/ferrox-models",
     "crates/ferrox-cli",
@@ -63,6 +64,7 @@ ferrox-safetensors = { version = "0.11.1", path = "crates/ferrox-safetensors" }
 ferrox-cuda = { version = "0.11.1", path = "crates/ferrox-cuda" }
 ferrox-metal = { version = "0.11.1", path = "crates/ferrox-metal" }
 ferrox-core = { version = "0.11.1", path = "crates/ferrox-core" }
+ferrox-edge = { version = "0.11.1", path = "crates/ferrox-edge" }
 ferrox-moe = { version = "0.11.1", path = "crates/ferrox-moe" }
 ferrox-models = { version = "0.11.1", path = "crates/ferrox-models" }
 ferrox-inference = { version = "0.11.1", path = "crates/ferrox-inference" }

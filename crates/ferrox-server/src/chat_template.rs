@@ -48,7 +48,9 @@
 
 use std::sync::Arc;
 
-use ferrox_edge::{probe_effort_profile, EffortProfile};
+use ferrox_edge::{
+    derive_think_gears, probe_effort_profile, probe_thinking_profile, EffortProfile, ThinkGears,
+};
 use ferrox_models::chat_template::{
     BuiltinTemplate, ChatTemplate as JinjaTemplate, RenderOptions, TemplateError,
 };
@@ -70,7 +72,8 @@ struct Inner {
     end_of_turn: Option<&'static str>,
     bos_token: Option<String>,
     eos_token: Option<String>,
-    efforts: EffortProfile,
+    thinking: ferrox_edge::ThinkingProfile,
+    gears: ThinkGears,
     handles_tools: bool,
 }
 
@@ -134,15 +137,19 @@ impl PromptTemplate {
         eos_token: Option<String>,
     ) -> Self {
         let (bos, eos) = (bos_token.as_deref(), eos_token.as_deref());
-        let efforts = probe_efforts(&template, bos, eos);
+        let thinking = probe_thinking_profile(
+            probe_render(&template, bos, eos),
+            probe_efforts(&template, bos, eos),
+        );
         let handles_tools = probe_tools_consumed(&template, bos, eos);
         Self {
             inner: Arc::new(Inner {
                 end_of_turn: end_of_turn_marker(source),
+                gears: derive_think_gears(&thinking),
                 template,
                 bos_token,
                 eos_token,
-                efforts,
+                thinking,
                 handles_tools,
             }),
         }
@@ -168,7 +175,13 @@ impl PromptTemplate {
     /// The effort vocabulary this checkpoint's template actually grades,
     /// probed at load.
     pub(crate) fn efforts(&self) -> &EffortProfile {
-        &self.inner.efforts
+        &self.inner.thinking.efforts
+    }
+
+    /// The thinking controls to advertise on `/v1/models`, so a client
+    /// picks a gear instead of guessing one.
+    pub(crate) fn think_gears(&self) -> &ThinkGears {
+        &self.inner.gears
     }
 
     /// Render a conversation into a prompt.
@@ -329,20 +342,19 @@ fn probe_tools_consumed(
     }
 }
 
-/// Learn the effort vocabulary by rendering probes through the template.
+/// One render closure over a fixed probe conversation.
 ///
-/// One fixed one-turn conversation, so the only thing that varies
-/// between probes is what the probe itself varies. A template that
-/// rejects the probe shape entirely is reported inert by
-/// [`ferrox_edge::probe_effort_profile`], which is the safe answer:
-/// send no effort at all.
-fn probe_efforts(
-    template: &JinjaTemplate,
-    bos_token: Option<&str>,
-    eos_token: Option<&str>,
-) -> EffortProfile {
+/// Both probes take the same shape -- vary one thing, render, compare
+/// -- so they share the conversation as well as the closure. Fixed, so
+/// the only thing that differs between two renders is the thing the
+/// probe varied.
+fn probe_render<'a>(
+    template: &'a JinjaTemplate,
+    bos_token: Option<&'a str>,
+    eos_token: Option<&'a str>,
+) -> impl FnMut(&Map<String, Value>, Option<&[Value]>) -> Result<String, TemplateError> + 'a {
     let messages = vec![json!({"role": "user", "content": "probe"})];
-    probe_effort_profile(|kwargs, tools| {
+    move |kwargs, tools| {
         let opts = RenderOptions {
             add_generation_prompt: true,
             bos_token: bos_token.map(str::to_string),
@@ -351,7 +363,20 @@ fn probe_efforts(
             extra: kwargs.clone(),
         };
         template.render(&messages, &opts)
-    })
+    }
+}
+
+/// Learn the effort vocabulary by rendering probes through the template.
+///
+/// A template that rejects the probe shape entirely is reported inert
+/// by [`ferrox_edge::probe_effort_profile`], which is the safe answer:
+/// send no effort at all.
+fn probe_efforts(
+    template: &JinjaTemplate,
+    bos_token: Option<&str>,
+    eos_token: Option<&str>,
+) -> EffortProfile {
+    probe_effort_profile(probe_render(template, bos_token, eos_token))
 }
 
 /// The one thing the marker sniffer was still right about: Gemma IT

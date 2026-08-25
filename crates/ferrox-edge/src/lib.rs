@@ -83,7 +83,7 @@ pub use radix::{
 };
 
 pub use effort::{
-    broadcast_effort_spellings, effective_efforts, probe_effort_profile, probe_thinking_profile,
-    quantize_effort, resolve_thinking_mode, sanitize_effort, Effort, EffortMapping, EffortProfile,
-    ThinkingMode, ThinkingProfile, ThinkingState,
+    broadcast_effort_spellings, derive_think_gears, effective_efforts, probe_effort_profile,
+    probe_thinking_profile, quantize_effort, resolve_thinking_mode, sanitize_effort, Effort,
+    EffortMapping, EffortProfile, ThinkGears, ThinkingMode, ThinkingProfile, ThinkingState,
 };

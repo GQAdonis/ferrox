@@ -93,6 +93,15 @@ Three rules are applied to it before rendering:
   `reasoning_strength`; the value is broadcast to both, and a Jinja
   template ignores variables it does not declare.
 
+`GET /v1/models` advertises what came out of that probe:
+`supported_reasoning_efforts` (least thinking first — `off`, `adaptive`,
+then the gears, or a bare `on` when there is a toggle but no ladder) and
+`default_reasoning_effort` (the gear the checkpoint is already in when
+asked for nothing). A checkpoint that says nothing about thinking
+carries **neither field**, rather than an empty list: an empty list
+would read as "asked, and it has no gears", which is a different claim
+from "this is not a reasoning model".
+
 Whether the *tools* are described by the template or by a text preamble
 depends on the template, established at load by rendering it with and
 without a tool rather than by looking for the word: one that really

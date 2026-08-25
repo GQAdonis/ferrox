@@ -527,6 +527,86 @@ pub fn sanitize_effort(
     }
 }
 
+/// What a checkpoint can be *asked for*, as a client would list it.
+///
+/// One flat vocabulary rather than two fields, because a client picking
+/// a control does not care whether "off" is a toggle and "high" is a
+/// gear -- both are things it may send, and sending either is one
+/// string in `reasoning_effort`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ThinkGears {
+    /// In the order a UI would show them: least thinking first.
+    pub supported: Vec<String>,
+    /// Which one the checkpoint is already in when asked for nothing.
+    /// Always a member of `supported`.
+    pub default: Option<String>,
+}
+
+impl ThinkGears {
+    /// A checkpoint that says nothing about thinking. Advertising an
+    /// empty list would claim it was asked and answered "none"; this is
+    /// the difference between "no gears" and "not a reasoning model".
+    pub fn is_empty(&self) -> bool {
+        self.supported.is_empty()
+    }
+}
+
+/// The gears to advertise for one checkpoint, from its probed profile.
+///
+/// The build order is the whole content of this function, and it is
+/// least-thinking-first: `off` if the template can be turned off,
+/// `adaptive` if it has that third state, then the effort ladder
+/// ascending by scale -- or a bare `on` when there is a toggle but no
+/// ladder, since `off` needs a counterpart to be worth offering.
+///
+/// A template with no toggle, no adaptive state, and no graded effort
+/// gets an EMPTY list. It is not a reasoning model with zero gears; it
+/// is a model that was asked and had nothing to say, and a client
+/// should see no such field rather than an empty one.
+///
+/// The default is what the bare render already matches -- `off` or
+/// `adaptive` when the probe found the template sitting in one of them
+/// -- and otherwise the probed effort default. Failing both, `medium`
+/// if it is on offer (the ecosystem's neutral gear) and otherwise the
+/// last gear, because a ladder with no stated default is one whose top
+/// is its normal operating point.
+pub fn derive_think_gears(profile: &ThinkingProfile) -> ThinkGears {
+    let mut supported: Vec<String> = Vec::new();
+    if profile.toggleable {
+        supported.push("off".to_string());
+    }
+    if profile.has_adaptive {
+        supported.push("adaptive".to_string());
+    }
+    let efforts = effective_efforts(&profile.efforts);
+    if !efforts.is_empty() {
+        supported.extend(efforts.iter().map(|e| e.as_str().to_string()));
+    } else if !supported.is_empty() {
+        supported.push("on".to_string());
+    }
+
+    let has = |gear: &str| supported.iter().any(|g| g == gear);
+    let default = match profile.default_state {
+        ThinkingState::Off if has("off") => Some("off".to_string()),
+        ThinkingState::Adaptive if has("adaptive") => Some("adaptive".to_string()),
+        _ => None,
+    }
+    .or_else(|| {
+        profile
+            .efforts
+            .default
+            .map(|e| e.as_str().to_string())
+            .filter(|e| has(e))
+    })
+    .or_else(|| has("medium").then(|| "medium".to_string()))
+    .or_else(|| supported.last().cloned());
+
+    ThinkGears {
+        default: default.filter(|_| !supported.is_empty()),
+        supported,
+    }
+}
+
 /// Broadcast the effort in every spelling the ecosystem's templates
 /// read, the same rule the thinking toggles use: a graded-strength
 /// template reads `reasoning_strength`, and a Jinja template ignores
@@ -819,5 +899,120 @@ mod tests {
         );
         assert!(!p.toggleable);
         assert_eq!(p.default_state, ThinkingState::On);
+    }
+
+    fn thinking(
+        toggleable: bool,
+        has_adaptive: bool,
+        default_state: ThinkingState,
+        efforts: EffortProfile,
+    ) -> ThinkingProfile {
+        ThinkingProfile {
+            efforts,
+            toggleable,
+            has_adaptive,
+            default_state,
+        }
+    }
+
+    /// The build order is the content of the function, so the test is
+    /// an equality on the whole list rather than a membership check.
+    #[test]
+    fn gears_are_built_least_thinking_first() {
+        let gears = derive_think_gears(&thinking(
+            true,
+            true,
+            ThinkingState::Off,
+            profile(&[Effort::Low, Effort::Medium, Effort::High], None),
+        ));
+        assert_eq!(
+            gears.supported,
+            ["off", "adaptive", "low", "medium", "high"]
+        );
+        assert_eq!(gears.default.as_deref(), Some("off"));
+    }
+
+    /// `on` exists only as the counterpart to `off`: a toggle with no
+    /// ladder still needs something to name the other position.
+    #[test]
+    fn a_toggle_with_no_ladder_offers_a_bare_on() {
+        let gears = derive_think_gears(&thinking(
+            true,
+            false,
+            ThinkingState::On,
+            EffortProfile::inert(),
+        ));
+        assert_eq!(gears.supported, ["off", "on"]);
+        assert_eq!(gears.default.as_deref(), Some("on"));
+    }
+
+    /// The distinction the acceptance criterion turns on: a checkpoint
+    /// that says nothing about thinking advertises NOTHING, not an
+    /// empty list, which would read as "asked, and it has no gears".
+    #[test]
+    fn a_checkpoint_that_grades_nothing_advertises_nothing() {
+        let gears = derive_think_gears(&thinking(
+            false,
+            false,
+            ThinkingState::On,
+            EffortProfile::inert(),
+        ));
+        assert!(gears.is_empty());
+        assert_eq!(gears.default, None);
+    }
+
+    #[test]
+    fn the_probed_effort_default_wins_when_the_bare_render_is_thinking() {
+        let gears = derive_think_gears(&thinking(
+            false,
+            false,
+            ThinkingState::On,
+            profile(
+                &[Effort::Low, Effort::Medium, Effort::High],
+                Some(Effort::High),
+            ),
+        ));
+        assert_eq!(gears.supported, ["low", "medium", "high"]);
+        assert_eq!(gears.default.as_deref(), Some("high"));
+    }
+
+    /// No stated default: `medium` when it is on offer, and otherwise
+    /// the top of the ladder.
+    #[test]
+    fn a_ladder_with_no_stated_default_falls_back_to_medium_then_to_its_top() {
+        let with_medium = derive_think_gears(&thinking(
+            false,
+            false,
+            ThinkingState::On,
+            profile(&[Effort::Low, Effort::Medium, Effort::High], None),
+        ));
+        assert_eq!(with_medium.default.as_deref(), Some("medium"));
+
+        let without = derive_think_gears(&thinking(
+            false,
+            false,
+            ThinkingState::On,
+            profile(&[Effort::Low, Effort::XHigh], None),
+        ));
+        assert_eq!(without.default.as_deref(), Some("xhigh"));
+    }
+
+    /// A default that names a gear outside the advertised list would
+    /// be unaskable; the adaptive state is only the default when it is
+    /// actually offered.
+    #[test]
+    fn the_default_is_always_a_member_of_the_advertised_list() {
+        let gears = derive_think_gears(&thinking(
+            false,
+            false,
+            ThinkingState::Adaptive,
+            profile(&[Effort::Low, Effort::Medium], None),
+        ));
+        assert!(!gears.supported.contains(&"adaptive".to_string()));
+        assert_eq!(gears.default.as_deref(), Some("medium"));
+        assert!(gears
+            .default
+            .as_ref()
+            .is_some_and(|d| gears.supported.contains(d)));
     }
 }

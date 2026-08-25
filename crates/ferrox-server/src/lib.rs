@@ -1586,6 +1586,18 @@ async fn list_models(State(state): State<Arc<AppState>>) -> Json<serde_json::Val
         "ferrox_synthetic_weights": active.model.is_synthetic(),
         "ferrox_tokenizer": active.model.tokenizer_kind(),
     });
+    // Which reasoning gears this checkpoint really has, learned by
+    // probing its own template at load. A checkpoint that says nothing
+    // about thinking carries NEITHER field rather than an empty list:
+    // an empty list reads as "asked, and it has no gears", which is a
+    // different claim from "this is not a reasoning model".
+    let gears = active.model.chat_template().think_gears().clone();
+    if !gears.is_empty() {
+        model_entry["supported_reasoning_efforts"] = serde_json::json!(gears.supported);
+        if let Some(default) = gears.default {
+            model_entry["default_reasoning_effort"] = serde_json::json!(default);
+        }
+    }
     if let Some(mcp) = &state.mcp {
         model_entry["ferrox_mcp"] = mcp.models_metadata();
     }
@@ -4072,6 +4084,66 @@ mod tests {
             is_synthetic: true,
             chat_template: chat_template::PromptTemplate::plain(),
         })
+    }
+
+    /// The same model, served through a real checkpoint's template
+    /// rather than the role-labeled builtin -- so a test can ask what
+    /// gets advertised for a checkpoint that actually has gears.
+    fn model_with_template(name: &'static str, source: &str) -> Model {
+        let mut cfg = test_dense_fixture();
+        cfg.name = name;
+        cfg.vocab_size = 256;
+        Model::Gguf(GgufModel {
+            decoder: Arc::new(Decoder::new_random_small(cfg, 2, 256)),
+            tokenizer: Arc::new(ServerTokenizer::Byte),
+            stop_tokens: StopTokens::default(),
+            bos_id: None,
+            is_synthetic: true,
+            chat_template: chat_template::PromptTemplate::from_gguf_metadata(
+                Some(source),
+                Some("qwen3"),
+                false,
+                None,
+                None,
+            ),
+        })
+    }
+
+    /// A client should not have to guess which gears a checkpoint has.
+    #[tokio::test]
+    async fn models_advertises_the_gears_this_checkpoint_actually_has() {
+        let reasoning = "{% if enable_thinking %}<think>{% endif %}\
+             {% if reasoning_effort %}\
+               {% if reasoning_effort not in ['low','medium','high'] %}\
+                 {{ raise_exception('bad effort') }}\
+               {% endif %}[{{ reasoning_effort }}]\
+             {% endif %}{{ messages[0].content }}";
+        let state = Arc::new(test_state(
+            model_with_template("thinker", reasoning),
+            ResponseCache::new(4, Duration::from_secs(60)),
+        ));
+        let app = test_app_with_state(state);
+        let (status, models) = get_json(&app, ferrox_api::routes::V1_MODELS).await;
+        assert_eq!(status, StatusCode::OK);
+        let entry = &models["data"][0];
+        assert_eq!(
+            entry["supported_reasoning_efforts"],
+            serde_json::json!(["off", "low", "medium", "high"])
+        );
+        assert_eq!(entry["default_reasoning_effort"], serde_json::json!("off"));
+    }
+
+    /// The other half of the acceptance criterion: neither field, not
+    /// an empty one. An empty list would say the question was asked and
+    /// the answer was "no gears"; absence says it is not that kind of
+    /// model.
+    #[tokio::test]
+    async fn a_checkpoint_with_no_thinking_controls_advertises_neither_field() {
+        let app = test_app();
+        let (_, models) = get_json(&app, ferrox_api::routes::V1_MODELS).await;
+        let entry = &models["data"][0];
+        assert!(entry.get("supported_reasoning_efforts").is_none());
+        assert!(entry.get("default_reasoning_effort").is_none());
     }
 
     fn active_model(state: &AppState, name: &'static str) -> Arc<ActiveModel> {

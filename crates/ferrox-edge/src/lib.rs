@@ -27,6 +27,8 @@
 //! | [`parser`] | where a model's reasoning ends and its answer begins, and which tool it called |
 //! | [`effort`] | which reasoning-effort dialect this checkpoint speaks |
 //! | [`detokenize`] | what text is safe to stream after one more token |
+//! | [`stats`] | what a server may honestly claim about its own throughput and latency |
+//! | [`maintenance`] | whether a request, a rebuild, or a stop may proceed right now |
 //! | [`cache_report`] | what to show a human about all of the above |
 //!
 //! Where ferrox already had a mechanism the port would have duplicated
@@ -41,12 +43,14 @@ pub mod cache_report;
 pub mod detokenize;
 pub mod effort;
 pub mod expert_cache;
+pub mod maintenance;
 pub mod parser;
 pub mod placement;
 pub mod pool;
 pub mod qstar;
 pub mod radix;
 pub mod scheduler;
+pub mod stats;
 pub mod window_pool;
 
 pub use anchor::{
@@ -71,6 +75,15 @@ pub use qstar::{
 };
 
 pub use window_pool::{WindowPoolExhausted, WindowSlotPool, NO_SLOT};
+
+pub use maintenance::{
+    AdmissionClosed, MaintenanceGate, MaintenanceState, RebuildRefused, SealedAccounting,
+    StopRefused,
+};
+
+pub use stats::{
+    mean_of_present, percentile, LastKnown, RateWindow, RequestRing, RingPage, ServingStats,
+};
 
 pub use scheduler::{
     finish_reason, AdmittedChunk, Capacity, DecodeSet, FinishReason, Geometry, NotAdmitted,

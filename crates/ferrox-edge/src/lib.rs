@@ -121,3 +121,12 @@ pub use effort::{
     probe_thinking_profile, quantize_effort, resolve_thinking_mode, sanitize_effort, Effort,
     EffortMapping, EffortProfile, ThinkGears, ThinkingMode, ThinkingProfile, ThinkingState,
 };
+
+pub use dsv4::{
+    dsv4_auto_cost_model, dsv4_cache_per_page, dsv4_kv_unit_bytes, dsv4_pool_bytes,
+    dsv4_pool_sizes, dsv4_reserved_window_pages, dsv4_solve_num_pages, dsv4_window_floor_pages,
+    dsv4_window_unit_bytes, ring_size_for_ratio, window_ring_position, Dsv4Args, Dsv4AutoCost,
+    Dsv4BudgetTooSmall, Dsv4LayerSizes, Dsv4PoolSizes, Dsv4WindowCtx, Dsv4WindowPool,
+    FreeListAllocator, FreeListExhausted, AUTO_KV_SLACK_BYTES, BF16_BYTES, DEFAULT_WINDOW_PAGE,
+    FP32_BYTES, INT64_BYTES, NO_WINDOW_SLOT,
+};

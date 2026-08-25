@@ -1315,6 +1315,7 @@ pub(crate) async fn responses(
     let stream = req.stream;
 
     let result = async {
+        crate::cache_admin::check_admission(&state)?;
         if req.background {
             return Err(error_response(
                 StatusCode::BAD_REQUEST,

@@ -25,6 +25,12 @@ pub const V1_EMBEDDINGS: &str = "/v1/embeddings";
 /// Anthropic-compatible messages endpoint.
 pub const V1_MESSAGES: &str = "/v1/messages";
 
+/// Anthropic's prompt-sizing endpoint: how many input tokens a request
+/// *would* cost, without generating any. Behind the same key as
+/// [`V1_MESSAGES`], because answering it requires the loaded
+/// checkpoint's own tokenizer and chat template.
+pub const V1_MESSAGES_COUNT_TOKENS: &str = "/v1/messages/count_tokens";
+
 /// Explicit cancellation of one in-flight generation, by the
 /// `request_id` the server states on the first streamed chunk.
 ///
@@ -167,6 +173,7 @@ pub const ALL: &[&str] = &[
     V1_DETOKENIZE,
     V1_EMBEDDINGS,
     V1_MESSAGES,
+    V1_MESSAGES_COUNT_TOKENS,
     V1_CANCEL,
     ADMIN_MODELS,
     ADMIN_MODELS_LOAD,

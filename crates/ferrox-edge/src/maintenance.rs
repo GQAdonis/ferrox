@@ -194,6 +194,23 @@ impl MaintenanceGate {
         }
     }
 
+    /// A gate for an engine whose weights are already resident.
+    ///
+    /// Only for a host that finished its load *before* it built the
+    /// gate: the server constructs its state after the startup
+    /// checkpoint is activated, so starting that gate in `Loading`
+    /// would refuse every request forever, since nothing would ever
+    /// call [`finish_loading`](Self::finish_loading). A host that loads
+    /// after building the gate must use [`new`](Self::new) instead --
+    /// an optimistically-open gate admits requests into weights that
+    /// are not there yet.
+    pub fn serving() -> Self {
+        MaintenanceGate {
+            state: MaintenanceState::Serving,
+            sealed: None,
+        }
+    }
+
     pub fn state(&self) -> MaintenanceState {
         self.state
     }

@@ -66,6 +66,19 @@ impl PrefixCache {
         }
     }
 
+    /// Drops every stored prefix, keeping the capacity and the
+    /// lifetime hit/miss counters.
+    ///
+    /// For a KV-side cache rebuild. A stored prefix names positions in
+    /// an allocation that is about to stop existing, so handing one back
+    /// afterwards would restore another request's state into this one --
+    /// silently, since a KV cache carries no identity of its own. The
+    /// counters survive because they describe what this process has
+    /// served, which a re-split does not undo.
+    pub fn clear(&mut self) {
+        self.entries.clear();
+    }
+
     /// Finds the stored prefix with the longest common leading
     /// subsequence with `tokens`, and returns a ready-to-use clone of
     /// its KV state truncated to exactly that common length (a stored

@@ -40,6 +40,7 @@ mod attribution;
 mod batch_scheduler;
 mod budget;
 mod cache;
+mod cache_admin;
 mod cancel;
 mod chat_template;
 mod generate;
@@ -2468,7 +2469,15 @@ async fn chat_completions(
     let request_id = ferrox_api::next_request_id();
     let stream = req.stream.unwrap_or(false);
 
-    if let Err(err) = req.validate_supported_fields() {
+    // The maintenance gate comes before validation: while the cache is
+    // being resized or the server is draining, the honest answer is
+    // "not now" whichever fields the body carries, and admitting a
+    // request into a pool that is being rebuilt under it is worse than
+    // refusing one that would have 400'd anyway.
+    let refusal = cache_admin::check_admission(&state)
+        .err()
+        .or_else(|| req.validate_supported_fields().err());
+    if let Some(err) = refusal {
         state
             .request_errors_total
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -3342,7 +3351,7 @@ fn build_app_state(
         loading_model: Mutex::new(None),
         last_load_error: Mutex::new(None),
         serving: Mutex::new(ferrox_edge::ServingStats::default()),
-        maintenance: Mutex::new(ferrox_edge::MaintenanceGate::new()),
+        maintenance: Mutex::new(ferrox_edge::MaintenanceGate::serving()),
     }
 }
 
@@ -3953,6 +3962,9 @@ async fn run(mcp_config_path: Option<PathBuf>, exit_on_stdin_close: bool) -> any
         )
         .route(routes::V1_STATS, get(serving_stats))
         .route(routes::V1_REQUESTS, get(recent_requests))
+        .route(routes::V1_CACHE_STATUS, get(cache_admin::cache_status))
+        .route(routes::V1_CACHE_REBUILD, post(cache_admin::cache_rebuild))
+        .route(routes::ADMIN_PREPARE_STOP, post(cache_admin::prepare_stop))
         .route(routes::V1_CHAT_COMPLETIONS, post(chat_completions))
         // Behind the same key as the endpoint that started the work:
         // an unauthenticated caller must not be able to stop someone
@@ -3965,6 +3977,10 @@ async fn run(mcp_config_path: Option<PathBuf>, exit_on_stdin_close: bool) -> any
         .route(&resume_route(routes::V1_STREAM), get(resume::resume))
         .route(&resume_route(routes::V1_STREAM_POLL), get(resume::poll))
         .route(routes::V1_MESSAGES, post(anthropic::messages))
+        .route(
+            routes::V1_MESSAGES_COUNT_TOKENS,
+            post(anthropic::count_tokens),
+        )
         .route(routes::V1_COMPLETIONS, post(openai_extra::completions))
         .route(routes::V1_TOKENIZE, post(openai_extra::tokenize))
         .route(routes::V1_DETOKENIZE, post(openai_extra::detokenize))
@@ -4272,7 +4288,7 @@ mod tests {
             loading_model: Mutex::new(None),
             last_load_error: Mutex::new(None),
             serving: Mutex::new(ferrox_edge::ServingStats::default()),
-            maintenance: Mutex::new(ferrox_edge::MaintenanceGate::new()),
+            maintenance: Mutex::new(ferrox_edge::MaintenanceGate::serving()),
         }
     }
 
@@ -4308,7 +4324,24 @@ mod tests {
             )
             .route(ferrox_api::routes::V1_STATS, get(serving_stats))
             .route(ferrox_api::routes::V1_REQUESTS, get(recent_requests))
+            .route(
+                ferrox_api::routes::V1_CACHE_STATUS,
+                get(cache_admin::cache_status),
+            )
+            .route(
+                ferrox_api::routes::V1_CACHE_REBUILD,
+                post(cache_admin::cache_rebuild),
+            )
+            .route(
+                ferrox_api::routes::ADMIN_PREPARE_STOP,
+                post(cache_admin::prepare_stop),
+            )
             .route("/v1/chat/completions", post(chat_completions))
+            .route(ferrox_api::routes::V1_MESSAGES, post(anthropic::messages))
+            .route(
+                ferrox_api::routes::V1_MESSAGES_COUNT_TOKENS,
+                post(anthropic::count_tokens),
+            )
             .route("/v1/tokenize", post(openai_extra::tokenize))
             .route("/v1/detokenize", post(openai_extra::detokenize))
             .route("/v1/embeddings", post(openai_extra::embeddings))
@@ -5343,6 +5376,99 @@ mod tests {
 
     async fn post_json(app: &Router, body: serde_json::Value) -> serde_json::Value {
         post_json_uri(app, "/v1/chat/completions", body).await.1
+    }
+
+    /// A streamed `/v1/messages` can be cancelled only if the client
+    /// can learn the id, and the Anthropic protocol has no field for
+    /// it -- the `message_start` `msg_...` is a different identifier
+    /// the cancel registry has never seen. So the header carries it,
+    /// on the success path and on the error path alike, because a
+    /// client that logs one id per call should not lose it exactly
+    /// when something went wrong.
+    #[tokio::test]
+    async fn a_messages_response_states_the_id_that_v1_cancel_takes() {
+        use http_body_util::BodyExt;
+        use tower::ServiceExt;
+
+        let app = test_app();
+        let send = |body: serde_json::Value| {
+            let app = app.clone();
+            async move {
+                app.oneshot(
+                    axum::http::Request::builder()
+                        .method("POST")
+                        .uri(ferrox_api::routes::V1_MESSAGES)
+                        .header("content-type", "application/json")
+                        .body(axum::body::Body::from(serde_json::to_vec(&body).unwrap()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+            }
+        };
+
+        let ok = send(serde_json::json!({
+            "model": "test",
+            "max_tokens": 1,
+            "messages": [{"role": "user", "content": "hi"}],
+        }))
+        .await;
+        assert_eq!(ok.status(), StatusCode::OK);
+        let id = ok
+            .headers()
+            .get("request-id")
+            .expect("a served message names its id")
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(!id.is_empty());
+
+        // A rejected body still gets one, and a different one: two calls
+        // must never collide in the ring.
+        let bad = send(serde_json::json!({"model": "test"})).await;
+        assert!(bad.status().is_client_error());
+        let other = bad.headers().get("request-id").expect("errors too");
+        assert_ne!(other.to_str().unwrap(), id);
+        let _ = bad.into_body().collect().await.unwrap();
+    }
+
+    /// The gate is the point of the rebuild endpoint: a request that
+    /// arrives while the KV pool is being re-split must be refused,
+    /// because admitting it would let a decode allocate out of a pool
+    /// whose block count is about to change under it. `503` and not
+    /// `500` -- the caller should retry in a moment, and the body says
+    /// which of the four closed states it hit so a client can tell
+    /// "not yet" from "not ever".
+    #[tokio::test]
+    async fn a_request_that_arrives_mid_rebuild_is_refused_and_admitted_again_after() {
+        let state = Arc::new(test_state(
+            test_model_full_byte_vocab(),
+            ResponseCache::new(1000, Duration::from_secs(3600)),
+        ));
+        let app = test_app_with_state(Arc::clone(&state));
+        let body = serde_json::json!({
+            "model": "test",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 1,
+        });
+
+        state
+            .maintenance
+            .lock()
+            .unwrap()
+            .begin_rebuild()
+            .expect("a fresh server is serving, so the rebuild starts");
+        let (status, refused) = post_json_uri(&app, "/v1/chat/completions", body.clone()).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(refused["error"]["type"], "cache_rebuilding");
+
+        state.maintenance.lock().unwrap().finish_rebuild(true);
+        let (status, _) = post_json_uri(&app, "/v1/chat/completions", body).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "the gate reopens; a rebuild is not a latch"
+        );
     }
 
     /// Cancelling an id that is not generating must not answer `200`.

@@ -460,6 +460,7 @@ pub async fn completions(
     Json(req): Json<CompletionsRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let call = Call::new(&headers);
+    crate::cache_admin::check_admission(&state)?;
     req.validate()?;
     let prompt = req.prompt_text()?.to_string();
     let active = state.require_active()?;

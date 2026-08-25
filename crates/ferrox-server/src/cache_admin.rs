@@ -1,0 +1,509 @@
+//! The elastic cache surface: what the pools are, and moving VRAM
+//! between them without a restart.
+//!
+//! `ferrox-edge` has held the whole policy for a while with nobody to
+//! call it. `pool::CacheReadiness` produces the geometry,
+//! `pool::validate_rebuild` checks a re-split against the floors and the
+//! budget *before* anything is freed, and `maintenance::MaintenanceGate`
+//! decides whether a rebuild may start at all. This module is the three
+//! HTTP endpoints over them, plus the one piece of real mutation ferrox
+//! can do today: re-budgeting the shared KV block pool.
+//!
+//! # Why the order of the checks is the design
+//!
+//! A rebuild is destructive. The whole point of `validate_rebuild` is
+//! that every check is arithmetic and happens up front, so a refused
+//! rebuild leaves the engine serving exactly what it was serving. That
+//! ordering is preserved here and it is the reason the code reads
+//! back-to-front from what you might write first:
+//!
+//! 1. the **gate** (is a rebuild allowed to start?),
+//! 2. the **arithmetic** (does the target fit the floors and budget?),
+//! 3. only then the **pool** (which can still refuse, and says by how
+//!    much).
+//!
+//! Any refusal at any step reopens the gate and changes nothing.
+//!
+//! # What ferrox can actually re-split
+//!
+//! The KV pool, and only the KV pool. The expert cache is sized once at
+//! load from `FERROX_EXPERT_CACHE_BYTES`, and there is no device-side
+//! slot pool to move bytes into -- that is `persistent-gpu-expert-cache`
+//! in `docs/ROADMAP.md`. A request naming `moe` is therefore refused as
+//! a pool this deployment does not have, rather than accepted and
+//! silently ignored: an operator who asks for expert slots and gets a
+//! `200` has been told the split moved when it did not.
+//!
+//! Ported from FreeToken's `server/api_server.py` cache routes and
+//! `server/accounting.py`; see `docs/THIRD_PARTY_NOTICES.md`.
+
+use std::sync::Arc;
+
+use axum::extract::State;
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
+use axum::Json;
+use ferrox_edge::{MaintenanceState, RebuildRefused, StopRefused};
+use serde::Deserialize;
+
+use crate::AppState;
+
+/// `GET /v1/cache/status`.
+///
+/// Reports the geometry a client denominates its sliders in. Everything
+/// it cannot say is **absent** rather than zero -- the rule
+/// `ferrox_edge::cache_report` is built around, because `0.0 GiB` is a
+/// lie and a total that silently omits a pool is worse.
+pub(crate) async fn cache_status(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+    let gate = state
+        .maintenance
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .state();
+    let kv = state.kv_pool.as_ref().map(|cfg| {
+        let pool = cfg.pool.lock().unwrap_or_else(|p| p.into_inner());
+        (pool.total_blocks(), pool.free_blocks(), pool.block_size())
+    });
+    Json(serde_json::json!({
+        "state": gate.as_str(),
+        // `null`, not `{}`: a deployment with no shared KV pool has
+        // every request allocating privately, which is a different
+        // thing from a pool of size zero.
+        "kv": kv.map(|(total, free, page_size)| serde_json::json!({
+            "num_pages": total,
+            "used_pages": total - free,
+            "page_size": page_size,
+            "num_tokens": total * page_size,
+        })),
+        // The pools ferrox does not have. Named so a client can see
+        // they were considered and are absent, rather than guess.
+        "moe": serde_json::Value::Null,
+        "mamba": serde_json::Value::Null,
+        "swa": serde_json::Value::Null,
+        "resizable": kv.is_some().then(|| serde_json::json!(["kv"])),
+    }))
+}
+
+/// What a client may ask a rebuild for.
+///
+/// `kv` is in **tokens**, the unit an operator thinks in, converted to
+/// pages here. Every other pool is accepted only so it can be refused by
+/// name -- see the module doc.
+#[derive(Debug, Deserialize)]
+pub(crate) struct CacheRebuildRequest {
+    #[serde(default)]
+    kv: Option<u64>,
+    #[serde(default)]
+    moe: Option<u64>,
+    #[serde(default)]
+    mamba: Option<u64>,
+    #[serde(default)]
+    swa: Option<u64>,
+}
+
+fn refusal(status: StatusCode, status_word: &str, message: String) -> Response {
+    (
+        status,
+        Json(serde_json::json!({"status": status_word, "error": message})),
+    )
+        .into_response()
+}
+
+/// `POST /v1/cache/rebuild`.
+///
+/// Moves the KV pool's budget on a live engine. Refuses, changing
+/// nothing, when: the engine is not serving; the request names a pool
+/// this deployment does not have; the target is not a positive number of
+/// tokens; or the pool is holding more blocks than the target could
+/// cover.
+///
+/// The last one is the interesting refusal, and it is why this reports
+/// the floor rather than just saying no: shrinking below what is held
+/// cannot be represented, because the caches holding those blocks do not
+/// give them back on request.
+pub(crate) async fn cache_rebuild(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<CacheRebuildRequest>,
+) -> Response {
+    // 1. The gate. A rebuild through a load, another rebuild, or a stop
+    //    is refused before anything is measured.
+    {
+        let mut gate = state.maintenance.lock().unwrap_or_else(|p| p.into_inner());
+        if let Err(why) = gate.begin_rebuild() {
+            let status = match why {
+                RebuildRefused::NotReady | RebuildRefused::Latched => {
+                    StatusCode::SERVICE_UNAVAILABLE
+                }
+                RebuildRefused::Busy(_) => StatusCode::CONFLICT,
+            };
+            let word = match why {
+                RebuildRefused::NotReady => "loading",
+                RebuildRefused::Latched => "failed",
+                RebuildRefused::Busy(_) => "busy",
+            };
+            return refusal(status, word, why.to_string());
+        }
+    }
+
+    // From here every exit reopens the gate. `finish_rebuild(true)`
+    // rather than `rebuild_never_dispatched()`: this engine IS the
+    // scheduler, so there is no in-flight request that might still land
+    // -- the outcome is known the moment this function returns.
+    let reopen = |ok: bool| {
+        state
+            .maintenance
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .finish_rebuild(ok);
+    };
+
+    for (asked, pool) in [(req.moe, "moe"), (req.mamba, "mamba"), (req.swa, "swa")] {
+        if asked.is_some() {
+            reopen(true);
+            return refusal(
+                StatusCode::BAD_REQUEST,
+                "failed",
+                format!(
+                    "this deployment has no {pool} pool to rebuild; see \
+                     GET /v1/cache/status for what it does have"
+                ),
+            );
+        }
+    }
+
+    let Some(kv_tokens) = req.kv else {
+        reopen(true);
+        return refusal(
+            StatusCode::BAD_REQUEST,
+            "failed",
+            "nothing to rebuild: pass `kv` in tokens".to_string(),
+        );
+    };
+
+    let Some(cfg) = state.kv_pool.as_ref() else {
+        reopen(true);
+        return refusal(
+            StatusCode::BAD_REQUEST,
+            "failed",
+            "this deployment has no shared KV pool; every request allocates privately \
+             (set FERROX_KV_POOL_BLOCKS to enable one)"
+                .to_string(),
+        );
+    };
+
+    // 2. The arithmetic, before anything is touched.
+    let mut pool = cfg.pool.lock().unwrap_or_else(|p| p.into_inner());
+    let page_size = pool.block_size() as u64;
+    let pages = kv_tokens / page_size;
+    if pages == 0 {
+        let held = (pool.total_blocks() - pool.free_blocks()) as u64;
+        drop(pool);
+        reopen(true);
+        return refusal(
+            StatusCode::BAD_REQUEST,
+            "failed",
+            format!(
+                "kv={kv_tokens} tokens is below one {page_size}-token page; \
+                 the pool is currently holding {held} page(s)"
+            ),
+        );
+    }
+
+    // 3. The pool, which can still refuse -- and says by how much.
+    let before = pool.total_blocks() as u64;
+    match pool.resize(pages as usize) {
+        Ok(()) => {
+            let after = pool.total_blocks() as u64;
+            drop(pool);
+            // Any KV-side resize invalidates the prefix cache: a cached
+            // prefix names positions in an allocation that has just
+            // stopped existing, and handing one back would serve another
+            // request's state.
+            let invalidated = state.prefix_cache.is_some();
+            if let Some(pc) = &state.prefix_cache {
+                pc.lock().unwrap_or_else(|p| p.into_inner()).clear();
+            }
+            reopen(true);
+            tracing::info!(
+                "cache rebuilt: kv {before} -> {after} pages of {page_size} tokens \
+                 (prefix cache invalidated: {invalidated})"
+            );
+            Json(serde_json::json!({
+                "status": "ok",
+                "kv": {
+                    "num_pages": after,
+                    "page_size": page_size,
+                    "num_tokens": after * page_size,
+                },
+                "prefix_cache_invalidated": invalidated,
+            }))
+            .into_response()
+        }
+        Err(held) => {
+            drop(pool);
+            reopen(true);
+            refusal(
+                StatusCode::CONFLICT,
+                "busy",
+                format!(
+                    "kv={kv_tokens} tokens is {pages} page(s), below the {held} page(s) \
+                     currently held by in-flight requests; the engine is unchanged. \
+                     Retry when they finish, or ask for at least {} tokens",
+                    held as u64 * page_size
+                ),
+            )
+        }
+    }
+}
+
+/// What `prepare-stop` accepts. Both are seconds and both are advisory:
+/// the caller does the waiting, this decides what the waiting *meant*.
+#[derive(Debug, Deserialize)]
+pub(crate) struct PrepareStopRequest {
+    /// Ignored today -- see the handler. Accepted so a supervisor's
+    /// body deserializes rather than 422-ing.
+    #[serde(default)]
+    #[allow(dead_code)]
+    drain_timeout_s: Option<f64>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    abort_timeout_s: Option<f64>,
+}
+
+/// `POST /v1/admin/prepare-stop`.
+///
+/// Closes admission, then seals the token totals -- in that order, and
+/// only once nothing is in flight. A supervisor calls this before it
+/// signals the process, so shutdown cannot race the last sampled token.
+///
+/// Two rules carry the whole thing, both from
+/// `ferrox_edge::MaintenanceGate`:
+///
+/// * **A refusal never reopens admission.** A server that announced it
+///   was stopping, accepted more work, and then sealed totals that do
+///   not include it has produced accounting that is simply false. The
+///   caller is expected to preserve the process and retry.
+/// * **Sealing is idempotent for the life of the process.** A
+///   supervisor whose response was lost retries and gets exactly the
+///   same numbers, not a second and larger snapshot.
+pub(crate) async fn prepare_stop(
+    State(state): State<Arc<AppState>>,
+    body: Option<Json<PrepareStopRequest>>,
+) -> Response {
+    let _ = body;
+    let mut gate = state.maintenance.lock().unwrap_or_else(|p| p.into_inner());
+
+    // Already sealed: hand back the same document. Checked before
+    // `begin_stop` so a retry cannot be refused by a rebuild that
+    // started afterwards.
+    if let Some(sealed) = gate.sealed() {
+        return Json(serde_json::to_value(sealed_json(sealed)).unwrap()).into_response();
+    }
+
+    if let Err(why) = gate.begin_stop() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "error": why.to_string(),
+                "drain_complete": false,
+                "engine_preserved": true,
+            })),
+        )
+            .into_response();
+    }
+
+    // The caller owns the waiting; this reads what is still live. The
+    // cancel registry is the honest count -- it holds exactly the
+    // generations that have started and not finished.
+    let active = state.cancels.live_count();
+    let model_id = state.active_model_name();
+    let uptime = state.uptime().as_secs();
+    let (prompt_total, completion_total) = (
+        state.stats.tokens_prompt_total(),
+        state.stats.tokens_generated_total(),
+    );
+
+    match gate.seal(active, active > 0, || ferrox_edge::SealedAccounting {
+        model_id,
+        prompt_tokens_total: prompt_total,
+        completion_tokens_total: completion_total,
+        uptime_seconds: uptime,
+        drain_complete: true,
+    }) {
+        Ok(sealed) => Json(sealed_json(&sealed)).into_response(),
+        Err(why) => {
+            let engine_preserved = !matches!(why, StopRefused::RebuildInProgress);
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "error": why.to_string(),
+                    "drain_complete": false,
+                    "engine_preserved": engine_preserved,
+                    "active": active,
+                })),
+            )
+                .into_response()
+        }
+    }
+}
+
+fn sealed_json(sealed: &ferrox_edge::SealedAccounting) -> serde_json::Value {
+    serde_json::json!({
+        "model_id": sealed.model_id,
+        "prompt_tokens_total": sealed.prompt_tokens_total,
+        "completion_tokens_total": sealed.completion_tokens_total,
+        "uptime_s": sealed.uptime_seconds,
+        "drain_complete": sealed.drain_complete,
+    })
+}
+
+/// Whether the engine will admit a request right now.
+///
+/// Exposed for the generation handlers: a request that arrives during a
+/// rebuild or a stop must be refused rather than queued into a cache
+/// that is being resized under it.
+pub(crate) fn check_admission(state: &AppState) -> Result<(), crate::ApiError> {
+    let gate = state.maintenance.lock().unwrap_or_else(|p| p.into_inner());
+    gate.check_admission().map_err(|closed| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": {
+                "message": closed.to_string(),
+                "type": match closed.state {
+                    MaintenanceState::Loading => "model_loading",
+                    MaintenanceState::Rebuilding => "cache_rebuilding",
+                    MaintenanceState::Stopping => "server_stopping",
+                    MaintenanceState::Failed => "server_failed",
+                    MaintenanceState::Serving => unreachable!("serving admits"),
+                },
+            }})),
+        )
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ferrox_edge::MaintenanceGate;
+
+    /// A rebuild through a load, another rebuild, or a stop is refused
+    /// before anything is measured -- and each refusal is a DIFFERENT
+    /// status, because `busy` is retryable in a moment, `loading` when
+    /// the model finishes, and `failed` not at all.
+    #[test]
+    fn a_rebuild_is_refused_by_the_gate_before_anything_is_measured() {
+        let mut gate = MaintenanceGate::new();
+        assert_eq!(gate.begin_rebuild(), Err(RebuildRefused::NotReady));
+
+        gate.finish_loading(true);
+        gate.begin_rebuild().expect("the first one starts");
+        assert!(matches!(
+            gate.begin_rebuild(),
+            Err(RebuildRefused::Busy(MaintenanceState::Rebuilding))
+        ));
+
+        gate.finish_rebuild(true);
+        gate.begin_stop().expect("stop starts");
+        assert!(matches!(
+            gate.begin_rebuild(),
+            Err(RebuildRefused::Busy(MaintenanceState::Stopping))
+        ));
+    }
+
+    /// The refusal that matters: shrinking below what in-flight
+    /// requests hold cannot be represented, so the engine is left
+    /// exactly as it was and the caller is told the floor rather than
+    /// having to find it by being rejected again.
+    #[test]
+    fn a_rebuild_below_what_is_held_leaves_the_pool_untouched() {
+        use ferrox_core::cache::{KvBlockPool, KvCache};
+        use std::sync::Mutex;
+
+        let pool = Arc::new(Mutex::new(KvBlockPool::new(16, 64)));
+        let held = KvCache::with_pool(2, 4, Arc::clone(&pool), 64).expect("blocks");
+        let mut p = pool.lock().unwrap();
+        let in_use = p.total_blocks() - p.free_blocks();
+        assert!(in_use > 0);
+
+        assert_eq!(p.resize(in_use - 1), Err(in_use));
+        assert_eq!(p.total_blocks(), 64, "a refused rebuild changes nothing");
+        drop(p);
+        drop(held);
+    }
+
+    /// The whole reason a KV-side rebuild has to invalidate the prefix
+    /// cache: a stored prefix names positions in an allocation that has
+    /// just stopped existing, so handing one back would restore another
+    /// request's state into this one -- silently, since a KV cache
+    /// carries no identity of its own.
+    #[test]
+    fn a_kv_rebuild_drops_every_stored_prefix_but_keeps_the_counters() {
+        use ferrox_core::cache::KvCache;
+        use ferrox_models::PrefixCache;
+
+        // The cache must really hold the three positions the prefix
+        // names; `find_longest_prefix` truncates to the matched length.
+        let mut kv = KvCache::new(2, 4);
+        for _ in 0..3 {
+            kv.push(&[0.0; 8], &[0.0; 8]).expect("unpooled push");
+        }
+        let mut pc = PrefixCache::new(4);
+        pc.store(vec![1, 2, 3], vec![kv], vec![0.0; 8]);
+        assert!(pc.find_longest_prefix(&[1, 2, 3, 4]).matched_len > 0);
+        let hits_before = pc.stats().hits;
+
+        pc.clear();
+        assert_eq!(
+            pc.find_longest_prefix(&[1, 2, 3, 4]).matched_len,
+            0,
+            "nothing may survive a re-split"
+        );
+        assert_eq!(
+            pc.stats().hits,
+            hits_before,
+            "the counters describe what this process served, which a \
+             re-split does not undo"
+        );
+    }
+
+    /// A supervisor whose response was lost retries and must receive
+    /// exactly the same totals, not a second and larger snapshot taken
+    /// after more tokens were served.
+    #[test]
+    fn sealing_a_stop_is_idempotent_for_the_life_of_the_process() {
+        let mut gate = MaintenanceGate::new();
+        gate.finish_loading(true);
+        gate.begin_stop().expect("stop starts");
+
+        let snapshot = |completion| {
+            move || ferrox_edge::SealedAccounting {
+                model_id: Some("m".to_string()),
+                prompt_tokens_total: 10,
+                completion_tokens_total: completion,
+                uptime_seconds: 5,
+                drain_complete: true,
+            }
+        };
+        let first = gate.seal(0, false, snapshot(20)).expect("seals");
+        let again = gate.seal(0, false, snapshot(99_999)).expect("seals again");
+        assert_eq!(first, again, "a retry must not re-measure");
+    }
+
+    /// The rule the barrier exists for. A request that will not
+    /// terminate must not be able to talk the server back into serving,
+    /// and must not be sealed around.
+    #[test]
+    fn a_stop_with_work_still_in_flight_seals_nothing_and_reopens_nothing() {
+        let mut gate = MaintenanceGate::new();
+        gate.finish_loading(true);
+        gate.begin_stop().expect("stop starts");
+
+        let err = gate
+            .seal(2, true, || unreachable!("must not snapshot"))
+            .expect_err("refused");
+        assert_eq!(err, StopRefused::AbortBarrierTimedOut(2));
+        assert_eq!(gate.state(), MaintenanceState::Stopping);
+        assert!(gate.check_admission().is_err());
+        assert!(gate.sealed().is_none());
+    }
+}

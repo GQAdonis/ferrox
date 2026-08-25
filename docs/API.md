@@ -17,10 +17,13 @@ comes back the same way.
 | `POST /v1/tokenize` | Supported |
 | `POST /v1/detokenize` | Supported |
 | `POST /v1/embeddings` | Supported for GGUF Decoder (mean/last pool of hidden states) |
-| `POST /v1/messages` | Anthropic-shaped, non-stream text |
+| `POST /v1/messages` | Anthropic Messages, streaming and buffered |
+| `POST /v1/messages/count_tokens` | Anthropic prompt sizing, no generation |
 | `POST /v1/responses` | OpenAI Responses surface (what `codex` speaks), streaming and buffered |
 | `GET /v1/stats` · `GET /v1/requests` | Live serving telemetry and the request ring |
 | `POST /v1/cancel` | Stop a streamed generation by `request_id` (see below) |
+| `GET /v1/cache/status` · `POST /v1/cache/rebuild` | KV pool geometry and re-split (see below) |
+| `POST /admin/prepare_stop` | Close admission and seal the accounting (see below) |
 | `GET /cache/stats` · `GET /metrics` | Ferrox extensions |
 | `/admin/*` | Control surface (see below) |
 | Audio / images | Not supported |
@@ -531,7 +534,12 @@ mid-prefill, or decoding, and keeps whatever it produced.
 
 The mechanism has one honest edge: the flag is read between decoded
 tokens, so a prefill already inside a forward pass runs to completion.
-`/v1/completions` and `/v1/messages` are buffered and register no id.
+`/v1/completions` is buffered and registers no id. `/v1/messages` does
+register one, but the Anthropic protocol has no field to state it in --
+the `message_start` id is a per-message `msg_...` the cancel registry
+does not know -- so the server puts it in a `request-id` response
+header, spelled as the upstream API spells it. Cancel a streamed
+`/v1/messages` with that value.
 
 ## Streaming behind a proxy
 

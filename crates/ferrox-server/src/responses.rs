@@ -286,15 +286,18 @@ impl Turn {
     /// The turn as the renderer wants it, or `None` for a turn that
     /// held nothing but replayed reasoning.
     ///
-    /// **Reasoning is dropped here**, and it has to be: [`ChatMessage`]
-    /// has no `reasoning_content` slot and `chat_template::message_json`
-    /// emits only `role` / `content` / `tool_calls` / `tool_call_id`, so
-    /// there is nowhere for it to go that is not the visible answer --
-    /// and putting a past chain of thought into `content` would show the
-    /// model its own deliberation as something it *said*. Most reasoning
-    /// templates strip prior thinking out of history anyway. What is
-    /// kept is the half that shapes the conversation: a reasoning item
-    /// still opens its assistant turn.
+    /// A replayed reasoning item becomes
+    /// [`ChatMessage::reasoning_content`], never `content`: putting a
+    /// past chain of thought into the visible answer would show the
+    /// model its own deliberation as something it *said*, which is what
+    /// the family's thinking markers exist to prevent. A template that
+    /// does not know about reasoning simply never reads the key.
+    ///
+    /// A turn that held NOTHING but reasoning still lowers to `None`.
+    /// It has no content and no calls, so there is no message for the
+    /// reasoning to hang off; what is kept is the half that shapes the
+    /// conversation, since a reasoning item still opens its assistant
+    /// turn and the following message merges into it.
     fn lower(self) -> Option<ChatMessage> {
         if !self.has_text() && self.tool_calls.is_empty() && self.reasoning.is_some() {
             return None;
@@ -324,6 +327,7 @@ impl Turn {
             },
             tool_calls: (!tool_calls.is_empty()).then_some(tool_calls),
             tool_call_id: self.tool_call_id,
+            reasoning_content: self.reasoning.filter(|r| !r.is_empty()),
         })
     }
 }
@@ -594,6 +598,7 @@ fn to_chat_request(req: &ResponsesRequest) -> Result<ChatCompletionRequest, ApiE
             content: Some(MessageContent::Text(system_text)),
             tool_calls: None,
             tool_call_id: None,
+            reasoning_content: None,
         });
     }
     messages.extend(turns.into_iter().filter_map(Turn::lower));
@@ -1910,6 +1915,39 @@ mod tests {
         let calls = chat.messages[0].tool_calls.as_ref().expect("both calls");
         assert_eq!(calls.len(), 2);
         assert_eq!(calls[1].function.name, "two");
+    }
+
+    /// A replayed chain of thought survives to the template, and lands
+    /// on `reasoning_content` rather than on `content`.
+    ///
+    /// The distinction is the whole point: codex replays every turn's
+    /// reasoning on the next request, and folding it into `content`
+    /// would show the model its own deliberation as something it said
+    /// out loud -- which is what the family's thinking markers exist to
+    /// prevent. A template that does not know the key simply never
+    /// reads it.
+    #[test]
+    fn a_replayed_reasoning_item_lands_beside_the_answer_and_not_inside_it() {
+        let chat = converted(json!({
+            "model": "m",
+            "input": [
+                {"type": "reasoning", "content": [
+                    {"type": "reasoning_text", "text": "I should look it up."}
+                ]},
+                {"type": "message", "role": "assistant",
+                 "content": [{"type": "output_text", "text": "Let me check."}]},
+            ],
+        }));
+        assert_eq!(chat.messages.len(), 1);
+        assert_eq!(
+            chat.messages[0].reasoning_content.as_deref(),
+            Some("I should look it up.")
+        );
+        assert_eq!(
+            text_of(&chat.messages[0]),
+            "Let me check.",
+            "the visible answer must carry only what the model said"
+        );
     }
 
     /// A reasoning item with nothing recoverable in it (summary-only or

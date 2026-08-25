@@ -888,6 +888,23 @@ pub(crate) struct ChatMessage {
     #[serde(default)]
     #[allow(dead_code)]
     pub(crate) tool_call_id: Option<String>,
+    /// A replayed assistant turn's chain of thought, kept out of
+    /// `content` on the way in and handed back to the template on the
+    /// way out.
+    ///
+    /// It has to be a field of its own rather than prose folded into
+    /// `content`, because a template that knows about reasoning wraps
+    /// it in the family's own markers -- and a template that does not
+    /// must be able to drop it. Concatenating it into `content` would
+    /// show a model its own scratchpad as if it had said it out loud,
+    /// which is exactly what the markers exist to prevent.
+    ///
+    /// Accepted under both spellings clients use: `reasoning_content`
+    /// (the vLLM/DeepSeek convention ferrox emits) and `reasoning`
+    /// (what the OpenAI Responses and Anthropic surfaces call it), so a
+    /// client can replay a turn shaped the way it received it.
+    #[serde(default, alias = "reasoning")]
+    pub(crate) reasoning_content: Option<String>,
 }
 
 impl ChatMessage {
@@ -2265,6 +2282,7 @@ pub(crate) fn prompt_from_messages(
             content: Some(MessageContent::Text(tool_preamble(tools))),
             tool_calls: None,
             tool_call_id: None,
+            reasoning_content: None,
         });
         with_preamble.extend_from_slice(messages);
         template.render(&with_preamble, &[], extra)
@@ -2447,6 +2465,7 @@ fn inject_json_object_system_hint(messages: &mut Vec<ChatMessage>) {
                 content: Some(MessageContent::Text(HINT.to_string())),
                 tool_calls: None,
                 tool_call_id: None,
+                reasoning_content: None,
             },
         );
     }
@@ -2620,6 +2639,7 @@ async fn chat_completions_full(
                 content: Some(MessageContent::Text(content.clone())),
                 tool_calls: None,
                 tool_call_id: None,
+                reasoning_content: None,
             },
         );
     }
@@ -2873,6 +2893,7 @@ async fn chat_completions_stream(
                             content: Some(MessageContent::Text(full_text.clone())),
                             tool_calls: None,
                             tool_call_id: None,
+                            reasoning_content: None,
                         },
                     );
                 }

@@ -46,7 +46,7 @@ comes back the same way.
 | `chat_template_kwargs` | Supported (see [Chat templates](#chat-templates)) |
 | `reasoning_effort` | Supported, quantized onto what the checkpoint grades; `none`/`off` turn thinking off |
 | `thinking: {"type": …}` | Supported (DeepSeek wire): `enabled`/`disabled`, anything else is a 400 |
-| `reasoning_content` (response) | Ferrox extension: a reasoning model's chain of thought, split out of `content` |
+| `reasoning_content` (both ways) | Ferrox extension: a reasoning model's chain of thought, split out of `content` on the way out and replayable on the way in (`reasoning` is accepted as an alias) |
 
 ### Where a completion stops
 
@@ -655,6 +655,24 @@ all there is: ferrox carries no per-checkpoint parser declaration. A
 name that implies nothing gets no reasoning parser at all — the right
 answer for a model that does not reason, since an unconditional
 splitter would eat a literal `<think>` written in a code block.
+
+### Replaying it
+
+`reasoning_content` is accepted on a request's assistant messages, not
+only returned on responses, and `reasoning` is accepted as an alias so a
+turn can be replayed in the shape `/v1/responses` or `/v1/messages`
+handed it back. It is passed to the template on its own key — under
+*both* spellings, since the DeepSeek and GLM lineages iterate
+`message.reasoning_content` while Qwen and gpt-oss read
+`message.reasoning`, and a template treats the key it does not know as
+undefined. An empty string is dropped rather than passed, so a template
+that opens its thinking markers on `if message.reasoning_content` does
+not wrap them around nothing.
+
+It is never folded into `content`. A past chain of thought shown as
+content is something the model believes it said out loud, which is the
+whole reason the family markers exist. A template that knows nothing
+about reasoning ignores the key and renders exactly what it did before.
 
 Whether the block is *already open* is read off the rendered prompt, not
 guessed from the family: a template asked to think can open the block in

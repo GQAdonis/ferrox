@@ -297,8 +297,10 @@ struct ConvertedCall {
 
 /// One conversation turn under construction.
 ///
-/// `reasoning` exists here and nowhere downstream -- see [`Turn::lower`]
-/// for why it cannot survive, and what is kept instead.
+/// `reasoning` is a `thinking` block's text, carried separately from
+/// `content` all the way to [`ChatMessage::reasoning_content`] so a
+/// template that knows the family's thinking markers can wrap it and
+/// one that does not can drop it.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 struct Turn {
     role: String,
@@ -312,16 +314,15 @@ impl Turn {
     /// The turn as the renderer wants it, or `None` for a turn that
     /// held nothing a template can show the model.
     ///
-    /// **Reasoning is dropped here.** The reference maps a `thinking`
-    /// block to `reasoning_content`; [`ChatMessage`] has no such slot
-    /// and `chat_template::message_json` emits only `role` / `content` /
-    /// `tool_calls` / `tool_call_id`, so the only place left for a
-    /// replayed chain of thought is `content` -- which would show the
-    /// model its own past deliberation as something it *said*. Most
-    /// reasoning templates strip prior thinking out of history anyway.
-    /// This is the same trade `responses::Turn::lower` makes, for the
-    /// same reason, and it is the one divergence from the reference's
-    /// content conversion.
+    /// A `thinking` block becomes `reasoning_content`, as the
+    /// reference has it -- never `content`. Folding it into `content`
+    /// would show the model its own past deliberation as something it
+    /// *said*, which is the whole reason the family markers exist.
+    ///
+    /// A turn holding ONLY thinking still lowers to nothing. It has no
+    /// content and no calls, so there is no message for the reasoning
+    /// to hang off, and emitting a contentless turn would show the
+    /// model a blank turn it never took.
     fn lower(self) -> Option<ChatMessage> {
         let has_text = self.content.as_ref().is_some_and(|c| !c.is_empty());
         if !has_text && self.tool_calls.is_empty() && self.tool_call_id.is_none() {
@@ -355,6 +356,7 @@ impl Turn {
             },
             tool_calls: (!tool_calls.is_empty()).then_some(tool_calls),
             tool_call_id: self.tool_call_id,
+            reasoning_content: self.reasoning.filter(|r| !r.is_empty()),
         })
     }
 }
@@ -504,6 +506,7 @@ fn convert_prompt(prompt: &PromptFields) -> Vec<ChatMessage> {
                                 .or_else(|| block.id.clone())
                                 .unwrap_or_default(),
                         ),
+                        reasoning_content: None,
                     });
                 }
                 "tool_result" => {
@@ -546,6 +549,7 @@ fn convert_prompt(prompt: &PromptFields) -> Vec<ChatMessage> {
             content: Some(MessageContent::Text(system)),
             tool_calls: None,
             tool_call_id: None,
+            reasoning_content: None,
         });
     }
     messages.extend(rest);
@@ -2024,12 +2028,13 @@ mod tests {
         assert_eq!(text_of(&prepared.chat.messages[0]), "still here");
     }
 
-    /// A `thinking` block never leaks into `content`. There is nowhere
-    /// for a replayed chain of thought to go (see [`Turn::lower`]), and
-    /// the failure that matters is the wrong one: shown as `content` it
-    /// becomes something the model believes it *said* out loud.
+    /// A `thinking` block reaches the template as `reasoning_content`
+    /// and never as `content`. Claude Code replays the thinking of the
+    /// turn that opened a tool loop, so it has to survive; shown as
+    /// `content` it would become something the model believes it said
+    /// out loud.
     #[test]
-    fn a_thinking_block_does_not_become_visible_content() {
+    fn a_thinking_block_is_replayed_beside_the_answer_and_never_as_content() {
         let prepared = converted(json!({
             "model": "m",
             "max_tokens": 16,
@@ -2039,6 +2044,10 @@ mod tests {
             ]}],
         }));
         assert_eq!(text_of(&prepared.chat.messages[0]), "X.");
+        assert_eq!(
+            prepared.chat.messages[0].reasoning_content.as_deref(),
+            Some("the user probably means X"),
+        );
 
         let thinking_only = converted(json!({
             "model": "m",

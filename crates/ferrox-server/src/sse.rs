@@ -46,9 +46,75 @@
 //! long -- which is not a slow reader, it is a reader that has stopped.
 //! A healthy-but-slow client keeps draining and never approaches it.
 
+use std::convert::Infallible;
 use std::time::Duration;
 
-use tokio::sync::mpsc::Sender;
+use axum::response::sse::Event;
+use futures_util::Stream;
+use serde::Serialize;
+use tokio::sync::mpsc::{Receiver, Sender};
+
+/// Silence after which a keepalive goes out.
+///
+/// 15s, the same interval axum's own default uses and the same one the
+/// Anthropic and Responses streams use, so all three surfaces look
+/// alike to a proxy.
+pub(crate) const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
+
+/// The frame a stream sends when it has nothing to say.
+///
+/// **A data frame, never an SSE comment.** axum's `Sse::keep_alive`
+/// writes `: ping`, which a proxy sees but a client's event handler
+/// never does -- and a client's stream-idle timeout is armed on
+/// received *events*. codex's is 300s and only a data frame resets it,
+/// so a comment-kept stream is torn down and reconnected in the middle
+/// of a long prefill, which is exactly when a keepalive was supposed to
+/// help.
+///
+/// `payload` is whatever that surface's protocol calls a no-op: for
+/// chat completions, a chunk with an empty delta, which a concatenating
+/// client adds nothing from.
+pub(crate) fn keepalive_event<T: Serialize>(payload: &T) -> Event {
+    // Cannot fail for the chunk types this is called with; the fallback
+    // keeps a serialization bug from taking a stream down over a frame
+    // that carries no information anyway.
+    let data = serde_json::to_string(payload).unwrap_or_else(|e| {
+        tracing::error!("failed to serialize a keepalive frame: {e}");
+        "{}".to_string()
+    });
+    Event::default().data(data)
+}
+
+/// The stream, with `keepalive` injected after every `interval` of
+/// silence.
+///
+/// The silence BEFORE the first event counts, which is the point: that
+/// window is the queue wait plus the prefill, and on a long prompt it
+/// is the longest quiet stretch of the whole request. A keepalive that
+/// only started after the first token would miss it entirely.
+///
+/// Keepalives are injected here rather than sent through the channel so
+/// they never reach a `resume::Emitter`: a replayed stream must not
+/// re-deliver keepalives that were only ever about a connection that no
+/// longer exists.
+pub(crate) fn with_keepalive(
+    events: Receiver<Result<Event, Infallible>>,
+    keepalive: Event,
+    interval: Duration,
+) -> impl Stream<Item = Result<Event, Infallible>> {
+    // The receiver rides in the unfold's *state*: a future returned by
+    // the closure may not borrow it.
+    futures_util::stream::unfold(
+        (events, keepalive),
+        move |(mut events, keepalive)| async move {
+            match tokio::time::timeout(interval, events.recv()).await {
+                Err(_elapsed) => Some((Ok(keepalive.clone()), (events, keepalive))),
+                Ok(Some(event)) => Some((event, (events, keepalive))),
+                Ok(None) => None,
+            }
+        },
+    )
+}
 
 /// How long a blocking send waits for room before the stream is
 /// declared orphaned.
@@ -237,5 +303,50 @@ mod tests {
         // Not `set_var`: tests share a process, and this asserts the
         // parse rules rather than the environment.
         assert_eq!(DEFAULT_ORPHAN_TIMEOUT, Duration::from_secs(30));
+    }
+
+    /// The rule the whole thing exists for: silence BEFORE the first
+    /// event counts. That window is the queue wait plus the prefill,
+    /// which on a long prompt is the longest quiet stretch of the
+    /// request -- a keepalive that only armed after the first token
+    /// would miss exactly the case it was added for.
+    #[tokio::test]
+    async fn a_stream_that_has_not_started_still_sends_keepalives() {
+        use futures_util::StreamExt;
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<Event, Infallible>>(4);
+        let keepalive = keepalive_event(&serde_json::json!({"ping": true}));
+        let mut stream = Box::pin(with_keepalive(rx, keepalive, Duration::from_millis(20)));
+
+        // Nothing has been sent, and the stream still produces frames.
+        for _ in 0..2 {
+            assert!(
+                stream.next().await.is_some(),
+                "a quiet stream keeps talking"
+            );
+        }
+
+        tx.send(Ok(Event::default().data("real"))).await.unwrap();
+        assert!(stream.next().await.is_some());
+        drop(tx);
+        assert!(
+            stream.next().await.is_none(),
+            "a closed channel ends the stream rather than keeping it alive forever"
+        );
+    }
+
+    /// A keepalive is a DATA frame. axum's `Sse::keep_alive` writes
+    /// `: ping`, an SSE comment, which a proxy sees but a client's
+    /// event handler never does -- and the timeout being reset is armed
+    /// on received events. This asserts the serialized frame carries a
+    /// `data:` line, which is the whole difference.
+    #[test]
+    fn a_keepalive_carries_data_and_not_a_comment() {
+        let event = keepalive_event(&serde_json::json!({"object": "chat.completion.chunk"}));
+        let wire = format!("{:?}", event);
+        assert!(
+            wire.contains("chat.completion.chunk"),
+            "the payload must be in the frame, not just implied: {wire}"
+        );
     }
 }

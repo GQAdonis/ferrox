@@ -75,7 +75,7 @@ use std::time::Duration;
 use axum::{
     extract::State,
     http::StatusCode,
-    response::sse::{Event, KeepAlive, Sse},
+    response::sse::{Event, Sse},
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
@@ -2749,6 +2749,26 @@ async fn chat_completions_stream(
     let emitter = resume::Emitter::new(slot);
 
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Event, Infallible>>(64);
+    // Built here, where the id and model name are still owned by this
+    // frame: the generation task takes both. Serialized once, because
+    // it is byte-identical every time it goes out.
+    let keepalive = sse::keepalive_event(&ChatCompletionChunk {
+        id: request_id.clone(),
+        request_id: None,
+        object: "chat.completion.chunk",
+        model: model_name.clone(),
+        choices: vec![ChatCompletionChunkChoice {
+            index: 0,
+            delta: ChatCompletionChunkDelta {
+                role: None,
+                content: None,
+                reasoning_content: None,
+                tool_calls: None,
+            },
+            finish_reason: None,
+        }],
+        usage: None,
+    });
 
     tokio::task::spawn_blocking(move || {
         // Held for the whole generation; dropping it is what takes the
@@ -3068,11 +3088,7 @@ async fn chat_completions_stream(
         drop(emitter);
     });
 
-    let stream =
-        futures_util::stream::unfold(
-            rx,
-            |mut rx| async move { rx.recv().await.map(|ev| (ev, rx)) },
-        );
+    let stream = sse::with_keepalive(rx, keepalive, sse::KEEPALIVE_INTERVAL);
     // `X-Accel-Buffering: no` is the one header that actually reaches
     // the problem the plan names: nginx (and the proxies that copied
     // its convention) buffer `text/event-stream` by default, which
@@ -3081,16 +3097,26 @@ async fn chat_completions_stream(
     // from a hung backend. axum already sets `Cache-Control: no-cache`
     // on an `Sse` response, so that half is covered.
     //
-    // The keep-alive comment every 15s is the other half: it gives an
+    // The keepalive every 15s is the other half: it gives an
     // idle-but-healthy stream something to send, so a client's stall
     // timeout measures the *connection* rather than the model's
     // time-to-first-token on a long prompt.
+    //
+    // **Not `Sse::keep_alive`.** axum's keepalive is an SSE COMMENT,
+    // and a comment does not reach a client's event handler -- codex's
+    // 300s stream-idle timeout only resets on a data frame, so a
+    // comment-kept stream is reconnected mid-answer on a long prefill.
+    // `sse::with_keepalive` sends a real `chat.completion.chunk` with
+    // an empty delta instead: a concatenating client adds nothing, and
+    // the transport sees traffic. It also covers the silence BEFORE
+    // the first token, which is exactly the queue-wait and long-prefill
+    // window where this matters most.
     Ok((
         [(
             axum::http::HeaderName::from_static("x-accel-buffering"),
             axum::http::HeaderValue::from_static("no"),
         )],
-        Sse::new(stream).keep_alive(KeepAlive::default()),
+        Sse::new(stream),
     )
         .into_response())
 }

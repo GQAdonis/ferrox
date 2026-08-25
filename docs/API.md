@@ -563,6 +563,31 @@ does not know -- so the server puts it in a `request-id` response
 header, spelled as the upstream API spells it. Cancel a streamed
 `/v1/messages` with that value.
 
+## Keepalives
+
+Every streamed endpoint sends a keepalive after 15 seconds of silence,
+and every one of them is a **data frame**, never an SSE comment. axum's
+own `Sse::keep_alive` writes `: ping`, which a proxy sees but a client's
+event handler never does — and a client's stream-idle timeout is armed
+on received events, so a comment-kept stream gets torn down and
+reconnected in the middle of a long prefill, which is exactly when a
+keepalive was supposed to help.
+
+| Endpoint | Keepalive frame |
+|---|---|
+| `/v1/chat/completions` | a `chat.completion.chunk` with an empty delta |
+| `/v1/stream/{id}` (replay) | an id-less chunk with `choices: []` |
+| `/v1/responses` | `response.in_progress` |
+| `/v1/messages` | `ping` |
+
+The silence *before* the first token counts: that window is the queue
+wait plus the prefill, and on a long prompt it is the longest quiet
+stretch of the request.
+
+A replayed stream never re-delivers keepalives, and the replay
+keepalive carries no `id:`, so it does not enter the sequence a
+`Last-Event-ID` resumes from.
+
 ## Streaming behind a proxy
 
 Streamed completions carry `X-Accel-Buffering: no` beside axum's

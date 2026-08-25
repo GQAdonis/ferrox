@@ -43,9 +43,7 @@ use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
-use ferrox_edge::{
-    Footprint, FootprintKind, MaintenanceState, PoolUsage, RebuildRefused, Receipt, StopRefused,
-};
+use ferrox_edge::{Footprint, MaintenanceState, PoolUsage, RebuildRefused, Receipt, StopRefused};
 use serde::Deserialize;
 
 use crate::AppState;
@@ -270,6 +268,13 @@ pub(crate) fn pool_gauges(state: &AppState) -> serde_json::Value {
 /// engine is using no memory.
 #[cfg(target_os = "linux")]
 fn read_footprint() -> Option<Footprint> {
+    // Imported inside the arm that uses it, not at the top of the
+    // module: `FootprintKind` is named only here, so a module-level
+    // import would be an unused-import error on every other platform --
+    // which is a `-D warnings` build failure that a Linux-only local
+    // check cannot see.
+    use ferrox_edge::FootprintKind;
+
     if let Some(bytes) = std::fs::read_to_string("/proc/self/smaps_rollup")
         .ok()
         .as_deref()

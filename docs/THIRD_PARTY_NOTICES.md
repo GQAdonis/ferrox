@@ -290,6 +290,22 @@ torch/CUDA-bound, and ferrox has its own equivalents or its own plans
 for them. `ferrox-edge` is deliberately tensor-free: every module takes
 measured numbers and returns a decision.
 
+Two *decision*-side pieces are also absent, and are absent because they
+are single-family grammars for checkpoints ferrox does not run, not
+because they were hard:
+
+- **MiniMax-M3's tool-call grammar.** Its reasoning markers and its
+  adaptive leading-closer are ported; its namespaced, recursively
+  nested `]<]minimax[>[<k>…` element grammar for *arguments* is not, so
+  `ToolCallFormat` has no M3 arm. Its reasoning parser is unaffected.
+- **muse-glimmer's ATEM channel format**, on both the reasoning and the
+  tool-call side. It is one vendor's channel protocol with its own
+  header-span and synthetic-terminator rules, and nothing in
+  `docs/MODELS.md` runs it.
+
+Adding either is mechanical: both slot into the same `ReasoningFormat` /
+`ToolCallFormat` tables as the nine families that are here.
+
 Where ferrox already had a mechanism the port would have duplicated, the
 port plugs into it rather than shadowing it — `ferrox-core::kv_block`
 (content-addressed KV blocks), `ferrox-core::expert_store` (the SSD

@@ -489,8 +489,37 @@ impl ToolCallParser {
             self.emitted = open.index + 1;
         }
         let rest = std::mem::take(&mut self.buffer);
-        if !rest.is_empty() && !self.has_tool_call(&rest) {
+        if rest.is_empty() {
+            return events;
+        }
+        if !self.has_tool_call(&rest) {
             events.push(ToolCallEvent::Text(rest));
+            return events;
+        }
+        // Llama 3 and Mistral have no closing marker, so their payload
+        // is only parseable once the stream ends -- this is the only
+        // point at which their calls can be emitted at all. Dropping
+        // the buffer here because it "looks like a call" would lose
+        // every call those two families make.
+        let (text, calls) = self.parse_complete(&rest);
+        if !text.trim().is_empty() {
+            events.push(ToolCallEvent::Text(text));
+        }
+        for call in calls {
+            let index = self.emitted;
+            self.emitted += 1;
+            events.push(ToolCallEvent::CallStart {
+                index,
+                name: call.name,
+            });
+            events.push(ToolCallEvent::CallArguments {
+                index,
+                fragment: call.arguments.clone(),
+            });
+            events.push(ToolCallEvent::CallEnd {
+                index,
+                arguments: call.arguments,
+            });
         }
         events
     }
@@ -498,8 +527,18 @@ impl ToolCallParser {
     /// Looking for the start of a call. Returns whether it made
     /// progress.
     fn step_idle(&mut self, events: &mut Vec<ToolCallEvent>) -> bool {
-        let open_marker = self.markers.open;
-        match self.buffer.find(open_marker) {
+        // A model does not always wrap its call in the block marker its
+        // template shows -- Qwen3-Coder in particular often emits a
+        // bare `<function=…>`. The invoke tag opens a call just as
+        // definitively, so whichever comes first counts.
+        let opener = match self.markers.invoke {
+            Some(invoke) => [self.markers.open, invoke.open]
+                .iter()
+                .filter_map(|marker| self.buffer.find(marker))
+                .min(),
+            None => self.buffer.find(self.markers.open),
+        };
+        match opener {
             Some(index) => {
                 if index > 0 {
                     let text: String = self.buffer.drain(..index).collect();
@@ -1567,6 +1606,62 @@ mod tests {
         let calls = calls_of(&events);
         assert_eq!(calls.len(), 1);
         serde_json::from_str::<Value>(&calls[0].2).expect("valid JSON despite truncation");
+    }
+
+    /// Llama 3 and Mistral have no closing marker, so the end of the
+    /// stream is the only place their calls can be recognized. A parser
+    /// that dropped its buffer there because it "looked like a call"
+    /// would lose every call those two families make.
+    #[test]
+    fn a_format_with_no_closing_marker_still_emits_at_the_end() {
+        for (format, wire) in [
+            (
+                ToolCallFormat::Llama3,
+                "<|python_tag|>{\"name\": \"get_weather\", \"parameters\": {\"city\": \"Rome\"}}",
+            ),
+            (
+                ToolCallFormat::Mistral,
+                "[TOOL_CALLS] [{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Rome\"}}]",
+            ),
+        ] {
+            let mut parser = parser(format);
+            let events = stream(&mut parser, wire, 6);
+            let calls = calls_of(&events);
+            assert_eq!(calls.len(), 1, "{format:?}: {events:?}");
+            assert_eq!(calls[0].1, "get_weather", "{format:?}");
+            assert_eq!(calls[0].2, r#"{"city":"Rome"}"#, "{format:?}");
+        }
+    }
+
+    /// Qwen3-Coder often emits a bare `<function=…>` without the
+    /// `<tool_call>` wrapper its template shows. The invoke tag opens a
+    /// call just as definitively.
+    #[test]
+    fn an_unwrapped_invoke_tag_still_opens_a_call() {
+        let wire = "sure: <function=get_weather><parameter=city>\nRome\n</parameter></function>";
+        let mut streamed = parser(ToolCallFormat::Qwen3Coder);
+        // Push everything but do NOT finish: the call must be
+        // recognized while the stream is running, not salvaged from the
+        // buffer at the end.
+        let mut events = Vec::new();
+        for chunk in wire.chars().collect::<Vec<_>>().chunks(5) {
+            events.extend(streamed.push(&chunk.iter().collect::<String>()));
+        }
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, ToolCallEvent::CallStart { .. })),
+            "the call must open mid-stream: {events:?}"
+        );
+        events.extend(streamed.finish());
+        let calls = calls_of(&events);
+        assert_eq!(calls.len(), 1, "{events:?}");
+        assert_eq!(calls[0].2, r#"{"city":"Rome"}"#);
+        assert_eq!(text_of(&events), "sure: ");
+
+        let (_, complete) = parser(ToolCallFormat::Qwen3Coder).parse_complete(wire);
+        assert_eq!(complete.len(), 1);
+        assert_eq!(complete[0].arguments, r#"{"city":"Rome"}"#);
     }
 
     #[test]

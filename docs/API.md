@@ -702,6 +702,20 @@ from the tool's own `parameters` schema: a declared `string` is handed
 over verbatim, which is what keeps a zero-padded id like `"018956"`
 from arriving as a number.
 
+## Legacy completions
+
+`/v1/completions` honours `stop`, `max_tokens` (default 16 — the legacy
+floor is right *here*, where a caller completing a fragment usually
+wants a fragment back), `temperature`, `top_p` and `seed`.
+
+Everything it does not implement is refused **by name** rather than
+dropped: token-id prompts (`[int]` / `[[int]]`), `logprobs`, `echo`,
+`suffix`, `logit_bias`, and any `response_format` other than
+`{"type": "text"}`. Serde drops an undeclared field silently, and a
+caller cannot tell that apart from having had it honoured — which for
+`stop` in particular means believing generation will halt at a sentinel
+and instead getting the full budget of text past it.
+
 ## Not yet
 
 Anthropic streaming/tools/images · full JSON schema / grammar ·

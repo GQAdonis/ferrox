@@ -118,7 +118,15 @@ pub(crate) struct EmbeddingsRequest {
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct CompletionsRequest {
-    prompt: String,
+    /// Accepted as a `Value` rather than a `String` so a token-id prompt
+    /// -- `[int]` or `[[int]]`, which OpenAI allows and this server does
+    /// not implement -- is REFUSED BY NAME rather than dying as a serde
+    /// type error the caller has to guess at.
+    prompt: serde_json::Value,
+    /// The legacy 16 is right *here*, and only here: a caller asking to
+    /// complete a fragment usually wants a fragment back. The chat and
+    /// Responses surfaces deliberately keep it out (see
+    /// `DEFAULT_CHAT_MAX_TOKENS`).
     #[serde(default = "default_max_tokens")]
     max_tokens: usize,
     #[serde(default)]
@@ -129,6 +137,85 @@ pub(crate) struct CompletionsRequest {
     top_p: Option<f32>,
     #[serde(default)]
     seed: Option<u64>,
+    /// Honoured. Silently dropping this is the dangerous one: the caller
+    /// believes generation halts at their sentinel and instead gets the
+    /// full budget of text past it.
+    #[serde(default)]
+    stop: Option<StopParam>,
+    // Fields this server does not implement. Deserialized ONLY so they
+    // can be refused by name -- serde would otherwise drop each one
+    // silently, which is indistinguishable from having honoured it.
+    #[serde(default)]
+    logprobs: Option<serde_json::Value>,
+    #[serde(default)]
+    echo: Option<bool>,
+    #[serde(default)]
+    suffix: Option<String>,
+    #[serde(default)]
+    logit_bias: Option<serde_json::Value>,
+    #[serde(default)]
+    response_format: Option<serde_json::Value>,
+}
+
+/// `stop` as OpenAI sends it: one string or a list of them.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+pub(crate) enum StopParam {
+    One(String),
+    Many(Vec<String>),
+}
+
+impl CompletionsRequest {
+    /// The prompt text, or a named refusal.
+    ///
+    /// A token-id prompt is a real OpenAI shape and a real thing this
+    /// server cannot serve; saying so beats a deserialization error, and
+    /// beats silently treating `[1,2,3]` as the string it is not.
+    fn prompt_text(&self) -> Result<&str, ApiError> {
+        match &self.prompt {
+            serde_json::Value::String(s) => Ok(s),
+            serde_json::Value::Array(_) => Err(crate::unsupported_feature(
+                "token-id prompts are not implemented; send `prompt` as a string",
+            )),
+            _ => Err(crate::invalid_request("prompt must be a string", "prompt")),
+        }
+    }
+
+    fn stop_sequences(&self) -> Vec<String> {
+        match &self.stop {
+            Some(StopParam::One(s)) => vec![s.clone()],
+            Some(StopParam::Many(v)) => v.clone(),
+            None => Vec::new(),
+        }
+    }
+
+    /// Refuse what this server does not implement, by name.
+    fn validate(&self) -> Result<(), ApiError> {
+        let unsupported = [
+            (self.logprobs.is_some(), "logprobs"),
+            (self.echo == Some(true), "echo"),
+            (self.suffix.is_some(), "suffix"),
+            (self.logit_bias.is_some(), "logit_bias"),
+        ];
+        for (present, name) in unsupported {
+            if present {
+                return Err(crate::unsupported_feature(&format!(
+                    "`{name}` is not implemented on /v1/completions (see docs/API.md)"
+                )));
+            }
+        }
+        // `{"type": "text"}` is the default and means nothing to refuse.
+        if let Some(fmt) = &self.response_format {
+            let kind = fmt.get("type").and_then(|v| v.as_str());
+            if kind != Some("text") {
+                return Err(crate::unsupported_feature(
+                    "only `response_format: {\"type\": \"text\"}` is implemented on \
+                     /v1/completions (see docs/API.md)",
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 
 fn default_max_tokens() -> usize {
@@ -373,6 +460,8 @@ pub async fn completions(
     Json(req): Json<CompletionsRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let call = Call::new(&headers);
+    req.validate()?;
+    let prompt = req.prompt_text()?.to_string();
     let active = state.require_active()?;
     let params = GenerationParams {
         max_tokens: req.max_tokens,
@@ -385,7 +474,7 @@ pub async fn completions(
             frequency_penalty: 0.0,
         },
         seed: req.seed.unwrap_or(0),
-        stop: Vec::new(),
+        stop: req.stop_sequences(),
         json_object: false,
         // `/v1/completions` is buffered rather than streamed here, so
         // there is no first chunk on which to state a request id and
@@ -398,7 +487,6 @@ pub async fn completions(
     let prefix_cache = state.prefix_cache.clone();
     let batcher = active.batcher.clone();
     let ceiling = active.ceiling.clone();
-    let prompt = req.prompt;
 
     let (chunks, finish, usage) = tokio::task::spawn_blocking(move || {
         run_generation(
@@ -444,4 +532,90 @@ pub async fn completions(
         }],
         "usage": usage,
     })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn request(value: serde_json::Value) -> CompletionsRequest {
+        serde_json::from_value(value).expect("request")
+    }
+
+    /// The dangerous silent drop. A caller who sets `stop` believes
+    /// generation halts at their sentinel; dropping it hands them the
+    /// full budget of text past it instead.
+    #[test]
+    fn a_completion_stop_string_reaches_the_generation_params() {
+        let one = request(serde_json::json!({"prompt": "hi", "stop": "END"}));
+        assert_eq!(one.stop_sequences(), vec!["END".to_string()]);
+
+        let many = request(serde_json::json!({"prompt": "hi", "stop": ["A", "B"]}));
+        assert_eq!(
+            many.stop_sequences(),
+            vec!["A".to_string(), "B".to_string()]
+        );
+
+        let none = request(serde_json::json!({"prompt": "hi"}));
+        assert!(none.stop_sequences().is_empty());
+    }
+
+    /// Each of these is a real OpenAI field this server does not
+    /// implement. Serde drops an undeclared field silently, which a
+    /// caller cannot tell apart from having had it honoured -- so each
+    /// is declared purely in order to be refused BY NAME.
+    #[test]
+    fn every_unimplemented_completion_field_is_refused_by_name() {
+        for (field, value) in [
+            ("logprobs", serde_json::json!(5)),
+            ("echo", serde_json::json!(true)),
+            ("suffix", serde_json::json!("tail")),
+            ("logit_bias", serde_json::json!({"5": -100})),
+        ] {
+            let mut body = serde_json::json!({"prompt": "hi"});
+            body[field] = value;
+            let (status, payload) = request(body)
+                .validate()
+                .expect_err(&format!("`{field}` must be refused"));
+            assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
+            assert!(
+                payload["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains(field),
+                "the refusal must name `{field}`"
+            );
+        }
+    }
+
+    /// `{"type": "text"}` is the default and means nothing to refuse;
+    /// anything else is a promise this endpoint cannot keep.
+    #[test]
+    fn only_the_text_response_format_is_accepted() {
+        let text =
+            request(serde_json::json!({"prompt": "hi", "response_format": {"type": "text"}}));
+        assert!(text.validate().is_ok());
+
+        let json = request(
+            serde_json::json!({"prompt": "hi", "response_format": {"type": "json_object"}}),
+        );
+        assert!(json.validate().is_err());
+    }
+
+    /// A token-id prompt is a real OpenAI shape. Saying so beats a
+    /// deserialization error the caller has to guess at, and beats
+    /// treating `[1,2,3]` as a string it is not.
+    #[test]
+    fn a_token_id_prompt_is_refused_by_name_rather_than_mis_parsed() {
+        let ids = request(serde_json::json!({"prompt": [1, 2, 3]}));
+        let (status, payload) = ids.prompt_text().expect_err("refused");
+        assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
+        assert!(payload["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("token-id"));
+
+        let text = request(serde_json::json!({"prompt": "hi"}));
+        assert_eq!(text.prompt_text().expect("a string prompt"), "hi");
+    }
 }

@@ -51,7 +51,7 @@ pub fn run_chat(args: ChatArgs) -> Result<()> {
     if !(200..300).contains(&health.status) {
         anyhow::bail!("server /health returned HTTP {}", health.status);
     }
-    eprintln!("ferrox chat → {base}  (quit with /quit or Ctrl-D)");
+    eprintln!("ferrox chat → {base}  (/help for commands, /quit to leave)");
     if let Some(sys) = &args.system {
         eprintln!("system: {sys}");
     }
@@ -60,6 +60,14 @@ pub fn run_chat(args: ChatArgs) -> Result<()> {
     if let Some(sys) = &args.system {
         messages.push(json!({"role": "system", "content": sys}));
     }
+
+    // The gears the SERVER advertises, read once at connect. Not a
+    // hardcoded list: which efforts exist is a property of the served
+    // checkpoint's own template, probed at load, so a client that
+    // guesses offers gears the model does not grade -- and hides ones
+    // it does. An older server that advertises none simply has no
+    // `/think`.
+    let mut gears = ThinkGears::fetch(base).unwrap_or_default();
 
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout();
@@ -87,9 +95,43 @@ pub fn run_chat(args: ChatArgs) -> Result<()> {
             eprintln!("(history cleared)");
             continue;
         }
+        if line == "/help" {
+            eprint!("{HELP}");
+            continue;
+        }
+        if line == "/stats" {
+            match http_get(&format!("{base}/v1/stats")) {
+                Ok(resp) => match serde_json::from_slice::<Value>(&resp.body) {
+                    Ok(v) => eprintln!("{}", render_stats(&v)),
+                    Err(e) => eprintln!("(could not read /v1/stats: {e})"),
+                },
+                Err(e) => eprintln!("(could not reach /v1/stats: {e:#})"),
+            }
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("/think") {
+            let rest = rest.trim();
+            match gears.select(rest) {
+                Ok(chosen) => eprintln!("(thinking: {chosen})"),
+                Err(why) => eprintln!("({why})"),
+            }
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("/cache") {
+            let rest = rest.trim();
+            eprintln!("{}", cache_command(base, rest));
+            continue;
+        }
+        if line.starts_with('/') {
+            // A mistyped command must not be sent to the model as a
+            // prompt: the answer would be a plausible-looking
+            // hallucination about a command that does not exist.
+            eprintln!("(unknown command {line}; /help lists them)");
+            continue;
+        }
 
         messages.push(json!({"role": "user", "content": line}));
-        let body = json!({
+        let mut body = json!({
             "model": args.model,
             "messages": messages,
             "max_tokens": args.max_tokens,
@@ -97,6 +139,13 @@ pub fn run_chat(args: ChatArgs) -> Result<()> {
             "top_p": args.top_p,
             "stream": stream,
         });
+        // Only when a gear is actually selected: an absent key lets the
+        // checkpoint's own template default apply, which is not the
+        // same as sending the default explicitly -- a template may
+        // treat "unset" and "set to its default" differently.
+        if let Some(kwargs) = gears.selected_kwargs() {
+            body["chat_template_kwargs"] = kwargs;
+        }
 
         let reply = if stream {
             print_streamed_completion(base, &body, &mut stdout)?
@@ -110,6 +159,208 @@ pub fn run_chat(args: ChatArgs) -> Result<()> {
         messages.push(json!({"role": "assistant", "content": reply}));
     }
     Ok(())
+}
+
+/// What `/help` prints.
+const HELP: &str = "\
+  /help            this list
+  /clear           forget the conversation (keeps --system)
+  /stats           what the server is doing right now
+  /think [gear]    cycle, or set, the server's advertised thinking gear
+  /cache [tokens]  show the KV pool, or resize it to N tokens
+  /quit            leave
+";
+
+/// The thinking gears the SERVER advertises, and which one is selected.
+///
+/// Read from `/v1/models` rather than hardcoded, because which efforts
+/// exist is a property of the served checkpoint's own template --
+/// probed at load, not guessable. A client with a fixed list offers
+/// gears the model does not grade and hides ones it does.
+#[derive(Debug, Default)]
+struct ThinkGears {
+    supported: Vec<String>,
+    /// Per-gear `chat_template_kwargs`, as the server derived them.
+    /// Sent verbatim: the client's job is to pick a gear, not to know
+    /// what selecting it means on this family.
+    kwargs: std::collections::BTreeMap<String, Value>,
+    selected: Option<String>,
+}
+
+impl ThinkGears {
+    fn fetch(base: &str) -> Result<Self> {
+        let resp = http_get(&format!("{base}/v1/models"))?;
+        let body: Value = serde_json::from_slice(&resp.body).context("parse /v1/models")?;
+        Ok(Self::from_models(&body))
+    }
+
+    fn from_models(body: &Value) -> Self {
+        let first = body.pointer("/data/0").cloned().unwrap_or(Value::Null);
+        let supported: Vec<String> = first
+            .get("supported_reasoning_efforts")
+            .and_then(Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let kwargs = first
+            .get("reasoning_effort_kwargs")
+            .and_then(Value::as_object)
+            .map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+            .unwrap_or_default();
+        ThinkGears {
+            supported,
+            kwargs,
+            selected: None,
+        }
+    }
+
+    /// `/think` with no argument cycles; with one, sets that gear.
+    ///
+    /// Cycling starts from the FIRST gear rather than from the server's
+    /// default, so the first press is deterministic whatever the
+    /// checkpoint defaults to -- a user pressing it twice on two
+    /// different models gets the same two gears both times.
+    fn select(&mut self, want: &str) -> std::result::Result<String, String> {
+        if self.supported.is_empty() {
+            return Err("this server advertises no thinking gears".to_string());
+        }
+        let next = if want.is_empty() {
+            let at = self
+                .selected
+                .as_ref()
+                .and_then(|s| self.supported.iter().position(|g| g == s));
+            match at {
+                Some(i) => self.supported[(i + 1) % self.supported.len()].clone(),
+                None => self.supported[0].clone(),
+            }
+        } else if self.supported.iter().any(|g| g == want) {
+            want.to_string()
+        } else {
+            return Err(format!(
+                "no gear {want:?}; this server has {}",
+                self.supported.join(", ")
+            ));
+        };
+        self.selected = Some(next.clone());
+        Ok(next)
+    }
+
+    /// The kwargs for the selected gear, or `None` when nothing is
+    /// selected.
+    ///
+    /// `None` and not an empty object: an absent key lets the
+    /// checkpoint's template apply its own default, which a template
+    /// may treat differently from being handed that default
+    /// explicitly.
+    fn selected_kwargs(&self) -> Option<Value> {
+        let gear = self.selected.as_ref()?;
+        // A gear with EMPTY kwargs is a real answer -- an
+        // always-thinking family advertises one gear with nothing to
+        // send -- so it is passed through rather than skipped.
+        self.kwargs.get(gear).cloned()
+    }
+}
+
+/// `/stats`, as one line per section.
+///
+/// A figure the server reported as `null` prints as `-`, never as `0`:
+/// a p95 of zero would read as an instantaneous server and a memory
+/// figure of zero as an idle one, and both are the shapes `/v1/stats`
+/// deliberately avoids emitting.
+fn render_stats(v: &Value) -> String {
+    let num = |p: &str| -> String {
+        match v.pointer(p) {
+            Some(Value::Number(n)) => format!("{n}"),
+            _ => "-".to_string(),
+        }
+    };
+    let mut out = format!(
+        "  model    {}  ({})\n",
+        v.get("model").and_then(Value::as_str).unwrap_or("none"),
+        v.get("state").and_then(Value::as_str).unwrap_or("?"),
+    );
+    out.push_str(&format!(
+        "  tokens   decode {} tok/s   prefill {} tok/s\n",
+        num("/throughput/decode_tps"),
+        num("/throughput/prefill_tps"),
+    ));
+    out.push_str(&format!(
+        "  requests {} active   {} done   p95 {} ms   ttft {} ms\n",
+        num("/requests/active"),
+        num("/requests/completed"),
+        num("/requests/p95_ms"),
+        num("/requests/ttft_mean_ms"),
+    ));
+    match v.pointer("/pools/kv_pages") {
+        Some(kv) if !kv.is_null() => out.push_str(&format!(
+            "  kv pool  {}/{} pages of {} tokens\n",
+            kv.get("used").and_then(Value::as_u64).unwrap_or(0),
+            kv.get("total").and_then(Value::as_u64).unwrap_or(0),
+            kv.get("page_size").and_then(Value::as_u64).unwrap_or(0),
+        )),
+        // Absent, not zero: this deployment allocates privately per
+        // request, which is a different thing from an empty pool.
+        _ => out.push_str("  kv pool  none (every request allocates privately)\n"),
+    }
+    if let Some(mem) = v.get("memory").filter(|m| !m.is_null()) {
+        out.push_str(&format!(
+            "  memory   {:.2} GiB ({})\n",
+            mem.get("bytes").and_then(Value::as_u64).unwrap_or(0) as f64 / (1 << 30) as f64,
+            mem.get("kind").and_then(Value::as_str).unwrap_or("?"),
+        ));
+    }
+    out.trim_end().to_string()
+}
+
+/// `/cache` with no argument shows the pool; with one, resizes it.
+fn cache_command(base: &str, arg: &str) -> String {
+    if arg.is_empty() {
+        return match http_get(&format!("{base}/v1/cache/status")) {
+            Ok(resp) => match serde_json::from_slice::<Value>(&resp.body) {
+                Ok(v) => render_cache_status(&v),
+                Err(e) => format!("(could not read /v1/cache/status: {e})"),
+            },
+            Err(e) => format!("(could not reach /v1/cache/status: {e:#})"),
+        };
+    }
+    let Ok(tokens) = arg.parse::<u64>() else {
+        return format!("(/cache takes a token count, not {arg:?})");
+    };
+    let body = json!({"kv": tokens});
+    let bytes = match serde_json::to_vec(&body) {
+        Ok(b) => b,
+        Err(e) => return format!("(could not encode the request: {e})"),
+    };
+    match http_exchange("POST", &format!("{base}/v1/cache/rebuild"), Some(&bytes)) {
+        Ok(resp) => {
+            let v: Value = serde_json::from_slice(&resp.body).unwrap_or(Value::Null);
+            // The server's own refusal text, verbatim: it names the
+            // floor a shrink has to clear, which is the one thing a
+            // user needs in order to retry with a number that works.
+            match v.get("error").and_then(Value::as_str) {
+                Some(err) => format!("(refused: {err})"),
+                None => render_cache_status(&json!({"kv": v.get("kv")})),
+            }
+        }
+        Err(e) => format!("(could not reach /v1/cache/rebuild: {e:#})"),
+    }
+}
+
+fn render_cache_status(v: &Value) -> String {
+    match v.get("kv").filter(|kv| !kv.is_null()) {
+        Some(kv) => format!(
+            "  kv pool  {} pages of {} tokens = {} tokens",
+            kv.get("num_pages").and_then(Value::as_u64).unwrap_or(0),
+            kv.get("page_size").and_then(Value::as_u64).unwrap_or(0),
+            kv.get("num_tokens").and_then(Value::as_u64).unwrap_or(0),
+        ),
+        None => "  kv pool  none; this server allocates per request \
+                 (start it with FERROX_KV_POOL_BLOCKS)"
+            .to_string(),
+    }
 }
 
 struct HttpResponse {
@@ -415,5 +666,109 @@ mod tests {
         let (printed, assembled) = render(&[content("hello "), content("world")]);
         assert_eq!(printed, "hello world\n");
         assert_eq!(assembled, "hello world");
+    }
+
+    /// The gears come from the SERVER, because which efforts exist is a
+    /// property of the served checkpoint's own template. A client with
+    /// a hardcoded list offers gears the model does not grade and hides
+    /// ones it does.
+    #[test]
+    fn the_gears_are_whatever_this_server_advertises() {
+        let body = json!({"data": [{
+            "supported_reasoning_efforts": ["off", "low", "high"],
+            "reasoning_effort_kwargs": {
+                "off": {"enable_thinking": false},
+                "low": {"enable_thinking": true, "reasoning_effort": "low"},
+                "high": {"enable_thinking": true, "reasoning_effort": "high"},
+            },
+        }]});
+        let mut gears = ThinkGears::from_models(&body);
+        assert_eq!(gears.supported, vec!["off", "low", "high"]);
+
+        // Nothing selected yet means the template's own default
+        // applies, which is NOT the same as sending that default.
+        assert!(gears.selected_kwargs().is_none());
+
+        // Cycling starts at the first gear, so the first press is
+        // deterministic whatever this checkpoint defaults to.
+        assert_eq!(gears.select("").unwrap(), "off");
+        assert_eq!(gears.select("").unwrap(), "low");
+        assert_eq!(gears.select("").unwrap(), "high");
+        assert_eq!(gears.select("").unwrap(), "off", "and it wraps");
+
+        assert_eq!(gears.select("high").unwrap(), "high");
+        assert_eq!(
+            gears.selected_kwargs().unwrap()["reasoning_effort"],
+            json!("high")
+        );
+    }
+
+    /// A gear this server does not have is refused by name rather than
+    /// sent: the server would either reject it or, worse, quietly
+    /// render a prompt the user did not ask for.
+    #[test]
+    fn a_gear_this_server_does_not_have_is_refused_with_the_ones_it_does() {
+        let mut gears = ThinkGears::from_models(&json!({"data": [{
+            "supported_reasoning_efforts": ["on"],
+            "reasoning_effort_kwargs": {"on": {}},
+        }]}));
+        let err = gears.select("turbo").unwrap_err();
+        assert!(err.contains("turbo") && err.contains("on"), "{err}");
+
+        // An always-thinking family advertises ONE gear with empty
+        // kwargs -- there is nothing to send, and that is a real
+        // answer, so it is passed through rather than skipped.
+        assert_eq!(gears.select("").unwrap(), "on");
+        assert_eq!(gears.selected_kwargs(), Some(json!({})));
+    }
+
+    /// A server too old to advertise gears simply has no `/think`,
+    /// rather than the client inventing some.
+    #[test]
+    fn a_server_that_advertises_no_gears_has_no_think_command() {
+        let mut gears = ThinkGears::from_models(&json!({"data": [{"id": "m"}]}));
+        assert!(gears.select("").is_err());
+        assert!(gears.selected_kwargs().is_none());
+    }
+
+    /// A figure the server reported as `null` prints as `-`, never as
+    /// `0`. A p95 of zero reads as an instantaneous server and a memory
+    /// figure of zero as an idle one -- both are exactly the shapes
+    /// `/v1/stats` goes out of its way not to emit.
+    #[test]
+    fn a_statistic_the_server_could_not_state_renders_as_a_dash() {
+        let rendered = render_stats(&json!({
+            "model": "m",
+            "state": "serving",
+            "throughput": {"decode_tps": 12.5, "prefill_tps": 0.0},
+            "requests": {
+                "active": 0, "completed": 3,
+                "p95_ms": Value::Null, "ttft_mean_ms": Value::Null,
+            },
+            "pools": {"kv_pages": Value::Null},
+            "memory": Value::Null,
+        }));
+        assert!(rendered.contains("p95 - ms"), "{rendered}");
+        assert!(rendered.contains("ttft - ms"), "{rendered}");
+        assert!(rendered.contains("decode 12.5"), "{rendered}");
+        assert!(
+            rendered.contains("none (every request allocates privately)"),
+            "an absent pool is not an empty one: {rendered}"
+        );
+        assert!(!rendered.contains("memory"), "absent memory prints nothing");
+    }
+
+    #[test]
+    fn stats_renders_the_pool_and_memory_when_the_server_has_them() {
+        let rendered = render_stats(&json!({
+            "model": "m",
+            "state": "serving",
+            "throughput": {"decode_tps": 1.0, "prefill_tps": 2.0},
+            "requests": {"active": 1, "completed": 2, "p95_ms": 30, "ttft_mean_ms": 10},
+            "pools": {"kv_pages": {"used": 4, "total": 64, "page_size": 256}},
+            "memory": {"bytes": 2u64 << 30, "kind": "pss"},
+        }));
+        assert!(rendered.contains("4/64 pages of 256 tokens"), "{rendered}");
+        assert!(rendered.contains("2.00 GiB (pss)"), "{rendered}");
     }
 }

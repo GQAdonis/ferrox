@@ -224,7 +224,7 @@ fn print_streamed_completion(base: &str, body: &Value, out: &mut impl Write) -> 
         anyhow::bail!("HTTP {status}: {rest}");
     }
 
-    let mut assembled = String::new();
+    let mut render = StreamRender::default();
     let mut line = String::new();
     while reader.read_line(&mut line)? > 0 {
         let trimmed = line.trim_end();
@@ -233,29 +233,95 @@ fn print_streamed_completion(base: &str, body: &Value, out: &mut impl Write) -> 
                 break;
             }
             if let Ok(v) = serde_json::from_str::<Value>(data) {
-                if let Some(delta) = v
-                    .pointer("/choices/0/delta/content")
-                    .and_then(|c| c.as_str())
-                {
-                    write!(out, "{delta}")?;
-                    out.flush()?;
-                    assembled.push_str(delta);
-                }
-                // Non-streaming-shaped chunk with full message
-                if assembled.is_empty() {
-                    if let Ok(full) = extract_message_content(&v) {
-                        write!(out, "{full}")?;
-                        out.flush()?;
-                        assembled = full;
-                    }
-                }
+                render.push_chunk(&v, out)?;
             }
         }
         line.clear();
     }
-    writeln!(out)?;
-    Ok(assembled)
+    render.finish(out)?;
+    Ok(render.assembled)
 }
+
+/// Turns one SSE chunk into terminal output, and keeps the answer.
+///
+/// Split out of the socket loop so its three rules can be tested
+/// without one.
+#[derive(Default)]
+struct StreamRender {
+    /// The ANSWER only. Deliberately not the chain of thought: this
+    /// becomes the assistant turn in the next request's history, and a
+    /// replayed chain of thought is both wrong to re-send and rejected
+    /// outright by some templates.
+    assembled: String,
+    /// Whether the dim reasoning run is open, so the escape is written
+    /// once per run rather than per delta -- and, more importantly, is
+    /// always closed before the answer starts.
+    thinking: bool,
+}
+
+impl StreamRender {
+    fn push_chunk(&mut self, v: &Value, out: &mut impl Write) -> Result<()> {
+        // Reading only `delta.content` -- which this did -- makes a
+        // reasoning model look like it answered nothing for several
+        // seconds and then blurted the answer, because its whole chain
+        // of thought arrives on the other field.
+        if let Some(thought) = v
+            .pointer("/choices/0/delta/reasoning_content")
+            .and_then(|c| c.as_str())
+            .filter(|s| !s.is_empty())
+        {
+            if !self.thinking {
+                self.thinking = true;
+                write!(out, "{DIM}")?;
+            }
+            write!(out, "{thought}")?;
+            out.flush()?;
+        }
+        if let Some(delta) = v
+            .pointer("/choices/0/delta/content")
+            .and_then(|c| c.as_str())
+        {
+            // The first content delta closes the thought.
+            if self.thinking && !delta.is_empty() {
+                self.thinking = false;
+                write!(out, "{RESET}")?;
+            }
+            write!(out, "{delta}")?;
+            out.flush()?;
+            self.assembled.push_str(delta);
+        }
+        // Non-streaming-shaped chunk with a full message.
+        if self.assembled.is_empty() {
+            if let Ok(full) = extract_message_content(v) {
+                if self.thinking {
+                    self.thinking = false;
+                    write!(out, "{RESET}")?;
+                }
+                write!(out, "{full}")?;
+                out.flush()?;
+                self.assembled = full;
+            }
+        }
+        Ok(())
+    }
+
+    /// A stream that ended mid-thought -- a cancel, a dropped
+    /// connection -- must not leave the terminal dim.
+    fn finish(&mut self, out: &mut impl Write) -> Result<()> {
+        if self.thinking {
+            self.thinking = false;
+            write!(out, "{RESET}")?;
+        }
+        writeln!(out)?;
+        Ok(())
+    }
+}
+
+/// Dim, then back to normal. Written around the reasoning run only, so
+/// a terminal that ignores them shows the thought as ordinary text
+/// rather than as escape codes.
+const DIM: &str = "\x1b[2m";
+const RESET: &str = "\x1b[0m";
 
 fn extract_message_content(v: &Value) -> Result<String> {
     if let Some(s) = v
@@ -271,4 +337,83 @@ fn extract_message_content(v: &Value) -> Result<String> {
         return Ok(s.to_string());
     }
     anyhow::bail!("no choices[0].message.content in response: {v}");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn thought(text: &str) -> Value {
+        json!({"choices": [{"delta": {"reasoning_content": text}}]})
+    }
+
+    fn content(text: &str) -> Value {
+        json!({"choices": [{"delta": {"content": text}}]})
+    }
+
+    fn render(chunks: &[Value]) -> (String, String) {
+        let mut out: Vec<u8> = Vec::new();
+        let mut r = StreamRender::default();
+        for c in chunks {
+            r.push_chunk(c, &mut out).expect("render");
+        }
+        r.finish(&mut out).expect("finish");
+        (String::from_utf8(out).expect("utf-8"), r.assembled)
+    }
+
+    /// The bug this exists to fix: reading only `delta.content` shows
+    /// nothing at all while a reasoning model thinks, so its answer
+    /// looks like it arrived out of a long silence.
+    #[test]
+    fn a_reasoning_models_thoughts_are_shown_rather_than_dropped() {
+        let (printed, _) = render(&[thought("weighing "), thought("it up"), content("Paris.")]);
+        assert!(printed.contains("weighing it up"), "{printed:?}");
+        assert!(printed.contains("Paris."));
+    }
+
+    /// The chain of thought is shown and NOT kept. `assembled` becomes
+    /// the assistant turn in the next request's history, and replaying
+    /// a chain of thought is both wrong to re-send and rejected by some
+    /// templates.
+    #[test]
+    fn the_thought_is_never_part_of_the_answer_that_is_replayed() {
+        let (_, assembled) = render(&[thought("weighing it up"), content("Paris.")]);
+        assert_eq!(assembled, "Paris.");
+    }
+
+    /// One escape per run, not per delta, and the run is closed by the
+    /// first content delta -- otherwise the answer itself renders dim.
+    #[test]
+    fn the_dim_run_is_opened_once_and_closed_before_the_answer() {
+        let (printed, _) = render(&[thought("a"), thought("b"), content("X"), content("Y")]);
+        assert_eq!(printed.matches(DIM).count(), 1, "{printed:?}");
+        let dim_at = printed.find(DIM).expect("opened");
+        let reset_at = printed.find(RESET).expect("closed");
+        let answer_at = printed.find('X').expect("answered");
+        assert!(dim_at < reset_at, "the run opens before it closes");
+        assert!(
+            reset_at < answer_at,
+            "the answer must not be inside the dim run: {printed:?}"
+        );
+    }
+
+    /// A stream cut off mid-thought -- a cancel, a dropped connection --
+    /// must not leave the terminal dim for everything the user types
+    /// afterwards.
+    #[test]
+    fn a_stream_that_ends_mid_thought_still_resets_the_terminal() {
+        let (printed, assembled) = render(&[thought("weighing it up")]);
+        assert!(printed.ends_with("\x1b[0m\n"), "{printed:?}");
+        assert!(assembled.is_empty());
+    }
+
+    /// A server with no reasoning to report is unchanged: no escapes at
+    /// all, so a terminal that does not understand them sees nothing new.
+    #[test]
+    fn a_plain_answer_is_printed_without_any_escapes() {
+        let (printed, assembled) = render(&[content("hello "), content("world")]);
+        assert_eq!(printed, "hello world\n");
+        assert_eq!(assembled, "hello world");
+    }
 }

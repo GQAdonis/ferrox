@@ -4368,6 +4368,65 @@ mod tests {
         })
     }
 
+    /// Once a `200` and `text/event-stream` are on the wire, a
+    /// rejection can only ride *in* the stream, where several agents
+    /// render it as an empty response. So the prompt is rendered before
+    /// the stream is committed, and a template that rejects this
+    /// particular conversation is an ordinary 400 with a body.
+    ///
+    /// Fails if `prompt_from_messages` moves back inside the spawned
+    /// generation task.
+    #[tokio::test]
+    async fn a_template_that_rejects_the_conversation_is_a_400_on_the_streaming_path() {
+        // Raises on a second user turn, the way a real strict template
+        // rejects an ordering it was never trained on.
+        let strict = "{% if messages | length > 1 %}\
+             {{ raise_exception('this template takes one turn') }}\
+             {% endif %}{{ messages[0].content }}";
+        let state = Arc::new(test_state(
+            model_with_template("strict", strict),
+            ResponseCache::new(4, Duration::from_secs(60)),
+        ));
+        let app = test_app_with_state(state);
+
+        let (status, body) = post_json_uri(
+            &app,
+            "/v1/chat/completions",
+            serde_json::json!({
+                "model": "strict",
+                "stream": true,
+                "messages": [
+                    {"role": "user", "content": "one"},
+                    {"role": "user", "content": "two"},
+                ],
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"]["param"], serde_json::json!("messages"));
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("one turn"),
+            "the template's own message must reach the caller: {body}"
+        );
+
+        // And the same template serves a conversation it accepts.
+        let (status, _) = post_json_uri(
+            &app,
+            "/v1/chat/completions",
+            serde_json::json!({
+                "model": "strict",
+                "stream": true,
+                "max_tokens": 1,
+                "messages": [{"role": "user", "content": "one"}],
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
     /// A client should not have to guess which gears a checkpoint has.
     #[tokio::test]
     async fn models_advertises_the_gears_this_checkpoint_actually_has() {

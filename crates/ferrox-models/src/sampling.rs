@@ -802,7 +802,10 @@ mod tests {
     /// the normal case for most checkpoints.
     #[test]
     fn a_model_directory_without_a_generation_config_recommends_nothing() {
-        let dir = std::env::temp_dir().join("ferrox_test_no_generation_config");
+        let dir = std::env::temp_dir().join(format!(
+            "ferrox_test_no_generation_config_{}",
+            std::process::id()
+        ));
         std::fs::create_dir_all(&dir).unwrap();
         assert!(RecommendedSampling::from_model_dir(&dir).is_empty());
         std::fs::remove_dir_all(&dir).ok();
@@ -812,7 +815,10 @@ mod tests {
     /// same place HF's `GenerationConfig.from_pretrained` looks.
     #[test]
     fn a_model_directory_generation_config_is_read_from_beside_the_weights() {
-        let dir = std::env::temp_dir().join("ferrox_test_generation_config_dir");
+        let dir = std::env::temp_dir().join(format!(
+            "ferrox_test_generation_config_dir_{}",
+            std::process::id()
+        ));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
             dir.join("generation_config.json"),

@@ -2083,7 +2083,8 @@ mod tests {
 
     #[test]
     fn model_config_from_gguf_fails_loudly_when_required_hparams_are_missing() {
-        let tmp = std::env::temp_dir().join("ferrox_test_arch_only.gguf");
+        let tmp =
+            std::env::temp_dir().join(format!("ferrox_test_arch_only_{}.gguf", std::process::id()));
         // Use a registered architecture so the failure is MissingHparam,
         // not UnsupportedArchitecture.
         std::fs::write(&tmp, build_arch_only_gguf("llama")).unwrap();
@@ -2102,7 +2103,10 @@ mod tests {
 
     #[test]
     fn model_config_from_gguf_fails_closed_on_unknown_architecture() {
-        let tmp = std::env::temp_dir().join("ferrox_test_unknown_arch.gguf");
+        let tmp = std::env::temp_dir().join(format!(
+            "ferrox_test_unknown_arch_{}.gguf",
+            std::process::id()
+        ));
         std::fs::write(&tmp, build_arch_only_gguf("bogus-arch-with-no-hparams")).unwrap();
         let file = ferrox_gguf::GgufFile::open(&tmp).expect("minimal header must still parse");
         std::fs::remove_file(&tmp).ok();
@@ -2417,7 +2421,10 @@ mod tests {
 
     #[test]
     fn model_config_from_gguf_rejects_dedicated_architectures() {
-        let tmp = std::env::temp_dir().join("ferrox_test_dedicated_arch.gguf");
+        let tmp = std::env::temp_dir().join(format!(
+            "ferrox_test_dedicated_arch_{}.gguf",
+            std::process::id()
+        ));
         std::fs::write(&tmp, build_arch_only_gguf("deepseek4")).unwrap();
         let file = ferrox_gguf::GgufFile::open(&tmp).expect("minimal header must still parse");
         std::fs::remove_file(&tmp).ok();
@@ -2480,7 +2487,10 @@ mod tests {
 
     #[test]
     fn load_weight_matrix_handles_a_real_on_disk_q5_k_tensor_end_to_end() {
-        let tmp = std::env::temp_dir().join("ferrox_test_q5k_tensor.gguf");
+        let tmp = std::env::temp_dir().join(format!(
+            "ferrox_test_q5k_tensor_{}.gguf",
+            std::process::id()
+        ));
         std::fs::write(&tmp, build_single_q5_k_tensor_gguf()).unwrap();
         let file = ferrox_gguf::GgufFile::open(&tmp).expect("real Q5_K GGUF file must parse");
         std::fs::remove_file(&tmp).ok();
@@ -2566,7 +2576,10 @@ mod tests {
 
     #[test]
     fn load_weight_matrix_handles_a_real_on_disk_q6_k_tensor_end_to_end() {
-        let tmp = std::env::temp_dir().join("ferrox_test_q6k_tensor.gguf");
+        let tmp = std::env::temp_dir().join(format!(
+            "ferrox_test_q6k_tensor_{}.gguf",
+            std::process::id()
+        ));
         std::fs::write(&tmp, build_single_q6_k_tensor_gguf()).unwrap();
         let file = ferrox_gguf::GgufFile::open(&tmp).expect("real Q6_K GGUF file must parse");
         std::fs::remove_file(&tmp).ok();
@@ -2635,7 +2648,10 @@ mod tests {
         // Values with zero low-mantissa bits, so f32->bf16 truncation
         // is lossless and this is an exact-equality check.
         let values: Vec<f32> = vec![1.0, -2.5, 0.0, 4.0, -8.0, 16.0];
-        let tmp = std::env::temp_dir().join("ferrox_test_bf16_tensor.gguf");
+        let tmp = std::env::temp_dir().join(format!(
+            "ferrox_test_bf16_tensor_{}.gguf",
+            std::process::id()
+        ));
         std::fs::write(&tmp, build_single_bf16_tensor_gguf(2, 3, &values)).unwrap();
         let file = ferrox_gguf::GgufFile::open(&tmp).expect("real BF16 GGUF file must parse");
         std::fs::remove_file(&tmp).ok();
@@ -2684,7 +2700,10 @@ mod tests {
     #[test]
     fn load_weight_matrix_handles_a_real_on_disk_f16_tensor_end_to_end() {
         let values: Vec<f32> = vec![1.0, -2.5, 0.0, 4.0, -8.0, 16.0];
-        let tmp = std::env::temp_dir().join("ferrox_test_f16_tensor.gguf");
+        let tmp = std::env::temp_dir().join(format!(
+            "ferrox_test_f16_tensor_{}.gguf",
+            std::process::id()
+        ));
         std::fs::write(&tmp, build_single_f16_tensor_gguf(2, 3, &values)).unwrap();
         let file = ferrox_gguf::GgufFile::open(&tmp).expect("real F16 GGUF file must parse");
         std::fs::remove_file(&tmp).ok();
@@ -2701,7 +2720,8 @@ mod tests {
 
         // The same tensor read as a plain vector (norm weights, biases and
         // the router all take this path, not `load_weight_matrix`).
-        let tmp = std::env::temp_dir().join("ferrox_test_f16_vec.gguf");
+        let tmp =
+            std::env::temp_dir().join(format!("ferrox_test_f16_vec_{}.gguf", std::process::id()));
         std::fs::write(&tmp, build_single_f16_tensor_gguf(2, 3, &values)).unwrap();
         let file = ferrox_gguf::GgufFile::open(&tmp).expect("real F16 GGUF file must parse");
         std::fs::remove_file(&tmp).ok();
@@ -2742,7 +2762,10 @@ mod tests {
 
     #[test]
     fn load_weight_matrix_handles_a_real_on_disk_q5_1_tensor_end_to_end() {
-        let tmp = std::env::temp_dir().join("ferrox_test_q5_1_tensor.gguf");
+        let tmp = std::env::temp_dir().join(format!(
+            "ferrox_test_q5_1_tensor_{}.gguf",
+            std::process::id()
+        ));
         std::fs::write(&tmp, build_single_q5_1_tensor_gguf()).unwrap();
         let file = ferrox_gguf::GgufFile::open(&tmp).expect("real Q5_1 GGUF file must parse");
         std::fs::remove_file(&tmp).ok();
@@ -2814,7 +2837,10 @@ mod tests {
 
     #[test]
     fn load_weight_matrix_handles_a_real_on_disk_q3_k_tensor_end_to_end() {
-        let tmp = std::env::temp_dir().join("ferrox_test_q3k_tensor.gguf");
+        let tmp = std::env::temp_dir().join(format!(
+            "ferrox_test_q3k_tensor_{}.gguf",
+            std::process::id()
+        ));
         std::fs::write(&tmp, build_single_q3_k_tensor_gguf()).unwrap();
         let file = ferrox_gguf::GgufFile::open(&tmp).expect("real Q3_K GGUF file must parse");
         std::fs::remove_file(&tmp).ok();
@@ -2887,7 +2913,10 @@ mod tests {
 
     #[test]
     fn load_weight_matrix_handles_a_real_on_disk_iq4_xs_tensor_end_to_end() {
-        let tmp = std::env::temp_dir().join("ferrox_test_iq4xs_tensor.gguf");
+        let tmp = std::env::temp_dir().join(format!(
+            "ferrox_test_iq4xs_tensor_{}.gguf",
+            std::process::id()
+        ));
         std::fs::write(&tmp, build_single_iq4_xs_tensor_gguf()).unwrap();
         let file = ferrox_gguf::GgufFile::open(&tmp).expect("real IQ4_XS GGUF file must parse");
         std::fs::remove_file(&tmp).ok();

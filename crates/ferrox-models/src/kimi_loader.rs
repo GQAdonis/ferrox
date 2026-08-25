@@ -928,7 +928,10 @@ mod tests {
             ),
         ]);
 
-        let dir = std::env::temp_dir().join("ferrox_kimi_loader_dense_test");
+        let dir = std::env::temp_dir().join(format!(
+            "ferrox_kimi_loader_dense_test_{}",
+            std::process::id()
+        ));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("shard0.safetensors"), &shard_bytes).unwrap();
         let index = r#"{"weight_map":{
@@ -961,7 +964,10 @@ mod tests {
         let raw: Vec<u8> = a_log_full.iter().flat_map(|v| v.to_le_bytes()).collect();
 
         let shard_bytes = build_shard(&[("self_attn.A_log", "F32", &[8], raw)]);
-        let dir = std::env::temp_dir().join("ferrox_kimi_loader_alog_test");
+        let dir = std::env::temp_dir().join(format!(
+            "ferrox_kimi_loader_alog_test_{}",
+            std::process::id()
+        ));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("shard0.safetensors"), &shard_bytes).unwrap();
         let index = r#"{"weight_map":{"self_attn.A_log":"shard0.safetensors"}}"#;
@@ -1062,7 +1068,10 @@ mod tests {
             ),
         ]);
 
-        let dir = std::env::temp_dir().join("ferrox_kimi_loader_mxfp4_test");
+        let dir = std::env::temp_dir().join(format!(
+            "ferrox_kimi_loader_mxfp4_test_{}",
+            std::process::id()
+        ));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("shard0.safetensors"), &shard_bytes).unwrap();
         let index = format!(
@@ -1244,7 +1253,10 @@ mod tests {
         }
 
         let shard_bytes = build_shard_owned(tensors.clone());
-        let dir = std::env::temp_dir().join("ferrox_kimi_loader_layer_kda_dense_test");
+        let dir = std::env::temp_dir().join(format!(
+            "ferrox_kimi_loader_layer_kda_dense_test_{}",
+            std::process::id()
+        ));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("shard0.safetensors"), &shard_bytes).unwrap();
         let map_entries: Vec<String> = tensors
@@ -1485,7 +1497,10 @@ mod tests {
         }
 
         let shard_bytes = build_shard_owned(tensors.clone());
-        let dir = std::env::temp_dir().join("ferrox_kimi_loader_layer_mla_moe_test");
+        let dir = std::env::temp_dir().join(format!(
+            "ferrox_kimi_loader_layer_mla_moe_test_{}",
+            std::process::id()
+        ));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("shard0.safetensors"), &shard_bytes).unwrap();
         let map_entries: Vec<String> = tensors

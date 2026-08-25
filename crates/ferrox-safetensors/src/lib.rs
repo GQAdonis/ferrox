@@ -406,7 +406,10 @@ mod tests {
         let header = r#"{"weight":{"dtype":"F32","shape":[3],"data_offsets":[0,12]}}"#;
         let bytes = build_file(header, &data);
 
-        let tmp = std::env::temp_dir().join("ferrox_st_single.safetensors");
+        let tmp = std::env::temp_dir().join(format!(
+            "ferrox_st_single_{}.safetensors",
+            std::process::id()
+        ));
         std::fs::write(&tmp, &bytes).unwrap();
         let file = SafetensorsFile::open(&tmp).expect("must parse");
         std::fs::remove_file(&tmp).ok();
@@ -429,7 +432,10 @@ mod tests {
         let data = [10u8, 11, 20, 21];
         let bytes = build_file(header, &data);
 
-        let tmp = std::env::temp_dir().join("ferrox_st_multi.safetensors");
+        let tmp = std::env::temp_dir().join(format!(
+            "ferrox_st_multi_{}.safetensors",
+            std::process::id()
+        ));
         std::fs::write(&tmp, &bytes).unwrap();
         let file = SafetensorsFile::open(&tmp).expect("must parse");
         std::fs::remove_file(&tmp).ok();
@@ -451,7 +457,8 @@ mod tests {
         let data = [0u8; 6];
         let bytes = build_file(header, &data);
 
-        let tmp = std::env::temp_dir().join("ferrox_st_gap.safetensors");
+        let tmp =
+            std::env::temp_dir().join(format!("ferrox_st_gap_{}.safetensors", std::process::id()));
         std::fs::write(&tmp, &bytes).unwrap();
         let result = SafetensorsFile::open(&tmp);
         std::fs::remove_file(&tmp).ok();
@@ -469,7 +476,10 @@ mod tests {
         let data = [0u8; 12];
         let bytes = build_file(header, &data);
 
-        let tmp = std::env::temp_dir().join("ferrox_st_sizemismatch.safetensors");
+        let tmp = std::env::temp_dir().join(format!(
+            "ferrox_st_sizemismatch_{}.safetensors",
+            std::process::id()
+        ));
         std::fs::write(&tmp, &bytes).unwrap();
         let result = SafetensorsFile::open(&tmp);
         std::fs::remove_file(&tmp).ok();
@@ -486,7 +496,10 @@ mod tests {
         let data = [0u8; 5]; // 3 bytes more than the header's tensor claims
         let bytes = build_file(header, &data);
 
-        let tmp = std::env::temp_dir().join("ferrox_st_trailing.safetensors");
+        let tmp = std::env::temp_dir().join(format!(
+            "ferrox_st_trailing_{}.safetensors",
+            std::process::id()
+        ));
         std::fs::write(&tmp, &bytes).unwrap();
         let result = SafetensorsFile::open(&tmp);
         std::fs::remove_file(&tmp).ok();
@@ -503,7 +516,10 @@ mod tests {
         let data = [0u8; 2];
         let bytes = build_file(header, &data);
 
-        let tmp = std::env::temp_dir().join("ferrox_st_baddtype.safetensors");
+        let tmp = std::env::temp_dir().join(format!(
+            "ferrox_st_baddtype_{}.safetensors",
+            std::process::id()
+        ));
         std::fs::write(&tmp, &bytes).unwrap();
         let result = SafetensorsFile::open(&tmp);
         std::fs::remove_file(&tmp).ok();
@@ -513,7 +529,8 @@ mod tests {
 
     #[test]
     fn rejects_a_file_too_small_for_even_the_header_length_field() {
-        let tmp = std::env::temp_dir().join("ferrox_st_tiny.safetensors");
+        let tmp =
+            std::env::temp_dir().join(format!("ferrox_st_tiny_{}.safetensors", std::process::id()));
         std::fs::write(&tmp, [0u8; 4]).unwrap();
         let result = SafetensorsFile::open(&tmp);
         std::fs::remove_file(&tmp).ok();
@@ -523,7 +540,8 @@ mod tests {
 
     #[test]
     fn sharded_index_resolves_tensors_across_multiple_shard_files() {
-        let dir = std::env::temp_dir().join("ferrox_st_sharded_test");
+        let dir =
+            std::env::temp_dir().join(format!("ferrox_st_sharded_test_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
 
         let shard0 = build_file(
@@ -568,7 +586,10 @@ mod tests {
 
     #[test]
     fn sharded_lookup_of_a_missing_tensor_is_a_clean_error_not_a_panic() {
-        let dir = std::env::temp_dir().join("ferrox_st_sharded_missing_test");
+        let dir = std::env::temp_dir().join(format!(
+            "ferrox_st_sharded_missing_test_{}",
+            std::process::id()
+        ));
         std::fs::create_dir_all(&dir).unwrap();
         let shard0 = build_file(
             r#"{"layer0.weight":{"dtype":"U8","shape":[1],"data_offsets":[0,1]}}"#,

@@ -27,16 +27,21 @@ comes back the same way.
 
 | Field | Status |
 |---|---|
-| `model`, `messages`, `max_tokens` | Supported |
+| `model`, `messages` | Supported |
+| `max_tokens` | Supported; **defaults to 32768**, not OpenAI's legacy 16. An explicit `0` is a 400 |
 | `temperature`, `top_p`, `top_k`, `repetition_penalty`, `seed`, `stop` | Supported |
 | `presence_penalty`, `frequency_penalty` | Supported |
 | `stream` | Supported (overlapped SSE when tools off and CB off) |
-| `tools` / `tool_choice: none\|auto` | Supported (prompt-engineered) |
+| `tools` / `tool_choice: none\|auto` | Supported (prompt-engineered, parsed in nine wire formats) |
 | `tool_choice: required` / named function | **Reject** |
 | `logprobs` / `top_logprobs` / `n` (>1) | **Reject** |
 | `response_format: json_object` | Supported (best-effort mask + validate) |
 | Other `response_format` types | **Reject** |
 | `session_id` | Ferrox extension (server-side history) |
+| `chat_template_kwargs` | Supported (see [Chat templates](#chat-templates)) |
+| `reasoning_effort` | Supported, quantized onto what the checkpoint grades; `none`/`off` turn thinking off |
+| `thinking: {"type": …}` | Supported (DeepSeek wire): `enabled`/`disabled`, anything else is a 400 |
+| `reasoning_content` (response) | Ferrox extension: a reasoning model's chain of thought, split out of `content` |
 
 ### Where a completion stops
 
@@ -55,6 +60,81 @@ from its special-token names and `[EOT]` ends a turn there too.
 BOS follows the rule in [CLI.md](CLI.md#who-adds-bos): the chat template
 owns it when it prints one, the loader otherwise, added idempotently so a
 template that already emitted BOS never gets a second one.
+
+### When a request does not fit the context
+
+Two outcomes, not one. A **prompt** at or past the deployment's
+per-request position ceiling is refused with a 400 whose message reads
+`prompt is too long: N tokens > M maximum` — wording that Claude Code
+and OpenClaw match on, because the Anthropic wire carries no error code
+for it. A prompt that *fits* is **served**, with `max_tokens` clamped
+down to the room that remains; refusing that case would turn a servable
+long-prompt request into an error over a `max_tokens` the caller most
+likely never set. The clamp is also what makes the 32768 default output
+budget safe.
+
+## Chat templates
+
+The prompt is rendered by evaluating the checkpoint's own
+`tokenizer.chat_template` — the real Jinja2 source shipped in the GGUF —
+not by recognising it. A checkpoint that ships no template at all falls
+back to ChatML (matching llama.cpp `--jinja`), or to role-labeled lines
+for a byte/synthetic tokenizer. A template that does not compile, or that
+uses a construct this evaluator does not provide, fails the chat request
+with the compiler's own message; it does **not** quietly fall back to a
+guessed framing, which is the failure it exists to remove.
+
+`chat_template_kwargs` is passed through: whatever a client puts there
+becomes a top-level template variable, which is how `enable_thinking`
+(Qwen3, gemma-4), `thinking` (DeepSeek) and `preserve_thinking` are
+really driven. It can never shadow `messages`, `tools`, or
+`add_generation_prompt`.
+
+Five rules are applied to it before rendering:
+
+* **An explicit knob wins wholesale.** A caller who already set any of
+  `enable_thinking`, `thinking`, `thinking_mode` or `reasoning_effort`
+  *inside* `chat_template_kwargs` has said what they want; the
+  protocol-level knobs then stand down entirely rather than merging, so
+  a default can never contradict an explicit request.
+* **`none` and `off` are not gears.** `reasoning_effort: "none"` means
+  *turn thinking off*, and is broadcast as such — it is not quantized
+  onto the nearest gear, which would turn "do not think" into "think a
+  little". The DeepSeek-wire `thinking: {"type": "disabled"}` does the
+  same and beats any effort in the same request, because the switch is
+  what the caller reached for last and the gear is what they would have
+  used had thinking been on.
+
+* **Offering tools turns thinking on.** Some encoders emit well-formed
+  tool calls only in thinking mode, so `tools` implies
+  `enable_thinking` unless the request said otherwise.
+* **Effort is quantized onto what this checkpoint grades.** The
+  template's real effort vocabulary is probed once at load; a request
+  asking for a gear outside it is mapped to the nearest one, or dropped
+  (so the template's own default applies) when nothing is close enough.
+  `reasoning_effort: "minimal"` against a checkpoint that grades only
+  `low`/`medium`/`high` renders as `low` rather than failing or
+  interpolating an unknown word into the prompt. Top-level
+  `reasoning_effort` loses to an explicit `chat_template_kwargs` entry.
+* **One value, every spelling.** The graded-strength dialect reads
+  `reasoning_strength`; the value is broadcast to both, and a Jinja
+  template ignores variables it does not declare.
+
+`GET /v1/models` advertises what came out of that probe:
+`supported_reasoning_efforts` (least thinking first — `off`, `adaptive`,
+then the gears, or a bare `on` when there is a toggle but no ladder) and
+`default_reasoning_effort` (the gear the checkpoint is already in when
+asked for nothing). A checkpoint that says nothing about thinking
+carries **neither field**, rather than an empty list: an empty list
+would read as "asked, and it has no gears", which is a different claim
+from "this is not a reasoning model".
+
+Whether the *tools* are described by the template or by a text preamble
+depends on the template, established at load by rendering it with and
+without a tool rather than by looking for the word: one that really
+consumes `tools` is handed them as structured JSON and owns the whole
+grammar; one that does not gets the preamble described under
+[Tool-call formats](#tool-call-formats).
 
 ## Health
 
@@ -550,9 +630,81 @@ throughput, and the server does not know it.
 `--mcp-config PATH` loads server metadata under `ferrox_mcp` in
 `GET /v1/models`. Tool invocation is not wired yet.
 
+## Reasoning content
+
+A checkpoint whose family reasons inside markers (`<think>`, DeepSeek's
+DSML variant, Gemma's channels, MiniMax-M3's namespaced pair, the
+gpt-oss harmony `analysis` channel) has that block split out of
+`content` and returned as `reasoning_content`, on the message and on
+each streamed delta. The split runs *as tokens arrive*, so an
+overlapped SSE stream and a buffered one report the same fields for the
+same request rather than differing by transport.
+
+Which family applies is inferred from the served model's name, which is
+all there is: ferrox carries no per-checkpoint parser declaration. A
+name that implies nothing gets no reasoning parser at all — the right
+answer for a model that does not reason, since an unconditional
+splitter would eat a literal `<think>` written in a code block.
+
+Whether the block is *already open* is read off the rendered prompt, not
+guessed from the family: a template asked to think can open the block in
+the prompt itself, and then the model's first token is reasoning and no
+opening marker ever arrives. Same checkpoint, same request text,
+different answer depending on what `chat_template_kwargs` rendered — so
+the prompt is what gets consulted.
+
+## Tool-call formats
+
+`tools` is still prompt-engineered (there is no grammar-constrained
+decoding here — see the `tool_choice` rejections above), and the
+preamble asks for a Hermes-style
+`<tool_call>{"name": …, "arguments": {…}}</tool_call>`. But a model
+trained on a different format frequently answers in its own, correctly
+and in its own terms. Parsing tries the format the served checkpoint's
+family implies, then the one the preamble asked for:
+
+| Family | Shape |
+|---|---|
+| Hermes / Qwen2.5 | `<tool_call>{"name": …, "arguments": {…}}</tool_call>` |
+| Llama 3 | `<\|python_tag\|>{"name": …, "parameters": {…}}` |
+| Mistral | `[TOOL_CALLS] [{…}]` |
+| Qwen3-Coder | `<function=name><parameter=key>value</parameter></function>` |
+| GLM-4.7 | `<arg_key>k</arg_key><arg_value>v</arg_value>` |
+| DeepSeek | `<｜DSML｜invoke name="…"><｜DSML｜parameter name="…">…` |
+| MiniMax | `<minimax:tool_call><invoke name="…"><parameter name="…">…` |
+| gpt-oss | `<\|channel\|>commentary to=functions.name<\|message\|>{…}<\|call\|>` |
+| Gemma 4 | `<\|tool_call>call:name{k: v}<tool_call\|>` |
+
+Every call in a response is returned, not just the first, with ids
+`call_0`, `call_1`, … — nothing in these formats carries an id, and a
+client correlates by index.
+
+**Streaming.** On the non-batched path the four invoke/parameter
+families stream their arguments as OpenAI-shaped deltas: the first
+delta of a call carries `index`, `id`, `type` and `function.name` with
+empty arguments, and every delta after it carries only more
+`function.arguments` text. The fragments are literal continuations, so
+a client concatenates them in `index` order and parses the result —
+which is what lets a coding agent watch a file argument arrive instead
+of waiting for it. The JSON-payload families (Hermes, Llama 3, Mistral,
+gpt-oss, Gemma) still arrive whole, because a half-written JSON object
+is not a fragment anyone can use. A generation truncated mid-call
+reports `length`, not `tool_calls`: a half-written call must not be
+executed. A call naming a tool the request never
+offered is dropped rather than forwarded; a namespaced name
+(`skills:read`) is forwarded, because the client is what resolves the
+namespace.
+
+The XML-ish formats state no types, so a parameter's value is typed
+from the tool's own `parameters` schema: a declared `string` is handed
+over verbatim, which is what keeps a zero-padded id like `"018956"`
+from arriving as a number.
+
 ## Not yet
 
 Anthropic streaming/tools/images · full JSON schema / grammar ·
-`tool_choice=required` · dedicated embedding models · multi-GPU / TP / PD.
+`tool_choice=required` · dedicated embedding models · multi-GPU / TP / PD ·
+streamed argument deltas for the JSON-payload families (they arrive
+whole) · streamed tool calls on the continuous-batching path.
 
 See [`ROADMAP.md`](ROADMAP.md).

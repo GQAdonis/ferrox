@@ -69,8 +69,18 @@ ferrox-gguf + ferrox-quant
         → ferrox-models (loader, Decoder, Kimi/GLM/DS4 stacks)
         → ferrox-cli / ferrox-server
 
-ferrox-api (routes + wire DTOs, serde-only) → ferrox-server + clients
+ferrox-api  (routes + wire DTOs, serde-only) → ferrox-server + clients
+ferrox-edge (serving policy, tensor-free)    → ferrox-server
 ```
+
+`ferrox-edge` is a Rust port of FreeToken's host-side decision logic
+(Apache-2.0; see `docs/THIRD_PARTY_NOTICES.md`): the `q*` bandwidth
+split, the global expert cache, page-keyed radix prefix caches
+(plain / sliding-window / recurrent), pool budgets, admission and
+chunked prefill, and the reasoning / tool-call output parsers. It has
+no tensors and no device memory, so every policy in it is testable on
+any host. Wired in today: the two parsers and the stop-string withhold
+rule; the cache and placement policies are groundwork (`docs/ROADMAP.md`).
 
 Load path: GGUF mmap → keep quantized → fused dequant+dot →
 RMSNorm → GQA(+RoPE) → MoE/dense FFN. Serving: `FERROX_MODEL_PATH`

@@ -480,6 +480,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "ferrox-edge"
+version = "0.11.1"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "ferrox-gguf"
 version = "0.11.1"
 dependencies = [
@@ -495,6 +503,7 @@ version = "0.11.1"
 dependencies = [
  "ferrox-api",
  "ferrox-core",
+ "ferrox-edge",
  "ferrox-gguf",
  "ferrox-models",
  "ferrox-moe",
@@ -580,6 +589,7 @@ dependencies = [
  "ferrox-api",
  "ferrox-core",
  "ferrox-cuda",
+ "ferrox-edge",
  "ferrox-gguf",
  "ferrox-metal",
  "ferrox-models",

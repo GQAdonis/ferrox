@@ -385,8 +385,6 @@ pub fn generate(
     // admission control would let a request's real memory usage
     // silently bypass the pool's bounded-memory guarantee. Not
     // supported together yet.
-    let max_seq_len = tokens.len() + params.max_tokens;
-
     // The per-request context ceiling, checked before any KV is
     // acquired and before a single forward pass runs. This path used to
     // have no context ceiling at all: an oversized request either ran
@@ -395,11 +393,37 @@ pub fn generate(
     // a request an idle server would refuse identically. The ceiling is
     // the same `ContextCeiling` the batch scheduler admits on (see
     // `crate::budget`), so the two paths cannot disagree.
-    if let Some(ceiling) = ceiling {
-        if let Some(err) = ceiling.refusal(max_seq_len) {
-            return Err(err);
+    //
+    // It has TWO outcomes, not one. A prompt at or past the ceiling has
+    // no output budget left to give it and is refused. A prompt that
+    // fits is SERVED, with `max_tokens` clamped down to what remains --
+    // refusing that case instead turns a servable 100k-prompt request
+    // into a 400 over a `max_tokens` the caller very likely never set.
+    // The clamp is what makes a large default output budget safe.
+    let clamped;
+    let params = match ceiling {
+        Some(ceiling) => {
+            if let Some(err) = ceiling.prompt_refusal(prompt_tokens) {
+                return Err(err);
+            }
+            match ceiling.limit() {
+                Some(limit) if prompt_tokens + params.max_tokens > limit => {
+                    let mut p = params.clone();
+                    p.max_tokens = limit - prompt_tokens;
+                    tracing::debug!(
+                        "max_tokens clamped from {} to {} by the {limit}-position context ceiling",
+                        params.max_tokens,
+                        p.max_tokens
+                    );
+                    clamped = p;
+                    &clamped
+                }
+                _ => params,
+            }
         }
-    }
+        None => params,
+    };
+    let max_seq_len = prompt_tokens + params.max_tokens;
 
     // A request whose worst case exceeds the *whole* pool is not a
     // request to retry: no amount of waiting frees blocks that do not
@@ -785,14 +809,12 @@ pub(crate) fn earliest_stop_match(text: &str, stops: &[String]) -> Option<usize>
 }
 
 /// The largest char boundary `<= idx`. `str::floor_char_boundary` is
-/// still nightly-only in stable Rust as of this writing; this is the
-/// same walk-backward-to-a-boundary logic on stable.
+/// still nightly-only in stable Rust as of this writing; the
+/// walk-backward-to-a-boundary logic lives in `ferrox-edge`, next to
+/// the byte-length withhold rules that produce the indices it is
+/// applied to.
 pub(crate) fn floor_char_boundary(s: &str, idx: usize) -> usize {
-    let mut i = idx.min(s.len());
-    while i > 0 && !s.is_char_boundary(i) {
-        i -= 1;
-    }
-    i
+    ferrox_edge::floor_char_boundary(s, idx)
 }
 
 #[cfg(test)]
@@ -1975,18 +1997,22 @@ mod tests {
     /// it worth having: the refusal happens before any KV is acquired
     /// and before a single forward pass runs.
     ///
-    /// Confirmed to FAIL when the `ceiling.refusal` block is removed
+    /// The refusal is for a prompt that does not fit BY ITSELF. That is
+    /// the only case with no output budget left to clamp to; see the
+    /// test below for the other outcome.
+    ///
+    /// Confirmed to FAIL when the `prompt_refusal` block is removed
     /// from `generate` -- the request then runs to completion and
     /// returns `Ok`.
     #[test]
-    fn a_request_past_the_context_ceiling_is_refused_before_any_kv_is_acquired() {
+    fn a_prompt_past_the_context_ceiling_is_refused_before_any_kv_is_acquired() {
         let decoder = small_decoder();
-        let prompt = String::from_utf8(vec![1u8, 2]).unwrap();
+        let prompt = String::from_utf8(vec![1u8, 2, 3, 4, 5]).unwrap();
         let pool = Arc::new(Mutex::new(KvBlockPool::new(64, 64)));
         let config = pool_config(pool.clone(), Duration::ZERO);
         let shape = KvShape::from_config(&decoder.config, KvElem::F32, 1);
-        // Prompt is 2 tokens, max_tokens is 5, so the request asks for
-        // 7 positions against a ceiling of 4.
+        // The prompt alone is 5 tokens against a ceiling of 4, so no
+        // output budget exists that would make it servable.
         let ceiling = ContextCeiling::new(Some(4), shape);
 
         let err = generate(
@@ -2001,21 +2027,22 @@ mod tests {
             Some(&ceiling),
             |_| panic!("no token may be emitted by a refused request"),
         )
-        .expect_err("7 positions must not be admitted under a 4-position ceiling");
+        .expect_err("a 5-token prompt must not be admitted under a 4-position ceiling");
         match &err {
             DecodeError::KvBudgetExceeded {
                 binding,
                 positions,
                 positions_limit,
-                estimated_bytes,
-                limit_bytes,
+                detail,
                 ..
             } => {
                 assert_eq!(*binding, ferrox_models::Ceiling::ContextLength.code());
-                assert_eq!(*positions, 7);
+                assert_eq!(*positions, 5);
                 assert_eq!(*positions_limit, 4);
-                assert_eq!(*estimated_bytes, shape.kv_bytes_for_tokens(7));
-                assert_eq!(*limit_bytes, shape.kv_bytes_for_tokens(4));
+                // Load-bearing wording: Claude Code and OpenClaw match
+                // on this text to recognise a blown context window,
+                // because the Anthropic wire carries no error code.
+                assert_eq!(detail, "prompt is too long: 5 tokens > 4 maximum");
             }
             other => panic!("expected a context-length refusal, got {other:?}"),
         }
@@ -2026,6 +2053,43 @@ mod tests {
             "the refusal must land before any block is taken"
         );
         assert_eq!(ceiling.refused(), 1);
+    }
+
+    /// The other outcome, and the one this test used to get wrong: a
+    /// prompt that FITS is served with `max_tokens` clamped to what
+    /// remains, not refused.
+    ///
+    /// This test previously asserted the refusal. Refusing here turns a
+    /// servable request into a 400 over a `max_tokens` the caller very
+    /// likely never set -- which is exactly what a large default output
+    /// budget would make happen on every long prompt.
+    #[test]
+    fn a_prompt_that_fits_is_served_with_its_budget_clamped_rather_than_refused() {
+        let decoder = small_decoder();
+        let prompt = String::from_utf8(vec![1u8, 2]).unwrap();
+        let shape = KvShape::from_config(&decoder.config, KvElem::F32, 1);
+        // 2 prompt tokens under a 4-position ceiling leaves room for 2,
+        // and the request asks for 5.
+        let ceiling = ContextCeiling::new(Some(4), shape);
+
+        let mut emitted = 0usize;
+        let (finish, usage) = generate(
+            &decoder,
+            &ServerTokenizer::Byte,
+            &StopTokens::default(),
+            None,
+            &prompt,
+            &greedy_params(5),
+            None,
+            None,
+            Some(&ceiling),
+            |_| emitted += 1,
+        )
+        .expect("a prompt that fits must be served");
+        assert_eq!(usage.completion_tokens, 2, "clamped to the room left");
+        assert_eq!(finish, FinishReason::Length);
+        assert_eq!(ceiling.refused(), 0, "a clamp is not a refusal");
+        assert!(emitted > 0);
     }
 
     /// A request that fits the ceiling is untouched by it: the same

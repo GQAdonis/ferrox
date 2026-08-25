@@ -51,6 +51,8 @@ mod limits;
 mod mcp;
 mod model;
 mod openai_extra;
+mod output;
+pub(crate) mod responses;
 mod resume;
 mod security;
 mod session;
@@ -59,10 +61,12 @@ mod stats;
 mod stop;
 mod tasks;
 
+use std::cell::RefCell;
 use std::convert::Infallible;
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
@@ -402,14 +406,14 @@ pub(crate) struct GgufModel {
     stop_tokens: StopTokens,
     bos_id: Option<usize>,
     is_synthetic: bool,
-    chat_template: chat_template::ChatTemplate,
+    chat_template: chat_template::PromptTemplate,
 }
 
 pub(crate) struct KimiModel {
     engine: KimiEngine,
     tokenizer: KimiTokenizer,
     stop_tokens: StopTokens,
-    chat_template: chat_template::ChatTemplate,
+    chat_template: chat_template::PromptTemplate,
 }
 
 pub(crate) struct MlaModel {
@@ -418,7 +422,7 @@ pub(crate) struct MlaModel {
     stop_tokens: StopTokens,
     bos_id: Option<usize>,
     name: String,
-    chat_template: chat_template::ChatTemplate,
+    chat_template: chat_template::PromptTemplate,
 }
 
 pub(crate) struct Gemma4Model {
@@ -427,7 +431,7 @@ pub(crate) struct Gemma4Model {
     stop_tokens: StopTokens,
     bos_id: Option<usize>,
     name: String,
-    chat_template: chat_template::ChatTemplate,
+    chat_template: chat_template::PromptTemplate,
 }
 
 pub(crate) struct Glm52Model {
@@ -436,17 +440,17 @@ pub(crate) struct Glm52Model {
     stop_tokens: StopTokens,
     bos_id: Option<usize>,
     name: String,
-    chat_template: chat_template::ChatTemplate,
+    chat_template: chat_template::PromptTemplate,
 }
 
 impl Model {
-    pub(crate) fn chat_template(&self) -> chat_template::ChatTemplate {
+    pub(crate) fn chat_template(&self) -> chat_template::PromptTemplate {
         match self {
-            Model::Gguf(m) => m.chat_template,
-            Model::Kimi(m) => m.chat_template,
-            Model::Mla(m) => m.chat_template,
-            Model::Gemma4(m) => m.chat_template,
-            Model::Glm52(m) => m.chat_template,
+            Model::Gguf(m) => m.chat_template.clone(),
+            Model::Kimi(m) => m.chat_template.clone(),
+            Model::Mla(m) => m.chat_template.clone(),
+            Model::Gemma4(m) => m.chat_template.clone(),
+            Model::Glm52(m) => m.chat_template.clone(),
         }
     }
 
@@ -675,6 +679,16 @@ pub(crate) struct AppState {
     /// next successful load so `/admin/models` can say *why* an entry
     /// is in `error` without the user retrying to find out.
     last_load_error: Mutex<Option<(String, String)>>,
+    /// Live serving counters and the two sliding-window rates behind
+    /// `/v1/stats` -- see `ferrox_edge::ServingStats`. Distinct from
+    /// `stats`, which is the historical ring: this is what is happening
+    /// *now*, and it decays to zero when nothing is.
+    pub(crate) serving: Mutex<ferrox_edge::ServingStats>,
+    /// The gate every request, cache rebuild and shutdown passes
+    /// through -- see `ferrox_edge::MaintenanceGate`. Held across none
+    /// of them: each operation takes it, reads or moves the state, and
+    /// releases before doing any work.
+    pub(crate) maintenance: Mutex<ferrox_edge::MaintenanceGate>,
 }
 
 impl AppState {
@@ -1004,6 +1018,29 @@ struct ChatCompletionRequest {
     tools: Vec<ToolDef>,
     #[serde(default)]
     tool_choice: Option<ToolChoice>,
+    /// The OpenAI extension every reasoning-model deployment actually
+    /// uses: whatever is in here becomes a top-level variable in the
+    /// checkpoint's own chat template, which is how `enable_thinking`
+    /// (Qwen3, gemma-4), `thinking` (DeepSeek) and `reasoning_effort`
+    /// are really driven. Values here can never shadow the structural
+    /// variables (`messages`, `tools`, `add_generation_prompt`) -- see
+    /// `ferrox_models::chat_template::RenderOptions`.
+    #[serde(default)]
+    chat_template_kwargs: Option<serde_json::Map<String, serde_json::Value>>,
+    /// OpenAI's own spelling of the same knob. It is folded into
+    /// `chat_template_kwargs` before rendering, and loses to an explicit
+    /// entry there: a caller who wrote both meant the specific one.
+    ///
+    /// `"none"` and `"off"` are not gears -- they mean *do not think*,
+    /// and are handled by [`ChatCompletionRequest::thinking_direction`]
+    /// before any quantization can round them onto a real one.
+    #[serde(default)]
+    reasoning_effort: Option<String>,
+    /// The DeepSeek wire's thinking switch: `{"type": "enabled"}` or
+    /// `{"type": "disabled"}`. It decides the direction outright, and
+    /// `disabled` beats any effort the same request also carries.
+    #[serde(default)]
+    thinking: Option<ThinkingSwitch>,
     /// Server-side conversation history key (see the `session`
     /// module): when set, `messages` is treated as
     /// *only the new turn(s)* to append to this session's stored
@@ -1025,8 +1062,43 @@ struct ChatCompletionRequest {
     response_format: Option<serde_json::Value>,
 }
 
+/// The output budget a chat request gets when it names none.
+///
+/// Not OpenAI's legacy 16 -- that floor belongs to `/v1/completions`,
+/// where a caller asking for a completion of a fragment usually wants a
+/// fragment back. A chat client that omits `max_tokens` wants an
+/// answer, and 16 tokens of one reads as a truncated server.
+///
+/// It is safe to be this large only because the context ceiling CLAMPS
+/// rather than refuses (see `generate`): a request whose prompt leaves
+/// less than this much room is served with what remains, not rejected
+/// over a number the caller never set.
+const DEFAULT_CHAT_MAX_TOKENS: usize = 32_768;
+
+/// The DeepSeek-wire thinking switch.
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct ThinkingSwitch {
+    #[serde(rename = "type")]
+    pub(crate) kind: String,
+}
+
+/// Every spelling a caller can use to steer the template's thinking
+/// themselves. If any of these is already present in
+/// `chat_template_kwargs`, the protocol-level knobs stand down.
+const THINKING_KWARG_KEYS: [&str; 4] = [
+    "enable_thinking",
+    "thinking",
+    "thinking_mode",
+    "reasoning_effort",
+];
+
+/// The efforts that mean "do not think" rather than naming a gear.
+/// Compared after trimming and lowercasing, because a client that sends
+/// `"None"` means the same thing.
+const DISABLE_EFFORTS: [&str; 2] = ["none", "off"];
+
 fn default_max_tokens() -> usize {
-    16
+    DEFAULT_CHAT_MAX_TOKENS
 }
 
 impl ChatCompletionRequest {
@@ -1060,9 +1132,153 @@ impl ChatCompletionRequest {
             && !matches!(&self.tool_choice, Some(ToolChoice::Mode(m)) if m == "none")
     }
 
+    /// The `chat_template_kwargs` this request actually renders with.
+    ///
+    /// Five rules, all of them from `ferrox-edge`:
+    ///
+    /// * **An explicit knob wins wholesale.** A caller who already set
+    ///   any of `enable_thinking` / `thinking` / `thinking_mode` /
+    ///   `reasoning_effort` inside `chat_template_kwargs` has said what
+    ///   they want; the protocol-level knobs are then ignored entirely
+    ///   rather than merged, because a merge would let a default
+    ///   contradict an explicit request.
+    /// * **`none` and `off` are not gears.** `reasoning_effort: "none"`
+    ///   means *turn thinking off* and broadcasts the off pair; it must
+    ///   not be quantized onto the nearest gear, which would turn "do
+    ///   not think" into "think a little". Same for the DeepSeek-wire
+    ///   `thinking: {"type": "disabled"}`, which beats any effort.
+    ///
+    /// * **Thinking follows the tools.** Offering tools turns thinking
+    ///   on even when the caller said nothing, because some encoders
+    ///   emit well-formed tool calls only in thinking mode
+    ///   ([`ferrox_edge::resolve_thinking_mode`]).
+    /// * **Effort is quantized onto what this checkpoint grades.** A
+    ///   template that accepts only the OpenAI triple must not be sent
+    ///   `minimal`; it is mapped to the nearest gear, or dropped when no
+    ///   gear is close enough, rather than interpolated verbatim into
+    ///   the prompt ([`ferrox_edge::sanitize_effort`], against the
+    ///   profile probed at load).
+    /// * **One value, every spelling.** The graded-strength dialect
+    ///   reads `reasoning_strength`; a Jinja template ignores variables
+    ///   it does not declare, so broadcasting costs nothing and removes
+    ///   a per-family routing table
+    ///   ([`ferrox_edge::broadcast_effort_spellings`]).
+    ///
+    /// Every render path has to do this identically -- a request that
+    /// validates against one prompt and generates from another is the
+    /// failure this returns a single value to prevent.
+    /// Which way this request steers thinking, before any template is
+    /// consulted: `Some(false)` off, `Some(true)` on, `None` unstated.
+    ///
+    /// `thinking: {"type": …}` decides outright and `disabled` wins over
+    /// any effort, because a client that sent both a switch and a gear
+    /// meant the switch -- the gear is what it would use *if* thinking
+    /// were on.
+    fn thinking_direction(&self) -> Option<bool> {
+        if let Some(switch) = &self.thinking {
+            return match switch.kind.trim().to_ascii_lowercase().as_str() {
+                "disabled" => Some(false),
+                "enabled" => Some(true),
+                // An unrecognized type is not a silent default -- see
+                // `validate_supported_fields`, which rejects it.
+                _ => None,
+            };
+        }
+        let effort = self.reasoning_effort.as_ref()?;
+        DISABLE_EFFORTS
+            .contains(&effort.trim().to_ascii_lowercase().as_str())
+            .then_some(false)
+    }
+
+    fn resolve_template_kwargs(
+        &self,
+        template: &chat_template::PromptTemplate,
+    ) -> serde_json::Map<String, serde_json::Value> {
+        let mut kwargs = self.chat_template_kwargs.clone().unwrap_or_default();
+        // Whether the caller steered the template themselves. Read
+        // BEFORE anything is added, or every request looks explicit
+        // from the second statement on.
+        let caller_steered = THINKING_KWARG_KEYS.iter().any(|k| kwargs.contains_key(*k));
+
+        if !caller_steered {
+            match self.thinking_direction() {
+                Some(false) => {
+                    for (k, v) in ferrox_edge::effort::thinking_off_kwargs() {
+                        kwargs.insert(k, v);
+                    }
+                    // Nothing below applies: an effort would re-enter a
+                    // block this request just closed.
+                    return kwargs;
+                }
+                Some(true) => {
+                    for (k, v) in ferrox_edge::effort::thinking_on_kwargs() {
+                        kwargs.insert(k, v);
+                    }
+                }
+                None => {}
+            }
+            if let Some(effort) = &self.reasoning_effort {
+                kwargs
+                    .entry("reasoning_effort".to_string())
+                    .or_insert_with(|| serde_json::json!(effort));
+            }
+        }
+
+        let offered: Vec<serde_json::Value> = if self.tools_active() {
+            self.tools.iter().map(chat_template::tool_json).collect()
+        } else {
+            Vec::new()
+        };
+        let thinking = ferrox_edge::resolve_thinking_mode(Some(&kwargs), Some(&offered));
+        if thinking == ferrox_edge::ThinkingMode::Thinking {
+            for (k, v) in ferrox_edge::effort::thinking_on_kwargs() {
+                kwargs.entry(k).or_insert(v);
+            }
+        }
+        match ferrox_edge::sanitize_effort(&mut kwargs, template.efforts()) {
+            ferrox_edge::EffortMapping::Mapped(to) => {
+                tracing::debug!("reasoning_effort quantized to {}", to.as_str());
+            }
+            ferrox_edge::EffortMapping::Dropped => {
+                tracing::debug!(
+                    "reasoning_effort dropped: this checkpoint's template grades no gear close \
+                     enough, so its own default applies"
+                );
+            }
+            ferrox_edge::EffortMapping::Unchanged => {}
+        }
+        ferrox_edge::broadcast_effort_spellings(&mut kwargs);
+        kwargs
+    }
+
     /// Reject OpenAI fields we do not implement, and `tool_choice`
     /// values that would silently lie (required / named function).
     fn validate_supported_fields(&self) -> Result<(), ApiError> {
+        // An explicit zero is a client error, not "unset". Serde already
+        // told them apart -- an absent field became
+        // `DEFAULT_CHAT_MAX_TOKENS` -- so a 0 here is one the caller
+        // wrote, and the engine cannot serve a zero-token budget: the
+        // request would never become decodable and the client would wait
+        // for an answer that cannot arrive.
+        if self.max_tokens == 0 {
+            return Err(invalid_request(
+                "max_tokens must be at least 1",
+                "max_tokens",
+            ));
+        }
+        // An unrecognized switch is refused rather than read as "on":
+        // a client that misspells `disabled` and is served a thinking
+        // model anyway has been silently given the opposite of what it
+        // asked for.
+        if let Some(switch) = &self.thinking {
+            let kind = switch.kind.trim().to_ascii_lowercase();
+            if kind != "enabled" && kind != "disabled" {
+                return Err(invalid_request(
+                    "thinking.type must be \"enabled\" or \"disabled\"",
+                    "thinking.type",
+                ));
+            }
+        }
         for msg in &self.messages {
             if msg.content.as_ref().is_some_and(MessageContent::has_image) {
                 return Err(unsupported_feature(
@@ -1166,18 +1382,10 @@ impl ChatCompletionRequest {
     /// strings (Gemma IT emits `<end_of_turn>` before `<eos>`).
     fn generation_params_for_template(
         &self,
-        template: chat_template::ChatTemplate,
+        template: &chat_template::PromptTemplate,
     ) -> GenerationParams {
         let mut params = self.generation_params();
-        if matches!(
-            template,
-            chat_template::ChatTemplate::Gemma | chat_template::ChatTemplate::Gemma4
-        ) {
-            let stop = match template {
-                chat_template::ChatTemplate::Gemma => "<end_of_turn>",
-                chat_template::ChatTemplate::Gemma4 => "<turn|>",
-                _ => unreachable!(),
-            };
+        if let Some(stop) = template.end_of_turn() {
             if !params.stop.iter().any(|s| s == stop) {
                 params.stop.push(stop.to_string());
             }
@@ -1235,6 +1443,11 @@ struct ChatCompletionResponseMessage {
     role: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     content: Option<String>,
+    /// A reasoning model's chain of thought, split out of `content`.
+    /// Absent for a model that emitted none, which is also what a
+    /// client that does not know the field sees.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_content: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_calls: Option<Vec<ToolCallOut>>,
 }
@@ -1245,6 +1458,74 @@ struct ToolCallOut {
     #[serde(rename = "type")]
     kind: &'static str,
     function: ToolCallFunctionOut,
+}
+
+/// One tool call as a **streamed delta**.
+///
+/// OpenAI's incremental shape: `index` correlates the pieces, and every
+/// other field is optional because the first delta of a call carries
+/// its identity and the ones after it carry only more argument text. A
+/// buffered path expresses a whole call as a delta with every field
+/// set, so there is one type on the wire rather than two.
+#[derive(Serialize, Clone)]
+struct ToolCallDelta {
+    index: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    id: Option<String>,
+    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+    kind: Option<&'static str>,
+    function: ToolCallFunctionDelta,
+}
+
+#[derive(Serialize, Clone, Default)]
+struct ToolCallFunctionDelta {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
+    /// A literal continuation of this call's arguments JSON. A client
+    /// concatenates them in `index` order and parses the result.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    arguments: Option<String>,
+}
+
+impl ToolCallDelta {
+    /// The whole call in one delta, for a path that had it all along.
+    fn whole(index: usize, name: String, arguments: String) -> Self {
+        ToolCallDelta {
+            index,
+            id: Some(format!("call_{index}")),
+            kind: Some("function"),
+            function: ToolCallFunctionDelta {
+                name: Some(name),
+                arguments: Some(arguments),
+            },
+        }
+    }
+
+    /// The opening delta: identity, and no arguments yet.
+    fn opening(index: usize, name: String) -> Self {
+        ToolCallDelta {
+            index,
+            id: Some(format!("call_{index}")),
+            kind: Some("function"),
+            function: ToolCallFunctionDelta {
+                name: Some(name),
+                arguments: Some(String::new()),
+            },
+        }
+    }
+
+    /// A continuation: more argument text for a call already opened.
+    fn arguments(index: usize, fragment: String) -> Self {
+        ToolCallDelta {
+            index,
+            id: None,
+            kind: None,
+            function: ToolCallFunctionDelta {
+                name: None,
+                arguments: Some(fragment),
+            },
+        }
+    }
 }
 
 #[derive(Serialize, Clone)]
@@ -1289,8 +1570,11 @@ struct ChatCompletionChunkDelta {
     role: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     content: Option<String>,
+    /// See `ChatCompletionResponseMessage::reasoning_content`.
     #[serde(skip_serializing_if = "Option::is_none")]
-    tool_calls: Option<Vec<ToolCallOut>>,
+    reasoning_content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_calls: Option<Vec<ToolCallDelta>>,
 }
 
 #[derive(Serialize)]
@@ -1441,6 +1725,18 @@ async fn list_models(State(state): State<Arc<AppState>>) -> Json<serde_json::Val
         "ferrox_synthetic_weights": active.model.is_synthetic(),
         "ferrox_tokenizer": active.model.tokenizer_kind(),
     });
+    // Which reasoning gears this checkpoint really has, learned by
+    // probing its own template at load. A checkpoint that says nothing
+    // about thinking carries NEITHER field rather than an empty list:
+    // an empty list reads as "asked, and it has no gears", which is a
+    // different claim from "this is not a reasoning model".
+    let gears = active.model.chat_template().think_gears().clone();
+    if !gears.is_empty() {
+        model_entry["supported_reasoning_efforts"] = serde_json::json!(gears.supported);
+        if let Some(default) = gears.default {
+            model_entry["default_reasoning_effort"] = serde_json::json!(default);
+        }
+    }
     if let Some(mcp) = &state.mcp {
         model_entry["ferrox_mcp"] = mcp.models_metadata();
     }
@@ -1615,6 +1911,23 @@ async fn metrics(State(state): State<Arc<AppState>>) -> Response {
 }
 
 pub(crate) type ApiError = (StatusCode, Json<serde_json::Value>);
+
+/// A field the server understands but this value of which it cannot
+/// serve. Distinct from [`unsupported_feature`] (501, "ferrox does not
+/// implement this") -- a 400 says the request itself is wrong, which is
+/// the difference between a client retrying elsewhere and a client
+/// fixing its own body.
+pub(crate) fn invalid_request(message: &str, param: &str) -> ApiError {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(serde_json::json!({"error": {
+            "message": message,
+            "type": "invalid_request_error",
+            "param": param,
+            "code": null,
+        }})),
+    )
+}
 
 pub(crate) fn unsupported_feature(message: &str) -> ApiError {
     (
@@ -1849,13 +2162,24 @@ pub(crate) fn run_generation(
     ))
 }
 
+/// Render a conversation into the prompt the served checkpoint expects.
+///
+/// Who describes the tools depends on the template: one that reads
+/// `tools` is handed them structurally and owns the whole grammar, and
+/// one that does not gets [`tool_preamble`] as an extra leading system
+/// turn -- this server's original answer, and still the only one
+/// available for a checkpoint whose template never mentions tools.
+///
+/// `extra` is the request's already-sanitized `chat_template_kwargs`
+/// (see [`resolve_template_kwargs`]).
 pub(crate) fn prompt_from_messages(
     messages: &[ChatMessage],
-    template: chat_template::ChatTemplate,
+    template: &chat_template::PromptTemplate,
     tools: &[ToolDef],
-) -> String {
-    if tools.is_empty() {
-        template.render(messages)
+    extra: serde_json::Map<String, serde_json::Value>,
+) -> Result<String, ApiError> {
+    let rendered = if tools.is_empty() || template.handles_tools() {
+        template.render(messages, tools, extra)
     } else {
         let mut with_preamble = Vec::with_capacity(messages.len() + 1);
         with_preamble.push(ChatMessage {
@@ -1865,8 +2189,27 @@ pub(crate) fn prompt_from_messages(
             tool_call_id: None,
         });
         with_preamble.extend_from_slice(messages);
-        template.render(&with_preamble)
-    }
+        template.render(&with_preamble, &[], extra)
+    };
+    rendered.map_err(template_error_response)
+}
+
+/// A template that will not render is a request failure, never a
+/// fallback to a guessed one: serving a checkpoint framing it has never
+/// seen is the exact bug `chat_template` exists to delete, so the
+/// compiler's own message goes back to the caller instead.
+fn template_error_response(err: ferrox_models::chat_template::TemplateError) -> ApiError {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(serde_json::json!({
+            "error": {
+                "message": format!("chat template failed to render: {err}"),
+                "type": "invalid_request_error",
+                "param": "messages",
+                "code": null,
+            }
+        })),
+    )
 }
 
 /// Real, disclosed approach for tool-calling without grammar-
@@ -1876,7 +2219,9 @@ pub(crate) fn prompt_from_messages(
 /// marker, then reuse the existing stop-sequence machinery (see
 /// `ChatCompletionRequest::effective_stop_sequences`) to end
 /// generation right after it, and parse the captured text for that
-/// marker afterward (`extract_tool_call`). This is stop-bounded,
+/// marker afterward (`output::parse_output`, which also accepts the
+/// format the served checkpoint's own family emits). This is
+/// stop-bounded,
 /// prompt-engineered JSON extraction, not enforced-valid-JSON output --
 /// a real limitation, not overclaimed.
 fn tool_preamble(tools: &[ToolDef]) -> String {
@@ -1902,59 +2247,85 @@ fn tool_preamble(tools: &[ToolDef]) -> String {
     out
 }
 
-/// Looks for a `<tool_call>{...}</tool_call>` marker (see
-/// `tool_preamble`) and parses its JSON body into a `(name,
-/// arguments)` pair -- `arguments` kept as a JSON-encoded *string*,
-/// matching OpenAI's real `tool_calls[].function.arguments`
-/// convention (a string, even though the model itself writes it as
-/// literal JSON).
-fn extract_tool_call(text: &str) -> Option<(String, String)> {
-    const START: &str = "<tool_call>";
-    const END: &str = "</tool_call>";
-    let start = text.find(START)? + START.len();
-    let end = start + text[start..].find(END)?;
-    let body = text[start..end].trim();
-    let value: serde_json::Value = serde_json::from_str(body).ok()?;
-    let name = value.get("name")?.as_str()?.to_string();
-    let arguments = value
-        .get("arguments")
-        .cloned()
-        .unwrap_or_else(|| serde_json::json!({}));
-    Some((name, arguments.to_string()))
+/// Fold one batch of parser events into the text to stream and the
+/// tool-call deltas to stream beside it.
+///
+/// `opened` counts calls that have gone out, which is both the wire
+/// `index` and how the terminal chunk knows whether this generation
+/// ended in a tool call. `CallEnd` deliberately emits nothing: every
+/// byte of the arguments has already gone out as a fragment, and
+/// repeating them would make a client that concatenates deltas produce
+/// the arguments twice.
+fn tool_call_deltas(
+    events: Vec<ferrox_edge::ToolCallEvent>,
+    opened: &std::cell::Cell<usize>,
+) -> (String, Vec<ToolCallDelta>) {
+    let mut text = String::new();
+    let mut deltas = Vec::new();
+    for event in events {
+        match event {
+            ferrox_edge::ToolCallEvent::Text(chunk) => text.push_str(&chunk),
+            ferrox_edge::ToolCallEvent::CallStart { index, name } => {
+                opened.set(opened.get().max(index + 1));
+                deltas.push(ToolCallDelta::opening(index, name));
+            }
+            ferrox_edge::ToolCallEvent::CallArguments { index, fragment } => {
+                if !fragment.is_empty() {
+                    deltas.push(ToolCallDelta::arguments(index, fragment));
+                }
+            }
+            ferrox_edge::ToolCallEvent::CallEnd { .. } => {}
+        }
+    }
+    (text, deltas)
 }
 
 /// Builds the final response message + finish reason from raw
-/// generated text: promotes `base_finish` to `"tool_calls"` (moving
-/// the text into a structured `tool_calls` entry instead of `content`)
-/// when tool-calling was active and the text actually contains a real
-/// `<tool_call>{...}</tool_call>` marker -- a model can still just
-/// answer in plain text despite tools being offered, which must fall
-/// through to an ordinary text response, not an error.
+/// generated text.
+///
+/// Three things come out of the text: a reasoning block, when the
+/// served checkpoint's family emits one; every tool call it made, in
+/// whichever format it used; and whatever prose is left. `base_finish`
+/// is promoted to `"tool_calls"` only when a call was actually found --
+/// a model can answer in plain text despite tools being offered, and
+/// that must fall through to an ordinary text response rather than an
+/// error.
 fn build_response_message(
-    content: String,
-    tools_active: bool,
+    text: String,
+    tools: &[ToolDef],
+    posture: output::OutputPosture,
     base_finish: &'static str,
 ) -> (ChatCompletionResponseMessage, &'static str) {
-    if tools_active {
-        if let Some((name, arguments)) = extract_tool_call(&content) {
-            return (
-                ChatCompletionResponseMessage {
-                    role: "assistant",
-                    content: None,
-                    tool_calls: Some(vec![ToolCallOut {
-                        id: "call_0".to_string(),
-                        kind: "function",
-                        function: ToolCallFunctionOut { name, arguments },
-                    }]),
-                },
-                "tool_calls",
-            );
-        }
+    let parsed = output::parse_output(&text, tools, posture);
+    let calls: Vec<ToolCallOut> = parsed
+        .calls
+        .into_iter()
+        .enumerate()
+        .map(|(index, call)| ToolCallOut {
+            id: format!("call_{index}"),
+            kind: "function",
+            function: ToolCallFunctionOut {
+                name: call.name,
+                arguments: call.arguments,
+            },
+        })
+        .collect();
+    if !calls.is_empty() {
+        return (
+            ChatCompletionResponseMessage {
+                role: "assistant",
+                content: None,
+                reasoning_content: parsed.reasoning,
+                tool_calls: Some(calls),
+            },
+            "tool_calls",
+        );
     }
     (
         ChatCompletionResponseMessage {
             role: "assistant",
-            content: Some(content),
+            content: Some(parsed.content),
+            reasoning_content: parsed.reasoning,
             tool_calls: None,
         },
         base_finish,
@@ -2098,7 +2469,9 @@ async fn chat_completions_full(
     // halfway through (see `AppState::active`).
     let active = state.require_active()?;
     let history = resolve_history(&state, &req);
-    let prompt = prompt_from_messages(&history, active.model.chat_template(), &req.tools);
+    let template = active.model.chat_template();
+    let kwargs = req.resolve_template_kwargs(&template);
+    let prompt = prompt_from_messages(&history, &template, &req.tools, kwargs)?;
     let key = req.is_cacheable().then(|| req.cache_key(&prompt));
 
     let (completion, cache_status) = if let Some(cached) = key
@@ -2113,7 +2486,7 @@ async fn chat_completions_full(
         let prefix_cache = state.prefix_cache.clone();
         let batcher = active.batcher.clone();
         let ceiling = active.ceiling.clone();
-        let params = req.generation_params_for_template(active.model.chat_template());
+        let params = req.generation_params_for_template(&template);
         let prompt_for_task = prompt.clone();
         let (chunks, finish, usage) = tokio::task::spawn_blocking(move || {
             run_generation(
@@ -2165,8 +2538,12 @@ async fn chat_completions_full(
         );
     }
 
-    let (message, finish_reason) =
-        build_response_message(content, tools_active, completion.finish.as_str());
+    let (message, finish_reason) = build_response_message(
+        content,
+        if tools_active { &req.tools } else { &[] },
+        output::OutputPosture::resolve(active.model.name(), &prompt),
+        completion.finish.as_str(),
+    );
 
     state.record_request(stats::Record {
         request_id: &request_id,
@@ -2210,7 +2587,9 @@ async fn chat_completions_stream(
     // splice two checkpoints into one completion.
     let active = state.require_active()?;
     let history = resolve_history(&state, &req);
-    let prompt = prompt_from_messages(&history, active.model.chat_template(), &req.tools);
+    let template = active.model.chat_template();
+    let kwargs = req.resolve_template_kwargs(&template);
+    let prompt = prompt_from_messages(&history, &template, &req.tools, kwargs)?;
     let model_name = req.model.clone();
     let session_id = req.session_id.clone();
     let sessions = state.sessions.clone();
@@ -2220,11 +2599,22 @@ async fn chat_completions_stream(
     let prefix_cache = state.prefix_cache.clone();
     let batcher = active.batcher.clone();
     let ceiling = active.ceiling.clone();
-    let mut params = req.generation_params_for_template(active.model.chat_template());
+    let mut params = req.generation_params_for_template(&template);
     let stats_state = Arc::clone(&state);
     // Read now, off the handle this stream will decode against. Read
     // later it would name whatever a swap had made current by then.
     let served_model = active.model.name().to_string();
+    // How to read this stream, fixed before the first token: the family
+    // from the served checkpoint, and whether the prompt that was
+    // actually rendered left the model inside a reasoning block.
+    let posture = output::OutputPosture::resolve(&served_model, &prompt);
+    // The offered tools, captured for the terminal parse: the request
+    // itself does not outlive the closure that consumes it.
+    let offered_tools: Vec<ToolDef> = if tools_active {
+        req.tools.clone()
+    } else {
+        Vec::new()
+    };
 
     // Tier two of cancellation: the id is already on the wire, so the
     // client can name it. The guard rides with the generation task and
@@ -2236,7 +2626,12 @@ async fn chat_completions_stream(
     // Tool-call detection needs the full stop-bounded text; continuous
     // batching returns one string. Both stay buffered. Otherwise each
     // decoded chunk is pushed on a channel for overlapped SSE delivery.
-    let overlap = !tools_active && batcher.is_none();
+    // Incremental streaming, including when tools are offered. It used
+    // to be `!tools_active && ...`: finding a tool call needed the
+    // whole text. `ferrox_edge::ToolCallParser` streams prefix-stable
+    // argument fragments, so that reason is gone, and a coding agent
+    // now watches an argument arrive instead of waiting for it.
+    let overlap = batcher.is_none();
 
     // Opt-in replay. Registering a buffer is also what decides whether a
     // dropped socket cancels this generation -- see `resume`'s module
@@ -2261,6 +2656,30 @@ async fn chat_completions_stream(
         let orphan_timeout = sse::orphan_timeout_from_env();
         let mut first = true;
         let head_request_id = request_id.clone();
+        // The chain-of-thought split, applied as the tokens arrive
+        // rather than at the end. Without this an overlapped stream --
+        // which is the default for a reasoning model with no tools --
+        // would deliver the whole thinking block as `content` and then
+        // the buffered path would deliver the same request's thinking
+        // as `reasoning_content`, so the same question would answer
+        // differently depending on a transport detail. Shared with the
+        // terminal flush below, which releases whatever the parser is
+        // still withholding against a marker that never arrived.
+        let stream_reasoning: Rc<RefCell<Option<ferrox_edge::ReasoningParser>>> =
+            Rc::new(RefCell::new(posture.reasoning_parser()));
+        let emit_reasoning = Rc::clone(&stream_reasoning);
+        // The tool-call parser, fed whatever the reasoning parser
+        // classified as content. Absent when the request offered no
+        // tools, in which case marker-looking text is just text.
+        let stream_tools: Rc<RefCell<Option<ferrox_edge::ToolCallParser>>> = Rc::new(RefCell::new(
+            tools_active.then(|| posture.tool_call_parser(&offered_tools)),
+        ));
+        let emit_tools = Rc::clone(&stream_tools);
+        // How many calls have been opened on the wire, so the terminal
+        // chunk knows whether to say `tool_calls` and does not repeat
+        // what already went out.
+        let streamed_calls = Rc::new(std::cell::Cell::new(0usize));
+        let emit_streamed_calls = Rc::clone(&streamed_calls);
         let result = run_generation_emit(
             &model,
             &prompt,
@@ -2271,6 +2690,29 @@ async fn chat_completions_stream(
             ceiling.as_deref(),
             |chunk| {
                 if !overlap || chunk.is_empty() {
+                    return;
+                }
+                let (reasoning, content) = match emit_reasoning.borrow_mut().as_mut() {
+                    Some(parser) => {
+                        let delta = parser.push(chunk);
+                        (delta.reasoning, delta.content)
+                    }
+                    None => (String::new(), chunk.to_string()),
+                };
+                // Content goes through the tool parser, which holds
+                // back anything that could still become a marker and
+                // turns a recognized call into wire deltas.
+                let (content, tool_calls) = match emit_tools.borrow_mut().as_mut() {
+                    Some(parser) => {
+                        let (text, calls) =
+                            tool_call_deltas(parser.push(&content), &emit_streamed_calls);
+                        (text, calls)
+                    }
+                    None => (content, Vec::new()),
+                };
+                // Both parsers withhold partial markers, so a chunk can
+                // legitimately produce nothing at all this time round.
+                if reasoning.is_empty() && content.is_empty() && tool_calls.is_empty() {
                     return;
                 }
                 let role = if first { Some("assistant") } else { None };
@@ -2285,8 +2727,9 @@ async fn chat_completions_stream(
                         index: 0,
                         delta: ChatCompletionChunkDelta {
                             role,
-                            content: Some(chunk.to_string()),
-                            tool_calls: None,
+                            content: (!content.is_empty()).then_some(content),
+                            reasoning_content: (!reasoning.is_empty()).then_some(reasoning),
+                            tool_calls: (!tool_calls.is_empty()).then_some(tool_calls),
                         },
                         finish_reason: None,
                     }],
@@ -2347,13 +2790,27 @@ async fn chat_completions_stream(
                         },
                     );
                 }
-                let tool_call = if tools_active {
-                    extract_tool_call(&full_text)
-                } else {
-                    None
-                };
-                if !overlap {
-                    if let Some((name, arguments)) = &tool_call {
+                // Both parsers may still be holding a run that could
+                // have become a marker and did not. It is ordinary
+                // output; dropping it would truncate every answer whose
+                // tail happens to look like the start of a `</think>`
+                // or a `<tool_call>`.
+                let mut streamed_finish: Option<&'static str> = None;
+                if overlap {
+                    let tail = stream_reasoning
+                        .borrow_mut()
+                        .as_mut()
+                        .map(|parser| parser.flush())
+                        .unwrap_or_default();
+                    let (mut content, mut tool_calls) = (tail.content, Vec::new());
+                    if let Some(parser) = stream_tools.borrow_mut().as_mut() {
+                        let mut events = parser.push(&content);
+                        events.extend(parser.finish());
+                        let (text, calls) = tool_call_deltas(events, &streamed_calls);
+                        content = text;
+                        tool_calls = calls;
+                    }
+                    if !content.is_empty() || !tail.reasoning.is_empty() || !tool_calls.is_empty() {
                         let payload = ChatCompletionChunk {
                             id: request_id.clone(),
                             request_id: pending_request_id.take(),
@@ -2362,16 +2819,11 @@ async fn chat_completions_stream(
                             choices: vec![ChatCompletionChunkChoice {
                                 index: 0,
                                 delta: ChatCompletionChunkDelta {
-                                    role: Some("assistant"),
-                                    content: None,
-                                    tool_calls: Some(vec![ToolCallOut {
-                                        id: "call_0".to_string(),
-                                        kind: "function",
-                                        function: ToolCallFunctionOut {
-                                            name: name.clone(),
-                                            arguments: arguments.clone(),
-                                        },
-                                    }]),
+                                    role: None,
+                                    content: (!content.is_empty()).then_some(content),
+                                    reasoning_content: (!tail.reasoning.is_empty())
+                                        .then_some(tail.reasoning),
+                                    tool_calls: (!tool_calls.is_empty()).then_some(tool_calls),
                                 },
                                 finish_reason: None,
                             }],
@@ -2379,7 +2831,29 @@ async fn chat_completions_stream(
                         };
                         let _ =
                             sse::send_or_orphan(&tx, Ok(emitter.event(&payload)), orphan_timeout);
-                    } else if !full_text.is_empty() {
+                    }
+                    if streamed_calls.get() > 0 {
+                        streamed_finish = Some("tool_calls");
+                    }
+                } else {
+                    // The batched path had no incremental stream to
+                    // ride on, so the whole answer goes out at once.
+                    let parsed = output::parse_output(&full_text, &offered_tools, posture);
+                    let tool_calls: Vec<ToolCallDelta> = parsed
+                        .calls
+                        .iter()
+                        .enumerate()
+                        .map(|(index, call)| {
+                            ToolCallDelta::whole(index, call.name.clone(), call.arguments.clone())
+                        })
+                        .collect();
+                    if !tool_calls.is_empty() {
+                        streamed_finish = Some("tool_calls");
+                    }
+                    if !tool_calls.is_empty()
+                        || !parsed.content.is_empty()
+                        || parsed.reasoning.is_some()
+                    {
                         let payload = ChatCompletionChunk {
                             id: request_id.clone(),
                             request_id: pending_request_id.take(),
@@ -2389,8 +2863,10 @@ async fn chat_completions_stream(
                                 index: 0,
                                 delta: ChatCompletionChunkDelta {
                                     role: Some("assistant"),
-                                    content: Some(full_text),
-                                    tool_calls: None,
+                                    content: (!parsed.content.is_empty() && tool_calls.is_empty())
+                                        .then(|| parsed.content.clone()),
+                                    reasoning_content: parsed.reasoning.clone(),
+                                    tool_calls: (!tool_calls.is_empty()).then_some(tool_calls),
                                 },
                                 finish_reason: None,
                             }],
@@ -2400,10 +2876,12 @@ async fn chat_completions_stream(
                             sse::send_or_orphan(&tx, Ok(emitter.event(&payload)), orphan_timeout);
                     }
                 }
-                let final_finish_reason = if tool_call.is_some() {
-                    "tool_calls"
-                } else {
-                    finish.as_str()
+                // A truncated generation is `length` even if it managed
+                // to open a call: the client must not treat a
+                // half-written call as one it should execute.
+                let final_finish_reason = match streamed_finish {
+                    Some(reason) if finish.as_str() != "length" => reason,
+                    _ => finish.as_str(),
                 };
                 let final_payload = ChatCompletionChunk {
                     id: request_id.clone(),
@@ -2415,6 +2893,7 @@ async fn chat_completions_stream(
                         delta: ChatCompletionChunkDelta {
                             role: None,
                             content: None,
+                            reasoning_content: None,
                             tool_calls: None,
                         },
                         finish_reason: Some(final_finish_reason),
@@ -2465,6 +2944,7 @@ async fn chat_completions_stream(
                         delta: ChatCompletionChunkDelta {
                             role: Some("assistant"),
                             content: Some(format!("[error: {e}]")),
+                            reasoning_content: None,
                             tool_calls: None,
                         },
                         finish_reason: Some("stop"),
@@ -2784,6 +3264,8 @@ fn build_app_state(
         continuous_batching_enabled: enable_continuous_batching,
         loading_model: Mutex::new(None),
         last_load_error: Mutex::new(None),
+        serving: Mutex::new(ferrox_edge::ServingStats::default()),
+        maintenance: Mutex::new(ferrox_edge::MaintenanceGate::new()),
     }
 }
 
@@ -3639,7 +4121,7 @@ mod tests {
             stop_tokens: StopTokens::default(),
             bos_id: None,
             is_synthetic: true,
-            chat_template: chat_template::ChatTemplate::Plain,
+            chat_template: chat_template::PromptTemplate::plain(),
         })
     }
 
@@ -3667,7 +4149,7 @@ mod tests {
             stop_tokens: StopTokens::default(),
             bos_id: None,
             is_synthetic: true,
-            chat_template: chat_template::ChatTemplate::Plain,
+            chat_template: chat_template::PromptTemplate::plain(),
         })
     }
 
@@ -3701,6 +4183,8 @@ mod tests {
             continuous_batching_enabled: false,
             loading_model: Mutex::new(None),
             last_load_error: Mutex::new(None),
+            serving: Mutex::new(ferrox_edge::ServingStats::default()),
+            maintenance: Mutex::new(ferrox_edge::MaintenanceGate::new()),
         }
     }
 
@@ -3758,8 +4242,68 @@ mod tests {
             stop_tokens: StopTokens::default(),
             bos_id: None,
             is_synthetic: true,
-            chat_template: chat_template::ChatTemplate::Plain,
+            chat_template: chat_template::PromptTemplate::plain(),
         })
+    }
+
+    /// The same model, served through a real checkpoint's template
+    /// rather than the role-labeled builtin -- so a test can ask what
+    /// gets advertised for a checkpoint that actually has gears.
+    fn model_with_template(name: &'static str, source: &str) -> Model {
+        let mut cfg = test_dense_fixture();
+        cfg.name = name;
+        cfg.vocab_size = 256;
+        Model::Gguf(GgufModel {
+            decoder: Arc::new(Decoder::new_random_small(cfg, 2, 256)),
+            tokenizer: Arc::new(ServerTokenizer::Byte),
+            stop_tokens: StopTokens::default(),
+            bos_id: None,
+            is_synthetic: true,
+            chat_template: chat_template::PromptTemplate::from_gguf_metadata(
+                Some(source),
+                Some("qwen3"),
+                false,
+                None,
+                None,
+            ),
+        })
+    }
+
+    /// A client should not have to guess which gears a checkpoint has.
+    #[tokio::test]
+    async fn models_advertises_the_gears_this_checkpoint_actually_has() {
+        let reasoning = "{% if enable_thinking %}<think>{% endif %}\
+             {% if reasoning_effort %}\
+               {% if reasoning_effort not in ['low','medium','high'] %}\
+                 {{ raise_exception('bad effort') }}\
+               {% endif %}[{{ reasoning_effort }}]\
+             {% endif %}{{ messages[0].content }}";
+        let state = Arc::new(test_state(
+            model_with_template("thinker", reasoning),
+            ResponseCache::new(4, Duration::from_secs(60)),
+        ));
+        let app = test_app_with_state(state);
+        let (status, models) = get_json(&app, ferrox_api::routes::V1_MODELS).await;
+        assert_eq!(status, StatusCode::OK);
+        let entry = &models["data"][0];
+        assert_eq!(
+            entry["supported_reasoning_efforts"],
+            serde_json::json!(["off", "low", "medium", "high"])
+        );
+        assert_eq!(entry["default_reasoning_effort"], serde_json::json!("off"));
+    }
+
+    /// The other half of the acceptance criterion: neither field, not
+    /// an empty one. An empty list would say the question was asked and
+    /// the answer was "no gears"; absence says it is not that kind of
+    /// model.
+    #[tokio::test]
+    async fn a_checkpoint_with_no_thinking_controls_advertises_neither_field() {
+        let app = test_app();
+        let (_, models) = get_json(&app, ferrox_api::routes::V1_MODELS).await;
+        let entry = &models["data"][0];
+        assert!(entry.get("supported_reasoning_efforts").is_none());
+        assert!(entry.get("default_reasoning_effort").is_none());
     }
 
     fn active_model(state: &AppState, name: &'static str) -> Arc<ActiveModel> {
@@ -4768,7 +5312,7 @@ mod tests {
             stop_tokens: StopTokens::default(),
             bos_id: None,
             is_synthetic: false,
-            chat_template: chat_template::ChatTemplate::Plain,
+            chat_template: chat_template::PromptTemplate::plain(),
         });
         let state = Arc::new(test_state(
             model,
@@ -4851,58 +5395,69 @@ mod tests {
     }
 
     #[test]
-    fn extract_tool_call_parses_a_real_marker() {
+    fn a_real_marker_becomes_a_structured_tool_call() {
         let text = "sure, let me check.<tool_call>{\"name\": \"get_weather\", \"arguments\": {\"location\": \"Paris\"}}</tool_call>";
-        let (name, arguments) = extract_tool_call(text).expect("must find the marker");
-        assert_eq!(name, "get_weather");
-        let parsed: serde_json::Value = serde_json::from_str(&arguments).unwrap();
+        let (message, finish) = build_response_message(
+            text.to_string(),
+            &[weather_tool_def()],
+            output::OutputPosture::for_model("test-model"),
+            "stop",
+        );
+        assert_eq!(finish, "tool_calls");
+        let calls = message.tool_calls.expect("must carry a tool call");
+        assert_eq!(calls[0].function.name, "get_weather");
+        let parsed: serde_json::Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
         assert_eq!(parsed["location"], "Paris");
     }
 
     #[test]
-    fn extract_tool_call_returns_none_when_no_marker_present() {
-        assert_eq!(
-            extract_tool_call("just a plain answer, no markers here"),
-            None
-        );
-    }
-
-    #[test]
-    fn extract_tool_call_returns_none_on_malformed_json_inside_the_marker() {
-        assert_eq!(
-            extract_tool_call("<tool_call>not valid json at all</tool_call>"),
-            None
-        );
-    }
-
-    #[test]
-    fn extract_tool_call_defaults_to_empty_arguments_when_the_field_is_absent() {
-        let (name, arguments) =
-            extract_tool_call("<tool_call>{\"name\": \"ping\"}</tool_call>").unwrap();
-        assert_eq!(name, "ping");
-        assert_eq!(arguments, "{}");
-    }
-
-    #[test]
-    fn build_response_message_promotes_a_real_tool_call_to_tool_calls() {
+    fn a_plain_answer_is_not_promoted_to_a_tool_call() {
         let (message, finish) = build_response_message(
-            "<tool_call>{\"name\": \"get_weather\", \"arguments\": {\"location\": \"Rome\"}}</tool_call>"
-                .to_string(),
-            true,
+            "just an answer".to_string(),
+            &[weather_tool_def()],
+            output::OutputPosture::for_model("test-model"),
             "stop",
         );
-        assert_eq!(finish, "tool_calls");
-        assert!(message.content.is_none());
-        let calls = message.tool_calls.expect("must carry a tool call");
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].function.name, "get_weather");
+        assert_eq!(finish, "stop");
+        assert!(message.tool_calls.is_none());
+        assert_eq!(message.content.as_deref(), Some("just an answer"));
     }
 
+    /// Malformed JSON inside the marker is not a call. Returning it as
+    /// one would hand a client arguments it cannot parse.
     #[test]
-    fn build_response_message_falls_back_to_plain_text_when_tools_are_inactive() {
+    fn a_malformed_payload_is_not_a_tool_call() {
+        let (message, finish) = build_response_message(
+            "<tool_call>not valid json at all</tool_call>".to_string(),
+            &[weather_tool_def()],
+            output::OutputPosture::for_model("test-model"),
+            "stop",
+        );
+        assert_eq!(finish, "stop");
+        assert!(message.tool_calls.is_none());
+    }
+
+    /// A call to something the request never offered is refused: the
+    /// client would be asked to execute a tool it does not have.
+    #[test]
+    fn a_tool_that_was_never_offered_is_not_returned() {
+        let (message, finish) = build_response_message(
+            "<tool_call>{\"name\": \"ping\", \"arguments\": {}}</tool_call>".to_string(),
+            &[weather_tool_def()],
+            output::OutputPosture::for_model("test-model"),
+            "stop",
+        );
+        assert_eq!(finish, "stop");
+        assert!(message.tool_calls.is_none());
+    }
+
+    /// With no tools offered at all, marker text is just text.
+    #[test]
+    fn marker_text_with_no_tools_offered_stays_content() {
         let (message, finish) = build_response_message(
             "<tool_call>{\"name\": \"get_weather\", \"arguments\": {}}</tool_call>".to_string(),
-            false,
+            &[],
+            output::OutputPosture::for_model("test-model"),
             "stop",
         );
         assert_eq!(finish, "stop");
@@ -4910,12 +5465,126 @@ mod tests {
         assert!(message.content.is_some());
     }
 
+    /// The streaming contract a coding agent depends on: the call's
+    /// identity arrives first, then its arguments in pieces, and the
+    /// pieces concatenate to exactly the final arguments.
     #[test]
-    fn build_response_message_falls_back_to_plain_text_when_no_marker_is_present() {
-        let (message, finish) = build_response_message("just an answer".to_string(), true, "stop");
+    fn a_streamed_call_opens_then_delivers_its_arguments_in_pieces() {
+        let opened = std::cell::Cell::new(0usize);
+        let mut parser = ferrox_edge::ToolCallParser::new(
+            ferrox_edge::ToolCallFormat::Qwen3Coder,
+            vec![ferrox_edge::parser::tool_call::ToolSchema::with_parameters(
+                "write_file",
+                serde_json::json!({"type": "object", "properties": {
+                    "path": {"type": "string"},
+                    "contents": {"type": "string"}
+                }}),
+            )],
+        );
+        let wire = "<tool_call><function=write_file>\
+                    <parameter=path>\n/tmp/x\n</parameter>\
+                    <parameter=contents>\nhello world\n</parameter>\
+                    </function></tool_call>";
+
+        let mut deltas = Vec::new();
+        let mut text = String::new();
+        for piece in wire.as_bytes().chunks(7) {
+            let chunk = String::from_utf8_lossy(piece).into_owned();
+            let (more_text, more) = tool_call_deltas(parser.push(&chunk), &opened);
+            text.push_str(&more_text);
+            deltas.extend(more);
+        }
+        let (more_text, more) = tool_call_deltas(parser.finish(), &opened);
+        text.push_str(&more_text);
+        deltas.extend(more);
+
+        assert_eq!(opened.get(), 1, "one call opened");
+        assert!(text.is_empty(), "the markers are not content: {text:?}");
+
+        let first = &deltas[0];
+        assert_eq!(first.index, 0);
+        assert_eq!(first.id.as_deref(), Some("call_0"));
+        assert_eq!(first.kind, Some("function"));
+        assert_eq!(first.function.name.as_deref(), Some("write_file"));
+
+        // Everything after the opening delta is argument text only,
+        // and it parses once concatenated.
+        let joined: String = deltas
+            .iter()
+            .filter_map(|d| d.function.arguments.clone())
+            .collect();
+        let parsed: serde_json::Value =
+            serde_json::from_str(&joined).expect("the fragments concatenate to valid JSON");
+        assert_eq!(parsed["path"], serde_json::json!("/tmp/x"));
+        assert_eq!(parsed["contents"], serde_json::json!("hello world"));
+        assert!(
+            deltas.len() >= 3,
+            "the arguments arrived in pieces, not whole: {}",
+            deltas.len()
+        );
+        assert!(
+            deltas[1..].iter().all(|d| d.function.name.is_none()),
+            "only the opening delta carries identity"
+        );
+    }
+
+    /// Text either side of a call still streams as content, in order.
+    #[test]
+    fn text_around_a_streamed_call_is_still_content() {
+        let opened = std::cell::Cell::new(0usize);
+        let mut parser = ferrox_edge::ToolCallParser::new(
+            ferrox_edge::ToolCallFormat::Qwen25,
+            vec![ferrox_edge::parser::tool_call::ToolSchema::new(
+                "get_weather",
+            )],
+        );
+        let wire = "let me check. <tool_call>{\"name\": \"get_weather\", \
+                    \"arguments\": {}}</tool_call> done";
+        let mut text = String::new();
+        for piece in wire.as_bytes().chunks(5) {
+            let chunk = String::from_utf8_lossy(piece).into_owned();
+            let (more, _) = tool_call_deltas(parser.push(&chunk), &opened);
+            text.push_str(&more);
+        }
+        let (more, _) = tool_call_deltas(parser.finish(), &opened);
+        text.push_str(&more);
+
+        assert_eq!(opened.get(), 1);
+        assert!(text.starts_with("let me check. "), "{text:?}");
+        assert!(text.ends_with(" done"), "{text:?}");
+        assert!(!text.contains("<tool_call>"), "markers leaked: {text:?}");
+    }
+
+    /// A reasoning model's thinking must not be returned as its
+    /// answer.
+    #[test]
+    fn a_reasoning_block_is_split_out_of_the_answer() {
+        let (message, finish) = build_response_message(
+            "<think>weighing it up</think>The answer is 4.".to_string(),
+            &[],
+            output::OutputPosture::for_model("Qwen3-8B"),
+            "stop",
+        );
         assert_eq!(finish, "stop");
-        assert!(message.tool_calls.is_none());
-        assert_eq!(message.content.as_deref(), Some("just an answer"));
+        assert_eq!(message.content.as_deref(), Some("The answer is 4."));
+        assert_eq!(message.reasoning_content.as_deref(), Some("weighing it up"));
+    }
+
+    /// ... and a model with no reasoning format keeps its text intact,
+    /// markers and all.
+    #[test]
+    fn a_non_reasoning_model_keeps_a_literal_marker_in_its_answer() {
+        let (message, _) = build_response_message(
+            "Use the <think> tag like this.".to_string(),
+            &[],
+            output::OutputPosture::for_model("llama-3.1-8b"),
+            "stop",
+        );
+        assert_eq!(
+            message.content.as_deref(),
+            Some("Use the <think> tag like this.")
+        );
+        assert!(message.reasoning_content.is_none());
     }
 
     /// Zero-regression proof: an ordinary request with no `tools`/
@@ -5343,6 +6012,248 @@ mod tests {
             req.is_cacheable(),
             "sampling with an explicit seed is deterministic and must be cacheable"
         );
+    }
+
+    /// A template that grades only the OpenAI triple. `raise_exception`
+    /// is how a real one rejects a value it does not know, which is what
+    /// makes the load-time probe able to learn the vocabulary at all.
+    const GRADED: &str = "{% if reasoning_effort %}\
+         {% if reasoning_effort not in ['low','medium','high'] %}\
+           {{ raise_exception('unsupported effort') }}\
+         {% endif %}E:{{ reasoning_effort }}|{% endif %}\
+         {% if enable_thinking %}THINK|{% endif %}{{ messages[0].content }}";
+
+    fn graded_template() -> chat_template::PromptTemplate {
+        chat_template::PromptTemplate::from_gguf_metadata(
+            Some(GRADED),
+            Some("qwen3"),
+            false,
+            None,
+            None,
+        )
+    }
+
+    fn chat_request(value: serde_json::Value) -> ChatCompletionRequest {
+        serde_json::from_value(value).expect("request")
+    }
+
+    /// A chat client that omits `max_tokens` wants an answer, not
+    /// OpenAI's legacy 16-token completion fragment.
+    #[test]
+    fn an_omitted_output_budget_is_a_whole_answer_not_sixteen_tokens() {
+        let req = chat_request(serde_json::json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+        }));
+        assert_eq!(req.max_tokens, DEFAULT_CHAT_MAX_TOKENS);
+    }
+
+    /// Serde already tells absent from zero -- an absent field became
+    /// the default -- so a 0 here is one the caller wrote, and a
+    /// zero-token budget is a request that can never become decodable.
+    #[test]
+    fn an_explicit_zero_output_budget_is_a_client_error() {
+        let req = chat_request(serde_json::json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 0,
+        }));
+        let (status, body) = req.validate_supported_fields().expect_err("rejected");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"]["param"], serde_json::json!("max_tokens"));
+    }
+
+    /// The direction that had no wire path at all before: every request
+    /// rendered in thinking mode because only the ON branch existed.
+    #[test]
+    fn a_request_can_turn_thinking_off() {
+        let template = graded_template();
+        for body in [
+            serde_json::json!({
+                "model": "m",
+                "messages": [{"role": "user", "content": "hi"}],
+                "reasoning_effort": "none",
+            }),
+            serde_json::json!({
+                "model": "m",
+                "messages": [{"role": "user", "content": "hi"}],
+                "thinking": {"type": "disabled"},
+            }),
+        ] {
+            let kwargs = chat_request(body).resolve_template_kwargs(&template);
+            assert_eq!(kwargs["enable_thinking"], serde_json::json!(false));
+            assert_eq!(kwargs["thinking_mode"], serde_json::json!("disabled"));
+            // And `none` must not have been rounded onto a real gear on
+            // the way: "do not think" is not "think a little".
+            assert!(!kwargs.contains_key("reasoning_effort"));
+        }
+    }
+
+    /// The switch is what the caller reached for last; the gear is what
+    /// they would have used had thinking been on.
+    #[test]
+    fn a_disabled_switch_beats_an_effort_in_the_same_request() {
+        let template = graded_template();
+        let kwargs = chat_request(serde_json::json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "reasoning_effort": "high",
+            "thinking": {"type": "disabled"},
+        }))
+        .resolve_template_kwargs(&template);
+        assert_eq!(kwargs["enable_thinking"], serde_json::json!(false));
+        assert!(!kwargs.contains_key("reasoning_effort"));
+    }
+
+    /// Read as "on", a misspelled switch silently serves the opposite
+    /// of what was asked for.
+    #[test]
+    fn an_unrecognized_thinking_switch_is_refused_rather_than_read_as_on() {
+        let req = chat_request(serde_json::json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "thinking": {"type": "disable"},
+        }));
+        let (status, _) = req.validate_supported_fields().expect_err("rejected");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    /// A caller who steered the template themselves has said what they
+    /// want; merging a protocol default in would let it contradict them.
+    #[test]
+    fn an_explicit_template_kwarg_stands_the_protocol_knobs_down() {
+        let template = graded_template();
+        let kwargs = chat_request(serde_json::json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "reasoning_effort": "none",
+            "chat_template_kwargs": {"enable_thinking": true},
+        }))
+        .resolve_template_kwargs(&template);
+        assert_eq!(kwargs["enable_thinking"], serde_json::json!(true));
+    }
+
+    /// The acceptance criterion for effort plumbing: an off-vocabulary
+    /// value is quantized onto the nearest gear the checkpoint really
+    /// grades, and the request renders instead of failing.
+    #[test]
+    fn an_off_vocabulary_reasoning_effort_is_quantized_rather_than_interpolated() {
+        let template = graded_template();
+        let req = chat_request(serde_json::json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "reasoning_effort": "minimal",
+        }));
+        let kwargs = req.resolve_template_kwargs(&template);
+        assert_eq!(kwargs["reasoning_effort"], serde_json::json!("low"));
+        let prompt = prompt_from_messages(&req.messages, &template, &[], kwargs).expect("renders");
+        assert!(prompt.starts_with("E:low|"), "{prompt}");
+    }
+
+    /// The other half of the same rule: a value no gear is close enough
+    /// to is dropped, so the checkpoint's own default applies rather
+    /// than an unknown string reaching the prompt.
+    #[test]
+    fn an_effort_with_no_near_gear_is_dropped_so_the_template_default_applies() {
+        let template = graded_template();
+        let req = chat_request(serde_json::json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "chat_template_kwargs": {"reasoning_effort": "none"},
+        }));
+        let kwargs = req.resolve_template_kwargs(&template);
+        assert!(!kwargs.contains_key("reasoning_effort"));
+        let prompt = prompt_from_messages(&req.messages, &template, &[], kwargs).expect("renders");
+        assert_eq!(prompt, "hi");
+    }
+
+    /// `chat_template_kwargs` is the specific spelling and wins over the
+    /// top-level one, which is what a caller who wrote both meant.
+    #[test]
+    fn chat_template_kwargs_wins_over_the_top_level_reasoning_effort() {
+        let template = graded_template();
+        let req = chat_request(serde_json::json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "reasoning_effort": "low",
+            "chat_template_kwargs": {"reasoning_effort": "high"},
+        }));
+        assert_eq!(
+            req.resolve_template_kwargs(&template)["reasoning_effort"],
+            serde_json::json!("high")
+        );
+    }
+
+    /// Offering tools turns thinking on even when the caller asked for
+    /// nothing: some encoders emit well-formed calls only in thinking
+    /// mode.
+    #[test]
+    fn offering_tools_turns_thinking_on_by_itself() {
+        let template = graded_template();
+        let quiet = chat_request(serde_json::json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+        }));
+        assert!(!quiet
+            .resolve_template_kwargs(&template)
+            .contains_key("enable_thinking"));
+
+        let with_tools = chat_request(serde_json::json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{"type": "function", "function": {"name": "get_weather"}}],
+        }));
+        let kwargs = with_tools.resolve_template_kwargs(&template);
+        assert_eq!(kwargs["enable_thinking"], serde_json::json!(true));
+        let prompt =
+            prompt_from_messages(&with_tools.messages, &template, &[], kwargs).expect("renders");
+        assert!(prompt.starts_with("THINK|"), "{prompt}");
+    }
+
+    /// The reason `force_reasoning` could only ever be `false` before:
+    /// no template could open a block in the prompt, because no kwargs
+    /// reached one. Now that they do, the parser has to start inside it
+    /// -- and the evidence is the rendered prompt, not the model name.
+    #[test]
+    fn a_prompt_that_opens_the_reasoning_block_makes_the_first_token_reasoning() {
+        let opener = chat_template::PromptTemplate::from_gguf_metadata(
+            Some("{{ messages[0].content }}{% if enable_thinking %}<think>{% endif %}"),
+            Some("qwen3"),
+            false,
+            None,
+            None,
+        );
+        let req = chat_request(serde_json::json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "chat_template_kwargs": {"enable_thinking": true},
+        }));
+        let kwargs = req.resolve_template_kwargs(&opener);
+        let prompt = prompt_from_messages(&req.messages, &opener, &[], kwargs).expect("renders");
+        assert!(prompt.ends_with("<think>"), "{prompt}");
+
+        // No opening marker will ever arrive, so unparsed this whole
+        // deliberation would have been served as the answer.
+        let posture = output::OutputPosture::resolve("Qwen3-8B", &prompt);
+        let (message, _) = build_response_message(
+            "weighing it up</think>Paris.".to_string(),
+            &[],
+            posture,
+            "stop",
+        );
+        assert_eq!(message.reasoning_content.as_deref(), Some("weighing it up"));
+        assert_eq!(message.content.as_deref(), Some("Paris."));
+
+        // Same text, a prompt that did not open the block: the model
+        // wrote a stray closer and it stays content.
+        let closed = output::OutputPosture::resolve("Qwen3-8B", "<|im_start|>assistant\n");
+        let (message, _) = build_response_message(
+            "weighing it up</think>Paris.".to_string(),
+            &[],
+            closed,
+            "stop",
+        );
+        assert_eq!(message.reasoning_content, None);
     }
 
     #[test]

@@ -410,120 +410,69 @@ impl CliTokenizer {
     }
 }
 
-#[derive(Clone, Copy)]
-enum ChatKind {
-    ChatMl,
-    GenericRoleMarkers,
-    Llama3,
-    Gemma,
-    /// Gemma-4 IT: `<|turn>user\n…<turn|>\n<|turn>model\n`.
-    Gemma4,
-    Plain,
+/// The checkpoint's own chat template, evaluated.
+///
+/// This used to be a near-identical copy of `ferrox-server`'s marker
+/// sniffer -- six hand-written renderers picked by which literal marker
+/// a template string happened to contain. Both are gone; both now
+/// compile the real Jinja source with
+/// [`ferrox_models::chat_template`], so `ferrox -m mistral.gguf -p hi`
+/// and `POST /v1/chat/completions` frame the same conversation the same
+/// way, including for the families the sniffer never recognised.
+struct ChatKind {
+    template: ferrox_models::chat_template::ChatTemplate,
+    bos_token: Option<String>,
+    eos_token: Option<String>,
 }
 
 impl ChatKind {
-    fn detect(template: Option<&str>) -> Self {
-        match template {
-            Some(t) if t.contains("<|im_start|>") => ChatKind::ChatMl,
-            Some(t) if t.contains("<|start_header_id|>") => ChatKind::Llama3,
-            Some(t) if t.contains("<|user|>") || t.contains("<|assistant|>") => {
-                ChatKind::GenericRoleMarkers
-            }
-            Some(t) if t.contains("<start_of_turn>") => ChatKind::Gemma,
-            // Gemma-4 IT: `<|turn>{role}\n…<turn|>\n` (not Gemma-2's
-            // `<start_of_turn>`). Detect before Plain so chat mode does
-            // not fall through to `user: …` framing.
-            Some(t) if t.contains("<|turn>") || t.contains("<turn|>") => ChatKind::Gemma4,
-            _ => ChatKind::Plain,
+    fn detect_for_gguf(file: &ShardedGguf, byte_tokenizer: bool) -> Self {
+        ChatKind {
+            template: ferrox_models::chat_template::ChatTemplate::from_gguf_metadata(
+                file.metadata_str("tokenizer.chat_template"),
+                file.metadata_str("general.architecture"),
+                byte_tokenizer,
+            ),
+            bos_token: token_text(file, "tokenizer.ggml.bos_token_id"),
+            eos_token: token_text(file, "tokenizer.ggml.eos_token_id"),
         }
     }
 
-    /// Match `ferrox-server::chat_template::ChatTemplate::detect_for_gguf`.
-    fn detect_for_gguf(template: Option<&str>, arch: Option<&str>, byte_tokenizer: bool) -> Self {
-        match template.filter(|t| !t.is_empty()) {
-            Some(t) => Self::detect(Some(t)),
-            None if byte_tokenizer || arch.is_none() => Self::Plain,
-            None => Self::ChatMl,
+    /// One conversation turn, framed the way this checkpoint expects.
+    ///
+    /// A template that will not render is an error, never a fallback to
+    /// a guessed framing: a silently mis-framed prompt is exactly the
+    /// bug that made this stop sniffing, and it shows up as degenerate
+    /// output rather than as a message.
+    fn wrap_user(&self, system: Option<&str>, user: &str) -> anyhow::Result<String> {
+        let mut messages = Vec::new();
+        if let Some(sys) = system {
+            messages.push(serde_json::json!({"role": "system", "content": sys}));
         }
+        messages.push(serde_json::json!({"role": "user", "content": user}));
+        let opts = ferrox_models::chat_template::RenderOptions {
+            add_generation_prompt: true,
+            bos_token: self.bos_token.clone(),
+            eos_token: self.eos_token.clone(),
+            ..Default::default()
+        };
+        self.template
+            .render(&messages, &opts)
+            .map_err(|e| anyhow::anyhow!("chat template failed to render: {e}"))
     }
+}
 
-    fn wrap_user(&self, system: Option<&str>, user: &str) -> String {
-        match self {
-            ChatKind::ChatMl => {
-                let mut out = String::new();
-                if let Some(sys) = system {
-                    out.push_str("<|im_start|>system\n");
-                    out.push_str(sys);
-                    out.push_str("<|im_end|>\n");
-                }
-                out.push_str("<|im_start|>user\n");
-                out.push_str(user);
-                out.push_str("<|im_end|>\n<|im_start|>assistant\n");
-                out
-            }
-            ChatKind::GenericRoleMarkers => {
-                let mut out = String::new();
-                if let Some(sys) = system {
-                    out.push_str("<|system|>\n");
-                    out.push_str(sys);
-                    out.push_str("</s>\n");
-                }
-                out.push_str("<|user|>\n");
-                out.push_str(user);
-                out.push_str("</s>\n<|assistant|>\n");
-                out
-            }
-            ChatKind::Llama3 => {
-                let mut out = String::new();
-                if let Some(sys) = system {
-                    out.push_str("<|start_header_id|>system<|end_header_id|>\n\n");
-                    out.push_str(sys);
-                    out.push_str("<|eot_id|>");
-                }
-                out.push_str("<|start_header_id|>user<|end_header_id|>\n\n");
-                out.push_str(user);
-                out.push_str("<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n");
-                out
-            }
-            ChatKind::Gemma => {
-                let mut out = String::new();
-                if let Some(sys) = system {
-                    // Gemma often folds system into the first user turn.
-                    out.push_str("<start_of_turn>user\n");
-                    out.push_str(sys);
-                    out.push('\n');
-                    out.push_str(user);
-                    out.push_str("<end_of_turn>\n<start_of_turn>model\n");
-                } else {
-                    out.push_str("<start_of_turn>user\n");
-                    out.push_str(user);
-                    out.push_str("<end_of_turn>\n<start_of_turn>model\n");
-                }
-                out
-            }
-            ChatKind::Gemma4 => {
-                let mut out = String::new();
-                if let Some(sys) = system {
-                    out.push_str("<|turn>system\n");
-                    out.push_str(sys);
-                    out.push_str("<turn|>\n");
-                }
-                out.push_str("<|turn>user\n");
-                out.push_str(user);
-                out.push_str("<turn|>\n<|turn>model\n");
-                out
-            }
-            // Match `ferrox-server::chat_template::ChatTemplate::Plain`
-            // (`role: content` lines) so CLI and `/v1/chat/completions`
-            // share the same prompt framing when GGUF has no template.
-            ChatKind::Plain => {
-                if let Some(sys) = system {
-                    format!("system: {sys}\nuser: {user}")
-                } else {
-                    format!("user: {user}")
-                }
-            }
-        }
+/// The *text* of a token named by an id-valued metadata key: a template
+/// prints `{{ bos_token }}` as a string, and GGUF records it as an id
+/// into the vocabulary.
+fn token_text(file: &ShardedGguf, key: &str) -> Option<String> {
+    let id = file.metadata_u64(key)? as usize;
+    let ferrox_gguf::GgufValue::Array(items) = file.metadata("tokenizer.ggml.tokens")? else {
+        return None;
+    };
+    match items.get(id)? {
+        ferrox_gguf::GgufValue::String(s) => Some(s.clone()),
+        _ => None,
     }
 }
 
@@ -771,16 +720,12 @@ pub fn run_infer(args: InferArgs) -> anyhow::Result<()> {
         .unwrap_or(4096);
     let ctx_size = resolve_ctx_size(&args, path, gguf_ctx)?;
 
-    let chat = ChatKind::detect_for_gguf(
-        file.metadata_str("tokenizer.chat_template"),
-        file.metadata_str("general.architecture"),
-        matches!(tokenizer, CliTokenizer::Byte),
-    );
+    let chat = ChatKind::detect_for_gguf(&file, matches!(tokenizer, CliTokenizer::Byte));
     let user_prompt = resolve_prompt(&args)?;
     let prompt = if args.no_cnv {
         user_prompt
     } else {
-        chat.wrap_user(args.system.as_deref(), &user_prompt)
+        chat.wrap_user(args.system.as_deref(), &user_prompt)?
     };
 
     if args.verbose_prompt {
@@ -940,16 +885,12 @@ fn run_mla_infer(args: InferArgs, path: &Path, file: &ShardedGguf) -> anyhow::Re
         .unwrap_or(4096);
     let ctx_size = resolve_ctx_size(&args, path, gguf_ctx)?;
 
-    let chat = ChatKind::detect_for_gguf(
-        file.metadata_str("tokenizer.chat_template"),
-        file.metadata_str("general.architecture"),
-        matches!(tokenizer, CliTokenizer::Byte),
-    );
+    let chat = ChatKind::detect_for_gguf(file, matches!(tokenizer, CliTokenizer::Byte));
     let user_prompt = resolve_prompt(&args)?;
     let prompt = if args.no_cnv {
         user_prompt
     } else {
-        chat.wrap_user(args.system.as_deref(), &user_prompt)
+        chat.wrap_user(args.system.as_deref(), &user_prompt)?
     };
 
     eprintln!(
@@ -1079,16 +1020,12 @@ fn run_gemma4_infer(args: InferArgs, path: &Path, file: &ShardedGguf) -> anyhow:
         .unwrap_or(4096);
     let ctx_size = resolve_ctx_size(&args, path, gguf_ctx)?;
 
-    let chat = ChatKind::detect_for_gguf(
-        file.metadata_str("tokenizer.chat_template"),
-        file.metadata_str("general.architecture"),
-        matches!(tokenizer, CliTokenizer::Byte),
-    );
+    let chat = ChatKind::detect_for_gguf(file, matches!(tokenizer, CliTokenizer::Byte));
     let user_prompt = resolve_prompt(&args)?;
     let prompt = if args.no_cnv {
         user_prompt
     } else {
-        chat.wrap_user(args.system.as_deref(), &user_prompt)
+        chat.wrap_user(args.system.as_deref(), &user_prompt)?
     };
 
     eprintln!(
@@ -1219,16 +1156,12 @@ fn run_glm52_infer(args: InferArgs, path: &Path, file: &ShardedGguf) -> anyhow::
         .unwrap_or(4096);
     let ctx_size = resolve_ctx_size(&args, path, gguf_ctx)?;
 
-    let chat = ChatKind::detect_for_gguf(
-        file.metadata_str("tokenizer.chat_template"),
-        file.metadata_str("general.architecture"),
-        matches!(tokenizer, CliTokenizer::Byte),
-    );
+    let chat = ChatKind::detect_for_gguf(file, matches!(tokenizer, CliTokenizer::Byte));
     let user_prompt = resolve_prompt(&args)?;
     let prompt = if args.no_cnv {
         user_prompt
     } else {
-        chat.wrap_user(args.system.as_deref(), &user_prompt)
+        chat.wrap_user(args.system.as_deref(), &user_prompt)?
     };
 
     eprintln!(

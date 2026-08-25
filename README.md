@@ -59,6 +59,19 @@ attention and expert routing are all implemented here.
   Acceptance length and the per-position accept rate are reported, so a
   drafter that decays toward the end of a block is visible rather than
   averaged away.
+- **Prompts rendered by the checkpoint's own template.** The GGUF's real
+  `tokenizer.chat_template` is compiled and evaluated, not sniffed for
+  markers, so a family nobody hand-wrote a renderer for is still framed
+  the way it was trained. `chat_template_kwargs` and `reasoning_effort`
+  are passed through, and the effort is quantized onto the gears that
+  checkpoint actually grades — probed from its own template at load,
+  never read from a table keyed by model name.
+- **Agent-facing output, parsed.** A reasoning model's chain of thought
+  is split into `reasoning_content` as tokens arrive, and tool calls are
+  recognised in the format the served checkpoint's family really emits —
+  eleven of them — rather than only the one the prompt asked for.
+  Arguments stream as deltas, so a coding agent watches a file argument
+  arrive instead of waiting for it.
 
 ## Install
 

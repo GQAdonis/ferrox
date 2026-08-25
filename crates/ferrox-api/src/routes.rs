@@ -96,6 +96,30 @@ pub const ADMIN_TASK_CANCEL: &str = "/admin/tasks/{task_id}/cancel";
 /// Counters, uptime, and the recent-request ring buffer.
 pub const ADMIN_STATS: &str = "/admin/stats";
 
+/// Live serving telemetry: throughput over a trailing window, request
+/// latency percentile, and the cache pools' occupancy. Distinct from
+/// [`ADMIN_STATS`], which is this server's own operational ring; this
+/// is the shape a desktop or dashboard polls.
+pub const V1_STATS: &str = "/v1/stats";
+
+/// Incremental page over the recent-request ring: `?since=<cursor>` and
+/// `?limit=<n>`. The cursor is all-time, so a poller that keeps up
+/// reads each row exactly once.
+pub const V1_REQUESTS: &str = "/v1/requests";
+
+/// The current cache geometry: how VRAM is split between the expert
+/// cache and the KV pools, and what a re-split could move.
+pub const V1_CACHE_STATUS: &str = "/v1/cache/status";
+
+/// Re-split the caches on a live engine. New generation is refused
+/// while a rebuild is in flight.
+pub const V1_CACHE_REBUILD: &str = "/v1/cache/rebuild";
+
+/// Close admission, drain, and seal the final accounting snapshot. A
+/// supervisor calls this before it sends a signal, so process shutdown
+/// cannot race the last sampled token.
+pub const ADMIN_PREPARE_STOP: &str = "/v1/admin/prepare-stop";
+
 /// The concrete cancel path for one task id.
 pub fn admin_task_cancel(task_id: &str) -> String {
     ADMIN_TASK_CANCEL.replace("{task_id}", task_id)
@@ -135,6 +159,11 @@ pub const ALL: &[&str] = &[
     ADMIN_DOWNLOAD,
     ADMIN_TASKS,
     ADMIN_STATS,
+    V1_STATS,
+    V1_REQUESTS,
+    V1_CACHE_STATUS,
+    V1_CACHE_REBUILD,
+    ADMIN_PREPARE_STOP,
 ];
 
 #[cfg(test)]

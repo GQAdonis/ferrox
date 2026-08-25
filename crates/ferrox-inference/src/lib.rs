@@ -21,6 +21,7 @@
 //! | [`quant`] | `ferrox-quant` | Block layouts and fused dequant+dot |
 //! | [`safetensors`] | `ferrox-safetensors` | SafeTensors mmap reader |
 //! | [`core`] | `ferrox-core` | Tensor ops, RoPE, GQA, KV cache |
+//! | [`edge`] | `ferrox-edge` | Serving policy: `q*` split, radix prefix caches, output parsers |
 //! | [`moe`] | `ferrox-moe` | Expert routing and dispatch |
 //! | [`models`] | `ferrox-models` | Loaders and decoder stacks |
 //! | [`api`] | `ferrox-api` | Route constants + wire DTOs (feature `api`) |
@@ -50,6 +51,7 @@
 #![forbid(unsafe_code)]
 
 pub use ferrox_core as core;
+pub use ferrox_edge as edge;
 pub use ferrox_gguf as gguf;
 pub use ferrox_models as models;
 pub use ferrox_moe as moe;

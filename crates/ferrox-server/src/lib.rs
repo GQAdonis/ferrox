@@ -1730,12 +1730,16 @@ async fn list_models(State(state): State<Arc<AppState>>) -> Json<serde_json::Val
     // about thinking carries NEITHER field rather than an empty list:
     // an empty list reads as "asked, and it has no gears", which is a
     // different claim from "this is not a reasoning model".
-    let gears = active.model.chat_template().think_gears().clone();
+    let parser_configured = ferrox_edge::ReasoningFormat::infer(active.model.name()).is_some();
+    let gears = active.model.chat_template().think_gears(parser_configured);
     if !gears.is_empty() {
         model_entry["supported_reasoning_efforts"] = serde_json::json!(gears.supported);
-        if let Some(default) = gears.default {
+        if let Some(default) = &gears.default {
             model_entry["default_reasoning_effort"] = serde_json::json!(default);
         }
+        // What to SEND for each gear, so a client selects one without
+        // knowing that "off" is two booleans and "high" is a string.
+        model_entry["reasoning_effort_kwargs"] = serde_json::json!(gears.kwargs);
     }
     if let Some(mcp) = &state.mcp {
         model_entry["ferrox_mcp"] = mcp.models_metadata();
@@ -1743,6 +1747,79 @@ async fn list_models(State(state): State<Arc<AppState>>) -> Json<serde_json::Val
     Json(serde_json::json!({
         "object": "list",
         "data": [model_entry]
+    }))
+}
+
+/// `GET /v1/stats`: what is happening *now*.
+///
+/// Distinct from `/admin/stats`, which is the historical ring. The two
+/// throughput figures come from sliding windows, so an idle server
+/// reports 0 rather than the rate it managed while it was busy -- a
+/// cumulative average never comes back down, and a status bar showing
+/// one is reporting the past as the present.
+///
+/// Latency is the ring's p95, nearest-rank, so it names a request that
+/// really took that long. Both it and the mean time-to-first-token are
+/// `null` rather than `0` when nothing can be said: a non-streamed
+/// request has no TTFT, and averaging those in as zero would make the
+/// server look faster the fewer clients stream.
+async fn serving_stats(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+    let now_ms = state.uptime().as_millis().min(u64::MAX as u128) as u64;
+    let mut serving = state.serving.lock().unwrap_or_else(|p| p.into_inner());
+    let active = state.active();
+    Json(serde_json::json!({
+        "model": active.as_ref().map(|a| a.model.name()),
+        "state": state
+            .maintenance
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .state()
+            .as_str(),
+        "uptime_s": state.uptime().as_secs(),
+        "throughput": {
+            "decode_tps": (serving.decode_tokens_per_second(now_ms) * 10.0).round() / 10.0,
+            "prefill_tps": (serving.prefill_tokens_per_second(now_ms) * 10.0).round() / 10.0,
+        },
+        "requests": {
+            "active": state.cancels.live_count(),
+            "completed": state.stats.recorded_total(),
+            "p95_ms": state.stats.p95_duration_ms(),
+            "ttft_mean_ms": state.stats.ttft_mean_ms(),
+            "prompt_tokens_total": state.stats.tokens_prompt_total(),
+            "completion_tokens_total": state.stats.tokens_generated_total(),
+        },
+    }))
+}
+
+#[derive(Deserialize)]
+struct RequestsQuery {
+    #[serde(default)]
+    since: u64,
+    #[serde(default = "default_requests_limit")]
+    limit: usize,
+}
+
+fn default_requests_limit() -> usize {
+    stats::MAX_PAGE
+}
+
+/// `GET /v1/requests?since=&limit=`: an incremental page of the ring.
+///
+/// The cursor is all-time, so a poller that keeps up reads each row
+/// exactly once and never re-reads. `missed` is the honest half: rows
+/// that existed and were evicted before this poll could see them. A
+/// client polling slower than the server finishes requests needs to
+/// know that, rather than have it hidden by a shorter page.
+async fn recent_requests(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Query(q): axum::extract::Query<RequestsQuery>,
+) -> Json<serde_json::Value> {
+    let (rows, cursor, missed) = state.stats.page(q.since, q.limit);
+    Json(serde_json::json!({
+        "requests": rows,
+        "next_cursor": cursor,
+        "missed": missed,
+        "total": state.stats.recorded_total(),
     }))
 }
 
@@ -3865,6 +3942,8 @@ async fn run(mcp_config_path: Option<PathBuf>, exit_on_stdin_close: bool) -> any
 
     let mut protected = Router::new()
         .route(routes::V1_MODELS, get(list_models))
+        .route(routes::V1_STATS, get(serving_stats))
+        .route(routes::V1_REQUESTS, get(recent_requests))
         .route(routes::V1_CHAT_COMPLETIONS, post(chat_completions))
         // Behind the same key as the endpoint that started the work:
         // an unauthenticated caller must not be able to stop someone
@@ -4209,6 +4288,8 @@ mod tests {
         Router::new()
             .route(ferrox_api::routes::HEALTH, get(health))
             .route(ferrox_api::routes::V1_MODELS, get(list_models))
+            .route(ferrox_api::routes::V1_STATS, get(serving_stats))
+            .route(ferrox_api::routes::V1_REQUESTS, get(recent_requests))
             .route("/v1/chat/completions", post(chat_completions))
             .route("/v1/tokenize", post(openai_extra::tokenize))
             .route("/v1/detokenize", post(openai_extra::detokenize))

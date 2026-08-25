@@ -101,8 +101,14 @@ pub use stats::{
 };
 
 pub use scheduler::{
-    finish_reason, AdmittedChunk, Capacity, DecodeSet, FinishReason, Geometry, NotAdmitted,
-    PendingRequest, PrefillPass, SlotTable,
+    finish_reason, state_pool_usage, window_pool_usage, AdmittedChunk, BatchStatus, Capacity,
+    DecodeSet, FinishReason, Geometry, NotAdmitted, PendingRequest, PoolUsage, PrefillPass,
+    PrefillSnapshot, SlotTable, StatusReporter, DEFAULT_DECODE_LOG_INTERVAL,
+};
+
+pub use residency::{
+    host_pin_budget_bytes, pin_budget_bytes, requested_labels, BankResidency, CopyRoute,
+    HostResidency, ResidencyError, ResidencyPlan, SettleAction,
 };
 
 pub use radix::{

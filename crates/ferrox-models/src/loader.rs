@@ -530,6 +530,52 @@ impl ModelConfig {
             .filter(|f| f.is_finite() && *f > 0.0)
             .unwrap_or(1.0);
 
+        // YaRN long-context scaling. `rope.scaling.attn_factor` above is
+        // only YaRN's *magnitude* term (ggml `rope_yarn`'s `mscale`); the
+        // frequency half -- which bands get interpolated toward the
+        // trained context and which stay extrapolated -- lives in
+        // `rope.scaling.type` + `rope.scaling.factor`, and ferrox read
+        // neither before this. A YaRN checkpoint was therefore roped as
+        // if it declared no scaling at all: right near position 0 and
+        // progressively wrong further in, i.e. the failure that reads as
+        // long-prompt quality decay rather than as a bug.
+        //
+        // The rewrite is folded into `rope_freqs`, the same per-band
+        // divisor array Llama-3's `rope_freqs.weight` supplies (ggml
+        // divides each band's theta by it), so it rides the existing CPU
+        // and Metal RoPE paths unchanged. When a file carries both, the
+        // two corrections compose by multiplication, as they do in
+        // llama.cpp (`ggml_rope_cache_init` divides by `freq_factors`
+        // *and then* runs `rope_yarn`).
+        let rope_freqs = match yarn_scaling_from_gguf(file, &arch, rope_orig_ctx) {
+            None => rope_freqs,
+            Some(scaling) => {
+                let rotary_dim = rope_dim.unwrap_or(head_dim);
+                if rotary_dim == 0 || !rotary_dim.is_multiple_of(2) {
+                    best_effort_fields.push(
+                        "rope_freqs (YaRN declared but the rotary width is odd; scaling not applied)",
+                    );
+                    rope_freqs
+                } else {
+                    let yarn =
+                        ferrox_core::attention::yarn_freq_factors(scaling, rotary_dim, rope_theta);
+                    match rope_freqs {
+                        None => Some(yarn),
+                        Some(own) if own.len() == yarn.len() => {
+                            Some(own.iter().zip(yarn.iter()).map(|(a, b)| a * b).collect())
+                        }
+                        Some(own) => {
+                            best_effort_fields.push(
+                                "rope_freqs (YaRN declared alongside a per-band factor tensor of a \
+                                 different width; the file's own tensor is used unscaled)",
+                            );
+                            Some(own)
+                        }
+                    }
+                }
+            }
+        };
+
         // RoPE layout comes from the capability registry above (fail-
         // closed). Getting this wrong for `llama` (needs Norm) was the
         // real root cause of the Llama-3.1-8B early-stop/wrong-logits bug.
@@ -590,6 +636,109 @@ impl ModelConfig {
             best_effort_fields: Box::leak(best_effort_fields.into_boxed_slice()),
         })
     }
+}
+
+impl crate::sampling::RecommendedSampling {
+    /// The sampling a GGUF recommends for itself, from the
+    /// `general.sampling.*` metadata keys llama.cpp's converter writes
+    /// when the source checkpoint carried a `generation_config.json`.
+    ///
+    /// This is the GGUF half of FreeToken's `load_generation_sampling`
+    /// (`python/freetoken/utils/hf.py:92`), which checks the GGUF
+    /// metadata *first* and only falls back to a `generation_config.json`
+    /// sidecar for non-GGUF checkpoints -- a GGUF is a single file and
+    /// has no sidecar to read.
+    ///
+    /// Key names are llama.cpp's own (`general.sampling.temp`, not
+    /// `temperature`). Each key is independent: a file that names only
+    /// `top_k` recommends only `top_k`, and the two fields it did not
+    /// mention stay `None` so the server's own defaults keep speaking
+    /// for them.
+    ///
+    /// `temp` / `top_p` are read as float *or* integer, because a
+    /// converter that wrote `temp = 1` stores a GGUF integer and
+    /// dropping that value would silently serve the checkpoint greedy --
+    /// the exact repetition-loop failure the recommendation exists to
+    /// prevent.
+    pub fn from_gguf(file: &impl TensorSource) -> Self {
+        let number = |k: &str| -> Option<f32> {
+            file.metadata(k)
+                .and_then(|v| v.as_f32().or_else(|| v.as_u64().map(|u| u as f32)))
+        };
+        crate::sampling::RecommendedSampling {
+            temperature: number("general.sampling.temp"),
+            top_p: number("general.sampling.top_p"),
+            top_k: file
+                .metadata("general.sampling.top_k")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as usize),
+        }
+    }
+}
+
+/// The YaRN RoPE scaling a GGUF declares, or `None` when this file
+/// declares none that changes the rotation.
+///
+/// llama.cpp's key names (`llama-arch.cpp`
+/// `LLM_KV_ROPE_SCALING_TYPE` / `_FACTOR`): `<arch>.rope.scaling.type`
+/// is a string (`"none"`, `"linear"`, `"yarn"`, `"longrope"`) and
+/// `<arch>.rope.scaling.factor` the ratio of served to trained context.
+/// `beta_fast` / `beta_slow` are read from both the plain and the
+/// `yarn_`-prefixed spelling and otherwise fall back to the reference's
+/// own defaults (32.0 / 1.0), which is what a real checkpoint relies on
+/// -- almost none of them write those two keys.
+///
+/// `None` is returned for every case where applying YaRN would be a
+/// guess or a no-op rather than a correction, so that no checkpoint's
+/// rotation moves without the file having asked for it:
+///
+/// * a scaling type other than `yarn` (`linear` divides positions,
+///   `longrope` rides the `rope_factors_long`/`_short` tensors this
+///   loader already reads -- neither is this rewrite, and treating them
+///   as YaRN would rope them wrong in a *new* way instead of leaving
+///   them as they are),
+/// * a missing, non-finite or `<= 1.0` factor (the reference's own
+///   `get_mscale` treats `scale <= 1` as unscaled, and a factor of 1.0
+///   makes every band's divisor exactly 1.0 anyway),
+/// * a missing `rope.scaling.original_context_length` -- the trained
+///   context is what the correction range is measured against, and
+///   inventing one (say, from `context_length`, which on a YaRN file is
+///   the *extended* length) would put the ramp in the wrong place and
+///   quietly rope the checkpoint at frequencies nobody trained.
+fn yarn_scaling_from_gguf(
+    file: &impl TensorSource,
+    arch: &str,
+    orig_ctx: Option<usize>,
+) -> Option<ferrox_core::attention::YarnScaling> {
+    let key = |suffix: &str| format!("{arch}.{suffix}");
+    let scaling_type = file.metadata_str(&key("rope.scaling.type"))?;
+    if !scaling_type.eq_ignore_ascii_case("yarn") {
+        return None;
+    }
+    let factor = metadata_f32_any(file, &[key("rope.scaling.factor")])
+        .filter(|f| f.is_finite() && *f > 1.0)?;
+    let orig_max_pos = orig_ctx?;
+    let beta = |suffix: &str, default: f32| -> f32 {
+        metadata_f32_any(
+            file,
+            &[
+                key(&format!("rope.scaling.{suffix}")),
+                key(&format!("rope.scaling.yarn_{suffix}")),
+            ],
+        )
+        .filter(|v| v.is_finite() && *v > 0.0)
+        .unwrap_or(default)
+    };
+    Some(ferrox_core::attention::YarnScaling {
+        factor,
+        beta_fast: beta("beta_fast", 32.0),
+        beta_slow: beta("beta_slow", 1.0),
+        orig_max_pos,
+        // No GGUF key carries the reference's `truncate` flag, and its
+        // default is `true`; a file that wanted the fractional range
+        // would have no way to say so here.
+        truncate: true,
+    })
 }
 
 fn find_info<'a>(file: &'a impl TensorSource, name: &str) -> Result<&'a TensorInfo, LoadError> {
@@ -2041,6 +2190,229 @@ mod tests {
                 other => panic!("no-op {key}={val} must pass the scaling gate, got {other:?}"),
             }
         }
+    }
+
+    /// One GGUF metadata value, in the three types these header-only
+    /// fixtures need.
+    enum Kv<'a> {
+        Str(&'a str),
+        U32(u32),
+        F32(f32),
+    }
+
+    /// A tensor-free GGUF carrying exactly `kvs` -- enough for
+    /// `ModelConfig::from_gguf` to run without a single weight on disk.
+    fn build_metadata_gguf(kvs: &[(&str, Kv)]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.write_u32::<LittleEndian>(ferrox_gguf::GGUF_MAGIC)
+            .unwrap();
+        buf.write_u32::<LittleEndian>(3).unwrap(); // version
+        buf.write_u64::<LittleEndian>(0).unwrap(); // tensor_count
+        buf.write_u64::<LittleEndian>(kvs.len() as u64).unwrap();
+        for (k, v) in kvs {
+            match v {
+                Kv::Str(s) => write_kv_str(&mut buf, k, s),
+                Kv::U32(n) => {
+                    write_string(&mut buf, k);
+                    buf.write_u32::<LittleEndian>(4).unwrap(); // type = uint32
+                    buf.write_u32::<LittleEndian>(*n).unwrap();
+                }
+                Kv::F32(f) => write_kv_f32(&mut buf, k, *f),
+            }
+        }
+        buf
+    }
+
+    fn open_metadata_gguf(tag: &str, kvs: &[(&str, Kv)]) -> ferrox_gguf::GgufFile {
+        let tmp = std::env::temp_dir().join(format!("ferrox_test_meta_{tag}.gguf"));
+        std::fs::write(&tmp, build_metadata_gguf(kvs)).unwrap();
+        let file = ferrox_gguf::GgufFile::open(&tmp).expect("header-only file must parse");
+        std::fs::remove_file(&tmp).ok();
+        file
+    }
+
+    /// A minimal `llama` hparam set (64-wide single head, base 10000)
+    /// plus whatever RoPE-scaling keys a test wants to add.
+    fn llama_config_with(tag: &str, extra: &[(&str, Kv)]) -> ModelConfig {
+        let mut kvs: Vec<(&str, Kv)> = vec![
+            ("general.architecture", Kv::Str("llama")),
+            ("llama.block_count", Kv::U32(1)),
+            ("llama.embedding_length", Kv::U32(64)),
+            ("llama.attention.head_count", Kv::U32(1)),
+            ("llama.attention.head_count_kv", Kv::U32(1)),
+            ("llama.attention.key_length", Kv::U32(64)),
+            ("llama.rope.freq_base", Kv::F32(10_000.0)),
+        ];
+        for (k, v) in extra {
+            kvs.push((
+                k,
+                match v {
+                    Kv::Str(s) => Kv::Str(s),
+                    Kv::U32(n) => Kv::U32(*n),
+                    Kv::F32(f) => Kv::F32(*f),
+                },
+            ));
+        }
+        ModelConfig::from_gguf(&open_metadata_gguf(tag, &kvs)).expect("fixture must load")
+    }
+
+    /// A checkpoint that declares YaRN gets the per-band divisors the
+    /// reference's `"yarn"` arm implies, folded into `rope_freqs` so the
+    /// existing RoPE kernels apply them. Expected values are hand-derived
+    /// from `_find_correction_dim` for this fixture (rotary width 64,
+    /// base 10000, original context 131072): `low = 22`, `high = 35`.
+    ///
+    /// Before this, ferrox read neither `rope.scaling.type` nor
+    /// `rope.scaling.factor`, so this file roped exactly like an
+    /// unscaled one -- correct near position 0, progressively wrong
+    /// further in.
+    #[test]
+    fn a_gguf_declaring_yarn_gets_its_rope_frequencies_rewritten() {
+        let cfg = llama_config_with(
+            "yarn",
+            &[
+                ("llama.rope.scaling.type", Kv::Str("yarn")),
+                ("llama.rope.scaling.factor", Kv::F32(8.0)),
+                (
+                    "llama.rope.scaling.original_context_length",
+                    Kv::U32(131_072),
+                ),
+            ],
+        );
+        let factors = cfg
+            .rope_freqs
+            .expect("a YaRN checkpoint must carry rewritten per-band frequencies");
+        assert_eq!(factors.len(), 32, "one divisor per rotation band");
+        assert!(
+            (factors[0] - 1.0).abs() < 1e-6,
+            "the fastest band is left extrapolated, got {}",
+            factors[0]
+        );
+        let ramp = (31.0 - 22.0) / (35.0 - 22.0);
+        let want = 1.0 / (ramp / 8.0 + (1.0 - ramp));
+        assert!(
+            (factors[31] - want).abs() < 1e-4,
+            "slowest band: got {}, reference {want}",
+            factors[31]
+        );
+    }
+
+    /// The rewrite must not fire on a file that did not ask for it. A
+    /// scaling type ferrox does not implement (`linear`, `longrope`) is
+    /// left exactly as it was rather than being roped as YaRN, which
+    /// would be a new kind of wrong rather than the current known one.
+    #[test]
+    fn a_gguf_without_yarn_scaling_keeps_its_rope_frequencies_untouched() {
+        assert!(llama_config_with("noscale", &[]).rope_freqs.is_none());
+        assert!(llama_config_with(
+            "linear",
+            &[
+                ("llama.rope.scaling.type", Kv::Str("linear")),
+                ("llama.rope.scaling.factor", Kv::F32(4.0)),
+                (
+                    "llama.rope.scaling.original_context_length",
+                    Kv::U32(131_072),
+                ),
+            ],
+        )
+        .rope_freqs
+        .is_none());
+        // YaRN with a no-op factor is not a correction either.
+        assert!(llama_config_with(
+            "yarn_factor_one",
+            &[
+                ("llama.rope.scaling.type", Kv::Str("yarn")),
+                ("llama.rope.scaling.factor", Kv::F32(1.0)),
+                (
+                    "llama.rope.scaling.original_context_length",
+                    Kv::U32(131_072),
+                ),
+            ],
+        )
+        .rope_freqs
+        .is_none());
+    }
+
+    /// The correction range is measured against the context the
+    /// checkpoint was *trained* at, so a file that declares YaRN without
+    /// `rope.scaling.original_context_length` leaves the rotation alone
+    /// rather than inventing a trained length (`context_length` on such
+    /// a file is the *extended* one, which would put the ramp in the
+    /// wrong place at every band).
+    #[test]
+    fn yarn_without_an_original_context_length_is_not_guessed_at() {
+        let cfg = llama_config_with(
+            "yarn_noctx",
+            &[
+                ("llama.rope.scaling.type", Kv::Str("yarn")),
+                ("llama.rope.scaling.factor", Kv::F32(8.0)),
+            ],
+        );
+        assert!(cfg.rope_freqs.is_none());
+    }
+
+    /// `general.sampling.*` is the checkpoint's own recommendation, and
+    /// only the keys the file carries become one: a file naming just
+    /// `top_k` must leave temperature and top_p to the server's
+    /// defaults.
+    #[test]
+    fn gguf_sampling_metadata_is_read_as_the_checkpoints_recommendation() {
+        use crate::sampling::RecommendedSampling;
+        let full = RecommendedSampling::from_gguf(&open_metadata_gguf(
+            "sampling_full",
+            &[
+                ("general.architecture", Kv::Str("llama")),
+                ("general.sampling.temp", Kv::F32(1.0)),
+                ("general.sampling.top_k", Kv::U32(20)),
+                ("general.sampling.top_p", Kv::F32(0.95)),
+            ],
+        ));
+        assert_eq!(
+            full,
+            RecommendedSampling {
+                temperature: Some(1.0),
+                top_p: Some(0.95),
+                top_k: Some(20),
+            }
+        );
+
+        let partial = RecommendedSampling::from_gguf(&open_metadata_gguf(
+            "sampling_partial",
+            &[
+                ("general.architecture", Kv::Str("llama")),
+                ("general.sampling.top_k", Kv::U32(40)),
+            ],
+        ));
+        assert_eq!(partial.top_k, Some(40));
+        assert_eq!(partial.temperature, None);
+        assert_eq!(partial.top_p, None);
+    }
+
+    /// A converter that wrote `temp = 1` stores a GGUF integer, not a
+    /// float. Dropping it would serve a checkpoint that asked for
+    /// temperature 1.0 at the framework's greedy default -- the
+    /// repetition-loop failure the recommendation exists to prevent.
+    #[test]
+    fn an_integer_valued_sampling_temp_is_still_a_recommendation() {
+        let recommended = crate::sampling::RecommendedSampling::from_gguf(&open_metadata_gguf(
+            "sampling_int_temp",
+            &[
+                ("general.architecture", Kv::Str("llama")),
+                ("general.sampling.temp", Kv::U32(1)),
+            ],
+        ));
+        assert_eq!(recommended.temperature, Some(1.0));
+    }
+
+    /// The overwhelming majority of checkpoints recommend nothing, and
+    /// those must keep ferrox's existing defaults exactly.
+    #[test]
+    fn a_gguf_without_sampling_metadata_recommends_nothing() {
+        let recommended = crate::sampling::RecommendedSampling::from_gguf(&open_metadata_gguf(
+            "sampling_absent",
+            &[("general.architecture", Kv::Str("llama"))],
+        ));
+        assert!(recommended.is_empty());
     }
 
     #[test]

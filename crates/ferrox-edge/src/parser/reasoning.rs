@@ -30,7 +30,19 @@
 //! `force_reasoning`, and it is read off the rendered prompt
 //! ([`ReasoningFormat::prompt_opens_reasoning`]) rather than guessed
 //! from the model name, because the same checkpoint does it or does not
-//! depending on how the request was rendered.
+//! depending on how the request was rendered. The same rule decides
+//! muse-glimmer's `header_open`: its template ends *inside* an
+//! assistant channel header, so the turn's first bytes are the tail of
+//! a header nobody emitted.
+//!
+//! # Two shapes of grammar
+//!
+//! Most families delimit reasoning with a pair of markers. Two do not:
+//! gpt-oss and muse-glimmer are *channel* grammars, where a header
+//! names the recipient of everything up to the next terminator and the
+//! recipient -- not a marker -- says which field the text belongs to.
+//! Those two have their own scanners ([`HarmonyState`], [`AtemState`]);
+//! the marker machinery is unused for them.
 //!
 //! Ported 1:1 from FreeToken's `server/reasoning_parser.py`
 //! (Apache-2.0); see `docs/THIRD_PARTY_NOTICES.md`.
@@ -63,6 +75,10 @@ pub enum ReasoningFormat {
     /// The gpt-oss "harmony" channel format, which is a different shape
     /// of grammar entirely.
     GptOss,
+    /// muse-glimmer's ATEM channel format: `<|start|>` headers naming a
+    /// recipient, bodies closed by `<|eot|>` / `<|eom|>` /
+    /// `<|end_of_text|>`.
+    MuseGlimmer,
 }
 
 impl ReasoningFormat {
@@ -75,6 +91,7 @@ impl ReasoningFormat {
             ReasoningFormat::MiniMaxM3 => "minimax_m3",
             ReasoningFormat::Gemma4 => "gemma4",
             ReasoningFormat::GptOss => "gpt_oss",
+            ReasoningFormat::MuseGlimmer => "muse_glimmer",
         }
     }
 
@@ -87,6 +104,7 @@ impl ReasoningFormat {
             "minimax_m3" => Some(ReasoningFormat::MiniMaxM3),
             "gemma4" => Some(ReasoningFormat::Gemma4),
             "gpt_oss" | "gpt-oss" => Some(ReasoningFormat::GptOss),
+            "muse_glimmer" => Some(ReasoningFormat::MuseGlimmer),
             _ => None,
         }
     }
@@ -101,6 +119,11 @@ impl ReasoningFormat {
         let has = |needle: &str| marker.contains(needle);
         if has("gpt_oss") || has("gpt-oss") || has("gptoss") {
             return Some(ReasoningFormat::GptOss);
+        }
+        // Written with every separator its checkpoints use; the two
+        // words never occur together in another family's name.
+        if has("muse") && has("glimmer") {
+            return Some(ReasoningFormat::MuseGlimmer);
         }
         if has("deepseek") && (has("v4") || has("v3.2") || has("v32")) {
             return Some(ReasoningFormat::DeepSeekV32);
@@ -192,8 +215,221 @@ impl ReasoningFormat {
                 tool_start: None,
                 always_open: false,
             },
+            // Not marker-delimited either; see `AtemState`. The pair is
+            // still filled in, because for a channel grammar
+            // `prompt_opens_reasoning` asks exactly the same question
+            // the marker families ask -- "did the rendered prompt stop
+            // between the opener and its closer?" -- with the channel
+            // header's own two markers. That answer is muse-glimmer's
+            // `header_open`.
+            ReasoningFormat::MuseGlimmer => Markers {
+                start: ATEM_START,
+                end: ATEM_MESSAGE,
+                tool_start: None,
+                always_open: false,
+            },
         }
     }
+}
+
+/// The ATEM control tokens, shared with the tool-call side.
+///
+/// muse-glimmer's turn is a sequence of channels: `<|start|>` opens a
+/// header, `to=<recipient>` names who the body is for, `<|message|>`
+/// ends the header, and one of [`ATEM_CLOSING_TOKENS`] ends the body.
+/// The recipient is what classifies the text -- `self` is reasoning,
+/// `user` is the answer, anything else is a tool.
+pub const ATEM_START: &str = "<|start|>";
+/// The token that ends a channel header and starts its body.
+pub const ATEM_MESSAGE: &str = "<|message|>";
+/// Everything that can end a channel body. `<|eom|>` separates channels
+/// within one turn; the other two are stops.
+pub const ATEM_CLOSING_TOKENS: [&str; 3] = ["<|eot|>", "<|eom|>", "<|end_of_text|>"];
+/// Every ATEM control token, for the hold-back and the "a header never
+/// contains a marker" test.
+pub const ATEM_ALL_TOKENS: [&str; 5] = [
+    ATEM_START,
+    ATEM_MESSAGE,
+    "<|eot|>",
+    "<|eom|>",
+    "<|end_of_text|>",
+];
+/// The longest a recipient name may be, in characters, in *every*
+/// header shape.
+///
+/// One bound everywhere is what keeps streaming and one-shot agreeing
+/// about which recipients are valid: a longer name degrades the same
+/// way in the hold-back, the inline switch and the full header.
+const ATEM_NAME_MAX: usize = 64;
+/// How far past `<|start|>` a real header can run before its
+/// `<|message|>` arrives (`assistant to=<name>` plus slack).
+///
+/// Past this a `<|start|>` cannot be opening a header any more, so it
+/// is released as literal text instead of held forever -- a degenerate
+/// wire must neither stall the stream nor eat the turn.
+pub const ATEM_HEADER_SPAN: usize = 128;
+/// How far back the hold-back looks for a headerless `to=…<|message|>`
+/// switch that is still arriving.
+const ATEM_HOLD_WINDOW: usize = 96;
+
+/// Whether a complete ATEM control token lies inside `text[start..end]`.
+///
+/// A channel header can never contain one, so a `<|start|>` with a
+/// marker before its `<|message|>` is not a header -- it is literal
+/// text the model wrote. `<|message|>` itself is excluded: it is the
+/// terminator being sought, not a byte of the header.
+pub fn atem_marker_inside(text: &str, start: usize, end: usize) -> bool {
+    if start > end || end > text.len() {
+        return false;
+    }
+    let window = &text[start..end];
+    ATEM_ALL_TOKENS
+        .iter()
+        .any(|token| *token != ATEM_MESSAGE && window.contains(token))
+}
+
+/// The streaming hold-back for ATEM output: the longest suffix that
+/// could still grow into a control token *or* into a headerless
+/// `to=<name><|message|>` channel switch.
+///
+/// The switch half is what the generic marker hold-back cannot do. A
+/// switch has no fixed opener -- the model simply writes
+/// `to=weather.get<|message|>` in the middle of a body -- so the only
+/// way to avoid emitting text that later turns out to be a header is to
+/// withhold a whole window of it ([`ATEM_HOLD_WINDOW`] characters)
+/// while a `to=` is still unresolved. Emitted text can never shrink,
+/// and SSE cannot retract, so the window is the price.
+pub fn atem_hold_len(text: &str) -> usize {
+    let owned: Vec<String> = ATEM_ALL_TOKENS.iter().map(|t| t.to_string()).collect();
+    let mut best = crate::detokenize::stop_prefix_holdback(text, &owned);
+
+    let window_start = text
+        .char_indices()
+        .rev()
+        .take(ATEM_HOLD_WINDOW)
+        .last()
+        .map(|(index, _)| index)
+        .unwrap_or(0);
+    let window = &text[window_start..];
+    if let Some(index) = window.rfind("to=") {
+        let tail = &window[index..];
+        let name = &tail["to=".len()..];
+        let run: String = name
+            .chars()
+            .take_while(|c| !c.is_whitespace() && *c != '<')
+            .collect();
+        if run.len() == name.len() && run.chars().count() <= ATEM_NAME_MAX {
+            // The name (or the bare `to=`) is still streaming.
+            best = best.max(tail.len());
+        } else if run.chars().count() <= ATEM_NAME_MAX
+            && !run.is_empty()
+            && ATEM_MESSAGE.starts_with(&name[run.len()..])
+            && name.len() > run.len()
+        {
+            // The name is complete and a partial `<|message|>` follows.
+            best = best.max(tail.len());
+        }
+    }
+    // Proper prefixes of `to=` itself: at most a one-chunk delay.
+    for prefix in ["t", "to"] {
+        if prefix.len() > best && text.ends_with(prefix) {
+            best = prefix.len();
+        }
+    }
+    best
+}
+
+/// A headerless channel switch: `to=<name>` abutting `<|message|>`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AtemSwitch {
+    /// Where the `to=` begins.
+    pub start: usize,
+    /// Just past the `<|message|>`.
+    pub end: usize,
+    pub recipient: String,
+}
+
+/// The first complete headerless switch in `text`, if any.
+///
+/// The model leaves a channel without emitting `<|eom|>` more often
+/// than the template suggests, and a complete match of this shape is a
+/// channel boundary wherever it appears -- including inside a body.
+pub fn find_atem_switch(text: &str) -> Option<AtemSwitch> {
+    let mut from = 0usize;
+    while let Some(index) = text[from..].find("to=").map(|i| i + from) {
+        let name_start = index + "to=".len();
+        let run: String = text[name_start..]
+            .chars()
+            .take_while(|c| !c.is_whitespace() && *c != '<')
+            .collect();
+        let count = run.chars().count();
+        if (1..=ATEM_NAME_MAX).contains(&count)
+            && text[name_start + run.len()..].starts_with(ATEM_MESSAGE)
+        {
+            return Some(AtemSwitch {
+                start: index,
+                end: name_start + run.len() + ATEM_MESSAGE.len(),
+                recipient: run,
+            });
+        }
+        from = index + "to=".len();
+    }
+    None
+}
+
+/// The recipient a header names, if it names one.
+pub fn atem_recipient(header: &str) -> Option<String> {
+    let index = header.find("to=")? + "to=".len();
+    let run: String = header[index..]
+        .chars()
+        .take_while(|c| !c.is_whitespace() && *c != '<')
+        .collect();
+    let count = run.chars().count();
+    (1..=ATEM_NAME_MAX).contains(&count).then_some(run)
+}
+
+/// What ends a channel body, and where.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AtemBoundary {
+    /// One of [`ATEM_CLOSING_TOKENS`], which belongs to the body it
+    /// closes.
+    Closer { at: usize, token: &'static str },
+    /// An abutting `<|start|>`: the next channel's header, which
+    /// belongs to the next channel.
+    Start { at: usize },
+    /// A headerless switch.
+    Switch(AtemSwitch),
+}
+
+impl AtemBoundary {
+    pub fn at(&self) -> usize {
+        match self {
+            AtemBoundary::Closer { at, .. } | AtemBoundary::Start { at } => *at,
+            AtemBoundary::Switch(switch) => switch.start,
+        }
+    }
+}
+
+/// The earliest channel boundary in `text`, if one is complete.
+pub fn atem_boundary(text: &str) -> Option<AtemBoundary> {
+    let mut best: Option<AtemBoundary> = None;
+    let mut consider = |candidate: AtemBoundary| {
+        if best.as_ref().is_none_or(|b| candidate.at() < b.at()) {
+            best = Some(candidate);
+        }
+    };
+    for token in ATEM_CLOSING_TOKENS {
+        if let Some(at) = text.find(token) {
+            consider(AtemBoundary::Closer { at, token });
+        }
+    }
+    if let Some(at) = text.find(ATEM_START) {
+        consider(AtemBoundary::Start { at });
+    }
+    if let Some(switch) = find_atem_switch(text) {
+        consider(AtemBoundary::Switch(switch));
+    }
+    best
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -246,6 +482,51 @@ const HARMONY_BOUNDARIES: [&str; 5] = [
 /// it closes rather than to whatever follows.
 const HARMONY_CLOSERS: [&str; 3] = ["<|end|>", "<|return|>", "<|call|>"];
 
+/// Where in the ATEM channel grammar the stream currently is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AtemMode {
+    /// Between channels, looking for the next header.
+    Seek,
+    /// Streaming a channel body to [`AtemState::recipient`].
+    Body,
+}
+
+/// The ATEM channel format's incremental state.
+#[derive(Debug)]
+struct AtemState {
+    buffer: String,
+    mode: AtemMode,
+    recipient: String,
+    /// Whether the `<|start|>` at the head of the buffer is the seed
+    /// rather than something the model emitted.
+    ///
+    /// The seed exists because the template's prompt ends *inside* a
+    /// header, so the turn's first bytes are a header continuation
+    /// (` to=self<|message|>…`). Seeding the marker sends those bytes
+    /// through the ordinary full-header machinery instead of a second,
+    /// guessing code path -- but if the candidate is ever ruled *not* a
+    /// header, the seed must be dropped rather than delivered: the
+    /// model never wrote it.
+    synthetic_open: bool,
+    header_open: bool,
+}
+
+impl AtemState {
+    fn new(header_open: bool) -> Self {
+        AtemState {
+            buffer: if header_open {
+                ATEM_START.to_string()
+            } else {
+                String::new()
+            },
+            mode: AtemMode::Seek,
+            recipient: "user".to_string(),
+            synthetic_open: header_open,
+            header_open,
+        }
+    }
+}
+
 /// Splits a model's output into reasoning and answer.
 #[derive(Debug)]
 pub struct ReasoningParser {
@@ -259,6 +540,7 @@ pub struct ReasoningParser {
     buffer: String,
     stripped_start: bool,
     harmony: HarmonyState,
+    atem: AtemState,
     /// MiniMax-M3 only: the template may or may not have opened the
     /// block, and the model says which by whether it leads with a bare
     /// closer.
@@ -269,6 +551,11 @@ pub struct ReasoningParser {
 impl ReasoningParser {
     /// `force_reasoning` starts the parser inside the block, for a
     /// template that opened it in the prompt.
+    ///
+    /// For the ATEM channel format the same flag means "the prompt
+    /// ended inside a channel header", which is the same fact read the
+    /// same way ([`ReasoningFormat::prompt_opens_reasoning`]) and is
+    /// what seeds [`AtemState::synthetic_open`].
     pub fn new(format: ReasoningFormat, force_reasoning: bool, stream_reasoning: bool) -> Self {
         let markers = format.markers();
         let force = force_reasoning || markers.always_open;
@@ -280,6 +567,7 @@ impl ReasoningParser {
             buffer: String::new(),
             stripped_start: false,
             harmony: HarmonyState::default(),
+            atem: AtemState::new(force),
             leading_closer_pending: format == ReasoningFormat::MiniMaxM3 && !force,
             head_buffer: String::new(),
         }
@@ -313,6 +601,10 @@ impl ReasoningParser {
         if self.format == ReasoningFormat::GptOss {
             return self.push_harmony(chunk);
         }
+        if self.format == ReasoningFormat::MuseGlimmer {
+            self.atem.buffer.push_str(chunk);
+            return self.drain_atem(false);
+        }
         if self.leading_closer_pending {
             if let Some(delta) = self.push_leading_closer(chunk) {
                 return delta;
@@ -332,6 +624,11 @@ impl ReasoningParser {
             let (reasoning, content) = self.harmony_scan(false);
             let delta = self.harmony_delta(reasoning, content);
             self.harmony = HarmonyState::default();
+            return delta;
+        }
+        if self.format == ReasoningFormat::MuseGlimmer {
+            let delta = self.drain_atem(true);
+            self.atem = AtemState::new(self.atem.header_open);
             return delta;
         }
         if self.leading_closer_pending && !self.head_buffer.is_empty() {
@@ -371,6 +668,188 @@ impl ReasoningParser {
                 ..Default::default()
             }
         }
+    }
+
+    /// Consume as much of the ATEM buffer as is decided.
+    ///
+    /// Channel bodies are routed by recipient: `self` is reasoning,
+    /// `user` (and a header naming nobody) is the answer, and anything
+    /// else is a tool channel, which is passed through to `content`
+    /// **verbatim, header and terminator included** -- the tool parser
+    /// downstream needs the whole block, and a channel that ended
+    /// without its own terminator (an abutting header, a headerless
+    /// switch) is given a synthetic `<|eom|>` so that parser always
+    /// receives a delimited block.
+    ///
+    /// The buffer is *consumed* as it emits rather than re-scanned from
+    /// byte zero each chunk: this family's default chain of thought is
+    /// long, and a per-chunk rescan is quadratic in it.
+    ///
+    /// `at_end` drops the hold-back: text withheld against a boundary
+    /// that never arrived is ordinary output, and dropping it would
+    /// truncate every reply whose tail happens to look like a header.
+    fn drain_atem(&mut self, at_end: bool) -> ReasoningDelta {
+        let mut out = ReasoningDelta::default();
+        while !self.atem.buffer.is_empty() {
+            let buf = std::mem::take(&mut self.atem.buffer);
+            let progressed = match self.atem.mode {
+                AtemMode::Seek => self.atem_seek(&buf, at_end, &mut out),
+                AtemMode::Body => self.atem_body(&buf, at_end, &mut out),
+            };
+            if !progressed {
+                break;
+            }
+        }
+        out
+    }
+
+    /// Between channels: find the next header. Returns whether the scan
+    /// made progress and should run again.
+    fn atem_seek(&mut self, buf: &str, at_end: bool, out: &mut ReasoningDelta) -> bool {
+        let start = buf.find(ATEM_START);
+        if let Some(switch) = find_atem_switch(buf) {
+            if start.is_none_or(|s| switch.start < s) {
+                push_seek_text(&mut out.content, &buf[..switch.start]);
+                self.atem.buffer = buf[switch.end..].to_string();
+                let header = buf[switch.start..switch.end].to_string();
+                self.atem_begin_body(&switch.recipient, &header, out);
+                return true;
+            }
+        }
+        let Some(start) = start else {
+            // Nothing in sight: stream eagerly, holding only the tail
+            // that could still grow into a boundary.
+            let hold = if at_end { 0 } else { atem_hold_len(buf) };
+            let split = crate::detokenize::floor_char_boundary(buf, buf.len() - hold);
+            push_seek_text(&mut out.content, &buf[..split]);
+            self.atem.buffer = buf[split..].to_string();
+            return false;
+        };
+        let synthetic = self.atem.synthetic_open;
+        let header_start = start + ATEM_START.len();
+        let message = buf[header_start..]
+            .find(ATEM_MESSAGE)
+            .map(|i| i + header_start);
+        // A control token inside the candidate settles it immediately:
+        // headers never contain one, so this `<|start|>` is literal
+        // text. Deciding here rather than at the span bound is what
+        // keeps a quoted marker from holding the stream.
+        if atem_marker_inside(buf, header_start, message.unwrap_or(buf.len())) {
+            push_seek_text(&mut out.content, &buf[..start]);
+            self.atem_release_start(synthetic, out);
+            self.atem.buffer = buf[header_start..].to_string();
+            return true;
+        }
+        match message {
+            // A `<|message|>` too far away belongs to the *next*
+            // segment's real header, not to this marker: a stray
+            // literal `<|start|>`, junk, then a genuine header. Parsing
+            // the pair as one giant header would also let a `to=`
+            // inside the junk hijack the recipient.
+            Some(message) if message - header_start > ATEM_HEADER_SPAN => {
+                push_seek_text(&mut out.content, &buf[..start]);
+                self.atem_release_start(synthetic, out);
+                self.atem.buffer = buf[header_start..].to_string();
+                true
+            }
+            Some(message) => {
+                push_seek_text(&mut out.content, &buf[..start]);
+                let recipient =
+                    atem_recipient(&buf[header_start..message]).unwrap_or_else(|| "user".into());
+                let body_start = message + ATEM_MESSAGE.len();
+                let header = buf[start..body_start].to_string();
+                self.atem.synthetic_open = false;
+                self.atem.buffer = buf[body_start..].to_string();
+                self.atem_begin_body(&recipient, &header, out);
+                true
+            }
+            None => {
+                // A complete `<|start|>` whose `<|message|>` has not
+                // arrived. Text before it is content now and is never
+                // re-dropped; the candidate itself is held, with slack
+                // for a `<|message|>` mid-arrival so a protocol-legal
+                // long-name header is not cut at the nominal span.
+                push_seek_text(&mut out.content, &buf[..start]);
+                self.atem.buffer = buf[start..].to_string();
+                let held = self.atem.buffer.len() - ATEM_START.len();
+                if held > ATEM_HEADER_SPAN + ATEM_MESSAGE.len() {
+                    self.atem_release_start(synthetic, out);
+                    self.atem.buffer = self.atem.buffer[ATEM_START.len()..].to_string();
+                    return true;
+                }
+                if at_end {
+                    // At end of stream a candidate that never received
+                    // its `<|message|>` is not a header: deliver the
+                    // tail, drop only the marker.
+                    let tail = self.atem.buffer[ATEM_START.len()..].to_string();
+                    push_seek_text(&mut out.content, &tail);
+                    self.atem.synthetic_open = false;
+                    self.atem.buffer.clear();
+                }
+                false
+            }
+        }
+    }
+
+    /// Inside a channel body: emit up to the next boundary. Returns
+    /// whether the scan made progress and should run again.
+    fn atem_body(&mut self, buf: &str, at_end: bool, out: &mut ReasoningDelta) -> bool {
+        let recipient = self.atem.recipient.clone();
+        let Some(boundary) = atem_boundary(buf) else {
+            let hold = if at_end { 0 } else { atem_hold_len(buf) };
+            let split = crate::detokenize::floor_char_boundary(buf, buf.len() - hold);
+            atem_emit(out, &recipient, &buf[..split]);
+            self.atem.buffer = buf[split..].to_string();
+            return false;
+        };
+        let end = boundary.at();
+        let mut body = buf[..end].to_string();
+        if !matches!(recipient.as_str(), "self" | "user") {
+            // A tool slice keeps its terminator; one that ended without
+            // a terminator gets a synthetic `<|eom|>`, so the tool
+            // parser always receives a delimited block.
+            body.push_str(match &boundary {
+                AtemBoundary::Closer { token, .. } => token,
+                _ => "<|eom|>",
+            });
+        }
+        atem_emit(out, &recipient, &body);
+        match boundary {
+            AtemBoundary::Closer { token, .. } => {
+                self.atem.buffer = buf[end + token.len()..].to_string();
+                self.atem.mode = AtemMode::Seek;
+            }
+            AtemBoundary::Start { .. } => {
+                self.atem.buffer = buf[end..].to_string();
+                self.atem.mode = AtemMode::Seek;
+            }
+            AtemBoundary::Switch(switch) => {
+                self.atem.buffer = buf[switch.end..].to_string();
+                let header = buf[switch.start..switch.end].to_string();
+                self.atem_begin_body(&switch.recipient, &header, out);
+            }
+        }
+        true
+    }
+
+    /// Enter a channel body. A tool channel's header is part of the
+    /// slice the tool parser has to see, so it goes out with the body.
+    fn atem_begin_body(&mut self, recipient: &str, header: &str, out: &mut ReasoningDelta) {
+        self.atem.recipient = recipient.to_string();
+        self.atem.mode = AtemMode::Body;
+        if !matches!(recipient, "self" | "user") {
+            atem_emit(out, recipient, header);
+        }
+    }
+
+    /// Release a `<|start|>` that turned out not to open a header --
+    /// unless it is the synthetic seed, which the model never emitted
+    /// and which must therefore never be delivered.
+    fn atem_release_start(&mut self, synthetic: bool, out: &mut ReasoningDelta) {
+        if !synthetic {
+            out.content.push_str(ATEM_START);
+        }
+        self.atem.synthetic_open = false;
     }
 
     /// MiniMax-M3's adaptive mode: the model signals "no thinking this
@@ -608,6 +1087,38 @@ fn earliest_marker<'a>(text: &str, from: usize, markers: &[&'a str]) -> (usize, 
         }
     }
     (best, which)
+}
+
+/// Route one piece of a channel body by its recipient.
+fn atem_emit(out: &mut ReasoningDelta, recipient: &str, piece: &str) {
+    if piece.is_empty() {
+        return;
+    }
+    if recipient == "self" {
+        out.reasoning.push_str(piece);
+    } else {
+        // A `user` body is unwrapped; a tool slice is verbatim.
+        out.content.push_str(piece);
+    }
+}
+
+/// Deliver inter-channel text as content, stripping the protocol debris
+/// a degenerate decode leaves in it.
+///
+/// Text between channels is still text -- delivering it is what keeps a
+/// reply stranded after a stray closer from vanishing -- but a repeated
+/// terminator in it is not something a client should ever render.
+fn push_seek_text(content: &mut String, piece: &str) {
+    if piece.is_empty() {
+        return;
+    }
+    let mut piece = piece.to_string();
+    for token in ATEM_CLOSING_TOKENS {
+        if piece.contains(token) {
+            piece = piece.replace(token, "");
+        }
+    }
+    content.push_str(&piece);
 }
 
 /// Whether `text` is a non-empty proper prefix of `marker`.
@@ -873,5 +1384,223 @@ mod tests {
     fn an_always_open_family_needs_no_evidence_and_harmony_takes_none() {
         assert!(ReasoningFormat::ThinkAlwaysOpen.prompt_opens_reasoning("anything"));
         assert!(!ReasoningFormat::GptOss.prompt_opens_reasoning("<think>"));
+    }
+
+    // ---- muse-glimmer / ATEM ----
+
+    fn atem(name: &str, params: &[(&str, &str)]) -> String {
+        let body: String = params
+            .iter()
+            .map(|(k, v)| format!("<atem:parameter name=\"{k}\">{v}</atem:parameter>\n"))
+            .collect();
+        format!(
+            "<atem:function_calls>\n<atem:invoke name=\"{name}\">\n{body}\
+             </atem:invoke>\n</atem:function_calls>"
+        )
+    }
+
+    /// Chunk by characters and run the whole stream, flush included.
+    fn stream_chars(parser: &mut ReasoningParser, text: &str, width: usize) -> ReasoningDelta {
+        let chars: Vec<char> = text.chars().collect();
+        let mut out = ReasoningDelta::default();
+        for chunk in chars.chunks(width) {
+            let piece: String = chunk.iter().collect();
+            let delta = parser.push(&piece);
+            out.reasoning.push_str(&delta.reasoning);
+            out.content.push_str(&delta.content);
+        }
+        let tail = parser.flush();
+        out.reasoning.push_str(&tail.reasoning);
+        out.content.push_str(&tail.content);
+        out
+    }
+
+    fn muse(header_open: bool) -> ReasoningParser {
+        ReasoningParser::new(ReasoningFormat::MuseGlimmer, header_open, true)
+    }
+
+    /// The turn begins *inside* a header, because the template's prompt
+    /// ends there. A parser that assumes the header is closed has
+    /// nothing to attach the turn's first bytes to, and a bare
+    /// recipient-less header (`assistant<|message|>`) is then streamed
+    /// to the client as literal markup -- this test fails outright
+    /// without the synthetic seed.
+    #[test]
+    fn a_bare_first_header_is_completed_by_the_synthetic_start() {
+        let split = muse(true).parse_complete("assistant<|message|>Plain.<|eot|>");
+        assert_eq!(split.content, "Plain.");
+        assert_eq!(split.reasoning, "");
+
+        let closed = muse(false).parse_complete("assistant<|message|>Plain.<|eot|>");
+        assert!(
+            closed.content.contains("<|message|>"),
+            "a header-closed parser has no choice but to leak: {closed:?}"
+        );
+    }
+
+    /// The recipient, not a marker, decides which field a body lands in.
+    #[test]
+    fn channel_bodies_are_routed_by_their_recipient() {
+        let split = muse(true).parse_complete(
+            " to=self<|message|>Let me think about this.<|eom|>\
+             <|start|>assistant to=user<|message|>The answer is 42.<|eot|>",
+        );
+        assert_eq!(split.reasoning, "Let me think about this.");
+        assert_eq!(split.content, "The answer is 42.");
+    }
+
+    /// A tool channel is neither reasoning nor prose: it is handed on
+    /// verbatim, header and terminator included, for the tool parser.
+    #[test]
+    fn a_tool_channel_reaches_content_verbatim_with_its_header() {
+        let wire = format!(
+            " to=self<|message|>check the weather<|eom|>\
+             <|start|>assistant to=weather.get<|message|>{}<|eot|>",
+            atem("weather.get", &[("city", "Paris")])
+        );
+        let split = muse(true).parse_complete(&wire);
+        assert_eq!(split.reasoning, "check the weather");
+        assert!(
+            split
+                .content
+                .starts_with("<|start|>assistant to=weather.get<|message|>"),
+            "{:?}",
+            split.content
+        );
+        assert!(split.content.ends_with("<|eot|>"));
+        assert!(split.content.contains("<atem:function_calls>"));
+    }
+
+    /// A channel the model left without a terminator still has to reach
+    /// the tool parser as a *delimited* block, so one is supplied.
+    #[test]
+    fn a_tool_channel_cut_off_by_the_next_header_gets_a_synthetic_terminator() {
+        let wire = format!(
+            " to=weather.get<|message|>{}<|start|>assistant to=user<|message|>done<|eot|>",
+            atem("weather.get", &[("city", "Rome")])
+        );
+        let split = muse(true).parse_complete(&wire);
+        assert!(
+            split.content.contains("</atem:function_calls><|eom|>"),
+            "the slice must be delimited: {:?}",
+            split.content
+        );
+        assert!(split.content.ends_with("done"));
+    }
+
+    /// The model leaves a channel without `<|eom|>` more often than the
+    /// template suggests: a complete `to=X<|message|>` is a boundary
+    /// wherever it appears.
+    #[test]
+    fn a_headerless_switch_ends_the_body_it_appears_in() {
+        let split = muse(true).parse_complete(
+            " to=self<|message|>quick thought to=user<|message|>Here you go.<|eot|>",
+        );
+        assert_eq!(split.reasoning, "quick thought");
+        assert_eq!(split.content, "Here you go.");
+    }
+
+    /// The load-bearing hold-back: a headerless switch has no fixed
+    /// opener, so the tail of a body is withheld while a `to=` in it is
+    /// still unresolved. A hold-back that only knew the control tokens
+    /// would emit `send it to=we` as content and then be unable to
+    /// recognize the switch at all -- and SSE cannot retract.
+    #[test]
+    fn the_atem_hold_back_withholds_a_switch_that_is_still_arriving() {
+        let mut parser = muse(true);
+        let first = parser.push(" to=user<|message|>send it to=we");
+        assert_eq!(first.content, "send it ");
+        assert!(!first.content.contains("to=we"));
+
+        let rest = parser.push(&format!(
+            "ather.get<|message|>{}<|eot|>",
+            atem("weather.get", &[("city", "Lima")])
+        ));
+        assert!(
+            rest.content.starts_with("to=weather.get<|message|>"),
+            "the switch reassembled into a tool slice: {:?}",
+            rest.content
+        );
+        assert_eq!(atem_hold_len("send it to=we"), "to=we".len());
+    }
+
+    /// Streaming and one-shot must agree, at every chunk width -- one
+    /// character per chunk included, which is where a hold-back bug
+    /// hides.
+    #[test]
+    fn atem_streaming_agrees_with_one_shot_at_every_chunk_width() {
+        let wire = format!(
+            " to=self<|message|>step one\nstep two<|eom|>\
+             <|start|>assistant to=weather.get<|message|>{}<|eot|>\
+             <|start|>assistant to=user<|message|>Done: 42.<|eot|>",
+            atem("weather.get", &[("city", "Paris")])
+        );
+        let reference = muse(true).parse_complete(&wire);
+        assert_eq!(reference.reasoning, "step one\nstep two");
+        for width in [1usize, 3, 17, 4096] {
+            let mut parser = muse(true);
+            let out = stream_chars(&mut parser, &wire, width);
+            assert_eq!(out.reasoning.trim(), reference.reasoning, "width {width}");
+            assert_eq!(out.content.trim(), reference.content, "width {width}");
+        }
+    }
+
+    /// A `<|start|>` that never becomes a header is literal text, and a
+    /// reply that merely looks like the start of one is delivered at the
+    /// end of the stream rather than dropped.
+    #[test]
+    fn a_start_marker_that_opens_no_header_is_released_as_text() {
+        let tail = "x".repeat(400);
+        let mut parser = muse(true);
+        let out = stream_chars(
+            &mut parser,
+            &format!(" to=user<|message|>The token <|start|> opens a segment. {tail}"),
+            7,
+        );
+        assert!(out.content.contains("The token "), "{:?}", out.content);
+        assert!(out.content.contains(&tail));
+
+        let mut short = muse(true);
+        let out = stream_chars(&mut short, "assistant", 3);
+        assert_eq!(out.content, "assistant", "a short lookalike still arrives");
+    }
+
+    /// A stray terminator is protocol debris, but the prose around it is
+    /// the answer.
+    #[test]
+    fn a_stray_terminator_is_stripped_without_losing_the_prose() {
+        let mut parser = muse(true);
+        let out = stream_chars(&mut parser, "The token <|eot|> ends a turn.", 5);
+        assert!(out.content.contains("The token "), "{:?}", out.content);
+        assert!(out.content.contains(" ends a turn."));
+        assert!(!out.content.contains("<|eot|>"));
+    }
+
+    /// Output with no ATEM markers at all is somebody answering
+    /// plainly, and passes straight through.
+    #[test]
+    fn atem_text_with_no_channels_passes_through() {
+        let text = "Just a plain answer, no channels.";
+        let split = muse(true).parse_complete(text);
+        assert_eq!(split.content, text);
+        assert_eq!(split.reasoning, "");
+    }
+
+    /// The same prompt-reading rule as the `<think>` families, asking
+    /// the channel grammar's own question: did the render stop between
+    /// `<|start|>` and its `<|message|>`?
+    #[test]
+    fn a_prompt_ending_inside_a_channel_header_opens_the_header() {
+        let f = ReasoningFormat::MuseGlimmer;
+        assert!(f.prompt_opens_reasoning("<|start|>user<|message|>hi<|eot|><|start|>assistant"));
+        assert!(!f.prompt_opens_reasoning("<|start|>user<|message|>hi<|eot|>"));
+        assert_eq!(
+            ReasoningFormat::infer("Muse-Glimmer-40B-A3B"),
+            Some(ReasoningFormat::MuseGlimmer)
+        );
+        assert_eq!(
+            ReasoningFormat::parse("muse_glimmer"),
+            Some(ReasoningFormat::MuseGlimmer)
+        );
     }
 }

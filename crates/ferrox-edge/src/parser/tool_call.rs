@@ -13,9 +13,28 @@
 //! | Qwen3-Coder | `<tool_call><function=name><parameter=key>value</parameter></function></tool_call>` |
 //! | GLM-4.7 | `<tool_call>name\n<arg_key>k</arg_key><arg_value>v</arg_value></tool_call>` |
 //! | DeepSeek | `<｜DSML｜invoke name="…"><｜DSML｜parameter name="…">…` |
-//! | MiniMax | `<minimax:tool_call><invoke name="…"><parameter name="…">…` |
+//! | MiniMax-M2 | `<minimax:tool_call><invoke name="…"><parameter name="…">…` |
+//! | MiniMax-M3 | `]<]minimax[>[<tool_call>]<]minimax[>[<invoke name="…">]<]minimax[>[<key>…` |
 //! | gpt-oss | `<\|channel\|>commentary to=functions.name<\|message\|>{…}<\|call\|>` |
 //! | Gemma 4 | `<\|tool_call>call:name{k: v}<tool_call\|>` |
+//! | muse-glimmer | `<\|start\|>assistant to=tool<\|message\|><atem:function_calls>…<\|eot\|>` |
+//!
+//! Two of these are *not* variations on the others, and both were
+//! mis-parsed by being treated as one:
+//!
+//! **MiniMax-M3 is a different protocol from M2's**, not M2 with
+//! renamed tags. Every structural tag carries the `]<]minimax[>[`
+//! namespace prefix, one wrapper holds several `<invoke>` tags, and the
+//! arguments are parameter-*name* elements rendered recursively --
+//! objects nest tags, arrays repeat `<item>` -- typed from the tool's
+//! schema at every nesting level.
+//!
+//! **muse-glimmer wraps its calls in a channel**. The invoke/parameter
+//! block is ordinary, but it only *counts* inside a channel addressed
+//! to a tool ([`ToolCallFormat::MuseGlimmer`]); the same block written
+//! in an answer to the user -- the system prompt's own example, echoed
+//! back -- is text. Everything else the model says in a tool channel is
+//! dropped, because the template puts nothing else there.
 //!
 //! # Why the XML-ish families need a schema
 //!
@@ -49,6 +68,10 @@ use std::collections::BTreeMap;
 use serde_json::{Map, Value};
 
 use crate::detokenize::{floor_char_boundary, stop_prefix_holdback};
+use crate::parser::reasoning::{
+    atem_boundary, atem_hold_len, atem_marker_inside, atem_recipient, AtemBoundary,
+    ATEM_CLOSING_TOKENS, ATEM_HEADER_SPAN, ATEM_MESSAGE, ATEM_START,
+};
 
 /// One recognized call.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -123,29 +146,52 @@ pub enum ToolCallFormat {
     Glm47,
     /// DeepSeek's DSML invoke/parameter grammar.
     DeepSeekV32,
-    /// MiniMax's namespaced invoke/parameter grammar.
+    /// MiniMax-M2's `<minimax:tool_call>` invoke/parameter grammar.
     MiniMax,
+    /// MiniMax-M3's `]<]minimax[>[`-namespaced recursive element
+    /// grammar -- a different protocol, not renamed tags.
+    MiniMaxM3,
     /// The gpt-oss harmony commentary channel.
     GptOss,
     /// Gemma 4's `call:name{…}` form.
     Gemma4,
+    /// muse-glimmer's ATEM channel grammar around an
+    /// `<atem:invoke>`/`<atem:parameter>` block.
+    MuseGlimmer,
 }
 
 /// Every marker that means "a tool call may be starting", across all
 /// families. Used to decide, cheaply, whether a response is worth
 /// parsing at all.
-pub const TOOL_MARKERS: [&str; 10] = [
+pub const TOOL_MARKERS: [&str; 12] = [
     "<tool_call>",
     "<function=",
     "<|python_tag|>",
     "[TOOL_CALLS]",
     "<minimax:tool_call>",
+    "]<]minimax[>[<tool_call>",
     "<｜DSML｜function_calls>",
     "<｜DSML｜invoke",
     "<|channel|>",
     "<|tool_call>",
     "to=functions.",
+    "<atem:function_calls>",
 ];
+
+/// MiniMax-M3's namespace prefix, in front of every structural tag.
+const M3_NS: &str = "]<]minimax[>[";
+/// `M3_NS` plus `<`: where every M3 tag begins.
+const M3_TAG: &str = "]<]minimax[>[<";
+/// `M3_NS` plus `</`: where every M3 closing tag begins.
+const M3_CLOSE_TAG: &str = "]<]minimax[>[</";
+const M3_OPEN: &str = "]<]minimax[>[<tool_call>";
+const M3_CLOSE: &str = "]<]minimax[>[</tool_call>";
+const M3_INVOKE_OPEN: &str = "]<]minimax[>[<invoke";
+const M3_INVOKE_CLOSE: &str = "]<]minimax[>[</invoke>";
+/// Characters that cannot appear in an element's tag name. A "name"
+/// holding one of these is not a parameter element at all -- it is an
+/// `<invoke …>` echo or model noise -- and is stepped over.
+const M3_TAG_BAD: [char; 5] = [' ', '"', '<', '>', '/'];
 
 impl ToolCallFormat {
     pub fn as_str(self) -> &'static str {
@@ -157,8 +203,10 @@ impl ToolCallFormat {
             ToolCallFormat::Glm47 => "glm47",
             ToolCallFormat::DeepSeekV32 => "deepseekv32",
             ToolCallFormat::MiniMax => "minimax",
+            ToolCallFormat::MiniMaxM3 => "minimax_m3",
             ToolCallFormat::GptOss => "gpt_oss",
             ToolCallFormat::Gemma4 => "gemma4",
+            ToolCallFormat::MuseGlimmer => "muse_glimmer",
         }
     }
 
@@ -171,8 +219,10 @@ impl ToolCallFormat {
             "glm47" => Some(ToolCallFormat::Glm47),
             "deepseekv32" => Some(ToolCallFormat::DeepSeekV32),
             "minimax" => Some(ToolCallFormat::MiniMax),
+            "minimax_m3" => Some(ToolCallFormat::MiniMaxM3),
             "gpt_oss" | "gpt-oss" => Some(ToolCallFormat::GptOss),
             "gemma4" => Some(ToolCallFormat::Gemma4),
+            "muse_glimmer" => Some(ToolCallFormat::MuseGlimmer),
             _ => None,
         }
     }
@@ -182,13 +232,20 @@ impl ToolCallFormat {
     /// The order of these arms is load-bearing: the specific families
     /// have to be tested before the general ones they look like, or
     /// Qwen3-Coder resolves to plain Qwen and its whole grammar is
-    /// missed. Llama 3 is the fallback because its `<|python_tag|>`
-    /// form is also what an untrained model most often improvises.
+    /// missed -- and MiniMax-M3 resolves to M2, whose `<minimax:…>`
+    /// tags appear nowhere in an M3 turn, so every call it makes is
+    /// emitted to the client as raw markup in `content`. Llama 3 is the
+    /// fallback because its `<|python_tag|>` form is also what an
+    /// untrained model most often improvises.
     pub fn infer(marker: &str) -> ToolCallFormat {
         let marker = marker.to_ascii_lowercase();
         let has = |needle: &str| marker.contains(needle);
         if has("gpt_oss") || has("gpt-oss") || has("gptoss") {
             ToolCallFormat::GptOss
+        } else if has("muse") && has("glimmer") {
+            ToolCallFormat::MuseGlimmer
+        } else if has("minimax_m3") || has("minimax-m3") || has("minimaxm3") {
+            ToolCallFormat::MiniMaxM3
         } else if has("minimax") {
             ToolCallFormat::MiniMax
         } else if has("gemma4") {
@@ -220,16 +277,28 @@ impl ToolCallFormat {
             ToolCallFormat::Mistral => Some("[TOOL_CALLS]"),
             ToolCallFormat::DeepSeekV32 => Some("<｜DSML｜function_calls>"),
             ToolCallFormat::MiniMax => Some("<minimax:tool_call>"),
+            ToolCallFormat::MiniMaxM3 => Some(M3_OPEN),
             ToolCallFormat::Gemma4 => Some("<|tool_call>"),
             // A harmony call opens with a channel header, which also
             // opens ordinary messages -- there is no marker that means
             // "tool call" on its own.
             ToolCallFormat::GptOss => None,
+            // Nor does muse-glimmer have one: `<atem:function_calls>`
+            // is a tool call only inside a tool channel, and the same
+            // text in an answer is prose. A checkpoint anchor set on it
+            // would fire on the model quoting its own instructions.
+            ToolCallFormat::MuseGlimmer => None,
         }
     }
 
     /// Whether this format's arguments stream as prefix-stable
     /// fragments, or arrive whole when the call completes.
+    ///
+    /// MiniMax-M3 is deliberately not in this list: its arguments are a
+    /// recursive element tree whose meaning depends on siblings that
+    /// have not arrived yet (a repeated tag turns a value into an
+    /// array), so a fragment emitted early would have to be taken back.
+    /// Its calls are emitted whole, one per `</invoke>`.
     pub fn streams_arguments(self) -> bool {
         matches!(
             self,
@@ -237,7 +306,20 @@ impl ToolCallFormat {
                 | ToolCallFormat::DeepSeekV32
                 | ToolCallFormat::MiniMax
                 | ToolCallFormat::Glm47
+                | ToolCallFormat::MuseGlimmer
         )
+    }
+
+    /// Whether this format's parser has to be told where the turn
+    /// started.
+    ///
+    /// Only the channel grammar does: muse-glimmer's templated prompt
+    /// ends *inside* an assistant channel header, so a parser reading
+    /// the raw turn bytes must start header-open. Downstream of the
+    /// reasoning parser it must not -- that parser delivers tool slices
+    /// with their full headers already attached.
+    pub fn accepts_header_open(self) -> bool {
+        matches!(self, ToolCallFormat::MuseGlimmer)
     }
 
     fn markers(self) -> Markers {
@@ -247,6 +329,27 @@ impl ToolCallFormat {
             ToolCallFormat::Mistral => Markers::block("[TOOL_CALLS]", ""),
             ToolCallFormat::Gemma4 => Markers::block("<|tool_call>", "<tool_call|>"),
             ToolCallFormat::GptOss => Markers::block("<|channel|>", "<|call|>"),
+            // The element grammar is scanned by `parse_m3`; only the
+            // wrapper is a marker in the ordinary sense.
+            ToolCallFormat::MiniMaxM3 => Markers::block(M3_OPEN, M3_CLOSE),
+            ToolCallFormat::MuseGlimmer => Markers {
+                open: "<atem:function_calls>",
+                close: "</atem:function_calls>",
+                invoke: Some(TagGrammar {
+                    open: "<atem:invoke",
+                    name: NameStyle::Attribute,
+                    close: "</atem:invoke>",
+                }),
+                param: Some(TagGrammar {
+                    open: "<atem:parameter",
+                    name: NameStyle::Attribute,
+                    close: "</atem:parameter>",
+                }),
+                // "spaces for string values are not stripped" is the
+                // chat template's own words.
+                trim_newlines: TrimStyle::None,
+                undeclared: Undeclared::String,
+            },
             ToolCallFormat::Qwen3Coder => Markers {
                 open: "<tool_call>",
                 close: "</tool_call>",
@@ -261,6 +364,7 @@ impl ToolCallFormat {
                     close: "</parameter>",
                 }),
                 trim_newlines: TrimStyle::One,
+                undeclared: Undeclared::Loose,
             },
             ToolCallFormat::MiniMax => Markers {
                 open: "<minimax:tool_call>",
@@ -276,6 +380,7 @@ impl ToolCallFormat {
                     close: "</parameter>",
                 }),
                 trim_newlines: TrimStyle::All,
+                undeclared: Undeclared::Loose,
             },
             ToolCallFormat::DeepSeekV32 => Markers {
                 open: "<｜DSML｜function_calls>",
@@ -291,6 +396,7 @@ impl ToolCallFormat {
                     close: "</｜DSML｜parameter>",
                 }),
                 trim_newlines: TrimStyle::None,
+                undeclared: Undeclared::Loose,
             },
             ToolCallFormat::Glm47 => Markers {
                 open: "<tool_call>",
@@ -302,6 +408,7 @@ impl ToolCallFormat {
                     close: "</arg_value>",
                 }),
                 trim_newlines: TrimStyle::All,
+                undeclared: Undeclared::Loose,
             },
         }
     }
@@ -333,6 +440,16 @@ enum TrimStyle {
     All,
 }
 
+/// What a parameter the request's schema never mentioned is worth.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Undeclared {
+    /// Guess from the text: a number if it reads as one, and so on.
+    Loose,
+    /// A string, always. muse-glimmer's template says so, and guessing
+    /// against it turns an undeclared `007` into `7`.
+    String,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct Markers {
     open: &'static str,
@@ -340,6 +457,7 @@ struct Markers {
     invoke: Option<TagGrammar>,
     param: Option<TagGrammar>,
     trim_newlines: TrimStyle,
+    undeclared: Undeclared,
 }
 
 impl Markers {
@@ -350,8 +468,22 @@ impl Markers {
             invoke: None,
             param: None,
             trim_newlines: TrimStyle::None,
+            undeclared: Undeclared::Loose,
         }
     }
+}
+
+/// Which ATEM channel the muse-glimmer parser is inside.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Channel {
+    /// Outside a channel, or inside one addressed to the user: text.
+    Text,
+    /// Inside a `to=self` channel: reasoning the tool parser has no
+    /// business emitting. Only reached when no reasoning parser is
+    /// stacked above, which is exactly when it must be swallowed.
+    Skip,
+    /// Inside a channel addressed to a tool: ATEM markup, executed.
+    Tool,
 }
 
 /// Parses one response's tool calls.
@@ -365,6 +497,25 @@ pub struct ToolCallParser {
     emitted: usize,
     /// Set while a streamed call is open.
     open: Option<OpenCall>,
+    /// MiniMax-M3 only: whether the buffer's head is a wrapper that has
+    /// opened and not closed. While it is, the buffer *keeps* the
+    /// opener, so a stream that ends mid-block is still recognizable as
+    /// a block and its complete invokes can be salvaged.
+    m3_in_block: bool,
+    /// muse-glimmer only: whether this parser reads the raw turn, whose
+    /// prompt ended inside a channel header.
+    header_open: bool,
+    /// muse-glimmer only: the channel the stream is in.
+    channel: Channel,
+    /// muse-glimmer only: whether the `<|start|>` at the head of the
+    /// buffer is the seed rather than model output, and so must be
+    /// dropped rather than delivered if it turns out not to be a
+    /// header.
+    synthetic_open: bool,
+    /// muse-glimmer only: whether a channel boundary cut an invoke in
+    /// half. What follows is that broken channel's markup residue, not
+    /// content, until the first character that cannot be residue.
+    truncated_channel: bool,
 }
 
 #[derive(Debug)]
@@ -379,6 +530,27 @@ struct OpenCall {
 
 impl ToolCallParser {
     pub fn new(format: ToolCallFormat, tools: Vec<ToolSchema>) -> Self {
+        ToolCallParser::with_header_open(format, tools, false)
+    }
+
+    /// A parser told where the turn started.
+    ///
+    /// Pass `header_open` for a muse-glimmer checkpoint whose raw turn
+    /// bytes reach this parser directly -- the template's prompt ends
+    /// with `<|start|>assistant`, so the model's first token continues
+    /// a header nobody sent us. A synthetic `<|start|>` is seeded so
+    /// those bytes go through the ordinary full-header machinery
+    /// instead of a second guessing path; if the candidate turns out
+    /// not to be a header, the seed is dropped rather than emitted.
+    ///
+    /// Every other format ignores the flag
+    /// ([`ToolCallFormat::accepts_header_open`]).
+    pub fn with_header_open(
+        format: ToolCallFormat,
+        tools: Vec<ToolSchema>,
+        header_open: bool,
+    ) -> Self {
+        let header_open = header_open && format.accepts_header_open();
         ToolCallParser {
             format,
             markers: format.markers(),
@@ -386,9 +558,18 @@ impl ToolCallParser {
                 .into_iter()
                 .map(|tool| (tool.name.clone(), tool))
                 .collect(),
-            buffer: String::new(),
+            buffer: if header_open {
+                ATEM_START.to_string()
+            } else {
+                String::new()
+            },
             emitted: 0,
             open: None,
+            m3_in_block: false,
+            header_open,
+            channel: Channel::Text,
+            synthetic_open: header_open,
+            truncated_channel: false,
         }
     }
 
@@ -423,10 +604,22 @@ impl ToolCallParser {
 
     /// Parse a complete response into its text and its calls.
     pub fn parse_complete(&self, text: &str) -> (String, Vec<ToolCall>) {
-        if self.tools.is_empty() || !self.has_tool_call(text) {
+        if self.tools.is_empty() {
+            return (text.to_string(), Vec::new());
+        }
+        // muse-glimmer takes no such shortcut: its channel layer
+        // classifies text as well as calls, and a `to=self` body with
+        // no ATEM block in it would otherwise be handed to the client
+        // as the answer.
+        if self.format == ToolCallFormat::MuseGlimmer {
+            return self.replay_streaming(text);
+        }
+        if !self.has_tool_call(text) {
             return (text.to_string(), Vec::new());
         }
         match self.format {
+            ToolCallFormat::MiniMaxM3 => self.parse_m3(text),
+            ToolCallFormat::MuseGlimmer => unreachable!("handled above"),
             ToolCallFormat::Qwen25 => self.parse_json_blocks(text, "<tool_call>", "</tool_call>"),
             ToolCallFormat::Llama3 => self.parse_bare_json(text, "<|python_tag|>"),
             ToolCallFormat::Mistral => self.parse_mistral(text),
@@ -451,15 +644,21 @@ impl ToolCallParser {
             }
             return events;
         }
-        loop {
-            let progressed = if self.open.is_some() {
-                self.step_open_call(&mut events)
-            } else {
-                self.step_idle(&mut events)
-            };
-            if !progressed {
-                break;
-            }
+        match self.format {
+            // Two grammars whose structure is not a marker pair: they
+            // drive their own scan.
+            ToolCallFormat::MiniMaxM3 => self.drain_m3(&mut events),
+            ToolCallFormat::MuseGlimmer => self.drain_muse(&mut events),
+            _ => loop {
+                let progressed = if self.open.is_some() {
+                    self.step_open_call(&mut events)
+                } else {
+                    self.step_idle(&mut events)
+                };
+                if !progressed {
+                    break;
+                }
+            },
         }
         events
     }
@@ -472,6 +671,10 @@ impl ToolCallParser {
     /// leave the client parsing an unterminated object forever.
     pub fn finish(&mut self) -> Vec<ToolCallEvent> {
         let mut events = Vec::new();
+        if self.format == ToolCallFormat::MuseGlimmer {
+            self.finish_muse(&mut events);
+            return events;
+        }
         if let Some(open) = self.open.take() {
             let arguments = close_ledger(&open);
             events.push(ToolCallEvent::CallArguments {
@@ -669,6 +872,7 @@ impl ToolCallParser {
             self.buffer.drain(..gt + 1);
             return true;
         };
+        let name = self.canonical_name(name);
         let index = self.emitted;
         self.open = Some(OpenCall {
             index,
@@ -846,24 +1050,10 @@ impl ToolCallParser {
             return Value::String(trimmed.to_string());
         }
         let declared = self.tools.get(tool).and_then(|t| t.parameter_type(key));
-        match declared.as_deref() {
-            Some("string") | Some("str") | Some("enum") => Value::String(trimmed.to_string()),
-            Some("integer") | Some("int") => trimmed
-                .parse::<i64>()
-                .map(Value::from)
-                .unwrap_or_else(|_| Value::String(trimmed.to_string())),
-            Some("number") | Some("float") | Some("double") => trimmed
-                .parse::<f64>()
-                .map(Value::from)
-                .unwrap_or_else(|_| Value::String(trimmed.to_string())),
-            Some("boolean") | Some("bool") => Value::Bool(trimmed.eq_ignore_ascii_case("true")),
-            Some("object") | Some("array") => {
-                serde_json::from_str(trimmed).unwrap_or_else(|_| Value::String(trimmed.to_string()))
-            }
-            // Undeclared: a best-effort parse, keeping the text
-            // whenever it is not obviously something else.
-            _ => parse_loose(trimmed),
+        if declared.is_none() && self.markers.undeclared == Undeclared::String {
+            return Value::String(trimmed.to_string());
         }
+        convert_declared(trimmed, declared.as_deref())
     }
 
     // ---- one-shot parsers, per family ----
@@ -1037,7 +1227,11 @@ impl ToolCallParser {
     /// grammar, so a streamed response and a buffered one cannot
     /// disagree about what the model said.
     fn replay_streaming(&self, text: &str) -> (String, Vec<ToolCall>) {
-        let mut parser = ToolCallParser::new(self.format, self.tools.values().cloned().collect());
+        let mut parser = ToolCallParser::with_header_open(
+            self.format,
+            self.tools.values().cloned().collect(),
+            self.header_open,
+        );
         let mut events = parser.push(text);
         events.extend(parser.finish());
 
@@ -1099,6 +1293,925 @@ impl ToolCallParser {
     fn known(&self, name: &str) -> bool {
         self.tools.contains_key(name) || name.contains(':')
     }
+
+    /// Normalize an invoke's function name before it is reported.
+    ///
+    /// muse-glimmer's template renders a bare-name tool's recipient
+    /// namespace as `name.*`, so the model writes
+    /// `get_weather.get_weather`. Collapsing the doubled form to the
+    /// registered head is what makes such a call executable -- but
+    /// never when the doubled form is itself a registered tool, and
+    /// never for a genuinely namespaced `weather.get`.
+    fn canonical_name(&self, name: String) -> String {
+        if self.format != ToolCallFormat::MuseGlimmer {
+            return name;
+        }
+        if let Some((head, tail)) = name.split_once('.') {
+            if head == tail && self.tools.contains_key(head) && !self.tools.contains_key(&name) {
+                return head.to_string();
+            }
+        }
+        name
+    }
+
+    // ---- MiniMax-M3: a namespaced recursive element grammar ----
+
+    /// Scan the buffer for M3 wrappers, emitting one call per complete
+    /// `</invoke>`.
+    ///
+    /// While a wrapper is open the buffer *keeps* its opener, so a
+    /// stream that stops mid-block is still recognizable as a block:
+    /// [`ToolCallParser::finish`] re-parses it and salvages every
+    /// invoke that did complete.
+    fn drain_m3(&mut self, events: &mut Vec<ToolCallEvent>) {
+        while !self.buffer.is_empty() {
+            if !self.m3_in_block {
+                match self.buffer.find(M3_OPEN) {
+                    None => {
+                        // The hold-back has to take the LONGEST suffix
+                        // that is a proper prefix of the opener, not
+                        // the shortest: `]` recurs inside
+                        // `]<]minimax[>[`, so a buffer ending `]<]`
+                        // matches at one character too, and holding
+                        // only that leaks `]<` as content -- after
+                        // which the marker can never be recognized.
+                        let hold = longest_partial_prefix(&self.buffer, M3_OPEN);
+                        let split = floor_char_boundary(&self.buffer, self.buffer.len() - hold);
+                        if split == 0 {
+                            return;
+                        }
+                        let text: String = self.buffer.drain(..split).collect();
+                        events.push(ToolCallEvent::Text(text));
+                        return;
+                    }
+                    Some(0) => self.m3_in_block = true,
+                    Some(at) => {
+                        let text: String = self.buffer.drain(..at).collect();
+                        events.push(ToolCallEvent::Text(text));
+                    }
+                }
+                continue;
+            }
+            // Inside a wrapper. Markers are interpreted structurally --
+            // between elements only -- so a value quoting the wire
+            // syntax can neither spawn a phantom call nor end the block.
+            let step = {
+                let body = &self.buffer[M3_OPEN.len()..];
+                match m3_next_action(body) {
+                    None => None,
+                    Some(M3Action::Close { at }) => Some(M3Step::Close { at }),
+                    Some(M3Action::Invoke { name, body_at }) => {
+                        let (items, end, closer) = m3_scan_invoke_interior(body, body_at);
+                        // Anything but a complete `</invoke>` means the
+                        // call is still arriving (or was truncated, in
+                        // which case `finish` salvages it).
+                        (closer == Some(M3Closer::Invoke)).then_some(M3Step::Call {
+                            name,
+                            items,
+                            end,
+                        })
+                    }
+                }
+            };
+            match step {
+                None => return,
+                Some(M3Step::Close { at }) => {
+                    self.buffer = self.buffer[M3_OPEN.len() + at + M3_CLOSE.len()..].to_string();
+                    self.m3_in_block = false;
+                }
+                Some(M3Step::Call { name, items, end }) => {
+                    let arguments = self.m3_arguments(&name, &items);
+                    let rest =
+                        self.buffer[M3_OPEN.len() + end + M3_INVOKE_CLOSE.len()..].to_string();
+                    self.buffer = format!("{M3_OPEN}{rest}");
+                    let index = self.emitted;
+                    self.emitted += 1;
+                    events.push(ToolCallEvent::CallStart { index, name });
+                    events.push(ToolCallEvent::CallArguments {
+                        index,
+                        fragment: arguments.clone(),
+                    });
+                    events.push(ToolCallEvent::CallEnd { index, arguments });
+                }
+            }
+        }
+    }
+
+    /// One-shot: every wrapper in the text, with the text between and
+    /// after them kept as content.
+    fn parse_m3(&self, text: &str) -> (String, Vec<ToolCall>) {
+        let mut normal = String::new();
+        let mut calls = Vec::new();
+        let mut pos = 0usize;
+        loop {
+            let Some(at) = text[pos..].find(M3_OPEN).map(|i| i + pos) else {
+                normal.push_str(&text[pos..]);
+                break;
+            };
+            normal.push_str(&text[pos..at]);
+            pos = self.parse_m3_block(text, at + M3_OPEN.len(), &mut calls);
+        }
+        (normal, calls)
+    }
+
+    /// Parse one wrapper interior, returning where it ended.
+    ///
+    /// A wrapper that never closes -- the shape a generation truncated
+    /// by `max_tokens` leaves -- still yields the invokes that did
+    /// complete, and a truncated trailing element still salvages its
+    /// complete siblings.
+    fn parse_m3_block(&self, text: &str, from: usize, calls: &mut Vec<ToolCall>) -> usize {
+        let mut pos = from;
+        while pos < text.len() {
+            let Some(at) = text[pos..].find(M3_TAG).map(|i| i + pos) else {
+                return text.len();
+            };
+            if text[at..].starts_with(M3_CLOSE) {
+                return at + M3_CLOSE.len();
+            }
+            let Some((name, body_at)) = m3_invoke_open_at(text, at) else {
+                pos = at + M3_NS.len() + 1; // a stray marker at block level
+                continue;
+            };
+            let (items, end, closer) = m3_scan_invoke_interior(text, body_at);
+            if self.known(&name) {
+                let arguments = self.m3_arguments(&name, &items);
+                calls.push(ToolCall {
+                    index: calls.len(),
+                    name,
+                    arguments,
+                });
+            }
+            match closer {
+                Some(M3Closer::Invoke) => pos = end + M3_INVOKE_CLOSE.len(),
+                Some(M3Closer::Wrapper) => return end + M3_CLOSE.len(),
+                None => return text.len(),
+            }
+        }
+        text.len()
+    }
+
+    /// Build one invoke's arguments from its scanned elements.
+    ///
+    /// The tool's schema is threaded down the whole tree, not just
+    /// applied at the top: a nested leaf declared `string` stays a
+    /// string, which is what keeps a postcode like `018956` from being
+    /// read as the number 18956 three levels down.
+    fn m3_arguments(&self, name: &str, items: &[(String, String)]) -> String {
+        let params = self
+            .tools
+            .get(name)
+            .and_then(|tool| tool.parameters.as_ref());
+        // The properties map when there is one, the schema itself
+        // otherwise -- some requests send the properties bare.
+        let props = params.map(|schema| schema.get("properties").unwrap_or(schema));
+        let value = m3_args_from_items(items, props);
+        serde_json::to_string(&value).unwrap_or_else(|_| "{}".into())
+    }
+
+    // ---- muse-glimmer: an ATEM channel around an invoke block ----
+
+    /// Run the channel layer, which decides what the invoke machinery
+    /// is even allowed to look at.
+    fn drain_muse(&mut self, events: &mut Vec<ToolCallEvent>) {
+        while !self.buffer.is_empty() {
+            let progressed = match self.channel {
+                Channel::Text => self.muse_text(events),
+                Channel::Skip => self.muse_skip(),
+                Channel::Tool => self.muse_tool(events),
+            };
+            if !progressed {
+                break;
+            }
+        }
+    }
+
+    /// Outside a tool channel: stream text and watch for a header.
+    fn muse_text(&mut self, events: &mut Vec<ToolCallEvent>) -> bool {
+        if self.truncated_channel {
+            // A broken channel's trailing markup is dropped BY SHAPE --
+            // closing tags and whitespace -- and the mark clears at the
+            // first character that cannot be residue. Waiting for a
+            // later boundary instead would swallow the turn's real
+            // reply, which on this wire arrives immediately.
+            let (consumed, decided) = atem_residue_end(&self.buffer);
+            if consumed > 0 {
+                self.buffer.drain(..consumed);
+            }
+            if !decided {
+                return false;
+            }
+            self.truncated_channel = false;
+            return true;
+        }
+        let Some(boundary) = atem_boundary(&self.buffer) else {
+            let hold = atem_hold_len(&self.buffer);
+            let split = floor_char_boundary(&self.buffer, self.buffer.len() - hold);
+            if split == 0 {
+                return false;
+            }
+            let text: String = self.buffer.drain(..split).collect();
+            events.push(ToolCallEvent::Text(text));
+            return false;
+        };
+        let at = boundary.at();
+        if at > 0 {
+            let text: String = self.buffer.drain(..at).collect();
+            events.push(ToolCallEvent::Text(text));
+            return true;
+        }
+        match boundary {
+            // A terminator with no channel to close is protocol debris.
+            AtemBoundary::Closer { token, .. } => {
+                self.buffer.drain(..token.len());
+                true
+            }
+            AtemBoundary::Switch(switch) => {
+                self.buffer.drain(..switch.end);
+                self.enter_recipient(&switch.recipient);
+                true
+            }
+            AtemBoundary::Start { .. } => self.muse_header(events),
+        }
+    }
+
+    /// Read the channel header the buffer opens with.
+    fn muse_header(&mut self, events: &mut Vec<ToolCallEvent>) -> bool {
+        let synthetic = self.synthetic_open;
+        let message = self.buffer.find(ATEM_MESSAGE);
+        // A control token inside the candidate settles it at once:
+        // headers never contain one, so this `<|start|>` is text.
+        if atem_marker_inside(
+            &self.buffer,
+            ATEM_START.len(),
+            message.unwrap_or(self.buffer.len()),
+        ) {
+            self.release_start(synthetic, events);
+            return true;
+        }
+        match message {
+            // Too far away to belong to this marker: a stray literal
+            // `<|start|>`, junk, then the next segment's real header.
+            Some(message) if message - ATEM_START.len() > ATEM_HEADER_SPAN => {
+                self.release_start(synthetic, events);
+                true
+            }
+            Some(message) => {
+                let recipient = atem_recipient(&self.buffer[ATEM_START.len()..message])
+                    .unwrap_or_else(|| "user".into());
+                self.synthetic_open = false;
+                self.buffer.drain(..message + ATEM_MESSAGE.len());
+                self.enter_recipient(&recipient);
+                true
+            }
+            None => {
+                // Held while it could still become a header, with slack
+                // for a `<|message|>` mid-arrival; past that bound it
+                // cannot open one any more and is released as text, so
+                // a degenerate wire neither stalls nor eats the turn.
+                if self.buffer.len() > ATEM_START.len() + ATEM_HEADER_SPAN + ATEM_MESSAGE.len() {
+                    self.release_start(synthetic, events);
+                    return true;
+                }
+                false
+            }
+        }
+    }
+
+    /// Give up on a `<|start|>` that opens no header. The synthetic
+    /// seed is dropped rather than delivered: the model never wrote it.
+    fn release_start(&mut self, synthetic: bool, events: &mut Vec<ToolCallEvent>) {
+        if !synthetic {
+            events.push(ToolCallEvent::Text(ATEM_START.to_string()));
+        }
+        self.synthetic_open = false;
+        self.buffer.drain(..ATEM_START.len());
+    }
+
+    /// Inside a `to=self` channel: swallow the body.
+    fn muse_skip(&mut self) -> bool {
+        match atem_boundary(&self.buffer) {
+            None => {
+                let hold = atem_hold_len(&self.buffer);
+                let split = floor_char_boundary(&self.buffer, self.buffer.len() - hold);
+                self.buffer.drain(..split);
+                false
+            }
+            Some(boundary) => {
+                // Drop the body; the boundary itself is handled by text
+                // mode, exactly as if the channel had been one.
+                self.buffer.drain(..boundary.at());
+                self.channel = Channel::Text;
+                true
+            }
+        }
+    }
+
+    /// Inside a tool channel: the body up to the next channel boundary
+    /// belongs to the invoke machinery.
+    fn muse_tool(&mut self, events: &mut Vec<ToolCallEvent>) -> bool {
+        let Some(boundary) = atem_boundary(&self.buffer) else {
+            let hold = atem_hold_len(&self.buffer);
+            let split = floor_char_boundary(&self.buffer, self.buffer.len() - hold);
+            if split == 0 {
+                return false;
+            }
+            return self.run_atem_machinery(split, events);
+        };
+        let at = boundary.at();
+        if self.run_atem_machinery(at, events) {
+            // The machinery stops after each call, so a second block
+            // before the same boundary must get its turn rather than
+            // being written off as debris.
+            return true;
+        }
+        // Inert: nothing before the boundary the machinery can consume.
+        // Close a mid-flight invoke here rather than letting the next
+        // channel's call merge into it, then leave the channel; the
+        // residue ahead of the boundary is markup debris and goes with
+        // it.
+        self.finalize_truncated_invoke(events);
+        match boundary {
+            AtemBoundary::Closer { token, .. } => {
+                self.buffer.drain(..at + token.len());
+                self.channel = Channel::Text;
+            }
+            AtemBoundary::Switch(switch) => {
+                self.buffer.drain(..switch.end);
+                self.enter_recipient(&switch.recipient);
+            }
+            AtemBoundary::Start { .. } => {
+                self.buffer.drain(..at);
+                self.channel = Channel::Text;
+            }
+        }
+        true
+    }
+
+    /// Feed the first `prefix_len` bytes of the buffer through the
+    /// ordinary invoke/parameter machinery, keeping the rest buffered
+    /// behind it. Returns whether it consumed anything.
+    ///
+    /// Text the machinery releases inside a tool channel is dropped:
+    /// only tool-recipient markup is executed, and the template puts
+    /// nothing else in such a channel.
+    fn run_atem_machinery(&mut self, prefix_len: usize, events: &mut Vec<ToolCallEvent>) -> bool {
+        let remainder = self.buffer.split_off(prefix_len);
+        let before = self.buffer.len();
+        let mut scratch = Vec::new();
+        loop {
+            let progressed = if self.open.is_some() {
+                self.step_open_call(&mut scratch)
+            } else {
+                self.step_idle(&mut scratch)
+            };
+            if !progressed {
+                break;
+            }
+        }
+        let consumed = self.buffer.len() != before;
+        self.buffer.push_str(&remainder);
+        events.extend(
+            scratch
+                .into_iter()
+                .filter(|event| !matches!(event, ToolCallEvent::Text(_))),
+        );
+        consumed
+    }
+
+    /// Close a call the channel (or the stream) cut off mid-arguments.
+    ///
+    /// Its `CallStart` has already gone out, so the client is holding a
+    /// half-written arguments object. Closing it here is what keeps the
+    /// fragments it received concatenating to valid JSON; dropping the
+    /// call instead would leave that client parsing an unterminated
+    /// object forever, and reusing its ordinal would merge the next
+    /// channel's call into this one.
+    fn finalize_truncated_invoke(&mut self, events: &mut Vec<ToolCallEvent>) {
+        let Some(open) = self.open.take() else {
+            return;
+        };
+        let arguments = close_ledger(&open);
+        events.push(ToolCallEvent::CallArguments {
+            index: open.index,
+            fragment: if open.started {
+                "}".into()
+            } else {
+                "{}".into()
+            },
+        });
+        events.push(ToolCallEvent::CallEnd {
+            index: open.index,
+            arguments,
+        });
+        self.emitted = open.index + 1;
+        self.truncated_channel = true;
+    }
+
+    /// End of stream for the channel format.
+    fn finish_muse(&mut self, events: &mut Vec<ToolCallEvent>) {
+        self.finalize_truncated_invoke(events);
+        let mut residual = std::mem::take(&mut self.buffer);
+        let channel = self.channel;
+        let synthetic = self.synthetic_open;
+        let truncated = self.truncated_channel;
+        self.buffer = if self.header_open {
+            ATEM_START.to_string()
+        } else {
+            String::new()
+        };
+        self.channel = Channel::Text;
+        self.synthetic_open = self.header_open;
+        self.truncated_channel = false;
+        if channel != Channel::Text || truncated {
+            // Whatever is left is the inside of a channel that never
+            // closed: markup, or a body meant for somebody who is not
+            // the client.
+            return;
+        }
+        if synthetic {
+            if let Some(rest) = residual.strip_prefix(ATEM_START) {
+                residual = rest.to_string();
+            }
+        }
+        // At end of stream a `<|start|>` that never received its
+        // `<|message|>` is not a header: deliver the text, drop only
+        // the markers.
+        residual = residual.replace(ATEM_START, "");
+        for token in ATEM_CLOSING_TOKENS {
+            residual = residual.replace(token, "");
+        }
+        if self.emitted > 0 && residual.trim().is_empty() {
+            return;
+        }
+        if !residual.is_empty() {
+            events.push(ToolCallEvent::Text(residual));
+        }
+    }
+
+    /// Enter the channel a header just named.
+    fn enter_recipient(&mut self, recipient: &str) {
+        self.channel = match recipient {
+            "self" => Channel::Skip,
+            "user" => Channel::Text,
+            _ => Channel::Tool,
+        };
+    }
+}
+
+/// One thing the M3 scanner can do next.
+#[derive(Debug)]
+enum M3Action {
+    Close { at: usize },
+    Invoke { name: String, body_at: usize },
+}
+
+/// One thing the M3 streaming loop can do next.
+#[derive(Debug)]
+enum M3Step {
+    Close {
+        at: usize,
+    },
+    Call {
+        name: String,
+        items: Vec<(String, String)>,
+        end: usize,
+    },
+}
+
+/// What ended an invoke's interior.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum M3Closer {
+    Invoke,
+    Wrapper,
+}
+
+/// One read of the element scanner.
+#[derive(Debug)]
+enum M3Element {
+    /// A complete `NS<name>…NS</name>`.
+    Element {
+        name: String,
+        inner: String,
+        next: usize,
+    },
+    /// Model noise -- a dangling closer, or a tag whose name cannot be
+    /// one. Scanning continues at `next`: aborting would drop every
+    /// well-formed sibling after it.
+    Skipped { next: usize },
+    /// The element never terminated. Everything before it still counts,
+    /// which is what makes a call cut off by `max_tokens` salvageable.
+    Truncated,
+}
+
+/// The longest suffix of `text` that is a proper prefix of `marker`.
+///
+/// Deliberately longest, not shortest: a marker whose own characters
+/// recur inside it (`]` in `]<]minimax[>[`) matches at several lengths,
+/// and holding back the shortest one emits the rest as content.
+fn longest_partial_prefix(text: &str, marker: &str) -> usize {
+    let max = marker.len().saturating_sub(1).min(text.len());
+    (1..=max)
+        .rev()
+        .find(|&k| {
+            let at = text.len() - k;
+            text.is_char_boundary(at) && marker.starts_with(&text[at..])
+        })
+        .unwrap_or(0)
+}
+
+/// Read one element at `pos`, which must be the start of an M3 tag.
+fn m3_read_element(text: &str, pos: usize) -> M3Element {
+    if text[pos..].starts_with(M3_CLOSE_TAG) {
+        return M3Element::Skipped {
+            next: pos + M3_CLOSE_TAG.len(),
+        };
+    }
+    let tag_start = pos + M3_TAG.len();
+    let Some(gt) = text[tag_start..].find('>').map(|i| i + tag_start) else {
+        return M3Element::Truncated;
+    };
+    let name = &text[tag_start..gt];
+    if name.is_empty() || name.contains(M3_TAG_BAD) {
+        return M3Element::Skipped { next: gt + 1 };
+    }
+    let open_tag = format!("{M3_NS}<{name}>");
+    let close_tag = format!("{M3_NS}</{name}>");
+    // Same-name nesting is depth-matched, so an `<items>` inside an
+    // `<items>` closes the right one.
+    let mut depth = 1usize;
+    let mut search = gt + 1;
+    let mut inner_end = gt + 1;
+    while depth > 0 {
+        let Some(close_at) = text[search..].find(&close_tag).map(|i| i + search) else {
+            return M3Element::Truncated;
+        };
+        match text[search..].find(&open_tag).map(|i| i + search) {
+            Some(open_at) if open_at < close_at => {
+                depth += 1;
+                search = open_at + open_tag.len();
+            }
+            _ => {
+                depth -= 1;
+                inner_end = close_at;
+                search = close_at + close_tag.len();
+            }
+        }
+    }
+    M3Element::Element {
+        name: name.to_string(),
+        inner: text[gt + 1..inner_end].to_string(),
+        next: search,
+    }
+}
+
+/// Scan a value for nested elements, returning them and the text
+/// between them.
+///
+/// Lenient on purpose. The strict alternative -- voiding the whole
+/// parameter over one stray character -- loses a call the model got
+/// right in every respect but one. The cost is stated: a leaf value
+/// that quotes a well-formed element pair parses as structure.
+fn m3_scan_elements(text: &str) -> (Vec<(String, String)>, String) {
+    let mut items = Vec::new();
+    let mut stray = String::new();
+    let mut pos = 0usize;
+    while pos < text.len() {
+        let Some(at) = text[pos..].find(M3_TAG).map(|i| i + pos) else {
+            stray.push_str(&text[pos..]);
+            break;
+        };
+        stray.push_str(&text[pos..at]);
+        match m3_read_element(text, at) {
+            M3Element::Element { name, inner, next } => {
+                items.push((name, inner));
+                pos = next;
+            }
+            M3Element::Skipped { next } => pos = next,
+            M3Element::Truncated => break,
+        }
+    }
+    (items, stray)
+}
+
+/// Collect an invoke's parameter elements, from just past its opener to
+/// its closer.
+///
+/// Close markers count only *between* elements, which is what stops a
+/// value quoting `]<]minimax[>[</tool_call>` from ending the block.
+fn m3_scan_invoke_interior(
+    text: &str,
+    from: usize,
+) -> (Vec<(String, String)>, usize, Option<M3Closer>) {
+    let mut items = Vec::new();
+    let mut pos = from;
+    while pos < text.len() {
+        let Some(at) = text[pos..].find(M3_TAG).map(|i| i + pos) else {
+            return (items, text.len(), None);
+        };
+        if text[at..].starts_with(M3_INVOKE_CLOSE) {
+            return (items, at, Some(M3Closer::Invoke));
+        }
+        if text[at..].starts_with(M3_CLOSE) {
+            return (items, at, Some(M3Closer::Wrapper));
+        }
+        match m3_read_element(text, at) {
+            M3Element::Element { name, inner, next } => {
+                items.push((name, inner));
+                pos = next;
+            }
+            M3Element::Skipped { next } => pos = next,
+            // Truncated: salvage the complete siblings.
+            M3Element::Truncated => return (items, text.len(), None),
+        }
+    }
+    (items, text.len(), None)
+}
+
+/// The next structural thing in a wrapper interior: its closer, or an
+/// invoke opener. A marker that is neither is model noise and is
+/// stepped over.
+fn m3_next_action(body: &str) -> Option<M3Action> {
+    let mut scan = 0usize;
+    while let Some(at) = body[scan..].find(M3_TAG).map(|i| i + scan) {
+        if body[at..].starts_with(M3_CLOSE) {
+            return Some(M3Action::Close { at });
+        }
+        if let Some((name, body_at)) = m3_invoke_open_at(body, at) {
+            return Some(M3Action::Invoke { name, body_at });
+        }
+        scan = at + M3_NS.len() + 1;
+    }
+    None
+}
+
+/// Read `]<]minimax[>[<invoke name="…">` at `at`, giving the name and
+/// where the interior begins.
+///
+/// The template renders double quotes; models emit single ones too, so
+/// both are accepted.
+fn m3_invoke_open_at(text: &str, at: usize) -> Option<(String, usize)> {
+    let rest = text.get(at..)?.strip_prefix(M3_INVOKE_OPEN)?;
+    let attrs = rest.trim_start_matches([' ', '\t', '\r', '\n']);
+    if attrs.len() == rest.len() {
+        return None; // the opener needs whitespace before its attributes
+    }
+    let value = attrs.strip_prefix("name=")?;
+    let quote = value.chars().next()?;
+    if quote != '"' && quote != '\'' {
+        return None;
+    }
+    let body = &value[quote.len_utf8()..];
+    let end = body.find(quote)?;
+    let name = &body[..end];
+    if name.is_empty() {
+        return None;
+    }
+    let tail = body[end + quote.len_utf8()..].trim_start_matches([' ', '\t', '\r', '\n']);
+    let tail = tail.strip_prefix('>')?;
+    Some((name.to_string(), text.len() - tail.len()))
+}
+
+/// Build an invoke's arguments object from its top-level elements.
+fn m3_args_from_items(items: &[(String, String)], props: Option<&Value>) -> Value {
+    let mut out = Map::new();
+    for (key, raw) in items {
+        let prop = props.and_then(|p| p.get(key));
+        let (nested, stray) = m3_scan_elements(raw);
+        let value = if nested.is_empty() {
+            m3_typed_leaf(raw, prop)
+        } else {
+            m3_structure(&nested, prop, &stray)
+        };
+        m3_insert(&mut out, key, value);
+    }
+    Value::Object(out)
+}
+
+/// Insert a key, turning a repeat into an array rather than losing the
+/// first occurrence.
+fn m3_insert(map: &mut Map<String, Value>, key: &str, value: Value) {
+    match map.remove(key) {
+        Some(Value::Array(mut items)) => {
+            items.push(value);
+            map.insert(key.to_string(), Value::Array(items));
+        }
+        Some(previous) => {
+            map.insert(key.to_string(), Value::Array(vec![previous, value]));
+        }
+        None => {
+            map.insert(key.to_string(), value);
+        }
+    }
+}
+
+/// A value that has children: an object, or an array when the template
+/// used its array convention.
+///
+/// Only `<item>` children render as a bare array -- that is the
+/// convention the template writes. Repeated siblings under any other
+/// tag stay an object with an array-valued key, because collapsing them
+/// would drop the parent key the tool is expecting.
+fn m3_structure(items: &[(String, String)], schema: Option<&Value>, stray: &str) -> Value {
+    let props = schema.and_then(|s| s.get("properties"));
+    let item_schema = schema.and_then(|s| s.get("items"));
+    let sub_schema = |key: &str| -> Option<&Value> {
+        props.and_then(|p| p.get(key)).or_else(|| {
+            schema
+                .and_then(|s| s.get("additionalProperties"))
+                .filter(|value| value.is_object())
+        })
+    };
+    if !items.is_empty() && items.iter().all(|(name, _)| name == "item") {
+        return Value::Array(
+            items
+                .iter()
+                .map(|(_, raw)| m3_nested_value(raw, item_schema))
+                .collect(),
+        );
+    }
+    let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
+    for (name, _) in items {
+        *counts.entry(name.as_str()).or_default() += 1;
+    }
+    let mut out = Map::new();
+    for (key, raw) in items {
+        let mut sub = sub_schema(key);
+        // A repeated key's elements are the array's members, so its
+        // array schema unwraps to the item schema. A singleton key
+        // keeps the array schema -- its `<item>` children unwrap
+        // inside it.
+        if counts[key.as_str()] > 1 && declared_type(sub) == Some("array".to_string()) {
+            sub = sub.and_then(|s| s.get("items"));
+        }
+        m3_insert(&mut out, key, m3_nested_value(raw, sub));
+    }
+    if !stray.trim().is_empty() {
+        out.insert("$text".to_string(), Value::String(stray.trim().to_string()));
+    }
+    Value::Object(out)
+}
+
+/// One element's value: a subtree if it has children, a typed leaf
+/// otherwise.
+fn m3_nested_value(raw: &str, schema: Option<&Value>) -> Value {
+    let (items, stray) = m3_scan_elements(raw);
+    if items.is_empty() {
+        m3_typed_leaf(raw, schema)
+    } else {
+        m3_structure(&items, schema, &stray)
+    }
+}
+
+/// The normalized JSON Schema `type` of a subschema, if it states one.
+fn declared_type(schema: Option<&Value>) -> Option<String> {
+    let schema = schema?;
+    if !schema.is_object() {
+        return None;
+    }
+    Some(
+        schema
+            .get("type")?
+            .as_str()?
+            .trim()
+            .to_ascii_lowercase()
+            .to_string(),
+    )
+}
+
+/// Type one leaf value from the schema at its own nesting level.
+///
+/// A string leaf round-trips **verbatim**: the template renders leaf
+/// values exactly as written, and trimming here eats the trailing
+/// newline of every multi-line file argument. Declared non-string types
+/// tolerate the whitespace around them; an undeclared leaf falls back
+/// to a loose parse but keeps its verbatim text whenever that parse
+/// yields a string anyway.
+fn m3_typed_leaf(raw: &str, prop: Option<&Value>) -> Value {
+    let Some(prop) = prop else {
+        if raw.trim().is_empty() {
+            // An empty element is the empty STRING; a loose parse would
+            // make it an empty object.
+            return Value::String(String::new());
+        }
+        return match parse_loose(raw.trim()) {
+            Value::String(_) => Value::String(raw.to_string()),
+            value => value,
+        };
+    };
+    if prop.is_object() && prop.get("type").is_none() {
+        if let Some(Value::Array(subs)) = prop.get("anyOf").or_else(|| prop.get("oneOf")) {
+            if !subs.is_empty() {
+                return m3_union_leaf(raw, subs);
+            }
+        }
+    }
+    let declared = declared_type(Some(prop)).unwrap_or_else(|| "string".to_string());
+    match declared.as_str() {
+        "string" | "str" | "enum" => Value::String(raw.to_string()),
+        // An integer literal stays an integer and `5.0` stays 5.0.
+        "number" | "float" | "double" => {
+            let text = raw.trim();
+            if let Ok(value) = text.parse::<i64>() {
+                Value::from(value)
+            } else if let Ok(value) = text.parse::<f64>() {
+                Value::from(value)
+            } else {
+                Value::String(raw.to_string())
+            }
+        }
+        // An empty container-typed element is that empty container.
+        "object" if raw.trim().is_empty() => Value::Object(Map::new()),
+        "array" if raw.trim().is_empty() => Value::Array(Vec::new()),
+        other => convert_declared(raw.trim(), Some(other)),
+    }
+}
+
+/// An `anyOf` / `oneOf` leaf: try each member's strict coercion in the
+/// order the schema declared them, and keep the verbatim text when only
+/// the string member (or nothing) fits.
+fn m3_union_leaf(raw: &str, subs: &[Value]) -> Value {
+    let text = raw.trim();
+    for sub in subs {
+        match declared_type(Some(sub)).unwrap_or_default().as_str() {
+            "integer" | "int" => {
+                if let Ok(value) = text.parse::<i64>() {
+                    return Value::from(value);
+                }
+            }
+            "number" | "float" | "double" => {
+                if let Ok(value) = text.parse::<i64>() {
+                    return Value::from(value);
+                }
+                if let Ok(value) = text.parse::<f64>() {
+                    return Value::from(value);
+                }
+            }
+            "boolean" | "bool" => {
+                if text.eq_ignore_ascii_case("true") || text.eq_ignore_ascii_case("false") {
+                    return Value::Bool(text.eq_ignore_ascii_case("true"));
+                }
+            }
+            "null" => {
+                if text.eq_ignore_ascii_case("null") {
+                    return Value::Null;
+                }
+            }
+            "object" => {
+                if let Ok(value @ Value::Object(_)) = serde_json::from_str::<Value>(text) {
+                    return value;
+                }
+            }
+            "array" => {
+                if let Ok(value @ Value::Array(_)) = serde_json::from_str::<Value>(text) {
+                    return value;
+                }
+            }
+            _ => {}
+        }
+    }
+    Value::String(raw.to_string())
+}
+
+/// The ATEM closing tags a broken-off invoke leaves behind.
+const ATEM_CLOSING_MARKUP: [&str; 3] = [
+    "</atem:parameter>",
+    "</atem:invoke>",
+    "</atem:function_calls>",
+];
+
+/// How much of `text` is the leading run of ATEM closing markup, and
+/// whether the scan *decided*.
+///
+/// `false` means the buffer ends inside the run or on a partial tag, so
+/// more input is needed. The cost of dropping by shape is stated: a
+/// reply that literally begins with a complete closing tag loses that
+/// tag. Partial-tag-shaped prose is held and released intact, so no
+/// ordinary word is ever eaten -- only a verbatim full tag immediately
+/// after a truncated invoke, which is indistinguishable from the
+/// residue this exists to drop.
+fn atem_residue_end(text: &str) -> (usize, bool) {
+    let mut at = 0usize;
+    while at < text.len() {
+        let rest = &text[at..];
+        let ch = rest.chars().next().expect("the slice is non-empty");
+        if matches!(ch, ' ' | '\t' | '\r' | '\n') {
+            at += ch.len_utf8();
+            continue;
+        }
+        if let Some(tag) = ATEM_CLOSING_MARKUP
+            .iter()
+            .find(|tag| rest.starts_with(**tag))
+        {
+            at += tag.len();
+            continue;
+        }
+        if ATEM_CLOSING_MARKUP.iter().any(|tag| tag.starts_with(rest)) {
+            return (at, false);
+        }
+        return (at, true);
+    }
+    (at, false)
 }
 
 fn close_ledger(open: &OpenCall) -> String {
@@ -1106,6 +2219,29 @@ fn close_ledger(open: &OpenCall) -> String {
         format!("{}}}", open.ledger)
     } else {
         "{}".to_string()
+    }
+}
+
+/// Type one value against the JSON Schema type its parameter declared.
+///
+/// `None` -- undeclared -- is a best-effort parse that keeps the text
+/// whenever it is not obviously something else.
+fn convert_declared(text: &str, declared: Option<&str>) -> Value {
+    match declared {
+        Some("string") | Some("str") | Some("enum") => Value::String(text.to_string()),
+        Some("integer") | Some("int") => text
+            .parse::<i64>()
+            .map(Value::from)
+            .unwrap_or_else(|_| Value::String(text.to_string())),
+        Some("number") | Some("float") | Some("double") => text
+            .parse::<f64>()
+            .map(Value::from)
+            .unwrap_or_else(|_| Value::String(text.to_string())),
+        Some("boolean") | Some("bool") => Value::Bool(text.eq_ignore_ascii_case("true")),
+        Some("object") | Some("array") => {
+            serde_json::from_str(text).unwrap_or_else(|_| Value::String(text.to_string()))
+        }
+        _ => parse_loose(text),
     }
 }
 

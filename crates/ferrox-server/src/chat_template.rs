@@ -73,7 +73,6 @@ struct Inner {
     bos_token: Option<String>,
     eos_token: Option<String>,
     thinking: ferrox_edge::ThinkingProfile,
-    gears: ThinkGears,
     handles_tools: bool,
 }
 
@@ -145,7 +144,6 @@ impl PromptTemplate {
         Self {
             inner: Arc::new(Inner {
                 end_of_turn: end_of_turn_marker(source),
-                gears: derive_think_gears(&thinking),
                 template,
                 bos_token,
                 eos_token,
@@ -180,8 +178,15 @@ impl PromptTemplate {
 
     /// The thinking controls to advertise on `/v1/models`, so a client
     /// picks a gear instead of guessing one.
-    pub(crate) fn think_gears(&self) -> &ThinkGears {
-        &self.inner.gears
+    ///
+    /// `parser_configured` covers the one case the template cannot
+    /// speak for: an always-thinking family whose template has no
+    /// observable knob, but whose output really is being split into
+    /// `reasoning_content`. Such a checkpoint advertises a single `on`
+    /// gear with no kwargs -- there is nothing to send, and the point is
+    /// only to stop a reasoning model looking like one with no gears.
+    pub(crate) fn think_gears(&self, parser_configured: bool) -> ThinkGears {
+        derive_think_gears(&self.inner.thinking, parser_configured)
     }
 
     /// Render a conversation into a prompt.

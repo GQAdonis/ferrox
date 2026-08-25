@@ -34,13 +34,17 @@ pub struct HybridHparams {
     pub rope_theta: f32,
     /// Depthwise conv kernel (`{arch}.ssm.conv_kernel`).
     pub ssm_conv_kernel: usize,
-    /// Unused by equal-head [`GdnConfig`] today; retained for inventory.
+    /// Total V width (`{arch}.ssm.inner_size`) = `num_value_heads ·
+    /// value_head_dim`. This is the **only** place GGUF records the V head
+    /// dim, so [`gdn_config_from_hparams`] divides it by the V head count;
+    /// see the failure mode documented there.
     pub ssm_inner_size: usize,
-    /// GDN head dim (`{arch}.ssm.state_size`).
+    /// GDN **key** head dim (`{arch}.ssm.state_size`) — not the V head dim.
     pub ssm_state_size: usize,
     /// Number of V heads (`{arch}.ssm.time_step_rank`).
     pub ssm_time_step_rank: usize,
-    /// Number of K heads (`{arch}.ssm.group_count`).
+    /// Number of K heads (`{arch}.ssm.group_count`); `≤ time_step_rank`
+    /// for the real GQA-shaped Qwen3.5 / Qwen3-Next geometry.
     pub ssm_group_count: usize,
     /// Default full-attn interval when `attention.recurrent_layers` absent.
     pub full_attention_interval: usize,
@@ -260,21 +264,72 @@ fn load_weight_matrix(file: &impl TensorSource, name: &str) -> Result<WeightMatr
     }
 }
 
+/// Map `{arch}.ssm.*` metadata onto the GQA-shaped [`GdnConfig`].
+///
+/// The four GDN geometry numbers come from four distinct keys:
+///
+/// | `GdnConfig` field | GGUF key |
+/// |---|---|
+/// | `num_key_heads` | `ssm.group_count` |
+/// | `num_value_heads` | `ssm.time_step_rank` |
+/// | `key_head_dim` | `ssm.state_size` |
+/// | `value_head_dim` | `ssm.inner_size / ssm.time_step_rank` |
+///
+/// `ssm.inner_size` is the **whole** V width (`num_value_heads ·
+/// value_head_dim`), which is why the V head dim is a division and not a
+/// key of its own. Two ways that can go wrong, both refused here rather
+/// than silently mis-slicing the fused QKV projection:
+///
+/// * `time_step_rank` not dividing `inner_size` — the file is either
+///   truncated or uses a different `inner_size` convention (e.g. writing
+///   the full `conv_dim`), so the V head dim is unknowable.
+/// * `time_step_rank` not a positive multiple of `group_count` — no whole
+///   `repeat_interleave` factor exists, so some V heads would have no K
+///   head. [`crate::gdn::gdn_forward_token`] asserts the same invariant;
+///   catching it at load time turns a decode-time panic into a load error.
+///
+/// A wrong-but-divisible `inner_size` is still caught downstream in
+/// [`load_gdn_layer_weights`], which cross-checks the derived
+/// `value_head_dim` against the real `ssm_norm.weight` length.
 fn gdn_config_from_hparams(hp: &HybridHparams) -> Result<GdnConfig, LoadError> {
-    if hp.ssm_group_count != hp.ssm_time_step_rank {
+    let num_value_heads = hp.ssm_time_step_rank;
+    let num_key_heads = hp.ssm_group_count;
+    if num_key_heads == 0 || num_value_heads == 0 {
         return Err(LoadError::UnsupportedFeature(
             hp.arch.clone(),
             format!(
-                "GDN with unequal K/V heads (ssm.group_count={} vs ssm.time_step_rank={}); \
-                 gdn_forward_token currently requires equal heads",
-                hp.ssm_group_count, hp.ssm_time_step_rank
+                "GDN head counts must be non-zero (ssm.group_count={num_key_heads}, \
+                 ssm.time_step_rank={num_value_heads})"
+            ),
+        ));
+    }
+    if !num_value_heads.is_multiple_of(num_key_heads) {
+        return Err(LoadError::UnsupportedFeature(
+            hp.arch.clone(),
+            format!(
+                "GDN V heads ({num_value_heads}, ssm.time_step_rank) must be a whole multiple \
+                 of K heads ({num_key_heads}, ssm.group_count) — repeat_interleave has no \
+                 integer replication factor otherwise"
+            ),
+        ));
+    }
+    if hp.ssm_inner_size == 0 || !hp.ssm_inner_size.is_multiple_of(num_value_heads) {
+        return Err(LoadError::UnsupportedFeature(
+            hp.arch.clone(),
+            format!(
+                "cannot derive GDN value_head_dim: ssm.inner_size={} is not a positive multiple \
+                 of ssm.time_step_rank={num_value_heads} (inner_size must be the total V width, \
+                 num_value_heads × value_head_dim)",
+                hp.ssm_inner_size
             ),
         ));
     }
     Ok(GdnConfig {
         hidden_dim: hp.hidden_dim,
-        num_v_heads: hp.ssm_time_step_rank,
-        head_dim: hp.ssm_state_size,
+        num_key_heads,
+        num_value_heads,
+        key_head_dim: hp.ssm_state_size,
+        value_head_dim: hp.ssm_inner_size / num_value_heads,
         conv_kernel_size: hp.ssm_conv_kernel,
         rms_norm_eps: hp.rms_norm_eps,
     })
@@ -309,7 +364,57 @@ pub fn load_gdn_layer_weights(
     let ssm_norm = load_f32_vec(file, &format!("blk.{l}.ssm_norm.weight"))?;
     let ssm_out = load_weight_matrix(file, &format!("blk.{l}.ssm_out.weight"))?;
 
+    // Head geometry before the conv taps: `qkv_dim` is itself derived from
+    // the head counts and head dims, so a wrong `value_head_dim` would
+    // otherwise surface as a confusing conv-length mismatch.
     let qkv_dim = cfg.qkv_dim();
+    if ssm_dt.len() != cfg.num_value_heads || ssm_a.len() != cfg.num_value_heads {
+        return Err(LoadError::UnsupportedFeature(
+            hp.arch.clone(),
+            format!(
+                "blk.{l} ssm_dt/ssm_a length mismatch: dt={}, a={}, num_value_heads={}",
+                ssm_dt.len(),
+                ssm_a.len(),
+                cfg.num_value_heads
+            ),
+        ));
+    }
+    // `ssm_norm` is per V head, so its length is the authoritative
+    // `value_head_dim` — this is what catches an `ssm.inner_size` that
+    // divides evenly but means something other than the total V width.
+    if ssm_norm.len() != cfg.value_head_dim {
+        return Err(LoadError::UnsupportedFeature(
+            hp.arch.clone(),
+            format!(
+                "blk.{l}.ssm_norm.weight has {} elements, expected value_head_dim={} \
+                 (derived as ssm.inner_size={} / ssm.time_step_rank={})",
+                ssm_norm.len(),
+                cfg.value_head_dim,
+                hp.ssm_inner_size,
+                hp.ssm_time_step_rank
+            ),
+        ));
+    }
+    // Fused QKV rows are 2*key_dim + value_dim; the z gate is value_dim
+    // wide. A mismatch here means the split offsets would land inside the
+    // wrong tensor — finite, correctly shaped, and wrong — so refuse.
+    if attn_qkv.rows() != qkv_dim || attn_gate.rows() != cfg.value_dim() {
+        return Err(LoadError::UnsupportedFeature(
+            hp.arch.clone(),
+            format!(
+                "blk.{l} projection geometry mismatch: attn_qkv has {} rows (expected \
+                 2*key_dim + value_dim = {qkv_dim}), attn_gate has {} rows (expected \
+                 value_dim={}); K heads={}, V heads={}, key_head_dim={}, value_head_dim={}",
+                attn_qkv.rows(),
+                attn_gate.rows(),
+                cfg.value_dim(),
+                cfg.num_key_heads,
+                cfg.num_value_heads,
+                cfg.key_head_dim,
+                cfg.value_head_dim
+            ),
+        ));
+    }
     let expected_conv = qkv_dim * cfg.conv_kernel_size;
     if ssm_conv1d.len() != expected_conv {
         return Err(LoadError::UnsupportedFeature(
@@ -319,27 +424,6 @@ pub fn load_gdn_layer_weights(
                  (qkv_dim={qkv_dim} × kernel={})",
                 ssm_conv1d.len(),
                 cfg.conv_kernel_size
-            ),
-        ));
-    }
-    if ssm_dt.len() != cfg.num_v_heads || ssm_a.len() != cfg.num_v_heads {
-        return Err(LoadError::UnsupportedFeature(
-            hp.arch.clone(),
-            format!(
-                "blk.{l} ssm_dt/ssm_a length mismatch: dt={}, a={}, num_v_heads={}",
-                ssm_dt.len(),
-                ssm_a.len(),
-                cfg.num_v_heads
-            ),
-        ));
-    }
-    if ssm_norm.len() != cfg.head_dim {
-        return Err(LoadError::UnsupportedFeature(
-            hp.arch.clone(),
-            format!(
-                "blk.{l}.ssm_norm.weight has {} elements, expected head_dim={}",
-                ssm_norm.len(),
-                cfg.head_dim
             ),
         ));
     }
@@ -379,12 +463,6 @@ fn serve_gap_message(hp: &HybridHparams, kinds: &[HybridLayerKind]) -> String {
     if hp.n_expert > 0 {
         missing.push(format!("MoE expert routing (expert_count={})", hp.n_expert));
     }
-    if hp.ssm_group_count != hp.ssm_time_step_rank {
-        missing.push(format!(
-            "unequal GDN K/V heads (group_count={} vs time_step_rank={})",
-            hp.ssm_group_count, hp.ssm_time_step_rank
-        ));
-    }
     if hp.arch == "qwen3next" {
         missing.push("qwen3next legacy fused tensors (ssm_ba / ssm_in) if present".into());
     }
@@ -403,11 +481,12 @@ fn serve_gap_message(hp: &HybridHparams, kinds: &[HybridLayerKind]) -> String {
 pub fn try_load(file: &impl TensorSource) -> Result<HybridEngine, LoadError> {
     let hp = read_hybrid_hparams(file)?;
     let kinds = classify_layers(file, &hp)?;
-    // Prove at least one GDN layer's tensors parse when present.
+    // Prove at least one GDN layer's tensors parse when present. No
+    // equal-head precondition any more: the GQA-shaped geometry
+    // (group_count < time_step_rank, key_head_dim != value_head_dim) is
+    // exactly what the real Qwen3.5 / Qwen3-Next checkpoints carry.
     if let Some(i) = kinds.iter().position(|k| *k == HybridLayerKind::Gdn) {
-        if hp.ssm_group_count == hp.ssm_time_step_rank {
-            let _ = load_gdn_layer_weights(file, i, &hp)?;
-        }
+        let _ = load_gdn_layer_weights(file, i, &hp)?;
     }
     Err(LoadError::UnsupportedFeature(
         hp.arch.clone(),
@@ -511,82 +590,143 @@ mod tests {
         buf
     }
 
-    fn tiny_gdn_fixture() -> (std::path::PathBuf, GgufFile, HybridHparams) {
-        const H: usize = 4;
-        const N_HEADS: usize = 2;
-        const HEAD: usize = 2;
-        const CONV: usize = 2;
-        const QKV: usize = 3 * N_HEADS * HEAD; // 12
-        const V: usize = N_HEADS * HEAD; // 4
+    /// One synthetic GDN block's geometry. Tensors are always built for
+    /// the *true* geometry; `inner_size_override` lets a test write an
+    /// `ssm.inner_size` that disagrees with them, which is how a
+    /// checkpoint using a different `inner_size` convention would look.
+    struct GdnFixtureSpec {
+        hidden: usize,
+        num_key_heads: usize,
+        num_value_heads: usize,
+        key_head_dim: usize,
+        value_head_dim: usize,
+        conv: usize,
+        inner_size_override: Option<usize>,
+    }
+
+    impl GdnFixtureSpec {
+        /// The equal-head geometry the loader supported before the GQA
+        /// generalization: 2 K heads, 2 V heads, both head dims 2.
+        fn equal_heads() -> Self {
+            Self {
+                hidden: 4,
+                num_key_heads: 2,
+                num_value_heads: 2,
+                key_head_dim: 2,
+                value_head_dim: 2,
+                conv: 2,
+                inner_size_override: None,
+            }
+        }
+
+        /// The real GDN shape: fewer K heads than V heads, and K/V head
+        /// dims that differ.
+        fn gqa_heads() -> Self {
+            Self {
+                hidden: 4,
+                num_key_heads: 1,
+                num_value_heads: 2,
+                key_head_dim: 2,
+                value_head_dim: 3,
+                conv: 2,
+                inner_size_override: None,
+            }
+        }
+
+        fn key_dim(&self) -> usize {
+            self.num_key_heads * self.key_head_dim
+        }
+
+        fn value_dim(&self) -> usize {
+            self.num_value_heads * self.value_head_dim
+        }
+
+        fn qkv_dim(&self) -> usize {
+            2 * self.key_dim() + self.value_dim()
+        }
+    }
+
+    fn gdn_fixture(spec: &GdnFixtureSpec) -> (std::path::PathBuf, GgufFile, HybridHparams) {
+        let h = spec.hidden;
+        let conv = spec.conv;
+        let qkv = spec.qkv_dim();
+        let v = spec.value_dim();
+        let nv = spec.num_value_heads;
         let arch = "qwen35";
 
         let mut tensors = Vec::new();
         // Fixture shape = WeightMatrix [rows, cols]; build_gguf+loader reverse to GGML ne order.
         tensors.push(f32_tensor(
             "blk.0.attn_qkv.weight",
-            vec![QKV as u64, H as u64],
-            vec![0.05; QKV * H],
+            vec![qkv as u64, h as u64],
+            vec![0.05; qkv * h],
         ));
         tensors.push(f32_tensor(
             "blk.0.attn_gate.weight",
-            vec![V as u64, H as u64],
-            vec![0.04; V * H],
+            vec![v as u64, h as u64],
+            vec![0.04; v * h],
         ));
         // Flat layout [qkv_dim, kernel] as gdn::causal_conv_step expects.
         tensors.push(f32_tensor(
             "blk.0.ssm_conv1d.weight",
-            vec![CONV as u64, QKV as u64],
+            vec![conv as u64, qkv as u64],
             {
-                let mut c = vec![0.1; QKV * CONV];
-                for d in 0..QKV {
-                    c[d * CONV + (CONV - 1)] = 1.0;
+                let mut c = vec![0.1; qkv * conv];
+                for d in 0..qkv {
+                    c[d * conv + (conv - 1)] = 1.0;
                 }
                 c
             },
         ));
         tensors.push(f32_tensor(
             "blk.0.ssm_dt.bias",
-            vec![N_HEADS as u64],
-            vec![0.1, -0.05],
+            vec![nv as u64],
+            (0..nv)
+                .map(|i| if i % 2 == 0 { 0.1 } else { -0.05 })
+                .collect(),
         ));
         tensors.push(f32_tensor(
             "blk.0.ssm_a",
-            vec![N_HEADS as u64],
-            vec![-0.5, -0.75],
+            vec![nv as u64],
+            (0..nv)
+                .map(|i| if i % 2 == 0 { -0.5 } else { -0.75 })
+                .collect(),
         ));
         tensors.push(f32_tensor(
             "blk.0.ssm_beta.weight",
-            vec![N_HEADS as u64, H as u64],
-            vec![0.1; N_HEADS * H],
+            vec![nv as u64, h as u64],
+            vec![0.1; nv * h],
         ));
         tensors.push(f32_tensor(
             "blk.0.ssm_alpha.weight",
-            vec![N_HEADS as u64, H as u64],
-            vec![0.08; N_HEADS * H],
+            vec![nv as u64, h as u64],
+            vec![0.08; nv * h],
         ));
         tensors.push(f32_tensor(
             "blk.0.ssm_norm.weight",
-            vec![HEAD as u64],
-            vec![1.0; HEAD],
+            vec![spec.value_head_dim as u64],
+            vec![1.0; spec.value_head_dim],
         ));
         tensors.push(f32_tensor(
             "blk.0.ssm_out.weight",
-            vec![H as u64, V as u64],
-            vec![0.06; H * V],
+            vec![h as u64, v as u64],
+            vec![0.06; h * v],
         ));
 
+        // ssm.inner_size is the total V width; ssm.state_size is the K head dim.
+        let inner_size = spec.inner_size_override.unwrap_or(v);
         let kv = [
             ("qwen35.block_count", 1u64),
-            ("qwen35.embedding_length", H as u64),
+            ("qwen35.embedding_length", h as u64),
             ("qwen35.feed_forward_length", 8u64),
             ("qwen35.attention.head_count", 2u64),
             ("qwen35.attention.head_count_kv", 2u64),
-            ("qwen35.attention.key_length", HEAD as u64),
-            ("qwen35.ssm.conv_kernel", CONV as u64),
-            ("qwen35.ssm.inner_size", QKV as u64),
-            ("qwen35.ssm.state_size", HEAD as u64),
-            ("qwen35.ssm.time_step_rank", N_HEADS as u64),
-            ("qwen35.ssm.group_count", N_HEADS as u64),
+            ("qwen35.attention.key_length", spec.key_head_dim as u64),
+            ("qwen35.ssm.conv_kernel", conv as u64),
+            ("qwen35.ssm.inner_size", inner_size as u64),
+            ("qwen35.ssm.state_size", spec.key_head_dim as u64),
+            ("qwen35.ssm.time_step_rank", nv as u64),
+            ("qwen35.ssm.group_count", spec.num_key_heads as u64),
         ];
         let fkv = [
             ("qwen35.attention.layer_norm_rms_epsilon", 1e-5f32),
@@ -605,6 +745,19 @@ mod tests {
         let file = GgufFile::open(&path).expect("synthetic hybrid GGUF must parse");
         let hp = read_hybrid_hparams(&file).expect("hparams");
         (path, file, hp)
+    }
+
+    fn tiny_gdn_fixture() -> (std::path::PathBuf, GgufFile, HybridHparams) {
+        gdn_fixture(&GdnFixtureSpec::equal_heads())
+    }
+
+    /// `GdnWeights` is not `Debug` (it owns mapped quant bytes), so
+    /// `unwrap_err` is unavailable on a load result.
+    fn expect_load_error(result: Result<(GdnConfig, GdnWeights), LoadError>) -> LoadError {
+        match result {
+            Ok((cfg, _)) => panic!("expected a load error, got config {cfg:?}"),
+            Err(e) => e,
+        }
     }
 
     #[test]
@@ -662,6 +815,141 @@ mod tests {
                     msg.contains("serve blocked") || msg.contains("missing"),
                     "{msg}"
                 );
+                assert!(msg.contains("load_gdn_layer_weights"), "{msg}");
+            }
+            other => panic!("expected UnsupportedFeature, got {other:?}"),
+        }
+    }
+
+    /// The geometry the loader used to refuse outright: `ssm.group_count`
+    /// (K heads) below `ssm.time_step_rank` (V heads), with a
+    /// `value_head_dim` that differs from `ssm.state_size`. The config it
+    /// derives must carry the reference's four independent numbers and the
+    /// `[key_dim, key_dim, value_dim]` split — under the old equal-head
+    /// formula this file's `attn_qkv` (10 rows) would have been read as
+    /// `3 * 2 * 2 = 12` rows split into equal thirds.
+    #[test]
+    fn unequal_gdn_head_geometry_loads_instead_of_being_refused() {
+        let spec = GdnFixtureSpec::gqa_heads();
+        let (path, file, hp) = gdn_fixture(&spec);
+        let loaded = load_gdn_layer_weights(&file, 0, &hp);
+        std::fs::remove_file(&path).ok();
+        let (cfg, weights) = loaded.expect("GQA-shaped GDN layer must load");
+
+        assert_eq!(cfg.num_key_heads, 1);
+        assert_eq!(cfg.num_value_heads, 2);
+        assert_eq!(cfg.key_head_dim, 2, "from ssm.state_size");
+        assert_eq!(
+            cfg.value_head_dim, 3,
+            "from ssm.inner_size / ssm.time_step_rank"
+        );
+        assert_eq!(cfg.key_dim(), 2);
+        assert_eq!(cfg.value_dim(), 6);
+        assert_eq!(cfg.qkv_dim(), 10, "2*key_dim + value_dim, not 3*n*head_dim");
+        assert_eq!(cfg.heads_per_key_group(), 2);
+
+        let mut state = GdnState::new(&cfg);
+        let hidden = [0.2f32, -0.1, 0.3, -0.4];
+        let out = gdn_forward_token(&weights, &cfg, &hidden, &mut state);
+        assert_eq!(out.len(), hp.hidden_dim);
+        assert!(out.iter().all(|x| x.is_finite()));
+    }
+
+    /// Regression: equal K/V heads and equal head dims must still derive
+    /// exactly the config they did before the generalization, so no
+    /// already-loadable checkpoint changes shape.
+    #[test]
+    fn equal_head_metadata_still_derives_the_pre_generalization_config() {
+        let (path, file, hp) = tiny_gdn_fixture();
+        let loaded = load_gdn_layer_weights(&file, 0, &hp);
+        std::fs::remove_file(&path).ok();
+        let (cfg, _) = loaded.expect("equal-head GDN layer must load");
+
+        assert_eq!(cfg.num_key_heads, cfg.num_value_heads);
+        assert_eq!(cfg.key_head_dim, cfg.value_head_dim);
+        assert_eq!(cfg.num_value_heads, 2);
+        assert_eq!(cfg.value_head_dim, 2);
+        assert_eq!(cfg.qkv_dim(), 3 * 2 * 2, "equal heads: still three thirds");
+        assert_eq!(cfg.heads_per_key_group(), 1);
+    }
+
+    /// `ssm.inner_size` is the only record of the V head dim, so a file
+    /// whose `inner_size` is not a whole multiple of `time_step_rank`
+    /// leaves it unknowable — refuse rather than round.
+    #[test]
+    fn inner_size_not_divisible_by_v_head_count_is_refused() {
+        let mut spec = GdnFixtureSpec::gqa_heads();
+        spec.inner_size_override = Some(7); // 7 % 2 != 0
+        let (path, file, hp) = gdn_fixture(&spec);
+        let err = expect_load_error(load_gdn_layer_weights(&file, 0, &hp));
+        std::fs::remove_file(&path).ok();
+        match err {
+            LoadError::UnsupportedFeature(arch, msg) => {
+                assert_eq!(arch, "qwen35");
+                assert!(msg.contains("value_head_dim"), "{msg}");
+                assert!(msg.contains("inner_size"), "{msg}");
+            }
+            other => panic!("expected UnsupportedFeature, got {other:?}"),
+        }
+    }
+
+    /// A divisible-but-wrong `inner_size` (here: the whole fused QKV
+    /// width, a plausible alternative convention) derives the wrong V head
+    /// dim. `ssm_norm.weight` is per V head and settles it, so the load
+    /// fails loudly instead of mis-splitting the projection.
+    #[test]
+    fn inner_size_disagreeing_with_ssm_norm_length_is_refused() {
+        let mut spec = GdnFixtureSpec::gqa_heads();
+        spec.inner_size_override = Some(spec.qkv_dim()); // 10 / 2 = 5 != 3
+        let (path, file, hp) = gdn_fixture(&spec);
+        let err = expect_load_error(load_gdn_layer_weights(&file, 0, &hp));
+        std::fs::remove_file(&path).ok();
+        match err {
+            LoadError::UnsupportedFeature(_, msg) => {
+                assert!(msg.contains("ssm_norm.weight"), "{msg}");
+                assert!(msg.contains("value_head_dim"), "{msg}");
+            }
+            other => panic!("expected UnsupportedFeature, got {other:?}"),
+        }
+    }
+
+    /// V heads must be a whole multiple of K heads — otherwise
+    /// `repeat_interleave` has no integer factor and some V heads would
+    /// pair with a K head that never fed them. Caught at load time so the
+    /// forward pass never has to panic on it.
+    #[test]
+    fn v_heads_not_a_multiple_of_k_heads_is_refused_at_load() {
+        let spec = GdnFixtureSpec {
+            hidden: 4,
+            num_key_heads: 3,
+            num_value_heads: 4,
+            key_head_dim: 2,
+            value_head_dim: 2,
+            conv: 2,
+            inner_size_override: None,
+        };
+        let (path, file, hp) = gdn_fixture(&spec);
+        let err = expect_load_error(load_gdn_layer_weights(&file, 0, &hp));
+        std::fs::remove_file(&path).ok();
+        match err {
+            LoadError::UnsupportedFeature(_, msg) => {
+                assert!(msg.contains("repeat_interleave"), "{msg}");
+                assert!(msg.contains("whole multiple"), "{msg}");
+            }
+            other => panic!("expected UnsupportedFeature, got {other:?}"),
+        }
+    }
+
+    /// `try_load` still fails closed on serve, but unequal K/V heads is no
+    /// longer one of the reasons it lists — the layer loads now.
+    #[test]
+    fn try_load_no_longer_reports_unequal_gdn_heads_as_a_gap() {
+        let (path, file, _) = gdn_fixture(&GdnFixtureSpec::gqa_heads());
+        let err = try_load(&file).unwrap_err();
+        std::fs::remove_file(&path).ok();
+        match err {
+            LoadError::UnsupportedFeature(_, msg) => {
+                assert!(!msg.contains("unequal GDN K/V heads"), "{msg}");
                 assert!(msg.contains("load_gdn_layer_weights"), "{msg}");
             }
             other => panic!("expected UnsupportedFeature, got {other:?}"),

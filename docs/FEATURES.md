@@ -129,6 +129,11 @@ returns a decision.
 | `scheduler` | admission, chunked-prefill sizing, and what a chunk reserves |
 | `parser` | where reasoning ends and the answer begins; which tool was called, in which format |
 | `effort` | which reasoning-effort dialect a checkpoint speaks, probed from its own template |
+| `stats` | what a server may honestly claim about its own throughput and latency |
+| `maintenance` | whether a request, a cache rebuild or a stop may proceed right now |
+| `residency` | which class a layer's expert bank settles into, and what that then forbids |
+| `state_pool` | which recurrent-state slot a request holds, and where a prefill freezes one |
+| `bench_profile` | where this machine's measured bandwidth profile lives, and when it may be trusted |
 
 Wired in today: the two parsers (chat completions, streaming and
 buffered), the stop-string withhold rule, which `ferrox-server`'s

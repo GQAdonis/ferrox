@@ -21,6 +21,7 @@
 //! | [`radix`] | which prefix of a new prompt is already computed, and what may be evicted |
 //! | [`anchor`] | which position an agentic turn will come back to, and what to keep for it |
 //! | [`window_pool`] | which window-pool slot holds a given position's sliding-window KV |
+//! | [`cache_manager`] | who owns which KV page, and what a request hands back when it commits |
 //! | [`pool`] | how VRAM is split between the expert cache and the KV pools, and how it is re-split live |
 //! | [`scheduler`] | which requests run this step, how much prefill they get, and who is retracted |
 //! | [`parser`] | where a model's reasoning ends and its answer begins, and which tool it called |
@@ -35,6 +36,7 @@
 //! instead of shadowing it. Each module's docs say which.
 
 pub mod anchor;
+pub mod cache_manager;
 pub mod cache_report;
 pub mod detokenize;
 pub mod effort;
@@ -51,6 +53,7 @@ pub use anchor::{
     decode_slide, prefill_slide, resolve_anchor_token, snapshot_at_anchor, AnchorSnapshot,
     AnchorState, PingPong, RecurrentState, SlideDecision, SlidingRequest, WindowPolicy,
 };
+pub use cache_manager::{CacheManager, CommitOutcome, OutOfMemory, SequenceState};
 pub use cache_report::{CacheGeometry, CachePools};
 pub use detokenize::{
     find_printable_text, floor_char_boundary, stop_prefix_holdback, DetokenizeManager,

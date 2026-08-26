@@ -144,6 +144,158 @@ pub fn ring_size_for_ratio(ratio: u32) -> usize {
     }
 }
 
+/// CSA's ratio. Overlapping blocks, a doubled compressor projection,
+/// and a Lightning Indexer.
+pub const CSA_RATIO: u32 = 4;
+
+/// HCA's ratio. Non-overlapping blocks, a single-width compressor, and
+/// no indexer.
+pub const HCA_RATIO: u32 = 128;
+
+/// Which compressor one layer runs, and everything that follows from it.
+///
+/// The ratio is not a tuning knob with a smooth range: it selects one of
+/// three *different mechanisms*, and the parameters below are not
+/// interpolations between them. Deriving them here, once, is what stops
+/// a single scalar ratio from building an indexer on an HCA layer or
+/// none on a CSA layer -- both of which run, produce numbers, and are
+/// wrong.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LayerCompressor {
+    /// Ratio 0: no compressed tier at all. Attention sees the raw
+    /// sliding window and nothing else.
+    ///
+    /// A real entry in the shipped schedule rather than a disabled
+    /// state -- `(0, 0, 4, 128, 4, 128, 4, 0)` opens with two of them
+    /// and closes with one -- so it must be executable, not skipped.
+    None,
+    /// Ratio 4: Compressed Sparse Attention. Overlapping blocks, a
+    /// compressor projection twice as wide, and the Lightning Indexer
+    /// restricting which compressed entries a query may see.
+    Csa,
+    /// Ratio 128: Heavily Compressed Attention. Non-overlapping blocks,
+    /// a single-width compressor, and dense visibility over every
+    /// compressed entry -- no indexer.
+    Hca,
+}
+
+impl LayerCompressor {
+    /// Reads one layer's ratio.
+    ///
+    /// Returns `None` for a ratio that is not 0, 4 or 128, rather than
+    /// approximating it to the nearest mechanism: there is no nearest
+    /// mechanism, and picking one would give that layer the wrong
+    /// compressor width and the wrong indexer, silently.
+    pub fn from_ratio(ratio: u32) -> Option<Self> {
+        match ratio {
+            0 => Some(LayerCompressor::None),
+            CSA_RATIO => Some(LayerCompressor::Csa),
+            HCA_RATIO => Some(LayerCompressor::Hca),
+            _ => None,
+        }
+    }
+
+    /// The ratio this compressor runs at; `0` for [`None`](Self::None).
+    pub fn ratio(self) -> u32 {
+        match self {
+            LayerCompressor::None => 0,
+            LayerCompressor::Csa => CSA_RATIO,
+            LayerCompressor::Hca => HCA_RATIO,
+        }
+    }
+
+    /// Whether this layer instantiates the Lightning Indexer.
+    ///
+    /// CSA only. On an HCA layer every compressed entry is visible, so
+    /// there is nothing for a top-k selector to select; building one
+    /// there costs its own compressor, its own keys and its own tier of
+    /// device memory to answer a question with a fixed answer.
+    pub fn has_indexer(self) -> bool {
+        matches!(self, LayerCompressor::Csa)
+    }
+
+    /// How many times wider this layer's raw per-token compressor
+    /// projection is than one head.
+    ///
+    /// `2` for CSA, and this is the detail a single scalar ratio gets
+    /// wrong on half the stack. Each raw token is projected *twice*:
+    /// once for its role as the tail of the block ending at it, and
+    /// once as the head of the next, overlapping block -- two different
+    /// learned projections of the same token, not one reused twice
+    /// (llama.cpp `load_arch_tensors`' `coff = ratio == 4 ? 2 : 1`, and
+    /// `build_overlap_compressed_kv_from_state`'s
+    /// `GGML_ASSERT(kv_state->ne[0] == 2*n_embd_head)`).
+    pub fn projection_width_multiple(self) -> usize {
+        match self {
+            LayerCompressor::Csa => 2,
+            LayerCompressor::None | LayerCompressor::Hca => 1,
+        }
+    }
+
+    /// Whether consecutive compression blocks share raw positions.
+    pub fn overlapping(self) -> bool {
+        matches!(self, LayerCompressor::Csa)
+    }
+
+    /// How many compressed entries a query at position `pos` may see.
+    ///
+    /// `(pos + 1) / ratio`: ratio-derived, like everything else here,
+    /// and zero on a layer with no compressor. The `+1` is because
+    /// `pos` is an index and the count of tokens through it is one
+    /// more -- without it the query at the last position of a block
+    /// cannot see the block it just completed, which is off by exactly
+    /// one entry for the whole of the sequence.
+    pub fn visible_compressed(self, pos: usize) -> usize {
+        match self.ratio() {
+            0 => 0,
+            r => (pos + 1) / r as usize,
+        }
+    }
+}
+
+/// The schedule a ratio that is not 0, 4 or 128 could not be read into.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UnknownCompressRatio {
+    pub layer: usize,
+    pub ratio: u32,
+}
+
+impl std::fmt::Display for UnknownCompressRatio {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self { layer, ratio } = self;
+        write!(
+            f,
+            "layer {layer} has compress ratio {ratio}, which is none of 0 (no compressor), \
+             {CSA_RATIO} (CSA) or {HCA_RATIO} (HCA); these are three different mechanisms, \
+             so there is no nearest one to fall back to"
+        )
+    }
+}
+
+impl std::error::Error for UnknownCompressRatio {}
+
+impl Dsv4Args {
+    /// The compressor each layer runs, in layer order.
+    ///
+    /// Reads the same `compress_ratios` the four KV tiers are priced
+    /// from, so what a layer is *sized* for and what it *executes* can
+    /// never drift apart -- which they would the moment the execution
+    /// side kept a scalar of its own.
+    ///
+    /// Refuses the whole schedule on the first unreadable ratio rather
+    /// than dropping that layer: a stack missing one layer's compressor
+    /// still runs, and answers with the wrong attention on it.
+    pub fn compressors(&self) -> Result<Vec<LayerCompressor>, UnknownCompressRatio> {
+        self.ratios()
+            .iter()
+            .enumerate()
+            .map(|(layer, &ratio)| {
+                LayerCompressor::from_ratio(ratio).ok_or(UnknownCompressRatio { layer, ratio })
+            })
+            .collect()
+    }
+}
+
 /// Window pages the sliding pool must always keep for the concurrent
 /// working set.
 ///
@@ -1130,6 +1282,141 @@ impl Dsv4WindowPool {
 
 #[cfg(test)]
 mod tests {
+
+    /// The shipped schedule, and the whole reason a scalar ratio is
+    /// wrong: one array holds all three mechanisms, so any single value
+    /// applied uniformly is right for at most one kind of layer.
+    #[test]
+    fn the_shipped_schedule_reads_as_three_different_mechanisms() {
+        let args = Dsv4Args {
+            head_dim: 64,
+            index_head_dim: 32,
+            n_layers: 8,
+            compress_ratios: vec![0, 0, 4, 128, 4, 128, 4, 0],
+        };
+        assert_eq!(
+            args.compressors().unwrap(),
+            vec![
+                LayerCompressor::None,
+                LayerCompressor::None,
+                LayerCompressor::Csa,
+                LayerCompressor::Hca,
+                LayerCompressor::Csa,
+                LayerCompressor::Hca,
+                LayerCompressor::Csa,
+                LayerCompressor::None,
+            ]
+        );
+    }
+
+    /// The two properties a uniform ratio gets wrong on half the stack:
+    /// an indexer built where every entry is already visible, and a
+    /// compressor projection of the wrong width. Both run and produce
+    /// numbers, which is why they are derived from the mechanism rather
+    /// than configured.
+    #[test]
+    fn the_indexer_and_the_projection_width_follow_from_the_mechanism() {
+        assert!(LayerCompressor::Csa.has_indexer());
+        assert!(!LayerCompressor::Hca.has_indexer());
+        assert!(!LayerCompressor::None.has_indexer());
+
+        assert_eq!(LayerCompressor::Csa.projection_width_multiple(), 2);
+        assert_eq!(LayerCompressor::Hca.projection_width_multiple(), 1);
+        assert_eq!(LayerCompressor::None.projection_width_multiple(), 1);
+
+        assert!(LayerCompressor::Csa.overlapping());
+        assert!(!LayerCompressor::Hca.overlapping());
+    }
+
+    /// Visibility is ratio-derived, and the `+1` is load-bearing: the
+    /// query at the last position of a block must see the block it just
+    /// completed. Without it every layer is short exactly one
+    /// compressed entry, for the whole sequence.
+    #[test]
+    fn a_query_sees_one_compressed_entry_per_completed_block() {
+        let csa = LayerCompressor::Csa;
+        assert_eq!(csa.visible_compressed(0), 0, "no block is complete yet");
+        assert_eq!(csa.visible_compressed(2), 0);
+        assert_eq!(csa.visible_compressed(3), 1, "the first block just closed");
+        assert_eq!(csa.visible_compressed(7), 2);
+        assert_eq!(csa.visible_compressed(8), 2);
+
+        let hca = LayerCompressor::Hca;
+        assert_eq!(hca.visible_compressed(126), 0);
+        assert_eq!(hca.visible_compressed(127), 1);
+        assert_eq!(hca.visible_compressed(255), 2);
+
+        // A layer with no compressor has nothing to see, at any
+        // position -- not "all of them", which a ratio of zero would
+        // produce as a divide by zero rather than an answer.
+        for pos in [0, 1, 127, 1_000_000] {
+            assert_eq!(LayerCompressor::None.visible_compressed(pos), 0);
+        }
+    }
+
+    /// A ratio that is none of the three is refused, naming its layer.
+    /// There is no nearest mechanism to round to, and picking one gives
+    /// that layer the wrong compressor width and the wrong indexer with
+    /// nothing to point at afterwards.
+    #[test]
+    fn an_unknown_ratio_is_refused_and_names_its_layer() {
+        assert_eq!(LayerCompressor::from_ratio(7), None);
+        assert_eq!(LayerCompressor::from_ratio(64), None);
+
+        let args = Dsv4Args {
+            head_dim: 64,
+            index_head_dim: 32,
+            n_layers: 3,
+            compress_ratios: vec![0, 64, 128],
+        };
+        let err = args.compressors().unwrap_err();
+        assert_eq!(
+            err,
+            UnknownCompressRatio {
+                layer: 1,
+                ratio: 64
+            }
+        );
+        assert!(err.to_string().contains("layer 1"));
+    }
+
+    /// The schedule reads the same array the tiers are priced from, and
+    /// truncates the same way -- a checkpoint shipping 44 ratios for 43
+    /// layers describes 43 layers. Sizing a tier this stack never
+    /// executes, or executing one it never sized, are the two failures
+    /// sharing the array prevents.
+    #[test]
+    fn the_schedule_and_the_sizing_read_the_same_truncated_array() {
+        let args = Dsv4Args {
+            head_dim: 64,
+            index_head_dim: 32,
+            n_layers: 3,
+            compress_ratios: vec![4, 128, 0, 4],
+        };
+        assert_eq!(args.ratios(), &[4, 128, 0]);
+        let compressors = args.compressors().unwrap();
+        assert_eq!(compressors.len(), args.ratios().len());
+        for (c, &r) in compressors.iter().zip(args.ratios()) {
+            assert_eq!(c.ratio(), r);
+        }
+    }
+
+    /// Every ratio the ring geometry accepts is one the schedule can
+    /// read, and vice versa for the compressed tiers. The two tables
+    /// are separate functions over the same three values, and a ratio
+    /// only one of them knows is a layer that is sized without being
+    /// executable or the reverse.
+    #[test]
+    fn the_ring_table_and_the_compressor_table_agree_on_which_ratios_exist() {
+        for ratio in [CSA_RATIO, HCA_RATIO] {
+            assert!(LayerCompressor::from_ratio(ratio).is_some());
+            assert!(ring_size_for_ratio(ratio) > 0);
+        }
+        // Ratio 0 is readable as a mechanism but has no ring, because a
+        // layer with no compressor has no carry state to address.
+        assert_eq!(LayerCompressor::from_ratio(0), Some(LayerCompressor::None));
+        assert!(std::panic::catch_unwind(|| ring_size_for_ratio(0)).is_err());
+    }
     use super::*;
 
     const P: usize = DEFAULT_WINDOW_PAGE;

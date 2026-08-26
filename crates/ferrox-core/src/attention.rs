@@ -1842,9 +1842,75 @@ pub fn causal_mla_attention(
     v_head_dim: usize,
     seq_len: usize,
 ) -> Vec<f32> {
+    mla_attention_inner(
+        q,
+        k_cache,
+        v_cache,
+        n_heads,
+        qk_head_dim,
+        v_head_dim,
+        seq_len,
+        None,
+        None,
+    )
+}
+
+/// The one MLA attention body, shared by the dense, sparse and
+/// sink-carrying entry points.
+///
+/// `visible` restricts which key positions participate (`None` is every
+/// position through `seq_len`); `sinks` is one learned logit per query
+/// head. Sharing the body is deliberate rather than tidy: the four
+/// public forms differ only in those two options, and a second copy of
+/// the softmax is how one of them quietly stops matching the others.
+///
+/// A sink joins the softmax denominator with a **zero** value vector,
+/// so it takes probability mass away from the real keys without
+/// contributing to the output -- the same semantics as
+/// [`causal_gqa_attention_sinks`], and for the same reason: it lets a
+/// head decline to attend to anything rather than being forced to
+/// spread a full unit of weight over keys it does not want. The sink
+/// logit is **not** scaled by `1/sqrt(qk_head_dim)`; it is a learned
+/// logit already in score space.
+///
+/// A head whose sink dominates gets an output near zero, which is the
+/// intended behaviour and not a bug to guard against -- clamping it
+/// would remove the only thing the sink is for.
+#[allow(clippy::too_many_arguments)]
+fn mla_attention_inner(
+    q: &[f32],
+    k_cache: &[f32],
+    v_cache: &[f32],
+    n_heads: usize,
+    qk_head_dim: usize,
+    v_head_dim: usize,
+    seq_len: usize,
+    visible: Option<&[usize]>,
+    sinks: Option<&[f32]>,
+) -> Vec<f32> {
     assert_eq!(q.len(), n_heads * qk_head_dim);
     assert_eq!(k_cache.len(), seq_len * n_heads * qk_head_dim);
     assert_eq!(v_cache.len(), seq_len * n_heads * v_head_dim);
+    if let Some(visible) = visible {
+        assert!(
+            visible.iter().all(|&t| t < seq_len),
+            "visible positions must be within seq_len"
+        );
+    }
+    if let Some(sinks) = sinks {
+        assert_eq!(
+            sinks.len(),
+            n_heads,
+            "one sink logit per query head, or none at all"
+        );
+    }
+
+    // Indexed rather than materialized: `None` means every position
+    // through `seq_len`, and building that list would allocate one
+    // `usize` per cached token on every decode step of every layer --
+    // paid on the dense path, which is the common one.
+    let n_positions = visible.map_or(seq_len, |v| v.len());
+    let position_at = |i: usize| visible.map_or(i, |v| v[i]);
 
     let scale = 1.0 / (qk_head_dim as f32).sqrt();
     let mut out = vec![0f32; n_heads * v_head_dim];
@@ -1852,31 +1918,44 @@ pub fn causal_mla_attention(
     for h in 0..n_heads {
         let q_h = &q[h * qk_head_dim..(h + 1) * qk_head_dim];
 
-        let mut scores = vec![0f32; seq_len];
-        for t in 0..seq_len {
+        let mut scores = vec![0f32; n_positions];
+        for (i, score) in scores.iter_mut().enumerate() {
+            let t = position_at(i);
             let k_t =
                 &k_cache[(t * n_heads + h) * qk_head_dim..(t * n_heads + h + 1) * qk_head_dim];
             let mut dot = 0f32;
             for d in 0..qk_head_dim {
                 dot += q_h[d] * k_t[d];
             }
-            scores[t] = dot * scale;
+            *score = dot * scale;
         }
 
-        let max = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let sink = sinks.map(|s| s[h]);
+        let mut max = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        if let Some(s) = sink {
+            max = max.max(s);
+        }
         let mut sum = 0f32;
         for s in scores.iter_mut() {
             *s = (*s - max).exp();
             sum += *s;
         }
-        for s in scores.iter_mut() {
-            *s /= sum;
+        // The sink's mass lands in the denominator only: it has no value
+        // vector, which is exactly how it removes weight from the real
+        // keys instead of redistributing it among them.
+        if let Some(s) = sink {
+            sum += (s - max).exp();
+        }
+        if sum > 0.0 {
+            for s in scores.iter_mut() {
+                *s /= sum;
+            }
         }
 
         let out_h = &mut out[h * v_head_dim..(h + 1) * v_head_dim];
-        for t in 0..seq_len {
+        for (i, &w) in scores.iter().enumerate() {
+            let t = position_at(i);
             let v_t = &v_cache[(t * n_heads + h) * v_head_dim..(t * n_heads + h + 1) * v_head_dim];
-            let w = scores[t];
             for d in 0..v_head_dim {
                 out_h[d] += w * v_t[d];
             }
@@ -1884,6 +1963,66 @@ pub fn causal_mla_attention(
     }
 
     out
+}
+
+/// [`causal_mla_attention`] with DeepSeek V4's per-head attention sinks.
+///
+/// `sinks` is one learned logit per query head. See
+/// [`mla_attention_inner`] for what a sink does and why it is not
+/// scaled.
+#[allow(clippy::too_many_arguments)]
+pub fn causal_mla_attention_sinks(
+    q: &[f32],
+    k_cache: &[f32],
+    v_cache: &[f32],
+    n_heads: usize,
+    qk_head_dim: usize,
+    v_head_dim: usize,
+    seq_len: usize,
+    sinks: Option<&[f32]>,
+) -> Vec<f32> {
+    mla_attention_inner(
+        q,
+        k_cache,
+        v_cache,
+        n_heads,
+        qk_head_dim,
+        v_head_dim,
+        seq_len,
+        None,
+        sinks,
+    )
+}
+
+/// [`causal_mla_attention_sparse`] with per-head attention sinks.
+///
+/// The sink matters more here than on the dense path: a sparse query
+/// sees only the positions the indexer selected, and without a sink its
+/// softmax is forced to spend a full unit of weight on them however
+/// poorly they match.
+#[allow(clippy::too_many_arguments)]
+pub fn causal_mla_attention_sparse_sinks(
+    q: &[f32],
+    k_cache: &[f32],
+    v_cache: &[f32],
+    n_heads: usize,
+    qk_head_dim: usize,
+    v_head_dim: usize,
+    seq_len: usize,
+    visible: &[usize],
+    sinks: Option<&[f32]>,
+) -> Vec<f32> {
+    mla_attention_inner(
+        q,
+        k_cache,
+        v_cache,
+        n_heads,
+        qk_head_dim,
+        v_head_dim,
+        seq_len,
+        Some(visible),
+        sinks,
+    )
 }
 
 /// The DeepSeek-V3.2 / GLM-5.2 "lightning indexer" (arXiv 2512.02556;
@@ -1955,56 +2094,150 @@ pub fn causal_mla_attention_sparse(
     seq_len: usize,
     visible: &[usize],
 ) -> Vec<f32> {
-    assert_eq!(q.len(), n_heads * qk_head_dim);
-    assert_eq!(k_cache.len(), seq_len * n_heads * qk_head_dim);
-    assert_eq!(v_cache.len(), seq_len * n_heads * v_head_dim);
-    assert!(
-        visible.iter().all(|&t| t < seq_len),
-        "visible positions must be within seq_len"
-    );
-
-    let scale = 1.0 / (qk_head_dim as f32).sqrt();
-    let mut out = vec![0f32; n_heads * v_head_dim];
-
-    for h in 0..n_heads {
-        let q_h = &q[h * qk_head_dim..(h + 1) * qk_head_dim];
-
-        let mut scores = vec![0f32; visible.len()];
-        for (i, &t) in visible.iter().enumerate() {
-            let k_t =
-                &k_cache[(t * n_heads + h) * qk_head_dim..(t * n_heads + h + 1) * qk_head_dim];
-            let mut dot = 0f32;
-            for d in 0..qk_head_dim {
-                dot += q_h[d] * k_t[d];
-            }
-            scores[i] = dot * scale;
-        }
-
-        let max = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-        let mut sum = 0f32;
-        for s in scores.iter_mut() {
-            *s = (*s - max).exp();
-            sum += *s;
-        }
-        for s in scores.iter_mut() {
-            *s /= sum;
-        }
-
-        let out_h = &mut out[h * v_head_dim..(h + 1) * v_head_dim];
-        for (i, &t) in visible.iter().enumerate() {
-            let v_t = &v_cache[(t * n_heads + h) * v_head_dim..(t * n_heads + h + 1) * v_head_dim];
-            let w = scores[i];
-            for d in 0..v_head_dim {
-                out_h[d] += w * v_t[d];
-            }
-        }
-    }
-
-    out
+    mla_attention_inner(
+        q,
+        k_cache,
+        v_cache,
+        n_heads,
+        qk_head_dim,
+        v_head_dim,
+        seq_len,
+        Some(visible),
+        None,
+    )
 }
 
 #[cfg(test)]
 mod tests {
+
+    /// A sink takes probability mass away from the real keys without
+    /// contributing to the output, so the result shrinks toward zero
+    /// rather than being redistributed. Without a sink the softmax must
+    /// spend a full unit of weight on the keys it has, however poorly
+    /// they match; with one, a head can decline.
+    #[test]
+    fn an_mla_sink_removes_weight_from_the_real_keys_instead_of_moving_it() {
+        let (n_heads, qk, vd, seq) = (2, 2, 2, 2);
+        let q = vec![1.0, 0.0, 0.0, 1.0];
+        let k = vec![1.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 1.0];
+        let v = vec![4.0, 8.0, 1.0, 2.0, 4.0, 8.0, 1.0, 2.0];
+
+        let plain = super::causal_mla_attention(&q, &k, &v, n_heads, qk, vd, seq);
+        let none = super::causal_mla_attention_sinks(&q, &k, &v, n_heads, qk, vd, seq, None);
+        assert_eq!(plain, none, "no sink must be exactly the old path");
+
+        // A sink far above every score takes nearly all the mass.
+        let big = super::causal_mla_attention_sinks(
+            &q,
+            &k,
+            &v,
+            n_heads,
+            qk,
+            vd,
+            seq,
+            Some(&[40.0, 40.0]),
+        );
+        for (b, p) in big.iter().zip(plain.iter()) {
+            assert!(b.abs() < 1e-6, "a dominant sink leaves ~0, got {b} vs {p}");
+        }
+
+        // A sink far below every score changes almost nothing.
+        let tiny = super::causal_mla_attention_sinks(
+            &q,
+            &k,
+            &v,
+            n_heads,
+            qk,
+            vd,
+            seq,
+            Some(&[-40.0, -40.0]),
+        );
+        for (s, p) in tiny.iter().zip(plain.iter()) {
+            assert!((s - p).abs() < 1e-5, "negligible sink: {s} vs {p}");
+        }
+    }
+
+    /// The sink is per HEAD, so one head may decline while another
+    /// attends normally. A single shared sink would be a different
+    /// mechanism, and one that cannot express this.
+    #[test]
+    fn each_head_gets_its_own_mla_sink() {
+        let (n_heads, qk, vd, seq) = (2, 1, 1, 1);
+        let q = vec![1.0, 1.0];
+        let k = vec![1.0, 1.0];
+        let v = vec![5.0, 5.0];
+
+        let out = super::causal_mla_attention_sinks(
+            &q,
+            &k,
+            &v,
+            n_heads,
+            qk,
+            vd,
+            seq,
+            Some(&[40.0, -40.0]),
+        );
+        assert!(out[0].abs() < 1e-6, "head 0 declined: {}", out[0]);
+        assert!(
+            (out[1] - 5.0).abs() < 1e-5,
+            "head 1 attended normally: {}",
+            out[1]
+        );
+    }
+
+    /// The sink logit is NOT multiplied by the `1/sqrt(qk_head_dim)`
+    /// score scale -- it is a learned logit already in score space. If
+    /// it were scaled, the same checkpoint would sink differently at
+    /// different head widths, which is what this pins down.
+    #[test]
+    fn the_mla_sink_logit_is_not_scaled_by_the_head_width() {
+        // One key whose score is exactly 0 before and after scaling, so
+        // the only thing the head width can affect is the sink.
+        let sink = 0.0f32;
+        let mut outs = Vec::new();
+        for qk in [1usize, 4, 16] {
+            let q = vec![0.0; qk];
+            let k = vec![0.0; qk];
+            let v = vec![10.0];
+            outs.push(super::causal_mla_attention_sinks(&q, &k, &v, 1, qk, 1, 1, Some(&[sink]))[0]);
+        }
+        // score 0 and sink 0 split the mass evenly, at every width.
+        for o in &outs {
+            assert!((o - 5.0).abs() < 1e-5, "expected 5.0, got {o}");
+        }
+    }
+
+    /// The sparse path takes a sink too, and it matters more there: a
+    /// query that sees only the indexer's selection would otherwise be
+    /// forced to spend a full unit of weight on it.
+    #[test]
+    fn the_sparse_mla_path_honours_a_sink_over_the_selected_positions() {
+        let (n_heads, qk, vd, seq) = (1, 1, 1, 3);
+        let q = vec![1.0];
+        let k = vec![1.0, 1.0, 1.0];
+        let v = vec![2.0, 4.0, 6.0];
+        let visible = [0usize, 2];
+
+        let plain = super::causal_mla_attention_sparse(&q, &k, &v, n_heads, qk, vd, seq, &visible);
+        let none = super::causal_mla_attention_sparse_sinks(
+            &q, &k, &v, n_heads, qk, vd, seq, &visible, None,
+        );
+        assert_eq!(plain, none);
+        assert!((plain[0] - 4.0).abs() < 1e-5, "mean of 2 and 6");
+
+        let sunk = super::causal_mla_attention_sparse_sinks(
+            &q,
+            &k,
+            &v,
+            n_heads,
+            qk,
+            vd,
+            seq,
+            &visible,
+            Some(&[40.0]),
+        );
+        assert!(sunk[0].abs() < 1e-6, "a dominant sink leaves ~0");
+    }
     #[test]
     fn prefill_shared_kv_matches_per_query_reference() {
         // Shapes chosen to cross the query-block boundary (n_q > 2 blocks,

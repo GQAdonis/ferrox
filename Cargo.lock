@@ -538,6 +538,7 @@ dependencies = [
  "fancy-regex",
  "ferrox-core",
  "ferrox-cuda",
+ "ferrox-edge",
  "ferrox-gguf",
  "ferrox-metal",
  "ferrox-moe",

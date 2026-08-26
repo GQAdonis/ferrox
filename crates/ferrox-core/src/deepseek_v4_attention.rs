@@ -26,9 +26,9 @@
 //! math needed: since the real mechanism is exactly "concatenate raw and
 //! compressed K/V into one sequence, then run one masked attention pass
 //! over the concatenation," building that one combined K/V cache and
-//! delegating to [`crate::attention::causal_mla_attention`] (HCA: dense,
+//! delegating to [`crate::attention::causal_mla_attention_sinks`] (HCA: dense,
 //! every raw and compressed position visible) or
-//! [`crate::attention::causal_mla_attention_sparse`] (CSA: raw positions
+//! [`crate::attention::causal_mla_attention_sparse_sinks`] (CSA: raw positions
 //! always visible, compressed positions restricted to the indexer's
 //! top-k) reproduces the real op sequence exactly. The lightning-indexer
 //! selection itself is likewise DeepSeek-V3.2/GLM-5.2's existing
@@ -46,7 +46,9 @@
 //! is real, cited scope this module does not attempt; see
 //! `crate::csa_hca_compress`'s module doc comment for the same caveat.
 
-use crate::attention::{causal_mla_attention, causal_mla_attention_sparse, lightning_indexer_topk};
+use crate::attention::{
+    causal_mla_attention_sinks, causal_mla_attention_sparse_sinks, lightning_indexer_topk,
+};
 
 /// Concatenates a raw window and a compressed set of K or V buffers
 /// (each `[n_positions, n_heads, head_dim]` flattened row-major) into one
@@ -80,10 +82,11 @@ pub fn hca_attention(
     n_heads: usize,
     qk_head_dim: usize,
     v_head_dim: usize,
+    sinks: Option<&[f32]>,
 ) -> Vec<f32> {
     let k_all = concat_raw_and_compressed(raw_k, compressed_k);
     let v_all = concat_raw_and_compressed(raw_v, compressed_v);
-    causal_mla_attention(
+    causal_mla_attention_sinks(
         q,
         &k_all,
         &v_all,
@@ -91,6 +94,7 @@ pub fn hca_attention(
         qk_head_dim,
         v_head_dim,
         n_raw + n_compressed,
+        sinks,
     )
 }
 
@@ -123,6 +127,7 @@ pub fn csa_attention(
     n_heads: usize,
     qk_head_dim: usize,
     v_head_dim: usize,
+    sinks: Option<&[f32]>,
 ) -> Vec<f32> {
     assert_eq!(indexer_keys.len(), n_compressed);
 
@@ -134,7 +139,7 @@ pub fn csa_attention(
     let mut visible: Vec<usize> = (0..n_raw).collect();
     visible.extend(selected.iter().map(|&i| n_raw + i));
 
-    causal_mla_attention_sparse(
+    causal_mla_attention_sparse_sinks(
         q,
         &k_all,
         &v_all,
@@ -143,12 +148,14 @@ pub fn csa_attention(
         v_head_dim,
         n_raw + n_compressed,
         &visible,
+        sinks,
     )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::attention::causal_mla_attention;
 
     #[test]
     fn hca_attention_with_single_raw_and_single_compressed_position_matches_full_causal_over_both()
@@ -173,6 +180,7 @@ mod tests {
             n_heads,
             qk_head_dim,
             v_head_dim,
+            None,
         );
 
         // Cross-check against causal_mla_attention on the manually
@@ -214,6 +222,7 @@ mod tests {
             n_heads,
             qk_head_dim,
             v_head_dim,
+            None,
         );
         // Identical keys -> softmax splits 50/50 -> average of 5 and 999.
         assert!((out[0] - 502.0).abs() < 1e-3, "out[0]={}", out[0]);
@@ -255,6 +264,7 @@ mod tests {
             n_heads,
             qk_head_dim,
             v_head_dim,
+            None,
         );
         let hca_out = hca_attention(
             &q,
@@ -267,6 +277,7 @@ mod tests {
             n_heads,
             qk_head_dim,
             v_head_dim,
+            None,
         );
         assert_eq!(csa_out.len(), hca_out.len());
         for (a, b) in csa_out.iter().zip(hca_out.iter()) {
@@ -310,6 +321,7 @@ mod tests {
             n_heads,
             qk_head_dim,
             v_head_dim,
+            None,
         );
         // Raw and the one selected compressed entry have identical keys
         // (both [1,0]), so softmax splits 50/50 between V=5 and V=7.

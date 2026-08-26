@@ -141,6 +141,124 @@ pub fn default_profile_path(gpu_uuid: Option<&str>) -> PathBuf {
     default_profile_path_in(&cache_dir(), gpu_uuid)
 }
 
+// ---- writing a profile ---------------------------------------------
+
+/// A measured (format, card) pair, before it becomes a profile entry.
+///
+/// All four bandwidths are `Option` for the same reason the profile's
+/// are: a run that could only measure one side has not measured the
+/// thing the fraction is made of, and a half-entry that reads as
+/// complete is worse than none.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct Measured {
+    pub cpu_moe_gbs: Option<f64>,
+    pub pcie_gather_gbs: Option<f64>,
+    pub cpu_moe_overlap_gbs: Option<f64>,
+    pub pcie_gather_overlap_gbs: Option<f64>,
+}
+
+/// Why a measurement cannot become a profile.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NotMeasurable {
+    /// One side was measured and the other was not.
+    ///
+    /// The fraction is a RATIO of the two, so one number alone implies
+    /// nothing about the split -- and a profile carrying it would be
+    /// consulted by `policy_for` as though it did.
+    OnlyOneSide,
+    /// A bandwidth came back at or below zero, which is a failed
+    /// measurement rather than an infinitely slow link.
+    NotPositive,
+}
+
+impl std::fmt::Display for NotMeasurable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            NotMeasurable::OnlyOneSide => write!(
+                f,
+                "only one side was measured; the fetch fraction is a ratio of \
+                 the two, so one number alone says nothing about the split"
+            ),
+            NotMeasurable::NotPositive => {
+                write!(
+                    f,
+                    "a bandwidth came back at or below zero, which is a failed measurement"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for NotMeasurable {}
+
+/// Turns a measurement into the entry a profile stores, deriving the
+/// verdict the reader consults.
+///
+/// `threshold` is the same one [`crate::qstar::recommend_backend`]
+/// applies, and the CONTENDED pair is preferred wherever it exists --
+/// standalone numbers assume each side owns the machine, and neither
+/// does once they run together, which is the whole reason the contended
+/// pair is measured at all.
+pub fn entry_from(
+    measured: &Measured,
+    threshold: f64,
+) -> Result<crate::qstar::KernelBandwidths, NotMeasurable> {
+    let positive = |v: Option<f64>| -> Result<Option<f64>, NotMeasurable> {
+        match v {
+            Some(x) if x > 0.0 && x.is_finite() => Ok(Some(x)),
+            Some(_) => Err(NotMeasurable::NotPositive),
+            None => Ok(None),
+        }
+    };
+    let cpu = positive(measured.cpu_moe_gbs)?;
+    let pcie = positive(measured.pcie_gather_gbs)?;
+    let cpu_ov = positive(measured.cpu_moe_overlap_gbs)?;
+    let pcie_ov = positive(measured.pcie_gather_overlap_gbs)?;
+
+    if cpu.is_some() != pcie.is_some() || cpu_ov.is_some() != pcie_ov.is_some() {
+        return Err(NotMeasurable::OnlyOneSide);
+    }
+    let (Some(cpu), Some(pcie)) = (cpu, pcie) else {
+        return Err(NotMeasurable::OnlyOneSide);
+    };
+
+    // The contended pair when it exists, exactly as `fetch_fraction`
+    // prefers it, so the verdict and the fraction cannot disagree about
+    // which numbers they came from.
+    let (verdict_cpu, verdict_pcie) = match (cpu_ov, pcie_ov) {
+        (Some(c), Some(p)) => (c, p),
+        _ => (cpu, pcie),
+    };
+    Ok(crate::qstar::KernelBandwidths {
+        cpu_moe_gbs: Some(cpu),
+        pcie_gather_gbs: Some(pcie),
+        cpu_moe_overlap_gbs: cpu_ov,
+        pcie_gather_overlap_gbs: pcie_ov,
+        recommended: Some(crate::qstar::recommend_backend(
+            verdict_cpu,
+            verdict_pcie,
+            threshold,
+        )),
+    })
+}
+
+/// Writes `profile` where [`read_profile`] will find it.
+///
+/// Through a temporary file and a rename, because a plain write is not
+/// atomic and a reader that catches a half-written profile gets serde's
+/// parse error -- which `read_profile` turns into NO profile, silently
+/// discarding a measurement the user did take.
+pub fn write_profile(path: &Path, profile: &BandwidthProfile) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let body = serde_json::to_vec_pretty(profile)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    let tmp = path.with_extension("json.partial");
+    std::fs::write(&tmp, body)?;
+    std::fs::rename(&tmp, path)
+}
+
 /// The newest `benchbw/*.json` under `cache_dir`, else the legacy
 /// `benchbw.json`, else [`None`].
 ///
@@ -672,5 +790,170 @@ mod tests {
         let dir = cache_dir();
         assert!(dir.is_absolute(), "{dir:?}");
         assert_eq!(dir.file_name().and_then(|n| n.to_str()), Some("ferrox"));
+    }
+
+    /// The fraction is a RATIO, so one side alone implies nothing about
+    /// the split -- and a profile carrying it would be consulted by
+    /// `policy_for` as though it did.
+    #[test]
+    fn one_side_measured_is_not_a_measurement() {
+        assert_eq!(
+            entry_from(
+                &Measured {
+                    cpu_moe_gbs: Some(50.0),
+                    ..Measured::default()
+                },
+                1.0
+            ),
+            Err(NotMeasurable::OnlyOneSide)
+        );
+        assert_eq!(
+            entry_from(
+                &Measured {
+                    pcie_gather_gbs: Some(20.0),
+                    ..Measured::default()
+                },
+                1.0
+            ),
+            Err(NotMeasurable::OnlyOneSide)
+        );
+        // Half a contended pair is the same failure: it is the pair
+        // that means something, not either half.
+        assert_eq!(
+            entry_from(
+                &Measured {
+                    cpu_moe_gbs: Some(50.0),
+                    pcie_gather_gbs: Some(20.0),
+                    cpu_moe_overlap_gbs: Some(30.0),
+                    pcie_gather_overlap_gbs: None,
+                },
+                1.0
+            ),
+            Err(NotMeasurable::OnlyOneSide)
+        );
+    }
+
+    /// A zero or negative bandwidth is a FAILED measurement, not an
+    /// infinitely slow link, and must not be written as though the
+    /// benchmark had succeeded.
+    #[test]
+    fn a_bandwidth_at_or_below_zero_is_a_failed_measurement() {
+        for bad in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            assert_eq!(
+                entry_from(
+                    &Measured {
+                        cpu_moe_gbs: Some(bad),
+                        pcie_gather_gbs: Some(20.0),
+                        ..Measured::default()
+                    },
+                    1.0
+                ),
+                Err(NotMeasurable::NotPositive),
+                "{bad} must not become a profile entry"
+            );
+        }
+    }
+
+    /// The verdict comes from the CONTENDED pair wherever it exists, so
+    /// it cannot disagree with the fraction about which numbers it came
+    /// from. Standalone numbers assume each side owns the machine, and
+    /// neither does once they run together -- which is the entire
+    /// reason the contended pair is measured.
+    #[test]
+    fn the_verdict_and_the_fraction_read_the_same_numbers() {
+        // Standalone says hybrid (cpu far outruns pcie); contended says
+        // offload, because under contention the CPU side collapses.
+        let measured = Measured {
+            cpu_moe_gbs: Some(100.0),
+            pcie_gather_gbs: Some(20.0),
+            cpu_moe_overlap_gbs: Some(10.0),
+            pcie_gather_overlap_gbs: Some(19.0),
+        };
+        let entry = entry_from(&measured, 1.0).expect("both sides measured");
+        assert_eq!(
+            entry.recommended,
+            Some(crate::qstar::MoeBackend::Offload),
+            "the contended pair is what the machine actually does"
+        );
+        // And the fraction the reader derives comes from the same pair.
+        let fraction = entry.fetch_fraction().expect("a pair exists");
+        let from_pair = crate::qstar::fetch_fraction_from_overlap(10.0, 19.0).unwrap();
+        assert!((fraction - from_pair).abs() < 1e-9);
+
+        // With no contended pair, the standalone numbers are all there
+        // is, and both halves fall back together.
+        let standalone = entry_from(
+            &Measured {
+                cpu_moe_gbs: Some(100.0),
+                pcie_gather_gbs: Some(20.0),
+                ..Measured::default()
+            },
+            1.0,
+        )
+        .unwrap();
+        assert_eq!(
+            standalone.recommended,
+            Some(crate::qstar::MoeBackend::Hybrid)
+        );
+    }
+
+    /// A reader that catches a half-written profile gets serde's parse
+    /// error, which `read_profile` turns into NO profile -- silently
+    /// discarding a measurement the user did take. So the write is
+    /// atomic, and nothing partial is ever left behind.
+    #[test]
+    fn a_profile_is_written_atomically_and_reads_back() {
+        let dir = std::env::temp_dir().join(format!(
+            "ferrox-benchbw-write-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = default_profile_path_in(&dir, Some("GPU-abc"));
+
+        let mut profile = BandwidthProfile {
+            threshold: Some(1.0),
+            ..BandwidthProfile::default()
+        };
+        profile.gpu.name = Some("NVIDIA GeForce RTX 4090".to_string());
+        profile.gpu.uuid = Some("GPU-abc".to_string());
+        profile.dtype_kernels.insert(
+            "q4_k".to_string(),
+            entry_from(
+                &Measured {
+                    cpu_moe_gbs: Some(80.0),
+                    pcie_gather_gbs: Some(20.0),
+                    ..Measured::default()
+                },
+                1.0,
+            )
+            .unwrap(),
+        );
+
+        write_profile(&path, &profile).expect("writes");
+        let read = read_profile(&path).expect("reads back");
+        assert_eq!(read.gpu.uuid.as_deref(), Some("GPU-abc"));
+        assert_eq!(
+            read.dtype_kernels["q4_k"].recommended,
+            Some(crate::qstar::MoeBackend::Hybrid)
+        );
+
+        assert!(
+            std::fs::read_dir(path.parent().unwrap())
+                .unwrap()
+                .all(|e| !e
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .ends_with(".partial")),
+            "nothing partial may survive a completed write"
+        );
+
+        // The card it was taken on is what it is keyed to: another
+        // card's split is worse than no split.
+        assert!(read.matches_gpu(Some("NVIDIA GeForce RTX 4090")));
+        assert!(!read.matches_gpu(Some("NVIDIA GeForce RTX 3060 Ti")));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

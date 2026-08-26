@@ -12,6 +12,8 @@ use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::{Arc, Mutex, OnceLock};
 
+use ferrox_gguf::GgmlType;
+
 use crate::tensor::Tensor;
 
 #[allow(dead_code)]
@@ -338,6 +340,49 @@ pub fn metal_mul_mm_kind_supported(kind: QuantKind) -> bool {
             | QuantKind::Q6K
             | QuantKind::IQ4XS
     )
+}
+
+/// Maps a GGUF tensor's on-disk dtype to the [`QuantKind`] a
+/// [`WeightMatrix`] uses to pick a fused dequant+dot kernel, or `None`
+/// for a dtype with no quantized kernel (F32, or one not implemented at
+/// all).
+///
+/// **The single source of truth for that question**, for the same
+/// reason [`metal_mul_mm_kind_supported`] is for its own: this table
+/// used to be copied into six GGUF loaders, and the copies drifted.
+/// Three of them (`loader`, `glm52_gguf_loader`, `kimi_gguf_loader`)
+/// listed 21 dtypes while the other three (`mla_gguf_loader`,
+/// `gemma4_gguf_loader`, `hybrid_gguf_loader`) listed 17 -- missing
+/// `IQ1_S`, `IQ2_XXS`, `IQ3_XXS` and `MXFP4`. A miss is not a slow
+/// path, it is `LoadError::UnsupportedDtype`, so a DeepSeek-MLA
+/// checkpoint quantized to `IQ2_XXS` -- an ordinary combination for a
+/// model that large -- was refused outright while the identical quant
+/// loaded fine on the generic path.
+pub fn quant_kind_for(dtype: GgmlType) -> Option<QuantKind> {
+    match dtype {
+        GgmlType::Q8_0 => Some(QuantKind::Q8_0),
+        GgmlType::Q4_0 => Some(QuantKind::Q4_0),
+        GgmlType::Q4K => Some(QuantKind::Q4K),
+        GgmlType::Q5K => Some(QuantKind::Q5K),
+        GgmlType::Q6K => Some(QuantKind::Q6K),
+        GgmlType::Q2K => Some(QuantKind::Q2K),
+        GgmlType::Q3K => Some(QuantKind::Q3K),
+        GgmlType::Q4_1 => Some(QuantKind::Q4_1),
+        GgmlType::Q5_0 => Some(QuantKind::Q5_0),
+        GgmlType::Q5_1 => Some(QuantKind::Q5_1),
+        GgmlType::Q8_1 => Some(QuantKind::Q8_1),
+        GgmlType::IQ4NL => Some(QuantKind::IQ4NL),
+        GgmlType::IQ4XS => Some(QuantKind::IQ4XS),
+        GgmlType::IQ2XS => Some(QuantKind::IQ2XS),
+        GgmlType::IQ2S => Some(QuantKind::IQ2S),
+        GgmlType::IQ3S => Some(QuantKind::IQ3S),
+        GgmlType::IQ1M => Some(QuantKind::IQ1M),
+        GgmlType::IQ1S => Some(QuantKind::IQ1S),
+        GgmlType::IQ2XXS => Some(QuantKind::IQ2XXS),
+        GgmlType::IQ3XXS => Some(QuantKind::IQ3XXS),
+        GgmlType::MXFP4 => Some(QuantKind::Mxfp4Gguf),
+        _ => None,
+    }
 }
 
 /// Which quant kinds have a **CUDA matvec** kernel.
@@ -3299,6 +3344,58 @@ impl WeightMatrix {
 }
 #[cfg(test)]
 mod tests {
+
+    /// The four dtypes the drifted copies were missing.
+    ///
+    /// Three of the six loaders stopped at IQ1_M, so `IQ1_S`,
+    /// `IQ2_XXS`, `IQ3_XXS` and `MXFP4` mapped to `None` there -- and a
+    /// `None` is `LoadError::UnsupportedDtype`, not a slower path. A
+    /// DeepSeek-MLA checkpoint at `IQ2_XXS`, an ordinary quant for a
+    /// model that size, was refused outright while the same quant
+    /// loaded on the generic path. One table is what stops that
+    /// recurring.
+    #[test]
+    fn the_four_dtypes_the_duplicated_tables_disagreed_about_all_map() {
+        assert_eq!(quant_kind_for(GgmlType::IQ1S), Some(QuantKind::IQ1S));
+        assert_eq!(quant_kind_for(GgmlType::IQ2XXS), Some(QuantKind::IQ2XXS));
+        assert_eq!(quant_kind_for(GgmlType::IQ3XXS), Some(QuantKind::IQ3XXS));
+        assert_eq!(quant_kind_for(GgmlType::MXFP4), Some(QuantKind::Mxfp4Gguf));
+    }
+
+    /// Every dtype with a CPU dequant kernel must be reachable through
+    /// this map, or the kernel exists and no loader can ever hand it a
+    /// tensor. Checked against the two backend tables rather than a
+    /// hand-written list, so adding a kernel without a mapping fails
+    /// here instead of at a user's load.
+    #[test]
+    fn every_dtype_with_a_gpu_kernel_is_reachable_through_the_map() {
+        let mapped: Vec<QuantKind> = [
+            GgmlType::Q8_0,
+            GgmlType::Q4_0,
+            GgmlType::Q4K,
+            GgmlType::Q5K,
+            GgmlType::Q6K,
+            GgmlType::IQ4XS,
+        ]
+        .into_iter()
+        .map(|d| quant_kind_for(d).expect("a dtype with a GPU kernel must map"))
+        .collect();
+        for kind in mapped {
+            assert!(
+                metal_mul_mm_kind_supported(kind) || cuda_matvec_kind_supported(kind),
+                "{kind:?} was listed as having a GPU kernel"
+            );
+        }
+    }
+
+    /// F32 and F16 are not quantized, so `None` is the right answer and
+    /// not a gap: the loader builds a plain `WeightMatrix::F32` for
+    /// them rather than reporting an unsupported dtype.
+    #[test]
+    fn an_unquantized_dtype_maps_to_nothing() {
+        assert_eq!(quant_kind_for(GgmlType::F32), None);
+        assert_eq!(quant_kind_for(GgmlType::F16), None);
+    }
     use super::*;
 
     /// `dequant_row` must reproduce exactly the values a full-buffer

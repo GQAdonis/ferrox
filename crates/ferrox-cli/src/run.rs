@@ -433,8 +433,8 @@ impl ChatKind {
                 file.metadata_str("general.architecture"),
                 byte_tokenizer,
             ),
-            bos_token: token_text(file, "tokenizer.ggml.bos_token_id"),
-            eos_token: token_text(file, "tokenizer.ggml.eos_token_id"),
+            bos_token: file.token_text("tokenizer.ggml.bos_token_id"),
+            eos_token: file.token_text("tokenizer.ggml.eos_token_id"),
         }
     }
 
@@ -459,20 +459,6 @@ impl ChatKind {
         self.template
             .render(&messages, &opts)
             .map_err(|e| anyhow::anyhow!("chat template failed to render: {e}"))
-    }
-}
-
-/// The *text* of a token named by an id-valued metadata key: a template
-/// prints `{{ bos_token }}` as a string, and GGUF records it as an id
-/// into the vocabulary.
-fn token_text(file: &ShardedGguf, key: &str) -> Option<String> {
-    let id = file.metadata_u64(key)? as usize;
-    let ferrox_gguf::GgufValue::Array(items) = file.metadata("tokenizer.ggml.tokens")? else {
-        return None;
-    };
-    match items.get(id)? {
-        ferrox_gguf::GgufValue::String(s) => Some(s.clone()),
-        _ => None,
     }
 }
 

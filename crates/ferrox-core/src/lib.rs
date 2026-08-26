@@ -7,6 +7,7 @@
 //! written independently. See docs/THIRD_PARTY_NOTICES.md for design credit.
 
 pub mod attention;
+pub mod block_sparse;
 pub mod cache;
 pub mod csa_hca_compress;
 pub mod deepseek_v4_attention;

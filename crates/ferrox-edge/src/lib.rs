@@ -48,6 +48,7 @@ pub mod detokenize;
 pub mod dsv4;
 pub mod effort;
 pub mod expert_cache;
+pub mod expert_slots;
 pub mod footprint;
 pub mod maintenance;
 pub mod outbox;
@@ -72,7 +73,8 @@ pub use bench_client::{
     PromptLengthNotReached, RequestTiming, MAX_PROMPT_FIXED_POINT_STEPS,
 };
 pub use bench_profile::{
-    load_backend_recommendation, load_hybrid_fetch_fraction, load_policy, usable_profile,
+    entry_from, load_backend_recommendation, load_hybrid_fetch_fraction, load_policy,
+    usable_profile, write_profile, Measured, NotMeasurable,
 };
 pub use cache_manager::{CacheManager, CommitOutcome, OutOfMemory, SequenceState};
 pub use cache_report::{CacheGeometry, CachePools};
@@ -80,7 +82,15 @@ pub use detokenize::{
     find_printable_text, floor_char_boundary, stop_prefix_holdback, DetokenizeManager,
     DetokenizeMsg, Detokenizer,
 };
-pub use expert_cache::{CopyPlan, EnsurePlan, ExpertCache, ExpertCacheStats, ExpertId};
+pub use expert_cache::{
+    BankEntry, CopyPlan, EnsurePlan, ExpertCache, ExpertCacheStats, ExpertId, GatherPlan,
+    PrefillPlan,
+};
+
+pub use expert_slots::{
+    Applied, ExpertRows, ExpertSlots, HostSlotMemory, SlotDevice, SlotFault, SlotGeometry,
+    SlotStats,
+};
 pub use parser::{
     ReasoningDelta, ReasoningFormat, ReasoningParser, ToolCall, ToolCallEvent, ToolCallFormat,
     ToolCallParser,
@@ -143,6 +153,7 @@ pub use dsv4::{
     dsv4_pool_sizes, dsv4_reserved_window_pages, dsv4_solve_num_pages, dsv4_window_floor_pages,
     dsv4_window_unit_bytes, ring_size_for_ratio, window_ring_position, Dsv4Args, Dsv4AutoCost,
     Dsv4BudgetTooSmall, Dsv4LayerSizes, Dsv4PoolSizes, Dsv4WindowCtx, Dsv4WindowPool,
-    FreeListAllocator, FreeListExhausted, AUTO_KV_SLACK_BYTES, BF16_BYTES, DEFAULT_WINDOW_PAGE,
-    FP32_BYTES, INT64_BYTES, NO_WINDOW_SLOT,
+    FreeListAllocator, FreeListExhausted, LayerCompressor, UnknownCompressRatio,
+    AUTO_KV_SLACK_BYTES, BF16_BYTES, CSA_RATIO, DEFAULT_WINDOW_PAGE, FP32_BYTES, HCA_RATIO,
+    INT64_BYTES, NO_WINDOW_SLOT,
 };

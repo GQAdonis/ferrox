@@ -31,6 +31,8 @@
 //! /tmp/ref_logits crates/ferrox-models/tests/fixtures/dots1_tiny.gguf 3 7 11 19 23 5
 //! ```
 
+mod common;
+use common::assert_close;
 use ferrox_core::cache::KvCache;
 use ferrox_models::{Decoder, ModelConfig};
 
@@ -103,21 +105,6 @@ fn load() -> Decoder {
     let file = ferrox_gguf::GgufFile::open(FIXTURE).expect("fixture opens");
     let config = ModelConfig::from_gguf(&file).expect("fixture config parses");
     Decoder::from_gguf(FIXTURE, config).expect("fixture loads")
-}
-
-fn assert_close(got: &[f32], want: &[f32], tol: f32, what: &str) {
-    assert_eq!(got.len(), want.len(), "{what}: logit count");
-    let worst = got
-        .iter()
-        .zip(want.iter())
-        .map(|(a, b)| (a - b).abs())
-        .fold(0f32, f32::max);
-    assert!(
-        worst <= tol,
-        "{what}: max |ferrox - llama.cpp| = {worst} > {tol}\n  ferrox: {:?}\n  llama:  {:?}",
-        &got[..8.min(got.len())],
-        &want[..8.min(want.len())]
-    );
 }
 
 fn prefill(decoder: &Decoder) -> Vec<f32> {

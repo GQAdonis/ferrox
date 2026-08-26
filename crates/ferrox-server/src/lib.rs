@@ -60,6 +60,7 @@ mod session;
 mod sse;
 mod stats;
 mod stop;
+mod stream_events;
 mod tasks;
 
 use std::cell::RefCell;

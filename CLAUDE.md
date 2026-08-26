@@ -71,6 +71,7 @@ ferrox-gguf + ferrox-quant
 
 ferrox-api  (routes + wire DTOs, serde-only) → ferrox-server + clients
 ferrox-edge (serving policy, tensor-free)    → ferrox-server
+                                             → ferrox-cuda (`cuda` only)
 ```
 
 `ferrox-edge` is a Rust port of FreeToken's host-side decision logic
@@ -81,6 +82,13 @@ chunked prefill, and the reasoning / tool-call output parsers. It has
 no tensors and no device memory, so every policy in it is testable on
 any host. Wired in today: the two parsers and the stop-string withhold
 rule; the cache and placement policies are groundwork (`docs/ROADMAP.md`).
+
+`ferrox-edge::expert_slots` is where that policy meets real memory: it
+executes the expert cache's copy plans against a bounded slot pool
+behind a `SlotDevice` trait, which is why `ferrox-cuda` depends on it
+under `--features cuda` (`expert_pool::CudaExpertPool`). The trait
+keeps the device memory out of ferrox-edge; the CUDA pool is
+compile-verified only, and its hardware test is `#[ignore]`d.
 
 Load path: GGUF mmap → keep quantized → fused dequant+dot →
 RMSNorm → GQA(+RoPE) → MoE/dense FFN. Serving: `FERROX_MODEL_PATH`

@@ -448,6 +448,7 @@ dependencies = [
  "ferrox-safetensors",
  "ferrox-server",
  "half",
+ "libc",
  "rayon",
  "serde_json",
  "tracing",
@@ -475,6 +476,7 @@ name = "ferrox-cuda"
 version = "0.11.1"
 dependencies = [
  "cudarc",
+ "ferrox-edge",
  "ferrox-quant",
  "half",
  "thiserror",
@@ -536,6 +538,7 @@ dependencies = [
  "fancy-regex",
  "ferrox-core",
  "ferrox-cuda",
+ "ferrox-edge",
  "ferrox-gguf",
  "ferrox-metal",
  "ferrox-moe",

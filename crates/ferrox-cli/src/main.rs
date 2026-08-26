@@ -1,11 +1,13 @@
 //! ferrox CLI, llama.cpp-style GGUF completion (`-m`/`-p`/`-n`/…) plus
 //! inspect / presets / smoke / Kimi helpers. See `docs/CLI.md`.
 
+mod bench_bw;
 mod bench_guard;
 mod bench_model;
 mod bench_suite;
 mod chat;
 mod host_state;
+mod http;
 mod parity;
 mod pull;
 mod run;
@@ -65,6 +67,14 @@ enum Commands {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, hide = true)]
         args: Vec<String>,
     },
+    /// Measure this host's CPU/PCIe bandwidths and write the profile
+    /// `qstar` reads to decide the MoE fetch split.
+    ///
+    /// Without one, every deployment gets an unbenchmarked default.
+    /// The PCIe half needs a CUDA build; without it the command
+    /// measures the CPU side, says so, and writes nothing rather than
+    /// half a profile.
+    BenchBw(bench_bw::BenchBwArgs),
     /// Concurrency, TTFT and queueing numbers for a running
     /// `ferrox-server` (HTTP).
     ///
@@ -383,6 +393,7 @@ const SUBCOMMANDS: &[&str] = &[
     "chat",
     "serve",
     "serve-bench",
+    "bench-bw",
     "inspect",
     "inspect-plan",
     "presets",
@@ -541,6 +552,7 @@ fn main() -> anyhow::Result<()> {
         Commands::Run(args) => run::run_infer(args)?,
         Commands::Chat(args) => chat::run_chat(args)?,
         Commands::ServeBench(args) => serve_bench::run_serve_bench(args)?,
+        Commands::BenchBw(args) => bench_bw::run_bench_bw(args)?,
         // Blocking, and it builds its own Tokio runtime: nothing above
         // this point has started one. It also claims the instance
         // registry itself (as `server`), which is why `instance_target`

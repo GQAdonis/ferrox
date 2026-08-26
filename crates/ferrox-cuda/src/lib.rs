@@ -17,6 +17,11 @@ pub mod capability;
 
 #[cfg(feature = "cuda")]
 pub mod attn;
+// Not feature-gated: the slot-index arithmetic inside is the one part
+// of the device copy path a compiler cannot check, so it is compiled
+// and tested on every host. Only `CudaExpertPool` itself is behind
+// `cuda`.
+pub mod expert_pool;
 #[cfg(feature = "cuda")]
 pub mod gpu;
 #[cfg(feature = "cuda")]

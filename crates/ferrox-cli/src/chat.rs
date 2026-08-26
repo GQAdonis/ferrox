@@ -3,13 +3,13 @@
 //! Talks to a running `ferrox-server` over HTTP so chat-template wrapping
 //! and streaming stay on the validated serve path (no duplicated decode).
 
-use std::io::{BufRead, BufReader, Read, Write};
-use std::net::TcpStream;
-use std::time::Duration;
+use std::io::{BufRead, Read, Write};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result};
 use clap::Parser;
 use serde_json::{json, Value};
+
+use crate::http;
 
 #[derive(Parser, Debug)]
 pub struct ChatArgs {
@@ -46,12 +46,13 @@ pub struct ChatArgs {
 pub fn run_chat(args: ChatArgs) -> Result<()> {
     let stream = args.stream && !args.no_stream;
     let base = args.url.trim_end_matches('/');
-    let health = http_get(&format!("{base}/health"))
+    let health = http::get(&format!("{base}/health"))
         .with_context(|| format!("health check failed for {base}"))?;
     if !(200..300).contains(&health.status) {
         anyhow::bail!("server /health returned HTTP {}", health.status);
     }
-    eprintln!("ferrox chat → {base}  (/help for commands, /quit to leave)");
+    install_sigint_handler();
+    eprintln!("ferrox chat → {base}  (/help for commands, Ctrl-C stops a turn, /quit to leave)");
     if let Some(sys) = &args.system {
         eprintln!("system: {sys}");
     }
@@ -100,7 +101,7 @@ pub fn run_chat(args: ChatArgs) -> Result<()> {
             continue;
         }
         if line == "/stats" {
-            match http_get(&format!("{base}/v1/stats")) {
+            match http::get(&format!("{base}/v1/stats")) {
                 Ok(resp) => match serde_json::from_slice::<Value>(&resp.body) {
                     Ok(v) => eprintln!("{}", render_stats(&v)),
                     Err(e) => eprintln!("(could not read /v1/stats: {e})"),
@@ -161,6 +162,76 @@ pub fn run_chat(args: ChatArgs) -> Result<()> {
     Ok(())
 }
 
+// ---------------------------------------------------------------------
+// Ctrl-C: cancel the turn, not the session
+// ---------------------------------------------------------------------
+
+/// Set while a generation is streaming.
+static GENERATING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Set by the signal handler when a turn should stop.
+static INTERRUPTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Marks a generation in flight, and clears the mark however the
+/// generation ends -- a `?` return or a panic included, which is why it
+/// is a guard and not two calls.
+struct Generating;
+
+impl Generating {
+    fn begin() -> Self {
+        INTERRUPTED.store(false, std::sync::atomic::Ordering::SeqCst);
+        GENERATING.store(true, std::sync::atomic::Ordering::SeqCst);
+        Generating
+    }
+}
+
+impl Drop for Generating {
+    fn drop(&mut self) {
+        GENERATING.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+fn interrupted() -> bool {
+    INTERRUPTED.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// What SIGINT does, and it depends on what the REPL is doing.
+///
+/// **Mid-generation**: set a flag and return. The stream loop notices
+/// between chunks, cancels the generation server-side and hands back
+/// what arrived, so Ctrl-C costs the turn rather than the session --
+/// which is the whole point, since the alternative is losing a
+/// conversation to stop one answer.
+///
+/// **At the prompt**: exit, because that is what Ctrl-C means at a
+/// shell prompt and a REPL that cannot be quit with it is worse than
+/// one with no handler at all.
+///
+/// Only two things happen in here, and both are async-signal-safe: an
+/// atomic store and `_exit`. Anything else -- a `println!`, an
+/// allocation, unwinding -- is undefined behaviour in a signal handler,
+/// and the failure mode is a deadlock inside the allocator that looks
+/// like a hang rather than a crash.
+extern "C" fn on_sigint(_sig: libc::c_int) {
+    if GENERATING.load(std::sync::atomic::Ordering::SeqCst) {
+        INTERRUPTED.store(true, std::sync::atomic::Ordering::SeqCst);
+    } else {
+        // 130 is the shell convention for "killed by SIGINT".
+        unsafe { libc::_exit(130) };
+    }
+}
+
+/// Installs [`on_sigint`]. Best-effort: a platform that refuses simply
+/// keeps the default behaviour, which is the one we started with.
+fn install_sigint_handler() {
+    unsafe {
+        // Through a pointer rather than casting the function item
+        // straight to an integer, which clippy rightly refuses: the
+        // direct cast is a lint-level trap for the case where the
+        // integer width and the pointer width differ.
+        libc::signal(libc::SIGINT, on_sigint as *const () as libc::sighandler_t);
+    }
+}
+
 /// What `/help` prints.
 const HELP: &str = "\
   /help            this list
@@ -189,7 +260,7 @@ struct ThinkGears {
 
 impl ThinkGears {
     fn fetch(base: &str) -> Result<Self> {
-        let resp = http_get(&format!("{base}/v1/models"))?;
+        let resp = http::get(&format!("{base}/v1/models"))?;
         let body: Value = serde_json::from_slice(&resp.body).context("parse /v1/models")?;
         Ok(Self::from_models(&body))
     }
@@ -318,7 +389,7 @@ fn render_stats(v: &Value) -> String {
 /// `/cache` with no argument shows the pool; with one, resizes it.
 fn cache_command(base: &str, arg: &str) -> String {
     if arg.is_empty() {
-        return match http_get(&format!("{base}/v1/cache/status")) {
+        return match http::get(&format!("{base}/v1/cache/status")) {
             Ok(resp) => match serde_json::from_slice::<Value>(&resp.body) {
                 Ok(v) => render_cache_status(&v),
                 Err(e) => format!("(could not read /v1/cache/status: {e})"),
@@ -334,7 +405,7 @@ fn cache_command(base: &str, arg: &str) -> String {
         Ok(b) => b,
         Err(e) => return format!("(could not encode the request: {e})"),
     };
-    match http_exchange("POST", &format!("{base}/v1/cache/rebuild"), Some(&bytes)) {
+    match http::exchange("POST", &format!("{base}/v1/cache/rebuild"), Some(&bytes)) {
         Ok(resp) => {
             let v: Value = serde_json::from_slice(&resp.body).unwrap_or(Value::Null);
             // The server's own refusal text, verbatim: it names the
@@ -363,112 +434,18 @@ fn render_cache_status(v: &Value) -> String {
     }
 }
 
-struct HttpResponse {
-    status: u16,
-    body: Vec<u8>,
-}
-
-fn parse_url(url: &str) -> Result<(String, u16, String)> {
-    let url = url.strip_prefix("http://").ok_or_else(|| {
-        anyhow!("only http:// URLs are supported (got {url}); https not implemented in chat client")
-    })?;
-    let (hostport, path) = match url.split_once('/') {
-        Some((hp, p)) => (hp, format!("/{p}")),
-        None => (url, "/".to_string()),
-    };
-    let (host, port) = match hostport.split_once(':') {
-        Some((h, p)) => (h.to_string(), p.parse().context("bad port")?),
-        None => (hostport.to_string(), 80u16),
-    };
-    Ok((host, port, path))
-}
-
-fn http_exchange(method: &str, url: &str, body: Option<&[u8]>) -> Result<HttpResponse> {
-    let (host, port, path) = parse_url(url)?;
-    let mut stream = TcpStream::connect((host.as_str(), port))
-        .with_context(|| format!("connect {host}:{port}"))?;
-    stream.set_read_timeout(Some(Duration::from_secs(600)))?;
-    stream.set_write_timeout(Some(Duration::from_secs(30)))?;
-
-    let mut req =
-        format!("{method} {path} HTTP/1.1\r\nHost: {host}:{port}\r\nConnection: close\r\n");
-    if let Some(b) = body {
-        req.push_str("Content-Type: application/json\r\n");
-        req.push_str(&format!("Content-Length: {}\r\n", b.len()));
-        req.push_str("\r\n");
-        stream.write_all(req.as_bytes())?;
-        stream.write_all(b)?;
-    } else {
-        req.push_str("\r\n");
-        stream.write_all(req.as_bytes())?;
-    }
-
-    let mut reader = BufReader::new(stream);
-    let mut status_line = String::new();
-    reader.read_line(&mut status_line)?;
-    let status: u16 = status_line
-        .split_whitespace()
-        .nth(1)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
-
-    // Skip headers
-    loop {
-        let mut line = String::new();
-        reader.read_line(&mut line)?;
-        if line == "\r\n" || line == "\n" || line.is_empty() {
-            break;
-        }
-    }
-
-    let mut body = Vec::new();
-    reader.read_to_end(&mut body)?;
-    Ok(HttpResponse { status, body })
-}
-
-fn http_get(url: &str) -> Result<HttpResponse> {
-    http_exchange("GET", url, None)
-}
-
 fn post_completion(base: &str, body: &Value) -> Result<String> {
     let bytes = serde_json::to_vec(body)?;
-    let resp = http_exchange("POST", &format!("{base}/v1/chat/completions"), Some(&bytes))?;
-    if !(200..300).contains(&resp.status) {
-        let msg = String::from_utf8_lossy(&resp.body);
-        anyhow::bail!("HTTP {}: {msg}", resp.status);
-    }
-    let v: Value = serde_json::from_slice(&resp.body).context("parse chat response")?;
+    let body = http::exchange("POST", &format!("{base}/v1/chat/completions"), Some(&bytes))?
+        .ok_or_status()?;
+    let v: Value = serde_json::from_slice(&body).context("parse chat response")?;
     extract_message_content(&v)
 }
 
 fn print_streamed_completion(base: &str, body: &Value, out: &mut impl Write) -> Result<String> {
-    let (host, port, path) = parse_url(&format!("{base}/v1/chat/completions"))?;
     let bytes = serde_json::to_vec(body)?;
-    let mut stream = TcpStream::connect((host.as_str(), port))?;
-    stream.set_read_timeout(Some(Duration::from_secs(600)))?;
-    let header = format!(
-        "POST {path} HTTP/1.1\r\nHost: {host}:{port}\r\nConnection: close\r\n\
-         Content-Type: application/json\r\nContent-Length: {}\r\n\r\n",
-        bytes.len()
-    );
-    stream.write_all(header.as_bytes())?;
-    stream.write_all(&bytes)?;
-
-    let mut reader = BufReader::new(stream);
-    let mut status_line = String::new();
-    reader.read_line(&mut status_line)?;
-    let status: u16 = status_line
-        .split_whitespace()
-        .nth(1)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
-    loop {
-        let mut line = String::new();
-        reader.read_line(&mut line)?;
-        if line == "\r\n" || line == "\n" || line.is_empty() {
-            break;
-        }
-    }
+    let (status, mut reader) =
+        http::open("POST", &format!("{base}/v1/chat/completions"), Some(&bytes))?;
     if !(200..300).contains(&status) {
         let mut rest = String::new();
         reader.read_to_string(&mut rest)?;
@@ -477,6 +454,11 @@ fn print_streamed_completion(base: &str, body: &Value, out: &mut impl Write) -> 
 
     let mut render = StreamRender::default();
     let mut line = String::new();
+    // The id `/v1/cancel` takes, stated by the server on the first
+    // chunk. Captured rather than invented: a client cannot name a
+    // generation the server has not told it about.
+    let mut request_id: Option<String> = None;
+    let _generating = Generating::begin();
     while reader.read_line(&mut line)? > 0 {
         let trimmed = line.trim_end();
         if let Some(data) = trimmed.strip_prefix("data: ") {
@@ -484,13 +466,58 @@ fn print_streamed_completion(base: &str, body: &Value, out: &mut impl Write) -> 
                 break;
             }
             if let Ok(v) = serde_json::from_str::<Value>(data) {
+                if request_id.is_none() {
+                    request_id = stated_request_id(&v);
+                }
                 render.push_chunk(&v, out)?;
             }
+        }
+        // Checked between chunks, which is the only place it can be:
+        // the read above blocks, so an interrupt arriving mid-read is
+        // noticed when the next chunk lands or the socket closes.
+        if interrupted() {
+            render.finish(out)?;
+            match &request_id {
+                Some(id) => match cancel_generation(base, id) {
+                    Ok(()) => eprintln!("(interrupted; the server stopped generating)"),
+                    // Worth saying: the local stream is over either
+                    // way, but a server still decoding is burning the
+                    // machine for an answer nobody will read.
+                    Err(e) => eprintln!("(interrupted locally, but the cancel failed: {e:#})"),
+                },
+                // Before the first chunk there is no id to cancel with,
+                // so dropping the socket is all there is -- which the
+                // server treats as a disconnect and stops on.
+                None => eprintln!("(interrupted before the server named the request)"),
+            }
+            return Ok(render.assembled);
         }
         line.clear();
     }
     render.finish(out)?;
     Ok(render.assembled)
+}
+
+/// The request id a streamed chunk states, if this is the chunk that
+/// states it.
+fn stated_request_id(chunk: &Value) -> Option<String> {
+    chunk
+        .get("request_id")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
+fn cancel_generation(base: &str, request_id: &str) -> Result<()> {
+    let body = serde_json::to_vec(&json!({"request_id": request_id}))?;
+    let resp = http::exchange("POST", &format!("{base}/v1/cancel"), Some(&body))?;
+    if !(200..300).contains(&resp.status) {
+        anyhow::bail!(
+            "HTTP {}: {}",
+            resp.status,
+            String::from_utf8_lossy(&resp.body)
+        );
+    }
+    Ok(())
 }
 
 /// Turns one SSE chunk into terminal output, and keeps the answer.
@@ -770,5 +797,48 @@ mod tests {
         }));
         assert!(rendered.contains("4/64 pages of 256 tokens"), "{rendered}");
         assert!(rendered.contains("2.00 GiB (pss)"), "{rendered}");
+    }
+
+    /// A client cannot cancel a generation the server has not named,
+    /// so the id is taken from the stream rather than invented. Only
+    /// the FIRST chunk carries it, which is why it is captured once and
+    /// kept.
+    #[test]
+    fn the_request_id_is_read_from_the_chunk_that_states_it() {
+        let first = json!({
+            "id": "chatcmpl-1",
+            "request_id": "chatcmpl-1",
+            "choices": [{"delta": {"role": "assistant"}}],
+        });
+        assert_eq!(stated_request_id(&first).as_deref(), Some("chatcmpl-1"));
+
+        // Later chunks carry no `request_id`, and must not be mistaken
+        // for stating one -- `id` is the completion id, not the cancel
+        // handle.
+        let later = json!({"id": "chatcmpl-1", "choices": [{"delta": {"content": "hi"}}]});
+        assert_eq!(stated_request_id(&later), None);
+    }
+
+    /// The guard exists so the flag clears however a turn ends -- an
+    /// error return or a panic included. Left set, the next turn would
+    /// cancel itself the moment it started.
+    #[test]
+    fn a_finished_turn_stops_being_interruptible_however_it_ended() {
+        assert!(!GENERATING.load(std::sync::atomic::Ordering::SeqCst));
+        {
+            let _g = Generating::begin();
+            assert!(GENERATING.load(std::sync::atomic::Ordering::SeqCst));
+            INTERRUPTED.store(true, std::sync::atomic::Ordering::SeqCst);
+            assert!(interrupted());
+        }
+        assert!(
+            !GENERATING.load(std::sync::atomic::Ordering::SeqCst),
+            "the guard must clear the mark on drop"
+        );
+
+        // And beginning the next turn clears a flag the last one left,
+        // so it cannot cancel itself before its first chunk.
+        let _g = Generating::begin();
+        assert!(!interrupted());
     }
 }

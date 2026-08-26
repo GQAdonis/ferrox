@@ -31,7 +31,12 @@ is faster.
 - **MLA**: dense-lead and MoE-after-dense `deepseek2` / `mistral4`.
 - **Gemma-4**: dedicated engine (per-layer embeddings, shared KV,
   SWA/full), an SPM-style `gemma4` BPE tokenizer, and the `<|turn>` chat
-  wrap.
+  wrap. Dense only — the MoE router is ported and tested
+  (`ferrox_moe::route_gemma4_moe`) but the loader still expects
+  `ffn_gate.weight`, so a MoE Gemma-4 GGUF does not load yet.
+- **MiniMax-M3**: the block-sparse block selection is ported and tested
+  (`ferrox_core::block_sparse`); the engine itself is still fail-closed
+  — no loader, no 256-expert sigmoid MoE, no MTP draft heads.
 - **Also loadable**: yi, qwen2moe / qwen3moe (MiroThinker GGUFs, for
   example), Gemma-2, Phi-3, Llama-3.1, and GLM4 when the tensors are
   there. None of these are in the published suite.
@@ -132,6 +137,8 @@ returns a decision.
 |---|---|
 | `qstar` | how many of a step's expert-cache misses to fetch over PCIe vs. run on the CPU, from measured bandwidths |
 | `expert_cache` | which experts stay resident, as one global LRU over a flat `(layer, expert)` id space |
+| `expert_slots` | executes those residency plans against a bounded slot pool, and counts what crossed the link |
+| `dsv4` | per-layer KV tier sizing, and which compressor each layer runs (none / CSA / HCA) |
 | `radix` | which prefix of a prompt is already computed — page-keyed, node-sharing, with sliding-window and recurrent-state variants |
 | `pool` | how VRAM splits between the expert cache and KV, and how it is re-split live |
 | `placement` | which layers decode on the CPU when the expert banks exceed the host's page-locking budget |
@@ -151,6 +158,10 @@ buffered), the stop-string withhold rule, which `ferrox-server`'s
 request's `chat_template_kwargs`.
 The cache and placement policies are complete and tested but are not
 yet driving the decoder — see [`ROADMAP.md`](ROADMAP.md).
+`expert_slots` closes the gap between planning residency and performing
+it: a warm decode step provably copies zero bytes, on a host pool. No
+GPU backend implements its `SlotDevice` trait yet, so on a real card
+that property is written down and not yet measured.
 
 Ferrox Studio, the web UI in [`ui/`](../ui), is a separate app that
 talks to this API over HTTP. `ferrox-server` does not serve it.

@@ -513,6 +513,34 @@ impl ExpertCache {
         self.id_of_slot.iter().filter(|id| **id >= 0).count()
     }
 
+    /// Drop one slot's residency, returning what it used to hold.
+    ///
+    /// The map here is a record of copies the caller was *asked* to
+    /// make, and a copy can fail after the map has recorded it -- see
+    /// [`crate::expert_slots::SlotFault::Device`]. Without this the
+    /// next step reads that slot as a hit and multiplies whatever the
+    /// failed copy left in it; with it, the expert simply misses again
+    /// and is re-fetched.
+    ///
+    /// The slot becomes the *first* eviction candidate rather than
+    /// merely an empty one: its LRU stamp goes to the beginning of
+    /// time, so a pool under pressure spends it before evicting an
+    /// expert that is really there. Idempotent, and `None` for a slot
+    /// that already held nothing.
+    pub fn forget_slot(&mut self, slot: u32) -> Option<ExpertId> {
+        let id = *self.id_of_slot.get(slot as usize)?;
+        if id < 0 {
+            return None;
+        }
+        self.id_of_slot[slot as usize] = -1;
+        self.slot_for_id[id as usize] = -1;
+        self.usage[slot as usize] = i64::MIN;
+        Some(ExpertId {
+            layer: (id as usize / self.num_experts) as u32,
+            expert: (id as usize % self.num_experts) as u32,
+        })
+    }
+
     /// Forget everything. A rebuild is a cold start, so the counters go
     /// too -- carrying them across would skew every rate that is quoted
     /// per call.

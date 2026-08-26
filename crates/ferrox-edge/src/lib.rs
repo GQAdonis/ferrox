@@ -48,6 +48,7 @@ pub mod detokenize;
 pub mod dsv4;
 pub mod effort;
 pub mod expert_cache;
+pub mod expert_slots;
 pub mod footprint;
 pub mod maintenance;
 pub mod outbox;
@@ -81,7 +82,15 @@ pub use detokenize::{
     find_printable_text, floor_char_boundary, stop_prefix_holdback, DetokenizeManager,
     DetokenizeMsg, Detokenizer,
 };
-pub use expert_cache::{CopyPlan, EnsurePlan, ExpertCache, ExpertCacheStats, ExpertId};
+pub use expert_cache::{
+    BankEntry, CopyPlan, EnsurePlan, ExpertCache, ExpertCacheStats, ExpertId, GatherPlan,
+    PrefillPlan,
+};
+
+pub use expert_slots::{
+    Applied, ExpertRows, ExpertSlots, HostSlotMemory, SlotDevice, SlotFault, SlotGeometry,
+    SlotStats,
+};
 pub use parser::{
     ReasoningDelta, ReasoningFormat, ReasoningParser, ToolCall, ToolCallEvent, ToolCallFormat,
     ToolCallParser,

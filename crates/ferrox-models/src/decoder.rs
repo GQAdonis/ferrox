@@ -1534,19 +1534,17 @@ impl Decoder {
                 None
             }
         };
+        // `metal_embd_kind` is only `Some` when `embedding_scale` is
+        // `None` (the GPU gather has no scale op), so the empty vector
+        // this leaves behind is one the scale would not have touched.
         #[cfg(feature = "metal")]
         let mut hidden = if metal_embd_kind.is_some() {
             Vec::new()
         } else {
-            self.embedding.dequant_row(token_id)
+            self.embed_token(token_id)
         };
         #[cfg(not(feature = "metal"))]
-        let mut hidden = self.embedding.dequant_row(token_id);
-        if let Some(scale) = self.config.embedding_scale {
-            for v in hidden.iter_mut() {
-                *v *= scale;
-            }
-        }
+        let mut hidden = self.embed_token(token_id);
         #[cfg(feature = "cuda")]
         if cuda_gqa_enabled() {
             // Fixed capacity so ensure_layer_kv does not recreate (and
@@ -2492,10 +2490,7 @@ impl Decoder {
         #[cfg(not(feature = "metal"))]
         let final_normed = rms_norm(&hidden, &self.final_norm, self.config.rms_norm_eps);
 
-        let mut logits = self.output_head.apply(&final_normed);
-        if let Some(sc) = self.config.final_logit_softcap {
-            softcap_inplace(&mut logits, sc);
-        }
+        let logits = self.logits_from_normed(&final_normed);
         // Clear dense-stack activation TLS after lm_head (may have consumed it).
         // Keep MoE scratch buffers alive across tokens — `moe_decode_seed`
         // overwrites `h` each token; clearing here forced full realloc.
@@ -2536,7 +2531,7 @@ impl Decoder {
         let n_heads = self.config.n_heads;
         let n_kv_heads = self.config.n_kv_heads;
 
-        let mut hidden = self.embedding.dequant_row(token_id);
+        let mut hidden = self.embed_token(token_id);
         let residency = self.gpu_vram_budget_bytes.map(|b| self.residency_plan(b));
 
         for (l, ((layer, cache), store)) in self
@@ -2660,7 +2655,7 @@ impl Decoder {
         }
 
         let final_normed = rms_norm(&hidden, &self.final_norm, self.config.rms_norm_eps);
-        Ok(self.output_head.apply(&final_normed))
+        Ok(self.logits_from_normed(&final_normed))
     }
 
     /// The shared expert store's live counters, when this model runs
@@ -3405,6 +3400,47 @@ impl Decoder {
         (self.logits_from_flat_hidden(flat, batch_size), hiddens)
     }
 
+    /// One token's embedding row, scaled if this checkpoint scales it.
+    ///
+    /// `embedding_scale` is `sqrt(hidden_dim)` on the Gemma family and
+    /// `None` everywhere else, so a path that dequantizes the row and
+    /// forgets the multiply is wrong on exactly one family and right on
+    /// every other -- which is why it survived as a drift for as long as
+    /// it did. The lookup and the scale live in one function so a caller
+    /// cannot obtain the row without it.
+    fn embed_token(&self, token_id: usize) -> Vec<f32> {
+        let mut row = self.embedding.dequant_row(token_id);
+        if let Some(scale) = self.config.embedding_scale {
+            for v in row.iter_mut() {
+                *v *= scale;
+            }
+        }
+        row
+    }
+
+    /// [`Self::embed_token`] for a whole batch: `[batch, hidden]`,
+    /// flattened row-major.
+    fn embed_tokens(&self, tokens: &[usize]) -> Vec<f32> {
+        tokens.iter().flat_map(|&t| self.embed_token(t)).collect()
+    }
+
+    /// The `output_head` half of a single-position forward: project the
+    /// final-normed hidden state and softcap the result if this
+    /// checkpoint softcaps it.
+    ///
+    /// The counterpart to [`Self::logits_from_flat_hidden`] for the
+    /// one-row case, and held here for the same reason: Gemma-2 caps its
+    /// final logits at 30.0, so a path that projects and returns without
+    /// capping produces a different distribution -- not an error, just a
+    /// quietly wrong one.
+    fn logits_from_normed(&self, final_normed: &[f32]) -> Vec<f32> {
+        let mut logits = self.output_head.apply(final_normed);
+        if let Some(sc) = self.config.final_logit_softcap {
+            softcap_inplace(&mut logits, sc);
+        }
+        logits
+    }
+
     /// The `output_head` half of [`Self::forward_batch`], split out so
     /// the hidden-state-returning variant cannot drift from it (a
     /// second copy of the softcap would be a silent quality bug).
@@ -3449,11 +3485,7 @@ impl Decoder {
         let Some(last) = hiddens.last() else {
             return Vec::new();
         };
-        let mut logits = self.output_head.apply(last);
-        if let Some(sc) = self.config.final_logit_softcap {
-            softcap_inplace(&mut logits, sc);
-        }
-        logits
+        self.logits_from_normed(last)
     }
 
     /// Like [`Self::forward_batch`], but returns final RMS-normed hidden
@@ -3477,15 +3509,7 @@ impl Decoder {
         let n_kv_heads = self.config.n_kv_heads;
 
         // [batch, hidden], flattened row-major.
-        let mut hidden_batch: Vec<f32> = tokens
-            .iter()
-            .flat_map(|&t| self.embedding.dequant_row(t))
-            .collect();
-        if let Some(scale) = self.config.embedding_scale {
-            for v in hidden_batch.iter_mut() {
-                *v *= scale;
-            }
-        }
+        let mut hidden_batch: Vec<f32> = self.embed_tokens(tokens);
 
         #[cfg(feature = "metal")]
         let use_metal_attn = ferrox_core::metal_dense_enabled()
@@ -4249,15 +4273,7 @@ impl Decoder {
         let n_kv_heads = self.config.n_kv_heads;
 
         // [batch, hidden], flattened row-major.
-        let mut hidden_batch: Vec<f32> = tokens
-            .iter()
-            .flat_map(|&t| self.embedding.dequant_row(t))
-            .collect();
-        if let Some(scale) = self.config.embedding_scale {
-            for v in hidden_batch.iter_mut() {
-                *v *= scale;
-            }
-        }
+        let mut hidden_batch: Vec<f32> = self.embed_tokens(tokens);
 
         let residency = self.gpu_vram_budget_bytes.map(|b| self.residency_plan(b));
 
@@ -4875,6 +4891,50 @@ mod tests {
         };
 
         for cfg in [windowed(), softcapped(), both(), alternating()] {
+            paged_matches_contiguous(cfg);
+        }
+    }
+
+    /// The two rules that live OUTSIDE the layer loop, which the arm
+    /// test above cannot reach.
+    ///
+    /// The paged path had drifted from the contiguous one at both ends
+    /// of the stack, and neither drift was visible to any existing test
+    /// because `tiny_test_config` sets neither field:
+    ///
+    /// - it called `embedding.dequant_row` directly instead of scaling
+    ///   the row by `embedding_scale`, so every Gemma token entered the
+    ///   stack `sqrt(hidden_dim)` times too small;
+    /// - it returned `output_head.apply(..)` raw instead of applying
+    ///   `final_logit_softcap`, so Gemma-2's 30.0 cap never ran.
+    ///
+    /// Both produce a plausible distribution rather than an error, which
+    /// is the whole reason to pin them: a wrong answer that still looks
+    /// like an answer is what a parity test is for. Values here are
+    /// chosen so each one actually bites -- a scale of 1.0 or a cap far
+    /// above the logit range would let this pass either way.
+    #[test]
+    fn the_paged_path_scales_embeddings_and_softcaps_logits_like_the_contiguous_one() {
+        let scaled = || {
+            let mut cfg = tiny_test_config();
+            cfg.embedding_scale = Some(7.5);
+            cfg
+        };
+        let capped = || {
+            let mut cfg = tiny_test_config();
+            // Small enough that `sc * tanh(x / sc)` really compresses at
+            // this model's logit magnitudes, on the same reasoning as
+            // the attention softcap above.
+            cfg.final_logit_softcap = Some(0.05);
+            cfg
+        };
+        let both = || {
+            let mut cfg = scaled();
+            cfg.final_logit_softcap = Some(0.05);
+            cfg
+        };
+
+        for cfg in [scaled(), capped(), both()] {
             paged_matches_contiguous(cfg);
         }
     }

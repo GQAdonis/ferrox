@@ -1637,3 +1637,229 @@ mod tests {
         }
     }
 }
+
+/// Gemma-4's MoE router: how a hidden state becomes routing weights.
+///
+/// Four things differ from every other family here, and three of them
+/// change the numbers without changing any shape -- so getting one
+/// wrong produces a model that is fluent and wrong, with nothing to
+/// catch it.
+///
+/// 1. The router input is normalized by a **weightless** RMSNorm. No
+///    learned per-channel scale, unlike every other norm in the stack.
+///    Reusing a weighted `rms_norm` here silently applies whatever
+///    weight vector happened to be at hand.
+/// 2. The normalized state is multiplied by a learned `router_scale`
+///    vector, **and** by `hidden^-0.5`. The second factor is a
+///    function of the width alone, so it is easy to omit and impossible
+///    to notice: it rescales every logit by the same constant, which
+///    changes the softmax temperature over the selected experts and
+///    therefore the mixing weights, while leaving the top-k selection
+///    itself identical.
+/// 3. Selection is by **raw logit**, and the softmax runs over just the
+///    selected `k`. That is not the same as softmaxing all experts and
+///    slicing (see [`route_top_k_softmax`], where the surviving weights
+///    sum to less than one); here they sum to exactly one.
+/// 4. Each selected weight is then multiplied by
+///    `per_expert_scale[expert_id]` -- a per-expert rescale applied to
+///    the ROUTING WEIGHT rather than to the expert's output. No other
+///    family here has it, and after it the weights no longer sum to
+///    one, which is correct and must not be "fixed" by renormalizing.
+///
+/// `hidden` is the router's input; `router_weight` is the router
+/// projection's output for it (one logit per expert, already computed
+/// by the caller from the scaled state -- see
+/// [`gemma4_router_logits`]).
+pub fn route_gemma4_moe(logits: &[f32], k: usize, per_expert_scale: &[f32]) -> RoutingDecision {
+    let mut idx: Vec<usize> = (0..logits.len()).collect();
+    // Top-k by RAW logit, ties toward the lower expert id so a cached
+    // prefix cannot disagree with the run that produced it.
+    idx.sort_unstable_by(|&a, &b| logits[b].total_cmp(&logits[a]).then(a.cmp(&b)));
+    let top = &idx[..k.min(idx.len())];
+
+    let selected: Vec<f32> = top.iter().map(|&i| logits[i]).collect();
+    let max = selected.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let exps: Vec<f32> = selected.iter().map(|&l| (l - max).exp()).collect();
+    let sum: f32 = exps.iter().sum();
+    let weights: Vec<f32> = if sum > 0.0 {
+        top.iter()
+            .zip(exps.iter())
+            .map(|(&e, &x)| {
+                // The per-expert scale lands on the weight, after the
+                // softmax. The weights deliberately no longer sum to
+                // one afterwards.
+                (x / sum) * per_expert_scale.get(e).copied().unwrap_or(1.0)
+            })
+            .collect()
+    } else {
+        exps
+    };
+
+    RoutingDecision {
+        expert_ids: top.to_vec(),
+        weights,
+    }
+}
+
+/// The router logits Gemma-4 feeds to [`route_gemma4_moe`]: a
+/// weightless RMSNorm of the hidden state, scaled by `router_scale` and
+/// by `hidden^-0.5`, then projected.
+///
+/// Split from the routing itself so the two unusual scalings are
+/// testable without a projection matrix -- see [`route_gemma4_moe`]'s
+/// docs on why the `hidden^-0.5` factor is the easy one to lose.
+pub fn gemma4_router_logits(
+    hidden: &[f32],
+    router_scale: &[f32],
+    router_proj: &WeightMatrix,
+    eps: f32,
+) -> Vec<f32> {
+    debug_assert_eq!(hidden.len(), router_scale.len());
+    let n = hidden.len() as f32;
+    // Weightless RMSNorm: no learned per-channel term.
+    let mean_sq = hidden.iter().map(|v| v * v).sum::<f32>() / n;
+    let inv_rms = 1.0 / (mean_sq + eps).sqrt();
+    let width_scale = n.powf(-0.5);
+    let scaled: Vec<f32> = hidden
+        .iter()
+        .zip(router_scale.iter())
+        .map(|(&v, &s)| v * inv_rms * s * width_scale)
+        .collect();
+    router_proj.apply(&scaled)
+}
+
+#[cfg(test)]
+mod gemma4_router_tests {
+    use super::*;
+
+    /// The per-expert scale lands on the routing WEIGHT, after the
+    /// softmax, and the weights deliberately stop summing to one. A
+    /// renormalization "fixing" that would cancel the scale exactly,
+    /// which is the whole failure this pins: no shape changes, and the
+    /// model stays fluent.
+    #[test]
+    fn the_per_expert_scale_multiplies_the_weight_and_breaks_the_sum_to_one() {
+        let logits = vec![3.0, 1.0, 2.0, 0.0];
+        let flat = route_gemma4_moe(&logits, 2, &[1.0; 4]);
+        let sum: f32 = flat.weights.iter().sum();
+        assert!(
+            (sum - 1.0).abs() < 1e-6,
+            "with unit scales, k weights sum to one"
+        );
+
+        let scaled = route_gemma4_moe(&logits, 2, &[2.0, 1.0, 0.5, 1.0]);
+        assert_eq!(scaled.expert_ids, flat.expert_ids, "selection is unchanged");
+        // Experts 0 and 2 were selected; their scales are 2.0 and 0.5.
+        assert!((scaled.weights[0] - flat.weights[0] * 2.0).abs() < 1e-6);
+        assert!((scaled.weights[1] - flat.weights[1] * 0.5).abs() < 1e-6);
+        let sum: f32 = scaled.weights.iter().sum();
+        assert!(
+            (sum - 1.0).abs() > 1e-3,
+            "the scaled weights must NOT be renormalized back to one, got {sum}"
+        );
+    }
+
+    /// Softmax over just the selected k, not a slice of the full
+    /// distribution. The two pick the same experts and weight them
+    /// differently, which is exactly the kind of difference that
+    /// produces a fluent wrong model.
+    #[test]
+    fn the_softmax_runs_over_the_selected_experts_only() {
+        let logits = vec![3.0, 1.0, 2.0, 0.0];
+        let gemma = route_gemma4_moe(&logits, 2, &[1.0; 4]);
+        let sliced = route_top_k_softmax(&logits, 2, false);
+        assert_eq!(gemma.expert_ids, sliced.expert_ids);
+        let gemma_sum: f32 = gemma.weights.iter().sum();
+        let sliced_sum: f32 = sliced.weights.iter().sum();
+        assert!((gemma_sum - 1.0).abs() < 1e-6);
+        assert!(
+            sliced_sum < 0.99,
+            "a slice of the full softmax sums to less than one, got {sliced_sum}"
+        );
+    }
+
+    /// Selection is by raw logit, so the largest logits win regardless
+    /// of the per-expert scales -- the scale rescales a weight, it does
+    /// not buy an expert its way into the selection.
+    #[test]
+    fn selection_is_by_raw_logit_and_the_scale_cannot_change_it() {
+        let logits = vec![3.0, 1.0, 2.0, 0.0];
+        let huge = route_gemma4_moe(&logits, 2, &[1.0, 1000.0, 1.0, 1000.0]);
+        assert_eq!(
+            huge.expert_ids,
+            vec![0, 2],
+            "expert 1's scale must not select it"
+        );
+    }
+
+    /// The width factor is a function of the hidden size alone, so it
+    /// leaves the selection identical and changes the softmax
+    /// temperature -- which is what makes omitting it invisible.
+    #[test]
+    fn the_width_scaling_changes_the_weights_but_not_the_selection() {
+        let hidden = vec![1.0, -2.0, 0.5, 3.0];
+        let router_scale = vec![1.0; 4];
+        let proj = WeightMatrix::F32(ferrox_core::tensor::Tensor::new(
+            vec![
+                1.0, 0.0, 0.0, 0.0, //
+                0.0, 1.0, 0.0, 0.0, //
+                0.0, 0.0, 1.0, 0.0, //
+                0.0, 0.0, 0.0, 1.0,
+            ],
+            vec![4, 4],
+        ));
+        let with_width = gemma4_router_logits(&hidden, &router_scale, &proj, 1e-6);
+
+        // The same thing without the hidden^-0.5 factor: every logit is
+        // larger by exactly sqrt(hidden).
+        let n = hidden.len() as f32;
+        let without: Vec<f32> = with_width.iter().map(|v| v * n.sqrt()).collect();
+
+        let a = route_gemma4_moe(&with_width, 2, &[1.0; 4]);
+        let b = route_gemma4_moe(&without, 2, &[1.0; 4]);
+        assert_eq!(a.expert_ids, b.expert_ids, "the selection is unaffected");
+        assert!(
+            a.weights
+                .iter()
+                .zip(b.weights.iter())
+                .any(|(x, y)| (x - y).abs() > 1e-4),
+            "but the mixing weights are not: {:?} vs {:?}",
+            a.weights,
+            b.weights
+        );
+    }
+
+    /// The router's norm is WEIGHTLESS. Feeding a non-unit scale vector
+    /// through must change the logits, which is what proves the norm
+    /// itself is not quietly applying one.
+    #[test]
+    fn the_router_norm_carries_no_learned_weight_of_its_own() {
+        let hidden = vec![1.0, -2.0, 0.5, 3.0];
+        let proj = WeightMatrix::F32(ferrox_core::tensor::Tensor::new(
+            (0..16)
+                .map(|i| if i % 5 == 0 { 1.0 } else { 0.0 })
+                .collect(),
+            vec![4, 4],
+        ));
+        let unit = gemma4_router_logits(&hidden, &[1.0; 4], &proj, 1e-6);
+        let scaled = gemma4_router_logits(&hidden, &[2.0; 4], &proj, 1e-6);
+        for (u, s) in unit.iter().zip(scaled.iter()) {
+            assert!(
+                (s - u * 2.0).abs() < 1e-5,
+                "router_scale is the ONLY learned scale on this path: {u} -> {s}"
+            );
+        }
+    }
+
+    /// Ties break toward the lower expert id, deterministically.
+    #[test]
+    fn ties_break_toward_the_lower_expert_id() {
+        let logits = vec![1.0, 1.0, 1.0, 1.0];
+        for _ in 0..8 {
+            assert_eq!(
+                route_gemma4_moe(&logits, 2, &[1.0; 4]).expert_ids,
+                vec![0, 1]
+            );
+        }
+    }
+}

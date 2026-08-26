@@ -19,7 +19,7 @@ use ferrox_core::attention::{
     apply_rope_with_freq_factors, causal_gqa_attention_prefill_shared_kv_windowed,
     causal_gqa_attention_softcap, causal_gqa_attention_windowed_softcap,
 };
-use ferrox_core::cache::{KvCache, PagedKvCache, PagedKvStore, PagedStoreExhausted};
+use ferrox_core::cache::{KvCache, PagedKvCache, PagedStoreExhausted, SharedPagedKv};
 use ferrox_core::matmul::{geglu, rms_norm, rms_norm_per_head, softcap_inplace};
 use rayon::prelude::*;
 
@@ -2522,10 +2522,37 @@ impl Decoder {
         token_id: usize,
         pos: usize,
         kv_caches: &mut [PagedKvCache],
-        stores: &mut [PagedKvStore],
+        stores: &SharedPagedKv,
     ) -> Result<Vec<f32>, PagedStoreExhausted> {
         assert_eq!(kv_caches.len(), self.layers.len());
-        assert_eq!(stores.len(), self.layers.len());
+        assert_eq!(stores.layer_count(), self.layers.len());
+        // All layers advance or none do. Pushing per layer with `?` and
+        // failing at layer 3 of 4 leaves layers 0..2 holding a position
+        // the rest do not, and nothing downstream reports it: the next
+        // step simply attends over a shorter history in the tail
+        // layers. Reserving one position everywhere first turns that
+        // into a clean refusal.
+        //
+        // The guards span the check AND the push for the same reason
+        // the prefill path holds them: otherwise another request takes
+        // the blocks in between.
+        {
+            let mut guards = stores.write_all();
+            for (cache, store) in kv_caches.iter().zip(guards.iter()) {
+                if cache.blocks_needed_for(store, 1) > store.free_block_count() {
+                    return Err(PagedStoreExhausted);
+                }
+            }
+            // Reserve by taking the blocks now, so the per-layer pushes
+            // below cannot fail. `PagedKvCache::reserve` grows the block
+            // table without advancing `seq_len`, leaving each push a
+            // pure write into a block this sequence already owns.
+            for (cache, store) in kv_caches.iter_mut().zip(guards.iter_mut()) {
+                cache
+                    .reserve(store, 1)
+                    .expect("checked against free_block_count under this same guard");
+            }
+        }
         let hidden_dim = self.config.hidden_dim;
         let head_dim = self.config.head_dim;
         let n_heads = self.config.n_heads;
@@ -2534,13 +2561,7 @@ impl Decoder {
         let mut hidden = self.embed_token(token_id);
         let residency = self.gpu_vram_budget_bytes.map(|b| self.residency_plan(b));
 
-        for (l, ((layer, cache), store)) in self
-            .layers
-            .iter()
-            .zip(kv_caches.iter_mut())
-            .zip(stores.iter_mut())
-            .enumerate()
-        {
+        for (l, (layer, cache)) in self.layers.iter().zip(kv_caches.iter_mut()).enumerate() {
             // --- attention block ---
             let normed = rms_norm(&hidden, &layer.attn.norm_weight, self.config.rms_norm_eps);
 
@@ -2605,7 +2626,16 @@ impl Decoder {
                 self.apply_rope_head_layer(&mut k[h * head_dim..(h + 1) * head_dim], pos, l);
             }
 
-            cache.push(store, &k, &v)?;
+            // Write guard for the push alone; see `SharedPagedKv`.
+            // Holding it across attention below would serialise the
+            // expensive half and give back a global lock.
+            {
+                let mut store = stores.write(l);
+                cache
+                    .push(&mut store, &k, &v)
+                    .expect("reserved for every layer before the stack ran");
+            }
+            let store = stores.read(l);
 
             // Mirrors the contiguous dispatch above arm for arm. It has
             // to: the premise of paged KV is that it changes where rows
@@ -2618,7 +2648,7 @@ impl Decoder {
             let window = self.config.layer_sliding_window(l);
             let attn_out = ferrox_core::causal_gqa_attention_paged_sinks(
                 &q,
-                store,
+                &store,
                 cache.block_table(),
                 n_heads,
                 n_kv_heads,
@@ -3486,6 +3516,107 @@ impl Decoder {
             return Vec::new();
         };
         self.logits_from_normed(last)
+    }
+
+    /// [`Self::forward_batch_last`] over paged KV: the prefill twin of
+    /// [`Self::forward_token_paged`].
+    ///
+    /// # Why this gathers instead of paging the kernel
+    ///
+    /// `forward_hidden_batch`'s fast arm hands `cache.k` / `cache.v` to
+    /// `causal_gqa_attention_prefill_shared_kv_windowed`, which is Rayon
+    /// over `[query-block x head]` against one flat KV buffer. That
+    /// blocking is why CPU prefill is not the per-query path, and a
+    /// block table cannot be handed to it as a slice.
+    ///
+    /// The alternative was a second blocked kernel that reads through
+    /// the table. This file has just finished paying for what a second
+    /// copy of a rule costs: the paged decode path silently lost the
+    /// window arm, the sink term, the attention softcap, the embedding
+    /// scale and the final logit softcap, one at a time, because it was
+    /// a copy. A prefill kernel is a much larger surface to keep in
+    /// step than any of those. So the pages are materialised, the ONE
+    /// prefill implementation every other path uses runs against them,
+    /// and the new rows go back.
+    ///
+    /// Bit-identity is therefore by construction rather than by
+    /// agreement between two kernels: this calls the same function with
+    /// the same values. What the tests pin is that the gather and the
+    /// scatter are faithful, not that two implementations of attention
+    /// happen to match.
+    ///
+    /// The cost is one KV-sized copy per layer per call, against the
+    /// matmuls that dominate prefill. Decode is untouched: it still
+    /// reads through the block table and copies nothing, which is where
+    /// page sharing pays.
+    ///
+    /// # Failure is checked before anything is written
+    ///
+    /// Every layer's blocks are reserved up front, so a store too small
+    /// for the batch refuses with `PagedStoreExhausted` having mutated
+    /// no layer. A partial append would leave some layers longer than
+    /// others, and no caller can recover from that.
+    pub fn forward_batch_last_paged(
+        &self,
+        tokens: &[usize],
+        start_pos: usize,
+        kv_caches: &mut [PagedKvCache],
+        stores: &SharedPagedKv,
+    ) -> Result<Vec<f32>, PagedStoreExhausted> {
+        assert_eq!(kv_caches.len(), self.layers.len());
+        assert_eq!(stores.layer_count(), self.layers.len());
+        if tokens.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Reserve every layer up front, under guards spanning the check
+        // AND the take. Each layer has its own store, so one having
+        // room says nothing about the next -- and under concurrency,
+        // checking and then taking as separate steps lets another
+        // request slip in between and leave this one half-written.
+        //
+        // Reserving before the forward rather than after also means a
+        // request that cannot fit is refused before it burns a prefill.
+        {
+            let mut guards = stores.write_all();
+            for (cache, store) in kv_caches.iter().zip(guards.iter()) {
+                if cache.blocks_needed_for(store, tokens.len()) > store.free_block_count() {
+                    return Err(PagedStoreExhausted);
+                }
+            }
+            for (cache, store) in kv_caches.iter_mut().zip(guards.iter_mut()) {
+                cache
+                    .reserve(store, tokens.len())
+                    .expect("checked against free_block_count under this same guard");
+            }
+        }
+
+        // Gather under read guards, one layer at a time: the forward
+        // below is the expensive part and holds nothing.
+        let mut scratch: Vec<KvCache> = kv_caches
+            .iter()
+            .enumerate()
+            .map(|(l, cache)| cache.to_contiguous(&stores.read(l)))
+            .collect();
+
+        let logits = self.forward_batch_last(tokens, start_pos, &mut scratch);
+
+        // Scatter into blocks this sequence already owns. Nothing here
+        // can fail, which is the point of reserving above.
+        for (l, (cache, gathered)) in kv_caches.iter_mut().zip(&scratch).enumerate() {
+            let mut store = stores.write(l);
+            let width = store.n_kv_heads() * store.head_dim();
+            let base = cache.seq_len() * width;
+            cache
+                .append_contiguous(
+                    &mut store,
+                    &gathered.k[base..],
+                    &gathered.v[base..],
+                    tokens.len(),
+                )
+                .expect("blocks reserved above are still held by this sequence");
+        }
+        Ok(logits)
     }
 
     /// Like [`Self::forward_batch`], but returns final RMS-normed hidden
@@ -4637,6 +4768,7 @@ mod partial_rotary_tests {
 mod tests {
     use super::*;
     use crate::config::glm_5_2;
+    use ferrox_core::cache::PagedKvStore;
 
     /// Small config used purely to keep the test fast: same
     /// architecture *shape* (GQA ratio, MoE topology) as GLM-5.2, but
@@ -4928,6 +5060,353 @@ mod tests {
         }
     }
 
+    /// Paged prefill must agree with contiguous prefill, and must leave
+    /// the KV in a state a paged DECODE can continue from.
+    ///
+    /// The second half is the one worth having. `forward_batch_last`
+    /// returns only the last row's logits, so a gather/scatter that
+    /// mangled the KV -- wrote the rows in the wrong order, dropped the
+    /// part-full tail block, mis-sized a copy -- could still return the
+    /// right logits for THIS call and only surface on the next token.
+    /// Decoding four more tokens after the prefill is what makes the
+    /// stored KV observable, so both paths are compared over the whole
+    /// continuation rather than at the seam.
+    ///
+    /// A block size of 2 against a 5-token prompt is deliberate: it
+    /// leaves the tail block part-full, which is the case
+    /// `blocks_needed_for` exists for and the one a `n / block_size`
+    /// reservation would get wrong.
+    fn paged_prefill_matches_contiguous(config: ModelConfig) {
+        let n_layers = 2;
+        let decoder = Decoder::new_random_small(config, n_layers, 10);
+        let prompt = [3usize, 1, 4, 1, 5];
+        let continuation = [9usize, 2, 6, 5];
+
+        let mut caches: Vec<KvCache> = (0..n_layers)
+            .map(|_| KvCache::new(decoder.config.n_kv_heads, decoder.config.head_dim))
+            .collect();
+        let mut plain = vec![decoder.forward_batch_last(&prompt, 0, &mut caches)];
+        for (i, &tok) in continuation.iter().enumerate() {
+            plain.push(decoder.forward_token(tok, prompt.len() + i, &mut caches));
+        }
+
+        let mut paged_caches: Vec<PagedKvCache> =
+            (0..n_layers).map(|_| PagedKvCache::new()).collect();
+        let stores = SharedPagedKv::from_stores(
+            (0..n_layers)
+                .map(|_| {
+                    PagedKvStore::new(
+                        /* block_size = */ 2,
+                        /* total_blocks = */ 16,
+                        decoder.config.n_kv_heads,
+                        decoder.config.head_dim,
+                    )
+                })
+                .collect(),
+        );
+        let mut paged = vec![decoder
+            .forward_batch_last_paged(&prompt, 0, &mut paged_caches, &stores)
+            .expect("store sized generously, must not exhaust")];
+        for (i, &tok) in continuation.iter().enumerate() {
+            paged.push(
+                decoder
+                    .forward_token_paged(tok, prompt.len() + i, &mut paged_caches, &stores)
+                    .expect("store sized generously, must not exhaust"),
+            );
+        }
+
+        assert_eq!(
+            paged_caches[0].seq_len(),
+            prompt.len() + continuation.len(),
+            "paged prefill must advance seq_len by exactly the batch size"
+        );
+        assert_eq!(plain.len(), paged.len());
+        for (step, (a, b)) in plain.iter().zip(paged.iter()).enumerate() {
+            assert_eq!(a.len(), b.len(), "step {step}: logit count");
+            for (x, y) in a.iter().zip(b.iter()) {
+                assert_eq!(
+                    x.to_bits(),
+                    y.to_bits(),
+                    "step {step}: paged prefill + decode must be bit-identical to contiguous"
+                );
+            }
+        }
+    }
+
+    /// Every arm again, this time through the prefill entry point. The
+    /// gather is shared, but the kernel the gathered buffer reaches is
+    /// the BLOCKED prefill one rather than the per-query decode one, so
+    /// arm coverage here is not implied by the decode tests above.
+    #[test]
+    fn paged_prefill_is_bit_identical_across_every_arm() {
+        let windowed = || {
+            let mut cfg = tiny_test_config();
+            cfg.sliding_window = Some(2);
+            cfg.swa_pattern = None;
+            cfg
+        };
+        let scaled_and_capped = || {
+            let mut cfg = tiny_test_config();
+            cfg.embedding_scale = Some(7.5);
+            cfg.final_logit_softcap = Some(0.05);
+            cfg.attn_logit_softcap = Some(0.05);
+            cfg
+        };
+        let alternating = || {
+            let mut cfg = tiny_test_config();
+            cfg.sliding_window = Some(2);
+            cfg.swa_pattern = Some(2);
+            cfg
+        };
+
+        for cfg in [
+            tiny_test_config(),
+            windowed(),
+            scaled_and_capped(),
+            alternating(),
+        ] {
+            paged_prefill_matches_contiguous(cfg);
+        }
+    }
+
+    /// A prefill the stores cannot hold refuses having written NOTHING
+    /// -- checked on the case that actually needs the up-front loop.
+    ///
+    /// Each layer owns its own store, so layer 0 having room says
+    /// nothing about layer 1. `append_contiguous` already refuses
+    /// rather than half-writing a single layer, so a test whose layers
+    /// are sized alike passes with the cross-layer reservation deleted
+    /// -- it would be asserting a property it never exercises. Here
+    /// layer 0 has room for the whole prompt and layer 1 does not, so
+    /// without the up-front check layer 0 is written, layer 1 refuses,
+    /// and the sequence ends up with its layers at DIFFERENT lengths.
+    /// No caller can recover from that, and nothing downstream would
+    /// report it: the next decode step simply attends over a shorter
+    /// history in one layer than the others.
+    ///
+    /// Verified by deleting the reservation loop and watching this fail
+    /// on `layer 1 must be untouched`.
+    /// Three requests sharing one set of per-layer stores must get
+    /// exactly what they would get alone.
+    ///
+    /// This is the property the RwLock exists for, and it cannot be
+    /// asserted single-threaded. Every request writes only blocks it
+    /// owns, so sharing changes where rows live and nothing else --
+    /// bit-identical, not close. A store that let one request's rows
+    /// land in another's blocks shows up here and nowhere else.
+    #[test]
+    fn concurrent_decodes_against_one_shared_store_match_running_them_alone() {
+        use std::sync::Arc;
+
+        let decoder = Arc::new(Decoder::new_random_small(tiny_test_config(), 2, 10));
+        let prompts: [&[usize]; 3] = [&[3, 1, 4], &[1, 5, 9], &[2, 6, 5]];
+        let continuation = [7usize, 8, 3];
+
+        // Each request run alone, against its own store, is the answer
+        // sharing must not change.
+        let solo: Vec<Vec<Vec<f32>>> = prompts
+            .iter()
+            .map(|prompt| {
+                let stores = SharedPagedKv::new(
+                    2,
+                    4,
+                    32,
+                    decoder.config.n_kv_heads,
+                    decoder.config.head_dim,
+                );
+                let mut caches: Vec<PagedKvCache> = (0..2).map(|_| PagedKvCache::new()).collect();
+                run_one(&decoder, prompt, &continuation, &mut caches, &stores)
+            })
+            .collect();
+
+        // The same three, concurrently, sharing ONE set of per-layer
+        // stores. Every request writes only blocks it owns, so the
+        // answers must be identical -- not close, identical. A store
+        // that let one request's rows land in another's blocks would
+        // show up here and nowhere else.
+        let shared = Arc::new(SharedPagedKv::new(
+            2,
+            4,
+            96,
+            decoder.config.n_kv_heads,
+            decoder.config.head_dim,
+        ));
+        let together: Vec<Vec<Vec<f32>>> = std::thread::scope(|scope| {
+            let handles: Vec<_> = prompts
+                .iter()
+                .map(|prompt| {
+                    let decoder = Arc::clone(&decoder);
+                    let shared = Arc::clone(&shared);
+                    scope.spawn(move || {
+                        let mut caches: Vec<PagedKvCache> =
+                            (0..2).map(|_| PagedKvCache::new()).collect();
+                        run_one(&decoder, prompt, &continuation, &mut caches, &shared)
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+
+        for (r, (alone, concurrent)) in solo.iter().zip(together.iter()).enumerate() {
+            assert_eq!(alone.len(), concurrent.len(), "request {r}: step count");
+            for (step, (a, b)) in alone.iter().zip(concurrent.iter()).enumerate() {
+                for (x, y) in a.iter().zip(b.iter()) {
+                    assert_eq!(
+                        x.to_bits(),
+                        y.to_bits(),
+                        "request {r} step {step}: sharing a store changed the answer"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Prefill then decode, returning every step's logits.
+    fn run_one(
+        decoder: &Decoder,
+        prompt: &[usize],
+        continuation: &[usize],
+        caches: &mut [PagedKvCache],
+        stores: &SharedPagedKv,
+    ) -> Vec<Vec<f32>> {
+        let mut out = vec![decoder
+            .forward_batch_last_paged(prompt, 0, caches, stores)
+            .expect("sized generously")];
+        for (i, &tok) in continuation.iter().enumerate() {
+            out.push(
+                decoder
+                    .forward_token_paged(tok, prompt.len() + i, caches, stores)
+                    .expect("sized generously"),
+            );
+        }
+        out
+    }
+
+    /// A decode step the stores cannot hold advances NO layer.
+    ///
+    /// This was a real defect until the reservation moved into
+    /// `forward_token_paged`: it pushed per layer with `?`, so a store
+    /// exhausting at layer 1 of 2 left layer 0 holding a position layer
+    /// 1 did not. Nothing downstream reports that -- the next step just
+    /// attends over a shorter history in the tail layers -- and the
+    /// prefill path had the guard while decode never did.
+    ///
+    /// Layer 0 is given room and layer 1 none, so the bug is reachable:
+    /// with the reservation removed, layer 0 advances and layer 1
+    /// refuses.
+    #[test]
+    fn a_decode_step_the_stores_cannot_hold_advances_no_layer() {
+        let decoder = Decoder::new_random_small(tiny_test_config(), 2, 10);
+        let mut caches: Vec<PagedKvCache> = (0..2).map(|_| PagedKvCache::new()).collect();
+        // Block size 1 so "one more position" always needs a block.
+        // Layer 0 gets two, layer 1 exactly one: the prompt fills layer
+        // 1 completely, so the decode step below cannot fit there.
+        let stores = SharedPagedKv::from_stores(
+            [2usize, 1]
+                .into_iter()
+                .map(|blocks| {
+                    PagedKvStore::new(
+                        1,
+                        blocks,
+                        decoder.config.n_kv_heads,
+                        decoder.config.head_dim,
+                    )
+                })
+                .collect(),
+        );
+
+        decoder
+            .forward_batch_last_paged(&[1usize], 0, &mut caches, &stores)
+            .expect("one position fits in both layers");
+        assert_eq!(caches[0].seq_len(), 1);
+        assert_eq!(caches[1].seq_len(), 1);
+
+        let result = decoder.forward_token_paged(2, 1, &mut caches, &stores);
+        assert!(result.is_err(), "layer 1 has no block left");
+        assert_eq!(
+            caches[0].seq_len(),
+            1,
+            "layer 0 must not advance past a layer that could not"
+        );
+        assert_eq!(caches[1].seq_len(), 1);
+    }
+
+    #[test]
+    fn a_prefill_the_stores_cannot_hold_refuses_before_writing_any_layer() {
+        let decoder = Decoder::new_random_small(tiny_test_config(), 2, 10);
+        let prompt = [1usize, 2, 3, 4, 5, 6];
+        let mut paged_caches: Vec<PagedKvCache> = (0..2).map(|_| PagedKvCache::new()).collect();
+        // Layer 0 fits the prompt with room to spare; layer 1's two
+        // blocks of 2 hold 4 positions against a prompt of 6.
+        let stores = SharedPagedKv::from_stores(
+            [8usize, 2]
+                .into_iter()
+                .map(|blocks| {
+                    PagedKvStore::new(
+                        2,
+                        blocks,
+                        decoder.config.n_kv_heads,
+                        decoder.config.head_dim,
+                    )
+                })
+                .collect(),
+        );
+
+        let result = decoder.forward_batch_last_paged(&prompt, 0, &mut paged_caches, &stores);
+        assert!(result.is_err(), "layer 1's store cannot hold the prompt");
+        for (i, cache) in paged_caches.iter().enumerate() {
+            assert_eq!(cache.seq_len(), 0, "layer {i} must be untouched");
+            assert!(cache.block_table().is_empty(), "layer {i} holds no block");
+        }
+        for (i, expected) in [8usize, 2].into_iter().enumerate() {
+            assert_eq!(stores.free_blocks(i), expected, "layer {i} leaked no block");
+        }
+    }
+
+    /// Chunked prefill: two calls appending into the same sequence must
+    /// equal one call over the concatenation.
+    ///
+    /// This is the case the part-full tail block breaks if
+    /// `to_contiguous` or the reservation is wrong, and it is how the
+    /// serving path actually prefills long prompts.
+    #[test]
+    fn two_paged_prefill_chunks_equal_one_call_over_the_whole_prompt() {
+        let decoder = Decoder::new_random_small(tiny_test_config(), 2, 10);
+        let prompt = [3usize, 1, 4, 1, 5, 9, 2];
+        let split = 3;
+
+        let run = |chunks: &[&[usize]]| {
+            let mut caches: Vec<PagedKvCache> = (0..2).map(|_| PagedKvCache::new()).collect();
+            let stores = SharedPagedKv::from_stores(
+                (0..2)
+                    .map(|_| {
+                        PagedKvStore::new(2, 16, decoder.config.n_kv_heads, decoder.config.head_dim)
+                    })
+                    .collect(),
+            );
+            let mut pos = 0;
+            let mut last = Vec::new();
+            for chunk in chunks {
+                last = decoder
+                    .forward_batch_last_paged(chunk, pos, &mut caches, &stores)
+                    .expect("sized generously");
+                pos += chunk.len();
+            }
+            last
+        };
+
+        let whole = run(&[&prompt]);
+        let chunked = run(&[&prompt[..split], &prompt[split..]]);
+        assert_eq!(whole.len(), chunked.len());
+        for (x, y) in whole.iter().zip(chunked.iter()) {
+            assert_eq!(
+                x.to_bits(),
+                y.to_bits(),
+                "a chunked prefill must equal one call over the same tokens"
+            );
+        }
+    }
+
     fn paged_matches_contiguous(config: ModelConfig) {
         let n_layers = 2;
         let decoder = Decoder::new_random_small(config, n_layers, 10);
@@ -4944,21 +5423,23 @@ mod tests {
         let block_size = 2;
         let mut paged_caches: Vec<PagedKvCache> =
             (0..n_layers).map(|_| PagedKvCache::new()).collect();
-        let mut stores: Vec<PagedKvStore> = (0..n_layers)
-            .map(|_| {
-                PagedKvStore::new(
-                    block_size,
-                    /* total_blocks = */ 16,
-                    decoder.config.n_kv_heads,
-                    decoder.config.head_dim,
-                )
-            })
-            .collect();
+        let stores = SharedPagedKv::from_stores(
+            (0..n_layers)
+                .map(|_| {
+                    PagedKvStore::new(
+                        block_size,
+                        /* total_blocks = */ 16,
+                        decoder.config.n_kv_heads,
+                        decoder.config.head_dim,
+                    )
+                })
+                .collect(),
+        );
         let mut paged_logits = Vec::new();
         for (pos, &tok) in steps.iter().enumerate() {
             paged_logits.push(
                 decoder
-                    .forward_token_paged(tok, pos, &mut paged_caches, &mut stores)
+                    .forward_token_paged(tok, pos, &mut paged_caches, &stores)
                     .expect("store sized generously, must not exhaust"),
             );
         }

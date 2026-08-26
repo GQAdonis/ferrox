@@ -34,6 +34,7 @@ pub use attention::{
 };
 pub use cache::{
     KvBlockPool, KvCache, KvPoolExhausted, PagedKvCache, PagedKvStore, PagedStoreExhausted,
+    SharedPagedKv,
 };
 pub use csa_hca_compress::{channel_gated_pool, compress_block};
 pub use deepseek_v4_attention::{csa_attention, hca_attention};

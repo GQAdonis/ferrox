@@ -9,9 +9,10 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use ferrox_core::cache::{
-    KvBlockPool, KvCache, KvPoolExhausted as CacheKvPoolExhausted, PagedKvCache,
+    KvBlockPool, KvCache, KvPoolExhausted as CacheKvPoolExhausted, PageGroup, PagedKvCache,
     PagedStoreExhausted, SharedPagedKv,
 };
+use ferrox_edge::radix::{align_down, NodeId, RadixCache};
 use ferrox_models::sampling::{Sampler, SamplingParams};
 use ferrox_models::tokenizer::{prepend_bos, StopTokens};
 use ferrox_models::{Ceiling, Decoder, Engine, KvElem, KvShape, PrefixCache, TextTokenizer};
@@ -99,6 +100,14 @@ pub struct KvPoolConfig {
 pub struct PagedKvConfig {
     pub store: Arc<SharedPagedKv>,
     pub queue_wait: Duration,
+    /// `Some` when prefix sharing is on: a radix tree from token
+    /// prefixes to the page groups holding their KV.
+    ///
+    /// This is what `ferrox-models::prefix_cache` could not be. That
+    /// one CLONES a `Vec<KvCache>` per entry, so N conversations off
+    /// one system prompt hold N copies of its KV. The radix tree stores
+    /// page groups and reference-counts them, so they hold one.
+    pub radix: Option<Arc<Mutex<RadixCache>>>,
 }
 
 /// One request's paged KV, which returns its pages when dropped.
@@ -112,14 +121,52 @@ pub struct PagedKvConfig {
 pub struct PagedLease {
     caches: Vec<PagedKvCache>,
     store: Arc<SharedPagedKv>,
+    /// This sequence's page groups, in position order: `groups[i]`
+    /// holds positions `[i * block_size, (i+1) * block_size)`.
+    ///
+    /// Held as groups rather than per-layer block ids because that is
+    /// the unit the radix tree shares and reference-counts. Every entry
+    /// here is one the lease must release exactly once.
+    groups: Vec<PageGroup>,
+    /// How many leading groups came from the radix tree rather than
+    /// from a fresh allocation, and the node they were matched at.
+    ///
+    /// The node stays locked against eviction for as long as this lease
+    /// lives, because those pages are being attended over.
+    adopted: Option<(usize, NodeId)>,
+    radix: Option<Arc<Mutex<RadixCache>>>,
 }
 
 impl Drop for PagedLease {
     fn drop(&mut self) {
-        // Ascending layer order, the same rule `write_all` follows.
-        for (layer, cache) in self.caches.iter_mut().enumerate() {
-            cache.release(&mut self.store.write(layer));
+        // Unlock first: while the node is locked its pages are
+        // protected from eviction, and releasing our own hold before
+        // unlocking would let the tree believe a page is free while
+        // this lease still names it.
+        if let (Some((_, node)), Some(radix)) = (self.adopted, self.radix.as_ref()) {
+            radix.lock().unwrap_or_else(|p| p.into_inner()).unlock(node);
         }
+        // Every group this sequence held, adopted or fresh. A group the
+        // tree also holds survives this, because its refcount does not
+        // reach zero.
+        for group in self.groups.drain(..) {
+            self.store.release_group(group);
+        }
+    }
+}
+
+impl PagedLease {
+    /// The store's page size, which every caller needs to turn groups
+    /// into positions.
+    pub fn block_size(&self) -> usize {
+        self.store.read(0).block_size()
+    }
+
+    /// Positions this request did not have to compute.
+    pub fn adopted_positions(&self, block_size: usize) -> usize {
+        self.adopted
+            .map(|(groups, _)| groups * block_size)
+            .unwrap_or(0)
     }
 }
 
@@ -137,44 +184,170 @@ impl Drop for PagedLease {
 fn acquire_paged_caches(
     decoder: &Decoder,
     config: &PagedKvConfig,
+    tokens: &[usize],
     max_seq_len: usize,
 ) -> Result<PagedLease, PagedStoreExhausted> {
+    let block_size = config.store.read(0).block_size();
     let deadline = Instant::now() + config.queue_wait;
-    loop {
-        let mut caches: Vec<PagedKvCache> =
-            decoder.layers.iter().map(|_| PagedKvCache::new()).collect();
-        // Under one `write_all` so the reservation is atomic against
-        // other requests: layer 0 having room says nothing about layer
-        // 1, and checking then taking as separate steps lets another
-        // request slip in between.
-        let attempt = {
-            let mut guards = config.store.write_all();
-            let fits = caches
-                .iter()
-                .zip(guards.iter())
-                .all(|(c, s)| c.blocks_needed_for(s, max_seq_len) <= s.free_block_count());
-            if fits {
-                for (cache, store) in caches.iter_mut().zip(guards.iter_mut()) {
-                    cache
-                        .reserve(store, max_seq_len)
-                        .expect("checked under this same guard");
-                }
+
+    // Consult the tree ONCE, before the retry loop. A match locks the
+    // node, so re-matching per attempt would take a second lock on the
+    // same node and the unlock on drop would balance only one of them,
+    // leaving the prefix pinned forever.
+    let adopted = match config.radix.as_ref() {
+        Some(radix) => {
+            let ids: Vec<u32> = tokens.iter().map(|&t| t as u32).collect();
+            let mut tree = radix.lock().unwrap_or_else(|p| p.into_inner());
+            let m = tree.match_prefix(&ids);
+            // Never adopt the WHOLE prompt. Prefill has to run over at
+            // least one token to produce the logits that predict the
+            // next one, and a fully-adopted prompt leaves nothing to
+            // run. Backing off one page is the cheap answer; the old
+            // contiguous prefix cache hit the same wall and backed off
+            // one POSITION, which paging cannot do because a partly
+            // shared page cannot be written.
+            let cap = align_down(ids.len().saturating_sub(1), block_size);
+            let cached_len = m.cached_len.min(cap);
+            if cached_len == 0 {
+                None
+            } else {
+                tree.lock(m.node);
+                // One index per TOKEN, so consecutive tokens in a page
+                // repeat its group. Step by `block_size` to get each
+                // group once, in position order.
+                let per_token = tree.matched_indices(m.node);
+                let groups: Vec<PageGroup> = per_token[..cached_len]
+                    .iter()
+                    .step_by(block_size)
+                    .map(|&g| PageGroup(g))
+                    .collect();
+                Some((cached_len, m.node, groups))
             }
-            fits
-        };
-        if attempt {
+        }
+        None => None,
+    };
+    // Every adopted group gains a holder for the life of this lease.
+    if let Some((_, _, groups)) = adopted.as_ref() {
+        for &g in groups {
+            config.store.retain_group(g);
+        }
+    }
+    let (cached_len, node, adopted_groups) = match adopted {
+        Some((len, node, groups)) => (len, Some(node), groups),
+        None => (0, None, Vec::new()),
+    };
+
+    // Only what the adopted prefix does not already cover.
+    let total_groups = max_seq_len.div_ceil(block_size).max(1);
+    let need = total_groups.saturating_sub(adopted_groups.len());
+
+    loop {
+        let mut fresh: Vec<PageGroup> = Vec::with_capacity(need);
+        while fresh.len() < need {
+            match config.store.acquire_group() {
+                Some(g) => fresh.push(g),
+                None => break,
+            }
+        }
+        if fresh.len() == need {
+            let mut groups = adopted_groups;
+            groups.extend(fresh);
+            let caches = seed_caches(decoder, config, &groups, cached_len, block_size);
             return Ok(PagedLease {
                 caches,
                 store: Arc::clone(&config.store),
+                groups,
+                adopted: node.map(|n| (cached_len / block_size, n)),
+                radix: config.radix.clone(),
             });
         }
-        // Nothing was taken (the check failed before any reserve), so
-        // `caches` holds no pages and dropping it here leaks nothing.
+        // Give back what this attempt took before waiting, or a
+        // request that never fits holds pages the requests that would
+        // fit are waiting for.
+        for g in fresh {
+            config.store.release_group(g);
+        }
         let now = Instant::now();
         if now >= deadline {
+            // The adopted groups and the tree lock go back through the
+            // lease's own Drop, which is why they are handed to one
+            // here rather than released by hand: one release path, not
+            // two that must agree.
+            drop(PagedLease {
+                caches: Vec::new(),
+                store: Arc::clone(&config.store),
+                groups: adopted_groups,
+                adopted: node.map(|n| (cached_len / block_size, n)),
+                radix: config.radix.clone(),
+            });
             return Err(PagedStoreExhausted);
         }
         std::thread::sleep(Duration::from_millis(10).min(deadline - now));
+    }
+}
+
+/// Installs the per-layer block tables for `groups`, with `cached_len`
+/// positions already computed.
+fn seed_caches(
+    decoder: &Decoder,
+    config: &PagedKvConfig,
+    groups: &[PageGroup],
+    cached_len: usize,
+    block_size: usize,
+) -> Vec<PagedKvCache> {
+    // A group holds one block per layer, so layer `l`'s table is the
+    // `l`th block of each group, in order.
+    let per_group: Vec<Vec<usize>> = groups
+        .iter()
+        .map(|&g| config.store.group_blocks(g))
+        .collect();
+    (0..decoder.layers.len())
+        .map(|layer| {
+            let table: Vec<usize> = per_group.iter().map(|blocks| blocks[layer]).collect();
+            let mut cache = PagedKvCache::new();
+            cache.adopt_blocks(table, cached_len, block_size);
+            cache
+        })
+        .collect()
+}
+
+/// Publishes this request's pages under its full token sequence, so the
+/// next request sharing the prefix adopts them instead of recomputing.
+///
+/// The duplicate count `insert_prefix` returns is the load-bearing
+/// part: it is not "how much I stored", it is "how much you must free".
+/// Another request published the same prefix while this one was
+/// generating, the tree kept ITS pages, and ours for that span are now
+/// unreferenced by the tree. Dropping them on the floor is the classic
+/// leak in this shape of cache.
+fn publish_to_radix(lease: &mut PagedLease, tokens: &[usize], block_size: usize) {
+    let Some(radix) = lease.radix.clone() else {
+        return;
+    };
+    let ids: Vec<u32> = tokens.iter().map(|&t| t as u32).collect();
+    // One index per token: each position names the group holding it.
+    let mut per_token: Vec<u32> = Vec::with_capacity(ids.len());
+    for (i, group) in lease.groups.iter().enumerate() {
+        let covered = block_size.min(ids.len().saturating_sub(i * block_size));
+        for _ in 0..covered {
+            per_token.push(group.0);
+        }
+    }
+    if per_token.len() < ids.len() {
+        // More tokens than pages held: nothing coherent to publish.
+        return;
+    }
+    let result = {
+        let mut tree = radix.lock().unwrap_or_else(|p| p.into_inner());
+        tree.insert_prefix(&ids, &per_token[..ids.len()])
+    };
+    // The tree now holds a reference to every group it kept, so those
+    // survive this lease's own release.
+    let kept = result.cached_len / block_size..result.inserted_len / block_size;
+    for i in kept {
+        if let Some(&g) = lease.groups.get(i) {
+            lease.store.retain_group(g);
+        }
     }
 }
 
@@ -196,9 +369,20 @@ impl Kv {
     fn prefill(&mut self, decoder: &Decoder, tokens: &[usize]) -> Vec<f32> {
         match self {
             Kv::Contiguous(caches) => forward_prompt_batch(decoder, tokens, 0, caches),
-            Kv::Paged(lease) => decoder
-                .forward_batch_last_paged(tokens, 0, &mut lease.caches, &lease.store)
-                .expect("the whole request's pages were reserved at admission"),
+            Kv::Paged(lease) => {
+                // Skip whatever the radix tree already computed. Those
+                // positions are already in the block table with their
+                // KV written, so prefill starts where they end.
+                let done = lease.adopted_positions(lease.block_size());
+                decoder
+                    .forward_batch_last_paged(
+                        &tokens[done..],
+                        done,
+                        &mut lease.caches,
+                        &lease.store,
+                    )
+                    .expect("the whole request's pages were reserved at admission")
+            }
         }
     }
 
@@ -707,7 +891,7 @@ pub fn generate(
     } else {
         kv = match (paged_kv, kv_pool) {
             (Some(config), _) => Kv::Paged(
-                acquire_paged_caches(decoder, config, max_seq_len)
+                acquire_paged_caches(decoder, config, &tokens, max_seq_len)
                     .map_err(|_| DecodeError::KvPoolExhausted)?,
             ),
             (None, Some(config)) => Kv::Contiguous(
@@ -799,6 +983,16 @@ pub fn generate(
     if let Some(cached) = cached_tokens {
         usage = usage.with_cached_tokens(cached);
     }
+    // A paged request's reuse is the radix tree's, not the contiguous
+    // prefix cache's, so it is counted here instead. Reported through
+    // the same field because it means the same thing to a caller:
+    // prompt positions this request did not have to compute.
+    if let Kv::Paged(lease) = &kv {
+        let adopted = lease.adopted_positions(lease.block_size());
+        if paged_kv.is_some_and(|c| c.radix.is_some()) {
+            usage = usage.with_cached_tokens(adopted);
+        }
+    }
 
     // Store the full sequence this request actually processed (prompt
     // plus everything generated) so a future request sharing this
@@ -817,6 +1011,24 @@ pub fn generate(
     // Metal dense-stack decode may leave host KvCache lagging the
     // Metal-resident KV; flush before storing so prefix restore gets
     // complete K/V.
+    // Before the contiguous store below, which consumes `kv`,
+    // `tokens` and `generated_ids`. Independent of `kv_pool`, which a
+    // paged request never has: it is the paged store that holds this
+    // request's KV, and the tree that decides whether the next request
+    // can reuse it. The two are mutually exclusive at startup, so only
+    // one of these ever runs.
+    if let Kv::Paged(lease) = &mut kv {
+        // Publish under the sequence actually processed, prompt plus
+        // everything generated, so the next request sharing that prefix
+        // adopts the pages rather than recomputing them. The lease
+        // keeps holding them either way; what changes is that the tree
+        // now holds them too, so they outlive this request.
+        let mut full = tokens.clone();
+        full.extend(generated_ids.iter().copied());
+        let block_size = lease.block_size();
+        publish_to_radix(lease, &full, block_size);
+    }
+
     if kv_pool.is_none() {
         if let Some(pc) = prefix_cache {
             // Greedy Metal argmax returns a 1-element "logits" vec; that is
@@ -2021,6 +2233,15 @@ mod tests {
     }
 
     fn paged_config(decoder: &Decoder, block_size: usize, blocks: usize) -> PagedKvConfig {
+        paged_config_with_radix(decoder, block_size, blocks, false)
+    }
+
+    fn paged_config_with_radix(
+        decoder: &Decoder,
+        block_size: usize,
+        blocks: usize,
+        share_prefixes: bool,
+    ) -> PagedKvConfig {
         PagedKvConfig {
             store: Arc::new(SharedPagedKv::new(
                 decoder.layers.len(),
@@ -2030,6 +2251,8 @@ mod tests {
                 decoder.config.head_dim,
             )),
             queue_wait: Duration::ZERO,
+            radix: share_prefixes
+                .then(|| Arc::new(Mutex::new(ferrox_edge::radix::RadixCache::new(block_size)))),
         }
     }
 
@@ -2131,6 +2354,175 @@ mod tests {
                 "layer {l} leaked pages across repeated requests"
             );
         }
+    }
+
+    /// THE ACCEPTANCE PROPERTY: two prompts sharing a prefix hold ONE
+    /// copy of its pages, not two.
+    ///
+    /// This is what `ferrox-models::prefix_cache` structurally cannot
+    /// do. That one clones a `Vec<KvCache>` per entry, so the second
+    /// conversation off a shared system prompt holds its own copy of
+    /// that prompt's KV. Here the second adopts the first's page
+    /// groups and the refcount goes to two, so the pages consumed by
+    /// two requests are strictly fewer than twice one request's.
+    ///
+    /// Measured as free groups, which is the store's own count rather
+    /// than a number this test computes.
+    #[test]
+    fn two_prompts_sharing_a_prefix_hold_one_copy_of_it() {
+        let decoder = small_decoder();
+        // A shared prefix of 8 bytes, then one differing byte each.
+        let shared: Vec<u8> = (1u8..=8).collect();
+        let mut a = shared.clone();
+        a.push(40);
+        let mut b = shared.clone();
+        b.push(50);
+        let prompt_a = String::from_utf8(a).unwrap();
+        let prompt_b = String::from_utf8(b).unwrap();
+
+        let run = |config: &PagedKvConfig, prompt: &str| -> String {
+            let mut out = String::new();
+            generate(
+                &decoder,
+                &ServerTokenizer::Byte,
+                &StopTokens::default(),
+                None,
+                prompt,
+                &greedy_params(2),
+                None,
+                Some(config),
+                None,
+                None,
+                |s| out.push_str(s),
+            )
+            .unwrap();
+            out
+        };
+
+        // Measured as what each request COSTS the store, not what is
+        // free afterwards: without a tree every group is released at
+        // the end, so free-afterwards is identical either way and
+        // measures nothing. With a tree, pages it keeps stay held, so
+        // the drop in free groups is what each request added.
+        let cfg = paged_config_with_radix(&decoder, 4, 64, true);
+        let start = cfg.store.free_groups();
+        let text_a = run(&cfg, &prompt_a);
+        let after_a = cfg.store.free_groups();
+        let text_b = run(&cfg, &prompt_b);
+        let after_b = cfg.store.free_groups();
+
+        let cost_a = start - after_a;
+        let cost_b = after_a - after_b;
+        assert!(cost_a > 0, "the first request must publish something");
+        assert!(
+            cost_b < cost_a,
+            "the second request shares A's prefix and must cost less \
+             (first {cost_a} groups, second {cost_b})"
+        );
+
+        // And the saving is REPORTED, not merely real: a caller sees
+        // the adopted positions as `cached_tokens`, the same field the
+        // contiguous prefix cache uses for the same meaning.
+        let cfg2 = paged_config_with_radix(&decoder, 4, 64, true);
+        let mut sink = String::new();
+        let (_f, first_usage) = generate(
+            &decoder,
+            &ServerTokenizer::Byte,
+            &StopTokens::default(),
+            None,
+            &prompt_a,
+            &greedy_params(2),
+            None,
+            Some(&cfg2),
+            None,
+            None,
+            |s| sink.push_str(s),
+        )
+        .unwrap();
+        assert_eq!(
+            first_usage.cached_tokens,
+            Some(0),
+            "a cold tree reuses nothing"
+        );
+        let (_f, second_usage) = generate(
+            &decoder,
+            &ServerTokenizer::Byte,
+            &StopTokens::default(),
+            None,
+            &prompt_b,
+            &greedy_params(2),
+            None,
+            Some(&cfg2),
+            None,
+            None,
+            |s| sink.push_str(s),
+        )
+        .unwrap();
+        let reused = second_usage.cached_tokens.expect("a tree is configured");
+        assert!(
+            reused >= 8,
+            "the 8-token shared prefix must be reported as reused, got {reused}"
+        );
+
+        // And the answers are unchanged: adopting a prefix must not
+        // change what the model says. A cache that is fast and wrong is
+        // worse than no cache.
+        let plain = paged_config(&decoder, 4, 64);
+        assert_eq!(text_a, run(&plain, &prompt_a), "prompt A changed");
+        assert_eq!(text_b, run(&plain, &prompt_b), "prompt B changed");
+    }
+
+    /// Repeated requests off one prefix do not exhaust the store.
+    ///
+    /// The leak this guards is specific: `insert_prefix` reports how
+    /// much of the span the tree ALREADY had, and those pages of ours
+    /// are the ones the tree did not take. Retaining the wrong range
+    /// either leaks them (retained but never released) or frees pages
+    /// the tree still points at.
+    #[test]
+    fn many_requests_off_one_prefix_neither_leak_nor_free_the_trees_pages() {
+        let decoder = small_decoder();
+        let config = paged_config_with_radix(&decoder, 4, 64, true);
+        let shared: Vec<u8> = (1u8..=8).collect();
+
+        let mut lows = Vec::new();
+        for suffix in 0..6u8 {
+            let mut p = shared.clone();
+            p.push(60 + suffix);
+            let prompt = String::from_utf8(p).unwrap();
+            let mut out = String::new();
+            generate(
+                &decoder,
+                &ServerTokenizer::Byte,
+                &StopTokens::default(),
+                None,
+                &prompt,
+                &greedy_params(2),
+                None,
+                Some(&config),
+                None,
+                None,
+                |s| out.push_str(s),
+            )
+            .expect("the store is sized for many of these");
+            lows.push(config.store.free_groups());
+        }
+
+        // The tree keeps some pages forever, so free groups settle to a
+        // floor rather than returning to the start. What must NOT
+        // happen is a monotone slide toward zero: after the prefix is
+        // published once, later requests off it cost only their own
+        // suffix, so the last two runs must leave the same amount free.
+        assert_eq!(
+            lows[lows.len() - 1],
+            lows[lows.len() - 2],
+            "steady state expected once the shared prefix is published; \
+             free groups per run were {lows:?}"
+        );
+        assert!(
+            lows[lows.len() - 1] > 0,
+            "the store must not have been consumed: {lows:?}"
+        );
     }
 
     /// A request too big for the store is refused at admission, having

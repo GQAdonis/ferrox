@@ -4017,6 +4017,13 @@ async fn run(mcp_config_path: Option<PathBuf>, exit_on_stdin_close: bool) -> any
                  {queue_wait_ms}ms admission queue wait",
                 cfg.n_layers
             );
+            // Prefix sharing rides on the same switch: paged KV is
+            // what makes it possible at all, since sharing means two
+            // sequences pointing at one page rather than one of them
+            // holding a copy.
+            let radix = Some(Arc::new(Mutex::new(ferrox_edge::radix::RadixCache::new(
+                block_size,
+            ))));
             Some(generate::PagedKvConfig {
                 store: Arc::new(ferrox_core::cache::SharedPagedKv::new(
                     cfg.n_layers,
@@ -4026,6 +4033,7 @@ async fn run(mcp_config_path: Option<PathBuf>, exit_on_stdin_close: bool) -> any
                     cfg.head_dim,
                 )),
                 queue_wait: Duration::from_millis(queue_wait_ms),
+                radix,
             })
         }
         (Err(_), Err(_)) => None,

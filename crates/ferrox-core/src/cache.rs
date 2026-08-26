@@ -570,6 +570,31 @@ impl PagedKvCache {
         Ok(())
     }
 
+    /// Installs a block table the caller allocated, with `seq_len`
+    /// positions already computed in it.
+    ///
+    /// This is how a sequence starts life on top of a cached prefix:
+    /// the blocks are somebody else's, already full, and this sequence
+    /// appends past them. `seq_len` MUST be a whole number of blocks,
+    /// because the first append writes at `seq_len` and a shared block
+    /// must never be written -- another sequence is attending over it.
+    /// A ragged length would put that write inside the last shared
+    /// block, corrupting a prefix every other holder is reading.
+    pub fn adopt_blocks(&mut self, block_table: Vec<usize>, seq_len: usize, block_size: usize) {
+        assert_eq!(
+            seq_len % block_size,
+            0,
+            "an adopted prefix must end on a block boundary, or the first \
+             append writes into a block another sequence is reading"
+        );
+        assert!(
+            seq_len / block_size <= block_table.len(),
+            "block table too short for the adopted length"
+        );
+        self.block_table = block_table;
+        self.seq_len = seq_len;
+    }
+
     /// Copies this sequence's KV out of the shared store into a plain
     /// contiguous [`KvCache`].
     ///
@@ -676,6 +701,11 @@ impl PagedKvCache {
 /// should not turn one request's panic into a permanently dead server.
 pub struct SharedPagedKv {
     layers: Vec<RwLock<PagedKvStore>>,
+    /// Guarded separately from the layers, and always taken BEFORE
+    /// them, never while a layer guard is held. That one-way order is
+    /// what keeps group allocation and the per-layer push paths from
+    /// deadlocking against each other.
+    groups: Mutex<GroupTable>,
 }
 
 impl SharedPagedKv {
@@ -698,6 +728,7 @@ impl SharedPagedKv {
                     ))
                 })
                 .collect(),
+            groups: Mutex::new(GroupTable::default()),
         }
     }
 
@@ -706,6 +737,7 @@ impl SharedPagedKv {
     pub fn from_stores(stores: Vec<PagedKvStore>) -> Self {
         SharedPagedKv {
             layers: stores.into_iter().map(RwLock::new).collect(),
+            groups: Mutex::new(GroupTable::default()),
         }
     }
 
@@ -750,6 +782,162 @@ impl SharedPagedKv {
     /// them, which is why the append itself re-checks under the guard.
     pub fn free_blocks(&self, layer: usize) -> usize {
         self.read(layer).free_block_count()
+    }
+
+    /// Takes one block from EVERY layer as a single group, refcount 1.
+    ///
+    /// All layers or none: a group that existed in some layers and not
+    /// others could not answer "which block holds position p in layer
+    /// l", which is the only question it exists to answer.
+    pub fn acquire_group(&self) -> Option<PageGroup> {
+        let mut guards = self.write_all();
+        if guards.iter().any(|s| s.free_block_count() == 0) {
+            return None;
+        }
+        let blocks: Vec<usize> = guards
+            .iter_mut()
+            .map(|s| {
+                s.acquire_block()
+                    .expect("checked every layer under these same guards")
+            })
+            .collect();
+        let mut groups = self
+            .groups
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Some(PageGroup(groups.insert(blocks)))
+    }
+
+    /// One more holder of `group`.
+    ///
+    /// Called when a second sequence adopts a cached prefix. Without
+    /// it, the first sequence to finish frees pages the second is
+    /// still attending over -- a use-after-free that shows up as
+    /// another conversation's tokens rather than as a crash.
+    pub fn retain_group(&self, group: PageGroup) {
+        let mut groups = self
+            .groups
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        groups.retain(group.0);
+    }
+
+    /// One fewer holder. At zero the blocks go back to their layers.
+    ///
+    /// Returns whether this was the last holder, so a caller can assert
+    /// on it rather than guess.
+    pub fn release_group(&self, group: PageGroup) -> bool {
+        let blocks = {
+            let mut groups = self
+                .groups
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            match groups.release(group.0) {
+                Some(blocks) => blocks,
+                None => return false,
+            }
+        };
+        // The groups lock is dropped before the layer guards are taken,
+        // so the lock order is always groups-then-layers and never the
+        // reverse. See the type docs on deadlock.
+        let mut guards = self.write_all();
+        for (store, block) in guards.iter_mut().zip(blocks) {
+            store.release_block(block);
+        }
+        true
+    }
+
+    /// Which block in each layer this group owns, indexed by layer.
+    pub fn group_blocks(&self, group: PageGroup) -> Vec<usize> {
+        let groups = self
+            .groups
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        groups.blocks(group.0).to_vec()
+    }
+
+    /// How many holders `group` has. Zero means it does not exist.
+    pub fn group_refs(&self, group: PageGroup) -> u32 {
+        let groups = self
+            .groups
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        groups.refs(group.0)
+    }
+
+    /// Groups that could still be allocated, bounded by the layer with
+    /// the fewest free blocks: a group needs one from each.
+    pub fn free_groups(&self) -> usize {
+        (0..self.layers.len())
+            .map(|l| self.free_blocks(l))
+            .min()
+            .unwrap_or(0)
+    }
+}
+
+/// A handle to one block in every layer.
+///
+/// The unit of sharing between sequences, and the only thing small
+/// enough to be what a radix prefix cache stores: that cache maps a
+/// token prefix to ONE index per token, while a position's KV lives in
+/// `n_layers` different blocks. A group is the name for all of them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct PageGroup(pub u32);
+
+/// Group ids, their per-layer blocks, and how many holders each has.
+#[derive(Debug, Default)]
+struct GroupTable {
+    /// Indexed by group id. `None` for an id currently on the free list.
+    blocks: Vec<Option<Vec<usize>>>,
+    refs: Vec<u32>,
+    free_ids: Vec<u32>,
+}
+
+impl GroupTable {
+    fn insert(&mut self, blocks: Vec<usize>) -> u32 {
+        if let Some(id) = self.free_ids.pop() {
+            self.blocks[id as usize] = Some(blocks);
+            self.refs[id as usize] = 1;
+            return id;
+        }
+        self.blocks.push(Some(blocks));
+        self.refs.push(1);
+        (self.blocks.len() - 1) as u32
+    }
+
+    fn retain(&mut self, id: u32) {
+        let refs = &mut self.refs[id as usize];
+        assert!(*refs > 0, "cannot retain group {id}, which has no holders");
+        *refs += 1;
+    }
+
+    /// Drops one holder, returning the blocks to free only when the
+    /// last one goes.
+    fn release(&mut self, id: u32) -> Option<Vec<usize>> {
+        let refs = &mut self.refs[id as usize];
+        assert!(*refs > 0, "double free of group {id}");
+        *refs -= 1;
+        if *refs > 0 {
+            return None;
+        }
+        // The id is reusable now, but only after the blocks are out:
+        // handing the id back while it still named blocks would let a
+        // later `acquire_group` believe it owns them too.
+        let blocks = self.blocks[id as usize]
+            .take()
+            .expect("a group with holders always has blocks");
+        self.free_ids.push(id);
+        Some(blocks)
+    }
+
+    fn blocks(&self, id: u32) -> &[usize] {
+        self.blocks[id as usize]
+            .as_deref()
+            .expect("group has no blocks; it was already released")
+    }
+
+    fn refs(&self, id: u32) -> u32 {
+        self.refs.get(id as usize).copied().unwrap_or(0)
     }
 }
 
@@ -825,6 +1013,144 @@ mod tests {
             "a reserved block is already held"
         );
         assert_eq!(cache.blocks_needed_for(&store, 5), 1);
+    }
+
+    /// A group takes one block from every layer, and gives them all
+    /// back together.
+    ///
+    /// All-or-nothing is the point: a group holding blocks in some
+    /// layers and not others cannot answer "which block holds position
+    /// p in layer l", which is the only question it exists for.
+    #[test]
+    fn a_group_takes_one_block_from_every_layer_and_returns_them_together() {
+        let kv = SharedPagedKv::new(3, 2, 4, 1, 1);
+        assert_eq!(kv.free_groups(), 4);
+
+        let g = kv.acquire_group().expect("4 groups available");
+        let blocks = kv.group_blocks(g);
+        assert_eq!(blocks.len(), 3, "one block per layer");
+        for l in 0..3 {
+            assert_eq!(kv.free_blocks(l), 3, "layer {l} gave up exactly one");
+        }
+        assert_eq!(kv.free_groups(), 3);
+
+        assert!(kv.release_group(g), "sole holder, so this frees it");
+        for l in 0..3 {
+            assert_eq!(kv.free_blocks(l), 4, "layer {l} got its block back");
+        }
+        assert_eq!(kv.free_groups(), 4);
+    }
+
+    /// A group survives until its LAST holder releases it.
+    ///
+    /// This is what makes prefix sharing safe. Two sequences off one
+    /// system prompt hold the same pages; if the first to finish freed
+    /// them, the second would keep attending over blocks the store had
+    /// already handed to somebody else -- surfacing as another
+    /// conversation's tokens, not as a crash.
+    #[test]
+    fn a_group_shared_by_two_holders_survives_the_first_release() {
+        let kv = SharedPagedKv::new(2, 2, 2, 1, 1);
+        let g = kv.acquire_group().unwrap();
+        let blocks = kv.group_blocks(g);
+        kv.retain_group(g);
+        assert_eq!(kv.group_refs(g), 2);
+
+        assert!(
+            !kv.release_group(g),
+            "one holder remains, so nothing is freed"
+        );
+        assert_eq!(kv.group_refs(g), 1);
+        assert_eq!(kv.free_blocks(0), 1, "the blocks are still held");
+        assert_eq!(kv.group_blocks(g), blocks, "and still name the same blocks");
+
+        assert!(kv.release_group(g), "last holder frees it");
+        assert_eq!(kv.group_refs(g), 0);
+        assert_eq!(kv.free_blocks(0), 2);
+    }
+
+    /// Exhaustion is per group, bounded by the tightest layer.
+    ///
+    /// A layer with one block left caps the whole pool at one more
+    /// group however much room the others have, because a group needs
+    /// one block from each.
+    #[test]
+    fn group_capacity_is_bounded_by_the_layer_with_the_fewest_blocks() {
+        let kv = SharedPagedKv::from_stores(vec![
+            PagedKvStore::new(2, 5, 1, 1),
+            PagedKvStore::new(2, 1, 1, 1),
+        ]);
+        assert_eq!(kv.free_groups(), 1, "layer 1 has only one block");
+
+        let g = kv.acquire_group().expect("one group fits");
+        assert_eq!(kv.free_groups(), 0);
+        assert!(
+            kv.acquire_group().is_none(),
+            "layer 1 is empty, so no group can be formed"
+        );
+        // The refused attempt must not have taken layer 0's block.
+        assert_eq!(kv.free_blocks(0), 4, "a refused group leaks nothing");
+        kv.release_group(g);
+        assert_eq!(kv.free_blocks(0), 5);
+    }
+
+    /// A released id is reused, with a refcount that starts over.
+    #[test]
+    fn a_released_group_id_is_reused_with_a_fresh_refcount() {
+        let kv = SharedPagedKv::new(1, 2, 2, 1, 1);
+        let first = kv.acquire_group().unwrap();
+        kv.retain_group(first);
+        assert_eq!(kv.group_refs(first), 2);
+        kv.release_group(first);
+        kv.release_group(first);
+        assert_eq!(kv.group_refs(first), 0, "gone, not merely decremented");
+
+        let second = kv.acquire_group().unwrap();
+        assert_eq!(second, first, "the id is reused");
+        assert_eq!(
+            kv.group_refs(second),
+            1,
+            "a reused id must not inherit the old count"
+        );
+        assert_eq!(kv.group_blocks(second).len(), 1);
+        assert_eq!(kv.free_blocks(0), 1);
+    }
+
+    /// Reading a group after its last holder released it PANICS rather
+    /// than answering with stale blocks.
+    ///
+    /// This is the observable half of clearing the entry on release,
+    /// and the reason it is `take` rather than `clone`: a caller still
+    /// holding a `PageGroup` after releasing it is exactly the bug
+    /// refcounting exists to prevent, and blocks that now belong to
+    /// somebody else are the worst possible answer -- the caller reads
+    /// another sequence's KV and nothing says so.
+    ///
+    /// Written after sabotage showed the previous test here passed with
+    /// `clone` in place of `take`: `insert` overwrites the entry on
+    /// reuse, so a stale entry was never reachable through the path
+    /// that test took. This one reaches it.
+    #[test]
+    #[should_panic(expected = "already released")]
+    fn reading_a_released_group_panics_rather_than_returning_stale_blocks() {
+        let kv = SharedPagedKv::new(2, 2, 2, 1, 1);
+        let g = kv.acquire_group().unwrap();
+        assert!(kv.release_group(g));
+        let _ = kv.group_blocks(g);
+    }
+
+    /// Releasing a group nobody holds is a bug, not a no-op.
+    ///
+    /// Silently ignoring it would let a double release return the same
+    /// blocks to the store twice, after which two sequences are handed
+    /// the same page and both write it.
+    #[test]
+    #[should_panic(expected = "double free of group")]
+    fn releasing_a_group_twice_panics_rather_than_freeing_it_twice() {
+        let kv = SharedPagedKv::new(1, 2, 2, 1, 1);
+        let g = kv.acquire_group().unwrap();
+        assert!(kv.release_group(g));
+        kv.release_group(g);
     }
 
     #[test]

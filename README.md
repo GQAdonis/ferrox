@@ -42,18 +42,21 @@ attention and expert routing are all implemented here.
   backend. Every run writes a small JSON file of raw timings, and those
   files are checked into `benchmarks/receipts/engine/`. The table in
   [benchmarks/RESULTS.md](benchmarks/RESULTS.md) is generated from them,
-  never typed in by hand. When the machine is too busy for a timing to
-  mean anything, `ferrox bench` stops instead of printing a number.
+  never typed in by hand. A host that is busy, thermally limited, or too
+  short on free memory to hold the weights stops `ferrox bench` instead
+  of getting a number out of it.
 - **Validated against the reference.** Quant kernels are checked
   bit-exact against llama.cpp's own dequantization, and `ferrox parity`
   compares first-token logit distributions with llama.cpp on the same
   prompt. A model whose maths Ferrox only partly implements stops with
   an error naming what is missing, rather than loading and returning
   fluent text computed the wrong way.
-- **OpenAI-compatible server** with continuous batching, a prefix cache
-  that survives restarts, runtime model swap, resumable streams that
-  survive a dropped connection, and a `/admin` control surface. Point
-  your existing client at it.
+- **OpenAI-compatible server** with continuous batching, paged KV that
+  shares a system prompt's pages between conversations instead of
+  copying them per request, runtime model swap, resumable streams that
+  survive a dropped connection, Anthropic and Responses endpoints beside
+  the OpenAI ones, and an `/admin` control surface. Point your existing
+  client at it.
 - **Speculative decoding that stays lossless** at any temperature, not
   only at `--temp 0`, using the speculative-sampling rejection rule.
   Acceptance length and the per-position accept rate are reported, so a
@@ -64,12 +67,12 @@ attention and expert routing are all implemented here.
   markers, so a family nobody hand-wrote a renderer for is still framed
   the way it was trained. `chat_template_kwargs` and `reasoning_effort`
   are passed through, and the effort is quantized onto the gears that
-  checkpoint actually grades — probed from its own template at load,
-  never read from a table keyed by model name.
+  checkpoint actually grades, probed from its own template at load rather
+  than read from a table keyed by model name.
 - **Agent-facing output, parsed.** A reasoning model's chain of thought
   is split into `reasoning_content` as tokens arrive, and tool calls are
-  recognised in the format the served checkpoint's family really emits —
-  eleven of them — rather than only the one the prompt asked for.
+  recognised in the format the served checkpoint's family really emits,
+  eleven of them, rather than only the one the prompt asked for.
   Arguments stream as deltas, so a coding agent watches a file argument
   arrive instead of waiting for it.
 
@@ -114,8 +117,8 @@ mkdir -p models
 hf download bartowski/Llama-3.2-3B-Instruct-GGUF \
   Llama-3.2-3B-Instruct-Q4_K_M.gguf --local-dir models
 
-# 2. Run it. Ferrox matches the GGUF's chat template to a known family and
-#    wraps your prompt in it. Add --no-cnv for a raw completion.
+# 2. Run it. Ferrox evaluates the GGUF's own chat template and wraps your
+#    prompt in it. Add --no-cnv for a raw completion.
 ferrox -m models/Llama-3.2-3B-Instruct-Q4_K_M.gguf \
   -p "Explain quantization in two sentences" -n 128 -dev metal -ngl all
 
@@ -169,6 +172,7 @@ published separately if you want one rather than the stack:
 [core](https://crates.io/crates/ferrox-core),
 [moe](https://crates.io/crates/ferrox-moe),
 [models](https://crates.io/crates/ferrox-models),
+[edge](https://crates.io/crates/ferrox-edge),
 [api](https://crates.io/crates/ferrox-api),
 [metal](https://crates.io/crates/ferrox-metal),
 [cuda](https://crates.io/crates/ferrox-cuda). All share one version.

@@ -14,6 +14,8 @@
 //!   `docs/plans/llama-cpp-parity-push.md` was measured; re-run it with
 //!   `cargo test -p ferrox-models --test chat_template_real_gguf -- --ignored --nocapture`.
 
+mod common;
+use common::collect_gguf;
 use ferrox_models::chat_template::{ChatTemplate, RenderOptions};
 use serde_json::json;
 
@@ -118,18 +120,4 @@ fn sweep_every_local_gguf_template() {
     }
     println!("{with_template} templates, {} failures", failures.len());
     assert!(failures.is_empty(), "{failures:#?}");
-}
-
-fn collect_gguf(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for e in entries.flatten() {
-        let p = e.path();
-        if p.is_dir() {
-            collect_gguf(&p, out);
-        } else if p.extension().and_then(|x| x.to_str()) == Some("gguf") {
-            out.push(p);
-        }
-    }
 }

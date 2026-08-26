@@ -13,6 +13,8 @@
 //! cargo test -p ferrox-models --test bos_policy -- --ignored --nocapture
 //! ```
 
+mod common;
+use common::collect_gguf;
 use ferrox_models::chat_template::{ChatTemplate, RenderOptions};
 use ferrox_models::tokenizer::{
     prepend_bos, should_add_bos_token, GgufBpeTokenizer, GgufSpmTokenizer, GgufUnigramTokenizer,
@@ -42,20 +44,6 @@ impl Tok {
             Tok::Bpe(t) => t.encode(text),
             Tok::Spm(t) => t.encode(text),
             Tok::Unigram(t) => t.encode(text),
-        }
-    }
-}
-
-fn collect_gguf(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for e in entries.flatten() {
-        let p = e.path();
-        if p.is_dir() {
-            collect_gguf(&p, out);
-        } else if p.extension().and_then(|x| x.to_str()) == Some("gguf") {
-            out.push(p);
         }
     }
 }

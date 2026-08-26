@@ -742,7 +742,10 @@ fn yarn_scaling_from_gguf(
     })
 }
 
-fn find_info<'a>(file: &'a impl TensorSource, name: &str) -> Result<&'a TensorInfo, LoadError> {
+pub(crate) fn find_info<'a>(
+    file: &'a impl TensorSource,
+    name: &str,
+) -> Result<&'a TensorInfo, LoadError> {
     file.find_tensor(name)
         .ok_or_else(|| LoadError::Gguf(GgufError::TensorNotFound(name.to_string())))
 }
@@ -845,7 +848,7 @@ fn load_gpt_oss_layer(
     })
 }
 
-fn load_f32_vec_optional(
+pub(crate) fn load_f32_vec_optional(
     file: &impl TensorSource,
     name: &str,
 ) -> Result<Option<Vec<f32>>, LoadError> {
@@ -1048,7 +1051,7 @@ pub(crate) fn widen_plain_float(
     }
 }
 
-fn load_f32_vec(file: &impl TensorSource, name: &str) -> Result<Vec<f32>, LoadError> {
+pub(crate) fn load_f32_vec(file: &impl TensorSource, name: &str) -> Result<Vec<f32>, LoadError> {
     let info = find_info(file, name)?;
     let raw = file.tensor_bytes(name)?;
     match info.dtype {
@@ -1109,7 +1112,10 @@ fn load_f32_vec(file: &impl TensorSource, name: &str) -> Result<Vec<f32>, LoadEr
 /// multi-billion-parameter checkpoint the difference between this and
 /// "dequant everything on load" is the difference between fitting in
 /// RAM and not.
-fn load_weight_matrix(file: &impl TensorSource, name: &str) -> Result<WeightMatrix, LoadError> {
+pub(crate) fn load_weight_matrix(
+    file: &impl TensorSource,
+    name: &str,
+) -> Result<WeightMatrix, LoadError> {
     let info = find_info(file, name)?;
     // GGUF's on-disk `ne[]` shape array is fastest-varying-dimension-first
     // (ggml convention), i.e. `[in_features, out_features]` for a 2D
@@ -1167,7 +1173,7 @@ fn load_weight_matrix(file: &impl TensorSource, name: &str) -> Result<WeightMatr
 /// boundaries never cross expert boundaries since `in_dim` is a whole
 /// number of quantization blocks). Matches llama.cpp/ik_llama.cpp layout
 /// confirmed on real OLMoE and Qwen2-MoE GGUF checkpoints.
-fn split_expert_tensor(
+pub(crate) fn split_expert_tensor(
     file: &impl TensorSource,
     name: &str,
     n_experts: usize,
@@ -2021,6 +2027,76 @@ pub fn assert_every_tensor_consumed(file: &ShardedGguf) -> Result<(), LoadError>
 
 #[cfg(test)]
 mod tests {
+
+    /// A quantized 1-D tensor loads through the shared helper.
+    ///
+    /// This used to be six copies of `load_f32_vec`, and they had
+    /// drifted badly: this one decoded twenty dtypes while the five
+    /// architecture loaders decoded three (F32/F16/BF16). A quantizer
+    /// that emits a Q8_0 norm or bias -- ordinary for aggressive
+    /// quants -- loaded on the generic path and was rejected with
+    /// `UnsupportedDtype` on GLM-5.2, Kimi, DeepSeek-MLA, Gemma-4 and
+    /// the hybrid stack.
+    ///
+    /// This file's own comment predicted exactly that, about the same
+    /// split one level down: "a dtype ferrox can decode should never be
+    /// rejected here just because the *other* dispatch table below
+    /// knows it -- that split is how a supported format turns into a
+    /// load failure on the one checkpoint that uses it."
+    #[test]
+    fn a_quantized_one_dimensional_tensor_widens_through_the_shared_helper() {
+        let values: Vec<f32> = (0..64).map(|i| (i as f32 - 32.0) * 0.25).collect();
+        let quantized = ferrox_quant::quantize_q8_0(&values);
+
+        struct OneTensor {
+            info: TensorInfo,
+            bytes: Vec<u8>,
+        }
+        impl TensorSource for OneTensor {
+            fn metadata(&self, _key: &str) -> Option<&ferrox_gguf::GgufValue> {
+                None
+            }
+            fn find_tensor(&self, name: &str) -> Option<&TensorInfo> {
+                (name == self.info.name).then_some(&self.info)
+            }
+            fn tensor_bytes(&self, _name: &str) -> Result<&[u8], GgufError> {
+                Ok(&self.bytes)
+            }
+            fn tensor_mapped_range(
+                &self,
+                name: &str,
+            ) -> Result<
+                (
+                    std::sync::Arc<ferrox_gguf::MmapHandle>,
+                    std::ops::Range<usize>,
+                ),
+                GgufError,
+            > {
+                // Never reached: `load_f32_vec` widens from bytes.
+                Err(GgufError::TensorNotFound(name.to_string()))
+            }
+        }
+
+        let source = OneTensor {
+            info: TensorInfo {
+                name: "blk.0.attn_norm.weight".to_string(),
+                shape: vec![64],
+                dtype: GgmlType::Q8_0,
+                offset: 0,
+            },
+            bytes: quantized,
+        };
+
+        let widened = load_f32_vec(&source, "blk.0.attn_norm.weight")
+            .expect("a Q8_0 norm must load, not report an unsupported dtype");
+        assert_eq!(widened.len(), values.len());
+        for (got, want) in widened.iter().zip(values.iter()) {
+            assert!(
+                (got - want).abs() < 0.05,
+                "q8_0 round trip: got {got}, want {want}"
+            );
+        }
+    }
     use super::*;
     use byteorder::{LittleEndian, WriteBytesExt};
     use std::io::Write;

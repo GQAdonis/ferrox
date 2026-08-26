@@ -57,70 +57,7 @@ use ferrox_gguf::{GgmlType, TensorSource};
 
 use crate::glm_dsa::{Glm52AttnWeights, Glm52MlaConfig, IndexerConfig, IndexerWeights};
 use crate::loader::LoadError;
-
-fn find_info<'a>(
-    file: &'a impl TensorSource,
-    name: &str,
-) -> Result<&'a ferrox_gguf::TensorInfo, LoadError> {
-    file.find_tensor(name)
-        .ok_or_else(|| LoadError::Gguf(ferrox_gguf::GgufError::TensorNotFound(name.to_string())))
-}
-
-fn load_f32_vec(file: &impl TensorSource, name: &str) -> Result<Vec<f32>, LoadError> {
-    let info = find_info(file, name)?;
-    let raw = file.tensor_bytes(name)?;
-    match info.dtype {
-        GgmlType::F32 => {
-            let mut out = Vec::with_capacity(raw.len() / 4);
-            for chunk in raw.as_chunks::<4>().0 {
-                out.push(f32::from_le_bytes(*chunk));
-            }
-            Ok(out)
-        }
-        GgmlType::F16 => ferrox_quant::dequant_f16(raw)
-            .map_err(|_| LoadError::UnsupportedDtype(name.to_string(), GgmlType::F16)),
-        GgmlType::BF16 => ferrox_quant::dequant_bf16(raw)
-            .map_err(|_| LoadError::UnsupportedDtype(name.to_string(), GgmlType::BF16)),
-        other => Err(LoadError::UnsupportedDtype(name.to_string(), other)),
-    }
-}
-
-/// Loads a real 2D GGUF weight matrix. Mirrors
-/// `kimi_gguf_loader::load_weight_matrix`'s ggml `ne[]`-reversal and
-/// quantized-in-place dispatch exactly (duplicated rather than shared,
-/// same precedent that module sets for not sharing this private
-/// helper across loaders).
-fn load_weight_matrix(file: &impl TensorSource, name: &str) -> Result<WeightMatrix, LoadError> {
-    let info = find_info(file, name)?;
-    let shape: Vec<usize> = info.shape.iter().rev().map(|&d| d as usize).collect();
-    let (rows, cols) = match shape.as_slice() {
-        [r, c] => (*r, *c),
-        other => {
-            return Err(LoadError::UnsupportedDtype(
-                format!("{name} (expected 2D, got shape {other:?})"),
-                info.dtype,
-            ))
-        }
-    };
-    match info.dtype {
-        GgmlType::F32 | GgmlType::F16 | GgmlType::BF16 => {
-            let data = load_f32_vec(file, name)?;
-            Ok(WeightMatrix::F32(Tensor::new(data, shape)))
-        }
-        other => match quant_kind_for(other) {
-            Some(kind) => {
-                let (mmap, range) = file.tensor_mapped_range(name)?;
-                Ok(WeightMatrix::Quantized {
-                    data: WeightBytes::Mapped { mmap, range },
-                    rows,
-                    cols,
-                    kind,
-                })
-            }
-            None => Err(LoadError::UnsupportedDtype(name.to_string(), other)),
-        },
-    }
-}
+use crate::loader::{find_info, load_f32_vec, load_weight_matrix, split_expert_tensor};
 
 /// Splits `blk.N.attn_k_b.weight` (real on-disk ggml `ne[]` =
 /// `[qk_nope_head_dim, kv_lora_rank, n_head]`, i.e. per head, physically
@@ -222,64 +159,6 @@ fn load_wv_b(
                         },
                         rows: v_head_dim,
                         cols: kv_lora_rank,
-                        kind,
-                    })
-                    .collect())
-            }
-            None => Err(LoadError::UnsupportedDtype(name.to_string(), other)),
-        },
-    }
-}
-
-/// Splits a packed 3D expert tensor (`blk.N.ffn_{gate,down,up}_exps.weight`)
-/// into per-expert `WeightMatrix`es. Duplicated from
-/// `kimi_gguf_loader::split_expert_tensor` (itself duplicated from
-/// `loader::split_expert_tensor`) -- identical byte-chunking logic,
-/// GGUF's `n_experts`-as-slowest-varying-dimension convention.
-fn split_expert_tensor(
-    file: &impl TensorSource,
-    name: &str,
-    n_experts: usize,
-) -> Result<Vec<WeightMatrix>, LoadError> {
-    let info = find_info(file, name)?;
-    if info.shape.len() != 3 || info.shape[2] as usize != n_experts {
-        let file_experts = info.shape.last().map(|&d| d as usize).unwrap_or(0);
-        return Err(LoadError::ExpertCountMismatch(
-            name.to_string(),
-            file_experts,
-            n_experts,
-        ));
-    }
-    let out_dim = info.shape[1] as usize;
-    let in_dim = info.shape[0] as usize;
-    let raw = file.tensor_bytes(name)?;
-
-    match info.dtype {
-        GgmlType::F32 | GgmlType::F16 | GgmlType::BF16 => {
-            let all = crate::loader::widen_plain_float(info.dtype, raw, name)?;
-            let per_expert = out_dim * in_dim;
-            Ok((0..n_experts)
-                .map(|e| {
-                    WeightMatrix::F32(Tensor::new(
-                        all[e * per_expert..(e + 1) * per_expert].to_vec(),
-                        vec![out_dim, in_dim],
-                    ))
-                })
-                .collect())
-        }
-        other => match quant_kind_for(other) {
-            Some(kind) => {
-                let (mmap, full_range) = file.tensor_mapped_range(name)?;
-                let bytes_per_expert = raw.len() / n_experts;
-                Ok((0..n_experts)
-                    .map(|e| WeightMatrix::Quantized {
-                        data: WeightBytes::Mapped {
-                            mmap: std::sync::Arc::clone(&mmap),
-                            range: (full_range.start + e * bytes_per_expert)
-                                ..(full_range.start + (e + 1) * bytes_per_expert),
-                        },
-                        rows: out_dim,
-                        cols: in_dim,
                         kind,
                     })
                     .collect())

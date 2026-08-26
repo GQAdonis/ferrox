@@ -4,16 +4,14 @@
 //! dims, per-layer emb) and loads tensors named as in llama.cpp
 //! `gemma4.cpp` / `LLM_TENSOR_NAMES`.
 
-use ferrox_core::tensor::Tensor;
-use ferrox_core::weight_matrix::quant_kind_for;
-use ferrox_core::weight_matrix::{WeightBytes, WeightMatrix};
-use ferrox_gguf::{GgmlType, GgufValue, TensorSource};
+use ferrox_gguf::{GgufValue, TensorSource};
 
 use crate::gemma4_engine::{
     Gemma4AttnWeights, Gemma4Engine, Gemma4Hparams, Gemma4LayerWeights, Gemma4Weights,
     GEMMA4_ARCHES,
 };
 use crate::loader::LoadError;
+use crate::loader::{load_f32_vec, load_weight_matrix};
 
 fn meta_u64(file: &impl TensorSource, key: &str) -> Result<u64, LoadError> {
     file.metadata_u64(key)
@@ -136,65 +134,6 @@ pub fn read_gemma4_hparams(file: &impl TensorSource) -> Result<Gemma4Hparams, Lo
         final_logit_softcap,
         attention_scale: 1.0,
     })
-}
-
-fn find_info<'a>(
-    file: &'a impl TensorSource,
-    name: &str,
-) -> Result<&'a ferrox_gguf::TensorInfo, LoadError> {
-    file.find_tensor(name)
-        .ok_or_else(|| LoadError::Gguf(ferrox_gguf::GgufError::TensorNotFound(name.to_string())))
-}
-
-fn load_f32_vec(file: &impl TensorSource, name: &str) -> Result<Vec<f32>, LoadError> {
-    let info = find_info(file, name)?;
-    let raw = file.tensor_bytes(name)?;
-    match info.dtype {
-        GgmlType::F32 => {
-            let mut out = Vec::with_capacity(raw.len() / 4);
-            for chunk in raw.as_chunks::<4>().0 {
-                out.push(f32::from_le_bytes(*chunk));
-            }
-            Ok(out)
-        }
-        GgmlType::F16 => ferrox_quant::dequant_f16(raw)
-            .map_err(|_| LoadError::UnsupportedDtype(name.to_string(), GgmlType::F16)),
-        GgmlType::BF16 => ferrox_quant::dequant_bf16(raw)
-            .map_err(|_| LoadError::UnsupportedDtype(name.to_string(), GgmlType::BF16)),
-        other => Err(LoadError::UnsupportedDtype(name.to_string(), other)),
-    }
-}
-
-fn load_weight_matrix(file: &impl TensorSource, name: &str) -> Result<WeightMatrix, LoadError> {
-    let info = find_info(file, name)?;
-    let shape: Vec<usize> = info.shape.iter().rev().map(|&d| d as usize).collect();
-    let (rows, cols) = match shape.as_slice() {
-        [r, c] => (*r, *c),
-        other => {
-            return Err(LoadError::UnsupportedDtype(
-                format!("{name} (expected 2D, got shape {other:?})"),
-                info.dtype,
-            ))
-        }
-    };
-    match info.dtype {
-        GgmlType::F32 | GgmlType::F16 | GgmlType::BF16 => {
-            let data = load_f32_vec(file, name)?;
-            Ok(WeightMatrix::F32(Tensor::new(data, shape)))
-        }
-        other => match quant_kind_for(other) {
-            Some(kind) => {
-                let (mmap, range) = file.tensor_mapped_range(name)?;
-                Ok(WeightMatrix::Quantized {
-                    data: WeightBytes::Mapped { mmap, range },
-                    rows,
-                    cols,
-                    kind,
-                })
-            }
-            None => Err(LoadError::UnsupportedDtype(name.to_string(), other)),
-        },
-    }
 }
 
 fn load_layer(

@@ -141,6 +141,12 @@ fn load_layer(
     hp: &Gemma4Hparams,
     il: usize,
 ) -> Result<Gemma4LayerWeights, LoadError> {
+    // First, before a single tensor is read. A MoE Gemma-4 layer has no
+    // `ffn_gate.weight` at all -- its feed-forward is `ffn_gate_exps`
+    // and friends -- so leaving this until the dense loads would report
+    // whichever tensor happened to be missing first, which reads like a
+    // corrupt file rather than an unsupported architecture.
+    refuse_moe_layer(file, hp, il)?;
     let head_dim = hp.head_dim(il);
     let has_kv = hp.has_kv(il);
     let k_name = format!("blk.{il}.attn_k.weight");
@@ -202,6 +208,69 @@ fn load_layer(
         per_layer_post_norm,
         out_scale,
     })
+}
+
+/// Stops a MoE Gemma-4 checkpoint with an error that says what it is.
+///
+/// # Why this refuses instead of falling back to the dense path
+///
+/// Gemma-4's MoE layer is not a router bolted onto the dense FFN. Three
+/// of its differences change the numbers without changing any shape, so
+/// a stack that ignored them would load, run at full speed, and return
+/// fluent text computed the wrong way, with nothing in the output to say
+/// so:
+///
+/// - the router normalizes with a **weightless** RMSNorm, then scales by
+///   a learned vector **and** by `hidden^-0.5`;
+/// - selection is by raw logit with the softmax over only the selected
+///   `k`, which sums to one, unlike a slice of a full softmax;
+/// - each routing weight is then multiplied by
+///   `per_expert_scale[expert_id]`, after which the weights deliberately
+///   no longer sum to one.
+///
+/// The routing arithmetic itself is ported and tested --
+/// [`ferrox_moe::route_gemma4_moe`] and
+/// [`ferrox_moe::gemma4_router_logits`]. What is missing is the tensor
+/// names those two scale vectors and the layer's three feed-forward
+/// norms carry in a real GGUF, which cannot be guessed: the feed-forward
+/// runs two branches from two different pre-norms, post-norms each with
+/// its own weight, RMS-norms their sum with a third, adds the residual,
+/// and scales the layer output by a scalar.
+///
+/// So the error names what was found and what is still needed, which is
+/// also how those names get settled the first time someone points a real
+/// checkpoint at it.
+fn refuse_moe_layer(
+    file: &impl TensorSource,
+    hp: &Gemma4Hparams,
+    il: usize,
+) -> Result<(), LoadError> {
+    let expert_tensor = format!("blk.{il}.ffn_gate_exps.weight");
+    let declared = file
+        .metadata_u64(&format!("{}.expert_count", hp.arch))
+        .unwrap_or(0);
+    if declared == 0 && file.find_tensor(&expert_tensor).is_none() {
+        return Ok(());
+    }
+    let active = file
+        .metadata_u64(&format!("{}.expert_used_count", hp.arch))
+        .unwrap_or(0);
+    let found = file.find_tensor(&expert_tensor).is_some();
+    Err(LoadError::UnsupportedFeature(
+        hp.arch.clone(),
+        format!(
+            "this is a MoE Gemma-4 checkpoint ({declared} experts, {active} active per token, \
+             blk.{il}.ffn_gate_exps.weight {}), and ferrox loads only the dense Gemma-4 \
+             feed-forward. The routing arithmetic is implemented \
+             (ferrox_moe::route_gemma4_moe) but the loader cannot place it: Gemma-4's router \
+             needs a learned input scale and a per-expert output scale, and its feed-forward \
+             needs three separate norms, none of whose GGUF tensor names are known here. \
+             Loading it as dense would drop the per-expert scale and collapse the norms, which \
+             produces fluent, wrong output rather than an error. Report the tensor names in \
+             this file to have them wired up",
+            if found { "present" } else { "absent" }
+        ),
+    ))
 }
 
 /// Load a Gemma-4 GGUF into [`Gemma4Engine`].
@@ -567,6 +636,183 @@ mod tests {
         let logits = engine.forward_token(0, 0, &mut state);
         assert_eq!(logits.len(), vocab);
         assert!(logits.iter().all(|x| x.is_finite()));
+        let _ = std::fs::remove_file(&path);
+    }
+    /// A MoE Gemma-4 checkpoint is refused by NAME, not by a missing
+    /// dense tensor.
+    ///
+    /// The reported symptom was a bare
+    /// `TensorNotFound(blk.0.ffn_gate.weight)`, which reads like a
+    /// corrupt file. A MoE layer simply has no `ffn_gate.weight`: its
+    /// feed-forward is `ffn_gate_exps` and friends. The error now says
+    /// what the file is, how many experts it has, and what ferrox still
+    /// needs -- and crucially it REFUSES rather than falling back to the
+    /// dense path, because dropping Gemma-4's per-expert scale and
+    /// collapsing its three feed-forward norms changes no shape at all
+    /// and yields fluent, wrong output.
+    #[test]
+    fn a_moe_gemma4_checkpoint_is_refused_by_name_not_by_a_missing_dense_tensor() {
+        let (h, n_experts, ffn, vocab) = (16usize, 4usize, 32usize, 4usize);
+        let swa = [false];
+        let mut tensors = vec![
+            f32_tensor(
+                "token_embd.weight",
+                vec![vocab as u64, h as u64],
+                vec![0.01; vocab * h],
+            ),
+            f32_tensor("output_norm.weight", vec![h as u64], vec![1.0; h]),
+        ];
+        // Only the attention side plus the MoE feed-forward: exactly the
+        // tensor set that made the dense loader report a missing gate.
+        for name in [
+            "attn_norm.weight",
+            "post_attention_norm.weight",
+            "ffn_norm.weight",
+            "post_ffw_norm.weight",
+        ] {
+            tensors.push(f32_tensor(
+                &format!("blk.0.{name}"),
+                vec![h as u64],
+                vec![1.0; h],
+            ));
+        }
+        // A real MoE checkpoint carries its attention side unchanged;
+        // included so the refusal is proven to be about the FEED-FORWARD
+        // rather than about a fixture that is merely incomplete.
+        let (n_heads, n_kv, hd) = (2usize, 1usize, 8usize);
+        for (name, rows, cols) in [
+            ("attn_q", n_heads * hd, h),
+            ("attn_k", n_kv * hd, h),
+            ("attn_v", n_kv * hd, h),
+            ("attn_output", h, n_heads * hd),
+        ] {
+            tensors.push(f32_tensor(
+                &format!("blk.0.{name}.weight"),
+                vec![rows as u64, cols as u64],
+                vec![0.01; rows * cols],
+            ));
+        }
+        for name in ["attn_q_norm", "attn_k_norm"] {
+            tensors.push(f32_tensor(
+                &format!("blk.0.{name}.weight"),
+                vec![hd as u64],
+                vec![1.0; hd],
+            ));
+        }
+        tensors.push(f32_tensor(
+            "blk.0.ffn_gate_inp.weight",
+            vec![n_experts as u64, h as u64],
+            vec![0.01; n_experts * h],
+        ));
+        for name in ["ffn_gate_exps", "ffn_up_exps"] {
+            tensors.push(f32_tensor(
+                &format!("blk.0.{name}.weight"),
+                vec![n_experts as u64, ffn as u64, h as u64],
+                vec![0.01; n_experts * ffn * h],
+            ));
+        }
+
+        let kv = [
+            ("gemma4.block_count", 1u64),
+            ("gemma4.embedding_length", h as u64),
+            ("gemma4.feed_forward_length", ffn as u64),
+            ("gemma4.attention.head_count", 2u64),
+            ("gemma4.attention.head_count_kv", 1u64),
+            ("gemma4.attention.key_length", 8u64),
+            ("gemma4.attention.key_length_swa", 8u64),
+            ("gemma4.attention.sliding_window", 4u64),
+            ("gemma4.attention.shared_kv_layers", 0u64),
+            ("gemma4.embedding_length_per_layer_input", 0u64),
+            ("gemma4.expert_count", n_experts as u64),
+            ("gemma4.expert_used_count", 2u64),
+        ];
+        let fkv = [
+            ("gemma4.attention.layer_norm_rms_epsilon", 1e-5f32),
+            ("gemma4.rope.freq_base", 10000.0f32),
+            ("gemma4.rope.freq_base_swa", 10000.0f32),
+        ];
+        let bytes = build_gguf(
+            "gemma4",
+            &kv,
+            &fkv,
+            Some(("gemma4.attention.sliding_window_pattern", &swa)),
+            &tensors,
+        );
+        let path =
+            std::env::temp_dir().join(format!("ferrox_gemma4_moe_{}.gguf", std::process::id()));
+        std::fs::write(&path, &bytes).unwrap();
+        let file = GgufFile::open(&path).unwrap();
+
+        let err = match load_gemma4_engine(&file) {
+            Err(e) => e,
+            Ok(_) => panic!("a MoE Gemma-4 must not load as dense"),
+        };
+        let msg = err.to_string();
+        assert!(
+            matches!(err, LoadError::UnsupportedFeature(ref a, _) if a == "gemma4"),
+            "wrong error kind: {msg}"
+        );
+        assert!(msg.contains("MoE Gemma-4"), "{msg}");
+        assert!(msg.contains("4 experts"), "the count it found: {msg}");
+        assert!(msg.contains("2 active"), "the top-k it found: {msg}");
+        assert!(
+            msg.contains("route_gemma4_moe"),
+            "point at the routing that IS implemented: {msg}"
+        );
+        assert!(
+            !msg.contains("ffn_gate.weight'"),
+            "must not report the dense tensor a MoE layer never has: {msg}"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// And the detection must not fire on a dense checkpoint, which has
+    /// neither the metadata nor the expert tensors.
+    #[test]
+    fn a_dense_gemma4_checkpoint_is_untouched_by_the_moe_check() {
+        // `load_tiny_gemma4_and_forward` is the positive case in full;
+        // this pins the predicate itself, so a future edit that made the
+        // check fire on `expert_count == 0` would fail here rather than
+        // by breaking every dense load.
+        let (h, ffn) = (16usize, 32usize);
+        let tensors = vec![f32_tensor(
+            "token_embd.weight",
+            vec![4u64, h as u64],
+            vec![0.01; 4 * h],
+        )];
+        let kv = [
+            ("gemma4.block_count", 1u64),
+            ("gemma4.embedding_length", h as u64),
+            ("gemma4.feed_forward_length", ffn as u64),
+            ("gemma4.attention.head_count", 2u64),
+            ("gemma4.attention.head_count_kv", 1u64),
+            ("gemma4.attention.key_length", 8u64),
+            ("gemma4.attention.key_length_swa", 8u64),
+            ("gemma4.attention.sliding_window", 4u64),
+            ("gemma4.attention.shared_kv_layers", 0u64),
+            ("gemma4.embedding_length_per_layer_input", 0u64),
+        ];
+        let fkv = [
+            ("gemma4.attention.layer_norm_rms_epsilon", 1e-5f32),
+            ("gemma4.rope.freq_base", 10000.0f32),
+            ("gemma4.rope.freq_base_swa", 10000.0f32),
+        ];
+        let bytes = build_gguf(
+            "gemma4",
+            &kv,
+            &fkv,
+            Some(("gemma4.attention.sliding_window_pattern", &[false])),
+            &tensors,
+        );
+        let path =
+            std::env::temp_dir().join(format!("ferrox_gemma4_dense_{}.gguf", std::process::id()));
+        std::fs::write(&path, &bytes).unwrap();
+        let file = GgufFile::open(&path).unwrap();
+        let hp = read_gemma4_hparams(&file).expect("hparams");
+        assert!(
+            refuse_moe_layer(&file, &hp, 0).is_ok(),
+            "a dense checkpoint must pass the MoE check untouched"
+        );
         let _ = std::fs::remove_file(&path);
     }
 }

@@ -7,6 +7,30 @@
 //! machine cannot finish -- is an arithmetic failure, and it is much
 //! easier to be sure about arithmetic that can be run without a GPU.
 //!
+//! # This is not the batcher, and it is not meant to become it
+//!
+//! `ferrox-server`'s `batch_scheduler` also admits requests FIFO, and
+//! it is tempting to read the two as one policy written twice. They are
+//! not, and the difference is the memory model each admits against.
+//!
+//! The batcher serves the BLOCK model ferrox ships today: a request
+//! reserves `ceil((prompt + max_tokens) / block_size)` blocks for its
+//! lifetime. It says so itself -- "ferrox serves no windowed or
+//! recurrent model through this batcher" -- and it contains no
+//! sliding-window or recurrent-slot logic at all.
+//!
+//! This module admits against the WINDOW and RECURRENT models: chunks
+//! that must end on a page boundary, a request reclaiming its own
+//! slid-out window, and a recurrent slot per request. Those are exactly
+//! the cases the batcher excludes.
+//!
+//! The genuine overlap is "FIFO, bounded by a token budget", which is a
+//! `min()` and a subtraction. Routing the live batcher through this
+//! module to share that would put a never-run code path on the serving
+//! hot path to deduplicate two lines. So: the batcher is authoritative
+//! for the block model, this is authoritative for the window and
+//! recurrent models, and neither should grow the other's rules.
+//!
 //! # Prefill first, and no skipping ahead
 //!
 //! A step runs prefill if any prompt can be admitted, otherwise decode.

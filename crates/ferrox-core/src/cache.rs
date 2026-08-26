@@ -390,6 +390,14 @@ impl PagedKvStore {
         self.free_block_ids.len()
     }
 
+    pub fn n_kv_heads(&self) -> usize {
+        self.n_kv_heads
+    }
+
+    pub fn head_dim(&self) -> usize {
+        self.head_dim
+    }
+
     fn acquire_block(&mut self) -> Option<usize> {
         self.free_block_ids.pop()
     }
@@ -513,11 +521,173 @@ impl PagedKvCache {
         }
         self.seq_len = 0;
     }
+
+    /// How many *additional* blocks appending `n_new` positions would
+    /// take from `store`, given what this sequence already holds.
+    ///
+    /// The tail block is usually part-full, so the answer is not simply
+    /// `n_new / block_size`: the first `block_size - (seq_len %
+    /// block_size)` positions land in a block already held and cost
+    /// nothing. Callers that must not fail part-way through a write use
+    /// this to check the whole request against
+    /// [`PagedKvStore::free_block_count`] *before* touching anything.
+    pub fn blocks_needed_for(&self, store: &PagedKvStore, n_new: usize) -> usize {
+        let block_size = store.block_size();
+        let free_in_tail = (block_size - self.seq_len % block_size) % block_size;
+        n_new.saturating_sub(free_in_tail).div_ceil(block_size)
+    }
+
+    /// Copies this sequence's KV out of the shared store into a plain
+    /// contiguous [`KvCache`].
+    ///
+    /// This is what lets the batched prefill path run *unchanged* over
+    /// paged storage. Its fast arm hands `cache.k` / `cache.v` to a
+    /// blocked kernel that reads them as flat slices, and a block table
+    /// cannot be expressed that way. Rather than maintain a second
+    /// prefill kernel that reads through the table -- a copy that could
+    /// drift from the one every other model path uses -- the pages are
+    /// materialised once per layer, the existing kernel runs, and the
+    /// new rows go back with [`Self::append_contiguous`].
+    ///
+    /// The cost is one `seq_len * n_kv_heads * head_dim` copy per layer
+    /// per prefill call, against matmuls that dominate prefill. Decode
+    /// still reads through the block table and copies nothing, which is
+    /// where page sharing actually pays.
+    pub fn to_contiguous(&self, store: &PagedKvStore) -> KvCache {
+        let elems_per_position = store.n_kv_heads * store.head_dim;
+        let mut cache = KvCache::with_capacity(store.n_kv_heads, store.head_dim, self.seq_len);
+        cache.k.reserve_exact(self.seq_len * elems_per_position);
+        cache.v.reserve_exact(self.seq_len * elems_per_position);
+        for pos in 0..self.seq_len {
+            let block_id = self.block_table[pos / store.block_size];
+            let offset = pos % store.block_size;
+            cache.k.extend_from_slice(store.k_row(block_id, offset));
+            cache.v.extend_from_slice(store.v_row(block_id, offset));
+        }
+        cache.seq_len = self.seq_len;
+        cache
+    }
+
+    /// Appends `count` positions' worth of contiguous K/V rows, the
+    /// inverse of [`Self::to_contiguous`].
+    ///
+    /// Blocks are reserved for the whole append *before* the first row
+    /// is written, so a store that cannot hold the request refuses it
+    /// having changed nothing. Writing rows until the store runs dry
+    /// would leave the sequence with a `seq_len` that disagrees with
+    /// the model's own idea of how far it has got, which is not a
+    /// recoverable state.
+    pub fn append_contiguous(
+        &mut self,
+        store: &mut PagedKvStore,
+        k: &[f32],
+        v: &[f32],
+        count: usize,
+    ) -> Result<(), PagedStoreExhausted> {
+        let elems_per_position = store.n_kv_heads * store.head_dim;
+        assert_eq!(k.len(), count * elems_per_position, "k row count");
+        assert_eq!(v.len(), count * elems_per_position, "v row count");
+        if self.blocks_needed_for(store, count) > store.free_block_count() {
+            return Err(PagedStoreExhausted);
+        }
+        for i in 0..count {
+            let lo = i * elems_per_position;
+            let hi = lo + elems_per_position;
+            self.push(store, &k[lo..hi], &v[lo..hi])
+                .expect("blocks reserved above, so no push here can exhaust the store");
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `blocks_needed_for` is the reservation the whole no-partial-write
+    /// guarantee rests on, and it is wrong in two opposite directions
+    /// that fail very differently.
+    ///
+    /// UNDER-counting is the dangerous one: `append_contiguous` reserves
+    /// on this answer and then pushes with an `expect`, so too small a
+    /// number panics part-way through a layer -- exactly the corrupted
+    /// state the reservation exists to prevent. Over-counting merely
+    /// refuses a request that would have fitted.
+    ///
+    /// Both mistakes are one edit away. Flooring instead of ceiling
+    /// under-counts whenever the append does not land on a block
+    /// boundary; ignoring the part-full tail over-counts whenever a
+    /// sequence is mid-block, which after the first token is almost
+    /// always. Neither shows up when the numbers happen to divide
+    /// evenly, so the cases here are chosen so that they do not.
+    #[test]
+    fn blocks_needed_for_accounts_for_the_part_full_tail_block() {
+        let store = PagedKvStore::new(/* block_size = */ 4, 64, 1, 1);
+        let mut cache = PagedKvCache::new();
+
+        // Empty: a whole-block boundary, and a remainder that a floor
+        // would round away.
+        assert_eq!(cache.blocks_needed_for(&store, 0), 0);
+        assert_eq!(cache.blocks_needed_for(&store, 1), 1);
+        assert_eq!(cache.blocks_needed_for(&store, 4), 1);
+        assert_eq!(cache.blocks_needed_for(&store, 5), 2, "5 into 4s needs 2");
+
+        // One position in: three slots free in the tail, so appending up
+        // to three costs NOTHING. Ignoring the tail would say 1.
+        cache.seq_len = 1;
+        assert_eq!(cache.blocks_needed_for(&store, 3), 0, "fits in the tail");
+        assert_eq!(cache.blocks_needed_for(&store, 4), 1);
+        assert_eq!(cache.blocks_needed_for(&store, 8), 2);
+
+        // Tail exactly full: no free slots, so this behaves like empty.
+        cache.seq_len = 4;
+        assert_eq!(cache.blocks_needed_for(&store, 1), 1);
+        assert_eq!(cache.blocks_needed_for(&store, 4), 1);
+
+        // The awkward case: 1 free in the tail, 6 to append. 5 spill
+        // over 4-wide blocks, so 2. A floor gives 1 and a tail-blind
+        // ceil gives 2 for the wrong reason, so this pins the shape.
+        cache.seq_len = 3;
+        assert_eq!(cache.blocks_needed_for(&store, 6), 2);
+        assert_eq!(cache.blocks_needed_for(&store, 5), 1);
+    }
+
+    #[test]
+    fn a_gathered_sequence_round_trips_through_the_store() {
+        let mut store = PagedKvStore::new(2, 8, 2, 2);
+        let mut cache = PagedKvCache::new();
+        // Five positions over blocks of two: the tail block is half
+        // full, which is where an off-by-one in the gather shows up.
+        let rows: Vec<[f32; 4]> = (0..5)
+            .map(|i| {
+                let b = i as f32 * 10.0;
+                [b + 1.0, b + 2.0, b + 3.0, b + 4.0]
+            })
+            .collect();
+        for r in &rows {
+            cache.push(&mut store, r, r).unwrap();
+        }
+
+        let flat = cache.to_contiguous(&store);
+        assert_eq!(flat.seq_len, 5);
+        assert_eq!(flat.k.len(), 5 * 4);
+        for (i, r) in rows.iter().enumerate() {
+            assert_eq!(&flat.k[i * 4..(i + 1) * 4], r, "position {i} k");
+            assert_eq!(&flat.v[i * 4..(i + 1) * 4], r, "position {i} v");
+        }
+
+        // And appending those same rows back onto a fresh sequence
+        // reproduces the store's view of them exactly.
+        let mut rebuilt = PagedKvCache::new();
+        let mut store2 = PagedKvStore::new(2, 8, 2, 2);
+        rebuilt
+            .append_contiguous(&mut store2, &flat.k, &flat.v, 5)
+            .unwrap();
+        let again = rebuilt.to_contiguous(&store2);
+        assert_eq!(again.k, flat.k);
+        assert_eq!(again.v, flat.v);
+        assert_eq!(again.seq_len, flat.seq_len);
+    }
 
     #[test]
     fn push_grows_seq_len_and_stores_values() {

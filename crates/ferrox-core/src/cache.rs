@@ -17,7 +17,7 @@
 //!   `ferrox-server` as live per-request admission control via
 //!   `FERROX_KV_POOL_BLOCKS`/`FERROX_KV_POOL_BLOCK_SIZE`.
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 /// Returned by `KvCache::push` (and `with_pool`) when a pool-backed
 /// cache needs another block but its shared `KvBlockPool` has none
@@ -493,14 +493,16 @@ impl PagedKvCache {
     ) -> Result<(), PagedStoreExhausted> {
         let block_size = store.block_size();
         let offset_in_block = self.seq_len % block_size;
-        if offset_in_block == 0 {
+        // Index by position rather than taking the tail block: a
+        // sequence that pre-reserved (see `reserve`) already holds the
+        // block this position belongs in, and appending another would
+        // both leak a block and write the row in the wrong place.
+        let block_index = self.seq_len / block_size;
+        if block_index >= self.block_table.len() {
             let id = store.acquire_block().ok_or(PagedStoreExhausted)?;
             self.block_table.push(id);
         }
-        let block_id = *self
-            .block_table
-            .last()
-            .expect("offset_in_block == 0 branch above always pushes one first");
+        let block_id = self.block_table[block_index];
         store
             .k_row_mut(block_id, offset_in_block)
             .copy_from_slice(k_step);
@@ -525,16 +527,47 @@ impl PagedKvCache {
     /// How many *additional* blocks appending `n_new` positions would
     /// take from `store`, given what this sequence already holds.
     ///
-    /// The tail block is usually part-full, so the answer is not simply
-    /// `n_new / block_size`: the first `block_size - (seq_len %
-    /// block_size)` positions land in a block already held and cost
-    /// nothing. Callers that must not fail part-way through a write use
-    /// this to check the whole request against
-    /// [`PagedKvStore::free_block_count`] *before* touching anything.
+    /// Counted against held CAPACITY rather than against `seq_len`, so
+    /// it is right in both cases. The tail block is usually part-full,
+    /// so the answer is never simply `n_new / block_size`: positions
+    /// that land in a block already held cost nothing. And a sequence
+    /// that pre-reserved (see [`Self::reserve`]) holds blocks beyond
+    /// its length, which a `seq_len`-only sum would ask for twice.
+    ///
+    /// Callers that must not fail part-way through a write check this
+    /// against [`PagedKvStore::free_block_count`] before touching
+    /// anything.
     pub fn blocks_needed_for(&self, store: &PagedKvStore, n_new: usize) -> usize {
-        let block_size = store.block_size();
-        let free_in_tail = (block_size - self.seq_len % block_size) % block_size;
-        n_new.saturating_sub(free_in_tail).div_ceil(block_size)
+        let held_capacity = self.block_table.len() * store.block_size();
+        let unused = held_capacity.saturating_sub(self.seq_len);
+        n_new.saturating_sub(unused).div_ceil(store.block_size())
+    }
+
+    /// Takes the blocks `n_new` more positions will need, without
+    /// advancing `seq_len`.
+    ///
+    /// This is what makes a multi-layer append all-or-nothing. The
+    /// check and the taking happen together, so every later
+    /// [`Self::push`] writes into a block this sequence already owns
+    /// and cannot fail. Reserving and then not filling is harmless: the
+    /// blocks are this sequence's until it releases, and `seq_len`
+    /// still says how far it really got.
+    pub fn reserve(
+        &mut self,
+        store: &mut PagedKvStore,
+        n_new: usize,
+    ) -> Result<(), PagedStoreExhausted> {
+        let need = self.blocks_needed_for(store, n_new);
+        if need > store.free_block_count() {
+            return Err(PagedStoreExhausted);
+        }
+        for _ in 0..need {
+            let id = store
+                .acquire_block()
+                .expect("checked against free_block_count immediately above");
+            self.block_table.push(id);
+        }
+        Ok(())
     }
 
     /// Copies this sequence's KV out of the shared store into a plain
@@ -600,6 +633,126 @@ impl PagedKvCache {
     }
 }
 
+/// Per-layer [`PagedKvStore`]s that many concurrent requests share.
+///
+/// # Why a lock per layer, and why two phases
+///
+/// `ferrox-server` runs generation on `spawn_blocking` with, in its own
+/// words, "no I/O and no shared lock". `KvBlockPool` survives that
+/// because it only bounds a *count*: each `KvCache` owns a private
+/// `Vec`, and the pool mutex is taken briefly at acquire and release,
+/// never during a forward. A `PagedKvStore` is the opposite -- it IS
+/// the backing memory -- so sharing one across concurrent requests
+/// needs an answer to "who may touch these bytes when".
+///
+/// The answer the API already implies: attention takes
+/// `&PagedKvStore` and only `push` takes `&mut`. So the accesses split
+/// cleanly into many concurrent readers and one short exclusive write
+/// per position, which is exactly an `RwLock` -- and one per LAYER
+/// rather than one for the whole model, so two requests contend only
+/// when both are writing the same layer at the same instant.
+///
+/// A caller must therefore take the write guard for the push alone and
+/// drop it before attending under a read guard. Holding the write
+/// guard across attention would serialise the expensive half and give
+/// back a global lock with extra steps. Nothing breaks in the gap: a
+/// sequence's block table and length are its own, and another
+/// request's push in between only touches blocks it exclusively holds.
+///
+/// # Deadlock
+///
+/// [`Self::write_all`] is the one place several layers are held at
+/// once, and it takes them in ascending layer order. Every caller
+/// getting the same order is what makes that safe; there is no other
+/// multi-layer acquisition in the codebase, and a new one must follow
+/// the same rule.
+///
+/// # Poisoning
+///
+/// A panic while holding a store leaves the KV mid-write, which is not
+/// recoverable state, but it is also not *unsound* -- the bytes are
+/// plain `f32`. Poison is stepped over with `into_inner`, matching how
+/// `ferrox-server` already treats its pool mutex: a poisoned lock
+/// should not turn one request's panic into a permanently dead server.
+pub struct SharedPagedKv {
+    layers: Vec<RwLock<PagedKvStore>>,
+}
+
+impl SharedPagedKv {
+    /// One store per layer, each with `blocks_per_layer` blocks.
+    pub fn new(
+        n_layers: usize,
+        block_size: usize,
+        blocks_per_layer: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+    ) -> Self {
+        SharedPagedKv {
+            layers: (0..n_layers)
+                .map(|_| {
+                    RwLock::new(PagedKvStore::new(
+                        block_size,
+                        blocks_per_layer,
+                        n_kv_heads,
+                        head_dim,
+                    ))
+                })
+                .collect(),
+        }
+    }
+
+    /// Wraps stores the caller built, for tests and for callers that
+    /// size layers differently.
+    pub fn from_stores(stores: Vec<PagedKvStore>) -> Self {
+        SharedPagedKv {
+            layers: stores.into_iter().map(RwLock::new).collect(),
+        }
+    }
+
+    pub fn layer_count(&self) -> usize {
+        self.layers.len()
+    }
+
+    /// Shared access to one layer, for attention.
+    pub fn read(&self, layer: usize) -> RwLockReadGuard<'_, PagedKvStore> {
+        self.layers[layer]
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Exclusive access to one layer, for a push. Hold it for the push
+    /// and nothing else -- see the type docs.
+    pub fn write(&self, layer: usize) -> RwLockWriteGuard<'_, PagedKvStore> {
+        self.layers[layer]
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Every layer at once, in ascending order, so a multi-layer append
+    /// is atomic against other requests.
+    ///
+    /// This is what makes "all layers advance or none do" hold under
+    /// concurrency rather than only single-threaded: checking free
+    /// space and then appending are separate steps, and without the
+    /// guards spanning both, another request can take the blocks in
+    /// between and leave this one half-written.
+    ///
+    /// Ascending order is the deadlock rule; see the type docs.
+    pub fn write_all(&self) -> Vec<RwLockWriteGuard<'_, PagedKvStore>> {
+        self.layers
+            .iter()
+            .map(|l| l.write().unwrap_or_else(|poisoned| poisoned.into_inner()))
+            .collect()
+    }
+
+    /// Free blocks in one layer, for admission control. A snapshot: by
+    /// the time a caller acts on it another request may have taken
+    /// them, which is why the append itself re-checks under the guard.
+    pub fn free_blocks(&self, layer: usize) -> usize {
+        self.read(layer).free_block_count()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -622,8 +775,18 @@ mod tests {
     /// evenly, so the cases here are chosen so that they do not.
     #[test]
     fn blocks_needed_for_accounts_for_the_part_full_tail_block() {
-        let store = PagedKvStore::new(/* block_size = */ 4, 64, 1, 1);
+        let mut store = PagedKvStore::new(/* block_size = */ 4, 64, 1, 1);
         let mut cache = PagedKvCache::new();
+        let row = [1.0f32];
+        // Real pushes rather than poking `seq_len`: the count is
+        // against blocks this sequence HOLDS, so a length with no
+        // blocks behind it is a state that cannot occur and would only
+        // let the test agree with an arithmetic nothing produces.
+        let advance = |cache: &mut PagedKvCache, store: &mut PagedKvStore, n: usize| {
+            for _ in 0..n {
+                cache.push(store, &row, &row).unwrap();
+            }
+        };
 
         // Empty: a whole-block boundary, and a remainder that a floor
         // would round away.
@@ -634,21 +797,33 @@ mod tests {
 
         // One position in: three slots free in the tail, so appending up
         // to three costs NOTHING. Ignoring the tail would say 1.
-        cache.seq_len = 1;
+        advance(&mut cache, &mut store, 1);
         assert_eq!(cache.blocks_needed_for(&store, 3), 0, "fits in the tail");
         assert_eq!(cache.blocks_needed_for(&store, 4), 1);
         assert_eq!(cache.blocks_needed_for(&store, 8), 2);
 
-        // Tail exactly full: no free slots, so this behaves like empty.
-        cache.seq_len = 4;
-        assert_eq!(cache.blocks_needed_for(&store, 1), 1);
-        assert_eq!(cache.blocks_needed_for(&store, 4), 1);
-
         // The awkward case: 1 free in the tail, 6 to append. 5 spill
         // over 4-wide blocks, so 2. A floor gives 1 and a tail-blind
         // ceil gives 2 for the wrong reason, so this pins the shape.
-        cache.seq_len = 3;
+        advance(&mut cache, &mut store, 2); // seq_len = 3
         assert_eq!(cache.blocks_needed_for(&store, 6), 2);
+        assert_eq!(cache.blocks_needed_for(&store, 5), 1);
+
+        // Tail exactly full: no free slots, so this behaves like empty.
+        advance(&mut cache, &mut store, 1); // seq_len = 4
+        assert_eq!(cache.blocks_needed_for(&store, 1), 1);
+        assert_eq!(cache.blocks_needed_for(&store, 4), 1);
+
+        // A RESERVED block is capacity this sequence already holds, so
+        // it must not be asked for twice. Counting from `seq_len` alone
+        // would say 1 here and take a second block for positions the
+        // reservation already covers.
+        cache.reserve(&mut store, 4).unwrap();
+        assert_eq!(
+            cache.blocks_needed_for(&store, 4),
+            0,
+            "a reserved block is already held"
+        );
         assert_eq!(cache.blocks_needed_for(&store, 5), 1);
     }
 

@@ -449,14 +449,16 @@ fn attn_forward_token(
                 .as_ref()
                 .expect("a CSA layer must carry its role projections and indexer");
             let n_index_heads = csa.indexer_head_weights.len();
-            let index_head_dim = if n_index_heads > 0 {
-                csa.indexer_q_proj.apply(&q[..cfg.qk_head_dim]).len() / n_index_heads
-            } else {
-                0
-            };
-            let indexer_q: Vec<Vec<f32>> = csa
-                .indexer_q_proj
-                .apply(&q[..cfg.qk_head_dim])
+            // Projected once. Splitting the width across the index
+            // heads needs the length, and computing it by projecting a
+            // second time would run the indexer's matvec twice on every
+            // decode step of every CSA layer.
+            let projected = csa.indexer_q_proj.apply(&q[..cfg.qk_head_dim]);
+            // `checked_div` rather than a guarded `/`: a layer that
+            // declares no index heads has no width to split, and zero
+            // is the honest answer rather than a panic.
+            let index_head_dim = projected.len().checked_div(n_index_heads).unwrap_or(0);
+            let indexer_q: Vec<Vec<f32>> = projected
                 .chunks(index_head_dim.max(1))
                 .map(|c| c.to_vec())
                 .collect();

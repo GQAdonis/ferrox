@@ -3991,6 +3991,29 @@ async fn run(mcp_config_path: Option<PathBuf>, exit_on_stdin_close: bool) -> any
                  mutually exclusive: both bound the same KV memory, by different means. \
                  Set one."
             );
+            // Paged KV computes the wrong answer on the GPU today.
+            // Measured on this host with Llama-3.2-3B Q4_K_M: CPU
+            // paged and non-paged both answer "Blue and Red.", and
+            // Metal paged answers "Blue ( question mark;>a> is a> is".
+            // The prompt, the seed and the model are identical, so the
+            // page indirection is diverging somewhere the contiguous
+            // path does not.
+            //
+            // Refused rather than left to run, because fluent wrong
+            // output is the failure this project refuses everywhere
+            // else: nothing in the response says the attention read the
+            // wrong pages. Lift this once the paged path passes
+            // `ferrox verify --backend metal` with prefill covered.
+            let gpu_offload = std::env::var("FERROX_METAL").as_deref() == Ok("1")
+                || std::env::var("FERROX_CUDA").as_deref() == Ok("1");
+            assert!(
+                !gpu_offload,
+                "FERROX_PAGED_KV_BLOCKS is CPU-only right now: on a GPU \
+                 backend the paged attention path returns wrong tokens \
+                 rather than failing, so it is refused instead. Run the \
+                 server with `-dev none -ngl 0` to use paged KV, or unset \
+                 FERROX_PAGED_KV_BLOCKS to use the GPU."
+            );
             let blocks_per_layer: usize = blocks
                 .parse()
                 .expect("FERROX_PAGED_KV_BLOCKS must be a positive integer");

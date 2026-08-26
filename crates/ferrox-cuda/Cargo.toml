@@ -31,6 +31,13 @@ thiserror = { workspace = true }
 # build under the rustc 1.75 available here. If this project is later
 # built on a newer toolchain, revisit this pin -- there is no reason to
 # stay on 0.11.9 once the constraint is gone.
+# Policy only, and a leaf crate with no ferrox dependencies of its own,
+# so this adds no cycle. Needed for the `SlotDevice` trait that
+# `expert_pool` implements: ferrox-edge decides expert residency and
+# holds no device memory by design, and this crate is where that
+# decision meets a real allocation. Optional and tied to `cuda`, so a
+# default build of this crate does not pull it in at all.
+ferrox-edge = { workspace = true, optional = true }
 cudarc = { version = "=0.11.9", optional = true, default-features = false, features = [
     "std",
     "driver",
@@ -44,4 +51,4 @@ half = { workspace = true }
 
 [features]
 default = []
-cuda = ["dep:cudarc"]
+cuda = ["dep:cudarc", "dep:ferrox-edge"]

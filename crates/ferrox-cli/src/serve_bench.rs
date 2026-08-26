@@ -18,15 +18,16 @@
 //! in a TLS-capable one would measure the client's connection handling
 //! as much as the server's.
 
-use std::io::{BufRead, BufReader, Write};
-use std::net::TcpStream;
+use std::io::BufRead;
 use std::sync::mpsc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::Result;
 use clap::Parser;
 use ferrox_edge::{is_token_chunk, BenchReport, BenchSampling, Latency, RequestTiming};
 use serde_json::{json, Value};
+
+use crate::http;
 
 #[derive(Parser, Debug)]
 pub struct ServeBenchArgs {
@@ -74,7 +75,7 @@ pub fn run_serve_bench(args: ServeBenchArgs) -> Result<()> {
     let base = args.url.trim_end_matches('/').to_string();
     // Fail before the run rather than N times inside it: a connection
     // refused per worker buries the one useful line under noise.
-    parse_url(&format!("{base}/v1/chat/completions"))?;
+    http::parse_url(&format!("{base}/v1/chat/completions"))?;
 
     let sampling = BenchSampling::new(args.output_len);
     let prompt = filler_prompt(args.prompt_chars);
@@ -203,39 +204,9 @@ fn stream_request(
     started: &Instant,
     timing: &mut RequestTiming,
 ) -> Result<()> {
-    let (host, port, path) = parse_url(&format!("{base}/v1/chat/completions"))?;
     let bytes = serde_json::to_vec(body)?;
-    let stream = TcpStream::connect((host.as_str(), port))
-        .with_context(|| format!("connect {host}:{port}"))?;
-    stream.set_read_timeout(Some(Duration::from_secs(600)))?;
-    stream.set_write_timeout(Some(Duration::from_secs(30)))?;
-    let mut stream = stream;
-
-    let header = format!(
-        "POST {path} HTTP/1.1\r\nHost: {host}:{port}\r\nConnection: close\r\n\
-         Content-Type: application/json\r\nContent-Length: {}\r\n\r\n",
-        bytes.len()
-    );
-    stream.write_all(header.as_bytes())?;
-    stream.write_all(&bytes)?;
-
-    let mut reader = BufReader::new(stream);
-    let mut status_line = String::new();
-    reader.read_line(&mut status_line)?;
-    let status: u16 = status_line
-        .split_whitespace()
-        .nth(1)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
-    loop {
-        let mut line = String::new();
-        if reader.read_line(&mut line)? == 0 {
-            break;
-        }
-        if line == "\r\n" || line == "\n" {
-            break;
-        }
-    }
+    let (status, mut reader) =
+        http::open("POST", &format!("{base}/v1/chat/completions"), Some(&bytes))?;
     if !(200..300).contains(&status) {
         let mut rest = String::new();
         use std::io::Read;
@@ -274,21 +245,6 @@ fn stream_request(
         line.clear();
     }
     Ok(())
-}
-
-fn parse_url(url: &str) -> Result<(String, u16, String)> {
-    let url = url.strip_prefix("http://").ok_or_else(|| {
-        anyhow!("only http:// URLs are supported (got {url}); https is not implemented here")
-    })?;
-    let (hostport, path) = match url.split_once('/') {
-        Some((hp, p)) => (hp, format!("/{p}")),
-        None => (url, "/".to_string()),
-    };
-    let (host, port) = match hostport.split_once(':') {
-        Some((h, p)) => (h.to_string(), p.parse().context("bad port")?),
-        None => (hostport.to_string(), 80u16),
-    };
-    Ok((host, port, path))
 }
 
 fn ms(seconds: Option<f64>) -> String {
@@ -411,21 +367,5 @@ mod tests {
     fn a_latency_that_was_never_measured_prints_as_a_dash() {
         assert_eq!(ms(None), "-");
         assert_eq!(ms(Some(0.0125)), "12.5");
-    }
-
-    #[test]
-    fn only_http_urls_are_accepted_and_the_default_port_is_80() {
-        let (host, port, path) = parse_url("http://127.0.0.1:8383/v1/chat/completions").unwrap();
-        assert_eq!(host, "127.0.0.1");
-        assert_eq!(port, 8383);
-        assert_eq!(path, "/v1/chat/completions");
-
-        let (host, port, path) = parse_url("http://example.test").unwrap();
-        assert_eq!(
-            (host.as_str(), port, path.as_str()),
-            ("example.test", 80, "/")
-        );
-
-        assert!(parse_url("https://example.test").is_err());
     }
 }

@@ -3,13 +3,13 @@
 //! Talks to a running `ferrox-server` over HTTP so chat-template wrapping
 //! and streaming stay on the validated serve path (no duplicated decode).
 
-use std::io::{BufRead, BufReader, Read, Write};
-use std::net::TcpStream;
-use std::time::Duration;
+use std::io::{BufRead, Read, Write};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result};
 use clap::Parser;
 use serde_json::{json, Value};
+
+use crate::http;
 
 #[derive(Parser, Debug)]
 pub struct ChatArgs {
@@ -46,7 +46,7 @@ pub struct ChatArgs {
 pub fn run_chat(args: ChatArgs) -> Result<()> {
     let stream = args.stream && !args.no_stream;
     let base = args.url.trim_end_matches('/');
-    let health = http_get(&format!("{base}/health"))
+    let health = http::get(&format!("{base}/health"))
         .with_context(|| format!("health check failed for {base}"))?;
     if !(200..300).contains(&health.status) {
         anyhow::bail!("server /health returned HTTP {}", health.status);
@@ -101,7 +101,7 @@ pub fn run_chat(args: ChatArgs) -> Result<()> {
             continue;
         }
         if line == "/stats" {
-            match http_get(&format!("{base}/v1/stats")) {
+            match http::get(&format!("{base}/v1/stats")) {
                 Ok(resp) => match serde_json::from_slice::<Value>(&resp.body) {
                     Ok(v) => eprintln!("{}", render_stats(&v)),
                     Err(e) => eprintln!("(could not read /v1/stats: {e})"),
@@ -260,7 +260,7 @@ struct ThinkGears {
 
 impl ThinkGears {
     fn fetch(base: &str) -> Result<Self> {
-        let resp = http_get(&format!("{base}/v1/models"))?;
+        let resp = http::get(&format!("{base}/v1/models"))?;
         let body: Value = serde_json::from_slice(&resp.body).context("parse /v1/models")?;
         Ok(Self::from_models(&body))
     }
@@ -389,7 +389,7 @@ fn render_stats(v: &Value) -> String {
 /// `/cache` with no argument shows the pool; with one, resizes it.
 fn cache_command(base: &str, arg: &str) -> String {
     if arg.is_empty() {
-        return match http_get(&format!("{base}/v1/cache/status")) {
+        return match http::get(&format!("{base}/v1/cache/status")) {
             Ok(resp) => match serde_json::from_slice::<Value>(&resp.body) {
                 Ok(v) => render_cache_status(&v),
                 Err(e) => format!("(could not read /v1/cache/status: {e})"),
@@ -405,7 +405,7 @@ fn cache_command(base: &str, arg: &str) -> String {
         Ok(b) => b,
         Err(e) => return format!("(could not encode the request: {e})"),
     };
-    match http_exchange("POST", &format!("{base}/v1/cache/rebuild"), Some(&bytes)) {
+    match http::exchange("POST", &format!("{base}/v1/cache/rebuild"), Some(&bytes)) {
         Ok(resp) => {
             let v: Value = serde_json::from_slice(&resp.body).unwrap_or(Value::Null);
             // The server's own refusal text, verbatim: it names the
@@ -434,112 +434,18 @@ fn render_cache_status(v: &Value) -> String {
     }
 }
 
-struct HttpResponse {
-    status: u16,
-    body: Vec<u8>,
-}
-
-fn parse_url(url: &str) -> Result<(String, u16, String)> {
-    let url = url.strip_prefix("http://").ok_or_else(|| {
-        anyhow!("only http:// URLs are supported (got {url}); https not implemented in chat client")
-    })?;
-    let (hostport, path) = match url.split_once('/') {
-        Some((hp, p)) => (hp, format!("/{p}")),
-        None => (url, "/".to_string()),
-    };
-    let (host, port) = match hostport.split_once(':') {
-        Some((h, p)) => (h.to_string(), p.parse().context("bad port")?),
-        None => (hostport.to_string(), 80u16),
-    };
-    Ok((host, port, path))
-}
-
-fn http_exchange(method: &str, url: &str, body: Option<&[u8]>) -> Result<HttpResponse> {
-    let (host, port, path) = parse_url(url)?;
-    let mut stream = TcpStream::connect((host.as_str(), port))
-        .with_context(|| format!("connect {host}:{port}"))?;
-    stream.set_read_timeout(Some(Duration::from_secs(600)))?;
-    stream.set_write_timeout(Some(Duration::from_secs(30)))?;
-
-    let mut req =
-        format!("{method} {path} HTTP/1.1\r\nHost: {host}:{port}\r\nConnection: close\r\n");
-    if let Some(b) = body {
-        req.push_str("Content-Type: application/json\r\n");
-        req.push_str(&format!("Content-Length: {}\r\n", b.len()));
-        req.push_str("\r\n");
-        stream.write_all(req.as_bytes())?;
-        stream.write_all(b)?;
-    } else {
-        req.push_str("\r\n");
-        stream.write_all(req.as_bytes())?;
-    }
-
-    let mut reader = BufReader::new(stream);
-    let mut status_line = String::new();
-    reader.read_line(&mut status_line)?;
-    let status: u16 = status_line
-        .split_whitespace()
-        .nth(1)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
-
-    // Skip headers
-    loop {
-        let mut line = String::new();
-        reader.read_line(&mut line)?;
-        if line == "\r\n" || line == "\n" || line.is_empty() {
-            break;
-        }
-    }
-
-    let mut body = Vec::new();
-    reader.read_to_end(&mut body)?;
-    Ok(HttpResponse { status, body })
-}
-
-fn http_get(url: &str) -> Result<HttpResponse> {
-    http_exchange("GET", url, None)
-}
-
 fn post_completion(base: &str, body: &Value) -> Result<String> {
     let bytes = serde_json::to_vec(body)?;
-    let resp = http_exchange("POST", &format!("{base}/v1/chat/completions"), Some(&bytes))?;
-    if !(200..300).contains(&resp.status) {
-        let msg = String::from_utf8_lossy(&resp.body);
-        anyhow::bail!("HTTP {}: {msg}", resp.status);
-    }
-    let v: Value = serde_json::from_slice(&resp.body).context("parse chat response")?;
+    let body = http::exchange("POST", &format!("{base}/v1/chat/completions"), Some(&bytes))?
+        .ok_or_status()?;
+    let v: Value = serde_json::from_slice(&body).context("parse chat response")?;
     extract_message_content(&v)
 }
 
 fn print_streamed_completion(base: &str, body: &Value, out: &mut impl Write) -> Result<String> {
-    let (host, port, path) = parse_url(&format!("{base}/v1/chat/completions"))?;
     let bytes = serde_json::to_vec(body)?;
-    let mut stream = TcpStream::connect((host.as_str(), port))?;
-    stream.set_read_timeout(Some(Duration::from_secs(600)))?;
-    let header = format!(
-        "POST {path} HTTP/1.1\r\nHost: {host}:{port}\r\nConnection: close\r\n\
-         Content-Type: application/json\r\nContent-Length: {}\r\n\r\n",
-        bytes.len()
-    );
-    stream.write_all(header.as_bytes())?;
-    stream.write_all(&bytes)?;
-
-    let mut reader = BufReader::new(stream);
-    let mut status_line = String::new();
-    reader.read_line(&mut status_line)?;
-    let status: u16 = status_line
-        .split_whitespace()
-        .nth(1)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
-    loop {
-        let mut line = String::new();
-        reader.read_line(&mut line)?;
-        if line == "\r\n" || line == "\n" || line.is_empty() {
-            break;
-        }
-    }
+    let (status, mut reader) =
+        http::open("POST", &format!("{base}/v1/chat/completions"), Some(&bytes))?;
     if !(200..300).contains(&status) {
         let mut rest = String::new();
         reader.read_to_string(&mut rest)?;
@@ -603,7 +509,7 @@ fn stated_request_id(chunk: &Value) -> Option<String> {
 
 fn cancel_generation(base: &str, request_id: &str) -> Result<()> {
     let body = serde_json::to_vec(&json!({"request_id": request_id}))?;
-    let resp = http_exchange("POST", &format!("{base}/v1/cancel"), Some(&body))?;
+    let resp = http::exchange("POST", &format!("{base}/v1/cancel"), Some(&body))?;
     if !(200..300).contains(&resp.status) {
         anyhow::bail!(
             "HTTP {}: {}",

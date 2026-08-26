@@ -7,6 +7,7 @@ mod bench_model;
 mod bench_suite;
 mod chat;
 mod host_state;
+mod http;
 mod parity;
 mod pull;
 mod run;

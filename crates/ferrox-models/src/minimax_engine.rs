@@ -25,10 +25,24 @@ pub struct MinimaxEngine {
 }
 
 impl MinimaxEngine {
+    /// Refuses, naming what exists and what does not.
+    ///
+    /// The block-sparse SELECTION is ported and tested
+    /// ([`ferrox_core::block_sparse`]): which 128-token KV blocks a
+    /// query may read, per KV head, with the force-included first and
+    /// newest blocks that keep a selection from ever being empty. What
+    /// is absent is everything around it -- the loader, the 256-expert
+    /// sigmoid MoE, and the MTP draft heads -- so there is nothing for
+    /// that selection to select over yet.
+    ///
+    /// Saying which half exists matters: a bare "not implemented"
+    /// invites the next reader to re-port the selection rule that is
+    /// already here and already covered.
     pub fn reject(_arch: &str) -> Result<(), MinimaxUnavailable> {
         Err(MinimaxUnavailable {
-            reason:
-                "MiniMax 256-expert sigmoid MoE + MTP not yet implemented (see minimax_engine.rs)",
+            reason: "MiniMax needs a loader, 256-expert sigmoid MoE routing and MTP draft heads, \
+                     none of which exist yet. Its block-sparse attention SELECTION is ported and \
+                     tested (ferrox_core::block_sparse); only the engine around it is missing",
         })
     }
 }

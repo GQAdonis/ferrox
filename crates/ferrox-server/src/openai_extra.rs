@@ -490,6 +490,7 @@ pub async fn completions(
     };
     let model = Arc::clone(&active.model);
     let kv_pool = state.kv_pool.clone();
+    let paged_kv = state.paged_kv.clone();
     let prefix_cache = state.prefix_cache.clone();
     let batcher = active.batcher.clone();
     let ceiling = active.ceiling.clone();
@@ -500,6 +501,7 @@ pub async fn completions(
             &prompt,
             &params,
             kv_pool.as_ref(),
+            paged_kv.as_ref(),
             prefix_cache.as_deref(),
             batcher.as_ref(),
             ceiling.as_deref(),

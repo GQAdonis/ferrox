@@ -52,11 +52,13 @@ library or overriding the CLI.
 | `FERROX_TOKIO_WORKERS` | `ferrox-server` async worker threads (default `2`); keeps the HTTP runtime from oversubscribing the decode pool |
 | `FERROX_QOS_LOG` | `1`, log each rayon worker's macOS QoS class at pool start |
 | `FERROX_EXIT_ON_STDIN_CLOSE` | `1`, exit on stdin EOF (same as `--exit-on-stdin-close`); off by default so a `/dev/null` stdin does not stop the server |
-| `FERROX_KV_POOL_BLOCKS` | Paged-KV pool size (blocks) |
-| `FERROX_KV_POOL_BLOCK_SIZE` | Tokens per paged-KV block |
-| `FERROX_KV_POOL_QUEUE_TIMEOUT_MS` | How long a request waits for a free block before it is rejected |
-| `FERROX_KV_BYTE_BUDGET` | Byte ceiling for the paged-KV pool, independent of block count |
-| `FERROX_PREFIX_CACHE_ENTRIES` | Prefix-cache capacity for the private generate path. Mutually exclusive with continuous batching |
+| `FERROX_KV_POOL_BLOCKS` | KV block-pool size (blocks). Bounds how much KV all requests may hold; each request still owns a private contiguous buffer |
+| `FERROX_KV_POOL_BLOCK_SIZE` | Tokens per KV pool block |
+| `FERROX_KV_POOL_QUEUE_TIMEOUT_MS` | How long a request waits for free KV before it is rejected. Applies to both the pool and paged KV |
+| `FERROX_KV_BYTE_BUDGET` | Byte ceiling for the KV block pool, independent of block count |
+| `FERROX_PAGED_KV_BLOCKS` | Blocks per layer of real paged KV: shared page storage many requests read through a block table, rather than a private buffer each. Mutually exclusive with `FERROX_KV_POOL_BLOCKS`/`FERROX_KV_BYTE_BUDGET` and with `FERROX_PREFIX_CACHE_ENTRIES`; setting an excluded pair stops the server with an error naming both |
+| `FERROX_PAGED_KV_BLOCK_SIZE` | Positions per paged-KV block. Must be set together with `FERROX_PAGED_KV_BLOCKS` |
+| `FERROX_PREFIX_CACHE_ENTRIES` | Prefix-cache capacity for the private generate path. Mutually exclusive with continuous batching and with paged KV |
 | `FERROX_EXPERT_CACHE_BYTES` | MoE expert-streaming cache budget |
 | `FERROX_SSD_STREAMING` | `1`, stream MoE experts from disk |
 | `FERROX_GPU_VRAM_BUDGET_BYTES` | Cap GPU-resident MoE experts (`0` = CPU experts on Metal) |

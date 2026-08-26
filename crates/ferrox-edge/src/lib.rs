@@ -72,7 +72,8 @@ pub use bench_client::{
     PromptLengthNotReached, RequestTiming, MAX_PROMPT_FIXED_POINT_STEPS,
 };
 pub use bench_profile::{
-    load_backend_recommendation, load_hybrid_fetch_fraction, load_policy, usable_profile,
+    entry_from, load_backend_recommendation, load_hybrid_fetch_fraction, load_policy,
+    usable_profile, write_profile, Measured, NotMeasurable,
 };
 pub use cache_manager::{CacheManager, CommitOutcome, OutOfMemory, SequenceState};
 pub use cache_report::{CacheGeometry, CachePools};

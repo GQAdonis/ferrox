@@ -206,6 +206,44 @@ still N tokens of work. A buffered stream therefore reports TTFT and
 end-to-end but no TPOT — that detail does not exist, and it is left
 blank rather than invented.
 
+## Bandwidth profile (`bench-bw`)
+
+`ferrox-edge`'s `qstar` decides how much of a MoE layer to fetch across
+the link and how much to compute on the CPU. Without a measured
+profile it falls back to an unbenchmarked default — one fetch per layer
+per step — so every deployment gets a split nobody measured.
+
+```bash
+cargo build --release -p ferrox-cli --features cuda
+./target/release/ferrox bench-bw --format q4_k
+./target/release/ferrox bench-bw --dry-run          # measure, write nothing
+```
+
+It writes `$XDG_CACHE_HOME/ferrox/benchbw/<gpu-uuid>.json`, which the
+loader finds on its own. A profile is keyed to the card it was taken
+on: another machine's split is worse than no split, so a profile whose
+recorded GPU name disagrees is refused rather than approximated.
+
+It refuses to write in two cases, both deliberate:
+
+- **Only one side measured.** The fetch fraction is a *ratio*, so one
+  number says nothing about the split. The PCIe half needs a CUDA
+  build; without one the command measures the CPU side, says so, and
+  writes nothing rather than half a profile that `policy_for` would
+  consult as though it were whole.
+- **An unoptimized build.** A debug binary measures its own code
+  generation, and since the device copy is driver-performed and
+  unaffected, that moves the *ratio* rather than merely lowering both
+  numbers. A verdict that flips with `--release` measures nothing.
+  `--allow-debug-build` overrides it if you know why you want that.
+
+The device-side measurement is a documented stub pending a benchmark
+host — see `docs/plans/freetoken-parity.md`. It must be timed with CUDA
+events rather than a wall clock, and repeated under contention, because
+the number the policy wants is the *contended* pair: standalone
+bandwidths assume each side owns the machine and neither does once they
+run together.
+
 ## Correctness (`verify`, `parity`)
 
 Two different questions, and only the second one involves llama.cpp.

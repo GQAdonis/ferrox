@@ -74,6 +74,7 @@
 //! authoritative arguments before it closes. [`MessagesStream`] owns
 //! all of that and is driven from tests with no model and no socket.
 
+use crate::stream_events::{map_tool_event, with_keepalive};
 use std::collections::VecDeque;
 use std::convert::Infallible;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -85,7 +86,7 @@ use axum::http::StatusCode;
 use axum::response::sse::{Event, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
-use futures_util::{Stream, StreamExt};
+use futures_util::StreamExt;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -960,6 +961,24 @@ pub(crate) enum GenEvent {
     Keepalive,
 }
 
+impl crate::stream_events::StreamEvent for GenEvent {
+    fn keepalive() -> Self {
+        GenEvent::Keepalive
+    }
+    fn content(text: String) -> Self {
+        GenEvent::Content(text)
+    }
+    fn call_start(index: usize, name: String) -> Self {
+        GenEvent::CallStart { index, name }
+    }
+    fn call_arguments(index: usize, fragment: String) -> Self {
+        GenEvent::CallArguments { index, fragment }
+    }
+    fn call_end(index: usize, arguments: String) -> Self {
+        GenEvent::CallEnd { index, arguments }
+    }
+}
+
 /// One SSE frame: the event name that goes in `event:` and the object
 /// that goes in `data:`.
 #[derive(Debug, Clone, PartialEq)]
@@ -1244,51 +1263,6 @@ impl MessagesStream {
                 frames.push(self.frame("error", json!({"error": error})));
                 frames
             }
-        }
-    }
-}
-
-/// Yields the generator's events, inserting [`GenEvent::Keepalive`]
-/// whenever `interval` passes with nothing to yield.
-///
-/// The timeout wraps the *receive*, not the previous event, which is
-/// what makes it cover the silence **before** the first event too --
-/// queueing and prefill on a long prompt is exactly where a stream goes
-/// quiet for minutes, and a keepalive that only started after the first
-/// token would not be there for it.
-fn with_keepalive(
-    events: tokio::sync::mpsc::Receiver<GenEvent>,
-    interval: Duration,
-) -> impl Stream<Item = GenEvent> {
-    // The receiver rides in the unfold's *state* rather than in the
-    // closure: a future returned by the closure may not borrow it.
-    futures_util::stream::unfold(events, move |mut events| async move {
-        match tokio::time::timeout(interval, events.recv()).await {
-            Err(_elapsed) => Some((GenEvent::Keepalive, events)),
-            Ok(Some(event)) => Some((event, events)),
-            Ok(None) => None,
-        }
-    })
-}
-
-/// One `ferrox_edge` tool-call parser event in this module's
-/// vocabulary. Empty fragments are dropped so an empty `partial_json`
-/// never reaches a client.
-fn map_tool_event(event: ferrox_edge::ToolCallEvent) -> Vec<GenEvent> {
-    match event {
-        ferrox_edge::ToolCallEvent::Text(text) if text.is_empty() => Vec::new(),
-        ferrox_edge::ToolCallEvent::Text(text) => vec![GenEvent::Content(text)],
-        ferrox_edge::ToolCallEvent::CallStart { index, name } => {
-            vec![GenEvent::CallStart { index, name }]
-        }
-        ferrox_edge::ToolCallEvent::CallArguments { fragment, .. } if fragment.is_empty() => {
-            Vec::new()
-        }
-        ferrox_edge::ToolCallEvent::CallArguments { index, fragment } => {
-            vec![GenEvent::CallArguments { index, fragment }]
-        }
-        ferrox_edge::ToolCallEvent::CallEnd { index, arguments } => {
-            vec![GenEvent::CallEnd { index, arguments }]
         }
     }
 }

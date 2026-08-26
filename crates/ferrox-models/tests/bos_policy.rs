@@ -46,17 +46,6 @@ impl Tok {
     }
 }
 
-fn token_text(file: &ferrox_gguf::ShardedGguf, key: &str) -> Option<String> {
-    let id = file.metadata_u64(key)? as usize;
-    let ferrox_gguf::GgufValue::Array(items) = file.metadata("tokenizer.ggml.tokens")? else {
-        return None;
-    };
-    match items.get(id)? {
-        ferrox_gguf::GgufValue::String(s) => Some(s.clone()),
-        _ => None,
-    }
-}
-
 fn collect_gguf(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
@@ -97,8 +86,8 @@ fn sweep_local_gguf_bos_policy() {
         else {
             continue;
         };
-        let bos_text = token_text(&file, "tokenizer.ggml.bos_token_id");
-        let eos_text = token_text(&file, "tokenizer.ggml.eos_token_id");
+        let bos_text = file.token_text("tokenizer.ggml.bos_token_id");
+        let eos_text = file.token_text("tokenizer.ggml.eos_token_id");
         let bos_id = file
             .metadata_u64("tokenizer.ggml.bos_token_id")
             .map(|v| v as u32);

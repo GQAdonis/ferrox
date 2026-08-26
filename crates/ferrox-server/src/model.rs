@@ -260,25 +260,6 @@ pub fn load() -> anyhow::Result<LoadedModel> {
     }
 }
 
-/// The *text* of a token named by an id-valued metadata key.
-///
-/// A chat template prints `{{ bos_token }}` / `{{ eos_token }}` as
-/// strings, and GGUF records those two as ids into
-/// `tokenizer.ggml.tokens` -- so the id has to be resolved back through
-/// the vocabulary before a template can print it. A checkpoint that
-/// names neither simply renders without them, which is what a template
-/// that never prints them expects anyway.
-fn token_text(file: &ShardedGguf, key: &str) -> Option<String> {
-    let id = file.metadata_u64(key)? as usize;
-    let ferrox_gguf::GgufValue::Array(items) = file.metadata("tokenizer.ggml.tokens")? else {
-        return None;
-    };
-    match items.get(id)? {
-        ferrox_gguf::GgufValue::String(s) => Some(s.clone()),
-        _ => None,
-    }
-}
-
 fn load_gguf_file(path: &str) -> anyhow::Result<LoadedModel> {
     let file = ShardedGguf::open(path)?;
     if file.shard_count() > 1 {
@@ -338,8 +319,8 @@ fn load_glm52_checkpoint(path: &str, file: &ShardedGguf) -> anyhow::Result<Glm52
         file.metadata_str("tokenizer.chat_template"),
         Some(arch.as_str()),
         byte_tokenizer,
-        token_text(file, "tokenizer.ggml.bos_token_id"),
-        token_text(file, "tokenizer.ggml.eos_token_id"),
+        file.token_text("tokenizer.ggml.bos_token_id"),
+        file.token_text("tokenizer.ggml.eos_token_id"),
     );
     tracing::info!("chat template: {}", chat_template.describe());
 
@@ -386,8 +367,8 @@ fn load_mla_checkpoint(path: &str, file: &ShardedGguf) -> anyhow::Result<MlaLoad
         file.metadata_str("tokenizer.chat_template"),
         Some(arch.as_str()),
         byte_tokenizer,
-        token_text(file, "tokenizer.ggml.bos_token_id"),
-        token_text(file, "tokenizer.ggml.eos_token_id"),
+        file.token_text("tokenizer.ggml.bos_token_id"),
+        file.token_text("tokenizer.ggml.eos_token_id"),
     );
     tracing::info!("chat template: {}", chat_template.describe());
 
@@ -435,8 +416,8 @@ fn load_gemma4_checkpoint(path: &str, file: &ShardedGguf) -> anyhow::Result<Gemm
         file.metadata_str("tokenizer.chat_template"),
         Some(arch.as_str()),
         byte_tokenizer,
-        token_text(file, "tokenizer.ggml.bos_token_id"),
-        token_text(file, "tokenizer.ggml.eos_token_id"),
+        file.token_text("tokenizer.ggml.bos_token_id"),
+        file.token_text("tokenizer.ggml.eos_token_id"),
     );
     tracing::info!("chat template: {}", chat_template.describe());
 
@@ -485,8 +466,8 @@ fn load_real_gguf_checkpoint(path: &str, file: &ShardedGguf) -> anyhow::Result<G
         file.metadata_str("tokenizer.chat_template"),
         file.metadata_str("general.architecture"),
         byte_tokenizer,
-        token_text(file, "tokenizer.ggml.bos_token_id"),
-        token_text(file, "tokenizer.ggml.eos_token_id"),
+        file.token_text("tokenizer.ggml.bos_token_id"),
+        file.token_text("tokenizer.ggml.eos_token_id"),
     );
     tracing::info!("chat template: {}", chat_template.describe());
 

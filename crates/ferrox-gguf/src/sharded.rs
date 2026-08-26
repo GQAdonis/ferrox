@@ -177,6 +177,25 @@ pub struct ShardedGguf {
 }
 
 impl ShardedGguf {
+    /// The token *text* a metadata key names by id, e.g.
+    /// `tokenizer.ggml.bos_token_id` -> `"<s>"`.
+    ///
+    /// Two lookups, and both can legitimately miss: the key may be
+    /// absent, and the id may be outside the token list a checkpoint
+    /// shipped. `None` for either, because a checkpoint without a BOS
+    /// token is a real configuration and not an error -- substituting a
+    /// placeholder would put a token in the prompt that the model was
+    /// never trained to see.
+    pub fn token_text(&self, key: &str) -> Option<String> {
+        let id = self.metadata_u64(key)? as usize;
+        let crate::GgufValue::Array(items) = self.metadata("tokenizer.ggml.tokens")? else {
+            return None;
+        };
+        match items.get(id)? {
+            crate::GgufValue::String(s) => Some(s.clone()),
+            _ => None,
+        }
+    }
     /// Opens the shard set containing `path`. `path` may be any shard of
     /// a split checkpoint (siblings are discovered from the canonical
     /// filename) or a plain single-file GGUF (loaded as a one-shard set).

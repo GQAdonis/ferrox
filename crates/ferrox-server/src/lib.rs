@@ -641,6 +641,19 @@ pub(crate) struct AppState {
     /// `None` (the default) preserves the
     /// original unbounded-per-request behavior exactly.
     pub(crate) kv_pool: Option<generate::KvPoolConfig>,
+    /// `Some` when `FERROX_PAGED_KV_BLOCKS` is set: per-layer paged KV
+    /// storage every request draws pages from, rather than each request
+    /// owning a private contiguous buffer.
+    ///
+    /// Mutually exclusive with BOTH `kv_pool` and `prefix_cache`, and
+    /// refused at startup rather than silently preferred. Against
+    /// `kv_pool` because they are two answers to the same question.
+    /// Against `prefix_cache` because `PrefixCache` stores
+    /// `Vec<KvCache>` snapshots, which a paged request has none of, so
+    /// enabling both would give a cache that can never hit -- see
+    /// `wire-radix-prefix-cache` in the plan, which is what removes
+    /// that restriction.
+    pub(crate) paged_kv: Option<generate::PagedKvConfig>,
     /// `Some` when `FERROX_PREFIX_CACHE_ENTRIES` is set: a shared,
     /// LRU-bounded store of previously processed prompt+KV-state
     /// snapshots (see `ferrox_models::PrefixCache`), consulted so a
@@ -2148,6 +2161,7 @@ fn run_generation_emit(
     prompt: &str,
     params: &GenerationParams,
     kv_pool: Option<&generate::KvPoolConfig>,
+    paged_kv: Option<&generate::PagedKvConfig>,
     prefix_cache: Option<&Mutex<PrefixCache>>,
     continuous_batcher: Option<&batch_scheduler::ContinuousBatcher>,
     ceiling: Option<&budget::ContextCeiling>,
@@ -2187,6 +2201,7 @@ fn run_generation_emit(
                     prompt,
                     params,
                     kv_pool,
+                    paged_kv,
                     prefix_cache,
                     ceiling,
                     |chunk| {
@@ -2272,11 +2287,14 @@ fn run_generation_emit(
 
 /// Collecting wrapper around [`run_generation_emit`] for non-streaming
 /// paths and tests.
+#[allow(clippy::too_many_arguments)] // mirrors `run_generation_emit`
+                                     // exactly, minus the sink; see its note.
 pub(crate) fn run_generation(
     model: &Model,
     prompt: &str,
     params: &GenerationParams,
     kv_pool: Option<&generate::KvPoolConfig>,
+    paged_kv: Option<&generate::PagedKvConfig>,
     prefix_cache: Option<&Mutex<PrefixCache>>,
     continuous_batcher: Option<&batch_scheduler::ContinuousBatcher>,
     ceiling: Option<&budget::ContextCeiling>,
@@ -2286,6 +2304,7 @@ pub(crate) fn run_generation(
         prompt,
         params,
         kv_pool,
+        paged_kv,
         prefix_cache,
         continuous_batcher,
         ceiling,
@@ -2633,6 +2652,7 @@ async fn chat_completions_full(
     } else {
         let model = Arc::clone(&active.model);
         let kv_pool = state.kv_pool.clone();
+        let paged_kv = state.paged_kv.clone();
         let prefix_cache = state.prefix_cache.clone();
         let batcher = active.batcher.clone();
         let ceiling = active.ceiling.clone();
@@ -2644,6 +2664,7 @@ async fn chat_completions_full(
                 &prompt_for_task,
                 &params,
                 kv_pool.as_ref(),
+                paged_kv.as_ref(),
                 prefix_cache.as_deref(),
                 batcher.as_ref(),
                 ceiling.as_deref(),
@@ -2747,6 +2768,7 @@ async fn chat_completions_stream(
 
     let model = Arc::clone(&active.model);
     let kv_pool = state.kv_pool.clone();
+    let paged_kv = state.paged_kv.clone();
     let prefix_cache = state.prefix_cache.clone();
     let batcher = active.batcher.clone();
     let ceiling = active.ceiling.clone();
@@ -2856,6 +2878,7 @@ async fn chat_completions_stream(
             &prompt,
             &params,
             kv_pool.as_ref(),
+            paged_kv.as_ref(),
             prefix_cache.as_deref(),
             batcher.as_ref(),
             ceiling.as_deref(),
@@ -3400,6 +3423,7 @@ pub(crate) fn activate_loaded_model(
 fn build_app_state(
     loaded: model::LoadedModel,
     kv_pool: Option<generate::KvPoolConfig>,
+    paged_kv: Option<generate::PagedKvConfig>,
     prefix_cache: Option<Arc<Mutex<PrefixCache>>>,
     enable_continuous_batching: bool,
     mcp: Option<mcp::LoadedMcpConfig>,
@@ -3423,6 +3447,7 @@ fn build_app_state(
             batcher,
             ceiling,
         }))),
+        paged_kv,
         load_in_progress: std::sync::atomic::AtomicBool::new(false),
         tasks: Arc::new(tasks::TaskRegistry::new()),
         cancels: Arc::new(cancel::CancelRegistry::new()),
@@ -3950,6 +3975,65 @@ async fn run(mcp_config_path: Option<PathBuf>, exit_on_stdin_close: bool) -> any
              set together (or neither, to disable KV cache pooling)"
         ),
     };
+    // Paged KV: per-layer shared page storage rather than a private
+    // contiguous buffer per request. Refused alongside the pool and the
+    // prefix cache rather than silently preferred over either -- an
+    // operator who set two of these meant one of them, and picking for
+    // them is how a deployment ends up not running what it thinks.
+    let paged_kv = match (
+        std::env::var("FERROX_PAGED_KV_BLOCKS"),
+        std::env::var("FERROX_PAGED_KV_BLOCK_SIZE"),
+    ) {
+        (Ok(blocks), Ok(block_size)) => {
+            assert!(
+                kv_pool.is_none(),
+                "FERROX_PAGED_KV_BLOCKS and FERROX_KV_POOL_BLOCKS/FERROX_KV_BYTE_BUDGET are \
+                 mutually exclusive: both bound the same KV memory, by different means. \
+                 Set one."
+            );
+            let blocks_per_layer: usize = blocks
+                .parse()
+                .expect("FERROX_PAGED_KV_BLOCKS must be a positive integer");
+            let block_size: usize = block_size
+                .parse()
+                .expect("FERROX_PAGED_KV_BLOCK_SIZE must be a positive integer");
+            let cfg = match &loaded {
+                model::LoadedModel::Gguf(g) => &g.decoder.config,
+                _ => panic!(
+                    "FERROX_PAGED_KV_BLOCKS requires a GGUF decoder model \
+                     (set FERROX_MODEL_PATH to a generic-decoder .gguf file)"
+                ),
+            };
+            let queue_wait_ms: u64 = std::env::var("FERROX_KV_POOL_QUEUE_TIMEOUT_MS")
+                .ok()
+                .map(|v| {
+                    v.parse()
+                        .expect("FERROX_KV_POOL_QUEUE_TIMEOUT_MS must be a non-negative integer")
+                })
+                .unwrap_or(0);
+            tracing::info!(
+                "Paged KV enabled: {blocks_per_layer} blocks x {block_size} positions per \
+                 layer across {} layers, shared by all concurrent requests, \
+                 {queue_wait_ms}ms admission queue wait",
+                cfg.n_layers
+            );
+            Some(generate::PagedKvConfig {
+                store: Arc::new(ferrox_core::cache::SharedPagedKv::new(
+                    cfg.n_layers,
+                    block_size,
+                    blocks_per_layer,
+                    cfg.n_kv_heads,
+                    cfg.head_dim,
+                )),
+                queue_wait: Duration::from_millis(queue_wait_ms),
+            })
+        }
+        (Err(_), Err(_)) => None,
+        _ => panic!(
+            "FERROX_PAGED_KV_BLOCKS and FERROX_PAGED_KV_BLOCK_SIZE must be set together \
+             (or neither, to disable paged KV)"
+        ),
+    };
     // Mutually exclusive with kv_pool (see generate::generate's doc
     // comment on why a pool-backed cache can't safely be restored from
     // a prefix-cache clone): if both are set, the KV pool wins and
@@ -3966,6 +4050,18 @@ async fn run(mcp_config_path: Option<PathBuf>, exit_on_stdin_close: bool) -> any
                      caching will never be consulted while a KV pool is configured"
             );
         }
+        // A hard refusal rather than the warning above, because the
+        // outcome is worse than "never consulted": `PrefixCache` stores
+        // `Vec<KvCache>` snapshots, and a paged request has none to
+        // give, so every store would be skipped and every lookup miss.
+        // An operator would see a prefix cache configured, reporting
+        // zero hits forever, with nothing saying why.
+        assert!(
+            paged_kv.is_none(),
+            "FERROX_PREFIX_CACHE_ENTRIES and FERROX_PAGED_KV_BLOCKS are mutually exclusive: \
+             the prefix cache stores contiguous KV snapshots, which a paged request does not \
+             produce, so the cache could never hit. Set one."
+        );
         tracing::info!(
             "KV-prefix cache enabled: up to {max_entries} stored prefixes, shared across \
                  all requests"
@@ -4037,6 +4133,7 @@ async fn run(mcp_config_path: Option<PathBuf>, exit_on_stdin_close: bool) -> any
     let state = Arc::new(build_app_state(
         loaded,
         kv_pool,
+        paged_kv,
         prefix_cache,
         enable_cb,
         mcp,
@@ -4368,6 +4465,7 @@ mod tests {
     /// builds one.
     fn test_state(model: Model, response_cache: ResponseCache) -> AppState {
         AppState {
+            paged_kv: None,
             active: std::sync::RwLock::new(Some(Arc::new(ActiveModel {
                 id: None,
                 model: Arc::new(model),
@@ -4653,6 +4751,7 @@ mod tests {
             &in_flight.model,
             "hi",
             &greedy_params(3),
+            None,
             None,
             None,
             None,
@@ -6720,7 +6819,16 @@ mod tests {
     #[test]
     fn run_generation_rejects_out_of_vocab_tokens_instead_of_panicking() {
         let model = test_model();
-        let result = run_generation(&model, "hello", &greedy_params(4), None, None, None, None);
+        let result = run_generation(
+            &model,
+            "hello",
+            &greedy_params(4),
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
         assert!(matches!(
             result,
             Err(generate::DecodeError::TokenOutOfVocab { .. })
@@ -6754,6 +6862,7 @@ mod tests {
             &prompt,
             &greedy_params(4),
             Some(&config),
+            None,
             None,
             None,
             None,
@@ -6791,6 +6900,7 @@ mod tests {
             &prompt,
             &greedy_params(4),
             Some(&config),
+            None,
             None,
             None,
             None,
@@ -6864,6 +6974,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .unwrap();
         assert_eq!(finish, FinishReason::Length);
@@ -6888,7 +6999,17 @@ mod tests {
             let model = Arc::clone(&model);
             let prompt = prompt.clone();
             handles.push(tokio::task::spawn_blocking(move || {
-                run_generation(&model, &prompt, &greedy_params(6), None, None, None, None).unwrap()
+                run_generation(
+                    &model,
+                    &prompt,
+                    &greedy_params(6),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .unwrap()
             }));
         }
 
@@ -7302,6 +7423,7 @@ mod tests {
             model::LoadedModel::Kimi(loaded),
             None,
             None,
+            None,
             false,
             None,
             Arc::new(health::Detection::ready(health::probe_backends())),
@@ -7314,6 +7436,7 @@ mod tests {
             &active.model,
             "hi",
             &greedy_params(5),
+            None,
             None,
             None,
             None,
@@ -7339,6 +7462,7 @@ mod tests {
             model::LoadedModel::Kimi(loaded),
             None,
             None,
+            None,
             false,
             None,
             Arc::new(health::Detection::ready(health::probe_backends())),
@@ -7359,6 +7483,7 @@ mod tests {
             "hi",
             &greedy_params(5),
             Some(&kv_pool_config),
+            None,
             Some(&pc),
             None,
             None,

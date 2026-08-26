@@ -8,7 +8,10 @@
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use ferrox_core::cache::{KvBlockPool, KvCache, KvPoolExhausted as CacheKvPoolExhausted};
+use ferrox_core::cache::{
+    KvBlockPool, KvCache, KvPoolExhausted as CacheKvPoolExhausted, PagedKvCache,
+    PagedStoreExhausted, SharedPagedKv,
+};
 use ferrox_models::sampling::{Sampler, SamplingParams};
 use ferrox_models::tokenizer::{prepend_bos, StopTokens};
 use ferrox_models::{Ceiling, Decoder, Engine, KvElem, KvShape, PrefixCache, TextTokenizer};
@@ -84,6 +87,150 @@ impl DecodeError {
 pub struct KvPoolConfig {
     pub pool: Arc<Mutex<KvBlockPool>>,
     pub queue_wait: Duration,
+}
+
+/// The paged counterpart to [`KvPoolConfig`]: per-layer
+/// [`SharedPagedKv`] storage every request draws pages from, plus the
+/// same admission wait policy.
+///
+/// Mutually exclusive with `KvPoolConfig` -- they are two answers to
+/// the same question, and a deployment picks one.
+#[derive(Clone)]
+pub struct PagedKvConfig {
+    pub store: Arc<SharedPagedKv>,
+    pub queue_wait: Duration,
+}
+
+/// One request's paged KV, which returns its pages when dropped.
+///
+/// `PagedKvCache` has no `Drop` of its own -- releasing needs a
+/// `&mut PagedKvStore` it does not hold a reference to -- so without
+/// this, every refusal path and every `?` between admission and the end
+/// of generation leaks the whole request's pages until the process
+/// exits. `KvCache::with_pool` gets this for free from its own `Drop`;
+/// the paged side has to be given it.
+pub struct PagedLease {
+    caches: Vec<PagedKvCache>,
+    store: Arc<SharedPagedKv>,
+}
+
+impl Drop for PagedLease {
+    fn drop(&mut self) {
+        // Ascending layer order, the same rule `write_all` follows.
+        for (layer, cache) in self.caches.iter_mut().enumerate() {
+            cache.release(&mut self.store.write(layer));
+        }
+    }
+}
+
+/// Reserves this request's WHOLE worst-case length up front, retrying
+/// until `config.queue_wait` elapses.
+///
+/// Reserving everything at admission is not an optimisation, it is what
+/// makes the decode loop's signature honest. `sample_until_stop` takes
+/// a closure returning `Vec<f32>`, with nowhere to report a store that
+/// ran dry at token 300 of 400 -- the same reason
+/// `acquire_pooled_caches` sizes for `max_seq_len` rather than growing,
+/// which that function's comment records as having been found by a real
+/// panic in live testing. A request that cannot fit is refused here,
+/// before any work, rather than dying halfway through an answer.
+fn acquire_paged_caches(
+    decoder: &Decoder,
+    config: &PagedKvConfig,
+    max_seq_len: usize,
+) -> Result<PagedLease, PagedStoreExhausted> {
+    let deadline = Instant::now() + config.queue_wait;
+    loop {
+        let mut caches: Vec<PagedKvCache> =
+            decoder.layers.iter().map(|_| PagedKvCache::new()).collect();
+        // Under one `write_all` so the reservation is atomic against
+        // other requests: layer 0 having room says nothing about layer
+        // 1, and checking then taking as separate steps lets another
+        // request slip in between.
+        let attempt = {
+            let mut guards = config.store.write_all();
+            let fits = caches
+                .iter()
+                .zip(guards.iter())
+                .all(|(c, s)| c.blocks_needed_for(s, max_seq_len) <= s.free_block_count());
+            if fits {
+                for (cache, store) in caches.iter_mut().zip(guards.iter_mut()) {
+                    cache
+                        .reserve(store, max_seq_len)
+                        .expect("checked under this same guard");
+                }
+            }
+            fits
+        };
+        if attempt {
+            return Ok(PagedLease {
+                caches,
+                store: Arc::clone(&config.store),
+            });
+        }
+        // Nothing was taken (the check failed before any reserve), so
+        // `caches` holds no pages and dropping it here leaks nothing.
+        let now = Instant::now();
+        if now >= deadline {
+            return Err(PagedStoreExhausted);
+        }
+        std::thread::sleep(Duration::from_millis(10).min(deadline - now));
+    }
+}
+
+/// Which KV representation this request is running on.
+///
+/// One enum rather than a second `generate`: the decode loop already
+/// takes an "advance one token" closure, so paging changes three
+/// expressions inside `generate` and nothing else. A parallel function
+/// would duplicate the sampling, the stop matching and the usage
+/// accounting, which is how the paged DECODER path lost five model
+/// features one at a time.
+enum Kv {
+    Contiguous(Vec<KvCache>),
+    Paged(PagedLease),
+}
+
+impl Kv {
+    /// Prefill, returning the last position's logits.
+    fn prefill(&mut self, decoder: &Decoder, tokens: &[usize]) -> Vec<f32> {
+        match self {
+            Kv::Contiguous(caches) => forward_prompt_batch(decoder, tokens, 0, caches),
+            Kv::Paged(lease) => decoder
+                .forward_batch_last_paged(tokens, 0, &mut lease.caches, &lease.store)
+                .expect("the whole request's pages were reserved at admission"),
+        }
+    }
+
+    /// One decode step.
+    fn step(&mut self, decoder: &Decoder, token: usize, pos: usize) -> Vec<f32> {
+        match self {
+            Kv::Contiguous(caches) => decoder.forward_token(token, pos, caches),
+            Kv::Paged(lease) => decoder
+                .forward_token_paged(token, pos, &mut lease.caches, &lease.store)
+                .expect("the whole request's pages were reserved at admission"),
+        }
+    }
+
+    /// The contiguous caches, when there are any.
+    ///
+    /// `prefix_cache` stores `Vec<KvCache>` snapshots, so a paged
+    /// request has nothing to hand it. That is why the two are refused
+    /// together at startup rather than silently producing a cache that
+    /// never hits -- and it is what `wire-radix-prefix-cache` removes.
+    fn contiguous_mut(&mut self) -> Option<&mut Vec<KvCache>> {
+        match self {
+            Kv::Contiguous(caches) => Some(caches),
+            Kv::Paged(_) => None,
+        }
+    }
+
+    fn into_contiguous(self) -> Option<Vec<KvCache>> {
+        match self {
+            Kv::Contiguous(caches) => Some(caches),
+            Kv::Paged(_) => None,
+        }
+    }
 }
 
 /// Retries acquiring one `KvCache` per layer from `config.pool` until
@@ -378,6 +525,7 @@ pub fn generate(
     prompt: &str,
     params: &GenerationParams,
     kv_pool: Option<&KvPoolConfig>,
+    paged_kv: Option<&PagedKvConfig>,
     prefix_cache: Option<&Mutex<PrefixCache>>,
     ceiling: Option<&ContextCeiling>,
     mut emit: impl FnMut(&str),
@@ -509,11 +657,19 @@ pub fn generate(
     let prefill_start = std::time::Instant::now();
     let mut pos;
     let mut logits: Vec<f32>;
-    let mut caches: Vec<KvCache>;
+    let mut kv: Kv;
     if let Some(m) = restored {
-        caches = m
-            .kv_caches
-            .expect("matched_len > 0 always carries kv_caches");
+        // Only the contiguous path reaches here: a prefix cache and a
+        // paged store are refused together at startup, because
+        // `PrefixCache` stores `Vec<KvCache>` snapshots a paged request
+        // cannot produce.
+        kv = Kv::Contiguous(
+            m.kv_caches
+                .expect("matched_len > 0 always carries kv_caches"),
+        );
+        let caches = &mut *kv
+            .contiguous_mut()
+            .expect("a restored prefix is contiguous by construction");
         let suffix = &tokens[m.matched_len..];
         if suffix.is_empty() {
             if let Some(pl) = m.pending_logits {
@@ -536,27 +692,35 @@ pub fn generate(
                     c.truncate(back_to);
                 }
                 pos = back_to;
-                logits = decoder.forward_token(tokens[back_to], pos, &mut caches);
+                logits = decoder.forward_token(tokens[back_to], pos, caches);
                 pos += 1;
             }
         } else {
             pos = m.matched_len;
             let mut l = Vec::new();
             for &tok in suffix {
-                l = decoder.forward_token(tok, pos, &mut caches);
+                l = decoder.forward_token(tok, pos, caches);
                 pos += 1;
             }
             logits = l;
         }
     } else {
-        caches = match kv_pool {
-            Some(config) => acquire_pooled_caches(decoder, config, max_seq_len)
-                .map_err(|_| DecodeError::KvPoolExhausted)?,
-            None => decoder
-                .layers
-                .iter()
-                .map(|_| KvCache::new(decoder.config.n_kv_heads, decoder.config.head_dim))
-                .collect(),
+        kv = match (paged_kv, kv_pool) {
+            (Some(config), _) => Kv::Paged(
+                acquire_paged_caches(decoder, config, max_seq_len)
+                    .map_err(|_| DecodeError::KvPoolExhausted)?,
+            ),
+            (None, Some(config)) => Kv::Contiguous(
+                acquire_pooled_caches(decoder, config, max_seq_len)
+                    .map_err(|_| DecodeError::KvPoolExhausted)?,
+            ),
+            (None, None) => Kv::Contiguous(
+                decoder
+                    .layers
+                    .iter()
+                    .map(|_| KvCache::new(decoder.config.n_kv_heads, decoder.config.head_dim))
+                    .collect(),
+            ),
         };
         // Process the prompt once, capturing the *last* call's logits
         // (which already predict the first generated token) instead of
@@ -565,7 +729,7 @@ pub fn generate(
         // seed from, so a synthetic id 0 bootstraps decoding.
         pos = 0;
         logits = if tokens.is_empty() {
-            let l = decoder.forward_token(0, pos, &mut caches);
+            let l = kv.step(decoder, 0, pos);
             pos += 1;
             l
         } else {
@@ -576,7 +740,7 @@ pub fn generate(
             // When `FERROX_CHUNKED_PREFILL` is set, split long prompts
             // into chunks that reuse the same KV caches.
             pos = tokens.len();
-            forward_prompt_batch(decoder, &tokens, 0, &mut caches)
+            kv.prefill(decoder, &tokens)
         };
     }
 
@@ -609,10 +773,12 @@ pub fn generate(
             if first_token_at.is_none() {
                 first_token_at = Some(std::time::Instant::now());
             }
-            let l = decoder.forward_token(next, pos, &mut caches);
+            let l = kv.step(decoder, next, pos);
             #[cfg(feature = "metal")]
             if kv_offload {
-                decoder.sync_metal_attn_kv_to_host(&mut caches);
+                if let Some(caches) = kv.contiguous_mut() {
+                    decoder.sync_metal_attn_kv_to_host(caches);
+                }
             }
             l
         },
@@ -658,11 +824,18 @@ pub fn generate(
             // later (possibly non-greedy) prefix restores.
             if logits.len() == vocab_size {
                 #[cfg(feature = "metal")]
-                decoder.sync_metal_attn_kv_to_host(&mut caches);
-                tokens.extend(generated_ids);
-                pc.lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .store(tokens, caches, logits);
+                if let Some(caches) = kv.contiguous_mut() {
+                    decoder.sync_metal_attn_kv_to_host(caches);
+                }
+                // `None` only for a paged request, which is refused
+                // alongside a prefix cache at startup; storing nothing
+                // is the honest answer either way.
+                if let Some(caches) = kv.into_contiguous() {
+                    tokens.extend(generated_ids);
+                    pc.lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .store(tokens, caches, logits);
+                }
             }
         }
     }
@@ -1011,6 +1184,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             |s| actual_text.push_str(s),
         )
         .unwrap();
@@ -1032,6 +1206,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             |_| {},
         );
         assert!(matches!(result, Err(DecodeError::TokenOutOfVocab { .. })));
@@ -1049,6 +1224,7 @@ mod tests {
             None,
             &prompt,
             &greedy_params(5),
+            None,
             None,
             None,
             None,
@@ -1079,6 +1255,7 @@ mod tests {
             None,
             &prompt,
             &params,
+            None,
             None,
             None,
             None,
@@ -1123,6 +1300,7 @@ mod tests {
             None,
             &prompt,
             &params,
+            None,
             None,
             None,
             None,
@@ -1183,6 +1361,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             |_| {},
         )
         .unwrap();
@@ -1220,6 +1399,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             |_| {},
         )
         .unwrap();
@@ -1253,6 +1433,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             |s| baseline.push_str(s),
         )
         .unwrap();
@@ -1274,6 +1455,7 @@ mod tests {
                 cancel: None,
                 ignore_eos: false,
             },
+            None,
             None,
             None,
             None,
@@ -1523,6 +1705,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             |s| baseline.push_str(s),
         )
         .unwrap();
@@ -1556,6 +1739,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             |s| truncated.push_str(s),
         )
         .unwrap();
@@ -1575,6 +1759,7 @@ mod tests {
             None,
             &prompt,
             &greedy_params(5),
+            None,
             None,
             None,
             None,
@@ -1612,6 +1797,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             |_| {},
         )
         .unwrap();
@@ -1625,6 +1811,7 @@ mod tests {
             None,
             &prompt,
             &greedy_params(2),
+            None,
             None,
             Some(&pc),
             None,
@@ -1642,6 +1829,7 @@ mod tests {
             None,
             &longer,
             &greedy_params(2),
+            None,
             None,
             Some(&pc),
             None,
@@ -1666,6 +1854,7 @@ mod tests {
             &prompt1,
             &greedy_params(5),
             None,
+            None,
             Some(&pc),
             None,
             |s| out1.push_str(s),
@@ -1686,6 +1875,7 @@ mod tests {
             &prompt2,
             &greedy_params(5),
             None,
+            None,
             Some(&pc),
             None,
             |s| out2_with_cache.push_str(s),
@@ -1703,6 +1893,7 @@ mod tests {
             None,
             &prompt2,
             &greedy_params(5),
+            None,
             None,
             None,
             None,
@@ -1731,6 +1922,7 @@ mod tests {
             &prompt,
             &greedy_params(5),
             None,
+            None,
             Some(&pc),
             None,
             |s| out1.push_str(s),
@@ -1753,6 +1945,7 @@ mod tests {
             &prompt,
             &greedy_params(5),
             None,
+            None,
             Some(&pc),
             None,
             |s| out2_with_cache.push_str(s),
@@ -1767,6 +1960,7 @@ mod tests {
             None,
             &prompt,
             &greedy_params(5),
+            None,
             None,
             None,
             None,
@@ -1793,6 +1987,7 @@ mod tests {
             &prompt,
             &greedy_params(5),
             Some(&config),
+            None,
             Some(&pc),
             None,
             |_| {},
@@ -1806,6 +2001,7 @@ mod tests {
             &prompt,
             &greedy_params(5),
             Some(&config),
+            None,
             Some(&pc),
             None,
             |_| {},
@@ -1824,6 +2020,162 @@ mod tests {
         KvPoolConfig { pool, queue_wait }
     }
 
+    fn paged_config(decoder: &Decoder, block_size: usize, blocks: usize) -> PagedKvConfig {
+        PagedKvConfig {
+            store: Arc::new(SharedPagedKv::new(
+                decoder.layers.len(),
+                block_size,
+                blocks,
+                decoder.config.n_kv_heads,
+                decoder.config.head_dim,
+            )),
+            queue_wait: Duration::ZERO,
+        }
+    }
+
+    /// Serving on paged KV must produce the SAME TEXT as serving on
+    /// contiguous KV.
+    ///
+    /// This is the property the whole paged path exists to preserve,
+    /// and the one no lower-level test can state: the decoder tests pin
+    /// bit-identity of logits, but a caller only ever sees tokens, and
+    /// between the two sit admission, prefill, the decode loop and
+    /// sampling. If any of those dispatched differently, the logits
+    /// could match and the answer still change.
+    ///
+    /// Greedy sampling makes the comparison exact rather than
+    /// distributional.
+    #[test]
+    fn a_paged_request_generates_the_same_text_as_a_contiguous_one() {
+        let decoder = small_decoder();
+        let prompt = String::from_utf8(vec![1u8, 2, 3]).unwrap();
+
+        let mut contiguous = String::new();
+        let (finish_a, usage_a) = generate(
+            &decoder,
+            &ServerTokenizer::Byte,
+            &StopTokens::default(),
+            None,
+            &prompt,
+            &greedy_params(6),
+            None,
+            None,
+            None,
+            None,
+            |s| contiguous.push_str(s),
+        )
+        .unwrap();
+
+        let config = paged_config(&decoder, /* block_size = */ 4, /* blocks = */ 64);
+        let mut paged = String::new();
+        let (finish_b, usage_b) = generate(
+            &decoder,
+            &ServerTokenizer::Byte,
+            &StopTokens::default(),
+            None,
+            &prompt,
+            &greedy_params(6),
+            None,
+            Some(&config),
+            None,
+            None,
+            |s| paged.push_str(s),
+        )
+        .unwrap();
+
+        assert_eq!(paged, contiguous, "paged serving changed the answer");
+        assert_eq!(finish_b, finish_a);
+        assert_eq!(usage_b.completion_tokens, usage_a.completion_tokens);
+        assert_eq!(usage_b.prompt_tokens, usage_a.prompt_tokens);
+    }
+
+    /// Every page comes back when the request ends.
+    ///
+    /// `PagedKvCache` has no `Drop`, so releasing is `PagedLease`'s job
+    /// alone. Without it the store bleeds a whole request's pages per
+    /// request and a long-running server stops admitting anything, with
+    /// nothing in the logs to say why. Checked per layer, since the
+    /// lease releases in a loop and a bound that skipped the last layer
+    /// would still look right on layer 0.
+    #[test]
+    fn a_finished_paged_request_returns_every_page_it_held() {
+        let decoder = small_decoder();
+        let prompt = String::from_utf8(vec![1u8, 2]).unwrap();
+        let config = paged_config(&decoder, 4, 64);
+        let before: Vec<usize> = (0..decoder.layers.len())
+            .map(|l| config.store.free_blocks(l))
+            .collect();
+
+        for _ in 0..3 {
+            let mut out = String::new();
+            generate(
+                &decoder,
+                &ServerTokenizer::Byte,
+                &StopTokens::default(),
+                None,
+                &prompt,
+                &greedy_params(5),
+                None,
+                Some(&config),
+                None,
+                None,
+                |s| out.push_str(s),
+            )
+            .unwrap();
+        }
+
+        for (l, expected) in before.iter().enumerate() {
+            assert_eq!(
+                config.store.free_blocks(l),
+                *expected,
+                "layer {l} leaked pages across repeated requests"
+            );
+        }
+    }
+
+    /// A request too big for the store is refused at admission, having
+    /// emitted nothing and taken no page.
+    ///
+    /// The refusal must happen BEFORE any work: `sample_until_stop`
+    /// takes a closure returning `Vec<f32>` with nowhere to report a
+    /// store that ran dry at token 300 of 400, which is why
+    /// `acquire_paged_caches` reserves the whole worst-case length up
+    /// front. The same reasoning `acquire_pooled_caches` records having
+    /// learned from a live panic.
+    #[test]
+    fn a_paged_request_too_big_for_the_store_is_refused_before_emitting_anything() {
+        let decoder = small_decoder();
+        let prompt = String::from_utf8(vec![1u8, 2, 3, 4]).unwrap();
+        // One block of 2 positions per layer against a prompt of 4 plus
+        // 8 more tokens.
+        let config = paged_config(&decoder, /* block_size = */ 2, /* blocks = */ 1);
+
+        let result = generate(
+            &decoder,
+            &ServerTokenizer::Byte,
+            &StopTokens::default(),
+            None,
+            &prompt,
+            &greedy_params(8),
+            None,
+            Some(&config),
+            None,
+            None,
+            |_| panic!("a refused request must not emit"),
+        );
+        assert!(
+            matches!(result, Err(DecodeError::KvPoolExhausted)),
+            "expected a typed refusal, got {result:?}"
+        );
+        for l in 0..decoder.layers.len() {
+            assert_eq!(
+                config.store.free_blocks(l),
+                1,
+                "layer {l} must keep every page after a refusal"
+            );
+        }
+    }
+
     #[test]
     fn generate_succeeds_with_a_pool_that_has_enough_blocks() {
         let decoder = small_decoder(); // 2 layers
@@ -1840,6 +2192,7 @@ mod tests {
             &prompt,
             &greedy_params(5),
             Some(&config),
+            None,
             None,
             None,
             |s| out.push_str(s),
@@ -1884,6 +2237,7 @@ mod tests {
             Some(&config),
             None,
             None,
+            None,
             |_| {},
         )
         .unwrap();
@@ -1919,6 +2273,7 @@ mod tests {
             &prompt,
             &greedy_params(max_tokens),
             Some(&config),
+            None,
             None,
             None,
             |_| {},
@@ -1964,6 +2319,7 @@ mod tests {
             Some(&config),
             None,
             None,
+            None,
             |_| {},
         );
         let err = result.expect_err("one block cannot hold two layers' caches");
@@ -2002,6 +2358,7 @@ mod tests {
                 &prompt,
                 &greedy_params(5),
                 Some(&config),
+                None,
                 None,
                 None,
                 |_| {},
@@ -2049,6 +2406,7 @@ mod tests {
             Some(&config),
             None,
             None,
+            None,
             |_| {},
         );
         assert!(
@@ -2094,6 +2452,7 @@ mod tests {
             &prompt,
             &greedy_params(5),
             Some(&config),
+            None,
             None,
             Some(&ceiling),
             |_| panic!("no token may be emitted by a refused request"),
@@ -2153,6 +2512,7 @@ mod tests {
             &greedy_params(5),
             None,
             None,
+            None,
             Some(&ceiling),
             |_| emitted += 1,
         )
@@ -2185,6 +2545,7 @@ mod tests {
             &greedy_params(5),
             None,
             None,
+            None,
             Some(&ceiling),
             |s| with.push_str(s),
         )
@@ -2199,6 +2560,7 @@ mod tests {
             None,
             &prompt,
             &greedy_params(5),
+            None,
             None,
             None,
             None,
@@ -2237,6 +2599,7 @@ mod tests {
             &prompt,
             &greedy_params(5),
             Some(&config),
+            None,
             None,
             None,
             |_| {},

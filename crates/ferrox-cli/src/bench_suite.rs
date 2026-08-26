@@ -153,6 +153,25 @@ pub fn run_suite(args: SuiteArgs) -> anyhow::Result<()> {
                 );
                 continue;
             }
+            // Total RAM says the model COULD fit this machine. Free RAM
+            // says whether it fits right now. A 32 GiB box with 3.5 GiB
+            // free accepts a 10 GiB model on the check above, then runs
+            // it out of swap and reports a real-looking number for work
+            // the disk did. Skipping keeps the previous receipt, which
+            // is stale and says so, rather than replacing it with a
+            // paged one that does not.
+            if args.fit_host && args.max_load > 0.0 {
+                if let Some(free) = crate::host_state::free_ram_gb() {
+                    if entry.estimated_ram_gb + 2.0 > free {
+                        eprintln!(
+                            "skip {} {backend}: needs ~{:.0} GiB, only {free:.1} GiB free \
+                             (it would run from swap)",
+                            entry.id, entry.estimated_ram_gb
+                        );
+                        continue;
+                    }
+                }
+            }
             let model_path = args.bench_dir.join("..").join(&entry.gguf);
             if !model_path.exists() {
                 if args.skip_missing {

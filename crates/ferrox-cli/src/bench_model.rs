@@ -128,6 +128,18 @@ pub fn run(args: BenchArgs) -> anyhow::Result<()> {
         anyhow::bail!("model not found: {model}");
     }
 
+    // A busy host and a hot host are already refused above. A FULL host
+    // is the same failure with a different cause: the weights page to
+    // disk and the run times the page file. The file size is the floor
+    // on the footprint, and `--max-load 0` waives this the same way it
+    // waives the other two.
+    if args.max_load > 0.0 {
+        if let Ok(meta) = std::fs::metadata(path) {
+            let weights_gb = meta.len() as f64 / 1024.0 / 1024.0 / 1024.0;
+            crate::host_state::ensure_fits_in_ram(weights_gb, 2.0)?;
+        }
+    }
+
     let file = ferrox_gguf::ShardedGguf::open(path)?;
     let arch = file
         .metadata_str("general.architecture")

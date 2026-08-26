@@ -12,6 +12,8 @@ use ferrox_core::cache::{
     KvBlockPool, KvCache, KvPoolExhausted as CacheKvPoolExhausted, PageGroup, PagedKvCache,
     PagedStoreExhausted, SharedPagedKv,
 };
+use ferrox_edge::anchor::{decode_slide, AnchorState, SlidingRequest, WindowPolicy};
+use ferrox_edge::pool::SWA_RETAIN_GAP;
 use ferrox_edge::radix::{align_down, NodeId, RadixCache};
 use ferrox_models::sampling::{Sampler, SamplingParams};
 use ferrox_models::tokenizer::{prepend_bos, StopTokens};
@@ -108,6 +110,65 @@ pub struct PagedKvConfig {
     /// one system prompt hold N copies of its KV. The radix tree stores
     /// page groups and reference-counts them, so they hold one.
     pub radix: Option<Arc<Mutex<RadixCache>>>,
+    /// The single token that opens a tool call for this checkpoint, when
+    /// its family has one and it encodes to exactly one token.
+    ///
+    /// `None` costs nothing but the anchor: the slide still runs, it
+    /// just follows the cursor instead of stopping short of the position
+    /// the next agentic turn will rejoin at.
+    pub anchor_token: Option<u32>,
+    /// Decode steps between window slides.
+    ///
+    /// Sliding every step would cost a page operation per token for a
+    /// page's worth of pages every `block_size` tokens; the admission
+    /// bound pays for what accumulates in between, which is why this
+    /// number appears in [`slide_hold_bound`] as well as here. Zero is
+    /// clamped to one by [`WindowPolicy::with_eviction_interval`], since
+    /// it would otherwise divide by zero on the cadence check.
+    pub slide_interval: usize,
+}
+
+/// The sliding-window state one paged request carries.
+///
+/// Present only when [`ModelConfig::uniform_sliding_window`] said every
+/// layer slides. A page group holds one block in every layer, so a model
+/// with even one full-attention layer cannot give a group back -- see
+/// that method for why the narrowest window is the wrong answer there.
+///
+/// [`ModelConfig::uniform_sliding_window`]: ferrox_models::ModelConfig::uniform_sliding_window
+struct WindowSlide {
+    policy: WindowPolicy,
+    /// Positions whose pages this request has already recycled. Behind
+    /// the window, so nothing reads them again.
+    released: usize,
+    /// The prefix the radix tree owns, which is shared with every other
+    /// request holding it and so is never recycled however far behind
+    /// the window it falls.
+    locked_prefix: usize,
+    /// Decode steps taken. `decode_slide` skips step 0, whose state may
+    /// still be in flight from the prefill that produced it.
+    decode_step: usize,
+    anchor: AnchorState,
+    anchor_token: Option<u32>,
+}
+
+/// Positions a sliding request may hold beyond its prompt.
+///
+/// This is the ceiling `ferrox-edge`'s own bound test asserts at every
+/// step of a 100_000-token run, and it is what makes admission by the
+/// window sound rather than hopeful. Each term is a real reason the
+/// slide lags the cursor:
+///
+/// - `window` is what attention still reads;
+/// - a second `window + gap` is the anchor's, which caps the threshold
+///   at `anchor - window - gap` until the cursor drifts a whole window
+///   past it and the anchor is dropped;
+/// - `eviction_interval` is the cadence -- positions accumulate between
+///   slides, which is the point of not sliding every step;
+/// - two pages cover the `- page` in the threshold and the alignment
+///   down to a page boundary.
+fn slide_hold_bound(window: usize, policy: &WindowPolicy) -> usize {
+    2 * (window + SWA_RETAIN_GAP) + policy.eviction_interval + 2 * policy.page_size
 }
 
 /// One request's paged KV, which returns its pages when dropped.
@@ -127,7 +188,21 @@ pub struct PagedLease {
     /// Held as groups rather than per-layer block ids because that is
     /// the unit the radix tree shares and reference-counts. Every entry
     /// here is one the lease must release exactly once.
-    groups: Vec<PageGroup>,
+    /// `None` where a sliding window has recycled the group away: that
+    /// index is behind the window, nothing reads it, and its group is
+    /// waiting in `spare` to back a later position.
+    groups: Vec<Option<PageGroup>>,
+    /// Groups this request recycled, kept PRIVATE rather than handed
+    /// back to the store.
+    ///
+    /// Handing them back would be the generous thing and it would also
+    /// make `push` fallible again: another request could take the page
+    /// this one is about to need, mid-answer, with nowhere to report it.
+    /// The generosity happens once, at admission, where a sliding
+    /// request asks for a window's worth instead of a whole context's --
+    /// which is the larger saving anyway, and one that a refusal can
+    /// still be returned from.
+    spare: Vec<PageGroup>,
     /// How many leading groups came from the radix tree rather than
     /// from a fresh allocation, and the node they were matched at.
     ///
@@ -135,6 +210,7 @@ pub struct PagedLease {
     /// lives, because those pages are being attended over.
     adopted: Option<(usize, NodeId)>,
     radix: Option<Arc<Mutex<RadixCache>>>,
+    window: Option<WindowSlide>,
 }
 
 impl Drop for PagedLease {
@@ -149,7 +225,15 @@ impl Drop for PagedLease {
         // Every group this sequence held, adopted or fresh. A group the
         // tree also holds survives this, because its refcount does not
         // reach zero.
-        for group in self.groups.drain(..) {
+        //
+        // `flatten` rather than `unwrap`: a slid request left holes
+        // where it recycled, and those groups are in `spare`. Both
+        // halves are drained, and a group is in exactly one of them, so
+        // each is still released exactly once.
+        for group in self.groups.drain(..).flatten() {
+            self.store.release_group(group);
+        }
+        for group in self.spare.drain(..) {
             self.store.release_group(group);
         }
     }
@@ -183,19 +267,220 @@ impl PagedLease {
             .map(|(groups, _)| groups * block_size)
             .unwrap_or(0)
     }
+
+    /// Whether this request's window has taken any page away.
+    ///
+    /// Load-bearing at publish time: a slid sequence cannot be published
+    /// to the radix tree. The tree keys on a PREFIX and this sequence's
+    /// prefix is exactly the part that is gone -- what it still holds is
+    /// a suffix. Publishing anyway would hand the next request a page
+    /// whose contents belong to a position a thousand tokens later.
+    pub fn has_slid(&self) -> bool {
+        self.window.as_ref().is_some_and(|w| w.released > 0)
+    }
+
+    /// Offer one sampled token to the anchor detector.
+    ///
+    /// Separate from [`Self::before_step`] because the two happen at
+    /// different moments: a token is observed once it has been sampled,
+    /// and the slide runs before the forward that consumes it.
+    pub fn observe_sampled(&mut self, token: usize, position: usize, finished: bool) {
+        if let Some(w) = self.window.as_mut() {
+            w.anchor
+                .observe(token as u32, w.anchor_token, position, finished);
+        }
+    }
+
+    /// Run one decode step's window slide, then make sure the page
+    /// `position` will be written into exists.
+    ///
+    /// Both halves here, in this order, because they are two ends of one
+    /// mechanism: the slide is what produces the spare page that the
+    /// extension then installs. Splitting them would let a caller do the
+    /// second without the first and quietly fall back to taking a page
+    /// from the store, which is the failure this whole design removes.
+    pub fn before_step(&mut self, position: usize) {
+        if self.window.is_none() {
+            return;
+        }
+        let block_size = self.block_size();
+        self.slide(position, block_size);
+        self.extend_to(position, block_size);
+        debug_assert!(
+            self.tables_match_groups(),
+            "a sliding lease must own every block its tables name"
+        );
+    }
+
+    fn slide(&mut self, position: usize, block_size: usize) {
+        let Some(w) = self.window.as_mut() else {
+            return;
+        };
+        w.decode_step += 1;
+        let request = SlidingRequest {
+            position,
+            already_released: w.released,
+            locked_prefix: w.locked_prefix,
+            decode_step: w.decode_step,
+        };
+        // `forward_iter` and `decode_step` are the same counter here:
+        // one request's cadence is its own step count. A batched engine
+        // that wanted every row to slide on the same iteration would
+        // pass the batcher's counter instead, and the policy would
+        // still be this one.
+        let Some(decision) =
+            decode_slide(&request, w.anchor.anchor_len(), &w.policy, w.decode_step)
+        else {
+            return;
+        };
+        if decision.drop_anchor {
+            w.anchor.clear();
+        }
+        if decision.frees_nothing() {
+            return;
+        }
+        // Both ends are page-aligned -- `free_from` is the previous
+        // `free_to` or the locked prefix, `free_to` is aligned down --
+        // so this divides exactly and never half-frees a page.
+        let (from, to) = (
+            decision.free_from / block_size,
+            decision.free_to / block_size,
+        );
+        for slot in &mut self.groups[from..to] {
+            if let Some(group) = slot.take() {
+                self.spare.push(group);
+            }
+        }
+        w.released = decision.free_to;
+    }
+
+    /// Installs a page at the index `position` belongs to, if the block
+    /// tables do not reach that far yet.
+    ///
+    /// Recycled spare first, a fresh group from the store second. The
+    /// order matters more than the fallback ever firing: taking the
+    /// spare is what keeps a long generation's footprint flat, and the
+    /// store acquire is there so that `groups` stays the *only* owner of
+    /// every block in the tables. Letting `PagedKvCache::push` grow a
+    /// table by itself would acquire a block this lease never records,
+    /// and `Drop` releases what `groups` names -- so that block would be
+    /// gone until the process exits.
+    ///
+    /// Extending nothing when the store is empty too is the one clean
+    /// answer left: the tables are unchanged, and the caller's `reserve`
+    /// refuses having taken nothing.
+    fn extend_to(&mut self, position: usize, block_size: usize) {
+        let index = position / block_size;
+        while self.groups.len() <= index {
+            let Some(group) = self.spare.pop().or_else(|| self.store.acquire_group()) else {
+                return;
+            };
+            // A recycled group's physical blocks now back two table
+            // indices: the stale one the slide emptied, and this one.
+            // Safe precisely because the stale index is behind the
+            // window and the kernel never reads it -- see
+            // `PagedKvCache::append_block`.
+            let blocks = self.store.group_blocks(group);
+            for (cache, &block) in self.caches.iter_mut().zip(&blocks) {
+                cache.append_block(block);
+            }
+            self.groups.push(Some(group));
+        }
+    }
+
+    /// Every cache's block table names exactly the groups this lease
+    /// holds, in order.
+    ///
+    /// The property the whole recycling scheme rests on: `Drop` releases
+    /// `groups`, so a table entry that no group accounts for is a leaked
+    /// page and a group no table names is a page nothing can read.
+    #[cfg(debug_assertions)]
+    fn tables_match_groups(&self) -> bool {
+        self.caches
+            .iter()
+            .all(|c| c.block_table().len() == self.groups.len())
+    }
 }
 
-/// Reserves this request's WHOLE worst-case length up front, retrying
-/// until `config.queue_wait` elapses.
+/// How many page groups a request must hold to run to `max_seq_len`
+/// without ever asking the store for another one.
 ///
-/// Reserving everything at admission is not an optimisation, it is what
-/// makes the decode loop's signature honest. `sample_until_stop` takes
-/// a closure returning `Vec<f32>`, with nowhere to report a store that
-/// ran dry at token 300 of 400 -- the same reason
-/// `acquire_pooled_caches` sizes for `max_seq_len` rather than growing,
-/// which that function's comment records as having been found by a real
-/// panic in live testing. A request that cannot fit is refused here,
-/// before any work, rather than dying halfway through an answer.
+/// Without a window that is the whole sequence, and reserving it all up
+/// front is not an optimisation -- it is what makes the decode loop's
+/// signature honest. `sample_until_stop` takes a closure returning
+/// `Vec<f32>`, with nowhere to report a store that ran dry at token 300
+/// of 400, the same reason `acquire_pooled_caches` sizes for
+/// `max_seq_len` rather than growing (a real panic in live testing).
+///
+/// WITH a window the answer is the prompt plus a bound, because the
+/// slide gives pages back to this request faster than decode consumes
+/// them. The prompt term is not a window's worth: prefill materialises
+/// positions `0..prompt_len` to reuse the one prefill kernel
+/// (`PagedKvCache::to_contiguous`), so every prompt page must still be
+/// there while it runs. What the window removes is the *generation*
+/// term -- a 4k-window model answering 100k tokens holds its prompt and
+/// a window, not a prompt and 100k.
+///
+/// `prompt_len + bound` is safe at every position, in two cases. Below
+/// `prompt_len + bound` it is trivially safe, since nothing is ever
+/// released. Above it, `ferrox-edge`'s own ceiling applies -- the one
+/// its bound test asserts at every step of a 100_000-token run -- and
+/// the live span is at most `bound` on its own.
+fn paged_groups_needed(
+    max_seq_len: usize,
+    prompt_len: usize,
+    block_size: usize,
+    window: Option<&WindowPolicy>,
+) -> usize {
+    paged_hold_positions(max_seq_len, prompt_len, block_size, window)
+        .div_ceil(block_size)
+        .max(1)
+}
+
+/// The same answer in POSITIONS, which is the unit the batch
+/// scheduler's block budget speaks.
+///
+/// One function for both because they are one decision. The budget
+/// bounds how many requests the server admits at once and the store
+/// bounds whether each of them can run; a budget that priced a windowed
+/// request at its whole context would keep refusing admissions the
+/// store would happily serve, and the two would disagree about the same
+/// server.
+///
+/// The extra page is slack over the bound, and the `min` is what stops
+/// a short request from being made *more* expensive by being windowed.
+pub(crate) fn paged_hold_positions(
+    max_seq_len: usize,
+    prompt_len: usize,
+    block_size: usize,
+    window: Option<&WindowPolicy>,
+) -> usize {
+    let Some(policy) = window else {
+        return max_seq_len;
+    };
+    (prompt_len + slide_hold_bound(policy.sliding_window, policy) + block_size).min(max_seq_len)
+}
+
+/// The window policy a paged request runs under on this model, or
+/// `None` when it may not slide at all.
+pub(crate) fn paged_window_policy(
+    decoder: &Decoder,
+    config: &PagedKvConfig,
+) -> Option<WindowPolicy> {
+    let block_size = config.store.read(0).block_size();
+    decoder
+        .config
+        .uniform_sliding_window()
+        .map(|w| WindowPolicy::new(w, block_size).with_eviction_interval(config.slide_interval))
+}
+
+/// Reserves everything this request can need up front, retrying until
+/// `config.queue_wait` elapses.
+///
+/// "Everything it can need" is [`paged_groups_needed`], which is the
+/// whole sequence for a full-attention model and prompt-plus-a-window
+/// for a sliding one. A request that cannot fit is refused here, before
+/// any work, rather than dying halfway through an answer.
 pub(crate) fn acquire_paged_caches(
     decoder: &Decoder,
     config: &PagedKvConfig,
@@ -252,9 +537,27 @@ pub(crate) fn acquire_paged_caches(
         None => (0, None, Vec::new()),
     };
 
+    // A model whose layers do not all slide by the same window cannot
+    // give a page group back at all: the group holds a block in every
+    // layer, and a full-attention layer still reads position 0.
+    let policy = paged_window_policy(decoder, config);
+
     // Only what the adopted prefix does not already cover.
-    let total_groups = max_seq_len.div_ceil(block_size).max(1);
+    let total_groups = paged_groups_needed(max_seq_len, tokens.len(), block_size, policy.as_ref());
     let need = total_groups.saturating_sub(adopted_groups.len());
+    let make_window = || {
+        policy.map(|policy| WindowSlide {
+            policy,
+            released: 0,
+            // The adopted prefix is the tree's, shared with every other
+            // request holding it, so the slide floors here rather than
+            // at zero.
+            locked_prefix: cached_len,
+            decode_step: 0,
+            anchor: AnchorState::new(),
+            anchor_token: config.anchor_token,
+        })
+    };
 
     loop {
         let mut fresh: Vec<PageGroup> = Vec::with_capacity(need);
@@ -271,9 +574,11 @@ pub(crate) fn acquire_paged_caches(
             return Ok(PagedLease {
                 caches,
                 store: Arc::clone(&config.store),
-                groups,
+                groups: groups.into_iter().map(Some).collect(),
+                spare: Vec::new(),
                 adopted: node.map(|n| (cached_len / block_size, n)),
                 radix: config.radix.clone(),
+                window: make_window(),
             });
         }
         // Give back what this attempt took before waiting, or a
@@ -291,9 +596,11 @@ pub(crate) fn acquire_paged_caches(
             drop(PagedLease {
                 caches: Vec::new(),
                 store: Arc::clone(&config.store),
-                groups: adopted_groups,
+                groups: adopted_groups.into_iter().map(Some).collect(),
+                spare: Vec::new(),
                 adopted: node.map(|n| (cached_len / block_size, n)),
                 radix: config.radix.clone(),
+                window: make_window(),
             });
             return Err(PagedStoreExhausted);
         }
@@ -339,10 +646,19 @@ fn publish_to_radix(lease: &mut PagedLease, tokens: &[usize], block_size: usize)
     let Some(radix) = lease.radix.clone() else {
         return;
     };
+    // A sequence whose window slid has given its prefix away, and a
+    // prefix is exactly what the tree keys on. What it still holds is a
+    // suffix at the cursor; publishing it would hand the next request
+    // pages whose contents belong to positions far past the ones it
+    // matched on.
+    if lease.has_slid() {
+        return;
+    }
     let ids: Vec<u32> = tokens.iter().map(|&t| t as u32).collect();
     // One index per token: each position names the group holding it.
     let mut per_token: Vec<u32> = Vec::with_capacity(ids.len());
     for (i, group) in lease.groups.iter().enumerate() {
+        let group = group.expect("a lease that has not slid holds every group it names");
         let covered = block_size.min(ids.len().saturating_sub(i * block_size));
         for _ in 0..covered {
             per_token.push(group.0);
@@ -360,8 +676,8 @@ fn publish_to_radix(lease: &mut PagedLease, tokens: &[usize], block_size: usize)
     // survive this lease's own release.
     let kept = result.cached_len / block_size..result.inserted_len / block_size;
     for i in kept {
-        if let Some(&g) = lease.groups.get(i) {
-            lease.store.retain_group(g);
+        if let Some(Some(g)) = lease.groups.get(i) {
+            lease.store.retain_group(*g);
         }
     }
 }
@@ -409,9 +725,15 @@ impl Kv {
     fn step(&mut self, decoder: &Decoder, token: usize, pos: usize) -> Vec<f32> {
         match self {
             Kv::Contiguous(caches) => decoder.forward_token(token, pos, caches),
-            Kv::Paged(lease) => decoder
-                .forward_token_paged(token, pos, &mut lease.caches, &lease.store)
-                .expect("the whole request's pages were reserved at admission"),
+            Kv::Paged(lease) => {
+                // Slides the window and installs the page this position
+                // writes into, before the forward that writes it. A
+                // no-op for a model without a uniform window.
+                lease.before_step(pos);
+                decoder
+                    .forward_token_paged(token, pos, &mut lease.caches, &lease.store)
+                    .expect("admission reserved the prompt plus this request's window bound")
+            }
         }
     }
 
@@ -994,6 +1316,14 @@ pub fn generate(
         |next, pos| {
             if first_token_at.is_none() {
                 first_token_at = Some(std::time::Instant::now());
+            }
+            // The anchor is offered the token that is about to be fed
+            // forward, at the length that includes it. A token that
+            // ended the generation never reaches here, which is the
+            // `finished` case `observe` refuses -- there would be no
+            // continuation to rejoin at.
+            if let Kv::Paged(lease) = &mut kv {
+                lease.observe_sampled(next, pos + 1, false);
             }
             let l = kv.step(decoder, next, pos);
             #[cfg(feature = "metal")]
@@ -2291,6 +2621,8 @@ mod tests {
             queue_wait: Duration::ZERO,
             radix: share_prefixes
                 .then(|| Arc::new(Mutex::new(ferrox_edge::radix::RadixCache::new(block_size)))),
+            anchor_token: None,
+            slide_interval: ferrox_edge::pool::DEFAULT_SWA_EVICTION_INTERVAL,
         }
     }
 
@@ -2392,6 +2724,519 @@ mod tests {
                 "layer {l} leaked pages across repeated requests"
             );
         }
+    }
+
+    /// A model where EVERY layer slides by the same window, which is
+    /// what makes a page group releasable: the group holds one block in
+    /// every layer, so one full-attention layer would still be reading
+    /// the block the slide gave away.
+    fn windowed_decoder(window: usize) -> Decoder {
+        let mut cfg = test_dense_fixture();
+        cfg.sliding_window = Some(window);
+        cfg.swa_pattern = None;
+        Decoder::new_random_small(cfg, 2, 256)
+    }
+
+    fn run_to_completion(max_tokens: usize) -> GenerationParams {
+        GenerationParams {
+            // Every one of these tokens must actually be generated, or
+            // a run that stopped at token 5 would "pass" a test about
+            // what happens after 200.
+            ignore_eos: true,
+            ..greedy_params(max_tokens)
+        }
+    }
+
+    /// The arithmetic both admission paths share, on its own.
+    ///
+    /// A unit test because the two callers price the same request in
+    /// different units -- the store in page groups, the batch
+    /// scheduler's budget in positions -- and a formula that drifted
+    /// between them would have the two components refusing and
+    /// admitting the same request.
+    #[test]
+    fn a_window_prices_a_request_at_its_prompt_plus_a_bound() {
+        let block_size = 4;
+        let policy = WindowPolicy::new(8, block_size);
+        let bound = slide_hold_bound(8, &policy);
+        assert_eq!(bound, 2 * (8 + SWA_RETAIN_GAP) + 128 + 2 * block_size);
+
+        // Full attention: the whole sequence, however long.
+        assert_eq!(paged_hold_positions(10_000, 3, block_size, None), 10_000);
+        assert_eq!(paged_groups_needed(10_000, 3, block_size, None), 2_500);
+
+        // Windowed: prompt plus the bound plus a page of slack, and
+        // flat in `max_seq_len` -- ten times the generation costs the
+        // same pages, which IS the feature.
+        let held = paged_hold_positions(10_000, 3, block_size, Some(&policy));
+        assert_eq!(held, 3 + bound + block_size);
+        assert_eq!(
+            paged_hold_positions(100_000, 3, block_size, Some(&policy)),
+            held,
+            "a longer generation must not cost more pages"
+        );
+        // But a longer PROMPT does, because prefill materialises
+        // positions 0..prompt_len to reuse the one prefill kernel.
+        assert!(paged_hold_positions(10_000, 900, block_size, Some(&policy)) > held);
+
+        // And a request shorter than the bound is not made more
+        // expensive by being windowed.
+        assert_eq!(paged_hold_positions(20, 3, block_size, Some(&policy)), 20);
+        assert_eq!(
+            paged_groups_needed(20, 3, block_size, Some(&policy)),
+            paged_groups_needed(20, 3, block_size, None)
+        );
+    }
+
+    /// THE ACCEPTANCE PROPERTY of this feature: a window model holds its
+    /// prompt and a window, not its whole context.
+    ///
+    /// Stated as the only thing an operator can actually observe --
+    /// whether the request is served. One store, one prompt, one length,
+    /// two models: the windowed one runs, the full-attention one is
+    /// refused by the same store. The window is the whole difference.
+    #[test]
+    fn a_window_model_runs_on_a_store_too_small_for_its_whole_context() {
+        let window = 8;
+        let windowed = windowed_decoder(window);
+        assert_eq!(
+            windowed.config.uniform_sliding_window(),
+            Some(window),
+            "the fixture must be uniformly windowed or this test proves nothing"
+        );
+        let full = small_decoder();
+        assert_eq!(full.config.uniform_sliding_window(), None);
+
+        let block_size = 4;
+        let prompt = String::from_utf8(vec![1u8, 2, 3]).unwrap();
+        let max_tokens = 400;
+        // Between the two answers: 48 groups for the windowed request,
+        // 101 for the same request without a window.
+        let blocks = 60;
+        let params = run_to_completion(max_tokens);
+
+        let win_config = paged_config(&windowed, block_size, blocks);
+        let mut out = String::new();
+        let (_, usage) = generate(
+            &windowed,
+            &ServerTokenizer::Byte,
+            &StopTokens::default(),
+            None,
+            &prompt,
+            &params,
+            None,
+            Some(&win_config),
+            None,
+            None,
+            |s| out.push_str(s),
+        )
+        .expect("a window model must fit a store sized for its window");
+        assert_eq!(usage.completion_tokens, max_tokens);
+
+        // Full attention, and ALTERNATING attention, are both refused by
+        // the same store. The alternating case is the one worth spelling
+        // out: its `kv_block_window` is `Some(8)`, so a slide keyed on
+        // that question would have admitted it and then freed pages its
+        // full-attention layers were still reading -- a wrong answer
+        // rather than a refusal.
+        let mut alternating_cfg = test_dense_fixture();
+        alternating_cfg.sliding_window = Some(window);
+        alternating_cfg.swa_pattern = Some(2);
+        let alternating = Decoder::new_random_small(alternating_cfg, 2, 256);
+        assert_eq!(alternating.config.kv_block_window(), Some(window));
+        assert_eq!(alternating.config.uniform_sliding_window(), None);
+
+        for (name, model) in [("full attention", &full), ("alternating", &alternating)] {
+            let config = paged_config(model, block_size, blocks);
+            let err = generate(
+                model,
+                &ServerTokenizer::Byte,
+                &StopTokens::default(),
+                None,
+                &prompt,
+                &params,
+                None,
+                Some(&config),
+                None,
+                None,
+                |_| {},
+            )
+            .unwrap_err();
+            assert!(matches!(err, DecodeError::KvPoolExhausted), "{name}: {err}");
+        }
+    }
+
+    /// Sliding must not change what the model says.
+    ///
+    /// The sharp end of the whole design: a recycled page is overwritten
+    /// by a later position, so a page freed one token too early does not
+    /// fail -- it answers with another position's keys. Greedy sampling
+    /// against the contiguous path, which applies the same window in
+    /// attention and frees nothing, makes that visible as different
+    /// text.
+    ///
+    /// Long enough to slide many times over: the default cadence is 128
+    /// steps, so a six-token test would exercise none of this.
+    #[test]
+    fn a_sliding_paged_request_says_the_same_thing_as_a_contiguous_one() {
+        let decoder = windowed_decoder(8);
+        let prompt = String::from_utf8(vec![1u8, 2, 3]).unwrap();
+        let params = run_to_completion(400);
+
+        let mut contiguous = String::new();
+        generate(
+            &decoder,
+            &ServerTokenizer::Byte,
+            &StopTokens::default(),
+            None,
+            &prompt,
+            &params,
+            None,
+            None,
+            None,
+            None,
+            |s| contiguous.push_str(s),
+        )
+        .unwrap();
+
+        let config = paged_config(&decoder, /* block_size = */ 4, /* blocks = */ 60);
+        let mut paged = String::new();
+        generate(
+            &decoder,
+            &ServerTokenizer::Byte,
+            &StopTokens::default(),
+            None,
+            &prompt,
+            &params,
+            None,
+            Some(&config),
+            None,
+            None,
+            |s| paged.push_str(s),
+        )
+        .unwrap();
+
+        assert_eq!(paged, contiguous, "the window slide changed the answer");
+    }
+
+    /// Once the window is sliding, a request stops asking the store for
+    /// pages: it reuses its own.
+    ///
+    /// This is what keeps the footprint flat, and it is measured as the
+    /// STORE's free-group count rather than as anything the lease
+    /// reports about itself. A request that quietly kept acquiring would
+    /// still answer correctly and would still bring a busy server down.
+    #[test]
+    fn a_long_windowed_generation_stops_taking_pages_from_the_store() {
+        let decoder = windowed_decoder(8);
+        let block_size = 4;
+        let config = paged_config(&decoder, block_size, /* blocks = */ 200);
+        let tokens: Vec<usize> = vec![1, 2, 3];
+
+        let mut lease = acquire_paged_caches(&decoder, &config, &tokens, tokens.len() + 4_000)
+            .expect("the store holds a window's worth");
+        let after_admission = config.store.free_groups();
+        let held = lease.groups.len();
+
+        for pos in tokens.len()..tokens.len() + 4_000 {
+            lease.before_step(pos);
+            assert_eq!(
+                config.store.free_groups(),
+                after_admission,
+                "position {pos} took a page from the store instead of recycling"
+            );
+        }
+        assert!(
+            lease.window.as_ref().unwrap().released > 0,
+            "4000 positions at a window of 8 must have slid"
+        );
+        // Live pages plus spares is what admission reserved: recycling
+        // moves groups between the two, it does not create or lose them.
+        assert_eq!(
+            lease.groups.iter().flatten().count() + lease.spare.len(),
+            held
+        );
+    }
+
+    /// A tool call holds the window back at the position the next turn
+    /// will rejoin at.
+    ///
+    /// An agentic turn does not end the conversation: the harness runs
+    /// the tool and comes back with the same context up to the call and
+    /// a different one after it. So the position where the call opened
+    /// is where the next request rejoins, and a window that followed the
+    /// cursor would have thrown it away by then.
+    ///
+    /// Two identical runs, one with the checkpoint's anchor token
+    /// configured and one without, differing only in that. The anchored
+    /// one must hold strictly more, and must then let go once the cursor
+    /// has drifted a whole window past -- because holding the cursor and
+    /// an unbounded-distance anchor is what the pool sizing cannot pay
+    /// for.
+    #[test]
+    fn a_tool_call_anchor_holds_the_window_back_and_then_lets_go() {
+        let anchor_token = 77;
+        let block_size = 4;
+        let decoder = windowed_decoder(8);
+        let tokens: Vec<usize> = vec![1, 2, 3];
+
+        // Released positions at `check`, with the anchor token offered
+        // at each of `at`, when `armed`.
+        let released_at = |armed: bool, at: &[usize], check: usize| -> usize {
+            let mut config = paged_config(&decoder, block_size, 400);
+            // Every four steps rather than every 128: the cadence is
+            // what makes the anchor's effect observable at a chosen
+            // position rather than at the next multiple of the default.
+            config.slide_interval = 4;
+            config.anchor_token = armed.then_some(anchor_token as u32);
+            let mut lease = acquire_paged_caches(&decoder, &config, &tokens, tokens.len() + 1_000)
+                .expect("the store is large enough");
+            for pos in tokens.len()..check {
+                if at.contains(&(pos + 1)) {
+                    lease.observe_sampled(anchor_token, pos + 1, false);
+                }
+                lease.before_step(pos);
+            }
+            lease.window.as_ref().unwrap().released
+        };
+
+        // Just after the call: the anchored run has held on to the
+        // pages around it, the unanchored one has moved past them.
+        let first = 200;
+        assert!(
+            released_at(true, &[first], 208) < released_at(false, &[first], 208),
+            "the anchor did not hold the window back"
+        );
+
+        // Far past it: the anchored run has caught up, because the turn
+        // is clearly not about to end and holding two windows an
+        // unbounded distance apart needs an unbounded pool.
+        assert_eq!(
+            released_at(true, &[first], 600),
+            released_at(false, &[first], 600),
+            "the anchor was never dropped, so the hold is unbounded"
+        );
+
+        // And a LATER call anchors again. Only the first call of a turn
+        // is the anchor, so a request that had one and dropped it must
+        // be able to take another -- otherwise one early tool call
+        // spends the anchor for the whole rest of the conversation.
+        let second = 600;
+        assert!(
+            released_at(true, &[first, second], 610) < released_at(false, &[], 610),
+            "a dropped anchor left the request unable to take another"
+        );
+    }
+
+    /// A slid request returns its recycled pages too.
+    ///
+    /// `Drop` releases what `groups` names, and a slide takes groups OUT
+    /// of `groups` -- so a lease that forgot its spare list would give
+    /// back only the live window and leak everything the slide had
+    /// recycled, which on a window model is most of what it held.
+    /// Checked per layer, since a bound that skipped the last layer
+    /// would still look right on layer 0.
+    #[test]
+    fn a_slid_request_returns_the_pages_it_recycled_as_well_as_the_ones_it_held() {
+        let decoder = windowed_decoder(8);
+        let prompt = String::from_utf8(vec![1u8, 2, 3]).unwrap();
+        let config = paged_config(&decoder, /* block_size = */ 4, /* blocks = */ 60);
+        let before: Vec<usize> = (0..decoder.layers.len())
+            .map(|l| config.store.free_blocks(l))
+            .collect();
+
+        // Three runs on a store that could not serve even one of them
+        // twice over: a leak shows as the second run being refused.
+        for run in 0..3 {
+            let mut out = String::new();
+            generate(
+                &decoder,
+                &ServerTokenizer::Byte,
+                &StopTokens::default(),
+                None,
+                &prompt,
+                &run_to_completion(400),
+                None,
+                Some(&config),
+                None,
+                None,
+                |s| out.push_str(s),
+            )
+            .unwrap_or_else(|e| panic!("run {run} was refused: {e}"));
+        }
+
+        for (l, expected) in before.iter().enumerate() {
+            assert_eq!(
+                config.store.free_blocks(l),
+                *expected,
+                "layer {l} kept the pages a slid request recycled"
+            );
+        }
+    }
+
+    /// THE SAFETY BOUNDARY: every page the kernel still reads is one the
+    /// lease still owns.
+    ///
+    /// The paged attention kernel indexes `block_table[t / block_size]`
+    /// for `t` from `seq_len - window`, so an index in that range whose
+    /// group has been recycled is a page some LATER position has been
+    /// writing into. That does not fail -- it answers with another
+    /// position's keys.
+    ///
+    /// Checked as a property at every step rather than at the end,
+    /// because a page freed one step too early is back to being safe a
+    /// few steps later once the window has moved past it. And checked
+    /// here rather than through generated text, which cannot see it: the
+    /// reserve slack means a recycled page is not physically reused
+    /// until long after the window has left it, so a slide freeing a
+    /// whole window too much still produces the right answer on this
+    /// fixture. Robust, but not evidence -- so the invariant is stated
+    /// where it is true rather than where it happens to show.
+    #[test]
+    fn every_page_the_kernel_still_reads_is_one_the_lease_still_owns() {
+        let window = 8;
+        let block_size = 4;
+        let decoder = windowed_decoder(window);
+        let config = paged_config(&decoder, block_size, /* blocks = */ 200);
+        let tokens: Vec<usize> = vec![1, 2, 3];
+
+        let mut lease = acquire_paged_caches(&decoder, &config, &tokens, tokens.len() + 4_000)
+            .expect("the store holds a window's worth");
+
+        for pos in tokens.len()..tokens.len() + 4_000 {
+            lease.before_step(pos);
+            // What attention sees once this position is written.
+            let seq_len = pos + 1;
+            let first = seq_len.saturating_sub(window) / block_size;
+            for i in first..=pos / block_size {
+                assert!(
+                    lease.groups[i].is_some(),
+                    "at position {pos} the window reaches page {i}, which was recycled"
+                );
+            }
+        }
+        assert!(
+            lease.window.as_ref().unwrap().released > 0,
+            "nothing was recycled, so this proved nothing"
+        );
+    }
+
+    /// A slid request never gives away the prefix the tree owns.
+    ///
+    /// Those pages are shared: another request is attending over them
+    /// right now, and a third will adopt them tomorrow. The slide floors
+    /// at the locked prefix rather than at zero for exactly that reason,
+    /// and this checks the floor by looking at which page groups are
+    /// still there rather than at what the policy returned.
+    #[test]
+    fn a_slid_request_never_recycles_the_prefix_the_tree_owns() {
+        let decoder = windowed_decoder(8);
+        let block_size = 4;
+        let config = paged_config_with_radix(&decoder, block_size, 400, true);
+
+        // Publish a prefix: a short request, which does not slide, so
+        // its pages reach the tree.
+        let shared: Vec<u8> = (1u8..=16).collect();
+        let prompt = String::from_utf8(shared.clone()).unwrap();
+        generate(
+            &decoder,
+            &ServerTokenizer::Byte,
+            &StopTokens::default(),
+            None,
+            &prompt,
+            &greedy_params(2),
+            None,
+            Some(&config),
+            None,
+            None,
+            |_| {},
+        )
+        .unwrap();
+
+        // A second request off that prefix, driven long past the window.
+        let tokens: Vec<usize> = shared.iter().map(|&b| b as usize).collect();
+        let mut lease = acquire_paged_caches(&decoder, &config, &tokens, tokens.len() + 3_000)
+            .expect("the store is large enough");
+        let locked = lease.adopted_positions(block_size);
+        assert!(locked > 0, "this test needs a real prefix match");
+
+        for pos in tokens.len()..tokens.len() + 3_000 {
+            lease.before_step(pos);
+        }
+        let released = lease.window.as_ref().unwrap().released;
+        assert!(released >= locked, "the slide must have passed the prefix");
+        for i in 0..locked / block_size {
+            assert!(
+                lease.groups[i].is_some(),
+                "page {i} of the shared prefix was recycled out from under the tree"
+            );
+        }
+    }
+
+    /// A sequence whose window slid is NOT published to the tree.
+    ///
+    /// The tree keys on a prefix, and a slid sequence's prefix is
+    /// precisely the part it gave away -- what it still holds is a
+    /// suffix at the cursor. Publishing anyway would hand the next
+    /// request pages whose contents belong a thousand positions later,
+    /// and it would match on them, and the answer would be wrong rather
+    /// than slow.
+    ///
+    /// The control is the same prompt on a request too short to slide,
+    /// which does publish. Without it this test would pass against a
+    /// tree that never publishes anything.
+    #[test]
+    fn a_slid_sequence_is_not_published_to_the_tree() {
+        let decoder = windowed_decoder(8);
+        let block_size = 4;
+        let prompt = String::from_utf8((1u8..=16).collect::<Vec<u8>>()).unwrap();
+
+        let cached_after = |first: GenerationParams| -> usize {
+            let config = paged_config_with_radix(&decoder, block_size, 400, true);
+            let mut out = String::new();
+            generate(
+                &decoder,
+                &ServerTokenizer::Byte,
+                &StopTokens::default(),
+                None,
+                &prompt,
+                &first,
+                None,
+                Some(&config),
+                None,
+                None,
+                |s| out.push_str(s),
+            )
+            .unwrap();
+            // What the SECOND request adopted, which on a fresh tree is
+            // only ever what the first published.
+            let mut probe = String::new();
+            let (_, usage) = generate(
+                &decoder,
+                &ServerTokenizer::Byte,
+                &StopTokens::default(),
+                None,
+                &prompt,
+                &greedy_params(2),
+                None,
+                Some(&config),
+                None,
+                None,
+                |s| probe.push_str(s),
+            )
+            .unwrap();
+            usage.cached_tokens.unwrap_or(0)
+        };
+
+        assert!(
+            cached_after(greedy_params(2)) > 0,
+            "a request that never slid must publish its pages"
+        );
+        assert_eq!(
+            cached_after(run_to_completion(600)),
+            0,
+            "a slid sequence published a prefix it no longer holds"
+        );
     }
 
     /// THE ACCEPTANCE PROPERTY: two prompts sharing a prefix hold ONE

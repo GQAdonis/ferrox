@@ -161,10 +161,11 @@ use ferrox_models::MultiSeqKv;
 use crate::budget::ContextCeiling;
 
 use crate::generate::{
-    acquire_paged_caches, DecodeError, FinishReason, GenerationParams, PagedKvConfig, PagedLease,
-    Usage,
+    acquire_paged_caches, paged_hold_positions, paged_window_policy, DecodeError, FinishReason,
+    GenerationParams, PagedKvConfig, PagedLease, Usage,
 };
 use crate::stop::{StopMatcher, StopStep};
+use ferrox_edge::anchor::WindowPolicy;
 
 type DecodeFn = Arc<dyn Fn(&[usize]) -> String + Send + Sync>;
 
@@ -381,18 +382,28 @@ impl BlockBudget {
         self.ceiling.bytes_for(positions)
     }
 
-    /// The typed refusal for a request of `positions` tokens, or `None`
-    /// when no immovable ceiling binds.
+    /// The typed refusal for a request of `requested` tokens that will
+    /// hold `held` of them at once, or `None` when no immovable ceiling
+    /// binds.
     ///
     /// Order matters: the context ceiling is checked first because it
     /// is the request's own size, and telling a client "the machine is
     /// too small" when the real answer is "your prompt is too long"
     /// sends it to a knob it does not have.
-    fn immovable_refusal(&self, positions: usize) -> Option<DecodeError> {
-        if let Some(err) = self.ceiling.refusal(positions) {
+    ///
+    /// The two arguments differ only for a sliding-window request on a
+    /// paged store, where the tail is given back as the window moves.
+    /// They are on either side of that split deliberately: a window
+    /// bounds the MEMORY, so it belongs to the KV-budget check, and it
+    /// does not shorten what the client asked for, so the context
+    /// ceiling must not see it. A deployment that caps context at 8k
+    /// means 8k on a window model too.
+    fn immovable_refusal(&self, requested: usize, held: usize) -> Option<DecodeError> {
+        if let Some(err) = self.ceiling.refusal(requested) {
             return Some(err);
         }
         let total = self.total?;
+        let positions = held;
         let blocks = self.blocks_for(positions);
         if blocks <= total {
             return None;
@@ -808,6 +819,15 @@ pub struct ContinuousBatcher {
     queue: Arc<QueueGate>,
     budget: Arc<BlockBudget>,
     aborts: Arc<AbortInbox>,
+    /// The window a paged row slides by, when the store is paged and
+    /// every layer of this model slides by the same window.
+    ///
+    /// Held here so the block budget prices a request at what it will
+    /// actually hold. Without it the budget would keep pricing a
+    /// windowed request at its whole context and refuse admissions the
+    /// paged store would happily serve -- two components disagreeing
+    /// about the same server.
+    paged_window: Option<WindowPolicy>,
 }
 
 struct WorkerGuard {
@@ -878,6 +898,9 @@ impl ContinuousBatcher {
             ceiling,
         ));
         let aborts = Arc::new(AbortInbox::default());
+        let paged_window = paged
+            .as_ref()
+            .and_then(|p| paged_window_policy(&decoder, p));
         let worker_counters = Arc::clone(&counters);
         let worker_queue = Arc::clone(&queue);
         let worker_budget = Arc::clone(&budget);
@@ -910,6 +933,7 @@ impl ContinuousBatcher {
             queue,
             budget,
             aborts,
+            paged_window,
         }
     }
 
@@ -945,9 +969,20 @@ impl ContinuousBatcher {
         // with the ceiling named: queueing it would only make it wait
         // for capacity that will never be enough. This is the
         // immovable half of the rejection split -- 400, not 503.
-        let positions = prompt_tokens.len().saturating_add(params.max_tokens);
+        let max_seq_len = prompt_tokens.len().saturating_add(params.max_tokens);
+        // What this request will HOLD, which is its whole length unless
+        // a sliding window gives the tail back as it goes. The ceiling
+        // is still checked against the full length below: a window
+        // bounds the memory, not what the request asked for, and a
+        // deployment that caps context at 8k means 8k either way.
+        let positions = paged_hold_positions(
+            max_seq_len,
+            prompt_tokens.len(),
+            self.budget.block_size,
+            self.paged_window.as_ref(),
+        );
         let blocks = self.budget.blocks_for(positions);
-        if let Some(refusal) = self.budget.immovable_refusal(positions) {
+        if let Some(refusal) = self.budget.immovable_refusal(max_seq_len, positions) {
             return Err(refusal);
         }
         // Refuse before allocating a queue slot for the prompt, so a
@@ -1355,9 +1390,24 @@ fn worker_loop(
             let mut contiguous_refs: Vec<Vec<KvCache>> = Vec::new();
             let mut paged_refs: Vec<Vec<PagedKvCache>> = Vec::new();
             for &uid in &active {
-                match &mut rows.get_mut(uid).expect("active row exists").kv {
+                let slot = rows.get_mut(uid).expect("active row exists");
+                let pos = slot.pos;
+                let token = *slot
+                    .generated_ids
+                    .last()
+                    .expect("an active row has a token");
+                match &mut slot.kv {
                     RowKv::Contiguous(c) => contiguous_refs.push(std::mem::take(c)),
-                    RowKv::Paged(lease) => paged_refs.push(std::mem::take(lease.caches_mut())),
+                    RowKv::Paged(lease) => {
+                        // Before the caches leave the lease: the slide
+                        // moves page groups between the lease's own
+                        // books and its block tables, so it has to see
+                        // both. A no-op unless every layer slides by the
+                        // same window.
+                        lease.observe_sampled(token, pos + 1, false);
+                        lease.before_step(pos);
+                        paged_refs.push(std::mem::take(lease.caches_mut()));
+                    }
                 }
             }
             // `j` below indexes `active`, and only one of the two
@@ -1656,6 +1706,8 @@ mod tests {
             )),
             queue_wait: std::time::Duration::ZERO,
             radix: None,
+            anchor_token: None,
+            slide_interval: ferrox_edge::pool::DEFAULT_SWA_EVICTION_INTERVAL,
         };
         let store = Arc::clone(&paged.store);
         let free_before = store.free_groups();
@@ -1722,6 +1774,112 @@ mod tests {
             store.free_groups(),
             free_before,
             "a finished batched row must return its pages"
+        );
+    }
+
+    /// A window model slides ON THE BATCHER, and the batcher's own
+    /// budget prices it at what it holds.
+    ///
+    /// Both halves are needed and they fail differently. Without the
+    /// slide in the decode step the paged store runs out and a row is
+    /// refused; without the window in the budget the row never gets that
+    /// far, because the budget refuses it at submission for a context it
+    /// was never going to hold. Both ceilings are set between the two
+    /// answers here, so either alone breaks the test.
+    ///
+    /// Token-for-token against the sequential private loop, because a
+    /// slide that dropped a page one step early would still produce
+    /// fluent output -- just not this output.
+    #[test]
+    fn a_window_model_slides_while_continuously_batched() {
+        let window = 8;
+        let block_size = 4;
+        let mut cfg = test_dense_fixture();
+        cfg.sliding_window = Some(window);
+        cfg.swa_pattern = None;
+        let vocab = cfg.vocab_size;
+        let decoder = Arc::new(Decoder::new_random_small(cfg, 2, vocab));
+        assert_eq!(decoder.config.uniform_sliding_window(), Some(window));
+
+        let max_tokens = 400;
+        let prompts: [Vec<usize>; 2] = [vec![1, 2, 3], vec![4, 5, 6]];
+        let long = |seed: u64| GenerationParams {
+            ignore_eos: true,
+            ..greedy_params(max_tokens, seed)
+        };
+        let params = [long(7), long(11)];
+        let sequential: Vec<Vec<usize>> = prompts
+            .iter()
+            .zip(params.iter())
+            .map(|(p, par)| sequential_ids(&decoder, p, par))
+            .collect();
+
+        // 48 page groups per windowed row against 101 without the
+        // window, and two rows to serve.
+        let paged = PagedKvConfig {
+            store: Arc::new(ferrox_core::cache::SharedPagedKv::new(
+                decoder.layers.len(),
+                block_size,
+                /* blocks_per_layer = */ 120,
+                decoder.config.n_kv_heads,
+                decoder.config.head_dim,
+            )),
+            queue_wait: std::time::Duration::from_secs(5),
+            radix: None,
+            anchor_token: None,
+            slide_interval: ferrox_edge::pool::DEFAULT_SWA_EVICTION_INTERVAL,
+        };
+        let store = Arc::clone(&paged.store);
+        let free_before = store.free_groups();
+
+        let batcher = ContinuousBatcher::spawn_with_config_paged(
+            Arc::clone(&decoder),
+            identity_decode(),
+            BatcherConfig {
+                prefill_chunk: 8,
+                kv_block_size: block_size,
+                // 48 blocks per windowed row; 101 without the window,
+                // which does not fit even once.
+                kv_blocks: Some(100),
+                ..BatcherConfig::default()
+            },
+            Some(paged),
+        );
+
+        let barrier = Arc::new(Barrier::new(3));
+        let results = Arc::new(Mutex::new(vec![None, None]));
+        let mut threads = Vec::new();
+        for i in 0..2 {
+            let batcher = batcher.clone();
+            let barrier = Arc::clone(&barrier);
+            let results = Arc::clone(&results);
+            let prompt = prompts[i].clone();
+            let par = params[i].clone();
+            threads.push(thread::spawn(move || {
+                barrier.wait();
+                let out = batcher
+                    .generate(prompt, par, StopTokens::default())
+                    .expect("a windowed batched row must serve");
+                results.lock().unwrap()[i] = Some(out.1);
+            }));
+        }
+        barrier.wait();
+        for t in threads {
+            t.join().unwrap();
+        }
+        let got = results.lock().unwrap().clone();
+        for (i, want) in sequential.iter().enumerate() {
+            let ids = got[i].as_ref().expect("both rows replied");
+            assert_eq!(ids.len(), max_tokens, "row {i} stopped early");
+            assert_eq!(ids, want, "row {i}: the window slide changed the ids");
+        }
+
+        drop(batcher);
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert_eq!(
+            store.free_groups(),
+            free_before,
+            "a finished slid row must return its recycled pages too"
         );
     }
 
@@ -2423,7 +2581,7 @@ mod tests {
     #[test]
     fn an_unconfigured_budget_admits_everything() {
         let budget = budget(4, None);
-        assert!(budget.immovable_refusal(usize::MAX).is_none());
+        assert!(budget.immovable_refusal(usize::MAX, usize::MAX).is_none());
         assert!(budget.try_reserve(1_000_000));
         budget.release(1_000_000);
     }
@@ -2610,7 +2768,7 @@ mod tests {
     #[test]
     fn without_ceilings_nothing_is_refused_as_too_large() {
         let budget = BlockBudget::new(4, None, Arc::new(ContextCeiling::new(None, test_shape())));
-        assert!(budget.immovable_refusal(1_000_000).is_none());
+        assert!(budget.immovable_refusal(1_000_000, 1_000_000).is_none());
         assert_eq!(budget.rejected_too_large.load(Ordering::Relaxed), 0);
         assert_eq!(budget.ceiling.refused(), 0);
     }

@@ -62,6 +62,7 @@ pub mod residency;
 pub mod scheduler;
 pub mod state_pool;
 pub mod stats;
+pub mod supervisor;
 pub mod window_pool;
 
 pub use anchor::{

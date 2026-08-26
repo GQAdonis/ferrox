@@ -148,6 +148,7 @@ returns a decision.
 | `stats` | what a server may honestly claim about its own throughput and latency |
 | `maintenance` | whether a request, a cache rebuild or a stop may proceed right now |
 | `residency` | which class a layer's expert bank settles into, and what that then forbids |
+| `supervisor` | whether a start spawns, no-ops or conflicts; whether a death was asked for; which process the OOM killer should take |
 | `state_pool` | which recurrent-state slot a request holds, and where a prefill freezes one |
 | `bench_profile` | where this machine's measured bandwidth profile lives, and when it may be trusted |
 
@@ -162,6 +163,19 @@ yet driving the decoder — see [`ROADMAP.md`](ROADMAP.md).
 it: a warm decode step provably copies zero bytes, on a host pool. No
 GPU backend implements its `SlotDevice` trait yet, so on a real card
 that property is written down and not yet measured.
+
+`supervisor` is the same shape for processes: the lifecycle rules are
+here and testable, and spawning sits behind a `ProcessHost` the caller
+supplies. Ferrox ships one binary, so nothing implements that trait
+yet. The rules are the reason it exists at all, since each is a race
+you would otherwise only meet in production: a retried start must not
+become a second engine, one party reaps and everyone else waits on
+what it publishes (a poll transiently lies), the stop-requested latch
+is set before the signal so a crash mid-stop is not read as an
+unplanned death, shutdown is permanent so a start queued behind the
+final stop is rejected, and a recorded child is re-adopted only on
+`(pid, start_time, argv, port)` -- `start_time` being what stops a
+recycled PID from being adopted as the engine.
 
 Ferrox Studio, the web UI in [`ui/`](../ui), is a separate app that
 talks to this API over HTTP. `ferrox-server` does not serve it.

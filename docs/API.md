@@ -20,13 +20,35 @@ comes back the same way.
 | `POST /v1/messages` | Anthropic Messages, streaming and buffered |
 | `POST /v1/messages/count_tokens` | Anthropic prompt sizing, no generation |
 | `POST /v1/responses` | OpenAI Responses surface (what `codex` speaks), streaming and buffered |
+| `GET /v1/responses/{id}` · `POST /v1/responses/{id}/cancel` | Always 404. This server keeps no responses, so there is nothing to fetch or cancel by response id. Cancel a live generation with `POST /v1/cancel` |
 | `GET /v1/stats` · `GET /v1/requests` | Live serving telemetry, pool gauges, memory footprint, and the request ring |
 | `POST /v1/cancel` | Stop a streamed generation by `request_id` (see below) |
+| `GET /v1/stream/{request_id}` · `GET /v1/stream/{request_id}/poll` | Reconnect into a resumable stream, over SSE or plain JSON (see below) |
 | `GET /v1/cache/status` · `POST /v1/cache/rebuild` | KV pool geometry and re-split (see below) |
 | `POST /v1/admin/prepare-stop` | Close admission, seal the accounting, and make the receipt durable (see below) |
 | `GET /cache/stats` · `GET /metrics` | Ferrox extensions |
 | `/admin/*` | Control surface (see below) |
+| `GET /` | 404. The web UI in [`ui/`](../ui) is a separate app and this server does not serve it |
 | Audio / images | Not supported |
+
+That is the whole list. Every path lives as one constant in the
+`ferrox-api` crate, and the server mounts nothing that is not in it, so
+the UI and the server cannot disagree about a URL.
+
+## Authentication
+
+Set `FERROX_API_KEY` and every route except `GET /health` needs
+`Authorization: Bearer <key>`. `/metrics` and `/cache/stats` are in that
+set, so a Prometheus scraper needs the header too.
+
+Only the `Authorization` header is read. `x-api-key`, which the
+Anthropic SDK sends by default, is **not** accepted: a stock Anthropic
+client pointed at a keyed server gets a 401 until you set the bearer
+header yourself.
+
+Request bodies are capped at axum's 2 MiB default. A long `/v1/messages`
+conversation or a large `/v1/embeddings` batch past that comes back
+`413` before any handler sees it.
 
 ## Chat completions fields
 
@@ -37,7 +59,7 @@ comes back the same way.
 | `temperature`, `top_p`, `top_k`, `repetition_penalty`, `seed`, `stop` | Supported |
 | `presence_penalty`, `frequency_penalty` | Supported |
 | `stream` | Supported (overlapped SSE when tools off and CB off) |
-| `tools` / `tool_choice: none\|auto` | Supported (prompt-engineered, parsed in nine wire formats) |
+| `tools` / `tool_choice: none\|auto` | Supported (prompt-engineered, parsed in eleven wire formats) |
 | `tool_choice: required` / named function | **Reject** |
 | `logprobs` / `top_logprobs` / `n` (>1) | **Reject** |
 | `response_format: json_object` | Supported (best-effort mask + validate) |
@@ -46,7 +68,7 @@ comes back the same way.
 | `chat_template_kwargs` | Supported (see [Chat templates](#chat-templates)) |
 | `reasoning_effort` | Supported, quantized onto what the checkpoint grades; `none`/`off` turn thinking off |
 | `thinking: {"type": …}` | Supported (DeepSeek wire): `enabled`/`disabled`, anything else is a 400 |
-| `ignore_eos` | Ferrox extension: run past the model's own end-of-generation tokens so the request produces exactly `max_tokens`. A serving-benchmark knob. Suppresses the model's set only — a caller's own `stop` strings still end the answer |
+| `ignore_eos` | Ferrox extension: run past the model's own end-of-generation tokens so the request produces exactly `max_tokens`. A serving-benchmark knob. Suppresses the model's set only. A caller's own `stop` strings still end the answer |
 | `reasoning_content` (both ways) | Ferrox extension: a reasoning model's chain of thought, split out of `content` on the way out and replayable on the way in (`reasoning` is accepted as an alias) |
 
 ### Where a completion stops
@@ -71,7 +93,7 @@ template that already emitted BOS never gets a second one.
 
 Two outcomes, not one. A **prompt** at or past the deployment's
 per-request position ceiling is refused with a 400 whose message reads
-`prompt is too long: N tokens > M maximum` — wording that Claude Code
+`prompt is too long: N tokens > M maximum`, the wording that Claude Code
 and OpenClaw match on, because the Anthropic wire carries no error code
 for it. A prompt that *fits* is **served**, with `max_tokens` clamped
 down to the room that remains; refusing that case would turn a servable
@@ -82,8 +104,8 @@ budget safe.
 ## Chat templates
 
 The prompt is rendered by evaluating the checkpoint's own
-`tokenizer.chat_template` — the real Jinja2 source shipped in the GGUF —
-not by recognising it. A checkpoint that ships no template at all falls
+`tokenizer.chat_template`, the real Jinja2 source shipped in the GGUF,
+rather than by recognising it. A checkpoint that ships no template at all falls
 back to ChatML (matching llama.cpp `--jinja`), or to role-labeled lines
 for a byte/synthetic tokenizer. A template that does not compile, or that
 uses a construct this evaluator does not provide, fails the chat request
@@ -104,7 +126,7 @@ Five rules are applied to it before rendering:
   protocol-level knobs then stand down entirely rather than merging, so
   a default can never contradict an explicit request.
 * **`none` and `off` are not gears.** `reasoning_effort: "none"` means
-  *turn thinking off*, and is broadcast as such — it is not quantized
+  *turn thinking off*, and is broadcast as such. It is not quantized
   onto the nearest gear, which would turn "do not think" into "think a
   little". The DeepSeek-wire `thinking: {"type": "disabled"}` does the
   same and beats any effort in the same request, because the switch is
@@ -127,7 +149,7 @@ Five rules are applied to it before rendering:
   template ignores variables it does not declare.
 
 `GET /v1/models` advertises what came out of that probe:
-`supported_reasoning_efforts` (least thinking first — `off`, `adaptive`,
+`supported_reasoning_efforts` (least thinking first: `off`, `adaptive`,
 then the gears, or a bare `on` when there is a toggle but no ladder) and
 `default_reasoning_effort` (the gear the checkpoint is already in when
 asked for nothing). A checkpoint that says nothing about thinking
@@ -156,7 +178,7 @@ never behind auth or rate limiting.
       "reason": "metal_not_built",       // stable code, safe to switch on
       "detail": "Apple M2 Pro is present but this binary was built without --features metal; rebuild to use it." }
   ],
-  "version": "0.9.1", "pid": 4242, "uptime_seconds": 12.5,
+  "version": "0.12.0", "pid": 4242, "uptime_seconds": 12.5,
   "server_time_unix_ms": 1786000000000,
   "last_request_age_seconds": 0.4    // absent until one is served
 }
@@ -249,11 +271,6 @@ server cannot disagree about them.
 | `GET /admin/tasks` | every job, newest last |
 | `POST /admin/tasks/{task_id}/cancel` | `200 {"ok":true}` |
 | `GET /admin/stats` | counters + recent-request ring |
-
-| Stream recovery | |
-|---|---|
-| `GET /v1/stream/{request_id}` | reconnect into a resumable stream (SSE) |
-| `GET /v1/stream/{request_id}/poll` | the same replay buffer over JSON |
 
 ### Models
 
@@ -377,7 +394,6 @@ Set `HF_TOKEN` (or `HUGGING_FACE_HUB_TOKEN`) for gated repos, and
   "tokens_prompt_total": 17, "tokens_generated_total": 24,
   "last_request_age_seconds": 0.02,
   "generating_now": 0,               // decoding right now, NOT a queue depth
-  "generating_now": 0,               // decoding right now; NOT a queue depth
   "queue_depth": null,               // null unless continuous batching is on
   "queue_rejected_total": null,      // turned away by the queue cap, since start
   "recent": [{
@@ -523,7 +539,7 @@ stopped something it did not.
 ### Stop strings
 
 A generation that runs into one of the caller's `stop` strings reports
-`finish_reason: "stop"` here — OpenAI's vocabulary has no other value,
+`finish_reason: "stop"` here. OpenAI's vocabulary has no other value,
 and inventing one would make a completed answer look like a failure to
 a client checking against the documented set. The stop string itself is
 trimmed from the answer.
@@ -534,8 +550,8 @@ with `stop_sequence: "<the string>"` beside it, on the buffered body and
 in the terminal `message_delta` alike. The two are only ever reported
 together. Two things are deliberately *not* reported that way:
 
-- A stop the **server** added — the served template's own end-of-turn
-  marker — reports the ordinary `end_turn`. Telling an agent it hit a
+- A stop the **server** added, the served template's own end-of-turn
+  marker, reports the ordinary `end_turn`. Telling an agent it hit a
   fence it never put up is worse than telling it nothing.
 - A **truncated** generation reports `max_tokens` even if a stop
   matched, and a generation that produced tool calls reports
@@ -569,7 +585,7 @@ header, spelled as the upstream API spells it. Cancel a streamed
 Every streamed endpoint sends a keepalive after 15 seconds of silence,
 and every one of them is a **data frame**, never an SSE comment. axum's
 own `Sse::keep_alive` writes `: ping`, which a proxy sees but a client's
-event handler never does — and a client's stream-idle timeout is armed
+event handler never does. A client's stream-idle timeout is armed
 on received events, so a comment-kept stream gets torn down and
 reconnected in the middle of a long prefill, which is exactly when a
 keepalive was supposed to help.
@@ -597,14 +613,11 @@ convention, buffer `text/event-stream` by default. That turns a
 token-by-token stream into one silent wait followed by the whole answer,
 which looks exactly like a hung backend from the client side.
 
-A keep-alive comment goes out every 15 s, so an idle but healthy stream
-still puts bytes on the wire. Measure your stall timeout against bytes
-received rather than tokens. A long prefill then never trips it, and a
-swallowed connection does.
+A keepalive data frame goes out every 15 s, so an idle but healthy
+stream still puts bytes on the wire. Measure your stall timeout against
+bytes received rather than tokens. A long prefill then never trips it,
+and a swallowed connection does.
 
-Not implemented: `id:`, `retry:` and `Last-Event-ID` replay, plus a
-polling fallback. Sending `id:` without a server-side replay buffer
-would be a promise this server cannot keep.
 ### Resumable streams
 
 `id:` is a promise that a reconnect can pick up where the connection
@@ -700,7 +713,7 @@ same request rather than differing by transport.
 
 Which family applies is inferred from the served model's name, which is
 all there is: ferrox carries no per-checkpoint parser declaration. A
-name that implies nothing gets no reasoning parser at all — the right
+name that implies nothing gets no reasoning parser at all, the right
 answer for a model that does not reason, since an unconditional
 splitter would eat a literal `<think>` written in a code block.
 
@@ -709,7 +722,7 @@ splitter would eat a literal `<think>` written in a code block.
 `reasoning_content` is accepted on a request's assistant messages, not
 only returned on responses, and `reasoning` is accepted as an alias so a
 turn can be replayed in the shape `/v1/responses` or `/v1/messages`
-handed it back. It is passed to the template on its own key — under
+handed it back. It is passed to the template on its own key, under
 *both* spellings, since the DeepSeek and GLM lineages iterate
 `message.reasoning_content` while Qwen and gpt-oss read
 `message.reasoning`, and a template treats the key it does not know as
@@ -726,13 +739,13 @@ Whether the block is *already open* is read off the rendered prompt, not
 guessed from the family: a template asked to think can open the block in
 the prompt itself, and then the model's first token is reasoning and no
 opening marker ever arrives. Same checkpoint, same request text,
-different answer depending on what `chat_template_kwargs` rendered — so
+different answer depending on what `chat_template_kwargs` rendered, so
 the prompt is what gets consulted.
 
 ## Tool-call formats
 
 `tools` is still prompt-engineered (there is no grammar-constrained
-decoding here — see the `tool_choice` rejections above), and the
+decoding here, see the `tool_choice` rejections above), and the
 preamble asks for a Hermes-style
 `<tool_call>{"name": …, "arguments": {…}}</tool_call>`. But a model
 trained on a different format frequently answers in its own, correctly
@@ -748,21 +761,32 @@ family implies, then the one the preamble asked for:
 | GLM-4.7 | `<arg_key>k</arg_key><arg_value>v</arg_value>` |
 | DeepSeek | `<｜DSML｜invoke name="…"><｜DSML｜parameter name="…">…` |
 | MiniMax | `<minimax:tool_call><invoke name="…"><parameter name="…">…` |
+| MiniMax-M3 | `]<]minimax[>[<tool_call>` around a namespaced element grammar, a different protocol rather than renamed tags |
 | gpt-oss | `<\|channel\|>commentary to=functions.name<\|message\|>{…}<\|call\|>` |
 | Gemma 4 | `<\|tool_call>call:name{k: v}<tool_call\|>` |
+| muse-glimmer | `<atem:invoke>` / `<atem:parameter>` inside an ATEM channel block |
 
-Every call in a response is returned, not just the first, with ids
-`call_0`, `call_1`, … — nothing in these formats carries an id, and a
+Eleven formats, and the parser chooses among them from the served
+model's name. Every call in a response is returned, not just the first, with ids
+`call_0`, `call_1`, and so on. Nothing in these formats carries an id, so a
 client correlates by index.
 
-**Streaming.** On the non-batched path the four invoke/parameter
-families stream their arguments as OpenAI-shaped deltas: the first
-delta of a call carries `index`, `id`, `type` and `function.name` with
-empty arguments, and every delta after it carries only more
-`function.arguments` text. The fragments are literal continuations, so
-a client concatenates them in `index` order and parses the result —
-which is what lets a coding agent watch a file argument arrive instead
-of waiting for it. The JSON-payload families (Hermes, Llama 3, Mistral,
+**Streaming.** On the non-batched path five invoke/parameter families
+stream their arguments as deltas: Qwen3-Coder, GLM-4.7, DeepSeek,
+MiniMax and muse-glimmer. The first delta of a call carries `index`,
+`id`, `type` and `function.name` with empty arguments, and every delta
+after it carries only more `function.arguments` text. The fragments are
+literal continuations, so a client concatenates them in `index` order
+and parses the result, which is what lets a coding agent watch a file
+argument arrive instead of waiting for it.
+
+`/v1/messages` and `/v1/responses` stream the same events in their own
+protocols rather than in OpenAI's: Anthropic sends `content_block_start`
+with a `tool_use` block and then `input_json_delta` fragments, and the
+Responses API sends `response.output_item.added` followed by
+`response.function_call_arguments.delta`.
+
+The JSON-payload families (Hermes, Llama 3, Mistral, MiniMax-M3,
 gpt-oss, Gemma) still arrive whole, because a half-written JSON object
 is not a fragment anyone can use. A generation truncated mid-call
 reports `length`, not `tool_calls`: a half-written call must not be
@@ -778,7 +802,7 @@ from arriving as a number.
 
 ## Legacy completions
 
-`/v1/completions` honours `stop`, `max_tokens` (default 16 — the legacy
+`/v1/completions` honours `stop`, `max_tokens` (default 16, because the legacy
 floor is right *here*, where a caller completing a fragment usually
 wants a fragment back), `temperature`, `top_p` and `seed`.
 
@@ -786,15 +810,26 @@ Everything it does not implement is refused **by name** rather than
 dropped: token-id prompts (`[int]` / `[[int]]`), `logprobs`, `echo`,
 `suffix`, `logit_bias`, and any `response_format` other than
 `{"type": "text"}`. Serde drops an undeclared field silently, and a
-caller cannot tell that apart from having had it honoured — which for
+caller cannot tell that apart from having had it honoured, which for
 `stop` in particular means believing generation will halt at a sentinel
 and instead getting the full budget of text past it.
 
 ## Not yet
 
-Anthropic streaming/tools/images · full JSON schema / grammar ·
-`tool_choice=required` · dedicated embedding models · multi-GPU / TP / PD ·
-streamed argument deltas for the JSON-payload families (they arrive
-whole) · streamed tool calls on the continuous-batching path.
+Image and audio input · full JSON schema / grammar constrained decoding ·
+`tool_choice: required` and named `tool_choice` · MCP tool invocation
+(the config is read, nothing is called) · dedicated embedding models ·
+multi-GPU, tensor parallel, prefill/decode disaggregation · streamed
+argument deltas for the JSON-payload tool formats (they arrive whole) ·
+streamed tool calls on the continuous-batching path · a speculative
+decode path in the server, so every speculation field in `usage` is
+absent today.
+
+A few request fields deserialize and then go nowhere, accepted so a
+stock client's body does not fail validation over something this server
+has no use for: `metadata` and `thinking.budget_tokens` on
+`/v1/messages`, and `store`, `metadata` and `parallel_tool_calls` on
+`/v1/responses`. Everything else this server does not implement is
+refused by name.
 
 See [`ROADMAP.md`](ROADMAP.md).

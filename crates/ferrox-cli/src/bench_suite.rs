@@ -186,10 +186,19 @@ pub fn run_suite(args: SuiteArgs) -> anyhow::Result<()> {
             // The previous entry's own benchmark is still in the
             // 1-minute average, and the child re-checks the bar. Let it
             // decay instead of letting the suite lock itself out.
-            crate::host_state::wait_until_quiet_enough(
+            // Skip this entry rather than abandoning the suite. `?` here
+            // meant one busy stretch killed the whole run and every
+            // model after it never went, which is how a 12-model suite
+            // stopped at 8 and left the table half old and half new.
+            // A missing GGUF already skips; an unclearable host is the
+            // same kind of "not now", and the previous receipt stands.
+            if let Err(why) = crate::host_state::wait_until_quiet_enough(
                 args.max_load,
                 std::time::Duration::from_secs(180),
-            )?;
+            ) {
+                eprintln!("skip {} {backend}: {why}", entry.id);
+                continue;
+            }
             let status = std::process::Command::new(&exe)
                 .arg("bench")
                 .args(["-m", &entry.gguf])

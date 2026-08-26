@@ -4487,23 +4487,12 @@ impl Decoder {
             }
         }
 
-        let vocab_size = self.output_head.rows();
         let final_normed_batch: Vec<f32> = hidden_batch
             .par_chunks(hidden_dim)
             .map(|h| rms_norm(h, &self.final_norm, self.config.rms_norm_eps))
             .flatten()
             .collect();
-        let mut logits_batch = self
-            .output_head
-            .apply_batch(&final_normed_batch, batch_size);
-        if let Some(sc) = self.config.final_logit_softcap {
-            softcap_inplace(&mut logits_batch, sc);
-        }
-
-        logits_batch
-            .chunks(vocab_size)
-            .map(|c| c.to_vec())
-            .collect()
+        self.logits_from_flat_hidden(final_normed_batch, batch_size)
     }
 }
 

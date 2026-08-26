@@ -18,6 +18,20 @@
 //! small number of concurrent conversations a demo server actually
 //! handles, a linear scan is simpler and correctness is easier to
 //! verify.
+//!
+//! "LRU-bounded" is now true. It was not: eviction dropped the oldest
+//! ARRIVAL while nothing on the hit path recorded that an entry had
+//! been used, so the policy was first-in-first-out under an LRU name.
+//! That inverted the cache's purpose, because the entry a prefix cache
+//! exists for -- the system prompt every request shares -- is the
+//! oldest one precisely because it is the most reused.
+//!
+//! What is still true of the scope: each entry CLONES its
+//! `Vec<KvCache>`, so N conversations off one system prompt hold N
+//! copies of its KV rather than sharing the pages. Fixing that is the
+//! radix cache's job (`ferrox_edge::radix`), which shares nodes and
+//! reference-counts pages, and which needs a serving path that reads
+//! paged KV before it can be wired in.
 
 use ferrox_core::cache::KvCache;
 
@@ -31,6 +45,14 @@ struct StoredPrefix {
     tokens: Vec<usize>,
     kv_caches: Vec<KvCache>,
     pending_logits: Vec<f32>,
+    /// Monotonic recency stamp; smallest = least recently used.
+    ///
+    /// A stamp per touch rather than reshuffling a dedicated LRU list,
+    /// the same shape `ferrox_core::expert_store` uses and for the same
+    /// reason: eviction pays an O(n) scan, which costs nothing here
+    /// because the lookup that precedes it is already O(n) over the
+    /// same vector.
+    last_used: u64,
 }
 
 /// LRU-bounded store of `StoredPrefix` snapshots, searched for the
@@ -41,6 +63,10 @@ pub struct PrefixCache {
     hits_positions_reused: u64,
     hits_count: u64,
     misses_count: u64,
+    /// Ticks on every hit and every store, so `last_used` orders
+    /// entries by when they were last USEFUL rather than by when they
+    /// arrived.
+    clock: u64,
 }
 
 /// What was found (or not) for an incoming token sequence.
@@ -63,6 +89,7 @@ impl PrefixCache {
             hits_positions_reused: 0,
             hits_count: 0,
             misses_count: 0,
+            clock: 0,
         }
     }
 
@@ -87,18 +114,28 @@ impl PrefixCache {
     /// truncated to the matching length before being handed back, so
     /// the caller never sees state from a divergent continuation).
     pub fn find_longest_prefix(&mut self, tokens: &[usize]) -> PrefixMatch {
-        let mut best: Option<(usize, &StoredPrefix)> = None;
-        for entry in &self.entries {
+        let mut best: Option<(usize, usize)> = None; // (matched_len, index)
+        for (i, entry) in self.entries.iter().enumerate() {
             let common = common_prefix_len(&entry.tokens, tokens);
             if common > 0 && best.map(|(len, _)| common > len).unwrap_or(true) {
-                best = Some((common, entry));
+                best = Some((common, i));
             }
         }
 
         match best {
-            Some((matched_len, entry)) => {
+            Some((matched_len, index)) => {
                 self.hits_count += 1;
                 self.hits_positions_reused += matched_len as u64;
+                // A HIT is what makes an entry worth keeping, so this
+                // is where recency has to be recorded. Without it the
+                // policy degenerates to first-in-first-out, and the one
+                // entry a prefix cache exists for -- a shared system
+                // prompt every request starts with -- is evicted as
+                // soon as `max_entries` newer prompts arrive, however
+                // often it is being reused.
+                self.clock += 1;
+                self.entries[index].last_used = self.clock;
+                let entry = &self.entries[index];
 
                 let mut kv_caches = entry.kv_caches.clone();
                 for cache in kv_caches.iter_mut() {
@@ -139,13 +176,34 @@ impl PrefixCache {
 
     /// Stores a snapshot for `tokens` (all tokens processed so far,
     /// prompt plus any generated continuation) with the given KV cache
-    /// state and next-token logits, evicting the least-recently-stored
+    /// state and next-token logits, evicting the least recently USED
     /// entry if already at capacity.
+    ///
+    /// Used, not stored. This used to drop `entries[0]` -- the oldest
+    /// arrival -- while the type documented itself as LRU-bounded. The
+    /// difference is the whole value of the cache: a system prompt that
+    /// every request shares is the oldest entry precisely BECAUSE it is
+    /// the most reused, so FIFO evicted the one entry worth keeping as
+    /// soon as `max_entries` newer prompts arrived, and the next
+    /// request off that system prompt recomputed all of it.
     pub fn store(&mut self, tokens: Vec<usize>, kv_caches: Vec<KvCache>, pending_logits: Vec<f32>) {
         if self.entries.len() >= self.max_entries {
-            self.entries.remove(0);
+            // An O(n) scan, over the same vector the lookup above
+            // already scans linearly -- so this costs nothing the
+            // design was not already paying.
+            if let Some(coldest) = self
+                .entries
+                .iter()
+                .enumerate()
+                .min_by_key(|(i, e)| (e.last_used, *i))
+                .map(|(i, _)| i)
+            {
+                self.entries.remove(coldest);
+            }
         }
+        self.clock += 1;
         self.entries.push(StoredPrefix {
+            last_used: self.clock,
             tokens,
             kv_caches,
             pending_logits,
@@ -184,6 +242,88 @@ mod tests {
             cache.push(&[i as f32], &[i as f32 * 10.0]).unwrap();
         }
         cache
+    }
+
+    /// The bug this type was named after and did not have.
+    ///
+    /// A shared system prompt is the entry a prefix cache exists for,
+    /// and under FIFO it was the FIRST thing evicted -- it is the
+    /// oldest arrival precisely because it is the most reused. Here it
+    /// is kept hot by hits while `max_entries` newer prompts arrive,
+    /// and it must survive.
+    #[test]
+    fn a_prefix_that_keeps_being_hit_survives_newer_arrivals() {
+        let system: Vec<usize> = (0..8).collect();
+        let mut cache = PrefixCache::new(3);
+        cache.store(system.clone(), vec![dummy_cache(system.len())], vec![0.5]);
+
+        // Three unrelated prompts arrive, which is capacity twice over.
+        // Between each, the system prompt is used again.
+        for n in 0..3usize {
+            let hit = cache.find_longest_prefix(&system);
+            assert_eq!(
+                hit.matched_len,
+                system.len(),
+                "the system prompt must still be here before arrival {n}"
+            );
+            let other: Vec<usize> = (100 + n * 10..100 + n * 10 + 4).collect();
+            cache.store(other.clone(), vec![dummy_cache(other.len())], vec![0.5]);
+        }
+
+        let hit = cache.find_longest_prefix(&system);
+        assert_eq!(
+            hit.matched_len,
+            system.len(),
+            "a hot prefix was evicted while cold newer ones were kept"
+        );
+    }
+
+    /// And the converse: the entry nobody has touched is the one that
+    /// goes. Without this the first test could pass by never evicting
+    /// anything at all.
+    #[test]
+    fn the_least_recently_used_prefix_is_the_one_evicted() {
+        let mut cache = PrefixCache::new(2);
+        let cold: Vec<usize> = vec![1, 2, 3, 4];
+        let warm: Vec<usize> = vec![5, 6, 7, 8];
+        cache.store(cold.clone(), vec![dummy_cache(cold.len())], vec![0.5]);
+        cache.store(warm.clone(), vec![dummy_cache(warm.len())], vec![0.5]);
+
+        // Touch `warm` only, then push past capacity.
+        assert_eq!(cache.find_longest_prefix(&warm).matched_len, warm.len());
+        let fresh: Vec<usize> = vec![9, 10, 11, 12];
+        cache.store(fresh.clone(), vec![dummy_cache(fresh.len())], vec![0.5]);
+
+        assert_eq!(
+            cache.find_longest_prefix(&cold).matched_len,
+            0,
+            "the untouched entry should have been evicted"
+        );
+        assert_eq!(cache.find_longest_prefix(&warm).matched_len, warm.len());
+        assert_eq!(cache.find_longest_prefix(&fresh).matched_len, fresh.len());
+    }
+
+    /// With nothing ever hit, eviction still has to make progress and
+    /// has to be deterministic: equal stamps break toward the lower
+    /// index, so the oldest arrival goes, which is the FIFO behaviour
+    /// as a degenerate case rather than as the policy.
+    #[test]
+    fn untouched_entries_evict_oldest_first_and_capacity_is_never_exceeded() {
+        let mut cache = PrefixCache::new(2);
+        for n in 0..5usize {
+            let p: Vec<usize> = (n * 10..n * 10 + 4).collect();
+            cache.store(p.clone(), vec![dummy_cache(p.len())], vec![0.5]);
+        }
+        assert_eq!(cache.entries.len(), 2, "capacity must hold");
+        // The two most recent survive.
+        for n in [3usize, 4] {
+            let p: Vec<usize> = (n * 10..n * 10 + 4).collect();
+            assert_eq!(cache.find_longest_prefix(&p).matched_len, 4, "prompt {n}");
+        }
+        for n in [0usize, 1, 2] {
+            let p: Vec<usize> = (n * 10..n * 10 + 4).collect();
+            assert_eq!(cache.find_longest_prefix(&p).matched_len, 0, "prompt {n}");
+        }
     }
 
     #[test]

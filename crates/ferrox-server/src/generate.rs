@@ -156,6 +156,21 @@ impl Drop for PagedLease {
 }
 
 impl PagedLease {
+    /// This request's per-layer paged caches, for a caller that drives
+    /// the forward itself.
+    ///
+    /// The lease keeps owning the page GROUPS, so taking the caches out
+    /// with `mem::take` and putting them back -- which the batched
+    /// decode step does, to hand the whole batch to one call -- does
+    /// not disturb the accounting. Only `Drop` releases groups.
+    pub fn caches_mut(&mut self) -> &mut Vec<PagedKvCache> {
+        &mut self.caches
+    }
+
+    pub fn store(&self) -> &Arc<SharedPagedKv> {
+        &self.store
+    }
+
     /// The store's page size, which every caller needs to turn groups
     /// into positions.
     pub fn block_size(&self) -> usize {
@@ -181,7 +196,7 @@ impl PagedLease {
 /// which that function's comment records as having been found by a real
 /// panic in live testing. A request that cannot fit is refused here,
 /// before any work, rather than dying halfway through an answer.
-fn acquire_paged_caches(
+pub(crate) fn acquire_paged_caches(
     decoder: &Decoder,
     config: &PagedKvConfig,
     tokens: &[usize],

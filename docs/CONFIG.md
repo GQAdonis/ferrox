@@ -58,7 +58,7 @@ library or overriding the CLI.
 | `FERROX_KV_BYTE_BUDGET` | Byte ceiling for the KV block pool, independent of block count |
 | `FERROX_PAGED_KV_BLOCKS` | Blocks per layer of real paged KV: shared page storage many requests read through a block table, rather than a private buffer each. Mutually exclusive with `FERROX_KV_POOL_BLOCKS`/`FERROX_KV_BYTE_BUDGET` and with `FERROX_PREFIX_CACHE_ENTRIES`; setting an excluded pair stops the server with an error naming both |
 | `FERROX_PAGED_KV_BLOCK_SIZE` | Positions per paged-KV block. Must be set together with `FERROX_PAGED_KV_BLOCKS` |
-| `FERROX_PREFIX_CACHE_ENTRIES` | Prefix-cache capacity for the private generate path. Mutually exclusive with continuous batching and with paged KV |
+| `FERROX_PREFIX_CACHE_ENTRIES` | Prefix-cache capacity for the private generate path. Mutually exclusive with continuous batching and with paged KV. Paged KV has no such exclusion: it composes with continuous batching, and shares prefixes through the radix tree instead |
 | `FERROX_EXPERT_CACHE_BYTES` | MoE expert-streaming cache budget |
 | `FERROX_SSD_STREAMING` | `1`, stream MoE experts from disk |
 | `FERROX_GPU_VRAM_BUDGET_BYTES` | Cap GPU-resident MoE experts (`0` = CPU experts on Metal) |

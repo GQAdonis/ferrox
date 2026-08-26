@@ -2579,6 +2579,8 @@ mod tests {
             ToolCallFormat::MiniMax,
             ToolCallFormat::DeepSeekV32,
             ToolCallFormat::Glm47,
+            ToolCallFormat::MiniMaxM3,
+            ToolCallFormat::MuseGlimmer,
         ] {
             let wire = wire_for(format);
             for width in [1usize, 5, 17, 4096] {
@@ -2609,6 +2611,8 @@ mod tests {
             ToolCallFormat::MiniMax,
             ToolCallFormat::DeepSeekV32,
             ToolCallFormat::Glm47,
+            ToolCallFormat::MiniMaxM3,
+            ToolCallFormat::MuseGlimmer,
         ] {
             let wire = wire_for(format);
             let (_, complete) = parser(format).parse_complete(&wire);
@@ -2627,6 +2631,26 @@ mod tests {
                  <parameter=city>\nRome\n</parameter>\
                  <parameter=days>\n3\n</parameter>\
                  </function></tool_call>"
+                .to_string(),
+            // M3 is a different protocol from MiniMax-M2, not renamed
+            // tags: every structural tag is namespaced, and a parameter
+            // is named by its own ELEMENT rather than by an attribute.
+            ToolCallFormat::MiniMaxM3 => "]<]minimax[>[<tool_call>\
+                 ]<]minimax[>[<invoke name=\"get_weather\">\
+                 ]<]minimax[>[<city>Rome]<]minimax[>[</city>\
+                 ]<]minimax[>[<days>3]<]minimax[>[</days>\
+                 ]<]minimax[>[</invoke>]<]minimax[>[</tool_call>"
+                .to_string(),
+            // The ATEM block does not stand alone: muse-glimmer's
+            // channel layer classifies the segment, so the block has to
+            // arrive inside a `to=tool` message or the parser is right
+            // to treat it as text.
+            ToolCallFormat::MuseGlimmer => "assistant to=tool<|message|>\
+                 <atem:function_calls>\
+                 <atem:invoke name=\"get_weather\">\
+                 <atem:parameter name=\"city\">Rome</atem:parameter>\
+                 <atem:parameter name=\"days\">3</atem:parameter>\
+                 </atem:invoke></atem:function_calls><|eot|>"
                 .to_string(),
             ToolCallFormat::MiniMax => "<minimax:tool_call>\
                  <invoke name=\"get_weather\">\

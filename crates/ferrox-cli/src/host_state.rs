@@ -267,6 +267,44 @@ pub fn ensure_quiet_enough(max_load: f64) -> anyhow::Result<Option<f64>> {
     Ok(load)
 }
 
+/// Waits for the host to fall back under the bar, then returns.
+///
+/// A suite runs one heavy child per entry, and the 1-minute load
+/// average it reads is mostly the PREVIOUS entry's own benchmark still
+/// decaying. Failing on that makes the suite defeat its own gate: the
+/// first entries measure, their load locks out everything after them,
+/// and a 21-row run writes 2 receipts. Measured that way on Host B
+/// before this existed.
+///
+/// So between entries the answer is to wait rather than to refuse. An
+/// external load that never clears still fails, after `timeout`, which
+/// is the case the bar was written for.
+pub fn wait_until_quiet_enough(max_load: f64, timeout: std::time::Duration) -> anyhow::Result<()> {
+    if max_load <= 0.0 {
+        return Ok(());
+    }
+    let start = std::time::Instant::now();
+    loop {
+        match load_average_1min() {
+            // An unmeasured host never blocks: silence is not evidence
+            // of a busy machine, the same rule the bar itself follows.
+            None => return Ok(()),
+            Some(l) if l < max_load => return Ok(()),
+            Some(l) => {
+                if start.elapsed() >= timeout {
+                    anyhow::bail!(
+                        "host 1-minute load average is still {l:.2} after waiting {}s for it \
+                         to fall below {max_load:.2}. Something other than this suite is \
+                         busy; a timed run here is noise, not a measurement.",
+                        timeout.as_secs()
+                    );
+                }
+                std::thread::sleep(std::time::Duration::from_secs(5));
+            }
+        }
+    }
+}
+
 /// Refuses a timed run while the OS says it is actively giving up
 /// clocks to stay cool. Shares `--max-load 0`'s escape hatch, because
 /// it is the same escape: measure anyway, but the number is not
@@ -309,6 +347,37 @@ mod tests {
         assert_eq!(
             parse_pmset_therm("Note: No thermal warning level has been recorded"),
             None
+        );
+    }
+
+    /// The disable switch has to disable the WAIT too, or
+    /// `--max-load 0` would still block a suite for three minutes per
+    /// entry on a busy box, which is the opposite of what it promises.
+    #[test]
+    fn waiting_is_disabled_by_the_same_switch_that_disables_refusing() {
+        let start = std::time::Instant::now();
+        wait_until_quiet_enough(0.0, std::time::Duration::from_secs(30))
+            .expect("max_load 0 must never block");
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(1),
+            "max_load 0 returned only after waiting, so it did not disable the wait"
+        );
+    }
+
+    /// A bar nothing could ever clear must give up rather than hang the
+    /// suite forever. The timeout is the whole reason a wait is safe to
+    /// put in front of every entry.
+    #[test]
+    fn an_impossible_bar_times_out_instead_of_waiting_forever() {
+        if load_average_1min().is_none() {
+            return; // platform will not say; the wait correctly no-ops
+        }
+        let err = wait_until_quiet_enough(0.000_001, std::time::Duration::from_millis(1))
+            .expect_err("a bar no host can clear must time out");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("still") && msg.contains("busy"),
+            "the timeout must say what it waited for, got: {msg}"
         );
     }
 

@@ -112,7 +112,9 @@ pub fn run_suite(args: SuiteArgs) -> anyhow::Result<()> {
     // The suite is the unit of truth for RESULTS.md, so check the host
     // once up front rather than discovering at model 9 of 13 that the
     // first eight rows were measured on a busy box. Children re-check
-    // individually -- load can rise mid-suite.
+    // individually, because load can rise mid-suite, and the loop below
+    // waits for the previous entry's own load to decay before starting
+    // the next one so the suite does not lock itself out.
     crate::host_state::ensure_quiet_enough(args.max_load)?;
     let entries = load_suite(&args.bench_dir)?;
     let exe = std::env::current_exe()?;
@@ -162,6 +164,13 @@ pub fn run_suite(args: SuiteArgs) -> anyhow::Result<()> {
 
             let receipt = out_dir.join(format!("{}_{backend}.json", entry.id));
             eprintln!("\n=== {} [{}] {backend} ===", entry.id, entry.name);
+            // The previous entry's own benchmark is still in the
+            // 1-minute average, and the child re-checks the bar. Let it
+            // decay instead of letting the suite lock itself out.
+            crate::host_state::wait_until_quiet_enough(
+                args.max_load,
+                std::time::Duration::from_secs(180),
+            )?;
             let status = std::process::Command::new(&exe)
                 .arg("bench")
                 .args(["-m", &entry.gguf])

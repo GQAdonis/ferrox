@@ -92,84 +92,28 @@ binary**. oMLX's packaging chapter — venvstacks, `PYTHONHOME` relocation,
 exist to solve a problem ferrox does not have. Nothing in this plan may
 reintroduce it.
 
-## Landed so far (2026-08-14)
+## Where this stands
 
-Phase 1a, 1b and 1c are in, plus the contract crate they all write to.
+The frontmatter above is the checklist and the only status worth
+reading. Three dated snapshots used to live here (2026-08-14,
+2026-08-21, and a strikethrough list of what was missing), which meant
+three answers to one question and two of them wrong.
 
-- **`crates/ferrox-api`** — routes, health/capability DTOs, the ready
-  line, `Usage`, request ids, the rate estimator. serde-only, so a CLI,
-  a desktop shell and a browser frontend can all link it. The server's
-  router and `Usage` come from it, so a path or payload has one
-  definition rather than one per end.
-- **`GET /health`** is the three-state handshake. Probing happens once
-  in the background under a 1s budget and the handler never blocks;
-  before the budget it offers *no* GPU verdict, after it answers
-  provisionally with `detection_timed_out`. `unavailable` is defined but
-  unreachable until model swap exists — the port only binds after a
-  model is loaded.
-- **`--port 0` + the `ferrox.server.ready` stdout line**, and opt-in
-  `--exit-on-stdin-close`. Verified end to end (kernel-assigned port,
-  requests served on it, exit 0 when the parent closes the pipe).
-- **`request_id`** and **per-phase `usage` timings** on chat
-  completions, including the Kimi/MLA engine path.
-- The **honesty clause** is stated in `docs/FEATURES.md`.
+Shipped: the `ferrox-api` contract crate, the three-state `/health`
+handshake, `--port 0` with the `ferrox.server.ready` line, `request_id`
+and per-phase `usage` timings, the `/admin` control surface with runtime
+model swap, and all four screens (Chat, Models, Activity, Connect)
+verified in a browser against a real checkpoint.
 
-Deliberately not started: cancellation, SSE hardening, the admin
-surface, model swap, the task contract, and everything in Phases 2 and
-3. Model swap is the gate on the whole model-manager screen and is the
-next real backend work.
+The UI is a standalone React app under `ui/`. `ferrox-server` serves the
+API and nothing else, and `GET /` is a 404. `npm run dev` proxies the
+API so development is one origin; a hosted build needs
+`FERROX_CORS_ORIGINS` set to its exact origin.
 
-## Phase 2 status (2026-08-21)
+Still open, and each says why in its own todo: server-side conversation
+storage (the transcript is in `localStorage` today and the screen says
+so), and the Tauri shell.
 
-All four first-cut screens are in and were **verified in a browser
-against a real checkpoint**, not by reading the diff: the chat streams,
-the Activity table fills from `/admin/stats`, the Models inventory lists,
-loads and downloads, and the Connect snippets carry the live model id.
-
-**The frontend moved twice, and both moves are worth stating.** The
-first cut was plain ES modules with no build step, embedded with
-`rust-embed`. It was rebuilt on React 19 + Vite + Tailwind v4 + Radix
-(the shadcn/ui foundation) with `@assistant-ui/react` owning the chat
-transcript and TanStack Table the request log — a real component stack,
-so the screens stop being a hand-rolled stylesheet's worth of work each.
-Then the embedding was **removed**: `ferrox-server` serves the API only,
-`/` is a 404, and the studio lives at `ui/` as a standalone app.
-
-That split is the interesting one. It deletes a committed build output
-inside a published crate and an SPA fallback that had to be stopped, by
-rule and by test, from answering an API path with HTML. It adds exactly
-one problem: **two origins, so CORS**. The dev server proxies every API
-prefix, which keeps the browser same-origin in development with no
-server configuration; a bundle served from elsewhere needs
-`FERROX_CORS_ORIGINS` set to that exact origin, and `*` stays refused.
-
-Real gaps, stated rather than implied away: no reasoning blocks, no
-math, and no server-side conversation tree — the transcript is
-`localStorage` and the screen says so. A model switcher inside Chat,
-edit/regenerate branching, sortable Activity columns and download
-progress with real cancellation are all in.
-
-## What exists today
-
-- ~~`ferrox-server` serves `/` and `/ui` from
-  `crates/ferrox-server/static/ui.html` — **72 lines**.~~ **Replaced
-  4fbfe62** by the embedded studio and its SPA fallback, then **removed
-  entirely**: the studio is a standalone app in `ui/` and this server
-  serves the API only.
-- Already present and reusable: `/v1/chat/completions` (SSE),
-  `/v1/models`, `/v1/completions`, `/v1/embeddings`, `/v1/tokenize`,
-  `/v1/detokenize`, Anthropic `/v1/messages`, `/metrics` (Prometheus —
-  which **oMLX has no equivalent of**), `/cache/stats`, `/health`,
-  server-side `session.rs`, `batch_scheduler.rs` (continuous batching,
-  opt-in), prefix cache, response cache.
-- ~~Missing and load-bearing for the first cut: **model swap**.~~
-  **Landed 1a59c15.** `model.rs::load()` still reads env at startup, but
-  `load_from_path()` beside it takes a path, and `AppState.active` is a
-  swappable `Arc` behind an `RwLock` held only long enough to clone a
-  handle. `/admin/models`, `/admin/models/load|unload`,
-  `/admin/download`, `/admin/tasks`, `/admin/tasks/{id}/cancel` and
-  `/admin/stats` exist and are documented in `docs/API.md`. Phase 2 is
-  unblocked.
 
 ## Architecture
 

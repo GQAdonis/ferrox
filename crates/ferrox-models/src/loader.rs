@@ -24,6 +24,7 @@
 
 use ferrox_core::expert_store::{ExpertKey, ExpertSource, ExpertStore};
 use ferrox_core::tensor::Tensor;
+use ferrox_core::weight_matrix::quant_kind_for;
 use ferrox_core::weight_matrix::{QuantKind, WeightBytes, WeightMatrix};
 use ferrox_gguf::{GgmlType, GgufError, GgufValue, ShardedGguf, TensorInfo, TensorSource};
 use ferrox_moe::{ExpertWeights, GatingFunction, MoeLayerConfig};
@@ -744,36 +745,6 @@ fn yarn_scaling_from_gguf(
 fn find_info<'a>(file: &'a impl TensorSource, name: &str) -> Result<&'a TensorInfo, LoadError> {
     file.find_tensor(name)
         .ok_or_else(|| LoadError::Gguf(GgufError::TensorNotFound(name.to_string())))
-}
-
-/// Maps a GGUF tensor's on-disk dtype to the `QuantKind` `WeightMatrix`
-/// uses to pick a fused dequant+dot kernel, or `None` for dtypes with
-/// no quantized kernel (F32, or a dtype not yet implemented at all).
-fn quant_kind_for(dtype: GgmlType) -> Option<QuantKind> {
-    match dtype {
-        GgmlType::Q8_0 => Some(QuantKind::Q8_0),
-        GgmlType::Q4_0 => Some(QuantKind::Q4_0),
-        GgmlType::Q4K => Some(QuantKind::Q4K),
-        GgmlType::Q5K => Some(QuantKind::Q5K),
-        GgmlType::Q6K => Some(QuantKind::Q6K),
-        GgmlType::Q2K => Some(QuantKind::Q2K),
-        GgmlType::Q3K => Some(QuantKind::Q3K),
-        GgmlType::Q4_1 => Some(QuantKind::Q4_1),
-        GgmlType::Q5_0 => Some(QuantKind::Q5_0),
-        GgmlType::Q5_1 => Some(QuantKind::Q5_1),
-        GgmlType::Q8_1 => Some(QuantKind::Q8_1),
-        GgmlType::IQ4NL => Some(QuantKind::IQ4NL),
-        GgmlType::IQ4XS => Some(QuantKind::IQ4XS),
-        GgmlType::IQ2XS => Some(QuantKind::IQ2XS),
-        GgmlType::IQ2S => Some(QuantKind::IQ2S),
-        GgmlType::IQ3S => Some(QuantKind::IQ3S),
-        GgmlType::IQ1M => Some(QuantKind::IQ1M),
-        GgmlType::IQ1S => Some(QuantKind::IQ1S),
-        GgmlType::IQ2XXS => Some(QuantKind::IQ2XXS),
-        GgmlType::IQ3XXS => Some(QuantKind::IQ3XXS),
-        GgmlType::MXFP4 => Some(QuantKind::Mxfp4Gguf),
-        _ => None,
-    }
 }
 
 /// Like `load_f32_vec`, but for tensors that only exist on some

@@ -5,7 +5,8 @@
 //! `gemma4.cpp` / `LLM_TENSOR_NAMES`.
 
 use ferrox_core::tensor::Tensor;
-use ferrox_core::weight_matrix::{QuantKind, WeightBytes, WeightMatrix};
+use ferrox_core::weight_matrix::quant_kind_for;
+use ferrox_core::weight_matrix::{WeightBytes, WeightMatrix};
 use ferrox_gguf::{GgmlType, GgufValue, TensorSource};
 
 use crate::gemma4_engine::{
@@ -161,29 +162,6 @@ fn load_f32_vec(file: &impl TensorSource, name: &str) -> Result<Vec<f32>, LoadEr
         GgmlType::BF16 => ferrox_quant::dequant_bf16(raw)
             .map_err(|_| LoadError::UnsupportedDtype(name.to_string(), GgmlType::BF16)),
         other => Err(LoadError::UnsupportedDtype(name.to_string(), other)),
-    }
-}
-
-fn quant_kind_for(dtype: GgmlType) -> Option<QuantKind> {
-    match dtype {
-        GgmlType::Q8_0 => Some(QuantKind::Q8_0),
-        GgmlType::Q4_0 => Some(QuantKind::Q4_0),
-        GgmlType::Q4K => Some(QuantKind::Q4K),
-        GgmlType::Q5K => Some(QuantKind::Q5K),
-        GgmlType::Q6K => Some(QuantKind::Q6K),
-        GgmlType::Q2K => Some(QuantKind::Q2K),
-        GgmlType::Q3K => Some(QuantKind::Q3K),
-        GgmlType::Q4_1 => Some(QuantKind::Q4_1),
-        GgmlType::Q5_0 => Some(QuantKind::Q5_0),
-        GgmlType::Q5_1 => Some(QuantKind::Q5_1),
-        GgmlType::Q8_1 => Some(QuantKind::Q8_1),
-        GgmlType::IQ4NL => Some(QuantKind::IQ4NL),
-        GgmlType::IQ4XS => Some(QuantKind::IQ4XS),
-        GgmlType::IQ2XS => Some(QuantKind::IQ2XS),
-        GgmlType::IQ2S => Some(QuantKind::IQ2S),
-        GgmlType::IQ3S => Some(QuantKind::IQ3S),
-        GgmlType::IQ1M => Some(QuantKind::IQ1M),
-        _ => None,
     }
 }
 

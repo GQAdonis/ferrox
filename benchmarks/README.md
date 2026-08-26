@@ -105,14 +105,19 @@ between entries for the 1-minute average to fall back below the bar,
 polling every 5 seconds for up to 3 minutes. It prints nothing while it
 waits, so a quiet pause between two entry headers is this and not a
 hang. Without the wait the suite locked itself out with its own
-benchmark: a 21-entry run wrote 2 receipts. Past 3 minutes it stops and
-says something other than the suite is busy.
+benchmark: a 21-entry run wrote 2 receipts. Past 3 minutes it skips that
+entry and moves on, the same way a missing GGUF is skipped, and the
+entry's previous receipt stands.
 
 A separate set of checks has no override at all, because failing one
 means the two repetitions were not the same experiment: exactly one
 discarded warmup, caches cold before the prompt, identical workload
 digest across repetitions, identical greedy output across repetitions,
-and no `inf`, `NaN` or non-positive rate.
+and no `inf`, `NaN` or non-positive rate. One of them counts KV
+positions after a decode run to catch skipped steps, and it runs only
+where the host cache is the record. Under GPU offload the device holds
+the KV and the host struct stays empty, so the receipt records that the
+check did not run rather than that it passed.
 
 ### Adding a model
 

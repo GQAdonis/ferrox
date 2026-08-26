@@ -53,13 +53,66 @@ once, so benchmarking several backends inside one process would measure
 the first one's configuration for all of them and say nothing about
 it.
 
-`--fit-host` skips entries whose `estimated_ram_gb` exceeds ~75% of
-physical RAM, and skips `cuda` on darwin. `--skip-missing` skips GGUFs
-absent from `models/`.
+`--fit-host` skips an entry two ways: when its `estimated_ram_gb`
+exceeds ~75% of physical RAM (macOS only, since that is where the total
+is read), and when the host does not have `estimated_ram_gb + 2 GiB`
+free right now. `--skip-missing` skips GGUFs absent from `models/`.
 
 Each run drops its numbers in [`receipts/engine/`](receipts/engine/)
-as `{id}_{backend}.json`. `--render` rewrites the engine table in
-`RESULTS.md` between HTML markers and leaves the Open notes alone.
+as `{id}_{backend}.json`. A run that fails leaves the previous receipt
+in place instead of overwriting it. `--render` rewrites the engine table
+in `RESULTS.md` between HTML markers and leaves the Open notes alone.
+
+## When a run stops instead of printing a number
+
+Four checks run before the timer starts. Each one exists because the
+number you would otherwise get looks real and measures the wrong thing.
+All four are turned off together by `--max-load 0`, which is the switch
+for "measure anyway, and do not publish this".
+
+**The host is busy.** The 1-minute load average has to be *below*
+`--max-load` (default `2.0`, raw, not divided by core count). Known-good
+rows read 25-45% low under load. Message:
+
+```
+host 1-minute load average is 3.10, above the 2.00 bar: a timed run
+here is noise, not a measurement …
+```
+
+**The host is thermally limited.** On macOS, `NSProcessInfo`'s thermal
+state at `serious` or `critical`, or an Intel Mac reporting a
+`CPU_Speed_Limit` under 100%, stops the run: the OS is cutting sustained
+performance, so the timing describes the cooling system. `fair` is
+recorded and does not stop anything, or a laptop would never run one.
+Nothing is read on Linux or Windows, because a temperature in
+`/sys/class/thermal` is not a pressure level and inventing a mapping
+would manufacture exactly the false precision this check exists to
+avoid. A host that starts cool and heats up mid-run finishes and prints
+a warning that the later repetitions did not run under the same
+conditions as the first.
+
+**The model would not fit in free memory.** The GGUF's size on disk is
+the floor on its footprint, so a single-model run needs that plus 2 GiB
+free (`vm_stat` free + inactive pages on macOS, `MemAvailable` on
+Linux). Without this, a model that pages to disk still finishes and
+still reports a real-looking number for work the disk did. In `--suite`
+the same arithmetic skips the entry rather than stopping the whole run,
+which keeps a previous receipt that is stale and says so instead of
+replacing it with a paged one that does not.
+
+**The previous entry is still in the load average.** `--suite` waits
+between entries for the 1-minute average to fall back below the bar,
+polling every 5 seconds for up to 3 minutes. It prints nothing while it
+waits, so a quiet pause between two entry headers is this and not a
+hang. Without the wait the suite locked itself out with its own
+benchmark: a 21-entry run wrote 2 receipts. Past 3 minutes it stops and
+says something other than the suite is busy.
+
+A separate set of checks has no override at all, because failing one
+means the two repetitions were not the same experiment: exactly one
+discarded warmup, caches cold before the prompt, identical workload
+digest across repetitions, identical greedy output across repetitions,
+and no `inf`, `NaN` or non-positive rate.
 
 ### Adding a model
 

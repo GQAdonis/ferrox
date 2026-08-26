@@ -16,9 +16,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use ferrox_core::attention::{
     apply_rope, apply_rope_interleaved, apply_rope_interleaved_with_freq_factors,
-    apply_rope_with_freq_factors, causal_gqa_attention_paged,
-    causal_gqa_attention_prefill_shared_kv_windowed, causal_gqa_attention_softcap,
-    causal_gqa_attention_windowed_softcap,
+    apply_rope_with_freq_factors, causal_gqa_attention_prefill_shared_kv_windowed,
+    causal_gqa_attention_softcap, causal_gqa_attention_windowed_softcap,
 };
 use ferrox_core::cache::{KvCache, PagedKvCache, PagedKvStore, PagedStoreExhausted};
 use ferrox_core::matmul::{geglu, rms_norm, rms_norm_per_head, softcap_inplace};
@@ -2508,13 +2507,21 @@ impl Decoder {
     /// Same computation as `forward_token`, but each layer's K/V cache
     /// is a `PagedKvCache` (block-table-indexed into a per-layer
     /// `PagedKvStore`) instead of a `KvCache`'s contiguous buffer --
-    /// exercises `causal_gqa_attention_paged` in a real decode loop
+    /// exercises the paged attention kernel in a real decode loop
     /// instead of only in isolation. `kv_caches`/`stores` are parallel
     /// per-layer arrays, mirroring `forward_token`'s `kv_caches: &mut
     /// [KvCache]`. Must produce bit-identical output to `forward_token`
     /// given stores sized so no layer ever exhausts its blocks --
     /// pinned by
-    /// `forward_token_paged_matches_forward_token_bit_identical`.
+    /// `forward_token_paged_matches_forward_token_bit_identical` and,
+    /// per attention arm, by
+    /// `every_paged_attention_arm_is_bit_identical_to_its_contiguous_twin`.
+    ///
+    /// This used to refuse gpt-oss outright, because the paged kernel
+    /// had no attention-sink term and no sliding-window arm and would
+    /// have answered differently from the contiguous path without
+    /// saying so. It now mirrors all three arms of that dispatch, so
+    /// the refusal is gone rather than merely relaxed.
     pub fn forward_token_paged(
         &self,
         token_id: usize,
@@ -2524,16 +2531,6 @@ impl Decoder {
     ) -> Result<Vec<f32>, PagedStoreExhausted> {
         assert_eq!(kv_caches.len(), self.layers.len());
         assert_eq!(stores.len(), self.layers.len());
-        // The paged kernel has no attention-sink term and no
-        // sliding-window arm, so running gpt-oss here would produce a
-        // different distribution than the contiguous path for the same
-        // input -- silently, and only for callers who happened to
-        // configure a KV pool. Refuse instead. See `Decoder::gpt_oss`.
-        assert!(
-            self.gpt_oss.is_none(),
-            "gpt-oss requires attention sinks; the paged-KV decode path does not implement them. \
-             Run this model without a KV pool (FERROX_KV_POOL_BLOCKS unset)."
-        );
         let hidden_dim = self.config.hidden_dim;
         let head_dim = self.config.head_dim;
         let n_heads = self.config.n_heads;
@@ -2615,7 +2612,16 @@ impl Decoder {
 
             cache.push(store, &k, &v)?;
 
-            let attn_out = causal_gqa_attention_paged(
+            // Mirrors the contiguous dispatch above arm for arm. It has
+            // to: the premise of paged KV is that it changes where rows
+            // live and nothing else, so any arm the paged path did not
+            // reproduce would be a model that answers differently
+            // depending on whether a KV pool happened to be configured.
+            // `causal_gqa_attention_paged_sinks` covers all three, and
+            // is bit-identical to its contiguous twin by construction.
+            let oai = self.gpt_oss.as_ref().map(|g| &g.layers[l]);
+            let window = self.config.layer_sliding_window(l);
+            let attn_out = ferrox_core::causal_gqa_attention_paged_sinks(
                 &q,
                 store,
                 cache.block_table(),
@@ -2623,6 +2629,15 @@ impl Decoder {
                 n_kv_heads,
                 head_dim,
                 cache.seq_len(),
+                window,
+                oai.map(|o| o.attn_sinks.as_slice()),
+                // The contiguous sink arm passes no softcap, so neither
+                // does this one; the other two carry the config's.
+                if oai.is_some() {
+                    None
+                } else {
+                    self.config.attn_logit_softcap
+                },
             );
             let projected = layer.attn.o_proj.apply(&attn_out);
 
@@ -4811,14 +4826,69 @@ mod tests {
     /// math change.
     #[test]
     fn forward_token_paged_matches_forward_token_bit_identical() {
+        paged_matches_contiguous(tiny_test_config());
+    }
+
+    /// Every arm of the attention dispatch, not just the plain one.
+    ///
+    /// The paged path used to implement only full causal attention, and
+    /// `forward_token_paged` asserted rather than run gpt-oss, because a
+    /// missing sink term would have changed the distribution silently.
+    /// Now that it mirrors all three arms, each one has to be held to
+    /// the same bar the plain arm always was: BIT-identical, not close.
+    ///
+    /// A sliding window and a softcap are both driven from the config
+    /// here, so a future edit that wires one arm and forgets another
+    /// fails on the arm it forgot rather than on a model nobody tests.
+    #[test]
+    fn every_paged_attention_arm_is_bit_identical_to_its_contiguous_twin() {
+        let windowed = || {
+            let mut cfg = tiny_test_config();
+            // Smaller than the decode length below, so the window really
+            // drops positions rather than degenerating to full causal.
+            cfg.sliding_window = Some(2);
+            cfg.swa_pattern = None;
+            cfg
+        };
+        let softcapped = || {
+            let mut cfg = tiny_test_config();
+            // Small enough that `sc * tanh(s / sc)` actually compresses.
+            // A realistic 30.0 is numerically indistinguishable from no
+            // cap at these tiny weights, so a test using it would pass
+            // whether or not the arm was wired -- checked by breaking
+            // the arm on purpose and watching it still pass.
+            cfg.attn_logit_softcap = Some(0.05);
+            cfg
+        };
+        let both = || {
+            let mut cfg = windowed();
+            cfg.attn_logit_softcap = Some(0.05);
+            cfg
+        };
+        // Alternating window/full layers: the per-layer arm choice has
+        // to be honoured per layer, not decided once for the model.
+        let alternating = || {
+            let mut cfg = tiny_test_config();
+            cfg.sliding_window = Some(2);
+            cfg.swa_pattern = Some(2);
+            cfg
+        };
+
+        for cfg in [windowed(), softcapped(), both(), alternating()] {
+            paged_matches_contiguous(cfg);
+        }
+    }
+
+    fn paged_matches_contiguous(config: ModelConfig) {
         let n_layers = 2;
-        let decoder = Decoder::new_random_small(tiny_test_config(), n_layers, 10);
+        let decoder = Decoder::new_random_small(config, n_layers, 10);
 
         let mut caches: Vec<KvCache> = (0..n_layers)
             .map(|_| KvCache::new(decoder.config.n_kv_heads, decoder.config.head_dim))
             .collect();
+        let steps = [3usize, 5, 7, 2, 9, 1];
         let mut plain_logits = Vec::new();
-        for (pos, &tok) in [3usize, 5, 7].iter().enumerate() {
+        for (pos, &tok) in steps.iter().enumerate() {
             plain_logits.push(decoder.forward_token(tok, pos, &mut caches));
         }
 
@@ -4836,7 +4906,7 @@ mod tests {
             })
             .collect();
         let mut paged_logits = Vec::new();
-        for (pos, &tok) in [3usize, 5, 7].iter().enumerate() {
+        for (pos, &tok) in steps.iter().enumerate() {
             paged_logits.push(
                 decoder
                     .forward_token_paged(tok, pos, &mut paged_caches, &mut stores)

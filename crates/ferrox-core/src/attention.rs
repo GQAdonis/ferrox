@@ -1820,6 +1820,99 @@ pub fn causal_gqa_attention_paged(
     out
 }
 
+/// [`causal_gqa_attention_paged`] with per-head attention sinks and an
+/// optional sliding window: the paged twin of
+/// [`causal_gqa_attention_sinks`].
+///
+/// # Why this had to exist before the paged path could serve anything
+///
+/// `causal_gqa_attention_paged` had neither term, and
+/// `Decoder::forward_token_paged` therefore refused gpt-oss with an
+/// assert rather than answer it differently from the contiguous path.
+/// That assert was the right call and a dead end: a sliding-window or
+/// sink-carrying model could never move onto paged KV, and paged KV is
+/// what a radix prefix cache hands back page indices for. So this is a
+/// correctness item before it is a caching one.
+///
+/// # Bit-identity is by construction, not by tolerance
+///
+/// Both this and the contiguous kernel funnel the same `(k, v)` rows,
+/// in the same order, through the same [`online_attn_accumulate`] with
+/// the same scale and the same sink. Nothing is re-associated and no
+/// sum is reordered, so the results are bit-identical rather than
+/// close -- which is the only useful bar here, since the whole point is
+/// that moving a model onto paged KV must not change its distribution.
+/// The tests assert exact equality.
+///
+/// `sinks` is `None` for a model that ships none, which is the ordinary
+/// case; `window` is `Some(w)` for a sliding-window layer and `None`
+/// for full causal. `attn_softcap` is carried too, so this one entry
+/// point can mirror every arm of the contiguous dispatch: a softcapped
+/// model moved onto paged KV without it would differ silently, which is
+/// the same class of bug this function exists to close.
+#[allow(clippy::too_many_arguments)]
+pub fn causal_gqa_attention_paged_sinks(
+    q: &[f32],
+    store: &PagedKvStore,
+    block_table: &[usize],
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    seq_len: usize,
+    window: Option<usize>,
+    sinks: Option<&[f32]>,
+    attn_softcap: Option<f32>,
+) -> Vec<f32> {
+    assert_eq!(q.len(), n_heads * head_dim);
+    let block_size = store.block_size();
+    assert!(
+        block_table.len() * block_size >= seq_len,
+        "block table too short for seq_len"
+    );
+    if let Some(sinks) = sinks {
+        assert_eq!(
+            sinks.len(),
+            n_heads,
+            "attention sinks are per query head (llama.cpp `attn_sinks` is {{n_head}})"
+        );
+    }
+
+    let group_size = n_heads / n_kv_heads.max(1);
+    let scale = 1.0 / (head_dim as f32).sqrt();
+    let mut out = vec![0f32; n_heads * head_dim];
+    // The query is the last cached position; a windowed layer sees only
+    // the most recent `window` positions including its own. Identical
+    // to the contiguous kernel's `start`, deliberately: a different
+    // rounding here would silently shift which token a window drops.
+    let start = match window {
+        Some(w) => {
+            assert!(w > 0, "window must be positive");
+            seq_len.saturating_sub(w)
+        }
+        None => 0,
+    };
+
+    for h in 0..n_heads {
+        let kv_h = h / group_size.max(1);
+        let q_h = &q[h * head_dim..(h + 1) * head_dim];
+        let sink = sinks.map(|s| s[h]);
+        let out_h = &mut out[h * head_dim..(h + 1) * head_dim];
+        online_attn_accumulate(q_h, scale, head_dim, out_h, attn_softcap, sink, |visit| {
+            for t in start..seq_len {
+                let block_id = block_table[t / block_size];
+                let offset = t % block_size;
+                let k_row = store.k_row(block_id, offset);
+                let v_row = store.v_row(block_id, offset);
+                let k_t = &k_row[kv_h * head_dim..(kv_h + 1) * head_dim];
+                let v_t = &v_row[kv_h * head_dim..(kv_h + 1) * head_dim];
+                visit(k_t, v_t);
+            }
+        });
+    }
+
+    out
+}
+
 /// Single-token causal attention for DeepSeek/Kimi-style Multi-head
 /// Latent Attention (MLA): every query head has its own key/value (no
 /// GQA-style grouping -- verified directly against Kimi K3's real
@@ -3074,6 +3167,147 @@ mod tests {
         assert_eq!(contiguous.len(), paged.len());
         for (a, b) in contiguous.iter().zip(paged.iter()) {
             assert_eq!(a.to_bits(), b.to_bits(), "paged path must be bit-identical");
+        }
+    }
+
+    /// A helper for the paged/contiguous comparisons below: the same
+    /// K/V pushed into a paged store, so only the ADDRESSING differs
+    /// between the two kernels under test.
+    fn paged_fixture(
+        seq_len: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        block_size: usize,
+    ) -> (Vec<f32>, Vec<f32>, crate::cache::PagedKvStore, Vec<usize>) {
+        use crate::cache::{PagedKvCache, PagedKvStore};
+        let k_flat: Vec<f32> = (0..seq_len * n_kv_heads * head_dim)
+            .map(|i| ((i * 7 + 1) % 13) as f32 * 0.1)
+            .collect();
+        let v_flat: Vec<f32> = (0..seq_len * n_kv_heads * head_dim)
+            .map(|i| ((i * 5 + 3) % 11) as f32 * 0.1)
+            .collect();
+        let mut store = PagedKvStore::new(block_size, seq_len, n_kv_heads, head_dim);
+        let mut cache = PagedKvCache::new();
+        for t in 0..seq_len {
+            let start = t * n_kv_heads * head_dim;
+            let end = start + n_kv_heads * head_dim;
+            cache
+                .push(&mut store, &k_flat[start..end], &v_flat[start..end])
+                .expect("store sized for seq_len blocks, must not exhaust");
+        }
+        let table = cache.block_table().to_vec();
+        (k_flat, v_flat, store, table)
+    }
+
+    /// The paged kernel's sink term must be BIT-identical to the
+    /// contiguous one, not merely close.
+    ///
+    /// This is what let `forward_token_paged` stop refusing gpt-oss.
+    /// The whole premise of moving a model onto paged KV is that its
+    /// distribution does not change, so "within tolerance" is not the
+    /// bar -- a distribution that differs in the last bit is still a
+    /// different distribution, and it would show up as a model that
+    /// answers differently depending on which cache it happened to be
+    /// served from.
+    #[test]
+    fn the_paged_sink_term_is_bit_identical_to_the_contiguous_one() {
+        let (n_heads, n_kv_heads, head_dim, seq_len, block_size) = (4, 2, 3, 5, 2);
+        let (k_flat, v_flat, store, table) =
+            paged_fixture(seq_len, n_kv_heads, head_dim, block_size);
+        let q: Vec<f32> = (0..n_heads * head_dim)
+            .map(|i| ((i * 3 + 2) % 9) as f32 * 0.1)
+            .collect();
+
+        // A spread of sinks, including one that dominates and one that
+        // is negligible, so the comparison covers both ends of the
+        // online-softmax rescale rather than a single middling value.
+        let sinks = vec![-30.0f32, 0.0, 1.5, 30.0];
+        let contiguous = causal_gqa_attention_sinks(
+            &q, &k_flat, &v_flat, n_heads, n_kv_heads, head_dim, seq_len, None, &sinks,
+        );
+        let paged = causal_gqa_attention_paged_sinks(
+            &q,
+            &store,
+            &table,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            seq_len,
+            None,
+            Some(&sinks),
+            None,
+        );
+        assert_eq!(contiguous.len(), paged.len());
+        for (i, (a, b)) in contiguous.iter().zip(paged.iter()).enumerate() {
+            assert_eq!(a.to_bits(), b.to_bits(), "element {i}: {a} vs {b}");
+        }
+    }
+
+    /// The window arm too, at a width that really drops positions --
+    /// and at one that covers the whole history, which must degenerate
+    /// to full causal rather than to an off-by-one.
+    #[test]
+    fn the_paged_window_arm_is_bit_identical_to_the_contiguous_one() {
+        let (n_heads, n_kv_heads, head_dim, seq_len, block_size) = (4, 2, 3, 7, 2);
+        let (k_flat, v_flat, store, table) =
+            paged_fixture(seq_len, n_kv_heads, head_dim, block_size);
+        let q: Vec<f32> = (0..n_heads * head_dim)
+            .map(|i| ((i * 3 + 2) % 9) as f32 * 0.1)
+            .collect();
+        let sinks = vec![0.5f32; n_heads];
+
+        for window in [1usize, 2, 3, 6, 7, 99] {
+            let contiguous = causal_gqa_attention_sinks(
+                &q,
+                &k_flat,
+                &v_flat,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                seq_len,
+                Some(window),
+                &sinks,
+            );
+            let paged = causal_gqa_attention_paged_sinks(
+                &q,
+                &store,
+                &table,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                seq_len,
+                Some(window),
+                Some(&sinks),
+                None,
+            );
+            for (i, (a, b)) in contiguous.iter().zip(paged.iter()).enumerate() {
+                assert_eq!(
+                    a.to_bits(),
+                    b.to_bits(),
+                    "window {window} element {i}: {a} vs {b}"
+                );
+            }
+        }
+    }
+
+    /// With no sinks and no window it must reproduce the plain paged
+    /// kernel exactly, so the new entry point is a strict superset
+    /// rather than a second implementation that drifts from it.
+    #[test]
+    fn the_paged_sink_kernel_without_sinks_or_window_is_the_plain_paged_kernel() {
+        let (n_heads, n_kv_heads, head_dim, seq_len, block_size) = (4, 2, 3, 5, 2);
+        let (_k, _v, store, table) = paged_fixture(seq_len, n_kv_heads, head_dim, block_size);
+        let q: Vec<f32> = (0..n_heads * head_dim)
+            .map(|i| ((i * 3 + 2) % 9) as f32 * 0.1)
+            .collect();
+
+        let plain =
+            causal_gqa_attention_paged(&q, &store, &table, n_heads, n_kv_heads, head_dim, seq_len);
+        let via_sinks = causal_gqa_attention_paged_sinks(
+            &q, &store, &table, n_heads, n_kv_heads, head_dim, seq_len, None, None, None,
+        );
+        for (i, (a, b)) in plain.iter().zip(via_sinks.iter()).enumerate() {
+            assert_eq!(a.to_bits(), b.to_bits(), "element {i}");
         }
     }
 

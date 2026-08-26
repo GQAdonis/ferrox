@@ -603,7 +603,11 @@ mod tests {
         let mut released = 0usize;
         let bound = 2 * (WINDOW + SWA_RETAIN_GAP) + policy.eviction_interval + 2 * PAGE;
 
-        for position in (128..60_000).step_by(128) {
+        // 100k, the length the acceptance names. The property is a
+        // CEILING checked at every step, so a longer run is strictly
+        // more evidence: a leak that only shows past 60k would pass the
+        // shorter loop and still be a leak.
+        for position in (128..100_000).step_by(128) {
             if position >= anchor_at && anchor.is_none() {
                 anchor = Some(anchor_at);
             }

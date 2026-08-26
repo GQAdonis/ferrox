@@ -30,9 +30,8 @@ FERROX_BACKEND=http://127.0.0.1:9001 npm run dev
 ```bash
 npm run typecheck   # tsc, no emit
 npm run lint        # eslint
-npm run licenses    # fails on any non-permissive dependency
+npm run licenses    # fails the build on any non-permissive dependency
 npm test            # node's own test runner, no framework installed
-npm run licenses    # refuses any non-permissive dependency
 npm run build       # -> dist/, gitignored
 npm run check       # typecheck + lint + test
 ```
@@ -42,10 +41,14 @@ types itself, so there is no test framework in the dependency tree and
 nothing for the licence check to weigh. It covers the stream recovery
 paths in `lib/api.ts`, which are the half of SSE hardening that cannot
 be proven from the server: that a reconnect resumes from the last `id:`
-without repeating a token, that a lost replay window fails closed
-instead of presenting a partial answer as a whole one, and that a
-non-resumable stream never tries to reconnect into a buffer that does
-not exist.
+without repeating a token, that a lost replay window surfaces as a
+truncation error instead of a partial answer shown as a whole one, and
+that a non-resumable stream never tries to reconnect into a buffer that
+does not exist.
+
+CI runs `npm run licenses`, `npm run typecheck`, `npm run lint` and
+`npm run build`. It does not run `npm test`, so run `npm run check`
+yourself before opening a PR that touches `lib/`.
 
 `dist/` is **not committed**. Nothing built here ships inside a Rust
 crate, so there is no artefact to keep in sync. Serve `dist/` with any

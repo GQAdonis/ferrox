@@ -222,7 +222,7 @@ cargo build --release -p ferrox-cli --features cuda
 It writes `$XDG_CACHE_HOME/ferrox/benchbw/<gpu-uuid>.json`, which the
 loader finds on its own. A profile is keyed to the card it was taken
 on: another machine's split is worse than no split, so a profile whose
-recorded GPU name disagrees is refused rather than approximated.
+recorded GPU name disagrees is ignored rather than approximated.
 
 It refuses to write in two cases, both deliberate:
 

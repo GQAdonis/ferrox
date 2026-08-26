@@ -806,8 +806,8 @@ from arriving as a number.
 floor is right *here*, where a caller completing a fragment usually
 wants a fragment back), `temperature`, `top_p` and `seed`.
 
-Everything it does not implement is refused **by name** rather than
-dropped: token-id prompts (`[int]` / `[[int]]`), `logprobs`, `echo`,
+Everything it does not implement comes back as an error **naming the
+field**, rather than being dropped: token-id prompts (`[int]` / `[[int]]`), `logprobs`, `echo`,
 `suffix`, `logit_bias`, and any `response_format` other than
 `{"type": "text"}`. Serde drops an undeclared field silently, and a
 caller cannot tell that apart from having had it honoured, which for

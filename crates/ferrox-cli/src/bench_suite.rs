@@ -109,6 +109,7 @@ fn host_ram_gb() -> f64 {
 }
 
 pub fn run_suite(args: SuiteArgs) -> anyhow::Result<()> {
+    let mut measured = 0usize;
     // The suite is the unit of truth for RESULTS.md, so check the host
     // once up front rather than discovering at model 9 of 13 that the
     // first eight rows were measured on a busy box. Children re-check
@@ -212,13 +213,35 @@ pub fn run_suite(args: SuiteArgs) -> anyhow::Result<()> {
                 .args(["--receipt", receipt.to_str().unwrap()])
                 .args(["--max-load", &args.max_load.to_string()])
                 .status()?;
-            if !status.success() {
+            if status.success() {
+                measured += 1;
+            } else {
                 eprintln!(
                     "!! {} {backend} failed ({status}); leaving previous receipt alone",
                     entry.id
                 );
             }
         }
+    }
+
+    // A run that measured nothing must not republish the table.
+    //
+    // `render` reads whatever receipts are on disk, so a suite where
+    // every entry failed or skipped would rewrite RESULTS.md from the
+    // OLD receipts and print its usual success line. That happened: a
+    // stray `ferrox` process from an earlier run held the instance
+    // lock, all 21 entries refused, and the table was regenerated from
+    // stale receipts anyway, mixing versions under one heading. The
+    // table is only republished when this run actually produced a
+    // number.
+    if measured == 0 {
+        eprintln!(
+            "ferrox bench: no entry produced a measurement, so {} was left alone. \
+             Nothing here is a result, and republishing the table would date it to \
+             this run while its numbers came from earlier ones.",
+            args.bench_dir.join("RESULTS.md").display()
+        );
+        return Ok(());
     }
     render(&args.bench_dir)
 }
@@ -244,6 +267,17 @@ pub fn render(bench_dir: &Path) -> anyhow::Result<()> {
                 }
             }
         }
+    }
+
+    // No receipts at all means there is nothing to render. Writing the
+    // table anyway would replace a real ledger with an empty one and
+    // report success, which is worse than doing nothing.
+    if receipts.is_empty() {
+        anyhow::bail!(
+            "no engine receipts under {}, so there is nothing to render. \
+             Run `ferrox bench --suite` first.",
+            dir.display()
+        );
     }
 
     let suite = load_suite(bench_dir).unwrap_or_default();
@@ -469,6 +503,30 @@ mod tests {
         let out = splice("just some prose\n", &format!("{BEGIN}\nfresh\n{END}"));
         assert!(out.starts_with("just some prose"));
         assert!(out.contains("fresh"));
+    }
+
+    /// A render with no receipts must refuse rather than publish an
+    /// empty table over a real one.
+    #[test]
+    fn rendering_nothing_refuses_instead_of_emptying_the_ledger() {
+        let dir = std::env::temp_dir().join(format!("ferrox-render-guard-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("receipts").join("engine")).unwrap();
+        let results = dir.join("RESULTS.md");
+        let original = "# Results\n\nreal numbers live here\n";
+        std::fs::write(&results, original).unwrap();
+
+        let err = render(&dir).unwrap_err().to_string();
+        assert!(
+            err.contains("nothing to render"),
+            "expected a refusal naming the empty receipt dir, got: {err}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&results).unwrap(),
+            original,
+            "the existing ledger must survive a render that had no receipts"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

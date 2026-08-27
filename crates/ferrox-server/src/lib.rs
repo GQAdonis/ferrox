@@ -4016,13 +4016,14 @@ async fn run(mcp_config_path: Option<PathBuf>, exit_on_stdin_close: bool) -> any
             let block_size: usize = block_size
                 .parse()
                 .expect("FERROX_PAGED_KV_BLOCK_SIZE must be a positive integer");
-            let cfg = match &loaded {
-                model::LoadedModel::Gguf(g) => &g.decoder.config,
+            let gguf = match &loaded {
+                model::LoadedModel::Gguf(g) => g,
                 _ => panic!(
                     "FERROX_PAGED_KV_BLOCKS requires a GGUF decoder model \
                      (set FERROX_MODEL_PATH to a generic-decoder .gguf file)"
                 ),
             };
+            let cfg = &gguf.decoder.config;
             let queue_wait_ms: u64 = std::env::var("FERROX_KV_POOL_QUEUE_TIMEOUT_MS")
                 .ok()
                 .map(|v| {
@@ -4043,6 +4044,52 @@ async fn run(mcp_config_path: Option<PathBuf>, exit_on_stdin_close: bool) -> any
             let radix = Some(Arc::new(Mutex::new(ferrox_edge::radix::RadixCache::new(
                 block_size,
             ))));
+            // The anchor: the position an agentic turn will come back
+            // to. Resolved ONCE here, from the served checkpoint's own
+            // family and its own tokenizer, because it has to be a
+            // single token id for the slide to recognize it on the hot
+            // path for nothing. A checkpoint whose opener is more than
+            // one token, or whose family has no opener at all (harmony
+            // opens a call with an ordinary channel header), simply gets
+            // no anchors and the slide follows the cursor.
+            let anchor_token = ferrox_edge::resolve_anchor_token(
+                ferrox_edge::ToolCallFormat::infer(
+                    &std::env::var("FERROX_MODEL_PATH").unwrap_or_default(),
+                )
+                .opener(),
+                |text| {
+                    gguf.tokenizer
+                        .encode(text)
+                        .into_iter()
+                        .map(|t| t as u32)
+                        .collect()
+                },
+            );
+            if let Some(id) = anchor_token {
+                tracing::info!(
+                    "Paged KV window slide: tool-call anchor is token {id}, so a turn's \
+                     window stops short of where its next turn rejoins"
+                );
+            }
+            let slide_interval: usize = std::env::var("FERROX_PAGED_KV_SLIDE_INTERVAL")
+                .ok()
+                .map(|v| {
+                    v.parse()
+                        .expect("FERROX_PAGED_KV_SLIDE_INTERVAL must be a positive integer")
+                })
+                .unwrap_or(ferrox_edge::pool::DEFAULT_SWA_EVICTION_INTERVAL);
+            if let Some(window) = cfg.uniform_sliding_window() {
+                tracing::info!(
+                    "Paged KV window slide enabled: every layer slides by {window} every \
+                     {slide_interval} decode steps, so a request holds its prompt and a \
+                     window rather than its whole context"
+                );
+            } else if cfg.kv_block_window().is_some() {
+                tracing::info!(
+                    "Paged KV window slide NOT enabled: this model has full-attention layers, \
+                     and a page group holds one block in every layer"
+                );
+            }
             Some(generate::PagedKvConfig {
                 store: Arc::new(ferrox_core::cache::SharedPagedKv::new(
                     cfg.n_layers,
@@ -4053,6 +4100,8 @@ async fn run(mcp_config_path: Option<PathBuf>, exit_on_stdin_close: bool) -> any
                 )),
                 queue_wait: Duration::from_millis(queue_wait_ms),
                 radix,
+                anchor_token,
+                slide_interval,
             })
         }
         (Err(_), Err(_)) => None,

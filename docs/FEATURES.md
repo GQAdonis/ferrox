@@ -122,11 +122,21 @@ OpenAI-compatible HTTP API:
 - Paged KV: shared page storage many requests read through a block
   table, with a radix tree over reference-counted page groups so
   conversations off one system prompt share its KV rather than each
-  holding a copy. **CPU only**, since the paged attention path returns
-  wrong tokens on a GPU backend. Off unless
-  `FERROX_PAGED_KV_BLOCKS` is set, and the server stops at startup when
-  it is set beside `-dev metal` or `-dev cuda`. See
+  holding a copy. Off unless `FERROX_PAGED_KV_BLOCKS` is set. It used to
+  be refused on a GPU backend, where it returned fluent wrong tokens; the
+  cause was a Metal prefill leaving K/V on the device and filling the
+  host cache with placeholders that the paged prefill then copied into
+  the page store, and that refusal is lifted. See
   [`CONFIG.md`](CONFIG.md)
+- On a model whose layers *all* slide by the same window, that
+  window slides during decode, so a request holds its prompt and a
+  window rather than its whole context — and admission prices it
+  that way, so a store too small for the whole context still serves
+  it. A tool call anchors the slide at the position the next agentic
+  turn will rejoin at, and the anchor is dropped once the cursor
+  drifts a window past it. An alternating-SWA model (gpt-oss,
+  Gemma-3) does not slide: a page group holds one block in every
+  layer, and the full-attention layers still read position 0
 - `ferrox serve-bench`: concurrency, TTFT, TPOT and queueing numbers
   for a live server, with the methodology (positional split, pooled
   nearest-rank percentiles, whole-run throughput) tested socket-free
@@ -162,6 +172,7 @@ returns a decision.
 | `parser` | where reasoning ends and the answer begins, and which tool was called in which format | `/v1/chat/completions`, `/v1/messages`, `/v1/responses`, streaming and buffered |
 | `detokenize` | what text is safe to stream after one more token | the stop-string withhold rule, which `ferrox-server`'s `StopMatcher` delegates to so there is one implementation |
 | `radix` | which prefix of a new prompt is already computed, page-keyed and node-sharing | the paged-KV serving path, where it shares KV pages between prompts by reference count |
+| `anchor` | how far a window may slide, and where a tool call pins it so the next agentic turn rejoins rather than recomputes | the paged-KV serving path, on both the private generate loop and the continuous batcher |
 | `scheduler` | admission, chunked-prefill sizing, and what a chunk reserves | the continuous batcher's status and pool accounting |
 | `effort` | which reasoning-effort dialect a checkpoint speaks | probed once per checkpoint at load, then applied to every request's `chat_template_kwargs`, and advertised on `/v1/models` |
 | `stats` | what a server may honestly claim about its own throughput and latency | `/v1/stats`, `/v1/requests`, `/admin/stats` |
@@ -174,7 +185,7 @@ returns a decision.
 ### Complete, tested, and waiting for a consumer
 
 `qstar` (the `q*` bandwidth split), `expert_cache`, `placement`,
-`residency`, `cache_manager`, `cache_report`, `anchor`, `window_pool`,
+`residency`, `cache_manager`, `cache_report`, `window_pool`,
 `state_pool` and `supervisor`. Each is covered by unit tests and none of
 them is on a serving path. Do not read a benchmark as evidence for any
 of them. [`ROADMAP.md`](ROADMAP.md) says what each is waiting on.

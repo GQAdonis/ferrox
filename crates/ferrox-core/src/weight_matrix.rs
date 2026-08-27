@@ -3768,12 +3768,7 @@ mod tests {
             let x = &x_batch[b * cols..(b + 1) * cols];
             let sequential = matrix.apply(x);
             let from_batch = &batched[b * rows..(b + 1) * rows];
-            for (s, fb) in sequential.iter().zip(from_batch.iter()) {
-                assert!(
-                    (s - fb).abs() < 1e-4,
-                    "batch row {b}: sequential={s} batched={fb}"
-                );
-            }
+            assert_batch_row_matches(QuantKind::Q8_0, b, &sequential, from_batch);
         }
     }
 
@@ -3787,6 +3782,44 @@ mod tests {
 
     /// Deterministic pseudo-random quantized matrix: every byte pattern is
     /// a valid weight block, only the f16 scale fields need sane values.
+    /// Compare one row of `apply_batch` against `apply`, scaled by the
+    /// magnitude of the row rather than of each element.
+    ///
+    /// The element-wise denominator (`err / s.abs().max(1.0)`) is wrong
+    /// for a dot product over random data: the sums cancel, so a result
+    /// that lands near zero turns a normal rounding difference into a
+    /// relative error of 30%. Measured on Metal, the divergence is a
+    /// uniform 5.5e-4 of the row's own scale across every quant kind
+    /// and batch index, and up to 2.9e-1 of the individual result. The
+    /// first number describes the arithmetic; the second describes
+    /// which results happened to cancel.
+    ///
+    /// This matters because `apply_batch` is not `apply` on a GPU
+    /// build: `apply_batch` dispatches to Metal while `apply` stays on
+    /// the CPU, so this compares two backends. The bound stays tight on
+    /// CPU, where both sides are the same code and must agree closely.
+    fn assert_batch_row_matches(kind: QuantKind, b: usize, sequential: &[f32], from_batch: &[f32]) {
+        let scale = sequential
+            .iter()
+            .fold(0.0f32, |a, v| a.max(v.abs()))
+            .max(1.0);
+        // A GPU build compares Metal against the CPU; a CPU build
+        // compares the CPU against itself.
+        let bound = if cfg!(any(feature = "metal", feature = "cuda")) {
+            5e-3
+        } else {
+            1e-4
+        };
+        for (r, (s, got)) in sequential.iter().zip(from_batch.iter()).enumerate() {
+            let err = (s - got).abs() / scale;
+            assert!(
+                err < bound,
+                "{kind:?} batch {b} row {r}: apply()={s} apply_batch={got} \
+                 (err {err:e} of row scale {scale}, bound {bound:e})"
+            );
+        }
+    }
+
     fn synth_quant_matrix(kind: QuantKind, rows: usize, cols: usize) -> WeightMatrix {
         let mut state = 0x1234_5678u32;
         let mut next = move || {
@@ -3863,13 +3896,7 @@ mod tests {
                 let x = &x_batch[b * cols..(b + 1) * cols];
                 let sequential = matrix.apply(x);
                 let from_batch = &batched[b * rows..(b + 1) * rows];
-                for (r, (s, got)) in sequential.iter().zip(from_batch.iter()).enumerate() {
-                    let err = (s - got).abs();
-                    assert!(
-                        err / s.abs().max(1.0) < 1e-4,
-                        "{kind:?} batch {b} row {r}: apply()={s} apply_batch={got}"
-                    );
-                }
+                assert_batch_row_matches(kind, b, &sequential, from_batch);
             }
         }
     }
@@ -3901,13 +3928,7 @@ mod tests {
                 let x = &x_batch[b * cols..(b + 1) * cols];
                 let sequential = matrix.apply(x);
                 let from_batch = &batched[b * rows..(b + 1) * rows];
-                for (r, (s, got)) in sequential.iter().zip(from_batch.iter()).enumerate() {
-                    let err = (s - got).abs();
-                    assert!(
-                        err / s.abs().max(1.0) < 1e-4,
-                        "{kind:?} batch {b} row {r}: apply()={s} apply_batch={got}"
-                    );
-                }
+                assert_batch_row_matches(kind, b, &sequential, from_batch);
             }
         }
     }

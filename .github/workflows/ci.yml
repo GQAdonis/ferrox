@@ -67,6 +67,34 @@ jobs:
       - run: cargo build -p ferrox-metal -p ferrox-cli -p ferrox-server --features metal --verbose
       - run: cargo clippy -p ferrox-metal -p ferrox-cli -p ferrox-server --features metal -- -D warnings
 
+  # What the release tarball actually ships.
+  #
+  # `release.yml` builds the CLI with `serve` (plus `metal` on macOS),
+  # and no CI job built that combination: the cuda and metal jobs both
+  # leave `serve` off. So a break confined to the `serve` feature would
+  # have reached users through the install script with CI green, which
+  # is the one path where a compile error is guaranteed to be somebody
+  # else's first experience of the project.
+  serve-feature-chain:
+    name: clippy/build --features serve (what the tarball ships)
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            features: serve metal
+          - os: ubuntu-latest
+            features: serve
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build -p ferrox-cli --features "${{ matrix.features }}" --verbose
+      - run: cargo clippy -p ferrox-cli --all-targets --features "${{ matrix.features }}" -- -D warnings
+
   # Ferrox Studio (ui/) is a standalone app: nothing it builds is
   # committed and nothing ships inside a Rust crate, so there is no
   # stale-artefact check to run. What CI does owe this directory is the

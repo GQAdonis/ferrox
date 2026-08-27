@@ -1,99 +1,46 @@
 # Plans
 
-The goal is in [`north-star.md`](north-star.md): **be the Rust
-alternative to llama.cpp.** Same models, same command shapes, same or
-better performance, on the hardware people actually own.
+Two files hold the plan:
 
-Every plan below is ranked against that. Read the north star first; it
-is the argument, this file is the index.
+- **[`north-star.md`](north-star.md)** is the goal and the ranking rule.
+  Be the Rust alternative to llama.cpp: same models, same command
+  shapes, same or better performance, on the hardware people actually
+  own.
+- **[`roadmap.md`](roadmap.md)** is every open item, merged by theme.
 
-## Priority order
+Two items are large enough to carry their own design document:
 
-### 1. Decoder scalability, the gate on everything else
+- **[`model-layer-reorg.md`](model-layer-reorg.md)**, splitting the
+  6438-line decoder so architectures scale.
+- **[`out-of-core-moe.md`](out-of-core-moe.md)**, running a 155 GB model
+  on a 32 GB machine.
 
-[`model-layer-reorg.md`](model-layer-reorg.md)
+Everything else is history: [`archive/`](archive/) holds the five plans
+whose items were merged into the roadmap, [`on-hold/`](on-hold/) holds
+work ranked below the goal with the condition that brings it back, and
+[`done/`](done/) holds plans whose todos are all completed.
 
-`crates/ferrox-models/src/decoder.rs` is **6438 lines**. Adding a model
-means editing it. llama.cpp adds a model as one small file, which is
-why it has **140** architectures and ferrox has **47 paths of which
-about 12 are proven**.
+## Where the project stands
 
-That is not a tidiness complaint. It already costs correctness: the
-paged decode loop had **lost five model features** by being a copy of
-the contiguous one, three of them wrong on CPU too. Copy-per-path loses
-features one at a time and nothing notices.
-
-Nothing else in this list scales until this is fixed, which is why it
-is first.
-
-### 2. Correctness of what already loads
-
-[`llama-cpp-parity-push.md`](llama-cpp-parity-push.md)
-
-A coverage audit on 2026-08-27 classified all 150 catalog rows by what
-happens when a real checkpoint loads:
+Audited 2026-08-27, by what happens when a real checkpoint loads rather
+than by whether the architecture name is known:
 
 | Outcome | Count |
 |---|---|
-| Runs, with evidence | **~12** |
+| Runs, **with evidence** | **~12** |
 | Refuses, naming what is missing | ~90 |
 | **Loads and is WRONG** | 5 arch strings + 3 cross-cutting axes |
 | Unknown, unproven | ~40 |
 
-The wrong ones are live and on popular checkpoints. They outrank every
-performance item.
+| | llama.cpp | ferrox |
+|---|---|---|
+| Per-architecture graphs | 140 hand-written | 47 paths, **~12 proven** |
+| Metal `pp512` | baseline | 0.98x-1.10x, at parity |
+| Metal `tg128` | baseline | **8 of 12 rows faster** |
+| CPU, all rows | baseline | **1.41x-5.06x slower** |
+| GPU backends | CUDA, Metal, Vulkan, SYCL, HIP | CUDA, Metal |
 
-### 3. Running models that do not fit
-
-[`freetoken-parity.md`](freetoken-parity.md),
-[`serving-and-tiered-kv.md`](serving-and-tiered-kv.md)
-
-The strongest reason to choose ferrox over llama.cpp rather than tie
-with it. `ferrox-edge` already holds the policy (`expert_cache`,
-`expert_slots`, `placement`, `residency`, `footprint`) and **nothing
-executes it** outside a compile-only CUDA pool.
-
-### 4. Hardware reach
-
-[`amd-strix-halo.md`](amd-strix-halo.md)
-
-Ferrox has CPU, Metal and CUDA. That is Apple and NVIDIA and nothing
-else. Every AMD and Intel GPU has no path, while llama.cpp reaches all
-of them through Vulkan.
-
-### 5. Performance where it is behind
-
-[`llama-cpp-parity-push.md`](llama-cpp-parity-push.md) (CPU half)
-
-Metal is done: every dense `pp512` row is 0.98x-1.10x and **8 of 12
-`tg128` rows are faster than llama.cpp**. CPU is not: all 16 comparable
-rows are red, 1.41x to 5.06x.
-
-Ranked below correctness because it makes no new model runnable, and
-because the measured evidence says the remaining lever is thread
-scaling rather than kernels.
-
-### 6. Below the line
-
-[`dflash-speculative-decoding.md`](dflash-speculative-decoding.md) makes
-an already-running model faster, never makes a new one runnable, and
-all nine items sit behind a GO/NO-GO that needs a drafter checkpoint
-which may not exist in loadable form.
-
-[`ferrox-ui.md`](ferrox-ui.md) has one item left, the Tauri shell. The
-web UI works and is standalone.
-
-## Housekeeping
-
-[`completion-push.md`](completion-push.md) is a scheduling document, not
-a feature plan: it says which items may run in parallel and which
-collide on the same file. Its merge discipline still applies and is
-worth reading before dispatching work.
-
-[`one-binary-serve.md`](one-binary-serve.md) is effectively done, one
-item left.
-
-[`done/`](done/) holds plans whose todos are all completed.
+Do not read the architecture catalog as a support matrix.
 
 ## The rules that keep being re-learned
 

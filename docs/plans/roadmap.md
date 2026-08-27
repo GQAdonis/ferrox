@@ -1,0 +1,106 @@
+---
+name: "the roadmap: every open item, merged and ranked"
+overview: "ONE FILE FOR ALL OPEN WORK. Five plans held 43 pending items between them, with the same work described from different angles in different files: MoE residency appeared in freetoken-parity as policy and in amd-strix-halo as a UMA question, CPU attention appeared in llama-cpp-parity-push twice, and measurement discipline appeared in three. They are merged here by WHAT THE WORK IS rather than by which document happened to raise it. The goal that ranks them is in `north-star.md`: be the Rust alternative to llama.cpp, same models, same command shapes, same or better performance, on the hardware people actually own. TWO ITEMS ARE BIG ENOUGH TO HAVE THEIR OWN DESIGN DOCUMENT and are referenced rather than expanded here: `model-layer-reorg.md` (splitting the 6438-line decoder so architectures scale) and `out-of-core-moe.md` (running a 155 GB model on a 32 GB machine). THE HONEST POSITION, audited 2026-08-27: of 150 architecture catalog rows, about 12 run with evidence, roughly 90 refuse while naming what is missing, roughly 40 are unproven, and a handful LOAD AND ARE WRONG. Metal is at or past parity (8 of 12 decode rows faster than llama.cpp). CPU is behind on all 16 comparable rows. Superseded plan files are archived, not deleted, because their reasoning is worth keeping."
+todos:
+  - id: a-model-layer-scalability
+    content: "THEME A, THE GATE ON EVERYTHING ELSE. `crates/ferrox-models/src/decoder.rs` is 6438 lines and holds the generic path plus per-architecture branching, so adding a model means editing it. llama.cpp has 140 architectures because adding one is a small new file; this project has 47 paths of which ~12 are proven. The counts differ for a structural reason. It already cost correctness: the paged decode loop had LOST five model features (`attention_scale`, `post_attn_norm`, `post_ffn_norm`, gpt-oss `o_bias`, `gpt_oss_ffn`) by being a copy of the contiguous one, three wrong on CPU too. DESIGN IS IN `model-layer-reorg.md`. Reference shapes studied: llama.cpp's `src/models/*.cpp` (one file per arch building a ggml graph) and `.scratch/FreeToken/python/freetoken/models/` (a PACKAGE per arch with its own config parser, weight iterator, attention and ops, plus a `register.py` keyed by architecture string). FreeToken is the closer fit, and this project already ported its host-side policy into ferrox-edge. MEASURED CAVEAT from FreeToken's own `support-muse-glimmer` branch: adding an architecture there touched 27 files and `support-minimax-m3` touched 49, because a new model brings a tool-call parser, a reasoning parser, effort vocabulary and server metadata, not just a graph. Isolating the decoder is necessary and NOT sufficient. Ferrox is already better placed on that axis, since ferrox-edge owns 11 tool-call formats and probes effort from the template."
+    status: pending
+  - id: b1-silently-wrong-today
+    content: "THEME B, HIGHEST VALUE IN THE WHOLE ROADMAP, because these produce fluent wrong answers rather than errors. All found by the 2026-08-27 audit. (1) `smollm3` ROTATES NINE LAYERS llama.cpp does not: `src/models/smollm3.cpp:5` sets `n_no_rope_layer_step = 4` with NO GGUF key, so the file loads clean and runs at full speed while rotating every layer. Same class as the gpt2/mpt/refact/bloom/jais bug already fixed, on a more popular checkpoint. Fix is a per-layer rope skip plus a registry entry, or one line to refuse. (2) ONE HARDCODED BPE PRE-TOKENIZER REGEX serves EVERY BPE checkpoint (`tokenizer.rs:308-311`); zero of llama.cpp's ~30 variants exist. Any number of 4+ digits and any run of 2+ whitespace tokenizes differently, so indented code and blank lines diverge from llama.cpp on Llama-3.x, Qwen, DeepSeek and SmolLM. Invisible because BPE tests are round-trip only and `ferrox parity` hands llama.cpp explicit ids, excluding the tokenizer from the only cross-engine oracle. CHEAPEST FIRST MOVE is goldens from llama.cpp's CI corpus, not the regexes. (3) An unhandled `tokenizer.ggml.model` FALLS BACK TO BYTES (`ferrox-server/src/model.rs:146-151` plus four CLI clones) so bert/rwkv/none vocabs generate garbage instead of refusing. (4) `rope.scaling.type = linear` is silently ignored (`loader.rs:733-736`) with a TEST asserting it. (5) `default_swa_pattern` covers 6 archs where llama.cpp hardcodes 18, so `mellum` and `exaone-moe` window every layer, `smallthinker` diverges four ways at once, and `gemma3n` is transcribed as 6 where llama.cpp says 5."
+    status: pending
+  - id: b2-close-the-68
+    content: "THEME B. 68 architectures share ONE generic GQA path against llama.cpp's 68 bespoke graphs, and five were found silently wrong. THE CHEAP FIX BEATS THE AUDIT: make the generic path OPT-IN. Today an unrecognised architecture FALLS ONTO generic GQA and runs; it should have to ASSERT it is plain GQA. That inversion turns 63 unaudited architectures from silently-wrong into honestly-refused, which is this project's stated rule everywhere else, and it makes the remaining work visible instead of hypothetical. It also depends on the registry from THEME A, which is why that is first. THEN audit outward from what people actually run: `qwen3moe`, `glm4moe`, `deepseek2` (MLA), `minimax`, `gemma3`/`gemma4`, `dots1`, `olmoe`. The 2023 tail IS in scope under this goal (same models as llama.cpp includes `bloom` and `gpt2`) but comes last and is handled safely meanwhile by the inversion. Absorbs `coverage-cheap-archs`."
+    status: pending
+  - id: b3-the-embedding-model-gap
+    content: "THEME B, and the LARGEST RAW CHECKPOINT-COUNT GAP in the audit, larger than any decoder family. Ferrox handles 3 of llama.cpp's 6 `tokenizer.ggml.model` values (gpt2/gemma4 to BPE, llama to SPM, t5 to Unigram). MISSING: `bert`/wpm with no WordPiece code anywhere, `rwkv` with no trie tokenizer, and `none`. Separately, 12 encoder/embedding architectures (`bert`, `nomic-bert`, `jina-bert-v2/v3`, `modern-bert`, `gemma-embedding`, `llama-embed`) all refuse, and `/v1/embeddings` only pools a DECODER GGUF's hidden states. So every BGE, E5, nomic-embed, jina-embed and GTE, which is what people actually use for embeddings, cannot be served. There is also no `/v1/rerank` route and `classifier.output_labels`/`pooling_type` are unread. Medium to large, and it unlocks more published files than anything else here."
+    status: pending
+  - id: b4-quant-and-doc-correctness
+    content: "THEME B, small and cheap. (1) UNKNOWN GGUF TYPES SIZE AS ZERO: `block_layout` returns `(0, 1)` for `Other(_)` (`ferrox-gguf/src/lib.rs:230`) so `byte_len` short-circuits to 0 and `tensor_bytes` returns an EMPTY SLICE WITH NO ERROR. A TQ2_0 file does not fail to parse, it under-counts every size estimate then fails later somewhere less informative. (2) MXFP4 is accepted as a weight matrix (`loader.rs:1172`) and an MoE expert (`:1220`) but REJECTED by `load_f32_vec` (`:1124`) despite `dequant_mxfp4_gguf` existing, so an MXFP4 norm or bias is a hard load error. One missing match arm. (3) Genuinely missing live ggml types: TQ1_0/TQ2_0 ternary, NVFP4, Q1_0, Q2_0. The `Q4_0_4_4` family is missing but REMOVED from ggml, so it is not a gap. (4) `docs/MODELS.md:157-159` is wrong in BOTH directions at once: IQ4_XS DOES have a Metal matvec and simdgroup GEMM and IQ4_NL/IQ4_XS both have NEON kernels, while 'scalar + AVX2' overstates the second IQ tier. (5) A Q5_0 Metal GEMM exists but Q5_0 is excluded from `metal_mul_mm_kind_supported`, so Q5_0 MoE experts run on Metal while Q5_0 dense weights fall to CPU."
+    status: pending
+  - id: c-out-of-core-big-models
+    content: "THEME C, the strongest reason to choose ferrox over llama.cpp rather than tie with it. Run a model larger than memory: DeepSeek-V4-Flash is 155 GB at UD-Q4_K_XL against a 32 GiB machine. DESIGN IS IN `out-of-core-moe.md`. WHAT EXISTS: `ferrox-edge` holds the policy already (`expert_cache` LRU with copy plans, `expert_slots` bounded pool behind a `SlotDevice` trait, `placement`, `residency`, `footprint`, `pool`) and NOTHING EXECUTES IT except `expert_pool::CudaExpertPool`, compile-verified only with its hardware test `#[ignore]`d. Needs a `SlotDevice` for Metal and one for host RAM, plus an SSD-backed source. REFERENCE: `.scratch/ds4` does this in C, with `ds4_ssd.c`, `ds4_layer_pack.c` for an on-disk layout that keeps the next-needed bytes contiguous, and `ds4_streaming_hotlist.inc`, a PRECOMPUTED PROFILED expert hotlist of 13334 {layer, expert} pairs sorted by hits/weight, shipped as a header per model family. THAT LAST IDEA MATTERS HERE SPECIFICALLY: ferrox tries to learn hotness at runtime via `activation_counts`, and that signal is ALL ZEROS ON METAL (`ferrox-metal/src/attn.rs:5620` returns empty id vectors; `MoeDecodeScratch.ids` is one top_k buffer reused per layer). So ferrox's eviction policy currently reads nothing on the backend this machine uses. Absorbs `persistent-gpu-expert-cache`, `concurrent-cpu-moe-executor`, `double-buffered-prefill`, `uma-residency-semantics` and `real-moe-checkpoints`."
+    status: pending
+  - id: c2-moe-execution-quality
+    content: "THEME C. Recent good models are overwhelmingly MoE and MoE is where this engine is weakest. (1) FIX THE METAL `activation_counts` DROP, which is a prerequisite for THEME C's eviction policy, not a separate curiosity: widen `MoeDecodeScratch.ids` to `top_k * n_layers` and slice it, or add a persistent per-expert histogram the router increments atomically, which preserves the no-sync intent the current comment cites. (2) `concurrent-cpu-moe-executor`: q* assumes a step costs max(fetch, cpu) and ferrox's CPU MoE does not overlap them. (3) `double-buffered-prefill`: not portable as policy alone, it needs a copy stream and two events per buffer. (4) OLMoE CPU is 2.19x prefill and 2.46x decode while its Metal rows are at parity. (5) MoE bench coverage rested on ONE model until Qwen1.5-MoE was added, which has SHARED experts, a shape OLMoE lacks and one `metal_prefill_moe` explicitly refuses."
+    status: pending
+  - id: c3-serving-and-kv
+    content: "THEME C, the serving half. (1) `sched-time-debt`: time-debt prefill/decode interleaving, where chunk DURATION is the quantum because a GPU cannot preempt a running kernel. Read that todo's own text, it carries the design. (2) `wire-radix-prefix-cache` and `window-slide-during-decode`: partial, and the policy half of the window slide is done with a caller (`anchor::decode_slide`). (3) `child-log-stream`: deliberately not built, because ferrox has no consumer for it yet. (4) `bench-bw`: the writer exists (`bench_profile::entry_from`); the reader does not. NOTE the batcher defect wave 0 found and could not confirm: continuous batching prefills with `forward_token`, which leaves the host cache SHORT rather than zeroed, and whether the batcher calls the existing catch-up before `forward_multi_seq` was never established."
+    status: pending
+  - id: d-hardware-reach
+    content: "THEME D, and the largest single hardware gap. Ferrox has CPU, Metal and CUDA: Apple and NVIDIA and NOTHING ELSE. Every AMD and Intel GPU has no path, while llama.cpp reaches all of them through Vulkan, so 'same hardware as llama.cpp' is currently false by a wide margin. RE-SCOPE REQUIRED: the four Vulkan items are filed as blocked on owning a Strix Halo box, which is the wrong framing. Vulkan is testable on ANY machine with a Vulkan driver including an Intel iGPU; Strix Halo is a tuning target, not a prerequisite. ORDER: `backend-seam-refactor` first, because there is no backend trait at all today and it is a prerequisite for any third backend; then `vulkan-beachhead` as a GO/NO-GO on the smallest honest slice (`ash` plus one SPIR-V kernel), not a full backend; then decode, then prefill GEMM, which is the item that decides whether the whole thing was worth doing. Absorbs `hip-revisit-gate`, which stays REJECTED unless all three of its conditions hold, and `gtt-carveout-doc`."
+    status: pending
+  - id: d2-x86
+    content: "THEME D. Ten items are doable on any x86 host and unblock a real class of commercial edge machine. `x86-first-measurement` is the blocker: there is NO ferrox measurement on any x86_64 host at all. `scripts/check-cross-target.sh` already gates `x86_64-apple-darwin` compilation in about 24 seconds, so `avx512-int-dot` and `strict-kernels-on-x86` can be WRITTEN and compile-checked here, held to the standard the existing AVX2 arms are held to: a verified algebraic mirror of the NEON arm, stated in the code as unrun. `avx512-int-dot` is called out as the largest lever with no new backend. `thread-default-x86` matters because `default_worker_threads()` reads `hw.perflevel0.physicalcpu` on macOS and falls through elsewhere. `docs-and-features-honesty` belongs at the top of this theme in spirit: it exists to stop the project claiming a backend nobody has measured, the same rule that keeps CUDA at 'must compile'."
+    status: pending
+  - id: e-cpu-performance
+    content: "THEME E, ranked below correctness because it makes NO new model runnable, though under the north star's bar it is a genuine parity failure and cannot be dropped. Every red row is CPU: all 16 comparable rows, prefill 1.41x to 5.06x, decode 1.68x to 3.55x. MEASURED EVIDENCE THAT REDIRECTS THE WORK: the gap scales INVERSELY with model size, 5.06x at 135M down to 1.41x at 7B, which is the signature of FIXED PER-MATMUL OVERHEAD rather than kernel throughput, and every i8mm kernel already exists and is on the hot path. So `cpu-decode-scaling` (fork-join, against llama's persistent spin-barrier pool) is the remaining lever and the kernel items are largely spent. `cpu-kill-transpose` stays open but its 7 serial scatter loops are already gone; what remains is a 32-float stack tile whose fix needs an aliasing raw pointer into ferrox-quant, judged not worth the unsafe on no profile. FIRST EVIDENCE THE RECENT WORK PAID: TinyLlama CPU decode 48.11 to 54.41 tok/s, gap 2.15x to 2.00x, and prefill 2.02x to 1.97x."
+    status: pending
+  - id: f-measurement-and-proof
+    content: "THEME F, cross-cutting, and it now blocks the CLAIM rather than merely annoying us. Every number comes from ONE 32 GiB M2 Pro that is also the development machine. Already hit: two Metal rows skipped mid-suite when macOS CoreSuggestions spiked the load, a whole suite lost to an orphaned process holding the instance lock, Mixtral permanently unmeasurable, CUDA never measured, x86 never executed. LANDED 2026-08-27: a receipt `host_spec` field recording CPU model, core split, RAM and OS but NOT hostname or user, and a render that REFUSES to merge receipts from different hosts. STILL NEEDED: (a) `suite-validate-every-change` and `quality-gates`, where a row closes only at gap <= 1.0x AND answers match llama.cpp; (b) `close-all-red-rows`, the definition of done for parity; (c) `tooling-quality-eval`, since ferrox validates NUMERICS against NumPy goldens but cannot answer whether a quantization damaged the model; (d) `ci-x86-and-vulkan`, since CI builds cuda twice and metal once and runs GPU tests never; (e) `hygiene-cross-target-gate`, half landed, with the `rust-toolchain.toml` pin still owed; (f) a BARE-METAL rental, NOT a shared-vCPU instance, because a noisy neighbour's steal time does not appear in the guest's load average and would defeat the quiet-host guard invisibly."
+    status: pending
+  - id: g-verification-without-downloading-everything
+    content: "THEME G, cross-cutting, and the answer to 'do we have to test every model'. No. 140 real checkpoints is tens of terabytes and would still only prove the ones downloaded. THREE MECHANISMS ALREADY EXIST IN THIS REPO, each applied to far less than it could be. (1) DIFFERENTIAL, the decisive one: `ferrox parity` plus `tools/llama_logits.c` compares first-token logit distributions against llama.cpp on the same file and needs no knowledge of the architecture. It is NOT run across the suite, and it currently EXCLUDES the tokenizer by handing llama.cpp explicit ids, which is precisely why the BPE defect in `b1` went unseen. (2) SYNTHETIC FIXTURES: `scripts/make_dots1_fixture.py` and `make_gptoss_fixture.py`, two architectures out of 139. A fixture is kilobytes, needs no download, and catches wrong tensor wiring and wrong refusals. One per supported architecture is the best coverage-per-byte available and should be a REQUIREMENT of the registry in THEME A. (3) PINNED PROPERTY TABLES transcribed from llama.cpp's own loader: `LLAMA_NO_ROPE` does this for one property and is exactly what caught the gpt2/bloom class. Extend to ALiBi slopes, norm placement, QKV bias and the MoE routing bias."
+    status: pending
+  - id: h-a-large-real-checkpoint
+    content: "THEME H, the thing that would prove THEME C is real. Research on 2026-08-27 found ONE recent large model that clears both gates: DeepSeek-V4-Flash-0731, `general.architecture` = `deepseek4`, 304B total / ~13B active, 256 routed experts plus 1 shared, 155 GB at UD-Q4_K_XL. ggml-org PUBLISHES THE GGUF ITSELF and llama.cpp merged support on 2026-06-29 (#24162), so a baseline exists. Its shape is worth the run: MLA, a lightning indexer, per-layer compression alternating 4 and 128, mHC hyper-connections, a routing bias tensor (`exp_probs_b`), and `scoring_func: sqrtsoftplus`. The checkpoint is NATIVELY FP4, so any Q4_K_M is a requantization of already-4-bit weights, which is why bartowski ships MXFP4 only. WHAT WAS REJECTED AND WHY, so it is not re-researched: Qwen3.8-Flash-Next exists (2026-08-26, unsloth GGUF) but llama.cpp support is an OPEN PR written before the weights were public, so there is NO BASELINE, and 36 of its 48 layers are Gated DeltaNet, which lands in ferrox's unconditional `HybridEngine::reject`. Kimi K3 is linear attention on 69 of 93 layers, GLM-5.3-Flash is 34 of 45, both in the same reject family. GLM-5.2, MiniMax-M3 and Muse Glimmer clear the gates but are less interesting or much larger. NOTE `docs/MODELS.md` says DeepSeek V4 is 'loaders and primitives only, nothing run end to end on a real checkpoint', and the suite tops out at Mixtral/48 GB, so the honest first milestone is DOES IT LOAD, not a tok/s number."
+    status: pending
+isProject: false
+---
+
+# The roadmap
+
+Every open item, merged by what the work is rather than by which
+document raised it. The goal that ranks them is in
+[`north-star.md`](north-star.md).
+
+Two items are big enough to have their own design document:
+
+- [`model-layer-reorg.md`](model-layer-reorg.md), splitting the
+  6438-line decoder so architectures scale.
+- [`out-of-core-moe.md`](out-of-core-moe.md), running a 155 GB model on
+  a 32 GB machine.
+
+## Themes, in priority order
+
+| | Theme | Why here |
+|---|---|---|
+| **A** | Model layer scalability | Gates every other model item |
+| **B** | Correctness | Some models are wrong *right now* |
+| **C** | Out-of-core and MoE | The reason to choose ferrox, not tie |
+| **D** | Hardware reach | No AMD or Intel GPU path at all |
+| **E** | CPU performance | Every red row, but unlocks no new model |
+| **F** | Measurement | One laptop cannot prove the claim |
+| **G** | Verification method | How coverage gets affordable |
+| **H** | A large real checkpoint | Proof that C is real |
+
+## What was merged
+
+Five plans held 43 pending items, with the same work described from
+different angles in different files. MoE residency appeared in
+`freetoken-parity` as policy and in `amd-strix-halo` as a UMA question.
+CPU attention appeared twice in `llama-cpp-parity-push`. Measurement
+discipline appeared in three files.
+
+One item was already stale and is now closed:
+`publish-order-blocked-on-workflow-scope` said `ferrox-edge` was missing
+from the crates.io publish order. It was added, and all 13 crates
+published at 0.12.0 and again at 0.13.0.
+
+Superseded plan files moved to [`archive/`](archive/). They are kept
+because their reasoning is worth not re-deriving, not because they are
+still the plan.
+
+## The rules that keep being re-learned
+
+**A plan's own status field is a claim, not evidence.** A merged PR once
+marked `paged-decode-path` complete while it returned wrong tokens on
+Metal.
+
+**One agent owns a file.** Two branches editing one file produce a merge
+nobody can review, and this project has had a branch silently revert
+three others.
+
+**No agent runs benchmarks.** A loaded host reads 25-45% low.
+
+**Refusing is not a defect.** llama.cpp will often run something
+approximately; this project stops and names what is missing.

@@ -983,9 +983,7 @@ impl Decoder {
         layer: &'a LayerWeights,
         config: &ModelConfig,
     ) -> Option<ferrox_metal::gpu::PrefillMoeMetal<'a>> {
-        if !ferrox_metal::attn::metal_moe_stack_enabled()
-            || !ferrox_metal::attn::metal_moe_resident_enabled()
-            || Self::is_dense_layer(layer)
+        if Self::is_dense_layer(layer)
             || !layer.moe.shared_experts.is_empty()
             || !matches!(
                 config.ffn_activation,
@@ -1267,7 +1265,6 @@ impl Decoder {
     ) -> Option<Vec<f32>> {
         if batch_size == 0
             || !ferrox_core::metal_dense_enabled()
-            || !ferrox_metal::attn::metal_moe_resident_enabled()
             || !matches!(
                 config.ffn_activation,
                 crate::config::FfnActivation::Swiglu | crate::config::FfnActivation::SwigluFused
@@ -1739,7 +1736,6 @@ impl Decoder {
         // OLMoE: all MoE layers in one CB (llama graph style).
         #[cfg(feature = "metal")]
         if use_metal_attn
-            && ferrox_metal::attn::metal_moe_resident_enabled()
             && matches!(self.config.moe.gating, ferrox_moe::GatingFunction::Softmax)
             && self
                 .layers
@@ -1784,16 +1780,12 @@ impl Decoder {
                             });
                         }
                         if ok {
-                            // Greedy / FERROX_METAL_LOGITS: fold lm_head(+argmax)
-                            // like dense stack — download 1×u32 or vocab, skip host.
+                            // Greedy: fold lm_head+argmax into the stack like the
+                            // dense path does, and download one u32 instead of a
+                            // hidden vector.
                             let greedy_gpu = ferrox_metal::attn::metal_greedy_argmax_active();
                             let lm_head_gpu_launch = Self::metal_matvec_launch(&self.output_head);
-                            let out_launch =
-                                if greedy_gpu || ferrox_metal::attn::metal_logits_enabled() {
-                                    lm_head_gpu_launch
-                                } else {
-                                    None
-                                };
+                            let out_launch = if greedy_gpu { lm_head_gpu_launch } else { None };
                             let embd_launch = Self::metal_matvec_launch(&self.embedding);
                             // Gemma scales embd on host; GPU gather has no scale.
                             let embd_gather = if self.config.embedding_scale.is_some() {
@@ -1935,22 +1927,13 @@ impl Decoder {
                             });
                         }
                         if ok {
-                            // Prefer greedy GPU argmax-in-stack (1×u32 download)
-                            // when generate marked this thread for temperature<=0.
-                            // Else opt-in FERROX_METAL_LOGITS downloads full vocab
-                            // (often slower). Default: host lm_head after hidden.
+                            // Greedy GPU argmax-in-stack (1×u32 download) when
+                            // generate marked this thread for temperature<=0.
+                            // Otherwise host lm_head after the hidden download,
+                            // which measured ~2x the tok/s of a full-vocab one.
                             let greedy_gpu = ferrox_metal::attn::metal_greedy_argmax_active();
                             let lm_head_gpu_launch = Self::metal_matvec_launch(&self.output_head);
-                            // Prefer greedy GPU argmax-in-stack (1×u32 download)
-                            // when generate marked this thread for temperature<=0.
-                            // Else opt-in FERROX_METAL_LOGITS downloads full vocab
-                            // (often slower). Default: host lm_head after hidden.
-                            let out_launch =
-                                if greedy_gpu || ferrox_metal::attn::metal_logits_enabled() {
-                                    lm_head_gpu_launch
-                                } else {
-                                    None
-                                };
+                            let out_launch = if greedy_gpu { lm_head_gpu_launch } else { None };
                             // Pass final_norm_w when: (1) lm_head runs in stack (out_launch),
                             // OR (2) lm_head will route to GPU after stack (lm_head_gpu_launch
                             // but no out_launch) so we can skip download→reupload via TLS.
@@ -2167,7 +2150,6 @@ impl Decoder {
                                     // then batched experts — no hidden download/upload.
                                     if !did_metal_dense
                                         && !clear_metal_kv
-                                        && ferrox_metal::attn::metal_moe_resident_enabled()
                                         && Self::layer_supports_metal_moe_resident(
                                             layer,
                                             &self.config,
@@ -4101,96 +4083,47 @@ impl Decoder {
                             && swa_fits
                         {
                             let prefill_res = {
-                                let o_launch = Self::metal_matvec_launch(&layer.attn.o_proj);
-                                // Prefill O fusion: opt-in. Default off until
-                                // fair-chat prompt_per_s proves a win without
-                                // decode noise (Host B contention-sensitive).
-                                let fuse_o = matches!(
-                                    std::env::var("FERROX_METAL_PREFILL_FUSE_O").ok().as_deref(),
-                                    Some("1") | Some("true") | Some("on")
-                                ) && o_launch.as_ref().is_some_and(|o| {
-                                    o.fn_name == "q4_0_matvec"
-                                        && o.block_bytes == 18
-                                        && layer.attn.post_attn_norm.is_none()
-                                });
-                                if fuse_o {
-                                    let o = o_launch.as_ref().unwrap();
-                                    ferrox_metal::attn::launch_prefill_attn_o_residual(
-                                        &q_batch,
-                                        &k_batch,
-                                        &v_batch,
-                                        &hidden_batch,
-                                        o,
-                                        &mut metal_kvs[l],
-                                        n_heads,
+                                ferrox_metal::attn::launch_prefill_attn_block(
+                                    &q_batch,
+                                    &k_batch,
+                                    &v_batch,
+                                    &mut metal_kvs[l],
+                                    n_heads,
+                                    batch_size,
+                                    self.metal_rope().attn_factor_applied_by_caller(),
+                                    self.config.layer_rope_theta(l),
+                                    self.config.rope_freqs.as_deref(),
+                                    start_pos,
+                                    self.config.attn_logit_softcap,
+                                    false,
+                                )
+                                .map(|(attn_out_batch, _, _)| {
+                                    Self::advance_host_kv_after_metal_prefill(
+                                        &metal_kvs[l],
+                                        cache,
                                         batch_size,
-                                        self.metal_rope().attn_factor_applied_by_caller(),
-                                        self.config.layer_rope_theta(l),
-                                        self.config.rope_freqs.as_deref(),
-                                        start_pos,
-                                        self.config.attn_logit_softcap,
-                                    )
-                                    .map(|h_out| {
-                                        Self::advance_host_kv_after_metal_prefill(
-                                            &metal_kvs[l],
-                                            cache,
-                                            batch_size,
-                                            host_kv_authoritative,
-                                        );
-                                        hidden_batch = h_out;
-                                        true
-                                    })
-                                } else {
-                                    ferrox_metal::attn::launch_prefill_attn_block(
-                                        &q_batch,
-                                        &k_batch,
-                                        &v_batch,
-                                        &mut metal_kvs[l],
-                                        n_heads,
-                                        batch_size,
-                                        self.metal_rope().attn_factor_applied_by_caller(),
-                                        self.config.layer_rope_theta(l),
-                                        self.config.rope_freqs.as_deref(),
-                                        start_pos,
-                                        self.config.attn_logit_softcap,
-                                        false,
-                                    )
-                                    .map(
-                                        |(attn_out_batch, _, _)| {
-                                            Self::advance_host_kv_after_metal_prefill(
-                                                &metal_kvs[l],
-                                                cache,
-                                                batch_size,
-                                                host_kv_authoritative,
-                                            );
-                                            let projected_batch = layer
-                                                .attn
-                                                .o_proj
-                                                .apply_batch(&attn_out_batch, batch_size);
-                                            let projected_batch =
-                                                if let Some(post) = &layer.attn.post_attn_norm {
-                                                    projected_batch
-                                                        .chunks(hidden_dim)
-                                                        .flat_map(|row| {
-                                                            rms_norm(
-                                                                row,
-                                                                post,
-                                                                self.config.rms_norm_eps,
-                                                            )
-                                                        })
-                                                        .collect::<Vec<_>>()
-                                                } else {
-                                                    projected_batch
-                                                };
-                                            for (h, p) in
-                                                hidden_batch.iter_mut().zip(projected_batch.iter())
-                                            {
-                                                *h += p;
-                                            }
-                                            true
-                                        },
-                                    )
-                                }
+                                        host_kv_authoritative,
+                                    );
+                                    let projected_batch =
+                                        layer.attn.o_proj.apply_batch(&attn_out_batch, batch_size);
+                                    let projected_batch =
+                                        if let Some(post) = &layer.attn.post_attn_norm {
+                                            projected_batch
+                                                .chunks(hidden_dim)
+                                                .flat_map(|row| {
+                                                    rms_norm(row, post, self.config.rms_norm_eps)
+                                                })
+                                                .collect::<Vec<_>>()
+                                        } else {
+                                            projected_batch
+                                        };
+                                    for (h, p) in
+                                        hidden_batch.iter_mut().zip(projected_batch.iter())
+                                    {
+                                        *h += p;
+                                    }
+                                    true
+                                })
                             };
                             match prefill_res {
                                 Ok(true) => {

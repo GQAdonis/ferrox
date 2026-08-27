@@ -532,14 +532,14 @@ fn raise_exception(msg: String) -> Result<JinjaValue, minijinja::Error> {
 /// wrong date — a model told the wrong year is a real quality bug and it
 /// would never show up as a crash.
 ///
-/// `FERROX_CHAT_TEMPLATE_NOW` (Unix seconds) pins the clock, which is
+/// `FERROX_TEST_CHAT_TEMPLATE_NOW` (Unix seconds) pins the clock, which is
 /// how the regression tests below assert an exact string.
 fn strftime_now(fmt: String) -> Result<String, minijinja::Error> {
-    let secs = match std::env::var("FERROX_CHAT_TEMPLATE_NOW") {
+    let secs = match std::env::var("FERROX_TEST_CHAT_TEMPLATE_NOW") {
         Ok(v) => v.trim().parse::<i64>().map_err(|_| {
             minijinja::Error::new(
                 minijinja::ErrorKind::InvalidOperation,
-                "FERROX_CHAT_TEMPLATE_NOW must be Unix seconds",
+                "FERROX_TEST_CHAT_TEMPLATE_NOW must be Unix seconds",
             )
         })?,
         Err(_) => std::time::SystemTime::now()
@@ -958,14 +958,14 @@ mod tests {
     #[test]
     fn strftime_now_stamps_a_pinned_clock() {
         // 2024-07-04T12:34:56Z
-        std::env::set_var("FERROX_CHAT_TEMPLATE_NOW", "1720096496");
+        std::env::set_var("FERROX_TEST_CHAT_TEMPLATE_NOW", "1720096496");
         let out = ChatTemplate::from_jinja(
             "{{ strftime_now(\"%d %b %Y\") }}|{{ strftime_now('%A %F %T %j %-d') }}",
         )
         .unwrap()
         .render(&[], &opts())
         .unwrap();
-        std::env::remove_var("FERROX_CHAT_TEMPLATE_NOW");
+        std::env::remove_var("FERROX_TEST_CHAT_TEMPLATE_NOW");
         assert_eq!(out, "04 Jul 2024|Thursday 2024-07-04 12:34:56 186 4");
     }
 

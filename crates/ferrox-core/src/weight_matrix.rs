@@ -446,18 +446,8 @@ thread_local! {
 }
 
 /// Minimum multiply-accumulates a rayon task should carry before it is
-/// worth its own scheduling. Tunable for A/B; the default was chosen by
-/// measurement, not derivation.
-fn min_task_macs() -> usize {
-    use std::sync::OnceLock;
-    static V: OnceLock<usize> = OnceLock::new();
-    *V.get_or_init(|| {
-        std::env::var("FERROX_MIN_TASK_MACS")
-            .ok()
-            .and_then(|v| v.trim().parse().ok())
-            .unwrap_or(1 << 16)
-    })
-}
+/// worth its own scheduling. Chosen by measurement, not derivation.
+const MIN_TASK_MACS: usize = 1 << 16;
 
 /// Whether dense [`WeightMatrix::apply`] / [`WeightMatrix::apply_batch`]
 /// should try Metal first (when built with `--features metal`).
@@ -475,38 +465,6 @@ pub fn metal_dense_enabled() -> bool {
         Some("0") | Some("false") | Some("off") | Some("cpu") => false,
         Some("1") | Some("true") | Some("on") | Some("metal") => true,
         _ => ferrox_metal::gpu::probe().is_some(),
-    })
-}
-
-/// `FERROX_METAL_MATMUL=1` opts into the first-cut Q4/Q6 matmul kernels,
-/// which can lose to N x matvec for typical chat prompts.
-///
-/// Read once. These sit inside `apply_gpu_batch`, i.e. once per GEMM per
-/// layer per forward pass -- `std::env::var` allocates a `String` and
-/// takes the environment lock every time.
-#[cfg(feature = "metal")]
-fn metal_matmul_opt_in() -> bool {
-    use std::sync::OnceLock;
-    static V: OnceLock<bool> = OnceLock::new();
-    *V.get_or_init(|| {
-        matches!(
-            std::env::var("FERROX_METAL_MATMUL").ok().as_deref(),
-            Some("1") | Some("true") | Some("on")
-        )
-    })
-}
-
-/// Weight-reuse `mul_mm` for prefill. Default on; `FERROX_METAL_MUL_MM=0`
-/// forces the N x matvec batch. Read once, same reason as above.
-#[cfg(feature = "metal")]
-fn metal_mul_mm_enabled() -> bool {
-    use std::sync::OnceLock;
-    static V: OnceLock<bool> = OnceLock::new();
-    *V.get_or_init(|| {
-        !matches!(
-            std::env::var("FERROX_METAL_MUL_MM").ok().as_deref(),
-            Some("0") | Some("false") | Some("off")
-        )
     })
 }
 
@@ -765,7 +723,7 @@ impl WeightMatrix {
     /// *ahead* of llama at one thread on Mistral-7B).
     ///
     /// [`Self::with_row_work`] supplies the elements-per-row so a task
-    /// can be required to carry at least `FERROX_MIN_TASK_MACS`
+    /// can be required to carry at least [`MIN_TASK_MACS`]
     /// multiply-accumulates. Zero (unset) keeps the old row-only
     /// behaviour, so any call site that has not opted in is unchanged.
     fn min_rows_per_task(rows: usize) -> usize {
@@ -775,7 +733,7 @@ impl WeightMatrix {
         if per_row == 0 {
             return by_threads;
         }
-        let need = min_task_macs().div_ceil(per_row.max(1));
+        let need = MIN_TASK_MACS.div_ceil(per_row.max(1));
         by_threads.max(need.min(rows.max(1)))
     }
 
@@ -1729,10 +1687,9 @@ impl WeightMatrix {
     /// same weights into one.
     ///
     /// With Metal dense enabled, dispatches a single batched Metal
-    /// command buffer — Q4_K/Q6_K use
-    /// [`ferrox_metal::gpu::launch_q4_k_matmul_batch`] /
-    /// [`ferrox_metal::gpu::launch_q6_k_matmul_batch`] when
-    /// `batch_size >= 2`; other kinds use
+    /// command buffer — Q4_0/Q4_K/Q6_K/Q8_0 reuse the weights through a
+    /// simdgroup `mul_mm` at `batch_size >= 4`; every other kind, and
+    /// every smaller batch, uses
     /// [`ferrox_metal::gpu::launch_matvec_batch`]. Falls back to
     /// per-row [`Self::apply`] if the batch launch fails.
     pub fn apply_batch(&self, x_batch: &[f32], batch_size: usize) -> Vec<f32> {
@@ -3036,10 +2993,9 @@ impl WeightMatrix {
     /// Returns `None` if Metal dense is off, the kind lacks a Metal
     /// kernel, or the launch fails.
     ///
-    /// Q4_K / Q6_K with `batch_size >= 2` use
-    /// [`ferrox_metal::gpu::launch_q4_k_matmul_batch`] /
-    /// [`ferrox_metal::gpu::launch_q6_k_matmul_batch`]; other kinds
-    /// fall through to [`ferrox_metal::gpu::launch_matvec_batch`].
+    /// `batch_size >= 4` takes the weight-reuse `mul_mm` path where the
+    /// kind has one; everything else falls through to
+    /// [`ferrox_metal::gpu::launch_matvec_batch`].
     #[cfg(feature = "metal")]
     pub fn apply_gpu_batch(&self, x_batch: &[f32], batch_size: usize) -> Option<Vec<f32>> {
         if !metal_dense_enabled() || batch_size == 0 {
@@ -3068,15 +3024,10 @@ impl WeightMatrix {
         let (src, fn_name, block_bytes, block_elems, rows_per_tg) =
             ferrox_metal::gpu::matvec_launch_meta(kind_name)?;
         let row_bytes = self.block_bytes_per_row(*kind, *cols);
-        // First-cut Q4/Q6 matmul kernels can lose to N× matvec on Host B
-        // for typical chat prompts (8B fair: ~17 vs ~21 prompt tok/s).
-        // Opt in with FERROX_METAL_MATMUL=1 once tiling improves.
-        let use_matmul = batch_size >= 2 && metal_matmul_opt_in();
-        // Weight-reuse mul_mm for prefill batch ≥ 4 (Q4_0 / Q4_K / Q6_K).
-        // Default **on**; `FERROX_METAL_MUL_MM=0` forces N× matvec batch.
+        // Weight-reuse mul_mm for prefill batch >= 4 (Q4_0 / Q4_K / Q6_K).
         // Threshold 4 (was 8) covers shorter prompts without changing the
         // decode path (batch_size == 1 still uses matvec).
-        let use_mul_mm = batch_size >= 4 && metal_mul_mm_enabled();
+        let use_mul_mm = batch_size >= 4;
         if use_mul_mm {
             // Observation only: a kind with a matvec kernel but no
             // simdgroup GEMM still runs on Metal, as `batch` separate
@@ -3223,58 +3174,7 @@ impl WeightMatrix {
                         Ok(out) => return Some(out),
                         Err(e) => {
                             eprintln!(
-                                "ferrox: Metal Q6_K simdgroup mul_mm failed, matmul-batch fallback: {e}"
-                            );
-                        }
-                    }
-                    match ferrox_metal::gpu::launch_q6_k_matmul_batch(
-                        data.as_slice(),
-                        x_batch,
-                        *rows,
-                        row_bytes,
-                        batch_size,
-                    ) {
-                        Ok(out) => return Some(out),
-                        Err(e) => {
-                            eprintln!(
-                                "ferrox: Metal Q6_K matmul batch (MUL_MM path) failed, matvec fallback: {e}"
-                            );
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-        if use_matmul {
-            match kind {
-                QuantKind::Q4K => {
-                    match ferrox_metal::gpu::launch_q4_k_matmul_batch(
-                        data.as_slice(),
-                        x_batch,
-                        *rows,
-                        row_bytes,
-                        batch_size,
-                    ) {
-                        Ok(out) => return Some(out),
-                        Err(e) => {
-                            eprintln!(
-                                "ferrox: Metal Q4_K matmul batch failed, matvec fallback: {e}"
-                            );
-                        }
-                    }
-                }
-                QuantKind::Q6K => {
-                    match ferrox_metal::gpu::launch_q6_k_matmul_batch(
-                        data.as_slice(),
-                        x_batch,
-                        *rows,
-                        row_bytes,
-                        batch_size,
-                    ) {
-                        Ok(out) => return Some(out),
-                        Err(e) => {
-                            eprintln!(
-                                "ferrox: Metal Q6_K matmul batch failed, matvec fallback: {e}"
+                                "ferrox: Metal Q6_K simdgroup mul_mm failed, matvec fallback: {e}"
                             );
                         }
                     }

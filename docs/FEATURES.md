@@ -25,9 +25,7 @@ is faster.
   predate that fix and need measuring again before you quote them.
 - **MoE**: OLMoE-1B-7B, still behind on Metal decode (~1.41×). Metal
   Concurrent plus fused encode groups, `MemRanges`, `mul_mv_id` and
-  prefill `mul_mm_id`, and a fused attn+O residual command buffer
-  (`FERROX_METAL_PREFILL_FUSE_O=1`). On CPU: int-dot and interleaved
-  Q4_K.
+  prefill `mul_mm_id`. On CPU: int-dot and interleaved Q4_K.
 - **MLA**: dense-lead and MoE-after-dense `deepseek2` / `mistral4`.
 - **Gemma-4**: dedicated engine (per-layer embeddings, shared KV,
   SWA/full), an SPM-style `gemma4` BPE tokenizer, and the `<|turn>` chat

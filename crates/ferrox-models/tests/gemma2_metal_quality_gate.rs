@@ -21,7 +21,7 @@ const PROMPT: &str = "The capital of France is";
 const MAX_NEW: usize = 24;
 
 fn gguf_path() -> PathBuf {
-    if let Ok(p) = std::env::var("FERROX_GEMMA2_GGUF") {
+    if let Ok(p) = std::env::var("FERROX_TEST_GEMMA2_GGUF") {
         return PathBuf::from(p);
     }
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../models/gemma-2-2b-it-Q4_K_M.gguf")
@@ -107,7 +107,9 @@ fn gemma2_metal_greedy_contains_paris() {
         }
         std::env::set_var("FERROX_METAL", "1");
         std::env::set_var("FERROX_METAL_ATTN", "1");
-        std::env::set_var("FERROX_METAL_GREEDY_GPU", "0");
+        // Host lm_head + host argmax, so this gate measures the attention
+        // and FFN stack rather than the GPU argmax fold.
+        ferrox_models::set_metal_greedy_argmax(false);
         let file = ShardedGguf::open(&path).expect("open");
         let config = ModelConfig::from_gguf(&file).expect("config");
         let tok = GgufSpmTokenizer::from_gguf(&file).expect("tokenizer");

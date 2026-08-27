@@ -17,8 +17,8 @@
 //! Requires:
 //! - `cargo test -p ferrox-models --features metal --test paged_metal_parity -- --ignored --nocapture`
 //! - Apple Silicon + Metal
-//! - the GGUFs under `models/` (`FERROX_MODELS_DIR` to point elsewhere),
-//!   or `FERROX_PAGED_PARITY_GGUF` for a single file
+//! - the GGUFs under `models/` (`FERROX_TEST_MODELS_DIR` to point elsewhere),
+//!   or `FERROX_TEST_PAGED_PARITY_GGUF` for a single file
 
 #![cfg(feature = "metal")]
 
@@ -48,9 +48,9 @@ const MODELS: &[&str] = &[
 ];
 
 fn model_dir() -> PathBuf {
-    // `FERROX_MODELS_DIR` because a git worktree has no `models/` of its
+    // `FERROX_TEST_MODELS_DIR` because a git worktree has no `models/` of its
     // own, and this check is worth running from one.
-    if let Ok(d) = std::env::var("FERROX_MODELS_DIR") {
+    if let Ok(d) = std::env::var("FERROX_TEST_MODELS_DIR") {
         return PathBuf::from(d);
     }
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../models")
@@ -164,7 +164,7 @@ fn greedy_paged(decoder: &Decoder, prompt: &[usize], eos: Option<usize>) -> Vec<
 /// on any backend, or a deployment's answers depend on whether a KV
 /// pool happened to be configured.
 #[test]
-#[ignore = "needs Apple Metal GPU + the GGUFs under models/ (or FERROX_PAGED_PARITY_GGUF)"]
+#[ignore = "needs Apple Metal GPU + the GGUFs under models/ (or FERROX_TEST_PAGED_PARITY_GGUF)"]
 fn paged_kv_answers_exactly_what_contiguous_kv_answers_on_metal() {
     if ferrox_metal::gpu::probe().is_none() {
         eprintln!("skip: no Metal GPU detected");
@@ -179,7 +179,7 @@ fn paged_kv_answers_exactly_what_contiguous_kv_answers_on_metal() {
         }
     }
 
-    match std::env::var("FERROX_PAGED_PARITY_GGUF") {
+    match std::env::var("FERROX_TEST_PAGED_PARITY_GGUF") {
         Ok(p) => check_one(Path::new(&p)),
         Err(_) => check_each_in_its_own_process(),
     }
@@ -214,7 +214,7 @@ fn check_each_in_its_own_process() {
                 "--nocapture",
                 "paged_kv_answers_exactly_what_contiguous_kv_answers_on_metal",
             ])
-            .env("FERROX_PAGED_PARITY_GGUF", &path)
+            .env("FERROX_TEST_PAGED_PARITY_GGUF", &path)
             .output()
             .expect("spawning the per-model child");
         eprint!("{}", String::from_utf8_lossy(&out.stderr));

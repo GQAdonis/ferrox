@@ -3,11 +3,8 @@
 //! CUDA-toolkit-style SDK needed -- the framework ships with macOS).
 //!
 //! Five matvec kernels are implemented: `Q8_0`/`Q4_0`/`Q4_K`/`Q5_K`/
-//! `Q6_K`, plus multi-activation matmul kernels
-//! (`Q4_K_MATMUL_BATCH_KERNEL_SRC` / `Q6_K_MATMUL_BATCH_KERNEL_SRC`)
-//! for prefill (`batch >= 2`) that reuse weight-block loads across an
-//! `NB=4` activation tile — a simpler correct first cut vs full
-//! ggml-metal `mul_mm` (no simdgroup_matrix tiles).
+//! `Q6_K`, plus simdgroup-matrix `mul_mm` kernels for prefill
+//! (`batch >= 4`) that reuse each weight-block load across the batch.
 //!
 //! **Verified directly on real hardware** (unlike `ferrox-cuda`, which
 //! needed a rented GPU): this crate is developed on an Apple M2 Pro, so
@@ -783,123 +780,6 @@ kernel void q4_0_moe_matvec_id(
     }
 }
 
-/// Like matvec_id, but writes silu(gate)*dot into `out` (skips a separate
-/// silu_mul pass after the up projection).
-kernel void q4_0_moe_matvec_id_silu(
-    device const uchar* w_all [[buffer(0)]],
-    device const float* x [[buffer(1)]],
-    device float* out [[buffer(2)]],
-    device const int* ids [[buffer(3)]],
-    constant uint& row_bytes [[buffer(4)]],
-    constant uint& n_blocks [[buffer(5)]],
-    constant uint& n_rows [[buffer(6)]],
-    constant uint& top_k [[buffer(7)]],
-    constant uint& expert_stride [[buffer(8)]],
-    constant uint& n_tokens [[buffer(9)]],
-    constant uint& x_stride [[buffer(10)]],
-    device const float* gate [[buffer(11)]],
-    uint3 tgpig [[threadgroup_position_in_grid]],
-    uint lane [[thread_index_in_simdgroup]],
-    uint sg [[simdgroup_index_in_threadgroup]]
-) {
-    constexpr uint NR = 4u;
-    constexpr uint NSG = 2u;
-    const uint group = tgpig.x;
-    const uint slot = tgpig.z;
-    const uint first_row = (group * NSG + sg) * NR;
-    const uint n_slots = n_tokens * top_k;
-    if (slot >= n_slots) return;
-    const uint token = slot / top_k;
-    const uint eid = uint(ids[slot]);
-    device const uchar* w = w_all + (size_t)eid * expert_stride;
-    float acc[NR] = { 0.0f };
-    device const uchar* ax[NR];
-    for (uint rr = 0u; rr < NR; ++rr) {
-        const uint row = min(first_row + rr, n_rows > 0u ? n_rows - 1u : 0u);
-        ax[rr] = w + (size_t)row * row_bytes;
-    }
-    const uint ix = lane / 2u;
-    const uint il = (lane % 2u) * 8u;
-    device const float* yb = x + (size_t)token * x_stride + ix * 32u + il;
-    for (uint b = ix; b < n_blocks; b += 16u) {
-        float yl[16];
-        const float sumy = q4_0_load_y(yb, yl);
-        #pragma clang loop unroll(full)
-        for (uint rr = 0u; rr < NR; ++rr) {
-            acc[rr] += q4_0_half_dot(ax[rr] + (size_t)b * 18u, sumy, yl, il);
-        }
-        yb += 16u * 32u;
-    }
-    for (uint rr = 0u; rr < NR; ++rr) {
-        const uint row = first_row + rr;
-        const float sum = simd_sum(acc[rr]);
-        if (lane == 0u && row < n_rows) {
-            const float g = gate[(size_t)slot * n_rows + row];
-            const float silu = g / (1.0f + exp(-g));
-            out[(size_t)slot * n_rows + row] = silu * sum;
-        }
-    }
-}
-
-kernel void q4_0_moe_gate_up_id(
-    device const uchar* gate_all [[buffer(0)]],
-    device const uchar* up_all [[buffer(1)]],
-    device const float* x [[buffer(2)]],
-    device float* act [[buffer(3)]],
-    device const int* ids [[buffer(4)]],
-    constant uint& row_bytes [[buffer(5)]],
-    constant uint& n_blocks [[buffer(6)]],
-    constant uint& ffn_rows [[buffer(7)]],
-    constant uint& top_k [[buffer(8)]],
-    constant uint& expert_stride [[buffer(9)]],
-    constant uint& n_tokens [[buffer(10)]],
-    constant uint& x_stride [[buffer(11)]],
-    uint tgpig [[threadgroup_position_in_grid]],
-    uint lane [[thread_index_in_simdgroup]],
-    uint sg [[simdgroup_index_in_threadgroup]]
-) {
-    // Kept for prefill path / tests; decode prefers q4_0_moe_matvec_id ×2.
-    constexpr uint NR = 4u;
-    constexpr uint NSG = 2u;
-    constexpr uint ROWS_PER_TG = NR * NSG;
-    const uint row_groups = (ffn_rows + ROWS_PER_TG - 1u) / ROWS_PER_TG;
-    const uint n_slots = n_tokens * top_k;
-    const uint slot = tgpig / row_groups;
-    const uint group = tgpig - slot * row_groups;
-    const uint first_row = (group * NSG + sg) * NR;
-    if (slot >= n_slots) return;
-    const uint token = slot / top_k;
-    const uint eid = uint(ids[slot]);
-    device const uchar* wg = gate_all + (size_t)eid * expert_stride;
-    device const uchar* wu = up_all + (size_t)eid * expert_stride;
-    float ga[NR] = { 0.0f };
-    float ua[NR] = { 0.0f };
-    const uint ix = lane / 2u;
-    const uint il = (lane % 2u) * 8u;
-    device const float* yb = x + (size_t)token * x_stride + ix * 32u + il;
-    for (uint b = ix; b < n_blocks; b += 16u) {
-        float yl[16];
-        const float sumy = q4_0_load_y(yb, yl);
-        for (uint rr = 0u; rr < NR; ++rr) {
-            const uint row = first_row + rr;
-            if (row >= ffn_rows) continue;
-            device const uchar* gb = wg + (size_t)row * row_bytes + (size_t)b * 18u;
-            device const uchar* ub = wu + (size_t)row * row_bytes + (size_t)b * 18u;
-            ga[rr] += q4_0_half_dot(gb, sumy, yl, il);
-            ua[rr] += q4_0_half_dot(ub, sumy, yl, il);
-        }
-        yb += 16u * 32u;
-    }
-    for (uint rr = 0u; rr < NR; ++rr) {
-        const uint row = first_row + rr;
-        const float g = simd_sum(ga[rr]);
-        const float u = simd_sum(ua[rr]);
-        if (lane == 0u && row < ffn_rows) {
-            act[(size_t)slot * ffn_rows + row] = (g / (1.0f + exp(-g))) * u;
-        }
-    }
-}
-
 kernel void q4_0_moe_down_id(
     device const uchar* down_all [[buffer(0)]],
     device const float* act [[buffer(1)]],
@@ -1285,7 +1165,7 @@ pub fn launch_q4_0_matvec(
     )
 }
 
-/// Q4_0 multi-activation matmul (`FERROX_METAL_MUL_MM` path).
+/// Q4_0 multi-activation matmul (prefill weight-reuse path).
 ///
 /// Correctness-first: same dequant as [`Q4_0_MATVEC_KERNEL_SRC`]
 /// (`scale * (nibble - 8)`), one threadgroup per weight row, threads
@@ -2063,184 +1943,7 @@ pub fn launch_q4_k_matvec(
     )
 }
 
-/// Multi-activation Q4_K matmul (first-cut GEMM): weight matrix ×
-/// `[cols, batch]` → `[rows, batch]` with layout `[batch, cols]` /
-/// `[batch, rows]` on the host.
-///
-/// Same dequant/dot identity as [`Q4_K_MATVEC_KERNEL_SRC`], but each
-/// threadgroup walks a batch tile (`NB=4`) inside the K-loop so one
-/// weight-block load serves multiple activations — better than
-/// [`launch_matvec_batch`]'s N separate matvec encodings (still N×
-/// weight traffic). Not a full ggml-metal `mul_mm` (no simdgroup_matrix
-/// / 64×32 tiles); correct first cut for prefill.
-///
-/// Host dispatches `ceil(n_rows/4)` threadgroups of 64 threads (1D grid;
-/// batch tiling is inside the kernel).
-pub const Q4_K_MATMUL_BATCH_KERNEL_SRC: &str = r#"
-#include <metal_stdlib>
-using namespace metal;
-
-kernel void q4_k_matmul_batch(
-    device const uchar* weights [[buffer(0)]],
-    device const float* x [[buffer(1)]],
-    device float* out [[buffer(2)]],
-    constant uint& row_bytes [[buffer(3)]],
-    constant uint& n_blocks_per_row [[buffer(4)]],
-    constant uint& n_rows [[buffer(5)]],
-    constant uint& batch_size [[buffer(6)]],
-    uint tgpig [[threadgroup_position_in_grid]],
-    uint tid [[thread_position_in_threadgroup]]
-) {
-    constexpr short NSG = 2;
-    constexpr short nr0 = 2;
-    constexpr short NW = 32;
-    constexpr short NB = 4;
-    constexpr uint16_t kmask1 = 0x3f3f;
-    constexpr uint16_t kmask2 = 0x0f0f;
-    constexpr uint16_t kmask3 = 0xc0c0;
-
-    const ushort tiisg = tid % NW;
-    const ushort sgitg = tid / NW;
-
-    const short ix = tiisg / 8;
-    const short it = tiisg % 8;
-    const short iq = it / 4;
-    const short ir = it % 4;
-
-    const int first_row = int(tgpig * NSG + sgitg) * nr0;
-    const int nb = int(n_blocks_per_row);
-    const int cols = nb * 256;
-
-    float yl[16];
-    float yh[16];
-
-    for (int bt = 0; bt < int(batch_size); bt += NB) {
-        float sumf[2][4];
-        for (short r = 0; r < nr0; ++r) {
-            for (short b = 0; b < NB; ++b) {
-                sumf[r][b] = 0.0f;
-            }
-        }
-
-        for (int ib = ix; ib < nb; ib += 4) {
-            device const uchar* block0 =
-                weights + (size_t)first_row * row_bytes + (size_t)ib * 144u;
-            device const uint16_t* sc0 =
-                (device const uint16_t*)(block0 + 4) + iq;
-            device const uint16_t* q10 =
-                (device const uint16_t*)(block0 + 16) + 16 * iq + 4 * ir;
-            device const half* dh0 = (device const half*)(block0);
-
-            for (short row = 0; row < nr0; row++) {
-                device const uint16_t* sc =
-                    (device const uint16_t*)((device const uchar*)sc0 + row * row_bytes);
-                device const uint16_t* q1 =
-                    (device const uint16_t*)((device const uchar*)q10 + row * row_bytes);
-                device const half* dh =
-                    (device const half*)((device const uchar*)dh0 + row * row_bytes);
-
-                uint16_t sc16[4];
-                thread const uint8_t* sc8 = (thread const uint8_t*)sc16;
-                sc16[0] = sc[0] & kmask1;
-                sc16[1] = sc[2] & kmask1;
-                sc16[2] = ((sc[4] >> 0) & kmask2) | ((sc[0] & kmask3) >> 2);
-                sc16[3] = ((sc[4] >> 4) & kmask2) | ((sc[2] & kmask3) >> 2);
-
-                uint16_t q1r[4];
-                uint16_t q2r[4];
-                device const uint16_t* q2 = q1 + 32;
-                for (short i = 0; i < 4; ++i) {
-                    q1r[i] = q1[i];
-                    q2r[i] = q2[i];
-                }
-                const float dscale = float(dh[0]);
-                const float dmin = float(dh[1]);
-
-                for (short b = 0; b < NB; ++b) {
-                    const int batch_idx = bt + b;
-                    if (batch_idx >= int(batch_size)) {
-                        break;
-                    }
-                    device const float* y4 =
-                        x + (size_t)batch_idx * cols + ib * 256 + 64 * iq + 8 * ir;
-
-                    float4 sumy = float4(0.0f);
-                    for (short i = 0; i < 8; ++i) {
-                        yl[i + 0] = y4[i + 0];
-                        sumy[0] += yl[i + 0];
-                        yl[i + 8] = y4[i + 32];
-                        sumy[1] += yl[i + 8];
-                        yh[i + 0] = y4[i + 128];
-                        sumy[2] += yh[i + 0];
-                        yh[i + 8] = y4[i + 160];
-                        sumy[3] += yh[i + 8];
-                    }
-
-                    float4 acc1 = float4(0.0f);
-                    float4 acc2 = float4(0.0f);
-                    for (short i = 0; i < 4; ++i) {
-                        acc1[0] += yl[2 * i + 0] * float(q1r[i] & 0x000F);
-                        acc1[1] += yl[2 * i + 1] * float(q1r[i] & 0x0F00);
-                        acc1[2] += yl[2 * i + 8] * float(q1r[i] & 0x00F0);
-                        acc1[3] += yl[2 * i + 9] * float(q1r[i] & 0xF000);
-                        acc2[0] += yh[2 * i + 0] * float(q2r[i] & 0x000F);
-                        acc2[1] += yh[2 * i + 1] * float(q2r[i] & 0x0F00);
-                        acc2[2] += yh[2 * i + 8] * float(q2r[i] & 0x00F0);
-                        acc2[3] += yh[2 * i + 9] * float(q2r[i] & 0xF000);
-                    }
-
-                    sumf[row][b] += dscale
-                            * ((acc1[0] + (1.0f / 256.0f) * acc1[1]) * float(sc8[0])
-                                + (acc1[2] + (1.0f / 256.0f) * acc1[3]) * float(sc8[1])
-                                    * (1.0f / 16.0f)
-                                + (acc2[0] + (1.0f / 256.0f) * acc2[1]) * float(sc8[4])
-                                + (acc2[2] + (1.0f / 256.0f) * acc2[3]) * float(sc8[5])
-                                    * (1.0f / 16.0f))
-                        - dmin
-                            * (sumy[0] * float(sc8[2]) + sumy[1] * float(sc8[3])
-                                + sumy[2] * float(sc8[6]) + sumy[3] * float(sc8[7]));
-                }
-            }
-        }
-
-        for (int row = 0; row < nr0; ++row) {
-            for (short b = 0; b < NB; ++b) {
-                const int batch_idx = bt + b;
-                float sum_all = simd_sum(sumf[row][b]);
-                if (tiisg == 0 && first_row + row < int(n_rows)
-                    && batch_idx < int(batch_size)) {
-                    out[(size_t)batch_idx * n_rows + first_row + row] = sum_all;
-                }
-            }
-        }
-    }
-}
-"#;
-
-/// Launches the Q4_K multi-activation matmul. `x_batch` is `[batch, cols]`;
-/// returns `[batch, rows]`.
-pub fn launch_q4_k_matmul_batch(
-    weights: &[u8],
-    x_batch: &[f32],
-    rows: usize,
-    row_bytes: usize,
-    batch_size: usize,
-) -> Result<Vec<f32>, MetalError> {
-    launch_matmul_batch(
-        Q4_K_MATMUL_BATCH_KERNEL_SRC,
-        "q4_k_matmul_batch",
-        144,
-        256,
-        4, // rows_per_tg (NSG=2 × nr0=2)
-        weights,
-        x_batch,
-        rows,
-        row_bytes,
-        batch_size,
-    )
-}
-
-/// Q4_K multi-activation matmul (`FERROX_METAL_MUL_MM` prefill path).
+/// Q4_K multi-activation matmul (prefill weight-reuse path).
 ///
 /// Correctness-first, same shape as [`Q4_0_MUL_MM_KERNEL_SRC`]: one
 /// threadgroup per weight row, threads stride over the row's Q4_K blocks
@@ -4697,110 +4400,6 @@ pub fn launch_q4_k_mul_mm(
     Ok(out_slice.to_vec())
 }
 
-/// Shared host plumbing for multi-activation matmul kernels (one CB,
-/// `ceil(rows / rows_per_tg)` threadgroups × 64 threads, `batch_size`
-/// bound as buffer 6).
-#[allow(clippy::too_many_arguments)]
-fn launch_matmul_batch(
-    kernel_src: &'static str,
-    fn_name: &'static str,
-    block_bytes: usize,
-    block_elems: usize,
-    rows_per_tg: usize,
-    weights: &[u8],
-    x_batch: &[f32],
-    rows: usize,
-    row_bytes: usize,
-    batch_size: usize,
-) -> Result<Vec<f32>, MetalError> {
-    if batch_size == 0 {
-        return Ok(Vec::new());
-    }
-    let n_blocks_per_row = row_bytes / block_bytes;
-    let cols = n_blocks_per_row * block_elems;
-    assert_eq!(weights.len(), rows * row_bytes);
-    assert_eq!(x_batch.len(), batch_size * cols);
-
-    let shared = shared_metal()?;
-    let device = &shared.device;
-    let queue = &shared.queue;
-
-    let mut x_owned = x_batch.to_vec();
-    let x_buf = unsafe {
-        device.newBufferWithBytes_length_options(
-            NonNull::new(x_owned.as_mut_ptr() as *mut _).unwrap(),
-            x_owned.len() * 4,
-            MTLResourceOptions::StorageModeShared,
-        )
-    }
-    .ok_or(MetalError::BufferAllocFailed)?;
-
-    let weight_buf = resident_weight_buffer(device, weights)?;
-    let out_elems = batch_size * rows;
-    let out_buf = device
-        .newBufferWithLength_options(out_elems * 4, MTLResourceOptions::StorageModeShared)
-        .ok_or(MetalError::BufferAllocFailed)?;
-
-    let cached_pipeline = ensure_pipeline(device, kernel_src, fn_name)?;
-    let pipeline = &cached_pipeline.0;
-
-    let cmd_buf = queue.commandBuffer().ok_or(MetalError::CommandFailed)?;
-    let encoder = cmd_buf
-        .computeCommandEncoder()
-        .ok_or(MetalError::CommandFailed)?;
-    encoder.setComputePipelineState(pipeline);
-    unsafe {
-        encoder.setBuffer_offset_atIndex(Some(&weight_buf.buffer), weight_buf.weight_offset, 0);
-        encoder.setBuffer_offset_atIndex(Some(&x_buf), 0, 1);
-        encoder.setBuffer_offset_atIndex(Some(&out_buf), 0, 2);
-        let mut row_bytes_u32 = row_bytes as u32;
-        encoder.setBytes_length_atIndex(
-            NonNull::new(&mut row_bytes_u32 as *mut u32 as *mut _).unwrap(),
-            4,
-            3,
-        );
-        let mut n_blocks_u32 = n_blocks_per_row as u32;
-        encoder.setBytes_length_atIndex(
-            NonNull::new(&mut n_blocks_u32 as *mut u32 as *mut _).unwrap(),
-            4,
-            4,
-        );
-        let mut n_rows_u32 = rows as u32;
-        encoder.setBytes_length_atIndex(
-            NonNull::new(&mut n_rows_u32 as *mut u32 as *mut _).unwrap(),
-            4,
-            5,
-        );
-        let mut batch_u32 = batch_size as u32;
-        encoder.setBytes_length_atIndex(
-            NonNull::new(&mut batch_u32 as *mut u32 as *mut _).unwrap(),
-            4,
-            6,
-        );
-    }
-    let n_tg = rows.div_ceil(rows_per_tg.max(1));
-    encoder.dispatchThreadgroups_threadsPerThreadgroup(
-        MTLSize {
-            width: n_tg,
-            height: 1,
-            depth: 1,
-        },
-        MTLSize {
-            width: 64,
-            height: 1,
-            depth: 1,
-        },
-    );
-    encoder.endEncoding();
-    cmd_buf.commit();
-    cmd_buf.waitUntilCompleted();
-
-    let out_ptr = out_buf.contents();
-    let out_slice =
-        unsafe { std::slice::from_raw_parts(out_ptr.as_ptr() as *const f32, out_elems) };
-    Ok(out_slice.to_vec())
-}
-
 /// ggml-metal `kernel_mul_mv_q5_K_f32` port: `N_R0=1` row per simdgroup,
 /// `NSG=2` simdgroups per TG (2 rows / 64 threads). Register-local
 /// `yl`/`yh` activation packs with Q5_K's 5th-bit `qh` plane — same
@@ -5068,160 +4667,6 @@ pub fn launch_q6_k_matvec(
         x,
         rows,
         row_bytes,
-    )
-}
-
-/// Multi-activation Q6_K matmul — same idea as
-/// [`Q4_K_MATMUL_BATCH_KERNEL_SRC`]: matvec dequant identity with an
-/// inner `NB=4` batch tile so weight blocks are reused across
-/// activations. Host grid is still `ceil(n_rows/4)` × 64 threads.
-pub const Q6_K_MATMUL_BATCH_KERNEL_SRC: &str = r#"
-#include <metal_stdlib>
-using namespace metal;
-
-kernel void q6_k_matmul_batch(
-    device const uchar* weights [[buffer(0)]],
-    device const float* x [[buffer(1)]],
-    device float* out [[buffer(2)]],
-    constant uint& row_bytes [[buffer(3)]],
-    constant uint& n_blocks_per_row [[buffer(4)]],
-    constant uint& n_rows [[buffer(5)]],
-    constant uint& batch_size [[buffer(6)]],
-    uint tgpig [[threadgroup_position_in_grid]],
-    uint tid_tg [[thread_position_in_threadgroup]]
-) {
-    constexpr short NSG = 2;
-    constexpr short nr0 = 2;
-    constexpr short NW = 32;
-    constexpr short NB = 4;
-    constexpr uint8_t kmask1 = 0x03;
-    constexpr uint8_t kmask2 = 0x0C;
-    constexpr uint8_t kmask3 = 0x30;
-    constexpr uint8_t kmask4 = 0xC0;
-
-    const ushort tiisg = tid_tg % NW;
-    const ushort sgitg = tid_tg / NW;
-
-    const int first_row = int(tgpig * NSG + sgitg) * nr0;
-    const int nb = int(n_blocks_per_row);
-    const int cols = nb * 256;
-
-    const short tid = tiisg / 2;
-    const short ix = tiisg % 2;
-    const short ip = tid / 8;
-    const short il = tid % 8;
-    const short l0 = 4 * il;
-    const short is = 8 * ip + l0 / 16;
-
-    const short y_offset = 128 * ip + l0;
-    const short q_offset_l = 64 * ip + l0;
-    const short q_offset_h = 32 * ip + l0;
-
-    float yl[16];
-
-    for (int bt = 0; bt < int(batch_size); bt += NB) {
-        float sumf[2][4];
-        for (short r = 0; r < nr0; ++r) {
-            for (short b = 0; b < NB; ++b) {
-                sumf[r][b] = 0.0f;
-            }
-        }
-
-        for (int i = ix; i < nb; i += 2) {
-            device const uchar* block0 =
-                weights + (size_t)first_row * row_bytes + (size_t)i * 210u;
-
-            for (short row = 0; row < nr0; ++row) {
-                device const uchar* brow = block0 + (size_t)row * row_bytes;
-                device const uchar* q1 = brow + q_offset_l;
-                device const uchar* q2 = q1 + 32;
-                device const uchar* qh = brow + 128 + q_offset_h;
-                device const char* sc = (device const char*)(brow + 192 + is);
-                device const half* dh = (device const half*)(brow + 208);
-
-                uchar q1r[4];
-                uchar q2r[4];
-                uchar qhr[4];
-                char scr[4];
-                for (short l = 0; l < 4; ++l) {
-                    q1r[l] = q1[l];
-                    q2r[l] = q2[l];
-                    qhr[l] = qh[l];
-                }
-                scr[0] = sc[0];
-                scr[1] = sc[2];
-                scr[2] = sc[4];
-                scr[3] = sc[6];
-                const float dscale = float(dh[0]);
-
-                for (short b = 0; b < NB; ++b) {
-                    const int batch_idx = bt + b;
-                    if (batch_idx >= int(batch_size)) {
-                        break;
-                    }
-                    device const float* y =
-                        x + (size_t)batch_idx * cols + i * 256 + y_offset;
-
-                    for (short l = 0; l < 4; ++l) {
-                        yl[4 * l + 0] = y[l + 0];
-                        yl[4 * l + 1] = y[l + 32];
-                        yl[4 * l + 2] = y[l + 64];
-                        yl[4 * l + 3] = y[l + 96];
-                    }
-
-                    float4 sums = float4(0.0f);
-                    for (short l = 0; l < 4; ++l) {
-                        sums[0] += yl[4 * l + 0]
-                            * float(int((q1r[l] & 0xF) | ((qhr[l] & kmask1) << 4)) - 32);
-                        sums[1] += yl[4 * l + 1]
-                            * float(int((q2r[l] & 0xF) | ((qhr[l] & kmask2) << 2)) - 32);
-                        sums[2] += yl[4 * l + 2]
-                            * float(int((q1r[l] >> 4) | ((qhr[l] & kmask3) << 0)) - 32);
-                        sums[3] += yl[4 * l + 3]
-                            * float(int((q2r[l] >> 4) | ((qhr[l] & kmask4) >> 2)) - 32);
-                    }
-
-                    sumf[row][b] += dscale
-                        * (sums[0] * float(scr[0]) + sums[1] * float(scr[1])
-                            + sums[2] * float(scr[2]) + sums[3] * float(scr[3]));
-                }
-            }
-        }
-
-        for (int row = 0; row < nr0; ++row) {
-            for (short b = 0; b < NB; ++b) {
-                const int batch_idx = bt + b;
-                float sum_all = simd_sum(sumf[row][b]);
-                if (tiisg == 0 && first_row + row < int(n_rows)
-                    && batch_idx < int(batch_size)) {
-                    out[(size_t)batch_idx * n_rows + first_row + row] = sum_all;
-                }
-            }
-        }
-    }
-}
-"#;
-
-/// Launches the Q6_K multi-activation matmul. `x_batch` is `[batch, cols]`;
-/// returns `[batch, rows]`.
-pub fn launch_q6_k_matmul_batch(
-    weights: &[u8],
-    x_batch: &[f32],
-    rows: usize,
-    row_bytes: usize,
-    batch_size: usize,
-) -> Result<Vec<f32>, MetalError> {
-    launch_matmul_batch(
-        Q6_K_MATMUL_BATCH_KERNEL_SRC,
-        "q6_k_matmul_batch",
-        210,
-        256,
-        4,
-        weights,
-        x_batch,
-        rows,
-        row_bytes,
-        batch_size,
     )
 }
 
@@ -5651,10 +5096,7 @@ static MMAP_FILE_CACHE: Mutex<Option<MmapFileCache>> = Mutex::new(None);
 /// copying. Safe to call multiple times for the same `Arc` (idempotent).
 /// Call from the loader when taking [`WeightBytes::Mapped`] views.
 pub fn register_weight_mmap(mmap: Arc<memmap2::Mmap>) {
-    let force_copy = std::env::var("FERROX_METAL_WEIGHT_COPY")
-        .map(|v| v != "0")
-        .unwrap_or(false);
-    if force_copy || mmap.is_empty() {
+    if mmap.is_empty() {
         return;
     }
     let key = mmap.as_ptr() as usize;
@@ -5719,16 +5161,12 @@ fn find_registered_mmap(weights: &[u8]) -> Option<(Arc<ResidentMmapFile>, usize)
 /// Prefer zero-copy: if the slice lives inside a mmap registered via
 /// [`register_weight_mmap`], alias that file's MTLBuffer at the tensor
 /// byte offset (no `to_vec` double). Owned / unregistered slices fall
-/// back to a Shared copy. Set `FERROX_METAL_WEIGHT_COPY=1` to force copy.
+/// back to a Shared copy.
 fn build_resident_weight_buffer(
     device: &Retained<ProtocolObject<dyn MTLDevice>>,
     weights: &[u8],
 ) -> Result<ResidentWeightBuffer, MetalError> {
-    let force_copy = std::env::var("FERROX_METAL_WEIGHT_COPY")
-        .map(|v| v != "0")
-        .unwrap_or(false);
-
-    if !force_copy && !weights.is_empty() {
+    if !weights.is_empty() {
         if let Some((file, offset)) = find_registered_mmap(weights) {
             return Ok(ResidentWeightBuffer {
                 buffer: file.buffer.clone(),
@@ -6311,42 +5749,6 @@ fn encode_moe_down_id(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
-fn encode_q4_0_moe_matvec_id(
-    encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
-    device: &Retained<ProtocolObject<dyn MTLDevice>>,
-    w: &ResidentWeightBuffer,
-    x_buf: &ProtocolObject<dyn MTLBuffer>,
-    out: &ProtocolObject<dyn MTLBuffer>,
-    ids: &ProtocolObject<dyn MTLBuffer>,
-    row_bytes: u32,
-    n_blocks: u32,
-    n_rows: u32,
-    top_k: u32,
-    expert_stride: u32,
-    n_tokens: u32,
-    x_stride: u32,
-    n_slots: usize,
-) -> Result<(), MetalError> {
-    encode_moe_matvec_id(
-        encoder,
-        device,
-        "Q4_0",
-        w,
-        x_buf,
-        out,
-        ids,
-        row_bytes,
-        n_blocks,
-        n_rows,
-        top_k,
-        expert_stride,
-        n_tokens,
-        x_stride,
-        n_slots,
-    )
-}
-
 /// Prefill map0: per-expert token/slot lists (llama `kernel_mul_mm_id_map0`).
 fn moe_mm_id_map0(
     ids: &[i32],
@@ -6646,184 +6048,10 @@ pub(crate) fn encode_q4_0_moe_gate_up_id(
     Ok(())
 }
 
-/// Decode FFN: `gate = matvec_id(gate)`; barrier; `act = silu(gate)*matvec_id(up)`.
-/// Drops a separate `silu_mul` dispatch vs Concurrent gate∥up + silu.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn encode_q4_0_moe_gate_then_up_silu(
-    encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
-    device: &Retained<ProtocolObject<dyn MTLDevice>>,
-    x_buf: &ProtocolObject<dyn MTLBuffer>,
-    packed: &MoePackedQ4<'_>,
-    ids: &ProtocolObject<dyn MTLBuffer>,
-    gate_buf: &ProtocolObject<dyn MTLBuffer>,
-    act_buf: &ProtocolObject<dyn MTLBuffer>,
-    top_k: u32,
-    n_tokens: u32,
-) -> Result<(), MetalError> {
-    assert_eq!(packed.gate_stride, packed.up_stride);
-    assert!(n_tokens >= 1 && top_k >= 1);
-    let bound = moe_packed_resident(device, packed)?;
-    let input_blocks = packed.gate_row_bytes / 18;
-    let x_stride = (input_blocks * 32) as u32;
-    let n_slots = (n_tokens as usize) * (top_k as usize);
-    encode_q4_0_moe_matvec_id(
-        encoder,
-        device,
-        &bound.gate,
-        x_buf,
-        gate_buf,
-        ids,
-        packed.gate_row_bytes as u32,
-        input_blocks as u32,
-        packed.ffn_rows as u32,
-        top_k,
-        packed.gate_stride as u32,
-        n_tokens,
-        x_stride,
-        n_slots,
-    )?;
-    memory_barrier_resources(encoder, &[gate_buf]);
-    let pipe = ensure_pipeline(device, Q4_0_MOE_TOPK_KERNEL_SRC, "q4_0_moe_matvec_id_silu")?;
-    encoder.setComputePipelineState(&pipe.0);
-    const ROWS_PER_TG: usize = 8;
-    unsafe {
-        encoder.setBuffer_offset_atIndex(Some(&bound.up.buffer), bound.up.weight_offset, 0);
-        encoder.setBuffer_offset_atIndex(Some(x_buf), 0, 1);
-        encoder.setBuffer_offset_atIndex(Some(act_buf), 0, 2);
-        encoder.setBuffer_offset_atIndex(Some(ids), 0, 3);
-        let mut rb = packed.gate_row_bytes as u32;
-        encoder.setBytes_length_atIndex(NonNull::new(&mut rb as *mut u32 as *mut _).unwrap(), 4, 4);
-        let mut blocks = input_blocks as u32;
-        encoder.setBytes_length_atIndex(
-            NonNull::new(&mut blocks as *mut u32 as *mut _).unwrap(),
-            4,
-            5,
-        );
-        let mut rows = packed.ffn_rows as u32;
-        encoder.setBytes_length_atIndex(
-            NonNull::new(&mut rows as *mut u32 as *mut _).unwrap(),
-            4,
-            6,
-        );
-        let mut tk = top_k;
-        encoder.setBytes_length_atIndex(NonNull::new(&mut tk as *mut u32 as *mut _).unwrap(), 4, 7);
-        let mut stride = packed.up_stride as u32;
-        encoder.setBytes_length_atIndex(
-            NonNull::new(&mut stride as *mut u32 as *mut _).unwrap(),
-            4,
-            8,
-        );
-        let mut nt = n_tokens;
-        encoder.setBytes_length_atIndex(NonNull::new(&mut nt as *mut u32 as *mut _).unwrap(), 4, 9);
-        let mut xs = x_stride;
-        encoder.setBytes_length_atIndex(
-            NonNull::new(&mut xs as *mut u32 as *mut _).unwrap(),
-            4,
-            10,
-        );
-        encoder.setBuffer_offset_atIndex(Some(gate_buf), 0, 11);
-    }
-    encoder.dispatchThreadgroups_threadsPerThreadgroup(
-        MTLSize {
-            width: packed.ffn_rows.div_ceil(ROWS_PER_TG),
-            height: 1,
-            depth: n_slots,
-        },
-        MTLSize {
-            width: 32,
-            height: 2,
-            depth: 1,
-        },
-    );
-    Ok(())
-}
-
-/// One dispatch: `act = silu(gate_id(x)) * up_id(x)` (reads x once).
-/// Shortens the MoE critical path vs Concurrent gate∥up + silu (+barrier).
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn encode_q4_0_moe_gate_up_silu_fused(
-    encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
-    device: &Retained<ProtocolObject<dyn MTLDevice>>,
-    x_buf: &ProtocolObject<dyn MTLBuffer>,
-    packed: &MoePackedQ4<'_>,
-    ids: &ProtocolObject<dyn MTLBuffer>,
-    act_buf: &ProtocolObject<dyn MTLBuffer>,
-    top_k: u32,
-    n_tokens: u32,
-) -> Result<(), MetalError> {
-    assert_eq!(packed.gate_stride, packed.up_stride);
-    assert!(n_tokens >= 1 && top_k >= 1);
-    let bound = moe_packed_resident(device, packed)?;
-    let input_blocks = packed.gate_row_bytes / 18;
-    let x_stride = (input_blocks * 32) as u32;
-    let n_slots = (n_tokens as usize) * (top_k as usize);
-    let pipe = ensure_pipeline(device, Q4_0_MOE_TOPK_KERNEL_SRC, "q4_0_moe_gate_up_id")?;
-    encoder.setComputePipelineState(&pipe.0);
-    const ROWS_PER_TG: usize = 8;
-    let row_groups = packed.ffn_rows.div_ceil(ROWS_PER_TG);
-    unsafe {
-        encoder.setBuffer_offset_atIndex(Some(&bound.gate.buffer), bound.gate.weight_offset, 0);
-        encoder.setBuffer_offset_atIndex(Some(&bound.up.buffer), bound.up.weight_offset, 1);
-        encoder.setBuffer_offset_atIndex(Some(x_buf), 0, 2);
-        encoder.setBuffer_offset_atIndex(Some(act_buf), 0, 3);
-        encoder.setBuffer_offset_atIndex(Some(ids), 0, 4);
-        let mut rb = packed.gate_row_bytes as u32;
-        encoder.setBytes_length_atIndex(NonNull::new(&mut rb as *mut u32 as *mut _).unwrap(), 4, 5);
-        let mut blocks = input_blocks as u32;
-        encoder.setBytes_length_atIndex(
-            NonNull::new(&mut blocks as *mut u32 as *mut _).unwrap(),
-            4,
-            6,
-        );
-        let mut ffn = packed.ffn_rows as u32;
-        encoder.setBytes_length_atIndex(
-            NonNull::new(&mut ffn as *mut u32 as *mut _).unwrap(),
-            4,
-            7,
-        );
-        let mut tk = top_k;
-        encoder.setBytes_length_atIndex(NonNull::new(&mut tk as *mut u32 as *mut _).unwrap(), 4, 8);
-        let mut stride = packed.gate_stride as u32;
-        encoder.setBytes_length_atIndex(
-            NonNull::new(&mut stride as *mut u32 as *mut _).unwrap(),
-            4,
-            9,
-        );
-        let mut nt = n_tokens;
-        encoder.setBytes_length_atIndex(
-            NonNull::new(&mut nt as *mut u32 as *mut _).unwrap(),
-            4,
-            10,
-        );
-        let mut xs = x_stride;
-        encoder.setBytes_length_atIndex(
-            NonNull::new(&mut xs as *mut u32 as *mut _).unwrap(),
-            4,
-            11,
-        );
-    }
-    encoder.dispatchThreadgroups_threadsPerThreadgroup(
-        MTLSize {
-            width: n_slots * row_groups,
-            height: 1,
-            depth: 1,
-        },
-        MTLSize {
-            width: 32,
-            height: 2,
-            depth: 1,
-        },
-    );
-    Ok(())
-}
-
 /// Encode packed-id Q4_0 MoE: optional gate∥up → silu_mul → down_id → sum.
 ///
 /// Set `gate_up_done=true` when [`encode_q4_0_moe_gate_up_id`] already ran
 /// in a prior Concurrent encoder window (MoE stack on Host B).
-/// Set `act_done=true` when [`encode_q4_0_moe_gate_up_silu_fused`] already
-/// wrote `act` (skips gate/up/silu).
-///
 /// `n_tokens=1` is decode; prefill passes `T`.
 /// When `residual_into_out` and `n_tokens==1`, the final sum does
 /// `out += weighted` (decode residual fuse); otherwise `out = weighted`.
@@ -6845,49 +6073,6 @@ pub(crate) fn encode_q4_0_moe_id(
     residual_into_out: bool,
     gate_up_done: bool,
 ) -> Result<(), MetalError> {
-    encode_q4_0_moe_id_ex(
-        encoder,
-        device,
-        x_buf,
-        packed,
-        ids,
-        route,
-        gate_buf,
-        up_buf,
-        act_buf,
-        expert_out_buf,
-        out_buf,
-        top_k,
-        n_tokens,
-        residual_into_out,
-        gate_up_done,
-        false,
-        false,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn encode_q4_0_moe_id_ex(
-    encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
-    device: &Retained<ProtocolObject<dyn MTLDevice>>,
-    x_buf: &ProtocolObject<dyn MTLBuffer>,
-    packed: &MoePackedQ4<'_>,
-    ids: &ProtocolObject<dyn MTLBuffer>,
-    route: &ProtocolObject<dyn MTLBuffer>,
-    gate_buf: &ProtocolObject<dyn MTLBuffer>,
-    up_buf: &ProtocolObject<dyn MTLBuffer>,
-    act_buf: &ProtocolObject<dyn MTLBuffer>,
-    expert_out_buf: &ProtocolObject<dyn MTLBuffer>,
-    out_buf: &ProtocolObject<dyn MTLBuffer>,
-    top_k: u32,
-    n_tokens: u32,
-    residual_into_out: bool,
-    gate_up_done: bool,
-    act_done: bool,
-    // When true, caller already wrote `expert_out` via grouped `mul_mm_id`
-    // on down (prefill path); skip the per-slot `q4_0_moe_down_id` matvec.
-    down_done: bool,
-) -> Result<(), MetalError> {
     assert_eq!(packed.gate_stride, packed.up_stride);
     assert!(n_tokens >= 1);
     assert!(top_k >= 1);
@@ -6895,47 +6080,43 @@ pub(crate) fn encode_q4_0_moe_id_ex(
     let down_w = &bound.down;
     let n_slots = (n_tokens as usize) * (top_k as usize);
 
-    if !act_done {
-        if !gate_up_done {
-            encode_q4_0_moe_gate_up_id(
-                encoder, device, x_buf, packed, ids, gate_buf, up_buf, top_k, n_tokens,
-            )?;
-            memory_barrier_resources(encoder, &[gate_buf, up_buf]);
-        }
-        crate::elem::encode_silu_mul(
-            encoder,
-            device,
-            gate_buf,
-            up_buf,
-            act_buf,
-            (n_slots * packed.ffn_rows) as u32,
+    if !gate_up_done {
+        encode_q4_0_moe_gate_up_id(
+            encoder, device, x_buf, packed, ids, gate_buf, up_buf, top_k, n_tokens,
         )?;
-        memory_barrier_resources(encoder, &[act_buf]);
+        memory_barrier_resources(encoder, &[gate_buf, up_buf]);
     }
+    crate::elem::encode_silu_mul(
+        encoder,
+        device,
+        gate_buf,
+        up_buf,
+        act_buf,
+        (n_slots * packed.ffn_rows) as u32,
+    )?;
+    memory_barrier_resources(encoder, &[act_buf]);
 
     let weighted_sum = ensure_pipeline(device, Q4_0_MOE_TOPK_KERNEL_SRC, "moe_weighted_sum")?;
 
-    if !down_done {
-        let down_blocks = moe_row_blocks(packed.down_row_bytes, packed.down_kind)?;
-        encode_moe_down_id(
-            encoder,
-            device,
-            packed.down_kind,
-            down_w,
-            act_buf,
-            expert_out_buf,
-            ids,
-            packed.down_row_bytes as u32,
-            down_blocks,
-            packed.hidden_rows as u32,
-            packed.ffn_rows as u32,
-            top_k,
-            packed.down_stride as u32,
-            n_tokens,
-            n_slots,
-        )?;
-        memory_barrier_resources(encoder, &[expert_out_buf]);
-    } // !down_done
+    let down_blocks = moe_row_blocks(packed.down_row_bytes, packed.down_kind)?;
+    encode_moe_down_id(
+        encoder,
+        device,
+        packed.down_kind,
+        down_w,
+        act_buf,
+        expert_out_buf,
+        ids,
+        packed.down_row_bytes as u32,
+        down_blocks,
+        packed.hidden_rows as u32,
+        packed.ffn_rows as u32,
+        top_k,
+        packed.down_stride as u32,
+        n_tokens,
+        n_slots,
+    )?;
+    memory_barrier_resources(encoder, &[expert_out_buf]);
 
     const SUM_TG: usize = 256;
     if residual_into_out && n_tokens == 1 {
@@ -7847,9 +7028,9 @@ pub(crate) fn encode_matvec_with_offsets(
 /// multi-`x`: `x_batch` is layout `[batch, cols]`, returned `y` is
 /// `[batch, rows]`.
 ///
-/// For Q4_K / Q6_K with `batch_size >= 2`, prefer
-/// [`launch_q4_k_matmul_batch`] / [`launch_q6_k_matmul_batch`] (real
-/// multi-x kernel with weight reuse). This path encodes N matvecs.
+/// For a kind with a simdgroup `mul_mm` kernel, prefer that at
+/// `batch_size >= 4` (real multi-x kernel with weight reuse). This path
+/// encodes N matvecs.
 pub fn launch_matvec_batch(
     launch: &MatvecLaunch<'_>,
     x_batch: &[f32],
@@ -8788,73 +7969,6 @@ mod tests {
                 (a - b).abs() < 1e-2,
                 "elem {i}: batch={a} sequential={b} (diff too large)"
             );
-        }
-    }
-
-    #[test]
-    #[ignore = "needs a real Metal-capable GPU; run manually with --ignored on Apple Silicon"]
-    fn launch_q4_k_matmul_batch_matches_sequential_apply() {
-        // Multi-x Q4_K matmul vs N sequential matvecs (parity).
-        let rows = 5;
-        let cols = 512;
-        let batch_size = 6; // exercises NB=4 tile + partial last tile
-        let row_bytes = (cols / 256) * ferrox_quant::Q4_K_BLOCK_BYTES;
-        let (weights, _x0, _) = real_k_quant_test_matrix(
-            rows,
-            cols,
-            ferrox_quant::Q4_K_BLOCK_BYTES,
-            ferrox_quant::dot_q4_k_f32_scalar,
-        );
-
-        let mut x_batch = Vec::with_capacity(batch_size * cols);
-        let mut expected = Vec::with_capacity(batch_size * rows);
-        for b in 0..batch_size {
-            let x: Vec<f32> = (0..cols)
-                .map(|i| ((i + b * 19) as f32 * 0.023).sin())
-                .collect();
-            let y = launch_q4_k_matvec(&weights, &x, rows, row_bytes).expect("matvec");
-            expected.extend_from_slice(&y);
-            x_batch.extend_from_slice(&x);
-        }
-
-        let got = launch_q4_k_matmul_batch(&weights, &x_batch, rows, row_bytes, batch_size)
-            .expect("matmul batch");
-        assert_eq!(got.len(), expected.len());
-        for (i, (a, b)) in got.iter().zip(expected.iter()).enumerate() {
-            assert_close_relative(*a, *b, i);
-        }
-    }
-
-    #[test]
-    #[ignore = "needs a real Metal-capable GPU; run manually with --ignored on Apple Silicon"]
-    fn launch_q6_k_matmul_batch_matches_sequential_apply() {
-        let rows = 5;
-        let cols = 512;
-        let batch_size = 6;
-        let row_bytes = (cols / 256) * ferrox_quant::Q6_K_BLOCK_BYTES;
-        let (weights, _x0, _) = real_k_quant_test_matrix(
-            rows,
-            cols,
-            ferrox_quant::Q6_K_BLOCK_BYTES,
-            ferrox_quant::dot_q6_k_f32_scalar,
-        );
-
-        let mut x_batch = Vec::with_capacity(batch_size * cols);
-        let mut expected = Vec::with_capacity(batch_size * rows);
-        for b in 0..batch_size {
-            let x: Vec<f32> = (0..cols)
-                .map(|i| ((i + b * 23) as f32 * 0.027).sin())
-                .collect();
-            let y = launch_q6_k_matvec(&weights, &x, rows, row_bytes).expect("matvec");
-            expected.extend_from_slice(&y);
-            x_batch.extend_from_slice(&x);
-        }
-
-        let got = launch_q6_k_matmul_batch(&weights, &x_batch, rows, row_bytes, batch_size)
-            .expect("matmul batch");
-        assert_eq!(got.len(), expected.len());
-        for (i, (a, b)) in got.iter().zip(expected.iter()).enumerate() {
-            assert_close_relative(*a, *b, i);
         }
     }
 

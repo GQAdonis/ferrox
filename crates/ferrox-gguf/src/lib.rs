@@ -612,10 +612,10 @@ mod tests {
     /// `kimi_gguf_loader`'s tensor-name assumptions against a real
     /// downloaded `unsloth/Kimi-K3-GGUF` payload shard.
     #[test]
-    #[ignore = "prints real tensor names from a real GGUF file at FERROX_INSPECT_PATH; not a correctness assertion"]
+    #[ignore = "prints real tensor names from a real GGUF file at FERROX_TEST_INSPECT_PATH; not a correctness assertion"]
     fn dump_real_gguf_tensor_table() {
-        let path = std::env::var("FERROX_INSPECT_PATH")
-            .expect("set FERROX_INSPECT_PATH to a real .gguf file path");
+        let path = std::env::var("FERROX_TEST_INSPECT_PATH")
+            .expect("set FERROX_TEST_INSPECT_PATH to a real .gguf file path");
         let file = GgufFile::open(&path).expect("real file must parse");
         println!(
             "architecture: {:?}",

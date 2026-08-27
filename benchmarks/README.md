@@ -192,11 +192,8 @@ Never quote a ratio that has no matching file under
 |---|---|
 | `FERROX_METAL` | `1` (Metal), `0` for CPU runs |
 | `FERROX_METAL_ATTN` | `1` |
-| `FERROX_METAL_LOGITS` | unset (host lm_head, `1` = slower vocab-in-stack) |
-| `FERROX_METAL_GREEDY_GPU` | default **on** for `temperature<=0`, `0` = host lm_head |
 | `FERROX_METAL_FA_VEC` | default **on** for `head_dim` in {64,96,128,256}, `0` = legacy GQA |
-| `FERROX_METAL_MUL_MM` | default **on** for prefill batch ≥ 4, `0` = N× matvec |
-| `FERROX_METAL_WEIGHT_COPY` | unset (`BytesNoCopy`), `1` forces copy upload |
+| `FERROX_CTK` | `f16` unless the row says otherwise |
 | `FERROX_CPU_INT_DOT` | **on by default** in both binaries, `0` opts out |
 | `FERROX_CPU_THREADS` | unset = performance cores (6 on Host B) |
 | `FERROX_CUDA_GQA` / `FERROX_CUDA_GRAPH` | CUDA path (not Host B) |

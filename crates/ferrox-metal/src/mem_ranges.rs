@@ -21,8 +21,7 @@
 //! matvecs does not stall the next activation-only dispatch — measured
 //! ~2× GPU-idle on OLMoE when every conflict used scope-Buffers.
 //!
-//! Set `FERROX_METAL_BARRIER_LOG=1` (or the older
-//! `FERROX_METAL_MOE_BARRIER_LOG=1`) to log the running barriers-per-op
+//! Set `FERROX_METAL_BARRIER_LOG=1` to log the running barriers-per-op
 //! ratio, which is the direct measure of how much a graph change bought:
 //! 1.00 means the pass is fully serialised, lower means dispatches are
 //! overlapping.
@@ -39,10 +38,7 @@ static BEGIN_OP_COUNT: AtomicU64 = AtomicU64::new(0);
 /// True when barrier logging is requested (cached; read once).
 fn barrier_log_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        std::env::var_os("FERROX_METAL_BARRIER_LOG").is_some()
-            || std::env::var_os("FERROX_METAL_MOE_BARRIER_LOG").is_some()
-    })
+    *ON.get_or_init(|| std::env::var_os("FERROX_METAL_BARRIER_LOG").is_some())
 }
 
 /// Snapshot `(barriers, begin_ops)` since last reset (test / debug).

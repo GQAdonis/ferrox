@@ -91,6 +91,4 @@ pub use tokenizer::{
 };
 
 #[cfg(feature = "metal")]
-pub use ferrox_metal::attn::{
-    metal_greedy_argmax_active, metal_greedy_gpu_enabled, set_metal_greedy_argmax,
-};
+pub use ferrox_metal::attn::{metal_greedy_argmax_active, set_metal_greedy_argmax};

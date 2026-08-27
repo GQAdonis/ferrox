@@ -4,7 +4,7 @@
 //! Requires:
 //! - `cargo test -p ferrox-models --features metal --test smollm2_metal_paris -- --ignored`
 //! - Apple Silicon + Metal
-//! - `models/hf_test/SmolLM2-135M-Instruct-Q8_0.gguf` (or `FERROX_SMOLLM2_GGUF`)
+//! - `models/hf_test/SmolLM2-135M-Instruct-Q8_0.gguf` (or `FERROX_TEST_SMOLLM2_GGUF`)
 //!
 //! Mirrors the llama.cpp parity check documented in `ferrox-moe` (Paris vs
 //! wrong continuation when MoE/Metal routing regresses).
@@ -23,7 +23,7 @@ const PROMPT: &str = "The capital of France is";
 const MAX_NEW_TOKENS: usize = 16;
 
 fn smollm2_gguf_path() -> PathBuf {
-    if let Ok(p) = std::env::var("FERROX_SMOLLM2_GGUF") {
+    if let Ok(p) = std::env::var("FERROX_TEST_SMOLLM2_GGUF") {
         return PathBuf::from(p);
     }
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -40,7 +40,7 @@ fn argmax(logits: &[f32]) -> usize {
 }
 
 #[test]
-#[ignore = "needs Apple Metal GPU + models/hf_test/SmolLM2-135M-Instruct-Q8_0.gguf (or FERROX_SMOLLM2_GGUF)"]
+#[ignore = "needs Apple Metal GPU + models/hf_test/SmolLM2-135M-Instruct-Q8_0.gguf (or FERROX_TEST_SMOLLM2_GGUF)"]
 fn smollm2_metal_greedy_paris_regression() {
     let path = smollm2_gguf_path();
     if !path.exists() {

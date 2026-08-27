@@ -78,12 +78,11 @@ prompt and same seed: CPU paged and CPU contiguous both answer
 a> is". Nothing in the response says the attention read the wrong pages,
 which is why the server stops rather than serving it.
 
-The check reads `FERROX_METAL` and `FERROX_CUDA` for the exact value
-`1`, so it fires for `-dev metal`, `-dev cuda`, and either variable set
-by hand. It does **not** fire for `-ngl 99` on its own, which resolves
-to `auto` and still picks up a Metal device if one is present. Start the
-server with `-dev none -ngl 0` when you want paged KV, and do not rely
-on the startup check to catch the auto case for you.
+The check resolves the device rather than matching a string. It fires
+for `-dev metal`, `-dev cuda`, either variable set to `1` by hand, and
+for `-ngl 99` on its own, which leaves the device on `auto` and still
+picks up a Metal device when one is present. `auto` on a host with no
+GPU is a CPU run, so paged KV stays available there.
 
 ### Sharing pages between prompts
 

@@ -17,12 +17,10 @@ CI also builds that CLI/server chain and, on `macos-latest`, compiles
 `cargo clippy -p ferrox-metal -p ferrox-cli --features metal`. Hardware
 kernel tests stay `#[ignore]`d on hosted CI.
 
-CI does **not** build `ferrox-cli --features serve`, which is what the
-release tarball ships, so check it yourself when you touch either crate:
-
-```
-cargo build -p ferrox-cli --features serve
-```
+CI builds `ferrox-cli --features serve` too, which is what the release
+tarball ships: `serve` on Linux and `serve metal` on macOS. That gate
+was added after noticing a break confined to `serve` could reach users
+through the install script with CI green.
 
 The `ui/` job runs `npm run licenses`, `typecheck`, `lint` and `build`.
 It does not run `npm test`, so run `npm run check` in `ui/` before a PR

@@ -41,10 +41,10 @@ Set `FERROX_API_KEY` and every route except `GET /health` needs
 `Authorization: Bearer <key>`. `/metrics` and `/cache/stats` are in that
 set, so a Prometheus scraper needs the header too.
 
-Only the `Authorization` header is read. `x-api-key`, which the
-Anthropic SDK sends by default, is **not** accepted: a stock Anthropic
-client pointed at a keyed server gets a 401 until you set the bearer
-header yourself.
+Both spellings are read: `Authorization: Bearer <key>` and
+`x-api-key: <key>`, which is what the Anthropic SDKs send. A stock
+Anthropic client works against a keyed server without setting a header
+by hand. If a request carries both, `Authorization` wins.
 
 Request bodies are capped at axum's 2 MiB default. A long `/v1/messages`
 conversation or a large `/v1/embeddings` batch past that comes back

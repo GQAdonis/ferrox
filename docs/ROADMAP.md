@@ -152,6 +152,3 @@ CUDA-side parity would actually cost:
 - Something equivalent to `test-backend-ops`: every kernel checked
   against a CPU reference across shapes and quant kinds, so no backend
   gets merged on the strength of running fast alone.
-- Build `ferrox-cli --features serve` in CI. The `cuda` and `metal`
-  feature chains are covered there and `serve` is not, so the feature
-  the release tarball ships with is the one nothing checks.

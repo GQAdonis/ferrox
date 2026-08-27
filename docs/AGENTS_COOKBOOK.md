@@ -20,10 +20,10 @@ cargo build -p ferrox-cli --release --features "serve metal"
 | codex | Responses provider → `POST /v1/responses` |
 | curl | `POST /v1/chat/completions` (see [CLI.md](CLI.md)) |
 
-If `FERROX_API_KEY` is set, send `Authorization: Bearer …`. That header
-is the only one checked, so an Anthropic SDK sending its usual
-`x-api-key` gets a 401 against a keyed server. Set the bearer header
-yourself, or leave the key unset on a loopback bind.
+If `FERROX_API_KEY` is set, send `Authorization: Bearer …` or
+`x-api-key: …`. Both are accepted, so an Anthropic SDK works unchanged
+against a keyed server. Leave the key unset on a loopback bind if you
+would rather not send one at all.
 
 Tool calls come back parsed in eleven wire formats rather than only the
 one the prompt asks for, and five of those stream their arguments as

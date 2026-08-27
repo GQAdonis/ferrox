@@ -1,0 +1,85 @@
+refactor(edge): dissolve ferrox-edge into the crates that use it, delete what nothing will
+
+`ferrox-edge` was FreeToken's host-side policy meant to be INTEGRATED
+into ferrox. It became a separate crate of 28384 lines, roughly half
+wired. It is gone. The serving half is `ferrox-server::policy`; the MoE
+expert-residency half landed in `ferrox-core` in the previous commit.
+
+WHY MODULE-LEVEL REACHABILITY WAS THE WRONG TEST, since the measured
+"external references per module" numbers that motivated this were wrong
+in BOTH directions. They said `stats`, `maintenance`, `outbox`,
+`footprint` and `rebuild` had zero external callers. Every one of them
+is wired: the callers reach them through the crate's `pub use` facade,
+so a `ferrox_edge::module::` grep never sees them. And they said
+`window_pool` and `state_pool` were reachable, through `scheduler`
+functions that were themselves dead.
+
+WHAT ACTUALLY FINDS DEAD CODE is making it crate-INTERNAL and reading
+`dead_code`. A published crate's `pub` items are invisible to that lint,
+which is exactly how 5000+ lines sat here tested and uncalled. Moving
+the modules behind `pub(crate)` turned 155 warnings on, and they are the
+real inventory.
+
+DELETED, 8098 lines, none of it reachable and none of it serving an open
+roadmap item:
+
+  cache_manager 2001 + radix::swa 970 + radix::hybrid 626
+    + window_pool 397 + state_pool 807
+      One closed cluster: only `cache_manager` uses the others and
+      nothing uses it. It is a SECOND page allocator for a job
+      `ferrox_core::cache::KvBlockPool` already does on a wired, running
+      path -- `generate.rs` allocates, publishes and refcounts through
+      it today. Wiring this would mean replacing a working allocator,
+      not filling a gap, and it is the same "two systems that do not
+      know about each other" hazard this refactor exists to remove.
+  cache_report 495   a text renderer for a CacheGeometry nothing builds
+  supervisor 747     the lifecycle of an engine CHILD PROCESS; ferrox
+                     ships one binary and nothing implements ProcessHost
+  detokenize -294    the async detokenizer worker; ferrox detokenizes
+                     inline. The stop-string withhold rule and
+                     floor_char_boundary, both wired, stay
+  anchor -176        the recurrent-state half (PingPong, snapshot);
+                     its consumers went with the cluster above
+  pool -1076         the SWA/linear sizing and KV cost model, whose only
+                     callers were cache_manager and state_pool
+
+KEPT DESPITE HAVING NO CALLER, because each serves a named open item,
+and each now says so at its declaration in `policy/mod.rs`:
+`scheduler`'s admission and chunked prefill (`sched-time-debt`),
+`radix::evict` (`wire-radix-prefix-cache`), `pool::validate_rebuild` and
+`rebuild`/`maintenance`'s transitions (the /admin rebuild endpoint),
+`anchor::prefill_slide` (`window-slide-during-decode`).
+`grep -n "allow(dead_code)" crates/ferrox-server/src/policy/mod.rs` is
+meant to read as a to-do list, not as cover.
+
+`pool` split in two on its own seam: the byte-budget-to-slot-count
+arithmetic is `ferrox_core::expert_budget`, beside the expert cache
+whose slots it counts and named verbatim by `out-of-core-moe.md` as
+existing and unwired. The live re-split validation stayed here.
+`stats` split the same way: the two summary statistics both crates need
+are `ferrox_core::summary_stats`, the serving telemetry is
+`policy::serving_stats`. No module was appended to an existing large
+file; every survivor is its own file under `policy/`.
+
+TWO LIVE DEFECTS FOUND WHILE VERIFYING A DELETION, both recorded in
+`docs/plans/roadmap.md` under `c3-serving-and-kv` and NOT fixed here:
+`RadixCache::evict` has no caller, so nothing releases what
+`generate.rs:685` retains and the page pool shrinks monotonically until
+admission refuses; and `batch_scheduler` adopts from the tree but never
+publishes to it, so prefix sharing under continuous batching is
+adopt-only. Checked and CLEAN: the handover trap `cache_manager`
+documented does not exist in `generate::publish_to_radix`, which avoids
+both the leak and the read-after-free structurally.
+
+ATTRIBUTION. FreeToken is Apache-2.0 and the notice is a licence
+obligation, so `docs/THIRD_PARTY_NOTICES.md` now maps every surviving
+module to its FreeToken source at its NEW path, and keeps a table of
+what was ported and then deleted, with the reason. Dropping those rows
+silently would have been the dishonest option.
+
+Gated: build/test/clippy -D warnings/fmt on default, `--features metal`
+and `--features cuda`, plus `--release -p ferrox-cli --features
+"serve metal"` and `clippy --release`.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01M5Meu19B6yUK24hFe5R7BN

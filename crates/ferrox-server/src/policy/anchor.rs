@@ -40,7 +40,7 @@
 //! and a prefix that far back is cheaper to recompute than to hold.
 //!
 //! That bound is exactly what the `anchor_checkpoints` term in
-//! [`crate::pool::swa_tokens_per_request`] pays for. Without the drop
+//! [`crate::policy::pool::swa_tokens_per_request`] pays for. Without the drop
 //! rule the pool sizing would be a fiction.
 //!
 //! Ported 1:1 from FreeToken's `scheduler/scheduler.py` (anchor
@@ -49,8 +49,8 @@
 //! (`load_toolcall_anchor_id`) (Apache-2.0); see
 //! `docs/THIRD_PARTY_NOTICES.md`.
 
-use crate::pool::SWA_RETAIN_GAP;
-use crate::radix::align_down;
+use crate::policy::pool::SWA_RETAIN_GAP;
+use crate::policy::radix::align_down;
 
 /// Resolve a tool-call opener to the single token that announces it.
 ///
@@ -141,7 +141,7 @@ impl WindowPolicy {
         WindowPolicy {
             sliding_window,
             page_size,
-            eviction_interval: crate::pool::DEFAULT_SWA_EVICTION_INTERVAL,
+            eviction_interval: crate::policy::pool::DEFAULT_SWA_EVICTION_INTERVAL,
         }
     }
 
@@ -277,106 +277,10 @@ fn release_span(
     }
 }
 
-/// The two recurrent-state slots a request ping-pongs between.
-///
-/// One holds the state a snapshot is being taken into while the other
-/// stays readable, so a snapshot never races the live computation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PingPong {
-    pub slots: [u32; 2],
-    /// Which of the two the next snapshot goes into.
-    pub next: usize,
-}
-
-impl PingPong {
-    pub fn new(a: u32, b: u32) -> Self {
-        PingPong {
-            slots: [a, b],
-            next: 0,
-        }
-    }
-
-    pub fn idle_slot(&self) -> u32 {
-        self.slots[self.next % 2]
-    }
-
-    pub fn flipped(&self) -> PingPong {
-        PingPong {
-            slots: self.slots,
-            next: (self.next + 1) % 2,
-        }
-    }
-}
-
-/// What a recurrent model must do to keep the anchor's state.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct AnchorSnapshot {
-    /// The request's live recurrent slot, to copy from.
-    pub from_slot: u32,
-    /// The idle ping-pong slot, to copy into.
-    pub into_slot: u32,
-    /// The sequence length the frozen state is valid at.
-    pub at_len: usize,
-    /// The ping-pong after the flip, for the caller to store back.
-    pub ping_pong: PingPong,
-}
-
-/// One request's recurrent state, as a snapshot decision sees it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct RecurrentState {
-    /// The slot holding the live state.
-    pub live_slot: u32,
-    pub ping_pong: PingPong,
-    /// The length of a snapshot already frozen and not yet handed to
-    /// the prefix cache. One at a time: the second would overwrite the
-    /// first's slot.
-    pub pending_snapshot: Option<usize>,
-    /// How much of this request's prompt the prefix cache holds.
-    pub cached_len: usize,
-}
-
-/// Whether to freeze the recurrent state at the anchor, and where.
-///
-/// Four conditions, and each rules out a real way of getting it wrong:
-///
-/// - **there is an anchor**, or there is nothing to freeze at;
-/// - **no snapshot is pending**, or this one would overwrite a frozen
-///   state that has not been handed over yet;
-/// - **the anchor is exactly the cached length**, so the frozen state
-///   corresponds to a prefix the cache can actually key on -- a
-///   snapshot at a position no node ends at is unreachable;
-/// - **the anchor is page-aligned**, because the prefix cache stores
-///   whole pages and a snapshot mid-page belongs to no node.
-///
-/// The copy itself is the caller's: this returns which slot to which,
-/// and the ping-pong to store back.
-pub fn snapshot_at_anchor(
-    anchor: Option<usize>,
-    state: &RecurrentState,
-    page_size: usize,
-) -> Option<AnchorSnapshot> {
-    let anchor_len = anchor?;
-    if state.pending_snapshot.is_some() {
-        return None;
-    }
-    if state.cached_len != anchor_len {
-        return None;
-    }
-    if anchor_len == 0 || align_down(anchor_len, page_size) != anchor_len {
-        return None;
-    }
-    Some(AnchorSnapshot {
-        from_slot: state.live_slot,
-        into_slot: state.ping_pong.idle_slot(),
-        at_len: anchor_len,
-        ping_pong: state.ping_pong.flipped(),
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::parser::ToolCallFormat;
+    use crate::policy::parser::ToolCallFormat;
 
     const WINDOW: usize = 512;
     const PAGE: usize = 64;
@@ -641,84 +545,5 @@ mod tests {
         assert_eq!(decision.free_to, 3520);
         assert!(!decision.drop_anchor);
         assert!(prefill_slide(&request(100), &policy).frees_nothing());
-    }
-
-    #[test]
-    fn a_snapshot_is_taken_into_the_idle_slot_and_flips_the_ping_pong() {
-        let state = RecurrentState {
-            live_slot: 7,
-            ping_pong: PingPong::new(11, 12),
-            pending_snapshot: None,
-            cached_len: 128,
-        };
-        let snapshot = snapshot_at_anchor(Some(128), &state, PAGE).expect("a snapshot is due");
-        assert_eq!(snapshot.from_slot, 7);
-        assert_eq!(snapshot.into_slot, 11);
-        assert_eq!(snapshot.at_len, 128);
-        assert_eq!(
-            snapshot.ping_pong.idle_slot(),
-            12,
-            "the next one alternates"
-        );
-    }
-
-    /// Each of the four gates rules out a real way of getting it wrong.
-    #[test]
-    fn a_snapshot_is_refused_when_it_would_be_unreachable_or_destructive() {
-        let base = RecurrentState {
-            live_slot: 7,
-            ping_pong: PingPong::new(11, 12),
-            pending_snapshot: None,
-            cached_len: 128,
-        };
-        assert!(snapshot_at_anchor(None, &base, PAGE).is_none(), "no anchor");
-        assert!(
-            snapshot_at_anchor(
-                Some(128),
-                &RecurrentState {
-                    pending_snapshot: Some(64),
-                    ..base
-                },
-                PAGE
-            )
-            .is_none(),
-            "a second snapshot would overwrite the first's slot"
-        );
-        assert!(
-            snapshot_at_anchor(
-                Some(200),
-                &RecurrentState {
-                    cached_len: 128,
-                    ..base
-                },
-                PAGE
-            )
-            .is_none(),
-            "a snapshot at a length no node ends at is unreachable"
-        );
-        assert!(
-            snapshot_at_anchor(
-                Some(100),
-                &RecurrentState {
-                    cached_len: 100,
-                    ..base
-                },
-                PAGE
-            )
-            .is_none(),
-            "mid-page belongs to no node"
-        );
-        assert!(
-            snapshot_at_anchor(
-                Some(0),
-                &RecurrentState {
-                    cached_len: 0,
-                    ..base
-                },
-                PAGE
-            )
-            .is_none(),
-            "the empty prefix has no state to freeze"
-        );
     }
 }

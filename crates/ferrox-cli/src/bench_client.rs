@@ -34,7 +34,7 @@
 //! Ported from FreeToken's `benchmark/client.py`; see
 //! `docs/THIRD_PARTY_NOTICES.md`.
 
-use ferrox_edge::stats::percentile;
+use ferrox_core::summary_stats::percentile;
 
 /// The sampling every benchmark request is pinned to.
 ///

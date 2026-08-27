@@ -70,7 +70,7 @@ Beyond closing the measured gaps.
 **Serving**
 
 - Tool calling: the OpenAI `tools` / `tool_choice` request and response
-  shape. *Eleven wire formats now parse* (`ferrox-edge::parser::tool_call`),
+  shape. *Eleven wire formats now parse* (`ferrox-server::policy::parser::tool_call`),
   every call in a response rather than the first, and a reasoning
   model's chain of thought comes back as `reasoning_content`. Five of
   the eleven stream `tool_calls[].index` argument deltas. What is left
@@ -92,10 +92,12 @@ Beyond closing the measured gaps.
 - Hybrid CPU/GPU expert placement for MoE, the main lever for running a
   larger model or a higher quant on unchanged hardware
 
-**Wiring `ferrox-edge`**
+**Wiring the ported serving policy**
 
-The ported FreeToken serving policy (`crates/ferrox-edge`, see
-[`FEATURES.md`](FEATURES.md)) is complete and tested. Roughly half of it
+The ported FreeToken serving policy (see [`FEATURES.md`](FEATURES.md))
+is complete and tested. It no longer lives in a crate of its own: the
+serving half is `ferrox-server::policy` and the MoE expert-residency
+half is in `ferrox-core` beside `expert_store`. Roughly half of it
 now drives something: the two output parsers, the withhold rule, the
 effort/thinking probe, the request ring, the batcher's status and pool
 accounting, the two maintenance endpoints, the DeepSeek-V4 KV tier
@@ -107,12 +109,12 @@ CPU-MoE bandwidth and writes the profile `qstar` reads, so a deployment
 no longer has to take the unbenchmarked one-fetch-per-step default
 (the PCIe half still needs a CUDA benchmark host). `POST
 /v1/cache/rebuild` moves VRAM between the expert cache and KV without a
-restart, validated by `ferrox-edge::pool` and rolled back by
-`ferrox-edge::rebuild`.
+restart, validated by `policy::pool` and rolled back by
+`policy::rebuild`.
 
 Still waiting on a consumer:
 
-- Drive expert residency from `ferrox-edge::expert_cache` and the `q*`
+- Drive expert residency from `ferrox_core::expert_cache` and the `q*`
   split, which needs the other half FreeToken has and ferrox does not:
   a *persistent* GPU expert cache (`ferrox-moe::run_expert_placed`
   re-uploads every weight matrix per call) and a CPU MoE path that can
@@ -129,10 +131,19 @@ Still waiting on a consumer:
 - Make prefix reuse work on the continuous-batching path. Paged KV and
   continuous batching are separate switches and the sharing only
   happens under the first
-- Size the pools with `ferrox-edge::pool` at load, not only when a
-  rebuild asks for a new geometry
-- Find consumers for `placement`, `residency`, `cache_manager`,
-  `anchor`, `window_pool`, `state_pool` and `supervisor`
+- Size the pools with `ferrox_core::expert_budget::plan_cache_budget` at
+  load, not only when a rebuild asks for a new geometry
+- Find consumers for `ferrox_core::placement` and `residency`, and for
+  `policy::anchor`'s `prefill_slide`. The multi-currency prefix cache
+  (`cache_manager`, `radix::swa`, `radix::hybrid`, `window_pool`,
+  `state_pool`), the cache report renderer and the process supervisor
+  were DELETED rather than left waiting: see
+  [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) for what each was
+  and why it went
+- Publish into the radix tree from the continuous batcher too.
+  `batch_scheduler` adopts from the tree (`acquire_paged_caches`) but
+  never calls `publish_to_radix`, so under `FERROX_CONTINUOUS_BATCHING=1`
+  prefix sharing is adopt-only and the tree is filled by nothing
 
 A full recursive re-read of the reference (six readers over its 435
 files, checked against every ferrox crate rather than against the port's

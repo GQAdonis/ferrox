@@ -18,7 +18,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
 use ferrox_api::RecentRequest;
-use ferrox_edge::{mean_of_present, percentile, RequestRing};
+use ferrox_core::summary_stats::{mean_of_present, percentile};
+
+use crate::policy::serving_stats::RequestRing;
 
 use crate::attribution::Attribution;
 

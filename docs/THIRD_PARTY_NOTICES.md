@@ -242,9 +242,9 @@ was read for information architecture and for which libraries a shipped
 product of this kind chooses, and nothing else. Camelid (MIT) was read
 the same way, for feature and layout ideas only.
 
-## FreeToken — edge-native MoE serving policy (`ferrox-edge`)
+## FreeToken — edge-native MoE serving policy
 
-`crates/ferrox-edge` is a Rust port of the host-side decision logic in
+Ferrox contains a Rust port of the host-side decision logic in
 [FreeToken](https://github.com/FlashML-org/FreeToken), the edge-native
 MoE serving engine described in *FreeToken: Efficient Edge-Native MoE
 Serving with Bandwidth-Adaptive Execution*
@@ -257,30 +257,71 @@ from. FreeToken is Apache-2.0 licensed, the same license as ferrox:
 
   Copyright (c) 2026 FlashML and the FreeToken contributors
 
-What was ported, and from where:
+The port originally lived in a crate of its own, `ferrox-edge`. It no
+longer does: the modules were moved into the crates that use them, and
+the ones nothing would ever use were deleted. This notice tracks where
+each surviving piece now lives, because the attribution follows the
+code and not the crate name.
 
-| ferrox-edge module | FreeToken source |
+**The MoE expert-residency half, in `ferrox-core`**, beside
+`expert_store`, which holds the byte budget it sizes:
+
+| ferrox module | FreeToken source |
 |---|---|
-| `radix::{tree,plain}` | `python/freetoken/kvcache/radix_cache.py` |
-| `radix::swa` | `python/freetoken/kvcache/swa_radix_cache.py` |
-| `radix::hybrid` | `python/freetoken/kvcache/hybrid_radix_cache.py` |
-| `qstar` | `python/freetoken/moe/bench_profile.py`, the split in `moe/offload_kernels.py` |
-| `expert_cache` | `python/freetoken/moe/offload_cache.py`, `moe/offload_kernels.py` |
-| `pool` | `python/freetoken/engine/cache_budget.py`, `kvcache/hybrid_swa_pool.py`, `kvcache/base.py` |
-| `placement` | `python/freetoken/engine/engine.py` (CPU-layer selection) |
-| `scheduler` | `python/freetoken/scheduler/{prefill,decode,table,status}.py` |
-| `parser::reasoning` | `python/freetoken/server/reasoning_parser.py` |
-| `parser::tool_call` | `python/freetoken/server/function_call_parser.py` |
-| `effort` | `python/freetoken/tokenizer/effort.py`, part of `tokenizer/tokenize.py` |
-| `detokenize` | `python/freetoken/tokenizer/detokenize.py` |
-| `cache_report` | `python/freetoken/cache_report.py` |
-| `anchor` | `python/freetoken/scheduler/cache.py` (tool-call anchor, window slide), `attention/linear.py` |
-| `window_pool` | `python/freetoken/kvcache/hybrid_swa_pool.py` |
-| `state_pool` | `python/freetoken/kvcache/linear_state_pool.py`, `attention/linear.py` |
-| `cache_manager` | `python/freetoken/scheduler/cache.py` |
-| `stats` | `python/freetoken/server/request_ring.py`, `server/stats.py` |
-| `maintenance` | `python/freetoken/server/accounting.py`, the gate in `server/api_server.py` |
-| `bench_profile` | `python/freetoken/moe/bench_profile.py` (path resolution) |
+| `ferrox_core::expert_cache` | `python/freetoken/moe/offload_cache.py`, `moe/offload_kernels.py` |
+| `ferrox_core::expert_slots` | the slot/bank model behind `moe/offload_cache.py` |
+| `ferrox_core::expert_budget` | `python/freetoken/engine/cache_budget.py` |
+| `ferrox_core::qstar` | `python/freetoken/moe/bench_profile.py`, the split in `moe/offload_kernels.py` |
+| `ferrox_core::bench_profile` | `python/freetoken/moe/bench_profile.py` (path resolution) |
+| `ferrox_core::residency` | `python/freetoken/moe/offload_cache.py` (residency plans) |
+| `ferrox_core::placement` | `python/freetoken/engine/engine.py` (CPU-layer selection) |
+| `ferrox_core::summary_stats` | `python/freetoken/server/stats.py` (percentile, mean-of-present) |
+| `ferrox_core::expert_pool` | ferrox's own CUDA `SlotDevice`, against the ported trait |
+
+**The serving-policy half, in `ferrox-server::policy`:**
+
+| ferrox module | FreeToken source |
+|---|---|
+| `policy::radix::{tree,plain}` | `python/freetoken/kvcache/radix_cache.py` |
+| `policy::scheduler` | `python/freetoken/scheduler/{prefill,decode,table,status}.py` |
+| `policy::parser::reasoning` | `python/freetoken/server/reasoning_parser.py` |
+| `policy::parser::tool_call` | `python/freetoken/server/function_call_parser.py` |
+| `policy::effort` | `python/freetoken/tokenizer/effort.py`, part of `tokenizer/tokenize.py` |
+| `policy::detokenize` | `python/freetoken/tokenizer/detokenize.py` |
+| `policy::anchor` | `python/freetoken/scheduler/cache.py` (tool-call anchor, window slide) |
+| `policy::pool` | `python/freetoken/engine/cache_budget.py` |
+| `policy::rebuild` | the live re-split in `python/freetoken/engine/engine.py` |
+| `policy::serving_stats` | `python/freetoken/server/request_ring.py`, `server/stats.py` |
+| `policy::maintenance` | `python/freetoken/server/accounting.py`, the gate in `server/api_server.py` |
+| `policy::outbox` | `python/freetoken/server/accounting.py` (stop receipts) |
+| `policy::footprint` | `python/freetoken/server/footprint.py` |
+
+**In `ferrox-models`:**
+
+| ferrox module | FreeToken source |
+|---|---|
+| `deepseek_v4_budget` | `python/freetoken/models/deepseek_v4/` (KV tier sizing, the compressor schedule) |
+
+**In `ferrox-cli`:**
+
+| ferrox module | FreeToken source |
+|---|---|
+| `bench_client` | `python/freetoken/bench/serving.py` |
+
+**What was ported and has since been DELETED**, recorded here because
+the port happened and the attribution should say so honestly rather
+than quietly dropping the rows:
+
+| deleted module | FreeToken source | why |
+|---|---|---|
+| `cache_manager` | `python/freetoken/scheduler/cache.py` | a second page ledger; ferrox's own `ferrox_core::cache::KvBlockPool` is wired and running |
+| `radix::swa` | `python/freetoken/kvcache/swa_radix_cache.py` | reachable only from `cache_manager` |
+| `radix::hybrid` | `python/freetoken/kvcache/hybrid_radix_cache.py` | reachable only from `cache_manager`; ferrox refuses recurrent checkpoints |
+| `window_pool` | `python/freetoken/kvcache/hybrid_swa_pool.py` | reachable only from `cache_manager` |
+| `state_pool` | `python/freetoken/kvcache/linear_state_pool.py`, `attention/linear.py` | reachable only from `cache_manager` |
+| `cache_report` | `python/freetoken/cache_report.py` | rendered a `CacheGeometry` nothing built |
+| `supervisor` | `python/freetoken/daemon/serve_manager.py` | manages an engine child process; ferrox ships one binary |
+
 
 FreeToken itself credits SGLang, vLLM, FlashInfer,
 flash-linear-attention, LightLLM and llama.cpp; in particular its radix
@@ -294,8 +335,9 @@ rather than decides. The Triton and CUDA kernels, the C++ CPU MoE
 executor, the FTW weight loader's O_DIRECT/mmap machinery, the pinned
 host-bank allocator and the CUDA-graph capture ordering are all
 torch/CUDA-bound, and ferrox has its own equivalents or its own plans
-for them. `ferrox-edge` is deliberately tensor-free: every module takes
-measured numbers and returns a decision.
+for them. The ported policy is deliberately tensor-free: every module
+takes measured numbers and returns a decision, which is why it is all
+testable on a host with no GPU and no model.
 
 A full recursive re-read of the reference in August 2026 -- six readers
 over its 435 files, checked against every ferrox crate rather than
@@ -328,8 +370,9 @@ Where ferrox already had a mechanism the port would have duplicated, the
 port plugs into it rather than shadowing it — `ferrox-core::kv_block`
 (content-addressed KV blocks), `ferrox-core::expert_store` (the SSD
 expert tier), `ferrox-server::batch_scheduler` (continuous batching),
-`ferrox-server::stop` (which now delegates its withhold rule to
-`ferrox-edge` so there is one implementation of it in the workspace).
+`ferrox-server::stop` (which delegates its withhold rule to
+`policy::detokenize` so there is one implementation of it in the
+workspace).
 
 ## Design inspiration, not code reuse
 

@@ -22,7 +22,6 @@ ferrox-metal = { workspace = true }
 half = { workspace = true }
 ferrox-core = { workspace = true }
 ferrox-models = { workspace = true, features = ["hub"] }
-ferrox-edge = { workspace = true }
 ferrox-safetensors = { workspace = true }
 # Optional, and off by default -- see the `serve` feature below.
 ferrox-server = { workspace = true, optional = true }

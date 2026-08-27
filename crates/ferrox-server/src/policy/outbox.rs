@@ -1,6 +1,6 @@
 //! The accounting receipt, and the one ordering that keeps it honest.
 //!
-//! [`crate::maintenance::MaintenanceGate`] is the barrier half of a
+//! [`crate::policy::maintenance::MaintenanceGate`] is the barrier half of a
 //! stop: it closes admission, refuses to seal while work is in flight,
 //! and hands back a [`SealedAccounting`] exactly once. This module is
 //! the other half -- turning that snapshot into a receipt that cannot
@@ -33,7 +33,7 @@
 
 use sha2::{Digest, Sha256};
 
-use crate::maintenance::SealedAccounting;
+use crate::policy::maintenance::SealedAccounting;
 
 /// How much a receipt claims to know.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

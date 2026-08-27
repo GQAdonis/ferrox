@@ -67,8 +67,8 @@ use std::collections::BTreeMap;
 
 use serde_json::{Map, Value};
 
-use crate::detokenize::{floor_char_boundary, stop_prefix_holdback};
-use crate::parser::reasoning::{
+use crate::policy::detokenize::{floor_char_boundary, stop_prefix_holdback};
+use crate::policy::parser::reasoning::{
     atem_boundary, atem_hold_len, atem_marker_inside, atem_recipient, AtemBoundary,
     ATEM_CLOSING_TOKENS, ATEM_HEADER_SPAN, ATEM_MESSAGE, ATEM_START,
 };

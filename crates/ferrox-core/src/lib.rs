@@ -10,7 +10,8 @@
 //! and the SSD tier), [`expert_cache`] (which experts stay resident and
 //! the copy plans that make them so), [`expert_slots`] (the bounded
 //! slot pool behind the [`expert_slots::SlotDevice`] seam),
-//! [`expert_pool`] (the CUDA side of that seam), [`residency`],
+//! [`expert_pool`] (the CUDA side of that seam), [`expert_budget`]
+//! (bytes in, expert slot count out), [`residency`],
 //! [`placement`] and [`qstar`] -- lives together in one crate on
 //! purpose: on unified memory two independent expert budgets are the
 //! same physical RAM counted twice. [`expert_store`] is the budget
@@ -23,6 +24,7 @@ pub mod block_sparse;
 pub mod cache;
 pub mod csa_hca_compress;
 pub mod deepseek_v4_attention;
+pub mod expert_budget;
 pub mod expert_cache;
 // Not feature-gated: `expert_pool::split_pair` is the one part of the
 // slot-copy path a compiler cannot check and a GPU-less host can, so it
@@ -42,6 +44,7 @@ pub mod matmul;
 pub mod placement;
 pub mod qstar;
 pub mod residency;
+pub mod summary_stats;
 pub mod tensor;
 pub mod threads;
 pub mod turboquant;

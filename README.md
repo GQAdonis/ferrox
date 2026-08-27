@@ -171,7 +171,6 @@ published separately if you want one rather than the stack:
 [core](https://crates.io/crates/ferrox-core),
 [moe](https://crates.io/crates/ferrox-moe),
 [models](https://crates.io/crates/ferrox-models),
-[edge](https://crates.io/crates/ferrox-edge),
 [api](https://crates.io/crates/ferrox-api),
 [metal](https://crates.io/crates/ferrox-metal),
 [cuda](https://crates.io/crates/ferrox-cuda). All share one version.

@@ -54,18 +54,24 @@ pub(crate) trait StreamEvent: Send + 'static {
 ///
 /// Zero is the interesting case -- see the module docs on why an empty
 /// text run or argument fragment must not become a frame.
-pub(crate) fn map_tool_event<E: StreamEvent>(event: ferrox_edge::ToolCallEvent) -> Vec<E> {
+pub(crate) fn map_tool_event<E: StreamEvent>(
+    event: crate::policy::parser::ToolCallEvent,
+) -> Vec<E> {
     match event {
-        ferrox_edge::ToolCallEvent::Text(text) if text.is_empty() => Vec::new(),
-        ferrox_edge::ToolCallEvent::Text(text) => vec![E::content(text)],
-        ferrox_edge::ToolCallEvent::CallStart { index, name } => vec![E::call_start(index, name)],
-        ferrox_edge::ToolCallEvent::CallArguments { fragment, .. } if fragment.is_empty() => {
+        crate::policy::parser::ToolCallEvent::Text(text) if text.is_empty() => Vec::new(),
+        crate::policy::parser::ToolCallEvent::Text(text) => vec![E::content(text)],
+        crate::policy::parser::ToolCallEvent::CallStart { index, name } => {
+            vec![E::call_start(index, name)]
+        }
+        crate::policy::parser::ToolCallEvent::CallArguments { fragment, .. }
+            if fragment.is_empty() =>
+        {
             Vec::new()
         }
-        ferrox_edge::ToolCallEvent::CallArguments { index, fragment } => {
+        crate::policy::parser::ToolCallEvent::CallArguments { index, fragment } => {
             vec![E::call_arguments(index, fragment)]
         }
-        ferrox_edge::ToolCallEvent::CallEnd { index, arguments } => {
+        crate::policy::parser::ToolCallEvent::CallEnd { index, arguments } => {
             vec![E::call_end(index, arguments)]
         }
     }
@@ -127,10 +133,11 @@ mod tests {
     /// model is producing text when it is not.
     #[test]
     fn an_empty_text_run_or_argument_fragment_produces_no_event() {
-        let none: Vec<Ev> = map_tool_event(ferrox_edge::ToolCallEvent::Text(String::new()));
+        let none: Vec<Ev> =
+            map_tool_event(crate::policy::parser::ToolCallEvent::Text(String::new()));
         assert!(none.is_empty(), "an empty text run is not an event");
 
-        let none: Vec<Ev> = map_tool_event(ferrox_edge::ToolCallEvent::CallArguments {
+        let none: Vec<Ev> = map_tool_event(crate::policy::parser::ToolCallEvent::CallArguments {
             index: 0,
             fragment: String::new(),
         });
@@ -141,25 +148,25 @@ mod tests {
     #[test]
     fn every_non_empty_parser_event_maps_to_exactly_one_protocol_event() {
         assert_eq!(
-            map_tool_event::<Ev>(ferrox_edge::ToolCallEvent::Text("hi".into())),
+            map_tool_event::<Ev>(crate::policy::parser::ToolCallEvent::Text("hi".into())),
             vec![Ev::Content("hi".into())]
         );
         assert_eq!(
-            map_tool_event::<Ev>(ferrox_edge::ToolCallEvent::CallStart {
+            map_tool_event::<Ev>(crate::policy::parser::ToolCallEvent::CallStart {
                 index: 2,
                 name: "search".into()
             }),
             vec![Ev::CallStart(2, "search".into())]
         );
         assert_eq!(
-            map_tool_event::<Ev>(ferrox_edge::ToolCallEvent::CallArguments {
+            map_tool_event::<Ev>(crate::policy::parser::ToolCallEvent::CallArguments {
                 index: 2,
                 fragment: "{\"q\"".into()
             }),
             vec![Ev::CallArguments(2, "{\"q\"".into())]
         );
         assert_eq!(
-            map_tool_event::<Ev>(ferrox_edge::ToolCallEvent::CallEnd {
+            map_tool_event::<Ev>(crate::policy::parser::ToolCallEvent::CallEnd {
                 index: 2,
                 arguments: "{}".into()
             }),

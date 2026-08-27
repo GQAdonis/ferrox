@@ -39,11 +39,14 @@
 
 use std::sync::Arc;
 
+use crate::policy::footprint::Footprint;
+use crate::policy::maintenance::{MaintenanceState, RebuildRefused, StopRefused};
+use crate::policy::outbox::Receipt;
+use crate::policy::scheduler::PoolUsage;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
-use ferrox_edge::{Footprint, MaintenanceState, PoolUsage, RebuildRefused, Receipt, StopRefused};
 use serde::Deserialize;
 
 use crate::AppState;
@@ -52,7 +55,7 @@ use crate::AppState;
 ///
 /// Reports the geometry a client denominates its sliders in. Everything
 /// it cannot say is **absent** rather than zero -- the rule
-/// `ferrox_edge::cache_report` is built around, because `0.0 GiB` is a
+/// `crate::policy::cache_report` is built around, because `0.0 GiB` is a
 /// lie and a total that silently omits a pool is worse.
 pub(crate) async fn cache_status(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
     let gate = state
@@ -90,13 +93,16 @@ pub(crate) async fn cache_status(State(state): State<Arc<AppState>>) -> Json<ser
 /// stop is sealed by reading this response. Answering first and writing
 /// after would leave a crash in between with the supervisor believing a
 /// receipt exists that does not -- which is the exact loss the ordering
-/// rule in `ferrox_edge::outbox` exists to prevent.
+/// rule in `crate::policy::outbox` exists to prevent.
 ///
 /// A write failure is therefore a refusal rather than a warning. The
 /// engine is preserved, the totals are already sealed and idempotent,
 /// and a retry derives the same id and seals the same numbers, so
 /// retrying costs nothing and cannot double-count.
-fn sealed_response(state: &AppState, sealed: &ferrox_edge::SealedAccounting) -> Response {
+fn sealed_response(
+    state: &AppState,
+    sealed: &crate::policy::maintenance::SealedAccounting,
+) -> Response {
     match persist_receipt(state, sealed) {
         Ok(receipt) => {
             let mut body = sealed_json(sealed);
@@ -163,7 +169,7 @@ fn engine_identity(state: &AppState) -> String {
 /// were somehow read differently.
 fn persist_receipt(
     state: &AppState,
-    sealed: &ferrox_edge::SealedAccounting,
+    sealed: &crate::policy::maintenance::SealedAccounting,
 ) -> Result<Option<Receipt>, std::io::Error> {
     let Some(dir) = outbox_dir() else {
         return Ok(None);
@@ -171,7 +177,7 @@ fn persist_receipt(
     let receipt = Receipt::from_sealed(&engine_identity(state), sealed);
     let final_path = dir.join(format!("{}.json", receipt.id));
 
-    let result = ferrox_edge::finish_stop(
+    let result = crate::policy::outbox::finish_stop(
         receipt,
         |receipt| {
             std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
@@ -213,7 +219,7 @@ fn persist_receipt(
 /// counting those as occupied puts every gauge near 100% while the
 /// machine is doing nothing -- and admission, which is happily seating
 /// requests into that memory, disagrees with the number the operator is
-/// reading. `ferrox_edge::PoolUsage::from_available` is where the rule
+/// reading. `crate::policy::scheduler::PoolUsage::from_available` is where the rule
 /// lives, so it is stated once rather than re-derived per endpoint.
 ///
 /// Evictable is **zero today, and structurally so**: `generate` stores
@@ -261,7 +267,7 @@ pub(crate) fn pool_gauges(state: &AppState) -> serde_json::Value {
 /// group. RSS is the fallback for a kernel without `smaps_rollup`
 /// (before 4.14), and it OVERCOUNTS the moment anything is shared -- so
 /// which one was read travels with the number. See
-/// `ferrox_edge::footprint`.
+/// `crate::policy::footprint`.
 ///
 /// `None` on a platform with no `/proc` at all, which is macOS and
 /// Windows: absent is the honest answer, and a zero would say the
@@ -273,12 +279,12 @@ fn read_footprint() -> Option<Footprint> {
     // import would be an unused-import error on every other platform --
     // which is a `-D warnings` build failure that a Linux-only local
     // check cannot see.
-    use ferrox_edge::FootprintKind;
+    use crate::policy::footprint::FootprintKind;
 
     if let Some(bytes) = std::fs::read_to_string("/proc/self/smaps_rollup")
         .ok()
         .as_deref()
-        .and_then(ferrox_edge::parse_smaps_rollup_pss)
+        .and_then(crate::policy::footprint::parse_smaps_rollup_pss)
     {
         return Some(Footprint {
             bytes,
@@ -288,7 +294,7 @@ fn read_footprint() -> Option<Footprint> {
     let bytes = std::fs::read_to_string("/proc/self/status")
         .ok()
         .as_deref()
-        .and_then(ferrox_edge::parse_status_rss)?;
+        .and_then(crate::policy::footprint::parse_status_rss)?;
     Some(Footprint {
         bytes,
         kind: FootprintKind::Rss,
@@ -460,7 +466,7 @@ pub(crate) async fn cache_rebuild(
     //
     // `RebuildTxn` exists for the destructive case: free the old pools,
     // allocate the new, and a failure on either side of that line means
-    // something different (see `ferrox_edge::rebuild`). Ferrox has no
+    // something different (see `crate::policy::rebuild`). Ferrox has no
     // such line YET -- `KvBlockPool::resize` moves counters and frees
     // nothing, so it either succeeds or refuses atomically, and the
     // closure below never marks a teardown. The transaction is wired
@@ -469,17 +475,17 @@ pub(crate) async fn cache_rebuild(
     // is already here and already tested, instead of being written
     // under the pressure of the first engine that 503s forever.
     let before = pool.total_blocks() as u64;
-    let current = ferrox_edge::PoolSizes {
+    let current = crate::policy::pool::PoolSizes {
         moe_cache_slots: 0,
         kv_pages: before,
         prefill_overlap: false,
     };
-    let target = ferrox_edge::PoolSizes {
+    let target = crate::policy::pool::PoolSizes {
         kv_pages: pages,
         ..current
     };
-    let txn = ferrox_edge::RebuildTxn::open(
-        &ferrox_edge::RebuildRequest {
+    let txn = crate::policy::rebuild::RebuildTxn::open(
+        &crate::policy::pool::RebuildRequest {
             moe_cache_slots: None,
             kv_pages: Some(pages),
             mamba_slots: None,
@@ -502,7 +508,7 @@ pub(crate) async fn cache_rebuild(
     );
 
     match outcome {
-        ferrox_edge::RebuildOutcome::Applied(_) => {
+        crate::policy::rebuild::RebuildOutcome::Applied(_) => {
             let after = pool.total_blocks() as u64;
             drop(pool);
             // Any KV-side resize invalidates the prefix cache: a cached
@@ -529,7 +535,7 @@ pub(crate) async fn cache_rebuild(
             }))
             .into_response()
         }
-        ferrox_edge::RebuildOutcome::RejectedIntact { .. } => {
+        crate::policy::rebuild::RebuildOutcome::RejectedIntact { .. } => {
             drop(pool);
             reopen(true);
             let held = refused_floor.unwrap_or(0);
@@ -547,12 +553,12 @@ pub(crate) async fn cache_rebuild(
         // Unreachable while the resize frees nothing, and written out
         // rather than defaulted so that making it destructive is a
         // compile error here first instead of a silent 503-forever.
-        ferrox_edge::RebuildOutcome::RolledBack { reason, .. } => {
+        crate::policy::rebuild::RebuildOutcome::RolledBack { reason, .. } => {
             drop(pool);
             reopen(true);
             refusal(StatusCode::CONFLICT, "busy", reason)
         }
-        ferrox_edge::RebuildOutcome::Latched {
+        crate::policy::rebuild::RebuildOutcome::Latched {
             reason,
             rollback_error,
         } => {
@@ -595,7 +601,7 @@ pub(crate) struct PrepareStopRequest {
 /// signals the process, so shutdown cannot race the last sampled token.
 ///
 /// Two rules carry the whole thing, both from
-/// `ferrox_edge::MaintenanceGate`:
+/// `crate::policy::maintenance::MaintenanceGate`:
 ///
 /// * **A refusal never reopens admission.** A server that announced it
 ///   was stopping, accepted more work, and then sealed totals that do
@@ -651,12 +657,14 @@ pub(crate) async fn prepare_stop(
         state.stats.tokens_generated_total(),
     );
 
-    match gate.seal(active, active > 0, || ferrox_edge::SealedAccounting {
-        model_id,
-        prompt_tokens_total: prompt_total,
-        completion_tokens_total: completion_total,
-        uptime_seconds: uptime,
-        drain_complete: true,
+    match gate.seal(active, active > 0, || {
+        crate::policy::maintenance::SealedAccounting {
+            model_id,
+            prompt_tokens_total: prompt_total,
+            completion_tokens_total: completion_total,
+            uptime_seconds: uptime,
+            drain_complete: true,
+        }
     }) {
         Ok(sealed) => {
             drop(gate);
@@ -678,7 +686,7 @@ pub(crate) async fn prepare_stop(
     }
 }
 
-fn sealed_json(sealed: &ferrox_edge::SealedAccounting) -> serde_json::Value {
+fn sealed_json(sealed: &crate::policy::maintenance::SealedAccounting) -> serde_json::Value {
     serde_json::json!({
         "model_id": sealed.model_id,
         "prompt_tokens_total": sealed.prompt_tokens_total,
@@ -715,7 +723,7 @@ pub(crate) fn check_admission(state: &AppState) -> Result<(), crate::ApiError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ferrox_edge::MaintenanceGate;
+    use crate::policy::maintenance::MaintenanceGate;
 
     /// A rebuild through a load, another rebuild, or a stop is refused
     /// before anything is measured -- and each refusal is a DIFFERENT
@@ -807,7 +815,7 @@ mod tests {
         gate.begin_stop().expect("stop starts");
 
         let snapshot = |completion| {
-            move || ferrox_edge::SealedAccounting {
+            move || crate::policy::maintenance::SealedAccounting {
                 model_id: Some("m".to_string()),
                 prompt_tokens_total: 10,
                 completion_tokens_total: completion,
@@ -875,7 +883,7 @@ mod tests {
     /// billing event for work that happened once.
     #[test]
     fn a_receipt_lands_on_disk_and_a_retry_reuses_the_same_document() {
-        use ferrox_edge::SealedAccounting;
+        use crate::policy::maintenance::SealedAccounting;
 
         let dir = std::env::temp_dir().join(format!(
             "ferrox-outbox-test-{}-{}",
@@ -904,14 +912,14 @@ mod tests {
             std::fs::rename(&tmp, &path).map_err(|e| e.to_string())
         };
 
-        ferrox_edge::finish_stop(receipt.clone(), write, |_| Ok(())).expect("first stop");
+        crate::policy::outbox::finish_stop(receipt.clone(), write, |_| Ok(())).expect("first stop");
         assert!(path.exists(), "the receipt must be durable");
 
         // The retry derives the same id, so it addresses the same file
         // and writes no second document.
         let retry = Receipt::from_sealed("stable-identity", &sealed);
         assert_eq!(retry.id, receipt.id);
-        ferrox_edge::finish_stop(retry, write, |_| Ok(())).expect("retry");
+        crate::policy::outbox::finish_stop(retry, write, |_| Ok(())).expect("retry");
         let count = std::fs::read_dir(&dir).unwrap().count();
         assert_eq!(count, 1, "one generation, one receipt");
 

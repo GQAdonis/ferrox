@@ -19,5 +19,5 @@
 pub mod reasoning;
 pub mod tool_call;
 
-pub use reasoning::{ReasoningDelta, ReasoningFormat, ReasoningParser};
-pub use tool_call::{ToolCall, ToolCallEvent, ToolCallFormat, ToolCallParser};
+pub use reasoning::{ReasoningFormat, ReasoningParser};
+pub use tool_call::{ToolCallEvent, ToolCallFormat, ToolCallParser};

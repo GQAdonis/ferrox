@@ -34,7 +34,7 @@
 //! Ported from FreeToken's `benchmark/client.py`; see
 //! `docs/THIRD_PARTY_NOTICES.md`.
 
-use crate::stats::percentile;
+use ferrox_edge::stats::percentile;
 
 /// The sampling every benchmark request is pinned to.
 ///
@@ -329,111 +329,6 @@ impl BenchReport {
     }
 }
 
-/// A replayed trace's dispatch offsets, in seconds from the run's
-/// start.
-///
-/// The wall clock is offset so the earliest request lands at one second
-/// in, never at zero. A trace whose first request fires at t=0 gives the
-/// client no time to open its connections, so the first arrivals'
-/// TTFTs carry the connection setup of the whole pool -- which is a
-/// property of the benchmark harness, not of the server.
-///
-/// Order is preserved rather than sorted: a trace's own order is part
-/// of what it encodes, and the offsets are consumed positionally
-/// alongside its prompts.
-pub fn replay_offsets(timestamps: &[f64]) -> Vec<f64> {
-    let Some(earliest) = timestamps.iter().copied().reduce(f64::min) else {
-        return Vec::new();
-    };
-    let base = earliest - 1.0;
-    timestamps.iter().map(|t| t - base).collect()
-}
-
-/// A prompt that really encodes to `target` tokens could not be built.
-///
-/// Carries the closest attempt so a caller can say how far off it got.
-/// A benchmark must not silently proceed with a prompt of a different
-/// length: prompt length is the independent variable of half the
-/// questions a serving run is asked.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PromptLengthNotReached {
-    pub wanted: usize,
-    pub got: usize,
-    pub text: String,
-}
-
-impl std::fmt::Display for PromptLengthNotReached {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "could not build a prompt of exactly {} tokens in {MAX_PROMPT_FIXED_POINT_STEPS} \
-             attempts; the closest was {}",
-            self.wanted, self.got
-        )
-    }
-}
-
-impl std::error::Error for PromptLengthNotReached {}
-
-/// Attempts before [`prompt_of_exact_length`] gives up.
-pub const MAX_PROMPT_FIXED_POINT_STEPS: usize = 64;
-
-/// A prompt whose *re-encoding* is exactly `target` tokens.
-///
-/// The naive construction -- decode `target` random ids and use that
-/// string -- is wrong, and the reason is worth stating: decoding ids to
-/// text and encoding that text back is not the identity. The tokenizer
-/// merges adjacent pieces, so a decoded 512-id string commonly
-/// re-encodes to rather fewer tokens, and a run labelled "512-token
-/// prompts" is quietly benchmarking something shorter.
-///
-/// So this iterates to a fixed point: build `n` ids, decode, re-encode,
-/// and move `n` by the shortfall. It converges in a handful of steps for
-/// a normal vocabulary and is capped so a pathological tokenizer fails
-/// loudly rather than spinning.
-///
-/// `ids_for(n)` must return `n` token ids; it is a parameter so the
-/// caller owns the id distribution and the seed, which is what makes a
-/// run reproducible.
-pub fn prompt_of_exact_length(
-    target: usize,
-    mut ids_for: impl FnMut(usize) -> Vec<usize>,
-    decode: impl Fn(&[usize]) -> String,
-    encode: impl Fn(&str) -> Vec<usize>,
-) -> Result<String, PromptLengthNotReached> {
-    if target == 0 {
-        return Ok(String::new());
-    }
-    let mut n = target;
-    let mut closest = (usize::MAX, String::new());
-    for _ in 0..MAX_PROMPT_FIXED_POINT_STEPS {
-        let text = decode(&ids_for(n));
-        let got = encode(&text).len();
-        if got == target {
-            return Ok(text);
-        }
-        if target.abs_diff(got) < target.abs_diff(closest.0) {
-            closest = (got, text);
-        }
-        // Move by the shortfall rather than by one: the relationship is
-        // close to linear, so this lands in a couple of steps where a
-        // unit walk would take as many steps as the gap is wide.
-        n = if got < target {
-            n + (target - got)
-        } else {
-            // Never below one. A zero would decode to the empty string
-            // for every remaining attempt, so the loop would stop
-            // learning anything and burn the whole budget.
-            n.saturating_sub(got - target).max(1)
-        };
-    }
-    Err(PromptLengthNotReached {
-        wanted: target,
-        got: closest.0,
-        text: closest.1,
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -618,69 +513,6 @@ mod tests {
         assert_eq!(report.duration_s, 0.0);
         assert_eq!(report.output_throughput(), None);
         assert_eq!(report.ttft, Latency::default());
-    }
-
-    /// The earliest request lands one second in, never at zero: a trace
-    /// firing at t=0 makes the first arrivals carry the connection
-    /// setup of the whole pool, which is a property of the harness
-    /// rather than of the server.
-    #[test]
-    fn a_replayed_trace_starts_one_second_in_and_keeps_its_own_order() {
-        let offsets = replay_offsets(&[100.0, 100.5, 103.0]);
-        assert_eq!(offsets, vec![1.0, 1.5, 4.0]);
-
-        // Order is the trace's, not sorted: the offsets are consumed
-        // positionally alongside its prompts.
-        let offsets = replay_offsets(&[103.0, 100.0]);
-        assert_eq!(offsets, vec![4.0, 1.0]);
-
-        assert!(replay_offsets(&[]).is_empty());
-    }
-
-    /// Decoding ids to text and encoding it back is not the identity --
-    /// the tokenizer merges adjacent pieces -- so a prompt built from
-    /// `target` random ids re-encodes shorter, and a run labelled
-    /// "512-token prompts" quietly benchmarks something else.
-    #[test]
-    fn a_prompt_is_built_until_it_really_re_encodes_to_the_asked_length() {
-        // A toy tokenizer that merges every adjacent pair: n ids decode
-        // to a string that re-encodes to ceil(n / 2).
-        let decode = |ids: &[usize]| "x".repeat(ids.len());
-        let encode = |s: &str| vec![0usize; s.len().div_ceil(2)];
-
-        let text = prompt_of_exact_length(10, |n| vec![0; n], decode, encode).expect("converges");
-        assert_eq!(
-            encode(&text).len(),
-            10,
-            "the RE-ENCODED length is the one asked for"
-        );
-        assert!(
-            text.len() > 10,
-            "which took more ids than the target: {} ids for 10 tokens",
-            text.len()
-        );
-
-        assert_eq!(
-            prompt_of_exact_length(0, |n| vec![0; n], decode, encode),
-            Ok(String::new())
-        );
-    }
-
-    /// A pathological tokenizer fails loudly with its closest attempt
-    /// rather than spinning, and rather than handing back a prompt of
-    /// the wrong length -- prompt length is the independent variable of
-    /// half the questions a serving run is asked.
-    #[test]
-    fn a_prompt_length_that_cannot_be_hit_is_an_error_and_not_a_wrong_prompt() {
-        // Always re-encodes to 3, whatever it is given.
-        let decode = |ids: &[usize]| "y".repeat(ids.len());
-        let encode = |_: &str| vec![0usize; 3];
-
-        let err = prompt_of_exact_length(10, |n| vec![0; n], decode, encode)
-            .expect_err("cannot converge");
-        assert_eq!(err.wanted, 10);
-        assert_eq!(err.got, 3, "the closest attempt is reported");
-        assert!(err.to_string().contains("10"));
     }
 
     /// Chunks and tokens are not the same thing. A server that streams

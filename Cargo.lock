@@ -460,6 +460,7 @@ name = "ferrox-core"
 version = "0.13.0"
 dependencies = [
  "anyhow",
+ "cudarc",
  "ferrox-cuda",
  "ferrox-gguf",
  "ferrox-metal",
@@ -467,6 +468,8 @@ dependencies = [
  "libc",
  "memmap2",
  "rayon",
+ "serde",
+ "serde_json",
  "sha2",
  "thiserror",
 ]
@@ -476,7 +479,6 @@ name = "ferrox-cuda"
 version = "0.13.0"
 dependencies = [
  "cudarc",
- "ferrox-edge",
  "ferrox-quant",
  "half",
  "thiserror",

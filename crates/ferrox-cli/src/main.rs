@@ -2,6 +2,7 @@
 //! inspect / presets / smoke / Kimi helpers. See `docs/CLI.md`.
 
 mod bench_bw;
+mod bench_client;
 mod bench_guard;
 mod bench_model;
 mod bench_suite;

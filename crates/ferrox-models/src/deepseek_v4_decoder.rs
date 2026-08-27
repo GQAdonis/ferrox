@@ -30,13 +30,13 @@
 //! (`llama-kv-cache-dsv4.cpp`), CSA's `coff=2` dual-role projection,
 //! hash-based first-layer MoE selection, and multi-layer stacking.
 
+use crate::deepseek_v4_budget::LayerCompressor;
 use ferrox_core::attention::apply_rope_back;
 use ferrox_core::csa_hca_compress::compress_block;
 use ferrox_core::deepseek_v4_attention::{csa_attention, hca_attention};
 use ferrox_core::matmul::rms_norm;
 use ferrox_core::tensor::Tensor;
 use ferrox_core::weight_matrix::WeightMatrix;
-use ferrox_edge::dsv4::LayerCompressor;
 use ferrox_moe::{combine_expert_outputs, route_top_k, run_expert, ExpertWeights, GatingFunction};
 
 use crate::hyper_connections::{

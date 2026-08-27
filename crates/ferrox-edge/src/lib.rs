@@ -16,9 +16,6 @@
 //!
 //! | module | decides |
 //! |---|---|
-//! | [`qstar`] | how many of a step's expert-cache misses to fetch over PCIe vs. run on the CPU |
-//! | [`bench_profile`] | where this machine's measured bandwidth profile lives, and when it may be trusted |
-//! | [`expert_cache`] | which experts stay resident in the GPU expert cache |
 //! | [`radix`] | which prefix of a new prompt is already computed, and what may be evicted |
 //! | [`anchor`] | which position an agentic turn will come back to, and what to keep for it |
 //! | [`window_pool`] | which window-pool slot holds a given position's sliding-window KV |
@@ -38,27 +35,25 @@
 //! expert tier (`ferrox-core::expert_store`), continuous batching
 //! (`ferrox-server::batch_scheduler`) -- these modules plug into it
 //! instead of shadowing it. Each module's docs say which.
+//!
+//! The MoE expert-residency half of the port (`expert_cache`,
+//! `expert_slots`, `residency`, `placement`, `qstar`) now lives in
+//! `ferrox-core` beside `expert_store`, because two expert byte
+//! budgets that do not know about each other are, on unified memory,
+//! the same RAM counted twice.
 
 pub mod anchor;
-pub mod bench_client;
-pub mod bench_profile;
 pub mod cache_manager;
 pub mod cache_report;
 pub mod detokenize;
-pub mod dsv4;
 pub mod effort;
-pub mod expert_cache;
-pub mod expert_slots;
 pub mod footprint;
 pub mod maintenance;
 pub mod outbox;
 pub mod parser;
-pub mod placement;
 pub mod pool;
-pub mod qstar;
 pub mod radix;
 pub mod rebuild;
-pub mod residency;
 pub mod scheduler;
 pub mod state_pool;
 pub mod stats;
@@ -68,39 +63,18 @@ pub use anchor::{
     decode_slide, prefill_slide, resolve_anchor_token, snapshot_at_anchor, AnchorSnapshot,
     AnchorState, PingPong, RecurrentState, SlideDecision, SlidingRequest, WindowPolicy,
 };
-pub use bench_client::{
-    is_token_chunk, prompt_of_exact_length, replay_offsets, BenchReport, BenchSampling, Latency,
-    PromptLengthNotReached, RequestTiming, MAX_PROMPT_FIXED_POINT_STEPS,
-};
-pub use bench_profile::{
-    entry_from, load_backend_recommendation, load_hybrid_fetch_fraction, load_policy,
-    usable_profile, write_profile, Measured, NotMeasurable,
-};
 pub use cache_manager::{CacheManager, CommitOutcome, OutOfMemory, SequenceState};
 pub use cache_report::{CacheGeometry, CachePools};
 pub use detokenize::{
     find_printable_text, floor_char_boundary, stop_prefix_holdback, DetokenizeManager,
     DetokenizeMsg, Detokenizer,
 };
-pub use expert_cache::{
-    BankEntry, CopyPlan, EnsurePlan, ExpertCache, ExpertCacheStats, ExpertId, GatherPlan,
-    PrefillPlan,
-};
 
-pub use expert_slots::{
-    Applied, ExpertRows, ExpertSlots, HostSlotMemory, SlotDevice, SlotFault, SlotGeometry,
-    SlotStats,
-};
 pub use parser::{
     ReasoningDelta, ReasoningFormat, ReasoningParser, ToolCall, ToolCallEvent, ToolCallFormat,
     ToolCallParser,
 };
-pub use placement::{auto_cpu_layers, parse_cpu_layers_spec};
 pub use pool::{plan_cache_budget, validate_rebuild, PoolSizes, RebuildRequest};
-
-pub use qstar::{
-    balanced_fetch, recommend_backend, BandwidthProfile, MoeBackend, QStarPolicy, QStarSplit,
-};
 
 pub use window_pool::{WindowPoolExhausted, WindowSlotPool, NO_SLOT};
 
@@ -132,11 +106,6 @@ pub use scheduler::{
     PrefillSnapshot, SlotTable, StatusReporter, DEFAULT_DECODE_LOG_INTERVAL,
 };
 
-pub use residency::{
-    host_pin_budget_bytes, pin_budget_bytes, requested_labels, BankResidency, CopyRoute,
-    HostResidency, ResidencyError, ResidencyPlan, SettleAction,
-};
-
 pub use radix::{
     HybridMatch, HybridRadixCache, InsertResult, MatchResult, NodeId, RadixCache, SwaMatch,
     SwaRadixCache,
@@ -146,14 +115,4 @@ pub use effort::{
     broadcast_effort_spellings, derive_think_gears, effective_efforts, probe_effort_profile,
     probe_thinking_profile, quantize_effort, resolve_thinking_mode, sanitize_effort, Effort,
     EffortMapping, EffortProfile, ThinkGears, ThinkingMode, ThinkingProfile, ThinkingState,
-};
-
-pub use dsv4::{
-    dsv4_auto_cost_model, dsv4_cache_per_page, dsv4_kv_unit_bytes, dsv4_pool_bytes,
-    dsv4_pool_sizes, dsv4_reserved_window_pages, dsv4_solve_num_pages, dsv4_window_floor_pages,
-    dsv4_window_unit_bytes, ring_size_for_ratio, window_ring_position, Dsv4Args, Dsv4AutoCost,
-    Dsv4BudgetTooSmall, Dsv4LayerSizes, Dsv4PoolSizes, Dsv4WindowCtx, Dsv4WindowPool,
-    FreeListAllocator, FreeListExhausted, LayerCompressor, UnknownCompressRatio,
-    AUTO_KV_SLACK_BYTES, BF16_BYTES, CSA_RATIO, DEFAULT_WINDOW_PAGE, FP32_BYTES, HCA_RATIO,
-    INT64_BYTES, NO_WINDOW_SLOT,
 };

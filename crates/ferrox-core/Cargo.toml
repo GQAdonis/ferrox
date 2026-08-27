@@ -20,6 +20,27 @@ rayon = { workspace = true }
 sha2 = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
+# `qstar::BandwidthProfile` is read back from the profile `ferrox bench
+# --bw` writes, so the shape the policy reads and the shape the bench
+# writes are one type rather than two that can drift.
+serde = { workspace = true }
+# `bench_profile` reads and writes the JSON profile `ferrox bench --bw`
+# leaves on disk; the reader and the writer are one module so the shape
+# cannot drift between them.
+serde_json = { workspace = true }
+
+# `expert_pool::CudaExpertPool` is the CUDA side of the `SlotDevice`
+# seam. It lives here rather than in ferrox-cuda because ferrox-core
+# already depends on ferrox-cuda, so the reverse edge would be a cycle,
+# and because the Metal pool the out-of-core plan calls for belongs
+# beside it. Same pin as ferrox-cuda's: see that crate's comment for
+# why 0.11.9.
+cudarc = { version = "=0.11.9", optional = true, default-features = false, features = [
+    "std",
+    "driver",
+    "nvrtc",
+    "cuda-11080",
+] }
 
 # `statvfs` for kv_disk's free-space budget. Unix only; elsewhere the
 # probe reports "unknown" and the configured byte budget is the only
@@ -32,7 +53,7 @@ default = []
 # Propagates to ferrox-cuda's own `cuda` feature (real NVRTC-compiled
 # kernel dispatch, dynamic-loaded -- builds fine without a CUDA
 # toolkit/GPU present, see ferrox-cuda's Cargo.toml comment).
-cuda = ["dep:ferrox-cuda", "ferrox-cuda/cuda"]
+cuda = ["dep:ferrox-cuda", "ferrox-cuda/cuda", "dep:cudarc"]
 # Propagates to ferrox-metal's `metal` feature (Apple Silicon only;
 # see ferrox-metal's Cargo.toml). Shares WeightMatrix::apply_gpu with CUDA.
 metal = ["dep:ferrox-metal", "ferrox-metal/metal"]

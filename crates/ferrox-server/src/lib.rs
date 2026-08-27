@@ -3350,6 +3350,7 @@ pub(crate) fn activate_loaded_model(
     loaded: model::LoadedModel,
     enable_continuous_batching: bool,
     path: Option<&str>,
+    paged_kv: Option<&generate::PagedKvConfig>,
 ) -> Activated {
     match loaded {
         model::LoadedModel::Gguf(g) => {
@@ -3376,6 +3377,7 @@ pub(crate) fn activate_loaded_model(
                     decode,
                     config,
                     Arc::clone(&ceiling),
+                    paged_kv.cloned(),
                 ))
             } else {
                 None
@@ -3455,6 +3457,7 @@ fn build_app_state(
         loaded,
         enable_continuous_batching,
         std::env::var("FERROX_MODEL_PATH").ok().as_deref(),
+        paged_kv.as_ref(),
     );
     // The startup model's admin id is whichever discovered entry sits
     // at the configured path; `None` when it was not discovered (the
@@ -4125,8 +4128,14 @@ async fn run(mcp_config_path: Option<PathBuf>, exit_on_stdin_close: bool) -> any
     let enable_cb = std::env::var("FERROX_CONTINUOUS_BATCHING")
         .map(|v| v == "1")
         .unwrap_or(false)
-        && kv_pool.is_none()
-        && prefix_cache.is_none()
+        // Paged KV is what removed the old exclusivity: a batched row
+        // now holds a `PagedLease`, which is pool-accounted by
+        // construction and shares a prefix through the radix tree, so
+        // the two things the batcher could not previously do it now
+        // gets for free. The CONTIGUOUS pool and prefix cache still
+        // keep the private path, because a batched row has no way to
+        // restore a `Vec<KvCache>` snapshot.
+        && (paged_kv.is_some() || (kv_pool.is_none() && prefix_cache.is_none()))
         && matches!(loaded, model::LoadedModel::Gguf(_));
     if std::env::var("FERROX_CONTINUOUS_BATCHING")
         .map(|v| v == "1")

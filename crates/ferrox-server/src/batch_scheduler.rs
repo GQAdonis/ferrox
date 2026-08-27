@@ -148,7 +148,7 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
-use ferrox_core::cache::KvCache;
+use ferrox_core::cache::{KvCache, PagedKvCache};
 use ferrox_edge::{
     BatchStatus, PoolUsage, PrefillSnapshot, StatusReporter, DEFAULT_DECODE_LOG_INTERVAL,
 };
@@ -156,10 +156,14 @@ use ferrox_models::sampling::Sampler;
 use ferrox_models::tokenizer::StopTokens;
 use ferrox_models::Ceiling;
 use ferrox_models::Decoder;
+use ferrox_models::MultiSeqKv;
 
 use crate::budget::ContextCeiling;
 
-use crate::generate::{DecodeError, FinishReason, GenerationParams, Usage};
+use crate::generate::{
+    acquire_paged_caches, DecodeError, FinishReason, GenerationParams, PagedKvConfig, PagedLease,
+    Usage,
+};
 use crate::stop::{StopMatcher, StopStep};
 
 type DecodeFn = Arc<dyn Fn(&[usize]) -> String + Send + Sync>;
@@ -512,6 +516,18 @@ pub struct BatcherStats {
     pub aborted: u64,
 }
 
+/// Where one batched row keeps its KV.
+///
+/// A paged row holds a whole [`PagedLease`], not just its caches: the
+/// lease is what returns the row's page groups when the row ends, and
+/// every way a row can end -- finished, cancelled, evicted, refused at
+/// validation -- goes through dropping it. Splitting the caches from
+/// the lease would mean one more path that has to remember to free.
+enum RowKv {
+    Contiguous(Vec<KvCache>),
+    Paged(PagedLease),
+}
+
 /// One request's prefill as a resumable state machine.
 ///
 /// Holds the KV `caches` being built, how many prompt tokens have been
@@ -522,7 +538,7 @@ pub struct BatcherStats {
 /// decode.
 pub struct PrefillState {
     decoder: Arc<Decoder>,
-    caches: Vec<KvCache>,
+    kv: RowKv,
     /// The tokens this prefill must run. An *empty* prompt is stored as
     /// a single token 0, matching the private `generate` loop: one
     /// forward pass is still required to produce the logits the first
@@ -536,11 +552,13 @@ pub struct PrefillState {
 impl PrefillState {
     pub fn new(decoder: Arc<Decoder>, prompt_tokens: &[usize], chunk_size: usize) -> Self {
         assert!(chunk_size > 0, "prefill chunk size must be positive");
-        let caches: Vec<KvCache> = decoder
-            .layers
-            .iter()
-            .map(|_| KvCache::new(decoder.config.n_kv_heads, decoder.config.head_dim))
-            .collect();
+        let kv = RowKv::Contiguous(
+            decoder
+                .layers
+                .iter()
+                .map(|_| KvCache::new(decoder.config.n_kv_heads, decoder.config.head_dim))
+                .collect(),
+        );
         let tokens = if prompt_tokens.is_empty() {
             vec![0]
         } else {
@@ -548,7 +566,35 @@ impl PrefillState {
         };
         PrefillState {
             decoder,
-            caches,
+            kv,
+            tokens,
+            tokens_processed: 0,
+            logits: Vec::new(),
+            chunk_size,
+        }
+    }
+
+    /// A prefill whose KV lives in a shared paged store, with its
+    /// pages already reserved.
+    ///
+    /// Reserved for `prompt + max_tokens` at admission for the same
+    /// reason the private path does it: the decode step has nowhere to
+    /// report a store that ran dry mid-answer.
+    pub fn new_paged(
+        decoder: Arc<Decoder>,
+        prompt_tokens: &[usize],
+        chunk_size: usize,
+        lease: PagedLease,
+    ) -> Self {
+        assert!(chunk_size > 0, "prefill chunk size must be positive");
+        let tokens = if prompt_tokens.is_empty() {
+            vec![0]
+        } else {
+            prompt_tokens.to_vec()
+        };
+        PrefillState {
+            decoder,
+            kv: RowKv::Paged(lease),
             tokens,
             tokens_processed: 0,
             logits: Vec::new(),
@@ -580,9 +626,17 @@ impl PrefillState {
     pub fn step_chunk(&mut self) -> bool {
         let end = (self.tokens_processed + self.chunk_size).min(self.tokens.len());
         for pos in self.tokens_processed..end {
-            self.logits = self
-                .decoder
-                .forward_token(self.tokens[pos], pos, &mut self.caches);
+            self.logits = match &mut self.kv {
+                RowKv::Contiguous(caches) => {
+                    self.decoder.forward_token(self.tokens[pos], pos, caches)
+                }
+                RowKv::Paged(lease) => {
+                    let store = Arc::clone(lease.store());
+                    self.decoder
+                        .forward_token_paged(self.tokens[pos], pos, lease.caches_mut(), &store)
+                        .expect("the row's pages were reserved at admission")
+                }
+            };
         }
         self.tokens_processed = end;
         self.is_done()
@@ -591,9 +645,9 @@ impl PrefillState {
     /// Consumes a finished prefill into the pieces a decode row needs:
     /// KV caches, the logits the first token is sampled from, and the
     /// position the first generated token occupies.
-    fn into_decode_start(self) -> (Vec<KvCache>, Vec<f32>, usize) {
+    fn into_decode_start(self) -> (RowKv, Vec<f32>, usize) {
         debug_assert!(self.is_done(), "prefill must finish before decoding");
-        (self.caches, self.logits, self.tokens_processed)
+        (self.kv, self.logits, self.tokens_processed)
     }
 }
 
@@ -723,7 +777,7 @@ impl Rows {
 }
 
 struct Slot {
-    caches: Vec<KvCache>,
+    kv: RowKv,
     pos: usize,
     logits: Vec<f32>,
     sampler: Sampler,
@@ -779,13 +833,25 @@ impl ContinuousBatcher {
         decode: DecodeFn,
         config: BatcherConfig,
     ) -> Self {
+        Self::spawn_with_config_paged(decoder, decode, config, None)
+    }
+
+    /// `spawn_with_config` with a paged store, for the tests that check
+    /// batching and paging compose.
+    #[cfg(test)]
+    pub fn spawn_with_config_paged(
+        decoder: Arc<Decoder>,
+        decode: DecodeFn,
+        config: BatcherConfig,
+        paged: Option<PagedKvConfig>,
+    ) -> Self {
         let ceiling = Arc::new(ContextCeiling::new(
             config.max_context,
             // Prefill runs one token at a time here, so a sliding layer
             // needs `window + 1 - 1` positions live: chunk = 1.
             ferrox_models::KvShape::from_config(&decoder.config, ferrox_models::KvElem::F32, 1),
         ));
-        Self::spawn_with_ceiling(decoder, decode, config, ceiling)
+        Self::spawn_with_ceiling(decoder, decode, config, ceiling, paged)
     }
 
     /// `spawn_with_config` with the per-request context ceiling handed
@@ -801,6 +867,7 @@ impl ContinuousBatcher {
         decode: DecodeFn,
         config: BatcherConfig,
         ceiling: Arc<ContextCeiling>,
+        paged: Option<PagedKvConfig>,
     ) -> Self {
         let (tx, rx) = mpsc::channel::<Job>();
         let counters = Arc::new(Counters::default());
@@ -815,6 +882,7 @@ impl ContinuousBatcher {
         let worker_queue = Arc::clone(&queue);
         let worker_budget = Arc::clone(&budget);
         let worker_aborts = Arc::clone(&aborts);
+        let worker_paged = paged.clone();
         let _join = thread::Builder::new()
             .name("ferrox-continuous-batch".into())
             .spawn(move || {
@@ -827,6 +895,7 @@ impl ContinuousBatcher {
                     worker_queue,
                     worker_budget,
                     worker_aborts,
+                    worker_paged,
                 )
             })
             .expect("spawn continuous-batch worker");
@@ -945,6 +1014,9 @@ fn drain_channel(rx: &Receiver<Job>, waiting: &mut VecDeque<Job>) {
 /// Strict FIFO: a head job that does not fit stops the line rather than
 /// being skipped over. See the module note on why the skip-ahead
 /// alternative is a starvation bug, not an optimization.
+#[allow(clippy::too_many_arguments)] // one per thing admission needs;
+                                     // bundling them would only move the
+                                     // same list behind a struct.
 fn admit(
     decoder: &Arc<Decoder>,
     waiting: &mut VecDeque<Job>,
@@ -953,6 +1025,7 @@ fn admit(
     config: &BatcherConfig,
     queue: &QueueGate,
     budget: &BlockBudget,
+    paged: Option<&PagedKvConfig>,
 ) -> PrefillSnapshot {
     // Counted HERE, as each prompt is accepted, and not read back off
     // the live requests afterwards. By the time this tick's forward has
@@ -974,7 +1047,7 @@ fn admit(
         // Admitted: the job has stopped waiting, so its queue slot goes
         // back now rather than when it was pulled off the channel.
         queue.release();
-        match accept(decoder, job, config.prefill_chunk) {
+        match accept(decoder, job, config.prefill_chunk, paged) {
             Some(prefill) => {
                 snapshot.new_seqs += 1;
                 snapshot.new_tokens += prefill.prompt_tokens;
@@ -1129,6 +1202,7 @@ fn worker_loop(
     queue: Arc<QueueGate>,
     budget: Arc<BlockBudget>,
     aborts: Arc<AbortInbox>,
+    paged: Option<PagedKvConfig>,
 ) {
     let mut rows = Rows::default();
     let mut prefills: VecDeque<Prefill> = VecDeque::new();
@@ -1174,6 +1248,7 @@ fn worker_loop(
             &config,
             &queue,
             &budget,
+            paged.as_ref(),
         );
         if admitted.new_seqs > 0 {
             let status = batch_status(&rows, &prefills, &waiting, &budget);
@@ -1271,11 +1346,45 @@ fn worker_loop(
                 .iter()
                 .map(|&uid| rows.get(uid).unwrap().pos)
                 .collect();
-            let mut cache_refs: Vec<Vec<KvCache>> = active
-                .iter()
-                .map(|&uid| std::mem::take(&mut rows.get_mut(uid).unwrap().caches))
-                .collect();
-            let logits_batch = decoder.forward_multi_seq(&tokens, &positions, &mut cache_refs);
+            // Taken out of the rows for the call and put straight
+            // back below, so one call sees the whole batch. For a paged
+            // row this moves only the per-layer caches; the LEASE stays
+            // in the row, so the page groups stay accounted even though
+            // the caches are momentarily elsewhere.
+            let paged = matches!(rows.get(active[0]).map(|s| &s.kv), Some(RowKv::Paged(_)));
+            let mut contiguous_refs: Vec<Vec<KvCache>> = Vec::new();
+            let mut paged_refs: Vec<Vec<PagedKvCache>> = Vec::new();
+            for &uid in &active {
+                match &mut rows.get_mut(uid).expect("active row exists").kv {
+                    RowKv::Contiguous(c) => contiguous_refs.push(std::mem::take(c)),
+                    RowKv::Paged(lease) => paged_refs.push(std::mem::take(lease.caches_mut())),
+                }
+            }
+            // `j` below indexes `active`, and only one of the two
+            // vectors is populated, so it indexes that one. That holds
+            // because the backing is a server-wide choice and every row
+            // shares it -- asserted rather than assumed, since a mixed
+            // batch would silently pair row `j` with another row's KV.
+            debug_assert!(
+                contiguous_refs.len() == active.len() || paged_refs.len() == active.len(),
+                "every row in a batch must share one KV backing"
+            );
+            let logits_batch = if paged {
+                let store = Arc::clone(match &rows.get(active[0]).expect("active row exists").kv {
+                    RowKv::Paged(lease) => lease.store(),
+                    RowKv::Contiguous(_) => unreachable!("checked above"),
+                });
+                decoder.forward_multi_seq_kv(
+                    &tokens,
+                    &positions,
+                    &mut MultiSeqKv::Paged {
+                        caches: &mut paged_refs,
+                        stores: &store,
+                    },
+                )
+            } else {
+                decoder.forward_multi_seq(&tokens, &positions, &mut contiguous_refs)
+            };
             counters.decode_steps.fetch_add(1, Ordering::Relaxed);
             // Every forward counts; only every Nth emits. The silent
             // ones are exactly what the emitted line's throughput is
@@ -1294,7 +1403,10 @@ fn worker_loop(
                 let slot = rows
                     .get_mut(uid)
                     .expect("an active row cannot vanish mid-step");
-                slot.caches = std::mem::take(&mut cache_refs[j]);
+                match &mut slot.kv {
+                    RowKv::Contiguous(c) => *c = std::mem::take(&mut contiguous_refs[j]),
+                    RowKv::Paged(lease) => *lease.caches_mut() = std::mem::take(&mut paged_refs[j]),
+                }
                 slot.logits = logits_batch[j].clone();
                 slot.pos += 1;
                 if slot.generated_ids.len() >= slot.max_tokens {
@@ -1351,9 +1463,9 @@ impl Prefill {
             abort,
             blocks,
         } = self;
-        let (caches, logits, pos) = state.into_decode_start();
+        let (kv, logits, pos) = state.into_decode_start();
         Slot {
-            caches,
+            kv,
             pos,
             logits,
             sampler: Sampler::new(params.seed),
@@ -1377,7 +1489,12 @@ impl Prefill {
 /// scheduler's own tick, which is the whole point of chunked prefill.
 /// Returns `None` (having replied with the error) for a prompt this
 /// model cannot accept at all.
-fn accept(decoder: &Arc<Decoder>, job: Job, chunk_size: usize) -> Option<Prefill> {
+fn accept(
+    decoder: &Arc<Decoder>,
+    job: Job,
+    chunk_size: usize,
+    paged: Option<&PagedKvConfig>,
+) -> Option<Prefill> {
     let vocab_size = decoder.config.vocab_size;
     if let Some(&bad) = job.prompt_tokens.iter().find(|&&t| t >= vocab_size) {
         let _ = job.reply.send(Err(DecodeError::TokenOutOfVocab {
@@ -1387,8 +1504,32 @@ fn accept(decoder: &Arc<Decoder>, job: Job, chunk_size: usize) -> Option<Prefill
         return None;
     }
 
+    let state = match paged {
+        Some(config) => {
+            // Worst case for this row: its prompt plus everything it
+            // may generate.
+            let max_seq_len = job.prompt_tokens.len() + job.params.max_tokens;
+            match acquire_paged_caches(decoder, config, &job.prompt_tokens, max_seq_len) {
+                Ok(lease) => PrefillState::new_paged(
+                    Arc::clone(decoder),
+                    &job.prompt_tokens,
+                    chunk_size,
+                    lease,
+                ),
+                Err(_) => {
+                    // The block budget said yes and the store said no.
+                    // Refuse this row rather than admit one with no
+                    // pages: the two counts are meant to agree, and the
+                    // store is the one holding real memory.
+                    let _ = job.reply.send(Err(DecodeError::KvPoolExhausted));
+                    return None;
+                }
+            }
+        }
+        None => PrefillState::new(Arc::clone(decoder), &job.prompt_tokens, chunk_size),
+    };
     Some(Prefill {
-        state: PrefillState::new(Arc::clone(decoder), &job.prompt_tokens, chunk_size),
+        state,
         prompt_tokens: job.prompt_tokens.len(),
         params: job.params,
         stop_tokens: job.stop_tokens,
@@ -1481,6 +1622,107 @@ mod tests {
             pos += 1;
         }
         generated
+    }
+
+    /// Continuous batching and paged KV COMPOSE: two concurrent jobs
+    /// over a shared paged store produce the same ids as two sequential
+    /// private-loop generates.
+    ///
+    /// This is what the old exclusivity forbade. The batcher refused to
+    /// run alongside a KV pool or prefix cache because a batched row
+    /// could do neither pool acquisition nor prefix restore; a row that
+    /// holds a `PagedLease` gets both, so the refusal had nothing left
+    /// to protect. Token-for-token, not merely "it runs": the point is
+    /// that turning two independent switches on does not change what
+    /// the model says.
+    #[test]
+    fn continuous_batching_composes_with_paged_kv() {
+        let decoder = tiny_decoder();
+        let prompts: [Vec<usize>; 2] = [vec![1, 2, 3], vec![4, 5]];
+        let params = [greedy_params(6, 7), greedy_params(4, 11)];
+        let sequential: Vec<Vec<usize>> = prompts
+            .iter()
+            .zip(params.iter())
+            .map(|(p, par)| sequential_ids(&decoder, p, par))
+            .collect();
+
+        let paged = PagedKvConfig {
+            store: Arc::new(ferrox_core::cache::SharedPagedKv::new(
+                decoder.layers.len(),
+                /* block_size = */ 4,
+                /* blocks_per_layer = */ 256,
+                decoder.config.n_kv_heads,
+                decoder.config.head_dim,
+            )),
+            queue_wait: std::time::Duration::ZERO,
+            radix: None,
+        };
+        let store = Arc::clone(&paged.store);
+        let free_before = store.free_groups();
+
+        let batcher = ContinuousBatcher::spawn_with_config_paged(
+            Arc::clone(&decoder),
+            identity_decode(),
+            BatcherConfig {
+                prefill_chunk: 1,
+                ..BatcherConfig::default()
+            },
+            Some(paged),
+        );
+        let barrier = Arc::new(Barrier::new(3));
+        let results = Arc::new(Mutex::new(vec![None, None]));
+        let mut threads = Vec::new();
+        for i in 0..2 {
+            let batcher = batcher.clone();
+            let barrier = Arc::clone(&barrier);
+            let results = Arc::clone(&results);
+            let prompt = prompts[i].clone();
+            let par = GenerationParams {
+                max_tokens: params[i].max_tokens,
+                sampling: SamplingParams {
+                    temperature: params[i].sampling.temperature,
+                    top_p: params[i].sampling.top_p,
+                    top_k: params[i].sampling.top_k,
+                    repetition_penalty: params[i].sampling.repetition_penalty,
+                    presence_penalty: params[i].sampling.presence_penalty,
+                    frequency_penalty: params[i].sampling.frequency_penalty,
+                },
+                seed: params[i].seed,
+                stop: vec![],
+                stop_token_ids: Vec::new(),
+                json_object: params[i].json_object,
+                cancel: params[i].cancel.clone(),
+                ignore_eos: false,
+            };
+            threads.push(thread::spawn(move || {
+                barrier.wait();
+                let out = batcher
+                    .generate(prompt, par, StopTokens::default())
+                    .expect("a paged batched row must serve");
+                results.lock().unwrap()[i] = Some(out.1);
+            }));
+        }
+        barrier.wait();
+        for t in threads {
+            t.join().unwrap();
+        }
+        let got = results.lock().unwrap().clone();
+        for (i, want) in sequential.iter().enumerate() {
+            assert_eq!(
+                got[i].as_ref().expect("both rows replied"),
+                want,
+                "row {i}: batching over paged KV changed the ids"
+            );
+        }
+
+        // And every page came back once both rows ended.
+        drop(batcher);
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert_eq!(
+            store.free_groups(),
+            free_before,
+            "a finished batched row must return its pages"
+        );
     }
 
     /// Two concurrent jobs through the batcher must match two sequential
@@ -1864,7 +2106,7 @@ mod tests {
         let params = greedy_params(max_tokens, seed);
         (
             Slot {
-                caches: Vec::new(),
+                kv: RowKv::Contiguous(Vec::new()),
                 pos: 0,
                 logits: Vec::new(),
                 sampler: Sampler::new(seed),
@@ -2544,6 +2786,7 @@ mod tests {
             &config,
             &queue,
             &budget,
+            None,
         );
 
         assert!(
@@ -2564,6 +2807,7 @@ mod tests {
             &config,
             &queue,
             &budget,
+            None,
         );
         assert_eq!(prefills.len(), 2);
         assert!(waiting.is_empty());
@@ -2614,6 +2858,7 @@ mod tests {
             &config,
             &queue,
             &budget,
+            None,
         );
         assert_eq!(prefills.len(), 1, "max_seqs still binds");
         assert_eq!(budget.free(), 7, "only the admitted job reserved");
@@ -2838,6 +3083,7 @@ mod tests {
             &config,
             &queue,
             &budget,
+            None,
         );
         assert_eq!(prefills.len(), 1);
         assert_eq!(budget.free(), 3, "the prefill holds its reservation");
@@ -3097,6 +3343,7 @@ mod tests {
             &BatcherConfig::default(),
             &queue,
             &budget,
+            None,
         );
         assert_eq!(snapshot.new_seqs, 2);
         assert_eq!(
@@ -3114,6 +3361,7 @@ mod tests {
             &BatcherConfig::default(),
             &queue,
             &budget,
+            None,
         );
         assert_eq!(idle, PrefillSnapshot::default());
     }

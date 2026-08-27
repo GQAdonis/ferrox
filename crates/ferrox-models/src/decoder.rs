@@ -441,6 +441,45 @@ impl Lcg {
     }
 }
 
+/// Where a batch of independent sequences keeps its KV.
+///
+/// `forward_multi_seq` batches the projections across sequences but
+/// must attend per sequence, because each has its own length and its
+/// own history. That per-sequence step is the ONLY place the batched
+/// path touches a cache, which is why paging it is a parameter here
+/// rather than a second copy of a 300-line function -- the lesson the
+/// paged decode path taught by losing five model features one at a
+/// time to exactly that kind of copy.
+pub enum MultiSeqKv<'a> {
+    Contiguous(&'a mut [Vec<KvCache>]),
+    Paged {
+        caches: &'a mut [Vec<PagedKvCache>],
+        stores: &'a SharedPagedKv,
+    },
+}
+
+impl MultiSeqKv<'_> {
+    /// Sequences in the batch.
+    pub fn len(&self) -> usize {
+        match self {
+            MultiSeqKv::Contiguous(c) => c.len(),
+            MultiSeqKv::Paged { caches, .. } => caches.len(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Layers each sequence carries, for the shape assertion.
+    fn layers_per_seq(&self, seq: usize) -> usize {
+        match self {
+            MultiSeqKv::Contiguous(c) => c[seq].len(),
+            MultiSeqKv::Paged { caches, .. } => caches[seq].len(),
+        }
+    }
+}
+
 impl Decoder {
     /// Eagerly resolve every kernel lookup this model's dispatch paths
     /// will make, and record it in
@@ -4542,14 +4581,128 @@ impl Decoder {
         positions: &[usize],
         kv_caches: &mut [Vec<KvCache>],
     ) -> Vec<Vec<f32>> {
+        self.forward_multi_seq_kv(tokens, positions, &mut MultiSeqKv::Contiguous(kv_caches))
+    }
+
+    /// Appends one position to sequence `b`'s layer-`l` KV, then
+    /// attends over everything that sequence holds.
+    ///
+    /// The only place `forward_multi_seq_kv` touches a cache, and so
+    /// the only place the backing matters. The contiguous arm keeps
+    /// its three specialised kernels; the paged arm reaches
+    /// `causal_gqa_attention_paged_sinks`, which covers all three of
+    /// them in one entry point and is bit-identical to each by
+    /// construction.
+    #[allow(clippy::too_many_arguments)] // one per thing the step needs
+    fn push_and_attend(
+        &self,
+        kv: &mut MultiSeqKv<'_>,
+        b: usize,
+        l: usize,
+        k: &[f32],
+        v: &[f32],
+        q: &[f32],
+        oai: Option<&GptOssLayer>,
+    ) -> Vec<f32> {
+        let n_heads = self.config.n_heads;
+        let n_kv_heads = self.config.n_kv_heads;
+        let head_dim = self.config.head_dim;
+        let window = self.config.layer_sliding_window(l);
+        match kv {
+            MultiSeqKv::Contiguous(caches) => {
+                let cache = &mut caches[b][l];
+                cache
+                    .push(k, v)
+                    .expect("unbounded/planned KvCache growth is infallible");
+                if let Some(oai) = oai {
+                    return ferrox_core::causal_gqa_attention_sinks(
+                        q,
+                        &cache.k,
+                        &cache.v,
+                        n_heads,
+                        n_kv_heads,
+                        head_dim,
+                        cache.seq_len,
+                        window,
+                        &oai.attn_sinks,
+                    );
+                }
+                match window {
+                    Some(window) => causal_gqa_attention_windowed_softcap(
+                        q,
+                        &cache.k,
+                        &cache.v,
+                        n_heads,
+                        n_kv_heads,
+                        head_dim,
+                        cache.seq_len,
+                        window,
+                        self.config.attn_logit_softcap,
+                    ),
+                    None => causal_gqa_attention_softcap(
+                        q,
+                        &cache.k,
+                        &cache.v,
+                        n_heads,
+                        n_kv_heads,
+                        head_dim,
+                        cache.seq_len,
+                        self.config.attn_logit_softcap,
+                    ),
+                }
+            }
+            MultiSeqKv::Paged { caches, stores } => {
+                let cache = &mut caches[b][l];
+                // Write guard for the push alone, then a read guard for
+                // the attention: the rule `SharedPagedKv` documents.
+                {
+                    let mut store = stores.write(l);
+                    cache
+                        .push(&mut store, k, v)
+                        .expect("the batcher reserves every row's pages at admission");
+                }
+                let store = stores.read(l);
+                ferrox_core::causal_gqa_attention_paged_sinks(
+                    q,
+                    &store,
+                    cache.block_table(),
+                    n_heads,
+                    n_kv_heads,
+                    head_dim,
+                    cache.seq_len(),
+                    window,
+                    oai.map(|o| o.attn_sinks.as_slice()),
+                    // The sink arm carries no softcap, matching the
+                    // contiguous dispatch above.
+                    if oai.is_some() {
+                        None
+                    } else {
+                        self.config.attn_logit_softcap
+                    },
+                )
+            }
+        }
+    }
+
+    /// [`Self::forward_multi_seq`] over either KV backing.
+    ///
+    /// One body for both: the batched projections are identical, and
+    /// the per-sequence attention step is the only place the backing
+    /// shows through.
+    pub fn forward_multi_seq_kv(
+        &self,
+        tokens: &[usize],
+        positions: &[usize],
+        kv: &mut MultiSeqKv<'_>,
+    ) -> Vec<Vec<f32>> {
         assert_eq!(tokens.len(), positions.len());
-        assert_eq!(tokens.len(), kv_caches.len());
+        assert_eq!(tokens.len(), kv.len());
         let batch_size = tokens.len();
         if batch_size == 0 {
             return Vec::new();
         }
-        for seq in kv_caches.iter() {
-            assert_eq!(seq.len(), self.layers.len());
+        for seq in 0..batch_size {
+            assert_eq!(kv.layers_per_seq(seq), self.layers.len());
         }
 
         let hidden_dim = self.config.hidden_dim;
@@ -4657,51 +4810,15 @@ impl Decoder {
             let oai = self.gpt_oss.as_ref().map(|g| &g.layers[l]);
             let mut attn_out_batch = vec![0f32; batch_size * q_width];
             for b in 0..batch_size {
-                let cache = &mut kv_caches[b][l];
-                cache
-                    .push(
-                        &k_batch[b * kv_width..(b + 1) * kv_width],
-                        &v_batch[b * kv_width..(b + 1) * kv_width],
-                    )
-                    .expect("unbounded/planned KvCache growth is infallible");
-                if let Some(oai) = oai {
-                    let attn_out = ferrox_core::causal_gqa_attention_sinks(
-                        &q_batch[b * q_width..(b + 1) * q_width],
-                        &cache.k,
-                        &cache.v,
-                        n_heads,
-                        n_kv_heads,
-                        head_dim,
-                        cache.seq_len,
-                        self.config.layer_sliding_window(l),
-                        &oai.attn_sinks,
-                    );
-                    attn_out_batch[b * q_width..(b + 1) * q_width].copy_from_slice(&attn_out);
-                    continue;
-                }
-                let attn_out = match self.config.layer_sliding_window(l) {
-                    Some(window) => causal_gqa_attention_windowed_softcap(
-                        &q_batch[b * q_width..(b + 1) * q_width],
-                        &cache.k,
-                        &cache.v,
-                        n_heads,
-                        n_kv_heads,
-                        head_dim,
-                        cache.seq_len,
-                        window,
-                        self.config.attn_logit_softcap,
-                    ),
-                    None => causal_gqa_attention_softcap(
-                        &q_batch[b * q_width..(b + 1) * q_width],
-                        &cache.k,
-                        &cache.v,
-                        n_heads,
-                        n_kv_heads,
-                        head_dim,
-                        cache.seq_len,
-                        self.config.attn_logit_softcap,
-                    ),
-                };
+                let attn_out = self.push_and_attend(
+                    kv,
+                    b,
+                    l,
+                    &k_batch[b * kv_width..(b + 1) * kv_width],
+                    &v_batch[b * kv_width..(b + 1) * kv_width],
+                    &q_batch[b * q_width..(b + 1) * q_width],
+                    oai,
+                );
                 attn_out_batch[b * q_width..(b + 1) * q_width].copy_from_slice(&attn_out);
             }
 
@@ -5807,6 +5924,98 @@ mod tests {
     /// makes continuous batching safe -- no sequence's attention may
     /// ever be perturbed by another sequence sharing its batched
     /// matmul step.
+    /// The PAGED batch step must equal the contiguous one, bit for bit.
+    ///
+    /// Continuous batching and paging are independent choices, so a
+    /// deployment can have either, both or neither; if they disagree,
+    /// the answer depends on two switches nobody thinks of as changing
+    /// the model. Every sequence here is at a different position with a
+    /// different length, which is the case the batched path exists for
+    /// and the one where a shared-KV mistake would surface.
+    #[test]
+    fn a_paged_multi_seq_step_is_bit_identical_to_the_contiguous_one() {
+        for cfg in [
+            tiny_test_config(),
+            {
+                let mut c = tiny_test_config();
+                c.sliding_window = Some(2);
+                c.swa_pattern = None;
+                c
+            },
+            {
+                let mut c = tiny_test_config();
+                c.embedding_scale = Some(7.5);
+                c.final_logit_softcap = Some(0.05);
+                c.attn_logit_softcap = Some(0.05);
+                c
+            },
+        ] {
+            let n_layers = 2;
+            let decoder = Decoder::new_random_small(cfg, n_layers, 10);
+            let histories: [&[usize]; 3] = [&[1, 3, 5], &[2, 7], &[4, 4, 4, 6]];
+            let next = [6usize, 1, 2];
+
+            // Contiguous: build each sequence's history, then one step.
+            let mut contiguous: Vec<Vec<KvCache>> = histories
+                .iter()
+                .map(|h| {
+                    let mut caches: Vec<KvCache> = (0..n_layers)
+                        .map(|_| KvCache::new(decoder.config.n_kv_heads, decoder.config.head_dim))
+                        .collect();
+                    for (pos, &tok) in h.iter().enumerate() {
+                        decoder.forward_token(tok, pos, &mut caches);
+                    }
+                    caches
+                })
+                .collect();
+            let positions: Vec<usize> = histories.iter().map(|h| h.len()).collect();
+            let want = decoder.forward_multi_seq(&next, &positions, &mut contiguous);
+
+            // Paged: same histories through the paged decode path, then
+            // one batched step over the shared store.
+            let stores = SharedPagedKv::new(
+                n_layers,
+                /* block_size = */ 2,
+                /* blocks_per_layer = */ 64,
+                decoder.config.n_kv_heads,
+                decoder.config.head_dim,
+            );
+            let mut paged: Vec<Vec<PagedKvCache>> = histories
+                .iter()
+                .map(|h| {
+                    let mut caches: Vec<PagedKvCache> =
+                        (0..n_layers).map(|_| PagedKvCache::new()).collect();
+                    for (pos, &tok) in h.iter().enumerate() {
+                        decoder
+                            .forward_token_paged(tok, pos, &mut caches, &stores)
+                            .expect("sized generously");
+                    }
+                    caches
+                })
+                .collect();
+            let got = decoder.forward_multi_seq_kv(
+                &next,
+                &positions,
+                &mut MultiSeqKv::Paged {
+                    caches: &mut paged,
+                    stores: &stores,
+                },
+            );
+
+            assert_eq!(want.len(), got.len());
+            for (s, (a, b)) in want.iter().zip(got.iter()).enumerate() {
+                assert_eq!(a.len(), b.len(), "sequence {s}: logit count");
+                for (x, y) in a.iter().zip(b.iter()) {
+                    assert_eq!(
+                        x.to_bits(),
+                        y.to_bits(),
+                        "sequence {s}: paged batching changed the answer"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn forward_multi_seq_matches_independent_forward_token_per_sequence() {
         let cfg = tiny_test_config();

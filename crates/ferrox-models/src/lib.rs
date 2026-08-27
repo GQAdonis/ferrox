@@ -60,7 +60,7 @@ pub use capability::{
     ArchPath, ArchProfile, ArchScope, DecoderFamily, MemoryKind, QkNormStyle,
 };
 pub use config::{deepseek_v4_pro, glm_5_2, kimi_k3, FfnActivation, ModelConfig, RopeLayout};
-pub use decoder::Decoder;
+pub use decoder::{Decoder, MultiSeqKv};
 pub use device_budget::{BudgetBackend, DeviceBudget};
 pub use engine::{
     DeepseekV4Engine, Engine, Glm52Engine, KimiEngine, MlaDenseFfn, MlaEngine, MlaLayerFfn,

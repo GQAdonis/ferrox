@@ -575,6 +575,9 @@ fn run_load_task(state: Arc<AppState>, task: Arc<Task>, id: String, path: String
         loaded,
         state.continuous_batching_enabled,
         Some(path.as_str()),
+        // A hot-swapped model reuses the server's paged store: the
+        // pages are the deployment's memory, not the model's.
+        state.paged_kv.as_ref(),
     );
     let previous = state.swap_active(Some(Arc::new(ActiveModel {
         id: Some(id.clone()),

@@ -235,7 +235,7 @@ fn rope_layout_matches_llama_cpp() {
 ///
 /// This is the hole `rope_layout_matches_llama_cpp` had: its lookup
 /// miss is a `continue`, so an arch absent from the reference table is
-/// silently exempt — and the `LLAMA_ROPE_TYPE_NONE` group was absent by
+/// silently exempt, and the `LLAMA_ROPE_TYPE_NONE` group was absent by
 /// design. `gpt2`, `bloom`, `mpt`, `refact` and `jais` were all admitted
 /// as `GenericGqa { rope: Neox }` and skipped by the only test that
 /// could have said so.

@@ -271,7 +271,7 @@ pub fn architecture_catalog() -> &'static [ArchProfile] {
         // group, and these five sat on ferrox's NEOX list instead. The
         // generic decoder rotates every Q/K head of every layer, so each
         // of them loaded, ran at full speed, and answered fluently from
-        // positions the checkpoint never encodes that way — the same
+        // positions the checkpoint never encodes that way, the same
         // silent failure the 24-arch RoPE audit found, one level worse,
         // because here the right answer is *no rotation*.
         //

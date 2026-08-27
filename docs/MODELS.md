@@ -137,7 +137,7 @@ The error always names the reason. Five things cause it:
    hardcode their ALiBi slope in llama.cpp's own loader and carry no
    GGUF key at all, and `mpt` leaves no unread tensor behind, so neither
    check 3 nor check 4 could ever see them. `baichuan` is the same
-   problem conditionally — the 7B rotates, the 13B uses ALiBi, and
+   problem conditionally: the 7B rotates, the 13B uses ALiBi, and
    llama.cpp tells them apart by layer count alone, so a 40-layer
    Baichuan is refused and a 32-layer one is not.
 

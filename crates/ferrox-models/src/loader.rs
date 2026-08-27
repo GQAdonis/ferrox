@@ -202,12 +202,12 @@ impl ModelConfig {
                 .ok_or_else(|| LoadError::MissingHparam(key("block_count")))? as usize;
         // Baichuan is one architecture string covering two positional
         // schemes: 7B rotates, 13B uses ALiBi and no RoPE at all
-        // (`src/models/baichuan.cpp:11-14`, `:57-58` — `inp_pos` is
+        // (`src/models/baichuan.cpp:11-14`, `:57-58`, where `inp_pos` is
         // `nullptr` for 13B, so `ggml_rope_ext` is never reached).
         // llama.cpp decides that on the layer count and says so in a
         // comment: "TODO: become GGUF KV parameter". There is therefore
         // no key for `capability::unsupported_feature_keys` to test and
-        // no tensor for `assert_every_tensor_consumed` to miss — a
+        // no tensor for `assert_every_tensor_consumed` to miss. A
         // Baichuan-13B checkpoint loads clean and is rotated anyway.
         // Refuse it here, where the layer count is known.
         if arch == "baichuan" && n_layers == 40 {

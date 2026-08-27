@@ -1164,7 +1164,14 @@ impl Decoder {
                 config.ffn_activation,
                 crate::config::FfnActivation::Swiglu | crate::config::FfnActivation::SwigluFused
             )
-            && matches!(layer.moe.experts, ExpertBacking::Resident(_))
+            // Streamed experts are eligible too. They were excluded
+            // while the fused launch could not hold all of top-k at
+            // once; it can now, by materialising each expert into an
+            // owned view that carries its own pin on the store entry.
+            && matches!(
+                layer.moe.experts,
+                ExpertBacking::Resident(_) | ExpertBacking::Stored { .. }
+            )
             && Self::metal_matvec_launch(&layer.moe.router).is_some()
             && Self::metal_matvec_launch(&layer.attn.q_proj).is_some()
             && Self::metal_matvec_launch(&layer.attn.k_proj).is_some()
@@ -1214,9 +1221,27 @@ impl Decoder {
             }
         }
 
-        // Hold expert refs: Resident experts are in a Vec; with_expert
-        // only borrows one at a time. For Resident backing we can get
-        // all launches by indexing once.
+        // A `MatvecLaunch` borrows the expert's bytes, so every expert
+        // in the batch has to stay alive until the command buffer is
+        // encoded. Resident experts live in a `Vec` and can simply be
+        // indexed. Streamed experts used to fall back to the CPU here,
+        // on the reasoning that `with_expert` lends one at a time so
+        // all of top-k could not be held at once.
+        //
+        // That was true of `with_expert` and not of the store beneath
+        // it: `StoredExpertLayout::materialize` returns an OWNED
+        // `ExpertWeights` whose `WeightBytes::Shared` clones the
+        // lease's `Arc`, so each one carries its own pin and the store
+        // cannot evict it while the view is alive. Materialising all of
+        // top-k into a vector that outlives the launches is therefore
+        // sound, and the vector is what holds the pins.
+        //
+        // The fallback was not a small loss. Expert streaming is how a
+        // model larger than memory runs at all, so refusing the fused
+        // path here meant that turning streaming on silently disabled
+        // the Metal MoE kernels: exactly the configuration where the
+        // GPU matters most ran on the CPU instead.
+        let streamed: Vec<ExpertWeights>;
         match &layer.moe.experts {
             ExpertBacking::Resident(experts) => {
                 for p in &pending {
@@ -1229,9 +1254,42 @@ impl Decoder {
                     });
                 }
             }
-            ExpertBacking::Stored { .. } => {
-                // Streaming experts: fall back (can't hold all refs easily).
-                return None;
+            ExpertBacking::Stored {
+                store,
+                layouts,
+                layer: layer_idx,
+            } => {
+                // Ask for the whole batch before touching any of it, so
+                // a miss on the last expert cannot evict the first: the
+                // store is bounded, and top-k reads are what compete
+                // for it.
+                let keys: Vec<_> = pending
+                    .iter()
+                    .map(|p| ferrox_core::expert_store::ExpertKey {
+                        layer: *layer_idx,
+                        expert: p.eid as u32,
+                    })
+                    .collect();
+                store.prefetch(&keys);
+
+                let mut held = Vec::with_capacity(pending.len());
+                for (p, key) in pending.iter().zip(keys) {
+                    // A read failure here is not fatal: the CPU path
+                    // reads the same bytes and will report it. Falling
+                    // back beats panicking mid-decode.
+                    let lease = store.acquire(key).ok()?;
+                    held.push(layouts[p.eid].materialize(&lease));
+                }
+                streamed = held;
+
+                for (p, ex) in pending.iter().zip(streamed.iter()) {
+                    launches.push(ferrox_metal::gpu::MoeExpertLaunch {
+                        gate: Self::metal_matvec_launch(&ex.gate)?,
+                        up: Self::metal_matvec_launch(&ex.up)?,
+                        down: Self::metal_matvec_launch(&ex.down)?,
+                        weight: p.weight,
+                    });
+                }
             }
         }
 

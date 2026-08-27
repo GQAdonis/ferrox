@@ -437,6 +437,77 @@ fn split_gguf_metadata_only_first_shard_drives_model_config_derivation() {
 
 /// The unchanged-output gate for store-backed experts: the MoE fixture
 /// loaded with routed experts streaming through the bounded
+/// The FUSED METAL MoE path must accept streamed experts and agree with
+/// resident experts, on hardware.
+///
+/// This is the configuration that matters most and was silently the
+/// slowest: `ExpertBacking::Stored` used to fall back to the CPU inside
+/// `metal_moe_topk`, so switching expert streaming on, which is how a
+/// model larger than memory runs at all, turned the Metal MoE kernels
+/// OFF. The comment there said all of top-k could not be held at once.
+/// That was true of `with_expert`, which lends one expert at a time,
+/// and not of the store: `materialize` hands back an owned view whose
+/// `WeightBytes::Shared` clones the lease's `Arc`, so each view pins
+/// its own entry.
+///
+/// A 1-byte budget is included deliberately: it forces every acquire to
+/// miss, so the launches are built over buffers the store is free to
+/// drop the instant a pin is released. If the pins were wrong, this is
+/// the budget that would expose it.
+///
+/// `#[ignore]`d because it needs a real Metal device. Run with
+/// `cargo test -p ferrox-models --features metal -- --ignored`.
+#[test]
+#[ignore]
+#[cfg(feature = "metal")]
+fn metal_fused_moe_agrees_between_streamed_and_resident_experts() {
+    let fixture_path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/ferrox_real_moe_test.gguf"
+    );
+    let cfg = ferrox_models::config::test_moe_fixture;
+
+    // SAFETY: single-threaded test process, set before any decode.
+    unsafe {
+        std::env::set_var("FERROX_METAL", "1");
+        std::env::set_var("FERROX_METAL_ATTN", "1");
+    }
+
+    let resident = Decoder::from_gguf(fixture_path, cfg()).expect("resident load");
+    for budget in [64 * 1024 * 1024u64, 1u64] {
+        let stored = Decoder::from_gguf_with_expert_cache(fixture_path, cfg(), Some(budget))
+            .expect("store-backed load");
+
+        let mut caches_a: Vec<KvCache> = resident
+            .layers
+            .iter()
+            .map(|_| KvCache::new(resident.config.n_kv_heads, resident.config.head_dim))
+            .collect();
+        let mut caches_b: Vec<KvCache> = stored
+            .layers
+            .iter()
+            .map(|_| KvCache::new(stored.config.n_kv_heads, stored.config.head_dim))
+            .collect();
+
+        for (pos, tok) in [2usize, 5, 9, 1].iter().enumerate() {
+            let a = resident.forward_token(*tok, pos, &mut caches_a);
+            let b = stored.forward_token(*tok, pos, &mut caches_b);
+            assert_eq!(
+                a.len(),
+                b.len(),
+                "budget={budget}: logit vectors differ in length at pos {pos}"
+            );
+            // Both sides run the same Metal kernels over the same
+            // bytes, so this is exact rather than approximate.
+            assert_eq!(
+                a, b,
+                "budget={budget}: streamed experts must match resident on the fused \
+                 Metal path at pos {pos}"
+            );
+        }
+    }
+}
+
 /// `ExpertStore` must produce logits bit-identical to the resident
 /// (mmap) path -- with a generous budget (everything cacheable) AND
 /// with a budget smaller than one decode step's expert union (every

@@ -79,6 +79,26 @@ library or overriding the CLI.
 | `FERROX_PREFIX_CACHE_ENTRIES` | Prefix-cache capacity for the private generate path: whole KV snapshots in an LRU list, reported under `GET /cache/stats`. Mutually exclusive with continuous batching and with paged KV. Paged KV carries no such exclusion: it composes with continuous batching and shares prefixes through the radix tree instead |
 | `FERROX_EXPERT_CACHE_BYTES` | MoE expert-streaming cache budget |
 | `FERROX_SSD_STREAMING` | `1`, stream MoE experts from disk |
+
+Streaming is **off by default and turns itself on only when the weights
+will not fit.** It is strictly slower than running resident, so it is a
+way to run a model that otherwise could not run at all, not a default.
+The automatic decision compares the checkpoint's size against the host's
+available memory, reserves 4 GiB for the KV cache and activations, and
+if the weights still do not fit it enables streaming and logs the two
+figures and the cache size it chose.
+
+`FERROX_SSD_STREAMING=0` refuses that: it forces resident loading even
+when the weights do not fit, because an operator who says so may know
+something the probe does not. `FERROX_EXPERT_CACHE_BYTES` sets the
+budget explicitly and also wins over the automatic choice. A host whose
+available memory cannot be determined resolves to resident rather than
+to streaming: guessing a machine is short would silently put every user
+on the slow path.
+
+On Metal there is a further cost today. Several MoE fast paths still
+accept only resident experts, so streaming currently gives up the fused
+Metal MoE kernels as well. The warning says so when it fires.
 | `FERROX_GPU_VRAM_BUDGET_BYTES` | Cap GPU-resident MoE experts (`0` = CPU experts on Metal) |
 | `FERROX_DEVICE_BUDGET_BYTES` | Override the probed memory budget the pre-load KV check plans against (Metal `recommendedMaxWorkingSetSize` / free VRAM / host RAM minus a reserve). For container limits and shared GPUs |
 | `FERROX_PIN_BUDGET_GB` | Override the page-locking budget expert-bank placement plans against. Unset means no cap on plain Linux; on WSL, where WDDM-backed CUDA caps pinning near half of RAM *shared across processes*, it defaults to 40% of physical RAM |

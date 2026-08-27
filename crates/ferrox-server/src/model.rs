@@ -47,6 +47,57 @@ fn env_truthy(name: &str) -> bool {
     )
 }
 
+/// Headroom left for the KV cache, activations and the OS when
+/// deciding whether weights fit. A model that fills memory to the last
+/// byte leaves nothing to decode with.
+const FIT_HEADROOM_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+
+/// Streams experts only when the weights do not fit, and says why.
+///
+/// Streaming is OFF by default and stays off: it is strictly slower
+/// than resident, so it is a way to run a model that otherwise could
+/// not run at all, not a default. But requiring an operator to know in
+/// advance is its own failure: without this, meeting a model too large
+/// for the machine means a failed load rather than a slow success.
+///
+/// Explicit settings always win, in both directions.
+/// `FERROX_SSD_STREAMING=0` forces resident even when the weights do
+/// not fit, because an operator who says so may know something this
+/// does not, such as a machine about to free memory.
+fn auto_stream_if_needed(weight_bytes: u64) -> Option<u64> {
+    // An explicit refusal is authoritative.
+    if matches!(
+        std::env::var("FERROX_SSD_STREAMING").ok().as_deref(),
+        Some("0") | Some("false") | Some("off")
+    ) {
+        return None;
+    }
+    let available = ferrox_core::host_memory::available_bytes();
+    match ferrox_core::host_memory::plan_for(
+        weight_bytes,
+        available,
+        FIT_HEADROOM_BYTES,
+        DEFAULT_SSD_STREAMING_CACHE_BYTES,
+    ) {
+        ferrox_core::host_memory::FitPlan::Resident => None,
+        ferrox_core::host_memory::FitPlan::Stream { cache_bytes } => {
+            let gib = |b: u64| b as f64 / 1024.0 / 1024.0 / 1024.0;
+            tracing::warn!(
+                "weights are {:.1} GiB and only {:.1} GiB is available after reserving \
+                 {:.1} GiB, so expert streaming was enabled automatically with a {:.1} GiB \
+                 cache. This is SLOWER than running resident, and on Metal it currently \
+                 also gives up the fused MoE kernels. Set FERROX_SSD_STREAMING=0 to refuse \
+                 instead, or FERROX_EXPERT_CACHE_BYTES to choose the budget yourself.",
+                gib(weight_bytes),
+                available.map(gib).unwrap_or(0.0),
+                gib(FIT_HEADROOM_BYTES),
+                gib(cache_bytes),
+            );
+            Some(cache_bytes)
+        }
+    }
+}
+
 /// Resolves the opt-in expert-streaming cache budget from
 /// `FERROX_EXPERT_CACHE_BYTES` and/or `FERROX_SSD_STREAMING`.
 fn resolve_expert_cache_bytes() -> anyhow::Result<Option<u64>> {
@@ -67,7 +118,19 @@ fn resolve_expert_cache_bytes() -> anyhow::Result<Option<u64>> {
         tracing::info!("expert streaming enabled: bounded cache of {b} bytes");
         Ok(Some(b))
     } else {
+        // Nothing explicit. Fall through to the automatic decision at
+        // the call site, which needs the file size and so cannot be
+        // made here.
         Ok(None)
+    }
+}
+
+/// The budget to use for a model of `weight_bytes`, explicit if the
+/// operator set one and automatic otherwise.
+fn expert_cache_bytes_for(weight_bytes: u64) -> anyhow::Result<Option<u64>> {
+    match resolve_expert_cache_bytes()? {
+        Some(explicit) => Ok(Some(explicit)),
+        None => Ok(auto_stream_if_needed(weight_bytes)),
     }
 }
 
@@ -478,7 +541,10 @@ fn load_real_gguf_checkpoint(path: &str, file: &ShardedGguf) -> anyhow::Result<G
     // budget across all layers), reading from the checkpoint file on
     // miss. Output is bit-identical to resident loading (same bytes,
     // same kernels); the trade is RAM footprint vs. read I/O.
-    let expert_cache_bytes = resolve_expert_cache_bytes()?;
+    // The file's own size is the weight footprint, which is what the
+    // automatic decision needs and why it cannot be made without a path.
+    let weight_bytes = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    let expert_cache_bytes = expert_cache_bytes_for(weight_bytes)?;
     let decoder = Decoder::from_gguf_with_expert_cache(path, config, expert_cache_bytes)?;
 
     Ok(GgufLoaded {
@@ -536,7 +602,25 @@ pub(crate) fn load_kimi_checkpoint_with_config(
     // FERROX_SSD_STREAMING) streams routed experts through one bounded,
     // lease-protected store instead of holding every expert object
     // resident (bit-identical output).
-    let expert_cache_bytes = resolve_expert_cache_bytes()?;
+    // Every shard beside the index, summed. An unreadable directory
+    // yields 0, which resolves to Resident: refusing to guess beats
+    // putting a model that would have fitted onto the slow path.
+    let weight_bytes: u64 = index_path
+        .parent()
+        .and_then(|dir| std::fs::read_dir(dir).ok())
+        .map(|entries| {
+            entries
+                .filter_map(|e| e.ok())
+                .filter(|e| {
+                    e.path()
+                        .extension()
+                        .is_some_and(|x| x == "safetensors" || x == "gguf")
+                })
+                .filter_map(|e| e.metadata().ok().map(|m| m.len()))
+                .sum()
+        })
+        .unwrap_or(0);
+    let expert_cache_bytes = expert_cache_bytes_for(weight_bytes)?;
     let weights = ferrox_models::kimi_loader::load_kimi_checkpoint_with_expert_cache(
         &shard,
         &model_cfg,

@@ -74,7 +74,7 @@ OLMoE (1.11×) and Gemma-3-1B (1.18×) on Metal.
 | MLA (`deepseek2` / `mistral4`) | Dense-lead + MoE-after-dense via `MlaEngine` |
 | GLM4 / glm4moe | Loads via the GLM-5.2 path when the tensors are there. Never measured in the suite |
 | Gemma-4-E2B | Dedicated `Gemma4Engine` + SPM-style `gemma4` BPE tokenizer + `<|turn>` chat wrap. GGUF: `models/gemma-4-E2B-it-Q4_K_M.gguf` (`unsloth/gemma-4-E2B-it-GGUF`). Suite id `gemma4_e2b_q4km`, Homebrew llama may still lack `gemma4` arch. |
-| gpt-oss | **CPU only.** Attention sinks, alternating sliding-window attention, biased router and the `swiglu_oai` clamp, checked against llama.cpp's own reference logits. Metal and the paged-KV decode path both stop with an error on it, because neither computes that attention shape |
+| gpt-oss | **CPU only.** Attention sinks, alternating sliding-window attention, biased router and the `swiglu_oai` clamp, checked against llama.cpp's own reference logits. Metal stops with an error, because no Metal kernel implements attention sinks. The paged-KV decode path runs it: all three attention arms are bit-identical to their contiguous twins |
 | Llama 4 / MiniMax | **Will not load**, with the reason stated: `llama4 MoE + non-GQA attn` and `MiniMax 256-expert sigmoid MoE + MTP` |
 | Hybrid GDN / Qwen3.5 | Scaffold only |
 | Kimi K3 / GLM-5.2 / DeepSeek V4 | Loaders and primitives only. Nothing has been run end to end on a real checkpoint |
@@ -161,6 +161,15 @@ published `UD-*` checkpoint.
 | CPU | Dense and MoE. `FERROX_CPU_INT_DOT=1` (Q4_Kx8 / Q8_0x4 / Q5·Q6 int-dot) on suite runs |
 | Metal | Dense, MoE, FA-vec, fused MoE encode groups, `mul_mm_id` prefill, quantized KV |
 | CUDA | Matvec + resident weights + FFN fuse |
+
+Every number on this page was taken on CPU or Apple Metal. CUDA compiles
+and runs, has no pinned benchmark host, and has no published timings, so
+treat a Windows or Linux install as CPU-only in practice.
+
+Paged KV is CPU only as well. On Metal or CUDA the paged attention path
+returns wrong tokens rather than failing, so `ferrox-server` stops at
+startup when `FERROX_PAGED_KV_BLOCKS` is set beside `-dev metal` or
+`-dev cuda`. See [`CONFIG.md`](CONFIG.md).
 
 Capabilities overview: [`FEATURES.md`](FEATURES.md).
 Planned work: [`ROADMAP.md`](ROADMAP.md).

@@ -1,17 +1,16 @@
-import {
-  createContext,
-  useCallback,
-  useContext,
-  useEffect,
-  useState,
-} from "react";
-import {
-  AssistantRuntimeProvider,
-  type AssistantRuntime,
-} from "@assistant-ui/react";
+import { useCallback, useEffect, useState } from "react";
+import { AssistantRuntimeProvider } from "@assistant-ui/react";
 import * as Popover from "@radix-ui/react-popover";
 import { Link, useOutletContext } from "react-router";
-import { Check, ChevronDown, Loader2, SlidersHorizontal, SquarePen } from "lucide-react";
+import {
+  Check,
+  ChevronDown,
+  Loader2,
+  MessagesSquare,
+  SlidersHorizontal,
+  SquarePen,
+  Trash2,
+} from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Field, Input, Textarea } from "@/components/ui/field";
 import { Notice } from "@/components/ui/feedback";
@@ -33,7 +32,11 @@ import {
   useFerroxRuntime,
   type Sampling,
 } from "@/screens/chat/runtime";
-import { clearTranscript, usePersistedThread } from "@/screens/chat/persistence";
+import {
+  useTranscript,
+  type Transcript,
+} from "@/screens/chat/persistence";
+import { conversationLabel } from "@/lib/conversations";
 
 const SETTINGS_KEY = "ferrox.studio.sampling.v1";
 
@@ -315,6 +318,95 @@ function SamplingPanel({
   );
 }
 
+/**
+ * The saved conversations, and the switch between them.
+ *
+ * Only rendered when the server actually keeps conversations. In local
+ * mode there is exactly one transcript and a list of it would be a
+ * menu with one entry pretending to be a library.
+ */
+function ConversationPicker({ transcript }: { transcript: Transcript }) {
+  const { summaries, current } = transcript;
+
+  return (
+    <Popover.Root
+      onOpenChange={(open) => {
+        if (open) transcript.refresh();
+      }}
+    >
+      <Popover.Trigger asChild>
+        <Button variant="default" size="sm" className="max-w-[14rem]">
+          <MessagesSquare className="text-faint" />
+          <span className="truncate text-[0.6875rem]">
+            {current ? conversationLabel(current) : "New conversation"}
+          </span>
+          <ChevronDown className="text-faint" />
+        </Button>
+      </Popover.Trigger>
+      <Popover.Portal>
+        <Popover.Content
+          align="end"
+          sideOffset={6}
+          collisionPadding={12}
+          className="z-50 w-[min(26rem,calc(100vw-1.5rem))] rounded-card border border-line bg-raised p-1.5 shadow-pop data-[state=open]:animate-in data-[state=open]:fade-in-0 data-[state=open]:zoom-in-95"
+        >
+          {!summaries.length ? (
+            <p className="p-2 text-xs text-faint">
+              Nothing saved yet. A conversation is created on this server the
+              first time you send a message.
+            </p>
+          ) : (
+            <ul className="max-h-80 space-y-0.5 overflow-y-auto">
+              {summaries.map((entry) => {
+                const isActive = entry.id === current?.id;
+                return (
+                  <li key={entry.id} className="flex items-center gap-1">
+                    <button
+                      type="button"
+                      onClick={() => transcript.open(entry.id)}
+                      className={cn(
+                        "min-w-0 flex-1 rounded-lg px-2 py-1.5 text-left transition-colors",
+                        isActive
+                          ? "bg-accent-soft text-accent"
+                          : "hover:bg-inset",
+                      )}
+                    >
+                      <span className="block truncate text-xs">
+                        {conversationLabel(entry)}
+                      </span>
+                      <span className="block truncate text-[0.6875rem] text-faint">
+                        {[
+                          `${entry.message_count} message${entry.message_count === 1 ? "" : "s"}`,
+                          entry.model,
+                        ]
+                          .filter(Boolean)
+                          .join(" · ")}
+                      </span>
+                    </button>
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      title="Delete this conversation from the server"
+                      onClick={() => transcript.remove(entry.id)}
+                    >
+                      <Trash2 />
+                    </Button>
+                  </li>
+                );
+              })}
+            </ul>
+          )}
+          <p className="mt-1 border-t border-line px-2 pt-1.5 text-[0.6875rem] text-faint">
+            Stored on the server, not in this browser. Deleting one deletes it
+            for every client of this server, and nothing is ever deleted to
+            make room.
+          </p>
+        </Popover.Content>
+      </Popover.Portal>
+    </Popover.Root>
+  );
+}
+
 function ChatInner({
   sampling,
   setSampling,
@@ -322,6 +414,7 @@ function ChatInner({
   refreshServing,
   stall,
   transport,
+  transcript,
 }: {
   sampling: Sampling;
   setSampling: (next: Sampling) => void;
@@ -329,10 +422,8 @@ function ChatInner({
   refreshServing: () => void;
   stall: string | null;
   transport: string | null;
+  transcript: Transcript;
 }) {
-  const runtime = useFerroxRuntimeContext();
-  usePersistedThread(runtime);
-
   const disabledReason = serving.modelId
     ? null
     : serving.error
@@ -346,25 +437,33 @@ function ChatInner({
         {serving.synthetic ? (
           <Badge tone="err">synthetic weights</Badge>
         ) : null}
+        {transcript.saving ? (
+          <span className="text-[0.6875rem] text-faint">saving…</span>
+        ) : null}
         <span className="flex-1" />
+        {transcript.mode === "server" ? (
+          <ConversationPicker transcript={transcript} />
+        ) : null}
         <ModelSwitcher active={serving.modelId} onSwitched={refreshServing} />
         <SamplingPanel value={sampling} onChange={setSampling} />
-        <Button
-          variant="ghost"
-          size="sm"
-          onClick={() => {
-            runtime.thread.cancelRun();
-            runtime.thread.reset();
-            clearTranscript();
-          }}
-        >
+        <Button variant="ghost" size="sm" onClick={transcript.newChat}>
           <SquarePen />
           <span className="hidden sm:inline">New chat</span>
         </Button>
       </header>
 
-      {stall || transport || serving.synthetic || disabledReason ? (
+      {stall ||
+      transport ||
+      serving.synthetic ||
+      disabledReason ||
+      transcript.error ? (
         <div className="shrink-0 space-y-2 border-b border-line bg-raised/40 px-4 py-2.5">
+          {transcript.error ? (
+            <Notice tone="err">
+              This conversation is not being saved: {transcript.error} The
+              messages on screen are unaffected, and the next change retries.
+            </Notice>
+          ) : null}
           {disabledReason ? (
             <Notice tone="warn">
               {disabledReason}{" "}
@@ -389,25 +488,18 @@ function ChatInner({
           disabledReason={disabledReason}
           footer={
             <p className="text-center text-[0.6875rem] text-faint">
-              Transcript is stored in this browser only — this server has no
-              conversation API.
+              {transcript.mode === "server"
+                ? "Transcript is stored on the server, branches included, and survives this browser."
+                : transcript.mode === "local"
+                  ? (transcript.reason ??
+                    "Transcript is stored in this browser only.")
+                  : "Checking where this transcript will be stored…"}
             </p>
           }
         />
       </div>
     </div>
   );
-}
-
-// `useFerroxRuntime` must run above `AssistantRuntimeProvider`, and
-// `usePersistedThread` needs the same object; passing it down through a
-// tiny context keeps both without prop-drilling the runtime into every
-// child that happens to sit under the provider.
-const RuntimeContext = createContext<AssistantRuntime | null>(null);
-function useFerroxRuntimeContext(): AssistantRuntime {
-  const runtime = useContext(RuntimeContext);
-  if (!runtime) throw new Error("no runtime in scope");
-  return runtime;
 }
 
 export function ChatScreen() {
@@ -458,18 +550,24 @@ export function ChatScreen() {
       ),
   });
 
+  // Above the provider on purpose: the sync loop needs the runtime
+  // object itself (export/import/subscribe), not the React context a
+  // component under the provider would read.
+  const transcript = useTranscript(runtime, {
+    model: () => servingRef.current.modelId,
+  });
+
   return (
-    <RuntimeContext.Provider value={runtime}>
-      <AssistantRuntimeProvider runtime={runtime}>
-        <ChatInner
-          sampling={sampling}
-          setSampling={setSampling}
-          serving={serving}
-          refreshServing={refreshServing}
-          stall={stall}
-          transport={transport}
-        />
-      </AssistantRuntimeProvider>
-    </RuntimeContext.Provider>
+    <AssistantRuntimeProvider runtime={runtime}>
+      <ChatInner
+        sampling={sampling}
+        setSampling={setSampling}
+        serving={serving}
+        refreshServing={refreshServing}
+        stall={stall}
+        transport={transport}
+        transcript={transcript}
+      />
+    </AssistantRuntimeProvider>
   );
 }

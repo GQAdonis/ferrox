@@ -1,0 +1,291 @@
+// The conversation store, as this app sees it: the wire types for
+// `/v1/conversations`, and the two pure translations between the
+// server's message tree and assistant-ui's exported repository.
+//
+// The translations live here rather than in the Chat screen because
+// they are the part worth testing without a browser: "which nodes have
+// not been stored yet" is where a sync loop either duplicates a message
+// or silently drops one, and both failures are invisible until someone
+// reloads the page a day later.
+//
+// The server's shape is deliberately neutral -- role, text, parent --
+// so a transcript is readable by something that is not this app.
+// Everything assistant-ui needs and the server does not understand
+// rides in `metadata`, which the server stores opaquely and hands back
+// byte-identical.
+
+import { getJson, postJson, routes } from "./api.ts";
+
+export type ConversationRole = "user" | "assistant" | "system";
+
+/** One node of the stored tree. */
+export type StoredMessage = {
+  id: string;
+  parent_id: string | null;
+  role: ConversationRole;
+  content: string;
+  created_at: number;
+  metadata?: Record<string, unknown> | null;
+};
+
+export type Conversation = {
+  object: "conversation";
+  id: string;
+  title: string | null;
+  model: string | null;
+  created_at: number;
+  updated_at: number;
+  head_id: string | null;
+  messages: StoredMessage[];
+};
+
+/**
+ * A listed conversation.
+ *
+ * Tagged differently from a full one by the server on purpose: it
+ * carries no `messages`, and a client that treated the two as the same
+ * shape would render an empty transcript and believe it.
+ */
+export type ConversationSummary = {
+  object: "conversation.summary";
+  id: string;
+  title: string | null;
+  model: string | null;
+  created_at: number;
+  updated_at: number;
+  head_id: string | null;
+  message_count: number;
+};
+
+/** A message on the way to the server. It states no timestamp: the
+ * server stamps that, and a client-supplied one would be a claim. */
+export type NewMessage = {
+  id: string;
+  parent_id: string | null;
+  role: ConversationRole;
+  content: string;
+  metadata?: Record<string, unknown>;
+};
+
+export type CreateBody = {
+  title?: string;
+  model?: string;
+  head_id?: string;
+  messages?: NewMessage[];
+};
+
+export type UpdateBody = {
+  title?: string;
+  model?: string;
+  head_id?: string;
+  append?: NewMessage[];
+};
+
+// ---------------------------------------------------------------------
+// HTTP
+// ---------------------------------------------------------------------
+
+export async function listConversations(): Promise<ConversationSummary[]> {
+  const body = await getJson<{ data?: ConversationSummary[] }>(
+    routes.conversations,
+  );
+  return body?.data ?? [];
+}
+
+export function createConversation(body: CreateBody): Promise<Conversation> {
+  return postJson<Conversation>(routes.conversations, body);
+}
+
+export function getConversation(id: string): Promise<Conversation> {
+  return getJson<Conversation>(routes.conversation(id));
+}
+
+export function updateConversation(
+  id: string,
+  body: UpdateBody,
+): Promise<Conversation> {
+  return postJson<Conversation>(routes.conversation(id), body);
+}
+
+export function deleteConversation(id: string): Promise<unknown> {
+  return postJson(routes.conversationDelete(id), {});
+}
+
+// ---------------------------------------------------------------------
+// assistant-ui <-> the store
+// ---------------------------------------------------------------------
+
+/**
+ * The parts of an exported node this module reads.
+ *
+ * Structural rather than imported from `@assistant-ui/react` so that
+ * this file stays importable by node's test runner without pulling a
+ * React tree in behind it. The real type is wider; nothing here needs
+ * the rest of it.
+ */
+export type ExportedItem = {
+  parentId: string | null;
+  message: {
+    id?: string;
+    role: string;
+    content: readonly { type: string; text?: string }[];
+    status?: { type: string; reason?: string };
+    metadata?: Record<string, unknown>;
+  };
+};
+
+export type ExportedRepository = {
+  headId?: string | null;
+  messages: readonly ExportedItem[];
+};
+
+const ROLES: ReadonlySet<string> = new Set(["user", "assistant", "system"]);
+
+/** Text parts, concatenated. Anything else in the message is not text
+ * and is not what a transcript stores. */
+export function plainText(
+  content: readonly { type: string; text?: string }[],
+): string {
+  return content
+    .filter((part) => part.type === "text" && typeof part.text === "string")
+    .map((part) => part.text as string)
+    .join("");
+}
+
+/**
+ * Whether a node is finished enough to store.
+ *
+ * A message still streaming is skipped, not stored-then-updated: the
+ * server's append is an append, ids are unique, and a half-decoded
+ * answer written now would have to be rewritten on every token. It is
+ * picked up on the tick after the stream ends.
+ *
+ * A failed answer is skipped for good. There is nothing in it worth
+ * replaying to the model, and `toWire` in the runtime already refuses
+ * to send one, so storing it would put a message in the transcript that
+ * the next turn silently drops.
+ */
+export function isStorable(message: ExportedItem["message"]): boolean {
+  if (!message.id || !ROLES.has(message.role)) return false;
+  const status = message.status?.type;
+  if (status === "running" || status === "requires-action") return false;
+  if (status === "incomplete" && message.status?.reason === "error")
+    return false;
+  return true;
+}
+
+export type Pending = {
+  /** Nodes not yet on the server, parents before children. */
+  messages: NewMessage[];
+  /**
+   * The selected leaf, once it is a node the server has. `null` when
+   * the head is a message that was skipped -- sending it would be
+   * refused, and a refusal for something the user cannot see is worse
+   * than a head that catches up on the next write.
+   */
+  headId: string | null;
+};
+
+/**
+ * What still has to be written, given what has already been.
+ *
+ * A node is included only when its parent is already stored or is
+ * included earlier in the same batch, so the server's
+ * parent-must-exist rule is satisfied by construction rather than by a
+ * retry. A node whose parent was skipped is skipped too, and comes back
+ * on the tick after its parent lands.
+ */
+export function pendingAppend(
+  exported: ExportedRepository,
+  stored: ReadonlySet<string>,
+): Pending {
+  const messages: NewMessage[] = [];
+  const reachable = new Set<string>(stored);
+
+  for (const item of exported.messages) {
+    const { message } = item;
+    if (!message.id || reachable.has(message.id)) continue;
+    if (!isStorable(message)) continue;
+    const parentId = item.parentId;
+    if (parentId !== null && !reachable.has(parentId)) continue;
+    reachable.add(message.id);
+    messages.push({
+      id: message.id,
+      parent_id: parentId,
+      role: message.role as ConversationRole,
+      content: plainText(message.content),
+      ...(message.metadata ? { metadata: message.metadata } : {}),
+    });
+  }
+
+  const head = exported.headId ?? null;
+  return { messages, headId: head && reachable.has(head) ? head : null };
+}
+
+/**
+ * Whether anything in `pending` is worth a request.
+ *
+ * A withheld head (`null`) is not work. Counting it would spin: there
+ * is nothing to send that would change it, so the next export would
+ * report the same difference, and the loop would write forever without
+ * ever agreeing with itself.
+ */
+export function hasWork(pending: Pending, storedHead: string | null): boolean {
+  if (pending.messages.length > 0) return true;
+  return pending.headId !== null && pending.headId !== storedHead;
+}
+
+/**
+ * The stored tree, in the shape `ExportedMessageRepository
+ * .fromBranchableArray` takes.
+ *
+ * `status` is reconstructed rather than stored: an assistant node is
+ * complete unless its own metadata says the run was stopped, and the
+ * store has no business keeping a copy of a fact that is already in the
+ * metadata it carries.
+ */
+export function toBranchable(conversation: Conversation): {
+  items: {
+    parentId: string | null;
+    message: {
+      id: string;
+      role: ConversationRole;
+      content: { type: "text"; text: string }[];
+      createdAt: Date;
+      status?: { type: "complete"; reason: "stop" };
+      metadata?: Record<string, unknown>;
+    };
+  }[];
+  headId: string | null;
+} {
+  return {
+    items: conversation.messages.map((node) => ({
+      parentId: node.parent_id,
+      message: {
+        id: node.id,
+        role: node.role,
+        content: [{ type: "text" as const, text: node.content }],
+        createdAt: new Date(node.created_at * 1000),
+        ...(node.role === "assistant"
+          ? { status: { type: "complete" as const, reason: "stop" as const } }
+          : {}),
+        ...(node.metadata ? { metadata: node.metadata } : {}),
+      },
+    })),
+    headId: conversation.head_id,
+  };
+}
+
+/** Ids of every node the server is holding, for the sync loop's
+ * "already stored" set. */
+export function storedIds(conversation: Conversation): Set<string> {
+  return new Set(conversation.messages.map((m) => m.id));
+}
+
+/** What to call a conversation with no title yet. */
+export function conversationLabel(
+  summary: Pick<ConversationSummary, "title" | "id">,
+): string {
+  const title = summary.title?.trim();
+  return title || "Untitled conversation";
+}

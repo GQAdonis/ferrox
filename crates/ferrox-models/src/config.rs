@@ -374,6 +374,32 @@ impl ModelConfig {
         (0..self.n_layers).find_map(|il| self.layer_sliding_window(il))
     }
 
+    /// The window EVERY layer slides by, or `None` if any layer attends
+    /// over the whole history.
+    ///
+    /// This is the opposite question to [`Self::kv_block_window`], and
+    /// the difference is the whole reason both exist. That one asks
+    /// "does any layer constrain the block layout", so one sliding layer
+    /// is enough. This one asks "may a page that has fallen behind the
+    /// window be taken away", and there one *full-attention* layer is
+    /// enough to say no.
+    ///
+    /// A page group holds one block in every layer and is freed as a
+    /// unit, so on an alternating-SWA model (gpt-oss, Gemma-3) freeing
+    /// the group behind the window would take the full-attention layers'
+    /// block with it -- and those layers still read position 0 at every
+    /// step. The result is not a crash: the block is reused by another
+    /// request and the full layers attend over its bytes. So this
+    /// returns `None` for the alternating case, and a mixed-window model
+    /// (were one to appear) gets `None` too rather than the narrowest
+    /// window, because the widest is the one that must still be readable.
+    pub fn uniform_sliding_window(&self) -> Option<usize> {
+        let first = self.layer_sliding_window(0)?;
+        (1..self.n_layers)
+            .all(|il| self.layer_sliding_window(il) == Some(first))
+            .then_some(first)
+    }
+
     /// The KV cache block layout to use for this model, given the block
     /// size an operator asked for.
     ///
@@ -927,6 +953,47 @@ mod tests {
         assert_eq!(cfg.kv_block_window(), Some(512));
         assert_eq!(cfg.kv_block_layout(100).block_size(), 64);
         assert_eq!(cfg.kv_block_layout(64).blocks_per_window(), Some(8));
+    }
+
+    /// The two window questions give OPPOSITE answers on an alternating
+    /// model, and that is the point of having both.
+    ///
+    /// "Does any layer constrain the block layout" is yes, so the block
+    /// size rounds down to the window. "May a page behind the window be
+    /// taken away" is no, because the group holds the full-attention
+    /// layers' blocks too and those layers still read position 0. A
+    /// serving path that read `kv_block_window` for the second question
+    /// would free pages half the layers are still attending over -- not
+    /// a crash, just another request's bytes in this one's answer.
+    #[test]
+    fn only_a_uniformly_windowed_model_may_give_a_page_back() {
+        let mut alternating = test_dense_fixture();
+        alternating.n_layers = 24;
+        alternating.sliding_window = Some(128);
+        alternating.swa_pattern = Some(2);
+        assert_eq!(alternating.kv_block_window(), Some(128));
+        assert_eq!(
+            alternating.uniform_sliding_window(),
+            None,
+            "a full-attention layer forbids the slide"
+        );
+
+        let mut uniform = test_dense_fixture();
+        uniform.n_layers = 24;
+        uniform.sliding_window = Some(128);
+        uniform.swa_pattern = None;
+        assert_eq!(uniform.uniform_sliding_window(), Some(128));
+
+        // `swa_pattern = Some(1)` is every layer sliding, spelled as a
+        // pattern -- `layer_sliding_window` already treats it that way,
+        // and the two answers must agree with it.
+        let mut period_one = uniform.clone();
+        period_one.swa_pattern = Some(1);
+        assert_eq!(period_one.uniform_sliding_window(), Some(128));
+
+        let mut full = test_dense_fixture();
+        full.sliding_window = None;
+        assert_eq!(full.uniform_sliding_window(), None);
     }
 
     #[test]

@@ -513,13 +513,43 @@ impl PagedKvCache {
         Ok(())
     }
 
+    /// Appends a block the caller already owns, without taking one from
+    /// the store.
+    ///
+    /// This is how a sliding window recycles. A block whose positions
+    /// have fallen behind the window is never read again -- the paged
+    /// attention kernel indexes `block_table[t / block_size]` only for
+    /// `t >= seq_len - window` -- so its storage can back a *later*
+    /// position instead of being handed back and re-acquired. The table
+    /// keeps its absolute-position indexing and simply names the same
+    /// physical block at two indices: the stale one, which nothing
+    /// reads, and the live one.
+    ///
+    /// That aliasing is the reason this is a separate method rather than
+    /// a flag on [`Self::reserve`]. A caller that recycles owns the
+    /// obligation to release each distinct block exactly once, and to
+    /// have established that the donor index really is out of window --
+    /// neither of which this type can check for itself.
+    pub fn append_block(&mut self, block_id: usize) {
+        self.block_table.push(block_id);
+    }
+
     /// Releases every block this sequence holds back to `store`. Must be
     /// called explicitly (there's no `Drop` here, since dropping needs a
     /// `&mut PagedKvStore` this type doesn't own a reference to) --
     /// mirrors `KvCache::release_to_pool`, just not automatic.
+    ///
+    /// Each *distinct* block once: a table that has recycled through
+    /// [`Self::append_block`] names one block at more than one index, and
+    /// releasing per index would put the same id on the free list twice,
+    /// after which two sequences are handed the same memory.
     pub fn release(&mut self, store: &mut PagedKvStore) {
+        let mut seen: Vec<usize> = Vec::new();
         for id in self.block_table.drain(..) {
-            store.release_block(id);
+            if !seen.contains(&id) {
+                seen.push(id);
+                store.release_block(id);
+            }
         }
         self.seq_len = 0;
     }
@@ -1151,6 +1181,79 @@ mod tests {
         let g = kv.acquire_group().unwrap();
         assert!(kv.release_group(g));
         kv.release_group(g);
+    }
+
+    /// A recycled block backs a later position without the store ever
+    /// being asked for another one, and the later position's writes are
+    /// what a read at that position returns.
+    ///
+    /// This is the whole sliding-window mechanism in miniature. Blocks
+    /// of two, four positions, and only two blocks in the store: without
+    /// recycling, position 2 has nowhere to go.
+    #[test]
+    fn a_recycled_block_backs_a_later_position_without_touching_the_store() {
+        let mut store = PagedKvStore::new(2, 2, 1, 2);
+        let mut cache = PagedKvCache::new();
+        cache.push(&mut store, &[1.0, 1.0], &[1.0, 1.0]).unwrap();
+        cache.push(&mut store, &[2.0, 2.0], &[2.0, 2.0]).unwrap();
+        assert_eq!(store.free_block_count(), 1, "one block per position pair");
+
+        // Positions 0..2 have fallen behind a window of two. Their block
+        // backs positions 2..4 instead, and the store is untouched.
+        let recycled = cache.block_table()[0];
+        cache.append_block(recycled);
+        assert_eq!(
+            store.free_block_count(),
+            1,
+            "recycling must not take a block from the store"
+        );
+        cache.push(&mut store, &[3.0, 3.0], &[3.0, 3.0]).unwrap();
+        assert_eq!(cache.seq_len(), 3);
+        assert_eq!(
+            cache.block_table(),
+            &[recycled, recycled],
+            "the same block at the stale index and the live one"
+        );
+
+        // Reading position 2 sees the new row. Position 0's row is gone,
+        // which is exactly what "behind the window" means -- the kernel
+        // never indexes it.
+        let flat = cache.to_contiguous(&store);
+        assert_eq!(&flat.k[4..6], &[3.0, 3.0], "position 2 reads its own row");
+        assert_eq!(
+            &flat.k[0..2],
+            &[3.0, 3.0],
+            "position 0 now reads the recycled row, and nothing may read it"
+        );
+    }
+
+    /// Releasing an aliased table hands each block back ONCE.
+    ///
+    /// Per index instead of per distinct block would put the recycled id
+    /// on the free list twice, and the next two acquisitions would hand
+    /// two sequences the same memory -- which does not fail, it
+    /// interleaves two conversations' KV.
+    #[test]
+    fn releasing_a_recycled_table_gives_each_block_back_once() {
+        // Exactly one block in the store, so "handed back twice" is
+        // observable as a second acquisition succeeding.
+        let mut store = PagedKvStore::new(2, 1, 1, 2);
+        let mut cache = PagedKvCache::new();
+        cache.push(&mut store, &[1.0, 1.0], &[1.0, 1.0]).unwrap();
+        let held = cache.block_table()[0];
+        cache.append_block(held);
+        cache.append_block(held);
+
+        let free_before = store.free_block_count();
+        cache.release(&mut store);
+        assert_eq!(
+            store.free_block_count(),
+            free_before + 1,
+            "three table entries naming one block are one block back"
+        );
+        // And the store agrees: it can hand out that block once.
+        assert!(store.acquire_block().is_some());
+        assert!(store.acquire_block().is_none());
     }
 
     #[test]

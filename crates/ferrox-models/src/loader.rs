@@ -2551,6 +2551,34 @@ mod tests {
         buf
     }
 
+    /// How far a fused dot may sit from an exact dequantized dot.
+    ///
+    /// Two regimes, and one fixed number cannot describe both. With
+    /// `FERROX_CPU_INT_DOT` off the activation stays f32 and only
+    /// rounding separates the two. With it on, the activation is
+    /// quantized to int8 at `d = amax / 127`, which is the flag both
+    /// binaries turn on by default and the reason the Q5_K and Q6_K
+    /// cases failed against a flat `1e-2`.
+    ///
+    /// The bound grows with the L2 norm of the row, NOT the L1. Each
+    /// element carries an independent rounding of up to `d/2`, so the
+    /// dot's error is a sum of independent terms whose standard
+    /// deviation is `d/sqrt(12) * ||w||_2`. Bounding by the worst case
+    /// `d/2 * ||w||_1` instead assumes every rounding aligns with its
+    /// weight's sign, which on this fixture gives 0.347 against a dot
+    /// of 2.77: 12% of the value, loose enough that injecting a 5%
+    /// error still passed. Measured here, the real error is 1.8 sigma,
+    /// so four sigma keeps better than 2x headroom while still failing
+    /// that 5% injection.
+    fn fused_dot_tolerance(weights: &[f32], x: &[f32], exact_bound: f32) -> f32 {
+        if !ferrox_core::weight_matrix::cpu_int_dot_enabled() {
+            return exact_bound;
+        }
+        let amax = x.iter().fold(0.0f32, |a, v| a.max(v.abs()));
+        let l2 = weights.iter().map(|w| w * w).sum::<f32>().sqrt();
+        4.0 * (amax / 127.0) / 12f32.sqrt() * l2 + exact_bound
+    }
+
     #[test]
     fn load_weight_matrix_handles_a_real_on_disk_q5_k_tensor_end_to_end() {
         let tmp = std::env::temp_dir().join(format!(
@@ -2582,7 +2610,7 @@ mod tests {
         let got = matrix.apply(&x);
         assert_eq!(got.len(), 1);
         assert!(
-            (got[0] - expected_dot).abs() < 1e-2,
+            (got[0] - expected_dot).abs() < fused_dot_tolerance(&expected, &x, 1e-2),
             "end-to-end loaded+applied Q5_K matrix diverged from direct dequant: got={} expected={}",
             got[0],
             expected_dot
@@ -2671,7 +2699,7 @@ mod tests {
         let got = matrix.apply(&x);
         assert_eq!(got.len(), 1);
         assert!(
-            (got[0] - expected_dot).abs() < 1e-2,
+            (got[0] - expected_dot).abs() < fused_dot_tolerance(&expected, &x, 1e-2),
             "end-to-end loaded+applied Q6_K matrix diverged from direct dequant: got={} expected={}",
             got[0],
             expected_dot
@@ -2929,7 +2957,7 @@ mod tests {
         let got = matrix.apply(&x);
         assert_eq!(got.len(), 1);
         assert!(
-            (got[0] - expected_dot).abs() < 1e-1,
+            (got[0] - expected_dot).abs() < fused_dot_tolerance(&expected, &x, 1e-1),
             "end-to-end loaded+applied Q3_K matrix diverged from direct dequant: got={} expected={}",
             got[0],
             expected_dot

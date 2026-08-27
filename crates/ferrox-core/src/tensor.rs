@@ -51,10 +51,6 @@ impl Tensor {
         let cols = self.cols();
         &self.data[i * cols..(i + 1) * cols]
     }
-
-    pub fn has_nan_or_inf(&self) -> bool {
-        self.data.iter().any(|v| !v.is_finite())
-    }
 }
 
 #[cfg(test)]

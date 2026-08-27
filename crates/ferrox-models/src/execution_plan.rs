@@ -77,15 +77,6 @@ impl ExecutionPlan {
         }
     }
 
-    /// Look up or insert fused-op caps for a decode/prefill geometry.
-    pub fn caps_for_geometry(
-        &self,
-        cache: &mut std::collections::HashMap<PlanGeometry, FusedOpCaps>,
-        geom: PlanGeometry,
-    ) -> FusedOpCaps {
-        *cache.entry(geom).or_insert(self.fused)
-    }
-
     /// Probe Metal fused-op availability without changing the Llama
     /// default path. Returns conservative caps when Metal is off.
     pub fn probe_metal_caps() -> FusedOpCaps {

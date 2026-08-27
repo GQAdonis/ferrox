@@ -1304,24 +1304,13 @@ unsafe fn expf_avx2(x: std::arch::x86_64::__m256) -> std::arch::x86_64::__m256 {
 // compiles clean under `-D warnings`.
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 mod exp_consts {
-    /// `0x1.8p23`: adding this to `x·log2(e)` rounds it to an integer and
-    /// parks that integer in the mantissa's low bits.
-    pub const EXP_SHIFT: f32 = 12582912.0;
-    /// `log2(e)`, `0x1.715476p+0`.
-    pub const EXP_LOG2E: f32 = std::f32::consts::LOG2_E;
-    /// High half of `ln 2`, `0x1.62e4p-1` -- chosen with trailing zero
-    /// bits so `n · ln2_hi` is exact in `f32`.
-    pub const EXP_LN2_HI: f32 = 0.693_145_75;
-    /// Low half of `ln 2`, `0x1.7f7d1cp-20`.
-    pub const EXP_LN2_LO: f32 = 1.428_606_8e-6;
-    /// Minimax coefficients for `e^b - 1` on `[-ln2/2, ln2/2]`:
-    /// `0x1.ffffecp-1`, `0x1.fffdb6p-2`, `0x1.555e66p-3`,
-    /// `0x1.573e2ep-5`, `0x1.0e4020p-7`.
-    pub const EXP_C0: f32 = 0.999_999_4;
-    pub const EXP_C1: f32 = 0.499_991_27;
-    pub const EXP_C2: f32 = 0.166_683_96;
-    pub const EXP_C3: f32 = 0.041_899_767;
-    pub const EXP_C4: f32 = 0.008_247_39;
+    // Shared with `matmul`, which had a byte-identical copy of these
+    // nine. Only EXP_MIN_ARG below is ours: a softmax argument is
+    // always <= 0, so this clamps below only, where `matmul` must also
+    // select zero above because its argument is an unbounded
+    // denominator.
+    pub use crate::vexp::*;
+
     /// Below this the exponential is smaller than `f32::MIN_POSITIVE`, so
     /// clamping here costs nothing and keeps `n` inside the fast path.
     pub const EXP_MIN_ARG: f32 = -87.0;

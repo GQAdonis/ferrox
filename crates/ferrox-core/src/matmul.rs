@@ -352,22 +352,12 @@ fn silu_mul(gate: &[f32], up: &[f32], out: &mut [f32]) {
 // see [`EXP_CLAMP`].
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 mod exp_consts {
-    /// `0x1.8p23`: adding this to `x·log2(e)` rounds it to an integer and
-    /// parks that integer in the mantissa's low bits.
-    pub const EXP_SHIFT: f32 = 12582912.0;
-    /// `log2(e)`.
-    pub const EXP_LOG2E: f32 = std::f32::consts::LOG2_E;
-    /// High half of `ln 2`, chosen with trailing zero bits so `n · ln2_hi`
-    /// is exact in `f32`.
-    pub const EXP_LN2_HI: f32 = 0.693_145_75;
-    /// Low half of `ln 2`.
-    pub const EXP_LN2_LO: f32 = 1.428_606_8e-6;
-    /// Minimax coefficients for `e^b - 1` on `[-ln2/2, ln2/2]`.
-    pub const EXP_C0: f32 = 0.999_999_4;
-    pub const EXP_C1: f32 = 0.499_991_27;
-    pub const EXP_C2: f32 = 0.166_683_96;
-    pub const EXP_C3: f32 = 0.041_899_767;
-    pub const EXP_C4: f32 = 0.008_247_39;
+    // The nine ggml_v_expf polynomial constants live in
+    // `ferrox_core::vexp`, shared with `attention`, which had a
+    // byte-identical copy. Only the clamp differs between the two, and
+    // it differs on purpose: see EXP_CLAMP.
+    pub use crate::vexp::*;
+
     /// **Clamped on BOTH sides, unlike the softmax copy in `attention`,
     /// and that is the whole difference between the two.**
     ///

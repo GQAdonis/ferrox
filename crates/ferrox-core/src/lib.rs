@@ -23,6 +23,7 @@ pub mod matmul;
 pub mod tensor;
 pub mod threads;
 pub mod turboquant;
+pub mod vexp;
 pub mod weight_matrix;
 
 pub use attention::{

@@ -574,10 +574,41 @@ pub unsafe fn default_cpu_int_dot_on() {
 /// (q/k/v on one normed batch; gate/up on another). Build with
 /// [`WeightMatrix::quantize_batch_acts`]. Q8_0/Q4_0 matrices consume
 /// [`BatchActs::Q8`]; the K-quants consume [`BatchActs::Q8K`].
+///
+/// `tiles` carries the *interleaved* activation quads the i8mm GEMMs read
+/// (llama.cpp's `wdata` after `ggml_quantize_mat_q8_K_4x8`), not just the
+/// per-position quantization. Sharing stops at the same place the
+/// quantization does: q/k/v build one set between them instead of three,
+/// gate/up one instead of two. It is empty on hosts with no i8mm kernel,
+/// where preparing a quad buys nothing.
+///
+/// `cols` is recorded so a set built for one width can never be handed to
+/// a matrix of another. The tiles are chunked four positions wide for
+/// every kind (`Q8K_ACTS_X4_NC`, and `Q4_KX8_GEMM_NC` / `Q5_KX8_GEMM_NC`
+/// are the same 4), which is why one set serves Q4_K, Q5_K and Q6_K --
+/// and, in the [`BatchActs::Q8`] variant, both Q8_0 and Q4_0.
 pub enum BatchActs {
-    Q8(Vec<ferrox_quant::Q8Activations>),
-    Q8K(Vec<ferrox_quant::Q8KActivations>),
+    Q8 {
+        acts: Vec<ferrox_quant::Q8Activations>,
+        tiles: Vec<ferrox_quant::Q8ActsX4>,
+        cols: usize,
+    },
+    Q8K {
+        acts: Vec<ferrox_quant::Q8KActivations>,
+        tiles: Vec<ferrox_quant::Q8KActsX4>,
+        cols: usize,
+    },
 }
+
+// Sharing one quad set across kinds is only sound while every `x4`
+// consumer chunks the batch the same way. If one of these widths is ever
+// retuned on its own, the quads a Q4_K gate builds stop lining up with
+// what a Q5_K sibling indexes, and the failure is a wrong answer rather
+// than a panic -- so it fails the build instead.
+const _: () = {
+    assert!(ferrox_quant::Q4_KX8_GEMM_NC == ferrox_quant::Q8K_ACTS_X4_NC);
+    assert!(ferrox_quant::Q5_KX8_GEMM_NC == ferrox_quant::Q8K_ACTS_X4_NC);
+};
 
 pub enum WeightMatrix {
     F32(Tensor),
@@ -811,6 +842,74 @@ impl WeightMatrix {
                     body(g, t0, t1);
                 }
             });
+    }
+
+    /// Resolve the Q8_0-format activations (and the interleaved quads, if
+    /// any) an [`Self::apply_batch_with_acts`] arm should read.
+    ///
+    /// Returns the shared batch when it matches this matrix -- same
+    /// positions, same width -- and otherwise quantizes into `owned` and
+    /// returns that with no quads, so the caller builds its own. A
+    /// mismatched `shared` is silently ignored rather than trusted, which
+    /// is what keeps a mixed-width projection group correct.
+    ///
+    /// The returned quads are only ever the *shared* ones. The empty slice
+    /// therefore means "nobody prepared these for you", not "this host has
+    /// no i8mm kernel" -- the caller still decides that with
+    /// `q8_0x4_gemm_uses_acts_x4`.
+    fn q8_acts<'a>(
+        shared: Option<&'a BatchActs>,
+        x_batch: &[f32],
+        batch_size: usize,
+        cols: usize,
+        owned: &'a mut Vec<ferrox_quant::Q8Activations>,
+    ) -> (
+        &'a [ferrox_quant::Q8Activations],
+        &'a [ferrox_quant::Q8ActsX4],
+    ) {
+        if let Some(BatchActs::Q8 {
+            acts,
+            tiles,
+            cols: c,
+        }) = shared
+        {
+            if acts.len() == batch_size && *c == cols {
+                return (acts, tiles);
+            }
+        }
+        *owned = (0..batch_size)
+            .into_par_iter()
+            .map(|b| ferrox_quant::quantize_activations_q8(&x_batch[b * cols..(b + 1) * cols]))
+            .collect();
+        (owned, &[])
+    }
+
+    /// [`Self::q8_acts`] for the Q8_K format the K-quants consume.
+    fn q8k_acts<'a>(
+        shared: Option<&'a BatchActs>,
+        x_batch: &[f32],
+        batch_size: usize,
+        cols: usize,
+        owned: &'a mut Vec<ferrox_quant::Q8KActivations>,
+    ) -> (
+        &'a [ferrox_quant::Q8KActivations],
+        &'a [ferrox_quant::Q8KActsX4],
+    ) {
+        if let Some(BatchActs::Q8K {
+            acts,
+            tiles,
+            cols: c,
+        }) = shared
+        {
+            if acts.len() == batch_size && *c == cols {
+                return (acts, tiles);
+            }
+        }
+        *owned = (0..batch_size)
+            .into_par_iter()
+            .map(|b| ferrox_quant::quantize_activations_q8_k(&x_batch[b * cols..(b + 1) * cols]))
+            .collect();
+        (owned, &[])
     }
 
     /// Prefer serial when the mat is too small for fork-join to pay off.
@@ -1671,26 +1770,46 @@ impl WeightMatrix {
         if !cpu_int_dot_enabled() || x_batch.len() != batch_size * cols {
             return None;
         }
+        let cols = *cols;
         match kind {
-            QuantKind::Q8_0 | QuantKind::Q4_0 if cols.is_multiple_of(32) => Some(BatchActs::Q8(
-                (0..batch_size)
+            QuantKind::Q8_0 | QuantKind::Q4_0 if cols.is_multiple_of(32) => {
+                let acts: Vec<_> = (0..batch_size)
                     .into_par_iter()
                     .map(|b| {
                         ferrox_quant::quantize_activations_q8(&x_batch[b * cols..(b + 1) * cols])
                     })
-                    .collect(),
-            )),
+                    .collect();
+                // Q8_0 and Q4_0 agree on both the interleave width and the
+                // predicate, so one tile set serves either consumer.
+                let tiles =
+                    if ferrox_quant::q8_0x4_gemm_uses_acts_x4(ferrox_quant::q8_0x4_interleave()) {
+                        acts.par_chunks(ferrox_quant::Q8K_ACTS_X4_NC)
+                            .map(|chunk| ferrox_quant::prepare_q8_acts_x4(chunk, cols))
+                            .collect()
+                    } else {
+                        Vec::new()
+                    };
+                Some(BatchActs::Q8 { acts, tiles, cols })
+            }
             QuantKind::Q4K | QuantKind::Q5K | QuantKind::Q6K if cols.is_multiple_of(256) => {
-                Some(BatchActs::Q8K(
-                    (0..batch_size)
-                        .into_par_iter()
-                        .map(|b| {
-                            ferrox_quant::quantize_activations_q8_k(
-                                &x_batch[b * cols..(b + 1) * cols],
-                            )
-                        })
-                        .collect(),
-                ))
+                let acts: Vec<_> = (0..batch_size)
+                    .into_par_iter()
+                    .map(|b| {
+                        ferrox_quant::quantize_activations_q8_k(&x_batch[b * cols..(b + 1) * cols])
+                    })
+                    .collect();
+                // All three K-quants share the predicate and the quad
+                // width, so the set a Q4_K gate builds is exactly what a
+                // Q5_K or Q6_K sibling would have built for itself.
+                let tiles =
+                    if ferrox_quant::q4_kx8_gemm_uses_acts_x4(ferrox_quant::q4_kx8_interleave()) {
+                        acts.par_chunks(ferrox_quant::Q8K_ACTS_X4_NC)
+                            .map(|chunk| ferrox_quant::prepare_q8_k_acts_x4(chunk, cols))
+                            .collect()
+                    } else {
+                        Vec::new()
+                    };
+                Some(BatchActs::Q8K { acts, tiles, cols })
             }
             _ => None,
         }
@@ -1842,21 +1961,9 @@ impl WeightMatrix {
                 if cpu_int_dot_enabled() {
                     match *kind {
                         QuantKind::Q8_0 if cols.is_multiple_of(32) => {
-                            let acts_owned: Vec<_>;
-                            let acts: &[ferrox_quant::Q8Activations] = match shared {
-                                Some(BatchActs::Q8(a)) if a.len() == batch_size => a,
-                                _ => {
-                                    acts_owned = (0..batch_size)
-                                        .into_par_iter()
-                                        .map(|b| {
-                                            ferrox_quant::quantize_activations_q8(
-                                                &x_batch[b * cols..(b + 1) * cols],
-                                            )
-                                        })
-                                        .collect();
-                                    &acts_owned
-                                }
-                            };
+                            let mut acts_owned = Vec::new();
+                            let (acts, shared_tiles) =
+                                Self::q8_acts(shared, x_batch, batch_size, cols, &mut acts_owned);
                             let n_groups = *rows / ferrox_quant::Q8_0X4_NROWS;
                             if n_groups > 0 {
                                 let packed = get_or_repack_q8x4(data.as_slice(), *rows, cols);
@@ -1868,10 +1975,23 @@ impl WeightMatrix {
                                     // `ggml_quantize_mat_q8_0_4x8` into
                                     // `wdata`); every row-group reuses it.
                                     let nc = ferrox_quant::Q8K_ACTS_X4_NC;
-                                    let act_tiles: Vec<ferrox_quant::Q8ActsX4> = acts
-                                        .par_chunks(nc)
-                                        .map(|chunk| ferrox_quant::prepare_q8_acts_x4(chunk, cols))
-                                        .collect();
+                                    let tiles_owned: Vec<ferrox_quant::Q8ActsX4>;
+                                    let act_tiles: &[ferrox_quant::Q8ActsX4] =
+                                        if shared_tiles.is_empty() {
+                                            tiles_owned = acts
+                                                .par_chunks(nc)
+                                                .map(|chunk| {
+                                                    ferrox_quant::prepare_q8_acts_x4(chunk, cols)
+                                                })
+                                                .collect();
+                                            &tiles_owned
+                                        } else {
+                                            shared_tiles
+                                        };
+                                    // One runtime i8mm probe per matmul, not
+                                    // one per (row-group x quad); see
+                                    // `ferrox_quant::AccelX4`.
+                                    let accel = ferrox_quant::AccelX4::detect();
                                     Self::par_chunked_groups(
                                         n_groups,
                                         nrows_g,
@@ -1885,8 +2005,8 @@ impl WeightMatrix {
                                                 let t = t0 + t;
                                                 let n = tile.na;
                                                 let tmp = &mut tmp[..nrows_g * n];
-                                                ferrox_quant::gemm_q8_0x4_group_x4(
-                                                    &packed, g, tile, cols, interleave, tmp,
+                                                ferrox_quant::gemm_q8_0x4_group_x4_on(
+                                                    &packed, g, tile, cols, interleave, accel, tmp,
                                                 );
                                                 for j in 0..n {
                                                     let col = (t * nc + j) * rows + g * nrows_g;
@@ -1977,21 +2097,9 @@ impl WeightMatrix {
                             return out;
                         }
                         QuantKind::Q4_0 if cols.is_multiple_of(32) => {
-                            let acts_owned: Vec<_>;
-                            let acts: &[ferrox_quant::Q8Activations] = match shared {
-                                Some(BatchActs::Q8(a)) if a.len() == batch_size => a,
-                                _ => {
-                                    acts_owned = (0..batch_size)
-                                        .into_par_iter()
-                                        .map(|b| {
-                                            ferrox_quant::quantize_activations_q8(
-                                                &x_batch[b * cols..(b + 1) * cols],
-                                            )
-                                        })
-                                        .collect();
-                                    &acts_owned
-                                }
-                            };
+                            let mut acts_owned = Vec::new();
+                            let (acts, shared_tiles) =
+                                Self::q8_acts(shared, x_batch, batch_size, cols, &mut acts_owned);
                             let n_groups = *rows / ferrox_quant::Q4_0X4_NROWS;
                             if n_groups > 0 {
                                 let packed = get_or_repack_q4_0x4(data.as_slice(), *rows, cols);
@@ -2001,10 +2109,20 @@ impl WeightMatrix {
                                     // i8mm: same once-per-matmul activation
                                     // quad hoist as the Q8_0 arm above.
                                     let nc = ferrox_quant::Q8K_ACTS_X4_NC;
-                                    let act_tiles: Vec<ferrox_quant::Q8ActsX4> = acts
-                                        .par_chunks(nc)
-                                        .map(|chunk| ferrox_quant::prepare_q8_acts_x4(chunk, cols))
-                                        .collect();
+                                    let tiles_owned: Vec<ferrox_quant::Q8ActsX4>;
+                                    let act_tiles: &[ferrox_quant::Q8ActsX4] =
+                                        if shared_tiles.is_empty() {
+                                            tiles_owned = acts
+                                                .par_chunks(nc)
+                                                .map(|chunk| {
+                                                    ferrox_quant::prepare_q8_acts_x4(chunk, cols)
+                                                })
+                                                .collect();
+                                            &tiles_owned
+                                        } else {
+                                            shared_tiles
+                                        };
+                                    let accel = ferrox_quant::AccelX4::detect();
                                     Self::par_chunked_groups(
                                         n_groups,
                                         nrows_g,
@@ -2018,8 +2136,8 @@ impl WeightMatrix {
                                                 let t = t0 + t;
                                                 let n = tile.na;
                                                 let tmp = &mut tmp[..nrows_g * n];
-                                                ferrox_quant::gemm_q4_0x4_group_x4(
-                                                    &packed, g, tile, cols, interleave, tmp,
+                                                ferrox_quant::gemm_q4_0x4_group_x4_on(
+                                                    &packed, g, tile, cols, interleave, accel, tmp,
                                                 );
                                                 for j in 0..n {
                                                     let col = (t * nc + j) * rows + g * nrows_g;
@@ -2110,21 +2228,9 @@ impl WeightMatrix {
                             return out;
                         }
                         QuantKind::Q4K if cols.is_multiple_of(256) => {
-                            let acts_owned: Vec<_>;
-                            let acts: &[ferrox_quant::Q8KActivations] = match shared {
-                                Some(BatchActs::Q8K(a)) if a.len() == batch_size => a,
-                                _ => {
-                                    acts_owned = (0..batch_size)
-                                        .into_par_iter()
-                                        .map(|b| {
-                                            ferrox_quant::quantize_activations_q8_k(
-                                                &x_batch[b * cols..(b + 1) * cols],
-                                            )
-                                        })
-                                        .collect();
-                                    &acts_owned
-                                }
-                            };
+                            let mut acts_owned = Vec::new();
+                            let (acts, shared_tiles) =
+                                Self::q8k_acts(shared, x_batch, batch_size, cols, &mut acts_owned);
                             let n_groups = *rows / ferrox_quant::Q4_KX8_NROWS;
                             if n_groups > 0 {
                                 let interleave = ferrox_quant::q4_kx8_interleave();
@@ -2134,16 +2240,27 @@ impl WeightMatrix {
                                 // activations once per matmul (llama.cpp
                                 // `ggml_quantize_mat_q8_K_4x8` into `wdata`);
                                 // the kernel used to redo it per row-group.
-                                let act_tiles: Vec<ferrox_quant::Q8KActsX4> =
-                                    if ferrox_quant::q4_kx8_gemm_uses_acts_x4(interleave) {
-                                        acts.par_chunks(nc)
+                                // A `shared` batch has already paid for this
+                                // on behalf of every sibling projection. The
+                                // predicate is asked first either way: it,
+                                // not the donor, decides whether this matrix
+                                // has an x4 kernel at all.
+                                let tiles_owned: Vec<ferrox_quant::Q8KActsX4>;
+                                let act_tiles: &[ferrox_quant::Q8KActsX4] =
+                                    if !ferrox_quant::q4_kx8_gemm_uses_acts_x4(interleave) {
+                                        &[]
+                                    } else if !shared_tiles.is_empty() {
+                                        shared_tiles
+                                    } else {
+                                        tiles_owned = acts
+                                            .par_chunks(nc)
                                             .map(|chunk| {
                                                 ferrox_quant::prepare_q8_k_acts_x4(chunk, cols)
                                             })
-                                            .collect()
-                                    } else {
-                                        Vec::new()
+                                            .collect();
+                                        &tiles_owned
                                     };
+                                let accel = ferrox_quant::AccelX4::detect();
                                 let n_tiles = batch_size.div_ceil(nc);
                                 Self::par_chunked_groups(
                                     n_groups,
@@ -2164,12 +2281,13 @@ impl WeightMatrix {
                                                     &packed, g, chunk, cols, interleave, tile,
                                                 );
                                             } else {
-                                                ferrox_quant::gemm_q4_kx8_group_x4(
+                                                ferrox_quant::gemm_q4_kx8_group_x4_on(
                                                     &packed,
                                                     g,
                                                     &act_tiles[t],
                                                     cols,
                                                     interleave,
+                                                    accel,
                                                     tile,
                                                 );
                                             }
@@ -2222,21 +2340,9 @@ impl WeightMatrix {
                             return out;
                         }
                         QuantKind::Q5K if cols.is_multiple_of(256) => {
-                            let acts_owned: Vec<_>;
-                            let acts: &[ferrox_quant::Q8KActivations] = match shared {
-                                Some(BatchActs::Q8K(a)) if a.len() == batch_size => a,
-                                _ => {
-                                    acts_owned = (0..batch_size)
-                                        .into_par_iter()
-                                        .map(|b| {
-                                            ferrox_quant::quantize_activations_q8_k(
-                                                &x_batch[b * cols..(b + 1) * cols],
-                                            )
-                                        })
-                                        .collect();
-                                    &acts_owned
-                                }
-                            };
+                            let mut acts_owned = Vec::new();
+                            let (acts, shared_tiles) =
+                                Self::q8k_acts(shared, x_batch, batch_size, cols, &mut acts_owned);
                             // Q5_Kx8 multi-act NEON GEMM amortizes weight unpack.
                             let use_kx8 = cfg!(target_arch = "aarch64");
                             let n_groups = if use_kx8 {
@@ -2250,17 +2356,25 @@ impl WeightMatrix {
                                 let nc = ferrox_quant::Q5_KX8_GEMM_NC;
                                 // On the i8mm path, interleave each quad of
                                 // activations once per matmul; the kernel
-                                // consumes it for every row-group.
-                                let act_tiles: Vec<ferrox_quant::Q8KActsX4> =
-                                    if ferrox_quant::q5_kx8_gemm_uses_acts_x4(interleave) {
-                                        acts.par_chunks(nc)
+                                // consumes it for every row-group. A `shared`
+                                // batch has already paid for it. Predicate
+                                // first, as in the Q4_K arm.
+                                let tiles_owned: Vec<ferrox_quant::Q8KActsX4>;
+                                let act_tiles: &[ferrox_quant::Q8KActsX4] =
+                                    if !ferrox_quant::q5_kx8_gemm_uses_acts_x4(interleave) {
+                                        &[]
+                                    } else if !shared_tiles.is_empty() {
+                                        shared_tiles
+                                    } else {
+                                        tiles_owned = acts
+                                            .par_chunks(nc)
                                             .map(|chunk| {
                                                 ferrox_quant::prepare_q8_k_acts_x4(chunk, cols)
                                             })
-                                            .collect()
-                                    } else {
-                                        Vec::new()
+                                            .collect();
+                                        &tiles_owned
                                     };
+                                let accel = ferrox_quant::AccelX4::detect();
                                 let n_tiles = batch_size.div_ceil(nc);
                                 Self::par_chunked_groups(
                                     n_groups,
@@ -2281,12 +2395,13 @@ impl WeightMatrix {
                                                     &packed, g, chunk, cols, interleave, tile,
                                                 );
                                             } else {
-                                                ferrox_quant::gemm_q5_kx8_group_x4(
+                                                ferrox_quant::gemm_q5_kx8_group_x4_on(
                                                     &packed,
                                                     g,
                                                     &act_tiles[t],
                                                     cols,
                                                     interleave,
+                                                    accel,
                                                     tile,
                                                 );
                                             }
@@ -2346,21 +2461,9 @@ impl WeightMatrix {
                             return out;
                         }
                         QuantKind::Q6K if cols.is_multiple_of(256) => {
-                            let acts_owned: Vec<_>;
-                            let acts: &[ferrox_quant::Q8KActivations] = match shared {
-                                Some(BatchActs::Q8K(a)) if a.len() == batch_size => a,
-                                _ => {
-                                    acts_owned = (0..batch_size)
-                                        .into_par_iter()
-                                        .map(|b| {
-                                            ferrox_quant::quantize_activations_q8_k(
-                                                &x_batch[b * cols..(b + 1) * cols],
-                                            )
-                                        })
-                                        .collect();
-                                    &acts_owned
-                                }
-                            };
+                            let mut acts_owned = Vec::new();
+                            let (acts, shared_tiles) =
+                                Self::q8k_acts(shared, x_batch, batch_size, cols, &mut acts_owned);
                             // Kx8 batch path only where the i8mm GEMM
                             // exists (the scalar Kx8 GEMM measured slower
                             // than the per-row NEON dot on Phi ffn_down,
@@ -2377,10 +2480,20 @@ impl WeightMatrix {
                                 // Quads of 4 (the i8mm tile shape), not
                                 // [`Q6_KX8_GEMM_NC`].
                                 let nc = ferrox_quant::Q8K_ACTS_X4_NC;
-                                let act_tiles: Vec<ferrox_quant::Q8KActsX4> = acts
-                                    .par_chunks(nc)
-                                    .map(|chunk| ferrox_quant::prepare_q8_k_acts_x4(chunk, cols))
-                                    .collect();
+                                let tiles_owned: Vec<ferrox_quant::Q8KActsX4>;
+                                let act_tiles: &[ferrox_quant::Q8KActsX4] =
+                                    if shared_tiles.is_empty() {
+                                        tiles_owned = acts
+                                            .par_chunks(nc)
+                                            .map(|chunk| {
+                                                ferrox_quant::prepare_q8_k_acts_x4(chunk, cols)
+                                            })
+                                            .collect();
+                                        &tiles_owned
+                                    } else {
+                                        shared_tiles
+                                    };
+                                let accel = ferrox_quant::AccelX4::detect();
                                 let n_tiles = batch_size.div_ceil(nc);
                                 Self::par_chunked_groups(
                                     n_groups,
@@ -2396,12 +2509,13 @@ impl WeightMatrix {
                                                 &acts[t * nc..((t + 1) * nc).min(batch_size)];
                                             let n = chunk.len();
                                             let tile = &mut tile[..ferrox_quant::Q6_KX8_NROWS * n];
-                                            ferrox_quant::gemm_q6_kx8_group_x4(
+                                            ferrox_quant::gemm_q6_kx8_group_x4_on(
                                                 &packed,
                                                 g,
                                                 &act_tiles[t],
                                                 cols,
                                                 interleave,
+                                                accel,
                                                 tile,
                                             );
                                             for j in 0..n {
@@ -3476,11 +3590,29 @@ mod tests {
         };
         let x: Vec<f32> = (0..cols).map(|i| ((i as f32) * 0.031).cos()).collect();
         let applied = q.apply(&x);
+        // With `FERROX_CPU_INT_DOT` on, `apply` quantizes the ACTIVATION to
+        // int8 as well, so the two sides no longer differ only by float
+        // summation order and a fixed 1e-4 is not the right bar -- it fired
+        // at 6.5e-3 on a result of 5.25, which is the activation error, not
+        // a byte disagreement. The worst case is derivable rather than
+        // guessed: `quantize_activations_q8` rounds to `d = amax/127`, so
+        // each element moves by at most `d/2`, and the dot's error is
+        // bounded by that times the row's L1 norm.
+        let bound = |row: &[f32]| {
+            if !cpu_int_dot_enabled() {
+                return 1e-4;
+            }
+            let amax = x.iter().fold(0f32, |m, v| m.max(v.abs()));
+            let l1: f32 = row.iter().map(|w| w.abs()).sum();
+            (amax / 127.0 / 2.0) * l1
+        };
         for (r, &got) in applied.iter().enumerate() {
-            let via_row: f32 = q.dequant_row(r).iter().zip(&x).map(|(a, b)| a * b).sum();
+            let row = q.dequant_row(r);
+            let via_row: f32 = row.iter().zip(&x).map(|(a, b)| a * b).sum();
+            let bound = bound(&row);
             assert!(
-                (got - via_row).abs() < 1e-4,
-                "row {r}: apply={got} via dequant_row={via_row}"
+                (got - via_row).abs() < bound,
+                "row {r}: apply={got} via dequant_row={via_row} (bound {bound:e})"
             );
         }
     }
@@ -3935,8 +4067,9 @@ mod tests {
 
     /// Sharing one quantized activation batch across projections must be
     /// invisible in the results: a matching `BatchActs` produces exactly
-    /// what `apply_batch` produces (same quantization, same kernels), and
-    /// a mismatched variant is ignored rather than misused.
+    /// what `apply_batch` produces (same quantization, same interleaved
+    /// quads, same kernels), and a mismatched variant is ignored rather
+    /// than misused.
     #[test]
     fn apply_batch_with_shared_acts_matches_apply_batch() {
         let rows = 19;
@@ -3962,14 +4095,144 @@ mod tests {
             );
 
             let wrong = match kind {
-                QuantKind::Q8_0 | QuantKind::Q4_0 => BatchActs::Q8K(Vec::new()),
-                _ => BatchActs::Q8(Vec::new()),
+                QuantKind::Q8_0 | QuantKind::Q4_0 => BatchActs::Q8K {
+                    acts: Vec::new(),
+                    tiles: Vec::new(),
+                    cols,
+                },
+                _ => BatchActs::Q8 {
+                    acts: Vec::new(),
+                    tiles: Vec::new(),
+                    cols,
+                },
             };
             let with_wrong = matrix.apply_batch_with_acts(&x_batch, batch_size, Some(&wrong));
             assert_eq!(
                 baseline, with_wrong,
                 "{kind:?}: mismatched shared acts were not ignored"
             );
+        }
+    }
+
+    /// The interleaved quads now ride along with the activations, so the
+    /// guard that decides whether a `shared` batch is usable has to cover
+    /// them too -- and that guard is the one thing here that is not gated
+    /// on `FERROX_CPU_INT_DOT`, so it is tested directly.
+    ///
+    /// A stale set is not a panic. The quads are indexed by super-block, so
+    /// a batch prepared at another width either reads past its own end or
+    /// silently dots the wrong columns; both surface as a wrong answer.
+    /// What must happen instead is a local re-quantization with no quads,
+    /// which is what the fresh-fallback assertions below pin.
+    #[test]
+    fn shared_acts_are_reused_only_at_the_matching_length_and_width() {
+        let cols = 512;
+        let batch_size = 7;
+        let x_batch: Vec<f32> = (0..batch_size * cols)
+            .map(|i| (((i * 37 + 5) % 83) as f32) * 0.019 - 0.9)
+            .collect();
+
+        let acts: Vec<_> = (0..batch_size)
+            .map(|b| ferrox_quant::quantize_activations_q8_k(&x_batch[b * cols..(b + 1) * cols]))
+            .collect();
+        let tiles: Vec<_> = acts
+            .chunks(ferrox_quant::Q8K_ACTS_X4_NC)
+            .map(|c| ferrox_quant::prepare_q8_k_acts_x4(c, cols))
+            .collect();
+        let n_tiles = tiles.len();
+        let shared = BatchActs::Q8K { acts, tiles, cols };
+
+        let mut owned = Vec::new();
+        let (got, quads) =
+            WeightMatrix::q8k_acts(Some(&shared), &x_batch, batch_size, cols, &mut owned);
+        assert_eq!(got.len(), batch_size);
+        assert_eq!(
+            quads.len(),
+            n_tiles,
+            "matching batch did not reuse its quads"
+        );
+        assert!(owned.is_empty(), "matching batch was re-quantized anyway");
+
+        // Same positions, another width: refuse and re-quantize.
+        let mut owned = Vec::new();
+        let (got, quads) =
+            WeightMatrix::q8k_acts(Some(&shared), &x_batch, batch_size, 256, &mut owned);
+        assert!(quads.is_empty(), "quads from another width were accepted");
+        assert_eq!(got.len(), batch_size);
+        assert_eq!(got[0].n_blocks(), 1, "fallback did not quantize at 256");
+
+        // Same width, another position count: refuse and re-quantize.
+        let mut owned = Vec::new();
+        let (got, quads) =
+            WeightMatrix::q8k_acts(Some(&shared), &x_batch[..cols], 1, cols, &mut owned);
+        assert!(quads.is_empty(), "quads for another batch were accepted");
+        assert_eq!(got.len(), 1);
+
+        // The Q8_0 half of the same guard.
+        let acts: Vec<_> = (0..batch_size)
+            .map(|b| ferrox_quant::quantize_activations_q8(&x_batch[b * cols..(b + 1) * cols]))
+            .collect();
+        let tiles: Vec<_> = acts
+            .chunks(ferrox_quant::Q8K_ACTS_X4_NC)
+            .map(|c| ferrox_quant::prepare_q8_acts_x4(c, cols))
+            .collect();
+        let n_tiles = tiles.len();
+        let shared = BatchActs::Q8 { acts, tiles, cols };
+
+        let mut owned = Vec::new();
+        let (got, quads) =
+            WeightMatrix::q8_acts(Some(&shared), &x_batch, batch_size, cols, &mut owned);
+        assert_eq!(got.len(), batch_size);
+        assert_eq!(
+            quads.len(),
+            n_tiles,
+            "matching batch did not reuse its quads"
+        );
+
+        let mut owned = Vec::new();
+        let (got, quads) =
+            WeightMatrix::q8_acts(Some(&shared), &x_batch, batch_size, 256, &mut owned);
+        assert!(quads.is_empty(), "quads from another width were accepted");
+        assert_eq!(got[0].n_blocks(), 8, "fallback did not quantize at 256");
+    }
+
+    /// Whatever a projection would have built for itself, a sibling's
+    /// shared batch must hand it the same thing. Q4_K, Q5_K and Q6_K read
+    /// one Q8_K quad set between them, and Q8_0 and Q4_0 one Q8_0 set, so
+    /// the donor's kind must not show through.
+    ///
+    /// Gated the same way the path itself is: with `FERROX_CPU_INT_DOT`
+    /// off (the library default) `quantize_batch_acts` returns `None` and
+    /// no projection consumes quads at all, so this asserts against the
+    /// INT_DOT build. Run the suite both ways.
+    #[test]
+    fn shared_quads_are_what_each_consumer_would_have_built_itself() {
+        if !cpu_int_dot_enabled() {
+            return;
+        }
+        let rows = 24;
+        let cols = 512;
+        let batch_size = 7;
+        let x_batch: Vec<f32> = (0..batch_size * cols)
+            .map(|i| (((i * 37 + 5) % 83) as f32) * 0.019 - 0.9)
+            .collect();
+
+        for (donor, consumers) in [
+            (QuantKind::Q4K, &[QuantKind::Q5K, QuantKind::Q6K][..]),
+            (QuantKind::Q8_0, &[QuantKind::Q4_0][..]),
+        ] {
+            let shared = synth_quant_matrix(donor, rows, cols)
+                .quantize_batch_acts(&x_batch, batch_size)
+                .expect("INT_DOT is on and this kind/width is eligible");
+            for kind in consumers {
+                let matrix = synth_quant_matrix(*kind, rows, cols);
+                let baseline = matrix.apply_batch(&x_batch, batch_size);
+                let shared_out = matrix.apply_batch_with_acts(&x_batch, batch_size, Some(&shared));
+                assert_eq!(
+                    baseline, shared_out,
+                    "{kind:?} consuming {donor:?} quads changed the result"
+                );
+            }
         }
     }
 

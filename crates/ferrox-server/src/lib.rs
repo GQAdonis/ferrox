@@ -3190,52 +3190,6 @@ async fn chat_completions_stream(
         .into_response())
 }
 
-/// Does this value, on this hardware, put layers on the GPU?
-///
-/// Split out from the env lookup because it is the whole decision and
-/// the env lookup is not testable. `"auto"` is the interesting case:
-/// it means "GPU if there is one", so it can only be answered together
-/// with whether a device was found.
-fn gpu_selected(value: Option<&str>, device_present: bool) -> bool {
-    match value {
-        Some("1") => true,
-        Some("auto") => device_present,
-        _ => false,
-    }
-}
-
-/// Whether the run will really offload to a GPU.
-///
-/// `-dev metal` sets `FERROX_METAL=1`, but a plain `--ngl 99` leaves
-/// the device on `Auto` and sets `"auto"` instead. The paged-KV guard
-/// below compared against `"1"` alone, so the most common way to ask
-/// for the GPU walked past it and paged decode ran on Metal anyway,
-/// which is exactly the wrong-token case the guard exists to stop.
-fn gpu_offload_resolved() -> bool {
-    let metal_present = {
-        #[cfg(feature = "metal")]
-        {
-            ferrox_metal::MetalProfile::detect().available
-        }
-        #[cfg(not(feature = "metal"))]
-        {
-            false
-        }
-    };
-    let cuda_present = {
-        #[cfg(feature = "cuda")]
-        {
-            ferrox_cuda::HardwareProfile::detect().cuda_available
-        }
-        #[cfg(not(feature = "cuda"))]
-        {
-            false
-        }
-    };
-    gpu_selected(std::env::var("FERROX_METAL").ok().as_deref(), metal_present)
-        || gpu_selected(std::env::var("FERROX_CUDA").ok().as_deref(), cuda_present)
-}
-
 /// The axum pattern for one of the published path templates.
 ///
 /// `ferrox_api::routes` writes placeholders in the OpenAPI style
@@ -4059,28 +4013,19 @@ async fn run(mcp_config_path: Option<PathBuf>, exit_on_stdin_close: bool) -> any
                  mutually exclusive: both bound the same KV memory, by different means. \
                  Set one."
             );
-            // Paged KV computes the wrong answer on the GPU today.
-            // Measured on this host with Llama-3.2-3B Q4_K_M: CPU
-            // paged and non-paged both answer "Blue and Red.", and
-            // Metal paged answers "Blue ( question mark;>a> is a> is".
-            // The prompt, the seed and the model are identical, so the
-            // page indirection is diverging somewhere the contiguous
-            // path does not.
+            // Paged KV used to be refused here on any GPU backend,
+            // because it returned fluent wrong tokens on Metal: the
+            // prefill left K/V on the device and filled the host cache
+            // with `KvCache::advance_len` placeholders, and the paged
+            // prefill then copied those placeholders into the page
+            // store. The decode that followed attended over a prompt
+            // the model never saw.
             //
-            // Refused rather than left to run, because fluent wrong
-            // output is the failure this project refuses everywhere
-            // else: nothing in the response says the attention read the
-            // wrong pages. Lift this once the paged path passes
-            // `ferrox verify --backend metal` with prefill covered.
-            let gpu_offload = gpu_offload_resolved();
-            assert!(
-                !gpu_offload,
-                "FERROX_PAGED_KV_BLOCKS is CPU-only right now: on a GPU \
-                 backend the paged attention path returns wrong tokens \
-                 rather than failing, so it is refused instead. Run the \
-                 server with `-dev none -ngl 0` to use paged KV, or unset \
-                 FERROX_PAGED_KV_BLOCKS to use the GPU."
-            );
+            // Fixed in `ferrox_models::Decoder`, which now downloads
+            // the real rows for the caller that reads them, and pinned
+            // on hardware by `paged_metal_parity` -- greedy ids
+            // identical between paged and contiguous KV on a dense
+            // model, an MoE model and a sliding-window model.
             let blocks_per_layer: usize = blocks
                 .parse()
                 .expect("FERROX_PAGED_KV_BLOCKS must be a positive integer");
@@ -5648,28 +5593,6 @@ mod tests {
             ferrox_api::routes::v1_stream("abc"),
             axum_path(ferrox_api::routes::V1_STREAM).replace(":request_id", "abc")
         );
-    }
-
-    /// `--ngl 99` on its own asks for the GPU, and the paged-KV guard
-    /// has to see that.
-    ///
-    /// The guard compared the env var against "1", which only `-dev
-    /// metal` sets. A plain `--ngl 99` leaves the device on Auto and
-    /// sets "auto", so paged decode ran on Metal and returned fluent
-    /// wrong tokens: the exact outcome the guard was added to prevent.
-    #[test]
-    fn auto_counts_as_the_gpu_whenever_there_is_one() {
-        assert!(gpu_selected(Some("1"), true));
-        assert!(
-            gpu_selected(Some("auto"), true),
-            "--ngl 99 with a Metal device present is a GPU run"
-        );
-        assert!(
-            !gpu_selected(Some("auto"), false),
-            "auto on a box with no GPU is a CPU run, and paged KV is fine there"
-        );
-        assert!(!gpu_selected(Some("0"), true));
-        assert!(!gpu_selected(None, true));
     }
 
     /// Every published template goes through the converter, and what

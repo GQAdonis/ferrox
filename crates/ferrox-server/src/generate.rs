@@ -366,9 +366,13 @@ enum Kv {
 
 impl Kv {
     /// Prefill, returning the last position's logits.
-    fn prefill(&mut self, decoder: &Decoder, tokens: &[usize]) -> Vec<f32> {
+    ///
+    /// `host_kv` only reaches the contiguous arm: the paged arm always
+    /// needs real host rows, because scattering them into the page
+    /// store IS reading them back.
+    fn prefill(&mut self, decoder: &Decoder, tokens: &[usize], host_kv: bool) -> Vec<f32> {
         match self {
-            Kv::Contiguous(caches) => forward_prompt_batch(decoder, tokens, 0, caches),
+            Kv::Contiguous(caches) => forward_prompt_batch(decoder, tokens, 0, caches, host_kv),
             Kv::Paged(lease) => {
                 // Skip whatever the radix tree already computed. Those
                 // positions are already in the block table with their
@@ -662,22 +666,39 @@ fn cpu_kv_offload_enabled() -> bool {
 
 /// Batched prompt prefill, optionally split into `FERROX_CHUNKED_PREFILL`-sized
 /// chunks that append into the same KV caches.
+/// `host_kv`: whether these caches will be READ afterwards rather than
+/// only decoded from. A Metal prefill otherwise leaves the real K/V on
+/// the device and the host rows zero-filled, and
+/// `sync_metal_attn_kv_to_host` cannot repair that -- it appends past
+/// `seq_len`, which the zero fill has already advanced. The prefix
+/// cache reads them, so a stored snapshot was all zeros and the next
+/// request restoring it answered fluent nonsense. Paid for only when a
+/// prefix cache is configured, because it costs one KV download per
+/// layer and nothing else in this path reads the rows back.
 fn forward_prompt_batch(
     decoder: &Decoder,
     tokens: &[usize],
     start_pos: usize,
     caches: &mut [KvCache],
+    host_kv: bool,
 ) -> Vec<f32> {
+    let run = |part: &[usize], pos: usize, caches: &mut [KvCache]| {
+        if host_kv {
+            decoder.forward_batch_last_host_kv(part, pos, caches)
+        } else {
+            decoder.forward_batch_last(part, pos, caches)
+        }
+    };
     if let Some(chunk) = chunked_prefill_tokens() {
         let mut pos = start_pos;
         let mut last = Vec::new();
         for part in tokens.chunks(chunk) {
-            last = decoder.forward_batch_last(part, pos, caches);
+            last = run(part, pos, caches);
             pos += part.len();
         }
         last
     } else {
-        decoder.forward_batch_last(tokens, start_pos, caches)
+        run(tokens, start_pos, caches)
     }
 }
 
@@ -924,7 +945,9 @@ pub fn generate(
             // When `FERROX_CHUNKED_PREFILL` is set, split long prompts
             // into chunks that reuse the same KV caches.
             pos = tokens.len();
-            kv.prefill(decoder, &tokens)
+            // The prefix cache is the only thing here that reads these
+            // caches back; without one, the download is pure cost.
+            kv.prefill(decoder, &tokens, prefix_cache.is_some())
         };
     }
 

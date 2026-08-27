@@ -567,6 +567,52 @@ impl ModelConfig {
         // two corrections compose by multiplication, as they do in
         // llama.cpp (`ggml_rope_cache_init` divides by `freq_factors`
         // *and then* runs `rope_yarn`).
+        // Linear scaling, which was silently DROPPED before this.
+        //
+        // `rope.scaling.type = "linear"` with factor s means rotating
+        // position `p/s` instead of `p`. Since the angle is `p * freq`,
+        // that is exactly `p * (freq / s)`, and `rope_freqs` already
+        // divides each band's frequency. So a uniform vector of `s`
+        // expresses it exactly and rides the existing CPU and Metal RoPE
+        // paths unchanged, the same way YaRN does below.
+        //
+        // Before this, the type was compared against "yarn" and anything
+        // else returned None, so a checkpoint declaring linear scaling
+        // with factor 4 loaded and roped at UNSCALED positions where
+        // llama.cpp divides them by 4. It answered as a different model
+        // with no error. Affects the long-context community rescales
+        // (`*-16k`, `*-32k` Llama-2 derivatives).
+        let rope_freqs = match linear_scaling_from_gguf(file, &arch) {
+            None => rope_freqs,
+            Some(factor) => {
+                let rotary_dim = rope_dim.unwrap_or(head_dim);
+                if rotary_dim == 0 || !rotary_dim.is_multiple_of(2) {
+                    best_effort_fields.push(
+                        "rope_freqs (linear scaling declared but the rotary width is odd; \
+                         scaling not applied)",
+                    );
+                    rope_freqs
+                } else {
+                    let linear = vec![factor; rotary_dim / 2];
+                    match rope_freqs {
+                        None => Some(linear),
+                        // Compose by multiplication, as a file carrying
+                        // its own `rope_freqs.weight` tensor and a
+                        // declared linear factor means both.
+                        Some(own) if own.len() == linear.len() => {
+                            Some(own.iter().zip(linear.iter()).map(|(a, b)| a * b).collect())
+                        }
+                        Some(own) => {
+                            best_effort_fields.push(
+                                "rope_freqs (linear scaling declared but the file's own \
+                                 rope_freqs tensor has a different width; scaling not applied)",
+                            );
+                            Some(own)
+                        }
+                    }
+                }
+            }
+        };
         let rope_freqs = match yarn_scaling_from_gguf(file, &arch, rope_orig_ctx) {
             None => rope_freqs,
             Some(scaling) => {
@@ -694,6 +740,21 @@ impl crate::sampling::RecommendedSampling {
                 .map(|v| v as usize),
         }
     }
+}
+
+/// The `linear` RoPE scaling factor, if this file declares one.
+///
+/// Deliberately separate from [`yarn_scaling_from_gguf`]: YaRN needs an
+/// original context length and per-band betas, and linear needs neither.
+/// Any factor at or below one is not a correction, and is treated as
+/// absent rather than applied as a no-op.
+fn linear_scaling_from_gguf(file: &impl TensorSource, arch: &str) -> Option<f32> {
+    let key = |suffix: &str| format!("{arch}.{suffix}");
+    let scaling_type = file.metadata_str(&key("rope.scaling.type"))?;
+    if !scaling_type.eq_ignore_ascii_case("linear") {
+        return None;
+    }
+    metadata_f32_any(file, &[key("rope.scaling.factor")]).filter(|f| f.is_finite() && *f > 1.0)
 }
 
 /// The YaRN RoPE scaling a GGUF declares, or `None` when this file
@@ -2371,22 +2432,58 @@ mod tests {
     /// scaling type ferrox does not implement (`linear`, `longrope`) is
     /// left exactly as it was rather than being roped as YaRN, which
     /// would be a new kind of wrong rather than the current known one.
+    /// `rope.scaling.type = "linear"` must actually scale.
+    ///
+    /// Rotating position `p/s` is the same as rotating `p` with every
+    /// band's frequency divided by `s`, and `rope_freqs` is exactly a
+    /// per-band frequency divisor, so a uniform vector of `s` expresses
+    /// linear scaling with no new code on the RoPE paths.
+    ///
+    /// Before this, the scaling type was compared against "yarn" and
+    /// anything else returned None, so such a file loaded and roped at
+    /// unscaled positions: a different model, no error.
     #[test]
-    fn a_gguf_without_yarn_scaling_keeps_its_rope_frequencies_untouched() {
-        assert!(llama_config_with("noscale", &[]).rope_freqs.is_none());
-        assert!(llama_config_with(
+    fn linear_scaling_is_applied_as_a_uniform_frequency_divisor() {
+        let cfg = llama_config_with(
             "linear",
             &[
                 ("llama.rope.scaling.type", Kv::Str("linear")),
                 ("llama.rope.scaling.factor", Kv::F32(4.0)),
-                (
-                    "llama.rope.scaling.original_context_length",
-                    Kv::U32(131_072),
-                ),
+            ],
+        );
+        let freqs = cfg
+            .rope_freqs
+            .as_ref()
+            .expect("linear scaling must produce frequency factors");
+        assert_eq!(freqs.len(), cfg.head_dim / 2, "one factor per rotated pair");
+        assert!(
+            freqs.iter().all(|f| (*f - 4.0).abs() < 1e-6),
+            "linear scaling is uniform across bands, unlike YaRN: got {freqs:?}"
+        );
+    }
+
+    /// A factor that corrects nothing is not a correction.
+    #[test]
+    fn a_linear_factor_of_one_is_treated_as_absent() {
+        assert!(llama_config_with(
+            "linear_one",
+            &[
+                ("llama.rope.scaling.type", Kv::Str("linear")),
+                ("llama.rope.scaling.factor", Kv::F32(1.0)),
             ],
         )
         .rope_freqs
         .is_none());
+    }
+
+    #[test]
+    fn a_gguf_without_yarn_scaling_keeps_its_rope_frequencies_untouched() {
+        assert!(llama_config_with("noscale", &[]).rope_freqs.is_none());
+        // Linear scaling is NOT "no scaling". It used to land here,
+        // asserted as `is_none()`, on the reasoning that leaving
+        // positions alone beat roping them wrong in a new way. Both are
+        // wrong output: llama.cpp divides the positions by the factor.
+        // See `linear_scaling_is_applied_as_a_uniform_frequency_divisor`.
         // YaRN with a no-op factor is not a correction either.
         assert!(llama_config_with(
             "yarn_factor_one",

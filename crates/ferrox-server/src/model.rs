@@ -205,13 +205,34 @@ fn tokenizer_from_gguf(file: &ShardedGguf) -> anyhow::Result<ServerTokenizer> {
         Some("t5") => Ok(ServerTokenizer::Unigram(GgufUnigramTokenizer::from_gguf(
             file,
         )?)),
-        other => {
-            tracing::warn!(
-                "unrecognized or missing tokenizer.ggml.model ({other:?}) -- falling back to \
-                 a raw byte tokenizer, which will not match this checkpoint's real vocabulary"
-            );
-            Ok(ServerTokenizer::Byte)
-        }
+        // A vocabulary this engine cannot read is not a warning, it is a
+        // refusal.
+        //
+        // Falling back to raw bytes here produced FLUENT GARBAGE: the
+        // model was fed ids from a vocabulary it was never trained on,
+        // so it generated confidently and wrongly, and nothing in the
+        // response said so. That is the exact failure this project
+        // refuses everywhere else, and this was the one place that did
+        // not. `ByteTokenizer` stays for synthetic-weight test models,
+        // which have no real vocabulary to mismatch.
+        Some(known @ ("bert" | "rwkv" | "none")) => anyhow::bail!(
+            "this checkpoint's tokenizer is `{known}`, which ferrox cannot read yet. \
+             Supported: `llama` (SentencePiece), `gpt2` and `gemma4` (BPE), `t5` \
+             (Unigram). {}",
+            match known {
+                "bert" =>
+                    "WordPiece is what BERT-family embedding models use; \
+                           ferrox has no WordPiece implementation.",
+                "rwkv" => "RWKV uses a trie tokenizer ferrox does not implement.",
+                _ => "`none` means the file carries no vocabulary at all.",
+            }
+        ),
+        other => anyhow::bail!(
+            "this checkpoint declares tokenizer.ggml.model = {other:?}, which ferrox does \
+             not recognise. Supported: `llama`, `gpt2`, `gemma4`, `t5`. Serving it would \
+             mean feeding the model ids from a vocabulary it was not trained on, which \
+             produces fluent text that is wrong rather than an error."
+        ),
     }
 }
 

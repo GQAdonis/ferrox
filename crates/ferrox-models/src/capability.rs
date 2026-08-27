@@ -210,7 +210,6 @@ pub fn architecture_catalog() -> &'static [ArchProfile] {
             "granite-moe",
             "mistral3",
             "maincoder",
-            "smollm3",
             "arcee",
             "ernie4_5",
             "ernie4_5-moe",
@@ -282,6 +281,17 @@ pub fn architecture_catalog() -> &'static [ArchProfile] {
         // `LLAMA_NO_ROPE` pins the group so a later edit cannot quietly
         // put one back on a rotating path.
         for (n, reason) in [
+            (
+                "smollm3",
+                "a NoPE layer pattern: llama.cpp hardcodes \
+                 `hparams.n_no_rope_layer_step = 4` (src/models/smollm3.cpp:5) and \
+                 skips RoPE where `(il + 1) % 4 == 0` (:69), so 9 of a 36-layer \
+                 SmolLM3-3B's layers get NO rotation at all. There is NO GGUF key \
+                 for it, so no metadata gate could see it: the tensor set matches \
+                 the generic llama set exactly and the file loads clean. The \
+                 generic decoder rotates every layer, which is a different model. \
+                 Same shape as the ALiBi group below, and found the same way",
+            ),
             (
                 "gpt2",
                 "learned absolute position embeddings (`position_embd.weight`, \
@@ -769,10 +779,32 @@ pub fn default_swa_pattern(arch: &str) -> Option<usize> {
         "gpt-oss" => Some(2),
         // src/models/gemma2.cpp:8
         "gemma2" => Some(2),
-        // src/models/gemma3.cpp:7, gemma3n.cpp:6
-        "gemma3" | "gemma3n" => Some(6),
+        // src/models/gemma3.cpp:7
+        "gemma3" => Some(6),
+        // src/models/gemma3n.cpp:4 says 5, NOT 6. This was transcribed
+        // as 6 alongside gemma3 and is simply wrong. Inert only because
+        // `gemma3n` refuses for other reasons today.
+        "gemma3n" => Some(5),
         // src/models/cohere2.cpp:5, exaone4.cpp:7, olmo2.cpp:9
         "cohere2" | "exaone4" | "olmo2" => Some(4),
+        // Added after an audit found this table covered 6 architectures
+        // where llama.cpp hardcodes a period for 18. A MISSING entry is
+        // not neutral: with no period, every layer gets windowed, so a
+        // model whose full-attention layers should see the whole context
+        // sees only a window instead. That is a different model, and it
+        // fails silently.
+        //
+        // src/models/mellum.cpp:11
+        "mellum" => Some(4),
+        // src/models/exaone-moe.cpp:4-8. SWA is unconditional there
+        // with n_swa = 128, so without this every layer ran with a
+        // 128-token history.
+        "exaone-moe" => Some(4),
+        // src/models/afmoe.cpp, plamo3.cpp. Both refuse for other
+        // reasons today, so these are latent rather than live, and
+        // pinned here so they stay right if that changes.
+        "afmoe" => Some(4),
+        "plamo3" => Some(8),
         _ => None,
     }
 }

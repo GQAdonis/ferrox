@@ -11,8 +11,8 @@ use ferrox_core::cache::KvCache;
 use ferrox_gguf::ShardedGguf;
 use ferrox_models::{
     ensure_generic_decoder, load_gemma4_engine_from_path, load_glm52_engine_from_path,
-    load_mla_engine_from_path, select_engine_kind, ByteTokenizer, Decoder, Engine,
-    GgufBpeTokenizer, GgufSpmTokenizer, GgufUnigramTokenizer, ModelConfig, Sampler, SamplingParams,
+    load_mla_engine_from_path, select_engine_kind, Decoder, Engine, GgufBpeTokenizer,
+    GgufSpmTokenizer, GgufUnigramTokenizer, ModelConfig, Sampler, SamplingParams,
     SelectedEngineKind, ServedEngine,
 };
 
@@ -370,11 +370,44 @@ fn prefill_chunk_from_env() -> usize {
         .unwrap_or(1)
 }
 
+/// The tokenizer a GGUF's own metadata names, or a refusal.
+///
+/// Four call sites had a byte-by-byte copy of this match, each falling
+/// back to `CliTokenizer::Byte` on anything unrecognised. That fallback
+/// produced FLUENT GARBAGE: the model was fed ids from a vocabulary it
+/// was never trained on, so it generated confidently and wrongly with
+/// nothing in the output saying so. This project refuses everywhere
+/// else rather than compute something different; the tokenizer was the
+/// one place that did not.
+///
+/// The `Byte` variant went with it: the CLI has no synthetic-weight
+/// path, so with the fallback gone nothing could construct it.
+fn cli_tokenizer_from_gguf(file: &ShardedGguf) -> anyhow::Result<CliTokenizer> {
+    match file.metadata_str("tokenizer.ggml.model") {
+        Some("gpt2" | "gemma4") => Ok(CliTokenizer::Bpe(Box::new(GgufBpeTokenizer::from_gguf(
+            file,
+        )?))),
+        Some("llama") => Ok(CliTokenizer::Spm(GgufSpmTokenizer::from_gguf(file)?)),
+        Some("t5") => Ok(CliTokenizer::Unigram(GgufUnigramTokenizer::from_gguf(
+            file,
+        )?)),
+        Some(known @ ("bert" | "rwkv" | "none")) => anyhow::bail!(
+            "this checkpoint's tokenizer is `{known}`, which ferrox cannot read yet. \
+             Supported: `llama` (SentencePiece), `gpt2` and `gemma4` (BPE), `t5` (Unigram)."
+        ),
+        other => anyhow::bail!(
+            "this checkpoint declares tokenizer.ggml.model = {other:?}, which ferrox does \
+             not recognise. Supported: `llama`, `gpt2`, `gemma4`, `t5`. Serving it would \
+             mean feeding the model ids from a vocabulary it was not trained on, which \
+             produces fluent text that is wrong rather than an error."
+        ),
+    }
+}
+
 enum CliTokenizer {
     Bpe(Box<GgufBpeTokenizer>),
     Spm(GgufSpmTokenizer),
     Unigram(GgufUnigramTokenizer),
-    Byte,
 }
 
 impl CliTokenizer {
@@ -383,10 +416,6 @@ impl CliTokenizer {
             CliTokenizer::Bpe(t) => t.encode(text).into_iter().map(|id| id as usize).collect(),
             CliTokenizer::Spm(t) => t.encode(text).into_iter().map(|id| id as usize).collect(),
             CliTokenizer::Unigram(t) => t.encode(text).into_iter().map(|id| id as usize).collect(),
-            CliTokenizer::Byte => ByteTokenizer::encode(text)
-                .into_iter()
-                .map(|id| id as usize)
-                .collect(),
         }
     }
 
@@ -396,7 +425,6 @@ impl CliTokenizer {
             CliTokenizer::Bpe(t) => t.decode(&ids32),
             CliTokenizer::Spm(t) => t.decode(&ids32),
             CliTokenizer::Unigram(t) => t.decode(&ids32),
-            CliTokenizer::Byte => ByteTokenizer::decode(&ids32),
         }
     }
 
@@ -405,7 +433,6 @@ impl CliTokenizer {
             CliTokenizer::Bpe(_) => "gguf-bpe",
             CliTokenizer::Spm(_) => "gguf-spm",
             CliTokenizer::Unigram(_) => "gguf-unigram",
-            CliTokenizer::Byte => "byte",
         }
     }
 }
@@ -679,17 +706,7 @@ pub fn run_infer(args: InferArgs) -> anyhow::Result<()> {
         );
     }
 
-    let tokenizer = match file.metadata_str("tokenizer.ggml.model") {
-        Some("gpt2" | "gemma4") => CliTokenizer::Bpe(Box::new(GgufBpeTokenizer::from_gguf(&file)?)),
-        Some("llama") => CliTokenizer::Spm(GgufSpmTokenizer::from_gguf(&file)?),
-        Some("t5") => CliTokenizer::Unigram(GgufUnigramTokenizer::from_gguf(&file)?),
-        other => {
-            eprintln!(
-                "ferrox: unrecognized tokenizer.ggml.model ({other:?}); using byte tokenizer"
-            );
-            CliTokenizer::Byte
-        }
-    };
+    let tokenizer = cli_tokenizer_from_gguf(&file)?;
     // Not just `eos_token_id`: Llama-3 ends a turn with `<|eot_id|>` and
     // gemma-4 with `<turn|>`, neither of which is the metadata EOS.
     let stop_tokens = ferrox_models::tokenizer::StopTokens::from_gguf(&file);
@@ -706,7 +723,7 @@ pub fn run_infer(args: InferArgs) -> anyhow::Result<()> {
         .unwrap_or(4096);
     let ctx_size = resolve_ctx_size(&args, path, gguf_ctx)?;
 
-    let chat = ChatKind::detect_for_gguf(&file, matches!(tokenizer, CliTokenizer::Byte));
+    let chat = ChatKind::detect_for_gguf(&file, false);
     let user_prompt = resolve_prompt(&args)?;
     let prompt = if args.no_cnv {
         user_prompt
@@ -845,17 +862,7 @@ pub fn run_infer(args: InferArgs) -> anyhow::Result<()> {
 
 /// Dense-lead DeepSeek-2 / Mistral-4 path via [`MlaEngine`].
 fn run_mla_infer(args: InferArgs, path: &Path, file: &ShardedGguf) -> anyhow::Result<()> {
-    let tokenizer = match file.metadata_str("tokenizer.ggml.model") {
-        Some("gpt2" | "gemma4") => CliTokenizer::Bpe(Box::new(GgufBpeTokenizer::from_gguf(file)?)),
-        Some("llama") => CliTokenizer::Spm(GgufSpmTokenizer::from_gguf(file)?),
-        Some("t5") => CliTokenizer::Unigram(GgufUnigramTokenizer::from_gguf(file)?),
-        other => {
-            eprintln!(
-                "ferrox: unrecognized tokenizer.ggml.model ({other:?}); using byte tokenizer"
-            );
-            CliTokenizer::Byte
-        }
-    };
+    let tokenizer = cli_tokenizer_from_gguf(file)?;
     // Not just `eos_token_id`: Llama-3 ends a turn with `<|eot_id|>` and
     // gemma-4 with `<turn|>`, neither of which is the metadata EOS.
     let stop_tokens = ferrox_models::tokenizer::StopTokens::from_gguf(file);
@@ -871,7 +878,7 @@ fn run_mla_infer(args: InferArgs, path: &Path, file: &ShardedGguf) -> anyhow::Re
         .unwrap_or(4096);
     let ctx_size = resolve_ctx_size(&args, path, gguf_ctx)?;
 
-    let chat = ChatKind::detect_for_gguf(file, matches!(tokenizer, CliTokenizer::Byte));
+    let chat = ChatKind::detect_for_gguf(file, false);
     let user_prompt = resolve_prompt(&args)?;
     let prompt = if args.no_cnv {
         user_prompt
@@ -980,17 +987,7 @@ fn run_mla_infer(args: InferArgs, path: &Path, file: &ShardedGguf) -> anyhow::Re
 
 /// GLM-5.2 / GLM4-family path via [`Glm52Engine`]./// Gemma-4 dedicated path via [`ferrox_models::Gemma4Engine`].
 fn run_gemma4_infer(args: InferArgs, path: &Path, file: &ShardedGguf) -> anyhow::Result<()> {
-    let tokenizer = match file.metadata_str("tokenizer.ggml.model") {
-        Some("gpt2" | "gemma4") => CliTokenizer::Bpe(Box::new(GgufBpeTokenizer::from_gguf(file)?)),
-        Some("llama") => CliTokenizer::Spm(GgufSpmTokenizer::from_gguf(file)?),
-        Some("t5") => CliTokenizer::Unigram(GgufUnigramTokenizer::from_gguf(file)?),
-        other => {
-            eprintln!(
-                "ferrox: unrecognized tokenizer.ggml.model ({other:?}); using byte tokenizer"
-            );
-            CliTokenizer::Byte
-        }
-    };
+    let tokenizer = cli_tokenizer_from_gguf(file)?;
     // Not just `eos_token_id`: Llama-3 ends a turn with `<|eot_id|>` and
     // gemma-4 with `<turn|>`, neither of which is the metadata EOS.
     let stop_tokens = ferrox_models::tokenizer::StopTokens::from_gguf(file);
@@ -1006,7 +1003,7 @@ fn run_gemma4_infer(args: InferArgs, path: &Path, file: &ShardedGguf) -> anyhow:
         .unwrap_or(4096);
     let ctx_size = resolve_ctx_size(&args, path, gguf_ctx)?;
 
-    let chat = ChatKind::detect_for_gguf(file, matches!(tokenizer, CliTokenizer::Byte));
+    let chat = ChatKind::detect_for_gguf(file, false);
     let user_prompt = resolve_prompt(&args)?;
     let prompt = if args.no_cnv {
         user_prompt
@@ -1116,17 +1113,7 @@ fn run_gemma4_infer(args: InferArgs, path: &Path, file: &ShardedGguf) -> anyhow:
 
 /// GLM-5.2 / GLM4-family path via [`Glm52Engine`].
 fn run_glm52_infer(args: InferArgs, path: &Path, file: &ShardedGguf) -> anyhow::Result<()> {
-    let tokenizer = match file.metadata_str("tokenizer.ggml.model") {
-        Some("gpt2" | "gemma4") => CliTokenizer::Bpe(Box::new(GgufBpeTokenizer::from_gguf(file)?)),
-        Some("llama") => CliTokenizer::Spm(GgufSpmTokenizer::from_gguf(file)?),
-        Some("t5") => CliTokenizer::Unigram(GgufUnigramTokenizer::from_gguf(file)?),
-        other => {
-            eprintln!(
-                "ferrox: unrecognized tokenizer.ggml.model ({other:?}); using byte tokenizer"
-            );
-            CliTokenizer::Byte
-        }
-    };
+    let tokenizer = cli_tokenizer_from_gguf(file)?;
     // Not just `eos_token_id`: Llama-3 ends a turn with `<|eot_id|>` and
     // gemma-4 with `<turn|>`, neither of which is the metadata EOS.
     let stop_tokens = ferrox_models::tokenizer::StopTokens::from_gguf(file);
@@ -1142,7 +1129,7 @@ fn run_glm52_infer(args: InferArgs, path: &Path, file: &ShardedGguf) -> anyhow::
         .unwrap_or(4096);
     let ctx_size = resolve_ctx_size(&args, path, gguf_ctx)?;
 
-    let chat = ChatKind::detect_for_gguf(file, matches!(tokenizer, CliTokenizer::Byte));
+    let chat = ChatKind::detect_for_gguf(file, false);
     let user_prompt = resolve_prompt(&args)?;
     let prompt = if args.no_cnv {
         user_prompt

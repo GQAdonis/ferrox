@@ -56,7 +56,7 @@ library or overriding the CLI.
 | `FERROX_KV_POOL_BLOCK_SIZE` | Tokens per KV pool block |
 | `FERROX_KV_POOL_QUEUE_TIMEOUT_MS` | How long a request waits for free KV before it is rejected. Applies to both the pool and paged KV |
 | `FERROX_KV_BYTE_BUDGET` | Byte ceiling for the KV block pool, independent of block count |
-| `FERROX_PAGED_KV_BLOCKS` | Blocks per layer of real paged KV: shared page storage many requests read through a block table, rather than a private buffer each. **CPU only today**, and `ferrox-server` only. Mutually exclusive with `FERROX_KV_POOL_BLOCKS`/`FERROX_KV_BYTE_BUDGET` and with `FERROX_PREFIX_CACHE_ENTRIES`; setting an excluded pair stops the server with an error naming both. Read the paragraph under this table before using it |
+| `FERROX_PAGED_KV_BLOCKS` | Blocks per layer of real paged KV: shared page storage many requests read through a block table, rather than a private buffer each. `ferrox-server` only. Mutually exclusive with `FERROX_KV_POOL_BLOCKS`/`FERROX_KV_BYTE_BUDGET` and with `FERROX_PREFIX_CACHE_ENTRIES`; setting an excluded pair stops the server with an error naming both. Read the paragraph under this table before using it |
 | `FERROX_PAGED_KV_BLOCK_SIZE` | Positions per paged-KV block. Must be set together with `FERROX_PAGED_KV_BLOCKS`, or the server stops |
 | `FERROX_PREFIX_CACHE_ENTRIES` | Prefix-cache capacity for the private generate path: whole KV snapshots in an LRU list, reported under `GET /cache/stats`. Mutually exclusive with continuous batching and with paged KV, which brings its own sharing |
 | `FERROX_EXPERT_CACHE_BYTES` | MoE expert-streaming cache budget |
@@ -69,20 +69,38 @@ library or overriding the CLI.
 | `FERROX_ACCOUNTING_OUTBOX` | Directory accounting receipts are written to, atomically and idempotently by receipt id, before `POST /v1/admin/prepare-stop` answers. Unset means no outbox and no persistence step |
 | `FERROX_INSTANCE_ID` | Names this engine generation for the receipt id. Unset falls back to the pid plus the process's wall-clock start, which is stable for the life of the process and different in the next one |
 
-### Paged KV is CPU only, and the check has a hole
+### Reading KV back after a Metal prefill
 
-On a GPU backend the paged attention path returns wrong tokens rather
-than failing. Measured on an M2 Pro with Llama-3.2-3B Q4_K_M, same
-prompt and same seed: CPU paged and CPU contiguous both answer
-"Blue and Red.", and Metal paged answers "Blue ( question mark;>a> is
-a> is". Nothing in the response says the attention read the wrong pages,
-which is why the server stops rather than serving it.
+Paged KV used to be refused on any GPU backend, because it returned
+fluent wrong tokens there. Measured on an M2 Pro with Llama-3.2-3B
+Q4_K_M, same prompt and same seed: CPU paged and CPU contiguous both
+answered "Blue and Red.", and Metal paged answered "Blue ( question
+mark;>a> is a> is".
 
-The check resolves the device rather than matching a string. It fires
-for `-dev metal`, `-dev cuda`, either variable set to `1` by hand, and
-for `-ngl 99` on its own, which leaves the device on `auto` and still
-picks up a Metal device when one is present. `auto` on a host with no
-GPU is a CPU run, so paged KV stays available there.
+The cause was not the page indirection. A Metal prefill leaves K/V on
+the device and fills the host cache with placeholder rows, which the
+contiguous decode path knows and reads around; the paged prefill copied
+those placeholders into the page store, and decode then attended over a
+prompt the model never saw. The prefill now downloads the real rows for
+the caller that reads them.
+
+Held by `cargo test -p ferrox-models --features metal --test
+paged_metal_parity -- --ignored`, which greedy-decodes the same prompt
+twice in one process, once through each cache, on a dense model, an MoE
+model and a sliding-window model. It runs one model per process on
+purpose: two checkpoints loaded into a single process do not answer the
+same as either alone on Metal, which is a separate bug and not one this
+check should be at the mercy of.
+
+`FERROX_PREFIX_CACHE_ENTRIES` had the same bug and no refusal in front
+of it. A stored snapshot is the host rows, so on Metal it was all zeros,
+and the next request restoring it answered nonsense at full speed --
+"Blue and red." became " question mark of the day. The question of the
+day is a question of the day." `sync_metal_attn_kv_to_host` could not
+repair it: that function appends past `seq_len`, and the placeholder
+fill has already advanced `seq_len` past the region needing filled. The
+prefill now downloads the real rows when a prefix cache is configured,
+and only then, since nothing else on that path reads them back.
 
 ### Sharing pages between prompts
 

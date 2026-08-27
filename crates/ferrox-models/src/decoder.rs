@@ -1054,6 +1054,7 @@ impl Decoder {
         n_heads: usize,
         metal_kvs: &mut [ferrox_metal::attn::MetalKvBuffers],
         kv_caches: &mut [KvCache],
+        host_kv_authoritative: bool,
     ) -> Option<Vec<f32>> {
         let gelu = matches!(
             self.config.ffn_activation,
@@ -1104,10 +1105,13 @@ impl Decoder {
             self.config.attn_logit_softcap,
         )
         .ok()?;
-        for cache in &mut kv_caches[start..start + run_len] {
-            cache
-                .advance_len(batch_size)
-                .expect("unbounded/planned KvCache growth is infallible");
+        for (mkv, cache) in kvs.iter().zip(&mut kv_caches[start..start + run_len]) {
+            Self::advance_host_kv_after_metal_prefill(
+                mkv,
+                cache,
+                batch_size,
+                host_kv_authoritative,
+            );
         }
         Some(h_out)
     }
@@ -1401,6 +1405,46 @@ impl Decoder {
                 eprintln!("ferrox: Metal MoE experts failed, falling back: {e}");
                 None
             }
+        }
+    }
+
+    /// Advance the host [`KvCache`] over the positions a Metal prefill
+    /// kernel just wrote to the device.
+    ///
+    /// Two ways to do that, and which one is right depends on whether
+    /// anyone will READ the host rows.
+    ///
+    /// The contiguous path never does: Metal stays authoritative from
+    /// prefill through decode, so [`KvCache::advance_len`]'s zero fill
+    /// is a placeholder that only has to keep `seq_len` in step for the
+    /// sync checks, and skipping the download is the whole point.
+    ///
+    /// The PAGED path does. `forward_batch_last_paged` scatters these
+    /// rows into the page store, and a caller that reads placeholders
+    /// gets a prompt the model never saw -- which is exactly how paged
+    /// KV on Metal came to answer fluent nonsense while paged-on-CPU
+    /// and contiguous-on-Metal were each correct. So it asks for the
+    /// real rows and pays one download per layer, against a gather and
+    /// a scatter it was already paying.
+    ///
+    /// Done here, per layer, immediately after the launch, rather than
+    /// once at the end: the Metal KV buffers are dropped outright when
+    /// a later layer's launch fails, and rows nobody downloaded before
+    /// that are simply gone.
+    #[cfg(feature = "metal")]
+    fn advance_host_kv_after_metal_prefill(
+        mkv: &ferrox_metal::attn::MetalKvBuffers,
+        cache: &mut KvCache,
+        batch_size: usize,
+        host_kv_authoritative: bool,
+    ) {
+        if host_kv_authoritative {
+            Self::catch_up_host_kv_from_metal(mkv, cache);
+            debug_assert_eq!(cache.seq_len, mkv.seq_len);
+        } else {
+            cache
+                .advance_len(batch_size)
+                .expect("unbounded/planned KvCache growth is infallible");
         }
     }
 
@@ -2625,6 +2669,18 @@ impl Decoder {
             for h in 0..n_kv_heads {
                 self.apply_rope_head_layer(&mut k[h * head_dim..(h + 1) * head_dim], pos, l);
             }
+            // The sixth feature this path lost by being a copy. Gemma
+            // scales Q itself and asks for a score scale of 1.0, so the
+            // kernel's built-in `1/sqrt(head_dim)` has to be
+            // compensated for -- exactly as the contiguous path does.
+            // Missing, it is not an error: it is Gemma answering with a
+            // different temperature, on CPU as much as on GPU.
+            if let Some(scale) = self.config.attention_scale {
+                let compensate = scale * (head_dim as f32).sqrt();
+                for v in q.iter_mut() {
+                    *v *= compensate;
+                }
+            }
 
             // Write guard for the push alone; see `SharedPagedKv`.
             // Holding it across attention below would serialise the
@@ -2664,7 +2720,21 @@ impl Decoder {
                     self.config.attn_logit_softcap
                 },
             );
-            let projected = layer.attn.o_proj.apply(&attn_out);
+            // Three more the copy had dropped, each silent: gpt-oss's O
+            // bias, and the two sandwich norms Gemma-2 applies to the
+            // attention and FFN branches before they rejoin the
+            // residual. A residual short by a normalisation is still a
+            // residual, so nothing fails -- the model just answers as a
+            // different model.
+            let mut projected = layer.attn.o_proj.apply(&attn_out);
+            if let Some(oai) = oai {
+                for (x, b) in projected.iter_mut().zip(oai.o_bias.iter()) {
+                    *x += b;
+                }
+            }
+            if let Some(post) = &layer.attn.post_attn_norm {
+                projected = rms_norm(&projected, post, self.config.rms_norm_eps);
+            }
 
             for (h, p) in hidden.iter_mut().zip(projected.iter()) {
                 *h += p;
@@ -2672,13 +2742,19 @@ impl Decoder {
 
             // --- MoE FFN block ---
             let normed2 = rms_norm(&hidden, &layer.moe.norm_weight, self.config.rms_norm_eps);
-            let ffn_out = Self::run_ffn_block(
-                layer,
-                &normed2,
-                &self.config,
-                hidden_dim,
-                residency.as_ref().map(|p| p.layer_plan(l)),
-            );
+            let mut ffn_out = match oai {
+                Some(oai) => Self::gpt_oss_ffn(layer, oai, &normed2, &self.config, hidden_dim),
+                None => Self::run_ffn_block(
+                    layer,
+                    &normed2,
+                    &self.config,
+                    hidden_dim,
+                    residency.as_ref().map(|p| p.layer_plan(l)),
+                ),
+            };
+            if let Some(post) = &layer.attn.post_ffn_norm {
+                ffn_out = rms_norm(&ffn_out, post, self.config.rms_norm_eps);
+            }
             for (h, f) in hidden.iter_mut().zip(ffn_out.iter()) {
                 *h += f;
             }
@@ -3511,7 +3587,45 @@ impl Decoder {
         start_pos: usize,
         kv_caches: &mut [KvCache],
     ) -> Vec<f32> {
-        let hiddens = self.forward_hidden_batch(tokens, start_pos, kv_caches);
+        self.forward_batch_last_inner(tokens, start_pos, kv_caches, false)
+    }
+
+    /// [`Self::forward_batch_last`] for a caller that will READ the
+    /// caches afterwards rather than only decode from them.
+    ///
+    /// A Metal prefill otherwise leaves K/V on the device and the host
+    /// rows zero-filled, which is invisible to a caller that keeps
+    /// decoding (the device buffers stay authoritative) and fatal to
+    /// one that copies the rows somewhere else. Two callers do copy
+    /// them: `forward_batch_last_paged`, into the page store, and
+    /// `ferrox-server`'s prefix cache, into a snapshot a later request
+    /// restores from. Both used to get zeros, and both answered fluent
+    /// nonsense from a prompt the model never attended over.
+    ///
+    /// Costs one KV download per layer. Use [`Self::forward_batch_last`]
+    /// when nothing will read the caches back.
+    pub fn forward_batch_last_host_kv(
+        &self,
+        tokens: &[usize],
+        start_pos: usize,
+        kv_caches: &mut [KvCache],
+    ) -> Vec<f32> {
+        self.forward_batch_last_inner(tokens, start_pos, kv_caches, true)
+    }
+
+    /// [`Self::forward_batch_last`], plus the choice of whether the host
+    /// caches have to hold the real K/V when it returns. See
+    /// [`Self::advance_host_kv_after_metal_prefill`] for why that is a
+    /// choice at all.
+    fn forward_batch_last_inner(
+        &self,
+        tokens: &[usize],
+        start_pos: usize,
+        kv_caches: &mut [KvCache],
+        host_kv_authoritative: bool,
+    ) -> Vec<f32> {
+        let hiddens =
+            self.forward_hidden_batch_inner(tokens, start_pos, kv_caches, host_kv_authoritative);
         let Some(last) = hiddens.last() else {
             return Vec::new();
         };
@@ -3599,7 +3713,13 @@ impl Decoder {
             .map(|(l, cache)| cache.to_contiguous(&stores.read(l)))
             .collect();
 
-        let logits = self.forward_batch_last(tokens, start_pos, &mut scratch);
+        // `host_kv_authoritative`: the scatter below READS these caches,
+        // and a Metal prefill otherwise leaves them holding
+        // `advance_len` placeholders while the real K/V sits on the
+        // device. Copying those placeholders into the page store is
+        // what made paged KV on Metal answer fluent nonsense from a
+        // prompt the model never attended over.
+        let logits = self.forward_batch_last_inner(tokens, start_pos, &mut scratch, true);
 
         // Scatter into blocks this sequence already owns. Nothing here
         // can fail, which is the point of reserving above.
@@ -3628,6 +3748,30 @@ impl Decoder {
         start_pos: usize,
         kv_caches: &mut [KvCache],
     ) -> Vec<Vec<f32>> {
+        self.forward_hidden_batch_inner(tokens, start_pos, kv_caches, false)
+    }
+
+    /// [`Self::forward_hidden_batch`] with one extra promise the public
+    /// signature cannot express.
+    ///
+    /// `host_kv_authoritative` says whether the caller will READ
+    /// `kv_caches` afterwards. Metal prefill normally leaves K/V on the
+    /// device and fills the host rows with a `advance_len` placeholder,
+    /// which is correct only because the contiguous decode path then
+    /// reads the device buffers too. `forward_batch_last_paged` reads
+    /// the host rows -- it copies them into the page store -- so it
+    /// passes `true` and pays for the download.
+    fn forward_hidden_batch_inner(
+        &self,
+        tokens: &[usize],
+        start_pos: usize,
+        kv_caches: &mut [KvCache],
+        host_kv_authoritative: bool,
+    ) -> Vec<Vec<f32>> {
+        // Read only by the Metal arms below; a CPU-only build fills the
+        // host cache with real rows on every path and has nothing to
+        // choose between.
+        let _ = host_kv_authoritative;
         assert_eq!(kv_caches.len(), self.layers.len());
         let batch_size = tokens.len();
         if batch_size == 0 {
@@ -3741,6 +3885,7 @@ impl Decoder {
                                 n_heads,
                                 metal_kvs,
                                 kv_caches,
+                                host_kv_authoritative,
                             ) {
                                 hidden_batch = h_out;
                                 l += run_len;
@@ -3811,9 +3956,12 @@ impl Decoder {
                                     .ok()
                                 });
                                 if let Some(h_out) = fused {
-                                    cache
-                                        .advance_len(batch_size)
-                                        .expect("unbounded/planned KvCache growth is infallible");
+                                    Self::advance_host_kv_after_metal_prefill(
+                                        &metal_kvs[l],
+                                        cache,
+                                        batch_size,
+                                        host_kv_authoritative,
+                                    );
                                     hidden_batch = h_out;
                                     l += 1;
                                     continue;
@@ -3944,8 +4092,11 @@ impl Decoder {
                                         self.config.attn_logit_softcap,
                                     )
                                     .map(|h_out| {
-                                        cache.advance_len(batch_size).expect(
-                                            "unbounded/planned KvCache growth is infallible",
+                                        Self::advance_host_kv_after_metal_prefill(
+                                            &metal_kvs[l],
+                                            cache,
+                                            batch_size,
+                                            host_kv_authoritative,
                                         );
                                         hidden_batch = h_out;
                                         true
@@ -3967,8 +4118,11 @@ impl Decoder {
                                     )
                                     .map(
                                         |(attn_out_batch, _, _)| {
-                                            cache.advance_len(batch_size).expect(
-                                                "unbounded/planned KvCache growth is infallible",
+                                            Self::advance_host_kv_after_metal_prefill(
+                                                &metal_kvs[l],
+                                                cache,
+                                                batch_size,
+                                                host_kv_authoritative,
                                             );
                                             let projected_batch = layer
                                                 .attn
@@ -5016,6 +5170,87 @@ mod tests {
         }
     }
 
+    /// Five MORE model features the paged path had lost the same way
+    /// the first five went: by being a copy of the contiguous loop that
+    /// nothing forced to stay in step.
+    ///
+    /// Found by running Gemma-2-2B through paged KV and watching it
+    /// answer differently from the same model on the same backend with
+    /// a contiguous cache -- on CPU, with no GPU involved at all. None
+    /// of the arm tests above could see it, because `tiny_test_config`
+    /// sets none of these and `new_random_small` builds every layer
+    /// without the two sandwich norms.
+    ///
+    /// - `attention_scale`: Gemma scales Q itself and asks the kernel
+    ///   for a score scale of 1.0, so the built-in `1/sqrt(head_dim)`
+    ///   has to be compensated for. Missing, the model answers at a
+    ///   different temperature.
+    /// - `post_attn_norm` / `post_ffn_norm`: Gemma-2's sandwich norms,
+    ///   applied to each branch before it rejoins the residual.
+    /// - gpt-oss's `o_bias`, and its own FFN (`gpt_oss_ffn`, which
+    ///   biases the router and runs the clamped OAI SwiGLU) instead of
+    ///   the generic one.
+    ///
+    /// Every one of them produces a plausible distribution rather than
+    /// an error, which is exactly why they are pinned rather than
+    /// trusted. Values are chosen so each really bites: a scale of 1.0
+    /// or an all-ones norm would let this pass either way.
+    #[test]
+    fn the_paged_path_keeps_every_per_layer_feature_the_contiguous_one_applies() {
+        // Gemma's query pre-attention scalar, well away from the
+        // kernel's own 1/sqrt(head_dim).
+        let mut scaled = tiny_test_config();
+        scaled.attention_scale = Some(0.37);
+        paged_matches_contiguous_with(scaled, |_| {});
+
+        // Sandwich norms, one at a time and then together, so a wired
+        // half is not covered for by the other.
+        for (attn, ffn) in [(true, false), (false, true), (true, true)] {
+            paged_matches_contiguous_with(tiny_test_config(), |d| {
+                let hidden = d.config.hidden_dim;
+                for (i, layer) in d.layers.iter_mut().enumerate() {
+                    // Per-layer values, so a path that applied layer 0's
+                    // norm everywhere would still fail.
+                    let w: Vec<f32> = (0..hidden)
+                        .map(|j| 0.5 + (i * hidden + j) as f32 * 0.01)
+                        .collect();
+                    if attn {
+                        layer.attn.post_attn_norm = Some(w.clone());
+                    }
+                    if ffn {
+                        layer.attn.post_ffn_norm = Some(w);
+                    }
+                }
+            });
+        }
+
+        // gpt-oss: the O bias and the OAI FFN, which the paged path was
+        // substituting the generic router+SwiGLU for.
+        paged_matches_contiguous_with(tiny_test_config(), |d| {
+            let hidden = d.config.hidden_dim;
+            let n_heads = d.config.n_heads;
+            let n_experts = d.config.moe.n_experts;
+            let ffn = d.config.moe.expert_ffn_dim;
+            let n_layers = d.layers.len();
+            d.gpt_oss = Some(GptOssWeights {
+                layers: (0..n_layers)
+                    .map(|l| GptOssLayer {
+                        attn_sinks: (0..n_heads).map(|h| 0.1 + (l + h) as f32 * 0.05).collect(),
+                        o_bias: (0..hidden).map(|j| 0.02 * (j as f32 - 8.0)).collect(),
+                        router_bias: (0..n_experts).map(|e| 0.03 * e as f32).collect(),
+                        expert_bias: (0..n_experts)
+                            .map(|e| ferrox_moe::ExpertBias {
+                                gate: vec![0.01 * (e + 1) as f32; ffn],
+                                up: vec![-0.02 * (e + 1) as f32; ffn],
+                                down: vec![0.005 * (e + 1) as f32; hidden],
+                            })
+                            .collect(),
+                    })
+                    .collect(),
+            });
+        });
+    }
+
     /// The two rules that live OUTSIDE the layer loop, which the arm
     /// test above cannot reach.
     ///
@@ -5408,8 +5643,17 @@ mod tests {
     }
 
     fn paged_matches_contiguous(config: ModelConfig) {
+        paged_matches_contiguous_with(config, |_| {});
+    }
+
+    /// [`paged_matches_contiguous`] for the features that live on the
+    /// WEIGHTS rather than in the config, and so cannot be switched on
+    /// by handing a different `ModelConfig` in.
+    fn paged_matches_contiguous_with(config: ModelConfig, prepare: impl FnOnce(&mut Decoder)) {
         let n_layers = 2;
-        let decoder = Decoder::new_random_small(config, n_layers, 10);
+        let mut decoder = Decoder::new_random_small(config, n_layers, 10);
+        prepare(&mut decoder);
+        let decoder = decoder;
 
         let mut caches: Vec<KvCache> = (0..n_layers)
             .map(|_| KvCache::new(decoder.config.n_kv_heads, decoder.config.head_dim))

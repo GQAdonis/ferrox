@@ -8,13 +8,13 @@
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use crate::policy::anchor::{decode_slide, AnchorState, SlidingRequest, WindowPolicy};
+use crate::policy::pool::SWA_RETAIN_GAP;
+use crate::policy::radix::{align_down, NodeId, RadixCache};
 use ferrox_core::cache::{
     KvBlockPool, KvCache, KvPoolExhausted as CacheKvPoolExhausted, PageGroup, PagedKvCache,
     PagedStoreExhausted, SharedPagedKv,
 };
-use ferrox_edge::anchor::{decode_slide, AnchorState, SlidingRequest, WindowPolicy};
-use ferrox_edge::pool::SWA_RETAIN_GAP;
-use ferrox_edge::radix::{align_down, NodeId, RadixCache};
 use ferrox_models::sampling::{Sampler, SamplingParams};
 use ferrox_models::tokenizer::{prepend_bos, StopTokens};
 use ferrox_models::{Ceiling, Decoder, Engine, KvElem, KvShape, PrefixCache, TextTokenizer};
@@ -1626,7 +1626,7 @@ pub(crate) fn earliest_stop_match<'a>(text: &str, stops: &'a [String]) -> Option
 /// the byte-length withhold rules that produce the indices it is
 /// applied to.
 pub(crate) fn floor_char_boundary(s: &str, idx: usize) -> usize {
-    ferrox_edge::floor_char_boundary(s, idx)
+    crate::policy::detokenize::floor_char_boundary(s, idx)
 }
 
 #[cfg(test)]
@@ -2624,10 +2624,13 @@ mod tests {
                 decoder.config.head_dim,
             )),
             queue_wait: Duration::ZERO,
-            radix: share_prefixes
-                .then(|| Arc::new(Mutex::new(ferrox_edge::radix::RadixCache::new(block_size)))),
+            radix: share_prefixes.then(|| {
+                Arc::new(Mutex::new(crate::policy::radix::RadixCache::new(
+                    block_size,
+                )))
+            }),
             anchor_token: None,
-            slide_interval: ferrox_edge::pool::DEFAULT_SWA_EVICTION_INTERVAL,
+            slide_interval: crate::policy::pool::DEFAULT_SWA_EVICTION_INTERVAL,
         }
     }
 

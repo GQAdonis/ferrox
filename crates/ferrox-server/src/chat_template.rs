@@ -33,7 +33,7 @@
 //!    asks for -- so a conversation looks consistent to the model on
 //!    every turn regardless of which half of that split it lands in.
 //! 3. **The effort vocabulary.** Probed once at load
-//!    ([`ferrox_edge::probe_effort_profile`]) rather than per request,
+//!    ([`crate::policy::effort::probe_effort_profile`]) rather than per request,
 //!    because it costs ~30 renders and never changes for a checkpoint.
 //!
 //! Both probes run once, at load, which is what lets them be renders
@@ -49,7 +49,7 @@
 
 use std::sync::Arc;
 
-use ferrox_edge::{
+use crate::policy::effort::{
     derive_think_gears, probe_effort_profile, probe_thinking_profile, EffortProfile, ThinkGears,
 };
 use ferrox_models::chat_template::{
@@ -73,7 +73,7 @@ struct Inner {
     end_of_turn: Option<&'static str>,
     bos_token: Option<String>,
     eos_token: Option<String>,
-    thinking: ferrox_edge::ThinkingProfile,
+    thinking: crate::policy::effort::ThinkingProfile,
     handles_tools: bool,
 }
 
@@ -401,7 +401,7 @@ fn probe_render<'a>(
 /// Learn the effort vocabulary by rendering probes through the template.
 ///
 /// A template that rejects the probe shape entirely is reported inert
-/// by [`ferrox_edge::probe_effort_profile`], which is the safe answer:
+/// by [`crate::policy::effort::probe_effort_profile`], which is the safe answer:
 /// send no effort at all.
 fn probe_efforts(
     template: &JinjaTemplate,

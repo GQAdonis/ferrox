@@ -29,7 +29,7 @@
 //! What is still true of the scope: each entry CLONES its
 //! `Vec<KvCache>`, so N conversations off one system prompt hold N
 //! copies of its KV rather than sharing the pages. Fixing that is the
-//! radix cache's job (`ferrox_edge::radix`), which shares nodes and
+//! radix cache's job (`crate::policy::radix`), which shares nodes and
 //! reference-counts pages, and which needs a serving path that reads
 //! paged KV before it can be wired in.
 

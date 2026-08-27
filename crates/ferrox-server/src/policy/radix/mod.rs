@@ -21,12 +21,8 @@
 //! system prompt hold one copy of it and the KV pages under it are
 //! reference-counted rather than cloned.
 
-pub mod hybrid;
 pub mod plain;
-pub mod swa;
 pub mod tree;
 
-pub use hybrid::{HybridInsert, HybridMatch, HybridRadixCache};
-pub use plain::{InsertResult, MatchResult, RadixCache};
-pub use swa::{SwaEvicted, SwaMatch, SwaRadixCache};
-pub use tree::{align_ceil, align_down, NodeId, RadixTree, ROOT};
+pub use plain::RadixCache;
+pub use tree::{align_ceil, align_down, NodeId};

@@ -160,20 +160,23 @@ OpenAI-compatible HTTP API:
 
 FreeToken describes an edge-native MoE serving engine, and ferrox ports
 its host-side policy (Apache-2.0, see
-[THIRD_PARTY_NOTICES](THIRD_PARTY_NOTICES.md)). This table is what
-ferrox actually does against that description, checked against the code
-on 2026-08-27 rather than asserted. It is here because the gap is the
-roadmap.
+[THIRD_PARTY_NOTICES](THIRD_PARTY_NOTICES.md)). That policy now lives in
+the crates that use it rather than in a crate of its own: the expert
+residency stack in `ferrox-core` beside `expert_store`, and the serving
+policy in `ferrox-server::policy`.
+
+This table is what ferrox actually does against that description,
+checked against the code rather than asserted. The gap is the roadmap.
 
 | Capability | In ferrox today |
 |---|---|
-| Bandwidth-adaptive CPU/GPU co-execution (`q*`) | **Partial.** `qstar::BandwidthProfile` exists and is used by `ferrox bench-bw`, a measurement tool. The serving path does not consult it. |
-| Full-layer double-buffered prefill streaming | **No.** The policy is written with 11 tests and has zero callers. |
-| Global LRU expert caching | **Yes, one of two.** `expert_store` is wired into both decode paths and proven bit-identical to resident at a 1-byte budget. A second, unwired cache also exists; consolidating them is roadmap item 1. |
+| Bandwidth-adaptive CPU/GPU co-execution (`q*`) | **Partial.** `qstar::BandwidthProfile` is in `ferrox-core` and used by `ferrox bench-bw`, a measurement tool. The serving path does not consult it. |
+| Full-layer double-buffered prefill streaming | **Built, not wired.** Kept for the out-of-core work, which names it. |
+| Global LRU expert caching | **Yes, and now singular.** `expert_store` is wired into both decode paths and proven bit-identical to resident at a 1-byte budget. The second, competing cache and its separate byte budget were folded in beside it. |
 | Graph-compatible execution | **No.** Execution is eager. `ExecutionPlan` is built and read by nothing. |
 | FTW fast weight format | **No.** GGUF only. |
 | Semantic anchor checkpoints for KV | **Yes.** `anchor::decode_slide` and `WindowPolicy` are wired into `generate.rs` and the batch scheduler. |
-| Agentic context edits without recompute | **Partial.** The radix prefix cache shares pages across requests and reports `cached_tokens`. Anchor-based edit replay is policy-complete, not proven end to end. |
+| Agentic context edits without recompute | **Partial, and currently leaking.** The radix prefix cache shares pages and reports `cached_tokens`, but `RadixCache::evict` has no caller, so the page pool shrinks until admission refuses. |
 | Elastic VRAM re-allocation without restart | **Partial.** `POST /v1/cache/rebuild` re-splits KV pool geometry at runtime. Moving bytes between an expert cache and KV is not implemented. |
 | MXFP4 / BF16 | **Yes**, executable. MXFP4 is CPU-only. |
 | NVFP4 / FP8 | **No.** Neither is parsed. |
@@ -185,10 +188,9 @@ Two honest notes. Ferrox runs on Apple Metal, which that description
 does not cover, and Metal is where it is fastest: every dense `pp512`
 row is 0.98x to 1.10x against llama.cpp and 8 of 12 `tg128` rows are
 faster. And the single largest gap is not on this table: running a model
-that does not fit in memory works as policy and not as execution, which
-is why it is roadmap item 5.
+that does not fit in memory works as policy and not as execution.
 
-## Serving policy (`ferrox-edge`)
+## Serving policy
 
 A Rust port of the host-side decision logic in
 [FreeToken](https://github.com/FlashML-org/FreeToken)
@@ -196,6 +198,11 @@ A Rust port of the host-side decision logic in
 edge-native MoE engine that *decide* rather than compute. Tensor-free
 and testable without a GPU. Each module takes measured numbers and
 returns a decision.
+
+It lives in the crates that use it: the serving half in
+`ferrox-server::policy`, the MoE expert-residency half in `ferrox-core`
+beside `expert_store`, which is the single holder of the expert byte
+budget.
 
 ### Driving something today
 
@@ -207,40 +214,36 @@ returns a decision.
 | `anchor` | how far a window may slide, and where a tool call pins it so the next agentic turn rejoins rather than recomputes | the paged-KV serving path, on both the private generate loop and the continuous batcher |
 | `scheduler` | admission, chunked-prefill sizing, and what a chunk reserves | the continuous batcher's status and pool accounting |
 | `effort` | which reasoning-effort dialect a checkpoint speaks | probed once per checkpoint at load, then applied to every request's `chat_template_kwargs`, and advertised on `/v1/models` |
-| `stats` | what a server may honestly claim about its own throughput and latency | `/v1/stats`, `/v1/requests`, `/admin/stats` |
+| `serving_stats` | what a server may honestly claim about its own throughput and latency | `/v1/stats`, `/v1/requests`, `/admin/stats` |
 | `maintenance` | whether a request, a cache rebuild or a stop may proceed right now | `POST /v1/cache/rebuild` and `POST /v1/admin/prepare-stop` |
 | `pool` | how VRAM splits between the expert cache and KV, and how it is re-split live | the target geometry `POST /v1/cache/rebuild` validates against |
 | `rebuild` · `outbox` · `footprint` | whether a re-split rolls back, what a stop receipt is worth, what this process really occupies | the same two admin endpoints |
-| `dsv4` | per-layer KV tier sizing, and which compressor each layer runs (none / CSA / HCA) | the DeepSeek-V4 decoder |
+| `deepseek_v4_budget` | per-layer KV tier sizing, and which compressor each layer runs (none / CSA / HCA) | the DeepSeek-V4 decoder |
 | `bench_profile` · `bench_client` | when a measured bandwidth profile may be trusted, and what a serving benchmark may report | `ferrox bench-bw` and `ferrox serve-bench` |
 
 ### Complete, tested, and waiting for a consumer
 
-`qstar` (the `q*` bandwidth split), `expert_cache`, `placement`,
-`residency`, `cache_manager`, `cache_report`, `window_pool`,
-`state_pool` and `supervisor`. Each is covered by unit tests and none of
-them is on a serving path. Do not read a benchmark as evidence for any
-of them. [`ROADMAP.md`](ROADMAP.md) says what each is waiting on.
+`qstar` (the `q*` bandwidth split), `expert_cache`, `expert_slots`,
+`expert_budget`, `placement` and `residency`, all in `ferrox-core`.
+Each is covered by unit tests and none of them is on a serving path.
+Do not read a benchmark as evidence for any of them.
+[`plans/out-of-core-moe.md`](plans/out-of-core-moe.md) is what they are
+waiting on: running a model larger than memory, which is the single
+largest thing they would buy.
 
-`expert_slots` sits between the two: it executes the expert cache's copy
-plans against a bounded slot pool, and a warm decode step copies zero
-bytes on a host pool. `ferrox-cuda`'s `CudaExpertPool` implements its
-`SlotDevice` trait under `--features cuda`, and that pool is
-compile-verified with its hardware test left `#[ignore]`d, so on a real
-card the property is written down and not yet measured.
+`expert_slots` sits closest to real memory: it executes the expert
+cache's copy plans against a bounded slot pool, and a warm decode step
+copies zero bytes on a host pool. `ferrox-core`'s `CudaExpertPool`
+implements its `SlotDevice` trait under `--features cuda`, and that pool
+is compile-verified with its hardware test left `#[ignore]`d, so on a
+real card the property is written down and not yet measured. A host
+`SlotDevice` (`HostSlotMemory`) also exists; a Metal one does not, and
+that is the concrete gap.
 
-`supervisor` is the same shape for processes: the lifecycle rules are
-here and testable, and spawning sits behind a `ProcessHost` the caller
-supplies. No ferrox binary spawns another one, so nothing implements
-that trait yet. The rules are the reason it exists at all, since each is a race
-you would otherwise only meet in production: a retried start must not
-become a second engine, one party reaps and everyone else waits on
-what it publishes (a poll transiently lies), the stop-requested latch
-is set before the signal so a crash mid-stop is not read as an
-unplanned death, shutdown is permanent so a start queued behind the
-final stop is rejected, and a recorded child is re-adopted only on
-`(pid, start_time, argv, port)` -- `start_time` being what stops a
-recycled PID from being adopted as the engine.
+Inside `ferrox-server::policy`, the modules carrying an unwired half
+name the roadmap item that would close it, at their declaration in
+`policy/mod.rs`. `grep -n "allow(dead_code)" crates/ferrox-server/src/policy/mod.rs`
+is the list of what still owes a caller.
 
 Ferrox Studio, the web UI in [`ui/`](../ui), is a separate app that
 talks to this API over HTTP. `ferrox-server` does not serve it, and

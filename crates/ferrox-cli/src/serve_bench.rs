@@ -7,7 +7,7 @@
 //! question an operator sizing a deployment is actually asking.
 //!
 //! Every rule that decides whether the numbers mean anything lives in
-//! [`ferrox_edge::bench_client`], with no socket in it, so each one is
+//! [`crate::bench_client`], with no socket in it, so each one is
 //! asserted on any host rather than inferred from a live server that
 //! might have been slow for an unrelated reason. This module is the
 //! socket: it opens connections, dispatches on a schedule, tics per
@@ -22,9 +22,9 @@ use std::io::BufRead;
 use std::sync::mpsc;
 use std::time::Instant;
 
+use crate::bench_client::{is_token_chunk, BenchReport, BenchSampling, Latency, RequestTiming};
 use anyhow::Result;
 use clap::Parser;
-use ferrox_edge::{is_token_chunk, BenchReport, BenchSampling, Latency, RequestTiming};
 use serde_json::{json, Value};
 
 use crate::http;
@@ -45,12 +45,14 @@ pub struct ServeBenchArgs {
     pub output_len: usize,
     /// Prompt length, in characters of the generated filler.
     ///
-    /// Characters and not tokens: an exact TOKEN length needs the
-    /// server's own tokenizer in a fixed-point loop (see
-    /// `ferrox_edge::prompt_of_exact_length`), which is a round trip per
-    /// step against a server this command is about to benchmark. The
-    /// reported prompt-token count is the server's, so a run says what
-    /// it really sent rather than what it meant to.
+    /// Characters and not tokens, deliberately. An exact TOKEN length
+    /// needs the server's own tokenizer driven to a fixed point --
+    /// decoding ids to text and encoding it back is not the identity,
+    /// since the tokenizer merges adjacent pieces, so a prompt built
+    /// from N ids re-encodes shorter -- and every step of that loop is
+    /// a round trip against the server this command is about to
+    /// benchmark. The reported prompt-token count is the server's, so a
+    /// run says what it really sent rather than what it meant to.
     #[arg(long, default_value_t = 512)]
     pub prompt_chars: usize,
     /// Model name to send. Optional: the server serves whatever is

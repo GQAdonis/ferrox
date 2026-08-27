@@ -140,29 +140,35 @@ ferrox-gguf + ferrox-quant
         → ferrox-cli / ferrox-server
 
 ferrox-api  (routes + wire DTOs, serde-only) → ferrox-server + clients
-ferrox-edge (serving policy, tensor-free)    → ferrox-server
-                                             → ferrox-cuda (`cuda` only)
 ```
 
-`ferrox-edge` is a Rust port of FreeToken's host-side decision logic
-(Apache-2.0; see `docs/THIRD_PARTY_NOTICES.md`): the `q*` bandwidth
-split, the global expert cache, page-keyed radix prefix caches
-(plain / sliding-window / recurrent), pool budgets, admission and
-chunked prefill, and the reasoning / tool-call output parsers. It has
-no tensors and no device memory, so every policy in it is testable on
-any host. Wired in today: the two parsers, the stop-string withhold rule, the
-radix prefix cache over paged KV, the scheduler, stats, maintenance,
-pool, rebuild, outbox, footprint and effort probing. STILL GROUNDWORK,
-and this is the gap that matters most: `expert_cache`, `expert_slots`,
-`placement` and `residency` hold the policy for running a model larger
-than memory, and nothing executes it except a compile-only CUDA pool.
+**The FreeToken port** (Apache-2.0; see `docs/THIRD_PARTY_NOTICES.md`,
+which is a licence obligation and must stay accurate) is a Rust port of
+FreeToken's host-side decision logic. It used to be a crate of its own,
+`ferrox-edge`; it now lives in the crates that use it, and the parts
+nothing would ever use are deleted.
 
-`ferrox-edge::expert_slots` is where that policy meets real memory: it
-executes the expert cache's copy plans against a bounded slot pool
-behind a `SlotDevice` trait, which is why `ferrox-cuda` depends on it
-under `--features cuda` (`expert_pool::CudaExpertPool`). The trait
-keeps the device memory out of ferrox-edge; the CUDA pool is
-compile-verified only, and its hardware test is `#[ignore]`d.
+- **`ferrox-core`** holds the MoE expert-residency half, beside
+  `expert_store`: `expert_cache`, `expert_slots` (the `SlotDevice`
+  seam), `expert_pool` (its CUDA implementation), `expert_budget`,
+  `qstar`, `bench_profile`, `residency`, `placement`. `expert_store` is
+  the SINGLE holder of the expert byte budget -- on unified memory two
+  budgets are the same RAM counted twice.
+- **`ferrox-server::policy`** holds the serving half: the two parsers,
+  the radix prefix cache, anchor/window slide, scheduler, serving stats,
+  maintenance, pool, rebuild, outbox, footprint, effort probing.
+
+Wired today: the parsers, the stop-string withhold rule, the radix
+prefix cache over paged KV, effort probing, stats, maintenance, outbox,
+footprint, and the scheduler's status reporting. STILL GROUNDWORK, and
+this is the gap that matters most: the whole `ferrox-core` expert
+residency stack holds the policy for running a model larger than memory
+(`docs/plans/out-of-core-moe.md`) and nothing executes it except a
+compile-only CUDA pool whose hardware test is `#[ignore]`d.
+
+Anything in `policy` with an unwired half names the roadmap item that
+would close it, at its declaration in `policy/mod.rs`. That
+`allow(dead_code)` list is meant to be read as a to-do, not as cover.
 
 Load path: GGUF mmap → keep quantized → fused dequant+dot →
 RMSNorm → GQA(+RoPE) → MoE/dense FFN. Serving: `FERROX_MODEL_PATH`

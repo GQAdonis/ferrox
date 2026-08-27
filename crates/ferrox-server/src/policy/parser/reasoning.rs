@@ -12,7 +12,7 @@
 //! **A marker can arrive in pieces.** `</think>` may come as `</thi` +
 //! `nk>`. So any trailing run of the buffer that is a proper prefix of
 //! a marker is withheld until the next token settles it -- the same
-//! rule as [`crate::detokenize::stop_prefix_holdback`], for the same
+//! rule as [`crate::policy::detokenize::stop_prefix_holdback`], for the same
 //! reason: SSE cannot retract.
 //!
 //! **A tool call inside reasoning is not reasoning.** Some families
@@ -301,7 +301,7 @@ pub fn atem_marker_inside(text: &str, start: usize, end: usize) -> bool {
 /// and SSE cannot retract, so the window is the price.
 pub fn atem_hold_len(text: &str) -> usize {
     let owned: Vec<String> = ATEM_ALL_TOKENS.iter().map(|t| t.to_string()).collect();
-    let mut best = crate::detokenize::stop_prefix_holdback(text, &owned);
+    let mut best = crate::policy::detokenize::stop_prefix_holdback(text, &owned);
 
     let window_start = text
         .char_indices()
@@ -720,7 +720,7 @@ impl ReasoningParser {
             // Nothing in sight: stream eagerly, holding only the tail
             // that could still grow into a boundary.
             let hold = if at_end { 0 } else { atem_hold_len(buf) };
-            let split = crate::detokenize::floor_char_boundary(buf, buf.len() - hold);
+            let split = crate::policy::detokenize::floor_char_boundary(buf, buf.len() - hold);
             push_seek_text(&mut out.content, &buf[..split]);
             self.atem.buffer = buf[split..].to_string();
             return false;
@@ -797,7 +797,7 @@ impl ReasoningParser {
         let recipient = self.atem.recipient.clone();
         let Some(boundary) = atem_boundary(buf) else {
             let hold = if at_end { 0 } else { atem_hold_len(buf) };
-            let split = crate::detokenize::floor_char_boundary(buf, buf.len() - hold);
+            let split = crate::policy::detokenize::floor_char_boundary(buf, buf.len() - hold);
             atem_emit(out, &recipient, &buf[..split]);
             self.atem.buffer = buf[split..].to_string();
             return false;
@@ -964,8 +964,9 @@ impl ReasoningParser {
         }
         candidates.retain(|c| !c.is_empty());
         let owned: Vec<String> = candidates.iter().map(|c| c.to_string()).collect();
-        let hold = crate::detokenize::stop_prefix_holdback(&self.buffer, &owned);
-        let split = crate::detokenize::floor_char_boundary(&self.buffer, self.buffer.len() - hold);
+        let hold = crate::policy::detokenize::stop_prefix_holdback(&self.buffer, &owned);
+        let split =
+            crate::policy::detokenize::floor_char_boundary(&self.buffer, self.buffer.len() - hold);
         self.buffer.len() - split
     }
 
@@ -1021,8 +1022,9 @@ impl ReasoningParser {
             let mut body = text.as_str();
             if hold_partial {
                 let markers = [HARMONY_CHANNEL.to_string()];
-                let hold = crate::detokenize::stop_prefix_holdback(body, &markers);
-                body = &body[..crate::detokenize::floor_char_boundary(body, body.len() - hold)];
+                let hold = crate::policy::detokenize::stop_prefix_holdback(body, &markers);
+                body = &body
+                    [..crate::policy::detokenize::floor_char_boundary(body, body.len() - hold)];
             }
             return (String::new(), body.to_string());
         }
@@ -1056,8 +1058,9 @@ impl ReasoningParser {
                 if matched.is_none() && hold_partial {
                     let markers: Vec<String> =
                         HARMONY_BOUNDARIES.iter().map(|m| m.to_string()).collect();
-                    let hold = crate::detokenize::stop_prefix_holdback(body, &markers);
-                    body = &body[..crate::detokenize::floor_char_boundary(body, body.len() - hold)];
+                    let hold = crate::policy::detokenize::stop_prefix_holdback(body, &markers);
+                    body = &body
+                        [..crate::policy::detokenize::floor_char_boundary(body, body.len() - hold)];
                 }
                 if channel_name == "analysis" {
                     reasoning.push_str(body);

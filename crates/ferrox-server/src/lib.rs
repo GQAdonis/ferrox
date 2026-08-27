@@ -53,6 +53,7 @@ mod mcp;
 mod model;
 mod openai_extra;
 mod output;
+mod policy;
 pub(crate) mod responses;
 mod resume;
 mod security;
@@ -695,21 +696,22 @@ pub(crate) struct AppState {
     /// is in `error` without the user retrying to find out.
     last_load_error: Mutex<Option<(String, String)>>,
     /// Live serving counters and the two sliding-window rates behind
-    /// `/v1/stats` -- see `ferrox_edge::ServingStats`. Distinct from
+    /// `/v1/stats` -- see `crate::policy::serving_stats::ServingStats`. Distinct from
     /// `stats`, which is the historical ring: this is what is happening
     /// *now*, and it decays to zero when nothing is.
-    pub(crate) serving: Mutex<ferrox_edge::ServingStats>,
+    pub(crate) serving: Mutex<crate::policy::serving_stats::ServingStats>,
     /// The gate every request, cache rebuild and shutdown passes
-    /// through -- see `ferrox_edge::MaintenanceGate`. Held across none
+    /// through -- see `crate::policy::maintenance::MaintenanceGate`. Held across none
     /// of them: each operation takes it, reads or moves the state, and
     /// releases before doing any work.
-    pub(crate) maintenance: Mutex<ferrox_edge::MaintenanceGate>,
+    pub(crate) maintenance: Mutex<crate::policy::maintenance::MaintenanceGate>,
     /// The live memory reading behind `/v1/stats`, re-probed at most
     /// once per [`FOOTPRINT_TTL_MS`] -- see
     /// `cache_admin::footprint_json`. A `Mutex` and not an atomic
     /// because holding it across the probe is what collapses concurrent
     /// pollers onto ONE VMA walk.
-    pub(crate) footprint: Mutex<ferrox_edge::ProbeCache<ferrox_edge::Footprint>>,
+    pub(crate) footprint:
+        Mutex<crate::policy::footprint::ProbeCache<crate::policy::footprint::Footprint>>,
     /// Wall-clock second this process started serving.
     ///
     /// Distinct from `started_at`, which is an `Instant` and has no
@@ -1217,18 +1219,18 @@ impl ChatCompletionRequest {
     /// * **Thinking follows the tools.** Offering tools turns thinking
     ///   on even when the caller said nothing, because some encoders
     ///   emit well-formed tool calls only in thinking mode
-    ///   ([`ferrox_edge::resolve_thinking_mode`]).
+    ///   ([`crate::policy::effort::resolve_thinking_mode`]).
     /// * **Effort is quantized onto what this checkpoint grades.** A
     ///   template that accepts only the OpenAI triple must not be sent
     ///   `minimal`; it is mapped to the nearest gear, or dropped when no
     ///   gear is close enough, rather than interpolated verbatim into
-    ///   the prompt ([`ferrox_edge::sanitize_effort`], against the
+    ///   the prompt ([`crate::policy::effort::sanitize_effort`], against the
     ///   profile probed at load).
     /// * **One value, every spelling.** The graded-strength dialect
     ///   reads `reasoning_strength`; a Jinja template ignores variables
     ///   it does not declare, so broadcasting costs nothing and removes
     ///   a per-family routing table
-    ///   ([`ferrox_edge::broadcast_effort_spellings`]).
+    ///   ([`crate::policy::effort::broadcast_effort_spellings`]).
     ///
     /// Every render path has to do this identically -- a request that
     /// validates against one prompt and generates from another is the
@@ -1269,7 +1271,7 @@ impl ChatCompletionRequest {
         if !caller_steered {
             match self.thinking_direction() {
                 Some(false) => {
-                    for (k, v) in ferrox_edge::effort::thinking_off_kwargs() {
+                    for (k, v) in crate::policy::effort::thinking_off_kwargs() {
                         kwargs.insert(k, v);
                     }
                     // Nothing below applies: an effort would re-enter a
@@ -1277,7 +1279,7 @@ impl ChatCompletionRequest {
                     return kwargs;
                 }
                 Some(true) => {
-                    for (k, v) in ferrox_edge::effort::thinking_on_kwargs() {
+                    for (k, v) in crate::policy::effort::thinking_on_kwargs() {
                         kwargs.insert(k, v);
                     }
                 }
@@ -1295,25 +1297,25 @@ impl ChatCompletionRequest {
         } else {
             Vec::new()
         };
-        let thinking = ferrox_edge::resolve_thinking_mode(Some(&kwargs), Some(&offered));
-        if thinking == ferrox_edge::ThinkingMode::Thinking {
-            for (k, v) in ferrox_edge::effort::thinking_on_kwargs() {
+        let thinking = crate::policy::effort::resolve_thinking_mode(Some(&kwargs), Some(&offered));
+        if thinking == crate::policy::effort::ThinkingMode::Thinking {
+            for (k, v) in crate::policy::effort::thinking_on_kwargs() {
                 kwargs.entry(k).or_insert(v);
             }
         }
-        match ferrox_edge::sanitize_effort(&mut kwargs, template.efforts()) {
-            ferrox_edge::EffortMapping::Mapped(to) => {
+        match crate::policy::effort::sanitize_effort(&mut kwargs, template.efforts()) {
+            crate::policy::effort::EffortMapping::Mapped(to) => {
                 tracing::debug!("reasoning_effort quantized to {}", to.as_str());
             }
-            ferrox_edge::EffortMapping::Dropped => {
+            crate::policy::effort::EffortMapping::Dropped => {
                 tracing::debug!(
                     "reasoning_effort dropped: this checkpoint's template grades no gear close \
                      enough, so its own default applies"
                 );
             }
-            ferrox_edge::EffortMapping::Unchanged => {}
+            crate::policy::effort::EffortMapping::Unchanged => {}
         }
-        ferrox_edge::broadcast_effort_spellings(&mut kwargs);
+        crate::policy::effort::broadcast_effort_spellings(&mut kwargs);
         kwargs
     }
 
@@ -1797,7 +1799,8 @@ async fn list_models(State(state): State<Arc<AppState>>) -> Json<serde_json::Val
     // about thinking carries NEITHER field rather than an empty list:
     // an empty list reads as "asked, and it has no gears", which is a
     // different claim from "this is not a reasoning model".
-    let parser_configured = ferrox_edge::ReasoningFormat::infer(active.model.name()).is_some();
+    let parser_configured =
+        crate::policy::parser::ReasoningFormat::infer(active.model.name()).is_some();
     let gears = active.model.chat_template().think_gears(parser_configured);
     if !gears.is_empty() {
         model_entry["supported_reasoning_efforts"] = serde_json::json!(gears.supported);
@@ -2417,24 +2420,24 @@ fn tool_preamble(tools: &[ToolDef]) -> String {
 /// repeating them would make a client that concatenates deltas produce
 /// the arguments twice.
 fn tool_call_deltas(
-    events: Vec<ferrox_edge::ToolCallEvent>,
+    events: Vec<crate::policy::parser::ToolCallEvent>,
     opened: &std::cell::Cell<usize>,
 ) -> (String, Vec<ToolCallDelta>) {
     let mut text = String::new();
     let mut deltas = Vec::new();
     for event in events {
         match event {
-            ferrox_edge::ToolCallEvent::Text(chunk) => text.push_str(&chunk),
-            ferrox_edge::ToolCallEvent::CallStart { index, name } => {
+            crate::policy::parser::ToolCallEvent::Text(chunk) => text.push_str(&chunk),
+            crate::policy::parser::ToolCallEvent::CallStart { index, name } => {
                 opened.set(opened.get().max(index + 1));
                 deltas.push(ToolCallDelta::opening(index, name));
             }
-            ferrox_edge::ToolCallEvent::CallArguments { index, fragment } => {
+            crate::policy::parser::ToolCallEvent::CallArguments { index, fragment } => {
                 if !fragment.is_empty() {
                     deltas.push(ToolCallDelta::arguments(index, fragment));
                 }
             }
-            ferrox_edge::ToolCallEvent::CallEnd { .. } => {}
+            crate::policy::parser::ToolCallEvent::CallEnd { .. } => {}
         }
     }
     (text, deltas)
@@ -2801,7 +2804,7 @@ async fn chat_completions_stream(
     // decoded chunk is pushed on a channel for overlapped SSE delivery.
     // Incremental streaming, including when tools are offered. It used
     // to be `!tools_active && ...`: finding a tool call needed the
-    // whole text. `ferrox_edge::ToolCallParser` streams prefix-stable
+    // whole text. `crate::policy::parser::ToolCallParser` streams prefix-stable
     // argument fragments, so that reason is gone, and a coding agent
     // now watches an argument arrive instead of waiting for it.
     let overlap = batcher.is_none();
@@ -2858,15 +2861,15 @@ async fn chat_completions_stream(
         // differently depending on a transport detail. Shared with the
         // terminal flush below, which releases whatever the parser is
         // still withholding against a marker that never arrived.
-        let stream_reasoning: Rc<RefCell<Option<ferrox_edge::ReasoningParser>>> =
+        let stream_reasoning: Rc<RefCell<Option<crate::policy::parser::ReasoningParser>>> =
             Rc::new(RefCell::new(posture.reasoning_parser()));
         let emit_reasoning = Rc::clone(&stream_reasoning);
         // The tool-call parser, fed whatever the reasoning parser
         // classified as content. Absent when the request offered no
         // tools, in which case marker-looking text is just text.
-        let stream_tools: Rc<RefCell<Option<ferrox_edge::ToolCallParser>>> = Rc::new(RefCell::new(
-            tools_active.then(|| posture.tool_call_parser(&offered_tools)),
-        ));
+        let stream_tools: Rc<RefCell<Option<crate::policy::parser::ToolCallParser>>> = Rc::new(
+            RefCell::new(tools_active.then(|| posture.tool_call_parser(&offered_tools))),
+        );
         let emit_tools = Rc::clone(&stream_tools);
         // How many calls have been opened on the wire, so the terminal
         // chunk knows whether to say `tool_calls` and does not repeat
@@ -3491,9 +3494,9 @@ fn build_app_state(
         continuous_batching_enabled: enable_continuous_batching,
         loading_model: Mutex::new(None),
         last_load_error: Mutex::new(None),
-        serving: Mutex::new(ferrox_edge::ServingStats::default()),
-        maintenance: Mutex::new(ferrox_edge::MaintenanceGate::serving()),
-        footprint: Mutex::new(ferrox_edge::ProbeCache::new(FOOTPRINT_TTL_MS)),
+        serving: Mutex::new(crate::policy::serving_stats::ServingStats::default()),
+        maintenance: Mutex::new(crate::policy::maintenance::MaintenanceGate::serving()),
+        footprint: Mutex::new(crate::policy::footprint::ProbeCache::new(FOOTPRINT_TTL_MS)),
         started_unix: unix_now(),
     }
 }
@@ -4040,7 +4043,7 @@ async fn run(mcp_config_path: Option<PathBuf>, exit_on_stdin_close: bool) -> any
             // what makes it possible at all, since sharing means two
             // sequences pointing at one page rather than one of them
             // holding a copy.
-            let radix = Some(Arc::new(Mutex::new(ferrox_edge::radix::RadixCache::new(
+            let radix = Some(Arc::new(Mutex::new(crate::policy::radix::RadixCache::new(
                 block_size,
             ))));
             // The anchor: the position an agentic turn will come back
@@ -4051,8 +4054,8 @@ async fn run(mcp_config_path: Option<PathBuf>, exit_on_stdin_close: bool) -> any
             // one token, or whose family has no opener at all (harmony
             // opens a call with an ordinary channel header), simply gets
             // no anchors and the slide follows the cursor.
-            let anchor_token = ferrox_edge::resolve_anchor_token(
-                ferrox_edge::ToolCallFormat::infer(
+            let anchor_token = crate::policy::anchor::resolve_anchor_token(
+                crate::policy::parser::ToolCallFormat::infer(
                     &std::env::var("FERROX_MODEL_PATH").unwrap_or_default(),
                 )
                 .opener(),
@@ -4076,7 +4079,7 @@ async fn run(mcp_config_path: Option<PathBuf>, exit_on_stdin_close: bool) -> any
                     v.parse()
                         .expect("FERROX_PAGED_KV_SLIDE_INTERVAL must be a positive integer")
                 })
-                .unwrap_or(ferrox_edge::pool::DEFAULT_SWA_EVICTION_INTERVAL);
+                .unwrap_or(crate::policy::pool::DEFAULT_SWA_EVICTION_INTERVAL);
             if let Some(window) = cfg.uniform_sliding_window() {
                 tracing::info!(
                     "Paged KV window slide enabled: every layer slides by {window} every \
@@ -4579,9 +4582,9 @@ mod tests {
             continuous_batching_enabled: false,
             loading_model: Mutex::new(None),
             last_load_error: Mutex::new(None),
-            serving: Mutex::new(ferrox_edge::ServingStats::default()),
-            maintenance: Mutex::new(ferrox_edge::MaintenanceGate::serving()),
-            footprint: Mutex::new(ferrox_edge::ProbeCache::new(FOOTPRINT_TTL_MS)),
+            serving: Mutex::new(crate::policy::serving_stats::ServingStats::default()),
+            maintenance: Mutex::new(crate::policy::maintenance::MaintenanceGate::serving()),
+            footprint: Mutex::new(crate::policy::footprint::ProbeCache::new(FOOTPRINT_TTL_MS)),
             started_unix: unix_now(),
         }
     }
@@ -6152,15 +6155,17 @@ mod tests {
     #[test]
     fn a_streamed_call_opens_then_delivers_its_arguments_in_pieces() {
         let opened = std::cell::Cell::new(0usize);
-        let mut parser = ferrox_edge::ToolCallParser::new(
-            ferrox_edge::ToolCallFormat::Qwen3Coder,
-            vec![ferrox_edge::parser::tool_call::ToolSchema::with_parameters(
-                "write_file",
-                serde_json::json!({"type": "object", "properties": {
-                    "path": {"type": "string"},
-                    "contents": {"type": "string"}
-                }}),
-            )],
+        let mut parser = crate::policy::parser::ToolCallParser::new(
+            crate::policy::parser::ToolCallFormat::Qwen3Coder,
+            vec![
+                crate::policy::parser::tool_call::ToolSchema::with_parameters(
+                    "write_file",
+                    serde_json::json!({"type": "object", "properties": {
+                        "path": {"type": "string"},
+                        "contents": {"type": "string"}
+                    }}),
+                ),
+            ],
         );
         let wire = "<tool_call><function=write_file>\
                     <parameter=path>\n/tmp/x\n</parameter>\
@@ -6213,9 +6218,9 @@ mod tests {
     #[test]
     fn text_around_a_streamed_call_is_still_content() {
         let opened = std::cell::Cell::new(0usize);
-        let mut parser = ferrox_edge::ToolCallParser::new(
-            ferrox_edge::ToolCallFormat::Qwen25,
-            vec![ferrox_edge::parser::tool_call::ToolSchema::new(
+        let mut parser = crate::policy::parser::ToolCallParser::new(
+            crate::policy::parser::ToolCallFormat::Qwen25,
+            vec![crate::policy::parser::tool_call::ToolSchema::new(
                 "get_weather",
             )],
         );

@@ -222,7 +222,7 @@ blank rather than invented.
 
 ## Bandwidth profile (`bench-bw`)
 
-`ferrox-edge`'s `qstar` decides how much of a MoE layer to fetch across
+`ferrox-core`'s `qstar` decides how much of a MoE layer to fetch across
 the link and how much to compute on the CPU. Without a measured
 profile it falls back to an unbenchmarked default of one fetch per layer
 per step, so every deployment gets a split nobody measured.

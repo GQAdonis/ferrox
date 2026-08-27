@@ -168,14 +168,14 @@ impl StopMatcher {
 /// checked, so a suffix equal to a whole stop string is not what this
 /// looks for.
 ///
-/// The rule itself lives in `ferrox_edge::stop_prefix_holdback`, which
+/// The rule itself lives in `crate::policy::detokenize::stop_prefix_holdback`, which
 /// the streaming detokenizer and both output parsers also withhold
 /// against. One implementation, because three copies of a rule this
 /// exact would disagree eventually, and the disagreement would show up
 /// as a partial stop string reaching a client on one code path and not
 /// another.
 fn partial_suffix_len(pending: &str, stops: &[String]) -> usize {
-    ferrox_edge::stop_prefix_holdback(pending, stops)
+    crate::policy::detokenize::stop_prefix_holdback(pending, stops)
 }
 
 #[cfg(test)]

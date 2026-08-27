@@ -371,7 +371,7 @@ fn scaled(ratio: f64, count: usize) -> usize {
         ratio.is_finite() && ratio >= 0.0,
         "swa_ratio must be a non-negative fraction of the full history, got {ratio}"
     );
-    crate::placement::round_half_even(ratio * count as f64).max(0) as usize
+    ferrox_core::placement::round_half_even(ratio * count as f64).max(0) as usize
 }
 
 /// Bytes per `P`-token page across **all** tiers, summed over the layers.

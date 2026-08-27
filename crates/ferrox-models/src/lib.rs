@@ -13,6 +13,7 @@ pub mod capability;
 pub mod chat_template;
 pub mod config;
 pub mod decoder;
+pub mod deepseek_v4_budget;
 pub mod deepseek_v4_decoder;
 pub mod device_budget;
 pub mod engine;

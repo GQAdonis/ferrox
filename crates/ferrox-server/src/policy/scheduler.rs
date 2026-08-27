@@ -62,9 +62,7 @@
 //! and the pool-occupancy helpers of `scheduler/scheduler.py`
 //! (Apache-2.0); see `docs/THIRD_PARTY_NOTICES.md`.
 
-use crate::radix::{align_ceil, align_down};
-use crate::state_pool::StateSlotPool;
-use crate::window_pool::WindowSlotPool;
+use crate::policy::radix::{align_ceil, align_down};
 
 /// Request slots: the fixed set of rows the engine's page table has.
 ///
@@ -552,9 +550,9 @@ pub fn throughput(tokens: usize, seconds: f64) -> f64 {
 ///   a unit of capacity nothing can ever occupy.
 /// * `used` **excludes free units and evictable cache entries alike**.
 ///   An evictable prefix nobody is reading is memory, not occupancy --
-///   exactly the rule [`crate::cache_manager::CacheManager::page_usage`]
+///   exactly the rule [`crate::policy::cache_manager::CacheManager::page_usage`]
 ///   already applies to KV pages, and the rule
-///   [`crate::cache_manager::CacheManager::available_tokens`] admits
+///   [`crate::policy::cache_manager::CacheManager::available_tokens`] admits
 ///   against.
 ///
 /// Counting evictable entries as used is the failure this type exists
@@ -599,29 +597,6 @@ impl PoolUsage {
     }
 }
 
-/// Window-pool occupancy, in window slots -- one slot per live token,
-/// which is why the status line denominates it in tokens.
-///
-/// `evictable_slots` is what the prefix tree would hand back if asked:
-/// unlocked window state on live tree nodes. The pool cannot know it,
-/// because from the pool's side an evictable slot is indistinguishable
-/// from one a request is reading this instant.
-///
-/// Reads [`WindowSlotPool::capacity`] and not `num_slots`, so the
-/// reserved sentinel is excluded from `total`.
-pub fn window_pool_usage(pool: &WindowSlotPool, evictable_slots: usize) -> PoolUsage {
-    PoolUsage::from_available(pool.capacity(), pool.available() + evictable_slots)
-}
-
-/// Recurrent-state pool occupancy, in slots.
-///
-/// `evictable_slots` is the tree's evictable state snapshots. Reads
-/// [`StateSlotPool::capacity`] and not `num_slots`, so the padding sink
-/// at slot 0 is excluded from `total`.
-pub fn state_pool_usage(pool: &StateSlotPool, evictable_slots: usize) -> PoolUsage {
-    PoolUsage::from_available(pool.capacity(), pool.available() + evictable_slots)
-}
-
 /// The gauges every status line carries, whichever phase it reports.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BatchStatus {
@@ -629,8 +604,7 @@ pub struct BatchStatus {
     pub running_reqs: usize,
     /// Prompts still waiting to be admitted.
     pub queue_reqs: usize,
-    /// KV occupancy **in pages**, as
-    /// [`crate::cache_manager::CacheManager::page_usage`] reports it.
+    /// KV occupancy **in pages**.
     pub kv_pages: PoolUsage,
     pub page_size: usize,
     /// `None` for a model with no window pool.
@@ -1272,39 +1246,21 @@ mod tests {
         }
     }
 
-    /// A pool's total is what can ever be handed out, so the reserved
-    /// sentinel is not in it. Reading `num_slots` instead would report a
-    /// pool that is one unit short of full as full, and one that is
-    /// genuinely full as over-provisioned.
-    #[test]
-    fn a_pool_total_excludes_its_reserved_sentinel() {
-        // 8 physical window slots, 7 usable; 8 physical state slots, 7
-        // usable.
-        let window = WindowSlotPool::new(64, 4, 8);
-        let state = StateSlotPool::new(8);
-        assert_eq!(window_pool_usage(&window, 0).total, 7);
-        assert_eq!(state_pool_usage(&state, 0).total, 7);
-        assert_eq!(
-            window_pool_usage(&window, 0).used,
-            0,
-            "a fresh pool holds nothing"
-        );
-    }
-
-    /// The rule the three gauges share: an evictable cache entry is
+    /// The rule every pool gauge shares: an evictable cache entry is
     /// memory, not occupancy. Counting it as used -- the naive way --
-    /// reports this idle-but-warm pool at 6/7 (0.86) instead of 1/7
+    /// reports an idle-but-warm pool at 6/7 (0.86) instead of 1/7
     /// (0.14), and an operator grows a pool that was never full.
+    ///
+    /// Stated against [`PoolUsage::from_available`] directly. The
+    /// window and recurrent slot pools that used to supply the numbers
+    /// went with the multi-currency prefix cache; the arithmetic they
+    /// shared with the KV gauge is what mattered and is still here.
     #[test]
     fn evictable_entries_are_memory_and_not_occupancy() {
-        let mut window = WindowSlotPool::new(64, 4, 8);
-        // Six of the seven usable slots are handed out: five of them sit
-        // on unlocked tree nodes a new request could evict, and exactly
-        // one is held by a live request.
-        window.alloc(&[0, 1, 2, 3, 4, 5]).unwrap();
-        assert_eq!(window.available(), 1, "one slot on the free list");
-
-        let usage = window_pool_usage(&window, 5);
+        // Seven usable slots: five sit on unlocked tree nodes a new
+        // request could evict, one is free, one is held by a live
+        // request.
+        let usage = PoolUsage::from_available(7, 1 + 5);
         assert_eq!(usage.used, 1, "5 evictable + 1 free are all available");
         assert_eq!(usage.total, 7);
         assert!(
@@ -1313,34 +1269,20 @@ mod tests {
             usage.ratio()
         );
 
-        let naive = PoolUsage::from_available(window.capacity(), window.available());
+        let naive = PoolUsage::from_available(7, 1);
         assert_eq!(
             naive.used, 6,
             "counting evictable as used is what this test rejects"
         );
     }
 
-    /// The KV gauge already follows the rule (`CacheManager::page_usage`
-    /// subtracts evictable pages), and a pool gauge built the same way
-    /// agrees with it: same free count, same evictable count, same
-    /// occupancy.
+    /// Every pool is gauged the same way, whatever it holds: 200 units,
+    /// 50 free and 30 evictable is 120 used, on the KV pool and on any
+    /// other.
     #[test]
     fn every_pool_gauge_counts_availability_the_same_way() {
-        // 200 pages: 50 free, 30 evictable -> 120 used, as page_usage
-        // would report it.
         let kv = PoolUsage::from_available(200, 50 + 30);
         assert_eq!((kv.used, kv.total), (120, 200));
-
-        let mut state = StateSlotPool::new(201);
-        let held = state.alloc(150).unwrap();
-        assert_eq!(state.available(), 50);
-        let recurrent = state_pool_usage(&state, 30);
-        assert_eq!(
-            (recurrent.used, recurrent.total),
-            (120, 200),
-            "the same arithmetic on a different pool"
-        );
-        state.free(&held);
     }
 
     /// A pool the model does not have is left out of the line entirely.

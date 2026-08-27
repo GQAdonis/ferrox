@@ -106,7 +106,6 @@ jobs:
             ferrox-gguf
             ferrox-quant
             ferrox-safetensors
-            ferrox-edge
             ferrox-cuda
             ferrox-metal
             ferrox-core

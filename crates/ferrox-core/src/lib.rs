@@ -5,12 +5,33 @@
 //! GQA, KV cache) follow the now-standard vocabulary popularized by
 //! llama.cpp / vLLM / candle-transformers; the actual Rust code below is
 //! written independently. See docs/THIRD_PARTY_NOTICES.md for design credit.
+//!
+//! The MoE expert-residency stack -- [`expert_store`] (the byte budget
+//! and the SSD tier), [`expert_cache`] (which experts stay resident and
+//! the copy plans that make them so), [`expert_slots`] (the bounded
+//! slot pool behind the [`expert_slots::SlotDevice`] seam),
+//! [`expert_pool`] (the CUDA side of that seam), [`expert_budget`]
+//! (bytes in, expert slot count out), [`residency`],
+//! [`placement`] and [`qstar`] -- lives together in one crate on
+//! purpose: on unified memory two independent expert budgets are the
+//! same physical RAM counted twice. [`expert_store`] is the budget
+//! holder. The policy half is ported from FreeToken (Apache-2.0); see
+//! docs/THIRD_PARTY_NOTICES.md.
 
 pub mod attention;
+pub mod bench_profile;
 pub mod block_sparse;
 pub mod cache;
 pub mod csa_hca_compress;
 pub mod deepseek_v4_attention;
+pub mod expert_budget;
+pub mod expert_cache;
+// Not feature-gated: `expert_pool::split_pair` is the one part of the
+// slot-copy path a compiler cannot check and a GPU-less host can, so it
+// is compiled and tested by the ordinary `cargo test` run. Everything
+// touching cudarc inside it carries its own `cuda` gate.
+pub mod expert_pool;
+pub mod expert_slots;
 pub mod expert_store;
 pub mod host_memory;
 pub mod instance;
@@ -20,6 +41,10 @@ pub mod kv_disk;
 pub mod kv_signature;
 pub mod kv_swa;
 pub mod matmul;
+pub mod placement;
+pub mod qstar;
+pub mod residency;
+pub mod summary_stats;
 pub mod tensor;
 pub mod threads;
 pub mod turboquant;

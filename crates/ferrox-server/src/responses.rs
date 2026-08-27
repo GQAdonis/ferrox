@@ -829,7 +829,7 @@ fn build_response(
 // ---------------------------------------------------------------------
 
 /// What the generation thread tells the stream, in the vocabulary the
-/// engine already speaks (`ferrox_edge`'s parser events plus a
+/// engine already speaks (the policy parser's events plus a
 /// terminal). Keeping this protocol-neutral is what lets every
 /// sequencing rule below be tested with no model and no socket.
 #[derive(Debug, Clone, PartialEq)]

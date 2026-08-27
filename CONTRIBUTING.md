@@ -86,7 +86,6 @@ that touches `ui/src/lib/`.
 | `docs/API.md` | HTTP API matrix |
 | `docs/CONFIG.md` | Environment variables |
 | `docs/AGENTS_COOKBOOK.md` | Pointing an IDE or agent at the server |
-| `crates/ferrox-edge/README.md` | Which serving policies run and which do not |
 | `benchmarks/RESULTS.md` | Speed vs llama.cpp (generated) |
 | `benchmarks/README.md` | How those numbers are measured |
 | `docs/ROADMAP.md` | Planned work |

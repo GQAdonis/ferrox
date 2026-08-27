@@ -12,12 +12,6 @@ categories = ["science", "algorithms"]
 
 [dependencies]
 ferrox-core = { workspace = true }
-# For the DSV4 per-layer compressor schedule (`LayerCompressor`), which
-# lives beside the `compress_ratios` array the KV tiers are priced from
-# so that what a layer is SIZED for and what it EXECUTES cannot drift.
-# ferrox-edge is a leaf with no ferrox dependencies, so this adds no
-# cycle.
-ferrox-edge = { workspace = true }
 ferrox-moe = { workspace = true }
 ferrox-gguf = { workspace = true }
 ferrox-quant = { workspace = true }

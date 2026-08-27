@@ -23,8 +23,8 @@
 //! model implies, and how to say the answer in OpenAI's response
 //! shape.
 
-use ferrox_edge::parser::tool_call::ToolSchema;
-use ferrox_edge::{ReasoningFormat, ReasoningParser, ToolCallFormat, ToolCallParser};
+use crate::policy::parser::tool_call::ToolSchema;
+use crate::policy::parser::{ReasoningFormat, ReasoningParser, ToolCallFormat, ToolCallParser};
 
 use crate::{ToolDef, ToolFunctionDef};
 

@@ -35,8 +35,8 @@ use std::time::Instant;
 
 use anyhow::Result;
 use clap::Parser;
-use ferrox_edge::bench_profile::{self, Measured};
-use ferrox_edge::qstar::BandwidthProfile;
+use ferrox_core::bench_profile::{self, Measured};
+use ferrox_core::qstar::BandwidthProfile;
 
 #[derive(Parser, Debug)]
 pub struct BenchBwArgs {
@@ -255,8 +255,8 @@ fn measure_pcie_gather(_bytes: usize, _reps: usize) -> Option<f64> {
 /// hardware facts and another machine's split is worse than no split —
 /// `BandwidthProfile::matches_gpu` refuses a mismatch rather than
 /// approximating.
-fn detect_gpu() -> ferrox_edge::qstar::ProfileGpu {
-    ferrox_edge::qstar::ProfileGpu::default()
+fn detect_gpu() -> ferrox_core::qstar::ProfileGpu {
+    ferrox_core::qstar::ProfileGpu::default()
 }
 
 #[cfg(test)]
@@ -321,7 +321,7 @@ mod tests {
         if measured.pcie_gather_gbs.is_none() {
             assert_eq!(
                 bench_profile::entry_from(&measured, 1.0),
-                Err(ferrox_edge::NotMeasurable::OnlyOneSide)
+                Err(bench_profile::NotMeasurable::OnlyOneSide)
             );
         }
     }

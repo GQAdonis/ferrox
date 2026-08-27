@@ -1,7 +1,7 @@
 //! Device-side homes for the expert slot pool
-//! [`ferrox_edge::ExpertSlots`] governs.
+//! [`crate::expert_slots::ExpertSlots`] governs.
 //!
-//! `ferrox-edge` decides which experts are resident and validates the
+//! `crate::expert_cache` decides which experts are resident and validates the
 //! plans that make them so, but holds no device memory by design. This
 //! is the other side of that line: the allocations, and the
 //! [`SlotDevice`] implementations that write into them.
@@ -10,7 +10,7 @@
 //!
 //! The policy is verified: every rule about plans, occupancy,
 //! attribution of failures and the zero-copy warm step is tested in
-//! `ferrox_edge::expert_slots` on any host.
+//! `crate::expert_slots` on any host.
 //!
 //! [`CudaExpertPool`] is **compile-verified only**. ferrox holds CUDA
 //! to a must-compile bar and its hardware tests stay `#[ignore]`d, and
@@ -41,11 +41,11 @@
 use std::sync::Arc;
 
 #[cfg(feature = "cuda")]
+use crate::expert_slots::{SlotDevice, SlotGeometry};
+#[cfg(feature = "cuda")]
+use crate::residency::CopyRoute;
+#[cfg(feature = "cuda")]
 use cudarc::driver::{CudaDevice, CudaSlice, DeviceSlice};
-#[cfg(feature = "cuda")]
-use ferrox_edge::expert_slots::{SlotDevice, SlotGeometry};
-#[cfg(feature = "cuda")]
-use ferrox_edge::residency::CopyRoute;
 
 /// Borrows two distinct slots of one bank at once: the source shared,
 /// the destination mutable.
@@ -79,7 +79,7 @@ pub fn split_pair<T>(slots: &mut [T], dst: usize, src: usize) -> Option<(&T, &mu
 /// Expert slots in CUDA device memory.
 ///
 /// Built from the same [`SlotGeometry`] the
-/// [`ExpertSlots`](ferrox_edge::ExpertSlots) governing it was built
+/// [`ExpertSlots`](crate::expert_slots::ExpertSlots) governing it was built
 /// from, so the two cannot disagree about how many slots exist or
 /// how wide a row is.
 #[cfg(feature = "cuda")]
@@ -257,8 +257,8 @@ mod split_tests {
 #[cfg(all(test, feature = "cuda"))]
 mod tests {
     use super::*;
-    use ferrox_edge::expert_cache::{CopyPlan, ExpertId, GatherPlan};
-    use ferrox_edge::expert_slots::{ExpertRows, ExpertSlots};
+    use crate::expert_cache::{CopyPlan, ExpertId, GatherPlan};
+    use crate::expert_slots::{ExpertRows, ExpertSlots};
 
     /// Host rows whose bytes name the expert they belong to, so a slot
     /// read back from the device can be checked for *which* expert it
@@ -292,7 +292,7 @@ mod tests {
     ///
     /// This is the hardware half of `persistent-gpu-expert-cache`'s
     /// acceptance. The policy half is proven on any host in
-    /// `ferrox_edge::expert_slots`; what needs a GPU is that these
+    /// `crate::expert_slots`; what needs a GPU is that these
     /// driver calls do what they are read as doing.
     #[test]
     #[ignore = "requires real CUDA hardware -- NOT yet run on a GPU; run with --ignored on a CUDA-capable machine"]

@@ -915,7 +915,7 @@ fn message_body(
 // ---------------------------------------------------------------------
 
 /// What the generation thread tells the stream, in the vocabulary the
-/// engine already speaks (`ferrox_edge`'s parser events plus a
+/// engine already speaks (the policy parser's events plus a
 /// terminal). Protocol-neutral, which is what lets every ordering rule
 /// below be tested with no model and no socket.
 #[derive(Debug, Clone, PartialEq)]
@@ -1204,7 +1204,7 @@ impl MessagesStream {
                 // `partial_json` ends with exactly this string.
                 //
                 // The `strip_prefix` guard is what enforces "only while
-                // fragments are prefix-stable". `ferrox_edge`'s parser
+                // fragments are prefix-stable". the policy parser
                 // emits literal continuations of the arguments JSON (or
                 // nothing at all until the block completes), so the
                 // guard holds; if a format ever broke that, this sends

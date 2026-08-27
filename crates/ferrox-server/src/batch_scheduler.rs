@@ -148,10 +148,10 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
-use ferrox_core::cache::{KvCache, PagedKvCache};
-use ferrox_edge::{
+use crate::policy::scheduler::{
     BatchStatus, PoolUsage, PrefillSnapshot, StatusReporter, DEFAULT_DECODE_LOG_INTERVAL,
 };
+use ferrox_core::cache::{KvCache, PagedKvCache};
 use ferrox_models::sampling::Sampler;
 use ferrox_models::tokenizer::StopTokens;
 use ferrox_models::Ceiling;
@@ -164,8 +164,8 @@ use crate::generate::{
     acquire_paged_caches, paged_hold_positions, paged_window_policy, DecodeError, FinishReason,
     GenerationParams, PagedKvConfig, PagedLease, Usage,
 };
+use crate::policy::anchor::WindowPolicy;
 use crate::stop::{StopMatcher, StopStep};
-use ferrox_edge::anchor::WindowPolicy;
 
 type DecodeFn = Arc<dyn Fn(&[usize]) -> String + Send + Sync>;
 
@@ -1194,7 +1194,7 @@ fn decode_log_interval_from_env() -> usize {
 /// The gauges both status lines carry.
 ///
 /// This is the block model's admission policy, and the only one on the
-/// serving path. `ferrox_edge::scheduler` holds the WINDOW and
+/// serving path. `crate::policy::scheduler` holds the WINDOW and
 /// RECURRENT models' -- page-aligned chunks, window reclaim, recurrent
 /// slots -- which are precisely the cases this batcher excludes below.
 /// The two are not one policy written twice; see that module's docs
@@ -1707,7 +1707,7 @@ mod tests {
             queue_wait: std::time::Duration::ZERO,
             radix: None,
             anchor_token: None,
-            slide_interval: ferrox_edge::pool::DEFAULT_SWA_EVICTION_INTERVAL,
+            slide_interval: crate::policy::pool::DEFAULT_SWA_EVICTION_INTERVAL,
         };
         let store = Arc::clone(&paged.store);
         let free_before = store.free_groups();
@@ -1827,7 +1827,7 @@ mod tests {
             queue_wait: std::time::Duration::from_secs(5),
             radix: None,
             anchor_token: None,
-            slide_interval: ferrox_edge::pool::DEFAULT_SWA_EVICTION_INTERVAL,
+            slide_interval: crate::policy::pool::DEFAULT_SWA_EVICTION_INTERVAL,
         };
         let store = Arc::clone(&paged.store);
         let free_before = store.free_groups();

@@ -25,10 +25,13 @@ path = "src/main.rs"
 [dependencies]
 ferrox-api = { workspace = true }
 ferrox-core = { workspace = true }
+# For the deterministic receipt id in `policy::outbox`: a retried stop
+# must derive the same id, or it writes a second billing event for work
+# that happened once.
+sha2 = { workspace = true }
 # The ported FreeToken serving policy: the reasoning / tool-call
 # parsers this server's chat path uses, and the withhold rule that
 # `stop::StopMatcher` shares with them.
-ferrox-edge = { workspace = true }
 ferrox-models = { workspace = true, features = ["hub"] }
 ferrox-gguf = { workspace = true }
 ferrox-safetensors = { workspace = true }

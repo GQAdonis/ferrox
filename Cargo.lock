@@ -440,7 +440,6 @@ dependencies = [
  "clap",
  "ferrox-core",
  "ferrox-cuda",
- "ferrox-edge",
  "ferrox-gguf",
  "ferrox-metal",
  "ferrox-models",
@@ -460,6 +459,7 @@ name = "ferrox-core"
 version = "0.13.0"
 dependencies = [
  "anyhow",
+ "cudarc",
  "ferrox-cuda",
  "ferrox-gguf",
  "ferrox-metal",
@@ -467,6 +467,8 @@ dependencies = [
  "libc",
  "memmap2",
  "rayon",
+ "serde",
+ "serde_json",
  "sha2",
  "thiserror",
 ]
@@ -476,19 +478,9 @@ name = "ferrox-cuda"
 version = "0.13.0"
 dependencies = [
  "cudarc",
- "ferrox-edge",
  "ferrox-quant",
  "half",
  "thiserror",
-]
-
-[[package]]
-name = "ferrox-edge"
-version = "0.13.0"
-dependencies = [
- "serde",
- "serde_json",
- "sha2",
 ]
 
 [[package]]
@@ -507,7 +499,6 @@ version = "0.13.0"
 dependencies = [
  "ferrox-api",
  "ferrox-core",
- "ferrox-edge",
  "ferrox-gguf",
  "ferrox-models",
  "ferrox-moe",
@@ -538,7 +529,6 @@ dependencies = [
  "fancy-regex",
  "ferrox-core",
  "ferrox-cuda",
- "ferrox-edge",
  "ferrox-gguf",
  "ferrox-metal",
  "ferrox-moe",
@@ -595,7 +585,6 @@ dependencies = [
  "ferrox-api",
  "ferrox-core",
  "ferrox-cuda",
- "ferrox-edge",
  "ferrox-gguf",
  "ferrox-metal",
  "ferrox-models",
@@ -606,6 +595,7 @@ dependencies = [
  "rustls",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror",
  "tokio",
  "tower",

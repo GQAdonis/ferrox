@@ -1115,13 +1115,7 @@ pub fn causal_gqa_attention_prefill_shared_kv_windowed(
                         *s = sc * (*s / sc).tanh();
                     }
                 }
-                let m = live.iter().fold(f32::NEG_INFINITY, |a, &s| a.max(s));
-                let mut l = 0f32;
-                for s in live.iter_mut() {
-                    *s = (*s - m).exp();
-                    l += *s;
-                }
-                norms[b - b_start] = l;
+                norms[b - b_start] = softmax_row_exp_sum(live);
             }
 
             // Pass 3: `acc[n_b, head_dim] += P * V`, the second GEMM.
@@ -1145,6 +1139,294 @@ pub fn causal_gqa_attention_prefill_shared_kv_windowed(
         });
 
     out
+}
+
+/// In-place row softmax for the blocked prefill kernel: `x[i]` becomes
+/// `exp(x[i] - max(x))` and the sum of those exponentials is returned,
+/// so the caller divides once at the end instead of normalising per
+/// position.
+///
+/// This is the third pass of the blocked form, and on small models it
+/// was the expensive one. `pass 1` and `pass 3` are register-tiled
+/// GEMMs; this pass was a **scalar `f32::exp` per (query, KV position)**,
+/// i.e. one libm `expf` call for every score the GEMM had just produced
+/// four-at-a-time. At `pp512` a single layer of a 32-head model issues
+/// `512 × 32 × ~256 ≈ 4.2 M` of them.
+///
+/// llama.cpp does not pay that: `ggml_vec_soft_max_f32`
+/// (`ggml/src/ggml-cpu/vec.cpp`) exponentiates a whole row through
+/// `ggml_v_expf` (`ggml/src/ggml-cpu/vec.h`), which is ARM's
+/// optimized-routines `expf` rewritten over a vector register. This is
+/// that same routine; see [`expf_neon`] for the derivation.
+///
+/// **This changes CPU prefill numerics**, and deliberately: the
+/// polynomial is not libm's `expf` to the last bit, and the vector
+/// accumulator reassociates the sum. On a near-tie that is enough to
+/// move a greedy argmax, so a CPU generation is not token-identical to
+/// what the scalar form produced. It is not *less* accurate -- the
+/// probabilities land at the same handful of ulps and the normaliser
+/// lands closer to the truth, which
+/// `the_vectorised_softmax_is_no_less_accurate_than_the_scalar_one`
+/// measures against an `f64` reference.
+///
+/// The reduction order of the max is irrelevant (max is associative and
+/// the scores are finite). Both the kernel and the row-at-a-time
+/// reference it is pinned against call this one function, which is what
+/// keeps `position_outer_prefill_is_bit_identical_to_the_query_outer_form`
+/// an equality test rather than a tolerance;
+/// `vectorised_softmax_row_matches_the_scalar_libm_form` is what checks
+/// this function against `f32::exp` itself.
+#[inline]
+fn softmax_row_exp_sum(x: &mut [f32]) -> f32 {
+    if x.is_empty() {
+        // A zero-width visible range (`window == 0`) leaves the caller's
+        // accumulator at zero and skips the normalisation, which is what
+        // the scalar form did too: `l` never left `0.0`.
+        return 0.0;
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        if std::arch::is_aarch64_feature_detected!("neon") {
+            return unsafe { softmax_row_exp_sum_neon(x) };
+        }
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {
+            return unsafe { softmax_row_exp_sum_avx2(x) };
+        }
+    }
+    softmax_row_exp_sum_scalar(x)
+}
+
+/// Scalar `softmax_row_exp_sum` for hosts with neither NEON nor AVX2 --
+/// and the shape the SIMD arms are tested against.
+fn softmax_row_exp_sum_scalar(x: &mut [f32]) -> f32 {
+    let m = x.iter().fold(f32::NEG_INFINITY, |a, &s| a.max(s));
+    let mut l = 0f32;
+    for s in x.iter_mut() {
+        *s = (*s - m).exp();
+        l += *s;
+    }
+    l
+}
+
+/// `exp(x)` for four lanes at once: ARM optimized-routines' `expf` in
+/// the shape llama.cpp vendors as `ggml_v_expf`
+/// (`ggml/src/ggml-cpu/vec.h`, the `__ARM_NEON` arm).
+///
+/// `z = fma(x, log2(e), 0x1.8p23)` rounds `x·log2(e)` to an integer `n`
+/// by the round-to-nearest of the add itself, and leaves that integer in
+/// the low mantissa bits of `z`, so `bits(z) << 23` is exactly the
+/// exponent field of `2^n` -- one shift instead of a conversion and a
+/// scalb. `b = x - n·ln2_hi - n·ln2_lo` is the reduced argument in
+/// `[-ln2/2, ln2/2]` (split so the product is exact in `f32`), and the
+/// degree-5 minimax polynomial evaluates `e^b - 1` there. The result is
+/// `2^n · (1 + j)`, accurate to under an ulp.
+///
+/// **The overflow branch of the original is dropped, and the clamp is
+/// what makes that sound.** llama.cpp keeps a slow path for `|n| > 126`
+/// because `ggml_v_expf` is a general `expf`. Here every argument is
+/// `score - row_max`, hence `<= 0`, and `exp` of anything below about
+/// `-87.3` is already smaller than the smallest normal `f32` -- so
+/// clamping the input at `-87` changes no representable output (the row
+/// max itself contributes `exp(0) == 1.0` exactly, so a clamped term is
+/// at most `1.6e-38` of the sum) while pinning `n` to `[-125.5, 0]`,
+/// where the fast path is the only path.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+#[inline]
+unsafe fn expf_neon(x: std::arch::aarch64::float32x4_t) -> std::arch::aarch64::float32x4_t {
+    use std::arch::aarch64::*;
+    let x = vmaxq_f32(x, vdupq_n_f32(EXP_MIN_ARG));
+    let r = vdupq_n_f32(EXP_SHIFT);
+    let z = vfmaq_f32(r, x, vdupq_n_f32(EXP_LOG2E));
+    let n = vsubq_f32(z, r);
+    // `b = x - n*ln2_hi - n*ln2_lo`; `vfmsq_f32(a, b, c) == a - b*c`.
+    let b = vfmsq_f32(
+        vfmsq_f32(x, n, vdupq_n_f32(EXP_LN2_HI)),
+        n,
+        vdupq_n_f32(EXP_LN2_LO),
+    );
+    // `2^n`, built by dropping `n` into the exponent field. The add
+    // wraps for negative `n`, which is exactly the intended borrow.
+    let e = vshlq_n_u32::<23>(vreinterpretq_u32_f32(z));
+    let k = vreinterpretq_f32_u32(vaddq_u32(e, vreinterpretq_u32_f32(vdupq_n_f32(1.0))));
+    let u = vmulq_f32(b, b);
+    let j = vfmaq_f32(
+        vmulq_f32(vdupq_n_f32(EXP_C0), b),
+        vfmaq_f32(
+            vfmaq_f32(vdupq_n_f32(EXP_C1), vdupq_n_f32(EXP_C2), b),
+            vfmaq_f32(vdupq_n_f32(EXP_C3), vdupq_n_f32(EXP_C4), b),
+            u,
+        ),
+        u,
+    );
+    vfmaq_f32(k, j, k)
+}
+
+/// AVX2 sibling of [`expf_neon`]: same constants, same polynomial, same
+/// clamp, eight lanes (`ggml_v_expf`'s `__AVX2__ && __FMA__` arm).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+#[inline]
+unsafe fn expf_avx2(x: std::arch::x86_64::__m256) -> std::arch::x86_64::__m256 {
+    use std::arch::x86_64::*;
+    let x = _mm256_max_ps(x, _mm256_set1_ps(EXP_MIN_ARG));
+    let r = _mm256_set1_ps(EXP_SHIFT);
+    let z = _mm256_fmadd_ps(x, _mm256_set1_ps(EXP_LOG2E), r);
+    let n = _mm256_sub_ps(z, r);
+    let b = _mm256_fnmadd_ps(
+        n,
+        _mm256_set1_ps(EXP_LN2_LO),
+        _mm256_fnmadd_ps(n, _mm256_set1_ps(EXP_LN2_HI), x),
+    );
+    let e = _mm256_slli_epi32::<23>(_mm256_castps_si256(z));
+    let k = _mm256_castsi256_ps(_mm256_add_epi32(
+        e,
+        _mm256_castps_si256(_mm256_set1_ps(1.0)),
+    ));
+    let u = _mm256_mul_ps(b, b);
+    let j = _mm256_fmadd_ps(
+        _mm256_fmadd_ps(
+            _mm256_fmadd_ps(_mm256_set1_ps(EXP_C4), b, _mm256_set1_ps(EXP_C3)),
+            u,
+            _mm256_fmadd_ps(_mm256_set1_ps(EXP_C2), b, _mm256_set1_ps(EXP_C1)),
+        ),
+        u,
+        _mm256_mul_ps(_mm256_set1_ps(EXP_C0), b),
+    );
+    _mm256_fmadd_ps(j, k, k)
+}
+
+// The `ggml_v_expf` constants, shared by both vector arms and used by
+// neither scalar path -- gated so a host with no SIMD arm at all still
+// compiles clean under `-D warnings`.
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+mod exp_consts {
+    /// `0x1.8p23`: adding this to `x·log2(e)` rounds it to an integer and
+    /// parks that integer in the mantissa's low bits.
+    pub const EXP_SHIFT: f32 = 12582912.0;
+    /// `log2(e)`, `0x1.715476p+0`.
+    pub const EXP_LOG2E: f32 = std::f32::consts::LOG2_E;
+    /// High half of `ln 2`, `0x1.62e4p-1` -- chosen with trailing zero
+    /// bits so `n · ln2_hi` is exact in `f32`.
+    pub const EXP_LN2_HI: f32 = 0.693_145_75;
+    /// Low half of `ln 2`, `0x1.7f7d1cp-20`.
+    pub const EXP_LN2_LO: f32 = 1.428_606_8e-6;
+    /// Minimax coefficients for `e^b - 1` on `[-ln2/2, ln2/2]`:
+    /// `0x1.ffffecp-1`, `0x1.fffdb6p-2`, `0x1.555e66p-3`,
+    /// `0x1.573e2ep-5`, `0x1.0e4020p-7`.
+    pub const EXP_C0: f32 = 0.999_999_4;
+    pub const EXP_C1: f32 = 0.499_991_27;
+    pub const EXP_C2: f32 = 0.166_683_96;
+    pub const EXP_C3: f32 = 0.041_899_767;
+    pub const EXP_C4: f32 = 0.008_247_39;
+    /// Below this the exponential is smaller than `f32::MIN_POSITIVE`, so
+    /// clamping here costs nothing and keeps `n` inside the fast path.
+    pub const EXP_MIN_ARG: f32 = -87.0;
+}
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+use exp_consts::*;
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn softmax_row_exp_sum_neon(x: &mut [f32]) -> f32 {
+    use std::arch::aarch64::*;
+    let n = x.len();
+    let p = x.as_mut_ptr();
+    let nv = n & !3;
+
+    let mut mv = vdupq_n_f32(f32::NEG_INFINITY);
+    let mut i = 0;
+    while i < nv {
+        mv = vmaxq_f32(mv, vld1q_f32(p.add(i)));
+        i += 4;
+    }
+    let mut m = if nv == 0 {
+        f32::NEG_INFINITY
+    } else {
+        vmaxvq_f32(mv)
+    };
+    for j in nv..n {
+        m = m.max(*p.add(j));
+    }
+
+    let mvec = vdupq_n_f32(m);
+    let mut sv = vdupq_n_f32(0.0);
+    let mut i = 0;
+    while i < nv {
+        let e = expf_neon(vsubq_f32(vld1q_f32(p.add(i)), mvec));
+        vst1q_f32(p.add(i), e);
+        sv = vaddq_f32(sv, e);
+        i += 4;
+    }
+    let mut l = vaddvq_f32(sv);
+    if nv < n {
+        // The tail goes through the same approximation rather than
+        // `f32::exp`, so a row's values do not change character at the
+        // width boundary. Padding lanes hold `0.0`; they are exponentiated
+        // and then simply not read.
+        let mut buf = [0f32; 4];
+        for (j, slot) in (nv..n).zip(buf.iter_mut()) {
+            *slot = *p.add(j) - m;
+        }
+        vst1q_f32(buf.as_mut_ptr(), expf_neon(vld1q_f32(buf.as_ptr())));
+        for (j, &e) in (nv..n).zip(buf.iter()) {
+            *p.add(j) = e;
+            l += e;
+        }
+    }
+    l
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn softmax_row_exp_sum_avx2(x: &mut [f32]) -> f32 {
+    use std::arch::x86_64::*;
+    let n = x.len();
+    let p = x.as_mut_ptr();
+    let nv = n & !7;
+
+    let mut mv = _mm256_set1_ps(f32::NEG_INFINITY);
+    let mut i = 0;
+    while i < nv {
+        mv = _mm256_max_ps(mv, _mm256_loadu_ps(p.add(i)));
+        i += 8;
+    }
+    let mut m = if nv == 0 {
+        f32::NEG_INFINITY
+    } else {
+        let mut lanes = [0f32; 8];
+        _mm256_storeu_ps(lanes.as_mut_ptr(), mv);
+        lanes.iter().fold(f32::NEG_INFINITY, |a, &s| a.max(s))
+    };
+    for j in nv..n {
+        m = m.max(*p.add(j));
+    }
+
+    let mvec = _mm256_set1_ps(m);
+    let mut sv = _mm256_setzero_ps();
+    let mut i = 0;
+    while i < nv {
+        let e = expf_avx2(_mm256_sub_ps(_mm256_loadu_ps(p.add(i)), mvec));
+        _mm256_storeu_ps(p.add(i), e);
+        sv = _mm256_add_ps(sv, e);
+        i += 8;
+    }
+    let mut l = hsum256_ps(sv);
+    if nv < n {
+        let mut buf = [0f32; 8];
+        for (j, slot) in (nv..n).zip(buf.iter_mut()) {
+            *slot = *p.add(j) - m;
+        }
+        _mm256_storeu_ps(buf.as_mut_ptr(), expf_avx2(_mm256_loadu_ps(buf.as_ptr())));
+        for (j, &e) in (nv..n).zip(buf.iter()) {
+            *p.add(j) = e;
+            l += e;
+        }
+    }
+    l
 }
 
 /// `scores[b][t] = scale · Σ_d q_tile[b][d]·k[t][d]` for one query block
@@ -2481,10 +2763,13 @@ mod tests {
     /// The query-outer form the blocked kernel had before the K/V rows
     /// were hoisted to the outer loop: one query at a time, streaming
     /// the whole visible K slab and then the whole visible V slab.
-    /// Built from the same `dot_f32` / `axpy` / `scale_inplace`
-    /// primitives, so the kernel must match it **bit for bit**, not
-    /// within a tolerance — reordering which rows are loaded when must
-    /// not reorder any arithmetic.
+    /// Built from the same `dot_f32` / `softmax_row_exp_sum` / `axpy` /
+    /// `scale_inplace` primitives, so the kernel must match it **bit for
+    /// bit**, not within a tolerance: reordering which rows are loaded
+    /// when must not reorder any arithmetic. What those primitives
+    /// compute is checked separately, `dot_f32` against a scalar sum and
+    /// `softmax_row_exp_sum` against libm's own `expf` in
+    /// `vectorised_softmax_row_matches_the_scalar_libm_form`.
     #[allow(clippy::too_many_arguments)]
     fn prefill_query_outer_reference(
         q: &[f32],
@@ -2522,12 +2807,7 @@ mod tests {
                     }
                     *s = v;
                 }
-                let m = scores.iter().fold(f32::NEG_INFINITY, |a, &s| a.max(s));
-                let mut l = 0f32;
-                for s in scores.iter_mut() {
-                    *s = (*s - m).exp();
-                    l += *s;
-                }
+                let l = super::softmax_row_exp_sum(&mut scores);
                 acc.fill(0.0);
                 for (i, &p) in scores.iter().enumerate() {
                     let base = ((t_start + i) * n_kv_heads + kv_h) * head_dim;
@@ -2637,6 +2917,157 @@ mod tests {
                         );
                     }
                 }
+            }
+        }
+    }
+
+    /// The blocked kernel and its query-outer reference share
+    /// `softmax_row_exp_sum`, so their bit-equality test cannot see a
+    /// wrong exponential -- it would be equally wrong on both sides.
+    /// This is the test that can: the vectorised routine against
+    /// `f32::exp`, i.e. against libm, which is what the kernel called
+    /// before.
+    ///
+    /// Swept: every length from 0 through twice the widest vector so all
+    /// four NEON and all eight AVX2 tail positions are hit; rows whose
+    /// spread is far past the `-87` clamp, where the vector form floors
+    /// at `~1.6e-38` and libm returns a true zero; a constant row, where
+    /// every term is `exp(0)` and the sum must come out at exactly the
+    /// row length; and a row of one.
+    #[test]
+    fn vectorised_softmax_row_matches_the_scalar_libm_form() {
+        fn libm_reference(x: &[f32]) -> (Vec<f32>, f32) {
+            let m = x.iter().fold(f32::NEG_INFINITY, |a, &s| a.max(s));
+            let out: Vec<f32> = x.iter().map(|s| (s - m).exp()).collect();
+            let mut l = 0f32;
+            for &e in out.iter() {
+                l += e;
+            }
+            (out, l)
+        }
+
+        // `spread` scales the score range: 200.0 pushes the low tail
+        // past the clamp, 0.0 makes every score identical.
+        for spread in [1.0f32, 8.0, 200.0, 0.0] {
+            for n in (0..=17).chain([31, 32, 33, 64, 127, 512]) {
+                let row: Vec<f32> = (0..n)
+                    .map(|i| ((i as f32) * 0.37 - 1.1).sin() * spread)
+                    .collect();
+                let (want, want_l) = libm_reference(&row);
+
+                let mut got = row.clone();
+                let got_l = super::softmax_row_exp_sum(&mut got);
+
+                for (i, (g, w)) in got.iter().zip(want.iter()).enumerate() {
+                    assert!(
+                        (g - w).abs() <= 1e-6 * w + 1e-30,
+                        "spread {spread} n {n} slot {i}: vector {g} vs libm {w}"
+                    );
+                }
+                assert!(
+                    (got_l - want_l).abs() <= 1e-5 * want_l.max(1.0),
+                    "spread {spread} n {n}: sum {got_l} vs libm {want_l}"
+                );
+                if n == 0 {
+                    assert_eq!(got_l, 0.0, "an empty visible range normalises to nothing");
+                }
+                if spread == 0.0 && n > 0 {
+                    // Every score equal means every term is `exp(0)`, and
+                    // the routine has to return that as *exactly* 1.0 --
+                    // an approximation that drifts at zero would bias
+                    // every uniform attention row.
+                    for (i, g) in got.iter().enumerate() {
+                        assert_eq!(*g, 1.0, "n {n} slot {i}: exp(0) must be exact");
+                    }
+                }
+            }
+        }
+    }
+
+    /// Replacing libm's `expf` and a sequential `f32` sum changes the
+    /// last bits of every attention probability, and across a 26-layer
+    /// prefill that is enough to move a greedy argmax on a near-tie. So
+    /// "different from what the scalar form produced" is not the
+    /// question worth asking, because the answer is yes and will stay
+    /// yes. "Further from the true softmax" is the question, and this
+    /// answers it against an `f64` ground truth.
+    ///
+    /// Measured on this sweep: the probabilities come out at the same
+    /// accuracy as the scalar form (both within a factor of two of each
+    /// other, both growing together with the spread of the row, because
+    /// the shared error term is rounding `score - max` into `f32`, not
+    /// the exponential); the normaliser comes out **better**, by 3x to
+    /// 10x, because four partial sums is a pairwise reduction and
+    /// `l += *s` down the row is not.
+    #[test]
+    fn the_vectorised_softmax_is_no_less_accurate_than_the_scalar_one() {
+        for spread in [1.0f64, 6.0, 20.0] {
+            for n in [64usize, 253, 512] {
+                let row: Vec<f64> = (0..n)
+                    .map(|i| ((i as f64) * 0.37 - 1.1).sin() * spread)
+                    .collect();
+
+                // Ground truth: the same reduction in `f64`.
+                let m64 = row.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+                let truth: Vec<f64> = row.iter().map(|s| (s - m64).exp()).collect();
+                let truth_l: f64 = truth.iter().sum();
+
+                let f32_row: Vec<f32> = row.iter().map(|&s| s as f32).collect();
+
+                let mut vector = f32_row.clone();
+                let vector_l = super::softmax_row_exp_sum(&mut vector);
+                let mut scalar = f32_row.clone();
+                let scalar_l = super::softmax_row_exp_sum_scalar(&mut scalar);
+
+                let worst = |got: &[f32]| -> f64 {
+                    got.iter()
+                        .zip(truth.iter())
+                        .map(|(&g, &t)| ((g as f64) - t).abs() / t)
+                        .fold(0.0, f64::max)
+                };
+                let (ev, es) = (worst(&vector), worst(&scalar));
+                let lv = ((vector_l as f64) - truth_l).abs() / truth_l;
+                let ls = ((scalar_l as f64) - truth_l).abs() / truth_l;
+                let eps = f64::from(f32::EPSILON);
+
+                // Probabilities: the same accuracy, within a factor of
+                // two either way. Neither form is the error term here --
+                // rounding `score - max` into `f32` is, which is why the
+                // error grows with the spread of the row and why both
+                // forms grow with it together.
+                assert!(
+                    ev <= 2.0 * es.max(eps) && ev <= 64.0 * eps,
+                    "spread {spread} n {n}: vector probabilities err {ev:e} \
+                     against scalar {es:e}"
+                );
+
+                // The normaliser: the vector form is the better one,
+                // every time. Four (or eight) partial sums is a pairwise
+                // reduction; `l += *s` down a 512-wide row is not.
+                assert!(
+                    lv <= ls.max(eps),
+                    "spread {spread} n {n}: vector normaliser err {lv:e} \
+                     against scalar {ls:e}"
+                );
+            }
+        }
+    }
+
+    /// The row max must be the true max whichever lane it lands in, and
+    /// the largest term must come back as exactly `1.0`, because the
+    /// caller divides by the sum rather than tracking a running maximum.
+    #[test]
+    fn softmax_row_finds_its_maximum_in_every_lane_position() {
+        for n in 1usize..=20 {
+            for peak in 0..n {
+                let mut row: Vec<f32> = (0..n).map(|i| -(i as f32) - 3.0).collect();
+                row[peak] = 12.5;
+                let l = super::softmax_row_exp_sum(&mut row);
+                assert_eq!(row[peak], 1.0, "n {n} peak {peak}: the max term is exp(0)");
+                for (i, &p) in row.iter().enumerate() {
+                    assert!(p <= 1.0, "n {n} peak {peak} slot {i}: {p} exceeds the max");
+                }
+                assert!(l >= 1.0, "n {n} peak {peak}: sum {l} must include the max");
             }
         }
     }

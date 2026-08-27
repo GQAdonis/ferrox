@@ -290,6 +290,62 @@ LLAMA_CPP_PREFIX=/path/to/llama.cpp ./tools/build_llama_logits.sh
 Point `--dumper` or `FERROX_LLAMA_LOGITS` at it if you build it
 elsewhere.
 
+## Diagnostics (`layer-divergence`, `quant-sensitivity`)
+
+`verify` says *which token* two backends stopped agreeing on.
+`layer-divergence` says *which layer*.
+
+```bash
+./target/release/ferrox layer-divergence -m models/Llama-3.2-1B-Instruct-Q4_K_M.gguf \
+  --backend metal --prompt-tokens 16
+```
+
+It runs one prefill per backend (a child process each, because the
+backend is a process-lifetime choice), then reads every layer's KV cache
+back and scores the per-head magnitudes. What it prints per layer is the
+**spread** of the per-head ratios, not the mean: one wrong head in
+thirty-two leaves the mean at 1.0, and a single bad head is the shape of
+every simdgroup-indexing bug this project has hit. The mean is printed
+next to it so the reader can watch it fail to notice.
+
+Read a first divergence at layer L as "at or immediately before layer
+L": layer L's K and V come from layer L's input, so the fault is in
+layer L's norm/QKV projection or in whatever produced its input. Layers
+below it are exonerated.
+
+Measured noise floor between CPU and Metal on a healthy model
+(Llama-3.2-1B Q4_K_M, 16 tokens): spread 1.6e-5 to 1.3e-4. The default
+`--tol 1e-3` sits about 8x above the worst of that.
+
+MoE checkpoints also get a routing column: the total-variation distance
+between the two backends' expert-selection histograms. `no counts` there
+means one side never recorded a selection, which is not agreement.
+
+```bash
+./target/release/ferrox quant-sensitivity -m models/Llama-3.2-1B-Instruct-Q4_K_M.gguf \
+  --candidate q4_0 --prompt-tokens 16 --top 10
+```
+
+`inspect-plan` prices a checkpoint from static type rules.
+`quant-sensitivity` measures the same question on the checkpoint in
+front of it: it round-trips **one tensor at a time** through a candidate
+format, scores `relative_mse` per block, swaps the result into the
+loaded model and reports how far the next-token distribution moved (KL,
+nats). Every other weight stays as the checkpoint shipped it, so no
+tensor inherits damage from the layers above it.
+
+Both columns are printed because they disagree, and the disagreement is
+the point: a tensor can round-trip badly and barely move the logits, or
+round-trip cleanly and move them a lot. Only the second is a reason to
+spend bits. The rollup at the bottom gives each tensor family's share of
+the total measured KL, which is what a static quant rule is guessing at.
+
+It runs on CPU by construction and refuses to start with
+`FERROX_CPU_INT_DOT=1`, whose repack cache is keyed by buffer address
+and would hand a swapped-in tensor another tensor's repacked bytes.
+Cost is one forward pass per tensor: about two minutes for a 1B model's
+112 tensors at 16 prompt tokens. `--layers 0:4` restricts the sweep.
+
 ## Hugging Face Hub (`pull`)
 
 Download a GGUF via the [`hf` CLI](https://huggingface.co/docs/huggingface_hub/guides/cli) (install: `pip install huggingface_hub`):

@@ -11,6 +11,30 @@ cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
+On an Apple-silicon checkout those four are not enough, because several
+kernels exist twice: a NEON path under `#[cfg(target_arch = "aarch64")]`
+and a portable scalar fallback the local build never compiles. A lint
+that fires only in the fallback is invisible here and red on CI, which
+is how a Rust 1.98 fix passed every local gate and still broke the
+build. Compile for a second architecture before pushing:
+
+```
+scripts/check-cross-target.sh    # clippy for x86_64-apple-darwin, ~2s warm
+rustup target add x86_64-apple-darwin   # once, if it refuses
+```
+
+To run it automatically, call it from your local pre-push hook. That
+directory is gitignored and may already hold a hook of its own, so add
+the line rather than replacing the file:
+
+```
+echo 'exec "$(git rev-parse --show-toplevel)/scripts/check-cross-target.sh"' \
+  >> .githooks/pre-push
+```
+
+CI's Linux `clippy` job compiles the same fallbacks, so this is about
+finding them a round trip earlier, not about a check CI lacks.
+
 The `cuda` feature must keep compiling without a GPU or CUDA toolkit
 present: `cargo clippy -p ferrox-cli -p ferrox-server --features cuda`.
 CI also builds that CLI/server chain and, on `macos-latest`, compiles

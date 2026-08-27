@@ -8,8 +8,10 @@ mod bench_suite;
 mod chat;
 mod host_state;
 mod http;
+mod layer_divergence;
 mod parity;
 mod pull;
+mod quant_sensitivity;
 mod run;
 mod serve_bench;
 mod verify;
@@ -211,6 +213,74 @@ enum Commands {
         #[arg(long)]
         dumper: Option<String>,
     },
+    /// Find the layer where a GPU backend starts disagreeing with the
+    /// CPU reference, rather than the token.
+    ///
+    /// One prefill per backend, then every layer's KV cache is read
+    /// back and scored per head. Reports the SPREAD of the per-head
+    /// magnitude ratios, not the mean: one wrong head in thirty-two
+    /// leaves the mean at 1.0. MoE checkpoints also get a per-layer
+    /// expert-routing comparison.
+    LayerDivergence {
+        /// GGUF to check.
+        #[arg(short = 'm', long)]
+        model: String,
+        /// Backend to compare against the CPU reference. `cpu` is the
+        /// self-test: every ratio must come back exactly 1.
+        #[arg(long, default_value = "metal")]
+        backend: String,
+        /// Prompt to compare on. Defaults to a fixed short one so runs
+        /// are comparable across models.
+        #[arg(short = 'p', long)]
+        prompt: Option<String>,
+        /// Stretch the prompt to this many tokens before prefill, so
+        /// the batched-prefill kernels are actually reached.
+        #[arg(long)]
+        prompt_tokens: Option<usize>,
+        /// Per-head magnitude-ratio spread at or above which a layer is
+        /// called diverged.
+        #[arg(long, default_value_t = 1e-3)]
+        tol: f64,
+        /// Score every prompt position (`all`) or only the last one
+        /// (`last`, the position the next token is decoded from).
+        #[arg(long, default_value = "all")]
+        at: String,
+        /// Internal: probe one backend and print the payload.
+        #[arg(long, hide = true)]
+        emit: bool,
+    },
+    /// Measure what quantizing each tensor would cost THIS checkpoint,
+    /// instead of applying a static quant-mix rule to it.
+    ///
+    /// Round-trips one tensor at a time through a candidate format,
+    /// scores relative_mse per block, swaps it into the loaded model,
+    /// and reports how far the next-token distribution moved. Every
+    /// other weight stays as the checkpoint shipped it, so no tensor
+    /// inherits the layers above it.
+    QuantSensitivity {
+        /// GGUF to measure.
+        #[arg(short = 'm', long)]
+        model: String,
+        /// Prompt the sensitivity is measured on.
+        #[arg(short = 'p', long)]
+        prompt: Option<String>,
+        /// Stretch the prompt to this many tokens before prefill.
+        #[arg(long)]
+        prompt_tokens: Option<usize>,
+        /// Format to round-trip through: `q4_0` or `q8_0`.
+        #[arg(long, default_value = "q4_0")]
+        candidate: String,
+        /// Restrict the sweep to `START:END` (end exclusive).
+        #[arg(long)]
+        layers: Option<String>,
+        /// Routed experts to probe per MoE layer, from index 0. Each
+        /// one costs three more forward passes per layer.
+        #[arg(long, default_value_t = 1)]
+        experts: usize,
+        /// How many rows of the ranked table to print.
+        #[arg(long, default_value_t = 20)]
+        top: usize,
+    },
     Bench {
         /// Real GGUF to benchmark. With this set, `bench` becomes a
         /// `llama-bench` work-alike (pp/tg on real weights) and the
@@ -403,6 +473,8 @@ const SUBCOMMANDS: &[&str] = &[
     "run-real",
     "bench",
     "verify",
+    "layer-divergence",
+    "quant-sensitivity",
     "parity",
     "speculative",
     "run-kimi",
@@ -497,7 +569,22 @@ fn rewrite_llama_style_argv(args: Vec<String>) -> Vec<String> {
 fn instance_target(command: &Commands) -> Option<(&'static str, Option<String>)> {
     match command {
         Commands::Run(a) => Some(("run", a.model.clone())),
-        Commands::Verify { model, .. } => Some(("verify", Some(model.clone()))),
+        // Only the `--emit` child loads weights; the parent spawns one
+        // child per backend and compares what they print. A parent that
+        // registered would be refused by its own first child, which is
+        // exactly what `verify` did on an idle host until this line
+        // grew the `emit` test.
+        Commands::Verify { model, emit, .. } => emit.then(|| ("verify", Some(model.clone()))),
+        // Only the `--emit` child of `layer-divergence` loads weights;
+        // the parent is a supervisor, exactly like `bench --suite`. If
+        // it registered, its own children would be refused by the
+        // one-model-per-host rule it exists to run under.
+        Commands::LayerDivergence { model, emit, .. } => {
+            emit.then(|| ("layer-divergence", Some(model.clone())))
+        }
+        Commands::QuantSensitivity { model, .. } => {
+            Some(("quant-sensitivity", Some(model.clone())))
+        }
         Commands::Bench {
             model,
             suite,
@@ -547,6 +634,11 @@ fn main() -> anyhow::Result<()> {
 
     // Held for the whole run: dropping it deregisters this process.
     let _instance = claim_instance(&cli)?;
+    // Read before `cli.command` is moved into the match. Subcommands
+    // that re-invoke this binary have to hand the child the same
+    // decision the parent was given, and a clap flag -- unlike an
+    // environment variable -- is not inherited.
+    let allow_multiple_instances = cli.allow_multiple_instances;
 
     match cli.command {
         Commands::Run(args) => run::run_infer(args)?,
@@ -795,6 +887,7 @@ fn main() -> anyhow::Result<()> {
                 emit,
                 prompt_tokens,
                 prompt,
+                allow_multiple_instances,
             });
         }
         Commands::Parity {
@@ -810,6 +903,45 @@ fn main() -> anyhow::Result<()> {
                 prompt_tokens,
                 top_k,
                 dumper,
+            });
+        }
+        Commands::LayerDivergence {
+            model,
+            backend,
+            prompt,
+            prompt_tokens,
+            tol,
+            at,
+            emit,
+        } => {
+            return layer_divergence::run(layer_divergence::DivergenceArgs {
+                model,
+                backend,
+                prompt,
+                prompt_tokens,
+                tol,
+                at,
+                emit,
+                allow_multiple_instances,
+            });
+        }
+        Commands::QuantSensitivity {
+            model,
+            prompt,
+            prompt_tokens,
+            candidate,
+            layers,
+            experts,
+            top,
+        } => {
+            return quant_sensitivity::run(quant_sensitivity::QuantSensitivityArgs {
+                model,
+                prompt,
+                prompt_tokens,
+                candidate,
+                layers,
+                experts,
+                top,
             });
         }
         Commands::Bench {

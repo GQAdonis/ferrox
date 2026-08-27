@@ -47,6 +47,10 @@ pub struct VerifyArgs {
     pub prompt_tokens: Option<usize>,
     /// Override the fixed prompt.
     pub prompt: Option<String>,
+    /// The global `--allow-multiple-instances` flag. Forwarded to the
+    /// children, which are the processes that actually load a model: a
+    /// clap flag, unlike an environment variable, is not inherited.
+    pub allow_multiple_instances: bool,
 }
 
 /// Marker the child prints so the parent can find the payload even if the
@@ -65,8 +69,8 @@ pub fn run(args: VerifyArgs) -> anyhow::Result<()> {
         return emit_tokens(&args.model, &prompt, args.prompt_tokens);
     }
 
-    let (reference, prompt_len) = child_tokens(&args.model, "cpu", &prompt, args.prompt_tokens)?;
-    let (candidate, _) = child_tokens(&args.model, &args.backend, &prompt, args.prompt_tokens)?;
+    let (reference, prompt_len) = child_tokens(&args, "cpu", &prompt)?;
+    let (candidate, _) = child_tokens(&args, &args.backend, &prompt)?;
 
     if prompt_len < PREFILL_MIN_TOKENS {
         eprintln!(
@@ -140,20 +144,22 @@ fn short(model: &str) -> String {
 
 /// Runs one backend in a child and parses back the token ids.
 fn child_tokens(
-    model: &str,
+    args: &VerifyArgs,
     backend: &str,
     prompt: &str,
-    prompt_tokens: Option<usize>,
 ) -> anyhow::Result<(Vec<u32>, usize)> {
     let exe = std::env::current_exe()?;
     let mut cmd = Command::new(&exe);
     cmd.arg("verify")
-        .args(["-m", model])
+        .args(["-m", &args.model])
         .args(["--backend", backend])
         .args(["--prompt", prompt])
         .arg("--emit");
-    if let Some(n) = prompt_tokens {
+    if let Some(n) = args.prompt_tokens {
         cmd.args(["--prompt-tokens", &n.to_string()]);
+    }
+    if args.allow_multiple_instances {
+        cmd.env("FERROX_ALLOW_MULTIPLE_INSTANCES", "1");
     }
     // `FERROX_METAL` alone only turns on the Metal *matvecs*: the fused
     // attention block, its RoPE kernels and the resident KV are behind

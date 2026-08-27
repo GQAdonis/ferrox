@@ -130,7 +130,7 @@ OpenAI-compatible HTTP API:
   [`CONFIG.md`](CONFIG.md)
 - On a model whose layers *all* slide by the same window, that
   window slides during decode, so a request holds its prompt and a
-  window rather than its whole context — and admission prices it
+  window rather than its whole context , and admission prices it
   that way, so a store too small for the whole context still serves
   it. A tool call anchors the slide at the position the next agentic
   turn will rejoin at, and the anchor is dropped once the cursor
@@ -155,6 +155,38 @@ OpenAI-compatible HTTP API:
   `tokenizer.chat_template`, with `chat_template_kwargs` and
   `reasoning_effort` passed through (the effort quantized onto what that
   checkpoint's template really grades)
+
+## Edge-native MoE serving: what is real here
+
+FreeToken describes an edge-native MoE serving engine, and ferrox ports
+its host-side policy (Apache-2.0, see
+[THIRD_PARTY_NOTICES](THIRD_PARTY_NOTICES.md)). This table is what
+ferrox actually does against that description, checked against the code
+on 2026-08-27 rather than asserted. It is here because the gap is the
+roadmap.
+
+| Capability | In ferrox today |
+|---|---|
+| Bandwidth-adaptive CPU/GPU co-execution (`q*`) | **Partial.** `qstar::BandwidthProfile` exists and is used by `ferrox bench-bw`, a measurement tool. The serving path does not consult it. |
+| Full-layer double-buffered prefill streaming | **No.** The policy is written with 11 tests and has zero callers. |
+| Global LRU expert caching | **Yes, one of two.** `expert_store` is wired into both decode paths and proven bit-identical to resident at a 1-byte budget. A second, unwired cache also exists; consolidating them is roadmap item 1. |
+| Graph-compatible execution | **No.** Execution is eager. `ExecutionPlan` is built and read by nothing. |
+| FTW fast weight format | **No.** GGUF only. |
+| Semantic anchor checkpoints for KV | **Yes.** `anchor::decode_slide` and `WindowPolicy` are wired into `generate.rs` and the batch scheduler. |
+| Agentic context edits without recompute | **Partial.** The radix prefix cache shares pages across requests and reports `cached_tokens`. Anchor-based edit replay is policy-complete, not proven end to end. |
+| Elastic VRAM re-allocation without restart | **Partial.** `POST /v1/cache/rebuild` re-splits KV pool geometry at runtime. Moving bytes between an expert cache and KV is not implemented. |
+| MXFP4 / BF16 | **Yes**, executable. MXFP4 is CPU-only. |
+| NVFP4 / FP8 | **No.** Neither is parsed. |
+| DeepSeek-V4-Flash, GLM-5.2, Kimi K3 | **Loaders and primitives only.** Nothing has run end to end on a real checkpoint. |
+| OpenAI + Anthropic compatible APIs | **Yes**, both, plus Responses. Tool calls parsed in eleven wire formats. |
+| NVIDIA RTX 30/40/50 | **Compiles, never measured.** CUDA has no in-tree benchmark receipt and no GPU in CI. |
+
+Two honest notes. Ferrox runs on Apple Metal, which that description
+does not cover, and Metal is where it is fastest: every dense `pp512`
+row is 0.98x to 1.10x against llama.cpp and 8 of 12 `tg128` rows are
+faster. And the single largest gap is not on this table: running a model
+that does not fit in memory works as policy and not as execution, which
+is why it is roadmap item 5.
 
 ## Serving policy (`ferrox-edge`)
 

@@ -35,8 +35,12 @@ attention and expert routing are all implemented here.
   dequantization happens inside the matmul, so an 8B model fits on a
   laptop. K-quants, the IQ tiers, MXFP4, F16 and BF16.
 - **Mixture-of-experts gets its own path.** GPU routing, indexed expert
-  GEMMs, and residency planning, so a model larger than your VRAM still
-  runs.
+  GEMMs, and residency planning. Experts stream from the checkpoint
+  through a bounded cache when the weights do not fit, and that turns
+  itself on only when they do not: it is slower than running resident,
+  so it is a way to run a model that otherwise could not run at all,
+  never a default. What it costs and where it is still policy rather
+  than execution is in [docs/FEATURES.md](docs/FEATURES.md).
 - **Every speed number is measured.** Each claim comes from a run
   against llama.cpp on the same host, the same file and the same
   backend. Every run writes a small JSON file of raw timings, and those

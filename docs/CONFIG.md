@@ -118,6 +118,7 @@ scraper pointed at a keyed server gets a `401`.
 | `FERROX_CORS_ORIGINS` | Comma-separated **exact** origins. `*` is rejected on purpose, because a wildcard plus a bearer token is a credential-leak shape. **Required to serve Ferrox Studio (`ui/`) from another origin**, set it to that origin exactly. `ui/`'s dev server proxies the API instead, so `npm run dev` needs none of this |
 | `FERROX_RATE_LIMIT_PER_MINUTE` | Global request cap. A non-integer value is a startup error, not a silent default |
 | `FERROX_JOURNAL_PATH` | Where the process-lifecycle journal is written |
+| `FERROX_CONVERSATIONS_DIR` | Where server-side conversations are stored, one JSON file each (default `./ferrox-conversations`). Created on first write. Nothing is evicted: the caps refuse with a reason rather than dropping an older conversation |
 
 ## Kernel-lookup registry
 

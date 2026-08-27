@@ -116,6 +116,18 @@ remaining work visible instead of hypothetical.
 
 ## Ranking
 
+**Shipped and working beats big and undone.** That rule outranks the
+tiers below. An item that cannot be cut into steps which each land is
+filed wrong, and the fix is to re-cut it, not to start it.
+
+The executable order lives in [`roadmap.md`](roadmap.md). It differs
+from a pure tier sort in one deliberate way: correctness and the
+verification oracle come FIRST, ahead of the model layer refactor,
+because some checkpoints are wrong right now and their fixes are small,
+and because refactoring 15464 lines across two crates without a working
+cross-engine oracle means refactoring known-wrong code with no way to
+tell if you broke it.
+
 ```
 TIER 1  scale the model layer     6438 lines is why we have 47 not 140
         close the 68              invert the default, then audit outward

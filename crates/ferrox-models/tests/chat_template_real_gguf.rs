@@ -25,7 +25,7 @@
 //!   smoke test over the same corpus.
 //! * `sweep_every_local_gguf_template` is `#[ignore]`d because it needs
 //!   the checkpoints themselves. It opens every GGUF under `models/`
-//!   (or `$FERROX_MODELS_DIR`), pulls each one's real template, and
+//!   (or `$FERROX_TEST_MODELS_DIR`), pulls each one's real template, and
 //!   renders a fixed three-turn conversation through it. That is how
 //!   the compile/render coverage claim in
 //!   `docs/plans/llama-cpp-parity-push.md` was measured; re-run it with
@@ -276,7 +276,7 @@ fn a_checkpoint_with_no_template_falls_back_to_chatml_not_to_a_guess() {
 #[test]
 #[ignore = "needs the real GGUF checkpoints in models/"]
 fn sweep_every_local_gguf_template() {
-    let root = std::env::var("FERROX_MODELS_DIR").unwrap_or_else(|_| "models".to_string());
+    let root = std::env::var("FERROX_TEST_MODELS_DIR").unwrap_or_else(|_| "models".to_string());
     let mut files = Vec::new();
     collect_gguf(std::path::Path::new(&root), &mut files);
     assert!(!files.is_empty(), "no GGUFs under {root}");

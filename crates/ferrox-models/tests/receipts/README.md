@@ -11,7 +11,7 @@ To add a receipt once a local GGUF is available:
    `ferrox inspect` / tokenizer roundtrip.
 3. Cross-check top-1 / greedy decode against llama.cpp on the same file.
 4. Drop `<id>.json` here and add an `#[ignore]` test in
-   `checkpoint_receipts.rs` that sets `FERROX_RECEIPT_CHECKPOINT`.
+   `checkpoint_receipts.rs` that sets `FERROX_TEST_RECEIPT_CHECKPOINT`.
 
 Suite entries already exist in `benchmarks/suite.json`:
 

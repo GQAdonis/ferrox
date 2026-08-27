@@ -1,7 +1,7 @@
 //! Who owns BOS: the chat template, or the loader?
 //!
 //! Measured, not reasoned about. `sweep_local_gguf_bos_policy` opens
-//! every GGUF under `models/` (or `$FERROX_MODELS_DIR`), renders that
+//! every GGUF under `models/` (or `$FERROX_TEST_MODELS_DIR`), renders that
 //! checkpoint's own `tokenizer.chat_template` through the minijinja
 //! evaluator, encodes the result with that checkpoint's own tokenizer,
 //! and counts how many BOS ids come out at the front under
@@ -51,7 +51,7 @@ impl Tok {
 #[test]
 #[ignore = "needs the real GGUF checkpoints in models/"]
 fn sweep_local_gguf_bos_policy() {
-    let root = std::env::var("FERROX_MODELS_DIR").unwrap_or_else(|_| "models".to_string());
+    let root = std::env::var("FERROX_TEST_MODELS_DIR").unwrap_or_else(|_| "models".to_string());
     let mut files = Vec::new();
     collect_gguf(std::path::Path::new(&root), &mut files);
     files.sort();

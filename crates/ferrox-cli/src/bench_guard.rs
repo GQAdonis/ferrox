@@ -397,15 +397,16 @@ const SELF_SET_ENV: &[&str] = &[
 /// Every `FERROX_*` variable in effect that the bench did not set
 /// itself, as `(name, value)` pairs sorted by name.
 ///
-/// This is recorded, not refused. Several of these knobs exist
-/// precisely so a change can be A/B'd by toggling one
-/// (`FERROX_METAL_FA_MMA=0`), and refusing would break the workflow
-/// the ledger depends on. But some of them -- `FERROX_METAL_MOE_ABLATE`
-/// removes whole stages, `FERROX_ALLOW_UNKNOWN_TENSORS` disables the
-/// fail-closed loader gate -- change how much work the engine does, and
-/// a published row taken under one of them is not comparable to a row
-/// taken without it. Putting them in the receipt means the difference
-/// is discoverable later instead of lost with the shell history.
+/// This is recorded, not refused. Some of these knobs pick a device or a
+/// budget and say nothing an auditor cannot already read off the receipt,
+/// and refusing on them would break the workflow the ledger depends on.
+/// But others -- `FERROX_ALLOW_UNKNOWN_TENSORS` disables the fail-closed
+/// loader gate, `FERROX_STRICT_KERNELS` is the gate a benchmark host is
+/// supposed to be running under -- change how much work the engine does
+/// or how much of it is checked, and a published row taken under one of
+/// them is not comparable to a row taken without it. Putting them in the
+/// receipt means the difference is discoverable later instead of lost
+/// with the shell history.
 pub fn nondefault_engine_env<I, K, V>(vars: I) -> Vec<(String, String)>
 where
     I: IntoIterator<Item = (K, V)>,
@@ -700,7 +701,7 @@ mod tests {
             ("FERROX_METAL_ATTN", "1"),
             ("FERROX_CUDA", "auto"),
             ("FERROX_CPU_THREADS", "8"),
-            ("FERROX_METAL_MOE_ABLATE", "topk"),
+            ("FERROX_CTK", "q8_0"),
             ("FERROX_ALLOW_UNKNOWN_TENSORS", "1"),
             ("HOME", "/Users/x"),
         ]);
@@ -708,7 +709,7 @@ mod tests {
             got,
             vec![
                 ("FERROX_ALLOW_UNKNOWN_TENSORS".to_string(), "1".to_string()),
-                ("FERROX_METAL_MOE_ABLATE".to_string(), "topk".to_string()),
+                ("FERROX_CTK".to_string(), "q8_0".to_string()),
             ]
         );
     }

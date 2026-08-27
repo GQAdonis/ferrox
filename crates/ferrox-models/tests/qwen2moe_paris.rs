@@ -3,7 +3,7 @@
 //!
 //! Requires:
 //! - `cargo test -p ferrox-models --test qwen2moe_paris -- --ignored`
-//! - `models/Qwen1.5-MoE-A2.7B-Chat-Q4_K_M.gguf` (or `FERROX_QWEN2MOE_GGUF`)
+//! - `models/Qwen1.5-MoE-A2.7B-Chat-Q4_K_M.gguf` (or `FERROX_TEST_QWEN2MOE_GGUF`)
 
 use std::path::{Path, PathBuf};
 
@@ -17,7 +17,7 @@ const PROMPT: &str = "The capital of France is";
 const MAX_NEW_TOKENS: usize = 16;
 
 fn qwen2moe_gguf_path() -> PathBuf {
-    if let Ok(p) = std::env::var("FERROX_QWEN2MOE_GGUF") {
+    if let Ok(p) = std::env::var("FERROX_TEST_QWEN2MOE_GGUF") {
         return PathBuf::from(p);
     }
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../models/Qwen1.5-MoE-A2.7B-Chat-Q4_K_M.gguf")
@@ -33,7 +33,7 @@ fn argmax(logits: &[f32]) -> usize {
 }
 
 #[test]
-#[ignore = "needs models/Qwen1.5-MoE-A2.7B-Chat-Q4_K_M.gguf (or FERROX_QWEN2MOE_GGUF)"]
+#[ignore = "needs models/Qwen1.5-MoE-A2.7B-Chat-Q4_K_M.gguf (or FERROX_TEST_QWEN2MOE_GGUF)"]
 fn qwen2moe_cpu_greedy_paris_regression() {
     let path = qwen2moe_gguf_path();
     if !path.exists() {

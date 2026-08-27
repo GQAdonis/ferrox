@@ -778,7 +778,7 @@ pub fn run_infer(args: InferArgs) -> anyhow::Result<()> {
                 ferrox_models::set_metal_greedy_argmax(false);
             }
         }
-        if sampling.temperature <= 0.0 && ferrox_models::metal_greedy_gpu_enabled() {
+        if sampling.temperature <= 0.0 {
             ferrox_models::set_metal_greedy_argmax(true);
             Some(Guard)
         } else {

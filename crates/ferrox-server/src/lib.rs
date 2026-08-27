@@ -3861,29 +3861,10 @@ async fn run(mcp_config_path: Option<PathBuf>, exit_on_stdin_close: bool) -> any
                 }
                 _ => {}
             }
-            match std::env::var("FERROX_METAL_LOGITS").ok().as_deref() {
-                Some("1") | Some("true") | Some("on") | Some("logits") => {
-                    tracing::info!(
-                        "Metal logits-in-stack enabled (FERROX_METAL_LOGITS): \
-                         final_norm+lm_head on-GPU (often slower than host lm_head)"
-                    );
-                }
-                _ => {}
-            }
-            match std::env::var("FERROX_METAL_GREEDY_GPU").ok().as_deref() {
-                Some("0") | Some("false") | Some("off") | Some("no") => {
-                    tracing::info!(
-                        "Metal greedy GPU argmax disabled (FERROX_METAL_GREEDY_GPU=0); \
-                         temperature<=0 uses host lm_head"
-                    );
-                }
-                _ => {
-                    tracing::info!(
-                        "Metal greedy GPU argmax on by default (opt out FERROX_METAL_GREEDY_GPU=0): \
-                         temperature<=0 folds final_norm+lm_head+argmax into dense stack"
-                    );
-                }
-            }
+            tracing::info!(
+                "Metal greedy GPU argmax: temperature<=0 folds \
+                 final_norm+lm_head+argmax into the dense stack"
+            );
         } else {
             tracing::info!("Metal dense matvec disabled (FERROX_METAL); dense decode uses CPU");
         }

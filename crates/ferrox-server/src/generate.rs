@@ -748,7 +748,7 @@ pub fn generate(
                 ferrox_models::set_metal_greedy_argmax(false);
             }
         }
-        if params.sampling.temperature <= 0.0 && ferrox_models::metal_greedy_gpu_enabled() {
+        if params.sampling.temperature <= 0.0 {
             ferrox_models::set_metal_greedy_argmax(true);
             Some(Guard)
         } else {

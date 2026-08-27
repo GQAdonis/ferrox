@@ -8,7 +8,7 @@
 //!
 //! Run:
 //! ```text
-//! export FERROX_RECEIPT_CHECKPOINT=/path/to/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf
+//! export FERROX_TEST_RECEIPT_CHECKPOINT=/path/to/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf
 //! cargo test -p ferrox-models --test checkpoint_receipts -- --ignored --nocapture
 //! ```
 
@@ -96,12 +96,12 @@ fn argmax(logits: &[f32]) -> usize {
 }
 
 #[test]
-#[ignore = "needs FERROX_RECEIPT_CHECKPOINT pointing at the pinned Llama-3.1 Q4_K_M GGUF"]
+#[ignore = "needs FERROX_TEST_RECEIPT_CHECKPOINT pointing at the pinned Llama-3.1 Q4_K_M GGUF"]
 fn llama31_8b_q4km_forced_continuation_receipt() {
     let receipt = load_receipt("llama31_8b_instruct_q4_k_m.json");
-    let path = std::env::var("FERROX_RECEIPT_CHECKPOINT").unwrap_or_else(|_| {
+    let path = std::env::var("FERROX_TEST_RECEIPT_CHECKPOINT").unwrap_or_else(|_| {
         panic!(
-            "set FERROX_RECEIPT_CHECKPOINT to the local path of {}",
+            "set FERROX_TEST_RECEIPT_CHECKPOINT to the local path of {}",
             receipt.checkpoint.filename
         )
     });

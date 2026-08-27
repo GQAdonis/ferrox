@@ -13,7 +13,7 @@
 //!    curl -L -o model-00001-of-000096.safetensors \
 //!      https://huggingface.co/moonshotai/Kimi-K3/resolve/main/model-00001-of-000096.safetensors
 //!    ```
-//! 2. `export FERROX_KIMI_SHARD_DIR=/path/to/that/directory`
+//! 2. `export FERROX_TEST_KIMI_SHARD_DIR=/path/to/that/directory`
 //! 3. `cargo test -p ferrox-models --test kimi_real_data -- --ignored --nocapture`
 //!
 //! This builds its own minimal `weight_map` (rather than requiring the
@@ -25,8 +25,8 @@
 #[test]
 #[ignore]
 fn loads_and_runs_a_real_kimi_k3_layer_from_downloaded_bytes() {
-    let dir = std::env::var("FERROX_KIMI_SHARD_DIR")
-        .expect("set FERROX_KIMI_SHARD_DIR to the directory containing the downloaded shard");
+    let dir = std::env::var("FERROX_TEST_KIMI_SHARD_DIR")
+        .expect("set FERROX_TEST_KIMI_SHARD_DIR to the directory containing the downloaded shard");
     let shard_dir = std::path::PathBuf::from(dir);
     let shard_filename = "model-00001-of-000096.safetensors";
     assert!(
@@ -239,13 +239,14 @@ fn loads_and_runs_a_real_kimi_k3_layer_from_downloaded_bytes() {
 ///    curl -L -o model-00002-of-000096.safetensors \
 ///      https://huggingface.co/moonshotai/Kimi-K3/resolve/main/model-00002-of-000096.safetensors
 ///    ```
-/// 2. `export FERROX_KIMI_MOE_SHARD_DIR=/path/to/that/directory`
+/// 2. `export FERROX_TEST_KIMI_MOE_SHARD_DIR=/path/to/that/directory`
 /// 3. `cargo test -p ferrox-models --test kimi_real_data moe_layer -- --ignored --nocapture`
 #[test]
 #[ignore]
 fn loads_and_runs_a_real_kimi_k3_moe_layer_from_downloaded_bytes() {
-    let dir = std::env::var("FERROX_KIMI_MOE_SHARD_DIR")
-        .expect("set FERROX_KIMI_MOE_SHARD_DIR to the directory containing the downloaded shard");
+    let dir = std::env::var("FERROX_TEST_KIMI_MOE_SHARD_DIR").expect(
+        "set FERROX_TEST_KIMI_MOE_SHARD_DIR to the directory containing the downloaded shard",
+    );
     let shard_dir = std::path::PathBuf::from(dir);
     let shard_filename = "model-00002-of-000096.safetensors";
     assert!(
@@ -448,8 +449,9 @@ fn loads_and_runs_a_real_kimi_k3_moe_layer_from_downloaded_bytes() {
 #[test]
 #[ignore]
 fn loads_real_kda_attention_and_a_sample_of_real_mxfp4_experts_for_layer_1() {
-    let dir = std::env::var("FERROX_KIMI_MOE_SHARD_DIR")
-        .expect("set FERROX_KIMI_MOE_SHARD_DIR to the directory containing the downloaded shard");
+    let dir = std::env::var("FERROX_TEST_KIMI_MOE_SHARD_DIR").expect(
+        "set FERROX_TEST_KIMI_MOE_SHARD_DIR to the directory containing the downloaded shard",
+    );
     let shard_dir = std::path::PathBuf::from(dir);
     let shard_filename = "model-00002-of-000096.safetensors";
     assert!(
@@ -547,13 +549,13 @@ fn loads_real_kda_attention_and_a_sample_of_real_mxfp4_experts_for_layer_1() {
 ///
 /// To re-run this verification:
 /// 1. `curl -L -o tiktoken.model https://huggingface.co/moonshotai/Kimi-K3/resolve/main/tiktoken.model`
-/// 2. `export FERROX_KIMI_TOKENIZER_PATH=/path/to/tiktoken.model`
+/// 2. `export FERROX_TEST_KIMI_TOKENIZER_PATH=/path/to/tiktoken.model`
 /// 3. `cargo test -p ferrox-models --test kimi_real_data tokenizer -- --ignored --nocapture`
 #[test]
 #[ignore]
 fn kimi_tokenizer_matches_the_real_tiktoken_library_on_real_vocab() {
-    let path = std::env::var("FERROX_KIMI_TOKENIZER_PATH")
-        .expect("set FERROX_KIMI_TOKENIZER_PATH to the downloaded tiktoken.model file");
+    let path = std::env::var("FERROX_TEST_KIMI_TOKENIZER_PATH")
+        .expect("set FERROX_TEST_KIMI_TOKENIZER_PATH to the downloaded tiktoken.model file");
     let text = std::fs::read_to_string(&path).expect("must read tiktoken.model");
     let ranks = ferrox_models::kimi_tokenizer::parse_tiktoken_vocab(&text)
         .expect("must parse real tiktoken.model");

@@ -3,6 +3,18 @@
 Prefer CLI flags ([CLI.md](CLI.md)). Environment variables are for server
 deployments and advanced tuning. Flags override env when both are set.
 
+Everything Ferrox reads from the environment is listed here. Three
+namespaces, and the prefix tells you which:
+
+- `FERROX_*` — operator configuration. Sections
+  [Server](#server) through [Kernel-lookup registry](#kernel-lookup-registry).
+- `FERROX_METAL_*_TIMING` / `_BARRIER_LOG` — Metal instrumentation. They
+  print numbers and change nothing else. See
+  [Metal instrumentation](#metal-instrumentation).
+- `FERROX_TEST_*` — fixtures that point an `#[ignore]`d test at a local
+  checkpoint. Not configuration; see
+  [Test and development fixtures](#test-and-development-fixtures).
+
 ## Server
 
 | Variable | Purpose |
@@ -34,6 +46,11 @@ library or overriding the CLI.
 | `FERROX_CUDA` | `1` / `0` / `auto` (build with `--features cuda`) |
 | `FERROX_CPU_THREADS` | Worker threads; same as `-t`. Default: **performance cores** (`hw.perflevel0.physicalcpu` on macOS), matching llama.cpp, not logical cores |
 | `FERROX_CPU_INT_DOT` | int8×int8 matvec + repacked GEMV. **On by default** in `ferrox` / `ferrox-server`; `0` opts out. Off in the library so golden cross-validation stays reference-exact |
+| `FERROX_METAL_FA_VEC` | `0`, disable llama-style FA-vec for decode **and** prefill and fall back to the legacy online-softmax GQA. Default **on** for `head_dim` in {64, 96, 128, 256}; other widths take the legacy kernel either way. Prefill at 64 / 128 / 256 with at least 8 new tokens goes further and takes the simdgroup-MMA `flash_attn_ext` kernel, which is not separately switchable |
+| `FERROX_METAL_SCRATCH_BUDGET_BYTES` | Ceiling on the pooled Metal scratch buffers (default 768 MiB). Past it a returned buffer is dropped rather than kept for reuse. Lower it on a small machine where the pool competes with the weights |
+| `FERROX_METAL_WEIGHT_CACHE_BYTES` | Ceiling on the resident Metal weight-buffer cache. Default is effectively unlimited, which is right on unified memory; cap it on a small machine. An unparseable value also means unlimited |
+| `FERROX_CUDA_GQA` | `1`, serve the per-token GQA reduction from the CUDA `gqa_decode` kernel instead of the host path, falling back to the host on any launch error. Off by default: the kernel's numerical parity is gated on hardware tests that need a real GPU |
+| `FERROX_CUDA_GRAPH` | `1`, request CUDA-graph capture and replay for decode. Nothing enqueues into a captured stream yet, so today this changes nothing; it is groundwork with a pending hardware receipt (`docs/ROADMAP.md`) |
 
 ## Tuning
 
@@ -153,5 +170,58 @@ takes a fallback warns once with its call site. See
 | `FERROX_INSTANCE_DIR` | Where the running-instance registry lives (default `$XDG_CACHE_HOME/ferrox/instances`, else `~/.cache/ferrox/instances`). One small file per live process, pruned when its pid is gone |
 | `FERROX_STRICT_KERNELS` | `1`, refuse to load a model whose weights have no kernel on the selected accelerator, instead of running it on a slower path. Set this in CI and in benchmark harnesses so a number cannot be published for a backend it was not taken on |
 
-Debug switches (`FERROX_METAL_FA_VEC`, `FERROX_METAL_LOGITS`, …) live next
-to the code and may change without notice.
+## Metal instrumentation
+
+These print numbers and change nothing else: no kernel is selected
+differently, no output moves. They exist so a Metal change can be
+attributed rather than guessed at, and they are the only in-tree way to
+do that without a GPU capture.
+
+| Variable | Purpose |
+|---|---|
+| `FERROX_METAL_MM_TIMING` | `1`, accumulate **wall-clock** setup / GPU-wait / readback microseconds across the prefill GEMM paths and print the totals. This is how long the host waited, which is what a `pp512` number is made of |
+| `FERROX_METAL_GPU_TIMING` | `1`, accumulate **GPU-clock** milliseconds per tagged submission (`moe-decode/tok`, `dense-decode/tok`, `prefill-dense-stack`) from the command buffer's own timestamps, and print a running mean. Different question from the above: this one excludes host stalls |
+| `FERROX_METAL_BARRIER_LOG` | `1`, log the running barriers-per-op ratio from `MemRanges`. `1.00` means the pass is fully serialised; lower means dispatches are overlapping. This is the direct measure of what a graph change bought |
+
+## Test and development fixtures
+
+Not configuration. `FERROX_TEST_*` exists so an `#[ignore]`d test can find
+a checkpoint that is too large to commit, and points at a local file or
+directory. `cargo test --workspace` passes with none of them set; the
+tests that read them skip instead.
+
+| Variable | Purpose |
+|---|---|
+| `FERROX_TEST_MODELS_DIR` | Root the real-GGUF sweeps scan (default `models`). Read by `bos_policy`, `chat_template_real_gguf` and `paged_metal_parity` -- a git worktree has no `models/` of its own, which is what this is for. Unrelated to `FERROX_MODEL_DIR`, which is server config |
+| `FERROX_TEST_GEMMA2_GGUF` | Gemma-2 GGUF for the Metal quality gate |
+| `FERROX_TEST_QWEN2MOE_GGUF` | Qwen2-MoE GGUF for the "capital of France" check |
+| `FERROX_TEST_SMOLLM2_GGUF` | SmolLM2 GGUF for the same check on Metal |
+| `FERROX_TEST_PAGED_PARITY_GGUF` | GGUF for the paged-vs-contiguous KV parity test |
+| `FERROX_TEST_RECEIPT_CHECKPOINT` | The pinned Llama-3.1 Q4_K_M GGUF the checkpoint-receipt test hashes |
+| `FERROX_TEST_KIMI_SHARD_DIR` · `FERROX_TEST_KIMI_MOE_SHARD_DIR` · `FERROX_TEST_KIMI_TOKENIZER_PATH` | Kimi shards and tokenizer for the real-data tests |
+| `FERROX_TEST_INSPECT_PATH` | A real `.gguf` for the tensor-table dump in `ferrox-gguf` (a print, not an assertion) |
+| `FERROX_TEST_CHAT_TEMPLATE_NOW` | Pins `strftime_now`'s clock to Unix seconds so a template that stamps the date renders the same string every run. The only one of these read from library code rather than a test |
+
+Two more that are development tools rather than deployment settings:
+
+| Variable | Purpose |
+|---|---|
+| `FERROX_LLAMA_LOGITS` | Path to a locally built `llama_logits` reference dumper for `ferrox parity`. Otherwise `target/llama_logits`, then `.local-scripts/llama_logits`. `--dumper` is the flag form |
+| `FERROX_PRESET` | Only consulted when `FERROX_MODEL_PATH` is unset, and then only to name which architecture sketch `ferrox-server` should build **random weights** for (default `glm-5.2`). It logs a warning saying so. A served model never reaches this path |
+
+## Removed
+
+These were switches, not configuration: each one only chose between a
+default and a path that was slower, unproven, or produced deliberate
+garbage for profiling. They are gone and the default is now the only
+path. Setting them does nothing.
+
+`FERROX_METAL_MATMUL` · `FERROX_METAL_MUL_MM` · `FERROX_METAL_LOGITS` ·
+`FERROX_METAL_GREEDY_GPU` · `FERROX_METAL_WEIGHT_COPY` ·
+`FERROX_METAL_PREFILL_FUSE_O` · `FERROX_METAL_FA_EXT` ·
+`FERROX_METAL_FA_MMA` · `FERROX_METAL_FA_NQ` ·
+`FERROX_METAL_MOE_RESIDENT` · `FERROX_METAL_MOE_STACK` ·
+`FERROX_METAL_MOE_ABLATE` · `FERROX_METAL_MOE_FUSED_GATE_UP` ·
+`FERROX_METAL_MOE_GATE_THEN_SILU` · `FERROX_METAL_MOE_BARRIER_LOG` ·
+`FERROX_GEMV_DEDICATED` · `FERROX_GEMV_THREADS` ·
+`FERROX_MIN_TASK_MACS`

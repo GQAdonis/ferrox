@@ -7,8 +7,8 @@
     "FERROX_CPU_INT_DOT": "1"
   },
   "ferrox_version": "0.12.0",
-  "host_load_1min_end": 1.61,
-  "host_load_1min_start": 1.63,
+  "host_load_1min_end": 2.59,
+  "host_load_1min_start": 1.99,
   "host_thermal_end": {
     "cpu_speed_limit_percent": null,
     "degraded": false,
@@ -25,7 +25,7 @@
   },
   "id": "tinyllama_q8",
   "kind": "engine",
-  "load_s": 0.011040708,
+  "load_s": 0.012631,
   "model_path": "models/tinyllama-1.1b-chat-v1.0.Q8_0.gguf",
   "quant": "quantized",
   "quiet_host": true,
@@ -35,27 +35,27 @@
   "tests": [
     {
       "ferrox_samples": [
-        974.0272865564021,
-        970.3771213564451,
-        979.5730961519527
+        938.3054267401994,
+        951.9943976765937,
+        965.4281954530124
       ],
-      "ferrox_stddev": 3.7807357087783977,
-      "ferrox_tps": 974.0272865564021,
-      "gap": 2.0933499791455077,
-      "llama_tps": 2038.98,
+      "ferrox_stddev": 11.072987304667299,
+      "ferrox_tps": 951.9943976765937,
+      "gap": 2.0179110346535936,
+      "llama_tps": 1921.04,
       "test": "pp512",
       "workload_digest": "b8d417040110e751"
     },
     {
       "ferrox_samples": [
-        48.42615774261562,
-        48.3614900477343,
-        48.765626424471805
+        48.1324228301899,
+        48.10586673124629,
+        47.868924401693725
       ],
-      "ferrox_stddev": 0.17724656640615885,
-      "ferrox_tps": 48.42615774261562,
-      "gap": 2.267782643085,
-      "llama_tps": 109.82,
+      "ferrox_stddev": 0.11845220121065861,
+      "ferrox_tps": 48.10586673124629,
+      "gap": 2.151296859033203,
+      "llama_tps": 103.49,
       "test": "tg128",
       "workload_digest": "044655d19aa3baa5"
     }

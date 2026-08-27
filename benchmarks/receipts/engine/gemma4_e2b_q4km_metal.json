@@ -3,40 +3,63 @@
   "arch": "gemma4",
   "backend": "metal",
   "backend_active": "Metal",
-  "ferrox_version": "0.4.1",
+  "engine_env": {
+    "FERROX_CPU_INT_DOT": "1"
+  },
+  "ferrox_version": "0.12.0",
+  "host_load_1min_end": 3.11,
+  "host_load_1min_start": 1.99,
+  "host_thermal_end": {
+    "cpu_speed_limit_percent": null,
+    "degraded": false,
+    "measured": true,
+    "pressure": "nominal",
+    "source": "NSProcessInfo.thermalState"
+  },
+  "host_thermal_start": {
+    "cpu_speed_limit_percent": null,
+    "degraded": false,
+    "measured": true,
+    "pressure": "nominal",
+    "source": "NSProcessInfo.thermalState"
+  },
   "id": "gemma4_e2b_q4km",
   "kind": "engine",
-  "load_s": 0.366404375,
+  "load_s": 0.385559666,
   "model_path": "models/gemma-4-E2B-it-Q4_K_M.gguf",
   "quant": "quantized",
+  "quiet_host": true,
   "reps": 3,
-  "schema": 1,
+  "schema": 2,
   "size_bytes": 3106738272,
   "tests": [
     {
       "ferrox_samples": [
-        13.40017953851581,
-        13.49012852916696,
-        13.48343502552407
+        14.457260583979227,
+        14.236137766516169,
+        14.175720313736365
       ],
-      "ferrox_stddev": 0.040916038728597386,
-      "ferrox_tps": 13.48343502552407,
+      "ferrox_stddev": 0.12101904935983558,
+      "ferrox_tps": 14.236137766516169,
       "gap": null,
       "llama_tps": null,
-      "test": "pp512"
+      "test": "pp512",
+      "workload_digest": "b8d417040110e751"
     },
     {
       "ferrox_samples": [
-        14.927676428152234,
-        14.950199848303173,
-        15.120139773293689
+        15.71577344412002,
+        15.724082561456568,
+        15.69015394459142
       ],
-      "ferrox_stddev": 0.08591276052169088,
-      "ferrox_tps": 14.950199848303173,
+      "ferrox_stddev": 0.014439726180038217,
+      "ferrox_tps": 15.71577344412002,
       "gap": null,
       "llama_tps": null,
-      "test": "tg128"
+      "test": "tg128",
+      "workload_digest": "044655d19aa3baa5"
     }
   ],
-  "threads": 6
+  "threads": 6,
+  "warmup_reps": 1
 }

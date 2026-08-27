@@ -1,7 +1,7 @@
 //! `ferrox bench --suite` / `--render`: the llama-bench-shaped ledger.
 //!
-//! Numbers are `pp<N>` / `tg<N>` from `ferrox bench` vs `llama-bench` —
-//! no HTTP, template, tokenizer, or sampler. That is what a kernel
+//! Numbers are `pp<N>` / `tg<N>` from `ferrox bench` vs `llama-bench`,
+//! with no HTTP, template, tokenizer, or sampler. That is what a kernel
 //! change moves, and what [`benchmarks/RESULTS.md`](../../../benchmarks/RESULTS.md)
 //! quotes.
 //!
@@ -324,7 +324,7 @@ pub fn render(bench_dir: &Path) -> anyhow::Result<()> {
     table.push_str(BEGIN);
     table.push_str("\n\n## Engine (`ferrox bench` vs `llama-bench`)\n\n");
     table.push_str(
-        "No HTTP, no chat template, no tokenizer, no sampler — this is the engine\n\
+        "No HTTP, no chat template, no tokenizer, no sampler. This is the engine\n\
          alone. `pp512` is batched prefill, `tg128` is decode. **Neither engine's\n\
          thread count is forced**: each picks its own default, because llama.cpp\n\
          defaults to performance cores and loses 2–4× when pushed above them, so\n\

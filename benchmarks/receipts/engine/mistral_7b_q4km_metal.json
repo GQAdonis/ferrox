@@ -3,40 +3,63 @@
   "arch": "llama",
   "backend": "metal",
   "backend_active": "Metal",
-  "ferrox_version": "0.4.1",
+  "engine_env": {
+    "FERROX_CPU_INT_DOT": "1"
+  },
+  "ferrox_version": "0.12.0",
+  "host_load_1min_end": 1.67,
+  "host_load_1min_start": 1.75,
+  "host_thermal_end": {
+    "cpu_speed_limit_percent": null,
+    "degraded": false,
+    "measured": true,
+    "pressure": "nominal",
+    "source": "NSProcessInfo.thermalState"
+  },
+  "host_thermal_start": {
+    "cpu_speed_limit_percent": null,
+    "degraded": false,
+    "measured": true,
+    "pressure": "nominal",
+    "source": "NSProcessInfo.thermalState"
+  },
   "id": "mistral_7b_q4km",
   "kind": "engine",
-  "load_s": 0.036863917,
+  "load_s": 0.005169833,
   "model_path": "models/Mistral-7B-Instruct-v0.2-Q4_K_M.gguf",
   "quant": "quantized",
+  "quiet_host": true,
   "reps": 3,
-  "schema": 1,
+  "schema": 2,
   "size_bytes": 4368439584,
   "tests": [
     {
       "ferrox_samples": [
-        266.42205916245155,
-        266.56478435656317,
-        266.61252835443116
+        272.65058369923605,
+        272.899112724394,
+        272.807784155794
       ],
-      "ferrox_stddev": 0.08091729897452005,
-      "ferrox_tps": 266.56478435656317,
-      "gap": 1.050063685927793,
-      "llama_tps": 279.91,
-      "test": "pp512"
+      "ferrox_stddev": 0.10264262019828085,
+      "ferrox_tps": 272.807784155794,
+      "gap": 1.0265836103857815,
+      "llama_tps": 280.06,
+      "test": "pp512",
+      "workload_digest": "b8d417040110e751"
     },
     {
       "ferrox_samples": [
-        32.75066153777661,
-        32.53218451521965,
-        32.57416927885122
+        32.852505053238225,
+        32.92143072294144,
+        32.73979453604802
       ],
-      "ferrox_stddev": 0.09465988662524571,
-      "ferrox_tps": 32.57416927885122,
-      "gap": 0.9968020894728126,
-      "llama_tps": 32.47,
-      "test": "tg128"
+      "ferrox_stddev": 0.07486737386019683,
+      "ferrox_tps": 32.852505053238225,
+      "gap": 0.9859217720996093,
+      "llama_tps": 32.39,
+      "test": "tg128",
+      "workload_digest": "044655d19aa3baa5"
     }
   ],
-  "threads": 6
+  "threads": 6,
+  "warmup_reps": 1
 }

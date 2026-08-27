@@ -43,6 +43,7 @@ mod cache;
 mod cache_admin;
 mod cancel;
 mod chat_template;
+mod conversations;
 mod generate;
 mod health;
 mod hub;
@@ -4299,7 +4300,11 @@ async fn run(mcp_config_path: Option<PathBuf>, exit_on_stdin_close: bool) -> any
         .route(routes::ADMIN_DOWNLOAD, post(admin::download))
         .route(routes::ADMIN_TASKS, get(admin::tasks))
         .route(&admin::cancel_route(), post(admin::cancel_task))
-        .route(routes::ADMIN_STATS, get(admin::stats));
+        .route(routes::ADMIN_STATS, get(admin::stats))
+        // Server-side conversation storage, mounted here so it inherits
+        // the same key gate as the endpoint that generated the text it
+        // stores. Routes and store both live in `conversations`.
+        .merge(conversations::router());
 
     // Both off by default; set the corresponding env var to enable.
     // route_layer (not layer) so these apply only to the routes above,

@@ -33,6 +33,13 @@ export const routes = {
   stream: (requestId: string) => `/v1/stream/${encodeURIComponent(requestId)}`,
   streamPoll: (requestId: string) =>
     `/v1/stream/${encodeURIComponent(requestId)}/poll`,
+  conversations: "/v1/conversations",
+  conversation: (id: string) => `/v1/conversations/${encodeURIComponent(id)}`,
+  // A POST, not a DELETE: the server's CORS allow-list is GET + POST, so
+  // a DELETE would pass from curl and fail the preflight from a browser
+  // on any other origin. See `conversations.rs`.
+  conversationDelete: (id: string) =>
+    `/v1/conversations/${encodeURIComponent(id)}/delete`,
   adminModels: "/admin/models",
   adminModelsLoad: "/admin/models/load",
   adminModelsUnload: "/admin/models/unload",

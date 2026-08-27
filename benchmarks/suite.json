@@ -3,7 +3,7 @@
   "reps": 3,
   "n_prompt": 512,
   "n_gen": 128,
-  "workload": "ferrox bench vs llama-bench: pp512 + tg128 (median ± stddev, one warmup discarded)",
+  "workload": "ferrox bench vs llama-bench: pp512 + tg128 (median \u00b1 stddev, one warmup discarded)",
   "host_ram_gb": 32,
   "models": [
     {
@@ -74,7 +74,7 @@
       ],
       "estimated_ram_gb": 48,
       "expect": "ok",
-      "notes": "Grouped MoE + SWA; needs ≥48 GiB host — skip on Host B via --fit-host"
+      "notes": "Grouped MoE + SWA; needs \u226548 GiB host \u2014 skip on Host B via --fit-host"
     },
     {
       "id": "iq4_xs",
@@ -158,6 +158,66 @@
       "estimated_ram_gb": 5,
       "expect": "ok",
       "notes": "P6 PhiFamily (phi4 fused QKV); Host B receipt"
+    },
+    {
+      "id": "qwen15_moe_a27b_q4km",
+      "name": "Qwen1.5-MoE-A2.7B-Chat Q4_K_M",
+      "gguf": "models/Qwen1.5-MoE-A2.7B-Chat-Q4_K_M.gguf",
+      "backends": [
+        "cpu",
+        "metal"
+      ],
+      "estimated_ram_gb": 12,
+      "expect": "ok",
+      "notes": "Second MoE, and a different shape: SHARED experts, which OLMoE has none of. `metal_prefill_moe` refuses shared experts, so this row exercises a different execution route than every other MoE number here. MoE rested on OLMoE alone before this, since Mixtral does not fit on Host B"
+    },
+    {
+      "id": "llama32_1b_q5km",
+      "name": "Llama-3.2-1B-Instruct Q5_K_M",
+      "gguf": "models/Llama-3.2-1B-Instruct-Q5_K_M.gguf",
+      "backends": [
+        "cpu",
+        "metal"
+      ],
+      "estimated_ram_gb": 3,
+      "expect": "ok",
+      "notes": "Covers the Q5_K i8mm SMMLA kernel, which shipped with no ledger row. Same model as the Q4_K_M and IQ4_XS rows on purpose, so the quant is the only variable"
+    },
+    {
+      "id": "llama32_1b_q6k",
+      "name": "Llama-3.2-1B-Instruct Q6_K",
+      "gguf": "models/Llama-3.2-1B-Instruct-Q6_K.gguf",
+      "backends": [
+        "cpu",
+        "metal"
+      ],
+      "estimated_ram_gb": 3,
+      "expect": "ok",
+      "notes": "Covers the Q6_K i8mm SMMLA kernel, likewise unmeasured until now"
+    },
+    {
+      "id": "gemma2_2b_q4km",
+      "name": "Gemma-2-2B-IT Q4_K_M",
+      "gguf": "models/gemma-2-2b-it-Q4_K_M.gguf",
+      "backends": [
+        "cpu",
+        "metal"
+      ],
+      "estimated_ram_gb": 4,
+      "expect": "ok",
+      "notes": "The only benchmarked model that uses attention SOFTCAPPING; Gemma-3 dropped it. The CPU softmax work left the softcap on scalar libm because it was off on every red row, which was only true because nothing measured it"
+    },
+    {
+      "id": "llama31_8b_q4km",
+      "name": "Meta-Llama-3.1-8B-Instruct Q4_K_M",
+      "gguf": "models/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf",
+      "backends": [
+        "cpu",
+        "metal"
+      ],
+      "estimated_ram_gb": 8,
+      "expect": "ok",
+      "notes": "Second point in the 7-8B tier, which rested on Mistral-7B alone. The CPU gap scales inversely with size, so the large end needs more than one model"
     }
   ],
   "threads_note": "Not forced. Each engine picks its own default; llama.cpp uses performance cores and degrades 2-4x above them, so pinning both to one count flatters ferrox. Override with ferrox bench -t N / llama-bench -t N."

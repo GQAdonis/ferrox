@@ -7,6 +7,18 @@ Guidance for agents working in this repo.
 Pure-Rust GGUF / MoE inference engine: mmap loaders, quantized CPU +
 Metal + CUDA kernels, OpenAI-compatible `ferrox-server`.
 
+**The goal is to be the Rust alternative to llama.cpp**: same models,
+same command shapes, same or better performance, on the hardware people
+actually own. `docs/plans/north-star.md` is the ranking every other plan
+is read through, and `docs/plans/README.md` is the index.
+
+Honest position, audited 2026-08-27: of 150 catalog rows, about **12**
+run with evidence, ~90 refuse while naming what is missing, ~40 are
+unproven, and a handful load and are WRONG. llama.cpp hand-writes 140
+per-architecture graphs; `decoder.rs` is 6438 lines and that is why the
+counts differ. Do not read the architecture catalog as a support
+matrix.
+
 Capabilities: `docs/FEATURES.md`. Models & speed ledger: `docs/MODELS.md`,
 `benchmarks/RESULTS.md`. Planned: `docs/ROADMAP.md`.
 
@@ -21,6 +33,8 @@ Capabilities: `docs/FEATURES.md`. Models & speed ledger: `docs/MODELS.md`,
 | `benchmarks/RESULTS.md` | tok/s vs llama.cpp (Gap = llama/ferrox); `ferrox bench` ledger |
 | `benchmarks/README.md` | how `ferrox bench` / `llama-bench` is measured |
 | `docs/ROADMAP.md` | planned work |
+| `docs/plans/README.md` | **the plan index and priority order** |
+| `docs/plans/north-star.md` | the goal, and how plans are ranked against it |
 
 ## Commands
 
@@ -80,8 +94,12 @@ split, the global expert cache, page-keyed radix prefix caches
 (plain / sliding-window / recurrent), pool budgets, admission and
 chunked prefill, and the reasoning / tool-call output parsers. It has
 no tensors and no device memory, so every policy in it is testable on
-any host. Wired in today: the two parsers and the stop-string withhold
-rule; the cache and placement policies are groundwork (`docs/ROADMAP.md`).
+any host. Wired in today: the two parsers, the stop-string withhold rule, the
+radix prefix cache over paged KV, the scheduler, stats, maintenance,
+pool, rebuild, outbox, footprint and effort probing. STILL GROUNDWORK,
+and this is the gap that matters most: `expert_cache`, `expert_slots`,
+`placement` and `residency` hold the policy for running a model larger
+than memory, and nothing executes it except a compile-only CUDA pool.
 
 `ferrox-edge::expert_slots` is where that policy meets real memory: it
 executes the expert cache's copy plans against a bounded slot pool
@@ -94,6 +112,6 @@ Load path: GGUF mmap → keep quantized → fused dequant+dot →
 RMSNorm → GQA(+RoPE) → MoE/dense FFN. Serving: `FERROX_MODEL_PATH`
 GGUF or Kimi dir; generation on `spawn_blocking`.
 
-Presets `glm_5_2` / `deepseek_v4_pro` / `kimi_k3` are sketches —
+Presets `glm_5_2` / `deepseek_v4_pro` / `kimi_k3` are sketches,
 not proof of real-checkpoint support. `test_*_fixture` presets match
 Python test GGUFs only.

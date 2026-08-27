@@ -1,6 +1,17 @@
-//! Hugging Face Hub download helper (`hf download` when the CLI is installed).
+//! Hugging Face Hub download helper.
+//!
+//! This used to shell out to the `hf` CLI, which meant a Rust engine
+//! could not fetch its own weights without a Python install and
+//! `pip install huggingface_hub`. The transport is native now: see
+//! [`crate::hub`], which resolves IPv4 first, reads `HF_TOKEN`, honours
+//! `HF_ENDPOINT`, and asks for a byte range so an interrupted download
+//! resumes rather than starting from zero.
+//!
+//! `hf` is still used when it is on PATH and the native path is not
+//! compiled in, so an existing setup keeps working.
 
 use std::path::{Path, PathBuf};
+#[cfg(not(feature = "hub"))]
 use std::process::Command;
 
 /// True when `path` looks like a Hub repo id rather than a local file.
@@ -13,6 +24,7 @@ pub fn looks_like_hf_repo(path: &str) -> bool {
         && !path.starts_with('.')
 }
 
+#[cfg(not(feature = "hub"))]
 fn hf_available() -> bool {
     Command::new("hf")
         .arg("--version")
@@ -44,34 +56,43 @@ fn resolve_gguf_in_dir(dir: &Path) -> anyhow::Result<PathBuf> {
     })
 }
 
-/// Download `repo` via `hf download` and return a local `.gguf` path.
+/// Download `repo` and return a local `.gguf` path.
 pub fn pull_hf_gguf(
     repo: &str,
     file_pattern: &str,
     local_dir: Option<PathBuf>,
 ) -> anyhow::Result<PathBuf> {
-    if !hf_available() {
-        anyhow::bail!(
-            "Hugging Face CLI `hf` not found on PATH. Install: pip install huggingface_hub && hf auth login"
-        );
-    }
-
     let local_dir = local_dir.unwrap_or_else(|| default_cache_dir(repo));
     std::fs::create_dir_all(&local_dir)?;
 
-    let status = Command::new("hf")
-        .arg("download")
-        .arg(repo)
-        .arg(file_pattern)
-        .arg("--local-dir")
-        .arg(&local_dir)
-        .status()?;
-
-    if !status.success() {
-        anyhow::bail!("hf download failed for {repo}");
+    #[cfg(feature = "hub")]
+    {
+        crate::hub::fetch_to_dir(repo, file_pattern, &local_dir)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        resolve_gguf_in_dir(&local_dir)
     }
 
-    resolve_gguf_in_dir(&local_dir)
+    #[cfg(not(feature = "hub"))]
+    {
+        if !hf_available() {
+            anyhow::bail!(
+                "this build has no native downloader (feature `hub` is off) and the \
+                 Hugging Face CLI `hf` is not on PATH. Either install it with \
+                 `pip install huggingface_hub`, or use a ferrox build with `hub` on."
+            );
+        }
+        let status = Command::new("hf")
+            .arg("download")
+            .arg(repo)
+            .arg(file_pattern)
+            .arg("--local-dir")
+            .arg(&local_dir)
+            .status()?;
+        if !status.success() {
+            anyhow::bail!("hf download failed for {repo}");
+        }
+        resolve_gguf_in_dir(&local_dir)
+    }
 }
 
 /// If `model` is a Hub repo id, download and return the local GGUF path.

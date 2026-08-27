@@ -641,3 +641,236 @@ mod tests {
         assert_eq!(reading.source, Some("NSProcessInfo.thermalState"));
     }
 }
+
+/// What kind of machine a row was measured on, with nothing in it that
+/// identifies WHICH machine.
+///
+/// A receipt already records whether the host was quiet, but not what
+/// the host WAS. That was survivable while one laptop produced every
+/// row. It stops being survivable the moment a second machine exists:
+/// `--render` reads every receipt in the directory and would merge two
+/// machines into one table with no column that says so, which is the
+/// same silent mixing the version stamp was added to prevent.
+///
+/// DELIBERATELY ABSENT: hostname, user, serial number, MAC address,
+/// local IP. A receipt is checked into a public repository. The CPU
+/// model and the OS version are what make a number reproducible; the
+/// name of the laptop is not, and publishing it tells a reader
+/// something about its owner rather than about the measurement.
+#[derive(Debug, Clone, PartialEq)]
+pub struct HostSpec {
+    /// e.g. "Apple M2 Pro", "AMD Ryzen 9 7950X". None when the platform
+    /// will not say, which is reported rather than guessed.
+    pub cpu: Option<String>,
+    pub arch: &'static str,
+    /// Physical cores. On Apple silicon this is performance plus
+    /// efficiency, which is why `perf_cores` is separate: a 10-core M2
+    /// Pro runs engine threads on 6 of them, and a reader comparing it
+    /// to a 10-core x86 part needs to know that.
+    pub cores: Option<usize>,
+    pub perf_cores: Option<usize>,
+    pub ram_gb: Option<f64>,
+    /// e.g. "macOS 15.6", "Linux 6.8.0-45-generic".
+    pub os: Option<String>,
+}
+
+fn sysctl(key: &str) -> Option<String> {
+    let out = std::process::Command::new("sysctl")
+        .args(["-n", key])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let v = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!v.is_empty()).then_some(v)
+}
+
+/// The host's specification, never its identity.
+pub fn host_spec() -> HostSpec {
+    let arch = std::env::consts::ARCH;
+
+    #[cfg(target_os = "macos")]
+    let (cpu, cores, perf_cores, ram_gb, os) = {
+        let cpu = sysctl("machdep.cpu.brand_string");
+        let cores = sysctl("hw.physicalcpu").and_then(|v| v.parse().ok());
+        let perf = sysctl("hw.perflevel0.physicalcpu").and_then(|v| v.parse().ok());
+        let ram = sysctl("hw.memsize")
+            .and_then(|v| v.parse::<u64>().ok())
+            .map(|b| b as f64 / 1024.0 / 1024.0 / 1024.0);
+        let os = std::process::Command::new("sw_vers")
+            .arg("-productVersion")
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| format!("macOS {}", String::from_utf8_lossy(&o.stdout).trim()));
+        (cpu, cores, perf, ram, os)
+    };
+
+    #[cfg(target_os = "linux")]
+    let (cpu, cores, perf_cores, ram_gb, os) = {
+        let info = std::fs::read_to_string("/proc/cpuinfo").unwrap_or_default();
+        let cpu = info
+            .lines()
+            .find(|l| l.starts_with("model name"))
+            .and_then(|l| l.split_once(':'))
+            .map(|(_, v)| v.trim().to_string());
+        // Physical cores, not hyperthreads: count distinct
+        // (physical id, core id) pairs. Falls back to None rather than
+        // reporting thread count as core count, which would make a
+        // 16-thread 8-core part look like a 16-core one.
+        let mut pairs = std::collections::BTreeSet::new();
+        let (mut phys, mut core) = (None, None);
+        for line in info.lines() {
+            if let Some((k, v)) = line.split_once(':') {
+                match k.trim() {
+                    "physical id" => phys = v.trim().parse::<u32>().ok(),
+                    "core id" => core = v.trim().parse::<u32>().ok(),
+                    _ => {}
+                }
+            }
+            if line.trim().is_empty() {
+                if let (Some(p), Some(c)) = (phys, core) {
+                    pairs.insert((p, c));
+                }
+                phys = None;
+                core = None;
+            }
+        }
+        if let (Some(p), Some(c)) = (phys, core) {
+            pairs.insert((p, c));
+        }
+        let cores = (!pairs.is_empty()).then_some(pairs.len());
+        let ram_gb = std::fs::read_to_string("/proc/meminfo")
+            .ok()
+            .and_then(|m| {
+                m.lines()
+                    .find(|l| l.starts_with("MemTotal:"))
+                    .and_then(|l| l.split_whitespace().nth(1)?.parse::<f64>().ok())
+            })
+            .map(|kb| kb / 1024.0 / 1024.0);
+        let os = std::fs::read_to_string("/proc/sys/kernel/osrelease")
+            .ok()
+            .map(|r| format!("Linux {}", r.trim()));
+        (cpu, cores, None, ram_gb, os)
+    };
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    let (cpu, cores, perf_cores, ram_gb, os) = (None, None, None, None, None);
+
+    HostSpec {
+        cpu,
+        arch,
+        cores,
+        perf_cores,
+        ram_gb,
+        os,
+    }
+}
+
+/// A short label a table can group rows by, e.g.
+/// "Apple M2 Pro (10c) macOS 15.6". Stable for one machine and equal
+/// across two machines of the same specification, which is the point:
+/// rows that are comparable share a label.
+pub fn host_label(spec: &HostSpec) -> String {
+    let mut out = spec.cpu.clone().unwrap_or_else(|| spec.arch.to_string());
+    if let Some(c) = spec.cores {
+        out.push_str(&format!(" ({c}c"));
+        if let Some(p) = spec.perf_cores.filter(|p| *p != c) {
+            out.push_str(&format!("/{p}p"));
+        }
+        out.push(')');
+    }
+    if let Some(os) = &spec.os {
+        out.push(' ');
+        out.push_str(os);
+    }
+    out
+}
+
+#[cfg(test)]
+mod host_spec_tests {
+    use super::*;
+
+    /// A receipt is checked into a public repository, so the spec must
+    /// describe the machine without naming it.
+    #[test]
+    fn the_spec_carries_no_identifying_field() {
+        let spec = host_spec();
+        let rendered = format!("{spec:?}").to_lowercase();
+
+        // Whatever this machine is called, the spec must not say it.
+        if let Ok(host) = std::process::Command::new("hostname").output() {
+            let name = String::from_utf8_lossy(&host.stdout).trim().to_lowercase();
+            let stem = name.split('.').next().unwrap_or("").to_string();
+            if stem.len() > 3 {
+                assert!(
+                    !rendered.contains(&stem),
+                    "the host spec leaked this machine's name"
+                );
+            }
+        }
+        for (name, value) in [("USER", "user"), ("HOME", "home directory")] {
+            if let Ok(v) = std::env::var(name) {
+                let v = v.to_lowercase();
+                if v.len() > 3 {
+                    assert!(!rendered.contains(&v), "the host spec leaked the {value}");
+                }
+            }
+        }
+    }
+
+    /// Two machines of the same specification must produce the same
+    /// label, or grouping rows by host would split a comparable set.
+    #[test]
+    fn the_label_describes_the_kind_of_machine_not_the_instance() {
+        let a = HostSpec {
+            cpu: Some("Apple M2 Pro".into()),
+            arch: "aarch64",
+            cores: Some(10),
+            perf_cores: Some(6),
+            ram_gb: Some(32.0),
+            os: Some("macOS 15.6".into()),
+        };
+        assert_eq!(host_label(&a), "Apple M2 Pro (10c/6p) macOS 15.6");
+        assert_eq!(host_label(&a), host_label(&a.clone()));
+
+        // A part with no efficiency cores must not print a redundant
+        // "/10p" that implies a split it does not have.
+        let b = HostSpec {
+            cpu: Some("AMD Ryzen 9 7950X".into()),
+            arch: "x86_64",
+            cores: Some(16),
+            perf_cores: Some(16),
+            ram_gb: Some(128.0),
+            os: Some("Linux 6.8.0".into()),
+        };
+        assert_eq!(host_label(&b), "AMD Ryzen 9 7950X (16c) Linux 6.8.0");
+    }
+
+    /// An unknown field is reported as unknown rather than invented.
+    #[test]
+    fn nothing_is_guessed_when_the_platform_will_not_say() {
+        let bare = HostSpec {
+            cpu: None,
+            arch: "riscv64",
+            cores: None,
+            perf_cores: None,
+            ram_gb: None,
+            os: None,
+        };
+        assert_eq!(host_label(&bare), "riscv64");
+    }
+
+    /// On a supported platform the fields that make a number
+    /// reproducible must actually arrive.
+    #[test]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn a_supported_platform_reports_its_cpu_and_memory() {
+        let spec = host_spec();
+        assert!(spec.cpu.is_some(), "no CPU model on a supported platform");
+        assert!(spec.cores.unwrap_or(0) > 0, "no core count");
+        assert!(spec.ram_gb.unwrap_or(0.0) > 0.5, "no memory size");
+        assert!(spec.os.is_some(), "no OS version");
+    }
+}

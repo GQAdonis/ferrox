@@ -97,7 +97,7 @@ fn with_auth(req: ureq::Request) -> ureq::Request {
 /// same repo rather than depending on the order the API happens to
 /// return. A repo with several matching quantizations is ambiguous by
 /// construction; the caller can name one exactly to be sure.
-pub(crate) fn resolve_glob(repo: &str, pattern: &str) -> Result<String, String> {
+pub fn resolve_glob(repo: &str, pattern: &str) -> Result<String, String> {
     let url = format!("{}/api/models/{repo}", endpoint());
     let response = with_auth(agent().get(&url))
         .call()
@@ -123,26 +123,26 @@ pub(crate) fn resolve_glob(repo: &str, pattern: &str) -> Result<String, String> 
         // A repo may hold shards in subdirectories; a target this
         // server can safely write is a bare name in the repo root.
         .filter(|n| !n.contains('/'))
-        .find(|n| crate::admin::glob_matches(pattern, n))
+        .find(|n| glob_matches(pattern, n))
         .ok_or_else(|| format!("no file in {repo} matches '{pattern}'"))
 }
 
 /// An open response body plus what the caller needs to write it.
-pub(crate) struct HubFile {
-    pub(crate) body: Box<dyn Read + Send>,
+pub struct HubFile {
+    pub body: Box<dyn Read + Send>,
     /// Total size of the *whole* file when the server states one, not
     /// of the remaining range: the caller's progress counter is
     /// cumulative. `None` when there is no usable `Content-Length`,
     /// which is a real case and means an indeterminate progress bar
     /// rather than a fabricated total.
-    pub(crate) total_bytes: Option<u64>,
+    pub total_bytes: Option<u64>,
     /// True only on a `206`. See the module docs.
-    pub(crate) resumed: bool,
+    pub resumed: bool,
 }
 
 /// Opens `repo`/`filename` for reading, asking to resume at
 /// `resume_from` when that is non-zero.
-pub(crate) fn open_file(repo: &str, filename: &str, resume_from: u64) -> Result<HubFile, String> {
+pub fn open_file(repo: &str, filename: &str, resume_from: u64) -> Result<HubFile, String> {
     let url = format!("{}/{repo}/resolve/main/{filename}", endpoint());
     let mut req = with_auth(agent().get(&url));
     if resume_from > 0 {
@@ -173,6 +173,128 @@ pub(crate) fn open_file(repo: &str, filename: &str, resume_from: u64) -> Result<
 fn content_range_total(header: Option<&str>) -> Option<u64> {
     let total = header?.rsplit('/').next()?.trim();
     total.parse::<u64>().ok()
+}
+
+/// Matches a `*`-glob against a filename. `*` matches any run of
+/// characters including none; every other character is literal.
+///
+/// Enough for the Hub filename patterns people actually type
+/// (`*.gguf`, `*Q4_K_M*.gguf`) and small enough to read in one go.
+pub fn glob_matches(pattern: &str, name: &str) -> bool {
+    let segments: Vec<&str> = pattern.split('*').collect();
+    if segments.len() == 1 {
+        return pattern == name;
+    }
+    let mut rest = name;
+    if let Some(first) = segments.first() {
+        let Some(stripped) = rest.strip_prefix(first) else {
+            return false;
+        };
+        rest = stripped;
+    }
+    if let Some(last) = segments.last() {
+        let Some(stripped) = rest.strip_suffix(last) else {
+            return false;
+        };
+        // A pattern like "a*b" over "ab" leaves nothing between: fine.
+        rest = stripped;
+    }
+    for middle in segments
+        .iter()
+        .skip(1)
+        .take(segments.len().saturating_sub(2))
+    {
+        match rest.find(*middle) {
+            Some(at) => rest = &rest[at + middle.len()..],
+            None => return false,
+        }
+    }
+    true
+}
+
+/// Resolve `pattern` in `repo` and write the matching file into `dir`,
+/// resuming an interrupted download rather than starting over.
+///
+/// Returns the path written. Progress goes to `on_progress` so a CLI
+/// can draw a bar and a server can stay silent.
+pub fn fetch_to_dir_with_progress(
+    repo: &str,
+    pattern: &str,
+    dir: &std::path::Path,
+    mut on_progress: impl FnMut(u64, Option<u64>),
+) -> Result<std::path::PathBuf, String> {
+    use std::io::{Read, Write};
+
+    let filename = resolve_glob(repo, pattern)?;
+    std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    let final_path = dir.join(&filename);
+
+    // Resume needs the partial bytes to survive an interruption, but a
+    // partial file under the final name would later be opened as if it
+    // were a whole GGUF. So it lands beside the real name and is
+    // renamed only once the last byte is in.
+    let partial = dir.join(format!("{filename}.partial"));
+    if final_path.exists() {
+        return Ok(final_path);
+    }
+    let resume_from = std::fs::metadata(&partial).map(|m| m.len()).unwrap_or(0);
+
+    let mut hub = open_file(repo, &filename, resume_from)?;
+    // A server that ignores `Range` answers 200 with the whole file.
+    // Appending in that case would corrupt it, so what actually
+    // happened is read off the response, not off what was asked for.
+    let mut done = if hub.resumed { resume_from } else { 0 };
+    let mut out = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .append(hub.resumed)
+        .truncate(!hub.resumed)
+        .open(&partial)
+        .map_err(|e| format!("{}: {e}", partial.display()))?;
+
+    let mut buf = vec![0u8; 1 << 20];
+    loop {
+        let n = hub
+            .body
+            .read(&mut buf)
+            .map_err(|e| format!("reading {filename} from {repo} failed: {e}"))?;
+        if n == 0 {
+            break;
+        }
+        out.write_all(&buf[..n])
+            .map_err(|e| format!("{}: {e}", partial.display()))?;
+        done += n as u64;
+        on_progress(done, hub.total_bytes);
+    }
+    out.flush().map_err(|e| e.to_string())?;
+    // The rename must not outrun the bytes it publishes.
+    out.sync_all().map_err(|e| e.to_string())?;
+    drop(out);
+
+    // A short file is a truncated download. Renaming it would hand the
+    // loader a GGUF that ends in the middle of a tensor, so it stays
+    // under the partial name and the next run resumes it.
+    if let Some(total) = hub.total_bytes {
+        if done != total {
+            return Err(format!(
+                "{filename} stopped at {done} of {total} bytes. The partial file is kept \
+                 at {}, so running this again resumes rather than restarting.",
+                partial.display()
+            ));
+        }
+    }
+
+    std::fs::rename(&partial, &final_path).map_err(|e| e.to_string())?;
+    Ok(final_path)
+}
+
+/// [`fetch_to_dir_with_progress`] without the progress callback.
+pub fn fetch_to_dir(
+    repo: &str,
+    pattern: &str,
+    dir: &std::path::Path,
+) -> Result<std::path::PathBuf, String> {
+    fetch_to_dir_with_progress(repo, pattern, dir, |_, _| {})
 }
 
 #[cfg(test)]

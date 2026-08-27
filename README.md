@@ -83,7 +83,7 @@ curl -fsSL https://raw.githubusercontent.com/antonellof/ferrox/main/scripts/inst
 ```
 
 Installs `ferrox` and `ferrox-server` into `~/.local/bin` (override with
-`FERROX_INSTALL_DIR`, pin with `FERROX_VERSION=v0.12.0`). The downloaded
+`FERROX_INSTALL_DIR`, pin with `FERROX_VERSION=v0.13.0`). The downloaded
 `ferrox` is built with `serve`, so one binary runs completions and
 serves the API. `ferrox-server` ships alongside it so an existing one on
 your PATH keeps working. Prebuilts are macOS arm64 with Metal and Linux
@@ -112,9 +112,8 @@ need, including a C crypto library, so a CLI-only install stays small.
 ## Quick start
 
 ```bash
-# 1. Get a model (needs `pip install -U "huggingface_hub[cli]"`).
-mkdir -p models
-hf download bartowski/Llama-3.2-3B-Instruct-GGUF \
+# 1. Get a model. No Python, no huggingface_hub: same syntax as `hf download`.
+ferrox download bartowski/Llama-3.2-3B-Instruct-GGUF \
   Llama-3.2-3B-Instruct-Q4_K_M.gguf --local-dir models
 
 # 2. Run it. Ferrox evaluates the GGUF's own chat template and wraps your
@@ -145,7 +144,7 @@ belongs to an unrelated crate.
 
 ```toml
 [dependencies]
-ferrox-inference = "0.12"
+ferrox-inference = "0.13"
 ```
 
 ```rust

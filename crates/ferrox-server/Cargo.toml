@@ -29,7 +29,7 @@ ferrox-core = { workspace = true }
 # parsers this server's chat path uses, and the withhold rule that
 # `stop::StopMatcher` shares with them.
 ferrox-edge = { workspace = true }
-ferrox-models = { workspace = true }
+ferrox-models = { workspace = true, features = ["hub"] }
 ferrox-gguf = { workspace = true }
 ferrox-safetensors = { workspace = true }
 axum = { workspace = true }

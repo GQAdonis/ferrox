@@ -6,6 +6,7 @@ mod bench_guard;
 mod bench_model;
 mod bench_suite;
 mod chat;
+mod download;
 mod host_state;
 mod http;
 mod layer_divergence;
@@ -86,6 +87,9 @@ enum Commands {
     ServeBench(serve_bench::ServeBenchArgs),
     /// Download a GGUF from Hugging Face Hub (`hf download`).
     Pull(pull::PullArgs),
+
+    /// Download a GGUF from Hugging Face, same syntax as `hf download`.
+    Download(download::DownloadArgs),
     /// Print GGUF header metadata and tensor list for a model file.
     Inspect { path: String },
     /// Dry-run residency plan for a GGUF checkpoint: what it would
@@ -460,6 +464,7 @@ Or run the standalone binary:  ferrox-server -m model.gguf
 const SUBCOMMANDS: &[&str] = &[
     "run",
     "pull",
+    "download",
     "chat",
     "serve",
     "serve-bench",
@@ -654,6 +659,7 @@ fn main() -> anyhow::Result<()> {
         #[cfg(not(feature = "serve"))]
         Commands::Serve { .. } => anyhow::bail!(SERVE_FEATURE_MISSING),
         Commands::Pull(args) => pull::run_pull(args)?,
+        Commands::Download(args) => download::run(args)?,
         Commands::Inspect { path } => {
             let file = ShardedGguf::open(&path)?;
             if file.shard_count() > 1 {

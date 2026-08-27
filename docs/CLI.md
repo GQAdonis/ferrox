@@ -360,16 +360,46 @@ and would hand a swapped-in tensor another tensor's repacked bytes.
 Cost is one forward pass per tensor: about two minutes for a 1B model's
 112 tensors at 16 prompt tokens. `--layers 0:4` restricts the sweep.
 
-## Hugging Face Hub (`pull`)
+## Hugging Face Hub (`download`, `pull`)
 
-Download a GGUF via the [`hf` CLI](https://huggingface.co/docs/huggingface_hub/guides/cli) (install: `pip install huggingface_hub`):
+Fetches a GGUF over HTTPS directly. No Python and no
+`huggingface_hub` install: this used to shell out to the `hf` CLI, so a
+Rust engine could not fetch its own weights without a Python
+toolchain.
+
+`download` takes the same arguments as `hf download`, so a command
+copied off a model card runs unchanged:
 
 ```bash
-./target/release/ferrox pull org/model --file '*.gguf'
-# Prints the local path. Also works as: ferrox -m org/model (downloads when the path is missing)
+ferrox download bartowski/Llama-3.2-3B-Instruct-GGUF \
+  Llama-3.2-3B-Instruct-Q4_K_M.gguf --local-dir models
 ```
 
-Cache default: `~/.cache/ferrox/hf/<org--model>/`.
+`pull` is the older spelling, and prints the local path so it can be
+substituted into another command:
+
+```bash
+ferrox pull org/model --file '*.gguf'
+ferrox -m org/model      # downloads when the path is missing
+```
+
+Cache default for `pull`: `~/.cache/ferrox/hf/<org--model>/`.
+`download` defaults to `models/`.
+
+| Variable | Effect |
+|---|---|
+| `HF_TOKEN` or `HUGGING_FACE_HUB_TOKEN` | Sent as a bearer token, for gated or private repos |
+| `HF_ENDPOINT` | Mirror to fetch from instead of `huggingface.co` |
+
+An interrupted download resumes. The bytes land under
+`<name>.partial` and are renamed only once the last one arrives, so a
+truncated file is never left under a name the loader would open as a
+whole GGUF. If the server ignores the range request and restarts the
+body, that is detected from the response rather than assumed, so the
+file is rewritten instead of being appended to itself.
+
+A file already present is left alone rather than fetched again. When
+the pattern matches more than one file, it says so instead of picking.
 
 ## Interactive chat (`chat`)
 

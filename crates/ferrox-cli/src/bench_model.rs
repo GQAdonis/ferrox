@@ -820,6 +820,22 @@ fn write_receipt(
             "workload_digest": row.digest.hex(),
         }));
     }
+    // WHAT the machine was, never WHICH machine it was. A receipt is
+    // public, and `--render` reads every receipt in the directory:
+    // without this, rows from two hosts merge into one table with no
+    // column saying so.
+    let host_spec_json = {
+        let spec = host_state::host_spec();
+        serde_json::json!({
+            "label": host_state::host_label(&spec),
+            "cpu": spec.cpu,
+            "arch": spec.arch,
+            "cores": spec.cores,
+            "perf_cores": spec.perf_cores,
+            "ram_gb": spec.ram_gb.map(|g| (g * 10.0).round() / 10.0),
+            "os": spec.os,
+        })
+    };
     let receipt = serde_json::json!({
         "schema": 2,
         "kind": "engine",
@@ -843,6 +859,11 @@ fn write_receipt(
         // The single field an auditor reads first: was this row taken
         // under the measurement contract's quiet-host bar at all?
         "quiet_host": host.load_start.map(|l| l < host_state::DEFAULT_MAX_LOAD),
+        // WHAT the machine was, never WHICH machine it was. A receipt
+        // is public, and `--render` reads every receipt in the
+        // directory: without this, rows from two hosts merge into one
+        // table with no column that says so.
+        "host_spec": host_spec_json,
         // Non-default `FERROX_*` knobs in effect. Some of them (MoE
         // stage ablation, the fail-closed loader override) change how
         // much work the engine does, so a row taken under one is not

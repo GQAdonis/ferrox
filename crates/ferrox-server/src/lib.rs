@@ -46,7 +46,6 @@ mod chat_template;
 mod conversations;
 mod generate;
 mod health;
-mod hub;
 mod journal;
 mod json_mode;
 mod limits;

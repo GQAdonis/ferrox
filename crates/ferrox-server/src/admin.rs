@@ -749,43 +749,6 @@ pub(crate) fn sanitize_repo(repo: &str) -> Result<String, String> {
     Ok(repo.to_string())
 }
 
-/// Matches a `*`-glob against a filename. `*` matches any run of
-/// characters including none; every other character is literal.
-///
-/// Enough for the Hub filename patterns people actually type
-/// (`*.gguf`, `*Q4_K_M*.gguf`) and small enough to read in one go.
-pub(crate) fn glob_matches(pattern: &str, name: &str) -> bool {
-    let segments: Vec<&str> = pattern.split('*').collect();
-    if segments.len() == 1 {
-        return pattern == name;
-    }
-    let mut rest = name;
-    if let Some(first) = segments.first() {
-        let Some(stripped) = rest.strip_prefix(first) else {
-            return false;
-        };
-        rest = stripped;
-    }
-    if let Some(last) = segments.last() {
-        let Some(stripped) = rest.strip_suffix(last) else {
-            return false;
-        };
-        // A pattern like "a*b" over "ab" leaves nothing between: fine.
-        rest = stripped;
-    }
-    for middle in segments
-        .iter()
-        .skip(1)
-        .take(segments.len().saturating_sub(2))
-    {
-        match rest.find(*middle) {
-            Some(at) => rest = &rest[at + middle.len()..],
-            None => return false,
-        }
-    }
-    true
-}
-
 pub(crate) async fn download(
     State(state): State<Arc<AppState>>,
     Json(req): Json<DownloadRequest>,
@@ -860,7 +823,7 @@ pub(crate) async fn download(
 fn run_download_task(task: &Task, repo: &str, pattern: &str, dir: &Path) -> Result<(), String> {
     task.start();
     let filename = if pattern.contains('*') {
-        crate::hub::resolve_glob(repo, pattern)?
+        ferrox_models::hub::resolve_glob(repo, pattern)?
     } else {
         pattern.to_string()
     };
@@ -874,7 +837,7 @@ fn run_download_task(task: &Task, repo: &str, pattern: &str, dir: &Path) -> Resu
     let part = target.with_extension("gguf.part");
 
     let resume_from = std::fs::metadata(&part).map(|m| m.len()).unwrap_or(0);
-    let mut response = crate::hub::open_file(repo, &filename, resume_from)?;
+    let mut response = ferrox_models::hub::open_file(repo, &filename, resume_from)?;
     let mut file = if response.resumed {
         let mut f = std::fs::OpenOptions::new()
             .write(true)
@@ -1012,13 +975,28 @@ mod tests {
 
     #[test]
     fn globs_match_the_patterns_people_actually_type() {
-        assert!(glob_matches("*.gguf", "model-Q4_K_M.gguf"));
-        assert!(!glob_matches("*.gguf", "model.safetensors"));
-        assert!(glob_matches("*Q4_K_M*.gguf", "llama-3.2-3B-Q4_K_M-v2.gguf"));
-        assert!(!glob_matches("*Q4_K_M*.gguf", "llama-3.2-3B-Q8_0.gguf"));
-        assert!(glob_matches("exact.gguf", "exact.gguf"));
-        assert!(!glob_matches("exact.gguf", "other.gguf"));
-        assert!(glob_matches("*", "anything"));
+        assert!(ferrox_models::hub::glob_matches(
+            "*.gguf",
+            "model-Q4_K_M.gguf"
+        ));
+        assert!(!ferrox_models::hub::glob_matches(
+            "*.gguf",
+            "model.safetensors"
+        ));
+        assert!(ferrox_models::hub::glob_matches(
+            "*Q4_K_M*.gguf",
+            "llama-3.2-3B-Q4_K_M-v2.gguf"
+        ));
+        assert!(!ferrox_models::hub::glob_matches(
+            "*Q4_K_M*.gguf",
+            "llama-3.2-3B-Q8_0.gguf"
+        ));
+        assert!(ferrox_models::hub::glob_matches("exact.gguf", "exact.gguf"));
+        assert!(!ferrox_models::hub::glob_matches(
+            "exact.gguf",
+            "other.gguf"
+        ));
+        assert!(ferrox_models::hub::glob_matches("*", "anything"));
     }
 
     #[test]

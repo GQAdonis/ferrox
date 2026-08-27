@@ -37,6 +37,10 @@ base64 = "0.23.0"
 serde_json.workspace = true
 minijinja = { workspace = true }
 rayon = { workspace = true }
+# Only pulled in by the `hub` feature: the Hugging Face downloader needs
+# a TLS stack, and a consumer that loads a local GGUF should not pay for
+# it.
+ureq = { workspace = true, optional = true }
 
 [dev-dependencies]
 byteorder = { workspace = true }
@@ -45,4 +49,7 @@ half = { workspace = true }
 [features]
 default = []
 cuda = ["ferrox-moe/cuda", "ferrox-cuda/cuda"]
+# The Hugging Face downloader. Optional because it drags a TLS stack in,
+# and a consumer that only loads a local GGUF should not pay for it.
+hub = ["dep:ureq"]
 metal = ["ferrox-moe/metal", "ferrox-metal/metal"]

@@ -299,6 +299,38 @@ pub fn render(bench_dir: &Path) -> anyhow::Result<()> {
         gap: Option<f64>,
     }
 
+    // Rows from two machines are not one table.
+    //
+    // `render` reads every receipt in the directory, so the moment a
+    // second host writes one, its numbers would sort in beside this
+    // one's under a single heading with nothing saying so. A reader
+    // comparing a 5.06x row against a 1.41x row would be comparing two
+    // computers. Receipts written before 0.13.0 carry no spec at all,
+    // and they group together as one unknown host rather than being
+    // waved through individually.
+    let mut hosts: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for r in &receipts {
+        hosts.insert(
+            r.get("host_spec")
+                .and_then(|h| h.get("label"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("unrecorded (receipt written before 0.13.0)")
+                .to_string(),
+        );
+    }
+    if hosts.len() > 1 {
+        anyhow::bail!(
+            "receipts under {} come from {} different hosts, and one table cannot \
+             describe them:\n  {}\nA gap is only meaningful against the machine it \
+             was measured on. Keep one host's receipts per directory, or re-measure \
+             the rows you want to publish on a single machine.",
+            dir.display(),
+            hosts.len(),
+            hosts.iter().cloned().collect::<Vec<_>>().join("\n  ")
+        );
+    }
+    let host_line = hosts.iter().next().cloned().unwrap_or_default();
+
     let mut rows: Vec<Row> = Vec::new();
     for r in &receipts {
         let id = r.get("id").and_then(|v| v.as_str()).unwrap_or("?");
@@ -357,6 +389,11 @@ pub fn render(bench_dir: &Path) -> anyhow::Result<()> {
     let mut table = String::new();
     table.push_str(BEGIN);
     table.push_str("\n\n## Engine (`ferrox bench` vs `llama-bench`)\n\n");
+    // Which machine, stated in the generated block rather than in prose
+    // above it, so it cannot drift away from the numbers it describes.
+    if !host_line.is_empty() {
+        table.push_str(&format!("Measured on: **{host_line}**\n\n"));
+    }
     table.push_str(
         "No HTTP, no chat template, no tokenizer, no sampler. This is the engine\n\
          alone. `pp512` is batched prefill, `tg128` is decode. **Neither engine's\n\

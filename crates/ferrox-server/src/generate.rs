@@ -306,6 +306,11 @@ impl PagedLease {
         let block_size = self.block_size();
         self.slide(position, block_size);
         self.extend_to(position, block_size);
+        // `debug_assert!` still TYPE-CHECKS its argument in release, so
+        // calling a `#[cfg(debug_assertions)]` method from inside one
+        // does not compile without debug assertions. The cfg has to be
+        // on the call, not only on the definition.
+        #[cfg(debug_assertions)]
         debug_assert!(
             self.tables_match_groups(),
             "a sliding lease must own every block its tables name"

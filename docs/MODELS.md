@@ -90,7 +90,7 @@ partly implements will load, run fast, and return fluent text computed
 by the wrong maths, and nothing in the output tells you. An error you
 can read beats output you cannot trust.
 
-The error always names the reason. Four things cause it:
+The error always names the reason. Five things cause it:
 
 1. **Ferrox does not know the architecture.** It is not in the
    capability registry.
@@ -128,6 +128,18 @@ The error always names the reason. Four things cause it:
    of that right gives you a model that loads, runs, and returns wrong
    answers with nothing in the output to say so. That is the outcome
    this check exists to prevent.
+
+5. **The architecture encodes position some other way than RoPE.** The
+   generic decoder rotates every Q and K head of every layer. `gpt2`
+   uses a learned absolute position table instead; `mpt`, `refact`,
+   `bloom` and `jais` use ALiBi. All five stop with the reason named.
+   This is the least visible failure of the five: `bloom` and `refact`
+   hardcode their ALiBi slope in llama.cpp's own loader and carry no
+   GGUF key at all, and `mpt` leaves no unread tensor behind, so neither
+   check 3 nor check 4 could ever see them. `baichuan` is the same
+   problem conditionally: the 7B rotates, the 13B uses ALiBi, and
+   llama.cpp tells them apart by layer count alone, so a 40-layer
+   Baichuan is refused and a 32-layer one is not.
 
 `FERROX_ALLOW_UNKNOWN_TENSORS=1` loads the checkpoint anyway and accepts
 whatever comes out. Use it while you debug, not to get past the error

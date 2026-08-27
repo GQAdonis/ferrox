@@ -48,6 +48,43 @@ fn f16_from_bytes(b: &[u8]) -> f32 {
     f16::from_le_bytes([b[0], b[1]]).to_f32()
 }
 
+/// Which `×4` GEMM kernel this host runs, resolved once instead of once
+/// per call.
+///
+/// The `gemm_*_group_x4` entry points are called once per (row-group ×
+/// activation-quad) pair, which on a `pp512` projection is 10^4 to 10^5
+/// calls per GEMM. Each one used to re-run `is_aarch64_feature_detected!`,
+/// whose relaxed atomic load LLVM cannot hoist out of the caller's loop.
+/// Callers now probe once per matmul and pass the answer down through the
+/// `_on` variants; [`gemm_q4_kx8_group_x4`] and its siblings stay as
+/// probe-per-call wrappers so existing callers and tests are unchanged.
+///
+/// This is a dispatch decision only. Both arms compute the same values,
+/// bit-identically, which is what the `*_x4_portable_is_bit_exact_vs_scalar_gemv`
+/// tests assert. Forcing [`AccelX4::Portable`] on an i8mm host is therefore
+/// a valid (slow) way to run, and the tests use it that way.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum AccelX4 {
+    /// ARM i8mm `SMMLA` kernels in [`neon`].
+    NeonI8mm,
+    /// The portable scalar reference.
+    Portable,
+}
+
+impl AccelX4 {
+    /// The fastest kernel available on this host.
+    #[inline]
+    pub fn detect() -> Self {
+        #[cfg(target_arch = "aarch64")]
+        {
+            if std::arch::is_aarch64_feature_detected!("i8mm") {
+                return AccelX4::NeonI8mm;
+            }
+        }
+        AccelX4::Portable
+    }
+}
+
 /// Pack eight canonical Q4_K super-blocks (same column-block index) into
 /// one `block_q4_Kx8`. `interleave` is 4 (ARM DotProd) or 8 (x86 / ARM i8mm).
 pub fn make_block_q4_kx8(
@@ -687,6 +724,29 @@ pub fn gemm_q8_0x4_group_x4(
     interleave: usize,
     out: &mut [f32],
 ) {
+    gemm_q8_0x4_group_x4_on(
+        packed,
+        group,
+        tile,
+        n_cols,
+        interleave,
+        AccelX4::detect(),
+        out,
+    );
+}
+
+/// [`gemm_q8_0x4_group_x4`] with the kernel choice already made; see
+/// [`AccelX4`].
+#[inline]
+pub fn gemm_q8_0x4_group_x4_on(
+    packed: &[u8],
+    group: usize,
+    tile: &Q8ActsX4,
+    n_cols: usize,
+    interleave: usize,
+    accel: AccelX4,
+    out: &mut [f32],
+) {
     assert_eq!(
         interleave, 8,
         "the x4 GEMM only exists for interleave-8 packing"
@@ -702,12 +762,13 @@ pub fn gemm_q8_0x4_group_x4(
     let slice = &packed[off..off + nb * Q8_0X4_BLOCK_BYTES];
 
     #[cfg(target_arch = "aarch64")]
-    if std::arch::is_aarch64_feature_detected!("i8mm") {
+    if accel == AccelX4::NeonI8mm {
         unsafe {
             neon::gemm_q8_0x4_q8_0_neon_i8mm(slice, tile, n_cols, out);
         }
         return;
     }
+    let _ = accel;
     gemm_q8_0x4_acts_x4_scalar_8(slice, tile, n_cols, out);
 }
 
@@ -917,6 +978,30 @@ pub fn gemm_q4_kx8_group_x4(
     interleave: usize,
     out: &mut [f32],
 ) {
+    gemm_q4_kx8_group_x4_on(
+        packed,
+        group,
+        tile,
+        n_cols,
+        interleave,
+        AccelX4::detect(),
+        out,
+    );
+}
+
+/// [`gemm_q4_kx8_group_x4`] with the kernel choice already made. Hoist
+/// [`AccelX4::detect`] out of the (row-group × quad) loop and pass it here;
+/// see [`AccelX4`].
+#[inline]
+pub fn gemm_q4_kx8_group_x4_on(
+    packed: &[u8],
+    group: usize,
+    tile: &Q8KActsX4,
+    n_cols: usize,
+    interleave: usize,
+    accel: AccelX4,
+    out: &mut [f32],
+) {
     assert_eq!(
         interleave, 8,
         "the x4 GEMM only exists for interleave-8 packing"
@@ -932,12 +1017,13 @@ pub fn gemm_q4_kx8_group_x4(
     let slice = &packed[off..off + nb * Q4_KX8_BLOCK_BYTES];
 
     #[cfg(target_arch = "aarch64")]
-    if std::arch::is_aarch64_feature_detected!("i8mm") {
+    if accel == AccelX4::NeonI8mm {
         unsafe {
             neon::gemm_q4_kx8_q8_k_neon_i8mm(slice, tile, n_cols, out);
         }
         return;
     }
+    let _ = accel;
     gemm_q4_kx8_acts_x4_scalar_8(slice, tile, n_cols, out);
 }
 
@@ -1439,6 +1525,29 @@ pub fn gemm_q5_kx8_group_x4(
     interleave: usize,
     out: &mut [f32],
 ) {
+    gemm_q5_kx8_group_x4_on(
+        packed,
+        group,
+        tile,
+        n_cols,
+        interleave,
+        AccelX4::detect(),
+        out,
+    );
+}
+
+/// [`gemm_q5_kx8_group_x4`] with the kernel choice already made; see
+/// [`AccelX4`].
+#[inline]
+pub fn gemm_q5_kx8_group_x4_on(
+    packed: &[u8],
+    group: usize,
+    tile: &Q8KActsX4,
+    n_cols: usize,
+    interleave: usize,
+    accel: AccelX4,
+    out: &mut [f32],
+) {
     assert_eq!(
         interleave, 8,
         "the x4 GEMM only exists for interleave-8 packing"
@@ -1454,12 +1563,13 @@ pub fn gemm_q5_kx8_group_x4(
     let slice = &packed[off..off + nb * Q5_KX8_BLOCK_BYTES];
 
     #[cfg(target_arch = "aarch64")]
-    if std::arch::is_aarch64_feature_detected!("i8mm") {
+    if accel == AccelX4::NeonI8mm {
         unsafe {
             neon::gemm_q5_kx8_q8_k_neon_i8mm(slice, tile, n_cols, out);
         }
         return;
     }
+    let _ = accel;
     gemm_q5_kx8_acts_x4_scalar_8(slice, tile, n_cols, out);
 }
 
@@ -2008,6 +2118,29 @@ pub fn gemm_q6_kx8_group_x4(
     interleave: usize,
     out: &mut [f32],
 ) {
+    gemm_q6_kx8_group_x4_on(
+        packed,
+        group,
+        tile,
+        n_cols,
+        interleave,
+        AccelX4::detect(),
+        out,
+    );
+}
+
+/// [`gemm_q6_kx8_group_x4`] with the kernel choice already made; see
+/// [`AccelX4`].
+#[inline]
+pub fn gemm_q6_kx8_group_x4_on(
+    packed: &[u8],
+    group: usize,
+    tile: &Q8KActsX4,
+    n_cols: usize,
+    interleave: usize,
+    accel: AccelX4,
+    out: &mut [f32],
+) {
     assert_eq!(
         interleave, 8,
         "the x4 GEMM only exists for interleave-8 packing"
@@ -2023,12 +2156,13 @@ pub fn gemm_q6_kx8_group_x4(
     let slice = &packed[off..off + nb * Q6_KX8_BLOCK_BYTES];
 
     #[cfg(target_arch = "aarch64")]
-    if std::arch::is_aarch64_feature_detected!("i8mm") {
+    if accel == AccelX4::NeonI8mm {
         unsafe {
             neon::gemm_q6_kx8_q8_k_neon_i8mm(slice, tile, n_cols, out);
         }
         return;
     }
+    let _ = accel;
     gemm_q6_kx8_acts_x4_scalar_8(slice, tile, n_cols, out);
 }
 
@@ -2381,6 +2515,29 @@ pub fn gemm_q4_0x4_group_x4(
     interleave: usize,
     out: &mut [f32],
 ) {
+    gemm_q4_0x4_group_x4_on(
+        packed,
+        group,
+        tile,
+        n_cols,
+        interleave,
+        AccelX4::detect(),
+        out,
+    );
+}
+
+/// [`gemm_q4_0x4_group_x4`] with the kernel choice already made; see
+/// [`AccelX4`].
+#[inline]
+pub fn gemm_q4_0x4_group_x4_on(
+    packed: &[u8],
+    group: usize,
+    tile: &Q8ActsX4,
+    n_cols: usize,
+    interleave: usize,
+    accel: AccelX4,
+    out: &mut [f32],
+) {
     assert_eq!(
         interleave, 8,
         "the x4 GEMM only exists for interleave-8 packing"
@@ -2396,12 +2553,13 @@ pub fn gemm_q4_0x4_group_x4(
     let slice = &packed[off..off + nb * Q4_0X4_BLOCK_BYTES];
 
     #[cfg(target_arch = "aarch64")]
-    if std::arch::is_aarch64_feature_detected!("i8mm") {
+    if accel == AccelX4::NeonI8mm {
         unsafe {
             neon::gemm_q4_0x4_q8_0_neon_i8mm(slice, tile, n_cols, out);
         }
         return;
     }
+    let _ = accel;
     gemm_q4_0x4_acts_x4_scalar_8(slice, tile, n_cols, out);
 }
 
@@ -5426,6 +5584,112 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// `AccelX4` only chooses a kernel; it must never change an answer.
+    ///
+    /// Two claims, for all five `×4` GEMMs at once. First, passing the
+    /// host's own [`AccelX4::detect`] to the `_on` entry point is
+    /// bit-identical to letting the probing wrapper detect per call -- that
+    /// is what lets `apply_batch` hoist the probe out of a 10^5-iteration
+    /// loop. Second, [`AccelX4::Portable`] really does select the portable
+    /// kernel even on an i8mm host, so the scalar reference stays reachable
+    /// and the `_portable_is_bit_exact_vs_scalar_gemv` tests keep meaning
+    /// something on this machine.
+    #[test]
+    fn accel_x4_only_picks_a_kernel_it_never_changes_the_answer() {
+        let na = 3;
+        let here = AccelX4::detect();
+
+        // Q4_K / Q5_K / Q6_K share the Q8_K activation quad.
+        {
+            let n_blocks = 3;
+            let cols = n_blocks * Q4_K_BLOCK_ELEMS;
+            let acts = synth_q8_k_acts(na, cols);
+            let tile = prepare_q8_k_acts_x4(&acts, cols);
+
+            let mut q4 = Vec::new();
+            let mut q5 = Vec::new();
+            let mut q6 = Vec::new();
+            for r in 0..Q4_KX8_NROWS {
+                q4.extend_from_slice(&synth_q4_k_row(n_blocks, (r * 7 + 2) as u8));
+                q5.extend_from_slice(&synth_q5_k_row(n_blocks, (r * 3 + 5) as u8));
+                q6.extend_from_slice(&synth_q6_k_row(n_blocks, (r * 11 + 1) as u8));
+            }
+            let q4 = pack_q4_k_matrix_x8(&q4, Q4_KX8_NROWS, cols, 8);
+            let q5 = pack_q5_k_matrix_x8(&q5, Q5_KX8_NROWS, cols, 8);
+            let q6 = pack_q6_k_matrix_x8(&q6, Q6_KX8_NROWS, cols, 8);
+
+            let mut wrapper = vec![0f32; Q4_KX8_NROWS * na];
+            let mut hoisted = vec![0f32; Q4_KX8_NROWS * na];
+            let mut portable = vec![0f32; Q4_KX8_NROWS * na];
+            let mut reference = vec![0f32; Q4_KX8_NROWS * na];
+
+            gemm_q4_kx8_group_x4(&q4, 0, &tile, cols, 8, &mut wrapper);
+            gemm_q4_kx8_group_x4_on(&q4, 0, &tile, cols, 8, here, &mut hoisted);
+            gemm_q4_kx8_group_x4_on(&q4, 0, &tile, cols, 8, AccelX4::Portable, &mut portable);
+            gemm_q4_kx8_acts_x4_scalar_8(&q4, &tile, cols, &mut reference);
+            assert_bits_eq("q4_k hoisted", &hoisted, &wrapper);
+            assert_bits_eq("q4_k portable", &portable, &reference);
+
+            gemm_q5_kx8_group_x4(&q5, 0, &tile, cols, 8, &mut wrapper);
+            gemm_q5_kx8_group_x4_on(&q5, 0, &tile, cols, 8, here, &mut hoisted);
+            gemm_q5_kx8_group_x4_on(&q5, 0, &tile, cols, 8, AccelX4::Portable, &mut portable);
+            gemm_q5_kx8_acts_x4_scalar_8(&q5, &tile, cols, &mut reference);
+            assert_bits_eq("q5_k hoisted", &hoisted, &wrapper);
+            assert_bits_eq("q5_k portable", &portable, &reference);
+
+            gemm_q6_kx8_group_x4(&q6, 0, &tile, cols, 8, &mut wrapper);
+            gemm_q6_kx8_group_x4_on(&q6, 0, &tile, cols, 8, here, &mut hoisted);
+            gemm_q6_kx8_group_x4_on(&q6, 0, &tile, cols, 8, AccelX4::Portable, &mut portable);
+            gemm_q6_kx8_acts_x4_scalar_8(&q6, &tile, cols, &mut reference);
+            assert_bits_eq("q6_k hoisted", &hoisted, &wrapper);
+            assert_bits_eq("q6_k portable", &portable, &reference);
+        }
+
+        // Q8_0 / Q4_0 share the Q8_0 activation quad.
+        {
+            let n_blocks = 4;
+            let cols = n_blocks * Q8_0_BLOCK_ELEMS;
+            let acts = synth_q8_0_acts(na, cols);
+            let tile = prepare_q8_acts_x4(&acts, cols);
+
+            let mut q8 = Vec::new();
+            let mut q4 = Vec::new();
+            for r in 0..Q8_0X4_NROWS {
+                q8.extend_from_slice(&synth_q8_0_row(n_blocks, (r * 9 + 4) as u8));
+                q4.extend_from_slice(&synth_q4_0_row(n_blocks, (r * 13 + 6) as u8));
+            }
+            let q8 = pack_q8_0_matrix_x4(&q8, Q8_0X4_NROWS, cols, 8);
+            let q4 = pack_q4_0_matrix_x4(&q4, Q4_0X4_NROWS, cols, 8);
+
+            let mut wrapper = vec![0f32; Q8_0X4_NROWS * na];
+            let mut hoisted = vec![0f32; Q8_0X4_NROWS * na];
+            let mut portable = vec![0f32; Q8_0X4_NROWS * na];
+            let mut reference = vec![0f32; Q8_0X4_NROWS * na];
+
+            gemm_q8_0x4_group_x4(&q8, 0, &tile, cols, 8, &mut wrapper);
+            gemm_q8_0x4_group_x4_on(&q8, 0, &tile, cols, 8, here, &mut hoisted);
+            gemm_q8_0x4_group_x4_on(&q8, 0, &tile, cols, 8, AccelX4::Portable, &mut portable);
+            gemm_q8_0x4_acts_x4_scalar_8(&q8, &tile, cols, &mut reference);
+            assert_bits_eq("q8_0 hoisted", &hoisted, &wrapper);
+            assert_bits_eq("q8_0 portable", &portable, &reference);
+
+            gemm_q4_0x4_group_x4(&q4, 0, &tile, cols, 8, &mut wrapper);
+            gemm_q4_0x4_group_x4_on(&q4, 0, &tile, cols, 8, here, &mut hoisted);
+            gemm_q4_0x4_group_x4_on(&q4, 0, &tile, cols, 8, AccelX4::Portable, &mut portable);
+            gemm_q4_0x4_acts_x4_scalar_8(&q4, &tile, cols, &mut reference);
+            assert_bits_eq("q4_0 hoisted", &hoisted, &wrapper);
+            assert_bits_eq("q4_0 portable", &portable, &reference);
+        }
+    }
+
+    fn assert_bits_eq(what: &str, got: &[f32], want: &[f32]) {
+        assert_eq!(
+            got.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            want.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            "{what}: {got:?} vs {want:?}"
+        );
     }
 
     #[test]

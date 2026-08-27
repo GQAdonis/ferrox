@@ -230,9 +230,27 @@ pub fn gelu(x: f32) -> f32 {
 }
 
 /// Elementwise gated FFN combine: gelu(gate) * up (Gemma GeGLU).
+///
+/// **The tanh is gone and the answers moved. Both are on purpose.**
+///
+/// `gelu` above spends a libm `tanhf` per element, which does not
+/// vectorize and does not inline: on Gemma-3-1B CPU `pp512` it was 10.7%
+/// of all non-idle samples in the process. The identity
+/// `0.5·x·(1 + tanh(u)) == x / (1 + exp(-2u))` turns that into one
+/// vectorized exponential, and [`expf_neon`] / [`expf_avx2`] do four or
+/// eight at a time.
+///
+/// The rewrite is also *more* accurate on the side that matters, which is
+/// why it clears the "no less accurate than what it replaces" bar rather
+/// than merely getting close to it. For `x` negative, `tanh(u) → -1`, so
+/// `1 + tanh(u)` is a difference of nearly equal numbers and loses most of
+/// its significant bits; `1 + exp(-2u)` is a sum of a large term and 1 and
+/// loses none. `geglu_is_no_less_accurate_than_the_tanh_form_it_replaces`
+/// measures both against an `f64` evaluation of the same formula and
+/// pins it.
 pub fn geglu(gate: &[f32], up: &[f32]) -> Vec<f32> {
     assert_eq!(gate.len(), up.len());
-    par_gated(gate, up, |g, u| gelu(g) * u)
+    par_gated_chunks(gate, up, gelu_mul)
 }
 
 /// Threshold above which the elementwise FFN activations fork to Rayon.
@@ -241,36 +259,396 @@ pub fn geglu(gate: &[f32], up: &[f32]) -> Vec<f32> {
 /// Gemma-3-1B is 3.5 M elements per layer.
 const GATED_PAR_MIN: usize = 1 << 15;
 
-/// Elementwise `f(gate[i], up[i])` over the whole pair, forked to Rayon
+/// Run a gated-activation kernel over the whole pair, forked to Rayon
 /// past [`GATED_PAR_MIN`].
 ///
 /// Prefill ran these serially on the calling thread while every other
 /// core sat in the FFN's fork-join: on Gemma-3-1B CPU `pp512`, `tanhf`
 /// under `geglu` was 10.7% of *all* non-idle samples in the process and
-/// 3682 of its 3688 samples were on the main thread alone. Chunking is
-/// bit-exact — no reduction, each output element depends only on its
-/// own inputs.
+/// 3682 of its 3688 samples were on the main thread alone.
+///
+/// `f` takes slices rather than one element, so the kernel can hold a
+/// vector register across a run instead of being called per lane.
+/// Chunking stays bit-exact for the same reason it always was — no
+/// reduction, each output element depends only on its own inputs — and
+/// the chunk length is a multiple of 16, so it never splits a 4- or
+/// 8-lane group and the vector arms cannot see a boundary either.
 #[inline]
-fn par_gated<F>(gate: &[f32], up: &[f32], f: F) -> Vec<f32>
+fn par_gated_chunks<F>(gate: &[f32], up: &[f32], f: F) -> Vec<f32>
 where
-    F: Fn(f32, f32) -> f32 + Sync + Send,
+    F: Fn(&[f32], &[f32], &mut [f32]) + Sync + Send,
 {
     let n = gate.len();
-    if n < GATED_PAR_MIN {
-        return gate.iter().zip(up.iter()).map(|(g, u)| f(*g, *u)).collect();
-    }
     let mut out = vec![0f32; n];
+    if n < GATED_PAR_MIN {
+        f(gate, up, &mut out);
+        return out;
+    }
     // Cache-line-aligned chunks so no two tasks share a 64-byte line.
     let chunk = (n.div_ceil(rayon::current_num_threads() * 4)).next_multiple_of(16);
     out.par_chunks_mut(chunk)
         .zip(gate.par_chunks(chunk))
         .zip(up.par_chunks(chunk))
-        .for_each(|((o, g), u)| {
-            for ((o, g), u) in o.iter_mut().zip(g.iter()).zip(u.iter()) {
-                *o = f(*g, *u);
-            }
-        });
+        .for_each(|((o, g), u)| f(g, u, o));
     out
+}
+
+/// `out[i] = gelu(gate[i]) * up[i]`, vectorized where there is a vector
+/// exponential and falling back to the scalar [`gelu`] where there is not.
+fn gelu_mul(gate: &[f32], up: &[f32], out: &mut [f32]) {
+    debug_assert_eq!(gate.len(), up.len());
+    debug_assert_eq!(gate.len(), out.len());
+    #[cfg(target_arch = "aarch64")]
+    {
+        if std::arch::is_aarch64_feature_detected!("neon") {
+            unsafe { gelu_mul_neon(gate, up, out) };
+            return;
+        }
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {
+            unsafe { gelu_mul_avx2(gate, up, out) };
+            return;
+        }
+    }
+    for ((o, g), u) in out.iter_mut().zip(gate.iter()).zip(up.iter()) {
+        *o = gelu(*g) * *u;
+    }
+}
+
+/// `out[i] = silu(gate[i]) * up[i]`, same shape as [`gelu_mul`].
+fn silu_mul(gate: &[f32], up: &[f32], out: &mut [f32]) {
+    debug_assert_eq!(gate.len(), up.len());
+    debug_assert_eq!(gate.len(), out.len());
+    #[cfg(target_arch = "aarch64")]
+    {
+        if std::arch::is_aarch64_feature_detected!("neon") {
+            unsafe { silu_mul_neon(gate, up, out) };
+            return;
+        }
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {
+            unsafe { silu_mul_avx2(gate, up, out) };
+            return;
+        }
+    }
+    for ((o, g), u) in out.iter_mut().zip(gate.iter()).zip(up.iter()) {
+        *o = silu(*g) * *u;
+    }
+}
+
+// The `ggml_v_expf` constants (`ggml/src/ggml-cpu/vec.h`), used only by
+// the vector arms below -- gated so a host with neither SIMD arm still
+// compiles clean under `-D warnings`.
+//
+// `crate::attention` carries its own private copy of this kernel for the
+// softmax. THEY ARE THE SAME ROUTINE AND SHOULD LIVE IN ONE MODULE; this
+// copy exists only because that one is private to `attention` and this
+// branch does not own that file. Whoever merges them: the two differ in
+// exactly one way, the clamp, and the difference is load-bearing --
+// see [`EXP_CLAMP`].
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+mod exp_consts {
+    /// `0x1.8p23`: adding this to `x·log2(e)` rounds it to an integer and
+    /// parks that integer in the mantissa's low bits.
+    pub const EXP_SHIFT: f32 = 12582912.0;
+    /// `log2(e)`.
+    pub const EXP_LOG2E: f32 = std::f32::consts::LOG2_E;
+    /// High half of `ln 2`, chosen with trailing zero bits so `n · ln2_hi`
+    /// is exact in `f32`.
+    pub const EXP_LN2_HI: f32 = 0.693_145_75;
+    /// Low half of `ln 2`.
+    pub const EXP_LN2_LO: f32 = 1.428_606_8e-6;
+    /// Minimax coefficients for `e^b - 1` on `[-ln2/2, ln2/2]`.
+    pub const EXP_C0: f32 = 0.999_999_4;
+    pub const EXP_C1: f32 = 0.499_991_27;
+    pub const EXP_C2: f32 = 0.166_683_96;
+    pub const EXP_C3: f32 = 0.041_899_767;
+    pub const EXP_C4: f32 = 0.008_247_39;
+    /// **Clamped on BOTH sides, unlike the softmax copy in `attention`,
+    /// and that is the whole difference between the two.**
+    ///
+    /// This kernel drops `ggml_v_expf`'s overflow branch, which is only
+    /// sound while `|n| <= 126`. A softmax argument is `score - row_max`,
+    /// hence never positive, so the softmax copy clamps from below alone.
+    /// A gated-activation argument is `-x` (SiLU) or `-2u` (GELU) and has
+    /// no sign at all, so an upper clamp is required or a large negative
+    /// input walks `bits(z) << 23` straight out of the exponent field and
+    /// returns garbage rather than infinity.
+    ///
+    /// `87` is where clamping stops costing anything *below*: `exp(-87)`
+    /// is already under `f32::MIN_POSITIVE`, and `87 · log2(e)` is
+    /// `125.5`, which keeps `n` inside the fast path's range with room.
+    ///
+    /// Above it the clamp alone is NOT harmless, and this is the trap:
+    /// the value appears as the denominator `x / (1 + exp(t))`, so a
+    /// saturated `exp` divides a numerator that has no bound of its own.
+    /// At `x = -1e30` the true `t` is infinite and the answer is `-0`,
+    /// while `x / (1 + exp(87))` is `-1.6e-8` -- a real number where there
+    /// should be nothing. So the vector arms do not merely clamp on the
+    /// high side, they *select*: `t >= EXP_CLAMP` yields zero. That is
+    /// exact to within `1.5e-37`, because `t >= 87` only happens where the
+    /// activation itself has collapsed (`x <= -10` for GELU, `x <= -87`
+    /// for SiLU) and it collapses far faster than `|x|` grows.
+    pub const EXP_CLAMP: f32 = 87.0;
+    /// `sqrt(2/pi)`, the GELU tanh approximation's outer constant.
+    pub const GELU_K: f32 = 0.797_884_6;
+    /// `-2 · GELU_K`: `gelu(x) = x / (1 + exp(x·(A + B·x²)))` with
+    /// `A = -2K` and `B = -2KC`, which is `0.5·x·(1 + tanh(K·(x + C·x³)))`
+    /// rearranged so no cancellation is left in it.
+    pub const GELU_A: f32 = -2.0 * GELU_K;
+    /// `-2 · GELU_K · 0.044715`.
+    pub const GELU_B: f32 = -2.0 * GELU_K * 0.044_715;
+}
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+use exp_consts::*;
+
+/// `exp(x)` for four lanes: ARM optimized-routines' `expf`, the shape
+/// llama.cpp vendors as `ggml_v_expf`. Accurate to under an ulp.
+///
+/// `z = fma(x, log2(e), 0x1.8p23)` rounds `x·log2(e)` to an integer `n`
+/// and leaves it in the low mantissa bits of `z`, so `bits(z) << 23` is
+/// the exponent field of `2^n`. `b = x - n·ln2_hi - n·ln2_lo` is the
+/// reduced argument in `[-ln2/2, ln2/2]`, and the degree-5 polynomial
+/// evaluates `e^b - 1` there.
+///
+/// The input is clamped to `±EXP_CLAMP` first, which is what lets the
+/// overflow branch of the original be dropped; read [`EXP_CLAMP`] before
+/// widening it.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+#[inline]
+unsafe fn expf_neon(x: std::arch::aarch64::float32x4_t) -> std::arch::aarch64::float32x4_t {
+    use std::arch::aarch64::*;
+    let x = vminq_f32(
+        vmaxq_f32(x, vdupq_n_f32(-EXP_CLAMP)),
+        vdupq_n_f32(EXP_CLAMP),
+    );
+    let r = vdupq_n_f32(EXP_SHIFT);
+    let z = vfmaq_f32(r, x, vdupq_n_f32(EXP_LOG2E));
+    let n = vsubq_f32(z, r);
+    // `b = x - n*ln2_hi - n*ln2_lo`; `vfmsq_f32(a, b, c) == a - b*c`.
+    let b = vfmsq_f32(
+        vfmsq_f32(x, n, vdupq_n_f32(EXP_LN2_HI)),
+        n,
+        vdupq_n_f32(EXP_LN2_LO),
+    );
+    let e = vshlq_n_u32::<23>(vreinterpretq_u32_f32(z));
+    let k = vreinterpretq_f32_u32(vaddq_u32(e, vreinterpretq_u32_f32(vdupq_n_f32(1.0))));
+    let u = vmulq_f32(b, b);
+    let j = vfmaq_f32(
+        vmulq_f32(vdupq_n_f32(EXP_C0), b),
+        vfmaq_f32(
+            vfmaq_f32(vdupq_n_f32(EXP_C1), vdupq_n_f32(EXP_C2), b),
+            vfmaq_f32(vdupq_n_f32(EXP_C3), vdupq_n_f32(EXP_C4), b),
+            u,
+        ),
+        u,
+    );
+    vfmaq_f32(k, j, k)
+}
+
+/// One-lane [`expf_neon`], op for op, so a kernel's scalar tail computes
+/// the same bits as its vector body.
+///
+/// A libm `expf` here instead would make the answer depend on where the
+/// slice happens to end, and prefill and decode do not end in the same
+/// place. `mul_add` is the scalar FMA the vector arms use lane-wise, and
+/// both round once, so this is equality and not approximation --
+/// `parallel_gated_activations_are_bit_identical_to_the_serial_form`
+/// asserts it by pushing every element through this path.
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+#[inline]
+fn expf_scalar(x: f32) -> f32 {
+    let x = x.clamp(-EXP_CLAMP, EXP_CLAMP);
+    let z = x.mul_add(EXP_LOG2E, EXP_SHIFT);
+    let n = z - EXP_SHIFT;
+    let b = (-n).mul_add(EXP_LN2_LO, (-n).mul_add(EXP_LN2_HI, x));
+    let k = f32::from_bits((z.to_bits() << 23).wrapping_add(1.0f32.to_bits()));
+    let u = b * b;
+    let j = EXP_C4
+        .mul_add(b, EXP_C3)
+        .mul_add(u, EXP_C2.mul_add(b, EXP_C1))
+        .mul_add(u, EXP_C0 * b);
+    j.mul_add(k, k)
+}
+
+/// AVX2 sibling of [`expf_neon`]: same constants, same polynomial, same
+/// two-sided clamp, eight lanes.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+#[inline]
+unsafe fn expf_avx2(x: std::arch::x86_64::__m256) -> std::arch::x86_64::__m256 {
+    use std::arch::x86_64::*;
+    let x = _mm256_min_ps(
+        _mm256_max_ps(x, _mm256_set1_ps(-EXP_CLAMP)),
+        _mm256_set1_ps(EXP_CLAMP),
+    );
+    let r = _mm256_set1_ps(EXP_SHIFT);
+    let z = _mm256_fmadd_ps(x, _mm256_set1_ps(EXP_LOG2E), r);
+    let n = _mm256_sub_ps(z, r);
+    let b = _mm256_fnmadd_ps(
+        n,
+        _mm256_set1_ps(EXP_LN2_LO),
+        _mm256_fnmadd_ps(n, _mm256_set1_ps(EXP_LN2_HI), x),
+    );
+    let e = _mm256_slli_epi32::<23>(_mm256_castps_si256(z));
+    let k = _mm256_castsi256_ps(_mm256_add_epi32(
+        e,
+        _mm256_castps_si256(_mm256_set1_ps(1.0)),
+    ));
+    let u = _mm256_mul_ps(b, b);
+    let j = _mm256_fmadd_ps(
+        _mm256_fmadd_ps(
+            _mm256_fmadd_ps(_mm256_set1_ps(EXP_C4), b, _mm256_set1_ps(EXP_C3)),
+            u,
+            _mm256_fmadd_ps(_mm256_set1_ps(EXP_C2), b, _mm256_set1_ps(EXP_C1)),
+        ),
+        u,
+        _mm256_mul_ps(_mm256_set1_ps(EXP_C0), b),
+    );
+    _mm256_fmadd_ps(j, k, k)
+}
+
+/// `x / (1 + exp(t))`, with the saturating branch [`EXP_CLAMP`] describes:
+/// once `t` reaches the clamp the true quotient is below `1.5e-37`, and
+/// returning it rather than dividing by a saturated exponential is what
+/// keeps a large negative input from producing a real number.
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+#[inline]
+fn gate_by_exp_scalar(x: f32, t: f32) -> f32 {
+    if t >= EXP_CLAMP {
+        0.0
+    } else {
+        x / (1.0 + expf_scalar(t))
+    }
+}
+
+/// `t = -2·K·(g + C·g³)`, written as `g·(A + B·g²)` so it is one multiply
+/// and one FMA. GELU's exponent argument.
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+#[inline]
+fn gelu_exp_arg(g: f32) -> f32 {
+    g * GELU_B.mul_add(g * g, GELU_A)
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn gelu_mul_neon(gate: &[f32], up: &[f32], out: &mut [f32]) {
+    use std::arch::aarch64::*;
+    let n = out.len();
+    let nv = n & !3;
+    let one = vdupq_n_f32(1.0);
+    let zero = vdupq_n_f32(0.0);
+    let a = vdupq_n_f32(GELU_A);
+    let b = vdupq_n_f32(GELU_B);
+    let sat = vdupq_n_f32(EXP_CLAMP);
+    let mut i = 0;
+    while i < nv {
+        let g = vld1q_f32(gate.as_ptr().add(i));
+        // `t = g * (A + B*g^2)`, i.e. `-2*K*(g + C*g^3)`.
+        let t = vmulq_f32(g, vfmaq_f32(a, b, vmulq_f32(g, g)));
+        let y = vdivq_f32(g, vaddq_f32(one, expf_neon(t)));
+        let y = vbslq_f32(vcgeq_f32(t, sat), zero, y);
+        vst1q_f32(
+            out.as_mut_ptr().add(i),
+            vmulq_f32(y, vld1q_f32(up.as_ptr().add(i))),
+        );
+        i += 4;
+    }
+    for j in nv..n {
+        let g = *gate.get_unchecked(j);
+        *out.get_unchecked_mut(j) = gate_by_exp_scalar(g, gelu_exp_arg(g)) * *up.get_unchecked(j);
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn silu_mul_neon(gate: &[f32], up: &[f32], out: &mut [f32]) {
+    use std::arch::aarch64::*;
+    let n = out.len();
+    let nv = n & !3;
+    let one = vdupq_n_f32(1.0);
+    let zero = vdupq_n_f32(0.0);
+    let sat = vdupq_n_f32(EXP_CLAMP);
+    let mut i = 0;
+    while i < nv {
+        let g = vld1q_f32(gate.as_ptr().add(i));
+        let t = vnegq_f32(g);
+        let y = vdivq_f32(g, vaddq_f32(one, expf_neon(t)));
+        let y = vbslq_f32(vcgeq_f32(t, sat), zero, y);
+        vst1q_f32(
+            out.as_mut_ptr().add(i),
+            vmulq_f32(y, vld1q_f32(up.as_ptr().add(i))),
+        );
+        i += 4;
+    }
+    for j in nv..n {
+        let g = *gate.get_unchecked(j);
+        *out.get_unchecked_mut(j) = gate_by_exp_scalar(g, -g) * *up.get_unchecked(j);
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn gelu_mul_avx2(gate: &[f32], up: &[f32], out: &mut [f32]) {
+    use std::arch::x86_64::*;
+    let n = out.len();
+    let nv = n & !7;
+    let one = _mm256_set1_ps(1.0);
+    let zero = _mm256_setzero_ps();
+    let a = _mm256_set1_ps(GELU_A);
+    let b = _mm256_set1_ps(GELU_B);
+    let sat = _mm256_set1_ps(EXP_CLAMP);
+    let mut i = 0;
+    while i < nv {
+        let g = _mm256_loadu_ps(gate.as_ptr().add(i));
+        let t = _mm256_mul_ps(g, _mm256_fmadd_ps(b, _mm256_mul_ps(g, g), a));
+        let y = _mm256_div_ps(g, _mm256_add_ps(one, expf_avx2(t)));
+        let y = _mm256_blendv_ps(y, zero, _mm256_cmp_ps::<_CMP_GE_OQ>(t, sat));
+        _mm256_storeu_ps(
+            out.as_mut_ptr().add(i),
+            _mm256_mul_ps(y, _mm256_loadu_ps(up.as_ptr().add(i))),
+        );
+        i += 8;
+    }
+    for j in nv..n {
+        let g = *gate.get_unchecked(j);
+        *out.get_unchecked_mut(j) = gate_by_exp_scalar(g, gelu_exp_arg(g)) * *up.get_unchecked(j);
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn silu_mul_avx2(gate: &[f32], up: &[f32], out: &mut [f32]) {
+    use std::arch::x86_64::*;
+    let n = out.len();
+    let nv = n & !7;
+    let one = _mm256_set1_ps(1.0);
+    let zero = _mm256_setzero_ps();
+    let neg = _mm256_set1_ps(-0.0);
+    let sat = _mm256_set1_ps(EXP_CLAMP);
+    let mut i = 0;
+    while i < nv {
+        let g = _mm256_loadu_ps(gate.as_ptr().add(i));
+        // `-g` as a sign flip, so `-0.0` negates to `0.0` exactly as
+        // NEON's `vnegq_f32` does and the two arms cannot disagree there.
+        let t = _mm256_xor_ps(g, neg);
+        let y = _mm256_div_ps(g, _mm256_add_ps(one, expf_avx2(t)));
+        let y = _mm256_blendv_ps(y, zero, _mm256_cmp_ps::<_CMP_GE_OQ>(t, sat));
+        _mm256_storeu_ps(
+            out.as_mut_ptr().add(i),
+            _mm256_mul_ps(y, _mm256_loadu_ps(up.as_ptr().add(i))),
+        );
+        i += 8;
+    }
+    for j in nv..n {
+        let g = *gate.get_unchecked(j);
+        *out.get_unchecked_mut(j) = gate_by_exp_scalar(g, -g) * *up.get_unchecked(j);
+    }
 }
 
 /// Plain (non-RMS) LayerNorm -- ggml's `LLM_NORM` (as opposed to
@@ -306,9 +684,16 @@ pub fn silu(x: f32) -> f32 {
 
 /// Elementwise gated FFN combine: silu(gate) * up, the standard SwiGLU
 /// pairing used inside both dense and MoE-expert feed-forward blocks.
+///
+/// Same rewrite as [`geglu`], and it reaches far more of the ledger:
+/// [`silu`] was already the cancellation-free `x / (1 + exp(-x))` form,
+/// so this changes only *which* exponential runs, from a scalar libm
+/// `expf` per element to four or eight lanes at a time. Every SwiGLU
+/// model on the CPU rows goes through here — TinyLlama, SmolLM2, Qwen,
+/// Mistral, Llama — not just the Gemma family that named the todo.
 pub fn swiglu(gate: &[f32], up: &[f32]) -> Vec<f32> {
     assert_eq!(gate.len(), up.len());
-    par_gated(gate, up, |g, u| silu(g) * u)
+    par_gated_chunks(gate, up, silu_mul)
 }
 
 /// Kimi K3's `situ` activation (`hidden_act: "situ"` in its real
@@ -335,13 +720,26 @@ pub fn situ_and_mul(gate: &[f32], up: &[f32], beta: f32, linear_beta: f32) -> Ve
 mod tests {
     use super::*;
 
+    /// Decode and prefill must compute the same bits from the same
+    /// weights. Decode runs one row through the serial arm, prefill runs
+    /// `batch x ffn_dim` through the Rayon arm, and the vector kernel sees
+    /// a different tail split in each -- so the claim is not "chunking is
+    /// elementwise, therefore fine", it is that the kernel's own vector
+    /// and scalar-tail paths agree everywhere the split can fall.
+    ///
+    /// The reference is the kernel applied to one element at a time, which
+    /// puts every lane through the scalar tail. It is deliberately NOT
+    /// `silu(g) * u`: the scalar [`silu`] and [`gelu`] keep libm and are
+    /// still the reference for the CUDA and Metal ports and for `kda` /
+    /// `gdn`, while these two run the vector exponential. The distance
+    /// between them is what the accuracy test below measures.
     #[test]
     fn parallel_gated_activations_are_bit_identical_to_the_serial_form() {
         // Straddle GATED_PAR_MIN so both arms are covered, and use a
-        // length that is not a multiple of the chunk size. Elementwise
-        // with no reduction, so "close enough" is not the bar: every
-        // bit must match, or prefill and decode disagree on the same
-        // model.
+        // length that is not a multiple of the chunk size or of a vector
+        // width. Elementwise with no reduction, so "close enough" is not
+        // the bar: every bit must match, or prefill and decode disagree
+        // on the same model.
         for n in [7usize, GATED_PAR_MIN - 1, GATED_PAR_MIN, 300_007] {
             let gate: Vec<f32> = (0..n)
                 .map(|i| ((i as f32) * 0.0037 - 4.0).sin() * 6.0)
@@ -350,19 +748,193 @@ mod tests {
                 .map(|i| ((i as f32) * 0.0041 + 1.0).cos() * 2.5)
                 .collect();
 
-            let want_swi: Vec<f32> = gate
-                .iter()
-                .zip(up.iter())
-                .map(|(g, u)| silu(*g) * u)
-                .collect();
-            assert_eq!(swiglu(&gate, &up), want_swi, "swiglu at n = {n}");
+            let one_at_a_time = |f: fn(&[f32], &[f32], &mut [f32])| -> Vec<f32> {
+                let mut out = vec![0f32; n];
+                for i in 0..n {
+                    f(&gate[i..i + 1], &up[i..i + 1], &mut out[i..i + 1]);
+                }
+                out
+            };
+            assert_eq!(
+                swiglu(&gate, &up),
+                one_at_a_time(silu_mul),
+                "swiglu at n = {n}"
+            );
+            assert_eq!(
+                geglu(&gate, &up),
+                one_at_a_time(gelu_mul),
+                "geglu at n = {n}"
+            );
+        }
+    }
 
-            let want_ge: Vec<f32> = gate
-                .iter()
-                .zip(up.iter())
-                .map(|(g, u)| gelu(*g) * u)
-                .collect();
-            assert_eq!(geglu(&gate, &up), want_ge, "geglu at n = {n}");
+    /// The bar for replacing a libm call in a hot loop is not "the output
+    /// did not change" -- it did change -- but "the output is no less
+    /// accurate than what it replaced", measured against a reference
+    /// neither side can flatter.
+    ///
+    /// **The obvious reference is the wrong one, and finding that out is
+    /// half of what this test is for.** Evaluating
+    /// `0.5·x·(1 + tanh(u))` in `f64` cancels for the same reason the
+    /// `f32` version does: `tanh(u) → -1` for `x` negative, so `1 + tanh(u)`
+    /// is a difference of nearly equal numbers in `f64` too, and past
+    /// `x ≈ -7` the "reference" is itself noise. It scored the vector form
+    /// at `1.97e22` relative error against a value that had already
+    /// collapsed. The reference here is therefore the algebraically
+    /// identical `x / (1 + exp(-2u))` in `f64`, which has no subtraction
+    /// in it at all.
+    ///
+    /// Two metrics, because they answer different questions and the
+    /// rewrite does not win both.
+    ///
+    /// 1. Scaled by `|x|` -- how much absolute error this contributes to
+    ///    the sum it feeds. GELU: `1.13e-7` vs `9.74e-8`, so the vector
+    ///    form is 1.16x behind, both at one to two ulp of `|x|`; the extra
+    ///    rounding is the divide. SiLU: identical to the last digit.
+    /// 2. Scaled by `|gelu(x)|` -- whether the returned number is itself
+    ///    right. Here the rewrite is not marginally better but categorically
+    ///    so: over 240001 samples the tanh form loses more than 0.1% of the
+    ///    value at 5047 of them, up to and including every significant bit,
+    ///    and the new form at none.
+    ///
+    /// So the assertions are: nobody may lose a value (metric 2), and the
+    /// absolute contribution may not slip by more than a quarter ulp
+    /// (metric 1). Both numbers above are what the code measures today, so
+    /// a regression in either direction fires.
+    #[test]
+    fn geglu_and_swiglu_are_no_less_accurate_than_the_libm_forms_they_replace() {
+        /// Worst error under both metrics, plus how many samples lost more
+        /// than 0.1% of the value.
+        ///
+        /// The `1e-30` floor on metric 2 is not a fudge: below it the
+        /// activation cannot change any `f32` sum it participates in, and
+        /// both forms flush to zero there anyway, which would otherwise
+        /// score as 100% error for both and hide the real difference.
+        fn sweep(
+            reference: fn(f64) -> f64,
+            vector: fn(f32) -> f32,
+            libm: fn(f32) -> f32,
+        ) -> (f64, f64, u32, u32) {
+            let (mut v_abs, mut l_abs) = (0f64, 0f64);
+            let (mut v_lost, mut l_lost) = (0u32, 0u32);
+            let mut i = -120_000i32;
+            while i <= 120_000 {
+                let x = i as f32 * 0.001;
+                let want = reference(x as f64);
+                let (v, l) = (vector(x) as f64 - want, libm(x) as f64 - want);
+                let scale = (x as f64).abs().max(1e-30);
+                v_abs = v_abs.max(v.abs() / scale);
+                l_abs = l_abs.max(l.abs() / scale);
+                if want.abs() >= 1e-30 {
+                    v_lost += u32::from(v.abs() / want.abs() > 1e-3);
+                    l_lost += u32::from(l.abs() / want.abs() > 1e-3);
+                }
+                i += 1;
+            }
+            (v_abs, l_abs, v_lost, l_lost)
+        }
+
+        /// The tanh-approximation GELU rearranged so it does not cancel,
+        /// with `sqrt(2/pi)` to full precision rather than the `f32`
+        /// constant either implementation rounds it to.
+        fn gelu_f64(x: f64) -> f64 {
+            const K: f64 = 0.797_884_560_802_865_4;
+            let u = K * (x + 0.044_715 * x * x * x);
+            x / (1.0 + (-2.0 * u).exp())
+        }
+        fn silu_f64(x: f64) -> f64 {
+            x / (1.0 + (-x).exp())
+        }
+        fn vec_gelu(x: f32) -> f32 {
+            let mut out = [0f32; 1];
+            gelu_mul(&[x], &[1.0], &mut out);
+            out[0]
+        }
+        fn vec_silu(x: f32) -> f32 {
+            let mut out = [0f32; 1];
+            silu_mul(&[x], &[1.0], &mut out);
+            out[0]
+        }
+
+        for (what, reference, vector, libm) in [
+            (
+                "GELU",
+                gelu_f64 as fn(f64) -> f64,
+                vec_gelu as fn(f32) -> f32,
+                gelu as fn(f32) -> f32,
+            ),
+            ("SiLU", silu_f64, vec_silu, silu),
+        ] {
+            let (v_abs, l_abs, v_lost, l_lost) = sweep(reference, vector, libm);
+            assert_eq!(
+                v_lost, 0,
+                "vector {what} lost more than 0.1% of the value at {v_lost} samples \
+                 (the form it replaces: {l_lost})"
+            );
+            assert!(
+                v_lost <= l_lost,
+                "vector {what} loses values the form it replaces kept: {v_lost} vs {l_lost}"
+            );
+            assert!(
+                v_abs <= l_abs * 1.25,
+                "vector {what} contributes more absolute error than the form it \
+                 replaces: {v_abs:e} vs {l_abs:e}"
+            );
+        }
+    }
+
+    /// The clamp is only free where [`EXP_CLAMP`] says it is, and the
+    /// saturating select is what makes the high side true.
+    ///
+    /// Without it a large negative input walks `bits(z) << 23` out of the
+    /// exponent field, or -- worse, because it looks like an answer --
+    /// divides an unbounded numerator by a saturated exponential and
+    /// returns `-1.6e-8` for `gelu(-1e30)`, which should be `-0`. The
+    /// tolerance is absolute rather than relative because everything here
+    /// is either exactly the input or smaller than any `f32` sum can
+    /// notice.
+    #[test]
+    fn the_two_sided_clamp_leaves_the_saturating_tails_correct() {
+        fn gelu_f64(x: f64) -> f64 {
+            const K: f64 = 0.797_884_560_802_865_4;
+            let u = K * (x + 0.044_715 * x * x * x);
+            x / (1.0 + (-2.0 * u).exp())
+        }
+        for x in [
+            -1e30f32, -1e10, -1000.0, -120.0, -88.0, -12.0, -10.0, 10.0, 12.0, 20.0, 120.0, 1000.0,
+            1e30,
+        ] {
+            let mut g = [0f32; 1];
+            gelu_mul(&[x], &[1.0], &mut g);
+            let mut s = [0f32; 1];
+            silu_mul(&[x], &[1.0], &mut s);
+            assert!(g[0].is_finite() || x.abs() > 1e20, "gelu({x}) = {}", g[0]);
+            assert!(s[0].is_finite() || x.abs() > 1e20, "silu({x}) = {}", s[0]);
+
+            // A `f64` reference that does not cancel; anything past the
+            // clamp has collapsed far below what an `f32` sum resolves.
+            let want_g = gelu_f64(x as f64);
+            let want_s = (x as f64) / (1.0 + (-(x as f64)).exp());
+            assert!(
+                (g[0] as f64 - want_g).abs() <= 1e-30 + 1e-6 * want_g.abs(),
+                "gelu({x}) = {} want {want_g:e}",
+                g[0]
+            );
+            assert!(
+                (s[0] as f64 - want_s).abs() <= 1e-30 + 1e-6 * want_s.abs(),
+                "silu({x}) = {} want {want_s:e}",
+                s[0]
+            );
+            // The two saturate to the identity at different places, and
+            // the gap is the point of the `-2·K·(x + C·x³)` argument:
+            // GELU's exponent runs away cubically, so it is already `x`
+            // by 10, while SiLU's is linear and still `9.9995` there.
+            if x >= 10.0 {
+                assert_eq!(g[0], x, "gelu should saturate to the identity at {x}");
+            }
+            if x >= 20.0 {
+                assert_eq!(s[0], x, "silu should saturate to the identity at {x}");
+            }
         }
     }
 

@@ -74,6 +74,62 @@ Tests are mostly `#[cfg(test)]` next to the code. Integration:
 `crates/ferrox-models/tests/gguf_roundtrip.rs`. Never un-ignore CUDA /
 Metal hardware tests without a real GPU.
 
+## How to write code here
+
+**Keep files small, modules narrow, and the binary light.** This is not
+style preference, it is the repo's most expensive lesson. Measured
+2026-08-27:
+
+| File | Lines |
+|---|---|
+| `ferrox-metal/src/attn.rs` | 8840 |
+| `ferrox-metal/src/gpu.rs` | 8385 |
+| `ferrox-quant/src/lib.rs` | 8230 |
+| `ferrox-server/src/lib.rs` | 7645 |
+| `ferrox-models/src/decoder.rs` | 6530 |
+
+Those files are why llama.cpp has 140 architectures and ferrox has 47
+paths of which about 12 are proven. Adding a model means editing a
+6500-line file, so nobody adds one. And the same decode layer is written
+out about ELEVEN times across `decoder.rs` and `attn.rs`, which has
+already lost SEVEN model features one at a time, each silently:
+`attention_scale`, `post_attn_norm`, `post_ffn_norm`, gpt-oss `o_bias`,
+`gpt_oss_ffn`, and the four the Metal MoE decode stack ignored. A copy
+diverges from its original and nothing notices.
+
+Rules that follow from that:
+
+- **A new file beats a new section.** If a change would push a file past
+  roughly 1000 lines, split it first, then make the change.
+- **One concept per module.** A module named after a noun that holds
+  three unrelated things is three modules.
+- **Never copy a code path to vary it.** Parameterise the original. The
+  precedent that works: `forward_multi_seq` takes a `MultiSeqKv`
+  parameter rather than having a paged twin. The precedent that failed:
+  `forward_token_paged` was a copy, and lost five features.
+- **Dead code is a liability, not an asset.** 5,400 lines in
+  `ferrox-edge` have no caller. Delete on sight unless it serves a named
+  roadmap theme; if it does, wire it or say where it is going.
+- **No new crate for something one crate uses.** `ferrox-edge` became a
+  crate instead of an integration and half of it was never called.
+
+Rust specifics this repo holds to:
+
+- `cargo clippy --workspace --all-targets -- -D warnings` is a gate, not
+  advice. Also run it `--release`: `debug_assert!` type-checks its
+  argument in release, and a `#[cfg(debug_assertions)]` method called
+  from one broke every release build while all of CI stayed green.
+- Prefer borrowing to cloning on any path that runs per token. Hoist
+  feature probes out of loops: `is_aarch64_feature_detected!` ran 131k
+  times in one Mistral-7B projection before it was hoisted.
+- `unsafe` needs a `// SAFETY:` comment stating the invariant, and a
+  scalar twin it is checked against. Every SIMD arm here has one.
+- Return `Result` and name what is missing. A model this engine only
+  partly implements must STOP, never compute something else. A refusal
+  is coverage, not a defect.
+- Tests live in `#[cfg(test)]` beside the code. A test that cannot fail
+  is not a test: sabotage it once and confirm it goes red.
+
 ## Architecture
 
 ```

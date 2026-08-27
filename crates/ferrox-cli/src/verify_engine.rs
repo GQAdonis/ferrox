@@ -93,7 +93,7 @@ pub fn prefill_logits(
 /// Shared setup: open the GGUF, build the tokenizer the header names,
 /// encode the prompt (adding BOS only when the checkpoint says to),
 /// stretch it if asked, and build the decoder.
-fn load_and_tokenize(
+pub(crate) fn load_and_tokenize(
     path: &Path,
     prompt: &str,
     prompt_tokens: Option<usize>,

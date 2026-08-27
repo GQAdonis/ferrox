@@ -67,7 +67,7 @@ jobs:
       - run: cargo build -p ferrox-metal -p ferrox-cli -p ferrox-server --features metal --verbose
       - run: cargo clippy -p ferrox-metal -p ferrox-cli -p ferrox-server --features metal -- -D warnings
 
-  # What the release tarball actually ships.
+  # What the release tarball actually ships, in the PROFILE it ships in.
   #
   # `release.yml` builds the CLI with `serve` (plus `metal` on macOS),
   # and no CI job built that combination: the cuda and metal jobs both
@@ -75,8 +75,21 @@ jobs:
   # have reached users through the install script with CI green, which
   # is the one path where a compile error is guaranteed to be somebody
   # else's first experience of the project.
+  #
+  # `--release` matters as much as the features, and this job did not
+  # have it at first. Nothing else in CI builds release either: every
+  # other step is a debug build, and `release.yml` only runs on a tag,
+  # which is after merge and too late. A real break got through exactly
+  # that way: `PagedLease::tables_match_groups` is
+  # `#[cfg(debug_assertions)]` and was called from a `debug_assert!`,
+  # which still TYPE-CHECKS its argument in release, so the method did
+  # not exist where the call did and every release build of
+  # ferrox-server failed to compile while all of CI stayed green.
+  #
+  # Anything gated on `debug_assertions` has this shape, so the gate is
+  # the profile, not the feature.
   serve-feature-chain:
-    name: clippy/build --features serve (what the tarball ships)
+    name: build --release --features serve (what the tarball ships)
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -92,8 +105,9 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      - run: cargo build -p ferrox-cli --features "${{ matrix.features }}" --verbose
-      - run: cargo clippy -p ferrox-cli --all-targets --features "${{ matrix.features }}" -- -D warnings
+      # Release profile on purpose: see the comment above this job.
+      - run: cargo build --release -p ferrox-cli --features "${{ matrix.features }}" --verbose
+      - run: cargo clippy --release -p ferrox-cli --all-targets --features "${{ matrix.features }}" -- -D warnings
 
   # Ferrox Studio (ui/) is a standalone app: nothing it builds is
   # committed and nothing ships inside a Rust crate, so there is no

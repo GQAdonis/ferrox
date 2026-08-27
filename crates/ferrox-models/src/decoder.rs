@@ -847,8 +847,17 @@ impl Decoder {
         }
         // Softcaps: final logit softcap is applied on the host after
         // lm_head (Metal-safe). Attention softcap runs on Metal FA-vec /
-        // legacy GQA (decode + prefill). attention_scale is compensated
-        // by scaling Q on the host/Metal extras path.
+        // legacy GQA (decode + prefill).
+        //
+        // NOT attention_scale. This comment used to claim it was
+        // "compensated by scaling Q on the host/Metal extras path".
+        // There is no such compensation: `AttnExtras` has no field for
+        // it, and repo-wide `attention_scale` is applied at exactly two
+        // sites, both in the single-token CPU arm. So the claim
+        // certified a gap shut that is still open, which is worse than
+        // saying nothing. It is inert only because `loader.rs` hardcodes
+        // `attention_scale = None`, and the day a loader sets it, the
+        // batched, multi-seq and Metal paths will all ignore it.
         if self.config.head_dim > 256 {
             return false;
         }
@@ -1470,19 +1479,26 @@ impl Decoder {
             .zip(decision.weights.iter())
             .map(|(&eid, &w)| (eid, w))
             .collect();
-        for &(eid, _) in &pending {
-            let ok = layer.moe.with_expert(eid, |ex| {
-                Self::metal_matvec_launch(&ex.gate).is_some()
-                    && Self::metal_matvec_launch(&ex.up).is_some()
-                    && Self::metal_matvec_launch(&ex.down).is_some()
-            });
-            if !ok {
-                return None;
-            }
-        }
+        // Bail on the backing BEFORE validating the experts. The
+        // validation loop below calls `with_expert`, which for
+        // `Stored` backing acquires a lease and so can read from the
+        // checkpoint file. Refusing afterwards meant a streamed layer
+        // paid one read per top-k expert and then threw all of them
+        // away, before `try_metal_moe_topk` read the same experts
+        // again. This path stays resident-only for now, but it must
+        // decline for free.
         let ExpertBacking::Resident(experts) = &layer.moe.experts else {
             return None;
         };
+        for &(eid, _) in &pending {
+            let ex = &experts[eid];
+            if Self::metal_matvec_launch(&ex.gate).is_none()
+                || Self::metal_matvec_launch(&ex.up).is_none()
+                || Self::metal_matvec_launch(&ex.down).is_none()
+            {
+                return None;
+            }
+        }
         let mut launches = Vec::with_capacity(pending.len());
         for &(eid, weight) in &pending {
             let ex = &experts[eid];
@@ -1795,10 +1811,28 @@ impl Decoder {
         #[cfg(feature = "metal")]
         if use_metal_attn
             && matches!(self.config.moe.gating, ferrox_moe::GatingFunction::Softmax)
-            && self
-                .layers
-                .iter()
-                .all(|l| Self::layer_supports_metal_moe_resident(l, &self.config))
+            && self.layers.iter().enumerate().all(|(i, l)| {
+                // Both halves are required. `layer_supports_metal_moe_resident`
+                // answers "is this an MoE layer the GPU router can serve",
+                // and says nothing about the four features
+                // `MoeLayerMetal` has no fields for: a per-layer
+                // `rope_theta`, a sliding `window`, `post_attn_norm`
+                // and `post_ffn_norm`. `DenseLayerMetal` carries all
+                // four and `launch_decode_dense_stack` implements
+                // them; the MoE stack does neither, and nothing here
+                // refused, so a windowed or sandwich-normed MoE
+                // checkpoint would have answered as a different
+                // model with no error.
+                //
+                // The per-layer path already pairs these two checks
+                // (see the `metal_moe_resident` branch in the decode
+                // loop). Only the whole-stack path was missing it.
+                // Latent today because OLMoE and Qwen3-MoE ship none
+                // of the four, which is exactly how `attention_scale`
+                // stayed latent.
+                Self::layer_supports_metal_moe_resident(l, &self.config)
+                    && !self.layer_needs_metal_stack(l, i)
+            })
             && !self.layers.iter().all(Self::layer_supports_metal_dense_ffn)
         {
             if let Some(guard) = metal_kv_guard.as_mut() {

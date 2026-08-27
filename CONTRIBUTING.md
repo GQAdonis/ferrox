@@ -17,6 +17,15 @@ CI also builds that CLI/server chain and, on `macos-latest`, compiles
 `cargo clippy -p ferrox-metal -p ferrox-cli --features metal`. Hardware
 kernel tests stay `#[ignore]`d on hosted CI.
 
+CI builds `ferrox-cli --features serve` too, which is what the release
+tarball ships: `serve` on Linux and `serve metal` on macOS. That gate
+was added after noticing a break confined to `serve` could reach users
+through the install script with CI green.
+
+The `ui/` job runs `npm run licenses`, `typecheck`, `lint` and `build`.
+It does not run `npm test`, so run `npm run check` in `ui/` before a PR
+that touches `ui/src/lib/`.
+
 ## Benchmarks & presets
 
 - Preset fields: confirm each one against a primary source, or list it
@@ -30,6 +39,10 @@ kernel tests stay `#[ignore]`d on hosted CI.
   table by hand. To measure a new model, add an entry to `suite.json`,
   put the GGUF under `models/`, then run
   `ferrox bench --suite --id <id> --fit-host --skip-missing`.
+- A run that stops before timing anything is telling you the host is
+  busy, hot, or short on free memory. Fix the host rather than reaching
+  for `--max-load 0`, which turns off all three checks and produces a
+  number nobody may publish. `benchmarks/README.md` has each one.
 - Never force a thread count on either engine. llama.cpp defaults to
   performance cores and loses 2-4x above them, so pinning both to the
   same count flatters ferrox instead of making the comparison fair.
@@ -48,6 +61,8 @@ kernel tests stay `#[ignore]`d on hosted CI.
 | `docs/MODELS.md` | Supported models |
 | `docs/API.md` | HTTP API matrix |
 | `docs/CONFIG.md` | Environment variables |
+| `docs/AGENTS_COOKBOOK.md` | Pointing an IDE or agent at the server |
+| `crates/ferrox-edge/README.md` | Which serving policies run and which do not |
 | `benchmarks/RESULTS.md` | Speed vs llama.cpp (generated) |
 | `benchmarks/README.md` | How those numbers are measured |
 | `docs/ROADMAP.md` | Planned work |

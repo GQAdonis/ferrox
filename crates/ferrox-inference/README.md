@@ -11,7 +11,7 @@ crate.
 
 ```toml
 [dependencies]
-ferrox-inference = "0.11"
+ferrox-inference = "0.12"
 ```
 
 ```rust
@@ -57,6 +57,7 @@ install as CPU-only in practice. See
 | [`ferrox-core`](https://crates.io/crates/ferrox-core) | Tensor ops, RoPE, GQA, KV cache |
 | [`ferrox-moe`](https://crates.io/crates/ferrox-moe) | Expert routing and dispatch |
 | [`ferrox-models`](https://crates.io/crates/ferrox-models) | Loaders and decoder stacks |
+| [`ferrox-edge`](https://crates.io/crates/ferrox-edge) | Serving policy: prefix caches, schedulers, output parsers |
 | [`ferrox-api`](https://crates.io/crates/ferrox-api) | Route constants + wire DTOs |
 | [`ferrox-metal`](https://crates.io/crates/ferrox-metal) | Apple Metal kernels |
 | [`ferrox-cuda`](https://crates.io/crates/ferrox-cuda) | CUDA/NVRTC kernels |

@@ -70,14 +70,15 @@ Beyond closing the measured gaps.
 **Serving**
 
 - Tool calling: the OpenAI `tools` / `tool_choice` request and response
-  shape. *Nine wire formats now parse* (`ferrox-edge::parser::tool_call`),
+  shape. *Eleven wire formats now parse* (`ferrox-edge::parser::tool_call`),
   every call in a response rather than the first, and a reasoning
-  model's chain of thought comes back as `reasoning_content`. What is
-  left here is `tool_choice: required`/named, which needs constrained
-  decoding, and incremental `tool_calls[].index` argument deltas on the
-  streaming path
+  model's chain of thought comes back as `reasoning_content`. Five of
+  the eleven stream `tool_calls[].index` argument deltas. What is left
+  here is `tool_choice: required`/named, which needs constrained
+  decoding, argument deltas for the six JSON-payload formats, and
+  streamed tool calls on the continuous-batching path
 - Full grammar and JSON-schema constrained decoding
-- MCP tool invocation, plus Anthropic streaming and tools
+- MCP tool invocation. Anthropic streaming and tools now ship
 - The rest of the OpenAI API surface (see [`API.md`](API.md))
 - Docker images (CPU, Metal and CUDA variants)
 - Throughput measurement for concurrent continuous-batching requests
@@ -94,28 +95,44 @@ Beyond closing the measured gaps.
 **Wiring `ferrox-edge`**
 
 The ported FreeToken serving policy (`crates/ferrox-edge`, see
-[`FEATURES.md`](FEATURES.md)) is complete and tested. Driving something
-today: the two output parsers, the withhold rule, the effort/thinking
-probe behind `chat_template_kwargs` and `/v1/models`'s advertised gears,
-and the request ring behind `/admin/stats`. The rest is groundwork
-waiting on a consumer:
+[`FEATURES.md`](FEATURES.md)) is complete and tested. Roughly half of it
+now drives something: the two output parsers, the withhold rule, the
+effort/thinking probe, the request ring, the batcher's status and pool
+accounting, the two maintenance endpoints, the DeepSeek-V4 KV tier
+sizing, and `radix`, which shares KV pages between prompts on the
+paged-KV path. `FEATURES.md` has the per-module split.
 
-- Replace `ferrox-models::prefix_cache`'s flat snapshot list with
-  `ferrox-edge::radix`, so a thousand requests off one system prompt
-  share its nodes instead of cloning its KV, and so prefix reuse works
-  on the continuous-batching path (today the two are mutually
-  exclusive)
+Closed since the last pass: `ferrox bench-bw` measures this host's
+CPU-MoE bandwidth and writes the profile `qstar` reads, so a deployment
+no longer has to take the unbenchmarked one-fetch-per-step default
+(the PCIe half still needs a CUDA benchmark host). `POST
+/v1/cache/rebuild` moves VRAM between the expert cache and KV without a
+restart, validated by `ferrox-edge::pool` and rolled back by
+`ferrox-edge::rebuild`.
+
+Still waiting on a consumer:
+
 - Drive expert residency from `ferrox-edge::expert_cache` and the `q*`
   split, which needs the other half FreeToken has and ferrox does not:
   a *persistent* GPU expert cache (`ferrox-moe::run_expert_placed`
   re-uploads every weight matrix per call) and a CPU MoE path that can
   run concurrently with a device copy
-- `ferrox bench bw` — measure this host's CPU-MoE and PCIe bandwidths so
-  `qstar::BandwidthProfile` has real numbers to read, instead of the
-  unbenchmarked one-fetch-per-step default
-- Size the pools with `ferrox-edge::pool` at load, and expose the live
-  re-split (`POST /v1/cache/rebuild`) so VRAM can move between the
-  expert cache and KV without a restart
+- Make paged KV, and the radix cache riding on it, correct on Metal and
+  CUDA. Today the paged attention path returns wrong tokens on a GPU
+  backend, so the server stops rather than serving them. Lift that once
+  the paged path passes `ferrox verify --backend metal` with prefill
+  covered
+- Give the radix cache an aggregate hit rate on `/v1/stats` and
+  `/metrics`, and an eviction budget. `RadixCache::evict` is written and
+  tested with nothing calling it, so back pressure today is the page
+  store running out
+- Make prefix reuse work on the continuous-batching path. Paged KV and
+  continuous batching are separate switches and the sharing only
+  happens under the first
+- Size the pools with `ferrox-edge::pool` at load, not only when a
+  rebuild asks for a new geometry
+- Find consumers for `placement`, `residency`, `cache_manager`,
+  `anchor`, `window_pool`, `state_pool` and `supervisor`
 
 A full recursive re-read of the reference (six readers over its 435
 files, checked against every ferrox crate rather than against the port's
@@ -135,5 +152,3 @@ CUDA-side parity would actually cost:
 - Something equivalent to `test-backend-ops`: every kernel checked
   against a CPU reference across shapes and quant kinds, so no backend
   gets merged on the strength of running fast alone.
-- Build the CUDA feature combination in CI, even with no GPU to run it
-  on. The last break there was a compile error, not a runtime one.

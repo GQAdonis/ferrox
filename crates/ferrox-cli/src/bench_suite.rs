@@ -1,7 +1,7 @@
 //! `ferrox bench --suite` / `--render`: the llama-bench-shaped ledger.
 //!
-//! Numbers are `pp<N>` / `tg<N>` from `ferrox bench` vs `llama-bench` —
-//! no HTTP, template, tokenizer, or sampler. That is what a kernel
+//! Numbers are `pp<N>` / `tg<N>` from `ferrox bench` vs `llama-bench`,
+//! with no HTTP, template, tokenizer, or sampler. That is what a kernel
 //! change moves, and what [`benchmarks/RESULTS.md`](../../../benchmarks/RESULTS.md)
 //! quotes.
 //!
@@ -109,10 +109,13 @@ fn host_ram_gb() -> f64 {
 }
 
 pub fn run_suite(args: SuiteArgs) -> anyhow::Result<()> {
+    let mut measured = 0usize;
     // The suite is the unit of truth for RESULTS.md, so check the host
     // once up front rather than discovering at model 9 of 13 that the
     // first eight rows were measured on a busy box. Children re-check
-    // individually -- load can rise mid-suite.
+    // individually, because load can rise mid-suite, and the loop below
+    // waits for the previous entry's own load to decay before starting
+    // the next one so the suite does not lock itself out.
     crate::host_state::ensure_quiet_enough(args.max_load)?;
     let entries = load_suite(&args.bench_dir)?;
     let exe = std::env::current_exe()?;
@@ -151,6 +154,25 @@ pub fn run_suite(args: SuiteArgs) -> anyhow::Result<()> {
                 );
                 continue;
             }
+            // Total RAM says the model COULD fit this machine. Free RAM
+            // says whether it fits right now. A 32 GiB box with 3.5 GiB
+            // free accepts a 10 GiB model on the check above, then runs
+            // it out of swap and reports a real-looking number for work
+            // the disk did. Skipping keeps the previous receipt, which
+            // is stale and says so, rather than replacing it with a
+            // paged one that does not.
+            if args.fit_host && args.max_load > 0.0 {
+                if let Some(free) = crate::host_state::free_ram_gb() {
+                    if entry.estimated_ram_gb + 2.0 > free {
+                        eprintln!(
+                            "skip {} {backend}: needs ~{:.0} GiB, only {free:.1} GiB free \
+                             (it would run from swap)",
+                            entry.id, entry.estimated_ram_gb
+                        );
+                        continue;
+                    }
+                }
+            }
             let model_path = args.bench_dir.join("..").join(&entry.gguf);
             if !model_path.exists() {
                 if args.skip_missing {
@@ -162,6 +184,22 @@ pub fn run_suite(args: SuiteArgs) -> anyhow::Result<()> {
 
             let receipt = out_dir.join(format!("{}_{backend}.json", entry.id));
             eprintln!("\n=== {} [{}] {backend} ===", entry.id, entry.name);
+            // The previous entry's own benchmark is still in the
+            // 1-minute average, and the child re-checks the bar. Let it
+            // decay instead of letting the suite lock itself out.
+            // Skip this entry rather than abandoning the suite. `?` here
+            // meant one busy stretch killed the whole run and every
+            // model after it never went, which is how a 12-model suite
+            // stopped at 8 and left the table half old and half new.
+            // A missing GGUF already skips; an unclearable host is the
+            // same kind of "not now", and the previous receipt stands.
+            if let Err(why) = crate::host_state::wait_until_quiet_enough(
+                args.max_load,
+                std::time::Duration::from_secs(180),
+            ) {
+                eprintln!("skip {} {backend}: {why}", entry.id);
+                continue;
+            }
             let status = std::process::Command::new(&exe)
                 .arg("bench")
                 .args(["-m", &entry.gguf])
@@ -175,13 +213,35 @@ pub fn run_suite(args: SuiteArgs) -> anyhow::Result<()> {
                 .args(["--receipt", receipt.to_str().unwrap()])
                 .args(["--max-load", &args.max_load.to_string()])
                 .status()?;
-            if !status.success() {
+            if status.success() {
+                measured += 1;
+            } else {
                 eprintln!(
                     "!! {} {backend} failed ({status}); leaving previous receipt alone",
                     entry.id
                 );
             }
         }
+    }
+
+    // A run that measured nothing must not republish the table.
+    //
+    // `render` reads whatever receipts are on disk, so a suite where
+    // every entry failed or skipped would rewrite RESULTS.md from the
+    // OLD receipts and print its usual success line. That happened: a
+    // stray `ferrox` process from an earlier run held the instance
+    // lock, all 21 entries refused, and the table was regenerated from
+    // stale receipts anyway, mixing versions under one heading. The
+    // table is only republished when this run actually produced a
+    // number.
+    if measured == 0 {
+        eprintln!(
+            "ferrox bench: no entry produced a measurement, so {} was left alone. \
+             Nothing here is a result, and republishing the table would date it to \
+             this run while its numbers came from earlier ones.",
+            args.bench_dir.join("RESULTS.md").display()
+        );
+        return Ok(());
     }
     render(&args.bench_dir)
 }
@@ -207,6 +267,17 @@ pub fn render(bench_dir: &Path) -> anyhow::Result<()> {
                 }
             }
         }
+    }
+
+    // No receipts at all means there is nothing to render. Writing the
+    // table anyway would replace a real ledger with an empty one and
+    // report success, which is worse than doing nothing.
+    if receipts.is_empty() {
+        anyhow::bail!(
+            "no engine receipts under {}, so there is nothing to render. \
+             Run `ferrox bench --suite` first.",
+            dir.display()
+        );
     }
 
     let suite = load_suite(bench_dir).unwrap_or_default();
@@ -287,7 +358,7 @@ pub fn render(bench_dir: &Path) -> anyhow::Result<()> {
     table.push_str(BEGIN);
     table.push_str("\n\n## Engine (`ferrox bench` vs `llama-bench`)\n\n");
     table.push_str(
-        "No HTTP, no chat template, no tokenizer, no sampler — this is the engine\n\
+        "No HTTP, no chat template, no tokenizer, no sampler. This is the engine\n\
          alone. `pp512` is batched prefill, `tg128` is decode. **Neither engine's\n\
          thread count is forced**: each picks its own default, because llama.cpp\n\
          defaults to performance cores and loses 2–4× when pushed above them, so\n\
@@ -432,6 +503,30 @@ mod tests {
         let out = splice("just some prose\n", &format!("{BEGIN}\nfresh\n{END}"));
         assert!(out.starts_with("just some prose"));
         assert!(out.contains("fresh"));
+    }
+
+    /// A render with no receipts must refuse rather than publish an
+    /// empty table over a real one.
+    #[test]
+    fn rendering_nothing_refuses_instead_of_emptying_the_ledger() {
+        let dir = std::env::temp_dir().join(format!("ferrox-render-guard-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("receipts").join("engine")).unwrap();
+        let results = dir.join("RESULTS.md");
+        let original = "# Results\n\nreal numbers live here\n";
+        std::fs::write(&results, original).unwrap();
+
+        let err = render(&dir).unwrap_err().to_string();
+        assert!(
+            err.contains("nothing to render"),
+            "expected a refusal naming the empty receipt dir, got: {err}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&results).unwrap(),
+            original,
+            "the existing ledger must survive a render that had no receipts"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

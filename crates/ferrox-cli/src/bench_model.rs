@@ -128,6 +128,18 @@ pub fn run(args: BenchArgs) -> anyhow::Result<()> {
         anyhow::bail!("model not found: {model}");
     }
 
+    // A busy host and a hot host are already refused above. A FULL host
+    // is the same failure with a different cause: the weights page to
+    // disk and the run times the page file. The file size is the floor
+    // on the footprint, and `--max-load 0` waives this the same way it
+    // waives the other two.
+    if args.max_load > 0.0 {
+        if let Ok(meta) = std::fs::metadata(path) {
+            let weights_gb = meta.len() as f64 / 1024.0 / 1024.0 / 1024.0;
+            crate::host_state::ensure_fits_in_ram(weights_gb, 2.0)?;
+        }
+    }
+
     let file = ferrox_gguf::ShardedGguf::open(path)?;
     let arch = file
         .metadata_str("general.architecture")
@@ -474,6 +486,18 @@ fn bench_prefill_gemma4(
 
 /// `tg<N>`: N single-token decode steps after a one-token prime, so KV
 /// length grows exactly as it does in real generation.
+/// Whether the host-side `KvCache` is where the KV actually lands.
+///
+/// With GPU offload it is not: the device holds the KV and the host
+/// struct stays empty unless `FERROX_CPU_KV_OFFLOAD=1` syncs it back.
+/// Any assertion that counts host cache positions has to know that, or
+/// it refuses every GPU run for doing nothing wrong.
+fn host_kv_is_the_record() -> bool {
+    let off = |k: &str| std::env::var(k).map(|v| v == "0").unwrap_or(false);
+    let synced = std::env::var("FERROX_CPU_KV_OFFLOAD").as_deref() == Ok("1");
+    synced || (off("FERROX_METAL") && off("FERROX_CUDA"))
+}
+
 fn bench_decode(decoder: &Decoder, n_gen: usize, reps: usize) -> anyhow::Result<Row> {
     let test = format!("tg{n_gen}");
     let vocab = decoder.config.vocab_size;
@@ -500,7 +524,13 @@ fn bench_decode(decoder: &Decoder, n_gen: usize, reps: usize) -> anyhow::Result<
         let dt = t.elapsed().as_secs_f64();
         // One priming token plus n_gen decode steps. A short cache
         // means steps were skipped, which would inflate the rate.
-        bench_guard::check_decode_after(&test, n_gen, &probe(&caches))?;
+        let kv_checked = bench_guard::check_decode_after(
+            &test,
+            n_gen,
+            &probe(&caches),
+            host_kv_is_the_record(),
+        )?;
+        let _ = kv_checked;
         let first = *first_digest.get_or_insert(digest);
         bench_guard::check_same_workload(&test, rep, first, digest)?;
         check_result(&test, rep, &logits, &mut first_result)?;
@@ -535,7 +565,13 @@ fn bench_decode_gemma4(engine: &Gemma4Engine, n_gen: usize, reps: usize) -> anyh
             logits = Engine::forward_token(engine, tok, i + 1, &mut state);
         }
         let dt = t.elapsed().as_secs_f64();
-        bench_guard::check_decode_after(&test, n_gen, &probe_gemma4(&state))?;
+        let kv_checked = bench_guard::check_decode_after(
+            &test,
+            n_gen,
+            &probe_gemma4(&state),
+            host_kv_is_the_record(),
+        )?;
+        let _ = kv_checked;
         let first = *first_digest.get_or_insert(digest);
         bench_guard::check_same_workload(&test, rep, first, digest)?;
         check_result(&test, rep, &logits, &mut first_result)?;

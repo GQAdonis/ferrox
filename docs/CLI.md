@@ -100,7 +100,7 @@ not available yet).
 ### Chat vs completion
 
 - **Default:** the prompt is rendered through the GGUF's own
-  `tokenizer.chat_template`, evaluated as Jinja2 — the same evaluator
+  `tokenizer.chat_template`, evaluated as Jinja2 by the same evaluator
   `ferrox-server` uses, so the CLI and `/v1/chat/completions` frame a
   conversation identically. A checkpoint that ships no template falls
   back to ChatML (matching llama.cpp `--jinja`), or to role-labeled
@@ -168,7 +168,7 @@ uses the same set.
 ## Serving benchmark (`serve-bench`)
 
 `ferrox bench` is single-stream and HTTP-free: it measures kernels
-against `llama-bench`. `ferrox serve-bench` answers the other question —
+against `llama-bench`. `ferrox serve-bench` answers the other question:
 what a running `ferrox-server` does under concurrency.
 
 ```bash
@@ -186,16 +186,16 @@ covered by a test rather than inferred from a live run:
 - **Every request does exactly the requested work.** Temperature 0,
   top-k 1, `ignore_eos`, and an exact output length. Without
   `ignore_eos` the requests finish at different lengths and the slowest
-  percentile is whichever prompt happened to run longest — a fact about
-  the prompts, reported as a fact about the server.
+  percentile is whichever prompt happened to run longest, a fact about
+  the prompts reported as a fact about the server.
 - **The TTFT/TPOT split is positional.** The first token-bearing chunk
   is time-to-first-token; every later one is an inter-token sample.
   Keepalives and the terminal `finish_reason` frame are excluded: a
   keepalive arrives during exactly the window TTFT measures, and the
   terminal frame carries no token.
 - **Percentiles are nearest-rank over samples pooled across requests**,
-  never per-request means percentiled afterwards — one request that
-  stalled mid-answer must reach the p99, and inside its own mean it
+  never per-request means percentiled afterwards. One request that
+  stalled mid-answer has to reach the p99, and inside its own mean it
   never does.
 - **Throughput is total tokens over the whole run's span**, not the sum
   of per-request rates, which gets *better* the worse the queueing is.
@@ -203,15 +203,15 @@ covered by a test rather than inferred from a live run:
 Token counts come from the server's own `usage.completion_tokens`, not
 from the chunk count: a buffered answer arrives as one chunk and was
 still N tokens of work. A buffered stream therefore reports TTFT and
-end-to-end but no TPOT — that detail does not exist, and it is left
+end-to-end but no TPOT. That detail does not exist, and it is left
 blank rather than invented.
 
 ## Bandwidth profile (`bench-bw`)
 
 `ferrox-edge`'s `qstar` decides how much of a MoE layer to fetch across
 the link and how much to compute on the CPU. Without a measured
-profile it falls back to an unbenchmarked default — one fetch per layer
-per step — so every deployment gets a split nobody measured.
+profile it falls back to an unbenchmarked default of one fetch per layer
+per step, so every deployment gets a split nobody measured.
 
 ```bash
 cargo build --release -p ferrox-cli --features cuda
@@ -222,7 +222,7 @@ cargo build --release -p ferrox-cli --features cuda
 It writes `$XDG_CACHE_HOME/ferrox/benchbw/<gpu-uuid>.json`, which the
 loader finds on its own. A profile is keyed to the card it was taken
 on: another machine's split is worse than no split, so a profile whose
-recorded GPU name disagrees is refused rather than approximated.
+recorded GPU name disagrees is ignored rather than approximated.
 
 It refuses to write in two cases, both deliberate:
 
@@ -238,7 +238,7 @@ It refuses to write in two cases, both deliberate:
   `--allow-debug-build` overrides it if you know why you want that.
 
 The device-side measurement is a documented stub pending a benchmark
-host — see `docs/plans/freetoken-parity.md`. It must be timed with CUDA
+host, see `docs/plans/freetoken-parity.md`. It must be timed with CUDA
 events rather than a wall clock, and repeated under contention, because
 the number the policy wants is the *contended* pair: standalone
 bandwidths assume each side owns the machine and neither does once they
@@ -359,7 +359,7 @@ curl -s -X POST http://127.0.0.1:8383/v1/chat/completions \
 ```bash
 # The kernel picks the port. The bound address is announced on stdout.
 ./target/release/ferrox-server -m model.gguf --port 0 --exit-on-stdin-close
-{"event":"ferrox.server.ready","addr":"127.0.0.1:52091","port":52091,"scheme":"http","pid":4242,"version":"0.9.1"}
+{"event":"ferrox.server.ready","addr":"127.0.0.1:52091","port":52091,"scheme":"http","pid":4242,"version":"0.12.0"}
 ```
 
 `--port 0` plus that one line saves a parent process from probing
@@ -421,7 +421,14 @@ line up.
 | `--render` | Re-render the RESULTS table from the timing files already on disk, measuring nothing |
 | `--id` / `--backend` | Restrict `--suite` to one entry / backend |
 | `--fit-host` / `--skip-missing` | Skip entries too large for the host / with no GGUF present |
-| `--max-load` | Stop instead of timing when the host's 1-minute load average is at or above this (default `2.0`, `0` disables). `--suite` checks once up front and forwards the bar to every child |
+| `--max-load` | The 1-minute load average a timed run needs to be under (default `2.0`, raw, not per core). `0` waives this and the thermal and free-memory checks with it. `--suite` checks once up front, forwards the bar to every child, and waits between entries for the previous entry's own load to decay |
+| `--bench-dir` | Where `suite.json`, `RESULTS.md` and `receipts/` live (default `benchmarks`) |
+| `--receipt` | Write a single run's raw timings to this path |
+
+A run stops before the timer starts when the host is busy, thermally
+limited, or short enough on free memory that the weights would page to
+disk. [`benchmarks/README.md`](../benchmarks/README.md) has each check,
+what it reads, and what `--max-load 0` waives.
 
 ### One model at a time
 

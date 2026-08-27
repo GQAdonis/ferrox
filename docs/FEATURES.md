@@ -31,12 +31,12 @@ is faster.
 - **MLA**: dense-lead and MoE-after-dense `deepseek2` / `mistral4`.
 - **Gemma-4**: dedicated engine (per-layer embeddings, shared KV,
   SWA/full), an SPM-style `gemma4` BPE tokenizer, and the `<|turn>` chat
-  wrap. Dense only — the MoE router is ported and tested
+  wrap. Dense only: the MoE router is ported and tested
   (`ferrox_moe::route_gemma4_moe`) but the loader still expects
   `ffn_gate.weight`, so a MoE Gemma-4 GGUF does not load yet.
 - **MiniMax-M3**: the block-sparse block selection is ported and tested
-  (`ferrox_core::block_sparse`); the engine itself is still fail-closed
-  — no loader, no 256-expert sigmoid MoE, no MTP draft heads.
+  (`ferrox_core::block_sparse`). The engine itself stops with an error:
+  no loader, no 256-expert sigmoid MoE, no MTP draft heads.
 - **Also loadable**: yi, qwen2moe / qwen3moe (MiroThinker GGUFs, for
   example), Gemma-2, Phi-3, Llama-3.1, and GLM4 when the tensors are
   there. None of these are in the published suite.
@@ -96,29 +96,53 @@ Add `--compare` to run `llama-bench` alongside it and print the gap.
 
 ## Server
 
+Two ways to start the same server. `ferrox serve` is a subcommand of the
+main binary behind an optional `serve` feature, off by default for
+`cargo install` because it pulls in 98 crates a completion-only user
+does not need. `ferrox-server` is that same server as its own
+executable, and both parse identical arguments through identical code.
+The prebuilt release binary is built with `serve`, so the downloaded
+`ferrox` does both.
+
 OpenAI-compatible HTTP API:
 
 - Chat completions (SSE, optionally resumable: `id:` + `retry:` +
   `Last-Event-ID` replay and a JSON polling fallback), completions,
   tokenize / detokenize
+- `POST /v1/cancel` stops a running generation by request id, which is
+  the stop path a resumable stream needs, since closing its socket no
+  longer ends it
 - Decoder embeddings (mean/last pool)
 - Anthropic Messages: `POST /v1/messages` streaming and buffered
   (thinking and tool blocks, protocol-native `ping` keepalive) plus
   `POST /v1/messages/count_tokens`
+- `POST /v1/responses`, the surface `codex` speaks, streaming and
+  buffered. This server keeps no responses, so the two lookups by
+  response id answer 404
 - Presence and frequency penalties, best-effort `json_object`
 - Continuous batching and chunked prefill
+- Paged KV: shared page storage many requests read through a block
+  table, with a radix tree over reference-counted page groups so
+  conversations off one system prompt share its KV rather than each
+  holding a copy. **CPU only**, since the paged attention path returns
+  wrong tokens on a GPU backend. Off unless
+  `FERROX_PAGED_KV_BLOCKS` is set, and the server stops at startup when
+  it is set beside `-dev metal` or `-dev cuda`. See
+  [`CONFIG.md`](CONFIG.md)
 - `ferrox serve-bench`: concurrency, TTFT, TPOT and queueing numbers
   for a live server, with the methodology (positional split, pooled
   nearest-rank percentiles, whole-run throughput) tested socket-free
 - Live serving telemetry (`GET /v1/stats`, `GET /v1/requests`) and an
   elastic KV/expert split that can be reported and re-sized without a
-  restart (`GET /v1/cache/status`, `POST /v1/cache/rebuild`), behind a
-  maintenance gate that refuses rather than queues while it happens
+  restart (`GET /v1/cache/status`, `POST /v1/cache/rebuild`). A request
+  that arrives mid-rebuild is turned away with an error rather than
+  parked in a queue behind it
 - `reasoning_content`: a reasoning model's chain of thought is split
   out of `content`, streamed as it arrives rather than at the end
-- Tool calls in nine wire formats, not one — the format the served
-  checkpoint's family emits, then the prompt-engineered one — and every
-  call in a response, not the first
+- Tool calls in eleven wire formats, not one: the format the served
+  checkpoint's family emits, then the prompt-engineered one, and every
+  call in a response rather than the first. Five of the eleven stream
+  their arguments as deltas
 - Prompts rendered by *evaluating* the checkpoint's own
   `tokenizer.chat_template`, with `chat_template_kwargs` and
   `reasoning_effort` passed through (the effort quantized onto what that
@@ -130,44 +154,44 @@ A Rust port of the host-side decision logic in
 [FreeToken](https://github.com/FlashML-org/FreeToken)
 ([arXiv:2608.16157](https://arxiv.org/abs/2608.16157)): the parts of an
 edge-native MoE engine that *decide* rather than compute. Tensor-free
-and testable without a GPU — each module takes measured numbers and
+and testable without a GPU. Each module takes measured numbers and
 returns a decision.
 
-| Module | Decides |
-|---|---|
-| `qstar` | how many of a step's expert-cache misses to fetch over PCIe vs. run on the CPU, from measured bandwidths |
-| `expert_cache` | which experts stay resident, as one global LRU over a flat `(layer, expert)` id space |
-| `expert_slots` | executes those residency plans against a bounded slot pool, and counts what crossed the link |
-| `dsv4` | per-layer KV tier sizing, and which compressor each layer runs (none / CSA / HCA) |
-| `radix` | which prefix of a prompt is already computed — page-keyed, node-sharing, with sliding-window and recurrent-state variants |
-| `pool` | how VRAM splits between the expert cache and KV, and how it is re-split live |
-| `placement` | which layers decode on the CPU when the expert banks exceed the host's page-locking budget |
-| `scheduler` | admission, chunked-prefill sizing, and what a chunk reserves |
-| `parser` | where reasoning ends and the answer begins; which tool was called, in which format |
-| `effort` | which reasoning-effort dialect a checkpoint speaks, probed from its own template |
-| `stats` | what a server may honestly claim about its own throughput and latency |
-| `maintenance` | whether a request, a cache rebuild or a stop may proceed right now |
-| `residency` | which class a layer's expert bank settles into, and what that then forbids |
-| `supervisor` | whether a start spawns, no-ops or conflicts; whether a death was asked for; which process the OOM killer should take |
-| `state_pool` | which recurrent-state slot a request holds, and where a prefill freezes one |
-| `bench_profile` | where this machine's measured bandwidth profile lives, and when it may be trusted |
+### Driving something today
 
-Wired in today: the two parsers (chat completions, streaming and
-buffered), the stop-string withhold rule, which `ferrox-server`'s
-`StopMatcher` now delegates to so there is one implementation of it, and
-`effort` — probed once per checkpoint at load, then applied to every
-request's `chat_template_kwargs`.
-The cache and placement policies are complete and tested but are not
-yet driving the decoder — see [`ROADMAP.md`](ROADMAP.md).
-`expert_slots` closes the gap between planning residency and performing
-it: a warm decode step provably copies zero bytes, on a host pool. No
-GPU backend implements its `SlotDevice` trait yet, so on a real card
-that property is written down and not yet measured.
+| Module | Decides | Where it runs |
+|---|---|---|
+| `parser` | where reasoning ends and the answer begins, and which tool was called in which format | `/v1/chat/completions`, `/v1/messages`, `/v1/responses`, streaming and buffered |
+| `detokenize` | what text is safe to stream after one more token | the stop-string withhold rule, which `ferrox-server`'s `StopMatcher` delegates to so there is one implementation |
+| `radix` | which prefix of a new prompt is already computed, page-keyed and node-sharing | the paged-KV serving path, where it shares KV pages between prompts by reference count |
+| `scheduler` | admission, chunked-prefill sizing, and what a chunk reserves | the continuous batcher's status and pool accounting |
+| `effort` | which reasoning-effort dialect a checkpoint speaks | probed once per checkpoint at load, then applied to every request's `chat_template_kwargs`, and advertised on `/v1/models` |
+| `stats` | what a server may honestly claim about its own throughput and latency | `/v1/stats`, `/v1/requests`, `/admin/stats` |
+| `maintenance` | whether a request, a cache rebuild or a stop may proceed right now | `POST /v1/cache/rebuild` and `POST /v1/admin/prepare-stop` |
+| `pool` | how VRAM splits between the expert cache and KV, and how it is re-split live | the target geometry `POST /v1/cache/rebuild` validates against |
+| `rebuild` · `outbox` · `footprint` | whether a re-split rolls back, what a stop receipt is worth, what this process really occupies | the same two admin endpoints |
+| `dsv4` | per-layer KV tier sizing, and which compressor each layer runs (none / CSA / HCA) | the DeepSeek-V4 decoder |
+| `bench_profile` · `bench_client` | when a measured bandwidth profile may be trusted, and what a serving benchmark may report | `ferrox bench-bw` and `ferrox serve-bench` |
+
+### Complete, tested, and waiting for a consumer
+
+`qstar` (the `q*` bandwidth split), `expert_cache`, `placement`,
+`residency`, `cache_manager`, `cache_report`, `anchor`, `window_pool`,
+`state_pool` and `supervisor`. Each is covered by unit tests and none of
+them is on a serving path. Do not read a benchmark as evidence for any
+of them. [`ROADMAP.md`](ROADMAP.md) says what each is waiting on.
+
+`expert_slots` sits between the two: it executes the expert cache's copy
+plans against a bounded slot pool, and a warm decode step copies zero
+bytes on a host pool. `ferrox-cuda`'s `CudaExpertPool` implements its
+`SlotDevice` trait under `--features cuda`, and that pool is
+compile-verified with its hardware test left `#[ignore]`d, so on a real
+card the property is written down and not yet measured.
 
 `supervisor` is the same shape for processes: the lifecycle rules are
 here and testable, and spawning sits behind a `ProcessHost` the caller
-supplies. Ferrox ships one binary, so nothing implements that trait
-yet. The rules are the reason it exists at all, since each is a race
+supplies. No ferrox binary spawns another one, so nothing implements
+that trait yet. The rules are the reason it exists at all, since each is a race
 you would otherwise only meet in production: a retried start must not
 become a second engine, one party reaps and everyone else waits on
 what it publishes (a poll transiently lies), the stop-requested latch
@@ -178,6 +202,7 @@ final stop is rejected, and a recorded child is re-adopted only on
 recycled PID from being adopted as the engine.
 
 Ferrox Studio, the web UI in [`ui/`](../ui), is a separate app that
-talks to this API over HTTP. `ferrox-server` does not serve it.
+talks to this API over HTTP. `ferrox-server` does not serve it, and
+`GET /` on it is a 404.
 
 See [`API.md`](API.md) and [`AGENTS_COOKBOOK.md`](AGENTS_COOKBOOK.md).

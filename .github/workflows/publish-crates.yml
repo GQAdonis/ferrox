@@ -85,7 +85,11 @@ jobs:
           # indexed. Derived by hand from the workspace graph:
           #
           #   api, gguf, quant, safetensors   (no internal deps)
-          #   cuda, metal                     <- quant
+          #   edge                            (no internal deps, but
+          #                                      cuda/models/server/cli/
+          #                                      inference all need it, so
+          #                                      it goes with the leaves)
+          #   cuda, metal                     <- quant, and cuda <- edge
           #   core                            <- gguf, quant, (cuda, metal)
           #   moe                             <- core, quant
           #   models                          <- core, moe, gguf, quant, safetensors
@@ -102,6 +106,7 @@ jobs:
             ferrox-gguf
             ferrox-quant
             ferrox-safetensors
+            ferrox-edge
             ferrox-cuda
             ferrox-metal
             ferrox-core

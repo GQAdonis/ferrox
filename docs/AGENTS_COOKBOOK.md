@@ -17,12 +17,24 @@ cargo build -p ferrox-cli --release --features "serve metal"
 | Cursor / OpenAI SDK | `baseURL` → `http://127.0.0.1:8383/v1` |
 | OpenCode / Cline / similar | OpenAI-compatible provider → same URL |
 | Anthropic SDK | `baseURL` → `http://127.0.0.1:8383`, use `POST /v1/messages` |
+| codex | Responses provider → `POST /v1/responses` |
 | curl | `POST /v1/chat/completions` (see [CLI.md](CLI.md)) |
 
-If `FERROX_API_KEY` is set, send `Authorization: Bearer …`.
+If `FERROX_API_KEY` is set, send `Authorization: Bearer …` or
+`x-api-key: …`. Both are accepted, so an Anthropic SDK works unchanged
+against a keyed server. Leave the key unset on a loopback bind if you
+would rather not send one at all.
+
+Tool calls come back parsed in eleven wire formats rather than only the
+one the prompt asks for, and five of those stream their arguments as
+deltas, so an agent watching a file path arrive does not wait for the
+whole call. A reasoning model's chain of thought arrives separately as
+`reasoning_content` (`thinking` blocks on `/v1/messages`).
 
 Also available: `POST /v1/tokenize`, `/v1/detokenize`, `/v1/embeddings`
-(Decoder pool), `/v1/messages` (non-stream text).
+(Decoder pool), `POST /v1/messages/count_tokens`, and `POST /v1/cancel`
+to stop a generation by the `request_id` its first streamed chunk
+carries. Full list: [API.md](API.md).
 
 For a browser client, Ferrox Studio lives in [`ui/`](../ui) as a
 separate app. This server does not serve it, and `GET /` here is a 404.
@@ -36,5 +48,21 @@ FERROX_CONTINUOUS_BATCHING=1 ./target/release/ferrox-server -m model.gguf …
 
 - Mutually exclusive with `FERROX_KV_POOL_BLOCKS` and `FERROX_PREFIX_CACHE_ENTRIES`
 - GGUF Decoder only (Kimi / MLA ignore CB)
+
+## Sharing a system prompt between conversations
+
+Agents send the same long preamble on every turn. Paged KV stores it
+once and lets each conversation point at those pages, instead of every
+request holding a copy:
+
+```bash
+FERROX_PAGED_KV_BLOCKS=4096 FERROX_PAGED_KV_BLOCK_SIZE=16 \
+  ./target/release/ferrox-server -m model.gguf -dev none -ngl 0
+```
+
+`usage.cached_tokens` on each response says how much of that prompt was
+already computed. **CPU only**: the paged attention path returns wrong
+tokens on Metal and CUDA, and `-dev none -ngl 0` is what keeps you off
+it. See [CONFIG.md](CONFIG.md).
 
 Full API matrix: [API.md](API.md).

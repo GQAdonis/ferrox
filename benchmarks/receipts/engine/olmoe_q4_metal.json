@@ -3,40 +3,63 @@
   "arch": "olmoe",
   "backend": "metal",
   "backend_active": "Metal",
-  "ferrox_version": "0.5.0",
+  "engine_env": {
+    "FERROX_CPU_INT_DOT": "1"
+  },
+  "ferrox_version": "0.12.0",
+  "host_load_1min_end": 2.01,
+  "host_load_1min_start": 1.92,
+  "host_thermal_end": {
+    "cpu_speed_limit_percent": null,
+    "degraded": false,
+    "measured": true,
+    "pressure": "nominal",
+    "source": "NSProcessInfo.thermalState"
+  },
+  "host_thermal_start": {
+    "cpu_speed_limit_percent": null,
+    "degraded": false,
+    "measured": true,
+    "pressure": "nominal",
+    "source": "NSProcessInfo.thermalState"
+  },
   "id": "olmoe_q4",
   "kind": "engine",
-  "load_s": 0.071753708,
+  "load_s": 0.013761625,
   "model_path": "models/olmoe-1b-7b-0924-q4_0.gguf",
   "quant": "quantized",
+  "quiet_host": true,
   "reps": 3,
-  "schema": 1,
+  "schema": 2,
   "size_bytes": 3928036960,
   "tests": [
     {
       "ferrox_samples": [
-        1316.3279056523209,
-        1402.3828868202372,
-        1422.1715257578055
+        1345.0782483508342,
+        1350.2973225476578,
+        1353.5306972487622
       ],
-      "ferrox_stddev": 45.9467347792178,
-      "ferrox_tps": 1402.3828868202372,
-      "gap": 1.1068517839086913,
-      "llama_tps": 1552.23,
-      "test": "pp512"
+      "ferrox_stddev": 3.4822939406497824,
+      "ferrox_tps": 1350.2973225476578,
+      "gap": 1.0859015829443357,
+      "llama_tps": 1466.29,
+      "test": "pp512",
+      "workload_digest": "b8d417040110e751"
     },
     {
       "ferrox_samples": [
-        116.28389827462414,
-        115.1900158708174,
-        116.17202296822907
+        152.01624152925717,
+        151.57965540496932,
+        152.45127960815256
       ],
-      "ferrox_stddev": 0.4914188908893047,
-      "ferrox_tps": 116.17202296822907,
-      "gap": 1.4136794367858594,
-      "llama_tps": 164.23,
-      "test": "tg128"
+      "ferrox_stddev": 0.3558392779494868,
+      "ferrox_tps": 152.01624152925717,
+      "gap": 0.997393426351875,
+      "llama_tps": 151.62,
+      "test": "tg128",
+      "workload_digest": "044655d19aa3baa5"
     }
   ],
-  "threads": 6
+  "threads": 6,
+  "warmup_reps": 1
 }

@@ -24,21 +24,33 @@ pub struct AuthConfig {
     pub api_key: Arc<String>,
 }
 
-/// Rejects any request whose `Authorization: Bearer <key>` header
-/// doesn't match the configured key. Only ever added to the router
-/// when `FERROX_API_KEY` is set (see `main.rs`) -- there is no
-/// "disabled" state to check here, keeping the common unauthenticated
-/// path free of any per-request branch.
+/// The key a request presents, by either accepted spelling.
+///
+/// `Authorization: Bearer` is the OpenAI convention and was the only
+/// one accepted. But this server also serves `/v1/messages`, and the
+/// Anthropic SDKs send `x-api-key` instead, so a stock Anthropic client
+/// pointed at a keyed deployment got a 401 no matter what key it held.
+/// Both are read here; the Authorization header wins when a client
+/// sends both, because it is the more specific request.
+fn presented_key(headers: &axum::http::HeaderMap) -> Option<&str> {
+    headers
+        .get(AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .or_else(|| headers.get("x-api-key").and_then(|v| v.to_str().ok()))
+}
+
+/// Rejects any request that does not present the configured key, as
+/// either `Authorization: Bearer <key>` or `x-api-key: <key>`. Only
+/// ever added to the router when `FERROX_API_KEY` is set (see
+/// `main.rs`) -- there is no "disabled" state to check here, keeping
+/// the common unauthenticated path free of any per-request branch.
 pub async fn require_api_key(
     State(config): State<AuthConfig>,
     req: Request<Body>,
     next: Next,
 ) -> Response {
-    let provided = req
-        .headers()
-        .get(AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "));
+    let provided = presented_key(req.headers());
 
     if provided == Some(config.api_key.as_str()) {
         next.run(req).await
@@ -153,6 +165,49 @@ pub async fn retry_after(req: Request<Body>, next: Next) -> Response {
 
 #[cfg(test)]
 mod tests {
+    use super::presented_key;
+
+    fn headers(pairs: &[(&str, &str)]) -> axum::http::HeaderMap {
+        let mut map = axum::http::HeaderMap::new();
+        for (name, value) in pairs {
+            map.insert(
+                axum::http::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                value.parse().unwrap(),
+            );
+        }
+        map
+    }
+
+    /// An Anthropic SDK sends `x-api-key`, and this server answers
+    /// `/v1/messages`, so refusing that header made the Anthropic
+    /// surface unreachable on any deployment that set a key.
+    #[test]
+    fn both_the_openai_and_the_anthropic_spellings_are_accepted() {
+        assert_eq!(
+            presented_key(&headers(&[("authorization", "Bearer sk-abc")])),
+            Some("sk-abc")
+        );
+        assert_eq!(
+            presented_key(&headers(&[("x-api-key", "sk-abc")])),
+            Some("sk-abc"),
+            "a stock Anthropic client sends only this header"
+        );
+        assert_eq!(presented_key(&headers(&[])), None);
+        assert_eq!(
+            presented_key(&headers(&[("authorization", "sk-abc")])),
+            None,
+            "Bearer is still required when the Authorization header is used"
+        );
+        assert_eq!(
+            presented_key(&headers(&[
+                ("authorization", "Bearer from-auth"),
+                ("x-api-key", "from-x"),
+            ])),
+            Some("from-auth"),
+            "the more specific header wins rather than the lookup order deciding"
+        );
+    }
+
     use super::*;
     use axum::{routing::get, Router};
     use tower::ServiceExt;

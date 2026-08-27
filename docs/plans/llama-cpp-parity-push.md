@@ -398,88 +398,14 @@ be edited until then. Not fixed here, and each worth ~1 ms/tok:
 3. `metal-fa-mma-d256` and the OLMoE Metal `tg128` row (1.41×), which
    the prefill stack did not touch.
 
-## Ledger as of v0.4.0 (2026-08-11, regenerated on Host B)
+## Historical ledger snapshots
 
-Phase 1 is complete **and now measured** — it was written on x86, where every
-aarch64 kernel compiles out, and sat unmeasured until it ran here.
-
-| Axis | Before | Now | Worst row |
-|---|---|---|---|
-| Metal `pp512` | 2.33–35.06× | **1.17–2.89×** | SmolLM2 2.89× |
-| CPU `pp512` | 3.17–5.82× | **0.94–1.63×** | Gemma-3-1B 1.63× |
-| Metal `tg128` | 1.03–2.87× | **0.60–1.46×** (6 of 11 at/ahead) | OLMoE 1.46× |
-| CPU `tg128` | 1.13–2.60× | **1.20–1.71×** | OLMoE 1.71× |
-
-Prefill is no longer the headline deficit. **CPU decode is** — behind on every
-row, and the only axis with no row at parity. Re-rank accordingly: 2a still
-owns the sub-1.5B Metal rows, but the conditional threadpool item under 1f is
-now unconditional.
-
-Two things the regenerated ledger surfaced that were not in the plan:
-
-- **Gemma-4-E2B Q4_K_M is slower on Metal than on CPU** (12.86 vs 21.66
-  `pp512`). Output is correct, so nothing is broken — the `Gemma4` engine is a
-  separate stack that never reaches `launch_prefill_dense_stack`. It is a
-  coverage gap, and it is the only model in the suite with no llama comparison.
-- **Sub-20% differences in the table are not resolvable.** Suite numbers sit
-  below a quieter interleaved `--compare` sweep by up to 15% on the same rows
-  (Qwen2.5-0.5B CPU `pp512` 614.59 vs 726.51). Only claim a row moved when it
-  moved by more than that.
-
-## Ledger after the MMA port (2026-08-11, commit 356dce1)
-
-Metal `pp512` was the worst axis at 1.7-2.9x. The simdgroup-MMA d=64
-flash attention closed it:
-
-| Model | before | now | llama | gap |
-|---|---|---|---|---|
-| SmolLM2-135M Q8_0 | 4183 | **11729** | 12002 | **1.02x** |
-| TinyLlama-1.1B Q8_0 | 1177 | **1975** | 2000 | **1.01x** |
-| Qwen2.5-0.5B Q8_0 | 2456 | **4389** | 4904 | 1.12x |
-| Llama-3.2-1B Q4_K_M | 1227 | **1746** | 1892 | 1.08x |
-| Llama-3.2-1B IQ4_XS | 1228 | **1756** | 1896 | 1.08x |
-
-Confirmed by interleaved A/B on `FERROX_METAL_FA_MMA` before the suite
-run: SmolLM2 2.8x, TinyLlama 1.69x, Qwen2.5 1.78x over the scalar kernel.
-
-**Qwen3-0.6B metal is the odd one out at 1.81x** where every other
-sub-1.5B dense model moved to ~1.1x. Its head_dim is 128, so it never
-takes the new d=64 kernel. Extending MMA to d=128 is the next Metal
-target and it is a known-shaped job, not an open question. d=256
-(Gemma-3) follows.
-
-Worst remaining rows overall are now **MoE and CPU**, not dense Metal
-prefill: OLMoE metal pp512 2.48x, Qwen3-0.6B metal 1.81x (above),
-Gemma-3-1B cpu pp512 1.94x.
-
-## d=128 MMA (2026-08-12, commit 0ee4d0b) — every d=128 Metal row closed
-
-The d=64 kernel body is now parameterised over the head dim, so one macro
-emits both `gqa_prefill_fa_ext_mma_d64` and `_d128`. Interleaved A/B,
-`-p 512 -n 0 -r 3 --ngl 99`, two reps per arm:
-
-| Model | fa_vec | mma | speedup | llama | gap |
-|---|---|---|---|---|---|
-| Qwen3-0.6B Q8_0 | 1917 | **3277** | 1.71x | 3509.65 | 1.81x -> **1.07x** |
-| Phi-4-mini Q4_K_M | 450 | **540** | 1.20x | 561.98 | 1.24x -> **1.04x** |
-| Llama-3.2-3B Q4_K_M | 523 | **630** | 1.20x | 563.26 | 1.08x -> **0.89x** |
-| Mistral-7B Q4_K_M | 235 | **266** | 1.13x | 256.55 | 1.10x -> **0.97x** |
-
-Greedy output is byte-identical with MMA on and off on Qwen3-0.6B and
-Phi-4-mini at a 16-token prompt. `gqa_prefill_fa_ext_mma_d128_matches_cpu_and_fa_vec`
-covers padded tails, exact 8-row fits and long-prefix/short-batch.
-
-**Owed: a suite run.** Host B sat at load 2.4-3.5 for the whole session
-(user applications), above the 2.0 bar, so `RESULTS.md` was deliberately
-not regenerated and still advertises Qwen3-0.6B metal at 1.81x. The A/B
-above is interleaved and valid as a *relative* measurement only. Run
-`--suite --fit-host --skip-missing` + `--render` on the next quiet window
-before any further Metal change, so this and the next change are not
-measured together.
-
-Only d=256 (Gemma-3, metal pp512 1.17x) is left without an MMA kernel.
-It needs a lane loop in the epilogue: `own` gives each lane one `float4`
-of the output row, which caps the macro at D/4 <= 32. **Done — see below.**
+Removed. Four point-in-time copies of the results table lived here (v0.4.0,
+the MMA port, the d=128 run, and a ranking the file itself labelled
+superseded). `benchmarks/RESULTS.md` is generated from the receipts and is
+the only table worth reading; keeping frozen copies beside it meant five
+answers to one question, four of them wrong. Receipts under
+`benchmarks/receipts/engine/` carry the version each row was measured on.
 
 ## d=256 MMA (2026-08-18, branch `wf/metal-fa-mma-d256`)
 
@@ -618,85 +544,6 @@ cycle:
   kernels. Either the MMA work fixed it or the original observation was
   logit drift that never flipped an argmax. Not claimed as a fix; reopen
   with a reproducer.
-
-## Every row still >1x, ranked (superseded above; kept for the CPU rows)
-
-The remaining work, in one place. Gap = `llama / ferrox`.
-
-**CPU decode (`tg128`) — 8 rows, nothing at parity. Largest single block.**
-
-| Model | ferrox | llama | gap |
-|---|---|---|---|
-| OLMoE-1B-7B Q4_0 | 65.72 | 112.08 | 1.71x |
-| TinyLlama-1.1B Q8_0 | 53.26 | 87.50 | 1.64x |
-| SmolLM2-135M Q8_0 | 110.48 | 176.12 | 1.59x |
-| Gemma-3-1B Q8_0 | 45.00 | 61.92 | 1.38x |
-| Qwen3-0.6B Q8_0 | 55.47 | 75.08 | 1.35x |
-| Phi-4-mini Q4_K_M | 25.69 | 31.67 | 1.23x |
-| Qwen2.5-0.5B Q8_0 | 81.15 | 99.63 | 1.23x |
-| Mistral-7B Q4_K_M | 16.74 | 20.06 | 1.20x |
-
-Decode is one activation against the whole weight matrix, so it is bandwidth-
-and latency-bound, not FLOP-bound: none of the Phase 1 GEMM work touches it.
-
-**MEASURED 2026-08-11 — it is scaling, not per-thread throughput.** Both
-engines run back-to-back, no forced `-t` except as the diagnostic variable:
-
-| Model | | ferrox | llama | gap | ferrox 1→6 | llama 1→6 |
-|---|---|---|---|---|---|---|
-| TinyLlama Q8_0 | t=1 | 38.25 | 43.47 | 1.14x | | |
-| | t=6 | 53.73 | 86.34 | 1.61x | **1.40x** | **1.99x** |
-| Mistral-7B Q4_K_M | t=1 | 5.87 | 4.75 | **0.81x** | | |
-| | t=6 | 17.19 | 20.85 | 1.21x | **2.93x** | **4.39x** |
-
-Per-thread throughput is not the problem — ferrox *beats* llama at one thread
-on Mistral-7B. The gap opens as threads are added, on both models. So
-**candidate 1 (fork-join overhead) is the cause and candidate 2 is closed**;
-the interleave-8 / i8mm decode kernels from PRs #4-#5 did their job.
-
-Headroom, if ferrox matched llama's scaling ratio: TinyLlama 38.25 x 1.99 =
-76.1 (gap 1.13x, from 1.61x), Mistral 5.87 x 4.39 = 25.8 — ahead of llama.
-
-Do **not** generalise from SmolLM2-135M. At that size both engines get *slower*
-with threads (ferrox 148.79 -> 105.46, llama 226.67 -> 166.78) and the gap is
-flat across thread counts, so it looks like a throughput problem and is not.
-It is the one row where a thread-count heuristic, not a faster pool, is the fix.
-
-Two candidate causes, now resolved by the measurement above:
-
-1. **Fork-join per matvec.** Decode does one rayon fork-join per weight
-   matrix, ~200/token on SmolLM2, and `sample` previously showed workers
-   parked in `wait_until_cold`. llama runs a persistent pool that spins on
-   `ggml_thread_cpu_relax` before parking (`ggml-cpu.c`, `ggml_barrier`).
-   This is the item 1f follow-up, now unconditional. Note the gap is largest
-   on the *smallest* models, which is what a fixed per-matvec overhead looks
-   like.
-2. ~~**Per-thread GEMV throughput.**~~ **Closed by measurement** — ferrox is
-   at 1.14x (TinyLlama) and 0.81x (Mistral) at equal thread count. PRs #4-#5
-   closed it. Cause 1 is the whole remainder.
-
-**CPU prefill (`pp512`) — 7 rows left, all under 1.7x.**
-
-| Model | gap | note |
-|---|---|---|
-| Gemma-3-1B Q8_0 | 1.63x | worst remaining; no diagnosis yet |
-| OLMoE-1B-7B Q4_0 | 1.33x | MoE, see Phase 4 |
-| SmolLM2-135M Q8_0 | 1.25x | smallest model, fixed-overhead shaped |
-| Mistral-7B Q4_K_M | 1.14x | |
-| Qwen2.5-0.5B Q8_0 | 1.12x | |
-| Qwen3-0.6B Q8_0 | 1.08x | |
-| Phi-4-mini Q4_K_M | 1.07x | |
-
-TinyLlama is ahead at 0.94x. The four rows at 1.07-1.14x are within a
-generous reading of this host's spread and should not be chased individually;
-Gemma-3-1B at 1.63x is the one that needs a cause.
-
-**Metal prefill — 5 rows above 1.5x**, all sub-1.5B or MoE: SmolLM2 2.89x,
-OLMoE 2.30x, Qwen2.5-0.5B 1.99x, Qwen3-0.6B 1.80x, TinyLlama 1.70x,
-IQ4_XS 1.60x, Llama-3.2-1B 1.53x. Owned by 2a, which is blocked on 2a-0.
-
-**Metal decode — 1 row**: OLMoE 1.46x. Everything else is at or ahead of
-parity.
 
 ## What a survey of two peer Rust engines actually yielded
 

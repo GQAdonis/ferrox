@@ -2,41 +2,64 @@
   "approx_params": 2640838656,
   "arch": "gemma4",
   "backend": "cpu",
-  "backend_active": "CPU",
-  "ferrox_version": "0.4.1",
+  "backend_active": "Metal",
+  "engine_env": {
+    "FERROX_CPU_INT_DOT": "1"
+  },
+  "ferrox_version": "0.12.0",
+  "host_load_1min_end": 2.84,
+  "host_load_1min_start": 1.95,
+  "host_thermal_end": {
+    "cpu_speed_limit_percent": null,
+    "degraded": false,
+    "measured": true,
+    "pressure": "nominal",
+    "source": "NSProcessInfo.thermalState"
+  },
+  "host_thermal_start": {
+    "cpu_speed_limit_percent": null,
+    "degraded": false,
+    "measured": true,
+    "pressure": "nominal",
+    "source": "NSProcessInfo.thermalState"
+  },
   "id": "gemma4_e2b_q4km",
   "kind": "engine",
-  "load_s": 0.094743625,
+  "load_s": 0.094035584,
   "model_path": "models/gemma-4-E2B-it-Q4_K_M.gguf",
   "quant": "quantized",
+  "quiet_host": true,
   "reps": 3,
-  "schema": 1,
+  "schema": 2,
   "size_bytes": 3106738272,
   "tests": [
     {
       "ferrox_samples": [
-        23.146255170748407,
-        23.119009330676203,
-        22.950755857095942
+        14.667225014310572,
+        14.58671434829896,
+        14.382799082458883
       ],
-      "ferrox_stddev": 0.08645586466300398,
-      "ferrox_tps": 23.119009330676203,
+      "ferrox_stddev": 0.11970403951875311,
+      "ferrox_tps": 14.58671434829896,
       "gap": null,
       "llama_tps": null,
-      "test": "pp512"
+      "test": "pp512",
+      "workload_digest": "b8d417040110e751"
     },
     {
       "ferrox_samples": [
-        24.830365037264333,
-        27.161380324525016,
-        27.20985858719115
+        15.786483939009639,
+        15.779045612066666,
+        15.846100689342519
       ],
-      "ferrox_stddev": 1.110453959500721,
-      "ferrox_tps": 27.161380324525016,
+      "ferrox_stddev": 0.030010866580909182,
+      "ferrox_tps": 15.786483939009639,
       "gap": null,
       "llama_tps": null,
-      "test": "tg128"
+      "test": "tg128",
+      "workload_digest": "044655d19aa3baa5"
     }
   ],
-  "threads": 6
+  "threads": 6,
+  "warmup_reps": 1
 }

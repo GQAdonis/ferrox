@@ -23,6 +23,92 @@
 /// start. Matches the bar in `docs/plans/llama-cpp-parity-push.md`.
 pub const DEFAULT_MAX_LOAD: f64 = 2.0;
 
+/// Free physical memory in GiB, or `None` if this platform will not
+/// say.
+///
+/// "Free" here means pages the kernel can hand out without evicting
+/// something, so on macOS it is the free plus inactive (reclaimable)
+/// pages from `vm_stat`, not `hw.memsize` and not the "unused" figure
+/// `top` prints.
+///
+/// This exists because `--fit-host` compares a model's estimated
+/// footprint against TOTAL physical memory. A 32 GiB box with 3.5 GiB
+/// free therefore accepts a 10 GiB model, runs it, pages it to disk,
+/// and reports a number that looks like a measurement. That is the
+/// same failure the load bar exists to stop, and nothing caught it.
+pub fn free_ram_gb() -> Option<f64> {
+    #[cfg(target_os = "macos")]
+    {
+        let out = std::process::Command::new("vm_stat").output().ok()?;
+        let text = String::from_utf8(out.stdout).ok()?;
+        return parse_vm_stat_free_gb(&text);
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let text = std::fs::read_to_string("/proc/meminfo").ok()?;
+        // MemAvailable is the kernel's own estimate of what a new
+        // allocation can get, which is exactly the question here.
+        let kb: f64 = text
+            .lines()
+            .find_map(|l| l.strip_prefix("MemAvailable:"))?
+            .split_whitespace()
+            .next()?
+            .parse()
+            .ok()?;
+        return Some(kb / 1024.0 / 1024.0);
+    }
+    #[allow(unreachable_code)]
+    None
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn parse_vm_stat_free_gb(text: &str) -> Option<f64> {
+    let page_size: f64 = text
+        .lines()
+        .next()?
+        .split("page size of ")
+        .nth(1)?
+        .split_whitespace()
+        .next()?
+        .parse()
+        .ok()?;
+    let pages = |label: &str| -> f64 {
+        text.lines()
+            .find_map(|l| l.strip_prefix(label))
+            .and_then(|v| v.trim().trim_end_matches('.').parse::<f64>().ok())
+            .unwrap_or(0.0)
+    };
+    // Inactive pages are reclaimable without swapping, so a benchmark
+    // can have them. Speculative pages are already counted in free.
+    let usable = pages("Pages free:") + pages("Pages inactive:");
+    Some(usable * page_size / 1024.0 / 1024.0 / 1024.0)
+}
+
+/// Refuses a timed run that would not fit in memory and so would be
+/// measuring the page file.
+///
+/// `needs_gb <= 0.0` means the caller does not know the footprint, and
+/// an unknown never refuses. Neither does a host that will not report
+/// its free memory: silence is not evidence, the same rule the load bar
+/// follows.
+pub fn ensure_fits_in_ram(needs_gb: f64, headroom_gb: f64) -> anyhow::Result<()> {
+    if needs_gb <= 0.0 {
+        return Ok(());
+    }
+    let Some(free) = free_ram_gb() else {
+        return Ok(());
+    };
+    anyhow::ensure!(
+        free >= needs_gb + headroom_gb,
+        "this model needs about {needs_gb:.1} GiB and only {free:.1} GiB is free \
+         (plus {headroom_gb:.1} GiB headroom). It would run from swap, and a paged \
+         run reports a real-looking number for work the disk did. Close something, \
+         or pass --max-load 0 to measure anyway and accept that the number is not \
+         publishable."
+    );
+    Ok(())
+}
+
 /// 1-minute load average, or `None` if this platform will not say.
 pub fn load_average_1min() -> Option<f64> {
     // Linux: cheapest possible, no child process.
@@ -267,6 +353,44 @@ pub fn ensure_quiet_enough(max_load: f64) -> anyhow::Result<Option<f64>> {
     Ok(load)
 }
 
+/// Waits for the host to fall back under the bar, then returns.
+///
+/// A suite runs one heavy child per entry, and the 1-minute load
+/// average it reads is mostly the PREVIOUS entry's own benchmark still
+/// decaying. Failing on that makes the suite defeat its own gate: the
+/// first entries measure, their load locks out everything after them,
+/// and a 21-row run writes 2 receipts. Measured that way on Host B
+/// before this existed.
+///
+/// So between entries the answer is to wait rather than to refuse. An
+/// external load that never clears still fails, after `timeout`, which
+/// is the case the bar was written for.
+pub fn wait_until_quiet_enough(max_load: f64, timeout: std::time::Duration) -> anyhow::Result<()> {
+    if max_load <= 0.0 {
+        return Ok(());
+    }
+    let start = std::time::Instant::now();
+    loop {
+        match load_average_1min() {
+            // An unmeasured host never blocks: silence is not evidence
+            // of a busy machine, the same rule the bar itself follows.
+            None => return Ok(()),
+            Some(l) if l < max_load => return Ok(()),
+            Some(l) => {
+                if start.elapsed() >= timeout {
+                    anyhow::bail!(
+                        "host 1-minute load average is still {l:.2} after waiting {}s for it \
+                         to fall below {max_load:.2}. Something other than this suite is \
+                         busy; a timed run here is noise, not a measurement.",
+                        timeout.as_secs()
+                    );
+                }
+                std::thread::sleep(std::time::Duration::from_secs(5));
+            }
+        }
+    }
+}
+
 /// Refuses a timed run while the OS says it is actively giving up
 /// clocks to stay cool. Shares `--max-load 0`'s escape hatch, because
 /// it is the same escape: measure anyway, but the number is not
@@ -303,12 +427,85 @@ mod tests {
         assert_eq!(parse_sysctl_loadavg("no such oid"), None);
     }
 
+    /// `vm_stat` output is the only thing standing between a paged
+    /// benchmark and a published number, so its parse is pinned to a
+    /// real sample rather than to whatever the current host prints.
+    #[test]
+    fn free_ram_counts_reclaimable_pages_not_just_free_ones() {
+        let sample = "Mach Virtual Memory Statistics: (page size of 16384 bytes)\n\
+             Pages free:                          65536.\n\
+             Pages active:                       500000.\n\
+             Pages inactive:                      65536.\n\
+             Pages speculative:                    1000.\n";
+        let gb = parse_vm_stat_free_gb(sample).expect("a well-formed vm_stat must parse");
+        // 131072 pages * 16 KiB = 2 GiB. Inactive is reclaimable, so
+        // counting free alone would report half the truth and let a
+        // model through that then pages.
+        assert!(
+            (gb - 2.0).abs() < 0.01,
+            "expected 2 GiB from free+inactive, got {gb}"
+        );
+    }
+
+    /// An unknown footprint and an unmeasurable host both mean "do not
+    /// know", and neither may refuse a run.
+    #[test]
+    fn an_unknown_footprint_never_refuses() {
+        ensure_fits_in_ram(0.0, 2.0).expect("an unknown footprint must not refuse");
+    }
+
+    /// The refusal has to name the number the operator can act on.
+    #[test]
+    fn a_model_larger_than_free_ram_is_refused_with_both_figures() {
+        if free_ram_gb().is_none() {
+            return; // platform will not say; the guard correctly no-ops
+        }
+        let err = ensure_fits_in_ram(1_000_000.0, 2.0)
+            .expect_err("a model larger than any host must be refused");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("swap") && msg.contains("free"),
+            "the refusal must say it would page and how much is free, got: {msg}"
+        );
+    }
+
     #[test]
     fn pmset_reports_a_speed_limit_only_when_it_has_one() {
         assert_eq!(parse_pmset_therm("CPU_Speed_Limit \t= 70\n"), Some(70));
         assert_eq!(
             parse_pmset_therm("Note: No thermal warning level has been recorded"),
             None
+        );
+    }
+
+    /// The disable switch has to disable the WAIT too, or
+    /// `--max-load 0` would still block a suite for three minutes per
+    /// entry on a busy box, which is the opposite of what it promises.
+    #[test]
+    fn waiting_is_disabled_by_the_same_switch_that_disables_refusing() {
+        let start = std::time::Instant::now();
+        wait_until_quiet_enough(0.0, std::time::Duration::from_secs(30))
+            .expect("max_load 0 must never block");
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(1),
+            "max_load 0 returned only after waiting, so it did not disable the wait"
+        );
+    }
+
+    /// A bar nothing could ever clear must give up rather than hang the
+    /// suite forever. The timeout is the whole reason a wait is safe to
+    /// put in front of every entry.
+    #[test]
+    fn an_impossible_bar_times_out_instead_of_waiting_forever() {
+        if load_average_1min().is_none() {
+            return; // platform will not say; the wait correctly no-ops
+        }
+        let err = wait_until_quiet_enough(0.000_001, std::time::Duration::from_millis(1))
+            .expect_err("a bar no host can clear must time out");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("still") && msg.contains("busy"),
+            "the timeout must say what it waited for, got: {msg}"
         );
     }
 

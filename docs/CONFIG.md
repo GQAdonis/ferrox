@@ -56,9 +56,9 @@ library or overriding the CLI.
 | `FERROX_KV_POOL_BLOCK_SIZE` | Tokens per KV pool block |
 | `FERROX_KV_POOL_QUEUE_TIMEOUT_MS` | How long a request waits for free KV before it is rejected. Applies to both the pool and paged KV |
 | `FERROX_KV_BYTE_BUDGET` | Byte ceiling for the KV block pool, independent of block count |
-| `FERROX_PAGED_KV_BLOCKS` | Blocks per layer of real paged KV: shared page storage many requests read through a block table, rather than a private buffer each. Mutually exclusive with `FERROX_KV_POOL_BLOCKS`/`FERROX_KV_BYTE_BUDGET` and with `FERROX_PREFIX_CACHE_ENTRIES`; setting an excluded pair stops the server with an error naming both |
-| `FERROX_PAGED_KV_BLOCK_SIZE` | Positions per paged-KV block. Must be set together with `FERROX_PAGED_KV_BLOCKS` |
-| `FERROX_PREFIX_CACHE_ENTRIES` | Prefix-cache capacity for the private generate path. Mutually exclusive with continuous batching and with paged KV. Paged KV has no such exclusion: it composes with continuous batching, and shares prefixes through the radix tree instead |
+| `FERROX_PAGED_KV_BLOCKS` | Blocks per layer of real paged KV: shared page storage many requests read through a block table, rather than a private buffer each. **CPU only today**, and `ferrox-server` only. Mutually exclusive with `FERROX_KV_POOL_BLOCKS`/`FERROX_KV_BYTE_BUDGET` and with `FERROX_PREFIX_CACHE_ENTRIES`; setting an excluded pair stops the server with an error naming both. Read the paragraph under this table before using it |
+| `FERROX_PAGED_KV_BLOCK_SIZE` | Positions per paged-KV block. Must be set together with `FERROX_PAGED_KV_BLOCKS`, or the server stops |
+| `FERROX_PREFIX_CACHE_ENTRIES` | Prefix-cache capacity for the private generate path: whole KV snapshots in an LRU list, reported under `GET /cache/stats`. Mutually exclusive with continuous batching and with paged KV. Paged KV carries no such exclusion: it composes with continuous batching and shares prefixes through the radix tree instead |
 | `FERROX_EXPERT_CACHE_BYTES` | MoE expert-streaming cache budget |
 | `FERROX_SSD_STREAMING` | `1`, stream MoE experts from disk |
 | `FERROX_GPU_VRAM_BUDGET_BYTES` | Cap GPU-resident MoE experts (`0` = CPU experts on Metal) |
@@ -68,6 +68,41 @@ library or overriding the CLI.
 | `FERROX_DECODE_LOG_INTERVAL` | Decode forwards between two batch status lines (default 40). `0` logs every forward. An unparseable value takes the default rather than failing a server to start over a log setting |
 | `FERROX_ACCOUNTING_OUTBOX` | Directory accounting receipts are written to, atomically and idempotently by receipt id, before `POST /v1/admin/prepare-stop` answers. Unset means no outbox and no persistence step |
 | `FERROX_INSTANCE_ID` | Names this engine generation for the receipt id. Unset falls back to the pid plus the process's wall-clock start, which is stable for the life of the process and different in the next one |
+
+### Paged KV is CPU only, and the check has a hole
+
+On a GPU backend the paged attention path returns wrong tokens rather
+than failing. Measured on an M2 Pro with Llama-3.2-3B Q4_K_M, same
+prompt and same seed: CPU paged and CPU contiguous both answer
+"Blue and Red.", and Metal paged answers "Blue ( question mark;>a> is
+a> is". Nothing in the response says the attention read the wrong pages,
+which is why the server stops rather than serving it.
+
+The check resolves the device rather than matching a string. It fires
+for `-dev metal`, `-dev cuda`, either variable set to `1` by hand, and
+for `-ngl 99` on its own, which leaves the device on `auto` and still
+picks up a Metal device when one is present. `auto` on a host with no
+GPU is a CPU run, so paged KV stays available there.
+
+### Sharing pages between prompts
+
+Turning paged KV on also turns on a radix prefix cache over the same
+pages. There is no separate switch, because sharing means two sequences
+pointing at one page rather than one of them holding a copy, and only
+the paged store can do that.
+
+Each new prompt is matched against a tree of already-computed prefixes,
+keyed by page. The matched prefix is locked for the request's life and
+its page groups have their reference counts raised, so a thousand
+conversations off one system prompt hold one copy of its KV rather than
+a thousand. What the request reused shows up as `usage.cached_tokens`.
+There is no aggregate hit rate on `/v1/stats` or `/metrics`, and no
+eviction knob: back pressure comes from the page store running out and
+`FERROX_KV_POOL_QUEUE_TIMEOUT_MS` turning waiting requests away.
+
+This is a different mechanism from `FERROX_PREFIX_CACHE_ENTRIES`, which
+stores whole contiguous KV snapshots and copies them. The two cannot be
+on at once.
 
 ## Security and transport
 

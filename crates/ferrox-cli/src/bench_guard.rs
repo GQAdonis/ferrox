@@ -171,7 +171,28 @@ pub fn check_prefill_after(
 /// The decode equivalent: one priming token plus `n_gen` steps must
 /// leave exactly `n_gen + 1` positions in every layer's cache. A short
 /// cache means steps were skipped, which inflates the rate.
-pub fn check_decode_after(test: &str, n_gen: usize, caches: &[CacheProbe]) -> anyhow::Result<()> {
+///
+/// Only meaningful when the HOST cache is the record. With GPU offload
+/// the KV lives in device memory and the host `KvCache` is never
+/// written unless `FERROX_CPU_KV_OFFLOAD=1` syncs it back, so every
+/// layer reads 0 and this refuses a run that did nothing wrong. That
+/// is not hypothetical: it failed every Metal row of a full suite
+/// while the CPU rows passed, which is what a backend-blind assertion
+/// looks like from the outside.
+///
+/// Returns whether the check actually ran, so the caller can record
+/// that in the receipt. "Not checked" and "checked and passed" are
+/// different facts and a receipt that conflates them is worth less.
+pub fn check_decode_after(
+    test: &str,
+    n_gen: usize,
+    caches: &[CacheProbe],
+    host_kv_is_the_record: bool,
+) -> anyhow::Result<bool> {
+    if !host_kv_is_the_record {
+        // The device holds the KV. There is nothing here to count.
+        return Ok(false);
+    }
     let expected = n_gen + 1;
     if let Some((layer, c)) = caches
         .iter()
@@ -185,7 +206,57 @@ pub fn check_decode_after(test: &str, n_gen: usize, caches: &[CacheProbe]) -> an
             c.seq_len
         );
     }
-    Ok(())
+    Ok(true)
+}
+
+#[cfg(test)]
+mod decode_guard_tests {
+    use super::*;
+
+    /// The whole point of the backend flag: a GPU run has an empty host
+    /// cache and must not be refused for it. Before this, every Metal
+    /// row of a full suite failed while the CPU rows passed.
+    #[test]
+    fn a_device_resident_cache_is_not_counted_and_says_so() {
+        let empty = vec![
+            CacheProbe {
+                seq_len: 0,
+                k_len: 0,
+                v_len: 0
+            };
+            4
+        ];
+        let ran = check_decode_after("tg128", 128, &empty, false)
+            .expect("a device-resident cache must not refuse the run");
+        assert!(
+            !ran,
+            "it must report that it did not check, not that it passed"
+        );
+    }
+
+    /// And the check still bites where the host cache IS the record,
+    /// or turning it off for GPU would have removed it everywhere.
+    #[test]
+    fn a_short_host_cache_still_fails() {
+        let short = vec![CacheProbe {
+            seq_len: 3,
+            k_len: 3,
+            v_len: 3,
+        }];
+        let err = check_decode_after("tg128", 128, &short, true)
+            .expect_err("a short host cache means skipped decode steps");
+        assert!(err.to_string().contains("expected 129"));
+    }
+
+    #[test]
+    fn a_correct_host_cache_reports_that_it_actually_checked() {
+        let good = vec![CacheProbe {
+            seq_len: 129,
+            k_len: 129,
+            v_len: 129,
+        }];
+        assert!(check_decode_after("tg128", 128, &good, true).expect("must pass"));
+    }
 }
 
 /// Running digest of the exact token stream fed inside the timed
@@ -488,8 +559,8 @@ mod tests {
 
     #[test]
     fn skipped_decode_steps_are_caught_by_the_final_cache_length() {
-        assert!(check_decode_after("tg128", 128, &filled(4, 129, 64)).is_ok());
-        let err = check_decode_after("tg128", 128, &filled(4, 65, 64))
+        assert!(check_decode_after("tg128", 128, &filled(4, 129, 64), true).is_ok());
+        let err = check_decode_after("tg128", 128, &filled(4, 65, 64), true)
             .unwrap_err()
             .to_string();
         assert!(err.contains("expected 129"), "{err}");

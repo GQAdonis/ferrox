@@ -3189,15 +3189,82 @@ async fn chat_completions_stream(
         .into_response())
 }
 
-/// The axum pattern for one of the published stream templates.
+/// Does this value, on this hardware, put layers on the GPU?
+///
+/// Split out from the env lookup because it is the whole decision and
+/// the env lookup is not testable. `"auto"` is the interesting case:
+/// it means "GPU if there is one", so it can only be answered together
+/// with whether a device was found.
+fn gpu_selected(value: Option<&str>, device_present: bool) -> bool {
+    match value {
+        Some("1") => true,
+        Some("auto") => device_present,
+        _ => false,
+    }
+}
+
+/// Whether the run will really offload to a GPU.
+///
+/// `-dev metal` sets `FERROX_METAL=1`, but a plain `--ngl 99` leaves
+/// the device on `Auto` and sets `"auto"` instead. The paged-KV guard
+/// below compared against `"1"` alone, so the most common way to ask
+/// for the GPU walked past it and paged decode ran on Metal anyway,
+/// which is exactly the wrong-token case the guard exists to stop.
+fn gpu_offload_resolved() -> bool {
+    let metal_present = {
+        #[cfg(feature = "metal")]
+        {
+            ferrox_metal::MetalProfile::detect().available
+        }
+        #[cfg(not(feature = "metal"))]
+        {
+            false
+        }
+    };
+    let cuda_present = {
+        #[cfg(feature = "cuda")]
+        {
+            ferrox_cuda::HardwareProfile::detect().cuda_available
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            false
+        }
+    };
+    gpu_selected(std::env::var("FERROX_METAL").ok().as_deref(), metal_present)
+        || gpu_selected(std::env::var("FERROX_CUDA").ok().as_deref(), cuda_present)
+}
+
+/// The axum pattern for one of the published path templates.
 ///
 /// `ferrox_api::routes` writes placeholders in the OpenAPI style
 /// because it is imported by clients that have never heard of this
 /// server's router; axum 0.7 wants `:name`. Converting here keeps one
 /// published spelling and one router spelling, and the test below fails
 /// if they ever stop describing the same path.
-fn resume_route(template: &str) -> String {
-    template.replace("{request_id}", ":request_id")
+///
+/// This rewrites EVERY `{name}` it finds rather than one known
+/// placeholder. The narrow version took `{request_id}` only, so the two
+/// Responses templates were mounted with their braces intact and axum
+/// read `{response_id}` as a literal segment: `GET /v1/responses/abc`
+/// matched no route and got axum's bodiless 404 instead of the
+/// handler's, and the one path that did match would have panicked on
+/// `MissingPathParams`. Anything with a placeholder must go through
+/// here.
+fn axum_path(template: &str) -> String {
+    let mut out = String::with_capacity(template.len());
+    let mut rest = template;
+    while let Some(open) = rest.find('{') {
+        let Some(close) = rest[open..].find('}').map(|c| open + c) else {
+            break;
+        };
+        out.push_str(&rest[..open]);
+        out.push(':');
+        out.push_str(&rest[open + 1..close]);
+        rest = &rest[close + 1..];
+    }
+    out.push_str(rest);
+    out
 }
 
 /// `POST /v1/cancel` -- the explicit half of two-tier cancellation.
@@ -3994,6 +4061,28 @@ async fn run(mcp_config_path: Option<PathBuf>, exit_on_stdin_close: bool) -> any
                  mutually exclusive: both bound the same KV memory, by different means. \
                  Set one."
             );
+            // Paged KV computes the wrong answer on the GPU today.
+            // Measured on this host with Llama-3.2-3B Q4_K_M: CPU
+            // paged and non-paged both answer "Blue and Red.", and
+            // Metal paged answers "Blue ( question mark;>a> is a> is".
+            // The prompt, the seed and the model are identical, so the
+            // page indirection is diverging somewhere the contiguous
+            // path does not.
+            //
+            // Refused rather than left to run, because fluent wrong
+            // output is the failure this project refuses everywhere
+            // else: nothing in the response says the attention read the
+            // wrong pages. Lift this once the paged path passes
+            // `ferrox verify --backend metal` with prefill covered.
+            let gpu_offload = gpu_offload_resolved();
+            assert!(
+                !gpu_offload,
+                "FERROX_PAGED_KV_BLOCKS is CPU-only right now: on a GPU \
+                 backend the paged attention path returns wrong tokens \
+                 rather than failing, so it is refused instead. Run the \
+                 server with `-dev none -ngl 0` to use paged KV, or unset \
+                 FERROX_PAGED_KV_BLOCKS to use the GPU."
+            );
             let blocks_per_layer: usize = blocks
                 .parse()
                 .expect("FERROX_PAGED_KV_BLOCKS must be a positive integer");
@@ -4174,9 +4263,12 @@ async fn run(mcp_config_path: Option<PathBuf>, exit_on_stdin_close: bool) -> any
         // same key as `/v1/chat/completions`: it must cost what
         // decoding tokens costs.
         .route(routes::V1_RESPONSES, post(responses::responses))
-        .route(routes::V1_RESPONSE, get(responses::responses_get))
         .route(
-            routes::V1_RESPONSE_CANCEL,
+            &axum_path(routes::V1_RESPONSE),
+            get(responses::responses_get),
+        )
+        .route(
+            &axum_path(routes::V1_RESPONSE_CANCEL),
             post(responses::responses_cancel),
         )
         .route(routes::V1_STATS, get(serving_stats))
@@ -4193,8 +4285,8 @@ async fn run(mcp_config_path: Option<PathBuf>, exit_on_stdin_close: bool) -> any
         // as the request that filled the buffer: the replay window holds
         // the model's output, so reading it must cost what producing it
         // cost.
-        .route(&resume_route(routes::V1_STREAM), get(resume::resume))
-        .route(&resume_route(routes::V1_STREAM_POLL), get(resume::poll))
+        .route(&axum_path(routes::V1_STREAM), get(resume::resume))
+        .route(&axum_path(routes::V1_STREAM_POLL), get(resume::poll))
         .route(routes::V1_MESSAGES, post(anthropic::messages))
         .route(
             routes::V1_MESSAGES_COUNT_TOKENS,
@@ -4538,11 +4630,11 @@ mod tests {
             .route(ferrox_api::routes::V1_MODELS, get(list_models))
             .route(ferrox_api::routes::V1_RESPONSES, post(responses::responses))
             .route(
-                ferrox_api::routes::V1_RESPONSE,
+                &axum_path(ferrox_api::routes::V1_RESPONSE),
                 get(responses::responses_get),
             )
             .route(
-                ferrox_api::routes::V1_RESPONSE_CANCEL,
+                &axum_path(ferrox_api::routes::V1_RESPONSE_CANCEL),
                 post(responses::responses_cancel),
             )
             .route(ferrox_api::routes::V1_STATS, get(serving_stats))
@@ -4577,11 +4669,11 @@ mod tests {
             .route(ferrox_api::routes::ADMIN_STATS, get(admin::stats))
             .route(ferrox_api::routes::V1_CANCEL, post(cancel_generation))
             .route(
-                &resume_route(ferrox_api::routes::V1_STREAM),
+                &axum_path(ferrox_api::routes::V1_STREAM),
                 get(resume::resume),
             )
             .route(
-                &resume_route(ferrox_api::routes::V1_STREAM_POLL),
+                &axum_path(ferrox_api::routes::V1_STREAM_POLL),
                 get(resume::poll),
             )
             .with_state(state)
@@ -5549,16 +5641,90 @@ mod tests {
     #[test]
     fn the_axum_stream_patterns_match_the_published_templates() {
         assert_eq!(
-            resume_route(ferrox_api::routes::V1_STREAM),
+            axum_path(ferrox_api::routes::V1_STREAM),
             "/v1/stream/:request_id"
         );
         assert_eq!(
-            resume_route(ferrox_api::routes::V1_STREAM_POLL),
+            axum_path(ferrox_api::routes::V1_STREAM_POLL),
             "/v1/stream/:request_id/poll"
         );
         assert_eq!(
             ferrox_api::routes::v1_stream("abc"),
-            resume_route(ferrox_api::routes::V1_STREAM).replace(":request_id", "abc")
+            axum_path(ferrox_api::routes::V1_STREAM).replace(":request_id", "abc")
+        );
+    }
+
+    /// `--ngl 99` on its own asks for the GPU, and the paged-KV guard
+    /// has to see that.
+    ///
+    /// The guard compared the env var against "1", which only `-dev
+    /// metal` sets. A plain `--ngl 99` leaves the device on Auto and
+    /// sets "auto", so paged decode ran on Metal and returned fluent
+    /// wrong tokens: the exact outcome the guard was added to prevent.
+    #[test]
+    fn auto_counts_as_the_gpu_whenever_there_is_one() {
+        assert!(gpu_selected(Some("1"), true));
+        assert!(
+            gpu_selected(Some("auto"), true),
+            "--ngl 99 with a Metal device present is a GPU run"
+        );
+        assert!(
+            !gpu_selected(Some("auto"), false),
+            "auto on a box with no GPU is a CPU run, and paged KV is fine there"
+        );
+        assert!(!gpu_selected(Some("0"), true));
+        assert!(!gpu_selected(None, true));
+    }
+
+    /// Every published template goes through the converter, and what
+    /// comes out has no braces left in it.
+    ///
+    /// The two Responses routes were mounted raw, so axum matched the
+    /// literal segment `{response_id}` and a real id fell through to a
+    /// bodiless 404. The test router had the same two lines, which is
+    /// why nothing caught it. This walks the templates instead of
+    /// naming them, so the next one added is covered without anybody
+    /// remembering to come back here.
+    #[test]
+    fn no_published_template_reaches_the_router_with_its_braces() {
+        for template in [
+            ferrox_api::routes::V1_STREAM,
+            ferrox_api::routes::V1_STREAM_POLL,
+            ferrox_api::routes::V1_RESPONSE,
+            ferrox_api::routes::V1_RESPONSE_CANCEL,
+            ferrox_api::routes::ADMIN_TASK_CANCEL,
+        ] {
+            assert!(
+                template.contains('{'),
+                "{template} is in the template list but has no placeholder"
+            );
+            let mounted = axum_path(template);
+            assert!(
+                !mounted.contains('{') && !mounted.contains('}'),
+                "{template} would be mounted as {mounted}, whose braces axum reads as a literal segment"
+            );
+            assert!(
+                mounted.contains(':'),
+                "{template} lost its placeholder entirely and would match one path only"
+            );
+        }
+    }
+
+    /// A real id must reach the handler, not axum's catch-all 404.
+    ///
+    /// The distinction is the whole point: axum answers an unmatched
+    /// path with an empty body, while the handler answers an unknown id
+    /// with a reasoned JSON error. Asserting on the body rather than
+    /// the status is what separates "the route is missing" from "the
+    /// response is not here".
+    #[tokio::test]
+    async fn an_unknown_response_id_gets_the_handler_not_a_bare_404() {
+        let app = test_app();
+        let (status, body) = get_json(&app, "/v1/responses/resp_nonexistent").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(
+            !body.is_null(),
+            "empty body means axum never matched the route, so the id was read as a literal segment"
         );
     }
 

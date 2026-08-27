@@ -124,10 +124,11 @@ OpenAI-compatible HTTP API:
 - Paged KV: shared page storage many requests read through a block
   table, with a radix tree over reference-counted page groups so
   conversations off one system prompt share its KV rather than each
-  holding a copy. **CPU only**, since the paged attention path returns
-  wrong tokens on a GPU backend. Off unless
-  `FERROX_PAGED_KV_BLOCKS` is set, and the server stops at startup when
-  it is set beside `-dev metal` or `-dev cuda`. See
+  holding a copy. Off unless `FERROX_PAGED_KV_BLOCKS` is set. It used to
+  be refused on a GPU backend, where it returned fluent wrong tokens; the
+  cause was a Metal prefill leaving K/V on the device and filling the
+  host cache with placeholders that the paged prefill then copied into
+  the page store, and that refusal is lifted. See
   [`CONFIG.md`](CONFIG.md)
 - On a model whose layers *all* slide by the same window, that
   window slides during decode, so a request holds its prompt and a

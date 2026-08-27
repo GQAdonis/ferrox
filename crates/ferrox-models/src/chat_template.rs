@@ -56,7 +56,7 @@
 //! | `raise_exception(msg)` | provided here; aborts the render with the message |
 //! | `strftime_now(fmt)` | provided here, UTC, subset of `strftime` (see [`strftime_now`]) |
 //! | `dictsort`, `map`, `default`, `trim`, `reject`, `join`, slicing | minijinja builtins |
-//! | `tojson` | reimplemented here to match jinja2's `json.dumps(sort_keys=True)` byte for byte |
+//! | `tojson` | reimplemented here; `json.dumps` separators, keys sorted (see [`tojson`]) |
 //! | Python methods `.get()`, `.split()`, `.strip()/.lstrip()/.rstrip()` | provided here (see [`python_method`]) |
 //! | anything else | **hard error**, never silently empty |
 //!
@@ -321,6 +321,27 @@ fn new_environment() -> minijinja::Environment<'static> {
     // undefined is falsy and prints empty, but any *operation* on it
     // (indexing, arithmetic, calling) is still an error.
     env.set_undefined_behavior(minijinja::UndefinedBehavior::Lenient);
+    // The two whitespace flags a chat template is authored against, and
+    // the only two settings in this function whose absence is *silent*.
+    //
+    // HuggingFace compiles every chat template with
+    // `ImmutableSandboxedEnvironment(trim_blocks=True, lstrip_blocks=True)`
+    // and llama.cpp's own Jinja engine hardcodes the same pair for chat
+    // templates (`common/jinja/lexer.cpp:112-118`: "default config for
+    // chat template: lstrip_blocks = true, trim_blocks = true").
+    // minijinja defaults both to `false`, matching stock jinja2 rather
+    // than either engine that actually renders these strings.
+    //
+    // A template written with explicit `{%- … -%}` markers is unaffected,
+    // which is why most of `tests/templates/` renders identically either
+    // way and this went unnoticed. TinyLlama-1.1B-Chat's real template is
+    // not written that way: without these two flags its three-turn render
+    // is `\n\n<|user|>\n…</s>\n\n\n\n\n<|assistant|>\n…`, thirteen bytes of
+    // stray blank line that the checkpoint was never trained on and that
+    // llama.cpp does not emit. `whitespace_control_matches_huggingface_and_llama_cpp`
+    // pins it.
+    env.set_trim_blocks(true);
+    env.set_lstrip_blocks(true);
     // Real templates are one giant expression; the default recursion
     // limit is fine, but gemma-4's `format_parameters` recurses through
     // nested JSON schemas, so keep the default rather than lowering it.
@@ -335,16 +356,28 @@ fn new_environment() -> minijinja::Environment<'static> {
 /// function schema into the prompt, so its exact byte output is part of
 /// the prompt the model was trained on.
 ///
-/// Overrides minijinja's builtin, which emits `{"a":1}`. jinja2's
-/// `tojson` is `json.dumps` with `sort_keys=True` (jinja2's default
-/// policy) and `json.dumps`' default `", "` / `": "` separators, i.e.
-/// `{"a": 1}`. Matching that is the difference between the prompt
+/// Overrides minijinja's builtin, which emits `{"a":1}`. Both reference
+/// engines use `json.dumps`' default `", "` / `": "` separators, i.e.
+/// `{"a": 1}`, and matching that is the difference between the prompt
 /// HuggingFace produces and a near-miss.
 ///
-/// One disclosed deviation from jinja2: no `htmlsafe_json_dumps`
-/// escaping of `< > & '` into `<`-style escapes. llama.cpp's minja
-/// does not do it either, and it is llama.cpp that this engine is
-/// checked against.
+/// Two disclosed deviations, both deliberate:
+///
+/// 1. **Key order.** This sorts, which is *stock* jinja2's default
+///    policy (`policies["json.dumps_kwargs"] = {"sort_keys": True}`).
+///    Neither engine that actually renders chat templates does:
+///    transformers replaces the filter with
+///    `json.dumps(..., sort_keys=False)`, and llama.cpp's refuses
+///    `sort_keys=true` outright (`common/jinja/value.cpp:251`). Ferrox
+///    cannot follow them today for a reason below this module:
+///    `serde_json::Map` is a `BTreeMap` unless the whole workspace turns
+///    on `serde_json/preserve_order`, so a tool schema arrives here
+///    already sorted and the author's key order is gone before `tojson`
+///    ever sees it. The visible effect is the order of the keys inside a
+///    `<tools>` block, not their content.
+/// 2. No `htmlsafe_json_dumps` escaping of `< > & '` into `<`-style
+///    escapes. llama.cpp does not do it either, and it is llama.cpp that
+///    this engine is checked against.
 fn tojson(value: JinjaValue) -> Result<String, minijinja::Error> {
     let json: Value = serde_json::to_value(&value).map_err(|e| {
         minijinja::Error::new(

@@ -200,6 +200,25 @@ impl ModelConfig {
         let n_layers =
             file.metadata_u64(&key("block_count"))
                 .ok_or_else(|| LoadError::MissingHparam(key("block_count")))? as usize;
+        // Baichuan is one architecture string covering two positional
+        // schemes: 7B rotates, 13B uses ALiBi and no RoPE at all
+        // (`src/models/baichuan.cpp:11-14`, `:57-58` — `inp_pos` is
+        // `nullptr` for 13B, so `ggml_rope_ext` is never reached).
+        // llama.cpp decides that on the layer count and says so in a
+        // comment: "TODO: become GGUF KV parameter". There is therefore
+        // no key for `capability::unsupported_feature_keys` to test and
+        // no tensor for `assert_every_tensor_consumed` to miss — a
+        // Baichuan-13B checkpoint loads clean and is rotated anyway.
+        // Refuse it here, where the layer count is known.
+        if arch == "baichuan" && n_layers == 40 {
+            return Err(LoadError::UnsupportedFeature(
+                arch.clone(),
+                "Baichuan-13B (block_count=40) uses ALiBi and no RoPE, decided by layer \
+                 count with no GGUF key to declare it; the generic decoder would rotate \
+                 every Q/K head instead. Baichuan-7B (block_count=32) is unaffected"
+                    .to_string(),
+            ));
+        }
         let hidden_dim = file
             .metadata_u64(&key("embedding_length"))
             .ok_or_else(|| LoadError::MissingHparam(key("embedding_length")))?
@@ -3193,5 +3212,77 @@ mod tests {
             NO_TOPK_RENORMALIZE_ARCHITECTURES.contains(&"qwen2moe"),
             "qwen2moe must have norm_topk_prob=false (llama.cpp build_moe_ffn norm_w=false)"
         );
+    }
+
+    /// An architecture that uses no RoPE must not reach the generic
+    /// decoder, which rotates unconditionally.
+    ///
+    /// All five of these were admitted as `GenericGqa { rope: Neox }`.
+    /// Nothing downstream could have caught it: `bloom` and `refact`
+    /// hardcode their ALiBi slope in `load_arch_hparams` with no GGUF
+    /// key, so the metadata gates above see nothing, and `mpt` carries
+    /// no tensor the generic loader fails to consume, so
+    /// `assert_every_tensor_consumed` sees nothing either. It would have
+    /// loaded, run at full speed, and answered from rotated positions.
+    #[test]
+    fn an_architecture_with_no_rope_is_refused_by_name() {
+        for arch in ["gpt2", "mpt", "refact", "bloom", "jais"] {
+            let file = open_metadata_gguf(
+                &format!("norope_{arch}"),
+                &[("general.architecture", Kv::Str(arch))],
+            );
+            match ModelConfig::from_gguf(&file) {
+                Err(LoadError::DedicatedArchitectureRequired(got, reason)) => {
+                    assert_eq!(got, arch);
+                    assert!(
+                        reason.contains("ALiBi") || reason.contains("position embeddings"),
+                        "{arch}: the refusal must name what is missing, got {reason:?}"
+                    );
+                }
+                other => panic!("{arch} must be refused, got {other:?}"),
+            }
+        }
+    }
+
+    /// Baichuan is one `general.architecture` string covering two
+    /// positional schemes, and llama.cpp picks between them on the layer
+    /// count alone (`src/models/baichuan.cpp:11-14`, with its own "TODO:
+    /// become GGUF KV parameter"). So the 13B is the MiniCPM case: no
+    /// key to gate on and no tensor to miss.
+    #[test]
+    fn baichuan_13b_is_refused_because_it_uses_alibi_and_the_7b_is_not() {
+        let thirteen_b = open_metadata_gguf(
+            "baichuan13b",
+            &[
+                ("general.architecture", Kv::Str("baichuan")),
+                ("baichuan.block_count", Kv::U32(40)),
+            ],
+        );
+        match ModelConfig::from_gguf(&thirteen_b) {
+            Err(LoadError::UnsupportedFeature(arch, msg)) => {
+                assert_eq!(arch, "baichuan");
+                assert!(msg.contains("ALiBi"), "{msg}");
+                assert!(
+                    msg.contains("40"),
+                    "the refusal must name the layer count: {msg}"
+                );
+            }
+            other => panic!("Baichuan-13B must be refused, got {other:?}"),
+        }
+
+        // The 7B rotates exactly as the generic decoder does, so it must
+        // pass this gate. It still fails later, on the next missing
+        // hparam, which is what proves the gate let it through.
+        let seven_b = open_metadata_gguf(
+            "baichuan7b",
+            &[
+                ("general.architecture", Kv::Str("baichuan")),
+                ("baichuan.block_count", Kv::U32(32)),
+            ],
+        );
+        match ModelConfig::from_gguf(&seven_b) {
+            Err(LoadError::MissingHparam(key)) => assert_eq!(key, "baichuan.embedding_length"),
+            other => panic!("Baichuan-7B must pass the ALiBi gate, got {other:?}"),
+        }
     }
 }

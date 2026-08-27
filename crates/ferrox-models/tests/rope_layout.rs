@@ -18,15 +18,26 @@
 //! `LLAMA_ROPE_TYPE_NORM` and `LLAMA_ROPE_TYPE_NEOX` groups of that
 //! switch (`src/llama-model.cpp`), keyed by the GGUF architecture string
 //! from `LLM_ARCH_NAMES` (`src/llama-arch.cpp`). Architectures llama.cpp
-//! returns `NONE` / `MROPE` / `IMROPE` for, or decides per-checkpoint
-//! (`glm4`, `dflash`), are deliberately absent: ferrox does not
-//! implement those layouts, and a placeholder here would assert
-//! agreement that does not exist.
+//! returns `MROPE` / `IMROPE` for, or decides per-checkpoint (`glm4`,
+//! `dflash`), are deliberately absent: ferrox does not implement those
+//! layouts, and a placeholder here would assert agreement that does not
+//! exist.
+//!
+//! `LLAMA_NO_ROPE` is the switch's *first* group, `LLAMA_ROPE_TYPE_NONE`,
+//! and it exists because leaving it out left a hole exactly where the
+//! stakes are highest. `rope_layout_matches_llama_cpp` skips any
+//! architecture it has no entry for, so an arch that must not be rotated
+//! at all could sit on the generic (rotating) path and be *skipped* by
+//! the test that exists to catch that. Five did: `gpt2` (learned
+//! absolute position embeddings) and `bloom` / `mpt` / `refact` / `jais`
+//! (ALiBi). `bloom` and `refact` hardcode `f_max_alibi_bias = 8.0f` in
+//! `load_arch_hparams` and carry no GGUF key at all, so no
+//! metadata-presence gate could have found them either.
 //!
 //! Regenerate by re-reading the reference; do not edit an entry to make
 //! a failing test pass.
 
-use ferrox_models::capability::{architecture_catalog, ArchPath};
+use ferrox_models::capability::{architecture_catalog, resolve_profile, ArchPath};
 use ferrox_models::config::RopeLayout;
 
 const LLAMA_ROPE_TYPES: &[(&str, RopeLayout)] = &[
@@ -139,6 +150,38 @@ const LLAMA_ROPE_TYPES: &[(&str, RopeLayout)] = &[
     ("xverse", RopeLayout::Norm),
 ];
 
+/// `llama_model_rope_type`'s `LLAMA_ROPE_TYPE_NONE` group, transcribed
+/// from the same switch. For every one of these the correct rotation is
+/// *none*: the position information lives in ALiBi biases, in a learned
+/// `position_embd` table, in a recurrent state, or nowhere.
+///
+/// No entry carries a `RopeLayout`, because there is no honest value to
+/// put there. What the test asserts instead is structural: none of them
+/// may reach a path that rotates.
+const LLAMA_NO_ROPE: &[&str] = &[
+    "clip",
+    "gpt2",
+    "gptj",
+    "mpt",
+    "refact",
+    "bloom",
+    "mamba",
+    "mamba2",
+    "jamba",
+    "jina-bert-v2",
+    "t5",
+    "t5encoder",
+    "jais",
+    "rwkv6",
+    "rwkv6qwen2",
+    "rwkv7",
+    "arwkv7",
+    "wavtokenizer-dec",
+    "nemotron_h",
+    "nemotron_h_moe",
+    "kimi-linear",
+];
+
 /// Every architecture ferrox actually routes through a RoPE kernel must
 /// agree with the reference.
 ///
@@ -187,6 +230,41 @@ fn rope_layout_matches_llama_cpp() {
     );
 }
 
+/// An architecture llama.cpp does not rotate must never reach a ferrox
+/// path that does.
+///
+/// This is the hole `rope_layout_matches_llama_cpp` had: its lookup
+/// miss is a `continue`, so an arch absent from the reference table is
+/// silently exempt — and the `LLAMA_ROPE_TYPE_NONE` group was absent by
+/// design. `gpt2`, `bloom`, `mpt`, `refact` and `jais` were all admitted
+/// as `GenericGqa { rope: Neox }` and skipped by the only test that
+/// could have said so.
+#[test]
+fn no_rope_architectures_never_reach_a_rotating_path() {
+    let mut rotated = Vec::new();
+    let mut unknown = Vec::new();
+    for &name in LLAMA_NO_ROPE {
+        let Some(p) = resolve_profile(name) else {
+            unknown.push(name);
+            continue;
+        };
+        // `TestFixture` is not in this group and would be a mistake here.
+        if let ArchPath::GenericGqa { rope } | ArchPath::TestFixture { rope } = p.path {
+            rotated.push(format!("{name}: ferrox rotates it as {rope:?}"));
+        }
+    }
+    assert!(
+        unknown.is_empty(),
+        "not in ferrox's registry, so a checkpoint tagged with it is refused for the \
+         wrong reason: {unknown:?}"
+    );
+    assert!(
+        rotated.is_empty(),
+        "llama.cpp applies no RoPE to these:\n  {}",
+        rotated.join("\n  ")
+    );
+}
+
 /// The transcription itself must not silently shrink.
 #[test]
 fn the_reference_table_is_complete_enough_to_be_worth_pinning() {
@@ -195,4 +273,20 @@ fn the_reference_table_is_complete_enough_to_be_worth_pinning() {
         "transcribed {} entries from llama_model_rope_type",
         LLAMA_ROPE_TYPES.len()
     );
+    assert!(
+        LLAMA_NO_ROPE.len() >= 21,
+        "transcribed {} entries from the LLAMA_ROPE_TYPE_NONE group",
+        LLAMA_NO_ROPE.len()
+    );
+    // Every name in either transcription has to resolve, or the two
+    // tests above quietly compare nothing.
+    for &name in LLAMA_NO_ROPE
+        .iter()
+        .chain(LLAMA_ROPE_TYPES.iter().map(|(n, _)| n))
+    {
+        assert!(
+            resolve_profile(name).is_some(),
+            "{name} is in llama.cpp's inventory but not in ferrox's capability registry"
+        );
+    }
 }

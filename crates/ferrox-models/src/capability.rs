@@ -222,7 +222,7 @@ pub fn architecture_catalog() -> &'static [ArchProfile] {
         }
         for n in [
             "olmoe", "qwen", "qwen2", "qwen2moe", "stablelm", "mistral",
-            "mixtral", "olmo2", "gpt2", "bloom", "mpt", "refact", "bitnet", "jais", "jais2",
+            "mixtral", "olmo2", "bitnet", "jais2",
             "grok", "dbrx", "exaone4", "yi",
             // llama-model.cpp `llama_model_rope_type`: LLM_ARCH_OPENAI_MOE
             // falls in the `return LLAMA_ROPE_TYPE_NEOX` group, and a live
@@ -264,6 +264,68 @@ pub fn architecture_catalog() -> &'static [ArchProfile] {
             "talkie",
         ] {
             v.push(gqa_neox(n));
+        }
+        // --- No RoPE at all: refused, not rotated ------------------
+        //
+        // `llama_model_rope_type` opens with a `LLAMA_ROPE_TYPE_NONE`
+        // group, and these five sat on ferrox's NEOX list instead. The
+        // generic decoder rotates every Q/K head of every layer, so each
+        // of them loaded, ran at full speed, and answered fluently from
+        // positions the checkpoint never encodes that way — the same
+        // silent failure the 24-arch RoPE audit found, one level worse,
+        // because here the right answer is *no rotation*.
+        //
+        // Worse still for a metadata gate: `bloom` and `refact` hardcode
+        // `f_max_alibi_bias = 8.0f` in `load_arch_hparams` and carry no
+        // key at all, so `unsupported_feature_keys` could never have seen
+        // them. Only the registry can. `tests/rope_layout.rs`'s
+        // `LLAMA_NO_ROPE` pins the group so a later edit cannot quietly
+        // put one back on a rotating path.
+        for (n, reason) in [
+            (
+                "gpt2",
+                "learned absolute position embeddings (`position_embd.weight`, \
+                 src/models/gpt2.cpp:19,74) and no RoPE; the generic decoder has no \
+                 slot for them and rotates instead",
+            ),
+            (
+                "mpt",
+                "ALiBi attention bias (src/models/mpt.cpp:6), plus an optional \
+                 learned `position_embd` and an optional QKV clamp; the generic \
+                 decoder implements none of the three and applies RoPE instead",
+            ),
+            (
+                "refact",
+                "ALiBi attention bias, hardcoded `f_max_alibi_bias = 8.0f` with no \
+                 GGUF key to detect it (src/models/refact.cpp:12); the generic \
+                 decoder applies RoPE instead",
+            ),
+            (
+                "bloom",
+                "ALiBi attention bias, hardcoded `f_max_alibi_bias = 8.0f` with no \
+                 GGUF key (src/models/bloom.cpp:18), plus a `token_embd_norm` the \
+                 generic decoder never applies; RoPE is applied instead",
+            ),
+            (
+                "jais",
+                "ALiBi attention bias (src/models/jais.cpp:5); the generic decoder \
+                 applies RoPE instead",
+            ),
+        ] {
+            v.push(prof(
+                n,
+                TextGeneration,
+                StandardGqa,
+                KvGqa,
+                // No layout is right here. `Norm` is the struct's least
+                // surprising filler and nothing reads it: the load
+                // refuses in `ModelConfig::from_gguf` before any graph
+                // asks. `rope_layout_matches_llama_cpp` skips
+                // non-generic paths for exactly this reason.
+                Norm,
+                ArchPath::DedicatedOnly { reason },
+                WholeVector,
+            ));
         }
         v.push(prof(
             "qwen3",

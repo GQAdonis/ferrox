@@ -438,6 +438,22 @@ fn end_of_turn_marker(source: Option<&str>) -> Option<&'static str> {
         Some("<turn|>")
     } else if src.contains("<start_of_turn>") {
         Some("<end_of_turn>")
+    } else if src.contains("<|im_end|>") {
+        // A ChatML template whose `<|im_end|>` is NOT the EOS token.
+        //
+        // Most ChatML checkpoints set `eos_token_id` to `<|im_end|>`, so
+        // decoding stops on it for free and this never fires. Yi-1.5-6B
+        // does not: its template ends every turn with `<|im_end|>`
+        // (id 7) while `eos_token_id` is 2. Nothing stopped, so the
+        // marker was EMITTED AS TEXT and the model carried on talking:
+        // "The capital of France is Paris.<|im_end|>  I used the
+        // definition of the capital city, which is the politi..." for 71
+        // tokens instead of 7.
+        //
+        // Same rule as the two arms above, which exist because a Gemma
+        // turn also ends with a string that is not EOS. Adding it to the
+        // stop set is harmless where EOS already covers it.
+        Some("<|im_end|>")
     } else {
         None
     }
@@ -656,7 +672,13 @@ mod tests {
             end_of_turn_marker(Some("{{- '<|turn>' + m.role -}}")),
             Some("<turn|>")
         );
-        assert_eq!(end_of_turn_marker(Some(CHATML)), None);
+        // ChatML ends a turn with `<|im_end|>`, and MOST checkpoints
+        // make that their EOS so decoding stops on it for free. Yi-1.5
+        // does not: its template uses `<|im_end|>` (id 7) while
+        // `eos_token_id` is 2, so nothing stopped and the marker was
+        // emitted as literal text mid-answer. Adding it to the stop set
+        // is harmless where EOS already covers it.
+        assert_eq!(end_of_turn_marker(Some(CHATML)), Some("<|im_end|>"));
         // No template means the builtin prints `user:` / `assistant:`
         // lines, and a base model continues that pattern to the token
         // cap because it has no EOS for a turn it never saw. The marker

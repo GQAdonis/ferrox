@@ -128,6 +128,16 @@ impl ReasoningFormat {
         if has("deepseek") && (has("v4") || has("v3.2") || has("v32")) {
             return Some(ReasoningFormat::DeepSeekV32);
         }
+        // R1 and every distill of it. The distills are named for the
+        // model they were distilled INTO, so
+        // `DeepSeek-R1-Distill-Qwen-1.5B` matched neither the DeepSeek
+        // arm above (no v3.2/v4) nor the `qwen3` arm below, and got no
+        // reasoning format at all. The result was `<think>` sitting in
+        // `content` with `reasoning_content` empty, which is exactly
+        // what this parser exists to prevent.
+        if has("deepseek") && has("r1") {
+            return Some(ReasoningFormat::Think);
+        }
         if has("qwen3") {
             return Some(ReasoningFormat::Think);
         }

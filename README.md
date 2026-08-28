@@ -107,14 +107,19 @@ cargo install ferrox-server --features metal
 cargo build --release -p ferrox-cli --features metal
 ```
 
-Neither install pulls in a GPU backend unless you ask for it. Everything
-else is on: one binary runs completions, serves the API, downloads
-models, benchmarks and verifies. That costs build time and dependencies,
-and it is the trade this project makes on purpose. A capability behind a
-feature flag is one nobody finds.
+**The only flag you need is your GPU.** `--features metal` on Apple
+silicon, `--features cuda` on Linux with an NVIDIA card, nothing on a
+CPU-only machine. Everything else is already in: `ferrox serve`,
+`ferrox download`, `ferrox bench`, `ferrox verify` and completions all
+work out of the box.
 
-A library consumer who wants only the model code should depend on
-`ferrox-models` or `ferrox-core` directly rather than on the CLI.
+Building it takes a few minutes because the HTTP server and the
+downloader come with it.
+
+Using ferrox as a Rust library rather than a command? Depend on
+[`ferrox-inference`](https://crates.io/crates/ferrox-inference), or on
+`ferrox-models` / `ferrox-core` for just the engine. None of them pull
+in the CLI or the server.
 
 ## Quick start
 

@@ -5,6 +5,7 @@
 //! plus stop-sequence handling that's correct even when a stop string
 //! spans more than one generated token.
 
+use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -589,8 +590,56 @@ pub(crate) fn acquire_paged_caches(
         // Give back what this attempt took before waiting, or a
         // request that never fits holds pages the requests that would
         // fit are waiting for.
+        let short = need - fresh.len();
         for g in fresh {
             config.store.release_group(g);
+        }
+        // THEN reclaim from the tree, which is the only thing that ever
+        // gives these pages back.
+        //
+        // `publish_to_radix` retains a group for every page it hands
+        // the tree, and nothing released them, so the pool shrank
+        // monotonically: a long-running server ended up refusing
+        // requests that fit, while the tree sat on pages no request was
+        // reading. `evict` was written for exactly this call (its own
+        // doc says asking for more than `evictable_size` means "the
+        // admission arithmetic promised memory the cache never had")
+        // and had no caller at all.
+        //
+        // Only unlocked nodes are evictable, so a prefix some live
+        // lease adopted cannot be taken out from under it. The adopted
+        // node above is locked before this point for that reason.
+        let mut reclaimed = 0usize;
+        if let Some(radix) = config.radix.as_ref() {
+            let freed = {
+                let mut tree = radix.lock().unwrap_or_else(|p| p.into_inner());
+                // The tree counts TOKENS and the shortfall is in
+                // GROUPS, one block per group. Never ask for more than
+                // it holds unlocked: `evict` panics on that, by design,
+                // because it means the caller's arithmetic was wrong.
+                let want = (short * block_size).min(tree.evictable_size());
+                // One index per token, so a page repeats across its
+                // block. Release each group ONCE or the store's
+                // refcount underflows.
+                let per_token = tree.evict(want);
+                per_token.into_iter().collect::<BTreeSet<u32>>()
+            };
+            for g in freed {
+                config.store.release_group(PageGroup(g));
+                reclaimed += 1;
+            }
+        }
+        // Reclaiming is PROGRESS, not waiting, so retry immediately
+        // rather than charging it against the deadline. A caller with
+        // `queue_wait = 0` would otherwise evict and then give up
+        // without ever trying the pages it just freed, which is a
+        // refusal with the memory sitting right there.
+        //
+        // This terminates: every pass either frees at least one group
+        // or falls through to the deadline, and `evictable_size` only
+        // shrinks.
+        if reclaimed > 0 {
+            continue;
         }
         let now = Instant::now();
         if now >= deadline {
@@ -2603,6 +2652,62 @@ mod tests {
 
     fn pool_config(pool: Arc<Mutex<KvBlockPool>>, queue_wait: Duration) -> KvPoolConfig {
         KvPoolConfig { pool, queue_wait }
+    }
+
+    /// Published prefixes must come BACK, or a long-running server
+    /// refuses requests that fit.
+    ///
+    /// `publish_to_radix` retains a page group for every page it hands
+    /// the tree, and nothing released them: `RadixCache::evict` had no
+    /// caller anywhere. So the pool shrank monotonically, and a server
+    /// that had been up long enough started answering
+    /// `PagedStoreExhausted` while the tree sat on pages no request was
+    /// reading.
+    ///
+    /// This asserts the POOL recovers, not that `evict` was called. A
+    /// test that only checks the call happened proves nothing about a
+    /// leak, which is how this one survived having 33 tests around it.
+    #[test]
+    fn published_prefixes_are_reclaimed_under_pressure() {
+        let decoder = small_decoder();
+        let block_size = 4;
+        // Small on purpose: enough for a few prompts at once, so the
+        // pool must be recycled rather than merely large.
+        let config = paged_config_with_radix(&decoder, block_size, 24, true);
+        let free_before = config.store.free_groups();
+        assert!(free_before > 0, "the fixture must start with free pages");
+
+        // Each prompt is distinct, so every one publishes a NEW prefix
+        // and none of them can be adopted from an earlier one. Without
+        // eviction the tree accumulates all of them and the pool runs
+        // dry.
+        for round in 0..40u32 {
+            let tokens: Vec<usize> = (0..12).map(|i| (round * 100 + i) as usize).collect();
+            let mut lease = acquire_paged_caches(&decoder, &config, &tokens, tokens.len() + 8)
+                .expect("admission must keep succeeding once the tree can be evicted");
+            publish_to_radix(&mut lease, &tokens, block_size);
+            drop(lease);
+        }
+
+        // The pool is whole again: every page either sits in the tree
+        // as evictable or is free, and nothing has leaked.
+        let tree_holds = {
+            let tree = config
+                .radix
+                .as_ref()
+                .expect("configured with a tree")
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            tree.total_size().div_ceil(block_size)
+        };
+        assert_eq!(
+            config.store.free_groups() + tree_holds,
+            free_before,
+            "every page must be free or accounted for in the tree: \
+             free={} tree={} started={free_before}",
+            config.store.free_groups(),
+            tree_holds
+        );
     }
 
     fn paged_config(decoder: &Decoder, block_size: usize, blocks: usize) -> PagedKvConfig {

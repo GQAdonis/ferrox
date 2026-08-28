@@ -36,3 +36,8 @@ data/
 /ui/.vite/
 /ui/node_modules/.vite/
 /ui/*.tsbuildinfo
+
+# Scratch commit-message files. One was committed by accident in
+# 175d20d; agents write these and they are never part of the tree.
+.git-msg
+.git-msg.*

@@ -11,6 +11,45 @@
 
 use crate::cache::PagedKvStore;
 
+/// The RoPE frequency table for `(theta, dim)`, computed once per
+/// thread.
+///
+/// `1.0 / theta.powf(2i/dim)` depends on nothing but the band index and
+/// two values that are fixed for the life of a model, yet it was
+/// evaluated inside the band loop on every call. For Llama-3-8B decode
+/// that is (32 query + 8 kv heads) x 64 bands x 32 layers, roughly 82k
+/// `powf` per token, all producing the same couple of 64-entry tables.
+///
+/// Thread-local rather than a shared map because this is a per-token
+/// path and a mutex here would trade one cost for another. The tables
+/// are tens of floats, so the duplication across worker threads is
+/// nothing.
+///
+/// The expression is unchanged, so the values are bit-identical to what
+/// the loop produced.
+fn rope_freqs(theta: f32, dim: usize) -> std::rc::Rc<Vec<f32>> {
+    /// Keyed on `(theta bits, dim)`, both of which are fixed per model.
+    type FreqTables = std::collections::HashMap<(u32, usize), std::rc::Rc<Vec<f32>>>;
+    thread_local! {
+        static CACHE: std::cell::RefCell<FreqTables> =
+            std::cell::RefCell::new(FreqTables::new());
+    }
+    // Keyed on the bit pattern: theta is a config value copied around,
+    // never computed, so equal thetas are bit-equal.
+    let key = (theta.to_bits(), dim);
+    CACHE.with(|c| {
+        if let Some(hit) = c.borrow().get(&key) {
+            return std::rc::Rc::clone(hit);
+        }
+        let table: Vec<f32> = (0..dim / 2)
+            .map(|i| 1.0 / theta.powf((2 * i) as f32 / dim as f32))
+            .collect();
+        let table = std::rc::Rc::new(table);
+        c.borrow_mut().insert(key, std::rc::Rc::clone(&table));
+        table
+    })
+}
+
 /// Applies rotary position embedding in place to a single head's vector,
 /// split-half (GPT-NeoX / `LLAMA_ROPE_TYPE_NEOX`) style: each pair
 /// `(i, i+half)` is rotated together, for position `pos` with base
@@ -20,8 +59,9 @@ use crate::cache::PagedKvStore;
 pub fn apply_rope(vec: &mut [f32], pos: usize, theta: f32) {
     let dim = vec.len();
     let half = dim / 2;
+    let freqs = rope_freqs(theta, dim);
     for i in 0..half {
-        let freq = 1.0 / theta.powf((2 * i) as f32 / dim as f32);
+        let freq = freqs[i];
         let angle = pos as f32 * freq;
         let (sin, cos) = angle.sin_cos();
         let a = vec[i];
@@ -38,8 +78,9 @@ pub fn apply_rope(vec: &mut [f32], pos: usize, theta: f32) {
 pub fn apply_rope_back(vec: &mut [f32], pos: usize, theta: f32) {
     let dim = vec.len();
     let half = dim / 2;
+    let freqs = rope_freqs(theta, dim);
     for i in 0..half {
-        let freq = 1.0 / theta.powf((2 * i) as f32 / dim as f32);
+        let freq = freqs[i];
         let angle = pos as f32 * freq;
         let (sin, cos) = angle.sin_cos();
         let a = vec[i];
@@ -54,8 +95,9 @@ pub fn apply_rope_back(vec: &mut [f32], pos: usize, theta: f32) {
 pub fn apply_rope_interleaved_back(vec: &mut [f32], pos: usize, theta: f32) {
     let dim = vec.len();
     let half = dim / 2;
+    let freqs = rope_freqs(theta, dim);
     for i in 0..half {
-        let freq = 1.0 / theta.powf((2 * i) as f32 / dim as f32);
+        let freq = freqs[i];
         let angle = pos as f32 * freq;
         let (sin, cos) = angle.sin_cos();
         let a = vec[2 * i];
@@ -421,8 +463,9 @@ pub fn apply_rope_with_freq_factors(vec: &mut [f32], pos: usize, theta: f32, fre
         half,
         "freq_factors must have one entry per rotation band (dim/2)"
     );
+    let freqs = rope_freqs(theta, dim);
     for i in 0..half {
-        let freq = 1.0 / theta.powf((2 * i) as f32 / dim as f32);
+        let freq = freqs[i];
         let angle = pos as f32 * freq / freq_factors[i];
         let (sin, cos) = angle.sin_cos();
         let a = vec[i];
@@ -444,8 +487,9 @@ pub fn apply_rope_with_freq_factors(vec: &mut [f32], pos: usize, theta: f32, fre
 pub fn apply_rope_interleaved(vec: &mut [f32], pos: usize, theta: f32) {
     let dim = vec.len();
     let half = dim / 2;
+    let freqs = rope_freqs(theta, dim);
     for i in 0..half {
-        let freq = 1.0 / theta.powf((2 * i) as f32 / dim as f32);
+        let freq = freqs[i];
         let angle = pos as f32 * freq;
         let (sin, cos) = angle.sin_cos();
         let a = vec[2 * i];
@@ -477,8 +521,9 @@ pub fn apply_rope_interleaved_with_freq_factors(
         half,
         "freq_factors must have one entry per rotation band (dim/2)"
     );
+    let freqs = rope_freqs(theta, dim);
     for i in 0..half {
-        let freq = 1.0 / theta.powf((2 * i) as f32 / dim as f32);
+        let freq = freqs[i];
         let angle = pos as f32 * freq / freq_factors[i];
         let (sin, cos) = angle.sin_cos();
         let a = vec[2 * i];

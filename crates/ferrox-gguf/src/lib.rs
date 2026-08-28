@@ -41,6 +41,12 @@ pub enum GgufError {
     TensorNotFound(String),
     #[error("malformed tensor data for '{0}': expected {1} bytes, file has {2}")]
     TruncatedTensor(String, usize, usize),
+    #[error(
+        "tensor '{0}' has dtype {1:?}, whose block layout this build does not know, so its \
+         size cannot be computed. Reading it would hand back an empty slice and look like \
+         success"
+    )]
+    UnsizedTensor(String, GgmlType),
 }
 
 /// A single scalar/array metadata value from the GGUF key-value header.
@@ -245,13 +251,21 @@ impl TensorInfo {
         self.shape.iter().product::<u64>() as usize
     }
 
-    pub fn byte_len(&self) -> usize {
+    /// Size on disk, or `None` for a dtype whose block layout this
+    /// build does not know.
+    ///
+    /// `None` rather than `0`: a zero here used to flow silently into
+    /// every size estimate and into `tensor_bytes`, which then returned
+    /// an EMPTY SLICE with no error. A TQ2_0 file did not fail to parse,
+    /// it under-counted its own footprint and then failed later
+    /// somewhere far less informative.
+    pub fn byte_len(&self) -> Option<usize> {
         let (block_bytes, block_elems) = self.dtype.block_layout();
         if block_bytes == 0 {
-            return 0;
+            return None;
         }
         let n = self.n_elements();
-        (n / block_elems) * block_bytes
+        Some((n / block_elems) * block_bytes)
     }
 }
 
@@ -338,7 +352,9 @@ impl GgufFile {
             .find(|t| t.name == name)
             .ok_or_else(|| GgufError::TensorNotFound(name.to_string()))?;
         let start = self.data_start + info.offset as usize;
-        let len = info.byte_len();
+        let len = info
+            .byte_len()
+            .ok_or_else(|| GgufError::UnsizedTensor(name.to_string(), info.dtype))?;
         if start + len > self.mmap.len() {
             return Err(GgufError::TruncatedTensor(
                 name.to_string(),
@@ -366,7 +382,9 @@ impl GgufFile {
             .find(|t| t.name == name)
             .ok_or_else(|| GgufError::TensorNotFound(name.to_string()))?;
         let start = self.data_start + info.offset as usize;
-        let len = info.byte_len();
+        let len = info
+            .byte_len()
+            .ok_or_else(|| GgufError::UnsizedTensor(name.to_string(), info.dtype))?;
         if start + len > self.mmap.len() {
             return Err(GgufError::TruncatedTensor(
                 name.to_string(),

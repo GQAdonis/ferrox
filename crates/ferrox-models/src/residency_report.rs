@@ -110,14 +110,29 @@ impl ResidencyReport {
         let mut dense_bytes: u64 = 0;
         let mut routed_bytes: u64 = 0;
         let mut routed_tensors = 0usize;
+        // A tensor whose dtype this build cannot size contributes
+        // nothing here, which is what the old `byte_len() -> 0` did
+        // implicitly. It is explicit now, and counted, so a footprint
+        // that silently omits tensors says so rather than reading as a
+        // smaller model.
+        let mut unsized_tensors = 0usize;
         for (_, t) in file.tensors() {
-            let is_routed_expert = t.name.contains("_exps.weight");
-            if is_routed_expert {
-                routed_bytes += t.byte_len() as u64;
+            let Some(bytes) = t.byte_len() else {
+                unsized_tensors += 1;
+                continue;
+            };
+            if t.name.contains("_exps.weight") {
+                routed_bytes += bytes as u64;
                 routed_tensors += 1;
             } else {
-                dense_bytes += t.byte_len() as u64;
+                dense_bytes += bytes as u64;
             }
+        }
+        if unsized_tensors > 0 {
+            eprintln!(
+                "ferrox: {unsized_tensors} tensor(s) have a dtype this build cannot size; \
+                 the footprint below EXCLUDES them and is therefore a lower bound"
+            );
         }
 
         let mut lines = Vec::new();

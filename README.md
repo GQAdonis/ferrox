@@ -111,7 +111,14 @@ cargo build --release -p ferrox-cli --features "serve metal"
 
 Neither install pulls in a GPU backend unless you ask for it. `serve` is
 off by default too: it pulls in 98 crates the CLI does not otherwise
-need, including a C crypto library, so a CLI-only install stays small.
+need, so a CLI-only install stays smaller.
+
+Counted rather than claimed: the CLI is 115 crates, of which 37 come
+from `ferrox download` needing HTTPS (`ureq`, `rustls`, `ring`). Without
+a downloader it would be 78. That is the price of fetching a model
+without a Python install, and it is charged whether or not you use it,
+because a download command hidden behind a feature flag is one nobody
+finds.
 
 ## Quick start
 

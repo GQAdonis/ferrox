@@ -1127,6 +1127,14 @@ pub(crate) fn widen_plain_float(
             .map_err(|_| LoadError::UnsupportedDtype(name.to_string(), GgmlType::F16)),
         GgmlType::BF16 => ferrox_quant::dequant_bf16(raw)
             .map_err(|_| LoadError::UnsupportedDtype(name.to_string(), GgmlType::BF16)),
+        // MXFP4 is accepted as a weight matrix and as an MoE expert
+        // tensor, and `WeightMatrix::dequant` already calls this
+        // dequantizer, so refusing it here made a 1-D MXFP4 norm or
+        // bias a hard load error on a checkpoint whose 2-D tensors of
+        // the same type load fine. That contradicted this function's
+        // own contract, which is to widen whatever the loaders accept.
+        GgmlType::MXFP4 => ferrox_quant::dequant_mxfp4_gguf(raw)
+            .map_err(|_| LoadError::UnsupportedDtype(name.to_string(), GgmlType::MXFP4)),
         other => Err(LoadError::UnsupportedDtype(name.to_string(), other)),
     }
 }

@@ -674,6 +674,9 @@ pub struct HostSpec {
     pub os: Option<String>,
 }
 
+// Only the macOS arm calls this; on Linux it is dead code and
+// `-D warnings` is a gate, not advice.
+#[cfg(target_os = "macos")]
 fn sysctl(key: &str) -> Option<String> {
     let out = std::process::Command::new("sysctl")
         .args(["-n", key])

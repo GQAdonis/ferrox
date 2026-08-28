@@ -63,6 +63,16 @@ pub enum LoadError {
     /// Metadata advertises a feature the generic decoder does not implement.
     #[error("architecture '{0}' requires unimplemented feature: {1}")]
     UnsupportedFeature(String, String),
+    #[error(
+        "architecture '{0}' has never been verified against llama.cpp. It would run on \
+         ferrox's shared generic-GQA path, which ASSUMES plain GQA with {1:?} RoPE and no \
+         ALiBi, no learned position embeddings and no per-layer rope skipping. That \
+         assumption has already been wrong for gpt2, mpt, refact, bloom and jais, each of \
+         which loaded clean and answered as a different model. Set \
+         FERROX_ALLOW_UNAUDITED_ARCH=1 to run it anyway and compare the output against \
+         llama.cpp yourself"
+    )]
+    UnauditedArchitecture(String, crate::config::RopeLayout),
     /// The checkpoint carries per-block tensors this build never reads,
     /// i.e. weights that contribute to the real graph and would simply
     /// be missing from ours. See [`assert_every_tensor_consumed`].
@@ -650,6 +660,28 @@ impl ModelConfig {
             best_effort_fields.push(
                 "none -- every field above was read directly from this file's own GGUF metadata",
             );
+        }
+
+        // LAST, deliberately. The generic path is a GUESS, so it has to
+        // be opted into rather than fallen onto: it assumes plain GQA
+        // with no ALiBi, no learned position embeddings and no
+        // per-layer rope skipping, and that assumption was already
+        // wrong for gpt2, mpt, refact, bloom and jais.
+        //
+        // But it runs AFTER every architecture-specific refusal, so a
+        // checkpoint with a NAMED problem still reports that problem.
+        // Checking first would have replaced "this uses ALiBi" with
+        // "this is unaudited", which is true and much less useful.
+        if matches!(
+            arch_profile.path,
+            crate::capability::ArchPath::GenericGqa { .. }
+        ) && !crate::capability::is_audited_generic(&arch)
+            && !matches!(
+                std::env::var("FERROX_ALLOW_UNAUDITED_ARCH").ok().as_deref(),
+                Some("1") | Some("true") | Some("on")
+            )
+        {
+            return Err(LoadError::UnauditedArchitecture(arch.clone(), rope_layout));
         }
 
         Ok(ModelConfig {

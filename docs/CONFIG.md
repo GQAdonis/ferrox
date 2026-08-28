@@ -190,6 +190,7 @@ takes a fallback warns once with its call site. See
 | `FERROX_ALLOW_MULTIPLE_INSTANCES` | `1`, start even though another ferrox process is already holding a model. Default is refusal: two models on one box do not share it, they thrash it, and every timing either reports becomes noise. `--allow-multiple-instances` on `ferrox` / `ferrox-server` does the same for one run |
 | `FERROX_INSTANCE_DIR` | Where the running-instance registry lives (default `$XDG_CACHE_HOME/ferrox/instances`, else `~/.cache/ferrox/instances`). One small file per live process, pruned when its pid is gone |
 | `FERROX_STRICT_KERNELS` | `1`, refuse to load a model whose weights have no kernel on the selected accelerator, instead of running it on a slower path. Set this in CI and in benchmark harnesses so a number cannot be published for a backend it was not taken on |
+| `FERROX_ALLOW_UNAUDITED_ARCH` | Run an architecture that has never been verified against llama.cpp. Off by default: such a model is refused rather than run on the shared generic-GQA path, which ASSUMES plain GQA and was already wrong for gpt2, mpt, refact, bloom and jais. Set it to compare the output against llama.cpp yourself |
 
 ## Metal instrumentation
 

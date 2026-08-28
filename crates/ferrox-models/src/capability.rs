@@ -79,6 +79,44 @@ pub enum QkNormStyle {
     PerHead,
 }
 
+/// Architectures on the shared generic-GQA path that somebody has
+/// actually PROVEN, and the evidence for each.
+///
+/// The generic path is a guess: it assumes an architecture is plain GQA
+/// because nothing said otherwise. That guess has already been wrong
+/// five times. `gpt2`, `mpt`, `refact`, `bloom` and `jais` all sat here
+/// computing ALiBi or learned absolute position embeddings as though
+/// they were NEOX RoPE, and every downstream guard missed them: two
+/// hardcode their ALiBi slope with no GGUF key, one leaves no unread
+/// tensor, and the RoPE pin excluded their group by construction.
+///
+/// So membership here is not "we think this works", it is "there is a
+/// benchmark row, a pinned logit comparison against llama.cpp, or a
+/// fixture". Everything else on the generic path is UNAUDITED and says
+/// so at load time rather than running and hoping.
+///
+/// Adding a name here without evidence defeats the entire point.
+pub const AUDITED_GENERIC_GQA: &[&str] = &[
+    // Bench rows in benchmarks/suite.json, measured against llama.cpp
+    // on the same host and file.
+    "llama",    // TinyLlama, Mistral, Mixtral, SmolLM2, Llama-3.x all tag llama
+    "qwen2",    // Qwen2.5-0.5B
+    "qwen2moe", // Qwen1.5-MoE-A2.7B
+    "qwen3",    // Qwen3-0.6B
+    "olmoe",    // OLMoE-1B-7B
+    "gemma2",   // Gemma-2-2B
+    "gemma3",   // Gemma-3-1B
+    "phi3",     // Phi-4-mini tags phi3
+    // Pinned against real libllama logits in tests/.
+    "gpt-oss", "dots1",
+];
+
+/// Is this architecture's use of the shared generic path backed by
+/// evidence?
+pub fn is_audited_generic(arch: &str) -> bool {
+    AUDITED_GENERIC_GQA.contains(&arch)
+}
+
 /// How the generic `Decoder` / `ModelConfig::from_gguf` path treats a
 /// GGUF architecture string.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -948,6 +986,54 @@ pub fn coverage_report_markdown() -> String {
     }
     lines.push(String::new());
     lines.join("\n")
+}
+
+#[cfg(test)]
+mod audit_tests {
+    use super::*;
+
+    /// Every audited name must actually be on the generic path.
+    ///
+    /// A name here that resolves to a dedicated engine, or to nothing,
+    /// is a stale entry claiming evidence for a path it does not use.
+    #[test]
+    fn every_audited_name_is_actually_on_the_generic_path() {
+        for name in AUDITED_GENERIC_GQA {
+            let profile = resolve_profile(name)
+                .unwrap_or_else(|| panic!("audited arch `{name}` is not in the catalog"));
+            assert!(
+                matches!(profile.path, ArchPath::GenericGqa { .. }),
+                "`{name}` is listed as an audited GENERIC-path arch but resolves to {:?}",
+                profile.path
+            );
+        }
+    }
+
+    /// The five architectures that were caught computing the wrong
+    /// thing must never appear here.
+    ///
+    /// They are refused outright now, but this pins the intent: the
+    /// audited list is evidence of correctness, and these are the
+    /// counter-examples that motivated it.
+    #[test]
+    fn the_architectures_that_were_wrong_are_not_claimed_as_audited() {
+        for name in ["gpt2", "mpt", "refact", "bloom", "jais"] {
+            assert!(
+                !is_audited_generic(name),
+                "`{name}` was found computing ALiBi or learned position embeddings as \
+                 though it were RoPE; it cannot be on the audited list"
+            );
+        }
+    }
+
+    /// An architecture nobody has checked is not audited, which is the
+    /// whole point of the inversion.
+    #[test]
+    fn an_unchecked_architecture_is_not_audited() {
+        assert!(!is_audited_generic("smallthinker"));
+        assert!(!is_audited_generic("mellum"));
+        assert!(!is_audited_generic("an-arch-that-does-not-exist"));
+    }
 }
 
 #[cfg(test)]

@@ -4692,6 +4692,7 @@ mod tests {
                 Some(source),
                 Some("qwen3"),
                 false,
+                true,
                 None,
                 None,
             ),
@@ -6714,6 +6715,7 @@ mod tests {
             Some(GRADED),
             Some("qwen3"),
             false,
+            true,
             None,
             None,
         )
@@ -6906,6 +6908,7 @@ mod tests {
             Some("{{ messages[0].content }}{% if enable_thinking %}<think>{% endif %}"),
             Some("qwen3"),
             false,
+            true,
             None,
             None,
         );

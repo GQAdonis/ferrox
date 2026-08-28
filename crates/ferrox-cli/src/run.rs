@@ -459,6 +459,7 @@ impl ChatKind {
                 file.metadata_str("tokenizer.chat_template"),
                 file.metadata_str("general.architecture"),
                 byte_tokenizer,
+                ferrox_models::chat_template::ChatTemplate::vocab_has_chatml(file),
             ),
             bos_token: file.token_text("tokenizer.ggml.bos_token_id"),
             eos_token: file.token_text("tokenizer.ggml.eos_token_id"),

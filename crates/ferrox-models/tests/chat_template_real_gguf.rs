@@ -249,7 +249,7 @@ fn a_template_with_no_recognisable_marker_still_renders_correctly() {
 /// state.
 #[test]
 fn a_checkpoint_with_no_template_falls_back_to_chatml_not_to_a_guess() {
-    let t = ChatTemplate::from_gguf_metadata(None, Some("olmoe"), false);
+    let t = ChatTemplate::from_gguf_metadata(None, Some("olmoe"), false, true);
     assert!(!t.is_jinja());
     let out = t.render(&conversation(), &opts()).unwrap();
     assert_eq!(
@@ -263,10 +263,10 @@ fn a_checkpoint_with_no_template_falls_back_to_chatml_not_to_a_guess() {
     );
     // An empty-string template is the same absence, not a template that
     // renders to nothing.
-    assert!(!ChatTemplate::from_gguf_metadata(Some("   "), Some("olmoe"), false).is_jinja());
+    assert!(!ChatTemplate::from_gguf_metadata(Some("   "), Some("olmoe"), false, true).is_jinja());
     // No real vocabulary for markers to live in ⇒ role-labelled lines.
     assert_eq!(
-        ChatTemplate::from_gguf_metadata(None, Some("ferroxtest"), true)
+        ChatTemplate::from_gguf_metadata(None, Some("ferroxtest"), true, true)
             .render(&[json!({"role": "user", "content": "hi"})], &opts())
             .unwrap(),
         "user: hi"

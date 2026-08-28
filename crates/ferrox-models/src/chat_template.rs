@@ -189,15 +189,56 @@ impl ChatTemplate {
         chat_template: Option<&str>,
         arch: Option<&str>,
         byte_tokenizer: bool,
+        chatml_tokens_present: bool,
     ) -> Self {
         match chat_template.filter(|t| !t.trim().is_empty()) {
             Some(t) => match Self::from_jinja(t) {
                 Ok(tmpl) => tmpl,
                 Err(e) => Self(Arc::new(Kind::Broken(e))),
             },
-            None if byte_tokenizer || arch.is_none() => Self::builtin(BuiltinTemplate::Plain),
+            // No template, and no `<|im_start|>` / `<|im_end|>` in the
+            // vocabulary to build one out of.
+            //
+            // Falling back to ChatML here is worse than useless, and
+            // OLMoE-1B-7B is the case that showed it: its vocab has
+            // neither marker, so they tokenize as literal text the model
+            // never saw in training, `<|im_end|>` can never be GENERATED
+            // and so can never stop anything, and the model imitates the
+            // `<|...|>` pattern it is being shown. The observed result
+            // was 512 tokens of invented `<|area_key|>`-style markers
+            // where the raw completion path answers correctly.
+            //
+            // `Plain` already existed for "no real vocabulary for
+            // markers to live in". This is the same condition, checked
+            // properly instead of assumed from the tokenizer kind.
+            None if byte_tokenizer || arch.is_none() || !chatml_tokens_present => {
+                Self::builtin(BuiltinTemplate::Plain)
+            }
             None => Self::builtin(BuiltinTemplate::ChatMl),
         }
+    }
+
+    /// Does this vocabulary actually contain the ChatML markers?
+    ///
+    /// Both are required: a checkpoint with one and not the other cannot
+    /// frame a turn either.
+    pub fn vocab_has_chatml(file: &impl ferrox_gguf::TensorSource) -> bool {
+        let Some(ferrox_gguf::GgufValue::Array(tokens)) = file.metadata("tokenizer.ggml.tokens")
+        else {
+            return false;
+        };
+        let (mut start, mut end) = (false, false);
+        for t in tokens {
+            match t.as_str() {
+                Some("<|im_start|>") => start = true,
+                Some("<|im_end|>") => end = true,
+                _ => {}
+            }
+            if start && end {
+                return true;
+            }
+        }
+        false
     }
 
     /// True when this is the checkpoint's own compiled template.
@@ -721,6 +762,32 @@ fn render_builtin(b: BuiltinTemplate, messages: &[Value], opts: &RenderOptions) 
 
 #[cfg(test)]
 mod tests {
+
+    /// A checkpoint with no template and no ChatML markers in its vocab
+    /// must NOT be wrapped in ChatML.
+    ///
+    /// OLMoE-1B-7B is the case: its vocabulary contains neither
+    /// `<|im_start|>` nor `<|im_end|>`. Wrapping it anyway made the
+    /// markers tokenize as literal text the model never saw, left
+    /// `<|im_end|>` impossible to generate so nothing could stop the
+    /// run, and led the model to imitate the pattern it was shown. The
+    /// observed output was 512 tokens of invented `<|area_key|>`-style
+    /// markers, while the raw completion path answered correctly.
+    #[test]
+    fn a_vocab_without_chatml_markers_falls_back_to_plain() {
+        let without = ChatTemplate::from_gguf_metadata(None, Some("olmoe"), false, false);
+        let with = ChatTemplate::from_gguf_metadata(None, Some("olmoe"), false, true);
+        assert_ne!(
+            without.describe(),
+            with.describe(),
+            "the ChatML fallback must depend on the markers actually existing"
+        );
+        assert!(
+            !without.describe().to_lowercase().contains("chatml"),
+            "got {} for a vocab with no ChatML tokens",
+            without.describe()
+        );
+    }
     use super::*;
     use serde_json::json;
 
@@ -1027,6 +1094,7 @@ mod tests {
             Some("{% for m in messages %}{{ m }}"),
             Some("llama"),
             false,
+            true,
         );
         assert!(!t.is_jinja());
         let err = t.render(&[msg("user", "hi")], &opts()).unwrap_err();
@@ -1157,19 +1225,19 @@ mod tests {
     #[test]
     fn a_checkpoint_with_no_template_gets_chatml_or_plain() {
         assert!(matches!(
-            &*ChatTemplate::from_gguf_metadata(None, Some("olmoe"), false).0,
+            &*ChatTemplate::from_gguf_metadata(None, Some("olmoe"), false, true).0,
             Kind::Builtin(BuiltinTemplate::ChatMl)
         ));
         assert!(matches!(
-            &*ChatTemplate::from_gguf_metadata(Some("   "), Some("olmoe"), false).0,
+            &*ChatTemplate::from_gguf_metadata(Some("   "), Some("olmoe"), false, true).0,
             Kind::Builtin(BuiltinTemplate::ChatMl)
         ));
         assert!(matches!(
-            &*ChatTemplate::from_gguf_metadata(None, Some("olmoe"), true).0,
+            &*ChatTemplate::from_gguf_metadata(None, Some("olmoe"), true, true).0,
             Kind::Builtin(BuiltinTemplate::Plain)
         ));
         assert!(matches!(
-            &*ChatTemplate::from_gguf_metadata(None, None, false).0,
+            &*ChatTemplate::from_gguf_metadata(None, None, false, true).0,
             Kind::Builtin(BuiltinTemplate::Plain)
         ));
     }

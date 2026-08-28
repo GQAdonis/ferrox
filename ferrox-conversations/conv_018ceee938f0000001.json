@@ -1,0 +1,50 @@
+{
+  "id": "conv_018ceee938f0000001",
+  "title": "capital of france is...?",
+  "model": "Olmoe Hf",
+  "created_at": 1787930771,
+  "updated_at": 1787930771,
+  "head_id": "whO7UwL",
+  "messages": [
+    {
+      "id": "tAURZgP",
+      "parent_id": null,
+      "role": "user",
+      "content": "capital of france is...?",
+      "created_at": 1787930771,
+      "metadata": {
+        "custom": {}
+      }
+    },
+    {
+      "id": "whO7UwL",
+      "parent_id": "tAURZgP",
+      "role": "assistant",
+      "content": "\na: is, of course,\nb: paris\nasked Jul 22 '13 at 02:11 Echo New member\n\n0 answers\n\nYour answer\n\nWrite at least 20 characters",
+      "created_at": 1787930771,
+      "metadata": {
+        "custom": {
+          "stats": {
+            "line": "TTFT 163 ms  ·  prefill 9 tok · 55.8 tok/s · 161 ms  ·  decode 42 tok · 122.1 tok/s · 344 ms  ·  chatcmpl-0181d6725910000002",
+            "outcome": "ok",
+            "requestId": "chatcmpl-0181d6725910000002",
+            "usage": {
+              "completion_tokens": 42,
+              "generation_duration_ms": 343.96475,
+              "predicted_per_second": 122.1055355236256,
+              "prompt_eval_duration_ms": 161.41679200000002,
+              "prompt_per_second": 55.7562809202651,
+              "prompt_tokens": 9,
+              "time_to_first_token_ms": 163.118042,
+              "total_tokens": 51
+            }
+          }
+        },
+        "steps": [],
+        "unstable_annotations": [],
+        "unstable_data": [],
+        "unstable_state": null
+      }
+    }
+  ]
+}

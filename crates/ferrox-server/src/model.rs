@@ -411,6 +411,7 @@ fn load_glm52_checkpoint(path: &str, file: &ShardedGguf) -> anyhow::Result<Glm52
         file.metadata_str("tokenizer.chat_template"),
         Some(arch.as_str()),
         byte_tokenizer,
+        ferrox_models::chat_template::ChatTemplate::vocab_has_chatml(file),
         file.token_text("tokenizer.ggml.bos_token_id"),
         file.token_text("tokenizer.ggml.eos_token_id"),
     );
@@ -459,6 +460,7 @@ fn load_mla_checkpoint(path: &str, file: &ShardedGguf) -> anyhow::Result<MlaLoad
         file.metadata_str("tokenizer.chat_template"),
         Some(arch.as_str()),
         byte_tokenizer,
+        ferrox_models::chat_template::ChatTemplate::vocab_has_chatml(file),
         file.token_text("tokenizer.ggml.bos_token_id"),
         file.token_text("tokenizer.ggml.eos_token_id"),
     );
@@ -508,6 +510,7 @@ fn load_gemma4_checkpoint(path: &str, file: &ShardedGguf) -> anyhow::Result<Gemm
         file.metadata_str("tokenizer.chat_template"),
         Some(arch.as_str()),
         byte_tokenizer,
+        ferrox_models::chat_template::ChatTemplate::vocab_has_chatml(file),
         file.token_text("tokenizer.ggml.bos_token_id"),
         file.token_text("tokenizer.ggml.eos_token_id"),
     );
@@ -558,6 +561,7 @@ fn load_real_gguf_checkpoint(path: &str, file: &ShardedGguf) -> anyhow::Result<G
         file.metadata_str("tokenizer.chat_template"),
         file.metadata_str("general.architecture"),
         byte_tokenizer,
+        ferrox_models::chat_template::ChatTemplate::vocab_has_chatml(file),
         file.token_text("tokenizer.ggml.bos_token_id"),
         file.token_text("tokenizer.ggml.eos_token_id"),
     );

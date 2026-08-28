@@ -92,11 +92,12 @@ impl PromptTemplate {
         source: Option<&str>,
         arch: Option<&str>,
         byte_tokenizer: bool,
+        chatml_tokens_present: bool,
         bos_token: Option<String>,
         eos_token: Option<String>,
     ) -> Self {
         Self::build(
-            JinjaTemplate::from_gguf_metadata(source, arch, byte_tokenizer),
+            JinjaTemplate::from_gguf_metadata(source, arch, byte_tokenizer, chatml_tokens_present),
             source,
             bos_token,
             eos_token,
@@ -112,7 +113,9 @@ impl PromptTemplate {
         eos_token: Option<String>,
     ) -> Self {
         Self::build(
-            JinjaTemplate::from_gguf_metadata(source, None, false),
+            // No vocabulary here: this path always carries its own
+            // template, so the ChatML fallback is unreachable.
+            JinjaTemplate::from_gguf_metadata(source, None, false, false),
             source,
             bos_token,
             eos_token,
@@ -469,8 +472,14 @@ mod tests {
     #[test]
     fn a_template_the_old_sniffer_could_not_recognise_now_renders_correctly() {
         let mistral = "{% for m in messages %}{% if m.role == 'user' %}[INST] {{ m.content }} [/INST]{% else %}{{ m.content }}</s>{% endif %}{% endfor %}";
-        let tmpl =
-            PromptTemplate::from_gguf_metadata(Some(mistral), Some("llama"), false, None, None);
+        let tmpl = PromptTemplate::from_gguf_metadata(
+            Some(mistral),
+            Some("llama"),
+            false,
+            true,
+            None,
+            None,
+        );
         let rendered = tmpl
             .render(&[msg("user", "hi")], &[], Map::new())
             .expect("renders");
@@ -479,7 +488,7 @@ mod tests {
 
     #[test]
     fn a_checkpoint_with_no_template_falls_back_to_chatml_like_llama_cpp() {
-        let tmpl = PromptTemplate::from_gguf_metadata(None, Some("olmoe"), false, None, None);
+        let tmpl = PromptTemplate::from_gguf_metadata(None, Some("olmoe"), false, true, None, None);
         let rendered = tmpl
             .render(&[msg("user", "hi")], &[], Map::new())
             .expect("renders");
@@ -491,7 +500,7 @@ mod tests {
 
     #[test]
     fn a_byte_tokenizer_checkpoint_falls_back_to_role_labeled_lines() {
-        let tmpl = PromptTemplate::from_gguf_metadata(None, Some("olmoe"), true, None, None);
+        let tmpl = PromptTemplate::from_gguf_metadata(None, Some("olmoe"), true, true, None, None);
         let rendered = tmpl
             .render(
                 &[msg("user", "hello"), msg("assistant", "hi back")],
@@ -505,7 +514,8 @@ mod tests {
     #[test]
     fn chat_template_kwargs_reach_the_template() {
         let src = "{% if enable_thinking %}THINK{% endif %}{{ messages[0].content }}";
-        let tmpl = PromptTemplate::from_gguf_metadata(Some(src), Some("qwen3"), false, None, None);
+        let tmpl =
+            PromptTemplate::from_gguf_metadata(Some(src), Some("qwen3"), false, true, None, None);
         let mut extra = Map::new();
         extra.insert("enable_thinking".into(), json!(true));
         assert_eq!(
@@ -524,7 +534,8 @@ mod tests {
     fn a_template_that_reads_tools_is_given_them_structurally() {
         let src =
             "{% for t in tools %}TOOL:{{ t.function.name }}{% endfor %}{{ messages[0].content }}";
-        let tmpl = PromptTemplate::from_gguf_metadata(Some(src), Some("qwen3"), false, None, None);
+        let tmpl =
+            PromptTemplate::from_gguf_metadata(Some(src), Some("qwen3"), false, true, None, None);
         assert!(tmpl.handles_tools());
         let tools = vec![tool_def("get_weather")];
         assert_eq!(
@@ -540,8 +551,14 @@ mod tests {
     fn a_template_that_only_mentions_tools_does_not_count_as_handling_them() {
         let mentions = "{# tools are described by the system prompt #}\
              {% for m in messages %}{{ m.role }}: {{ m.content }}\n{% endfor %}";
-        let tmpl =
-            PromptTemplate::from_gguf_metadata(Some(mentions), Some("qwen2"), false, None, None);
+        let tmpl = PromptTemplate::from_gguf_metadata(
+            Some(mentions),
+            Some("qwen2"),
+            false,
+            true,
+            None,
+            None,
+        );
         assert!(
             !tmpl.handles_tools(),
             "the word alone must not skip the preamble"
@@ -553,8 +570,14 @@ mod tests {
     /// come back as the marker text that preamble asked for.
     #[test]
     fn a_template_that_ignores_tools_sees_replayed_calls_as_marker_text() {
-        let tmpl =
-            PromptTemplate::from_gguf_metadata(Some(CHATML), Some("qwen2"), false, None, None);
+        let tmpl = PromptTemplate::from_gguf_metadata(
+            Some(CHATML),
+            Some("qwen2"),
+            false,
+            true,
+            None,
+            None,
+        );
         assert!(!tmpl.handles_tools());
         let replayed = ChatMessage {
             role: "assistant".to_string(),
@@ -578,7 +601,8 @@ mod tests {
     #[test]
     fn replayed_call_arguments_reach_a_structural_template_as_an_object() {
         let src = "{% for m in messages %}{% for c in m.tool_calls %}{{ c.function.arguments.city }}{% endfor %}{% endfor %}tools:{{ tools | length }}";
-        let tmpl = PromptTemplate::from_gguf_metadata(Some(src), Some("qwen3"), false, None, None);
+        let tmpl =
+            PromptTemplate::from_gguf_metadata(Some(src), Some("qwen3"), false, true, None, None);
         let replayed = ChatMessage {
             role: "assistant".to_string(),
             content: None,
@@ -600,6 +624,7 @@ mod tests {
             Some("{% for m in messages %}"),
             None,
             false,
+            true,
             None,
             None,
         );
@@ -630,8 +655,14 @@ mod tests {
                {% if reasoning_effort not in allowed %}{{ raise_exception('bad effort') }}{% endif %}\
                E:{{ reasoning_effort }}\
              {% endif %}{{ messages[0].content }}";
-        let tmpl =
-            PromptTemplate::from_gguf_metadata(Some(graded), Some("qwen3"), false, None, None);
+        let tmpl = PromptTemplate::from_gguf_metadata(
+            Some(graded),
+            Some("qwen3"),
+            false,
+            true,
+            None,
+            None,
+        );
         let profile = tmpl.efforts();
         assert!(profile.consumes_effort);
         assert!(profile.validates);
@@ -644,8 +675,14 @@ mod tests {
             vec!["low", "medium", "high"]
         );
 
-        let inert =
-            PromptTemplate::from_gguf_metadata(Some(CHATML), Some("qwen2"), false, None, None);
+        let inert = PromptTemplate::from_gguf_metadata(
+            Some(CHATML),
+            Some("qwen2"),
+            false,
+            true,
+            None,
+            None,
+        );
         assert!(!inert.efforts().consumes_effort);
     }
 

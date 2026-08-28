@@ -87,7 +87,7 @@ curl -fsSL https://raw.githubusercontent.com/antonellof/ferrox/main/scripts/inst
 ```
 
 Installs `ferrox` and `ferrox-server` into `~/.local/bin` (override with
-`FERROX_INSTALL_DIR`, pin with `FERROX_VERSION=v0.13.0`). The downloaded
+`FERROX_INSTALL_DIR`, pin with `FERROX_VERSION=v0.13.1`). The downloaded
 `ferrox` is built with `serve`, so one binary runs completions and
 serves the API. `ferrox-server` ships alongside it so an existing one on
 your PATH keeps working. Prebuilts are macOS arm64 with Metal and Linux
@@ -112,9 +112,6 @@ silicon, `--features cuda` on Linux with an NVIDIA card, nothing on a
 CPU-only machine. Everything else is already in: `ferrox serve`,
 `ferrox download`, `ferrox bench`, `ferrox verify` and completions all
 work out of the box.
-
-Building it takes a few minutes because the HTTP server and the
-downloader come with it.
 
 Using ferrox as a Rust library rather than a command? Depend on
 [`ferrox-inference`](https://crates.io/crates/ferrox-inference), or on

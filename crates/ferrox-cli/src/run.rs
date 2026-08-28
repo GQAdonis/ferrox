@@ -650,6 +650,76 @@ fn seed_from_args(seed: i64) -> u64 {
 }
 
 /// Run llama.cpp-style GGUF completion.
+/// Loads a GGUF decoder, streaming experts when the weights will not
+/// fit in memory.
+///
+/// The CLI could not stream AT ALL before this: `from_gguf_with_expert_cache`
+/// was used only by `ferrox-server`, so `FERROX_SSD_STREAMING` and
+/// `FERROX_EXPERT_CACHE_BYTES` were silently ignored by `ferrox -m`.
+/// The CLI even printed advice to set the latter, for a feature it did
+/// not implement. That matters because running a model too big for the
+/// machine is the project's headline capability and the CLI is how
+/// people run models.
+///
+/// Same decision as the server: explicit settings win in both
+/// directions, an unknown amount of memory resolves to resident rather
+/// than guessing, and enabling it says so, because streaming is slower
+/// than resident and a slow run should never be a silent one.
+pub(crate) fn load_decoder_streaming_if_needed(
+    path: &std::path::Path,
+    config: ferrox_models::config::ModelConfig,
+) -> anyhow::Result<Decoder> {
+    let explicit = std::env::var("FERROX_EXPERT_CACHE_BYTES")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok());
+    let refused = matches!(
+        std::env::var("FERROX_SSD_STREAMING").ok().as_deref(),
+        Some("0") | Some("false") | Some("off")
+    );
+    let budget = if let Some(b) = explicit {
+        Some(b)
+    } else if refused {
+        None
+    } else {
+        let weights = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+        let available = ferrox_core::host_memory::available_bytes();
+        match ferrox_core::host_memory::plan_for(
+            weights,
+            available,
+            /* headroom = */ 4 * 1024 * 1024 * 1024,
+            /* floor = */ 2 * 1024 * 1024 * 1024,
+        ) {
+            ferrox_core::host_memory::FitPlan::Resident => None,
+            ferrox_core::host_memory::FitPlan::Stream { cache_bytes } => {
+                // REFUSE rather than stream. Expert streaming produces
+                // WRONG OUTPUT on real checkpoints: OLMoE-1B-7B Q4_0
+                // answers "Paris." resident and "amongst amongst, and
+                // of" streamed, deterministically, at temperature 0.
+                //
+                // The fixture test
+                // `store_backed_experts_produce_bit_identical_logits_to_resident`
+                // passes, so whatever differs is not exercised by it.
+                // Until that is understood, enabling this automatically
+                // would turn "your model does not fit" into "your model
+                // answers nonsense", which is far worse.
+                let gib = |b: u64| b as f64 / 1024.0 / 1024.0 / 1024.0;
+                anyhow::bail!(
+                    "this checkpoint is {:.1} GiB and only {:.1} GiB is available. Expert \
+                     streaming would fit it in about {:.1} GiB, but it currently produces \
+                     WRONG OUTPUT on real checkpoints and is not enabled automatically \
+                     for that reason. Use a smaller quantization, or set \
+                     FERROX_EXPERT_CACHE_BYTES explicitly to try streaming anyway and \
+                     compare the output against llama.cpp yourself.",
+                    gib(weights),
+                    available.map(gib).unwrap_or(0.0),
+                    gib(cache_bytes),
+                );
+            }
+        }
+    };
+    Ok(Decoder::from_gguf_with_expert_cache(path, config, budget)?)
+}
+
 pub fn run_infer(args: InferArgs) -> anyhow::Result<()> {
     if args.list_devices {
         print_available_devices();
@@ -748,7 +818,7 @@ pub fn run_infer(args: InferArgs) -> anyhow::Result<()> {
     // request, from `cparams.n_ctx_seq`).
     let mut config = config;
     config.apply_runtime_context(ctx_size);
-    let decoder = Decoder::from_gguf(path, config)?;
+    let decoder = load_decoder_streaming_if_needed(path, config)?;
     eprintln!("ferrox: loaded in {:.2}s", load_t.elapsed().as_secs_f64());
 
     let mut tokens = tokenizer.encode(&prompt);

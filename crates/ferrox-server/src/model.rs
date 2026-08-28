@@ -81,19 +81,27 @@ fn auto_stream_if_needed(weight_bytes: u64) -> Option<u64> {
     ) {
         ferrox_core::host_memory::FitPlan::Resident => None,
         ferrox_core::host_memory::FitPlan::Stream { cache_bytes } => {
+            // REFUSE rather than stream. Expert streaming produces WRONG
+            // OUTPUT on real checkpoints: OLMoE-1B-7B Q4_0 answers
+            // "Paris." resident and "amongst amongst, and of" streamed,
+            // deterministically at temperature 0. The fixture test that
+            // pins streaming as bit-identical passes, so whatever
+            // differs is not exercised by it.
+            //
+            // Serving nonsense is worse than refusing to start, and an
+            // operator who set no flag did not ask for either.
             let gib = |b: u64| b as f64 / 1024.0 / 1024.0 / 1024.0;
-            tracing::warn!(
-                "weights are {:.1} GiB and only {:.1} GiB is available after reserving \
-                 {:.1} GiB, so expert streaming was enabled automatically with a {:.1} GiB \
-                 cache. This is SLOWER than running resident, and on Metal it currently \
-                 also gives up the fused MoE kernels. Set FERROX_SSD_STREAMING=0 to refuse \
-                 instead, or FERROX_EXPERT_CACHE_BYTES to choose the budget yourself.",
+            tracing::error!(
+                "weights are {:.1} GiB and only {:.1} GiB is available. Expert streaming \
+                 would fit them in about {:.1} GiB, but it currently produces WRONG \
+                 OUTPUT on real checkpoints, so it is NOT enabled automatically. Use a \
+                 smaller quantization, or set FERROX_EXPERT_CACHE_BYTES explicitly to \
+                 try it anyway.",
                 gib(weight_bytes),
                 available.map(gib).unwrap_or(0.0),
-                gib(FIT_HEADROOM_BYTES),
                 gib(cache_bytes),
             );
-            Some(cache_bytes)
+            None
         }
     }
 }

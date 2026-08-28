@@ -23,6 +23,49 @@ type Q6kRepackCache = Mutex<HashMap<(usize, usize), Arc<[u8]>>>;
 type Q8x4RepackCache = Mutex<HashMap<(usize, usize), Arc<[u8]>>>;
 type Q4x4RepackCache = Mutex<HashMap<(usize, usize), Arc<[u8]>>>;
 
+/// Repack without touching the cache, for buffers whose address is
+/// recycled (see `WeightBytes::address_is_stable`).
+#[allow(dead_code)]
+fn repack_q4k_uncached(data: &[u8], rows: usize, cols: usize) -> Arc<[u8]> {
+    let interleave = ferrox_quant::q4_kx8_interleave();
+    let packed = ferrox_quant::pack_q4_k_matrix_x8(data, rows, cols, interleave);
+    Arc::from(packed.into_boxed_slice())
+}
+
+/// Repack without touching the cache, for buffers whose address is
+/// recycled (see `WeightBytes::address_is_stable`).
+#[allow(dead_code)]
+fn repack_q5k_uncached(data: &[u8], rows: usize, cols: usize) -> Arc<[u8]> {
+    let interleave = ferrox_quant::q5_kx8_interleave();
+    let packed = ferrox_quant::pack_q5_k_matrix_x8(data, rows, cols, interleave);
+    Arc::from(packed.into_boxed_slice())
+}
+
+/// Repack without touching the cache, for buffers whose address is
+/// recycled (see `WeightBytes::address_is_stable`).
+#[allow(dead_code)]
+fn repack_q6k_uncached(data: &[u8], rows: usize, cols: usize) -> Arc<[u8]> {
+    let interleave = ferrox_quant::q6_kx8_interleave();
+    let packed = ferrox_quant::pack_q6_k_matrix_x8(data, rows, cols, interleave);
+    Arc::from(packed.into_boxed_slice())
+}
+
+/// Repack without touching the cache, for buffers whose address is
+/// recycled (see `WeightBytes::address_is_stable`).
+fn repack_q8x4_uncached(data: &[u8], rows: usize, cols: usize) -> Arc<[u8]> {
+    let packed =
+        ferrox_quant::pack_q8_0_matrix_x4(data, rows, cols, ferrox_quant::q8_0x4_interleave());
+    Arc::from(packed.into_boxed_slice())
+}
+
+/// Repack without touching the cache, for buffers whose address is
+/// recycled (see `WeightBytes::address_is_stable`).
+fn repack_q4_0x4_uncached(data: &[u8], rows: usize, cols: usize) -> Arc<[u8]> {
+    let packed =
+        ferrox_quant::pack_q4_0_matrix_x4(data, rows, cols, ferrox_quant::q4_0x4_interleave());
+    Arc::from(packed.into_boxed_slice())
+}
+
 /// Process-wide cache of interleaved Q4_K (`block_q4_Kx8`) bytes.
 /// Retained for when K-quant Q8_K int-dot is re-enabled after parity
 /// fixes on real Q4_K_M checkpoints.
@@ -33,7 +76,12 @@ fn q4k_repack_cache() -> &'static Q4kRepackCache {
 }
 
 #[allow(dead_code)]
-fn get_or_repack_q4k(data: &[u8], rows: usize, cols: usize) -> Arc<[u8]> {
+fn get_or_repack_q4k(data: &[u8], rows: usize, cols: usize, cacheable: bool) -> Arc<[u8]> {
+    // See `WeightBytes::address_is_stable`. Caching a recycled
+    // buffer by address serves one expert another expert's bytes.
+    if !cacheable {
+        return repack_q4k_uncached(data, rows, cols);
+    }
     let key = (data.as_ptr() as usize, rows);
     {
         let cache = q4k_repack_cache().lock().unwrap();
@@ -55,7 +103,12 @@ fn q5k_repack_cache() -> &'static Q5kRepackCache {
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn get_or_repack_q5k(data: &[u8], rows: usize, cols: usize) -> Arc<[u8]> {
+fn get_or_repack_q5k(data: &[u8], rows: usize, cols: usize, cacheable: bool) -> Arc<[u8]> {
+    // See `WeightBytes::address_is_stable`. Caching a recycled
+    // buffer by address serves one expert another expert's bytes.
+    if !cacheable {
+        return repack_q5k_uncached(data, rows, cols);
+    }
     let key = (data.as_ptr() as usize, rows);
     {
         let cache = q5k_repack_cache().lock().unwrap();
@@ -75,7 +128,12 @@ fn q6k_repack_cache() -> &'static Q6kRepackCache {
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn get_or_repack_q6k(data: &[u8], rows: usize, cols: usize) -> Arc<[u8]> {
+fn get_or_repack_q6k(data: &[u8], rows: usize, cols: usize, cacheable: bool) -> Arc<[u8]> {
+    // See `WeightBytes::address_is_stable`. Caching a recycled
+    // buffer by address serves one expert another expert's bytes.
+    if !cacheable {
+        return repack_q6k_uncached(data, rows, cols);
+    }
     let key = (data.as_ptr() as usize, rows);
     {
         let cache = q6k_repack_cache().lock().unwrap();
@@ -96,7 +154,12 @@ fn q8x4_repack_cache() -> &'static Q8x4RepackCache {
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn get_or_repack_q8x4(data: &[u8], rows: usize, cols: usize) -> Arc<[u8]> {
+fn get_or_repack_q8x4(data: &[u8], rows: usize, cols: usize, cacheable: bool) -> Arc<[u8]> {
+    // See `WeightBytes::address_is_stable`. Caching a recycled
+    // buffer by address serves one expert another expert's bytes.
+    if !cacheable {
+        return repack_q8x4_uncached(data, rows, cols);
+    }
     let key = (data.as_ptr() as usize, rows);
     {
         let cache = q8x4_repack_cache().lock().unwrap();
@@ -117,7 +180,12 @@ fn q4x4_repack_cache() -> &'static Q4x4RepackCache {
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn get_or_repack_q4_0x4(data: &[u8], rows: usize, cols: usize) -> Arc<[u8]> {
+fn get_or_repack_q4_0x4(data: &[u8], rows: usize, cols: usize, cacheable: bool) -> Arc<[u8]> {
+    // See `WeightBytes::address_is_stable`. Caching a recycled
+    // buffer by address serves one expert another expert's bytes.
+    if !cacheable {
+        return repack_q4_0x4_uncached(data, rows, cols);
+    }
     let key = (data.as_ptr() as usize, rows);
     {
         let cache = q4x4_repack_cache().lock().unwrap();
@@ -173,6 +241,23 @@ impl WeightBytes {
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    /// May a repack cache key on this buffer's ADDRESS?
+    ///
+    /// Only for `Mapped`, whose address is a fixed point in a
+    /// process-lifetime mmap. `Shared` is a lease over an expert
+    /// store's recycled buffer: two different experts routinely land at
+    /// the same address, and an address-keyed cache then serves one of
+    /// them the other's repacked bytes. That produced fluent garbage on
+    /// OLMoE with expert streaming on, while the raw weight bytes
+    /// compared equal, because the corruption was in the CACHE and not
+    /// in the weights.
+    ///
+    /// `Owned` is excluded for the same reason: a freed Vec's address
+    /// can be reused.
+    pub fn address_is_stable(&self) -> bool {
+        matches!(self, WeightBytes::Mapped { .. })
     }
 
     /// True if this is a zero-copy mmap view rather than an owned
@@ -599,6 +684,29 @@ pub enum WeightMatrix {
 }
 
 impl WeightMatrix {
+    /// Raw quantized byte length, or 0 for a float matrix. For
+    /// comparing two backings of the same weight.
+    pub fn bytes_len(&self) -> usize {
+        match self {
+            WeightMatrix::Quantized { data, .. } => data.len(),
+            _ => 0,
+        }
+    }
+
+    /// Do two matrices hold the same quantized bytes?
+    ///
+    /// Exists to answer one question: when a streamed expert and a
+    /// resident one disagree about a model's output, is the difference
+    /// in the WEIGHTS or downstream of them?
+    pub fn bytes_eq(&self, other: &WeightMatrix) -> bool {
+        match (self, other) {
+            (WeightMatrix::Quantized { data: a, .. }, WeightMatrix::Quantized { data: b, .. }) => {
+                a.as_slice() == b.as_slice()
+            }
+            _ => false,
+        }
+    }
+
     pub fn rows(&self) -> usize {
         match self {
             WeightMatrix::F32(t) => t.rows(),
@@ -1135,7 +1243,12 @@ impl WeightMatrix {
                             let n_groups = *rows / ferrox_quant::Q8_0X4_NROWS;
                             let serial = Self::prefer_serial_matvec(*rows, *cols);
                             if n_groups > 0 {
-                                let packed = get_or_repack_q8x4(data.as_slice(), *rows, *cols);
+                                let packed = get_or_repack_q8x4(
+                                    data.as_slice(),
+                                    *rows,
+                                    *cols,
+                                    data.address_is_stable(),
+                                );
                                 if serial {
                                     for (g, chunk) in out[..n_groups * ferrox_quant::Q8_0X4_NROWS]
                                         .chunks_mut(ferrox_quant::Q8_0X4_NROWS)
@@ -1214,7 +1327,12 @@ impl WeightMatrix {
                             let n_groups = *rows / ferrox_quant::Q4_0X4_NROWS;
                             let serial = Self::prefer_serial_matvec(*rows, *cols);
                             if n_groups > 0 {
-                                let packed = get_or_repack_q4_0x4(data.as_slice(), *rows, *cols);
+                                let packed = get_or_repack_q4_0x4(
+                                    data.as_slice(),
+                                    *rows,
+                                    *cols,
+                                    data.address_is_stable(),
+                                );
                                 if serial {
                                     for (g, chunk) in out[..n_groups * ferrox_quant::Q4_0X4_NROWS]
                                         .chunks_mut(ferrox_quant::Q4_0X4_NROWS)
@@ -1293,7 +1411,12 @@ impl WeightMatrix {
                             let n_groups = *rows / ferrox_quant::Q4_KX8_NROWS;
                             if n_groups > 0 {
                                 let interleave = ferrox_quant::q4_kx8_interleave();
-                                let packed = get_or_repack_q4k(data.as_slice(), *rows, *cols);
+                                let packed = get_or_repack_q4k(
+                                    data.as_slice(),
+                                    *rows,
+                                    *cols,
+                                    data.address_is_stable(),
+                                );
                                 out[..n_groups * ferrox_quant::Q4_KX8_NROWS]
                                     .par_chunks_mut(ferrox_quant::Q4_KX8_NROWS)
                                     .with_min_len(Self::min_rows_per_task(n_groups).max(1))
@@ -1331,7 +1454,12 @@ impl WeightMatrix {
                             let n_groups = *rows / ferrox_quant::Q5_KX8_NROWS;
                             if n_groups > 0 {
                                 let interleave = ferrox_quant::q5_kx8_interleave();
-                                let packed = get_or_repack_q5k(data.as_slice(), *rows, *cols);
+                                let packed = get_or_repack_q5k(
+                                    data.as_slice(),
+                                    *rows,
+                                    *cols,
+                                    data.address_is_stable(),
+                                );
                                 out[..n_groups * ferrox_quant::Q5_KX8_NROWS]
                                     .par_chunks_mut(ferrox_quant::Q5_KX8_NROWS)
                                     .with_min_len(Self::min_rows_per_task(n_groups).max(1))
@@ -1369,7 +1497,12 @@ impl WeightMatrix {
                             let n_groups = *rows / ferrox_quant::Q6_KX8_NROWS;
                             if n_groups > 0 {
                                 let interleave = ferrox_quant::q6_kx8_interleave();
-                                let packed = get_or_repack_q6k(data.as_slice(), *rows, *cols);
+                                let packed = get_or_repack_q6k(
+                                    data.as_slice(),
+                                    *rows,
+                                    *cols,
+                                    data.address_is_stable(),
+                                );
                                 out[..n_groups * ferrox_quant::Q6_KX8_NROWS]
                                     .par_chunks_mut(ferrox_quant::Q6_KX8_NROWS)
                                     .with_min_len(Self::min_rows_per_task(n_groups).max(1))
@@ -1464,7 +1597,7 @@ impl WeightMatrix {
         if matches!(kind, QuantKind::Q8_0) {
             let n_groups = *rows / ferrox_quant::Q8_0X4_NROWS;
             if n_groups > 0 {
-                let packed = get_or_repack_q8x4(data, *rows, *cols);
+                let packed = get_or_repack_q8x4(data, *rows, *cols, /* cacheable = */ false);
                 let serial = Self::prefer_serial_matvec(*rows, *cols);
                 let body = |g: usize, chunk: &mut [f32]| {
                     ferrox_quant::gemv_q8_0x4_group(
@@ -1521,7 +1654,7 @@ impl WeightMatrix {
         if matches!(kind, QuantKind::Q4_0) {
             let n_groups = *rows / ferrox_quant::Q4_0X4_NROWS;
             if n_groups > 0 {
-                let packed = get_or_repack_q4_0x4(data, *rows, *cols);
+                let packed = get_or_repack_q4_0x4(data, *rows, *cols, /* cacheable = */ false);
                 let serial = Self::prefer_serial_matvec(*rows, *cols);
                 let body = |g: usize, chunk: &mut [f32]| {
                     ferrox_quant::gemv_q4_0x4_group(
@@ -1923,7 +2056,12 @@ impl WeightMatrix {
                                 Self::q8_acts(shared, x_batch, batch_size, cols, &mut acts_owned);
                             let n_groups = *rows / ferrox_quant::Q8_0X4_NROWS;
                             if n_groups > 0 {
-                                let packed = get_or_repack_q8x4(data.as_slice(), *rows, cols);
+                                let packed = get_or_repack_q8x4(
+                                    data.as_slice(),
+                                    *rows,
+                                    cols,
+                                    data.address_is_stable(),
+                                );
                                 let nrows_g = ferrox_quant::Q8_0X4_NROWS;
                                 let interleave = ferrox_quant::q8_0x4_interleave();
                                 if ferrox_quant::q8_0x4_gemm_uses_acts_x4(interleave) {
@@ -2059,7 +2197,12 @@ impl WeightMatrix {
                                 Self::q8_acts(shared, x_batch, batch_size, cols, &mut acts_owned);
                             let n_groups = *rows / ferrox_quant::Q4_0X4_NROWS;
                             if n_groups > 0 {
-                                let packed = get_or_repack_q4_0x4(data.as_slice(), *rows, cols);
+                                let packed = get_or_repack_q4_0x4(
+                                    data.as_slice(),
+                                    *rows,
+                                    cols,
+                                    data.address_is_stable(),
+                                );
                                 let nrows_g = ferrox_quant::Q4_0X4_NROWS;
                                 let interleave = ferrox_quant::q4_0x4_interleave();
                                 if ferrox_quant::q4_0x4_gemm_uses_acts_x4(interleave) {
@@ -2191,7 +2334,12 @@ impl WeightMatrix {
                             let n_groups = *rows / ferrox_quant::Q4_KX8_NROWS;
                             if n_groups > 0 {
                                 let interleave = ferrox_quant::q4_kx8_interleave();
-                                let packed = get_or_repack_q4k(data.as_slice(), *rows, cols);
+                                let packed = get_or_repack_q4k(
+                                    data.as_slice(),
+                                    *rows,
+                                    cols,
+                                    data.address_is_stable(),
+                                );
                                 let nc = ferrox_quant::Q4_KX8_GEMM_NC;
                                 // On the i8mm path, interleave each quad of
                                 // activations once per matmul (llama.cpp
@@ -2309,7 +2457,12 @@ impl WeightMatrix {
                             };
                             if n_groups > 0 {
                                 let interleave = ferrox_quant::q5_kx8_interleave();
-                                let packed = get_or_repack_q5k(data.as_slice(), *rows, cols);
+                                let packed = get_or_repack_q5k(
+                                    data.as_slice(),
+                                    *rows,
+                                    cols,
+                                    data.address_is_stable(),
+                                );
                                 let nc = ferrox_quant::Q5_KX8_GEMM_NC;
                                 // On the i8mm path, interleave each quad of
                                 // activations once per matmul; the kernel
@@ -2433,7 +2586,12 @@ impl WeightMatrix {
                                 0
                             };
                             if n_groups > 0 {
-                                let packed = get_or_repack_q6k(data.as_slice(), *rows, cols);
+                                let packed = get_or_repack_q6k(
+                                    data.as_slice(),
+                                    *rows,
+                                    cols,
+                                    data.address_is_stable(),
+                                );
                                 // Quads of 4 (the i8mm tile shape), not
                                 // [`Q6_KX8_GEMM_NC`].
                                 let nc = ferrox_quant::Q8K_ACTS_X4_NC;

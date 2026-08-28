@@ -2427,6 +2427,78 @@ mod tests {
         ModelConfig::from_gguf(&open_metadata_gguf(tag, &kvs)).expect("fixture must load")
     }
 
+    /// Builds a config for an arbitrary architecture tag, returning the
+    /// error rather than unwrapping it.
+    fn config_for_arch(arch: &'static str) -> Result<ModelConfig, LoadError> {
+        // The per-arch hyperparameter keys are looked up by the arch's
+        // own prefix, so they have to be built for the arch under test.
+        let keys: Vec<String> = [
+            "block_count",
+            "embedding_length",
+            "attention.head_count",
+            "attention.head_count_kv",
+            "attention.key_length",
+        ]
+        .iter()
+        .map(|k| format!("{arch}.{k}"))
+        .collect();
+        let theta = format!("{arch}.rope.freq_base");
+        let kvs: Vec<(&str, Kv)> = vec![
+            ("general.architecture", Kv::Str(arch)),
+            (keys[0].as_str(), Kv::U32(1)),
+            (keys[1].as_str(), Kv::U32(64)),
+            (keys[2].as_str(), Kv::U32(1)),
+            (keys[3].as_str(), Kv::U32(1)),
+            (keys[4].as_str(), Kv::U32(64)),
+            (theta.as_str(), Kv::F32(10_000.0)),
+        ];
+        ModelConfig::from_gguf(&open_metadata_gguf(arch, &kvs))
+    }
+
+    /// The generic path is OPT-IN, and this is what proves it.
+    ///
+    /// An architecture nobody has checked used to FALL ONTO generic GQA
+    /// and run. Five did exactly that and computed the wrong thing for
+    /// the life of the project. The refusal exists; nothing tested it,
+    /// so a reordering or an unevidenced addition to
+    /// `AUDITED_GENERIC_GQA` would have gone unnoticed.
+    #[test]
+    fn an_unaudited_generic_architecture_refuses_rather_than_guessing() {
+        // `starcoder` is on the generic path and is not in the audited
+        // list: nobody has run a real one through ferrox.
+        assert!(
+            !crate::capability::is_audited_generic("starcoder"),
+            "this test needs an arch that is generic AND unaudited"
+        );
+        match config_for_arch("starcoder") {
+            Err(LoadError::UnauditedArchitecture(name, _)) => assert_eq!(name, "starcoder"),
+            other => panic!("expected an unaudited refusal, got {other:?}"),
+        }
+    }
+
+    /// An architecture with evidence still loads, or the inversion would
+    /// have turned every model off.
+    #[test]
+    fn an_audited_architecture_still_loads() {
+        assert!(crate::capability::is_audited_generic("llama"));
+        assert!(config_for_arch("llama").is_ok());
+    }
+
+    /// A NAMED problem must outrank "unaudited".
+    ///
+    /// `gpt2` uses learned absolute position embeddings, and that is
+    /// what its refusal should say. Reporting "unaudited" instead would
+    /// be true and far less useful, and it is the ordering the loader's
+    /// own comment claims. Nothing checked that claim.
+    #[test]
+    fn a_named_refusal_outranks_the_unaudited_one() {
+        let err = config_for_arch("gpt2").expect_err("gpt2 must refuse");
+        assert!(
+            !matches!(err, LoadError::UnauditedArchitecture(..)),
+            "gpt2 should report its own reason, not that nobody audited it: {err:?}"
+        );
+    }
+
     /// A checkpoint that declares YaRN gets the per-band divisors the
     /// reference's `"yarn"` arm implies, folded into `rope_freqs` so the
     /// existing RoPE kernels apply them. Expected values are hand-derived

@@ -108,30 +108,6 @@ fn parse_proc_kb_field(text: &str, name: &str) -> Option<u64> {
     None
 }
 
-/// Total footprint of a process group.
-///
-/// Summing PSS is correct and summing RSS is not, so a group in which
-/// ANY member could only be read as RSS is reported as RSS: the total is
-/// then an overcount, and saying so is the only honest option. Silently
-/// labelling a mixed sum as PSS would understate nothing and overstate
-/// invisibly.
-///
-/// `None` for a group nothing could be read from -- a zero would be a
-/// failed read presented as an idle engine.
-pub fn sum_footprints(readings: impl IntoIterator<Item = Footprint>) -> Option<Footprint> {
-    let mut bytes = 0u64;
-    let mut kind = FootprintKind::Pss;
-    let mut any = false;
-    for reading in readings {
-        any = true;
-        bytes = bytes.saturating_add(reading.bytes);
-        if reading.kind == FootprintKind::Rss {
-            kind = FootprintKind::Rss;
-        }
-    }
-    any.then_some(Footprint { bytes, kind })
-}
-
 /// A value re-probed at most once per TTL, with concurrent callers
 /// collapsed onto one probe.
 ///
@@ -177,13 +153,6 @@ impl<T: Clone> ProbeCache<T> {
         self.latest = Some((fresh.clone(), now_ms));
         Some(fresh)
     }
-
-    /// The last value probed, however old. For a caller that wants to
-    /// render something rather than nothing and is willing to say when
-    /// it was taken.
-    pub fn last(&self) -> Option<&(T, u64)> {
-        self.latest.as_ref()
-    }
 }
 
 #[cfg(test)]
@@ -222,43 +191,6 @@ Shared_Clean:     786432 kB
     fn vmrss_is_the_fallback_on_a_kernel_without_a_rollup() {
         let status = "Name:\tferrox-server\nVmPeak:\t 900 kB\nVmRSS:\t  4096 kB\n";
         assert_eq!(parse_status_rss(status), Some(4096 * 1024));
-    }
-
-    /// Summing PSS counts a shared page once; summing RSS counts it per
-    /// process. Two workers sharing a 40 GiB mapping report 80 GiB of a
-    /// machine that has 64, so a sum that had to fall back for ANY
-    /// member is labelled RSS -- an overcount that says it is one.
-    #[test]
-    fn a_group_that_had_to_fall_back_anywhere_is_reported_as_the_overcount() {
-        let pss = |bytes| Footprint {
-            bytes,
-            kind: FootprintKind::Pss,
-        };
-        let rss = |bytes| Footprint {
-            bytes,
-            kind: FootprintKind::Rss,
-        };
-
-        assert_eq!(
-            sum_footprints([pss(10), pss(20)]),
-            Some(Footprint {
-                bytes: 30,
-                kind: FootprintKind::Pss
-            })
-        );
-        assert_eq!(
-            sum_footprints([pss(10), rss(20)]),
-            Some(Footprint {
-                bytes: 30,
-                kind: FootprintKind::Rss
-            }),
-            "one RSS member makes the whole total an overcount"
-        );
-        assert_eq!(
-            sum_footprints(std::iter::empty()),
-            None,
-            "a group nothing could be read from is unknown, not idle"
-        );
     }
 
     /// The reason the type exists. Four dashboards polling a status

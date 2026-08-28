@@ -68,11 +68,12 @@ pub(crate) mod detokenize;
 #[allow(dead_code)]
 pub(crate) mod effort;
 
-// Not dead: `parse_smaps_rollup_pss`, `parse_status_rss`,
-// `sum_footprints` and the `Pss`/`Rss` kinds are called from
-// `cache_admin`'s `#[cfg(target_os = "linux")]` probe. Everywhere else
-// the caller is compiled out and the lint cannot see it, so the allow is
-// conditional -- on Linux these still have to earn their keep.
+// Not dead: `parse_smaps_rollup_pss` and `parse_status_rss` are called
+// from `cache_admin`'s `#[cfg(target_os = "linux")]` probe. Everywhere
+// else the caller is compiled out and the lint cannot see it, so the
+// allow is conditional: on Linux these still have to earn their keep,
+// which is exactly how `sum_footprints` and `ProbeCache::last` were
+// caught after the supervisor that used them was deleted.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) mod footprint;
 

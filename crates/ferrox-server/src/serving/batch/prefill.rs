@@ -138,9 +138,17 @@ impl PrefillState {
     /// Consumes a finished prefill into the pieces a decode row needs:
     /// KV caches, the logits the first token is sampled from, and the
     /// position the first generated token occupies.
-    pub(super) fn into_decode_start(self) -> (RowKv, Vec<f32>, usize) {
+    /// Hands the row over to decode, returning the prompt ids too.
+    ///
+    /// The ids used to be dropped here, which is why the batched path
+    /// could ADOPT a radix prefix and never PUBLISH one: publishing
+    /// needs the whole token sequence and the row no longer had it. The
+    /// private generate loop kept them and published; the batcher did
+    /// not, so prefix sharing under `FERROX_CONTINUOUS_BATCHING=1` was
+    /// adopt-only against a tree nothing filled.
+    pub(super) fn into_decode_start(self) -> (RowKv, Vec<f32>, usize, Vec<usize>) {
         debug_assert!(self.is_done(), "prefill must finish before decoding");
-        (self.kv, self.logits, self.tokens_processed)
+        (self.kv, self.logits, self.tokens_processed, self.tokens)
     }
 }
 
@@ -172,13 +180,14 @@ impl Prefill {
             abort,
             blocks,
         } = self;
-        let (kv, logits, pos) = state.into_decode_start();
+        let (kv, logits, pos, prompt_ids) = state.into_decode_start();
         Slot {
             kv,
             pos,
             logits,
             sampler: Sampler::new(params.seed),
             generated_ids: Vec::with_capacity(params.max_tokens),
+            prompt_ids,
             visible: String::new(),
             stops: StopMatcher::new(&params.stop, &params.stop_token_ids),
             prompt_tokens,

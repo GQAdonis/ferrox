@@ -696,7 +696,7 @@ fn seed_caches(
 /// generating, the tree kept ITS pages, and ours for that span are now
 /// unreferenced by the tree. Dropping them on the floor is the classic
 /// leak in this shape of cache.
-fn publish_to_radix(lease: &mut PagedLease, tokens: &[usize], block_size: usize) {
+pub(crate) fn publish_to_radix(lease: &mut PagedLease, tokens: &[usize], block_size: usize) {
     let Some(radix) = lease.radix.clone() else {
         return;
     };

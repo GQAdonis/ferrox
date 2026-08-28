@@ -398,7 +398,7 @@ fn empty_prompt_prefills_one_stand_in_token() {
     let mut state = PrefillState::new(Arc::clone(&decoder), &[], 4);
     assert_eq!(state.tokens_remaining(), 1);
     assert!(state.step_chunk());
-    let (_caches, logits, pos) = state.into_decode_start();
+    let (_caches, logits, pos, _ids) = state.into_decode_start();
     assert_eq!(pos, 1);
     assert_eq!(logits.len(), decoder.config.vocab_size);
 }
@@ -426,7 +426,7 @@ fn prefill_chunking_does_not_change_logits() {
     for chunk in [1usize, 2, 5, 11, 64] {
         let mut state = PrefillState::new(Arc::clone(&decoder), &prompt, chunk);
         while !state.step_chunk() {}
-        let (_caches, logits, pos) = state.into_decode_start();
+        let (_caches, logits, pos, _ids) = state.into_decode_start();
         assert_eq!(pos, prompt.len());
         assert_eq!(
             logits, sequential,
@@ -561,4 +561,64 @@ fn max_seqs_cap_counts_prefilling_prompts_and_still_serves_both() {
     let got: Vec<Vec<usize>> = handles.into_iter().map(|h| h.join().unwrap()).collect();
     assert_eq!(got[0], expected[0]);
     assert_eq!(got[1], expected[1]);
+}
+
+/// A finished batched row must PUBLISH its prefix, not just adopt one.
+///
+/// The batched path adopted from the radix tree and never contributed
+/// to it, because the prompt ids were dropped at the prefill-to-decode
+/// handover and publishing needs the whole sequence. So under
+/// `FERROX_CONTINUOUS_BATCHING=1` prefix sharing ran against a tree
+/// nothing filled: the first request paid full prefill and so did every
+/// request after it, forever.
+///
+/// Asserts the TREE grew, which is the thing that was missing. A test
+/// that only checked the second request was fast would pass on a warm
+/// page cache.
+#[test]
+fn a_finished_batched_row_publishes_its_prefix() {
+    let decoder = tiny_decoder();
+    let block_size = 4;
+    let radix = Arc::new(std::sync::Mutex::new(
+        crate::policy::radix::RadixCache::new(block_size),
+    ));
+    let paged = PagedKvConfig {
+        store: Arc::new(ferrox_core::cache::SharedPagedKv::new(
+            decoder.layers.len(),
+            block_size,
+            /* blocks_per_layer = */ 256,
+            decoder.config.n_kv_heads,
+            decoder.config.head_dim,
+        )),
+        queue_wait: std::time::Duration::ZERO,
+        radix: Some(Arc::clone(&radix)),
+        anchor_token: None,
+        slide_interval: crate::policy::pool_budget::DEFAULT_SWA_EVICTION_INTERVAL,
+    };
+    assert_eq!(
+        radix.lock().unwrap().total_size(),
+        0,
+        "the tree starts empty"
+    );
+
+    let batcher = ContinuousBatcher::spawn_with_config_paged(
+        Arc::clone(&decoder),
+        identity_decode(),
+        BatcherConfig {
+            prefill_chunk: 1,
+            ..BatcherConfig::default()
+        },
+        Some(paged),
+    );
+    let prompt: Vec<usize> = vec![1, 2, 3, 4, 5, 6, 7, 8];
+    batcher
+        .generate(prompt, greedy_params(4, 7), StopTokens::default())
+        .expect("a paged batched row must serve");
+    drop(batcher);
+    std::thread::sleep(std::time::Duration::from_millis(200));
+
+    assert!(
+        radix.lock().unwrap().total_size() > 0,
+        "a finished paged row must leave its prefix in the tree for the next request"
+    );
 }

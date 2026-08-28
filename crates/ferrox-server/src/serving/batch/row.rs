@@ -149,8 +149,24 @@ impl Rows {
             .filter(|uid| self.state.get(uid).is_some_and(|s| s.finish.is_some()))
             .collect();
         for uid in finished {
-            if let Some(slot) = self.remove(uid) {
+            if let Some(mut slot) = self.remove(uid) {
                 budget.release(slot.blocks);
+                // Publish before the lease drops, so the next request
+                // with this prefix can adopt it.
+                //
+                // The batched path used to ADOPT from the radix tree and
+                // never contribute to it, so under continuous batching
+                // prefix sharing ran against a tree nothing filled: the
+                // first request paid full prefill and so did every one
+                // after it. The private generate loop published all
+                // along; only the batcher did not, because the prompt
+                // ids were dropped at the prefill-to-decode handover.
+                if let RowKv::Paged(lease) = &mut slot.kv {
+                    let mut seq = std::mem::take(&mut slot.prompt_ids);
+                    seq.extend_from_slice(&slot.generated_ids);
+                    let bs = lease.block_size();
+                    crate::generate::publish_to_radix(lease, &seq, bs);
+                }
                 reply_finished(slot);
             }
         }
@@ -163,6 +179,10 @@ pub(super) struct Slot {
     pub(super) logits: Vec<f32>,
     pub(super) sampler: Sampler,
     pub(super) generated_ids: Vec<usize>,
+    /// The prompt this row ran, kept so a finished paged row can
+    /// PUBLISH its prefix to the radix tree. Without it the batched
+    /// path adopted prefixes and never contributed one.
+    pub(super) prompt_ids: Vec<usize>,
     /// Detokenized text already safe to expose (past the stop
     /// hold-back).
     pub(super) visible: String,

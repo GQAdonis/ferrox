@@ -124,6 +124,7 @@ fn test_slot(max_tokens: usize, seed: u64) -> (Slot, mpsc::Receiver<JobResult>) 
     let params = greedy_params(max_tokens, seed);
     (
         Slot {
+            prompt_ids: Vec::new(),
             kv: RowKv::Contiguous(Vec::new()),
             pos: 0,
             logits: Vec::new(),

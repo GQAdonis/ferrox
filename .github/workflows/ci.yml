@@ -89,16 +89,16 @@ jobs:
   # Anything gated on `debug_assertions` has this shape, so the gate is
   # the profile, not the feature.
   serve-feature-chain:
-    name: build --release --features serve (what the tarball ships)
+    name: build --release (what the tarball ships; serve is default)
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         include:
           - os: macos-latest
-            features: serve metal
+            features: metal
           - os: ubuntu-latest
-            features: serve
+            features: ""
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

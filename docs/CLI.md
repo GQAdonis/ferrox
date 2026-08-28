@@ -425,7 +425,7 @@ main binary and needs the optional `serve` feature at build time.
 `ferrox-server` is that same server as its own executable, and both
 parse identical arguments through the same code.
 
-Build the CLI with `--features serve` to get the subcommand:
+`serve` is on by default, so a stock `cargo install ferrox-cli` has it:
 
 ```bash
 cargo build --release -p ferrox-cli --features "serve metal"

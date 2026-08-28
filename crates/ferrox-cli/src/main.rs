@@ -52,7 +52,7 @@ enum Commands {
     /// Reuses the server's chat-template + streaming path, start the
     /// server first (`FERROX_MODEL_PATH=… ferrox-server`).
     Chat(chat::ChatArgs),
-    /// Serve the OpenAI-compatible HTTP API (needs `--features serve`).
+    /// Serve the OpenAI-compatible HTTP API.
     ///
     /// Identical to the standalone `ferrox-server` binary: same flags,
     /// same routes, same `ferrox.server.ready` line on stdout, it links
@@ -449,9 +449,9 @@ fn init_rayon_threads() {
 #[cfg(not(feature = "serve"))]
 const SERVE_FEATURE_MISSING: &str = "\
 this ferrox was built without the `serve` feature, so it has no HTTP server.
-Rebuild with it:  cargo install ferrox-cli --features serve
+Rebuild with it:  cargo install ferrox-cli   (serve is on by default)
 Or run the standalone binary:  ferrox-server -m model.gguf
-(The prebuilt release binaries are built with --features serve.)";
+(This only happens in a build that passed --no-default-features.)";
 
 /// Every subcommand `Commands` declares, as clap will name it.
 ///
@@ -1747,7 +1747,7 @@ mod cli_tests {
             panic!("`ferrox serve …` did not parse as the serve subcommand");
         };
         assert_eq!(args, ["-m", "model.gguf"]);
-        assert!(super::SERVE_FEATURE_MISSING.contains("--features serve"));
+        assert!(super::SERVE_FEATURE_MISSING.contains("serve is on by default"));
     }
 
     #[test]

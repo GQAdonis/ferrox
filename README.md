@@ -96,29 +96,25 @@ x86_64 with CPU.
 From crates.io or source instead:
 
 ```bash
-# The `ferrox` binary. Use --features cuda on Linux+NVIDIA.
+# One binary, everything: completions, `ferrox serve`, `ferrox download`,
+# bench, verify. Use --features cuda on Linux+NVIDIA.
 cargo install ferrox-cli --features metal
 
-# Same binary, plus `ferrox serve` for the HTTP API.
-cargo install ferrox-cli --features "serve metal"
-
-# Or the server on its own, unchanged.
+# Or the server on its own, if you prefer two binaries.
 cargo install ferrox-server --features metal
 
 # From source.
-cargo build --release -p ferrox-cli --features "serve metal"
+cargo build --release -p ferrox-cli --features metal
 ```
 
-Neither install pulls in a GPU backend unless you ask for it. `serve` is
-off by default too: it pulls in 98 crates the CLI does not otherwise
-need, so a CLI-only install stays smaller.
+Neither install pulls in a GPU backend unless you ask for it. Everything
+else is on: one binary runs completions, serves the API, downloads
+models, benchmarks and verifies. That costs build time and dependencies,
+and it is the trade this project makes on purpose. A capability behind a
+feature flag is one nobody finds.
 
-Counted rather than claimed: the CLI is 115 crates, of which 37 come
-from `ferrox download` needing HTTPS (`ureq`, `rustls`, `ring`). Without
-a downloader it would be 78. That is the price of fetching a model
-without a Python install, and it is charged whether or not you use it,
-because a download command hidden behind a feature flag is one nobody
-finds.
+A library consumer who wants only the model code should depend on
+`ferrox-models` or `ferrox-core` directly rather than on the CLI.
 
 ## Quick start
 
@@ -133,7 +129,7 @@ ferrox -m models/Llama-3.2-3B-Instruct-Q4_K_M.gguf \
   -p "Explain quantization in two sentences" -n 128 -dev metal -ngl all
 
 # 3. Or serve it on 127.0.0.1:8383 and point any OpenAI client at /v1.
-#    `ferrox serve` needs --features serve. `ferrox-server` is the same server standalone.
+#    `ferrox-server` is the same server standalone, if you prefer two binaries.
 ferrox serve -m models/Llama-3.2-3B-Instruct-Q4_K_M.gguf -dev metal -ngl all &
 curl -s -X POST http://127.0.0.1:8383/v1/chat/completions \
   -H 'content-type: application/json' \

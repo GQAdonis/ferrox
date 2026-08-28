@@ -49,15 +49,13 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # The downloaded `ferrox` is built WITH `serve`, so the tarball
-          # is one binary that both runs completions and serves the API.
-          # `serve` is default-off for `cargo install`, where a CLI-only
-          # user should not compile 98 extra crates and a C crypto
-          # library; someone who downloaded the release already has them.
-          CLI_FEATURES="serve"
+          # One binary that runs completions, serves the API, downloads
+          # models and benchmarks. `serve` is a default feature, so only
+          # the backend needs passing here.
+          CLI_FEATURES=""
           SERVER_FEATURES=""
           if [[ -n "${{ matrix.features }}" ]]; then
-            CLI_FEATURES="serve ${{ matrix.features }}"
+            CLI_FEATURES="${{ matrix.features }}"
             SERVER_FEATURES="${{ matrix.features }}"
           fi
           cargo build --release --locked -p ferrox-cli \

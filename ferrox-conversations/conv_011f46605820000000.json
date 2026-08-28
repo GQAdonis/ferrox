@@ -1,0 +1,50 @@
+{
+  "id": "conv_011f46605820000000",
+  "title": "Explain KV caching in three sentences.",
+  "model": "Olmoe Hf",
+  "created_at": 1787930285,
+  "updated_at": 1787930285,
+  "head_id": "naNUAVC",
+  "messages": [
+    {
+      "id": "ybG5Ify",
+      "parent_id": null,
+      "role": "user",
+      "content": "Explain KV caching in three sentences.",
+      "created_at": 1787930285,
+      "metadata": {
+        "custom": {}
+      }
+    },
+    {
+      "id": "naNUAVC",
+      "parent_id": "ybG5Ify",
+      "role": "assistant",
+      "content": "KV caching is a technique used to improve the performance of data retrieval in a key-value store. It involves storing frequently accessed data in memory (or a cache) for faster access, reducing the number of I/O operations required to retrieve the data. When a client requests data, the cache is checked first, and if it's present, it's served from the cache. If not, the data is fetched from the underlying storage system. Subsequent requests for the same data are served quickly from the cache, without the need to access the storage system. KV caching is commonly used in databases, web servers, and distributed systems to enhance the efficiency and responsiveness of data access.",
+      "created_at": 1787930285,
+      "metadata": {
+        "custom": {
+          "stats": {
+            "line": "TTFT 7.53 s  ·  prefill 27 tok · 3.6 tok/s · 7.52 s  ·  decode 134 tok · 5.5 tok/s · 24.25 s  ·  chatcmpl-9955e5e5c5d8000006",
+            "outcome": "ok",
+            "requestId": "chatcmpl-9955e5e5c5d8000006",
+            "usage": {
+              "completion_tokens": 134,
+              "generation_duration_ms": 24247.396583,
+              "predicted_per_second": 5.526366492225735,
+              "prompt_eval_duration_ms": 7519.305875,
+              "prompt_per_second": 3.5907569726308015,
+              "prompt_tokens": 27,
+              "time_to_first_token_ms": 7525.970792,
+              "total_tokens": 161
+            }
+          }
+        },
+        "steps": [],
+        "unstable_annotations": [],
+        "unstable_data": [],
+        "unstable_state": null
+      }
+    }
+  ]
+}

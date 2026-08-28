@@ -331,6 +331,15 @@ fn pretokenize_regex_for(pre: &str) -> fancy_regex::Regex {
         "qwen2" | "stablelm2" | "jina-v2-code" | "gpt-4o" | "superbpe" => {
             r"'s|'t|'re|'ve|'m|'ll|'d|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+"
         }
+        // OLMo and its neighbours: the GPT-2 alternatives, but ending at
+        // `\s+(?!\S)` with NO trailing `|\s+`. That absence is the
+        // whole difference and it is deliberate upstream, so it is a
+        // separate arm rather than folded into the fallback.
+        // (llama.cpp LLAMA_VOCAB_PRE_TYPE_OLMO, shared with jais,
+        // trillion and granite-docling.)
+        "olmo" | "jais" | "trillion" | "granite-docling" => {
+            r"'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)"
+        }
         // Plain GPT-2, now WITH the trailing-whitespace clause that was
         // dropped before.
         _ => r"'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+",

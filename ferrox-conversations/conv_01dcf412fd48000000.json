@@ -1,0 +1,50 @@
+{
+  "id": "conv_01dcf412fd48000000",
+  "title": "The capital of France is",
+  "model": "Olmoe Hf",
+  "created_at": 1787931100,
+  "updated_at": 1787931100,
+  "head_id": "CY3rWAH",
+  "messages": [
+    {
+      "id": "Hur3aXB",
+      "parent_id": null,
+      "role": "user",
+      "content": "The capital of France is",
+      "created_at": 1787931100,
+      "metadata": {
+        "custom": {}
+      }
+    },
+    {
+      "id": "CY3rWAH",
+      "parent_id": "Hur3aXB",
+      "role": "assistant",
+      "content": " Paris.\n",
+      "created_at": 1787931100,
+      "metadata": {
+        "custom": {
+          "stats": {
+            "line": "TTFT 198 ms  ·  prefill 7 tok · 35.4 tok/s · 198 ms  ·  decode 6 tok · 150.3 tok/s · 40 ms  ·  chatcmpl-01d5945acf40000001",
+            "outcome": "ok",
+            "requestId": "chatcmpl-01d5945acf40000001",
+            "usage": {
+              "completion_tokens": 6,
+              "generation_duration_ms": 39.927417,
+              "predicted_per_second": 150.2726810502167,
+              "prompt_eval_duration_ms": 197.759834,
+              "prompt_per_second": 35.39646984129244,
+              "prompt_tokens": 7,
+              "time_to_first_token_ms": 197.813667,
+              "total_tokens": 13
+            }
+          }
+        },
+        "steps": [],
+        "unstable_annotations": [],
+        "unstable_data": [],
+        "unstable_state": null
+      }
+    }
+  ]
+}

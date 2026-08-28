@@ -418,7 +418,22 @@ fn probe_efforts(
 /// ends a turn with a string that is not EOS, so a served Gemma needs
 /// it in the stop set however the prompt was rendered.
 fn end_of_turn_marker(source: Option<&str>) -> Option<&'static str> {
-    let src = source?;
+    let Some(src) = source else {
+        // No template at all, so the builtin renders turns as
+        // `user:` / `assistant:` lines. A BASE model continues that
+        // pattern forever: it has no EOS for a turn it was never
+        // trained on, so it answers and then writes the next `user:`
+        // line itself, to the token cap.
+        //
+        // Observed on OLMoE-1B-7B: "The capital of France is" answered
+        // "Paris." correctly and then repeated
+        // "user: The capital of France is Paris." for 512 tokens. The
+        // answer was right and unusable.
+        //
+        // The turn marker the builtin itself prints is the stop, which
+        // is the same rule the Gemma case below follows.
+        return Some("\nuser:");
+    };
     if src.contains("<|turn>") || src.contains("<turn|>") {
         Some("<turn|>")
     } else if src.contains("<start_of_turn>") {
@@ -642,7 +657,11 @@ mod tests {
             Some("<turn|>")
         );
         assert_eq!(end_of_turn_marker(Some(CHATML)), None);
-        assert_eq!(end_of_turn_marker(None), None);
+        // No template means the builtin prints `user:` / `assistant:`
+        // lines, and a base model continues that pattern to the token
+        // cap because it has no EOS for a turn it never saw. The marker
+        // the builtin itself prints is the stop.
+        assert_eq!(end_of_turn_marker(None), Some("\nuser:"));
     }
 
     /// The probe is what makes `reasoning_effort` mean anything: a

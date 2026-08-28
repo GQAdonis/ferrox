@@ -283,15 +283,17 @@ code and not the crate name.
 | ferrox module | FreeToken source |
 |---|---|
 | `policy::radix::{tree,plain}` | `python/freetoken/kvcache/radix_cache.py` |
-| `policy::scheduler` | `python/freetoken/scheduler/{prefill,decode,table,status}.py` |
+| `serving::admission` | `python/freetoken/scheduler/{prefill,decode,table}.py` |
+| `serving::batch::status` | `python/freetoken/scheduler/status.py`, the pool-occupancy helpers of `scheduler/scheduler.py` |
 | `policy::parser::reasoning` | `python/freetoken/server/reasoning_parser.py` |
 | `policy::parser::tool_call` | `python/freetoken/server/function_call_parser.py` |
 | `policy::effort` | `python/freetoken/tokenizer/effort.py`, part of `tokenizer/tokenize.py` |
 | `policy::detokenize` | `python/freetoken/tokenizer/detokenize.py` |
 | `policy::anchor` | `python/freetoken/scheduler/cache.py` (tool-call anchor, window slide) |
-| `policy::pool` | `python/freetoken/engine/cache_budget.py` |
+| `policy::pool_budget` | `python/freetoken/engine/cache_budget.py` |
 | `policy::rebuild` | the live re-split in `python/freetoken/engine/engine.py` |
-| `policy::serving_stats` | `python/freetoken/server/request_ring.py`, `server/stats.py` |
+| `stats::ring` | `python/freetoken/server/request_ring.py` |
+| `stats::{rate,serving}` | `python/freetoken/server/stats.py` |
 | `policy::maintenance` | `python/freetoken/server/accounting.py`, the gate in `server/api_server.py` |
 | `policy::outbox` | `python/freetoken/server/accounting.py` (stop receipts) |
 | `policy::footprint` | `python/freetoken/server/footprint.py` |
@@ -369,7 +371,7 @@ Adding either is mechanical: both slot into the same `ReasoningFormat` /
 Where ferrox already had a mechanism the port would have duplicated, the
 port plugs into it rather than shadowing it — `ferrox-core::kv_block`
 (content-addressed KV blocks), `ferrox-core::expert_store` (the SSD
-expert tier), `ferrox-server::batch_scheduler` (continuous batching),
+expert tier), `ferrox-server::serving::batch` (continuous batching),
 `ferrox-server::stop` (which delegates its withhold rule to
 `policy::detokenize` so there is one implementation of it in the
 workspace).

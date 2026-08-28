@@ -214,7 +214,7 @@ pub fn derive_limits(
 /// empty slot. Returns what changed, so the caller logs the numbers it
 /// actually adopted rather than the ones it computed.
 pub fn apply_derived(
-    config: &mut crate::batch_scheduler::BatcherConfig,
+    config: &mut crate::serving::batch::BatcherConfig,
     derived: &DerivedLimits,
 ) -> Adopted {
     let mut adopted = Adopted::default();
@@ -448,7 +448,7 @@ mod tests {
     /// instead of only into an empty slot.
     #[test]
     fn a_configured_ceiling_is_never_overridden_by_a_derived_one() {
-        let mut config = crate::batch_scheduler::BatcherConfig {
+        let mut config = crate::serving::batch::BatcherConfig {
             max_context: Some(999),
             kv_blocks: Some(7),
             ..Default::default()
@@ -464,7 +464,7 @@ mod tests {
     /// the other's derivation.
     #[test]
     fn an_absent_ceiling_is_filled_and_the_two_slots_are_independent() {
-        let mut both = crate::batch_scheduler::BatcherConfig {
+        let mut both = crate::serving::batch::BatcherConfig {
             max_context: None,
             kv_blocks: None,
             ..Default::default()
@@ -480,7 +480,7 @@ mod tests {
             }
         );
 
-        let mut half = crate::batch_scheduler::BatcherConfig {
+        let mut half = crate::serving::batch::BatcherConfig {
             max_context: Some(512),
             kv_blocks: None,
             ..Default::default()
@@ -506,7 +506,7 @@ mod tests {
     /// dropped: `kv_blocks` becomes `Some(0)`.
     #[test]
     fn a_fit_smaller_than_one_block_leaves_the_ledger_absent() {
-        let mut config = crate::batch_scheduler::BatcherConfig {
+        let mut config = crate::serving::batch::BatcherConfig {
             max_context: None,
             kv_blocks: None,
             ..Default::default()

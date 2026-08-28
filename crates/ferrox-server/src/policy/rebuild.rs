@@ -1,6 +1,6 @@
 //! The transaction around a live cache resize.
 //!
-//! [`crate::policy::pool::validate_rebuild`] is the *pre-check*: it decides
+//! [`crate::policy::pool_budget::validate_rebuild`] is the *pre-check*: it decides
 //! whether a split fits, before anything is freed. That is only half of
 //! a resize. The other half is what happens when the arithmetic said
 //! yes and the allocation still fails -- which is the case that turns a
@@ -45,7 +45,7 @@
 //! Ported from FreeToken's `scheduler/scheduler.py`; see
 //! `docs/THIRD_PARTY_NOTICES.md`.
 
-use crate::policy::pool::{PoolSizes, RebuildRequest};
+use crate::policy::pool_budget::{PoolSizes, RebuildRequest};
 
 /// What the engine is doing right now, as far as a resize cares.
 ///

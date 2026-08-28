@@ -1,0 +1,176 @@
+//! The batcher's tests, grouped by what they hold the scheduler to.
+//!
+//! They live under `batch` rather than beside one submodule because
+//! what almost all of them cover is the *tick* -- admission, prefill,
+//! decode and flush composed -- which is the whole module and not any
+//! one file in it. The fixtures they share are here; each group below
+//! uses them.
+
+use std::collections::{HashSet, VecDeque};
+use std::sync::atomic::Ordering;
+use std::sync::mpsc;
+use std::sync::{Arc, Barrier, Mutex};
+use std::thread;
+
+use ferrox_core::cache::KvCache;
+use ferrox_models::config::test_dense_fixture;
+use ferrox_models::sampling::{Sampler, SamplingParams};
+use ferrox_models::tokenizer::StopTokens;
+use ferrox_models::Decoder;
+
+use crate::budget::ContextCeiling;
+use crate::cancel::CancelToken;
+use crate::generate::{DecodeError, FinishReason, GenerationParams, PagedKvConfig};
+use crate::stop::StopMatcher;
+
+use super::batcher::ContinuousBatcher;
+use super::block_budget::BlockBudget;
+use super::config::{BatcherConfig, DecodeFn, JobResult, DEFAULT_KV_BLOCK_SIZE};
+use super::prefill::{Prefill, PrefillState};
+use super::queue::{AbortId, AbortInbox, QueueGate};
+use super::row::{Job, RowKv, Rows, Slot};
+use super::status::{PoolUsage, PrefillSnapshot};
+use super::worker::{admit, apply_aborts, batch_status};
+
+mod admission;
+mod batching;
+mod cancel;
+mod queue;
+mod rows;
+mod status;
+
+fn tiny_decoder() -> Arc<Decoder> {
+    let cfg = test_dense_fixture();
+    let vocab = cfg.vocab_size;
+    Arc::new(Decoder::new_random_small(cfg, 2, vocab))
+}
+
+fn greedy_params(max_tokens: usize, seed: u64) -> GenerationParams {
+    GenerationParams {
+        max_tokens,
+        sampling: SamplingParams {
+            temperature: 0.0,
+            top_p: 1.0,
+            top_k: 0,
+            repetition_penalty: 1.0,
+            presence_penalty: 0.0,
+            frequency_penalty: 0.0,
+        },
+        seed,
+        stop: vec![],
+        stop_token_ids: Vec::new(),
+        json_object: false,
+        cancel: None,
+        ignore_eos: false,
+    }
+}
+
+fn identity_decode() -> DecodeFn {
+    Arc::new(|ids: &[usize]| {
+        ids.iter()
+            .map(|id| char::from_u32(65 + (*id as u32 % 26)).unwrap_or('?'))
+            .collect()
+    })
+}
+
+fn sequential_ids(decoder: &Decoder, prompt: &[usize], params: &GenerationParams) -> Vec<usize> {
+    let mut caches: Vec<KvCache> = decoder
+        .layers
+        .iter()
+        .map(|_| KvCache::new(decoder.config.n_kv_heads, decoder.config.head_dim))
+        .collect();
+    let mut pos = 0;
+    let mut logits = Vec::new();
+    for &tok in prompt {
+        logits = decoder.forward_token(tok, pos, &mut caches);
+        pos += 1;
+    }
+    let mut sampler = Sampler::new(params.seed);
+    let mut generated = Vec::new();
+    for _ in 0..params.max_tokens {
+        let next = sampler.sample(&logits, &params.sampling, &generated);
+        generated.push(next);
+        logits = decoder.forward_token(next, pos, &mut caches);
+        pos += 1;
+    }
+    generated
+}
+
+/// The KV shape of `tiny_decoder`, for pricing a refusal in bytes.
+fn test_shape() -> ferrox_models::KvShape {
+    ferrox_models::KvShape::from_config(&test_dense_fixture(), ferrox_models::KvElem::F32, 1)
+}
+
+/// A ledger with no budget configured, for tests that are not
+/// about admission.
+fn no_budget() -> BlockBudget {
+    BlockBudget::new(
+        DEFAULT_KV_BLOCK_SIZE,
+        None,
+        Arc::new(ContextCeiling::new(None, test_shape())),
+    )
+}
+
+fn budget(block_size: usize, total: Option<usize>) -> BlockBudget {
+    BlockBudget::new(
+        block_size,
+        total,
+        Arc::new(ContextCeiling::new(None, test_shape())),
+    )
+}
+
+fn test_slot(max_tokens: usize, seed: u64) -> (Slot, mpsc::Receiver<JobResult>) {
+    let (tx, rx) = mpsc::channel();
+    let params = greedy_params(max_tokens, seed);
+    (
+        Slot {
+            kv: RowKv::Contiguous(Vec::new()),
+            pos: 0,
+            logits: Vec::new(),
+            sampler: Sampler::new(seed),
+            generated_ids: Vec::new(),
+            visible: String::new(),
+            stops: StopMatcher::new(&params.stop, &params.stop_token_ids),
+            prompt_tokens: 0,
+            max_tokens,
+            stop_tokens: StopTokens::default(),
+            params,
+            reply: tx,
+            abort: AbortId(0),
+            blocks: 1,
+            finish: None,
+        },
+        rx,
+    )
+}
+
+fn budget_config(block_size: usize, blocks: usize) -> BatcherConfig {
+    BatcherConfig {
+        prefill_chunk: 1,
+        kv_block_size: block_size,
+        kv_blocks: Some(blocks),
+        ..BatcherConfig::default()
+    }
+}
+
+fn cancellable_params(max_tokens: usize, seed: u64) -> (GenerationParams, CancelToken) {
+    let token = CancelToken::new();
+    let mut params = greedy_params(max_tokens, seed);
+    params.cancel = Some(token.clone());
+    (params, token)
+}
+
+fn abortable_job(abort: AbortId, prompt: Vec<usize>) -> (Job, mpsc::Receiver<JobResult>) {
+    let (tx, rx) = mpsc::channel();
+    (
+        Job {
+            prompt_tokens: prompt,
+            params: greedy_params(4, 1),
+            stop_tokens: StopTokens::from_eos(None),
+            reply: tx,
+            abort,
+            blocks: 1,
+        },
+        rx,
+    )
+}

@@ -22,12 +22,10 @@
 //! |---|---|
 //! | [`radix`] | which prefix of a new prompt is already computed, and what may be evicted |
 //! | [`anchor`] | which position an agentic turn will come back to, and what to keep for it |
-//! | [`pool`] | how VRAM is split between the expert cache and the KV pools, and how it is re-split live |
-//! | [`scheduler`] | which requests run this step, how much prefill they get, and who is retracted |
+//! | [`pool_budget`] | how VRAM is split between the expert cache and the KV pools, and how it is re-split live |
 //! | [`parser`] | where a model's reasoning ends and its answer begins, and which tool it called |
 //! | [`effort`] | which reasoning-effort dialect this checkpoint speaks |
 //! | [`detokenize`] | what text is safe to stream after one more token |
-//! | [`serving_stats`] | what a server may honestly claim about its own throughput and latency |
 //! | [`maintenance`] | whether a request, a rebuild, or a stop may proceed right now |
 //! | [`rebuild`] | how a live pool re-split commits, rolls back, or latches |
 //! | [`outbox`] | what a stop reports, once, however many times it is retried |
@@ -35,7 +33,7 @@
 //!
 //! Where ferrox already had a mechanism the port would have duplicated
 //! -- content-addressed KV blocks ([`ferrox_core::kv_block`]),
-//! continuous batching ([`crate::batch_scheduler`]) -- these modules
+//! continuous batching ([`crate::serving::batch`]) -- these modules
 //! plug into it instead of shadowing it. Each module's docs say which.
 //!
 //! The MoE expert-residency half of the same port lives in
@@ -100,7 +98,7 @@ pub(crate) mod parser;
 /// `/admin/cache/rebuild` exists and does not yet consult it.
 /// Closes with the rebuild half of `c3-serving-and-kv`.
 #[allow(dead_code)]
-pub(crate) mod pool;
+pub(crate) mod pool_budget;
 
 /// Wired: `RadixCache::insert_prefix` / `match_prefix` / `lock` /
 /// `unlock`, from `generate::publish_to_radix`.
@@ -118,25 +116,3 @@ pub(crate) mod radix;
 /// Closes with the rebuild half of `c3-serving-and-kv`.
 #[allow(dead_code)]
 pub(crate) mod rebuild;
-
-/// Wired: `BatchStatus`, `PoolUsage`, `PrefillSnapshot`,
-/// `StatusReporter` and the decode log interval, all from
-/// `batch_scheduler`.
-/// Unwired: `SlotTable`, `Capacity`, `Geometry`, `PromptAdmission`,
-/// `PrefillPass`, `NotAdmitted`, `FinishReason` -- admission, the
-/// chunked-prefill budget and retraction. This is the largest unwired
-/// block left in the crate and it is one roadmap item:
-/// `sched-time-debt` (roadmap `c3-serving-and-kv`), whose quantum is
-/// chunk DURATION because a GPU cannot preempt a running kernel.
-#[allow(dead_code)]
-pub(crate) mod scheduler;
-
-/// Wired: `ServingStats` and the two sliding-window rates `/v1/stats`
-/// reports. Unwired, and worth stating plainly: the counters
-/// (`inflight`, `completed`, `aborted`, `prompt_tokens_total`,
-/// `completion_tokens_total`) and `record` have NO caller, so the
-/// server holds a counter block it never increments. `/v1/stats`
-/// reports the rates only. Closes by wiring `record` into the request
-/// path, or by deleting the counters.
-#[allow(dead_code)]
-pub(crate) mod serving_stats;

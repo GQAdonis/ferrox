@@ -2,8 +2,8 @@
 //! between them without a restart.
 //!
 //! `ferrox-edge` has held the whole policy for a while with nobody to
-//! call it. `pool::CacheReadiness` produces the geometry,
-//! `pool::validate_rebuild` checks a re-split against the floors and the
+//! call it. `pool_budget::CacheReadiness` produces the geometry,
+//! `pool_budget::validate_rebuild` checks a re-split against the floors and the
 //! budget *before* anything is freed, and `maintenance::MaintenanceGate`
 //! decides whether a rebuild may start at all. This module is the three
 //! HTTP endpoints over them, plus the one piece of real mutation ferrox
@@ -42,7 +42,7 @@ use std::sync::Arc;
 use crate::policy::footprint::Footprint;
 use crate::policy::maintenance::{MaintenanceState, RebuildRefused, StopRefused};
 use crate::policy::outbox::Receipt;
-use crate::policy::scheduler::PoolUsage;
+use crate::serving::batch::PoolUsage;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -219,7 +219,7 @@ fn persist_receipt(
 /// counting those as occupied puts every gauge near 100% while the
 /// machine is doing nothing -- and admission, which is happily seating
 /// requests into that memory, disagrees with the number the operator is
-/// reading. `crate::policy::scheduler::PoolUsage::from_available` is where the rule
+/// reading. `crate::serving::batch::PoolUsage::from_available` is where the rule
 /// lives, so it is stated once rather than re-derived per endpoint.
 ///
 /// Evictable is **zero today, and structurally so**: `generate` stores
@@ -475,17 +475,17 @@ pub(crate) async fn cache_rebuild(
     // is already here and already tested, instead of being written
     // under the pressure of the first engine that 503s forever.
     let before = pool.total_blocks() as u64;
-    let current = crate::policy::pool::PoolSizes {
+    let current = crate::policy::pool_budget::PoolSizes {
         moe_cache_slots: 0,
         kv_pages: before,
         prefill_overlap: false,
     };
-    let target = crate::policy::pool::PoolSizes {
+    let target = crate::policy::pool_budget::PoolSizes {
         kv_pages: pages,
         ..current
     };
     let txn = crate::policy::rebuild::RebuildTxn::open(
-        &crate::policy::pool::RebuildRequest {
+        &crate::policy::pool_budget::RebuildRequest {
             moe_cache_slots: None,
             kv_pages: Some(pages),
             mamba_slots: None,

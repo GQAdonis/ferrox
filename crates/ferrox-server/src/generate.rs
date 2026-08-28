@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::policy::anchor::{decode_slide, AnchorState, SlidingRequest, WindowPolicy};
-use crate::policy::pool::SWA_RETAIN_GAP;
+use crate::policy::pool_budget::SWA_RETAIN_GAP;
 use crate::policy::radix::{align_down, NodeId, RadixCache};
 use ferrox_core::cache::{
     KvBlockPool, KvCache, KvPoolExhausted as CacheKvPoolExhausted, PageGroup, PagedKvCache,
@@ -2630,7 +2630,7 @@ mod tests {
                 )))
             }),
             anchor_token: None,
-            slide_interval: crate::policy::pool::DEFAULT_SWA_EVICTION_INTERVAL,
+            slide_interval: crate::policy::pool_budget::DEFAULT_SWA_EVICTION_INTERVAL,
         }
     }
 

@@ -40,7 +40,7 @@
 //! and a prefix that far back is cheaper to recompute than to hold.
 //!
 //! That bound is exactly what the `anchor_checkpoints` term in
-//! [`crate::policy::pool::swa_tokens_per_request`] pays for. Without the drop
+//! [`crate::policy::pool_budget::swa_tokens_per_request`] pays for. Without the drop
 //! rule the pool sizing would be a fiction.
 //!
 //! Ported 1:1 from FreeToken's `scheduler/scheduler.py` (anchor
@@ -49,7 +49,7 @@
 //! (`load_toolcall_anchor_id`) (Apache-2.0); see
 //! `docs/THIRD_PARTY_NOTICES.md`.
 
-use crate::policy::pool::SWA_RETAIN_GAP;
+use crate::policy::pool_budget::SWA_RETAIN_GAP;
 use crate::policy::radix::align_down;
 
 /// Resolve a tool-call opener to the single token that announces it.
@@ -141,7 +141,7 @@ impl WindowPolicy {
         WindowPolicy {
             sliding_window,
             page_size,
-            eviction_interval: crate::policy::pool::DEFAULT_SWA_EVICTION_INTERVAL,
+            eviction_interval: crate::policy::pool_budget::DEFAULT_SWA_EVICTION_INTERVAL,
         }
     }
 

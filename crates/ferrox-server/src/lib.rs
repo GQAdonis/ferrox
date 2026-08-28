@@ -37,9 +37,7 @@
 mod admin;
 mod anthropic;
 mod attribution;
-mod batch_scheduler;
 mod budget;
-mod cache;
 mod cache_admin;
 mod cancel;
 mod chat_template;
@@ -54,9 +52,11 @@ mod model;
 mod openai_extra;
 mod output;
 mod policy;
+mod response_cache;
 pub(crate) mod responses;
 mod resume;
 mod security;
+mod serving;
 mod session;
 mod sse;
 mod stats;
@@ -85,7 +85,6 @@ use axum::{
 use clap::{Parser, ValueEnum};
 use serde::{Deserialize, Serialize};
 
-use cache::{CacheKey, ResponseCache};
 use ferrox_core::cache::KvBlockPool;
 use ferrox_models::kimi_tokenizer::KimiTokenizer;
 use ferrox_models::sampling::SamplingParams;
@@ -93,6 +92,7 @@ use ferrox_models::tokenizer::StopTokens;
 use ferrox_models::{Decoder, Gemma4Engine, KimiEngine, MlaEngine, PrefixCache};
 use generate::{FinishReason, GenerationParams};
 use model::ServerTokenizer;
+use response_cache::{CacheKey, ResponseCache};
 
 // `PartialEq` so ferrox-cli's serve tests can assert that both front
 // ends parse a command line into the SAME arguments, rather than
@@ -575,7 +575,7 @@ pub(crate) struct ActiveModel {
     /// Shares `forward_multi_seq` across concurrent GGUF requests. Disabled
     /// when a KV pool or prefix cache is configured (those keep the
     /// private-loop `generate` path).
-    pub(crate) batcher: Option<batch_scheduler::ContinuousBatcher>,
+    pub(crate) batcher: Option<serving::batch::ContinuousBatcher>,
     /// The per-request context ceiling this model was priced for, or
     /// `None` when it could not be priced (see `crate::budget`).
     ///
@@ -696,10 +696,10 @@ pub(crate) struct AppState {
     /// is in `error` without the user retrying to find out.
     last_load_error: Mutex<Option<(String, String)>>,
     /// Live serving counters and the two sliding-window rates behind
-    /// `/v1/stats` -- see `crate::policy::serving_stats::ServingStats`. Distinct from
+    /// `/v1/stats` -- see `crate::stats::ServingStats`. Distinct from
     /// `stats`, which is the historical ring: this is what is happening
     /// *now*, and it decays to zero when nothing is.
-    pub(crate) serving: Mutex<crate::policy::serving_stats::ServingStats>,
+    pub(crate) serving: Mutex<crate::stats::ServingStats>,
     /// The gate every request, cache rebuild and shutdown passes
     /// through -- see `crate::policy::maintenance::MaintenanceGate`. Held across none
     /// of them: each operation takes it, reads or moves the state, and
@@ -801,7 +801,7 @@ impl AppState {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    pub(crate) fn cache_stats(&self) -> cache::CacheStats {
+    pub(crate) fn cache_stats(&self) -> response_cache::CacheStats {
         lock_cache(&self.response_cache).stats()
     }
 
@@ -1904,7 +1904,7 @@ async fn recent_requests(
 
 #[derive(Serialize)]
 struct CombinedCacheStats {
-    response_cache: cache::CacheStats,
+    response_cache: response_cache::CacheStats,
     /// `None` when `FERROX_PREFIX_CACHE_ENTRIES` isn't set.
     prefix_cache: Option<ferrox_models::PrefixCacheStats>,
 }
@@ -2166,7 +2166,7 @@ fn run_generation_emit(
     kv_pool: Option<&generate::KvPoolConfig>,
     paged_kv: Option<&generate::PagedKvConfig>,
     prefix_cache: Option<&Mutex<PrefixCache>>,
-    continuous_batcher: Option<&batch_scheduler::ContinuousBatcher>,
+    continuous_batcher: Option<&serving::batch::ContinuousBatcher>,
     ceiling: Option<&budget::ContextCeiling>,
     mut emit: impl FnMut(&str),
 ) -> Result<(FinishReason, generate::Usage, String), generate::DecodeError> {
@@ -2299,7 +2299,7 @@ pub(crate) fn run_generation(
     kv_pool: Option<&generate::KvPoolConfig>,
     paged_kv: Option<&generate::PagedKvConfig>,
     prefix_cache: Option<&Mutex<PrefixCache>>,
-    continuous_batcher: Option<&batch_scheduler::ContinuousBatcher>,
+    continuous_batcher: Option<&serving::batch::ContinuousBatcher>,
     ceiling: Option<&budget::ContextCeiling>,
 ) -> Result<(Vec<String>, FinishReason, generate::Usage), generate::DecodeError> {
     let (finish, usage, full) = run_generation_emit(
@@ -2677,7 +2677,7 @@ async fn chat_completions_full(
         .map_err(join_error_response)?
         .map_err(decode_error_response)?;
 
-        let completion = cache::CachedCompletion {
+        let completion = response_cache::CachedCompletion {
             content: chunks.concat(),
             finish,
             usage,
@@ -3266,7 +3266,7 @@ async fn cancel_generation(
 /// worker, and the context ceiling both decode paths admit on.
 type Activated = (
     Model,
-    Option<batch_scheduler::ContinuousBatcher>,
+    Option<serving::batch::ContinuousBatcher>,
     Option<Arc<budget::ContextCeiling>>,
 );
 
@@ -3287,8 +3287,8 @@ type Activated = (
 ///
 /// `path` is `None` for the synthetic-weights fallback, which has no
 /// checkpoint on disk to price.
-fn price_batcher_config(path: Option<&str>) -> batch_scheduler::BatcherConfig {
-    let mut batcher = batch_scheduler::BatcherConfig::from_env();
+fn price_batcher_config(path: Option<&str>) -> serving::batch::BatcherConfig {
+    let mut batcher = serving::batch::BatcherConfig::from_env();
     if batcher.max_context.is_some() && batcher.kv_blocks.is_some() {
         // Nothing left to derive, and pricing the checkpoint would only
         // print arithmetic that decides nothing.
@@ -3374,7 +3374,7 @@ pub(crate) fn activate_loaded_model(
                 );
                 let tok = Arc::clone(&tokenizer);
                 let decode = Arc::new(move |ids: &[usize]| tok.decode(ids));
-                Some(batch_scheduler::ContinuousBatcher::spawn_with_ceiling(
+                Some(serving::batch::ContinuousBatcher::spawn_with_ceiling(
                     Arc::clone(&decoder),
                     decode,
                     config,
@@ -3494,7 +3494,7 @@ fn build_app_state(
         continuous_batching_enabled: enable_continuous_batching,
         loading_model: Mutex::new(None),
         last_load_error: Mutex::new(None),
-        serving: Mutex::new(crate::policy::serving_stats::ServingStats::default()),
+        serving: Mutex::new(crate::stats::ServingStats::default()),
         maintenance: Mutex::new(crate::policy::maintenance::MaintenanceGate::serving()),
         footprint: Mutex::new(crate::policy::footprint::ProbeCache::new(FOOTPRINT_TTL_MS)),
         started_unix: unix_now(),
@@ -4079,7 +4079,7 @@ async fn run(mcp_config_path: Option<PathBuf>, exit_on_stdin_close: bool) -> any
                     v.parse()
                         .expect("FERROX_PAGED_KV_SLIDE_INTERVAL must be a positive integer")
                 })
-                .unwrap_or(crate::policy::pool::DEFAULT_SWA_EVICTION_INTERVAL);
+                .unwrap_or(crate::policy::pool_budget::DEFAULT_SWA_EVICTION_INTERVAL);
             if let Some(window) = cfg.uniform_sliding_window() {
                 tracing::info!(
                     "Paged KV window slide enabled: every layer slides by {window} every \
@@ -4582,7 +4582,7 @@ mod tests {
             continuous_batching_enabled: false,
             loading_model: Mutex::new(None),
             last_load_error: Mutex::new(None),
-            serving: Mutex::new(crate::policy::serving_stats::ServingStats::default()),
+            serving: Mutex::new(crate::stats::ServingStats::default()),
             maintenance: Mutex::new(crate::policy::maintenance::MaintenanceGate::serving()),
             footprint: Mutex::new(crate::policy::footprint::ProbeCache::new(FOOTPRINT_TTL_MS)),
             started_unix: unix_now(),

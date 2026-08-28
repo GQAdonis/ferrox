@@ -20,7 +20,7 @@ use std::sync::Mutex;
 use ferrox_api::RecentRequest;
 use ferrox_core::summary_stats::{mean_of_present, percentile};
 
-use crate::policy::serving_stats::RequestRing;
+use super::ring::RequestRing;
 
 use crate::attribution::Attribution;
 

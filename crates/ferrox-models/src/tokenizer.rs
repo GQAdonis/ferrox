@@ -296,25 +296,53 @@ fn gpt2_byte_to_unicode() -> ([char; 256], std::collections::HashMap<char, u8>) 
 /// silently produces different token sequences than llama.cpp or
 /// mistral.rs would for the same input.
 ///
-/// This is the real GPT2 regex (from OpenAI's `encoder.py`) minus its
-/// negative-lookahead whitespace clause `\s+(?!\S)`: Rust's `regex`
-/// crate is deliberately linear-time and does not support lookaround
-/// assertions, so that clause is dropped rather than faked. The
-/// practical effect is a known, documented deviation: ferrox may split
-/// a final trailing-whitespace run slightly differently than a real
-/// GPT2 tokenizer at the very end of a string. For all non-trailing
-/// text (the overwhelming majority of real input), the two patterns
-/// produce identical splits.
-fn gpt2_pretokenize_regex() -> regex::Regex {
-    regex::Regex::new(r"'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+")
-        .expect("GPT2 pre-tokenization pattern is a fixed, valid regex")
+/// Which pre-tokenizer regex a checkpoint's `tokenizer.ggml.pre` names.
+///
+/// Ferrox used to run ONE regex, the GPT-2 one, for every BPE
+/// checkpoint. llama.cpp has around thirty variants, and the difference
+/// is not cosmetic. Against the llama3 family regex, the old behaviour
+/// split `"1234567"` as a single run where llama.cpp gives
+/// `123|456|7`, so EVERY number of four or more digits got different
+/// ids; it split `"DON'T"` as `DON|'|T` where llama.cpp keeps `DON|'T`;
+/// and it split any run of two or more spaces differently, which means
+/// indented code and blank lines tokenize differently.
+///
+/// It stayed invisible because the BPE tests are round-trip only and
+/// `ferrox parity` hands llama.cpp explicit token ids, so the tokenizer
+/// sits outside the only cross-engine oracle in the repo.
+///
+/// `fancy_regex` rather than `regex` because the real patterns need the
+/// `\s+(?!\S)` negative lookahead that separates a trailing whitespace
+/// run from an interior one. That crate is already a dependency of this
+/// crate for the Kimi tokenizer, so the old comment's reasoning (that
+/// Rust has no lookaround available) no longer holds.
+fn pretokenize_regex_for(pre: &str) -> fancy_regex::Regex {
+    // Source: llama.cpp `llama-vocab.cpp`, `LLAMA_VOCAB_PRE_TYPE_*`.
+    let pattern = match pre {
+        // The llama3 family, and the shape most checkpoints ferrox
+        // actually runs use. `\p{N}{1,3}` is the digit grouping, and the
+        // `(?i:)` makes the contractions case-insensitive.
+        "llama3" | "llama-v3" | "llama-bpe" | "deepseek-llm" | "deepseek-coder" | "deepseek-v3"
+        | "falcon3" | "pixtral" | "minerva-7b" => {
+            r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+"
+        }
+        // Qwen2 and its descendants: same digit grouping, contractions
+        // are NOT case-insensitive here.
+        "qwen2" | "stablelm2" | "jina-v2-code" | "gpt-4o" | "superbpe" => {
+            r"'s|'t|'re|'ve|'m|'ll|'d|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+"
+        }
+        // Plain GPT-2, now WITH the trailing-whitespace clause that was
+        // dropped before.
+        _ => r"'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+",
+    };
+    fancy_regex::Regex::new(pattern).expect("pre-tokenization patterns are fixed and valid")
 }
 
 /// Gemma-4 / SARVAM-style pre-split: only carve on newlines so BPE can
 /// merge across ordinary word boundaries after `" "` → `▁` escaping
 /// (llama.cpp `LLAMA_VOCAB_PRE_TYPE_GEMMA4`).
-fn newline_pretokenize_regex() -> regex::Regex {
-    regex::Regex::new(r"[^\n]+|[\n]+").expect("newline pretokenize pattern is fixed")
+fn newline_pretokenize_regex() -> fancy_regex::Regex {
+    fancy_regex::Regex::new(r"[^\n]+|[\n]+").expect("newline pretokenize pattern is fixed")
 }
 
 /// U+2581 FIGURE SPACE used by SentencePiece-style BPE merge tables.
@@ -344,7 +372,7 @@ pub struct GgufBpeTokenizer {
     special_tokens: Vec<(String, u32)>,
     /// Compiled pre-tokenization pattern (GPT-2 word regex, or
     /// newline-only for Gemma-4 SPM-BPE).
-    pretokenize_pattern: regex::Regex,
+    pretokenize_pattern: fancy_regex::Regex,
     style: BpeEncodingStyle,
 }
 
@@ -566,7 +594,11 @@ impl GgufBpeTokenizer {
 
         let (byte_to_unicode, unicode_to_byte) = gpt2_byte_to_unicode();
         let pretokenize_pattern = match style {
-            BpeEncodingStyle::Gpt2 => gpt2_pretokenize_regex(),
+            // Keyed on the checkpoint's own `tokenizer.ggml.pre`, which
+            // was previously read only to decide BOS prepending.
+            BpeEncodingStyle::Gpt2 => {
+                pretokenize_regex_for(file.metadata_str("tokenizer.ggml.pre").unwrap_or(""))
+            }
             BpeEncodingStyle::SpmWhitespace => newline_pretokenize_regex(),
         };
         let special_tokens = load_special_tokens(file, &id_to_token);
@@ -679,6 +711,7 @@ impl GgufBpeTokenizer {
             BpeEncodingStyle::Gpt2 => self
                 .pretokenize_pattern
                 .find_iter(text)
+                .filter_map(|m| m.ok())
                 .flat_map(|m| self.encode_word(m.as_str()))
                 .collect(),
             BpeEncodingStyle::SpmWhitespace => {
@@ -1454,9 +1487,87 @@ mod gguf_vocab_tests {
         let pieces: Vec<&str> = tok
             .pretokenize_pattern
             .find_iter("don't")
-            .map(|m| m.as_str())
+            .map(|m| m.expect("a fixed pattern cannot fail").as_str())
             .collect();
         assert_eq!(pieces, vec!["don", "'t"]);
+    }
+
+    /// The three divergences from llama.cpp that one hardcoded regex
+    /// caused, pinned so they cannot come back.
+    ///
+    /// Every BPE checkpoint used to get the GPT-2 pattern regardless of
+    /// what `tokenizer.ggml.pre` said. Against the llama3 family that
+    /// meant different ids for any number of four or more digits, for
+    /// uppercase contractions, and for any interior run of two or more
+    /// spaces, which is every indented line of code.
+    ///
+    /// Expected splits are llama.cpp's, from its `LLAMA_VOCAB_PRE_TYPE`
+    /// patterns, not from what this implementation happens to produce.
+    #[test]
+    fn the_llama3_pretokenizer_groups_digits_and_keeps_uppercase_contractions() {
+        let re = super::pretokenize_regex_for("llama3");
+        let split = |t: &str| -> Vec<String> {
+            re.find_iter(t)
+                .map(|m| m.expect("fixed pattern").as_str().to_string())
+                .collect()
+        };
+
+        // Digits group in threes. The GPT-2 pattern took the whole run.
+        assert_eq!(split("1234567"), vec!["123", "456", "7"]);
+
+        // Contractions are case-insensitive here, so DON'T keeps its
+        // apostrophe with the T rather than splitting three ways.
+        assert_eq!(split("DON'T"), vec!["DON", "'T"]);
+
+        // An interior run of spaces is one piece, and the word after it
+        // keeps its leading space. This is the one that moves indented
+        // code and blank lines.
+        assert_eq!(split("hello  world"), vec!["hello", " ", " world"]);
+    }
+
+    /// Qwen2 is a SEPARATE arm, not an alias for llama3, and the
+    /// difference is the digit rule: `\p{N}` one at a time versus
+    /// llama3's `\p{N}{1,3}`.
+    ///
+    /// Worth pinning because the two patterns look alike and the
+    /// temptation is to merge them. Note what is NOT different here:
+    /// `DON'T` splits the same either way, because
+    /// `[^\r\n\p{L}\p{N}]?\p{L}+` matches `'T` whether or not the
+    /// contraction alternatives fold case. The case-insensitivity only
+    /// shows on lowercase input, which is why asserting on `DON'T`
+    /// alone would prove nothing.
+    #[test]
+    fn qwen2_splits_digits_singly_where_llama3_groups_them() {
+        let split = |pre: &str, t: &str| -> Vec<String> {
+            super::pretokenize_regex_for(pre)
+                .find_iter(t)
+                .map(|m| m.expect("fixed pattern").as_str().to_string())
+                .collect()
+        };
+        assert_eq!(split("qwen2", "1234"), vec!["1", "2", "3", "4"]);
+        assert_eq!(split("llama3", "1234"), vec!["123", "4"]);
+        assert_eq!(
+            split("qwen2", "DON'T"),
+            split("llama3", "DON'T"),
+            "the contraction case rule does not show on uppercase input"
+        );
+    }
+
+    /// An unknown `pre` falls back to GPT-2, which is what llama.cpp
+    /// does, and that fallback now carries the trailing-whitespace
+    /// clause that was dropped for lack of lookaround.
+    #[test]
+    fn an_unknown_pretokenizer_falls_back_to_gpt2_with_its_whitespace_clause() {
+        let re = super::pretokenize_regex_for("something-nobody-has-heard-of");
+        let pieces: Vec<String> = re
+            .find_iter("hi   ")
+            .map(|m| m.expect("fixed pattern").as_str().to_string())
+            .collect();
+        assert_eq!(
+            pieces,
+            vec!["hi", "   "],
+            "trailing whitespace is its own run, which is what `\\s+(?!\\S)` is for"
+        );
     }
 
     #[test]

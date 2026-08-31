@@ -236,7 +236,6 @@ pub fn architecture_catalog() -> &'static [ArchProfile] {
             "llama",
             "deci",
             "baichuan",
-            "starcoder",
             "internlm2",
             "xverse",
             "olmo",
@@ -258,8 +257,8 @@ pub fn architecture_catalog() -> &'static [ArchProfile] {
             v.push(gqa_norm(n));
         }
         for n in [
-            "olmoe", "qwen", "qwen2", "qwen2moe", "stablelm", "mistral",
-            "mixtral", "olmo2", "bitnet", "jais2",
+            "olmoe", "qwen2", "qwen2moe", "mistral",
+            "mixtral", "olmo2", "bitnet",
             "grok", "dbrx", "exaone4", "yi",
             // llama-model.cpp `llama_model_rope_type`: LLM_ARCH_OPENAI_MOE
             // falls in the `return LLAMA_ROPE_TYPE_NEOX` group, and a live
@@ -279,7 +278,6 @@ pub fn architecture_catalog() -> &'static [ArchProfile] {
             "afmoe",
             "apertus",
             "bailingmoe2",
-            "codeshell",
             "dots1",
             "exaone",
             "exaone-moe",
@@ -290,13 +288,10 @@ pub fn architecture_catalog() -> &'static [ArchProfile] {
             "mellum",
             "mimo2",
             "minicpm3",
-            "nemotron",
             "openelm",
-            "orion",
             "plamo3",
             "seed_oss",
             "smallthinker",
-            "starcoder2",
             "step35",
             "talkie",
         ] {
@@ -371,6 +366,130 @@ pub fn architecture_catalog() -> &'static [ArchProfile] {
                 // asks. `rope_layout_matches_llama_cpp` skips
                 // non-generic paths for exactly this reason.
                 Norm,
+                ArchPath::DedicatedOnly { reason },
+                WholeVector,
+            ));
+        }
+        // --- Required bias tensors the generic decoder has no slot for
+        //
+        // Found by transcribing every `create_tensor(tn(..., "bias"), ...)`
+        // llama.cpp's per-architecture loaders create with flag `0`
+        // (REQUIRED, as opposed to `TENSOR_NOT_REQUIRED`). Required means
+        // every real checkpoint of that architecture carries it, so this
+        // is not a "some files might" gate.
+        //
+        // `AttnWeights` carries exactly three of them -- `attn_q.bias`,
+        // `attn_k.bias`, `attn_v.bias` -- and `GptOssWeights` carries
+        // gpt-oss's `attn_output.bias` and `ffn_gate_inp.bias`. Nothing
+        // else has anywhere to go:
+        //
+        // - `attn_output.bias`, `ffn_{up,down,gate}.bias` and the
+        //   `output.bias` on the LM head are read by no loader path, so
+        //   they are simply dropped: the projection runs unbiased.
+        // - `attn_norm.bias` / `ffn_norm.bias` / `output_norm.bias` are
+        //   the marker of a real LayerNorm. The generic decoder only has
+        //   `rms_norm(x, w, eps)` -- no mean subtraction and no bias --
+        //   so it computes a different normalisation at every layer.
+        // - `attn_qkv.bias` is the *fused* spelling.
+        //   `load_qkv_projections` splits a fused `attn_qkv.weight` but
+        //   looks for the bias only under the split `attn_q.bias` names,
+        //   finds nothing, and runs unbiased.
+        //
+        // Every one of these loads clean and answers fluently, which is
+        // why they are refused here rather than left to a tensor gate.
+        // Pinned by `tests/attn_bias.rs`.
+        for (n, rope, reason) in [
+            (
+                "codeshell",
+                Neox,
+                "required bias tensors with no slot in the generic decoder: \
+                 `attn_output.bias`, `ffn_down.bias`, `ffn_up.bias` \
+                 (src/models/codeshell.cpp:36,42,45), plus the LayerNorm biases \
+                 `output_norm.bias`, `attn_norm.bias`, `ffn_norm.bias` (:24,31,39) \
+                 -- the generic decoder is RMSNorm-only and drops all six",
+            ),
+            (
+                "jais2",
+                Neox,
+                "required bias tensors with no slot in the generic decoder: \
+                 `attn_output.bias`, `ffn_up.bias`, `ffn_down.bias` \
+                 (src/models/jais2.cpp:41,48,50), plus the LayerNorm biases \
+                 `output_norm.bias`, `attn_norm.bias`, `ffn_norm.bias` (:20,30,44). \
+                 Only its Q/K/V biases (:38-40) would have been applied",
+            ),
+            (
+                "starcoder",
+                Norm,
+                "required bias tensors with no slot in the generic decoder: the \
+                 *fused* `attn_qkv.bias` (src/models/starcoder.cpp:40), which \
+                 `load_qkv_projections` never looks for because it reads bias only \
+                 under the split `attn_q.bias` names; `attn_output.bias`, \
+                 `ffn_down.bias`, `ffn_up.bias` (:43,49,52); and the LayerNorm \
+                 biases `output_norm.bias`, `attn_norm.bias`, `ffn_norm.bias` \
+                 (:24,37,46). It also adds a learned `position_embd` to the \
+                 embeddings (:75) that the generic decoder has no slot for",
+            ),
+            (
+                "starcoder2",
+                Neox,
+                "required bias tensors with no slot in the generic decoder: \
+                 `attn_output.bias`, `ffn_down.bias`, `ffn_up.bias` \
+                 (src/models/starcoder2.cpp:41,50,51), plus the LayerNorm biases \
+                 `output_norm.bias`, `attn_norm.bias`, `ffn_norm.bias` (:23,35,44)",
+            ),
+            (
+                "phimoe",
+                Neox,
+                "required bias tensors with no slot in the generic decoder: \
+                 `attn_output.bias` and an `output.bias` on the LM head \
+                 (src/models/phimoe.cpp:33,23), plus the LayerNorm biases \
+                 `output_norm.bias`, `attn_norm.bias`, `ffn_norm.bias` (:21,29,36). \
+                 `phi3` stays generic: it requires none of them",
+            ),
+            (
+                "nemotron",
+                Neox,
+                "required LayerNorm biases `output_norm.bias`, `attn_norm.bias`, \
+                 `ffn_norm.bias` (src/models/nemotron.cpp:19,26,35). llama.cpp \
+                 normalises with `build_norm(..., LLM_NORM, ...)` and a bias; the \
+                 generic decoder applies RMSNorm with weight only, which is a \
+                 different function of the same tensors at every layer",
+            ),
+            (
+                "orion",
+                Neox,
+                "required LayerNorm biases `output_norm.bias`, `attn_norm.bias`, \
+                 `ffn_norm.bias` (src/models/orion.cpp:18,25,31); the generic \
+                 decoder is RMSNorm-only and drops all three",
+            ),
+            (
+                "stablelm",
+                Neox,
+                "required LayerNorm biases `output_norm.bias` and `attn_norm.bias` \
+                 (src/models/stablelm.cpp:20,28); the generic decoder is \
+                 RMSNorm-only and drops both",
+            ),
+            (
+                "qwen",
+                Neox,
+                "a required *fused* `attn_qkv.bias` (src/models/qwen.cpp:28). \
+                 `load_qkv_projections` splits the fused `attn_qkv.weight` but reads \
+                 bias only under the split `attn_q.bias` / `attn_k.bias` / \
+                 `attn_v.bias` names, so Qwen-1's QKV bias is silently dropped and \
+                 every Q, K and V projection runs unbiased. Qwen-2 and later store \
+                 the split spelling and stay generic",
+            ),
+        ] {
+            v.push(prof(
+                n,
+                TextGeneration,
+                StandardGqa,
+                KvGqa,
+                // Unlike the no-RoPE group above, the layout here is
+                // real and `rope_layout_matches_llama_cpp` still checks
+                // it: refusing for a bias is not a licence to forget
+                // what these rotate as.
+                rope,
                 ArchPath::DedicatedOnly { reason },
                 WholeVector,
             ));
@@ -497,17 +616,15 @@ pub fn architecture_catalog() -> &'static [ArchProfile] {
             },
             WholeVector,
         ));
-        for (n, fam) in [("phi3", PhiFamily), ("phimoe", PhiFamily)] {
-            v.push(prof(
-                n,
-                TextGeneration,
-                fam,
-                KvGqa,
-                Neox,
-                ArchPath::GenericGqa { rope: Neox },
-                WholeVector,
-            ));
-        }
+        v.push(prof(
+            "phi3",
+            TextGeneration,
+            PhiFamily,
+            KvGqa,
+            Neox,
+            ArchPath::GenericGqa { rope: Neox },
+            WholeVector,
+        ));
         // Phi-4 GGUFs share the phi3 fused-QKV / fused gate+up graph
         // (PhiFamily). Many community checkpoints still tag `phi3`; admit
         // `phi4` the same way so either string can load. Receipts / head-dim
@@ -794,9 +911,33 @@ pub fn resolve_architecture(arch: &str) -> Option<ArchPath> {
     resolve_profile(arch).map(|p| p.path)
 }
 
-/// The alternating sliding-window period an architecture uses when its
-/// GGUF carries `{arch}.attention.sliding_window` but *not*
-/// `{arch}.attention.sliding_window_pattern`.
+/// llama.cpp's hardcoded alternating sliding-window layout for one
+/// architecture: the period, *and* which end of each period is the
+/// full-attention layer.
+///
+/// `llama_hparams::set_swa_pattern` (`src/llama-hparams.cpp:8-22`) has
+/// two phases, and they are not interchangeable:
+///
+/// - `dense_first = false`: `is_swa[il] = il % p < (p - 1)` — the
+///   **last** layer of every period is full attention.
+/// - `dense_first = true`:  `is_swa[il] = il % p != 0` — the **first**
+///   layer of every period is full attention.
+///
+/// For a 32-layer period-4 model the two disagree on 16 of the 32
+/// layers. Storing only the period would therefore not be a partial
+/// transcription, it would be a wrong one for the four architectures
+/// llama.cpp passes `dense_first = true`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SwaPattern {
+    /// llama.cpp's `swa_period` seed literal.
+    pub period: usize,
+    /// llama.cpp's `dense_first` argument to `set_swa_pattern`.
+    pub dense_first: bool,
+}
+
+/// Every architecture for which llama.cpp seeds a sliding-window period
+/// *before* letting `{arch}.attention.sliding_window_pattern` override
+/// it, transcribed from `src/models/*.cpp`.
 ///
 /// The period is not in the file for these families — llama.cpp
 /// hardcodes it per architecture and only lets the metadata key override
@@ -808,41 +949,119 @@ pub fn resolve_architecture(arch: &str) -> Option<ArchPath> {
 /// gpt-oss or cohere2 checkpoint ran its full-attention layers through a
 /// 128-token window and answered from a truncated history.
 ///
-/// Values transcribed from each arch's `load_arch_hparams`
-/// (`src/models/*.cpp`); `None` means "no per-arch default", i.e. the
-/// window applies uniformly when one is declared.
-pub fn default_swa_pattern(arch: &str) -> Option<usize> {
+/// Two llama.cpp spellings are deliberately absent, because neither is
+/// a per-arch *period*:
+///
+/// - `set_swa_pattern(0)` (`deepseek4.cpp:68`, `dflash.cpp:54`) makes
+///   **every** layer sliding, which is what ferrox already does for a
+///   declared window with no pattern.
+/// - `set_swa_pattern(1)` (`phi3.cpp:23`) makes **no** layer sliding,
+///   and phi3 zeroes `n_swa` and sets `swa_type = NONE` on the same
+///   branch, so there is no window left to place.
+///
+/// Architectures that only ever read a per-layer *array*
+/// (`get_key_or_arr(..., hparams.is_swa_impl, n_layer)`: `gemma4`,
+/// `gemma4-assistant`, `step35`, `mimo2`, `dflash`) seed no scalar and
+/// so have no default to pin.
+///
+/// Pinned by `tests/swa_pattern.rs`.
+pub fn default_swa_layout(arch: &str) -> Option<SwaPattern> {
+    let last_dense = |period| {
+        Some(SwaPattern {
+            period,
+            dense_first: false,
+        })
+    };
+    let dense_first = |period| {
+        Some(SwaPattern {
+            period,
+            dense_first: true,
+        })
+    };
     match arch {
-        // src/models/openai-moe.cpp:10
-        "gpt-oss" => Some(2),
-        // src/models/gemma2.cpp:8
-        "gemma2" => Some(2),
+        // src/models/openai-moe.cpp:9
+        "gpt-oss" => last_dense(2),
+        // src/models/gemma2.cpp:6
+        "gemma2" => last_dense(2),
         // src/models/gemma3.cpp:7
-        "gemma3" => Some(6),
+        "gemma3" => last_dense(6),
         // src/models/gemma3n.cpp:4 says 5, NOT 6. This was transcribed
         // as 6 alongside gemma3 and is simply wrong. Inert only because
         // `gemma3n` refuses for other reasons today.
-        "gemma3n" => Some(5),
+        "gemma3n" => last_dense(5),
+        // src/models/gemma-embedding.cpp:5. Deferred (embedding scope),
+        // so latent rather than live.
+        "gemma-embedding" => last_dense(6),
         // src/models/cohere2.cpp:5, exaone4.cpp:7, olmo2.cpp:9
-        "cohere2" | "exaone4" | "olmo2" => Some(4),
+        "cohere2" | "exaone4" | "olmo2" => last_dense(4),
         // Added after an audit found this table covered 6 architectures
-        // where llama.cpp hardcodes a period for 18. A MISSING entry is
+        // where llama.cpp hardcodes a period for 17. A MISSING entry is
         // not neutral: with no period, every layer gets windowed, so a
         // model whose full-attention layers should see the whole context
         // sees only a window instead. That is a different model, and it
         // fails silently.
         //
         // src/models/mellum.cpp:11
-        "mellum" => Some(4),
-        // src/models/exaone-moe.cpp:4-8. SWA is unconditional there
+        "mellum" => last_dense(4),
+        // src/models/exaone-moe.cpp:6. SWA is unconditional there
         // with n_swa = 128, so without this every layer ran with a
         // 128-token history.
-        "exaone-moe" => Some(4),
-        // src/models/afmoe.cpp, plamo3.cpp. Both refuse for other
+        "exaone-moe" => last_dense(4),
+        // src/models/afmoe.cpp:17, plamo3.cpp:9. Both refuse for other
         // reasons today, so these are latent rather than live, and
         // pinned here so they stay right if that changes.
-        "afmoe" => Some(4),
-        "plamo3" => Some(8),
+        "afmoe" => last_dense(4),
+        "plamo3" => last_dense(8),
+        // src/models/llama4.cpp:19 ("pattern: 3 chunked - 1 full").
+        // `llama4` is `DedicatedOnly` today, so latent.
+        "llama4" => last_dense(4),
+        // --- dense_first = true -----------------------------------
+        //
+        // These four put the full-attention layer at `il % p == 0`, not
+        // at `il % p == p - 1`. `ModelConfig::layer_sliding_window`
+        // implements only the `dense_first = false` phase, so
+        // `default_swa_pattern` below refuses to hand them a bare
+        // period rather than place their full layers one index off.
+        //
+        // src/models/smallthinker.cpp:9-11. LIVE: `smallthinker` is on
+        // the generic GQA path.
+        "smallthinker" => dense_first(4),
+        // src/models/laguna.cpp:39-41 (its own comment: "XS.2: FULL at
+        // il%4==0"). LIVE: `laguna` is on the generic GQA path.
+        "laguna" => dense_first(4),
+        // src/models/cohere2moe.cpp:31-33. `DedicatedOnly` today
+        // (parallel attention+FFN residual), so latent.
+        "cohere2moe" => dense_first(4),
+        // src/models/modern-bert.cpp:8-10. Deferred (encoder scope), so
+        // latent.
+        "modern-bert" => dense_first(3),
+        _ => None,
+    }
+}
+
+/// The alternating sliding-window period an architecture uses when its
+/// GGUF carries `{arch}.attention.sliding_window` but *not*
+/// `{arch}.attention.sliding_window_pattern`.
+///
+/// This is the half of [`default_swa_layout`] that ferrox's decoder can
+/// currently act on. `ModelConfig::layer_sliding_window` hardcodes
+/// llama.cpp's `dense_first = false` phase (full attention where
+/// `(il + 1) % period == 0`), so an architecture llama.cpp loads with
+/// `dense_first = true` gets `None` here on purpose:
+///
+/// - handing the caller the bare period would put every full-attention
+///   layer one index off, which for a 32-layer period-4 `smallthinker`
+///   is **16** layers attending over the wrong span;
+/// - `None` leaves ferrox's existing behaviour, every layer windowed,
+///   which is 8 layers wrong for the same model.
+///
+/// Both are wrong and neither is acceptable; the smaller of the two is
+/// what this returns until `ModelConfig` can carry `dense_first` and
+/// the loader can refuse what it still cannot express. See
+/// `tests/swa_pattern.rs::dense_first_architectures_are_not_handed_a_period_the_decoder_would_misplace`.
+pub fn default_swa_pattern(arch: &str) -> Option<usize> {
+    match default_swa_layout(arch) {
+        Some(p) if !p.dense_first => Some(p.period),
         _ => None,
     }
 }
@@ -1235,7 +1454,14 @@ mod tests {
         }
         // The sequential-residual siblings stay on the generic path --
         // this is a named list, not a family-wide ban.
-        for arch in ["phi3", "phimoe", "plamo3", "starcoder2", "nemotron"] {
+        //
+        // `phimoe`, `starcoder2` and `nemotron` used to be checked here
+        // too. They left the generic path for an unrelated reason (the
+        // required bias tensors pinned by `tests/attn_bias.rs`), so
+        // asserting them generic would now assert the wrong thing; what
+        // still has to hold is that neither they nor the archs below are
+        // refused for a *residual* reason they do not have.
+        for arch in ["phi3", "plamo3", "qwen2", "llama"] {
             assert!(
                 matches!(
                     resolve_architecture(arch),
@@ -1243,6 +1469,15 @@ mod tests {
                 ),
                 "{arch} must stay generic"
             );
+        }
+        for arch in ["phimoe", "starcoder2", "nemotron"] {
+            match resolve_architecture(arch) {
+                Some(ArchPath::DedicatedOnly { reason }) => assert!(
+                    reason.contains("bias"),
+                    "{arch} is refused for the wrong reason: {reason}"
+                ),
+                other => panic!("{arch} must be refused for its biases, got {other:?}"),
+            }
         }
     }
 

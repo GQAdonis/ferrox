@@ -152,21 +152,41 @@ Parsed and executable on CPU: `F32`, `F16`, `BF16`, `Q4_0`, `Q4_1`,
 `IQ4_NL`, `IQ4_XS`, `IQ1_S`, `IQ1_M`, `IQ2_XXS`, `IQ2_XS`, `IQ2_S`,
 `IQ3_XXS`, `IQ3_S`, `MXFP4`.
 
-Two caveats that matter in practice:
+"Executable" is not one speed. What a format actually gets, read off
+the kernel tables (`ferrox_quant`'s dispatch functions,
+`metal_matvec_kind_name` / `metal_mul_mm_kind_supported` and
+`cuda_matvec_kind_supported` in `ferrox-core`):
+
+| Tier | Formats | CPU SIMD | GPU |
+|---|---|---|---|
+| Full | `Q4_0`, `Q8_0`, `Q4_K`, `Q5_K`, `Q6_K` | AVX2 + NEON, plus the int-dot path (`FERROX_CPU_INT_DOT=1`) | Metal matvec + simdgroup GEMM, CUDA matvec |
+| Metal only | `IQ4_XS` | AVX2 + NEON | Metal matvec + simdgroup GEMM |
+| CPU-vectorized | `Q4_1`, `Q5_1`, `Q8_1`, `Q2_K`, `Q3_K`, `IQ4_NL`, safetensors two-buffer `MXFP4` | AVX2 + NEON | none |
+| Prefill only on GPU | `Q5_0` | AVX2 + NEON | a Metal simdgroup GEMM, but **no matvec**: prefill runs on the GPU and decode falls back to the CPU |
+| AVX2 only | `IQ1_S`, `IQ2_XXS`, `IQ3_XXS` | AVX2; **scalar on ARM** | none |
+| Scalar only | `IQ2_XS`, `IQ2_S`, `IQ3_S`, `IQ1_M`, GGUF-block `MXFP4` | none | none |
+
+Metal's MoE indexed GEMM (`mul_mm_id`) is narrower still: `Q4_0`,
+`Q8_0` and `Q4_K` only.
+
+Three caveats that matter in practice:
 
 - **The IQ tiers split, and the split matters if you are choosing a
-  quant.** `IQ4_NL` and `IQ4_XS` have NEON kernels, and `IQ4_XS` also
-  has a Metal matvec and a Metal simdgroup GEMM, so it runs on the GPU
-  at full speed. `IQ2_XS`, `IQ2_S`, `IQ3_S`, `IQ1_M` and GGUF-block
-  MXFP4 are **scalar only**: no NEON, no AVX2, no GPU. They load and
-  produce correct output, and they are slow. That was deliberate. They
-  were added for coverage, because before them those tags could not be
-  decoded at all, which ruled out 5 of the 16 published Unsloth `UD-*`
-  variants. A vectorized path was left out rather than written without a
-  golden vector that could tell it apart from the scalar one.
-- **`I32` is recognized and sized, but nothing executes it.** A
-  checkpoint that needs it stops with an error rather than being
-  quietly skipped.
+  quant.** The bottom two rows load and produce correct output, and they
+  are slow. That was deliberate. They were added for coverage, because
+  before them those tags could not be decoded at all, which ruled out 5
+  of the 16 published Unsloth `UD-*` variants. A vectorized path was
+  left out rather than written without a golden vector that could tell
+  it apart from the scalar one.
+- **On an Apple machine the "AVX2 only" row is the scalar row.**
+  `IQ1_S`, `IQ2_XXS` and `IQ3_XXS` have x86 kernels and no NEON ones, so
+  on ARM they run at the same speed as the scalar tier below them.
+- **`I32`, `TQ1_0`, `TQ2_0`, `NVFP4`, `Q1_0` and `Q2_0` are recognized
+  and sized, but nothing executes them.** They parse, `ferrox inspect`
+  reports their real footprint, and a checkpoint that needs one stops
+  with an error naming the format rather than being quietly skipped or
+  silently mis-measured. Ternary (`TQ*`) and the two newest `Q*_0`
+  formats are a real gap, not a claim of support.
 
 `IQ2_XS`, `IQ2_S`, `IQ3_S` and `IQ1_M` were validated bit-exact against
 llama.cpp's own `dequantize_row_*` by linking `ggml-quants.c`, not by

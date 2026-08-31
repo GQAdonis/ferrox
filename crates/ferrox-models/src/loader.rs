@@ -1175,7 +1175,20 @@ pub(crate) fn load_f32_vec(file: &impl TensorSource, name: &str) -> Result<Vec<f
     let info = find_info(file, name)?;
     let raw = file.tensor_bytes(name)?;
     match info.dtype {
-        GgmlType::F32 | GgmlType::F16 | GgmlType::BF16 => widen_plain_float(info.dtype, raw, name),
+        // MXFP4 rides with the plain floats because `widen_plain_float`
+        // is where its arm already lives -- routing it here rather than
+        // giving this table its own `dequant_mxfp4_gguf` call keeps ONE
+        // MXFP4 arm in this file instead of two that can drift.
+        //
+        // It has to be in *both* tables' reach, and it was in neither's:
+        // `load_weight_matrix` accepts MXFP4 as a 2-D weight and
+        // `load_moe_expert_matrices` accepts it as an expert tensor, so
+        // a checkpoint whose norms happen to be MXFP4 failed here with
+        // `UnsupportedDtype` while its far larger tensors of the exact
+        // same dtype loaded fine.
+        GgmlType::F32 | GgmlType::F16 | GgmlType::BF16 | GgmlType::MXFP4 => {
+            widen_plain_float(info.dtype, raw, name)
+        }
         GgmlType::Q8_0 => ferrox_quant::dequant_q8_0(raw)
             .map_err(|_| LoadError::UnsupportedDtype(name.to_string(), GgmlType::Q8_0)),
         GgmlType::Q4_0 => ferrox_quant::dequant_q4_0(raw)
@@ -2464,14 +2477,19 @@ mod tests {
     /// `AUDITED_GENERIC_GQA` would have gone unnoticed.
     #[test]
     fn an_unaudited_generic_architecture_refuses_rather_than_guessing() {
-        // `starcoder` is on the generic path and is not in the audited
-        // list: nobody has run a real one through ferrox.
+        // `xverse` is on the generic path and is not in the audited
+        // list: nobody has run a real one through ferrox. It replaced
+        // `starcoder`, which was the example here until an audit found
+        // starcoder REQUIRES a fused `attn_qkv.bias` and a learned
+        // `position_embd` that the generic decoder has no slot for --
+        // so it now refuses for a stronger reason than being unaudited,
+        // and stopped being an example of this one.
         assert!(
-            !crate::capability::is_audited_generic("starcoder"),
+            !crate::capability::is_audited_generic("xverse"),
             "this test needs an arch that is generic AND unaudited"
         );
-        match config_for_arch("starcoder") {
-            Err(LoadError::UnauditedArchitecture(name, _)) => assert_eq!(name, "starcoder"),
+        match config_for_arch("xverse") {
+            Err(LoadError::UnauditedArchitecture(name, _)) => assert_eq!(name, "xverse"),
             other => panic!("expected an unaudited refusal, got {other:?}"),
         }
     }
@@ -3278,6 +3296,101 @@ mod tests {
 
     #[rustfmt::skip]
     const MXFP4_GGUF_TEST_BLOCKS: [u8; 68] = [0x79, 0xb4, 0x8d, 0xe2, 0x62, 0x5d, 0xbb, 0x9d, 0x54, 0xe6, 0xdb, 0x94, 0x59, 0x7d, 0x28, 0xf9, 0x79, 0x7a, 0xfc, 0xc1, 0xfa, 0x1e, 0x53, 0x5b, 0x0e, 0xc2, 0x5a, 0x2f, 0x0c, 0x82, 0x4d, 0xcb, 0x11, 0x28, 0x7b, 0x7c, 0xb6, 0x45, 0xe0, 0xb0, 0x52, 0x40, 0x51, 0xec, 0x30, 0x1a, 0xd2, 0x17, 0xf3, 0xbb, 0xfc, 0x7c, 0x8f, 0xf0, 0x67, 0x83, 0x88, 0x9d, 0x79, 0xdb, 0xf4, 0x45, 0x29, 0x78, 0xe6, 0xf4, 0x99, 0xea];
+
+    /// A live ggml type this build has no kernel for must be REFUSED BY
+    /// NAME at execution, having been sized correctly at parse.
+    ///
+    /// Before `TQ2_0` was recognized, tag 35 was `Other(35)`, which had
+    /// no block layout: the tensor's size was unknown, so `tensor_bytes`
+    /// could not even hand back the row, and the error named a number.
+    /// Now the file parses, the tensor measures 66 bytes per 256
+    /// elements, and the stop happens where it belongs -- at the point
+    /// something wants to multiply by it -- naming `TQ2_0`.
+    #[test]
+    fn a_recognized_but_unimplemented_ggml_type_refuses_by_name_after_sizing_correctly() {
+        // 256 elements of TQ2_0 = one 66-byte block.
+        let block = pseudo_iq_block(66, 0x0720_5eed);
+        let tmp =
+            std::env::temp_dir().join(format!("ferrox_test_tq2_0_{}.gguf", std::process::id()));
+        std::fs::write(
+            &tmp,
+            build_single_iq_lowbit_tensor_gguf("tq2test", 35, 256, &block),
+        )
+        .unwrap();
+        let file = ferrox_gguf::GgufFile::open(&tmp).expect("a TQ2_0 file must still parse");
+        std::fs::remove_file(&tmp).ok();
+
+        // Sized, not zero: the size estimate is right even though the
+        // kernel is missing.
+        let info = file.find_tensor("test.weight").expect("tensor present");
+        assert_eq!(info.dtype, GgmlType::TQ2_0);
+        assert_eq!(info.byte_len(), Some(66));
+        assert_eq!(
+            file.tensor_bytes("test.weight").map(<[u8]>::len).ok(),
+            Some(66)
+        );
+
+        match load_weight_matrix(&file, "test.weight") {
+            Err(LoadError::UnsupportedDtype(name, GgmlType::TQ2_0)) => {
+                assert_eq!(name, "test.weight");
+            }
+            Err(other) => panic!("TQ2_0 must be refused by name, got {other:?}"),
+            Ok(_) => panic!("TQ2_0 must be refused, not loaded as some other kind"),
+        }
+    }
+
+    /// An MXFP4 norm/bias must widen, not be refused.
+    ///
+    /// `load_weight_matrix` accepts MXFP4 as a 2-D weight and
+    /// `load_moe_expert_matrices` accepts it as an expert tensor, and
+    /// `WeightMatrix::dequant` calls `dequant_mxfp4_gguf` on both. One
+    /// missing arm in `widen_plain_float` made the *1-D* tensors of the
+    /// exact same dtype a hard `UnsupportedDtype` -- the split that
+    /// turns a supported format into a load failure on the one
+    /// checkpoint that uses it.
+    #[test]
+    fn an_mxfp4_one_dimensional_tensor_widens_instead_of_being_refused() {
+        let expected = ferrox_quant::dequant_mxfp4_gguf(&MXFP4_GGUF_TEST_BLOCKS)
+            .expect("the fixture blocks must dequantize");
+        let cols = expected.len();
+        let tmp = std::env::temp_dir().join(format!(
+            "ferrox_test_mxfp4_norm_{}.gguf",
+            std::process::id()
+        ));
+        std::fs::write(
+            &tmp,
+            build_single_iq_lowbit_tensor_gguf(
+                "mxfp4norm",
+                39,
+                cols as u64,
+                &MXFP4_GGUF_TEST_BLOCKS,
+            ),
+        )
+        .unwrap();
+        let file = ferrox_gguf::GgufFile::open(&tmp).expect("file must parse");
+        std::fs::remove_file(&tmp).ok();
+
+        let got = load_f32_vec(&file, "test.weight")
+            .expect("an MXFP4 norm must load, not report an unsupported dtype");
+        assert_eq!(got, expected);
+
+        // Same arm, reached directly: `widen_plain_float` is the shared
+        // helper the six architecture loaders call, so its table is the
+        // one that has to know MXFP4.
+        let direct = widen_plain_float(GgmlType::MXFP4, &MXFP4_GGUF_TEST_BLOCKS, "test.weight")
+            .expect("widen_plain_float must widen MXFP4");
+        assert_eq!(direct, expected);
+
+        // And the refusal still works for a dtype that genuinely has no
+        // widening path, so this test cannot pass by making everything
+        // succeed.
+        match widen_plain_float(GgmlType::TQ2_0, &MXFP4_GGUF_TEST_BLOCKS, "test.weight") {
+            Err(LoadError::UnsupportedDtype(name, GgmlType::TQ2_0)) => {
+                assert_eq!(name, "test.weight");
+            }
+            other => panic!("TQ2_0 must be refused by name, got {other:?}"),
+        }
+    }
 
     fn build_single_iq_lowbit_tensor_gguf(
         arch: &str,

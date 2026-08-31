@@ -12,12 +12,15 @@
 //! and determinism, without requiring a multi-hundred-gigabyte
 //! checkpoint to be present.
 
+mod attn_block;
+
 use std::sync::atomic::{AtomicU64, Ordering};
 
+pub(crate) use attn_block::KvStep;
 use ferrox_core::attention::{
     apply_rope, apply_rope_interleaved, apply_rope_interleaved_with_freq_factors,
     apply_rope_with_freq_factors, causal_gqa_attention_prefill_shared_kv_windowed,
-    causal_gqa_attention_softcap, causal_gqa_attention_windowed_softcap,
+    causal_gqa_attention_softcap,
 };
 use ferrox_core::cache::{KvCache, PagedKvCache, PagedStoreExhausted, SharedPagedKv};
 use ferrox_core::matmul::{geglu, rms_norm, rms_norm_per_head, softcap_inplace};
@@ -739,6 +742,31 @@ impl Decoder {
         }
     }
 
+    /// An architecture's explicit attention score scale
+    /// (`ModelConfig::attention_scale`), applied to Q after RoPE.
+    ///
+    /// llama.cpp's Gemma graphs scale Q themselves and then call
+    /// `build_attn(..., 1.0f)`; ferrox's kernels always apply their own
+    /// `1/sqrt(head_dim)`, so the compensation has to be folded into Q
+    /// here for the NET score scale to equal `attention_scale`.
+    ///
+    /// One helper rather than one copy per host body, because that is
+    /// exactly how this feature came to be applied at two of four sites:
+    /// `forward_hidden_batch_inner` and `forward_multi_seq_kv` computed a
+    /// plausible distribution at the wrong temperature and nothing
+    /// failed. Elementwise, so a `[batch, n_heads*head_dim]` Q batch is
+    /// the same call as one row's.
+    #[inline]
+    fn apply_attention_scale(&self, q: &mut [f32]) {
+        let Some(scale) = self.config.attention_scale else {
+            return;
+        };
+        let compensate = scale * (self.config.head_dim as f32).sqrt();
+        for v in q.iter_mut() {
+            *v *= compensate;
+        }
+    }
+
     /// Applies Q/K RMSNorm according to [`ModelConfig::qk_norm_style`].
     fn apply_qk_norm(&self, x: &[f32], weight: &[f32]) -> Vec<f32> {
         use crate::capability::QkNormStyle;
@@ -849,15 +877,19 @@ impl Decoder {
         // lm_head (Metal-safe). Attention softcap runs on Metal FA-vec /
         // legacy GQA (decode + prefill).
         //
-        // NOT attention_scale. This comment used to claim it was
-        // "compensated by scaling Q on the host/Metal extras path".
-        // There is no such compensation: `AttnExtras` has no field for
-        // it, and repo-wide `attention_scale` is applied at exactly two
-        // sites, both in the single-token CPU arm. So the claim
-        // certified a gap shut that is still open, which is worse than
-        // saying nothing. It is inert only because `loader.rs` hardcodes
-        // `attention_scale = None`, and the day a loader sets it, the
-        // batched, multi-seq and Metal paths will all ignore it.
+        // NOT attention_scale, and this is now a refusal rather than a
+        // comment. `AttnExtras` has no field for it and no Metal kernel
+        // applies it, so a checkpoint carrying one would be scaled by
+        // the four host bodies and not by any of the seven fused
+        // launches -- the same weights answering at two different
+        // temperatures depending on which backend served the token.
+        // Inert today (`loader.rs` hardcodes `attention_scale = None`),
+        // which is exactly why it has to be written down as a fence
+        // instead of trusted: the day a loader sets it, this returns
+        // false and the layer takes the host path that does apply it.
+        if self.config.attention_scale.is_some() {
+            return false;
+        }
         if self.config.head_dim > 256 {
             return false;
         }
@@ -1666,8 +1698,14 @@ impl Decoder {
 
         assert_eq!(kv_caches.len(), self.layers.len());
         let hidden_dim = self.config.hidden_dim;
+        // Read only by the Metal arms below: the host layer body moved
+        // into `attn_block`, which reads the geometry off `self.config`
+        // itself.
+        #[cfg(feature = "metal")]
         let head_dim = self.config.head_dim;
+        #[cfg(feature = "metal")]
         let n_heads = self.config.n_heads;
+        #[cfg(feature = "metal")]
         let n_kv_heads = self.config.n_kv_heads;
 
         #[cfg(feature = "metal")]
@@ -2483,127 +2521,9 @@ impl Decoder {
                     }
                 }
 
-                let (mut q, mut k, mut v) = {
-                    #[cfg(any(feature = "cuda", feature = "metal"))]
-                    {
-                        if let Some(mut outs) = ferrox_core::WeightMatrix::apply_gpu_multi(
-                            &[&layer.attn.q_proj, &layer.attn.k_proj, &layer.attn.v_proj],
-                            &normed,
-                        ) {
-                            let v = outs.pop().unwrap();
-                            let k = outs.pop().unwrap();
-                            let q = outs.pop().unwrap();
-                            (q, k, v)
-                        } else {
-                            ferrox_core::weight_matrix::WeightMatrix::apply_three(
-                                &layer.attn.q_proj,
-                                &layer.attn.k_proj,
-                                &layer.attn.v_proj,
-                                &normed,
-                            )
-                        }
-                    }
-                    #[cfg(not(any(feature = "cuda", feature = "metal")))]
-                    {
-                        ferrox_core::weight_matrix::WeightMatrix::apply_three(
-                            &layer.attn.q_proj,
-                            &layer.attn.k_proj,
-                            &layer.attn.v_proj,
-                            &normed,
-                        )
-                    }
-                };
-
-                if let Some(bias) = &layer.attn.q_bias {
-                    for (x, b) in q.iter_mut().zip(bias.iter()) {
-                        *x += b;
-                    }
-                }
-                if let Some(bias) = &layer.attn.k_bias {
-                    for (x, b) in k.iter_mut().zip(bias.iter()) {
-                        *x += b;
-                    }
-                }
-                if let Some(bias) = &layer.attn.v_bias {
-                    for (x, b) in v.iter_mut().zip(bias.iter()) {
-                        *x += b;
-                    }
-                }
-
-                if let Some(q_norm) = &layer.attn.q_norm {
-                    q = self.apply_qk_norm(&q, q_norm);
-                }
-                if let Some(k_norm) = &layer.attn.k_norm {
-                    k = self.apply_qk_norm(&k, k_norm);
-                }
-                self.apply_rope_attn_factor(&mut q, &mut k);
-
-                for h in 0..n_heads {
-                    self.apply_rope_head_layer(&mut q[h * head_dim..(h + 1) * head_dim], pos, l);
-                }
-                for h in 0..n_kv_heads {
-                    self.apply_rope_head_layer(&mut k[h * head_dim..(h + 1) * head_dim], pos, l);
-                }
-                // When an architecture overrides the score scale (llama.cpp
-                // Gemma scales Q then calls build_attn with 1.0), compensate
-                // for the kernel's built-in 1/sqrt(head_dim) so the net
-                // score scale equals `attention_scale`.
-                if let Some(scale) = self.config.attention_scale {
-                    let compensate = scale * (head_dim as f32).sqrt();
-                    for v in q.iter_mut() {
-                        *v *= compensate;
-                    }
-                }
-
-                cache
-                    .push(&k, &v)
-                    .expect("unbounded/planned KvCache growth is infallible");
-
                 let oai = self.gpt_oss.as_ref().map(|g| &g.layers[l]);
-                let attn_out = match (oai, self.config.layer_sliding_window(l)) {
-                    (Some(oai), window) => ferrox_core::causal_gqa_attention_sinks(
-                        &q,
-                        &cache.k,
-                        &cache.v,
-                        n_heads,
-                        n_kv_heads,
-                        head_dim,
-                        cache.seq_len,
-                        window,
-                        &oai.attn_sinks,
-                    ),
-                    (None, Some(window)) => causal_gqa_attention_windowed_softcap(
-                        &q,
-                        &cache.k,
-                        &cache.v,
-                        n_heads,
-                        n_kv_heads,
-                        head_dim,
-                        cache.seq_len,
-                        window,
-                        self.config.attn_logit_softcap,
-                    ),
-                    (None, None) => self.gqa_attention(
-                        l,
-                        &q,
-                        &cache.k,
-                        &cache.v,
-                        n_heads,
-                        n_kv_heads,
-                        head_dim,
-                        cache.seq_len,
-                    ),
-                };
-                let mut projected = layer.attn.o_proj.apply(&attn_out);
-                if let Some(oai) = oai {
-                    for (x, b) in projected.iter_mut().zip(oai.o_bias.iter()) {
-                        *x += b;
-                    }
-                }
-                if let Some(post) = &layer.attn.post_attn_norm {
-                    projected = rms_norm(&projected, post, self.config.rms_norm_eps);
-                }
-
+                let projected =
+                    self.attn_block(l, layer, &normed, pos, KvStep::Decode(&mut *cache));
                 for (h, p) in hidden.iter_mut().zip(projected.iter()) {
                     *h += p;
                 }
@@ -2711,9 +2631,6 @@ impl Decoder {
             }
         }
         let hidden_dim = self.config.hidden_dim;
-        let head_dim = self.config.head_dim;
-        let n_heads = self.config.n_heads;
-        let n_kv_heads = self.config.n_kv_heads;
 
         let mut hidden = self.embed_token(token_id);
         let residency = self.gpu_vram_budget_bytes.map(|b| self.residency_plan(b));
@@ -2722,133 +2639,23 @@ impl Decoder {
             // --- attention block ---
             let normed = rms_norm(&hidden, &layer.attn.norm_weight, self.config.rms_norm_eps);
 
-            let (mut q, mut k, mut v) = {
-                #[cfg(any(feature = "cuda", feature = "metal"))]
-                {
-                    if let Some(mut outs) = ferrox_core::WeightMatrix::apply_gpu_multi(
-                        &[&layer.attn.q_proj, &layer.attn.k_proj, &layer.attn.v_proj],
-                        &normed,
-                    ) {
-                        let v = outs.pop().unwrap();
-                        let k = outs.pop().unwrap();
-                        let q = outs.pop().unwrap();
-                        (q, k, v)
-                    } else {
-                        ferrox_core::weight_matrix::WeightMatrix::apply_three(
-                            &layer.attn.q_proj,
-                            &layer.attn.k_proj,
-                            &layer.attn.v_proj,
-                            &normed,
-                        )
-                    }
-                }
-                #[cfg(not(any(feature = "cuda", feature = "metal")))]
-                {
-                    (
-                        layer.attn.q_proj.apply(&normed),
-                        layer.attn.k_proj.apply(&normed),
-                        layer.attn.v_proj.apply(&normed),
-                    )
-                }
-            };
-
-            if let Some(bias) = &layer.attn.q_bias {
-                for (x, b) in q.iter_mut().zip(bias.iter()) {
-                    *x += b;
-                }
-            }
-            if let Some(bias) = &layer.attn.k_bias {
-                for (x, b) in k.iter_mut().zip(bias.iter()) {
-                    *x += b;
-                }
-            }
-            if let Some(bias) = &layer.attn.v_bias {
-                for (x, b) in v.iter_mut().zip(bias.iter()) {
-                    *x += b;
-                }
-            }
-
-            if let Some(q_norm) = &layer.attn.q_norm {
-                q = self.apply_qk_norm(&q, q_norm);
-            }
-            if let Some(k_norm) = &layer.attn.k_norm {
-                k = self.apply_qk_norm(&k, k_norm);
-            }
-            self.apply_rope_attn_factor(&mut q, &mut k);
-
-            for h in 0..n_heads {
-                self.apply_rope_head_layer(&mut q[h * head_dim..(h + 1) * head_dim], pos, l);
-            }
-            for h in 0..n_kv_heads {
-                self.apply_rope_head_layer(&mut k[h * head_dim..(h + 1) * head_dim], pos, l);
-            }
-            // The sixth feature this path lost by being a copy. Gemma
-            // scales Q itself and asks for a score scale of 1.0, so the
-            // kernel's built-in `1/sqrt(head_dim)` has to be
-            // compensated for -- exactly as the contiguous path does.
-            // Missing, it is not an error: it is Gemma answering with a
-            // different temperature, on CPU as much as on GPU.
-            if let Some(scale) = self.config.attention_scale {
-                let compensate = scale * (head_dim as f32).sqrt();
-                for v in q.iter_mut() {
-                    *v *= compensate;
-                }
-            }
-
-            // Write guard for the push alone; see `SharedPagedKv`.
-            // Holding it across attention below would serialise the
-            // expensive half and give back a global lock.
-            {
-                let mut store = stores.write(l);
-                cache
-                    .push(&mut store, &k, &v)
-                    .expect("reserved for every layer before the stack ran");
-            }
-            let store = stores.read(l);
-
-            // Mirrors the contiguous dispatch above arm for arm. It has
-            // to: the premise of paged KV is that it changes where rows
-            // live and nothing else, so any arm the paged path did not
-            // reproduce would be a model that answers differently
-            // depending on whether a KV pool happened to be configured.
-            // `causal_gqa_attention_paged_sinks` covers all three, and
-            // is bit-identical to its contiguous twin by construction.
+            // The same body the contiguous path runs, with the paged
+            // backing as its one parameter. It used to be a copy, and
+            // the copy had silently dropped `attention_scale`,
+            // `post_attn_norm`, `post_ffn_norm`, gpt-oss's `o_bias` and
+            // `gpt_oss_ffn` -- five features that each produce a
+            // plausible distribution rather than an error.
             let oai = self.gpt_oss.as_ref().map(|g| &g.layers[l]);
-            let window = self.config.layer_sliding_window(l);
-            let attn_out = ferrox_core::causal_gqa_attention_paged_sinks(
-                &q,
-                &store,
-                cache.block_table(),
-                n_heads,
-                n_kv_heads,
-                head_dim,
-                cache.seq_len(),
-                window,
-                oai.map(|o| o.attn_sinks.as_slice()),
-                // The contiguous sink arm passes no softcap, so neither
-                // does this one; the other two carry the config's.
-                if oai.is_some() {
-                    None
-                } else {
-                    self.config.attn_logit_softcap
+            let projected = self.attn_block(
+                l,
+                layer,
+                &normed,
+                pos,
+                KvStep::Paged {
+                    cache: &mut *cache,
+                    stores,
                 },
             );
-            // Three more the copy had dropped, each silent: gpt-oss's O
-            // bias, and the two sandwich norms Gemma-2 applies to the
-            // attention and FFN branches before they rejoin the
-            // residual. A residual short by a normalisation is still a
-            // residual, so nothing fails -- the model just answers as a
-            // different model.
-            let mut projected = layer.attn.o_proj.apply(&attn_out);
-            if let Some(oai) = oai {
-                for (x, b) in projected.iter_mut().zip(oai.o_bias.iter()) {
-                    *x += b;
-                }
-            }
-            if let Some(post) = &layer.attn.post_attn_norm {
-                projected = rms_norm(&projected, post, self.config.rms_norm_eps);
-            }
-
             for (h, p) in hidden.iter_mut().zip(projected.iter()) {
                 *h += p;
             }
@@ -4357,6 +4164,16 @@ impl Decoder {
                         );
                     }
                 });
+            // Elementwise, so the whole Q batch in one call. Like the
+            // multi-sequence path, this body did not apply it at all
+            // until the decoration audit. It is placed AFTER the Metal
+            // arms above deliberately: none of the seven fused launches
+            // has an `attention_scale` uniform, and Q never returns to
+            // the host inside `launch_prefill_dense_layer` /
+            // `launch_prefill_dense_stack` for it to be scaled. The
+            // refusal that keeps those arms out of reach when
+            // `attention_scale` is set is in `layer_supports_metal_attn`.
+            self.apply_attention_scale(&mut q_batch);
 
             let base_seq_len = cache.seq_len;
             for b in 0..batch_size {
@@ -4613,11 +4430,14 @@ impl Decoder {
     /// attends over everything that sequence holds.
     ///
     /// The only place `forward_multi_seq_kv` touches a cache, and so
-    /// the only place the backing matters. The contiguous arm keeps
-    /// its three specialised kernels; the paged arm reaches
-    /// `causal_gqa_attention_paged_sinks`, which covers all three of
-    /// them in one entry point and is bit-identical to each by
-    /// construction.
+    /// the only place the backing matters.
+    ///
+    /// Selects sequence `b`'s layer-`l` cache and hands it to
+    /// [`Decoder::push_and_attend_row`], the one attend body the whole
+    /// crate shares. This used to spell that body out a second time; the
+    /// contiguous arm of the copy differed from `forward_token`'s by
+    /// exactly one call (the CUDA resident hook), which is the kind of
+    /// difference nobody notices until it is a wrong answer.
     #[allow(clippy::too_many_arguments)] // one per thing the step needs
     fn push_and_attend(
         &self,
@@ -4629,84 +4449,17 @@ impl Decoder {
         q: &[f32],
         oai: Option<&GptOssLayer>,
     ) -> Vec<f32> {
-        let n_heads = self.config.n_heads;
-        let n_kv_heads = self.config.n_kv_heads;
-        let head_dim = self.config.head_dim;
-        let window = self.config.layer_sliding_window(l);
-        match kv {
-            MultiSeqKv::Contiguous(caches) => {
-                let cache = &mut caches[b][l];
-                cache
-                    .push(k, v)
-                    .expect("unbounded/planned KvCache growth is infallible");
-                if let Some(oai) = oai {
-                    return ferrox_core::causal_gqa_attention_sinks(
-                        q,
-                        &cache.k,
-                        &cache.v,
-                        n_heads,
-                        n_kv_heads,
-                        head_dim,
-                        cache.seq_len,
-                        window,
-                        &oai.attn_sinks,
-                    );
-                }
-                match window {
-                    Some(window) => causal_gqa_attention_windowed_softcap(
-                        q,
-                        &cache.k,
-                        &cache.v,
-                        n_heads,
-                        n_kv_heads,
-                        head_dim,
-                        cache.seq_len,
-                        window,
-                        self.config.attn_logit_softcap,
-                    ),
-                    None => causal_gqa_attention_softcap(
-                        q,
-                        &cache.k,
-                        &cache.v,
-                        n_heads,
-                        n_kv_heads,
-                        head_dim,
-                        cache.seq_len,
-                        self.config.attn_logit_softcap,
-                    ),
-                }
-            }
-            MultiSeqKv::Paged { caches, stores } => {
-                let cache = &mut caches[b][l];
-                // Write guard for the push alone, then a read guard for
-                // the attention: the rule `SharedPagedKv` documents.
-                {
-                    let mut store = stores.write(l);
-                    cache
-                        .push(&mut store, k, v)
-                        .expect("the batcher reserves every row's pages at admission");
-                }
-                let store = stores.read(l);
-                ferrox_core::causal_gqa_attention_paged_sinks(
-                    q,
-                    &store,
-                    cache.block_table(),
-                    n_heads,
-                    n_kv_heads,
-                    head_dim,
-                    cache.seq_len(),
-                    window,
-                    oai.map(|o| o.attn_sinks.as_slice()),
-                    // The sink arm carries no softcap, matching the
-                    // contiguous dispatch above.
-                    if oai.is_some() {
-                        None
-                    } else {
-                        self.config.attn_logit_softcap
-                    },
-                )
-            }
-        }
+        let step = match kv {
+            // `Batched`, not `Decode`: the CUDA resident per-layer KV
+            // holds ONE sequence's history, and this path never seeds
+            // it. See `KvStep::Batched`.
+            MultiSeqKv::Contiguous(caches) => KvStep::Batched(&mut caches[b][l]),
+            MultiSeqKv::Paged { caches, stores } => KvStep::Paged {
+                cache: &mut caches[b][l],
+                stores,
+            },
+        };
+        self.push_and_attend_row(step, l, k, v, q, oai)
     }
 
     /// [`Self::forward_multi_seq`] over either KV backing.
@@ -4831,6 +4584,13 @@ impl Decoder {
                     );
                 }
             }
+            // Applied to the whole Q batch at once because it is
+            // elementwise. This path did not apply it at all until the
+            // decoration audit: `attention_scale` reached only
+            // `forward_token`'s CPU arm and `forward_token_paged`, so a
+            // checkpoint carrying one answered at one temperature when
+            // decoded alone and another when batched with its neighbours.
+            self.apply_attention_scale(&mut q_batch);
 
             let oai = self.gpt_oss.as_ref().map(|g| &g.layers[l]);
             let mut attn_out_batch = vec![0f32; batch_size * q_width];
@@ -5348,49 +5108,132 @@ mod tests {
         // Sandwich norms, one at a time and then together, so a wired
         // half is not covered for by the other.
         for (attn, ffn) in [(true, false), (false, true), (true, true)] {
-            paged_matches_contiguous_with(tiny_test_config(), |d| {
-                let hidden = d.config.hidden_dim;
-                for (i, layer) in d.layers.iter_mut().enumerate() {
-                    // Per-layer values, so a path that applied layer 0's
-                    // norm everywhere would still fail.
-                    let w: Vec<f32> = (0..hidden)
-                        .map(|j| 0.5 + (i * hidden + j) as f32 * 0.01)
-                        .collect();
-                    if attn {
-                        layer.attn.post_attn_norm = Some(w.clone());
-                    }
-                    if ffn {
-                        layer.attn.post_ffn_norm = Some(w);
-                    }
-                }
-            });
+            paged_matches_contiguous_with(tiny_test_config(), with_sandwich_norms(attn, ffn));
         }
 
         // gpt-oss: the O bias and the OAI FFN, which the paged path was
         // substituting the generic router+SwiGLU for.
-        paged_matches_contiguous_with(tiny_test_config(), |d| {
+        paged_matches_contiguous_with(tiny_test_config(), with_gpt_oss_graph);
+    }
+
+    /// The same feature list as
+    /// [`the_paged_path_keeps_every_per_layer_feature_the_contiguous_one_applies`],
+    /// checked against `forward_hidden_batch_inner` instead.
+    ///
+    /// Necessary because `forward_token` and `forward_token_paged` now
+    /// share ONE body (`Decoder::attn_block`) that differs only in its
+    /// `KvStep`, so the paged test can no longer see a decoration
+    /// dropped from that body -- deleting `post_attn_norm` or gpt-oss's
+    /// `o_bias` from it leaves the whole suite green, which was measured
+    /// rather than assumed. `forward_hidden_batch_inner` is deliberately
+    /// NOT collapsed into the same body, so it is the independent
+    /// ground truth that keeps these features pinned.
+    #[test]
+    fn the_batched_path_keeps_every_per_layer_feature_the_token_path_applies() {
+        for (attn, ffn) in [(true, false), (false, true), (true, true)] {
+            batched_matches_contiguous_with(tiny_test_config(), with_sandwich_norms(attn, ffn));
+        }
+        batched_matches_contiguous_with(tiny_test_config(), with_gpt_oss_graph);
+    }
+
+    /// Gemma-2's two sandwich norms, as a switch both parity helpers
+    /// take, so the paged and batched tests cannot drift over WHICH
+    /// features they claim to cover.
+    ///
+    /// Per-layer values, so a path that applied layer 0's norm
+    /// everywhere would still fail.
+    fn with_sandwich_norms(attn: bool, ffn: bool) -> impl Fn(&mut Decoder) {
+        move |d: &mut Decoder| {
             let hidden = d.config.hidden_dim;
-            let n_heads = d.config.n_heads;
-            let n_experts = d.config.moe.n_experts;
-            let ffn = d.config.moe.expert_ffn_dim;
-            let n_layers = d.layers.len();
-            d.gpt_oss = Some(GptOssWeights {
-                layers: (0..n_layers)
-                    .map(|l| GptOssLayer {
-                        attn_sinks: (0..n_heads).map(|h| 0.1 + (l + h) as f32 * 0.05).collect(),
-                        o_bias: (0..hidden).map(|j| 0.02 * (j as f32 - 8.0)).collect(),
-                        router_bias: (0..n_experts).map(|e| 0.03 * e as f32).collect(),
-                        expert_bias: (0..n_experts)
-                            .map(|e| ferrox_moe::ExpertBias {
-                                gate: vec![0.01 * (e + 1) as f32; ffn],
-                                up: vec![-0.02 * (e + 1) as f32; ffn],
-                                down: vec![0.005 * (e + 1) as f32; hidden],
-                            })
-                            .collect(),
-                    })
-                    .collect(),
-            });
+            for (i, layer) in d.layers.iter_mut().enumerate() {
+                let w: Vec<f32> = (0..hidden)
+                    .map(|j| 0.5 + (i * hidden + j) as f32 * 0.01)
+                    .collect();
+                if attn {
+                    layer.attn.post_attn_norm = Some(w.clone());
+                }
+                if ffn {
+                    layer.attn.post_ffn_norm = Some(w);
+                }
+            }
+        }
+    }
+
+    /// The whole gpt-oss side table: attention sinks, the O bias, the
+    /// router bias and the per-expert biases `gpt_oss_ffn` reads.
+    fn with_gpt_oss_graph(d: &mut Decoder) {
+        let hidden = d.config.hidden_dim;
+        let n_heads = d.config.n_heads;
+        let n_experts = d.config.moe.n_experts;
+        let ffn = d.config.moe.expert_ffn_dim;
+        let n_layers = d.layers.len();
+        d.gpt_oss = Some(GptOssWeights {
+            layers: (0..n_layers)
+                .map(|l| GptOssLayer {
+                    attn_sinks: (0..n_heads).map(|h| 0.1 + (l + h) as f32 * 0.05).collect(),
+                    o_bias: (0..hidden).map(|j| 0.02 * (j as f32 - 8.0)).collect(),
+                    router_bias: (0..n_experts).map(|e| 0.03 * e as f32).collect(),
+                    expert_bias: (0..n_experts)
+                        .map(|e| ferrox_moe::ExpertBias {
+                            gate: vec![0.01 * (e + 1) as f32; ffn],
+                            up: vec![-0.02 * (e + 1) as f32; ffn],
+                            down: vec![0.005 * (e + 1) as f32; hidden],
+                        })
+                        .collect(),
+                })
+                .collect(),
         });
+    }
+
+    /// [`paged_matches_contiguous_with`] for `forward_batch` against
+    /// sequential `forward_token`.
+    ///
+    /// Not bit-identity: batched prefill runs the blocked three-pass
+    /// softmax while decode keeps the online accumulator, so the two
+    /// agree to a tolerance rather than to the bit -- the same reason
+    /// `decoder_via_engine_trait_matches_forward_batch_ground_truth`
+    /// gives. 1e-5 is four orders below the ~1e-1 a dropped decoration
+    /// moves these logits by.
+    fn batched_matches_contiguous_with(config: ModelConfig, prepare: impl Fn(&mut Decoder)) {
+        let n_layers = 2;
+        let vocab = 10;
+        let tokens = [3usize, 5, 7, 2, 9, 1];
+
+        let mut seq_decoder = Decoder::new_random_small(config.clone(), n_layers, vocab);
+        prepare(&mut seq_decoder);
+        let mut seq_caches: Vec<KvCache> = (0..n_layers)
+            .map(|_| KvCache::new(seq_decoder.config.n_kv_heads, seq_decoder.config.head_dim))
+            .collect();
+        let sequential: Vec<Vec<f32>> = tokens
+            .iter()
+            .enumerate()
+            .map(|(pos, &t)| seq_decoder.forward_token(t, pos, &mut seq_caches))
+            .collect();
+
+        // Same seed -> identical weights before `prepare`, and `prepare`
+        // is deterministic, so this is a like-for-like comparison.
+        let mut batch_decoder = Decoder::new_random_small(config, n_layers, vocab);
+        prepare(&mut batch_decoder);
+        let mut batch_caches: Vec<KvCache> = (0..n_layers)
+            .map(|_| {
+                KvCache::new(
+                    batch_decoder.config.n_kv_heads,
+                    batch_decoder.config.head_dim,
+                )
+            })
+            .collect();
+        let batched = batch_decoder.forward_batch(&tokens, 0, &mut batch_caches);
+
+        assert_eq!(sequential.len(), batched.len());
+        for (pos, (a, b)) in sequential.iter().zip(batched.iter()).enumerate() {
+            assert_eq!(a.len(), b.len(), "position {pos}: logit count");
+            for (i, (x, y)) in a.iter().zip(b.iter()).enumerate() {
+                assert!(
+                    (x - y).abs() < 1e-5,
+                    "position {pos}, logit {i}: token path={x} batched={y}"
+                );
+            }
+        }
     }
 
     /// The two rules that live OUTSIDE the layer loop, which the arm
@@ -6120,6 +5963,150 @@ mod tests {
                 assert!(
                     (a - b).abs() < 1e-3,
                     "sequence {s}, logit {i}: independent={a} batched={b}"
+                );
+            }
+        }
+    }
+
+    /// The gap the decoration audit found, from the side the existing
+    /// guard could not see.
+    ///
+    /// `the_paged_path_keeps_every_per_layer_feature_the_contiguous_one_applies`
+    /// sets `attention_scale` and compares `forward_token` against
+    /// `forward_token_paged` -- the two bodies that AGREED. It never
+    /// compared them against `forward_hidden_batch_inner`, which applied
+    /// the scale nowhere, so a Gemma-shaped checkpoint would answer at
+    /// one temperature when decoded a token at a time and at another
+    /// when its prompt was prefilled. Not an error; a plausible
+    /// distribution from the wrong model.
+    ///
+    /// The first assertion is the one that makes this a guard rather
+    /// than an assertion: 0.37 is well away from the kernel's own
+    /// `1/sqrt(head_dim)`, so if setting it does not move the logits
+    /// then both sides are ignoring it and the comparison below proves
+    /// nothing.
+    #[test]
+    fn the_batched_path_applies_attention_scale_like_the_contiguous_one() {
+        let vocab = 8;
+        let tokens = [1usize, 3, 5, 2, 7];
+        let scaled = || {
+            let mut cfg = tiny_test_config();
+            // Far from the kernel's own 1/sqrt(head_dim) on purpose:
+            // at this model's scale a scalar near 1 moves the logits by
+            // ~2e-4, which is below the noise a tolerance test can see.
+            cfg.attention_scale = Some(8.0);
+            cfg
+        };
+        let fresh_caches = |d: &Decoder| -> Vec<KvCache> {
+            (0..d.layers.len())
+                .map(|_| KvCache::new(d.config.n_kv_heads, d.config.head_dim))
+                .collect()
+        };
+
+        // Same seed -> identical weights, so the only difference between
+        // these three decoders is the config field under test.
+        let seq_decoder = Decoder::new_random_small(scaled(), 2, vocab);
+        let mut seq_caches = fresh_caches(&seq_decoder);
+        let sequential: Vec<Vec<f32>> = tokens
+            .iter()
+            .enumerate()
+            .map(|(pos, &t)| seq_decoder.forward_token(t, pos, &mut seq_caches))
+            .collect();
+
+        let batch_decoder = Decoder::new_random_small(scaled(), 2, vocab);
+        let mut batch_caches = fresh_caches(&batch_decoder);
+        let batched = batch_decoder.forward_batch(&tokens, 0, &mut batch_caches);
+
+        let plain_decoder = Decoder::new_random_small(tiny_test_config(), 2, vocab);
+        let mut plain_caches = fresh_caches(&plain_decoder);
+        let unscaled = plain_decoder.forward_batch(&tokens, 0, &mut plain_caches);
+        assert!(
+            batched
+                .iter()
+                .zip(unscaled.iter())
+                .any(|(s, u)| s.iter().zip(u.iter()).any(|(a, b)| (a - b).abs() > 1e-3)),
+            "attention_scale must change the batched answer, or this test cannot fail"
+        );
+
+        assert_eq!(batched.len(), sequential.len());
+        for (pos, (seq_logits, batch_logits)) in sequential.iter().zip(batched.iter()).enumerate() {
+            assert_eq!(seq_logits.len(), batch_logits.len());
+            for (i, (s, b)) in seq_logits.iter().zip(batch_logits.iter()).enumerate() {
+                assert!(
+                    (s - b).abs() < 1e-5,
+                    "position {pos}, logit {i}: sequential={s} batched={b}"
+                );
+            }
+        }
+    }
+
+    /// [`the_batched_path_applies_attention_scale_like_the_contiguous_one`]
+    /// for the fourth host body.
+    ///
+    /// `forward_multi_seq_kv` did not apply `attention_scale` either, so
+    /// a served request answered differently the moment it was batched
+    /// with another request -- the same weights, the same position, a
+    /// different temperature, decided by how busy the server was.
+    #[test]
+    fn the_multi_seq_path_applies_attention_scale_like_the_contiguous_one() {
+        let vocab = 8;
+        let histories: [&[usize]; 3] = [&[1, 3, 5], &[2, 7], &[4, 4, 4, 6]];
+        let next = [6usize, 1, 2];
+        let n_layers = 2;
+        let scaled = || {
+            let mut cfg = tiny_test_config();
+            // See the batched twin: a scalar near 1 does not move this
+            // model's logits far enough for a tolerance to see it.
+            cfg.attention_scale = Some(8.0);
+            cfg
+        };
+
+        // Builds every sequence's history with `forward_token`, then
+        // takes the next step either per sequence or as one batch.
+        let run = |cfg: ModelConfig, batched: bool| -> Vec<Vec<f32>> {
+            let decoder = Decoder::new_random_small(cfg, n_layers, vocab);
+            let mut per_seq: Vec<Vec<KvCache>> = histories
+                .iter()
+                .map(|h| {
+                    let mut caches: Vec<KvCache> = (0..n_layers)
+                        .map(|_| KvCache::new(decoder.config.n_kv_heads, decoder.config.head_dim))
+                        .collect();
+                    for (pos, &tok) in h.iter().enumerate() {
+                        decoder.forward_token(tok, pos, &mut caches);
+                    }
+                    caches
+                })
+                .collect();
+            let positions: Vec<usize> = histories.iter().map(|h| h.len()).collect();
+            if batched {
+                decoder.forward_multi_seq(&next, &positions, &mut per_seq)
+            } else {
+                next.iter()
+                    .zip(positions.iter())
+                    .zip(per_seq.iter_mut())
+                    .map(|((&tok, &pos), caches)| decoder.forward_token(tok, pos, caches))
+                    .collect()
+            }
+        };
+
+        let want = run(scaled(), false);
+        let got = run(scaled(), true);
+        let unscaled = run(tiny_test_config(), true);
+
+        assert!(
+            got.iter()
+                .zip(unscaled.iter())
+                .any(|(g, u)| g.iter().zip(u.iter()).any(|(a, b)| (a - b).abs() > 1e-3)),
+            "attention_scale must change the multi-seq answer, or this test cannot fail"
+        );
+
+        assert_eq!(want.len(), got.len());
+        for (s, (a, b)) in want.iter().zip(got.iter()).enumerate() {
+            assert_eq!(a.len(), b.len(), "sequence {s}: logit count");
+            for (i, (x, y)) in a.iter().zip(b.iter()).enumerate() {
+                assert!(
+                    (x - y).abs() < 1e-5,
+                    "sequence {s}, logit {i}: independent={x} batched={y}"
                 );
             }
         }

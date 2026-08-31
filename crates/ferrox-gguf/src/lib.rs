@@ -157,6 +157,30 @@ pub enum GgmlType {
     /// by e.g. DeepSeek-V4's token-hash routing tables. Recognized and
     /// sized, no execution path.
     I32,
+    /// ggml's ternary quants (tags 34/35), used by the BitNet-style
+    /// checkpoints. **Recognized and sized, no execution path**, the
+    /// same deal `I32` gets.
+    ///
+    /// Sizing them is the whole point of naming them. Left as
+    /// `Other(34)` they had no block layout, so [`TensorInfo::byte_len`]
+    /// returned `None` and every consumer -- `inspect`, the footprint
+    /// estimate, `tensor_bytes` -- could say no more than "tag 34". Now
+    /// a TQ2_0 file inspects correctly, reports its real size, and stops
+    /// at the point of *execution* with `UnsupportedDtype("...", TQ2_0)`.
+    ///
+    /// A named refusal, not an implementation: writing a ternary
+    /// dequantizer without a golden vector to check it against is how
+    /// you ship a format that loads and is wrong.
+    TQ1_0,
+    TQ2_0,
+    /// NVFP4 (tag 40): 64-element blocks, four UE4M3 sub-block scales
+    /// over 32 nibble bytes of E2M1 values. Recognized and sized, no
+    /// execution path -- see [`GgmlType::TQ1_0`].
+    NVFP4,
+    /// ggml's newest legacy-shaped quants (tags 41/42). Recognized and
+    /// sized, no execution path -- see [`GgmlType::TQ1_0`].
+    Q1_0,
+    Q2_0,
     Other(u32),
 }
 
@@ -188,6 +212,15 @@ impl GgmlType {
             29 => GgmlType::IQ1M,
             39 => GgmlType::MXFP4,
             30 => GgmlType::BF16,
+            // Tags 31/32/33 (`Q4_0_4_4` and friends) are deliberately
+            // absent: ggml REMOVED them from gguf files, so a tag in
+            // that range is a malformed or ancient file, not a gap.
+            // Tags 36/37/38 (`IQ4_NL_4_4` and friends) likewise.
+            34 => GgmlType::TQ1_0,
+            35 => GgmlType::TQ2_0,
+            40 => GgmlType::NVFP4,
+            41 => GgmlType::Q1_0,
+            42 => GgmlType::Q2_0,
             other => GgmlType::Other(other),
         }
     }
@@ -233,6 +266,18 @@ impl GgmlType {
             GgmlType::IQ1M => (56, 256), // 32 grid bytes + 16 qh + 8 scale bytes
             GgmlType::MXFP4 => (17, 32), // 1x E8M0 scale byte + 16 nibble bytes
             GgmlType::I32 => (4, 1),
+            // Recognized-and-sized, no execution path. Layouts read off
+            // `ggml-common.h`'s block structs, not the docs:
+            //   block_tq1_0 { qs[(256-4*256/64)/5=48]; qh[4]; half d }
+            //   block_tq2_0 { qs[256/4=64]; half d }
+            //   block_nvfp4 { d[64/16=4]; qs[64/2=32] }      (QK_NVFP4 = 64)
+            //   block_q1_0  { half d; qs[128/8=16] }         (QK1_0   = 128)
+            //   block_q2_0  { half d; qs[64/4=16] }          (QK2_0   = 64)
+            GgmlType::TQ1_0 => (54, 256),
+            GgmlType::TQ2_0 => (66, 256),
+            GgmlType::NVFP4 => (36, 64),
+            GgmlType::Q1_0 => (18, 128),
+            GgmlType::Q2_0 => (18, 64),
             GgmlType::Other(_) => (0, 1),
         }
     }
@@ -506,6 +551,13 @@ mod tests {
     /// weights involved) so the parser can be exercised without any
     /// external file or network access.
     fn build_synthetic_gguf() -> Vec<u8> {
+        build_synthetic_gguf_with_dtype(0)
+    }
+
+    /// The synthetic file, parameterised by the tensor's dtype tag
+    /// rather than copied per dtype: the byte layout is identical and a
+    /// second copy would drift from this one.
+    fn build_synthetic_gguf_with_dtype(dtype_tag: u32) -> Vec<u8> {
         let mut buf = Vec::new();
         buf.write_u32::<LittleEndian>(GGUF_MAGIC).unwrap();
         buf.write_u32::<LittleEndian>(3).unwrap(); // version
@@ -527,7 +579,7 @@ mod tests {
         buf.write_u32::<LittleEndian>(2).unwrap(); // n_dims
         buf.write_u64::<LittleEndian>(4).unwrap();
         buf.write_u64::<LittleEndian>(8).unwrap();
-        buf.write_u32::<LittleEndian>(0).unwrap(); // dtype F32
+        buf.write_u32::<LittleEndian>(dtype_tag).unwrap(); // dtype (0 = F32)
         buf.write_u64::<LittleEndian>(0).unwrap(); // offset
 
         // pad to 32-byte alignment
@@ -609,6 +661,96 @@ mod tests {
         assert_eq!(GgmlType::I32.block_layout(), (4, 1));
         // An unknown tag still degrades to Other, never a wrong name.
         assert_eq!(GgmlType::from_tag(999), GgmlType::Other(999));
+    }
+
+    /// The live ggml tags this build cannot *execute* are still
+    /// recognized and sized, so a checkpoint using one inspects
+    /// correctly and refuses by name at execution instead of being
+    /// mis-measured at parse time.
+    ///
+    /// Block sizes are cross-checked against each format's published
+    /// bits-per-weight, the same arithmetic the IQ tiers get: a
+    /// transposed digit in a block size would otherwise mis-stride a
+    /// whole tensor silently.
+    #[test]
+    fn live_ggml_tags_without_a_kernel_are_still_named_and_sized() {
+        // (type, tag, bytes-per-block * 16 expressed as bpw * 16)
+        for (ty, tag, bpw_x16) in [
+            (GgmlType::TQ1_0, 34u32, 27u32), // 1.6875 bpw * 16
+            (GgmlType::TQ2_0, 35, 33),       // 2.0625 bpw * 16
+            (GgmlType::NVFP4, 40, 72),       // 4.5    bpw * 16
+            (GgmlType::Q1_0, 41, 18),        // 1.125  bpw * 16
+            (GgmlType::Q2_0, 42, 36),        // 2.25   bpw * 16
+        ] {
+            assert_eq!(GgmlType::from_tag(tag), ty);
+            let (bytes, elems) = ty.block_layout();
+            assert_ne!(bytes, 0, "{ty:?} must be sized, not zero-sized");
+            assert_eq!(
+                bytes * 8 * 16,
+                bpw_x16 as usize * elems,
+                "{ty:?} block layout does not reproduce its published bits-per-weight"
+            );
+            // Sized means `byte_len` answers, which is what makes the
+            // eventual refusal an execution-time one that names a
+            // format rather than a parse-time zero.
+            let info = TensorInfo {
+                name: "blk.0.ffn_down.weight".to_string(),
+                shape: vec![elems as u64, 4],
+                dtype: ty,
+                offset: 0,
+            };
+            assert_eq!(info.byte_len(), Some(bytes * 4));
+        }
+
+        // Tags 31/32/33 and 36/37/38 were REMOVED from gguf files by
+        // ggml. They are not a gap, and adding them would be inventing
+        // support for a format no current file can contain.
+        for removed in [31u32, 32, 33, 36, 37, 38] {
+            assert_eq!(GgmlType::from_tag(removed), GgmlType::Other(removed));
+        }
+    }
+
+    /// A dtype with no known block layout must REFUSE, naming the
+    /// tensor and the tag -- never hand back a zero-length slice that
+    /// reads as a successful load of an empty tensor.
+    ///
+    /// This is the whole reason `byte_len` returns `Option`: with
+    /// `Other(_) => (0, 1)` flowing through unguarded, `tensor_bytes`
+    /// returned `Ok(&[])` and the failure surfaced hundreds of lines
+    /// later as a shape mismatch that named nothing.
+    #[test]
+    fn an_unsized_dtype_refuses_by_name_rather_than_returning_an_empty_slice() {
+        // 250: past GGML_TYPE_COUNT, so it is unknown to any build.
+        let bytes = build_synthetic_gguf_with_dtype(250);
+        let tmp = std::env::temp_dir().join(format!(
+            "ferrox_test_unsized_{}_{}.gguf",
+            std::process::id(),
+            250
+        ));
+        std::fs::write(&tmp, &bytes).unwrap();
+        let f = GgufFile::open(&tmp).unwrap();
+        let info = f.find_tensor("tok_embd.weight").unwrap();
+        assert_eq!(info.dtype, GgmlType::Other(250));
+        assert_eq!(info.byte_len(), None);
+
+        match f.tensor_bytes("tok_embd.weight") {
+            Err(GgufError::UnsizedTensor(name, GgmlType::Other(250))) => {
+                assert_eq!(name, "tok_embd.weight");
+            }
+            Err(other) => panic!("expected UnsizedTensor, got {other}"),
+            Ok(slice) => panic!(
+                "tensor_bytes returned Ok({} bytes) for a dtype with no block layout",
+                slice.len()
+            ),
+        }
+        // The zero-copy accessor is the same hole through a different
+        // door; it must refuse identically.
+        match f.tensor_mapped_range("tok_embd.weight") {
+            Err(GgufError::UnsizedTensor(_, GgmlType::Other(250))) => {}
+            Err(other) => panic!("expected UnsizedTensor, got {other}"),
+            Ok((_, range)) => panic!("tensor_mapped_range returned Ok({range:?})"),
+        }
+        std::fs::remove_file(&tmp).ok();
     }
 
     #[test]

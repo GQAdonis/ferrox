@@ -164,6 +164,15 @@ fn ggml_type_name(t: GgmlType) -> Option<&'static str> {
         GgmlType::IQ3S => "IQ3_S",
         GgmlType::IQ1M => "IQ1_M",
         GgmlType::MXFP4 => "MXFP4",
+        // Recognized and sized, no execution path. They still name the
+        // checkpoint's quantization honestly, which is exactly what an
+        // admin listing is for -- the refusal happens at load, not
+        // here.
+        GgmlType::TQ1_0 => "TQ1_0",
+        GgmlType::TQ2_0 => "TQ2_0",
+        GgmlType::NVFP4 => "NVFP4",
+        GgmlType::Q1_0 => "Q1_0",
+        GgmlType::Q2_0 => "Q2_0",
         // I32 is a routing table, not a weight format, and `Other` is
         // a tag this build does not recognize. Neither names the
         // checkpoint's quantization.

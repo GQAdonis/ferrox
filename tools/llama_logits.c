@@ -1,13 +1,27 @@
-// Reference logits dumper: llama.cpp's own last-position logits for an
-// EXPLICIT token-id sequence, written as raw f32 to a file.
+// Reference dumper for `ferrox parity`: llama.cpp's own answers for a
+// GGUF, in two modes.
 //
-// Why token ids and not text: `ferrox` and llama.cpp were once compared
-// by greedy text, and it proved nothing — the two tokenizers had to agree
-// first, and once they did the sequences still diverged after ~3 tokens
-// from ordinary numeric drift flipping a single argmax. Text is the wrong
-// medium. This dumps the logit vector at one position, so the comparison
-// is over a distribution instead of over one sampled draw, and the
-// tokenizer is removed from the experiment entirely by passing the ids in.
+//   logits    llama.cpp's last-position logits for an EXPLICIT token-id
+//             sequence, written as raw f32.
+//   tokenize  llama.cpp's token ids for a batch of raw texts, written as
+//             length-prefixed i32 runs.
+//
+// Why the logits mode takes token ids and not text: `ferrox` and
+// llama.cpp were once compared by greedy text, and it proved nothing —
+// the two tokenizers had to agree first, and once they did the sequences
+// still diverged after ~3 tokens from ordinary numeric drift flipping a
+// single argmax. Text is the wrong medium. That mode dumps the logit
+// vector at one position, so the comparison is over a distribution
+// instead of over one sampled draw, and the tokenizer is removed from
+// the experiment entirely by passing the ids in.
+//
+// Why the tokenize mode exists: removing the tokenizer from the logits
+// experiment left it outside the only cross-engine oracle in the repo,
+// and a real defect lived there undetected for the life of the project
+// (one hardcoded pre-tokenizer regex for every BPE checkpoint, so every
+// run of 4+ digits and every run of 2+ whitespace tokenized differently
+// from llama.cpp). The tokenizer needs its OWN oracle, on the same file,
+// against the same library. That is this mode.
 //
 // Build (macOS, Homebrew llama.cpp):
 //   ./tools/build_llama_logits.sh
@@ -19,44 +33,254 @@
 //
 // Usage:
 //   llama_logits <model.gguf> <out.bin> <tok0> <tok1> ...
-// Writes n_vocab f32 to <out.bin> and prints "n_vocab <N>" on stdout.
+//       Writes n_vocab f32 to <out.bin> and prints "n_vocab <N>".
 //
-// CPU only (n_gpu_layers = 0): the ferrox side of the comparison is its
-// CPU path, which is the one cross-validated against NumPy. Comparing a
-// GPU reference against a CPU candidate would confound two differences.
+//   llama_logits --tokenize <model.gguf> <cases.bin> <out.bin>
+//       Reads an FXTK case file, writes an FXTK result file, and prints
+//       "tokenized <N> cases".
+//
+// Exit codes: 0 ok, 1 failed, 2 bad arguments or a malformed case file,
+// 3 llama.cpp cannot load this checkpoint (see EXIT_MODEL_UNSUPPORTED).
+//
+// FXTK wire format (little-endian throughout, written byte by byte so
+// the two sides do not have to share a host endianness):
+//
+//   cases   "FXTK" | u32 n_cases | repeat( u32 n_bytes | n_bytes text )
+//   result  "FXTK" | u32 version=1 | u32 flags | u32 n_vocab
+//                  | u32 n_cases  | repeat( u32 n_tokens | n_tokens i32 )
+//           flags bit0 = add_bos, bit1 = add_eos, as the vocab reports
+//           them. The ids themselves are dumped with add_special=false,
+//           so the BOS policy is compared as a FLAG rather than being
+//           baked into every sequence, where one disagreement would
+//           misreport every case as a tokenizer divergence.
+//
+// CPU only (n_gpu_layers = 0) in the logits mode: the ferrox side of the
+// comparison is its CPU path, which is the one cross-validated against
+// NumPy. Comparing a GPU reference against a CPU candidate would
+// confound two differences. The tokenize mode loads vocab_only, so it
+// touches no backend at all.
 
 #include "llama.h"
 
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
-int main(int argc, char ** argv) {
-    if (argc < 4) {
-        fprintf(stderr, "usage: %s <model.gguf> <out.bin> <tok0> [tok1 ...]\n", argv[0]);
-        return 2;
+#define FXTK_MAGIC "FXTK"
+#define FXTK_VERSION 1u
+
+// Exit code for "llama.cpp itself cannot load this checkpoint". Kept
+// distinct from the generic failure code because it is not evidence
+// about ferrox: a reference with no answer has no verdict, and a caller
+// that cannot tell the two apart has to either ignore real failures or
+// report a missing reference as a defect.
+#define EXIT_MODEL_UNSUPPORTED 3
+
+static uint32_t rd_u32(const unsigned char * p) {
+    return (uint32_t) p[0] | ((uint32_t) p[1] << 8) | ((uint32_t) p[2] << 16) | ((uint32_t) p[3] << 24);
+}
+
+static void wr_u32(FILE * f, uint32_t v) {
+    unsigned char b[4] = {
+        (unsigned char) ( v        & 0xff),
+        (unsigned char) ((v >>  8) & 0xff),
+        (unsigned char) ((v >> 16) & 0xff),
+        (unsigned char) ((v >> 24) & 0xff),
+    };
+    fwrite(b, 1, sizeof(b), f);
+}
+
+static void wr_i32(FILE * f, int32_t v) {
+    wr_u32(f, (uint32_t) v);
+}
+
+static unsigned char * read_all(const char * path, size_t * out_len) {
+    FILE * f = fopen(path, "rb");
+    if (!f) {
+        return NULL;
     }
-    const char * model_path = argv[1];
-    const char * out_path   = argv[2];
-
-    const int n_tokens = argc - 3;
-    if (n_tokens <= 0) {
-        fprintf(stderr, "no tokens given\n");
-        return 2;
+    if (fseek(f, 0, SEEK_END) != 0) {
+        fclose(f);
+        return NULL;
     }
-    llama_token * tokens = (llama_token *) malloc(sizeof(llama_token) * (size_t) n_tokens);
-    for (int i = 0; i < n_tokens; i++) {
-        tokens[i] = (llama_token) atoi(argv[i + 3]);
+    long n = ftell(f);
+    if (n < 0) {
+        fclose(f);
+        return NULL;
     }
+    rewind(f);
+    // One extra byte so the blob is always safe to treat as a buffer
+    // even when the file is empty; the caller reads *out_len only.
+    unsigned char * buf = (unsigned char *) malloc((size_t) n + 1);
+    if (!buf) {
+        fclose(f);
+        return NULL;
+    }
+    if (n > 0 && fread(buf, 1, (size_t) n, f) != (size_t) n) {
+        free(buf);
+        fclose(f);
+        return NULL;
+    }
+    fclose(f);
+    *out_len = (size_t) n;
+    return buf;
+}
 
-    llama_backend_init();
-
+static struct llama_model * load_model(const char * path, bool vocab_only) {
     struct llama_model_params mparams = llama_model_default_params();
     mparams.n_gpu_layers = 0;
+    mparams.vocab_only   = vocab_only;
 
-    struct llama_model * model = llama_model_load_from_file(model_path, mparams);
+    struct llama_model * model = llama_model_load_from_file(path, mparams);
     if (!model) {
-        fprintf(stderr, "failed to load %s\n", model_path);
+        fprintf(stderr, "failed to load %s\n", path);
+    }
+    return model;
+}
+
+// ---------------------------------------------------------------- tokenize
+
+static int cmd_tokenize(const char * model_path, const char * in_path, const char * out_path) {
+    size_t blob_len = 0;
+    unsigned char * blob = read_all(in_path, &blob_len);
+    if (!blob) {
+        fprintf(stderr, "cannot read case file %s\n", in_path);
         return 1;
+    }
+    if (blob_len < 8 || memcmp(blob, FXTK_MAGIC, 4) != 0) {
+        fprintf(stderr, "%s is not an FXTK case file\n", in_path);
+        free(blob);
+        return 2;
+    }
+
+    const uint32_t n_cases = rd_u32(blob + 4);
+
+    // Two passes: validate every length prefix before loading a model,
+    // so a truncated case file fails in milliseconds and says so,
+    // instead of failing after a multi-second load with a torn read.
+    size_t * offsets = (size_t *) malloc(sizeof(size_t) * (size_t) (n_cases ? n_cases : 1));
+    size_t * lengths = (size_t *) malloc(sizeof(size_t) * (size_t) (n_cases ? n_cases : 1));
+    if (!offsets || !lengths) {
+        fprintf(stderr, "out of memory for %u cases\n", n_cases);
+        free(offsets);
+        free(lengths);
+        free(blob);
+        return 1;
+    }
+    size_t at = 8;
+    for (uint32_t i = 0; i < n_cases; i++) {
+        if (at + 4 > blob_len) {
+            fprintf(stderr, "case file truncated in the length of case %u\n", i);
+            free(offsets);
+            free(lengths);
+            free(blob);
+            return 2;
+        }
+        const uint32_t len = rd_u32(blob + at);
+        at += 4;
+        if (at + len > blob_len) {
+            fprintf(stderr, "case file truncated in the body of case %u\n", i);
+            free(offsets);
+            free(lengths);
+            free(blob);
+            return 2;
+        }
+        offsets[i] = at;
+        lengths[i] = len;
+        at += len;
+    }
+
+    struct llama_model * model = load_model(model_path, true);
+    if (!model) {
+        free(offsets);
+        free(lengths);
+        free(blob);
+        return EXIT_MODEL_UNSUPPORTED;
+    }
+    const struct llama_vocab * vocab = llama_model_get_vocab(model);
+
+    FILE * f = fopen(out_path, "wb");
+    if (!f) {
+        fprintf(stderr, "cannot open %s for writing\n", out_path);
+        llama_model_free(model);
+        free(offsets);
+        free(lengths);
+        free(blob);
+        return 1;
+    }
+
+    uint32_t flags = 0;
+    if (llama_vocab_get_add_bos(vocab)) flags |= 1u;
+    if (llama_vocab_get_add_eos(vocab)) flags |= 2u;
+
+    fwrite(FXTK_MAGIC, 1, 4, f);
+    wr_u32(f, FXTK_VERSION);
+    wr_u32(f, flags);
+    wr_u32(f, (uint32_t) llama_vocab_n_tokens(vocab));
+    wr_u32(f, n_cases);
+
+    int rc = 0;
+    for (uint32_t i = 0; i < n_cases && rc == 0; i++) {
+        const char * text = (const char *) (blob + offsets[i]);
+        const int32_t text_len = (int32_t) lengths[i];
+
+        // One token per byte is the hard ceiling for any byte-fallback
+        // vocabulary, so this never needs a retry; +4 covers the
+        // specials llama.cpp may still emit for an empty case.
+        int32_t cap = text_len + 4;
+        llama_token * toks = (llama_token *) malloc(sizeof(llama_token) * (size_t) cap);
+        if (!toks) {
+            fprintf(stderr, "out of memory tokenizing case %u\n", i);
+            rc = 1;
+            break;
+        }
+        // add_special = false: BOS/EOS policy travels in `flags`.
+        // parse_special = true: ferrox's tokenizers always carve special
+        // tokens out of raw text, so the reference must too or the two
+        // sides are answering different questions.
+        const int32_t n = llama_tokenize(vocab, text, text_len, toks, cap, false, true);
+        if (n < 0) {
+            fprintf(stderr, "case %u needs %d tokens, buffer held %d\n", i, -n, cap);
+            free(toks);
+            rc = 1;
+            break;
+        }
+        wr_u32(f, (uint32_t) n);
+        for (int32_t t = 0; t < n; t++) {
+            wr_i32(f, (int32_t) toks[t]);
+        }
+        free(toks);
+    }
+
+    fclose(f);
+    llama_model_free(model);
+    free(offsets);
+    free(lengths);
+    free(blob);
+
+    if (rc == 0) {
+        printf("tokenized %u cases\n", n_cases);
+    }
+    return rc;
+}
+
+// ------------------------------------------------------------------ logits
+
+static int cmd_logits(const char * model_path, const char * out_path, int n_tokens, char ** tok_argv) {
+    llama_token * tokens = (llama_token *) malloc(sizeof(llama_token) * (size_t) n_tokens);
+    if (!tokens) {
+        fprintf(stderr, "out of memory for %d tokens\n", n_tokens);
+        return 1;
+    }
+    for (int i = 0; i < n_tokens; i++) {
+        tokens[i] = (llama_token) atoi(tok_argv[i]);
+    }
+
+    struct llama_model * model = load_model(model_path, false);
+    if (!model) {
+        free(tokens);
+        return EXIT_MODEL_UNSUPPORTED;
     }
 
     struct llama_context_params cparams = llama_context_default_params();
@@ -71,6 +295,7 @@ int main(int argc, char ** argv) {
     if (!ctx) {
         fprintf(stderr, "failed to create context\n");
         llama_model_free(model);
+        free(tokens);
         return 1;
     }
 
@@ -91,6 +316,7 @@ int main(int argc, char ** argv) {
         llama_batch_free(batch);
         llama_free(ctx);
         llama_model_free(model);
+        free(tokens);
         return 1;
     }
 
@@ -103,6 +329,7 @@ int main(int argc, char ** argv) {
         llama_batch_free(batch);
         llama_free(ctx);
         llama_model_free(model);
+        free(tokens);
         return 1;
     }
 
@@ -112,6 +339,7 @@ int main(int argc, char ** argv) {
         llama_batch_free(batch);
         llama_free(ctx);
         llama_model_free(model);
+        free(tokens);
         return 1;
     }
     fwrite(logits, sizeof(float), (size_t) n_vocab, f);
@@ -122,6 +350,30 @@ int main(int argc, char ** argv) {
     llama_batch_free(batch);
     llama_free(ctx);
     llama_model_free(model);
-    llama_backend_free();
+    free(tokens);
     return 0;
+}
+
+int main(int argc, char ** argv) {
+    if (argc >= 2 && strcmp(argv[1], "--tokenize") == 0) {
+        if (argc != 5) {
+            fprintf(stderr, "usage: %s --tokenize <model.gguf> <cases.bin> <out.bin>\n", argv[0]);
+            return 2;
+        }
+        llama_backend_init();
+        const int rc = cmd_tokenize(argv[2], argv[3], argv[4]);
+        llama_backend_free();
+        return rc;
+    }
+
+    if (argc < 4) {
+        fprintf(stderr, "usage: %s <model.gguf> <out.bin> <tok0> [tok1 ...]\n", argv[0]);
+        fprintf(stderr, "       %s --tokenize <model.gguf> <cases.bin> <out.bin>\n", argv[0]);
+        return 2;
+    }
+
+    llama_backend_init();
+    const int rc = cmd_logits(argv[1], argv[2], argc - 3, argv + 3);
+    llama_backend_free();
+    return rc;
 }

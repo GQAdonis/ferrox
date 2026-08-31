@@ -22,11 +22,25 @@
 //! from the experiment — ferrox tokenizes, and llama.cpp is handed the
 //! resulting ids.
 //!
+//! Removing the tokenizer from THIS experiment is right, and for years
+//! it also meant nothing tested the tokenizer at all: a single hardcoded
+//! pre-tokenizer regex mistokenized every digit run of four or more and
+//! every whitespace run of two or more, on Llama-3.x, Qwen, DeepSeek and
+//! SmolLM, and the repo's only cross-engine oracle was structurally
+//! unable to see it. So `parity` now runs a SECOND comparison first, in
+//! [`tokenize`]: same file, same library, ferrox's token ids against
+//! llama.cpp's for a corpus built out of the inputs the pre-tokenizers
+//! actually disagree on. It runs before the logit comparison because a
+//! tokenizer divergence means the distribution comparison below is
+//! measuring two different prompts.
+//!
 //! The reference side is a small C program (`tools/llama_logits.c`)
 //! linked against the installed `libllama`, in the same spirit as the
 //! IQ-tier goldens, which link ggml's own `ggml-quants.c` rather than
 //! re-reading the format spec. A reference you re-implemented is not a
 //! reference. Build it with `tools/build_llama_logits.sh`.
+
+mod tokenize;
 
 use anyhow::Context;
 use std::path::{Path, PathBuf};
@@ -66,6 +80,27 @@ pub struct ParityArgs {
 
 pub fn run(args: ParityArgs) -> anyhow::Result<()> {
     let path = crate::pull::resolve_model_path(&args.model)?;
+
+    // Resolved before anything expensive runs: a missing dumper is the
+    // most common way this command fails, and finding that out after a
+    // multi-second model load helps nobody.
+    let dumper = dumper_path(args.dumper.as_deref())?;
+
+    // The tokenizer comparison goes first. It is vocab-only on both
+    // sides, so it costs a fraction of the prefill below, and a
+    // divergence here means the logit numbers underneath it were
+    // computed from a prompt the two engines do not even agree on.
+    let tokens_report = tokenize::run(&dumper, Path::new(&path))?;
+    match &tokens_report {
+        Some(r) => tokenize::print_report(r),
+        None => println!(
+            "tokenizer: SKIPPED — the installed libllama cannot load this checkpoint, so it has \
+             no tokenization to compare against. The logit comparison below will fail for the \
+             same reason."
+        ),
+    }
+    println!();
+
     let prompt = args.prompt.clone().unwrap_or_else(|| PROMPT.to_string());
 
     let (tokens, ferrox_logits) =
@@ -87,7 +122,6 @@ pub fn run(args: ParityArgs) -> anyhow::Result<()> {
         );
     }
 
-    let dumper = dumper_path(args.dumper.as_deref())?;
     let ref_logits = reference_logits(&dumper, &path, &tokens)?;
 
     if ref_logits.len() != ferrox_logits.len() {
@@ -111,11 +145,22 @@ pub fn run(args: ParityArgs) -> anyhow::Result<()> {
         &report,
     );
 
+    // Both halves are reported before either is allowed to abort the
+    // command: a run that printed the tokenizer divergence and then
+    // exited would hide the logit numbers that say whether the graph is
+    // also wrong, and those are two separate pieces of work.
+    let mut failures: Vec<String> = Vec::new();
+    if tokens_report.as_ref().is_some_and(|r| r.diverged()) {
+        failures.push("ferrox and llama.cpp tokenize the same text differently".to_string());
+    }
     if report.verdict == Verdict::Wrong {
-        anyhow::bail!(
+        failures.push(format!(
             "ferrox disagrees with llama.cpp beyond numeric noise (KL {:.3e} nats)",
             report.kl_ref_ferrox
-        );
+        ));
+    }
+    if !failures.is_empty() {
+        anyhow::bail!("{}", failures.join("; "));
     }
     Ok(())
 }

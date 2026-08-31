@@ -275,9 +275,52 @@ Two different questions, and only the second one involves llama.cpp.
 `verify` greedy-decodes the same prompt on two ferrox backends and diffs
 the token ids. It cannot catch a bug both backends share.
 
+`parity` runs **two** comparisons against llama.cpp on the same GGUF: the
+tokenizer first, then the graph.
+
+### The tokenizer half
+
+Ferrox's token ids against llama.cpp's, for a fixed 19-case corpus, on
+the same file. It prints one line per checkpoint and, for each case that
+diverges, the token index, the approximate byte offset, the input either
+side of that offset, and both engines' ids and decoded pieces in a
+window around it:
+
+```
+tokenizer Phi-4-mini-instruct-Q4_K_M: DIVERGES (19 cases / 350 tokens, pre=gpt-4o, ...)
+  vocab  llama 200064 / ferrox 200064     add_bos  llama false / ferrox false
+  7/19 cases diverge:
+
+  [digit-runs] token 2 of 23 (llama) / 35 (ferrox), byte ~6 of 61
+      input around it: "Build " >|< "1234567 of 89 took 10000"
+      llama  12893:"Build" 220:" " *7633:"123" 19354:"456" 22:"7" 328:" of"
+      ferrox 12893:"Build" 220:" " *16:"1" 17:"2" 18:"3" 19:"4"
+```
+
+The corpus is built out of the clauses llama.cpp's pre-tokenizer regexes
+actually differ on, not out of prose: long digit runs, runs of two or
+more spaces, 4- and 8-space indents, tabs, blank lines, CRLF, trailing
+whitespace, uppercase and stacked contractions, CJK, emoji and ZWJ
+sequences, Unicode whitespace, control bytes, punctuation runs and
+version/address strings. Ordinary English is exactly what a wrong
+pre-tokenizer still gets right, which is why running it proved nothing
+for years.
+
+Ids are compared with `add_special = false` on both sides; the add-BOS
+*decision* is compared separately, as a flag, so that one policy
+disagreement does not misreport all 19 cases. Vocab sizes are compared
+first, because two different id spaces make everything below them
+meaningless.
+
+This half runs before the logit half and both are always reported, but
+either one diverging exits non-zero. A tokenizer divergence means the
+logit numbers underneath were computed from two different prompts.
+
+### The logit half
+
 `parity` compares the logit distribution at the last prompt position
 against llama.cpp's, feeding **the same token ids to both** so the
-tokenizer is not part of the experiment. It reports KL in both
+tokenizer is not part of *that* experiment. It reports KL in both
 directions, total variation, max |delta p|, top-k overlap, and where
 llama's top-1 ranks for ferrox, then gives one of four verdicts:
 
@@ -292,17 +335,35 @@ Comparing greedy *text* would not work here. A chain of argmaxes turns
 one last-bit difference into a different sentence, so a text diff cannot
 tell `TIE-FLIP` from `WRONG`.
 
-`parity` needs the reference dumper built once. It is C, not Rust, and
-it lives outside the cargo workspace on purpose. It exists to give
-llama.cpp's own answer, so it links llama.cpp's own library:
+### The reference dumper
+
+Both halves need it, built once. It is C, not Rust, and it lives outside
+the cargo workspace on purpose. It exists to give llama.cpp's own
+answer, so it links llama.cpp's own library:
 
 ```bash
 ./tools/build_llama_logits.sh          # -> target/llama_logits
 LLAMA_CPP_PREFIX=/path/to/llama.cpp ./tools/build_llama_logits.sh
 ```
 
-Point `--dumper` or `FERROX_LLAMA_LOGITS` at it if you build it
-elsewhere.
+It lands in `target/`, so `cargo clean` removes it; rebuild rather than
+assuming `parity` broke. Point `--dumper` or `FERROX_LLAMA_LOGITS` at it
+if you build it elsewhere. A dumper built before the tokenizer half
+existed has no `--tokenize` mode, and `parity` says so and names the
+rebuild.
+
+To sweep the tokenizer half across every checkpoint under `models/`
+without running any prefill:
+
+```bash
+./tools/build_llama_logits.sh
+cargo test -p ferrox-cli -- --ignored ferrox_and_llama_cpp_tokenize_the_corpus_identically --nocapture
+```
+
+That test is `#[ignore]`d because it needs the dumper and real
+checkpoints. Checkpoints that are missing, or that the installed
+`libllama` cannot load, are skipped by name — a reference with no answer
+is not a verdict either way.
 
 ## Diagnostics (`layer-divergence`, `quant-sensitivity`)
 

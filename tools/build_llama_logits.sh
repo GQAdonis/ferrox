@@ -29,9 +29,14 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 mkdir -p "$ROOT/target"
 OUT="$ROOT/target/llama_logits"
 
-cc -std=c11 -O2 \
+# -Wall -Wextra because this binary is a REFERENCE: a silently truncated
+# int or a misread length here would be reported as a ferrox defect.
+cc -std=c11 -O2 -Wall -Wextra \
   -I"$PREFIX/include" \
   -L"$PREFIX/lib" -lllama -Wl,-rpath,"$PREFIX/lib" \
   "$ROOT/tools/llama_logits.c" -o "$OUT"
 
 echo "built $OUT (llama.cpp at $PREFIX)"
+echo
+echo "It writes into target/, so 'cargo clean' removes it — rebuild with this"
+echo "script rather than assuming ferrox parity lost its reference."

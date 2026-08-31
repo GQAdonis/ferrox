@@ -154,9 +154,16 @@ Parsed and executable on CPU: `F32`, `F16`, `BF16`, `Q4_0`, `Q4_1`,
 
 Two caveats that matter in practice:
 
-- **The IQ codebook formats and MXFP4 are CPU-only** (scalar + AVX2, no
-  NEON and no GPU kernels). They load and produce correct output. They
-  are slow, and they do not run on Metal or CUDA at all.
+- **The IQ tiers split, and the split matters if you are choosing a
+  quant.** `IQ4_NL` and `IQ4_XS` have NEON kernels, and `IQ4_XS` also
+  has a Metal matvec and a Metal simdgroup GEMM, so it runs on the GPU
+  at full speed. `IQ2_XS`, `IQ2_S`, `IQ3_S`, `IQ1_M` and GGUF-block
+  MXFP4 are **scalar only**: no NEON, no AVX2, no GPU. They load and
+  produce correct output, and they are slow. That was deliberate. They
+  were added for coverage, because before them those tags could not be
+  decoded at all, which ruled out 5 of the 16 published Unsloth `UD-*`
+  variants. A vectorized path was left out rather than written without a
+  golden vector that could tell it apart from the scalar one.
 - **`I32` is recognized and sized, but nothing executes it.** A
   checkpoint that needs it stops with an error rather than being
   quietly skipped.

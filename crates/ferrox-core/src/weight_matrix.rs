@@ -416,6 +416,19 @@ pub fn metal_matvec_kind_name(kind: QuantKind) -> Option<&'static str> {
 /// asserted by a test, so adding a matvec kernel without a GEMM fails
 /// the suite instead of a benchmark.
 pub fn metal_mul_mm_kind_supported(kind: QuantKind) -> bool {
+    // Q5_0 IS ABSENT ON PURPOSE, not by oversight.
+    //
+    // `q5_0_mul_mm_sg` exists in ferrox-metal, so this list looks short
+    // by one. But there is no `q5_0_matvec`, so admitting it here buys
+    // GPU prefill and leaves decode on the CPU for the same weights.
+    // This project has already paid for a mixed CPU/GPU path once: the
+    // paged decode loop ran attention on the host against a KV plane
+    // Metal had left zero-filled, and answered fluently and wrongly for
+    // as long as nobody looked.
+    //
+    // There is also no Q5_0 checkpoint in the suite to check it with, so
+    // enabling it would ship an unmeasured GPU path. It goes in when the
+    // matvec lands or when a Q5_0 model is added and can prove it.
     matches!(
         kind,
         QuantKind::Q8_0

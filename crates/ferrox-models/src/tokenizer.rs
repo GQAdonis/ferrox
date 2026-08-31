@@ -15,14 +15,46 @@
 //! against a real downloaded llama.cpp vocab fixture) was the natural
 //! next step and now exists below (`GgufBpeTokenizer`,
 //! `GgufSpmTokenizer`, `GgufUnigramTokenizer`).
+//!
+//! The per-checkpoint pre-tokenization rules live next door in
+//! [`pretokenize`], which is a transcription of llama.cpp and is
+//! reviewed against it.
+
+mod pretokenize;
+
+/// The `tokenizer.ggml.pre` values whose llama.cpp arm sets
+/// `add_bos = true` for a BPE vocabulary.
+///
+/// Transcribed from `.scratch/llama.cpp/src/llama-vocab.cpp`: the
+/// `LLAMA_VOCAB_PRE_TYPE_LLAMA3` arm sets it for the whole llama3 group
+/// in one statement, and `tekken` and `chameleon` set it in arms of
+/// their own. Llama-3.x GGUFs ship no explicit
+/// `tokenizer.ggml.add_bos_token`, so leaving the group out made every
+/// raw completion prompt one `<|begin_of_text|>` short of llama.cpp's.
+const ADD_BOS_PRE: &[&str] = &[
+    // LLAMA_VOCAB_PRE_TYPE_LLAMA3
+    "llama3",
+    "llama-v3",
+    "llama-bpe",
+    "falcon3",
+    "falcon-h1",
+    "pixtral",
+    "midm-2.0",
+    "lfm2",
+    "jina-v5-nano",
+    // arms of their own, same flag
+    "tekken",
+    "chameleon",
+];
 
 /// Whether prompt encoding should prepend the GGUF BOS token.
 ///
 /// Port of llama.cpp `llama_vocab` add_bos defaults
 /// (`.scratch/llama.cpp/src/llama-vocab.cpp`): explicit
-/// `tokenizer.ggml.add_bos_token` wins; else SPM → true, BPE/`qwen2` pre
-/// → false. Qwen2-MoE ships `bos_token_id=<|endoftext|>` but
-/// `add_bos=false` — always prepending that token poisons greedy decode.
+/// `tokenizer.ggml.add_bos_token` wins; else SPM → true, BPE → false
+/// unless the checkpoint's `pre` is one of [`ADD_BOS_PRE`]. Qwen2-MoE
+/// ships `bos_token_id=<|endoftext|>` but `add_bos=false` — always
+/// prepending that token poisons greedy decode.
 pub fn should_add_bos_token(file: &impl ferrox_gguf::TensorSource) -> bool {
     if let Some(v) = file.metadata_bool("tokenizer.ggml.add_bos_token") {
         return v;
@@ -30,11 +62,11 @@ pub fn should_add_bos_token(file: &impl ferrox_gguf::TensorSource) -> bool {
     let model = file.metadata_str("tokenizer.ggml.model").unwrap_or("");
     let pre = file.metadata_str("tokenizer.ggml.pre").unwrap_or("");
     // llama.cpp: SPM/WPM default add_bos=true; BPE defaults false unless
-    // a pre-tokenizer (tekken/chameleon) opts in. qwen2 leaves false.
+    // its pre-tokenizer arm opts in. qwen2 leaves false.
     if matches!(model, "llama" | "spm") || model.contains("sentencepiece") {
         return true;
     }
-    matches!(pre, "tekken" | "chameleon")
+    ADD_BOS_PRE.contains(&pre)
 }
 
 /// Prepends the checkpoint's BOS id to an already-encoded prompt, unless
@@ -286,74 +318,16 @@ fn gpt2_byte_to_unicode() -> ([char; 256], std::collections::HashMap<char, u8>) 
     (forward, reverse)
 }
 
-/// Builds the GPT2-style pre-tokenization pattern: splits raw text
-/// into chunks (contractions, runs of letters, runs of digits, runs of
-/// other symbols, whitespace) *before* BPE-merging each chunk
-/// separately. This matters because without it, `encode_word` would
-/// treat an entire sentence as one word and could merge across word
-/// boundaries in ways a real tokenizer never would (e.g. merging the
-/// last letter of one word with the leading space of the next), which
-/// silently produces different token sequences than llama.cpp or
-/// mistral.rs would for the same input.
+/// The chunking that runs before BPE: raw text is cut into
+/// contractions, letter runs, digit runs, symbol runs and whitespace
+/// runs, and each chunk is merged separately. Without it `encode_word`
+/// would treat a whole sentence as one word and could merge across word
+/// boundaries in ways no real tokenizer does.
 ///
-/// Which pre-tokenizer regex a checkpoint's `tokenizer.ggml.pre` names.
-///
-/// Ferrox used to run ONE regex, the GPT-2 one, for every BPE
-/// checkpoint. llama.cpp has around thirty variants, and the difference
-/// is not cosmetic. Against the llama3 family regex, the old behaviour
-/// split `"1234567"` as a single run where llama.cpp gives
-/// `123|456|7`, so EVERY number of four or more digits got different
-/// ids; it split `"DON'T"` as `DON|'|T` where llama.cpp keeps `DON|'T`;
-/// and it split any run of two or more spaces differently, which means
-/// indented code and blank lines tokenize differently.
-///
-/// It stayed invisible because the BPE tests are round-trip only and
-/// `ferrox parity` hands llama.cpp explicit token ids, so the tokenizer
-/// sits outside the only cross-engine oracle in the repo.
-///
-/// `fancy_regex` rather than `regex` because the real patterns need the
-/// `\s+(?!\S)` negative lookahead that separates a trailing whitespace
-/// run from an interior one. That crate is already a dependency of this
-/// crate for the Kimi tokenizer, so the old comment's reasoning (that
-/// Rust has no lookaround available) no longer holds.
-fn pretokenize_regex_for(pre: &str) -> fancy_regex::Regex {
-    // Source: llama.cpp `llama-vocab.cpp`, `LLAMA_VOCAB_PRE_TYPE_*`.
-    let pattern = match pre {
-        // The llama3 family, and the shape most checkpoints ferrox
-        // actually runs use. `\p{N}{1,3}` is the digit grouping, and the
-        // `(?i:)` makes the contractions case-insensitive.
-        "llama3" | "llama-v3" | "llama-bpe" | "deepseek-llm" | "deepseek-coder" | "deepseek-v3"
-        | "falcon3" | "pixtral" | "minerva-7b" => {
-            r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+"
-        }
-        // Qwen2 and its descendants: same digit grouping, contractions
-        // are NOT case-insensitive here.
-        "qwen2" | "stablelm2" | "jina-v2-code" | "gpt-4o" | "superbpe" => {
-            r"'s|'t|'re|'ve|'m|'ll|'d|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+"
-        }
-        // OLMo and its neighbours: the GPT-2 alternatives, but ending at
-        // `\s+(?!\S)` with NO trailing `|\s+`. That absence is the
-        // whole difference and it is deliberate upstream, so it is a
-        // separate arm rather than folded into the fallback.
-        // (llama.cpp LLAMA_VOCAB_PRE_TYPE_OLMO, shared with jais,
-        // trillion and granite-docling.)
-        "olmo" | "jais" | "trillion" | "granite-docling" => {
-            r"'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)"
-        }
-        // Plain GPT-2, now WITH the trailing-whitespace clause that was
-        // dropped before.
-        _ => r"'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+",
-    };
-    fancy_regex::Regex::new(pattern).expect("pre-tokenization patterns are fixed and valid")
-}
-
-/// Gemma-4 / SARVAM-style pre-split: only carve on newlines so BPE can
-/// merge across ordinary word boundaries after `" "` → `▁` escaping
-/// (llama.cpp `LLAMA_VOCAB_PRE_TYPE_GEMMA4`).
-fn newline_pretokenize_regex() -> fancy_regex::Regex {
-    fancy_regex::Regex::new(r"[^\n]+|[\n]+").expect("newline pretokenize pattern is fixed")
-}
-
+/// Which pattern a checkpoint gets, and what happens to the text
+/// between matches, is [`pretokenize`]'s job — it is a transcription of
+/// llama.cpp's `llama-vocab.cpp` and `unicode.cpp` and is reviewed
+/// against them.
 /// U+2581 FIGURE SPACE used by SentencePiece-style BPE merge tables.
 const SPM_SPACE: char = '\u{2581}';
 
@@ -638,9 +612,9 @@ impl GgufBpeTokenizer {
             // Keyed on the checkpoint's own `tokenizer.ggml.pre`, which
             // was previously read only to decide BOS prepending.
             BpeEncodingStyle::Gpt2 => {
-                pretokenize_regex_for(file.metadata_str("tokenizer.ggml.pre").unwrap_or(""))
+                pretokenize::regex_for(file.metadata_str("tokenizer.ggml.pre").unwrap_or(""))
             }
-            BpeEncodingStyle::SpmWhitespace => newline_pretokenize_regex(),
+            BpeEncodingStyle::SpmWhitespace => pretokenize::newline_regex(),
         };
         let special_tokens = load_special_tokens(file, &id_to_token);
 
@@ -747,13 +721,15 @@ impl GgufBpeTokenizer {
             .collect()
     }
 
+    /// `pretokenize::split_with_gaps` rather than a bare `find_iter`
+    /// loop: the text BETWEEN matches is input too, and llama.cpp emits
+    /// it as its own chunk. Dropping it lost tabs, NBSPs, form feeds and
+    /// interior newlines out of the middle of every OLMo prompt.
     fn encode_text_run(&self, text: &str) -> Vec<u32> {
         match self.style {
-            BpeEncodingStyle::Gpt2 => self
-                .pretokenize_pattern
-                .find_iter(text)
-                .filter_map(|m| m.ok())
-                .flat_map(|m| self.encode_word(m.as_str()))
+            BpeEncodingStyle::Gpt2 => pretokenize::split_with_gaps(&self.pretokenize_pattern, text)
+                .into_iter()
+                .flat_map(|chunk| self.encode_word(chunk))
                 .collect(),
             BpeEncodingStyle::SpmWhitespace => {
                 let escaped: String = text
@@ -1533,81 +1509,46 @@ mod gguf_vocab_tests {
         assert_eq!(pieces, vec!["don", "'t"]);
     }
 
-    /// The three divergences from llama.cpp that one hardcoded regex
-    /// caused, pinned so they cannot come back.
+    /// **Defect 3, at the tokenizer level.** The pre-tokenizer arms
+    /// whose pattern has no catch-all leave text unmatched, and the
+    /// encoder used to drop it: `find_iter(..).flat_map(..)` sees only
+    /// the matches. That is silent data loss on the PROMPT, not a
+    /// different segmentation, so the guard is a byte-for-byte
+    /// round-trip rather than an id list.
     ///
-    /// Every BPE checkpoint used to get the GPT-2 pattern regardless of
-    /// what `tokenizer.ggml.pre` said. Against the llama3 family that
-    /// meant different ids for any number of four or more digits, for
-    /// uppercase contractions, and for any interior run of two or more
-    /// spaces, which is every indented line of code.
-    ///
-    /// Expected splits are llama.cpp's, from its `LLAMA_VOCAB_PRE_TYPE`
-    /// patterns, not from what this implementation happens to produce.
+    /// The fixture ships `pre = llama-bpe`, whose pattern ends in a
+    /// catch-all `\s+` and so has no gaps to lose. The OLMo arm is
+    /// swapped in to reproduce the checkpoint that actually broke —
+    /// only the split rule changes, the vocabulary and merges stay real.
     #[test]
-    fn the_llama3_pretokenizer_groups_digits_and_keeps_uppercase_contractions() {
-        let re = super::pretokenize_regex_for("llama3");
-        let split = |t: &str| -> Vec<String> {
-            re.find_iter(t)
-                .map(|m| m.expect("fixed pattern").as_str().to_string())
-                .collect()
-        };
+    fn every_byte_survives_encoding_on_an_arm_with_unmatched_gaps() {
+        let mut tok = load_real_fixture();
+        tok.pretokenize_pattern = super::pretokenize::regex_for("olmo");
 
-        // Digits group in threes. The GPT-2 pattern took the whole run.
-        assert_eq!(split("1234567"), vec!["123", "456", "7"]);
+        // A tab, an NBSP, an interior newline, a form feed and a
+        // trailing tab: every one of these was unmatched by the OLMo
+        // pattern and vanished from the prompt.
+        for text in [
+            "a\tb\u{a0}c\nd\u{c}e",
+            "\tif x:\n\t\treturn 1\n\t \treturn 2\n",
+            "para one\n\npara two\n",
+            "line one\r\nline two\r\n",
+        ] {
+            let ids = tok.encode(text);
+            assert_eq!(
+                tok.decode(&ids),
+                text,
+                "encoding {text:?} on the olmo arm lost input bytes"
+            );
+        }
 
-        // Contractions are case-insensitive here, so DON'T keeps its
-        // apostrophe with the T rather than splitting three ways.
-        assert_eq!(split("DON'T"), vec!["DON", "'T"]);
-
-        // An interior run of spaces is one piece, and the word after it
-        // keeps its leading space. This is the one that moves indented
-        // code and blank lines.
-        assert_eq!(split("hello  world"), vec!["hello", " ", " world"]);
-    }
-
-    /// Qwen2 is a SEPARATE arm, not an alias for llama3, and the
-    /// difference is the digit rule: `\p{N}` one at a time versus
-    /// llama3's `\p{N}{1,3}`.
-    ///
-    /// Worth pinning because the two patterns look alike and the
-    /// temptation is to merge them. Note what is NOT different here:
-    /// `DON'T` splits the same either way, because
-    /// `[^\r\n\p{L}\p{N}]?\p{L}+` matches `'T` whether or not the
-    /// contraction alternatives fold case. The case-insensitivity only
-    /// shows on lowercase input, which is why asserting on `DON'T`
-    /// alone would prove nothing.
-    #[test]
-    fn qwen2_splits_digits_singly_where_llama3_groups_them() {
-        let split = |pre: &str, t: &str| -> Vec<String> {
-            super::pretokenize_regex_for(pre)
-                .find_iter(t)
-                .map(|m| m.expect("fixed pattern").as_str().to_string())
-                .collect()
-        };
-        assert_eq!(split("qwen2", "1234"), vec!["1", "2", "3", "4"]);
-        assert_eq!(split("llama3", "1234"), vec!["123", "4"]);
+        // And the loss was real: the tab between `a` and `b` is its own
+        // token, not absorbed into either neighbour.
+        let ids = tok.encode("a\tb");
         assert_eq!(
-            split("qwen2", "DON'T"),
-            split("llama3", "DON'T"),
-            "the contraction case rule does not show on uppercase input"
-        );
-    }
-
-    /// An unknown `pre` falls back to GPT-2, which is what llama.cpp
-    /// does, and that fallback now carries the trailing-whitespace
-    /// clause that was dropped for lack of lookaround.
-    #[test]
-    fn an_unknown_pretokenizer_falls_back_to_gpt2_with_its_whitespace_clause() {
-        let re = super::pretokenize_regex_for("something-nobody-has-heard-of");
-        let pieces: Vec<String> = re
-            .find_iter("hi   ")
-            .map(|m| m.expect("fixed pattern").as_str().to_string())
-            .collect();
-        assert_eq!(
-            pieces,
-            vec!["hi", "   "],
-            "trailing whitespace is its own run, which is what `\\s+(?!\\S)` is for"
+            ids.len(),
+            3,
+            "a, the tab, b — the tab is a token of its own"
         );
     }
 
@@ -2028,6 +1969,91 @@ mod eog_tests {
             m.insert((*k).to_string(), GgufValue::U32(*v as u32));
         }
         MetaOnly(m)
+    }
+
+    /// A vocabulary described only by the three metadata keys
+    /// `should_add_bos_token` reads.
+    fn vocab_meta(model: &str, pre: Option<&str>, add_bos: Option<bool>) -> MetaOnly {
+        let mut m = HashMap::new();
+        m.insert(
+            "tokenizer.ggml.model".to_string(),
+            GgufValue::String(model.to_string()),
+        );
+        if let Some(pre) = pre {
+            m.insert(
+                "tokenizer.ggml.pre".to_string(),
+                GgufValue::String(pre.to_string()),
+            );
+        }
+        if let Some(v) = add_bos {
+            m.insert(
+                "tokenizer.ggml.add_bos_token".to_string(),
+                GgufValue::Bool(v),
+            );
+        }
+        MetaOnly(m)
+    }
+
+    /// **Defect 4.** llama.cpp sets `add_bos = true` for the whole
+    /// `LLAMA_VOCAB_PRE_TYPE_LLAMA3` group (`llama-vocab.cpp`, the
+    /// `tokenizer_pre == "llama-bpe"` arm), and Llama-3.x GGUFs ship no
+    /// explicit `tokenizer.ggml.add_bos_token`, so a missing group
+    /// member is a prompt one `<|begin_of_text|>` short of llama.cpp's
+    /// on every raw completion.
+    #[test]
+    fn the_llama_bpe_group_takes_bos_even_with_no_metadata_flag() {
+        for pre in [
+            "llama3",
+            "llama-v3",
+            "llama-bpe",
+            "falcon3",
+            "falcon-h1",
+            "pixtral",
+            "midm-2.0",
+            "lfm2",
+            "jina-v5-nano",
+            "tekken",
+            "chameleon",
+        ] {
+            assert!(
+                should_add_bos_token(&vocab_meta("gpt2", Some(pre), None)),
+                "llama.cpp sets add_bos for pre={pre}"
+            );
+        }
+    }
+
+    /// The other half of the same rule, so the fix cannot be "return
+    /// true": BPE arms outside that group leave `add_bos` false, and
+    /// Qwen2's `bos_token_id` is `<|endoftext|>` — prepending it poisons
+    /// greedy decode.
+    #[test]
+    fn other_bpe_pretokenizers_still_do_not_take_bos() {
+        for pre in ["qwen2", "deepseek-r1-qwen", "gpt-4o", "olmo", "gpt-2", ""] {
+            assert!(
+                !should_add_bos_token(&vocab_meta("gpt2", Some(pre), None)),
+                "llama.cpp leaves add_bos false for pre={pre}"
+            );
+        }
+    }
+
+    /// An explicit `tokenizer.ggml.add_bos_token` still wins in both
+    /// directions — the group default only applies when the key is
+    /// absent, which is what makes this a *default* rather than an
+    /// override.
+    #[test]
+    fn an_explicit_add_bos_flag_beats_the_pretokenizer_default() {
+        assert!(!should_add_bos_token(&vocab_meta(
+            "gpt2",
+            Some("llama-bpe"),
+            Some(false)
+        )));
+        assert!(should_add_bos_token(&vocab_meta(
+            "gpt2",
+            Some("qwen2"),
+            Some(true)
+        )));
+        // SPM still defaults to true with no flag and no pre.
+        assert!(should_add_bos_token(&vocab_meta("llama", None, None)));
     }
 
     /// The failure this exists to stop: a Llama-3 chat checkpoint whose

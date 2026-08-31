@@ -36,6 +36,7 @@ mod admission;
 mod batching;
 mod cancel;
 mod queue;
+mod radix;
 mod rows;
 mod status;
 

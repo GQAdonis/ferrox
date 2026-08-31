@@ -35,23 +35,31 @@
 //! 3. **The effort vocabulary.** Probed once at load
 //!    ([`crate::policy::effort::probe_effort_profile`]) rather than per request,
 //!    because it costs ~30 renders and never changes for a checkpoint.
+//! 4. **The end-of-turn marker.** Derived by rendering a conversation
+//!    whose assistant turn is closed and diffing it against one that is
+//!    not ([`crate::policy::turn::probe_end_of_turn`]). Gemma IT ends a
+//!    turn with `<end_of_turn>` and Yi-1.5 with `<|im_end|>`, neither of
+//!    which is that checkpoint's EOS, so both need the string in their
+//!    stop set or the model talks past the end of its own answer.
 //!
-//! Both probes run once, at load, which is what lets them be renders
+//! All four probes run once, at load, which is what lets them be renders
 //! rather than guesses.
 //!
-//! # End of turn
+//! # Nothing here matches template source any more
 //!
-//! [`PromptTemplate::end_of_turn`] survives the sniffer, and only that.
-//! Gemma IT emits `<end_of_turn>` before `<eos>`, so a served Gemma
-//! needs that string in its stop set no matter how the prompt was
-//! rendered. It is a property of the *family*, not of the render, which
-//! is why one literal marker test is all that is left of the six.
+//! The last substring check was the end-of-turn marker, which had an arm
+//! per family -- `<start_of_turn>`, `<|im_end|>`, `<|turn>` -- and so
+//! reported nothing for a family nobody had yet written an arm for. It
+//! is now derived from the render like the other three, which is both
+//! the same mechanism and the same reason: what a template PRINTS is the
+//! question, and its source is a proxy that answers a different one.
 
 use std::sync::Arc;
 
 use crate::policy::effort::{
     derive_think_gears, probe_effort_profile, probe_thinking_profile, EffortProfile, ThinkGears,
 };
+use crate::policy::turn::probe_end_of_turn;
 use ferrox_models::chat_template::{
     BuiltinTemplate, ChatTemplate as JinjaTemplate, RenderOptions, TemplateError,
 };
@@ -70,7 +78,7 @@ pub(crate) struct PromptTemplate {
 
 struct Inner {
     template: JinjaTemplate,
-    end_of_turn: Option<&'static str>,
+    end_of_turn: Option<String>,
     bos_token: Option<String>,
     eos_token: Option<String>,
     thinking: crate::policy::effort::ThinkingProfile,
@@ -98,7 +106,6 @@ impl PromptTemplate {
     ) -> Self {
         Self::build(
             JinjaTemplate::from_gguf_metadata(source, arch, byte_tokenizer, chatml_tokens_present),
-            source,
             bos_token,
             eos_token,
         )
@@ -116,7 +123,6 @@ impl PromptTemplate {
             // No vocabulary here: this path always carries its own
             // template, so the ChatML fallback is unreachable.
             JinjaTemplate::from_gguf_metadata(source, None, false, false),
-            source,
             bos_token,
             eos_token,
         )
@@ -125,17 +131,11 @@ impl PromptTemplate {
     /// Role-labeled lines, no special tokens: the synthetic-weights demo
     /// path, where there is no real vocabulary for markers to live in.
     pub(crate) fn plain() -> Self {
-        Self::build(
-            JinjaTemplate::builtin(BuiltinTemplate::Plain),
-            None,
-            None,
-            None,
-        )
+        Self::build(JinjaTemplate::builtin(BuiltinTemplate::Plain), None, None)
     }
 
     fn build(
         template: JinjaTemplate,
-        source: Option<&str>,
         bos_token: Option<String>,
         eos_token: Option<String>,
     ) -> Self {
@@ -147,7 +147,12 @@ impl PromptTemplate {
         let handles_tools = probe_tools_consumed(&template, bos, eos);
         Self {
             inner: Arc::new(Inner {
-                end_of_turn: end_of_turn_marker(source),
+                // A terminator that IS the EOS adds nothing to the stop
+                // set: decoding already stops on that token, and
+                // repeating it as a string only makes the withhold
+                // buffer hold text it never has to.
+                end_of_turn: probe_end_of_turn(turn_render(&template, bos, eos), bos)
+                    .filter(|marker| Some(marker.as_str()) != eos),
                 template,
                 bos_token,
                 eos_token,
@@ -164,8 +169,8 @@ impl PromptTemplate {
 
     /// The end-of-turn string this family emits before EOS, if it has
     /// one worth adding to the stop set.
-    pub(crate) fn end_of_turn(&self) -> Option<&'static str> {
-        self.inner.end_of_turn
+    pub(crate) fn end_of_turn(&self) -> Option<&str> {
+        self.inner.end_of_turn.as_deref()
     }
 
     /// Whether the template consumes `tools` itself. When it does not,
@@ -414,48 +419,29 @@ fn probe_efforts(
     probe_effort_profile(probe_render(template, bos_token, eos_token))
 }
 
-/// The one thing the marker sniffer was still right about: Gemma IT
-/// ends a turn with a string that is not EOS, so a served Gemma needs
-/// it in the stop set however the prompt was rendered.
-fn end_of_turn_marker(source: Option<&str>) -> Option<&'static str> {
-    let Some(src) = source else {
-        // No template at all, so the builtin renders turns as
-        // `user:` / `assistant:` lines. A BASE model continues that
-        // pattern forever: it has no EOS for a turn it was never
-        // trained on, so it answers and then writes the next `user:`
-        // line itself, to the token cap.
-        //
-        // Observed on OLMoE-1B-7B: "The capital of France is" answered
-        // "Paris." correctly and then repeated
-        // "user: The capital of France is Paris." for 512 tokens. The
-        // answer was right and unusable.
-        //
-        // The turn marker the builtin itself prints is the stop, which
-        // is the same rule the Gemma case below follows.
-        return Some("\nuser:");
-    };
-    if src.contains("<|turn>") || src.contains("<turn|>") {
-        Some("<turn|>")
-    } else if src.contains("<start_of_turn>") {
-        Some("<end_of_turn>")
-    } else if src.contains("<|im_end|>") {
-        // A ChatML template whose `<|im_end|>` is NOT the EOS token.
-        //
-        // Most ChatML checkpoints set `eos_token_id` to `<|im_end|>`, so
-        // decoding stops on it for free and this never fires. Yi-1.5-6B
-        // does not: its template ends every turn with `<|im_end|>`
-        // (id 7) while `eos_token_id` is 2. Nothing stopped, so the
-        // marker was EMITTED AS TEXT and the model carried on talking:
-        // "The capital of France is Paris.<|im_end|>  I used the
-        // definition of the capital city, which is the politi..." for 71
-        // tokens instead of 7.
-        //
-        // Same rule as the two arms above, which exist because a Gemma
-        // turn also ends with a string that is not EOS. Adding it to the
-        // stop set is harmless where EOS already covers it.
-        Some("<|im_end|>")
-    } else {
-        None
+/// A render closure that varies the CONVERSATION, for
+/// [`probe_end_of_turn`].
+///
+/// The other two probes hold the conversation fixed and vary a kwarg or
+/// the tool list; this one is the other way round, so it takes messages
+/// instead. `add_generation_prompt` is always false: the probe is asking
+/// what CLOSES an assistant turn, and a generation prompt opens one.
+pub(crate) fn turn_render<'a>(
+    template: &'a JinjaTemplate,
+    bos_token: Option<&'a str>,
+    eos_token: Option<&'a str>,
+) -> impl FnMut(&[Value]) -> Result<String, TemplateError> + 'a {
+    move |messages: &[Value]| {
+        template.render(
+            messages,
+            &RenderOptions {
+                add_generation_prompt: false,
+                bos_token: bos_token.map(str::to_string),
+                eos_token: eos_token.map(str::to_string),
+                tools: Vec::new(),
+                extra: Map::new(),
+            },
+        )
     }
 }
 
@@ -662,28 +648,91 @@ mod tests {
         assert!(tmpl.render(&[msg("user", "hi")], &[], Map::new()).is_err());
     }
 
+    /// Every one of these used to need its own arm in a substring
+    /// sniffer, and a family without an arm got no stop string at all.
+    /// They are now derived from the render, so this test is about the
+    /// families rather than about the list.
     #[test]
-    fn gemma_families_contribute_their_end_of_turn_marker_to_the_stop_set() {
+    fn the_end_of_turn_marker_is_derived_from_the_render() {
+        let marker = |src: Option<&str>, arch: Option<&str>, eos: Option<&str>| {
+            PromptTemplate::from_gguf_metadata(
+                src,
+                arch,
+                false,
+                true,
+                Some("<bos>".to_string()),
+                eos.map(str::to_string),
+            )
+            .end_of_turn()
+            .map(str::to_string)
+        };
+        let turns = |open: &str, close: &str| {
+            format!(
+                "{{{{ bos_token }}}}{{% for m in messages %}}{open}{{{{ m.role }}}}\n\
+                 {{{{ m.content }}}}{close}\n{{% endfor %}}"
+            )
+        };
+
+        // Gemma IT: `<end_of_turn>` before `<eos>`, so decoding does not
+        // stop on it and the stop set must.
         assert_eq!(
-            end_of_turn_marker(Some("{{ bos_token }}<start_of_turn>user\n")),
-            Some("<end_of_turn>")
+            marker(
+                Some(&turns("<start_of_turn>", "<end_of_turn>")),
+                None,
+                Some("<eos>")
+            ),
+            Some("<end_of_turn>".to_string())
         );
+        // gemma-4, a different marker in the same shape.
         assert_eq!(
-            end_of_turn_marker(Some("{{- '<|turn>' + m.role -}}")),
-            Some("<turn|>")
+            marker(Some(&turns("<|turn>", "<turn|>")), None, Some("<eos>")),
+            Some("<turn|>".to_string())
         );
+        // A marker no version of the sniffer ever had an arm for. This
+        // is the point: nothing in the code names it.
+        assert_eq!(
+            marker(Some(&turns("[[", "]]/turn")), None, Some("<eos>")),
+            Some("]]/turn".to_string())
+        );
+
         // ChatML ends a turn with `<|im_end|>`, and MOST checkpoints
         // make that their EOS so decoding stops on it for free. Yi-1.5
         // does not: its template uses `<|im_end|>` (id 7) while
         // `eos_token_id` is 2, so nothing stopped and the marker was
-        // emitted as literal text mid-answer. Adding it to the stop set
-        // is harmless where EOS already covers it.
-        assert_eq!(end_of_turn_marker(Some(CHATML)), Some("<|im_end|>"));
-        // No template means the builtin prints `user:` / `assistant:`
-        // lines, and a base model continues that pattern to the token
-        // cap because it has no EOS for a turn it never saw. The marker
-        // the builtin itself prints is the stop.
-        assert_eq!(end_of_turn_marker(None), Some("\nuser:"));
+        // emitted as literal text mid-answer.
+        assert_eq!(
+            marker(Some(CHATML), None, Some("</s>")),
+            Some("<|im_end|>".to_string())
+        );
+        // The same template on a checkpoint that DOES make the marker
+        // its EOS contributes nothing, because decoding already stops.
+        assert_eq!(marker(Some(CHATML), None, Some("<|im_end|>")), None);
+
+        // Mistral-Instruct, which has no per-turn marker at all: the
+        // assistant turn is closed by `</s>`, which IS the EOS, so there
+        // is nothing to add. The old sniffer reached the same answer by
+        // recognising none of its markers, which is the right answer for
+        // the wrong reason -- give the same template a different EOS and
+        // the derivation still finds the terminator.
+        const MISTRAL: &str = "{% for m in messages %}{% if m.role == 'user' %}\
+             [INST] {{ m.content }} [/INST]{% else %}{{ m.content }}</s>{% endif %}{% endfor %}";
+        assert_eq!(marker(Some(MISTRAL), None, Some("</s>")), None);
+        assert_eq!(
+            marker(Some(MISTRAL), None, Some("<eos>")),
+            Some("</s>".to_string())
+        );
+
+        // No template at all, so the builtin prints `user:` /
+        // `assistant:` lines and a base model continues that pattern to
+        // the token cap because it has no EOS for a turn it never saw.
+        // OLMoE-1B-7B answered "Paris." correctly and then wrote the
+        // next `user:` line itself for 512 tokens. The marker the
+        // builtin prints is the stop, and it is derived too.
+        // `chatml_tokens_present: false` is what makes this Plain: a
+        // vocabulary with no `<|im_start|>` cannot be wrapped in ChatML.
+        let plain =
+            PromptTemplate::from_gguf_metadata(None, Some("olmoe"), false, false, None, None);
+        assert_eq!(plain.end_of_turn(), Some("\nuser:"));
     }
 
     /// The probe is what makes `reasoning_effort` mean anything: a

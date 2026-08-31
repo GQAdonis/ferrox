@@ -117,3 +117,8 @@ pub(crate) mod radix;
 /// Closes with the rebuild half of `c3-serving-and-kv`.
 #[allow(dead_code)]
 pub(crate) mod rebuild;
+
+/// The differential turn-boundary analyzer, beside `effort` because it
+/// is the same mechanism: learn a template's behaviour by rendering it
+/// rather than by matching its source.
+pub(crate) mod turn;

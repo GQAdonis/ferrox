@@ -421,16 +421,22 @@ impl ModelConfig {
         // Gemma alternating SWA period (`attention.sliding_window_pattern`).
         // llama.cpp: gemma2 defaults period=2, gemma3 defaults period=6 when
         // the pattern key is absent. A missing key must NOT mean "all SWA".
+        //
+        // The metadata key overrides the PERIOD only. The phase is a
+        // property of the architecture in llama.cpp -- `dense_first` is
+        // an argument to `set_swa_pattern`, not a GGUF key -- so it
+        // comes from the registry either way.
+        let swa_layout = crate::capability::default_swa_layout(&arch);
+        let swa_dense_first = swa_layout.is_some_and(|p| p.dense_first);
         let swa_pattern = metadata_u64_any(file, &[key("attention.sliding_window_pattern")])
             .map(|v| v as usize)
-            .filter(|&p| p > 1)
             .or_else(|| {
                 sliding_window?;
                 // llama.cpp hardcodes the period per architecture and
                 // only lets the metadata key override it, so a missing
                 // key is *not* "every layer windowed" — see
-                // `capability::default_swa_pattern`.
-                crate::capability::default_swa_pattern(&arch).or(
+                // `capability::default_swa_layout`.
+                swa_layout.map(|p| p.period).or(
                     // Any Gemma variant not named in the table keeps the
                     // gemma3+ period rather than going uniform.
                     match arch_profile.family {
@@ -700,6 +706,7 @@ impl ModelConfig {
             attention: crate::config::AttentionKind::Gqa,
             sliding_window,
             swa_pattern,
+            swa_dense_first,
             moe: MoeLayerConfig {
                 n_experts: n_experts.max(1),
                 n_experts_active,

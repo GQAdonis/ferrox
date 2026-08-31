@@ -1968,6 +1968,7 @@ mod tests {
             rope_layout: crate::config::RopeLayout::Neox,
             qk_norm_style: crate::capability::QkNormStyle::WholeVector,
             swa_pattern: None,
+            swa_dense_first: false,
             attn_logit_softcap: None,
             final_logit_softcap: None,
             embedding_scale: None,

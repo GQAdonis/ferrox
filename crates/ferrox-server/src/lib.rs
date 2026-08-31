@@ -7306,6 +7306,7 @@ mod tests {
             rope_layout: ferrox_models::config::RopeLayout::Neox,
             qk_norm_style: ferrox_models::capability::QkNormStyle::WholeVector,
             swa_pattern: None,
+            swa_dense_first: false,
             attn_logit_softcap: None,
             final_logit_softcap: None,
             embedding_scale: None,

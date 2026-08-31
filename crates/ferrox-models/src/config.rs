@@ -258,10 +258,23 @@ pub struct ModelConfig {
     /// How Q/K RMSNorm weights are applied when present (see
     /// [`crate::capability::QkNormStyle`]).
     pub qk_norm_style: crate::capability::QkNormStyle,
-    /// Gemma 2+/3 alternating SWA period. When `Some(p)`, layer `il`
-    /// uses sliding-window attention iff `(il + 1) % p != 0` (llama.cpp
-    /// `set_swa_pattern` convention); every `p`-th layer is full-attn.
+    /// Alternating SWA period, llama.cpp's `set_swa_pattern` argument.
+    ///
+    /// `Some(0)` windows every layer and `Some(1)` windows none, which
+    /// are llama.cpp's two degenerate spellings and are NOT the same as
+    /// `None` (no period known, so every layer windows). Any larger `p`
+    /// alternates, with the phase in [`Self::swa_dense_first`].
     pub swa_pattern: Option<usize>,
+    /// llama.cpp's `dense_first` argument to `set_swa_pattern`, which
+    /// decides WHICH layer of each period is the full-attention one.
+    ///
+    /// `false` puts it last (`il % p == p - 1`), `true` puts it first
+    /// (`il % p == 0`). Getting this wrong is not a near miss: on a
+    /// 32-layer period-4 model the two phases disagree about SIXTEEN
+    /// layers, each of which then attends over the wrong span at full
+    /// speed. `capability::default_swa_layout` carries the per-arch
+    /// value, transcribed from llama.cpp.
+    pub swa_dense_first: bool,
     /// Attention logit soft-capping (Gemma 2+). Applied as
     /// `softcap * tanh(score / softcap)` before softmax.
     pub attn_logit_softcap: Option<f32>,
@@ -345,20 +358,22 @@ impl ModelConfig {
     /// alternating SWA patterns. `None` means full causal attention.
     pub fn layer_sliding_window(&self, layer_idx: usize) -> Option<usize> {
         let window = self.sliding_window?;
-        match self.swa_pattern {
-            None => Some(window),
-            Some(period) if period > 1 => {
-                // llama.cpp `set_swa_pattern` (dense_first=false):
-                // `is_swa = (il % period) < (period - 1)` — equivalent to
-                // full attention when `(il + 1) % period == 0`.
-                if (layer_idx + 1).is_multiple_of(period) {
-                    None
-                } else {
-                    Some(window)
-                }
-            }
-            Some(_) => Some(window),
-        }
+        // llama.cpp `llama_hparams::set_swa_pattern`
+        // (`src/llama-hparams.cpp:8-22`), both phases:
+        //
+        //   dense_first: is_swa = n_pattern == 0 || (il % n_pattern != 0)
+        //   otherwise:   is_swa = n_pattern == 0 || (il % n_pattern < n_pattern - 1)
+        //
+        // `period == 1` therefore windows NOTHING under either phase,
+        // which is the opposite of `None`. It used to be filtered out
+        // before it reached here and fell back to "every layer", which
+        // is exactly inverted.
+        let sliding = match self.swa_pattern {
+            None | Some(0) => true,
+            Some(period) if self.swa_dense_first => !layer_idx.is_multiple_of(period),
+            Some(period) => layer_idx % period < period - 1,
+        };
+        sliding.then_some(window)
     }
 
     /// The narrowest sliding window any layer of this model uses, or
@@ -517,6 +532,7 @@ pub fn glm_5_2() -> ModelConfig {
         rope_layout: RopeLayout::Neox,
         qk_norm_style: crate::capability::QkNormStyle::WholeVector,
         swa_pattern: None,
+        swa_dense_first: false,
         attn_logit_softcap: None,
         final_logit_softcap: None,
         embedding_scale: None,
@@ -595,6 +611,7 @@ pub fn deepseek_v4_pro() -> ModelConfig {
         rope_layout: RopeLayout::Norm,
         qk_norm_style: crate::capability::QkNormStyle::WholeVector,
         swa_pattern: None,
+        swa_dense_first: false,
         attn_logit_softcap: None,
         final_logit_softcap: None,
         embedding_scale: None,
@@ -705,6 +722,7 @@ pub fn kimi_k3() -> ModelConfig {
         rope_layout: RopeLayout::Neox,
         qk_norm_style: crate::capability::QkNormStyle::WholeVector,
         swa_pattern: None,
+        swa_dense_first: false,
         attn_logit_softcap: None,
         final_logit_softcap: None,
         embedding_scale: None,
@@ -761,6 +779,7 @@ pub fn test_dense_fixture() -> ModelConfig {
         rope_layout: RopeLayout::Neox,
         qk_norm_style: crate::capability::QkNormStyle::WholeVector,
         swa_pattern: None,
+        swa_dense_first: false,
         attn_logit_softcap: None,
         final_logit_softcap: None,
         embedding_scale: None,
@@ -812,6 +831,7 @@ pub fn test_moe_fixture() -> ModelConfig {
         rope_layout: RopeLayout::Neox,
         qk_norm_style: crate::capability::QkNormStyle::WholeVector,
         swa_pattern: None,
+        swa_dense_first: false,
         attn_logit_softcap: None,
         final_logit_softcap: None,
         embedding_scale: None,
@@ -866,6 +886,7 @@ pub fn test_mixed_fixture() -> ModelConfig {
         rope_layout: RopeLayout::Neox,
         qk_norm_style: crate::capability::QkNormStyle::WholeVector,
         swa_pattern: None,
+        swa_dense_first: false,
         attn_logit_softcap: None,
         final_logit_softcap: None,
         embedding_scale: None,
@@ -984,12 +1005,23 @@ mod tests {
         uniform.swa_pattern = None;
         assert_eq!(uniform.uniform_sliding_window(), Some(128));
 
-        // `swa_pattern = Some(1)` is every layer sliding, spelled as a
-        // pattern -- `layer_sliding_window` already treats it that way,
-        // and the two answers must agree with it.
+        // `Some(0)` is llama.cpp's spelling of "every layer slides"
+        // (`set_swa_pattern(0)`), and it is the one that may give a page
+        // back. `Some(1)` is the OPPOSITE -- no layer slides -- and this
+        // used to assert the two were the same, which is how the
+        // inversion stayed invisible.
+        let mut period_zero = uniform.clone();
+        period_zero.swa_pattern = Some(0);
+        assert_eq!(period_zero.uniform_sliding_window(), Some(128));
+
         let mut period_one = uniform.clone();
         period_one.swa_pattern = Some(1);
-        assert_eq!(period_one.uniform_sliding_window(), Some(128));
+        assert_eq!(
+            period_one.uniform_sliding_window(),
+            None,
+            "period 1 windows no layer, so there is no window to slide"
+        );
+        assert_eq!(period_one.kv_block_window(), None);
 
         let mut full = test_dense_fixture();
         full.sliding_window = None;

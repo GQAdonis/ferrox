@@ -1019,9 +1019,9 @@ pub fn default_swa_layout(arch: &str) -> Option<SwaPattern> {
         //
         // These four put the full-attention layer at `il % p == 0`, not
         // at `il % p == p - 1`. `ModelConfig::layer_sliding_window`
-        // implements only the `dense_first = false` phase, so
-        // `default_swa_pattern` below refuses to hand them a bare
-        // period rather than place their full layers one index off.
+        // implements BOTH phases and carries this flag as
+        // `swa_dense_first`; it used to implement only the first, which
+        // is why `smallthinker` and `laguna` windowed every layer.
         //
         // src/models/smallthinker.cpp:9-11. LIVE: `smallthinker` is on
         // the generic GQA path.
@@ -1035,33 +1035,6 @@ pub fn default_swa_layout(arch: &str) -> Option<SwaPattern> {
         // src/models/modern-bert.cpp:8-10. Deferred (encoder scope), so
         // latent.
         "modern-bert" => dense_first(3),
-        _ => None,
-    }
-}
-
-/// The alternating sliding-window period an architecture uses when its
-/// GGUF carries `{arch}.attention.sliding_window` but *not*
-/// `{arch}.attention.sliding_window_pattern`.
-///
-/// This is the half of [`default_swa_layout`] that ferrox's decoder can
-/// currently act on. `ModelConfig::layer_sliding_window` hardcodes
-/// llama.cpp's `dense_first = false` phase (full attention where
-/// `(il + 1) % period == 0`), so an architecture llama.cpp loads with
-/// `dense_first = true` gets `None` here on purpose:
-///
-/// - handing the caller the bare period would put every full-attention
-///   layer one index off, which for a 32-layer period-4 `smallthinker`
-///   is **16** layers attending over the wrong span;
-/// - `None` leaves ferrox's existing behaviour, every layer windowed,
-///   which is 8 layers wrong for the same model.
-///
-/// Both are wrong and neither is acceptable; the smaller of the two is
-/// what this returns until `ModelConfig` can carry `dense_first` and
-/// the loader can refuse what it still cannot express. See
-/// `tests/swa_pattern.rs::dense_first_architectures_are_not_handed_a_period_the_decoder_would_misplace`.
-pub fn default_swa_pattern(arch: &str) -> Option<usize> {
-    match default_swa_layout(arch) {
-        Some(p) if !p.dense_first => Some(p.period),
         _ => None,
     }
 }

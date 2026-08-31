@@ -5,7 +5,7 @@
 //! `{arch}.attention.sliding_window_pattern` is *optional* in a GGUF:
 //! llama.cpp seeds the period from a per-architecture literal and only
 //! lets the key override it. ferrox reads the key and, when it is
-//! absent, falls back to `capability::default_swa_pattern`.
+//! absent, falls back to `capability::default_swa_layout`.
 //!
 //! A missing entry in that table is not neutral. With no period,
 //! `ModelConfig::layer_sliding_window` returns the window for *every*
@@ -31,9 +31,7 @@
 //! Regenerate by re-reading the reference; do not edit an entry to make
 //! a failing test pass.
 
-use ferrox_models::capability::{
-    default_swa_layout, default_swa_pattern, resolve_profile, SwaPattern,
-};
+use ferrox_models::capability::{default_swa_layout, resolve_profile, SwaPattern};
 use ferrox_models::config::test_dense_fixture;
 
 /// `(gguf arch, period, dense_first, citation)`.
@@ -161,9 +159,14 @@ fn the_swa_transcription_is_complete_enough_to_be_worth_pinning() {
     );
 }
 
-/// For every `dense_first = false` architecture, feeding
-/// `default_swa_pattern`'s answer into `ModelConfig` has to put the
-/// full-attention layers on exactly the indices llama.cpp does.
+/// For EVERY architecture in the table, feeding `default_swa_layout`'s
+/// answer into `ModelConfig` has to put the full-attention layers on
+/// exactly the indices llama.cpp does.
+///
+/// Both phases, in one loop. `dense_first` used to be excluded here
+/// because `layer_sliding_window` could not express it; it can now, and
+/// running the two phases through the same assertion is the point --
+/// a phase that is only checked against itself is not checked.
 ///
 /// Pinning the number alone would not catch an off-by-one in
 /// `layer_sliding_window`; this walks 64 layers of each architecture and
@@ -173,13 +176,11 @@ fn the_period_lands_on_the_layers_llama_cpp_windows() {
     const WINDOW: usize = 128;
     let mut wrong = Vec::new();
     for &(arch, period, dense_first, cite) in LLAMA_SWA_DEFAULTS {
-        if dense_first {
-            continue; // covered by the test below
-        }
         let mut cfg = test_dense_fixture();
         cfg.n_layers = 64;
         cfg.sliding_window = Some(WINDOW);
-        cfg.swa_pattern = default_swa_pattern(arch);
+        cfg.swa_pattern = default_swa_layout(arch).map(|p| p.period);
+        cfg.swa_dense_first = default_swa_layout(arch).is_some_and(|p| p.dense_first);
         for il in 0..cfg.n_layers {
             let want = llama_layer_is_swa(il, period, dense_first);
             let got = cfg.layer_sliding_window(il).is_some();
@@ -198,63 +199,42 @@ fn the_period_lands_on_the_layers_llama_cpp_windows() {
     );
 }
 
-/// The `dense_first = true` architectures are a KNOWN, NAMED gap, and
-/// this test pins the shape of the gap so it cannot get quietly worse.
+/// The two phases must DISAGREE, or the loop above proves nothing.
 ///
-/// `ModelConfig::layer_sliding_window` implements only llama.cpp's
-/// `dense_first = false` phase. Handing it a dense-first architecture's
-/// period would place every full-attention layer one index off: for a
-/// 32-layer period-4 `smallthinker` that is 16 layers attending over the
-/// wrong span, against 8 for ferrox's current every-layer-windowed
-/// behaviour. So `default_swa_pattern` returns `None` for these four on
-/// purpose, and `default_swa_layout` keeps the real value for the day
-/// `ModelConfig` can carry `dense_first`.
-///
-/// The assertion below is deliberately two-sided: it fails if someone
-/// "completes" the table by letting the period through, and it fails if
-/// someone deletes the entry from `default_swa_layout`.
+/// `layer_sliding_window` used to implement only `dense_first = false`,
+/// which put `smallthinker` and `laguna` -- both live on the generic GQA
+/// path -- on every-layer-windowed instead. This pins the cost of that:
+/// on a 32-layer period-4 model the two phases disagree about SIXTEEN
+/// layers, so a single shared implementation cannot be right for both.
 #[test]
-fn dense_first_architectures_are_not_handed_a_period_the_decoder_would_misplace() {
+fn the_two_phases_are_not_the_same_answer() {
     const WINDOW: usize = 128;
     let mut dense_first_seen = 0usize;
     for &(arch, period, dense_first, cite) in LLAMA_SWA_DEFAULTS {
+        assert_eq!(
+            default_swa_layout(arch).map(|p| (p.period, p.dense_first)),
+            Some((period, dense_first)),
+            "{arch} ({cite}) lost its transcribed layout"
+        );
         if !dense_first {
-            assert_eq!(
-                default_swa_pattern(arch),
-                Some(period),
-                "{arch} ({cite}) is dense_first=false and must reach the decoder"
-            );
             continue;
         }
         dense_first_seen += 1;
-        assert_eq!(
-            default_swa_layout(arch).map(|p| p.period),
-            Some(period),
-            "{arch} ({cite}) lost its transcribed period"
-        );
-        assert_eq!(
-            default_swa_pattern(arch),
-            None,
-            "{arch} ({cite}) is dense_first=true: `layer_sliding_window` cannot express \
-             that phase, so handing it the bare period would put the full-attention \
-             layers on `(il + 1) % {period} == 0` instead of `il % {period} == 0`"
-        );
 
-        // And show what the wrong answer would actually cost, so the
-        // comment above is not the only record of it.
         let mut cfg = test_dense_fixture();
         cfg.n_layers = 32;
         cfg.sliding_window = Some(WINDOW);
         cfg.swa_pattern = Some(period);
-        let misplaced = (0..cfg.n_layers)
+        cfg.swa_dense_first = true;
+        let differs = (0..cfg.n_layers)
             .filter(|&il| {
-                cfg.layer_sliding_window(il).is_some() != llama_layer_is_swa(il, period, true)
+                cfg.layer_sliding_window(il).is_some() != llama_layer_is_swa(il, period, false)
             })
             .count();
         assert!(
-            misplaced > 0,
-            "{arch}: if the naive period were harmless there would be no reason to \
-             withhold it -- re-derive this test"
+            differs > 0,
+            "{arch} ({cite}): if the two phases agreed there would be nothing to carry \
+             -- re-derive this test"
         );
     }
     assert!(
@@ -262,4 +242,42 @@ fn dense_first_architectures_are_not_handed_a_period_the_decoder_would_misplace(
         "only {dense_first_seen} dense_first architectures checked; llama.cpp passes \
          dense_first=true for smallthinker, laguna, cohere2moe and modern-bert"
     );
+}
+
+/// llama.cpp's two DEGENERATE periods, which are not the same as having
+/// no period at all.
+///
+/// `set_swa_pattern(0)` windows every layer; `set_swa_pattern(1)` windows
+/// none, under either phase. ferrox filtered `pattern == 1` out of the
+/// metadata before it reached the config and fell back to the per-arch
+/// default, i.e. to alternating or to every-layer -- exactly inverted
+/// from "no layer slides". Latent, since no checkpoint here writes 1,
+/// but inverted is the wrong direction to be latent in.
+#[test]
+fn period_one_windows_nothing_and_period_zero_windows_everything() {
+    const WINDOW: usize = 128;
+    for dense_first in [false, true] {
+        let mut cfg = test_dense_fixture();
+        cfg.n_layers = 8;
+        cfg.sliding_window = Some(WINDOW);
+        cfg.swa_dense_first = dense_first;
+
+        cfg.swa_pattern = Some(1);
+        for il in 0..cfg.n_layers {
+            assert_eq!(
+                cfg.layer_sliding_window(il),
+                None,
+                "period 1 (dense_first={dense_first}) must window no layer, llama-hparams.cpp:8-22"
+            );
+        }
+
+        cfg.swa_pattern = Some(0);
+        for il in 0..cfg.n_layers {
+            assert_eq!(
+                cfg.layer_sliding_window(il),
+                Some(WINDOW),
+                "period 0 (dense_first={dense_first}) must window every layer"
+            );
+        }
+    }
 }

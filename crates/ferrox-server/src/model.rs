@@ -304,29 +304,18 @@ pub enum LoadedModel {
     Glm52(Glm52Loaded),
 }
 
+/// The GLM families that really do need the MLA loader.
+///
+/// `glm4moe` was here and must not be: GLM-4.5 / 4.5-Air / 4.6 all tag
+/// it, and none carries the four MLA hyper-parameters
+/// `read_glm52_hparams` demands, because `src/models/glm4-moe.cpp`
+/// builds plain Q/K/V and never reads them. Routing it here answered a
+/// real download with "missing hparam glm4moe.attention.q_lora_rank" --
+/// true, and about a key the architecture is not supposed to have.
+/// Refusing on the generic path names the norm slot that is genuinely
+/// missing instead. See `ferrox-models/tests/glm4moe_refusal.rs`.
 fn is_glm52_arch(arch: &str) -> bool {
-    matches!(arch, "glm-dsa" | "glm4" | "glm4moe")
-}
-
-/// Loads one checkpoint by path, with no reference to the environment.
-///
-/// Split out of [`load`] for `/admin/models/load`: the admin surface
-/// has already resolved an id to a path it discovered itself, so
-/// re-reading `FERROX_MODEL_PATH` there would load the *startup* model
-/// no matter which one the user picked. A directory is a Kimi K3
-/// checkpoint and a file is a GGUF, exactly as at startup -- see the
-/// module docs.
-///
-/// Blocking and CPU-bound (it mmaps, and for a Kimi checkpoint touches
-/// every expert range). Callers on the Tokio runtime must put it on
-/// `spawn_blocking`.
-pub fn load_from_path(path: &str) -> anyhow::Result<LoadedModel> {
-    let path = ferrox_models::hf_pull::resolve_model_path(path)?;
-    if Path::new(&path).is_dir() {
-        load_real_kimi_checkpoint(&path).map(LoadedModel::Kimi)
-    } else {
-        load_gguf_file(&path)
-    }
+    matches!(arch, "glm-dsa" | "glm4")
 }
 
 pub fn load() -> anyhow::Result<LoadedModel> {
@@ -755,4 +744,37 @@ fn build_synthetic_decoder(preset: &str) -> anyhow::Result<Decoder> {
     cfg.moe.expert_ffn_dim = 16;
 
     Ok(Decoder::new_random_small(cfg, 2, 256))
+}
+
+/// Loads one checkpoint by path, with no reference to the environment.
+///
+/// Split out of [`load`] for `/admin/models/load`: the admin surface
+/// has already resolved an id to a path it discovered itself, so
+/// re-reading `FERROX_MODEL_PATH` there would load the *startup* model
+/// no matter which one the user picked. A directory is a Kimi K3
+/// checkpoint and a file is a GGUF, exactly as at startup -- see the
+/// module docs.
+///
+/// Blocking and CPU-bound (it mmaps, and for a Kimi checkpoint touches
+/// every expert range). Callers on the Tokio runtime must put it on
+/// `spawn_blocking`.
+pub fn load_from_path(path: &str) -> anyhow::Result<LoadedModel> {
+    let path = ferrox_models::hf_pull::resolve_model_path(path)?;
+    if Path::new(&path).is_dir() {
+        load_real_kimi_checkpoint(&path).map(LoadedModel::Kimi)
+    } else {
+        load_gguf_file(&path)
+    }
+}
+
+#[cfg(test)]
+mod glm_dispatch_tests {
+    /// A wrong reason is worse than a refusal, because it sends the
+    /// reader after a key that does not exist.
+    #[test]
+    fn glm4moe_does_not_go_to_the_mla_loader() {
+        assert!(!super::is_glm52_arch("glm4moe"));
+        assert!(super::is_glm52_arch("glm-dsa"));
+        assert!(super::is_glm52_arch("glm4"));
+    }
 }

@@ -759,7 +759,16 @@ pub fn run_infer(args: InferArgs) -> anyhow::Result<()> {
     ) {
         return run_gemma4_infer(args, path, &file);
     }
-    if matches!(arch_early.as_str(), "glm-dsa" | "glm4" | "glm4moe") {
+    // `glm4moe` is NOT here, and its absence is the fix. GLM-4.5,
+    // GLM-4.5-Air and GLM-4.6 all tag `glm4moe`, and none of them is an
+    // MLA model: `src/models/glm4-moe.cpp` reads no `q_lora_rank` and
+    // builds plain Q/K/V. Sending them here made a real GLM-4.5-Air
+    // download fail with "missing hparam glm4moe.attention.q_lora_rank",
+    // a true statement about a key the architecture is not supposed to
+    // have. It now reaches the generic path and refuses there, naming
+    // the one thing that is actually missing -- the norm slot.
+    // See `crates/ferrox-models/tests/glm4moe_refusal.rs`.
+    if matches!(arch_early.as_str(), "glm-dsa" | "glm4") {
         return run_glm52_infer(args, path, &file);
     }
 

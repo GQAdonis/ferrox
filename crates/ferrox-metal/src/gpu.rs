@@ -6197,6 +6197,36 @@ pub(crate) fn encode_q4_0_moe_id(
     Ok(())
 }
 
+/// Whether the fused `mul_mm_id` path can run this pack.
+///
+/// TWO conditions, and only the first used to be checked.
+///
+/// 1. Some expert has gathered at least [`MOE_MM_ID_TOKEN_MIN`] tokens
+///    (llama `ne21_mm_id_min`). Below that, a host loop over 64 sparse
+///    experts is slower than slot-parallel `mul_mv_id` -- OLMoE
+///    fair-chat regressed ~143 to 84 prompt/s when this was ignored.
+/// 2. `mul_mm_id_meta` has a kernel for all three planes. It knows
+///    Q4_0, Q8_0 and Q4_K, and NOTHING ELSE.
+///
+/// The second was missing, and the loader does not agree with it: the
+/// packed planes admit Q5_0, Q5_K, Q6_K and IQ4_XS as well, because
+/// `mapped_sg` gates on `mul_mm_sg_meta`, which covers all seven. So a
+/// Q6_K MoE checkpoint packed fine, ran fine while every expert stayed
+/// under eight tokens, and then failed with a bare
+/// `MetalError::CommandFailed` the moment one expert gathered eight --
+/// a prompt-length-dependent failure with nothing in it naming the
+/// quantization.
+///
+/// Falling back to `mul_mv_id` is the right answer rather than a
+/// refusal: that path handles all seven kinds and is merely slower, so
+/// the checkpoint runs.
+fn moe_use_mm_id(max_batch: usize, gate_kind: &str, up_kind: &str, down_kind: &str) -> bool {
+    max_batch >= MOE_MM_ID_TOKEN_MIN
+        && mul_mm_id_meta(gate_kind).is_some()
+        && mul_mm_id_meta(up_kind).is_some()
+        && mul_mm_id_meta(down_kind).is_some()
+}
+
 /// Prefill MoE FFN: packed-id experts over `n_tokens` positions in one CB.
 /// `x_batch` is `[T, H]`, `ids`/`route` are `[T, top_k]` (host-routed).
 ///
@@ -6223,10 +6253,12 @@ pub fn launch_moe_prefill_q4_0(
     let hidden = packed.hidden_rows;
     let ffn = packed.ffn_rows;
     let (per_expert, max_batch) = moe_mm_id_map0(ids, n_tokens, top_k, packed.n_experts);
-    // llama `ne21_mm_id_min = 32`: only when some expert has enough
-    // gathered tokens. A host loop over 64 sparse experts is slower than
-    // slot-parallel `mul_mv_id` (OLMoE fair-chat regress ~143→84 prompt/s).
-    let use_mm_id = max_batch >= MOE_MM_ID_TOKEN_MIN;
+    let use_mm_id = moe_use_mm_id(
+        max_batch,
+        packed.gate_kind,
+        packed.up_kind,
+        packed.down_kind,
+    );
 
     let x_buf = unsafe {
         device.newBufferWithBytes_length_options(
@@ -7101,6 +7133,43 @@ pub fn launch_matvec_batch(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The loader packs seven quant kinds into MoE planes; `mul_mm_id`
+    /// has kernels for three. Batch size alone used to decide, so the
+    /// other four failed with `CommandFailed` as soon as one expert
+    /// gathered eight tokens -- and stayed fine below that, which is
+    /// what made it a prompt-length-dependent failure rather than a
+    /// load error.
+    #[test]
+    fn a_pack_without_a_mul_mm_id_kernel_falls_back_instead_of_failing() {
+        let big = MOE_MM_ID_TOKEN_MIN;
+        for kind in ["Q4_0", "Q8_0", "Q4_K"] {
+            assert!(
+                moe_use_mm_id(big, kind, kind, kind),
+                "{kind} has a mul_mm_id kernel and should use it"
+            );
+        }
+        // Every kind `mapped_sg` admits that `mul_mm_id_meta` does not
+        // know. These are the four that used to crash.
+        for kind in ["Q5_0", "Q5_K", "Q6_K", "IQ4_XS"] {
+            assert!(
+                !moe_use_mm_id(big, kind, kind, kind),
+                "{kind} has no mul_mm_id kernel and must fall back to mul_mv_id"
+            );
+        }
+        // A pack is only as fused as its weakest plane: one unsupported
+        // kind is enough, whichever of the three it is.
+        assert!(!moe_use_mm_id(big, "Q6_K", "Q4_0", "Q4_0"));
+        assert!(!moe_use_mm_id(big, "Q4_0", "Q6_K", "Q4_0"));
+        assert!(!moe_use_mm_id(big, "Q4_0", "Q4_0", "Q6_K"));
+        // The batch-size rule still applies to a supported pack.
+        assert!(!moe_use_mm_id(
+            MOE_MM_ID_TOKEN_MIN - 1,
+            "Q4_0",
+            "Q4_0",
+            "Q4_0"
+        ));
+    }
 
     fn real_q8_0_test_matrix(rows: usize, cols: usize) -> (Vec<u8>, Vec<f32>, Vec<f32>) {
         let x: Vec<f32> = (0..cols).map(|i| (i as f32 * 0.037).sin()).collect();

@@ -1030,14 +1030,9 @@ impl Decoder {
                 config.ffn_activation,
                 crate::config::FfnActivation::Swiglu | crate::config::FfnActivation::SwigluFused
             )
-            || !matches!(config.moe.gating, ferrox_moe::GatingFunction::Softmax)
-            || config.moe.expert_group_count.is_some()
-            // The GPU router kernels take router weights and nothing
-            // else: no `exp_probs_b` input, no `expert_weights_scale`
-            // uniform. A layer carrying either must stay on the CPU
-            // router rather than be routed without them.
-            || layer.moe.exp_probs_bias.is_some()
-            || config.moe.expert_weights_scale != 1.0
+            // See `gpu_router_matches_host_routing`: the GPU router
+            // takes router weights and nothing else.
+            || !Self::gpu_router_matches_host_routing(layer, config)
         {
             return None;
         }
@@ -1194,13 +1189,49 @@ impl Decoder {
         Some(h_out)
     }
 
+    /// True when a plain top-k softmax over the raw router logits picks
+    /// the SAME experts with the SAME weights that
+    /// [`Self::route_for_layer`] would.
+    ///
+    /// Every Metal MoE path either routes on the GPU (which implements
+    /// exactly that plain top-k and takes no other input) or, in
+    /// `launch_moe_decode_pre`'s case, used to re-implement it on the
+    /// host. `route_for_layer` has three arms this does not: grouped
+    /// routing, a per-expert router bias (`exp_probs_bias`), and
+    /// `expert_weights_scale`. A checkpoint carrying any of them routes
+    /// to DIFFERENT experts with DIFFERENT weights depending on which
+    /// backend served the token -- not an error, a different model.
+    ///
+    /// One predicate rather than the four hand-copied `.is_none()` lists
+    /// this used to be, because those lists had already drifted three
+    /// ways: the prefill sites checked all three conditions, the fused
+    /// decode layer checked two of them, and the whole-stack decode
+    /// checked none. Mirror `route_for_layer` arm for arm when either
+    /// changes.
+    // Read by the three Metal MoE eligibility predicates, and by
+    // `the_gpu_router_predicate_admits_only_routing_it_reproduces`. A
+    // CPU-only build has no Metal path to gate, so it is dead there.
+    #[cfg_attr(not(feature = "metal"), allow(dead_code))]
+    fn gpu_router_matches_host_routing(layer: &LayerWeights, config: &ModelConfig) -> bool {
+        matches!(config.moe.gating, ferrox_moe::GatingFunction::Softmax)
+            // Conservative on purpose: `route_for_layer` only takes its
+            // grouped arm for `n_groups > 1`, but a checkpoint that
+            // declares the key at all is one this kernel was never
+            // checked against.
+            && config.moe.expert_group_count.is_none()
+            && layer.moe.exp_probs_bias.is_none()
+            && config.moe.expert_weights_scale == 1.0
+    }
+
     /// MoE layer eligible for resident Metal decode (attn+router+experts
     /// without host residual ping-pong). Requires SwiGLU, no shared
-    /// experts, Resident expert backing, and Metal router/QKV/O.
+    /// experts, Resident expert backing, Metal router/QKV/O, and a
+    /// routing decision the GPU router reproduces exactly.
     #[cfg(feature = "metal")]
     fn layer_supports_metal_moe_resident(layer: &LayerWeights, config: &ModelConfig) -> bool {
         !Self::is_dense_layer(layer)
             && layer.moe.shared_experts.is_empty()
+            && Self::gpu_router_matches_host_routing(layer, config)
             && matches!(
                 config.ffn_activation,
                 crate::config::FfnActivation::Swiglu | crate::config::FfnActivation::SwigluFused
@@ -1368,14 +1399,10 @@ impl Decoder {
                 config.ffn_activation,
                 crate::config::FfnActivation::Swiglu | crate::config::FfnActivation::SwigluFused
             )
-            || !matches!(config.moe.gating, ferrox_moe::GatingFunction::Softmax)
-            || config.moe.expert_group_count.is_some()
             // The GPU router kernels take router weights and nothing
             // else: no `exp_probs_b` input, no `expert_weights_scale`
-            // uniform. A layer carrying either must stay on the CPU
-            // router rather than be routed without them.
-            || layer.moe.exp_probs_bias.is_some()
-            || config.moe.expert_weights_scale != 1.0
+            // uniform, no groups. See `gpu_router_matches_host_routing`.
+            || !Self::gpu_router_matches_host_routing(layer, config)
         {
             return None;
         }
@@ -1848,7 +1875,6 @@ impl Decoder {
         // OLMoE: all MoE layers in one CB (llama graph style).
         #[cfg(feature = "metal")]
         if use_metal_attn
-            && matches!(self.config.moe.gating, ferrox_moe::GatingFunction::Softmax)
             && self.layers.iter().enumerate().all(|(i, l)| {
                 // Both halves are required. `layer_supports_metal_moe_resident`
                 // answers "is this an MoE layer the GPU router can serve",
@@ -2313,20 +2339,12 @@ impl Decoder {
                                                 // has no `exp_probs_b` /
                                                 // `expert_weights_scale`
                                                 // input either.
-                                                let fused_ok = matches!(
-                                                    self.config.moe.gating,
-                                                    ferrox_moe::GatingFunction::Softmax
-                                                ) && layer
-                                                    .moe
-                                                    .exp_probs_bias
-                                                    .is_none()
-                                                    && self.config.moe.expert_weights_scale == 1.0
-                                                    && match &layer.moe.experts {
-                                                        ExpertBacking::Resident(_) => {
-                                                            if let Some(packed) =
-                                                                Self::moe_packed_q4(&layer.moe)
-                                                            {
-                                                                match ferrox_metal::attn::launch_moe_decode_layer_fused(
+                                                let fused_ok = match &layer.moe.experts {
+                                                    ExpertBacking::Resident(_) => {
+                                                        if let Some(packed) =
+                                                            Self::moe_packed_q4(&layer.moe)
+                                                        {
+                                                            match ferrox_metal::attn::launch_moe_decode_layer_fused(
                                                                 &layer.attn.norm_weight,
                                                                 &q_l,
                                                                 &k_l,
@@ -2359,12 +2377,12 @@ impl Decoder {
                                                                     false
                                                                 }
                                                             }
-                                                            } else {
-                                                                false
-                                                            }
+                                                        } else {
+                                                            false
                                                         }
-                                                        _ => false,
-                                                    };
+                                                    }
+                                                    _ => false,
+                                                };
 
                                                 if !fused_ok {
                                                     match ferrox_metal::attn::launch_moe_decode_pre(
@@ -2385,11 +2403,14 @@ impl Decoder {
                                                         &self.metal_attn_extras(layer),
                                                     ) {
                                                         Ok(logits) => {
-                                                            let decision = route_top_k(
+                                                            // Routing happens HERE, on the host,
+                                                            // so there is no kernel limitation to
+                                                            // excuse a second router: call the
+                                                            // one every other host path calls.
+                                                            let decision = Self::route_for_layer(
+                                                                layer,
                                                                 &logits,
-                                                                self.config.moe.n_experts_active,
-                                                                self.config.moe.gating,
-                                                                self.config.moe.norm_topk_prob,
+                                                                &self.config,
                                                             );
                                                             layer.moe.record_activations(
                                                                 &decision.expert_ids,
@@ -6110,6 +6131,115 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The predicate that decides whether a MoE layer may be routed by
+    /// the GPU must admit ONLY the routing the GPU actually computes.
+    ///
+    /// Every Metal MoE path -- `launch_moe_decode_stack`,
+    /// `launch_moe_decode_layer_fused`, `launch_moe_prefill_q4_0` and
+    /// the fused prefill stack -- routes with a plain top-k softmax over
+    /// the raw router logits. `Decoder::route_for_layer` has three more
+    /// arms: grouped routing, a per-expert router bias, and
+    /// `expert_weights_scale`. The audit found those four call sites
+    /// disagreeing about which of the three to refuse -- prefill checked
+    /// all three, the fused decode layer checked two, the whole-stack
+    /// decode checked none -- so a Softmax-gated MoE checkpoint carrying
+    /// a router bias would have routed to different experts on Metal
+    /// than on CPU, with no error.
+    ///
+    /// This asserts the invariant directly rather than the predicate's
+    /// spelling: whenever it says yes, plain `route_top_k` and
+    /// `route_for_layer` must return the same decision; and each of the
+    /// three features on its own must make it say no.
+    #[test]
+    fn the_gpu_router_predicate_admits_only_routing_it_reproduces() {
+        // `tiny_test_config` is GLM-shaped and so gates with sigmoid;
+        // the GPU router implements softmax, so start from the case the
+        // predicate is supposed to ADMIT.
+        let mut base = tiny_test_config();
+        base.moe.gating = ferrox_moe::GatingFunction::Softmax;
+        let decoder = Decoder::new_random_small(base.clone(), 2, 8);
+        let plain_layer = &decoder.layers[0];
+        let n_experts = base.moe.n_experts;
+        // Chosen so each feature really bites: the top two experts sit
+        // in DIFFERENT groups of two (so grouped routing must reorder
+        // them), and the runners-up are close enough behind that a
+        // per-expert bias flips the order.
+        assert_eq!(n_experts, 6, "the logits below are written for six experts");
+        let logits: Vec<f32> = vec![0.90, 0.10, 0.20, 0.85, 0.30, 0.05];
+
+        let agrees = |layer: &LayerWeights, cfg: &ModelConfig| -> bool {
+            let host = Decoder::route_for_layer(layer, &logits, cfg);
+            let gpu = route_top_k(
+                &logits,
+                cfg.moe.n_experts_active,
+                cfg.moe.gating,
+                cfg.moe.norm_topk_prob,
+            );
+            host.expert_ids == gpu.expert_ids
+                && host.weights.len() == gpu.weights.len()
+                && host
+                    .weights
+                    .iter()
+                    .zip(gpu.weights.iter())
+                    .all(|(a, b)| a.to_bits() == b.to_bits())
+        };
+
+        // The admitted case: the predicate says yes, and the two
+        // routers really do agree.
+        assert!(
+            Decoder::gpu_router_matches_host_routing(plain_layer, &base),
+            "a plain softmax MoE layer must stay eligible, or this test proves nothing"
+        );
+        assert!(agrees(plain_layer, &base));
+
+        // A per-expert router bias.
+        let mut biased_decoder = Decoder::new_random_small(base.clone(), 2, 8);
+        biased_decoder.layers[0].moe.exp_probs_bias =
+            Some((0..n_experts).map(|e| 0.9 - 0.4 * e as f32).collect());
+        let biased_layer = &biased_decoder.layers[0];
+        assert!(
+            !Decoder::gpu_router_matches_host_routing(biased_layer, &base),
+            "exp_probs_bias must make the layer ineligible for the GPU router"
+        );
+        assert!(
+            !agrees(biased_layer, &base),
+            "the bias must actually change the routing, or the check above is vacuous"
+        );
+
+        // `expert_weights_scale`.
+        let mut scaled = base.clone();
+        scaled.moe.expert_weights_scale = 2.5;
+        assert!(
+            !Decoder::gpu_router_matches_host_routing(plain_layer, &scaled),
+            "expert_weights_scale must make the layer ineligible for the GPU router"
+        );
+        assert!(
+            !agrees(plain_layer, &scaled),
+            "the scale must actually change the routing, or the check above is vacuous"
+        );
+
+        // Grouped routing.
+        let mut grouped = base.clone();
+        grouped.moe.expert_group_count = Some(3);
+        grouped.moe.expert_group_used_count = Some(1);
+        assert!(
+            !Decoder::gpu_router_matches_host_routing(plain_layer, &grouped),
+            "grouped routing must make the layer ineligible for the GPU router"
+        );
+        assert!(
+            !agrees(plain_layer, &grouped),
+            "the grouping must actually change the routing, or the check above is vacuous"
+        );
+
+        // A non-softmax gate: the GPU kernel implements softmax only.
+        let mut sigmoid = base;
+        sigmoid.moe.gating = ferrox_moe::GatingFunction::Sigmoid;
+        assert!(
+            !Decoder::gpu_router_matches_host_routing(plain_layer, &sigmoid),
+            "a non-softmax gate must make the layer ineligible for the GPU router"
+        );
     }
 
     /// OLMoE-style QK-norm (`attn_q_norm`/`attn_k_norm`, see `AttnWeights`'

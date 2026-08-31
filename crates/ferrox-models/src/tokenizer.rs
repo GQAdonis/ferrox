@@ -433,10 +433,42 @@ fn load_special_tokens(
                 ferrox_gguf::GgufValue::U32(t) => *t as i64,
                 _ => return None,
             };
-            (ty == GGML_TOKEN_TYPE_CONTROL || ty == GGML_TOKEN_TYPE_USER_DEFINED)
-                .then(|| (text.clone(), id as u32))
+            // A checkpoint that flags its markers is the easy case.
+            //
+            // Not every one does. Yi-1.5-6B-Chat lists `<|im_start|>`
+            // (id 6) and `<|im_end|>` (id 7) as NORMAL, so this filter
+            // dropped them, the splitter never saw them, and
+            // `<|im_end|>` tokenized as SIX ordinary BPE pieces instead
+            // of the single token the model was trained on. Its prompt
+            // was malformed and its turn marker could not be matched by
+            // id, so nothing stopped and the marker came back as text
+            // mid-answer.
+            //
+            // So a token that LOOKS like a marker and exists verbatim in
+            // the vocabulary is treated as one whatever its type says.
+            // The shape test is what keeps this narrow: ordinary words
+            // are in the vocabulary too, and promoting those would split
+            // real text.
+            (ty == GGML_TOKEN_TYPE_CONTROL
+                || ty == GGML_TOKEN_TYPE_USER_DEFINED
+                || looks_like_marker(text))
+            .then(|| (text.clone(), id as u32))
         })
         .collect()
+}
+
+/// Is this vocabulary entry shaped like a special marker?
+///
+/// Deliberately strict: `<|...|>` and `<...>` with no whitespace, at
+/// least three characters. That covers `<|im_end|>`, `<|endoftext|>`,
+/// `<end_of_turn>` and `</s>` while excluding ordinary text, which also
+/// lives in the vocabulary and must keep tokenizing normally.
+fn looks_like_marker(text: &str) -> bool {
+    let t = text.trim();
+    if t.len() < 3 || t.contains(char::is_whitespace) {
+        return false;
+    }
+    (t.starts_with("<|") && t.ends_with("|>")) || (t.starts_with('<') && t.ends_with('>'))
 }
 
 /// One chunk of `split_on_special_tokens`'s output: either a raw text

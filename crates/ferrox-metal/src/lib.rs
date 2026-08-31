@@ -24,6 +24,9 @@ pub mod attn;
 mod mem_ranges;
 
 #[cfg(feature = "metal")]
+mod moe_ids;
+
+#[cfg(feature = "metal")]
 pub use mem_ranges::{metal_barrier_stats, metal_barrier_stats_reset};
 
 #[cfg(feature = "metal")]

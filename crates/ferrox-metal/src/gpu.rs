@@ -51,6 +51,7 @@
 //! single-use access -- exactly matching what `launch_matvec` already
 //! does (a fresh command buffer/encoder every call, never stored).
 
+use crate::moe_ids::IdsBinding;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_foundation::NSString;
@@ -3500,7 +3501,7 @@ pub(crate) fn encode_moe_topk_softmax_batch(
     enc: &ProtocolObject<dyn MTLComputeCommandEncoder>,
     device: &Retained<ProtocolObject<dyn MTLDevice>>,
     logits: &ProtocolObject<dyn MTLBuffer>,
-    ids: &ProtocolObject<dyn MTLBuffer>,
+    ids: IdsBinding<'_>,
     weights: &ProtocolObject<dyn MTLBuffer>,
     n: u32,
     k: u32,
@@ -3511,7 +3512,7 @@ pub(crate) fn encode_moe_topk_softmax_batch(
     enc.setComputePipelineState(&pipe.0);
     unsafe {
         enc.setBuffer_offset_atIndex(Some(logits), 0, 0);
-        enc.setBuffer_offset_atIndex(Some(ids), 0, 1);
+        enc.setBuffer_offset_atIndex(Some(ids.buf), ids.offset, 1);
         enc.setBuffer_offset_atIndex(Some(weights), 0, 2);
         for (idx, mut v) in [
             (3usize, n),
@@ -3614,7 +3615,7 @@ pub(crate) fn encode_moe_prefill_ffn(
             enc,
             device,
             logits,
-            route_ids,
+            IdsBinding::whole(route_ids),
             route_w,
             n_experts as u32,
             top_k as u32,
@@ -5603,7 +5604,7 @@ fn encode_moe_matvec_id(
     w: &ResidentWeightBuffer,
     x_buf: &ProtocolObject<dyn MTLBuffer>,
     out: &ProtocolObject<dyn MTLBuffer>,
-    ids: &ProtocolObject<dyn MTLBuffer>,
+    ids: IdsBinding<'_>,
     row_bytes: u32,
     n_blocks: u32,
     n_rows: u32,
@@ -5620,7 +5621,7 @@ fn encode_moe_matvec_id(
         encoder.setBuffer_offset_atIndex(Some(&w.buffer), w.weight_offset, 0);
         encoder.setBuffer_offset_atIndex(Some(x_buf), 0, 1);
         encoder.setBuffer_offset_atIndex(Some(out), 0, 2);
-        encoder.setBuffer_offset_atIndex(Some(ids), 0, 3);
+        encoder.setBuffer_offset_atIndex(Some(ids.buf), ids.offset, 3);
         let mut rb = row_bytes;
         encoder.setBytes_length_atIndex(NonNull::new(&mut rb as *mut u32 as *mut _).unwrap(), 4, 4);
         let mut blocks = n_blocks;
@@ -5678,7 +5679,7 @@ fn encode_moe_down_id(
     down_w: &ResidentWeightBuffer,
     act_buf: &ProtocolObject<dyn MTLBuffer>,
     expert_out_buf: &ProtocolObject<dyn MTLBuffer>,
-    ids: &ProtocolObject<dyn MTLBuffer>,
+    ids: IdsBinding<'_>,
     row_bytes: u32,
     n_blocks: u32,
     hidden_rows: u32,
@@ -5695,7 +5696,7 @@ fn encode_moe_down_id(
         encoder.setBuffer_offset_atIndex(Some(&down_w.buffer), down_w.weight_offset, 0);
         encoder.setBuffer_offset_atIndex(Some(act_buf), 0, 1);
         encoder.setBuffer_offset_atIndex(Some(expert_out_buf), 0, 2);
-        encoder.setBuffer_offset_atIndex(Some(ids), 0, 3);
+        encoder.setBuffer_offset_atIndex(Some(ids.buf), ids.offset, 3);
         let mut rb = row_bytes;
         encoder.setBytes_length_atIndex(NonNull::new(&mut rb as *mut u32 as *mut _).unwrap(), 4, 4);
         let mut blocks = n_blocks;
@@ -5997,7 +5998,7 @@ pub(crate) fn encode_q4_0_moe_gate_up_id(
     device: &Retained<ProtocolObject<dyn MTLDevice>>,
     x_buf: &ProtocolObject<dyn MTLBuffer>,
     packed: &MoePackedQ4<'_>,
-    ids: &ProtocolObject<dyn MTLBuffer>,
+    ids: IdsBinding<'_>,
     gate_buf: &ProtocolObject<dyn MTLBuffer>,
     up_buf: &ProtocolObject<dyn MTLBuffer>,
     top_k: u32,
@@ -6061,7 +6062,7 @@ pub(crate) fn encode_q4_0_moe_id(
     device: &Retained<ProtocolObject<dyn MTLDevice>>,
     x_buf: &ProtocolObject<dyn MTLBuffer>,
     packed: &MoePackedQ4<'_>,
-    ids: &ProtocolObject<dyn MTLBuffer>,
+    ids: IdsBinding<'_>,
     route: &ProtocolObject<dyn MTLBuffer>,
     gate_buf: &ProtocolObject<dyn MTLBuffer>,
     up_buf: &ProtocolObject<dyn MTLBuffer>,
@@ -6430,7 +6431,7 @@ pub fn launch_moe_prefill_q4_0(
                 device,
                 &x_buf,
                 packed,
-                &ids_buf,
+                IdsBinding::whole(&ids_buf),
                 &route_buf,
                 gate_buf,
                 up_buf,

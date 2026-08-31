@@ -64,6 +64,7 @@ use crate::gpu::{
     ResidentF32Buffer, ResidentWeightBuffer,
 };
 use crate::mem_ranges::MemRanges;
+use crate::moe_ids::MoeIdsLog;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{
@@ -4316,7 +4317,10 @@ struct MoeDecodeScratch {
     attn: Retained<ProtocolObject<dyn MTLBuffer>>,
     o: Retained<ProtocolObject<dyn MTLBuffer>>,
     router: Retained<ProtocolObject<dyn MTLBuffer>>,
-    ids: Retained<ProtocolObject<dyn MTLBuffer>>,
+    /// One routed-expert id slot per stack layer, so every layer's
+    /// selection survives the single-command-buffer fold instead of being
+    /// overwritten by the next layer (see [`crate::moe_ids`]).
+    ids: MoeIdsLog,
     route: Retained<ProtocolObject<dyn MTLBuffer>>,
     /// Pre-SiLU gate projection (unfused MoE matvec_id).
     gate: Retained<ProtocolObject<dyn MTLBuffer>>,
@@ -4368,7 +4372,7 @@ pub fn moe_decode_ensure(hidden_dim: usize) -> Result<(), MetalError> {
                 attn: alloc_f32_buffer(device, q_rows)?,
                 o: alloc_f32_buffer(device, hidden_dim)?,
                 router: alloc_f32_buffer(device, n_router)?,
-                ids: alloc_u32_buffer(device, top_k_cap)?,
+                ids: MoeIdsLog::new(device, top_k_cap, 1)?,
                 route: alloc_f32_buffer(device, top_k_cap)?,
                 gate: alloc_f32_buffer(device, top_k_cap * ffn_rows)?,
                 up: alloc_f32_buffer(device, top_k_cap * ffn_rows)?,
@@ -4448,7 +4452,6 @@ fn moe_scratch_ensure_caps(
         scratch.up = alloc_f32_buffer(device, tk * fk)?;
         scratch.act = alloc_f32_buffer(device, tk * fk)?;
         scratch.expert_out = alloc_f32_buffer(device, tk * scratch.hidden_dim)?;
-        scratch.ids = alloc_u32_buffer(device, tk)?;
         scratch.route = alloc_f32_buffer(device, tk)?;
         scratch.ffn_rows = fk;
         scratch.top_k_cap = tk;
@@ -5046,7 +5049,7 @@ fn encode_moe_layer_fused(
     }
     {
         let srcs = [scratch.router.as_ref()];
-        let dsts = [scratch.ids.as_ref(), scratch.route.as_ref()];
+        let dsts = [scratch.ids.buffer(), scratch.route.as_ref()];
         mrs.begin_op(encoder, &srcs, &dsts);
         // One token, but the *batch* kernel: it spreads the softmax and
         // each of the k selection passes over a simdgroup and keeps `probs`
@@ -5057,7 +5060,7 @@ fn encode_moe_layer_fused(
             encoder,
             device,
             &scratch.router,
-            &scratch.ids,
+            scratch.ids.binding(layer_idx),
             &scratch.route,
             layer.router.rows as u32,
             top_k as u32,
@@ -5067,7 +5070,7 @@ fn encode_moe_layer_fused(
         mrs.end_op(&srcs, &dsts);
     }
     {
-        let srcs = [scratch.x2.as_ref(), scratch.ids.as_ref()];
+        let srcs = [scratch.x2.as_ref(), scratch.ids.buffer()];
         let dsts = [scratch.gate.as_ref(), scratch.up.as_ref()];
         mrs.begin_op(encoder, &srcs, &dsts);
         encode_q4_0_moe_gate_up_id(
@@ -5075,7 +5078,7 @@ fn encode_moe_layer_fused(
             device,
             &scratch.x2,
             &layer.packed,
-            &scratch.ids,
+            scratch.ids.binding(layer_idx),
             &scratch.gate,
             &scratch.up,
             top_k as u32,
@@ -5085,7 +5088,7 @@ fn encode_moe_layer_fused(
     }
     let srcs = [
         scratch.x2.as_ref(),
-        scratch.ids.as_ref(),
+        scratch.ids.buffer(),
         scratch.route.as_ref(),
         scratch.gate.as_ref(),
         scratch.up.as_ref(),
@@ -5102,7 +5105,7 @@ fn encode_moe_layer_fused(
         device,
         &scratch.x2,
         &layer.packed,
-        &scratch.ids,
+        scratch.ids.binding(layer_idx),
         &scratch.route,
         &scratch.gate,
         &scratch.up,
@@ -5312,6 +5315,10 @@ pub fn launch_moe_decode_stack(
         let max_ffn = layers.iter().map(|l| l.packed.ffn_rows).max().unwrap();
         let max_router = layers.iter().map(|l| l.router.rows).max().unwrap();
         moe_scratch_ensure_caps(device, scratch, max_q, max_k, max_ffn, top_k, max_router)?;
+        // One id slot per layer. Grow before encoding: the harvest below
+        // reads it after the command buffer this call already waits on,
+        // so recording hotness costs no dispatch and no extra sync.
+        scratch.ids.ensure(device, top_k, layers.len())?;
         if let Some(out_l) = output {
             moe_scratch_ensure_logits(device, scratch, out_l.rows)?;
         }
@@ -5431,9 +5438,12 @@ pub fn launch_moe_decode_stack(
             kv.seq_len = pos + 1;
         }
 
-        // Skip expert-id host download on the hot path (sync tax). Hotness
-        // tracking can be re-enabled later via a side channel if needed.
-        let all_ids = vec![Vec::new(); layers.len()];
+        // Every layer's routed-expert selection, read once from the id log
+        // after the wait above (no extra sync). This is what feeds
+        // `MoeWeights::activation_counts`, and through it the expert
+        // residency/placement plan -- which ranked every expert equal at
+        // zero on Metal for as long as this returned empty vectors.
+        let all_ids = scratch.ids.harvest(layers.len(), top_k);
 
         if download_argmax {
             let ptr = scratch.argmax_idx.contents();

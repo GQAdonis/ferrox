@@ -1,0 +1,191 @@
+#!/usr/bin/env python3
+"""Generate the tiny synthetic `deepseek2` GGUF used by ferrox's MLA
+hparam-contract test.
+
+`deepseek2` is what DeepSeek-V2, V2.5, V3 and R1 all tag, so it is the
+architecture behind the largest open models people run. ferrox routes it
+to `mla_gguf_loader` / `MlaEngine`, and this fixture exists to check the
+one thing nobody had checked: that the loader asks for keys a real
+checkpoint actually carries.
+
+Every metadata key and every tensor name below is exactly what
+llama.cpp's own converter emits, transcribed from
+`.scratch/llama.cpp/conversion/deepseek.py::DeepseekV2Model.set_gguf_parameters`
+(:324-356) and `modify_tensors` (:422-427), and read back by
+`src/models/deepseek2.cpp`. In particular:
+
+  * `attention.key_length` is `kv_lora_rank + qk_rope_head_dim`, and
+    `attention.value_length` is `kv_lora_rank` (deepseek.py:333-334).
+    Those are the *compressed* MQA widths, not per-head K/V dims.
+  * the per-head dims live in `attention.key_length_mla`
+    (`qk_nope + qk_rope`) and `attention.value_length_mla` (`v_head_dim`)
+    (deepseek.py:334-335, llama-arch.cpp:253).
+  * `rope.dimension_count` is `qk_rope_head_dim` (deepseek.py:356), and
+    llama.cpp derives `qk_nope = key_length_mla - rope.dimension_count`
+    (deepseek2.cpp:80-81). There is **no** `qk_nope_head_dim` or
+    `qk_rope_head_dim` GGUF key: neither string appears in
+    `llama-arch.cpp`'s `LLM_KV_NAMES` nor anywhere in `gguf-py`. They are
+    HF `config.json` field names.
+  * because `key_length_mla` / `value_length_mla` are present,
+    `llama_hparams::is_mla()` is true and the checkpoint carries the
+    **split** `blk.N.attn_k_b` / `blk.N.attn_v_b` (deepseek2.cpp:120-122),
+    not the legacy combined `attn_kv_b`. The converter splits them at
+    conversion time (deepseek.py:426-427).
+
+No RoPE scaling is declared, which keeps llama.cpp's YaRN `mscale`
+correction at 1.0 (`attn_factor_org * ...` with `freq_scale = 1` makes
+every `logf(1/freq_scale)` term vanish, deepseek2.cpp:444-448). A fixture
+that exercises `rope_yarn_log_mul` is a separate, larger job.
+
+Usage:
+    PYTHONPATH=/path/to/llama.cpp/gguf-py \\
+        python3 scripts/make_deepseek2_fixture.py OUT.gguf
+
+That the file is a *valid* deepseek2 checkpoint was checked by running
+llama.cpp's own loader over it (`scripts/gptoss_reference_logits.cpp`
+against a real `libllama`). No golden logits are checked in: ferrox's
+MLA loader refuses this file before any graph runs — see
+`crates/ferrox-models/tests/deepseek2_mla_hparams.rs`.
+"""
+
+import sys
+
+import numpy as np
+
+import gguf
+
+ARCH = "deepseek2"
+
+N_LAYER = 2
+N_DENSE_LEAD = 1
+N_EMBD = 32
+N_HEAD = 4
+Q_LORA_RANK = 16
+KV_LORA_RANK = 12
+QK_NOPE_HEAD_DIM = 8
+QK_ROPE_HEAD_DIM = 4
+V_HEAD_DIM = 8
+N_EXPERT = 6
+N_EXPERT_USED = 2
+N_EXPERT_SHARED = 1
+N_FF = 40
+N_FF_EXP = 16
+N_VOCAB = 48
+CTX = 64
+ROPE_BASE = 10000.0
+RMS_EPS = 1e-6
+EXPERT_WEIGHTS_SCALE = 2.5
+
+# llama.cpp: n_embd_head_k_mla = qk_nope + qk_rope.
+K_MLA = QK_NOPE_HEAD_DIM + QK_ROPE_HEAD_DIM
+
+
+def main(out_path: str) -> None:
+    rng = np.random.default_rng(0xD5002)
+
+    def rnd(*shape: int) -> np.ndarray:
+        return (rng.standard_normal(shape) * 0.25).astype(np.float32)
+
+    w = gguf.GGUFWriter(out_path, ARCH)
+    w.add_name("ferrox-deepseek2-fixture")
+    w.add_block_count(N_LAYER)
+    w.add_context_length(CTX)
+    w.add_embedding_length(N_EMBD)
+    w.add_feed_forward_length(N_FF)
+    w.add_head_count(N_HEAD)
+    w.add_head_count_kv(N_HEAD)
+    w.add_layer_norm_rms_eps(RMS_EPS)
+    w.add_rope_freq_base(ROPE_BASE)
+    # deepseek.py:356 -- the ROPE half of the head, not the whole head.
+    w.add_rope_dimension_count(QK_ROPE_HEAD_DIM)
+    w.add_vocab_size(N_VOCAB)
+    w.add_leading_dense_block_count(N_DENSE_LEAD)
+    w.add_q_lora_rank(Q_LORA_RANK)
+    w.add_kv_lora_rank(KV_LORA_RANK)
+    # deepseek.py:333-334: the COMPRESSED widths.
+    w.add_key_length(KV_LORA_RANK + QK_ROPE_HEAD_DIM)
+    w.add_value_length(KV_LORA_RANK)
+    # deepseek.py:334-335: the per-head widths.
+    w.add_key_length_mla(K_MLA)
+    w.add_value_length_mla(V_HEAD_DIM)
+    w.add_expert_feed_forward_length(N_FF_EXP)
+    w.add_expert_count(N_EXPERT)
+    w.add_expert_used_count(N_EXPERT_USED)
+    w.add_expert_shared_count(N_EXPERT_SHARED)
+    w.add_expert_weights_scale(EXPERT_WEIGHTS_SCALE)
+    w.add_expert_weights_norm(True)
+    w.add_expert_gating_func(gguf.ExpertGatingFuncType.SIGMOID)
+    w.add_file_type(gguf.LlamaFileType.ALL_F32)
+
+    tokens = ["<unk>", "<s>", "</s>"] + [f"tok{i}" for i in range(3, N_VOCAB)]
+    w.add_tokenizer_model("llama")
+    w.add_token_list(tokens)
+    w.add_token_scores([0.0] * N_VOCAB)
+    types = [gguf.TokenType.CONTROL if i < 3 else gguf.TokenType.NORMAL for i in range(N_VOCAB)]
+    w.add_token_types([int(t) for t in types])
+    w.add_bos_token_id(1)
+    w.add_eos_token_id(2)
+    w.add_unk_token_id(0)
+    w.add_add_bos_token(False)
+    w.add_add_eos_token(False)
+
+    w.add_tensor("token_embd.weight", rnd(N_VOCAB, N_EMBD))
+
+    for il in range(N_LAYER):
+        p = f"blk.{il}."
+        w.add_tensor(p + "attn_norm.weight", rnd(N_EMBD))
+
+        # Q down/up projection through the LoRA rank.
+        w.add_tensor(p + "attn_q_a.weight", rnd(Q_LORA_RANK, N_EMBD))
+        w.add_tensor(p + "attn_q_a_norm.weight", rnd(Q_LORA_RANK))
+        w.add_tensor(p + "attn_q_b.weight", rnd(N_HEAD * K_MLA, Q_LORA_RANK))
+
+        # Compressed KV + the RoPE'd shared key head.
+        w.add_tensor(
+            p + "attn_kv_a_mqa.weight",
+            rnd(KV_LORA_RANK + QK_ROPE_HEAD_DIM, N_EMBD),
+        )
+        w.add_tensor(p + "attn_kv_a_norm.weight", rnd(KV_LORA_RANK))
+
+        # Split decompression, per head. ne = [qk_nope, kv_lora, n_head]
+        # and [kv_lora, v_head_dim, n_head] -> reversed for numpy.
+        w.add_tensor(
+            p + "attn_k_b.weight", rnd(N_HEAD, KV_LORA_RANK, QK_NOPE_HEAD_DIM)
+        )
+        w.add_tensor(p + "attn_v_b.weight", rnd(N_HEAD, V_HEAD_DIM, KV_LORA_RANK))
+
+        w.add_tensor(p + "attn_output.weight", rnd(N_EMBD, N_HEAD * V_HEAD_DIM))
+        w.add_tensor(p + "ffn_norm.weight", rnd(N_EMBD))
+
+        if il < N_DENSE_LEAD:
+            w.add_tensor(p + "ffn_gate.weight", rnd(N_FF, N_EMBD))
+            w.add_tensor(p + "ffn_up.weight", rnd(N_FF, N_EMBD))
+            w.add_tensor(p + "ffn_down.weight", rnd(N_EMBD, N_FF))
+            continue
+
+        w.add_tensor(p + "ffn_gate_inp.weight", rnd(N_EXPERT, N_EMBD))
+        w.add_tensor(
+            p + "exp_probs_b.bias",
+            (rng.standard_normal(N_EXPERT) * 0.6).astype(np.float32),
+        )
+        w.add_tensor(p + "ffn_gate_exps.weight", rnd(N_EXPERT, N_FF_EXP, N_EMBD))
+        w.add_tensor(p + "ffn_up_exps.weight", rnd(N_EXPERT, N_FF_EXP, N_EMBD))
+        w.add_tensor(p + "ffn_down_exps.weight", rnd(N_EXPERT, N_EMBD, N_FF_EXP))
+
+        n_ff_sh = N_FF_EXP * N_EXPERT_SHARED
+        w.add_tensor(p + "ffn_gate_shexp.weight", rnd(n_ff_sh, N_EMBD))
+        w.add_tensor(p + "ffn_up_shexp.weight", rnd(n_ff_sh, N_EMBD))
+        w.add_tensor(p + "ffn_down_shexp.weight", rnd(N_EMBD, n_ff_sh))
+
+    w.add_tensor("output_norm.weight", rnd(N_EMBD))
+    w.add_tensor("output.weight", rnd(N_VOCAB, N_EMBD))
+
+    w.write_header_to_file()
+    w.write_kv_data_to_file()
+    w.write_tensors_to_file()
+    w.close()
+    print(f"wrote {out_path}")
+
+
+if __name__ == "__main__":
+    main(sys.argv[1] if len(sys.argv) > 1 else "deepseek2-fixture.gguf")

@@ -72,10 +72,48 @@ pub fn read_deepseek2_hparams(file: &impl TensorSource) -> Result<Deepseek2Hpara
     let n_heads = meta_u64(file, &p("attention.head_count"))? as usize;
     let q_lora_rank = meta_u64(file, &p("attention.q_lora_rank"))? as usize;
     let kv_lora_rank = meta_u64(file, &p("attention.kv_lora_rank"))? as usize;
-    let qk_nope_head_dim = meta_u64(file, &p("attention.qk_nope_head_dim"))? as usize;
-    let qk_rope_head_dim = meta_u64(file, &p("attention.qk_rope_head_dim"))? as usize;
-    let v_head_dim = meta_u64(file, &p("attention.v_head_dim"))
-        .or_else(|_| meta_u64(file, &p("attention.key_length")))
+    // `attention.qk_nope_head_dim` and `attention.qk_rope_head_dim` ARE
+    // NOT GGUF KEYS. Neither string appears in llama.cpp's
+    // `LLM_KV_NAMES` or anywhere in `gguf-py`; they are HF
+    // `config.json` field names. Requiring them meant DeepSeek-V2,
+    // V2.5, V3 and R1 -- the largest open models people run -- all
+    // failed with "missing hparam deepseek2.attention.qk_nope_head_dim",
+    // a true statement about a key no converter has ever written. The
+    // same shape as `glm4moe` being sent to an MLA loader for a
+    // `q_lora_rank` it does not have.
+    //
+    // What a real file carries, and how llama.cpp derives the per-head
+    // dims from it (`src/models/deepseek2.cpp:77-82`):
+    //
+    //   qk_rope = rope.dimension_count                  (`n_rot`)
+    //   qk_nope = attention.key_length_mla - qk_rope
+    //   v_head  = attention.value_length_mla
+    //
+    // `attention.key_length` / `value_length` are NOT these: for an MLA
+    // checkpoint they hold the COMPRESSED MQA widths
+    // (`kv_lora_rank + qk_rope` and `kv_lora_rank`), so reading them as
+    // per-head dims silently builds a differently shaped model.
+    //
+    // The HF spellings are still accepted, because ferrox's own
+    // synthetic fixtures were written against them, but they are the
+    // fallback rather than the contract.
+    let qk_rope_head_dim = meta_u64(file, &p("rope.dimension_count"))
+        .or_else(|_| meta_u64(file, &p("attention.qk_rope_head_dim")))?
+        as usize;
+    let qk_nope_head_dim = match meta_u64(file, &p("attention.key_length_mla")) {
+        Ok(k_mla) => (k_mla as usize)
+            .checked_sub(qk_rope_head_dim)
+            .filter(|&nope| nope >= 1)
+            .ok_or_else(|| {
+                LoadError::MissingHparam(format!(
+                    "{arch}.attention.key_length_mla ({k_mla}) must exceed \
+                     rope.dimension_count ({qk_rope_head_dim})"
+                ))
+            })?,
+        Err(_) => meta_u64(file, &p("attention.qk_nope_head_dim"))? as usize,
+    };
+    let v_head_dim = meta_u64(file, &p("attention.value_length_mla"))
+        .or_else(|_| meta_u64(file, &p("attention.v_head_dim")))
         .unwrap_or(qk_nope_head_dim as u64) as usize;
     let leading_dense = file
         .metadata_u64(&p("leading_dense_block_count"))

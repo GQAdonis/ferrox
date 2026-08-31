@@ -181,15 +181,29 @@ jobs:
             # dependency resolution reads the sparse index, which lags
             # the upload by seconds. Wait for the version to actually
             # appear instead of sleeping a guessed constant.
-            echo "waiting for ${c} ${version} to appear in the index"
+            # Wait for the SPARSE INDEX, not the web API.
+            #
+            # These are different services and the index lags. v0.13.3
+            # failed exactly here: ferrox-quant 0.13.3 was live on the
+            # API, the loop moved on, and ferrox-metal then could not
+            # resolve `ferrox-quant = "^0.13.3"` because the index still
+            # offered 0.13.2. Five crates went up and the publish died
+            # halfway.
+            #
+            # The index is what `cargo publish` actually resolves
+            # against, so it is what has to be polled. Path is
+            # first-two/second-two/name for names of four characters or
+            # more, which every crate here is.
+            idx="https://index.crates.io/${c:0:2}/${c:2:2}/${c}"
+            echo "waiting for ${c} ${version} in the sparse index"
             for i in $(seq 1 60); do
-              if curl -sf -H "User-Agent: ferrox-ci" \
-                   "https://crates.io/api/v1/crates/${c}/${version}" >/dev/null; then
-                echo "${c} ${version} is live"
+              if curl -sf -H "User-Agent: ferrox-ci" "${idx}" \
+                   | jq -e --arg v "${version}" 'select(.vers == $v)' >/dev/null 2>&1; then
+                echo "${c} ${version} is resolvable"
                 break
               fi
               if [[ "${i}" == "60" ]]; then
-                echo "::error::${c} ${version} never appeared in the index after 5 minutes"
+                echo "::error::${c} ${version} never reached the sparse index after 5 minutes"
                 exit 1
               fi
               sleep 5

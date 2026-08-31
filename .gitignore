@@ -41,3 +41,8 @@ data/
 # 175d20d; agents write these and they are never part of the tree.
 .git-msg
 .git-msg.*
+
+# Server-side chat transcripts written at runtime by
+# FERROX_CONVERSATIONS_DIR (default ./ferrox-conversations). Seven were
+# committed by accident in 56a0d48 while testing chat fixes locally.
+ferrox-conversations/

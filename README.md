@@ -31,6 +31,15 @@ Ferrox loads GGUF checkpoints and runs inference on your hardware. No
 bindings to llama.cpp, no ggml wrapper. The loader, quantized kernels,
 attention and expert routing are all implemented here.
 
+- **One binary, and no runtime under it.** The release build with Metal
+  and `serve` is 19 MB, 14 MB stripped, and that single file runs
+  completions, the server, `download`, `bench` and `verify`. Nothing to
+  activate, no interpreter, no wheels, no CUDA userspace to match
+  against a driver. Measured on the host the benchmarks use (M2 Pro,
+  macOS), that is the same ballpark as llama.cpp's own core, 14 MB of
+  executables and shared libraries, and it is a different category from
+  the Python serving stacks: PyTorch alone is 402 MB here, before vLLM
+  or TGI is installed on top of it.
 - **Quantized end to end.** Weights stay quantized on mmap and
   dequantization happens inside the matmul, so an 8B model fits on a
   laptop. K-quants, the IQ tiers, MXFP4, F16 and BF16.

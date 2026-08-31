@@ -94,41 +94,53 @@ fn streamed_and_resident_agree_on_a_real_checkpoint() {
     let cfg = ModelConfig::from_gguf(&file).expect("config");
     let resident = Decoder::from_gguf(MODEL, cfg.clone()).expect("resident load");
 
-    let prompt: Vec<usize> = vec![791, 6864, 315, 9822, 374];
-    let ids_of = |d: &Decoder| -> Vec<usize> {
-        let mut caches: Vec<ferrox_core::cache::KvCache> = d
-            .layers
-            .iter()
-            .map(|_| ferrox_core::cache::KvCache::new(d.config.n_kv_heads, d.config.head_dim))
-            .collect();
-        // PREFILL the prompt as a batch, then decode. The CLI does
-        // this, and it matters: prefill and decode take different MoE
-        // paths, and a decode-only test does not reproduce the repack
-        // cache collision at all.
-        let mut out = Vec::new();
-        let batch = d.forward_batch(&prompt, 0, &mut caches);
-        out.push(argmax(
-            batch.last().expect("prefill returns one row per token"),
-        ));
-        for pos in (prompt.len()..).take(4) {
-            let last = *out.last().unwrap();
-            let logits = d.forward_token(last, pos, &mut caches);
-            out.push(argmax(&logits));
-        }
-        out
-    };
+    // FOUR prompts, not one. The bug this test was written for was
+    // deterministic, so a single passing prompt proves very little: the
+    // synthetic fixture test also passed while the real checkpoint
+    // answered " amongst amongst, and of" instead of " Paris.". Diverse
+    // shapes (prose, a story opener, code, a list) exercise different
+    // expert routes, which is what a streamed cache actually varies.
+    for prompt in [
+        vec![791usize, 6864, 315, 9822, 374],
+        vec![12805usize, 5304, 264, 892],
+        vec![755usize, 16178, 41160, 1471],
+        vec![791usize, 2380, 6156, 8146, 527],
+    ] {
+        let ids_of = |d: &Decoder| -> Vec<usize> {
+            let mut caches: Vec<ferrox_core::cache::KvCache> = d
+                .layers
+                .iter()
+                .map(|_| ferrox_core::cache::KvCache::new(d.config.n_kv_heads, d.config.head_dim))
+                .collect();
+            // PREFILL the prompt as a batch, then decode. The CLI does
+            // this, and it matters: prefill and decode take different MoE
+            // paths, and a decode-only test does not reproduce the repack
+            // cache collision at all.
+            let mut out = Vec::new();
+            let batch = d.forward_batch(&prompt, 0, &mut caches);
+            out.push(argmax(
+                batch.last().expect("prefill returns one row per token"),
+            ));
+            for pos in (prompt.len()..).take(4) {
+                let last = *out.last().unwrap();
+                let logits = d.forward_token(last, pos, &mut caches);
+                out.push(argmax(&logits));
+            }
+            out
+        };
 
-    let want = ids_of(&resident);
-    // A generous budget and a 1-byte one: the second forces every
-    // acquire to miss, which is when buffers are recycled hardest.
-    for budget in [128u64 << 20, 1] {
-        let streamed = Decoder::from_gguf_with_expert_cache(MODEL, cfg.clone(), Some(budget))
-            .expect("streamed load");
-        assert_eq!(
-            ids_of(&streamed),
-            want,
-            "budget={budget}: streamed experts must produce the same tokens as resident"
-        );
+        let want = ids_of(&resident);
+        // A generous budget and a 1-byte one: the second forces every
+        // acquire to miss, which is when buffers are recycled hardest.
+        for budget in [128u64 << 20, 1] {
+            let streamed = Decoder::from_gguf_with_expert_cache(MODEL, cfg.clone(), Some(budget))
+                .expect("streamed load");
+            assert_eq!(
+                ids_of(&streamed),
+                want,
+                "budget={budget}: streamed experts must produce the same tokens as resident"
+            );
+        }
     }
 }
 

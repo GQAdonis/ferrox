@@ -109,6 +109,13 @@ pub const AUDITED_GENERIC_GQA: &[&str] = &[
     "phi3",     // Phi-4-mini tags phi3
     // Pinned against real libllama logits in tests/.
     "gpt-oss", "dots1",
+    // tests/qwen3moe_graph.rs: a synthetic 2-layer fixture
+    // (scripts/make_qwen3moe_fixture.py) compared against llama.cpp's
+    // own qwen3moe graph via libllama, on all three forward paths.
+    // Carries per-head QK norm before RoPE, head_dim * n_head != n_embd,
+    // GQA, NEOX RoPE, softmax gating with renormalised top-k, and
+    // n_ff != n_ff_exp.
+    "qwen3moe",
 ];
 
 /// Is this architecture's use of the shared generic path backed by
@@ -710,9 +717,38 @@ pub fn architecture_catalog() -> &'static [ArchProfile] {
             "glm4",
             "use ferrox_models::glm52_decoder / glm52_gguf_loader, not the generic GQA Decoder",
         ));
+        // GLM-4.5 / GLM-4.5-Air / GLM-4.6 tag `glm4moe`, and the reason
+        // here used to point at `glm52_gguf_loader` the way `glm-dsa`
+        // does. It cannot load one: `read_glm52_hparams` requires
+        // `{arch}.attention.q_lora_rank`, `.kv_lora_rank`,
+        // `.qk_nope_head_dim` and `.qk_rope_head_dim`, and glm4moe is
+        // NOT an MLA model -- `src/models/glm4-moe.cpp`'s
+        // `load_arch_hparams` never reads any of the four and its
+        // `load_arch_tensors` calls `create_tensor_qkv` (plain Q/K/V)
+        // with no `attn_kv_a_mqa` / `attn_kv_b` / `attn_q_a` /
+        // `attn_q_b` anywhere. So `ferrox run` on a real GLM-4.5-Air
+        // answered "missing hparam glm4moe.attention.q_lora_rank" for a
+        // model that has no MLA at all.
+        //
+        // What it actually is: plain GQA + DeepSeek-V3-shaped sigmoid
+        // MoE (`exp_probs_b`, shared expert, leading dense,
+        // `expert_weights_scale`), all of which the generic decoder
+        // already computes and `dots1` already pins. The one thing that
+        // does not fit is the norm slot, and it is a real divergence
+        // rather than a missing key -- see the reason string. Pinned by
+        // `tests/glm4moe_refusal.rs` against a synthetic checkpoint
+        // llama.cpp itself loads and decodes.
         v.push(dedicated(
             "glm4moe",
-            "use ferrox_models::glm52_decoder / glm52_gguf_loader, not the generic GQA Decoder",
+            "GLM-4.5-MoE stores its pre-FFN norm as `blk.N.post_attention_norm.weight` and \
+             carries NO `blk.N.ffn_norm.weight` (src/models/glm4-moe.cpp:75, applied to \
+             `ffn_inp` at :215 -- i.e. AFTER the attention residual). The generic decoder \
+             requires `ffn_norm` and puts `post_attention_norm` in Gemma's other slot, on the \
+             attention branch BEFORE the residual add, so it would both fail to find its \
+             tensors and compute a different graph. This is gpt-oss's norm slot exactly, and \
+             `loader.rs` already implements it behind an `is_gpt_oss` flag; widening that flag \
+             is what admits glm4moe. It is NOT MLA -- do not send it to glm52_gguf_loader, \
+             which asks for a `q_lora_rank` no glm4moe checkpoint carries",
         ));
         v.push(dedicated(
             "deepseek4",

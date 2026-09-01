@@ -54,6 +54,7 @@ fn greedy_params(max_tokens: usize, seed: u64) -> GenerationParams {
             top_p: 1.0,
             top_k: 0,
             repetition_penalty: 1.0,
+            penalty_last_n: 64,
             presence_penalty: 0.0,
             frequency_penalty: 0.0,
         },

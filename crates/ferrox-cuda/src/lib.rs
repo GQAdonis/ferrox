@@ -15,11 +15,21 @@
 
 pub mod capability;
 
+/// The `mul_mm` kernel source and its per-quant-kind dispatch table.
+/// Always compiled: it is CUDA C *text* plus a scalar twin, neither of
+/// which needs `cudarc`, so the default `cargo test -p ferrox-cuda` run
+/// on a GPU-less host still exercises the arithmetic the kernel encodes.
+/// Only the launch path ([`mul_mm_launch`]) is feature-gated.
+pub mod mul_mm;
+pub mod mul_mm_ref;
+
 #[cfg(feature = "cuda")]
 pub mod attn;
 #[cfg(feature = "cuda")]
 pub mod gpu;
 #[cfg(feature = "cuda")]
 pub mod graph;
+#[cfg(feature = "cuda")]
+pub mod mul_mm_launch;
 
 pub use capability::{HardwareProfile, SimdCaps};

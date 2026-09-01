@@ -1,0 +1,58 @@
+#pragma once
+// Enough of the CUDA execution model to run an UNMODIFIED `__global__`
+// body on a host CPU: one std::thread per CUDA thread, a counting
+// barrier standing in for `__syncthreads()`, and one block at a time so
+// that `__shared__` -> function-`static` is a faithful stand-in.
+//
+// This exists because ferrox's CUDA kernels are written in an
+// environment with no NVIDIA GPU. It does NOT emulate a GPU: no warp
+// scheduling, no memory model, no coalescing, no races. It checks
+// exactly one thing -- that the arithmetic and the index math in the
+// emitted CUDA C are the arithmetic and index math the Rust scalar twin
+// (`ferrox_cuda::mul_mm_ref`) was tested against.
+#include <math.h>
+#include <stddef.h>
+#include <string.h>
+#include <condition_variable>
+#include <mutex>
+#include <thread>
+#include <vector>
+
+struct Dim3 {
+    unsigned int x, y, z;
+};
+thread_local Dim3 blockIdx;
+thread_local Dim3 threadIdx;
+Dim3 blockDim, gridDim;
+
+struct Barrier {
+    unsigned n, count = 0, gen = 0;
+    std::mutex m;
+    std::condition_variable cv;
+    explicit Barrier(unsigned n) : n(n) {}
+    void wait() {
+        std::unique_lock<std::mutex> lk(m);
+        unsigned g = gen;
+        if (++count == n) {
+            count = 0;
+            gen++;
+            cv.notify_all();
+        } else {
+            cv.wait(lk, [&] { return gen != g; });
+        }
+    }
+};
+static Barrier* g_bar = nullptr;
+
+static inline void __syncthreads(void) { g_bar->wait(); }
+static inline float __int_as_float(int i) {
+    float f;
+    memcpy(&f, &i, 4);
+    return f;
+}
+
+#define __global__
+#define __device__
+#define __forceinline__ inline
+#define __shared__ static
+#define __restrict__

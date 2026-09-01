@@ -85,6 +85,11 @@ pub enum CudaError {
     KernelCompile(String),
     #[error("kernel launch failed: {0:?}")]
     Launch(String),
+    /// A shape or format this CUDA path does not implement. Distinct
+    /// from `Launch` on purpose: the caller must fall back to a path
+    /// that can compute it, never compute something else.
+    #[error("unsupported on the CUDA path: {0}")]
+    Unsupported(String),
 }
 
 /// Probes for CUDA devices. Returns `None` on any failure to load the
@@ -595,12 +600,25 @@ pub(crate) fn ensure_module_loaded(
     module_name: &'static str,
     fn_name: &'static str,
 ) -> Result<(), CudaError> {
+    ensure_module_loaded_lazy(dev, module_name, fn_name, || kernel_src.to_string())
+}
+
+/// The same load-once cache, for a kernel whose source is *generated*
+/// rather than a `&'static str` literal (`mul_mm`'s per-quant-kind
+/// bodies). `src` is called only on a cache miss, so a per-token launch
+/// does not re-format a translation unit it will not compile.
+pub(crate) fn ensure_module_loaded_lazy(
+    dev: &std::sync::Arc<cudarc::driver::CudaDevice>,
+    module_name: &'static str,
+    fn_name: &'static str,
+    src: impl FnOnce() -> String,
+) -> Result<(), CudaError> {
     let mut guard = LOADED_MODULES.lock().unwrap();
     let set = guard.get_or_insert_with(std::collections::HashSet::new);
     if set.contains(module_name) {
         return Ok(());
     }
-    let ptx = cudarc::nvrtc::compile_ptx(kernel_src)
+    let ptx = cudarc::nvrtc::compile_ptx(src())
         .map_err(|e| CudaError::KernelCompile(format!("{e:?}")))?;
     dev.load_ptx(ptx, module_name, &[fn_name])
         .map_err(|e| CudaError::KernelCompile(format!("{e:?}")))?;
@@ -722,8 +740,8 @@ fn enqueue_matvec(
     Ok((d_out, d_weights))
 }
 
-struct ResidentCudaWeights {
-    slice: cudarc::driver::CudaSlice<u8>,
+pub(crate) struct ResidentCudaWeights {
+    pub(crate) slice: cudarc::driver::CudaSlice<u8>,
     #[allow(dead_code)] // Kept for diagnostics / future eviction logic.
     nbytes: usize,
 }
@@ -740,7 +758,7 @@ type CudaWeightCacheMap =
 static CUDA_WEIGHT_CACHE: std::sync::Mutex<Option<CudaWeightCacheMap>> =
     std::sync::Mutex::new(None);
 
-fn resident_cuda_weights(
+pub(crate) fn resident_cuda_weights(
     dev: &std::sync::Arc<cudarc::driver::CudaDevice>,
     weights: &[u8],
 ) -> Result<std::sync::Arc<ResidentCudaWeights>, CudaError> {

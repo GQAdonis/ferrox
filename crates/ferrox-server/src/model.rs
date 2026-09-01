@@ -229,8 +229,12 @@ fn tokenizer_from_gguf(file: &ShardedGguf) -> anyhow::Result<ServerTokenizer> {
              (Unigram). {}",
             match known {
                 "bert" =>
-                    "WordPiece is what BERT-family embedding models use; \
-                           ferrox has no WordPiece implementation.",
+                    "WordPiece is what BERT-family embedding models use, and a BERT \
+                           checkpoint is an ENCODER: it has no output head and cannot \
+                           generate text at all, so there is nothing for this path to \
+                           serve. Ferrox can embed with it — set \
+                           FERROX_EMBEDDING_MODEL_PATH to this file and \
+                           POST /v1/embeddings.",
                 "rwkv" => "RWKV uses a trie tokenizer ferrox does not implement.",
                 _ => "`none` means the file carries no vocabulary at all.",
             }

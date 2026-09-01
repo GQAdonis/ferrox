@@ -44,6 +44,7 @@ mod chat_template;
 mod completion;
 mod conversations;
 mod decode_task;
+mod embeddings;
 mod generate;
 mod grammar_request;
 mod health;
@@ -615,6 +616,19 @@ pub(crate) struct ActiveModel {
 }
 
 pub(crate) struct AppState {
+    /// A real embedding model (`FERROX_EMBEDDING_MODEL_PATH`), served
+    /// by `/v1/embeddings` in preference to pooling a decoder's hidden
+    /// states.
+    ///
+    /// Deliberately a field beside [`AppState::active`] and NOT a
+    /// sixth `Model` variant. A BERT encoder has no chat template, no
+    /// stop tokens, no BOS policy and no logits, so every one of the
+    /// eighteen `match self` arms on `Model` would have to answer a
+    /// question it has no answer to. It is also not swappable through
+    /// `/admin/models/load`, because that surface loads *generation*
+    /// models. Serving an encoder as the active model is a real
+    /// feature and a larger one; this is the seam it would grow from.
+    pub(crate) embedding: Option<Arc<ferrox_models::EmbeddingModel>>,
     /// The swappable active model.
     ///
     /// **A reader clones the `Arc` under the read lock and then runs;
@@ -877,6 +891,21 @@ impl AppState {
     /// names it. `None` when nothing is loaded.
     pub(crate) fn active_model_name(&self) -> Option<String> {
         self.active().map(|a| a.model.name().to_string())
+    }
+
+    /// The configured embedding model, if any.
+    pub(crate) fn embedding_model(&self) -> Option<Arc<ferrox_models::EmbeddingModel>> {
+        self.embedding.clone()
+    }
+
+    /// What `/v1/embeddings` is actually charging against, for the
+    /// `/admin/stats` ring: the embedding model when one is configured,
+    /// otherwise whichever decoder is active.
+    pub(crate) fn embedding_model_name(&self) -> Option<String> {
+        match &self.embedding {
+            Some(e) => Some(e.name().to_string()),
+            None => self.active_model_name(),
+        }
     }
 
     pub(crate) fn record_request(&self, record: stats::Record<'_>) {
@@ -3610,8 +3639,19 @@ pub(crate) fn activate_loaded_model(
     }
 }
 
-fn build_app_state(
+/// The models a server starts with: the generation model, and the
+/// embedding model when `FERROX_EMBEDDING_MODEL_PATH` names one.
+///
+/// One struct rather than two parameters because they are chosen
+/// together at startup and are the only two things `build_app_state`
+/// takes that are a *model*.
+struct StartupModels {
     loaded: model::LoadedModel,
+    embedding: Option<Arc<ferrox_models::EmbeddingModel>>,
+}
+
+fn build_app_state(
+    models: StartupModels,
     kv_pool: Option<generate::KvPoolConfig>,
     paged_kv: Option<generate::PagedKvConfig>,
     prefix_cache: Option<Arc<Mutex<PrefixCache>>>,
@@ -3619,6 +3659,7 @@ fn build_app_state(
     mcp: Option<mcp::LoadedMcpConfig>,
     detection: Arc<health::Detection>,
 ) -> AppState {
+    let StartupModels { loaded, embedding } = models;
     let (model, batcher, ceiling) = activate_loaded_model(
         loaded,
         enable_continuous_batching,
@@ -3632,6 +3673,7 @@ fn build_app_state(
     // than inventing an id no `load` request could name.
     let id = startup_model_id();
     AppState {
+        embedding,
         active: std::sync::RwLock::new(Some(Arc::new(ActiveModel {
             id,
             model: Arc::new(model),
@@ -3663,6 +3705,30 @@ fn build_app_state(
         footprint: Mutex::new(crate::policy::footprint::ProbeCache::new(FOOTPRINT_TTL_MS)),
         started_unix: unix_now(),
     }
+}
+
+/// Builds the `/v1/embeddings` encoder from
+/// `FERROX_EMBEDDING_MODEL_PATH`, or `None` when the variable is unset.
+///
+/// A failure here is fatal rather than deferred: a server that starts
+/// with a misspelt path and then answers embedding requests out of the
+/// *decoder* would be handing back vectors from the wrong model with
+/// nothing in the response saying so.
+fn load_embedding_model() -> anyhow::Result<Option<Arc<ferrox_models::EmbeddingModel>>> {
+    let Ok(path) = std::env::var("FERROX_EMBEDDING_MODEL_PATH") else {
+        return Ok(None);
+    };
+    let model = ferrox_models::EmbeddingModel::from_gguf_path(&path)
+        .map_err(|e| anyhow::anyhow!("FERROX_EMBEDDING_MODEL_PATH={path}: {e}"))?;
+    tracing::info!(
+        "loaded embedding model '{}' ({}, {} dims, pooling {}, max {} tokens)",
+        model.name(),
+        model.architecture(),
+        model.n_embd(),
+        model.pooling_type().name(),
+        model.n_ctx_train(),
+    );
+    Ok(Some(Arc::new(model)))
 }
 
 /// Seconds since the epoch, or zero on a machine whose clock is set
@@ -3904,6 +3970,13 @@ async fn run(mcp_config_path: Option<PathBuf>, exit_on_stdin_close: bool) -> any
     {
         anyhow::bail!(msg);
     }
+
+    // Loaded before the generation model, so a bad path fails the
+    // start rather than the first `/v1/embeddings` request. It is
+    // separate from `FERROX_MODEL_PATH` on purpose: an encoder cannot
+    // generate, so it is not a substitute for the served model, and the
+    // two are configured independently.
+    let embedding_model = load_embedding_model()?;
 
     let mut loaded = model::load()?;
     match &loaded {
@@ -4379,7 +4452,10 @@ async fn run(mcp_config_path: Option<PathBuf>, exit_on_stdin_close: bool) -> any
     let detection = health::Detection::spawn();
 
     let state = Arc::new(build_app_state(
-        loaded,
+        StartupModels {
+            loaded,
+            embedding: embedding_model,
+        },
         kv_pool,
         paged_kv,
         prefix_cache,
@@ -4450,7 +4526,7 @@ async fn run(mcp_config_path: Option<PathBuf>, exit_on_stdin_close: bool) -> any
         // the key with their twins: they read the loaded vocabulary.
         .route(routes::TOKENIZE, post(openai_extra::tokenize))
         .route(routes::DETOKENIZE, post(openai_extra::detokenize))
-        .route(routes::V1_EMBEDDINGS, post(openai_extra::embeddings))
+        .route(routes::V1_EMBEDDINGS, post(embeddings::embeddings))
         .route(routes::CACHE_STATS, get(cache_stats))
         .route(routes::METRICS, get(metrics))
         // The control surface. Registered inside `protected` on
@@ -4734,6 +4810,7 @@ mod tests {
     /// builds one.
     fn test_state(model: Model, response_cache: ResponseCache) -> AppState {
         AppState {
+            embedding: None,
             paged_kv: None,
             active: std::sync::RwLock::new(Some(Arc::new(ActiveModel {
                 id: None,
@@ -4827,7 +4904,7 @@ mod tests {
                 ferrox_api::routes::DETOKENIZE,
                 post(openai_extra::detokenize),
             )
-            .route("/v1/embeddings", post(openai_extra::embeddings))
+            .route("/v1/embeddings", post(embeddings::embeddings))
             .route("/v1/completions", post(openai_extra::completions))
             // llama.cpp's native endpoint, under both of its spellings.
             .route(ferrox_api::routes::COMPLETION, post(completion::completion))
@@ -6521,6 +6598,85 @@ mod tests {
         let vec = emb["data"][0]["embedding"].as_array().unwrap();
         assert!(!vec.is_empty());
         assert!(vec.iter().all(|v| v.as_f64().is_some()));
+    }
+
+    /// The decoder path's accepted `embedding_type` set must not have
+    /// widened when the encoder path arrived: `cls` is row 0 of a
+    /// decoder's hidden states, which is its BOS position and means
+    /// nothing, so it stays refused here and the refusal names what is
+    /// accepted.
+    #[tokio::test]
+    async fn the_decoder_path_still_refuses_a_pooling_it_cannot_mean() {
+        let app = test_app();
+        let (status, body) = post_json_uri(
+            &app,
+            "/v1/embeddings",
+            serde_json::json!({ "input": "Hi", "embedding_type": "cls" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let msg = body["error"]["message"].as_str().unwrap();
+        assert!(msg.contains("mean") && msg.contains("last"), "{msg}");
+    }
+
+    /// A real BGE checkpoint served through the route: CLS by default
+    /// because the file says `pooling_type = 2`, 384 dims, unit norm,
+    /// and `usage.prompt_tokens` counting the `[CLS]`/`[SEP]` the model
+    /// actually saw.
+    #[tokio::test]
+    #[ignore = "needs models/bge-small-en-v1.5-q8_0.gguf"]
+    async fn a_real_embedding_model_serves_v1_embeddings() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../models/bge-small-en-v1.5-q8_0.gguf");
+        if !path.exists() {
+            eprintln!("SKIP: {} not present", path.display());
+            return;
+        }
+        let encoder = ferrox_models::EmbeddingModel::from_gguf_path(&path).expect("load bge");
+        let mut state = test_state(
+            test_model_full_byte_vocab(),
+            ResponseCache::new(1000, Duration::from_secs(3600)),
+        );
+        state.embedding = Some(Arc::new(encoder));
+        let app = test_app_with_state(Arc::new(state));
+
+        let (status, body) = post_json_uri(
+            &app,
+            "/v1/embeddings",
+            serde_json::json!({ "input": ["Hello world", "a second input"] }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["model"], "bge-small-en-v1.5");
+        let data = body["data"].as_array().unwrap();
+        assert_eq!(data.len(), 2);
+        for (i, row) in data.iter().enumerate() {
+            assert_eq!(row["index"], i);
+            let v: Vec<f64> = row["embedding"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|x| x.as_f64().unwrap())
+                .collect();
+            assert_eq!(v.len(), 384, "the encoder\'s width, not the decoder\'s");
+            let norm = v.iter().map(|x| x * x).sum::<f64>().sqrt();
+            assert!((norm - 1.0).abs() < 1e-4, "not L2-normalized: {norm}");
+        }
+        // "Hello world" is [CLS] hello world [SEP] = 4, and the second
+        // input adds its own two specials.
+        assert!(body["usage"]["prompt_tokens"].as_u64().unwrap() >= 4 + 2);
+
+        // The default came from the file. Asking for MEAN must give a
+        // different vector, which is what proves CLS was not a
+        // coincidence of this input.
+        let (status, mean) = post_json_uri(
+            &app,
+            "/v1/embeddings",
+            serde_json::json!({ "input": "Hello world", "embedding_type": "mean" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_ne!(mean["data"][0]["embedding"], data[0]["embedding"]);
     }
 
     /// The /metrics endpoint must expose the bounded expert cache's
@@ -8395,7 +8551,10 @@ mod tests {
     fn kimi_model_serves_real_text_end_to_end_via_run_generation() {
         let loaded = build_synthetic_kimi_loaded();
         let state = build_app_state(
-            model::LoadedModel::Kimi(loaded),
+            StartupModels {
+                loaded: model::LoadedModel::Kimi(loaded),
+                embedding: None,
+            },
             None,
             None,
             None,
@@ -8437,7 +8596,10 @@ mod tests {
     fn a_grammar_constrains_the_engine_decode_path() {
         let loaded = build_synthetic_kimi_loaded();
         let state = build_app_state(
-            model::LoadedModel::Kimi(loaded),
+            StartupModels {
+                loaded: model::LoadedModel::Kimi(loaded),
+                embedding: None,
+            },
             None,
             None,
             None,
@@ -8490,7 +8652,10 @@ mod tests {
     fn kv_pool_and_prefix_cache_are_never_consulted_for_a_kimi_model() {
         let loaded = build_synthetic_kimi_loaded();
         let state = build_app_state(
-            model::LoadedModel::Kimi(loaded),
+            StartupModels {
+                loaded: model::LoadedModel::Kimi(loaded),
+                embedding: None,
+            },
             None,
             None,
             None,

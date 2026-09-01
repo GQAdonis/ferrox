@@ -1,5 +1,9 @@
-//! Extra OpenAI-shaped endpoints: tokenize / detokenize, embeddings
-//! (GGUF Decoder hidden-state pool), and legacy `/v1/completions`.
+//! Extra OpenAI-shaped endpoints: tokenize / detokenize and legacy
+//! `/v1/completions`.
+//!
+//! `/v1/embeddings` used to live here too and now has its own module,
+//! [`crate::embeddings`] — this file was 939 lines and the embedding
+//! route was about to grow an encoder path.
 
 use std::sync::Arc;
 
@@ -11,7 +15,7 @@ use serde::Deserialize;
 use crate::attribution::Attribution;
 use crate::generate::{FinishReason, GenerationParams};
 use crate::sampling_knobs::SamplingKnobs;
-use crate::{join_error_response, unsupported_feature, ApiError, AppState};
+use crate::{unsupported_feature, ApiError, AppState};
 
 /// What one of the small endpoints knows before it does any work.
 ///
@@ -19,14 +23,14 @@ use crate::{join_error_response, unsupported_feature, ApiError, AppState};
 /// facts however the handler ends -- and so the three of them travel
 /// together instead of as three positional arguments that are each
 /// easy to pass in the wrong order.
-struct Call {
+pub(crate) struct Call {
     request_id: String,
     started: std::time::Instant,
     attribution: Attribution,
 }
 
 impl Call {
-    fn new(headers: &axum::http::HeaderMap) -> Self {
+    pub(crate) fn new(headers: &axum::http::HeaderMap) -> Self {
         Call {
             request_id: ferrox_api::next_request_id(),
             started: std::time::Instant::now(),
@@ -56,7 +60,7 @@ impl Call {
     /// failure is recorded with its own status for the same reason -- a
     /// 400 that leaves no trace is indistinguishable from a request
     /// that was never sent.
-    fn record<T>(
+    pub(crate) fn record<T>(
         &self,
         state: &AppState,
         route: &str,
@@ -173,26 +177,6 @@ impl TokenizeRequest {
 #[derive(Debug, Deserialize)]
 pub(crate) struct DetokenizeRequest {
     tokens: Vec<usize>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(untagged)]
-enum EmbeddingInput {
-    One(String),
-    Many(Vec<String>),
-}
-
-#[derive(Debug, Deserialize)]
-pub(crate) struct EmbeddingsRequest {
-    input: EmbeddingInput,
-    #[serde(default)]
-    model: Option<String>,
-    /// Only `"float"` is supported (OpenAI also has `base64`).
-    #[serde(default)]
-    encoding_format: Option<String>,
-    /// Pooling over token hidden states: `mean` (default) or `last`.
-    #[serde(default)]
-    embedding_type: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -454,174 +438,6 @@ fn detokenize_inner(
     // (`server-context.cpp:4970`), ferrox's existing ones read `text`,
     // and there is only one answer to disagree about.
     Ok(Json(serde_json::json!({ "text": text, "content": text })))
-}
-
-fn pool_hidden(hiddens: &[Vec<f32>], pooling: &str) -> Result<Vec<f32>, ApiError> {
-    if hiddens.is_empty() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({
-                "error": {"message": "input encoded to zero tokens; cannot embed empty sequence"}
-            })),
-        ));
-    }
-    match pooling {
-        "last" => Ok(hiddens.last().unwrap().clone()),
-        "mean" => {
-            let dim = hiddens[0].len();
-            let mut acc = vec![0.0f32; dim];
-            for h in hiddens {
-                for (a, &v) in acc.iter_mut().zip(h.iter()) {
-                    *a += v;
-                }
-            }
-            let n = hiddens.len() as f32;
-            for a in &mut acc {
-                *a /= n;
-            }
-            Ok(acc)
-        }
-        other => Err((
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({
-                "error": {
-                    "message": format!(
-                        "embedding_type must be \"mean\" or \"last\", got {other:?}"
-                    )
-                }
-            })),
-        )),
-    }
-}
-
-pub async fn embeddings(
-    State(state): State<Arc<AppState>>,
-    headers: axum::http::HeaderMap,
-    Json(req): Json<EmbeddingsRequest>,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    let call = Call::new(&headers);
-    let result = embeddings_inner(&state, req).await;
-    // Embeddings *do* run the model, so the prompt tokens they paid for
-    // are real prompt tokens and are recorded as such. There is no
-    // decode loop, so `decode_ms` stays null rather than borrowing the
-    // total -- the same rule the two duration columns exist for.
-    let usage = result
-        .as_ref()
-        .ok()
-        .map(|(_, prompt_tokens)| ferrox_api::Usage::new(*prompt_tokens, 0));
-    call.record(
-        &state,
-        ferrox_api::routes::V1_EMBEDDINGS,
-        state.active_model_name(),
-        &result,
-        usage.as_ref(),
-    );
-    result.map(|(body, _)| Json(body))
-}
-
-async fn embeddings_inner(
-    state: &AppState,
-    req: EmbeddingsRequest,
-) -> Result<(serde_json::Value, usize), ApiError> {
-    if let Some(fmt) = req.encoding_format.as_deref() {
-        if fmt != "float" {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({
-                    "error": {
-                        "message": format!(
-                            "encoding_format {fmt:?} is not supported (only \"float\")"
-                        )
-                    }
-                })),
-            ));
-        }
-    }
-    let pooling = req.embedding_type.as_deref().unwrap_or("mean");
-    if !matches!(pooling, "mean" | "last") {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({
-                "error": {
-                    "message": format!(
-                        "embedding_type must be \"mean\" or \"last\", got {pooling:?}"
-                    )
-                }
-            })),
-        ));
-    }
-
-    let active_model = state.require_model()?;
-    // Fail fast for non-GGUF engines before paying encode cost.
-    if active_model.embed_tokens(&[]).is_none() {
-        return Err(unsupported_feature(
-            "embeddings engine not yet available for this model",
-        ));
-    }
-
-    let inputs: Vec<String> = match req.input {
-        EmbeddingInput::One(s) => vec![s],
-        EmbeddingInput::Many(v) => v,
-    };
-    if inputs.is_empty() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({
-                "error": {"message": "input must be a non-empty string or array of strings"}
-            })),
-        ));
-    }
-
-    let model = Arc::clone(&active_model);
-    let pooling = pooling.to_string();
-    let (data, prompt_tokens) = tokio::task::spawn_blocking(move || {
-        let mut out = Vec::with_capacity(inputs.len());
-        let mut prompt_tokens = 0usize;
-        for (i, text) in inputs.iter().enumerate() {
-            let tokens = model.encode(text);
-            prompt_tokens += tokens.len();
-            if let Some(vocab) = model.vocab_size() {
-                if let Some(&bad) = tokens.iter().find(|&&t| t >= vocab) {
-                    return Err((
-                        StatusCode::BAD_REQUEST,
-                        Json(serde_json::json!({
-                            "error": {
-                                "message": format!(
-                                    "token id {bad} is outside this model's vocabulary of {vocab}"
-                                )
-                            }
-                        })),
-                    ));
-                }
-            }
-            let hiddens = model.embed_tokens(&tokens).ok_or_else(|| {
-                unsupported_feature("embeddings engine not yet available for this model")
-            })?;
-            let embedding = pool_hidden(&hiddens, &pooling)?;
-            out.push(serde_json::json!({
-                "object": "embedding",
-                "index": i,
-                "embedding": embedding,
-            }));
-        }
-        Ok::<_, ApiError>((out, prompt_tokens))
-    })
-    .await
-    .map_err(join_error_response)??;
-
-    let model_name = req.model.unwrap_or_else(|| active_model.name().to_string());
-    Ok((
-        serde_json::json!({
-            "object": "list",
-            "data": data,
-            "model": model_name,
-            "usage": {
-                "prompt_tokens": prompt_tokens,
-                "total_tokens": prompt_tokens,
-            }
-        }),
-        prompt_tokens,
-    ))
 }
 
 pub async fn completions(

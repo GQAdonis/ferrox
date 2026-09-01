@@ -8,6 +8,8 @@
 //! support. Dedicated primitives live in `glm52_*`, `deepseek_v4_*`,
 //! `kimi_*` modules.
 
+pub mod bert_encoder;
+pub mod bert_gguf_loader;
 pub mod block_residual;
 pub mod capability;
 pub mod chat_template;
@@ -16,6 +18,8 @@ pub mod decoder;
 pub mod deepseek_v4_budget;
 pub mod deepseek_v4_decoder;
 pub mod device_budget;
+pub mod embedding_model;
+pub mod encoder;
 pub mod engine;
 pub mod engine_factory;
 pub mod execution_plan;
@@ -49,6 +53,7 @@ pub mod mla;
 pub mod mla_gguf_loader;
 pub mod mmproj;
 pub mod output_projection;
+pub mod pooling;
 pub mod prefix_cache;
 pub mod recurrent_engine;
 pub mod residency_report;
@@ -61,6 +66,8 @@ pub mod tokenizer;
 pub mod vision;
 pub mod vl_engine;
 
+pub use bert_encoder::{BertEncoder, BertHparams, BertLayer};
+pub use bert_gguf_loader::{load_bert_encoder_from_path, read_bert_hparams, BERT_ARCH};
 pub use capability::{
     architecture_catalog, coverage_report_markdown, resolve_architecture, resolve_profile,
     ArchPath, ArchProfile, ArchScope, DecoderFamily, MemoryKind, QkNormStyle,
@@ -68,6 +75,8 @@ pub use capability::{
 pub use config::{deepseek_v4_pro, glm_5_2, kimi_k3, FfnActivation, ModelConfig, RopeLayout};
 pub use decoder::{Decoder, MultiSeqKv};
 pub use device_budget::{BudgetBackend, DeviceBudget};
+pub use embedding_model::{EmbedError, EmbeddingModel};
+pub use encoder::{EncodeError, TextEncoder};
 pub use engine::{
     DeepseekV4Engine, Engine, Glm52Engine, KimiEngine, MlaDenseFfn, MlaEngine, MlaLayerFfn,
     MlaLayerWeights, MlaMoeFfn, MlaMoeRuntime, TextTokenizer,
@@ -85,6 +94,7 @@ pub use kv_budget::{
 };
 pub use loader::LoadError;
 pub use output_projection::grouped_output_projection;
+pub use pooling::{l2_normalize, pool, PoolingError, PoolingType};
 pub use prefix_cache::{PrefixCache, PrefixCacheStats, PrefixMatch};
 pub use sampling::{sampling_distribution, Sampler, SamplingParams};
 pub use speculative::{

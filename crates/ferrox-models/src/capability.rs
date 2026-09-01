@@ -1619,7 +1619,18 @@ pub fn architecture_catalog() -> &'static [ArchProfile] {
                 DeferredEncoderEmbedding,
                 "encoder-only; deferred from text-generation parity",
             ),
-            ("bert", DeferredEncoderEmbedding, "encoder/embedding; deferred"),
+            // Deferred from the *decoder* path, and that is still
+            // right: a `bert` GGUF has no output head, so
+            // `ensure_generic_decoder` must keep refusing it. It is no
+            // longer deferred outright — it loads and embeds through
+            // `bert_gguf_loader` / `bert_encoder`, checked against
+            // llama.cpp by `tests/bert_llama_cpp_parity.rs`.
+            (
+                "bert",
+                DeferredEncoderEmbedding,
+                "encoder; no output head, so never a decoder — served by \
+                 ferrox_models::EmbeddingModel on /v1/embeddings",
+            ),
             (
                 "modern-bert",
                 DeferredEncoderEmbedding,

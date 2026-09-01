@@ -5,6 +5,8 @@
 //             sequence, written as raw f32.
 //   tokenize  llama.cpp's token ids for a batch of raw texts, written as
 //             length-prefixed i32 runs.
+//   embed     llama.cpp's POOLED EMBEDDING for one raw text, printed as
+//             one f32 per line.
 //
 // Why the logits mode takes token ids and not text: `ferrox` and
 // llama.cpp were once compared by greedy text, and it proved nothing —
@@ -31,6 +33,17 @@
 //   cc -std=c11 -O2 -I"$P/include" -L"$P/lib" -lllama \
 //       -Wl,-rpath,"$P/lib" tools/llama_logits.c -o target/llama_logits
 //
+// Why the embed mode exists: an encoder has no "first-token logit", so
+// the logits mode cannot reach a BGE/E5/nomic checkpoint at all. What it
+// has instead is one pooled vector per sequence, and that is what this
+// mode dumps — through llama.cpp's own pooling (`llama_get_embeddings_seq`
+// with the model's own `pooling_type`), so the comparison covers the
+// pooling rule and not only the graph. It takes TEXT rather than ids,
+// unlike the logits mode, because a BERT checkpoint's `[CLS]`/`[SEP]`
+// wrapping is part of what is being checked; ferrox's tokenizer is
+// already held to this same library by the tokenize mode above, so the
+// tokenizer is not an uncontrolled variable here.
+//
 // Usage:
 //   llama_logits <model.gguf> <out.bin> <tok0> <tok1> ...
 //       Writes n_vocab f32 to <out.bin> and prints "n_vocab <N>".
@@ -38,6 +51,10 @@
 //   llama_logits --tokenize <model.gguf> <cases.bin> <out.bin>
 //       Reads an FXTK case file, writes an FXTK result file, and prints
 //       "tokenized <N> cases".
+//
+//   llama_logits --embed <model.gguf> <text>
+//       Prints n_embd floats, one per line, un-normalized, and prints
+//       the token ids llama.cpp used to stderr.
 //
 // Exit codes: 0 ok, 1 failed, 2 bad arguments or a malformed case file,
 // 3 llama.cpp cannot load this checkpoint (see EXIT_MODEL_UNSUPPORTED).
@@ -354,6 +371,107 @@ static int cmd_logits(const char * model_path, const char * out_path, int n_toke
     return 0;
 }
 
+// ------------------------------------------------------------------- embed
+
+// Pooled embedding for one text, through llama.cpp's own tokenizer
+// (add_special = true, so a WPM vocab gets its [CLS]/[SEP]) and its own
+// pooling type (whatever the GGUF's `{arch}.pooling_type` said).
+static int cmd_embed(const char * model_path, const char * text) {
+    struct llama_model * model = load_model(model_path, false);
+    if (!model) {
+        return EXIT_MODEL_UNSUPPORTED;
+    }
+
+    const struct llama_vocab * vocab = llama_model_get_vocab(model);
+    const int text_len = (int) strlen(text);
+    int cap = text_len + 8;
+    llama_token * toks = (llama_token *) malloc(sizeof(llama_token) * (size_t) cap);
+    if (!toks) {
+        fprintf(stderr, "out of memory\n");
+        llama_model_free(model);
+        return 1;
+    }
+    int32_t n_tokens = llama_tokenize(vocab, text, text_len, toks, cap, true, true);
+    if (n_tokens < 0) {
+        cap = -n_tokens;
+        llama_token * grown = (llama_token *) realloc(toks, sizeof(llama_token) * (size_t) cap);
+        if (!grown) {
+            fprintf(stderr, "out of memory\n");
+            free(toks);
+            llama_model_free(model);
+            return 1;
+        }
+        toks = grown;
+        n_tokens = llama_tokenize(vocab, text, text_len, toks, cap, true, true);
+    }
+    if (n_tokens <= 0) {
+        fprintf(stderr, "tokenization produced %d tokens\n", (int) n_tokens);
+        free(toks);
+        llama_model_free(model);
+        return 1;
+    }
+
+    struct llama_context_params cparams = llama_context_default_params();
+    cparams.embeddings = true;
+    // A non-causal model cannot be split across micro-batches: every
+    // token attends to every other one, so n_ubatch must cover the whole
+    // sequence. Same reason the logits mode decodes in one call.
+    cparams.n_ctx    = (uint32_t) n_tokens + 8;
+    cparams.n_batch  = (uint32_t) n_tokens + 8;
+    cparams.n_ubatch = (uint32_t) n_tokens + 8;
+
+    struct llama_context * ctx = llama_init_from_model(model, cparams);
+    if (!ctx) {
+        fprintf(stderr, "failed to create context\n");
+        free(toks);
+        llama_model_free(model);
+        return 1;
+    }
+
+    struct llama_batch batch = llama_batch_init(n_tokens, 0, 1);
+    for (int32_t i = 0; i < n_tokens; i++) {
+        batch.token[i]     = toks[i];
+        batch.pos[i]       = (llama_pos) i;
+        batch.n_seq_id[i]  = 1;
+        batch.seq_id[i][0] = 0;
+        // Pooled output is produced only for positions flagged for
+        // output; the upstream embedding example flags every one.
+        batch.logits[i]    = 1;
+    }
+    batch.n_tokens = n_tokens;
+
+    int rc = 0;
+    if (llama_decode(ctx, batch) < 0) {
+        fprintf(stderr, "llama_decode failed\n");
+        rc = 1;
+    } else {
+        const enum llama_pooling_type pooling = llama_pooling_type(ctx);
+        const float * embd = (pooling == LLAMA_POOLING_TYPE_NONE)
+            ? llama_get_embeddings_ith(ctx, 0)
+            : llama_get_embeddings_seq(ctx, 0);
+        if (!embd) {
+            fprintf(stderr, "no embeddings returned (pooling_type %d)\n", (int) pooling);
+            rc = 1;
+        } else {
+            const int32_t n_embd = llama_model_n_embd(model);
+            fprintf(stderr, "pooling_type %d, n_tokens %d, ids:", (int) pooling, (int) n_tokens);
+            for (int32_t i = 0; i < n_tokens; i++) {
+                fprintf(stderr, " %d", (int) toks[i]);
+            }
+            fprintf(stderr, "\n");
+            for (int32_t i = 0; i < n_embd; i++) {
+                printf("%.9g\n", (double) embd[i]);
+            }
+        }
+    }
+
+    llama_batch_free(batch);
+    llama_free(ctx);
+    llama_model_free(model);
+    free(toks);
+    return rc;
+}
+
 int main(int argc, char ** argv) {
     if (argc >= 2 && strcmp(argv[1], "--tokenize") == 0) {
         if (argc != 5) {
@@ -366,9 +484,21 @@ int main(int argc, char ** argv) {
         return rc;
     }
 
+    if (argc >= 2 && strcmp(argv[1], "--embed") == 0) {
+        if (argc != 4) {
+            fprintf(stderr, "usage: %s --embed <model.gguf> <text>\n", argv[0]);
+            return 2;
+        }
+        llama_backend_init();
+        const int rc = cmd_embed(argv[2], argv[3]);
+        llama_backend_free();
+        return rc;
+    }
+
     if (argc < 4) {
         fprintf(stderr, "usage: %s <model.gguf> <out.bin> <tok0> [tok1 ...]\n", argv[0]);
         fprintf(stderr, "       %s --tokenize <model.gguf> <cases.bin> <out.bin>\n", argv[0]);
+        fprintf(stderr, "       %s --embed <model.gguf> <text>\n", argv[0]);
         return 2;
     }
 

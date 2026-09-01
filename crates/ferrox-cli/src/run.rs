@@ -642,7 +642,20 @@ fn cli_tokenizer_from_gguf(file: &ShardedGguf) -> anyhow::Result<CliTokenizer> {
         Some("t5") => Ok(CliTokenizer::Unigram(GgufUnigramTokenizer::from_gguf(
             file,
         )?)),
-        Some(known @ ("bert" | "rwkv" | "none")) => anyhow::bail!(
+        // `bert` is NOT here because the tokenizer is missing -- ferrox
+        // has WordPiece, and it is byte-exact against llama.cpp
+        // (`ferrox parity`). It is here because this is the *generation*
+        // path and a `bert` checkpoint is an encoder: no output head,
+        // no logits, nothing to sample. The refusal names where it can
+        // be used instead rather than repeating a claim that stopped
+        // being true.
+        Some("bert") => anyhow::bail!(
+            "this checkpoint's tokenizer is `bert` (WordPiece), which means it is a BERT-family \
+             ENCODER: it has no output head and cannot generate text, so there is nothing for \
+             `ferrox run` to sample. Ferrox can embed with it: start ferrox-server with \
+             FERROX_EMBEDDING_MODEL_PATH pointing at this file and POST /v1/embeddings."
+        ),
+        Some(known @ ("rwkv" | "none")) => anyhow::bail!(
             "this checkpoint's tokenizer is `{known}`, which ferrox cannot read yet. \
              Supported: `llama` (SentencePiece), `gpt2` and `gemma4` (BPE), `t5` (Unigram)."
         ),

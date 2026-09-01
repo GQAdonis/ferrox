@@ -418,6 +418,88 @@ kernel void f32_matvec(
 /// Host dispatches `ceil(n_rows/8)` threadgroups of 64 threads.
 ///
 /// Verified: see `launch_q4_0_matvec_matches_cpu_reference`.
+/// Q5_0 matrix-vector product.
+///
+/// Q5_0 has had a Metal simdgroup GEMM (`q5_0_mul_mm_sg`) for some time,
+/// so a Q5_0 checkpoint ran its PREFILL on the GPU while every DECODE
+/// step fell back to the CPU for want of this kernel -- the half of the
+/// run that dominates wall-clock for an interactive session.
+///
+/// Deliberately written straight rather than in the nibble-packed style
+/// of `Q4_0_MATVEC_KERNEL_SRC`. That kernel folds the `/256`, `/16` and
+/// `/4096` scaling into the activation so it can mask four nibbles out
+/// of one `ushort` at once; Q5_0's fifth bit lives in a separate 32-bit
+/// `qh` field indexed differently for the low and high halves, so the
+/// same trick needs two more shift chains and is much easier to get
+/// subtly wrong. The dequantisation here is `ggml`'s reference form.
+///
+/// One block per lane, 32 lanes striding the row: simpler than Q4_0's
+/// half-block split and correct for any block count, including rows
+/// whose block count is not a multiple of the simdgroup width.
+pub const Q5_0_MATVEC_KERNEL_SRC: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+inline float q5_0_mv_dot(device const uchar* block, thread const float* yl) {
+    const float d = float(*(device const half*)block);
+    const uint qh = uint(block[2]) | (uint(block[3]) << 8)
+        | (uint(block[4]) << 16) | (uint(block[5]) << 24);
+    device const uchar* qs = block + 6;
+    float acc = 0.0f;
+    for (uint j = 0u; j < 16u; ++j) {
+        // ggml `dequantize_row_q5_0`: the low half takes bit `j` of qh
+        // shifted up into position 4, the high half takes bit `j + 16`
+        // shifted down into it.
+        const uint xh_0 = ((qh >> j) << 4) & 0x10u;
+        const uint xh_1 = (qh >> (j + 12u)) & 0x10u;
+        const int x0 = int((uint(qs[j]) & 0x0Fu) | xh_0) - 16;
+        const int x1 = int((uint(qs[j]) >> 4) | xh_1) - 16;
+        acc += yl[j] * float(x0) + yl[j + 16u] * float(x1);
+    }
+    return d * acc;
+}
+
+kernel void q5_0_matvec(
+    device const uchar* weights [[buffer(0)]],
+    device const float* x [[buffer(1)]],
+    device float* out [[buffer(2)]],
+    constant uint& row_bytes [[buffer(3)]],
+    constant uint& n_blocks_per_row [[buffer(4)]],
+    constant uint& n_rows [[buffer(5)]],
+    uint tgpig [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]]
+) {
+    constexpr uint NR = 4u;
+    constexpr uint NSG = 2u;
+    const uint first_row = (tgpig * NSG + sg) * NR;
+    if (first_row >= n_rows) return;
+
+    float acc[NR] = { 0.0f };
+    for (uint b = lane; b < n_blocks_per_row; b += 32u) {
+        float yl[32];
+        device const float* yb = x + b * 32u;
+        for (uint i = 0u; i < 32u; ++i) {
+            yl[i] = yb[i];
+        }
+        for (uint rr = 0u; rr < NR; ++rr) {
+            const uint row = first_row + rr;
+            if (row >= n_rows) continue;
+            device const uchar* block =
+                weights + (size_t)row * row_bytes + (size_t)b * 22u;
+            acc[rr] += q5_0_mv_dot(block, yl);
+        }
+    }
+    for (uint rr = 0u; rr < NR; ++rr) {
+        const uint row = first_row + rr;
+        const float sum = simd_sum(acc[rr]);
+        if (lane == 0u && row < n_rows) {
+            out[row] = sum;
+        }
+    }
+}
+"#;
+
 pub const Q4_0_MATVEC_KERNEL_SRC: &str = r#"
 #include <metal_stdlib>
 using namespace metal;
@@ -4814,6 +4896,7 @@ pub fn matvec_launch_meta(kind: &str) -> Option<(&'static str, &'static str, usi
         "F32" => Some((F32_MATVEC_KERNEL_SRC, "f32_matvec", 4, 1, 1)),
         "Q8_0" => Some((Q8_0_MATVEC_KERNEL_SRC, "q8_0_matvec", 34, 32, 2)),
         "Q4_0" => Some((Q4_0_MATVEC_KERNEL_SRC, "q4_0_matvec", 18, 32, 8)),
+        "Q5_0" => Some((Q5_0_MATVEC_KERNEL_SRC, "q5_0_matvec", 22, 32, 8)),
         "Q4_K" => Some((Q4_K_MATVEC_KERNEL_SRC, "q4_k_matvec", 144, 256, 4)),
         "Q5_K" => Some((Q5_K_MATVEC_KERNEL_SRC, "q5_k_matvec", 176, 256, 2)),
         "Q6_K" => Some((Q6_K_MATVEC_KERNEL_SRC, "q6_k_matvec", 210, 256, 4)),
@@ -6885,6 +6968,24 @@ pub(crate) fn encode_matvec(
 ) -> Result<(), MetalError> {
     encode_matvec_with_offsets(encoder, device, launch, weight, x_buf, 0, out_buf, 0)
 }
+/// The threadgroup row count `matvec_launch_meta` declares for the
+/// kernel with this entry-point name.
+///
+/// One source of truth for a number that used to live in two places.
+/// Falls back to 1 only when no meta row names this kernel, which is a
+/// kernel outside the table entirely rather than a forgotten row.
+fn rows_per_threadgroup(fn_name: &str) -> usize {
+    for kind in [
+        "F32", "Q8_0", "Q4_0", "Q5_0", "Q4_K", "Q5_K", "Q6_K", "IQ4_XS",
+    ] {
+        if let Some((_, name, _, _, rows_per_tg)) = matvec_launch_meta(kind) {
+            if name == fn_name {
+                return rows_per_tg;
+            }
+        }
+    }
+    1
+}
 
 /// Shared internal launch plumbing for every matvec kernel in this
 /// module: the exact device/library/pipeline/buffer/dispatch sequence
@@ -6909,12 +7010,21 @@ fn launch_matvec(
     rows: usize,
     row_bytes: usize,
 ) -> Result<Vec<f32>, MetalError> {
-    let rows_per_tg = match fn_name {
-        "q4_0_matvec" => 8,
-        "q4_k_matvec" | "q6_k_matvec" | "iq4_xs_matvec" => 4,
-        "q5_k_matvec" | "q8_0_matvec" => 2,
-        _ => 1,
-    };
+    // Looked up in `matvec_launch_meta`, NOT restated here.
+    //
+    // This was a second hardcoded table keyed on `fn_name`, with a
+    // `_ => 1` default — so a kernel added to `matvec_launch_meta` and
+    // not to this match silently dispatched one row per threadgroup
+    // instead of eight, and every row past the first was never written.
+    // Adding `q5_0_matvec` hit exactly that: the kernel was correct and
+    // the output was zeros.
+    //
+    // Two tables that must agree about one number, with nothing
+    // enforcing it, is the bug shape this codebase has paid for
+    // repeatedly. `matvec_launch_meta` already carries the value as its
+    // fifth field; the default is now the honest 1 only for a kernel
+    // that has no meta row at all.
+    let rows_per_tg = rows_per_threadgroup(fn_name);
     let mut outs = launch_matvec_fused(
         x,
         &[MatvecLaunch {
@@ -6992,6 +7102,13 @@ pub(crate) fn encode_matvec_with_offsets(
     let (tg_threads, tg_mem_bytes) = match launch.fn_name {
         // ggml Q4_0: NSG=2 × NR0=4 → 8 rows / 64 threads; simd_sum only.
         "q4_0_matvec" => (64usize, 0usize),
+        // Q5_0: NSG=2 × NR=4 → the same 8 rows / 64 threads, simd_sum
+        // only. This entry is REQUIRED, not an optimisation: the
+        // `rows_per_tg > 1` default below dispatches 32 threads, i.e.
+        // ONE simdgroup, so `sg` is always 0 and the second group of
+        // four rows is never written. A correct kernel then returns
+        // zeros for half its rows, which is what it did.
+        "q5_0_matvec" => (64usize, 0usize),
         // ggml Q4_K / Q5_K / Q6_K: 2 simdgroups × 32 lanes, register packs (no TG mem).
         "q4_k_matvec" | "q5_k_matvec" | "q6_k_matvec" => (64usize, 0usize),
         // ggml Q8_0: NSG=4 simdgroups on nr0=2 rows; 2x4 floats of TG
@@ -7256,6 +7373,97 @@ mod tests {
     fn probe_finds_a_real_device_name() {
         let name = probe().expect("this dev machine has a real Metal GPU");
         assert!(!name.is_empty());
+    }
+
+    /// Build a Q5_0 block from 32 explicit 0..31 codes, in ggml's
+    /// on-disk layout.
+    ///
+    /// Hand-built rather than quantized, because `ferrox-quant` has
+    /// `dequant_q5_0` and no `quantize_q5_0` — and because a test that
+    /// round-trips through ferrox's own quantizer could not catch a
+    /// kernel that mirrors that quantizer's mistake. These codes are
+    /// chosen to put the fifth bit on both sides of the split: the low
+    /// half reads bit `j` of `qh`, the high half reads bit `j + 16`, and
+    /// a kernel that confuses the two passes any test whose codes are
+    /// all under 16.
+    fn q5_0_block(d: f32, codes: [u8; 32]) -> Vec<u8> {
+        let mut block = Vec::with_capacity(22);
+        block.extend_from_slice(&half::f16::from_f32(d).to_le_bytes());
+        let mut qh: u32 = 0;
+        for (j, &c) in codes.iter().enumerate() {
+            assert!(c < 32, "Q5_0 codes are 5-bit");
+            if c & 0x10 != 0 {
+                qh |= 1 << j;
+            }
+        }
+        block.extend_from_slice(&qh.to_le_bytes());
+        for j in 0..16 {
+            block.push((codes[j] & 0x0F) | ((codes[j + 16] & 0x0F) << 4));
+        }
+        block
+    }
+
+    /// The Q5_0 matvec, against `ferrox_quant::dequant_q5_0` as the
+    /// reference.
+    ///
+    /// Q5_0 had a Metal GEMM but no matvec, so a Q5_0 checkpoint ran
+    /// prefill on the GPU and every decode step on the CPU — the half of
+    /// the run that dominates an interactive session. This is the test
+    /// that lets the kernel be trusted.
+    ///
+    /// Shapes deliberately include a row count that is not a multiple of
+    /// the 8 rows a threadgroup covers (so the tail is clamped at the
+    /// write) and a block count that is not a multiple of the 32-lane
+    /// stride (so some lanes contribute nothing).
+    #[test]
+    #[ignore = "needs a real Metal-capable GPU; run manually with --ignored on Apple Silicon"]
+    fn q5_0_matvec_matches_the_reference_dequantizer() {
+        for (rows, blocks_per_row) in [(8usize, 32usize), (5, 3), (1, 1), (17, 40)] {
+            let cols = blocks_per_row * 32;
+            let x: Vec<f32> = (0..cols).map(|i| (i as f32 * 0.041).sin()).collect();
+
+            let mut weights: Vec<u8> = Vec::new();
+            let mut expected = Vec::with_capacity(rows);
+            for r in 0..rows {
+                let mut row_bytes: Vec<u8> = Vec::new();
+                for b in 0..blocks_per_row {
+                    let d = 0.05 + 0.01 * ((r + b) % 7) as f32;
+                    let codes: [u8; 32] =
+                        std::array::from_fn(|i| ((r * 13 + b * 5 + i * 3) % 32) as u8);
+                    row_bytes.extend_from_slice(&q5_0_block(d, codes));
+                }
+                let dequantized =
+                    ferrox_quant::dequant_q5_0(&row_bytes).expect("reference dequant");
+                assert_eq!(dequantized.len(), cols);
+                let acc: f64 = dequantized
+                    .iter()
+                    .zip(x.iter())
+                    .map(|(w, xv)| (w * xv) as f64)
+                    .sum();
+                expected.push(acc as f32);
+                weights.extend_from_slice(&row_bytes);
+            }
+
+            let got = launch_matvec(
+                Q5_0_MATVEC_KERNEL_SRC,
+                "q5_0_matvec",
+                22,
+                32,
+                &weights,
+                &x,
+                rows,
+                blocks_per_row * 22,
+            )
+            .expect("kernel launch");
+
+            assert_eq!(got.len(), rows, "rows={rows} blocks={blocks_per_row}");
+            for (i, (g, w)) in got.iter().zip(expected.iter()).enumerate() {
+                assert!(
+                    (g - w).abs() <= 1e-3 * w.abs().max(1.0),
+                    "row {i} of {rows} (blocks={blocks_per_row}): got {g}, reference {w}"
+                );
+            }
+        }
     }
 
     #[test]

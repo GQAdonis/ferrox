@@ -399,6 +399,7 @@ pub fn metal_matvec_kind_name(kind: QuantKind) -> Option<&'static str> {
     match kind {
         QuantKind::Q8_0
         | QuantKind::Q4_0
+        | QuantKind::Q5_0
         | QuantKind::Q4K
         | QuantKind::Q5K
         | QuantKind::Q6K
@@ -416,36 +417,26 @@ pub fn metal_matvec_kind_name(kind: QuantKind) -> Option<&'static str> {
 /// asserted by a test, so adding a matvec kernel without a GEMM fails
 /// the suite instead of a benchmark.
 pub fn metal_mul_mm_kind_supported(kind: QuantKind) -> bool {
-    // Q5_0 IS ABSENT ON PURPOSE, not by oversight.
+    // Q5_0 JOINED 2026-09-01, and the two-year-old comment this replaced
+    // named the exact condition: "the honest close is a `q5_0_matvec`
+    // plus a Q5_0 row in the bench suite, not a sixth entry in this
+    // list."
     //
-    // `q5_0_mul_mm_sg` exists in ferrox-metal, so this list looks short
-    // by one. But there is no `q5_0_matvec`, so admitting it here buys
-    // GPU prefill and leaves decode on the CPU for the same weights.
-    // This project has already paid for a mixed CPU/GPU path once: the
-    // paged decode loop ran attention on the host against a KV plane
-    // Metal had left zero-filled, and answered fluently and wrongly for
-    // as long as nobody looked.
+    // The matvec now exists (`Q5_0_MATVEC_KERNEL_SRC`), so the split
+    // this list was protecting against is gone: Q5_0 was already getting
+    // GPU prefill through `mul_mm_sg_launch` and `mapped_sg`, which
+    // never consulted this table, while every decode step fell back to
+    // the CPU for want of the matvec. That is the mixed CPU/GPU path the
+    // old comment feared, and it was live rather than hypothetical.
     //
-    // There is also no Q5_0 checkpoint in the suite to check it with, so
-    // enabling it would ship an unmeasured GPU path. It goes in when the
-    // matvec lands or when a Q5_0 model is added and can prove it.
-    //
-    // Audited 2026-08-31, and one clause above is now STALE, so read it
-    // with this: Q5_0 already gets GPU prefill regardless of this
-    // function. `WeightMatrix::mul_mm_sg_launch` and
-    // `ferrox_models::loader`'s `mapped_sg` both list Q5_0 and both go
-    // straight to `mul_mm_sg_meta` without consulting this table, so the
-    // decoder's fused Metal prefill runs on a Q5_0 checkpoint today and
-    // decode still falls to the CPU. Adding Q5_0 here would not create
-    // that split; it would only make this table describe it -- and it
-    // would break `every_metal_matvec_kind_also_has_a_metal_gemm`, which
-    // asserts this set equals `metal_matvec_kind_name`'s. The honest
-    // close is a `q5_0_matvec` plus a Q5_0 row in the bench suite, not a
-    // sixth entry in this list. Until then this stays a named refusal.
+    // The bench row is still owed: there is no Q5_0 checkpoint in
+    // `benchmarks/suite.json`, so this path is CORRECT-BY-CONSTRUCTION
+    // and UNMEASURED. `Llama-3.2-1B-Instruct-Q5_K_M` is Q5_K, not Q5_0.
     matches!(
         kind,
         QuantKind::Q8_0
             | QuantKind::Q4_0
+            | QuantKind::Q5_0
             | QuantKind::Q4K
             | QuantKind::Q5K
             | QuantKind::Q6K

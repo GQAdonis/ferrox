@@ -1,14 +1,14 @@
 {
-  "approx_params": 575143936,
-  "arch": "olmoe",
-  "backend": "metal",
+  "approx_params": 1599078400,
+  "arch": "llama",
+  "backend": "cpu",
   "backend_active": "Metal",
   "engine_env": {
     "FERROX_CPU_INT_DOT": "1"
   },
   "ferrox_version": "0.13.3",
-  "host_load_1min_end": 1.87,
-  "host_load_1min_start": 1.95,
+  "host_load_1min_end": 1.68,
+  "host_load_1min_start": 1.52,
   "host_spec": {
     "arch": "aarch64",
     "cores": 10,
@@ -32,39 +32,39 @@
     "pressure": "nominal",
     "source": "NSProcessInfo.thermalState"
   },
-  "id": "olmoe_q4",
+  "id": "llama32_1b_q5km",
   "kind": "engine",
-  "load_s": 0.014018833,
-  "model_path": "models/olmoe-1b-7b-0924-q4_0.gguf",
+  "load_s": 0.042540667,
+  "model_path": "models/Llama-3.2-1B-Instruct-Q5_K_M.gguf",
   "quant": "quantized",
   "quiet_host": true,
   "reps": 3,
   "schema": 2,
-  "size_bytes": 3928036960,
+  "size_bytes": 911503488,
   "tests": [
     {
       "ferrox_samples": [
-        1411.9757573249178,
-        1426.5227564134186,
-        1411.0554507917313
+        1028.9719926685746,
+        1030.7297209292435,
+        1041.056054418863
       ],
-      "ferrox_stddev": 7.084409249977866,
-      "ferrox_tps": 1411.9757573249178,
-      "gap": 1.097965026635547,
-      "llama_tps": 1550.3,
+      "ferrox_stddev": 5.3307006039645435,
+      "ferrox_tps": 1030.7297209292435,
+      "gap": 1.6437480802169533,
+      "llama_tps": 1694.26,
       "test": "pp512",
       "workload_digest": "b8d417040110e751"
     },
     {
       "ferrox_samples": [
-        154.5326898379646,
-        156.190179847501,
-        156.02289507753946
+        56.58791557229063,
+        58.31277119860469,
+        57.40688825960843
       ],
-      "ferrox_stddev": 0.7450554775787204,
-      "ferrox_tps": 156.02289507753946,
-      "gap": 1.0756113704760937,
-      "llama_tps": 167.82,
+      "ferrox_stddev": 0.7044672607615795,
+      "ferrox_tps": 57.40688825960843,
+      "gap": 2.0213602150884378,
+      "llama_tps": 116.04,
       "test": "tg128",
       "workload_digest": "044655d19aa3baa5"
     }

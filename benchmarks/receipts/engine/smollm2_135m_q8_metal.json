@@ -6,9 +6,18 @@
   "engine_env": {
     "FERROX_CPU_INT_DOT": "1"
   },
-  "ferrox_version": "0.12.0",
-  "host_load_1min_end": 1.91,
-  "host_load_1min_start": 1.91,
+  "ferrox_version": "0.13.3",
+  "host_load_1min_end": 1.43,
+  "host_load_1min_start": 1.56,
+  "host_spec": {
+    "arch": "aarch64",
+    "cores": 10,
+    "cpu": "Apple M2 Pro",
+    "label": "Apple M2 Pro (10c/6p) macOS 26.6.1",
+    "os": "macOS 26.6.1",
+    "perf_cores": 6,
+    "ram_gb": 32.0
+  },
   "host_thermal_end": {
     "cpu_speed_limit_percent": null,
     "degraded": false,
@@ -25,7 +34,7 @@
   },
   "id": "smollm2_135m_q8",
   "kind": "engine",
-  "load_s": 0.02190675,
+  "load_s": 0.02140925,
   "model_path": "models/hf_test/SmolLM2-135M-Instruct-Q8_0.gguf",
   "quant": "quantized",
   "quiet_host": true,
@@ -35,27 +44,27 @@
   "tests": [
     {
       "ferrox_samples": [
-        12061.970825202301,
-        11958.751463370461,
-        11986.2344652139
+        11698.501022167951,
+        12086.815060020479,
+        12309.504704719144
       ],
-      "ferrox_stddev": 43.64700355197031,
-      "ferrox_tps": 11986.2344652139,
-      "gap": 1.0240964362598046,
-      "llama_tps": 12275.06,
+      "ferrox_stddev": 252.47749513360816,
+      "ferrox_tps": 12086.815060020479,
+      "gap": 1.0011926169059375,
+      "llama_tps": 12101.23,
       "test": "pp512",
       "workload_digest": "b8d417040110e751"
     },
     {
       "ferrox_samples": [
-        332.37343193745147,
-        338.341380505523,
-        327.2465684649995
+        318.7255622933337,
+        310.29591568782894,
+        315.41812435222545
       ],
-      "ferrox_stddev": 4.533774407352177,
-      "ferrox_tps": 332.37343193745147,
-      "gap": 0.660792888046875,
-      "llama_tps": 219.63,
+      "ferrox_stddev": 3.4678701313245983,
+      "ferrox_tps": 315.41812435222545,
+      "gap": 0.6883244279189062,
+      "llama_tps": 217.11,
       "test": "tg128",
       "workload_digest": "044655d19aa3baa5"
     }

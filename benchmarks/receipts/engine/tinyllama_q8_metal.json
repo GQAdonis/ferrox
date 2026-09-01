@@ -6,9 +6,18 @@
   "engine_env": {
     "FERROX_CPU_INT_DOT": "1"
   },
-  "ferrox_version": "0.12.0",
-  "host_load_1min_end": 1.64,
-  "host_load_1min_start": 1.59,
+  "ferrox_version": "0.13.3",
+  "host_load_1min_end": 1.53,
+  "host_load_1min_start": 1.67,
+  "host_spec": {
+    "arch": "aarch64",
+    "cores": 10,
+    "cpu": "Apple M2 Pro",
+    "label": "Apple M2 Pro (10c/6p) macOS 26.6.1",
+    "os": "macOS 26.6.1",
+    "perf_cores": 6,
+    "ram_gb": 32.0
+  },
   "host_thermal_end": {
     "cpu_speed_limit_percent": null,
     "degraded": false,
@@ -25,7 +34,7 @@
   },
   "id": "tinyllama_q8",
   "kind": "engine",
-  "load_s": 0.008473583,
+  "load_s": 0.012410541,
   "model_path": "models/tinyllama-1.1b-chat-v1.0.Q8_0.gguf",
   "quant": "quantized",
   "quiet_host": true,
@@ -35,27 +44,27 @@
   "tests": [
     {
       "ferrox_samples": [
-        2024.0414216914382,
-        2028.2833978411966,
-        2024.2188054331282
+        2026.762231461575,
+        2022.5169657966628,
+        2031.9479444780861
       ],
-      "ferrox_stddev": 1.959215775385131,
-      "ferrox_tps": 2024.2188054331282,
-      "gap": 0.9847255616091797,
-      "llama_tps": 1993.3,
+      "ferrox_stddev": 3.8565565951557828,
+      "ferrox_tps": 2026.762231461575,
+      "gap": 0.9989134238701561,
+      "llama_tps": 2024.56,
       "test": "pp512",
       "workload_digest": "b8d417040110e751"
     },
     {
       "ferrox_samples": [
-        127.57832175202911,
-        127.49211387320308,
-        126.81321849471718
+        125.23084349265943,
+        126.76608541864675,
+        125.20285858667246
       ],
-      "ferrox_stddev": 0.3421685302190747,
-      "ferrox_tps": 127.49211387320308,
-      "gap": 0.7756558189814844,
-      "llama_tps": 98.89,
+      "ferrox_stddev": 0.7304054471073459,
+      "ferrox_tps": 125.23084349265943,
+      "gap": 0.8739061156799999,
+      "llama_tps": 109.44,
       "test": "tg128",
       "workload_digest": "044655d19aa3baa5"
     }

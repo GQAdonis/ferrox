@@ -6,9 +6,18 @@
   "engine_env": {
     "FERROX_CPU_INT_DOT": "1"
   },
-  "ferrox_version": "0.12.0",
-  "host_load_1min_end": 3.11,
-  "host_load_1min_start": 1.99,
+  "ferrox_version": "0.13.3",
+  "host_load_1min_end": 1.89,
+  "host_load_1min_start": 1.54,
+  "host_spec": {
+    "arch": "aarch64",
+    "cores": 10,
+    "cpu": "Apple M2 Pro",
+    "label": "Apple M2 Pro (10c/6p) macOS 26.6.1",
+    "os": "macOS 26.6.1",
+    "perf_cores": 6,
+    "ram_gb": 32.0
+  },
   "host_thermal_end": {
     "cpu_speed_limit_percent": null,
     "degraded": false,
@@ -25,7 +34,7 @@
   },
   "id": "gemma4_e2b_q4km",
   "kind": "engine",
-  "load_s": 0.385559666,
+  "load_s": 0.370968,
   "model_path": "models/gemma-4-E2B-it-Q4_K_M.gguf",
   "quant": "quantized",
   "quiet_host": true,
@@ -35,12 +44,12 @@
   "tests": [
     {
       "ferrox_samples": [
-        14.457260583979227,
-        14.236137766516169,
-        14.175720313736365
+        14.273297200945537,
+        14.375878600983857,
+        14.259120932077906
       ],
-      "ferrox_stddev": 0.12101904935983558,
-      "ferrox_tps": 14.236137766516169,
+      "ferrox_stddev": 0.052021644513692324,
+      "ferrox_tps": 14.273297200945537,
       "gap": null,
       "llama_tps": null,
       "test": "pp512",
@@ -48,12 +57,12 @@
     },
     {
       "ferrox_samples": [
-        15.71577344412002,
-        15.724082561456568,
-        15.69015394459142
+        15.907407619246117,
+        15.959032580860244,
+        15.816261501619344
       ],
-      "ferrox_stddev": 0.014439726180038217,
-      "ferrox_tps": 15.71577344412002,
+      "ferrox_stddev": 0.0590257311947791,
+      "ferrox_tps": 15.907407619246117,
       "gap": null,
       "llama_tps": null,
       "test": "tg128",

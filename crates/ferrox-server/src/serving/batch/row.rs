@@ -10,10 +10,10 @@ use std::collections::{HashMap, HashSet};
 use std::sync::mpsc::Sender;
 
 use ferrox_core::cache::KvCache;
-use ferrox_models::sampling::Sampler;
 use ferrox_models::tokenizer::StopTokens;
 
-use crate::generate::{FinishReason, GenerationParams, PagedLease, Usage};
+use crate::generate::{DecodeError, FinishReason, GenerationParams, PagedLease, Usage};
+use crate::sample_step::SampleState;
 use crate::stop::StopMatcher;
 
 use super::block_budget::BlockBudget;
@@ -177,7 +177,11 @@ pub(super) struct Slot {
     pub(super) kv: RowKv,
     pub(super) pos: usize,
     pub(super) logits: Vec<f32>,
-    pub(super) sampler: Sampler,
+    /// The seeded sampler AND this row's live grammar parse, in one
+    /// value: a row that could hold the first without the second is a
+    /// row that can sample a token its grammar forbids. See
+    /// [`crate::sample_step`].
+    pub(super) sample: SampleState,
     pub(super) generated_ids: Vec<usize>,
     /// The prompt this row ran, kept so a finished paged row can
     /// PUBLISH its prefix to the radix tree. Without it the batched
@@ -194,15 +198,45 @@ pub(super) struct Slot {
     pub(super) params: GenerationParams,
     pub(super) reply: Sender<JobResult>,
     pub(super) finish: Option<FinishReason>,
+    /// Set instead of an answer when this row cannot be served -- today,
+    /// only a grammar it cannot continue. Kept beside `finish` rather
+    /// than replacing it so a failed row leaves through the SAME
+    /// `flush_finished` path as every other ended row: its blocks are
+    /// released and its caller replied to exactly once, which a second
+    /// removal path is exactly how to get wrong.
+    pub(super) error: Option<DecodeError>,
     pub(super) abort: AbortId,
     /// KV blocks this row reserved at admission, returned when it ends.
     pub(super) blocks: usize,
+}
+
+impl Slot {
+    /// End this row with an error rather than an answer.
+    ///
+    /// One row's refusal, not the batch's: every other row in flight is
+    /// unaffected, which is the whole reason a per-row error exists
+    /// instead of a worker that stops.
+    pub(super) fn fail(&mut self, error: DecodeError) {
+        // `finish` is what `Rows::ready` and `Rows::flush_finished`
+        // read, so it is set here too -- a row with an error and no
+        // finish would keep taking decode steps forever.
+        self.finish = Some(FinishReason::Stop);
+        self.error = Some(error);
+    }
 }
 
 /// Sends one finished row's result to its own waiting caller. Takes the
 /// `Slot` by value, so a row's reply channel travels with its state and
 /// cannot be paired with another row's output.
 pub(super) fn reply_finished(mut slot: Slot) {
+    // A row that failed reports the failure, not the partial text it
+    // had produced: the caller asked for output under a constraint, and
+    // text that stops short of satisfying it is not a shorter answer to
+    // that question.
+    if let Some(error) = slot.error {
+        let _ = slot.reply.send(Err(error));
+        return;
+    }
     let finish = slot.finish.expect("only a finished row is replied to");
     // Text withheld against a stop that never arrived is ordinary
     // output; dropping it would truncate every answer whose tail looks

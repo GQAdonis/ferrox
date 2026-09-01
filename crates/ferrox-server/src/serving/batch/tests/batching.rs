@@ -71,6 +71,7 @@ fn continuous_batching_composes_with_paged_kv() {
             stop: vec![],
             stop_token_ids: Vec::new(),
             json_object: params[i].json_object,
+            grammar: None,
             cancel: params[i].cancel.clone(),
             ignore_eos: false,
         };
@@ -258,6 +259,7 @@ fn continuous_batch_matches_sequential_generate_token_ids() {
             stop: vec![],
             stop_token_ids: Vec::new(),
             json_object: params[i].json_object,
+            grammar: None,
             cancel: params[i].cancel.clone(),
             ignore_eos: false,
         };
@@ -565,6 +567,115 @@ fn max_seqs_cap_counts_prefilling_prompts_and_still_serves_both() {
     let got: Vec<Vec<usize>> = handles.into_iter().map(|h| h.join().unwrap()).collect();
     assert_eq!(got[0], expected[0]);
     assert_eq!(got[1], expected[1]);
+}
+
+/// The other constrained-decoding feature, on the other decode loop.
+///
+/// A grammar rides on `GenerationParams` exactly as `json_object` does,
+/// so the way it gets dropped here is the same way JSON mode did: the
+/// batcher sampling for itself instead of through `sample_step`. The
+/// detokenizer makes every EVEN id render as `b` and every odd id as
+/// `a`, and `root ::= "a"+` admits only the odd ones -- decidable from
+/// the ids alone, with no model behaviour assumed.
+///
+/// Both halves are asserted. The unconstrained run must reach an even
+/// id, or the constrained run below proves nothing.
+#[test]
+fn a_grammar_constrains_a_batched_row_as_it_does_a_private_one() {
+    let decoder = tiny_decoder();
+    let decode: DecodeFn = Arc::new(|ids: &[usize]| {
+        ids.iter()
+            .map(|id| if id % 2 == 0 { 'b' } else { 'a' })
+            .collect()
+    });
+    let batcher = ContinuousBatcher::spawn_with_config(
+        Arc::clone(&decoder),
+        decode,
+        BatcherConfig {
+            prefill_chunk: 1,
+            ..BatcherConfig::default()
+        },
+    );
+
+    let prompt = vec![1usize, 2, 3];
+    let run = |grammar: Option<&str>| {
+        let mut params = greedy_params(12, 5);
+        params.grammar = grammar.map(|src| {
+            Arc::new(
+                ferrox_models::grammar::Grammar::from_str_with_root(src, "root")
+                    .expect("test grammar parses"),
+            )
+        });
+        batcher
+            .generate(prompt.clone(), params, StopTokens::default())
+            .expect("generate")
+            .1
+    };
+
+    let unconstrained = run(None);
+    assert!(
+        unconstrained.iter().any(|id| id % 2 == 0),
+        "the unconstrained run reached no forbidden token, so the \
+         constrained run below would prove nothing"
+    );
+
+    let constrained = run(Some(r#"root ::= "a"+"#));
+    assert!(
+        !constrained.is_empty(),
+        "a grammar-constrained batched row must still produce tokens"
+    );
+    assert!(
+        constrained.iter().all(|id| id % 2 == 1),
+        "a batched row sampled a token that renders as `b`: the grammar \
+         was not applied ({constrained:?})"
+    );
+}
+
+/// A batched row whose grammar cannot be satisfied fails THAT ROW, and
+/// says why. The alternative -- a 200 carrying text the grammar forbids
+/// -- is the failure this whole path exists to prevent, and a worker
+/// that panicked or hung would take every other row down with it.
+#[test]
+fn a_batched_row_whose_grammar_dead_ends_is_refused_by_itself() {
+    let decoder = tiny_decoder();
+    let decode: DecodeFn = Arc::new(|ids: &[usize]| {
+        ids.iter()
+            .map(|id| if id % 2 == 0 { 'b' } else { 'a' })
+            .collect()
+    });
+    let batcher = ContinuousBatcher::spawn_with_config(
+        Arc::clone(&decoder),
+        decode,
+        BatcherConfig {
+            prefill_chunk: 1,
+            ..BatcherConfig::default()
+        },
+    );
+
+    let mut params = greedy_params(8, 5);
+    params.grammar = Some(Arc::new(
+        // No token in this vocabulary renders as "z".
+        ferrox_models::grammar::Grammar::from_str_with_root(r#"root ::= "z""#, "root")
+            .expect("test grammar parses"),
+    ));
+    let err = batcher
+        .generate(vec![1usize, 2, 3], params, StopTokens::default())
+        .expect_err("this grammar cannot be served");
+    assert!(
+        matches!(err, DecodeError::GrammarConstraint { .. }),
+        "{err}"
+    );
+
+    // The batcher is still serving: the refusal was one row's, not the
+    // worker's.
+    let after = batcher
+        .generate(
+            vec![1usize, 2, 3],
+            greedy_params(4, 5),
+            StopTokens::default(),
+        )
+        .expect("the worker survives a row it had to refuse");
+    assert_eq!(after.1.len(), 4);
 }
 
 /// A per-request feature must not depend on a server-side env var.

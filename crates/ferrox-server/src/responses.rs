@@ -653,6 +653,11 @@ fn to_chat_request(req: &ResponsesRequest) -> Result<ChatCompletionRequest, ApiE
         presence_penalty: None,
         frequency_penalty: None,
         response_format: None,
+        // Neither surface has a grammar field of its own yet. Named
+        // rather than defaulted so that adding one is a compile error
+        // here first, instead of a constraint silently dropped on the
+        // way through the chat request these translate into.
+        grammar: None,
         // Not on the Responses wire.
         logit_bias: None,
     };
@@ -689,6 +694,10 @@ fn failure_code(error: &DecodeError) -> &'static str {
         DecodeError::KvBudgetExceeded { binding, .. } => binding,
         DecodeError::TokenOutOfVocab { .. } => "invalid_prompt",
         DecodeError::KvPoolExhausted | DecodeError::QueueFull { .. } => "server_overloaded",
+        // The request named a constraint this model cannot satisfy, so
+        // it is the request that is invalid -- retrying it unchanged
+        // fails identically.
+        DecodeError::GrammarConstraint { .. } => "invalid_grammar",
     }
 }
 
@@ -1430,7 +1439,7 @@ async fn responses_full(
     let offered = offered_tools(&chat);
     let prompt = prompt_from_messages(&chat.messages, &template, &offered, kwargs)?;
     let posture = OutputPosture::resolve(active.model.name(), &prompt);
-    let params = chat.generation_params_for_template(&template);
+    let params = chat.generation_params_for_template(&template)?;
 
     let model = Arc::clone(&active.model);
     let kv_pool = state.kv_pool.clone();
@@ -1505,7 +1514,7 @@ async fn responses_stream(
     let prompt = prompt_from_messages(&chat.messages, &template, &offered, kwargs)?;
     let served_model = active.model.name().to_string();
     let posture = OutputPosture::resolve(&served_model, &prompt);
-    let mut params = chat.generation_params_for_template(&template);
+    let mut params = chat.generation_params_for_template(&template)?;
 
     // The same two-tier cancellation the chat stream has: the guard
     // rides with the generation task and deregisters however that task

@@ -178,6 +178,12 @@ pub(crate) struct CompletionsRequest {
     suffix: Option<String>,
     #[serde(default)]
     logit_bias: Option<serde_json::Value>,
+    /// A GBNF grammar every sampled token must keep parseable. The same
+    /// field, with the same meaning, as on `/v1/chat/completions`: a
+    /// constraint the two routes spelled differently would be a
+    /// constraint one of them eventually dropped.
+    #[serde(default)]
+    grammar: Option<String>,
     #[serde(default)]
     response_format: Option<serde_json::Value>,
 }
@@ -249,6 +255,11 @@ impl CompletionsRequest {
                 )));
             }
         }
+        // Compiled here so an unparseable grammar is a 400 before any
+        // prompt is tokenized. `response_format` is not passed: this
+        // route refuses every value of it but `text` just below, so
+        // there is no `json_schema` for the grammar seam to answer.
+        crate::grammar_request::for_request(self.grammar.as_deref(), None)?;
         // `{"type": "text"}` is the default and means nothing to refuse.
         if let Some(fmt) = &self.response_format {
             let kind = fmt.get("type").and_then(|v| v.as_str());
@@ -515,6 +526,7 @@ pub async fn completions(
         seed: req.seed.unwrap_or(0),
         stop: req.stop_sequences(),
         json_object: false,
+        grammar: crate::grammar_request::for_request(req.grammar.as_deref(), None)?,
         // `/v1/completions` is buffered rather than streamed here, so
         // there is no first chunk on which to state a request id and
         // nothing for a client to name in a cancel.
@@ -600,6 +612,24 @@ mod tests {
 
         let none = request(serde_json::json!({"prompt": "hi"}));
         assert!(none.stop_sequences().is_empty());
+    }
+
+    /// The same field, on the other route. A constraint honoured by
+    /// `/v1/chat/completions` and dropped by `/v1/completions` is the
+    /// `logit_bias` bug again, with a different field name.
+    #[test]
+    fn a_grammar_on_the_completions_wire_is_compiled_rather_than_dropped() {
+        let req = request(serde_json::json!({"prompt": "hi", "grammar": "root ::= \"a\"+"}));
+        req.validate().expect("a valid grammar is a valid request");
+        assert!(
+            crate::grammar_request::for_request(req.grammar.as_deref(), None)
+                .expect("it compiled during validate too")
+                .is_some()
+        );
+
+        let bad = request(serde_json::json!({"prompt": "hi", "grammar": "root ::= \"a"}));
+        let (status, _) = bad.validate().expect_err("this does not parse");
+        assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
     }
 
     /// The knobs this route accepted-and-dropped. `top_k`,

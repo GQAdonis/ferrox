@@ -18,8 +18,8 @@ use crate::generate::{GenerationParams, PagedLease};
 use super::config::JobResult;
 use super::queue::AbortId;
 use super::row::{RowKv, Slot};
+use crate::sample_step::SampleState;
 use crate::stop::StopMatcher;
-use ferrox_models::sampling::Sampler;
 
 /// One request's prefill as a resumable state machine.
 ///
@@ -185,7 +185,7 @@ impl Prefill {
             kv,
             pos,
             logits,
-            sampler: Sampler::new(params.seed),
+            sample: SampleState::new(params.seed),
             generated_ids: Vec::with_capacity(params.max_tokens),
             prompt_ids,
             visible: String::new(),
@@ -196,6 +196,7 @@ impl Prefill {
             params,
             reply,
             finish: None,
+            error: None,
             abort,
             blocks,
         }

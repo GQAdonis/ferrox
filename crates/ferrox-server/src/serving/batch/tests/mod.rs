@@ -63,6 +63,7 @@ fn greedy_params(max_tokens: usize, seed: u64) -> GenerationParams {
         stop: vec![],
         stop_token_ids: Vec::new(),
         json_object: false,
+        grammar: None,
         cancel: None,
         ignore_eos: false,
     }
@@ -131,7 +132,7 @@ fn test_slot(max_tokens: usize, seed: u64) -> (Slot, mpsc::Receiver<JobResult>) 
             kv: RowKv::Contiguous(Vec::new()),
             pos: 0,
             logits: Vec::new(),
-            sampler: Sampler::new(seed),
+            sample: crate::sample_step::SampleState::new(seed),
             generated_ids: Vec::new(),
             visible: String::new(),
             stops: StopMatcher::new(&params.stop, &params.stop_token_ids),
@@ -143,6 +144,7 @@ fn test_slot(max_tokens: usize, seed: u64) -> (Slot, mpsc::Receiver<JobResult>) 
             abort: AbortId(0),
             blocks: 1,
             finish: None,
+            error: None,
         },
         rx,
     )

@@ -16,7 +16,7 @@ use ferrox_core::cache::{
     KvBlockPool, KvCache, KvPoolExhausted as CacheKvPoolExhausted, PageGroup, PagedKvCache,
     PagedStoreExhausted, SharedPagedKv,
 };
-use ferrox_models::sampling::{Sampler, SamplingParams};
+use ferrox_models::sampling::SamplingParams;
 use ferrox_models::tokenizer::{prepend_bos, StopTokens};
 use ferrox_models::{Ceiling, Decoder, Engine, KvElem, KvShape, PrefixCache, TextTokenizer};
 
@@ -65,6 +65,18 @@ pub enum DecodeError {
         positions_limit: usize,
         detail: String,
     },
+    /// Grammar-constrained decoding could not continue.
+    ///
+    /// Two live causes, both properties of the *request* rather than of
+    /// the server: a grammar this model's vocabulary cannot spell, so
+    /// every logit was masked; and a sampled token the grammar refused,
+    /// which means the mask and the accept disagreed. Either way the
+    /// only alternative is to emit a token the caller's grammar forbids
+    /// and report it as constrained output, so this stops instead. See
+    /// [`ferrox_models::grammar_sampler::ConstraintError`], whose text
+    /// is carried in `detail`.
+    #[error("grammar-constrained decoding stopped: {detail}")]
+    GrammarConstraint { detail: String },
 }
 
 impl DecodeError {
@@ -73,6 +85,9 @@ impl DecodeError {
     pub fn retry_after_secs(&self) -> Option<u64> {
         match self {
             DecodeError::TokenOutOfVocab { .. } => None,
+            // The same grammar against the same vocabulary fails the
+            // same way on every retry.
+            DecodeError::GrammarConstraint { .. } => None,
             // Retrying an over-budget request changes nothing: the
             // ceiling it hit is the whole server, not the current load.
             DecodeError::KvBudgetExceeded { .. } => None,
@@ -1004,6 +1019,20 @@ pub struct GenerationParams {
     /// validate the emitted text is a JSON object (best-effort; see
     /// `json_mode` module).
     pub json_object: bool,
+    /// A GBNF grammar every sampled token must keep parseable.
+    ///
+    /// The *initial* machine, shared: a request's live parse state is
+    /// per-generation and lives in `sample_step::SampleState`, which
+    /// clones this on its first constrained step. An `Arc` because
+    /// `GenerationParams` is cloned per request and a compiled grammar
+    /// is a rule table, not a flag.
+    ///
+    /// This is the real constraint; `json_object` above is the
+    /// stateless character-class approximation that predates it. They
+    /// compose (both masks run, neither can unmask), so a request may
+    /// set both, and a `json_object` request whose grammar is
+    /// `json.gbnf` is simply the strict version of itself.
+    pub grammar: Option<std::sync::Arc<ferrox_models::grammar::Grammar>>,
     /// Cooperative stop flag, polled once per decoded token.
     ///
     /// It rides on the params rather than being a separate argument
@@ -1064,8 +1093,14 @@ impl GenerationParams {
     /// distribution -- is one arm added here and is then true everywhere
     /// the question is asked. Both askers are named in the doc of
     /// [`greedy_gpu_fold_allowed`].
+    ///
+    /// The grammar arm is that next thing, and it needs the vocabulary
+    /// even harder than JSON mode does: a grammar's mask is the ONLY
+    /// reason its output parses, so a folded argmax under a grammar is
+    /// unconstrained text served against a `response_format` the caller
+    /// was told was honoured.
     pub(crate) fn needs_vocab_logits(&self) -> bool {
-        self.json_object
+        self.json_object || self.grammar.is_some()
     }
 }
 
@@ -1443,7 +1478,7 @@ pub fn generate(
         },
         &mut emit,
         &decode_token,
-    );
+    )?;
     let decode_secs = decode_start.elapsed().as_secs_f64();
     logits = final_logits;
     let mut usage =
@@ -1537,6 +1572,11 @@ pub fn generate(
 /// exactly one place. Returns the finish reason, the generated token
 /// ids, and the final logits (the prediction for whatever would come
 /// next), since `generate`'s prefix-cache storage needs both.
+///
+/// Fallible since constrained decoding landed: a grammar that cannot be
+/// continued ends the generation with an error rather than with an
+/// answer, because the alternative is to emit a token the caller's
+/// grammar forbids and report it as constrained output.
 #[allow(clippy::too_many_arguments)] // one call site each from `generate`
                                      // and `generate_engine`; splitting it would only move the arguments.
 fn sample_until_stop(
@@ -1548,9 +1588,9 @@ fn sample_until_stop(
     mut step: impl FnMut(usize, usize) -> Vec<f32>,
     mut emit: impl FnMut(&str),
     decode_token: &dyn Fn(usize) -> String,
-) -> (FinishReason, Vec<usize>, Vec<f32>) {
+) -> Result<(FinishReason, Vec<usize>, Vec<f32>), DecodeError> {
     let mut matcher = crate::stop::StopMatcher::new(&params.stop, &params.stop_token_ids);
-    let mut sampler = Sampler::new(params.seed);
+    let mut state = crate::sample_step::SampleState::new(params.seed);
     let mut generated_ids: Vec<usize> = Vec::with_capacity(params.max_tokens);
     let mut finish = FinishReason::Length;
 
@@ -1564,13 +1604,25 @@ fn sample_until_stop(
             finish = FinishReason::Cancelled;
             break;
         }
-        let next = crate::sample_step::sample_next(
-            &mut sampler,
+        let next = match crate::sample_step::sample_next(
+            &mut state,
             &logits,
             params,
             &generated_ids,
+            stop_tokens,
             decode_token,
-        );
+        )? {
+            crate::sample_step::Step::Token(next) => next,
+            // The grammar's parse is complete and nothing may follow
+            // it. A finished answer, so `Stop` -- the same reason the
+            // model's own end-of-generation token gives, since it is
+            // the same statement made by the constraint instead of by
+            // the model.
+            crate::sample_step::Step::GrammarComplete => {
+                finish = FinishReason::Stop;
+                break;
+            }
+        };
         if !params.ignore_eos && stop_tokens.contains(next) {
             finish = FinishReason::Stop;
             break;
@@ -1612,7 +1664,7 @@ fn sample_until_stop(
         emit(&tail);
     }
 
-    (finish, generated_ids, logits)
+    Ok((finish, generated_ids, logits))
 }
 
 /// The generic counterpart to `generate`, for any `Engine` other than
@@ -1680,7 +1732,7 @@ pub fn generate_engine<E: Engine, T: TextTokenizer>(
         },
         &mut emit,
         &|id: usize| tokenizer.decode(&[id]),
-    );
+    )?;
     let decode_secs = decode_start.elapsed().as_secs_f64();
 
     let mut usage =
@@ -1734,6 +1786,7 @@ mod tests {
             stop: Vec::new(),
             stop_token_ids: Vec::new(),
             json_object: false,
+            grammar: None,
             cancel: None,
             ignore_eos: false,
         }
@@ -2125,6 +2178,7 @@ mod tests {
                 stop: vec!["ZZ_NEVER_MATCHES_ZZ".to_string()],
                 stop_token_ids: Vec::new(),
                 json_object: false,
+                grammar: None,
                 cancel: None,
                 ignore_eos: false,
             },
@@ -2162,6 +2216,21 @@ mod tests {
         params: &GenerationParams,
         stop_tokens: StopTokens,
     ) -> (FinishReason, Vec<usize>, Vec<String>) {
+        try_run_scripted_with_stops(script, render, params, stop_tokens)
+            .expect("an unconstrained script cannot fail to decode")
+    }
+
+    /// As [`run_scripted_with_stops`], for the tests that are ABOUT a
+    /// generation that stops with an error -- a grammar with no legal
+    /// continuation. Everything else goes through the unwrapping
+    /// version, so a decode that starts failing is a test failure
+    /// rather than a quietly different return value.
+    fn try_run_scripted_with_stops(
+        script: &[usize],
+        render: impl Fn(usize) -> String,
+        params: &GenerationParams,
+        stop_tokens: StopTokens,
+    ) -> Result<(FinishReason, Vec<usize>, Vec<String>), DecodeError> {
         let vocab = script.iter().copied().max().unwrap_or(0) + 2;
         let logits_for = |id: usize| {
             let mut v = vec![0.0f32; vocab];
@@ -2188,8 +2257,8 @@ mod tests {
             |_tok, _pos| logits_for(take()),
             |chunk| chunks.push(chunk.to_string()),
             &render,
-        );
-        (finish, ids, chunks)
+        )?;
+        Ok((finish, ids, chunks))
     }
 
     fn scripted_params(max_tokens: usize) -> GenerationParams {
@@ -2203,9 +2272,87 @@ mod tests {
             stop: Vec::new(),
             stop_token_ids: Vec::new(),
             json_object: false,
+            grammar: None,
             cancel: None,
             ignore_eos: false,
         }
+    }
+
+    /// A grammar reaches the PRIVATE decode loop -- the one `generate`
+    /// runs -- and both of its halves do.
+    ///
+    /// The script wants token 2 ("c") at every step, and `root ::= "ab"`
+    /// makes that illegal at every step. The mask alone would give
+    /// `[0, 0]`, because without the accept the grammar keeps answering
+    /// "what may the FIRST token be?"; both halves give `[0, 1]`, which
+    /// is the only string this grammar admits.
+    ///
+    /// The vacuity check is the unconstrained run below it: the same
+    /// script with no grammar must produce the token the grammar had to
+    /// take away, or this proves nothing.
+    #[test]
+    fn a_grammar_constrains_the_private_decode_loop() {
+        let render = |id: usize| char::from(b'a' + id as u8).to_string();
+        let script = [2usize, 2, 2, 2];
+
+        let unconstrained = run_scripted(&script, render, &scripted_params(2));
+        assert_eq!(
+            unconstrained.1,
+            vec![2, 2],
+            "the model wants \"cc\", so a grammar forbidding it has work to do"
+        );
+
+        let mut params = scripted_params(2);
+        params.grammar = Some(std::sync::Arc::new(
+            ferrox_models::grammar::Grammar::from_str_with_root(r#"root ::= "ab""#, "root")
+                .expect("test grammar parses"),
+        ));
+        let (finish, ids, chunks) = run_scripted(&script, render, &params);
+        assert_eq!(
+            ids,
+            vec![0, 1],
+            "the grammar was not applied token by token"
+        );
+        assert_eq!(chunks.concat(), "ab");
+        assert_eq!(finish, FinishReason::Length);
+    }
+
+    /// The same loop, where the grammar finishes before `max_tokens`
+    /// does and this vocabulary has no end-of-generation token to end
+    /// on: a COMPLETE answer, reported as `Stop` rather than as an
+    /// error or as 8 tokens of whatever came next.
+    #[test]
+    fn a_completed_grammar_ends_the_private_decode_loop() {
+        let render = |id: usize| char::from(b'a' + id as u8).to_string();
+        let mut params = scripted_params(8);
+        params.grammar = Some(std::sync::Arc::new(
+            ferrox_models::grammar::Grammar::from_str_with_root(r#"root ::= "ab""#, "root")
+                .expect("test grammar parses"),
+        ));
+        let (finish, ids, chunks) = run_scripted(&[2usize; 8], render, &params);
+        assert_eq!(ids, vec![0, 1]);
+        assert_eq!(chunks.concat(), "ab");
+        assert_eq!(finish, FinishReason::Stop);
+    }
+
+    /// And a grammar this vocabulary cannot spell STOPS, with an error
+    /// naming the constraint -- rather than serving text that does not
+    /// satisfy the grammar the caller was told was applied.
+    #[test]
+    fn a_grammar_the_vocabulary_cannot_spell_fails_the_generation() {
+        let render = |id: usize| char::from(b'a' + id as u8).to_string();
+        let mut params = scripted_params(4);
+        params.grammar = Some(std::sync::Arc::new(
+            ferrox_models::grammar::Grammar::from_str_with_root(r#"root ::= "z""#, "root")
+                .expect("test grammar parses"),
+        ));
+        let err =
+            try_run_scripted_with_stops(&[2usize; 4], render, &params, StopTokens::from_eos(None))
+                .expect_err("no token in this vocabulary renders as \"z\"");
+        assert!(
+            matches!(err, DecodeError::GrammarConstraint { .. }),
+            "{err}"
+        );
     }
 
     /// Layer 1: a stop *token* ends the answer, and the token itself
@@ -2406,6 +2553,7 @@ mod tests {
                 stop: vec![stop_str.clone()],
                 stop_token_ids: Vec::new(),
                 json_object: false,
+                grammar: None,
                 cancel: None,
                 ignore_eos: false,
             },

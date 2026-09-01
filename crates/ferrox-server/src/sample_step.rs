@@ -13,28 +13,97 @@
 //! constraint means adding it to [`sample_next`], and it is then in
 //! effect on both paths or on neither -- which is the only way the two
 //! can be made to agree about a constraint that does not exist yet.
+//!
+//! # Why the state is a struct and not a `Sampler`
+//!
+//! A grammar is not a filter, it is a parse in progress: the mask before
+//! the sample and the accept after it are one operation split in half,
+//! and a loop that keeps only the first half emits text that satisfies
+//! the grammar's FIRST token forever. So a decode loop no longer holds a
+//! `Sampler`, it holds a [`SampleState`], and the only thing it can do
+//! with one is call [`sample_next`] -- which does both halves. A third
+//! decode loop cannot repeat the JSON-mode bug here, because there is no
+//! shorter call for it to reach for.
 
+use ferrox_models::grammar_sampler::{ConstraintError, GrammarSampler, MaskOutcome};
 use ferrox_models::sampling::Sampler;
+use ferrox_models::tokenizer::StopTokens;
 
-use crate::generate::GenerationParams;
+use crate::generate::{DecodeError, GenerationParams};
 use crate::json_mode::mask_logits_for_json;
 
-/// Sample the next token id from `logits` under `params`.
+/// Everything a decode loop carries between token steps for ONE request:
+/// the seeded sampler, and the live grammar parse when there is one.
+pub(crate) struct SampleState {
+    sampler: Sampler,
+    /// Built on the first constrained step rather than at construction:
+    /// the vocabulary view a grammar needs (every token's piece, every
+    /// token's end-of-generation flag) is only knowable once a logits
+    /// vector has said how big the vocabulary is, and the batcher builds
+    /// its rows before it has ever decoded one.
+    grammar: Option<GrammarSampler>,
+}
+
+impl SampleState {
+    pub(crate) fn new(seed: u64) -> Self {
+        Self {
+            sampler: Sampler::new(seed),
+            grammar: None,
+        }
+    }
+
+    /// Whether a grammar is being applied. For tests and diagnostics;
+    /// `false` before the first constrained step even for a request that
+    /// has a grammar.
+    #[cfg(test)]
+    pub(crate) fn grammar_started(&self) -> bool {
+        self.grammar.is_some()
+    }
+}
+
+/// What one step of a decode loop got out of the sampler.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Step {
+    /// Sampled this token id, and every constraint has been advanced
+    /// over it.
+    Token(usize),
+    /// No token: the grammar's parse is complete and nothing may follow
+    /// it, so the generation is finished with what it already has.
+    ///
+    /// Distinct from a stop token, which is a token this model chose;
+    /// nothing was chosen here. Distinct from an error, which is what a
+    /// grammar that is *unsatisfied* and stuck returns.
+    GrammarComplete,
+}
+
+/// Sample the next token id from `logits` under `params`, and advance
+/// whatever state that token changes.
 ///
 /// `decode_token` renders one vocabulary entry as text. It is required
 /// rather than optional on purpose: the previous shape took an
 /// `Option`, and the `None` arm silently fell through to *unconstrained*
 /// sampling for a request that had asked to be constrained. Both callers
 /// already hold a tokenizer, so there is no arm to fall through to.
+///
+/// `stop_tokens` is the model's end-of-generation set, which a grammar
+/// needs for a reason no other caller has: EOG is the one token that
+/// asserts the parse is FINISHED, so it is masked out until the grammar
+/// says a parse is complete, and is never offered to the grammar as an
+/// ordinary piece of text.
 pub(crate) fn sample_next(
-    sampler: &mut Sampler,
+    state: &mut SampleState,
     logits: &[f32],
     params: &GenerationParams,
     history: &[usize],
+    stop_tokens: &StopTokens,
     decode_token: &dyn Fn(usize) -> String,
-) -> usize {
+) -> Result<Step, DecodeError> {
     if !params.needs_vocab_logits() {
-        return sampler.sample(logits, &params.sampling, history);
+        return Ok(Step::Token(state.sampler.sample(
+            logits,
+            &params.sampling,
+            history,
+        )));
     }
     // A backend that folded lm_head+argmax onto the device returns one
     // element holding the chosen id, not a vocabulary, and masking it
@@ -49,14 +118,80 @@ pub(crate) fn sample_next(
          greedy_gpu_fold_allowed and needs_vocab_logits have drifted apart",
         logits.len()
     );
-    let mut mask = |scores: &mut [f32]| mask_logits_for_json(scores, decode_token);
-    sampler.sample_with_mask(logits, &params.sampling, history, Some(&mut mask))
+
+    if state.grammar.is_none() {
+        if let Some(grammar) = &params.grammar {
+            state.grammar = Some(GrammarSampler::new(
+                grammar.as_ref().clone(),
+                logits.len(),
+                |id| decode_token(id).into_bytes(),
+                |id| stop_tokens.contains(id),
+            ));
+        }
+    }
+
+    // Destructured so the sampler can be borrowed mutably while the
+    // grammar is read by the mask closure it is handed.
+    let SampleState { sampler, grammar } = state;
+    let json_object = params.json_object;
+    let grammar_ref = grammar.as_ref();
+    // The mask cannot return an error through a callback the sampler
+    // calls, so it parks one here and the token is discarded below. It
+    // must be discarded: a mask that failed left every logit at `-inf`,
+    // and the "token" that comes back out of that is an artefact of
+    // argmax over negative infinity, not a choice.
+    let mut refusal: Option<ConstraintError> = None;
+    let mut outcome = MaskOutcome::Allowed;
+    let next = {
+        let mut mask = |scores: &mut [f32]| {
+            // Order does not matter and must not: neither mask ever
+            // clears a `-inf`, so the result is the intersection either
+            // way. JSON mode first only because it is the cheaper one.
+            if json_object {
+                mask_logits_for_json(scores, decode_token);
+            }
+            if let Some(g) = grammar_ref {
+                match g.mask_logits(scores) {
+                    Ok(o) => outcome = o,
+                    Err(e) => refusal = Some(e),
+                }
+            }
+        };
+        sampler.sample_with_mask(logits, &params.sampling, history, Some(&mut mask))
+    };
+    if let Some(e) = refusal {
+        return Err(DecodeError::GrammarConstraint {
+            detail: e.to_string(),
+        });
+    }
+    if outcome == MaskOutcome::Complete {
+        // Every logit was `-inf`, so `next` is an artefact of argmax
+        // over negative infinity rather than a token anything chose.
+        return Ok(Step::GrammarComplete);
+    }
+
+    // The other half of the hook. Done HERE, not in the decode loops,
+    // because a loop that can forget it is a loop that will: the mask
+    // would then keep answering the question "what may the FIRST token
+    // be?" for every token in the answer.
+    //
+    // Including for a token the loop is about to throw away as a stop:
+    // every such token ends the generation, so a parse advanced one step
+    // past its end is a parse nothing asks another question of.
+    if let Some(g) = grammar.as_mut() {
+        g.accept(next).map_err(|e| DecodeError::GrammarConstraint {
+            detail: e.to_string(),
+        })?;
+    }
+    Ok(Step::Token(next))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ferrox_models::grammar::Grammar;
     use ferrox_models::sampling::SamplingParams;
+    use std::sync::Arc;
 
     /// Token 0 renders as something no JSON document may contain;
     /// token 1 is a brace. Any masked sampler must refuse 0.
@@ -79,9 +214,58 @@ mod tests {
             stop: Vec::new(),
             stop_token_ids: Vec::new(),
             json_object,
+            grammar: None,
             cancel: None,
             ignore_eos: false,
         }
+    }
+
+    /// A vocabulary of single letters plus an end-of-generation token,
+    /// so a grammar over letters has something to be right about.
+    fn letter(id: usize) -> String {
+        match id {
+            0 => "a".to_string(),
+            1 => "b".to_string(),
+            2 => "c".to_string(),
+            3 => "d".to_string(),
+            _ => "</s>".to_string(),
+        }
+    }
+    const LETTER_EOG: usize = 4;
+
+    fn letter_stops() -> StopTokens {
+        StopTokens::from_eos(Some(LETTER_EOG))
+    }
+
+    fn with_grammar(mut p: GenerationParams, src: &str) -> GenerationParams {
+        p.grammar = Some(Arc::new(
+            Grammar::from_str_with_root(src, "root").expect("test grammar parses"),
+        ));
+        p
+    }
+
+    /// The id a step produced. A test that asks for a token and is told
+    /// the grammar is finished has found a different bug than the one
+    /// it was written for, so it says which.
+    fn token(step: Step) -> usize {
+        match step {
+            Step::Token(id) => id,
+            Step::GrammarComplete => {
+                panic!("the grammar ended the generation where a token was expected")
+            }
+        }
+    }
+
+    /// One step, with the arguments every test here shares.
+    fn step(
+        state: &mut SampleState,
+        logits: &[f32],
+        params: &GenerationParams,
+        history: &[usize],
+        stops: &StopTokens,
+        decode: &dyn Fn(usize) -> String,
+    ) -> Result<Step, DecodeError> {
+        sample_next(state, logits, params, history, stops, decode)
     }
 
     /// The assertion neither decode path had. Token 0 wins the argmax by
@@ -92,13 +276,17 @@ mod tests {
     #[test]
     fn json_mode_masks_at_temperature_zero() {
         let logits = vec![9.0, 1.0, 0.5];
-        let mut sampler = Sampler::new(7);
-        let chosen = sample_next(
-            &mut sampler,
-            &logits,
-            &params(true, 0.0),
-            &[],
-            &decode_token,
+        let mut state = SampleState::new(7);
+        let chosen = token(
+            step(
+                &mut state,
+                &logits,
+                &params(true, 0.0),
+                &[],
+                &StopTokens::default(),
+                &decode_token,
+            )
+            .expect("json mode has a legal token here"),
         );
         assert_ne!(chosen, 0, "a non-JSON-safe token was sampled in json mode");
         assert_eq!(chosen, 1);
@@ -110,13 +298,17 @@ mod tests {
     fn json_mode_masks_when_sampling_too() {
         let logits = vec![9.0, 1.0, 0.5];
         for seed in 0..16u64 {
-            let mut sampler = Sampler::new(seed);
-            let chosen = sample_next(
-                &mut sampler,
-                &logits,
-                &params(true, 1.0),
-                &[],
-                &decode_token,
+            let mut state = SampleState::new(seed);
+            let chosen = token(
+                step(
+                    &mut state,
+                    &logits,
+                    &params(true, 1.0),
+                    &[],
+                    &StopTokens::default(),
+                    &decode_token,
+                )
+                .expect("json mode has a legal token here"),
             );
             assert_ne!(chosen, 0, "seed {seed} sampled a non-JSON-safe token");
         }
@@ -127,15 +319,172 @@ mod tests {
     #[test]
     fn a_plain_request_is_not_masked() {
         let logits = vec![9.0, 1.0, 0.5];
-        let mut sampler = Sampler::new(7);
-        let chosen = sample_next(
-            &mut sampler,
-            &logits,
-            &params(false, 0.0),
-            &[],
-            &decode_token,
+        let mut state = SampleState::new(7);
+        let chosen = token(
+            step(
+                &mut state,
+                &logits,
+                &params(false, 0.0),
+                &[],
+                &StopTokens::default(),
+                &decode_token,
+            )
+            .expect("an unconstrained request cannot fail"),
         );
         assert_eq!(chosen, 0);
+    }
+
+    /// The grammar's mask half: "b" wins the argmax by a mile, and
+    /// `root ::= "ac"` forbids it.
+    #[test]
+    fn a_grammar_masks_the_argmax_it_forbids() {
+        let logits = vec![1.0, 9.0, 0.5, 0.1, 0.0];
+        let mut state = SampleState::new(7);
+        let chosen = token(
+            step(
+                &mut state,
+                &logits,
+                &with_grammar(params(false, 0.0), r#"root ::= "ac""#),
+                &[],
+                &letter_stops(),
+                &letter,
+            )
+            .expect("\"a\" is legal here"),
+        );
+        assert_eq!(chosen, 0, "the grammar's only legal first token is \"a\"");
+        assert!(state.grammar_started());
+    }
+
+    /// The grammar's accept half, which is the one a decode loop can
+    /// drop without noticing: the second step must be constrained by
+    /// what the FIRST step chose. Without the accept, "a" is the only
+    /// legal token forever and this returns 0 again.
+    #[test]
+    fn a_grammar_advances_between_steps() {
+        let logits = vec![1.0, 9.0, 0.5, 0.1, 0.0];
+        let params = with_grammar(params(false, 0.0), r#"root ::= "ac""#);
+        let mut state = SampleState::new(7);
+        let first = token(
+            step(&mut state, &logits, &params, &[], &letter_stops(), &letter)
+                .expect("\"a\" is legal here"),
+        );
+        let second = token(
+            step(
+                &mut state,
+                &logits,
+                &params,
+                &[first],
+                &letter_stops(),
+                &letter,
+            )
+            .expect("\"c\" is legal here"),
+        );
+        assert_eq!(
+            second, 2,
+            "the grammar did not advance past its first token"
+        );
+    }
+
+    /// End-of-generation is masked until the grammar is satisfied, and
+    /// allowed the moment it is. Token 4 wins the argmax throughout, so
+    /// an unconstrained sampler would end the answer immediately.
+    #[test]
+    fn a_grammar_holds_end_of_generation_back_until_it_is_satisfied() {
+        let logits = vec![1.0, 0.5, 0.4, 0.1, 9.0];
+        let params = with_grammar(params(false, 0.0), r#"root ::= "a""#);
+        let mut state = SampleState::new(7);
+        let first = token(
+            step(&mut state, &logits, &params, &[], &letter_stops(), &letter)
+                .expect("\"a\" is legal here"),
+        );
+        assert_eq!(first, 0, "generation was allowed to end unsatisfied");
+        let second = token(
+            step(
+                &mut state,
+                &logits,
+                &params,
+                &[first],
+                &letter_stops(),
+                &letter,
+            )
+            .expect("eog is legal once the parse is complete"),
+        );
+        assert_eq!(second, LETTER_EOG);
+    }
+
+    /// A satisfied grammar in a vocabulary with no end-of-generation
+    /// token has finished the answer, and says so rather than failing.
+    #[test]
+    fn a_finished_grammar_with_nothing_left_to_say_ends_the_generation() {
+        let logits = vec![1.0, 9.0, 0.5, 0.1, 0.0];
+        let params = with_grammar(params(false, 0.0), r#"root ::= "a""#);
+        let mut state = SampleState::new(7);
+        let first = token(
+            step(
+                &mut state,
+                &logits,
+                &params,
+                &[],
+                &StopTokens::default(),
+                &letter,
+            )
+            .expect("\"a\" is legal here"),
+        );
+        assert_eq!(first, 0);
+        assert_eq!(
+            step(
+                &mut state,
+                &logits,
+                &params,
+                &[first],
+                &StopTokens::default(),
+                &letter,
+            )
+            .expect("a completed parse is not an error"),
+            Step::GrammarComplete
+        );
+    }
+
+    /// A grammar this vocabulary cannot spell is a typed refusal, not a
+    /// token sampled out of an all-`-inf` distribution.
+    #[test]
+    fn a_grammar_no_token_can_satisfy_stops_the_generation() {
+        let logits = vec![1.0, 9.0, 0.5, 0.1, 0.0];
+        let mut state = SampleState::new(7);
+        let err = step(
+            &mut state,
+            &logits,
+            &with_grammar(params(false, 0.0), r#"root ::= "zz""#),
+            &[],
+            &letter_stops(),
+            &letter,
+        )
+        .expect_err("no token in this vocabulary starts with z");
+        assert!(
+            matches!(err, DecodeError::GrammarConstraint { .. }),
+            "{err}"
+        );
+    }
+
+    /// The two masks intersect rather than replace each other. Piece 0
+    /// is `<html>`, which json mode forbids; piece 1 is `{`, which the
+    /// grammar below forbids; piece 2 is `0`, allowed by both.
+    #[test]
+    fn a_grammar_and_json_mode_intersect_rather_than_replace_each_other() {
+        let logits = vec![9.0, 8.0, 0.5];
+        let mut state = SampleState::new(7);
+        let chosen = token(
+            step(
+                &mut state,
+                &logits,
+                &with_grammar(params(true, 0.0), r#"root ::= [0-9]+"#),
+                &[],
+                &StopTokens::default(),
+                &decode_token,
+            )
+            .expect("\"0\" is legal under both"),
+        );
+        assert_eq!(chosen, 2);
     }
 
     /// The coupling that keeps [`sample_next`]'s `debug_assert` true,
@@ -144,13 +493,19 @@ mod tests {
     ///
     /// `temperature <= 0` alone used to permit the fold. It must not: a
     /// JSON-mode request at temperature 0 would then be handed a
-    /// one-element vector and masked into nothing.
+    /// one-element vector and masked into nothing. A grammar request is
+    /// the same statement and is checked beside it, because a folded
+    /// grammar request is unconstrained text served as constrained.
     #[test]
-    fn a_json_mode_request_may_never_fold_lm_head_into_a_gpu_argmax() {
+    fn a_constrained_request_may_never_fold_lm_head_into_a_gpu_argmax() {
         use crate::generate::greedy_gpu_fold_allowed;
 
         assert!(greedy_gpu_fold_allowed(&params(false, 0.0)));
         assert!(!greedy_gpu_fold_allowed(&params(true, 0.0)));
+        assert!(!greedy_gpu_fold_allowed(&with_grammar(
+            params(false, 0.0),
+            r#"root ::= "a""#
+        )));
         // Not greedy: never folded either way, whatever the constraints.
         assert!(!greedy_gpu_fold_allowed(&params(false, 0.8)));
         assert!(!greedy_gpu_fold_allowed(&params(true, 0.8)));

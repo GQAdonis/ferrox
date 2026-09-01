@@ -331,13 +331,33 @@ pub(super) fn worker_loop(
             // (`FERROX_CONTINUOUS_BATCHING`) decided a per-request
             // feature, and the only visible symptom was the final
             // `validate_json_object_output` turning into a 400.
-            let next = crate::sample_step::sample_next(
-                &mut slot.sampler,
+            let next = match crate::sample_step::sample_next(
+                &mut slot.sample,
                 &slot.logits,
                 &slot.params,
                 &slot.generated_ids,
+                &slot.stop_tokens,
                 &|id| decode(&[id]),
-            );
+            ) {
+                Ok(crate::sample_step::Step::Token(next)) => next,
+                // A complete grammar with nothing legal after it: this
+                // row is finished, exactly as the private loop treats
+                // it, and for the same reason.
+                Ok(crate::sample_step::Step::GrammarComplete) => {
+                    slot.finish = Some(FinishReason::Stop);
+                    continue;
+                }
+                // A constraint this row cannot satisfy. It is this
+                // ROW's failure and nobody else's, so it is answered
+                // with an error and the batch carries on -- the same
+                // statement `sample_until_stop` makes by returning
+                // `Err`, which on the private path ends the one
+                // generation it is running.
+                Err(e) => {
+                    slot.fail(e);
+                    continue;
+                }
+            };
             // Three ways this token ends the answer, and they compose:
             // the model's own end-of-generation set (not `eos_id`
             // alone -- gemma-2 ends on `<end_of_turn>`), and a

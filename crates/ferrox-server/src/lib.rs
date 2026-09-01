@@ -43,6 +43,7 @@ mod cancel;
 mod chat_template;
 mod conversations;
 mod generate;
+mod grammar_request;
 mod health;
 mod journal;
 mod json_mode;
@@ -1146,6 +1147,16 @@ struct ChatCompletionRequest {
     /// the bias honoured.
     #[serde(default)]
     logit_bias: Option<serde_json::Value>,
+    /// A GBNF grammar every sampled token must keep parseable.
+    ///
+    /// llama.cpp's field, spelled the same way, because a client that
+    /// already builds a grammar for `llama-server` should not have to
+    /// build a second one. Not an OpenAI field: OpenAI states this as
+    /// `response_format: {"type": "json_schema"}`, which needs a
+    /// schema-to-grammar converter that does not exist yet -- see
+    /// [`crate::grammar_request`], where both spellings are resolved.
+    #[serde(default)]
+    grammar: Option<String>,
 }
 
 /// The output budget a chat request gets when it names none.
@@ -1392,9 +1403,20 @@ impl ChatCompletionRequest {
             ));
         }
         unsupported_sampling::refuse_logit_bias(self.logit_bias.as_ref(), "/v1/chat/completions")?;
+        // Both spellings of "constrain the output", resolved by the one
+        // function that knows the rule -- refusing `json_schema` by
+        // name, and compiling a `grammar` here so a grammar that does
+        // not parse is a 400 before any prompt is rendered. The result
+        // is thrown away and recompiled in `generation_params`, which
+        // is the only other caller: a grammar is a small parse, and one
+        // rule in two places would be two rules soon enough.
+        grammar_request::for_request(self.grammar.as_deref(), self.response_format.as_ref())?;
         if let Some(fmt) = &self.response_format {
             match fmt.get("type").and_then(|v| v.as_str()) {
                 Some("json_object") => {}
+                // `json_schema` never reaches here: `for_request` above
+                // refuses it with the 501 that names the missing
+                // converter, rather than the 400 this arm would give.
                 Some(other) => {
                     return Err((
                         StatusCode::BAD_REQUEST,
@@ -1457,8 +1479,12 @@ impl ChatCompletionRequest {
             == Some("json_object")
     }
 
-    fn generation_params(&self) -> GenerationParams {
-        GenerationParams {
+    /// Fallible because a constraint is compiled here: an unparseable
+    /// grammar, or a `response_format` this server cannot honour, is a
+    /// refusal rather than a request served without the constraint it
+    /// asked for.
+    fn generation_params(&self) -> Result<GenerationParams, ApiError> {
+        Ok(GenerationParams {
             max_tokens: self.max_tokens,
             sampling: self.sampling_params(),
             seed: self.resolved_seed(),
@@ -1468,11 +1494,15 @@ impl ChatCompletionRequest {
             // the model can say which of them are single tokens.
             stop_token_ids: Vec::new(),
             json_object: self.json_object_mode(),
+            grammar: grammar_request::for_request(
+                self.grammar.as_deref(),
+                self.response_format.as_ref(),
+            )?,
             // Filled in by the handler that owns the request id --
             // the request body cannot name its own cancel token.
             cancel: None,
             ignore_eos: self.ignore_eos.unwrap_or(false),
-        }
+        })
     }
 
     /// Like [`Self::generation_params`], plus architecture-default stop
@@ -1480,14 +1510,14 @@ impl ChatCompletionRequest {
     fn generation_params_for_template(
         &self,
         template: &chat_template::PromptTemplate,
-    ) -> GenerationParams {
-        let mut params = self.generation_params();
+    ) -> Result<GenerationParams, ApiError> {
+        let mut params = self.generation_params()?;
         if let Some(stop) = template.end_of_turn() {
             if !params.stop.iter().any(|s| s == stop) {
                 params.stop.push(stop.to_string());
             }
         }
-        params
+        Ok(params)
     }
 
     /// A request only has a deterministic outcome -- and therefore is
@@ -2135,6 +2165,10 @@ pub(crate) fn decode_error_response(e: generate::DecodeError) -> ApiError {
         generate::DecodeError::KvPoolExhausted | generate::DecodeError::QueueFull { .. } => {
             StatusCode::SERVICE_UNAVAILABLE
         }
+        // The caller's grammar against this model's vocabulary, and
+        // nothing about the server's load: the same body fails the same
+        // way on an idle box, so 400 rather than 503.
+        generate::DecodeError::GrammarConstraint { .. } => StatusCode::BAD_REQUEST,
     };
     tracing::warn!("decode error: {e}");
     let mut body = serde_json::json!({"error": {"message": e.to_string()}});
@@ -2686,7 +2720,7 @@ async fn chat_completions_full(
         let prefix_cache = state.prefix_cache.clone();
         let batcher = active.batcher.clone();
         let ceiling = active.ceiling.clone();
-        let params = req.generation_params_for_template(&template);
+        let params = req.generation_params_for_template(&template)?;
         let prompt_for_task = prompt.clone();
         let (chunks, finish, usage) = tokio::task::spawn_blocking(move || {
             run_generation(
@@ -2802,7 +2836,7 @@ async fn chat_completions_stream(
     let prefix_cache = state.prefix_cache.clone();
     let batcher = active.batcher.clone();
     let ceiling = active.ceiling.clone();
-    let mut params = req.generation_params_for_template(&template);
+    let mut params = req.generation_params_for_template(&template)?;
     let stats_state = Arc::clone(&state);
     // Read now, off the handle this stream will decode against. Read
     // later it would name whatever a swap had made current by then.
@@ -4557,6 +4591,7 @@ mod tests {
             stop: Vec::new(),
             stop_token_ids: Vec::new(),
             json_object: false,
+            grammar: None,
             cancel: None,
             ignore_eos: false,
         }
@@ -6752,6 +6787,83 @@ mod tests {
         serde_json::from_value(value).expect("request")
     }
 
+    /// The wire field reaches the sampler, compiled.
+    ///
+    /// Serde is the failure mode here, not the grammar engine: an
+    /// undeclared field is dropped silently and the caller is served
+    /// unconstrained text with a 200, which is exactly why `logit_bias`
+    /// is declared on this struct only to be refused by name.
+    #[test]
+    fn a_grammar_on_the_chat_wire_reaches_the_generation_params() {
+        let req = chat_request(serde_json::json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "grammar": "root ::= \"a\"+",
+        }));
+        req.validate_supported_fields()
+            .expect("a valid grammar is a valid request");
+        let params = req
+            .generation_params()
+            .expect("a valid grammar compiles at params time too");
+        assert!(
+            params.grammar.is_some(),
+            "the grammar was dropped between the wire and the sampler"
+        );
+        assert!(
+            params.needs_vocab_logits(),
+            "a grammar request that may fold lm_head into a GPU argmax is \
+             a grammar request served unconstrained"
+        );
+
+        let plain = chat_request(serde_json::json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+        }));
+        assert!(plain.generation_params().unwrap().grammar.is_none());
+    }
+
+    /// A grammar that does not parse is refused before any work, and
+    /// the refusal names the field and the parser's own diagnostic.
+    #[test]
+    fn an_unparseable_grammar_on_the_chat_wire_is_a_400() {
+        let req = chat_request(serde_json::json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "grammar": "root ::= \"a",
+        }));
+        let (status, Json(body)) = req
+            .validate_supported_fields()
+            .expect_err("this does not parse");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"]["param"], "grammar");
+        assert!(req.generation_params().is_err(), "and again at params time");
+    }
+
+    /// `response_format: json_schema` is refused by name, with the 501
+    /// that says which half is missing -- not the 400 that reads as
+    /// "this server does not do structured output", which is no longer
+    /// true, and not a 200 carrying unconstrained text.
+    #[test]
+    fn response_format_json_schema_names_the_missing_converter() {
+        let req = chat_request(serde_json::json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {"name": "x", "schema": {"type": "object"}},
+            },
+        }));
+        let (status, Json(body)) = req
+            .validate_supported_fields()
+            .expect_err("not implemented yet");
+        assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
+        let message = body["error"]["message"].as_str().expect("a message");
+        assert!(
+            message.contains("JSON schema") && message.contains("grammar"),
+            "the refusal must say what is missing: {message}"
+        );
+    }
+
     /// A chat client that omits `max_tokens` wants an answer, not
     /// OpenAI's legacy 16-token completion fragment.
     #[test]
@@ -7679,6 +7791,62 @@ mod tests {
             None,
         )
         .expect("a real Kimi checkpoint must generate without error");
+        assert!(matches!(finish, FinishReason::Length | FinishReason::Stop));
+    }
+
+    /// The THIRD decode path: `generate_engine`, which serves every
+    /// model that is not a `Decoder`.
+    ///
+    /// This is where a constraint gets dropped without anyone noticing.
+    /// JSON mode was honoured on the `Decoder` path and silently not on
+    /// this one, because this path had no tokenizer to hand the mask.
+    /// A grammar must reach it too, and this checkpoint's vocabulary is
+    /// one token per byte value, so `root ::= "a"+` has exactly one
+    /// legal token (97) and the answer is decidable: all `a`, however
+    /// the random weights would otherwise have decoded.
+    ///
+    /// The unconstrained run beside it is the vacuity check.
+    #[test]
+    fn a_grammar_constrains_the_engine_decode_path() {
+        let loaded = build_synthetic_kimi_loaded();
+        let state = build_app_state(
+            model::LoadedModel::Kimi(loaded),
+            None,
+            None,
+            None,
+            false,
+            None,
+            Arc::new(health::Detection::ready(health::probe_backends())),
+        );
+        let active = state.active().expect("a freshly built state has a model");
+
+        let run = |grammar: Option<&str>| {
+            let mut params = greedy_params(6);
+            params.grammar = grammar.map(|src| {
+                Arc::new(
+                    ferrox_models::grammar::Grammar::from_str_with_root(src, "root")
+                        .expect("test grammar parses"),
+                )
+            });
+            run_generation(&active.model, "hi", &params, None, None, None, None, None)
+        };
+
+        let (chunks, _, _) = run(None).expect("the unconstrained run must serve");
+        let unconstrained = chunks.concat();
+        assert!(
+            unconstrained.chars().any(|c| c != 'a'),
+            "the unconstrained run produced only `a` ({unconstrained:?}), so the \
+             constrained run below would prove nothing"
+        );
+
+        let (chunks, finish, _) =
+            run(Some(r#"root ::= "a"+"#)).expect("a grammar this vocabulary can spell must serve");
+        let constrained = chunks.concat();
+        assert!(
+            !constrained.is_empty() && constrained.chars().all(|c| c == 'a'),
+            "the engine decode path served text its grammar forbids ({constrained:?}): \
+             the constraint was dropped between `generate_engine` and the sampler"
+        );
         assert!(matches!(finish, FinishReason::Length | FinishReason::Stop));
     }
 

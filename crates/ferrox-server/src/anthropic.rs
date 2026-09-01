@@ -671,6 +671,11 @@ fn prepare_prompt(prompt: &PromptFields, model: String, max_tokens: usize) -> Pr
         presence_penalty: None,
         frequency_penalty: None,
         response_format: None,
+        // Neither surface has a grammar field of its own yet. Named
+        // rather than defaulted so that adding one is a compile error
+        // here first, instead of a constraint silently dropped on the
+        // way through the chat request these translate into.
+        grammar: None,
         // Not on the Anthropic wire.
         logit_bias: None,
         // A serving-benchmark knob on the OpenAI surface only; this
@@ -1390,7 +1395,7 @@ async fn messages_full(
     // The client's own list, kept apart from `params.stop`, which the
     // template adds its end-of-turn marker to. See `caller_stop`.
     let caller_stops = chat.stop_sequences();
-    let params = chat.generation_params_for_template(&template);
+    let params = chat.generation_params_for_template(&template)?;
 
     let model = Arc::clone(&active.model);
     let kv_pool = state.kv_pool.clone();
@@ -1461,7 +1466,7 @@ async fn messages_stream(
     let posture = OutputPosture::resolve(&served_model, &prompt);
     // See `messages_full`: the client's list, not the template's.
     let caller_stops = chat.stop_sequences();
-    let mut params = chat.generation_params_for_template(&template);
+    let mut params = chat.generation_params_for_template(&template)?;
 
     // The same two-tier cancellation the chat stream has: the guard
     // rides with the generation task and deregisters however that task

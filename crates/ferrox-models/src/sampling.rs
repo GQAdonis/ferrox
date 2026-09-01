@@ -223,9 +223,23 @@ impl RecommendedSampling {
     }
 }
 
-/// Zeroes out logits a caller wants to forbid, in place, before the
-/// sampler looks at them. Used by JSON-object mode to keep generation
-/// inside the grammar.
+/// Sets logits a caller wants to forbid to `-inf`, in place, before the
+/// sampler looks at them.
+///
+/// Two callers today, and they COMPOSE rather than exclude each other --
+/// a masked logit stays masked, so the order they run in cannot matter:
+/// JSON-object mode's character-class filter
+/// (`ferrox_server::json_mode`), and grammar-constrained decoding
+/// ([`crate::grammar_sampler::GrammarSampler::mask_logits`]).
+///
+/// The signature returns nothing because the callback runs from inside
+/// the sampler, which has no error to return one through. A mask that
+/// CAN fail -- a grammar that dead-ends leaves every logit at `-inf`,
+/// and sampling from that is how an "impossible" request becomes
+/// arbitrary text with a 200 -- records its refusal in the closure's own
+/// captured state, and the decode loop reads it after the sample and
+/// throws the token away. `ferrox_server::sample_step::sample_next` is
+/// the one place that pairing lives.
 pub type LogitMask<'a> = &'a mut dyn FnMut(&mut [f32]);
 
 /// A small, seedable xorshift64* generator. Not cryptographically

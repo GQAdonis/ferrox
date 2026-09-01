@@ -3,7 +3,9 @@
 //! Every expectation below is upstream's, byte for byte, for a schema this
 //! port accepts. Two are edited, and both edits are noted where they
 //! appear. The refusal cases at the bottom are this port's own: upstream
-//! converts most of them into a grammar that is wider than the schema.
+//! either drops the keyword and emits a grammar wider than the schema, or
+//! -- for the pattern cases in [`patterns`] -- emits one that does not
+//! parse at all.
 //!
 //! [`super::convert`] already re-parses everything it emits, so a golden
 //! that matches is also a grammar `crate::grammar::parse` accepts; the
@@ -192,6 +194,8 @@ fn description_only_is_unconstrained() {
         "##,
     );
 }
+
+mod patterns;
 
 // -- string formats --------------------------------------------------
 
@@ -738,29 +742,6 @@ fn unknown_and_invalid_types() {
     ));
 }
 
-/// `pattern` is refused because ferrox has not ported `_visit_pattern`,
-/// NOT because upstream ignores it.
-///
-/// Upstream DOES implement it: `json-schema-to-grammar.cpp:961-962`
-/// dispatches to `_visit_pattern`, which compiles the regex into a real
-/// grammar. An earlier version of this test claimed llama.cpp "compiles
-/// this to a grammar for any string", which is false, and would have
-/// justified a refusal with a reason that does not exist.
-///
-/// The refusal is still the right behaviour -- a `pattern` silently
-/// dropped permits documents the caller said were invalid -- but it is
-/// a MISSING FEATURE here, not a divergence from upstream, and the
-/// error message says so.
-#[test]
-fn pattern_is_refused_because_ferrox_has_not_ported_it() {
-    let err = refuse(r##"{"type": "string", "pattern": "^[a-z]+$"}"##);
-    match err {
-        SchemaError::UnsupportedKeyword { ref keyword, .. } => assert_eq!(keyword, "pattern"),
-        other => panic!("expected a pattern refusal, got {other}"),
-    }
-    assert!(err.to_string().contains("regular-expression"));
-}
-
 #[test]
 fn numeric_bounds_are_refused() {
     for schema in [
@@ -943,5 +924,27 @@ fn serde_json_value_entry_point_agrees_on_sorted_schemas() {
     assert_eq!(
         json_schema_to_grammar(text).expect("text converts"),
         json_schema_to_grammar_value(&value).expect("value converts")
+    );
+}
+
+#[test]
+fn a_hyphen_in_a_property_name_stays_out_of_a_range() {
+    // `-` is the one character llama.cpp's GRAMMAR_RANGE_LITERAL_ESCAPES
+    // table spells `\-` while its GBNF *parser* has no such escape. Written
+    // bare it would open a range instead. `\x2D` is the spelling both
+    // halves accept, and this grammar has to parse.
+    check(
+        r##"{"properties": {"a-b": {"type": "integer"}}, "additionalProperties": {"type": "integer"}}"##,
+        r##"
+        a-b-kv ::= "\"a-b\"" space ":" space integer
+        a-b-rest ::= ( "," space additional-kv )*
+        additional-k ::= ["] ( [a] ([\x2D] ([b] char+ | [^"b] char*) | [^"\x2D] char*) | [^"a] char* )? ["]
+        additional-kv ::= additional-k ":" space integer
+        char ::= [^"\\\x7F\x00-\x1F] | [\\] (["\\bfnrt] | "u" [0-9a-fA-F]{4})
+        integer ::= ("-"? integral-part)
+        integral-part ::= [0] | [1-9] [0-9]{0,15}
+        root ::= "{" space  (a-b-kv a-b-rest | additional-kv ( "," space additional-kv )* )? space "}"
+        space ::= | " " | "\n"{1,2} [ \t]{0,20}
+        "##,
     );
 }

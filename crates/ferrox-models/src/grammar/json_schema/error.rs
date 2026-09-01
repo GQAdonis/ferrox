@@ -32,6 +32,10 @@ pub enum SchemaError {
         at: String,
         why: &'static str,
     },
+    /// A `pattern` this port cannot compile to GBNF. llama.cpp's
+    /// `_visit_pattern` handles a subset of ECMA-262; the cases named here
+    /// are the ones it mishandles rather than the ones it skips.
+    UnsupportedPattern { pattern: String, why: String },
     /// `"format"` names something outside the six llama.cpp special-cases
     /// (`date`, `time`, `date-time`, `uuid`, `uuid1`..`uuid5`).
     UnsupportedFormat { format: String, at: String },
@@ -73,6 +77,10 @@ impl fmt::Display for SchemaError {
                 f,
                 "JSON schema keyword {keyword:?} at {at} is not supported ({why}); it would be \
                  ignored, and the grammar would then accept documents the schema rejects"
+            ),
+            SchemaError::UnsupportedPattern { pattern, why } => write!(
+                f,
+                "JSON schema \"pattern\" {pattern:?} cannot be compiled to a grammar: {why}"
             ),
             SchemaError::UnsupportedFormat { format, at } => write!(
                 f,

@@ -7,6 +7,7 @@
 
 use super::branch::{select, Branch};
 use super::error::{at, SchemaError};
+use super::pattern::PatternCompiler;
 use super::primitives::{
     build_repetition, builtin, escape_in_range, format_literal, is_reserved_name, primitive,
     BuiltinRule, SPACE_RULE,
@@ -56,7 +57,7 @@ impl Converter {
 
     /// `_add_rule`. A name already bound to a *different* body gets the
     /// lowest numeric suffix that is free or already holds this same body.
-    fn add_rule(&mut self, name: &str, rule: &str) -> String {
+    pub(super) fn add_rule(&mut self, name: &str, rule: &str) -> String {
         let esc = collapse_invalid(name);
         match self.rules.get(&esc) {
             None => {
@@ -169,6 +170,7 @@ impl Converter {
                 );
                 Ok(self.add_rule(&rule_name, &body))
             }
+            Branch::Pattern(pattern) => PatternCompiler::compile(self, pattern, &rule_name),
             Branch::Uuid { format } => {
                 let target = if rule_name == "root" { "root" } else { format };
                 // `uuid` is a primitive with no dependencies, so the rule

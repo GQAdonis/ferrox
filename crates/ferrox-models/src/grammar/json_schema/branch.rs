@@ -44,6 +44,8 @@ pub(super) enum Branch<'a> {
         min: u64,
         max: Option<u64>,
     },
+    /// `pattern`: an anchored ECMA-262 regular expression.
+    Pattern(&'a str),
     /// `"format": "uuid"` (or `uuid1`..`uuid5`).
     Uuid { format: &'a str },
     /// `"format"` of `date`, `time` or `date-time`.
@@ -187,7 +189,6 @@ fn why(keyword: &str) -> &'static str {
             "schema intersection is not ported: llama.cpp merges the components' properties and \
              intersects their enums, and a component it does not recognise is dropped"
         }
-        "pattern" => "the regular-expression-to-GBNF compiler is not ported",
         "not" | "if" | "then" | "else" => {
             "negated and conditional subschemas have no GBNF form; a grammar cannot express them"
         }
@@ -212,8 +213,8 @@ fn why(keyword: &str) -> &'static str {
             "object member schemas apply only to \"type\": \"object\""
         }
         "patternProperties" | "propertyNames" => {
-            "constraining property *names* by a pattern needs the regex compiler, which is not \
-             ported"
+            "constraining which property *names* may appear, rather than what a declared one \
+             holds, is not ported"
         }
         "minProperties" | "maxProperties" => "property counts have no GBNF form",
         "dependencies" | "dependentSchemas" | "dependentRequired" => {
@@ -367,6 +368,16 @@ pub(super) fn select<'a>(
     }
 
     let string_typed = type_absent || type_str == Some("string");
+    if string_typed {
+        if let Some(v) = get("pattern") {
+            let p = v.as_str().ok_or_else(|| SchemaError::BadValue {
+                keyword: "pattern".into(),
+                at: at(name),
+                why: format!("expected a string, found {}", v.kind()),
+            })?;
+            return sel(Branch::Pattern(p), &["type", "pattern"]);
+        }
+    }
     if string_typed {
         if let Some(f) = format {
             if is_uuid_format(f) {

@@ -23,6 +23,7 @@
 //! | `oneOf`, `anyOf` | union of alternatives |
 //! | `$ref`, `$defs`, `definitions` | same-document `#/` pointers, recursion included |
 //! | `format` | `date`, `time`, `date-time`, `uuid`, `uuid1`..`uuid5` |
+//! | `pattern` | an anchored ECMA-262 regex, via [`pattern`] |
 //!
 //! Annotations (`title`, `description`, `default`, `examples`, `$schema`,
 //! `$id`, `$comment`, `deprecated`, `readOnly`, `writeOnly`) are ignored,
@@ -36,9 +37,8 @@
 //! `"type": "null"` says nothing about a null, so it is dropped, while
 //! `pattern` beside `"type": "string"` is refused.
 //!
-//! The notable refusals are `pattern` (llama.cpp's regex-to-GBNF compiler
-//! is not ported), `allOf` (schema intersection), the numeric bounds
-//! `minimum` / `maximum` / `exclusiveMinimum` / `exclusiveMaximum`
+//! The notable refusals are `allOf` (schema intersection), the numeric
+//! bounds `minimum` / `maximum` / `exclusiveMinimum` / `exclusiveMaximum`
 //! (llama.cpp builds a digit-by-digit range grammar for integers), `not` /
 //! `if` / `then` / `else`, `patternProperties`, `propertyNames`,
 //! `uniqueItems`, `minProperties` / `maxProperties`, `multipleOf`, the
@@ -60,6 +60,16 @@
 //! - JSON Pointer escapes (`~1`, `~0`) in a `$ref` are decoded. Upstream
 //!   splits on `/` and cannot address such a member at all.
 //! - Remote (`https://`) `$ref`s are refused rather than fetched.
+//! - `pattern` compiles the subset of ECMA-262 that upstream compiles, but
+//!   refuses several inputs upstream mishandles rather than reproducing the
+//!   mishandling: a lookaround group (upstream warns, then silently drops
+//!   the group), an escape its own GBNF parser rejects (`\s`, `\b`, a
+//!   backreference, a dangling `\`), a stray `]` or `}` (upstream loops
+//!   forever), `*` with nothing before it (upstream reads past the end of a
+//!   vector), and a top-level `)` (upstream returns early, discarding the
+//!   rest of the pattern). `\d` / `\D` / `\w` / `\W` are translated to
+//!   their exact ECMA-262 classes, where upstream copies them through into
+//!   a grammar that does not parse. See [`pattern`].
 //! - A top-level schema whose rule ends up named something other than
 //!   `root` is refused ([`SchemaError::RootDisplaced`]) instead of silently
 //!   producing a grammar that starts from a subschema; upstream reaches
@@ -80,6 +90,7 @@
 mod branch;
 mod converter;
 mod error;
+mod pattern;
 mod primitives;
 mod refs;
 mod value;

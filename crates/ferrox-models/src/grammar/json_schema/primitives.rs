@@ -194,20 +194,27 @@ pub(super) fn format_literal(literal: &str) -> String {
     out
 }
 
-/// `GRAMMAR_RANGE_LITERAL_ESCAPES`: the same table plus `-` and `]`, for a
-/// character that appears inside a `[…]` class.
+/// `GRAMMAR_RANGE_LITERAL_ESCAPES`: escaping for a character that appears
+/// inside a `[…]` class.
 ///
 /// Upstream's `_not_strings` writes property-name bytes into a class with
 /// no escaping at all, so a property named `a-b` or `a]b` yields a grammar
 /// that does not parse. This module escapes them, which is the one place
 /// its output can differ from llama.cpp's for a schema llama.cpp accepts.
+///
+/// `-` is spelled `\x2D` rather than `\-`: llama.cpp's *table* lists `\-`,
+/// but its GBNF *parser* -- and so this repo's [`crate::grammar::parser`],
+/// which transcribes it -- has no `\-` escape and rejects it as an unknown
+/// one. A bare `-` would start a range. The codepoint form is the only
+/// spelling both halves agree on.
 pub(super) fn escape_in_range(c: char, out: &mut String) {
     match c {
         '\r' => out.push_str("\\r"),
         '\n' => out.push_str("\\n"),
         '"' => out.push_str("\\\""),
-        '-' => out.push_str("\\-"),
+        '-' => out.push_str("\\x2D"),
         ']' => out.push_str("\\]"),
+        '[' => out.push_str("\\["),
         '\\' => out.push_str("\\\\"),
         c => out.push(c),
     }

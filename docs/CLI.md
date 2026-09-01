@@ -69,11 +69,12 @@ Same via explicit subcommand: `ferrox run -m …`.
 | `-s` / `--seed` | `-1` = time-based |
 | `-dev` / `--device` | `auto`, `none`, `cpu`, `metal`, or `cuda` |
 | `--list-devices` | Print compiled, detected devices and exit |
-| `-ngl` / `--gpu-layers` / `--n-gpu-layers` | `0`, a number, `auto`, or `all` |
+| `-ngl` / `--gpu-layers` / `--n-gpu-layers` | `0`, `auto`, `all`, or a count at/above the layer count. A *partial* count is refused — see below |
 | `--ctk` | KV dtype: `f16` (default), `q8_0`/`turbo8`/`fp8`/`turbo4` (Metal), `turbo3` (falls back). Sets `FERROX_CTK` |
 | `--system` | Chat mode only |
 | `--no-cnv` | Skip chat-template wrap |
-| `-e` / `--escape` | `\n` `\t` `\r` `\\` in `-p` |
+| `-e` / `--escape` | Expand `\n` `\t` `\r` `\\` in `-p`. **On by default**, as in llama.cpp |
+| `--no-escape` | Pass `-p` through literally |
 | `--ignore-eos` | Always emit up to `-n` |
 | `--verbose-prompt` | Print final prompt to stderr |
 | `--mtp` | Errors: MTP draft heads not loaded from GGUF yet |
@@ -93,9 +94,16 @@ plug in through the `Drafter` trait in `ferrox_models::speculative`.
 (`num_nextn_predict_layers`) and errors today.
 
 `--device none` (or `cpu`) and `-ngl 0` force CPU. Default is
-`--device auto -ngl auto`. Any positive `-ngl`, `auto`, or `all` enables
-all supported ops on the selected backend (partial layer placement is
-not available yet).
+`--device auto -ngl auto`. `auto`, `all`, or a count at or above the
+model's layer count enable all supported ops on the selected backend.
+
+**A partial `-ngl` is refused, deliberately.** llama.cpp's `-ngl N` puts
+exactly `N` layers in VRAM and runs the rest on the CPU, which is how
+you fit a model that does not otherwise fit. ferrox has no partial layer
+placement, and it used to accept the count and then offload *everything*
+— same flag, same value, no error, and an out-of-memory on exactly the
+machine the flag existed to accommodate. It now stops and says so. Use
+`-ngl 0` for CPU or `-ngl all` for the whole model.
 
 ### Chat vs completion
 

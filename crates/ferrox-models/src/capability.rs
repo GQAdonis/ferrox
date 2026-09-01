@@ -1046,6 +1046,30 @@ pub struct SwaPattern {
 /// so have no default to pin.
 ///
 /// Pinned by `tests/swa_pattern.rs`.
+/// Architectures where llama.cpp DISABLES sliding-window attention even
+/// though the checkpoint declares a window.
+///
+/// `src/models/phi3.cpp:12-24`: if `attention.sliding_window` is present
+/// and non-zero, llama.cpp warns, then sets `n_swa = 0`,
+/// `swa_type = LLAMA_SWA_TYPE_NONE` and `set_swa_pattern(1)` -- i.e. NO
+/// layer slides. Its own comment says the conversion scripts populate
+/// the key wrongly and links the PR that turned it off.
+///
+/// ferrox read the key and, having no per-architecture period for
+/// `phi3`, windowed EVERY layer. So a Phi-3 or Phi-4 model attended over
+/// a truncated history on every layer where llama.cpp attends over the
+/// whole context. `phi3` is in [`AUDITED_GENERIC_GQA`], and
+/// `models/Phi-4-mini-instruct-Q4_K_M.gguf` really does declare
+/// `phi3.attention.sliding_window = 262144` -- so this was live on a
+/// model in the benchmark suite, not hypothetical.
+///
+/// This is deliberately a REFUSAL TO HONOUR the key rather than a
+/// transcribed period: llama.cpp is not choosing a different window
+/// here, it is declining to use the one in the file.
+pub fn swa_disabled_by_arch(arch: &str) -> bool {
+    matches!(arch, "phi3")
+}
+
 /// Architectures whose FFN gate uses GELU rather than SiLU, i.e. GeGLU
 /// rather than SwiGLU.
 ///

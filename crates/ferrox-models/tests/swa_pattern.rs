@@ -281,3 +281,73 @@ fn period_one_windows_nothing_and_period_zero_windows_everything() {
         }
     }
 }
+
+/// `phi3` declares a sliding window that llama.cpp refuses to honour,
+/// and ferrox windowed every layer with it.
+///
+/// `src/models/phi3.cpp:12-24`: when `attention.sliding_window` is
+/// present and non-zero, llama.cpp warns, then sets `n_swa = 0`,
+/// `swa_type = NONE` and `set_swa_pattern(1)`. Its own comment says the
+/// conversion scripts populate the key wrongly.
+///
+/// ferrox read the key, found no per-architecture period for `phi3`, and
+/// fell through to "every layer windowed". `phi3` is AUDITED, and
+/// `models/Phi-4-mini-instruct-Q4_K_M.gguf` declares
+/// `sliding_window = 262144`, so this was live on a benchmark-suite
+/// model rather than hypothetical.
+#[test]
+fn phi3_ignores_the_sliding_window_its_own_checkpoints_declare() {
+    use ferrox_models::capability::{default_swa_layout, swa_disabled_by_arch};
+
+    assert!(swa_disabled_by_arch("phi3"));
+    // The disable is per architecture and must not leak: these read
+    // their windows normally.
+    for other in ["gemma2", "gemma3", "gpt-oss", "cohere2", "phimoe"] {
+        assert!(
+            !swa_disabled_by_arch(other),
+            "{other} honours its declared window"
+        );
+    }
+
+    // It is a REFUSAL, not a period: `phi3` must have no entry in the
+    // per-architecture table either, or the two mechanisms would
+    // disagree about the same architecture.
+    assert!(
+        default_swa_layout("phi3").is_none(),
+        "phi3 must not also carry a transcribed period"
+    );
+}
+
+/// The same rule, through the real loader on the real checkpoint.
+///
+/// The table test above pins `swa_disabled_by_arch`; this pins that the
+/// LOADER acts on it. Those are two different failures and the first
+/// does not imply the second -- the rule existed as a fact about
+/// llama.cpp long before ferrox honoured it.
+#[test]
+#[ignore = "needs models/Phi-4-mini-instruct-Q4_K_M.gguf"]
+fn a_real_phi3_checkpoint_loads_with_no_layer_windowed() {
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../models/Phi-4-mini-instruct-Q4_K_M.gguf"
+    );
+    let file = ferrox_gguf::GgufFile::open(path).expect("fixture opens");
+    assert_eq!(file.metadata_str("general.architecture"), Some("phi3"));
+    assert_eq!(
+        file.metadata_u64("phi3.attention.sliding_window"),
+        Some(262_144),
+        "this checkpoint really does declare a window -- if it stopped, \
+         pick one that still does rather than deleting this test"
+    );
+
+    let cfg = ferrox_models::ModelConfig::from_gguf(&file).expect("phi3 loads");
+    assert_eq!(cfg.sliding_window, None, "llama.cpp sets n_swa = 0");
+    assert_eq!(cfg.kv_block_window(), None);
+    for il in 0..cfg.n_layers {
+        assert_eq!(
+            cfg.layer_sliding_window(il),
+            None,
+            "layer {il} must attend over the whole context"
+        );
+    }
+}

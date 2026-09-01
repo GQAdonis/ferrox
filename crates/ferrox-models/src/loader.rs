@@ -416,7 +416,13 @@ impl ModelConfig {
         // value here is treated as active.
         let sliding_window = metadata_u64_any(file, &[key("attention.sliding_window")])
             .map(|v| v as usize)
-            .filter(|&w| w > 0);
+            .filter(|&w| w > 0)
+            // `phi3` declares a window that llama.cpp deliberately does
+            // NOT honour -- see `capability::swa_disabled_by_arch`. This
+            // has to drop the window rather than pick a period, because
+            // upstream is declining to use the file's value, not
+            // choosing a different one.
+            .filter(|_| !crate::capability::swa_disabled_by_arch(&arch));
 
         // Gemma alternating SWA period (`attention.sliding_window_pattern`).
         // llama.cpp: gemma2 defaults period=2, gemma3 defaults period=6 when

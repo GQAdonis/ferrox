@@ -25,6 +25,10 @@ use thiserror::Error;
 
 pub const GGUF_MAGIC: u32 = 0x4655_4747; // "GGUF" little-endian
 
+// Upper bound on capacity pre-reserved from an untrusted count in the header,
+// so a malformed file cannot trigger a huge allocation before any data is read.
+const PREALLOC_CAP: usize = 16 * 1024;
+
 #[derive(Debug, Error)]
 pub enum GgufError {
     #[error("io error: {0}")]
@@ -347,18 +351,21 @@ impl GgufFile {
         let tensor_count = cursor.read_u64::<LittleEndian>()?;
         let kv_count = cursor.read_u64::<LittleEndian>()?;
 
-        let mut metadata = HashMap::with_capacity(kv_count as usize);
+        // Counts come off the wire; cap the reserved capacity so a tiny header
+        // can't request a multi-gigabyte allocation. The collections still grow
+        // to fit a file that genuinely contains this many items.
+        let mut metadata = HashMap::with_capacity((kv_count as usize).min(PREALLOC_CAP));
         for _ in 0..kv_count {
             let key = read_gguf_string(&mut cursor)?;
             let value = read_gguf_value(&mut cursor)?;
             metadata.insert(key, value);
         }
 
-        let mut tensors = Vec::with_capacity(tensor_count as usize);
+        let mut tensors = Vec::with_capacity((tensor_count as usize).min(PREALLOC_CAP));
         for _ in 0..tensor_count {
             let name = read_gguf_string(&mut cursor)?;
             let n_dims = cursor.read_u32::<LittleEndian>()?;
-            let mut shape = Vec::with_capacity(n_dims as usize);
+            let mut shape = Vec::with_capacity((n_dims as usize).min(PREALLOC_CAP));
             for _ in 0..n_dims {
                 shape.push(cursor.read_u64::<LittleEndian>()?);
             }
@@ -501,6 +508,15 @@ impl TensorSource for GgufFile {
 
 fn read_gguf_string(cursor: &mut io::Cursor<&[u8]>) -> Result<String, GgufError> {
     let len = cursor.read_u64::<LittleEndian>()? as usize;
+    // A string cannot be longer than the bytes remaining in the file; reject an
+    // oversized length before allocating so a bogus header can't request gigabytes.
+    let remaining = cursor
+        .get_ref()
+        .len()
+        .saturating_sub(cursor.position() as usize);
+    if len > remaining {
+        return Err(io::Error::from(io::ErrorKind::UnexpectedEof).into());
+    }
     let mut buf = vec![0u8; len];
     cursor.read_exact(&mut buf)?;
     Ok(String::from_utf8_lossy(&buf).into_owned())
@@ -631,6 +647,40 @@ mod tests {
         let second = f32::from_le_bytes(raw[4..8].try_into().unwrap());
         assert_eq!(second, 0.5);
         std::fs::remove_file(&tmp).ok();
+    }
+
+    #[test]
+    fn rejects_oversized_counts_without_huge_allocation() {
+        // A tiny header must not be able to request a multi-gigabyte allocation
+        // via an untrusted kv_count / tensor_count / string length. Each of
+        // these headers is 24-40 bytes but declares billions of entries; the
+        // parser must return an error rather than pre-allocating (or panicking).
+        let cases: [(u64, u64, Option<u64>); 3] = [
+            // (tensor_count, kv_count, oversized_string_len)
+            (0, 500_000_000, None),
+            (500_000_000, 0, None),
+            (0, 1, Some(u64::MAX / 2)),
+        ];
+        for (i, (tensor_count, kv_count, str_len)) in cases.into_iter().enumerate() {
+            let mut buf = Vec::new();
+            buf.write_u32::<LittleEndian>(GGUF_MAGIC).unwrap();
+            buf.write_u32::<LittleEndian>(3).unwrap();
+            buf.write_u64::<LittleEndian>(tensor_count).unwrap();
+            buf.write_u64::<LittleEndian>(kv_count).unwrap();
+            if let Some(len) = str_len {
+                // start of a KV entry: an oversized key string length
+                buf.write_u64::<LittleEndian>(len).unwrap();
+            }
+            let tmp = std::env::temp_dir().join(format!(
+                "ferrox_test_dos_{}_{}.gguf",
+                std::process::id(),
+                i
+            ));
+            std::fs::write(&tmp, &buf).unwrap();
+            let res = GgufFile::open(&tmp);
+            std::fs::remove_file(&tmp).ok();
+            assert!(res.is_err(), "case {i} should error, not parse/allocate");
+        }
     }
 
     #[test]

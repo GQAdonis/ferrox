@@ -168,8 +168,16 @@ impl GrammarSampler {
         // returns before all of it. The shape check stays above this: the
         // trigger can fire on any token, so the caller must be handing
         // over real logits from the first one.
+        //
+        // The one exception is this repo's own
+        // [`LazyTriggers::mandatory`](crate::grammar::LazyTriggers::mandatory),
+        // which forbids ENDING before the trigger fires and nothing else.
+        // Everything the model might say on the way there is still free.
         if self.grammar.is_awaiting_trigger() {
-            return Ok(MaskOutcome::Allowed);
+            if self.grammar.allows_eog() {
+                return Ok(MaskOutcome::Allowed);
+            }
+            return self.mask_eog_only(logits);
         }
 
         let allow_eog = self.grammar.allows_eog();
@@ -204,6 +212,32 @@ impl GrammarSampler {
             if allow_eog {
                 return Ok(MaskOutcome::Complete);
             }
+            return Err(ConstraintError::NoAllowedToken {
+                accepted: self.accepted,
+            });
+        }
+        Ok(MaskOutcome::Allowed)
+    }
+
+    /// Take out every end-of-generation token and leave the rest alone.
+    ///
+    /// The whole mask for an untriggered MANDATORY lazy grammar: the turn
+    /// may not end, and nothing else is decided yet. A vocabulary with
+    /// nothing left but its end-of-generation tokens is refused rather
+    /// than sampled, for the same reason the ordinary path refuses one.
+    fn mask_eog_only(&self, logits: &mut [f32]) -> Result<MaskOutcome, ConstraintError> {
+        let mut survivors = 0usize;
+        for (id, logit) in logits.iter_mut().enumerate() {
+            if *logit == f32::NEG_INFINITY {
+                continue;
+            }
+            if self.eog[id] {
+                *logit = f32::NEG_INFINITY;
+            } else {
+                survivors += 1;
+            }
+        }
+        if survivors == 0 {
             return Err(ConstraintError::NoAllowedToken {
                 accepted: self.accepted,
             });
@@ -601,6 +635,60 @@ mod tests {
         assert!(s.allows_eog());
         s.accept(LAZY_EOG)
             .expect("an untriggered grammar cannot object to stopping");
+    }
+
+    /// A MANDATORY trigger forbids exactly one thing before it fires:
+    /// ending the turn. Everything the model might say on the way to a
+    /// tool call is still free, which is the difference from an eager
+    /// grammar and the reason this exists.
+    #[test]
+    fn a_mandatory_trigger_forbids_ending_the_turn_before_it_fires() {
+        let mut s = lazy_sampler(
+            LazyTriggers::new()
+                .with_word("<tool_call>")
+                .unwrap()
+                .mandatory(),
+        );
+        assert!(!s.allows_eog(), "the turn must not be endable yet");
+
+        let mut logits = lazy_logits();
+        s.mask_logits(&mut logits).expect("prose is still free");
+        assert_eq!(
+            allowed(&logits),
+            vec![0, 1, 2, 3, 4, 5, 7],
+            "only the end-of-generation token may be taken away"
+        );
+
+        // Prose, then the trigger.
+        s.accept(0).unwrap();
+        s.accept(2).unwrap();
+        s.accept(3).unwrap();
+        assert!(!s.is_awaiting_trigger());
+        assert!(
+            !s.allows_eog(),
+            "the grammar is now live and unsatisfied, so still no ending"
+        );
+
+        s.accept(4).unwrap();
+        s.accept(5).unwrap();
+        let mut logits = lazy_logits();
+        s.mask_logits(&mut logits).unwrap();
+        assert_eq!(
+            allowed(&logits),
+            vec![LAZY_EOG],
+            "with the call complete the turn may finally end"
+        );
+    }
+
+    /// The same triggers WITHOUT `mandatory` leave the ending free. The
+    /// pair is what shows the flag is what did it.
+    #[test]
+    fn an_optional_trigger_leaves_the_ending_free() {
+        let s = lazy_sampler(LazyTriggers::new().with_word("<tool_call>").unwrap());
+        assert!(s.allows_eog());
+        let mut logits = lazy_logits();
+        s.mask_logits(&mut logits).unwrap();
+        assert!(allowed(&logits).contains(&LAZY_EOG));
     }
 
     /// The mask never *unblocks* anything: a logit already forbidden --

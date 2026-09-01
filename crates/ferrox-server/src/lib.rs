@@ -68,6 +68,7 @@ mod stats;
 mod stop;
 mod stream_events;
 mod tasks;
+mod tool_grammar;
 mod unsupported_sampling;
 
 use std::cell::RefCell;
@@ -1037,19 +1038,19 @@ struct ToolFunctionDef {
 }
 
 /// OpenAI's `tool_choice`: `"auto"`/`"none"`/`"required"`, or an object
-/// pinning one specific function. Only whether it's literally
-/// `"none"` is actually consulted (to suppress tool-calling prompting
-/// entirely) -- forcing a *specific* named call isn't implementable
-/// honestly without grammar-constrained decoding (which doesn't exist
-/// in this server), so `"required"` and a
-/// specific-function choice are both treated the same as `"auto"`:
-/// offered, not forced. A real, disclosed simplification, not silently
-/// wrong behavior.
+/// pinning one specific function.
+///
+/// All four are honoured now. `"none"` hides the tools from the prompt;
+/// `"auto"` offers them; `"required"` and a named function FORCE a call,
+/// by compiling the offered tools into a grammar the decode loop must
+/// keep parseable (`crate::tool_grammar`). Before that grammar existed
+/// the last two were a 501, because a server that is asked to force a
+/// call and can only ask for one in the prompt has not done what it was
+/// told.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(untagged)]
 enum ToolChoice {
     Mode(String),
-    #[allow(dead_code)]
     Specific(serde_json::Value),
 }
 
@@ -1262,6 +1263,53 @@ impl ChatCompletionRequest {
             && !matches!(&self.tool_choice, Some(ToolChoice::Mode(m)) if m == "none")
     }
 
+    /// Whether this request FORCES a tool call, and which tools it may
+    /// choose between.
+    ///
+    /// `"required"` and a named function are the same question with a
+    /// different answer set, so they are one function here and one
+    /// grammar builder downstream. Everything else -- absent, `"auto"`,
+    /// `"none"` -- forces nothing and returns `None`.
+    ///
+    /// An object `tool_choice` that names nothing is a 400 rather than a
+    /// silent `None`: a client that sent `{"type": "function"}` and got
+    /// an unforced answer cannot tell that apart from a served one.
+    fn forced_tool_choice(&self) -> Result<Option<tool_grammar::Forced<'_>>, ApiError> {
+        match &self.tool_choice {
+            Some(ToolChoice::Mode(m)) if m == "required" => Ok(Some(tool_grammar::Forced::Any)),
+            Some(ToolChoice::Specific(value)) => {
+                // OpenAI's shape is `{"type":"function","function":{"name":…}}`;
+                // several clients send `{"name":…}` flat, and both name
+                // the same thing.
+                let name = value
+                    .get("function")
+                    .and_then(|f| f.get("name"))
+                    .or_else(|| value.get("name"))
+                    .and_then(|n| n.as_str());
+                match name {
+                    Some(name) => Ok(Some(tool_grammar::Forced::Named(name))),
+                    None => Err(invalid_request(
+                        "tool_choice must be \"auto\", \"none\", \"required\", or an object with \
+                         function.name",
+                        "tool_choice",
+                    )),
+                }
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// The offered tools, reduced to what [`tool_grammar`] needs.
+    fn tool_specs(&self) -> Vec<tool_grammar::ToolSpec<'_>> {
+        self.tools
+            .iter()
+            .map(|t| tool_grammar::ToolSpec {
+                name: &t.function.name,
+                parameters: t.function.parameters.as_ref(),
+            })
+            .collect()
+    }
+
     /// The `chat_template_kwargs` this request actually renders with.
     ///
     /// Five rules, all of them from `ferrox-edge`:
@@ -1465,18 +1513,46 @@ impl ChatCompletionRequest {
                 }
             }
         }
-        match &self.tool_choice {
-            Some(ToolChoice::Mode(m)) if m == "required" => {
-                return Err(unsupported_feature(
-                    "tool_choice=required needs constrained decoding (not implemented)",
+        // A forced `tool_choice` is served by compiling the offered tools
+        // into a grammar (`tool_grammar`). What can be checked without
+        // knowing which checkpoint is loaded is checked here, so the
+        // caller's own mistakes are refused before a prompt is rendered;
+        // the rest -- whether the served family's wire format has a
+        // grammar at all -- needs the model and is refused in
+        // `generation_params_for_template`.
+        if let Some(forced) = self.forced_tool_choice()? {
+            if self.tools.is_empty() {
+                return Err(invalid_request(
+                    "tool_choice forces a tool call, but no tools were offered",
+                    "tool_choice",
                 ));
             }
-            Some(ToolChoice::Specific(_)) => {
-                return Err(unsupported_feature(
-                    "named tool_choice is not implemented (use auto/none)",
+            if let tool_grammar::Forced::Named(name) = forced {
+                if !self.tools.iter().any(|t| t.function.name == name) {
+                    return Err(invalid_request(
+                        &format!(
+                            "tool_choice names {name:?}, which is not one of the tools offered"
+                        ),
+                        "tool_choice",
+                    ));
+                }
+            }
+            // Two different constraints on one generation. Serving the
+            // one we happen to compile last is not answering either.
+            if self.grammar.is_some() {
+                return Err(invalid_request(
+                    "a forced tool_choice and a \"grammar\" are two different constraints on the \
+                     same generation; send one",
+                    "tool_choice",
                 ));
             }
-            _ => {}
+            if self.json_object_mode() {
+                return Err(invalid_request(
+                    "a forced tool_choice cannot be combined with response_format json_object: \
+                     the tool-call markers are not JSON",
+                    "tool_choice",
+                ));
+            }
         }
         Ok(())
     }
@@ -1530,16 +1606,35 @@ impl ChatCompletionRequest {
     }
 
     /// Like [`Self::generation_params`], plus architecture-default stop
-    /// strings (Gemma IT emits `<end_of_turn>` before `<eos>`).
+    /// strings (Gemma IT emits `<end_of_turn>` before `<eos>`) and, for a
+    /// forced `tool_choice`, the grammar that makes it forced.
+    ///
+    /// `served_model` is the name of the checkpoint this generation will
+    /// actually run against -- `active.model.name()`, the same string
+    /// [`output::OutputPosture::resolve`] reads the answer back with, and
+    /// NOT the `model` field of the request. The two can differ, and a
+    /// grammar built for one wire format while the response is parsed in
+    /// another would force a call this server then cannot read.
     fn generation_params_for_template(
         &self,
         template: &chat_template::PromptTemplate,
+        served_model: &str,
     ) -> Result<GenerationParams, ApiError> {
         let mut params = self.generation_params()?;
         if let Some(stop) = template.end_of_turn() {
             if !params.stop.iter().any(|s| s == stop) {
                 params.stop.push(stop.to_string());
             }
+        }
+        if let Some(forced) = self.forced_tool_choice()? {
+            // `validate_supported_fields` has already refused the
+            // combinations that would put two constraints on one
+            // generation, so there is nothing here to overwrite.
+            params.grammar = Some(tool_grammar::build(
+                forced,
+                &self.tool_specs(),
+                policy::parser::ToolCallFormat::infer(served_model),
+            )?);
         }
         Ok(params)
     }
@@ -2738,7 +2833,7 @@ async fn chat_completions_full(
         tracing::debug!("cache hit for key {}", key.as_ref().unwrap().digest());
         (cached, "hit")
     } else {
-        let params = req.generation_params_for_template(&template)?;
+        let params = req.generation_params_for_template(&template, active.model.name())?;
         let (chunks, finish, usage) = decode_task::buffered(
             decode_task::DecodeHandles::take(&state, &active),
             prompt.clone(),
@@ -2844,7 +2939,7 @@ async fn chat_completions_stream(
     let prefix_cache = state.prefix_cache.clone();
     let batcher = active.batcher.clone();
     let ceiling = active.ceiling.clone();
-    let mut params = req.generation_params_for_template(&template)?;
+    let mut params = req.generation_params_for_template(&template, active.model.name())?;
     let stats_state = Arc::clone(&state);
     // Read now, off the handle this stream will decode against. Read
     // later it would name whatever a swap had made current by then.
@@ -7228,6 +7323,130 @@ mod tests {
             "messages": [{"role": "user", "content": "hi"}],
         }));
         assert!(plain.generation_params().unwrap().grammar.is_none());
+    }
+
+    fn tool_request(tool_choice: serde_json::Value) -> ChatCompletionRequest {
+        chat_request(serde_json::json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "weather in Rome?"}],
+            "tools": [weather_tool()],
+            "tool_choice": tool_choice,
+        }))
+    }
+
+    /// `tool_choice: "required"` used to be a 501. It now compiles the
+    /// offered tools into a grammar that rides on the params, which is
+    /// the only thing every decode path shares.
+    #[test]
+    fn a_forced_tool_choice_puts_a_grammar_on_the_generation_params() {
+        for choice in [
+            serde_json::json!("required"),
+            serde_json::json!({"type": "function", "function": {"name": "get_weather"}}),
+        ] {
+            let req = tool_request(choice.clone());
+            req.validate_supported_fields()
+                .unwrap_or_else(|e| panic!("{choice} is a valid request: {e:?}"));
+            let params = req
+                .generation_params_for_template(&graded_template(), "Qwen3-8B")
+                .unwrap_or_else(|e| panic!("{choice} compiles: {e:?}"));
+            let grammar = params
+                .grammar
+                .as_ref()
+                .unwrap_or_else(|| panic!("{choice} was accepted and then not enforced"));
+            assert!(
+                grammar.is_awaiting_trigger(),
+                "the model must be free to think before it calls"
+            );
+            assert!(
+                !grammar.allows_eog(),
+                "{choice} must not be able to end the turn without a call"
+            );
+            // The bug that has been fixed three times: a constrained
+            // request that lets a backend fold lm_head+argmax on device
+            // is a constrained request served unconstrained. A LAZY
+            // grammar needs the vocabulary from the FIRST token, because
+            // its trigger can fire on any of them.
+            assert!(
+                params.needs_vocab_logits(),
+                "{choice} would let a backend return a token id instead of logits"
+            );
+            assert!(
+                !generate::greedy_gpu_fold_allowed(&params),
+                "{choice} at temperature 0 must still refuse the greedy GPU fold"
+            );
+        }
+    }
+
+    /// `auto` and `none` force nothing, and must not acquire a grammar.
+    #[test]
+    fn an_unforced_tool_choice_leaves_the_generation_unconstrained() {
+        for choice in [serde_json::json!("auto"), serde_json::json!("none")] {
+            let req = tool_request(choice.clone());
+            req.validate_supported_fields().expect("still supported");
+            let params = match req.generation_params_for_template(&graded_template(), "Qwen3-8B") {
+                Ok(p) => p,
+                Err((status, _)) => panic!("{choice} has no constraint to compile: {status}"),
+            };
+            assert!(
+                params.grammar.is_none(),
+                "{choice} does not force a call and must not be constrained"
+            );
+        }
+    }
+
+    /// Every refusal a forced choice can produce names the field, and
+    /// none of them is a silent downgrade to `auto`.
+    #[test]
+    fn a_forced_tool_choice_refuses_rather_than_quietly_not_forcing() {
+        // No tools to choose between.
+        let req = chat_request(serde_json::json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tool_choice": "required",
+        }));
+        let (status, _) = req
+            .validate_supported_fields()
+            .expect_err("nothing to call");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        // A name that is not on offer.
+        let req =
+            tool_request(serde_json::json!({"type": "function", "function": {"name": "nope"}}));
+        let (status, Json(body)) = req.validate_supported_fields().expect_err("no such tool");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"]["param"], "tool_choice");
+
+        // An object that names nothing at all.
+        let req = tool_request(serde_json::json!({"type": "function"}));
+        let (status, _) = req.validate_supported_fields().expect_err("names nothing");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        // Two constraints on one generation.
+        let req = chat_request(serde_json::json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [weather_tool()],
+            "tool_choice": "required",
+            "grammar": "root ::= \"a\"+",
+        }));
+        let (status, _) = req
+            .validate_supported_fields()
+            .expect_err("a grammar and a forced call are two constraints");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        // A checkpoint whose wire format has no grammar yet is refused
+        // by name at params time, when the served model is known.
+        let req = tool_request(serde_json::json!("required"));
+        let (status, Json(body)) =
+            match req.generation_params_for_template(&graded_template(), "GLM-4.7") {
+                Err(e) => e,
+                Ok(_) => panic!("glm calls are not JSON behind a marker"),
+            };
+        assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
+        assert!(
+            body["error"]["message"].as_str().unwrap().contains("glm47"),
+            "{body}"
+        );
     }
 
     /// A grammar that does not parse is refused before any work, and

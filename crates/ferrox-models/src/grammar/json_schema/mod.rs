@@ -122,6 +122,102 @@ pub fn json_schema_to_grammar_value(schema: &serde_json::Value) -> Result<String
     convert(&JsonValue::from(schema))
 }
 
+/// Several schemas and some hand-written rules, compiled into ONE
+/// grammar.
+///
+/// `common_grammar_builder` upstream (`common/chat.cpp` builds every
+/// tool-call grammar through it): each schema becomes a NAMED rule
+/// instead of `root`, and the caller writes the rule that composes them.
+/// One converter, so the shared `space` / `char` / `string` builtins are
+/// emitted once and a rule name used by two schemas is disambiguated
+/// rather than silently redefined.
+///
+/// The single-schema [`json_schema_to_grammar`] is not a special case of
+/// this and is left alone: it must produce `root` itself, and refuses if
+/// a subschema takes that name first.
+///
+/// ```
+/// use ferrox_models::grammar::json_schema::GrammarBuilder;
+/// let mut b = GrammarBuilder::new();
+/// let args = b
+///     .add_schema_value("get-weather-args", &serde_json::json!({
+///         "type": "object",
+///         "properties": {"city": {"type": "string"}},
+///         "required": ["city"],
+///     }))
+///     .unwrap();
+/// b.add_rule("root", &format!("\"call \" {args}"));
+/// let grammar = b.finish().unwrap();
+/// assert!(grammar.contains("root ::="));
+/// ```
+pub struct GrammarBuilder {
+    conv: Converter,
+}
+
+impl Default for GrammarBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl GrammarBuilder {
+    pub fn new() -> Self {
+        Self {
+            conv: Converter::new(std::collections::HashMap::new()),
+        }
+    }
+
+    /// Compile `schema` into a rule named `name`, and return the name it
+    /// actually got.
+    ///
+    /// The returned name is what the caller must reference: a name
+    /// already bound to a different body gets a numeric suffix, which is
+    /// how two tools with parameter sets that collapse to the same rule
+    /// name stay distinct.
+    pub fn add_schema(&mut self, name: &str, schema: &JsonValue) -> Result<String, SchemaError> {
+        self.conv.add_refs(refs::collect(schema)?)?;
+        self.conv.visit(schema, name)
+    }
+
+    /// As [`Self::add_schema`], for an already-parsed `serde_json::Value`.
+    ///
+    /// See the module docs on property order: a `Value` built without
+    /// `serde_json`'s `preserve_order` has already lost the schema's
+    /// declaration order, so required members are required in
+    /// lexicographic order instead. That constrains a model harder than
+    /// the schema does, never softer, so the JSON it is forced to emit is
+    /// still JSON the schema accepts.
+    pub fn add_schema_value(
+        &mut self,
+        name: &str,
+        schema: &serde_json::Value,
+    ) -> Result<String, SchemaError> {
+        self.add_schema(name, &JsonValue::from(schema))
+    }
+
+    /// Add a hand-written rule body, and return the name it got.
+    pub fn add_rule(&mut self, name: &str, body: &str) -> String {
+        self.conv.add_rule(name, body)
+    }
+
+    /// Emit the grammar text, checking it parses.
+    ///
+    /// Refuses a grammar with no `root`: it would compile to
+    /// [`GrammarError::MissingRoot`](crate::grammar::GrammarError) at
+    /// whatever call site tried to run it, which is further from the
+    /// mistake than here.
+    pub fn finish(self) -> Result<String, SchemaError> {
+        if !self.conv.has_rule("root") {
+            return Err(SchemaError::RootDisplaced {
+                got: "<no root rule was added>".to_string(),
+            });
+        }
+        let grammar = self.conv.finish();
+        crate::grammar::parse(&grammar)?;
+        Ok(grammar)
+    }
+}
+
 /// `json_schema_to_grammar` / `build_grammar`: resolve refs, visit the
 /// root, emit, and check the result against this repo's own GBNF parser.
 fn convert(schema: &JsonValue) -> Result<String, SchemaError> {

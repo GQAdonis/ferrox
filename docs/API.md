@@ -64,7 +64,7 @@ conversation or a large `/v1/embeddings` batch past that comes back
 | `presence_penalty`, `frequency_penalty` | Supported |
 | `stream` | Supported (overlapped SSE when tools off and CB off) |
 | `tools` / `tool_choice: none\|auto` | Supported (prompt-engineered, parsed in eleven wire formats) |
-| `tool_choice: required` / named function | **Reject** |
+| `tool_choice: required` / named function | Supported on the three JSON-object wire formats (Hermes/Qwen2.5, Llama 3, Mistral), by a lazy grammar. **501 naming the format** on the other eight |
 | `logprobs` / `top_logprobs` / `n` (>1) | **Reject** |
 | `response_format: json_object` | Supported (best-effort character mask + validate) |
 | `grammar` | Supported. llama.cpp's own field: a GBNF string, enforced per token by a real parser |
@@ -751,10 +751,9 @@ the prompt is what gets consulted.
 ## Tool-call formats
 
 `tools` is still prompt-engineered. A grammar engine exists now, but
-nothing wires it to `tools`: constraining a tool call needs a *lazy*
-grammar that switches on partway through a response, which is why the
-`tool_choice` rejections above still stand. The preamble asks for a
-Hermes-style
+and it is now wired to `tools`: a forced `tool_choice` compiles the
+offered tools into a lazy grammar, so the call itself is
+schema-constrained. The preamble asks for a Hermes-style
 `<tool_call>{"name": …, "arguments": {…}}</tool_call>`. But a model
 trained on a different format frequently answers in its own, correctly
 and in its own terms. Parsing tries the format the served checkpoint's
@@ -1012,15 +1011,40 @@ unexplained 400 — and it refuses even when a `grammar` is supplied
 alongside, rather than quietly honouring a different constraint than the
 one asked for.
 
-`tool_choice: "required"` and a named `tool_choice` still return 501.
-They need *lazy* grammars — llama.cpp's `trigger_patterns`, which switch
-a grammar on partway through a response — and that is not ported.
+`tool_choice: "required"` and a named `tool_choice` are supported, by a
+lazy grammar built from the request's own `tools`. Each tool's
+`arguments` rule is its `parameters` JSON Schema compiled to GBNF, so a
+`required` property cannot be omitted and an `enum` cannot be invented.
+A named choice is the same grammar with the union narrowed to one
+alternative.
+
+**The trigger is mandatory, and that is a deliberate departure from
+llama.cpp.** Upstream forces a call with an *eager* grammar. That does
+not survive this server: several families open the reasoning block in
+the prompt, so the model's first token is already inside `<think>`, and
+a call forced there is read back by ferrox's own reasoning parser as
+thinking — the caller who demanded a call would get `reasoning_content`
+and no call. So the grammar stays lazy, triggers on the wire format's
+opening marker, and while awaiting masks *only* the end-of-generation
+tokens: the prefix is free, but the turn cannot END until a call has
+begun.
+
+The cost, stated: a model that never opens a call runs to `max_tokens`
+and finishes `"length"` — a visible failure rather than prose served as
+the call that was asked for.
+
+Only the three wire formats whose call is a JSON object behind a marker
+are supported: Hermes/Qwen2.5, Llama 3 and Mistral. The other eight
+return **501 naming the format**, because a Hermes-shaped grammar on a
+GLM checkpoint would force output that ferrox's own streaming parser
+cannot read back.
 
 ## Not yet
 
 Image and audio input · `response_format: json_schema` (GBNF grammars
-themselves *are* supported, see above) ·
-`tool_choice: required` and named `tool_choice` · MCP tool invocation
+themselves *are* supported, see above, and `tool_choice` uses the
+schema converter — only this wire spelling is unwired) · MCP tool
+invocation
 (the config is read, nothing is called) · dedicated embedding models ·
 multi-GPU, tensor parallel, prefill/decode disaggregation · streamed
 argument deltas for the JSON-payload tool formats (they arrive whole) ·

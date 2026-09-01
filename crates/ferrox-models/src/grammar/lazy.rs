@@ -199,11 +199,48 @@ fn start_of_match(caps: &fancy_regex::Captures<'_>) -> usize {
 pub struct LazyTriggers {
     tokens: Vec<u32>,
     patterns: Vec<TriggerPattern>,
+    mandatory: bool,
 }
 
 impl LazyTriggers {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// The generation may NOT end before a trigger has fired.
+    ///
+    /// **This is not upstream.** llama.cpp's lazy grammars are always
+    /// optional: `awaiting_trigger` masks nothing, end-of-generation
+    /// included, so a model that never triggers simply produces
+    /// unconstrained text. Upstream enforces OpenAI's `tool_choice:
+    /// "required"` a different way -- with an EAGER grammar
+    /// (`grammar_lazy = false` for `COMMON_CHAT_TOOL_CHOICE_REQUIRED` in
+    /// `common/chat.cpp`) whose root IS a tool call, so the very first
+    /// token is already inside one.
+    ///
+    /// That trade does not survive this server: several checkpoint
+    /// families open a reasoning block in the PROMPT
+    /// (`ferrox_server::policy::parser::reasoning`'s `always_open`), so
+    /// the model's first token is inside `<think>`, and a grammar that
+    /// forces a tool call there produces a call that this server's own
+    /// reasoning parser then reads as thinking. Marking the trigger
+    /// mandatory keeps the prefix free -- thinking, prose, whatever the
+    /// checkpoint does -- while making the *turn* unable to end until a
+    /// call has begun, after which the grammar forces it to be complete
+    /// and schema-valid.
+    ///
+    /// The cost is stated where it is wired: a model that never begins a
+    /// call runs to `max_tokens` instead of stopping. For a caller who
+    /// said `required`, that is a visible failure rather than an answer
+    /// that quietly ignores what they asked for.
+    pub fn mandatory(mut self) -> Self {
+        self.mandatory = true;
+        self
+    }
+
+    /// Whether the generation may end before a trigger fires.
+    pub fn is_mandatory(&self) -> bool {
+        self.mandatory
     }
 
     /// `COMMON_GRAMMAR_TRIGGER_TYPE_TOKEN`: this token id, exactly.
@@ -314,6 +351,12 @@ impl LazyState {
     /// The triggers being waited on.
     pub fn triggers(&self) -> &LazyTriggers {
         &self.triggers
+    }
+
+    /// Whether the generation may not end before a trigger fires. See
+    /// [`LazyTriggers::mandatory`], which is not upstream.
+    pub fn is_mandatory(&self) -> bool {
+        self.triggers.mandatory
     }
 
     /// Offer one sampled token to the triggers.

@@ -1438,7 +1438,7 @@ async fn responses_full(
     let offered = offered_tools(&chat);
     let prompt = prompt_from_messages(&chat.messages, &template, &offered, kwargs)?;
     let posture = OutputPosture::resolve(active.model.name(), &prompt);
-    let params = chat.generation_params_for_template(&template)?;
+    let params = chat.generation_params_for_template(&template, active.model.name())?;
 
     let (chunks, finish, usage) = crate::decode_task::buffered(
         crate::decode_task::DecodeHandles::take(&state, &active),
@@ -1498,7 +1498,7 @@ async fn responses_stream(
     let prompt = prompt_from_messages(&chat.messages, &template, &offered, kwargs)?;
     let served_model = active.model.name().to_string();
     let posture = OutputPosture::resolve(&served_model, &prompt);
-    let mut params = chat.generation_params_for_template(&template)?;
+    let mut params = chat.generation_params_for_template(&template, &served_model)?;
 
     // The same two-tier cancellation the chat stream has: the guard
     // rides with the generation task and deregisters however that task

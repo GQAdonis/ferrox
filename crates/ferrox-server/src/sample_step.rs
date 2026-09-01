@@ -509,5 +509,86 @@ mod tests {
         // Not greedy: never folded either way, whatever the constraints.
         assert!(!greedy_gpu_fold_allowed(&params(false, 0.8)));
         assert!(!greedy_gpu_fold_allowed(&params(true, 0.8)));
+        // A LAZY grammar is the case that looks unconstrained and is
+        // not: its trigger can fire on any token, so it needs the whole
+        // vocabulary from the first one.
+        assert!(!greedy_gpu_fold_allowed(&with_lazy_grammar(
+            params(false, 0.0),
+            r#"root ::= "cd""#,
+            "c",
+        )));
+    }
+
+    /// A grammar that waits for a trigger, with the trigger MANDATORY --
+    /// what `tool_choice: "required"` compiles to.
+    fn with_lazy_grammar(mut p: GenerationParams, src: &str, trigger: &str) -> GenerationParams {
+        use ferrox_models::grammar::LazyTriggers;
+        p.grammar = Some(Arc::new(
+            Grammar::from_str_with_root(src, "root")
+                .expect("test grammar parses")
+                .into_lazy(
+                    LazyTriggers::new()
+                        .with_word(trigger)
+                        .expect("the trigger compiles")
+                        .mandatory(),
+                )
+                .expect("there is a trigger"),
+        ));
+        p
+    }
+
+    /// The `tool_choice: "required"` shape, on the one step both decode
+    /// loops and `generate_engine` share.
+    ///
+    /// Three things at once, because they only mean anything together:
+    /// free text before the trigger, an ENDING that is forbidden until
+    /// the trigger fires, and a grammar that constrains hard once it
+    /// does.
+    #[test]
+    fn a_mandatory_lazy_grammar_forbids_only_the_ending_until_it_fires() {
+        let params = with_lazy_grammar(params(false, 0.0), r#"root ::= "cd""#, "c");
+        let stops = letter_stops();
+        let mut state = SampleState::new(7);
+
+        // End-of-generation wins the argmax by a mile, and "a" -- which
+        // the grammar could never accept -- is the best of the rest.
+        let logits = vec![5.0, 1.0, 0.5, 0.5, 9.0];
+        let chosen = token(step(&mut state, &logits, &params, &[], &stops, &letter).unwrap());
+        assert_eq!(
+            chosen, 0,
+            "free text before the trigger, but not the end of the turn"
+        );
+
+        // "c" is the trigger. After it the grammar is live and wants "d".
+        let logits = vec![1.0, 1.0, 9.0, 0.5, 5.0];
+        let chosen = token(step(&mut state, &logits, &params, &[0], &stops, &letter).unwrap());
+        assert_eq!(chosen, 2, "the trigger token itself");
+
+        let logits = vec![9.0, 9.0, 9.0, 0.0, 9.0];
+        let chosen = token(step(&mut state, &logits, &params, &[0, 2], &stops, &letter).unwrap());
+        assert_eq!(
+            chosen, 3,
+            "once triggered the grammar constrains: only \"d\" continues \"c\""
+        );
+    }
+
+    /// The same grammar WITHOUT `mandatory` lets the turn end. The pair
+    /// is what shows the first test is measuring the flag and not the
+    /// mask in general.
+    #[test]
+    fn an_optional_lazy_grammar_lets_the_turn_end_before_the_trigger() {
+        use ferrox_models::grammar::LazyTriggers;
+        let mut params = params(false, 0.0);
+        params.grammar = Some(Arc::new(
+            Grammar::from_str_with_root(r#"root ::= "cd""#, "root")
+                .unwrap()
+                .into_lazy(LazyTriggers::new().with_word("c").unwrap())
+                .unwrap(),
+        ));
+        let logits = vec![5.0, 1.0, 0.5, 0.5, 9.0];
+        let mut state = SampleState::new(7);
+        let chosen =
+            token(step(&mut state, &logits, &params, &[], &letter_stops(), &letter).unwrap());
+        assert_eq!(chosen, LETTER_EOG, "an optional trigger constrains nothing");
     }
 }

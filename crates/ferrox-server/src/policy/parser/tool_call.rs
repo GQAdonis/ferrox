@@ -158,13 +158,41 @@ pub enum ToolCallFormat {
     /// muse-glimmer's ATEM channel grammar around an
     /// `<atem:invoke>`/`<atem:parameter>` block.
     MuseGlimmer,
+    /// A fenced ```json block holding `{"name": …, "arguments": {…}}`.
+    ///
+    /// Not a trained format: it is what an instruct model reaches for
+    /// when asked to "call a tool" and its own template did not fire —
+    /// markdown, because that is how JSON is shown to humans. Observed
+    /// 2026-09-01 through UAR, where the model named a real tool with
+    /// real arguments and the call was rendered as prose because
+    /// nothing recognized the fence.
+    ///
+    /// Accepted only when the fenced object actually validates as a
+    /// call against an offered tool — `call_from_json` does that — so
+    /// a model *displaying* JSON in an answer is not mistaken for one
+    /// invoking a tool.
+    FencedJson,
+    /// `<function_call>{"name": …, "arguments": {…}}</function_call>`.
+    ///
+    /// Structurally identical to [`ToolCallFormat::Qwen25`] -- a JSON
+    /// object between markers -- with a different tag. Observed
+    /// 2026-09-01 from `Qwen2.5-Coder-7B-Instruct-Q5_K_M.gguf`, whose
+    /// chat template emits this instead of the Hermes `<tool_call>`
+    /// the same family is documented to use. The call was correct and
+    /// went unrecognized, which is the exact failure this module's
+    /// header describes: "a model trained on a different format
+    /// frequently answers in its own anyway -- correctly, in its own
+    /// terms, and then went unrecognized."
+    FunctionCall,
 }
 
 /// Every marker that means "a tool call may be starting", across all
 /// families. Used to decide, cheaply, whether a response is worth
 /// parsing at all.
-pub const TOOL_MARKERS: [&str; 12] = [
+pub const TOOL_MARKERS: [&str; 14] = [
     "<tool_call>",
+    "```",
+    "<function_call>",
     "<function=",
     "<|python_tag|>",
     "[TOOL_CALLS]",
@@ -207,6 +235,8 @@ impl ToolCallFormat {
             ToolCallFormat::GptOss => "gpt_oss",
             ToolCallFormat::Gemma4 => "gemma4",
             ToolCallFormat::MuseGlimmer => "muse_glimmer",
+            ToolCallFormat::FunctionCall => "function_call",
+            ToolCallFormat::FencedJson => "fenced_json",
         }
     }
 
@@ -288,6 +318,12 @@ impl ToolCallFormat {
             // text in an answer is prose. A checkpoint anchor set on it
             // would fire on the model quoting its own instructions.
             ToolCallFormat::MuseGlimmer => None,
+            // Unambiguous: the tag means a call and nothing else.
+            ToolCallFormat::FunctionCall => Some("<function_call>"),
+            // A fence opens ordinary prose too, so it is not an anchor:
+            // `call_from_json` validating the payload is what makes a
+            // fenced object a call rather than a listing.
+            ToolCallFormat::FencedJson => None,
         }
     }
 
@@ -325,6 +361,10 @@ impl ToolCallFormat {
     fn markers(self) -> Markers {
         match self {
             ToolCallFormat::Qwen25 => Markers::block("<tool_call>", "</tool_call>"),
+            ToolCallFormat::FunctionCall => {
+                Markers::block("<function_call>", "</function_call>")
+            }
+            ToolCallFormat::FencedJson => Markers::block("```", "```"),
             ToolCallFormat::Llama3 => Markers::block("<|python_tag|>", ""),
             ToolCallFormat::Mistral => Markers::block("[TOOL_CALLS]", ""),
             ToolCallFormat::Gemma4 => Markers::block("<|tool_call>", "<tool_call|>"),
@@ -621,6 +661,13 @@ impl ToolCallParser {
             ToolCallFormat::MiniMaxM3 => self.parse_m3(text),
             ToolCallFormat::MuseGlimmer => unreachable!("handled above"),
             ToolCallFormat::Qwen25 => self.parse_json_blocks(text, "<tool_call>", "</tool_call>"),
+            ToolCallFormat::FunctionCall => {
+                self.parse_json_blocks(text, "<function_call>", "</function_call>")
+            }
+            // The bare fence, so a language tag is optional: models emit
+            // both "```json" and a plain "```". `call_from_json` trims the
+            // leading tag along with surrounding whitespace.
+            ToolCallFormat::FencedJson => self.parse_json_blocks(text, "```", "```"),
             ToolCallFormat::Llama3 => self.parse_bare_json(text, "<|python_tag|>"),
             ToolCallFormat::Mistral => self.parse_mistral(text),
             ToolCallFormat::GptOss => self.parse_harmony(text),
@@ -1262,7 +1309,18 @@ impl ToolCallParser {
     }
 
     fn call_from_json(&self, text: &str, index: usize) -> Option<ToolCall> {
-        let value: Value = serde_json::from_str(text).ok()?;
+        // A fenced block may carry a language tag on its opening line
+        // (```json). The tag is not JSON, so strip a leading bare word
+        // before parsing; every other caller passes a clean object and
+        // is unaffected, because the strip only fires when the text
+        // does not already start with `{`.
+        let body = text.trim();
+        let body = if body.starts_with('{') {
+            body
+        } else {
+            body.split_once('\n').map_or(body, |(_tag, rest)| rest.trim())
+        };
+        let value: Value = serde_json::from_str(body).ok()?;
         self.call_from_value(&value, index)
     }
 
@@ -1272,9 +1330,17 @@ impl ToolCallParser {
             return None;
         }
         // Families disagree on the key; they never both appear.
+        //
+        // `input` was added 2026-09-01 from an observed failure: UAR's
+        // XML tool injector (`llm/xml_tool_injector.rs`) instructs models
+        // to emit `{"name": …, "input": {…}}`, and UAR's own extractor
+        // reads `input` OR `arguments`. Ferrox read neither `input` nor
+        // recognized the call, so a correct tool call from a UAR-driven
+        // model was returned as prose and the tool never ran.
         let arguments = value
             .get("arguments")
             .or_else(|| value.get("parameters"))
+            .or_else(|| value.get("input"))
             .cloned()
             .unwrap_or(Value::Object(Map::new()));
         Some(ToolCall {

@@ -142,12 +142,21 @@ fn split_reasoning(text: &str, posture: OutputPosture) -> (Option<String>, Strin
 
 /// Find every tool call in `text`.
 ///
-/// Two formats are tried, in this order and for this reason: the one
+/// Three formats are tried, in this order and for this reason: the one
 /// the served model's family emits natively, then the Hermes-style one
-/// the preamble asked for. A model that ignores the preamble and
-/// answers in its own format is the common case worth getting right,
-/// and a model that follows the preamble is caught by the fallback --
-/// so both work, and neither has to be configured.
+/// the preamble asked for, then the bare `<function_call>` tag. A model
+/// that ignores the preamble and answers in its own format is the
+/// common case worth getting right, and a model that follows the
+/// preamble is caught by the fallback -- so both work, and neither has
+/// to be configured.
+///
+/// The third was added 2026-09-01 from an observed failure:
+/// `Qwen2.5-Coder-7B-Instruct-Q5_K_M.gguf` emitted a correct call as
+/// `<function_call>{…}</function_call>`, matching neither its family's
+/// native format nor the preamble's, so `tool_calls` came back null
+/// and the call reached the client as prose. Its cost is one extra
+/// parse attempt on text that already failed two, and only when tools
+/// were offered.
 fn extract_tool_calls(
     text: &str,
     tools: &[ToolDef],
@@ -161,6 +170,14 @@ fn extract_tool_calls(
     let mut formats = vec![native];
     if native != ToolCallFormat::Qwen25 {
         formats.push(ToolCallFormat::Qwen25);
+    }
+    if native != ToolCallFormat::FunctionCall {
+        formats.push(ToolCallFormat::FunctionCall);
+    }
+    // Last, because it is the loosest: a fenced object is a call only
+    // if it validates as one against an offered tool.
+    if native != ToolCallFormat::FencedJson {
+        formats.push(ToolCallFormat::FencedJson);
     }
     for format in formats {
         let parser = ToolCallParser::new(format, schemas.clone());
@@ -198,6 +215,60 @@ mod tests {
                 })),
             },
         }]
+    }
+
+    /// A fenced ```json object naming an offered tool is a call.
+    ///
+    /// Regression test, 2026-09-01: asked through UAR to call
+    /// `current_time`, the model emitted exactly this. Nothing
+    /// recognized the fence, so the call rendered as prose and the
+    /// tool never ran.
+    #[test]
+    fn a_fenced_json_object_is_understood() {
+        let parsed = parse_output(
+            "```json\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Rome\"}}\n```",
+            &tools(),
+            OutputPosture::for_model("some-random-7b"),
+        );
+        assert_eq!(parsed.calls.len(), 1);
+        assert_eq!(parsed.calls[0].name, "get_weather");
+        assert_eq!(parsed.calls[0].arguments, r#"{"city":"Rome"}"#);
+    }
+
+    /// A fenced object that is NOT a call stays prose.
+    ///
+    /// The guard on the loosest format: an answer that displays JSON
+    /// must not be mistaken for one invoking a tool.
+    #[test]
+    fn a_fenced_json_object_that_is_not_a_call_stays_content() {
+        let parsed = parse_output(
+            "Here is the config:\n\n```json\n{\"port\": 8899, \"host\": \"127.0.0.1\"}\n```",
+            &tools(),
+            OutputPosture::for_model("some-random-7b"),
+        );
+        assert!(parsed.calls.is_empty(), "a data listing is not a tool call");
+        assert!(parsed.content.contains("port"));
+    }
+
+    /// A `<function_call>` block is recognized, whatever the served
+    /// model's native format is.
+    ///
+    /// Regression test for an observed failure, 2026-09-01:
+    /// `Qwen2.5-Coder-7B-Instruct-Q5_K_M.gguf` emitted exactly this
+    /// text for a correct call. It matched neither its family's native
+    /// format nor the Hermes marker the preamble asks for, so
+    /// `tool_calls` came back null and the call reached the client as
+    /// prose -- the code map was never queried.
+    #[test]
+    fn the_bare_function_call_marker_is_understood() {
+        let parsed = parse_output(
+            "<function_call>\n  {\"name\": \"get_weather\", \"arguments\": {\"city\": \"Rome\"}}\n</function_call>",
+            &tools(),
+            OutputPosture::for_model("some-random-7b"),
+        );
+        assert_eq!(parsed.calls.len(), 1);
+        assert_eq!(parsed.calls[0].name, "get_weather");
+        assert_eq!(parsed.calls[0].arguments, r#"{"city":"Rome"}"#);
     }
 
     /// The format the preamble asks for, from a model that has no

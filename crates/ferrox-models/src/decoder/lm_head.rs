@@ -1,0 +1,218 @@
+//! The output head's two invariants, held as types rather than as
+//! coincidences between call sites.
+//!
+//! 1. [`Logits`]: a vocabulary of logits is softcapped exactly once, by
+//!    the only constructor that can produce one. Gemma-2 caps at 30.0,
+//!    so a path that projects and returns raw is not an error, just a
+//!    quietly different distribution.
+//!
+//! 2. [`FoldedLmHead`]: `final_norm` + `lm_head` may be folded into a
+//!    fused Metal decode stack ONLY when the stack's result is a greedy
+//!    argmax token id. That result bypasses `Decoder::logits_from_normed`
+//!    entirely, so `final_logit_softcap` never runs on it, and the ONLY
+//!    reason that is sound is that `sc * tanh(x / sc)` is strictly
+//!    increasing: capping cannot reorder logits, so it cannot move an
+//!    argmax. On a full vocabulary of logits it changes every value.
+//!
+//! Before this module, invariant 2 held by accident. `decoder.rs`
+//! computed `out_launch = if greedy_gpu { launch } else { None }` and
+//! then passed `greedy_gpu && out_launch.is_some()` as the *separate*
+//! `argmax_only` argument -- two hand-written expressions of one fact,
+//! either of which could be edited without the other, and
+//! `launch_decode_dense_stack(output: Some(..), argmax_only: false)` is
+//! a representable call that downloads full uncapped logits which
+//! `forward_token` then returned as-is. Nothing stated the coupling and
+//! no test could see it break. Here the launch and the `argmax_only`
+//! flag are one value with one constructor, and the result is
+//! interpreted by [`FoldedLmHead::interpret`], which softcaps anything
+//! vocabulary-shaped on the way out.
+
+use ferrox_core::matmul::softcap_inplace;
+
+/// A vocabulary of logits that has already had `final_logit_softcap`
+/// applied (or has none to apply).
+///
+/// A newtype with a single constructor, so "these logits skipped the
+/// cap" is a state that cannot be built. Every output-head path in
+/// `decoder.rs` goes through it.
+pub(crate) struct Logits(Vec<f32>);
+
+impl Logits {
+    /// The one place the final softcap is applied.
+    pub(crate) fn from_output_head(mut raw: Vec<f32>, softcap: Option<f32>) -> Self {
+        if let Some(sc) = softcap {
+            softcap_inplace(&mut raw, sc);
+        }
+        Logits(raw)
+    }
+
+    pub(crate) fn as_slice(&self) -> &[f32] {
+        &self.0
+    }
+
+    pub(crate) fn into_vec(self) -> Vec<f32> {
+        self.0
+    }
+}
+
+/// Permission to fold `final_norm` + `lm_head` + `argmax` into a fused
+/// Metal decode stack, carrying the launch it is permission for.
+///
+/// Generic over the launch type so this compiles and is testable
+/// without the `metal` feature and without a device; `decoder.rs`
+/// instantiates it at `ferrox_metal::gpu::MatvecLaunch<'_>`.
+///
+/// The only constructor is [`Self::permit`], which refuses unless greedy
+/// argmax is active for this thread. That is what makes
+/// [`Self::argmax_only`] able to be a constant instead of a second
+/// expression the caller has to keep in step.
+/// Only `decoder.rs`'s Metal decode stacks fold an lm_head, so outside a
+/// `metal` build this type has no caller -- but its tests are the ones
+/// that pin the invariant, and they must run in the default build the
+/// gates actually exercise.
+#[cfg(any(feature = "metal", test))]
+pub(crate) struct FoldedLmHead<L> {
+    launch: L,
+}
+
+#[cfg(any(feature = "metal", test))]
+impl<L> FoldedLmHead<L> {
+    /// `Some` only when the stack is allowed to run lm_head on device:
+    /// greedy argmax is active for this thread AND the output head has a
+    /// Metal launch. Any other combination keeps lm_head on the host,
+    /// where `Decoder::logits_from_normed` applies the cap.
+    pub(crate) fn permit(greedy_argmax: bool, launch: Option<L>) -> Option<Self> {
+        if !greedy_argmax {
+            return None;
+        }
+        launch.map(|launch| FoldedLmHead { launch })
+    }
+
+    pub(crate) fn launch(&self) -> &L {
+        &self.launch
+    }
+
+    /// Always `true`, and that is the point: the stack's `argmax_only`
+    /// argument is now read off the same value that decided lm_head may
+    /// fold at all, so the two cannot disagree. Folding with
+    /// `argmax_only = false` returns a full uncapped vocabulary and is
+    /// exactly the state this type exists to make unrepresentable.
+    pub(crate) fn argmax_only(&self) -> bool {
+        true
+    }
+
+    /// Turn a fused stack's on-device lm_head result into what
+    /// `forward_token` returns.
+    ///
+    /// Both stacks document two shapes and return no others: a
+    /// 1-element `vec![token_id as f32]` under `argmax_only`, or
+    /// `vocab_size` logits otherwise. The vocabulary case is checked
+    /// FIRST, which both removes the ambiguity at `vocab_size == 1` and
+    /// means that the day either stack starts handing back logits from
+    /// this path, they arrive capped instead of silently raw.
+    ///
+    /// The id case is passed through untouched, and must be: softcapping
+    /// a token id would corrupt it. It is safe uncapped for the reason
+    /// in this module's header -- the cap is monotone, so it cannot move
+    /// an argmax -- and this is the only place that reasoning is relied
+    /// upon.
+    pub(crate) fn interpret(
+        &self,
+        out: Vec<f32>,
+        vocab_size: usize,
+        softcap: Option<f32>,
+    ) -> Vec<f32> {
+        if out.len() == vocab_size {
+            Logits::from_output_head(out, softcap).into_vec()
+        } else {
+            out
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Softcap is `sc * tanh(x / sc)`, computed here rather than taken
+    /// from `ferrox_core` so the assertions cannot agree with the code
+    /// under test by sharing its bug.
+    fn capped(x: f32, sc: f32) -> f32 {
+        sc * (x / sc).tanh()
+    }
+
+    #[test]
+    fn logits_cannot_be_built_without_the_cap_being_applied() {
+        let out = Logits::from_output_head(vec![100.0, -100.0, 0.5], Some(30.0)).into_vec();
+        for (got, &raw) in out.iter().zip([100.0f32, -100.0, 0.5].iter()) {
+            assert!(
+                (got - capped(raw, 30.0)).abs() < 1e-5,
+                "got {got} for raw {raw}"
+            );
+        }
+        assert_eq!(
+            Logits::from_output_head(vec![100.0, -100.0], None).into_vec(),
+            vec![100.0, -100.0],
+            "no cap configured must leave the head's output exactly alone"
+        );
+    }
+
+    /// Invariant 2's constructor. Folding lm_head into the stack when
+    /// greedy argmax is NOT active would return a full vocabulary that
+    /// bypasses `logits_from_normed` and therefore the cap.
+    #[test]
+    fn lm_head_folds_into_the_stack_only_under_greedy_argmax() {
+        assert!(
+            FoldedLmHead::permit(false, Some(())).is_none(),
+            "without greedy argmax the stack would return uncapped logits"
+        );
+        assert!(FoldedLmHead::permit(true, None::<u32>).is_none());
+        let folded =
+            FoldedLmHead::permit(true, Some(7u32)).expect("greedy + launch permits folding");
+        assert_eq!(
+            *folded.launch(),
+            7,
+            "the permission must carry the launch it was granted for"
+        );
+        assert!(
+            folded.argmax_only(),
+            "a permitted fold is an argmax fold; anything else returns raw logits"
+        );
+    }
+
+    /// The hazard itself: if that path ever hands back a vocabulary
+    /// instead of an id, Gemma-2's 30.0 cap must still apply.
+    #[test]
+    fn a_folded_stack_returning_logits_gets_them_softcapped() {
+        let folded = FoldedLmHead::permit(true, Some(())).unwrap();
+        let vocab = 4;
+        let raw = vec![100.0f32, -100.0, 31.0, 0.25];
+        let got = folded.interpret(raw.clone(), vocab, Some(30.0));
+        for (i, (g, r)) in got.iter().zip(raw.iter()).enumerate() {
+            assert!(
+                (g - capped(*r, 30.0)).abs() < 1e-4,
+                "logit {i}: got {g}, expected {} (raw {r})",
+                capped(*r, 30.0)
+            );
+        }
+        assert!(
+            got.iter().zip(raw.iter()).any(|(g, r)| (g - r).abs() > 1.0),
+            "the cap must actually bite at these magnitudes, or this test \
+             cannot tell a capped path from a raw one"
+        );
+    }
+
+    /// The other half, and the one that stops the lazy fix: a greedy
+    /// argmax id is NOT logits. Capping it would corrupt the token id --
+    /// with a 30.0 cap, id 100 would come back as 29.98 and the caller
+    /// would emit token 29.
+    #[test]
+    fn a_folded_stack_returning_an_argmax_id_is_passed_through_untouched() {
+        let folded = FoldedLmHead::permit(true, Some(())).unwrap();
+        assert_eq!(
+            folded.interpret(vec![100.0], 32_000, Some(30.0)),
+            vec![100.0],
+            "a 1-element argmax id must not be softcapped"
+        );
+    }
+}

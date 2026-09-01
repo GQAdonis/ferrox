@@ -14,6 +14,7 @@
 
 mod attn_block;
 mod ffn_act;
+mod lm_head;
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -24,7 +25,10 @@ use ferrox_core::attention::{
     causal_gqa_attention_softcap,
 };
 use ferrox_core::cache::{KvCache, PagedKvCache, PagedStoreExhausted, SharedPagedKv};
-use ferrox_core::matmul::{rms_norm, rms_norm_per_head, softcap_inplace};
+use ferrox_core::matmul::{rms_norm, rms_norm_per_head};
+#[cfg(feature = "metal")]
+use lm_head::FoldedLmHead;
+use lm_head::Logits;
 use rayon::prelude::*;
 
 /// Whether the CUDA `gqa_decode` kernel should serve the per-token GQA
@@ -1935,7 +1939,11 @@ impl Decoder {
                             // hidden vector.
                             let greedy_gpu = ferrox_metal::attn::metal_greedy_argmax_active();
                             let lm_head_gpu_launch = Self::metal_matvec_launch(&self.output_head);
-                            let out_launch = if greedy_gpu { lm_head_gpu_launch } else { None };
+                            // One value carries both "lm_head runs in the
+                            // stack" and "the stack returns an argmax id",
+                            // so the second cannot drift off the first.
+                            // See `decoder::lm_head`.
+                            let folded = FoldedLmHead::permit(greedy_gpu, lm_head_gpu_launch);
                             let embd_launch = Self::metal_matvec_launch(&self.embedding);
                             // Gemma scales embd on host; GPU gather has no scale.
                             let embd_gather = if self.config.embedding_scale.is_some() {
@@ -1984,8 +1992,8 @@ impl Decoder {
                                     pos,
                                     self.config.rms_norm_eps,
                                     Some(&self.final_norm),
-                                    out_launch.as_ref(),
-                                    greedy_gpu && out_launch.is_some(),
+                                    folded.as_ref().map(FoldedLmHead::launch),
+                                    folded.as_ref().is_some_and(FoldedLmHead::argmax_only),
                                     true,
                                     embd_gather.as_ref(),
                                 )
@@ -1997,10 +2005,16 @@ impl Decoder {
                                             layer.moe.record_activations(ids);
                                         }
                                     }
-                                    if out_launch.is_some() {
+                                    if let Some(folded) = folded.as_ref() {
                                         #[cfg(feature = "metal")]
                                         ferrox_metal::gpu::clear_resident_activation();
-                                        return out;
+                                        // Softcaps anything vocabulary-shaped;
+                                        // passes a 1-element argmax id through.
+                                        return folded.interpret(
+                                            out,
+                                            self.output_head.rows(),
+                                            self.config.final_logit_softcap,
+                                        );
                                     }
                                     hidden = out;
                                     final_norm_done_in_stack = true;
@@ -2083,16 +2097,18 @@ impl Decoder {
                             // which measured ~2x the tok/s of a full-vocab one.
                             let greedy_gpu = ferrox_metal::attn::metal_greedy_argmax_active();
                             let lm_head_gpu_launch = Self::metal_matvec_launch(&self.output_head);
-                            let out_launch = if greedy_gpu { lm_head_gpu_launch } else { None };
-                            // Pass final_norm_w when: (1) lm_head runs in stack (out_launch),
+                            // See `decoder::lm_head`: folding lm_head into
+                            // the stack and the stack returning an argmax id
+                            // are one decision, held in one value.
+                            let folded = FoldedLmHead::permit(greedy_gpu, lm_head_gpu_launch);
+                            // Pass final_norm_w when: (1) lm_head runs in stack (folded),
                             // OR (2) lm_head will route to GPU after stack (lm_head_gpu_launch
-                            // but no out_launch) so we can skip download→reupload via TLS.
-                            let final_norm_w =
-                                if out_launch.is_some() || lm_head_gpu_launch.is_some() {
-                                    Some(self.final_norm.as_slice())
-                                } else {
-                                    None
-                                };
+                            // but no fold) so we can skip download→reupload via TLS.
+                            let final_norm_w = if folded.is_some() || lm_head_gpu_launch.is_some() {
+                                Some(self.final_norm.as_slice())
+                            } else {
+                                None
+                            };
                             let embd_launch = Self::metal_matvec_launch(&self.embedding);
                             // Gemma scales the embedding row on the host
                             // (`hidden` already carries sqrt(hidden_dim));
@@ -2127,8 +2143,8 @@ impl Decoder {
                                 pos,
                                 self.config.rms_norm_eps,
                                 final_norm_w,
-                                out_launch.as_ref(),
-                                greedy_gpu && out_launch.is_some(),
+                                folded.as_ref().map(FoldedLmHead::launch),
+                                folded.as_ref().is_some_and(FoldedLmHead::argmax_only),
                                 embd_gather.as_ref(),
                                 !GluAct::from(self.config.ffn_activation).is_swiglu(),
                             ) {
@@ -2138,12 +2154,19 @@ impl Decoder {
                                     // sync_metal_attn_kv_to_host / CPU fallback.
                                     // Dense stack has no MoE routing; skip
                                     // per-layer hotness atomics on the hot path.
-                                    if out_launch.is_some() {
-                                        // Stack returned logits or [argmax id] —
-                                        // skip host final_norm/lm_head. Clear TLS.
+                                    if let Some(folded) = folded.as_ref() {
+                                        // Skip host final_norm/lm_head. Clear TLS.
                                         #[cfg(feature = "metal")]
                                         ferrox_metal::gpu::clear_resident_activation();
-                                        return out;
+                                        // `interpret` is what keeps
+                                        // `final_logit_softcap` applied: the id
+                                        // shape passes through, anything
+                                        // vocabulary-shaped gets capped.
+                                        return folded.interpret(
+                                            out,
+                                            self.output_head.rows(),
+                                            self.config.final_logit_softcap,
+                                        );
                                     }
                                     // Stack downloaded hidden (possibly normalized if
                                     // final_norm_w was Some). Track whether host should
@@ -3459,11 +3482,11 @@ impl Decoder {
     /// capping produces a different distribution -- not an error, just a
     /// quietly wrong one.
     fn logits_from_normed(&self, final_normed: &[f32]) -> Vec<f32> {
-        let mut logits = self.output_head.apply(final_normed);
-        if let Some(sc) = self.config.final_logit_softcap {
-            softcap_inplace(&mut logits, sc);
-        }
-        logits
+        Logits::from_output_head(
+            self.output_head.apply(final_normed),
+            self.config.final_logit_softcap,
+        )
+        .into_vec()
     }
 
     /// The `output_head` half of [`Self::forward_batch`], split out so
@@ -3471,11 +3494,12 @@ impl Decoder {
     /// second copy of the softcap would be a silent quality bug).
     fn logits_from_flat_hidden(&self, flat: Vec<f32>, batch_size: usize) -> Vec<Vec<f32>> {
         let vocab_size = self.output_head.rows();
-        let mut logits_batch = self.output_head.apply_batch(&flat, batch_size);
-        if let Some(sc) = self.config.final_logit_softcap {
-            softcap_inplace(&mut logits_batch, sc);
-        }
+        let logits_batch = Logits::from_output_head(
+            self.output_head.apply_batch(&flat, batch_size),
+            self.config.final_logit_softcap,
+        );
         logits_batch
+            .as_slice()
             .chunks(vocab_size)
             .map(|c| c.to_vec())
             .collect()

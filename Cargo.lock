@@ -473,6 +473,7 @@ dependencies = [
  "ferrox-gguf",
  "ferrox-metal",
  "ferrox-quant",
+ "ferrox-vulkan",
  "libc",
  "memmap2",
  "rayon",

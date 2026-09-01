@@ -63,6 +63,7 @@ ferrox-quant = { version = "0.14.0", path = "crates/ferrox-quant" }
 ferrox-safetensors = { version = "0.14.0", path = "crates/ferrox-safetensors" }
 ferrox-cuda = { version = "0.14.0", path = "crates/ferrox-cuda" }
 ferrox-metal = { version = "0.14.0", path = "crates/ferrox-metal" }
+ferrox-vulkan = { version = "0.14.0", path = "crates/ferrox-vulkan" }
 ferrox-core = { version = "0.14.0", path = "crates/ferrox-core" }
 ferrox-moe = { version = "0.14.0", path = "crates/ferrox-moe" }
 ferrox-models = { version = "0.14.0", path = "crates/ferrox-models" }

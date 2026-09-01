@@ -18,9 +18,9 @@ use crate::tensor::Tensor;
 
 pub mod gpu_backend;
 
-#[cfg(any(feature = "cuda", feature = "metal"))]
+#[cfg(any(feature = "cuda", feature = "metal", feature = "vulkan"))]
 use gpu_backend::BackendDispatch;
-use gpu_backend::{with_gpu_backends, BackendCaps, Cuda, Metal};
+use gpu_backend::{with_gpu_backend_caps, with_gpu_backends, BackendCaps, Cuda, Metal};
 
 #[allow(dead_code)]
 type Q4kRepackCache = Mutex<HashMap<(usize, usize), Arc<[u8]>>>;
@@ -2770,7 +2770,7 @@ impl WeightMatrix {
     /// upload (`ferrox_metal::gpu` weight cache); activations still
     /// upload per call. When both `cuda` and `metal` are enabled, CUDA
     /// is tried first and Metal is the fallback.
-    #[cfg(any(feature = "cuda", feature = "metal"))]
+    #[cfg(any(feature = "cuda", feature = "metal", feature = "vulkan"))]
     pub fn apply_gpu(&self, x: &[f32]) -> Option<Vec<f32>> {
         assert_eq!(
             x.len(),
@@ -3412,21 +3412,41 @@ impl WeightMatrix {
         // Whether the accelerator, if one is selected, can run this
         // matrix at all -- and if so, whether prefill gets a real GEMM
         // or `batch` matvecs over the same weights.
-        let (matvec, gemm) = match backend {
-            Backend::Metal => (
-                kind.is_some_and(|k| metal_matvec_kind_name(k).is_some()),
-                kind.is_some_and(metal_mul_mm_kind_supported),
-            ),
-            // CUDA now has a batched GEMM for a SUBSET of the kinds
-            // that have matvecs (Q8_0 and Q4_0). Everything else still
-            // decomposes a batched prefill into per-position matvecs,
-            // which is why these two predicates are different sets and
-            // not one.
-            Backend::Cuda => (
-                kind.is_some_and(cuda_matvec_kind_supported),
-                kind.is_some_and(cuda_mul_mm_kind_supported),
-            ),
-            Backend::Cpu => (false, false),
+        //
+        // Read off `BackendCaps` over the ungated backend table rather
+        // than from a `match backend` written out here. The two are
+        // NOT interchangeable: the hand-written match had a `Backend::
+        // Cpu => (false, false)` arm and no `_`, so it was exhaustive
+        // by luck -- a third variant broke it, which is the good case.
+        // A fourth backend added while a `_` arm existed would have
+        // silently reported "no kernels" for a backend that had them.
+        //
+        // Ungated on purpose: a CPU-only build must be able to ask what
+        // CUDA would resolve, which is what every kernel-coverage test
+        // below does. `BackendDispatch` is unavailable here for exactly
+        // that reason.
+        //
+        // The predicate sets are per backend and genuinely different:
+        // CUDA has a batched GEMM for a SUBSET of the kinds it has
+        // matvecs for (Q8_0, Q4_0) and decomposes the rest into
+        // per-position matvecs; Vulkan has one matvec and no GEMM at
+        // all. `GEMM_FALLBACK` is what each of those decompositions is
+        // actually called.
+        let (matvec, gemm, gemm_fallback) = {
+            let mut found = (false, false, "");
+            macro_rules! caps_of {
+                ($b:ty) => {
+                    if backend == <$b as BackendCaps>::ID {
+                        found = (
+                            kind.is_some_and(|k| <$b as BackendCaps>::matvec_kernel(k).is_some()),
+                            kind.is_some_and(<$b as BackendCaps>::gemm_supported),
+                            <$b as BackendCaps>::GEMM_FALLBACK,
+                        );
+                    }
+                };
+            }
+            with_gpu_backend_caps!(caps_of);
+            found
         };
 
         if backend.is_accelerator() {
@@ -3447,16 +3467,19 @@ impl WeightMatrix {
             reg.record_build_at(
                 loc,
                 look(op::GEMM_PREFILL),
-                match (gemm, backend, matvec, kind) {
+                match (gemm, matvec, kind) {
                     (true, ..) => Outcome::Hit,
-                    // Still on the GPU, but re-reading the whole weight
-                    // matrix once per position. This is the 13.7x shape.
-                    (false, Backend::Cuda, true, _) => {
-                        Outcome::slow_path("CUDA per-position matvec")
-                    }
-                    (false, _, true, _) => Outcome::slow_path("Metal N x matvec batch"),
-                    (false, _, false, Some(_)) => Outcome::slow_path("CPU apply_batch"),
-                    (false, _, false, None) => Outcome::by_design("CPU f32 GEMM"),
+                    // A matvec but no GEMM. What that costs is per
+                    // backend -- Metal re-reads the whole weight matrix
+                    // once per position but stays on the GPU (the 13.7x
+                    // shape), CUDA does the same through a different
+                    // entry point, and Vulkan has no batch path at all
+                    // so the prefill lands on the host -- so the name
+                    // comes from the backend instead of from an arm
+                    // here that a new variant would fall through.
+                    (false, true, _) => Outcome::slow_path(gemm_fallback),
+                    (false, false, Some(_)) => Outcome::slow_path("CPU apply_batch"),
+                    (false, false, None) => Outcome::by_design("CPU f32 GEMM"),
                 },
             );
         }
@@ -3491,7 +3514,7 @@ impl WeightMatrix {
     /// `apply_gpu` dispatches to a real kernel for -- a small,
     /// deliberately partial mirror of `block_bytes_per_row`'s per-kind
     /// match (only these five formats have a real GPU kernel today).
-    #[cfg(feature = "cuda")]
+    #[cfg(any(feature = "cuda", feature = "vulkan"))]
     pub(crate) fn block_bytes_for_kind(kind: QuantKind) -> usize {
         match kind {
             QuantKind::Q8_0 => ferrox_quant::Q8_0_BLOCK_BYTES,
@@ -4312,7 +4335,7 @@ mod tests {
         assert!(out.is_empty());
     }
 
-    #[cfg(any(feature = "cuda", feature = "metal"))]
+    #[cfg(any(feature = "cuda", feature = "metal", feature = "vulkan"))]
     mod gpu_dispatch {
         use super::*;
 

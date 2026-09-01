@@ -9,12 +9,20 @@
 //! `d-hardware-reach`, and it is deliberately scoped below a backend:
 //! **one kernel, one quant kind, no integration**.
 //!
-//! It is NOT wired into `ferrox-core`. `WeightMatrix::apply_gpu` still
-//! knows about exactly two backends, because adding a third to the
-//! seam as it stands today means a third copy of four hand-kept tables
-//! and 214 `#[cfg]` sites -- which is `backend-seam-refactor`, the item
-//! the roadmap puts *before* this one. The verdict document records
-//! what that seam would have to become.
+//! It IS now wired into `ferrox-core`, as of 2026-09-01, once
+//! `backend-seam-refactor` landed the seam the verdict asked for:
+//! `ferrox_core::weight_matrix::gpu_backend::Vulkan` is a third
+//! `BackendCaps` / `BackendDispatch`, behind `ferrox-core`'s `vulkan`
+//! feature. What it wires up is only what is in here -- ONE Q8_0
+//! matvec -- and the seam says so: no GEMM for any kind, no matvec for
+//! any other kind, and guard tests that go red if either changes
+//! without a shader behind it.
+//!
+//! That does not promote this crate to a backend. `q8_0_matvec` still
+//! rebuilds its entire pipeline per call, weights are still staged
+//! rather than imported zero-copy, and nothing here has a measured
+//! number. `vulkan-decode-path` and `vulkan-prefill-gemm` are still
+//! where a real backend gets decided.
 //!
 //! # What has actually run
 //!

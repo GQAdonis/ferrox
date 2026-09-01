@@ -6,11 +6,11 @@ use std::sync::Arc;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::Json;
-use ferrox_models::sampling::SamplingParams;
 use serde::Deserialize;
 
 use crate::attribution::Attribution;
 use crate::generate::{FinishReason, GenerationParams};
+use crate::sampling_knobs::SamplingKnobs;
 use crate::{
     decode_error_response, join_error_response, run_generation, unsupported_feature, ApiError,
     AppState,
@@ -131,10 +131,31 @@ pub(crate) struct CompletionsRequest {
     max_tokens: usize,
     #[serde(default)]
     model: Option<String>,
+    // Sampler knobs. These four were NOT declared until now, so serde
+    // dropped `top_k`, `repetition_penalty`, `presence_penalty` and
+    // `frequency_penalty` on this route while the chat route honoured
+    // every one of them -- and the `SamplingParams` below hardcoded
+    // `top_k: 0` and `repetition_penalty: 1.0` over the top. Two of
+    // them (`presence_penalty`, `frequency_penalty`) are OpenAI's own
+    // `/v1/completions` fields. Same defect as `logit_bias`, four more
+    // times, so they are honoured here rather than refused: the chat
+    // route already implements all four.
     #[serde(default)]
     temperature: Option<f32>,
     #[serde(default)]
     top_p: Option<f32>,
+    /// llama.cpp's `--min-p`. See `SamplingKnobs::min_p` for why an
+    /// absent one is off rather than llama.cpp's CLI default of 0.05.
+    #[serde(default)]
+    min_p: Option<f32>,
+    #[serde(default)]
+    top_k: Option<usize>,
+    #[serde(default)]
+    repetition_penalty: Option<f32>,
+    #[serde(default)]
+    presence_penalty: Option<f32>,
+    #[serde(default)]
+    frequency_penalty: Option<f32>,
     #[serde(default)]
     seed: Option<u64>,
     /// Honoured. Silently dropping this is the dangerous one: the caller
@@ -182,6 +203,20 @@ impl CompletionsRequest {
                 "token-id prompts are not implemented; send `prompt` as a string",
             )),
             _ => Err(crate::invalid_request("prompt must be a string", "prompt")),
+        }
+    }
+
+    /// This request's sampler knobs, resolved by the same function the
+    /// chat route uses. See `crate::sampling_knobs`.
+    fn sampling_knobs(&self) -> SamplingKnobs {
+        SamplingKnobs {
+            temperature: self.temperature,
+            top_p: self.top_p,
+            min_p: self.min_p,
+            top_k: self.top_k,
+            repetition_penalty: self.repetition_penalty,
+            presence_penalty: self.presence_penalty,
+            frequency_penalty: self.frequency_penalty,
         }
     }
 
@@ -476,17 +511,7 @@ pub async fn completions(
     let active = state.require_active()?;
     let params = GenerationParams {
         max_tokens: req.max_tokens,
-        sampling: SamplingParams {
-            temperature: req.temperature.unwrap_or(0.0),
-            top_p: req.top_p.unwrap_or(1.0),
-            // No `min_p` on the OpenAI completions wire; 0.0 is off.
-            min_p: 0.0,
-            top_k: 0,
-            repetition_penalty: 1.0,
-            penalty_last_n: 64,
-            presence_penalty: 0.0,
-            frequency_penalty: 0.0,
-        },
+        sampling: req.sampling_knobs().resolve(),
         seed: req.seed.unwrap_or(0),
         stop: req.stop_sequences(),
         json_object: false,
@@ -575,6 +600,76 @@ mod tests {
 
         let none = request(serde_json::json!({"prompt": "hi"}));
         assert!(none.stop_sequences().is_empty());
+    }
+
+    /// The knobs this route accepted-and-dropped. `top_k`,
+    /// `repetition_penalty`, `presence_penalty` and `frequency_penalty`
+    /// were undeclared, so serde discarded them and the request was
+    /// served with `top_k: 0` and `repetition_penalty: 1.0` hardcoded
+    /// over the top -- while `/v1/chat/completions` honoured all four.
+    /// `min_p` was never on either wire.
+    ///
+    /// Every value here is deliberately different from the default it
+    /// replaces, so a knob that stopped being read would show up as the
+    /// default rather than as the asked-for number.
+    #[test]
+    fn every_sampler_knob_reaches_the_sampler_from_the_completions_wire() {
+        let resolved = request(serde_json::json!({
+            "prompt": "hi",
+            "temperature": 0.5,
+            "top_p": 0.9,
+            "min_p": 0.05,
+            "top_k": 40,
+            "repetition_penalty": 1.1,
+            "presence_penalty": 0.25,
+            "frequency_penalty": 0.75,
+        }))
+        .sampling_knobs()
+        .resolve();
+
+        assert_eq!(resolved.temperature, 0.5);
+        assert_eq!(resolved.top_p, 0.9);
+        assert_eq!(resolved.min_p, 0.05);
+        assert_eq!(resolved.top_k, 40);
+        assert_eq!(resolved.repetition_penalty, 1.1);
+        assert_eq!(resolved.presence_penalty, 0.25);
+        assert_eq!(resolved.frequency_penalty, 0.75);
+    }
+
+    /// And the two routes resolve one body to the same sampler, which is
+    /// the property that kept breaking: each route owning its own
+    /// mapping is how `/v1/completions` came to hardcode two of these.
+    #[test]
+    fn both_routes_resolve_the_same_knobs_to_the_same_sampler() {
+        let knobs = serde_json::json!({
+            "temperature": 0.5,
+            "top_p": 0.9,
+            "min_p": 0.05,
+            "top_k": 40,
+            "repetition_penalty": 1.1,
+            "presence_penalty": 0.25,
+            "frequency_penalty": 0.75,
+        });
+
+        let mut completion_body = knobs.clone();
+        completion_body["prompt"] = serde_json::json!("hi");
+        let completion = request(completion_body).sampling_knobs().resolve();
+
+        let mut chat_body = knobs;
+        chat_body["model"] = serde_json::json!("m");
+        chat_body["messages"] = serde_json::json!([{"role": "user", "content": "hi"}]);
+        let chat: crate::ChatCompletionRequest =
+            serde_json::from_value(chat_body).expect("chat request");
+        let chat = chat.sampling_params();
+
+        assert_eq!(completion.temperature, chat.temperature);
+        assert_eq!(completion.top_p, chat.top_p);
+        assert_eq!(completion.min_p, chat.min_p);
+        assert_eq!(completion.top_k, chat.top_k);
+        assert_eq!(completion.repetition_penalty, chat.repetition_penalty);
+        assert_eq!(completion.penalty_last_n, chat.penalty_last_n);
+        assert_eq!(completion.presence_penalty, chat.presence_penalty);
+        assert_eq!(completion.frequency_penalty, chat.frequency_penalty);
     }
 
     /// Each of these is a real OpenAI field this server does not

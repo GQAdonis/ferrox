@@ -56,6 +56,7 @@ mod response_cache;
 pub(crate) mod responses;
 mod resume;
 mod sample_step;
+mod sampling_knobs;
 mod security;
 mod serving;
 mod session;
@@ -95,6 +96,7 @@ use ferrox_models::{Decoder, Gemma4Engine, KimiEngine, MlaEngine, PrefixCache};
 use generate::{FinishReason, GenerationParams};
 use model::ServerTokenizer;
 use response_cache::{CacheKey, ResponseCache};
+use sampling_knobs::SamplingKnobs;
 
 // `PartialEq` so ferrox-cli's serve tests can assert that both front
 // ends parse a command line into the SAME arguments, rather than
@@ -1049,6 +1051,12 @@ struct ChatCompletionRequest {
     temperature: Option<f32>,
     #[serde(default)]
     top_p: Option<f32>,
+    /// llama.cpp's `--min-p`. Not an OpenAI field; accepted under the
+    /// same spelling llama.cpp's server and vLLM use, because a client
+    /// that sends it and is silently served an unfiltered distribution
+    /// cannot tell that apart from having had it honoured.
+    #[serde(default)]
+    min_p: Option<f32>,
     #[serde(default)]
     top_k: Option<usize>,
     #[serde(default)]
@@ -1180,20 +1188,24 @@ fn default_max_tokens() -> usize {
 }
 
 impl ChatCompletionRequest {
-    fn sampling_params(&self) -> SamplingParams {
-        SamplingParams {
-            temperature: self.temperature.unwrap_or(0.0),
-            top_p: self.top_p.unwrap_or(1.0),
-            // No `min_p` on the OpenAI chat wire; 0.0 is off.
-            min_p: 0.0,
-            top_k: self.top_k.unwrap_or(0),
-            repetition_penalty: self.repetition_penalty.unwrap_or(1.0),
-            // llama.cpp's `penalty_last_n` default; not exposed on the
-            // OpenAI wire format, which has no equivalent field.
-            penalty_last_n: 64,
-            presence_penalty: self.presence_penalty.unwrap_or(0.0),
-            frequency_penalty: self.frequency_penalty.unwrap_or(0.0),
+    /// This request's sampler knobs. Resolved to `SamplingParams` by
+    /// `sampling_knobs`, shared with `/v1/completions`, so the two
+    /// routes cannot disagree about what a knob means or which ones
+    /// exist.
+    fn sampling_knobs(&self) -> SamplingKnobs {
+        SamplingKnobs {
+            temperature: self.temperature,
+            top_p: self.top_p,
+            min_p: self.min_p,
+            top_k: self.top_k,
+            repetition_penalty: self.repetition_penalty,
+            presence_penalty: self.presence_penalty,
+            frequency_penalty: self.frequency_penalty,
         }
+    }
+
+    fn sampling_params(&self) -> SamplingParams {
+        self.sampling_knobs().resolve()
     }
 
     fn stop_sequences(&self) -> Vec<String> {
@@ -1495,12 +1507,11 @@ impl ChatCompletionRequest {
             model: self.model.clone(),
             prompt: prompt.to_string(),
             max_tokens: self.max_tokens,
-            temperature_bits: self.temperature.unwrap_or(0.0).to_bits(),
-            top_p_bits: self.top_p.unwrap_or(1.0).to_bits(),
-            top_k: self.top_k.unwrap_or(0),
-            repetition_penalty_bits: self.repetition_penalty.unwrap_or(1.0).to_bits(),
-            presence_penalty_bits: self.presence_penalty.unwrap_or(0.0).to_bits(),
-            frequency_penalty_bits: self.frequency_penalty.unwrap_or(0.0).to_bits(),
+            // Off the RESOLVED params, not off the request fields: this
+            // used to re-state every `unwrap_or` default a second time,
+            // so a default changed in one place and not the other would
+            // have keyed the cache on a configuration nothing ran.
+            sampling: response_cache::sampling_key(&self.sampling_params()),
             seed: self.seed,
             stop: self.effective_stop_sequences(),
         }
@@ -6750,6 +6761,66 @@ mod tests {
             "messages": [{"role": "user", "content": "hi"}],
         }));
         assert_eq!(req.max_tokens, DEFAULT_CHAT_MAX_TOKENS);
+    }
+
+    /// A knob the wire accepts must reach the sampler. Serde declaring
+    /// `min_p` is only half of it: the field spent two commits resolved
+    /// to a hardcoded `0.0` on both routes, which is exactly the
+    /// silently-dropped-parameter bug, just one layer further in.
+    #[test]
+    fn min_p_reaches_the_sampler_from_the_chat_wire() {
+        let asked = chat_request(serde_json::json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "min_p": 0.07,
+        }));
+        assert_eq!(asked.sampling_params().min_p, 0.07);
+
+        let silent = chat_request(serde_json::json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+        }));
+        assert_eq!(
+            silent.sampling_params().min_p,
+            0.0,
+            "an unset min_p must be off, not llama.cpp's CLI default"
+        );
+    }
+
+    /// The whole-response cache is keyed on the sampler settings, and a
+    /// setting left OUT of that key means two requests differing only in
+    /// it share one answer: the second caller silently gets output
+    /// computed under the first caller's parameters.
+    ///
+    /// Every knob the wire accepts is checked, not just the new one --
+    /// this is the assertion that would have caught `min_p` being added
+    /// to the sampler and forgotten here.
+    #[test]
+    fn no_sampler_knob_is_missing_from_the_cache_key() {
+        let base = serde_json::json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "seed": 1,
+        });
+        let baseline = chat_request(base.clone()).cache_key("prompt");
+        for (knob, value) in [
+            ("temperature", serde_json::json!(0.5)),
+            ("top_p", serde_json::json!(0.9)),
+            ("min_p", serde_json::json!(0.05)),
+            ("top_k", serde_json::json!(40)),
+            ("repetition_penalty", serde_json::json!(1.1)),
+            ("presence_penalty", serde_json::json!(0.3)),
+            ("frequency_penalty", serde_json::json!(0.3)),
+        ] {
+            let mut body = base.clone();
+            body[knob] = value;
+            assert_ne!(
+                chat_request(body).cache_key("prompt"),
+                baseline,
+                "`{knob}` is not in the cache key: two requests differing \
+                 only in it would share one cached answer"
+            );
+        }
     }
 
     /// Serde already tells absent from zero -- an absent field became

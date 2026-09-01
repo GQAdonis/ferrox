@@ -15,6 +15,7 @@
 //! prompts) is a separate, larger piece of work, tracked separately.
 
 use crate::generate::{FinishReason, Usage};
+use ferrox_models::sampling::SamplingParams;
 use std::collections::{HashMap, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::time::{Duration, Instant};
@@ -24,25 +25,79 @@ pub struct CacheKey {
     pub model: String,
     pub prompt: String,
     pub max_tokens: usize,
-    /// Sampling parameters that affect output, packed as bits so `f32`
-    /// participates in `Eq`/`Hash` (sampling only ever compares these
-    /// for exact key equality, never arithmetic, so bit-identity is the
-    /// right notion of "same parameters" here). Only requests with a
-    /// deterministic outcome -- greedy (temperature 0) or an explicit
-    /// seed -- are ever looked up against this cache at all; see
-    /// `main.rs`'s `is_cacheable`. A request without a deterministic
-    /// outcome must never populate or read this cache, since a "hit"
-    /// would silently replay one random sample forever instead of
-    /// producing fresh output each call, defeating the entire point of
-    /// sampling.
-    pub temperature_bits: u32,
-    pub top_p_bits: u32,
-    pub top_k: usize,
-    pub repetition_penalty_bits: u32,
-    pub presence_penalty_bits: u32,
-    pub frequency_penalty_bits: u32,
+    /// Every sampling parameter that affects output. See
+    /// [`SamplingKey`] for why it is a struct built by one function
+    /// rather than a handful of fields written out here.
+    ///
+    /// Only requests with a deterministic outcome -- greedy
+    /// (temperature 0) or an explicit seed -- are ever looked up against
+    /// this cache at all; see `ChatCompletionRequest::is_cacheable`. A
+    /// request without a deterministic outcome must never populate or
+    /// read this cache, since a "hit" would silently replay one random
+    /// sample forever instead of producing fresh output each call,
+    /// defeating the entire point of sampling.
+    pub sampling: SamplingKey,
     pub seed: Option<u64>,
     pub stop: Vec<String>,
+}
+
+/// Every field of a resolved [`SamplingParams`], in a form that can be
+/// hashed and compared for exact equality.
+///
+/// One struct rather than six fields inlined into [`CacheKey`], and
+/// built by [`sampling_key`] rather than by whoever happens to be
+/// constructing a key, because the interesting property is not what is
+/// in it -- it is that NOTHING is left out. A sampler setting outside
+/// the key means two requests differing only in that setting share one
+/// cached answer: the second caller is served output computed under the
+/// first caller's parameters, with a 200 and no way to tell.
+///
+/// `f32`s are stored as bits so they participate in `Eq`/`Hash`. The
+/// cache only ever compares these for exact key equality, never
+/// arithmetic, so bit-identity is the right notion of "same parameters".
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct SamplingKey {
+    pub temperature_bits: u32,
+    pub top_p_bits: u32,
+    pub min_p_bits: u32,
+    pub top_k: usize,
+    pub repetition_penalty_bits: u32,
+    pub penalty_last_n: usize,
+    pub presence_penalty_bits: u32,
+    pub frequency_penalty_bits: u32,
+}
+
+/// The cache-key form of a resolved sampling configuration.
+///
+/// The destructure below is exhaustive ON PURPOSE, and is the whole
+/// point of this function: a sampler knob added to `SamplingParams`
+/// upstream stops this crate compiling, HERE, until someone decides
+/// whether it belongs in the cache key. Reading the fields through `.`
+/// accessors instead would let a new knob be added, be honoured by the
+/// sampler, and be silently absent from the key -- which is the bug
+/// described on [`SamplingKey`], arriving without anyone touching this
+/// file.
+pub fn sampling_key(params: &SamplingParams) -> SamplingKey {
+    let SamplingParams {
+        temperature,
+        top_p,
+        min_p,
+        top_k,
+        repetition_penalty,
+        penalty_last_n,
+        presence_penalty,
+        frequency_penalty,
+    } = params;
+    SamplingKey {
+        temperature_bits: temperature.to_bits(),
+        top_p_bits: top_p.to_bits(),
+        min_p_bits: min_p.to_bits(),
+        top_k: *top_k,
+        repetition_penalty_bits: repetition_penalty.to_bits(),
+        penalty_last_n: *penalty_last_n,
+        presence_penalty_bits: presence_penalty.to_bits(),
+        frequency_penalty_bits: frequency_penalty.to_bits(),
+    }
 }
 
 impl CacheKey {
@@ -184,12 +239,7 @@ mod tests {
             model: "test-model".to_string(),
             prompt: prompt.to_string(),
             max_tokens: 16,
-            temperature_bits: 0.0f32.to_bits(),
-            top_p_bits: 1.0f32.to_bits(),
-            top_k: 0,
-            repetition_penalty_bits: 1.0f32.to_bits(),
-            presence_penalty_bits: 0.0f32.to_bits(),
-            frequency_penalty_bits: 0.0f32.to_bits(),
+            sampling: sampling_key(&SamplingParams::default()),
             seed: None,
             stop: Vec::new(),
         }

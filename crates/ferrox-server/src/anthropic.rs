@@ -640,6 +640,8 @@ fn prepare_prompt(prompt: &PromptFields, model: String, max_tokens: usize) -> Pr
         max_tokens,
         temperature: None,
         top_p: None,
+        // Neither wire has a min_p; 0.0 (off) is what None resolves to.
+        min_p: None,
         top_k: None,
         repetition_penalty: None,
         // No seed on this wire, so the chat path's policy applies

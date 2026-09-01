@@ -617,6 +617,8 @@ fn to_chat_request(req: &ResponsesRequest) -> Result<ChatCompletionRequest, ApiE
         max_tokens,
         temperature: req.temperature,
         top_p: req.top_p,
+        // Neither wire has a min_p; 0.0 (off) is what None resolves to.
+        min_p: None,
         top_k: req.top_k,
         repetition_penalty: None,
         // No seed field on this surface, so the chat path's policy

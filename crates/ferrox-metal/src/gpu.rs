@@ -4735,6 +4735,43 @@ kernel void q6_k_matvec(
 
 /// Launches the Q6_K matvec kernel. Verified on a real Apple M2 Pro GPU
 /// -- see `Q6_K_MATVEC_KERNEL_SRC`'s doc comment.
+/// The Q5_0 matvec, and the wrapper whose absence made `Q5_0` a
+/// half-supported kind.
+///
+/// `Q5_0_MATVEC_KERNEL_SRC` and the `matvec_launch_meta` row landed
+/// together, and both the capability tables were widened on the strength
+/// of them. But `apply_gpu`'s single-matvec decode path dispatches
+/// through a per-kind `launch_*_matvec` FUNCTION, and there was no Q5_0
+/// one -- so `apply_gpu_batch`, `apply_gpu_multi` and the fused FFN all
+/// ran Q5_0 on the GPU while single-token decode silently fell to the
+/// CPU. That is exactly the mixed CPU/GPU split the widening was
+/// supposed to close.
+///
+/// Derived from `matvec_launch_meta` rather than restating the
+/// constants. The six wrappers above each hard-code the block size and
+/// element count that the meta table already holds, which is a seventh
+/// copy of the same data and is why one kind could be present in the
+/// table and absent here without anything noticing.
+pub fn launch_q5_0_matvec(
+    weights: &[u8],
+    x: &[f32],
+    rows: usize,
+    row_bytes: usize,
+) -> Result<Vec<f32>, MetalError> {
+    let (src, name, block_bytes, block_elems, _) =
+        matvec_launch_meta("Q5_0").ok_or(MetalError::CommandFailed)?;
+    launch_matvec(
+        src,
+        name,
+        block_bytes,
+        block_elems,
+        weights,
+        x,
+        rows,
+        row_bytes,
+    )
+}
+
 pub fn launch_q6_k_matvec(
     weights: &[u8],
     x: &[f32],

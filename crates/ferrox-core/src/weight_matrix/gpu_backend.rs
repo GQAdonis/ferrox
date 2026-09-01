@@ -1,0 +1,533 @@
+//! The seam every GPU backend goes through.
+//!
+//! Four things used to exist once per backend as free functions in
+//! `weight_matrix.rs`, with no shape holding them together:
+//!
+//! | Axis | Metal | CUDA |
+//! |---|---|---|
+//! | kind → matvec | `metal_matvec_kind_name` → `Option<&str>` | `cuda_matvec_kind_supported` → `bool` |
+//! | kind → GEMM | `metal_mul_mm_kind_supported` | `cuda_mul_mm_kind_supported` |
+//! | launch alias | `MetalMatvecLaunchFn`, 4 args | `CudaMatvecLaunchFn`, 5 args |
+//! | enable probe | `metal_dense_enabled` | `cuda_dense_enabled`, byte-identical body |
+//!
+//! and they were re-selected by hand at every dispatch site, so
+//! `apply_gpu` carried two near-identical `match kind` tables that could
+//! only be kept honest by a `debug_assert!`. A third backend would have
+//! copied all four. This module is the shape they now share.
+//!
+//! # What a third backend has to provide
+//!
+//! Exactly this, and nothing else:
+//!
+//! 1. A unit type (`pub struct Vulkan;`).
+//! 2. [`BackendCaps`] — the two capability tables plus an id and a
+//!    display name. **Compiled unconditionally**, with no dependency on
+//!    the backend crate, because the tables are a property of the kernel
+//!    set rather than of the build, and gating them would make them
+//!    untestable on the CPU builds that run `cargo test --workspace`.
+//!    This is the rule that kept `metal_matvec_kind_name` un-`cfg`'d and
+//!    it is load-bearing: `probe_kernels_for` asks what Metal *would*
+//!    resolve from a build with no Metal.
+//! 3. [`BackendDispatch`] under `#[cfg(feature = "…")]` — the enable
+//!    probe and one launch entry point.
+//! 4. One line in [`with_gpu_backends`], which is the single ordered
+//!    list of backend precedence.
+//!
+//! # The launch signature, and the fifth argument
+//!
+//! `ferrox-cuda`'s `launch_*_matvec` takes
+//! `(weights, x, rows, row_bytes, n_blocks_per_row)`; `ferrox-metal`'s
+//! takes the first four. [`BackendDispatch::launch_matvec`] takes the
+//! four plus the [`QuantKind`], and every backend derives the rest.
+//!
+//! That is deliberate, and it is not the wider arity the beachhead
+//! verdict proposed. `n_blocks_per_row` is **redundant information**,
+//! not missing information: it is `row_bytes / block_bytes(kind)`, and
+//! Metal already recomputes exactly that inside
+//! `ferrox_metal::gpu::matvec_launch_meta`, which hands back the block
+//! size for the kind. Hoisting it into the shared signature would buy a
+//! backend nothing it cannot derive, and would cost a
+//! `block_bytes(kind)` that is total over all 21 `QuantKind`s — the
+//! existing one, `WeightMatrix::block_bytes_for_kind`, is deliberately
+//! partial and `unreachable!()`s outside the five CUDA kinds, and
+//! Metal's `IQ4_XS` is not one of them. So the seam passes the kind and
+//! lets each backend ask its own table.
+
+use crate::kernel_registry::Backend;
+use crate::weight_matrix::QuantKind;
+
+/// A backend launch failure, flattened to its rendered message.
+///
+/// `ferrox_metal::gpu::MetalError` and `ferrox_cuda::gpu::CudaError` are
+/// different types living behind different features, and the only thing
+/// any caller does with either is print it before falling back — so the
+/// seam carries the message rather than an enum that would have to grow
+/// a variant per backend crate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackendError(String);
+
+impl BackendError {
+    /// Renders any backend error into the one shape the seam carries.
+    pub fn new(e: impl std::fmt::Display) -> Self {
+        BackendError(e.to_string())
+    }
+}
+
+impl std::fmt::Display for BackendError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// What a backend can run, asked without the backend crate present.
+///
+/// Every member is an associated function with no receiver, which is
+/// what the free functions this replaced already were, so implementing
+/// it is a lift rather than a redesign.
+pub trait BackendCaps {
+    /// How [`crate::kernel_registry`] reports this backend. Dispatch and
+    /// observability read the same constant, so a backend cannot be
+    /// dispatched to under one name and reported under another.
+    const ID: Backend;
+
+    /// Human-readable name, for the one message a dispatch failure
+    /// prints.
+    const NAME: &'static str;
+
+    /// Which quant kinds have a **matvec** kernel (the decode path), as
+    /// the kernel name the backend's own launch-meta table is keyed by,
+    /// or `None` for a kind with no kernel.
+    ///
+    /// Returning the name rather than a `bool` is what let the two
+    /// backends share one member: CUDA only ever needed the `bool`
+    /// (`.is_some()`), Metal needs the name to look up
+    /// `ferrox_metal::gpu::matvec_launch_meta`, and a `bool` cannot be
+    /// widened after the fact without another table.
+    fn matvec_kernel(kind: QuantKind) -> Option<&'static str>;
+
+    /// Which quant kinds have a **batched GEMM** (the prefill path). A
+    /// kind with a matvec but no GEMM still runs on the accelerator — as
+    /// `batch` separate matvecs over the same weights, which is the
+    /// 13.7x shape, and which is why these are two predicates and not
+    /// one.
+    fn gemm_supported(kind: QuantKind) -> bool;
+}
+
+/// What a backend can actually do, which needs its crate compiled in.
+pub trait BackendDispatch: BackendCaps {
+    /// What [`crate::weight_matrix::WeightMatrix::apply_gpu`] will do
+    /// next if this backend's launch fails, named for the log line.
+    /// A property of this backend's position in
+    /// [`with_gpu_backends`], not of the backend itself.
+    const MATVEC_FALLBACK: &'static str;
+
+    /// Whether dense matmuls should try this backend in this process.
+    /// Decided once from the environment, then cached for the process
+    /// lifetime. See `env_or_probe` for the grammar, which is shared.
+    fn dense_enabled() -> bool;
+
+    /// One matvec. `None` means "this backend has no kernel for `kind`",
+    /// which is a different answer from `Some(Err(_))`, "the kernel
+    /// exists and the launch failed" — the caller logs only the second.
+    fn launch_matvec(
+        kind: QuantKind,
+        weights: &[u8],
+        x: &[f32],
+        rows: usize,
+        row_bytes: usize,
+    ) -> Option<Result<Vec<f32>, BackendError>>;
+}
+
+/// The per-kind Metal launch table, split out of
+/// [`BackendDispatch::launch_matvec`] so it can be checked for EVERY
+/// kind without a device.
+///
+/// It has to agree with [`Metal::matvec_kernel`], and it cannot be the
+/// same table: the kernel NAMES are needed on builds where
+/// `ferrox-metal` is not a dependency and these function pointers do not
+/// exist. So the agreement is asserted, and asserting it only inside
+/// `launch_matvec` was not enough -- that fires just for kinds a run
+/// actually reaches, in debug. `Q5_0` was in the capability table and
+/// missing here from the day it was added, and the symptom was
+/// single-token decode silently falling to the CPU while batched
+/// prefill ran on the GPU.
+#[cfg(feature = "metal")]
+fn metal_matvec_launch(kind: QuantKind) -> Option<MetalMatvecLaunchFn> {
+    match kind {
+        QuantKind::Q8_0 => Some(ferrox_metal::gpu::launch_q8_0_matvec),
+        QuantKind::Q4_0 => Some(ferrox_metal::gpu::launch_q4_0_matvec),
+        QuantKind::Q4K => Some(ferrox_metal::gpu::launch_q4_k_matvec),
+        QuantKind::Q5_0 => Some(ferrox_metal::gpu::launch_q5_0_matvec),
+        QuantKind::Q5K => Some(ferrox_metal::gpu::launch_q5_k_matvec),
+        QuantKind::Q6K => Some(ferrox_metal::gpu::launch_q6_k_matvec),
+        QuantKind::IQ4XS => Some(ferrox_metal::gpu::launch_iq4_xs_matvec),
+        _ => None,
+    }
+}
+
+/// The Metal backend (`ferrox-metal`).
+pub struct Metal;
+
+/// The CUDA backend (`ferrox-cuda`).
+pub struct Cuda;
+
+impl BackendCaps for Metal {
+    const ID: Backend = Backend::Metal;
+    const NAME: &'static str = "Metal";
+
+    /// As the kernel name [`ferrox_metal::gpu::matvec_launch_meta`]
+    /// resolves.
+    ///
+    /// This is the single source of truth for that question. It is *not*
+    /// `#[cfg(feature = "metal")]`-gated deliberately: the table is a
+    /// property of the kernel set, and gating it would make it
+    /// untestable on the builds that run `cargo test --workspace`.
+    ///
+    /// Duplicating this list is how IQ4_XS batched prefill silently ran
+    /// on the CPU — `metal_kind_supported` and `apply_gpu_batch`'s kind
+    /// table disagreed by exactly one entry, and the only symptom was a
+    /// benchmark row 13.7x behind. Every Metal-kind question now routes
+    /// through here.
+    fn matvec_kernel(kind: QuantKind) -> Option<&'static str> {
+        match kind {
+            QuantKind::Q8_0
+            | QuantKind::Q4_0
+            | QuantKind::Q5_0
+            | QuantKind::Q4K
+            | QuantKind::Q5K
+            | QuantKind::Q6K
+            | QuantKind::IQ4XS => Some(kind.name()),
+            _ => None,
+        }
+    }
+
+    /// The `*_mul_mm_sg` simdgroup GEMMs.
+    ///
+    /// The invariant that this set equals [`Metal::matvec_kernel`]'s is
+    /// asserted by a test, so adding a matvec kernel without a GEMM
+    /// fails the suite instead of a benchmark.
+    fn gemm_supported(kind: QuantKind) -> bool {
+        // Q5_0 JOINED 2026-09-01, and the two-year-old comment this
+        // replaced named the exact condition: "the honest close is a
+        // `q5_0_matvec` plus a Q5_0 row in the bench suite, not a sixth
+        // entry in this list."
+        //
+        // The matvec now exists (`Q5_0_MATVEC_KERNEL_SRC`), so the split
+        // this list was protecting against is gone: Q5_0 was already
+        // getting GPU prefill through `mul_mm_sg_launch` and `mapped_sg`,
+        // which never consulted this table, while every decode step fell
+        // back to the CPU for want of the matvec. That is the mixed
+        // CPU/GPU path the old comment feared, and it was live rather
+        // than hypothetical.
+        //
+        // The bench row is still owed: there is no Q5_0 checkpoint in
+        // `benchmarks/suite.json`, so this path is
+        // CORRECT-BY-CONSTRUCTION and UNMEASURED.
+        // `Llama-3.2-1B-Instruct-Q5_K_M` is Q5_K, not Q5_0.
+        matches!(
+            kind,
+            QuantKind::Q8_0
+                | QuantKind::Q4_0
+                | QuantKind::Q5_0
+                | QuantKind::Q4K
+                | QuantKind::Q5K
+                | QuantKind::Q6K
+                | QuantKind::IQ4XS
+        )
+    }
+}
+
+impl BackendCaps for Cuda {
+    const ID: Backend = Backend::Cuda;
+    const NAME: &'static str = "CUDA";
+
+    /// The decode path, and the arm that has actually run on a GPU.
+    ///
+    /// Wider than [`Cuda::gemm_supported`]. The name is returned only to
+    /// share [`BackendCaps::matvec_kernel`]'s shape with Metal; nothing
+    /// on the CUDA path reads it, because `ferrox-cuda`'s launchers are
+    /// named functions rather than entries in a string-keyed table.
+    fn matvec_kernel(kind: QuantKind) -> Option<&'static str> {
+        match kind {
+            QuantKind::Q8_0
+            | QuantKind::Q4_0
+            | QuantKind::Q4K
+            | QuantKind::Q5K
+            | QuantKind::Q6K => Some(kind.name()),
+            _ => None,
+        }
+    }
+
+    /// The `mul_mm` prefill path.
+    ///
+    /// Deliberately narrower than [`Cuda::matvec_kernel`]: `ferrox-cuda`
+    /// had no matrix-matrix product at all until Q8_0 and Q4_0 landed,
+    /// so every other kind still decomposes a prefill into per-position
+    /// matvecs.
+    ///
+    /// Stated here rather than delegating to
+    /// `ferrox_cuda::mul_mm::kind_by_name`, because `ferrox-cuda` is
+    /// only a dependency under the `cuda` feature and this predicate is
+    /// compiled unconditionally (the capability report reads it on every
+    /// build).
+    ///
+    /// Two tables that must agree about one set is the failure this
+    /// codebase keeps paying for, so the agreement is a TEST rather than
+    /// a hope: `the_cuda_gemm_kinds_match_the_kernel_table` runs under
+    /// `--features cuda` and compares this against `kind_by_name` for
+    /// every `QuantKind`.
+    ///
+    /// **UNRUN ON HARDWARE.** The kernel is checked against a scalar
+    /// twin and by executing the emitted CUDA C on the host, and has
+    /// never executed on a GPU. See `crates/ferrox-cuda/src/mul_mm.rs`.
+    fn gemm_supported(kind: QuantKind) -> bool {
+        matches!(kind, QuantKind::Q8_0 | QuantKind::Q4_0)
+    }
+}
+
+/// The `FERROX_METAL` / `FERROX_CUDA` grammar, which was written out
+/// twice in bodies that were byte-identical apart from the alias:
+///
+/// - `0|false|off|cpu` — force CPU
+/// - `1|true|on|<alias>` — force this backend
+/// - unset / anything else — whatever `probe` says
+///
+/// `probe` is only called when the environment did not decide, which is
+/// what keeps a forced-off build from opening a device.
+///
+/// Compiled when a backend needs it, and under `test` so the grammar
+/// stays checked on the CPU-only builds that run `cargo test`.
+#[cfg(any(feature = "metal", feature = "cuda", test))]
+fn env_or_probe(value: Option<&str>, on_alias: &str, probe: impl FnOnce() -> bool) -> bool {
+    match value {
+        Some("0") | Some("false") | Some("off") | Some("cpu") => false,
+        Some("1") | Some("true") | Some("on") => true,
+        Some(v) if v == on_alias => true,
+        _ => probe(),
+    }
+}
+
+/// A `ferrox_metal::gpu::launch_*_matvec` function pointer's signature
+/// (`weights`/`x` borrowed; row block count is derived inside
+/// `ferrox_metal::gpu`).
+#[cfg(feature = "metal")]
+type MetalMatvecLaunchFn =
+    fn(&[u8], &[f32], usize, usize) -> Result<Vec<f32>, ferrox_metal::gpu::MetalError>;
+
+/// A `ferrox_cuda::gpu::launch_*_matvec` function pointer's signature
+/// (all five real kernels share it exactly).
+#[cfg(feature = "cuda")]
+type CudaMatvecLaunchFn =
+    fn(&[u8], &[f32], usize, usize, usize) -> Result<Vec<f32>, ferrox_cuda::gpu::CudaError>;
+
+#[cfg(feature = "metal")]
+impl BackendDispatch for Metal {
+    const MATVEC_FALLBACK: &'static str = "falling back to CPU";
+
+    fn dense_enabled() -> bool {
+        use std::sync::OnceLock;
+        // A `static` inside a generic function is shared across every
+        // monomorphization, so this cache cannot be hoisted into a
+        // default trait method: each backend needs its own cell.
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| {
+            let v = std::env::var("FERROX_METAL").ok();
+            env_or_probe(v.as_deref(), "metal", || {
+                ferrox_metal::gpu::probe().is_some()
+            })
+        })
+    }
+
+    fn launch_matvec(
+        kind: QuantKind,
+        weights: &[u8],
+        x: &[f32],
+        rows: usize,
+        row_bytes: usize,
+    ) -> Option<Result<Vec<f32>, BackendError>> {
+        let launch = metal_matvec_launch(kind);
+        // This table and `Metal::matvec_kernel` answer the same question
+        // and must never diverge; when they did, IQ4_XS prefill silently
+        // moved to the CPU. They CANNOT be one table -- the names are
+        // needed on builds where `ferrox-metal` is not a dependency and
+        // these function pointers do not exist -- so the agreement stays
+        // asserted rather than structural.
+        debug_assert_eq!(
+            launch.is_some(),
+            Self::matvec_kernel(kind).is_some(),
+            "apply_gpu's Metal launch table disagrees with metal_matvec_kind_name for {:?}",
+            kind
+        );
+        let launch = launch?;
+        Some(launch(weights, x, rows, row_bytes).map_err(BackendError::new))
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl BackendDispatch for Cuda {
+    const MATVEC_FALLBACK: &'static str = "trying next backend / CPU";
+
+    fn dense_enabled() -> bool {
+        use std::sync::OnceLock;
+        // See the note on `Metal::dense_enabled` for why this cell is
+        // not shared through a default method.
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| {
+            let v = std::env::var("FERROX_CUDA").ok();
+            env_or_probe(v.as_deref(), "cuda", || ferrox_cuda::gpu::probe().is_some())
+        })
+    }
+
+    fn launch_matvec(
+        kind: QuantKind,
+        weights: &[u8],
+        x: &[f32],
+        rows: usize,
+        row_bytes: usize,
+    ) -> Option<Result<Vec<f32>, BackendError>> {
+        let launch: CudaMatvecLaunchFn = match kind {
+            QuantKind::Q8_0 => ferrox_cuda::gpu::launch_q8_0_matvec,
+            QuantKind::Q4_0 => ferrox_cuda::gpu::launch_q4_0_matvec,
+            QuantKind::Q4K => ferrox_cuda::gpu::launch_q4_k_matvec,
+            QuantKind::Q5K => ferrox_cuda::gpu::launch_q5_k_matvec,
+            QuantKind::Q6K => ferrox_cuda::gpu::launch_q6_k_matvec,
+            _ => return None,
+        };
+        // Derived here rather than at the seam: `block_bytes_for_kind`
+        // is `unreachable!()` outside these five kinds, and reaching it
+        // is gated on the match above having named one of them.
+        let n_blocks_per_row =
+            row_bytes / crate::weight_matrix::WeightMatrix::block_bytes_for_kind(kind);
+        Some(launch(weights, x, rows, row_bytes, n_blocks_per_row).map_err(BackendError::new))
+    }
+}
+
+/// **The** backend precedence: CUDA first, then Metal, then the CPU
+/// fallthrough the caller supplies.
+///
+/// Expands `$mac!(Backend)` once per compiled-in backend, in order.
+/// This exists because the order was hand-copied at every dispatch site
+/// and in `active_backend`, and a macro is the only way to keep static
+/// dispatch, per-backend `#[cfg]`, and one written-down order at the
+/// same time. A third backend is one line here.
+///
+/// `$mac` must tolerate being expanded zero times: on a CPU-only build
+/// this produces nothing, so define it `#[allow(unused_macros)]`.
+macro_rules! with_gpu_backends {
+    ($mac:ident) => {
+        #[cfg(feature = "cuda")]
+        $mac!($crate::weight_matrix::gpu_backend::Cuda);
+        #[cfg(feature = "metal")]
+        $mac!($crate::weight_matrix::gpu_backend::Metal);
+    };
+}
+pub(crate) use with_gpu_backends;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The env grammar both enable probes share. `probe` must not be
+    /// consulted when the environment already decided — a forced-off
+    /// build must never open a device.
+    #[test]
+    fn env_decides_before_the_probe_is_consulted() {
+        for forced_off in ["0", "false", "off", "cpu"] {
+            assert!(!env_or_probe(Some(forced_off), "metal", || panic!(
+                "probed after {forced_off}"
+            )));
+        }
+        for forced_on in ["1", "true", "on"] {
+            assert!(env_or_probe(Some(forced_on), "metal", || panic!(
+                "probed after {forced_on}"
+            )));
+        }
+    }
+
+    /// Each backend's own alias forces it on; the *other* backend's
+    /// alias is not a value it understands, so it falls through to the
+    /// probe rather than silently forcing.
+    #[test]
+    fn the_alias_is_per_backend() {
+        assert!(env_or_probe(Some("metal"), "metal", || false));
+        assert!(env_or_probe(Some("cuda"), "cuda", || false));
+        assert!(!env_or_probe(Some("cuda"), "metal", || false));
+        assert!(!env_or_probe(Some("metal"), "cuda", || false));
+    }
+
+    /// Unset, or a value the grammar does not name, defers to the probe.
+    #[test]
+    fn an_unrecognised_value_defers_to_the_probe() {
+        assert!(env_or_probe(None, "metal", || true));
+        assert!(!env_or_probe(None, "metal", || false));
+        assert!(env_or_probe(Some("auto"), "metal", || true));
+        assert!(!env_or_probe(Some("auto"), "metal", || false));
+    }
+
+    /// A backend cannot be dispatched to under one name and reported
+    /// under another: dispatch and the registry read the same constant.
+    #[test]
+    fn every_backend_id_is_distinct_and_an_accelerator() {
+        assert_ne!(Metal::ID, Cuda::ID);
+        assert!(Metal::ID.is_accelerator());
+        assert!(Cuda::ID.is_accelerator());
+    }
+
+    /// A kind that claims a matvec must name itself the way the
+    /// backend's launch-meta table is keyed, for every backend and not
+    /// just Metal — a third backend gets this test for free.
+    /// Every kind Metal's capability table CLAIMS must have a launch
+    /// function behind it, for all 21 kinds and without a device.
+    ///
+    /// `Q5_0` did not, from the day it was added. The kernel source and
+    /// the `matvec_launch_meta` row landed together and both capability
+    /// tables were widened on the strength of them — but `apply_gpu`'s
+    /// single-matvec decode path dispatches through a per-kind
+    /// `launch_*_matvec` FUNCTION, and there was no Q5_0 one. So batched
+    /// prefill ran on the GPU while single-token decode silently fell to
+    /// the CPU: exactly the mixed CPU/GPU split that widening was
+    /// supposed to close.
+    ///
+    /// The `debug_assert_eq!` in `launch_matvec` did guard this, but only
+    /// for kinds a run actually reaches, and only in debug. A release
+    /// build just ran slower. This checks the whole table up front.
+    #[cfg(feature = "metal")]
+    #[test]
+    fn every_kind_the_metal_table_claims_can_actually_be_launched() {
+        let mut claimed_without_launch = Vec::new();
+        let mut launchable_unclaimed = Vec::new();
+        for &kind in QuantKind::ALL {
+            let claimed = Metal::matvec_kernel(kind).is_some();
+            let launchable = super::metal_matvec_launch(kind).is_some();
+            if claimed && !launchable {
+                claimed_without_launch.push(kind);
+            }
+            if launchable && !claimed {
+                launchable_unclaimed.push(kind);
+            }
+        }
+        assert!(
+            claimed_without_launch.is_empty(),
+            "the capability table claims a Metal matvec nothing can launch: \
+             {claimed_without_launch:?} — decode falls to the CPU for these while \
+             batched prefill runs on the GPU"
+        );
+        assert!(
+            launchable_unclaimed.is_empty(),
+            "these have a Metal launch the capability table does not claim, so \
+             nothing will ever call it: {launchable_unclaimed:?}"
+        );
+    }
+
+    #[test]
+    fn a_claimed_matvec_kernel_is_named_after_its_kind() {
+        for &k in QuantKind::ALL {
+            for name in [Metal::matvec_kernel(k), Cuda::matvec_kernel(k)]
+                .into_iter()
+                .flatten()
+            {
+                assert_eq!(name, k.name());
+            }
+        }
+    }
+}

@@ -12,12 +12,25 @@ same command shapes, same or better performance, on the hardware people
 actually own. `docs/plans/north-star.md` is the ranking every other plan
 is read through, and `docs/plans/README.md` is the index.
 
-Honest position, audited 2026-08-27: of 150 catalog rows, about **12**
-run with evidence, ~90 refuse while naming what is missing, ~40 are
-unproven, and a handful load and are WRONG. llama.cpp hand-writes 140
-per-architecture graphs; `decoder.rs` is 6438 lines and that is why the
-counts differ. Do not read the architecture catalog as a support
-matrix.
+Honest position, re-audited 2026-09-01. **11** architectures run with
+evidence (`capability::AUDITED_GENERIC_GQA`), 4 more have dedicated
+engines, and everything else REFUSES. The "loads and is WRONG" class is
+closed: the generic path is opt-in, so an unaudited architecture stops
+instead of guessing.
+
+The 46 unaudited refusals are now TRIAGED, and the refusal says which of
+three things is missing: 9 are a fixture away (implemented, unevidenced),
+7 need one named match arm, 26 need new code, 4 are unknown with the
+question stated. `unaudited_triage` carries the verdict and the
+llama.cpp line that decides it. llama.cpp hand-writes 140
+per-architecture graphs; `decoder.rs` is 6875 lines and that is why the
+counts differ.
+
+Do not read the architecture catalog as a support matrix. `ferrox
+parity` is the oracle: its tokenizer half matches llama.cpp on every
+local checkpoint libllama can load, and its logit half MATCHES on
+Q8_0/IQ4_NL while DRIFTING on K-quants — for a known reason that is not
+a ferrox bug (`docs/plans/llama-cpp-gap-inventory.md` §10).
 
 Capabilities: `docs/FEATURES.md`. Models & speed ledger: `docs/MODELS.md`,
 `benchmarks/RESULTS.md`. Planned: `docs/ROADMAP.md`.
@@ -78,24 +91,44 @@ Metal hardware tests without a real GPU.
 
 **Keep files small, modules narrow, and the binary light.** This is not
 style preference, it is the repo's most expensive lesson. Measured
-2026-08-27:
+2026-09-01, and every one of these GREW since the last measurement:
 
 | File | Lines |
 |---|---|
-| `ferrox-metal/src/attn.rs` | 8840 |
-| `ferrox-metal/src/gpu.rs` | 8385 |
+| `ferrox-metal/src/attn.rs` | 8860 |
+| `ferrox-metal/src/gpu.rs` | 8663 |
 | `ferrox-quant/src/lib.rs` | 8230 |
-| `ferrox-server/src/lib.rs` | 7645 |
-| `ferrox-models/src/decoder.rs` | 6530 |
+| `ferrox-server/src/lib.rs` | 7741 |
+| `ferrox-models/src/decoder.rs` | 6875 |
 
-Those files are why llama.cpp has 140 architectures and ferrox has 47
-paths of which about 12 are proven. Adding a model means editing a
-6500-line file, so nobody adds one. And the same decode layer is written
-out about ELEVEN times across `decoder.rs` and `attn.rs`, which has
-already lost SEVEN model features one at a time, each silently:
+Those files are why llama.cpp has 140 architectures and ferrox has 11
+proven. Adding a model means editing a 6900-line file, so nobody adds
+one. The same decode layer used to be written out about ELEVEN times
+across `decoder.rs` and `attn.rs`, which has already lost EIGHT model
+features one at a time, each silently:
 `attention_scale`, `post_attn_norm`, `post_ffn_norm`, gpt-oss `o_bias`,
-`gpt_oss_ffn`, and the four the Metal MoE decode stack ignored. A copy
-diverges from its original and nothing notices.
+`gpt_oss_ffn`, the four the Metal MoE decode stack ignored, and the
+four-way drift of the GPU-router eligibility check, where the prefill
+sites tested three conditions, the fused decode two and the whole-stack
+decode NONE. A copy diverges from its original and nothing notices.
+
+**THIS IS THE DOMINANT BUG SHAPE IN THIS REPO, and 2026-09-01 found a
+dozen more instances of it in one day** — not all of them copied code.
+The general form is TWO STRUCTURES THAT MUST AGREE ABOUT ONE THING,
+WITH NOTHING ENFORCING IT: two spellings of a GGUF key (`unsupported_
+feature_keys` gated on one no converter writes, so it never fired); two
+copies of a default (the response cache restated every `unwrap_or`
+independently of the sampler); four hand-written `SamplingParams`
+literals in one file; three tables that had to agree about a Metal
+kernel's threadgroup geometry (a correct kernel returned zeros for half
+its rows); a wire struct and a sampler that silently disagreed about
+which fields exist (SIX parameters accepted and ignored).
+
+The durable fixes are never the individual patches. They are the places
+where disagreement now fails to COMPILE or turns a test red: an
+exhaustive destructure with no `..`, one predicate the four call sites
+share, a derived table instead of a restated one, and a test asserting
+every refused key is one a converter actually writes.
 
 Rules that follow from that:
 
@@ -106,10 +139,14 @@ Rules that follow from that:
 - **Never copy a code path to vary it.** Parameterise the original. The
   precedent that works: `forward_multi_seq` takes a `MultiSeqKv`
   parameter rather than having a paged twin. The precedent that failed:
-  `forward_token_paged` was a copy, and lost five features.
-- **Dead code is a liability, not an asset.** 5,400 lines in
-  `ferrox-edge` have no caller. Delete on sight unless it serves a named
-  roadmap theme; if it does, wire it or say where it is going.
+  `forward_token_paged` was a copy, and lost five features -- it is now
+  collapsed onto one `attn_block` taking a `KvStep`.
+- **Dead code is a liability, not an asset.** Delete on sight unless it
+  serves a named roadmap theme; if it does, wire it or say where it is
+  going. `ferrox-edge` was 5,400 uncalled lines and is now dissolved.
+- **A gate that cannot fire is worse than no gate**, because it reads as
+  coverage. Check that a refusal's condition is reachable at all: this
+  repo shipped one keyed on a GGUF spelling nothing writes.
 - **No new crate for something one crate uses.** `ferrox-edge` became a
   crate instead of an integration and half of it was never called.
 

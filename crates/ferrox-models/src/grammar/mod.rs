@@ -24,6 +24,7 @@
 //! | [`parser`] | GBNF text to a rule table |
 //! | [`machine`] | the pushdown stack machine over that table |
 //! | [`candidates`] | which candidate tokens no viable stack accepts |
+//! | [`json_schema`] | JSON Schema to GBNF text, for `response_format` |
 //!
 //! # Status
 //!
@@ -35,17 +36,24 @@
 //! and [`candidates::reject_candidates`] before each sample; nothing calls
 //! either yet.
 //!
-//! Also not ported, and each is a separate piece of work:
+//! [`json_schema`] now ports `common/json-schema-to-grammar.cpp`, which is
+//! what `response_format: json_schema` needs on top of a grammar. It is
+//! stricter than upstream by design -- a keyword it cannot honour is a
+//! typed refusal rather than a grammar that accepts too much -- and its
+//! module docs list what is ported, what is refused by name, and where its
+//! output differs from llama.cpp's. It is not wired into the server
+//! either; `ferrox-server` still answers `response_format: json_schema`
+//! with a 501.
+//!
+//! Still not ported, and a separate piece of work:
 //!
 //! - **Lazy grammars** (`trigger_patterns` / `trigger_tokens`), which is
 //!   what `tool_choice: "required"` needs on top of a grammar.
-//! - **JSON schema to grammar**
-//!   (`common/json-schema-to-grammar.cpp`), which is what
-//!   `response_format: json_schema` needs on top of a grammar.
 
 pub mod candidates;
 pub mod element;
 pub mod error;
+pub mod json_schema;
 pub mod machine;
 pub mod parser;
 pub mod utf8;
@@ -60,6 +68,7 @@ mod parser_tests;
 pub use candidates::{reject_candidates, Candidate, DecodedPiece};
 pub use element::{GrammarElement, GrammarRule, GrammarStack, GreType, RulePos};
 pub use error::GrammarError;
+pub use json_schema::{json_schema_to_grammar, json_schema_to_grammar_value, SchemaError};
 pub use machine::Grammar;
 pub use parser::{parse, parse_with_vocab, GrammarVocab, ParsedGrammar};
 pub use utf8::PartialUtf8;

@@ -357,47 +357,75 @@ pub fn sampling_distribution(
 }
 
 /// Shared tail of [`Sampler::sample_with_mask`] and
-/// [`sampling_distribution`]: divide the already-penalised `scores` by
-/// the temperature, softmax, apply top-k and top-p, and renormalise.
-/// `raw_logits` is only consulted for the degenerate
+/// [`sampling_distribution`]: truncate the already-penalised `scores`
+/// with top-k and top-p, THEN apply the temperature, softmax and
+/// renormalise. `raw_logits` is only consulted for the degenerate
 /// everything-filtered-to-zero fallback.
 ///
+/// # Order, and why it is this one
+///
+/// TEMPERATURE COMES LAST. llama.cpp's default sampler chain is
+/// `penalties, dry, top_n_sigma, top_k, typical_p, top_p, min_p, xtc,
+/// temperature` (`common/common.h:259-269`), and ferrox used to divide
+/// by the temperature FIRST and filter afterwards.
+///
+/// That is not a reordering of independent steps. Top-p selects the
+/// smallest set of candidates whose probabilities sum to `p`, and
+/// temperature changes those probabilities: a high temperature flattens
+/// the distribution so the nucleus grows, a low one sharpens it so the
+/// nucleus shrinks. Filtering before scaling and filtering after scaling
+/// therefore keep DIFFERENT candidate sets for the same
+/// `--temp`/`--top-p` pair, which is why identical flags gave llama.cpp
+/// and ferrox different output.
+///
+/// So the cut is taken on the unscaled distribution, exactly as
+/// llama.cpp takes it on the candidate list before its temperature
+/// sampler runs, and the temperature then reshapes only the survivors.
+///
 /// Both callers go through here rather than each doing their own
-/// temperature-then-filter, because a difference between the two is
-/// exactly the kind of silent non-losslessness speculative
-/// verification is supposed to rule out.
+/// filter-then-temperature, because a difference between the two is
+/// exactly the kind of silent non-losslessness speculative verification
+/// is supposed to rule out.
 fn filtered_distribution(
     mut scores: Vec<f32>,
     raw_logits: &[f32],
     params: &SamplingParams,
 ) -> Vec<f32> {
-    for s in scores.iter_mut() {
-        *s /= params.temperature;
-    }
-    let mut probs = softmax(&scores);
+    // The cut is taken on the UNSCALED distribution, before the
+    // temperature reshapes it -- see this function's doc comment.
+    let unscaled = softmax(&scores);
+    let mut keep = vec![true; scores.len()];
+    let mut idx: Vec<usize> = (0..unscaled.len()).collect();
+    idx.sort_unstable_by(|&a, &b| unscaled[b].partial_cmp(&unscaled[a]).unwrap());
 
-    if params.top_k > 0 && params.top_k < probs.len() {
-        let mut idx: Vec<usize> = (0..probs.len()).collect();
-        idx.sort_unstable_by(|&a, &b| probs[b].partial_cmp(&probs[a]).unwrap());
+    if params.top_k > 0 && params.top_k < keep.len() {
         for &i in idx.iter().skip(params.top_k) {
-            probs[i] = 0.0;
+            keep[i] = false;
         }
     }
 
     if params.top_p < 1.0 {
-        let mut idx: Vec<usize> = (0..probs.len()).collect();
-        idx.sort_unstable_by(|&a, &b| probs[b].partial_cmp(&probs[a]).unwrap());
         let mut cumulative = 0.0f32;
         let mut cutoff = idx.len();
         for (rank, &i) in idx.iter().enumerate() {
-            cumulative += probs[i];
+            cumulative += unscaled[i];
             if cumulative >= params.top_p {
                 cutoff = rank + 1;
                 break;
             }
         }
         for &i in idx.iter().skip(cutoff) {
-            probs[i] = 0.0;
+            keep[i] = false;
+        }
+    }
+
+    for s in scores.iter_mut() {
+        *s /= params.temperature;
+    }
+    let mut probs = softmax(&scores);
+    for (p, &k) in probs.iter_mut().zip(keep.iter()) {
+        if !k {
+            *p = 0.0;
         }
     }
 
@@ -417,29 +445,46 @@ fn filtered_distribution(
     probs
 }
 
+/// Penalise tokens that already appear in `history`, once each.
+///
+/// ONCE EACH is the whole subtlety, and ferrox used to get it wrong.
+/// llama.cpp walks the CANDIDATE list and looks each candidate up in a
+/// count map (`llama-sampler.cpp:2735-2756`), so a token repeated `n`
+/// times is divided by `penalty_repeat` exactly once. ferrox walked the
+/// HISTORY, so the same token was divided `n` times and the effective
+/// penalty was `penalty^n`.
+///
+/// That was live on every `ferrox run`: `--repeat-penalty` defaults to
+/// 1.1, so a token seen five times was penalised 1.61x rather than
+/// 1.1x, and the divergence grew with the length of the output.
+///
+/// The sign convention is llama.cpp's and its comment explains it:
+/// dividing alone would make tokens with NEGATIVE logits more likely,
+/// so negatives are multiplied instead.
 fn apply_history_penalties(scores: &mut [f32], params: &SamplingParams, history: &[usize]) {
-    if params.repetition_penalty != 1.0 {
-        for &tok in history {
-            if let Some(s) = scores.get_mut(tok) {
-                *s = if *s > 0.0 {
-                    *s / params.repetition_penalty
-                } else {
-                    *s * params.repetition_penalty
-                };
-            }
-        }
+    if params.repetition_penalty == 1.0
+        && params.presence_penalty == 0.0
+        && params.frequency_penalty == 0.0
+    {
+        return;
     }
-    if params.presence_penalty != 0.0 || params.frequency_penalty != 0.0 {
-        let mut counts = std::collections::HashMap::<usize, usize>::new();
-        for &tok in history {
-            *counts.entry(tok).or_insert(0) += 1;
+    let mut counts = std::collections::HashMap::<usize, usize>::new();
+    for &tok in history {
+        *counts.entry(tok).or_insert(0) += 1;
+    }
+    for (tok, count) in counts {
+        let Some(s) = scores.get_mut(tok) else {
+            continue;
+        };
+        if params.repetition_penalty != 1.0 {
+            *s = if *s > 0.0 {
+                *s / params.repetition_penalty
+            } else {
+                *s * params.repetition_penalty
+            };
         }
-        for (tok, count) in counts {
-            if let Some(s) = scores.get_mut(tok) {
-                *s -= params.frequency_penalty * count as f32;
-                *s -= params.presence_penalty;
-            }
-        }
+        *s -= params.frequency_penalty * count as f32;
+        *s -= params.presence_penalty;
     }
 }
 
@@ -466,6 +511,112 @@ fn softmax(logits: &[f32]) -> Vec<f32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The repetition penalty is applied ONCE per token, however many
+    /// times that token appears in the history.
+    ///
+    /// ferrox walked the history and divided once per OCCURRENCE, so the
+    /// effective penalty was `penalty^n`. llama.cpp walks the candidates
+    /// and looks each up in a count map, so it is `penalty` flat
+    /// (`llama-sampler.cpp:2735-2756`).
+    ///
+    /// Live on every `ferrox run`: `--repeat-penalty` defaults to 1.1,
+    /// so a token seen five times was penalised 1.61x, and the
+    /// divergence grew with the length of the output. Twenty-four
+    /// sampling tests passed with the bug in place, which is why this
+    /// one exists.
+    #[test]
+    fn the_repetition_penalty_does_not_compound_with_repeats() {
+        let params = SamplingParams {
+            temperature: 1.0,
+            top_p: 1.0,
+            top_k: 0,
+            repetition_penalty: 2.0,
+            ..SamplingParams::default()
+        };
+        let logits = vec![4.0f32, 1.0, 1.0];
+
+        // Token 0 appears five times. Penalised once, its score is 2.0;
+        // compounded it would be 4 / 2^5 = 0.125.
+        let mut scores = logits.clone();
+        apply_history_penalties(&mut scores, &params, &[0, 0, 0, 0, 0]);
+        assert!(
+            (scores[0] - 2.0).abs() < 1e-6,
+            "expected one division (2.0), got {} -- {} would be 2^5",
+            scores[0],
+            4.0f32 / 32.0
+        );
+
+        // And once really is once: one occurrence and five occurrences
+        // must land on the same score, or the count still leaks in.
+        let mut once = logits.clone();
+        apply_history_penalties(&mut once, &params, &[0]);
+        assert_eq!(once[0].to_bits(), scores[0].to_bits());
+
+        // A NEGATIVE logit is multiplied rather than divided, or the
+        // penalty would make it more likely -- llama.cpp's own comment.
+        let mut negative = vec![-4.0f32];
+        apply_history_penalties(&mut negative, &params, &[0, 0, 0]);
+        assert!((negative[0] + 8.0).abs() < 1e-6, "got {}", negative[0]);
+    }
+
+    /// Frequency penalty still scales with the count, while the
+    /// repetition penalty does not.
+    ///
+    /// Both live in the same loop, so a fix that made the repetition
+    /// penalty flat by dropping the counts would break this one.
+    #[test]
+    fn the_frequency_penalty_still_counts_repeats() {
+        let params = SamplingParams {
+            frequency_penalty: 0.5,
+            presence_penalty: 0.25,
+            ..SamplingParams::default()
+        };
+        let mut scores = vec![10.0f32];
+        apply_history_penalties(&mut scores, &params, &[0, 0, 0, 0]);
+        // 10 - 0.5*4 - 0.25 = 7.75
+        assert!((scores[0] - 7.75).abs() < 1e-6, "got {}", scores[0]);
+    }
+
+    /// Top-p cuts the UNSCALED distribution; the temperature reshapes
+    /// only the survivors.
+    ///
+    /// llama.cpp's default chain runs temperature LAST
+    /// (`common/common.h:259-269`); ferrox divided first and filtered
+    /// afterwards. Not an innocuous reordering: temperature changes the
+    /// probabilities top-p sums over, so a high temperature flattens the
+    /// distribution and grows the nucleus. The two orders keep different
+    /// candidate sets for identical flags.
+    #[test]
+    fn temperature_does_not_change_which_candidates_top_p_keeps() {
+        let logits = vec![3.0f32, 2.0, 1.0, 0.0];
+        let at = |temperature: f32| -> Vec<bool> {
+            let params = SamplingParams {
+                temperature,
+                top_p: 0.9,
+                top_k: 0,
+                ..SamplingParams::default()
+            };
+            sampling_distribution(&logits, &params, &[])
+                .iter()
+                .map(|&p| p > 0.0)
+                .collect()
+        };
+
+        let cold = at(0.5);
+        let hot = at(4.0);
+        assert_eq!(
+            cold, hot,
+            "the surviving set must not depend on the temperature: \
+             cold={cold:?} hot={hot:?}"
+        );
+        // And the cut must actually bite, or the equality above is
+        // satisfied by keeping everything.
+        assert!(
+            cold.iter().any(|&k| !k),
+            "top_p = 0.9 must drop at least one of these four candidates"
+        );
+    }
 
     #[test]
     fn temperature_zero_accepts_precomputed_argmax_singleton() {

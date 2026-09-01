@@ -1433,15 +1433,15 @@ async fn responses_full(
     // Cloned once, up front: this request decodes against exactly this
     // model even if `/admin/models/load` swaps another one in halfway.
     let active = state.require_active()?;
-    let template = active.model.chat_template();
+    let template = active.generative()?.chat_template();
     let kwargs = chat.resolve_template_kwargs(&template);
     let offered = offered_tools(&chat);
     let prompt = prompt_from_messages(&chat.messages, &template, &offered, kwargs)?;
-    let posture = OutputPosture::resolve(active.model.name(), &prompt);
-    let params = chat.generation_params_for_template(&template, active.model.name())?;
+    let posture = OutputPosture::resolve(active.name(), &prompt);
+    let params = chat.generation_params_for_template(&template, active.name())?;
 
     let (chunks, finish, usage) = crate::decode_task::buffered(
-        crate::decode_task::DecodeHandles::take(&state, &active),
+        crate::decode_task::DecodeHandles::take(&state, &active)?,
         prompt,
         params,
     )
@@ -1452,7 +1452,7 @@ async fn responses_full(
         request_id: &request_id,
         route: ROUTE,
         // The handle this request decoded against, not `chat.model`.
-        model: Some(active.model.name().to_string()),
+        model: Some(active.name().to_string()),
         status: 200,
         stream: false,
         duration_ms: started.elapsed().as_millis() as u64,
@@ -1492,11 +1492,11 @@ async fn responses_stream(
     // stream runs against it, so a mid-stream model swap cannot splice
     // two checkpoints into one answer.
     let active = state.require_active()?;
-    let template = active.model.chat_template();
+    let template = active.generative()?.chat_template();
     let kwargs = chat.resolve_template_kwargs(&template);
     let offered = offered_tools(&chat);
     let prompt = prompt_from_messages(&chat.messages, &template, &offered, kwargs)?;
-    let served_model = active.model.name().to_string();
+    let served_model = active.name().to_string();
     let posture = OutputPosture::resolve(&served_model, &prompt);
     let mut params = chat.generation_params_for_template(&template, &served_model)?;
 
@@ -1506,7 +1506,7 @@ async fn responses_stream(
     let (cancel_token, cancel_guard) = state.cancels.register(&request_id);
     params.cancel = Some(cancel_token.clone());
 
-    let model = Arc::clone(&active.model);
+    let model = Arc::clone(active.generative()?);
     let kv_pool = state.kv_pool.clone();
     let paged_kv = state.paged_kv.clone();
     let prefix_cache = state.prefix_cache.clone();

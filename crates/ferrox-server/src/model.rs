@@ -26,6 +26,7 @@
 //! warning that this is not real model output.
 
 use std::path::Path;
+use std::sync::Arc;
 
 use ferrox_gguf::ShardedGguf;
 use ferrox_models::tokenizer::StopTokens;
@@ -306,6 +307,35 @@ pub enum LoadedModel {
     Mla(MlaLoaded),
     Gemma4(Gemma4Loaded),
     Glm52(Glm52Loaded),
+    /// An encoder-only embedding checkpoint (`bert`/BGE). It has no
+    /// output head, so it never reaches any of the decoder loaders --
+    /// see `crate::loaded::Loaded` for why it is not a `Model`.
+    Encoder(Arc<ferrox_models::EmbeddingModel>),
+}
+
+/// Opens an encoder-only checkpoint, or refuses naming what it needs.
+///
+/// Reached from [`load_gguf_file`] when the file's own
+/// `general.architecture` is one the capability registry scopes as
+/// encoder/embedding. That test happens BEFORE any decoder dispatch on
+/// purpose: sending a `bert` GGUF down the generic path answered a real
+/// download with "tokenizer `bert` ... ferrox cannot read yet", which is
+/// true of the decoder path and beside the point -- the file is an
+/// embedding model, and saying so is the difference between a user
+/// loading it correctly and a user going looking for a tokenizer bug.
+fn load_encoder_checkpoint(path: &str) -> anyhow::Result<Arc<ferrox_models::EmbeddingModel>> {
+    let model = ferrox_models::EmbeddingModel::from_gguf_path(path)
+        .map_err(|e| anyhow::anyhow!("{path}: {e}"))?;
+    tracing::info!(
+        "loaded embedding model '{}' ({}, {} dims, pooling {}, max {} tokens). This is an \
+         ENCODER: /v1/embeddings serves it and /v1/chat/completions refuses it.",
+        model.name(),
+        model.architecture(),
+        model.n_embd(),
+        model.pooling_type().name(),
+        model.n_ctx_train(),
+    );
+    Ok(Arc::new(model))
 }
 
 /// The GLM families that really do need the MLA loader.
@@ -357,6 +387,11 @@ fn load_gguf_file(path: &str) -> anyhow::Result<LoadedModel> {
     let arch = file.metadata_str("general.architecture");
     ferrox_models::mmproj::warn_mmproj_if_present(Path::new(path), arch);
     if let Some(arch) = arch {
+        // Before every decoder dispatch: an encoder has no output head,
+        // so none of them could ever serve it.
+        if ferrox_models::is_embedding_arch(arch) {
+            return load_encoder_checkpoint(path).map(LoadedModel::Encoder);
+        }
         if is_glm52_arch(arch) {
             return load_glm52_checkpoint(path, &file).map(LoadedModel::Glm52);
         }

@@ -55,15 +55,20 @@ impl DecodeHandles {
     /// ceiling all come from the same swap generation -- a ceiling
     /// derived for a checkpoint that is no longer loaded prices the
     /// wrong KV geometry.
-    pub(crate) fn take(state: &AppState, active: &ActiveModel) -> Self {
-        DecodeHandles {
-            model: Arc::clone(&active.model),
+    ///
+    /// Fails when `active` is an encoder-only checkpoint: there is no
+    /// decode to take handles for. Every generating route passes
+    /// through here, so this one `?` is what keeps an encoder off all
+    /// five of them.
+    pub(crate) fn take(state: &AppState, active: &ActiveModel) -> Result<Self, ApiError> {
+        Ok(DecodeHandles {
+            model: Arc::clone(active.generative()?),
             kv_pool: state.kv_pool.clone(),
             paged_kv: state.paged_kv.clone(),
             prefix_cache: state.prefix_cache.clone(),
             batcher: active.batcher.clone(),
             ceiling: active.ceiling.clone(),
-        }
+        })
     }
 
     /// The model this decode is pinned to. Read for its name or its

@@ -17,7 +17,7 @@ comes back the same way.
 | `POST /completion` · `POST /completions` | llama.cpp's **native** completion endpoint, JSON + its own SSE shape. Not an alias of the line above (see below) |
 | `POST /v1/tokenize` · `POST /tokenize` | Supported. The unprefixed spelling is llama.cpp's, on the same handler (see below) |
 | `POST /v1/detokenize` · `POST /detokenize` | Supported, same aliasing |
-| `POST /v1/embeddings` | Supported for GGUF Decoder (mean/last pool of hidden states) |
+| `POST /v1/embeddings` | Supported. A real BERT/BGE encoder when one is loaded (`cls`/`mean`/`last`, L2-normalized), otherwise a mean/last pool of a GGUF decoder's hidden states (see below) |
 | `POST /v1/messages` | Anthropic Messages, streaming and buffered |
 | `POST /v1/messages/count_tokens` | Anthropic prompt sizing, no generation |
 | `POST /v1/responses` | OpenAI Responses surface (what `codex` speaks), streaming and buffered |
@@ -454,6 +454,70 @@ request. `client` is the caller's own `X-Ferrox-Client` header, kept to
 32 label characters, **a claim, not proof**: Ferrox Studio sends
 `ferrox-studio` and so could anything else. Nothing authenticates it, and
 a UI that shows it must say so.
+
+## Embeddings
+
+Two different things can answer `POST /v1/embeddings`, and they are not
+equally good:
+
+| Source | How it is loaded | Default pooling | Normalized |
+|---|---|---|---|
+| A **BERT/BGE encoder** | `FERROX_MODEL_PATH` at an encoder-only GGUF, `/admin/models/load`, or `FERROX_EMBEDDING_MODEL_PATH` beside a generative model | the checkpoint's own `bert.pooling_type` (`CLS` for every BGE) | yes |
+| A **decoder's hidden states** | whatever generative model is loaded | `mean` | no |
+
+The encoder is the one that was trained to put a sentence
+representation somewhere; the decoder path is a best-effort reading of a
+model that was not. `embedding_type` overrides the default: `mean` and
+`last` on both, `cls` on the encoder path only (row 0 of a decoder's
+hidden states is its BOS position and means nothing in particular).
+`none` and `rank` are refused on both — this response shape carries one
+vector per input, not per token, and `rank` is a reranker
+classification head ferrox does not implement.
+
+### An encoder as the served model
+
+`FERROX_MODEL_PATH=bge-small-en-v1.5-q8_0.gguf` works. The file's
+`general.architecture` is what decides: an encoder/embedding
+architecture never reaches a decoder loader.
+
+`GET /v1/models` then says what it is, so a client does not have to send
+a request to find out:
+
+```json
+{"id": "bge-small-en-v1.5", "object": "model",
+ "ferrox_model_kind": "embedding",
+ "ferrox_endpoints": ["/v1/embeddings"],
+ "ferrox_n_embd": 384, "ferrox_pooling": "CLS",
+ "ferrox_context_length": 512,
+ "ferrox_tokenizer": "gguf-wordpiece"}
+```
+
+`GET /health` is `ready` — the server really can serve. Every
+generation endpoint (`/v1/chat/completions`, `/v1/completions`,
+`/completion`, `/v1/messages`, `/v1/responses`) answers `501` naming the
+model rather than blaming a tensor:
+
+```json
+{"error": {
+  "message": "the loaded model 'bge-small-en-v1.5' is an embedding model (bert encoder, 384 dims, pooling CLS). An encoder has no output head, so it cannot generate text at all — there is no next token for it to predict. POST /v1/embeddings to use it, or load a generative checkpoint.",
+  "type": "unsupported",
+  "param": "model"
+}}
+```
+
+`/v1/tokenize` and `/v1/detokenize` refuse the same way. They report the
+prompt the *generation* path would build, and an encoder has no
+generation path; `usage.prompt_tokens` on an embeddings response already
+counts the `[CLS]`/`[SEP]` the model actually saw.
+
+Only `bert` loads. The other encoder rows upstream builds from
+`bert.cpp` — `nomic-bert`, `jina-bert-v2/v3`, `neo-bert`,
+`modern-bert`, `eurobert`, `t5encoder`, and the decoder-style
+`llama-embed` / `gemma-embedding` / `pangu-embedded` — refuse **by
+name**, saying what each one needs (RoPE, a gated FFN, per-projection QK
+norm, its own graph). `ferrox_models::embedding_model::NOT_YET` is that
+list, and a test pins it against the capability registry so a new row
+cannot fall through to a generic refusal.
 
 ## Errors that retrying will not fix
 
@@ -1045,7 +1109,8 @@ Image and audio input · `response_format: json_schema` (GBNF grammars
 themselves *are* supported, see above, and `tool_choice` uses the
 schema converter — only this wire spelling is unwired) · MCP tool
 invocation
-(the config is read, nothing is called) · dedicated embedding models ·
+(the config is read, nothing is called) · embedding architectures other
+than `bert` (they refuse by name, see above) ·
 multi-GPU, tensor parallel, prefill/decode disaggregation · streamed
 argument deltas for the JSON-payload tool formats (they arrive whole) ·
 streamed tool calls on the continuous-batching path · a speculative

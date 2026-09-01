@@ -43,6 +43,30 @@ const NOT_YET: &[(&str, &str)] = &[
     ("pangu-embedded", "a decoder embedding path, not an encoder"),
 ];
 
+/// True when `general.architecture` names an encoder / embedding model
+/// rather than something with an output head.
+///
+/// This is the question a *server* asks before it decides which loader
+/// a checkpoint path goes to: an encoder can never reach the decoder
+/// path, so routing it there produces a refusal about a missing tensor
+/// instead of "this is an embedding model". The answer comes from the
+/// capability registry's own [`crate::capability::ArchScope`] and not
+/// from a second list beside [`NOT_YET`], because two lists of the same
+/// architectures is the copy this repo has already paid for seven times
+/// — a row added to the registry is covered here the moment it lands.
+///
+/// `true` does not mean ferrox can serve it. It means
+/// [`EmbeddingModel::from_gguf_path`] is the loader that will either
+/// build it or refuse it *by name*.
+pub fn is_embedding_arch(arch: &str) -> bool {
+    crate::capability::resolve_profile(arch).is_some_and(|p| {
+        matches!(
+            p.scope,
+            crate::capability::ArchScope::DeferredEncoderEmbedding
+        )
+    })
+}
+
 #[derive(Debug, Error)]
 pub enum EmbedError {
     #[error(transparent)]
@@ -193,6 +217,47 @@ mod tests {
                 crate::capability::resolve_profile(arch).is_some(),
                 "{arch} is not in the capability registry"
             );
+        }
+    }
+
+    /// [`is_embedding_arch`] is what a server routes on, so it has to
+    /// name *exactly* the architectures this module can answer for:
+    /// `bert`, which loads, plus every row in [`NOT_YET`], which
+    /// refuses by name. A registry row scoped
+    /// `DeferredEncoderEmbedding` that is in neither would be routed
+    /// here and hit the generic `NotAnEmbeddingModel` arm, which says
+    /// the opposite of the truth about it.
+    #[test]
+    fn is_embedding_arch_covers_the_registry_rows_and_nothing_else() {
+        let mut registry: Vec<&str> = crate::capability::architecture_catalog()
+            .iter()
+            .filter(|p| {
+                matches!(
+                    p.scope,
+                    crate::capability::ArchScope::DeferredEncoderEmbedding
+                )
+            })
+            .map(|p| p.gguf_name)
+            .collect();
+        registry.sort_unstable();
+        let mut known: Vec<&str> = NOT_YET
+            .iter()
+            .map(|(a, _)| *a)
+            .chain(std::iter::once(BERT_ARCH))
+            .collect();
+        known.sort_unstable();
+        assert_eq!(
+            registry, known,
+            "the registry's encoder/embedding rows and this module's own list disagree"
+        );
+        for arch in &registry {
+            assert!(is_embedding_arch(arch), "{arch} is not routed to this path");
+        }
+        // A decoder must NOT be routed here, or `FERROX_MODEL_PATH`
+        // pointing at a llama GGUF would be told it is an embedding
+        // model.
+        for arch in ["llama", "qwen3", "gemma3", "deepseek2"] {
+            assert!(!is_embedding_arch(arch), "{arch} was routed to this path");
         }
     }
 }

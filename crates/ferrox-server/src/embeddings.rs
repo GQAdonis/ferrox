@@ -7,13 +7,16 @@
 //!   pooled. This is what the route has always done, and it is a
 //!   best-effort reading of a model that was not trained to put a
 //!   sentence representation anywhere in particular.
-//! * A **real embedding model** (`FERROX_EMBEDDING_MODEL_PATH`), i.e. a
-//!   BERT/BGE encoder loaded through
+//! * A **real embedding model**, i.e. a BERT/BGE encoder loaded through
 //!   [`ferrox_models::EmbeddingModel`]. This one has a `[CLS]` position
 //!   it was trained to use and a `pooling_type` in its own metadata
-//!   saying so.
+//!   saying so. It reaches the server either as the *loaded model*
+//!   (`FERROX_MODEL_PATH` pointing at an encoder-only GGUF, or
+//!   `/admin/models/load` swapping one in -- see
+//!   [`crate::loaded::Loaded`]) or as a side-car beside a generative
+//!   model (`FERROX_EMBEDDING_MODEL_PATH`).
 //!
-//! When an embedding model is configured it wins, because it is the one
+//! When an embedding model is present it wins, because it is the one
 //! that was asked for. The decoder path is unchanged underneath it.
 //!
 //! Both go through [`ferrox_models::pooling::pool`]. That matters: the
@@ -182,9 +185,10 @@ async fn embeddings_inner(
             // Fail fast for non-GGUF engines before paying encode cost.
             if active_model.embed_tokens(&[]).is_none() {
                 return Err(unsupported_feature(
-                    "embeddings engine not yet available for this model. Point \
-                     FERROX_EMBEDDING_MODEL_PATH at a real embedding checkpoint \
-                     (a `bert` GGUF such as BGE) to serve embeddings from one",
+                    "embeddings engine not yet available for this model. Load a real \
+                     embedding checkpoint (a `bert` GGUF such as BGE) instead: either as \
+                     the served model (FERROX_MODEL_PATH), or beside this one \
+                     (FERROX_EMBEDDING_MODEL_PATH)",
                 ));
             }
             let name = active_model.name().to_string();

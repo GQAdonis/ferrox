@@ -465,7 +465,7 @@ pub async fn completions(
         ignore_eos: req.ignore_eos.unwrap_or(false),
     };
     let (chunks, finish, usage) = crate::decode_task::buffered(
-        crate::decode_task::DecodeHandles::take(&state, &active),
+        crate::decode_task::DecodeHandles::take(&state, &active)?,
         prompt,
         params,
     )
@@ -481,11 +481,11 @@ pub async fn completions(
         // instead of a completion silently reported as finished.
         FinishReason::Cancelled => "cancelled",
     };
-    let model_name = req.model.unwrap_or_else(|| active.model.name().to_string());
+    let model_name = req.model.unwrap_or_else(|| active.name().to_string());
     call.record_success(
         &state,
         ferrox_api::routes::V1_COMPLETIONS,
-        Some(active.model.name().to_string()),
+        Some(active.name().to_string()),
         Some(&usage),
     );
 

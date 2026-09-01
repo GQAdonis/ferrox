@@ -1386,18 +1386,21 @@ async fn messages_full(
     // model even if `/admin/models/load` swaps another one in halfway.
     let active = state.require_active().map_err(anthropic_shape)?;
     let chat = prepared.chat;
-    let template = active.model.chat_template();
+    let template = active
+        .generative()
+        .map_err(anthropic_shape)?
+        .chat_template();
     let kwargs = chat.resolve_template_kwargs(&template);
     let prompt = prompt_from_messages(&chat.messages, &template, &chat.tools, kwargs)
         .map_err(anthropic_shape)?;
-    let posture = OutputPosture::resolve(active.model.name(), &prompt);
+    let posture = OutputPosture::resolve(active.name(), &prompt);
     // The client's own list, kept apart from `params.stop`, which the
     // template adds its end-of-turn marker to. See `caller_stop`.
     let caller_stops = chat.stop_sequences();
-    let params = chat.generation_params_for_template(&template, active.model.name())?;
+    let params = chat.generation_params_for_template(&template, active.name())?;
 
     let (chunks, finish, usage) = crate::decode_task::buffered(
-        crate::decode_task::DecodeHandles::take(&state, &active),
+        crate::decode_task::DecodeHandles::take(&state, &active).map_err(anthropic_shape)?,
         prompt,
         params,
     )
@@ -1410,7 +1413,7 @@ async fn messages_full(
         route: ferrox_api::routes::V1_MESSAGES,
         // The handle this request decoded against, not `chat.model`: a
         // swap mid-flight does not change which weights answered.
-        model: Some(active.model.name().to_string()),
+        model: Some(active.name().to_string()),
         status: 200,
         stream: false,
         duration_ms: started.elapsed().as_millis() as u64,
@@ -1441,11 +1444,14 @@ async fn messages_stream(
     // checkpoints into one answer.
     let active = state.require_active().map_err(anthropic_shape)?;
     let chat = prepared.chat;
-    let template = active.model.chat_template();
+    let template = active
+        .generative()
+        .map_err(anthropic_shape)?
+        .chat_template();
     let kwargs = chat.resolve_template_kwargs(&template);
     let prompt = prompt_from_messages(&chat.messages, &template, &chat.tools, kwargs)
         .map_err(anthropic_shape)?;
-    let served_model = active.model.name().to_string();
+    let served_model = active.name().to_string();
     let posture = OutputPosture::resolve(&served_model, &prompt);
     // See `messages_full`: the client's list, not the template's.
     let caller_stops = chat.stop_sequences();
@@ -1457,7 +1463,7 @@ async fn messages_stream(
     let (cancel_token, cancel_guard) = state.cancels.register(&request_id);
     params.cancel = Some(cancel_token.clone());
 
-    let model = Arc::clone(&active.model);
+    let model = Arc::clone(active.generative().map_err(anthropic_shape)?);
     let kv_pool = state.kv_pool.clone();
     let paged_kv = state.paged_kv.clone();
     let prefix_cache = state.prefix_cache.clone();

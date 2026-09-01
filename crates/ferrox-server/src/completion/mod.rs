@@ -496,7 +496,7 @@ pub(crate) async fn completion(
     // Pinned once: this request decodes against exactly this checkpoint
     // even if `/admin/models/load` swaps another in halfway through.
     let active = state.require_active()?;
-    let handles = DecodeHandles::take(&state, &active);
+    let handles = DecodeHandles::take(&state, &active)?;
     req.validate(handles.has_prefix_cache())?;
 
     let prompt = req.prompt_text()?.to_string();

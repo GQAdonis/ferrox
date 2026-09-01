@@ -51,6 +51,7 @@ mod health;
 mod journal;
 mod json_mode;
 mod limits;
+mod loaded;
 mod mcp;
 mod model;
 mod openai_extra;
@@ -99,6 +100,7 @@ use ferrox_models::sampling::SamplingParams;
 use ferrox_models::tokenizer::StopTokens;
 use ferrox_models::{Decoder, Gemma4Engine, KimiEngine, MlaEngine, PrefixCache};
 use generate::{FinishReason, GenerationParams};
+pub(crate) use loaded::{ActiveModel, Loaded};
 use model::ServerTokenizer;
 use response_cache::{CacheKey, ResponseCache};
 use sampling_knobs::SamplingKnobs;
@@ -584,50 +586,20 @@ impl Model {
     }
 }
 
-/// The model the server is serving *right now*, together with the
-/// pieces that are built from it and must be replaced with it.
-///
-/// The continuous batcher owns a worker thread holding an
-/// `Arc<Decoder>`, so it belongs to one specific model: keeping it in a
-/// separate field would let a swap leave a batcher decoding against the
-/// old weights while `Model` named the new ones. Bundling them means
-/// one `Arc` swap replaces a consistent pair.
-pub(crate) struct ActiveModel {
-    /// Admin-surface id (see `admin::discover`), or `None` for a model
-    /// that was not discovered through it -- the synthetic fallback, or
-    /// a `FERROX_MODEL_PATH` outside the scanned directory.
-    pub(crate) id: Option<String>,
-    pub(crate) model: Arc<Model>,
-    /// Opt-in continuous-batching decode worker (`FERROX_CONTINUOUS_BATCHING=1`).
-    /// Shares `forward_multi_seq` across concurrent GGUF requests. Disabled
-    /// when a KV pool or prefix cache is configured (those keep the
-    /// private-loop `generate` path).
-    pub(crate) batcher: Option<serving::batch::ContinuousBatcher>,
-    /// The per-request context ceiling this model was priced for, or
-    /// `None` when it could not be priced (see `crate::budget`).
-    ///
-    /// Lives on the *model* rather than on `AppState` because it is a
-    /// property of the checkpoint plus the machine: `/admin/models/load`
-    /// swapping in a different model must swap in its ceiling too,
-    /// never keep the old model's arithmetic. The same `Arc` is inside
-    /// this model's `batcher`, so the batched and private decode paths
-    /// admit on one object.
-    pub(crate) ceiling: Option<Arc<budget::ContextCeiling>>,
-}
-
 pub(crate) struct AppState {
-    /// A real embedding model (`FERROX_EMBEDDING_MODEL_PATH`), served
-    /// by `/v1/embeddings` in preference to pooling a decoder's hidden
-    /// states.
+    /// A **side-car** embedding model (`FERROX_EMBEDDING_MODEL_PATH`),
+    /// served by `/v1/embeddings` in preference to pooling a decoder's
+    /// hidden states.
     ///
-    /// Deliberately a field beside [`AppState::active`] and NOT a
-    /// sixth `Model` variant. A BERT encoder has no chat template, no
-    /// stop tokens, no BOS policy and no logits, so every one of the
-    /// eighteen `match self` arms on `Model` would have to answer a
-    /// question it has no answer to. It is also not swappable through
-    /// `/admin/models/load`, because that surface loads *generation*
-    /// models. Serving an encoder as the active model is a real
-    /// feature and a larger one; this is the seam it would grow from.
+    /// This is now the *second* way an encoder gets here. The first is
+    /// [`AppState::active`]: an encoder-only checkpoint at
+    /// `FERROX_MODEL_PATH` (or swapped in through
+    /// `/admin/models/load`) is the loaded model, as
+    /// [`crate::loaded::Loaded::Encoder`]. This field is what a
+    /// deployment uses when it wants a generative model active *and*
+    /// embeddings from a real encoder at the same time -- one process,
+    /// two checkpoints, which the active-model slot alone cannot
+    /// express. See [`AppState::embedding_model`] for which wins.
     pub(crate) embedding: Option<Arc<ferrox_models::EmbeddingModel>>,
     /// The swappable active model.
     ///
@@ -800,10 +772,15 @@ impl AppState {
         })
     }
 
-    /// [`AppState::active`]'s model only, for the many call sites that
-    /// do not care about the batcher.
+    /// [`AppState::active`]'s *generation* model only, for the many
+    /// call sites that do not care about the batcher.
+    ///
+    /// Two refusals live behind this one `?`: nothing loaded (503, from
+    /// [`AppState::require_active`]) and an encoder loaded (501, from
+    /// [`ActiveModel::generative`]). They are different answers to
+    /// different questions and neither may be given for the other.
     pub(crate) fn require_model(&self) -> Result<Arc<Model>, ApiError> {
-        Ok(Arc::clone(&self.require_active()?.model))
+        Ok(Arc::clone(self.require_active()?.generative()?))
     }
 
     /// Publishes a new active model (or `None` to unload) and returns
@@ -890,19 +867,29 @@ impl AppState {
     /// The model that would serve a request right now, as `/v1/models`
     /// names it. `None` when nothing is loaded.
     pub(crate) fn active_model_name(&self) -> Option<String> {
-        self.active().map(|a| a.model.name().to_string())
+        self.active().map(|a| a.name().to_string())
     }
 
-    /// The configured embedding model, if any.
+    /// The encoder `/v1/embeddings` should use, from either of the two
+    /// ways one gets here.
+    ///
+    /// `FERROX_EMBEDDING_MODEL_PATH` wins over an encoder loaded as the
+    /// active model, and it has to: a deployment that names both has
+    /// asked for the side-car explicitly, while the active model may
+    /// have been swapped in by `/admin/models/load` since. Only one of
+    /// the two is ever set in practice -- the side-car exists so a
+    /// *generative* model can be active at the same time.
     pub(crate) fn embedding_model(&self) -> Option<Arc<ferrox_models::EmbeddingModel>> {
-        self.embedding.clone()
+        self.embedding
+            .clone()
+            .or_else(|| self.active().and_then(|a| a.encoder().map(Arc::clone)))
     }
 
     /// What `/v1/embeddings` is actually charging against, for the
-    /// `/admin/stats` ring: the embedding model when one is configured,
+    /// `/admin/stats` ring: the embedding model when one is serving,
     /// otherwise whichever decoder is active.
     pub(crate) fn embedding_model_name(&self) -> Option<String> {
-        match &self.embedding {
+        match self.embedding_model() {
             Some(e) => Some(e.name().to_string()),
             None => self.active_model_name(),
         }
@@ -1639,7 +1626,7 @@ impl ChatCompletionRequest {
     /// forced `tool_choice`, the grammar that makes it forced.
     ///
     /// `served_model` is the name of the checkpoint this generation will
-    /// actually run against -- `active.model.name()`, the same string
+    /// actually run against -- `active.name()`, the same string
     /// [`output::OutputPosture::resolve`] reads the answer back with, and
     /// NOT the `model` field of the request. The two can differ, and a
     /// grammar built for one wire format while the response is parsed in
@@ -1900,15 +1887,28 @@ async fn health(State(state): State<Arc<AppState>>) -> Response {
             ferrox_api::health::reason::MODEL_NOT_LOADED,
             "No model is loaded. POST /admin/models/load with an id from GET /admin/models.",
         ),
-        Some(active) if active.model.is_synthetic() => ferrox_api::Capability::unavailable(
+        Some(active) if active.is_synthetic() => ferrox_api::Capability::unavailable(
             ferrox_api::health::capability::REAL_WEIGHTS,
             ferrox_api::health::reason::MODEL_NOT_LOADED,
             "Serving synthetic random weights: set FERROX_MODEL_PATH (or -m) to a real \
              checkpoint. Output from this model is noise.",
         ),
+        // An encoder is real weights and is genuinely serving, so this
+        // is `available` -- but a supervisor reading "serving X" and
+        // then getting 501 from /v1/chat/completions learned nothing.
+        // The detail says which endpoint this checkpoint is for.
+        Some(active) if active.encoder().is_some() => ferrox_api::Capability::available(
+            ferrox_api::health::capability::REAL_WEIGHTS,
+            format!(
+                "Serving the real embedding checkpoint '{}'. This is an ENCODER: {} serves \
+                 it, generation endpoints refuse it.",
+                active.name(),
+                ferrox_api::routes::V1_EMBEDDINGS,
+            ),
+        ),
         Some(active) => ferrox_api::Capability::available(
             ferrox_api::health::capability::REAL_WEIGHTS,
-            format!("Serving the real checkpoint '{}'.", active.model.name()),
+            format!("Serving the real checkpoint '{}'.", active.name()),
         ),
     });
     capabilities.push(if active.as_ref().is_some_and(|a| a.batcher.is_some()) {
@@ -1964,9 +1964,9 @@ async fn health(State(state): State<Arc<AppState>>) -> Response {
         model: active
             .as_deref()
             .map(|active| ferrox_api::health::ModelSummary {
-                id: active.model.name().to_string(),
-                tokenizer: active.model.tokenizer_kind().to_string(),
-                synthetic_weights: active.model.is_synthetic(),
+                id: active.name().to_string(),
+                tokenizer: active.tokenizer_kind().to_string(),
+                synthetic_weights: active.is_synthetic(),
             }),
         capabilities,
         version: env!("CARGO_PKG_VERSION").to_string(),
@@ -1994,27 +1994,43 @@ async fn list_models(State(state): State<Arc<AppState>>) -> Json<serde_json::Val
         return Json(serde_json::json!({ "object": "list", "data": [] }));
     };
     let mut model_entry = serde_json::json!({
-        "id": active.model.name(),
+        "id": active.name(),
         "object": "model",
-        "ferrox_synthetic_weights": active.model.is_synthetic(),
-        "ferrox_tokenizer": active.model.tokenizer_kind(),
+        "ferrox_synthetic_weights": active.is_synthetic(),
+        "ferrox_tokenizer": active.tokenizer_kind(),
     });
+    // An encoder is listed -- it IS what is loaded, and a client asking
+    // "what can I use" must be told about it -- but it is listed as
+    // what it is. `ferrox_endpoints` is the machine-readable half of
+    // the 501 a generation route would answer with: a client that reads
+    // it never has to send the request to find out.
+    if let Some(encoder) = active.encoder() {
+        model_entry["ferrox_model_kind"] = serde_json::json!("embedding");
+        model_entry["ferrox_endpoints"] = serde_json::json!([ferrox_api::routes::V1_EMBEDDINGS]);
+        model_entry["ferrox_n_embd"] = serde_json::json!(encoder.n_embd());
+        model_entry["ferrox_pooling"] = serde_json::json!(encoder.pooling_type().name());
+        model_entry["ferrox_context_length"] = serde_json::json!(encoder.n_ctx_train());
+    }
     // Which reasoning gears this checkpoint really has, learned by
     // probing its own template at load. A checkpoint that says nothing
     // about thinking carries NEITHER field rather than an empty list:
     // an empty list reads as "asked, and it has no gears", which is a
-    // different claim from "this is not a reasoning model".
-    let parser_configured =
-        crate::policy::parser::ReasoningFormat::infer(active.model.name()).is_some();
-    let gears = active.model.chat_template().think_gears(parser_configured);
-    if !gears.is_empty() {
-        model_entry["supported_reasoning_efforts"] = serde_json::json!(gears.supported);
-        if let Some(default) = &gears.default {
-            model_entry["default_reasoning_effort"] = serde_json::json!(default);
+    // different claim from "this is not a reasoning model". An encoder
+    // is not asked at all, for the same reason -- it has no template to
+    // probe, and `ThinkGears::default()` would be an invented answer.
+    if let Some(model) = active.generative_opt() {
+        let parser_configured =
+            crate::policy::parser::ReasoningFormat::infer(active.name()).is_some();
+        let gears = model.chat_template().think_gears(parser_configured);
+        if !gears.is_empty() {
+            model_entry["supported_reasoning_efforts"] = serde_json::json!(gears.supported);
+            if let Some(default) = &gears.default {
+                model_entry["default_reasoning_effort"] = serde_json::json!(default);
+            }
+            // What to SEND for each gear, so a client selects one without
+            // knowing that "off" is two booleans and "high" is a string.
+            model_entry["reasoning_effort_kwargs"] = serde_json::json!(gears.kwargs);
         }
-        // What to SEND for each gear, so a client selects one without
-        // knowing that "off" is two booleans and "high" is a string.
-        model_entry["reasoning_effort_kwargs"] = serde_json::json!(gears.kwargs);
     }
     if let Some(mcp) = &state.mcp {
         model_entry["ferrox_mcp"] = mcp.models_metadata();
@@ -2043,7 +2059,7 @@ async fn serving_stats(State(state): State<Arc<AppState>>) -> Json<serde_json::V
     let mut serving = state.serving.lock().unwrap_or_else(|p| p.into_inner());
     let active = state.active();
     Json(serde_json::json!({
-        "model": active.as_ref().map(|a| a.model.name()),
+        "model": active.as_ref().map(|a| a.name()),
         "state": state
             .maintenance
             .lock()
@@ -2167,7 +2183,7 @@ async fn metrics(State(state): State<Arc<AppState>>) -> Response {
         // "serving noise" rather than "serving nothing".
         active
             .as_ref()
-            .map(|a| a.model.is_synthetic() as u8)
+            .map(|a| a.is_synthetic() as u8)
             .unwrap_or(0),
     );
 
@@ -2176,7 +2192,7 @@ async fn metrics(State(state): State<Arc<AppState>>) -> Response {
     // (FERROX_EXPERT_CACHE_BYTES).
     let body = match active
         .as_ref()
-        .and_then(|a| a.model.expert_store_stats())
+        .and_then(|a| a.expert_store_stats())
     {
         Some(es) => format!(
             "{body}\
@@ -2850,7 +2866,7 @@ async fn chat_completions_full(
     // halfway through (see `AppState::active`).
     let active = state.require_active()?;
     let history = resolve_history(&state, &req);
-    let template = active.model.chat_template();
+    let template = active.generative()?.chat_template();
     let kwargs = req.resolve_template_kwargs(&template);
     let prompt = prompt_from_messages(&history, &template, &req.tools, kwargs)?;
     let key = req.is_cacheable().then(|| req.cache_key(&prompt));
@@ -2862,9 +2878,9 @@ async fn chat_completions_full(
         tracing::debug!("cache hit for key {}", key.as_ref().unwrap().digest());
         (cached, "hit")
     } else {
-        let params = req.generation_params_for_template(&template, active.model.name())?;
+        let params = req.generation_params_for_template(&template, active.name())?;
         let (chunks, finish, usage) = decode_task::buffered(
-            decode_task::DecodeHandles::take(&state, &active),
+            decode_task::DecodeHandles::take(&state, &active)?,
             prompt.clone(),
             params,
         )
@@ -2909,7 +2925,7 @@ async fn chat_completions_full(
     let (message, finish_reason) = build_response_message(
         content,
         if tools_active { &req.tools } else { &[] },
-        output::OutputPosture::resolve(active.model.name(), &prompt),
+        output::OutputPosture::resolve(active.name(), &prompt),
         completion.finish.as_str(),
     );
 
@@ -2918,7 +2934,7 @@ async fn chat_completions_full(
         route: ferrox_api::routes::V1_CHAT_COMPLETIONS,
         // The handle this request decoded against, not `req.model`: a
         // swap mid-flight does not change which weights answered.
-        model: Some(active.model.name().to_string()),
+        model: Some(active.name().to_string()),
         status: 200,
         stream: false,
         duration_ms: started.elapsed().as_millis() as u64,
@@ -2955,24 +2971,24 @@ async fn chat_completions_stream(
     // splice two checkpoints into one completion.
     let active = state.require_active()?;
     let history = resolve_history(&state, &req);
-    let template = active.model.chat_template();
+    let template = active.generative()?.chat_template();
     let kwargs = req.resolve_template_kwargs(&template);
     let prompt = prompt_from_messages(&history, &template, &req.tools, kwargs)?;
     let model_name = req.model.clone();
     let session_id = req.session_id.clone();
     let sessions = state.sessions.clone();
 
-    let model = Arc::clone(&active.model);
+    let model = Arc::clone(active.generative()?);
     let kv_pool = state.kv_pool.clone();
     let paged_kv = state.paged_kv.clone();
     let prefix_cache = state.prefix_cache.clone();
     let batcher = active.batcher.clone();
     let ceiling = active.ceiling.clone();
-    let mut params = req.generation_params_for_template(&template, active.model.name())?;
+    let mut params = req.generation_params_for_template(&template, active.name())?;
     let stats_state = Arc::clone(&state);
     // Read now, off the handle this stream will decode against. Read
     // later it would name whatever a swap had made current by then.
-    let served_model = active.model.name().to_string();
+    let served_model = active.name().to_string();
     // How to read this stream, fixed before the first token: the family
     // from the served checkpoint, and whether the prompt that was
     // actually rendered left the model inside a reasoning block.
@@ -3458,7 +3474,7 @@ async fn cancel_generation(
 /// active model: the model itself, its optional continuous-batching
 /// worker, and the context ceiling both decode paths admit on.
 type Activated = (
-    Model,
+    Loaded,
     Option<serving::batch::ContinuousBatcher>,
     Option<Arc<budget::ContextCeiling>>,
 );
@@ -3578,64 +3594,69 @@ pub(crate) fn activate_loaded_model(
                 None
             };
             (
-                Model::Gguf(GgufModel {
+                Loaded::Generative(Arc::new(Model::Gguf(GgufModel {
                     decoder,
                     tokenizer,
                     stop_tokens: g.stop_tokens,
                     bos_id: g.bos_id,
                     is_synthetic: g.is_synthetic,
                     chat_template: g.chat_template,
-                }),
+                }))),
                 batcher,
                 Some(ceiling),
             )
         }
         model::LoadedModel::Kimi(k) => (
-            Model::Kimi(KimiModel {
+            Loaded::Generative(Arc::new(Model::Kimi(KimiModel {
                 engine: k.engine,
                 tokenizer: k.tokenizer,
                 stop_tokens: k.stop_tokens,
                 chat_template: k.chat_template,
-            }),
+            }))),
             None,
             None,
         ),
         model::LoadedModel::Mla(m) => (
-            Model::Mla(MlaModel {
+            Loaded::Generative(Arc::new(Model::Mla(MlaModel {
                 engine: m.engine,
                 tokenizer: m.tokenizer,
                 stop_tokens: m.stop_tokens,
                 bos_id: m.bos_id,
                 name: m.name,
                 chat_template: m.chat_template,
-            }),
+            }))),
             None,
             None,
         ),
         model::LoadedModel::Gemma4(m) => (
-            Model::Gemma4(Gemma4Model {
+            Loaded::Generative(Arc::new(Model::Gemma4(Gemma4Model {
                 engine: m.engine,
                 tokenizer: m.tokenizer,
                 stop_tokens: m.stop_tokens,
                 bos_id: m.bos_id,
                 name: m.name,
                 chat_template: m.chat_template,
-            }),
+            }))),
             None,
             None,
         ),
         model::LoadedModel::Glm52(g) => (
-            Model::Glm52(Glm52Model {
+            Loaded::Generative(Arc::new(Model::Glm52(Glm52Model {
                 engine: g.engine,
                 tokenizer: g.tokenizer,
                 stop_tokens: g.stop_tokens,
                 bos_id: g.bos_id,
                 name: g.name,
                 chat_template: g.chat_template,
-            }),
+            }))),
             None,
             None,
         ),
+        // No batcher and no ceiling, and neither is an omission: an
+        // encoder has no decode step to share between requests and no
+        // KV cache to price a context against. Handing it either would
+        // be pricing a cost it does not have.
+        model::LoadedModel::Encoder(e) => (Loaded::Encoder(e), None, None),
     }
 }
 
@@ -3660,7 +3681,7 @@ fn build_app_state(
     detection: Arc<health::Detection>,
 ) -> AppState {
     let StartupModels { loaded, embedding } = models;
-    let (model, batcher, ceiling) = activate_loaded_model(
+    let (loaded, batcher, ceiling) = activate_loaded_model(
         loaded,
         enable_continuous_batching,
         std::env::var("FERROX_MODEL_PATH").ok().as_deref(),
@@ -3676,7 +3697,7 @@ fn build_app_state(
         embedding,
         active: std::sync::RwLock::new(Some(Arc::new(ActiveModel {
             id,
-            model: Arc::new(model),
+            loaded,
             batcher,
             ceiling,
         }))),
@@ -3972,10 +3993,11 @@ async fn run(mcp_config_path: Option<PathBuf>, exit_on_stdin_close: bool) -> any
     }
 
     // Loaded before the generation model, so a bad path fails the
-    // start rather than the first `/v1/embeddings` request. It is
-    // separate from `FERROX_MODEL_PATH` on purpose: an encoder cannot
-    // generate, so it is not a substitute for the served model, and the
-    // two are configured independently.
+    // start rather than the first `/v1/embeddings` request. This is the
+    // SIDE-CAR: a second checkpoint beside a generative one. An encoder
+    // at `FERROX_MODEL_PATH` needs none of this -- it goes through
+    // `model::load()` below like any other checkpoint and becomes the
+    // active model.
     let embedding_model = load_embedding_model()?;
 
     let mut loaded = model::load()?;
@@ -4005,6 +4027,9 @@ async fn run(mcp_config_path: Option<PathBuf>, exit_on_stdin_close: bool) -> any
             g.name,
             g.tokenizer.kind()
         ),
+        // `model::load_encoder_checkpoint` has already logged the
+        // dimensions, the pooling rule and which endpoint serves it.
+        model::LoadedModel::Encoder(_) => {}
     }
     // Opt-in VRAM budget for GPU-resident MoE experts. When unset but
     // Metal is active, default to a large budget so routed experts that
@@ -4058,6 +4083,12 @@ async fn run(mcp_config_path: Option<PathBuf>, exit_on_stdin_close: bool) -> any
                 tracing::warn!(
                     "FERROX_GPU_VRAM_BUDGET_BYTES is set but the loaded model is GLM-5.2 DSA -- \
                      GPU expert placement not wired yet; ignoring"
+                );
+            }
+            model::LoadedModel::Encoder(_) => {
+                tracing::warn!(
+                    "FERROX_GPU_VRAM_BUDGET_BYTES is set but the loaded model is an encoder -- \
+                     it has no routed experts to place; ignoring"
                 );
             }
         }
@@ -4171,7 +4202,8 @@ async fn run(mcp_config_path: Option<PathBuf>, exit_on_stdin_close: bool) -> any
                 model::LoadedModel::Kimi(_)
                 | model::LoadedModel::Mla(_)
                 | model::LoadedModel::Gemma4(_)
-                | model::LoadedModel::Glm52(_) => {
+                | model::LoadedModel::Glm52(_)
+                | model::LoadedModel::Encoder(_) => {
                     panic!(
                         "FERROX_KV_BYTE_BUDGET requires a GGUF decoder model \
                          (set FERROX_MODEL_PATH to a generic-decoder .gguf file)"
@@ -4814,7 +4846,7 @@ mod tests {
             paged_kv: None,
             active: std::sync::RwLock::new(Some(Arc::new(ActiveModel {
                 id: None,
-                model: Arc::new(model),
+                loaded: Loaded::Generative(Arc::new(model)),
                 batcher: None,
                 ceiling: None,
             }))),
@@ -5067,7 +5099,7 @@ mod tests {
     fn active_model(state: &AppState, name: &'static str) -> Arc<ActiveModel> {
         Arc::new(ActiveModel {
             id: Some(name.to_string()),
-            model: Arc::new(named_test_model(name, 256)),
+            loaded: Loaded::Generative(Arc::new(named_test_model(name, 256))),
             batcher: None,
             ceiling: None,
         })
@@ -5100,16 +5132,16 @@ mod tests {
         // A request that has begun: it has cloned the handle and is
         // about to decode against it.
         let in_flight = state.active().expect("a model is loaded");
-        assert_eq!(in_flight.model.name(), "model-a");
+        assert_eq!(in_flight.name(), "model-a");
 
         active_model(&state, "model-b");
 
         // The swap is visible to anything that asks *now*...
-        assert_eq!(state.active().unwrap().model.name(), "model-b");
+        assert_eq!(state.active().unwrap().name(), "model-b");
         // ...and completely invisible to the request already running.
-        assert_eq!(in_flight.model.name(), "model-a");
+        assert_eq!(in_flight.name(), "model-a");
         let (_chunks, finish, _usage) = run_generation(
-            &in_flight.model,
+            in_flight.generative().unwrap(),
             "hi",
             &greedy_params(3),
             None,
@@ -5133,12 +5165,12 @@ mod tests {
             ResponseCache::new(4, Duration::from_secs(60)),
         );
         let in_flight = state.active().expect("a model is loaded");
-        let weights = Arc::clone(&in_flight.model);
+        let weights = Arc::clone(in_flight.generative().unwrap());
         assert!(Arc::strong_count(&weights) >= 2);
 
         let previous = state.swap_active(Some(Arc::new(ActiveModel {
             id: Some("model-b".to_string()),
-            model: Arc::new(named_test_model("model-b", 256)),
+            loaded: Loaded::Generative(Arc::new(named_test_model("model-b", 256))),
             batcher: None,
             ceiling: None,
         })));
@@ -6677,6 +6709,122 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK);
         assert_ne!(mean["data"][0]["embedding"], data[0]["embedding"]);
+    }
+
+    /// The same BGE checkpoint as `FERROX_MODEL_PATH` -- the *loaded*
+    /// model, not a side-car.
+    ///
+    /// Four claims, and the third is the one this whole seam exists
+    /// for: the loader routes an encoder-only GGUF away from every
+    /// decoder path, `/v1/embeddings` serves it, `/v1/chat/completions`
+    /// refuses it NAMING IT AS AN EMBEDDING MODEL (before this, the
+    /// same file died in `tokenizer_from_gguf` with a message about
+    /// WordPiece being unreadable -- true, and the wrong thing to send
+    /// a user after), and `/v1/models` says which endpoint it is for so
+    /// a client need not send a request to find out.
+    #[tokio::test]
+    #[ignore = "needs models/bge-small-en-v1.5-q8_0.gguf"]
+    async fn an_encoder_can_be_the_loaded_model() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../models/bge-small-en-v1.5-q8_0.gguf");
+        if !path.exists() {
+            eprintln!("SKIP: {} not present", path.display());
+            return;
+        }
+
+        // Through the real `FERROX_MODEL_PATH` loader, not by
+        // constructing an `EmbeddingModel` directly: the routing
+        // decision is half of what is under test.
+        let loaded = model::load_from_path(path.to_str().unwrap()).expect("load bge as the model");
+        assert!(
+            matches!(loaded, model::LoadedModel::Encoder(_)),
+            "an encoder-only GGUF reached a decoder loader"
+        );
+        let (loaded, batcher, ceiling) = activate_loaded_model(loaded, true, None, None);
+        assert!(
+            matches!(loaded, Loaded::Encoder(_)),
+            "the encoder did not stay an encoder through activation"
+        );
+        assert!(
+            batcher.is_none() && ceiling.is_none(),
+            "an encoder was given a decode batcher or a KV ceiling it has no use for"
+        );
+
+        let state = test_state(
+            test_model_full_byte_vocab(),
+            ResponseCache::new(1000, Duration::from_secs(3600)),
+        );
+        state.swap_active(Some(Arc::new(ActiveModel {
+            id: None,
+            loaded,
+            batcher,
+            ceiling,
+        })));
+        let app = test_app_with_state(Arc::new(state));
+
+        // 1. It embeds.
+        let (status, body) = post_json_uri(
+            &app,
+            "/v1/embeddings",
+            serde_json::json!({ "input": "Hello world" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["model"], "bge-small-en-v1.5");
+        let v = body["data"][0]["embedding"].as_array().unwrap();
+        assert_eq!(v.len(), 384, "the encoder's width, not the decoder's");
+
+        // 2. It refuses to chat, by name.
+        let (status, body) = post_json_uri(
+            &app,
+            "/v1/chat/completions",
+            serde_json::json!({
+                "model": "bge-small-en-v1.5",
+                "messages": [{"role": "user", "content": "hi"}],
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{body}");
+        let msg = body["error"]["message"].as_str().unwrap();
+        for fact in [
+            "bge-small-en-v1.5",
+            "bert",
+            "embedding model",
+            "/v1/embeddings",
+        ] {
+            assert!(msg.contains(fact), "the refusal does not say {fact}: {msg}");
+        }
+
+        // 3. `/v1/models` lists it as what it is.
+        let (status, models) = get_json(&app, ferrox_api::routes::V1_MODELS).await;
+        assert_eq!(status, StatusCode::OK);
+        let entry = &models["data"][0];
+        assert_eq!(entry["id"], "bge-small-en-v1.5");
+        assert_eq!(entry["ferrox_model_kind"], "embedding");
+        assert_eq!(entry["ferrox_tokenizer"], "gguf-wordpiece");
+        assert_eq!(entry["ferrox_n_embd"], 384);
+        assert_eq!(entry["ferrox_pooling"], "CLS");
+        assert_eq!(
+            entry["ferrox_endpoints"],
+            serde_json::json!(["/v1/embeddings"])
+        );
+        // A reasoning-gear field here would be an invented answer about
+        // a template the checkpoint does not have.
+        assert!(entry.get("supported_reasoning_efforts").is_none());
+
+        // 4. `/health` is ready, and says which endpoint is ready.
+        let (status, health) = get_json(&app, ferrox_api::routes::HEALTH).await;
+        assert_eq!(status, StatusCode::OK, "an encoder is a loaded model");
+        assert_eq!(health["model"]["id"], "bge-small-en-v1.5");
+        assert_eq!(health["model"]["synthetic_weights"], false);
+        let weights = health["capabilities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["id"] == ferrox_api::health::capability::REAL_WEIGHTS)
+            .expect("a real-weights capability row");
+        let detail = weights["detail"].as_str().unwrap_or_default();
+        assert!(detail.contains("ENCODER"), "{detail}");
     }
 
     /// The /metrics endpoint must expose the bounded expert cache's
@@ -8563,11 +8711,11 @@ mod tests {
             Arc::new(health::Detection::ready(health::probe_backends())),
         );
         let active = state.active().expect("a freshly built state has a model");
-        assert_eq!(active.model.tokenizer_kind(), "kimi-tiktoken-bpe");
-        assert!(!active.model.is_synthetic());
+        assert_eq!(active.tokenizer_kind(), "kimi-tiktoken-bpe");
+        assert!(!active.is_synthetic());
 
         let (_chunks, finish, _usage) = run_generation(
-            &active.model,
+            active.generative().unwrap(),
             "hi",
             &greedy_params(5),
             None,
@@ -8617,7 +8765,16 @@ mod tests {
                         .expect("test grammar parses"),
                 )
             });
-            run_generation(&active.model, "hi", &params, None, None, None, None, None)
+            run_generation(
+                active.generative().unwrap(),
+                "hi",
+                &params,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
         };
 
         let (chunks, _, _) = run(None).expect("the unconstrained run must serve");
@@ -8672,10 +8829,11 @@ mod tests {
         let pc = Mutex::new(PrefixCache::new(4));
 
         run_generation(
-            &state
+            state
                 .active()
                 .expect("a freshly built state has a model")
-                .model,
+                .generative()
+                .unwrap(),
             "hi",
             &greedy_params(5),
             Some(&kv_pool_config),

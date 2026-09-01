@@ -6006,6 +6006,69 @@ mod tests {
     /// `1/sqrt(head_dim)`, so if setting it does not move the logits
     /// then both sides are ignoring it and the comparison below proves
     /// nothing.
+    /// The Metal attention kernels infer Q/K norm style from the weight
+    /// LENGTH; the host branches on `ModelConfig::qk_norm_style`. Two
+    /// mechanisms for one decision, so they have to agree.
+    ///
+    /// They do, and not by luck: `loader.rs`'s `refined_qk_norm` DERIVES
+    /// the enum from the same length rule, and refuses to load anything
+    /// that matches neither width. This pins that, because the failure
+    /// would be silent and would land on audited architectures --
+    /// OLMoE is whole-vector, Qwen3 and Gemma-3 are per-head, and all
+    /// three are in `AUDITED_GENERIC_GQA`, so an inference that assumed
+    /// one style would answer wrong on the others at full speed.
+    ///
+    /// Raised by the decoration audit as unverifiable from the host
+    /// side, which is exactly why it is written down here rather than
+    /// left as a comment on one of the two sides.
+    #[test]
+    fn the_metal_qk_norm_length_rule_is_the_one_the_loader_derives_the_style_from() {
+        use crate::capability::QkNormStyle;
+        let head_dim = 8usize;
+        let n_heads = 4usize;
+
+        // The rule `ferrox-metal/src/attn.rs` applies, transcribed.
+        let metal_says_per_head = |len: usize| len == head_dim;
+        // The rule `loader.rs::refined_qk_norm` applies, transcribed.
+        let loader_style = |len: usize| -> Option<QkNormStyle> {
+            if len == head_dim {
+                Some(QkNormStyle::PerHead)
+            } else if len == n_heads * head_dim {
+                Some(QkNormStyle::WholeVector)
+            } else {
+                None
+            }
+        };
+
+        for len in [head_dim, n_heads * head_dim] {
+            let style = loader_style(len).expect("both widths load");
+            assert_eq!(
+                metal_says_per_head(len),
+                style == QkNormStyle::PerHead,
+                "length {len} loads as {style:?} but Metal would infer the other style"
+            );
+        }
+
+        // A width neither side handles must be refused at load rather
+        // than reaching a kernel that would pick a branch anyway.
+        assert!(
+            loader_style(head_dim + 1).is_none(),
+            "an unrecognised norm width must be a load error, not a coin flip"
+        );
+
+        // The one ambiguous case, and it is harmless: with a single
+        // head the two widths coincide, so both rules take their PerHead
+        // branch and per-head RMS over one head IS whole-vector RMS.
+        let single_head = |len: usize| len == head_dim;
+        assert!(single_head(head_dim));
+        assert_eq!(
+            loader_style(head_dim),
+            Some(QkNormStyle::PerHead),
+            "with n_heads == 1 both widths are head_dim, and both sides must land \
+             on the same branch rather than one falling through"
+        );
+    }
+
     #[test]
     fn the_batched_path_applies_attention_scale_like_the_contiguous_one() {
         let vocab = 8;

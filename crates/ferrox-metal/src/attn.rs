@@ -4053,6 +4053,16 @@ fn encode_attn_extras_batch(
             )?;
         }
     }
+    // Q/K norm style is inferred from the weight LENGTH, and that is
+    // sound rather than a guess: `loader.rs`'s `refined_qk_norm` derives
+    // `ModelConfig::qk_norm_style` from exactly this rule
+    // (`len == head_dim` is PerHead, `len == n_heads * head_dim` is
+    // WholeVector, anything else is a load error), so the host enum and
+    // this length check cannot disagree about a checkpoint that loaded.
+    // `AttnExtras` therefore does not carry the discriminator.
+    //
+    // The two rules agreeing is pinned host-side by
+    // `the_metal_qk_norm_length_rule_is_the_one_the_loader_derives_the_style_from`.
     if let (Some(w), Some(wb)) = (extras.q_norm, resident.q_norm.as_ref()) {
         if w.len() == head_dim {
             encode_rms_norm_per_head_batch(

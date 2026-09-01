@@ -923,21 +923,6 @@ const NEOX_ROPE_TRIAGED: &[(&str, TriageClass, &str)] = &[
          right outcome and not a small fix",
     ),
     (
-        "minicpm3",
-        TriageClass::NewCode,
-        "MiniCPM3 is an MLA model on ferrox's generic-GQA row, and both halves of that are \
-         wrong. src/models/minicpm3.cpp:5-6 requires q_lora_rank and kv_lora_rank and \
-         :41-46 creates `attn_q_a`/`attn_q_b`/`attn_kv_a_mqa`/`attn_kv_b` with \
-         `attn_q_a_norm`/`attn_kv_a_norm` -- the DeepSeek-2 tensor set, which needs the MLA \
-         engine, not `attn_q.weight`. It ALSO hardcodes MiniCPM's multipliers with no key to \
-         read them from: scale_embd = 12.0f, scale_depth = 1.4f and n_embd_base = 256 at \
-         :65-67, applied at :81, which is the blind spot `minicpm` is already refused for. \
-         SEPARATELY, and worth fixing when someone touches this row: the catalog gives \
-         minicpm3 `DecoderFamily::StandardGqa` and `MemoryKind::KvGqa`, which is simply not \
-         what it is; it belongs beside `deepseek2` as DedicatedOnly/Mla. It fails closed \
-         today only because the generic loader cannot find `blk.0.attn_q.weight`",
-    ),
-    (
         "openelm",
         TriageClass::NewCode,
         "per-LAYER head counts and FFN width. src/models/openelm.cpp:26-28 reads \
@@ -1454,6 +1439,38 @@ pub fn architecture_catalog() -> &'static [ArchProfile] {
             // applied to every head". M2 and M3 DIFFER here, which is why
             // the shared entry was wrong for M3.
             PerHead,
+        ));
+        // MiniCPM3 is MLA, not generic GQA, and the catalog said
+        // otherwise: it claimed `StandardGqa`/`KvGqa`, which is false
+        // about the model rather than merely unaudited.
+        // `src/models/minicpm3.cpp:5-6` requires `q_lora_rank` and
+        // `kv_lora_rank`, and `:41-46` creates
+        // `attn_q_a`/`attn_q_b`/`attn_kv_a_mqa`/`attn_kv_b` -- the
+        // DeepSeek-2 tensor set. There is no `attn_q.weight` in any
+        // MiniCPM3 checkpoint, so the generic path could never have
+        // loaded one whatever the audit said.
+        //
+        // Reclassified 2026-09-01 by the unaudited-refusal triage. This
+        // is a MESSAGE-QUALITY fix, not a correctness one: the old
+        // failure was already a clean missing-tensor error. It stops the
+        // user being told "unaudited" for something that is not merely
+        // unaudited.
+        v.push(prof(
+            "minicpm3",
+            TextGeneration,
+            Mla,
+            KvMla,
+            Neox,
+            ArchPath::DedicatedOnly {
+                reason: "MiniCPM3 is an MLA model (src/models/minicpm3.cpp:5-6,41-46 -- \
+                         q_lora_rank/kv_lora_rank and the attn_q_a/attn_q_b/attn_kv_a_mqa/\
+                         attn_kv_b tensor set), so it needs the MLA engine and not the \
+                         generic GQA decoder. It ALSO hardcodes MiniCPM's multipliers with \
+                         no GGUF key to read them from -- scale_embd = 12.0, \
+                         scale_depth = 1.4, n_embd_base = 256 at :65-67, applied at :81 -- \
+                         which is the same blind spot `minicpm` is refused for",
+            },
+            WholeVector,
         ));
         v.push(prof(
             "deepseek2",
@@ -2206,8 +2223,10 @@ mod audit_tests {
             }
         }
         assert!(
-            seen == 47,
-            "every unaudited generic architecture is triaged; found {seen}"
+            seen == 46,
+            "every unaudited generic architecture is triaged; found {seen}. \
+             It was 47 until the triage found `minicpm3` was an MLA model on the \
+             generic-GQA row and it moved to DedicatedOnly"
         );
     }
 

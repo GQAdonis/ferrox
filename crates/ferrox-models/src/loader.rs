@@ -96,7 +96,20 @@ pub enum LoadError {
 /// (`LLM_ARCH_DEEPSEEK2`, `LLM_ARCH_GLM4_MOE` cases), to default to
 /// sigmoid MoE gating with post-selection renormalization rather than
 /// softmax. See docs/MODELS.md for the citations behind this list.
-const SIGMOID_GATING_ARCHITECTURES: &[&str] = &["deepseek2", "glm4moe"];
+/// `afmoe`, `laguna` and `step35` added 2026-09-01 by the
+/// unaudited-refusal triage's gating sweep. Each reads
+/// `LLM_KV_EXPERT_GATING_FUNC` as OPTIONAL and then, when the key is
+/// absent, sets `LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID`
+/// (`afmoe.cpp:29-30`, `laguna.cpp:55-56`, `step35.cpp:19-20`). Ferrox
+/// fell back to softmax for all three.
+///
+/// This is the `deepseek` shape a third, fourth and fifth time: a
+/// default that is right for most architectures and silently wrong for
+/// one, where the GGUF carries no key to correct it. Nothing is live
+/// today -- all three are `NewCode` for other reasons and refuse before
+/// reaching here -- but the list is what a later admission would trust.
+const SIGMOID_GATING_ARCHITECTURES: &[&str] =
+    &["afmoe", "deepseek2", "glm4moe", "laguna", "step35"];
 
 /// Architecture-family names whose real reference implementation skips
 /// renormalizing top-k softmax routing weights after selection (GGUF
@@ -2547,6 +2560,34 @@ mod tests {
         // answer from the file.
         assert!(!NO_TOPK_RENORMALIZE_ARCHITECTURES.contains(&"deepseek2"));
         assert!(!NO_TOPK_RENORMALIZE_ARCHITECTURES.contains(&"qwen3moe"));
+    }
+
+    /// Every architecture llama.cpp defaults to SIGMOID gating must be
+    /// on the list, because for these the GGUF carries no key to say so.
+    ///
+    /// Each of these reads `LLM_KV_EXPERT_GATING_FUNC` as optional and
+    /// then sets SIGMOID when it is absent, so a converted checkpoint
+    /// has nothing in it that would correct ferrox's softmax default.
+    /// Same shape as the `deepseek` top-k renormalisation bug, and as
+    /// `phi3`'s sliding window: the file is silent and the architecture
+    /// decides.
+    #[test]
+    fn the_architectures_llama_cpp_defaults_to_sigmoid_gating_are_pinned() {
+        for arch in ["afmoe", "deepseek2", "glm4moe", "laguna", "step35"] {
+            assert!(
+                SIGMOID_GATING_ARCHITECTURES.contains(&arch),
+                "{arch} sets SIGMOID when the gating key is absent"
+            );
+        }
+        // Architectures that HARDCODE softmax must stay off it, or the
+        // fix becomes the opposite bug: `ernie4-5-moe.cpp:90` and
+        // `qwen3moe` both gate with softmax unconditionally.
+        for softmax in ["ernie4_5-moe", "qwen3moe", "olmoe", "llama"] {
+            assert!(
+                !SIGMOID_GATING_ARCHITECTURES.contains(&softmax),
+                "{softmax} does not default to sigmoid"
+            );
+        }
     }
 
     fn config_for_arch(arch: &'static str) -> Result<ModelConfig, LoadError> {

@@ -61,10 +61,12 @@ fn every_unaudited_architecture_renders_a_detail_line() {
         assert!(detail.len() > 100, "`{}` renders {detail:?}", p.gguf_name);
     }
     assert_eq!(
-        n, 47,
-        "the unaudited count moved; docs/plans/llama-cpp-gap-inventory.md §1.2 says 47. \
-         Either an architecture was audited (good — update the count and the docs) or one \
-         was added (check it was triaged)"
+        n, 46,
+        "the unaudited count moved. It was 47 until the triage itself found `minicpm3` was \
+         an MLA model sitting on the generic-GQA row and it was reclassified to \
+         DedicatedOnly — which is the count going DOWN for the right reason. Either an \
+         architecture was audited or reclassified (good — update the count and the docs) or \
+         one was added (check it was triaged)"
     );
 }
 
@@ -273,7 +275,37 @@ fn the_remaining_work_is_counted() {
         .iter()
         .filter(|p| p.triage.is_some())
         .count();
-    assert_eq!(triaged + TRIAGE_PENDING.len(), 47);
+    assert_eq!(triaged + TRIAGE_PENDING.len(), 46);
+}
+
+/// `minicpm3` is refused as an MLA model, not as an unaudited one.
+///
+/// The triage found the catalog claimed `StandardGqa`/`KvGqa` for a
+/// model whose every checkpoint carries `attn_q_a`/`attn_kv_a_mqa` and
+/// no `attn_q.weight` (`src/models/minicpm3.cpp:41-46`), so the generic
+/// path could never have loaded one. Being told "unaudited" for that is
+/// telling the user the wrong thing about their model.
+///
+/// A message-quality fix rather than a correctness one -- the old
+/// failure was already a clean missing-tensor error -- which is why the
+/// reason has to name BOTH blockers, the MLA tensor set and the
+/// hardcoded MiniCPM multipliers.
+#[test]
+fn minicpm3_is_refused_as_mla_not_as_unaudited() {
+    assert!(
+        unaudited_triage("minicpm3").is_none(),
+        "minicpm3 left the unaudited generic set"
+    );
+    match ferrox_models::capability::resolve_architecture("minicpm3") {
+        Some(ArchPath::DedicatedOnly { reason }) => {
+            assert!(reason.contains("MLA"), "{reason}");
+            assert!(
+                reason.contains("scale_depth"),
+                "the multipliers are the second blocker and must be named: {reason}"
+            );
+        }
+        other => panic!("minicpm3 must be DedicatedOnly, got {other:?}"),
+    }
 }
 
 /// The untriaged message still works, and still claims no class.
@@ -318,7 +350,12 @@ fn batch_two_verdicts_are_pinned_to_what_was_read() {
             "router reads a DIFFERENT tensor",
         ),
         ("bitnet", TriageClass::NewCode, "attn_sub_norm"),
-        ("minicpm3", TriageClass::NewCode, "MLA model"),
+        // `minicpm3` was HERE, and the triage that produced this list
+        // is what removed it: reading `minicpm3.cpp:5-6,41-46` showed an
+        // MLA tensor set on a row the catalog called `StandardGqa`, so
+        // it moved to `DedicatedOnly` rather than staying an unaudited
+        // generic architecture. Its refusal is now asserted by
+        // `minicpm3_is_refused_as_mla_not_as_unaudited` below.
         ("openelm", TriageClass::NewCode, "per-LAYER head counts"),
         ("arcee", TriageClass::NewCode, "UNGATED ReLU-squared"),
         ("plm", TriageClass::NewCode, "UNGATED ReLU-squared"),
@@ -586,7 +623,7 @@ fn exaone_moe_records_the_swa_sweep_as_clean() {
 /// honest answer to "how far is ferrox from llama.cpp on models", and it
 /// is the number this whole item existed to produce.
 #[test]
-fn all_forty_seven_are_triaged_and_the_distribution_is_pinned() {
+fn every_unaudited_row_is_triaged_and_the_distribution_is_pinned() {
     let mut fixture = 0;
     let mut arm = 0;
     let mut new_code = 0;
@@ -604,9 +641,9 @@ fn all_forty_seven_are_triaged_and_the_distribution_is_pinned() {
     }
     assert_eq!(
         (fixture, arm, new_code, unknown),
-        (9, 7, 27, 4),
+        (9, 7, 26, 4),
         "the triage distribution moved; if a verdict changed on evidence that is correct, \
          update this and docs/MODELS.md together"
     );
-    assert_eq!(fixture + arm + new_code + unknown, 47);
+    assert_eq!(fixture + arm + new_code + unknown, 46);
 }

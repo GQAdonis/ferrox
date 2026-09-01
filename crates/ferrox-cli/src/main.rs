@@ -1439,8 +1439,7 @@ fn main() -> anyhow::Result<()> {
                 top_k,
                 repetition_penalty,
                 penalty_last_n: 64,
-                presence_penalty: 0.0,
-                frequency_penalty: 0.0,
+                ..Default::default()
             };
 
             println!("Generating (max {max_new_tokens} new tokens)...");

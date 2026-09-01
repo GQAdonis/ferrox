@@ -70,6 +70,16 @@ pub struct InferArgs {
     #[arg(long = "top-p", default_value_t = 0.95)]
     pub top_p: f32,
 
+    /// Min-p sampling: drop every candidate less than this fraction as
+    /// likely as the most likely one (`0.0` = disabled).
+    ///
+    /// llama.cpp's `--min-p`, and its default is **0.05**, not off
+    /// (`common/common.h:231`, `common/arg.cpp:1987`). ferrox had no
+    /// min-p at all, so it could not reproduce llama.cpp's own
+    /// out-of-the-box output for any prompt.
+    #[arg(long = "min-p", default_value_t = 0.05)]
+    pub min_p: f32,
+
     /// How many recent tokens the penalties consider (`0` = off).
     ///
     /// llama.cpp's `--repeat-last-n`, default 64
@@ -157,6 +167,29 @@ pub struct InferArgs {
     /// Non-f16 paths warn and fall back to f16 until Metal kernels land.
     #[arg(long = "ctk", value_name = "TYPE", default_value = "f16")]
     pub ctk: String,
+}
+
+impl InferArgs {
+    /// The sampler these flags describe.
+    ///
+    /// One function rather than one copy per generation path. There were
+    /// four identical literals here (the dense path, the engine path and
+    /// two chat paths), which is the shape `CLAUDE.md` names as this
+    /// repo's most expensive failure: adding `--min-p` meant editing
+    /// four places, and a sampler added to three of them would be
+    /// silently absent from the fourth with every test still green.
+    pub fn sampling(&self) -> SamplingParams {
+        SamplingParams {
+            temperature: self.temperature,
+            top_p: self.top_p,
+            min_p: self.min_p,
+            top_k: self.top_k,
+            repetition_penalty: self.repeat_penalty,
+            penalty_last_n: self.repeat_last_n,
+            presence_penalty: 0.0,
+            frequency_penalty: 0.0,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -915,15 +948,7 @@ pub fn run_infer(args: InferArgs) -> anyhow::Result<()> {
         (args.n_predict as usize).min(room)
     };
 
-    let sampling = SamplingParams {
-        temperature: args.temperature,
-        top_p: args.top_p,
-        top_k: args.top_k,
-        repetition_penalty: args.repeat_penalty,
-        penalty_last_n: args.repeat_last_n,
-        presence_penalty: 0.0,
-        frequency_penalty: 0.0,
-    };
+    let sampling = args.sampling();
     let seed = seed_from_args(args.seed);
     let mut sampler = Sampler::new(seed);
 
@@ -1061,15 +1086,7 @@ fn run_mla_infer(args: InferArgs, path: &Path, file: &ShardedGguf) -> anyhow::Re
         (args.n_predict as usize).min(room)
     };
 
-    let sampling = SamplingParams {
-        temperature: args.temperature,
-        top_p: args.top_p,
-        top_k: args.top_k,
-        repetition_penalty: args.repeat_penalty,
-        penalty_last_n: args.repeat_last_n,
-        presence_penalty: 0.0,
-        frequency_penalty: 0.0,
-    };
+    let sampling = args.sampling();
     let mut sampler = Sampler::new(seed_from_args(args.seed));
     let mut state = Engine::new_state(&engine);
 
@@ -1188,15 +1205,7 @@ fn run_gemma4_infer(args: InferArgs, path: &Path, file: &ShardedGguf) -> anyhow:
         (args.n_predict as usize).min(room)
     };
 
-    let sampling = SamplingParams {
-        temperature: args.temperature,
-        top_p: args.top_p,
-        top_k: args.top_k,
-        repetition_penalty: args.repeat_penalty,
-        penalty_last_n: args.repeat_last_n,
-        presence_penalty: 0.0,
-        frequency_penalty: 0.0,
-    };
+    let sampling = args.sampling();
     let mut sampler = Sampler::new(seed_from_args(args.seed));
     let mut state = Engine::new_state(&engine);
 
@@ -1314,15 +1323,7 @@ fn run_glm52_infer(args: InferArgs, path: &Path, file: &ShardedGguf) -> anyhow::
         (args.n_predict as usize).min(room)
     };
 
-    let sampling = SamplingParams {
-        temperature: args.temperature,
-        top_p: args.top_p,
-        top_k: args.top_k,
-        repetition_penalty: args.repeat_penalty,
-        penalty_last_n: args.repeat_last_n,
-        presence_penalty: 0.0,
-        frequency_penalty: 0.0,
-    };
+    let sampling = args.sampling();
     let mut sampler = Sampler::new(seed_from_args(args.seed));
     let mut state = Engine::new_state(&engine);
 

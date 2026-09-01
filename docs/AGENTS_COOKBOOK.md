@@ -57,12 +57,14 @@ request holding a copy:
 
 ```bash
 FERROX_PAGED_KV_BLOCKS=4096 FERROX_PAGED_KV_BLOCK_SIZE=16 \
-  ./target/release/ferrox-server -m model.gguf -dev none -ngl 0
+  ./target/release/ferrox-server -m model.gguf -dev metal -ngl all
 ```
 
 `usage.cached_tokens` on each response says how much of that prompt was
-already computed. **CPU only**: the paged attention path returns wrong
-tokens on Metal and CUDA, and `-dev none -ngl 0` is what keeps you off
-it. See [CONFIG.md](CONFIG.md).
+already computed. This used to be refused on a GPU backend, because a
+Metal prefill left K/V on the device and the paged prefill copied host
+placeholders into the page store. Fixed, and pinned on hardware by
+`paged_metal_parity`, so Metal is supported. CUDA has no equivalent
+hardware run behind it. See [CONFIG.md](CONFIG.md).
 
 Full API matrix: [API.md](API.md).

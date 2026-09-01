@@ -32,9 +32,18 @@ is faster.
   wrap. Dense only: the MoE router is ported and tested
   (`ferrox_moe::route_gemma4_moe`) but the loader still expects
   `ffn_gate.weight`, so a MoE Gemma-4 GGUF does not load yet.
-- **MiniMax-M3**: the block-sparse block selection is ported and tested
-  (`ferrox_core::block_sparse`). The engine itself stops with an error:
-  no loader, no 256-expert sigmoid MoE, no MTP draft heads.
+- **MiniMax**, and the two architectures are not one thing.
+  `minimax-m2` builds ordinary dense GQA with whole-vector Q/K norm,
+  partial NEOX RoPE and a sigmoid MoE with router bias, every one of
+  which the generic path implements: it is **unaudited, not
+  unimplemented**, and what it needs is a fixture. `minimax-m3` is
+  genuinely unimplemented, and the blocker is MiniMax Sparse Attention:
+  a per-layer indexer driving its own KV cache with position-to-cell
+  maps, plus `SWIGLU_OAI` and shared experts. The block-sparse block
+  selection (`ferrox_core::block_sparse`) is the smallest piece of that
+  and is the only piece ported. Neither is blocked on MTP draft heads,
+  which no MiniMax GGUF can carry: `gguf-py`'s tensor lists for both
+  have no `NEXTN_*` entry, so the writer physically cannot emit one.
 - **Also loadable**: yi, qwen2moe / qwen3moe (MiroThinker GGUFs, for
   example), Gemma-2, Phi-3, Llama-3.1, and GLM4 when the tensors are
   there. None of these are in the published suite.
@@ -68,7 +77,19 @@ Full matrix: [`MODELS.md`](MODELS.md) ·
 |---|---|
 | **CPU** | Dense and MoE. int8×int8 matvec on by default (`FERROX_CPU_INT_DOT=0` opts out), interleaved Q4_Kx8 / Q8_0x4 GEMV, Q8_0x4 batch GEMM for prefill, Q5/Q6 int-dot, pool sized to performance cores |
 | **Metal** | FA-vec attention (decode d=64/96/128/256, prefill d=128/256), concurrent FFN/QKV encode, MoE Concurrent with fused groups, `MemRanges`, `mul_mm_id` prefill, quantized KV (`q8_0` / `turbo8` / `fp8` / `turbo4`) |
-| **CUDA** | Matvec, resident weights, FFN fuse (`--features cuda`) |
+| **CUDA** | Matvec, resident weights, FFN fuse (`--features cuda`), plus a batched `Q8_0`/`Q4_0` GEMM that **has never executed on a GPU** |
+
+**The CUDA GEMM is unrun, and that is not a formality.** It is wired
+into a wide prefill and it decides nothing about performance here,
+because nobody has put it on a card. What it does have is a
+thread-by-thread scalar twin held against `ferrox-quant`'s independent
+dequantize-then-GEMM, and a host harness that compiles and *executes*
+the emitted CUDA C against a barrier shim
+(`crates/ferrox-cuda/tools/mul_mm_host_check/run.sh`) with zero
+mismatches on both kinds. Its hardware test is `#[ignore]`d with "NEVER
+RUN" as the reason, and NVRTC is not clang, so "it compiles here" is not
+"NVRTC accepts it". Below the width threshold a single token stays on
+the matvec kernels, which are the arm that *has* run on a GPU.
 
 **CUDA compiles and runs, and nobody has benchmarked it.** Every number
 in this repo was taken on CPU or Apple Metal. GPU acceleration on
@@ -83,6 +104,15 @@ with a reason string, instead of quietly greying a control out.
 llama.cpp-style completion flags (`-m`, `-p`, `-n`, `-ngl`, `--ctk`, …),
 plus `ferrox chat`, `ferrox pull` (Hugging Face Hub), `inspect`, `archs`,
 and `presets`. See [`CLI.md`](CLI.md).
+
+The sampler flags carry llama.cpp's own defaults on `--temp` (0.8),
+`--top-k` (40), `--top-p` (0.95), `--min-p` (0.05) and `--repeat-last-n`
+(64). **One default still differs on purpose**: `--repeat-penalty` is
+1.1 here and 1.0 (off) in llama.cpp
+(`common/common.h:239`), so a run left entirely to defaults is not
+token-identical. `-e`/`--escape` is on by default as it is there, and a
+*partial* `-ngl N` is refused rather than silently offloading every
+layer.
 
 `ferrox bench -m model.gguf` works like `llama-bench`: the same `pp512`
 and `tg128` workloads, reported as a median with a population stddev.
@@ -117,7 +147,17 @@ OpenAI-compatible HTTP API:
 - `POST /v1/responses`, the surface `codex` speaks, streaming and
   buffered. This server keeps no responses, so the two lookups by
   response id answer 404
-- Presence and frequency penalties, best-effort `json_object`
+- Sampling matched to llama.cpp's own chain: `temperature`, `top_p`,
+  `top_k`, `min_p`, `repetition_penalty` over a 64-token penalty window,
+  presence and frequency penalties. Temperature runs **last**, after the
+  truncation filters, as llama.cpp orders it, and the repetition penalty
+  is applied once per candidate rather than once per occurrence. Both
+  routes read the same knobs through one `SamplingKnobs::resolve`
+- Grammar-constrained decoding: llama.cpp's own `grammar` field, a GBNF
+  string enforced on every token by a stack machine, on chat and
+  completions and on all three decode paths. `response_format:
+  json_object` is still the best-effort character mask, and the two
+  compose
 - Continuous batching and chunked prefill
 - Paged KV: shared page storage many requests read through a block
   table, with a radix tree over reference-counted page groups so

@@ -487,7 +487,6 @@ pub fn quant_kind_for(dtype: GgmlType) -> Option<QuantKind> {
     }
 }
 
-/// Which quant kinds have a **CUDA matvec** kernel.
 /// Which quant kinds have a **CUDA batched GEMM** (`mul_mm`), the
 /// prefill path.
 ///
@@ -514,6 +513,12 @@ pub fn cuda_mul_mm_kind_supported(kind: QuantKind) -> bool {
     matches!(kind, QuantKind::Q8_0 | QuantKind::Q4_0)
 }
 
+/// Which quant kinds have a **CUDA matvec** kernel, the decode path.
+///
+/// Wider than [`cuda_mul_mm_kind_supported`], and this is the arm that
+/// has actually run on a GPU. This doc line was orphaned onto the GEMM
+/// predicate when that one was inserted above it, leaving the matvec
+/// list undocumented and the GEMM list described as the matvec list.
 pub fn cuda_matvec_kind_supported(kind: QuantKind) -> bool {
     matches!(
         kind,
@@ -2042,13 +2047,18 @@ impl WeightMatrix {
             }
         }
 
-        // CUDA has no batched GEMM yet, but `apply` does dispatch a real
-        // CUDA matvec per position. Without this arm a batched prefill
-        // fell through to the CPU branch below and never touched the
-        // GPU at all -- measured on an RTX 4090, SmolLM2 `pp512` ran at
-        // 28 tok/s against llama.cpp's 57466. Per-position matvec is
-        // still the wrong shape (see ROADMAP: CUDA needs `mul_mm`), but
-        // it is the GPU rather than 26 idle SMs.
+        // CUDA now has a batched GEMM for Q8_0 and Q4_0 only
+        // (`cuda_mul_mm_kind_supported`), and it has NEVER RUN ON A GPU.
+        // Every other kind still takes the per-position matvec loop
+        // below, which is the arm that has.
+        //
+        // That loop is why this arm exists at all: without it a batched
+        // prefill fell through to the CPU branch and never touched the
+        // GPU -- measured on an RTX 4090, SmolLM2 `pp512` ran at 28
+        // tok/s against llama.cpp's 57466. Per-position matvec is still
+        // the wrong shape for a wide prefill, but it is the GPU rather
+        // than 26 idle SMs, and the fallback now records a
+        // `GEMM_PREFILL` miss instead of degrading silently.
         #[cfg(feature = "cuda")]
         {
             // The batched GEMM first, when the kind has one and the
@@ -4623,10 +4633,17 @@ mod tests {
         assert!(report.violations.is_empty(), "{}", report.render());
     }
 
-    /// CUDA has matvec kernels and no batched GEMM, so a CUDA prefill is
-    /// a per-position matvec loop. That is a real, known slow path and
-    /// the registry must say so by name rather than leave it to a
-    /// comment in `apply_batch_with_acts`.
+    /// For a kind with **no** CUDA batched GEMM, a CUDA prefill is a
+    /// per-position matvec loop. That is a real, known slow path and the
+    /// registry must say so by name rather than leave it to a comment in
+    /// `apply_batch_with_acts`.
+    ///
+    /// `Q4K` is deliberate here rather than incidental: it is on
+    /// [`cuda_matvec_kind_supported`] and off
+    /// [`cuda_mul_mm_kind_supported`], which is exactly the case this
+    /// test is about. The two lists stopped being the same set on
+    /// 2026-09-01, when Q8_0 and Q4_0 gained a GEMM, so probing one of
+    /// those two here would assert the opposite of what it looks like.
     #[test]
     fn cuda_prefill_is_recorded_as_a_per_position_matvec_loop() {
         use crate::kernel_registry::{op, Backend, Outcome};

@@ -70,6 +70,12 @@ attention and expert routing are all implemented here.
   survive a dropped connection, Anthropic and Responses endpoints beside
   the OpenAI ones, and an `/admin` control surface. Point your existing
   client at it.
+- **Grammar-constrained decoding, and a sampler that matches
+  llama.cpp's.** `grammar` takes llama.cpp's own GBNF and is enforced on
+  every token by a stack machine, not by masking characters, so it knows
+  whether a `}` closes an object that was opened. The sampler chain runs
+  in llama.cpp's order with `min_p` and a 64-token penalty window, so
+  the flags you already know produce the distribution you expect.
 - **Speculative decoding that stays lossless** at any temperature, not
   only at `--temp 0`, using the speculative-sampling rejection rule.
   Acceptance length and the per-position accept rate are reported, so a
@@ -96,7 +102,7 @@ curl -fsSL https://raw.githubusercontent.com/antonellof/ferrox/main/scripts/inst
 ```
 
 Installs `ferrox` and `ferrox-server` into `~/.local/bin` (override with
-`FERROX_INSTALL_DIR`, pin with `FERROX_VERSION=v0.13.3`). The downloaded
+`FERROX_INSTALL_DIR`, pin with `FERROX_VERSION=v0.14.0`). The downloaded
 `ferrox` is built with `serve`, so one binary runs completions and
 serves the API. `ferrox-server` ships alongside it so an existing one on
 your PATH keeps working. Prebuilts are macOS arm64 with Metal and Linux
@@ -162,7 +168,7 @@ belongs to an unrelated crate.
 
 ```toml
 [dependencies]
-ferrox-inference = "0.13"
+ferrox-inference = "0.14"
 ```
 
 ```rust

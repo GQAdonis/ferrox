@@ -1,6 +1,6 @@
 ---
 name: "north star: the Rust alternative to llama.cpp"
-overview: "THE GOAL, stated once so every other plan can be ranked against it: Ferrox should be what somebody reaches for INSTEAD OF llama.cpp. Same models, same command shapes, same or better performance, on the hardware people actually own. That is a bigger claim than 'a fast Rust inference engine' and it sets a bar that is checkable rather than aspirational: for any GGUF a user can run under llama.cpp, ferrox should run it, produce the same tokens, and not be slower. WHERE THE PROJECT ACTUALLY IS, counted rather than estimated: llama.cpp hand-writes 140 per-architecture graphs in `src/models/*.cpp`. Ferrox has 47 dedicated paths, 32 architectures it honestly refuses, and 68 mapped onto ONE shared generic GQA path. On 2026-08-27 five of those 68 (`gpt2`, `mpt`, `refact`, `bloom`, `jais`) were found computing ALiBi and learned absolute position embeddings as though they were NEOX RoPE, so 63 remain unaudited. On speed: Metal is at or past parity (every dense pp512 row 0.98x-1.10x, 8 of 12 tg128 rows FASTER than llama.cpp), and CPU is not (all 16 comparable rows red, 1.41x to 5.06x). THE SEQUENCING ARGUMENT: 'same models as llama.cpp' is 140 architectures and years of work. The wedge that gets there while being useful the whole way is RECENT BIG MODELS ON CONSUMER HARDWARE, including models too big for the machine's memory, because that is where llama.cpp is weakest and where a new engine can be chosen on merit rather than on being a rewrite. This plan ranks the other plans. It contains no engineering."
+overview: "THE GOAL, stated once so every other plan can be ranked against it: Ferrox should be what somebody reaches for INSTEAD OF llama.cpp. Same models, same command shapes, same or better performance, on the hardware people actually own. That is a bigger claim than 'a fast Rust inference engine' and it sets a bar that is checkable rather than aspirational: for any GGUF a user can run under llama.cpp, ferrox should run it, produce the same tokens, and not be slower. WHERE THE PROJECT ACTUALLY IS, counted rather than estimated: llama.cpp hand-writes 140 per-architecture graphs in `src/models/*.cpp`. Ferrox has 150 catalog rows: 57 on ONE shared generic GQA path, 58 dedicated, 32 deferred, 3 test fixtures. RE-COUNTED 2026-09-01: only 11 of the 57 are AUDITED and run; the other 46 REFUSE, because the generic path was made opt-in. Four dedicated engines (Mla, Glm52, Kimi, Gemma4) load with no cross-engine evidence. The five strings found computing ALiBi and learned absolute position embeddings as though they were NEOX RoPE (`gpt2`, `mpt`, `refact`, `bloom`, `jais`) are refusals now, so the loads-and-is-WRONG class is CLOSED. On speed: Metal is at or past parity (every dense pp512 row 0.98x-1.10x, 8 of 12 tg128 rows FASTER than llama.cpp), and CPU is not (all 16 comparable rows red, 1.41x to 5.06x). THE SEQUENCING ARGUMENT: 'same models as llama.cpp' is 140 architectures and years of work. The wedge that gets there while being useful the whole way is RECENT BIG MODELS ON CONSUMER HARDWARE, including models too big for the machine's memory, because that is where llama.cpp is weakest and where a new engine can be chosen on merit rather than on being a rewrite. This plan ranks the other plans. It contains no engineering."
 todos:
   - id: the-bar
     content: "NOT A TASK, the definition of done for the whole project, written so it can be argued with. Ferrox reaches parity when, for a GGUF a user can run under llama.cpp: (1) it LOADS, or refuses with a sentence naming exactly what is missing, and never loads-and-computes-something-else; (2) it produces the SAME TOKENS at temperature 0, checked against llama.cpp's own logits rather than against a golden file this project wrote; (3) it is NOT SLOWER on the same host, file and backend; (4) the COMMAND a user already knows works, or the difference is documented. Item (2) is the one that cannot be faked and the one this project already has the tool for: `ferrox parity` with `tools/llama_logits.c`. Item (1) is where ferrox currently differs most from llama.cpp, and deliberately so: llama.cpp will often run something approximately, this project's standing rule is to refuse. That rule stays. A refusal is a gap, not a defect."
@@ -9,7 +9,7 @@ todos:
     content: "TIER 1, and it gates every other model item, which is why it is first. `crates/ferrox-models/src/decoder.rs` is 6438 LINES and holds the generic path plus per-architecture branching. Adding a model means editing it, and reviewing a model change means reading it. llama.cpp adds a model as ONE SMALL FILE in `src/models/`, which is why it has 140 of them and ferrox has 47. This is not a style preference, it is the reason the counts differ. Evidence it already costs correctness: wave 0 found FIVE model features (`attention_scale`, `post_attn_norm`, `post_ffn_norm`, gpt-oss `o_bias`, `gpt_oss_ffn`) that the paged decode loop had LOST by being a copy of the contiguous one, three of them wrong on CPU too. A copy-per-path structure loses features one at a time and nothing notices. See `model-registry-reorg.md` for the design. DONE MEANS: adding an architecture is a new file, a trait impl, a registry line, a fixture and a parity test, with no edit to a shared multi-thousand-line file."
     status: pending
   - id: t1-close-the-68
-    content: "TIER 1. 68 architectures share one generic GQA path against llama.cpp's 68 bespoke graphs, and five were already found silently wrong. THE CHEAP FIX FIRST, because it is worth more than the audit and takes a fraction of the time: make the generic path OPT-IN. Today an unrecognised architecture FALLS ONTO generic GQA and runs; it should have to ASSERT that it really is plain GQA. That inversion converts 63 unaudited architectures from 'silently wrong' into 'honestly refused', which is this project's stated rule everywhere else, and it makes the remaining work visible instead of hypothetical. THEN audit outward from what people run: `qwen3moe`, `glm4moe`, `deepseek2` (MLA), `minimax`, `gemma3`/`gemma4`, `dots1`, `olmoe`, before the 2023 tail. Note that the tail IS in scope under this goal, unlike under a purely edge-focused one: 'same models as llama.cpp' includes `bloom` and `gpt2`. It is last, not excluded."
+    content: "TIER 1. 57 architectures share one generic GQA path against llama.cpp's bespoke graphs, and five were found silently wrong. TWO STEPS ARE DONE. (1) THE CHEAP FIX: the generic path is now OPT-IN. An architecture not on `capability::AUDITED_GENERIC_GQA` returns `LoadError::UnauditedArchitecture` rather than falling onto generic GQA and running, which converted the unaudited set from 'silently wrong' into 'honestly refused'. (2) THE TRIAGE, landed 2026-09-01: all 46 refusals are classified fixture-away (9) / one-match-arm (7) / new-code (26) / unknown (4), each naming the `llama.cpp/src/models/*.cpp` line that decides it, pinned by `tests/unaudited_triage.rs`. That triage IS the work queue. WHAT REMAINS: execute it, auditing outward from what people run: `qwen3moe` (done, fixture-pinned), `glm4moe`, `deepseek2` (MLA), `minimax-m2` (fixture-away), `gemma4`, before the 2023 tail. The tail IS in scope under this goal, unlike under a purely edge-focused one: 'same models as llama.cpp' includes `bloom` and `gpt2`. It is last, not excluded."
     status: pending
   - id: t1-out-of-core-execution
     content: "TIER 1, and the strongest single reason to choose ferrox over llama.cpp rather than merely tie with it. Make a model larger than memory run. A 200B MoE at Q4 is roughly 110 GiB; consumer machines have 16 to 128. An MoE touches only top-k of N experts per token, so the working set is a fraction of the weights, which is what makes this reachable. ferrox-core ALREADY HOLDS THE POLICY: `expert_cache` (LRU with copy plans), `expert_slots` (bounded pool behind a `SlotDevice` trait), `placement`, `residency`, `footprint`, `pool`. NOTHING EXECUTES IT except `expert_pool::CudaExpertPool`, which is compile-verified only with its hardware test `#[ignore]`d. So the capability exists on paper and not in the engine. NEEDS: a `SlotDevice` for Metal and one for host RAM. START WITH MoE, not dense weight streaming, which is a far worse trade and is not in scope."
@@ -64,40 +64,51 @@ stays. A refusal is a gap, not a defect.
 
 ## Counted, not estimated
 
-A coverage audit on 2026-08-27 classified all 150 catalog rows by what
-actually happens when a real checkpoint loads, rather than by whether
-the name is known. The result is harsher than the path count suggests:
+Re-counted 2026-09-01 against `capability::architecture_catalog` and
+[`../manifests/architecture_manifest.md`](../manifests/architecture_manifest.md),
+by what actually happens when a real checkpoint loads rather than by
+whether the name is known:
 
 | Outcome | Count |
 |---|---|
-| **A. Runs, with evidence** (bench row, or pinned against llama.cpp logits) | **~12** |
-| **B. Refuses, naming what is missing** | ~90 |
-| **C. Loads and is WRONG** | 5 arch strings + 3 cross-cutting axes |
-| **D. Unknown: nothing refuses it, nothing proves it** | ~40 |
+| **A. Runs, with evidence** (bench row, pinned llama.cpp logits, or a fixture) | **11** |
+| **B. Loads on a dedicated engine, no cross-engine evidence** | 4 engines |
+| **C. Refuses as unaudited**, with the missing piece triaged and named | 46 |
+| **D. Refuses by name, off the generic path** | 90 rows (58 `dedicated`, 32 `deferred`) |
+| **E. Loads and is WRONG** | **closed** |
 
-Category A in full: `llama` (covering TinyLlama, Mistral, Mixtral,
-SmolLM2), `qwen2`, `qwen2moe`, `qwen3`, `olmoe`, `gemma2`, `gemma3`,
-`gemma4`, `phi3`/`phi4`, plus `gpt-oss` and `dots1` pinned against real
-`libllama` logits. That is the honest extent of proven coverage.
+Category A in full, from `capability::AUDITED_GENERIC_GQA`: `llama`
+(covering TinyLlama, Mistral, Mixtral, SmolLM2), `qwen2`, `qwen2moe`,
+`qwen3`, `qwen3moe`, `olmoe`, `gemma2`, `gemma3`, `phi3` (which Phi-4
+tags as), plus `gpt-oss` and `dots1` pinned against real `libllama`
+logits. Category B is `Mla`, `Glm52`, `Kimi` and `Gemma4`, which load
+and have never been checked against another engine. That is the honest
+extent of proven coverage.
+
+Category E closed when the generic path became **opt-in**. The five
+strings found computing ALiBi or learned absolute position embeddings as
+though they were NEOX RoPE (`gpt2`, `mpt`, `refact`, `bloom`, `jais`)
+are now refusals, pinned by a test that they can never be re-listed as
+audited.
 
 | | llama.cpp | ferrox |
 |---|---|---|
-| Per-architecture graphs | 140 hand-written | 47 paths, **~12 proven** |
-| Shared generic path | none | **68 architectures** |
+| Per-architecture graphs | 140 hand-written | 150 catalog rows, **11 proven** |
+| Shared generic path | none | **57 architectures**, 11 of them audited |
 | Metal `pp512` | baseline | 0.98x-1.10x, at parity |
 | Metal `tg128` | baseline | **8 of 12 rows faster** |
 | CPU, all rows | baseline | **1.41x-5.06x slower** |
 | GPU backends | CUDA, Metal, Vulkan, SYCL, HIP | CUDA, Metal |
 
-Two numbers do most of the work. **6438** is the scaling problem: the
+Two numbers do most of the work. **6875** is the scaling problem: the
 line count of `decoder.rs`, the file you must edit to add a model, and
-the reason the left column says 140 and the right says 47. **~12** is
-how much of that 47 anyone has evidence for.
+the reason the left column says 140 and the right says 11 proven. It was
+6438 when this was first written, which is the direction of travel.
 
 ## Why the model layer is first
 
 llama.cpp has 140 architectures because adding one is a small new file.
-Ferrox has 47 because adding one means editing a 6438-line file. The
+Ferrox proves 11 because adding one means editing a 6875-line file. The
 counts differ for a structural reason, not an effort reason.
 
 It already costs correctness: the paged decode loop had **lost five
@@ -105,14 +116,21 @@ model features** by being a copy of the contiguous one, three of them
 wrong on CPU too. Copy-per-path loses features one at a time and
 nothing notices.
 
-## The cheap fix that beats the expensive audit
+## The cheap fix that beat the expensive audit: DONE
 
-Auditing 63 architectures is expensive. Inverting the default is not.
+Auditing every unproven architecture is expensive. Inverting the default
+was not, and it **landed**. An unrecognised architecture no longer falls
+onto the generic path and runs; it has to be on
+`capability::AUDITED_GENERIC_GQA` or it returns
+`LoadError::UnauditedArchitecture` (`FERROX_ALLOW_UNAUDITED_ARCH=1`
+overrides). That turned the silently-wrong risks into honest refusals.
 
-Today an unrecognised architecture **falls onto** the generic path and
-runs. It should have to **assert** it is plain GQA. That one inversion
-turns 63 silently-wrong risks into 63 honest refusals, and makes the
-remaining work visible instead of hypothetical.
+The follow-on also landed: all 46 refusals are **triaged** into
+fixture-away (9), one-match-arm (7), new-code (26) and unknown (4), each
+naming the `llama.cpp/src/models/*.cpp` line that decides it, so the
+refusal message distinguishes a week of work from a quarter. That triage
+is the work queue the audit-outward item needs. What remains is
+executing it.
 
 ## Ranking
 
@@ -129,8 +147,8 @@ cross-engine oracle means refactoring known-wrong code with no way to
 tell if you broke it.
 
 ```
-TIER 1  scale the model layer     6438 lines is why we have 47 not 140
-        close the 68              invert the default, then audit outward
+TIER 1  scale the model layer     6875 lines is why we prove 11 not 140
+        close the 46              inversion DONE, triage DONE, audit outward
         out-of-core execution     the reason to choose ferrox, not tie
         MoE execution quality     hotness signal, CPU executor, residency
 

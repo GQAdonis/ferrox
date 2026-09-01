@@ -366,8 +366,15 @@ impl Sampler {
 }
 
 /// The **exact** distribution [`Sampler::sample`] draws from for these
-/// logits, params and history: penalties applied, temperature divided
-/// in, top-k and top-p filtered, renormalised to sum to 1.
+/// logits, params and history: penalties applied over the
+/// `penalty_last_n` window, then top-k, top-p and min-p, then
+/// temperature, renormalised to sum to 1.
+///
+/// That is llama.cpp's chain order, and it is the order
+/// `filtered_distribution` runs -- **temperature last**, not first.
+/// This comment used to say "temperature divided in, top-k and top-p
+/// filtered", which described the pre-2026-09-01 pipeline and omitted
+/// min-p entirely.
 ///
 /// This is what makes lossless speculative verification possible. The
 /// speculative-sampling rejection rule compares `p_target(x)` against

@@ -75,11 +75,12 @@ OLMoE (1.11×) and Gemma-3-1B (1.18×) on Metal.
 | GLM4 / glm4moe | Loads via the GLM-5.2 path when the tensors are there. Never measured in the suite |
 | Gemma-4-E2B | Dedicated `Gemma4Engine` + SPM-style `gemma4` BPE tokenizer + `<|turn>` chat wrap. GGUF: `models/gemma-4-E2B-it-Q4_K_M.gguf` (`unsloth/gemma-4-E2B-it-GGUF`). Suite id `gemma4_e2b_q4km`, Homebrew llama may still lack `gemma4` arch. |
 | gpt-oss | **CPU only.** Attention sinks, alternating sliding-window attention, biased router and the `swiglu_oai` clamp, checked against llama.cpp's own reference logits. Metal stops with an error, because no Metal kernel implements attention sinks. The paged-KV decode path runs it: all three attention arms are bit-identical to their contiguous twins |
-| Llama 4 / MiniMax | **Will not load**, with the reason stated: `llama4 MoE + non-GQA attn` and `MiniMax 256-expert sigmoid MoE + MTP` |
+| Llama 4 | **Will not load**, with the reason stated: `llama4 MoE + non-GQA attn` |
+| MiniMax | **Will not load**, and the two are refused for different reasons. `minimax-m2` is *unaudited, not unimplemented*: plain GQA + whole-vector QK norm + partial NEOX RoPE + a sigmoid MoE with `exp_probs_b`, all of which the generic path has, so it needs a fixture rather than code. `minimax-m3` needs MiniMax Sparse Attention (a per-layer indexer driving its own MSA KV cache), of which ferrox has only the block-selection rule |
 | Hybrid GDN / Qwen3.5 | Scaffold only |
 | Kimi K3 / GLM-5.2 / DeepSeek V4 | Loaders and primitives only. Nothing has been run end to end on a real checkpoint |
 | Vision | Finds an mmproj file and warns about it. An `image_url` in a request returns an error |
-| MTP / speculative | `--mtp` errors by design. `ferrox speculative` is prompt-lookup only (an n-gram match over the history, no draft model) and runs on **synthetic random weights**, so the hit rate it prints is not representative of a real drafter. Plan for a real one: [`docs/plans/dflash-speculative-decoding.md`](plans/dflash-speculative-decoding.md) |
+| MTP / speculative | `--mtp` errors by design. `ferrox speculative` is prompt-lookup only (an n-gram match over the history, no draft model) and runs on **synthetic random weights**, so the hit rate it prints is not representative of a real drafter. Plan for a real one: [`docs/plans/on-hold/dflash-speculative-decoding.md`](plans/on-hold/dflash-speculative-decoding.md) |
 | Embeddings | `/v1/embeddings` for GGUF Decoder (mean/last pool) |
 
 ## When a model will not load
@@ -148,14 +149,14 @@ The error always names the reason. Six things cause it:
    An architecture reaches it only if there is a benchmark row, a pinned
    logit comparison against real `libllama`, or a fixture; 11 do today
    (`llama`, `qwen2`, `qwen2moe`, `qwen3`, `qwen3moe`, `olmoe`,
-   `gemma2`, `gemma3`, `phi3`, `gpt-oss`, `dots1`). The other **47**
+   `gemma2`, `gemma3`, `phi3`, `gpt-oss`, `dots1`). The other **46**
    stop with `UnauditedArchitecture`. `FERROX_ALLOW_UNAUDITED_ARCH=1`
    runs one anyway; compare the output against llama.cpp yourself
    before you trust it.
 
 ### What "unaudited" costs you, per architecture
 
-"Unaudited" is not one thing. Some of the 47 are one fixture away from
+"Unaudited" is not one thing. Some of the 46 are one fixture away from
 running and some need an attention implementation, so the refusal says
 which, with the `llama.cpp/src/models/*.cpp` line that decides it:
 
@@ -166,7 +167,7 @@ which, with the `llama.cpp/src/models/*.cpp` line that decides it:
 | `NEW CODE` | A different attention or residual structure. Not close. |
 | `UNKNOWN` | Reading both trees did not settle it. The message says what would. |
 
-All 47 have now been read on both sides (`ferrox_models::capability`,
+All 46 have now been read on both sides (`ferrox_models::capability`,
 pinned by `crates/ferrox-models/tests/unaudited_triage.rs`). The
 distribution is the headline answer to "how far is Ferrox from llama.cpp
 on models":
@@ -175,8 +176,17 @@ on models":
 |---|---|
 | fixture-away | 9 |
 | one match arm | 7 |
-| new code | 27 |
+| new code | 26 |
 | unknown | 4 |
+
+It was 47 until the triage itself removed one. Reading
+`src/models/minicpm3.cpp:5-6,41-46` showed `minicpm3` requires
+`q_lora_rank`/`kv_lora_rank` and the DeepSeek-2
+`attn_q_a`/`attn_q_b`/`attn_kv_a_mqa`/`attn_kv_b` tensor set: it is an
+MLA model that was never on the generic path, so it now refuses by name
+(naming both the MLA tensor set and MiniCPM's three hardcoded
+multipliers) rather than as unaudited. The count going down for the
+right reason.
 
 **Fixture-away (9)** — Ferrox already computes these graphs; only
 evidence is missing. `gemma`, `internlm2`, `exaone`, `ernie4_5`,
@@ -192,8 +202,8 @@ gpt-oss norm slot; `deepseek` and top-k renormalisation (fixed);
 `hunyuan-moe`, `maincoder` and `hunyuan-dense`, all three of which want
 the same flag: QK norm applied *after* RoPE rather than before.
 
-**New code (27)** — a different attention or residual structure. The
-recurring shapes, rather than 27 separate stories:
+**New code (26)** — a different attention or residual structure. The
+recurring shapes, rather than 26 separate stories:
 
 | Shape | Architectures |
 |---|---|
@@ -202,9 +212,9 @@ recurring shapes, rather than 27 separate stories:
 | LayerNorm rather than RMSNorm | `dbrx`, `olmo` |
 | Unkeyed NoPE layers — RoPE skipped on some layers with no GGUF key | `smallthinker`, `afmoe`, `exaone-moe` |
 | A branch fed from the raw layer input rather than the post-attention residual | `smallthinker` (its MoE router), `arctic` (its MoE branch) |
-| Hardcoded scales applied even when the GGUF carries no key | `grok`, `granite`, `granitemoe`, `granite-moe`, `minicpm3`, `mistral3` |
+| Hardcoded scales applied even when the GGUF carries no key | `grok`, `granite`, `granitemoe`, `granite-moe`, `mistral3` |
 | An ungated or non-SwiGLU FFN | `arcee`, `plm`, `apertus` |
-| Something structurally new | `minicpm3` (MLA), `nanbeige` (runs the same layers more than once), `grovemoe` (a second expert bank), `mellum` (two per-layer RoPE variants), `mistral3` (per-position attention temperature) |
+| Something structurally new | `nanbeige` (runs the same layers more than once), `grovemoe` (a second expert bank), `mellum` (two per-layer RoPE variants), `mistral3` (per-position attention temperature) |
 
 **Unknown (4)** — reading both trees did not settle it, and each says
 what would. `phi4`, `mistral`, `mixtral` and `yi` are all names that do
@@ -227,21 +237,35 @@ Parsed and executable on CPU: `F32`, `F16`, `BF16`, `Q4_0`, `Q4_1`,
 `IQ3_XXS`, `IQ3_S`, `MXFP4`.
 
 "Executable" is not one speed. What a format actually gets, read off
-the kernel tables (`ferrox_quant`'s dispatch functions,
-`metal_matvec_kind_name` / `metal_mul_mm_kind_supported` and
-`cuda_matvec_kind_supported` in `ferrox-core`):
+the kernel tables (`ferrox_quant`'s dispatch functions, and
+`metal_matvec_kind_name` / `metal_mul_mm_kind_supported` /
+`cuda_matvec_kind_supported` / `cuda_mul_mm_kind_supported` in
+`ferrox-core`'s `weight_matrix.rs`):
 
 | Tier | Formats | CPU SIMD | GPU |
 |---|---|---|---|
 | Full | `Q4_0`, `Q8_0`, `Q4_K`, `Q5_K`, `Q6_K` | AVX2 + NEON, plus the int-dot path (`FERROX_CPU_INT_DOT=1`) | Metal matvec + simdgroup GEMM, CUDA matvec |
-| Metal only | `IQ4_XS` | AVX2 + NEON | Metal matvec + simdgroup GEMM |
+| Metal only | `IQ4_XS`, `Q5_0` | AVX2 + NEON | Metal matvec + simdgroup GEMM; no CUDA kernel of either kind |
 | CPU-vectorized | `Q4_1`, `Q5_1`, `Q8_1`, `Q2_K`, `Q3_K`, `IQ4_NL`, safetensors two-buffer `MXFP4` | AVX2 + NEON | none |
-| Prefill only on GPU | `Q5_0` | AVX2 + NEON | a Metal simdgroup GEMM, but **no matvec**: prefill runs on the GPU and decode falls back to the CPU |
 | AVX2 only | `IQ1_S`, `IQ2_XXS`, `IQ3_XXS` | AVX2; **scalar on ARM** | none |
 | Scalar only | `IQ2_XS`, `IQ2_S`, `IQ3_S`, `IQ1_M`, GGUF-block `MXFP4` | none | none |
 
+`Q5_0` moved up on 2026-09-01. It had a Metal simdgroup GEMM and no
+matvec, so its prefill ran on the GPU and every decode step fell back to
+the CPU, silently. The matvec now exists
+(`Q5_0_MATVEC_KERNEL_SRC`, `ferrox-metal/src/gpu.rs:439`) and
+`metal_matvec_kind_name` / `metal_mul_mm_kind_supported` name the same
+seven kinds. It is **correct by construction and unmeasured**: there is
+no `Q5_0` checkpoint in `benchmarks/suite.json`, so no row in
+`RESULTS.md` covers it.
+
 Metal's MoE indexed GEMM (`mul_mm_id`) is narrower still: `Q4_0`,
 `Q8_0` and `Q4_K` only.
+
+The GPU column deliberately says **CUDA matvec** and not CUDA GEMM.
+`cuda_mul_mm_kind_supported` does hold `Q8_0` and `Q4_0`, and that
+kernel has never executed on a GPU, so it is not a tier this table can
+promise anything about. See Backends below.
 
 Three caveats that matter in practice:
 
@@ -273,16 +297,30 @@ published `UD-*` checkpoint.
 |---|---|
 | CPU | Dense and MoE. `FERROX_CPU_INT_DOT=1` (Q4_Kx8 / Q8_0x4 / Q5·Q6 int-dot) on suite runs |
 | Metal | Dense, MoE, FA-vec, fused MoE encode groups, `mul_mm_id` prefill, quantized KV |
-| CUDA | Matvec + resident weights + FFN fuse |
+| CUDA | Matvec + resident weights + FFN fuse. A batched `Q8_0`/`Q4_0` GEMM exists and has never run on a GPU (see below) |
 
 Every number on this page was taken on CPU or Apple Metal. CUDA compiles
 and runs, has no pinned benchmark host, and has no published timings, so
 treat a Windows or Linux install as CPU-only in practice.
 
-Paged KV is CPU only as well. On Metal or CUDA the paged attention path
-returns wrong tokens rather than failing, so `ferrox-server` stops at
-startup when `FERROX_PAGED_KV_BLOCKS` is set beside `-dev metal` or
-`-dev cuda`. See [`CONFIG.md`](CONFIG.md).
+A batched quantized GEMM for CUDA (`Q8_0` and `Q4_0` only) is in the
+tree and reachable from a wide prefill, and it has **never executed on a
+GPU**. Its evidence is a thread-by-thread scalar twin plus a host
+harness that compiles and runs the emitted CUDA against a barrier shim
+(`crates/ferrox-cuda/tools/mul_mm_host_check/run.sh`); the hardware test
+is `#[ignore]`d with "NEVER RUN" as its reason. That is not a
+performance claim, and no row in `RESULTS.md` rests on it.
+
+Paged KV used to be refused on Metal and CUDA, because the paged
+attention path there returned fluent wrong tokens. That refusal is
+**lifted**: a Metal prefill left K/V on the device and filled the host
+cache with placeholders that the paged prefill then copied into the page
+store, and the prefill now downloads the real rows for the caller that
+reads them. Pinned on hardware by `cargo test -p ferrox-models --features
+metal --test paged_metal_parity -- --ignored`, which gets identical
+greedy ids from the paged and contiguous caches on a dense, an MoE and a
+sliding-window model. CUDA carries no equivalent hardware run. See
+[`CONFIG.md`](CONFIG.md).
 
 Capabilities overview: [`FEATURES.md`](FEATURES.md).
 Planned work: [`ROADMAP.md`](ROADMAP.md).

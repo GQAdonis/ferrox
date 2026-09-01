@@ -95,7 +95,9 @@ pub enum LoadError {
 /// known, from reading ik_llama.cpp's `llama-hparams.cpp`
 /// (`LLM_ARCH_DEEPSEEK2`, `LLM_ARCH_GLM4_MOE` cases), to default to
 /// sigmoid MoE gating with post-selection renormalization rather than
-/// softmax. See docs/MODELS.md for the citations behind this list.
+/// softmax. Every member's citation is inline here; `docs/MODELS.md`
+/// carries none and the pointer that used to send readers there was
+/// dangling.
 /// `afmoe`, `laguna` and `step35` added 2026-09-01 by the
 /// unaudited-refusal triage's gating sweep. Each reads
 /// `LLM_KV_EXPERT_GATING_FUNC` as OPTIONAL and then, when the key is

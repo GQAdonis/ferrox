@@ -14,8 +14,8 @@ comes back the same way.
 | `GET /v1/models` | Supported |
 | `POST /v1/chat/completions` | Supported (JSON + SSE) |
 | `POST /v1/completions` | Supported (`prompt`, `max_tokens`, sampling subset) |
-| `POST /v1/tokenize` | Supported |
-| `POST /v1/detokenize` | Supported |
+| `POST /v1/tokenize` · `POST /tokenize` | Supported. The unprefixed spelling is llama.cpp's, on the same handler (see below) |
+| `POST /v1/detokenize` · `POST /detokenize` | Supported, same aliasing |
 | `POST /v1/embeddings` | Supported for GGUF Decoder (mean/last pool of hidden states) |
 | `POST /v1/messages` | Anthropic Messages, streaming and buffered |
 | `POST /v1/messages/count_tokens` | Anthropic prompt sizing, no generation |
@@ -749,9 +749,11 @@ the prompt is what gets consulted.
 
 ## Tool-call formats
 
-`tools` is still prompt-engineered (there is no grammar-constrained
-decoding here, see the `tool_choice` rejections above), and the
-preamble asks for a Hermes-style
+`tools` is still prompt-engineered. A grammar engine exists now, but
+nothing wires it to `tools`: constraining a tool call needs a *lazy*
+grammar that switches on partway through a response, which is why the
+`tool_choice` rejections above still stand. The preamble asks for a
+Hermes-style
 `<tool_call>{"name": …, "arguments": {…}}</tool_call>`. But a model
 trained on a different format frequently answers in its own, correctly
 and in its own terms. Parsing tries the format the served checkpoint's
@@ -809,7 +811,20 @@ from arriving as a number.
 
 `/v1/completions` honours `stop`, `max_tokens` (default 16, because the legacy
 floor is right *here*, where a caller completing a fragment usually
-wants a fragment back), `temperature`, `top_p` and `seed`.
+wants a fragment back), `temperature`, `top_p`, `min_p`, `top_k`,
+`repetition_penalty`, `presence_penalty`, `frequency_penalty`, `seed`,
+`ignore_eos` and `grammar`.
+
+Four of those are recent. `top_k`, `repetition_penalty`,
+`presence_penalty` and `frequency_penalty` were undeclared on this
+route, so serde dropped all four while the chat route honoured every
+one, and the sampler then had `top_k: 0` and `repetition_penalty: 1.0`
+hardcoded over the top. Both routes now read the same
+`SamplingKnobs::resolve`, so which knobs exist and what an absent one
+means are stated once rather than twice. An absent `min_p` resolves to
+`0.0` (off) rather than llama.cpp's CLI default of `0.05`: an HTTP
+caller is not running llama.cpp's command line, and quietly truncating
+every unconfigured request is a behaviour change nobody asked for.
 
 Everything it does not implement comes back as an error **naming the
 field**, rather than being dropped: token-id prompts (`[int]` / `[[int]]`), `logprobs`, `echo`,
@@ -831,6 +846,38 @@ refused**, on both routes. Several OpenAI clients send an empty map on
 every request, and there is no token whose logit it would move — so
 refusing it is a false refusal. A non-object (`[]`, `"none"`) is still
 refused, so nothing falls through the empty-map hole.
+
+## Tokenize / detokenize, in both dialects
+
+These two are the one place ferrox invented a path OpenAI does not have.
+OpenAI has no tokenize endpoint at all, so `/v1/tokenize` was ferrox's
+own spelling, while llama.cpp serves `/tokenize` and `/detokenize`
+unprefixed. Every llama.cpp client therefore asked for a URL that did
+not exist and got a 404 naming nothing.
+
+**Both spellings now answer, on the same handler.** `/tokenize` and
+`/v1/tokenize` are one function, not two implementations, so they cannot
+drift; `/admin/stats` records whichever path the client actually called,
+so the split between dialects stays visible.
+
+The request body accepts both dialects on both paths:
+
+| Field | Status |
+|---|---|
+| `content` | llama.cpp's name for the text. Supported |
+| `prompt` | ferrox's name for the same text. Supported |
+| both at once | **400.** They are one field, and guessing which was meant would tokenize text the caller did not ask about |
+| neither | **400** naming both. llama.cpp answers an empty array here; ferrox does not, because an empty array cannot be told apart from tokenizing `""` |
+| `add_special` | Supported. Prepends the same BOS id the generation path prepends — including its no-op on a checkpoint whose metadata says not to add one — so the count matches the prompt the model would really see |
+| `parse_special: true` (upstream's default) | Supported. ferrox's tokenizers always split on special-token text |
+| `parse_special: false` | **501 by name.** ferrox cannot tokenize `<|im_start|>` as plain characters |
+| `with_pieces` | **501 by name.** ferrox's tokenizers expose decoded text, not the raw per-token piece bytes, so a byte-fallback token could not be given llama.cpp's `piece` byte array |
+| `model` | Accepted and ignored; this server serves one model at a time |
+
+The tokenize response carries `tokens` (llama.cpp's key) plus ferrox's
+own `count`. The detokenize response carries the text under **both**
+`content` (llama.cpp's key) and `text` (ferrox's), same string, so
+neither dialect's client reads a null.
 
 ## Grammar-constrained decoding
 
@@ -863,7 +910,8 @@ a grammar on partway through a response — and that is not ported.
 
 ## Not yet
 
-Image and audio input · full JSON schema / grammar constrained decoding ·
+Image and audio input · `response_format: json_schema` (GBNF grammars
+themselves *are* supported, see above) ·
 `tool_choice: required` and named `tool_choice` · MCP tool invocation
 (the config is read, nothing is called) · dedicated embedding models ·
 multi-GPU, tensor parallel, prefill/decode disaggregation · streamed

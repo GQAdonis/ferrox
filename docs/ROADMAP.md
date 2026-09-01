@@ -7,6 +7,28 @@ numbers: [`benchmarks/RESULTS.md`](../benchmarks/RESULTS.md).
 What ships today: [`FEATURES.md`](FEATURES.md) ·
 [`MODELS.md`](MODELS.md).
 
+## Closed on 2026-09-01
+
+Against [`plans/llama-cpp-gap-inventory.md`](plans/llama-cpp-gap-inventory.md),
+whose §7 listed seven things that were silently wrong. All seven are
+fixed:
+
+- The repetition penalty compounded as `penalty^n`, and temperature ran
+  before the truncation filters. Both were live on every `ferrox run` at
+  the defaults
+- `phi3` windowed every layer where llama.cpp windows none
+- `logit_bias` was dropped on `/v1/chat/completions`, and JSON-object
+  mode was dropped under continuous batching
+- `Q5_0` prefilled on the GPU and decoded on the CPU
+- The attention-softcap refusal gated on a GGUF key no converter writes,
+  so it could never fire while reading as coverage
+
+Also landed: `--min-p` and `--repeat-last-n` at llama.cpp's defaults, a
+GBNF grammar engine wired to both HTTP routes and all three decode
+paths, a CUDA batched GEMM (**never run on a GPU**, see item 4 below),
+and a triage of every unaudited architecture refusal into
+fixture-away / one-match-arm / new-code / unknown.
+
 ## Speed gaps against llama.cpp
 
 Closed since the last pass over this list: bench last-token `lm_head`
@@ -48,11 +70,17 @@ Beyond closing the measured gaps.
    natural split. Hot experts stay resident on the GPU, cold ones get
    streamed or run on CPU. `PlacementPlan` and `ExpertStore` are the
    groundwork.
-4. **CUDA performance.** The kernels build and run on real hardware.
-   Nobody has tuned them.
+4. **CUDA performance.** The matvec kernels build and run on real
+   hardware. Nobody has tuned them. The batched `Q8_0`/`Q4_0` GEMM
+   added on 2026-09-01 has **never executed on a GPU at all**: its
+   evidence is a scalar twin plus a host harness that runs the emitted
+   CUDA against a barrier shim, and its hardware test is `#[ignore]`d
+   with "NEVER RUN" as the reason. Putting it on a card, and then the
+   dp4a/MMQ integer path and the other five quant kinds, is the work.
 5. **Tool calling and full OpenAI API compatibility.** See
-   [`API.md`](API.md). Grammar and JSON-schema constrained decoding,
-   plus MCP invocation, are the gaps.
+   [`API.md`](API.md). GBNF grammar-constrained decoding now ships; what
+   is left is `response_format: json_schema`, the *lazy* grammars
+   `tool_choice: required`/named needs, and MCP invocation.
 6. **Docker images**, so evaluating any of this stops requiring a Rust
    toolchain.
 
@@ -74,10 +102,15 @@ Beyond closing the measured gaps.
   every call in a response rather than the first, and a reasoning
   model's chain of thought comes back as `reasoning_content`. Five of
   the eleven stream `tool_calls[].index` argument deltas. What is left
-  here is `tool_choice: required`/named, which needs constrained
-  decoding, argument deltas for the six JSON-payload formats, and
-  streamed tool calls on the continuous-batching path
-- Full grammar and JSON-schema constrained decoding
+  here is `tool_choice: required`/named, which needs *lazy* grammars
+  (llama.cpp's `trigger_patterns`, a grammar switched on partway through
+  a response) rather than constrained decoding as such, argument deltas
+  for the six JSON-payload formats, and streamed tool calls on the
+  continuous-batching path
+- JSON-schema constrained decoding. The GBNF engine and the `grammar`
+  request field shipped on 2026-09-01, on chat, completions and all
+  three decode paths; `response_format: json_schema` still answers 501
+  naming the schema-to-grammar step
 - MCP tool invocation. Anthropic streaming and tools now ship
 - The rest of the OpenAI API surface (see [`API.md`](API.md))
 - Docker images (CPU, Metal and CUDA variants)
@@ -119,11 +152,13 @@ Still waiting on a consumer:
   a *persistent* GPU expert cache (`ferrox-moe::run_expert_placed`
   re-uploads every weight matrix per call) and a CPU MoE path that can
   run concurrently with a device copy
-- Make paged KV, and the radix cache riding on it, correct on Metal and
-  CUDA. Today the paged attention path returns wrong tokens on a GPU
-  backend, so the server stops rather than serving them. Lift that once
-  the paged path passes `ferrox verify --backend metal` with prefill
-  covered
+- Make paged KV, and the radix cache riding on it, correct on **CUDA**.
+  Metal is done: the prefill left K/V on the device and the paged
+  prefill copied host placeholders into the page store, the prefill now
+  downloads the real rows, the startup refusal is lifted, and
+  `paged_metal_parity` pins identical greedy ids against the contiguous
+  cache on a dense, an MoE and a sliding-window model. CUDA has no
+  equivalent hardware run
 - Give the radix cache an aggregate hit rate on `/v1/stats` and
   `/metrics`, and an eviction budget. `RadixCache::evict` is written and
   tested with nothing calling it, so back pressure today is the page
@@ -156,7 +191,7 @@ biased scores and then runs one global top-k. That one is first.
 Staged plan, including what the port left behind entirely (semantic
 anchor checkpoints, the cache manager, the window slide) and what a
 CUDA-side parity would actually cost:
-[`plans/freetoken-parity.md`](plans/freetoken-parity.md).
+[`plans/archive/freetoken-parity.md`](plans/archive/freetoken-parity.md).
 
 **Engineering practice worth taking from llama.cpp**
 

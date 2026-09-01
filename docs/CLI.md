@@ -62,10 +62,12 @@ Same via explicit subcommand: `ferrox run -m …`.
 | `-c` / `--ctx-size` | `auto` = largest that fits the device memory budget, `0` = GGUF `{arch}.context_length` (else 4096), or a token count |
 | `--strict-budget` | Stop with an error when the pre-load budget says the context will not fit (default: warn and continue) |
 | `-t` / `--threads` | Sets `RAYON_NUM_THREADS` |
-| `--temp` | `0` = greedy |
-| `--top-k` | `0` = off |
-| `--top-p` | Nucleus sampling |
-| `--repeat-penalty` | `1.0` = off |
+| `--temp` | `0` = greedy. Default `0.8`, llama.cpp's |
+| `--top-k` | `0` = off. Default `40`, llama.cpp's |
+| `--top-p` | Nucleus sampling. Default `0.95`, llama.cpp's |
+| `--min-p` | Drop every candidate less than this fraction as likely as the most likely one. `0.0` = off. Default `0.05`, llama.cpp's (`common/common.h:231`) |
+| `--repeat-penalty` | `1.0` = off. Default `1.1`; llama.cpp defaults this one to `1.0` |
+| `--repeat-last-n` | How many recent tokens the repetition / presence / frequency penalties consider. `0` = penalties off. Default `64`, llama.cpp's (`common/common.h:238`) |
 | `-s` / `--seed` | `-1` = time-based |
 | `-dev` / `--device` | `auto`, `none`, `cpu`, `metal`, or `cuda` |
 | `--list-devices` | Print compiled, detected devices and exit |
@@ -80,6 +82,18 @@ Same via explicit subcommand: `ferrox run -m …`.
 | `--mtp` | Errors: MTP draft heads not loaded from GGUF yet |
 
 Stderr prints load and throughput timings. Generated text goes to stdout.
+
+**The sampler chain is llama.cpp's, in llama.cpp's order.** Penalties,
+then top-k, then top-p, then min-p, and **temperature last**
+(`common/common.h:259-269`; ferrox
+`crates/ferrox-models/src/sampling.rs`'s `filtered_distribution`).
+Ferrox used to divide by the temperature first and filter afterwards,
+which keeps a different candidate set for the same flags: top-p selects
+the smallest set summing to `p`, and temperature changes the
+probabilities being summed. The repetition penalty is applied **once per
+candidate**, not once per occurrence in the history, so a token seen `n`
+times is no longer scaled by `penalty^n`. Both were live on every
+`ferrox run` at the defaults above.
 
 **Speculative decoding:** `ferrox speculative` is a prompt-lookup demo.
 It matches n-grams against the history, there is no draft model, and it
@@ -260,7 +274,7 @@ It refuses to write in two cases, both deliberate:
   `--allow-debug-build` overrides it if you know why you want that.
 
 The device-side measurement is a documented stub pending a benchmark
-host, see `docs/plans/freetoken-parity.md`. It must be timed with CUDA
+host, see `docs/plans/archive/freetoken-parity.md`. It must be timed with CUDA
 events rather than a wall clock, and repeated under contention, because
 the number the policy wants is the *contended* pair: standalone
 bandwidths assume each side owns the machine and neither does once they

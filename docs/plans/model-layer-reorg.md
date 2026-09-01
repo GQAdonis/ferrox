@@ -54,8 +54,12 @@ isProject: false
 
 ## The number, and what it is made of
 
-`crates/ferrox-models/src/decoder.rs` is **6438 lines**. Code runs to
-4842; the rest is its own test module.
+`crates/ferrox-models/src/decoder.rs` was **6438 lines** when this was
+measured. Code ran to 4842; the rest was its own test module. **It is
+6875 today**, and `ferrox-metal/src/attn.rs` is 8860 against the 9026
+below. The line numbers in the tables that follow are from the original
+measurement and have moved; the shape they describe has not. The
+direction of travel is the argument for this plan, not against it.
 
 Inside it, four host functions each contain a complete decoder layer
 written out longhand:

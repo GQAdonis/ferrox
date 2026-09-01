@@ -81,6 +81,16 @@ refusal is a gap rather than a defect.
 | **D. Refuses generically as unaudited** | 47 | `loader.rs:680-690`. Honest, but the message names no feature, so a user cannot tell a one-line fix from a six-month one |
 | **E. Loads and computes something else** | see §1.4 | Two found; both conditional |
 
+**Both D and E moved the same day.** D is now **46**, and the refusal is
+no longer generic: every row carries a triage verdict naming the missing
+piece (§8 item 6, landed). The count dropped by one because the triage
+itself found `minicpm3` was never a generic-GQA model at all. It
+requires `q_lora_rank`/`kv_lora_rank` and the DeepSeek-2
+`attn_q_a`/`attn_q_b`/`attn_kv_a_mqa`/`attn_kv_b` tensor set
+(`src/models/minicpm3.cpp:5-6,41-46`), so no MiniCPM3 checkpoint could
+ever have loaded on the generic path, and it now refuses by name. Both
+E rows are fixed; see §7.
+
 Category D is the one this document would most like to shrink, and
 §1.3 is why shrinking it is not free.
 
@@ -184,10 +194,12 @@ of the class that has bitten this repo four times (`glm4moe` demanding
 MTP). Those four are fixed and the reasons now read correctly against
 `glm4-moe.cpp:75,215`, `minimax-m2.cpp:26-141` and `minimax-m3.cpp:76-82`.
 
-One **documentation** instance survives: `docs/MODELS.md:78` still says
+One **documentation** instance survived: `docs/MODELS.md:78` still said
 MiniMax "will not load" for "MiniMax 256-expert sigmoid MoE + MTP",
 which is the reason `capability.rs:663-723` explicitly retired as false
-in both clauses. Doc drift, not a code defect.
+in both clauses. Doc drift, not a code defect. **Fixed**: that row is
+now two rows, one per architecture, carrying the reasons the code
+actually gives.
 
 ### 1.6 The single highest-value architecture item
 
@@ -421,6 +433,14 @@ checkout; note the file is `llama-sampler.cpp`, not
 `llama-sampling.cpp`) chained by `common/sampling.cpp:345-417`.
 
 ### 3.1 Sampler coverage
+
+**Seven rows of this table have moved since it was written**, all on
+2026-09-01. `min_p`, the `penalty_last_n` window, GBNF grammar and
+`logit_bias` are no longer missing; `top_p`, the repetition penalty and
+temperature ordering no longer diverge. JSON-schema-to-grammar has a
+converter in the tree but the `response_format: json_schema` route still
+answers 501. Everything else below still reads true. The per-row detail
+is in §7 and §8; the table is left as the reading found it.
 
 | Sampler | llama.cpp | ferrox | Severity | Size |
 |---|---|---|---|---|
@@ -795,19 +815,32 @@ These are bugs, not gaps. Under the bar in `north-star.md:51-56` a
 refusal is coverage and a wrong answer is not, so these jump the queue
 regardless of size.
 
-| # | What | Where | Live today? | Size |
-|---|---|---|---|---|
-| **E3** | Repetition penalty compounds as `penalty^n` where llama.cpp applies it once | `crates/ferrox-models/src/sampling.rs:421-431` vs `src/llama-sampler.cpp:2745-2752` | **Yes**, on every model at the CLI default `--repeat-penalty 1.1` | S |
-| **E4** | Temperature is applied before top-p, where llama.cpp applies it last | `sampling.rs:375-402` vs `common/common.h:259-269` | **Yes**, whenever `temp != 1` and `top_p < 1` | S |
-| **E1** | `phi3` windows every layer where llama.cpp windows none | `loader.rs:417-419` + `config.rs:359-377` vs `src/models/phi3.cpp:13-24`, key written at `conversion/phi.py:167-171` | **Yes** on Phi-3 (not Phi-4) beyond 2047 tokens. On an architecture that is on the *audited* list | S |
-| **E5** | `logit_bias` is silently dropped on `/v1/chat/completions` | `crates/ferrox-server/src/lib.rs:1040-1131` (no field, no `deny_unknown_fields`) vs `openai_extra.rs:159,202` which refuses it properly | **Yes** | S |
-| **E6** | JSON-object mode is dropped under continuous batching | `serving/batch/worker.rs:327-329` vs `generate.rs:1518-1533` | Yes, under `FERROX_CONTINUOUS_BATCHING=1` | S |
-| **E7** | Q5_0 prefills on Metal and decodes on CPU, from a stale exclusion table its own comment already flags | `crates/ferrox-core/src/weight_matrix.rs:418-455` | Yes | M |
-| **E2** | `unsupported_feature_keys` cannot see a softcap llama.cpp hardcodes | `capability.rs:1156-1177` vs `src/models/grok.cpp:9-11` | **Latent** -- `grok` refuses as unaudited first. A trap for whoever audits it | S |
+**ALL SEVEN ARE FIXED, later the same day.** The "Live today?" column is
+kept as written, because it is what the reading found; the "Fixed by"
+column is the record of what closed it. The estimate below the table was
+right: it was about a day of work.
 
-Six of the seven are S-sized. Together they are perhaps a day of work
-and they are the difference between "ferrox produces the same tokens as
-llama.cpp" being true and being nearly true.
+| # | What | Where | Live today? | Fixed by |
+|---|---|---|---|---|
+| **E3** | Repetition penalty compounds as `penalty^n` where llama.cpp applies it once | `crates/ferrox-models/src/sampling.rs:421-431` vs `src/llama-sampler.cpp:2745-2752` | **Yes**, on every model at the CLI default `--repeat-penalty 1.1` | `8356c74`. `apply_history_penalties` counts first and divides once per token |
+| **E4** | Temperature is applied before top-p, where llama.cpp applies it last | `sampling.rs:375-402` vs `common/common.h:259-269` | **Yes**, whenever `temp != 1` and `top_p < 1` | `8356c74`. `filtered_distribution` runs top-k, top-p, min-p, then temperature, with the renormalisation between steps in `sampler_chain` |
+| **E1** | `phi3` windows every layer where llama.cpp windows none | `loader.rs:417-419` + `config.rs:359-377` vs `src/models/phi3.cpp:13-24` | **Yes** beyond the declared window, on an architecture that is on the *audited* list | `2d36356`. See the correction below: this row's Phi-4 caveat was wrong |
+| **E5** | `logit_bias` is silently dropped on `/v1/chat/completions` | `crates/ferrox-server/src/lib.rs:1040-1131` (no field, no `deny_unknown_fields`) vs `openai_extra.rs:159,202` which refuses it properly | **Yes** | `1b4ab74`. Both routes call one `refuse_logit_bias`; an empty `{}` is served rather than refused |
+| **E6** | JSON-object mode is dropped under continuous batching | `serving/batch/worker.rs:327-329` vs `generate.rs:1518-1533` | Yes, under `FERROX_CONTINUOUS_BATCHING=1` | `1b4ab74`, and it was dropped three ways, not one: also by the Metal greedy lm_head fold at `temperature <= 0`, and by `generate_engine` passing no detokenizer at all |
+| **E7** | Q5_0 prefills on Metal and decodes on CPU, from a stale exclusion table its own comment already flags | `crates/ferrox-core/src/weight_matrix.rs:418-455` | Yes | `e7a6036`. `Q5_0_MATVEC_KERNEL_SRC` exists and the two Metal tables now name the same seven kinds. Still unmeasured: no Q5_0 row in the bench suite |
+| **E2** | `unsupported_feature_keys` cannot see a softcap llama.cpp hardcodes | `capability.rs:1156-1177` vs `src/models/grok.cpp:9-11` | **Latent** -- `grok` refuses as unaudited first. A trap for whoever audits it | `c7f9c63`, and the reading understated it. The refusal named a key **no converter writes**, so that arm had never matched anything for any non-Gemma architecture, ever. A gate that cannot fire is worse than no gate, because it reads as coverage |
+
+### One row of this section was itself wrong
+
+E1 above said Phi-4-mini "writes `0` and is filtered out ... which is
+exactly why the suite's Phi-4-mini bench row never saw this", citing the
+converter at `conversion/phi.py:167-171`. Reading the actual file showed
+otherwise: `models/Phi-4-mini-instruct-Q4_K_M.gguf`, a row in the
+benchmark suite, declares `phi3.attention.sliding_window = 262144`. The
+bench row did not dodge the bug by writing zero; it was affected and the
+window was simply larger than any prompt in `pp512`/`tg128`. Recorded
+here because "read the converter" is weaker evidence than "read the
+checkpoint", and this document's own standard says so.
 
 ---
 
@@ -819,16 +852,23 @@ slower, (4) the command a user knows works.** "Tracked" means an
 existing `roadmap.md` item already covers it; "new" means this inventory
 is the first place it is written down.
 
-| # | Item | Why here | Size | Roadmap |
+**Items 1 through 8 all landed on 2026-09-01**, in roughly the order
+this table ranks them; item 9's `/tokenize` and `/detokenize` aliases
+were in flight as this was written, and item 10 (Vulkan) is open. The
+`Landed` column below records what closed each, and item 7 carries the
+caveat that matters most in this whole document: the CUDA GEMM **has
+never executed on a GPU**.
+
+| # | Item | Why here | Size | Landed |
 |---|---|---|---|---|
-| **1** | **Fix the repetition penalty (E3)** | Bar item 2, and it is live on *every* model at the CLI's own default. Five lines: count first, penalise once | S | **NEW** |
-| **2** | **Apply temperature after the truncation filters (E4)** | Bar item 2. The same parameters produce a different nucleus than llama.cpp, and the user-visible symptom is "ferrox is more repetitive" | S | **NEW** |
-| **3** | **`phi3` must not window when the key says it should (E1)** | Bar item 1, on an architecture ferrox *claims as audited*. The bench row that was supposed to cover it is Phi-4, which writes `0` and dodges the bug | S | **NEW** |
-| **4** | **`-ngl N` offloads N layers, or refuses** | Bar item 4, and it is a *conflict* not a blank: the flag everyone types first silently means something else. If partial placement is far off, refusing `0 < N < n_layers` converts a critical into a documented limitation in an afternoon | S to refuse, L to implement | Named as an alias in `north-star.md:21`; the *defect* is **NEW** |
-| **5** | **`--escape` default must match llama.cpp's `true`** | Bar item 4. Every pasted command containing `\n` currently gets a different prompt, with no warning | S | **NEW** |
-| **6** | **Triage the 47 unaudited refusals** into fixture-away / one-match-arm / new-code, and say which in the error | Bar items 1 and 4. It is the only thing that makes "how far is ferrox from llama.cpp on models" legible, and §1.3 shows the three classes genuinely differ. It also produces the work queue that `b2-close-the-68` and the model-layer split both need | M | Partly **tracked** (`b2-close-the-68`); the triage itself is NEW |
-| **7** | **A batched quantized GEMM on CUDA (`mul_mm`)** | Bar item 3, on the hardware most llama.cpp users own. `ferrox-cuda` has **no matrix-matrix product at all** (§2.4), and the repo's own comment records the consequence. It is a port of `ferrox-metal`'s proven `mul_mm_sg_impl`, not a new design | L | **NEW** -- `roadmap.md` has no CUDA item; only a `weight_matrix.rs:2033` comment points at "the ROADMAP" |
-| **8** | **Grammar / GBNF and JSON-schema constrained decoding** | Bar item 4 at feature granularity: three separate 501s (`tool_choice: required`, named `tool_choice`, `response_format: json_schema`) all trace to this one absence, and the structured-output mode that does ship is an 83-line character filter | L | **NEW** -- sampling is not a theme in `roadmap.md` at all |
+| **1** | **Fix the repetition penalty (E3)** | Bar item 2, and it is live on *every* model at the CLI's own default. Five lines: count first, penalise once | S | **DONE** `8356c74` |
+| **2** | **Apply temperature after the truncation filters (E4)** | Bar item 2. The same parameters produce a different nucleus than llama.cpp, and the user-visible symptom is "ferrox is more repetitive" | S | **DONE** `8356c74` |
+| **3** | **`phi3` must not window when the key says it should (E1)** | Bar item 1, on an architecture ferrox *claims as audited*. This row's claim that the Phi-4 bench row "writes `0` and dodges the bug" was itself wrong: the file declares 262144. See the correction in §7 | S | **DONE** `2d36356` |
+| **4** | **`-ngl N` offloads N layers, or refuses** | Bar item 4, and it is a *conflict* not a blank: the flag everyone types first silently means something else. If partial placement is far off, refusing `0 < N < n_layers` converts a critical into a documented limitation in an afternoon | S to refuse, L to implement | **DONE (the refusal half)** `7b3a3f5`. `GpuLayers::check_supported` refuses `0 < N < n_layers` by name; partial placement is still unimplemented |
+| **5** | **`--escape` default must match llama.cpp's `true`** | Bar item 4. Every pasted command containing `\n` currently gets a different prompt, with no warning | S | **DONE** `7b3a3f5` |
+| **6** | **Triage the 46 unaudited refusals** into fixture-away / one-match-arm / new-code, and say which in the error | Bar items 1 and 4. It is the only thing that makes "how far is ferrox from llama.cpp on models" legible, and §1.3 shows the three classes genuinely differ. It also produces the work queue that `b2-close-the-68` and the model-layer split both need | M | **DONE** `126252b`, `52a25b6`. 9 fixture-away / 7 one-match-arm / 26 new-code / 4 unknown, pinned by `tests/unaudited_triage.rs`; the count fell 47 to 46 when the triage found `minicpm3` was MLA |
+| **7** | **A batched quantized GEMM on CUDA (`mul_mm`)** | Bar item 3, on the hardware most llama.cpp users own. `ferrox-cuda` has **no matrix-matrix product at all** (§2.4), and the repo's own comment records the consequence. It is a port of `ferrox-metal`'s proven `mul_mm_sg_impl`, not a new design | L | **WRITTEN AND WIRED, NEVER RUN ON A GPU** `5dd8202`, `75780d8`. Q8_0 and Q4_0 only. Evidence is a thread-by-thread scalar twin plus a host harness that compiles and executes the emitted CUDA against a barrier shim; the hardware test is `#[ignore]`d with "NEVER RUN" as its reason. This is not a performance claim and `docs/` makes none |
+| **8** | **Grammar / GBNF and JSON-schema constrained decoding** | Bar item 4 at feature granularity: three separate 501s (`tool_choice: required`, named `tool_choice`, `response_format: json_schema`) all trace to this one absence, and the structured-output mode that does ship is an 83-line character filter | L | **DONE for GBNF** `7cfdab8`, `5bd3518`, `a674f95`. Parser + stack machine + `grammar` on chat and completions, reaching all three decode paths. A JSON-Schema-to-GBNF converter exists in `ferrox_models::grammar`, but `response_format: json_schema` still answers 501, and lazy grammars (`trigger_patterns`) are unported, so both `tool_choice` 501s stand |
 | **9** | **Native `POST /completion` + alias `/tokenize` and `/detokenize`** | Bar item 4 for everything that is not an OpenAI client: llama.cpp's own web UI, `llama.vim`, and a long tail of wrappers. The alias half is an S-sized edit removing two silent 404s | M + S | **NEW** |
 | **10** | **Vulkan** | The largest single hardware gap and the only backend covering AMD, Intel and Android from one codebase. Ranked tenth only because everything above it is smaller and lands sooner, which is `roadmap.md:5-7`'s own rule | XL | **Tracked** (`d-hardware-reach`) |
 

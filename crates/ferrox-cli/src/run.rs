@@ -122,10 +122,17 @@ pub struct InferArgs {
     #[arg(long = "list-devices", default_value_t = false)]
     pub list_devices: bool,
 
-    /// GPU layers: `0`, a positive number, `auto`, or `all`.
+    /// GPU layers: `0`, `auto`, `all`, or a count at or above the
+    /// model's layer count.
     ///
-    /// Partial placement is not implemented yet; any value above zero
-    /// currently enables all supported operations on the selected backend.
+    /// Partial placement is not implemented, and a PARTIAL count is now
+    /// REFUSED rather than silently rounded up -- see
+    /// [`GpuLayers::check_supported`]. This comment used to say "any
+    /// value above zero currently enables all supported operations",
+    /// which described the behaviour that was the bug: llama.cpp's
+    /// `-ngl N` offloads exactly N layers, so accepting the count and
+    /// offloading everything turned the flag into an out-of-memory on
+    /// the machine it exists to accommodate.
     #[arg(
         long = "n-gpu-layers",
         visible_aliases = ["gpu-layers", "ngl"],

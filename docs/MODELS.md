@@ -90,7 +90,7 @@ partly implements will load, run fast, and return fluent text computed
 by the wrong maths, and nothing in the output tells you. An error you
 can read beats output you cannot trust.
 
-The error always names the reason. Five things cause it:
+The error always names the reason. Six things cause it:
 
 1. **Ferrox does not know the architecture.** It is not in the
    capability registry.
@@ -140,6 +140,52 @@ The error always names the reason. Five things cause it:
    problem conditionally: the 7B rotates, the 13B uses ALiBi, and
    llama.cpp tells them apart by layer count alone, so a 40-layer
    Baichuan is refused and a 32-layer one is not.
+
+6. **Nobody has ever verified this architecture against llama.cpp.**
+   The shared generic-GQA decoder is a *guess*: it assumes plain GQA
+   because nothing said otherwise, and that guess was already wrong for
+   the five architectures in cause 5. So the generic path is opt-in.
+   An architecture reaches it only if there is a benchmark row, a pinned
+   logit comparison against real `libllama`, or a fixture; 11 do today
+   (`llama`, `qwen2`, `qwen2moe`, `qwen3`, `qwen3moe`, `olmoe`,
+   `gemma2`, `gemma3`, `phi3`, `gpt-oss`, `dots1`). The other **47**
+   stop with `UnauditedArchitecture`. `FERROX_ALLOW_UNAUDITED_ARCH=1`
+   runs one anyway; compare the output against llama.cpp yourself
+   before you trust it.
+
+### What "unaudited" costs you, per architecture
+
+"Unaudited" is not one thing. Some of the 47 are one fixture away from
+running and some need an attention implementation, so the refusal says
+which, with the `llama.cpp/src/models/*.cpp` line that decides it:
+
+| Class | Means |
+|---|---|
+| `FIXTURE-AWAY` | Ferrox already computes this graph. What is missing is evidence. |
+| `ONE MATCH ARM` | One small, named piece: an activation, a norm slot, a routing flag, an ordering. |
+| `NEW CODE` | A different attention or residual structure. Not close. |
+| `UNKNOWN` | Reading both trees did not settle it. The message says what would. |
+
+Read on both sides so far, 15 of 47 (`ferrox_models::capability`, pinned
+by `crates/ferrox-models/tests/unaudited_triage.rs`):
+
+| Arch | Class | What decides it |
+|---|---|---|
+| `gemma` | fixture-away | `gemma.cpp:16-33` creates only tensors the generic decoder loads; the embedding scale, GeGLU and attention scale are all implemented for the Gemma family |
+| `internlm2` | fixture-away | `internlm2.cpp:25-33` is the plain Llama tensor set; sequential residual, SiLU SwiGLU |
+| `exaone` | fixture-away | `exaone.cpp:29-38` likewise, plus the global `rope_freqs.weight` the loader already reads |
+| `ernie4_5` | fixture-away | `ernie4-5.cpp:39-67`; its one unslotted tensor, an optional `attn_output.bias` at `:45`, is caught by name by the unread-tensor gate |
+| `bailingmoe2` | fixture-away | `bailingmoe2.cpp:47-73`: fused QKV Ferrox splits, per-head QK norm before RoPE, `exp_probs_b`, shared experts, gating read from metadata |
+| `seed_oss` | one match arm | `seed-oss.cpp:36-37,113-115`: `post_attention_norm` **is** the pre-FFN norm and there is no `ffn_norm`. gpt-oss's slot, behind an `is_gpt_oss` flag that would be widened |
+| `deepseek` | one match arm | `deepseek.cpp:145` passes `norm_w=false` and the converter never writes `expert_weights_norm`, so Ferrox renormalises top-k weights where llama.cpp does not |
+| `ernie4_5-moe` | one match arm | `ernie4-5-moe.cpp:64` interleaves MoE layers by `n_moe_layer_step`; `layer_is_dense` implements only a leading-dense prefix |
+| `hunyuan-moe` | one match arm | `hunyuan-moe.cpp:93-118` applies QK norm **after** RoPE; Ferrox norms then rotates |
+| `olmo2` | new code | `olmo2.cpp:47,52,92,169`: no `attn_norm` and no `ffn_norm` at all. Q/K/V come off the raw residual. The generic decoder requires and applies both |
+| `exaone4` | new code | `exaone4.cpp:60-67,118,159`: the same post-norm-only topology |
+| `granite`, `granitemoe`, `granite-moe` | new code | `granite.cpp:7-10,188,241-242,301-302`: four multipliers, including a residual scale on every branch output. Cause 4 above already refuses these by name first |
+| `phi4` | unknown | `phi4` is not in llama.cpp's `LLM_ARCH_NAMES` at all, so there is no reference graph to diff. A real GGUF spelling it would settle whether it is phi3's fused-QKV graph |
+
+The remaining 32 say so explicitly rather than guessing a class.
 
 `FERROX_ALLOW_UNKNOWN_TENSORS=1` loads the checkpoint anyway and accepts
 whatever comes out. Use it while you debug, not to get past the error

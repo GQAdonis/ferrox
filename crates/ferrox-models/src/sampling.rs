@@ -14,6 +14,8 @@
 //! dependency tree the same minimal, pure-Rust shape as the rest of
 //! this crate.
 
+use crate::sampler_chain::Candidates;
+
 /// Sampling parameters for one generation request. `temperature <= 0.0`
 /// means "sample nothing, take the greedy argmax" -- the same
 /// deterministic behavior ferrox always had before this module existed.
@@ -23,6 +25,20 @@ pub struct SamplingParams {
     /// Nucleus sampling threshold in (0.0, 1.0]. 1.0 disables top-p
     /// filtering (every token with nonzero probability is eligible).
     pub top_p: f32,
+    /// Keep only candidates at least `min_p` times as likely as the most
+    /// likely one. `0.0` disables it; llama.cpp's `--min-p`, whose
+    /// default is **0.05** (`common/common.h:231`) rather than off.
+    ///
+    /// That default is why this is a parity item and not a feature:
+    /// llama.cpp truncates with min-p on every run nobody configured,
+    /// so without it ferrox could not reproduce llama.cpp's *own*
+    /// out-of-the-box output for any prompt.
+    ///
+    /// The struct default here stays `0.0` (disabled) for the same
+    /// reason `temperature` defaults to greedy: `SamplingParams::default`
+    /// is ferrox's "do nothing the caller did not ask for" baseline, and
+    /// llama.cpp's CLI numbers live on the CLI flags.
+    pub min_p: f32,
     /// Keep only the `top_k` highest-probability tokens before
     /// sampling. 0 disables top-k filtering.
     pub top_k: usize,
@@ -55,6 +71,7 @@ impl Default for SamplingParams {
         SamplingParams {
             temperature: 0.0,
             top_p: 1.0,
+            min_p: 0.0,
             top_k: 0,
             repetition_penalty: 1.0,
             penalty_last_n: 64,
@@ -289,7 +306,7 @@ impl Sampler {
             return argmax(&scores);
         }
 
-        let probs = filtered_distribution(scores, logits, params);
+        let probs = filtered_distribution(scores, params);
         self.sample_from(&probs)
     }
 
@@ -363,96 +380,49 @@ pub fn sampling_distribution(
         }
         return probs;
     }
-    filtered_distribution(scores, logits, params)
+    filtered_distribution(scores, params)
 }
 
 /// Shared tail of [`Sampler::sample_with_mask`] and
-/// [`sampling_distribution`]: truncate the already-penalised `scores`
-/// with top-k and top-p, THEN apply the temperature, softmax and
-/// renormalise. `raw_logits` is only consulted for the degenerate
-/// everything-filtered-to-zero fallback.
+/// [`sampling_distribution`]: run the already-penalised `scores` through
+/// llama.cpp's sampler chain and return the resulting full-vocabulary
+/// distribution.
 ///
-/// # Order, and why it is this one
+/// # Order, and why it is a specification
 ///
-/// TEMPERATURE COMES LAST. llama.cpp's default sampler chain is
-/// `penalties, dry, top_n_sigma, top_k, typical_p, top_p, min_p, xtc,
-/// temperature` (`common/common.h:259-269`), and ferrox used to divide
-/// by the temperature FIRST and filter afterwards.
+/// llama.cpp's default chain is `penalties, dry, top_n_sigma, top_k,
+/// typical_p, top_p, min_p, xtc, temperature` (`common/common.h:259-269`,
+/// consumed by `common/sampling.cpp:349-397`). The penalties already ran
+/// in [`apply_history_penalties`]; this function is the rest of it, in
+/// that order, and **temperature is last**.
 ///
+/// ferrox used to divide by the temperature FIRST and filter afterwards.
 /// That is not a reordering of independent steps. Top-p selects the
 /// smallest set of candidates whose probabilities sum to `p`, and
 /// temperature changes those probabilities: a high temperature flattens
 /// the distribution so the nucleus grows, a low one sharpens it so the
-/// nucleus shrinks. Filtering before scaling and filtering after scaling
-/// therefore keep DIFFERENT candidate sets for the same
-/// `--temp`/`--top-p` pair, which is why identical flags gave llama.cpp
-/// and ferrox different output.
+/// nucleus shrinks. Min-p compares each candidate's logit against
+/// `max + ln(p)`, and temperature scales exactly the gap being compared.
+/// Filtering before scaling and filtering after scaling therefore keep
+/// DIFFERENT candidate sets for the same flags.
 ///
-/// So the cut is taken on the unscaled distribution, exactly as
-/// llama.cpp takes it on the candidate list before its temperature
-/// sampler runs, and the temperature then reshapes only the survivors.
+/// Both callers go through here rather than each running their own
+/// chain, because a difference between the two is exactly the kind of
+/// silent non-losslessness speculative verification is supposed to rule
+/// out.
 ///
-/// Both callers go through here rather than each doing their own
-/// filter-then-temperature, because a difference between the two is
-/// exactly the kind of silent non-losslessness speculative verification
-/// is supposed to rule out.
-fn filtered_distribution(
-    mut scores: Vec<f32>,
-    raw_logits: &[f32],
-    params: &SamplingParams,
-) -> Vec<f32> {
-    // The cut is taken on the UNSCALED distribution, before the
-    // temperature reshapes it -- see this function's doc comment.
-    let unscaled = softmax(&scores);
-    let mut keep = vec![true; scores.len()];
-    let mut idx: Vec<usize> = (0..unscaled.len()).collect();
-    idx.sort_unstable_by(|&a, &b| unscaled[b].partial_cmp(&unscaled[a]).unwrap());
-
-    if params.top_k > 0 && params.top_k < keep.len() {
-        for &i in idx.iter().skip(params.top_k) {
-            keep[i] = false;
-        }
-    }
-
-    if params.top_p < 1.0 {
-        let mut cumulative = 0.0f32;
-        let mut cutoff = idx.len();
-        for (rank, &i) in idx.iter().enumerate() {
-            cumulative += unscaled[i];
-            if cumulative >= params.top_p {
-                cutoff = rank + 1;
-                break;
-            }
-        }
-        for &i in idx.iter().skip(cutoff) {
-            keep[i] = false;
-        }
-    }
-
-    for s in scores.iter_mut() {
-        *s /= params.temperature;
-    }
-    let mut probs = softmax(&scores);
-    for (p, &k) in probs.iter_mut().zip(keep.iter()) {
-        if !k {
-            *p = 0.0;
-        }
-    }
-
-    let total: f32 = probs.iter().sum();
-    if total <= 0.0 {
-        // Every candidate got filtered to zero (degenerate params);
-        // fall back to greedy rather than sampling from nothing.
-        let mut point = vec![0.0f32; probs.len()];
-        if let Some(p) = point.get_mut(argmax(raw_logits)) {
-            *p = 1.0;
-        }
-        return point;
-    }
-    for p in probs.iter_mut() {
-        *p /= total;
-    }
-    probs
+/// The filters themselves live in [`crate::sampler_chain`], which models
+/// the shrinking candidate list llama.cpp passes down the chain --
+/// including the renormalisation between steps that a keep-mask cannot
+/// express. See that module's header.
+fn filtered_distribution(scores: Vec<f32>, params: &SamplingParams) -> Vec<f32> {
+    let vocab = scores.len();
+    let mut candidates = Candidates::new(&scores);
+    candidates.top_k(params.top_k);
+    candidates.top_p(params.top_p);
+    candidates.min_p(params.min_p);
+    candidates.temperature(params.temperature);
+    candidates.into_distribution(vocab)
 }
 
 /// Penalise tokens that already appear in `history`, once each.
@@ -510,17 +480,6 @@ fn argmax(logits: &[f32]) -> usize {
         .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
         .map(|(i, _)| i)
         .unwrap_or(0)
-}
-
-fn softmax(logits: &[f32]) -> Vec<f32> {
-    let max = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-    let exps: Vec<f32> = logits.iter().map(|&l| (l - max).exp()).collect();
-    let sum: f32 = exps.iter().sum();
-    if sum <= 0.0 {
-        vec![1.0 / logits.len().max(1) as f32; logits.len()]
-    } else {
-        exps.into_iter().map(|e| e / sum).collect()
-    }
 }
 
 #[cfg(test)]
@@ -676,6 +635,123 @@ mod tests {
         assert!(
             cold.iter().any(|&k| !k),
             "top_p = 0.9 must drop at least one of these four candidates"
+        );
+    }
+
+    /// min-p truncates, and it truncates on llama.cpp's threshold.
+    ///
+    /// llama.cpp enables min-p **by default** at 0.05
+    /// (`common/common.h:231`), so until this existed ferrox could not
+    /// reproduce llama.cpp's own out-of-the-box output on any prompt --
+    /// a parity gap, not a missing feature.
+    ///
+    /// Logits `[4, 3, 2, 1]` at `min_p = 0.2`: the threshold is
+    /// `4 + ln(0.2) = 2.3905`, so exactly the candidates at 4 and 3
+    /// survive. Arithmetic done by hand from
+    /// `src/llama-sampler.cpp:1556`, not read back off the code.
+    #[test]
+    fn min_p_truncates_at_ln_p_below_the_top_logit() {
+        let logits = vec![4.0f32, 3.0, 2.0, 1.0];
+        let params = SamplingParams {
+            temperature: 1.0,
+            min_p: 0.2,
+            ..SamplingParams::default()
+        };
+        let probs = sampling_distribution(&logits, &params, &[]);
+        assert!(probs[0] > 0.0 && probs[1] > 0.0);
+        assert_eq!(probs[2], 0.0, "2.0 is below 4 + ln(0.2) = 2.3905");
+        assert_eq!(probs[3], 0.0);
+        assert!((probs.iter().sum::<f32>() - 1.0).abs() < 1e-6);
+
+        // The two survivors are renormalised against each other:
+        // e^4 / (e^4 + e^3) = 0.7311.
+        assert!((probs[0] - 0.731_059).abs() < 1e-5, "got {}", probs[0]);
+
+        // 0.0 disables it, which is ferrox's struct default -- adding
+        // min-p must not change any existing caller's distribution.
+        let off = SamplingParams {
+            min_p: 0.0,
+            ..params.clone()
+        };
+        let unfiltered = sampling_distribution(&logits, &off, &[]);
+        assert!(unfiltered.iter().all(|&p| p > 0.0));
+    }
+
+    /// min-p runs BEFORE the temperature, so the set it keeps does not
+    /// depend on `--temp`.
+    ///
+    /// This is the same trap as E4 and it bites harder here. min-p's
+    /// test is `logit_i >= logit_max + ln(p)`, and temperature divides
+    /// **both** logits, so it scales the very gap being compared against
+    /// a fixed `ln(p)`. On these logits at `min_p = 0.2`, running min-p
+    /// after a temperature of 0.5 would keep one candidate and after 2.0
+    /// would keep all four; llama.cpp keeps two at every temperature
+    /// (`common/common.h:259-269` puts `MIN_P` before `TEMPERATURE`).
+    ///
+    /// Move `candidates.min_p(..)` after `candidates.temperature(..)` in
+    /// `filtered_distribution` and this goes red.
+    #[test]
+    fn temperature_does_not_change_which_candidates_min_p_keeps() {
+        let logits = vec![3.0f32, 2.0, 1.0, 0.0];
+        let survivors = |temperature: f32| -> Vec<bool> {
+            let params = SamplingParams {
+                temperature,
+                min_p: 0.2,
+                ..SamplingParams::default()
+            };
+            sampling_distribution(&logits, &params, &[])
+                .iter()
+                .map(|&p| p > 0.0)
+                .collect()
+        };
+
+        let cold = survivors(0.5);
+        let warm = survivors(1.0);
+        let hot = survivors(2.0);
+        assert_eq!(cold, warm, "cold={cold:?} warm={warm:?}");
+        assert_eq!(warm, hot, "warm={warm:?} hot={hot:?}");
+        // 3 + ln(0.2) = 1.3905, so exactly the 3.0 and 2.0 candidates.
+        assert_eq!(warm, vec![true, true, false, false]);
+    }
+
+    /// min-p sits AFTER top-p in the chain, and both may bite on the
+    /// same call.
+    ///
+    /// `top_p = 0.95` on this distribution keeps three candidates
+    /// (0.6337 + 0.2331 + 0.0857 = 0.9525); min-p at 0.2 then drops the
+    /// third, whose probability is 0.135 of the top one. Getting only
+    /// one of the two filters gives a different answer either way, so
+    /// this fails if either is dropped or if min-p is skipped when top-p
+    /// already truncated.
+    #[test]
+    fn top_p_and_min_p_both_apply() {
+        let logits = vec![3.0f32, 2.0, 1.0, 0.0];
+        let params = SamplingParams {
+            temperature: 1.0,
+            top_p: 0.95,
+            min_p: 0.2,
+            ..SamplingParams::default()
+        };
+        let probs = sampling_distribution(&logits, &params, &[]);
+        assert_eq!(
+            probs.iter().map(|&p| p > 0.0).collect::<Vec<_>>(),
+            vec![true, true, false, false]
+        );
+
+        // top-p alone keeps three; min-p alone also keeps two here, so
+        // pin the top-p-only case to prove the two filters are distinct
+        // and that this test is not satisfied by min-p doing all the
+        // work.
+        let top_p_only = SamplingParams {
+            min_p: 0.0,
+            ..params.clone()
+        };
+        assert_eq!(
+            sampling_distribution(&logits, &top_p_only, &[])
+                .iter()
+                .filter(|&&p| p > 0.0)
+                .count(),
+            3
         );
     }
 

@@ -68,11 +68,11 @@ pub enum LoadError {
          ferrox's shared generic-GQA path, which ASSUMES plain GQA with {1:?} RoPE and no \
          ALiBi, no learned position embeddings and no per-layer rope skipping. That \
          assumption has already been wrong for gpt2, mpt, refact, bloom and jais, each of \
-         which loaded clean and answered as a different model. Set \
+         which loaded clean and answered as a different model. {2} Set \
          FERROX_ALLOW_UNAUDITED_ARCH=1 to run it anyway and compare the output against \
          llama.cpp yourself"
     )]
-    UnauditedArchitecture(String, crate::config::RopeLayout),
+    UnauditedArchitecture(String, crate::config::RopeLayout, String),
     /// The checkpoint carries per-block tensors this build never reads,
     /// i.e. weights that contribute to the real graph and would simply
     /// be missing from ours. See [`assert_every_tensor_consumed`].
@@ -116,7 +116,15 @@ const SIGMOID_GATING_ARCHITECTURES: &[&str] = &["deepseek2", "glm4moe"];
 // Qwen2-MoE: `.scratch/llama.cpp/src/models/qwen2moe.cpp` — Softmax +
 // `false` for the norm_topk slot. Renormalizing top-k weights made
 // Qwen1.5-MoE greedy decode emit garbage despite shared-expert load.
-const NO_TOPK_RENORMALIZE_ARCHITECTURES: &[&str] = &["olmoe", "qwen2moe"];
+// `deepseek` (V1) added 2026-09-01 by the unaudited-refusal triage.
+// `src/models/deepseek.cpp:145-155` passes `norm_w=false`, and
+// `conversion/deepseek.py`'s `DeepseekModel` never writes
+// `{arch}.expert_weights_norm` -- only `DeepseekV2Model` does -- so no
+// real `deepseek` GGUF carries the key to override the default with.
+// Ferrox therefore renormalised where llama.cpp does not. Same class of
+// bug as the OLMoE one above, and latent only because `deepseek` is
+// unaudited and refuses first.
+const NO_TOPK_RENORMALIZE_ARCHITECTURES: &[&str] = &["deepseek", "olmoe", "qwen2moe"];
 
 fn metadata_u64_any(file: &impl TensorSource, keys: &[String]) -> Option<u64> {
     keys.iter().find_map(|k| file.metadata_u64(k))
@@ -697,7 +705,11 @@ impl ModelConfig {
                 Some("1") | Some("true") | Some("on")
             )
         {
-            return Err(LoadError::UnauditedArchitecture(arch.clone(), rope_layout));
+            return Err(LoadError::UnauditedArchitecture(
+                arch.clone(),
+                rope_layout,
+                crate::capability::unaudited_refusal_detail(&arch),
+            ));
         }
 
         Ok(ModelConfig {
@@ -2507,6 +2519,36 @@ mod tests {
         );
     }
 
+    /// The no-renormalise list is keyed on what llama.cpp's GRAPH does,
+    /// not on what a GGUF says, because for these architectures the
+    /// GGUF says nothing.
+    ///
+    /// `expert_weights_norm` is only written by converters that set it.
+    /// `deepseek.cpp:145` passes `norm_w=false`, and
+    /// `conversion/deepseek.py`'s `DeepseekModel` never writes the key
+    /// -- only `DeepseekV2Model` does. So a real `deepseek` checkpoint
+    /// carries no key at all and ferrox fell through to its default,
+    /// renormalising the selected experts' softmax weights where
+    /// llama.cpp leaves them alone.
+    ///
+    /// The same mistake made OLMoE emit garbage, which is why that list
+    /// exists. This pins the membership so a later edit cannot quietly
+    /// drop a name back into the renormalising default.
+    #[test]
+    fn the_architectures_llama_cpp_does_not_renormalise_are_pinned() {
+        for arch in ["deepseek", "olmoe", "qwen2moe"] {
+            assert!(
+                NO_TOPK_RENORMALIZE_ARCHITECTURES.contains(&arch),
+                "{arch} passes norm_w=false in llama.cpp and must not be renormalised"
+            );
+        }
+        // `deepseek2` is a DIFFERENT architecture whose converter DOES
+        // write the key, so it must not be on this list -- it gets its
+        // answer from the file.
+        assert!(!NO_TOPK_RENORMALIZE_ARCHITECTURES.contains(&"deepseek2"));
+        assert!(!NO_TOPK_RENORMALIZE_ARCHITECTURES.contains(&"qwen3moe"));
+    }
+
     fn config_for_arch(arch: &'static str) -> Result<ModelConfig, LoadError> {
         // The per-arch hyperparameter keys are looked up by the arch's
         // own prefix, so they have to be built for the arch under test.
@@ -2554,7 +2596,7 @@ mod tests {
             "this test needs an arch that is generic AND unaudited"
         );
         match config_for_arch("xverse") {
-            Err(LoadError::UnauditedArchitecture(name, _)) => assert_eq!(name, "xverse"),
+            Err(LoadError::UnauditedArchitecture(name, ..)) => assert_eq!(name, "xverse"),
             other => panic!("expected an unaudited refusal, got {other:?}"),
         }
     }

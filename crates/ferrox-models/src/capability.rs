@@ -79,6 +79,173 @@ pub enum QkNormStyle {
     PerHead,
 }
 
+/// How much work admitting one UNAUDITED architecture to the generic
+/// path would actually be.
+///
+/// Every architecture on the generic path that is not in
+/// [`AUDITED_GENERIC_GQA`] refuses with
+/// `LoadError::UnauditedArchitecture`, and that message used to say the
+/// same thing for all 47 of them. It hid a real difference:
+/// `bailingmoe2` needs a test fixture and nothing else, `deepseek` needs
+/// one name added to one list, and `olmo2` needs a decoder that can skip
+/// the two pre-norms it does not have. A user reading "nobody has
+/// checked this" cannot tell a one-line fix from a new attention
+/// implementation.
+///
+/// **A verdict here is a reading of BOTH trees, never a guess.** Every
+/// non-[`TriageClass::Unknown`] verdict names the `src/models/*.cpp`
+/// line that decides it and the ferrox file that would change.
+/// `Unknown` is a legitimate answer and says what would settle it. The
+/// precedent this rule exists for: four architectures in this very file
+/// once refused while naming a blocker that was not the real one --
+/// `glm4moe` was told it lacked an MLA hyper-parameter it must not have,
+/// and `minimax-m2` was blamed on MTP weights no converter can emit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TriageClass {
+    /// Ferrox already implements everything this architecture needs.
+    /// What is missing is EVIDENCE: a fixture, or a parity run against
+    /// llama.cpp on a real checkpoint.
+    FixtureAway,
+    /// One small, nameable piece is missing: an activation, a norm slot,
+    /// a routing flag, an ordering. Nameable is the bar -- if the blocker
+    /// cannot be written as a sentence naming the thing, it is not this
+    /// class.
+    OneMatchArm,
+    /// A different attention or residual structure: a norm the decoder
+    /// unconditionally applies and this model does not have, a scaled
+    /// residual, ALiBi, MLA, block-sparse, recurrent, hybrid.
+    NewCode,
+    /// Not decidable from reading the two trees. The blocker says what
+    /// would settle it.
+    Unknown,
+}
+
+impl TriageClass {
+    /// Short slug used in the refusal message.
+    pub fn label(self) -> &'static str {
+        match self {
+            TriageClass::FixtureAway => "FIXTURE-AWAY",
+            TriageClass::OneMatchArm => "ONE MATCH ARM",
+            TriageClass::NewCode => "NEW CODE",
+            TriageClass::Unknown => "UNKNOWN",
+        }
+    }
+
+    /// One sentence saying what the class means, so the message stands
+    /// alone without this doc comment.
+    pub fn headline(self) -> &'static str {
+        match self {
+            TriageClass::FixtureAway => {
+                "ferrox already implements everything this architecture needs; what is \
+                 missing is EVIDENCE, not capability"
+            }
+            TriageClass::OneMatchArm => {
+                "one small, named piece is missing -- an activation, a norm slot, a \
+                 routing flag or an ordering"
+            }
+            TriageClass::NewCode => {
+                "a different attention or residual structure than the generic decoder \
+                 computes; this is not a fixture away"
+            }
+            TriageClass::Unknown => {
+                "reading both trees did not settle this one; the note below says what \
+                 would"
+            }
+        }
+    }
+}
+
+/// One architecture's triage verdict, carried on its own catalog row.
+///
+/// Deliberately NOT a second table keyed by architecture name. This repo
+/// has fixed three separate bugs caused by two structures disagreeing
+/// about the same architecture, so the verdict lives on the
+/// [`ArchProfile`] the loader already resolves, and
+/// `every_unaudited_generic_architecture_is_triaged_or_listed_as_pending`
+/// pins that no generic row can exist without one or the other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UnauditedTriage {
+    pub class: TriageClass,
+    /// What is missing, with the llama.cpp `src/models/*.cpp` line that
+    /// decides it and the ferrox file that would change.
+    pub blocker: &'static str,
+}
+
+/// Unaudited generic-path architectures nobody has read against
+/// llama.cpp's graph yet.
+///
+/// This is a TO-DO, not cover. A name here means the refusal honestly
+/// says "not triaged" rather than inventing a class; a name leaves this
+/// list only by gaining an [`UnauditedTriage`] on its catalog row, and
+/// the two tests below make it impossible for a name to be on both or on
+/// neither.
+pub const TRIAGE_PENDING: &[&str] = &[
+    // Norm-RoPE group.
+    "deci",
+    "baichuan",
+    "xverse",
+    "olmo",
+    "arctic",
+    "chatglm",
+    "mistral3",
+    "maincoder",
+    "arcee",
+    "bailingmoe",
+    "nanbeige",
+    "plm",
+    // NEOX-RoPE group.
+    "mistral",
+    "mixtral",
+    "bitnet",
+    "grok",
+    "dbrx",
+    "yi",
+    "afmoe",
+    "apertus",
+    "exaone-moe",
+    "grovemoe",
+    "hunyuan-dense",
+    "laguna",
+    "mellum",
+    "mimo2",
+    "minicpm3",
+    "openelm",
+    "plamo3",
+    "smallthinker",
+    "step35",
+    "talkie",
+];
+
+/// This architecture's triage verdict, or `None` when it has not been
+/// triaged (see [`TRIAGE_PENDING`]) or does not need one.
+pub fn unaudited_triage(arch: &str) -> Option<UnauditedTriage> {
+    resolve_profile(arch).and_then(|p| p.triage)
+}
+
+/// The triage half of the `UnauditedArchitecture` refusal, rendered for
+/// the user.
+///
+/// Appended to the generic "nobody has verified this" sentence so the
+/// message says which of the three classes the architecture is in and
+/// what specifically is missing, rather than the same paragraph for all
+/// 47.
+pub fn unaudited_refusal_detail(arch: &str) -> String {
+    match unaudited_triage(arch) {
+        Some(t) => format!(
+            "TRIAGE ({}): {}. {}.",
+            t.class.label(),
+            t.class.headline(),
+            t.blocker
+        ),
+        None => format!(
+            "TRIAGE: not done for `{arch}` yet -- nobody has read llama.cpp's \
+             src/models/*.cpp for it against the generic decoder, so this refusal names \
+             no blocker and you should not read it as one. Triaging the remaining \
+             architectures is docs/plans/llama-cpp-gap-inventory.md section 8, item 6."
+        ),
+    }
+}
+
 /// Architectures on the shared generic-GQA path that somebody has
 /// actually PROVEN, and the evidence for each.
 ///
@@ -151,6 +318,19 @@ pub struct ArchProfile {
     /// Default QK-norm style when norm tensors are present; loader may
     /// refine from tensor length.
     pub qk_norm: QkNormStyle,
+    /// For an UNAUDITED [`ArchPath::GenericGqa`] row: how far it is from
+    /// running, read against llama.cpp's own graph. `None` on audited
+    /// rows (which run) and on rows still in [`TRIAGE_PENDING`].
+    pub triage: Option<UnauditedTriage>,
+}
+
+impl ArchProfile {
+    /// Attach a triage verdict to a catalog row. Private on purpose:
+    /// verdicts are data of the catalog, not something a caller supplies.
+    fn triaged(mut self, class: TriageClass, blocker: &'static str) -> Self {
+        self.triage = Some(UnauditedTriage { class, blocker });
+        self
+    }
 }
 
 fn prof(
@@ -170,6 +350,7 @@ fn prof(
         rope,
         path,
         qk_norm: qk,
+        triage: None,
     }
 }
 
@@ -225,6 +406,159 @@ fn deferred_scope(name: &'static str, scope: ArchScope, reason: &'static str) ->
     )
 }
 
+/// Triaged rows of the generic **Norm**-RoPE group, with the llama.cpp
+/// line that decides each verdict. Consumed by
+/// [`architecture_catalog`]; a name here must not also appear in the
+/// untriaged list above it or in [`TRIAGE_PENDING`], which
+/// `catalog_has_unique_names` and
+/// `every_unaudited_generic_architecture_is_triaged_or_listed_as_pending`
+/// between them enforce.
+const NORM_ROPE_TRIAGED: &[(&str, TriageClass, &str)] = &[
+    (
+        "internlm2",
+        TriageClass::FixtureAway,
+        "src/models/internlm2.cpp:25-33 creates attn_norm, split Q/K/V via create_tensor_qkv \
+         (whose only biases are TENSOR_NOT_REQUIRED q/k/v biases, which loader.rs already \
+         loads), attn_output, ffn_norm and gate/up/down -- no QK-norm, no post-norms, no \
+         bias the generic decoder has no slot for. The graph is sequential-residual SiLU \
+         SwiGLU (:98,107-115) and load_arch_hparams (:4) reads nothing but the RMS epsilon. \
+         Admitting it needs a fixture or a parity run, not new code",
+    ),
+    (
+        "deepseek",
+        TriageClass::OneMatchArm,
+        "top-k renormalisation. src/models/deepseek.cpp:145-155 passes norm_w=false to \
+         build_moe_ffn, and conversion/deepseek.py's DeepseekModel (:124-217) never writes \
+         {arch}.expert_weights_norm -- only DeepseekV2Model does (:354) -- so no real \
+         `deepseek` GGUF carries the key. ferrox therefore falls back to \
+         `!NO_TOPK_RENORMALIZE_ARCHITECTURES.contains(arch)` (loader.rs:119, currently \
+         [\"olmoe\", \"qwen2moe\"]) and renormalises the selected experts' softmax weights \
+         where llama.cpp does not; adding \"deepseek\" to that list is the change. This is \
+         the same class of bug that made OLMoE answer wrongly. Everything else -- leading \
+         dense (:43), shared experts (:63-65), expert_weights_scale (:153), softmax gating \
+         (:154), sequential residual (:130,172) -- ferrox already has",
+    ),
+    (
+        "ernie4_5",
+        TriageClass::FixtureAway,
+        "src/models/ernie4-5.cpp's dense branch (:39-47,65-67) is the plain Llama tensor set \
+         and its graph (:100-142) is sequential-residual SiLU SwiGLU with \
+         kq_scale=1/sqrt(head_dim) (:120). The only thing ferrox has no slot for is the \
+         OPTIONAL attn_output.bias at :45 (TENSOR_NOT_REQUIRED), and a checkpoint carrying \
+         one is refused BY NAME by assert_every_tensor_consumed rather than run unbiased. \
+         Admitting it needs a fixture, not new code",
+    ),
+    (
+        "ernie4_5-moe",
+        TriageClass::OneMatchArm,
+        "interleaved MoE layers. src/models/ernie4-5-moe.cpp:64 makes a layer MoE only when \
+         `il >= n_layer_dense_lead && (il + 1) % n_moe_layer_step == 0`, but \
+         ModelConfig::layer_is_dense (config.rs:353-355) implements only the leading-dense \
+         prefix and nothing in ferrox reads {arch}.interleave_moe_layer_step \
+         (LLM_KV_INTERLEAVE_MOE_LAYER_STEP, read at ernie4-5.cpp:11). A real checkpoint \
+         therefore looks for blk.N.ffn_gate_exps.weight on a layer that stores \
+         blk.N.ffn_gate.weight and fails on the missing tensor. Routing is SOFTMAX with \
+         norm_w=true (:88-90) plus an optional exp_probs_b (ernie4-5.cpp:53), and \
+         ferrox_moe::route_top_k_biased already applies a selection bias under softmax -- \
+         this architecture is NOT sigmoid-routed",
+    ),
+    ("granite", TriageClass::NewCode, GRANITE_MULTIPLIERS),
+    ("granitemoe", TriageClass::NewCode, GRANITE_MULTIPLIERS),
+    // ferrox-only alias row; no llama.cpp GGUF spells it this way, but
+    // it must not carry a different verdict from `granitemoe`.
+    ("granite-moe", TriageClass::NewCode, GRANITE_MULTIPLIERS),
+];
+
+/// Shared by `granite`, `granitemoe` and the `granite-moe` alias: one
+/// blocker, one string, so the three rows cannot drift apart.
+const GRANITE_MULTIPLIERS: &str =
+    "Granite's four multipliers. src/models/granite.cpp:7 reads {arch}.logit_scale as \
+     REQUIRED (granite-moe.cpp:5 too) and :8-10 reads residual_scale / embedding_scale / \
+     attention.scale; the graph divides the final logits by f_logit_scale (:188) and scales \
+     BOTH branch outputs by f_residual_scale before every residual add (:241-242, :301-302). \
+     The generic decoder applies none of them, and residual_scale in particular touches \
+     every CPU and Metal residual path. In practice a real Granite checkpoint never reaches \
+     THIS message: capability::unsupported_scaling_keys already refuses it by name at \
+     loader.rs:191, which runs before the unaudited gate. Separately, granite.cpp:206 gates \
+     RoPE on `hparams.rope_finetuned`, so a Granite export with rope.finetuned=false gets NO \
+     rotation at all -- the ALiBi class of divergence, with no ferrox expression";
+
+/// Triaged rows of the generic **NEOX**-RoPE group. Same rules as
+/// [`NORM_ROPE_TRIAGED`].
+const NEOX_ROPE_TRIAGED: &[(&str, TriageClass, &str)] = &[
+    (
+        "olmo2",
+        TriageClass::NewCode,
+        "olmo2 has NO pre-attention norm and NO pre-FFN norm. load_arch_tensors creates \
+         attn_post_norm and ffn_post_norm (src/models/olmo2.cpp:47,52) and no attn_norm or \
+         ffn_norm at all; the graph projects Q/K/V straight off the residual (:92, \
+         `cur = inpL`) and runs build_ffn on the raw ffn_inp (:169). The generic decoder \
+         REQUIRES blk.N.attn_norm.weight and a pre-FFN norm and applies both on every layer, \
+         so this is a different residual topology, not a missing tensor. Its post-norms are \
+         NOT the blocker: ferrox applies post_attn_norm and post_ffn_norm in exactly \
+         llama.cpp's places already (:160-163,:178-180 vs decoder.rs:4274-4281,:4333-4341). \
+         olmo2 additionally runs its SWA layers' RoPE with YaRN disabled (freq_scale=1, \
+         ext_factor=0, attn_factor=1, :118-133), a second per-layer RoPE variant ferrox \
+         cannot express",
+    ),
+    (
+        "exaone4",
+        TriageClass::NewCode,
+        "same shape as olmo2: src/models/exaone4.cpp:60-67 creates attn_post_norm, per-head \
+         attn_q_norm/attn_k_norm and ffn_post_norm and NO attn_norm and NO ffn_norm, and the \
+         graph projects Q/K/V off the raw residual (:118) and runs build_ffn on the raw \
+         ffn_inp (:159). The generic decoder requires and applies both pre-norms, which is a \
+         different residual topology. Its optional NEXTN/MTP tensors (:69-73) are a separate \
+         matter and are refused by name by the unread-tensor gate",
+    ),
+    (
+        "seed_oss",
+        TriageClass::OneMatchArm,
+        "the gpt-oss norm slot. seed_oss stores its PRE-FFN norm as \
+         blk.N.post_attention_norm.weight and carries NO blk.N.ffn_norm.weight: \
+         src/models/seed-oss.cpp:36-37 creates attn_norm and attn_post_norm only, and \
+         :113-115 applies attn_post_norm to ffn_inp, i.e. AFTER the attention residual. That \
+         is gpt-oss's slot exactly, and glm4moe's. loader.rs already implements it behind \
+         `let is_gpt_oss = arch == \"gpt-oss\"` (loader.rs:1736, used at :1796 and :2004); \
+         widening that one flag is the change. Everything else (:63-126) is plain GQA with a \
+         sequential residual and SiLU SwiGLU",
+    ),
+    (
+        "exaone",
+        TriageClass::FixtureAway,
+        "src/models/exaone.cpp:29-38 is the plain Llama tensor set plus an optional global \
+         rope_freqs.weight, which loader.rs:521 already loads; the graph is \
+         sequential-residual SiLU SwiGLU (:99,106-113) and load_arch_hparams (:4) reads \
+         nothing but the RMS epsilon. Note this is EXAONE 3.x, not exaone4, which is a \
+         different graph. Admitting it needs a fixture, not new code",
+    ),
+    (
+        "bailingmoe2",
+        TriageClass::FixtureAway,
+        "src/models/bailingmoe2.cpp is plain GQA on the generic path: attn_norm (:47), a \
+         FUSED attn_qkv (:49) that load_qkv_projections already splits, per-head \
+         attn_q_norm/attn_k_norm ({n_embd_head_k}, :52-53) applied BEFORE RoPE (:123-135) the \
+         way ferrox applies them, ffn_norm (:55), leading dense layers (:57), exp_probs_b \
+         (:61), shared experts (:67-69), and expert_weights_norm / expert_weights_scale / \
+         expert_gating_func all read from METADATA (:9-11) rather than hardcoded, which \
+         loader.rs reads too. Sequential residual (:149,191). What is missing is EVIDENCE. \
+         Caveat, and it fails closed: a checkpoint that ships the last n_layer_nextn layers' \
+         NEXTN and layer_out_norm tensors (:78-84) is refused by name by the unread-tensor \
+         gate",
+    ),
+    (
+        "hunyuan-moe",
+        TriageClass::OneMatchArm,
+        "QK-norm ordering. src/models/hunyuan-moe.cpp applies attn_k_norm and attn_q_norm \
+         AFTER ggml_rope_ext -- RoPE at :93 and :104, then build_norm at :110 and :115 -- \
+         while ferrox's decoder norms Q and K and then rotates. That is one named \
+         per-architecture ordering flag, but it changes every layer's attention scores, so it \
+         cannot be admitted without it. Everything else -- attn_norm (:31), ffn_norm (:39), a \
+         shared expert on every layer (:137-143), softmax with norm_w=true and \
+         expert_weights_scale (:147-150), sequential residual (:129,163) -- ferrox has",
+    ),
+];
+
 /// Full inventory keyed by GGUF `general.architecture` string.
 /// Kept in sync with `.scratch/llama.cpp/src/llama-arch.cpp` `LLM_ARCH_NAMES`.
 pub fn architecture_catalog() -> &'static [ArchProfile] {
@@ -243,30 +577,30 @@ pub fn architecture_catalog() -> &'static [ArchProfile] {
             "llama",
             "deci",
             "baichuan",
-            "internlm2",
             "xverse",
             "olmo",
             "arctic",
-            "deepseek",
             "chatglm",
-            "granite",
-            "granitemoe",
-            "granite-moe",
             "mistral3",
             "maincoder",
             "arcee",
-            "ernie4_5",
-            "ernie4_5-moe",
             "bailingmoe",
             "nanbeige",
             "plm",
         ] {
             v.push(gqa_norm(n));
         }
+        // Same generic Norm-RoPE path, but READ against llama.cpp's own
+        // graph -- see [`TriageClass`]. Each row below refuses with its
+        // class and its blocker instead of the generic
+        // "nobody has checked this" paragraph.
+        for (n, class, blocker) in NORM_ROPE_TRIAGED {
+            v.push(gqa_norm(n).triaged(*class, blocker));
+        }
         for n in [
             "olmoe", "qwen2", "qwen2moe", "mistral",
-            "mixtral", "olmo2", "bitnet",
-            "grok", "dbrx", "exaone4", "yi",
+            "mixtral", "bitnet",
+            "grok", "dbrx", "yi",
             // llama-model.cpp `llama_model_rope_type`: LLM_ARCH_OPENAI_MOE
             // falls in the `return LLAMA_ROPE_TYPE_NEOX` group, and a live
             // load of a gpt-oss GGUF prints `rope type = 2` (= NEOX).
@@ -284,25 +618,25 @@ pub fn architecture_catalog() -> &'static [ArchProfile] {
             // `tests/moe_routing_bias.rs`.
             "afmoe",
             "apertus",
-            "bailingmoe2",
             "dots1",
-            "exaone",
             "exaone-moe",
             "grovemoe",
             "hunyuan-dense",
-            "hunyuan-moe",
             "laguna",
             "mellum",
             "mimo2",
             "minicpm3",
             "openelm",
             "plamo3",
-            "seed_oss",
             "smallthinker",
             "step35",
             "talkie",
         ] {
             v.push(gqa_neox(n));
+        }
+        // Triaged NEOX-RoPE rows; see `NORM_ROPE_TRIAGED` above.
+        for (n, class, blocker) in NEOX_ROPE_TRIAGED {
+            v.push(gqa_neox(n).triaged(*class, blocker));
         }
         // --- No RoPE at all: refused, not rotated ------------------
         //
@@ -519,15 +853,31 @@ pub fn architecture_catalog() -> &'static [ArchProfile] {
             ArchPath::GenericGqa { rope: Neox },
             PerHead,
         ));
-        v.push(prof(
-            "gemma",
-            TextGeneration,
-            GemmaFamily,
-            KvGqa,
-            Neox,
-            ArchPath::GenericGqa { rope: Neox },
-            PerHead,
-        ));
+        v.push(
+            prof(
+                "gemma",
+                TextGeneration,
+                GemmaFamily,
+                KvGqa,
+                Neox,
+                ArchPath::GenericGqa { rope: Neox },
+                PerHead,
+            )
+            .triaged(
+                TriageClass::FixtureAway,
+                "src/models/gemma.cpp:16-33 creates exactly the tensors the generic decoder \
+                 loads -- attn_norm, split Q/K/V, attn_output, ffn_norm, gate/up/down -- with \
+                 no biases, no QK-norm and no post-norms, and its graph is \
+                 sequential-residual (:97,115). The three Gemma-specific pieces are all \
+                 implemented: the sqrt(n_embd) embedding scale (:49 vs loader.rs:467-474's \
+                 GemmaFamily embedding_scale), GeGLU (:112 vs FfnActivation::Gelu) and a \
+                 1/sqrt(head_dim) attention scale (:86 scales Q, then :91 passes \
+                 kq_scale=1.0f -- which is what loader.rs:476-480 leaving attention_scale as \
+                 None already produces). Gemma-1 declares no softcap and no sliding window, \
+                 so the Gemma-2/3 machinery is inert here. Admitting it needs a fixture or a \
+                 parity run, not new code",
+            ),
+        );
         v.push(prof(
             "gemma2",
             TextGeneration,
@@ -636,15 +986,30 @@ pub fn architecture_catalog() -> &'static [ArchProfile] {
         // (PhiFamily). Many community checkpoints still tag `phi3`; admit
         // `phi4` the same way so either string can load. Receipts / head-dim
         // FA-vec coverage remain P6 evidence work — not a speed claim.
-        v.push(prof(
-            "phi4",
-            TextGeneration,
-            PhiFamily,
-            KvGqa,
-            Neox,
-            ArchPath::GenericGqa { rope: Neox },
-            WholeVector,
-        ));
+        v.push(
+            prof(
+                "phi4",
+                TextGeneration,
+                PhiFamily,
+                KvGqa,
+                Neox,
+                ArchPath::GenericGqa { rope: Neox },
+                WholeVector,
+            )
+            .triaged(
+                TriageClass::Unknown,
+                "there is no llama.cpp graph to diff against. `phi4` is NOT in LLM_ARCH_NAMES \
+                 -- src/llama-arch.cpp:44 lists \"phi3\" and there is no phi4 entry -- so this \
+                 row is a ferrox-only alias and no llama.cpp-produced GGUF can carry the \
+                 string. ferrox admits it as PhiFamily/NEOX, i.e. phi3's fused-QKV and fused \
+                 gate+up graph, on the assumption that a file spelling it means the same \
+                 thing. WHAT WOULD SETTLE IT: a real GGUF whose general.architecture is \
+                 literally `phi4`. If its blk.0 carries attn_qkv.weight it is phi3's graph \
+                 and this row is fixture-away behind an already-audited phi3; if it carries \
+                 split attn_q/attn_k/attn_v it is a Llama-shaped graph and belongs on a \
+                 different row",
+            ),
+        );
         // Llama 4: MoE + interleaved / non-generic attention graph — not
         // safe to admit as GenericGqa (was wrongly listed with plain llama).
         v.push(prof(
@@ -1346,6 +1711,130 @@ mod audit_tests {
                  though it were RoPE; it cannot be on the audited list"
             );
         }
+    }
+
+    /// Every unaudited generic-path architecture either carries a
+    /// triage verdict or is named on [`TRIAGE_PENDING`] -- never both,
+    /// never neither.
+    ///
+    /// This is the anti-drift gate. Adding a new architecture to the
+    /// generic catalog without either reading it against llama.cpp or
+    /// admitting on the pending list that nobody has, fails here.
+    #[test]
+    fn every_unaudited_generic_architecture_is_triaged_or_listed_as_pending() {
+        for p in architecture_catalog() {
+            if !matches!(p.path, ArchPath::GenericGqa { .. }) || is_audited_generic(p.gguf_name) {
+                continue;
+            }
+            let pending = TRIAGE_PENDING.contains(&p.gguf_name);
+            match (p.triage, pending) {
+                (Some(_), false) | (None, true) => {}
+                (Some(t), true) => panic!(
+                    "`{}` carries a {:?} verdict AND is still on TRIAGE_PENDING; remove it \
+                     from the pending list",
+                    p.gguf_name, t.class
+                ),
+                (None, false) => panic!(
+                    "`{}` is on the generic path, is not audited, has no triage verdict and \
+                     is not on TRIAGE_PENDING. Read \
+                     .scratch/llama.cpp/src/models/ for it, or say so on the pending list",
+                    p.gguf_name
+                ),
+            }
+        }
+    }
+
+    /// A name on [`TRIAGE_PENDING`] that is not an unaudited generic row
+    /// is a stale to-do: it would keep claiming work that no longer
+    /// exists, or point at an architecture the loader never asks about.
+    #[test]
+    fn nothing_on_the_pending_list_is_stale() {
+        for name in TRIAGE_PENDING {
+            let p = resolve_profile(name)
+                .unwrap_or_else(|| panic!("TRIAGE_PENDING names `{name}`, not in the catalog"));
+            assert!(
+                matches!(p.path, ArchPath::GenericGqa { .. }),
+                "`{name}` is on TRIAGE_PENDING but resolves to {:?}, which never reaches the \
+                 unaudited refusal",
+                p.path
+            );
+            assert!(
+                !is_audited_generic(name),
+                "`{name}` is audited and runs; it does not need a triage verdict"
+            );
+        }
+    }
+
+    /// An audited architecture runs. A triage verdict on one would be a
+    /// refusal class attached to something that never refuses.
+    #[test]
+    fn an_audited_architecture_carries_no_triage_verdict() {
+        for name in AUDITED_GENERIC_GQA {
+            assert!(
+                unaudited_triage(name).is_none(),
+                "`{name}` is audited and runs, so it must not carry a triage verdict"
+            );
+        }
+    }
+
+    /// A verdict has to say something. An empty blocker, or one that
+    /// cites no llama.cpp source line, is the failure mode this whole
+    /// item exists to prevent: a refusal that names a blocker nobody
+    /// checked.
+    #[test]
+    fn every_triage_verdict_cites_the_llama_cpp_line_that_decides_it() {
+        let mut seen = 0;
+        for p in architecture_catalog() {
+            let Some(t) = p.triage else { continue };
+            seen += 1;
+            assert!(
+                t.blocker.len() > 80,
+                "`{}`'s blocker is too short to name anything: {:?}",
+                p.gguf_name,
+                t.blocker
+            );
+            let cites_llama_cpp =
+                t.blocker.contains("src/models/") || t.blocker.contains("src/llama-arch.cpp");
+            assert!(
+                cites_llama_cpp,
+                "`{}`'s blocker cites no llama.cpp source: {}",
+                p.gguf_name, t.blocker
+            );
+            if t.class == TriageClass::Unknown {
+                assert!(
+                    t.blocker.contains("WOULD SETTLE IT"),
+                    "`{}` is UNKNOWN but does not say what would settle it",
+                    p.gguf_name
+                );
+            }
+        }
+        assert!(seen >= 15, "expected the batch-1 triage rows, found {seen}");
+    }
+
+    /// The class reaches the message. Two architectures in different
+    /// classes must not read the same, which is the defect being fixed.
+    #[test]
+    fn the_refusal_detail_distinguishes_the_classes() {
+        let fixture = unaudited_refusal_detail("bailingmoe2");
+        let arm = unaudited_refusal_detail("seed_oss");
+        let new_code = unaudited_refusal_detail("olmo2");
+        let untriaged = unaudited_refusal_detail("grok");
+        assert!(fixture.contains("FIXTURE-AWAY"), "{fixture}");
+        assert!(arm.contains("ONE MATCH ARM"), "{arm}");
+        assert!(new_code.contains("NEW CODE"), "{new_code}");
+        assert!(untriaged.contains("not done for `grok` yet"), "{untriaged}");
+        for a in [&fixture, &arm, &new_code, &untriaged] {
+            for b in [&fixture, &arm, &new_code, &untriaged] {
+                if !std::ptr::eq(a, b) {
+                    assert_ne!(a, b, "two refusal details are identical");
+                }
+            }
+        }
+        // The blocker itself, not only the class label, has to be in the
+        // message -- a class with no specifics is the old refusal with a
+        // new adjective.
+        assert!(arm.contains("post_attention_norm"), "{arm}");
+        assert!(new_code.contains("olmo2.cpp:47,52"), "{new_code}");
     }
 
     /// An architecture nobody has checked is not audited, which is the

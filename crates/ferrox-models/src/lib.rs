@@ -50,6 +50,7 @@ pub mod output_projection;
 pub mod prefix_cache;
 pub mod recurrent_engine;
 pub mod residency_report;
+pub(crate) mod sampler_chain;
 pub mod sampling;
 pub mod speculative;
 pub mod t5_engine;

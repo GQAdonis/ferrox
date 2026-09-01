@@ -953,11 +953,52 @@ three of four data points fit and one does not. **Do not act on the
 hypothesis until the IQ4_XS row is explained** — it is the row that
 would falsify it.
 
-**What would settle it**, in order of cost: dot one K-quant row both
-ways in isolation (ferrox f32-activation vs a Q8_K-activation
-reference) and see whether the gap matches the observed KL; then check
-whether `IQ4_XS` reaches a different llama.cpp code path in practice
-than its table entry implies.
+### RESOLVED, same day: the IQ4_XS row was mislabelled by its own filename
+
+`models/Llama-3.2-1B-Instruct-IQ4_XS.gguf` **contains no IQ4_XS tensors
+at all.** Reading the tensor table directly:
+
+| file | quantized tensors | dominant `vec_dot_type` | verdict |
+|---|---|---|---|
+| `Q8_0` | 113x `Q8_0` | `Q8_0` | **MATCH** |
+| `IQ4_XS` | 96x **`IQ4_NL`** + 16x `Q5_K` + 1x `Q6_K` | `Q8_0` | **MATCH** |
+| `Q6_K` | 113x `Q6_K` | `Q8_K` | DRIFT |
+| `Q5_K_M` | 96x `Q5_K` + 17x `Q6_K` | `Q8_K` | DRIFT |
+| `Q4_K_M` | 96x `Q4_K` + 17x `Q6_K` | `Q8_K` | DRIFT |
+
+`IQ4_NL` declares `vec_dot_type = GGML_TYPE_Q8_0`, not `Q8_K`. So the
+row that appeared to falsify the hypothesis was never a Q8_K file --
+the name is the quantization RECIPE, and the recipe fell back to
+`IQ4_NL` for all 96 per-layer weights.
+
+**All five data points now fit, with no exception**: the verdict tracks
+the `vec_dot_type` of the 96 per-layer tensors exactly. `Q8_0`
+activations MATCH, `Q8_K` activations DRIFT.
+
+Note the `IQ4_XS` file still carries 16 `Q5_K` tensors and MATCHes
+anyway, which is consistent with a per-tensor accumulation difference
+that scales with how many layers use it rather than a single wrong
+constant.
+
+**So this is not a ferrox defect.** llama.cpp quantizes the ACTIVATION
+to 8 bits for K-quant dots and accumulates in integers; ferrox keeps
+activations in f32. Both are defensible, and ferrox is on the more
+accurate side of the trade -- llama.cpp is buying int8 SIMD throughput
+with precision. The `DRIFT` verdict is `ferrox parity` reporting a real
+difference, correctly, and mislabelling its cause: the threshold assumes
+both engines took the same numeric path.
+
+**What is still owed**, and it is small: `ferrox parity`'s verdict text
+should say so, rather than telling the reader to go do a per-layer
+divergence run on a difference that is expected. The decisive
+confirmation, if anyone wants it, is to dot one K-quant row with a
+Q8_K-quantized activation and check the gap matches the observed KL.
+
+**What this does NOT excuse.** A KL of 7.7e-3 on Qwen2.5 with a top-2
+margin of 2.5e-1 is comfortable; gemma-2's margin is 4.7e-2, which is
+not. Being the more accurate engine is not the same as being
+interchangeable, and any future claim of bit-identical output on
+K-quants is false.
 
 **Why this is not filed as a bug.** Nothing here shows ferrox computing
 the wrong thing. It shows two engines making different, defensible

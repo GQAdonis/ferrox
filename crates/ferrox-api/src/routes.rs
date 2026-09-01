@@ -20,6 +20,40 @@ pub const V1_CHAT_COMPLETIONS: &str = "/v1/chat/completions";
 pub const V1_COMPLETIONS: &str = "/v1/completions";
 pub const V1_TOKENIZE: &str = "/v1/tokenize";
 pub const V1_DETOKENIZE: &str = "/v1/detokenize";
+
+/// llama.cpp's **native** completion endpoint, which is not
+/// [`V1_COMPLETIONS`] with a shorter path.
+///
+/// Different request shape (`n_predict`, `repeat_penalty`,
+/// `cache_prompt`, …) and a different response shape (a flat object
+/// with `content` and `stop`, not `choices`), and its stream is a
+/// sequence of `data: {"content":…,"stop":false}` frames with **no**
+/// `[DONE]` sentinel. This is what llama.cpp's own web UI, `llama.vim`
+/// and a long tail of wrappers speak; `/v1/completions` is the OpenAI
+/// dialect and stays what it is.
+pub const COMPLETION: &str = "/completion";
+
+/// llama.cpp mounts its native endpoint under both spellings
+/// (`tools/server/server.cpp:240-241`), the plural being the one its
+/// own web UI uses. **Not** an alias of [`V1_COMPLETIONS`]: dropping
+/// the `/v1` changes the dialect, not just the path.
+pub const COMPLETIONS: &str = "/completions";
+
+/// llama.cpp's spelling of [`V1_TOKENIZE`], mounted on the same
+/// handler.
+///
+/// The `/v1/` prefix was ferrox's invention: OpenAI has no tokenize
+/// endpoint at all, and llama.cpp serves this one unprefixed
+/// (`tools/server/server.cpp:259`). Every llama.cpp client therefore
+/// asked for a path that did not exist, and got a 404 that named
+/// nothing. Both spellings now answer, and the handler accepts
+/// llama.cpp's `content` field alongside ferrox's `prompt`.
+pub const TOKENIZE: &str = "/tokenize";
+
+/// llama.cpp's spelling of [`V1_DETOKENIZE`], mounted on the same
+/// handler (`tools/server/server.cpp:260`). The response carries the
+/// text under both `content` (llama.cpp's key) and `text` (ferrox's).
+pub const DETOKENIZE: &str = "/detokenize";
 pub const V1_EMBEDDINGS: &str = "/v1/embeddings";
 
 /// Anthropic-compatible messages endpoint.
@@ -169,8 +203,12 @@ pub const ALL: &[&str] = &[
     V1_MODELS,
     V1_CHAT_COMPLETIONS,
     V1_COMPLETIONS,
+    COMPLETION,
+    COMPLETIONS,
     V1_TOKENIZE,
     V1_DETOKENIZE,
+    TOKENIZE,
+    DETOKENIZE,
     V1_EMBEDDINGS,
     V1_MESSAGES,
     V1_MESSAGES_COUNT_TOKENS,
@@ -200,6 +238,17 @@ mod tests {
             assert!(route.starts_with('/'), "{route} is not an absolute path");
             assert!(!route.ends_with('/'), "{route} has a trailing slash");
             assert!(seen.insert(*route), "{route} is listed twice");
+        }
+    }
+
+    /// The whole point of these two is that a llama.cpp client's URL
+    /// works unchanged, so each must be its `/v1` twin with the prefix
+    /// removed and nothing else changed.
+    #[test]
+    fn the_llama_cpp_aliases_are_the_v1_paths_without_the_prefix() {
+        for (alias, v1) in [(TOKENIZE, V1_TOKENIZE), (DETOKENIZE, V1_DETOKENIZE)] {
+            assert_eq!(v1, format!("/v1{alias}"));
+            assert!(ALL.contains(&alias), "{alias} must be enumerable");
         }
     }
 

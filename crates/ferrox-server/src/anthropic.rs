@@ -93,10 +93,9 @@ use serde_json::{json, Value};
 use crate::generate::Usage;
 use crate::output::{OutputPosture, ParsedOutput};
 use crate::{
-    attribution, decode_error_response, join_error_response, output, prompt_from_messages,
-    run_generation, run_generation_emit, sse, stats, ApiError, AppState, ChatCompletionRequest,
-    ChatMessage, MessageContent, StopParam, ThinkingSwitch, ToolCallFunctionIn, ToolCallIn,
-    ToolDef, ToolFunctionDef,
+    attribution, decode_error_response, output, prompt_from_messages, run_generation_emit, sse,
+    stats, ApiError, AppState, ChatCompletionRequest, ChatMessage, MessageContent, StopParam,
+    ThinkingSwitch, ToolCallFunctionIn, ToolCallIn, ToolDef, ToolFunctionDef,
 };
 
 /// Stream silence after which a protocol-native `ping` goes out.
@@ -1397,28 +1396,12 @@ async fn messages_full(
     let caller_stops = chat.stop_sequences();
     let params = chat.generation_params_for_template(&template)?;
 
-    let model = Arc::clone(&active.model);
-    let kv_pool = state.kv_pool.clone();
-    let paged_kv = state.paged_kv.clone();
-    let prefix_cache = state.prefix_cache.clone();
-    let batcher = active.batcher.clone();
-    let ceiling = active.ceiling.clone();
-    let (chunks, finish, usage) = tokio::task::spawn_blocking(move || {
-        run_generation(
-            &model,
-            &prompt,
-            &params,
-            kv_pool.as_ref(),
-            paged_kv.as_ref(),
-            prefix_cache.as_deref(),
-            batcher.as_ref(),
-            ceiling.as_deref(),
-        )
-    })
+    let (chunks, finish, usage) = crate::decode_task::buffered(
+        crate::decode_task::DecodeHandles::take(&state, &active),
+        prompt,
+        params,
+    )
     .await
-    .map_err(join_error_response)
-    .map_err(anthropic_shape)?
-    .map_err(decode_error_response)
     .map_err(anthropic_shape)?;
 
     let parsed = output::parse_output(&chunks.concat(), &prepared.parser_tools, posture);

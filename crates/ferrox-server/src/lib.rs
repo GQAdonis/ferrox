@@ -41,7 +41,9 @@ mod budget;
 mod cache_admin;
 mod cancel;
 mod chat_template;
+mod completion;
 mod conversations;
+mod decode_task;
 mod generate;
 mod grammar_request;
 mod health;
@@ -516,6 +518,24 @@ impl Model {
             Model::Mla(m) => m.tokenizer.encode(text),
             Model::Gemma4(m) => m.tokenizer.encode(text),
             Model::Glm52(m) => m.tokenizer.encode(text),
+        }
+    }
+
+    /// The BOS id the generation path would prepend, or `None` when
+    /// this checkpoint's own metadata says not to prepend one.
+    ///
+    /// Read by `/tokenize`'s `add_special`, so that endpoint reports
+    /// the prompt the model would actually be given rather than a
+    /// second opinion about it. Kimi has no BOS id plumbed through the
+    /// server -- `run_generation` passes `None` for it -- and this
+    /// agrees with that rather than inventing one.
+    pub(crate) fn bos_id(&self) -> Option<usize> {
+        match self {
+            Model::Gguf(m) => m.bos_id,
+            Model::Kimi(_) => None,
+            Model::Mla(m) => m.bos_id,
+            Model::Gemma4(m) => m.bos_id,
+            Model::Glm52(m) => m.bos_id,
         }
     }
 
@@ -1212,6 +1232,10 @@ impl ChatCompletionRequest {
             repetition_penalty: self.repetition_penalty,
             presence_penalty: self.presence_penalty,
             frequency_penalty: self.frequency_penalty,
+            // The OpenAI wire has no field for the penalty window; only
+            // llama.cpp's native `/completion` does. See
+            // `SamplingKnobs::penalty_last_n`.
+            penalty_last_n: None,
         }
     }
 
@@ -2714,29 +2738,13 @@ async fn chat_completions_full(
         tracing::debug!("cache hit for key {}", key.as_ref().unwrap().digest());
         (cached, "hit")
     } else {
-        let model = Arc::clone(&active.model);
-        let kv_pool = state.kv_pool.clone();
-        let paged_kv = state.paged_kv.clone();
-        let prefix_cache = state.prefix_cache.clone();
-        let batcher = active.batcher.clone();
-        let ceiling = active.ceiling.clone();
         let params = req.generation_params_for_template(&template)?;
-        let prompt_for_task = prompt.clone();
-        let (chunks, finish, usage) = tokio::task::spawn_blocking(move || {
-            run_generation(
-                &model,
-                &prompt_for_task,
-                &params,
-                kv_pool.as_ref(),
-                paged_kv.as_ref(),
-                prefix_cache.as_deref(),
-                batcher.as_ref(),
-                ceiling.as_deref(),
-            )
-        })
-        .await
-        .map_err(join_error_response)?
-        .map_err(decode_error_response)?;
+        let (chunks, finish, usage) = decode_task::buffered(
+            decode_task::DecodeHandles::take(&state, &active),
+            prompt.clone(),
+            params,
+        )
+        .await?;
 
         let completion = response_cache::CachedCompletion {
             content: chunks.concat(),
@@ -4332,8 +4340,21 @@ async fn run(mcp_config_path: Option<PathBuf>, exit_on_stdin_close: bool) -> any
             post(anthropic::count_tokens),
         )
         .route(routes::V1_COMPLETIONS, post(openai_extra::completions))
+        // llama.cpp's NATIVE completion endpoint, under both spellings
+        // it mounts. Not an alias of the line above: different request
+        // fields, a different response object, and a stream that ends
+        // without `[DONE]`. See `crate::completion`.
+        .route(routes::COMPLETION, post(completion::completion))
+        .route(routes::COMPLETIONS, post(completion::completion))
         .route(routes::V1_TOKENIZE, post(openai_extra::tokenize))
         .route(routes::V1_DETOKENIZE, post(openai_extra::detokenize))
+        // llama.cpp's unprefixed spelling of the same two, on the SAME
+        // handlers -- not copies. The `/v1/` prefix was ferrox's
+        // invention (OpenAI has no tokenize endpoint), so every
+        // llama.cpp client was getting a 404 that named nothing. Behind
+        // the key with their twins: they read the loaded vocabulary.
+        .route(routes::TOKENIZE, post(openai_extra::tokenize))
+        .route(routes::DETOKENIZE, post(openai_extra::detokenize))
         .route(routes::V1_EMBEDDINGS, post(openai_extra::embeddings))
         .route(routes::CACHE_STATS, get(cache_stats))
         .route(routes::METRICS, get(metrics))
@@ -4703,8 +4724,22 @@ mod tests {
             )
             .route("/v1/tokenize", post(openai_extra::tokenize))
             .route("/v1/detokenize", post(openai_extra::detokenize))
+            // llama.cpp's unprefixed spelling, mounted here too so the
+            // tests below reach the alias through a real router rather
+            // than by calling the handler function directly.
+            .route(ferrox_api::routes::TOKENIZE, post(openai_extra::tokenize))
+            .route(
+                ferrox_api::routes::DETOKENIZE,
+                post(openai_extra::detokenize),
+            )
             .route("/v1/embeddings", post(openai_extra::embeddings))
             .route("/v1/completions", post(openai_extra::completions))
+            // llama.cpp's native endpoint, under both of its spellings.
+            .route(ferrox_api::routes::COMPLETION, post(completion::completion))
+            .route(
+                ferrox_api::routes::COMPLETIONS,
+                post(completion::completion),
+            )
             .route(
                 ferrox_api::routes::ADMIN_MODELS_UNLOAD,
                 post(admin::unload_model),
@@ -5189,6 +5224,372 @@ mod tests {
         );
     }
 
+    /// A router over a model that is NOT flagged synthetic, so the
+    /// decode loop actually emits chunks: `run_generation_emit`
+    /// suppresses `emit` for a synthetic model, and a streaming test
+    /// against one would see only the terminal frame.
+    fn streaming_test_app() -> Router {
+        let mut cfg = test_dense_fixture();
+        cfg.vocab_size = 256;
+        let model = Model::Gguf(GgufModel {
+            decoder: Arc::new(Decoder::new_random_small(cfg, 2, 256)),
+            tokenizer: Arc::new(ServerTokenizer::Byte),
+            stop_tokens: StopTokens::default(),
+            bos_id: None,
+            is_synthetic: false,
+            chat_template: chat_template::PromptTemplate::plain(),
+        });
+        test_app_with_state(Arc::new(test_state(
+            model,
+            ResponseCache::new(1000, Duration::from_secs(3600)),
+        )))
+    }
+
+    /// llama.cpp's native endpoint is a different WIRE, not a shorter
+    /// path to the OpenAI one. If this ever starts answering `choices`,
+    /// every llama.cpp client reading `content` breaks silently.
+    #[tokio::test]
+    async fn the_native_completion_wire_is_not_the_openai_one() {
+        let app = test_app();
+
+        let (status, native) = post_json_uri(
+            &app,
+            ferrox_api::routes::COMPLETION,
+            serde_json::json!({"prompt": "hi", "n_predict": 4}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{native}");
+        assert!(native["content"].is_string(), "{native}");
+        assert_eq!(native["stop"], true);
+        assert_eq!(native["stop_type"], "limit");
+        assert_eq!(native["stopping_word"], "");
+        assert_eq!(native["truncated"], false);
+        assert_eq!(native["id_slot"], -1);
+        assert!(native["timings"]["prompt_n"].is_number(), "{native}");
+        assert!(native["generation_settings"]["n_predict"] == 4, "{native}");
+        assert!(
+            native.get("choices").is_none(),
+            "the native shape has no `choices`: {native}"
+        );
+
+        let (status, openai) = post_json_uri(
+            &app,
+            ferrox_api::routes::V1_COMPLETIONS,
+            serde_json::json!({"prompt": "hi", "max_tokens": 4}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(openai["choices"][0]["text"].is_string(), "{openai}");
+        assert!(
+            openai.get("content").is_none(),
+            "the OpenAI shape has no top-level `content`: {openai}"
+        );
+    }
+
+    /// llama.cpp mounts the native endpoint under both spellings
+    /// (`server.cpp:240-241`), and its own web UI uses the plural. One
+    /// handler, so the two cannot answer differently.
+    #[tokio::test]
+    async fn both_native_spellings_reach_the_same_handler() {
+        let app = test_app();
+        for route in [
+            ferrox_api::routes::COMPLETION,
+            ferrox_api::routes::COMPLETIONS,
+        ] {
+            let (status, body) = post_json_uri(
+                &app,
+                route,
+                serde_json::json!({"prompt": "hi", "n_predict": 2, "seed": 1}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{route}: {body}");
+            assert_eq!(body["stop"], true, "{route}");
+            assert!(body["content"].is_string(), "{route}");
+        }
+
+        // And the ring records which one was called, so the split
+        // between clients stays visible.
+        let (_, stats) = get_json(&app, ferrox_api::routes::ADMIN_STATS).await;
+        let routes: Vec<&str> = stats["recent"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["route"].as_str().unwrap())
+            .collect();
+        assert!(
+            routes.contains(&ferrox_api::routes::COMPLETION),
+            "{routes:?}"
+        );
+        assert!(
+            routes.contains(&ferrox_api::routes::COMPLETIONS),
+            "{routes:?}"
+        );
+    }
+
+    /// The native stream is not OpenAI's. Frames are bare objects with
+    /// `content` and `stop`, the last one carries `stop: true` and the
+    /// whole terminal body, and there is **no `[DONE]`** -- a client
+    /// waiting for one would hang, and one that got it would try to
+    /// parse it as JSON.
+    #[tokio::test]
+    async fn a_native_stream_ends_on_a_stop_frame_with_no_done_sentinel() {
+        let app = streaming_test_app();
+        let raw = post_sse_raw_uri(
+            &app,
+            ferrox_api::routes::COMPLETION,
+            serde_json::json!({"prompt": "hi", "n_predict": 6, "stream": true, "seed": 7}),
+        )
+        .await;
+
+        assert!(
+            !raw.contains("[DONE]"),
+            "llama.cpp's native stream has no sentinel: {raw}"
+        );
+        let frames: Vec<serde_json::Value> = raw
+            .lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .map(|json| serde_json::from_str(json).expect("every frame is one JSON object"))
+            .collect();
+        assert!(frames.len() >= 2, "expected partials then a final: {raw}");
+
+        let (last, partials) = frames.split_last().unwrap();
+        assert_eq!(last["stop"], true, "the last frame closes the stream");
+        assert!(last["timings"].is_object(), "{last}");
+        assert!(last["stop_type"].is_string(), "{last}");
+        for partial in partials {
+            assert_eq!(partial["stop"], false, "{partial}");
+            assert!(partial["content"].is_string(), "{partial}");
+            // Upstream's documented partial carries content/tokens/stop
+            // and nothing else; the terminal fields belong to the last
+            // frame only.
+            assert!(partial.get("timings").is_none(), "{partial}");
+            assert!(partial.get("generation_settings").is_none(), "{partial}");
+        }
+        // The concatenated partials are the answer, so a client that
+        // streams sees what a client that buffers would get.
+        let streamed: String = partials
+            .iter()
+            .filter_map(|p| p["content"].as_str())
+            .collect();
+        assert_eq!(last["content"].as_str().unwrap(), streamed);
+    }
+
+    /// `n_predict: -1` is llama.cpp's default AND its "until the
+    /// context is full". With no derived ceiling there is no context to
+    /// be full of, and quietly substituting a small budget would hand a
+    /// caller a truncated answer it never asked for.
+    #[tokio::test]
+    async fn an_unbounded_n_predict_is_refused_rather_than_quietly_shrunk() {
+        let app = test_app();
+        for body in [
+            serde_json::json!({"prompt": "hi"}),
+            serde_json::json!({"prompt": "hi", "n_predict": -1}),
+        ] {
+            let (status, refusal) =
+                post_json_uri(&app, ferrox_api::routes::COMPLETION, body.clone()).await;
+            assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{body}: {refusal}");
+            assert!(
+                refusal["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("n_predict"),
+                "{refusal}"
+            );
+        }
+        // An explicit budget is served, so the refusal is about the
+        // unbounded case and not about the endpoint.
+        let (status, _) = post_json_uri(
+            &app,
+            ferrox_api::routes::COMPLETION,
+            serde_json::json!({"prompt": "hi", "n_predict": 2}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    /// A caller's `stop` must actually reach the sampler, and be named
+    /// back in llama.cpp's own vocabulary. Dropping it is the dangerous
+    /// silent failure: the caller believes generation halts at its
+    /// sentinel and instead gets the whole budget of text past it.
+    ///
+    /// Deterministic without depending on what random weights say:
+    /// generate once with no stop, then take a character out of that
+    /// answer and demand the second run halt before it.
+    #[tokio::test]
+    async fn a_stop_string_halts_the_answer_and_is_named_back() {
+        let app = streaming_test_app();
+        let ask = |stop: serde_json::Value| {
+            let app = app.clone();
+            async move {
+                post_json_uri(
+                    &app,
+                    ferrox_api::routes::COMPLETION,
+                    serde_json::json!({
+                        "prompt": "hi",
+                        "n_predict": 64,
+                        "ignore_eos": true,
+                        "stop": stop,
+                    }),
+                )
+                .await
+                .1
+            }
+        };
+
+        let baseline = ask(serde_json::json!([])).await;
+        assert_eq!(baseline["stop_type"], "limit");
+        assert_eq!(baseline["stopping_word"], "");
+        let text = baseline["content"].as_str().unwrap().to_string();
+        // Two characters, so the sentinel is more than one token in
+        // this vocabulary and goes through the output-suffix layer that
+        // reports WHICH string matched. A single-token stop is caught
+        // by the token layer, which does not carry the string back --
+        // see `stop_type`'s note and docs/API.md.
+        let sentinel: String = text.chars().skip(1).take(2).collect();
+        assert_eq!(
+            sentinel.chars().count(),
+            2,
+            "the fixture must produce enough output to cut: {text:?}"
+        );
+        let cut = text.find(&sentinel).expect("it came out of this text");
+
+        let stopped = ask(serde_json::json!([sentinel])).await;
+        assert_eq!(stopped["stop_type"], "word", "{stopped}");
+        assert_eq!(stopped["stopping_word"], sentinel);
+        assert_eq!(
+            stopped["content"].as_str().unwrap(),
+            &text[..cut],
+            "the answer must be cut at the sentinel, not run past it"
+        );
+    }
+
+    /// llama.cpp mounts these two unprefixed and sends `content`, not
+    /// `prompt`. ferrox mounted only the `/v1/` spelling it invented,
+    /// so every llama.cpp client got a 404 that named nothing. The
+    /// alias must reach the SAME handler -- identical ids for identical
+    /// text -- rather than a second implementation of it.
+    #[tokio::test]
+    async fn the_llama_cpp_spelling_of_tokenize_reaches_the_same_handler() {
+        let app = test_app();
+
+        let (v1_status, v1) = post_json_uri(
+            &app,
+            ferrox_api::routes::V1_TOKENIZE,
+            serde_json::json!({"prompt": "hello"}),
+        )
+        .await;
+        let (alias_status, alias) = post_json_uri(
+            &app,
+            ferrox_api::routes::TOKENIZE,
+            serde_json::json!({"content": "hello"}),
+        )
+        .await;
+        assert_eq!(v1_status, StatusCode::OK);
+        assert_eq!(alias_status, StatusCode::OK, "{alias}");
+        assert_eq!(v1["tokens"], alias["tokens"]);
+        assert!(!alias["tokens"].as_array().unwrap().is_empty());
+
+        // And the reverse: ferrox's own field still works on llama.cpp's
+        // path, so a client that switches URLs need not switch dialects.
+        let (status, both_ways) = post_json_uri(
+            &app,
+            ferrox_api::routes::TOKENIZE,
+            serde_json::json!({"prompt": "hello"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(both_ways["tokens"], v1["tokens"]);
+    }
+
+    /// llama.cpp answers detokenize under `content`
+    /// (`server-context.cpp:4970`); ferrox has always answered under
+    /// `text`. Both keys carry the same string, so neither dialect's
+    /// client reads a null.
+    #[tokio::test]
+    async fn detokenize_answers_under_both_dialects_keys() {
+        let app = test_app();
+        for route in [
+            ferrox_api::routes::DETOKENIZE,
+            ferrox_api::routes::V1_DETOKENIZE,
+        ] {
+            let (status, body) =
+                post_json_uri(&app, route, serde_json::json!({"tokens": [104, 105]})).await;
+            assert_eq!(status, StatusCode::OK, "{route}");
+            assert_eq!(body["text"], "hi", "{route}");
+            assert_eq!(body["content"], body["text"], "{route}");
+        }
+    }
+
+    /// The alias is one handler, so the ring must not attribute a
+    /// llama.cpp client's traffic to the ferrox spelling: the row
+    /// carries the path that was actually matched.
+    #[tokio::test]
+    async fn the_alias_is_recorded_under_the_path_the_client_called() {
+        let app = test_app();
+        let (status, _) = post_json_uri(
+            &app,
+            ferrox_api::routes::TOKENIZE,
+            serde_json::json!({"content": "hello"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let (_, stats) = get_json(&app, ferrox_api::routes::ADMIN_STATS).await;
+        let routes: Vec<&str> = stats["recent"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["route"].as_str().unwrap())
+            .collect();
+        assert!(
+            routes.contains(&ferrox_api::routes::TOKENIZE),
+            "the alias must be its own row: {routes:?}"
+        );
+        assert!(
+            !routes.contains(&ferrox_api::routes::V1_TOKENIZE),
+            "nothing called /v1/tokenize: {routes:?}"
+        );
+    }
+
+    /// `add_special` is llama.cpp's "prepend BOS". Honoured, and with
+    /// the id the generation path itself would prepend -- a tokenize
+    /// endpoint that disagrees with the decoder about the prompt is
+    /// worse than one that has no such option.
+    #[tokio::test]
+    async fn add_special_prepends_the_same_bos_the_decoder_would() {
+        let mut cfg = test_dense_fixture();
+        cfg.vocab_size = 256;
+        let model = Model::Gguf(GgufModel {
+            decoder: Arc::new(Decoder::new_random_small(cfg, 2, 256)),
+            tokenizer: Arc::new(ServerTokenizer::Byte),
+            stop_tokens: StopTokens::default(),
+            bos_id: Some(7),
+            is_synthetic: true,
+            chat_template: chat_template::PromptTemplate::plain(),
+        });
+        let app = test_app_with_state(Arc::new(test_state(
+            model,
+            ResponseCache::new(1000, Duration::from_secs(3600)),
+        )));
+
+        let (_, plain) = post_json_uri(
+            &app,
+            ferrox_api::routes::TOKENIZE,
+            serde_json::json!({"content": "hi"}),
+        )
+        .await;
+        let (_, special) = post_json_uri(
+            &app,
+            ferrox_api::routes::TOKENIZE,
+            serde_json::json!({"content": "hi", "add_special": true}),
+        )
+        .await;
+
+        assert_eq!(plain["tokens"], serde_json::json!([104, 105]));
+        assert_eq!(special["tokens"], serde_json::json!([7, 104, 105]));
+        assert_eq!(special["count"], 3);
+    }
+
     /// A failed small-endpoint call is still traffic. A 400 that leaves
     /// no row is indistinguishable from a request that was never sent.
     #[tokio::test]
@@ -5369,6 +5770,13 @@ mod tests {
     /// `data:`. Those two fields are the whole of the replay contract
     /// on the wire.
     async fn post_sse_raw(app: &Router, body: serde_json::Value) -> String {
+        post_sse_raw_uri(app, ferrox_api::routes::V1_CHAT_COMPLETIONS, body).await
+    }
+
+    /// The same, on any route: `/completion` streams a different
+    /// protocol over the same transport, and a second copy of this
+    /// helper would be a second thing to keep in step.
+    async fn post_sse_raw_uri(app: &Router, uri: &str, body: serde_json::Value) -> String {
         use http_body_util::BodyExt;
         use tower::ServiceExt;
 
@@ -5377,7 +5785,7 @@ mod tests {
             .oneshot(
                 axum::http::Request::builder()
                     .method("POST")
-                    .uri("/v1/chat/completions")
+                    .uri(uri)
                     .header("content-type", "application/json")
                     .body(axum::body::Body::from(serde_json::to_vec(&body).unwrap()))
                     .unwrap(),

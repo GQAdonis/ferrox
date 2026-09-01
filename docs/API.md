@@ -14,6 +14,7 @@ comes back the same way.
 | `GET /v1/models` | Supported |
 | `POST /v1/chat/completions` | Supported (JSON + SSE) |
 | `POST /v1/completions` | Supported (`prompt`, `max_tokens`, sampling subset) |
+| `POST /completion` · `POST /completions` | llama.cpp's **native** completion endpoint, JSON + its own SSE shape. Not an alias of the line above (see below) |
 | `POST /v1/tokenize` · `POST /tokenize` | Supported. The unprefixed spelling is llama.cpp's, on the same handler (see below) |
 | `POST /v1/detokenize` · `POST /detokenize` | Supported, same aliasing |
 | `POST /v1/embeddings` | Supported for GGUF Decoder (mean/last pool of hidden states) |
@@ -847,6 +848,113 @@ every request, and there is no token whose logit it would move — so
 refusing it is a false refusal. A non-object (`[]`, `"none"`) is still
 refused, so nothing falls through the empty-map hole.
 
+## llama.cpp's native `/completion`
+
+`POST /completion` and `POST /completions` are llama.cpp's own
+completion endpoint, which is **not** `/v1/completions` with a shorter
+path. Different request fields, a different response object, and a
+different stream. It is what llama.cpp's own web UI, `llama.vim` and a
+long tail of wrappers speak; before it existed here they got a 404.
+
+| | `/completion` (llama.cpp) | `/v1/completions` (OpenAI) |
+|---|---|---|
+| budget | `n_predict`; `-1`, and absent, mean "until the context is full" | `max_tokens`, default 16 |
+| repetition | `repeat_penalty`, `repeat_last_n` | `repetition_penalty` |
+| response | flat object: `content`, `stop`, `stop_type`, `timings`, `generation_settings` | `choices[].text`, `finish_reason` |
+| stream frame | `data: {"content":…,"stop":false}` | `data: {"choices":[{"text":…}]}` |
+| stream end | the terminal object with `"stop": true`, and **no `[DONE]`** | `data: [DONE]` |
+
+Both routes are the same handler; `/admin/stats` records whichever one
+the client called. Generation itself is the same engine, sampler,
+grammar seam and stop machinery `/v1/completions` uses — this endpoint
+is a wire, not a second implementation.
+
+### What it honours
+
+`prompt` (string, or `{"prompt_string": "…"}`) · `n_predict` ·
+`stream` · `stop` · `temperature` · `top_p` · `min_p` · `top_k` ·
+`repeat_penalty` · `repeat_last_n` · `presence_penalty` ·
+`frequency_penalty` · `seed` (`-1` draws one) · `ignore_eos` ·
+`grammar` · `cache_prompt`.
+
+`n_predict` keeps llama.cpp's meaning exactly, including the part that
+is easy to get wrong: **an absent `n_predict` is `-1`**, which means
+"generate until the context is full", and this server does not quietly
+substitute a smaller budget. `-1` resolves against the derived context
+ceiling (`crate::budget`) minus the tokenized prompt. On a deployment
+where the model could not be priced there is no ceiling to be full of,
+and `-1` is a **501** naming `n_predict` and `FERROX_CB_MAX_CONTEXT`
+rather than a silent 16. `n_predict: 0` generates nothing, as upstream.
+
+`repeat_last_n: -1` ("the whole context") is refused for the same
+reason: shrinking it to the default 64 would give a caller a window
+orders of magnitude smaller than the one it asked for.
+
+`cache_prompt: true` is upstream's default and is a *permission* to
+reuse KV, so it is always servable. `cache_prompt: false` is a
+*requirement* not to, which this server can only keep when no prefix
+cache is configured; with `FERROX_PREFIX_CACHE_ENTRIES` set it is
+refused rather than ignored.
+
+### What it refuses, by name
+
+Every option below deserializes and is checked against the value at
+which llama.cpp itself treats it as off. **At that value it is served**
+— a stock client sends most of them explicitly, and refusing
+`mirostat: 0` would be a false refusal. At any other value it is a 501
+naming the field:
+
+`dynatemp_range` · `typical_p` · `xtc_probability` · `mirostat` ·
+`dry_multiplier` · `samplers` (the sampler chain order is fixed) ·
+`n_probs` and `post_sampling_probs` (no per-token logprobs) ·
+`min_keep` · `return_tokens` (the decode loop hands this layer text,
+not ids) · `n_indent` · `n_keep` (ferrox refuses an oversized request
+rather than shifting context, so there is nothing to protect) ·
+`n_cmpl` · `n_cache_reuse` · `t_max_predict_ms` · `id_slot` (no slots)
+· `lora` · `response_fields` · `return_progress` · `timings_per_token`
+· `sse_ping_interval` (the keepalive is fixed at 15s).
+
+Also refused: `logit_bias` (through the same rule both OpenAI routes
+use), `json_schema` (through the same site that refuses
+`response_format: json_schema`), token-id prompts, multiple prompts in
+one request, and `prompt.multimodal_data`.
+
+Options that only *parameterise* a switched-off sampler —
+`mirostat_tau`, `mirostat_eta`, `dry_base`, `dry_allowed_length`,
+`dry_penalty_last_n`, `dry_sequence_breakers`, `xtc_threshold`,
+`dynatemp_exponent` — are deliberately not in that list: they do
+nothing while their switch is off, and their switch is. A field
+llama.cpp does not define either is ignored, exactly as upstream
+ignores it.
+
+### Response fields, and two honest ones
+
+`truncated` is always `false`, and that is a statement rather than a
+placeholder: ferrox refuses a request that does not fit its context
+instead of discarding tokens to make it fit, so a served answer was
+never truncated. A `timings` value this server did not measure is
+`null` rather than `0`, which would read as an instantaneous prefill,
+and `cache_n` is `-1` (upstream's sentinel) when no prefix cache is
+configured — which says something different from "the cache missed".
+
+`stop_type` uses llama.cpp's vocabulary (`eos`, `word`, `limit`) plus
+one value it has no word for: **`cancelled`**, for an answer stopped
+through `POST /v1/cancel` or by the client disconnecting. None of
+upstream's three is true of an interrupted answer, and `none` means
+"still generating", so folding it into one of them would report an
+interruption as a normal finish.
+
+**One known inaccuracy in `stop_type`.** A caller stop string that is
+exactly *one token* in the model's vocabulary is caught by the token
+layer of the stop machinery, which matches on the id before
+detokenizing and does not carry back which string it was; it is
+reported as `"eos"` where llama.cpp would say `"word"`. This is not
+local to this endpoint — `/v1/messages` loses its `stop_sequence`
+attribution on the same inputs — and closing it means giving the stop
+matcher the id-to-string mapping it currently discards. Multi-token
+stop strings, which is what a `/completion` caller normally sets, are
+reported correctly.
+
 ## Tokenize / detokenize, in both dialects
 
 These two are the one place ferrox invented a path OpenAI does not have.
@@ -918,7 +1026,9 @@ multi-GPU, tensor parallel, prefill/decode disaggregation · streamed
 argument deltas for the JSON-payload tool formats (they arrive whole) ·
 streamed tool calls on the continuous-batching path · a speculative
 decode path in the server, so every speculation field in `usage` is
-absent today.
+absent today · llama.cpp's `/infill`, `/props`, `/slots`,
+`/apply-template`, `/rerank` and `/lora-adapters`, none of which have a
+ferrox counterpart.
 
 A few request fields deserialize and then go nowhere, accepted so a
 stock client's body does not fail validation over something this server

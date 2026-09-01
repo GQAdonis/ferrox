@@ -104,10 +104,9 @@ use serde_json::{json, Map, Value};
 use crate::generate::{DecodeError, Usage};
 use crate::output::OutputPosture;
 use crate::{
-    attribution, decode_error_response, join_error_response, output, prompt_from_messages,
-    run_generation, run_generation_emit, sse, stats, ApiError, AppState, ChatCompletionRequest,
-    ChatMessage, MessageContent, ToolCallFunctionIn, ToolCallIn, ToolChoice, ToolDef,
-    ToolFunctionDef,
+    attribution, output, prompt_from_messages, run_generation_emit, sse, stats, ApiError, AppState,
+    ChatCompletionRequest, ChatMessage, MessageContent, ToolCallFunctionIn, ToolCallIn, ToolChoice,
+    ToolDef, ToolFunctionDef,
 };
 
 /// The path this module wants to be mounted at. Kept here only until it
@@ -1441,27 +1440,12 @@ async fn responses_full(
     let posture = OutputPosture::resolve(active.model.name(), &prompt);
     let params = chat.generation_params_for_template(&template)?;
 
-    let model = Arc::clone(&active.model);
-    let kv_pool = state.kv_pool.clone();
-    let paged_kv = state.paged_kv.clone();
-    let prefix_cache = state.prefix_cache.clone();
-    let batcher = active.batcher.clone();
-    let ceiling = active.ceiling.clone();
-    let (chunks, finish, usage) = tokio::task::spawn_blocking(move || {
-        run_generation(
-            &model,
-            &prompt,
-            &params,
-            kv_pool.as_ref(),
-            paged_kv.as_ref(),
-            prefix_cache.as_deref(),
-            batcher.as_ref(),
-            ceiling.as_deref(),
-        )
-    })
-    .await
-    .map_err(join_error_response)?
-    .map_err(decode_error_response)?;
+    let (chunks, finish, usage) = crate::decode_task::buffered(
+        crate::decode_task::DecodeHandles::take(&state, &active),
+        prompt,
+        params,
+    )
+    .await?;
 
     let parsed = output::parse_output(&chunks.concat(), &offered, posture);
     state.record_request(stats::Record {

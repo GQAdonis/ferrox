@@ -11,10 +11,7 @@ use serde::Deserialize;
 use crate::attribution::Attribution;
 use crate::generate::{FinishReason, GenerationParams};
 use crate::sampling_knobs::SamplingKnobs;
-use crate::{
-    decode_error_response, join_error_response, run_generation, unsupported_feature, ApiError,
-    AppState,
-};
+use crate::{join_error_response, unsupported_feature, ApiError, AppState};
 
 /// What one of the small endpoints knows before it does any work.
 ///
@@ -84,13 +81,95 @@ impl Call {
     }
 }
 
+/// Both dialects of the tokenize request in one struct.
+///
+/// ferrox invented `/v1/tokenize` with a `prompt` field; llama.cpp
+/// serves `/tokenize` with a `content` field
+/// (`tools/server/server-context.cpp:4918-4956`). Two structs would be
+/// two handlers, which is how a copied path starts, so the field is
+/// accepted under either spelling and resolved once in
+/// [`TokenizeRequest::text`].
 #[derive(Debug, Deserialize)]
 pub(crate) struct TokenizeRequest {
-    prompt: String,
+    /// ferrox's spelling.
+    #[serde(default)]
+    prompt: Option<String>,
+    /// llama.cpp's spelling.
+    #[serde(default)]
+    content: Option<String>,
     #[serde(default)]
     model: Option<String>,
+    /// llama.cpp: prepend `BOS`. Default `false`, as upstream. Honoured
+    /// -- it prepends exactly the id the generation path prepends, so
+    /// a caller counting a prompt's tokens gets the count the model
+    /// will actually see.
+    #[serde(default)]
+    add_special: Option<bool>,
+    /// llama.cpp: tokenize special-token text as special tokens rather
+    /// than as plaintext. Upstream defaults to `true`, and ferrox's
+    /// tokenizers always split on special tokens
+    /// (`ferrox_models::tokenizer::split_on_special_tokens`), so `true`
+    /// is honoured and `false` is REFUSED BY NAME rather than silently
+    /// ignored.
+    #[serde(default)]
+    parse_special: Option<bool>,
+    /// llama.cpp: return `{"id", "piece"}` objects instead of bare ids.
+    /// Refused by name -- see the refusal message for why.
+    #[serde(default)]
+    with_pieces: Option<bool>,
 }
 
+impl TokenizeRequest {
+    /// The text to tokenize, under whichever spelling the client used.
+    ///
+    /// llama.cpp answers `{"tokens": []}` when `content` is absent.
+    /// ferrox does not: a request that names neither field is far more
+    /// likely a typo than a deliberate ask for an empty array, and an
+    /// empty array is indistinguishable from tokenizing `""`.
+    fn text(&self) -> Result<&str, ApiError> {
+        match (&self.prompt, &self.content) {
+            (Some(_), Some(_)) => Err((
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": {"message":
+                    "give either `prompt` (ferrox) or `content` (llama.cpp), not both: \
+                     they are the same field and this server cannot tell which you meant"}})),
+            )),
+            (Some(p), None) => Ok(p.as_str()),
+            (None, Some(c)) => Ok(c.as_str()),
+            (None, None) => Err((
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": {"message":
+                    "missing the text to tokenize: send `content` (llama.cpp's spelling) \
+                     or `prompt` (ferrox's). Both are accepted on both /tokenize and \
+                     /v1/tokenize"}})),
+            )),
+        }
+    }
+
+    /// Every knob this server does not implement, refused by name
+    /// before any work happens.
+    fn reject_unsupported(&self) -> Result<(), ApiError> {
+        if self.parse_special == Some(false) {
+            return Err(unsupported_feature(
+                "`parse_special: false` is not implemented: ferrox's tokenizers always split \
+                 on special-token text, so this server cannot tokenize `<|im_start|>` as \
+                 plain characters. Omit the field or send `true` (llama.cpp's default)",
+            ));
+        }
+        if self.with_pieces == Some(true) {
+            return Err(unsupported_feature(
+                "`with_pieces: true` is not implemented: ferrox's tokenizers expose decoded \
+                 text, not the raw per-token piece bytes llama.cpp returns, so a \
+                 byte-fallback token could not be represented as its `piece` byte array. \
+                 Detokenize the ids you want the text for instead",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Shared by `/detokenize` and `/v1/detokenize`; the field name is the
+/// same in both dialects.
 #[derive(Debug, Deserialize)]
 pub(crate) struct DetokenizeRequest {
     tokens: Vec<usize>,
@@ -223,6 +302,9 @@ impl CompletionsRequest {
             repetition_penalty: self.repetition_penalty,
             presence_penalty: self.presence_penalty,
             frequency_penalty: self.frequency_penalty,
+            // The OpenAI wire has no field for the penalty window; see
+            // `SamplingKnobs::penalty_last_n`.
+            penalty_last_n: None,
         }
     }
 
@@ -278,8 +360,24 @@ fn default_max_tokens() -> usize {
     16
 }
 
+/// The path this request was actually routed on, for the `/admin/stats`
+/// ring.
+///
+/// `/tokenize` and `/v1/tokenize` are one handler, so recording a
+/// constant would make every llama.cpp client's traffic show up under
+/// the ferrox spelling and hide the split. `MatchedPath` is the route
+/// pattern the router matched, not the raw URI, so it cannot be
+/// influenced by the caller.
+fn matched_route(matched: &Option<axum::extract::MatchedPath>, fallback: &'static str) -> String {
+    matched
+        .as_ref()
+        .map(|m| m.as_str().to_string())
+        .unwrap_or_else(|| fallback.to_string())
+}
+
 pub async fn tokenize(
     State(state): State<Arc<AppState>>,
+    matched: Option<axum::extract::MatchedPath>,
     headers: axum::http::HeaderMap,
     Json(req): Json<TokenizeRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
@@ -292,7 +390,7 @@ pub async fn tokenize(
     // number derived from it.
     call.record(
         &state,
-        ferrox_api::routes::V1_TOKENIZE,
+        &matched_route(&matched, ferrox_api::routes::V1_TOKENIZE),
         state.active_model_name(),
         &result,
         None,
@@ -304,20 +402,33 @@ fn tokenize_inner(
     state: &AppState,
     req: TokenizeRequest,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let _ = req.model;
+    let _ = &req.model;
+    req.reject_unsupported()?;
+    let text = req.text()?;
     // Tokenizing needs the loaded vocabulary, so this is a 503 like any
     // other generation endpoint when nothing is loaded -- answering
     // with byte-fallback ids would silently be the wrong vocabulary.
-    let tokens = state.require_model()?.encode(&req.prompt);
+    let model = state.require_model()?;
+    let mut tokens = model.encode(text);
+    if req.add_special == Some(true) {
+        // The same helper the generation path uses, so `add_special`
+        // reports the prompt the model would actually be given --
+        // including its no-op behaviour on a checkpoint whose metadata
+        // says not to add BOS.
+        ferrox_models::tokenizer::prepend_bos(&mut tokens, model.bos_id());
+    }
     let count = tokens.len();
     Ok(Json(serde_json::json!({
         "tokens": tokens,
+        // ferrox's own extra; llama.cpp returns `tokens` alone, and a
+        // client of either dialect ignores what it does not read.
         "count": count,
     })))
 }
 
 pub async fn detokenize(
     State(state): State<Arc<AppState>>,
+    matched: Option<axum::extract::MatchedPath>,
     headers: axum::http::HeaderMap,
     Json(req): Json<DetokenizeRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
@@ -326,7 +437,7 @@ pub async fn detokenize(
     // Same reasoning as `tokenize`: no forward pass, so no usage.
     call.record(
         &state,
-        ferrox_api::routes::V1_DETOKENIZE,
+        &matched_route(&matched, ferrox_api::routes::V1_DETOKENIZE),
         state.active_model_name(),
         &result,
         None,
@@ -339,7 +450,10 @@ fn detokenize_inner(
     req: DetokenizeRequest,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let text = state.require_model()?.decode(&req.tokens);
-    Ok(Json(serde_json::json!({ "text": text })))
+    // Both keys, same string: llama.cpp's clients read `content`
+    // (`server-context.cpp:4970`), ferrox's existing ones read `text`,
+    // and there is only one answer to disagree about.
+    Ok(Json(serde_json::json!({ "text": text, "content": text })))
 }
 
 fn pool_hidden(hiddens: &[Vec<f32>], pooling: &str) -> Result<Vec<f32>, ApiError> {
@@ -534,28 +648,12 @@ pub async fn completions(
         cancel: None,
         ignore_eos: req.ignore_eos.unwrap_or(false),
     };
-    let model = Arc::clone(&active.model);
-    let kv_pool = state.kv_pool.clone();
-    let paged_kv = state.paged_kv.clone();
-    let prefix_cache = state.prefix_cache.clone();
-    let batcher = active.batcher.clone();
-    let ceiling = active.ceiling.clone();
-
-    let (chunks, finish, usage) = tokio::task::spawn_blocking(move || {
-        run_generation(
-            &model,
-            &prompt,
-            &params,
-            kv_pool.as_ref(),
-            paged_kv.as_ref(),
-            prefix_cache.as_deref(),
-            batcher.as_ref(),
-            ceiling.as_deref(),
-        )
-    })
-    .await
-    .map_err(join_error_response)?
-    .map_err(decode_error_response)?;
+    let (chunks, finish, usage) = crate::decode_task::buffered(
+        crate::decode_task::DecodeHandles::take(&state, &active),
+        prompt,
+        params,
+    )
+    .await?;
 
     let text = chunks.concat();
     let finish_reason = match finish {
@@ -594,6 +692,84 @@ mod tests {
 
     fn request(value: serde_json::Value) -> CompletionsRequest {
         serde_json::from_value(value).expect("request")
+    }
+
+    fn tokenize_request(value: serde_json::Value) -> TokenizeRequest {
+        serde_json::from_value(value).expect("request")
+    }
+
+    /// The two llama.cpp knobs this server does not implement. Both
+    /// deserialize, so serde would happily have dropped them; the
+    /// point of declaring them is that they are refused BY NAME.
+    #[test]
+    fn the_tokenize_knobs_ferrox_lacks_are_refused_by_name() {
+        for (field, body) in [
+            (
+                "parse_special",
+                serde_json::json!({"content": "hi", "parse_special": false}),
+            ),
+            (
+                "with_pieces",
+                serde_json::json!({"content": "hi", "with_pieces": true}),
+            ),
+        ] {
+            let (status, body) = tokenize_request(body)
+                .reject_unsupported()
+                .expect_err("this is not implemented");
+            assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{field}");
+            assert!(
+                body.0["error"]["message"].as_str().unwrap().contains(field),
+                "the refusal must name {field}: {body:?}"
+            );
+        }
+    }
+
+    /// The values ferrox *does* honour must not be refused: upstream's
+    /// defaults are `parse_special: true` and `with_pieces: false`, so
+    /// a llama.cpp client that sends them explicitly must still work.
+    #[test]
+    fn the_upstream_defaults_are_accepted_rather_than_refused() {
+        tokenize_request(
+            serde_json::json!({"content": "hi", "parse_special": true, "with_pieces": false}),
+        )
+        .reject_unsupported()
+        .expect("these are the values this server implements");
+    }
+
+    /// One field under two spellings. Absent means absent -- llama.cpp
+    /// answers an empty array, which is indistinguishable from
+    /// tokenizing `""`, so ferrox says what is missing instead.
+    #[test]
+    fn the_text_is_read_from_either_dialects_field() {
+        assert_eq!(
+            tokenize_request(serde_json::json!({"prompt": "a"}))
+                .text()
+                .expect("ferrox's spelling"),
+            "a"
+        );
+        assert_eq!(
+            tokenize_request(serde_json::json!({"content": "b"}))
+                .text()
+                .expect("llama.cpp's spelling"),
+            "b"
+        );
+
+        let (status, body) = tokenize_request(serde_json::json!({}))
+            .text()
+            .expect_err("neither field is present");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let message = body.0["error"]["message"].as_str().unwrap().to_string();
+        assert!(
+            message.contains("content") && message.contains("prompt"),
+            "{message}"
+        );
+
+        // Both at once is a client bug, and guessing which one it meant
+        // would tokenize text the caller never asked about.
+        let (status, _) = tokenize_request(serde_json::json!({"prompt": "a", "content": "b"}))
+            .text()
+            .expect_err("ambiguous");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
     }
 
     /// The dangerous silent drop. A caller who sets `stop` believes

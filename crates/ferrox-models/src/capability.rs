@@ -181,31 +181,7 @@ pub struct UnauditedTriage {
 /// neither.
 pub const TRIAGE_PENDING: &[&str] = &[
     // Norm-RoPE group.
-    "deci",
-    "baichuan",
-    "xverse",
-    "olmo",
-    "arctic",
-    "chatglm",
-    "mistral3",
-    "maincoder",
-    "bailingmoe",
-    "nanbeige",
     // NEOX-RoPE group.
-    "mistral",
-    "mixtral",
-    "yi",
-    "afmoe",
-    "apertus",
-    "exaone-moe",
-    "grovemoe",
-    "hunyuan-dense",
-    "laguna",
-    "mellum",
-    "mimo2",
-    "plamo3",
-    "step35",
-    "talkie",
 ];
 
 /// This architecture's triage verdict, or `None` when it has not been
@@ -459,9 +435,161 @@ const NORM_ROPE_TRIAGED: &[(&str, TriageClass, &str)] = &[
     // ferrox-only alias row; no llama.cpp GGUF spells it this way, but
     // it must not carry a different verdict from `granitemoe`.
     ("granite-moe", TriageClass::NewCode, GRANITE_MULTIPLIERS),
+    (
+        "xverse",
+        TriageClass::FixtureAway,
+        "xverse is llama under a different name. src/models/xverse.cpp:25-33 creates \
+         attn_norm, split Q/K/V via create_tensor_qkv (optional biases only), attn_output, \
+         ffn_norm and gate/up/down and nothing else; the graph (:60-114) is the sequential \
+         `x + attn(norm(x))` then `y + ffn(norm(y))` residual with SiLU SwiGLU, and \
+         load_arch_hparams (:4) reads nothing but the RMS epsilon. llama-model.cpp's \
+         `llama_model_rope_type` puts it in the NORM group, which is where the catalog has \
+         it. Admitting it needs a fixture, not new code",
+    ),
+    (
+        "baichuan",
+        TriageClass::FixtureAway,
+        "for the 7B. src/models/baichuan.cpp:29-38 is the plain llama tensor set and the \
+         graph (:65-130) is sequential-residual SiLU SwiGLU, NORM RoPE. The 13B is a \
+         DIFFERENT model under the same string -- baichuan.cpp:5-13 switches on layer count \
+         and sets `f_max_alibi_bias = 8.0f` for the 40-layer case, with no GGUF key to \
+         detect it -- and ferrox already refuses that one by name at loader.rs:231, pinned \
+         by `baichuan_13b_is_refused_because_it_uses_alibi_and_the_7b_is_not`. So the \
+         unaudited refusal only ever reaches a 32-layer file, and for that file this is a \
+         fixture away",
+    ),
+    (
+        "chatglm",
+        TriageClass::FixtureAway,
+        "the one non-llama thing chatglm does is the FUSED gate+up SwiGLU, and that is the \
+         audited phi3 path exactly. src/models/chatglm.cpp:48 sizes `ffn_up` as \
+         `{n_embd, n_ff * 2}` and :128-133 calls build_ffn with a NULL gate and \
+         `LLM_FFN_SWIGLU, LLM_FFN_SEQ` -- the same call shape as phi3.cpp:52 and :144-149, \
+         and `phi3` is in AUDITED_GENERIC_GQA. ferrox handles it without an activation \
+         flag: `load_dense_expert` (loader.rs:1127-1161) finds no `ffn_gate`, takes the \
+         fused branch and splits the tensor into gate and up itself. Everything else \
+         (:41-50, :76-138) is attn_norm, create_tensor_qkv with optional biases, \
+         attn_output, ffn_norm and a sequential residual. Admitting it needs a fixture",
+    ),
+    (
+        "deci",
+        TriageClass::NewCode,
+        "DeciLM / Llama-3.1-Nemotron layers are not all the same shape. \
+         src/models/deci.cpp:30-34 reads n_head(i), n_head_kv(i) and n_ff(i) PER LAYER, and \
+         the graph branches on them three ways: `n_head == 0` is an attention-free layer \
+         that passes the residual straight through (:107-109), `n_head_kv == 0` is a \
+         \"linear attention\" layer that applies only `wo` with no Q/K/V and no RoPE \
+         (:115-118), and `n_ff == 0` skips the FFN and the residual add entirely with a \
+         `continue` (:147-149). ferrox's ModelConfig carries n_heads, n_kv_heads and \
+         expert_ffn_dim as SCALARS and its decoder runs the same block on every layer, so \
+         there is nowhere to put any of the three. Same class as `openelm`, one step worse",
+    ),
+    (
+        "olmo",
+        TriageClass::NewCode,
+        "OLMo-1 has NO norm weights at all. src/models/olmo.cpp:27-35 creates Q/K/V, \
+         attn_output and gate/up/down and not one norm tensor, and the graph calls \
+         `build_norm(x, NULL, NULL, LLM_NORM, il)` at all three sites (:65-67, :104-106, \
+         :128-130) -- non-parametric LayerNorm: subtract the mean, divide by the standard \
+         deviation, no learned weight and no bias. ferrox has only `rms_norm(x, w, eps)` \
+         and requires `blk.N.attn_norm.weight`, so it is both a different function and a \
+         missing tensor. It also reads an optional {arch}.attention.clamp_kqv (:5) that \
+         nothing here applies. Note this is OLMo-1; `olmo2` is a separate row and a \
+         separate blocker",
+    ),
+    (
+        "maincoder",
+        TriageClass::OneMatchArm,
+        "QK-norm ordering, the same arm `hunyuan-moe` needs. src/models/maincoder.cpp \
+         norms Q and K AFTER rotating them, not before -- ggml_rope_ext at :78-90, then \
+         `build_norm(Qcur, attn_q_norm, ...)` at :92 and the K norm at :95 -- while ferrox's \
+         decoder norms Q and K and then rotates. Everything else is plain: attn_norm (:28), \
+         create_tensor_qkv, attn_output, per-head attn_q_norm/attn_k_norm at \
+         {n_embd_head_k} (:33-34), ffn_norm (:36), gate/up/down, sequential residual with \
+         SiLU SwiGLU (:110,119-127), kq_scale = 1/sqrt(head_dim) (:104), and \
+         load_arch_hparams (:4) reads nothing but the RMS epsilon. Two architectures now \
+         need this one flag, which is the argument for adding it rather than special-casing",
+    ),
+    (
+        "bailingmoe",
+        TriageClass::OneMatchArm,
+        "llama.cpp READS `leading_dense_block_count` and then never branches on it. \
+         src/models/bailingmoe.cpp:5 reads LLM_KV_LEADING_DENSE_BLOCK_COUNT, but \
+         load_arch_tensors creates ffn_gate_inp and the expert and shared-expert tensors \
+         UNCONDITIONALLY for every layer (:39-54, no `if (i < n_layer_dense_lead)` branch \
+         anywhere) and the graph has no dense path either (:119-152). ferrox's \
+         `ModelConfig::layer_is_dense` does branch on the key, so on a checkpoint whose \
+         `first_k_dense_replace` is nonzero (conversion/bailingmoe.py:27 writes it \
+         verbatim) ferrox looks for `blk.0.ffn_gate.weight` on a layer that only has \
+         experts, and fails on the missing tensor. Making bailingmoe ignore that key is the \
+         change. The rest agrees: gating is hardcoded SOFTMAX (:137) and no converter writes \
+         expert_gating_func, so ferrox's softmax default matches; expert_weights_norm and \
+         expert_weights_scale come from metadata (:9,:8) and ferrox reads both",
+    ),
+    (
+        "arctic",
+        TriageClass::NewCode,
+        "a PARALLEL dense+MoE layer whose MoE branch reads the pre-attention residual. \
+         src/models/arctic.cpp:124-132 runs a dense SiLU FFN on `ffn_norm(ffn_inp)` and adds \
+         it back to ffn_inp, then :136-141 norms `inpSA` -- the layer INPUT, before \
+         attention -- through a second per-layer norm `ffn_norm_exps` (:45) and runs the MoE \
+         on that, and :154 sums the two. The generic decoder computes one FFN on the \
+         post-attention residual, so this is a different graph, not a wider one. The dense \
+         half is also sized `{n_embd, n_embd}` (:40-42) rather than n_ff. Same shape as \
+         `smallthinker`'s router: a branch fed from the raw layer input",
+    ),
+    (
+        "mistral3",
+        TriageClass::NewCode,
+        "per-position attention temperature tuning. src/models/mistral3.cpp:5,14-17 reads \
+         {arch}.attention.temperature_scale and seeds n_attn_temp_floor_scale from \
+         n_ctx_orig_yarn, and :109-111 builds a per-position Q scale that llama-graph.cpp \
+         computes as `log(floor(pos / floor_scale) + 1) * temp_scale + 1` (:159-167). ferrox \
+         has no per-position attention scale at all and no gate on that key, so a checkpoint \
+         carrying it would load and silently drop it -- the class of defect \
+         `unsupported_scaling_keys` exists for, on a key that list does not have. :9 also \
+         reads rope.scaling.yarn_log_multiplier, and loader.rs:588's own comment records \
+         that ferrox implements only YaRN's magnitude term. The rest (:46-83, :120-210) is \
+         leading-dense + MoE + shared expert on a sequential residual, which ferrox has",
+    ),
+    (
+        "nanbeige",
+        TriageClass::NewCode,
+        "nanbeige RUNS THE SAME PHYSICAL LAYERS MORE THAN ONCE. \
+         src/models/nanbeige.cpp:13-31 sets `n_layer_all = n_layer_phys * n_loops` and \
+         rewrites the per-layer head/ff/swa arrays so the graph walks n_layer_all steps over \
+         n_layer_phys sets of weights, and :167 applies `output_norm` to the running \
+         residual inside the loop at the end of each pass. ferrox's decoder walks its layer \
+         vector exactly once and has no concept of a loop count. Everything inside one pass \
+         (:52-63, :106-155) is plain llama, which is what makes this deceptive: the tensor \
+         set alone looks generic",
+    ),
     ("arcee", TriageClass::NewCode, UNGATED_RELU_SQR),
     ("plm", TriageClass::NewCode, UNGATED_RELU_SQR),
 ];
+
+/// Shared by the three ferrox-only alias rows `mistral`, `mixtral` and
+/// `yi`, and the reason they are UNKNOWN rather than fixture-away.
+///
+/// The temptation is to call them "llama with a different name" and mark
+/// them fixture-away. That would be a guess about a file nobody has
+/// seen, and the RoPE hazard below is exactly why it would be an
+/// expensive one.
+const NO_UPSTREAM_ARCH: &str =
+    "there is no llama.cpp graph to diff against: none of `mistral`, `mixtral` or `yi` \
+     appears in LLM_ARCH_NAMES (src/llama-arch.cpp) or in gguf-py's MODEL_ARCH_NAMES, and \
+     every real Mistral, Mixtral and Yi checkpoint converts to `llama` (llama.cpp's own \
+     conversion scripts emit MODEL_ARCH.LLAMA for all three; only `mistral3` and `mistral4` \
+     exist as their own strings). So these are ferrox-only rows that no llama.cpp-produced \
+     file can carry. THE HAZARD, and why this is not marked fixture-away: the catalog gives \
+     all three NEOX RoPE, while `llama` -- the string these models really ship under, and \
+     the graph they really are -- is in `llama_model_rope_type`'s NORM group \
+     (llama-model.cpp, the `case LLM_ARCH_LLAMA:` arm). A file spelling `mistral` would \
+     therefore be rotated on the wrong pairs of every Q/K head, which is the exact defect \
+     that caused the Llama-3.1-8B wrong-logits bug. It is latent only because the row \
+     refuses. WHAT WOULD SETTLE IT: a real GGUF whose general.architecture is literally one \
+     of these three. Absent one, the honest options are to delete the rows or to move them \
+     to NORM to match the graph they claim to be";
 
 /// Shared by `arcee` and `plm`: an ungated ReLU-squared MLP.
 ///
@@ -569,6 +697,168 @@ const NEOX_ROPE_TRIAGED: &[(&str, TriageClass, &str)] = &[
          shared expert on every layer (:137-143), softmax with norm_w=true and \
          expert_weights_scale (:147-150), sequential residual (:129,163) -- ferrox has",
     ),
+    (
+        "mellum",
+        TriageClass::NewCode,
+        "two per-layer RoPE variants in one model. src/models/mellum.cpp:128-142 runs the \
+         SWA layers' RoPE with YaRN switched off -- freq_scale = 1.0, ext_factor = 0.0, \
+         attn_factor = 1.0 -- while the full-attention layers use the model's own YaRN \
+         (:143-154). ferrox carries one YaRN configuration for the whole model (it has \
+         `rope_theta_swa` for the BASE only) and cannot express a per-layer ext_factor. \
+         Second, smaller hazard on the same architecture: :12-17 accepts the sliding-window \
+         pattern as a scalar OR as a per-layer ARRAY, and ferrox reads it only as a scalar \
+         (`GgufValue::as_u64` returns None for an array), so an array-valued file falls back \
+         to `default_swa_layout`'s period of 4 with nothing saying it substituted its own \
+         layout for the file's. The tensor set and residual (:45-68, :169-197) are generic",
+    ),
+    (
+        "talkie",
+        TriageClass::NewCode,
+        "talkie has NO norm weights and a learned per-layer skip connection. In \
+         src/models/talkie.cpp every \
+         normalisation is `build_norm(x, nullptr, nullptr, LLM_NORM_RMS, ...)` -- \
+         non-parametric RMSNorm, no weight tensor -- at :50 (on the embeddings, before layer \
+         0), :68, :90, :110 and :137; the only norm weight in the file is `attn_q_norm`, and \
+         it is shaped {1, n_head} (:26), one SCALAR PER HEAD rather than a head_dim vector, \
+         which is neither of ferrox's two QkNormStyle variants. Each layer then adds \
+         `inp_skip * out_scale` (:123-126) with a per-layer learned scalar `out_scale` \
+         (:32), a second residual stream the generic decoder has no slot for, and :5 reads \
+         {arch}.logit_scale as REQUIRED",
+    ),
+    (
+        "mimo2",
+        TriageClass::NewCode,
+        "attention sinks on a non-gpt-oss architecture, plus per-layer shapes. \
+         src/models/mimo2.cpp:58 creates `attn_sinks` per layer; ferrox implements sinks \
+         only inside the gpt-oss path and, per docs/MODELS.md, on CPU only. :47-49 reads \
+         n_head and the KV widths PER LAYER, :16 and :181 scale the attention output by \
+         {arch}.attention.value_scale (a key ferrox neither reads nor gates), :6-12 makes \
+         SWA unconditional with a per-layer is_swa ARRAY rather than a period, and :19,:76-82 \
+         add NEXTN/MTP layers with a `layer_out_norm`. Any one of the first three would \
+         disqualify it; the dense-or-MoE-per-layer choice at :63-72 is the only part ferrox \
+         already has",
+    ),
+    (
+        "plamo3",
+        TriageClass::FixtureAway,
+        "PLaMo-3 is the sandwich-norm shape ferrox already implements, and this one really \
+         does line up slot for slot. src/models/plamo3.cpp:46-58 creates attn_norm, a FUSED \
+         attn_qkv (:47) that load_qkv_projections splits, per-head attn_q_norm/attn_k_norm \
+         (:49-50) applied BEFORE RoPE (:128-137), attn_post_norm (:52), ffn_norm (:54), \
+         ffn_post_norm (:55) and a fused SwiGLU ffn_up of `n_ff * 2` (:57) driven by \
+         `LLM_FFN_SWIGLU, LLM_FFN_SEQ` (:168) -- the audited phi3 path. The graph applies \
+         the post-norms exactly where ferrox does: attn_post_norm to the attention branch \
+         before the residual add (:152-155) and ffn_post_norm to the FFN output before its \
+         add (:171-174). Its SWA uses a scalar sliding_window_pattern that \
+         conversion/plamo.py's Plamo3Model writes verbatim (:176-177), and \
+         `default_swa_layout` already carries plamo3 as period 8. Plamo3Model also inherits \
+         TextModel's scalar head_count / key_length / value_length, so the per-layer \
+         `hparams.n_head(i)` accessors in the graph are uniform -- unlike deci, laguna and \
+         openelm, whose converters really do write arrays. CONFIRM ON THE FIXTURE: that \
+         attention.key_length equals attention.value_length, since llama.cpp carries \
+         head_dim_q and head_dim_v separately (:25-26) and ferrox has one head_dim",
+    ),
+    (
+        "afmoe",
+        TriageClass::NewCode,
+        "gated attention plus NoPE layers. src/models/afmoe.cpp:73 creates `wqkv_gate` \
+         (LLM_TENSOR_ATTN_GATE), a learned gate applied to the attention output that the \
+         generic decoder has no slot for, and :137-138 skips RoPE where \
+         `(il + 1) % n_no_rope_layer_step == 0`, the smollm3 class with no GGUF key. It also \
+         scales the embeddings by sqrt(n_embd) at :120, which ferrox does only for the Gemma \
+         family. THIRD, and the quiet one: :8 reads expert_gating_func as OPTIONAL and \
+         :29-30 defaults it to SIGMOID when absent, while ferrox's fallback \
+         (loader.rs:375, SIGMOID_GATING_ARCHITECTURES) defaults to softmax for any \
+         architecture not on its list -- so a checkpoint omitting the key would be routed \
+         through the wrong scoring function. That last one is the `deepseek` shape and would \
+         need fixing even if the rest were free",
+    ),
+    (
+        "apertus",
+        TriageClass::NewCode,
+        "xIELU, with four PER-LAYER parameter arrays. src/models/apertus.cpp:6-9 reads \
+         xielu_alpha_n, xielu_alpha_p, xielu_beta and xielu_eps as n_layer-long arrays and \
+         :132-135 indexes them per layer; `FfnActivation` (config.rs:302-312) has three \
+         variants and no way to carry a per-layer parameter at all. The FFN is also UNGATED \
+         -- :45-46 creates only ffn_down and ffn_up, no ffn_gate -- so it is the same \
+         two-matrix shape as `arcee` and `plm` on top of the activation. It further requires \
+         optional attn_q_norm/attn_k_norm BIASES (:50,:52), and ferrox's norms take a weight \
+         only",
+    ),
+    (
+        "exaone-moe",
+        TriageClass::NewCode,
+        "the GLOBAL layers get no RoPE. src/models/exaone-moe.cpp:155-161 wraps both \
+         ggml_rope_ext calls in `if (is_local_layer)`, where is_local_layer is \
+         `hparams.is_swa(il)` (:136) -- so on the full-attention layers of every period Q \
+         and K are never rotated. ferrox rotates every layer, and there is no GGUF key that \
+         says otherwise: the SWA pattern implies it. Checked and CLEAN on the other axis: \
+         :5 seeds n_swa = 128 but :13 reads {arch}.attention.sliding_window as REQUIRED, so \
+         the window is always the file's own value and ferrox reads the same number, and \
+         `default_swa_layout` already carries exaone-moe as period 4. The MoE half (:72-93) \
+         -- leading dense, exp_probs_b, shared expert, gating from metadata -- ferrox has",
+    ),
+    (
+        "grovemoe",
+        TriageClass::NewCode,
+        "a SECOND bank of experts, not just a scale. src/models/grovemoe.cpp:57-59 creates \
+         `ffn_gate_chexps` / `ffn_down_chexps` / `ffn_up_chexps` -- `n_expert / \
+         n_group_experts` \"chunk\" experts with their own width n_ff_chexp -- and the graph \
+         runs build_moe_ffn TWICE (:137 over the ordinary experts, :153 over the chunk \
+         experts) before :167 adds `scale(moe_out, expert_group_scale)` to the residual. The \
+         inventory recorded only the post-sum group scale and called this small; the second \
+         expert bank with its own routing is the larger half and ferrox's MoE layer holds \
+         one bank. Both n_group_experts and expert_group_scale are REQUIRED keys (:6-7). \
+         QK-norm is before RoPE (:100-109), which is the one thing that would otherwise have \
+         been a blocker",
+    ),
+    (
+        "hunyuan-dense",
+        TriageClass::OneMatchArm,
+        "two named pieces, both small. hunyuan-dense has no graph of its own -- \
+         models.h:1830 derives it from llama_model_hunyuan_vl -- so the file to read is \
+         src/models/hunyuan-vl.cpp. (1) It applies attn_k_norm and attn_q_norm AFTER \
+         ggml_rope_ext (:105-123 rotate, then :132 and :137 norm), the same ordering flag \
+         `hunyuan-moe` and `maincoder` need; three architectures now want it. (2) :8-12 \
+         rescales rope_freq_base_train by `alpha^(head_dim / (head_dim - 2))` when \
+         {arch}.rope.scaling.alpha is positive -- an NTK-alpha base rescale ferrox neither \
+         applies nor gates, so a checkpoint carrying the key would load and rotate at the \
+         unscaled base. Everything else (:39-51, :86-167) is attn_norm, per-head QK norm, \
+         ffn_norm, dense SiLU SwiGLU and a sequential residual",
+    ),
+    (
+        "laguna",
+        TriageClass::NewCode,
+        "per-layer head counts AND a second rotary width. conversion/laguna.py:79 calls \
+         `add_head_count(per_layer_heads)` with a LIST, so the array is really in the file, \
+         and src/models/laguna.cpp:87-88 and :176-177 read n_head(i) / n_head_kv(i) per \
+         layer while ferrox carries both as scalars. :50 then reads \
+         LLM_KV_ROPE_DIMENSION_COUNT_SWA into `n_rot_swa`, so the sliding-window layers \
+         rotate a DIFFERENT number of dimensions than the full-attention layers (its own \
+         comment at :43-45: full layers YaRN over 64 dims, SWA layers plain RoPE over 128); \
+         ferrox has one rotary_dim. It also creates `wqkv_gate` (:124), the gated-attention \
+         tensor afmoe has, and :55-56 defaults expert_gating_func to SIGMOID when the key is \
+         absent where ferrox would default to softmax. `default_swa_layout` already has \
+         laguna as dense_first period 4, which is correct and is not the blocker",
+    ),
+    (
+        "step35",
+        TriageClass::NewCode,
+        "a per-LAYER rotary width. src/models/step35.cpp:65-70 takes `n_rot_max` as the max \
+         of `hparams.n_rot(i)` over all layers -- because n_rot varies by layer -- and :9 \
+         first halves n_rot_full; ferrox has one rotary_dim for the model. On top of that: \
+         per-layer SwiGLU clamp arrays for the routed and shared experts (:28-29, \
+         LLM_KV_SWIGLU_CLAMP_EXP / _SHEXP), where ferrox's only clamp is the gpt-oss scalar; \
+         a `wqkv_gate` (:96); a per-layer is_swa ARRAY rather than a period (:26), which \
+         ferrox reads only as a scalar; NEXTN/MTP layers with trunk-only and MTP-only load \
+         modes (:32-49); and expert_gating_func defaulting to SIGMOID when absent (:19-20) \
+         where ferrox defaults to softmax. The inventory guessed this was \"probably \
+         parameterisable from the gpt-oss clamp\" -- the clamp is, the per-layer n_rot is \
+         not",
+    ),
+    ("mistral", TriageClass::Unknown, NO_UPSTREAM_ARCH),
+    ("mixtral", TriageClass::Unknown, NO_UPSTREAM_ARCH),
+    ("yi", TriageClass::Unknown, NO_UPSTREAM_ARCH),
     (
         "grok",
         TriageClass::NewCode,
@@ -679,21 +969,12 @@ pub fn architecture_catalog() -> &'static [ArchProfile] {
     CAT.get_or_init(|| {
         let mut v = Vec::with_capacity(160);
         // --- Verified / standard GQA (Norm RoPE) ---
-        for n in [
-            "llama",
-            "deci",
-            "baichuan",
-            "xverse",
-            "olmo",
-            "arctic",
-            "chatglm",
-            "mistral3",
-            "maincoder",
-            "bailingmoe",
-            "nanbeige",
-        ] {
-            v.push(gqa_norm(n));
-        }
+        //
+        // `llama` is the only untriaged name left in this group: it is
+        // audited, so it runs and needs no verdict. Every other
+        // Norm-RoPE row moved into `NORM_ROPE_TRIAGED` below when it was
+        // read against llama.cpp's graph.
+        v.push(gqa_norm("llama"));
         // Same generic Norm-RoPE path, but READ against llama.cpp's own
         // graph -- see [`TriageClass`]. Each row below refuses with its
         // class and its blocker instead of the generic
@@ -702,8 +983,7 @@ pub fn architecture_catalog() -> &'static [ArchProfile] {
             v.push(gqa_norm(n).triaged(*class, blocker));
         }
         for n in [
-            "olmoe", "qwen2", "qwen2moe", "mistral",
-            "mixtral", "yi",
+            "olmoe", "qwen2", "qwen2moe",
             // llama-model.cpp `llama_model_rope_type`: LLM_ARCH_OPENAI_MOE
             // falls in the `return LLAMA_ROPE_TYPE_NEOX` group, and a live
             // load of a gpt-oss GGUF prints `rope type = 2` (= NEOX).
@@ -719,18 +999,7 @@ pub fn architecture_catalog() -> &'static [ArchProfile] {
             // `rope_layout_matches_llama_cpp` below; dots1 additionally
             // checked end-to-end against llama.cpp's own logits in
             // `tests/moe_routing_bias.rs`.
-            "afmoe",
-            "apertus",
             "dots1",
-            "exaone-moe",
-            "grovemoe",
-            "hunyuan-dense",
-            "laguna",
-            "mellum",
-            "mimo2",
-            "plamo3",
-            "step35",
-            "talkie",
         ] {
             v.push(gqa_neox(n));
         }
@@ -1881,6 +2150,16 @@ mod audit_tests {
                 "`{name}` is audited and runs; it does not need a triage verdict"
             );
         }
+        // The list is empty because the triage finished, not because it
+        // was never populated. If a future architecture lands on the
+        // generic path with no verdict, it belongs here and
+        // `every_unaudited_generic_architecture_is_triaged_or_listed_as_pending`
+        // will say so; until then, empty is the completed state.
+        assert!(
+            TRIAGE_PENDING.is_empty(),
+            "TRIAGE_PENDING regrew to {:?}; that is fine, but say so in docs/MODELS.md too",
+            TRIAGE_PENDING
+        );
     }
 
     /// An audited architecture runs. A triage verdict on one would be a
@@ -1927,8 +2206,8 @@ mod audit_tests {
             }
         }
         assert!(
-            seen >= 23,
-            "expected the batch-1 and batch-2 triage rows, found {seen}"
+            seen == 47,
+            "every unaudited generic architecture is triaged; found {seen}"
         );
     }
 
@@ -1939,12 +2218,17 @@ mod audit_tests {
         let fixture = unaudited_refusal_detail("bailingmoe2");
         let arm = unaudited_refusal_detail("seed_oss");
         let new_code = unaudited_refusal_detail("olmo2");
-        let untriaged = unaudited_refusal_detail("baichuan");
+        // TRIAGE_PENDING is empty now that all 47 are read, so the
+        // untriaged branch is exercised through a name the catalog does
+        // not carry. The branch has to keep working: it is what a NEW
+        // architecture added to the catalog would render until somebody
+        // reads it.
+        let untriaged = unaudited_refusal_detail("an-arch-nobody-has-read");
         assert!(fixture.contains("FIXTURE-AWAY"), "{fixture}");
         assert!(arm.contains("ONE MATCH ARM"), "{arm}");
         assert!(new_code.contains("NEW CODE"), "{new_code}");
         assert!(
-            untriaged.contains("not done for `baichuan` yet"),
+            untriaged.contains("not done for `an-arch-nobody-has-read` yet"),
             "{untriaged}"
         );
         for a in [&fixture, &arm, &new_code, &untriaged] {

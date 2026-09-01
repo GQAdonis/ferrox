@@ -166,38 +166,54 @@ which, with the `llama.cpp/src/models/*.cpp` line that decides it:
 | `NEW CODE` | A different attention or residual structure. Not close. |
 | `UNKNOWN` | Reading both trees did not settle it. The message says what would. |
 
-Read on both sides so far, 23 of 47 (`ferrox_models::capability`, pinned
-by `crates/ferrox-models/tests/unaudited_triage.rs`):
+All 47 have now been read on both sides (`ferrox_models::capability`,
+pinned by `crates/ferrox-models/tests/unaudited_triage.rs`). The
+distribution is the headline answer to "how far is Ferrox from llama.cpp
+on models":
 
-| Arch | Class | What decides it |
-|---|---|---|
-| `gemma` | fixture-away | `gemma.cpp:16-33` creates only tensors the generic decoder loads; the embedding scale, GeGLU and attention scale are all implemented for the Gemma family |
-| `internlm2` | fixture-away | `internlm2.cpp:25-33` is the plain Llama tensor set; sequential residual, SiLU SwiGLU |
-| `exaone` | fixture-away | `exaone.cpp:29-38` likewise, plus the global `rope_freqs.weight` the loader already reads |
-| `ernie4_5` | fixture-away | `ernie4-5.cpp:39-67`; its one unslotted tensor, an optional `attn_output.bias` at `:45`, is caught by name by the unread-tensor gate |
-| `bailingmoe2` | fixture-away | `bailingmoe2.cpp:47-73`: fused QKV Ferrox splits, per-head QK norm before RoPE, `exp_probs_b`, shared experts, gating read from metadata |
-| `seed_oss` | one match arm | `seed-oss.cpp:36-37,113-115`: `post_attention_norm` **is** the pre-FFN norm and there is no `ffn_norm`. gpt-oss's slot, behind an `is_gpt_oss` flag that would be widened |
-| `deepseek` | one match arm | `deepseek.cpp:145` passes `norm_w=false` and the converter never writes `expert_weights_norm`, so Ferrox renormalises top-k weights where llama.cpp does not |
-| `ernie4_5-moe` | one match arm | `ernie4-5-moe.cpp:64` interleaves MoE layers by `n_moe_layer_step`; `layer_is_dense` implements only a leading-dense prefix |
-| `hunyuan-moe` | one match arm | `hunyuan-moe.cpp:93-118` applies QK norm **after** RoPE; Ferrox norms then rotates |
-| `olmo2` | new code | `olmo2.cpp:47,52,92,169`: no `attn_norm` and no `ffn_norm` at all. Q/K/V come off the raw residual. The generic decoder requires and applies both |
-| `exaone4` | new code | `exaone4.cpp:60-67,118,159`: the same post-norm-only topology |
-| `granite`, `granitemoe`, `granite-moe` | new code | `granite.cpp:7-10,188,241-242,301-302`: four multipliers, including a residual scale on every branch output. Cause 4 above already refuses these by name first |
-| `phi4` | unknown | `phi4` is not in llama.cpp's `LLM_ARCH_NAMES` at all, so there is no reference graph to diff. A real GGUF spelling it would settle whether it is phi3's fused-QKV graph |
-| `grok` | new code | `grok.cpp:5-21` hardcodes five scales and softcaps before any key can override them; attention runs at `kq_scale = 1.0` with the real scale folded into a tanh softcap, and each layer computes a dense FFN **and** a MoE |
-| `dbrx` | new code | `dbrx.cpp:69-71,110-112,140-142` normalise with `LLM_NORM`, which subtracts the mean. Ferrox is RMSNorm-only. The required-bias refusal group does not catch it: dbrx creates no norm bias tensors at all |
-| `smallthinker` | new code | `smallthinker.cpp:111` computes the MoE router logits from the **raw layer input**, not the normed FFN input; plus unkeyed NoPE layers (`:108-109` with the default step of 4) and ReLU experts |
-| `bitnet` | new code | `bitnet.cpp:101-106,135-140`: `attn_sub_norm` sits before the output projection and `ffn_sub_norm` inside the FFN. Neither slot exists here |
-| `minicpm3` | new code | `minicpm3.cpp:41-46` is the DeepSeek-2 MLA tensor set, plus MiniCPM's hardcoded multipliers at `:65-67`. It is on the generic-GQA row and should not be |
-| `openelm` | new code | `openelm.cpp:26-28` sizes heads and FFN width **per layer**; Ferrox carries them as scalars |
-| `arcee`, `plm` | new code | `arcee.cpp:39-40`, `plm.cpp:39-40`: no `ffn_gate` at all. An ungated ReLU-squared MLP, which is a different FFN shape and not only a different activation |
+| Class | Count |
+|---|---|
+| fixture-away | 9 |
+| one match arm | 7 |
+| new code | 27 |
+| unknown | 4 |
 
-The remaining 24 say so explicitly rather than guessing a class.
+**Fixture-away (9)** — Ferrox already computes these graphs; only
+evidence is missing. `gemma`, `internlm2`, `exaone`, `ernie4_5`,
+`bailingmoe2`, `xverse`, `baichuan` (the 7B; the 13B uses ALiBi and is
+refused by layer count), `chatglm` (its fused SwiGLU is the audited
+`phi3` path exactly) and `plamo3` (sandwich norms, fused QKV, fused
+SwiGLU — every slot already exists).
 
-All eight of batch 2 came out `new code`, which is itself a result:
-batch 1 mixed five fixture-away rows in, and past the first dozen the
-unaudited set is genuinely harder. The refusal now says that per
-architecture rather than implying one uniform distance.
+**One match arm (7)** — one small named piece each. `seed_oss` and the
+gpt-oss norm slot; `deepseek` and top-k renormalisation (fixed);
+`ernie4_5-moe` and interleaved MoE layers; `bailingmoe` and a
+`leading_dense_block_count` llama.cpp reads but never uses; and
+`hunyuan-moe`, `maincoder` and `hunyuan-dense`, all three of which want
+the same flag: QK norm applied *after* RoPE rather than before.
+
+**New code (27)** — a different attention or residual structure. The
+recurring shapes, rather than 27 separate stories:
+
+| Shape | Architectures |
+|---|---|
+| Per-layer head counts, FFN width or rotary width | `openelm`, `deci`, `laguna`, `step35`, `mimo2` |
+| A norm the generic decoder always applies and the model does not have (or a norm it does not have a slot for) | `olmo2`, `exaone4`, `olmo`, `talkie`, `bitnet`, `dbrx` |
+| LayerNorm rather than RMSNorm | `dbrx`, `olmo` |
+| Unkeyed NoPE layers — RoPE skipped on some layers with no GGUF key | `smallthinker`, `afmoe`, `exaone-moe` |
+| A branch fed from the raw layer input rather than the post-attention residual | `smallthinker` (its MoE router), `arctic` (its MoE branch) |
+| Hardcoded scales applied even when the GGUF carries no key | `grok`, `granite`, `granitemoe`, `granite-moe`, `minicpm3`, `mistral3` |
+| An ungated or non-SwiGLU FFN | `arcee`, `plm`, `apertus` |
+| Something structurally new | `minicpm3` (MLA), `nanbeige` (runs the same layers more than once), `grovemoe` (a second expert bank), `mellum` (two per-layer RoPE variants), `mistral3` (per-position attention temperature) |
+
+**Unknown (4)** — reading both trees did not settle it, and each says
+what would. `phi4`, `mistral`, `mixtral` and `yi` are all names that do
+not exist in llama.cpp's `LLM_ARCH_NAMES`, so there is no reference
+graph to diff against. For the three alias rows this is not academic:
+Ferrox gives them NEOX RoPE, while `llama` — the string real Mistral,
+Mixtral and Yi checkpoints actually ship under — is in llama.cpp's NORM
+group. A file spelling `mistral` would be rotated on the wrong pairs of
+every Q/K head. Latent only because the row refuses.
 
 `FERROX_ALLOW_UNKNOWN_TENSORS=1` loads the checkpoint anyway and accepts
 whatever comes out. Use it while you debug, not to get past the error

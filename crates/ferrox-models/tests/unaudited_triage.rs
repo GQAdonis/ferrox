@@ -265,8 +265,9 @@ fn every_verdict_is_attached_to_a_row_that_actually_refuses_as_unaudited() {
 fn the_remaining_work_is_counted() {
     assert_eq!(
         TRIAGE_PENDING.len(),
-        24,
-        "batches 1 and 2 triaged 23 of 47; update this number as later batches land"
+        0,
+        "all 47 unaudited architectures are triaged; a name reappearing here means a new \
+         architecture reached the generic path without being read"
     );
     let triaged = architecture_catalog()
         .iter()
@@ -275,27 +276,27 @@ fn the_remaining_work_is_counted() {
     assert_eq!(triaged + TRIAGE_PENDING.len(), 47);
 }
 
-/// A pending architecture's message says it is untriaged and does NOT
-/// imply a class.
+/// The untriaged message still works, and still claims no class.
 ///
-/// "Unaudited" and "untriaged" are different claims and the message has
-/// to keep them apart: reading a class into the pending message is how a
-/// guess becomes a citation.
+/// `TRIAGE_PENDING` is empty now that all 47 are read, so this exercises
+/// the branch through a name the catalog does not carry. It is what a
+/// NEW architecture added to the generic path would render until
+/// somebody reads it, and it must not imply a class: "unaudited" and
+/// "untriaged" are different claims, and reading a class into the
+/// untriaged message is how a guess becomes a citation.
 #[test]
-fn a_pending_architecture_claims_no_class() {
-    for arch in ["baichuan", "xverse", "apertus", "mellum"] {
-        let d = unaudited_refusal_detail(arch);
-        assert!(d.contains("not done for"), "{arch}: {d}");
-        for label in [
-            TriageClass::FixtureAway.label(),
-            TriageClass::OneMatchArm.label(),
-            TriageClass::NewCode.label(),
-        ] {
-            assert!(
-                !d.contains(label),
-                "{arch}'s untriaged message must not imply {label}: {d}"
-            );
-        }
+fn the_untriaged_message_claims_no_class() {
+    let d = unaudited_refusal_detail("an-architecture-nobody-has-read-yet");
+    assert!(d.contains("not done for"), "{d}");
+    for label in [
+        TriageClass::FixtureAway.label(),
+        TriageClass::OneMatchArm.label(),
+        TriageClass::NewCode.label(),
+    ] {
+        assert!(
+            !d.contains(label),
+            "the untriaged message implies {label}: {d}"
+        );
     }
 }
 
@@ -309,28 +310,19 @@ fn a_pending_architecture_claims_no_class() {
 #[test]
 fn batch_two_verdicts_are_pinned_to_what_was_read() {
     let cases: &[(&str, TriageClass, &str)] = &[
-        // grok.cpp:5-21 hardcodes five constants before any key can
-        // override them, so a key-presence gate cannot see them.
         ("grok", TriageClass::NewCode, "grok.cpp:5-21"),
-        // dbrx.cpp:69-71,110-112,140-142 normalise with LLM_NORM.
         ("dbrx", TriageClass::NewCode, "LayerNorm, not RMSNorm"),
-        // smallthinker.cpp:111 routes on the raw layer input.
         (
             "smallthinker",
             TriageClass::NewCode,
             "router reads a DIFFERENT tensor",
         ),
-        // bitnet.cpp:101-106,135-140 norm inside the blocks.
         ("bitnet", TriageClass::NewCode, "attn_sub_norm"),
-        // minicpm3.cpp:41-46 is the DeepSeek-2 MLA tensor set.
         ("minicpm3", TriageClass::NewCode, "MLA model"),
-        // openelm.cpp:26-28 sizes every layer separately.
         ("openelm", TriageClass::NewCode, "per-LAYER head counts"),
-        // arcee.cpp:39-40 / plm.cpp:39-40 have no ffn_gate at all.
         ("arcee", TriageClass::NewCode, "UNGATED ReLU-squared"),
         ("plm", TriageClass::NewCode, "UNGATED ReLU-squared"),
     ];
-
     for (arch, class, evidence) in cases {
         let t = unaudited_triage(arch).unwrap_or_else(|| panic!("`{arch}` carries no verdict"));
         assert_eq!(t.class, *class, "`{arch}` changed class");
@@ -362,7 +354,6 @@ fn smallthinker_names_the_routing_input_and_the_nope_layers() {
             t.blocker
         );
     }
-    // The order matters: the routing input is the lead, not the ReLU.
     let routing = t.blocker.find("inpL").expect("inpL");
     let relu = t.blocker.find("LLM_FFN_RELU").expect("relu");
     assert!(
@@ -375,11 +366,11 @@ fn smallthinker_names_the_routing_input_and_the_nope_layers() {
 /// `dbrx` is refused for its normalisation, and the verdict says why the
 /// existing bias-tensor refusal group does NOT cover it.
 ///
-/// The group at `capability.rs` keys on required `*_norm.bias` tensors
-/// as the marker of a real LayerNorm. `dbrx` creates none of them
-/// (`dbrx.cpp:26-40`) and is still LayerNorm, because llama.cpp's
-/// `LLM_NORM` subtracts the mean with or without a bias. Somebody
-/// reading only that group's comment would conclude dbrx is fine.
+/// The group keys on required `*_norm.bias` tensors as the marker of a
+/// real LayerNorm. `dbrx` creates none of them and is still LayerNorm,
+/// because llama.cpp's `LLM_NORM` subtracts the mean with or without a
+/// bias. Somebody reading only that group's comment would conclude dbrx
+/// is fine.
 #[test]
 fn dbrx_says_why_the_bias_group_does_not_catch_it() {
     let t = unaudited_triage("dbrx").expect("verdict");
@@ -390,14 +381,14 @@ fn dbrx_says_why_the_bias_group_does_not_catch_it() {
     );
 }
 
-/// Where a refusal a user actually sees is NOT this one, the verdict
+/// Where the refusal a user actually sees is NOT this one, the verdict
 /// says so rather than letting the reader assume the triage line is what
 /// they got.
 ///
 /// `granite` dies on `capability::unsupported_scaling_keys` and
-/// `openelm` on a missing-hparam error for keys its file does carry, both
-/// before the unaudited gate. A verdict that stayed silent about that
-/// would send someone looking for a message they will never see.
+/// `openelm` on a missing-hparam error for keys its file does carry,
+/// both before the unaudited gate. A verdict that stayed silent about
+/// that would send someone looking for a message they will never see.
 #[test]
 fn verdicts_disclose_when_an_earlier_refusal_fires_first() {
     for (arch, marker) in [
@@ -411,4 +402,211 @@ fn verdicts_disclose_when_an_earlier_refusal_fires_first() {
             t.blocker
         );
     }
+}
+
+/// Batch 3: the alias rows and the plain long-tail.
+///
+/// This is the batch that was expected to be cheap, and half of it was.
+/// `xverse`, `baichuan` and `chatglm` really are llama-shaped and say so
+/// plainly. `deci` and `olmo` are not, and neither is the alias trio,
+/// for a reason that has nothing to do with their graphs.
+#[test]
+fn batch_three_verdicts_are_pinned_to_what_was_read() {
+    let cases: &[(&str, TriageClass, &str)] = &[
+        (
+            "xverse",
+            TriageClass::FixtureAway,
+            "llama under a different name",
+        ),
+        ("baichuan", TriageClass::FixtureAway, "for the 7B"),
+        (
+            "chatglm",
+            TriageClass::FixtureAway,
+            "audited phi3 path exactly",
+        ),
+        ("deci", TriageClass::NewCode, "PER LAYER"),
+        ("olmo", TriageClass::NewCode, "NO norm weights at all"),
+        ("mistral", TriageClass::Unknown, "WHAT WOULD SETTLE IT"),
+        ("mixtral", TriageClass::Unknown, "WHAT WOULD SETTLE IT"),
+        ("yi", TriageClass::Unknown, "WHAT WOULD SETTLE IT"),
+    ];
+    for (arch, class, evidence) in cases {
+        let t = unaudited_triage(arch).unwrap_or_else(|| panic!("`{arch}` carries no verdict"));
+        assert_eq!(t.class, *class, "`{arch}` changed class");
+        assert!(
+            t.blocker.contains(evidence),
+            "`{arch}` is still {class:?} but no longer says {evidence:?}: {}",
+            t.blocker
+        );
+    }
+}
+
+/// The three alias rows are UNKNOWN, and the verdict names the RoPE
+/// hazard rather than calling them llama-shaped.
+///
+/// Marking them fixture-away would be the cheap answer and the wrong
+/// one. `llama` -- the string real Mistral, Mixtral and Yi checkpoints
+/// actually ship under -- is in `llama_model_rope_type`'s NORM group,
+/// while these three rows are NEOX. A file spelling `mistral` would be
+/// rotated on the wrong pairs of every Q/K head, the defect behind the
+/// Llama-3.1-8B wrong-logits bug.
+#[test]
+fn the_alias_rows_name_the_rope_hazard_rather_than_claiming_llama_shape() {
+    for arch in ["mistral", "mixtral", "yi"] {
+        let t = unaudited_triage(arch).expect("verdict");
+        assert_eq!(t.class, TriageClass::Unknown, "`{arch}`");
+        for claim in ["NEOX", "NORM group", "LLM_ARCH_NAMES"] {
+            assert!(
+                t.blocker.contains(claim),
+                "`{arch}`'s verdict drops {claim:?}: {}",
+                t.blocker
+            );
+        }
+    }
+}
+
+/// `baichuan` is one architecture string covering two different models,
+/// and the verdict says which one the refusal is about.
+#[test]
+fn baichuan_says_which_of_its_two_models_the_verdict_covers() {
+    let t = unaudited_triage("baichuan").expect("verdict");
+    for claim in ["13B is a DIFFERENT model", "f_max_alibi_bias", "32-layer"] {
+        assert!(
+            t.blocker.contains(claim),
+            "baichuan's verdict drops {claim:?}: {}",
+            t.blocker
+        );
+    }
+}
+
+/// Batch 4 and batch 5: the remaining long tail.
+#[test]
+fn batches_four_and_five_verdicts_are_pinned_to_what_was_read() {
+    let cases: &[(&str, TriageClass, &str)] = &[
+        // Batch 4.
+        ("maincoder", TriageClass::OneMatchArm, "QK-norm ordering"),
+        (
+            "bailingmoe",
+            TriageClass::OneMatchArm,
+            "never branches on it",
+        ),
+        ("arctic", TriageClass::NewCode, "PARALLEL dense+MoE"),
+        (
+            "mistral3",
+            TriageClass::NewCode,
+            "attention temperature tuning",
+        ),
+        (
+            "nanbeige",
+            TriageClass::NewCode,
+            "RUNS THE SAME PHYSICAL LAYERS MORE THAN ONCE",
+        ),
+        (
+            "mellum",
+            TriageClass::NewCode,
+            "two per-layer RoPE variants",
+        ),
+        ("talkie", TriageClass::NewCode, "NO norm weights"),
+        ("mimo2", TriageClass::NewCode, "attention sinks"),
+        // Batch 5.
+        ("plamo3", TriageClass::FixtureAway, "slot for slot"),
+        ("afmoe", TriageClass::NewCode, "gated attention"),
+        ("apertus", TriageClass::NewCode, "xIELU"),
+        (
+            "exaone-moe",
+            TriageClass::NewCode,
+            "GLOBAL layers get no RoPE",
+        ),
+        ("grovemoe", TriageClass::NewCode, "SECOND bank of experts"),
+        (
+            "hunyuan-dense",
+            TriageClass::OneMatchArm,
+            "no graph of its own",
+        ),
+        ("laguna", TriageClass::NewCode, "second rotary width"),
+        ("step35", TriageClass::NewCode, "per-LAYER rotary width"),
+    ];
+    for (arch, class, evidence) in cases {
+        let t = unaudited_triage(arch).unwrap_or_else(|| panic!("`{arch}` carries no verdict"));
+        assert_eq!(t.class, *class, "`{arch}` changed class");
+        assert!(
+            t.blocker.contains(evidence),
+            "`{arch}` is still {class:?} but no longer says {evidence:?}: {}",
+            t.blocker
+        );
+    }
+}
+
+/// Three architectures now want the same QK-norm ordering flag, and each
+/// verdict says so.
+///
+/// That is the argument for adding the flag rather than special-casing
+/// one architecture, and it is the kind of fact a per-row refusal string
+/// loses unless something checks across rows.
+#[test]
+fn the_qk_norm_ordering_arm_is_wanted_by_three_architectures() {
+    let wanting: Vec<&str> = ["hunyuan-moe", "maincoder", "hunyuan-dense"]
+        .into_iter()
+        .filter(|a| {
+            unaudited_triage(a)
+                .is_some_and(|t| t.blocker.contains("AFTER") && t.blocker.contains("rope"))
+        })
+        .collect();
+    assert_eq!(
+        wanting.len(),
+        3,
+        "expected all three to name the post-RoPE QK norm; got {wanting:?}"
+    );
+}
+
+/// `exaone-moe`'s hardcoded `n_swa = 128` was checked and is NOT a
+/// divergence, and the verdict records that.
+///
+/// A cross-cutting sweep of every `hparams.n_swa =` in llama.cpp turned
+/// this up as a candidate for the `deepseek` shape: a per-architecture
+/// default with no key to correct it. It is not one, because
+/// `exaone-moe.cpp:13` reads the window as a REQUIRED key. A clean
+/// result is still a result, and recording it stops the next person
+/// re-running the same sweep and re-raising the same false alarm.
+#[test]
+fn exaone_moe_records_the_swa_sweep_as_clean() {
+    let t = unaudited_triage("exaone-moe").expect("verdict");
+    assert!(
+        t.blocker.contains("CLEAN"),
+        "exaone-moe's verdict must record the checked-and-clean axis: {}",
+        t.blocker
+    );
+    assert!(t.blocker.contains("REQUIRED"), "{}", t.blocker);
+}
+
+/// Every one of the 47 now carries a verdict, and the four classes are
+/// all represented.
+///
+/// The distribution is the headline: `NewCode` dominates. That is the
+/// honest answer to "how far is ferrox from llama.cpp on models", and it
+/// is the number this whole item existed to produce.
+#[test]
+fn all_forty_seven_are_triaged_and_the_distribution_is_pinned() {
+    let mut fixture = 0;
+    let mut arm = 0;
+    let mut new_code = 0;
+    let mut unknown = 0;
+    for p in architecture_catalog() {
+        if !matches!(p.path, ArchPath::GenericGqa { .. }) || is_audited_generic(p.gguf_name) {
+            continue;
+        }
+        match p.triage.expect("every unaudited row is triaged").class {
+            TriageClass::FixtureAway => fixture += 1,
+            TriageClass::OneMatchArm => arm += 1,
+            TriageClass::NewCode => new_code += 1,
+            TriageClass::Unknown => unknown += 1,
+        }
+    }
+    assert_eq!(
+        (fixture, arm, new_code, unknown),
+        (9, 7, 27, 4),
+        "the triage distribution moved; if a verdict changed on evidence that is correct, \
+         update this and docs/MODELS.md together"
+    );
+    assert_eq!(fixture + arm + new_code + unknown, 47);
 }

@@ -137,11 +137,15 @@ pub fn run(args: ParityArgs) -> anyhow::Result<()> {
     }
 
     let report = compare(&ref_logits, &ferrox_logits, args.top_k);
+    let quant = ferrox_gguf::GgufFile::open(&args.model)
+        .ok()
+        .and_then(|f| dominant_quant(&f));
     print_report(
         &args.model,
         tokens.len(),
         args.top_k,
         backend.as_str(),
+        quant.as_deref(),
         &report,
     );
 
@@ -268,7 +272,74 @@ fn compare(ref_logits: &[f32], ferrox_logits: &[f32], k: usize) -> Report {
     }
 }
 
-fn print_report(model: &str, n_tokens: usize, k: usize, backend: &str, r: &Report) {
+/// The quantization of the per-layer weights, and whether llama.cpp
+/// dots it against 8-bit-quantized ACTIVATIONS.
+///
+/// This exists because a `DRIFT` verdict on a K-quant is expected rather
+/// than suspicious, and the old message sent the reader off to do a
+/// per-layer divergence run on a difference that has a known cause.
+///
+/// ggml declares a `vec_dot_type` per quantization
+/// (`ggml/src/ggml-cpu/ggml-cpu.c`). For the K-quants it is
+/// `GGML_TYPE_Q8_K`: llama.cpp quantizes the activation to 8 bits and
+/// accumulates in integers. ferrox keeps activations in f32. Both are
+/// defensible and ferrox is the more precise of the two, but they are
+/// not the same arithmetic, so the distributions differ by more than
+/// summation order.
+///
+/// Measured on five quantizations of one checkpoint: the verdict tracks
+/// this predicate on the 96 per-layer tensors exactly. See
+/// `docs/plans/llama-cpp-gap-inventory.md` §10.
+fn llama_dots_this_against_q8k(kind: &str) -> bool {
+    // Spelled as `GgmlType`'s own variant names (`Q4K`, not `Q4_K`) --
+    // these come from `format!("{:?}", dtype)`, and writing the ggml
+    // spelling here would have matched nothing while looking correct.
+    matches!(
+        kind,
+        "Q2K"
+            | "Q3K"
+            | "Q4K"
+            | "Q5K"
+            | "Q6K"
+            | "IQ2XXS"
+            | "IQ2XS"
+            | "IQ2S"
+            | "IQ3XXS"
+            | "IQ3S"
+            | "IQ1S"
+            | "IQ1M"
+            | "IQ4XS"
+    )
+}
+
+/// The most common quantization among a checkpoint's tensors.
+///
+/// The FILENAME is not this. `Llama-3.2-1B-Instruct-IQ4_XS.gguf`
+/// contains no IQ4_XS tensors at all -- 96 of its per-layer weights are
+/// `IQ4_NL` -- because the name is the quantization RECIPE and the
+/// recipe falls back. Reading the tensor table is the only way to know,
+/// and mistaking the two is what made that file look like a
+/// counterexample.
+fn dominant_quant(file: &ferrox_gguf::GgufFile) -> Option<String> {
+    use std::collections::HashMap;
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    for t in &file.tensors {
+        let kind = format!("{:?}", t.dtype);
+        if kind != "F32" && kind != "F16" && kind != "BF16" {
+            *counts.entry(kind).or_default() += 1;
+        }
+    }
+    counts.into_iter().max_by_key(|(_, n)| *n).map(|(k, _)| k)
+}
+
+fn print_report(
+    model: &str,
+    n_tokens: usize,
+    k: usize,
+    backend: &str,
+    quant: Option<&str>,
+    r: &Report,
+) {
     let name = Path::new(model)
         .file_stem()
         .map(|s| s.to_string_lossy().into_owned())
@@ -301,10 +372,22 @@ fn print_report(model: &str, n_tokens: usize, k: usize, backend: &str, r: &Repor
     );
     match r.verdict {
         Verdict::Match => println!("  same distribution to within f32 accumulation-order noise."),
-        Verdict::Drift => println!(
-            "  same token, but the distributions differ by more than accumulation order \
-             explains — worth a per-layer divergence run before trusting this row."
-        ),
+        Verdict::Drift => match quant.filter(|q| llama_dots_this_against_q8k(q)) {
+            // Expected, with a named cause. Saying "go run a per-layer
+            // divergence" here would send the reader after a bug that
+            // is not there.
+            Some(q) => println!(
+                "  same token. The distributions differ by more than summation order, and for \
+                 {q} that is EXPECTED: llama.cpp declares `vec_dot_type = Q8_K` for it, so it \
+                 quantizes the ACTIVATION to 8 bits and accumulates in integers, while ferrox \
+                 keeps activations in f32. Different arithmetic, with ferrox on the more \
+                 precise side. See docs/plans/llama-cpp-gap-inventory.md §10."
+            ),
+            None => println!(
+                "  same token, but the distributions differ by more than accumulation order \
+                 explains — worth a per-layer divergence run before trusting this row."
+            ),
+        },
         Verdict::TieFlip => println!(
             "  top-1 differs, but llama's own top-2 margin ({:.3e}) is under the observed \
              per-token noise ({:.3e}): a tie swapped, not a wrong graph.",
@@ -463,5 +546,39 @@ mod tests {
         let b: Vec<f32> = a.iter().map(|v| v + 7.25).collect();
         let r = compare(&a, &b, 3);
         assert_eq!(r.verdict, Verdict::Match);
+    }
+
+    /// The Q8_K predicate is spelled in `GgmlType`'s variant names, not
+    /// ggml's.
+    ///
+    /// `format!("{:?}", dtype)` yields `Q4K`, and ggml calls the same
+    /// thing `Q4_K`. Writing the ggml spelling here matches NOTHING
+    /// while looking exactly right, and the symptom is the generic
+    /// "go run a per-layer divergence" message on every K-quant — which
+    /// is the message this predicate exists to suppress. That mistake
+    /// was made once already; this is what catches it.
+    #[test]
+    fn the_q8k_predicate_uses_the_dtype_debug_spelling() {
+        for kind in ["Q2K", "Q3K", "Q4K", "Q5K", "Q6K", "IQ4XS", "IQ2S"] {
+            assert!(
+                llama_dots_this_against_q8k(kind),
+                "{kind} declares vec_dot_type = Q8_K in ggml-cpu.c"
+            );
+        }
+        // The ggml spelling must NOT match, or the underscore bug is
+        // back and invisible.
+        for wrong in ["Q4_K", "Q6_K", "IQ4_XS"] {
+            assert!(
+                !llama_dots_this_against_q8k(wrong),
+                "{wrong} is ggml's spelling, not GgmlType's -- if this now matches, the \
+                 predicate is accepting both and the next reader cannot tell which is real"
+            );
+        }
+        // Q8_0-dotted quants must stay out: these are the ones that
+        // MATCH, and claiming the divergence is expected for them would
+        // excuse a real bug.
+        for q8_0_dotted in ["Q8_0", "Q4_0", "Q5_0", "IQ4NL"] {
+            assert!(!llama_dots_this_against_q8k(q8_0_dotted));
+        }
     }
 }

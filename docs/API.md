@@ -817,6 +817,19 @@ caller cannot tell that apart from having had it honoured, which for
 `stop` in particular means believing generation will halt at a sentinel
 and instead getting the full budget of text past it.
 
+**`logit_bias` is refused on `/v1/chat/completions` too**, and by the
+same rule rather than a second copy of it. Until recently only
+`/v1/completions` refused it: the chat request struct had no such field,
+so serde dropped it and the caller got a 200 with unbiased output. Two
+routes disagreeing about one parameter is the shape of bug this API
+surface keeps producing, so both now call one `refuse_logit_bias`.
+
+One deliberate exception: **an empty `logit_bias: {}` is served, not
+refused**, on both routes. Several OpenAI clients send an empty map on
+every request, and there is no token whose logit it would move — so
+refusing it is a false refusal. A non-object (`[]`, `"none"`) is still
+refused, so nothing falls through the empty-map hole.
+
 ## Not yet
 
 Image and audio input · full JSON schema / grammar constrained decoding ·

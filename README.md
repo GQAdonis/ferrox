@@ -28,72 +28,47 @@
 ---
 
 Ferrox loads GGUF checkpoints and runs inference on your hardware. No
-bindings to llama.cpp, no ggml wrapper. The loader, quantized kernels,
+bindings to llama.cpp, no ggml wrapper — the loader, quantized kernels,
 attention and expert routing are all implemented here.
 
-- **One binary, and no runtime under it.** The release build with Metal
-  and `serve` is 19 MB, 14 MB stripped, and that single file runs
-  completions, the server, `download`, `bench` and `verify`. Nothing to
-  activate, no interpreter, no wheels, no CUDA userspace to match
-  against a driver. Measured on the host the benchmarks use (M2 Pro,
-  macOS), that is the same ballpark as llama.cpp's own core, 14 MB of
-  executables and shared libraries, and it is a different category from
-  the Python serving stacks: PyTorch alone is 402 MB here, before vLLM
-  or TGI is installed on top of it.
+- **One binary, no runtime.** 19 MB with Metal and the server, 14 MB
+  stripped. It runs completions, the API server, `download`, `bench` and
+  `verify`. Nothing to activate, no wheels, no CUDA userspace to match
+  against a driver. PyTorch alone is 402 MB before vLLM sits on top.
 - **Quantized end to end.** Weights stay quantized on mmap and
-  dequantization happens inside the matmul, so an 8B model fits on a
-  laptop. K-quants, the IQ tiers, MXFP4, F16 and BF16.
-- **Mixture-of-experts gets its own path.** GPU routing, indexed expert
-  GEMMs, and residency planning. Experts stream from the checkpoint
-  through a bounded cache when the weights do not fit, and that turns
-  itself on only when they do not: it is slower than running resident,
-  so it is a way to run a model that otherwise could not run at all,
-  never a default. What it costs and where it is still policy rather
-  than execution is in [docs/FEATURES.md](docs/FEATURES.md).
-- **Every speed number is measured.** Each claim comes from a run
-  against llama.cpp on the same host, the same file and the same
-  backend. Every run writes a small JSON file of raw timings, and those
-  files are checked into `benchmarks/receipts/engine/`. The table in
-  [benchmarks/RESULTS.md](benchmarks/RESULTS.md) is generated from them,
-  never typed in by hand. A host that is busy, thermally limited, or too
-  short on free memory to hold the weights stops `ferrox bench` instead
-  of getting a number out of it.
-- **Validated against the reference.** Quant kernels are checked
-  bit-exact against llama.cpp's own dequantization, and `ferrox parity`
-  compares first-token logit distributions with llama.cpp on the same
-  prompt. A model whose maths Ferrox only partly implements stops with
-  an error naming what is missing, rather than loading and returning
-  fluent text computed the wrong way.
-- **OpenAI-compatible server** with continuous batching, paged KV that
-  shares a system prompt's pages between conversations instead of
-  copying them per request, runtime model swap, resumable streams that
-  survive a dropped connection, Anthropic and Responses endpoints beside
-  the OpenAI ones, and an `/admin` control surface. Point your existing
-  client at it.
-- **Grammar-constrained decoding, and a sampler that matches
-  llama.cpp's.** `grammar` takes llama.cpp's own GBNF and is enforced on
-  every token by a stack machine, not by masking characters, so it knows
-  whether a `}` closes an object that was opened. The sampler chain runs
-  in llama.cpp's order with `min_p` and a 64-token penalty window, so
-  the flags you already know produce the distribution you expect.
-- **Speculative decoding that stays lossless** at any temperature, not
-  only at `--temp 0`, using the speculative-sampling rejection rule.
-  Acceptance length and the per-position accept rate are reported, so a
-  drafter that decays toward the end of a block is visible rather than
-  averaged away.
-- **Prompts rendered by the checkpoint's own template.** The GGUF's real
-  `tokenizer.chat_template` is compiled and evaluated, not sniffed for
-  markers, so a family nobody hand-wrote a renderer for is still framed
-  the way it was trained. `chat_template_kwargs` and `reasoning_effort`
-  are passed through, and the effort is quantized onto the gears that
-  checkpoint actually grades, probed from its own template at load rather
-  than read from a table keyed by model name.
-- **Agent-facing output, parsed.** A reasoning model's chain of thought
-  is split into `reasoning_content` as tokens arrive, and tool calls are
-  recognised in the format the served checkpoint's family really emits,
-  eleven of them, rather than only the one the prompt asked for.
-  Arguments stream as deltas, so a coding agent watches a file argument
-  arrive instead of waiting for it.
+  dequantize inside the matmul, so an 8B model fits on a laptop.
+  K-quants, the IQ tiers, MXFP4, F16 and BF16.
+- **Mixture-of-experts has its own path** — GPU routing, indexed expert
+  GEMMs, residency planning. When the weights do not fit, experts stream
+  from the checkpoint through a bounded cache: slower than resident, so
+  it turns itself on only to run a model that otherwise could not run.
+- **OpenAI-compatible server.** Continuous batching, paged KV that
+  shares a system prompt's pages across conversations, runtime model
+  swap, resumable streams, Anthropic and Responses endpoints, and an
+  `/admin` surface. Point your existing client at it.
+- **Constrained output that actually holds.** Pass GBNF, a JSON Schema,
+  or `tool_choice: "required"`, and a stack machine enforces it every
+  token — so it knows whether a `}` closes an object that was opened.
+- **Same flags, same output as llama.cpp.** The sampler runs llama.cpp's
+  chain in llama.cpp's order, `min_p` included. Tokenization is verified
+  byte-for-byte against it on ten checkpoints, embeddings included.
+- **Prompts framed by the checkpoint's own template.** The GGUF's real
+  `tokenizer.chat_template` is compiled and evaluated, never sniffed —
+  so a family nobody hand-wrote a renderer for is still framed the way
+  it was trained.
+- **Agent-ready output.** Chain of thought splits into
+  `reasoning_content` as tokens arrive, and tool calls are parsed in the
+  eleven formats real checkpoints emit, streaming as argument deltas.
+- **Speculative decoding stays lossless** at any temperature, not just
+  `--temp 0`, and reports per-position accept rate rather than one
+  average.
+- **Every speed number is measured**, against llama.cpp on the same host
+  and file. Runs write JSON receipts that generate
+  [the table](benchmarks/RESULTS.md); a busy or thermally limited host
+  stops the benchmark instead of publishing a bad number.
+- **It refuses rather than guessing.** A model whose maths Ferrox only
+  partly implements stops and names what is missing, instead of loading
+  and returning fluent text computed the wrong way.
 
 ## Install
 

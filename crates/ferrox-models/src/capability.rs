@@ -1679,6 +1679,24 @@ pub fn unsupported_feature_keys(arch: &str) -> Vec<(String, &'static str)> {
             key("attention.logit_softcapping"),
             "attention logit soft-capping (Gemma 2+); not implemented in the generic decoder",
         ),
+        // The spelling llama.cpp's converters ACTUALLY write
+        // (`llama-arch.cpp:213` is `%s.attn_logit_softcapping`). The
+        // line above is a spelling no converter emits, so this gate has
+        // never fired for any non-Gemma architecture -- while
+        // `loader.rs` reads BOTH spellings and applies the value.
+        //
+        // A checkpoint declaring an attention softcap was therefore not
+        // refused; it ran with the generic formula. For `grok` that is a
+        // wrong answer rather than an approximation: `grok.cpp` folds
+        // the real attention scale INTO the softcap and passes
+        // `kq_scale = 1.0f`, which the generic path does not do.
+        //
+        // A gate that cannot fire is not a gate, and it looked exactly
+        // like one.
+        (
+            key("attn_logit_softcapping"),
+            "attention logit soft-capping (Gemma 2+); not implemented in the generic decoder",
+        ),
         (
             key("final_logit_softcapping"),
             "final logit soft-capping (Gemma 2+); not implemented in the generic decoder",
@@ -2186,5 +2204,49 @@ mod tests {
         for p in architecture_catalog() {
             assert!(seen.insert(p.gguf_name), "{} listed twice", p.gguf_name);
         }
+    }
+
+    /// Every key this gate refuses must be a key a converter actually
+    /// writes, or the gate cannot fire.
+    ///
+    /// `unsupported_feature_keys` listed `{arch}.attention.logit_softcapping`.
+    /// llama.cpp writes `{arch}.attn_logit_softcapping`
+    /// (`llama-arch.cpp:213`), and no converter emits the first
+    /// spelling — so that arm never matched anything, for any non-Gemma
+    /// architecture, ever. Meanwhile `loader.rs` reads BOTH spellings,
+    /// so the value was read and applied with the generic formula
+    /// instead of being refused. For `grok` that is a wrong answer:
+    /// `grok.cpp` folds the real attention scale into the softcap and
+    /// passes `kq_scale = 1.0f`.
+    ///
+    /// A gate that cannot fire is worse than a missing gate, because it
+    /// reads as coverage.
+    #[test]
+    fn every_refused_key_is_one_a_converter_actually_writes() {
+        let keys: Vec<String> = unsupported_feature_keys("llama")
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
+
+        // Transcribed from `llama-arch.cpp`'s LLM_KV_NAMES.
+        for real in [
+            "llama.attn_logit_softcapping",
+            "llama.final_logit_softcapping",
+            "llama.attention.sliding_window_pattern",
+        ] {
+            assert!(
+                keys.iter().any(|k| k == real),
+                "{real} is a key llama.cpp writes and this gate must refuse it; \
+                 gate currently holds {keys:?}"
+            );
+        }
+
+        // Gemma implements all three, so it must still be exempt --
+        // otherwise "fix the spelling" would have turned into "refuse
+        // every Gemma checkpoint".
+        assert!(
+            unsupported_feature_keys("gemma2").is_empty(),
+            "the Gemma family implements softcap and the SWA pattern"
+        );
     }
 }

@@ -70,6 +70,19 @@ pub struct InferArgs {
     #[arg(long = "top-p", default_value_t = 0.95)]
     pub top_p: f32,
 
+    /// Constrain generation to a GBNF grammar (llama.cpp's `--grammar`).
+    #[arg(long = "grammar")]
+    pub grammar: Option<String>,
+
+    /// Read the GBNF grammar from a file (llama.cpp's `--grammar-file`).
+    #[arg(long = "grammar-file")]
+    pub grammar_file: Option<std::path::PathBuf>,
+
+    /// Constrain generation to a JSON Schema, converted to GBNF
+    /// (llama.cpp's `-j` / `--json-schema`).
+    #[arg(short = 'j', long = "json-schema")]
+    pub json_schema: Option<String>,
+
     /// Min-p sampling: drop every candidate less than this fraction as
     /// likely as the most likely one (`0.0` = disabled).
     ///
@@ -169,7 +182,149 @@ pub struct InferArgs {
     pub ctk: String,
 }
 
+/// Build the shared decode step, compiling the grammar against this
+/// model's vocabulary if one was asked for.
+///
+/// Takes the tokenizer rather than a closure so the vocabulary view is
+/// built once per run, not once per token.
+fn token_step(
+    args: &InferArgs,
+    sampler: Sampler,
+    tokenizer: &CliTokenizer,
+    stop_tokens: &ferrox_models::tokenizer::StopTokens,
+    vocab_size: usize,
+) -> anyhow::Result<TokenStep> {
+    let Some(src) = args.grammar_source()? else {
+        return Ok(TokenStep::new(sampler, None));
+    };
+    // Compiled here, before the decode loop, so a grammar that does not
+    // parse fails the command rather than the first token.
+    let grammar = ferrox_models::grammar::Grammar::from_str_with_root(&src, "root")
+        .map_err(|e| anyhow::anyhow!("grammar does not parse: {e}"))?;
+    let grammar = ferrox_models::grammar_sampler::GrammarSampler::new(
+        grammar,
+        vocab_size,
+        |id| tokenizer.decode(&[id]).into_bytes(),
+        |id| stop_tokens.contains(id),
+    );
+    Ok(TokenStep::new(sampler, Some(grammar)))
+}
+
+/// One decode step, shared by every generation loop in this file.
+///
+/// There were FOUR byte-identical `sampler.sample(&logits, &sampling,
+/// &generated)` call sites here -- the dense path, the engine path and
+/// two chat paths. Adding a grammar to three of them and missing the
+/// fourth would have produced unconstrained output on one code path with
+/// every test still green, which is this repo's most-repeated bug and
+/// was the same shape `InferArgs::sampling()` was introduced to kill.
+///
+/// Holds the grammar because the mask and the accept are two halves of
+/// one hook: a caller that could take the mask without the accept would
+/// keep asking "what may the FIRST token be" forever.
+pub struct TokenStep {
+    sampler: ferrox_models::sampling::Sampler,
+    grammar: Option<ferrox_models::grammar_sampler::GrammarSampler>,
+}
+
+impl TokenStep {
+    pub fn new(
+        sampler: ferrox_models::sampling::Sampler,
+        grammar: Option<ferrox_models::grammar_sampler::GrammarSampler>,
+    ) -> Self {
+        Self { sampler, grammar }
+    }
+
+    /// Whether this step must see one logit per vocabulary entry.
+    ///
+    /// A backend may fold `lm_head + argmax` into its decode stack and
+    /// return a single token id instead of logits. That is sound only
+    /// when nothing needs to look at the vocabulary first, and a grammar
+    /// does. Read by the Metal greedy guard, which used to test the
+    /// temperature alone.
+    // Read only by the Metal greedy guard, so a CPU-only build has no
+    // fold to refuse and this is genuinely dead there. Same shape and
+    // same reason as `ferrox-models`'s `FoldedLmHead`.
+    #[cfg_attr(not(feature = "metal"), allow(dead_code))]
+    pub fn needs_vocab_logits(&self) -> bool {
+        self.grammar.is_some()
+    }
+
+    /// `Ok(None)` means the grammar is SATISFIED and has no legal
+    /// continuation -- a finished answer, not a failure. An unsatisfied
+    /// dead end is the `Err`.
+    pub fn next(
+        &mut self,
+        logits: &[f32],
+        sampling: &ferrox_models::sampling::SamplingParams,
+        generated: &[usize],
+    ) -> anyhow::Result<Option<usize>> {
+        let Some(grammar) = self.grammar.as_mut() else {
+            return Ok(Some(self.sampler.sample(logits, sampling, generated)));
+        };
+        let mut refusal = None;
+        let mut outcome = ferrox_models::grammar_sampler::MaskOutcome::Allowed;
+        let next = {
+            let g = &*grammar;
+            let mut mask = |scores: &mut [f32]| match g.mask_logits(scores) {
+                Ok(o) => outcome = o,
+                Err(e) => refusal = Some(e),
+            };
+            self.sampler
+                .sample_with_mask(logits, sampling, generated, Some(&mut mask))
+        };
+        if let Some(e) = refusal {
+            anyhow::bail!("grammar refused every continuation: {e}");
+        }
+        if outcome == ferrox_models::grammar_sampler::MaskOutcome::Complete {
+            return Ok(None);
+        }
+        grammar.accept(next)?;
+        Ok(Some(next))
+    }
+}
+
 impl InferArgs {
+    /// The grammar these flags describe, if any.
+    ///
+    /// The three spellings are llama.cpp's and are MUTUALLY EXCLUSIVE
+    /// there. Refused together rather than silently picking one, because
+    /// a caller who passed both asked for two different constraints and
+    /// honouring either is answering a question they did not ask.
+    pub fn grammar_source(&self) -> anyhow::Result<Option<String>> {
+        let given = [
+            self.grammar.is_some(),
+            self.grammar_file.is_some(),
+            self.json_schema.is_some(),
+        ]
+        .iter()
+        .filter(|b| **b)
+        .count();
+        if given > 1 {
+            anyhow::bail!(
+                "--grammar, --grammar-file and --json-schema are mutually exclusive; \
+                 pass exactly one"
+            );
+        }
+        if let Some(g) = &self.grammar {
+            return Ok(Some(g.clone()));
+        }
+        if let Some(path) = &self.grammar_file {
+            return Ok(Some(std::fs::read_to_string(path).map_err(|e| {
+                anyhow::anyhow!("--grammar-file {}: {e}", path.display())
+            })?));
+        }
+        if let Some(schema) = &self.json_schema {
+            // Converted here rather than at the sampler, so a schema that
+            // cannot be expressed fails BEFORE the model is loaded.
+            return Ok(Some(
+                ferrox_models::grammar::json_schema_to_grammar(schema)
+                    .map_err(|e| anyhow::anyhow!("--json-schema: {e}"))?,
+            ));
+        }
+        Ok(None)
+    }
+
     /// The sampler these flags describe.
     ///
     /// One function rather than one copy per generation path. There were
@@ -950,7 +1105,14 @@ pub fn run_infer(args: InferArgs) -> anyhow::Result<()> {
 
     let sampling = args.sampling();
     let seed = seed_from_args(args.seed);
-    let mut sampler = Sampler::new(seed);
+    let sampler = Sampler::new(seed);
+    let mut step = token_step(
+        &args,
+        sampler,
+        &tokenizer,
+        &stop_tokens,
+        decoder.config.vocab_size,
+    )?;
 
     #[cfg(feature = "metal")]
     let _metal_greedy_guard = {
@@ -960,7 +1122,17 @@ pub fn run_infer(args: InferArgs) -> anyhow::Result<()> {
                 ferrox_models::set_metal_greedy_argmax(false);
             }
         }
-        if sampling.temperature <= 0.0 {
+        // NOT `temperature <= 0.0` alone. The fold makes the stack
+        // return ONE element holding the chosen id, and a grammar needs
+        // one logit per vocabulary entry to mask. Gating on temperature
+        // only produced exactly that: `--json-schema` at `--temp 0`
+        // failed with "was handed 1 for a vocabulary of 128256".
+        //
+        // Same defect `ferrox-server`'s `greedy_gpu_fold_allowed` fixed
+        // for `json_object`, and the third instance of it. The rule is
+        // the server's: the fold is sound only when NOTHING needs to
+        // inspect the vocabulary before a token is chosen.
+        if sampling.temperature <= 0.0 && !step.needs_vocab_logits() {
             ferrox_models::set_metal_greedy_argmax(true);
             Some(Guard)
         } else {
@@ -991,7 +1163,11 @@ pub fn run_infer(args: InferArgs) -> anyhow::Result<()> {
     let mut stdout = io::stdout().lock();
     let decode_t = Instant::now();
     for _ in 0..max_new {
-        let next = sampler.sample(&logits, &sampling, &generated);
+        let Some(next) = step.next(&logits, &sampling, &generated)? else {
+            // The grammar is satisfied and permits nothing further: a
+            // finished answer, not a failure.
+            break;
+        };
         if !args.ignore_eos && stop_tokens.contains(next) {
             break;
         }
@@ -1087,7 +1263,14 @@ fn run_mla_infer(args: InferArgs, path: &Path, file: &ShardedGguf) -> anyhow::Re
     };
 
     let sampling = args.sampling();
-    let mut sampler = Sampler::new(seed_from_args(args.seed));
+    let sampler = Sampler::new(seed_from_args(args.seed));
+    let mut step = token_step(
+        &args,
+        sampler,
+        &tokenizer,
+        &stop_tokens,
+        engine.vocab_size(),
+    )?;
     let mut state = Engine::new_state(&engine);
 
     let prefill_t = Instant::now();
@@ -1110,7 +1293,11 @@ fn run_mla_infer(args: InferArgs, path: &Path, file: &ShardedGguf) -> anyhow::Re
     let mut stdout = io::stdout().lock();
     let decode_t = Instant::now();
     for _ in 0..max_new {
-        let next = sampler.sample(&logits, &sampling, &generated);
+        let Some(next) = step.next(&logits, &sampling, &generated)? else {
+            // The grammar is satisfied and permits nothing further: a
+            // finished answer, not a failure.
+            break;
+        };
         if !args.ignore_eos && stop_tokens.contains(next) {
             break;
         }
@@ -1206,7 +1393,14 @@ fn run_gemma4_infer(args: InferArgs, path: &Path, file: &ShardedGguf) -> anyhow:
     };
 
     let sampling = args.sampling();
-    let mut sampler = Sampler::new(seed_from_args(args.seed));
+    let sampler = Sampler::new(seed_from_args(args.seed));
+    let mut step = token_step(
+        &args,
+        sampler,
+        &tokenizer,
+        &stop_tokens,
+        engine.vocab_size(),
+    )?;
     let mut state = Engine::new_state(&engine);
 
     let prefill_t = Instant::now();
@@ -1229,7 +1423,11 @@ fn run_gemma4_infer(args: InferArgs, path: &Path, file: &ShardedGguf) -> anyhow:
     let mut stdout = io::stdout().lock();
     let decode_t = Instant::now();
     for _ in 0..max_new {
-        let next = sampler.sample(&logits, &sampling, &generated);
+        let Some(next) = step.next(&logits, &sampling, &generated)? else {
+            // The grammar is satisfied and permits nothing further: a
+            // finished answer, not a failure.
+            break;
+        };
         if !args.ignore_eos && stop_tokens.contains(next) {
             break;
         }
@@ -1324,7 +1522,14 @@ fn run_glm52_infer(args: InferArgs, path: &Path, file: &ShardedGguf) -> anyhow::
     };
 
     let sampling = args.sampling();
-    let mut sampler = Sampler::new(seed_from_args(args.seed));
+    let sampler = Sampler::new(seed_from_args(args.seed));
+    let mut step = token_step(
+        &args,
+        sampler,
+        &tokenizer,
+        &stop_tokens,
+        engine.vocab_size(),
+    )?;
     let mut state = Engine::new_state(&engine);
 
     let prefill_t = Instant::now();
@@ -1347,7 +1552,11 @@ fn run_glm52_infer(args: InferArgs, path: &Path, file: &ShardedGguf) -> anyhow::
     let mut stdout = io::stdout().lock();
     let decode_t = Instant::now();
     for _ in 0..max_new {
-        let next = sampler.sample(&logits, &sampling, &generated);
+        let Some(next) = step.next(&logits, &sampling, &generated)? else {
+            // The grammar is satisfied and permits nothing further: a
+            // finished answer, not a failure.
+            break;
+        };
         if !args.ignore_eos && stop_tokens.contains(next) {
             break;
         }

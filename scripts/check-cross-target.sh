@@ -51,3 +51,32 @@ echo "cross-target gate: clippy --workspace --all-targets --target ${TARGET}"
 # to learn the same thing.
 cargo clippy --workspace --all-targets --target "$TARGET" -- -D warnings
 echo "cross-target gate: ok (${TARGET})"
+
+# --- the second half, and the reason it exists -------------------------
+#
+# The gate above defaults to `x86_64-apple-darwin`, which selects the
+# non-aarch64 kernel fallbacks but is STILL macOS. Two releases were
+# broken by code that is dead only on LINUX and compiled fine here:
+# v0.13.0 by a `sysctl` helper behind `#[cfg(target_os = "macos")]`, and
+# v0.13.1 by `sum_footprints` and `ProbeCache::last`, orphans of a
+# deleted supervisor. Neither is reachable by any Apple target.
+#
+# A full Linux build needs a C cross-compiler (`ring`, via the HTTP
+# stack, will not build without one), so the whole workspace cannot be
+# checked here. The COMPUTE crates have no such dependency and can be,
+# which covers the `#[cfg(target_os)]` and dead-code classes in the code
+# that actually differs per platform.
+#
+# Skipped rather than failed when the target is absent: this is an
+# addition to the gate, not a new prerequisite for running it.
+LINUX_TARGET="x86_64-unknown-linux-gnu"
+if [ "$TARGET" != "$LINUX_TARGET" ] \
+  && rustup target list --installed | grep -qx "$LINUX_TARGET"; then
+  echo "cross-target gate: compute crates against ${LINUX_TARGET} (real non-Apple OS)"
+  cargo clippy --target "$LINUX_TARGET" --all-targets \
+    -p ferrox-quant -p ferrox-gguf -p ferrox-core -p ferrox-moe -p ferrox-models \
+    -- -D warnings
+  echo "cross-target gate: ok (${LINUX_TARGET}, compute crates)"
+else
+  echo "cross-target gate: skipping the ${LINUX_TARGET} pass (target not installed)"
+fi

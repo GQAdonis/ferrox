@@ -93,7 +93,8 @@ pub use speculative::{
 };
 pub use tensor_role::TensorRole;
 pub use tokenizer::{
-    ByteTokenizer, GgufBpeTokenizer, GgufSpmTokenizer, GgufUnigramTokenizer, TokenizerLoadError,
+    ByteTokenizer, GgufBpeTokenizer, GgufSpmTokenizer, GgufUnigramTokenizer,
+    GgufWordPieceTokenizer, NormalizerOptions, TokenizerLoadError,
 };
 
 #[cfg(feature = "metal")]

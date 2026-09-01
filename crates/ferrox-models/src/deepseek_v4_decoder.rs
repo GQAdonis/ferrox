@@ -37,7 +37,9 @@ use ferrox_core::deepseek_v4_attention::{csa_attention, hca_attention};
 use ferrox_core::matmul::rms_norm;
 use ferrox_core::tensor::Tensor;
 use ferrox_core::weight_matrix::WeightMatrix;
-use ferrox_moe::{combine_expert_outputs, route_top_k, run_expert, ExpertWeights, GatingFunction};
+use ferrox_moe::{
+    combine_expert_outputs, route_top_k, run_expert, ExpertWeights, GatingFunction, GluAct,
+};
 
 use crate::hyper_connections::{
     head as hc_head, post as hc_post, pre as hc_pre, HyperConnectionHeadWeights,
@@ -516,9 +518,9 @@ fn moe_ffn_forward(
         .expert_ids
         .iter()
         .zip(decision.weights.iter())
-        .map(|(&e, &w)| (run_expert(x, &weights.experts[e]), w))
+        .map(|(&e, &w)| (run_expert(x, &weights.experts[e], GluAct::Swiglu), w))
         .collect();
-    let shared_out = run_expert(x, &weights.shared_expert);
+    let shared_out = run_expert(x, &weights.shared_expert, GluAct::Swiglu);
     combine_expert_outputs(&routed_outputs, &[shared_out], x.len())
 }
 

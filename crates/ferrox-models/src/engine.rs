@@ -200,7 +200,7 @@ impl MlaEngine {
     fn moe_ffn_forward(&self, ffn: &MlaMoeFfn, x: &[f32]) -> Vec<f32> {
         use ferrox_moe::{
             combine_expert_outputs, route_top_k, route_top_k_sigmoid_with_bias, run_expert,
-            GatingFunction,
+            GatingFunction, GluAct,
         };
         let moe = self
             .moe
@@ -234,9 +234,9 @@ impl MlaEngine {
             .expert_ids
             .iter()
             .zip(decision.weights.iter())
-            .map(|(&e, &w)| (run_expert(x, &ffn.experts[e]), w))
+            .map(|(&e, &w)| (run_expert(x, &ffn.experts[e], GluAct::Swiglu), w))
             .collect();
-        let shared = run_expert(x, &ffn.shared_expert);
+        let shared = run_expert(x, &ffn.shared_expert, GluAct::Swiglu);
         combine_expert_outputs(&routed, &[shared], x.len())
     }
 }

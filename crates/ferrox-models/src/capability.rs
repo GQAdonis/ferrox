@@ -1046,6 +1046,31 @@ pub struct SwaPattern {
 /// so have no default to pin.
 ///
 /// Pinned by `tests/swa_pattern.rs`.
+/// Architectures whose FFN gate uses GELU rather than SiLU, i.e. GeGLU
+/// rather than SwiGLU.
+///
+/// llama.cpp picks this PER ARCHITECTURE -- it is the `LLM_FFN_GELU` vs
+/// `LLM_FFN_SILU` argument each `src/models/*.cpp` passes to `build_ffn`
+/// / `build_moe_ffn` -- and ferrox picked it per FAMILY, which is not
+/// the same partition. `grok` is the case that proves it:
+/// `src/models/grok.cpp:165` passes `LLM_FFN_GELU` to `build_moe_ffn`,
+/// but `grok` is `DecoderFamily::StandardGqa`, so ferrox handed it
+/// SwiGLU and would have computed a different FFN on every layer.
+///
+/// Latent only because `grok` is not in [`AUDITED_GENERIC_GQA`] and so
+/// refuses today. It would have become wrong the moment somebody
+/// audited it, which is the worst possible time to find out.
+///
+/// The other `LLM_FFN_GELU` users upstream -- `bert`, `bloom`,
+/// `codeshell`, `falcon`, `gpt2`, `gptneox`, `mpt`, `phi2`, `starcoder`,
+/// `starcoder2`, `t5`, `wavtokenizer-dec` -- are all `Deferred` or
+/// `DedicatedOnly` here, so none reaches the generic path and none is
+/// listed. The Gemma lineage is GELU too and stays on the family rule,
+/// because every Gemma row IS `GemmaFamily`.
+pub fn uses_geglu(arch: &str) -> bool {
+    matches!(arch, "grok")
+}
+
 pub fn default_swa_layout(arch: &str) -> Option<SwaPattern> {
     let last_dense = |period| {
         Some(SwaPattern {

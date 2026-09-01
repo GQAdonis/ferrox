@@ -13,6 +13,7 @@
 //! checkpoint to be present.
 
 mod attn_block;
+mod ffn_act;
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -23,7 +24,7 @@ use ferrox_core::attention::{
     causal_gqa_attention_softcap,
 };
 use ferrox_core::cache::{KvCache, PagedKvCache, PagedStoreExhausted, SharedPagedKv};
-use ferrox_core::matmul::{geglu, rms_norm, rms_norm_per_head, softcap_inplace};
+use ferrox_core::matmul::{rms_norm, rms_norm_per_head, softcap_inplace};
 use rayon::prelude::*;
 
 /// Whether the CUDA `gqa_decode` kernel should serve the per-token GQA
@@ -44,7 +45,7 @@ use ferrox_core::tensor::Tensor;
 use ferrox_core::weight_matrix::WeightMatrix;
 use ferrox_moe::{
     combine_expert_outputs, route_top_k, run_expert, run_expert_placed, ExpertPlacement,
-    ExpertWeights, PlacementPlan,
+    ExpertWeights, GluAct, PlacementPlan,
 };
 
 use crate::config::ModelConfig;
@@ -919,10 +920,7 @@ impl Decoder {
         layer.attn.post_attn_norm.is_some()
             || layer.attn.post_ffn_norm.is_some()
             || self.config.layer_sliding_window(layer_idx).is_some()
-            || matches!(
-                self.config.ffn_activation,
-                crate::config::FfnActivation::Gelu
-            )
+            || !GluAct::from(self.config.ffn_activation).is_swiglu()
             || self.config.layer_rope_theta(layer_idx) != self.config.rope_theta
     }
 
@@ -1026,10 +1024,7 @@ impl Decoder {
     ) -> Option<ferrox_metal::gpu::PrefillMoeMetal<'a>> {
         if Self::is_dense_layer(layer)
             || !layer.moe.shared_experts.is_empty()
-            || !matches!(
-                config.ffn_activation,
-                crate::config::FfnActivation::Swiglu | crate::config::FfnActivation::SwigluFused
-            )
+            || !GluAct::from(config.ffn_activation).is_swiglu()
             // See `gpu_router_matches_host_routing`: the GPU router
             // takes router weights and nothing else.
             || !Self::gpu_router_matches_host_routing(layer, config)
@@ -1129,10 +1124,7 @@ impl Decoder {
         kv_caches: &mut [KvCache],
         host_kv_authoritative: bool,
     ) -> Option<Vec<f32>> {
-        let gelu = matches!(
-            self.config.ffn_activation,
-            crate::config::FfnActivation::Gelu
-        );
+        let gelu = !GluAct::from(self.config.ffn_activation).is_swiglu();
         let mut prefill_layers = Vec::with_capacity(run_len);
         let mut rope_thetas = Vec::with_capacity(run_len);
         for li in start..start + run_len {
@@ -1232,10 +1224,7 @@ impl Decoder {
         !Self::is_dense_layer(layer)
             && layer.moe.shared_experts.is_empty()
             && Self::gpu_router_matches_host_routing(layer, config)
-            && matches!(
-                config.ffn_activation,
-                crate::config::FfnActivation::Swiglu | crate::config::FfnActivation::SwigluFused
-            )
+            && GluAct::from(config.ffn_activation).is_swiglu()
             // Streamed experts are eligible too. They were excluded
             // while the fused launch could not hold all of top-k at
             // once; it can now, by materialising each expert into an
@@ -1395,10 +1384,7 @@ impl Decoder {
     ) -> Option<Vec<f32>> {
         if batch_size == 0
             || !ferrox_core::metal_dense_enabled()
-            || !matches!(
-                config.ffn_activation,
-                crate::config::FfnActivation::Swiglu | crate::config::FfnActivation::SwigluFused
-            )
+            || !GluAct::from(config.ffn_activation).is_swiglu()
             // The GPU router kernels take router weights and nothing
             // else: no `exp_probs_b` input, no `expert_weights_scale`
             // uniform, no groups. See `gpu_router_matches_host_routing`.
@@ -1449,6 +1435,10 @@ impl Decoder {
             batch_size,
             hidden_dim,
             &mut out,
+            // Guaranteed `Swiglu` by the fence at the top of this
+            // function; read from the config anyway so the two cannot
+            // drift apart.
+            GluAct::from(config.ffn_activation),
         );
         Some(out)
     }
@@ -1461,6 +1451,7 @@ impl Decoder {
         batch_size: usize,
         hidden_dim: usize,
         acc: &mut [f32],
+        act: GluAct,
     ) {
         for shex in &layer.moe.shared_experts {
             // Prefer one Metal FFN CB (gate∥up→SiLU→down) over three
@@ -1473,13 +1464,16 @@ impl Decoder {
                     shex.down.mul_mm_sg_launch(),
                 ) {
                     (Some(g), Some(u), Some(d)) => {
+                        // The launch's last argument selects GELU over
+                        // SiLU inside the kernel; hardcoding `false` here
+                        // ran a shared expert as SwiGLU on a GeGLU model.
                         ferrox_metal::gpu::launch_dense_ffn_swiglu_batch(
                             &g,
                             &u,
                             &d,
                             normed2_batch,
                             batch_size,
-                            false,
+                            !act.is_swiglu(),
                         )
                         .ok()
                     }
@@ -1501,7 +1495,7 @@ impl Decoder {
                 let up =
                     shex.up
                         .apply_batch_with_acts(normed2_batch, batch_size, ffn_acts.as_ref());
-                let activated = ferrox_core::matmul::swiglu(&gate, &up);
+                let activated = act.apply(&gate, &up);
                 shex.down.apply_batch(&activated, batch_size)
             });
             if let Some(gate_w) = &layer.moe.shared_expert_gate {
@@ -2136,10 +2130,7 @@ impl Decoder {
                                 out_launch.as_ref(),
                                 greedy_gpu && out_launch.is_some(),
                                 embd_gather.as_ref(),
-                                matches!(
-                                    self.config.ffn_activation,
-                                    crate::config::FfnActivation::Gelu
-                                ),
+                                !GluAct::from(self.config.ffn_activation).is_swiglu(),
                             ) {
                                 Ok(out) => {
                                     // Metal KV advanced in-place. Skip host
@@ -2779,6 +2770,7 @@ impl Decoder {
         normed2: &[f32],
         decision: &ferrox_moe::RoutingDecision,
         hidden_dim: usize,
+        act: GluAct,
     ) -> Option<Vec<(Vec<f32>, f32)>> {
         use rayon::prelude::*;
         if !ferrox_core::weight_matrix::cpu_int_dot_enabled() || !normed2.len().is_multiple_of(32) {
@@ -2820,7 +2812,7 @@ impl Decoder {
         if !ffn_rows.is_multiple_of(2) {
             return None;
         }
-        let act = ferrox_quant::quantize_activations_q8(normed2);
+        let q8 = ferrox_quant::quantize_activations_q8(normed2);
         let eids = &decision.expert_ids;
         let mut gate = vec![0f32; n_slots * ffn_rows];
         let mut up = vec![0f32; n_slots * ffn_rows];
@@ -2833,25 +2825,35 @@ impl Decoder {
                 let r = row0 % ffn_rows;
                 let ex = &experts[eids[slot]];
                 if let (Some((g0, g1)), Some((u0, u1))) = (
-                    ex.gate.dot_pair_cpu_q8(r, &act),
-                    ex.up.dot_pair_cpu_q8(r, &act),
+                    ex.gate.dot_pair_cpu_q8(r, &q8),
+                    ex.up.dot_pair_cpu_q8(r, &q8),
                 ) {
                     gc[0] = g0;
                     gc[1] = g1;
                     uc[0] = u0;
                     uc[1] = u1;
                 } else {
-                    gc[0] = ex.gate.dot_row_cpu_q8(r, &act).unwrap_or(0.0);
-                    gc[1] = ex.gate.dot_row_cpu_q8(r + 1, &act).unwrap_or(0.0);
-                    uc[0] = ex.up.dot_row_cpu_q8(r, &act).unwrap_or(0.0);
-                    uc[1] = ex.up.dot_row_cpu_q8(r + 1, &act).unwrap_or(0.0);
+                    gc[0] = ex.gate.dot_row_cpu_q8(r, &q8).unwrap_or(0.0);
+                    gc[1] = ex.gate.dot_row_cpu_q8(r + 1, &q8).unwrap_or(0.0);
+                    uc[0] = ex.up.dot_row_cpu_q8(r, &q8).unwrap_or(0.0);
+                    uc[1] = ex.up.dot_row_cpu_q8(r + 1, &q8).unwrap_or(0.0);
                 }
             });
         let mut activated = vec![0f32; n_slots * ffn_rows];
-        activated.par_iter_mut().enumerate().for_each(|(idx, a)| {
-            let g = gate[idx];
-            *a = (g / (1.0 + (-g).exp())) * up[idx];
-        });
+        // Generic over the gate nonlinearity rather than two copies of
+        // the loop, and monomorphised so the call still inlines: the
+        // combine here is always parallel (decode's `n_slots * ffn_rows`
+        // sits under `ferrox_core::matmul`'s own fork threshold), which
+        // is why this does not just call `act.apply`.
+        fn combine<F: Fn(f32) -> f32 + Sync>(out: &mut [f32], gate: &[f32], up: &[f32], f: F) {
+            out.par_iter_mut()
+                .enumerate()
+                .for_each(|(idx, a)| *a = f(gate[idx]) * up[idx]);
+        }
+        match act {
+            GluAct::Swiglu => combine(&mut activated, &gate, &up, ferrox_core::matmul::silu),
+            GluAct::Geglu => combine(&mut activated, &gate, &up, ferrox_core::matmul::gelu),
+        }
         let mut outs: Vec<(Vec<f32>, f32)> = decision
             .weights
             .iter()
@@ -2863,8 +2865,8 @@ impl Decoder {
                 let ex = &experts[eids[slot]];
                 let act_slot = &activated[slot * ffn_rows..(slot + 1) * ffn_rows];
                 if act_slot.len().is_multiple_of(32) {
-                    let q8 = ferrox_quant::quantize_activations_q8(act_slot);
-                    if let Some(d) = ex.down.apply_cpu_q8(&q8) {
+                    let down_q8 = ferrox_quant::quantize_activations_q8(act_slot);
+                    if let Some(d) = ex.down.apply_cpu_q8(&down_q8) {
                         *out = d;
                         return;
                     }
@@ -2880,6 +2882,7 @@ impl Decoder {
         normed2: &[f32],
         decision: &ferrox_moe::RoutingDecision,
         plan: Option<&PlacementPlan>,
+        act: GluAct,
     ) -> Vec<(Vec<f32>, f32)> {
         let shared_act = if ferrox_core::weight_matrix::cpu_int_dot_enabled()
             && normed2.len().is_multiple_of(32)
@@ -2905,15 +2908,15 @@ impl Decoder {
                     .map(|p| p.placement_for(eid))
                     .unwrap_or(ExpertPlacement::Cpu);
                 let out = layer.moe.with_expert(eid, |ex| {
-                    if let Some(ref act) = shared_act {
+                    if let Some(ref q8) = shared_act {
                         if let (Some(gate), Some(up)) =
-                            (ex.gate.apply_cpu_q8(act), ex.up.apply_cpu_q8(act))
+                            (ex.gate.apply_cpu_q8(q8), ex.up.apply_cpu_q8(q8))
                         {
-                            let activated = ferrox_core::matmul::swiglu(&gate, &up);
+                            let activated = act.apply(&gate, &up);
                             return ex.down.apply(&activated);
                         }
                     }
-                    run_expert_placed(normed2, ex, placement)
+                    run_expert_placed(normed2, ex, placement, act)
                 });
                 (out, w)
             })
@@ -2994,6 +2997,7 @@ impl Decoder {
         plan: Option<&PlacementPlan>,
     ) -> Vec<f32> {
         let decision = Self::route_for_layer(layer, router_logits, config);
+        let act = GluAct::from(config.ffn_activation);
         layer.moe.record_activations(&decision.expert_ids);
         // Best-effort warm of the routed experts for this layer into
         // the store cache (SSD streaming overlap). Resident-backed
@@ -3018,12 +3022,12 @@ impl Decoder {
         // Metal: fuse all top-k experts into one CB (one wait) when every
         // routed expert has Metal matvec launches. Shared experts (rare
         // for OLMoE) still run on the host after.
+        // `launch_moe_topk_swiglu` is SwiGLU-only, so a GeGLU MoE layer
+        // keeps the host path rather than taking a kernel that computes
+        // a different activation.
         #[cfg(feature = "metal")]
         if ferrox_core::metal_dense_enabled()
-            && matches!(
-                config.ffn_activation,
-                crate::config::FfnActivation::Swiglu | crate::config::FfnActivation::SwigluFused
-            )
+            && act.is_swiglu()
             && layer.moe.shared_experts.is_empty()
         {
             if let Some(fused) = Self::try_metal_moe_topk(layer, normed2, &decision) {
@@ -3045,14 +3049,14 @@ impl Decoder {
                 .unwrap_or(true);
             if let (true, ExpertBacking::Resident(experts)) = (all_cpu, &layer.moe.experts) {
                 if let Some(outs) =
-                    Self::cpu_moe_topk_parallel_slots(experts, normed2, &decision, hidden_dim)
+                    Self::cpu_moe_topk_parallel_slots(experts, normed2, &decision, hidden_dim, act)
                 {
                     outs
                 } else {
-                    Self::cpu_moe_serial_experts(layer, normed2, &decision, plan)
+                    Self::cpu_moe_serial_experts(layer, normed2, &decision, plan, act)
                 }
             } else {
-                Self::cpu_moe_serial_experts(layer, normed2, &decision, plan)
+                Self::cpu_moe_serial_experts(layer, normed2, &decision, plan, act)
             }
         };
         // Shared experts fire on every token regardless of routing, so
@@ -3062,7 +3066,7 @@ impl Decoder {
             .moe
             .shared_experts
             .iter()
-            .map(|e| run_expert(normed2, e))
+            .map(|e| run_expert(normed2, e, act))
             .collect();
         // Qwen2-MoE-specific: see `MoeWeights::shared_expert_gate`'s doc
         // comment. Scaling here (before `combine_expert_outputs`, which
@@ -3149,7 +3153,7 @@ impl Decoder {
         // four copies of a `batch x ffn_dim` tensor.
         #[cfg(feature = "metal")]
         if ferrox_core::weight_matrix::metal_dense_enabled() {
-            let gelu = matches!(config.ffn_activation, crate::config::FfnActivation::Gelu);
+            let gelu = !GluAct::from(config.ffn_activation).is_swiglu();
             let fused = layer.moe.with_expert(0, |ex| {
                 let (g, u, d) = (
                     ex.gate.mul_mm_sg_launch()?,
@@ -3178,13 +3182,7 @@ impl Decoder {
             let up = ex
                 .up
                 .apply_batch_with_acts(normed2_batch, batch_size, ffn_acts.as_ref());
-            let activated: Vec<f32> = match config.ffn_activation {
-                crate::config::FfnActivation::Swiglu
-                | crate::config::FfnActivation::SwigluFused => {
-                    ferrox_core::matmul::swiglu(&gate, &up)
-                }
-                crate::config::FfnActivation::Gelu => geglu(&gate, &up),
-            };
+            let activated = GluAct::from(config.ffn_activation).apply(&gate, &up);
             ex.down.apply_batch(&activated, batch_size)
         }))
     }
@@ -3193,8 +3191,10 @@ impl Decoder {
     /// `apply_batch` per expert with tokens instead of per-token
     /// `combine_ffn_outputs_for_position`. Shared experts append via
     /// [`Self::accumulate_shared_experts_batch`]. `None` when gates fail
-    /// (small batch, dense, Metal preferred, non-SwiGLU, non-resident,
-    /// or any GPU-placed expert).
+    /// (small batch, dense, Metal preferred, non-resident, or any
+    /// GPU-placed expert). Both gated activations are served here --
+    /// the combine goes through [`GluAct`], so GeGLU no longer falls out
+    /// to the per-position path.
     fn moe_ffn_batch(
         layer: &LayerWeights,
         normed2_batch: &[f32],
@@ -3213,12 +3213,7 @@ impl Decoder {
         if ferrox_core::metal_dense_enabled() {
             return None;
         }
-        if !matches!(
-            config.ffn_activation,
-            crate::config::FfnActivation::Swiglu | crate::config::FfnActivation::SwigluFused
-        ) {
-            return None;
-        }
+        let act = GluAct::from(config.ffn_activation);
         let ExpertBacking::Resident(experts) = &layer.moe.experts else {
             return None;
         };
@@ -3257,7 +3252,7 @@ impl Decoder {
                 .gate
                 .apply_batch_with_acts(&gathered, n, ffn_acts.as_ref());
             let up = ex.up.apply_batch_with_acts(&gathered, n, ffn_acts.as_ref());
-            let activated = ferrox_core::matmul::swiglu(&gate, &up);
+            let activated = act.apply(&gate, &up);
             let down = ex.down.apply_batch(&activated, n);
             for (i, &(tok, w)) in toks.iter().enumerate() {
                 let out = &down[i * hidden_dim..(i + 1) * hidden_dim];
@@ -3274,6 +3269,7 @@ impl Decoder {
             batch_size,
             hidden_dim,
             &mut acc,
+            act,
         );
         Some(acc)
     }
@@ -3342,29 +3338,11 @@ impl Decoder {
     ) -> Vec<f32> {
         if Self::is_dense_layer(layer) {
             layer.moe.record_activations(&[0]);
-            return layer.moe.with_expert(0, |ex| match config.ffn_activation {
-                crate::config::FfnActivation::Swiglu
-                | crate::config::FfnActivation::SwigluFused => run_expert(normed2, ex),
-                crate::config::FfnActivation::Gelu => {
-                    // Share one Q8 act quant across gate+up when INT_DOT
-                    // can serve both (Q8_0 / Q4_0); else two `.apply`s.
-                    if ferrox_core::weight_matrix::cpu_int_dot_enabled()
-                        && normed2.len().is_multiple_of(32)
-                    {
-                        let act = ferrox_quant::quantize_activations_q8(normed2);
-                        if let (Some(gate), Some(up)) =
-                            (ex.gate.apply_cpu_q8(&act), ex.up.apply_cpu_q8(&act))
-                        {
-                            let activated = geglu(&gate, &up);
-                            return ex.down.apply(&activated);
-                        }
-                    }
-                    let gate = ex.gate.apply(normed2);
-                    let up = ex.up.apply(normed2);
-                    let activated = geglu(&gate, &up);
-                    ex.down.apply(&activated)
-                }
-            });
+            // One expert, run exactly the way a routed one is. The GeGLU
+            // arm used to be spelled out here and nowhere else, which is
+            // precisely how the routed paths ended up SwiGLU-only.
+            let act = GluAct::from(config.ffn_activation);
+            return layer.moe.with_expert(0, |ex| run_expert(normed2, ex, act));
         }
         let router_logits = layer.moe.router.apply(normed2);
         Self::combine_ffn_outputs_for_position(
@@ -3862,10 +3840,8 @@ impl Decoder {
                                         up: ex.up.mul_mm_sg_launch()?,
                                         down: ex.down.mul_mm_sg_launch()?,
                                     };
-                                    let gelu = matches!(
-                                        self.config.ffn_activation,
-                                        crate::config::FfnActivation::Gelu
-                                    );
+                                    let gelu =
+                                        !GluAct::from(self.config.ffn_activation).is_swiglu();
                                     let prefill_layer =
                                         ferrox_metal::attn::PrefillDenseLayerMetal {
                                             attn_norm_w: &layer.attn.norm_weight,
@@ -4864,6 +4840,97 @@ mod tests {
         cfg
     }
 
+    /// A GeGLU model's ROUTED experts must run GeGLU.
+    ///
+    /// `run_ffn_block` used to consult `ffn_activation` only in its dense
+    /// arm; `combine_ffn_outputs_for_position` and everything under it
+    /// was unconditionally SwiGLU, so a GeGLU MoE would have produced
+    /// fluent, wrong logits with nothing in the tree to notice. That is
+    /// not hypothetical: llama.cpp's `grok` passes `LLM_FFN_GELU` to
+    /// `build_moe_ffn` (`.scratch/llama.cpp/src/models/grok.cpp`), and
+    /// `grok` sits on `ArchPath::GenericGqa` in `capability.rs`.
+    ///
+    /// The reference is written out here in plain loops -- its own GELU
+    /// and SiLU, not `ferrox_core`'s -- so it cannot agree with the code
+    /// under test by sharing its bug. The second assertion is the one
+    /// that makes this a test rather than a smoke check: the SwiGLU
+    /// answer must be visibly different, so an implementation that
+    /// ignores the activation cannot pass.
+    #[test]
+    fn a_geglu_moe_layer_runs_geglu_in_its_routed_experts_not_swiglu() {
+        let mut cfg = tiny_test_config();
+        cfg.ffn_activation = crate::config::FfnActivation::Gelu;
+        let decoder = Decoder::new_random_small(cfg, 2, 8);
+        let hidden_dim = decoder.config.hidden_dim;
+        let layer = &decoder.layers[1];
+        assert!(
+            !Decoder::is_dense_layer(layer),
+            "this test is about the ROUTED path; layer 1 must be a real MoE layer"
+        );
+
+        // Larger than the usual unit inputs on purpose: GELU and SiLU
+        // are close near zero, and a reference that cannot tell them
+        // apart cannot catch the bug this test exists for.
+        let normed2: Vec<f32> = (0..hidden_dim)
+            .map(|i| (i as f32 * 0.37).sin() * 12.0)
+            .collect();
+
+        let gelu = |x: f32| {
+            let t = (0.797_884_6f32 * (x + 0.044_715 * x * x * x)).tanh();
+            0.5 * x * (1.0 + t)
+        };
+        let silu = |x: f32| x / (1.0 + (-x).exp());
+        let expert_ref = |ex: &ExpertWeights, f: &dyn Fn(f32) -> f32| -> Vec<f32> {
+            let g = ex.gate.apply(&normed2);
+            let u = ex.up.apply(&normed2);
+            let a: Vec<f32> = g.iter().zip(u.iter()).map(|(&g, &u)| f(g) * u).collect();
+            ex.down.apply(&a)
+        };
+
+        let ExpertBacking::Resident(experts) = &layer.moe.experts else {
+            panic!("new_random_small builds resident experts");
+        };
+        let router_logits = layer.moe.router.apply(&normed2);
+        let decision = Decoder::route_for_layer(layer, &router_logits, &decoder.config);
+        let block_ref = |f: &dyn Fn(f32) -> f32| -> Vec<f32> {
+            let mut out = vec![0f32; hidden_dim];
+            for (&eid, &w) in decision.expert_ids.iter().zip(decision.weights.iter()) {
+                for (o, e) in out.iter_mut().zip(expert_ref(&experts[eid], f).iter()) {
+                    *o += w * e;
+                }
+            }
+            assert!(
+                layer.moe.shared_expert_gate.is_none(),
+                "tiny_test_config's shared experts are ungated; reference assumes it"
+            );
+            for shex in &layer.moe.shared_experts {
+                for (o, e) in out.iter_mut().zip(expert_ref(shex, f).iter()) {
+                    *o += e;
+                }
+            }
+            out
+        };
+        let expected_geglu = block_ref(&gelu);
+        let expected_swiglu = block_ref(&silu);
+
+        let got = Decoder::run_ffn_block(layer, &normed2, &decoder.config, hidden_dim, None);
+        assert_eq!(got.len(), hidden_dim);
+        for (i, (a, b)) in got.iter().zip(expected_geglu.iter()).enumerate() {
+            assert!(
+                (a - b).abs() < 1e-4 * b.abs().max(1.0),
+                "routed GeGLU FFN element {i}: got {a}, expected {b}"
+            );
+        }
+        assert!(
+            expected_geglu
+                .iter()
+                .zip(expected_swiglu.iter())
+                .any(|(a, b)| (a - b).abs() > 1e-3),
+            "GeGLU and SwiGLU must differ measurably on this input, or this test \
+             could not detect a routed expert that silently ran SwiGLU"
+        );
+    }
+
     #[test]
     fn forward_pass_produces_finite_logits_of_correct_shape() {
         let vocab = 10;
@@ -4937,7 +5004,11 @@ mod tests {
         // Independently compute what the shared expert alone produces,
         // and what sigmoid(gate . x) should scale it by -- this is the
         // ground truth the gated code path must reproduce exactly.
-        let shared_out_raw = run_expert(&normed2, &decoder.layers[1].moe.shared_experts[0]);
+        let shared_out_raw = run_expert(
+            &normed2,
+            &decoder.layers[1].moe.shared_experts[0],
+            GluAct::from(decoder.config.ffn_activation),
+        );
         let gate_logit: f32 = gate_vec
             .iter()
             .zip(normed2.iter())

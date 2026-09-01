@@ -8,7 +8,7 @@
 //! scheduler rather than copied CLI-flag parsing code. See
 //! docs/THIRD_PARTY_NOTICES.md.
 
-use ferrox_core::matmul::swiglu;
+use ferrox_core::matmul::{geglu, swiglu};
 use ferrox_core::weight_matrix::WeightMatrix;
 
 /// Where a given expert's weights currently live. `GpuDevice`-placed
@@ -944,11 +944,64 @@ pub fn run_expert_oai(
     out
 }
 
-/// Runs one token's hidden state through a single expert's SwiGLU FFN.
-pub fn run_expert(hidden: &[f32], expert: &ExpertWeights) -> Vec<f32> {
+/// Which gated activation an expert's `down(act(gate(x)) * up(x))` FFN
+/// uses.
+///
+/// A named type rather than a `bool` or an implicit default, and a
+/// REQUIRED argument of [`run_expert`] / [`run_expert_placed`], because
+/// the alternative already failed once: every routed-expert path in
+/// `ferrox-models` hardcoded SwiGLU while only the dense arm consulted
+/// `ModelConfig::ffn_activation`, so a GeGLU MoE would have computed the
+/// wrong activation with nothing to notice. A caller cannot forget an
+/// argument the compiler demands.
+///
+/// [`Geglu`](GluAct::Geglu) is `gelu(gate) * up` with llama.cpp's tanh
+/// GELU approximation (`ferrox_core::matmul::gelu`), which is what
+/// `build_moe_ffn` does under `LLM_FFN_GELU` -- the real shape of
+/// llama.cpp's `grok` (`src/models/grok.cpp`, `LLM_FFN_GELU` passed to
+/// `build_moe_ffn`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GluAct {
+    /// `silu(gate) * up`.
+    Swiglu,
+    /// `gelu(gate) * up`.
+    Geglu,
+}
+
+impl GluAct {
+    /// The gated combine itself. One place, so a new variant is a
+    /// compile error at every site instead of a silent SwiGLU.
+    pub fn apply(self, gate: &[f32], up: &[f32]) -> Vec<f32> {
+        match self {
+            GluAct::Swiglu => swiglu(gate, up),
+            GluAct::Geglu => geglu(gate, up),
+        }
+    }
+
+    /// The scalar gate nonlinearity, for callers that fuse the multiply
+    /// into a loop of their own (`cpu_moe_topk_parallel_slots`).
+    pub fn gate_fn(self) -> fn(f32) -> f32 {
+        match self {
+            GluAct::Swiglu => ferrox_core::matmul::silu,
+            GluAct::Geglu => ferrox_core::matmul::gelu,
+        }
+    }
+
+    /// Whether the fused device kernels, which only implement SwiGLU,
+    /// may serve this activation.
+    pub fn is_swiglu(self) -> bool {
+        matches!(self, GluAct::Swiglu)
+    }
+}
+
+/// Runs one token's hidden state through a single expert's gated FFN.
+///
+/// `act` is not optional on purpose -- see [`GluAct`].
+pub fn run_expert(hidden: &[f32], expert: &ExpertWeights, act: GluAct) -> Vec<f32> {
     #[cfg(any(feature = "cuda", feature = "metal"))]
-    {
-        // Full SwiGLU on-device (1× upload + 1× download) when dense GPU is on.
+    if act.is_swiglu() {
+        // Full SwiGLU on-device (1× upload + 1× download) when dense GPU
+        // is on. SwiGLU-only kernel: a GeGLU expert must not take it.
         if let Some(out) = ferrox_core::WeightMatrix::apply_gpu_dense_ffn_swiglu(
             &expert.gate,
             &expert.up,
@@ -961,34 +1014,35 @@ pub fn run_expert(hidden: &[f32], expert: &ExpertWeights) -> Vec<f32> {
     #[cfg(any(feature = "cuda", feature = "metal"))]
     {
         // Gate and up share `hidden` — one GPU upload / multi-matvec.
+        // Activation-agnostic: the combine happens on the host below.
         if let Some(mut outs) =
             ferrox_core::WeightMatrix::apply_gpu_multi(&[&expert.gate, &expert.up], hidden)
         {
             let up = outs.pop().unwrap();
             let gate = outs.pop().unwrap();
-            let activated = swiglu(&gate, &up);
+            let activated = act.apply(&gate, &up);
             return expert.down.apply(&activated);
         }
     }
     // Share one Q8 activation quant across gate+up when INT_DOT is on
     // (OLMoE: avoids 2× quantize_activations_q8 per expert).
     if ferrox_core::weight_matrix::cpu_int_dot_enabled() && hidden.len().is_multiple_of(32) {
-        let act = ferrox_quant::quantize_activations_q8(hidden);
+        let act_q8 = ferrox_quant::quantize_activations_q8(hidden);
         // gate and up are independent over the same activation, so their
         // parallel regions can overlap instead of running back to back.
         // Decode's deficit is scheduling, not kernels -- see
         // `WeightMatrix::apply_three`, which does this for q/k/v.
         let (g, u) = rayon::join(
-            || expert.gate.apply_cpu_q8(&act),
-            || expert.up.apply_cpu_q8(&act),
+            || expert.gate.apply_cpu_q8(&act_q8),
+            || expert.up.apply_cpu_q8(&act_q8),
         );
         if let (Some(gate), Some(up)) = (g, u) {
-            let activated = swiglu(&gate, &up);
+            let activated = act.apply(&gate, &up);
             return expert.down.apply(&activated);
         }
     }
     let (gate, up) = rayon::join(|| expert.gate.apply(hidden), || expert.up.apply(hidden));
-    let activated = swiglu(&gate, &up);
+    let activated = act.apply(&gate, &up);
     expert.down.apply(&activated)
 }
 
@@ -1017,10 +1071,14 @@ pub fn run_expert_placed(
     hidden: &[f32],
     expert: &ExpertWeights,
     placement: ExpertPlacement,
+    act: GluAct,
 ) -> Vec<f32> {
     if matches!(placement, ExpertPlacement::GpuDevice(_)) {
         #[cfg(any(feature = "cuda", feature = "metal"))]
-        {
+        if act.is_swiglu() {
+            // SwiGLU-only fused kernel; a GeGLU expert falls through to
+            // the split gate/up launches below, which are activation
+            // agnostic because the combine runs on the host.
             if let Some(out) = ferrox_core::WeightMatrix::apply_gpu_dense_ffn_swiglu(
                 &expert.gate,
                 &expert.up,
@@ -1037,7 +1095,7 @@ pub fn run_expert_placed(
             {
                 let up = outs.pop().unwrap();
                 let gate = outs.pop().unwrap();
-                let activated = swiglu(&gate, &up);
+                let activated = act.apply(&gate, &up);
                 if let Some(down) = expert.down.apply_gpu(&activated) {
                     return down;
                 }
@@ -1046,14 +1104,14 @@ pub fn run_expert_placed(
         }
         if let Some(gate) = expert.gate.apply_gpu(hidden) {
             if let Some(up) = expert.up.apply_gpu(hidden) {
-                let activated = swiglu(&gate, &up);
+                let activated = act.apply(&gate, &up);
                 if let Some(down) = expert.down.apply_gpu(&activated) {
                     return down;
                 }
             }
         }
     }
-    run_expert(hidden, expert)
+    run_expert(hidden, expert, act)
 }
 
 #[cfg(not(any(feature = "cuda", feature = "metal")))]
@@ -1061,8 +1119,9 @@ pub fn run_expert_placed(
     hidden: &[f32],
     expert: &ExpertWeights,
     _placement: ExpertPlacement,
+    act: GluAct,
 ) -> Vec<f32> {
-    run_expert(hidden, expert)
+    run_expert(hidden, expert, act)
 }
 
 /// Combines routed + shared expert outputs for one token.
@@ -1552,9 +1611,84 @@ mod tests {
             )),
         };
         let hidden = vec![1.0, -1.0, 0.5, 0.5];
-        let out = run_expert(&hidden, &expert);
+        let out = run_expert(&hidden, &expert, GluAct::Swiglu);
         assert_eq!(out.len(), hidden_dim);
         assert!(out.iter().all(|v| v.is_finite()));
+    }
+
+    /// A GeGLU expert must compute `gelu(gate) * up`, not SwiGLU.
+    ///
+    /// Checked against an independently written scalar reference, and
+    /// separately asserted to DIFFER from the SwiGLU result: without the
+    /// second half, an implementation that ignored `act` entirely and
+    /// always ran SwiGLU could still pass a loose tolerance check on
+    /// weights where the two activations happen to be close.
+    #[test]
+    fn geglu_expert_computes_gelu_not_silu() {
+        use ferrox_core::tensor::Tensor;
+        let hidden_dim = 4;
+        let ffn_dim = 3;
+        let g: Vec<f32> = (0..ffn_dim * hidden_dim)
+            .map(|i| (i as f32 * 0.7).sin() * 3.0)
+            .collect();
+        let u: Vec<f32> = (0..ffn_dim * hidden_dim)
+            .map(|i| (i as f32 * 0.31).cos())
+            .collect();
+        let d: Vec<f32> = (0..hidden_dim * ffn_dim)
+            .map(|i| (i as f32 * 0.19).sin() * 0.5)
+            .collect();
+        let expert = ExpertWeights {
+            gate: WeightMatrix::F32(Tensor::new(g.clone(), vec![ffn_dim, hidden_dim])),
+            up: WeightMatrix::F32(Tensor::new(u.clone(), vec![ffn_dim, hidden_dim])),
+            down: WeightMatrix::F32(Tensor::new(d.clone(), vec![hidden_dim, ffn_dim])),
+        };
+        let hidden = vec![1.0, -1.0, 0.5, 0.25];
+
+        // Independent reference: three plain loops, tanh-approx GELU
+        // spelled out rather than borrowed from ferrox-core.
+        let row = |w: &[f32], cols: usize, r: usize, x: &[f32]| -> f32 {
+            (0..cols).map(|c| w[r * cols + c] * x[c]).sum()
+        };
+        let mut activated = vec![0f32; ffn_dim];
+        for (r, a) in activated.iter_mut().enumerate() {
+            let gv = row(&g, hidden_dim, r, &hidden);
+            let uv = row(&u, hidden_dim, r, &hidden);
+            let t = (0.797_884_6f32 * (gv + 0.044_715 * gv * gv * gv)).tanh();
+            *a = 0.5 * gv * (1.0 + t) * uv;
+        }
+        let expected: Vec<f32> = (0..hidden_dim)
+            .map(|r| row(&d, ffn_dim, r, &activated))
+            .collect();
+
+        let got = run_expert(&hidden, &expert, GluAct::Geglu);
+        assert_eq!(got.len(), hidden_dim);
+        for (i, (a, b)) in got.iter().zip(expected.iter()).enumerate() {
+            assert!(
+                (a - b).abs() < 1e-5,
+                "GeGLU expert row {i}: got {a}, expected {b}"
+            );
+        }
+
+        let swiglu_out = run_expert(&hidden, &expert, GluAct::Swiglu);
+        assert!(
+            got.iter()
+                .zip(swiglu_out.iter())
+                .any(|(a, b)| (a - b).abs() > 1e-4),
+            "GeGLU and SwiGLU must not agree on these weights -- if they do, \
+             this test cannot detect a routed expert that silently ran SwiGLU"
+        );
+
+        // Placement must not change the activation either.
+        assert_eq!(
+            run_expert_placed(
+                &hidden,
+                &expert,
+                ExpertPlacement::GpuDevice(0),
+                GluAct::Geglu
+            ),
+            got,
+            "a GPU-placed GeGLU expert must not fall into a SwiGLU kernel"
+        );
     }
 
     /// `run_expert_placed` must be a real drop-in for `run_expert` when
@@ -1583,14 +1717,19 @@ mod tests {
             )),
         };
         let hidden = vec![1.0, -1.0, 0.5, 0.5];
-        let expected = run_expert(&hidden, &expert);
+        let expected = run_expert(&hidden, &expert, GluAct::Swiglu);
 
         assert_eq!(
-            run_expert_placed(&hidden, &expert, ExpertPlacement::Cpu),
+            run_expert_placed(&hidden, &expert, ExpertPlacement::Cpu, GluAct::Swiglu),
             expected
         );
         assert_eq!(
-            run_expert_placed(&hidden, &expert, ExpertPlacement::GpuDevice(0)),
+            run_expert_placed(
+                &hidden,
+                &expert,
+                ExpertPlacement::GpuDevice(0),
+                GluAct::Swiglu
+            ),
             expected,
             "F32 has no GPU kernel, so GpuDevice placement must still fall through to the CPU path"
         );
@@ -1629,8 +1768,13 @@ mod tests {
         };
         let hidden = make_row(hidden_dim, 0.5);
 
-        let cpu = run_expert_placed(&hidden, &expert, ExpertPlacement::Cpu);
-        let gpu = run_expert_placed(&hidden, &expert, ExpertPlacement::GpuDevice(0));
+        let cpu = run_expert_placed(&hidden, &expert, ExpertPlacement::Cpu, GluAct::Swiglu);
+        let gpu = run_expert_placed(
+            &hidden,
+            &expert,
+            ExpertPlacement::GpuDevice(0),
+            GluAct::Swiglu,
+        );
         assert_eq!(cpu.len(), gpu.len());
         for (c, g) in cpu.iter().zip(gpu.iter()) {
             assert!((c - g).abs() < 1e-1, "cpu={c} gpu={g}");

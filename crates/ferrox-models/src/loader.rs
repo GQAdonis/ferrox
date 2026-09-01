@@ -495,6 +495,10 @@ impl ModelConfig {
         };
 
         let ffn_activation = match arch_profile.family {
+            // Per-ARCHITECTURE first, because llama.cpp's choice is per
+            // architecture and the family partition does not match it:
+            // `grok` is StandardGqa and passes `LLM_FFN_GELU`.
+            _ if crate::capability::uses_geglu(&arch) => crate::config::FfnActivation::Gelu,
             crate::capability::DecoderFamily::GemmaFamily => crate::config::FfnActivation::Gelu,
             crate::capability::DecoderFamily::PhiFamily => {
                 crate::config::FfnActivation::SwigluFused
@@ -2449,6 +2453,54 @@ mod tests {
 
     /// Builds a config for an arbitrary architecture tag, returning the
     /// error rather than unwrapping it.
+    /// llama.cpp chooses the FFN gate activation PER ARCHITECTURE;
+    /// ferrox chose it per family. Those are different partitions, and
+    /// `grok` is where they disagree: `src/models/grok.cpp:165` passes
+    /// `LLM_FFN_GELU` to `build_moe_ffn`, while `grok` is
+    /// `DecoderFamily::StandardGqa` and so was handed SwiGLU -- a
+    /// different FFN on every layer.
+    ///
+    /// Latent, because `grok` is not audited and refuses today. Pinned
+    /// anyway: the failure mode is that auditing it later makes it
+    /// silently wrong, and an audit is exactly when nobody thinks to
+    /// re-check the activation.
+    #[test]
+    fn the_ffn_activation_follows_the_architecture_not_the_family() {
+        use crate::capability::uses_geglu;
+        use crate::config::FfnActivation;
+
+        assert!(uses_geglu("grok"), "grok's MoE FFN gate is GELU upstream");
+        // Same family, SiLU upstream (`src/models/dbrx.cpp:122`), so the
+        // family rule alone cannot be what selects grok.
+        assert!(!uses_geglu("dbrx"));
+        assert!(!uses_geglu("llama"));
+
+        // The Gemma lineage keeps its GELU through the FAMILY rule, so
+        // the new per-architecture arm must not have displaced it.
+        // gemma2/gemma3 only: `gemma` v1 is unaudited and refuses, so
+        // it cannot be loaded to check its activation.
+        for gemma in ["gemma2", "gemma3"] {
+            assert!(
+                !uses_geglu(gemma),
+                "{gemma} is GELU via GemmaFamily; listing it here too \
+                 would hide a later regression in the family rule"
+            );
+            assert_eq!(
+                config_for_arch(gemma).expect("gemma loads").ffn_activation,
+                FfnActivation::Gelu,
+                "{gemma}"
+            );
+        }
+
+        // And a plain SwiGLU architecture stays SwiGLU.
+        assert_eq!(
+            config_for_arch("llama")
+                .expect("llama loads")
+                .ffn_activation,
+            FfnActivation::Swiglu
+        );
+    }
+
     fn config_for_arch(arch: &'static str) -> Result<ModelConfig, LoadError> {
         // The per-arch hyperparameter keys are looked up by the arch's
         // own prefix, so they have to be built for the arch under test.

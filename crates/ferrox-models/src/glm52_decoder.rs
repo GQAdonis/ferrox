@@ -48,7 +48,7 @@ use ferrox_core::matmul::{rms_norm, swiglu};
 use ferrox_core::tensor::Tensor;
 use ferrox_core::weight_matrix::WeightMatrix;
 use ferrox_moe::{
-    combine_expert_outputs, route_top_k_sigmoid_with_bias, run_expert, ExpertWeights,
+    combine_expert_outputs, route_top_k_sigmoid_with_bias, run_expert, ExpertWeights, GluAct,
 };
 
 use crate::glm_dsa::{Glm52AttnState, Glm52AttnWeights, Glm52MlaConfig, IndexerConfig};
@@ -144,9 +144,9 @@ fn moe_ffn_forward(weights: &Glm52MoeFfnWeights, cfg: &Glm52DecoderConfig, x: &[
         .expert_ids
         .iter()
         .zip(decision.weights.iter())
-        .map(|(&e, &w)| (run_expert(x, &weights.experts[e]), w))
+        .map(|(&e, &w)| (run_expert(x, &weights.experts[e], GluAct::Swiglu), w))
         .collect();
-    let shared_out = run_expert(x, &weights.shared_expert);
+    let shared_out = run_expert(x, &weights.shared_expert, GluAct::Swiglu);
     combine_expert_outputs(&routed_outputs, &[shared_out], x.len())
 }
 

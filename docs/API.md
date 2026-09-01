@@ -59,13 +59,15 @@ conversation or a large `/v1/embeddings` batch past that comes back
 |---|---|
 | `model`, `messages` | Supported |
 | `max_tokens` | Supported; **defaults to 32768**, not OpenAI's legacy 16. An explicit `0` is a 400 |
-| `temperature`, `top_p`, `top_k`, `repetition_penalty`, `seed`, `stop` | Supported |
+| `temperature`, `top_p`, `top_k`, `min_p`, `repetition_penalty`, `seed`, `stop` | Supported |
 | `presence_penalty`, `frequency_penalty` | Supported |
 | `stream` | Supported (overlapped SSE when tools off and CB off) |
 | `tools` / `tool_choice: none\|auto` | Supported (prompt-engineered, parsed in eleven wire formats) |
 | `tool_choice: required` / named function | **Reject** |
 | `logprobs` / `top_logprobs` / `n` (>1) | **Reject** |
-| `response_format: json_object` | Supported (best-effort mask + validate) |
+| `response_format: json_object` | Supported (best-effort character mask + validate) |
+| `grammar` | Supported. llama.cpp's own field: a GBNF string, enforced per token by a real parser |
+| `response_format: json_schema` | **501**, naming the missing schema-to-grammar step |
 | Other `response_format` types | **Reject** |
 | `session_id` | Ferrox extension (server-side history) |
 | `chat_template_kwargs` | Supported (see [Chat templates](#chat-templates)) |
@@ -829,6 +831,35 @@ refused**, on both routes. Several OpenAI clients send an empty map on
 every request, and there is no token whose logit it would move — so
 refusing it is a false refusal. A non-object (`[]`, `"none"`) is still
 refused, so nothing falls through the empty-map hole.
+
+## Grammar-constrained decoding
+
+`"grammar": "<GBNF>"` is llama.cpp's own field and takes the same
+syntax. It is accepted on `/v1/chat/completions` and `/v1/completions`,
+compiled once per request, and enforced on **every** token by a real
+stack machine — not by masking characters.
+
+That distinction is the point. `response_format: json_object` masks
+character classes, so it cannot know whether a `}` closes an object that
+was actually opened; a grammar can. The two compose, and neither can
+un-mask what the other forbids.
+
+A grammar that is **satisfied** and has no legal continuation ends the
+response normally (`finish_reason: "stop"`). Only a grammar that dead-ends
+while still unsatisfied is an error, and it is a 400 with
+`failure_code: "invalid_grammar"`. Under continuous batching that failure
+is scoped to the row that hit it; other requests in the batch keep
+running.
+
+`response_format: {"type": "json_schema"}` returns **501** naming the
+schema-to-grammar conversion as the missing piece, rather than an
+unexplained 400 — and it refuses even when a `grammar` is supplied
+alongside, rather than quietly honouring a different constraint than the
+one asked for.
+
+`tool_choice: "required"` and a named `tool_choice` still return 501.
+They need *lazy* grammars — llama.cpp's `trigger_patterns`, which switch
+a grammar on partway through a response — and that is not ported.
 
 ## Not yet
 

@@ -488,6 +488,32 @@ pub fn quant_kind_for(dtype: GgmlType) -> Option<QuantKind> {
 }
 
 /// Which quant kinds have a **CUDA matvec** kernel.
+/// Which quant kinds have a **CUDA batched GEMM** (`mul_mm`), the
+/// prefill path.
+///
+/// Deliberately narrower than [`cuda_matvec_kind_supported`]:
+/// `ferrox-cuda` had no matrix-matrix product at all until Q8_0 and
+/// Q4_0 landed, so every other kind still decomposes a prefill into
+/// per-position matvecs.
+///
+/// Stated here rather than delegating to
+/// `ferrox_cuda::mul_mm::kind_by_name`, because `ferrox-cuda` is only a
+/// dependency under the `cuda` feature and this predicate is compiled
+/// unconditionally (the capability report reads it on every build).
+///
+/// Two tables that must agree about one set is the failure this
+/// codebase keeps paying for, so the agreement is a TEST rather than a
+/// hope: `the_cuda_gemm_kinds_match_the_kernel_table` runs under
+/// `--features cuda` and compares this against `kind_by_name` for every
+/// `QuantKind`.
+///
+/// **UNRUN ON HARDWARE.** The kernel is checked against a scalar twin
+/// and by executing the emitted CUDA C on the host, and has never
+/// executed on a GPU. See `crates/ferrox-cuda/src/mul_mm.rs`.
+pub fn cuda_mul_mm_kind_supported(kind: QuantKind) -> bool {
+    matches!(kind, QuantKind::Q8_0 | QuantKind::Q4_0)
+}
+
 pub fn cuda_matvec_kind_supported(kind: QuantKind) -> bool {
     matches!(
         kind,
@@ -2025,6 +2051,47 @@ impl WeightMatrix {
         // it is the GPU rather than 26 idle SMs.
         #[cfg(feature = "cuda")]
         {
+            // The batched GEMM first, when the kind has one and the
+            // batch is wide enough to pay for it. Below that threshold a
+            // single token stays on the matvec kernels, which are the
+            // arm that has actually run on a GPU.
+            if cuda_dense_enabled() {
+                if let WeightMatrix::Quantized { data, kind, .. } = self {
+                    if cuda_mul_mm_kind_supported(*kind)
+                        && ferrox_cuda::mul_mm::worth_a_gemm(batch_size)
+                    {
+                        let mm_kind = ferrox_cuda::mul_mm::kind_by_name(kind.name())
+                            .expect("cuda_mul_mm_kind_supported agreed");
+                        let row_bytes = self.block_bytes_per_row(*kind, cols);
+                        match ferrox_cuda::mul_mm_launch::launch_mul_mm(
+                            mm_kind,
+                            data.as_slice(),
+                            x_batch,
+                            self.rows(),
+                            cols,
+                            batch_size,
+                            row_bytes,
+                        ) {
+                            Ok(out) => return out,
+                            Err(_) => {
+                                // The kind HAS a GEMM, so reaching here is a
+                                // launch failure rather than an unsupported
+                                // kind, and the batch degrades to per-position
+                                // matvecs. This call site used to be the one
+                                // SILENT fallback in the registry's table.
+                                crate::kernel_registry::miss(
+                                    crate::kernel_registry::Lookup::new(
+                                        crate::kernel_registry::Backend::Cuda,
+                                        crate::kernel_registry::op::GEMM_PREFILL,
+                                        self.quant_kind(),
+                                    ),
+                                    "N x matvec (the GEMM launch failed)",
+                                );
+                            }
+                        }
+                    }
+                }
+            }
             if cuda_dense_enabled()
                 && matches!(self, WeightMatrix::Quantized { .. })
                 && self.apply_gpu(&x_batch[..cols]).is_some()
@@ -3451,9 +3518,15 @@ impl WeightMatrix {
                 kind.is_some_and(|k| metal_matvec_kind_name(k).is_some()),
                 kind.is_some_and(metal_mul_mm_kind_supported),
             ),
-            // CUDA has real matvec kernels and no batched GEMM: a
-            // batched prefill is a per-position matvec loop.
-            Backend::Cuda => (kind.is_some_and(cuda_matvec_kind_supported), false),
+            // CUDA now has a batched GEMM for a SUBSET of the kinds
+            // that have matvecs (Q8_0 and Q4_0). Everything else still
+            // decomposes a batched prefill into per-position matvecs,
+            // which is why these two predicates are different sets and
+            // not one.
+            Backend::Cuda => (
+                kind.is_some_and(cuda_matvec_kind_supported),
+                kind.is_some_and(cuda_mul_mm_kind_supported),
+            ),
             Backend::Cpu => (false, false),
         };
 
@@ -3573,6 +3646,28 @@ mod tests {
             assert!(
                 metal_mul_mm_kind_supported(kind) || cuda_matvec_kind_supported(kind),
                 "{kind:?} was listed as having a GPU kernel"
+            );
+        }
+    }
+
+    /// The CUDA GEMM predicate and the kernel table must name the same
+    /// set.
+    ///
+    /// `cuda_mul_mm_kind_supported` cannot call
+    /// `ferrox_cuda::mul_mm::kind_by_name` -- it is compiled on builds
+    /// where `ferrox-cuda` is not a dependency -- so the set is written
+    /// out twice. Two tables that must agree about one thing, with
+    /// nothing enforcing it, is the failure this codebase has fixed
+    /// repeatedly today, so the agreement is checked here for EVERY
+    /// kind rather than for the two that happen to be supported.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn the_cuda_gemm_kinds_match_the_kernel_table() {
+        for &kind in QuantKind::ALL {
+            assert_eq!(
+                cuda_mul_mm_kind_supported(kind),
+                ferrox_cuda::mul_mm::kind_by_name(kind.name()).is_some(),
+                "{kind:?}: the predicate and the kernel table disagree"
             );
         }
     }

@@ -19,8 +19,21 @@
 //! The per-checkpoint pre-tokenization rules live next door in
 //! [`pretokenize`], which is a transcription of llama.cpp and is
 //! reviewed against it.
+//!
+//! Four of llama.cpp's six `tokenizer.ggml.model` values are covered:
+//! `gpt2`/`gemma4` by [`GgufBpeTokenizer`], `llama` by
+//! [`GgufSpmTokenizer`], `t5` by [`GgufUnigramTokenizer`], and `bert` by
+//! [`GgufWordPieceTokenizer`] in `wordpiece`, which brings its own
+//! normalizer and its own Unicode tables (`unicode`, `unicode_data`)
+//! because WordPiece does not use the pre-tokenizer regexes at all.
+//! Still missing: `rwkv`, which needs a trie tokenizer, and `none`.
 
 mod pretokenize;
+mod unicode;
+mod unicode_data;
+mod wordpiece;
+
+pub use wordpiece::{GgufWordPieceTokenizer, NormalizerOptions};
 
 /// The `tokenizer.ggml.pre` values whose llama.cpp arm sets
 /// `add_bos = true` for a BPE vocabulary.
@@ -63,7 +76,10 @@ pub fn should_add_bos_token(file: &impl ferrox_gguf::TensorSource) -> bool {
     let pre = file.metadata_str("tokenizer.ggml.pre").unwrap_or("");
     // llama.cpp: SPM/WPM default add_bos=true; BPE defaults false unless
     // its pre-tokenizer arm opts in. qwen2 leaves false.
-    if matches!(model, "llama" | "spm") || model.contains("sentencepiece") {
+    // `bert` is WPM, whose upstream arm sets add_bos AND add_sep true.
+    // It was missing here, so every WordPiece prompt was one `[CLS]`
+    // short of llama.cpp's.
+    if matches!(model, "llama" | "spm" | "bert") || model.contains("sentencepiece") {
         return true;
     }
     ADD_BOS_PRE.contains(&pre)

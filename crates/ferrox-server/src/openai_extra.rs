@@ -475,6 +475,7 @@ pub async fn completions(
             top_p: req.top_p.unwrap_or(1.0),
             top_k: 0,
             repetition_penalty: 1.0,
+            penalty_last_n: 64,
             presence_penalty: 0.0,
             frequency_penalty: 0.0,
         },

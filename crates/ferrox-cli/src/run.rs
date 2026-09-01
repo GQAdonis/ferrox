@@ -70,6 +70,14 @@ pub struct InferArgs {
     #[arg(long = "top-p", default_value_t = 0.95)]
     pub top_p: f32,
 
+    /// How many recent tokens the penalties consider (`0` = off).
+    ///
+    /// llama.cpp's `--repeat-last-n`, default 64
+    /// (`common/common.h:238`). ferrox had no window and scanned the
+    /// whole history.
+    #[arg(long = "repeat-last-n", default_value_t = 64)]
+    pub repeat_last_n: usize,
+
     /// Repetition penalty (`1.0` = off).
     #[arg(long = "repeat-penalty", default_value_t = 1.1)]
     pub repeat_penalty: f32,
@@ -912,6 +920,7 @@ pub fn run_infer(args: InferArgs) -> anyhow::Result<()> {
         top_p: args.top_p,
         top_k: args.top_k,
         repetition_penalty: args.repeat_penalty,
+        penalty_last_n: args.repeat_last_n,
         presence_penalty: 0.0,
         frequency_penalty: 0.0,
     };
@@ -1057,6 +1066,7 @@ fn run_mla_infer(args: InferArgs, path: &Path, file: &ShardedGguf) -> anyhow::Re
         top_p: args.top_p,
         top_k: args.top_k,
         repetition_penalty: args.repeat_penalty,
+        penalty_last_n: args.repeat_last_n,
         presence_penalty: 0.0,
         frequency_penalty: 0.0,
     };
@@ -1183,6 +1193,7 @@ fn run_gemma4_infer(args: InferArgs, path: &Path, file: &ShardedGguf) -> anyhow:
         top_p: args.top_p,
         top_k: args.top_k,
         repetition_penalty: args.repeat_penalty,
+        penalty_last_n: args.repeat_last_n,
         presence_penalty: 0.0,
         frequency_penalty: 0.0,
     };
@@ -1308,6 +1319,7 @@ fn run_glm52_infer(args: InferArgs, path: &Path, file: &ShardedGguf) -> anyhow::
         top_p: args.top_p,
         top_k: args.top_k,
         repetition_penalty: args.repeat_penalty,
+        penalty_last_n: args.repeat_last_n,
         presence_penalty: 0.0,
         frequency_penalty: 0.0,
     };

@@ -1176,6 +1176,9 @@ impl ChatCompletionRequest {
             top_p: self.top_p.unwrap_or(1.0),
             top_k: self.top_k.unwrap_or(0),
             repetition_penalty: self.repetition_penalty.unwrap_or(1.0),
+            // llama.cpp's `penalty_last_n` default; not exposed on the
+            // OpenAI wire format, which has no equivalent field.
+            penalty_last_n: 64,
             presence_penalty: self.presence_penalty.unwrap_or(0.0),
             frequency_penalty: self.frequency_penalty.unwrap_or(0.0),
         }

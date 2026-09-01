@@ -31,6 +31,15 @@ pub struct SamplingParams {
     /// > (divide positive logits, multiply negative ones) so the penalty
     /// > always pushes toward *less* likely, regardless of logit sign.
     pub repetition_penalty: f32,
+    /// How many of the most recent tokens the penalties look at, as
+    /// llama.cpp's `penalty_last_n` (`common/common.h:238`, default 64).
+    ///
+    /// `0` disables the penalties entirely. ferrox had no window at all
+    /// and scanned the WHOLE history, so on a long generation it
+    /// penalised a steadily growing set of tokens where llama.cpp
+    /// penalises the last 64 -- the divergence grew with output length,
+    /// which is exactly when a repetition penalty matters most.
+    pub penalty_last_n: usize,
     /// OpenAI-style presence penalty: subtract from logits of tokens
     /// that already appeared in `history` (once per distinct token).
     pub presence_penalty: f32,
@@ -48,6 +57,7 @@ impl Default for SamplingParams {
             top_p: 1.0,
             top_k: 0,
             repetition_penalty: 1.0,
+            penalty_last_n: 64,
             presence_penalty: 0.0,
             frequency_penalty: 0.0,
         }
@@ -468,8 +478,13 @@ fn apply_history_penalties(scores: &mut [f32], params: &SamplingParams, history:
     {
         return;
     }
+    // Only the last `penalty_last_n`, as llama.cpp's ring buffer does.
+    if params.penalty_last_n == 0 {
+        return;
+    }
+    let window = history.len().saturating_sub(params.penalty_last_n);
     let mut counts = std::collections::HashMap::<usize, usize>::new();
-    for &tok in history {
+    for &tok in &history[window..] {
         *counts.entry(tok).or_insert(0) += 1;
     }
     for (tok, count) in counts {
@@ -558,6 +573,52 @@ mod tests {
         let mut negative = vec![-4.0f32];
         apply_history_penalties(&mut negative, &params, &[0, 0, 0]);
         assert!((negative[0] + 8.0).abs() < 1e-6, "got {}", negative[0]);
+    }
+
+    /// The penalties look at the last `penalty_last_n` tokens, not the
+    /// whole history.
+    ///
+    /// llama.cpp keeps a ring buffer of `penalty_last_n` (default 64,
+    /// `common/common.h:238`); ferrox scanned everything generated so
+    /// far. On a long generation that is a steadily growing set of
+    /// penalised tokens against llama.cpp's fixed 64 -- the divergence
+    /// grows with output length, which is when a repetition penalty
+    /// matters most.
+    #[test]
+    fn the_penalties_only_see_the_last_n_tokens() {
+        let params = SamplingParams {
+            repetition_penalty: 2.0,
+            penalty_last_n: 2,
+            ..SamplingParams::default()
+        };
+        let mut scores = vec![8.0f32, 8.0, 8.0];
+        // Token 0 fell out of the window; tokens 1 and 2 are in it.
+        apply_history_penalties(&mut scores, &params, &[0, 1, 2]);
+        assert_eq!(
+            scores[0].to_bits(),
+            8.0f32.to_bits(),
+            "token 0 is outside the window"
+        );
+        assert!((scores[1] - 4.0).abs() < 1e-6, "got {}", scores[1]);
+        assert!((scores[2] - 4.0).abs() < 1e-6, "got {}", scores[2]);
+
+        // `0` disables the penalties outright, as llama.cpp documents.
+        let off = SamplingParams {
+            penalty_last_n: 0,
+            ..params
+        };
+        let mut untouched = vec![8.0f32; 3];
+        apply_history_penalties(&mut untouched, &off, &[0, 1, 2]);
+        assert_eq!(untouched, vec![8.0f32; 3]);
+
+        // A window longer than the history is not an overflow.
+        let wide = SamplingParams {
+            penalty_last_n: 1000,
+            ..params
+        };
+        let mut short = vec![8.0f32];
+        apply_history_penalties(&mut short, &wide, &[0]);
+        assert!((short[0] - 4.0).abs() < 1e-6);
     }
 
     /// Frequency penalty still scales with the count, while the

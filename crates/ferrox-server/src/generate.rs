@@ -22,7 +22,6 @@ use ferrox_models::{Ceiling, Decoder, Engine, KvElem, KvShape, PrefixCache, Text
 
 use crate::budget::ContextCeiling;
 
-use crate::json_mode::mask_logits_for_json;
 use crate::model::ServerTokenizer;
 
 #[derive(Debug, thiserror::Error)]
@@ -1038,6 +1037,55 @@ impl GenerationParams {
     pub(crate) fn is_cancelled(&self) -> bool {
         self.cancel.as_ref().is_some_and(|c| c.is_cancelled())
     }
+
+    /// Whether anything about this request has to LOOK at the logits of
+    /// the whole vocabulary before a token is chosen.
+    ///
+    /// The question exists because a decode backend is allowed to skip
+    /// producing a vocabulary-shaped vector at all: the Metal dense and
+    /// MoE stacks fold `final_norm + lm_head + argmax` onto the device
+    /// and hand `forward_token` back a ONE-element vector holding the
+    /// chosen id (`ferrox_models::decoder`, guarded by
+    /// `FoldedLmHead::permit`). That is a large win, and it is only
+    /// sound when nothing downstream needs the vocabulary.
+    ///
+    /// JSON-object mode needs it: [`crate::json_mode::mask_logits_for_json`]
+    /// scores every vocabulary entry. Handed a one-element vector it
+    /// masks one number that is not a logit, the constraint silently
+    /// does nothing, and the caller gets a 200 carrying unstructured
+    /// text. That was the live bug -- and `temperature: 0` with
+    /// `response_format: {"type":"json_object"}` is the ORDINARY way to
+    /// ask for structured output, so it was the common case rather than
+    /// a corner.
+    ///
+    /// It is a predicate rather than a second clause on the fold's own
+    /// condition so that the next thing to need the vocabulary -- a
+    /// grammar, `logit_bias`, a min-p that must see the full
+    /// distribution -- is one arm added here and is then true everywhere
+    /// the question is asked. Both askers are named in the doc of
+    /// [`greedy_gpu_fold_allowed`].
+    pub(crate) fn needs_vocab_logits(&self) -> bool {
+        self.json_object
+    }
+}
+
+/// Whether this request may let a backend fold `lm_head + argmax` into
+/// its decode stack and return a token id instead of logits.
+///
+/// Greedy decoding is a necessary condition -- an argmax computed on
+/// device cannot be re-sampled at temperature -- but it is NOT a
+/// sufficient one, and treating it as sufficient is what broke JSON mode
+/// at `temperature: 0`. The fold is sound only when the answer to
+/// [`GenerationParams::needs_vocab_logits`] is also no.
+///
+/// A free function, taking the params, so it can be asserted in the
+/// default (non-Metal) build the gates actually run: the fold itself is
+/// `#[cfg(feature = "metal")]`, and a condition that only type-checks
+/// under a feature flag is a condition nothing tests. Same `cfg` shape,
+/// and for the same reason, as `FoldedLmHead` on the models side.
+#[cfg(any(feature = "metal", test))]
+pub(crate) fn greedy_gpu_fold_allowed(params: &GenerationParams) -> bool {
+    params.sampling.temperature <= 0.0 && !params.needs_vocab_logits()
 }
 
 fn chunked_prefill_tokens() -> Option<usize> {
@@ -1131,6 +1179,11 @@ pub fn generate(
     // Metal greedy GPU argmax: fold final_norm+lm_head+argmax into the
     // dense-stack CB and download one token id instead of hidden/vocab.
     // Thread-local so concurrent Arc<Decoder> requests do not race.
+    //
+    // `greedy_gpu_fold_allowed` and not `temperature <= 0.0`: the fold
+    // returns a token id where a caller-supplied logit constraint
+    // expects a vocabulary, and the constraint would then apply to
+    // nothing at all. See `GenerationParams::needs_vocab_logits`.
     #[cfg(feature = "metal")]
     let _metal_greedy_guard = {
         struct Guard;
@@ -1139,7 +1192,7 @@ pub fn generate(
                 ferrox_models::set_metal_greedy_argmax(false);
             }
         }
-        if params.sampling.temperature <= 0.0 {
+        if greedy_gpu_fold_allowed(params) {
             ferrox_models::set_metal_greedy_argmax(true);
             Some(Guard)
         } else {
@@ -1389,11 +1442,7 @@ pub fn generate(
             l
         },
         &mut emit,
-        if params.json_object {
-            Some(&decode_token as &dyn Fn(usize) -> String)
-        } else {
-            None
-        },
+        &decode_token,
     );
     let decode_secs = decode_start.elapsed().as_secs_f64();
     logits = final_logits;
@@ -1498,7 +1547,7 @@ fn sample_until_stop(
     mut decode_one: impl FnMut(&[usize]) -> String,
     mut step: impl FnMut(usize, usize) -> Vec<f32>,
     mut emit: impl FnMut(&str),
-    decode_token: Option<&dyn Fn(usize) -> String>,
+    decode_token: &dyn Fn(usize) -> String,
 ) -> (FinishReason, Vec<usize>, Vec<f32>) {
     let mut matcher = crate::stop::StopMatcher::new(&params.stop, &params.stop_token_ids);
     let mut sampler = Sampler::new(params.seed);
@@ -1515,23 +1564,13 @@ fn sample_until_stop(
             finish = FinishReason::Cancelled;
             break;
         }
-        let next = if params.json_object {
-            if let Some(decode_token) = decode_token {
-                let mut mask_fn = |scores: &mut [f32]| {
-                    mask_logits_for_json(scores, decode_token);
-                };
-                sampler.sample_with_mask(
-                    &logits,
-                    &params.sampling,
-                    &generated_ids,
-                    Some(&mut mask_fn),
-                )
-            } else {
-                sampler.sample(&logits, &params.sampling, &generated_ids)
-            }
-        } else {
-            sampler.sample(&logits, &params.sampling, &generated_ids)
-        };
+        let next = crate::sample_step::sample_next(
+            &mut sampler,
+            &logits,
+            params,
+            &generated_ids,
+            decode_token,
+        );
         if !params.ignore_eos && stop_tokens.contains(next) {
             finish = FinishReason::Stop;
             break;
@@ -1640,7 +1679,7 @@ pub fn generate_engine<E: Engine, T: TextTokenizer>(
             engine.forward_token(next, pos, &mut state)
         },
         &mut emit,
-        None,
+        &|id: usize| tokenizer.decode(&[id]),
     );
     let decode_secs = decode_start.elapsed().as_secs_f64();
 
@@ -2148,7 +2187,7 @@ mod tests {
             |ids| ids.iter().copied().map(&render).collect::<String>(),
             |_tok, _pos| logits_for(take()),
             |chunk| chunks.push(chunk.to_string()),
-            None,
+            &render,
         );
         (finish, ids, chunks)
     }

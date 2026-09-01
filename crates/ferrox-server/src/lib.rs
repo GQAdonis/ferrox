@@ -55,6 +55,7 @@ mod policy;
 mod response_cache;
 pub(crate) mod responses;
 mod resume;
+mod sample_step;
 mod security;
 mod serving;
 mod session;
@@ -63,6 +64,7 @@ mod stats;
 mod stop;
 mod stream_events;
 mod tasks;
+mod unsupported_sampling;
 
 use std::cell::RefCell;
 use std::convert::Infallible;
@@ -1128,6 +1130,14 @@ struct ChatCompletionRequest {
     frequency_penalty: Option<f32>,
     #[serde(default)]
     response_format: Option<serde_json::Value>,
+    /// Declared ONLY so it can be refused by name -- see
+    /// [`crate::unsupported_sampling::refuse_logit_bias`], which
+    /// `/v1/completions` calls with the same rules. Undeclared, serde
+    /// dropped it and the caller got a 200 whose answer was sampled
+    /// from unbiased logits, which is indistinguishable from having had
+    /// the bias honoured.
+    #[serde(default)]
+    logit_bias: Option<serde_json::Value>,
 }
 
 /// The output budget a chat request gets when it names none.
@@ -1174,6 +1184,8 @@ impl ChatCompletionRequest {
         SamplingParams {
             temperature: self.temperature.unwrap_or(0.0),
             top_p: self.top_p.unwrap_or(1.0),
+            // No `min_p` on the OpenAI chat wire; 0.0 is off.
+            min_p: 0.0,
             top_k: self.top_k.unwrap_or(0),
             repetition_penalty: self.repetition_penalty.unwrap_or(1.0),
             // llama.cpp's `penalty_last_n` default; not exposed on the
@@ -1367,6 +1379,7 @@ impl ChatCompletionRequest {
                 "n > 1 is not implemented (single completion only)",
             ));
         }
+        unsupported_sampling::refuse_logit_bias(self.logit_bias.as_ref(), "/v1/chat/completions")?;
         if let Some(fmt) = &self.response_format {
             match fmt.get("type").and_then(|v| v.as_str()) {
                 Some("json_object") => {}

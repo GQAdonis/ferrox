@@ -52,6 +52,7 @@ fn greedy_params(max_tokens: usize, seed: u64) -> GenerationParams {
         sampling: SamplingParams {
             temperature: 0.0,
             top_p: 1.0,
+            min_p: 0.0,
             top_k: 0,
             repetition_penalty: 1.0,
             penalty_last_n: 64,

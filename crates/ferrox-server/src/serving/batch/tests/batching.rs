@@ -60,6 +60,7 @@ fn continuous_batching_composes_with_paged_kv() {
             sampling: SamplingParams {
                 temperature: params[i].sampling.temperature,
                 top_p: params[i].sampling.top_p,
+                min_p: params[i].sampling.min_p,
                 top_k: params[i].sampling.top_k,
                 repetition_penalty: params[i].sampling.repetition_penalty,
                 penalty_last_n: 64,
@@ -246,6 +247,7 @@ fn continuous_batch_matches_sequential_generate_token_ids() {
             sampling: SamplingParams {
                 temperature: params[i].sampling.temperature,
                 top_p: params[i].sampling.top_p,
+                min_p: params[i].sampling.min_p,
                 top_k: params[i].sampling.top_k,
                 repetition_penalty: params[i].sampling.repetition_penalty,
                 penalty_last_n: 64,
@@ -563,4 +565,68 @@ fn max_seqs_cap_counts_prefilling_prompts_and_still_serves_both() {
     let got: Vec<Vec<usize>> = handles.into_iter().map(|h| h.join().unwrap()).collect();
     assert_eq!(got[0], expected[0]);
     assert_eq!(got[1], expected[1]);
+}
+
+/// A per-request feature must not depend on a server-side env var.
+///
+/// `response_format: {"type": "json_object"}` was honoured by the
+/// private decode loop and dropped here, so the same body got a
+/// constrained answer or an unconstrained one depending on whether
+/// `FERROX_CONTINUOUS_BATCHING=1` was set -- which the caller cannot
+/// see. The only visible symptom was the final
+/// `validate_json_object_output` turning into a 400 for output the
+/// server itself had failed to constrain.
+///
+/// The detokenizer here makes every EVEN token id render as `<`, which
+/// no JSON document may contain, and every odd id render as `a`, which
+/// any of them may. So "the mask was applied" is decidable from the ids
+/// alone, with no model behaviour assumed.
+///
+/// Both halves are asserted, and the second is what stops this passing
+/// vacuously: the SAME prompt and seed without `json_object` must reach
+/// at least one even id, or the constrained run proves nothing.
+#[test]
+fn json_object_mode_constrains_a_batched_row_as_it_does_a_private_one() {
+    let decoder = tiny_decoder();
+    let decode: DecodeFn = Arc::new(|ids: &[usize]| {
+        ids.iter()
+            .map(|id| if id % 2 == 0 { '<' } else { 'a' })
+            .collect()
+    });
+    let batcher = ContinuousBatcher::spawn_with_config(
+        Arc::clone(&decoder),
+        decode,
+        BatcherConfig {
+            prefill_chunk: 1,
+            ..BatcherConfig::default()
+        },
+    );
+
+    let prompt = vec![1usize, 2, 3];
+    let run = |json_object: bool| {
+        let mut params = greedy_params(12, 5);
+        params.json_object = json_object;
+        batcher
+            .generate(prompt.clone(), params, StopTokens::default())
+            .expect("generate")
+            .1
+    };
+
+    let unconstrained = run(false);
+    assert!(
+        unconstrained.iter().any(|id| id % 2 == 0),
+        "the unconstrained run reached no forbidden token, so the \
+         constrained run below would prove nothing"
+    );
+
+    let constrained = run(true);
+    assert!(
+        !constrained.is_empty(),
+        "a json-mode batched row must still produce tokens"
+    );
+    assert!(
+        constrained.iter().all(|id| id % 2 == 1),
+        "a batched json-mode row sampled a token that renders as `<`: \
+         the logit mask was not applied ({constrained:?})"
+    );
 }

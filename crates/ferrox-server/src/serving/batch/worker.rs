@@ -324,9 +324,20 @@ pub(super) fn worker_loop(
             let Some(slot) = rows.get_mut(uid) else {
                 continue;
             };
-            let next =
-                slot.sampler
-                    .sample(&slot.logits, &slot.params.sampling, &slot.generated_ids);
+            // Through `sample_step`, the same call the private decode
+            // loop makes. Calling `Sampler` directly here is what
+            // dropped `response_format: {"type": "json_object"}` for
+            // every batched request: an env var the caller cannot see
+            // (`FERROX_CONTINUOUS_BATCHING`) decided a per-request
+            // feature, and the only visible symptom was the final
+            // `validate_json_object_output` turning into a 400.
+            let next = crate::sample_step::sample_next(
+                &mut slot.sampler,
+                &slot.logits,
+                &slot.params,
+                &slot.generated_ids,
+                &|id| decode(&[id]),
+            );
             // Three ways this token ends the answer, and they compose:
             // the model's own end-of-generation set (not `eos_id`
             // alone -- gemma-2 ends on `<end_of_turn>`), and a

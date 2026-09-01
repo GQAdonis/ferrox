@@ -194,12 +194,18 @@ impl CompletionsRequest {
     }
 
     /// Refuse what this server does not implement, by name.
-    fn validate(&self) -> Result<(), ApiError> {
+    pub(crate) fn validate(&self) -> Result<(), ApiError> {
+        // `logit_bias` decides in `unsupported_sampling`, shared with
+        // `/v1/chat/completions`: the two routes disagreed about this
+        // field for as long as each held its own copy of the rule.
+        crate::unsupported_sampling::refuse_logit_bias(
+            self.logit_bias.as_ref(),
+            "/v1/completions",
+        )?;
         let unsupported = [
             (self.logprobs.is_some(), "logprobs"),
             (self.echo == Some(true), "echo"),
             (self.suffix.is_some(), "suffix"),
-            (self.logit_bias.is_some(), "logit_bias"),
         ];
         for (present, name) in unsupported {
             if present {
@@ -473,6 +479,8 @@ pub async fn completions(
         sampling: SamplingParams {
             temperature: req.temperature.unwrap_or(0.0),
             top_p: req.top_p.unwrap_or(1.0),
+            // No `min_p` on the OpenAI completions wire; 0.0 is off.
+            min_p: 0.0,
             top_k: 0,
             repetition_penalty: 1.0,
             penalty_last_n: 64,

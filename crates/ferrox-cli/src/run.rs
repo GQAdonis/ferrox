@@ -111,9 +111,26 @@ pub struct InferArgs {
     #[arg(long = "no-cnv", default_value_t = false)]
     pub no_cnv: bool,
 
-    /// Process `\\n` / `\\t` / `\\r` / `\\\\` escapes in `-p`.
-    #[arg(short = 'e', long = "escape", default_value_t = false)]
+    /// Process `\\n` / `\\t` / `\\r` / `\\\\` escapes in `-p`. Use
+    /// `--no-escape` to pass the prompt through literally.
+    ///
+    /// Defaults TRUE, matching llama.cpp (`common/common.h:563`), which
+    /// also spells the negation `--no-escape` (`common/arg.cpp:1799`).
+    /// ferrox defaulted false, so `-p "line one\\nline two"` reached the
+    /// model as a literal backslash-n on ferrox and as a newline on
+    /// llama.cpp -- the same command, a different prompt, and no error
+    /// either way.
+    #[arg(
+        short = 'e',
+        long = "escape",
+        default_value_t = true,
+        overrides_with = "no_escape"
+    )]
     pub escape: bool,
+
+    /// Pass the prompt through literally, without expanding escapes.
+    #[arg(long = "no-escape", action = clap::ArgAction::SetTrue)]
+    pub no_escape: bool,
 
     /// Ignore EOS and always emit up to `-n` tokens.
     #[arg(long = "ignore-eos", default_value_t = false)]
@@ -153,6 +170,37 @@ pub enum GpuLayers {
 impl GpuLayers {
     fn offload_enabled(self) -> bool {
         !matches!(self, Self::Count(0))
+    }
+
+    /// Reject a PARTIAL offload rather than silently offloading
+    /// everything.
+    ///
+    /// llama.cpp's `-ngl N` puts exactly `N` layers in VRAM and runs the
+    /// rest on the CPU (`common/arg.cpp`), which is how people fit a
+    /// model that does not otherwise fit. ferrox parses the count and
+    /// then reads only `offload_enabled()`, a bool -- so `--ngl 10` on a
+    /// 32-layer model offloaded all 32.
+    ///
+    /// That is the worst shape of divergence: same flag, same value, no
+    /// error, and the failure lands as an out-of-memory on the machine
+    /// the flag existed to accommodate.
+    ///
+    /// Partial offload is a real feature and not implemented here, so
+    /// this REFUSES and names it. `0` (all CPU) and any count at or
+    /// above the layer count (all GPU) are exact, and stay accepted.
+    fn check_supported(self, n_layers: usize) -> anyhow::Result<()> {
+        if let Self::Count(n) = self {
+            let n = n as usize;
+            if n > 0 && n < n_layers {
+                anyhow::bail!(
+                    "--ngl {n} asks for a PARTIAL offload ({n} of {n_layers} layers), which \
+                     ferrox does not implement -- it would silently offload all {n_layers}. \
+                     Use `--ngl 0` for CPU only, or `--ngl {n_layers}` / `--ngl all` for \
+                     every layer."
+                );
+            }
+        }
+        Ok(())
     }
 }
 
@@ -522,7 +570,7 @@ fn resolve_prompt(args: &InferArgs) -> anyhow::Result<String> {
     } else {
         args.prompt.clone()
     };
-    if args.escape {
+    if args.escape && !args.no_escape {
         prompt = apply_escapes(&prompt);
     }
     Ok(prompt)
@@ -773,6 +821,9 @@ pub fn run_infer(args: InferArgs) -> anyhow::Result<()> {
     }
 
     let config = ModelConfig::from_gguf(&file)?;
+    // Checked here rather than at parse time: the layer count is what
+    // makes a given `--ngl N` exact or partial, and it is in the file.
+    args.n_gpu_layers.check_supported(config.n_layers)?;
     if let Some(arch) = file.metadata_str("general.architecture") {
         ensure_generic_decoder(arch).map_err(|e| anyhow::anyhow!("{e}"))?;
     }
@@ -1321,6 +1372,65 @@ fn run_glm52_infer(args: InferArgs, path: &Path, file: &ShardedGguf) -> anyhow::
 mod tests {
     use super::GpuLayers;
     use std::str::FromStr;
+
+    /// `-ngl N` must not silently mean "all layers".
+    ///
+    /// llama.cpp's `-ngl N` puts exactly N layers in VRAM and runs the
+    /// rest on the CPU, which is how people fit a model that otherwise
+    /// does not fit. ferrox parsed the count and read only
+    /// `offload_enabled()`, a bool, so `--ngl 10` on a 32-layer model
+    /// offloaded all 32 -- same flag, same value, no error, and the
+    /// failure arrives as an OOM on the machine the flag existed to
+    /// accommodate.
+    ///
+    /// Partial offload is not implemented, so it refuses. The two exact
+    /// cases still work.
+    #[test]
+    fn a_partial_gpu_layer_count_is_refused_rather_than_rounded_up() {
+        let err = GpuLayers::Count(10)
+            .check_supported(32)
+            .expect_err("10 of 32 is partial");
+        let msg = err.to_string();
+        assert!(msg.contains("PARTIAL"), "{msg}");
+        assert!(
+            msg.contains("--ngl 0"),
+            "the message must say what works: {msg}"
+        );
+        assert!(msg.contains("--ngl 32"), "{msg}");
+
+        // The exact cases are not partial and must stay accepted.
+        GpuLayers::Count(0)
+            .check_supported(32)
+            .expect("0 = CPU only");
+        GpuLayers::Count(32).check_supported(32).expect("32 = all");
+        GpuLayers::Count(99)
+            .check_supported(32)
+            .expect("clamps to all");
+        GpuLayers::All.check_supported(32).expect("all");
+        GpuLayers::Auto.check_supported(32).expect("auto");
+    }
+
+    /// `--escape` defaults TRUE, as llama.cpp does.
+    ///
+    /// ferrox defaulted false, so `-p "a\\nb"` reached the model as a
+    /// literal backslash-n on ferrox and as a newline on llama.cpp: the
+    /// same command, a different prompt, and no error on either side.
+    #[test]
+    fn escapes_are_processed_by_default_like_llama_cpp() {
+        use clap::Parser;
+        #[derive(Parser)]
+        struct Probe {
+            #[command(flatten)]
+            args: super::InferArgs,
+        }
+        let parsed = Probe::try_parse_from(["ferrox", "-m", "x.gguf"]).expect("defaults parse");
+        assert!(parsed.args.escape, "llama.cpp common/common.h:563 is true");
+        assert!(!parsed.args.no_escape);
+
+        let off = Probe::try_parse_from(["ferrox", "-m", "x.gguf", "--no-escape"])
+            .expect("--no-escape parses");
+        assert!(off.args.no_escape, "llama.cpp spells the negation this way");
+    }
 
     #[test]
     fn parses_llama_gpu_layer_values() {

@@ -166,7 +166,7 @@ which, with the `llama.cpp/src/models/*.cpp` line that decides it:
 | `NEW CODE` | A different attention or residual structure. Not close. |
 | `UNKNOWN` | Reading both trees did not settle it. The message says what would. |
 
-Read on both sides so far, 15 of 47 (`ferrox_models::capability`, pinned
+Read on both sides so far, 23 of 47 (`ferrox_models::capability`, pinned
 by `crates/ferrox-models/tests/unaudited_triage.rs`):
 
 | Arch | Class | What decides it |
@@ -184,8 +184,20 @@ by `crates/ferrox-models/tests/unaudited_triage.rs`):
 | `exaone4` | new code | `exaone4.cpp:60-67,118,159`: the same post-norm-only topology |
 | `granite`, `granitemoe`, `granite-moe` | new code | `granite.cpp:7-10,188,241-242,301-302`: four multipliers, including a residual scale on every branch output. Cause 4 above already refuses these by name first |
 | `phi4` | unknown | `phi4` is not in llama.cpp's `LLM_ARCH_NAMES` at all, so there is no reference graph to diff. A real GGUF spelling it would settle whether it is phi3's fused-QKV graph |
+| `grok` | new code | `grok.cpp:5-21` hardcodes five scales and softcaps before any key can override them; attention runs at `kq_scale = 1.0` with the real scale folded into a tanh softcap, and each layer computes a dense FFN **and** a MoE |
+| `dbrx` | new code | `dbrx.cpp:69-71,110-112,140-142` normalise with `LLM_NORM`, which subtracts the mean. Ferrox is RMSNorm-only. The required-bias refusal group does not catch it: dbrx creates no norm bias tensors at all |
+| `smallthinker` | new code | `smallthinker.cpp:111` computes the MoE router logits from the **raw layer input**, not the normed FFN input; plus unkeyed NoPE layers (`:108-109` with the default step of 4) and ReLU experts |
+| `bitnet` | new code | `bitnet.cpp:101-106,135-140`: `attn_sub_norm` sits before the output projection and `ffn_sub_norm` inside the FFN. Neither slot exists here |
+| `minicpm3` | new code | `minicpm3.cpp:41-46` is the DeepSeek-2 MLA tensor set, plus MiniCPM's hardcoded multipliers at `:65-67`. It is on the generic-GQA row and should not be |
+| `openelm` | new code | `openelm.cpp:26-28` sizes heads and FFN width **per layer**; Ferrox carries them as scalars |
+| `arcee`, `plm` | new code | `arcee.cpp:39-40`, `plm.cpp:39-40`: no `ffn_gate` at all. An ungated ReLU-squared MLP, which is a different FFN shape and not only a different activation |
 
-The remaining 32 say so explicitly rather than guessing a class.
+The remaining 24 say so explicitly rather than guessing a class.
+
+All eight of batch 2 came out `new code`, which is itself a result:
+batch 1 mixed five fixture-away rows in, and past the first dozen the
+unaudited set is genuinely harder. The refusal now says that per
+architecture rather than implying one uniform distance.
 
 `FERROX_ALLOW_UNKNOWN_TENSORS=1` loads the checkpoint anyway and accepts
 whatever comes out. Use it while you debug, not to get past the error

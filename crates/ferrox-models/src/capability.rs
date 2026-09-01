@@ -189,16 +189,11 @@ pub const TRIAGE_PENDING: &[&str] = &[
     "chatglm",
     "mistral3",
     "maincoder",
-    "arcee",
     "bailingmoe",
     "nanbeige",
-    "plm",
     // NEOX-RoPE group.
     "mistral",
     "mixtral",
-    "bitnet",
-    "grok",
-    "dbrx",
     "yi",
     "afmoe",
     "apertus",
@@ -208,10 +203,7 @@ pub const TRIAGE_PENDING: &[&str] = &[
     "laguna",
     "mellum",
     "mimo2",
-    "minicpm3",
-    "openelm",
     "plamo3",
-    "smallthinker",
     "step35",
     "talkie",
 ];
@@ -467,7 +459,27 @@ const NORM_ROPE_TRIAGED: &[(&str, TriageClass, &str)] = &[
     // ferrox-only alias row; no llama.cpp GGUF spells it this way, but
     // it must not carry a different verdict from `granitemoe`.
     ("granite-moe", TriageClass::NewCode, GRANITE_MULTIPLIERS),
+    ("arcee", TriageClass::NewCode, UNGATED_RELU_SQR),
+    ("plm", TriageClass::NewCode, UNGATED_RELU_SQR),
 ];
+
+/// Shared by `arcee` and `plm`: an ungated ReLU-squared MLP.
+///
+/// Found by the activation audit the `deepseek` renormalisation bug
+/// prompted, not by reading these two files on purpose. Both were on the
+/// generic path with nothing recording that their FFN is neither SwiGLU
+/// nor GeGLU.
+const UNGATED_RELU_SQR: &str =
+    "an UNGATED ReLU-squared MLP, which is a different FFN shape and not only a different \
+     activation. src/models/arcee.cpp:39-40 and plm.cpp:39-40 create only `ffn_up` and \
+     `ffn_down` and no `ffn_gate` at all, and arcee.cpp:123-128 calls build_ffn with a NULL \
+     gate, `LLM_FFN_RELU_SQR` and `LLM_FFN_SEQ` -- i.e. `down(relu(up(x))^2)`, two matrices \
+     in sequence. ferrox's `ExpertWeights` has three required matrices and \
+     `FfnActivation` has only the gated Swiglu / SwigluFused / Gelu variants \
+     (config.rs:302-312), so there is no shape for this and no activation for it either. It \
+     fails closed rather than computing SwiGLU: `load_dense_expert` (loader.rs:1112-1136) \
+     finds no `ffn_gate`, falls to the Phi-3 fused path, and rejects an `ffn_up` that is \
+     `n_ff` rows rather than `2 * n_ff`";
 
 /// Shared by `granite`, `granitemoe` and the `granite-moe` alias: one
 /// blocker, one string, so the three rows cannot drift apart.
@@ -557,6 +569,100 @@ const NEOX_ROPE_TRIAGED: &[(&str, TriageClass, &str)] = &[
          shared expert on every layer (:137-143), softmax with norm_w=true and \
          expert_weights_scale (:147-150), sequential residual (:129,163) -- ferrox has",
     ),
+    (
+        "grok",
+        TriageClass::NewCode,
+        "grok-1 hardcodes five constants BEFORE letting an optional key override them \
+         (src/models/grok.cpp:5-21): logit_scale = 0.5773502691896257 (1/sqrt(3)), \
+         embedding_scale = 78.38367176906169, attn_out_scale = 0.08838834764831845 \
+         (1/sqrt(128)), and attn / router logit softcapping both 30.0. A GGUF omitting every \
+         key is still scaled by all five, so a key-presence gate such as \
+         `unsupported_scaling_keys` cannot see them -- the same blind spot `minicpm` is \
+         refused for. On top of that the graph is not the generic one: attention runs with \
+         kq_scale = 1.0f (:137) and folds the real scale into a tanh softcap instead \
+         (llama-graph.cpp:2579-2581), every layer computes BOTH a dense GELU FFN and a GELU \
+         MoE and sums them scaled by sqrt(2)/2 (:171-184), and `blk.N.attn_output_norm` \
+         (:62, LLM_TENSOR_ATTN_OUT_NORM = \"blk.%d.attn_output_norm\", llama-arch.cpp:423) is \
+         a tensor name ferrox never reads. Router logit softcapping has no ferrox concept at \
+         all. `uses_geglu` already covers grok's GELU, which is necessary and nowhere near \
+         sufficient",
+    ),
+    (
+        "dbrx",
+        TriageClass::NewCode,
+        "LayerNorm, not RMSNorm. src/models/dbrx.cpp:4 reads LLM_KV_ATTENTION_LAYERNORM_EPS \
+         (not the RMS one) and the graph normalises with `LLM_NORM` at all three sites -- \
+         :69-71 pre-attention, :110-112 pre-FFN, :140-142 final -- which subtracts the mean; \
+         ferrox has only `rms_norm(x, w, eps)`, a different function of the same tensors on \
+         every layer. Note this is NOT caught by the required-bias refusal group: dbrx \
+         creates no norm bias tensors at all, so the marker that group keys on is absent \
+         while the normalisation is still LayerNorm. It also requires \
+         {arch}.attention.clamp_kqv (:5, REQUIRED) and carries no `ffn_norm` -- \
+         `attn_out_norm` (:34) IS the pre-FFN norm (:110-113), the gpt-oss slot again but \
+         under the unread name `blk.%d.attn_output_norm`",
+    ),
+    (
+        "smallthinker",
+        TriageClass::NewCode,
+        "the MoE router reads a DIFFERENT tensor. src/models/smallthinker.cpp:111 computes \
+         the router logits from the raw layer input `inpL`, before the attention block, and \
+         passes them into build_moe_ffn as a precomputed `probs` with a NULL ffn_gate_inp \
+         (:151-161); every other MoE architecture routes on the normed FFN input, which is \
+         what ferrox computes. Two more, either of which alone would disqualify it: (1) NoPE \
+         layers with no GGUF key -- llama-hparams.h:203 defaults n_no_rope_layer_step to 4 \
+         and the SWA branch (:6-15) never overwrites it, so :108-109's \
+         `use_rope = n_no_rope_layer_step == n_layer || il % n_no_rope_layer_step != 0` \
+         leaves layers 0, 4, 8 ... unrotated, the `smollm3` class exactly, which ferrox \
+         refuses outright; (2) `LLM_FFN_RELU` experts (:158), and FfnActivation has no ReLU \
+         variant. :8 also pins n_swa to 4096 over whatever the file declares. \
+         `default_swa_layout` and `swa_rope_base_follows_model` already carry smallthinker \
+         correctly; they are not the blocker",
+    ),
+    (
+        "bitnet",
+        TriageClass::NewCode,
+        "two norms INSIDE the blocks, in slots ferrox does not have. \
+         src/models/bitnet.cpp:24,36 require `attn_sub_norm` and `ffn_sub_norm`, and the \
+         graph applies attn_sub_norm to the attention output BEFORE the output projection \
+         (:101-106 -- not after it, where ferrox's post_attn_norm sits) and ffn_sub_norm \
+         between the gate*up product and `ffn_down` (:135-140), inside the FFN. It also \
+         carries a per-tensor `scale` for every projection (:27-43, applied via \
+         build_lora_mm) and creates no `output` tensor at all, taking the LM head from \
+         `tok_embd` unconditionally (:164). ferrox refuses it by name today via the \
+         unread-tensor gate (`blk.N.attn_sub_norm`, llama-arch.cpp:510-511), which is the \
+         right outcome and not a small fix",
+    ),
+    (
+        "minicpm3",
+        TriageClass::NewCode,
+        "MiniCPM3 is an MLA model on ferrox's generic-GQA row, and both halves of that are \
+         wrong. src/models/minicpm3.cpp:5-6 requires q_lora_rank and kv_lora_rank and \
+         :41-46 creates `attn_q_a`/`attn_q_b`/`attn_kv_a_mqa`/`attn_kv_b` with \
+         `attn_q_a_norm`/`attn_kv_a_norm` -- the DeepSeek-2 tensor set, which needs the MLA \
+         engine, not `attn_q.weight`. It ALSO hardcodes MiniCPM's multipliers with no key to \
+         read them from: scale_embd = 12.0f, scale_depth = 1.4f and n_embd_base = 256 at \
+         :65-67, applied at :81, which is the blind spot `minicpm` is already refused for. \
+         SEPARATELY, and worth fixing when someone touches this row: the catalog gives \
+         minicpm3 `DecoderFamily::StandardGqa` and `MemoryKind::KvGqa`, which is simply not \
+         what it is; it belongs beside `deepseek2` as DedicatedOnly/Mla. It fails closed \
+         today only because the generic loader cannot find `blk.0.attn_q.weight`",
+    ),
+    (
+        "openelm",
+        TriageClass::NewCode,
+        "per-LAYER head counts and FFN width. src/models/openelm.cpp:26-28 reads \
+         `hparams.n_head(i)`, `n_head_kv(i)` and `n_ff(i)` per layer and sizes the fused \
+         `wqkv` as `n_embd x (2*n_head_kv(i) + n_head(i)) * n_embd_head_k` (:34), and the \
+         graph re-derives those widths for every layer (:67-69). ferrox's ModelConfig \
+         carries n_heads, n_kv_heads and expert_ffn_dim as SCALARS, and \
+         `load_qkv_projections` splits a fused QKV at offsets computed from those scalars, \
+         so there is nowhere to put this. It fails closed, but NOT with this message: \
+         conversion/openelm.py:57-59 writes head_count, head_count_kv and \
+         feed_forward_length as ARRAYS, and `GgufValue::as_u64` returns None for an array \
+         (ferrox-gguf/src/lib.rs:83-93), so the load dies on a missing-hparam error for keys \
+         the file does carry, before the unaudited gate is reached. That misleading message \
+         is the `glm4moe` shape and should be fixed alongside",
+    ),
 ];
 
 /// Full inventory keyed by GGUF `general.architecture` string.
@@ -583,10 +689,8 @@ pub fn architecture_catalog() -> &'static [ArchProfile] {
             "chatglm",
             "mistral3",
             "maincoder",
-            "arcee",
             "bailingmoe",
             "nanbeige",
-            "plm",
         ] {
             v.push(gqa_norm(n));
         }
@@ -599,8 +703,7 @@ pub fn architecture_catalog() -> &'static [ArchProfile] {
         }
         for n in [
             "olmoe", "qwen2", "qwen2moe", "mistral",
-            "mixtral", "bitnet",
-            "grok", "dbrx", "yi",
+            "mixtral", "yi",
             // llama-model.cpp `llama_model_rope_type`: LLM_ARCH_OPENAI_MOE
             // falls in the `return LLAMA_ROPE_TYPE_NEOX` group, and a live
             // load of a gpt-oss GGUF prints `rope type = 2` (= NEOX).
@@ -625,10 +728,7 @@ pub fn architecture_catalog() -> &'static [ArchProfile] {
             "laguna",
             "mellum",
             "mimo2",
-            "minicpm3",
-            "openelm",
             "plamo3",
-            "smallthinker",
             "step35",
             "talkie",
         ] {
@@ -1808,7 +1908,10 @@ mod audit_tests {
                 );
             }
         }
-        assert!(seen >= 15, "expected the batch-1 triage rows, found {seen}");
+        assert!(
+            seen >= 23,
+            "expected the batch-1 and batch-2 triage rows, found {seen}"
+        );
     }
 
     /// The class reaches the message. Two architectures in different
@@ -1818,11 +1921,14 @@ mod audit_tests {
         let fixture = unaudited_refusal_detail("bailingmoe2");
         let arm = unaudited_refusal_detail("seed_oss");
         let new_code = unaudited_refusal_detail("olmo2");
-        let untriaged = unaudited_refusal_detail("grok");
+        let untriaged = unaudited_refusal_detail("baichuan");
         assert!(fixture.contains("FIXTURE-AWAY"), "{fixture}");
         assert!(arm.contains("ONE MATCH ARM"), "{arm}");
         assert!(new_code.contains("NEW CODE"), "{new_code}");
-        assert!(untriaged.contains("not done for `grok` yet"), "{untriaged}");
+        assert!(
+            untriaged.contains("not done for `baichuan` yet"),
+            "{untriaged}"
+        );
         for a in [&fixture, &arm, &new_code, &untriaged] {
             for b in [&fixture, &arm, &new_code, &untriaged] {
                 if !std::ptr::eq(a, b) {

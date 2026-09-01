@@ -893,3 +893,76 @@ absence of a gap.
   is not a substitute for a measurement.
 - **`ggml`'s CPU op set** was compared at the SIMD-tier and quant-type
   level, not op by op. A per-op CPU diff would likely find more.
+
+---
+
+## 10. Measured 2026-09-01: K-quants diverge from llama.cpp, and it is the QUANT not the architecture
+
+Everything above §9 is a source reading. This section is a measurement,
+run on a quiet host with `ferrox parity` after the tokenizer half was
+brought to MATCH.
+
+**The tokenizer half is clean.** Nine of nine checkpoints libllama can
+load tokenize identically to llama.cpp across the 19-case corpus, 3,839
+tokens: Llama-3.2, Qwen2.5, DeepSeek-R1-Distill, OLMoE, TinyLlama,
+gemma-2, Phi-4-mini, Yi-1.5, Mistral-7B. (`gemma-4` is skipped — the
+installed libllama predates the architecture.)
+
+**The logit half is not, and the controlled experiment localises it.**
+Five quantizations of the SAME checkpoint, same prompt, ferrox CPU
+against llama.cpp CPU so no backend difference is in play:
+
+| `models/Llama-3.2-1B-Instruct-*.gguf` | verdict |
+|---|---|
+| `Q8_0` | **MATCH** |
+| `IQ4_XS` | **MATCH** |
+| `Q6_K` | DRIFT |
+| `Q5_K_M` | DRIFT |
+| `Q4_K_M` | DRIFT |
+
+One model, one architecture, one prompt: the only variable is the quant
+format, so this is not a graph bug. It reproduces across architectures —
+Qwen2.5-1.5B `Q4_K_M` (KL 7.7e-3), gemma-2-2b `Q4_K_M` (KL 6.5e-3) and
+Llama-3.2-1B `Q4_K_M` (KL 1.8e-3) all DRIFT, while TinyLlama `Q8_0`
+MATCHes at KL 2.4e-4.
+
+**Impact is bounded and should not be overstated: the top-1 token is
+IDENTICAL on every row measured**, and top-10 overlap is 9 or 10 of 10.
+This is a distribution difference, not a wrong answer, and it is
+invisible to any greedy-text comparison — which is exactly why
+`ferrox parity` compares distributions rather than text.
+
+**Where it is NOT.** `dequant_q4_k`'s six-bit scale/min extraction is
+byte-identical to llama.cpp's `get_scale_min_k4`, including the
+awkward `j >= 4` branch that borrows bits across the array. Checked
+line by line.
+
+**The leading hypothesis, and the evidence against it.** llama.cpp does
+not dot K-quants against f32 activations: `GGML_TYPE_Q4_K`, `Q5_K` and
+`Q6_K` all declare `vec_dot_type = GGML_TYPE_Q8_K`, so the ACTIVATION is
+quantized to 8 bits and the product is an integer MAC scaled at the end.
+ferrox keeps activations in f32. Two different numeric paths, and
+ferrox's is the more precise one — llama.cpp is buying int8 SIMD
+throughput with accuracy. `Q8_0` uses `vec_dot_type = GGML_TYPE_Q8_0`,
+a much closer path, and it MATCHes.
+
+That theory does not survive contact with `IQ4_XS`, which ALSO declares
+`vec_dot_type = GGML_TYPE_Q8_K` and MATCHES. So the activation
+quantization cannot be the whole story, and the honest position is that
+three of four data points fit and one does not. **Do not act on the
+hypothesis until the IQ4_XS row is explained** — it is the row that
+would falsify it.
+
+**What would settle it**, in order of cost: dot one K-quant row both
+ways in isolation (ferrox f32-activation vs a Q8_K-activation
+reference) and see whether the gap matches the observed KL; then check
+whether `IQ4_XS` reaches a different llama.cpp code path in practice
+than its table entry implies.
+
+**Why this is not filed as a bug.** Nothing here shows ferrox computing
+the wrong thing. It shows two engines making different, defensible
+numeric choices, with ferrox on the more accurate side of the trade. It
+belongs in the gap inventory because "same or better performance on the
+same models" is the goal and a KL of 7.7e-3 is the sort of thing that
+becomes a wrong answer at a longer context or a narrower top-2 margin —
+gemma-2's margin here is 4.7e-2, which is not much headroom.

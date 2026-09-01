@@ -430,7 +430,11 @@ impl<'a> Parser<'a> {
             if i > 0 || no_max {
                 rec_rule.push(GrammarElement::new(
                     GreType::RuleRef,
-                    if no_max { rec_rule_id } else { last_rec_rule_id },
+                    if no_max {
+                        rec_rule_id
+                    } else {
+                        last_rec_rule_id
+                    },
                 ));
             }
             rec_rule.push(GrammarElement::new(GreType::Alt, 0));
@@ -565,12 +569,26 @@ impl<'a> Parser<'a> {
                 b'*' => {
                     self.pos += 1;
                     self.parse_space(is_nested);
-                    self.handle_repetitions(rule, rule_name, last_sym_start, &mut n_prev_rules, 0, None)?;
+                    self.handle_repetitions(
+                        rule,
+                        rule_name,
+                        last_sym_start,
+                        &mut n_prev_rules,
+                        0,
+                        None,
+                    )?;
                 }
                 b'+' => {
                     self.pos += 1;
                     self.parse_space(is_nested);
-                    self.handle_repetitions(rule, rule_name, last_sym_start, &mut n_prev_rules, 1, None)?;
+                    self.handle_repetitions(
+                        rule,
+                        rule_name,
+                        last_sym_start,
+                        &mut n_prev_rules,
+                        1,
+                        None,
+                    )?;
                 }
                 b'?' => {
                     self.pos += 1;

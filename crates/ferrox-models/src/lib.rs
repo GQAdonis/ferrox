@@ -25,6 +25,7 @@ pub mod gemma4_gguf_loader;
 pub mod glm52_decoder;
 pub mod glm52_gguf_loader;
 pub mod glm_dsa;
+pub mod grammar;
 pub mod hf_pull;
 #[cfg(feature = "hub")]
 pub mod hub;

@@ -121,6 +121,45 @@ The CUDA C kernel sources in `ferrox-cuda/src/gpu.rs` are original code
 written to mirror `ferrox-quant`'s CPU fused-dequant math; see that
 module's doc comments for their verification status.
 
+## GBNF grammar engine
+
+`ferrox-models::grammar` is a direct Rust port of llama.cpp's
+grammar-constrained decoding — `src/llama-grammar.h` and
+`src/llama-grammar.cpp`. This is a port of the ALGORITHM, not an
+independent reimplementation from a specification: the GBNF parser, the
+stack machine (`advance_stack`, `match_char`, `match_partial_char`), the
+shared-prefix candidate walk (`reject_candidates`) and both UTF-8
+decoders follow upstream's structure and arithmetic closely enough that
+the correspondence is the point, since divergence would mean accepting a
+different language.
+
+The eight `.gbnf` grammars in `grammar::grammars` are reproduced verbatim
+from llama.cpp's `grammars/` directory, and the parser goldens are
+transcribed from its `tests/test-grammar-parser.cpp`.
+
+llama.cpp is MIT licensed:
+
+  Copyright (c) 2023-2024 The ggml authors and llama.cpp
+  contributors (llama.cpp)
+
+Two deliberate, documented divergences, both in the module's own doc
+comments:
+
+- `"a"{4,2}` (a repetition whose maximum is below its minimum) hangs
+  upstream: `max_times - min_times` wraps as unsigned and loops roughly
+  2^64 times, and upstream's `> 2000` element guard does not catch it.
+  ferrox saturates to zero optional copies, so the rule reads as
+  `"a"{4}`.
+- Token pieces are handled as bytes rather than `&str`, because a piece
+  holding one byte of a multi-byte character is not valid UTF-8.
+
+One upstream asymmetry is REPRODUCED rather than corrected, and pinned
+by its own test: `reject_candidates` keeps an empty piece on a satisfied
+grammar while `accept_token` drops every empty stack and then fails.
+That is harmless only because the sampler masks empty pieces before the
+grammar sees them, and matching upstream is worth more than quietly
+being different.
+
 ## Tokenizer pre-tokenization pattern
 
 The GPT2 byte-to-unicode remap table and the pre-tokenization regex

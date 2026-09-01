@@ -81,7 +81,10 @@ impl fmt::Display for GrammarError {
                 offset,
                 rest,
             } => {
-                write!(f, "grammar syntax error at byte {offset}: {expected}, at {rest:?}")
+                write!(
+                    f,
+                    "grammar syntax error at byte {offset}: {expected}, at {rest:?}"
+                )
             }
             GrammarError::UndefinedRule { name, rule_id } => write!(
                 f,
@@ -138,7 +141,8 @@ mod tests {
 
     #[test]
     fn syntax_error_clips_and_quotes_the_rest_of_the_input() {
-        let src = b"root ::= \"a\" @@@ trailing garbage that runs on and on and on and on past the clip";
+        let src =
+            b"root ::= \"a\" @@@ trailing garbage that runs on and on and on and on past the clip";
         let e = GrammarError::syntax("expecting newline or end", src, 13);
         match &e {
             GrammarError::Syntax {

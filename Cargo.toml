@@ -11,6 +11,7 @@ members = [
     "crates/ferrox-server",
     "crates/ferrox-cuda",
     "crates/ferrox-metal",
+    "crates/ferrox-vulkan",
     "crates/ferrox-inference",
 ]
 resolver = "2"

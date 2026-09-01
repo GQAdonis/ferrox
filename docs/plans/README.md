@@ -16,6 +16,14 @@ Two items are large enough to carry their own design document:
 - **[`out-of-core-moe.md`](out-of-core-moe.md)**, running a 155 GB model
   on a 32 GB machine.
 
+One item has a written **verdict** rather than a design:
+
+- **[`vulkan-beachhead-verdict.md`](vulkan-beachhead-verdict.md)**, the
+  `d-hardware-reach` GO/NO-GO. GO: a Q8_0 matvec ran as a hand-emitted
+  SPIR-V shader on a real device and matched its scalar twin. It also
+  carries the survey of the backend seam a third backend would need,
+  which is `backend-seam-refactor`'s to-do list.
+
 Everything else is history: [`archive/`](archive/) holds the five plans
 whose items were merged into the roadmap, [`on-hold/`](on-hold/) holds
 work ranked below the goal with the condition that brings it back, and

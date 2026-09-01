@@ -1,16 +1,43 @@
-//! MiniMax M2/M3 dedicated stack stub — not generic GQA.
+//! MiniMax M2 / M3 refusal, and why the reason it used to give was the
+//! wrong one.
 //!
-//! Real checkpoints tag `minimax-m2` / `minimax-m3` with 256-expert
-//! sigmoid MoE and MTP (multi-token prediction) draft heads. Required
-//! tensors (llama.cpp `minimax*.cpp` graph), not implemented here:
+//! This module used to say MiniMax "needs a loader, 256-expert sigmoid
+//! MoE routing and MTP draft heads, none of which exist yet". Checked
+//! against llama.cpp, two of those three clauses are false and the third
+//! is only true of one of the two architectures:
 //!
-//! - Standard emb/norm/output head
-//! - MoE: `ffn_gate_inp`, `ffn_gate_exps`, `ffn_up_exps`, `ffn_down_exps`,
-//!   `ffn_exp_probs_b.bias` (sigmoid / `noaux_tc` routing)
-//! - MTP: `num_nextn_predict_layers` draft-head tensors (`nextn.*` in
-//!   llama.cpp) — see `docs/CLI.md` `--mtp` (honest fail until loaded)
+//! - **MTP does not exist in either model.** Neither
+//!   `.scratch/llama.cpp/src/models/minimax-m2.cpp` nor `minimax-m3.cpp`
+//!   creates a single `nextn.*` tensor, and `gguf-py`'s
+//!   `MODEL_ARCH.MINIMAXM2` / `.MINIMAXM3` tensor lists contain no
+//!   `NEXTN_*` entry, so no converter can emit MTP weights for these
+//!   files. `minimax-m3.cpp:9` states it: "MTP is not in released model
+//!   weights." A refusal naming a tensor family the checkpoint cannot
+//!   contain is unreachable by construction — glm4moe's `q_lora_rank`
+//!   defect in a different costume.
+//! - **Sigmoid MoE routing already exists here.** `loader.rs` reads
+//!   `{arch}.expert_gating_func` into `GatingFunction::Sigmoid`, loads
+//!   `blk.N.exp_probs_b.bias`, and reads `expert_weights_scale` and
+//!   `expert_weights_norm`. `ferrox_moe::route_top_k_sigmoid` is the
+//!   routing DeepSeek-V3 and GLM-4-MoE use. "256 experts" is an hparam,
+//!   not a ceiling.
+//! - **Block-sparse attention is M3's, not MiniMax's.** `minimax-m2.cpp`
+//!   builds ordinary dense GQA attention (:112). The ported selection in
+//!   [`ferrox_core::block_sparse`] is relevant only to M3's MSA, and is
+//!   the smallest piece of it.
 //!
-//! Fail-closed via [`Self::reject`] until loader + engine land.
+//! What is actually true, per architecture, is in [`crate::capability`]
+//! — and that is deliberately the ONLY copy. The live refusal a user
+//! hits is `LoadError::DedicatedArchitectureRequired`, built from
+//! `ArchPath::DedicatedOnly { reason }` in `loader.rs`; this module's
+//! [`MinimaxEngine::reject`] used to carry a second, longer, *different*
+//! reason that nothing ever printed. Two copies of one explanation is
+//! how they came to disagree, so `reject` now reads the catalog's string
+//! rather than repeating it.
+//!
+//! In short: `minimax-m2` is UNAUDITED (a fixture or a parity run would
+//! settle it — see `tests/minimax_refusal.rs`), while `minimax-m3` is
+//! genuinely UNIMPLEMENTED (the MSA indexer and its own KV cache).
 
 use thiserror::Error;
 
@@ -25,25 +52,23 @@ pub struct MinimaxEngine {
 }
 
 impl MinimaxEngine {
-    /// Refuses, naming what exists and what does not.
+    /// Refuses, with the SAME reason the loader gives for `arch`.
     ///
-    /// The block-sparse SELECTION is ported and tested
-    /// ([`ferrox_core::block_sparse`]): which 128-token KV blocks a
-    /// query may read, per KV head, with the force-included first and
-    /// newest blocks that keep a selection from ever being empty. What
-    /// is absent is everything around it -- the loader, the 256-expert
-    /// sigmoid MoE, and the MTP draft heads -- so there is nothing for
-    /// that selection to select over yet.
-    ///
-    /// Saying which half exists matters: a bare "not implemented"
-    /// invites the next reader to re-port the selection rule that is
-    /// already here and already covered.
-    pub fn reject(_arch: &str) -> Result<(), MinimaxUnavailable> {
-        Err(MinimaxUnavailable {
-            reason: "MiniMax needs a loader, 256-expert sigmoid MoE routing and MTP draft heads, \
-                     none of which exist yet. Its block-sparse attention SELECTION is ported and \
-                     tested (ferrox_core::block_sparse); only the engine around it is missing",
-        })
+    /// Deliberately delegating: the catalog owns the per-architecture
+    /// reason, so this cannot drift away from what a user actually sees.
+    pub fn reject(arch: &str) -> Result<(), MinimaxUnavailable> {
+        let reason = match crate::capability::resolve_architecture(arch) {
+            Some(crate::capability::ArchPath::DedicatedOnly { reason }) => reason,
+            // Any other path for a name routed here is itself the bug:
+            // say so rather than inventing an architecture reason.
+            _ => {
+                return Err(MinimaxUnavailable {
+                    reason: "not a MiniMax architecture: expected `minimax-m2` or `minimax-m3`, \
+                             which the capability catalog marks DedicatedOnly",
+                });
+            }
+        };
+        Err(MinimaxUnavailable { reason })
     }
 }
 
@@ -54,5 +79,48 @@ mod tests {
     #[test]
     fn reject_is_fail_closed() {
         assert!(MinimaxEngine::reject("minimax-m2").is_err());
+        assert!(MinimaxEngine::reject("minimax-m3").is_err());
+    }
+
+    /// The defect this module was fixed for: the engine's reason and the
+    /// loader's reason were two different strings, and only the loader's
+    /// was ever shown.
+    #[test]
+    fn reject_repeats_the_catalog_reason_verbatim() {
+        for arch in ["minimax-m2", "minimax-m3"] {
+            let Some(crate::capability::ArchPath::DedicatedOnly { reason }) =
+                crate::capability::resolve_architecture(arch)
+            else {
+                panic!("{arch} must be DedicatedOnly");
+            };
+            let err = MinimaxEngine::reject(arch).unwrap_err();
+            assert_eq!(
+                err.reason, reason,
+                "{arch}: the engine must not carry a second, different reason"
+            );
+        }
+    }
+
+    /// Neither reason may claim MTP again: no MiniMax GGUF can carry
+    /// `nextn.*` tensors, because `gguf-py`'s MINIMAXM2/MINIMAXM3 tensor
+    /// lists have no NEXTN entry and neither `minimax-m*.cpp` creates
+    /// one.
+    #[test]
+    fn no_minimax_reason_blames_mtp() {
+        for arch in ["minimax-m2", "minimax-m3"] {
+            let err = MinimaxEngine::reject(arch).unwrap_err();
+            let lower = err.reason.to_ascii_lowercase();
+            assert!(
+                !lower.contains("mtp") && !lower.contains("nextn"),
+                "{arch} may not be refused for MTP it cannot have: {}",
+                err.reason
+            );
+        }
+    }
+
+    #[test]
+    fn a_non_minimax_name_is_named_as_such() {
+        let err = MinimaxEngine::reject("llama").unwrap_err();
+        assert!(err.reason.contains("not a MiniMax architecture"));
     }
 }

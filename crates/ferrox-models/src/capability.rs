@@ -658,24 +658,69 @@ pub fn architecture_catalog() -> &'static [ArchProfile] {
             },
             WholeVector,
         ));
-        // MiniMax M2/M3: 256-expert sigmoid MoE + MTP — not generic GQA.
-        for n in ["minimax-m2", "minimax-m3"] {
-            v.push(prof(
-                n,
-                TextGeneration,
-                Dedicated,
-                KvGqa,
-                // llama-model.cpp puts both in the NEOX group. Inert
-                // today (minimax_engine.rs carries its own RoPE and
-                // never reads this field), but the table advertises
-                // itself as a mirror of llama.cpp's, so it says NEOX.
-                Neox,
-                ArchPath::DedicatedOnly {
-                    reason: "MiniMax 256-expert sigmoid MoE + MTP — see minimax_engine.rs",
-                },
-                WholeVector,
-            ));
-        }
+        // MiniMax M2 and M3 are two DIFFERENT architectures and were
+        // wrong to share one reason. Both used to refuse with "256-expert
+        // sigmoid MoE + MTP"; neither clause is true.
+        //
+        // MTP: `minimax-m2.cpp` and `minimax-m3.cpp` create no `nextn.*`
+        // tensor at all, and `gguf-py/gguf/constants.py`'s
+        // `MODEL_ARCH.MINIMAXM2` / `.MINIMAXM3` tensor lists contain no
+        // `NEXTN_*` entry — so no converter can even emit MTP weights for
+        // these files. `minimax-m3.cpp:9` says it outright: "MTP is not
+        // in released model weights."
+        //
+        // Sigmoid MoE: ferrox HAS it. `loader.rs` reads
+        // `{arch}.expert_gating_func` into `GatingFunction::Sigmoid`,
+        // loads `blk.N.exp_probs_b.bias`, and reads
+        // `expert_weights_scale` / `expert_weights_norm`. Expert count is
+        // an hparam, not a ceiling.
+        //
+        // llama-arch.cpp puts both in the NEOX RoPE group.
+        v.push(prof(
+            "minimax-m2",
+            TextGeneration,
+            Dedicated,
+            KvGqa,
+            Neox,
+            ArchPath::DedicatedOnly {
+                // `minimax-m2.cpp` is plain GQA: `create_tensor_qkv` at
+                // :26, whole-vector Q/K norm at :30-31 (`attn_q_norm` is
+                // `n_embd_head_k * n_head` wide, NOT per-head), partial
+                // NEOX RoPE at :96-106 (:51 notes head_dim=128 but
+                // n_rot=64), and one SiLU MoE with `exp_probs_b`,
+                // `expert_weights_scale` and norm_w=true at :131-141.
+                // ferrox implements every one of those on the generic
+                // path. What is missing is EVIDENCE, not capability.
+                reason: "minimax-m2 is UNAUDITED, not unimplemented: llama.cpp's minimax-m2.cpp \
+                         builds plain GQA + whole-vector QK-norm + partial NEOX RoPE (n_rot=64 < \
+                         head_dim=128) + a SiLU sigmoid MoE with exp_probs_b, all of which the \
+                         generic path already has. Admitting it needs a fixture or a parity run \
+                         against llama.cpp, not new code",
+            },
+            // `attn_q_norm` is `{n_embd_head_k * n_head}` wide
+            // (minimax-m2.cpp:30) — one RMSNorm over the whole Q
+            // projection, OLMoE's style, not Qwen3's per-head.
+            WholeVector,
+        ));
+        v.push(prof(
+            "minimax-m3",
+            TextGeneration,
+            Dedicated,
+            KvGqa,
+            Neox,
+            ArchPath::DedicatedOnly {
+                reason: "minimax-m3 needs MiniMax Sparse Attention: a per-layer indexer \
+                         (index_q_proj/index_k_proj/index_q_norm/index_k_norm, minimax-m3.cpp:76-82) \
+                         driving its own MSA KV cache (llama-kv-cache-msa.h) with position<->cell \
+                         maps, plus SWIGLU_OAI experts and shared experts. ferrox has only the \
+                         block-selection rule (ferrox_core::block_sparse), none of the rest",
+            },
+            // minimax-m3.cpp:53-55 — `{n_embd_head_k}`, with llama.cpp's
+            // own comment "per-head QK-norm: a single head_dim vector
+            // applied to every head". M2 and M3 DIFFER here, which is why
+            // the shared entry was wrong for M3.
+            PerHead,
+        ));
         v.push(prof(
             "deepseek2",
             TextGeneration,
@@ -1383,9 +1428,7 @@ mod tests {
             assert!(
                 matches!(
                     resolve_architecture(arch),
-                    Some(ArchPath::DedicatedOnly {
-                        reason: "MiniMax 256-expert sigmoid MoE + MTP — see minimax_engine.rs"
-                    })
+                    Some(ArchPath::DedicatedOnly { .. })
                 ),
                 "{arch} must fail closed, not silent generic GQA"
             );

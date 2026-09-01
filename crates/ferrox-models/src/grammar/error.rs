@@ -46,6 +46,24 @@ pub enum GrammarError {
     /// The generated text left no viable parse: every stack died. Carries
     /// the piece that killed it, as llama.cpp's thrown message does.
     NoViableStack { piece: String },
+    /// A lazy grammar's trigger pattern does not compile. llama.cpp builds
+    /// a `std::regex` in the constructor, which throws.
+    TriggerPatternInvalid { pattern: String, reason: String },
+    /// A trigger pattern compiled but failed while matching -- the
+    /// backtracking limit, in practice. Upstream's `std::regex` has the
+    /// same failure mode and does not report it.
+    TriggerPatternFailed { pattern: String, reason: String },
+    /// A grammar was made lazy with nothing that could ever switch it on,
+    /// which is an unconstrained generation wearing a grammar. llama.cpp
+    /// permits it; this engine will not pretend to constrain.
+    LazyWithoutTriggers,
+    /// A not-yet-triggered lazy grammar was asked which tokens it forbids.
+    /// It forbids nothing, and answering "nothing" would be
+    /// indistinguishable from a grammar that allows everything -- so the
+    /// question is refused. Callers test
+    /// [`Grammar::is_awaiting_trigger`](super::Grammar::is_awaiting_trigger)
+    /// first, as `llama_grammar_apply_impl` does.
+    AwaitingTrigger,
     /// An invariant llama.cpp asserts with `GGML_ABORT`. Reaching one is a
     /// bug in this engine, not in the caller's grammar.
     Internal(&'static str),
@@ -125,6 +143,25 @@ impl fmt::Display for GrammarError {
                 f,
                 "no grammar parse survives the piece {piece:?}; it should have been masked out \
                  before it was sampled"
+            ),
+            GrammarError::TriggerPatternInvalid { pattern, reason } => write!(
+                f,
+                "lazy grammar trigger pattern {pattern:?} does not compile: {reason}"
+            ),
+            GrammarError::TriggerPatternFailed { pattern, reason } => write!(
+                f,
+                "lazy grammar trigger pattern {pattern:?} failed while matching the output so \
+                 far: {reason}"
+            ),
+            GrammarError::LazyWithoutTriggers => write!(
+                f,
+                "a lazy grammar needs at least one trigger token or trigger pattern; with none \
+                 it can never switch on, and nothing would be constrained"
+            ),
+            GrammarError::AwaitingTrigger => write!(
+                f,
+                "this lazy grammar has not been triggered yet and constrains nothing; check \
+                 is_awaiting_trigger before asking which tokens it rejects"
             ),
             GrammarError::Internal(what) => {
                 write!(f, "internal grammar engine invariant violated: {what}")
@@ -216,6 +253,16 @@ mod tests {
                 n_tokens: 3,
             },
             GrammarError::NoViableStack { piece: "}".into() },
+            GrammarError::TriggerPatternInvalid {
+                pattern: "(unclosed".into(),
+                reason: "unclosed group".into(),
+            },
+            GrammarError::TriggerPatternFailed {
+                pattern: "(a+)+b".into(),
+                reason: "backtrack limit exceeded".into(),
+            },
+            GrammarError::LazyWithoutTriggers,
+            GrammarError::AwaitingTrigger,
             GrammarError::Internal("stack rested on CHAR_ALT"),
         ];
         for c in cases {

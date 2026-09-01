@@ -24,6 +24,7 @@
 //! | [`parser`] | GBNF text to a rule table |
 //! | [`machine`] | the pushdown stack machine over that table |
 //! | [`candidates`] | which candidate tokens no viable stack accepts |
+//! | [`lazy`] | trigger tokens / patterns: a grammar that switches on mid-generation |
 //! | [`json_schema`] | JSON Schema to GBNF text, for `response_format` |
 //!
 //! # Status
@@ -45,15 +46,17 @@
 //! either; `ferrox-server` still answers `response_format: json_schema`
 //! with a 501.
 //!
-//! Still not ported, and a separate piece of work:
-//!
-//! - **Lazy grammars** (`trigger_patterns` / `trigger_tokens`), which is
-//!   what `tool_choice: "required"` needs on top of a grammar.
+//! **Lazy grammars** ([`lazy`]) are ported: `trigger_tokens` and
+//! `trigger_patterns`, the accumulated trigger buffer, and the replay that
+//! feeds the grammar from the match onward. That is what `tool_choice`
+//! needs on top of a grammar -- a model may talk before it calls a tool,
+//! and a grammar applied from token zero forbids the talking.
 
 pub mod candidates;
 pub mod element;
 pub mod error;
 pub mod json_schema;
+pub mod lazy;
 pub mod machine;
 pub mod parser;
 pub mod utf8;
@@ -69,6 +72,7 @@ pub use candidates::{reject_candidates, Candidate, DecodedPiece};
 pub use element::{GrammarElement, GrammarRule, GrammarStack, GreType, RulePos};
 pub use error::GrammarError;
 pub use json_schema::{json_schema_to_grammar, json_schema_to_grammar_value, SchemaError};
+pub use lazy::{LazyState, LazyTriggers, TriggerPattern, TriggerStep};
 pub use machine::Grammar;
 pub use parser::{parse, parse_with_vocab, GrammarVocab, ParsedGrammar};
 pub use utf8::PartialUtf8;

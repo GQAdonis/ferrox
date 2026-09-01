@@ -89,6 +89,14 @@ pub fn reject_candidates(
     grammar: &Grammar,
     candidates: &[Candidate<'_>],
 ) -> Result<Vec<usize>, GrammarError> {
+    if grammar.is_awaiting_trigger() {
+        // A lazy grammar that has not fired constrains nothing, and its
+        // stacks are still at the start of the parse -- so answering this
+        // question from them would forbid the very prose the trigger
+        // exists to allow. Upstream's `apply` returns before it ever asks;
+        // a caller that gets here has skipped that check.
+        return Err(GrammarError::AwaitingTrigger);
+    }
     if candidates.is_empty() {
         return Ok(Vec::new());
     }

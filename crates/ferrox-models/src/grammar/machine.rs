@@ -20,6 +20,7 @@ use std::collections::HashSet;
 
 use super::element::{GrammarElement, GrammarRule, GrammarStack, GreType, RulePos};
 use super::error::GrammarError;
+use super::lazy::{LazyState, LazyTriggers, TriggerStep};
 use super::parser::{parse_with_vocab, GrammarVocab, ParsedGrammar};
 use super::utf8::{decode_piece, PartialUtf8};
 
@@ -29,6 +30,9 @@ pub struct Grammar {
     rules: Vec<GrammarRule>,
     stacks: Vec<GrammarStack>,
     partial_utf8: PartialUtf8,
+    /// Set by [`Grammar::into_lazy`]. `None` is llama.cpp's `lazy = false`:
+    /// the grammar applies from the first token.
+    lazy: Option<LazyState>,
 }
 
 impl Grammar {
@@ -133,7 +137,46 @@ impl Grammar {
             rules,
             stacks,
             partial_utf8: PartialUtf8::default(),
+            lazy: None,
         })
+    }
+
+    /// Make this grammar LAZY: it constrains nothing until one of
+    /// `triggers` matches the output.
+    ///
+    /// `llama_grammar_init_impl`'s `lazy` / `trigger_patterns` /
+    /// `trigger_tokens` arguments. See [`super::lazy`] for what the
+    /// triggers match against and what happens to the text before one.
+    ///
+    /// Refuses an empty trigger set: upstream allows it, and the result is
+    /// a grammar that can never switch on -- an unconstrained generation
+    /// that looks constrained from the outside.
+    pub fn into_lazy(mut self, triggers: LazyTriggers) -> Result<Self, GrammarError> {
+        if triggers.is_empty() {
+            return Err(GrammarError::LazyWithoutTriggers);
+        }
+        self.lazy = Some(LazyState::new(triggers));
+        Ok(self)
+    }
+
+    /// Whether this grammar waits for a trigger before it constrains.
+    pub fn is_lazy(&self) -> bool {
+        self.lazy.is_some()
+    }
+
+    /// Whether this grammar is lazy and has NOT yet been triggered, i.e.
+    /// constrains nothing right now.
+    ///
+    /// `llama_grammar::awaiting_trigger`, which is the first thing both
+    /// `llama_grammar_apply_impl` and `llama_grammar_accept_impl` test.
+    pub fn is_awaiting_trigger(&self) -> bool {
+        self.lazy.as_ref().is_some_and(LazyState::awaiting)
+    }
+
+    /// The output accumulated while awaiting a trigger. Empty once one has
+    /// fired, and for a grammar that is not lazy.
+    pub fn trigger_buffer(&self) -> &[u8] {
+        self.lazy.as_ref().map_or(&[], LazyState::buffer)
     }
 
     /// The compiled rule table.
@@ -156,8 +199,14 @@ impl Grammar {
     ///
     /// `llama_grammar_apply_impl`'s `allow_eog`. An empty stack is a
     /// finished parse.
+    ///
+    /// A lazy grammar that has not triggered allows it unconditionally:
+    /// upstream's `awaiting_trigger` early-return sits *above* both the
+    /// `allow_eog` mask and the abort in `llama_grammar_accept_impl`, so
+    /// an untriggered grammar has no opinion about ending. It has not been
+    /// applied; a generation that never calls a tool must be able to stop.
     pub fn allows_eog(&self) -> bool {
-        self.stacks.iter().any(|s| s.is_empty())
+        self.is_awaiting_trigger() || self.stacks.iter().any(|s| s.is_empty())
     }
 
     /// True when no parse is viable at all. Reaching this means a token was
@@ -216,7 +265,33 @@ impl Grammar {
     /// **id** and ignores the piece entirely, which is how a grammar can
     /// require a specific special token whose text is unreachable through
     /// its characters.
+    ///
+    /// While a lazy grammar is awaiting its trigger this does NOT advance
+    /// the parse: the token goes to the trigger buffer instead, and the
+    /// grammar is fed only once a trigger fires, and only from where it
+    /// says. That dispatch lives here, on the one accept path, rather than
+    /// in a lazy-aware twin of it.
     pub fn accept_token(&mut self, token: u32, piece: &[u8]) -> Result<(), GrammarError> {
+        if self.is_awaiting_trigger() {
+            let step = match self.lazy.as_mut() {
+                Some(lazy) => lazy.observe(token, piece)?,
+                None => return Err(GrammarError::Internal("lazy state vanished mid-accept")),
+            };
+            let replay = match step {
+                TriggerStep::Awaiting => return Ok(()),
+                TriggerStep::Fired(replay) => replay,
+            };
+            for (tok, piece) in replay {
+                self.accept_token_now(tok, &piece)?;
+            }
+            return Ok(());
+        }
+        self.accept_token_now(token, piece)
+    }
+
+    /// `llama_grammar_accept_token`: the acceptance itself, with no
+    /// trigger check. The replay above is upstream's direct call to it.
+    fn accept_token_now(&mut self, token: u32, piece: &[u8]) -> Result<(), GrammarError> {
         let (code_points, partial) = decode_piece(piece, self.partial_utf8);
         let chars = &code_points[..code_points.len() - 1];
 
@@ -275,6 +350,13 @@ impl Grammar {
     /// The EOG branch of `llama_grammar_accept_impl`, which aborts if no
     /// stack is empty. Here it is a refusal: EOG at a point where the
     /// grammar is unsatisfied means the mask let it through.
+    ///
+    /// Upstream's EOG branch sits *below* the `awaiting_trigger` check, so
+    /// an untriggered lazy grammar never reaches it: an EOG token is
+    /// buffered like any other. A caller that has the token's piece --
+    /// [`crate::grammar_sampler::GrammarSampler`] does -- must therefore
+    /// send it to [`Self::accept_token`] while [`Self::is_awaiting_trigger`],
+    /// not here.
     pub fn accept_eog(&mut self) -> Result<(), GrammarError> {
         if self.allows_eog() {
             Ok(())

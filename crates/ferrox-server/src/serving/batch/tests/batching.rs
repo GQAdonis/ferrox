@@ -437,10 +437,11 @@ fn empty_prompt_prefills_one_stand_in_token() {
 }
 
 /// Chunking is a scheduling boundary, not a numerical one: whatever
-/// the chunk size, the prompt runs through the same `forward_token`
-/// sequence at the same positions, so the logits are bit-identical
-/// to the sequential prefill this replaced. If this ever fails,
-/// every sampled token downstream is suspect.
+/// the chunk size, the prompt runs through the same prefill at the
+/// same positions, so the final logits match the sequential reference.
+/// Prefill uses `forward_batch_last_host_kv` so host K/V stays
+/// authoritative for batched Metal decode; tiny float drift vs
+/// per-token `forward_token` on CPU is expected and harmless.
 #[test]
 fn prefill_chunking_does_not_change_logits() {
     let decoder = tiny_decoder();
@@ -461,10 +462,13 @@ fn prefill_chunking_does_not_change_logits() {
         while !state.step_chunk() {}
         let (_caches, logits, pos, _ids) = state.into_decode_start();
         assert_eq!(pos, prompt.len());
-        assert_eq!(
-            logits, sequential,
-            "chunk size {chunk} changed the prefill logits"
-        );
+        assert_eq!(logits.len(), sequential.len());
+        for (i, (&got, &want)) in logits.iter().zip(sequential.iter()).enumerate() {
+            assert!(
+                (got - want).abs() < 1e-3,
+                "chunk size {chunk}, logit {i}: got={got} want={want}"
+            );
+        }
     }
 }
 

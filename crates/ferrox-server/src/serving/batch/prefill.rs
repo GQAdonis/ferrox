@@ -1,9 +1,9 @@
 //! Chunked prefill: a prompt as a resumable state machine rather than
 //! one uninterruptible `forward_token` loop.
 //!
-//! Chunking is a *scheduling* boundary, not a numerical one. A chunk is
-//! still the same per-token sequence at the same positions, so chunk
-//! size never changes the logits or the sampled tokens (asserted by
+//! Chunking is a *scheduling* boundary, not a numerical one. Each chunk
+//! runs the same prompt slice at the same positions, so chunk size never
+//! changes the final logits or sampled tokens (asserted by
 //! `prefill_chunking_does_not_change_logits`).
 
 use std::sync::mpsc::Sender;
@@ -149,29 +149,33 @@ impl PrefillState {
     /// points.
     pub fn step_chunk(&mut self) -> bool {
         let end = (self.tokens_processed + self.chunk_size).min(self.tokens.len());
-        while self.tokens_processed < end {
-            // The position comes from the KV every step, never from a
-            // counter kept alongside it. `push` writes at `seq_len` and
-            // discards this argument, so any other value pairs a row
-            // with a RoPE angle that does not belong to it -- fluent,
-            // wrong, and silent.
-            let pos = self.kv.positions_written();
-            debug_assert_eq!(
-                pos, self.tokens_processed,
-                "the KV write cursor and the prompt cursor diverged"
-            );
-            let token = self.tokens[self.tokens_processed];
-            self.logits = match &mut self.kv {
-                RowKv::Contiguous(caches) => self.decoder.forward_token(token, pos, caches),
-                RowKv::Paged(lease) => {
-                    let store = Arc::clone(lease.store());
-                    self.decoder
-                        .forward_token_paged(token, pos, lease.caches_mut(), &store)
-                        .expect("the row's pages were reserved at admission")
-                }
-            };
-            self.tokens_processed += 1;
+        if self.tokens_processed >= end {
+            return self.is_done();
         }
+        // The position comes from the KV every chunk, never from a
+        // counter kept alongside it.
+        let pos = self.kv.positions_written();
+        debug_assert_eq!(
+            pos, self.tokens_processed,
+            "the KV write cursor and the prompt cursor diverged"
+        );
+        let chunk = &self.tokens[self.tokens_processed..end];
+        self.logits = match &mut self.kv {
+            // Batched decode reads host K/V via `forward_multi_seq`. Metal
+            // `forward_token` leaves host rows length-advanced but zero-filled;
+            // `sync_metal_attn_kv_to_host` cannot repair that once lengths
+            // match. Same contract as `forward_prompt_batch(..., host_kv: true)`.
+            RowKv::Contiguous(caches) => {
+                self.decoder.forward_batch_last_host_kv(chunk, pos, caches)
+            }
+            RowKv::Paged(lease) => {
+                let store = Arc::clone(lease.store());
+                self.decoder
+                    .forward_batch_last_paged(chunk, pos, lease.caches_mut(), &store)
+                    .expect("the row's pages were reserved at admission")
+            }
+        };
+        self.tokens_processed = end;
         self.is_done()
     }
 

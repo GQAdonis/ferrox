@@ -131,11 +131,26 @@ remembering it. How work lands is written down in
 completed feature is a branch and a pull request, a defect is an issue,
 and the two are never the same artifact.
 
-| # | What |
-|---|---|
-| [#27](https://github.com/antonellof/ferrox/issues/27) | CPU decode is scheduling-bound. rayon fork-join per operation where llama.cpp parks a persistent pool on a spin barrier: ~75% of decode time at 135M, ~9% at 8B |
-| [#28](https://github.com/antonellof/ferrox/issues/28) | No `/tokenize` or `/detokenize`, so an encoder model's embedding cannot be debugged without a second tool |
-| [#29](https://github.com/antonellof/ferrox/issues/29) | A forced `tool_choice` works on 3 of the 11 wire formats ferrox already parses; the other 8 answer 501 |
+Everything open, as of 2026-09-02:
+
+| # | What | Blocked on |
+|---|---|---|
+| [#27](https://github.com/antonellof/ferrox/issues/27) | CPU decode is scheduling-bound. The persistent pool is built and opt-in behind `FERROX_CPU_POOL=spin`, token-identical to the default | A measurement. `ferrox bench --suite` under each setting, on a quiet host |
+| [#29](https://github.com/antonellof/ferrox/issues/29) | A forced `tool_choice` reaches eight of the eleven wire formats. `gemma4`, `minimax_m3` and `muse_glimmer` still answer 501 | Nothing: each refuses for a stated reason, not for effort. Reopen only with a better idea than approximating a framing |
+| [#61](https://github.com/antonellof/ferrox/issues/61) | No KV store evicts behind a sliding window, so Gemma-3-4B holds 9.1 GB where 1.6 GB would do | Splitting `KvCache::seq_len` into positions and rows first. The design and the ordered steps are in the issue |
+| [#70](https://github.com/antonellof/ferrox/issues/70) | `ferrox quantize` writes Q8_0 byte-identically to llama.cpp and refuses the rest by name | K-quant encoders with importance-weighted rounding. Steps 2 to 4 are in the issue |
+| [#82](https://github.com/antonellof/ferrox/issues/82) | Rerank scores are the head minus its pooler, so a thresholding client gets a range that never fires | A converter that keeps `bert.pooler.dense`, which ferrox can now write. Ordering is unaffected |
+
+Closed on 2026-09-02 and worth knowing about: the GGUF parser hardening
+(#24, #25, #26, #30, #31, #32), `max_tokens` reaching
+`Vec::with_capacity(usize::MAX)` (#36), every continuous-batching cache
+hit returning wrong logits (#37), the response cache serving
+unconstrained answers to grammar requests (#35) and cancelled answers as
+finished ones (#57), the Gemma numerics (#39, #40), the unigram
+tokenizer panicking per request on a short scores array (#34), the KV
+budget pricing a window no store implements (#33), `/tokenize` refusing
+for an encoder (#28), penalties never seeing the prompt (#55, #73), and
+`/v1/rerank` ranking the answering document LAST (#43, #44).
 
 ## Speed gaps against llama.cpp
 
@@ -164,7 +179,24 @@ Still open (see the Open section of
 
 ## Where the project goes next
 
-Beyond closing the measured gaps.
+This section is the reader-facing half of
+[`plans/roadmap.md`](plans/roadmap.md), which holds every open item
+ranked, and [`plans/north-star.md`](plans/north-star.md), which is the
+rule that ranks them. The plan's order is:
+
+| # | Theme |
+|---|---|
+| 1 | Fix what is wrong, and close the oracle's hole |
+| 2 | Model layer: audit, vocabulary, then split |
+| 3 | Close the 41 unaudited architectures, auditing outward |
+| 4 | Out-of-core MoE, and one large real checkpoint |
+| 5 | CPU decode scaling |
+| 6 | Hardware reach: the backend seam, then Vulkan |
+| 7 | The rest: embeddings, quants, serving, measurement |
+
+What follows is what those steps mean for someone running the engine
+rather than working on it. Where the two disagree, the plan is right and
+this is stale.
 
 1. **Run bigger models on the same hardware.** Make Qwen3 35B-A3B Q5
    usable on a box that today handles Q4, or an 8B. Most of what
@@ -214,13 +246,17 @@ Beyond closing the measured gaps.
   every call in a response rather than the first, and a reasoning
   model's chain of thought comes back as `reasoning_content`. Five of
   the eleven stream `tool_calls[].index` argument deltas.
-  `tool_choice: "required"` and a named `tool_choice` now compile a
-  *lazy* grammar (llama.cpp's `trigger_patterns`, a grammar switched on
-  partway through a response) from the request's own `tools`, on the
-  three JSON-object formats; the other eight answer 501 naming the
-  format. What is left here is those eight, argument deltas for the six
-  JSON-payload formats, and streamed tool calls on the
-  continuous-batching path
+  `tool_choice: "required"` and a named `tool_choice` compile a *lazy*
+  grammar (llama.cpp's `trigger_patterns`, a grammar switched on partway
+  through a response) from the request's own `tools`, on **eight of the
+  eleven** formats. The grammar's literals come from the same marker
+  description the parser reads with, which is what makes widening it
+  safe: two hand-kept tables, one for writing a call and one for reading
+  it, would drift into output the engine forced and could not parse
+  back. `gemma4`, `minimax_m3` and `muse_glimmer` answer 501 for stated
+  reasons rather than for effort (#29). What is left here is argument
+  deltas for the six JSON-payload formats, and streamed tool calls on
+  the continuous-batching path
 - JSON-schema constrained decoding, **done**. The GBNF engine and the
   `grammar` request field shipped on 2026-09-01, on chat, completions
   and all three decode paths; `response_format: json_schema` and

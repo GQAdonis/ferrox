@@ -178,6 +178,40 @@ pub const TOOL_MARKERS: [&str; 12] = [
     "<atem:function_calls>",
 ];
 
+/// gpt-oss's harmony framing, which is not a marker pair and so has no
+/// [`Markers`] entry: a call is a CHANNEL whose header is addressed to a
+/// function, and `<|channel|>` on its own opens an ordinary message.
+///
+/// These are the literals [`ToolCallParser::parse_harmony`] reads a call
+/// with, and they are `pub(crate)` because
+/// [`crate::tool_grammar`] WRITES a forced call from the same ones.
+/// Spelling a marker twice, once to read and once to write, is how the
+/// two halves drift.
+pub(crate) mod harmony {
+    /// Opens a channel header.
+    pub(crate) const CHANNEL_OPEN: &str = "<|channel|>";
+    /// Ends the header and opens the message body.
+    pub(crate) const MESSAGE_OPEN: &str = "<|message|>";
+    /// Ends a message body that is a tool call.
+    pub(crate) const CALL_CLOSE: &str = "<|call|>";
+    /// Every marker that ends a message body. `<|start|>` is here
+    /// because a model that forgets to close one starts the next.
+    pub(crate) const BODY_ENDS: [&str; 4] = ["<|end|>", "<|return|>", CALL_CLOSE, "<|start|>"];
+    /// The header token that addresses a message, and the namespace a
+    /// tool lives in. A header token spelled `to=functions.NAME` is what
+    /// makes a channel a call.
+    pub(crate) const RECIPIENT_KEY: &str = "to=";
+    pub(crate) const FUNCTION_NAMESPACE: &str = "functions.";
+    /// The optional constrain hint the harmony spec allows in a header
+    /// between the recipient and the message.
+    pub(crate) const CONSTRAIN: &str = "<|constrain|>";
+    /// The channels a call is written on. `parse_harmony` accepts any
+    /// channel whose header addresses a function; these two are the ones
+    /// the checkpoint is trained to use, per llama.cpp's
+    /// `common_chat_params_init_gpt_oss`.
+    pub(crate) const CHANNELS: [&str; 2] = ["commentary", "analysis"];
+}
+
 /// MiniMax-M3's namespace prefix, in front of every structural tag.
 const M3_NS: &str = "]<]minimax[>[";
 /// `M3_NS` plus `<`: where every M3 tag begins.
@@ -1160,17 +1194,20 @@ impl ToolCallParser {
         let mut normal = String::new();
         let mut calls = Vec::new();
         let mut cursor = 0usize;
-        while let Some(channel) = text[cursor..].find("<|channel|>").map(|i| i + cursor) {
-            let header_start = channel + "<|channel|>".len();
+        while let Some(channel) = text[cursor..]
+            .find(harmony::CHANNEL_OPEN)
+            .map(|i| i + cursor)
+        {
+            let header_start = channel + harmony::CHANNEL_OPEN.len();
             let Some(message) = text[header_start..]
-                .find("<|message|>")
+                .find(harmony::MESSAGE_OPEN)
                 .map(|i| i + header_start)
             else {
                 break;
             };
             let header = &text[header_start..message];
-            let body_start = message + "<|message|>".len();
-            let (end, matched) = ["<|end|>", "<|return|>", "<|call|>", "<|start|>"]
+            let body_start = message + harmony::MESSAGE_OPEN.len();
+            let (end, matched) = harmony::BODY_ENDS
                 .iter()
                 .filter_map(|marker| {
                     text[body_start..]
@@ -1181,10 +1218,11 @@ impl ToolCallParser {
                 .map(|(index, marker)| (index, Some(marker)))
                 .unwrap_or((text.len(), None));
 
-            if let Some(name) = header
-                .split_whitespace()
-                .find_map(|token| token.strip_prefix("to=functions."))
-            {
+            if let Some(name) = header.split_whitespace().find_map(|token| {
+                token
+                    .strip_prefix(harmony::RECIPIENT_KEY)?
+                    .strip_prefix(harmony::FUNCTION_NAMESPACE)
+            }) {
                 normal.push_str(&text[cursor..channel]);
                 let arguments = normalize_arguments(&text[body_start..end]);
                 if self.known(name) {
@@ -2256,17 +2294,25 @@ fn close_ledger(open: &OpenCall) -> String {
 /// `None` -- undeclared -- is a best-effort parse that keeps the text
 /// whenever it is not obviously something else.
 fn convert_declared(text: &str, declared: Option<&str>) -> Value {
+    // A declared NUMBER carries no meaning in the whitespace around it,
+    // and `str::parse` refuses it: a DeepSeek template's own layout puts
+    // a newline there (`TrimStyle::None` keeps it, because a declared
+    // STRING's spaces are the model's), and an un-trimmed `"\n3\n"`
+    // reached the tool as a string where the schema said integer. The
+    // string arms are deliberately not trimmed.
     match declared {
         Some("string") | Some("str") | Some("enum") => Value::String(text.to_string()),
         Some("integer") | Some("int") => text
+            .trim()
             .parse::<i64>()
             .map(Value::from)
             .unwrap_or_else(|_| Value::String(text.to_string())),
         Some("number") | Some("float") | Some("double") => text
+            .trim()
             .parse::<f64>()
             .map(Value::from)
             .unwrap_or_else(|_| Value::String(text.to_string())),
-        Some("boolean") | Some("bool") => Value::Bool(text.eq_ignore_ascii_case("true")),
+        Some("boolean") | Some("bool") => Value::Bool(text.trim().eq_ignore_ascii_case("true")),
         Some("object") | Some("array") => {
             serde_json::from_str(text).unwrap_or_else(|_| Value::String(text.to_string()))
         }

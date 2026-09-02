@@ -17,7 +17,7 @@
 **[CLI](docs/CLI.md)** ·
 **[API](docs/API.md)** ·
 **[Config](docs/CONFIG.md)** ·
-**[Benchmarks](benchmarks/RESULTS.md)** ·
+**[Benchmarks](benchmarks/README.md)** ·
 **[Studio UI](ui/)** ·
 **[Agents](docs/AGENTS_COOKBOOK.md)** ·
 **[Roadmap](docs/ROADMAP.md)** ·
@@ -40,12 +40,14 @@ kernels, attention and expert routing are written here, in Rust.
   K-quants, the IQ tiers, MXFP4, F16 and BF16.
 - **Drop-in for llama.cpp.** Same flags, same sampler chain in the same
   order. Tokenization is verified byte-for-byte on ten checkpoints, and
-  every number in [the speed table](benchmarks/RESULTS.md) was measured
-  against llama.cpp on the same host and the same file.
-- **OpenAI-compatible server.** Continuous batching, paged KV shared
-  across conversations, runtime model swap, resumable streams, Anthropic
-  and Responses endpoints, and speculative decoding that stays lossless
-  at any temperature. Point your existing client at it.
+  every engine number in [the speed table](benchmarks/RESULTS.md) was
+  measured against llama.cpp on the same host and the same file.
+- **OpenAI-compatible server.** On Metal, multiple concurrent clients
+  share one batched decode worker (llama.cpp slots + continuous batching,
+  on by default). Paged KV shared across conversations, runtime model
+  swap, resumable streams, Anthropic and Responses endpoints, and
+  speculative decoding that stays lossless at any temperature. Point your
+  existing client at it.
 - **Structured output, enforced per token.** A GBNF grammar, a forced
   `tool_choice`, or a tool's own `parameters` schema: a stack machine
   masks every token that would break the constraint, so an invalid
@@ -112,7 +114,8 @@ ferrox -m models/Llama-3.2-3B-Instruct-Q4_K_M.gguf \
   -p "Explain quantization in two sentences" -n 128 -dev metal -ngl all
 
 # 3. Or serve it on 127.0.0.1:8383 and point any OpenAI client at /v1.
-#    `ferrox-server` is the same server standalone, if you prefer two binaries.
+#    On Metal, continuous batching is on by default — several clients can
+#    stream in parallel. `ferrox-server` is the same server standalone.
 ferrox serve -m models/Llama-3.2-3B-Instruct-Q4_K_M.gguf -dev metal -ngl all &
 curl -s -X POST http://127.0.0.1:8383/v1/chat/completions \
   -H 'content-type: application/json' \

@@ -2,7 +2,7 @@
 
 Status: **design / in progress** (branch `fix/metal-parallel-concurrency`)
 
-Related defect: GitHub issue *(linked after creation)*
+Related defect: https://github.com/antonellof/ferrox/issues/46
 
 ## Problem
 

@@ -1188,10 +1188,11 @@ struct ChatCompletionRequest {
     ///
     /// llama.cpp's field, spelled the same way, because a client that
     /// already builds a grammar for `llama-server` should not have to
-    /// build a second one. Not an OpenAI field: OpenAI states this as
-    /// `response_format: {"type": "json_schema"}`, which needs a
-    /// schema-to-grammar converter that does not exist yet -- see
-    /// [`crate::grammar_request`], where both spellings are resolved.
+    /// build a second one. Not an OpenAI field: OpenAI states the same
+    /// constraint as `response_format: {"type": "json_schema"}`, which
+    /// is now compiled through the same grammar engine. Sending BOTH is
+    /// two constraints on one generation and is refused -- see
+    /// [`crate::grammar_request`], where every spelling is resolved.
     #[serde(default)]
     grammar: Option<String>,
 }
@@ -1491,44 +1492,22 @@ impl ChatCompletionRequest {
             ));
         }
         unsupported_sampling::refuse_logit_bias(self.logit_bias.as_ref(), "/v1/chat/completions")?;
-        // Both spellings of "constrain the output", resolved by the one
-        // function that knows the rule -- refusing `json_schema` by
-        // name, and compiling a `grammar` here so a grammar that does
-        // not parse is a 400 before any prompt is rendered. The result
-        // is thrown away and recompiled in `generation_params`, which
-        // is the only other caller: a grammar is a small parse, and one
-        // rule in two places would be two rules soon enough.
-        grammar_request::for_request(self.grammar.as_deref(), self.response_format.as_ref())?;
-        if let Some(fmt) = &self.response_format {
-            match fmt.get("type").and_then(|v| v.as_str()) {
-                Some("json_object") => {}
-                // `json_schema` never reaches here: `for_request` above
-                // refuses it with the 501 that names the missing
-                // converter, rather than the 400 this arm would give.
-                Some(other) => {
-                    return Err((
-                        StatusCode::BAD_REQUEST,
-                        Json(serde_json::json!({
-                            "error": {
-                                "message": format!(
-                                    "response_format type {other:?} is not supported (only json_object)"
-                                )
-                            }
-                        })),
-                    ));
-                }
-                None => {
-                    return Err((
-                        StatusCode::BAD_REQUEST,
-                        Json(serde_json::json!({
-                            "error": {
-                                "message": "response_format must include \"type\" (only json_object is supported)"
-                            }
-                        })),
-                    ));
-                }
-            }
-        }
+        // Every spelling of "constrain the output", resolved by the one
+        // function that knows the rule: `grammar` is compiled and a
+        // `response_format` is decided in full -- its schema converted,
+        // its unhonoured members refused by name, its unknown types
+        // refused by the type they named. Done here so all of that is a
+        // 400 before any prompt is rendered. The result is recompiled in
+        // `generation_params`, which is the only other caller: a grammar
+        // is a small parse, and one rule in two places would be two
+        // rules soon enough.
+        //
+        // Kept as ONE call rather than a second `match` on
+        // `response_format` beside it. The one that used to be here
+        // answered `json_schema` with "only json_object is supported"
+        // and had to be kept in step with the module by hand.
+        let stated_grammar =
+            grammar_request::for_request(self.grammar.as_deref(), self.response_format.as_ref())?;
         // A forced `tool_choice` is served by compiling the offered tools
         // into a grammar (`tool_grammar`). What can be checked without
         // knowing which checkpoint is loaded is checked here, so the
@@ -1555,10 +1534,17 @@ impl ChatCompletionRequest {
             }
             // Two different constraints on one generation. Serving the
             // one we happen to compile last is not answering either.
-            if self.grammar.is_some() {
+            //
+            // Asked of the RESOLVED grammar rather than of
+            // `self.grammar`: a `response_format` json_schema states one
+            // too, and a check spelled against one field would have let
+            // the other through -- `generation_params_for_template`
+            // overwrites `params.grammar` with the tool-call grammar on
+            // the strength of this refusal having happened.
+            if stated_grammar.is_some() {
                 return Err(invalid_request(
-                    "a forced tool_choice and a \"grammar\" are two different constraints on the \
-                     same generation; send one",
+                    "a forced tool_choice and a \"grammar\" or response_format \"json_schema\" \
+                     are two different constraints on the same generation; send one",
                     "tool_choice",
                 ));
             }
@@ -7770,29 +7756,87 @@ mod tests {
         assert!(req.generation_params().is_err(), "and again at params time");
     }
 
-    /// `response_format: json_schema` is refused by name, with the 501
-    /// that says which half is missing -- not the 400 that reads as
-    /// "this server does not do structured output", which is no longer
-    /// true, and not a 200 carrying unconstrained text.
+    /// `response_format: json_schema` used to be a 501 naming the
+    /// missing converter. It is served now, and the request-level
+    /// evidence is that the schema reaches `generation_params` as a
+    /// grammar -- there is exactly one place a `response_format` is
+    /// decided, so a route that validated it and then forgot to apply
+    /// it is the failure this asserts against.
     #[test]
-    fn response_format_json_schema_names_the_missing_converter() {
+    fn response_format_json_schema_becomes_the_requests_grammar() {
         let req = chat_request(serde_json::json!({
             "model": "m",
             "messages": [{"role": "user", "content": "hi"}],
             "response_format": {
                 "type": "json_schema",
-                "json_schema": {"name": "x", "schema": {"type": "object"}},
+                "json_schema": {"name": "x", "schema": {"type": "boolean"}},
+            },
+        }));
+        req.validate_supported_fields()
+            .expect("a boolean schema converts");
+        let params = req.generation_params().expect("and compiles");
+        let grammar = params.grammar.expect("the schema is the grammar");
+        let mut g = (*grammar).clone();
+        g.accept_token(0, b"true").expect("a boolean is accepted");
+        assert!(g.allows_eog(), "and completes the parse");
+        assert!(
+            !params.json_object,
+            "a schema is not the json_object character-class mask"
+        );
+    }
+
+    /// A schema the converter will not compile is a 400 naming the
+    /// keyword, at both the validation and the params seam -- never a
+    /// 500, and never a grammar that is approximately the schema.
+    #[test]
+    fn an_unconvertible_response_format_schema_is_a_400_naming_the_keyword() {
+        let req = chat_request(serde_json::json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {"name": "x", "schema": {"type": "integer", "minimum": 3}},
             },
         }));
         let (status, Json(body)) = req
             .validate_supported_fields()
-            .expect_err("not implemented yet");
-        assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
-        let message = body["error"]["message"].as_str().expect("a message");
+            .expect_err("minimum has no grammar in this port");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
         assert!(
-            message.contains("JSON schema") && message.contains("grammar"),
-            "the refusal must say what is missing: {message}"
+            body["error"]["message"]
+                .as_str()
+                .expect("a message")
+                .contains("minimum"),
+            "the refusal must name the keyword: {body}"
         );
+        assert!(req.generation_params().is_err(), "and again at params time");
+    }
+
+    /// A forced `tool_choice` and a `response_format` schema are two
+    /// constraints on one generation. The refusal used to be spelled
+    /// against `self.grammar` alone, so the schema spelling walked past
+    /// it and `generation_params_for_template` overwrote the schema's
+    /// grammar with the tool-call one.
+    #[test]
+    fn a_forced_tool_choice_and_a_schema_are_two_constraints() {
+        let req = chat_request(serde_json::json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tool_choice": "required",
+            "tools": [{
+                "type": "function",
+                "function": {"name": "f", "parameters": {"type": "object"}},
+            }],
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {"name": "x", "schema": {"type": "boolean"}},
+            },
+        }));
+        let (status, Json(body)) = req
+            .validate_supported_fields()
+            .expect_err("two constraints, one generation");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"]["param"], "tool_choice");
     }
 
     /// A chat client that omits `max_tokens` wants an answer, not

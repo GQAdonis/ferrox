@@ -294,9 +294,10 @@ pub(crate) struct CompletionRequest {
     /// GBNF, the same field and the same syntax `/v1/completions` takes.
     #[serde(default)]
     grammar: Option<String>,
-    /// Refused through the one site that refuses a JSON schema
-    /// everywhere else, so the converter that closes it has one place
-    /// to land.
+    /// upstream's bare JSON Schema, compiled to a grammar through the
+    /// one site that decides a schema everywhere else. Not a
+    /// `response_format`: llama.cpp's request has no such field, and
+    /// this one carries the schema directly.
     #[serde(default)]
     json_schema: Option<Value>,
     /// Upstream's default is `true`, and `true` is a PERMISSION to reuse
@@ -433,15 +434,6 @@ impl CompletionRequest {
             self.logit_bias.as_ref(),
             ferrox_api::routes::COMPLETION,
         )?;
-        if self.json_schema.is_some() {
-            // Routed through the single site that refuses a schema on
-            // every other surface, so the converter that closes this
-            // has one call site to land in. Its message names
-            // `response_format` because that is the OpenAI spelling;
-            // the remedy it gives -- send the equivalent `grammar` --
-            // is the same one that applies here.
-            crate::grammar_request::for_request(None, Some(&json!({"type": "json_schema"})))?;
-        }
         for option in UNSUPPORTED {
             let sent = self.extra.get(option.field);
             let asked_for_something = match sent {
@@ -470,10 +462,36 @@ impl CompletionRequest {
                  variable to serve requests that require a cold prompt",
             ));
         }
-        // Compiled here so an unparseable grammar is a 400 before any
-        // work happens.
-        crate::grammar_request::for_request(self.grammar.as_deref(), None)?;
+        // Compiled here so an unparseable grammar, or a schema with a
+        // keyword that has none, is a 400 before any work happens.
+        self.constraint()?;
         Ok(())
+    }
+
+    /// The grammar this request runs under, from either field that can
+    /// state one.
+    ///
+    /// One function, called by both [`Self::validate`] and the handler,
+    /// because the two of them disagreeing about which field wins is
+    /// exactly the shape that lets a request be validated against one
+    /// constraint and served under another.
+    ///
+    /// `grammar` and `json_schema` together are refused rather than
+    /// ranked: upstream silently prefers `grammar` and drops the schema,
+    /// which is a 200 whose answer need not match the schema the caller
+    /// sent.
+    fn constraint(&self) -> Result<Option<Arc<ferrox_models::grammar::Grammar>>, ApiError> {
+        match (&self.grammar, &self.json_schema) {
+            (Some(g), Some(_)) if !g.trim().is_empty() => Err(crate::invalid_request(
+                "a \"grammar\" and a \"json_schema\" are two different constraints on the same \
+                 generation; send one",
+                "json_schema",
+            )),
+            (_, Some(schema)) => {
+                crate::grammar_request::from_schema(schema, "json_schema").map(Some)
+            }
+            (grammar, None) => crate::grammar_request::for_request(grammar.as_deref(), None),
+        }
     }
 }
 pub(crate) async fn completion(
@@ -506,7 +524,7 @@ pub(crate) async fn completion(
         seed: req.seed(),
         stop: req.stop.clone().unwrap_or_default(),
         json_object: false,
-        grammar: crate::grammar_request::for_request(req.grammar.as_deref(), None)?,
+        grammar: req.constraint()?,
         stop_token_ids: Vec::new(),
         cancel: None,
         ignore_eos: req.ignore_eos.unwrap_or(false),
@@ -817,6 +835,87 @@ mod tests {
         stock
             .validate(false)
             .expect("every one of these asks for nothing");
+    }
+
+    /// Upstream's bare `json_schema` used to be routed into the 501 that
+    /// said the schema-to-grammar converter was missing. It is compiled
+    /// now, through the same module `response_format` goes through, and
+    /// the evidence is the machine rejecting a document the schema does.
+    #[test]
+    fn a_bare_json_schema_becomes_the_requests_grammar() {
+        let req = request(json!({
+            "prompt": "hi",
+            "json_schema": {
+                "type": "object",
+                "properties": {"ok": {"type": "boolean"}},
+                "required": ["ok"],
+                "additionalProperties": false,
+            },
+        }));
+        req.validate(false).expect("this schema converts");
+        let grammar = req
+            .constraint()
+            .expect("and compiles")
+            .expect("into a grammar");
+        let mut good = (*grammar).clone();
+        good.accept_token(0, br#"{"ok": true}"#)
+            .expect("a schema-valid document");
+        assert!(good.allows_eog(), "and it completes the parse");
+        let mut bad = (*grammar).clone();
+        assert!(
+            bad.accept_token(0, br#"{"ok": "yes""#).is_err(),
+            "a property's own type must be enforced"
+        );
+    }
+
+    /// A schema with no grammar is a 400 naming the keyword, at the same
+    /// seam an unparseable `grammar` is refused at.
+    #[test]
+    fn a_json_schema_with_no_grammar_is_a_400_naming_the_keyword() {
+        let (status, body) = request(json!({
+            "prompt": "hi",
+            "json_schema": {"type": "object", "patternProperties": {"^a": {}}},
+        }))
+        .validate(false)
+        .expect_err("patternProperties has no grammar");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(
+            body.0["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("patternProperties"),
+            "the refusal must name the keyword: {body:?}"
+        );
+    }
+
+    /// Two constraints on one generation. Upstream silently prefers
+    /// `grammar` and drops the schema, which is a 200 whose answer need
+    /// not match the schema the caller sent.
+    #[test]
+    fn a_grammar_and_a_json_schema_together_are_refused() {
+        let (status, body) = request(json!({
+            "prompt": "hi",
+            "grammar": "root ::= \"a\"",
+            "json_schema": {"type": "boolean"},
+        }))
+        .validate(false)
+        .expect_err("two constraints, one generation");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body.0["error"]["param"], "json_schema");
+
+        // Each alone is still served, so the refusal is about the pair.
+        assert!(
+            request(json!({"prompt": "hi", "grammar": "root ::= \"a\""}))
+                .constraint()
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            request(json!({"prompt": "hi", "json_schema": {"type": "boolean"}}))
+                .constraint()
+                .unwrap()
+                .is_some()
+        );
     }
 
     /// And each one refused by name the moment it asks for something.

@@ -110,10 +110,9 @@ mod tests {
     /// agree, so this golden is what the real tool writes and not just
     /// what a reference function does.
     ///
-    /// This is the whole reason the encoder multiplies by a reciprocal
-    /// and folds `amax` the way it does: an encoder that is merely
-    /// *within Q8_0's error bound* passes a tolerance test and still
-    /// writes a different file.
+    /// An encoder that is merely *within Q8_0's error bound* passes a
+    /// tolerance test and still writes a different file; this is what
+    /// catches that.
     const LLAMA_CPP_Q8_0_GOLDEN: [u8; 2 * Q8_0_BLOCK_BYTES] = [
         0xdc, 0x1f, 0x08, 0x93, 0xc7, 0x02, 0xf0, 0xa8, 0x0a, 0x46, 0x55, 0xb9, 0xe9, 0xcd, 0x7f,
         0xb4, 0x0d, 0x79, 0x4f, 0x71, 0x6a, 0xc0, 0xac, 0x6d, 0xa8, 0x51, 0x7a, 0x77, 0x2d, 0x42,
@@ -134,6 +133,63 @@ mod tests {
             got.as_slice(),
             &LLAMA_CPP_Q8_0_GOLDEN[..],
             "ferrox's Q8_0 encoder disagrees with llama.cpp's"
+        );
+    }
+
+    /// One block, as f16 bit patterns, on which `v * (1/d)` and `v / d`
+    /// round to DIFFERENT int8s -- exactly one of its 32 quants, 63
+    /// against 64.
+    ///
+    /// It exists because the obvious golden does not catch the
+    /// difference: over uniform f32 noise the two spellings agree for
+    /// at least 8192 consecutive values. Over real F16 weights they
+    /// disagree constantly -- f16's 11-bit mantissa lands on the `.5`
+    /// boundary far more often than f32's 24-bit one -- and quantizing
+    /// a 135M F16 checkpoint with the divide spelling gave a file whose
+    /// every one of 211 quantized tensors differed from
+    /// `llama-quantize`'s (9877 of token_embd's 30 MB, for instance).
+    ///
+    /// So this block is the small, checked-in stand-in for that whole
+    /// experiment. Found by scanning the same xorshift stream rounded
+    /// through f16 and scaled to where weights actually live.
+    const TIE_BLOCK_F16_BITS: [u16; Q8_0_BLOCK_ELEMS] = [
+        0xadf3, 0x247e, 0x28d0, 0x221a, 0xb017, 0x98ed, 0xa97d, 0x3010, 0xac34, 0x0c3e, 0x2cb8,
+        0x2bf9, 0xa7e5, 0xb0b8, 0x3030, 0xb00a, 0xac33, 0xac39, 0xac46, 0x2b78, 0x3007, 0xa5fe,
+        0x2feb, 0x30b2, 0x3033, 0xad15, 0xb046, 0x2cd7, 0xaff4, 0xaca6, 0x2c7c, 0xaf49,
+    ];
+
+    /// llama.cpp's bytes for [`TIE_BLOCK_F16_BITS`], from the same
+    /// harness (and again cross-checked against `ggml_quantize_chunk`).
+    const LLAMA_CPP_TIE_BLOCK_GOLDEN: [u8; Q8_0_BLOCK_BYTES] = [
+        0xc2, 0x14, 0xb0, 0x0f, 0x20, 0x0a, 0x92, 0xfe, 0xdb, 0x6d, 0xc7, 0x00, 0x3f, 0x36, 0xe5,
+        0x81, 0x71, 0x93, 0xc7, 0xc7, 0xc6, 0x32, 0x6c, 0xec, 0x6b, 0x7e, 0x71, 0xbc, 0x8d, 0x41,
+        0x95, 0xc1, 0x3c, 0x9e,
+    ];
+
+    /// The reciprocal multiply is not a micro-optimisation, it is what
+    /// llama.cpp does, and `v / d` rounds this block differently.
+    #[test]
+    fn the_scale_is_applied_as_llama_cpp_applies_it_not_as_a_division() {
+        let x: Vec<f32> = TIE_BLOCK_F16_BITS
+            .iter()
+            .map(|b| f16::from_bits(*b).to_f32())
+            .collect();
+        let mut got = Vec::new();
+        encode_row_q8_0(&x, &mut got).unwrap();
+        assert_eq!(got.as_slice(), &LLAMA_CPP_TIE_BLOCK_GOLDEN[..]);
+
+        // And the divide spelling really does differ here, so the test
+        // above is asserting something rather than restating an
+        // identity.
+        let amax = x
+            .iter()
+            .fold(0f32, |a, &b| if a > b.abs() { a } else { b.abs() });
+        let d = amax / 127.0;
+        let divided: Vec<u8> = x.iter().map(|v| ((v / d).round() as i8) as u8).collect();
+        assert_ne!(
+            divided.as_slice(),
+            &LLAMA_CPP_TIE_BLOCK_GOLDEN[2..],
+            "this block no longer distinguishes the two spellings"
         );
     }
 

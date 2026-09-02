@@ -385,8 +385,14 @@ mod tests {
         dir
     }
 
-    /// Writes a tiny but structurally real F16 GGUF: a 2-D weight, a
-    /// 1-D norm, and a tensor llama.cpp keeps at source precision.
+    /// Writes a tiny but structurally real F16 GGUF: a 2-D weight to
+    /// quantize, a 1-D tensor (the dimension rule), a 2-D norm and a
+    /// 2-D router gate (the keep-list rules).
+    ///
+    /// The norm is 2-D on purpose. A 1-D one would be kept by the
+    /// dimension rule alone, so deleting `_norm.weight` from the
+    /// keep-list would leave this test green -- which it did, until the
+    /// sabotage pass found it.
     fn write_f16_source(path: &Path) -> Vec<f32> {
         let n = 64usize;
         let values: Vec<f32> = (0..n * 2)
@@ -405,7 +411,8 @@ mod tests {
         metadata.insert("general.file_type".to_string(), GgufValue::U32(1));
 
         let w = f16_bytes(&values);
-        let norm = f16_bytes(&values[..64]);
+        let one_d = f16_bytes(&values[..64]);
+        let norm = f16_bytes(&values[..128]);
         let gate = f16_bytes(&values[..128]);
         let plan = vec![
             TensorPlan {
@@ -415,8 +422,14 @@ mod tests {
                 byte_len: w.len(),
             },
             TensorPlan {
-                name: "blk.0.attn_norm.weight".into(),
+                name: "blk.0.attn_q.bias".into(),
                 shape: vec![64],
+                dtype: GgmlType::F16,
+                byte_len: one_d.len(),
+            },
+            TensorPlan {
+                name: "blk.0.attn_norm.weight".into(),
+                shape: vec![64, 2],
                 dtype: GgmlType::F16,
                 byte_len: norm.len(),
             },
@@ -430,6 +443,7 @@ mod tests {
         let f = std::fs::File::create(path).unwrap();
         let mut wr = GgufWriter::create(BufWriter::new(f), &metadata, plan).unwrap();
         wr.write_tensor("blk.0.attn_q.weight", &w).unwrap();
+        wr.write_tensor("blk.0.attn_q.bias", &one_d).unwrap();
         wr.write_tensor("blk.0.attn_norm.weight", &norm).unwrap();
         wr.write_tensor("blk.0.ffn_gate_inp.weight", &gate).unwrap();
         wr.finish().unwrap().into_inner().unwrap();
@@ -464,15 +478,19 @@ mod tests {
         let q = out.find_tensor("blk.0.attn_q.weight").unwrap();
         assert_eq!(q.dtype, GgmlType::Q8_0);
         assert_eq!(q.shape, vec![64, 2]);
-        // The norm and the router gate are llama.cpp's keep-list.
-        assert_eq!(
-            out.find_tensor("blk.0.attn_norm.weight").unwrap().dtype,
-            GgmlType::F16
-        );
-        assert_eq!(
-            out.find_tensor("blk.0.ffn_gate_inp.weight").unwrap().dtype,
-            GgmlType::F16
-        );
+        // The 2-D norm and the router gate are llama.cpp's keep-list;
+        // the bias is the dimension rule and the not-a-weight rule.
+        for kept in [
+            "blk.0.attn_q.bias",
+            "blk.0.attn_norm.weight",
+            "blk.0.ffn_gate_inp.weight",
+        ] {
+            assert_eq!(
+                out.find_tensor(kept).unwrap().dtype,
+                GgmlType::F16,
+                "{kept} should have been kept at source precision"
+            );
+        }
 
         let back =
             ferrox_quant::dequant_q8_0(out.tensor_bytes("blk.0.attn_q.weight").unwrap()).unwrap();

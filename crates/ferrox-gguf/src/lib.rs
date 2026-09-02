@@ -271,11 +271,14 @@ impl GgmlType {
                 .iter()
                 .find(|(_, ty)| ty == named)
                 .map(|(t, _)| *t)
-                // Unreachable while every named variant has a table row,
-                // which `every_named_type_has_a_tag` asserts. A future
-                // variant added without one lands here: `u32::MAX` is
-                // not a valid ggml type, so a reader refuses the file
-                // instead of reading it as F32 (tag 0).
+                // NOT a gate -- it cannot fire today, and
+                // `every_named_type_round_trips_through_its_tag` is
+                // what keeps it that way, by walking the enum against
+                // the table. It is the total-function fallback Rust
+                // requires, and `u32::MAX` is chosen so that if a
+                // future variant is ever added without a table row the
+                // file is refused by a reader rather than read as F32
+                // (tag 0), which is what a `0` here would produce.
                 .unwrap_or(u32::MAX),
         }
     }

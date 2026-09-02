@@ -124,6 +124,21 @@ pub struct ServerArgs {
     #[arg(short = 'm', long = "model", value_name = "FILE")]
     model: Option<String>,
 
+    /// Hugging Face repo to serve, `user/repo[:QUANT]`, llama.cpp's
+    /// `-hf`.
+    ///
+    /// Downloads into the ferrox cache on first use and reuses it
+    /// after, so `-hf TheBloke/Mixtral-8x7B-Instruct-v0.1-GGUF:Q4_K_M`
+    /// is the whole command. The tag after the colon is a QUANT LABEL,
+    /// not a git revision, and it matches without regard to case.
+    #[arg(
+        long = "hf-repo",
+        visible_alias = "hf",
+        value_name = "REPO[:QUANT]",
+        conflicts_with = "model"
+    )]
+    hf_repo: Option<String>,
+
     /// IP address to listen on.
     #[arg(long, value_name = "HOST")]
     host: Option<IpAddr>,
@@ -292,6 +307,12 @@ fn rewrite_llama_style_argv(args: Vec<String>) -> Vec<String> {
             "-dev" => "--device".into(),
             "-cb" => "--cont-batching".into(),
             "-np" => "--parallel".into(),
+            // One token in llama.cpp's hand-written parser. clap sees
+            // `-h` followed by `f` and prints help, which is what
+            // `ferrox serve -hf repo:Q4_K_M` did: the flag looked
+            // absent rather than mis-spelled.
+            "-hf" => "--hf-repo".into(),
+            "-hff" => "--hf-file".into(),
             _ => arg,
         })
         .collect()
@@ -333,10 +354,61 @@ fn cli_bind_addr(args: &ServerArgs, env_addr: Option<&str>) -> Option<String> {
     Some(SocketAddr::new(host, port).to_string())
 }
 
+/// Resolves a `-hf` reference to a local path, downloading it once.
+///
+/// Progress goes to STDERR, not stdout: stdout carries the
+/// `ferrox.server.ready` line a supervising process parses, and a
+/// progress bar in the middle of it would break that contract.
+fn resolve_hf_repo(spec: &str) -> anyhow::Result<String> {
+    let hf = ferrox_models::hub::HfRef::parse(spec);
+    eprintln!(
+        "ferrox: resolving {} on the Hub{}",
+        hf.repo,
+        hf.quant
+            .as_deref()
+            .map(|q| format!(" ({q})"))
+            .unwrap_or_default()
+    );
+
+    let mut last = std::time::Instant::now();
+    let mut draw = move |done: u64, total: Option<u64>| {
+        if last.elapsed() < std::time::Duration::from_millis(200) {
+            return;
+        }
+        last = std::time::Instant::now();
+        let mib = done as f64 / 1024.0 / 1024.0;
+        match total {
+            Some(t) if t > 0 => {
+                eprint!(
+                    "\r  {mib:>9.1} MiB  {:5.1}%",
+                    (done as f64 / t as f64) * 100.0
+                )
+            }
+            _ => eprint!("\r  {mib:>9.1} MiB"),
+        }
+    };
+
+    let (path, downloaded) = hf
+        .ensure_local(&mut draw)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    if downloaded {
+        eprintln!();
+        eprintln!("ferrox: downloaded {}", path.display());
+    } else {
+        eprintln!("ferrox: using cached {}", path.display());
+    }
+    Ok(path.to_string_lossy().into_owned())
+}
+
 fn apply_cli_overrides(args: &ServerArgs) -> anyhow::Result<()> {
     if let Some(model) = &args.model {
         // SAFETY: called before the runtime starts worker threads.
         unsafe { std::env::set_var("FERROX_MODEL_PATH", model) };
+    }
+    if let Some(spec) = &args.hf_repo {
+        let path = resolve_hf_repo(spec)?;
+        // SAFETY: called before the runtime starts worker threads.
+        unsafe { std::env::set_var("FERROX_MODEL_PATH", &path) };
     }
 
     if let Some(addr) = cli_bind_addr(args, std::env::var("FERROX_ADDR").ok().as_deref()) {

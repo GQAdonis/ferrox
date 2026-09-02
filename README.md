@@ -104,7 +104,11 @@ in the CLI or the server.
 ## Quick start
 
 ```bash
+# 0. Or skip step 1 entirely: -hf is llama.cpp's, and fetches on first use.
+ferrox serve -hf bartowski/Llama-3.2-3B-Instruct-GGUF:Q4_K_M
+
 # 1. Get a model. No Python, no huggingface_hub: same syntax as `hf download`.
+#    The `:QUANT` tag works here too and picks the file for you.
 ferrox download bartowski/Llama-3.2-3B-Instruct-GGUF \
   Llama-3.2-3B-Instruct-Q4_K_M.gguf --local-dir models
 
@@ -114,7 +118,7 @@ ferrox -m models/Llama-3.2-3B-Instruct-Q4_K_M.gguf \
   -p "Explain quantization in two sentences" -n 128 -dev metal -ngl all
 
 # 3. Or serve it on 127.0.0.1:8383 and point any OpenAI client at /v1.
-#    On Metal, continuous batching is on by default — several clients can
+#    On Metal, continuous batching is on by default, so several clients can
 #    stream in parallel. `ferrox-server` is the same server standalone.
 ferrox serve -m models/Llama-3.2-3B-Instruct-Q4_K_M.gguf -dev metal -ngl all &
 curl -s -X POST http://127.0.0.1:8383/v1/chat/completions \

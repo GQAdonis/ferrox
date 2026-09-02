@@ -24,9 +24,23 @@ pub struct InferArgs {
         short = 'm',
         long = "model",
         value_name = "FILE",
-        required_unless_present = "list_devices"
+        required_unless_present_any = ["list_devices", "hf_repo"]
     )]
     pub model: Option<String>,
+
+    /// Hugging Face repo to run, `user/repo[:QUANT]`, llama.cpp's
+    /// `-hf`.
+    ///
+    /// Fetched into the ferrox cache on first use and reused after. The
+    /// tag after the colon is a QUANT LABEL, not a git revision, and it
+    /// matches without regard to case.
+    #[arg(
+        long = "hf-repo",
+        visible_alias = "hf",
+        value_name = "REPO[:QUANT]",
+        conflicts_with = "model"
+    )]
+    pub hf_repo: Option<String>,
 
     /// Prompt string. Alias of llama.cpp `-p`.
     #[arg(short = 'p', long = "prompt", default_value = "")]
@@ -1045,6 +1059,12 @@ pub fn run_infer(args: InferArgs) -> anyhow::Result<()> {
     if args.list_devices {
         print_available_devices();
         return Ok(());
+    }
+    // `-hf` resolves to a local path before anything else looks at
+    // `--model`, so the rest of this function sees one kind of input.
+    let mut args = args;
+    if let Some(spec) = args.hf_repo.clone() {
+        args.model = Some(crate::hf::resolve(&spec)?);
     }
     if args.mtp {
         anyhow::bail!(

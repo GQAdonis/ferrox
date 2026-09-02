@@ -97,6 +97,172 @@ fn with_auth(req: ureq::Request) -> ureq::Request {
 /// same repo rather than depending on the order the API happens to
 /// return. A repo with several matching quantizations is ambiguous by
 /// construction; the caller can name one exactly to be sure.
+/// Where a `-hf` download lands, and where a second run finds it
+/// already there.
+///
+/// `FERROX_CACHE`, else `$XDG_CACHE_HOME/ferrox`, else `~/.cache/ferrox`.
+/// llama.cpp does the same thing with `LLAMA_CACHE`, and for the same
+/// reason: a model fetched by `-hf` is not part of the project you are
+/// standing in, so it does not belong in `./models`.
+pub fn cache_dir() -> std::path::PathBuf {
+    if let Some(dir) = std::env::var_os("FERROX_CACHE") {
+        return std::path::PathBuf::from(dir);
+    }
+    if let Some(dir) = std::env::var_os("XDG_CACHE_HOME") {
+        return std::path::PathBuf::from(dir).join("ferrox");
+    }
+    match std::env::var_os("HOME") {
+        Some(home) => std::path::PathBuf::from(home).join(".cache").join("ferrox"),
+        // No HOME is a real case in a container. A relative path is a
+        // worse cache than an absolute one and a better failure than a
+        // panic.
+        None => std::path::PathBuf::from(".ferrox-cache"),
+    }
+}
+
+/// A `-hf` argument: `user/repo`, optionally `:QUANT`.
+///
+/// llama.cpp's spelling, so a command copied off a model card runs
+/// unchanged: `-hf TheBloke/Mixtral-8x7B-Instruct-v0.1-GGUF:Q4_K_M`.
+/// The tag after the colon is a QUANT LABEL, not a git revision, which
+/// is worth saying because the same `repo:thing` shape means a revision
+/// almost everywhere else.
+///
+/// Without a tag the pattern is every GGUF in the repo, which resolves
+/// only when there is exactly one and otherwise refuses by name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HfRef {
+    pub repo: String,
+    /// The quant label, upper-cased for reporting. Matching is
+    /// case-insensitive: repos spell it `Q4_K_M` and `q4_k_m` about
+    /// equally often, and a case-sensitive match would 404 on half of
+    /// them for a reason the user cannot see.
+    pub quant: Option<String>,
+}
+
+impl HfRef {
+    /// Splits on the LAST colon, so a repo id containing one is still
+    /// parsed the way the user meant.
+    pub fn parse(spec: &str) -> Self {
+        match spec.rsplit_once(':') {
+            Some((repo, quant)) if !repo.is_empty() && !quant.is_empty() => HfRef {
+                repo: repo.to_string(),
+                quant: Some(quant.to_ascii_uppercase()),
+            },
+            // A TRAILING colon is a typo, not a tag, and the colon is
+            // dropped rather than carried into the repo id. Keeping it
+            // sent `owner/repo:` to the Hub and came back a 404 about a
+            // repo the user can see exists.
+            Some((repo, _)) if !repo.is_empty() => HfRef {
+                repo: repo.to_string(),
+                quant: None,
+            },
+            _ => HfRef {
+                repo: spec.to_string(),
+                quant: None,
+            },
+        }
+    }
+
+    /// The filename glob this reference resolves through.
+    pub fn pattern(&self) -> String {
+        match &self.quant {
+            Some(q) => format!("*{q}*.gguf"),
+            None => "*.gguf".to_string(),
+        }
+    }
+
+    /// Resolves to one filename in the repo.
+    pub fn resolve(&self) -> Result<String, String> {
+        resolve_glob_ci(&self.repo, &self.pattern())
+    }
+}
+
+impl HfRef {
+    /// The local path this reference resolves to, downloading it into
+    /// [`cache_dir`] only when it is not already there.
+    ///
+    /// Returns `(path, downloaded)` so a caller can say "using cached"
+    /// rather than printing a progress bar that never moves.
+    pub fn ensure_local(
+        &self,
+        on_progress: &mut dyn FnMut(u64, Option<u64>),
+    ) -> Result<(std::path::PathBuf, bool), String> {
+        let filename = self.resolve()?;
+        // Under `hub/` rather than directly in the cache root, which
+        // already holds `instances/` (the running-instance registry). A
+        // repo named `instances` would otherwise land on top of it.
+        let dir = cache_dir().join("hub").join(self.repo.replace('/', "__"));
+        let path = dir.join(&filename);
+        if path.is_file() {
+            return Ok((path, false));
+        }
+        let path = fetch_to_dir_with_progress(&self.repo, &filename, &dir, on_progress)?;
+        Ok((path, true))
+    }
+}
+
+/// [`resolve_glob`], matching without regard to case.
+///
+/// Separate from `resolve_glob` rather than replacing it: the exact
+/// pattern a caller passes to `ferrox download` should mean what it
+/// says, and only the `-hf` quant tag is case-insensitive.
+pub fn resolve_glob_ci(repo: &str, pattern: &str) -> Result<String, String> {
+    let names = list_files(repo)?;
+    let lowered = pattern.to_ascii_lowercase();
+    names
+        .iter()
+        .find(|n| glob_matches(&lowered, &n.to_ascii_lowercase()))
+        .cloned()
+        .ok_or_else(|| {
+            let ggufs: Vec<&str> = names
+                .iter()
+                .filter(|n| n.to_ascii_lowercase().ends_with(".gguf"))
+                .map(String::as_str)
+                .collect();
+            if ggufs.is_empty() {
+                format!("no file in {repo} matches '{pattern}', and the repo holds no GGUF at all")
+            } else {
+                // Listing what IS there turns "no match" into an
+                // answerable question: the usual cause is a quant this
+                // repo does not publish, and the user cannot see the
+                // repo's file list from a command line.
+                format!(
+                    "no file in {repo} matches '{pattern}'. That repo publishes: {}",
+                    ggufs.join(", ")
+                )
+            }
+        })
+}
+
+/// Every root-level filename in `repo`.
+fn list_files(repo: &str) -> Result<Vec<String>, String> {
+    let url = format!("{}/api/models/{repo}", endpoint());
+    let response = with_auth(agent().get(&url))
+        .call()
+        .map_err(|e| format!("listing {repo} on the Hub failed: {e}"))?;
+    let body = response
+        .into_string()
+        .map_err(|e| format!("reading the file list for {repo}: {e}"))?;
+    let value: serde_json::Value = serde_json::from_str(&body)
+        .map_err(|e| format!("the Hub's file list for {repo} was not JSON: {e}"))?;
+    let mut names: Vec<String> = value
+        .get("siblings")
+        .and_then(|s| s.as_array())
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(|e| e.get("rfilename")?.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    names.sort();
+    // A repo may hold shards in subdirectories; a target this server
+    // can safely write is a bare name in the repo root.
+    names.retain(|n| !n.contains('/'));
+    Ok(names)
+}
+
 pub fn resolve_glob(repo: &str, pattern: &str) -> Result<String, String> {
     let url = format!("{}/api/models/{repo}", endpoint());
     let response = with_auth(agent().get(&url))
@@ -333,5 +499,77 @@ mod tests {
     fn the_endpoint_has_no_trailing_slash_to_double_up() {
         // Default, and any override, must join cleanly with "/api/...".
         assert!(!endpoint().ends_with('/'));
+    }
+}
+
+#[cfg(test)]
+mod hf_ref_tests {
+    use super::*;
+
+    /// llama.cpp's `-hf user/repo:QUANT`. The tag is a quant label, not
+    /// a git revision, which is the opposite of what `repo:thing` means
+    /// nearly everywhere else.
+    #[test]
+    fn a_quant_tag_is_split_off_and_becomes_a_glob() {
+        let r = HfRef::parse("TheBloke/Mixtral-8x7B-Instruct-v0.1-GGUF:Q4_K_M");
+        assert_eq!(r.repo, "TheBloke/Mixtral-8x7B-Instruct-v0.1-GGUF");
+        assert_eq!(r.quant.as_deref(), Some("Q4_K_M"));
+        assert_eq!(r.pattern(), "*Q4_K_M*.gguf");
+    }
+
+    /// Without a tag the whole string is the repo. Sending
+    /// `repo:Q4_K_M` to the Hub as a repo id is what produced a bare
+    /// `401`, which reads like an auth failure and is not one.
+    #[test]
+    fn a_bare_repo_keeps_its_whole_name_and_matches_every_gguf() {
+        let r = HfRef::parse("bartowski/Llama-3.2-3B-Instruct-GGUF");
+        assert_eq!(r.repo, "bartowski/Llama-3.2-3B-Instruct-GGUF");
+        assert_eq!(r.quant, None);
+        assert_eq!(r.pattern(), "*.gguf");
+    }
+
+    /// A trailing or leading colon is not a tag. Treating `repo:` as
+    /// "quant is empty string" would build the pattern `**.gguf` and
+    /// match a file the user did not ask for.
+    #[test]
+    fn a_degenerate_colon_is_not_a_tag() {
+        assert_eq!(HfRef::parse("owner/repo:").quant, None);
+        assert_eq!(HfRef::parse("owner/repo:").repo, "owner/repo");
+        assert_eq!(HfRef::parse(":Q4_K_M").quant, None);
+    }
+
+    /// Case-insensitive on purpose: repos spell the quant `Q4_K_M` and
+    /// `q4_k_m` about equally often, and a case-sensitive match would
+    /// fail on half of them for a reason invisible from a command line.
+    #[test]
+    fn a_lowercase_tag_matches_an_uppercase_filename() {
+        let r = HfRef::parse("owner/repo:q4_k_m");
+        assert_eq!(r.quant.as_deref(), Some("Q4_K_M"));
+        assert!(glob_matches(
+            &r.pattern().to_ascii_lowercase(),
+            &"SmolLM2-135M-Instruct-Q4_K_M.gguf".to_ascii_lowercase()
+        ));
+    }
+
+    /// A quant label is a substring of a longer one, so the glob must
+    /// not let `Q4_K_M` answer a request for `Q4_K`.
+    #[test]
+    fn a_tag_does_not_match_a_longer_quant_by_accident() {
+        let asked = HfRef::parse("owner/repo:Q4_K_M");
+        assert!(!glob_matches(
+            &asked.pattern().to_ascii_lowercase(),
+            &"model-Q4_K_S.gguf".to_ascii_lowercase()
+        ));
+    }
+
+    /// The cache is per repo, and under `hub/` rather than the cache
+    /// root, which already holds `instances/`.
+    #[test]
+    fn the_cache_path_is_namespaced_under_hub() {
+        let dir = cache_dir();
+        assert!(
+            !dir.as_os_str().is_empty(),
+            "a cache dir must always resolve, even with no HOME"
+        );
     }
 }

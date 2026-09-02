@@ -25,7 +25,7 @@ use crate::stop::StopMatcher;
 
 use super::batcher::ContinuousBatcher;
 use super::block_budget::BlockBudget;
-use super::config::{BatcherConfig, DecodeFn, JobResult, DEFAULT_KV_BLOCK_SIZE};
+use super::config::{BatcherConfig, BatcherEvent, DecodeFn, JobResult, DEFAULT_KV_BLOCK_SIZE};
 use super::prefill::{Prefill, PrefillState};
 use super::queue::{AbortId, AbortInbox, QueueGate};
 use super::row::{Job, RowKv, Rows, Slot};
@@ -123,7 +123,14 @@ fn budget(block_size: usize, total: Option<usize>) -> BlockBudget {
     )
 }
 
-fn test_slot(max_tokens: usize, seed: u64) -> (Slot, mpsc::Receiver<JobResult>) {
+fn finished_result(event: BatcherEvent) -> JobResult {
+    match event {
+        BatcherEvent::Finished(result) => *result,
+        BatcherEvent::Chunk(_) => panic!("expected finished event, got chunk"),
+    }
+}
+
+fn test_slot(max_tokens: usize, seed: u64) -> (Slot, mpsc::Receiver<BatcherEvent>) {
     let (tx, rx) = mpsc::channel();
     let params = greedy_params(max_tokens, seed);
     (
@@ -166,7 +173,7 @@ fn cancellable_params(max_tokens: usize, seed: u64) -> (GenerationParams, Cancel
     (params, token)
 }
 
-fn abortable_job(abort: AbortId, prompt: Vec<usize>) -> (Job, mpsc::Receiver<JobResult>) {
+fn abortable_job(abort: AbortId, prompt: Vec<usize>) -> (Job, mpsc::Receiver<BatcherEvent>) {
     let (tx, rx) = mpsc::channel();
     (
         Job {

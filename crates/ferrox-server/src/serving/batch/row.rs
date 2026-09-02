@@ -17,7 +17,7 @@ use crate::sample_step::SampleState;
 use crate::stop::StopMatcher;
 
 use super::block_budget::BlockBudget;
-use super::config::JobResult;
+use super::config::{send_finished, BatcherEvent};
 use super::queue::AbortId;
 
 /// Where one batched row keeps its KV.
@@ -36,7 +36,7 @@ pub(super) struct Job {
     pub(super) prompt_tokens: Vec<usize>,
     pub(super) params: GenerationParams,
     pub(super) stop_tokens: StopTokens,
-    pub(super) reply: Sender<JobResult>,
+    pub(super) reply: Sender<BatcherEvent>,
     /// Cancellation handle for this job, from submission onwards.
     pub(super) abort: AbortId,
     /// KV blocks this job will need for its whole lifetime, computed
@@ -196,7 +196,7 @@ pub(super) struct Slot {
     pub(super) max_tokens: usize,
     pub(super) stop_tokens: StopTokens,
     pub(super) params: GenerationParams,
-    pub(super) reply: Sender<JobResult>,
+    pub(super) reply: Sender<BatcherEvent>,
     pub(super) finish: Option<FinishReason>,
     /// Set instead of an answer when this row cannot be served -- today,
     /// only a grammar it cannot continue. Kept beside `finish` rather
@@ -234,7 +234,7 @@ pub(super) fn reply_finished(mut slot: Slot) {
     // text that stops short of satisfying it is not a shorter answer to
     // that question.
     if let Some(error) = slot.error {
-        let _ = slot.reply.send(Err(error));
+        send_finished(&slot.reply, Err(error));
         return;
     }
     let finish = slot.finish.expect("only a finished row is replied to");
@@ -242,9 +242,13 @@ pub(super) fn reply_finished(mut slot: Slot) {
     // output; dropping it would truncate every answer whose tail looks
     // like the start of a stop string.
     let tail = slot.stops.flush();
-    slot.visible.push_str(&tail);
+    if !tail.is_empty() {
+        slot.visible.push_str(&tail);
+        let _ = slot.reply.send(BatcherEvent::Chunk(tail));
+    }
     let usage = Usage::new(slot.prompt_tokens, slot.generated_ids.len());
-    let _ = slot
-        .reply
-        .send(Ok((finish, slot.generated_ids, slot.visible, usage)));
+    send_finished(
+        &slot.reply,
+        Ok((finish, slot.generated_ids, slot.visible, usage)),
+    );
 }

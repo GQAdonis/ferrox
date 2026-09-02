@@ -1516,7 +1516,7 @@ async fn responses_stream(
     // Continuous batching returns one string, so there is no
     // incremental stream to ride on and the whole answer is parsed at
     // the end instead.
-    let overlap = batcher.is_none();
+    let overlap = true;
     let stats_state = Arc::clone(&state);
     let stats_request_id = request_id.clone();
 

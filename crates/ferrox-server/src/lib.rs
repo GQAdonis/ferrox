@@ -29,10 +29,8 @@
 //! Streaming scope: when `stream: true` and tools are inactive, each
 //! decoded chunk is pushed through a bounded `mpsc` channel from the
 //! blocking generate task into the SSE writer so time-to-first-byte
-//! overlaps with ongoing decode. Tool-call requests still buffer the
-//! full response first (detection needs the stop-bounded text).
-//! Continuous-batching streaming also buffers (batcher returns one
-//! string).
+//! overlaps with ongoing decode. Under continuous batching the batch
+//! worker emits the same incremental chunks as the private decode loop.
 
 mod admin;
 mod anthropic;
@@ -197,6 +195,12 @@ pub struct ServerArgs {
     )]
     no_cont_batching: bool,
 
+    /// Max concurrent sequences under continuous batching (llama.cpp
+    /// `-np`). Sets `FERROX_CB_MAX_SEQS`; implies `--cont-batching`
+    /// unless `--no-cont-batching` is set.
+    #[arg(long = "parallel", visible_alias = "np", value_name = "N")]
+    parallel: Option<usize>,
+
     /// Start even though another ferrox process is already holding a
     /// model. Off by default: two models on one box do not share it,
     /// they thrash it, and both serve slower than either would alone.
@@ -287,6 +291,7 @@ fn rewrite_llama_style_argv(args: Vec<String>) -> Vec<String> {
             "-ngl" => "--n-gpu-layers".into(),
             "-dev" => "--device".into(),
             "-cb" => "--cont-batching".into(),
+            "-np" => "--parallel".into(),
             _ => arg,
         })
         .collect()
@@ -416,12 +421,24 @@ fn apply_cli_overrides(args: &ServerArgs) -> anyhow::Result<()> {
         }
     }
 
+    if let Some(n) = args.parallel {
+        if n == 0 {
+            anyhow::bail!("--parallel must be greater than zero");
+        }
+        // SAFETY: called before the runtime starts worker threads.
+        unsafe { std::env::set_var("FERROX_CB_MAX_SEQS", n.to_string()) };
+    }
+
     if args.cont_batching {
         // SAFETY: called before the runtime starts worker threads.
         unsafe { std::env::set_var("FERROX_CONTINUOUS_BATCHING", "1") };
     } else if args.no_cont_batching {
         // SAFETY: called before the runtime starts worker threads.
         unsafe { std::env::set_var("FERROX_CONTINUOUS_BATCHING", "0") };
+    } else if args.parallel.is_some() {
+        // llama.cpp `-np` is only meaningful with continuous batching.
+        // SAFETY: called before the runtime starts worker threads.
+        unsafe { std::env::set_var("FERROX_CONTINUOUS_BATCHING", "1") };
     }
 
     Ok(())
@@ -2460,9 +2477,22 @@ fn run_generation_emit(
             if let Some(batcher) = continuous_batcher {
                 let mut tokens = m.tokenizer.encode(prompt);
                 ferrox_models::tokenizer::prepend_bos(&mut tokens, m.bos_id);
-                let (finish, _generated_ids, text, usage) =
-                    batcher.generate(tokens, params.clone(), m.stop_tokens.clone())?;
-                if !text.is_empty() {
+                let (finish, _generated_ids, text, usage) = if synthetic {
+                    batcher.generate(tokens, params.clone(), m.stop_tokens.clone())?
+                } else {
+                    batcher.generate_streaming(
+                        tokens,
+                        params.clone(),
+                        m.stop_tokens.clone(),
+                        Some(|chunk: &str| {
+                            if !chunk.is_empty() {
+                                chunks.push(chunk.to_string());
+                                emit(chunk);
+                            }
+                        }),
+                    )?
+                };
+                if !text.is_empty() && chunks.is_empty() {
                     chunks.push(text);
                 }
                 (finish, usage)
@@ -2552,7 +2582,7 @@ fn run_generation_emit(
              to serve a real model. Decoded ids -> {full:?}]"
         );
         emit(&full);
-    } else if used_batcher && !full.is_empty() {
+    } else if used_batcher && !full.is_empty() && chunks.is_empty() {
         emit(&full);
     }
 
@@ -3065,7 +3095,7 @@ async fn chat_completions_stream(
     // whole text. `crate::policy::parser::ToolCallParser` streams prefix-stable
     // argument fragments, so that reason is gone, and a coding agent
     // now watches an argument arrive instead of waiting for it.
-    let overlap = batcher.is_none();
+    let overlap = true;
 
     // Opt-in replay. Registering a buffer is also what decides whether a
     // dropped socket cancels this generation -- see `resume`'s module
@@ -4887,6 +4917,16 @@ mod tests {
             cli_bind_addr(&args, Some("127.0.0.1:8383")).as_deref(),
             Some("127.0.0.1:0")
         );
+    }
+
+    #[test]
+    fn parallel_flag_parses_and_rewrites_np() {
+        let argv = ["ferrox-server", "-np", "4"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        let args = ServerArgs::try_parse_from(rewrite_llama_style_argv(argv)).unwrap();
+        assert_eq!(args.parallel, Some(4));
     }
 
     #[test]

@@ -369,6 +369,33 @@ fn continuous_batch_stops_on_any_member_of_the_stop_set() {
     assert_eq!(usage.completion_tokens, 2);
 }
 
+/// Under continuous batching, callers can observe tokens as they are
+/// sampled rather than only in the final reply.
+#[test]
+fn batched_generate_streams_incremental_chunks() {
+    let decoder = tiny_decoder();
+    let batcher = ContinuousBatcher::spawn_with_config(
+        Arc::clone(&decoder),
+        identity_decode(),
+        BatcherConfig {
+            prefill_chunk: 1,
+            ..BatcherConfig::default()
+        },
+    );
+    let mut streamed = Vec::new();
+    let (finish, _ids, text, _usage) = batcher
+        .generate_streaming(
+            vec![1, 2, 3],
+            greedy_params(8, 4),
+            StopTokens::default(),
+            Some(|chunk: &str| streamed.push(chunk.to_string())),
+        )
+        .expect("generate");
+    assert!(matches!(finish, FinishReason::Length | FinishReason::Stop));
+    assert!(!streamed.is_empty(), "expected at least one streamed chunk");
+    assert_eq!(streamed.concat(), text);
+}
+
 /// The state machine itself: each `step_chunk` is bounded by the
 /// chunk size, is resumable, and reports done exactly once the
 /// prompt is exhausted. This is the property the whole scheduler

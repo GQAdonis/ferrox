@@ -1940,6 +1940,48 @@ pub fn swa_rope_base_follows_model(arch: &str) -> bool {
     )
 }
 
+/// True when this architecture's SWA layers inherit the model's TRAINED
+/// RoPE position scale rather than llama.cpp's
+/// `rope_freq_scale_train_swa` default of `1.0`.
+///
+/// The sibling of [`swa_rope_base_follows_model`], and deliberately NOT
+/// derived from it: llama.cpp defaults both fields
+/// (`src/llama-hparams.h:127,129`) and each architecture assigns them
+/// independently, so the two lists differ. `olmo2.cpp:13-14` and
+/// `laguna.cpp:47-48` seed the BASE from the model and then pin the
+/// SCALE to `1.0` -- laguna's own comment is "SWA uses plain RoPE (no
+/// YaRN scaling); do NOT inherit full layers 1/factor". Collapsing the
+/// two tables into one would rope those two architectures wrong in
+/// exactly the way this function exists to stop.
+///
+/// The default matters more than the list. `gemma3.cpp:11` reads only
+/// `LLM_KV_ROPE_FREQ_BASE_SWA` and never touches
+/// `rope_freq_scale_train_swa`, so Gemma-3's sliding layers rope at
+/// scale `1.0` while its full-attention layers use the trained scale --
+/// and the converter agrees, writing `rope.scaling.factor` from
+/// `rope_parameters["full_attention"]` alone (`conversion/base.py:1222`,
+/// whose own comment is "TODO: Handle sliding_attention similarly when
+/// models start implementing it").
+///
+/// Every name here is a `hparams.rope_freq_scale_train_swa =
+/// hparams.rope_freq_scale_train;` in `src/models/`, at the line given.
+pub fn swa_rope_scale_follows_model(arch: &str) -> bool {
+    matches!(
+        arch,
+        "afmoe"          // afmoe.cpp:22
+            | "cohere2"     // cohere2.cpp:10
+            | "cohere2moe"  // cohere2moe.cpp:39
+            | "dflash"      // dflash.cpp:59, :71
+            | "exaone-moe"  // exaone-moe.cpp:10
+            | "exaone4"     // exaone4.cpp:12
+            | "gemma2"      // gemma2.cpp:11
+            | "llama4"      // llama4.cpp:24
+            | "mellum"      // mellum.cpp:20
+            | "gpt-oss"     // openai-moe.cpp:14
+            | "smallthinker" // smallthinker.cpp:14
+    )
+}
+
 /// llama.cpp's `hparams.f_attention_scale`, but only when it DIFFERS
 /// from the `1/sqrt(head_dim)` every ferrox attention kernel already
 /// applies. `None` means "the kernels' own scale is already right", so

@@ -752,6 +752,16 @@ impl ModelConfig {
         // llama.cpp divides them by 4. It answered as a different model
         // with no error. Affects the long-context community rescales
         // (`*-16k`, `*-32k` Llama-2 derivatives).
+
+        // The file's own per-band factors, BEFORE any position-scaling
+        // fold. That is what a sliding layer uses on an architecture
+        // whose SWA layers do not inherit the trained scale -- llama.cpp
+        // keeps the two apart as `freq_factors` (a tensor, the same for
+        // every layer) and `freq_scale` (per layer,
+        // `llama-model.cpp:2033`), while ferrox folds them into one
+        // vector. See `config::RopeFreqs`.
+        let rope_freqs_unscaled = rope_freqs.clone();
+
         let rope_freqs = match linear_scaling_from_gguf(file, &arch) {
             None => rope_freqs,
             Some(factor) => {
@@ -811,6 +821,29 @@ impl ModelConfig {
                 }
             }
         };
+
+        // The SWA half of the split. llama.cpp defaults
+        // `rope_freq_scale_train_swa` to `1.0f`
+        // (`src/llama-hparams.h:129`) and only the architectures in
+        // `swa_rope_scale_follows_model` assign it from
+        // `rope_freq_scale_train`; `get_rope_freq_scale`
+        // (`llama-model.cpp:2033-2035`) then picks between them per
+        // layer. `gemma3.cpp` is not on that list and its converter
+        // writes the FULL-ATTENTION factor
+        // (`conversion/base.py:1222-1230`), so a Gemma-3 4B/12B/27B was
+        // rotating five layers in six at `p/8` where llama.cpp rotates
+        // at `p`.
+        //
+        // "No scaling" is spelled as an all-ones divisor vector, which
+        // is what dividing by nothing is, so the sliding layers need no
+        // second code path anywhere downstream.
+        let rope_freqs = rope_freqs.map(|full| {
+            let swa = (sliding_window.is_some()
+                && !crate::capability::swa_rope_scale_follows_model(&arch))
+            .then(|| rope_freqs_unscaled.unwrap_or_else(|| vec![1.0; full.len()]))
+            .filter(|swa| *swa != full);
+            crate::config::RopeFreqs { full, swa }
+        });
 
         // RoPE layout comes from the capability registry above (fail-
         // closed). Getting this wrong for `llama` (needs Norm) was the
@@ -2921,7 +2954,8 @@ mod tests {
         );
         let factors = cfg
             .rope_freqs
-            .expect("a YaRN checkpoint must carry rewritten per-band frequencies");
+            .expect("a YaRN checkpoint must carry rewritten per-band frequencies")
+            .full;
         assert_eq!(factors.len(), 32, "one divisor per rotation band");
         assert!(
             (factors[0] - 1.0).abs() < 1e-6,
@@ -2960,10 +2994,11 @@ mod tests {
                 ("llama.rope.scaling.factor", Kv::F32(4.0)),
             ],
         );
-        let freqs = cfg
+        let freqs = &cfg
             .rope_freqs
             .as_ref()
-            .expect("linear scaling must produce frequency factors");
+            .expect("linear scaling must produce frequency factors")
+            .full;
         assert_eq!(freqs.len(), cfg.head_dim / 2, "one factor per rotated pair");
         assert!(
             freqs.iter().all(|f| (*f - 4.0).abs() < 1e-6),
@@ -4091,6 +4126,120 @@ mod tests {
             assert_eq!(
                 cfg.attention_scale, None,
                 "{tag} must keep the kernels' own 1/sqrt(head_dim)"
+            );
+        }
+    }
+
+    /// Gemma-3's declared linear scaling reaches the FULL-ATTENTION
+    /// layers only, and the sliding ones rope unscaled.
+    ///
+    /// `gemma3.cpp:11` reads `LLM_KV_ROPE_FREQ_BASE_SWA` and nothing
+    /// else, so `rope_freq_scale_train_swa` keeps its `1.0f` default
+    /// (`src/llama-hparams.h:129`) while `get_rope_freq_scale`
+    /// (`llama-model.cpp:2033-2035`) hands the trained scale to the full
+    /// layers. The converter agrees: `conversion/base.py:1222-1230`
+    /// takes the factor from `rope_parameters["full_attention"]` and
+    /// writes nothing for the sliding half.
+    ///
+    /// ferrox folded the factor into ONE global `rope_freqs` vector, so
+    /// Gemma-3-4B/12B/27B rotated five layers in six at `p/8`.
+    #[test]
+    fn gemma3_linear_scaling_reaches_the_full_layers_and_not_the_sliding_ones() {
+        // Gemma-3-4B: 34 layers, head_dim 256, `rope_scaling: linear 8`.
+        let cfg = gemma3_config("g3_4b_rope", 34, 2560, 8, 256, Some(8.0));
+        let freqs = cfg
+            .rope_freqs
+            .as_ref()
+            .expect("declared linear scaling must produce per-band divisors");
+        assert!(
+            freqs.full.iter().all(|f| (*f - 8.0).abs() < 1e-6),
+            "full-attention layers divide every band by the trained factor: {:?}",
+            freqs.full
+        );
+        let swa = freqs
+            .swa
+            .as_ref()
+            .expect("gemma3 does not assign rope_freq_scale_train_swa, so 1.0 applies");
+        assert!(
+            swa.iter().all(|f| (*f - 1.0).abs() < 1e-6),
+            "sliding layers rope at the raw position: {swa:?}"
+        );
+        assert_eq!(swa.len(), freqs.full.len(), "one divisor per rotated pair");
+
+        // Period 6, last-dense (`capability::default_swa_layout`), so
+        // layer 5 is the full-attention one and 0..=4 slide. The phase
+        // matters: getting it wrong swaps which five-sixths are wrong.
+        assert!(cfg.layer_sliding_window(0).is_some());
+        assert!(cfg.layer_sliding_window(5).is_none());
+        assert_eq!(cfg.layer_rope_freqs(0), Some(&[1.0f32; 128][..]));
+        assert_eq!(cfg.layer_rope_freqs(5), Some(&[8.0f32; 128][..]));
+        assert_eq!(cfg.layer_rope_theta(0), 10_000.0);
+        assert_eq!(cfg.layer_rope_theta(5), 1_000_000.0);
+        assert!(
+            cfg.rope_freqs_vary_by_layer(),
+            "the fused Metal stacks take one divisor slice for a whole run \
+             and so must refuse this model"
+        );
+
+        // Gemma-3-1B declares no scaling at all -- the audited fixture,
+        // and the reason this was invisible. Nothing to split, so no
+        // per-layer set and no Metal refusal.
+        let plain = gemma3_config("g3_1b_rope", 26, 1152, 4, 256, None);
+        assert!(plain.rope_freqs.is_none());
+        assert!(!plain.rope_freqs_vary_by_layer());
+    }
+
+    /// Gemma-2 is the counter-case, and it is why the SWA scale needs
+    /// its own table rather than reusing `swa_rope_base_follows_model`.
+    ///
+    /// `gemma2.cpp:10-11` assigns BOTH `rope_freq_base_train_swa` and
+    /// `rope_freq_scale_train_swa` from the model's trained values, so
+    /// its sliding layers keep the declared scaling. Splitting them here
+    /// would be the same bug pointed the other way.
+    #[test]
+    fn gemma2_sliding_layers_inherit_the_trained_rope_scale() {
+        let cfg = ModelConfig::from_gguf(&open_metadata_gguf(
+            "g2_rope",
+            &[
+                ("general.architecture", Kv::Str("gemma2")),
+                ("gemma2.block_count", Kv::U32(26)),
+                ("gemma2.embedding_length", Kv::U32(2304)),
+                ("gemma2.attention.head_count", Kv::U32(8)),
+                ("gemma2.attention.head_count_kv", Kv::U32(4)),
+                ("gemma2.attention.key_length", Kv::U32(256)),
+                ("gemma2.attention.value_length", Kv::U32(256)),
+                ("gemma2.rope.freq_base", Kv::F32(10_000.0)),
+                ("gemma2.attention.sliding_window", Kv::U32(4096)),
+                ("gemma2.rope.scaling.type", Kv::Str("linear")),
+                ("gemma2.rope.scaling.factor", Kv::F32(8.0)),
+            ],
+        ))
+        .expect("gemma2 fixture must load");
+
+        let freqs = cfg.rope_freqs.as_ref().expect("linear scaling declared");
+        assert_eq!(
+            freqs.swa, None,
+            "gemma2.cpp:11 assigns rope_freq_scale_train_swa from the trained scale"
+        );
+        assert!(!cfg.rope_freqs_vary_by_layer());
+        // Period 2, last-dense: layer 0 slides, layer 1 does not, and
+        // both get the same divisors.
+        assert!(cfg.layer_sliding_window(0).is_some());
+        assert!(cfg.layer_sliding_window(1).is_none());
+        assert_eq!(cfg.layer_rope_freqs(0), cfg.layer_rope_freqs(1));
+
+        // The two tables really are different: this is the pair that
+        // must not be collapsed into one.
+        assert!(crate::capability::swa_rope_scale_follows_model("gemma2"));
+        assert!(!crate::capability::swa_rope_scale_follows_model("gemma3"));
+        for arch in ["olmo2", "laguna"] {
+            assert!(
+                crate::capability::swa_rope_base_follows_model(arch),
+                "{arch} seeds the SWA base from the model"
+            );
+            assert!(
+                !crate::capability::swa_rope_scale_follows_model(arch),
+                "{arch} pins the SWA scale to 1.0 (olmo2.cpp:14, laguna.cpp:48)"
             );
         }
     }

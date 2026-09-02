@@ -14,31 +14,152 @@
 //! KV-prefix cache (reusing the shared prefix of two *different*
 //! prompts) is a separate, larger piece of work, tracked separately.
 
-use crate::generate::{FinishReason, Usage};
+use crate::generate::{FinishReason, GenerationParams, Usage};
+use ferrox_models::grammar::Grammar;
 use ferrox_models::sampling::SamplingParams;
 use std::collections::{HashMap, VecDeque};
 use std::hash::{Hash, Hasher};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CacheKey {
     pub model: String,
     pub prompt: String,
-    pub max_tokens: usize,
-    /// Every sampling parameter that affects output. See
-    /// [`SamplingKey`] for why it is a struct built by one function
-    /// rather than a handful of fields written out here.
+    /// Every resolved generation parameter that decides the answer.
+    /// See [`GenerationKey`] for why it is a struct built by one
+    /// function rather than a handful of fields written out here.
+    pub generation: GenerationKey,
+    /// The seed **as the request spelled it**, not the resolved one.
     ///
-    /// Only requests with a deterministic outcome -- greedy
-    /// (temperature 0) or an explicit seed -- are ever looked up against
-    /// this cache at all; see `ChatCompletionRequest::is_cacheable`. A
-    /// request without a deterministic outcome must never populate or
-    /// read this cache, since a "hit" would silently replay one random
-    /// sample forever instead of producing fresh output each call,
-    /// defeating the entire point of sampling.
-    pub sampling: SamplingKey,
+    /// [`GenerationParams::seed`] is already resolved, and for a request
+    /// that named no seed that resolution is a nanosecond clock reading
+    /// (`ChatCompletionRequest::resolved_seed`). Keying on it would make
+    /// every greedy request a fresh key and switch this cache off
+    /// entirely, so the request's own `Option` is what is keyed here.
+    ///
+    /// That is sound only because of what is allowed in at all: only
+    /// requests with a deterministic outcome -- greedy (temperature 0)
+    /// or an explicit seed -- are ever looked up against this cache;
+    /// see `ChatCompletionRequest::is_cacheable`. A request without a
+    /// deterministic outcome must never populate or read this cache,
+    /// since a "hit" would silently replay one random sample forever
+    /// instead of producing fresh output each call, defeating the
+    /// entire point of sampling. Greedy ignores the seed, and a seeded
+    /// request carries its seed here, so the resolved value never
+    /// distinguishes two keys that this `Option` does not.
     pub seed: Option<u64>,
+}
+
+/// Every field of a resolved [`GenerationParams`] that can change the
+/// answer, in a form that can be hashed and compared for exact
+/// equality.
+///
+/// Same reason [`SamplingKey`] exists, one layer out: the interesting
+/// property is not what is in it, it is that nothing is left out. This
+/// struct is what shipped broken. `CacheKey` used to restate a few of
+/// the request's fields by hand, so `grammar`, `json_object` and
+/// `ignore_eos` -- three things that decide the answer and change
+/// nothing about the prompt -- hashed identically to their absence, and
+/// a grammar-constrained request was served the unconstrained answer a
+/// previous caller had cached, with a 200 and no way to tell (#35).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct GenerationKey {
+    pub max_tokens: usize,
+    pub sampling: SamplingKey,
     pub stop: Vec<String>,
+    pub stop_token_ids: Vec<usize>,
+    pub json_object: bool,
+    pub grammar: Option<GrammarKey>,
+    pub ignore_eos: bool,
+}
+
+/// A compiled grammar, in a form a hashed cache key can hold.
+///
+/// [`Grammar`] is `Eq` but not `Hash`, and it belongs to
+/// `ferrox-models`, so equality here is the grammar's own -- exact and
+/// structural -- and only the hash is supplied. It is taken over the
+/// derived `Debug` rendering, which is a total dump of the same fields
+/// derived `PartialEq` compares, so equal grammars render equally and
+/// hash equally: the one law `Hash` owes `Eq`.
+///
+/// Two *different* grammars that happened to render the same would only
+/// share a hash bucket, never an entry, because `Eq` still separates
+/// them. So the failure this could produce is a slower lookup, not a
+/// wrong answer.
+///
+/// The rendering is transient -- built inside `hash` and dropped there
+/// -- so a large schema-derived grammar costs a hash rather than a
+/// second copy of itself in every cache key.
+#[derive(Debug, Clone)]
+pub struct GrammarKey(pub Arc<Grammar>);
+
+impl PartialEq for GrammarKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.0 == other.0
+    }
+}
+
+impl Eq for GrammarKey {}
+
+impl Hash for GrammarKey {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        format!("{:?}", self.0).hash(state);
+    }
+}
+
+/// The cache-key form of a resolved generation configuration.
+///
+/// The destructure below is exhaustive ON PURPOSE, for the same reason
+/// [`sampling_key`]'s is: a field added to `GenerationParams` stops this
+/// crate compiling, HERE, until someone decides whether it belongs in
+/// the cache key. Two of the nine fields are deliberately NOT keyed and
+/// each says why at its `_` binding -- an exclusion on the record is a
+/// decision; a field nobody looked at is the bug in #35.
+pub fn generation_key(params: &GenerationParams) -> GenerationKey {
+    let GenerationParams {
+        max_tokens,
+        sampling,
+        // NOT KEYED. The resolved seed is a clock reading for any
+        // request that named none, which would give every greedy
+        // request a unique key. `CacheKey::seed` carries the request's
+        // own `Option<u64>` instead, and its doc comment argues why the
+        // two never disagree about which answers may be shared.
+        seed: _,
+        stop,
+        stop_token_ids,
+        json_object,
+        grammar,
+        // NOT KEYED. A cancel token is this request's own handle, not a
+        // parameter of the answer: two identical requests hold two
+        // different tokens, so keying on it would give every request a
+        // unique key and switch the cache off.
+        //
+        // Cancellation does change what comes back -- a `Cancelled`
+        // partial -- but it is `None` on the only path that reaches
+        // this key: `chat_completions_full` registers no token (the
+        // STREAMING handler is the one that does, and it does not
+        // cache). If that ever changes, the guard belongs on the PUT,
+        // as "do not cache a partial answer", and not on this key.
+        // Tracked in #57.
+        cancel: _,
+        ignore_eos,
+    } = params;
+    GenerationKey {
+        max_tokens: *max_tokens,
+        sampling: sampling_key(sampling),
+        stop: stop.clone(),
+        // Keyed even though it is EMPTY at every current call site (the
+        // ids are resolved later, by the layer holding the tokenizer).
+        // It is derived from `stop` and the model's vocabulary, both of
+        // which are already in the key, so keying it can never split
+        // two answers that are the same -- and "empty here" is a fact
+        // about today's call order, not a property of the field.
+        stop_token_ids: stop_token_ids.clone(),
+        json_object: *json_object,
+        grammar: grammar.clone().map(GrammarKey),
+        ignore_eos: *ignore_eos,
+    }
 }
 
 /// Every field of a resolved [`SamplingParams`], in a form that can be
@@ -235,14 +356,47 @@ mod tests {
     use super::*;
 
     fn key(prompt: &str) -> CacheKey {
+        key_under(prompt, |_| {})
+    }
+
+    /// A key built the way the server builds one: from
+    /// [`GenerationParams`], through [`generation_key`]. `tweak` is the
+    /// single parameter under test.
+    ///
+    /// Going through the real builder is the point. Reaching into
+    /// [`CacheKey`] and setting `generation.grammar` by hand would test
+    /// this module's `Eq`/`Hash` and nothing else -- it passes happily
+    /// against the broken key that shipped, because the broken part was
+    /// the BUILDER dropping the field on its way in.
+    fn key_under(prompt: &str, tweak: impl FnOnce(&mut GenerationParams)) -> CacheKey {
+        let mut params = params();
+        tweak(&mut params);
         CacheKey {
             model: "test-model".to_string(),
             prompt: prompt.to_string(),
-            max_tokens: 16,
-            sampling: sampling_key(&SamplingParams::default()),
+            generation: generation_key(&params),
             seed: None,
-            stop: Vec::new(),
         }
+    }
+
+    /// The `GenerationParams` these cache-mechanics tests key on: every
+    /// field at its do-nothing value.
+    fn params() -> GenerationParams {
+        GenerationParams {
+            max_tokens: 16,
+            sampling: SamplingParams::default(),
+            seed: 0,
+            stop: Vec::new(),
+            stop_token_ids: Vec::new(),
+            json_object: false,
+            grammar: None,
+            cancel: None,
+            ignore_eos: false,
+        }
+    }
+
+    fn grammar(src: &str) -> Arc<Grammar> {
+        Arc::new(Grammar::from_str_with_root(src, "root").expect("grammar"))
     }
 
     /// Wraps plain text into a `CachedCompletion` with fixed
@@ -281,10 +435,8 @@ mod tests {
     #[test]
     fn different_max_tokens_is_a_different_key_even_for_the_same_prompt() {
         let mut cache = ResponseCache::new(10, Duration::from_secs(60));
-        let mut k1 = key("same prompt");
-        k1.max_tokens = 16;
-        let mut k2 = key("same prompt");
-        k2.max_tokens = 32;
+        let k1 = key_under("same prompt", |p| p.max_tokens = 16);
+        let k2 = key_under("same prompt", |p| p.max_tokens = 32);
 
         cache.put(k1.clone(), cc("short response"));
         assert_eq!(
@@ -293,6 +445,112 @@ mod tests {
             "different max_tokens must be a cache miss even with identical prompt text"
         );
         assert_eq!(cache.get(&k1), Some(cc("short response")));
+    }
+
+    /// A grammar is a logit mask: it changes the answer and changes
+    /// nothing about the prompt. It was outside the key, so the second
+    /// request here used to be SERVED THE FIRST ONE'S UNCONSTRAINED
+    /// PROSE -- a 200 that looks like compliance with a constraint that
+    /// was never even compiled (#35).
+    ///
+    /// Asserted on the answer that comes back rather than on key
+    /// inequality, because a key that differs is only interesting if the
+    /// lookup the server performs is the one using it.
+    #[test]
+    fn a_grammar_request_is_not_served_the_unconstrained_answer() {
+        let mut cache = ResponseCache::new(10, Duration::from_secs(60));
+
+        let plain = key("same prompt");
+        cache.put(plain.clone(), cc("Sure! Here are a few options..."));
+
+        let constrained = key_under("same prompt", |p| {
+            p.grammar = Some(grammar("root ::= \"yes\" | \"no\""))
+        });
+
+        assert_eq!(
+            cache.get(&constrained),
+            None,
+            "a grammar-constrained request must not be answered with prose \
+             generated under no grammar"
+        );
+        assert_eq!(
+            cache.get(&plain),
+            Some(cc("Sure! Here are a few options...")),
+            "the unconstrained entry is still there: the miss above is the \
+             grammar, not an unstable key"
+        );
+    }
+
+    /// Two different grammars are two different constraints, so one's
+    /// answer is not the other's. The strictly-stronger half of the test
+    /// above: keying on "is there a grammar at all" would pass that one
+    /// and fail this one.
+    #[test]
+    fn two_different_grammars_do_not_share_an_answer() {
+        let mut cache = ResponseCache::new(10, Duration::from_secs(60));
+        let keyed =
+            |src: &'static str| key_under("same prompt", move |p| p.grammar = Some(grammar(src)));
+
+        let yes_no = keyed("root ::= \"yes\" | \"no\"");
+        let digits = keyed("root ::= [0-9]+");
+        cache.put(yes_no.clone(), cc("yes"));
+
+        assert_eq!(
+            cache.get(&digits),
+            None,
+            "a request constrained to digits must not be served an answer \
+             produced under a yes/no grammar"
+        );
+        assert_eq!(cache.get(&yes_no), Some(cc("yes")));
+    }
+
+    /// JSON-object mode is the other logit mask, and its failure is
+    /// louder than the grammar one: `validate_json_object_output` runs
+    /// against whatever the cache handed back, so a `json_object`
+    /// request that hit a cached prose answer got a hard 400 for a body
+    /// that would have succeeded (#35).
+    #[test]
+    fn a_json_object_request_is_not_served_the_unconstrained_answer() {
+        let mut cache = ResponseCache::new(10, Duration::from_secs(60));
+
+        let plain = key("same prompt");
+        cache.put(plain.clone(), cc("Sure! Here are a few options..."));
+
+        let json = key_under("same prompt", |p| p.json_object = true);
+
+        assert_eq!(
+            cache.get(&json),
+            None,
+            "a json_object request must not be answered with prose the JSON \
+             mask never saw"
+        );
+        assert_eq!(
+            cache.get(&plain),
+            Some(cc("Sure! Here are a few options..."))
+        );
+    }
+
+    /// `ignore_eos` suppresses the model's own end-of-generation set so
+    /// a benchmarking run produces EXACTLY `max_tokens`. Served from a
+    /// cache entry populated without it, it returns the short
+    /// EOS-terminated answer instead -- the field's one stated purpose,
+    /// defeated silently (#35).
+    #[test]
+    fn an_ignore_eos_request_is_not_served_the_eos_terminated_answer() {
+        let mut cache = ResponseCache::new(10, Duration::from_secs(60));
+
+        let stops_at_eos = key("same prompt");
+        cache.put(stops_at_eos.clone(), cc("short"));
+
+        let runs_on = key_under("same prompt", |p| p.ignore_eos = true);
+
+        assert_eq!(
+            cache.get(&runs_on),
+            None,
+            "ignore_eos must not be answered with a completion that stopped \
+             at the model's EOS"
+        );
+        assert_eq!(cache.get(&stops_at_eos), Some(cc("short")));
     }
 
     #[test]

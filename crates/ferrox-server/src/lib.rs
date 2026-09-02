@@ -1703,18 +1703,27 @@ impl ChatCompletionRequest {
         self.temperature.unwrap_or(0.0) <= 0.0 || self.seed.is_some()
     }
 
-    fn cache_key(&self, prompt: &str) -> CacheKey {
+    /// The cache key for this request under the parameters it will
+    /// actually be generated with.
+    ///
+    /// `params` is taken rather than rebuilt because the RESOLVED
+    /// parameters are the only honest thing to key on: this function
+    /// used to re-state a handful of the request's fields, complete with
+    /// its own copy of every `unwrap_or` default, and then keyed on a
+    /// configuration that was only nearly the one that ran. Three fields
+    /// of that hand-written list were simply missing (#35).
+    ///
+    /// `params` must be the ones from
+    /// [`Self::generation_params_for_template`], not
+    /// [`Self::generation_params`]: the template's end-of-turn stop and
+    /// a forced `tool_choice`'s grammar are added there, and both change
+    /// the answer.
+    fn cache_key(&self, prompt: &str, params: &GenerationParams) -> CacheKey {
         CacheKey {
             model: self.model.clone(),
             prompt: prompt.to_string(),
-            max_tokens: self.max_tokens,
-            // Off the RESOLVED params, not off the request fields: this
-            // used to re-state every `unwrap_or` default a second time,
-            // so a default changed in one place and not the other would
-            // have keyed the cache on a configuration nothing ran.
-            sampling: response_cache::sampling_key(&self.sampling_params()),
+            generation: response_cache::generation_key(params),
             seed: self.seed,
-            stop: self.effective_stop_sequences(),
         }
     }
 
@@ -2947,7 +2956,15 @@ async fn chat_completions_full(
     let template = active.generative()?.chat_template();
     let kwargs = req.resolve_template_kwargs(&template);
     let prompt = prompt_from_messages(&history, &template, &req.tools, kwargs)?;
-    let key = req.is_cacheable().then(|| req.cache_key(&prompt));
+    // Resolved BEFORE the lookup, because the constraint is part of the
+    // key: a grammar, JSON mode and `ignore_eos` all change the answer
+    // and none of them changes the prompt, so a cache consulted first
+    // would answer a constrained request with an unconstrained
+    // completion (#35). It also means an unparseable grammar is a 400
+    // for the second caller too, rather than a 200 carrying prose
+    // generated under no grammar at all.
+    let params = req.generation_params_for_template(&template, active.name())?;
+    let key = req.is_cacheable().then(|| req.cache_key(&prompt, &params));
 
     let (completion, cache_status) = if let Some(cached) = key
         .as_ref()
@@ -2956,7 +2973,6 @@ async fn chat_completions_full(
         tracing::debug!("cache hit for key {}", key.as_ref().unwrap().digest());
         (cached, "hit")
     } else {
-        let params = req.generation_params_for_template(&template, active.name())?;
         let (chunks, finish, usage) = decode_task::buffered(
             decode_task::DecodeHandles::take(&state, &active)?,
             prompt.clone(),
@@ -4989,12 +5005,22 @@ mod tests {
     /// that render chat templates (ASCII role names) do not spuriously
     /// reject their own prompt prefixes.
     fn test_model_full_byte_vocab() -> Model {
+        test_model_full_byte_vocab_with_eos(None)
+    }
+
+    /// [`test_model_full_byte_vocab`] with an end-of-generation id, so a
+    /// test can tell a turn the MODEL ended from one that merely ran out
+    /// of budget -- which is the only way `ignore_eos` is observable.
+    ///
+    /// Parameterised rather than copied: a second `Model` literal here
+    /// is one more place a field has to be remembered.
+    fn test_model_full_byte_vocab_with_eos(eos: Option<usize>) -> Model {
         let mut cfg = test_dense_fixture();
         cfg.vocab_size = 256;
         Model::Gguf(GgufModel {
             decoder: Arc::new(Decoder::new_random_small(cfg, 2, 256)),
             tokenizer: Arc::new(ServerTokenizer::Byte),
-            stop_tokens: StopTokens::default(),
+            stop_tokens: StopTokens::from_eos(eos),
             bos_id: None,
             is_synthetic: true,
             chat_template: chat_template::PromptTemplate::plain(),
@@ -7600,6 +7626,179 @@ mod tests {
         assert_eq!(second["usage"]["completion_tokens"], 3);
     }
 
+    /// The whole of #35 through the real router: a request that adds a
+    /// GRAMMAR to a body already answered without one must be generated
+    /// afresh, under that grammar.
+    ///
+    /// The cache used to be consulted before
+    /// `generation_params_for_template` had even compiled the grammar,
+    /// and the key held no trace of it, so the constrained request was
+    /// handed the previous caller's unconstrained prose with a 200. The
+    /// answer is asserted, not the key: a key that differs proves
+    /// nothing if the lookup uses something else.
+    #[tokio::test]
+    async fn a_grammar_request_is_not_answered_from_an_unconstrained_cache_entry() {
+        let app = test_app();
+        let plain = serde_json::json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "\u{1}\u{2}"}],
+            "max_tokens": 3,
+            "temperature": 0,
+        });
+
+        let first = post_json(&app, plain.clone()).await;
+        assert_eq!(first["ferrox_cache"], "miss");
+        let unconstrained = first["choices"][0]["message"]["content"]
+            .as_str()
+            .expect("content")
+            .to_string();
+
+        let mut constrained = plain.clone();
+        constrained["grammar"] = serde_json::json!("root ::= \"yes\"");
+        let second = post_json(&app, constrained).await;
+        assert_eq!(
+            second["ferrox_cache"], "miss",
+            "a grammar is part of the key, so this body has never been answered"
+        );
+        // The synthetic demo model wraps its decode in a banner, so the
+        // assertion is on the decoded text inside it: `yes` is the only
+        // string this grammar admits, and it is there.
+        let constrained_answer = second["choices"][0]["message"]["content"]
+            .as_str()
+            .expect("content")
+            .to_string();
+        assert!(
+            constrained_answer.contains("-> \"yes\"]"),
+            "the grammar must have been compiled AND applied, not skipped \
+             by a cache hit: {constrained_answer}"
+        );
+        assert_ne!(
+            constrained_answer, unconstrained,
+            "the constrained request was served the unconstrained answer"
+        );
+
+        // And the entry the first request made is still the first
+        // request's: the miss above is the grammar, not a key that
+        // fails to repeat.
+        let third = post_json(&app, plain).await;
+        assert_eq!(third["ferrox_cache"], "hit");
+        assert_eq!(third["choices"][0]["message"]["content"], unconstrained);
+    }
+
+    /// The third of #35's fields, and the one whose old failure was
+    /// LOUD: `validate_json_object_output` runs against whatever came
+    /// back, so a `json_object` request answered from a cached prose
+    /// entry got a hard 400 for a body that had never been generated
+    /// under the JSON mask at all.
+    ///
+    /// The system message is what makes this reproducible, and it is the
+    /// repo's own bug shape underneath. `inject_json_object_system_hint`
+    /// usually leaves a fingerprint in the PROMPT, which happened to
+    /// split the two keys apart -- a correctness property nothing stated
+    /// or enforced, resting on a string edit made for a different
+    /// reason. Its `!s.contains("JSON")` arm is the hole: a caller who
+    /// already says "JSON" in their own system message gets NO hint
+    /// appended, so the two requests render byte-identical prompts and
+    /// the old key could not tell them apart.
+    ///
+    /// The synthetic model emits its demo banner under either mask, so
+    /// the 400 is the same on both sides of this fix and cannot be the
+    /// assertion; the cache-level twin in `response_cache` asserts the
+    /// answer. What is asserted here is that the answer did not come
+    /// from the other request's entry.
+    #[tokio::test]
+    async fn a_json_object_request_does_not_reuse_the_unconstrained_cache_entry() {
+        let state = Arc::new(test_state(
+            test_model_full_byte_vocab(),
+            ResponseCache::new(1000, Duration::from_secs(3600)),
+        ));
+        let app = test_app_with_state(state.clone());
+        let plain = serde_json::json!({
+            "model": "m",
+            "messages": [
+                {"role": "system", "content": "Answer in JSON when it helps."},
+                {"role": "user", "content": "\u{1}\u{2}"},
+            ],
+            "max_tokens": 3,
+            "temperature": 0,
+        });
+
+        let first = post_json(&app, plain.clone()).await;
+        assert_eq!(first["ferrox_cache"], "miss");
+        assert_eq!(state.cache_stats().entries, 1);
+
+        let mut as_json = plain.clone();
+        as_json["response_format"] = serde_json::json!({"type": "json_object"});
+        let (status, _) = post_json_uri(&app, "/v1/chat/completions", as_json).await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "the demo banner is not a JSON object, whoever generated it"
+        );
+        assert_eq!(
+            state.cache_stats().hits,
+            0,
+            "a json_object request must not be answered from an entry the \
+             JSON mask never produced"
+        );
+        assert_eq!(
+            state.cache_stats().entries,
+            2,
+            "json_object must key its own entry, not reuse the unconstrained \
+             one it happens to render the same prompt as"
+        );
+    }
+
+    /// The same failure for `ignore_eos`, whose whole purpose is that a
+    /// benchmarking run produces EXACTLY `max_tokens`. Answered from a
+    /// cache entry the model's own EOS had cut short, it produced the
+    /// short answer instead -- the one outcome the field exists to rule
+    /// out (#35).
+    ///
+    /// `0x77` is the id this model greedily emits SECOND for the prompt
+    /// below, so with it as the EOS the plain request stops after one
+    /// token and the `ignore_eos` one runs the whole budget. Asserted on
+    /// the token count and the finish reason, which is where a replayed
+    /// answer shows.
+    #[tokio::test]
+    async fn an_ignore_eos_request_is_not_answered_from_a_cache_entry_that_stopped_at_eos() {
+        let app = test_app_with_state(Arc::new(test_state(
+            test_model_full_byte_vocab_with_eos(Some(0x77)),
+            ResponseCache::new(1000, Duration::from_secs(3600)),
+        )));
+        let body = serde_json::json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "\u{1}\u{2}"}],
+            "max_tokens": 6,
+            "temperature": 0,
+        });
+
+        let stopped = post_json(&app, body.clone()).await;
+        assert_eq!(stopped["ferrox_cache"], "miss");
+        assert_eq!(
+            stopped["choices"][0]["finish_reason"], "stop",
+            "the fixture is only meaningful if the model's EOS really fires here"
+        );
+        assert_eq!(stopped["usage"]["completion_tokens"], 1);
+
+        let mut ignoring = body.clone();
+        ignoring["ignore_eos"] = serde_json::json!(true);
+        let ran_on = post_json(&app, ignoring).await;
+        assert_eq!(
+            ran_on["ferrox_cache"], "miss",
+            "ignore_eos is part of the key, so this body has never been answered"
+        );
+        assert_eq!(
+            ran_on["usage"]["completion_tokens"], 6,
+            "ignore_eos must run the full budget, not replay the EOS-terminated answer"
+        );
+        assert_eq!(ran_on["choices"][0]["finish_reason"], "length");
+        assert_ne!(
+            ran_on["choices"][0]["message"]["content"],
+            stopped["choices"][0]["message"]["content"]
+        );
+    }
+
     /// The real proof for session reuse:
     /// a two-request session where the second request sends only its
     /// new message must produce exactly the same output as manually
@@ -8069,7 +8268,12 @@ mod tests {
             "messages": [{"role": "user", "content": "hi"}],
             "seed": 1,
         });
-        let baseline = chat_request(base.clone()).cache_key("prompt");
+        let key_for = |body: serde_json::Value| {
+            let req = chat_request(body);
+            let params = req.generation_params().expect("params");
+            req.cache_key("prompt", &params)
+        };
+        let baseline = key_for(base.clone());
         for (knob, value) in [
             ("temperature", serde_json::json!(0.5)),
             ("top_p", serde_json::json!(0.9)),
@@ -8082,10 +8286,59 @@ mod tests {
             let mut body = base.clone();
             body[knob] = value;
             assert_ne!(
-                chat_request(body).cache_key("prompt"),
+                key_for(body),
                 baseline,
                 "`{knob}` is not in the cache key: two requests differing \
                  only in it would share one cached answer"
+            );
+        }
+    }
+
+    /// The sampler half's twin, for the constraints. Each of these
+    /// changes the answer and changes NOTHING about the rendered
+    /// prompt, so an omission is invisible until a caller compares two
+    /// answers it never sees side by side (#35).
+    ///
+    /// `grammar` here is the wire field; `response_format:
+    /// {"type":"json_schema"}` and a forced `tool_choice` compile to a
+    /// grammar through the same `GenerationParams::grammar`, so they are
+    /// keyed by the same field being keyed at all.
+    #[test]
+    fn no_constraint_is_missing_from_the_cache_key() {
+        let base = serde_json::json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "pick one"}],
+        });
+        let key_for = |body: serde_json::Value| {
+            let req = chat_request(body);
+            let params = req.generation_params().expect("params");
+            req.cache_key("prompt", &params)
+        };
+        let baseline = key_for(base.clone());
+        for (field, value) in [
+            ("grammar", serde_json::json!("root ::= \"yes\" | \"no\"")),
+            (
+                "response_format",
+                serde_json::json!({"type": "json_object"}),
+            ),
+            (
+                "response_format",
+                serde_json::json!({"type": "json_schema", "json_schema": {
+                    "name": "answer",
+                    "schema": {"type": "object", "properties": {"a": {"type": "string"}}}
+                }}),
+            ),
+            ("ignore_eos", serde_json::json!(true)),
+            ("stop", serde_json::json!(["\n"])),
+            ("max_tokens", serde_json::json!(7)),
+        ] {
+            let mut body = base.clone();
+            body[field] = value.clone();
+            assert_ne!(
+                key_for(body),
+                baseline,
+                "`{field}: {value}` is not in the cache key: two requests \
+                 differing only in it would share one cached answer"
             );
         }
     }

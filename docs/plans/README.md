@@ -16,6 +16,14 @@ Two items are large enough to carry their own design document:
 - **[`out-of-core-moe.md`](out-of-core-moe.md)**, running a 155 GB model
   on a 32 GB machine.
 
+How work lands is written down too:
+
+- **[`contribution-workflow.md`](contribution-workflow.md)**, the rule
+  that a completed feature is a branch and a pull request, a defect is a
+  GitHub issue, and the two are never the same artifact. It also carries
+  the parallel-agent rules, whose first failure is two branches editing
+  one file.
+
 One item has a written **verdict** rather than a design:
 
 - **[`vulkan-beachhead-verdict.md`](vulkan-beachhead-verdict.md)**, the

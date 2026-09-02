@@ -167,8 +167,10 @@ Beyond closing the measured gaps.
 - The rest of the OpenAI API surface (see [`API.md`](API.md))
 - Docker images (CPU, Metal and CUDA variants)
 - Throughput measurement for concurrent continuous-batching requests
-  (Metal parallel fix shipped 0.15.2: CB auto-default, incremental
-  streaming; see [`plans/metal-parallel-concurrency.md`](plans/metal-parallel-concurrency.md))
+  (Metal parallel fix shipped 0.15.2; CB garbled-output fix and Host B
+  serving receipts in 0.15.3 — see
+  [`plans/metal-parallel-concurrency.md`](plans/metal-parallel-concurrency.md)
+  and [`benchmarks/receipts/serving/`](../benchmarks/receipts/serving/))
 - Full KV layer offload, multi-GPU, tensor parallel, PD disaggregation
 
 **KV cache and memory**

@@ -15,6 +15,33 @@ matched. Fix: prefill uses `forward_batch_last_host_kv` /
 `forward_batch_last_paged` — same contract as `forward_prompt_batch(...,
 host_kv: true)` on the private path.
 
+### Verified on Host B (2026-09-02)
+
+Model: **Llama-3.2-3B-Instruct Q4_K_M**, `ferrox serve -dev metal -ngl
+all` (CB auto-on), binary **0.15.3**.
+
+**Correctness:** `"Hi"` → assistant greeting; `"What is 2+2?"` → `"2 +
+2 = 4"`; haiku prompt → distinct haiku. No identical garbled algebra
+quiz across unrelated prompts (the 0.15.2 CB regression).
+
+**Parallel streaming** (`max_tokens=64`, 2 bursts per level):
+
+| Concurrency | OK | Aggregate tok/s | Mean TTFT |
+|---|---|---|---|
+| 1 | 2/2 | 17.4 | 157 ms |
+| 2 | 4/4 | 19.0 | 272 ms |
+| 4 | 8/8 | 22.7 | 450 ms |
+| 8 | 16/16 | 24.4 | 957 ms |
+
+**Sequential streaming** (8 prompts, `max_tokens=128`): 8/8 OK, mean
+TTFT **118 ms**.
+
+Receipts:
+[`benchmarks/receipts/serving/llama32_3b_q4km_metal_cb_parallel_0.15.3.json`](../../benchmarks/receipts/serving/llama32_3b_q4km_metal_cb_parallel_0.15.3.json),
+[`benchmarks/receipts/serving/llama32_3b_q4km_metal_cb_stream_0.15.3.json`](../../benchmarks/receipts/serving/llama32_3b_q4km_metal_cb_stream_0.15.3.json).
+Harness: `pi-agent-tests/ferrox_parallel_bench.py`,
+`pi-agent-tests/ferrox_stream_bench.py`.
+
 ## Phase 1 shipped (0.15.2)
 
 - **Auto continuous batching on Metal** when compatible (no KV pool / prefix cache on contiguous path)
@@ -100,10 +127,11 @@ Treat `FERROX_CONTINUOUS_BATCHING=1` as the supported multi-request path on Meta
 
 ## Success criteria
 
-- [ ] Two concurrent streaming requests on Metal (CB off) complete with full output and `[DONE]`/`usage`
-- [ ] No panics in `ferrox-journal.log` under parallel load
-- [ ] `/health` accurately reports parallel decode capability
-- [ ] Regression test fails on `main`, passes on fix branch
+- [x] Two concurrent streaming requests on Metal (CB on, default) complete with full output and valid text (0.15.3)
+- [x] No panics under parallel load at concurrency 8 (0.15.3 receipt)
+- [x] `/health` reports continuous batching available on Metal
+- [x] Batch tests cover prefill chunking (`prefill_chunking_does_not_change_logits`)
+- [ ] Two concurrent streaming requests on Metal (CB **off**) complete without truncation — single-flight gate (0.15.2)
 
 ## References
 

@@ -1,0 +1,32 @@
+{
+  "id": "llama32_3b_q4km",
+  "kind": "serving",
+  "workload": "stream_sequential",
+  "ferrox_version": "0.15.3",
+  "host_spec": {
+    "arch": "aarch64",
+    "cores": 10,
+    "cpu": "Apple M2 Pro",
+    "label": "Apple M2 Pro (10c/6p) macOS 26.6.1",
+    "os": "macOS 26.6.1",
+    "perf_cores": 6,
+    "ram_gb": 32.0
+  },
+  "model_path": "models/Llama-3.2-3B-Instruct-Q4_K_M.gguf",
+  "model_id": "Llama 3.2 3B Instruct",
+  "backend": "metal",
+  "continuous_batching": true,
+  "server_url": "http://localhost:8383",
+  "max_tokens": 128,
+  "runs": 8,
+  "ok": 8,
+  "failed": 0,
+  "ttft_ms_mean": 117.7,
+  "ttft_ms_min": 115.6,
+  "ttft_ms_max": 120.5,
+  "completion_tokens_total": 759,
+  "completion_tokens_mean": 94.9,
+  "driver": "pi-agent-tests/ferrox_stream_bench.py",
+  "notes": "Sequential streaming chat/completions over SSE. CB auto-on on Metal. Temperature default (not greedy). Validates 0.15.3 CB prefill fix: all prompts returned distinct, sensible text.",
+  "measured_at": "2026-09-02"
+}

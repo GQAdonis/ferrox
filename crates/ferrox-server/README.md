@@ -19,6 +19,11 @@ ferrox serve -m model.gguf -dev metal --no-cont-batching      # private path (se
 
 See [`docs/plans/metal-parallel-concurrency.md`](../../docs/plans/metal-parallel-concurrency.md).
 
+**0.15.3 serving receipt (Host B, Llama-3.2-3B Q4_K_M, CB on):** concurrency
+1→8 all OK, ~24 aggregate tok/s at 8 clients, mean TTFT ~118 ms sequential /
+~957 ms at concurrency 8. Receipts under
+[`benchmarks/receipts/serving/`](../../benchmarks/receipts/serving/).
+
 ## The web UI is a separate app
 
 This binary serves the HTTP API and nothing else. `GET /` is a 404 like

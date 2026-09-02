@@ -163,14 +163,28 @@ The evidence is llama.cpp's source and header-driven loader tests, NOT a
 logit comparison: no checkpoint of those sizes exists on the development
 host. A `ferrox parity` run against one is what would settle it.
 
-A cost came with it. Gemma-3 4B and up no longer use the fused Metal
-dense stacks, because those take one `freq_factors` slice for a whole
-run of layers and these models need one per layer. They take the
-per-layer path instead: correct, and slower. No published number
-changes: [`benchmarks/RESULTS.md`](../benchmarks/RESULTS.md) carries
-Gemma-3-1B only, and 1B is neither 27B nor rope-scaled, so it is
-untouched by both corrections. Tracked as
-[#63](https://github.com/antonellof/ferrox/issues/63).
+A cost came with it and has since been paid back. Gemma-3 4B and up
+briefly left the fused Metal dense stacks, because those took one
+`freq_factors` slice for a whole run of layers while these models need
+one per layer: correct, and slower. The stacks now carry a per-layer
+`LayerRope` holding the base and its divisors together, so supplying one
+without the other does not compile, and Gemma-3 4B+ is back on the fused
+path (#63).
+
+**That last part is proven on synthetic layers, not on a checkpoint.**
+No Gemma-3 4B/12B/27B GGUF exists on the development host, and
+Gemma-3-1B would prove nothing because it declares no rope scaling. The
+Metal tests build a two-layer stack carrying Gemma-3's two answers
+(base 1e6 divided by 8, and base 1e4 divided by 1) and assert the fused
+and per-layer launches agree bit for bit, then re-run the old bug on
+purpose so neither can pass vacuously. `ferrox layer-divergence` on a
+real gemma-3-4b, plus `ferrox parity` at Q8_0, is what would settle it.
+
+No published number changes:
+[`benchmarks/RESULTS.md`](../benchmarks/RESULTS.md) carries Gemma-3-1B
+only, and 1B is neither 27B nor rope-scaled, so it is untouched by all
+of this. The speed recovery from returning to the fused path is
+unmeasured, because measuring it needs a quiet host.
 
    `gemma2`, `gemma3`, `phi3`, `gpt-oss`, `dots1`). The other **41**
    stop with `UnauditedArchitecture`. `FERROX_ALLOW_UNAUDITED_ARCH=1`

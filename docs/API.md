@@ -64,7 +64,7 @@ conversation or a large `/v1/embeddings` batch past that comes back
 | `presence_penalty`, `frequency_penalty` | Supported |
 | `stream` | Supported (overlapped SSE when tools off and CB off) |
 | `tools` / `tool_choice: none\|auto` | Supported (prompt-engineered, parsed in eleven wire formats) |
-| `tool_choice: required` / named function | Supported on the three JSON-object wire formats (Hermes/Qwen2.5, Llama 3, Mistral), by a lazy grammar. **501 naming the format** on the other eight |
+| `tool_choice: required` / named function | Supported on **eight of the eleven** wire formats, by a lazy grammar built from the same marker description the parser reads with. **501 naming the format** on the remaining three (`gemma4`, `minimax_m3`, `muse_glimmer`), each for a reason the refusal states |
 | `logprobs` / `top_logprobs` / `n` (>1) | **Reject** |
 | `response_format: json_object` | Supported (best-effort character mask + validate) |
 | `grammar` | Supported. llama.cpp's own field: a GBNF string, enforced per token by a real parser |
@@ -1190,11 +1190,28 @@ The cost, stated: a model that never opens a call runs to `max_tokens`
 and finishes `"length"`, a visible failure rather than prose served as
 the call that was asked for.
 
-Only the three wire formats whose call is a JSON object behind a marker
-are supported: Hermes/Qwen2.5, Llama 3 and Mistral. The other eight
-return **501 naming the format**, because a Hermes-shaped grammar on a
-GLM checkpoint would force output that ferrox's own streaming parser
-cannot read back.
+**Eight of the eleven** wire formats are supported: the three whose call
+is a JSON object behind a marker (Hermes/Qwen2.5, Llama 3, Mistral),
+plus `qwen3_coder`, `glm47`, `minimax`, `deepseekv32` and `gpt_oss`.
+
+The grammar's literals are built from the SAME marker description the
+streaming parser reads with, which is the only reason this is safe to
+widen. Two hand-kept tables, one for writing a call and one for reading
+it, would drift, and the symptom would be output the engine forced and
+then could not parse back.
+
+Three still return **501 naming the format**, each for a reason the
+refusal states:
+
+- `gemma4`: arguments are a comma-separated list in gemma's own quoting
+  rather than a JSON object, so required-versus-optional cannot be said
+  by the object rule every other format shares. llama.cpp does not
+  schema-constrain gemma4 either.
+- `minimax_m3`: an argument is named by an element, and a repeated
+  element means an array, so what a name means depends on siblings that
+  have not been written yet.
+- `muse_glimmer`: the call boundary is not syntactic. The same ATEM
+  block is a call in a tool channel and prose in a user-facing one.
 
 ## Not yet
 

@@ -32,6 +32,24 @@
 //! to one alternative -- that is the whole difference, which is why they
 //! are one function and not two.
 //!
+//! # Which wire format, and where its shape comes from
+//!
+//! [`wire`] holds one root rule per family, and every literal in it is
+//! read off `ToolCallFormat::markers()` -- the SAME description
+//! [`crate::policy::parser::tool_call`] reads a call with. There is no
+//! second table of framings here: two of them, one to read a format and
+//! one to write it, is this repo's dominant bug shape, and it decays into
+//! a 200 whose forced call this server cannot parse.
+//!
+//! Eight of the eleven formats this server parses can be forced today:
+//! the three whose payload is a JSON object behind a marker
+//! (hermes/qwen2.5, llama3, mistral), the four element grammars
+//! (qwen3_coder, glm47, minimax, deepseekv32), and gpt-oss's harmony
+//! channel. The remaining three -- gemma4, minimax_m3, muse_glimmer --
+//! are refused BY FORMAT NAME with the reason, in [`wire`]'s `shape`.
+//! A forced call served with a 200 that does not parse is worse than the
+//! 501, because the caller stops checking.
+//!
 //! # Lazy, and mandatory
 //!
 //! The grammar is LAZY (see [`ferrox_models::grammar::lazy`]), triggered
@@ -56,25 +74,24 @@
 //! opening a call runs to `max_tokens` and finishes with
 //! `finish_reason: "length"`. For a caller who said `required`, a visible
 //! failure is the honest outcome; the alternative is prose served as
-//! though it were the call they asked for.
-//!
-//! # Which checkpoints this can be done for
-//!
-//! Only the wire formats whose call IS a JSON object behind a marker:
-//! Hermes/Qwen2.5, Llama 3 and Mistral ([`wire_for`]). The other eight
-//! formats this server parses spell a call as nested XML-ish elements
-//! (`<function=`, `<arg_key>`, DSML, harmony channels), and a grammar for
-//! each is a per-format job llama.cpp does in ~3000 lines of
-//! `common/chat.cpp`. Those requests are refused BY FORMAT NAME rather
-//! than served a Hermes-shaped grammar the checkpoint was never trained
-//! to emit and this server's streaming parser would not read back.
+//! though it were the call they asked for. The same cost is why the
+//! element families are forced into the WRAPPED form their template
+//! teaches (`<tool_call><function=…>`): triggering on a bare
+//! `<function=` instead would fire only after the name it introduces had
+//! already been sampled unconstrained.
+
+mod exclude;
+mod wire;
+
+#[cfg(test)]
+mod format_tests;
 
 use std::sync::Arc;
 
 use axum::http::StatusCode;
 use axum::Json;
 use ferrox_models::grammar::json_schema::GrammarBuilder;
-use ferrox_models::grammar::{Grammar, LazyTriggers};
+use ferrox_models::grammar::Grammar;
 
 use crate::policy::parser::ToolCallFormat;
 use crate::ApiError;
@@ -95,55 +112,6 @@ pub(crate) struct ToolSpec<'a> {
     pub parameters: Option<&'a serde_json::Value>,
 }
 
-/// How one wire format spells a call: a marker, a JSON object, and
-/// whatever closes it.
-///
-/// A struct rather than a `match` inside the builder because the three
-/// formats differ ONLY in these four values -- copying the builder to
-/// vary a marker is how the same grammar ends up with three slightly
-/// different bugs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Wire {
-    /// The marker that opens a call. Also the lazy grammar's trigger.
-    open: &'static str,
-    /// What closes it, or `""` for the formats that end at end-of-text.
-    close: &'static str,
-    /// Whether the call object is wrapped in a one-element JSON array.
-    array: bool,
-}
-
-/// The wire shape for a format, or a refusal naming it.
-///
-/// The three that are here are the three whose payload is a JSON object;
-/// see the module docs for why the rest are refused rather than
-/// approximated.
-fn wire_for(format: ToolCallFormat) -> Result<Wire, ApiError> {
-    match format {
-        ToolCallFormat::Qwen25 => Ok(Wire {
-            open: "<tool_call>",
-            close: "</tool_call>",
-            array: false,
-        }),
-        ToolCallFormat::Llama3 => Ok(Wire {
-            open: "<|python_tag|>",
-            close: "",
-            array: false,
-        }),
-        ToolCallFormat::Mistral => Ok(Wire {
-            open: "[TOOL_CALLS]",
-            close: "",
-            array: true,
-        }),
-        other => Err(unsupported(format!(
-            "tool_choice cannot be enforced for a {} checkpoint yet: forcing a call needs a \
-             grammar for that family's wire format, and only the marker-plus-JSON formats \
-             (hermes/qwen2.5, llama3, mistral) have one. Use tool_choice \"auto\", which asks \
-             for a call in the prompt instead of forcing one.",
-            other.as_str()
-        ))),
-    }
-}
-
 /// Build the grammar that forces `forced` over `tools`, for a checkpoint
 /// whose calls are spelled in `format`.
 pub(crate) fn build(
@@ -151,39 +119,13 @@ pub(crate) fn build(
     tools: &[ToolSpec<'_>],
     format: ToolCallFormat,
 ) -> Result<Arc<Grammar>, ApiError> {
-    let wire = wire_for(format)?;
     let chosen = select(forced, tools)?;
-
-    let mut builder = GrammarBuilder::new();
-    let mut alternatives = Vec::with_capacity(chosen.len());
     for tool in &chosen {
         check_name(tool.name)?;
-        let empty_object = serde_json::json!({
-            "type": "object",
-            "properties": {},
-            "additionalProperties": false,
-        });
-        let schema = tool.parameters.unwrap_or(&empty_object);
-        let args = builder
-            .add_schema_value(&format!("tool-{}-args", tool.name), schema)
-            .map_err(|e| schema_refused(tool.name, &e))?;
-        let body = format!(
-            r#""{{" space "\"name\"" space ":" space "\"{name}\"" space "," space "\"arguments\"" space ":" space {args} space "}}""#,
-            name = tool.name,
-        );
-        alternatives.push(builder.add_rule(&format!("tool-{}-call", tool.name), &body));
     }
 
-    let call = builder.add_rule("tool-call", &alternatives.join(" | "));
-    let payload = if wire.array {
-        builder.add_rule("tool-call-list", &format!(r#""[" space {call} space "]""#))
-    } else {
-        call
-    };
-    let mut root = format!(r#""{}" space {payload} space"#, escape(wire.open));
-    if !wire.close.is_empty() {
-        root.push_str(&format!(r#" "{}""#, escape(wire.close)));
-    }
+    let mut builder = GrammarBuilder::new();
+    let (root, triggers) = wire::build_root(&mut builder, format, &chosen)?;
     builder.add_rule("root", &root);
 
     let text = builder.finish().map_err(|e| {
@@ -194,12 +136,7 @@ pub(crate) fn build(
 
     let grammar = Grammar::from_str_with_root(&text, "root")
         .map_err(|e| internal(format!("tool-call grammar does not compile: {e}")))?
-        .into_lazy(
-            LazyTriggers::new()
-                .with_word(wire.open)
-                .map_err(|e| internal(format!("tool-call trigger does not compile: {e}")))?
-                .mandatory(),
-        )
+        .into_lazy(triggers)
         .map_err(|e| internal(format!("tool-call grammar cannot be made lazy: {e}")))?;
     Ok(Arc::new(grammar))
 }
@@ -303,6 +240,7 @@ fn internal(message: String) -> ApiError {
 
 #[cfg(test)]
 mod tests {
+    use super::format_tests::feed;
     use super::*;
     use crate::output::{parse_output, OutputPosture};
     use crate::{ToolDef, ToolFunctionDef};
@@ -323,17 +261,6 @@ mod tests {
                 parameters: Some(params),
             })
             .collect()
-    }
-
-    /// Drive `text` through the grammar the way a decode loop would, one
-    /// piece at a time, and report whether the parse is complete.
-    fn feed(grammar: &Grammar, pieces: &[&str]) -> Result<bool, String> {
-        let mut g = grammar.clone();
-        for (i, piece) in pieces.iter().enumerate() {
-            g.accept_token(i as u32, piece.as_bytes())
-                .map_err(|e| format!("piece {piece:?}: {e}"))?;
-        }
-        Ok(g.allows_eog())
     }
 
     /// The headline: the grammar accepts exactly the text this server's
@@ -476,11 +403,14 @@ mod tests {
         )
         .unwrap());
 
-        let (status, Json(body)) = build(Forced::Any, &tools, ToolCallFormat::Glm47)
-            .expect_err("glm calls are not JSON behind a marker");
+        let (status, Json(body)) = build(Forced::Any, &tools, ToolCallFormat::Gemma4)
+            .expect_err("a gemma4 call's arguments are not an object rule this can write");
         assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
         assert!(
-            body["error"]["message"].as_str().unwrap().contains("glm47"),
+            body["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("gemma4"),
             "the refusal must name the format: {body}"
         );
     }

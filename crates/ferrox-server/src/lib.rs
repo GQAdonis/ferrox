@@ -8355,16 +8355,22 @@ mod tests {
         assert_eq!(status, StatusCode::BAD_REQUEST);
 
         // A checkpoint whose wire format has no grammar yet is refused
-        // by name at params time, when the served model is known.
+        // by name at params time, when the served model is known. GLM
+        // used to stand here and is forced now; gemma4 is one of the
+        // three `tool_grammar::wire::shape` still refuses, and it says
+        // which of them and why.
         let req = tool_request(serde_json::json!("required"));
         let (status, Json(body)) =
-            match req.generation_params_for_template(&graded_template(), "GLM-4.7") {
+            match req.generation_params_for_template(&graded_template(), "Gemma4-27B") {
                 Err(e) => e,
-                Ok(_) => panic!("glm calls are not JSON behind a marker"),
+                Ok(_) => panic!("a gemma4 call's arguments are not an object rule"),
             };
         assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
         assert!(
-            body["error"]["message"].as_str().unwrap().contains("glm47"),
+            body["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("gemma4"),
             "{body}"
         );
     }

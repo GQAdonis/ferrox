@@ -488,7 +488,8 @@ fn emit(model: &str, prompt: &str, prompt_tokens: Option<usize>) -> anyhow::Resu
             };
             let heads = cache.n_kv_heads;
             let dim = cache.head_dim;
-            let seq = cache.seq_len;
+            // ROWS: `last` indexes the final resident row of k/v below.
+            let seq = cache.rows();
             let last = seq.saturating_sub(1);
             LayerProbe {
                 seq,

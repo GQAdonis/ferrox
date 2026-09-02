@@ -121,7 +121,9 @@ impl DraftModelSpeculator {
     /// this after one warm-up rather than discovering it as a wrong
     /// accept rate.
     pub fn keeps_host_kv(&self) -> bool {
-        self.kv_caches.first().is_some_and(|c| c.seq_len > 0)
+        // ROWS: the question is whether K/V actually landed in the
+        // host buffer, which a device-resident backend leaves empty.
+        self.kv_caches.first().is_some_and(|c| c.rows() > 0)
     }
 
     /// How many tokens of history this drafter's KV currently holds.
@@ -205,7 +207,9 @@ impl DraftModelSpeculator {
         // counter there truncated to 7 rows of a cache holding 0 and
         // panicked on a real Metal run. That is the same lesson as the
         // batched prefill: read the cursor, do not keep a copy of it.
-        let held = self.kv_caches.first().map_or(0, |c| c.seq_len);
+        // ROWS, for the same reason: this bounds what can be kept by
+        // what is really there, not by what the counter believes.
+        let held = self.kv_caches.first().map_or(0, |c| c.rows());
         let keep = self.synced.min(history.len() - 1).min(held);
         self.truncate_to(keep);
         self.synced = keep;
@@ -376,7 +380,8 @@ mod tests {
         d.propose(&[1, 2, 3, block.tokens()[0]], &[], 4);
 
         assert_eq!(
-            d.kv_caches[0].seq_len, d.synced,
+            d.kv_caches[0].positions(),
+            d.synced,
             "every layer's cache agrees with the drafter's own count"
         );
         assert_eq!(
@@ -395,7 +400,7 @@ mod tests {
 
         d.propose(&[1, 2], &[], 1);
         assert_eq!(d.synced, 3, "2 of history plus 1 drafted");
-        assert_eq!(d.kv_caches[0].seq_len, 3);
+        assert_eq!(d.kv_caches[0].positions(), 3);
     }
 
     /// Drafting stops when the drafter's own probability for the token

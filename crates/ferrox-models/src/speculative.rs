@@ -548,7 +548,8 @@ pub fn speculative_decode_observed<D: Drafter + ?Sized>(
     assert!(!prompt_tokens.is_empty(), "prompt must not be empty");
     for cache in kv_caches.iter() {
         assert_eq!(
-            cache.seq_len, options.start_pos,
+            cache.positions(),
+            options.start_pos,
             "start_pos must be the caches' current length: they hold exactly the \
              context preceding the prompt"
         );
@@ -673,7 +674,8 @@ pub fn speculative_decode_observed<D: Drafter + ?Sized>(
                 cache.truncate(committed_len);
             }
         }
-        debug_assert!(kv_caches.iter().all(|c| c.seq_len == committed_len));
+        // POSITIONS: `committed_len` is absolute, offset by start_pos.
+        debug_assert!(kv_caches.iter().all(|c| c.positions() == committed_len));
 
         target_hidden = batch_hidden[accepted].clone();
         pending = match replacement {
@@ -1348,7 +1350,7 @@ mod tests {
 
         let mut kv = caches(&decoder);
         decoder.forward_batch(&context, 0, &mut kv);
-        assert_eq!(kv[0].seq_len, context.len());
+        assert_eq!(kv[0].positions(), context.len());
 
         let result = speculative_decode_with(
             &decoder,
@@ -1369,7 +1371,7 @@ mod tests {
         let expected = context.len() + prompt.len() + result.tokens_generated - 1;
         for cache in kv.iter() {
             assert_eq!(
-                cache.seq_len,
+                cache.positions(),
                 expected,
                 "cache length must be absolute: context {} + prompt {} + generated {} - 1",
                 context.len(),

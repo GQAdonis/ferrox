@@ -514,7 +514,7 @@ mod tests {
         // And the KV cache state itself must match too, not just the
         // final logits (in case a later request extends even further).
         for (restored, fresh) in restored_caches.iter().zip(fresh_caches.iter()) {
-            assert_eq!(restored.seq_len, fresh.seq_len);
+            assert_eq!(restored.positions(), fresh.positions());
             for (a, b) in restored.k.iter().zip(fresh.k.iter()) {
                 assert!((a - b).abs() < 1e-3);
             }

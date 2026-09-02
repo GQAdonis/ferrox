@@ -1423,6 +1423,17 @@ struct ChatCompletionRequest {
     /// the bias honoured.
     #[serde(default)]
     logit_bias: Option<serde_json::Value>,
+    /// llama.cpp's `samplers`: the ORDER the sampler chain runs in,
+    /// either a list of names or the one `;`-separated string
+    /// `--samplers` takes.
+    ///
+    /// Read as `Value` and decided by
+    /// [`crate::unsupported_sampling::parse_sampler_order`], shared with
+    /// `/v1/completions` and `/completion`, so the three routes cannot
+    /// disagree about which samplers exist. A sampler ferrox does not
+    /// implement is refused BY NAME rather than dropped from the chain.
+    #[serde(default)]
+    samplers: Option<serde_json::Value>,
     /// A GBNF grammar every sampled token must keep parseable.
     ///
     /// llama.cpp's field, spelled the same way, because a client that
@@ -1480,8 +1491,12 @@ impl ChatCompletionRequest {
     /// `sampling_knobs`, shared with `/v1/completions`, so the two
     /// routes cannot disagree about what a knob means or which ones
     /// exist.
-    fn sampling_knobs(&self) -> SamplingKnobs {
-        SamplingKnobs {
+    ///
+    /// Fallible because `samplers` is parsed here: a chain naming a
+    /// sampler this engine does not have is a refusal, never a chain
+    /// built without it.
+    fn sampling_knobs(&self) -> Result<SamplingKnobs, ApiError> {
+        Ok(SamplingKnobs {
             temperature: self.temperature,
             top_p: self.top_p,
             min_p: self.min_p,
@@ -1493,11 +1508,15 @@ impl ChatCompletionRequest {
             // llama.cpp's native `/completion` does. See
             // `SamplingKnobs::penalty_last_n`.
             penalty_last_n: None,
-        }
+            sampler_order: unsupported_sampling::parse_sampler_order(
+                self.samplers.as_ref(),
+                "/v1/chat/completions",
+            )?,
+        })
     }
 
-    fn sampling_params(&self) -> SamplingParams {
-        self.sampling_knobs().resolve()
+    fn sampling_params(&self) -> Result<SamplingParams, ApiError> {
+        Ok(self.sampling_knobs()?.resolve())
     }
 
     fn stop_sequences(&self) -> Vec<String> {
@@ -1731,6 +1750,10 @@ impl ChatCompletionRequest {
             ));
         }
         unsupported_sampling::refuse_logit_bias(self.logit_bias.as_ref(), "/v1/chat/completions")?;
+        // Parsed here as well as in `sampling_knobs` so a bad chain is
+        // a 400/501 before any prompt is rendered. The same function
+        // both times, so there is no second opinion to drift from.
+        unsupported_sampling::parse_sampler_order(self.samplers.as_ref(), "/v1/chat/completions")?;
         // Every spelling of "constrain the output", resolved by the one
         // function that knows the rule: `grammar` is compiled and a
         // `response_format` is decided in full -- its schema converted,
@@ -1827,7 +1850,7 @@ impl ChatCompletionRequest {
     fn generation_params(&self) -> Result<GenerationParams, ApiError> {
         Ok(GenerationParams {
             max_tokens: self.max_tokens,
-            sampling: self.sampling_params(),
+            sampling: self.sampling_params()?,
             seed: self.resolved_seed(),
             stop: self.effective_stop_sequences(),
             // Resolved by `run_generation_emit`, the layer that holds a
@@ -8497,14 +8520,14 @@ mod tests {
             "messages": [{"role": "user", "content": "hi"}],
             "min_p": 0.07,
         }));
-        assert_eq!(asked.sampling_params().min_p, 0.07);
+        assert_eq!(asked.sampling_params().expect("knobs").min_p, 0.07);
 
         let silent = chat_request(serde_json::json!({
             "model": "m",
             "messages": [{"role": "user", "content": "hi"}],
         }));
         assert_eq!(
-            silent.sampling_params().min_p,
+            silent.sampling_params().expect("knobs").min_p,
             0.0,
             "an unset min_p must be off, not llama.cpp's CLI default"
         );
@@ -8539,6 +8562,10 @@ mod tests {
             ("repetition_penalty", serde_json::json!(1.1)),
             ("presence_penalty", serde_json::json!(0.3)),
             ("frequency_penalty", serde_json::json!(0.3)),
+            (
+                "samplers",
+                serde_json::json!(["penalties", "top_p", "top_k", "min_p", "temperature"]),
+            ),
         ] {
             let mut body = base.clone();
             body[knob] = value;

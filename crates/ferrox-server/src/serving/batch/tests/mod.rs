@@ -58,6 +58,7 @@ fn greedy_params(max_tokens: usize, seed: u64) -> GenerationParams {
             penalty_last_n: 64,
             presence_penalty: 0.0,
             frequency_penalty: 0.0,
+            sampler_order: ferrox_models::SamplerOrder::default(),
         },
         seed,
         stop: vec![],

@@ -158,12 +158,6 @@ const UNSUPPORTED: &[Unsupported] = &[
         0.0,
         "DRY repetition sampling is not implemented",
     ),
-    off_when_empty(
-        "samplers",
-        "the sampler chain order is fixed in this engine \
-         (penalties, then top-k, top-p and min-p, then temperature) and cannot be reordered \
-         per request",
-    ),
     off_at(
         "n_probs",
         0.0,
@@ -311,6 +305,13 @@ pub(crate) struct CompletionRequest {
     /// server keeps re-fixing.
     #[serde(default)]
     logit_bias: Option<Value>,
+    /// The ORDER the sampler chain runs in, upstream's own field.
+    /// Decided through `unsupported_sampling`, shared with both OpenAI
+    /// routes: it used to be a blanket refusal in [`UNSUPPORTED`], and
+    /// is now honoured for the samplers ferrox has and refused BY NAME
+    /// for the ones it does not.
+    #[serde(default)]
+    samplers: Option<Value>,
     #[serde(flatten)]
     extra: Map<String, Value>,
 }
@@ -389,6 +390,10 @@ impl CompletionRequest {
             presence_penalty: self.presence_penalty,
             frequency_penalty: self.frequency_penalty,
             penalty_last_n,
+            sampler_order: crate::unsupported_sampling::parse_sampler_order(
+                self.samplers.as_ref(),
+                ferrox_api::routes::COMPLETION,
+            )?,
         })
     }
 
@@ -429,9 +434,16 @@ impl CompletionRequest {
 
     /// Refuse everything this server does not implement, by name,
     /// before any prompt is tokenized.
-    fn validate(&self, has_prefix_cache: bool) -> Result<(), ApiError> {
+    pub(crate) fn validate(&self, has_prefix_cache: bool) -> Result<(), ApiError> {
         crate::unsupported_sampling::refuse_logit_bias(
             self.logit_bias.as_ref(),
+            ferrox_api::routes::COMPLETION,
+        )?;
+        // Parsed here as well as in `sampling_knobs` -- the same
+        // function both times -- so a chain naming a sampler this
+        // engine lacks is refused before any prompt is tokenized.
+        crate::unsupported_sampling::parse_sampler_order(
+            self.samplers.as_ref(),
             ferrox_api::routes::COMPLETION,
         )?;
         for option in UNSUPPORTED {
@@ -927,7 +939,6 @@ mod tests {
             ("xtc_probability", json!(0.5)),
             ("mirostat", json!(2)),
             ("dry_multiplier", json!(0.8)),
-            ("samplers", json!(["top_k", "temperature"])),
             ("n_probs", json!(5)),
             ("post_sampling_probs", json!(true)),
             ("min_keep", json!(1)),

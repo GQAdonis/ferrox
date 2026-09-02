@@ -73,6 +73,7 @@ Same via explicit subcommand: `ferrox run -m …`.
 | `--hf-file` | Exact filename inside `--hf-repo`, llama.cpp's `-hff`. Skips quant resolution entirely |
 | `--repeat-last-n` | How many recent tokens the repetition / presence / frequency penalties consider. `0` = penalties off. Default `64`, llama.cpp's (`common/common.h:238`) |
 | `-s` / `--seed` | `-1` = time-based |
+| `--samplers` / `--sampler-seq` | Order the chain runs in, semicolon-separated. A sampler ferrox lacks is refused by name, see below |
 | `--grammar` | Constrain generation to a GBNF grammar, llama.cpp's `--grammar` |
 | `--grammar-file` | Read the GBNF grammar from a file, llama.cpp's `--grammar-file` |
 | `-j` / `--json-schema` | Constrain generation to a JSON Schema, converted to GBNF. llama.cpp's `-j` |
@@ -104,6 +105,24 @@ so `--ctk f16` there is accepted, ignored, and reported as ignored by
 the startup banner. That matters for memory: f32 doubles the KV bytes
 per token, which is why a model that fits at its full context on Metal
 can need `--ctx-size auto` on CPU. `ferrox inspect-plan` prices both.
+
+`--samplers` (llama.cpp's, also `--sampler-seq`) chooses the ORDER, as a
+semicolon-separated list: `--samplers "penalties;top_k;top_p;min_p;temperature"`
+is the default spelled out. llama.cpp's aliases parse, so `top-k`,
+`nucleus`, `temp` and `typical` all work.
+
+A sampler ferrox does not implement is **refused by name with the
+reason**, never skipped: `dry`, `typ_p`, `xtc` and `top_n_sigma` are
+real llama.cpp samplers, and a caller who asked for one and silently got
+a chain without it was handed a different sampler than the one they
+requested.
+
+Order is not cosmetic, which is why it is worth exposing and why getting
+it wrong is a silent quality regression rather than an error. Each
+filter renormalises over the survivors of the last, so moving a step
+changes what the next step can see. This project shipped that bug once:
+temperature ran first, and top-p then summed probabilities temperature
+had already reshaped.
 
 **The sampler chain is llama.cpp's, in llama.cpp's order.** Penalties,
 then top-k, then top-p, then min-p, and **temperature last**

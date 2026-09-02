@@ -322,7 +322,9 @@ impl ToolCallFormat {
         matches!(self, ToolCallFormat::MuseGlimmer)
     }
 
-    fn markers(self) -> Markers {
+    /// This format's framing, the one description both the reader and
+    /// the writer of a call work from. See [`Markers`].
+    pub(crate) fn markers(self) -> Markers {
         match self {
             ToolCallFormat::Qwen25 => Markers::block("<tool_call>", "</tool_call>"),
             ToolCallFormat::Llama3 => Markers::block("<|python_tag|>", ""),
@@ -404,7 +406,10 @@ impl ToolCallFormat {
                 invoke: None,
                 param: Some(TagGrammar {
                     open: "<arg_key>",
-                    name: NameStyle::Bare,
+                    name: NameStyle::Paired {
+                        key_close: "</arg_key>",
+                        value_open: "<arg_value>",
+                    },
                     close: "</arg_value>",
                 }),
                 trim_newlines: TrimStyle::All,
@@ -414,23 +419,38 @@ impl ToolCallFormat {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-enum NameStyle {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NameStyle {
     /// The name is everything between the opener and `>`.
     Bare,
     /// The name is the `name="…"` attribute.
     Attribute,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct TagGrammar {
-    open: &'static str,
-    name: NameStyle,
-    close: &'static str,
+    /// The name is an element of its own, and the value opens in a
+    /// second element after it: GLM writes
+    /// `<arg_key>k</arg_key><arg_value>v</arg_value>`.
+    ///
+    /// A variant rather than a `param.open == "<arg_key>"` test inside
+    /// [`ToolCallParser::read_param_header`], because that test was a
+    /// second place the format was written down: everything else about
+    /// GLM lives in [`Markers`], and a reader that special-cased a
+    /// marker string is one a writer cannot derive itself from.
+    Paired {
+        /// Closes the key element.
+        key_close: &'static str,
+        /// Opens the value element. [`TagGrammar::close`] closes it.
+        value_open: &'static str,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TrimStyle {
+pub(crate) struct TagGrammar {
+    pub(crate) open: &'static str,
+    pub(crate) name: NameStyle,
+    pub(crate) close: &'static str,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TrimStyle {
     /// Values are handed over exactly as written.
     None,
     /// Strip at most one leading and one trailing newline -- the ones
@@ -442,7 +462,7 @@ enum TrimStyle {
 
 /// What a parameter the request's schema never mentioned is worth.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Undeclared {
+pub(crate) enum Undeclared {
     /// Guess from the text: a number if it reads as one, and so on.
     Loose,
     /// A string, always. muse-glimmer's template says so, and guessing
@@ -450,14 +470,21 @@ enum Undeclared {
     String,
 }
 
-#[derive(Debug, Clone, Copy)]
-struct Markers {
-    open: &'static str,
-    close: &'static str,
-    invoke: Option<TagGrammar>,
-    param: Option<TagGrammar>,
-    trim_newlines: TrimStyle,
-    undeclared: Undeclared,
+/// One format's framing, as data.
+///
+/// This is the single description of a wire format in this server: the
+/// parser reads by it, and [`crate::tool_grammar`] writes the GBNF root
+/// rule that FORCES a call from the same values. Two hand-maintained
+/// tables -- one to read a framing and one to write it -- is this
+/// repo's dominant bug shape, so there is one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Markers {
+    pub(crate) open: &'static str,
+    pub(crate) close: &'static str,
+    pub(crate) invoke: Option<TagGrammar>,
+    pub(crate) param: Option<TagGrammar>,
+    pub(crate) trim_newlines: TrimStyle,
+    pub(crate) undeclared: Undeclared,
 }
 
 impl Markers {
@@ -1002,11 +1029,13 @@ impl ToolCallParser {
     fn read_param_header(&self, start: usize, param: &TagGrammar) -> Option<(String, bool, usize)> {
         match param.name {
             // GLM writes `<arg_key>k</arg_key><arg_value>v`.
-            NameStyle::Bare if param.open == "<arg_key>" => {
+            NameStyle::Paired {
+                key_close,
+                value_open,
+            } => {
                 let key_start = start + param.open.len();
-                let key_end = self.buffer[key_start..].find("</arg_key>")? + key_start;
+                let key_end = self.buffer[key_start..].find(key_close)? + key_start;
                 let key = self.buffer[key_start..key_end].trim().to_string();
-                let value_open = "<arg_value>";
                 let value_start =
                     self.buffer[key_end..].find(value_open)? + key_end + value_open.len();
                 Some((key, false, value_start))
@@ -2253,6 +2282,9 @@ fn read_name(attrs: &str, style: NameStyle) -> Option<String> {
             (!name.is_empty()).then(|| name.to_string())
         }
         NameStyle::Attribute => read_attribute(attrs, "name"),
+        // Only a parameter tag is ever paired, and a paired parameter's
+        // key is read by `read_param_header` before this is reached.
+        NameStyle::Paired { .. } => None,
     }
 }
 

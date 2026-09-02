@@ -174,8 +174,10 @@ OpenAI-compatible HTTP API:
   `POST /v1/rerank`, scoring `[CLS] query [SEP] document [SEP]` through
   the head itself rather than through the cosine of two embeddings. Such
   a checkpoint could not load at all before: `assert_every_tensor_
-  consumed` rejected the `cls.*` tensors nobody read. End-to-end
-  ordering against a real reranker is UNVERIFIED, see issue #43
+  consumed` rejected the `cls.*` tensors nobody read. Verified end to
+  end against `ms-marco-MiniLM-L6-v2`: the order matches a HuggingFace
+  reference, which needed the document to be segment 1 rather than
+  llama.cpp's all-zero token types
 - Anthropic Messages: `POST /v1/messages` streaming and buffered
   (thinking and tool blocks, protocol-native `ping` keepalive) plus
   `POST /v1/messages/count_tokens`

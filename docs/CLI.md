@@ -465,6 +465,39 @@ and would hand a swapped-in tensor another tensor's repacked bytes.
 Cost is one forward pass per tensor: about two minutes for a 1B model's
 112 tensors at 16 prompt tokens. `--layers 0:4` restricts the sweep.
 
+## Quantize (`ferrox quantize`)
+
+Writes a `Q8_0` GGUF from an F32/F16/BF16 one, and **refuses every other
+target by name**.
+
+```bash
+ferrox quantize model-f16.gguf model-q8_0.gguf --type q8_0
+```
+
+That refusal is the point rather than a limitation to apologise for.
+ferrox READS every quant kind it runs and until now could write only
+one, so evaluating it against llama.cpp side by side meant installing
+llama.cpp to produce the file ferrox then reads. A `quantize` whose name
+implied llama.cpp's whole range while emitting Q8_0 for everything would
+be worse than the gap: a K-quant encoder that takes min and max over a
+block, where llama.cpp does an iterative scale and min fit, produces a
+file that loads and generates measurably worse text.
+
+The output is **byte-identical to `llama_model_quantize()`**: 272 of 272
+tensors on `SmolLM2-135M-Instruct-f16`, same metadata, same size. Which
+tensors are quantized is transcribed from llama.cpp's
+`tensor_allows_quantization` rather than reinvented: everything 2-D
+ending in `weight`, except norms, router gates, position and token-type
+embeddings, SSM and shortconv kernels, RWKV time-mix, T5 position bias,
+multimodal patch tables and audio codebooks. `token_embd.weight` and
+`output.weight` ARE quantized here, because the arm that lifts the
+output head to Q6_K in other mixes is gated on the target not being
+Q8_0.
+
+K-quants, the IQ tiers, MXFP4 and imatrix are not implemented, and each
+is refused by name rather than approximated. Tracked as
+[#70](https://github.com/antonellof/ferrox/issues/70).
+
 ## Hugging Face Hub (`download`, `pull`)
 
 Fetches a GGUF over HTTPS directly. No Python and no

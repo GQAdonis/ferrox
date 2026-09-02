@@ -539,9 +539,16 @@ impl ModelConfig {
     }
 
     /// True when the sliding layers need different per-band divisors
-    /// from the full-attention ones, so a fused launch taking ONE
-    /// `freq_factors` buffer for a whole run of layers cannot serve this
-    /// model.
+    /// from the full-attention ones, i.e. when one `freq_factors` slice
+    /// cannot describe every layer of this model. Gemma-3 4B/12B/27B
+    /// are the shape that answers yes.
+    ///
+    /// It is NOT an eligibility check any more. It was one: the fused
+    /// Metal stacks took a single slice for a whole run of layers and
+    /// refused a model that answered yes here. They now take a
+    /// `ferrox_metal::attn::LayerRope` per layer, so this is a statement
+    /// about the checkpoint and nothing else -- which is all the loader
+    /// tests ever wanted from it.
     pub fn rope_freqs_vary_by_layer(&self) -> bool {
         self.rope_freqs
             .as_ref()

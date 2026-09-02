@@ -843,30 +843,24 @@ impl Decoder {
             || self.config.layer_rope_theta(layer_idx) != self.config.rope_theta
     }
 
-    /// True when no fused Metal *stack* can serve this model, because
-    /// its sliding layers need different RoPE per-band divisors from its
-    /// full-attention ones.
+    /// BOTH halves of layer `il`'s RoPE, in the shape the Metal
+    /// launches take.
     ///
-    /// Per-LAYER Metal launches are fine: each takes its own
-    /// `freq_factors` slice and is handed
-    /// `ModelConfig::layer_rope_freqs(l)`. The two whole-stack launches
-    /// (`launch_prefill_dense_stack`, `launch_decode_dense_stack`) take
-    /// ONE slice for a whole run of layers -- `PrefillDenseLayerMetal`
-    /// and `DenseLayerMetal` carry a per-layer `rope_theta` and `window`
-    /// but no per-layer divisors -- so they would rope the sliding
-    /// layers with the full-attention set. That is precisely the bug
-    /// this refusal exists to stop, one layer of the stack down.
-    ///
-    /// The cost is Gemma-3 4B/12B/27B taking the per-layer Metal path
-    /// rather than the fused stacks. Correct and slower beats fast and
-    /// wrong; restoring the stacks needs a per-layer `freq_factors`
-    /// buffer in `ferrox-metal`.
-    ///
-    /// One predicate, two call sites, because four spellings of one
-    /// eligibility check is how the GPU-router gate drifted four ways.
+    /// One conversion, every Metal call site, because
+    /// `ModelConfig::layer_rope` returning a pair and the launches
+    /// taking a pair is only worth anything while nothing in between
+    /// gets to take one half and default the other. That is exactly
+    /// what the fused stacks used to do: a per-layer `rope_theta` beside
+    /// ONE `freq_factors` slice for the whole run, which refused
+    /// Gemma-3 4B/12B/27B off the fused path entirely rather than rope
+    /// five layers in six at the wrong scale.
     #[cfg(feature = "metal")]
-    fn metal_stack_needs_per_layer_rope_freqs(&self) -> bool {
-        self.config.rope_freqs_vary_by_layer()
+    fn metal_layer_rope(&self, layer_idx: usize) -> ferrox_metal::attn::LayerRope<'_> {
+        let (theta, freq_factors) = self.config.layer_rope(layer_idx);
+        ferrox_metal::attn::LayerRope {
+            theta,
+            freq_factors,
+        }
     }
 
     /// Optional QKV bias / QK-norm ops for the Metal attn paths.
@@ -1069,12 +1063,8 @@ impl Decoder {
         kv_caches: &mut [KvCache],
         host_kv_authoritative: bool,
     ) -> Option<Vec<f32>> {
-        if self.metal_stack_needs_per_layer_rope_freqs() {
-            return None;
-        }
         let gelu = !GluAct::from(self.config.ffn_activation).is_swiglu();
         let mut prefill_layers = Vec::with_capacity(run_len);
-        let mut rope_thetas = Vec::with_capacity(run_len);
         for li in start..start + run_len {
             let layer = &self.layers[li];
             let ffn = Self::metal_prefill_ffn(layer, &self.config)?;
@@ -1098,9 +1088,9 @@ impl Decoder {
                 post_attn_norm: layer.attn.post_attn_norm.as_deref(),
                 post_ffn_norm: layer.attn.post_ffn_norm.as_deref(),
                 extras: self.metal_attn_extras(layer),
+                rope: self.metal_layer_rope(li),
                 layer_idx: li as u32,
             });
-            rope_thetas.push(self.config.layer_rope_theta(li));
         }
         let kvs = &mut metal_kvs[start..start + run_len];
         let h_out = ferrox_metal::attn::launch_prefill_dense_stack(
@@ -1110,12 +1100,6 @@ impl Decoder {
             n_heads,
             batch_size,
             self.metal_rope(),
-            &rope_thetas,
-            // One slice for the whole run. Sound only because
-            // `metal_stack_needs_per_layer_rope_freqs` refused above
-            // when the layers disagree, so every layer in the run --
-            // sliding or not -- resolves to this same set.
-            self.config.layer_rope_freqs(start),
             start_pos,
             self.config.rms_norm_eps,
             gelu,
@@ -2006,7 +1990,6 @@ impl Decoder {
         #[cfg(feature = "metal")]
         if !metal_stack_done
             && use_metal_attn
-            && !self.metal_stack_needs_per_layer_rope_freqs()
             && self.layers.iter().all(Self::layer_supports_metal_dense_ffn)
         {
             if let Some(guard) = metal_kv_guard.as_mut() {
@@ -2046,10 +2029,7 @@ impl Decoder {
                                 up: u,
                                 down: d,
                                 extras: self.metal_attn_extras(layer),
-                                rope_theta: {
-                                    let t = self.config.layer_rope_theta(li);
-                                    (t != self.config.rope_theta).then_some(t)
-                                },
+                                rope: self.metal_layer_rope(li),
                                 window: self.config.layer_sliding_window(li),
                                 post_attn_norm: layer.attn.post_attn_norm.as_deref(),
                                 post_ffn_norm: layer.attn.post_ffn_norm.as_deref(),
@@ -2103,15 +2083,6 @@ impl Decoder {
                                 metal_kvs,
                                 n_heads,
                                 self.metal_rope(),
-                                self.config.rope_theta,
-                                // `DenseLayerMetal` overrides the theta
-                                // per layer but has no per-layer
-                                // divisors, so this one slice must
-                                // serve them all --
-                                // `metal_stack_needs_per_layer_rope_freqs`
-                                // in the guard above is what makes that
-                                // true.
-                                self.config.layer_rope_freqs(0),
                                 pos,
                                 self.config.rms_norm_eps,
                                 final_norm_w,
@@ -3857,6 +3828,7 @@ impl Decoder {
                                             post_attn_norm: layer.attn.post_attn_norm.as_deref(),
                                             post_ffn_norm: layer.attn.post_ffn_norm.as_deref(),
                                             extras: self.metal_attn_extras(layer),
+                                            rope: self.metal_layer_rope(l),
                                             layer_idx: l as u32,
                                         };
                                     ferrox_metal::attn::launch_prefill_dense_layer(
@@ -3866,8 +3838,6 @@ impl Decoder {
                                         n_heads,
                                         batch_size,
                                         self.metal_rope(),
-                                        self.config.layer_rope_theta(l),
-                                        self.config.layer_rope_freqs(l),
                                         start_pos,
                                         self.config.rms_norm_eps,
                                         gelu,
@@ -6698,5 +6668,66 @@ mod metal_rope_tests {
         let mut odd = phi_like_config();
         odd.rope_dim = Some(95);
         assert!(!supported(odd), "odd n_rot must keep the model off Metal");
+    }
+
+    /// A Gemma-3-4B-shaped config: `rope_scaling {linear, factor 8}`
+    /// folded into the full-attention layers' divisors, nothing on the
+    /// sliding ones, `sliding_window_pattern = 6` last-dense.
+    fn gemma3_4b_shaped_config() -> ModelConfig {
+        let mut cfg = crate::config::test_dense_fixture();
+        cfg.head_dim = 8;
+        cfg.rope_layout = crate::config::RopeLayout::Norm;
+        cfg.rope_theta = 1_000_000.0;
+        cfg.rope_theta_swa = Some(10_000.0);
+        cfg.sliding_window = Some(4);
+        cfg.swa_pattern = Some(6);
+        cfg.rope_freqs = Some(crate::config::RopeFreqs {
+            full: vec![8.0; 4],
+            swa: Some(vec![1.0; 4]),
+        });
+        // One full period, so the run holds five sliding layers and one
+        // full-attention layer -- Gemma-3's ratio, and the smallest one
+        // that makes `rope_freqs_vary_by_layer` true.
+        cfg.n_layers = 6;
+        cfg
+    }
+
+    /// What the fused Metal stacks are handed per layer must be BOTH
+    /// halves of `ModelConfig::layer_rope`, layer by layer.
+    ///
+    /// `Decoder::metal_stack_needs_per_layer_rope_freqs` used to refuse
+    /// exactly this config off the fused prefill/decode stacks, because
+    /// those took one `freq_factors` slice for a whole run beside a
+    /// per-layer theta -- half the answer varying and half not, which is
+    /// this repo's dominant bug shape. `LayerRope` carries the pair, and
+    /// this pins that the decoder fills it from the pair rather than
+    /// re-deriving either half on its own.
+    #[test]
+    fn the_metal_stacks_are_handed_each_layer_s_own_rope_pair() {
+        let cfg = gemma3_4b_shaped_config();
+        assert!(
+            cfg.rope_freqs_vary_by_layer(),
+            "fixture must be the shape that used to be refused"
+        );
+        let decoder = Decoder::new_random_small(cfg, 6, 32);
+
+        for il in 0..decoder.layers.len() {
+            let (theta, ff) = decoder.config.layer_rope(il);
+            let sent = decoder.metal_layer_rope(il);
+            assert_eq!(sent.theta, theta, "layer {il} base");
+            assert_eq!(sent.freq_factors, ff, "layer {il} divisors");
+        }
+
+        // Not vacuous: with `swa_pattern = 6` last-dense, layers 0..=4
+        // slide and layer 5 does not, so the run really does hold two
+        // different answers.
+        let sliding = decoder.metal_layer_rope(0);
+        let full = decoder.metal_layer_rope(5);
+        assert_eq!(sliding.freq_factors, Some(&[1.0f32; 4][..]));
+        assert_eq!(full.freq_factors, Some(&[8.0f32; 4][..]));
+        assert_ne!(
+            sliding, full,
+            "a run of layers that all rope alike proves nothing here"
+        );
     }
 }

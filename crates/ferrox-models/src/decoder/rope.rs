@@ -375,7 +375,7 @@ mod tests {
         });
         assert!(
             !cfg.rope_freqs_vary_by_layer(),
-            "an inheriting model must stay eligible for the fused Metal stacks"
+            "an inheriting model resolves to ONE divisor set for every layer"
         );
 
         let decoder = Decoder::new_random_small(cfg, 2, 32);

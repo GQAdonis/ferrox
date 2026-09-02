@@ -128,7 +128,10 @@ llama.cpp's method, agreeing with `llama-perplexity` to within a fifth
 of one standard error on five checkpoints. Where the two differ, the gap
 is monotone in the quant and has the sign the documented `vec_dot_type`
 difference predicts. `ferrox quantize` writes `Q8_0` byte-identically to
-`llama_model_quantize()` and refuses every other target by name. See
+`llama_model_quantize()`, plus `Q4_K_S` and `Q4_K_M` with `--pure`, and
+refuses every other target by name. Q4_K is not byte-identical and
+cannot be, because the C reference is compiled with FP contraction; it
+matches on perplexity instead. See
 [`CLI.md`](CLI.md).
 
 The sampler flags carry llama.cpp's own defaults on `--temp` (0.8),

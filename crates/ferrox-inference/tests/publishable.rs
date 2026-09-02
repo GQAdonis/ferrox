@@ -111,3 +111,20 @@ fn ferrox_vulkan_stays_publishable_because_core_depends_on_it() {
          optional or not. Either publish it, or remove the dependency from ferrox-core."
     );
 }
+
+// A test asserting that the internal `version = "x"` pins match
+// `[workspace.package] version` was written here and DELETED, because
+// it could not fail. Cargo resolves a path dependency's version
+// requirement against the crate at that path, so a stale pin does not
+// build at all:
+//
+//     error: failed to select a version for the requirement
+//     `ferrox-api = "^0.15.3"`
+//     candidate versions found which didn't match: 0.16.0
+//
+// Recorded rather than silently dropped, because "the version is
+// written in eleven places" looks exactly like this repo's dominant bug
+// shape and the next person will reach for the same test. It is not an
+// instance of it: the build system is the thing enforcing agreement.
+// What DID cost a release was a `publish = false` crate, which the
+// tests above cover, and that failure is invisible until publish time.

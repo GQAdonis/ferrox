@@ -607,11 +607,21 @@ impl ModelConfig {
             None
         };
 
-        // Gemma's f_attention_scale equals 1/sqrt(n_embd_head_k) for non-27B,
-        // which is already what `causal_gqa_attention` applies. Do not also
-        // pre-scale Q (that double-scales scores vs llama.cpp's
-        // `build_attn(..., 1.0f)` after an explicit Q scale).
-        let attention_scale = None;
+        // llama.cpp's `f_attention_scale`, and ONLY where it differs from
+        // the `1/sqrt(head_dim)` ferrox's attention kernels already
+        // apply -- `Some` here means "pre-scale Q", so restating the
+        // kernels' own scale would double-scale every score.
+        //
+        // For Gemma-2 and Gemma-3 that difference is real at 27B and
+        // nowhere else (`capability::attention_scale_override` carries
+        // the llama.cpp lines). This used to be a hardcoded `None` under
+        // a comment that NAMED the 27B exception without implementing
+        // it, so Gemma-2-27B scored 1.061x and Gemma-3-27B 1.146x too
+        // large on every layer: a sharper softmax than the trained one,
+        // fluent and wrong, with no error.
+        let attention_scale = crate::capability::attention_scale_override(
+            &arch, n_layers, hidden_dim, n_heads, head_dim,
+        );
 
         // SWA-layer RoPE base. `llama_hparams` defaults it to 10000 and
         // the Gemma-3 lineage relies on that default; the architectures
@@ -4002,6 +4012,86 @@ mod tests {
         match ModelConfig::from_gguf(&seven_b) {
             Err(LoadError::MissingHparam(key)) => assert_eq!(key, "baichuan.embedding_length"),
             other => panic!("Baichuan-7B must pass the ALiBi gate, got {other:?}"),
+        }
+    }
+
+    /// The hyper-parameters a real Gemma-3 GGUF header carries for one
+    /// size. `block_count` is the field llama.cpp's `LLM_TYPE_27B`
+    /// switch reads (`gemma3.cpp:20-28`), so it is never a free
+    /// parameter here.
+    ///
+    /// `linear_factor` adds the pair `conversion/base.py:1222-1230`
+    /// writes from `rope_parameters["full_attention"]` -- and only from
+    /// there: its own comment is "TODO: Handle sliding_attention
+    /// similarly when models start implementing it", so the sliding
+    /// layers get no scaling key at all.
+    fn gemma3_config(
+        tag: &str,
+        n_layers: u32,
+        hidden_dim: u32,
+        n_heads: u32,
+        head_dim: u32,
+        linear_factor: Option<f32>,
+    ) -> ModelConfig {
+        let mut kvs: Vec<(&str, Kv)> = vec![
+            ("general.architecture", Kv::Str("gemma3")),
+            ("gemma3.block_count", Kv::U32(n_layers)),
+            ("gemma3.embedding_length", Kv::U32(hidden_dim)),
+            ("gemma3.attention.head_count", Kv::U32(n_heads)),
+            ("gemma3.attention.head_count_kv", Kv::U32(n_heads)),
+            ("gemma3.attention.key_length", Kv::U32(head_dim)),
+            ("gemma3.attention.value_length", Kv::U32(head_dim)),
+            // Global layers rotate at 1e6; the sliding ones fall back to
+            // llama.cpp's `rope_freq_base_train_swa` default of 10000,
+            // because `gemma3.cpp:11` reads only the BASE key.
+            ("gemma3.rope.freq_base", Kv::F32(1_000_000.0)),
+            ("gemma3.attention.sliding_window", Kv::U32(1024)),
+            ("gemma3.attention.sliding_window_pattern", Kv::U32(6)),
+        ];
+        if let Some(factor) = linear_factor {
+            kvs.push(("gemma3.rope.scaling.type", Kv::Str("linear")));
+            kvs.push(("gemma3.rope.scaling.factor", Kv::F32(factor)));
+        }
+        ModelConfig::from_gguf(&open_metadata_gguf(tag, &kvs)).expect("gemma3 fixture must load")
+    }
+
+    /// The 27B attention scale reaches `ModelConfig`, and no other
+    /// Gemma-3 size acquires one.
+    ///
+    /// `capability::attention_scale_override` is where the arithmetic is
+    /// checked; this pins that the LOADER calls it with this file's own
+    /// numbers. That step is the one that shipped broken: the function
+    /// did not exist and `attention_scale` was the literal `None`, under
+    /// a comment naming the exception. A helper nobody calls looks
+    /// exactly like a fix.
+    #[test]
+    fn a_gemma3_27b_header_sets_the_attention_scale_and_no_smaller_size_does() {
+        // Gemma-3-27B: 62 layers, n_embd 5376, 32 heads, head_dim 128.
+        let big = gemma3_config("g3_27b_scale", 62, 5376, 32, 128, Some(8.0));
+        let want = 1.0f32 / (5376.0f32 / 32.0).sqrt();
+        let got = big
+            .attention_scale
+            .expect("Gemma-3-27B is llama.cpp's LLM_TYPE_27B");
+        assert!(
+            (got - want).abs() < 1e-7,
+            "want 1/sqrt(168) = {want}, got {got}"
+        );
+        // The bug's magnitude: scores were sqrt(168/128) = 1.146x too
+        // large without this.
+        let kernel = 1.0f32 / 128.0f32.sqrt();
+        assert!((kernel / got - (168.0f32 / 128.0).sqrt()).abs() < 1e-5);
+
+        // Gemma-3-1B and -4B take llama.cpp's other branch, which is the
+        // scale the attention kernels already apply. A `Some` here would
+        // double-scale them.
+        for (tag, n_layers, hidden, heads) in
+            [("g3_1b_scale", 26, 1152, 4), ("g3_4b_scale", 34, 2560, 8)]
+        {
+            let cfg = gemma3_config(tag, n_layers, hidden, heads, 256, None);
+            assert_eq!(
+                cfg.attention_scale, None,
+                "{tag} must keep the kernels' own 1/sqrt(head_dim)"
+            );
         }
     }
 }

@@ -898,10 +898,13 @@ impl Decoder {
         // the four host bodies and not by any of the seven fused
         // launches -- the same weights answering at two different
         // temperatures depending on which backend served the token.
-        // Inert today (`loader.rs` hardcodes `attention_scale = None`),
-        // which is exactly why it has to be written down as a fence
-        // instead of trusted: the day a loader sets it, this returns
-        // false and the layer takes the host path that does apply it.
+        //
+        // LIVE, not latent: `capability::attention_scale_override` sets
+        // it for Gemma-2-27B and Gemma-3-27B, so those two checkpoints
+        // take the host path here and are scaled exactly once. It was
+        // written down as a fence while `loader.rs` still hardcoded
+        // `None`, which is why the day the loader started setting it
+        // cost nothing.
         if self.config.attention_scale.is_some() {
             return false;
         }

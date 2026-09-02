@@ -56,7 +56,7 @@ impl RowKv {
     /// mutably; nothing here is modified.
     pub(super) fn positions_written(&mut self) -> usize {
         match self {
-            RowKv::Contiguous(caches) => caches.first().map_or(0, |c| c.seq_len),
+            RowKv::Contiguous(caches) => caches.first().map_or(0, |c| c.positions()),
             RowKv::Paged(lease) => lease.caches_mut().first().map_or(0, |c| c.seq_len()),
         }
     }

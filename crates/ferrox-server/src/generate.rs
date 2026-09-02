@@ -1950,7 +1950,8 @@ mod tests {
         }
 
         assert_eq!(
-            caches[0].seq_len, fresh_caches[0].seq_len,
+            caches[0].positions(),
+            fresh_caches[0].positions(),
             "must not push any position beyond the real prompt length"
         );
         // Tolerance, not bit equality. `forward_token` goes through

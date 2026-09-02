@@ -193,7 +193,7 @@ impl Decoder {
                         n_heads,
                         n_kv_heads,
                         head_dim,
-                        cache.seq_len,
+                        cache.rows(),
                         window,
                         &oai.attn_sinks,
                     );
@@ -206,7 +206,7 @@ impl Decoder {
                         n_heads,
                         n_kv_heads,
                         head_dim,
-                        cache.seq_len,
+                        cache.rows(),
                         window,
                         self.config.attn_logit_softcap,
                     ),
@@ -218,7 +218,7 @@ impl Decoder {
                         n_heads,
                         n_kv_heads,
                         head_dim,
-                        cache.seq_len,
+                        cache.rows(),
                     ),
                     (None, None) => causal_gqa_attention_softcap(
                         q,
@@ -227,7 +227,7 @@ impl Decoder {
                         n_heads,
                         n_kv_heads,
                         head_dim,
-                        cache.seq_len,
+                        cache.rows(),
                         self.config.attn_logit_softcap,
                     ),
                 }

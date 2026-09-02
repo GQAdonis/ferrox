@@ -1030,7 +1030,9 @@ impl Decoder {
             if !self.metal_prefill_dense_swa_fits(li, start_pos, batch_size) {
                 break;
             }
-            if metal_kvs[li].seq_len != cache.seq_len || start_pos != cache.seq_len {
+            // POSITIONS: compared against `start_pos`, and against
+            // Metal's own count of the same sequence.
+            if metal_kvs[li].seq_len != cache.positions() || start_pos != cache.positions() {
                 break;
             }
             let ok = layer.attn.q_proj.mul_mm_sg_launch().is_some()
@@ -1539,7 +1541,7 @@ impl Decoder {
     ) {
         if host_kv_authoritative {
             Self::catch_up_host_kv_from_metal(mkv, cache);
-            debug_assert_eq!(cache.seq_len, mkv.seq_len);
+            debug_assert_eq!(cache.positions(), mkv.seq_len);
         } else {
             cache
                 .advance_len(batch_size)
@@ -1551,10 +1553,14 @@ impl Decoder {
     /// skipped (dense-stack fast path). No-op when `cache.seq_len` is caught up.
     #[cfg(feature = "metal")]
     fn catch_up_host_kv_from_metal(mkv: &ferrox_metal::attn::MetalKvBuffers, cache: &mut KvCache) {
-        if cache.seq_len >= mkv.seq_len {
+        // ROWS on both sides: this fills the host buffer with rows
+        // Metal already holds, and `push` below advances positions with
+        // them. Neither store evicts, so the two agree; when one learns
+        // to (#61) this is a place that has to say which it meant.
+        if cache.rows() >= mkv.seq_len {
             return;
         }
-        let start = cache.seq_len;
+        let start = cache.rows();
         let n = mkv.seq_len - start;
         let (k, v) = mkv.tokens_host(start, n);
         let per = cache.n_kv_heads * cache.head_dim;
@@ -1748,7 +1754,8 @@ impl Decoder {
             let need = self.layers.len();
             let cap = kv_caches
                 .iter()
-                .map(|c| c.seq_len.max(pos + 1).saturating_add(256))
+                // POSITIONS: sized against `pos`, which is a position.
+                .map(|c| c.positions().max(pos + 1).saturating_add(256))
                 .max()
                 .unwrap_or(512)
                 .max(512)
@@ -1791,7 +1798,9 @@ impl Decoder {
                     // Sync from host after CPU prefill / prefix restore / capacity grow.
                     let mut ok = true;
                     for (m, c) in bufs.iter_mut().zip(kv_caches.iter()) {
-                        if c.seq_len > 0 && m.upload_from_host(&c.k, &c.v, c.seq_len).is_err() {
+                        // ROWS: this uploads `c.k` / `c.v` themselves, so the
+                        // count must describe those buffers.
+                        if c.rows() > 0 && m.upload_from_host(&c.k, &c.v, c.rows()).is_err() {
                             ok = false;
                             break;
                         }
@@ -2259,7 +2268,7 @@ impl Decoder {
                                         if dense_ok {
                                             did_metal_dense = true;
                                             did_metal_attn = true;
-                                        } else if metal_kvs[l].seq_len != cache.seq_len {
+                                        } else if metal_kvs[l].seq_len != cache.rows() {
                                             // Dense path may have advanced Metal KV before failing.
                                             Self::catch_up_host_kv_from_metal(&metal_kvs[l], cache);
                                             clear_metal_kv = true;
@@ -2423,7 +2432,7 @@ impl Decoder {
                                                             hidden = h;
                                                         }
                                                             metal_moe_resident = false;
-                                                            if metal_kvs[l].seq_len != cache.seq_len
+                                                            if metal_kvs[l].seq_len != cache.rows()
                                                             {
                                                                 Self::catch_up_host_kv_from_metal(
                                                                     &metal_kvs[l],
@@ -2478,7 +2487,7 @@ impl Decoder {
                                         }
                                     }
                                 }
-                            } else if metal_kvs[l].seq_len > cache.seq_len {
+                            } else if metal_kvs[l].seq_len > cache.rows() {
                                 // Leaving Metal path: host must see full KV for CPU attn.
                                 Self::catch_up_host_kv_from_metal(&metal_kvs[l], cache);
                             }
@@ -3709,7 +3718,9 @@ impl Decoder {
                         || v.iter().any(|m| m.capacity() < need_cap)
                         || v.iter()
                             .zip(kv_caches.iter())
-                            .any(|(m, c)| m.seq_len != c.seq_len)
+                            // ROWS: Metal holds rows, and this asks whether the
+                            // host buffer matches them.
+                            .any(|(m, c)| m.seq_len != c.rows())
                 }
             };
             if reset {
@@ -3728,7 +3739,7 @@ impl Decoder {
                 if bufs.len() == need {
                     let mut ok = true;
                     for (m, c) in bufs.iter_mut().zip(kv_caches.iter()) {
-                        if c.seq_len > 0 && m.upload_from_host(&c.k, &c.v, c.seq_len).is_err() {
+                        if c.rows() > 0 && m.upload_from_host(&c.k, &c.v, c.rows()).is_err() {
                             ok = false;
                             break;
                         }
@@ -3794,7 +3805,10 @@ impl Decoder {
                 if swa_fits {
                     if let Some(guard) = metal_kv_guard.as_mut() {
                         if let Some(metal_kvs) = guard.as_mut() {
-                            if metal_kvs[l].seq_len == cache.seq_len && start_pos == cache.seq_len {
+                            // POSITIONS: compared against `start_pos`.
+                            if metal_kvs[l].seq_len == cache.positions()
+                                && start_pos == cache.positions()
+                            {
                                 layer.moe.record_activations(&[0]);
                                 let fused = layer.moe.with_expert(0, |ex| {
                                     let (q, k, v, o) = (
@@ -3930,8 +3944,9 @@ impl Decoder {
                 // Metal prefill applies attn softcap in FA-vec / legacy GQA.
                 if let Some(guard) = metal_kv_guard.as_mut() {
                     if let Some(metal_kvs) = guard.as_mut() {
-                        if metal_kvs[l].seq_len == cache.seq_len
-                            && start_pos == cache.seq_len
+                        // POSITIONS: compared against `start_pos`.
+                        if metal_kvs[l].seq_len == cache.positions()
+                            && start_pos == cache.positions()
                             && swa_fits
                         {
                             let prefill_res = {
@@ -4134,7 +4149,10 @@ impl Decoder {
             // `attention_scale` is set is in `layer_supports_metal_attn`.
             self.apply_attention_scale(&mut q_batch);
 
-            let base_seq_len = cache.seq_len;
+            // ROWS, not positions: it is added to `b + 1` below to give
+            // each query in the batch the length of the KV it attends
+            // over, which is a count of resident rows.
+            let base_seq_len = cache.rows();
             for b in 0..batch_size {
                 cache
                     .push(
@@ -4884,7 +4902,7 @@ mod tests {
         decoder.forward_token(2, 2, &mut caches);
 
         for cache in &caches {
-            assert_eq!(cache.seq_len, 3);
+            assert_eq!(cache.positions(), 3);
         }
     }
 
@@ -6410,7 +6428,7 @@ mod tests {
         decoder_b.forward_batch(&tokens, 0, &mut caches_b);
 
         for (ca, cb) in caches_a.iter().zip(caches_b.iter()) {
-            assert_eq!(ca.seq_len, cb.seq_len);
+            assert_eq!(ca.positions(), cb.positions());
             assert_eq!(ca.k.len(), cb.k.len());
             for (a, b) in ca.k.iter().zip(cb.k.iter()) {
                 assert!((a - b).abs() < 1e-4);

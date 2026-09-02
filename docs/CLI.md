@@ -73,6 +73,7 @@ Same via explicit subcommand: `ferrox run -m …`.
 | `--hf-file` | Exact filename inside `--hf-repo`, llama.cpp's `-hff`. Skips quant resolution entirely |
 | `--repeat-last-n` | How many recent tokens the repetition / presence / frequency penalties consider. `0` = penalties off. Default `64`, llama.cpp's (`common/common.h:238`) |
 | `-s` / `--seed` | `-1` = time-based |
+| `--samplers` / `--sampler-seq` | Order the chain runs in, semicolon-separated. A sampler ferrox lacks is refused by name, see below |
 | `--grammar` | Constrain generation to a GBNF grammar, llama.cpp's `--grammar` |
 | `--grammar-file` | Read the GBNF grammar from a file, llama.cpp's `--grammar-file` |
 | `-j` / `--json-schema` | Constrain generation to a JSON Schema, converted to GBNF. llama.cpp's `-j` |
@@ -104,6 +105,24 @@ so `--ctk f16` there is accepted, ignored, and reported as ignored by
 the startup banner. That matters for memory: f32 doubles the KV bytes
 per token, which is why a model that fits at its full context on Metal
 can need `--ctx-size auto` on CPU. `ferrox inspect-plan` prices both.
+
+`--samplers` (llama.cpp's, also `--sampler-seq`) chooses the ORDER, as a
+semicolon-separated list: `--samplers "penalties;top_k;top_p;min_p;temperature"`
+is the default spelled out. llama.cpp's aliases parse, so `top-k`,
+`nucleus`, `temp` and `typical` all work.
+
+A sampler ferrox does not implement is **refused by name with the
+reason**, never skipped: `dry`, `typ_p`, `xtc` and `top_n_sigma` are
+real llama.cpp samplers, and a caller who asked for one and silently got
+a chain without it was handed a different sampler than the one they
+requested.
+
+Order is not cosmetic, which is why it is worth exposing and why getting
+it wrong is a silent quality regression rather than an error. Each
+filter renormalises over the survivors of the last, so moving a step
+changes what the next step can see. This project shipped that bug once:
+temperature ran first, and top-p then summed probabilities temperature
+had already reshaped.
 
 **The sampler chain is llama.cpp's, in llama.cpp's order.** Penalties,
 then top-k, then top-p, then min-p, and **temperature last**
@@ -464,6 +483,66 @@ It runs on CPU by construction and refuses to start with
 and would hand a swapped-in tensor another tensor's repacked bytes.
 Cost is one forward pass per tensor: about two minutes for a 1B model's
 112 tensors at 16 prompt tokens. `--layers 0:4` restricts the sweep.
+
+## Perplexity (`ferrox perplexity`)
+
+Corpus evaluation, llama.cpp's `perplexity` tool.
+
+```bash
+ferrox perplexity -m model.gguf -f corpus.txt --ctx-size 512
+```
+
+This is the quality axis the project did not have. `ferrox parity`
+compares first-token distributions and `ferrox bench` measures speed;
+neither answers "is this quantization worse, and by how much". It is
+also the acceptance test the quantizer needs, because a bad K-quant
+encoder produces a file that loads fine and generates measurably worse
+text.
+
+**Measured against `llama-perplexity` on the same corpus and
+checkpoint**, both engines on CPU:
+
+| Checkpoint | ferrox | llama.cpp | Gap |
+|---|---|---|---|
+| SmolLM2-135M Q8_0 | 14.7284 | 14.7529 | -0.17% |
+| SmolLM2-135M Q4_K_M | 15.0896 | 15.1274 | -0.25% |
+| SmolLM2-135M IQ3_M | 16.5144 | 16.6004 | -0.52% |
+| Qwen3-0.6B Q8_0 | 19.9805 | 19.9799 | +0.003% |
+| TinyLlama-1.1B Q8_0 | 11.9852 | 12.0190 | -0.28% |
+
+Every gap is under a fifth of one standard error, and the per-window
+running estimates track window for window, which is what says
+tokenization and chunking agree.
+
+**The gaps are not noise, and their shape is the interesting part.**
+ferrox sits below llama.cpp on every quantized checkpoint and the gap
+widens as the quant coarsens. That is the `vec_dot_type` difference this
+repo already documents
+([`plans/llama-cpp-gap-inventory.md`](plans/llama-cpp-gap-inventory.md)
+§10) showing up on a second axis, with the sign it should have:
+llama.cpp quantizes the activation to the weight's vec_dot type and
+ferrox keeps it in f32, so ferrox is slightly less surprised. Qwen3 is
+the control, straddling zero. A difference in METHOD would not produce a
+gap that is monotone in the quant.
+
+The method is llama.cpp's, verified against `tools/perplexity/perplexity.cpp`
+rather than assumed, because getting any of it wrong makes the number
+incomparable to every published figure while still looking reasonable.
+Non-overlapping windows of `--ctx-size`; `first = n_ctx/2` so 255
+positions are scored at 512, not 256; BOS at the front of the corpus and
+the first token of each window overwritten with it, never scored;
+natural log; `exp` of the unweighted mean over all scored tokens pooled
+across windows, not a mean of per-window perplexities.
+
+Deviations, all recorded in the module doc: one `forward_batch` per
+window rather than an `n_batch` split, which changes the f32 reduction
+grouping and not the causal context; the output head runs at every
+position rather than the scored half, which costs memory and not
+accuracy; and `--ppl-stride`, HellaSwag, WinoGrande, multiple-choice and
+KL-divergence are not implemented.
+
+Every number above is CPU on both sides. Metal and CUDA perplexity is
+unevidenced.
 
 ## Quantize (`ferrox quantize`)
 

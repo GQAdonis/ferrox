@@ -241,6 +241,12 @@ pub(crate) struct CompletionsRequest {
     suffix: Option<String>,
     #[serde(default)]
     logit_bias: Option<serde_json::Value>,
+    /// llama.cpp's `samplers`: the ORDER the sampler chain runs in.
+    /// Decided by `unsupported_sampling::parse_sampler_order`, shared
+    /// with `/v1/chat/completions` and `/completion`, so the three
+    /// routes cannot disagree about which samplers exist.
+    #[serde(default)]
+    samplers: Option<serde_json::Value>,
     /// A GBNF grammar every sampled token must keep parseable. The same
     /// field, with the same meaning, as on `/v1/chat/completions`: a
     /// constraint the two routes spelled differently would be a
@@ -277,8 +283,10 @@ impl CompletionsRequest {
 
     /// This request's sampler knobs, resolved by the same function the
     /// chat route uses. See `crate::sampling_knobs`.
-    fn sampling_knobs(&self) -> SamplingKnobs {
-        SamplingKnobs {
+    /// Fallible because `samplers` is parsed here; see the chat route's
+    /// twin.
+    fn sampling_knobs(&self) -> Result<SamplingKnobs, ApiError> {
+        Ok(SamplingKnobs {
             temperature: self.temperature,
             top_p: self.top_p,
             min_p: self.min_p,
@@ -289,7 +297,11 @@ impl CompletionsRequest {
             // The OpenAI wire has no field for the penalty window; see
             // `SamplingKnobs::penalty_last_n`.
             penalty_last_n: None,
-        }
+            sampler_order: crate::unsupported_sampling::parse_sampler_order(
+                self.samplers.as_ref(),
+                "/v1/completions",
+            )?,
+        })
     }
 
     fn stop_sequences(&self) -> Vec<String> {
@@ -307,6 +319,10 @@ impl CompletionsRequest {
         // field for as long as each held its own copy of the rule.
         crate::unsupported_sampling::refuse_logit_bias(
             self.logit_bias.as_ref(),
+            "/v1/completions",
+        )?;
+        crate::unsupported_sampling::parse_sampler_order(
+            self.samplers.as_ref(),
             "/v1/completions",
         )?;
         let unsupported = [
@@ -464,7 +480,7 @@ pub async fn completions(
     let active = state.require_active()?;
     let params = GenerationParams {
         max_tokens: req.max_tokens,
-        sampling: req.sampling_knobs().resolve(),
+        sampling: req.sampling_knobs()?.resolve(),
         seed: req.seed.unwrap_or(0),
         stop: req.stop_sequences(),
         json_object: false,
@@ -657,8 +673,10 @@ mod tests {
             "repetition_penalty": 1.1,
             "presence_penalty": 0.25,
             "frequency_penalty": 0.75,
+            "samplers": ["penalties", "top_p", "top_k", "min_p", "temperature"],
         }))
         .sampling_knobs()
+        .expect("knobs")
         .resolve();
 
         assert_eq!(resolved.temperature, 0.5);
@@ -668,6 +686,10 @@ mod tests {
         assert_eq!(resolved.repetition_penalty, 1.1);
         assert_eq!(resolved.presence_penalty, 0.25);
         assert_eq!(resolved.frequency_penalty, 0.75);
+        assert_eq!(
+            resolved.sampler_order.to_string(),
+            "penalties;top_p;top_k;min_p;temperature"
+        );
     }
 
     /// And the two routes resolve one body to the same sampler, which is
@@ -683,18 +705,22 @@ mod tests {
             "repetition_penalty": 1.1,
             "presence_penalty": 0.25,
             "frequency_penalty": 0.75,
+            "samplers": ["penalties", "top_p", "top_k", "min_p", "temperature"],
         });
 
         let mut completion_body = knobs.clone();
         completion_body["prompt"] = serde_json::json!("hi");
-        let completion = request(completion_body).sampling_knobs().resolve();
+        let completion = request(completion_body)
+            .sampling_knobs()
+            .expect("knobs")
+            .resolve();
 
         let mut chat_body = knobs;
         chat_body["model"] = serde_json::json!("m");
         chat_body["messages"] = serde_json::json!([{"role": "user", "content": "hi"}]);
         let chat: crate::ChatCompletionRequest =
             serde_json::from_value(chat_body).expect("chat request");
-        let chat = chat.sampling_params();
+        let chat = chat.sampling_params().expect("knobs");
 
         assert_eq!(completion.temperature, chat.temperature);
         assert_eq!(completion.top_p, chat.top_p);
@@ -702,6 +728,7 @@ mod tests {
         assert_eq!(completion.top_k, chat.top_k);
         assert_eq!(completion.repetition_penalty, chat.repetition_penalty);
         assert_eq!(completion.penalty_last_n, chat.penalty_last_n);
+        assert_eq!(completion.sampler_order, chat.sampler_order);
         assert_eq!(completion.presence_penalty, chat.presence_penalty);
         assert_eq!(completion.frequency_penalty, chat.frequency_penalty);
     }

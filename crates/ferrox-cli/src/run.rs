@@ -12,8 +12,8 @@ use ferrox_gguf::ShardedGguf;
 use ferrox_models::{
     ensure_generic_decoder, load_gemma4_engine_from_path, load_glm52_engine_from_path,
     load_mla_engine_from_path, select_engine_kind, Decoder, Engine, GgufBpeTokenizer,
-    GgufSpmTokenizer, GgufUnigramTokenizer, ModelConfig, PenaltyWindow, Sampler, SamplingParams,
-    SelectedEngineKind, ServedEngine,
+    GgufSpmTokenizer, GgufUnigramTokenizer, ModelConfig, PenaltyWindow, Sampler, SamplerOrder,
+    SamplingParams, SelectedEngineKind, ServedEngine,
 };
 
 /// llama.cpp-compatible completion flags.
@@ -141,6 +141,23 @@ pub struct InferArgs {
     /// Repetition penalty (`1.0` = off).
     #[arg(long = "repeat-penalty", default_value_t = 1.1)]
     pub repeat_penalty: f32,
+
+    /// The order the sampler chain runs in, `;`-separated, llama.cpp's
+    /// `--samplers`.
+    ///
+    /// ferrox implements five of upstream's samplers, so a chain naming
+    /// `dry`, `xtc`, `typ_p`, `top_n_sigma`, `mirostat` or `infill` is
+    /// REFUSED by that name rather than built without it: a caller who
+    /// asked for `xtc` and was quietly served a chain with no XTC in it
+    /// got a different sampler and no way to tell.
+    ///
+    /// Two further rules the refusal explains when it fires:
+    /// `penalties` must be first (ferrox penalises the whole vocabulary
+    /// before the candidate list exists) and `temperature` must be
+    /// present (the greedy-versus-sampled decision is taken from
+    /// `--temp` before the chain runs).
+    #[arg(long = "samplers", value_name = "LIST", default_value_t = SamplerOrder::default())]
+    pub samplers: SamplerOrder,
 
     /// RNG seed (`-1` = time-based).
     #[arg(short = 's', long = "seed", default_value_t = -1)]
@@ -428,6 +445,7 @@ impl InferArgs {
             penalty_last_n: self.repeat_last_n,
             presence_penalty: self.presence_penalty,
             frequency_penalty: self.frequency_penalty,
+            sampler_order: self.samplers,
         }
     }
 }
@@ -1903,7 +1921,7 @@ mod tests {
 
     /// `InferArgs` is a `clap::Args` group, not a `Parser`, so the test
     /// gives it the top-level command it is normally flattened into.
-    #[derive(Parser)]
+    #[derive(Parser, Debug)]
     struct Cli {
         #[command(flatten)]
         infer: InferArgs,
@@ -2023,6 +2041,69 @@ mod tests {
         let off = Probe::try_parse_from(["ferrox", "-m", "x.gguf", "--no-escape"])
             .expect("--no-escape parses");
         assert!(off.args.no_escape, "llama.cpp spells the negation this way");
+    }
+
+    /// `--samplers` is llama.cpp's, and the DEFAULT is the chain ferrox
+    /// already ran: a command line that does not mention the flag must
+    /// sample exactly what it did before the flag existed.
+    ///
+    /// The distribution-level proof of that is
+    /// `ferrox_models::sampling::tests::the_default_order_is_the_chain_ferrox_already_ran`;
+    /// this is the CLI half -- that the flag's default resolves to the
+    /// same chain, so the two cannot drift apart.
+    #[test]
+    fn samplers_defaults_to_the_chain_ferrox_already_ran() {
+        let default = args(&["-m", "x.gguf"]).sampling().sampler_order;
+        assert_eq!(default, ferrox_models::SamplerOrder::default());
+        assert_eq!(
+            default.to_string(),
+            "penalties;top_k;top_p;min_p;temperature"
+        );
+    }
+
+    /// A caller-supplied order reaches the sampler, in the order typed.
+    #[test]
+    fn a_caller_supplied_order_reaches_the_sampler() {
+        let order = args(&["-m", "x.gguf", "--samplers", "penalties;temperature;top_k"])
+            .sampling()
+            .sampler_order;
+        assert_eq!(order.to_string(), "penalties;temperature;top_k");
+        // llama.cpp's own aliases, so an upstream command line works.
+        assert_eq!(
+            args(&["-m", "x.gguf", "--samplers", "top-k;min-p;temp"])
+                .sampling()
+                .sampler_order
+                .to_string(),
+            "top_k;min_p;temperature"
+        );
+    }
+
+    /// A sampler ferrox does not implement is refused BY NAME at the
+    /// command line, rather than dropped out of the chain.
+    ///
+    /// Upstream's own default string names three samplers this engine
+    /// lacks, so pasting it must fail loudly. A caller who asked for
+    /// `xtc` and was given a chain without it was silently handed a
+    /// different sampler.
+    #[test]
+    fn a_sampler_ferrox_lacks_is_refused_by_name_on_the_command_line() {
+        let err = Cli::try_parse_from([
+            "ferrox",
+            "-m",
+            "x.gguf",
+            "--samplers",
+            "dry;top_k;typ_p;top_p;min_p;xtc;temperature",
+        ])
+        .expect_err("upstream's default names samplers ferrox lacks")
+        .to_string();
+        assert!(err.contains("dry"), "{err}");
+        assert!(err.contains("not implemented"), "{err}");
+
+        let unknown = Cli::try_parse_from(["ferrox", "-m", "x.gguf", "--samplers", "top_kk"])
+            .expect_err("no such sampler")
+            .to_string();
+        assert!(unknown.contains("top_kk"), "{unknown}");
+        assert!(unknown.contains("unknown sampler"), "{unknown}");
     }
 
     #[test]

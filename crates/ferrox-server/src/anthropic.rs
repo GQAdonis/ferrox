@@ -634,6 +634,7 @@ fn prepare_prompt(prompt: &PromptFields, model: String, max_tokens: usize) -> Pr
     };
 
     let chat = ChatCompletionRequest {
+        samplers: None,
         model,
         messages: convert_prompt(prompt),
         max_tokens,

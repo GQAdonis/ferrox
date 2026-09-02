@@ -124,9 +124,28 @@ struct PooledState {
 pub struct KvCache {
     pub n_kv_heads: usize,
     pub head_dim: usize,
-    pub k: Vec<f32>, // [seq_len, n_kv_heads, head_dim], flattened
+    pub k: Vec<f32>, // [rows, n_kv_heads, head_dim], flattened
     pub v: Vec<f32>,
-    pub seq_len: usize,
+    /// Positions this sequence has consumed.
+    ///
+    /// **Not the same thing as the number of rows in `k`/`v`**, and the
+    /// distinction is the whole reason this field is private. They are
+    /// equal today because nothing evicts, and they stop being equal
+    /// the moment a windowed layer drops a position behind its window
+    /// (#61): `positions` keeps counting, `rows` does not.
+    ///
+    /// Every reader has to say which one it meant, so there is no
+    /// `seq_len` any more. [`Self::positions`] is what RoPE, a resume
+    /// point and a truncate target mean; [`Self::rows`] is what
+    /// attention iterates and what the bytes cost.
+    ///
+    /// Two bugs have already been caused by the two being one field.
+    /// `PrefillState` read the KV's length as the position to resume at
+    /// (#37), and `DraftModelSpeculator::sync` trusted a counter beside
+    /// a cache that a device-resident backend leaves empty. Both were
+    /// right to read the store rather than keep a copy; both would be
+    /// wrong the day the store evicts.
+    positions: usize,
     /// The capacity (in positions) this cache was pre-allocated for,
     /// if any. `None` for caches built with `new` or `with_pool`.
     planned_capacity: Option<usize>,
@@ -149,7 +168,7 @@ impl Clone for KvCache {
             head_dim: self.head_dim,
             k: self.k.clone(),
             v: self.v.clone(),
-            seq_len: self.seq_len,
+            positions: self.positions,
             planned_capacity: self.planned_capacity,
             pool_state: None,
         }
@@ -167,13 +186,69 @@ impl Drop for KvCache {
 }
 
 impl KvCache {
+    /// Positions this sequence has consumed: what RoPE means, what a
+    /// resume point means, and what a truncate target is measured in.
+    ///
+    /// Monotonic except through [`Self::truncate`] and [`Self::clear`].
+    /// Equal to [`Self::rows`] today, and deliberately a different
+    /// method so it stops being equal safely (#61).
+    #[inline]
+    pub fn positions(&self) -> usize {
+        self.positions
+    }
+
+    /// Sets the position counter directly, for a constructor that
+    /// filled `k`/`v` by hand rather than through `push`.
+    ///
+    /// Deliberately narrow and deliberately not `pub`: the only honest
+    /// caller is one that has just written exactly this many rows, and
+    /// a public setter on a counter the buffer should imply is how the
+    /// two drift apart again.
+    pub(crate) fn set_positions(&mut self, positions: usize) {
+        debug_assert_eq!(
+            positions,
+            self.rows(),
+            "set_positions must agree with the rows just written"
+        );
+        self.positions = positions;
+    }
+
+    /// Test-only: sets the position counter WITHOUT the agreement check
+    /// [`Self::set_positions`] makes.
+    ///
+    /// Exists for one caller: `kv_signature`'s test that a serialized
+    /// payload whose declared count contradicts its buffers is
+    /// rejected. That contradiction is the thing under test, so it has
+    /// to be constructible, and it must not be constructible anywhere
+    /// else.
+    #[cfg(test)]
+    pub(crate) fn force_positions_for_test(&mut self, positions: usize) {
+        self.positions = positions;
+    }
+
+    /// Rows of K/V actually resident: what attention iterates over and
+    /// what the memory costs.
+    ///
+    /// Derived from the buffer rather than counted alongside it, so it
+    /// cannot drift from what is really there. That is the same rule
+    /// the batched prefill learned in #37: read the cursor, do not keep
+    /// a copy of it.
+    #[inline]
+    pub fn rows(&self) -> usize {
+        let elems_per_position = self.n_kv_heads * self.head_dim;
+        if elems_per_position == 0 {
+            return 0;
+        }
+        self.k.len() / elems_per_position
+    }
+
     pub fn new(n_kv_heads: usize, head_dim: usize) -> Self {
         KvCache {
             n_kv_heads,
             head_dim,
             k: Vec::new(),
             v: Vec::new(),
-            seq_len: 0,
+            positions: 0,
             planned_capacity: None,
             pool_state: None,
         }
@@ -189,7 +264,7 @@ impl KvCache {
             head_dim,
             k: Vec::with_capacity(max_seq_len * elems_per_position),
             v: Vec::with_capacity(max_seq_len * elems_per_position),
-            seq_len: 0,
+            positions: 0,
             planned_capacity: Some(max_seq_len),
             pool_state: None,
         }
@@ -230,7 +305,7 @@ impl KvCache {
             head_dim,
             k: Vec::with_capacity(blocks_needed * block_size * elems_per_position),
             v: Vec::with_capacity(blocks_needed * block_size * elems_per_position),
-            seq_len: 0,
+            positions: 0,
             planned_capacity: None,
             pool_state: Some(PooledState {
                 pool,
@@ -253,7 +328,7 @@ impl KvCache {
         let elems_per_position = self.n_kv_heads * self.head_dim;
         if let Some(state) = &mut self.pool_state {
             let capacity_positions = self.k.capacity() / elems_per_position;
-            if self.seq_len == capacity_positions {
+            if self.positions == capacity_positions {
                 if !state.pool.lock().unwrap().try_acquire(1) {
                     return Err(KvPoolExhausted);
                 }
@@ -265,7 +340,7 @@ impl KvCache {
 
         self.k.extend_from_slice(k_step);
         self.v.extend_from_slice(v_step);
-        self.seq_len += 1;
+        self.positions += 1;
         Ok(())
     }
 
@@ -299,7 +374,7 @@ impl KvCache {
     pub fn clear(&mut self) {
         self.k.clear();
         self.v.clear();
-        self.seq_len = 0;
+        self.positions = 0;
     }
 
     /// Rolls the cache back to exactly `new_seq_len` positions,
@@ -310,14 +385,14 @@ impl KvCache {
     /// last *accepted* position, not the last *attempted* one.
     pub fn truncate(&mut self, new_seq_len: usize) {
         assert!(
-            new_seq_len <= self.seq_len,
+            new_seq_len <= self.positions,
             "truncate target {new_seq_len} must not exceed current seq_len {}",
-            self.seq_len
+            self.positions
         );
         let elems_per_position = self.n_kv_heads * self.head_dim;
         self.k.truncate(new_seq_len * elems_per_position);
         self.v.truncate(new_seq_len * elems_per_position);
-        self.seq_len = new_seq_len;
+        self.positions = new_seq_len;
     }
 
     /// Bytes currently resident for this cache's K and V buffers
@@ -335,8 +410,8 @@ impl KvCache {
     pub fn is_within_planned_capacity(&self) -> bool {
         match self.planned_capacity {
             Some(cap) => {
-                self.seq_len <= cap
-                    && self.k.capacity() >= self.seq_len * self.n_kv_heads * self.head_dim
+                self.positions <= cap
+                    && self.k.capacity() >= self.positions * self.n_kv_heads * self.head_dim
             }
             None => false,
         }
@@ -662,7 +737,9 @@ impl PagedKvCache {
             cache.k.extend_from_slice(store.k_row(block_id, offset));
             cache.v.extend_from_slice(store.v_row(block_id, offset));
         }
-        cache.seq_len = self.seq_len;
+        // The paged store does not evict either, so its positions and
+        // its rows agree and this one assignment is both.
+        cache.set_positions(self.seq_len);
         cache
     }
 
@@ -1283,7 +1360,7 @@ mod tests {
         }
 
         let flat = cache.to_contiguous(&store);
-        assert_eq!(flat.seq_len, 5);
+        assert_eq!(flat.positions(), 5);
         assert_eq!(flat.k.len(), 5 * 4);
         for (i, r) in rows.iter().enumerate() {
             assert_eq!(&flat.k[i * 4..(i + 1) * 4], r, "position {i} k");
@@ -1300,7 +1377,7 @@ mod tests {
         let again = rebuilt.to_contiguous(&store2);
         assert_eq!(again.k, flat.k);
         assert_eq!(again.v, flat.v);
-        assert_eq!(again.seq_len, flat.seq_len);
+        assert_eq!(again.positions(), flat.positions());
     }
 
     #[test]
@@ -1309,11 +1386,11 @@ mod tests {
         cache
             .push(&[1.0, 2.0, 3.0, 4.0], &[5.0, 6.0, 7.0, 8.0])
             .unwrap();
-        assert_eq!(cache.seq_len, 1);
+        assert_eq!(cache.positions(), 1);
         cache
             .push(&[9.0, 10.0, 11.0, 12.0], &[13.0, 14.0, 15.0, 16.0])
             .unwrap();
-        assert_eq!(cache.seq_len, 2);
+        assert_eq!(cache.positions(), 2);
         assert_eq!(cache.k.len(), 2 * 2 * 2);
         assert_eq!(cache.k[4], 9.0);
     }
@@ -1330,7 +1407,7 @@ mod tests {
         let mut cache = KvCache::new(1, 1);
         cache.push(&[1.0], &[2.0]).unwrap();
         cache.clear();
-        assert_eq!(cache.seq_len, 0);
+        assert_eq!(cache.positions(), 0);
         assert!(cache.k.is_empty());
     }
 
@@ -1346,10 +1423,10 @@ mod tests {
         cache
             .push(&[9.0, 9.0, 9.0, 9.0], &[90.0, 90.0, 90.0, 90.0])
             .unwrap();
-        assert_eq!(cache.seq_len, 3);
+        assert_eq!(cache.positions(), 3);
 
         cache.truncate(1);
-        assert_eq!(cache.seq_len, 1);
+        assert_eq!(cache.positions(), 1);
         assert_eq!(cache.k, vec![1.0, 2.0, 3.0, 4.0]);
         assert_eq!(cache.v, vec![10.0, 20.0, 30.0, 40.0]);
     }
@@ -1359,7 +1436,7 @@ mod tests {
         let mut cache = KvCache::new(1, 2);
         cache.push(&[1.0, 2.0], &[3.0, 4.0]).unwrap();
         cache.truncate(1);
-        assert_eq!(cache.seq_len, 1);
+        assert_eq!(cache.positions(), 1);
         assert_eq!(cache.k, vec![1.0, 2.0]);
     }
 
@@ -1368,7 +1445,7 @@ mod tests {
         let mut cache = KvCache::new(1, 2);
         cache.push(&[1.0, 2.0], &[3.0, 4.0]).unwrap();
         cache.truncate(0);
-        assert_eq!(cache.seq_len, 0);
+        assert_eq!(cache.positions(), 0);
         assert!(cache.k.is_empty());
         assert!(cache.v.is_empty());
     }
@@ -1389,7 +1466,7 @@ mod tests {
         cache.push(&[3.0], &[30.0]).unwrap(); // this one will be "rejected"
         cache.truncate(2);
         cache.push(&[99.0], &[990.0]).unwrap(); // real continuation after rejection
-        assert_eq!(cache.seq_len, 3);
+        assert_eq!(cache.positions(), 3);
         assert_eq!(cache.k, vec![1.0, 2.0, 99.0]);
         assert_eq!(cache.v, vec![10.0, 20.0, 990.0]);
     }
@@ -1429,7 +1506,7 @@ mod tests {
             cache.allocated_bytes()
         );
         // Nothing has been pushed yet, but the memory is already reserved.
-        assert_eq!(cache.seq_len, 0);
+        assert_eq!(cache.positions(), 0);
     }
 
     #[test]
@@ -1449,7 +1526,7 @@ mod tests {
         let pool = Arc::new(Mutex::new(KvBlockPool::new(4, 10)));
         let cache = KvCache::with_pool(2, 2, pool.clone(), 0).unwrap();
         assert_eq!(pool.lock().unwrap().free_blocks(), 9);
-        assert_eq!(cache.seq_len, 0);
+        assert_eq!(cache.positions(), 0);
     }
 
     #[test]
@@ -1480,7 +1557,7 @@ mod tests {
         // The third position crosses into a second block.
         cache.push(&[3.0], &[3.0]).unwrap();
         assert_eq!(pool.lock().unwrap().free_blocks(), 8);
-        assert_eq!(cache.seq_len, 3);
+        assert_eq!(cache.positions(), 3);
         assert_eq!(cache.k, vec![1.0, 2.0, 3.0]);
     }
 
@@ -1496,7 +1573,11 @@ mod tests {
         let before_k = cache.k.clone();
         let result = cache.push(&[2.0], &[2.0]);
         assert_eq!(result, Err(KvPoolExhausted));
-        assert_eq!(cache.seq_len, 1, "a failed push must not change seq_len");
+        assert_eq!(
+            cache.positions(),
+            1,
+            "a failed push must not change seq_len"
+        );
         assert_eq!(cache.k, before_k, "a failed push must not append data");
     }
 
@@ -1623,5 +1704,51 @@ mod tests {
         assert_eq!(p.free_blocks(), 32 - in_use);
         drop(p);
         drop(held);
+    }
+
+    /// Positions and rows agree for every store that does not evict,
+    /// and this pins that they are DERIVED separately rather than one
+    /// being an alias for the other.
+    ///
+    /// The point of the split is #61: a windowed layer will drop rows
+    /// behind its window while its position count keeps climbing. Until
+    /// then the two are equal, so this test cannot prove much about
+    /// eviction. What it CAN prove, and what matters, is that `rows`
+    /// reads the buffer rather than the counter: set the counter to a
+    /// lie and `rows` still reports the truth.
+    #[test]
+    fn rows_is_read_from_the_buffer_and_positions_from_the_counter() {
+        let mut cache = KvCache::new(2, 4);
+        for i in 0..5 {
+            let step = vec![i as f32; 8];
+            cache.push(&step, &step).expect("unbounded growth");
+        }
+        assert_eq!(cache.positions(), 5);
+        assert_eq!(cache.rows(), 5, "nothing evicts, so they agree");
+
+        // The counter lies; the buffer does not.
+        cache.force_positions_for_test(99);
+        assert_eq!(cache.positions(), 99);
+        assert_eq!(
+            cache.rows(),
+            5,
+            "rows must come from k/v, or it is just a second name for the counter"
+        );
+    }
+
+    /// `truncate` is measured in POSITIONS, and it moves both, because
+    /// nothing evicts yet. Written down because it is the first thing
+    /// eviction changes: a truncate target will stop being a row index.
+    #[test]
+    fn truncate_moves_positions_and_rows_together_while_nothing_evicts() {
+        let mut cache = KvCache::new(1, 2);
+        for i in 0..4 {
+            let step = vec![i as f32; 2];
+            cache.push(&step, &step).expect("unbounded growth");
+        }
+        cache.truncate(2);
+        assert_eq!(cache.positions(), 2);
+        assert_eq!(cache.rows(), 2);
+        assert_eq!(cache.k.len(), 4, "two positions of two elements each");
     }
 }

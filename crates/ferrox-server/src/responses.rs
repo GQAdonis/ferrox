@@ -611,6 +611,7 @@ fn to_chat_request(req: &ResponsesRequest) -> Result<ChatCompletionRequest, ApiE
         .map(str::to_string);
 
     let request = ChatCompletionRequest {
+        samplers: None,
         model: req.model.clone(),
         messages,
         max_tokens,

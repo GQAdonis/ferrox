@@ -16,6 +16,7 @@
 
 use crate::penalty_window::PenaltyWindow;
 use crate::sampler_chain::Candidates;
+use crate::sampler_order::{ChainStep, SamplerOrder};
 
 /// Sampling parameters for one generation request. `temperature <= 0.0`
 /// means "sample nothing, take the greedy argmax" -- the same
@@ -66,6 +67,18 @@ pub struct SamplingParams {
     /// count` from logits for each token id seen in the
     /// [`PenaltyWindow`].
     pub frequency_penalty: f32,
+    /// The ORDER the chain above runs in, llama.cpp's `--samplers`.
+    ///
+    /// Not a cosmetic setting. Each filter renormalises over the
+    /// survivors of the last one, so moving a step changes which
+    /// candidates the next step can see -- ferrox has already shipped
+    /// that bug once, with temperature running first.
+    ///
+    /// The default is ferrox's existing chain
+    /// (`penalties;top_k;top_p;min_p;temperature`), so a caller that
+    /// never touches this field samples exactly what it always did. See
+    /// [`crate::sampler_order`].
+    pub sampler_order: SamplerOrder,
 }
 
 impl Default for SamplingParams {
@@ -81,6 +94,7 @@ impl Default for SamplingParams {
             penalty_last_n: 64,
             presence_penalty: 0.0,
             frequency_penalty: 0.0,
+            sampler_order: SamplerOrder::default(),
         }
     }
 }
@@ -449,13 +463,36 @@ pub fn sampling_distribution(
 /// the shrinking candidate list llama.cpp passes down the chain --
 /// including the renormalisation between steps that a keep-mask cannot
 /// express. See that module's header.
+///
+/// # The order is now the caller's
+///
+/// `params.sampler_order` says which steps run and in what sequence,
+/// which is llama.cpp's `--samplers`. It DEFAULTS to the sequence
+/// written out above, so a caller that never sets it gets exactly the
+/// chain this function used to hardcode -- asserted bit-for-bit by
+/// [`tests::the_default_order_is_the_chain_ferrox_already_ran`].
+///
+/// The `match` is exhaustive over [`ChainStep`] with no `..`: a step
+/// added to the order's vocabulary stops this compiling until it has
+/// something to run. And because [`SamplerOrder`] can only be built out
+/// of steps ferrox implements, there is no arm here that means "asked
+/// for, silently not done".
 fn filtered_distribution(scores: Vec<f32>, params: &SamplingParams) -> Vec<f32> {
     let vocab = scores.len();
     let mut candidates = Candidates::new(&scores);
-    candidates.top_k(params.top_k);
-    candidates.top_p(params.top_p);
-    candidates.min_p(params.min_p);
-    candidates.temperature(params.temperature);
+    for &step in params.sampler_order.steps() {
+        match step {
+            // Already applied to `scores`, before the candidate list
+            // existed. `SamplerOrder` refuses a `penalties` that is not
+            // first precisely so that this is the same position the
+            // caller asked for; see `SamplerOrderError::PenaltiesNotFirst`.
+            ChainStep::Penalties => {}
+            ChainStep::TopK => candidates.top_k(params.top_k),
+            ChainStep::TopP => candidates.top_p(params.top_p),
+            ChainStep::MinP => candidates.min_p(params.min_p),
+            ChainStep::Temperature => candidates.temperature(params.temperature),
+        }
+    }
     candidates.into_distribution(vocab)
 }
 
@@ -481,11 +518,20 @@ fn filtered_distribution(scores: Vec<f32>, params: &SamplingParams) -> Vec<f32> 
 /// The sign convention is llama.cpp's and its comment explains it:
 /// dividing alone would make tokens with NEGATIVE logits more likely,
 /// so negatives are multiplied instead.
+///
+/// A chain that does not name `penalties` does not penalise. llama.cpp
+/// reads an omitted sampler as "do not run it", and this function is the
+/// one place the penalties happen -- on the greedy path as well as the
+/// sampled one -- so the check belongs here rather than beside the
+/// candidate list, where the greedy path would never see it.
 fn apply_history_penalties(
     scores: &mut [f32],
     params: &SamplingParams,
     history: PenaltyWindow<'_>,
 ) {
+    if !params.sampler_order.has_penalties() {
+        return;
+    }
     if params.repetition_penalty == 1.0
         && params.presence_penalty == 0.0
         && params.frequency_penalty == 0.0
@@ -528,6 +574,255 @@ fn argmax(logits: &[f32]) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sampler_order::SamplerOrder;
+
+    /// A deterministic, uninteresting-on-purpose logit vector: no ties,
+    /// a wide dynamic range, and a few negatives so the penalty's sign
+    /// convention is exercised.
+    fn spread_logits(vocab: usize) -> Vec<f32> {
+        (0..vocab)
+            .map(|i| ((i as f32 * 12.9898).sin() * 43_758.547).fract() * 8.0 - 3.0)
+            .collect()
+    }
+
+    /// The chain `filtered_distribution` ran BEFORE the order became a
+    /// parameter, written out by hand.
+    ///
+    /// Deliberately not built from `SamplerOrder`: a reference that read
+    /// the order it is supposed to be pinning would agree with any
+    /// reordering, which is the shape of test that proves nothing.
+    fn the_chain_ferrox_used_to_hardcode(
+        logits: &[f32],
+        params: &SamplingParams,
+        history: PenaltyWindow<'_>,
+    ) -> Vec<f32> {
+        let mut scores = logits.to_vec();
+        apply_history_penalties(&mut scores, params, history);
+        let vocab = scores.len();
+        let mut candidates = Candidates::new(&scores);
+        candidates.top_k(params.top_k);
+        candidates.top_p(params.top_p);
+        candidates.min_p(params.min_p);
+        candidates.temperature(params.temperature);
+        candidates.into_distribution(vocab)
+    }
+
+    /// **A run that does not ask for an order samples exactly what it
+    /// always did.** Bit-for-bit, against the chain written out by hand
+    /// rather than read back off `SamplerOrder`.
+    ///
+    /// This is the assertion that makes `--samplers` safe to add at all.
+    /// The order is not a reordering of independent steps: each filter
+    /// renormalises over the survivors of the last, so a default that
+    /// drifted by one position would change every generation on every
+    /// model, silently, with every other test in this file still green.
+    ///
+    /// Swap any two entries of `sampler_order::DEFAULT_STEPS` and this
+    /// goes red.
+    #[test]
+    fn the_default_order_is_the_chain_ferrox_already_ran() {
+        let logits = spread_logits(64);
+        let prompt = [3usize, 9, 17, 9];
+        let generated = [9usize, 40, 3];
+        // Every filter switched on, and all three penalties, so there is
+        // something for a misplaced step to change.
+        // Every adjacent pair of the default chain has to be
+        // DISTINGUISHED by at least one row, or the assertion below
+        // passes for a chain in the wrong order. `top_k 5` with
+        // `top_p 0.9` separates top-k from top-p (top-p over the whole
+        // vocabulary keeps far more than five, so which runs first
+        // decides the answer); `min_p 0.2` separates top-p from min-p;
+        // any temperature away from 1.0 separates min-p from
+        // temperature.
+        for (temperature, top_k, top_p, min_p) in [
+            (0.8f32, 5usize, 0.9f32, 0.05f32),
+            (4.0, 3, 0.85, 0.2),
+            (0.2, 8, 0.95, 0.1),
+            (1.0, 40, 0.5, 0.02),
+            (0.8, 40, 0.95, 0.05),
+        ] {
+            let params = SamplingParams {
+                temperature,
+                top_k,
+                top_p,
+                min_p,
+                repetition_penalty: 1.1,
+                presence_penalty: 0.3,
+                frequency_penalty: 0.4,
+                ..SamplingParams::default()
+            };
+            let window = || PenaltyWindow::new(&prompt, &generated);
+            let expected = the_chain_ferrox_used_to_hardcode(&logits, &params, window());
+            let actual = sampling_distribution(&logits, &params, window());
+            for (i, (a, e)) in actual.iter().zip(expected.iter()).enumerate() {
+                assert_eq!(
+                    a.to_bits(),
+                    e.to_bits(),
+                    "token {i} at temp {temperature}, top_k {top_k}, top_p {top_p}, \
+                     min_p {min_p}: the default order sampled {a} where the chain ferrox \
+                     already ran gives {e}"
+                );
+            }
+        }
+    }
+
+    /// And the same at the token level: the ids a seeded `Sampler` draws
+    /// under `SamplingParams::default()` are the ids it draws when the
+    /// caller spells out the default chain, so the flag's default value
+    /// and the struct's default are one chain and not two.
+    #[test]
+    fn spelling_out_the_default_chain_draws_the_same_tokens() {
+        let logits = spread_logits(48);
+        let base = SamplingParams {
+            temperature: 0.8,
+            top_k: 40,
+            top_p: 0.95,
+            min_p: 0.05,
+            repetition_penalty: 1.1,
+            ..SamplingParams::default()
+        };
+        let spelled = SamplingParams {
+            sampler_order: "penalties;top_k;top_p;min_p;temperature"
+                .parse::<SamplerOrder>()
+                .expect("the default chain must parse"),
+            ..base.clone()
+        };
+        let draw = |params: &SamplingParams| {
+            let mut sampler = Sampler::new(0xFE0);
+            let mut generated: Vec<usize> = Vec::new();
+            for _ in 0..64 {
+                let next = sampler.sample(&logits, params, PenaltyWindow::new(&[7], &generated));
+                generated.push(next);
+            }
+            generated
+        };
+        assert_eq!(draw(&base), draw(&spelled));
+    }
+
+    /// **The flag does something.** A chain that runs the temperature
+    /// before top-p keeps a different candidate set than the default,
+    /// which is the whole reason the order is worth exposing -- and the
+    /// reason getting it wrong is a silent quality regression rather
+    /// than an error.
+    ///
+    /// A hot temperature flattens the distribution, so a top-p applied
+    /// after it sums smaller probabilities and reaches `p` later,
+    /// keeping MORE candidates.
+    #[test]
+    fn running_the_temperature_first_keeps_a_different_candidate_set() {
+        let logits = vec![6.0f32, 4.0, 2.0, 0.0, -2.0, -4.0];
+        let params = |order: &str| SamplingParams {
+            temperature: 8.0,
+            top_p: 0.9,
+            top_k: 0,
+            min_p: 0.0,
+            sampler_order: order.parse().expect("chain"),
+            ..SamplingParams::default()
+        };
+        let support = |order: &str| -> Vec<bool> {
+            sampling_distribution(&logits, &params(order), PenaltyWindow::new(&[], &[]))
+                .iter()
+                .map(|&p| p > 0.0)
+                .collect()
+        };
+
+        let default = support("penalties;top_k;top_p;min_p;temperature");
+        let temperature_first = support("penalties;temperature;top_k;top_p;min_p");
+        assert_ne!(
+            default, temperature_first,
+            "reordering the chain must change which candidates survive, \
+             or the flag is decorative"
+        );
+        assert!(
+            temperature_first.iter().filter(|&&k| k).count()
+                > default.iter().filter(|&&k| k).count(),
+            "temp 8.0 flattens the distribution, so a later top-p keeps more: \
+             default={default:?} temperature_first={temperature_first:?}"
+        );
+    }
+
+    /// A sampler left OUT of the chain does not run, even though its
+    /// knob is set -- llama.cpp reads an omitted sampler as "do not run
+    /// it", and a chain that ran it anyway would be honouring a request
+    /// nobody made.
+    #[test]
+    fn a_sampler_absent_from_the_chain_does_not_filter() {
+        let logits = vec![4.0f32, 3.0, 2.0, 1.0];
+        let with_min_p = SamplingParams {
+            temperature: 1.0,
+            min_p: 0.2,
+            ..SamplingParams::default()
+        };
+        let survivors = |params: &SamplingParams| {
+            sampling_distribution(&logits, params, PenaltyWindow::new(&[], &[]))
+                .iter()
+                .filter(|&&p| p > 0.0)
+                .count()
+        };
+        // The default chain runs min-p: 4 + ln(0.2) = 2.3905 keeps two.
+        assert_eq!(survivors(&with_min_p), 2);
+
+        let without_min_p = SamplingParams {
+            sampler_order: "penalties;top_k;top_p;temperature".parse().expect("chain"),
+            ..with_min_p.clone()
+        };
+        assert_eq!(
+            survivors(&without_min_p),
+            4,
+            "`min_p` is set but not in the chain, so nothing should truncate"
+        );
+    }
+
+    /// Leaving `penalties` out of the chain disables the penalties, on
+    /// the SAMPLED path and on the greedy one.
+    ///
+    /// The greedy half is the one that would have been missed: the
+    /// penalties are applied before the candidate list exists, so a
+    /// check placed beside the chain would never run at `temp <= 0`,
+    /// and `--samplers` without `penalties` would still have penalised.
+    #[test]
+    fn a_chain_without_penalties_does_not_penalise_on_either_path() {
+        // Token 0 leads token 1 by less than the 1.1 penalty.
+        let logits = vec![4.0f32, 3.9];
+        let history = || PenaltyWindow::new(&[0], &[]);
+        let greedy = SamplingParams {
+            temperature: 0.0,
+            repetition_penalty: 1.1,
+            ..SamplingParams::default()
+        };
+        let mut sampler = Sampler::new(1);
+        assert_eq!(
+            sampler.sample(&logits, &greedy, history()),
+            1,
+            "the default chain penalises the prompt token"
+        );
+
+        let unpenalised = SamplingParams {
+            sampler_order: "top_k;top_p;min_p;temperature".parse().expect("chain"),
+            ..greedy.clone()
+        };
+        assert!(!unpenalised.sampler_order.has_penalties());
+        assert_eq!(
+            sampler.sample(&logits, &unpenalised, history()),
+            0,
+            "`penalties` is not in the chain, so the argmax must stand"
+        );
+
+        // And on the sampled path, where the whole distribution is
+        // visible rather than one argmax.
+        let sampled = SamplingParams {
+            temperature: 1.0,
+            ..unpenalised
+        };
+        let with = SamplingParams {
+            sampler_order: SamplerOrder::default(),
+            ..sampled.clone()
+        };
+        assert_ne!(
+            sampling_distribution(&logits, &sampled, history()),
+            sampling_distribution(&logits, &with, history())
+        );
+    }
 
     /// A token that has only ever appeared in the PROMPT is penalised
     /// on the very first generated position, and that changes which

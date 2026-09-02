@@ -400,7 +400,9 @@ pub fn decode_block(bytes: &[u8]) -> Result<DecodedBlock, BlockFormatError> {
         let mut cache = KvCache::new(n_kv_heads, head_dim);
         cache.k = k;
         cache.v = v;
-        cache.seq_len = tokens;
+        // The rows were just written by hand, so this is the one place
+        // a position count is set rather than counted by `push`.
+        cache.set_positions(tokens);
         layers.push(cache);
     }
 
@@ -2267,7 +2269,7 @@ mod tests {
         for (a, b) in read.layers().iter().zip(copy.layers()) {
             assert_eq!(a.k, b.k);
             assert_eq!(a.v, b.v);
-            assert_eq!(a.seq_len, b.seq_len);
+            assert_eq!(a.positions(), b.positions());
         }
         let stats = store.stats();
         assert_eq!(stats.hits, 1);

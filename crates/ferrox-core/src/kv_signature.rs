@@ -305,12 +305,19 @@ fn measure_layer(index: usize, layer: &KvCache, per_token: usize) -> Result<usiz
         });
     }
     let tokens = layer.k.len() / per_token;
-    if layer.seq_len != tokens {
+    // Positions against rows. They are equal for anything this codec
+    // can currently produce, and a payload where they disagree is
+    // ragged rather than windowed. When a store learns to evict (#61)
+    // a restored windowed layer will legitimately carry more positions
+    // than rows, and THIS CHECK IS WHERE THAT HAS TO BE TAUGHT: the
+    // codec will need to serialize the position count separately
+    // instead of deriving it from the byte length.
+    if layer.positions() != tokens {
         return Err(SignatureError::RaggedPayload {
             layer: index,
-            field: "seq_len",
+            field: "positions",
             expected: tokens.to_string(),
-            found: layer.seq_len.to_string(),
+            found: layer.positions().to_string(),
         });
     }
     Ok(tokens)
@@ -690,14 +697,15 @@ mod tests {
     #[test]
     fn a_layer_whose_seq_len_contradicts_its_buffers_is_rejected() {
         let mut layers = payload(2, 2, 8, 4);
-        layers[1].seq_len = 7;
+        // The contradiction is the thing under test.
+        layers[1].force_positions_for_test(7);
         let err = CacheSignature::from_payload("model-a", flat(4), &layers)
             .expect_err("seq_len must be verified, not believed");
         assert_eq!(
             err,
             SignatureError::RaggedPayload {
                 layer: 1,
-                field: "seq_len",
+                field: "positions",
                 expected: "4".into(),
                 found: "7".into(),
             }

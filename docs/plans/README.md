@@ -18,7 +18,7 @@ Three items are large enough to carry their own design document:
   samples. What is missing is a drafter worth having.
 - **[`model-layer-reorg.md`](model-layer-reorg.md)**, splitting the
   decoder so architectures scale. It was 6438 lines when that document
-  was written and is 6875 today.
+  was written and is 6702 today, the first time it has shrunk.
 - **[`out-of-core-moe.md`](out-of-core-moe.md)**, running a 155 GB model
   on a 32 GB machine.
 
@@ -50,9 +50,9 @@ rather than by whether the architecture name is known:
 
 | Outcome | Count |
 |---|---|
-| Runs, **with evidence** | **11** (`capability::AUDITED_GENERIC_GQA`) |
+| Runs, **with evidence** | **16** (`capability::AUDITED_GENERIC_GQA`) |
 | Loads on a dedicated engine, no cross-engine evidence | 4 engines (`Mla`, `Glm52`, `Kimi`, `Gemma4`) |
-| Refuses as **unaudited**, now triaged | 46 |
+| Refuses as **unaudited**, now triaged | 41 |
 | Off the generic path: refuses by name, or reaches one of those 4 engines | 90 (58 `dedicated` + 32 `deferred` in the manifest) |
 | **Loads and is WRONG** | **closed** |
 
@@ -68,13 +68,15 @@ position embeddings as though they were NEOX RoPE (`gpt2`, `mpt`,
 `refact`, `bloom`, `jais`) are `DedicatedOnly` refusals, pinned by a
 test that they can never be re-listed as audited.
 
-The 46 unaudited refusals split 9 fixture-away / 7 one-match-arm /
+The 41 unaudited refusals split 9 fixture-away / 2 one-match-arm /
 26 new-code / 4 unknown, each naming the `llama.cpp/src/models/*.cpp`
-line that decides it.
+line that decides it. Five of the seven one-match-arm rows were closed on
+2026-09-02 (`seed_oss`, `maincoder`, `bailingmoe`, `deepseek`,
+`hunyuan-moe`), each with a libllama-golden fixture.
 
 | | llama.cpp | ferrox |
 |---|---|---|
-| Per-architecture graphs | 140 hand-written | 150 catalog rows, **11 proven** |
+| Per-architecture graphs | 140 hand-written | 150 catalog rows, **16 proven** |
 | Metal `pp512` | baseline | 0.98x-1.10x, at parity |
 | Metal `tg128` | baseline | **8 of 12 rows faster** |
 | CPU, all rows | baseline | **1.41x-5.06x slower** |

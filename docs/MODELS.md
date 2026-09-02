@@ -172,14 +172,14 @@ Gemma-3-1B only, and 1B is neither 27B nor rope-scaled, so it is
 untouched by both corrections. Tracked as
 [#63](https://github.com/antonellof/ferrox/issues/63).
 
-   `gemma2`, `gemma3`, `phi3`, `gpt-oss`, `dots1`). The other **46**
+   `gemma2`, `gemma3`, `phi3`, `gpt-oss`, `dots1`). The other **41**
    stop with `UnauditedArchitecture`. `FERROX_ALLOW_UNAUDITED_ARCH=1`
    runs one anyway; compare the output against llama.cpp yourself
    before you trust it.
 
 ### What "unaudited" costs you, per architecture
 
-"Unaudited" is not one thing. Some of the 46 are one fixture away from
+"Unaudited" is not one thing. Some of the 41 are one fixture away from
 running and some need an attention implementation, so the refusal says
 which, with the `llama.cpp/src/models/*.cpp` line that decides it:
 
@@ -190,7 +190,7 @@ which, with the `llama.cpp/src/models/*.cpp` line that decides it:
 | `NEW CODE` | A different attention or residual structure. Not close. |
 | `UNKNOWN` | Reading both trees did not settle it. The message says what would. |
 
-All 46 have now been read on both sides (`ferrox_models::capability`,
+All 41 have now been read on both sides (`ferrox_models::capability`,
 pinned by `crates/ferrox-models/tests/unaudited_triage.rs`). The
 distribution is the headline answer to "how far is Ferrox from llama.cpp
 on models":

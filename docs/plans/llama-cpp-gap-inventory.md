@@ -50,7 +50,7 @@ which edits no existing file.**
 
 | | llama.cpp | ferrox | Evidence |
 |---|---|---|---|
-| Per-architecture graph files | **140** | n/a (one shared decoder + 4 dedicated engines) | `ls .scratch/llama.cpp/src/models/*.cpp` = 140; `crates/ferrox-models/src/decoder.rs` is 6875 lines |
+| Per-architecture graph files | **140** | n/a (one shared decoder + 4 dedicated engines) | `ls .scratch/llama.cpp/src/models/*.cpp` = 140; `crates/ferrox-models/src/decoder.rs` is 6702 lines |
 | Architecture strings in the registry | 140 + `(unknown)` sentinel | **150 rows, and every one of llama.cpp's 140 is present** | `.scratch/llama.cpp/src/llama-arch.cpp` `LLM_ARCH_NAMES`; `capability.rs:230-982` |
 | Strings that reach an executing path | 140 | **11** audited generic + 4 dedicated engines | `capability.rs:99-119`, `engine_factory.rs:114-122` |
 | Strings on ferrox's generic path but **not** audited (refuse today) | n/a | **47** | 20 at `capability.rs:242-265`, 31 at `:266-306`, 7 explicit pushes at `:504-647`, minus the 11 audited |

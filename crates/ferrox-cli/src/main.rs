@@ -13,6 +13,7 @@ mod host_state;
 mod http;
 mod layer_divergence;
 mod parity;
+mod perplexity;
 mod pull;
 mod quant_sensitivity;
 mod quantize;
@@ -228,6 +229,29 @@ enum Commands {
         /// Compiled reference dumper (see .local-scripts/llama_logits.c).
         #[arg(long)]
         dumper: Option<String>,
+    },
+    /// Corpus perplexity, llama.cpp's `perplexity` tool.
+    ///
+    /// `parity` compares one distribution and `verify` compares text;
+    /// neither says whether a quantized checkpoint is WORSE. This scores
+    /// a whole corpus in non-overlapping `--ctx-size` windows, scoring
+    /// only each window's second half, and reports `exp(mean nll)` with
+    /// a standard error — upstream's method, so the number is
+    /// comparable to a published one.
+    Perplexity {
+        /// GGUF to score.
+        #[arg(short = 'm', long)]
+        model: String,
+        /// Plain-text corpus. `crates/ferrox-cli/tests/corpus/` has one.
+        #[arg(short = 'f', long)]
+        file: String,
+        /// Window length. 512 is llama.cpp's `perplexity` default, and a
+        /// perplexity at another context is not comparable to one at 512.
+        #[arg(short = 'c', long = "ctx-size", default_value_t = perplexity::DEFAULT_CTX)]
+        ctx_size: usize,
+        /// Stop after this many windows (default: as many as fit).
+        #[arg(long)]
+        chunks: Option<usize>,
     },
     /// Find the layer where a GPU backend starts disagreeing with the
     /// CPU reference, rather than the token.
@@ -494,6 +518,7 @@ const SUBCOMMANDS: &[&str] = &[
     "quant-sensitivity",
     "quantize",
     "parity",
+    "perplexity",
     "speculative",
     "run-kimi",
     "help",
@@ -609,6 +634,12 @@ fn instance_target(command: &Commands) -> Option<(&'static str, Option<String>)>
         Commands::QuantSensitivity { model, .. } => {
             Some(("quant-sensitivity", Some(model.clone())))
         }
+        // Registered for the same reason `quant-sensitivity` is: it holds
+        // a whole checkpoint resident for as long as the corpus takes,
+        // which is the case the one-model-per-host rule exists for. It is
+        // not a timing, so `--allow-multiple-instances` costs nothing but
+        // the words.
+        Commands::Perplexity { model, .. } => Some(("perplexity", Some(model.clone()))),
         Commands::Bench {
             model,
             suite,
@@ -929,6 +960,19 @@ fn main() -> anyhow::Result<()> {
                 prompt_tokens,
                 top_k,
                 dumper,
+            });
+        }
+        Commands::Perplexity {
+            model,
+            file,
+            ctx_size,
+            chunks,
+        } => {
+            return perplexity::run(perplexity::PerplexityArgs {
+                model,
+                file,
+                ctx_size,
+                chunks,
             });
         }
         Commands::LayerDivergence {

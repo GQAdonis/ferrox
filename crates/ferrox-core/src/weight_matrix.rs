@@ -22,188 +22,159 @@ pub mod gpu_backend;
 use gpu_backend::BackendDispatch;
 use gpu_backend::{with_gpu_backend_caps, with_gpu_backends, BackendCaps, Cuda, Metal};
 
-#[allow(dead_code)]
-type Q4kRepackCache = Mutex<HashMap<(usize, usize), Arc<[u8]>>>;
-type Q5kRepackCache = Mutex<HashMap<(usize, usize), Arc<[u8]>>>;
-type Q6kRepackCache = Mutex<HashMap<(usize, usize), Arc<[u8]>>>;
-type Q8x4RepackCache = Mutex<HashMap<(usize, usize), Arc<[u8]>>>;
-type Q4x4RepackCache = Mutex<HashMap<(usize, usize), Arc<[u8]>>>;
-
-/// Repack without touching the cache, for buffers whose address is
-/// recycled (see `WeightBytes::address_is_stable`).
-#[allow(dead_code)]
-fn repack_q4k_uncached(data: &[u8], rows: usize, cols: usize) -> Arc<[u8]> {
-    let interleave = ferrox_quant::q4_kx8_interleave();
-    let packed = ferrox_quant::pack_q4_k_matrix_x8(data, rows, cols, interleave);
-    Arc::from(packed.into_boxed_slice())
+/// Identity of the memory mapping a repacked buffer was built from.
+///
+/// The repack caches below key on a weight's **address**, and an address
+/// is only a stable identity for as long as the mapping that published
+/// it is alive. Unmap one file and map another and the kernel will hand
+/// the same address straight back -- a textbook ABA. The cache then
+/// serves one matrix another matrix's interleaved bytes, which panicked
+/// with an out-of-range slice when the two shapes differed and was
+/// SILENT, i.e. wrong output, when they matched.
+///
+/// Holding a [`std::sync::Weak`] is what closes it, and it closes both
+/// halves at once:
+///
+/// * while the `Weak` lives, the `Arc`'s control block cannot be
+///   recycled, so [`Self::id`] is a unique name for exactly one mapping
+///   for as long as the cache entry exists; and
+/// * `upgrade()` succeeding proves the mapping itself is still alive,
+///   which is what makes the address it published still mean what it
+///   meant when the entry was written.
+///
+/// A dead `Weak` is therefore a *stale entry*, not a hit, and is
+/// repacked and replaced. The `Weak` holds no mapping open, so nothing
+/// here keeps a file resident.
+#[derive(Clone)]
+pub struct MapId {
+    map: std::sync::Weak<memmap2::Mmap>,
+    id: usize,
+    offset: usize,
 }
 
-/// Repack without touching the cache, for buffers whose address is
-/// recycled (see `WeightBytes::address_is_stable`).
-#[allow(dead_code)]
-fn repack_q5k_uncached(data: &[u8], rows: usize, cols: usize) -> Arc<[u8]> {
-    let interleave = ferrox_quant::q5_kx8_interleave();
-    let packed = ferrox_quant::pack_q5_k_matrix_x8(data, rows, cols, interleave);
-    Arc::from(packed.into_boxed_slice())
+impl MapId {
+    /// True when `other` names the same, still-live mapping.
+    fn matches(&self, other: &MapId) -> bool {
+        self.id == other.id
+            && self.offset == other.offset
+            && self
+                .map
+                .upgrade()
+                .is_some_and(|m| Arc::as_ptr(&m) as usize == other.id)
+    }
 }
 
-/// Repack without touching the cache, for buffers whose address is
-/// recycled (see `WeightBytes::address_is_stable`).
-#[allow(dead_code)]
-fn repack_q6k_uncached(data: &[u8], rows: usize, cols: usize) -> Arc<[u8]> {
-    let interleave = ferrox_quant::q6_kx8_interleave();
-    let packed = ferrox_quant::pack_q6_k_matrix_x8(data, rows, cols, interleave);
-    Arc::from(packed.into_boxed_slice())
-}
+/// `(mapping id, byte offset, rows, cols)`.
+///
+/// `cols` is in the key because two tensors of equal row count and
+/// unequal width are different matrices with different repacked lengths,
+/// and the old `(address, rows)` key called them the same one.
+type RepackKey = (usize, usize, usize, usize);
 
-/// Repack without touching the cache, for buffers whose address is
-/// recycled (see `WeightBytes::address_is_stable`).
-fn repack_q8x4_uncached(data: &[u8], rows: usize, cols: usize) -> Arc<[u8]> {
-    let packed =
-        ferrox_quant::pack_q8_0_matrix_x4(data, rows, cols, ferrox_quant::q8_0x4_interleave());
-    Arc::from(packed.into_boxed_slice())
-}
+/// Interleaved bytes, beside the mapping identity that makes the key
+/// meaningful. See [`MapId`].
+type RepackCache = Mutex<HashMap<RepackKey, (MapId, Arc<[u8]>)>>;
 
-/// Repack without touching the cache, for buffers whose address is
-/// recycled (see `WeightBytes::address_is_stable`).
-fn repack_q4_0x4_uncached(data: &[u8], rows: usize, cols: usize) -> Arc<[u8]> {
-    let packed =
-        ferrox_quant::pack_q4_0_matrix_x4(data, rows, cols, ferrox_quant::q4_0x4_interleave());
-    Arc::from(packed.into_boxed_slice())
+/// The one lookup every format's repack shares.
+///
+/// `id` is `None` for bytes whose address may be recycled under us
+/// (owned buffers, and an expert store's leases -- see
+/// [`WeightBytes::map_id`]), and those always repack.
+fn get_or_repack(
+    cache: &'static RepackCache,
+    id: Option<MapId>,
+    rows: usize,
+    cols: usize,
+    repack: impl FnOnce() -> Vec<u8>,
+) -> Arc<[u8]> {
+    let Some(id) = id else {
+        return Arc::from(repack().into_boxed_slice());
+    };
+    let key = (id.id, id.offset, rows, cols);
+    {
+        let mut cache = cache.lock().unwrap();
+        match cache.get(&key) {
+            Some((entry, hit)) if entry.matches(&id) => return Arc::clone(hit),
+            // The mapping that published this address is gone, so the
+            // address has been handed to somebody else. Drop the entry
+            // rather than leaving a `Weak` pinning a dead control block.
+            Some(_) => {
+                cache.remove(&key);
+            }
+            None => {}
+        }
+    }
+    let arc: Arc<[u8]> = Arc::from(repack().into_boxed_slice());
+    let mut cache = cache.lock().unwrap();
+    // Another thread may have won the race; prefer the existing entry,
+    // but only if it is one this caller would have accepted above.
+    match cache.get(&key) {
+        Some((entry, hit)) if entry.matches(&id) => Arc::clone(hit),
+        _ => {
+            cache.insert(key, (id, Arc::clone(&arc)));
+            arc
+        }
+    }
 }
 
 /// Process-wide cache of interleaved Q4_K (`block_q4_Kx8`) bytes.
-/// Retained for when K-quant Q8_K int-dot is re-enabled after parity
-/// fixes on real Q4_K_M checkpoints.
-#[allow(dead_code)]
-fn q4k_repack_cache() -> &'static Q4kRepackCache {
-    static CACHE: OnceLock<Q4kRepackCache> = OnceLock::new();
+fn q4k_repack_cache() -> &'static RepackCache {
+    static CACHE: OnceLock<RepackCache> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-#[allow(dead_code)]
-fn get_or_repack_q4k(data: &[u8], rows: usize, cols: usize, cacheable: bool) -> Arc<[u8]> {
-    // See `WeightBytes::address_is_stable`. Caching a recycled
-    // buffer by address serves one expert another expert's bytes.
-    if !cacheable {
-        return repack_q4k_uncached(data, rows, cols);
-    }
-    let key = (data.as_ptr() as usize, rows);
-    {
-        let cache = q4k_repack_cache().lock().unwrap();
-        if let Some(hit) = cache.get(&key) {
-            return Arc::clone(hit);
-        }
-    }
-    let interleave = ferrox_quant::q4_kx8_interleave();
-    let packed = ferrox_quant::pack_q4_k_matrix_x8(data, rows, cols, interleave);
-    let arc: Arc<[u8]> = Arc::from(packed.into_boxed_slice());
-    let mut cache = q4k_repack_cache().lock().unwrap();
-    // Another thread may have won the race; prefer the existing entry.
-    Arc::clone(cache.entry(key).or_insert_with(|| Arc::clone(&arc)))
+fn get_or_repack_q4k(data: &[u8], rows: usize, cols: usize, id: Option<MapId>) -> Arc<[u8]> {
+    get_or_repack(q4k_repack_cache(), id, rows, cols, || {
+        ferrox_quant::pack_q4_k_matrix_x8(data, rows, cols, ferrox_quant::q4_kx8_interleave())
+    })
 }
 
 /// Process-wide cache of interleaved Q5_K (`block_q5_Kx8`) bytes.
-fn q5k_repack_cache() -> &'static Q5kRepackCache {
-    static CACHE: OnceLock<Q5kRepackCache> = OnceLock::new();
+fn q5k_repack_cache() -> &'static RepackCache {
+    static CACHE: OnceLock<RepackCache> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn get_or_repack_q5k(data: &[u8], rows: usize, cols: usize, cacheable: bool) -> Arc<[u8]> {
-    // See `WeightBytes::address_is_stable`. Caching a recycled
-    // buffer by address serves one expert another expert's bytes.
-    if !cacheable {
-        return repack_q5k_uncached(data, rows, cols);
-    }
-    let key = (data.as_ptr() as usize, rows);
-    {
-        let cache = q5k_repack_cache().lock().unwrap();
-        if let Some(hit) = cache.get(&key) {
-            return Arc::clone(hit);
-        }
-    }
-    let interleave = ferrox_quant::q5_kx8_interleave();
-    let packed = ferrox_quant::pack_q5_k_matrix_x8(data, rows, cols, interleave);
-    let arc: Arc<[u8]> = Arc::from(packed.into_boxed_slice());
-    let mut cache = q5k_repack_cache().lock().unwrap();
-    Arc::clone(cache.entry(key).or_insert_with(|| Arc::clone(&arc)))
+fn get_or_repack_q5k(data: &[u8], rows: usize, cols: usize, id: Option<MapId>) -> Arc<[u8]> {
+    get_or_repack(q5k_repack_cache(), id, rows, cols, || {
+        ferrox_quant::pack_q5_k_matrix_x8(data, rows, cols, ferrox_quant::q5_kx8_interleave())
+    })
 }
 
-fn q6k_repack_cache() -> &'static Q6kRepackCache {
-    static CACHE: OnceLock<Q6kRepackCache> = OnceLock::new();
+/// Process-wide cache of interleaved Q6_K (`block_q6_Kx8`) bytes.
+fn q6k_repack_cache() -> &'static RepackCache {
+    static CACHE: OnceLock<RepackCache> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn get_or_repack_q6k(data: &[u8], rows: usize, cols: usize, cacheable: bool) -> Arc<[u8]> {
-    // See `WeightBytes::address_is_stable`. Caching a recycled
-    // buffer by address serves one expert another expert's bytes.
-    if !cacheable {
-        return repack_q6k_uncached(data, rows, cols);
-    }
-    let key = (data.as_ptr() as usize, rows);
-    {
-        let cache = q6k_repack_cache().lock().unwrap();
-        if let Some(hit) = cache.get(&key) {
-            return Arc::clone(hit);
-        }
-    }
-    let interleave = ferrox_quant::q6_kx8_interleave();
-    let packed = ferrox_quant::pack_q6_k_matrix_x8(data, rows, cols, interleave);
-    let arc: Arc<[u8]> = Arc::from(packed.into_boxed_slice());
-    let mut cache = q6k_repack_cache().lock().unwrap();
-    Arc::clone(cache.entry(key).or_insert_with(|| Arc::clone(&arc)))
+fn get_or_repack_q6k(data: &[u8], rows: usize, cols: usize, id: Option<MapId>) -> Arc<[u8]> {
+    get_or_repack(q6k_repack_cache(), id, rows, cols, || {
+        ferrox_quant::pack_q6_k_matrix_x8(data, rows, cols, ferrox_quant::q6_kx8_interleave())
+    })
 }
 
 /// Process-wide cache of interleaved Q8_0 (`block_q8_0x4`) bytes.
-fn q8x4_repack_cache() -> &'static Q8x4RepackCache {
-    static CACHE: OnceLock<Q8x4RepackCache> = OnceLock::new();
+fn q8x4_repack_cache() -> &'static RepackCache {
+    static CACHE: OnceLock<RepackCache> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn get_or_repack_q8x4(data: &[u8], rows: usize, cols: usize, cacheable: bool) -> Arc<[u8]> {
-    // See `WeightBytes::address_is_stable`. Caching a recycled
-    // buffer by address serves one expert another expert's bytes.
-    if !cacheable {
-        return repack_q8x4_uncached(data, rows, cols);
-    }
-    let key = (data.as_ptr() as usize, rows);
-    {
-        let cache = q8x4_repack_cache().lock().unwrap();
-        if let Some(hit) = cache.get(&key) {
-            return Arc::clone(hit);
-        }
-    }
-    let packed =
-        ferrox_quant::pack_q8_0_matrix_x4(data, rows, cols, ferrox_quant::q8_0x4_interleave());
-    let arc: Arc<[u8]> = Arc::from(packed.into_boxed_slice());
-    let mut cache = q8x4_repack_cache().lock().unwrap();
-    Arc::clone(cache.entry(key).or_insert_with(|| Arc::clone(&arc)))
+fn get_or_repack_q8x4(data: &[u8], rows: usize, cols: usize, id: Option<MapId>) -> Arc<[u8]> {
+    get_or_repack(q8x4_repack_cache(), id, rows, cols, || {
+        ferrox_quant::pack_q8_0_matrix_x4(data, rows, cols, ferrox_quant::q8_0x4_interleave())
+    })
 }
 
 /// Process-wide cache of interleaved Q4_0 (`block_q4_0x4`) bytes.
-fn q4x4_repack_cache() -> &'static Q4x4RepackCache {
-    static CACHE: OnceLock<Q4x4RepackCache> = OnceLock::new();
+fn q4x4_repack_cache() -> &'static RepackCache {
+    static CACHE: OnceLock<RepackCache> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn get_or_repack_q4_0x4(data: &[u8], rows: usize, cols: usize, cacheable: bool) -> Arc<[u8]> {
-    // See `WeightBytes::address_is_stable`. Caching a recycled
-    // buffer by address serves one expert another expert's bytes.
-    if !cacheable {
-        return repack_q4_0x4_uncached(data, rows, cols);
-    }
-    let key = (data.as_ptr() as usize, rows);
-    {
-        let cache = q4x4_repack_cache().lock().unwrap();
-        if let Some(hit) = cache.get(&key) {
-            return Arc::clone(hit);
-        }
-    }
-    let packed =
-        ferrox_quant::pack_q4_0_matrix_x4(data, rows, cols, ferrox_quant::q4_0x4_interleave());
-    let arc: Arc<[u8]> = Arc::from(packed.into_boxed_slice());
-    let mut cache = q4x4_repack_cache().lock().unwrap();
-    Arc::clone(cache.entry(key).or_insert_with(|| Arc::clone(&arc)))
+fn get_or_repack_q4_0x4(data: &[u8], rows: usize, cols: usize, id: Option<MapId>) -> Arc<[u8]> {
+    get_or_repack(q4x4_repack_cache(), id, rows, cols, || {
+        ferrox_quant::pack_q4_0_matrix_x4(data, rows, cols, ferrox_quant::q4_0x4_interleave())
+    })
 }
 
 /// Backing storage for a quantized weight matrix's raw bytes: either an
@@ -249,21 +220,35 @@ impl WeightBytes {
         self.len() == 0
     }
 
-    /// May a repack cache key on this buffer's ADDRESS?
+    /// The identity a repack cache may key on, or `None` for bytes that
+    /// must never be cached by address.
     ///
-    /// Only for `Mapped`, whose address is a fixed point in a
-    /// process-lifetime mmap. `Shared` is a lease over an expert
-    /// store's recycled buffer: two different experts routinely land at
-    /// the same address, and an address-keyed cache then serves one of
-    /// them the other's repacked bytes. That produced fluent garbage on
+    /// This *replaces* an `address_is_stable() -> bool`, and the boolean
+    /// was the bug: a yes/no answer cannot say whether the mapping that
+    /// made the address meaningful is still alive, so the cache went on
+    /// trusting an address after the mapping behind it was gone. See
+    /// [`MapId`] for the ABA that produces and how the `Weak` closes it.
+    ///
+    /// `Shared` stays `None`, and for a different reason that a `Weak`
+    /// would NOT fix: it is a lease over an expert store's *recycled*
+    /// buffer, so the allocation stays alive and keeps its address while
+    /// its CONTENTS are replaced by another expert's. Identity is stable
+    /// there and still means nothing. That produced fluent garbage on
     /// OLMoE with expert streaming on, while the raw weight bytes
     /// compared equal, because the corruption was in the CACHE and not
     /// in the weights.
     ///
-    /// `Owned` is excluded for the same reason: a freed Vec's address
-    /// can be reused.
-    pub fn address_is_stable(&self) -> bool {
-        matches!(self, WeightBytes::Mapped { .. })
+    /// `Owned` stays `None` too: a freed `Vec`'s address is reused, and
+    /// nothing holds a handle that could witness the free.
+    pub fn map_id(&self) -> Option<MapId> {
+        match self {
+            WeightBytes::Mapped { mmap, range } => Some(MapId {
+                map: Arc::downgrade(mmap),
+                id: Arc::as_ptr(mmap) as usize,
+                offset: range.start,
+            }),
+            WeightBytes::Owned(_) | WeightBytes::Shared { .. } => None,
+        }
     }
 
     /// True if this is a zero-copy mmap view rather than an owned
@@ -1208,7 +1193,7 @@ impl WeightMatrix {
                                     data.as_slice(),
                                     *rows,
                                     *cols,
-                                    data.address_is_stable(),
+                                    data.map_id(),
                                 );
                                 if serial {
                                     for (g, chunk) in out[..n_groups * ferrox_quant::Q8_0X4_NROWS]
@@ -1292,7 +1277,7 @@ impl WeightMatrix {
                                     data.as_slice(),
                                     *rows,
                                     *cols,
-                                    data.address_is_stable(),
+                                    data.map_id(),
                                 );
                                 if serial {
                                     for (g, chunk) in out[..n_groups * ferrox_quant::Q4_0X4_NROWS]
@@ -1372,12 +1357,8 @@ impl WeightMatrix {
                             let n_groups = *rows / ferrox_quant::Q4_KX8_NROWS;
                             if n_groups > 0 {
                                 let interleave = ferrox_quant::q4_kx8_interleave();
-                                let packed = get_or_repack_q4k(
-                                    data.as_slice(),
-                                    *rows,
-                                    *cols,
-                                    data.address_is_stable(),
-                                );
+                                let packed =
+                                    get_or_repack_q4k(data.as_slice(), *rows, *cols, data.map_id());
                                 out[..n_groups * ferrox_quant::Q4_KX8_NROWS]
                                     .par_chunks_mut(ferrox_quant::Q4_KX8_NROWS)
                                     .with_min_len(Self::min_rows_per_task(n_groups).max(1))
@@ -1415,12 +1396,8 @@ impl WeightMatrix {
                             let n_groups = *rows / ferrox_quant::Q5_KX8_NROWS;
                             if n_groups > 0 {
                                 let interleave = ferrox_quant::q5_kx8_interleave();
-                                let packed = get_or_repack_q5k(
-                                    data.as_slice(),
-                                    *rows,
-                                    *cols,
-                                    data.address_is_stable(),
-                                );
+                                let packed =
+                                    get_or_repack_q5k(data.as_slice(), *rows, *cols, data.map_id());
                                 out[..n_groups * ferrox_quant::Q5_KX8_NROWS]
                                     .par_chunks_mut(ferrox_quant::Q5_KX8_NROWS)
                                     .with_min_len(Self::min_rows_per_task(n_groups).max(1))
@@ -1458,12 +1435,8 @@ impl WeightMatrix {
                             let n_groups = *rows / ferrox_quant::Q6_KX8_NROWS;
                             if n_groups > 0 {
                                 let interleave = ferrox_quant::q6_kx8_interleave();
-                                let packed = get_or_repack_q6k(
-                                    data.as_slice(),
-                                    *rows,
-                                    *cols,
-                                    data.address_is_stable(),
-                                );
+                                let packed =
+                                    get_or_repack_q6k(data.as_slice(), *rows, *cols, data.map_id());
                                 out[..n_groups * ferrox_quant::Q6_KX8_NROWS]
                                     .par_chunks_mut(ferrox_quant::Q6_KX8_NROWS)
                                     .with_min_len(Self::min_rows_per_task(n_groups).max(1))
@@ -1558,7 +1531,7 @@ impl WeightMatrix {
         if matches!(kind, QuantKind::Q8_0) {
             let n_groups = *rows / ferrox_quant::Q8_0X4_NROWS;
             if n_groups > 0 {
-                let packed = get_or_repack_q8x4(data, *rows, *cols, /* cacheable = */ false);
+                let packed = get_or_repack_q8x4(data, *rows, *cols, /* uncacheable */ None);
                 let serial = Self::prefer_serial_matvec(*rows, *cols);
                 let body = |g: usize, chunk: &mut [f32]| {
                     ferrox_quant::gemv_q8_0x4_group(
@@ -1615,7 +1588,7 @@ impl WeightMatrix {
         if matches!(kind, QuantKind::Q4_0) {
             let n_groups = *rows / ferrox_quant::Q4_0X4_NROWS;
             if n_groups > 0 {
-                let packed = get_or_repack_q4_0x4(data, *rows, *cols, /* cacheable = */ false);
+                let packed = get_or_repack_q4_0x4(data, *rows, *cols, /* uncacheable */ None);
                 let serial = Self::prefer_serial_matvec(*rows, *cols);
                 let body = |g: usize, chunk: &mut [f32]| {
                     ferrox_quant::gemv_q4_0x4_group(
@@ -2063,12 +2036,8 @@ impl WeightMatrix {
                                 Self::q8_acts(shared, x_batch, batch_size, cols, &mut acts_owned);
                             let n_groups = *rows / ferrox_quant::Q8_0X4_NROWS;
                             if n_groups > 0 {
-                                let packed = get_or_repack_q8x4(
-                                    data.as_slice(),
-                                    *rows,
-                                    cols,
-                                    data.address_is_stable(),
-                                );
+                                let packed =
+                                    get_or_repack_q8x4(data.as_slice(), *rows, cols, data.map_id());
                                 let nrows_g = ferrox_quant::Q8_0X4_NROWS;
                                 let interleave = ferrox_quant::q8_0x4_interleave();
                                 if ferrox_quant::q8_0x4_gemm_uses_acts_x4(interleave) {
@@ -2208,7 +2177,7 @@ impl WeightMatrix {
                                     data.as_slice(),
                                     *rows,
                                     cols,
-                                    data.address_is_stable(),
+                                    data.map_id(),
                                 );
                                 let nrows_g = ferrox_quant::Q4_0X4_NROWS;
                                 let interleave = ferrox_quant::q4_0x4_interleave();
@@ -2341,12 +2310,8 @@ impl WeightMatrix {
                             let n_groups = *rows / ferrox_quant::Q4_KX8_NROWS;
                             if n_groups > 0 {
                                 let interleave = ferrox_quant::q4_kx8_interleave();
-                                let packed = get_or_repack_q4k(
-                                    data.as_slice(),
-                                    *rows,
-                                    cols,
-                                    data.address_is_stable(),
-                                );
+                                let packed =
+                                    get_or_repack_q4k(data.as_slice(), *rows, cols, data.map_id());
                                 let nc = ferrox_quant::Q4_KX8_GEMM_NC;
                                 // On the i8mm path, interleave each quad of
                                 // activations once per matmul (llama.cpp
@@ -2464,12 +2429,8 @@ impl WeightMatrix {
                             };
                             if n_groups > 0 {
                                 let interleave = ferrox_quant::q5_kx8_interleave();
-                                let packed = get_or_repack_q5k(
-                                    data.as_slice(),
-                                    *rows,
-                                    cols,
-                                    data.address_is_stable(),
-                                );
+                                let packed =
+                                    get_or_repack_q5k(data.as_slice(), *rows, cols, data.map_id());
                                 let nc = ferrox_quant::Q5_KX8_GEMM_NC;
                                 // On the i8mm path, interleave each quad of
                                 // activations once per matmul; the kernel
@@ -2593,12 +2554,8 @@ impl WeightMatrix {
                                 0
                             };
                             if n_groups > 0 {
-                                let packed = get_or_repack_q6k(
-                                    data.as_slice(),
-                                    *rows,
-                                    cols,
-                                    data.address_is_stable(),
-                                );
+                                let packed =
+                                    get_or_repack_q6k(data.as_slice(), *rows, cols, data.map_id());
                                 // Quads of 4 (the i8mm tile shape), not
                                 // [`Q6_KX8_GEMM_NC`].
                                 let nc = ferrox_quant::Q8K_ACTS_X4_NC;
@@ -4091,6 +4048,182 @@ mod tests {
             cols,
             kind,
         }
+    }
+
+    // -----------------------------------------------------------------
+    // Repack cache identity (see `MapId`)
+    //
+    // The bug these cover: the caches used to key on `(address, rows)`
+    // and gate on an `address_is_stable() -> bool`. Drop one mmap, make
+    // another, and the kernel hands the same address back, so the cache
+    // served the previous matrix's interleaved bytes -- an out-of-range
+    // panic when the shapes differed, silent wrong output when they
+    // matched.
+    //
+    // Address reuse is the OS's decision and cannot be demanded from a
+    // test, so these do not wait for it. They fabricate exactly what the
+    // cache would SEE in that moment -- a key that collides while the
+    // mapping behind it is gone, or while the width differs -- and
+    // assert the cache refuses to serve it.
+    // -----------------------------------------------------------------
+
+    /// Writes `bytes` to a temp file and maps it. The caller holds the
+    /// `Arc`, so when the mapping dies is explicit, which is the whole
+    /// subject of these tests.
+    fn mapped(tag: &str, bytes: &[u8]) -> (Arc<memmap2::Mmap>, WeightBytes) {
+        let path = std::env::temp_dir().join(format!(
+            "ferrox_repack_{tag}_{}_{:?}.bin",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::write(&path, bytes).expect("write fixture");
+        let file = std::fs::File::open(&path).expect("open fixture");
+        // SAFETY: the file was written and closed above, is named for
+        // this process and thread, and nothing mutates it while mapped.
+        let mmap = Arc::new(unsafe { memmap2::Mmap::map(&file).expect("map fixture") });
+        let _ = std::fs::remove_file(&path);
+        let view = WeightBytes::Mapped {
+            mmap: Arc::clone(&mmap),
+            range: 0..bytes.len(),
+        };
+        (mmap, view)
+    }
+
+    /// Q8_0 bytes with finite scales, `rows * cols/32` blocks.
+    fn q8_0_matrix_bytes(rows: usize, cols: usize, seed: u32) -> Vec<u8> {
+        let mut state = seed | 1;
+        let mut next = move || {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (state >> 24) as u8
+        };
+        let mut data = Vec::with_capacity(rows * (cols / 32) * 34);
+        for _ in 0..rows * (cols / 32) {
+            data.extend_from_slice(&f16_le(0.02 + f32::from(next()) * 0.0004));
+            for _ in 0..32 {
+                data.push(next());
+            }
+        }
+        data
+    }
+
+    /// A `MapId` is only an identity while its mapping is alive. This is
+    /// the check the old boolean could not express, and it is the one
+    /// thing standing between the cache and an ABA.
+    #[test]
+    fn map_id_stops_matching_once_its_mapping_is_dropped() {
+        let (mmap, view) = mapped("live", &q8_0_matrix_bytes(4, 32, 7));
+        let id = view.map_id().expect("Mapped bytes must have an identity");
+        let held = id.clone();
+        assert!(
+            held.matches(&id),
+            "a live mapping must match its own identity"
+        );
+
+        // Everything that could witness the mapping is gone: this is
+        // precisely the moment the address becomes reusable.
+        drop(view);
+        drop(mmap);
+        assert!(
+            !held.matches(&id),
+            "an identity whose mapping is dead must not match, or the \
+             cache will trust an address the kernel has already reissued"
+        );
+    }
+
+    /// A cache entry left behind by a dead mapping must be replaced, not
+    /// served. Fabricates the entry rather than waiting on the OS to
+    /// reissue an address; the entry is byte-for-byte what the old code
+    /// would have left there.
+    #[test]
+    fn stale_repack_entry_is_replaced_not_served() {
+        let (rows, cols) = (8usize, 64usize);
+        let bytes = q8_0_matrix_bytes(rows, cols, 11);
+        let (_mmap, view) = mapped("stale", &bytes);
+        let id = view.map_id().expect("Mapped bytes must have an identity");
+
+        // Some other matrix's packing, parked at the key this live
+        // matrix will look up, under an identity that can never upgrade.
+        let poison = vec![0xABu8; 16];
+        {
+            let mut cache = q8x4_repack_cache().lock().unwrap();
+            cache.insert(
+                (id.id, id.offset, rows, cols),
+                (
+                    MapId {
+                        map: std::sync::Weak::new(),
+                        id: id.id,
+                        offset: id.offset,
+                    },
+                    Arc::from(poison.clone().into_boxed_slice()),
+                ),
+            );
+        }
+
+        let got = get_or_repack_q8x4(view.as_slice(), rows, cols, Some(id.clone()));
+        let want = ferrox_quant::pack_q8_0_matrix_x4(
+            view.as_slice(),
+            rows,
+            cols,
+            ferrox_quant::q8_0x4_interleave(),
+        );
+        assert_ne!(&got[..], &poison[..], "served a dead mapping's bytes");
+        assert_eq!(&got[..], &want[..], "stale entry was not repacked");
+
+        // And the dead entry is gone rather than pinning a control block.
+        let cache = q8x4_repack_cache().lock().unwrap();
+        let (entry, _) = cache
+            .get(&(id.id, id.offset, rows, cols))
+            .expect("the live packing should now be cached");
+        assert!(
+            entry.matches(&id),
+            "the replacement entry must carry the LIVE identity"
+        );
+    }
+
+    /// Two widths at one address are two matrices. The old key was
+    /// `(address, rows)`, so a 576x576 and a 576x1536 collided and the
+    /// second was served the first's shorter buffer.
+    #[test]
+    fn repack_key_separates_two_widths_at_one_address() {
+        let rows = 8usize;
+        let narrow = q8_0_matrix_bytes(rows, 32, 3);
+        let wide = q8_0_matrix_bytes(rows, 64, 5);
+        let (_mmap, view) = mapped("widths", &narrow);
+        let id = view.map_id().expect("Mapped bytes must have an identity");
+
+        let il = ferrox_quant::q8_0x4_interleave();
+        let a = get_or_repack_q8x4(&narrow, rows, 32, Some(id.clone()));
+        let b = get_or_repack_q8x4(&wide, rows, 64, Some(id.clone()));
+        assert_eq!(
+            &a[..],
+            &ferrox_quant::pack_q8_0_matrix_x4(&narrow, rows, 32, il)[..]
+        );
+        assert_eq!(
+            &b[..],
+            &ferrox_quant::pack_q8_0_matrix_x4(&wide, rows, 64, il)[..],
+            "the wider matrix was served the narrower one's packing"
+        );
+        assert!(b.len() > a.len(), "widths must not share a cache entry");
+    }
+
+    /// Owned buffers and expert-store leases are never cacheable. The
+    /// lease is the interesting one: its allocation stays alive and keeps
+    /// its address while its CONTENTS are replaced by another expert's,
+    /// so no liveness check could rescue it.
+    #[test]
+    fn map_id_is_none_for_owned_and_shared_bytes() {
+        let owned = WeightBytes::Owned(q8_0_matrix_bytes(4, 32, 9));
+        assert!(owned.map_id().is_none(), "an owned Vec's address is reused");
+
+        let buf = Arc::new(q8_0_matrix_bytes(4, 32, 13));
+        let leased = WeightBytes::Shared {
+            buf,
+            range: 0..34 * 4,
+        };
+        assert!(
+            leased.map_id().is_none(),
+            "an expert lease keeps its address across a content swap"
+        );
     }
 
     /// `apply_batch` writes straight into the `[batch][rows]` output from

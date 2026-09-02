@@ -78,6 +78,18 @@ Full matrix: [`MODELS.md`](MODELS.md) ·
 | **CPU** | Dense and MoE. int8×int8 matvec on by default (`FERROX_CPU_INT_DOT=0` opts out), interleaved Q4_Kx8 / Q8_0x4 GEMV, Q8_0x4 batch GEMM for prefill, Q5/Q6 int-dot, pool sized to performance cores |
 | **Metal** | FA-vec attention (decode d=64/96/128/256, prefill d=128/256), concurrent FFN/QKV encode, MoE Concurrent with fused groups, `MemRanges`, `mul_mm_id` prefill, quantized KV (`q8_0` / `turbo8` / `fp8` / `turbo4`) |
 | **CUDA** | Matvec, resident weights, FFN fuse (`--features cuda`), plus a batched `Q8_0`/`Q4_0` GEMM that **has never executed on a GPU** |
+| **Vulkan** | `Q8_0` matvec only, no GEMM (`--features vulkan`). A beachhead, not a backend: see below |
+
+**Vulkan is one kernel, and calling it a backend would be generous.**
+`--features vulkan` gives a `Q8_0` matvec and nothing else. It reports
+no GEMM for any kind, so a prefill genuinely lands on the host, and it
+claims no other quantization. It did run on real hardware (an M2 Pro
+through MoltenVK) against a scalar twin, which is what earned it a place
+in the dispatch table at all, but there is no measured number for it and
+zero-copy residency from mmap is unproven. It exists so that AMD and
+Intel have a path at all, and because the seam it needed is the seam a
+real backend needs. `docs/plans/vulkan-beachhead-verdict.md` has the
+sizing: a full Vulkan backend is 15 to 25k lines.
 
 **The CUDA GEMM is unrun, and that is not a formality.** It is wired
 into a wide prefill and it decides nothing about performance here,
@@ -140,7 +152,16 @@ OpenAI-compatible HTTP API:
 - `POST /v1/cancel` stops a running generation by request id, which is
   the stop path a resumable stream needs, since closing its socket no
   longer ends it
-- Decoder embeddings (mean/last pool)
+- Embeddings. A real encoder checkpoint (BGE / E5 / GTE class, anything
+  whose `tokenizer.ggml.model` is `bert`) can be the loaded model:
+  `FERROX_MODEL_PATH=bge-small-en-v1.5-q8_0.gguf` serves `/v1/embeddings`
+  and the six generating routes answer **501 naming the model**, not a
+  missing tensor. Pooling comes from the checkpoint's own
+  `pooling_type` (NONE / MEAN / CLS / LAST; RANK refuses, it is a
+  classification head rather than a pooling rule). A decoder GGUF still
+  pools its hidden states (mean/last) as before, and
+  `FERROX_EMBEDDING_MODEL_PATH` runs an encoder side-by-side with a
+  generative model in one process
 - Anthropic Messages: `POST /v1/messages` streaming and buffered
   (thinking and tool blocks, protocol-native `ping` keepalive) plus
   `POST /v1/messages/count_tokens`

@@ -6,12 +6,12 @@ deployments and advanced tuning. Flags override env when both are set.
 Everything Ferrox reads from the environment is listed here. Three
 namespaces, and the prefix tells you which:
 
-- `FERROX_*` — operator configuration. Sections
+- `FERROX_*`: operator configuration. Sections
   [Server](#server) through [Kernel-lookup registry](#kernel-lookup-registry).
-- `FERROX_METAL_*_TIMING` / `_BARRIER_LOG` — Metal instrumentation. They
+- `FERROX_METAL_*_TIMING` / `_BARRIER_LOG`: Metal instrumentation. They
   print numbers and change nothing else. See
   [Metal instrumentation](#metal-instrumentation).
-- `FERROX_TEST_*` — fixtures that point an `#[ignore]`d test at a local
+- `FERROX_TEST_*`: fixtures that point an `#[ignore]`d test at a local
   checkpoint. Not configuration; see
   [Test and development fixtures](#test-and-development-fixtures).
 
@@ -19,7 +19,8 @@ namespaces, and the prefix tells you which:
 
 | Variable | Purpose |
 |---|---|
-| `FERROX_MODEL_PATH` | GGUF path (or Kimi dir); same as `-m` |
+| `FERROX_MODEL_PATH` | GGUF path (or Kimi dir); same as `-m`. An encoder-only checkpoint (WordPiece / `bert`) is accepted here and serves `/v1/embeddings`; the generating routes then answer 501 naming the model |
+| `FERROX_EMBEDDING_MODEL_PATH` | An encoder served ALONGSIDE a generative model in one process, which the single active-model slot cannot express. Wins over an active encoder, since explicit config beats a hot-swap |
 | `FERROX_MODEL_DIR` | Extra directory `GET /admin/models` scans, and the one `POST /admin/download` writes into. Without it, the directory holding `FERROX_MODEL_PATH` is used; with neither, downloads are refused (`412`) rather than guessing a location |
 | `FERROX_ADDR` | Bind address, e.g. `127.0.0.1:8383` |
 | `FERROX_API_KEY` | Require `Authorization: Bearer <key>`. Also gates the whole `/admin` control surface, which can swap models and write files |
@@ -44,6 +45,7 @@ library or overriding the CLI.
 | `FERROX_METAL_ATTN` | `1` / `0`, fused Metal attention + resident KV |
 | `FERROX_CTK` | KV dtype: `f16` (default), `q8_0` / `turbo8` / `fp8` / `turbo4` (Metal); `turbo3` falls back to F16. Same as `--ctk` |
 | `FERROX_CUDA` | `1` / `0` / `auto` (build with `--features cuda`) |
+| `FERROX_VULKAN` | `1` / `0` / `auto` (build with `--features vulkan`). `Q8_0` matvec only and no GEMM, so a prefill stays on the host |
 | `FERROX_CPU_THREADS` | Worker threads; same as `-t`. Default: **performance cores** (`hw.perflevel0.physicalcpu` on macOS), matching llama.cpp, not logical cores |
 | `FERROX_CPU_INT_DOT` | int8×int8 matvec + repacked GEMV. **On by default** in `ferrox` / `ferrox-server`; `0` opts out. Off in the library so golden cross-validation stays reference-exact |
 | `FERROX_METAL_FA_VEC` | `0`, disable llama-style FA-vec for decode **and** prefill and fall back to the legacy online-softmax GQA. Default **on** for `head_dim` in {64, 96, 128, 256}; other widths take the legacy kernel either way. Prefill at 64 / 128 / 256 with at least 8 new tokens goes further and takes the simdgroup-MMA `flash_attn_ext` kernel, which is not separately switchable |
@@ -75,7 +77,7 @@ library or overriding the CLI.
 | `FERROX_KV_BYTE_BUDGET` | Byte ceiling for the KV block pool, independent of block count |
 | `FERROX_PAGED_KV_BLOCKS` | Blocks per layer of real paged KV: shared page storage many requests read through a block table, rather than a private buffer each. `ferrox-server` only. Mutually exclusive with `FERROX_KV_POOL_BLOCKS`/`FERROX_KV_BYTE_BUDGET` and with `FERROX_PREFIX_CACHE_ENTRIES`; setting an excluded pair stops the server with an error naming both. Read the paragraph under this table before using it |
 | `FERROX_PAGED_KV_BLOCK_SIZE` | Positions per paged-KV block. Must be set together with `FERROX_PAGED_KV_BLOCKS`, or the server stops |
-| `FERROX_PAGED_KV_SLIDE_INTERVAL` | Decode steps between window slides on a paged store (default 128). Only applies when *every* layer of the served model slides by the same window — a page group holds one block in each layer, so a single full-attention layer disables sliding entirely. A smaller number returns pages sooner and costs a page operation more often; the admission bound pays for whatever accumulates in between |
+| `FERROX_PAGED_KV_SLIDE_INTERVAL` | Decode steps between window slides on a paged store (default 128). Only applies when *every* layer of the served model slides by the same window, because a page group holds one block in each layer, so a single full-attention layer disables sliding entirely. A smaller number returns pages sooner and costs a page operation more often; the admission bound pays for whatever accumulates in between |
 | `FERROX_PREFIX_CACHE_ENTRIES` | Prefix-cache capacity for the private generate path: whole KV snapshots in an LRU list, reported under `GET /cache/stats`. Mutually exclusive with continuous batching and with paged KV. Paged KV carries no such exclusion: it composes with continuous batching and shares prefixes through the radix tree instead |
 | `FERROX_EXPERT_CACHE_BYTES` | MoE expert-streaming cache budget |
 | `FERROX_SSD_STREAMING` | `1`, stream MoE experts from disk |

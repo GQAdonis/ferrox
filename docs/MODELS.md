@@ -188,21 +188,21 @@ MLA model that was never on the generic path, so it now refuses by name
 multipliers) rather than as unaudited. The count going down for the
 right reason.
 
-**Fixture-away (9)** — Ferrox already computes these graphs; only
+**Fixture-away (9).** Ferrox already computes these graphs; only
 evidence is missing. `gemma`, `internlm2`, `exaone`, `ernie4_5`,
 `bailingmoe2`, `xverse`, `baichuan` (the 7B; the 13B uses ALiBi and is
 refused by layer count), `chatglm` (its fused SwiGLU is the audited
 `phi3` path exactly) and `plamo3` (sandwich norms, fused QKV, fused
-SwiGLU — every slot already exists).
+SwiGLU, every slot already exists).
 
-**One match arm (7)** — one small named piece each. `seed_oss` and the
+**One match arm (7).** One small named piece each. `seed_oss` and the
 gpt-oss norm slot; `deepseek` and top-k renormalisation (fixed);
 `ernie4_5-moe` and interleaved MoE layers; `bailingmoe` and a
 `leading_dense_block_count` llama.cpp reads but never uses; and
 `hunyuan-moe`, `maincoder` and `hunyuan-dense`, all three of which want
 the same flag: QK norm applied *after* RoPE rather than before.
 
-**New code (26)** — a different attention or residual structure. The
+**New code (26).** A different attention or residual structure. The
 recurring shapes, rather than 26 separate stories:
 
 | Shape | Architectures |
@@ -210,18 +210,18 @@ recurring shapes, rather than 26 separate stories:
 | Per-layer head counts, FFN width or rotary width | `openelm`, `deci`, `laguna`, `step35`, `mimo2` |
 | A norm the generic decoder always applies and the model does not have (or a norm it does not have a slot for) | `olmo2`, `exaone4`, `olmo`, `talkie`, `bitnet`, `dbrx` |
 | LayerNorm rather than RMSNorm | `dbrx`, `olmo` |
-| Unkeyed NoPE layers — RoPE skipped on some layers with no GGUF key | `smallthinker`, `afmoe`, `exaone-moe` |
+| Unkeyed NoPE layers, RoPE skipped on some layers with no GGUF key | `smallthinker`, `afmoe`, `exaone-moe` |
 | A branch fed from the raw layer input rather than the post-attention residual | `smallthinker` (its MoE router), `arctic` (its MoE branch) |
 | Hardcoded scales applied even when the GGUF carries no key | `grok`, `granite`, `granitemoe`, `granite-moe`, `mistral3` |
 | An ungated or non-SwiGLU FFN | `arcee`, `plm`, `apertus` |
 | Something structurally new | `nanbeige` (runs the same layers more than once), `grovemoe` (a second expert bank), `mellum` (two per-layer RoPE variants), `mistral3` (per-position attention temperature) |
 
-**Unknown (4)** — reading both trees did not settle it, and each says
+**Unknown (4).** Reading both trees did not settle it, and each says
 what would. `phi4`, `mistral`, `mixtral` and `yi` are all names that do
 not exist in llama.cpp's `LLM_ARCH_NAMES`, so there is no reference
 graph to diff against. For the three alias rows this is not academic:
-Ferrox gives them NEOX RoPE, while `llama` — the string real Mistral,
-Mixtral and Yi checkpoints actually ship under — is in llama.cpp's NORM
+Ferrox gives them NEOX RoPE, while `llama`, the string real Mistral,
+Mixtral and Yi checkpoints actually ship under, is in llama.cpp's NORM
 group. A file spelling `mistral` would be rotated on the wrong pairs of
 every Q/K head. Latent only because the row refuses.
 

@@ -124,7 +124,7 @@ module's doc comments for their verification status.
 ## GBNF grammar engine
 
 `ferrox-models::grammar` is a direct Rust port of llama.cpp's
-grammar-constrained decoding — `src/llama-grammar.h` and
+grammar-constrained decoding: `src/llama-grammar.h` and
 `src/llama-grammar.cpp`. This is a port of the ALGORITHM, not an
 independent reimplementation from a specification: the GBNF parser, the
 stack machine (`advance_stack`, `match_char`, `match_partial_char`), the
@@ -281,7 +281,7 @@ was read for information architecture and for which libraries a shipped
 product of this kind chooses, and nothing else. Camelid (MIT) was read
 the same way, for feature and layout ideas only.
 
-## FreeToken — edge-native MoE serving policy
+## FreeToken: edge-native MoE serving policy
 
 Ferrox contains a Rust port of the host-side decision logic in
 [FreeToken](https://github.com/FlashML-org/FreeToken), the edge-native
@@ -408,7 +408,7 @@ Adding either is mechanical: both slot into the same `ReasoningFormat` /
 `ToolCallFormat` tables as the nine families that are here.
 
 Where ferrox already had a mechanism the port would have duplicated, the
-port plugs into it rather than shadowing it — `ferrox-core::kv_block`
+port plugs into it rather than shadowing it. `ferrox-core::kv_block`
 (content-addressed KV blocks), `ferrox-core::expert_store` (the SSD
 expert tier), `ferrox-server::serving::batch` (continuous batching),
 `ferrox-server::stop` (which delegates its withhold rule to

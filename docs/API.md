@@ -470,7 +470,7 @@ representation somewhere; the decoder path is a best-effort reading of a
 model that was not. `embedding_type` overrides the default: `mean` and
 `last` on both, `cls` on the encoder path only (row 0 of a decoder's
 hidden states is its BOS position and means nothing in particular).
-`none` and `rank` are refused on both — this response shape carries one
+`none` and `rank` are refused on both, because this response shape carries one
 vector per input, not per token, and `rank` is a reranker
 classification head ferrox does not implement.
 
@@ -492,14 +492,14 @@ a request to find out:
  "ferrox_tokenizer": "gguf-wordpiece"}
 ```
 
-`GET /health` is `ready` — the server really can serve. Every
+`GET /health` is `ready`, the server really can serve. Every
 generation endpoint (`/v1/chat/completions`, `/v1/completions`,
 `/completion`, `/v1/messages`, `/v1/responses`) answers `501` naming the
 model rather than blaming a tensor:
 
 ```json
 {"error": {
-  "message": "the loaded model 'bge-small-en-v1.5' is an embedding model (bert encoder, 384 dims, pooling CLS). An encoder has no output head, so it cannot generate text at all — there is no next token for it to predict. POST /v1/embeddings to use it, or load a generative checkpoint.",
+  "message": "the loaded model 'bge-small-en-v1.5' is an embedding model (bert encoder, 384 dims, pooling CLS). An encoder has no output head, so it cannot generate text at all. There is no next token for it to predict. POST /v1/embeddings to use it, or load a generative checkpoint.",
   "type": "unsupported",
   "param": "model"
 }}
@@ -511,9 +511,9 @@ generation path; `usage.prompt_tokens` on an embeddings response already
 counts the `[CLS]`/`[SEP]` the model actually saw.
 
 Only `bert` loads. The other encoder rows upstream builds from
-`bert.cpp` — `nomic-bert`, `jina-bert-v2/v3`, `neo-bert`,
+`bert.cpp`: `nomic-bert`, `jina-bert-v2/v3`, `neo-bert`,
 `modern-bert`, `eurobert`, `t5encoder`, and the decoder-style
-`llama-embed` / `gemma-embedding` / `pangu-embedded` — refuse **by
+`llama-embed` / `gemma-embedding` / `pangu-embedded` all refuse **by
 name**, saying what each one needs (RoPE, a gated FFN, per-projection QK
 norm, its own graph). `ferrox_models::embedding_model::NOT_YET` is that
 list, and a test pins it against the capability registry so a new row
@@ -907,7 +907,7 @@ surface keeps producing, so both now call one `refuse_logit_bias`.
 
 One deliberate exception: **an empty `logit_bias: {}` is served, not
 refused**, on both routes. Several OpenAI clients send an empty map on
-every request, and there is no token whose logit it would move — so
+every request, and there is no token whose logit it would move, so
 refusing it is a false refusal. A non-object (`[]`, `"none"`) is still
 refused, so nothing falls through the empty-map hole.
 
@@ -929,7 +929,7 @@ long tail of wrappers speak; before it existed here they got a 404.
 
 Both routes are the same handler; `/admin/stats` records whichever one
 the client called. Generation itself is the same engine, sampler,
-grammar seam and stop machinery `/v1/completions` uses — this endpoint
+grammar seam and stop machinery `/v1/completions` uses. This endpoint
 is a wire, not a second implementation.
 
 ### What it honours
@@ -962,8 +962,8 @@ refused rather than ignored.
 ### What it refuses, by name
 
 Every option below deserializes and is checked against the value at
-which llama.cpp itself treats it as off. **At that value it is served**
-— a stock client sends most of them explicitly, and refusing
+which llama.cpp itself treats it as off. **At that value it is served**,
+because a stock client sends most of them explicitly and refusing
 `mirostat: 0` would be a false refusal. At any other value it is a 501
 naming the field:
 
@@ -982,10 +982,10 @@ use), `json_schema` (through the same site that refuses
 `response_format: json_schema`), token-id prompts, multiple prompts in
 one request, and `prompt.multimodal_data`.
 
-Options that only *parameterise* a switched-off sampler —
+Options that only *parameterise* a switched-off sampler (
 `mirostat_tau`, `mirostat_eta`, `dry_base`, `dry_allowed_length`,
 `dry_penalty_last_n`, `dry_sequence_breakers`, `xtc_threshold`,
-`dynatemp_exponent` — are deliberately not in that list: they do
+`dynatemp_exponent`) are deliberately not in that list: they do
 nothing while their switch is off, and their switch is. A field
 llama.cpp does not define either is ignored, exactly as upstream
 ignores it.
@@ -998,7 +998,7 @@ instead of discarding tokens to make it fit, so a served answer was
 never truncated. A `timings` value this server did not measure is
 `null` rather than `0`, which would read as an instantaneous prefill,
 and `cache_n` is `-1` (upstream's sentinel) when no prefix cache is
-configured — which says something different from "the cache missed".
+configured, which says something different from "the cache missed".
 
 `stop_type` uses llama.cpp's vocabulary (`eos`, `word`, `limit`) plus
 one value it has no word for: **`cancelled`**, for an answer stopped
@@ -1012,8 +1012,8 @@ exactly *one token* in the model's vocabulary is caught by the token
 layer of the stop machinery, which matches on the id before
 detokenizing and does not carry back which string it was; it is
 reported as `"eos"` where llama.cpp would say `"word"`. This is not
-local to this endpoint — `/v1/messages` loses its `stop_sequence`
-attribution on the same inputs — and closing it means giving the stop
+local to this endpoint (`/v1/messages` loses its `stop_sequence`
+attribution on the same inputs), and closing it means giving the stop
 matcher the id-to-string mapping it currently discards. Multi-token
 stop strings, which is what a `/completion` caller normally sets, are
 reported correctly.
@@ -1039,7 +1039,7 @@ The request body accepts both dialects on both paths:
 | `prompt` | ferrox's name for the same text. Supported |
 | both at once | **400.** They are one field, and guessing which was meant would tokenize text the caller did not ask about |
 | neither | **400** naming both. llama.cpp answers an empty array here; ferrox does not, because an empty array cannot be told apart from tokenizing `""` |
-| `add_special` | Supported. Prepends the same BOS id the generation path prepends — including its no-op on a checkpoint whose metadata says not to add one — so the count matches the prompt the model would really see |
+| `add_special` | Supported. Prepends the same BOS id the generation path prepends, including its no-op on a checkpoint whose metadata says not to add one, so the count matches the prompt the model would really see |
 | `parse_special: true` (upstream's default) | Supported. ferrox's tokenizers always split on special-token text |
 | `parse_special: false` | **501 by name.** ferrox cannot tokenize `<|im_start|>` as plain characters |
 | `with_pieces` | **501 by name.** ferrox's tokenizers expose decoded text, not the raw per-token piece bytes, so a byte-fallback token could not be given llama.cpp's `piece` byte array |
@@ -1055,7 +1055,7 @@ neither dialect's client reads a null.
 `"grammar": "<GBNF>"` is llama.cpp's own field and takes the same
 syntax. It is accepted on `/v1/chat/completions` and `/v1/completions`,
 compiled once per request, and enforced on **every** token by a real
-stack machine — not by masking characters.
+stack machine, not by masking characters.
 
 That distinction is the point. `response_format: json_object` masks
 character classes, so it cannot know whether a `}` closes an object that
@@ -1071,7 +1071,7 @@ running.
 
 `response_format: {"type": "json_schema"}` returns **501** naming the
 schema-to-grammar conversion as the missing piece, rather than an
-unexplained 400 — and it refuses even when a `grammar` is supplied
+unexplained 400, and it refuses even when a `grammar` is supplied
 alongside, rather than quietly honouring a different constraint than the
 one asked for.
 
@@ -1087,14 +1087,14 @@ llama.cpp.** Upstream forces a call with an *eager* grammar. That does
 not survive this server: several families open the reasoning block in
 the prompt, so the model's first token is already inside `<think>`, and
 a call forced there is read back by ferrox's own reasoning parser as
-thinking — the caller who demanded a call would get `reasoning_content`
+thinking, so the caller who demanded a call would get `reasoning_content`
 and no call. So the grammar stays lazy, triggers on the wire format's
 opening marker, and while awaiting masks *only* the end-of-generation
 tokens: the prefix is free, but the turn cannot END until a call has
 begun.
 
 The cost, stated: a model that never opens a call runs to `max_tokens`
-and finishes `"length"` — a visible failure rather than prose served as
+and finishes `"length"`, a visible failure rather than prose served as
 the call that was asked for.
 
 Only the three wire formats whose call is a JSON object behind a marker
@@ -1107,7 +1107,7 @@ cannot read back.
 
 Image and audio input · `response_format: json_schema` (GBNF grammars
 themselves *are* supported, see above, and `tool_choice` uses the
-schema converter — only this wire spelling is unwired) · MCP tool
+schema converter, only this wire spelling is unwired) · MCP tool
 invocation
 (the config is read, nothing is called) · embedding architectures other
 than `bert` (they refuse by name, see above) ·

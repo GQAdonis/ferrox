@@ -71,7 +71,7 @@ Same via explicit subcommand: `ferrox run -m …`.
 | `-s` / `--seed` | `-1` = time-based |
 | `-dev` / `--device` | `auto`, `none`, `cpu`, `metal`, or `cuda` |
 | `--list-devices` | Print compiled, detected devices and exit |
-| `-ngl` / `--gpu-layers` / `--n-gpu-layers` | `0`, `auto`, `all`, or a count at/above the layer count. A *partial* count is refused — see below |
+| `-ngl` / `--gpu-layers` / `--n-gpu-layers` | `0`, `auto`, `all`, or a count at/above the layer count. A *partial* count is refused, see below |
 | `--ctk` | KV dtype: `f16` (default), `q8_0`/`turbo8`/`fp8`/`turbo4` (Metal), `turbo3` (falls back). Sets `FERROX_CTK` |
 | `--system` | Chat mode only |
 | `--no-cnv` | Skip chat-template wrap |
@@ -114,8 +114,8 @@ model's layer count enable all supported ops on the selected backend.
 **A partial `-ngl` is refused, deliberately.** llama.cpp's `-ngl N` puts
 exactly `N` layers in VRAM and runs the rest on the CPU, which is how
 you fit a model that does not otherwise fit. ferrox has no partial layer
-placement, and it used to accept the count and then offload *everything*
-— same flag, same value, no error, and an out-of-memory on exactly the
+placement, and it used to accept the count and then offload *everything*:
+same flag, same value, no error, and an out-of-memory on exactly the
 machine the flag existed to accommodate. It now stops and says so. Use
 `-ngl 0` for CPU or `-ngl all` for the whole model.
 
@@ -384,7 +384,7 @@ cargo test -p ferrox-cli -- --ignored ferrox_and_llama_cpp_tokenize_the_corpus_i
 
 That test is `#[ignore]`d because it needs the dumper and real
 checkpoints. Checkpoints that are missing, or that the installed
-`libllama` cannot load, are skipped by name — a reference with no answer
+`libllama` cannot load, are skipped by name. A reference with no answer
 is not a verdict either way.
 
 ## Diagnostics (`layer-divergence`, `quant-sensitivity`)

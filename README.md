@@ -28,7 +28,7 @@
 ---
 
 Ferrox loads GGUF checkpoints and runs inference on your hardware. No
-bindings to llama.cpp, no ggml wrapper — the loader, quantized kernels,
+bindings to llama.cpp, no ggml wrapper. The loader, quantized kernels,
 attention and expert routing are all implemented here.
 
 - **One binary, no runtime.** 19 MB with Metal and the server, 14 MB
@@ -38,24 +38,27 @@ attention and expert routing are all implemented here.
 - **Quantized end to end.** Weights stay quantized on mmap and
   dequantize inside the matmul, so an 8B model fits on a laptop.
   K-quants, the IQ tiers, MXFP4, F16 and BF16.
-- **Mixture-of-experts has its own path** — GPU routing, indexed expert
+- **Mixture-of-experts has its own path.** GPU routing, indexed expert
   GEMMs, residency planning. When the weights do not fit, experts stream
-  from the checkpoint through a bounded cache: slower than resident, so
-  it turns itself on only to run a model that otherwise could not run.
+  from the checkpoint through a bounded cache. That is slower than
+  keeping them resident, so it never switches on for a model that fits.
 - **OpenAI-compatible server.** Continuous batching, paged KV that
   shares a system prompt's pages across conversations, runtime model
   swap, resumable streams, Anthropic and Responses endpoints, and an
   `/admin` surface. Point your existing client at it.
-- **Constrained output that actually holds.** Pass GBNF, a JSON Schema,
-  or `tool_choice: "required"`, and a stack machine enforces it every
-  token — so it knows whether a `}` closes an object that was opened.
+- **Structured output, guaranteed.** Ask for a JSON Schema, a GBNF
+  grammar, or a specific tool call, and the model cannot emit anything
+  else. No retry loop, no validating after the fact, no repair pass.
 - **Same flags, same output as llama.cpp.** The sampler runs llama.cpp's
   chain in llama.cpp's order, `min_p` included. Tokenization is verified
-  byte-for-byte against it on ten checkpoints, embeddings included.
+  byte-for-byte against it on ten checkpoints.
+- **Embeddings from real encoder models.** Point `-m` at a BGE, E5 or GTE
+  checkpoint and `/v1/embeddings` serves it, pooled the way the file says
+  to. Not a decoder's hidden states borrowed for the job.
 - **Prompts framed by the checkpoint's own template.** The GGUF's real
-  `tokenizer.chat_template` is compiled and evaluated, never sniffed —
-  so a family nobody hand-wrote a renderer for is still framed the way
-  it was trained.
+  `tokenizer.chat_template` is compiled and evaluated, never sniffed. A
+  family nobody hand-wrote a renderer for is still framed the way it was
+  trained.
 - **Agent-ready output.** Chain of thought splits into
   `reasoning_content` as tokens arrive, and tool calls are parsed in the
   eleven formats real checkpoints emit, streaming as argument deltas.
@@ -68,7 +71,9 @@ attention and expert routing are all implemented here.
   stops the benchmark instead of publishing a bad number.
 - **It refuses rather than guessing.** A model whose maths Ferrox only
   partly implements stops and names what is missing, instead of loading
-  and returning fluent text computed the wrong way.
+  and returning fluent text computed the wrong way. The GGUF parser is
+  bounded against a hostile file too: every length it reads is checked
+  against what the file can actually contain.
 
 ## Install
 

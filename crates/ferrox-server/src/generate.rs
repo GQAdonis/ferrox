@@ -987,7 +987,52 @@ impl FinishReason {
             _ => None,
         }
     }
+
+    /// Proof that this generation produced a WHOLE answer, or `None`
+    /// if it did not.
+    ///
+    /// The match is exhaustive with no `_` arm on purpose: it is the
+    /// one place in the server that decides what "the answer is
+    /// finished" means, and a variant added to this enum later must
+    /// stop this crate compiling here rather than defaulting to
+    /// whichever side of the question its author never considered.
+    ///
+    /// Anything that stores an answer for a LATER caller needs this,
+    /// because storing a partial answer republishes it as a finished
+    /// one. Today that is the whole-response cache; see
+    /// [`crate::response_cache::CachedCompletion::cacheable`], which is
+    /// the only holder of a [`Completed`] outside this module and
+    /// cannot mint one itself.
+    pub fn completed(&self) -> Option<Completed> {
+        match self {
+            // Every one of these is the generation reaching an end the
+            // request asked for: the model's own turn end, a stop
+            // string the caller supplied, or the caller's own token
+            // budget (`max_tokens` is part of the cache key, so
+            // replaying a `Length` answer replays it under the same
+            // budget that produced it).
+            FinishReason::Stop | FinishReason::StopSequence(_) | FinishReason::Length => {
+                Some(Completed(()))
+            }
+            // A canceller cut this short. The tokens that arrived are
+            // the honest answer to THIS request and a truncation of
+            // every other one.
+            FinishReason::Cancelled => None,
+        }
+    }
 }
+
+/// Evidence that a generation ran to an end of its own, produced only
+/// by [`FinishReason::completed`].
+///
+/// The unit field is private to this module, so no other module can
+/// build one, clone one out of thin air, or forget to obtain one: a
+/// function that requires a `Completed` is a function a partial answer
+/// cannot be passed to. That is the difference between this and a
+/// `bool` beside the data, which the next caller does not have to look
+/// at (#57).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Completed(());
 
 /// OpenAI-convention token accounting, reported in the response's
 /// `usage` field. Counted from the exact token ids the generation loop
@@ -1804,8 +1849,38 @@ pub(crate) fn floor_char_boundary(s: &str, idx: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
     use ferrox_models::config::test_dense_fixture;
+
+    /// Which endings may be replayed to a LATER caller, enumerated so
+    /// the answer is on the record rather than inferred from whichever
+    /// handler happens to hold a cancel token (#57).
+    ///
+    /// `Length` is on the completed side deliberately: `max_tokens` is
+    /// part of the response cache's key, so an answer truncated at the
+    /// budget is only ever replayed under the same budget that produced
+    /// it. `Cancelled` is the whole of the other side -- it kept the
+    /// tokens that had arrived, which answers the cancelled request and
+    /// truncates every other one.
+    #[test]
+    fn only_a_generation_that_reached_an_end_of_its_own_counts_as_completed() {
+        for reason in [
+            FinishReason::Stop,
+            FinishReason::StopSequence("<END>".to_string()),
+            FinishReason::Length,
+        ] {
+            assert!(
+                reason.completed().is_some(),
+                "{reason:?} produced the whole answer the request asked for"
+            );
+        }
+        assert!(
+            FinishReason::Cancelled.completed().is_none(),
+            "a cancelled generation is a partial answer and may not be stored \
+             for anybody else"
+        );
+    }
 
     fn small_decoder() -> Decoder {
         Decoder::new_random_small(test_dense_fixture(), 2, 256)

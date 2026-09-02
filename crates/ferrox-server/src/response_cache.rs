@@ -14,7 +14,7 @@
 //! KV-prefix cache (reusing the shared prefix of two *different*
 //! prompts) is a separate, larger piece of work, tracked separately.
 
-use crate::generate::{FinishReason, GenerationParams, Usage};
+use crate::generate::{Completed, FinishReason, GenerationParams, Usage};
 use ferrox_models::grammar::Grammar;
 use ferrox_models::sampling::SamplingParams;
 use std::collections::{HashMap, VecDeque};
@@ -136,12 +136,13 @@ pub fn generation_key(params: &GenerationParams) -> GenerationKey {
         // unique key and switch the cache off.
         //
         // Cancellation does change what comes back -- a `Cancelled`
-        // partial -- but it is `None` on the only path that reaches
-        // this key: `chat_completions_full` registers no token (the
-        // STREAMING handler is the one that does, and it does not
-        // cache). If that ever changes, the guard belongs on the PUT,
-        // as "do not cache a partial answer", and not on this key.
-        // Tracked in #57.
+        // partial -- but that is not a question for the key. A partial
+        // answer must not be stored under ANY key, so the guard is on
+        // the PUT: [`CachedCompletion::cacheable`] is the only way to
+        // build the value [`ResponseCache::put`] accepts, and a
+        // cancelled generation cannot produce one (#57). Which handler
+        // happens to register a cancel token no longer decides whether
+        // this cache is correct.
         cancel: _,
         ignore_eos,
     } = params;
@@ -243,6 +244,45 @@ pub struct CachedCompletion {
     pub usage: Usage,
 }
 
+impl CachedCompletion {
+    /// This completion in the form [`ResponseCache::put`] accepts, or
+    /// `None` when it is a PARTIAL answer and may not be stored at all.
+    ///
+    /// The whole guard against #57 is that this is the only
+    /// constructor of [`CacheableCompletion`]: a cancelled generation
+    /// keeps the tokens it managed to decode, which is the right
+    /// response to the request that was cancelled and a truncation of
+    /// every later request that would be served it. The completeness
+    /// question is [`FinishReason::completed`]'s, asked once, next to
+    /// the enum that answers it.
+    pub fn cacheable(self) -> Option<CacheableCompletion> {
+        // Obtaining the proof IS the check, and it is then dropped:
+        // what a `Completed` certifies is that the value below may
+        // exist at all, so from here on the value's own existence
+        // carries it.
+        let _proof: Completed = self.finish.completed()?;
+        Some(CacheableCompletion { completion: self })
+    }
+}
+
+/// A completion that has been shown to be COMPLETE, and is therefore
+/// allowed into the cache.
+///
+/// Both fields are private and there is no public constructor, so this
+/// type cannot be built outside this module and
+/// [`CachedCompletion::cacheable`] is the only thing inside it that
+/// builds one. A caller holding a `Cancelled` partial has nothing it
+/// can pass to [`ResponseCache::put`]; it cannot forget the check,
+/// because there is no argument it could pass instead.
+///
+/// The [`Completed`] is minted from THIS completion's own finish
+/// reason, not handed in beside it, so the proof cannot be borrowed
+/// from some other generation that happened to end well.
+#[derive(Debug)]
+pub struct CacheableCompletion {
+    completion: CachedCompletion,
+}
+
 struct Entry {
     completion: CachedCompletion,
     inserted_at: Instant,
@@ -325,7 +365,12 @@ impl ResponseCache {
     /// Inserts or replaces the cached response for `key`, evicting the
     /// least-recently-used entry first if the cache is already at
     /// `max_entries` and `key` isn't already present.
-    pub fn put(&mut self, key: CacheKey, completion: CachedCompletion) {
+    ///
+    /// Takes a [`CacheableCompletion`] rather than a
+    /// [`CachedCompletion`] so that a partial answer has no spelling
+    /// that reaches this function (#57).
+    pub fn put(&mut self, key: CacheKey, completion: CacheableCompletion) {
+        let CacheableCompletion { completion } = completion;
         if !self.entries.contains_key(&key) && self.entries.len() >= self.max_entries {
             if let Some(oldest) = self.order.pop_front() {
                 self.entries.remove(&oldest);
@@ -410,11 +455,109 @@ mod tests {
         }
     }
 
+    /// The same thing in the form `put` accepts. It exists because
+    /// `put` takes proof of completeness and [`cc`] builds a `Stop`,
+    /// which has it. There is no expression that would put a
+    /// `Cancelled` partial in here.
+    fn cacheable(text: &str) -> CacheableCompletion {
+        cc(text)
+            .cacheable()
+            .expect("a completion that stopped on its own is cacheable")
+    }
+
+    /// The miss branch of `chat_completions_full`, in miniature: look
+    /// the request up, and on a miss offer what was generated to the
+    /// cache before answering with it.
+    ///
+    /// The two tests below assert on what this RETURNS, which is what a
+    /// later identical request is actually served. Asserting on
+    /// `stats()` instead would pass happily while a caller was being
+    /// handed somebody else's truncated answer.
+    fn serve(
+        cache: &mut ResponseCache,
+        key: &CacheKey,
+        generated: CachedCompletion,
+    ) -> CachedCompletion {
+        if let Some(hit) = cache.get(key) {
+            return hit;
+        }
+        // The handler's shape, and the whole guard: what is offered to
+        // the cache is whatever `cacheable` accepts, and there is no
+        // branch here that inspects a finish reason.
+        if let Some(cacheable) = generated.clone().cacheable() {
+            cache.put(key.clone(), cacheable);
+        }
+        generated
+    }
+
+    /// #57's two clients. Client A cancels after a few tokens; client B
+    /// sends the identical body and never cancels. B would have been
+    /// served A's fragment, carrying A's `finish_reason: "cancelled"`
+    /// for a request nobody cancelled.
+    ///
+    /// `cacheable` refuses the partial, so `serve` has nothing to hand
+    /// `put` -- and note there is no `if cancelled` in `serve` that
+    /// could have been forgotten. That is the fix: the check is not one
+    /// a caller can omit, because the caller cannot express the
+    /// alternative.
+    #[test]
+    fn a_cancelled_partial_is_not_served_to_a_later_identical_request() {
+        let mut cache = ResponseCache::new(10, Duration::from_secs(60));
+        let k = key("What is the capital of France?");
+
+        let partial = CachedCompletion {
+            content: "The capital of".to_string(),
+            finish: FinishReason::Cancelled,
+            usage: Usage::new(7, 3),
+        };
+        let client_a = serve(&mut cache, &k, partial.clone());
+        assert_eq!(
+            client_a, partial,
+            "the client that cancelled still gets the tokens it paid for"
+        );
+
+        let whole = CachedCompletion {
+            content: "The capital of France is Paris.".to_string(),
+            finish: FinishReason::Stop,
+            usage: Usage::new(7, 9),
+        };
+        let client_b = serve(&mut cache, &k, whole.clone());
+        assert_eq!(
+            client_b, whole,
+            "a request nobody cancelled must be answered by its own \
+             generation, never replayed from a cancelled one"
+        );
+        assert_eq!(
+            cache.stats().hits,
+            0,
+            "there was nothing to hit: the partial never became an entry"
+        );
+    }
+
+    /// The other half, because a guard that refuses everything reads as
+    /// coverage while quietly switching the cache off. The second
+    /// generation here produces DIFFERENT text, so if the first answer
+    /// was not stored and replayed, the difference reaches the caller.
+    #[test]
+    fn a_completed_answer_is_still_served_to_a_later_identical_request() {
+        let mut cache = ResponseCache::new(10, Duration::from_secs(60));
+        let k = key("What is the capital of France?");
+
+        let whole = cc("The capital of France is Paris.");
+        assert_eq!(serve(&mut cache, &k, whole.clone()), whole);
+        assert_eq!(
+            serve(&mut cache, &k, cc("something else entirely")),
+            whole,
+            "a completed answer must still be cached and replayed"
+        );
+        assert_eq!(cache.stats().hits, 1);
+    }
+
     #[test]
     fn miss_then_hit_for_the_same_key() {
         let mut cache = ResponseCache::new(10, Duration::from_secs(60));
         assert_eq!(cache.get(&key("hello")), None);
-        cache.put(key("hello"), cc("world"));
+        cache.put(key("hello"), cacheable("world"));
         assert_eq!(cache.get(&key("hello")), Some(cc("world")));
 
         let stats = cache.stats();
@@ -426,8 +569,8 @@ mod tests {
     #[test]
     fn different_keys_do_not_collide() {
         let mut cache = ResponseCache::new(10, Duration::from_secs(60));
-        cache.put(key("prompt a"), cc("response a"));
-        cache.put(key("prompt b"), cc("response b"));
+        cache.put(key("prompt a"), cacheable("response a"));
+        cache.put(key("prompt b"), cacheable("response b"));
         assert_eq!(cache.get(&key("prompt a")), Some(cc("response a")));
         assert_eq!(cache.get(&key("prompt b")), Some(cc("response b")));
     }
@@ -438,7 +581,7 @@ mod tests {
         let k1 = key_under("same prompt", |p| p.max_tokens = 16);
         let k2 = key_under("same prompt", |p| p.max_tokens = 32);
 
-        cache.put(k1.clone(), cc("short response"));
+        cache.put(k1.clone(), cacheable("short response"));
         assert_eq!(
             cache.get(&k2),
             None,
@@ -461,7 +604,7 @@ mod tests {
         let mut cache = ResponseCache::new(10, Duration::from_secs(60));
 
         let plain = key("same prompt");
-        cache.put(plain.clone(), cc("Sure! Here are a few options..."));
+        cache.put(plain.clone(), cacheable("Sure! Here are a few options..."));
 
         let constrained = key_under("same prompt", |p| {
             p.grammar = Some(grammar("root ::= \"yes\" | \"no\""))
@@ -493,7 +636,7 @@ mod tests {
 
         let yes_no = keyed("root ::= \"yes\" | \"no\"");
         let digits = keyed("root ::= [0-9]+");
-        cache.put(yes_no.clone(), cc("yes"));
+        cache.put(yes_no.clone(), cacheable("yes"));
 
         assert_eq!(
             cache.get(&digits),
@@ -514,7 +657,7 @@ mod tests {
         let mut cache = ResponseCache::new(10, Duration::from_secs(60));
 
         let plain = key("same prompt");
-        cache.put(plain.clone(), cc("Sure! Here are a few options..."));
+        cache.put(plain.clone(), cacheable("Sure! Here are a few options..."));
 
         let json = key_under("same prompt", |p| p.json_object = true);
 
@@ -540,7 +683,7 @@ mod tests {
         let mut cache = ResponseCache::new(10, Duration::from_secs(60));
 
         let stops_at_eos = key("same prompt");
-        cache.put(stops_at_eos.clone(), cc("short"));
+        cache.put(stops_at_eos.clone(), cacheable("short"));
 
         let runs_on = key_under("same prompt", |p| p.ignore_eos = true);
 
@@ -556,7 +699,7 @@ mod tests {
     #[test]
     fn expired_entry_is_a_miss_and_is_evicted() {
         let mut cache = ResponseCache::new(10, Duration::from_millis(10));
-        cache.put(key("hello"), cc("world"));
+        cache.put(key("hello"), cacheable("world"));
         std::thread::sleep(Duration::from_millis(30));
         assert_eq!(
             cache.get(&key("hello")),
@@ -573,11 +716,11 @@ mod tests {
     #[test]
     fn evicts_least_recently_used_entry_when_full() {
         let mut cache = ResponseCache::new(2, Duration::from_secs(60));
-        cache.put(key("a"), cc("1"));
-        cache.put(key("b"), cc("2"));
+        cache.put(key("a"), cacheable("1"));
+        cache.put(key("b"), cacheable("2"));
         // touch "a" so "b" becomes the least-recently-used entry
         assert_eq!(cache.get(&key("a")), Some(cc("1")));
-        cache.put(key("c"), cc("3"));
+        cache.put(key("c"), cacheable("3"));
 
         assert_eq!(
             cache.get(&key("b")),
@@ -599,9 +742,9 @@ mod tests {
     #[test]
     fn putting_an_existing_key_again_does_not_grow_past_capacity() {
         let mut cache = ResponseCache::new(2, Duration::from_secs(60));
-        cache.put(key("a"), cc("1"));
-        cache.put(key("b"), cc("2"));
-        cache.put(key("a"), cc("1-updated")); // re-insert, should replace, not evict
+        cache.put(key("a"), cacheable("1"));
+        cache.put(key("b"), cacheable("2"));
+        cache.put(key("a"), cacheable("1-updated")); // re-insert, should replace, not evict
         assert_eq!(cache.stats().entries, 2);
         assert_eq!(cache.get(&key("a")), Some(cc("1-updated")));
         assert_eq!(

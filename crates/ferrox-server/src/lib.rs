@@ -2053,9 +2053,12 @@ struct ChatCompletionResponse {
     /// contract, but additive and harmless to OpenAI-compatible
     /// clients that ignore unknown fields): "hit" if this exact
     /// cacheable request was already computed, "miss" if this request
-    /// just computed and cached a fresh completion, or "skip" if the
-    /// request wasn't cacheable at all (sampling without a seed --
-    /// see `ChatCompletionRequest::is_cacheable`).
+    /// just computed and cached a fresh completion, or "skip" if
+    /// nothing was stored -- either the request wasn't cacheable at all
+    /// (sampling without a seed -- see
+    /// `ChatCompletionRequest::is_cacheable`) or the answer was not a
+    /// complete one and may not be replayed to anybody (a cancelled
+    /// generation -- see `response_cache::CachedCompletion::cacheable`).
     ferrox_cache: &'static str,
 }
 
@@ -3174,12 +3177,24 @@ async fn chat_completions_full(
             finish,
             usage,
         };
-        let cache_status = if let Some(key) = key {
-            tracing::debug!("cache miss for key {}", key.digest());
-            lock_cache(&state.response_cache).put(key, completion.clone());
-            "miss"
-        } else {
-            "skip"
+        // A cacheable KEY is not on its own permission to store an
+        // answer: `cacheable` refuses a generation that did not run to
+        // its own end, and is the only way to build the value `put`
+        // takes, so a cancelled partial cannot become the cached answer
+        // for the next caller (#57).
+        let cache_status = match key {
+            // Nothing is cloned unless there is a key to store it
+            // under: the common path here is a sampled request, which
+            // has none.
+            Some(key) => match completion.clone().cacheable() {
+                Some(cacheable) => {
+                    tracing::debug!("cache miss for key {}", key.digest());
+                    lock_cache(&state.response_cache).put(key, cacheable);
+                    "miss"
+                }
+                None => "skip",
+            },
+            None => "skip",
         };
         (completion, cache_status)
     };

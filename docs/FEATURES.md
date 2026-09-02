@@ -196,7 +196,9 @@ OpenAI-compatible HTTP API:
   on chat and completions and all three decode paths. Two constraints in
   one request are refused rather than ranked. `response_format:
   json_object` is still the best-effort character mask, and composes
-- Continuous batching and chunked prefill
+- Continuous batching and chunked prefill. On Metal, continuous batching
+  is on by default when compatible; streaming emits tokens incrementally
+  under CB (0.15.2). CLI: `-cb`, `-np` / `--parallel N`
 - Paged KV: shared page storage many requests read through a block
   table, with a radix tree over reference-counted page groups so
   conversations off one system prompt share its KV rather than each

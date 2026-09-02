@@ -12,11 +12,11 @@ Companion to [`llama-cpp-gap-inventory.md`](llama-cpp-gap-inventory.md) (evidenc
 |------|--------------|----------|
 | Architecture coverage | ~11 audited + 4 dedicated engines vs 140 llama.cpp graphs | P0 — expand audited set |
 | CLI flag semantics | Several **same flag, different meaning** (`-ngl`, `-e`, repeat penalty) | P0 — refuse or match |
-| Server flags | ~10 argv flags vs llama-server’s dozens; env-heavy | P1 — `-cb`, `-np`, `-c`, `--api-key` |
+| Server flags | `-cb`, `-np` added; still env-heavy for `-c`, `--api-key` | P1 |
 | Sampling / grammar | Large sampler + grammar surface missing on API/CLI | P1 |
 | Tools (quantize, perplexity) | No in-tree quantize or corpus eval | P1 |
-| Serving / batching | Continuous batching now **auto on Metal**; streaming still buffered under CB | P1 — incremental CB streams |
-| Metal concurrency | Mitigated (CB default + private-path gate); per-request Metal KV is proper fix | P0 — track #46 |
+| Serving / batching | CB auto-on Metal; incremental CB streaming (0.15.2) | P1 — `-c`, slot save/load |
+| Metal concurrency | Phase 1 shipped (#46 closed); per-request Metal KV is follow-up | P2 |
 
 ---
 
@@ -117,12 +117,12 @@ Align: `-n` default (-1 = EOS), `-cnv`/`-no-cnv`, `-sys` spelling, `-hf` on run 
 
 ## Recommended roadmap slices
 
-1. **Merge `fix/metal-parallel-concurrency`** — Metal serving safe by default
+1. **Merge `fix/metal-parallel-concurrency`** — Metal serving safe by default *(done in 0.15.2)*
 2. **Flag semantics sprint** — `-ngl`, escape, repeat-last-n (refuse > wrong)
-3. **Server CLI parity pack** — `-np`, `-c`, `--api-key`, document env mapping table
+3. **Server CLI parity pack** — `-c`, `--api-key`, document env mapping table
 4. **Fixture-away architectures** — 3–5 new audited rows with tiny GGUF fixtures
-5. **CB streaming** — incremental SSE from batch worker (closes UX gap vs llama-server)
-6. **Quantize tool** — or official doc that points to llama.cpp quantize with ferrox-compatible outputs
+5. **Slot save/load** — llama.cpp KV serialize/restore (Ferrox has no equivalent yet)
+6. **Quantize tool** — or official doc pointing to llama.cpp quantize
 
 ---
 
@@ -140,7 +140,7 @@ Use [`llama-cpp-gap-inventory.md`](llama-cpp-gap-inventory.md) as the evidence l
 
 ## References
 
-- Issue [#46](https://github.com/antonellof/ferrox/issues/46) — Metal parallel decode
+- Issue [#46](https://github.com/antonellof/ferrox/issues/46) — Metal parallel decode (closed in 0.15.2)
 - [`docs/plans/metal-parallel-concurrency.md`](metal-parallel-concurrency.md) — design
 - [`docs/CONFIG.md`](../../CONFIG.md) — env vars
 - [`docs/API.md`](../../API.md) — HTTP surface

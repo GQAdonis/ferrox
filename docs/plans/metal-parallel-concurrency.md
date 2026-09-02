@@ -1,20 +1,21 @@
 # Metal parallel decode concurrency
 
-Status: **implemented (phase 1)** on branch `fix/metal-parallel-concurrency`
+Status: **phase 1 shipped** in **0.15.2** ([PR #47](https://github.com/antonellof/ferrox/pull/47))
 
-Related defect: https://github.com/antonellof/ferrox/issues/46
+Related defect: https://github.com/antonellof/ferrox/issues/46 (closed)
 
-## Phase 1 landed
+## Phase 1 shipped (0.15.2)
 
 - **Auto continuous batching on Metal** when compatible (no KV pool / prefix cache on contiguous path)
-- **CLI** `--cont-batching` / `-cb`, `--no-cont-batching`
+- **CLI** `--cont-batching` / `-cb`, `--no-cont-batching`, `-np` / `--parallel N`
 - **Single-flight gate** for private-loop Metal decode when CB is off
+- **Incremental CB streaming** — tokens emitted as sampled, not buffered to end
 - **Decoder hardening:** poison-tolerant `metal_attn_kv` lock, fill `hidden` before CPU `rms_norm` fallback
 - **Parity review:** [`llama-cpp-parity-review-2026-09-02.md`](llama-cpp-parity-review-2026-09-02.md)
 
-## Problem
+## Problem (historical, pre-0.15.2)
 
-With Metal enabled and continuous batching **off** (the default), ferrox-server accepts multiple concurrent streaming requests but only reliably serves **one at a time**. Two or more parallel private-loop decodes against the same loaded GGUF model produce:
+With Metal enabled and continuous batching **off**, ferrox-server accepted multiple concurrent streaming requests but only reliably served **one at a time**. Two or more parallel private-loop decodes against the same loaded GGUF model produced:
 
 - Truncated SSE streams (one token, then silence; HTTP 200, no `[DONE]`)
 - Journal panics: `rms_norm` length mismatch (`0` vs `3072`) in `ferrox-core/src/matmul.rs`

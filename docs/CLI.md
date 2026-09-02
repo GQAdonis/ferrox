@@ -533,8 +533,13 @@ cargo build --release -p ferrox-cli --features "serve metal"
 
 ./target/release/ferrox serve \
   -m models/tinyllama-1.1b-chat-v1.0.Q8_0.gguf \
-  --host 127.0.0.1 --port 8383 -dev metal -ngl all
+  --host 127.0.0.1 --port 8383 -dev metal -ngl all -cb -np 4
 ```
+
+On Metal, continuous batching turns on by default when compatible; use
+`-cb` / `--cont-batching` and `-np` / `--parallel N` (llama.cpp slot
+cap) to set it explicitly. `--no-cont-batching` keeps the private
+decode loop (Metal serializes concurrent requests on that path).
 
 Without the feature, `ferrox serve` still exists and explains itself
 rather than reporting an unknown subcommand, since a compiled-out
@@ -560,7 +565,7 @@ curl -s -X POST http://127.0.0.1:8383/v1/chat/completions \
 ```bash
 # The kernel picks the port. The bound address is announced on stdout.
 ./target/release/ferrox-server -m model.gguf --port 0 --exit-on-stdin-close
-{"event":"ferrox.server.ready","addr":"127.0.0.1:52091","port":52091,"scheme":"http","pid":4242,"version":"0.12.0"}
+{"event":"ferrox.server.ready","addr":"127.0.0.1:52091","port":52091,"scheme":"http","pid":4242,"version":"0.15.2"}
 ```
 
 `--port 0` plus that one line saves a parent process from probing
@@ -578,8 +583,9 @@ sees EOF immediately, so the parent that wants the guarantee is the one
 that asks for it and keeps the pipe open.
 
 The server accepts `-m/--model`, `--host`, `--port`, `-t/--threads`,
-`-dev/--device`, `-ngl/--n-gpu-layers`, `--exit-on-stdin-close`, and
-`--list-devices`. Existing
+`-dev/--device`, `-ngl/--n-gpu-layers`, `--cont-batching` / `-cb`,
+`--no-cont-batching`, `-np` / `--parallel N`, `--exit-on-stdin-close`,
+and `--list-devices`. Existing
 `FERROX_MODEL_PATH`, `FERROX_ADDR`, and the backend environment
 variables all still work. Command-line values win over them. Keep
 secrets such as `FERROX_API_KEY` in the environment.

@@ -783,8 +783,24 @@ forgotten id is `404 stream_not_found`.
 
 ## Continuous batching
 
-Set `FERROX_CONTINUOUS_BATCHING=1`. Mutually exclusive with
-`FERROX_KV_POOL_BLOCKS` and `FERROX_PREFIX_CACHE_ENTRIES`.
+Concurrent requests share one batched decode worker (llama.cpp's slot
+model): many in-flight sequences, one `forward_multi_seq` step per tick.
+This is the supported multi-client path on Metal.
+
+Enable explicitly with `FERROX_CONTINUOUS_BATCHING=1`, `--cont-batching`
+/ `-cb`, or `-np N` / `--parallel N` (which also sets
+`FERROX_CB_MAX_SEQS`). Disable with `FERROX_CONTINUOUS_BATCHING=0` or
+`--no-cont-batching`. When unset on Metal builds with fused attention,
+continuous batching is **on by default** unless a KV pool or prefix cache
+forces the private decode path.
+
+Mutually exclusive with `FERROX_KV_POOL_BLOCKS` and
+`FERROX_PREFIX_CACHE_ENTRIES` on the contiguous path (paged KV lifts
+this; see [`CONFIG.md`](CONFIG.md)).
+
+Streaming under continuous batching emits tokens incrementally as they are
+sampled (same SSE shape as the private decode path), not one string at
+the end.
 
 Prefill is chunked. Per tick the scheduler runs one bounded prefill
 chunk (`FERROX_CB_PREFILL_CHUNK`, default 128 tokens, round-robin

@@ -505,10 +505,15 @@ model rather than blaming a tensor:
 }}
 ```
 
-`/v1/tokenize` and `/v1/detokenize` refuse the same way. They report the
-prompt the *generation* path would build, and an encoder has no
-generation path; `usage.prompt_tokens` on an embeddings response already
-counts the `[CLS]`/`[SEP]` the model actually saw.
+`/v1/tokenize` and `/v1/detokenize` are the exception: they ANSWER for
+an encoder, because an encoder has a real tokenizer and asking what
+tokens it saw is not asking it to generate. They used to refuse with the
+rest, which left no way to check a surprising embedding without loading
+the checkpoint in a second tool. `add_special` is a no-op there, since
+an encoder wraps its own `[CLS]`/`[SEP]` already, and those are the same
+tokens `usage.prompt_tokens` counts on an embeddings response.
+
+Every route that needs a decode still refuses.
 
 Only `bert` loads. The other encoder rows upstream builds from
 `bert.cpp`: `nomic-bert`, `jina-bert-v2/v3`, `neo-bert`,

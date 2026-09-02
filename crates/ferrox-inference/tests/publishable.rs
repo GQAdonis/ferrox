@@ -70,10 +70,8 @@ fn no_publishable_crate_depends_on_an_unpublishable_one() {
         "expected to find the workspace members, found {}",
         members.len()
     );
-    let publishable: HashMap<&str, bool> = members
-        .iter()
-        .map(|(n, p, _)| (n.as_str(), *p))
-        .collect();
+    let publishable: HashMap<&str, bool> =
+        members.iter().map(|(n, p, _)| (n.as_str(), *p)).collect();
 
     let mut broken = Vec::new();
     for (name, is_publishable, deps) in &members {

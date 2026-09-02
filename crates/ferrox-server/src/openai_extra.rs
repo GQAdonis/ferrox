@@ -392,14 +392,23 @@ fn tokenize_inner(
     // Tokenizing needs the loaded vocabulary, so this is a 503 like any
     // other generation endpoint when nothing is loaded -- answering
     // with byte-fallback ids would silently be the wrong vocabulary.
-    let model = state.require_model()?;
-    let mut tokens = model.encode(text);
+    // `require_active`, not `require_model`. Tokenizing is a question
+    // about the tokenizer, and an encoder has a real one: routing this
+    // through `generative()` made `/v1/tokenize` answer 501 "not a
+    // generative model" on an encoder-only server, which is the right
+    // refusal for a decode and the wrong one for this (issue #28).
+    let active = state.require_active()?;
+    let mut tokens = active.encode_any(text);
     if req.add_special == Some(true) {
         // The same helper the generation path uses, so `add_special`
         // reports the prompt the model would actually be given --
         // including its no-op behaviour on a checkpoint whose metadata
-        // says not to add BOS.
-        ferrox_models::tokenizer::prepend_bos(&mut tokens, model.bos_id());
+        // says not to add BOS. An encoder wraps its own specials in
+        // `token_ids` already, so there is no BOS to prepend and
+        // `bos_id()` is `None` there: the helper is a no-op, which is
+        // the honest answer rather than a second special token.
+        let bos = active.generative_opt().and_then(|m| m.bos_id());
+        ferrox_models::tokenizer::prepend_bos(&mut tokens, bos);
     }
     let count = tokens.len();
     Ok(Json(serde_json::json!({
@@ -433,7 +442,10 @@ fn detokenize_inner(
     state: &AppState,
     req: DetokenizeRequest,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let text = state.require_model()?.decode(&req.tokens);
+    // Same reasoning as `tokenize_inner`: an encoder's vocabulary is a
+    // real vocabulary, and asking what a token id means is not asking
+    // for a decode.
+    let text = state.require_active()?.decode_any(&req.tokens);
     // Both keys, same string: llama.cpp's clients read `content`
     // (`server-context.cpp:4970`), ferrox's existing ones read `text`,
     // and there is only one answer to disagree about.

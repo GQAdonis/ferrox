@@ -116,6 +116,38 @@ impl ActiveModel {
         }
     }
 
+    /// Token ids for `text`, whichever kind of checkpoint is loaded.
+    ///
+    /// `/v1/tokenize` and `/v1/detokenize` went through
+    /// `require_model()`, which is `generative()?`, so on an
+    /// encoder-only server they answered 501 "not a generative model".
+    /// That is the right refusal for a decode and the wrong one for a
+    /// question about tokenization: an encoder has a real tokenizer,
+    /// and asking what tokens it saw is exactly what a surprising
+    /// embedding makes you want to do (issue #28).
+    ///
+    /// Deliberately NOT reached through `generative()`: routes that
+    /// need a decode still go through it and still refuse, and this
+    /// pair is the only thing that steps around it.
+    pub(crate) fn encode_any(&self, text: &str) -> Vec<usize> {
+        match &self.loaded {
+            Loaded::Generative(m) => m.encode(text),
+            Loaded::Encoder(e) => e.token_ids(text).into_iter().map(|t| t as usize).collect(),
+        }
+    }
+
+    /// Text for `ids`, whichever kind of checkpoint is loaded. The
+    /// counterpart to [`Self::encode_any`].
+    pub(crate) fn decode_any(&self, ids: &[usize]) -> String {
+        match &self.loaded {
+            Loaded::Generative(m) => m.decode(ids),
+            Loaded::Encoder(e) => {
+                let ids: Vec<u32> = ids.iter().map(|&i| i as u32).collect();
+                e.decode_tokens(&ids)
+            }
+        }
+    }
+
     /// What `/v1/models` and `/health` call this checkpoint. Both kinds
     /// have a real name.
     pub(crate) fn name(&self) -> &str {

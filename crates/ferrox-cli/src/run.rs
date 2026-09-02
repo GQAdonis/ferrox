@@ -490,6 +490,53 @@ fn budget_backend_for(args: &InferArgs) -> ferrox_models::BudgetBackend {
     }
 }
 
+/// The startup banner, as a value so a test can hold it to the
+/// same `kv_elem_for` the budget prices with.
+fn banner_line(args: &InferArgs, device: OffloadDevice) -> String {
+    // The banner reports what this run WILL DO, not what was typed.
+    // It used to echo `--ctk` verbatim, so a CPU run printed `ctk=f16`
+    // while the host `KvCache` is `Vec<f32>` and the budget priced it
+    // at f32 -- the same two-structures-must-agree shape as everywhere
+    // else in this repo, and it made the memory warning look wrong
+    // (double the KV bytes the banner implied) when the warning was
+    // the only honest line of the two. `kv_elem_for` is now the single
+    // source, so the number in the banner is the number in the budget.
+    let effective_ctk = kv_elem_for(args);
+    let requested_ctk = args.ctk.trim();
+    let ctk_note = if effective_ctk.as_str() == requested_ctk {
+        String::new()
+    } else {
+        format!(" (--ctk {requested_ctk} ignored: only the Metal KV store has a selectable dtype)")
+    };
+
+    format!(
+        "ferrox: device={} gpu-layers={} ctk={}{}",
+        match device {
+            OffloadDevice::Auto => "auto",
+            OffloadDevice::None => "none",
+            OffloadDevice::Cpu => "cpu",
+            OffloadDevice::Metal => "Metal",
+            OffloadDevice::Cuda => "CUDA",
+        },
+        gpu_layers_note(args, device),
+        effective_ctk.as_str(),
+        ctk_note
+    )
+}
+
+/// `-ngl` as the run will honour it. `-dev cpu -ngl all` offloads
+/// nothing, and printing a bare `gpu-layers=all` there reads as a
+/// promise the run does not keep.
+fn gpu_layers_note(args: &InferArgs, device: OffloadDevice) -> String {
+    let requested = args.n_gpu_layers.to_string();
+    match device {
+        OffloadDevice::None | OffloadDevice::Cpu if args.n_gpu_layers.offload_enabled() => {
+            format!("{requested} (ignored, no GPU offload on this device)")
+        }
+        _ => requested,
+    }
+}
+
 /// Width of the KV store the selected backend will really keep. The
 /// host `ferrox_core::cache::KvCache` is `Vec<f32>`; only the Metal
 /// path has a device KV whose dtype `--ctk` selects.
@@ -582,13 +629,14 @@ fn resolve_ctx_size(args: &InferArgs, path: &Path, gguf_ctx: usize) -> anyhow::R
         let fit = report.auto_context(gguf_ctx);
         let message = format!(
             "{}: {} bytes estimated at ctx={tokens} against a {} byte {} budget ({}); \
-             {} bytes over. `--ctx-size auto` would pick {}. {}",
+             {} bytes over. That estimate is {}. `--ctx-size auto` would pick {}. {}",
             e.code(),
             e.estimated_bytes,
             e.limit_bytes,
             backend,
-            budget.source,
+            budget.usable_provenance(),
             e.overage_bytes(),
+            e.detail,
             fit.tokens,
             budget.caveat(),
         );
@@ -889,17 +937,7 @@ fn apply_backend_env(args: &InferArgs) -> anyhow::Result<()> {
         std::env::set_var("FERROX_CTK", args.ctk.trim());
     }
 
-    eprintln!(
-        "ferrox: device={} gpu-layers={} ctk={}",
-        match device {
-            OffloadDevice::Auto => "auto",
-            OffloadDevice::None | OffloadDevice::Cpu => "none",
-            OffloadDevice::Metal => "Metal",
-            OffloadDevice::Cuda => "CUDA",
-        },
-        args.n_gpu_layers,
-        args.ctk.trim()
-    );
+    eprintln!("{}", banner_line(args, device));
     Ok(())
 }
 
@@ -1614,6 +1652,74 @@ fn run_glm52_infer(args: InferArgs, path: &Path, file: &ShardedGguf) -> anyhow::
 mod tests {
     use super::GpuLayers;
     use std::str::FromStr;
+
+    use super::{banner_line, kv_elem_for, InferArgs, OffloadDevice};
+    use clap::Parser;
+
+    /// `InferArgs` is a `clap::Args` group, not a `Parser`, so the test
+    /// gives it the top-level command it is normally flattened into.
+    #[derive(Parser)]
+    struct Cli {
+        #[command(flatten)]
+        infer: InferArgs,
+    }
+
+    fn args(argv: &[&str]) -> InferArgs {
+        let mut full = vec!["ferrox"];
+        full.extend_from_slice(argv);
+        Cli::parse_from(full).infer
+    }
+
+    /// The banner may not promise a KV dtype the run will not use.
+    ///
+    /// `ferrox -m m.gguf -dev cpu -ngl all` printed `ctk=f16` because
+    /// the banner echoed the flag's default, while the host `KvCache`
+    /// is `Vec<f32>` and the budget priced it at f32. That made the
+    /// memory warning look like a bug: it charged 229376 bytes/token
+    /// where the banner implied 114688, so a 3B model at its 131072
+    /// trained context read as 37.5 GB instead of 22.5 GB. The warning
+    /// was right and the banner was wrong.
+    ///
+    /// The flag and the store are two things that must agree, so the
+    /// banner now derives from `kv_elem_for`, the same function the
+    /// budget prices with.
+    #[test]
+    fn the_banner_reports_the_kv_dtype_the_run_will_actually_keep() {
+        let a = args(&["-m", "m.gguf", "--device", "cpu", "--ctk", "f16"]);
+        assert_eq!(kv_elem_for(&a).as_str(), "f32", "the host KV cache is f32");
+
+        let line = banner_line(&a, OffloadDevice::Cpu);
+        assert!(line.contains("ctk=f32"), "{line}");
+        assert!(
+            !line.contains("ctk=f16"),
+            "the banner echoed the flag: {line}"
+        );
+        assert!(
+            line.contains("--ctk f16 ignored"),
+            "a flag with no effect must say so: {line}"
+        );
+    }
+
+    /// `-dev cpu` is not `-dev none`, and `-ngl all` under either does
+    /// nothing. Both were printed as if honoured.
+    #[test]
+    fn the_banner_does_not_promise_gpu_layers_on_a_cpu_device() {
+        let a = args(&["-m", "m.gguf", "--device", "cpu", "--ngl", "all"]);
+        let line = banner_line(&a, OffloadDevice::Cpu);
+        assert!(line.contains("device=cpu"), "{line}");
+        assert!(line.contains("ignored, no GPU offload"), "{line}");
+    }
+
+    /// And a run that really does select the dtype keeps a clean line.
+    #[test]
+    fn a_metal_run_reports_the_requested_dtype_with_no_caveat() {
+        let a = args(&[
+            "-m", "m.gguf", "--device", "metal", "--ngl", "all", "--ctk", "f16",
+        ]);
+        let line = banner_line(&a, OffloadDevice::Metal);
+        assert!(line.contains("ctk=f16"), "{line}");
+        assert!(!line.contains("ignored"), "{line}");
+    }
 
     /// `-ngl N` must not silently mean "all layers".
     ///

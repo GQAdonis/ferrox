@@ -158,10 +158,30 @@ impl DeviceBudget {
         self.total_bytes == 0
     }
 
+    /// Where `usable_bytes` came from, spelled out.
+    ///
+    /// `source` describes `total_bytes`, so printing it next to
+    /// `usable_bytes` -- as the CLI's over-budget warning did -- reads
+    /// as "27487790694 bytes is the total physical host RAM" when the
+    /// machine has 32 GiB and 20% is held back. Same two-values-one-
+    /// label shape as the rest of this repo's bugs.
+    pub fn usable_provenance(&self) -> String {
+        if self.is_unknown() {
+            return self.source.clone();
+        }
+        format!(
+            "{:.0}% of {} {}, {:.0}% held back",
+            (1.0 - self.reserve_fraction) * 100.0,
+            self.total_bytes,
+            self.source,
+            self.reserve_fraction * 100.0,
+        )
+    }
+
     /// The caveat sentence every printer of this number owes the user.
     pub fn caveat(&self) -> &'static str {
-        "approximate: ferrox mmaps quantized weights, so their resident cost is the \
-         kernel's page cache to decide -- this charges the whole checkpoint, which is an \
+        "approximate: ferrox mmaps quantized weights, so how much of them stays resident is \
+         the kernel's page cache to decide; this charges the whole checkpoint, which is an \
          upper bound, and the budget itself is a snapshot, not a reservation"
     }
 }

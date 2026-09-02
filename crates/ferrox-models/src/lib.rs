@@ -80,7 +80,7 @@ pub use decoder::{Decoder, MultiSeqKv};
 pub use device_budget::{BudgetBackend, DeviceBudget};
 pub use draft_model::{DraftModelSpeculator, VocabMismatch};
 pub use embedding_model::{is_embedding_arch, EmbedError, EmbeddingModel};
-pub use encoder::{EncodeError, TextEncoder};
+pub use encoder::{EncodeError, PairSequence, TextEncoder};
 pub use engine::{
     DeepseekV4Engine, Engine, Glm52Engine, KimiEngine, MlaDenseFfn, MlaEngine, MlaLayerFfn,
     MlaLayerWeights, MlaMoeFfn, MlaMoeRuntime, TextTokenizer,

@@ -8,7 +8,7 @@
 //! # The graph, and the five places it is not a decoder
 //!
 //! ```text
-//! h[i] = tok_embd[t[i]] + type_embd[0] + pos_embd[i]      (1) (2)
+//! h[i] = tok_embd[t[i]] + type_embd[seg[i]] + pos_embd[i] (1) (2)
 //! h    = LayerNorm(h, token_embd_norm)                        (3)
 //! for each layer:
 //!     q,k,v = Wq h + bq,  Wk h + bk,  Wv h + bv
@@ -24,12 +24,20 @@
 //!    lookup. A learned table cannot be extrapolated, which is why
 //!    [`crate::encoder::EncodeError::TooLong`] is an error and not a
 //!    warning.
-//! 2. **A token-type embedding.** Upstream hardcodes row 0 ("Sentence
-//!    A") — `ggml_view_1d(ctx0, model.type_embd, n_embd, 0)` — because
-//!    the single-sequence embedding use never has a sentence B. Ferrox
-//!    does the same, and the loader refuses a checkpoint whose
-//!    `token_types` table is missing when the metadata says it should
-//!    have one.
+//! 2. **A token-type embedding, per position.** A single-sequence
+//!    embedding pass is all "Sentence A" and uses row 0, which is what
+//!    upstream hardcodes — `ggml_view_1d(ctx0, model.type_embd, n_embd,
+//!    0)`, with the comment that token types are hardcoded to zero
+//!    because `llama_batch` carries no segment ids. A cross-encoder
+//!    PAIR is not that case: HuggingFace's `tokenizer(query, document)`
+//!    emits `0…0 1…1` and `BertModel` adds row 1 to every position
+//!    after the first `[SEP]`. Ferrox adds the row the caller names,
+//!    which is row 0 for every embedding request and 0/1 for a rerank
+//!    pair. Matching upstream here instead was measured, on
+//!    `cross-encoder/ms-marco-MiniLM-L6-v2` against a NumPy transcription
+//!    of `BertForSequenceClassification`, to put the RELEVANT document
+//!    LAST in three of four rankings — see
+//!    `tests/rerank_cross_encoder_ordering.rs`.
 //! 3. **LayerNorm, not RMSNorm, at three sites per layer plus one on
 //!    the input.** Mean-subtracting, and every one of them carries a
 //!    `bias` tensor as well as a `weight`. Substituting RMSNorm here
@@ -55,7 +63,7 @@
 use ferrox_core::matmul::{gelu, layer_norm};
 use ferrox_core::weight_matrix::WeightMatrix;
 
-use crate::encoder::{EncodeError, TextEncoder};
+use crate::encoder::{EncodeError, PairSequence, TextEncoder};
 use crate::pooling::PoolingType;
 
 /// `bert.*` metadata, after the loader has checked it.
@@ -112,8 +120,13 @@ pub struct BertLayer {
 pub struct BertEncoder {
     pub hp: BertHparams,
     pub tok_embd: WeightMatrix,
-    /// Row 0 of `token_types.weight` — "Sentence A". See the module docs.
-    pub type_embd_row0: Option<Vec<f32>>,
+    /// `token_types.weight`, **every** row: `[n_token_types, n_embd]`.
+    /// Row 0 is "Sentence A" and row 1 "Sentence B". `None` when the
+    /// checkpoint carries no table at all, which upstream allows
+    /// (`TENSOR_NOT_REQUIRED`) and which means no segment embedding is
+    /// added anywhere. Loading only row 0 — what this held before — is
+    /// what made a rerank pair score both halves as Sentence A.
+    pub type_embd: Option<Vec<Vec<f32>>>,
     pub pos_embd: WeightMatrix,
     pub tok_norm_w: Vec<f32>,
     pub tok_norm_b: Vec<f32>,
@@ -229,33 +242,50 @@ impl TextEncoder for BertEncoder {
         out
     }
 
-    /// `[CLS] a [SEP] b [SEP]` — what HuggingFace's
-    /// `tokenizer(query, document)` builds for a BERT cross-encoder,
-    /// which is the input these checkpoints were trained on.
-    ///
-    /// The **segment ids** that pairing normally carries are not here,
-    /// and that is deliberate rather than forgotten: this graph adds
-    /// row 0 of `token_types.weight` to every position, because
-    /// llama.cpp does the same (`token types are hardcoded to zero`,
-    /// its `bert.cpp`; see [`BertEncoder::type_embd_row0`]). A reranker
-    /// scored here therefore differs from the HF reference by the
-    /// second segment's type embedding, on both engines equally. It is
-    /// recorded in the ferrox rerank docs and is the first thing to
-    /// check if an ordering disagrees with `transformers`.
-    fn wrap_special_pair(&self, a: &[u32], b: &[u32]) -> Option<Vec<u32>> {
-        let mut out = Vec::with_capacity(a.len() + b.len() + 3);
-        out.push(self.hp.cls_id);
-        out.extend_from_slice(a);
-        out.push(self.hp.sep_id);
-        out.extend_from_slice(b);
-        out.push(self.hp.sep_id);
-        Some(out)
+    /// The height of `token_types.weight`, or 1 when the checkpoint
+    /// carries no table (nothing is added at any position, which is
+    /// what a one-row table would do anyway).
+    fn n_segments(&self) -> usize {
+        self.type_embd.as_ref().map(Vec::len).unwrap_or(1)
     }
 
-    fn encode_tokens(&self, tokens: &[u32]) -> Result<Vec<f32>, EncodeError> {
+    /// `[CLS] a [SEP] b [SEP]` with segments `0…0 1…1` — what
+    /// HuggingFace's `tokenizer(query, document)` builds for a BERT
+    /// cross-encoder, which is the input these checkpoints were
+    /// trained on.
+    ///
+    /// The boundary is defined once, here, and both vectors are cut on
+    /// it: the first `[SEP]` closes segment 0 (HF counts it as part of
+    /// the first half) and everything after it is segment 1. Returning
+    /// the ids alone and letting the graph assume a segment is how the
+    /// document half came to be scored as "Sentence A".
+    fn wrap_special_pair(&self, a: &[u32], b: &[u32]) -> Option<PairSequence> {
+        let mut tokens = Vec::with_capacity(a.len() + b.len() + 3);
+        tokens.push(self.hp.cls_id);
+        tokens.extend_from_slice(a);
+        tokens.push(self.hp.sep_id);
+        let first_half = tokens.len();
+        tokens.extend_from_slice(b);
+        tokens.push(self.hp.sep_id);
+        let mut segments = vec![0u32; tokens.len()];
+        for s in segments[first_half..].iter_mut() {
+            *s = 1;
+        }
+        Some(PairSequence { tokens, segments })
+    }
+
+    fn encode(&self, tokens: &[u32], segments: Option<&[u32]>) -> Result<Vec<f32>, EncodeError> {
         let n = tokens.len();
         if n == 0 {
             return Err(EncodeError::EmptySequence);
+        }
+        if let Some(seg) = segments {
+            if seg.len() != n {
+                return Err(EncodeError::RaggedSegments {
+                    tokens: n,
+                    segments: seg.len(),
+                });
+            }
         }
         if n > self.hp.n_ctx_train {
             return Err(EncodeError::TooLong {
@@ -279,7 +309,15 @@ impl TextEncoder for BertEncoder {
             for (j, slot) in row.iter_mut().enumerate() {
                 *slot = tok[j] + pos[j];
             }
-            if let Some(ty) = &self.type_embd_row0 {
+            if let Some(table) = &self.type_embd {
+                let seg = segments.map(|s| s[i]).unwrap_or(0);
+                let ty = table
+                    .get(seg as usize)
+                    .ok_or(EncodeError::SegmentOutOfRange {
+                        id: seg,
+                        pos: i,
+                        n_segments: table.len(),
+                    })?;
                 for (slot, tv) in row.iter_mut().zip(ty.iter()) {
                     *slot += tv;
                 }
@@ -376,7 +414,8 @@ mod tests {
         let mut r = Lcg(0x5EED);
         let tok_embd = r.matrix(VOCAB, D);
         let pos_embd = r.matrix(CTX, D);
-        let type_embd_row0 = Some(r.vec(D));
+        // Two rows, like every real BERT: "Sentence A" and "Sentence B".
+        let type_embd = Some(vec![r.vec(D), r.vec(D)]);
         let tok_norm_w = r.vec(D);
         let tok_norm_b = r.vec(D);
         let layers = (0..n_layer)
@@ -415,7 +454,7 @@ mod tests {
                 sep_id: 2,
             },
             tok_embd,
-            type_embd_row0,
+            type_embd,
             pos_embd,
             tok_norm_w,
             tok_norm_b,
@@ -426,10 +465,10 @@ mod tests {
     /// An f64 transcription of the graph in the module docs, written
     /// the slowest possible way: no `apply_batch`, no shared buffers,
     /// one scalar loop per matrix element. It exists to disagree with
-    /// [`BertEncoder::encode_tokens`] if the fast path transposes a
-    /// matrix, drops a bias, norms the wrong residual, or reuses a
-    /// buffer it should not.
-    fn reference_forward(m: &BertEncoder, tokens: &[u32]) -> Vec<f64> {
+    /// [`BertEncoder::encode`] if the fast path transposes a matrix,
+    /// drops a bias, norms the wrong residual, reuses a buffer it
+    /// should not, or reads the wrong row of the token-type table.
+    fn reference_forward(m: &BertEncoder, tokens: &[u32], segments: &[u32]) -> Vec<f64> {
         let d = m.hp.n_embd;
         let n = tokens.len();
         let hd = m.hp.head_dim();
@@ -461,7 +500,11 @@ mod tests {
             .map(|(i, &t)| {
                 let tok = m.tok_embd.dequant_row(t as usize);
                 let pos = m.pos_embd.dequant_row(i);
-                let ty = m.type_embd_row0.clone().unwrap_or(vec![0.0; d]);
+                let ty = m
+                    .type_embd
+                    .as_ref()
+                    .map(|t| t[segments[i] as usize].clone())
+                    .unwrap_or_else(|| vec![0.0; d]);
                 let row: Vec<f64> = (0..d)
                     .map(|j| tok[j] as f64 + pos[j] as f64 + ty[j] as f64)
                     .collect();
@@ -554,7 +597,7 @@ mod tests {
         let m = fixture(3);
         let tokens = [1u32, 7, 13, 4, 9, 2];
         let got = m.encode_tokens(&tokens).unwrap();
-        let want = reference_forward(&m, &tokens);
+        let want = reference_forward(&m, &tokens, &[0; 6]);
         assert_eq!(got.len(), want.len());
         for (i, (g, w)) in got.iter().zip(&want).enumerate() {
             assert!(
@@ -562,6 +605,54 @@ mod tests {
                 "element {i}: {g} vs reference {w}"
             );
         }
+    }
+
+    /// The same transcription, driven with a real `0 0 0 1 1 1` split.
+    /// The point is not that segments *do something* — it is that the
+    /// fast path reads the SAME row the reference does at every
+    /// position, so an off-by-one on the boundary or a table indexed
+    /// with the token id would show up here.
+    #[test]
+    fn the_segment_id_selects_the_token_type_row_at_every_position() {
+        let m = fixture(3);
+        let tokens = [1u32, 7, 13, 4, 9, 2];
+        let segments = [0u32, 0, 0, 1, 1, 1];
+        let got = m.encode(&tokens, Some(&segments)).unwrap();
+        let want = reference_forward(&m, &tokens, &segments);
+        for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+            assert!(
+                (*g as f64 - w).abs() < 2e-4,
+                "element {i}: {g} vs reference {w}"
+            );
+        }
+        // And it is genuinely a different graph from the all-zeros one,
+        // which is the whole of issue #44: scoring the second half as
+        // "Sentence A" is not a rounding difference.
+        let all_zero = m.encode_tokens(&tokens).unwrap();
+        let moved: f32 = all_zero
+            .iter()
+            .zip(&got)
+            .map(|(x, y)| (x - y).abs())
+            .sum::<f32>();
+        assert!(moved > 1e-3, "segment 1 changed nothing ({moved})");
+    }
+
+    /// A segment id with no row, and a segment list that is not one per
+    /// token, are refusals rather than a panic or a silently wrong row.
+    #[test]
+    fn a_segment_id_off_the_table_and_a_ragged_segment_list_are_refused() {
+        let m = fixture(1);
+        assert!(matches!(
+            m.encode(&[1, 7, 2], Some(&[0, 2, 0])),
+            Err(EncodeError::SegmentOutOfRange { id: 2, pos: 1, .. })
+        ));
+        assert!(matches!(
+            m.encode(&[1, 7, 2], Some(&[0, 0])),
+            Err(EncodeError::RaggedSegments {
+                tokens: 3,
+                segments: 2
+            })
+        ));
     }
 
     /// The property that makes this an encoder. Row 0's output must
@@ -640,27 +731,43 @@ mod tests {
         assert_eq!(m.wrap_special(&[]), vec![1, 2]);
     }
 
-    /// The cross-encoder input is `[CLS] a [SEP] b [SEP]` — the
-    /// boundary between the two halves is the whole reason a reranker
-    /// scores differently from an embedding model. Concatenating
-    /// without it, or dropping the trailing `[SEP]`, produces a
-    /// perfectly plausible ranking that is not the model's, so the
-    /// exact sequence is asserted rather than its length.
+    /// The cross-encoder input is `[CLS] a [SEP] b [SEP]` with segments
+    /// `0 0 0 0 1 1` — the boundary between the two halves is the whole
+    /// reason a reranker scores differently from an embedding model.
+    /// Concatenating without it, dropping the trailing `[SEP]`, or
+    /// leaving every segment at 0, produces a perfectly plausible
+    /// ranking that is not the model's, so both vectors are asserted
+    /// exactly rather than by length.
+    ///
+    /// The first `[SEP]` belongs to segment 0, which is what
+    /// HuggingFace's `tokenizer(query, document)` emits: an off-by-one
+    /// there is a one-position difference that no shape check catches.
     #[test]
-    fn the_pair_form_separates_the_two_halves_and_closes_the_second() {
+    fn the_pair_form_separates_the_two_halves_and_labels_each_one() {
         let m = fixture(1);
-        assert_eq!(
-            m.wrap_special_pair(&[7, 8], &[9]).unwrap(),
-            vec![1, 7, 8, 2, 9, 2]
-        );
+        let pair = m.wrap_special_pair(&[7, 8], &[9]).unwrap();
+        assert_eq!(pair.tokens, vec![1, 7, 8, 2, 9, 2]);
+        assert_eq!(pair.segments, vec![0, 0, 0, 0, 1, 1]);
         // An empty half is still a half: the boundary stays.
-        assert_eq!(m.wrap_special_pair(&[], &[]).unwrap(), vec![1, 2, 2]);
+        let empty = m.wrap_special_pair(&[], &[]).unwrap();
+        assert_eq!(empty.tokens, vec![1, 2, 2]);
+        assert_eq!(empty.segments, vec![0, 0, 1]);
         // And it is NOT the single-sequence form of the two texts run
         // together, which is what a defaulted implementation would give.
-        assert_ne!(
-            m.wrap_special_pair(&[7, 8], &[9]).unwrap(),
-            m.wrap_special(&[7, 8, 9])
-        );
+        assert_ne!(pair.tokens, m.wrap_special(&[7, 8, 9]));
+    }
+
+    /// A checkpoint with no "Sentence B" row cannot express a pair, and
+    /// [`crate::EmbeddingModel`] refuses one at load. This is the value
+    /// that refusal reads.
+    #[test]
+    fn n_segments_is_the_height_of_the_token_type_table() {
+        let mut m = fixture(1);
+        assert_eq!(m.n_segments(), 2);
+        m.type_embd = Some(vec![vec![0.0; D]]);
+        assert_eq!(m.n_segments(), 1);
+        m.type_embd = None;
+        assert_eq!(m.n_segments(), 1);
     }
 
     /// `embed_tokens` must return the CLS row of the hidden states this

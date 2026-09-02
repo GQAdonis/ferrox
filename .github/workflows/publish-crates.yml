@@ -108,6 +108,7 @@ jobs:
             ferrox-safetensors
             ferrox-cuda
             ferrox-metal
+            ferrox-vulkan
             ferrox-core
             ferrox-moe
             ferrox-models

@@ -9,7 +9,11 @@ description = "Vulkan/SPIR-V beachhead for the Ferrox inference engine (GO/NO-GO
 readme = "README.md"
 keywords = ["vulkan", "spirv", "gpu", "llm", "ferrox"]
 categories = ["hardware-support", "science"]
-publish = false
+# Published because `ferrox-core` depends on it. Cargo requires every
+# dependency of a published crate to be resolvable on the registry,
+# optional ones included, so `publish = false` here made `ferrox-core`
+# unpublishable. The crate is still a beachhead and its description and
+# README say so.
 
 [dependencies]
 thiserror = { workspace = true }

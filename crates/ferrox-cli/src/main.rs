@@ -1310,13 +1310,14 @@ fn main() -> anyhow::Result<()> {
             );
             println!("low or zero accept rate below is expected and does not indicate a bug.\n");
 
-            let speculator = ferrox_models::PromptLookupSpeculator::new(ngram_size, max_draft_len);
+            let mut speculator =
+                ferrox_models::PromptLookupSpeculator::new(ngram_size, max_draft_len);
             let result = ferrox_models::speculative_decode(
                 &decoder,
                 &prompt_tokens,
                 max_new_tokens,
                 &mut caches,
-                &speculator,
+                &mut speculator,
             );
 
             println!("Tokens generated : {}", result.tokens_generated);

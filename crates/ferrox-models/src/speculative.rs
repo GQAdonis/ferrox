@@ -203,7 +203,11 @@ pub trait Drafter {
     /// for `history`'s last token, or empty when none is available yet
     /// (which a drafter that needs it must handle by proposing
     /// nothing).
-    fn propose(&self, history: &[usize], target_hidden: &[f32], max_len: usize) -> DraftBlock;
+    /// Takes `&mut self` because a drafter that is itself a model
+    /// carries KV state across calls, and hiding that behind interior
+    /// mutability would put a runtime borrow check on the hot path to
+    /// buy nothing. A stateless drafter simply ignores it.
+    fn propose(&mut self, history: &[usize], target_hidden: &[f32], max_len: usize) -> DraftBlock;
 }
 
 /// Proposes candidate continuation tokens by looking for the longest
@@ -262,7 +266,7 @@ impl PromptLookupSpeculator {
 }
 
 impl Drafter for PromptLookupSpeculator {
-    fn propose(&self, history: &[usize], _target_hidden: &[f32], max_len: usize) -> DraftBlock {
+    fn propose(&mut self, history: &[usize], _target_hidden: &[f32], max_len: usize) -> DraftBlock {
         let mut tokens = self.propose_tokens(history);
         tokens.truncate(max_len.min(self.max_draft_len));
         DraftBlock::deterministic(tokens)
@@ -461,7 +465,7 @@ pub fn speculative_decode<D: Drafter + ?Sized>(
     prompt_tokens: &[usize],
     max_new_tokens: usize,
     kv_caches: &mut [KvCache],
-    drafter: &D,
+    drafter: &mut D,
 ) -> SpeculativeDecodeResult {
     speculative_decode_with(
         decoder,
@@ -501,7 +505,7 @@ pub fn speculative_decode_with<D: Drafter + ?Sized>(
     decoder: &Decoder,
     prompt_tokens: &[usize],
     kv_caches: &mut [KvCache],
-    drafter: &D,
+    drafter: &mut D,
     options: &SpeculativeOptions,
 ) -> SpeculativeDecodeResult {
     assert!(!prompt_tokens.is_empty(), "prompt must not be empty");
@@ -684,7 +688,12 @@ mod tests {
     }
 
     impl Drafter for FixedDrafter {
-        fn propose(&self, history: &[usize], target_hidden: &[f32], max_len: usize) -> DraftBlock {
+        fn propose(
+            &mut self,
+            history: &[usize],
+            target_hidden: &[f32],
+            max_len: usize,
+        ) -> DraftBlock {
             self.seen_history.borrow_mut().push(history.to_vec());
             self.seen_hidden_len.borrow_mut().push(target_hidden.len());
             let mut block = self.block.clone();
@@ -697,7 +706,7 @@ mod tests {
 
     #[test]
     fn proposes_the_continuation_after_a_real_repeat() {
-        let spec = PromptLookupSpeculator::new(2, 4);
+        let mut spec = PromptLookupSpeculator::new(2, 4);
         // "...1 2 3 4 5 9 9 9 1 2" -> earlier "1 2" occurs at the very
         // start (indices 0-1); the 4 tokens that followed it are
         // "3 4 5 9" (capped at max_draft_len=4).
@@ -741,7 +750,7 @@ mod tests {
 
     #[test]
     fn the_trait_caps_a_block_at_the_callers_budget() {
-        let spec = PromptLookupSpeculator::new(2, 4);
+        let mut spec = PromptLookupSpeculator::new(2, 4);
         let history = vec![1, 2, 3, 4, 5, 9, 9, 9, 1, 2];
         let block = spec.propose(&history, &[], 2);
         assert_eq!(block.tokens(), &[3, 4]);
@@ -840,8 +849,9 @@ mod tests {
 
         let decoder_a = Decoder::new_random_small(cfg.clone(), 2, vocab);
         let mut caches_a = caches(&decoder_a);
-        let speculator = PromptLookupSpeculator::new(2, 3);
-        let result = speculative_decode(&decoder_a, &prompt, max_new, &mut caches_a, &speculator);
+        let mut speculator = PromptLookupSpeculator::new(2, 3);
+        let result =
+            speculative_decode(&decoder_a, &prompt, max_new, &mut caches_a, &mut speculator);
 
         let decoder_b = Decoder::new_random_small(cfg, 2, vocab);
         let mut caches_b = caches(&decoder_b);
@@ -955,7 +965,7 @@ mod tests {
         let seeds = 4_000u64;
 
         let decoder = Decoder::new_random_small(cfg, 1, vocab);
-        let speculator = PromptLookupSpeculator::new(2, 3);
+        let mut speculator = PromptLookupSpeculator::new(2, 3);
         let exact = exact_marginals(&decoder, &prompt, &params, max_new, vocab);
 
         let mut spec_counts = vec![vec![0usize; vocab]; max_new];
@@ -965,7 +975,7 @@ mod tests {
                 &decoder,
                 &prompt,
                 &mut kv,
-                &speculator,
+                &mut speculator,
                 &SpeculativeOptions {
                     max_new_tokens: max_new,
                     sampling: params.clone(),
@@ -1005,8 +1015,8 @@ mod tests {
 
         let decoder = Decoder::new_random_small(cfg, 2, vocab);
         let mut kv = caches(&decoder);
-        let speculator = PromptLookupSpeculator::new(2, 4);
-        let result = speculative_decode(&decoder, &prompt, max_new, &mut kv, &speculator);
+        let mut speculator = PromptLookupSpeculator::new(2, 4);
+        let result = speculative_decode(&decoder, &prompt, max_new, &mut kv, &mut speculator);
 
         assert_eq!(result.tokens_generated, max_new);
         // Plain sequential decode needs exactly `max_new` calls here:
@@ -1032,8 +1042,8 @@ mod tests {
 
         let decoder = Decoder::new_random_small(cfg, 2, vocab);
         let mut kv = caches(&decoder);
-        let speculator = PromptLookupSpeculator::new(10, 4); // ngram far longer than any possible history
-        let result = speculative_decode(&decoder, &prompt, max_new, &mut kv, &speculator);
+        let mut speculator = PromptLookupSpeculator::new(10, 4); // ngram far longer than any possible history
+        let result = speculative_decode(&decoder, &prompt, max_new, &mut kv, &mut speculator);
 
         assert_eq!(result.tokens_generated, max_new);
         assert_eq!(
@@ -1059,9 +1069,9 @@ mod tests {
         let decoder = Decoder::new_random_small(cfg, 2, 8);
         let mut kv = caches(&decoder);
         let prompt = vec![1usize, 2, 3];
-        let drafter = FixedDrafter::new(DraftBlock::deterministic(vec![5, 6]));
+        let mut drafter = FixedDrafter::new(DraftBlock::deterministic(vec![5, 6]));
 
-        let result = speculative_decode(&decoder, &prompt, 4, &mut kv, &drafter);
+        let result = speculative_decode(&decoder, &prompt, 4, &mut kv, &mut drafter);
 
         let seen = drafter.seen_history.borrow();
         assert!(!seen.is_empty(), "the drafter must actually be consulted");
@@ -1089,9 +1099,9 @@ mod tests {
         let hidden_dim = cfg.hidden_dim;
         let decoder = Decoder::new_random_small(cfg, 2, 8);
         let mut kv = caches(&decoder);
-        let drafter = FixedDrafter::new(DraftBlock::deterministic(vec![5, 6]));
+        let mut drafter = FixedDrafter::new(DraftBlock::deterministic(vec![5, 6]));
 
-        speculative_decode(&decoder, &[1usize, 2, 3], 4, &mut kv, &drafter);
+        speculative_decode(&decoder, &[1usize, 2, 3], 4, &mut kv, &mut drafter);
 
         let lens = drafter.seen_hidden_len.borrow();
         assert!(!lens.is_empty());
@@ -1112,12 +1122,12 @@ mod tests {
         let cfg = tiny_test_config();
         let vocab = 8;
         let decoder = Decoder::new_random_small(cfg, 2, vocab);
-        let speculator = PromptLookupSpeculator::new(2, 3);
+        let mut speculator = PromptLookupSpeculator::new(2, 3);
         let full_prompt = vec![1usize, 2, 3, 4, 1, 2];
         let max_new = 6;
 
         let mut fresh = caches(&decoder);
-        let cold = speculative_decode(&decoder, &full_prompt, max_new, &mut fresh, &speculator);
+        let cold = speculative_decode(&decoder, &full_prompt, max_new, &mut fresh, &mut speculator);
 
         // Warm: feed the first 4 prompt tokens through the decoder
         // first, then resume speculative decoding from position 4.
@@ -1128,7 +1138,7 @@ mod tests {
             &decoder,
             &full_prompt[split..],
             &mut warm,
-            &speculator,
+            &mut speculator,
             &SpeculativeOptions {
                 max_new_tokens: max_new,
                 start_pos: split,
@@ -1153,7 +1163,7 @@ mod tests {
         let decoder = Decoder::new_random_small(cfg, 2, 8);
         // Token 7 is a fixed guess; whether it is accepted is up to the
         // model, but the invariant below holds either way.
-        let drafter = FixedDrafter::new(DraftBlock::deterministic(vec![7, 7, 7]));
+        let mut drafter = FixedDrafter::new(DraftBlock::deterministic(vec![7, 7, 7]));
         let context = vec![1usize, 2, 3, 4];
         let prompt = vec![5usize, 6];
         let max_new = 6;
@@ -1166,7 +1176,7 @@ mod tests {
             &decoder,
             &prompt,
             &mut kv,
-            &drafter,
+            &mut drafter,
             &SpeculativeOptions {
                 max_new_tokens: max_new,
                 start_pos: context.len(),
@@ -1197,14 +1207,14 @@ mod tests {
         // call: this is what "not a demo" means for the serving path.
         let cfg = tiny_test_config();
         let decoder = Decoder::new_random_small(cfg, 2, 8);
-        let speculator = PromptLookupSpeculator::new(2, 3);
+        let mut speculator = PromptLookupSpeculator::new(2, 3);
         let prompt = vec![1usize, 2, 3, 4, 1, 2];
 
         let mut one = caches(&decoder);
-        let long = speculative_decode(&decoder, &prompt, 8, &mut one, &speculator);
+        let long = speculative_decode(&decoder, &prompt, 8, &mut one, &mut speculator);
 
         let mut kv = caches(&decoder);
-        let first = speculative_decode(&decoder, &prompt, 4, &mut kv, &speculator);
+        let first = speculative_decode(&decoder, &prompt, 4, &mut kv, &mut speculator);
         // The last generated token's KV is not in the cache yet, so it
         // is the first token of the continuation's "prompt".
         let resume_prompt = vec![*first.generated_tokens.last().unwrap()];
@@ -1213,7 +1223,7 @@ mod tests {
             &decoder,
             &resume_prompt,
             &mut kv,
-            &speculator,
+            &mut speculator,
             &SpeculativeOptions {
                 max_new_tokens: 5,
                 start_pos: start,
@@ -1238,8 +1248,8 @@ mod tests {
         let decoder = Decoder::new_random_small(cfg, 2, 8);
         let mut kv = caches(&decoder);
         decoder.forward_batch(&[1usize, 2, 3], 0, &mut kv);
-        let speculator = PromptLookupSpeculator::new(2, 2);
-        speculative_decode(&decoder, &[4usize, 5], 2, &mut kv, &speculator);
+        let mut speculator = PromptLookupSpeculator::new(2, 2);
+        speculative_decode(&decoder, &[4usize, 5], 2, &mut kv, &mut speculator);
     }
 
     // ---- acceptance metrics ----
@@ -1273,8 +1283,8 @@ mod tests {
         let mut kv = caches(&decoder);
         // Token 7 against a random model: whatever happens, every
         // counted position must have been reachable.
-        let drafter = FixedDrafter::new(DraftBlock::deterministic(vec![7, 7, 7, 7]));
-        let result = speculative_decode(&decoder, &[1usize, 2, 3], 6, &mut kv, &drafter);
+        let mut drafter = FixedDrafter::new(DraftBlock::deterministic(vec![7, 7, 7, 7]));
+        let result = speculative_decode(&decoder, &[1usize, 2, 3], 6, &mut kv, &mut drafter);
 
         let evaluated = &result.evaluated_at_position;
         let accepted = &result.accepted_at_position;
@@ -1321,8 +1331,9 @@ mod tests {
         let cfg = tiny_test_config();
         let decoder = Decoder::new_random_small(cfg, 2, 8);
         let mut kv = caches(&decoder);
-        let speculator = PromptLookupSpeculator::new(2, 3);
-        let result = speculative_decode(&decoder, &[1usize, 2, 3, 1, 2], 6, &mut kv, &speculator);
+        let mut speculator = PromptLookupSpeculator::new(2, 3);
+        let result =
+            speculative_decode(&decoder, &[1usize, 2, 3, 1, 2], 6, &mut kv, &mut speculator);
 
         assert_eq!(result.verification_steps, result.forward_calls - 1);
         let length = result.acceptance_length().unwrap();

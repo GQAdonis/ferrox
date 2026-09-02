@@ -237,8 +237,26 @@ pub fn encode_block_q4_k(block: &[f32; Q4_K_BLOCK_ELEMS], out: &mut Vec<u8>) {
         // `make_qp_quants`, where the bound is not automatic -- but no
         // fixture here can turn its removal red, and saying so is
         // better than implying the golden covers it.
-        let ls = nearest_int(inv_scale * scales[j]).min(63) as u8;
-        let lm = nearest_int(inv_min * mins[j]).min(63) as u8;
+        // The cast comes BEFORE the clamp, because upstream's does:
+        //
+        //     uint8_t ls = nearest_int(inv_scale*scales[j]);
+        //     ls = MIN(63, ls);
+        //
+        // `nearest_int` returns `int`, and storing it in a `uint8_t`
+        // truncates to eight bits FIRST. Clamping to 63 and casting
+        // afterwards is the same for every value in `0..=255` and
+        // different for a negative one: C wraps -1 to 255 and then
+        // clamps to 63, this order clamps -1 to -1 and casts to 255.
+        //
+        // A negative reaches here when a sub-block's least-squares fit
+        // returns a negative scale while some other sub-block's is
+        // positive, so `inv_scale` is positive and the product is not.
+        // Upstream's comment says scales are always positive "as we are
+        // deducting the min", which is the assumption this arithmetic
+        // quietly does not rely on. Rare, and it was 0.55% of the
+        // super-blocks in a real Qwen3-0.6B tensor.
+        let ls = (nearest_int(inv_scale * scales[j]) as u8).min(63);
+        let lm = (nearest_int(inv_min * mins[j]) as u8).min(63);
         if j < 4 {
             packed[j] = ls;
             packed[j + 4] = lm;

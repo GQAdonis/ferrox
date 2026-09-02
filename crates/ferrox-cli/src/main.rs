@@ -15,6 +15,7 @@ mod layer_divergence;
 mod parity;
 mod pull;
 mod quant_sensitivity;
+mod quantize;
 mod run;
 mod serve_bench;
 mod verify;
@@ -92,6 +93,15 @@ enum Commands {
 
     /// Download a GGUF from Hugging Face, same syntax as `hf download`.
     Download(download::DownloadArgs),
+    /// Write a quantized copy of a GGUF.
+    ///
+    /// ferrox READS every quant kind it runs and WRITES Q8_0. Every
+    /// other llama.cpp target -- the K-quants, the IQ tiers, MXFP4 --
+    /// is refused BY NAME: their encoders are an iterative
+    /// per-super-block fit, and an approximation of one produces a file
+    /// that loads and generates measurably worse text. Use
+    /// `llama-quantize` for those; ferrox reads what it writes.
+    Quantize(quantize::QuantizeArgs),
     /// Print GGUF header metadata and tensor list for a model file.
     Inspect { path: String },
     /// Dry-run residency plan for a GGUF checkpoint: what it would
@@ -482,6 +492,7 @@ const SUBCOMMANDS: &[&str] = &[
     "verify",
     "layer-divergence",
     "quant-sensitivity",
+    "quantize",
     "parity",
     "speculative",
     "run-kimi",
@@ -668,6 +679,7 @@ fn main() -> anyhow::Result<()> {
         Commands::Serve { .. } => anyhow::bail!(SERVE_FEATURE_MISSING),
         Commands::Pull(args) => pull::run_pull(args)?,
         Commands::Download(args) => download::run(args)?,
+        Commands::Quantize(args) => quantize::run(args)?,
         Commands::Inspect { path } => {
             let file = ShardedGguf::open(&path)?;
             if file.shard_count() > 1 {

@@ -138,6 +138,32 @@ impl MetalRope {
     }
 }
 
+/// The half of a RoPE call that varies from LAYER to layer: the
+/// frequency base and the per-band divisors. [`MetalRope`] carries the
+/// half that does not (pairing, rotary width, magnitude scale), so a
+/// fused stack takes one `MetalRope` and one of these per layer.
+///
+/// Both halves live in one struct because they vary TOGETHER and
+/// llama.cpp varies them together (`llama-model.cpp:2029-2035`,
+/// mirrored by `ferrox_models::config::ModelConfig::layer_rope`).
+/// Splitting them is what this type exists to prevent: the fused stacks
+/// used to take a per-layer `rope_theta` beside ONE `freq_factors`
+/// slice for the whole run, so a model whose sliding layers scale
+/// differently from its full-attention ones (Gemma-3 4B/12B/27B:
+/// `rope_scaling {linear, factor 8}` on the full layers, unscaled on
+/// the sliding ones) could not ride them at all. Answering the base
+/// question without answering the divisor question no longer compiles.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LayerRope<'a> {
+    /// This layer's RoPE frequency base (`rope_theta`, or
+    /// `rope_theta_swa` on a sliding layer).
+    pub theta: f32,
+    /// This layer's per-band divisors (`rope_freqs.weight`, folded with
+    /// any linear `freq_scale`), `n_rot/2` long. `None` = divide by
+    /// nothing.
+    pub freq_factors: Option<&'a [f32]>,
+}
+
 /// Whether the fused Metal attention block should run (in addition to
 /// dense Metal matvecs). Default off until measured; `1|true|on` enables.
 pub fn metal_attn_enabled() -> bool {
@@ -5726,9 +5752,11 @@ pub struct DenseLayerMetal<'a> {
     pub up: MatvecLaunch<'a>,
     pub down: MatvecLaunch<'a>,
     pub extras: AttnExtras<'a>,
-    /// Per-layer RoPE base override (Gemma-3 SWA layers use
-    /// `rope_theta_swa`); `None` = the stack-wide theta.
-    pub rope_theta: Option<f32>,
+    /// This layer's RoPE base AND divisors. Both halves, always: a
+    /// Gemma-3 SWA layer differs from its full-attention neighbours in
+    /// both (`rope_theta_swa`, and no linear scale folded into the
+    /// divisors). See [`LayerRope`].
+    pub rope: LayerRope<'a>,
     /// Sliding-window size for this layer (`None` = full causal).
     pub window: Option<usize>,
     /// Gemma post-attention / post-FFN sandwich norms, applied to the
@@ -5765,8 +5793,6 @@ pub fn launch_decode_dense_stack(
     kvs: &mut [MetalKvBuffers],
     n_heads: usize,
     rope_layout: MetalRope,
-    rope_theta: f32,
-    freq_factors: Option<&[f32]>,
     pos: usize,
     rms_eps: f32,
     final_norm_w: Option<&[f32]>,
@@ -5792,7 +5818,9 @@ pub fn launch_decode_dense_stack(
             return Err(MetalError::CommandFailed);
         }
     }
-    assert_freq_factors_len(freq_factors, rope_layout, head_dim);
+    for layer in layers.iter() {
+        assert_freq_factors_len(layer.rope.freq_factors, rope_layout, head_dim);
+    }
 
     let max_q = layers.iter().map(|l| l.q.rows).max().unwrap();
     let max_kv = layers.iter().map(|l| l.k.rows).max().unwrap();
@@ -5840,11 +5868,19 @@ pub fn launch_decode_dense_stack(
     let logits_buf = scratch.logits.as_ref();
     let argmax_idx_buf = &scratch.argmax_idx;
 
-    let ff_resident = match freq_factors {
-        Some(ff) => Some(resident_f32_buffer(device, ff)?),
-        None => None,
-    };
-    let ff_buf = ff_resident.as_ref().map(|b| b.buffer.as_ref());
+    // One resident buffer PER LAYER. `resident_f32_buffer` keys its
+    // cache on (pointer, len), so the at-most-two distinct divisor sets
+    // an alternating-SWA model has are uploaded once each and every
+    // layer past the first two is a cache hit -- no per-layer upload,
+    // and no table of "which set does layer i use" for a call site to
+    // get out of step with.
+    let ff_resident = layers
+        .iter()
+        .map(|l| match l.rope.freq_factors {
+            Some(ff) => resident_f32_buffer(device, ff).map(Some),
+            None => Ok(None),
+        })
+        .collect::<Result<Vec<_>, MetalError>>()?;
 
     let cmd_buf = queue.commandBuffer().ok_or(MetalError::CommandFailed)?;
     // Sandwich (Gemma post-norms): use the default serial encoder. Concurrent
@@ -5973,7 +6009,8 @@ pub fn launch_decode_dense_stack(
         )?;
         mrs.end_op(&[q_buf, k_buf, v_buf], &[q_buf, k_buf, v_buf]);
 
-        let layer_theta = layer.rope_theta.unwrap_or(rope_theta);
+        let layer_theta = layer.rope.theta;
+        let ff_buf = ff_resident[layer_idx].as_ref().map(|b| b.buffer.as_ref());
         mrs.begin_op(&encoder, &[q_buf, k_buf], &[q_buf, k_buf]);
         encode_rope(
             &encoder,
@@ -6256,6 +6293,8 @@ pub struct PrefillDenseLayerMetal<'a> {
     /// QKV bias / QK-norm (Qwen2.5, Qwen3, Gemma-3). Applied after GEMM,
     /// before RoPE — same order as the CPU / decode paths.
     pub extras: AttnExtras<'a>,
+    /// This layer's RoPE base AND divisors; see [`LayerRope`].
+    pub rope: LayerRope<'a>,
     /// Layer index for [`PrefillCbCache`] keying only.
     pub layer_idx: u32,
 }
@@ -6728,8 +6767,6 @@ pub fn launch_prefill_dense_stack(
     n_heads: usize,
     batch: usize,
     rope_layout: MetalRope,
-    rope_thetas: &[f32],
-    freq_factors: Option<&[f32]>,
     start_pos: usize,
     rms_eps: f32,
     gelu_ffn: bool,
@@ -6739,7 +6776,6 @@ pub fn launch_prefill_dense_stack(
         return Err(MetalError::CommandFailed);
     }
     assert_eq!(layers.len(), kvs.len());
-    assert_eq!(layers.len(), rope_thetas.len());
     assert!(!layers.is_empty());
 
     let hidden_dim = layers[0].attn_norm_w.len();
@@ -6768,8 +6804,8 @@ pub fn launch_prefill_dense_stack(
         }
         assert_eq!(kv.head_dim, head_dim);
         assert_eq!(kv.n_kv_heads, n_kv_heads);
+        assert_freq_factors_len(layer.rope.freq_factors, rope_layout, head_dim);
     }
-    assert_freq_factors_len(freq_factors, rope_layout, head_dim);
 
     let max_q = layers.iter().map(|l| l.q.rows).max().unwrap();
     let max_kv = layers.iter().map(|l| l.k.rows.max(l.v.rows)).max().unwrap();
@@ -6810,11 +6846,15 @@ pub fn launch_prefill_dense_stack(
         half_act: &scratch.half_act,
     };
 
-    let ff_resident = match freq_factors {
-        Some(ff) => Some(resident_f32_buffer(device, ff)?),
-        None => None,
-    };
-    let ff_buf = ff_resident.as_ref().map(|b| b.buffer.as_ref());
+    // Per layer, cached on (pointer, len) -- see the same comment in
+    // `launch_decode_dense_stack`.
+    let ff_resident = layers
+        .iter()
+        .map(|l| match l.rope.freq_factors {
+            Some(ff) => resident_f32_buffer(device, ff).map(Some),
+            None => Ok(None),
+        })
+        .collect::<Result<Vec<_>, MetalError>>()?;
 
     {
         let mut graph = metal_graph();
@@ -6868,8 +6908,8 @@ pub fn launch_prefill_dense_stack(
             batch,
             hidden_dim,
             rope_layout,
-            rope_thetas[layer_idx],
-            ff_buf,
+            layer.rope.theta,
+            ff_resident[layer_idx].as_ref().map(|b| b.buffer.as_ref()),
             start_pos,
             rms_eps,
             gelu_ffn,
@@ -6920,8 +6960,6 @@ pub fn launch_prefill_dense_layer(
     n_heads: usize,
     batch: usize,
     rope_layout: MetalRope,
-    rope_theta: f32,
-    freq_factors: Option<&[f32]>,
     start_pos: usize,
     rms_eps: f32,
     gelu_ffn: bool,
@@ -6934,8 +6972,6 @@ pub fn launch_prefill_dense_layer(
         n_heads,
         batch,
         rope_layout,
-        std::slice::from_ref(&rope_theta),
-        freq_factors,
         start_pos,
         rms_eps,
         gelu_ffn,
@@ -8856,5 +8892,440 @@ mod tests {
         }
         let (k_dl, _) = kv_q8.tokens_host(0, n_q);
         assert_eq!(k_dl.len(), n_q * n_kv_heads * head_dim);
+    }
+
+    /// Deterministic weights for one dense decode layer, owned so the
+    /// `MatvecLaunch` byte views below can borrow them.
+    struct DenseLayerBytes {
+        attn_norm: Vec<f32>,
+        ffn_norm: Vec<f32>,
+        q: Vec<u8>,
+        k: Vec<u8>,
+        v: Vec<u8>,
+        o: Vec<u8>,
+        gate: Vec<u8>,
+        up: Vec<u8>,
+        down: Vec<u8>,
+    }
+
+    fn f32_weight_bytes(rows: usize, cols: usize, seed: f32) -> Vec<u8> {
+        (0..rows * cols)
+            .flat_map(|i| (((i as f32 + seed) * 0.017).sin() * 0.25).to_le_bytes())
+            .collect()
+    }
+
+    impl DenseLayerBytes {
+        fn new(hidden: usize, n_q: usize, n_kv: usize, ffn: usize, seed: f32) -> Self {
+            Self {
+                attn_norm: (0..hidden)
+                    .map(|i| 1.0 + (i as f32 * 0.01 + seed).sin() * 0.1)
+                    .collect(),
+                ffn_norm: (0..hidden)
+                    .map(|i| 1.0 + (i as f32 * 0.02 + seed).cos() * 0.1)
+                    .collect(),
+                q: f32_weight_bytes(n_q, hidden, seed + 1.0),
+                k: f32_weight_bytes(n_kv, hidden, seed + 2.0),
+                v: f32_weight_bytes(n_kv, hidden, seed + 3.0),
+                o: f32_weight_bytes(hidden, n_q, seed + 4.0),
+                gate: f32_weight_bytes(ffn, hidden, seed + 5.0),
+                up: f32_weight_bytes(ffn, hidden, seed + 6.0),
+                down: f32_weight_bytes(hidden, ffn, seed + 7.0),
+            }
+        }
+    }
+
+    fn f32_matvec(bytes: &[u8], rows: usize, cols: usize) -> MatvecLaunch<'_> {
+        let (kernel_src, fn_name, block_bytes, block_elems, rows_per_tg) =
+            crate::gpu::matvec_launch_meta("F32").expect("F32 matvec kernel");
+        MatvecLaunch {
+            kernel_src,
+            fn_name,
+            block_bytes,
+            block_elems,
+            weights: bytes,
+            rows,
+            row_bytes: cols * 4,
+            rows_per_tg,
+        }
+    }
+
+    fn dense_layer_metal<'a>(
+        w: &'a DenseLayerBytes,
+        rope: LayerRope<'a>,
+        hidden: usize,
+        n_q: usize,
+        n_kv: usize,
+        ffn: usize,
+    ) -> DenseLayerMetal<'a> {
+        DenseLayerMetal {
+            attn_norm_w: &w.attn_norm,
+            ffn_norm_w: &w.ffn_norm,
+            q: f32_matvec(&w.q, n_q, hidden),
+            k: f32_matvec(&w.k, n_kv, hidden),
+            v: f32_matvec(&w.v, n_kv, hidden),
+            o: f32_matvec(&w.o, hidden, n_q),
+            gate: f32_matvec(&w.gate, ffn, hidden),
+            up: f32_matvec(&w.up, ffn, hidden),
+            down: f32_matvec(&w.down, hidden, ffn),
+            extras: AttnExtras::default(),
+            rope,
+            window: None,
+            post_attn_norm: None,
+            post_ffn_norm: None,
+        }
+    }
+
+    /// The fused decode stack must rope EVERY layer with that layer's
+    /// own per-band divisors, not with the first layer's.
+    ///
+    /// Gemma-3 4B/12B/27B are the model that needs this: `rope_scaling
+    /// {linear, factor 8}` folded into the full-attention layers'
+    /// divisors, nothing on the sliding ones (`gemma3.cpp` never assigns
+    /// `rope_freq_scale_train_swa`), five layers in six sliding. The
+    /// stack used to take ONE `freq_factors` slice for a whole run, so
+    /// `Decoder::metal_stack_needs_per_layer_rope_freqs` refused those
+    /// checkpoints off the fused path rather than rotate them wrongly
+    /// (issue #63). This test is what makes deleting that refusal safe.
+    ///
+    /// The oracle is the per-layer launch, which has always taken its
+    /// own `freq_factors` per call. The last assertion is what stops the
+    /// test being vacuous: feed the stack ONE set for both layers --
+    /// exactly the old bug -- and it must answer differently.
+    #[test]
+    #[ignore = "needs a real Metal GPU"]
+    fn a_decode_stack_ropes_each_layer_with_its_own_freq_factors() {
+        let (hidden, n_heads, n_kv_heads, head_dim, ffn) =
+            (32usize, 2usize, 1usize, 16usize, 32usize);
+        let n_q = n_heads * head_dim;
+        let n_kv = n_kv_heads * head_dim;
+        let rope = MetalRope::new(MetalRopeLayout::Norm);
+        let eps = 1e-5f32;
+        // Gemma-3's two sets: the full-attention layers divide every
+        // band by the trained linear factor, the sliding ones do not.
+        let full_ff = vec![8.0f32; head_dim / 2];
+        let swa_ff = vec![1.0f32; head_dim / 2];
+        // ... and its two bases, so the layers differ in BOTH halves of
+        // `LayerRope` at once, as a real checkpoint does.
+        let full_rope = LayerRope {
+            theta: 1_000_000.0,
+            freq_factors: Some(&full_ff),
+        };
+        let swa_rope = LayerRope {
+            theta: 10_000.0,
+            freq_factors: Some(&swa_ff),
+        };
+
+        let w: Vec<DenseLayerBytes> = (0..2)
+            .map(|i| DenseLayerBytes::new(hidden, n_q, n_kv, ffn, i as f32 * 11.0))
+            .collect();
+        // Layer 0 slides, layer 1 attends in full: the alternating
+        // pattern, in the smallest stack that can show it.
+        let ropes = [swa_rope, full_rope];
+
+        let steps = 6usize;
+        let hidden0: Vec<f32> = (0..hidden).map(|i| (i as f32 * 0.13).sin()).collect();
+
+        let mut kv_stack: Vec<MetalKvBuffers> = (0..2)
+            .map(|_| MetalKvBuffers::with_capacity(n_kv_heads, head_dim, 32).expect("kv"))
+            .collect();
+        let mut kv_ref: Vec<MetalKvBuffers> = (0..2)
+            .map(|_| MetalKvBuffers::with_capacity(n_kv_heads, head_dim, 32).expect("kv"))
+            .collect();
+        let mut kv_one: Vec<MetalKvBuffers> = (0..2)
+            .map(|_| MetalKvBuffers::with_capacity(n_kv_heads, head_dim, 32).expect("kv"))
+            .collect();
+
+        let mut h_stack = hidden0.clone();
+        let mut h_ref = hidden0.clone();
+        let mut h_one = hidden0.clone();
+
+        for pos in 0..steps {
+            let layers: Vec<DenseLayerMetal<'_>> = (0..2)
+                .map(|i| dense_layer_metal(&w[i], ropes[i], hidden, n_q, n_kv, ffn))
+                .collect();
+            h_stack = launch_decode_dense_stack(
+                &h_stack,
+                &layers,
+                &mut kv_stack,
+                n_heads,
+                rope,
+                pos,
+                eps,
+                None,
+                None,
+                false,
+                None,
+                false,
+            )
+            .expect("decode stack");
+
+            // Oracle: the same two layers, one command buffer each.
+            for i in 0..2 {
+                h_ref = launch_decode_dense_layer(
+                    &h_ref,
+                    &w[i].attn_norm,
+                    &f32_matvec(&w[i].q, n_q, hidden),
+                    &f32_matvec(&w[i].k, n_kv, hidden),
+                    &f32_matvec(&w[i].v, n_kv, hidden),
+                    &f32_matvec(&w[i].o, hidden, n_q),
+                    &mut kv_ref[i],
+                    &w[i].ffn_norm,
+                    &f32_matvec(&w[i].gate, ffn, hidden),
+                    &f32_matvec(&w[i].up, ffn, hidden),
+                    &f32_matvec(&w[i].down, hidden, ffn),
+                    n_heads,
+                    rope,
+                    ropes[i].theta,
+                    ropes[i].freq_factors,
+                    pos,
+                    eps,
+                    &AttnExtras::default(),
+                )
+                .expect("decode layer");
+            }
+
+            // The bug, run deliberately: layer 0's rope for both layers.
+            let one_set: Vec<DenseLayerMetal<'_>> = (0..2)
+                .map(|i| dense_layer_metal(&w[i], ropes[0], hidden, n_q, n_kv, ffn))
+                .collect();
+            h_one = launch_decode_dense_stack(
+                &h_one,
+                &one_set,
+                &mut kv_one,
+                n_heads,
+                rope,
+                pos,
+                eps,
+                None,
+                None,
+                false,
+                None,
+                false,
+            )
+            .expect("decode stack, one set");
+        }
+
+        assert_eq!(h_stack.len(), h_ref.len());
+        for (i, (a, b)) in h_ref.iter().zip(h_stack.iter()).enumerate() {
+            // Same kernels and the same f16 KV; the stack only
+            // reassociates the residual add into the next layer's norm,
+            // and on this device that is bit-identical. The tolerance is
+            // room for a future reassociation, not for a rope that
+            // rotated at the wrong scale: sharing one set instead of two
+            // moves the answer ~300x further than this (asserted below).
+            let tol = 1e-6 * a.abs().max(1.0);
+            assert!(
+                (a - b).abs() <= tol,
+                "elem {i}: per-layer={a} stack={b} tol={tol}"
+            );
+        }
+        let drift = h_stack
+            .iter()
+            .zip(h_one.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            drift > 1e-3,
+            "one shared rope for both layers answered the same as two: \
+             this test proves nothing (max drift {drift})"
+        );
+    }
+
+    /// Q8_0 weights for one dense PREFILL layer, owned like
+    /// [`DenseLayerBytes`] so the `MulMmSgLaunch` views can borrow them.
+    struct PrefillLayerBytes {
+        attn_norm: Vec<f32>,
+        ffn_norm: Vec<f32>,
+        q: Vec<u8>,
+        k: Vec<u8>,
+        v: Vec<u8>,
+        o: Vec<u8>,
+        gate: Vec<u8>,
+        up: Vec<u8>,
+        down: Vec<u8>,
+    }
+
+    fn q8_0_weight_bytes(rows: usize, cols: usize, seed: f32) -> Vec<u8> {
+        let mut out = Vec::new();
+        for r in 0..rows {
+            let row: Vec<f32> = (0..cols)
+                .map(|c| (((r * cols + c) as f32 + seed) * 0.017).sin() * 0.25)
+                .collect();
+            out.extend(ferrox_quant::quantize_q8_0(&row));
+        }
+        out
+    }
+
+    impl PrefillLayerBytes {
+        fn new(hidden: usize, n_q: usize, n_kv: usize, ffn: usize, seed: f32) -> Self {
+            Self {
+                attn_norm: (0..hidden)
+                    .map(|i| 1.0 + (i as f32 * 0.01 + seed).sin() * 0.1)
+                    .collect(),
+                ffn_norm: (0..hidden)
+                    .map(|i| 1.0 + (i as f32 * 0.02 + seed).cos() * 0.1)
+                    .collect(),
+                q: q8_0_weight_bytes(n_q, hidden, seed + 1.0),
+                k: q8_0_weight_bytes(n_kv, hidden, seed + 2.0),
+                v: q8_0_weight_bytes(n_kv, hidden, seed + 3.0),
+                o: q8_0_weight_bytes(hidden, n_q, seed + 4.0),
+                gate: q8_0_weight_bytes(ffn, hidden, seed + 5.0),
+                up: q8_0_weight_bytes(ffn, hidden, seed + 6.0),
+                down: q8_0_weight_bytes(hidden, ffn, seed + 7.0),
+            }
+        }
+    }
+
+    fn q8_0_mul_mm_sg(bytes: &[u8], rows: usize, cols: usize) -> MulMmSgLaunch<'_> {
+        let (fn_name, block_bytes, block_elems) =
+            crate::gpu::mul_mm_sg_meta("Q8_0").expect("Q8_0 mul_mm_sg kernel");
+        assert!(cols.is_multiple_of(block_elems));
+        MulMmSgLaunch {
+            weights: bytes,
+            rows,
+            row_bytes: (cols / block_elems) * block_bytes,
+            fn_name,
+            block_bytes,
+            block_elems,
+        }
+    }
+
+    fn prefill_layer_metal<'a>(
+        w: &'a PrefillLayerBytes,
+        rope: LayerRope<'a>,
+        layer_idx: u32,
+        hidden: usize,
+        n_q: usize,
+        n_kv: usize,
+        ffn: usize,
+    ) -> PrefillDenseLayerMetal<'a> {
+        PrefillDenseLayerMetal {
+            attn_norm_w: &w.attn_norm,
+            ffn_norm_w: &w.ffn_norm,
+            q: q8_0_mul_mm_sg(&w.q, n_q, hidden),
+            k: q8_0_mul_mm_sg(&w.k, n_kv, hidden),
+            v: q8_0_mul_mm_sg(&w.v, n_kv, hidden),
+            o: q8_0_mul_mm_sg(&w.o, hidden, n_q),
+            ffn: PrefillFfnMetal::Dense {
+                gate: q8_0_mul_mm_sg(&w.gate, ffn, hidden),
+                up: q8_0_mul_mm_sg(&w.up, ffn, hidden),
+                down: q8_0_mul_mm_sg(&w.down, hidden, ffn),
+            },
+            post_attn_norm: None,
+            post_ffn_norm: None,
+            extras: AttnExtras::default(),
+            rope,
+            layer_idx,
+        }
+    }
+
+    /// The prefill twin of
+    /// `a_decode_stack_ropes_each_layer_with_its_own_freq_factors`, and
+    /// it matters as much: prefill is where a long Gemma-3 prompt spends
+    /// its time, and the wrong divisors get worse the longer the prompt.
+    ///
+    /// Oracle and non-vacuity check are the same shape as the decode
+    /// test. The one-layer launch is the oracle because a run of one
+    /// cannot index the wrong layer's divisors.
+    #[test]
+    #[ignore = "needs a real Metal GPU"]
+    fn a_prefill_stack_ropes_each_layer_with_its_own_freq_factors() {
+        let (hidden, n_heads, n_kv_heads, head_dim, ffn) =
+            (32usize, 2usize, 2usize, 16usize, 64usize);
+        let n_q = n_heads * head_dim;
+        let n_kv = n_kv_heads * head_dim;
+        let batch = 8usize;
+        let rope = MetalRope::new(MetalRopeLayout::Norm);
+        let eps = 1e-5f32;
+        let full_ff = vec![8.0f32; head_dim / 2];
+        let swa_ff = vec![1.0f32; head_dim / 2];
+        let ropes = [
+            LayerRope {
+                theta: 10_000.0,
+                freq_factors: Some(&swa_ff),
+            },
+            LayerRope {
+                theta: 1_000_000.0,
+                freq_factors: Some(&full_ff),
+            },
+        ];
+
+        let w: Vec<PrefillLayerBytes> = (0..2)
+            .map(|i| PrefillLayerBytes::new(hidden, n_q, n_kv, ffn, i as f32 * 11.0))
+            .collect();
+        let hidden0: Vec<f32> = (0..batch * hidden)
+            .map(|i| (i as f32 * 0.031).sin())
+            .collect();
+
+        let mut kv_stack: Vec<MetalKvBuffers> = (0..2)
+            .map(|_| MetalKvBuffers::with_capacity(n_kv_heads, head_dim, 32).expect("kv"))
+            .collect();
+        let layers: Vec<PrefillDenseLayerMetal<'_>> = (0..2)
+            .map(|i| prefill_layer_metal(&w[i], ropes[i], i as u32, hidden, n_q, n_kv, ffn))
+            .collect();
+        let h_stack = launch_prefill_dense_stack(
+            &hidden0,
+            &layers,
+            &mut kv_stack,
+            n_heads,
+            batch,
+            rope,
+            0,
+            eps,
+            false,
+            None,
+        )
+        .expect("prefill stack");
+
+        let mut h_ref = hidden0.clone();
+        for i in 0..2 {
+            let mut kv = MetalKvBuffers::with_capacity(n_kv_heads, head_dim, 32).expect("kv");
+            let layer = prefill_layer_metal(&w[i], ropes[i], i as u32, hidden, n_q, n_kv, ffn);
+            let input = std::mem::take(&mut h_ref);
+            h_ref = launch_prefill_dense_layer(
+                &input, &layer, &mut kv, n_heads, batch, rope, 0, eps, false, None,
+            )
+            .expect("prefill layer");
+        }
+
+        // The bug: layer 0's rope for the whole run.
+        let mut kv_one: Vec<MetalKvBuffers> = (0..2)
+            .map(|_| MetalKvBuffers::with_capacity(n_kv_heads, head_dim, 32).expect("kv"))
+            .collect();
+        let one_set: Vec<PrefillDenseLayerMetal<'_>> = (0..2)
+            .map(|i| prefill_layer_metal(&w[i], ropes[0], i as u32, hidden, n_q, n_kv, ffn))
+            .collect();
+        let h_one = launch_prefill_dense_stack(
+            &hidden0,
+            &one_set,
+            &mut kv_one,
+            n_heads,
+            batch,
+            rope,
+            0,
+            eps,
+            false,
+            None,
+        )
+        .expect("prefill stack, one set");
+
+        assert_eq!(h_stack.len(), h_ref.len());
+        for (i, (a, b)) in h_ref.iter().zip(h_stack.iter()).enumerate() {
+            let tol = 1e-6 * a.abs().max(1.0);
+            assert!(
+                (a - b).abs() <= tol,
+                "elem {i}: per-layer={a} stack={b} tol={tol}"
+            );
+        }
+        let drift = h_stack
+            .iter()
+            .zip(h_one.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            drift > 1e-3,
+            "one shared rope for both layers answered the same as two: \
+             this test proves nothing (max drift {drift})"
+        );
     }
 }

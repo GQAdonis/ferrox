@@ -13,6 +13,7 @@
 //! GGUF-roundtrip tests.
 
 pub mod encode;
+pub use encode::q4_k::{encode_block_q4_k, encode_row_q4_k};
 pub use encode::{encode_block_q8_0, encode_row_q8_0};
 
 pub mod iq_tables;

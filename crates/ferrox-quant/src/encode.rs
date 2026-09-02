@@ -1,13 +1,18 @@
 //! Weight *encoders*: f32 in, GGUF block bytes out.
 //!
 //! The rest of this crate reads quantized blocks. This module is the
-//! only place that writes them, and today it writes exactly one format.
-//! That is not an oversight, it is the scope: llama.cpp's K-quant and
-//! IQ encoders do an iterative scale/min fit (and, for the IQ tiers, a
-//! lattice search), and a naive min/max encoder wearing a K-quant's
-//! name produces a file that loads and generates measurably worse text.
+//! only place that writes them, and today it writes two formats: Q8_0
+//! here, and Q4_K in [`q4_k`]. The rest is not an oversight, it is the
+//! scope: llama.cpp's remaining K-quant and IQ encoders each need their
+//! own transcription (and, for the IQ tiers, a lattice search over a
+//! codebook), and a naive min/max encoder wearing a K-quant's name
+//! produces a file that loads and generates measurably worse text.
 //! `ferrox quantize` refuses every target this module cannot encode, by
 //! name.
+//!
+//! Each format lands with a **byte-identical** golden against
+//! llama.cpp's own encoder, never a tolerance: two encoders can agree
+//! on dequantized values and still write different files.
 //!
 //! **Q8_0 here is byte-for-byte llama.cpp's `quantize_row_q8_0_ref`**,
 //! not merely "close enough". The arithmetic below is deliberately the
@@ -15,6 +20,8 @@
 //! `a > b ? a : b` maximum, because the file this writes is meant to be
 //! indistinguishable from `llama-quantize --type Q8_0`'s. See
 //! `q8_0_matches_llama_cpp_quantize_row_q8_0_ref` for the golden.
+
+pub mod q4_k;
 
 use half::f16;
 

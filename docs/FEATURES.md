@@ -123,6 +123,14 @@ the same stack machine the HTTP `grammar` field does. `--ctk` selects a
 KV dtype on Metal only; the CPU and CUDA KV cache is the host `Vec<f32>`
 and the startup banner says so when the flag is being ignored.
 
+`ferrox perplexity` is the quality axis: corpus evaluation using
+llama.cpp's method, agreeing with `llama-perplexity` to within a fifth
+of one standard error on five checkpoints. Where the two differ, the gap
+is monotone in the quant and has the sign the documented `vec_dot_type`
+difference predicts. `ferrox quantize` writes `Q8_0` byte-identically to
+`llama_model_quantize()` and refuses every other target by name. See
+[`CLI.md`](CLI.md).
+
 The sampler flags carry llama.cpp's own defaults on `--temp` (0.8),
 `--top-k` (40), `--top-p` (0.95), `--min-p` (0.05) and `--repeat-last-n`
 (64). **One default still differs on purpose**: `--repeat-penalty` is

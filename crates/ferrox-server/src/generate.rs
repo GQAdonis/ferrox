@@ -1285,8 +1285,16 @@ pub fn generate(
             if let Some(err) = ceiling.prompt_refusal(prompt_tokens) {
                 return Err(err);
             }
+            // Checked BEFORE the clamp below, because the clamp's own
+            // comparison used to be the thing that wrapped: a
+            // `max_tokens` near `usize::MAX` summed to less than the
+            // limit and walked straight past the guard that existed to
+            // stop it. See `ContextCeiling::positions_refusal`.
+            if let Some(err) = ceiling.overflow_refusal(prompt_tokens, params.max_tokens) {
+                return Err(err);
+            }
             match ceiling.limit() {
-                Some(limit) if prompt_tokens + params.max_tokens > limit => {
+                Some(limit) if prompt_tokens.saturating_add(params.max_tokens) > limit => {
                     let mut p = params.clone();
                     p.max_tokens = limit - prompt_tokens;
                     tracing::debug!(
@@ -1302,7 +1310,24 @@ pub fn generate(
         }
         None => params,
     };
-    let max_seq_len = prompt_tokens + params.max_tokens;
+    // `params` is the clamped copy by now, so this cannot exceed the
+    // ceiling when one exists. `checked_add` covers the case where none
+    // does: an unbounded deployment must still not wrap into a small
+    // number and pass every check below it.
+    let Some(max_seq_len) = prompt_tokens.checked_add(params.max_tokens) else {
+        return Err(DecodeError::KvBudgetExceeded {
+            binding: ferrox_models::Ceiling::ContextLength.code(),
+            estimated_bytes: 0,
+            limit_bytes: 0,
+            positions: usize::MAX,
+            positions_limit: usize::MAX,
+            detail: format!(
+                "prompt of {prompt_tokens} tokens plus max_tokens of {} overflows the position \
+                 counter, so this request cannot be served by any deployment",
+                params.max_tokens
+            ),
+        });
+    };
 
     // A request whose worst case exceeds the *whole* pool is not a
     // request to retry: no amount of waiting frees blocks that do not
@@ -1591,7 +1616,15 @@ fn sample_until_stop(
 ) -> Result<(FinishReason, Vec<usize>, Vec<f32>), DecodeError> {
     let mut matcher = crate::stop::StopMatcher::new(&params.stop, &params.stop_token_ids);
     let mut state = crate::sample_step::SampleState::new(params.seed);
-    let mut generated_ids: Vec<usize> = Vec::with_capacity(params.max_tokens);
+    // NOT `with_capacity(params.max_tokens)`. That is a caller-supplied
+    // number sizing an allocation, and it reached
+    // `Vec::with_capacity(usize::MAX)` from one unauthenticated POST.
+    // The vector grows as tokens are produced, so the reservation only
+    // ever saved reallocations on a path that performs a full model
+    // forward pass per element. A cap keeps that saving for the sizes
+    // it was worth having for, and refuses to pre-size beyond them.
+    const PREALLOC_CAP: usize = 4096;
+    let mut generated_ids: Vec<usize> = Vec::with_capacity(params.max_tokens.min(PREALLOC_CAP));
     let mut finish = FinishReason::Length;
 
     for _ in 0..params.max_tokens {

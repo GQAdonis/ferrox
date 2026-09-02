@@ -61,17 +61,31 @@ impl KvElem {
     /// Bytes needed to store `elems` cached scalars, rounding up to a
     /// whole block for the block-quantized wires (a partial block still
     /// costs a full one).
+    ///
+    /// Saturating rather than wrapping or panicking. This is a
+    /// REPORTING number: it exists to put bytes in a refusal message,
+    /// and it is reached with position counts that came off an HTTP
+    /// body. `max_tokens: u64::MAX / 64` does not overflow the position
+    /// sum, so it reaches here and multiplied past `u64::MAX`, panicking
+    /// the request thread while computing the text of the very refusal
+    /// that was about to reject it (#36).
+    ///
+    /// Saturating is right HERE and wrong for a bound. A saturated byte
+    /// count still reports "astronomically large", which is the only
+    /// thing the message needs to convey. A saturated position bound
+    /// would silently turn a nonsense request into a plausible one and
+    /// serve it.
     pub fn bytes_for(self, elems: u64) -> u64 {
         match self {
-            KvElem::F32 => elems * 4,
-            KvElem::F16 => elems * 2,
+            KvElem::F32 => elems.saturating_mul(4),
+            KvElem::F16 => elems.saturating_mul(2),
             KvElem::Q8_0 => {
                 let blocks = elems.div_ceil(ferrox_quant::Q8_0_BLOCK_ELEMS as u64);
-                blocks * ferrox_quant::Q8_0_BLOCK_BYTES as u64
+                blocks.saturating_mul(ferrox_quant::Q8_0_BLOCK_BYTES as u64)
             }
             KvElem::Turbo4 => {
                 let blocks = elems.div_ceil(ferrox_quant::TURBO4_KV_GROUP as u64);
-                blocks * ferrox_quant::TURBO4_KV_BLOCK_BYTES as u64
+                blocks.saturating_mul(ferrox_quant::TURBO4_KV_BLOCK_BYTES as u64)
             }
         }
     }
@@ -327,19 +341,19 @@ impl KvShape {
     /// Bytes one request's KV costs at `tokens` of context, applying
     /// the sliding-window cap per layer class.
     pub fn kv_bytes_for_tokens(&self, tokens: usize) -> u64 {
+        // Every multiplication here saturates, for the reason on
+        // `KvElem::bytes_for`: `tokens` can arrive from an HTTP body.
         let per_layer = self.layout.elems_per_token_per_layer();
-        let full =
-            self.full_attention_layers() as u64 * self.elem.bytes_for(per_layer * tokens as u64);
+        let full = (self.full_attention_layers() as u64)
+            .saturating_mul(self.elem.bytes_for(per_layer.saturating_mul(tokens as u64)));
         let sliding = match self.sliding {
             None => 0,
-            Some(w) => {
-                self.sliding_layers() as u64
-                    * self
-                        .elem
-                        .bytes_for(per_layer * w.resident_positions(tokens) as u64)
-            }
+            Some(w) => (self.sliding_layers() as u64).saturating_mul(
+                self.elem
+                    .bytes_for(per_layer.saturating_mul(w.resident_positions(tokens) as u64)),
+            ),
         };
-        full + sliding
+        full.saturating_add(sliding)
     }
 
     /// The sentence a user should be able to read and reproduce with a

@@ -519,6 +519,47 @@ norm, its own graph). `ferrox_models::embedding_model::NOT_YET` is that
 list, and a test pins it against the capability registry so a new row
 cannot fall through to a generic refusal.
 
+## Reranking
+
+`POST /v1/rerank`, and llama.cpp's `/rerank` on the same handler.
+
+Cross-encoder reranking against the loaded checkpoint's own
+classification head (`cls` / `cls.output`), NOT the cosine of two
+embeddings. The cheap version, embed the query and each document and
+sort by similarity, is a different model answering a different question,
+and it would be served with a 200 and read as a ranking.
+
+Request `{"model"?, "query", "documents": [...], "top_n"?,
+"return_documents"?}`. Response `{"object": "list", "model", "results":
+[{"index", "relevance_score", "document"?}], "usage"}`, best first.
+
+- `index` is the position in the request's own `documents` array, not
+  the position in the sorted result.
+- Ties keep request order; the sort is stable.
+- `top_n` clamps to `documents.len()`, and `top_n: 0` returns no
+  results. An empty `documents` array is a 400.
+- Needs a `bert` GGUF carrying a rank head, through `FERROX_MODEL_PATH`
+  or `FERROX_EMBEDDING_MODEL_PATH`. Anything else answers **501 naming
+  the model** rather than substituting a similarity.
+
+`/v1/embeddings` against a rank-head checkpoint still refuses: its
+`pooling_type` is RANK, which is a classification head and not a pooling
+rule, and that refusal is what sends a caller here.
+
+The pair is encoded as `[CLS] query [SEP] document [SEP]`. Both halves
+carry segment id 0, because llama.cpp hardcodes token types to zero;
+HuggingFace gives the second half segment 1, so a ferrox score can
+differ from a `transformers` reference by the second segment's type
+embedding. Tracked as
+[#44](https://github.com/antonellof/ferrox/issues/44).
+
+**End-to-end ordering is unverified.** The route has never run against a
+real reranker checkpoint, because there is none on the development host.
+Its parts are tested and CI is green; neither is evidence that it ranks
+correctly.
+[#43](https://github.com/antonellof/ferrox/issues/43) names the
+checkpoint that would settle it.
+
 ## Errors that retrying will not fix
 
 Two ceilings do not move with load. A request that hits one gets a `400`
@@ -1145,7 +1186,7 @@ argument deltas for the JSON-payload tool formats (they arrive whole) ·
 streamed tool calls on the continuous-batching path · a speculative
 decode path in the server, so every speculation field in `usage` is
 absent today · llama.cpp's `/infill`, `/props`, `/slots`,
-`/apply-template`, `/rerank` and `/lora-adapters`, none of which have a
+`/apply-template` and `/lora-adapters`, none of which have a
 ferrox counterpart.
 
 A few request fields deserialize and then go nowhere, accepted so a

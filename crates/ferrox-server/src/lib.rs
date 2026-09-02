@@ -3591,7 +3591,7 @@ fn price_batcher_config(path: Option<&str>) -> serving::batch::BatcherConfig {
     // the *device* also holds an f16 copy. Budgeting the host store is
     // the conservative reading: it over-charges KV and therefore
     // under-states the context that fits.
-    let priced = budget::price_gguf(path, ferrox_models::KvElem::F32, 1, 1);
+    let priced = budget::price_gguf(path, ferrox_models::KvElem::F32, 1);
     let Some((priced, gguf_ctx, source)) = priced else {
         return batcher;
     };
@@ -3654,7 +3654,7 @@ pub(crate) fn activate_loaded_model(
             // layer really does need only `window + 1 - 1` positions
             // live. `chunk = 1` here is the truth, not a simplification.
             let shape =
-                ferrox_models::KvShape::from_config(&decoder.config, ferrox_models::KvElem::F32, 1);
+                ferrox_models::KvShape::from_config(&decoder.config, ferrox_models::KvElem::F32);
             let ceiling = Arc::new(budget::ContextCeiling::new(config.max_context, shape));
             let batcher = if enable_continuous_batching {
                 tracing::info!(

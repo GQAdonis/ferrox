@@ -54,6 +54,20 @@ fixture-away / one-match-arm / new-code / unknown.
 Landed but not reachable yet: the reranker classification head
 (`ferrox_models::rank_head`) has no `/v1/rerank` route.
 
+## Tracked as issues
+
+Open work now has a GitHub issue each, so nothing depends on a person
+remembering it. How work lands is written down in
+[`plans/contribution-workflow.md`](plans/contribution-workflow.md): a
+completed feature is a branch and a pull request, a defect is an issue,
+and the two are never the same artifact.
+
+| # | What |
+|---|---|
+| [#27](https://github.com/antonellof/ferrox/issues/27) | CPU decode is scheduling-bound. rayon fork-join per operation where llama.cpp parks a persistent pool on a spin barrier: ~75% of decode time at 135M, ~9% at 8B |
+| [#28](https://github.com/antonellof/ferrox/issues/28) | No `/tokenize` or `/detokenize`, so an encoder model's embedding cannot be debugged without a second tool |
+| [#29](https://github.com/antonellof/ferrox/issues/29) | A forced `tool_choice` works on 3 of the 11 wire formats ferrox already parses; the other 8 answer 501 |
+
 ## Speed gaps against llama.cpp
 
 Closed since the last pass over this list: bench last-token `lm_head`

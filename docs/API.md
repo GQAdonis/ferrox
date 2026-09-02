@@ -68,7 +68,7 @@ conversation or a large `/v1/embeddings` batch past that comes back
 | `logprobs` / `top_logprobs` / `n` (>1) | **Reject** |
 | `response_format: json_object` | Supported (best-effort character mask + validate) |
 | `grammar` | Supported. llama.cpp's own field: a GBNF string, enforced per token by a real parser |
-| `response_format: json_schema` | **501**, naming the missing schema-to-grammar step |
+| `response_format: json_schema` | Supported. The `json_schema.schema` is compiled to GBNF and enforced per token. `strict: false` and any unknown member of the `json_schema` object are refused **by name**; a schema the converter cannot compile is a 400 naming the keyword |
 | Other `response_format` types | **Reject** |
 | `session_id` | Ferrox extension (server-side history) |
 | `chat_template_kwargs` | Supported (see [Chat templates](#chat-templates)) |
@@ -978,9 +978,14 @@ rather than shifting context, so there is nothing to protect) ·
 · `sse_ping_interval` (the keepalive is fixed at 15s).
 
 Also refused: `logit_bias` (through the same rule both OpenAI routes
-use), `json_schema` (through the same site that refuses
-`response_format: json_schema`), token-id prompts, multiple prompts in
-one request, and `prompt.multimodal_data`.
+use), token-id prompts, multiple prompts in one request, and
+`prompt.multimodal_data`.
+
+`json_schema` is llama.cpp's bare-schema field and is **supported**,
+compiled through the same site as `response_format: json_schema`. A
+`grammar` and a `json_schema` in one request are refused (400) rather
+than ranked; upstream prefers `grammar` and drops the schema, which is
+a 200 whose answer need not match the schema the caller sent.
 
 Options that only *parameterise* a switched-off sampler (
 `mirostat_tau`, `mirostat_eta`, `dry_base`, `dry_allowed_length`,
@@ -1069,11 +1074,37 @@ while still unsatisfied is an error, and it is a 400 with
 is scoped to the row that hit it; other requests in the batch keep
 running.
 
-`response_format: {"type": "json_schema"}` returns **501** naming the
-schema-to-grammar conversion as the missing piece, rather than an
-unexplained 400, and it refuses even when a `grammar` is supplied
-alongside, rather than quietly honouring a different constraint than the
-one asked for.
+`response_format: {"type": "json_schema", "json_schema": {"name": ...,
+"schema": {...}, "strict": true}}` is compiled to GBNF by the same
+converter `tool_choice` uses and enforced by the same stack machine, so
+a `required` property cannot be omitted and an `enum` cannot be
+invented. `name` and `description` are labels and constrain nothing.
+
+Everything inside `json_schema` that this server does not act on is
+refused **by name** rather than dropped: an unknown member is a 400
+naming it, and `strict: false` is a 400 too. OpenAI's `strict: false`
+asks for best-effort guidance and permits schemas that strict mode
+rejects. ferrox has one behaviour for a schema, which is to enforce it
+token by token, so serving that under `strict: false` would report a
+guarantee the caller declined. An **omitted** `strict` is enforced.
+
+A schema the converter will not compile is a 400 naming the keyword and
+the subschema it sits in, never a 500 and never a grammar that is only
+nearly the caller's schema. The converter is stricter than llama.cpp's
+on purpose: upstream discards a keyword no branch tested, so
+`{"type": "string", "pattern": "^[a-z]+$"}` compiles upstream to a
+grammar for *any* string.
+
+A `grammar` and a `json_schema` in one request are two different
+constraints on one generation and are refused (400), rather than one of
+them being quietly honoured. A forced `tool_choice` beside either is
+refused the same way.
+
+One observable difference from llama.cpp: `required` members are
+enforced in lexicographic order rather than the schema's declaration
+order, because the request body reaches the converter as a parsed value
+and this workspace builds `serde_json` without `preserve_order`. Both
+are valid grammars for the schema.
 
 `tool_choice: "required"` and a named `tool_choice` are supported, by a
 lazy grammar built from the request's own `tools`. Each tool's
@@ -1105,9 +1136,7 @@ cannot read back.
 
 ## Not yet
 
-Image and audio input · `response_format: json_schema` (GBNF grammars
-themselves *are* supported, see above, and `tool_choice` uses the
-schema converter, only this wire spelling is unwired) · MCP tool
+Image and audio input · MCP tool
 invocation
 (the config is read, nothing is called) · embedding architectures other
 than `bert` (they refuse by name, see above) ·

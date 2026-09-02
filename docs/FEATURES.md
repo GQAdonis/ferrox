@@ -182,11 +182,14 @@ OpenAI-compatible HTTP API:
   truncation filters, as llama.cpp orders it, and the repetition penalty
   is applied once per candidate rather than once per occurrence. Both
   routes read the same knobs through one `SamplingKnobs::resolve`
-- Grammar-constrained decoding: llama.cpp's own `grammar` field, a GBNF
-  string enforced on every token by a stack machine, on chat and
-  completions and on all three decode paths. `response_format:
-  json_object` is still the best-effort character mask, and the two
-  compose
+- Grammar-constrained decoding, in every spelling: llama.cpp's own
+  `grammar` field, OpenAI's `response_format: json_schema`, llama.cpp's
+  bare `json_schema` field on `/completion`, and a forced `tool_choice`.
+  A schema is compiled to GBNF first, so all of them end at one stack
+  machine that masks every token which cannot continue a valid string,
+  on chat and completions and all three decode paths. Two constraints in
+  one request are refused rather than ranked. `response_format:
+  json_object` is still the best-effort character mask, and composes
 - Continuous batching and chunked prefill
 - Paged KV: shared page storage many requests read through a block
   table, with a radix tree over reference-counted page groups so

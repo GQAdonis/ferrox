@@ -245,9 +245,9 @@ fn validate(query: &str, documents: &[String]) -> Result<(), ApiError> {
 /// is the caller's 400, named with the document it came from.
 fn embed_error(index: usize, e: EmbedError) -> ApiError {
     match e {
-        EmbedError::NoRankHead { .. } | EmbedError::NoPairInput { .. } => {
-            unsupported_feature(&e.to_string())
-        }
+        EmbedError::NoRankHead { .. }
+        | EmbedError::NoPairInput { .. }
+        | EmbedError::NoSegmentB { .. } => unsupported_feature(&e.to_string()),
         other => bad_request(format!("document {index}: {other}")),
     }
 }
@@ -266,11 +266,11 @@ async fn score_documents(
         let mut scores = Vec::with_capacity(documents.len());
         let mut prompt_tokens = 0usize;
         for (i, doc) in documents.iter().enumerate() {
-            let ids = encoder
-                .rerank_token_ids(&query, doc)
+            let pair = encoder
+                .rerank_input(&query, doc)
                 .map_err(|e| embed_error(i, e))?;
-            prompt_tokens += ids.len();
-            let score = encoder.rerank_score(&ids).map_err(|e| embed_error(i, e))?;
+            prompt_tokens += pair.tokens.len();
+            let score = encoder.rerank_score(&pair).map_err(|e| embed_error(i, e))?;
             scores.push(finite_score(score, i)?);
         }
         Ok::<_, ApiError>((scores, prompt_tokens))
@@ -529,5 +529,171 @@ mod tests {
 
         let bare = results_json(&order, &scores, &docs(3), false);
         assert!(bare[0].get("document").is_none());
+    }
+
+    // ---------------------------------------------------------------
+    // The composition, on a real cross-encoder.
+    //
+    // Everything above this line is the route's arithmetic with
+    // hand-written scores, which is what shipped in PR #42 and is
+    // exactly the coverage issue #43 said was not enough: a wrong
+    // ordering does not come from `ranking`, it comes from what
+    // `score_documents` puts into it. These run the encoder.
+    //
+    //     ferrox download sinjab/ms-marco-MiniLM-L6-v2-Q8_0-GGUF \
+    //         --local-dir models
+    //     cargo test -p ferrox-server rerank -- --ignored --nocapture
+    //
+    // The model half's own evidence -- the ordering against a NumPy
+    // transcription of HuggingFace `BertForSequenceClassification` --
+    // is `ferrox-models/tests/rerank_cross_encoder_ordering.rs`. What
+    // is added here is the part that lives in this file: that the
+    // route's `index` addresses the CALLER's array when the scores are
+    // real and the input is not already sorted.
+    // ---------------------------------------------------------------
+
+    /// Fails rather than skips when the checkpoint is absent -- see the
+    /// same rule in `rerank_cross_encoder_ordering.rs`. A `--ignored`
+    /// run that passes in 0.00s is how this route shipped unverified.
+    fn reranker() -> Arc<EmbeddingModel> {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../models/ms-marco-MiniLM-L6-v2-Q8_0.gguf");
+        assert!(
+            path.exists(),
+            "{} is missing; these tests are #[ignore]d so that running them means you want \
+             them to run.\n    ferrox download sinjab/ms-marco-MiniLM-L6-v2-Q8_0-GGUF \
+             --local-dir models",
+            path.display()
+        );
+        Arc::new(EmbeddingModel::from_gguf_path(&path).expect("load the reranker"))
+    }
+
+    const QUERY: &str = "How many people live in Berlin?";
+
+    /// Deliberately NOT in score order, and the answer is not first,
+    /// not last, and not at any index a fencepost error would land on.
+    fn berlin_documents() -> Vec<String> {
+        [
+            "Berlin is well known for its museums.",
+            "The capital of France is Paris.",
+            "Berlin had a population of 3,520,031 registered inhabitants in an area of \
+             891.82 square kilometers.",
+            "Elephants are the largest land animals.",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
+    }
+
+    /// **The whole route, on a real checkpoint.** The document that
+    /// answers the query is at index 2 of what the caller sent, so the
+    /// first result row must carry `index: 2` — the position in the
+    /// REQUEST. Reporting the position in the sorted output would give
+    /// `index: 0` here and would have been indistinguishable from
+    /// correct in every test that existed before this one, because
+    /// those supplied their own scores.
+    #[tokio::test]
+    #[ignore = "needs models/ms-marco-MiniLM-L6-v2-Q8_0.gguf"]
+    async fn the_relevant_document_wins_and_its_index_is_the_one_the_caller_sent() {
+        let documents = Arc::new(berlin_documents());
+        let (scores, prompt_tokens) =
+            score_documents(reranker(), QUERY.to_string(), Arc::clone(&documents))
+                .await
+                .expect("scoring");
+        assert_eq!(scores.len(), 4);
+
+        let order = ranking(&scores, None);
+        assert_eq!(order[0], 2, "ranked {order:?} from {scores:?}");
+        let rows = results_json(&order, &scores, &documents, true);
+        assert_eq!(rows[0]["index"], 2);
+        assert!(rows[0]["document"]["text"]
+            .as_str()
+            .unwrap()
+            .contains("3,520,031"));
+        // The score travelled with its document, not with its rank.
+        assert_eq!(rows[0]["relevance_score"], scores[2]);
+        // Every caller index appears exactly once.
+        let mut seen: Vec<u64> = rows.iter().map(|r| r["index"].as_u64().unwrap()).collect();
+        seen.sort_unstable();
+        assert_eq!(seen, vec![0, 1, 2, 3]);
+        // `usage.prompt_tokens` counts the pair sequences the encoder
+        // actually saw, specials included -- four pairs of a nine-token
+        // query plus a document, so comfortably over four.
+        assert!(prompt_tokens > 4 * 9, "{prompt_tokens}");
+    }
+
+    /// `top_n` truncates the ANSWER, and the indices in what survives
+    /// are still the caller's. Also the three boundaries, against real
+    /// scores rather than a fixture: 0, past the end, and absent.
+    #[tokio::test]
+    #[ignore = "needs models/ms-marco-MiniLM-L6-v2-Q8_0.gguf"]
+    async fn top_n_truncates_the_answer_without_renumbering_it() {
+        let documents = Arc::new(berlin_documents());
+        let (scores, _) = score_documents(reranker(), QUERY.to_string(), Arc::clone(&documents))
+            .await
+            .expect("scoring");
+
+        let top1 = ranking(&scores, Some(1));
+        assert_eq!(top1, vec![2]);
+        assert_eq!(
+            results_json(&top1, &scores, &documents, false)[0]["index"],
+            2
+        );
+
+        assert!(ranking(&scores, Some(0)).is_empty());
+        assert_eq!(ranking(&scores, Some(99)), ranking(&scores, None));
+        assert_eq!(ranking(&scores, Some(4)), ranking(&scores, None));
+    }
+
+    /// Duplicate documents are a real tie, not a contrived one: the
+    /// encoder is deterministic, so the same text against the same
+    /// query is the same float. The tie must keep the caller's order,
+    /// which is what makes the same request answer the same way twice.
+    #[tokio::test]
+    #[ignore = "needs models/ms-marco-MiniLM-L6-v2-Q8_0.gguf"]
+    async fn identical_documents_tie_exactly_and_keep_the_caller_s_order() {
+        let relevant = "Berlin had a population of 3,520,031 registered inhabitants.";
+        let documents = Arc::new(vec![
+            "The capital of France is Paris.".to_string(),
+            relevant.to_string(),
+            "Elephants are the largest land animals.".to_string(),
+            relevant.to_string(),
+        ]);
+        let (scores, _) = score_documents(reranker(), QUERY.to_string(), Arc::clone(&documents))
+            .await
+            .expect("scoring");
+        assert_eq!(scores[1], scores[3], "the encoder is not deterministic");
+        assert_eq!(scores[0], scores[0]);
+
+        let order = ranking(&scores, None);
+        assert_eq!(
+            order[0], 1,
+            "the earlier of the two tied winners must come first: {order:?}"
+        );
+        assert_eq!(order[1], 3);
+    }
+
+    /// The refusals in front of the encoder, with a real one loaded:
+    /// `require_reranker` accepts it (so the 501 path cannot be masking
+    /// a checkpoint that would have worked), and `validate` still turns
+    /// the two empty inputs away before a single encoder pass is paid
+    /// for.
+    #[tokio::test]
+    #[ignore = "needs models/ms-marco-MiniLM-L6-v2-Q8_0.gguf"]
+    async fn a_real_reranker_answers_this_route_and_only_this_route() {
+        let encoder = reranker();
+        assert!(encoder.rank_head().is_some());
+        assert_eq!(
+            encoder_endpoints(&encoder),
+            vec![
+                ferrox_api::routes::V1_EMBEDDINGS,
+                ferrox_api::routes::V1_RERANK
+            ],
+            "this checkpoint carries no {{arch}}.pooling_type, so it is a RANK head on an \
+             encoder whose pooling is NONE -- both routes are honestly listed"
+        );
+        assert!(validate(QUERY, &berlin_documents()).is_ok());
+        assert!(validate(QUERY, &[]).is_err());
+        assert!(validate("", &berlin_documents()).is_err());
     }
 }

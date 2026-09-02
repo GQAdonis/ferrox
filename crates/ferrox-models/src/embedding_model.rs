@@ -14,7 +14,7 @@
 use thiserror::Error;
 
 use crate::bert_gguf_loader::{load_bert_encoder, read_bert_hparams, BERT_ARCH};
-use crate::encoder::{EncodeError, TextEncoder};
+use crate::encoder::{EncodeError, PairSequence, TextEncoder};
 use crate::loader::LoadError;
 use crate::pooling::{l2_normalize, pool, PoolingType};
 use crate::rank_head::{load_rank_head, RankHead};
@@ -103,6 +103,48 @@ pub enum EmbedError {
          wrongly, so this refuses instead"
     )]
     NoPairInput { arch: String },
+    #[error(
+        "the reranker checkpoint {name:?} ({arch}) carries a classification head but only \
+         {rows} token-type row(s): there is no \"Sentence B\" embedding to put the document \
+         half of a pair on. Scoring both halves as Sentence A is what this cross-encoder was \
+         NOT trained on, and it reorders the results rather than merely shifting them, so \
+         this refuses at load instead of serving a plausible wrong ranking"
+    )]
+    NoSegmentB {
+        name: String,
+        arch: String,
+        rows: usize,
+    },
+}
+
+/// The one condition under which a checkpoint that HAS a classification
+/// head still cannot serve `/v1/rerank`: its token-type table has no
+/// "Sentence B" row, so a pair would put both halves on segment 0.
+///
+/// A function rather than an `if` inside the loader so the arm is
+/// testable without a GGUF carrying that shape. A refusal whose
+/// condition cannot be shown to fire reads as coverage and is not: this
+/// repo has shipped one keyed on a GGUF spelling nothing writes.
+///
+/// It is checked at LOAD, and only here, because this is the only place
+/// the head and the encoder are both in hand — the BERT loader does not
+/// know whether a head was found, and asking once per request would put
+/// the answer in two places. A checkpoint in this state cannot answer
+/// the one route it exists for, so it does not load.
+fn refuse_unpairable_reranker(
+    has_rank_head: bool,
+    n_segments: usize,
+    name: &str,
+    arch: &str,
+) -> Option<EmbedError> {
+    if has_rank_head && n_segments < 2 {
+        return Some(EmbedError::NoSegmentB {
+            name: name.to_string(),
+            arch: arch.to_string(),
+            rows: n_segments,
+        });
+    }
+    None
 }
 
 /// A loaded embedding model: tokenizer + encoder + the checkpoint's own
@@ -157,6 +199,12 @@ impl EmbeddingModel {
         let hp = read_bert_hparams(&file)?;
         let rank_head = load_rank_head(&file, &hp.arch, hp.n_embd, hp.layer_norm_eps)?;
         let encoder = load_bert_encoder(&file)?;
+
+        if let Some(refusal) =
+            refuse_unpairable_reranker(rank_head.is_some(), encoder.n_segments(), &name, &arch)
+        {
+            return Err(refusal);
+        }
 
         Ok(Self {
             encoder: Box::new(encoder),
@@ -239,14 +287,15 @@ impl EmbeddingModel {
         self.rank_head.as_ref()
     }
 
-    /// The exact ids [`Self::rerank_score`] will see for one
-    /// `(query, document)` pair: `[CLS] query [SEP] document [SEP]`.
+    /// The exact input [`Self::rerank_score`] will see for one
+    /// `(query, document)` pair: `[CLS] query [SEP] document [SEP]`,
+    /// **with** the segment id of every position.
     ///
     /// Separate from the scoring call for the same reason
     /// [`Self::token_ids`] is separate from [`Self::embed`] — a route
-    /// has to report `usage.prompt_tokens`, and that number is this
-    /// length.
-    pub fn rerank_token_ids(&self, query: &str, document: &str) -> Result<Vec<u32>, EmbedError> {
+    /// has to report `usage.prompt_tokens`, and that number is
+    /// `tokens.len()`.
+    pub fn rerank_input(&self, query: &str, document: &str) -> Result<PairSequence, EmbedError> {
         self.encoder
             .wrap_special_pair(
                 &self.tokenizer.encode(query),
@@ -258,7 +307,7 @@ impl EmbeddingModel {
     }
 
     /// The head's relevance score for a pair sequence built by
-    /// [`Self::rerank_token_ids`].
+    /// [`Self::rerank_input`].
     ///
     /// This is upstream's RANK path in full: encode, take the **CLS**
     /// row, run the classification head, report output 0
@@ -272,7 +321,7 @@ impl EmbeddingModel {
     /// No L2 normalization and no sigmoid: upstream reports the raw
     /// logit, so a score is comparable only against other scores from
     /// the same head, and this must not quietly squash it into `0..1`.
-    pub fn rerank_score(&self, pair_ids: &[u32]) -> Result<f32, EmbedError> {
+    pub fn rerank_score(&self, pair: &PairSequence) -> Result<f32, EmbedError> {
         let head = self
             .rank_head
             .as_ref()
@@ -280,10 +329,31 @@ impl EmbeddingModel {
                 name: self.name.clone(),
                 arch: self.arch.clone(),
             })?;
-        let hidden = self.encoder.encode_tokens(pair_ids)?;
+        let hidden = self.pair_hidden_states(pair)?;
         let cls = pool(&hidden, self.encoder.n_embd(), PoolingType::Cls)
             .map_err(|e| EmbedError::Encode(EncodeError::Pooling(e)))?;
         Ok(head.score(&cls))
+    }
+
+    /// Un-pooled `n_tokens × n_embd` hidden states for a pair built by
+    /// [`Self::rerank_input`] — [`Self::hidden_states`]'s counterpart
+    /// for the cross-encoder input, and the one graph call
+    /// [`Self::rerank_score`] itself makes.
+    ///
+    /// Public for the same reason [`Self::hidden_states`] is: when a
+    /// relevance score is surprising, the first questions are what
+    /// tokens the model saw and what came out before the head, and
+    /// without this the only way to ask was to load the checkpoint a
+    /// second time — which for a reranker does not even work, because
+    /// [`crate::load_bert_encoder_from_path`] alone leaves `cls.*`
+    /// unconsumed and refuses.
+    ///
+    /// The pair's own `segments` are honoured, so passing a
+    /// [`PairSequence`] whose segments are all zero reproduces the
+    /// segment-blind graph exactly, without a second copy of it to
+    /// drift.
+    pub fn pair_hidden_states(&self, pair: &PairSequence) -> Result<Vec<f32>, EmbedError> {
+        Ok(self.encoder.encode(&pair.tokens, Some(&pair.segments))?)
     }
 }
 
@@ -359,5 +429,29 @@ mod tests {
         for arch in ["llama", "qwen3", "gemma3", "deepseek2"] {
             assert!(!is_embedding_arch(arch), "{arch} was routed to this path");
         }
+    }
+
+    /// A reranker that cannot express "Sentence B" is refused at load,
+    /// and a plain embedding model in the same state is NOT — an
+    /// embedding pass is all segment 0 and has nothing to say about a
+    /// second row.
+    ///
+    /// The point of the test is that the refusing arm is REACHABLE.
+    /// Written as a condition inside the loader it could only be
+    /// exercised by a checkpoint nobody publishes, which is how a gate
+    /// comes to read as coverage while never firing.
+    #[test]
+    fn only_a_reranker_needs_a_second_token_type_row_and_it_is_refused_without_one() {
+        assert!(refuse_unpairable_reranker(true, 2, "r", "bert").is_none());
+        assert!(refuse_unpairable_reranker(false, 1, "e", "bert").is_none());
+        assert!(refuse_unpairable_reranker(false, 0, "e", "bert").is_none());
+
+        let err = refuse_unpairable_reranker(true, 1, "some-reranker", "bert")
+            .expect("a head with one segment row must refuse");
+        let msg = err.to_string();
+        for fact in ["some-reranker", "bert", "1 token-type row"] {
+            assert!(msg.contains(fact), "{msg} does not carry {fact}");
+        }
+        assert!(matches!(err, EmbedError::NoSegmentB { rows: 1, .. }));
     }
 }

@@ -53,8 +53,43 @@ pub enum EncodeError {
     },
     #[error("token id {id} is outside this checkpoint's {vocab_size}-entry vocabulary")]
     TokenOutOfRange { id: u32, vocab_size: usize },
+    #[error(
+        "segment id {id} at position {pos} is outside this checkpoint's {n_segments}-row \
+         token-type table"
+    )]
+    SegmentOutOfRange {
+        id: u32,
+        pos: usize,
+        n_segments: usize,
+    },
+    #[error(
+        "{tokens} token(s) were given {segments} segment id(s); every position needs exactly \
+         one, or the graph would add a segment embedding to the wrong row"
+    )]
+    RaggedSegments { tokens: usize, segments: usize },
     #[error(transparent)]
     Pooling(#[from] PoolingError),
+}
+
+/// One two-segment encoder input: the token ids and, for each of them,
+/// which half of the pair it belongs to.
+///
+/// The two vectors are built together and travel together on purpose.
+/// They are the repo's dominant bug shape waiting to happen — two
+/// structures that must agree, here about a length and about where the
+/// boundary is — and the single place that can get them right is
+/// [`TextEncoder::wrap_special_pair`], which inserts the `[SEP]` that
+/// the boundary is defined by. Handing a caller the ids alone (what
+/// this seam used to do) meant the segment ids did not exist at all
+/// and every position was scored as "Sentence A".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PairSequence {
+    /// `[CLS] a [SEP] b [SEP]` for BERT.
+    pub tokens: Vec<u32>,
+    /// `0` for the `[CLS] a [SEP]` half, `1` for the `b [SEP]` half —
+    /// HuggingFace's `token_type_ids`. Always the same length as
+    /// [`Self::tokens`].
+    pub segments: Vec<u32>,
 }
 
 /// A model that turns a whole token sequence into hidden states in one
@@ -84,9 +119,25 @@ pub trait TextEncoder {
         pieces.to_vec()
     }
 
+    /// How many rows the checkpoint's token-type ("segment") table
+    /// carries, i.e. the number of distinct segment ids
+    /// [`Self::encode`] will accept.
+    ///
+    /// `1` — the default — means the encoder can only represent
+    /// "Sentence A", which is enough for an embedding pass and is not
+    /// enough for a cross-encoder pair. Read at load time by
+    /// [`crate::EmbeddingModel`], which refuses a reranker checkpoint
+    /// that cannot express segment 1 rather than silently scoring the
+    /// document half as segment 0.
+    fn n_segments(&self) -> usize {
+        1
+    }
+
     /// The two-segment input a **cross-encoder** scores: one sequence
     /// holding a query and a document with the model's own boundary
-    /// between them. For BERT that is `[CLS] a [SEP] b [SEP]`.
+    /// between them, and the segment id of every position. For BERT
+    /// that is `[CLS] a [SEP] b [SEP]` with segments `0…0 1…1`, which is
+    /// exactly what HuggingFace's `tokenizer(query, document)` emits.
     ///
     /// `None` — the default — means this encoder has no two-segment
     /// form, and a caller that needs one must refuse. Deliberately NOT
@@ -95,12 +146,26 @@ pub trait TextEncoder {
     /// still returns a plausible float. That is the "computes something
     /// else" failure, and it is invisible — a rerank with no boundary
     /// produces an ordering, just not the model's.
-    fn wrap_special_pair(&self, _a: &[u32], _b: &[u32]) -> Option<Vec<u32>> {
+    fn wrap_special_pair(&self, _a: &[u32], _b: &[u32]) -> Option<PairSequence> {
         None
     }
 
     /// `n_tokens × n_embd` hidden states, in row order.
-    fn encode_tokens(&self, tokens: &[u32]) -> Result<Vec<f32>, EncodeError>;
+    ///
+    /// `segments` is the per-position segment id, or `None` for "all
+    /// zeros" — the single-sequence case. There is deliberately ONE
+    /// graph with a parameter rather than a segment-aware copy of a
+    /// segment-blind one: this repo has lost a model feature to every
+    /// copied forward pass it has ever had, and the pair path is
+    /// exercised far less often than the embedding path, so a copy is
+    /// exactly where a fix would fail to land.
+    fn encode(&self, tokens: &[u32], segments: Option<&[u32]>) -> Result<Vec<f32>, EncodeError>;
+
+    /// [`Self::encode`] for a single sequence: every position is
+    /// segment 0.
+    fn encode_tokens(&self, tokens: &[u32]) -> Result<Vec<f32>, EncodeError> {
+        self.encode(tokens, None)
+    }
 
     /// [`Self::encode_tokens`] followed by the checkpoint's own pooling.
     /// Not L2-normalized — see [`crate::pooling::pool`].

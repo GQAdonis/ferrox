@@ -188,12 +188,17 @@ pub fn load_bert_encoder(file: &ShardedGguf) -> Result<BertEncoder, LoadError> {
         )));
     }
 
-    // Row 0 only: upstream views `type_embd` at offset 0 and adds it,
-    // because a single-sequence embedding pass is always "Sentence A".
-    // The tensor is `TENSOR_NOT_REQUIRED` there, so its absence is not
-    // an error — but the whole table is then unused, and
-    // `assert_every_tensor_consumed` would flag any other row anyway.
-    let type_embd_row0 = match file.find_tensor("token_types.weight") {
+    // The WHOLE table, not row 0. Upstream views `type_embd` at offset
+    // 0 and adds it everywhere, because `llama_batch` carries no
+    // segment ids; ferrox's encoder takes them as a parameter, so a
+    // cross-encoder pair can put its document half on row 1 the way the
+    // checkpoint was trained. Loading row 0 alone is what made
+    // `/v1/rerank` rank the relevant document last (see
+    // `bert_encoder`'s module docs). The tensor is
+    // `TENSOR_NOT_REQUIRED` upstream, so its absence is not an error —
+    // it means no segment embedding is added at all, and a reranker
+    // checkpoint in that state is refused by `EmbeddingModel`.
+    let type_embd = match file.find_tensor("token_types.weight") {
         Some(_) => {
             let table = load_weight_matrix(file, "token_types.weight")?;
             if table.rows() != hp.n_token_types || table.cols() != hp.n_embd {
@@ -205,7 +210,7 @@ pub fn load_bert_encoder(file: &ShardedGguf) -> Result<BertEncoder, LoadError> {
                     hp.n_embd
                 )));
             }
-            Some(table.dequant_row(0))
+            Some((0..table.rows()).map(|r| table.dequant_row(r)).collect())
         }
         None => None,
     };
@@ -291,7 +296,7 @@ pub fn load_bert_encoder(file: &ShardedGguf) -> Result<BertEncoder, LoadError> {
     Ok(BertEncoder {
         hp,
         tok_embd,
-        type_embd_row0,
+        type_embd,
         pos_embd,
         tok_norm_w,
         tok_norm_b,

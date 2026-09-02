@@ -1461,8 +1461,20 @@ pub(crate) fn load_weight_matrix(
     // as a real transposition bug affecting every externally-produced
     // GGUF file, caught by serving a real downloaded checkpoint.
     let shape: Vec<usize> = info.shape.iter().rev().map(|&d| d as usize).collect();
+    // A ggml tensor's `ne[]` is always four long and trailing 1s are
+    // implicit, so a GGUF writer is free to store a `[in, 1]` matrix
+    // with `n_dims = 1`. llama.cpp reads it back as a matrix anyway --
+    // `check_tensor_dims` compares each requested dimension against
+    // `cur->ne[i]` and requires 1 for the dimensions the file does not
+    // carry -- so a single-output projection is a 2-D weight there and
+    // must be one here. Refusing it instead made a real checkpoint
+    // unloadable: `cross-encoder/ms-marco-MiniLM-L6-v2` writes
+    // `cls.output.weight` as `[384]`, i.e. the 1x384 relevance head
+    // that `/v1/rerank` exists to run, and the whole route died at load
+    // with "expected 2D".
     let (rows, cols) = match shape.as_slice() {
         [r, c] => (*r, *c),
+        [c] => (1, *c),
         other => {
             return Err(LoadError::UnsupportedDtype(
                 format!("{name} (expected 2D, got shape {other:?})"),
@@ -1470,6 +1482,10 @@ pub(crate) fn load_weight_matrix(
             ))
         }
     };
+    // `shape` is what the file said; `[rows, cols]` is what the matrix
+    // is. They differ exactly in the 1-D case above, and the `Tensor`
+    // must carry the matrix shape or `apply` reads it as a vector.
+    let shape = vec![rows, cols];
 
     match info.dtype {
         // BF16 has no block/scale structure to keep quantized-in-place

@@ -65,7 +65,7 @@
 
 use std::collections::BTreeMap;
 
-use serde_json::{Map, Value};
+use serde_json::{json, Map, Value};
 
 use crate::policy::detokenize::{floor_char_boundary, stop_prefix_holdback};
 use crate::policy::parser::reasoning::{
@@ -172,6 +172,21 @@ pub enum ToolCallFormat {
     /// a model *displaying* JSON in an answer is not mistaken for one
     /// invoking a tool.
     FencedJson,
+    /// A tool name used directly as an XML element:
+    /// `<current_time arguments="{}"/>`, `<get_weather>{"city":"Paris"}</get_weather>`,
+    /// or the catalogue tag itself, `<tools>{"name":…,"arguments":…}</tools>`.
+    ///
+    /// None of these is a format any template asks for. They are what
+    /// `Qwen2.5-Coder-7B-Instruct-Q5_K_M` actually emits: its chat template
+    /// prints the tool catalogue inside `<tools></tools>` and then requests
+    /// calls inside `<tool_call></tool_call>`, and the quantized model reaches
+    /// for the nearer tag. Measured 2026-09-01 — at temperature 0 it emits
+    /// `<current_time arguments="{}"/>` on every attempt, and a system-prompt
+    /// reminder of the correct format fixed only 2 of 5 samples.
+    ///
+    /// Safe because every candidate is resolved through `known()`: an element
+    /// whose tag is not an offered tool name is left as prose.
+    ElementNamedTool,
     /// `<function_call>{"name": …, "arguments": {…}}</function_call>`.
     ///
     /// Structurally identical to [`ToolCallFormat::Qwen25`] -- a JSON
@@ -189,6 +204,12 @@ pub enum ToolCallFormat {
 /// Every marker that means "a tool call may be starting", across all
 /// families. Used to decide, cheaply, whether a response is worth
 /// parsing at all.
+/// Most a wrapper may withhold before it is judged prose and released.
+///
+/// A real call in a stray wrapper is small; anything larger is an answer that
+/// happens to contain a bracket, and holding it would stall the stream.
+const WRAPPER_HOLD_LIMIT: usize = 4096;
+
 pub const TOOL_MARKERS: [&str; 14] = [
     "<tool_call>",
     "```",
@@ -237,6 +258,7 @@ impl ToolCallFormat {
             ToolCallFormat::MuseGlimmer => "muse_glimmer",
             ToolCallFormat::FunctionCall => "function_call",
             ToolCallFormat::FencedJson => "fenced_json",
+            ToolCallFormat::ElementNamedTool => "element_named_tool",
         }
     }
 
@@ -324,6 +346,7 @@ impl ToolCallFormat {
             // `call_from_json` validating the payload is what makes a
             // fenced object a call rather than a listing.
             ToolCallFormat::FencedJson => None,
+            ToolCallFormat::ElementNamedTool => None,
         }
     }
 
@@ -365,6 +388,7 @@ impl ToolCallFormat {
                 Markers::block("<function_call>", "</function_call>")
             }
             ToolCallFormat::FencedJson => Markers::block("```", "```"),
+            ToolCallFormat::ElementNamedTool => Markers::block("<", ">"),
             ToolCallFormat::Llama3 => Markers::block("<|python_tag|>", ""),
             ToolCallFormat::Mistral => Markers::block("[TOOL_CALLS]", ""),
             ToolCallFormat::Gemma4 => Markers::block("<|tool_call>", "<tool_call|>"),
@@ -532,6 +556,11 @@ pub struct ToolCallParser {
     format: ToolCallFormat,
     markers: Markers,
     tools: BTreeMap<String, ToolSchema>,
+    /// Text withheld while an unrecognized wrapper element completes.
+    ///
+    /// Empty in the overwhelming case. Bounded by `WRAPPER_HOLD_LIMIT` so a
+    /// model that opens `<` and never closes it cannot buffer a whole reply.
+    wrapper_hold: String,
     buffer: String,
     /// Calls emitted so far, which is also the next call's index.
     emitted: usize,
@@ -604,6 +633,7 @@ impl ToolCallParser {
                 String::new()
             },
             emitted: 0,
+            wrapper_hold: String::new(),
             open: None,
             m3_in_block: false,
             header_open,
@@ -623,7 +653,16 @@ impl ToolCallParser {
     /// these markers needs no parsing at all, and that is the common
     /// case.
     pub fn text_may_contain_call(text: &str) -> bool {
-        TOOL_MARKERS.iter().any(|marker| text.contains(marker))
+        if TOOL_MARKERS.iter().any(|marker| text.contains(marker)) {
+            return true;
+        }
+        // A model may name the element after the tool itself
+        // (`<current_time arguments="{}"/>`), which matches no fixed
+        // marker. Admit any XML-ish open tag to the parsers; each one
+        // still resolves the tag through the offered-tool map, so prose
+        // that merely contains a bracket cannot become a call. Keeps the
+        // prescreen cheap: no allocation, no scan of the tool list.
+        text.contains('<') && text.contains('>')
     }
 
     /// Whether `text` contains a call in *this* format.
@@ -668,6 +707,7 @@ impl ToolCallParser {
             // both "```json" and a plain "```". `call_from_json` trims the
             // leading tag along with surrounding whitespace.
             ToolCallFormat::FencedJson => self.parse_json_blocks(text, "```", "```"),
+            ToolCallFormat::ElementNamedTool => self.parse_element_named(text),
             ToolCallFormat::Llama3 => self.parse_bare_json(text, "<|python_tag|>"),
             ToolCallFormat::Mistral => self.parse_mistral(text),
             ToolCallFormat::GptOss => self.parse_harmony(text),
@@ -716,8 +756,53 @@ impl ToolCallParser {
     /// with what it has, so the fragments a client already received
     /// still concatenate to valid JSON. Silently dropping it would
     /// leave the client parsing an unterminated object forever.
+    /// Re-parse residual text against the fallback formats, in the same
+    /// order `output::extract_tool_calls` uses for a non-streaming reply.
+    ///
+    /// Exists because the streaming parser is built for exactly one
+    /// inferred format, while the buffered path gets four attempts. A
+    /// quantized model that ignores its own template -- emitting
+    /// `<xml>{...}</xml>` where `<tool_call>` was asked for -- was
+    /// therefore recovered when buffered and lost when streamed, from
+    /// byte-identical requests.
+    ///
+    /// Every candidate still resolves through `known()`, so this cannot
+    /// invent a call for a tool the request never offered.
+    fn parse_fallback_formats(&self, text: &str) -> (String, Vec<ToolCall>) {
+        for format in [
+            ToolCallFormat::Qwen25,
+            ToolCallFormat::FunctionCall,
+            ToolCallFormat::FencedJson,
+            ToolCallFormat::ElementNamedTool,
+        ] {
+            if format == self.format {
+                continue;
+            }
+            let schemas: Vec<ToolSchema> = self.tools.values().cloned().collect();
+            let mut probe = ToolCallParser::new(format, schemas);
+            let (content, calls) = probe.parse_complete(text);
+            if !calls.is_empty() {
+                return (content, calls);
+            }
+        }
+        (text.to_string(), Vec::new())
+    }
+
     pub fn finish(&mut self) -> Vec<ToolCallEvent> {
         let mut events = Vec::new();
+        // Anything still withheld by the wrapper accumulator is decided now.
+        // The stream is over, so this is the last chance for it to be a call
+        // -- and text held here must never simply vanish.
+        if !self.wrapper_hold.is_empty() {
+            // Join the held span with whatever the marker holdback is still
+            // sitting on. They are two halves of one payload -- the closing
+            // fence of "```json…```" ends up in `buffer` because ``` is a
+            // TOOL_MARKER -- and judging either half alone finds no call.
+            let mut held = std::mem::take(&mut self.wrapper_hold);
+            held.push_str(&std::mem::take(&mut self.buffer));
+            self.emit_text_or_call_now(held, &mut events);
+            return events;
+        }
         if self.format == ToolCallFormat::MuseGlimmer {
             self.finish_muse(&mut events);
             return events;
@@ -743,7 +828,38 @@ impl ToolCallParser {
             return events;
         }
         if !self.has_tool_call(&rest) {
-            self.emit_text(rest, &mut events);
+            // The native format found nothing. Before giving up and
+            // calling this prose, try the same fallback formats the
+            // non-streaming path tries -- a streamed answer and a
+            // buffered one must not disagree about whether a tool was
+            // called. Observed 2026-09-01: an identical request with
+            // `stream: false` returned `finish_reason: tool_calls`
+            // while `stream: true` returned the call as text, because
+            // this early return is reached before `parse_complete`.
+            let (text, calls) = self.parse_fallback_formats(&rest);
+            if calls.is_empty() {
+                self.emit_text(rest, &mut events);
+                return events;
+            }
+            if !text.trim().is_empty() {
+                events.push(ToolCallEvent::Text(text));
+            }
+            for call in calls {
+                let index = self.emitted;
+                self.emitted += 1;
+                events.push(ToolCallEvent::CallStart {
+                    index,
+                    name: call.name,
+                });
+                events.push(ToolCallEvent::CallArguments {
+                    index,
+                    fragment: call.arguments.clone(),
+                });
+                events.push(ToolCallEvent::CallEnd {
+                    index,
+                    arguments: call.arguments,
+                });
+            }
             return events;
         }
         // Llama 3 and Mistral have no closing marker, so their payload
@@ -819,7 +935,7 @@ impl ToolCallParser {
                     return false;
                 }
                 let text: String = self.buffer.drain(..split).collect();
-                self.emit_text(text, events);
+                self.emit_text_or_call(text, events);
                 false
             }
         }
@@ -833,6 +949,105 @@ impl ToolCallParser {
     /// the first belongs to the call. Emitting the remainder as content
     /// would print raw markup into an answer, which is exactly what a
     /// client renders verbatim.
+    /// Release text — unless it is a tool call in a wrapper we did not ask for.
+    ///
+    /// `step_idle` reaches here once it is sure the buffer holds no partial
+    /// marker for the native format. That is the last moment the text is
+    /// intact, and therefore the only place a whole-payload re-parse can
+    /// happen: `finish()` sees an empty buffer because this already ran.
+    ///
+    /// Only text that looks like a complete element is even considered, and
+    /// every candidate resolves through `known()`, so prose cannot become a
+    /// call. Fixes streamed and buffered replies disagreeing on identical
+    /// input (observed 2026-09-01: `stream:false` → `tool_calls`,
+    /// `stream:true` → the same call as prose).
+    fn emit_text_or_call(&mut self, text: String, events: &mut Vec<ToolCallEvent>) {
+        // The payload arrives in generation-sized pieces, so a wrapper is
+        // split across many calls (`<xml>\n  `, `{\"name\":`, ...). Nothing
+        // can be decided until the element closes: accumulate from the first
+        // suspicious opener and hold output until then.
+        if self.wrapper_hold.is_empty() {
+            // Only ever a fallback. Once this parser has recognized a call in
+            // its own format, the format is working and leftover structure is
+            // just residue -- reparsing it produced a phantom second call from
+            // MiniMax's trailing `</minimax:tool_call>`.
+            // Trigger on the first character of either shape, not the
+            // complete marker: at one character per chunk the opener arrives
+            // as `` ` `` and `<` alone, and waiting for "```" here means the
+            // accumulator never starts and the call is lost.
+            let opens_wrapper = self.emitted == 0
+                && self.open.is_none()
+                && (text.contains('<') || text.contains('`'));
+            if opens_wrapper {
+                self.wrapper_hold.push_str(&text);
+                return;
+            }
+        } else {
+            self.wrapper_hold.push_str(&text);
+            let held = self.wrapper_hold.clone();
+            // Closed, or clearly never going to close.
+            // A closing tag is only closed once its '>' has arrived. At one
+            // character per chunk the buffer passes through `</x`, and
+            // treating that as complete splits the payload -- which is
+            // exactly how a call was lost at small chunk sizes.
+            // A fence closes on its SECOND ``` -- but the opener is often
+            // "```json", so counting bare occurrences is right only once the
+            // closing fence has fully arrived. At one char per chunk the
+            // buffer passes through "``" and "```" mid-word, so require the
+            // closing fence to be followed by a newline or end of text.
+            let fence_closed = {
+                let n = held.matches("```").count();
+                n >= 2 && held.rfind("```").is_some_and(|at| {
+                    let tail = &held[at + 3..];
+                    tail.is_empty() || tail.starts_with('\n') || tail.trim().is_empty()
+                })
+            };
+            let closed = held
+                .rfind("</")
+                .is_some_and(|at| held[at..].contains('>'))
+                || held.contains("/>")
+                || fence_closed;
+            if !closed && held.len() < WRAPPER_HOLD_LIMIT {
+                return;
+            }
+            self.wrapper_hold.clear();
+            self.emit_text_or_call_now(held, events);
+            return;
+        }
+        self.emit_text_or_call_now(text, events);
+    }
+
+    /// Decide a fully-accumulated span: a call in an unexpected wrapper, or prose.
+    fn emit_text_or_call_now(&mut self, text: String, events: &mut Vec<ToolCallEvent>) {
+        let looks_structural = text.contains('<') && text.contains('>');
+        if looks_structural || text.contains("```") {
+            let (remainder, calls) = self.parse_fallback_formats(&text);
+            if !calls.is_empty() {
+                if !remainder.trim().is_empty() {
+                    events.push(ToolCallEvent::Text(remainder));
+                }
+                for call in calls {
+                    let index = self.emitted;
+                    self.emitted += 1;
+                    events.push(ToolCallEvent::CallStart {
+                        index,
+                        name: call.name,
+                    });
+                    events.push(ToolCallEvent::CallArguments {
+                        index,
+                        fragment: call.arguments.clone(),
+                    });
+                    events.push(ToolCallEvent::CallEnd {
+                        index,
+                        arguments: call.arguments,
+                    });
+                }
+                return;
+            }
+        }
+        self.emit_text(text, events);
+    }
+
     fn emit_text(&self, text: String, events: &mut Vec<ToolCallEvent>) {
         let mut text = text;
         for marker in self.closing_markers() {
@@ -1322,6 +1537,107 @@ impl ToolCallParser {
         };
         let value: Value = serde_json::from_str(body).ok()?;
         self.call_from_value(&value, index)
+    }
+
+    /// Parse `<tool_name .../>` and `<tool_name>…</tool_name>` elements whose
+    /// tag is an offered tool name.
+    ///
+    /// Three shapes, all observed from the same model:
+    ///   `<current_time arguments="{}"/>`      attribute-carried arguments
+    ///   `<get_weather>{"city":"Paris"}</get_weather>`  body-carried arguments
+    ///   `<tools>{"name":"x","arguments":{}}</tools>`   catalogue tag reused
+    ///
+    /// The tag is checked against `known()` before anything is parsed, so
+    /// ordinary prose containing angle brackets cannot become a call.
+    fn parse_element_named(&self, text: &str) -> (String, Vec<ToolCall>) {
+        let mut calls = Vec::new();
+        let mut content = String::new();
+        let mut rest = text;
+        let mut index = 0usize;
+
+        while let Some(open) = rest.find('<') {
+            let (before, tail) = rest.split_at(open);
+            let Some(close) = tail.find('>') else {
+                break;
+            };
+            let inner = &tail[1..close];
+            let after = &tail[close + 1..];
+
+            // `<tag ...attrs...` or `<tag/>` — take the tag, keep the rest.
+            // A closing tag (`</minimax:tool_call>`) is not an element that
+            // opens anything. Skipping it matters because `known()` admits any
+            // name containing ':' for client-side routing, so `/minimax:tool_call`
+            // sailed through and became a phantom second call.
+            if inner.starts_with('/') {
+                content.push_str(before);
+                content.push_str(&tail[..=close]);
+                rest = after;
+                continue;
+            }
+            let trimmed = inner.trim_end_matches('/').trim();
+            let (tag, attrs) = trimmed
+                .split_once(char::is_whitespace)
+                .map_or((trimmed, ""), |(t, a)| (t, a.trim()));
+
+            // A wrapper tag (`<tools>`) carries a JSON call in its body;
+            // a tool-named tag carries its own arguments.
+            // Every one of these was observed from the same quantized model
+            // wrapping a correct call in a tag no template asked for:
+            // `<tools>`/`<xml>` at temp 0, `<json>`/`<response>` at 0.7.
+            // The body must still parse as JSON and name an offered tool,
+            // so widening this list cannot invent a call.
+            // Deliberately NOT `tool`/`function`/`parameter`: those are
+            // structural elements of grammars that already have parsers
+            // (MiniMax `<invoke><parameter name=…>`, Qwen3-Coder
+            // `<function=…>`), and claiming them here turned one real call
+            // into two by re-reading its own inner markup.
+            let is_wrapper = matches!(tag, "tools" | "xml" | "json" | "response");
+            if !is_wrapper && !self.known(tag) {
+                content.push_str(before);
+                content.push_str(&tail[..=close]);
+                rest = after;
+                continue;
+            }
+
+            let closing = format!("</{tag}>");
+            let (body, remainder) = match after.find(&closing) {
+                Some(end) => (&after[..end], &after[end + closing.len()..]),
+                None => ("", after),
+            };
+
+            let candidate = if is_wrapper {
+                serde_json::from_str::<Value>(body.trim()).ok()
+            } else if let Some(args) = attribute_value(attrs, "arguments")
+                .or_else(|| attribute_value(attrs, "parameters"))
+                .or_else(|| attribute_value(attrs, "input"))
+            {
+                serde_json::from_str::<Value>(&args)
+                    .ok()
+                    .map(|a| json!({ "name": tag, "arguments": a }))
+            } else if body.trim().is_empty() {
+                Some(json!({ "name": tag, "arguments": {} }))
+            } else {
+                serde_json::from_str::<Value>(body.trim())
+                    .ok()
+                    .map(|a| json!({ "name": tag, "arguments": a }))
+            };
+
+            match candidate.and_then(|v| self.call_from_value(&v, index)) {
+                Some(call) => {
+                    content.push_str(before);
+                    calls.push(call);
+                    index += 1;
+                }
+                None => {
+                    content.push_str(before);
+                    content.push_str(&tail[..=close]);
+                    content.push_str(body);
+                }
+            }
+            rest = remainder;
+        }
+        content.push_str(rest);
+        (content, calls)
     }
 
     fn call_from_value(&self, value: &Value, index: usize) -> Option<ToolCall> {
@@ -3000,5 +3316,227 @@ mod tests {
         assert_eq!(json_object_end(r#"{"a": "\""} tail"#), Some(11));
         assert_eq!(json_object_end("{unterminated"), None);
         assert_eq!(json_array_end("[1, [2], 3] tail"), Some(11));
+    }
+}
+
+/// Read `name="value"` (or `name='value'`) out of an XML attribute string.
+///
+/// Deliberately tiny: the only attributes that matter here are the ones a
+/// model invents to carry tool arguments, and they are always quoted JSON.
+fn attribute_value(attrs: &str, key: &str) -> Option<String> {
+    let at = attrs.find(key)?;
+    let after = attrs[at + key.len()..].trim_start();
+    let after = after.strip_prefix('=')?.trim_start();
+    let quote = after.chars().next()?;
+    if quote != '"' && quote != '\'' {
+        return None;
+    }
+    let body = &after[1..];
+    let end = body.find(quote)?;
+    Some(body[..end].replace("&quot;", "\"").replace("&amp;", "&"))
+}
+
+#[cfg(test)]
+mod element_named_tool_tests {
+    use super::*;
+
+    fn parser() -> ToolCallParser {
+        let tools = vec![
+            ToolSchema { name: "current_time".to_string(), parameters: None },
+            ToolSchema { name: "get_weather".to_string(), parameters: None },
+        ];
+        ToolCallParser::new(ToolCallFormat::ElementNamedTool, tools)
+    }
+
+    #[test]
+    fn self_closing_with_attribute_arguments() {
+        // The exact string Qwen2.5-Coder-7B emits at temperature 0.
+        let (_c, calls) = parser().parse_complete(r#"<current_time arguments="{}"/>"#);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "current_time");
+    }
+
+    #[test]
+    fn paired_tag_with_json_body() {
+        let (_c, calls) =
+            parser().parse_complete(r#"<get_weather>{"city":"Paris"}</get_weather>"#);
+        assert_eq!(calls.len(), 1);
+        assert!(calls[0].arguments.contains("Paris"));
+    }
+
+    #[test]
+    fn empty_paired_tag_is_a_call_with_no_arguments() {
+        let (_c, calls) = parser().parse_complete("<current_time></current_time>");
+        assert_eq!(calls.len(), 1);
+    }
+
+    #[test]
+    fn catalogue_wrapper_tag() {
+        let (_c, calls) =
+            parser().parse_complete(r#"<tools>{"name":"current_time","arguments":{}}</tools>"#);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "current_time");
+    }
+
+    // Falsification: these MUST NOT become calls.
+    #[test]
+    fn prose_with_brackets_is_not_a_call() {
+        let (content, calls) = parser().parse_complete("Use a < b and c > d to compare.");
+        assert!(calls.is_empty());
+        assert!(content.contains("Use a < b"));
+    }
+
+    #[test]
+    fn unoffered_tool_name_is_not_a_call() {
+        let (_c, calls) = parser().parse_complete(r#"<delete_everything arguments="{}"/>"#);
+        assert!(calls.is_empty(), "a tag that is not an offered tool must stay prose");
+    }
+
+    #[test]
+    fn html_in_an_answer_is_not_a_call() {
+        let (_c, calls) = parser().parse_complete("<p>The time is 3pm</p>");
+        assert!(calls.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod streaming_fallback_tests {
+    use super::*;
+
+    fn schemas() -> Vec<ToolSchema> {
+        vec![
+            ToolSchema { name: "current_time".to_string(), parameters: None },
+            ToolSchema { name: "time__current_time".to_string(), parameters: None },
+        ]
+    }
+
+    /// Feed text through the STREAMING interface the way lib.rs does:
+    /// push() per chunk, then finish().
+    fn stream_calls(text: &str, chunk: usize) -> Vec<String> {
+        let mut parser = ToolCallParser::new(ToolCallFormat::Qwen25, schemas());
+        let mut events = Vec::new();
+        let bytes: Vec<char> = text.chars().collect();
+        for piece in bytes.chunks(chunk) {
+            let s: String = piece.iter().collect();
+            events.extend(parser.push(&s));
+        }
+        events.extend(parser.finish());
+        events
+            .into_iter()
+            .filter_map(|e| match e {
+                ToolCallEvent::CallStart { name, .. } => Some(name),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The buffered path as the server actually runs it: native format
+    /// first, then the fallback cascade. `parse_complete` alone is only
+    /// the first of those attempts, so comparing against it would test
+    /// something the server never does.
+    fn buffered_calls(text: &str) -> Vec<String> {
+        let mut parser = ToolCallParser::new(ToolCallFormat::Qwen25, schemas());
+        let (_text, calls) = parser.parse_complete(text);
+        if !calls.is_empty() {
+            return calls.into_iter().map(|c| c.name).collect();
+        }
+        parser
+            .parse_fallback_formats(text)
+            .1
+            .into_iter()
+            .map(|c| c.name)
+            .collect()
+    }
+
+    // The exact payload observed from ferrox with stream:true, which the
+    // buffered path recovered and the streamed path lost.
+    const XML_WRAPPED: &str =
+        "<xml>\n  {\"name\": \"time__current_time\", \"arguments\": {}}\n</xml>";
+
+    #[test]
+    fn streamed_xml_wrapper_now_yields_a_tool_call() {
+        assert_eq!(stream_calls(XML_WRAPPED, 8), vec!["time__current_time"]);
+    }
+
+    #[test]
+    fn streaming_and_buffered_agree_on_the_xml_wrapper() {
+        assert_eq!(stream_calls(XML_WRAPPED, 8), buffered_calls(XML_WRAPPED));
+    }
+
+    #[test]
+    fn agreement_holds_regardless_of_chunk_boundaries() {
+        // A marker split across chunks must not change the outcome.
+        for chunk in [1, 2, 3, 5, 13, 64] {
+            assert_eq!(
+                stream_calls(XML_WRAPPED, chunk),
+                vec!["time__current_time"],
+                "chunk size {chunk} changed the result"
+            );
+        }
+    }
+
+    #[test]
+    fn native_format_still_wins_when_present() {
+        let native = "<tool_call>\n{\"name\": \"current_time\", \"arguments\": {}}\n</tool_call>";
+        assert_eq!(stream_calls(native, 7), vec!["current_time"]);
+    }
+
+    // Falsification: these must NOT become calls on either path.
+    #[test]
+    fn streamed_prose_is_not_a_call() {
+        let prose = "The time is 3pm. Use a < b for comparison.";
+        assert!(stream_calls(prose, 5).is_empty());
+        assert!(buffered_calls(prose).is_empty());
+    }
+
+    #[test]
+    fn streamed_unoffered_tool_is_not_a_call() {
+        let bad = "<xml>{\"name\": \"rm_rf_everything\", \"arguments\": {}}</xml>";
+        assert!(stream_calls(bad, 6).is_empty(), "unoffered tool must stay prose");
+    }
+}
+
+#[cfg(test)]
+mod fenced_streaming_tests {
+    use super::*;
+
+    fn schemas() -> Vec<ToolSchema> {
+        vec![ToolSchema { name: "time__current_time".to_string(), parameters: None }]
+    }
+
+    const FENCED: &str =
+        "```json\n{\"name\": \"time__current_time\", \"arguments\": {}}\n```";
+
+    fn stream_calls(text: &str, chunk: usize) -> Vec<String> {
+        let mut p = ToolCallParser::new(ToolCallFormat::Qwen25, schemas());
+        let mut ev = Vec::new();
+        for c in text.chars().collect::<Vec<_>>().chunks(chunk) {
+            let s: String = c.iter().collect();
+            ev.extend(p.push(&s));
+        }
+        ev.extend(p.finish());
+        ev.into_iter()
+            .filter_map(|e| match e {
+                ToolCallEvent::CallStart { name, .. } => Some(name),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn streamed_fenced_json_yields_a_tool_call() {
+        for chunk in [1, 4, 9, 64] {
+            assert_eq!(
+                stream_calls(FENCED, chunk),
+                vec!["time__current_time"],
+                "chunk {chunk}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_fenced_code_sample_is_not_a_call() {
+        let sample = "Here is code:\n```python\nprint('hi')\n```";
+        assert!(stream_calls(sample, 5).is_empty());
     }
 }

@@ -179,6 +179,13 @@ fn extract_tool_calls(
     if native != ToolCallFormat::FencedJson {
         formats.push(ToolCallFormat::FencedJson);
     }
+    // After the fence: a quantized model that ignores every documented
+    // format still tends to reach for an element named after the tool
+    // itself (`<current_time arguments="{}"/>`). Every candidate is
+    // resolved through the offered-tool map, so this cannot invent a call.
+    if native != ToolCallFormat::ElementNamedTool {
+        formats.push(ToolCallFormat::ElementNamedTool);
+    }
     for format in formats {
         let parser = ToolCallParser::new(format, schemas.clone());
         let (content, calls) = parser.parse_complete(text);

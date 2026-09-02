@@ -8,6 +8,7 @@ mod bench_model;
 mod bench_suite;
 mod chat;
 mod download;
+mod hf;
 mod host_state;
 mod http;
 mod layer_divergence;
@@ -518,6 +519,12 @@ fn rewrite_llama_style_argv(args: Vec<String>) -> Vec<String> {
         .map(|arg| match arg.as_str() {
             "-ngl" => "--n-gpu-layers".into(),
             "-dev" => "--device".into(),
+            // llama.cpp's parser is hand-written, so `-hf` is ONE
+            // token. clap reads it as `-h` plus `f` and prints help,
+            // which is what `ferrox serve -hf repo:Q4_K_M` did: it
+            // looked like the flag did not exist.
+            "-hf" => "--hf-repo".into(),
+            "-hff" => "--hf-file".into(),
             _ => arg,
         })
         .collect();

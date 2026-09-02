@@ -16,7 +16,14 @@ use std::path::PathBuf;
 
 #[derive(clap::Args, Debug)]
 pub struct DownloadArgs {
-    /// Hugging Face repo id, for example `bartowski/Llama-3.2-3B-Instruct-GGUF`.
+    /// Hugging Face repo id, for example
+    /// `bartowski/Llama-3.2-3B-Instruct-GGUF`.
+    ///
+    /// Also accepts llama.cpp's `-hf` shape, `repo:QUANT`, so
+    /// `TheBloke/Mixtral-8x7B-Instruct-v0.1-GGUF:Q4_K_M` works. Before
+    /// that, the whole string was sent to the Hub as a repo id and came
+    /// back a bare `401`, which reads like an auth problem and is not
+    /// one.
     pub repo: String,
 
     /// File to fetch, or a glob. Defaults to the repo's single GGUF,
@@ -51,13 +58,22 @@ pub fn run(args: DownloadArgs) -> anyhow::Result<()> {
         let _ = std::io::stdout().flush();
     };
 
-    let path = ferrox_models::hub::fetch_to_dir_with_progress(
-        &args.repo,
-        &args.file,
-        &args.local_dir,
-        &mut draw,
-    )
-    .map_err(|e| anyhow::anyhow!("{e}"))?;
+    // `repo:QUANT` is resolved here rather than passed through, so the
+    // quant tag matches case-insensitively the way llama.cpp's does.
+    // An explicit `file` argument still wins: it is what the user typed.
+    let hf = ferrox_models::hub::HfRef::parse(&args.repo);
+    let (repo, file) = match (&hf.quant, args.file.as_str()) {
+        (Some(_), "*.gguf") => {
+            let resolved = hf.resolve().map_err(|e| anyhow::anyhow!("{e}"))?;
+            println!("resolved {} to {resolved}", args.repo);
+            (hf.repo.clone(), resolved)
+        }
+        _ => (hf.repo.clone(), args.file.clone()),
+    };
+
+    let path =
+        ferrox_models::hub::fetch_to_dir_with_progress(&repo, &file, &args.local_dir, &mut draw)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
 
     println!();
     let gb = std::fs::metadata(&path)

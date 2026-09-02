@@ -56,6 +56,7 @@ Same via explicit subcommand: `ferrox run -m …`.
 | Flag | Notes |
 |---|---|
 | `-m` / `--model` | GGUF path |
+| `-hf` / `--hf-repo` | Hugging Face repo, `user/repo[:QUANT]`. Fetched to the cache on first use. Mutually exclusive with `-m`, see below |
 | `-p` / `--prompt` | Prompt string |
 | `-f` / `--file` | Prompt from file |
 | `-n` / `--n-predict` | `-1` = fill remaining context |
@@ -468,8 +469,42 @@ Fetches a GGUF over HTTPS directly. No Python and no
 Rust engine could not fetch its own weights without a Python
 toolchain.
 
-`download` takes the same arguments as `hf download`, so a command
-copied off a model card runs unchanged:
+### `-hf`, llama.cpp's one-command form
+
+`-hf user/repo[:QUANT]` fetches on first use and serves or runs
+straight away, so nothing has to be downloaded by hand first:
+
+```bash
+ferrox serve -hf bartowski/Llama-3.2-3B-Instruct-GGUF:Q4_K_M
+ferrox -hf bartowski/Llama-3.2-3B-Instruct-GGUF:Q4_K_M -p "Hi" -n 64
+```
+
+The tag after the colon is a **quant label, not a git revision**, which
+is worth saying because `repo:thing` means a revision nearly everywhere
+else. It matches without regard to case, because repos spell it
+`Q4_K_M` and `q4_k_m` about equally often. A tag the repo does not
+publish is refused with the list of quants it does publish, since you
+cannot see a repo's file list from a command line.
+
+`-hf` is one token in llama.cpp's hand-written parser, and clap reads
+`-hf` as `-h` followed by `f`. Both ferrox binaries rewrite `-hf` and
+`-hff` before parsing, so the llama.cpp spelling works; `--hf-repo` is
+the same flag.
+
+Downloads land in the ferrox cache, not in `./models`: a model fetched
+by `-hf` is not part of the project directory you happen to be standing
+in. `FERROX_CACHE`, else `$XDG_CACHE_HOME/ferrox`, else
+`~/.cache/ferrox`, under `hub/<owner>__<repo>/`. A second run says
+`using cached` instead of fetching again, and an interrupted download
+resumes by byte range rather than starting over.
+
+`ferrox download` takes the same `repo:QUANT` shape and puts the file
+where you ask instead of in the cache. Before that it sent the whole
+string to the Hub as a repo id and returned a bare `401`, which reads
+like an auth problem and is not one.
+
+`download` otherwise takes the same arguments as `hf download`, so a
+command copied off a model card runs unchanged:
 
 ```bash
 ferrox download bartowski/Llama-3.2-3B-Instruct-GGUF \

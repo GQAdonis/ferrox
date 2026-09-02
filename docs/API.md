@@ -551,19 +551,31 @@ Request `{"model"?, "query", "documents": [...], "top_n"?,
 `pooling_type` is RANK, which is a classification head and not a pooling
 rule, and that refusal is what sends a caller here.
 
-The pair is encoded as `[CLS] query [SEP] document [SEP]`. Both halves
-carry segment id 0, because llama.cpp hardcodes token types to zero;
-HuggingFace gives the second half segment 1, so a ferrox score can
-differ from a `transformers` reference by the second segment's type
-embedding. Tracked as
-[#44](https://github.com/antonellof/ferrox/issues/44).
+The pair is encoded as `[CLS] query [SEP] document [SEP]`, with the
+query in segment 0 and the document in segment 1.
 
-**End-to-end ordering is unverified.** The route has never run against a
-real reranker checkpoint, because there is none on the development host.
-Its parts are tested and CI is green; neither is evidence that it ranks
-correctly.
-[#43](https://github.com/antonellof/ferrox/issues/43) names the
-checkpoint that would settle it.
+**This deliberately differs from llama.cpp**, which hardcodes token
+types to zero, and it is one of the few places ferrox does. The reason
+is measured rather than preferred: segment ids do not merely shift the
+scores, THEY REORDER THE RESULTS. On "How many people live in Berlin?"
+against five documents, the one carrying the population figure ranks
+first with segments 0/1 and FIFTH with segments all zero. Matching
+HuggingFace is what makes the ranking right, so a reranker checkpoint
+whose token-type table has fewer than two rows is refused at load.
+
+Verified end to end against `ms-marco-MiniLM-L6-v2`, with scores
+matching an independent NumPy transcription of
+`BertForSequenceClassification` to 4e-3 and the order matching the
+HuggingFace reference on four query sets.
+
+One known difference remains, and it is not ferrox's to fix in the
+reader: llama.cpp's converter deletes `bert.pooler.dense`, so no
+`BertForSequenceClassification` GGUF carries it and the head runs as
+`classifier(cls)` rather than `classifier(tanh(pooler(cls)))`. That
+changes the score SCALE, roughly plus or minus 0.2 where the reference
+spans plus or minus 11, and not which document wins. A client
+thresholding on an absolute score gets a range that never fires. See
+[#82](https://github.com/antonellof/ferrox/issues/82).
 
 ## Errors that retrying will not fix
 

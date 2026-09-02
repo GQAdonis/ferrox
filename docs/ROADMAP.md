@@ -44,6 +44,11 @@ fixture-away / one-match-arm / new-code / unknown.
 - **Lazy grammars**, so `tool_choice: "required"` and a named
   `tool_choice` are enforced rather than asked for in the prompt
 - **`pattern` in the JSON-schema-to-GBNF converter**
+- **`response_format: json_schema`** is served rather than refused, and
+  the second decision site that answered it with "only json_object is
+  supported" is deleted. A forced `tool_choice` beside a schema is now
+  refused against the *resolved* grammar: the check asked `self.grammar`
+  and a schema would have walked past it
 - **The GGUF parser is bounded against a hostile file** (#24, #25, #26):
   every count, string length, array length and nesting depth is checked
   against what the file can actually contain, rather than against a
@@ -118,12 +123,12 @@ Beyond closing the measured gaps.
    dp4a/MMQ integer path and the other five quant kinds, is the work.
 5. **Tool calling and full OpenAI API compatibility.** See
    [`API.md`](API.md). GBNF grammars and the lazy grammars behind a
-   forced `tool_choice` both ship. What is left is
-   `response_format: json_schema` (a 501 today, though the
-   schema-to-GBNF converter it needs already exists, and is what a
-   forced `tool_choice` compiles its arguments with), a forced
+   forced `tool_choice` both ship, and so does
+   `response_format: json_schema`, through the same converter a forced
+   `tool_choice` compiles its arguments with. What is left is a forced
    `tool_choice` on the eight wire formats that are not JSON-object
-   shaped, and MCP invocation.
+   shaped ([#29](https://github.com/antonellof/ferrox/issues/29)), and
+   MCP invocation.
 6. **Docker images**, so evaluating any of this stops requiring a Rust
    toolchain.
 
@@ -152,10 +157,12 @@ Beyond closing the measured gaps.
   format. What is left here is those eight, argument deltas for the six
   JSON-payload formats, and streamed tool calls on the
   continuous-batching path
-- JSON-schema constrained decoding. The GBNF engine and the `grammar`
-  request field shipped on 2026-09-01, on chat, completions and all
-  three decode paths; `response_format: json_schema` still answers 501
-  naming the schema-to-grammar step
+- JSON-schema constrained decoding, **done**. The GBNF engine and the
+  `grammar` request field shipped on 2026-09-01, on chat, completions
+  and all three decode paths; `response_format: json_schema` and
+  llama.cpp's bare `json_schema` field followed on 2026-09-02, compiled
+  by the same converter and decided at the one site that resolves every
+  spelling of "constrain the output"
 - MCP tool invocation. Anthropic streaming and tools now ship
 - The rest of the OpenAI API surface (see [`API.md`](API.md))
 - Docker images (CPU, Metal and CUDA variants)

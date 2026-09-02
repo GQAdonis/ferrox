@@ -68,6 +68,9 @@ Same via explicit subcommand: `ferrox run -m …`.
 | `--top-p` | Nucleus sampling. Default `0.95`, llama.cpp's |
 | `--min-p` | Drop every candidate less than this fraction as likely as the most likely one. `0.0` = off. Default `0.05`, llama.cpp's (`common/common.h:231`) |
 | `--repeat-penalty` | `1.0` = off. Default `1.1`; llama.cpp defaults this one to `1.0` |
+| `--presence-penalty` | Penalise a token for having appeared at all. `0.0` = off, llama.cpp's default. The engine and the HTTP API always supported this; the CLI used to hardcode it to zero |
+| `--frequency-penalty` | Penalise a token in proportion to how often it has appeared. `0.0` = off |
+| `--hf-file` | Exact filename inside `--hf-repo`, llama.cpp's `-hff`. Skips quant resolution entirely |
 | `--repeat-last-n` | How many recent tokens the repetition / presence / frequency penalties consider. `0` = penalties off. Default `64`, llama.cpp's (`common/common.h:238`) |
 | `-s` / `--seed` | `-1` = time-based |
 | `--grammar` | Constrain generation to a GBNF grammar, llama.cpp's `--grammar` |
@@ -560,6 +563,33 @@ Two ways to start the same server. `ferrox serve` is a subcommand of the
 main binary and needs the optional `serve` feature at build time.
 `ferrox-server` is that same server as its own executable, and both
 parse identical arguments through the same code.
+
+### Server flags, and llama.cpp's spellings
+
+`llama-server` commands mostly run unchanged:
+
+| Flag | Notes |
+|---|---|
+| `-m` / `--model` | GGUF path or Kimi directory |
+| `-hf` / `--hf-repo`, `--hf-file` | Fetch from the Hub, see above |
+| `-c` / `--ctx-size` | Positions any one request may ask for. Sets `FERROX_CB_MAX_CONTEXT`. Unset means the ceiling is derived at load from weights and per-token KV against the device budget, capped at the model's trained context |
+| `--api-key`, `--api-key-file` | Require `Authorization: Bearer`. Also gates `/admin`. Prefer the file form on a shared host: an argument is visible in `ps` to every user on the machine. An empty key file is refused rather than leaving every route open |
+| `--alias` | What the model is called in `/v1/models` and in every response's `model` field |
+| `--ctk` / `--cache-type-k` | KV dtype. **Metal only**, the CPU and CUDA cache is the host `Vec<f32>` |
+| `--host`, `--port` | `--port 0` asks the kernel for a free one and announces it on stdout |
+| `-t`, `-ngl`, `-dev` | Threads, GPU layers, device |
+| `-cb` / `--cont-batching`, `-np` / `--parallel` | Continuous batching and its sequence cap |
+| `--jinja` | Accepted, and already the default: ferrox always compiles and evaluates the GGUF's own `tokenizer.chat_template` |
+| `--no-warmup` | Accepted; there is no warm-up pass to skip |
+| `--flash-attn` / `-fa` | Accepted. Fused attention is a backend property here, not a per-run switch |
+
+Two are **refused by name** rather than ignored, because ignoring them
+would change the answer without saying so:
+
+- `--no-jinja`. There is no template-free mode to fall back to, and a
+  prompt framed by a guess instead of the checkpoint's own template
+  reads as a model-quality problem rather than a flag that was dropped.
+- `--flash-attn off`. Set `FERROX_METAL_ATTN=0` or `--device cpu`.
 
 `serve` is on by default, so a stock `cargo install ferrox-cli` has it:
 

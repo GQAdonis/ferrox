@@ -139,6 +139,66 @@ pub struct ServerArgs {
     )]
     hf_repo: Option<String>,
 
+    /// Exact filename inside `--hf-repo`, llama.cpp's `-hff`.
+    ///
+    /// For a repo whose quant labels do not disambiguate, or a file
+    /// whose name carries no quant at all.
+    #[arg(long = "hf-file", value_name = "FILE", requires = "hf_repo")]
+    hf_file: Option<String>,
+
+    /// Context size, llama.cpp's `-c`. Sets `FERROX_CB_MAX_CONTEXT`.
+    ///
+    /// Unset means the ceiling is derived at load from the weights and
+    /// the per-token KV against the device budget, capped at the
+    /// model's trained context, which is usually what you want.
+    #[arg(short = 'c', long = "ctx-size", value_name = "N")]
+    ctx_size: Option<usize>,
+
+    /// Require `Authorization: Bearer <key>`, llama.cpp's `--api-key`.
+    /// Sets `FERROX_API_KEY`, which also gates `/admin`.
+    #[arg(long = "api-key", value_name = "KEY")]
+    api_key: Option<String>,
+
+    /// Read the API key from a file, llama.cpp's `--api-key-file`.
+    ///
+    /// Preferred over `--api-key` on a shared host: an argument is
+    /// visible in `ps` to every user on the machine.
+    #[arg(long = "api-key-file", value_name = "PATH", conflicts_with = "api_key")]
+    api_key_file: Option<std::path::PathBuf>,
+
+    /// Name this model answers to in `/v1/models` and in responses,
+    /// llama.cpp's `--alias`. Sets `FERROX_MODEL_NAME`.
+    #[arg(long = "alias", visible_alias = "model-alias", value_name = "NAME")]
+    alias: Option<String>,
+
+    /// KV cache dtype, llama.cpp's `--cache-type-k`. Metal only; the
+    /// CPU and CUDA KV cache is the host `Vec<f32>`.
+    #[arg(long = "ctk", visible_alias = "cache-type-k", value_name = "TYPE")]
+    ctk: Option<String>,
+
+    /// Accepted and already the default: ferrox always compiles and
+    /// evaluates the GGUF's own `tokenizer.chat_template`. llama.cpp
+    /// needs `--jinja` to do that, so a command copied from there
+    /// carries it, and dying on an unknown flag would be a worse answer
+    /// than saying "yes, always".
+    #[arg(long = "jinja", default_value_t = false)]
+    jinja: bool,
+
+    /// Refused rather than ignored: ferrox has no
+    /// template-free/sniffing mode to fall back to. See `--jinja`.
+    #[arg(long = "no-jinja", default_value_t = false)]
+    no_jinja: bool,
+
+    /// Accepted; ferrox does no warm-up pass, so there is none to skip.
+    #[arg(long = "no-warmup", default_value_t = false)]
+    no_warmup: bool,
+
+    /// Accepted. Fused attention is a backend decision here, not a
+    /// request-time one: it is on wherever the Metal kernels support
+    /// the shape (`FERROX_METAL_ATTN`).
+    #[arg(long = "flash-attn", visible_alias = "fa", value_name = "MODE", num_args = 0..=1, default_missing_value = "auto")]
+    flash_attn: Option<String>,
+
     /// IP address to listen on.
     #[arg(long, value_name = "HOST")]
     host: Option<IpAddr>,
@@ -359,8 +419,11 @@ fn cli_bind_addr(args: &ServerArgs, env_addr: Option<&str>) -> Option<String> {
 /// Progress goes to STDERR, not stdout: stdout carries the
 /// `ferrox.server.ready` line a supervising process parses, and a
 /// progress bar in the middle of it would break that contract.
-fn resolve_hf_repo(spec: &str) -> anyhow::Result<String> {
-    let hf = ferrox_models::hub::HfRef::parse(spec);
+fn resolve_hf_repo(spec: &str, file: Option<&str>) -> anyhow::Result<String> {
+    let mut hf = ferrox_models::hub::HfRef::parse(spec);
+    if let Some(f) = file {
+        hf.file = Some(f.to_string());
+    }
     eprintln!(
         "ferrox: resolving {} on the Hub{}",
         hf.repo,
@@ -406,9 +469,63 @@ fn apply_cli_overrides(args: &ServerArgs) -> anyhow::Result<()> {
         unsafe { std::env::set_var("FERROX_MODEL_PATH", model) };
     }
     if let Some(spec) = &args.hf_repo {
-        let path = resolve_hf_repo(spec)?;
+        let path = resolve_hf_repo(spec, args.hf_file.as_deref())?;
         // SAFETY: called before the runtime starts worker threads.
         unsafe { std::env::set_var("FERROX_MODEL_PATH", &path) };
+    }
+    if let Some(n) = args.ctx_size {
+        if n == 0 {
+            anyhow::bail!("--ctx-size must be greater than zero");
+        }
+        // SAFETY: called before the runtime starts worker threads.
+        unsafe { std::env::set_var("FERROX_CB_MAX_CONTEXT", n.to_string()) };
+    }
+    if let Some(key) = &args.api_key {
+        // SAFETY: called before the runtime starts worker threads.
+        unsafe { std::env::set_var("FERROX_API_KEY", key) };
+    }
+    if let Some(path) = &args.api_key_file {
+        let key = std::fs::read_to_string(path)
+            .map_err(|e| anyhow::anyhow!("reading --api-key-file {}: {e}", path.display()))?;
+        let key = key.trim();
+        if key.is_empty() {
+            anyhow::bail!(
+                "--api-key-file {} is empty: an empty key would leave every route open, \
+                 which is the opposite of what passing the flag asked for",
+                path.display()
+            );
+        }
+        // SAFETY: called before the runtime starts worker threads.
+        unsafe { std::env::set_var("FERROX_API_KEY", key) };
+    }
+    if let Some(alias) = &args.alias {
+        // SAFETY: called before the runtime starts worker threads.
+        unsafe { std::env::set_var("FERROX_MODEL_NAME", alias) };
+    }
+    if let Some(ctk) = &args.ctk {
+        // SAFETY: called before the runtime starts worker threads.
+        unsafe { std::env::set_var("FERROX_CTK", ctk.trim()) };
+    }
+    // Refused by NAME rather than ignored. A prompt framed by a
+    // hand-written guess instead of the checkpoint's own template is
+    // the kind of wrong answer that reads as a model quality problem,
+    // so "ferrox cannot do that" is the honest reply.
+    if args.no_jinja {
+        anyhow::bail!(
+            "--no-jinja: ferrox has no template-free mode. It compiles and evaluates the GGUF's \
+             own tokenizer.chat_template, which is what llama.cpp's --jinja turns on, and there \
+             is no sniffing fallback to switch to. Use --no-cnv on `ferrox run` for a raw \
+             completion"
+        );
+    }
+    if let Some(mode) = &args.flash_attn {
+        let mode = mode.trim().to_ascii_lowercase();
+        if mode == "off" || mode == "disabled" || mode == "0" {
+            anyhow::bail!(
+                "--flash-attn off: fused attention is a backend property here, not a per-run \
+                 switch. Set FERROX_METAL_ATTN=0 to take the unfused Metal path, or --device cpu"
+            );
+        }
     }
 
     if let Some(addr) = cli_bind_addr(args, std::env::var("FERROX_ADDR").ok().as_deref()) {

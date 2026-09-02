@@ -10,8 +10,11 @@
 ///
 /// Progress goes to stderr so a caller redirecting stdout gets the
 /// model's output and not a progress bar.
-pub fn resolve(spec: &str) -> anyhow::Result<String> {
-    let hf = ferrox_models::hub::HfRef::parse(spec);
+pub fn resolve(spec: &str, file: Option<&str>) -> anyhow::Result<String> {
+    let mut hf = ferrox_models::hub::HfRef::parse(spec);
+    if let Some(f) = file {
+        hf.file = Some(f.to_string());
+    }
     eprintln!(
         "ferrox: resolving {} on the Hub{}",
         hf.repo,

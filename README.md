@@ -105,7 +105,8 @@ in the CLI or the server.
 
 ```bash
 # 0. Or skip step 1 entirely: -hf is llama.cpp's, and fetches on first use.
-ferrox serve -hf bartowski/Llama-3.2-3B-Instruct-GGUF:Q4_K_M
+#    Most llama-server flags work as spelled: -c, --api-key, --alias, --jinja.
+ferrox serve -hf bartowski/Llama-3.2-3B-Instruct-GGUF:Q4_K_M -c 8192 --alias local
 
 # 1. Get a model. No Python, no huggingface_hub: same syntax as `hf download`.
 #    The `:QUANT` tag works here too and picks the file for you.

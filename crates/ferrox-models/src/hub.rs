@@ -133,6 +133,10 @@ pub fn cache_dir() -> std::path::PathBuf {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HfRef {
     pub repo: String,
+    /// An exact filename, llama.cpp's `-hff`. When set it wins over
+    /// `quant`: the user named the file, so there is nothing left to
+    /// resolve and nothing to guess.
+    pub file: Option<String>,
     /// The quant label, upper-cased for reporting. Matching is
     /// case-insensitive: repos spell it `Q4_K_M` and `q4_k_m` about
     /// equally often, and a case-sensitive match would 404 on half of
@@ -147,6 +151,7 @@ impl HfRef {
         match spec.rsplit_once(':') {
             Some((repo, quant)) if !repo.is_empty() && !quant.is_empty() => HfRef {
                 repo: repo.to_string(),
+                file: None,
                 quant: Some(quant.to_ascii_uppercase()),
             },
             // A TRAILING colon is a typo, not a tag, and the colon is
@@ -155,10 +160,12 @@ impl HfRef {
             // repo the user can see exists.
             Some((repo, _)) if !repo.is_empty() => HfRef {
                 repo: repo.to_string(),
+                file: None,
                 quant: None,
             },
             _ => HfRef {
                 repo: spec.to_string(),
+                file: None,
                 quant: None,
             },
         }
@@ -173,8 +180,15 @@ impl HfRef {
     }
 
     /// Resolves to one filename in the repo.
+    ///
+    /// An explicit `file` short-circuits the Hub listing entirely: the
+    /// user named it, so asking the API which files exist would only
+    /// add a way to fail.
     pub fn resolve(&self) -> Result<String, String> {
-        resolve_glob_ci(&self.repo, &self.pattern())
+        match &self.file {
+            Some(f) => Ok(f.clone()),
+            None => resolve_glob_ci(&self.repo, &self.pattern()),
+        }
     }
 }
 
@@ -571,5 +585,15 @@ mod hf_ref_tests {
             !dir.as_os_str().is_empty(),
             "a cache dir must always resolve, even with no HOME"
         );
+    }
+
+    /// An explicit `--hf-file` wins over the quant tag and skips the
+    /// Hub listing entirely: the user named the file, so asking the API
+    /// which files exist only adds a way to fail.
+    #[test]
+    fn an_explicit_file_short_circuits_resolution() {
+        let mut r = HfRef::parse("owner/repo:Q4_K_M");
+        r.file = Some("exact-name.gguf".into());
+        assert_eq!(r.resolve().unwrap(), "exact-name.gguf");
     }
 }

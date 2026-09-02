@@ -17,6 +17,7 @@ use std::sync::Mutex;
 
 use ferrox_core::cache::{PageGroup, SharedPagedKv};
 
+use crate::generate::acquire_paged_caches;
 use crate::policy::radix::RadixCache;
 
 use super::super::row::{Job, RowKv, Rows};
@@ -191,6 +192,141 @@ fn a_second_batched_request_adopts_the_pages_the_first_published() {
             store.group_refs(PageGroup(g)),
             1,
             "the row's hold goes back on Drop; the tree's survives"
+        );
+    }
+}
+
+/// A cache HIT must not re-run the prompt on top of the prefix it hit.
+///
+/// The failure this pins down (issue #37): the batched prefill started
+/// at token 0 whatever its lease had already adopted, so the second of
+/// two identical requests wrote its eight prompt tokens into rows
+/// `4..11` of a cache that already held `0..3`, while handing the model
+/// RoPE positions `0..7`. The KV ended `prompt + cached` long instead of
+/// `prompt` long, decode then pushed past the block table the lease
+/// reserved (a per-request page leak, and `PagedStoreExhausted` into an
+/// `.expect` on a tight pool), and the answer was simply different.
+///
+/// `seq_len` is the assertion because it is the one number that cannot
+/// be right by accident: it is where `push` writes, so a cache that is
+/// `cached_len` too long has put every prompt token in the wrong row.
+/// The existing tests here assert page REFCOUNTS, which the bug left
+/// perfectly correct.
+#[test]
+fn a_batched_prefill_over_an_adopted_prefix_ends_exactly_at_the_prompt_length() {
+    let decoder = tiny_decoder();
+    let (config, _store, _radix) = paged_with_radix(&decoder, 64);
+    let prompt = vec![1usize, 2, 3, 4, 5, 6, 7, 8];
+
+    let (first, _rx1) = admit_prefilled(&decoder, &config, prompt.clone(), 4).expect("admitted");
+    finish_row(first);
+
+    let (job, _rx2) = paged_job(prompt.clone(), 4);
+    let mut prefill = accept(&decoder, job, /* chunk_size = */ 3, Some(&config)).expect("admitted");
+
+    // The starting cursor is the adopted prefix, not zero.
+    let adopted = prefill.state.tokens_processed();
+    assert_eq!(
+        adopted, BLOCK,
+        "the second request must start where the prefix it adopted ends"
+    );
+    assert_eq!(prefill.state.tokens_remaining(), prompt.len() - BLOCK);
+
+    while !prefill.state.step_chunk() {}
+    let mut slot = prefill.into_slot();
+    assert_eq!(
+        slot.pos,
+        prompt.len(),
+        "the first generated token sits at the end of the prompt"
+    );
+    let RowKv::Paged(lease) = &mut slot.kv else {
+        panic!("a paged config must produce a paged row");
+    };
+    for (layer, cache) in lease.caches_mut().iter().enumerate() {
+        assert_eq!(
+            cache.seq_len(),
+            prompt.len(),
+            "layer {layer}: a warm prefill left {} KV rows for a {}-token \
+             prompt, so it re-ran the prompt on top of the adopted prefix",
+            cache.seq_len(),
+            prompt.len()
+        );
+    }
+}
+
+/// A warm request must produce the SAME logits as a cold one.
+///
+/// The user-visible half of issue #37: same model, same body, a
+/// different answer, 200 OK, no log line. Bit-identical is the right
+/// bar here -- both runs go through the same paged kernel over the same
+/// page contents, so the only thing that can differ is which row a
+/// token was written into and which position it was told it had.
+#[test]
+fn a_warm_batched_request_produces_the_same_logits_as_a_cold_one() {
+    let decoder = tiny_decoder();
+    let (config, _store, _radix) = paged_with_radix(&decoder, 64);
+    let prompt = vec![1usize, 2, 3, 4, 5, 6, 7, 8];
+
+    let cold = {
+        let (job, _rx) = paged_job(prompt.clone(), 4);
+        let mut prefill = accept(&decoder, job, 3, Some(&config)).expect("admitted");
+        assert_eq!(
+            prefill.state.tokens_processed(),
+            0,
+            "the first request has nothing to adopt"
+        );
+        while !prefill.state.step_chunk() {}
+        let (_kv, logits, _pos, _ids) = prefill.state.into_decode_start();
+        logits
+    };
+    // Publish, so the second request has something to adopt.
+    let (first, _rx1) = admit_prefilled(&decoder, &config, prompt.clone(), 4).expect("admitted");
+    finish_row(first);
+
+    let (job, _rx2) = paged_job(prompt.clone(), 4);
+    let mut prefill = accept(&decoder, job, 3, Some(&config)).expect("admitted");
+    assert!(
+        prefill.state.tokens_processed() > 0,
+        "this test proves nothing unless the second request adopted a prefix"
+    );
+    while !prefill.state.step_chunk() {}
+    let (_kv, warm, _pos, _ids) = prefill.state.into_decode_start();
+
+    assert_eq!(
+        warm, cold,
+        "a prefix-cache hit changed the answer: the warm request's logits \
+         differ from the cold request's for the same prompt"
+    );
+}
+
+/// The lease's own count of adopted positions and the KV rows it was
+/// seeded with must be the same number.
+///
+/// Two structures that have to agree, walked against each other. The
+/// batched prefill reads the cursor off the KV and the private generate
+/// loop derives it from `PagedLease::adopted_positions`; if
+/// `acquire_paged_caches` ever seeds one without the other, this goes
+/// red here rather than as a wrong answer in production.
+#[test]
+fn the_leases_adopted_count_and_its_seeded_kv_rows_agree() {
+    let decoder = tiny_decoder();
+    let (config, _store, _radix) = paged_with_radix(&decoder, 64);
+    let prompt = vec![1usize, 2, 3, 4, 5, 6, 7, 8];
+
+    let (first, _rx1) = admit_prefilled(&decoder, &config, prompt.clone(), 4).expect("admitted");
+    finish_row(first);
+
+    let mut lease = acquire_paged_caches(&decoder, &config, &prompt, prompt.len() + 4)
+        .expect("the store has pages to spare");
+    let claimed = lease.adopted_positions(BLOCK);
+    assert!(claimed > 0, "the second request must adopt something");
+    for (layer, cache) in lease.caches_mut().iter().enumerate() {
+        assert_eq!(
+            cache.seq_len(),
+            claimed,
+            "layer {layer}: the lease says {claimed} positions were adopted \
+             but its KV was seeded with {} rows",
+            cache.seq_len()
         );
     }
 }

@@ -605,7 +605,17 @@ impl PagedKvCache {
     ///
     /// This is how a sequence starts life on top of a cached prefix:
     /// the blocks are somebody else's, already full, and this sequence
-    /// appends past them. `seq_len` MUST be a whole number of blocks,
+    /// appends past them.
+    ///
+    /// The `seq_len` installed here is therefore also the POSITION the
+    /// caller's next forward pass must run at, and the caller has no
+    /// second source for that number: [`Self::push`] writes at `seq_len`
+    /// and ignores whatever position its caller believes it is at. A
+    /// prefill that started from zero over an adopted prefix put the
+    /// prompt in the rows *after* the prefix while carrying positions
+    /// `0..n`, which is a wrong answer served with a 200.
+    ///
+    /// `seq_len` MUST be a whole number of blocks,
     /// because the first append writes at `seq_len` and a shared block
     /// must never be written -- another sequence is attending over it.
     /// A ragged length would put that write inside the last shared

@@ -37,6 +37,9 @@ pub struct PrefillState {
     /// forward pass is still required to produce the logits the first
     /// sampled token comes from.
     tokens: Vec<usize>,
+    /// How far through `tokens` this prefill has got. Never assigned a
+    /// literal: it is seeded from, and re-checked against,
+    /// [`RowKv::positions_written`] -- see [`PrefillState::over`].
     tokens_processed: usize,
     logits: Vec<f32>,
     chunk_size: usize,
@@ -44,7 +47,6 @@ pub struct PrefillState {
 
 impl PrefillState {
     pub fn new(decoder: Arc<Decoder>, prompt_tokens: &[usize], chunk_size: usize) -> Self {
-        assert!(chunk_size > 0, "prefill chunk size must be positive");
         let kv = RowKv::Contiguous(
             decoder
                 .layers
@@ -52,19 +54,7 @@ impl PrefillState {
                 .map(|_| KvCache::new(decoder.config.n_kv_heads, decoder.config.head_dim))
                 .collect(),
         );
-        let tokens = if prompt_tokens.is_empty() {
-            vec![0]
-        } else {
-            prompt_tokens.to_vec()
-        };
-        PrefillState {
-            decoder,
-            kv,
-            tokens,
-            tokens_processed: 0,
-            logits: Vec::new(),
-            chunk_size,
-        }
+        PrefillState::over(decoder, kv, prompt_tokens, chunk_size)
     }
 
     /// A prefill whose KV lives in a shared paged store, with its
@@ -73,11 +63,35 @@ impl PrefillState {
     /// Reserved for `prompt + max_tokens` at admission for the same
     /// reason the private path does it: the decode step has nowhere to
     /// report a store that ran dry mid-answer.
+    ///
+    /// The lease may arrive with a radix prefix already installed. That
+    /// is not this constructor's business to know: [`Self::over`] reads
+    /// the starting position off the KV, so a pre-seeded lease and a
+    /// cold one take the same path.
     pub fn new_paged(
         decoder: Arc<Decoder>,
         prompt_tokens: &[usize],
         chunk_size: usize,
         lease: PagedLease,
+    ) -> Self {
+        PrefillState::over(decoder, RowKv::Paged(lease), prompt_tokens, chunk_size)
+    }
+
+    /// The ONE place a prefill's starting position is decided, for
+    /// every kind of KV a row can have.
+    ///
+    /// It is read off the KV rather than assumed, because the KV is the
+    /// only thing that knows: `push` writes at its cache's `seq_len`
+    /// whatever position the caller names. A second constructor that
+    /// wrote `tokens_processed: 0` beside this one is exactly how issue
+    /// #37 happened -- a paged lease that had adopted a cached prefix
+    /// re-ran the whole prompt on top of it -- so there is no second
+    /// constructor, and no literal to get wrong.
+    fn over(
+        decoder: Arc<Decoder>,
+        mut kv: RowKv,
+        prompt_tokens: &[usize],
+        chunk_size: usize,
     ) -> Self {
         assert!(chunk_size > 0, "prefill chunk size must be positive");
         let tokens = if prompt_tokens.is_empty() {
@@ -85,17 +99,33 @@ impl PrefillState {
         } else {
             prompt_tokens.to_vec()
         };
+        let tokens_processed = kv.positions_written();
+        // `acquire_paged_caches` backs the adopted prefix off by a page
+        // so that at least one token is left to run: a prefill with
+        // nothing to run produces no logits, and the first sampled
+        // token has nowhere to come from. This is the assertion that
+        // holds that back-off and this loop to the same story.
+        debug_assert!(
+            tokens_processed < tokens.len(),
+            "a prefill must have at least one token left to run, \
+             got {tokens_processed} already done of {} -- the adopted \
+             prefix was not backed off",
+            tokens.len()
+        );
         PrefillState {
             decoder,
-            kv: RowKv::Paged(lease),
+            kv,
             tokens,
-            tokens_processed: 0,
+            tokens_processed,
             logits: Vec::new(),
             chunk_size,
         }
     }
 
-    /// Prompt tokens already through the model.
+    /// Prompt positions already in this row's KV. Includes any prefix
+    /// the lease adopted from the radix tree: those positions are
+    /// computed and resident, they were just computed by an earlier
+    /// request.
     pub fn tokens_processed(&self) -> usize {
         self.tokens_processed
     }
@@ -113,25 +143,35 @@ impl PrefillState {
     /// once the whole prompt has been processed. Calling it again after
     /// that is a no-op that still returns `true`.
     ///
-    /// The KV position of each token is its index in the prompt, so
-    /// resuming across chunk boundaries is exactly the sequential
-    /// `forward_token` loop it replaces, split at different points.
+    /// The KV position of each token is the row the KV will write it
+    /// into, so resuming across chunk boundaries is exactly the
+    /// sequential `forward_token` loop it replaces, split at different
+    /// points.
     pub fn step_chunk(&mut self) -> bool {
         let end = (self.tokens_processed + self.chunk_size).min(self.tokens.len());
-        for pos in self.tokens_processed..end {
+        while self.tokens_processed < end {
+            // The position comes from the KV every step, never from a
+            // counter kept alongside it. `push` writes at `seq_len` and
+            // discards this argument, so any other value pairs a row
+            // with a RoPE angle that does not belong to it -- fluent,
+            // wrong, and silent.
+            let pos = self.kv.positions_written();
+            debug_assert_eq!(
+                pos, self.tokens_processed,
+                "the KV write cursor and the prompt cursor diverged"
+            );
+            let token = self.tokens[self.tokens_processed];
             self.logits = match &mut self.kv {
-                RowKv::Contiguous(caches) => {
-                    self.decoder.forward_token(self.tokens[pos], pos, caches)
-                }
+                RowKv::Contiguous(caches) => self.decoder.forward_token(token, pos, caches),
                 RowKv::Paged(lease) => {
                     let store = Arc::clone(lease.store());
                     self.decoder
-                        .forward_token_paged(self.tokens[pos], pos, lease.caches_mut(), &store)
+                        .forward_token_paged(token, pos, lease.caches_mut(), &store)
                         .expect("the row's pages were reserved at admission")
                 }
             };
+            self.tokens_processed += 1;
         }
-        self.tokens_processed = end;
         self.is_done()
     }
 

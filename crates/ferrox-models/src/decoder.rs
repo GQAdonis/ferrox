@@ -15,6 +15,7 @@
 mod attn_block;
 mod ffn_act;
 mod lm_head;
+mod qk_norm;
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -25,7 +26,7 @@ use ferrox_core::attention::{
     causal_gqa_attention_softcap,
 };
 use ferrox_core::cache::{KvCache, PagedKvCache, PagedStoreExhausted, SharedPagedKv};
-use ferrox_core::matmul::{rms_norm, rms_norm_per_head};
+use ferrox_core::matmul::rms_norm;
 #[cfg(feature = "metal")]
 use lm_head::FoldedLmHead;
 use lm_head::Logits;
@@ -407,6 +408,13 @@ pub struct Decoder {
     /// refused at call time — neither implements sinks, and answering
     /// with a different distribution is the failure this replaces.
     pub gpt_oss: Option<GptOssWeights>,
+    /// Does this architecture norm Q and K AFTER RoPE rather than
+    /// before? `maincoder` and `hunyuan-moe` do; see [`qk_norm`] for
+    /// the llama.cpp lines and for why no GGUF key can answer this.
+    /// Set by the loader from the architecture string; refused by
+    /// `layer_supports_metal_attn`, because no fused kernel can express
+    /// the order.
+    pub qk_norm_after_rope: bool,
     /// Per-layer Metal-resident KV for fused decode/prefill attention
     /// (`FERROX_METAL_ATTN`). Lazily allocated. After
     /// [`ferrox_metal::attn::launch_decode_dense_stack`], Metal KV is
@@ -668,6 +676,9 @@ impl Decoder {
             gpu_vram_budget_bytes: None,
             // Synthetic-weights constructor: no checkpoint, no gpt-oss.
             gpt_oss: None,
+            // Synthetic-weights constructor: the preset families it
+            // serves all norm before RoPE.
+            qk_norm_after_rope: false,
             #[cfg(feature = "metal")]
             metal_attn_kv: std::sync::Mutex::new(None),
             execution_plan,
@@ -772,17 +783,6 @@ impl Decoder {
         }
     }
 
-    /// Applies Q/K RMSNorm according to [`ModelConfig::qk_norm_style`].
-    fn apply_qk_norm(&self, x: &[f32], weight: &[f32]) -> Vec<f32> {
-        use crate::capability::QkNormStyle;
-        match self.config.qk_norm_style {
-            QkNormStyle::WholeVector => rms_norm(x, weight, self.config.rms_norm_eps),
-            QkNormStyle::PerHead => {
-                rms_norm_per_head(x, weight, self.config.head_dim, self.config.rms_norm_eps)
-            }
-        }
-    }
-
     /// Builds a Metal [`MatvecLaunch`] for a quantized matrix, or `None`
     /// if the storage/kind cannot run on Metal.
     #[cfg(feature = "metal")]
@@ -876,6 +876,16 @@ impl Decoder {
         if !qk_norm_ok(layer.attn.q_norm.as_ref(), q_len)
             || !qk_norm_ok(layer.attn.k_norm.as_ref(), k_len)
         {
+            return false;
+        }
+        // NOT the QK-norm ORDER. `AttnExtras` hands the norm weights to
+        // kernels that apply them before their own RoPE, so a
+        // `maincoder` / `hunyuan-moe` layer would be normed on the wrong
+        // side of the rotation by every fused launch while the host
+        // bodies got it right — the same weights answering differently
+        // depending on which backend served the token. Same fence, same
+        // reason, as `attention_scale` below.
+        if self.qk_norm_after_rope {
             return false;
         }
         // Softcaps: final logit softcap is applied on the host after
@@ -3983,18 +3993,7 @@ impl Decoder {
                 }
             }
 
-            if let Some(q_norm) = &layer.attn.q_norm {
-                for row in q_batch.chunks_mut(q_width) {
-                    let normed = self.apply_qk_norm(row, q_norm);
-                    row.copy_from_slice(&normed);
-                }
-            }
-            if let Some(k_norm) = &layer.attn.k_norm {
-                for row in k_batch.chunks_mut(kv_width) {
-                    let normed = self.apply_qk_norm(row, k_norm);
-                    row.copy_from_slice(&normed);
-                }
-            }
+            self.apply_qk_norms_pre_rope(layer, &mut q_batch, &mut k_batch, q_width, kv_width);
             // Host-side `mscale`, applied before either backend ropes.
             // The Metal branch below therefore hands its kernels
             // `attn_factor_applied_by_caller()` — folding it into cos/sin
@@ -4201,6 +4200,12 @@ impl Decoder {
                         );
                     }
                 });
+            // `maincoder` / `hunyuan-moe` norm HERE instead. Reachable
+            // only on the host path, which is why
+            // `layer_supports_metal_attn` refuses the layer outright
+            // rather than letting the Metal arms above consume a batch
+            // that has not been normed yet.
+            self.apply_qk_norms_post_rope(layer, &mut q_batch, &mut k_batch, q_width, kv_width);
             // Elementwise, so the whole Q batch in one call. Like the
             // multi-sequence path, this body did not apply it at all
             // until the decoration audit. It is placed AFTER the Metal
@@ -4588,18 +4593,7 @@ impl Decoder {
                 }
             }
 
-            if let Some(q_norm) = &layer.attn.q_norm {
-                for row in q_batch.chunks_mut(q_width) {
-                    let normed = self.apply_qk_norm(row, q_norm);
-                    row.copy_from_slice(&normed);
-                }
-            }
-            if let Some(k_norm) = &layer.attn.k_norm {
-                for row in k_batch.chunks_mut(kv_width) {
-                    let normed = self.apply_qk_norm(row, k_norm);
-                    row.copy_from_slice(&normed);
-                }
-            }
+            self.apply_qk_norms_pre_rope(layer, &mut q_batch, &mut k_batch, q_width, kv_width);
             self.apply_rope_attn_factor(&mut q_batch, &mut k_batch);
 
             for b in 0..batch_size {
@@ -4621,6 +4615,7 @@ impl Decoder {
                     );
                 }
             }
+            self.apply_qk_norms_post_rope(layer, &mut q_batch, &mut k_batch, q_width, kv_width);
             // Applied to the whole Q batch at once because it is
             // elementwise. This path did not apply it at all until the
             // decoration audit: `attention_scale` reached only

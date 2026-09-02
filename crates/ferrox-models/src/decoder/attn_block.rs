@@ -121,12 +121,10 @@ impl Decoder {
             }
         }
 
-        if let Some(q_norm) = &layer.attn.q_norm {
-            q = self.apply_qk_norm(&q, q_norm);
-        }
-        if let Some(k_norm) = &layer.attn.k_norm {
-            k = self.apply_qk_norm(&k, k_norm);
-        }
+        // Whole rows here: one token's Q and K. See
+        // `Decoder::qk_norm_after_rope` for why the norm has two homes.
+        let (q_width, kv_width) = (q.len(), k.len());
+        self.apply_qk_norms_pre_rope(layer, &mut q, &mut k, q_width, kv_width);
         self.apply_rope_attn_factor(&mut q, &mut k);
 
         for h in 0..n_heads {
@@ -135,6 +133,7 @@ impl Decoder {
         for h in 0..n_kv_heads {
             self.apply_rope_head_layer(&mut k[h * head_dim..(h + 1) * head_dim], pos, layer_idx);
         }
+        self.apply_qk_norms_post_rope(layer, &mut q, &mut k, q_width, kv_width);
         self.apply_attention_scale(&mut q);
 
         let oai = self.gpt_oss.as_ref().map(|g| &g.layers[layer_idx]);

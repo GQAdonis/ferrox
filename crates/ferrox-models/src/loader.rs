@@ -50,7 +50,7 @@ pub enum LoadError {
     ExpertCountMismatch(String, usize, usize),
     #[error("GGUF file is missing required hparam metadata key '{0}'")]
     MissingHparam(String),
-    /// `general.architecture` is not in the capability registry — refuse
+    /// `general.architecture` is not in the capability registry -- refuse
     /// to guess RoPE/gating rather than emit fluent-but-wrong logits.
     #[error(
         "unsupported GGUF architecture '{0}': not in ferrox's capability registry \
@@ -113,6 +113,39 @@ pub enum LoadError {
 const SIGMOID_GATING_ARCHITECTURES: &[&str] =
     &["afmoe", "deepseek2", "glm4moe", "laguna", "step35"];
 
+/// Names that appear in a behaviour table above but are `DedicatedOnly`
+/// or `Deferred`, together with the module that actually applies the
+/// behaviour for them.
+///
+/// Two true things were in conflict here, and deleting either would
+/// have lost one. `SIGMOID_GATING_ARCHITECTURES` records a fact about
+/// llama.cpp (these architectures default to sigmoid when the GGUF
+/// carries no `expert_gating_func`), and a test pins it as such. The
+/// cross-table test records a different fact: an entry for an
+/// architecture that never reaches THIS loader cannot fire, and a gate
+/// that cannot fire is worse than no gate because it reads as coverage.
+///
+/// Both hold. `deepseek2` and `glm4moe` are genuinely sigmoid-gated and
+/// genuinely never arrive here. So the resolution is not to drop a name
+/// from either place, it is to say out loud who owns it instead, and to
+/// make an unexplained dead entry still fail.
+///
+/// Adding a name here is a claim that the named module applies the
+/// behaviour. It is checked no further than that, so it is the one line
+/// in this file to be suspicious of.
+/// Test-only: it asserts a relationship rather than driving one, and a
+/// production reader would have to be told that.
+#[cfg(test)]
+const DEDICATED_OWNS_ITS_BEHAVIOUR: &[(&str, &str)] = &[
+    // `mla_gguf_loader` reads `expert_gating_func` and falls back to
+    // Sigmoid itself, so deepseek2's gating is decided there.
+    ("deepseek2", "mla_gguf_loader"),
+    // glm4moe is refused today (it needs gpt-oss's norm slot, see its
+    // refusal text). The entry stays because the fact about llama.cpp
+    // stays true, and it becomes live the moment the refusal lifts.
+    ("glm4moe", "refused today, see capability::unaudited_triage"),
+];
+
 /// Architecture-family names whose real reference implementation skips
 /// renormalizing top-k softmax routing weights after selection (GGUF
 /// carries no metadata key for this -- it's hardcoded per-architecture in
@@ -128,7 +161,7 @@ const SIGMOID_GATING_ARCHITECTURES: &[&str] =
 /// though the file loads and shape-validates fine.
 // Architectures whose reference graphs pass `norm_w=false` to
 // `build_moe_ffn` (llama.cpp) / `norm_topk_prob=false` in HF config.
-// Qwen2-MoE: `.scratch/llama.cpp/src/models/qwen2moe.cpp` — Softmax +
+// Qwen2-MoE: `.scratch/llama.cpp/src/models/qwen2moe.cpp` -- Softmax +
 // `false` for the norm_topk slot. Renormalizing top-k weights made
 // Qwen1.5-MoE greedy decode emit garbage despite shared-expert load.
 // `deepseek` (V1) added 2026-09-01 by the unaudited-refusal triage.
@@ -140,6 +173,81 @@ const SIGMOID_GATING_ARCHITECTURES: &[&str] =
 // bug as the OLMoE one above, and latent only because `deepseek` is
 // unaudited and refuses first.
 const NO_TOPK_RENORMALIZE_ARCHITECTURES: &[&str] = &["deepseek", "olmoe", "qwen2moe"];
+
+/// Architectures that store their **pre-FFN** norm under the tensor name
+/// `blk.N.post_attention_norm.weight` and carry no `blk.N.ffn_norm`.
+///
+/// Gemma writes the same tensor name for a genuinely different norm: it
+/// is applied to the attention output *inside* the attention residual,
+/// and Gemma also carries `ffn_norm`. Reading one file's tensor with the
+/// other's meaning silently moves a whole RMSNorm to the wrong side of a
+/// residual add, so the meaning is decided by architecture, not by which
+/// tensors happen to be present.
+///
+/// - `gpt-oss`: `openai-moe.cpp` norms `ffn_inp` with `attn_post_norm`.
+/// - `seed_oss`: `src/models/seed-oss.cpp:36-37` creates `attn_norm` and
+///   `attn_post_norm` and **no** `ffn_norm`, and `:113-115` norms
+///   `ffn_inp` -- the post-attention residual -- with `attn_post_norm`.
+///
+/// This is deliberately NOT `arch == "gpt-oss"`, which is what it used
+/// to be. That one flag also gated gpt-oss's five extra per-layer
+/// tensors (sinks, biases, the SwiGLU clamp), and widening it would have
+/// handed `seed_oss` attention sinks it does not have. Two facts, two
+/// predicates. `the_norm_slot_list_and_the_audit_list_agree` pins that a
+/// name added here is a name somebody actually read a graph for.
+const PRE_FFN_NORM_IS_POST_ATTENTION_NORM: &[&str] = &["gpt-oss", "seed_oss"];
+
+/// Does this architecture keep its pre-FFN norm in the
+/// `post_attention_norm` slot? See
+/// [`PRE_FFN_NORM_IS_POST_ATTENTION_NORM`].
+fn pre_ffn_norm_is_post_attention_norm(arch: &str) -> bool {
+    PRE_FFN_NORM_IS_POST_ATTENTION_NORM.contains(&arch)
+}
+
+/// Architectures whose checkpoints carry `{arch}.leading_dense_block_count`
+/// while their reference graph never branches on it: **every** layer is
+/// MoE regardless of what the key says.
+///
+/// `bailingmoe` is the case this list exists for.
+/// `src/models/bailingmoe.cpp:5` reads
+/// `LLM_KV_LEADING_DENSE_BLOCK_COUNT` into `n_layer_dense_lead` and then
+/// `load_arch_tensors` creates `ffn_gate_inp`, the expert tensors and
+/// the shared-expert tensors unconditionally for every layer (:39-54 --
+/// there is no `if (i < n_layer_dense_lead)` anywhere in the file) and
+/// the graph has no dense branch either (:119-152). Meanwhile
+/// `conversion/bailingmoe.py:27` writes `first_k_dense_replace` into the
+/// key verbatim, so real Ling checkpoints DO carry a nonzero value.
+///
+/// Ferrox's `ModelConfig::layer_is_dense` does branch on it, so without
+/// this list ferrox looks for `blk.0.ffn_gate.weight` on a layer that
+/// only ships experts and dies on a missing tensor. That is a load
+/// failure rather than wrong logits, which is why it stayed latent.
+///
+/// Do not read this as "the key is meaningless": for `deepseek`,
+/// `dots1`, `glm4moe` and every other leading-dense architecture the key
+/// is load-bearing and must be honoured. Membership here is a statement
+/// about ONE architecture's graph, checked in that graph.
+const LEADING_DENSE_KEY_IS_INERT: &[&str] = &["bailingmoe"];
+
+/// Architectures whose reference graph applies `attn_q_norm` /
+/// `attn_k_norm` AFTER `ggml_rope_ext`, not before it.
+///
+/// There is no GGUF key for this. llama.cpp writes the order into each
+/// hand-written graph, so the only place it can come from is the
+/// architecture string, and getting it wrong changes every layer's
+/// attention scores without changing a single tensor shape.
+///
+/// - `maincoder`: `src/models/maincoder.cpp:78-90` ropes Q and K, then
+///   norms them at `:92` and `:95`.
+/// - `hunyuan-moe`: `src/models/hunyuan-moe.cpp:93,104` rope, `:110,115`
+///   norm.
+///
+/// The audited majority is the other way round -- `qwen3moe.cpp:99,108`
+/// and `bailingmoe2.cpp:123-135` both norm first -- which is why the
+/// decoder's default is "before" and this list is the exception.
+/// `hunyuan-dense` shares the ordering but is NOT here: it has a second
+/// blocker (`{arch}.rope.scaling.alpha`) and stays refusing.
+const QK_NORM_AFTER_ROPE_ARCHITECTURES: &[&str] = &["hunyuan-moe", "maincoder"];
 
 fn metadata_u64_any(file: &impl TensorSource, keys: &[String]) -> Option<u64> {
     keys.iter().find_map(|k| file.metadata_u64(k))
@@ -340,7 +448,7 @@ impl ModelConfig {
         };
         // Prefer the GGUF hparam when present. Qwen2MoE (and some other
         // HF→GGUF exports) omit `expert_shared_count` but still ship
-        // `blk.N.ffn_{gate,up,down}_shexp.weight` — without a tensor-
+        // `blk.N.ffn_{gate,up,down}_shexp.weight` -- without a tensor-
         // presence fallback those weights are silently dropped and the
         // model runs with a large chunk of active FFN missing.
         let n_shared_experts = match metadata_u64_any(file, &[key("expert_shared_count")]) {
@@ -375,8 +483,11 @@ impl ModelConfig {
                 );
                 (hidden_dim * 4) as u64
             }) as usize;
-        let n_dense_leading_layers =
-            metadata_u64_any(file, &[key("leading_dense_block_count")]).unwrap_or(0) as usize;
+        let n_dense_leading_layers = if LEADING_DENSE_KEY_IS_INERT.contains(&arch.as_str()) {
+            0
+        } else {
+            metadata_u64_any(file, &[key("leading_dense_block_count")]).unwrap_or(0) as usize
+        };
 
         // ik_llama.cpp's real gating-function hparam
         // (LLM_KV_EXPERT_GATING_FUNC: 1=softmax, 2=sigmoid) if the file
@@ -463,7 +574,7 @@ impl ModelConfig {
                 sliding_window?;
                 // llama.cpp hardcodes the period per architecture and
                 // only lets the metadata key override it, so a missing
-                // key is *not* "every layer windowed" — see
+                // key is *not* "every layer windowed" -- see
                 // `capability::default_swa_layout`.
                 swa_layout.map(|p| p.period).or(
                     // Any Gemma variant not named in the table keeps the
@@ -553,7 +664,7 @@ impl ModelConfig {
         // length, which is what llama.cpp defaults `n_ctx` to. A run that
         // caps the context below `original_context_length` should use the
         // short set; ferrox's config is built before the context size is
-        // known, so that case is not yet handled — recorded as a
+        // known, so that case is not yet handled -- recorded as a
         // best-effort field rather than silently assumed correct.
         let rope_orig_ctx = metadata_u64_any(file, &[key("rope.scaling.original_context_length")])
             .map(|v| v as usize);
@@ -921,7 +1032,7 @@ pub(crate) fn find_info<'a>(
 /// missing any of these is not a gpt-oss checkpoint ferrox can run, and
 /// quietly substituting zeros would reintroduce exactly the
 /// silently-wrong-graph failure this path exists to remove. The lengths
-/// are asserted against the config for the same reason — a bias of the
+/// are asserted against the config for the same reason -- a bias of the
 /// wrong width would otherwise be applied to a `zip`-truncated prefix
 /// and produce a plausible, wrong answer.
 ///
@@ -1019,7 +1130,7 @@ pub(crate) fn load_f32_vec_optional(
 /// buffer per row (fixed `row_bytes`), so a row range is a contiguous
 /// byte range. Mapped sources stay zero-copy (sub-range of the same
 /// mmap); other backings get an owned copy. Returns `None` for non-
-/// quantized matrices (F32 / MXFP4) — callers fall back to dequant.
+/// quantized matrices (F32 / MXFP4) -- callers fall back to dequant.
 fn slice_quantized_rows(m: &WeightMatrix, start: usize, n: usize) -> Option<WeightMatrix> {
     let WeightMatrix::Quantized {
         data,
@@ -1754,13 +1865,20 @@ impl Decoder {
         // gpt-oss carries five per-layer tensors the generic GQA layer
         // structs have no home for, and reuses `post_attention_norm` for
         // a *different* norm slot than Gemma does. Both are decided by
-        // the architecture string, so resolve it once here. See
-        // `crate::decoder::GptOssWeights`.
+        // the architecture string, so resolve them once here. See
+        // `crate::decoder::GptOssWeights` and
+        // `PRE_FFN_NORM_IS_POST_ATTENTION_NORM`.
+        //
+        // These used to be ONE flag, `arch == "gpt-oss"`, standing for
+        // two unrelated facts. Splitting them is what let `seed_oss` --
+        // which shares the norm slot and has none of the extra tensors
+        // -- be admitted without also being handed attention sinks.
         let arch = file
             .metadata_str("general.architecture")
             .unwrap_or_default()
             .to_string();
         let is_gpt_oss = arch == "gpt-oss";
+        let post_attn_norm_is_pre_ffn_norm = pre_ffn_norm_is_post_attention_norm(&arch);
         let mut gpt_oss_layers: Vec<crate::decoder::GptOssLayer> = Vec::new();
 
         // One store for the whole model (keys are (layer, expert)),
@@ -1820,7 +1938,7 @@ impl Decoder {
                 // norms `ffn_inp` with it after the attention residual,
                 // i.e. it is the pre-FFN norm, not a post-attention one.
                 // It is read below into `MoeWeights::norm_weight`.
-                post_attn_norm: if is_gpt_oss {
+                post_attn_norm: if post_attn_norm_is_pre_ffn_norm {
                     None
                 } else {
                     load_f32_vec_optional(&file, &format!("blk.{l}.post_attention_norm.weight"))?
@@ -2028,7 +2146,7 @@ impl Decoder {
                 shared_experts,
                 shared_expert_gate,
                 exp_probs_bias,
-                norm_weight: if is_gpt_oss {
+                norm_weight: if post_attn_norm_is_pre_ffn_norm {
                     load_f32_vec(&file, &format!("blk.{l}.post_attention_norm.weight"))?
                 } else {
                     load_f32_vec(&file, &format!("blk.{l}.ffn_norm.weight"))?
@@ -2118,6 +2236,7 @@ impl Decoder {
             } else {
                 None
             },
+            qk_norm_after_rope: QK_NORM_AFTER_ROPE_ARCHITECTURES.contains(&arch.as_str()),
             #[cfg(feature = "metal")]
             metal_attn_kv: std::sync::Mutex::new(None),
             execution_plan,
@@ -2159,7 +2278,7 @@ const IGNORED_TENSOR_PREFIXES: &[&str] = &["mm.", "v.", "mmproj.", "resampler.",
 /// it claims to be; the newer MoE recipes ship `ffn_exp_probs_b` the
 /// same way. Both are silent today, and both are exactly what the
 /// architecture registry cannot catch, because the architecture *string*
-/// is one ferrox does support — it is the checkpoint that carries more
+/// is one ferrox does support -- it is the checkpoint that carries more
 /// than the registry entry promises.
 ///
 /// This is deliberately the last check in the load: by here every loader
@@ -2193,7 +2312,7 @@ pub fn assert_every_tensor_consumed(file: &ShardedGguf) -> Result<(), LoadError>
         Some("1") | Some("true") | Some("on")
     ) {
         eprintln!(
-            "ferrox: WARNING — {} tensor(s) in this checkpoint are never read \
+            "ferrox: WARNING -- {} tensor(s) in this checkpoint are never read \
              ({listing}); output may be wrong (FERROX_ALLOW_UNKNOWN_TENSORS=1)",
             left.len()
         );
@@ -2589,6 +2708,106 @@ mod tests {
                 !SIGMOID_GATING_ARCHITECTURES.contains(&softmax),
                 "{softmax} does not default to sigmoid"
             );
+        }
+    }
+
+    /// Every name in every architecture-keyed behaviour table is a name
+    /// the catalog actually resolves, on the generic-GQA path.
+    ///
+    /// These five tables are the repo's dominant bug shape in its purest
+    /// form: five lists of strings that have to agree with a sixth
+    /// structure (`capability::architecture_catalog`) about what an
+    /// architecture is called, with nothing checking it. A typo, a
+    /// hyphen where the GGUF has an underscore, or a name that later
+    /// moves to a dedicated stack all produce the same thing -- an entry
+    /// that reads as coverage and can never fire. This repo has shipped
+    /// exactly that once already, in `unsupported_feature_keys`, keyed
+    /// on a GGUF spelling no converter writes.
+    ///
+    /// The generic-path check is the second half and the sharper one: a
+    /// behaviour flag on an architecture that is `DedicatedOnly` or
+    /// `Deferred` never reaches this loader, so it is dead text.
+    ///
+    /// Sabotage to confirm: add `"seedoss"` to any list below.
+    #[test]
+    fn every_architecture_keyed_behaviour_table_names_a_real_generic_row() {
+        let tables: &[(&str, &[&str])] = &[
+            ("SIGMOID_GATING_ARCHITECTURES", SIGMOID_GATING_ARCHITECTURES),
+            (
+                "NO_TOPK_RENORMALIZE_ARCHITECTURES",
+                NO_TOPK_RENORMALIZE_ARCHITECTURES,
+            ),
+            (
+                "PRE_FFN_NORM_IS_POST_ATTENTION_NORM",
+                PRE_FFN_NORM_IS_POST_ATTENTION_NORM,
+            ),
+            ("LEADING_DENSE_KEY_IS_INERT", LEADING_DENSE_KEY_IS_INERT),
+            (
+                "QK_NORM_AFTER_ROPE_ARCHITECTURES",
+                QK_NORM_AFTER_ROPE_ARCHITECTURES,
+            ),
+        ];
+        for (table, names) in tables {
+            for arch in *names {
+                let profile = crate::capability::resolve_profile(arch).unwrap_or_else(|| {
+                    panic!("{table} names `{arch}`, which the catalog does not have")
+                });
+                if matches!(profile.path, crate::capability::ArchPath::GenericGqa { .. }) {
+                    continue;
+                }
+                // Not a generic row, so the entry cannot fire HERE.
+                // That is allowed only when something else is named as
+                // applying the behaviour instead. An unexplained dead
+                // entry still fails, which is the whole point.
+                let owner = DEDICATED_OWNS_ITS_BEHAVIOUR
+                    .iter()
+                    .find(|(name, _)| name == arch)
+                    .map(|(_, owner)| *owner);
+                assert!(
+                    owner.is_some(),
+                    "{table} names `{arch}`, which resolves to {:?} and never reaches this \
+                     loader, so the entry cannot fire. Either drop it, or add it to \
+                     DEDICATED_OWNS_ITS_BEHAVIOUR naming what applies the behaviour instead",
+                    profile.path
+                );
+            }
+        }
+    }
+
+    /// The three tables that describe how a layer is BUILT, rather than
+    /// how it is routed, only carry architectures that are audited.
+    ///
+    /// The distinction matters and is not pedantry. A routing default
+    /// (`SIGMOID_GATING_ARCHITECTURES`, `NO_TOPK_RENORMALIZE_ARCHITECTURES`)
+    /// is allowed to name an architecture that still refuses: it is
+    /// written down ahead of time so a later admission inherits the
+    /// right answer, and the tables say so. But the three below change
+    /// which TENSOR a layer reads and in what order -- and each was
+    /// added for exactly one architecture, whose fixture is the only
+    /// thing proving the change is right. A fourth name appearing here
+    /// without evidence would be a claim about a graph nobody read,
+    /// carried by a list whose doc comment cites two.
+    #[test]
+    fn the_layer_shape_tables_only_name_audited_architectures() {
+        for (table, names) in [
+            (
+                "PRE_FFN_NORM_IS_POST_ATTENTION_NORM",
+                PRE_FFN_NORM_IS_POST_ATTENTION_NORM,
+            ),
+            ("LEADING_DENSE_KEY_IS_INERT", LEADING_DENSE_KEY_IS_INERT),
+            (
+                "QK_NORM_AFTER_ROPE_ARCHITECTURES",
+                QK_NORM_AFTER_ROPE_ARCHITECTURES,
+            ),
+        ] {
+            for arch in names {
+                assert!(
+                    crate::capability::is_audited_generic(arch),
+                    "{table} names `{arch}`, which is not in AUDITED_GENERIC_GQA. Either it \
+                     has a fixture proving the change is right -- audit it -- or the entry \
+                     is a guess about a graph"
+                );
+            }
         }
     }
 

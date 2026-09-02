@@ -1522,6 +1522,7 @@ pub fn generate(
     let (finish, generated_ids, final_logits) = sample_until_stop(
         logits,
         pos,
+        &tokens,
         stop_tokens,
         params,
         |ids| tokenizer.decode(ids),
@@ -1652,6 +1653,12 @@ pub fn generate(
 fn sample_until_stop(
     mut logits: Vec<f32>,
     mut pos: usize,
+    // The prompt this generation continues. Passed rather than derived
+    // because the penalties window is the tail of `prompt ++ generated`
+    // (llama-server seeds its sampler with the prompt before the first
+    // draw), and this seam previously had no way to see it, so the HTTP
+    // API and `ferrox run` disagreed about what one flag means (#73).
+    prompt_ids: &[usize],
     stop_tokens: &StopTokens,
     params: &GenerationParams,
     mut decode_one: impl FnMut(&[usize]) -> String,
@@ -1686,6 +1693,7 @@ fn sample_until_stop(
             &mut state,
             &logits,
             params,
+            prompt_ids,
             &generated_ids,
             stop_tokens,
             decode_token,
@@ -1799,6 +1807,7 @@ pub fn generate_engine<E: Engine, T: TextTokenizer>(
     let (finish, generated_ids, _final_logits) = sample_until_stop(
         logits,
         pos,
+        &tokens,
         stop_tokens,
         params,
         |ids| tokenizer.decode(ids),
@@ -2359,6 +2368,9 @@ mod tests {
         let (finish, ids, _) = sample_until_stop(
             first,
             0,
+            // A scripted-logits harness with no real prompt: the empty
+            // half is the truth here, not an omission.
+            &[],
             &stop_tokens,
             params,
             |ids| ids.iter().copied().map(&render).collect::<String>(),

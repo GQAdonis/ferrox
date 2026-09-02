@@ -341,6 +341,10 @@ pub(super) fn worker_loop(
                 &mut slot.sample,
                 &slot.logits,
                 &slot.params,
+                // The row already keeps its prompt, for the radix
+                // publish. The penalties window is the tail of
+                // `prompt ++ generated`, so it needs the same slice.
+                &slot.prompt_ids,
                 &slot.generated_ids,
                 &slot.stop_tokens,
                 &|id| decode(&[id]),

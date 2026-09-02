@@ -95,27 +95,19 @@ pub(crate) fn sample_next(
     state: &mut SampleState,
     logits: &[f32],
     params: &GenerationParams,
+    prompt: &[usize],
     history: &[usize],
     stop_tokens: &StopTokens,
     decode_token: &dyn Fn(usize) -> String,
 ) -> Result<Step, DecodeError> {
-    // The prompt half is EMPTY here, and that is a known divergence
-    // from llama.cpp, not a decision this function is making.
-    //
-    // llama.cpp seeds its penalties sampler with every prompt token
-    // before the first draw (`tools/server/server-context.cpp:386-390`),
-    // so `penalty_last_n` slides over `prompt ++ generated`. Both of
-    // this server's decode loops -- `generate::sample_until_stop` and
-    // `serving::batch::worker` -- hand this function the GENERATED ids
-    // alone, and neither has the prompt ids in scope to hand over:
-    // `sample_until_stop` takes `logits` and `pos`, never the ids.
-    // Closing it means threading the prompt through that signature,
-    // which is a `generate.rs` change and is tracked as issue #73.
-    //
-    // Spelled out as `&[]` at the ONE place the server builds a window,
-    // rather than left implicit in a slice argument, so the gap is a
-    // line someone deletes rather than a behaviour someone rediscovers.
-    let window = PenaltyWindow::new(&[], history);
+    // Both halves, so `penalty_last_n` slides over `prompt ++
+    // generated` exactly as llama-server's does: it seeds its sampler
+    // with every prompt token before the first draw
+    // (`tools/server/server-context.cpp:386-390`). The prompt used to
+    // be `&[]` here because the ids did not reach this seam, which made
+    // the HTTP API disagree with `ferrox run` about what the same flag
+    // means (#73).
+    let window = PenaltyWindow::new(prompt, history);
     if !params.needs_vocab_logits() {
         return Ok(Step::Token(state.sampler.sample(
             logits,
@@ -283,7 +275,9 @@ mod tests {
         stops: &StopTokens,
         decode: &dyn Fn(usize) -> String,
     ) -> Result<Step, DecodeError> {
-        sample_next(state, logits, params, history, stops, decode)
+        // These tests are about masking and stops, not penalties, so
+        // the prompt half is empty and says so.
+        sample_next(state, logits, params, &[], history, stops, decode)
     }
 
     /// The assertion neither decode path had. Token 0 wins the argmax by
@@ -608,5 +602,51 @@ mod tests {
         let chosen =
             token(step(&mut state, &logits, &params, &[], &letter_stops(), &letter).unwrap());
         assert_eq!(chosen, LETTER_EOG, "an optional trigger constrains nothing");
+    }
+
+    /// **The server must penalise the prompt, as llama-server does.**
+    ///
+    /// llama-server seeds its sampler with every prompt token before
+    /// the first draw (`tools/server/server-context.cpp:386-390`), so
+    /// `penalty_last_n` slides over `prompt ++ generated` there. This
+    /// seam passed `&[]` until #73, because the prompt ids did not
+    /// reach it, so the SAME request body produced different text from
+    /// llama-server, and from `ferrox run`, which was fixed first.
+    ///
+    /// Asserted on the sampled token. A test on the window's length
+    /// would pass with the window handed to the wrong distribution.
+    #[test]
+    fn a_prompt_token_is_penalised_by_the_server_before_it_is_generated() {
+        // Token 0 wins the argmax outright. A penalty heavy enough to
+        // dethrone it can only come from the PROMPT, since nothing has
+        // been generated yet.
+        let logits = vec![9.0, 8.0, 0.5];
+        let mut p = params(false, 0.0);
+        p.sampling.repetition_penalty = 50.0;
+        p.sampling.penalty_last_n = 64;
+
+        let mut state = SampleState::new(7);
+        let with_prompt = sample_next(&mut state, &logits, &p, &[0], &[], &letter_stops(), &|id| {
+            letter(id)
+        })
+        .expect("sampling succeeds");
+
+        let mut state = SampleState::new(7);
+        let without_prompt =
+            sample_next(&mut state, &logits, &p, &[], &[], &letter_stops(), &|id| {
+                letter(id)
+            })
+            .expect("sampling succeeds");
+
+        assert_eq!(
+            token(without_prompt),
+            0,
+            "with no prompt the argmax stands, which is what makes the other half meaningful"
+        );
+        assert_eq!(
+            token(with_prompt),
+            1,
+            "a token in the prompt must be penalised on its FIRST generated occurrence"
+        );
     }
 }

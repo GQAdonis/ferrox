@@ -220,7 +220,9 @@ OpenAI-compatible HTTP API:
   layer, and the full-attention layers still read position 0
 - `ferrox serve-bench`: concurrency, TTFT, TPOT and queueing numbers
   for a live server, with the methodology (positional split, pooled
-  nearest-rank percentiles, whole-run throughput) tested socket-free
+  nearest-rank percentiles, whole-run throughput) tested socket-free.
+  Host B receipts for Metal CB at 0.15.3:
+  [`benchmarks/receipts/serving/`](../benchmarks/receipts/serving/)
 - Live serving telemetry (`GET /v1/stats`, `GET /v1/requests`) and an
   elastic KV/expert split that can be reported and re-sized without a
   restart (`GET /v1/cache/status`, `POST /v1/cache/rebuild`). A request

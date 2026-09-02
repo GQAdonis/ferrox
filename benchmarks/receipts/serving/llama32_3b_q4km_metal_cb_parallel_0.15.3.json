@@ -1,0 +1,68 @@
+{
+  "id": "llama32_3b_q4km",
+  "kind": "serving",
+  "workload": "parallel_stream_burst",
+  "ferrox_version": "0.15.3",
+  "host_spec": {
+    "arch": "aarch64",
+    "cores": 10,
+    "cpu": "Apple M2 Pro",
+    "label": "Apple M2 Pro (10c/6p) macOS 26.6.1",
+    "os": "macOS 26.6.1",
+    "perf_cores": 6,
+    "ram_gb": 32.0
+  },
+  "model_path": "models/Llama-3.2-3B-Instruct-Q4_K_M.gguf",
+  "model_id": "Llama 3.2 3B Instruct",
+  "backend": "metal",
+  "continuous_batching": true,
+  "server_url": "http://localhost:8383",
+  "max_tokens": 64,
+  "bursts_per_level": 2,
+  "concurrency_levels": [1, 2, 4, 8],
+  "levels": [
+    {
+      "concurrency": 1,
+      "requests": 2,
+      "ok": 2,
+      "failed": 0,
+      "batch_wall_ms_mean": 3685,
+      "aggregate_tok_s": 17.4,
+      "mean_ttft_ms": 156.9,
+      "max_ttft_ms": 191.4
+    },
+    {
+      "concurrency": 2,
+      "requests": 4,
+      "ok": 4,
+      "failed": 0,
+      "batch_wall_ms_mean": 5122,
+      "aggregate_tok_s": 19.0,
+      "mean_ttft_ms": 271.8,
+      "max_ttft_ms": 402.0
+    },
+    {
+      "concurrency": 4,
+      "requests": 8,
+      "ok": 8,
+      "failed": 0,
+      "batch_wall_ms_mean": 10454,
+      "aggregate_tok_s": 22.7,
+      "mean_ttft_ms": 450.0,
+      "max_ttft_ms": 766.8
+    },
+    {
+      "concurrency": 8,
+      "requests": 16,
+      "ok": 16,
+      "failed": 0,
+      "batch_wall_ms_mean": 19025,
+      "aggregate_tok_s": 24.4,
+      "mean_ttft_ms": 956.8,
+      "max_ttft_ms": 1949.9
+    }
+  ],
+  "driver": "pi-agent-tests/ferrox_parallel_bench.py",
+  "notes": "Concurrent streaming bursts via POST /v1/chat/completions. CB auto-on on Metal. 0 failures at all concurrency levels after 0.15.3 host-KV prefill fix. Compare with 0.15.2 parallel receipt (same ~24 tok/s at concurrency 8, but 0.15.2 returned garbled text under CB).",
+  "measured_at": "2026-09-02"
+}

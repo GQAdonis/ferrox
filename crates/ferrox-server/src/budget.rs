@@ -558,15 +558,32 @@ mod tests {
     }
 
     /// A sliding-window model derives a ceiling from memory like any
-    /// other model. It used to derive the model's whole context length
-    /// whatever the budget was, because `KvShape` subtracted the sliding
-    /// layers out of the divisor and no KV store ever gave those bytes
-    /// back (#33) -- so the server admitted a context that then had to
-    /// be allocated in full.
+    /// other model. It used to derive the model's whole trained context
+    /// however small the budget was: `KvShape` subtracted the sliding
+    /// layers out of the divisor, a fully-windowed model divided by zero
+    /// bytes per token, and no KV store ever gave those bytes back
+    /// (#33). The server then admitted a context it had to allocate in
+    /// full.
+    ///
+    /// The window is taken from a real `ModelConfig` rather than
+    /// hand-written into the shape, because the shape has no window
+    /// field to write it into any more -- which is the fix.
     #[test]
     fn a_sliding_model_derives_its_ceiling_from_memory_like_any_other() {
-        // 64 bytes/token: room for 1024 tokens, not for 8192.
-        let b = budget(64 * 1024, 0);
+        let mut cfg = ferrox_models::config::test_dense_fixture();
+        cfg.n_layers = 2;
+        cfg.n_kv_heads = 1;
+        cfg.head_dim = 4;
+        cfg.sliding_window = Some(8);
+        cfg.swa_pattern = None; // every layer slides: the old zero divisor
+        let windowed = KvShape::from_config(&cfg, KvElem::F32);
+        assert_eq!(windowed, shape(), "64 bytes/token, window or no window");
+
+        // Room for 1024 tokens against a model that would like 8192.
+        let b = KvBudget {
+            shape: windowed,
+            ..budget(64 * 1024, 0)
+        };
         let derived = derive_limits(&b, 8192, 256).expect("a fit of 1024 tokens is a real fit");
         assert_eq!(derived.max_context, 1024);
     }

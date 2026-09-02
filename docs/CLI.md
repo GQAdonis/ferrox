@@ -69,10 +69,13 @@ Same via explicit subcommand: `ferrox run -m …`.
 | `--repeat-penalty` | `1.0` = off. Default `1.1`; llama.cpp defaults this one to `1.0` |
 | `--repeat-last-n` | How many recent tokens the repetition / presence / frequency penalties consider. `0` = penalties off. Default `64`, llama.cpp's (`common/common.h:238`) |
 | `-s` / `--seed` | `-1` = time-based |
+| `--grammar` | Constrain generation to a GBNF grammar, llama.cpp's `--grammar` |
+| `--grammar-file` | Read the GBNF grammar from a file, llama.cpp's `--grammar-file` |
+| `-j` / `--json-schema` | Constrain generation to a JSON Schema, converted to GBNF. llama.cpp's `-j` |
 | `-dev` / `--device` | `auto`, `none`, `cpu`, `metal`, or `cuda` |
 | `--list-devices` | Print compiled, detected devices and exit |
 | `-ngl` / `--gpu-layers` / `--n-gpu-layers` | `0`, `auto`, `all`, or a count at/above the layer count. A *partial* count is refused, see below |
-| `--ctk` | KV dtype: `f16` (default), `q8_0`/`turbo8`/`fp8`/`turbo4` (Metal), `turbo3` (falls back). Sets `FERROX_CTK` |
+| `--ctk` | KV dtype: `f16` (default), `q8_0`/`turbo8`/`fp8`/`turbo4`, `turbo3` (falls back). **Metal only**, see below. Sets `FERROX_CTK` |
 | `--system` | Chat mode only |
 | `--no-cnv` | Skip chat-template wrap |
 | `-e` / `--escape` | Expand `\n` `\t` `\r` `\\` in `-p`. **On by default**, as in llama.cpp |
@@ -82,6 +85,21 @@ Same via explicit subcommand: `ferrox run -m …`.
 | `--mtp` | Errors: MTP draft heads not loaded from GGUF yet |
 
 Stderr prints load and throughput timings. Generated text goes to stdout.
+
+**Structured output.** `--grammar`, `--grammar-file` and `-j` all end
+at the same stack machine, which masks every token that cannot continue
+a valid string. A schema is compiled to GBNF first, so the two paths
+share one enforcer rather than two that drift. The constraint holds per
+token, so there is no retry loop and no repair pass; the same machine
+serves `response_format` and `tool_choice` on the HTTP API
+([docs/API.md](API.md)).
+
+**`--ctk` only binds on Metal.** Only the Metal KV store has a
+selectable dtype. On CPU and CUDA the KV cache is the host `Vec<f32>`,
+so `--ctk f16` there is accepted, ignored, and reported as ignored by
+the startup banner. That matters for memory: f32 doubles the KV bytes
+per token, which is why a model that fits at its full context on Metal
+can need `--ctx-size auto` on CPU. `ferrox inspect-plan` prices both.
 
 **The sampler chain is llama.cpp's, in llama.cpp's order.** Penalties,
 then top-k, then top-p, then min-p, and **temperature last**

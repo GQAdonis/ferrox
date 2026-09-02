@@ -117,6 +117,12 @@ llama.cpp-style completion flags (`-m`, `-p`, `-n`, `-ngl`, `--ctk`, …),
 plus `ferrox chat`, `ferrox pull` (Hugging Face Hub), `inspect`, `archs`,
 and `presets`. See [`CLI.md`](CLI.md).
 
+Constrained decoding is on the CLI too: `--grammar`, `--grammar-file`
+and `-j` / `--json-schema`, the same spellings llama.cpp uses, reaching
+the same stack machine the HTTP `grammar` field does. `--ctk` selects a
+KV dtype on Metal only; the CPU and CUDA KV cache is the host `Vec<f32>`
+and the startup banner says so when the flag is being ignored.
+
 The sampler flags carry llama.cpp's own defaults on `--temp` (0.8),
 `--top-k` (40), `--top-p` (0.95), `--min-p` (0.05) and `--repeat-last-n`
 (64). **One default still differs on purpose**: `--repeat-penalty` is
@@ -158,7 +164,9 @@ OpenAI-compatible HTTP API:
   and the six generating routes answer **501 naming the model**, not a
   missing tensor. Pooling comes from the checkpoint's own
   `pooling_type` (NONE / MEAN / CLS / LAST; RANK refuses, it is a
-  classification head rather than a pooling rule). A decoder GGUF still
+  classification head rather than a pooling rule, and while
+  `ferrox_models::rank_head` loads one there is no `/v1/rerank` route to
+  reach it yet). A decoder GGUF still
   pools its hidden states (mean/last) as before, and
   `FERROX_EMBEDDING_MODEL_PATH` runs an encoder side-by-side with a
   generative model in one process

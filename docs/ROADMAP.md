@@ -29,6 +29,31 @@ paths, a CUDA batched GEMM (**never run on a GPU**, see item 4 below),
 and a triage of every unaudited architecture refusal into
 fixture-away / one-match-arm / new-code / unknown.
 
+## Closed on 2026-09-02
+
+- **Vulkan is a third backend**, behind `--features vulkan`. A `Q8_0`
+  matvec and nothing else, so a prefill still runs on the host. The
+  backend registry list is generated from the seam rather than
+  hand-kept, which is what caught a `Q5_0` Metal matvec that had been
+  half-wired since the previous release
+- **Encoder embeddings.** A BGE / E5 / GTE checkpoint can be the loaded
+  model, `/v1/embeddings` pools it the way the file says to, and the
+  generating routes answer 501 naming the model. Checked against
+  llama.cpp
+- **WordPiece tokenization**, verified against llama.cpp
+- **Lazy grammars**, so `tool_choice: "required"` and a named
+  `tool_choice` are enforced rather than asked for in the prompt
+- **`pattern` in the JSON-schema-to-GBNF converter**
+- **The GGUF parser is bounded against a hostile file** (#24, #25, #26):
+  every count, string length, array length and nesting depth is checked
+  against what the file can actually contain, rather than against a
+  chosen constant
+- The repack cache served a dead mapping's bytes, and the CLI banner
+  reported a KV dtype the run does not keep
+
+Landed but not reachable yet: the reranker classification head
+(`ferrox_models::rank_head`) has no `/v1/rerank` route.
+
 ## Speed gaps against llama.cpp
 
 Closed since the last pass over this list: bench last-token `lm_head`
@@ -78,9 +103,13 @@ Beyond closing the measured gaps.
    with "NEVER RUN" as the reason. Putting it on a card, and then the
    dp4a/MMQ integer path and the other five quant kinds, is the work.
 5. **Tool calling and full OpenAI API compatibility.** See
-   [`API.md`](API.md). GBNF grammar-constrained decoding now ships; what
-   is left is `response_format: json_schema`, the *lazy* grammars
-   `tool_choice: required`/named needs, and MCP invocation.
+   [`API.md`](API.md). GBNF grammars and the lazy grammars behind a
+   forced `tool_choice` both ship. What is left is
+   `response_format: json_schema` (a 501 today, though the
+   schema-to-GBNF converter it needs already exists, and is what a
+   forced `tool_choice` compiles its arguments with), a forced
+   `tool_choice` on the eight wire formats that are not JSON-object
+   shaped, and MCP invocation.
 6. **Docker images**, so evaluating any of this stops requiring a Rust
    toolchain.
 
@@ -101,11 +130,13 @@ Beyond closing the measured gaps.
   shape. *Eleven wire formats now parse* (`ferrox-server::policy::parser::tool_call`),
   every call in a response rather than the first, and a reasoning
   model's chain of thought comes back as `reasoning_content`. Five of
-  the eleven stream `tool_calls[].index` argument deltas. What is left
-  here is `tool_choice: required`/named, which needs *lazy* grammars
-  (llama.cpp's `trigger_patterns`, a grammar switched on partway through
-  a response) rather than constrained decoding as such, argument deltas
-  for the six JSON-payload formats, and streamed tool calls on the
+  the eleven stream `tool_calls[].index` argument deltas.
+  `tool_choice: "required"` and a named `tool_choice` now compile a
+  *lazy* grammar (llama.cpp's `trigger_patterns`, a grammar switched on
+  partway through a response) from the request's own `tools`, on the
+  three JSON-object formats; the other eight answer 501 naming the
+  format. What is left here is those eight, argument deltas for the six
+  JSON-payload formats, and streamed tool calls on the
   continuous-batching path
 - JSON-schema constrained decoding. The GBNF engine and the `grammar`
   request field shipped on 2026-09-01, on chat, completions and all

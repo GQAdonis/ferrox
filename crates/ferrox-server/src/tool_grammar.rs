@@ -20,7 +20,9 @@
 //!
 //! `tool-<name>-args` is the tool's own `parameters` JSON Schema, run
 //! through [`ferrox_models::grammar::json_schema`] -- the same converter
-//! `response_format: json_schema` uses, `pattern` included. So the
+//! the CLI's `-j` / `--json-schema` uses, `pattern` included. (The HTTP
+//! `response_format: json_schema` field is still a 501; see
+//! `grammar_request`. The converter is not what is missing there.) So the
 //! arguments are not merely well-formed JSON: a `required` property that
 //! the schema declares is a property the model cannot omit, and an `enum`
 //! is a choice it cannot invent a member of.

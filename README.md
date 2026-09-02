@@ -27,53 +27,39 @@
 
 ---
 
-Ferrox loads GGUF checkpoints and runs inference on your hardware. No
-bindings to llama.cpp, no ggml wrapper. The loader, quantized kernels,
-attention and expert routing are all implemented here.
+Ferrox loads GGUF checkpoints and runs them on the hardware you already
+own. No llama.cpp bindings, no ggml wrapper. The loader, the quantized
+kernels, attention and expert routing are written here, in Rust.
 
-- **One binary, no runtime.** 19 MB with Metal and the server, 14 MB
-  stripped. It runs completions, the API server, `download`, `bench` and
-  `verify`. Nothing to activate, no wheels, no CUDA userspace to match
-  against a driver. PyTorch alone is 402 MB before vLLM sits on top.
+- **One binary, no runtime.** 19 MB with Metal and the server, and
+  completions, the API server, `download`, `bench` and `verify` are all
+  inside it. No wheels, no CUDA userspace to match against a driver.
+  PyTorch alone is 402 MB, before vLLM sits on top.
 - **Quantized end to end.** Weights stay quantized on mmap and
   dequantize inside the matmul, so an 8B model fits on a laptop.
   K-quants, the IQ tiers, MXFP4, F16 and BF16.
-- **Mixture-of-experts has its own path.** GPU routing, indexed expert
-  GEMMs, residency planning. When the weights do not fit, experts stream
-  from the checkpoint through a bounded cache. That is slower than
-  keeping them resident, so it never switches on for a model that fits.
-- **OpenAI-compatible server.** Continuous batching, paged KV that
-  shares a system prompt's pages across conversations, runtime model
-  swap, resumable streams, Anthropic and Responses endpoints, and an
-  `/admin` surface. Point your existing client at it.
-- **Structured output, guaranteed.** Ask for a JSON Schema, a GBNF
-  grammar, or a specific tool call, and the model cannot emit anything
-  else. No retry loop, no validating after the fact, no repair pass.
-- **Same flags, same output as llama.cpp.** The sampler runs llama.cpp's
-  chain in llama.cpp's order, `min_p` included. Tokenization is verified
-  byte-for-byte against it on ten checkpoints.
-- **Embeddings from real encoder models.** Point `-m` at a BGE, E5 or GTE
-  checkpoint and `/v1/embeddings` serves it, pooled the way the file says
-  to. Not a decoder's hidden states borrowed for the job.
-- **Prompts framed by the checkpoint's own template.** The GGUF's real
-  `tokenizer.chat_template` is compiled and evaluated, never sniffed. A
-  family nobody hand-wrote a renderer for is still framed the way it was
-  trained.
-- **Agent-ready output.** Chain of thought splits into
-  `reasoning_content` as tokens arrive, and tool calls are parsed in the
-  eleven formats real checkpoints emit, streaming as argument deltas.
-- **Speculative decoding stays lossless** at any temperature, not just
-  `--temp 0`, and reports per-position accept rate rather than one
-  average.
-- **Every speed number is measured**, against llama.cpp on the same host
-  and file. Runs write JSON receipts that generate
-  [the table](benchmarks/RESULTS.md); a busy or thermally limited host
-  stops the benchmark instead of publishing a bad number.
-- **It refuses rather than guessing.** A model whose maths Ferrox only
-  partly implements stops and names what is missing, instead of loading
-  and returning fluent text computed the wrong way. The GGUF parser is
-  bounded against a hostile file too: every length it reads is checked
-  against what the file can actually contain.
+- **Drop-in for llama.cpp.** Same flags, same sampler chain in the same
+  order. Tokenization is verified byte-for-byte on ten checkpoints, and
+  every number in [the speed table](benchmarks/RESULTS.md) was measured
+  against llama.cpp on the same host and the same file.
+- **OpenAI-compatible server.** Continuous batching, paged KV shared
+  across conversations, runtime model swap, resumable streams, Anthropic
+  and Responses endpoints, and speculative decoding that stays lossless
+  at any temperature. Point your existing client at it.
+- **Structured output, enforced per token.** A GBNF grammar, a forced
+  `tool_choice`, or a tool's own `parameters` schema: a stack machine
+  masks every token that would break the constraint, so an invalid
+  answer is not reachable. No retry loop, no repair pass.
+- **Built for agents.** Reasoning streams into `reasoning_content`, tool
+  calls parse in the eleven formats real checkpoints emit, and prompts
+  are framed by the GGUF's own `tokenizer.chat_template`, compiled and
+  evaluated rather than sniffed.
+- **Mixture-of-experts is a first-class path.** GPU routing, indexed
+  expert GEMMs, residency planning. Experts stream from the checkpoint
+  when they do not fit, and never when they do.
+- **Embeddings from real encoder models.** Point `-m` at a BGE, E5 or
+  GTE checkpoint and `/v1/embeddings` serves it, pooled the way the file
+  says to. Not a decoder's hidden states borrowed for the job.
 
 ## Install
 

@@ -83,7 +83,8 @@ fn flush_replies_on_each_rows_own_channel() {
     assert!(rows.get(b).is_none());
     assert_eq!(rows.order, vec![a, c]);
 
-    let (finish, ids, text, usage) = rb.try_recv().expect("b's caller got a reply").expect("ok");
+    let (finish, ids, text, usage) =
+        finished_result(rb.try_recv().expect("b's caller got a reply")).expect("ok");
     assert_eq!(finish, FinishReason::Stop);
     assert_eq!(ids, vec![7]);
     assert_eq!(text, "bee");

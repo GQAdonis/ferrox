@@ -49,7 +49,7 @@ fn paged_with_radix(
     (config, store, radix)
 }
 
-fn paged_job(prompt: Vec<usize>, max_tokens: usize) -> (Job, mpsc::Receiver<JobResult>) {
+fn paged_job(prompt: Vec<usize>, max_tokens: usize) -> (Job, mpsc::Receiver<BatcherEvent>) {
     let (tx, rx) = mpsc::channel();
     (
         Job {
@@ -76,7 +76,7 @@ fn admit_prefilled(
     config: &PagedKvConfig,
     prompt: Vec<usize>,
     max_tokens: usize,
-) -> Option<(Slot, mpsc::Receiver<JobResult>)> {
+) -> Option<(Slot, mpsc::Receiver<BatcherEvent>)> {
     let (job, rx) = paged_job(prompt, max_tokens);
     let mut prefill = accept(decoder, job, /* chunk_size = */ 1, Some(config))?;
     while !prefill.state.step_chunk() {}

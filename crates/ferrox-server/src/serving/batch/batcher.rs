@@ -17,7 +17,7 @@ use crate::generate::{
 use crate::policy::anchor::WindowPolicy;
 
 use super::block_budget::BlockBudget;
-use super::config::{BatcherConfig, DecodeFn};
+use super::config::{BatcherConfig, BatcherEvent, DecodeFn};
 use super::counters::{BatcherStats, Counters};
 use super::queue::{AbortInbox, QueueGate};
 use super::row::Job;
@@ -179,6 +179,18 @@ impl ContinuousBatcher {
         params: GenerationParams,
         stop_tokens: StopTokens,
     ) -> Result<(FinishReason, Vec<usize>, String, Usage), DecodeError> {
+        self.generate_streaming(prompt_tokens, params, stop_tokens, None::<fn(&str)>)
+    }
+
+    /// Like [`Self::generate`], but invokes `on_chunk` on the worker
+    /// thread for each detokenized piece as it becomes visible.
+    pub fn generate_streaming(
+        &self,
+        prompt_tokens: Vec<usize>,
+        params: GenerationParams,
+        stop_tokens: StopTokens,
+        mut on_chunk: Option<impl FnMut(&str)>,
+    ) -> Result<(FinishReason, Vec<usize>, String, Usage), DecodeError> {
         // A request that could never fit is refused first, and refused
         // with the ceiling named: queueing it would only make it wait
         // for capacity that will never be enough. This is the
@@ -207,7 +219,7 @@ impl ContinuousBatcher {
                 queued,
                 cap: self.queue.cap,
             })?;
-        let (reply_tx, reply_rx) = mpsc::channel();
+        let (reply_tx, reply_rx) = mpsc::channel::<BatcherEvent>();
         let abort = self.aborts.next_id();
         let cancel = params.cancel.clone();
         if self
@@ -235,6 +247,16 @@ impl ContinuousBatcher {
             let inbox = Arc::clone(&self.aborts);
             token.on_cancel(move || inbox.enqueue(abort));
         }
-        reply_rx.recv().unwrap_or(Err(DecodeError::KvPoolExhausted))
+        loop {
+            match reply_rx.recv() {
+                Ok(BatcherEvent::Chunk(chunk)) => {
+                    if let Some(ref mut f) = on_chunk {
+                        f(&chunk);
+                    }
+                }
+                Ok(BatcherEvent::Finished(result)) => return *result,
+                Err(_) => return Err(DecodeError::KvPoolExhausted),
+            }
+        }
     }
 }

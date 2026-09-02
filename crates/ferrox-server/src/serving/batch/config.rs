@@ -4,6 +4,7 @@
 //! [`BatcherConfig`] explicitly rather than setting process environment,
 //! which two tests running in parallel cannot do without racing.
 
+use std::sync::mpsc::Sender;
 use std::sync::Arc;
 
 use crate::generate::{DecodeError, FinishReason, Usage};
@@ -17,6 +18,17 @@ pub(super) type DecodeFn = Arc<dyn Fn(&[usize]) -> String + Send + Sync>;
 /// stop sequences may have cut the decoded string short of a full
 /// `decode(ids)`.
 pub(super) type JobResult = Result<(FinishReason, Vec<usize>, String, Usage), DecodeError>;
+
+/// Worker → caller messages. Chunks carry incremental detokenized text;
+/// `Finished` ends the job with the same payload as before.
+pub(super) enum BatcherEvent {
+    Chunk(String),
+    Finished(Box<JobResult>),
+}
+
+pub(super) fn send_finished(reply: &Sender<BatcherEvent>, result: JobResult) {
+    let _ = reply.send(BatcherEvent::Finished(Box::new(result)));
+}
 
 /// Prompt tokens run per prefill chunk when `FERROX_CB_PREFILL_CHUNK`
 /// is unset. Large enough that a short prompt still prefills in one

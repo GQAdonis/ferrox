@@ -14,7 +14,7 @@ use crate::generate::{acquire_paged_caches, DecodeError, FinishReason, PagedKvCo
 use crate::stop::StopStep;
 
 use super::block_budget::BlockBudget;
-use super::config::{decode_log_interval_from_env, BatcherConfig, DecodeFn};
+use super::config::{decode_log_interval_from_env, send_finished, BatcherConfig, DecodeFn};
 use super::counters::Counters;
 use super::prefill::{Prefill, PrefillState};
 use super::queue::{AbortId, AbortInbox, QueueGate};
@@ -132,12 +132,15 @@ pub(super) fn apply_aborts(
     while let Some(job) = waiting.pop_front() {
         if carried.remove(&job.abort) {
             queue.release();
-            let _ = job.reply.send(Ok((
-                FinishReason::Cancelled,
-                Vec::new(),
-                String::new(),
-                Usage::new(job.prompt_tokens.len(), 0),
-            )));
+            send_finished(
+                &job.reply,
+                Ok((
+                    FinishReason::Cancelled,
+                    Vec::new(),
+                    String::new(),
+                    Usage::new(job.prompt_tokens.len(), 0),
+                )),
+            );
             stopped += 1;
         } else {
             still_waiting.push_back(job);
@@ -150,12 +153,15 @@ pub(super) fn apply_aborts(
     while let Some(prefill) = prefills.pop_front() {
         if carried.remove(&prefill.abort) {
             budget.release(prefill.blocks);
-            let _ = prefill.reply.send(Ok((
-                FinishReason::Cancelled,
-                Vec::new(),
-                String::new(),
-                Usage::new(prefill.prompt_tokens, 0),
-            )));
+            send_finished(
+                &prefill.reply,
+                Ok((
+                    FinishReason::Cancelled,
+                    Vec::new(),
+                    String::new(),
+                    Usage::new(prefill.prompt_tokens, 0),
+                )),
+            );
             stopped += 1;
         } else {
             still_prefilling.push_back(prefill);
@@ -488,11 +494,17 @@ pub(super) fn worker_loop(
 pub(super) fn apply_stop_buffer(slot: &mut Slot, piece: &str) -> bool {
     match slot.stops.push(piece) {
         StopStep::Emit(text) => {
-            slot.visible.push_str(&text);
+            if !text.is_empty() {
+                slot.visible.push_str(&text);
+                let _ = slot.reply.send(super::config::BatcherEvent::Chunk(text));
+            }
             false
         }
         StopStep::Matched { text, stop } => {
-            slot.visible.push_str(&text);
+            if !text.is_empty() {
+                slot.visible.push_str(&text);
+                let _ = slot.reply.send(super::config::BatcherEvent::Chunk(text));
+            }
             slot.finish = Some(FinishReason::StopSequence(stop));
             true
         }
@@ -512,10 +524,13 @@ pub(super) fn accept(
 ) -> Option<Prefill> {
     let vocab_size = decoder.config.vocab_size;
     if let Some(&bad) = job.prompt_tokens.iter().find(|&&t| t >= vocab_size) {
-        let _ = job.reply.send(Err(DecodeError::TokenOutOfVocab {
-            token: bad,
-            vocab_size,
-        }));
+        send_finished(
+            &job.reply,
+            Err(DecodeError::TokenOutOfVocab {
+                token: bad,
+                vocab_size,
+            }),
+        );
         return None;
     }
 
@@ -536,7 +551,7 @@ pub(super) fn accept(
                     // Refuse this row rather than admit one with no
                     // pages: the two counts are meant to agree, and the
                     // store is the one holding real memory.
-                    let _ = job.reply.send(Err(DecodeError::KvPoolExhausted));
+                    send_finished(&job.reply, Err(DecodeError::KvPoolExhausted));
                     return None;
                 }
             }

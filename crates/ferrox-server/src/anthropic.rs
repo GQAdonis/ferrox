@@ -1469,10 +1469,11 @@ async fn messages_stream(
     let prefix_cache = state.prefix_cache.clone();
     let batcher = active.batcher.clone();
     let ceiling = active.ceiling.clone();
+    let metal_private_decode_gate = state.metal_private_decode_gate.clone();
     // Continuous batching returns one string, so there is no
     // incremental stream to ride on and the whole answer is parsed at
     // the end instead.
-    let overlap = batcher.is_none();
+    let overlap = true;
     let offered = prepared.parser_tools;
     let stats_state = Arc::clone(&state);
     let stats_request_id = request_id.clone();
@@ -1500,6 +1501,7 @@ async fn messages_stream(
             prefix_cache.as_deref(),
             batcher.as_ref(),
             ceiling.as_deref(),
+            metal_private_decode_gate.as_deref(),
             |chunk| {
                 if !overlap || chunk.is_empty() {
                     return;

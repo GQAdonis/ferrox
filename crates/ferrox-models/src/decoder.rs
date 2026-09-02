@@ -1635,13 +1635,22 @@ impl Decoder {
     }
 
     /// Pull every layer's Metal-ahead suffix into `kv_caches` (prefix-cache
+    /// Poison-tolerant lock for the shared Metal KV arena. A panicked
+    /// holder must not permanently brick every later decode.
+    #[cfg(feature = "metal")]
+    fn lock_metal_attn_kv(
+        mutex: &std::sync::Mutex<Option<Vec<ferrox_metal::attn::MetalKvBuffers>>>,
+    ) -> std::sync::MutexGuard<'_, Option<Vec<ferrox_metal::attn::MetalKvBuffers>>> {
+        mutex
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     /// store, continuous-batch / CPU readers). Safe no-op without Metal KV.
     #[cfg(feature = "metal")]
     pub fn sync_metal_attn_kv_to_host(&self, kv_caches: &mut [KvCache]) {
         assert_eq!(kv_caches.len(), self.layers.len());
-        let Ok(guard) = self.metal_attn_kv.lock() else {
-            return;
-        };
+        let guard = Self::lock_metal_attn_kv(&self.metal_attn_kv);
         let Some(metal_kvs) = guard.as_ref() else {
             return;
         };
@@ -1797,7 +1806,7 @@ impl Decoder {
         let mut metal_kv_guard: Option<
             std::sync::MutexGuard<'_, Option<Vec<ferrox_metal::attn::MetalKvBuffers>>>,
         > = if use_metal_attn {
-            Some(self.metal_attn_kv.lock().unwrap())
+            Some(Self::lock_metal_attn_kv(&self.metal_attn_kv))
         } else {
             None
         };
@@ -2212,6 +2221,13 @@ impl Decoder {
         // When true, residual lives in Metal MoE scratch — host `hidden` is stale.
         #[cfg(feature = "metal")]
         let mut metal_moe_resident = false;
+
+        #[cfg(feature = "metal")]
+        if run_cpu_layers && hidden.is_empty() && !metal_moe_resident {
+            // GPU embedding gather or a skipped Metal dense stack can leave
+            // `hidden` empty; CPU fallback must not call rms_norm on it.
+            hidden = self.embed_token(token_id);
+        }
 
         if run_cpu_layers {
             for (l, (layer, cache)) in self.layers.iter().zip(kv_caches.iter_mut()).enumerate() {
@@ -3746,7 +3762,7 @@ impl Decoder {
         let mut metal_kv_guard: Option<
             std::sync::MutexGuard<'_, Option<Vec<ferrox_metal::attn::MetalKvBuffers>>>,
         > = if use_metal_attn {
-            Some(self.metal_attn_kv.lock().unwrap())
+            Some(Self::lock_metal_attn_kv(&self.metal_attn_kv))
         } else {
             None
         };

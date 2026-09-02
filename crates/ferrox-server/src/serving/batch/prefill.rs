@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use crate::generate::{GenerationParams, PagedLease};
 
-use super::config::JobResult;
+use super::config::BatcherEvent;
 use super::queue::AbortId;
 use super::row::{RowKv, Slot};
 use crate::sample_step::SampleState;
@@ -162,7 +162,7 @@ pub(super) struct Prefill {
     pub(super) prompt_tokens: usize,
     pub(super) params: GenerationParams,
     pub(super) stop_tokens: StopTokens,
-    pub(super) reply: Sender<JobResult>,
+    pub(super) reply: Sender<BatcherEvent>,
     pub(super) abort: AbortId,
     /// Blocks reserved at admission; carried into the `Slot` so the
     /// reservation survives the prefill-to-decode handover.

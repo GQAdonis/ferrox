@@ -3,8 +3,8 @@
 //! ferrox's generic GQA path is opt-in: an architecture that is not in
 //! `capability::AUDITED_GENERIC_GQA` refuses rather than running on the
 //! guess that it is plain GQA. That closed the "loads and computes
-//! something else" class — `gpt2`, `mpt`, `refact`, `bloom` and `jais`
-//! all did exactly that — but it left **47** architectures refusing with
+//! something else" class -- `gpt2`, `mpt`, `refact`, `bloom` and `jais`
+//! all did exactly that -- but it left **47** architectures refusing with
 //! one identical paragraph whose only content is "nobody has checked
 //! this".
 //!
@@ -14,18 +14,18 @@
 //! the 47 split at least three ways, and this suite pins the split for
 //! the architectures that have been read on **both** sides:
 //!
-//! - **fixture-away** — everything is implemented; evidence is missing.
-//! - **one match arm** — one small, nameable piece: an activation, a
+//! - **fixture-away** -- everything is implemented; evidence is missing.
+//! - **one match arm** -- one small, nameable piece: an activation, a
 //!   norm slot, a routing flag, an ordering.
-//! - **new code** — a different attention or residual structure.
-//! - **UNKNOWN** — reading did not settle it; the verdict says what
+//! - **new code** -- a different attention or residual structure.
+//! - **UNKNOWN** -- reading did not settle it; the verdict says what
 //!   would.
 //!
 //! **Why this suite exists rather than only the unit tests in
 //! `capability.rs`:** the failure mode here is not a compile error, it
 //! is a *confident wrong verdict*. This repo has now found four
 //! architectures whose refusal named something that was not the real
-//! blocker — `glm4moe` was told it lacked an MLA hyper-parameter it must
+//! blocker -- `glm4moe` was told it lacked an MLA hyper-parameter it must
 //! not have, and `minimax-m2` was blamed on MTP weights no converter can
 //! emit. Each assertion below therefore pins a specific claim about a
 //! specific llama.cpp line, so that changing the verdict without
@@ -41,7 +41,7 @@ use ferrox_models::capability::{
 };
 
 /// Every architecture that reaches the unaudited refusal gets a
-/// non-empty detail line — triaged or not.
+/// non-empty detail line -- triaged or not.
 ///
 /// A blank detail would be the old refusal wearing a new field.
 #[test]
@@ -61,12 +61,14 @@ fn every_unaudited_architecture_renders_a_detail_line() {
         assert!(detail.len() > 100, "`{}` renders {detail:?}", p.gguf_name);
     }
     assert_eq!(
-        n, 46,
+        n, 41,
         "the unaudited count moved. It was 47 until the triage itself found `minicpm3` was \
          an MLA model sitting on the generic-GQA row and it was reclassified to \
-         DedicatedOnly — which is the count going DOWN for the right reason. Either an \
-         architecture was audited or reclassified (good — update the count and the docs) or \
-         one was added (check it was triaged)"
+         DedicatedOnly, and 46 until `deepseek`, `bailingmoe`, `seed_oss`, `maincoder` and \
+         `hunyuan-moe` were admitted with libllama-golden fixtures -- five ONE MATCH ARM rows \
+         closing is the count going DOWN for the best reason. Either an architecture was \
+         audited or reclassified (good -- update the count and the docs) or one was added \
+         (check it was triaged)"
     );
 }
 
@@ -102,7 +104,7 @@ fn batch_one_verdicts_are_pinned_to_what_was_read() {
         ),
         // bailingmoe2.cpp: fused QKV that ferrox splits, per-head QK
         // norm BEFORE RoPE, sigmoid/softmax read from metadata,
-        // exp_probs_b, shared experts, leading dense — all implemented.
+        // exp_probs_b, shared experts, leading dense -- all implemented.
         (
             "bailingmoe2",
             TriageClass::FixtureAway,
@@ -110,39 +112,28 @@ fn batch_one_verdicts_are_pinned_to_what_was_read() {
         ),
         // --- one match arm: small and nameable -----------------------
         //
-        // seed-oss.cpp:36-37,113-115 — post_attention_norm IS the
-        // pre-FFN norm and there is no ffn_norm. gpt-oss's slot, behind
-        // an `is_gpt_oss` flag that would be widened.
-        ("seed_oss", TriageClass::OneMatchArm, "is_gpt_oss"),
-        // deepseek.cpp:145-155 passes norm_w=false, and the converter
-        // never writes expert_weights_norm, so ferrox renormalises
-        // where llama.cpp does not.
-        (
-            "deepseek",
-            TriageClass::OneMatchArm,
-            "NO_TOPK_RENORMALIZE_ARCHITECTURES",
-        ),
-        // ernie4-5-moe.cpp:64 — MoE layers are interleaved by
+        // `seed_oss`, `deepseek` and `hunyuan-moe` were HERE. All three
+        // arms landed, with libllama-golden fixtures
+        // (`tests/one_match_arm_graphs.rs`), so they are audited now and
+        // carry no verdict at all —
+        // `every_verdict_is_attached_to_a_row_that_actually_refuses_as_unaudited`
+        // is what stops a stale verdict outliving its refusal.
+        //
+        // ernie4-5-moe.cpp:64 -- MoE layers are interleaved by
         // n_moe_layer_step, which `layer_is_dense` does not implement.
         (
             "ernie4_5-moe",
             TriageClass::OneMatchArm,
             "interleave_moe_layer_step",
         ),
-        // hunyuan-moe.cpp:93-118 — QK norm AFTER RoPE, not before.
-        (
-            "hunyuan-moe",
-            TriageClass::OneMatchArm,
-            "AFTER ggml_rope_ext",
-        ),
         // --- new code: a different graph -----------------------------
         //
-        // olmo2.cpp:47,52,92,169 — no attn_norm and no ffn_norm at all;
+        // olmo2.cpp:47,52,92,169 -- no attn_norm and no ffn_norm at all;
         // Q/K/V come off the raw residual.
         ("olmo2", TriageClass::NewCode, "olmo2.cpp:47,52"),
-        // exaone4.cpp:60-67,118,159 — the same post-norm-only topology.
+        // exaone4.cpp:60-67,118,159 -- the same post-norm-only topology.
         ("exaone4", TriageClass::NewCode, "exaone4.cpp:60-67"),
-        // granite.cpp:7-10,188,241-242,301-302 — four multipliers the
+        // granite.cpp:7-10,188,241-242,301-302 -- four multipliers the
         // generic decoder does not apply, plus a rope_finetuned gate.
         ("granite", TriageClass::NewCode, "f_residual_scale"),
         ("granitemoe", TriageClass::NewCode, "f_residual_scale"),
@@ -171,10 +162,10 @@ fn batch_one_verdicts_are_pinned_to_what_was_read() {
 /// `docs/plans/llama-cpp-gap-inventory.md` §1.3 groups `olmo2`,
 /// `seed_oss` and `exaone4` together as "likely a fixture away, if the
 /// loader wires the post-norm slots for non-Gemma families". The wiring
-/// question has a yes answer — `loader.rs` reads
+/// question has a yes answer -- `loader.rs` reads
 /// `blk.N.post_attention_norm.weight` and `blk.N.post_ffw_norm.weight`
 /// for every non-gpt-oss architecture, and the decoder applies them in
-/// llama.cpp's own places — but it is the wrong question. `olmo2` and
+/// llama.cpp's own places -- but it is the wrong question. `olmo2` and
 /// `exaone4` create **no** `attn_norm` and **no** `ffn_norm`
 /// (`olmo2.cpp:42-52`, `exaone4.cpp:53-67`) and project Q/K/V straight
 /// off the residual (`olmo2.cpp:92`, `exaone4.cpp:118`), while the
@@ -183,17 +174,18 @@ fn batch_one_verdicts_are_pinned_to_what_was_read() {
 /// and uses `attn_post_norm` as its pre-FFN norm.
 ///
 /// So the three do not share a class. Pinning that stops the grouping
-/// from being restored from the prose.
+/// from being restored from the prose -- and the split is now settled the
+/// hard way: `seed_oss` RUNS, checked against llama.cpp's own logits,
+/// while `olmo2` and `exaone4` still refuse.
 #[test]
 fn the_post_norm_group_does_not_share_one_class() {
     let olmo2 = unaudited_triage("olmo2").expect("olmo2 verdict");
     let exaone4 = unaudited_triage("exaone4").expect("exaone4 verdict");
-    let seed_oss = unaudited_triage("seed_oss").expect("seed_oss verdict");
 
     assert_eq!(olmo2.class, TriageClass::NewCode);
     assert_eq!(exaone4.class, TriageClass::NewCode);
-    assert_ne!(
-        seed_oss.class, olmo2.class,
+    assert!(
+        is_audited_generic("seed_oss") && unaudited_triage("seed_oss").is_none(),
         "seed_oss has attn_norm and olmo2 does not; they cannot share a class"
     );
     for (name, t) in [("olmo2", olmo2), ("exaone4", exaone4)] {
@@ -236,7 +228,7 @@ fn ernie_moe_is_not_described_as_sigmoid_routed() {
 /// Every triaged architecture really does reach the unaudited refusal.
 ///
 /// A verdict on a row that refuses for a *different*, named reason would
-/// be dead text the user never sees — the same shape as the `glm4moe`
+/// be dead text the user never sees -- the same shape as the `glm4moe`
 /// bug, where the reason shown and the reason true were two different
 /// strings.
 #[test]
@@ -275,7 +267,7 @@ fn the_remaining_work_is_counted() {
         .iter()
         .filter(|p| p.triage.is_some())
         .count();
-    assert_eq!(triaged + TRIAGE_PENDING.len(), 46);
+    assert_eq!(triaged + TRIAGE_PENDING.len(), 41);
 }
 
 /// `minicpm3` is refused as an MLA model, not as an unaudited one.
@@ -520,13 +512,8 @@ fn baichuan_says_which_of_its_two_models_the_verdict_covers() {
 #[test]
 fn batches_four_and_five_verdicts_are_pinned_to_what_was_read() {
     let cases: &[(&str, TriageClass, &str)] = &[
-        // Batch 4.
-        ("maincoder", TriageClass::OneMatchArm, "QK-norm ordering"),
-        (
-            "bailingmoe",
-            TriageClass::OneMatchArm,
-            "never branches on it",
-        ),
+        // Batch 4. `maincoder` and `bailingmoe` were here and are now
+        // audited; see `tests/one_match_arm_graphs.rs`.
         ("arctic", TriageClass::NewCode, "PARALLEL dense+MoE"),
         (
             "mistral3",
@@ -558,7 +545,7 @@ fn batches_four_and_five_verdicts_are_pinned_to_what_was_read() {
         (
             "hunyuan-dense",
             TriageClass::OneMatchArm,
-            "no graph of its own",
+            "NTK-alpha RoPE base rescale",
         ),
         ("laguna", TriageClass::NewCode, "second rotary width"),
         ("step35", TriageClass::NewCode, "per-LAYER rotary width"),
@@ -574,25 +561,34 @@ fn batches_four_and_five_verdicts_are_pinned_to_what_was_read() {
     }
 }
 
-/// Three architectures now want the same QK-norm ordering flag, and each
-/// verdict says so.
+/// The QK-norm ordering arm was wanted by three architectures; two of
+/// them now run on it and the third must NOT still be refused for it.
 ///
-/// That is the argument for adding the flag rather than special-casing
-/// one architecture, and it is the kind of fact a per-row refusal string
-/// loses unless something checks across rows.
+/// The cross-row check was the argument for adding a shared flag rather
+/// than special-casing one architecture. Now that
+/// `Decoder::qk_norm_after_rope` exists, the same check has to run the
+/// other way: `hunyuan-dense` still refuses, and if its verdict still
+/// led with an ordering that is implemented it would send whoever picks
+/// the work up to a solved problem. That is the `glm4moe` defect exactly
+/// -- the reason shown and the reason true being two different strings.
 #[test]
-fn the_qk_norm_ordering_arm_is_wanted_by_three_architectures() {
-    let wanting: Vec<&str> = ["hunyuan-moe", "maincoder", "hunyuan-dense"]
-        .into_iter()
-        .filter(|a| {
-            unaudited_triage(a)
-                .is_some_and(|t| t.blocker.contains("AFTER") && t.blocker.contains("rope"))
-        })
-        .collect();
-    assert_eq!(
-        wanting.len(),
-        3,
-        "expected all three to name the post-RoPE QK norm; got {wanting:?}"
+fn the_qk_norm_ordering_arm_is_no_longer_anybody_s_leading_blocker() {
+    for arch in ["hunyuan-moe", "maincoder"] {
+        assert!(
+            is_audited_generic(arch) && unaudited_triage(arch).is_none(),
+            "`{arch}` got the ordering arm and evidence; it must not still be refused"
+        );
+    }
+    let dense = unaudited_triage("hunyuan-dense").expect("hunyuan-dense still refuses");
+    assert!(
+        dense.blocker.starts_with("the NTK-alpha RoPE base rescale"),
+        "hunyuan-dense must lead with what is actually left: {}",
+        dense.blocker
+    );
+    assert!(
+        dense.blocker.contains("that ordering is implemented"),
+        "and must say the ordering half landed: {}",
+        dense.blocker
     );
 }
 
@@ -641,9 +637,9 @@ fn every_unaudited_row_is_triaged_and_the_distribution_is_pinned() {
     }
     assert_eq!(
         (fixture, arm, new_code, unknown),
-        (9, 7, 26, 4),
+        (9, 2, 26, 4),
         "the triage distribution moved; if a verdict changed on evidence that is correct, \
          update this and docs/MODELS.md together"
     );
-    assert_eq!(fixture + arm + new_code + unknown, 46);
+    assert_eq!(fixture + arm + new_code + unknown, 41);
 }

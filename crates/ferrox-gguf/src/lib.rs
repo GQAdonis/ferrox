@@ -5,7 +5,9 @@
 //! See docs/THIRD_PARTY_NOTICES.md for design-credit details.
 
 pub mod sharded;
+pub mod writer;
 pub use sharded::{ShardError, ShardName, ShardedGguf};
+pub use writer::{GgufWriteError, GgufWriter, TensorPlan};
 
 use std::collections::HashMap;
 use std::fs::File;
@@ -198,44 +200,86 @@ pub enum GgmlType {
     Other(u32),
 }
 
+/// The tag <-> variant table, written ONCE.
+///
+/// This used to be a `match tag { .. }` with no inverse. The moment a
+/// writer needs `variant -> tag` (see [`writer`]) a second spelling of
+/// the same 30 numbers appears, with nothing enforcing that the two
+/// agree -- this repo's dominant bug shape. One table scanned in both
+/// directions, plus `every_named_type_round_trips_through_its_tag`,
+/// makes disagreement impossible rather than unlikely.
+///
+/// Numeric tag values verified directly against `ggml/include/ggml.h`'s
+/// `enum ggml_type` (the public GGUF/ggml tensor-type tag space).
+///
+/// Tags 31/32/33 (`Q4_0_4_4` and friends) are deliberately absent: ggml
+/// REMOVED them from gguf files, so a tag in that range is a malformed
+/// or ancient file, not a gap. Tags 36/37/38 (`IQ4_NL_4_4` and friends)
+/// likewise.
+const GGML_TYPE_TAGS: &[(u32, GgmlType)] = &[
+    (0, GgmlType::F32),
+    (1, GgmlType::F16),
+    (2, GgmlType::Q4_0),
+    (3, GgmlType::Q4_1),
+    (6, GgmlType::Q5_0),
+    (7, GgmlType::Q5_1),
+    (8, GgmlType::Q8_0),
+    (9, GgmlType::Q8_1),
+    (10, GgmlType::Q2K),
+    (11, GgmlType::Q3K),
+    (12, GgmlType::Q4K),
+    (13, GgmlType::Q5K),
+    (14, GgmlType::Q6K),
+    (16, GgmlType::IQ2XXS),
+    (17, GgmlType::IQ2XS),
+    (18, GgmlType::IQ3XXS),
+    (19, GgmlType::IQ1S),
+    (20, GgmlType::IQ4NL),
+    (21, GgmlType::IQ3S),
+    (22, GgmlType::IQ2S),
+    (23, GgmlType::IQ4XS),
+    (26, GgmlType::I32),
+    (29, GgmlType::IQ1M),
+    (30, GgmlType::BF16),
+    (34, GgmlType::TQ1_0),
+    (35, GgmlType::TQ2_0),
+    (39, GgmlType::MXFP4),
+    (40, GgmlType::NVFP4),
+    (41, GgmlType::Q1_0),
+    (42, GgmlType::Q2_0),
+];
+
 impl GgmlType {
     fn from_tag(tag: u32) -> Self {
-        match tag {
-            0 => GgmlType::F32,
-            1 => GgmlType::F16,
-            2 => GgmlType::Q4_0,
-            3 => GgmlType::Q4_1,
-            6 => GgmlType::Q5_0,
-            7 => GgmlType::Q5_1,
-            8 => GgmlType::Q8_0,
-            9 => GgmlType::Q8_1,
-            10 => GgmlType::Q2K,
-            11 => GgmlType::Q3K,
-            12 => GgmlType::Q4K,
-            13 => GgmlType::Q5K,
-            14 => GgmlType::Q6K,
-            16 => GgmlType::IQ2XXS,
-            17 => GgmlType::IQ2XS,
-            18 => GgmlType::IQ3XXS,
-            19 => GgmlType::IQ1S,
-            20 => GgmlType::IQ4NL,
-            21 => GgmlType::IQ3S,
-            22 => GgmlType::IQ2S,
-            23 => GgmlType::IQ4XS,
-            26 => GgmlType::I32,
-            29 => GgmlType::IQ1M,
-            39 => GgmlType::MXFP4,
-            30 => GgmlType::BF16,
-            // Tags 31/32/33 (`Q4_0_4_4` and friends) are deliberately
-            // absent: ggml REMOVED them from gguf files, so a tag in
-            // that range is a malformed or ancient file, not a gap.
-            // Tags 36/37/38 (`IQ4_NL_4_4` and friends) likewise.
-            34 => GgmlType::TQ1_0,
-            35 => GgmlType::TQ2_0,
-            40 => GgmlType::NVFP4,
-            41 => GgmlType::Q1_0,
-            42 => GgmlType::Q2_0,
-            other => GgmlType::Other(other),
+        match GGML_TYPE_TAGS.iter().find(|(t, _)| *t == tag) {
+            Some((_, ty)) => *ty,
+            None => GgmlType::Other(tag),
+        }
+    }
+
+    /// The wire tag for this type, for a GGUF *writer* (see [`writer`]).
+    ///
+    /// `Other(tag)` hands back its own tag, so a tensor of a type this
+    /// build does not name survives a read-then-write as itself rather
+    /// than silently becoming something else. Whether such a tensor can
+    /// be copied at all is [`TensorInfo::byte_len`]'s decision, not
+    /// this one.
+    pub fn to_tag(&self) -> u32 {
+        match self {
+            GgmlType::Other(tag) => *tag,
+            named => GGML_TYPE_TAGS
+                .iter()
+                .find(|(_, ty)| ty == named)
+                .map(|(t, _)| *t)
+                // NOT a gate -- it cannot fire today, and
+                // `every_named_type_round_trips_through_its_tag` is
+                // what keeps it that way, by walking the enum against
+                // the table. It is the total-function fallback Rust
+                // requires, and `u32::MAX` is chosen so that if a
+                // future variant is ever added without a table row the
+                // file is refused by a reader rather than read as F32
+                // (tag 0), which is what a `0` here would produce.
+                .unwrap_or(u32::MAX),
         }
     }
 
@@ -655,6 +699,85 @@ mod tests {
     use super::*;
     use byteorder::WriteBytesExt;
     use std::io::Write;
+
+    /// Walks the enum, one variant per arm, and hands back the next.
+    ///
+    /// Its only job is to make the compiler enumerate `GgmlType`: the
+    /// match has no `_` arm, so adding a variant stops this file
+    /// compiling until the variant is threaded into the chain, and
+    /// `every_named_type_round_trips_through_its_tag` then fails until
+    /// it is also in `GGML_TYPE_TAGS`. A plain list of variants in the
+    /// test would be a second table nothing forces anyone to update --
+    /// which is the exact defect the one-table refactor removed.
+    fn next_variant(t: GgmlType) -> Option<GgmlType> {
+        Some(match t {
+            GgmlType::F32 => GgmlType::F16,
+            GgmlType::F16 => GgmlType::BF16,
+            GgmlType::BF16 => GgmlType::Q4_0,
+            GgmlType::Q4_0 => GgmlType::Q4_1,
+            GgmlType::Q4_1 => GgmlType::Q5_0,
+            GgmlType::Q5_0 => GgmlType::Q5_1,
+            GgmlType::Q5_1 => GgmlType::Q8_0,
+            GgmlType::Q8_0 => GgmlType::Q8_1,
+            GgmlType::Q8_1 => GgmlType::Q2K,
+            GgmlType::Q2K => GgmlType::Q3K,
+            GgmlType::Q3K => GgmlType::Q4K,
+            GgmlType::Q4K => GgmlType::Q5K,
+            GgmlType::Q5K => GgmlType::Q6K,
+            GgmlType::Q6K => GgmlType::IQ4NL,
+            GgmlType::IQ4NL => GgmlType::IQ4XS,
+            GgmlType::IQ4XS => GgmlType::IQ1S,
+            GgmlType::IQ1S => GgmlType::IQ1M,
+            GgmlType::IQ1M => GgmlType::IQ2XXS,
+            GgmlType::IQ2XXS => GgmlType::IQ2XS,
+            GgmlType::IQ2XS => GgmlType::IQ2S,
+            GgmlType::IQ2S => GgmlType::IQ3XXS,
+            GgmlType::IQ3XXS => GgmlType::IQ3S,
+            GgmlType::IQ3S => GgmlType::MXFP4,
+            GgmlType::MXFP4 => GgmlType::I32,
+            GgmlType::I32 => GgmlType::TQ1_0,
+            GgmlType::TQ1_0 => GgmlType::TQ2_0,
+            GgmlType::TQ2_0 => GgmlType::NVFP4,
+            GgmlType::NVFP4 => GgmlType::Q1_0,
+            GgmlType::Q1_0 => GgmlType::Q2_0,
+            GgmlType::Q2_0 => return None,
+            GgmlType::Other(_) => return None,
+        })
+    }
+
+    /// `from_tag` and `to_tag` read one table, and every named variant
+    /// is in it. The writer added in `writer.rs` needs the inverse of a
+    /// mapping that used to exist only one way; two hand-written
+    /// tables agreeing about thirty numbers is this repo's dominant bug
+    /// shape, so this walks the enum and the table against each other.
+    #[test]
+    fn every_named_type_round_trips_through_its_tag() {
+        let mut ty = Some(GgmlType::F32);
+        let mut seen = 0usize;
+        while let Some(t) = ty {
+            let tag = t.to_tag();
+            assert_ne!(tag, u32::MAX, "{t:?} has no row in GGML_TYPE_TAGS");
+            assert_eq!(GgmlType::from_tag(tag), t, "tag {tag} does not map back");
+            seen += 1;
+            ty = next_variant(t);
+        }
+        assert_eq!(
+            seen,
+            GGML_TYPE_TAGS.len(),
+            "the enum and GGML_TYPE_TAGS disagree about how many named types there are"
+        );
+    }
+
+    /// A tag this build does not name survives a read-then-write as
+    /// itself. Writing it as F32 (tag 0) would turn an unknown tensor
+    /// into a wrong one silently; ggml has already added tags this
+    /// build predates, so the arm is reachable, not theoretical.
+    #[test]
+    fn an_unknown_tag_round_trips_as_itself() {
+        let unknown = GgmlType::from_tag(9999);
+        assert_eq!(unknown, GgmlType::Other(9999));
+        assert_eq!(unknown.to_tag(), 9999);
+    }
 
     /// Builds a tiny synthetic GGUF byte buffer in memory (no real model
     /// weights involved) so the parser can be exercised without any

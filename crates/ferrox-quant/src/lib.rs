@@ -12,6 +12,9 @@
 //! `ferrox-models`'
 //! GGUF-roundtrip tests.
 
+pub mod encode;
+pub use encode::{encode_block_q8_0, encode_row_q8_0};
+
 pub mod iq_tables;
 /// ggml-produced golden vectors for the IQ2_XS/IQ2_S/IQ3_S/IQ1_M
 /// kernels. Test-only: a ~60 KB data blob has no business in a release
@@ -570,24 +573,29 @@ pub fn dot_q6_k_f32_scalar(row_bytes: &[u8], x: &[f32]) -> f32 {
     acc
 }
 
-/// Quantize an f32 slice into Q8_0 blocks (used by test fixtures and by
-/// the CPU reference "quantize activations for a symmetric int8 matmul"
-/// path). Not performance tuned; correctness-first reference only.
+/// Quantize an f32 slice into Q8_0 blocks, zero-padding a partial
+/// trailing block. Used by test fixtures and by the CPU reference
+/// "quantize activations for a symmetric int8 matmul" path, where the
+/// vector length is not guaranteed to be a whole number of blocks.
+///
+/// The per-block arithmetic is [`encode::encode_block_q8_0`], not a
+/// second spelling of it: this function used to have its own, which
+/// divided by the scale where llama.cpp multiplies by its reciprocal
+/// and stored a scale of 1.0 for an all-zero block where llama.cpp
+/// stores 0.0. Both differences are invisible to a value comparison
+/// and both produce different bytes, which is exactly the kind of
+/// silent divergence a second copy of a code path creates. The tail
+/// padding is the ONLY thing this adds.
+///
+/// A *weight* encoder wants [`encode::encode_row_q8_0`] instead, which
+/// refuses a ragged length rather than padding it: padding a weight row
+/// writes more elements than its shape declares.
 pub fn quantize_q8_0(src: &[f32]) -> Vec<u8> {
-    let mut out = Vec::with_capacity((src.len() / Q8_0_BLOCK_ELEMS + 1) * Q8_0_BLOCK_BYTES);
+    let mut out = Vec::with_capacity(src.len().div_ceil(Q8_0_BLOCK_ELEMS) * Q8_0_BLOCK_BYTES);
     for chunk in src.chunks(Q8_0_BLOCK_ELEMS) {
-        let amax = chunk.iter().fold(0f32, |a, &b| a.max(b.abs()));
-        let scale = if amax == 0.0 { 1.0 } else { amax / 127.0 };
-        out.extend_from_slice(&f16::from_f32(scale).to_le_bytes());
-        for i in 0..Q8_0_BLOCK_ELEMS {
-            let v = chunk.get(i).copied().unwrap_or(0.0);
-            let q = if scale == 0.0 {
-                0
-            } else {
-                (v / scale).round().clamp(-127.0, 127.0) as i8
-            };
-            out.push(q as u8);
-        }
+        let mut block = [0f32; Q8_0_BLOCK_ELEMS];
+        block[..chunk.len()].copy_from_slice(chunk);
+        encode::encode_block_q8_0(&block, &mut out);
     }
     out
 }

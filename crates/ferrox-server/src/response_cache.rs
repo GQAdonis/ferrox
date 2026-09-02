@@ -187,6 +187,10 @@ pub struct SamplingKey {
     pub penalty_last_n: usize,
     pub presence_penalty_bits: u32,
     pub frequency_penalty_bits: u32,
+    /// The ORDER the chain ran in (llama.cpp's `samplers`). Two
+    /// requests that differ only in it get different answers, so it is
+    /// a key field like any other knob.
+    pub sampler_order: ferrox_models::sampler_order::SamplerOrder,
 }
 
 /// The cache-key form of a resolved sampling configuration.
@@ -209,6 +213,7 @@ pub fn sampling_key(params: &SamplingParams) -> SamplingKey {
         penalty_last_n,
         presence_penalty,
         frequency_penalty,
+        sampler_order,
     } = params;
     SamplingKey {
         temperature_bits: temperature.to_bits(),
@@ -219,6 +224,7 @@ pub fn sampling_key(params: &SamplingParams) -> SamplingKey {
         penalty_last_n: *penalty_last_n,
         presence_penalty_bits: presence_penalty.to_bits(),
         frequency_penalty_bits: frequency_penalty.to_bits(),
+        sampler_order: *sampler_order,
     }
 }
 

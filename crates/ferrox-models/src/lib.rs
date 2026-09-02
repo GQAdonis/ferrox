@@ -61,6 +61,7 @@ pub mod rank_head;
 pub mod recurrent_engine;
 pub mod residency_report;
 pub(crate) mod sampler_chain;
+pub mod sampler_order;
 pub mod sampling;
 pub mod speculative;
 pub mod t5_engine;
@@ -102,6 +103,7 @@ pub use penalty_window::PenaltyWindow;
 pub use pooling::{l2_normalize, pool, PoolingError, PoolingType};
 pub use prefix_cache::{PrefixCache, PrefixCacheStats, PrefixMatch};
 pub use rank_head::{load_rank_head, RankHead};
+pub use sampler_order::{ChainStep, SamplerName, SamplerOrder, SamplerOrderError};
 pub use sampling::{sampling_distribution, Sampler, SamplingParams};
 pub use speculative::{
     accept_or_resample, speculative_decode, speculative_decode_with, DraftBlock, DraftDist,

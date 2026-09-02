@@ -1,5 +1,3 @@
-use rayon::prelude::*;
-
 use crate::tensor::Tensor;
 
 /// Row-major matmul: `a` is [m, k], `b_t` is [n, k] (i.e. already
@@ -30,7 +28,7 @@ pub fn matmul_f32(a: &Tensor, b_t: &Tensor) -> Tensor {
     let mut out = vec![0f32; m * n];
     if m == 1 {
         let a_row = a.row(0);
-        out.par_iter_mut().enumerate().for_each(|(col, out_val)| {
+        crate::par::items_mut(&mut out, 1, |col, out_val| {
             let b_row = b_t.row(col);
             let mut acc = 0f32;
             for i in 0..k {
@@ -39,19 +37,17 @@ pub fn matmul_f32(a: &Tensor, b_t: &Tensor) -> Tensor {
             *out_val = acc;
         });
     } else {
-        out.par_chunks_mut(n)
-            .enumerate()
-            .for_each(|(row, out_row)| {
-                let a_row = a.row(row);
-                for (col, out_val) in out_row.iter_mut().enumerate() {
-                    let b_row = b_t.row(col);
-                    let mut acc = 0f32;
-                    for i in 0..k {
-                        acc += a_row[i] * b_row[i];
-                    }
-                    *out_val = acc;
+        crate::par::chunks_mut(&mut out, n, 1, |row, out_row| {
+            let a_row = a.row(row);
+            for (col, out_val) in out_row.iter_mut().enumerate() {
+                let b_row = b_t.row(col);
+                let mut acc = 0f32;
+                for i in 0..k {
+                    acc += a_row[i] * b_row[i];
                 }
-            });
+                *out_val = acc;
+            }
+        });
     }
 
     Tensor::new(out, vec![m, n])
@@ -285,11 +281,12 @@ where
         return out;
     }
     // Cache-line-aligned chunks so no two tasks share a 64-byte line.
-    let chunk = (n.div_ceil(rayon::current_num_threads() * 4)).next_multiple_of(16);
-    out.par_chunks_mut(chunk)
-        .zip(gate.par_chunks(chunk))
-        .zip(up.par_chunks(chunk))
-        .for_each(|((o, g), u)| f(g, u, o));
+    let chunk = (n.div_ceil(crate::par::num_threads() * 4)).next_multiple_of(16);
+    crate::par::chunks_mut(&mut out, chunk, 1, |c, o| {
+        let start = c * chunk;
+        let end = start + o.len();
+        f(&gate[start..end], &up[start..end], o);
+    });
     out
 }
 

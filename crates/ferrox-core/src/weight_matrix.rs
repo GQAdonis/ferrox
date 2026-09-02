@@ -490,6 +490,18 @@ thread_local! {
 
 /// Minimum multiply-accumulates a rayon task should carry before it is
 /// worth its own scheduling. Chosen by measurement, not derivation.
+///
+/// **This is a rayon-only mitigation and it is unreachable on
+/// [`crate::par::Backend::Spin`].** It exists to stop rayon splitting a
+/// matvec into tasks too small to repay a fork-join; the persistent pool
+/// has no fork-join to repay, so it chunks by pool width alone (see the
+/// `MIN_TASK_MACS` section of [`crate::par`]). Issue #27 asks for this
+/// constant to be deleted rather than retuned, and on the new path it is:
+/// [`WeightMatrix::with_row_work`] does not publish anything there, so
+/// the branch below that reads it cannot be taken. It survives on the
+/// rayon path because that path is still the default and removing it
+/// there re-opens the 13-16x small-model regression recorded on
+/// [`WeightMatrix::min_rows_per_task`].
 const MIN_TASK_MACS: usize = 1 << 16;
 
 /// Whether dense [`WeightMatrix::apply`] / [`WeightMatrix::apply_batch`]
@@ -781,7 +793,7 @@ impl WeightMatrix {
     /// multiply-accumulates. Zero (unset) keeps the old row-only
     /// behaviour, so any call site that has not opted in is unchanged.
     fn min_rows_per_task(rows: usize) -> usize {
-        let threads = rayon::current_num_threads().max(1);
+        let threads = crate::par::num_threads();
         let by_threads = (rows / (threads * 4)).max(8.min(rows.max(1)));
         let per_row = ROW_WORK.with(|c| c.get());
         if per_row == 0 {
@@ -794,11 +806,29 @@ impl WeightMatrix {
     /// Runs `f` with the per-row work (elements dotted per output row)
     /// published for [`Self::min_rows_per_task`]. Restores the previous
     /// value, so nesting is safe.
+    ///
+    /// Publishes **nothing** under [`crate::par::Backend::Spin`]: that is
+    /// the single place `MIN_TASK_MACS` is switched off, rather than a
+    /// second copy of the decision at each of the thirty-odd call sites
+    /// that ask for a `min_len`.
     fn with_row_work<R>(per_row: usize, f: impl FnOnce() -> R) -> R {
+        let per_row = Self::row_work_for(crate::par::backend(), per_row);
         let prev = ROW_WORK.with(|c| c.replace(per_row));
         let out = f();
         ROW_WORK.with(|c| c.set(prev));
         out
+    }
+
+    /// What [`Self::with_row_work`] publishes, as a pure function of the
+    /// scheduler, so the claim "`MIN_TASK_MACS` is unreachable on the
+    /// persistent pool" is a test rather than a comment.
+    fn row_work_for(backend: crate::par::Backend, per_row: usize) -> usize {
+        match backend {
+            crate::par::Backend::Rayon => per_row,
+            // Zero means "no work-aware floor", which is exactly the
+            // branch `min_rows_per_task` returns early on.
+            crate::par::Backend::Spin => 0,
+        }
     }
 
     /// Run `body(g, t0, t1)` for every row-group `g` and activation-tile
@@ -824,7 +854,7 @@ impl WeightMatrix {
         if n_groups == 0 || n_tiles == 0 {
             return;
         }
-        let nth = rayon::current_num_threads().max(1);
+        let nth = crate::par::num_threads();
         const CHUNK_ELEMS: usize = 16;
         let g_per_chunk = (CHUNK_ELEMS / group_rows).max(1);
         let t_per_chunk = (CHUNK_ELEMS / tile_batch).max(1);
@@ -842,18 +872,15 @@ impl WeightMatrix {
         }
         let dg = n_groups.div_ceil(nchunk_g);
         let dt = n_tiles.div_ceil(nchunk_t);
-        (0..nchunk_g * nchunk_t)
-            .into_par_iter()
-            .with_min_len(1)
-            .for_each(|chunk| {
-                let g0 = (chunk % nchunk_g) * dg;
-                let g1 = (g0 + dg).min(n_groups);
-                let t0 = (chunk / nchunk_g) * dt;
-                let t1 = (t0 + dt).min(n_tiles);
-                for g in g0..g1 {
-                    body(g, t0, t1);
-                }
-            });
+        crate::par::indices(nchunk_g * nchunk_t, 1, |chunk| {
+            let g0 = (chunk % nchunk_g) * dg;
+            let g1 = (g0 + dg).min(n_groups);
+            let t0 = (chunk / nchunk_g) * dt;
+            let t1 = (t0 + dt).min(n_tiles);
+            for g in g0..g1 {
+                body(g, t0, t1);
+            }
+        });
     }
 
     /// Resolve the Q8_0-format activations (and the interleaved quads, if
@@ -1136,6 +1163,13 @@ impl WeightMatrix {
     /// their regions can coexist and let rayon's work-stealing fill
     /// threads that would otherwise idle at the tail of each one.
     ///
+    /// Under [`crate::par::Backend::Spin`] the three run one after the
+    /// other instead: each already spreads across the whole persistent
+    /// pool, and the reason to overlap them was to hide a fork-join that
+    /// the persistent pool does not pay. That choice lives in
+    /// [`crate::par::join3`], not here, so it cannot drift from the one
+    /// in `ferrox-moe`'s gate/up pair.
+    ///
     /// CPU only. On a GPU backend each `apply` submits and waits on its
     /// own command buffer, and Metal decode is already at or ahead of
     /// parity -- there is nothing to win and a live path to disturb.
@@ -1149,9 +1183,7 @@ impl WeightMatrix {
         if gpu {
             return (a.apply(x), b.apply(x), c.apply(x));
         }
-        let (ra, (rb, rc)) =
-            rayon::join(|| a.apply(x), || rayon::join(|| b.apply(x), || c.apply(x)));
-        (ra, rb, rc)
+        crate::par::join3(|| a.apply(x), || b.apply(x), || c.apply(x))
     }
 
     pub fn apply_cpu(&self, x: &[f32]) -> Vec<f32> {
@@ -1210,11 +1242,11 @@ impl WeightMatrix {
                                         );
                                     }
                                 } else {
-                                    out[..n_groups * ferrox_quant::Q8_0X4_NROWS]
-                                        .par_chunks_mut(ferrox_quant::Q8_0X4_NROWS)
-                                        .with_min_len(Self::min_rows_per_task(n_groups).max(1))
-                                        .enumerate()
-                                        .for_each(|(g, chunk)| {
+                                    crate::par::chunks_mut(
+                                        &mut out[..n_groups * ferrox_quant::Q8_0X4_NROWS],
+                                        ferrox_quant::Q8_0X4_NROWS,
+                                        Self::min_rows_per_task(n_groups).max(1),
+                                        |g, chunk| {
                                             ferrox_quant::gemv_q8_0x4_group(
                                                 &packed,
                                                 g,
@@ -1223,7 +1255,8 @@ impl WeightMatrix {
                                                 ferrox_quant::q8_0x4_interleave(),
                                                 chunk,
                                             );
-                                        });
+                                        },
+                                    );
                                 }
                                 let data_slice = data.as_slice();
                                 let tail_len = *rows - n_groups * ferrox_quant::Q8_0X4_NROWS;
@@ -1238,15 +1271,12 @@ impl WeightMatrix {
                                         }
                                     } else {
                                         let min_len = Self::min_rows_per_task(tail_len);
-                                        tail.par_iter_mut()
-                                            .with_min_len(min_len)
-                                            .enumerate()
-                                            .for_each(|(i, o)| {
-                                                let r = n_groups * ferrox_quant::Q8_0X4_NROWS + i;
-                                                let row =
-                                                    &data_slice[r * row_bytes..(r + 1) * row_bytes];
-                                                *o = ferrox_quant::dot_q8_0_q8(row, &act);
-                                            });
+                                        crate::par::items_mut(tail, min_len, |i, o| {
+                                            let r = n_groups * ferrox_quant::Q8_0X4_NROWS + i;
+                                            let row =
+                                                &data_slice[r * row_bytes..(r + 1) * row_bytes];
+                                            *o = ferrox_quant::dot_q8_0_q8(row, &act);
+                                        });
                                     }
                                 }
                                 return out;
@@ -1257,14 +1287,15 @@ impl WeightMatrix {
                                     *o = ferrox_quant::dot_q8_0_q8(row, &act);
                                 }
                             } else {
-                                out.par_iter_mut()
-                                    .with_min_len(Self::min_rows_per_task(*rows))
-                                    .enumerate()
-                                    .for_each(|(r, o)| {
+                                crate::par::items_mut(
+                                    &mut out,
+                                    Self::min_rows_per_task(*rows),
+                                    |r, o| {
                                         let row =
                                             &data.as_slice()[r * row_bytes..(r + 1) * row_bytes];
                                         *o = ferrox_quant::dot_q8_0_q8(row, &act);
-                                    });
+                                    },
+                                );
                             }
                             return out;
                         }
@@ -1294,11 +1325,11 @@ impl WeightMatrix {
                                         );
                                     }
                                 } else {
-                                    out[..n_groups * ferrox_quant::Q4_0X4_NROWS]
-                                        .par_chunks_mut(ferrox_quant::Q4_0X4_NROWS)
-                                        .with_min_len(Self::min_rows_per_task(n_groups).max(1))
-                                        .enumerate()
-                                        .for_each(|(g, chunk)| {
+                                    crate::par::chunks_mut(
+                                        &mut out[..n_groups * ferrox_quant::Q4_0X4_NROWS],
+                                        ferrox_quant::Q4_0X4_NROWS,
+                                        Self::min_rows_per_task(n_groups).max(1),
+                                        |g, chunk| {
                                             ferrox_quant::gemv_q4_0x4_group(
                                                 &packed,
                                                 g,
@@ -1307,7 +1338,8 @@ impl WeightMatrix {
                                                 ferrox_quant::q4_0x4_interleave(),
                                                 chunk,
                                             );
-                                        });
+                                        },
+                                    );
                                 }
                                 let data_slice = data.as_slice();
                                 let tail_len = *rows - n_groups * ferrox_quant::Q4_0X4_NROWS;
@@ -1322,15 +1354,12 @@ impl WeightMatrix {
                                         }
                                     } else {
                                         let min_len = Self::min_rows_per_task(tail_len);
-                                        tail.par_iter_mut()
-                                            .with_min_len(min_len)
-                                            .enumerate()
-                                            .for_each(|(i, o)| {
-                                                let r = n_groups * ferrox_quant::Q4_0X4_NROWS + i;
-                                                let row =
-                                                    &data_slice[r * row_bytes..(r + 1) * row_bytes];
-                                                *o = ferrox_quant::dot_q4_0_q8(row, &act);
-                                            });
+                                        crate::par::items_mut(tail, min_len, |i, o| {
+                                            let r = n_groups * ferrox_quant::Q4_0X4_NROWS + i;
+                                            let row =
+                                                &data_slice[r * row_bytes..(r + 1) * row_bytes];
+                                            *o = ferrox_quant::dot_q4_0_q8(row, &act);
+                                        });
                                     }
                                 }
                                 return out;
@@ -1341,14 +1370,15 @@ impl WeightMatrix {
                                     *o = ferrox_quant::dot_q4_0_q8(row, &act);
                                 }
                             } else {
-                                out.par_iter_mut()
-                                    .with_min_len(Self::min_rows_per_task(*rows))
-                                    .enumerate()
-                                    .for_each(|(r, o)| {
+                                crate::par::items_mut(
+                                    &mut out,
+                                    Self::min_rows_per_task(*rows),
+                                    |r, o| {
                                         let row =
                                             &data.as_slice()[r * row_bytes..(r + 1) * row_bytes];
                                         *o = ferrox_quant::dot_q4_0_q8(row, &act);
-                                    });
+                                    },
+                                );
                             }
                             return out;
                         }
@@ -1359,36 +1389,38 @@ impl WeightMatrix {
                                 let interleave = ferrox_quant::q4_kx8_interleave();
                                 let packed =
                                     get_or_repack_q4k(data.as_slice(), *rows, *cols, data.map_id());
-                                out[..n_groups * ferrox_quant::Q4_KX8_NROWS]
-                                    .par_chunks_mut(ferrox_quant::Q4_KX8_NROWS)
-                                    .with_min_len(Self::min_rows_per_task(n_groups).max(1))
-                                    .enumerate()
-                                    .for_each(|(g, chunk)| {
+                                crate::par::chunks_mut(
+                                    &mut out[..n_groups * ferrox_quant::Q4_KX8_NROWS],
+                                    ferrox_quant::Q4_KX8_NROWS,
+                                    Self::min_rows_per_task(n_groups).max(1),
+                                    |g, chunk| {
                                         ferrox_quant::gemv_q4_kx8_group(
                                             &packed, g, &act, *cols, interleave, chunk,
                                         );
-                                    });
+                                    },
+                                );
                                 let data_slice = data.as_slice();
-                                out[n_groups * ferrox_quant::Q4_KX8_NROWS..]
-                                    .par_iter_mut()
-                                    .with_min_len(Self::min_rows_per_task(
+                                crate::par::items_mut(
+                                    &mut out[n_groups * ferrox_quant::Q4_KX8_NROWS..],
+                                    Self::min_rows_per_task(
                                         *rows - n_groups * ferrox_quant::Q4_KX8_NROWS,
-                                    ))
-                                    .enumerate()
-                                    .for_each(|(i, o)| {
+                                    ),
+                                    |i, o| {
                                         let r = n_groups * ferrox_quant::Q4_KX8_NROWS + i;
                                         let row = &data_slice[r * row_bytes..(r + 1) * row_bytes];
                                         *o = ferrox_quant::dot_q4_k_q8(row, &act);
-                                    });
+                                    },
+                                );
                                 return out;
                             }
-                            out.par_iter_mut()
-                                .with_min_len(Self::min_rows_per_task(*rows))
-                                .enumerate()
-                                .for_each(|(r, o)| {
+                            crate::par::items_mut(
+                                &mut out,
+                                Self::min_rows_per_task(*rows),
+                                |r, o| {
                                     let row = &data.as_slice()[r * row_bytes..(r + 1) * row_bytes];
                                     *o = ferrox_quant::dot_q4_k_q8(row, &act);
-                                });
+                                },
+                            );
                             return out;
                         }
                         QuantKind::Q5K if x.len().is_multiple_of(256) => {
@@ -1398,36 +1430,38 @@ impl WeightMatrix {
                                 let interleave = ferrox_quant::q5_kx8_interleave();
                                 let packed =
                                     get_or_repack_q5k(data.as_slice(), *rows, *cols, data.map_id());
-                                out[..n_groups * ferrox_quant::Q5_KX8_NROWS]
-                                    .par_chunks_mut(ferrox_quant::Q5_KX8_NROWS)
-                                    .with_min_len(Self::min_rows_per_task(n_groups).max(1))
-                                    .enumerate()
-                                    .for_each(|(g, chunk)| {
+                                crate::par::chunks_mut(
+                                    &mut out[..n_groups * ferrox_quant::Q5_KX8_NROWS],
+                                    ferrox_quant::Q5_KX8_NROWS,
+                                    Self::min_rows_per_task(n_groups).max(1),
+                                    |g, chunk| {
                                         ferrox_quant::gemv_q5_kx8_group(
                                             &packed, g, &act, *cols, interleave, chunk,
                                         );
-                                    });
+                                    },
+                                );
                                 let data_slice = data.as_slice();
-                                out[n_groups * ferrox_quant::Q5_KX8_NROWS..]
-                                    .par_iter_mut()
-                                    .with_min_len(Self::min_rows_per_task(
+                                crate::par::items_mut(
+                                    &mut out[n_groups * ferrox_quant::Q5_KX8_NROWS..],
+                                    Self::min_rows_per_task(
                                         *rows - n_groups * ferrox_quant::Q5_KX8_NROWS,
-                                    ))
-                                    .enumerate()
-                                    .for_each(|(i, o)| {
+                                    ),
+                                    |i, o| {
                                         let r = n_groups * ferrox_quant::Q5_KX8_NROWS + i;
                                         let row = &data_slice[r * row_bytes..(r + 1) * row_bytes];
                                         *o = ferrox_quant::dot_q5_k_q8(row, &act);
-                                    });
+                                    },
+                                );
                                 return out;
                             }
-                            out.par_iter_mut()
-                                .with_min_len(Self::min_rows_per_task(*rows))
-                                .enumerate()
-                                .for_each(|(r, o)| {
+                            crate::par::items_mut(
+                                &mut out,
+                                Self::min_rows_per_task(*rows),
+                                |r, o| {
                                     let row = &data.as_slice()[r * row_bytes..(r + 1) * row_bytes];
                                     *o = ferrox_quant::dot_q5_k_q8(row, &act);
-                                });
+                                },
+                            );
                             return out;
                         }
                         QuantKind::Q6K if x.len().is_multiple_of(256) => {
@@ -1437,48 +1471,47 @@ impl WeightMatrix {
                                 let interleave = ferrox_quant::q6_kx8_interleave();
                                 let packed =
                                     get_or_repack_q6k(data.as_slice(), *rows, *cols, data.map_id());
-                                out[..n_groups * ferrox_quant::Q6_KX8_NROWS]
-                                    .par_chunks_mut(ferrox_quant::Q6_KX8_NROWS)
-                                    .with_min_len(Self::min_rows_per_task(n_groups).max(1))
-                                    .enumerate()
-                                    .for_each(|(g, out8)| {
+                                crate::par::chunks_mut(
+                                    &mut out[..n_groups * ferrox_quant::Q6_KX8_NROWS],
+                                    ferrox_quant::Q6_KX8_NROWS,
+                                    Self::min_rows_per_task(n_groups).max(1),
+                                    |g, out8| {
                                         ferrox_quant::gemv_q6_kx8_group(
                                             &packed, g, &act, *cols, interleave, out8,
                                         );
-                                    });
-                                out[n_groups * ferrox_quant::Q6_KX8_NROWS..]
-                                    .par_iter_mut()
-                                    .with_min_len(Self::min_rows_per_task(
+                                    },
+                                );
+                                crate::par::items_mut(
+                                    &mut out[n_groups * ferrox_quant::Q6_KX8_NROWS..],
+                                    Self::min_rows_per_task(
                                         *rows - n_groups * ferrox_quant::Q6_KX8_NROWS,
-                                    ))
-                                    .enumerate()
-                                    .for_each(|(i, o)| {
+                                    ),
+                                    |i, o| {
                                         let r = n_groups * ferrox_quant::Q6_KX8_NROWS + i;
                                         let row =
                                             &data.as_slice()[r * row_bytes..(r + 1) * row_bytes];
                                         *o = ferrox_quant::dot_q6_k_q8(row, &act);
-                                    });
+                                    },
+                                );
                                 return out;
                             }
-                            out.par_iter_mut()
-                                .with_min_len(Self::min_rows_per_task(*rows))
-                                .enumerate()
-                                .for_each(|(r, o)| {
+                            crate::par::items_mut(
+                                &mut out,
+                                Self::min_rows_per_task(*rows),
+                                |r, o| {
                                     let row = &data.as_slice()[r * row_bytes..(r + 1) * row_bytes];
                                     *o = ferrox_quant::dot_q6_k_q8(row, &act);
-                                });
+                                },
+                            );
                             return out;
                         }
                         _ => {}
                     }
                 }
-                out.par_iter_mut()
-                    .with_min_len(Self::min_rows_per_task(*rows))
-                    .enumerate()
-                    .for_each(|(r, o)| {
-                        let row = &data.as_slice()[r * row_bytes..(r + 1) * row_bytes];
-                        *o = Self::dot(*kind, row, x);
-                    });
+                crate::par::items_mut(&mut out, Self::min_rows_per_task(*rows), |r, o| {
+                    let row = &data.as_slice()[r * row_bytes..(r + 1) * row_bytes];
+                    *o = Self::dot(*kind, row, x);
+                });
                 out
             }
             WeightMatrix::Mxfp4 {
@@ -1490,16 +1523,11 @@ impl WeightMatrix {
                 let packed_row_bytes = cols / 2;
                 let scale_row_bytes = cols / ferrox_quant::MXFP4_GROUP_SIZE;
                 let mut out = vec![0f32; *rows];
-                out.par_iter_mut()
-                    .with_min_len(Self::min_rows_per_task(*rows))
-                    .enumerate()
-                    .for_each(|(r, o)| {
-                        let prow =
-                            &packed.as_slice()[r * packed_row_bytes..(r + 1) * packed_row_bytes];
-                        let srow =
-                            &scale.as_slice()[r * scale_row_bytes..(r + 1) * scale_row_bytes];
-                        *o = ferrox_quant::dot_mxfp4_row_f32(prow, srow, x);
-                    });
+                crate::par::items_mut(&mut out, Self::min_rows_per_task(*rows), |r, o| {
+                    let prow = &packed.as_slice()[r * packed_row_bytes..(r + 1) * packed_row_bytes];
+                    let srow = &scale.as_slice()[r * scale_row_bytes..(r + 1) * scale_row_bytes];
+                    *o = ferrox_quant::dot_mxfp4_row_f32(prow, srow, x);
+                });
                 out
             }
         }
@@ -1551,11 +1579,12 @@ impl WeightMatrix {
                         body(g, chunk);
                     }
                 } else {
-                    out[..n_groups * ferrox_quant::Q8_0X4_NROWS]
-                        .par_chunks_mut(ferrox_quant::Q8_0X4_NROWS)
-                        .with_min_len(Self::min_rows_per_task(n_groups).max(1))
-                        .enumerate()
-                        .for_each(|(g, chunk)| body(g, chunk));
+                    crate::par::chunks_mut(
+                        &mut out[..n_groups * ferrox_quant::Q8_0X4_NROWS],
+                        ferrox_quant::Q8_0X4_NROWS,
+                        Self::min_rows_per_task(n_groups).max(1),
+                        |g, chunk| body(g, chunk),
+                    );
                 }
                 let tail_len = *rows - n_groups * ferrox_quant::Q8_0X4_NROWS;
                 if tail_len > 0 {
@@ -1570,16 +1599,13 @@ impl WeightMatrix {
                         }
                     } else {
                         let min_len = Self::min_rows_per_task(tail_len);
-                        tail.par_iter_mut()
-                            .with_min_len(min_len)
-                            .enumerate()
-                            .for_each(|(i, o)| {
-                                let r = n_groups * ferrox_quant::Q8_0X4_NROWS + i;
-                                *o = ferrox_quant::dot_q8_0_q8(
-                                    &data[r * row_bytes..(r + 1) * row_bytes],
-                                    act,
-                                );
-                            });
+                        crate::par::items_mut(tail, min_len, |i, o| {
+                            let r = n_groups * ferrox_quant::Q8_0X4_NROWS + i;
+                            *o = ferrox_quant::dot_q8_0_q8(
+                                &data[r * row_bytes..(r + 1) * row_bytes],
+                                act,
+                            );
+                        });
                     }
                 }
                 return Some(out);
@@ -1608,11 +1634,12 @@ impl WeightMatrix {
                         body(g, chunk);
                     }
                 } else {
-                    out[..n_groups * ferrox_quant::Q4_0X4_NROWS]
-                        .par_chunks_mut(ferrox_quant::Q4_0X4_NROWS)
-                        .with_min_len(Self::min_rows_per_task(n_groups).max(1))
-                        .enumerate()
-                        .for_each(|(g, chunk)| body(g, chunk));
+                    crate::par::chunks_mut(
+                        &mut out[..n_groups * ferrox_quant::Q4_0X4_NROWS],
+                        ferrox_quant::Q4_0X4_NROWS,
+                        Self::min_rows_per_task(n_groups).max(1),
+                        |g, chunk| body(g, chunk),
+                    );
                 }
                 let tail_len = *rows - n_groups * ferrox_quant::Q4_0X4_NROWS;
                 if tail_len > 0 {
@@ -1627,16 +1654,13 @@ impl WeightMatrix {
                         }
                     } else {
                         let min_len = Self::min_rows_per_task(tail_len);
-                        tail.par_iter_mut()
-                            .with_min_len(min_len)
-                            .enumerate()
-                            .for_each(|(i, o)| {
-                                let r = n_groups * ferrox_quant::Q4_0X4_NROWS + i;
-                                *o = ferrox_quant::dot_q4_0_q8(
-                                    &data[r * row_bytes..(r + 1) * row_bytes],
-                                    act,
-                                );
-                            });
+                        crate::par::items_mut(tail, min_len, |i, o| {
+                            let r = n_groups * ferrox_quant::Q4_0X4_NROWS + i;
+                            *o = ferrox_quant::dot_q4_0_q8(
+                                &data[r * row_bytes..(r + 1) * row_bytes],
+                                act,
+                            );
+                        });
                     }
                 }
                 return Some(out);
@@ -1653,17 +1677,14 @@ impl WeightMatrix {
             }
             return Some(out);
         }
-        out.par_iter_mut()
-            .with_min_len(Self::min_rows_per_task(*rows))
-            .enumerate()
-            .for_each(|(r, o)| {
-                let row = &data[r * row_bytes..(r + 1) * row_bytes];
-                *o = match kind {
-                    QuantKind::Q8_0 => ferrox_quant::dot_q8_0_q8(row, act),
-                    QuantKind::Q4_0 => ferrox_quant::dot_q4_0_q8(row, act),
-                    _ => unreachable!(),
-                };
-            });
+        crate::par::items_mut(&mut out, Self::min_rows_per_task(*rows), |r, o| {
+            let row = &data[r * row_bytes..(r + 1) * row_bytes];
+            *o = match kind {
+                QuantKind::Q8_0 => ferrox_quant::dot_q8_0_q8(row, act),
+                QuantKind::Q4_0 => ferrox_quant::dot_q4_0_q8(row, act),
+                _ => unreachable!(),
+            };
+        });
         Some(out)
     }
 
@@ -2133,37 +2154,30 @@ impl WeightMatrix {
                                 }
                                 let data_slice = data.as_slice();
                                 let tail = *rows - n_groups * ferrox_quant::Q8_0X4_NROWS;
-                                (0..tail)
-                                    .into_par_iter()
-                                    .with_min_len(Self::min_rows_per_task(tail))
-                                    .for_each(|i| {
-                                        let r = n_groups * ferrox_quant::Q8_0X4_NROWS + i;
-                                        let row = &data_slice[r * row_bytes..(r + 1) * row_bytes];
-                                        for (b, act) in acts.iter().enumerate() {
-                                            unsafe {
-                                                out_w.set(
-                                                    b * rows + r,
-                                                    ferrox_quant::dot_q8_0_q8(row, act),
-                                                );
-                                            }
+                                crate::par::indices(tail, Self::min_rows_per_task(tail), |i| {
+                                    let r = n_groups * ferrox_quant::Q8_0X4_NROWS + i;
+                                    let row = &data_slice[r * row_bytes..(r + 1) * row_bytes];
+                                    for (b, act) in acts.iter().enumerate() {
+                                        unsafe {
+                                            out_w.set(
+                                                b * rows + r,
+                                                ferrox_quant::dot_q8_0_q8(row, act),
+                                            );
                                         }
-                                    });
+                                    }
+                                });
                             } else {
-                                (0..*rows)
-                                    .into_par_iter()
-                                    .with_min_len(Self::min_rows_per_task(*rows))
-                                    .for_each(|r| {
-                                        let row =
-                                            &data.as_slice()[r * row_bytes..(r + 1) * row_bytes];
-                                        for (b, act) in acts.iter().enumerate() {
-                                            unsafe {
-                                                out_w.set(
-                                                    b * rows + r,
-                                                    ferrox_quant::dot_q8_0_q8(row, act),
-                                                );
-                                            }
+                                crate::par::indices(*rows, Self::min_rows_per_task(*rows), |r| {
+                                    let row = &data.as_slice()[r * row_bytes..(r + 1) * row_bytes];
+                                    for (b, act) in acts.iter().enumerate() {
+                                        unsafe {
+                                            out_w.set(
+                                                b * rows + r,
+                                                ferrox_quant::dot_q8_0_q8(row, act),
+                                            );
                                         }
-                                    });
+                                    }
+                                });
                             }
                             return out;
                         }
@@ -2269,37 +2283,30 @@ impl WeightMatrix {
                                 }
                                 let data_slice = data.as_slice();
                                 let tail = *rows - n_groups * ferrox_quant::Q4_0X4_NROWS;
-                                (0..tail)
-                                    .into_par_iter()
-                                    .with_min_len(Self::min_rows_per_task(tail))
-                                    .for_each(|i| {
-                                        let r = n_groups * ferrox_quant::Q4_0X4_NROWS + i;
-                                        let row = &data_slice[r * row_bytes..(r + 1) * row_bytes];
-                                        for (b, act) in acts.iter().enumerate() {
-                                            unsafe {
-                                                out_w.set(
-                                                    b * rows + r,
-                                                    ferrox_quant::dot_q4_0_q8(row, act),
-                                                );
-                                            }
+                                crate::par::indices(tail, Self::min_rows_per_task(tail), |i| {
+                                    let r = n_groups * ferrox_quant::Q4_0X4_NROWS + i;
+                                    let row = &data_slice[r * row_bytes..(r + 1) * row_bytes];
+                                    for (b, act) in acts.iter().enumerate() {
+                                        unsafe {
+                                            out_w.set(
+                                                b * rows + r,
+                                                ferrox_quant::dot_q4_0_q8(row, act),
+                                            );
                                         }
-                                    });
+                                    }
+                                });
                             } else {
-                                (0..*rows)
-                                    .into_par_iter()
-                                    .with_min_len(Self::min_rows_per_task(*rows))
-                                    .for_each(|r| {
-                                        let row =
-                                            &data.as_slice()[r * row_bytes..(r + 1) * row_bytes];
-                                        for (b, act) in acts.iter().enumerate() {
-                                            unsafe {
-                                                out_w.set(
-                                                    b * rows + r,
-                                                    ferrox_quant::dot_q4_0_q8(row, act),
-                                                );
-                                            }
+                                crate::par::indices(*rows, Self::min_rows_per_task(*rows), |r| {
+                                    let row = &data.as_slice()[r * row_bytes..(r + 1) * row_bytes];
+                                    for (b, act) in acts.iter().enumerate() {
+                                        unsafe {
+                                            out_w.set(
+                                                b * rows + r,
+                                                ferrox_quant::dot_q4_0_q8(row, act),
+                                            );
                                         }
-                                    });
+                                    }
+                                });
                             }
                             return out;
                         }
@@ -2382,37 +2389,30 @@ impl WeightMatrix {
                                 );
                                 let data_slice = data.as_slice();
                                 let tail = *rows - n_groups * ferrox_quant::Q4_KX8_NROWS;
-                                (0..tail)
-                                    .into_par_iter()
-                                    .with_min_len(Self::min_rows_per_task(tail))
-                                    .for_each(|i| {
-                                        let r = n_groups * ferrox_quant::Q4_KX8_NROWS + i;
-                                        let row = &data_slice[r * row_bytes..(r + 1) * row_bytes];
-                                        for (b, act) in acts.iter().enumerate() {
-                                            unsafe {
-                                                out_w.set(
-                                                    b * rows + r,
-                                                    ferrox_quant::dot_q4_k_q8(row, act),
-                                                );
-                                            }
+                                crate::par::indices(tail, Self::min_rows_per_task(tail), |i| {
+                                    let r = n_groups * ferrox_quant::Q4_KX8_NROWS + i;
+                                    let row = &data_slice[r * row_bytes..(r + 1) * row_bytes];
+                                    for (b, act) in acts.iter().enumerate() {
+                                        unsafe {
+                                            out_w.set(
+                                                b * rows + r,
+                                                ferrox_quant::dot_q4_k_q8(row, act),
+                                            );
                                         }
-                                    });
+                                    }
+                                });
                             } else {
-                                (0..*rows)
-                                    .into_par_iter()
-                                    .with_min_len(Self::min_rows_per_task(*rows))
-                                    .for_each(|r| {
-                                        let row =
-                                            &data.as_slice()[r * row_bytes..(r + 1) * row_bytes];
-                                        for (b, act) in acts.iter().enumerate() {
-                                            unsafe {
-                                                out_w.set(
-                                                    b * rows + r,
-                                                    ferrox_quant::dot_q4_k_q8(row, act),
-                                                );
-                                            }
+                                crate::par::indices(*rows, Self::min_rows_per_task(*rows), |r| {
+                                    let row = &data.as_slice()[r * row_bytes..(r + 1) * row_bytes];
+                                    for (b, act) in acts.iter().enumerate() {
+                                        unsafe {
+                                            out_w.set(
+                                                b * rows + r,
+                                                ferrox_quant::dot_q4_k_q8(row, act),
+                                            );
                                         }
-                                    });
+                                    }
+                                });
                             }
                             return out;
                         }
@@ -2497,44 +2497,34 @@ impl WeightMatrix {
                                 );
                                 let data_slice = data.as_slice();
                                 let tail = *rows - n_groups * ferrox_quant::Q5_KX8_NROWS;
-                                (0..tail)
-                                    .into_par_iter()
-                                    .with_min_len(Self::min_rows_per_task(tail))
-                                    .for_each(|i| {
-                                        let r = n_groups * ferrox_quant::Q5_KX8_NROWS + i;
-                                        let row = &data_slice[r * row_bytes..(r + 1) * row_bytes];
-                                        for (b, act) in acts.iter().enumerate() {
-                                            unsafe {
-                                                out_w.set(
-                                                    b * rows + r,
-                                                    ferrox_quant::dot_q5_k_q8(row, act),
-                                                );
-                                            }
+                                crate::par::indices(tail, Self::min_rows_per_task(tail), |i| {
+                                    let r = n_groups * ferrox_quant::Q5_KX8_NROWS + i;
+                                    let row = &data_slice[r * row_bytes..(r + 1) * row_bytes];
+                                    for (b, act) in acts.iter().enumerate() {
+                                        unsafe {
+                                            out_w.set(
+                                                b * rows + r,
+                                                ferrox_quant::dot_q5_k_q8(row, act),
+                                            );
                                         }
-                                    });
+                                    }
+                                });
                             } else {
                                 let data_slice = data.as_slice();
-                                (0..*rows)
-                                    .into_par_iter()
-                                    .with_min_len(Self::min_rows_per_task(*rows))
-                                    .for_each(|r| {
-                                        let row = &data_slice[r * row_bytes..(r + 1) * row_bytes];
-                                        let nc = ferrox_quant::Q5_K_GEMM_NC;
-                                        for (t, chunk) in acts.chunks(nc).enumerate() {
-                                            let n = chunk.len();
-                                            let mut tmp = [0f32; ferrox_quant::Q5_K_GEMM_NC];
-                                            ferrox_quant::gemm_q5_k_q8_row(
-                                                row,
-                                                chunk,
-                                                &mut tmp[..n],
-                                            );
-                                            for (j, v) in tmp[..n].iter().enumerate() {
-                                                unsafe {
-                                                    out_w.set((t * nc + j) * rows + r, *v);
-                                                }
+                                crate::par::indices(*rows, Self::min_rows_per_task(*rows), |r| {
+                                    let row = &data_slice[r * row_bytes..(r + 1) * row_bytes];
+                                    let nc = ferrox_quant::Q5_K_GEMM_NC;
+                                    for (t, chunk) in acts.chunks(nc).enumerate() {
+                                        let n = chunk.len();
+                                        let mut tmp = [0f32; ferrox_quant::Q5_K_GEMM_NC];
+                                        ferrox_quant::gemm_q5_k_q8_row(row, chunk, &mut tmp[..n]);
+                                        for (j, v) in tmp[..n].iter().enumerate() {
+                                            unsafe {
+                                                out_w.set((t * nc + j) * rows + r, *v);
                                             }
                                         }
-                                    });
+                                    }
+                                });
                             }
                             return out;
                         }
@@ -2611,44 +2601,34 @@ impl WeightMatrix {
                                 );
                                 let data_slice = data.as_slice();
                                 let tail = *rows - n_groups * ferrox_quant::Q6_KX8_NROWS;
-                                (0..tail)
-                                    .into_par_iter()
-                                    .with_min_len(Self::min_rows_per_task(tail))
-                                    .for_each(|i| {
-                                        let r = n_groups * ferrox_quant::Q6_KX8_NROWS + i;
-                                        let row = &data_slice[r * row_bytes..(r + 1) * row_bytes];
-                                        for (b, act) in acts.iter().enumerate() {
-                                            unsafe {
-                                                out_w.set(
-                                                    b * rows + r,
-                                                    ferrox_quant::dot_q6_k_q8(row, act),
-                                                );
-                                            }
+                                crate::par::indices(tail, Self::min_rows_per_task(tail), |i| {
+                                    let r = n_groups * ferrox_quant::Q6_KX8_NROWS + i;
+                                    let row = &data_slice[r * row_bytes..(r + 1) * row_bytes];
+                                    for (b, act) in acts.iter().enumerate() {
+                                        unsafe {
+                                            out_w.set(
+                                                b * rows + r,
+                                                ferrox_quant::dot_q6_k_q8(row, act),
+                                            );
                                         }
-                                    });
+                                    }
+                                });
                             } else {
                                 let data_slice = data.as_slice();
-                                (0..*rows)
-                                    .into_par_iter()
-                                    .with_min_len(Self::min_rows_per_task(*rows))
-                                    .for_each(|r| {
-                                        let row = &data_slice[r * row_bytes..(r + 1) * row_bytes];
-                                        let nc = ferrox_quant::Q6_K_GEMM_NC;
-                                        for (t, chunk) in acts.chunks(nc).enumerate() {
-                                            let mut tmp = [0f32; ferrox_quant::Q6_K_GEMM_NC];
-                                            let n = chunk.len();
-                                            ferrox_quant::gemm_q6_k_q8_row(
-                                                row,
-                                                chunk,
-                                                &mut tmp[..n],
-                                            );
-                                            for (j, v) in tmp[..n].iter().enumerate() {
-                                                unsafe {
-                                                    out_w.set((t * nc + j) * rows + r, *v);
-                                                }
+                                crate::par::indices(*rows, Self::min_rows_per_task(*rows), |r| {
+                                    let row = &data_slice[r * row_bytes..(r + 1) * row_bytes];
+                                    let nc = ferrox_quant::Q6_K_GEMM_NC;
+                                    for (t, chunk) in acts.chunks(nc).enumerate() {
+                                        let mut tmp = [0f32; ferrox_quant::Q6_K_GEMM_NC];
+                                        let n = chunk.len();
+                                        ferrox_quant::gemm_q6_k_q8_row(row, chunk, &mut tmp[..n]);
+                                        for (j, v) in tmp[..n].iter().enumerate() {
+                                            unsafe {
+                                                out_w.set((t * nc + j) * rows + r, *v);
                                             }
                                         }
-                                    });
+                                    }
+                                });
                             }
                             return out;
                         }
@@ -2657,18 +2637,15 @@ impl WeightMatrix {
                     }
                 }
 
-                (0..*rows)
-                    .into_par_iter()
-                    .with_min_len(Self::min_rows_per_task(*rows))
-                    .for_each(|r| {
-                        let row = &data.as_slice()[r * row_bytes..(r + 1) * row_bytes];
-                        for b in 0..batch_size {
-                            let x = &x_batch[b * cols..(b + 1) * cols];
-                            unsafe {
-                                out_w.set(b * rows + r, Self::dot(*kind, row, x));
-                            }
+                crate::par::indices(*rows, Self::min_rows_per_task(*rows), |r| {
+                    let row = &data.as_slice()[r * row_bytes..(r + 1) * row_bytes];
+                    for b in 0..batch_size {
+                        let x = &x_batch[b * cols..(b + 1) * cols];
+                        unsafe {
+                            out_w.set(b * rows + r, Self::dot(*kind, row, x));
                         }
-                    });
+                    }
+                });
                 out
             }
             WeightMatrix::Mxfp4 {
@@ -2681,24 +2658,16 @@ impl WeightMatrix {
                 let scale_row_bytes = cols / ferrox_quant::MXFP4_GROUP_SIZE;
                 let mut out = vec![0f32; batch_size * rows];
                 let out_w = BatchOut(out.as_mut_ptr());
-                (0..*rows)
-                    .into_par_iter()
-                    .with_min_len(Self::min_rows_per_task(*rows))
-                    .for_each(|r| {
-                        let prow =
-                            &packed.as_slice()[r * packed_row_bytes..(r + 1) * packed_row_bytes];
-                        let srow =
-                            &scale.as_slice()[r * scale_row_bytes..(r + 1) * scale_row_bytes];
-                        for b in 0..batch_size {
-                            let x = &x_batch[b * cols..(b + 1) * cols];
-                            unsafe {
-                                out_w.set(
-                                    b * rows + r,
-                                    ferrox_quant::dot_mxfp4_row_f32(prow, srow, x),
-                                );
-                            }
+                crate::par::indices(*rows, Self::min_rows_per_task(*rows), |r| {
+                    let prow = &packed.as_slice()[r * packed_row_bytes..(r + 1) * packed_row_bytes];
+                    let srow = &scale.as_slice()[r * scale_row_bytes..(r + 1) * scale_row_bytes];
+                    for b in 0..batch_size {
+                        let x = &x_batch[b * cols..(b + 1) * cols];
+                        unsafe {
+                            out_w.set(b * rows + r, ferrox_quant::dot_mxfp4_row_f32(prow, srow, x));
                         }
-                    });
+                    }
+                });
                 out
             }
         }
@@ -3485,6 +3454,32 @@ impl WeightMatrix {
 }
 #[cfg(test)]
 mod tests {
+
+    /// Issue #27 asks for `MIN_TASK_MACS` to be deleted rather than
+    /// retuned. It is deleted from the persistent-pool path and kept on
+    /// the rayon path, which is only an honest answer if the pool path
+    /// genuinely cannot consult it -- so assert the gate, both ways,
+    /// without needing a process whose env var says `spin`.
+    ///
+    /// Sabotage: make `row_work_for` return `per_row` for both arms and
+    /// this goes red, because the MACs floor is then live on a path
+    /// whose whole premise is that scheduling is no longer expensive.
+    #[test]
+    fn the_persistent_pool_path_never_publishes_a_macs_floor() {
+        use crate::par::Backend;
+        for per_row in [0usize, 1, 576, 4096, 1 << 20] {
+            assert_eq!(
+                WeightMatrix::row_work_for(Backend::Rayon, per_row),
+                per_row,
+                "the rayon arm keeps the measured mitigation"
+            );
+            assert_eq!(
+                WeightMatrix::row_work_for(Backend::Spin, per_row),
+                0,
+                "the persistent pool must reach `min_rows_per_task`'s                  early return, where MIN_TASK_MACS is not read"
+            );
+        }
+    }
 
     /// The four dtypes the drifted copies were missing.
     ///

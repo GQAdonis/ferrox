@@ -1032,7 +1032,7 @@ pub fn run_expert(hidden: &[f32], expert: &ExpertWeights, act: GluAct) -> Vec<f3
         // parallel regions can overlap instead of running back to back.
         // Decode's deficit is scheduling, not kernels -- see
         // `WeightMatrix::apply_three`, which does this for q/k/v.
-        let (g, u) = rayon::join(
+        let (g, u) = ferrox_core::par::join2(
             || expert.gate.apply_cpu_q8(&act_q8),
             || expert.up.apply_cpu_q8(&act_q8),
         );
@@ -1041,7 +1041,8 @@ pub fn run_expert(hidden: &[f32], expert: &ExpertWeights, act: GluAct) -> Vec<f3
             return expert.down.apply(&activated);
         }
     }
-    let (gate, up) = rayon::join(|| expert.gate.apply(hidden), || expert.up.apply(hidden));
+    let (gate, up) =
+        ferrox_core::par::join2(|| expert.gate.apply(hidden), || expert.up.apply(hidden));
     let activated = act.apply(&gate, &up);
     expert.down.apply(&activated)
 }

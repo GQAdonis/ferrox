@@ -2735,9 +2735,11 @@ impl Decoder {
         layer.moe.n_experts() == 1 && layer.moe.shared_experts.is_empty()
     }
 
-    /// llama.cpp `mul_mat_id` style: shared Q8 act + flat rayon over
-    /// `(slot, row_pair)` for gate∥up (2-row SDOT), then SwiGLU, then
-    /// per-slot down. One outer fork-join — no nested `apply_cpu_q8`.
+    /// llama.cpp `mul_mat_id` style: shared Q8 act + one flat parallel
+    /// region over `(slot, row_pair)` for gate∥up (2-row SDOT), then
+    /// SwiGLU, then per-slot down. Three regions, none nested, all
+    /// through `ferrox_core::par` so they follow whichever scheduler
+    /// `FERROX_CPU_POOL` selected.
     fn cpu_moe_topk_parallel_slots(
         experts: &[ExpertWeights],
         normed2: &[f32],
@@ -2745,7 +2747,6 @@ impl Decoder {
         hidden_dim: usize,
         act: GluAct,
     ) -> Option<Vec<(Vec<f32>, f32)>> {
-        use rayon::prelude::*;
         if !ferrox_core::weight_matrix::cpu_int_dot_enabled() || !normed2.len().is_multiple_of(32) {
             return None;
         }
@@ -2789,29 +2790,26 @@ impl Decoder {
         let eids = &decision.expert_ids;
         let mut gate = vec![0f32; n_slots * ffn_rows];
         let mut up = vec![0f32; n_slots * ffn_rows];
-        gate.par_chunks_mut(2)
-            .zip(up.par_chunks_mut(2))
-            .enumerate()
-            .for_each(|(p, (gc, uc))| {
-                let row0 = p * 2;
-                let slot = row0 / ffn_rows;
-                let r = row0 % ffn_rows;
-                let ex = &experts[eids[slot]];
-                if let (Some((g0, g1)), Some((u0, u1))) = (
-                    ex.gate.dot_pair_cpu_q8(r, &q8),
-                    ex.up.dot_pair_cpu_q8(r, &q8),
-                ) {
-                    gc[0] = g0;
-                    gc[1] = g1;
-                    uc[0] = u0;
-                    uc[1] = u1;
-                } else {
-                    gc[0] = ex.gate.dot_row_cpu_q8(r, &q8).unwrap_or(0.0);
-                    gc[1] = ex.gate.dot_row_cpu_q8(r + 1, &q8).unwrap_or(0.0);
-                    uc[0] = ex.up.dot_row_cpu_q8(r, &q8).unwrap_or(0.0);
-                    uc[1] = ex.up.dot_row_cpu_q8(r + 1, &q8).unwrap_or(0.0);
-                }
-            });
+        ferrox_core::par::chunks_mut2(&mut gate, &mut up, 2, 1, |p, gc, uc| {
+            let row0 = p * 2;
+            let slot = row0 / ffn_rows;
+            let r = row0 % ffn_rows;
+            let ex = &experts[eids[slot]];
+            if let (Some((g0, g1)), Some((u0, u1))) = (
+                ex.gate.dot_pair_cpu_q8(r, &q8),
+                ex.up.dot_pair_cpu_q8(r, &q8),
+            ) {
+                gc[0] = g0;
+                gc[1] = g1;
+                uc[0] = u0;
+                uc[1] = u1;
+            } else {
+                gc[0] = ex.gate.dot_row_cpu_q8(r, &q8).unwrap_or(0.0);
+                gc[1] = ex.gate.dot_row_cpu_q8(r + 1, &q8).unwrap_or(0.0);
+                uc[0] = ex.up.dot_row_cpu_q8(r, &q8).unwrap_or(0.0);
+                uc[1] = ex.up.dot_row_cpu_q8(r + 1, &q8).unwrap_or(0.0);
+            }
+        });
         let mut activated = vec![0f32; n_slots * ffn_rows];
         // Generic over the gate nonlinearity rather than two copies of
         // the loop, and monomorphised so the call still inlines: the
@@ -2819,9 +2817,7 @@ impl Decoder {
         // sits under `ferrox_core::matmul`'s own fork threshold), which
         // is why this does not just call `act.apply`.
         fn combine<F: Fn(f32) -> f32 + Sync>(out: &mut [f32], gate: &[f32], up: &[f32], f: F) {
-            out.par_iter_mut()
-                .enumerate()
-                .for_each(|(idx, a)| *a = f(gate[idx]) * up[idx]);
+            ferrox_core::par::items_mut(out, 1, |idx, a| *a = f(gate[idx]) * up[idx]);
         }
         match act {
             GluAct::Swiglu => combine(&mut activated, &gate, &up, ferrox_core::matmul::silu),
@@ -2832,20 +2828,18 @@ impl Decoder {
             .iter()
             .map(|&w| (vec![0f32; hidden_dim], w))
             .collect();
-        outs.par_iter_mut()
-            .enumerate()
-            .for_each(|(slot, (out, _))| {
-                let ex = &experts[eids[slot]];
-                let act_slot = &activated[slot * ffn_rows..(slot + 1) * ffn_rows];
-                if act_slot.len().is_multiple_of(32) {
-                    let down_q8 = ferrox_quant::quantize_activations_q8(act_slot);
-                    if let Some(d) = ex.down.apply_cpu_q8(&down_q8) {
-                        *out = d;
-                        return;
-                    }
+        ferrox_core::par::items_mut(&mut outs, 1, |slot, (out, _)| {
+            let ex = &experts[eids[slot]];
+            let act_slot = &activated[slot * ffn_rows..(slot + 1) * ffn_rows];
+            if act_slot.len().is_multiple_of(32) {
+                let down_q8 = ferrox_quant::quantize_activations_q8(act_slot);
+                if let Some(d) = ex.down.apply_cpu_q8(&down_q8) {
+                    *out = d;
+                    return;
                 }
-                *out = ex.down.apply(act_slot);
-            });
+            }
+            *out = ex.down.apply(act_slot);
+        });
         Some(outs)
     }
 

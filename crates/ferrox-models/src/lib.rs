@@ -18,6 +18,7 @@ pub mod decoder;
 pub mod deepseek_v4_budget;
 pub mod deepseek_v4_decoder;
 pub mod device_budget;
+pub mod draft_model;
 pub mod embedding_model;
 pub mod encoder;
 pub mod engine;
@@ -76,6 +77,7 @@ pub use capability::{
 pub use config::{deepseek_v4_pro, glm_5_2, kimi_k3, FfnActivation, ModelConfig, RopeLayout};
 pub use decoder::{Decoder, MultiSeqKv};
 pub use device_budget::{BudgetBackend, DeviceBudget};
+pub use draft_model::{DraftModelSpeculator, VocabMismatch};
 pub use embedding_model::{is_embedding_arch, EmbedError, EmbeddingModel};
 pub use encoder::{EncodeError, TextEncoder};
 pub use engine::{

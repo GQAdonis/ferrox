@@ -8,8 +8,14 @@ Two files hold the plan:
   own.
 - **[`roadmap.md`](roadmap.md)** is every open item, merged by theme.
 
-Two items are large enough to carry their own design document:
+Three items are large enough to carry their own design document:
 
+- **[`speculative-decoding.md`](speculative-decoding.md)**, the one
+  decode item that raises throughput without buying hardware. Decode
+  reads every weight per token, so bandwidth divided by model bytes is a
+  hard ceiling; a draft model changes what is read per token rather than
+  how fast. The lossless half already ships and is tested at 200k
+  samples. What is missing is a drafter worth having.
 - **[`model-layer-reorg.md`](model-layer-reorg.md)**, splitting the
   decoder so architectures scale. It was 6438 lines when that document
   was written and is 6875 today.

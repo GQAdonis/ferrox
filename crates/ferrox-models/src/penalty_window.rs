@@ -38,7 +38,8 @@
 //!
 //! Because it was a slice, and five call sites each chose their own.
 //! `ferrox run`'s decode loops passed the generated tokens; the server's
-//! two decode loops passed the generated tokens; `speculative` passed
+//! two decode loops passed the generated tokens (still do -- issue #73,
+//! the prompt ids do not reach that seam); `speculative` passed
 //! the prompt as well and then grew a `penalty_history_start` knob to
 //! paper over the disagreement; `draft_model` cloned the whole history
 //! per block; `kimi_generate` passed prompt and generated and was the

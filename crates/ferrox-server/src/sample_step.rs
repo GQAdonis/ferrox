@@ -110,7 +110,7 @@ pub(crate) fn sample_next(
     // alone, and neither has the prompt ids in scope to hand over:
     // `sample_until_stop` takes `logits` and `pos`, never the ids.
     // Closing it means threading the prompt through that signature,
-    // which is a `generate.rs` change and is tracked as its own issue.
+    // which is a `generate.rs` change and is tracked as issue #73.
     //
     // Spelled out as `&[]` at the ONE place the server builds a window,
     // rather than left implicit in a slice argument, so the gap is a

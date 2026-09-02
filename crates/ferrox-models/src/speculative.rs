@@ -346,6 +346,23 @@ pub struct SpeculativeOptions {
     /// exactly these parameters (see [`accept_or_resample`]).
     pub sampling: SamplingParams,
     pub seed: u64,
+    /// Index into the history at which the repetition / presence /
+    /// frequency penalty window starts.
+    ///
+    /// `0` penalises over the prompt as well, which is what
+    /// llama-server does (it seeds the sampler with the prompt tokens).
+    /// `prompt_tokens.len()` penalises over the generated tokens only,
+    /// which is what `ferrox run`'s ordinary decode loop does.
+    ///
+    /// This is a knob because the two ferrox paths currently disagree,
+    /// and a caller must be able to make speculation match whichever
+    /// path it is standing in for. Speculation that changes the output
+    /// at default settings is not speculation, it is a different
+    /// decoder: the whole promise is that the text is what the target
+    /// would have written alone. The underlying divergence from
+    /// llama.cpp is tracked separately and is not this option's job to
+    /// decide.
+    pub penalty_history_start: usize,
 }
 
 /// Result of a speculative decode run, with the counters that make its
@@ -456,6 +473,16 @@ impl SpeculativeDecodeResult {
     }
 }
 
+/// The slice of history the penalties see, per
+/// [`SpeculativeOptions::penalty_history_start`].
+///
+/// Clamped rather than indexed directly: a caller that passes a start
+/// past the current history (a warm cache resumed oddly, say) should
+/// get an empty window, not a panic mid-generation.
+fn penalty_window<'a>(history: &'a [usize], options: &SpeculativeOptions) -> &'a [usize] {
+    &history[options.penalty_history_start.min(history.len())..]
+}
+
 /// Greedy speculative decode over a **fresh** KV cache, with
 /// prompt-lookup drafting. Thin wrapper over
 /// [`speculative_decode_with`], kept for callers that want the original
@@ -467,11 +494,12 @@ pub fn speculative_decode<D: Drafter + ?Sized>(
     kv_caches: &mut [KvCache],
     drafter: &mut D,
 ) -> SpeculativeDecodeResult {
-    speculative_decode_with(
+    speculative_decode_observed(
         decoder,
         prompt_tokens,
         kv_caches,
         drafter,
+        &mut |_| true,
         &SpeculativeOptions {
             max_new_tokens,
             ..SpeculativeOptions::default()
@@ -508,6 +536,41 @@ pub fn speculative_decode_with<D: Drafter + ?Sized>(
     drafter: &mut D,
     options: &SpeculativeOptions,
 ) -> SpeculativeDecodeResult {
+    speculative_decode_observed(
+        decoder,
+        prompt_tokens,
+        kv_caches,
+        drafter,
+        &mut |_| true,
+        options,
+    )
+}
+
+/// [`speculative_decode_with`], plus an observer called once per
+/// committed token, in order, which can end the run by returning
+/// `false`.
+///
+/// This exists so a caller that streams output, or that stops on an EOS
+/// or a stop string, does not have to write a second copy of the
+/// verification loop. Copying that loop to vary it is how this project
+/// lost five model features from one duplicated decode path, and the
+/// rejection rule is the last code in the tree that should be
+/// duplicated: a subtly different copy is still lossless-looking.
+///
+/// The observer sees a token only once it is COMMITTED, so it never
+/// sees a draft that was rejected. Returning `false` ends generation
+/// after the current verification block finishes, which keeps the KV
+/// caches in the single consistent state this function documents;
+/// `generated_tokens` is truncated at the token that said stop, so the
+/// caller's output and the returned tokens agree.
+pub fn speculative_decode_observed<D: Drafter + ?Sized>(
+    decoder: &Decoder,
+    prompt_tokens: &[usize],
+    kv_caches: &mut [KvCache],
+    drafter: &mut D,
+    on_token: &mut dyn FnMut(usize) -> bool,
+    options: &SpeculativeOptions,
+) -> SpeculativeDecodeResult {
     assert!(!prompt_tokens.is_empty(), "prompt must not be empty");
     for cache in kv_caches.iter() {
         assert_eq!(
@@ -539,14 +602,24 @@ pub fn speculative_decode_with<D: Drafter + ?Sized>(
     // fed as the anchor of the next batch, which is what lets one
     // forward call both commit it and verify a block after it.
     let mut pending = {
-        let probs = sampling_distribution(last, &options.sampling, &history);
+        let probs =
+            sampling_distribution(last, &options.sampling, penalty_window(&history, options));
         rng.sample_from(&probs)
     };
     let mut pos = options.start_pos + prompt_tokens.len();
 
+    // Set when the observer asks to stop. The current block still runs
+    // to completion so the caches end in the one state this function
+    // documents, and `generated` is cut back to this length afterwards.
+    let mut stop_at: Option<usize> = None;
+
     loop {
         generated.push(pending);
         history.push(pending);
+        if !on_token(pending) {
+            stop_at = Some(generated.len());
+            break;
+        }
         if generated.len() == options.max_new_tokens {
             break;
         }
@@ -580,13 +653,24 @@ pub fn speculative_decode_with<D: Drafter + ?Sized>(
         let mut accepted = 0usize;
         let mut replacement: Option<usize> = None;
         for (i, (&token, dist)) in draft.tokens().iter().zip(draft.dists()).enumerate() {
-            let target = sampling_distribution(&batch_logits[i], &options.sampling, &history);
+            let target = sampling_distribution(
+                &batch_logits[i],
+                &options.sampling,
+                penalty_window(&history, options),
+            );
             match accept_or_resample(&target, dist, token, &mut rng) {
                 None => {
                     result.record_position(i, true);
                     accepted += 1;
                     history.push(token);
                     generated.push(token);
+                    if stop_at.is_none() && !on_token(token) {
+                        // Keep verifying the rest of the block: the
+                        // loop below truncates the caches to exactly
+                        // what was committed, and leaving early here
+                        // would skip that.
+                        stop_at = Some(generated.len());
+                    }
                 }
                 Some(resampled) => {
                     result.record_position(i, false);
@@ -617,16 +701,29 @@ pub fn speculative_decode_with<D: Drafter + ?Sized>(
             // batch predicts a genuinely new position -- the free bonus
             // token that makes a fully-accepted block worth `k + 1`.
             None => {
-                let probs =
-                    sampling_distribution(&batch_logits[accepted], &options.sampling, &history);
+                let probs = sampling_distribution(
+                    &batch_logits[accepted],
+                    &options.sampling,
+                    penalty_window(&history, options),
+                );
                 rng.sample_from(&probs)
             }
         };
         pos = committed_len;
+        if stop_at.is_some() {
+            break;
+        }
         debug_assert!(generated.len() < options.max_new_tokens);
     }
 
-    debug_assert_eq!(generated.len(), options.max_new_tokens);
+    if let Some(len) = stop_at {
+        // The observer said stop at this token. Everything after it was
+        // produced by a block that had already been dispatched, and the
+        // caller never saw it.
+        generated.truncate(len);
+    } else {
+        debug_assert_eq!(generated.len(), options.max_new_tokens);
+    }
     result.tokens_generated = generated.len();
     result.generated_tokens = generated;
     result
@@ -1350,5 +1447,81 @@ mod tests {
         assert_eq!(result.acceptance_length(), None);
         assert_eq!(result.accept_rate(), None);
         assert_eq!(result.tokens_per_call(), 0.0);
+    }
+
+    /// The observer sees exactly the committed tokens, in order, and
+    /// stopping through it truncates the result to the token that said
+    /// so.
+    ///
+    /// This is what lets `ferrox run` stream and stop on an EOS without
+    /// a second copy of the verification loop. A copy is how this
+    /// project lost five model features from one duplicated decode
+    /// path, and the rejection rule is the last code in the tree that
+    /// should be duplicated: a subtly wrong copy still looks lossless.
+    #[test]
+    fn the_observer_sees_every_committed_token_and_can_end_the_run() {
+        let cfg = tiny_test_config();
+        let vocab = 8;
+        let prompt = vec![1usize, 2, 3, 4, 1, 2];
+
+        let decoder = Decoder::new_random_small(cfg.clone(), 2, vocab);
+        let mut kv = caches(&decoder);
+        let mut spec = PromptLookupSpeculator::new(2, 3);
+
+        let mut seen = Vec::new();
+        let result = speculative_decode_observed(
+            &decoder,
+            &prompt,
+            &mut kv,
+            &mut spec,
+            &mut |t| {
+                seen.push(t);
+                true
+            },
+            &SpeculativeOptions {
+                max_new_tokens: 6,
+                start_pos: 0,
+                sampling: SamplingParams::default(),
+                seed: 0,
+                penalty_history_start: 0,
+            },
+        );
+        assert_eq!(
+            seen, result.generated_tokens,
+            "the observer must see exactly what the run returns, in order"
+        );
+
+        // Now stop after three tokens.
+        let decoder = Decoder::new_random_small(cfg, 2, vocab);
+        let mut kv = caches(&decoder);
+        let mut spec = PromptLookupSpeculator::new(2, 3);
+        let mut count = 0usize;
+        let stopped = speculative_decode_observed(
+            &decoder,
+            &prompt,
+            &mut kv,
+            &mut spec,
+            &mut |_| {
+                count += 1;
+                count < 3
+            },
+            &SpeculativeOptions {
+                max_new_tokens: 6,
+                start_pos: 0,
+                sampling: SamplingParams::default(),
+                seed: 0,
+                penalty_history_start: 0,
+            },
+        );
+        assert_eq!(
+            stopped.generated_tokens.len(),
+            3,
+            "the run must end at the token that said stop, not at the end of its block"
+        );
+        assert_eq!(
+            stopped.generated_tokens,
+            result.generated_tokens[..3],
+            "and the tokens up to the stop must be the ones an unstopped run produced"
+        );
     }
 }

@@ -141,6 +141,36 @@ pub struct InferArgs {
     )]
     pub n_gpu_layers: GpuLayers,
 
+    /// Draft model for speculative decoding, llama.cpp's `-md`.
+    ///
+    /// A smaller checkpoint from the SAME family and tokenizer as the
+    /// target. Decode reads every weight of the target per token, so
+    /// bandwidth divided by model bytes is a hard ceiling; a drafter
+    /// proposes several tokens and the target checks them all in one
+    /// pass, which changes what is read per token rather than how fast.
+    /// The output is exactly what the target would have written alone.
+    #[arg(long = "model-draft", short = 'd', value_name = "FILE")]
+    pub model_draft: Option<String>,
+
+    /// Tokens the drafter proposes per verification step (llama.cpp's
+    /// `--draft-max`, also spelled `--draft`).
+    #[arg(
+        long = "draft-max",
+        visible_aliases = ["draft"],
+        value_name = "N",
+        default_value_t = 5
+    )]
+    pub draft_max: usize,
+
+    /// Stop drafting when the drafter's own probability for the token
+    /// it just sampled is below this (llama.cpp's `--draft-p-min`).
+    ///
+    /// A guessing drafter is worse than none: the target pays for the
+    /// position either way, and a rejection also discards every
+    /// position after it.
+    #[arg(long = "draft-p-min", value_name = "P", default_value_t = 0.75)]
+    pub draft_p_min: f32,
+
     /// Optional system prompt (chat mode only).
     #[arg(long = "system")]
     pub system: Option<String>,
@@ -1204,6 +1234,24 @@ pub fn run_infer(args: InferArgs) -> anyhow::Result<()> {
         .map(|_| KvCache::new(decoder.config.n_kv_heads, decoder.config.head_dim))
         .collect();
 
+    // Speculative decoding with a real draft model, when `-d` names
+    // one. The verification rule lives in `ferrox_models::speculative`
+    // and is lossless at every temperature; this is only the wiring.
+    if let Some(draft_path) = args.model_draft.as_deref() {
+        return run_infer_speculative(
+            &args,
+            &decoder,
+            draft_path,
+            &tokenizer,
+            &tokens,
+            max_new,
+            &sampling,
+            seed,
+            &stop_tokens,
+            &mut caches,
+        );
+    }
+
     let prefill_t = Instant::now();
     let mut pos;
     let mut logits = if tokens.is_empty() {
@@ -1645,6 +1693,163 @@ fn run_glm52_infer(args: InferArgs, path: &Path, file: &ShardedGguf) -> anyhow::
          predict {gen_n} tokens, {pred_tps:.2} t/s"
     );
 
+    Ok(())
+}
+
+/// `ferrox run` with a draft model, llama.cpp's `-md`.
+///
+/// The verification rule lives in `ferrox_models::speculative` and is
+/// lossless at every temperature, not only at `--temp 0`. Nothing here
+/// re-implements it: this function loads the second checkpoint, refuses
+/// the combinations speculation cannot honour, and streams the tokens
+/// the shared loop commits.
+#[allow(clippy::too_many_arguments)]
+fn run_infer_speculative(
+    args: &InferArgs,
+    decoder: &ferrox_models::Decoder,
+    draft_path: &str,
+    tokenizer: &CliTokenizer,
+    tokens: &[usize],
+    max_new: usize,
+    sampling: &ferrox_models::sampling::SamplingParams,
+    seed: u64,
+    stop_tokens: &ferrox_models::tokenizer::StopTokens,
+    caches: &mut [KvCache],
+) -> anyhow::Result<()> {
+    // A grammar masks the candidate set per token. Speculation compares
+    // the drafter's probability for a token against the target's for
+    // the same token, and neither of those distributions is the masked
+    // one, so running both would either break the constraint or break
+    // losslessness. Refused by name rather than silently dropping one
+    // of the two, which is the failure this engine exists not to have:
+    // a grammar that is accepted and not applied is served with a 200
+    // and read as compliance.
+    if args.grammar_source()?.is_some() {
+        anyhow::bail!(
+            "--model-draft cannot be combined with --grammar / --grammar-file / --json-schema \
+             yet: constrained decoding masks the candidate set per token, and the speculative \
+             rejection rule compares unmasked draft and target probabilities, so the two \
+             together would either drop the constraint or stop being lossless. Run with one or \
+             the other"
+        );
+    }
+    if tokens.is_empty() {
+        anyhow::bail!("--model-draft needs a prompt to continue");
+    }
+
+    let config =
+        ferrox_models::ModelConfig::from_gguf(&ferrox_gguf::ShardedGguf::open(draft_path)?)?;
+    let draft = ferrox_models::Decoder::from_gguf(draft_path, config)?;
+    eprintln!("ferrox: draft model {draft_path}");
+
+    // Refused at construction when the vocabularies differ. The two
+    // models must number their tokens identically or the rejection rule
+    // is comparing probabilities of different tokens, which produces
+    // fluent text with a plausible accept rate and no error at all.
+    let mut drafter = ferrox_models::DraftModelSpeculator::new(
+        draft,
+        &decoder.config,
+        sampling.clone(),
+        seed,
+        args.draft_max,
+        args.draft_p_min,
+    )?;
+
+    // One warm-up proposal, to find out whether this drafter's KV
+    // actually lands in the host caches it owns. A backend that keeps
+    // KV on the device leaves them empty, and a drafter that cannot see
+    // its own rows cannot roll back the ones the target rejected. Found
+    // by running it: on Metal this panicked mid-answer, after the first
+    // block had already been printed.
+    {
+        use ferrox_models::speculative::Drafter;
+        let _ = drafter.propose(tokens, &[], 1);
+    }
+    if !drafter.keeps_host_kv() {
+        anyhow::bail!(
+            "--model-draft needs the draft model's KV cache in host memory, and this \
+             backend keeps it on the device, so the drafter cannot roll back the \
+             positions the target rejects. Re-run with --device cpu, or without \
+             --model-draft. Speculative decoding on a device-resident KV cache is \
+             not implemented yet"
+        );
+    }
+
+    let mut stdout = io::stdout().lock();
+    let decode_t = Instant::now();
+    let mut emitted = 0usize;
+    let mut write_err = None;
+
+    let result = ferrox_models::speculative::speculative_decode_observed(
+        decoder,
+        tokens,
+        caches,
+        &mut drafter,
+        &mut |token| {
+            if !args.ignore_eos && stop_tokens.contains(token) {
+                return false;
+            }
+            let piece = tokenizer.decode(&[token]);
+            if let Err(e) = stdout
+                .write_all(piece.as_bytes())
+                .and_then(|()| stdout.flush())
+            {
+                write_err = Some(e);
+                return false;
+            }
+            emitted += 1;
+            true
+        },
+        &ferrox_models::speculative::SpeculativeOptions {
+            max_new_tokens: max_new,
+            start_pos: 0,
+            sampling: sampling.clone(),
+            seed,
+            // Match the ordinary decode loop, which penalises over the
+            // generated tokens only. A draft model must not change the
+            // output, and at the default --repeat-penalty 1.1 a
+            // different penalty window changes it on the first repeated
+            // token: verified by running the same prompt both ways.
+            penalty_history_start: tokens.len(),
+        },
+    );
+    if let Some(e) = write_err {
+        return Err(e.into());
+    }
+    let decode_secs = decode_t.elapsed().as_secs_f64();
+    writeln!(stdout)?;
+
+    let tps = if decode_secs > 0.0 {
+        emitted as f64 / decode_secs
+    } else {
+        0.0
+    };
+    eprintln!(
+        "ferrox: predict {emitted} tokens, {tps:.2} t/s over {} verification steps",
+        result.verification_steps
+    );
+    // Reported as a pair with the throughput, and per position rather
+    // than folded into the mean: a drafter that is right at position 0
+    // and useless by position 7 has the same mean as a uniformly
+    // mediocre one, and the two want opposite block sizes. A speedup
+    // without an accept rate cannot be reproduced or debugged.
+    match result.acceptance_length() {
+        Some(len) => eprintln!(
+            "ferrox: acceptance length {len:.2} tokens/step, accepted {} of {} drafted",
+            result.accepted_tokens, result.drafted_tokens
+        ),
+        // `None` and 1.00 are different answers: "the drafter never got
+        // to propose" is not "it proposed and never helped".
+        None => eprintln!("ferrox: the drafter proposed nothing, so no acceptance length exists"),
+    }
+    let per_pos: Vec<String> = result
+        .accept_rate_per_position()
+        .iter()
+        .map(|r| format!("{r:.2}"))
+        .collect();
+    if !per_pos.is_empty() {
+        eprintln!("ferrox: accept rate per position [{}]", per_pos.join(", "));
+    }
     Ok(())
 }
 

@@ -371,7 +371,9 @@ fn probe(caches: &[KvCache]) -> Vec<CacheProbe> {
     caches
         .iter()
         .map(|c| CacheProbe {
-            seq_len: c.seq_len,
+            // ROWS: this probe reports buffer state, beside the two
+            // lengths it is derived from.
+            seq_len: c.rows(),
             k_len: c.k.len(),
             v_len: c.v.len(),
         })
@@ -386,7 +388,9 @@ fn probe_gemma4(state: &ferrox_models::gemma4_engine::Gemma4DecodeState) -> Vec<
         .iter()
         .flatten()
         .map(|c| CacheProbe {
-            seq_len: c.seq_len,
+            // ROWS: this probe reports buffer state, beside the two
+            // lengths it is derived from.
+            seq_len: c.rows(),
             k_len: c.k.len(),
             v_len: c.v.len(),
         })

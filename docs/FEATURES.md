@@ -198,7 +198,8 @@ OpenAI-compatible HTTP API:
   json_object` is still the best-effort character mask, and composes
 - Continuous batching and chunked prefill. On Metal, continuous batching
   is on by default when compatible; streaming emits tokens incrementally
-  under CB (0.15.2). CLI: `-cb`, `-np` / `--parallel N`
+  under CB (0.15.2). Metal CB prefill keeps host K/V authoritative for
+  batched decode (0.15.3). CLI: `-cb`, `-np` / `--parallel N`
 - Paged KV: shared page storage many requests read through a block
   table, with a radix tree over reference-counted page groups so
   conversations off one system prompt share its KV rather than each

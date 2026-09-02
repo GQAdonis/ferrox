@@ -1,8 +1,19 @@
 # Metal parallel decode concurrency
 
-Status: **phase 1 shipped** in **0.15.2** ([PR #47](https://github.com/antonellof/ferrox/pull/47))
+Status: **phase 1 shipped** in **0.15.2** ([PR #47](https://github.com/antonellof/ferrox/pull/47)); **CB Metal prefill fix** in **0.15.3**
 
 Related defect: https://github.com/antonellof/ferrox/issues/46 (closed)
+
+## Hotfix (0.15.3)
+
+Continuous batching on Metal returned garbled HTTP responses (fluent
+nonsense) while the private CLI path was fine. Root cause: CB prefill
+used `forward_token` (Metal-resident KV) but batched decode reads host
+`KvCache` via `forward_multi_seq`. Host rows were length-advanced but
+zero-filled; `sync_metal_attn_kv_to_host` could not repair once lengths
+matched. Fix: prefill uses `forward_batch_last_host_kv` /
+`forward_batch_last_paged` — same contract as `forward_prompt_batch(...,
+host_kv: true)` on the private path.
 
 ## Phase 1 shipped (0.15.2)
 

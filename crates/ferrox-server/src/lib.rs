@@ -57,6 +57,7 @@ mod model;
 mod openai_extra;
 mod output;
 mod policy;
+mod rerank;
 mod response_cache;
 pub(crate) mod responses;
 mod resume;
@@ -102,6 +103,7 @@ use ferrox_models::{Decoder, Gemma4Engine, KimiEngine, MlaEngine, PrefixCache};
 use generate::{FinishReason, GenerationParams};
 pub(crate) use loaded::{ActiveModel, Loaded};
 use model::ServerTokenizer;
+use rerank::encoder_endpoints;
 use response_cache::{CacheKey, ResponseCache};
 use sampling_knobs::SamplingKnobs;
 
@@ -1897,15 +1899,29 @@ async fn health(State(state): State<Arc<AppState>>) -> Response {
         // is `available` -- but a supervisor reading "serving X" and
         // then getting 501 from /v1/chat/completions learned nothing.
         // The detail says which endpoint this checkpoint is for.
-        Some(active) if active.encoder().is_some() => ferrox_api::Capability::available(
-            ferrox_api::health::capability::REAL_WEIGHTS,
-            format!(
-                "Serving the real embedding checkpoint '{}'. This is an ENCODER: {} serves \
-                 it, generation endpoints refuse it.",
-                active.name(),
-                ferrox_api::routes::V1_EMBEDDINGS,
-            ),
-        ),
+        // NOT a hard-coded /v1/embeddings any more: a reranker is an
+        // encoder too, and its pooling_type is RANK, which
+        // /v1/embeddings refuses and /v1/rerank is for. See
+        // `rerank::encoder_endpoints`, which `/v1/models` reads as well
+        // so the two cannot disagree.
+        Some(active) if active.encoder().is_some() => {
+            let endpoints = active
+                .encoder()
+                .map(|e| encoder_endpoints(e))
+                .unwrap_or_default();
+            let served_by = match endpoints.is_empty() {
+                true => "no endpoint in this build serves it".to_string(),
+                false => format!("served by {}", endpoints.join(" and ")),
+            };
+            ferrox_api::Capability::available(
+                ferrox_api::health::capability::REAL_WEIGHTS,
+                format!(
+                    "Serving the real embedding checkpoint '{}'. This is an ENCODER, \
+                     {served_by}; generation endpoints refuse it.",
+                    active.name(),
+                ),
+            )
+        }
         Some(active) => ferrox_api::Capability::available(
             ferrox_api::health::capability::REAL_WEIGHTS,
             format!("Serving the real checkpoint '{}'.", active.name()),
@@ -2006,7 +2022,7 @@ async fn list_models(State(state): State<Arc<AppState>>) -> Json<serde_json::Val
     // it never has to send the request to find out.
     if let Some(encoder) = active.encoder() {
         model_entry["ferrox_model_kind"] = serde_json::json!("embedding");
-        model_entry["ferrox_endpoints"] = serde_json::json!([ferrox_api::routes::V1_EMBEDDINGS]);
+        model_entry["ferrox_endpoints"] = serde_json::json!(encoder_endpoints(encoder));
         model_entry["ferrox_n_embd"] = serde_json::json!(encoder.n_embd());
         model_entry["ferrox_pooling"] = serde_json::json!(encoder.pooling_type().name());
         model_entry["ferrox_context_length"] = serde_json::json!(encoder.n_ctx_train());
@@ -4559,6 +4575,11 @@ async fn run(mcp_config_path: Option<PathBuf>, exit_on_stdin_close: bool) -> any
         .route(routes::TOKENIZE, post(openai_extra::tokenize))
         .route(routes::DETOKENIZE, post(openai_extra::detokenize))
         .route(routes::V1_EMBEDDINGS, post(embeddings::embeddings))
+        // Cross-encoder reranking, under the `/v1` spelling Cohere and
+        // Jina clients use and the unprefixed one llama.cpp mounts.
+        // Same handler: this really is an alias, not a second dialect.
+        .route(routes::V1_RERANK, post(rerank::rerank))
+        .route(routes::RERANK, post(rerank::rerank))
         .route(routes::CACHE_STATS, get(cache_stats))
         .route(routes::METRICS, get(metrics))
         // The control surface. Registered inside `protected` on

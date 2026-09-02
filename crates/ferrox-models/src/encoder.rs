@@ -84,6 +84,21 @@ pub trait TextEncoder {
         pieces.to_vec()
     }
 
+    /// The two-segment input a **cross-encoder** scores: one sequence
+    /// holding a query and a document with the model's own boundary
+    /// between them. For BERT that is `[CLS] a [SEP] b [SEP]`.
+    ///
+    /// `None` — the default — means this encoder has no two-segment
+    /// form, and a caller that needs one must refuse. Deliberately NOT
+    /// defaulted to `wrap_special(a ++ b)`: a cross-encoder was trained
+    /// with a separator between the halves, and one that never sees it
+    /// still returns a plausible float. That is the "computes something
+    /// else" failure, and it is invisible — a rerank with no boundary
+    /// produces an ordering, just not the model's.
+    fn wrap_special_pair(&self, _a: &[u32], _b: &[u32]) -> Option<Vec<u32>> {
+        None
+    }
+
     /// `n_tokens × n_embd` hidden states, in row order.
     fn encode_tokens(&self, tokens: &[u32]) -> Result<Vec<f32>, EncodeError>;
 

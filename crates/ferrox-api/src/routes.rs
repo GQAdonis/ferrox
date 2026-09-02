@@ -56,6 +56,26 @@ pub const TOKENIZE: &str = "/tokenize";
 pub const DETOKENIZE: &str = "/detokenize";
 pub const V1_EMBEDDINGS: &str = "/v1/embeddings";
 
+/// Cross-encoder reranking: one query against N documents, scored by
+/// the checkpoint's own classification head (`cls` / `cls.output`), not
+/// by the cosine similarity of two embeddings.
+///
+/// The path Cohere and Jina clients use, and one of the four llama.cpp
+/// mounts. Not an OpenAI endpoint at all -- OpenAI has no reranker --
+/// so the request and response shapes follow Jina/Cohere, which is what
+/// every existing client already speaks.
+pub const V1_RERANK: &str = "/v1/rerank";
+
+/// llama.cpp's unprefixed spelling of [`V1_RERANK`], mounted on the
+/// same handler (`tools/server/server.cpp` registers `/rerank`,
+/// `/reranking`, `/v1/rerank` and `/v1/reranking`).
+///
+/// Same reasoning as [`TOKENIZE`]: the client's configured URL should
+/// work unchanged rather than 404 on a prefix ferrox chose. Unlike
+/// [`COMPLETION`], this one really is an alias -- same dialect, same
+/// body, same response.
+pub const RERANK: &str = "/rerank";
+
 /// Anthropic-compatible messages endpoint.
 pub const V1_MESSAGES: &str = "/v1/messages";
 
@@ -210,6 +230,8 @@ pub const ALL: &[&str] = &[
     TOKENIZE,
     DETOKENIZE,
     V1_EMBEDDINGS,
+    V1_RERANK,
+    RERANK,
     V1_MESSAGES,
     V1_MESSAGES_COUNT_TOKENS,
     V1_CANCEL,
@@ -246,7 +268,11 @@ mod tests {
     /// removed and nothing else changed.
     #[test]
     fn the_llama_cpp_aliases_are_the_v1_paths_without_the_prefix() {
-        for (alias, v1) in [(TOKENIZE, V1_TOKENIZE), (DETOKENIZE, V1_DETOKENIZE)] {
+        for (alias, v1) in [
+            (TOKENIZE, V1_TOKENIZE),
+            (DETOKENIZE, V1_DETOKENIZE),
+            (RERANK, V1_RERANK),
+        ] {
             assert_eq!(v1, format!("/v1{alias}"));
             assert!(ALL.contains(&alias), "{alias} must be enumerable");
         }

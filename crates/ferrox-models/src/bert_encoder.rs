@@ -229,6 +229,29 @@ impl TextEncoder for BertEncoder {
         out
     }
 
+    /// `[CLS] a [SEP] b [SEP]` — what HuggingFace's
+    /// `tokenizer(query, document)` builds for a BERT cross-encoder,
+    /// which is the input these checkpoints were trained on.
+    ///
+    /// The **segment ids** that pairing normally carries are not here,
+    /// and that is deliberate rather than forgotten: this graph adds
+    /// row 0 of `token_types.weight` to every position, because
+    /// llama.cpp does the same (`token types are hardcoded to zero`,
+    /// its `bert.cpp`; see [`BertEncoder::type_embd_row0`]). A reranker
+    /// scored here therefore differs from the HF reference by the
+    /// second segment's type embedding, on both engines equally. It is
+    /// recorded in the ferrox rerank docs and is the first thing to
+    /// check if an ordering disagrees with `transformers`.
+    fn wrap_special_pair(&self, a: &[u32], b: &[u32]) -> Option<Vec<u32>> {
+        let mut out = Vec::with_capacity(a.len() + b.len() + 3);
+        out.push(self.hp.cls_id);
+        out.extend_from_slice(a);
+        out.push(self.hp.sep_id);
+        out.extend_from_slice(b);
+        out.push(self.hp.sep_id);
+        Some(out)
+    }
+
     fn encode_tokens(&self, tokens: &[u32]) -> Result<Vec<f32>, EncodeError> {
         let n = tokens.len();
         if n == 0 {
@@ -615,6 +638,29 @@ mod tests {
         let m = fixture(1);
         assert_eq!(m.wrap_special(&[7, 8]), vec![1, 7, 8, 2]);
         assert_eq!(m.wrap_special(&[]), vec![1, 2]);
+    }
+
+    /// The cross-encoder input is `[CLS] a [SEP] b [SEP]` — the
+    /// boundary between the two halves is the whole reason a reranker
+    /// scores differently from an embedding model. Concatenating
+    /// without it, or dropping the trailing `[SEP]`, produces a
+    /// perfectly plausible ranking that is not the model's, so the
+    /// exact sequence is asserted rather than its length.
+    #[test]
+    fn the_pair_form_separates_the_two_halves_and_closes_the_second() {
+        let m = fixture(1);
+        assert_eq!(
+            m.wrap_special_pair(&[7, 8], &[9]).unwrap(),
+            vec![1, 7, 8, 2, 9, 2]
+        );
+        // An empty half is still a half: the boundary stays.
+        assert_eq!(m.wrap_special_pair(&[], &[]).unwrap(), vec![1, 2, 2]);
+        // And it is NOT the single-sequence form of the two texts run
+        // together, which is what a defaulted implementation would give.
+        assert_ne!(
+            m.wrap_special_pair(&[7, 8], &[9]).unwrap(),
+            m.wrap_special(&[7, 8, 9])
+        );
     }
 
     /// `embed_tokens` must return the CLS row of the hidden states this

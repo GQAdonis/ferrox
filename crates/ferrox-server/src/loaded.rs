@@ -82,6 +82,23 @@ pub(crate) struct ActiveModel {
     pub(crate) ceiling: Option<Arc<budget::ContextCeiling>>,
 }
 
+/// `FERROX_MODEL_NAME`, cached because `name()` returns a `&str` and is
+/// called per request.
+///
+/// Read once: the server sets it before any worker thread starts, and a
+/// name that changed under a running server would make two responses
+/// disagree about which model answered them.
+fn served_name_override() -> Option<&'static str> {
+    static NAME: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    NAME.get_or_init(|| {
+        std::env::var("FERROX_MODEL_NAME")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    })
+    .as_deref()
+}
+
 impl ActiveModel {
     /// The model to decode with, or a refusal naming the encoder that
     /// is loaded instead.
@@ -150,7 +167,18 @@ impl ActiveModel {
 
     /// What `/v1/models` and `/health` call this checkpoint. Both kinds
     /// have a real name.
+    ///
+    /// `FERROX_MODEL_NAME` (llama.cpp's `--alias`) wins when set. It is
+    /// read HERE rather than at load because three loader paths derive
+    /// a name from `general.name` independently, and threading an
+    /// override through all three would be three places that have to
+    /// agree about one string. This is the single place the served name
+    /// is decided, so the override cannot apply to some models and not
+    /// others.
     pub(crate) fn name(&self) -> &str {
+        if let Some(alias) = served_name_override() {
+            return alias;
+        }
         match &self.loaded {
             Loaded::Generative(m) => m.name(),
             Loaded::Encoder(e) => e.name(),

@@ -42,6 +42,24 @@ pub struct InferArgs {
     )]
     pub hf_repo: Option<String>,
 
+    /// Exact filename inside `--hf-repo`, llama.cpp's `-hff`.
+    #[arg(long = "hf-file", value_name = "FILE", requires = "hf_repo")]
+    pub hf_file: Option<String>,
+
+    /// Penalise a token for having appeared at all, llama.cpp's
+    /// `--presence-penalty`. `0.0` = off, which is llama.cpp's default.
+    ///
+    /// The engine and `/v1/chat/completions` have always supported
+    /// this; the CLI hardcoded it to zero, so the two disagreed about
+    /// what `ferrox` could do.
+    #[arg(long = "presence-penalty", value_name = "P", default_value_t = 0.0)]
+    pub presence_penalty: f32,
+
+    /// Penalise a token in proportion to how often it has appeared,
+    /// llama.cpp's `--frequency-penalty`. `0.0` = off.
+    #[arg(long = "frequency-penalty", value_name = "P", default_value_t = 0.0)]
+    pub frequency_penalty: f32,
+
     /// Prompt string. Alias of llama.cpp `-p`.
     #[arg(short = 'p', long = "prompt", default_value = "")]
     pub prompt: String,
@@ -51,7 +69,12 @@ pub struct InferArgs {
     pub file: Option<String>,
 
     /// Number of tokens to predict (`-1` = fill remaining context).
-    #[arg(short = 'n', long = "n-predict", default_value_t = 128)]
+    #[arg(
+        short = 'n',
+        long = "n-predict",
+        visible_alias = "predict",
+        default_value_t = 128
+    )]
     pub n_predict: i64,
 
     /// Context size: `auto` = largest that fits the device memory
@@ -229,7 +252,12 @@ pub struct InferArgs {
     /// KV cache dtype (llama.cpp `-ctk` analogue). Sets `FERROX_CTK`.
     /// Values: `f16` (default), `q8_0`, `fp8`, `turbo8`, `turbo4`, `turbo3`.
     /// Non-f16 paths warn and fall back to f16 until Metal kernels land.
-    #[arg(long = "ctk", value_name = "TYPE", default_value = "f16")]
+    #[arg(
+        long = "ctk",
+        visible_alias = "cache-type-k",
+        value_name = "TYPE",
+        default_value = "f16"
+    )]
     pub ctk: String,
 }
 
@@ -392,8 +420,8 @@ impl InferArgs {
             top_k: self.top_k,
             repetition_penalty: self.repeat_penalty,
             penalty_last_n: self.repeat_last_n,
-            presence_penalty: 0.0,
-            frequency_penalty: 0.0,
+            presence_penalty: self.presence_penalty,
+            frequency_penalty: self.frequency_penalty,
         }
     }
 }
@@ -1064,7 +1092,7 @@ pub fn run_infer(args: InferArgs) -> anyhow::Result<()> {
     // `--model`, so the rest of this function sees one kind of input.
     let mut args = args;
     if let Some(spec) = args.hf_repo.clone() {
-        args.model = Some(crate::hf::resolve(&spec)?);
+        args.model = Some(crate::hf::resolve(&spec, args.hf_file.as_deref())?);
     }
     if args.mtp {
         anyhow::bail!(

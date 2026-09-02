@@ -1,9 +1,10 @@
 //! `ferrox quantize`: read a GGUF, write a GGUF whose eligible tensors
 //! are re-encoded to a quantization ferrox can actually produce.
 //!
-//! Today that is Q8_0 and nothing else. See [`policy`] for why the
-//! other targets refuse by name instead of being approximated, and for
-//! the tensor-eligibility rules this shares with llama.cpp.
+//! Today that is Q8_0, and Q4_K under `--pure`. See [`policy`] for why
+//! the other targets refuse by name instead of being approximated, why
+//! `--pure` is mandatory for the Q4_K names rather than optional, and
+//! for the tensor-eligibility rules this shares with llama.cpp.
 //!
 //! The pass is streaming: the input is mmap'd, tensors are re-encoded
 //! one at a time, and the output is written through a `BufWriter`. A
@@ -45,12 +46,24 @@ pub struct QuantizeArgs {
     /// share one; this one does not.)
     pub output: Option<PathBuf>,
 
-    /// Quantization to write. ferrox can write Q8_0. Every other
-    /// llama.cpp target is refused BY NAME -- ferrox reads them all and
-    /// encodes one, and a subcommand that pretended otherwise would
-    /// hand back a file that loads and is worse.
+    /// Quantization to write. ferrox can write Q8_0, and Q4_K_S /
+    /// Q4_K_M with --pure. Every other llama.cpp target is refused BY
+    /// NAME -- ferrox reads them all and encodes two, and a subcommand
+    /// that pretended otherwise would hand back a file that loads and
+    /// is worse.
     #[arg(long = "type", default_value = "Q8_0")]
     pub ty: String,
+
+    /// Skip llama.cpp's per-tensor mix and write every quantizable
+    /// tensor as `--type`, the way `llama-quantize --pure` does.
+    ///
+    /// Required for the Q4_K targets: their mixes promote
+    /// `output.weight` to Q6_K and several per-layer tensors to Q5_K or
+    /// Q6_K, and ferrox has no encoder for either, so it can write the
+    /// pure file or nothing. A no-op for Q8_0, whose mix is already
+    /// uniform.
+    #[arg(long)]
+    pub pure: bool,
 
     /// Print the plan (per tensor: quantize or copy, and why) and the
     /// resulting size, without writing anything.
@@ -75,7 +88,7 @@ struct Planned {
 }
 
 pub fn run(args: QuantizeArgs) -> Result<()> {
-    let target = parse_target(&args.ty).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let target = parse_target(&args.ty, args.pure).map_err(|e| anyhow::anyhow!("{e}"))?;
 
     let file =
         GgufFile::open(&args.input).with_context(|| format!("opening {}", args.input.display()))?;
@@ -259,11 +272,10 @@ fn plan(file: &GgufFile, target: Target) -> Result<Vec<Planned>> {
                 if !n_cols.is_multiple_of(block_elems) {
                     bail!(
                         "tensor '{}' has {n_cols} columns, which is not a multiple of {}'s block \
-                         size ({block_elems}). llama.cpp has no fallback type for {} either -- it \
-                         stops here too.",
+                         size ({block_elems}). {}",
                         t.name,
-                        target.name(),
-                        target.name()
+                        target.ggml_type_name(),
+                        target.fallback_note()
                     );
                 }
                 let n_elements = t.element_count().ok_or_else(|| {
@@ -311,17 +323,19 @@ fn encode_tensor(p: &Planned, src: &[u8], target: Target) -> Result<Vec<u8>> {
             for &r in rows {
                 let row = &src[r * src_row_bytes..(r + 1) * src_row_bytes];
                 decode_source_row(p.source_dtype, row, &mut scratch)?;
-                match target {
-                    Target::Q8_0 => {
-                        ferrox_quant::encode_row_q8_0(&scratch, &mut buf).ok_or_else(|| {
-                            anyhow::anyhow!(
-                                "tensor '{}' row length {n_cols} is not a whole number of Q8_0 \
-                                 blocks",
-                                p.name
-                            )
-                        })?
+                let encoded = match target {
+                    Target::Q8_0 => ferrox_quant::encode_row_q8_0(&scratch, &mut buf),
+                    Target::Q4_K_S | Target::Q4_K_M => {
+                        ferrox_quant::encode_row_q4_k(&scratch, &mut buf)
                     }
-                }
+                };
+                encoded.ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "tensor '{}' row length {n_cols} is not a whole number of {} blocks",
+                        p.name,
+                        target.ggml_type_name()
+                    )
+                })?;
             }
             Ok(buf)
         })
@@ -385,6 +399,24 @@ mod tests {
         dir
     }
 
+    /// One place the test `QuantizeArgs` are built.
+    ///
+    /// Six hand-written literals of this struct is the shape CLAUDE.md
+    /// names first: adding `--pure` had to be spelled six times, and
+    /// six copies is five chances to give one of them a different
+    /// default from the CLI's. The builder takes what each test varies
+    /// and nothing else.
+    fn args(input: &Path, output: &Path, ty: &str) -> QuantizeArgs {
+        QuantizeArgs {
+            input: input.to_path_buf(),
+            output: Some(output.to_path_buf()),
+            ty: ty.into(),
+            pure: false,
+            dry_run: false,
+            force: true,
+        }
+    }
+
     /// Writes a tiny but structurally real F16 GGUF: a 2-D weight to
     /// quantize, a 1-D tensor (the dimension rule), a 2-D norm and a
     /// 2-D router gate (the keep-list rules).
@@ -393,8 +425,12 @@ mod tests {
     /// dimension rule alone, so deleting `_norm.weight` from the
     /// keep-list would leave this test green -- which it did, until the
     /// sabotage pass found it.
-    fn write_f16_source(path: &Path) -> Vec<f32> {
-        let n = 64usize;
+    /// `n_cols` is a parameter because the two targets have different
+    /// block sizes: 64 columns is a whole number of Q8_0 blocks and NOT
+    /// of Q4_K super-blocks, and a fixture that only ever had one width
+    /// could not tell the two refusals apart.
+    fn write_f16_source(path: &Path, n_cols: usize) -> Vec<f32> {
+        let n = n_cols;
         let values: Vec<f32> = (0..n * 2)
             .map(|i| ((i as f32) * 0.037).sin() * 0.8)
             .collect();
@@ -411,31 +447,31 @@ mod tests {
         metadata.insert("general.file_type".to_string(), GgufValue::U32(1));
 
         let w = f16_bytes(&values);
-        let one_d = f16_bytes(&values[..64]);
-        let norm = f16_bytes(&values[..128]);
-        let gate = f16_bytes(&values[..128]);
+        let one_d = f16_bytes(&values[..n]);
+        let norm = f16_bytes(&values);
+        let gate = f16_bytes(&values);
         let plan = vec![
             TensorPlan {
                 name: "blk.0.attn_q.weight".into(),
-                shape: vec![64, 2],
+                shape: vec![n as u64, 2],
                 dtype: GgmlType::F16,
                 byte_len: w.len(),
             },
             TensorPlan {
                 name: "blk.0.attn_q.bias".into(),
-                shape: vec![64],
+                shape: vec![n as u64],
                 dtype: GgmlType::F16,
                 byte_len: one_d.len(),
             },
             TensorPlan {
                 name: "blk.0.attn_norm.weight".into(),
-                shape: vec![64, 2],
+                shape: vec![n as u64, 2],
                 dtype: GgmlType::F16,
                 byte_len: norm.len(),
             },
             TensorPlan {
                 name: "blk.0.ffn_gate_inp.weight".into(),
-                shape: vec![64, 2],
+                shape: vec![n as u64, 2],
                 dtype: GgmlType::F16,
                 byte_len: gate.len(),
             },
@@ -459,16 +495,9 @@ mod tests {
         let dir = tmp_dir("roundtrip");
         let src = dir.join("src.gguf");
         let dst = dir.join("dst.gguf");
-        let values = write_f16_source(&src);
+        let values = write_f16_source(&src, 64);
 
-        run(QuantizeArgs {
-            input: src.clone(),
-            output: Some(dst.clone()),
-            ty: "Q8_0".into(),
-            dry_run: false,
-            force: true,
-        })
-        .unwrap();
+        run(args(&src, &dst, "Q8_0")).unwrap();
 
         let out = GgufFile::open(&dst).unwrap();
         assert_eq!(out.metadata_u64("general.file_type"), Some(7));
@@ -512,15 +541,8 @@ mod tests {
         let dir = tmp_dir("bytes");
         let src = dir.join("src.gguf");
         let dst = dir.join("dst.gguf");
-        let values = write_f16_source(&src);
-        run(QuantizeArgs {
-            input: src,
-            output: Some(dst.clone()),
-            ty: "q8_0".into(),
-            dry_run: false,
-            force: true,
-        })
-        .unwrap();
+        let values = write_f16_source(&src, 64);
+        run(args(&src, &dst, "q8_0")).unwrap();
 
         // Re-encode independently, from the f16 the source stored (not
         // from `values`, which is f32 and would round differently).
@@ -540,21 +562,14 @@ mod tests {
     /// The refusal this subcommand is scoped around, exercised through
     /// the real entry point rather than only through `parse_target`.
     #[test]
-    fn asking_for_a_k_quant_refuses_before_touching_the_filesystem() {
+    fn asking_for_a_target_with_no_encoder_refuses_before_touching_the_filesystem() {
         let dir = tmp_dir("refuse");
         let src = dir.join("src.gguf");
         let dst = dir.join("dst.gguf");
-        write_f16_source(&src);
-        let err = run(QuantizeArgs {
-            input: src,
-            output: Some(dst.clone()),
-            ty: "Q4_K_M".into(),
-            dry_run: false,
-            force: true,
-        })
-        .unwrap_err();
+        write_f16_source(&src, 64);
+        let err = run(args(&src, &dst, "Q6_K")).unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("cannot WRITE Q4_K_M"), "{msg}");
+        assert!(msg.contains("cannot WRITE Q6_K"), "{msg}");
         assert!(msg.contains("Q8_0"), "{msg}");
         assert!(!dst.exists(), "a refused run must not leave a file behind");
         std::fs::remove_dir_all(&dir).ok();
@@ -580,11 +595,8 @@ mod tests {
         wr.finish().unwrap().into_inner().unwrap();
 
         let err = run(QuantizeArgs {
-            input: src,
-            output: Some(dir.join("dst.gguf")),
-            ty: "Q8_0".into(),
             dry_run: true,
-            force: true,
+            ..args(&src, &dir.join("dst.gguf"), "Q8_0")
         })
         .unwrap_err();
         assert!(
@@ -614,11 +626,8 @@ mod tests {
         wr.finish().unwrap().into_inner().unwrap();
 
         let err = run(QuantizeArgs {
-            input: src,
-            output: Some(dir.join("dst.gguf")),
-            ty: "Q8_0".into(),
             dry_run: true,
-            force: true,
+            ..args(&src, &dir.join("dst.gguf"), "Q8_0")
         })
         .unwrap_err();
         assert!(err.to_string().contains("not a multiple of"), "{err}");
@@ -630,18 +639,120 @@ mod tests {
         let dir = tmp_dir("clobber");
         let src = dir.join("src.gguf");
         let dst = dir.join("dst.gguf");
-        write_f16_source(&src);
+        write_f16_source(&src, 64);
         std::fs::write(&dst, b"precious").unwrap();
         let err = run(QuantizeArgs {
-            input: src,
-            output: Some(dst.clone()),
-            ty: "Q8_0".into(),
-            dry_run: false,
             force: false,
+            ..args(&src, &dst, "Q8_0")
         })
         .unwrap_err();
         assert!(err.to_string().contains("--force"), "{err}");
         assert_eq!(std::fs::read(&dst).unwrap(), b"precious");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `--type q4_k_m` names a MIX, and ferrox has only the block
+    /// encoder for it. Writing uniform Q4_K under that name would
+    /// produce a file whose `general.file_type` says Q4_K_M while its
+    /// output head is four bits where llama.cpp's is six -- a file that
+    /// loads, runs, and is not what it says it is.
+    ///
+    /// This is the refusal step 2 adds, and the one most likely to be
+    /// argued away later, so it is asserted through the real entry
+    /// point and it checks that nothing was written.
+    #[test]
+    fn asking_for_the_q4_k_mix_without_pure_refuses_and_writes_nothing() {
+        let dir = tmp_dir("mix");
+        let src = dir.join("src.gguf");
+        let dst = dir.join("dst.gguf");
+        write_f16_source(&src, 256);
+        let err = run(args(&src, &dst, "q4_k_m")).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("cannot write llama.cpp's Q4_K_M MIX"), "{msg}");
+        assert!(msg.contains("Q5_K / Q6_K"), "{msg}");
+        assert!(msg.contains("Pass --pure"), "{msg}");
+        assert!(!dst.exists(), "a refused run must not leave a file behind");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// End to end for the K-quant: an F16 GGUF in, a `--pure` Q4_K
+    /// GGUF out, read back by the reader the engine loads models with.
+    ///
+    /// The bytes are compared against the encoder rather than against a
+    /// tolerance, because `ferrox-quant`'s golden already pins the
+    /// encoder to llama.cpp's; what this adds is the pipeline around it
+    /// -- 256-wide row tiling, F16 decode, the writer's data-section
+    /// layout, and the `general.file_type` that tells every other tool
+    /// what the file is.
+    #[test]
+    fn an_f16_gguf_round_trips_through_quantize_and_reads_back_as_q4_k() {
+        let dir = tmp_dir("q4k");
+        let src = dir.join("src.gguf");
+        let dst = dir.join("dst.gguf");
+        let values = write_f16_source(&src, 256);
+
+        run(QuantizeArgs {
+            pure: true,
+            ..args(&src, &dst, "q4_k_s")
+        })
+        .unwrap();
+
+        let out = GgufFile::open(&dst).unwrap();
+        // 14 is LLAMA_FTYPE_MOSTLY_Q4_K_S. `q4_k_m` would write 15 from
+        // the same bytes, which is the whole reason the two are
+        // separate targets.
+        assert_eq!(out.metadata_u64("general.file_type"), Some(14));
+        let q = out.find_tensor("blk.0.attn_q.weight").unwrap();
+        assert_eq!(q.dtype, GgmlType::Q4K);
+        assert_eq!(q.shape, vec![256, 2]);
+        // `--pure` skips llama.cpp's per-layer mix, NOT its keep-list:
+        // a norm quantized to Q4_K is a broken model either way.
+        for kept in [
+            "blk.0.attn_q.bias",
+            "blk.0.attn_norm.weight",
+            "blk.0.ffn_gate_inp.weight",
+        ] {
+            assert_eq!(
+                out.find_tensor(kept).unwrap().dtype,
+                GgmlType::F16,
+                "{kept} should have been kept at source precision"
+            );
+        }
+
+        let mut want = Vec::new();
+        let f16_roundtrip: Vec<f32> = values
+            .iter()
+            .map(|v| half::f16::from_f32(*v).to_f32())
+            .collect();
+        for row in f16_roundtrip.chunks(256) {
+            ferrox_quant::encode_row_q4_k(row, &mut want).unwrap();
+        }
+        assert_eq!(out.tensor_bytes("blk.0.attn_q.weight").unwrap(), &want[..]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The block-size refusal has to say the right thing for the right
+    /// target. 64 columns is a whole number of Q8_0 blocks and not of
+    /// Q4_K super-blocks, and llama.cpp's answers differ: it throws for
+    /// Q8_0 and silently rewrites the tensor to Q5_0 for Q4_K. One
+    /// sentence covering both was true of only Q8_0.
+    #[test]
+    fn a_row_too_narrow_for_a_super_block_is_refused_and_names_llama_cpps_fallback() {
+        let dir = tmp_dir("narrow");
+        let src = dir.join("src.gguf");
+        write_f16_source(&src, 64);
+        let err = run(QuantizeArgs {
+            pure: true,
+            dry_run: true,
+            ..args(&src, &dir.join("dst.gguf"), "q4_k_s")
+        })
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("not a multiple of Q4_K's block size (256)"),
+            "{msg}"
+        );
+        assert!(msg.contains("Q4_K -> Q5_0"), "{msg}");
         std::fs::remove_dir_all(&dir).ok();
     }
 

@@ -96,12 +96,13 @@ enum Commands {
     Download(download::DownloadArgs),
     /// Write a quantized copy of a GGUF.
     ///
-    /// ferrox READS every quant kind it runs and WRITES Q8_0. Every
-    /// other llama.cpp target -- the K-quants, the IQ tiers, MXFP4 --
-    /// is refused BY NAME: their encoders are an iterative
-    /// per-super-block fit, and an approximation of one produces a file
-    /// that loads and generates measurably worse text. Use
-    /// `llama-quantize` for those; ferrox reads what it writes.
+    /// ferrox READS every quant kind it runs and writes `Q8_0`, plus
+    /// `Q4_K_S` / `Q4_K_M` with `--pure`. Every other llama.cpp target
+    /// -- the remaining K-quants, the IQ tiers, MXFP4 -- is refused BY
+    /// NAME: their encoders are an iterative per-super-block fit, and
+    /// an approximation of one produces a file that loads and generates
+    /// measurably worse text. Use `llama-quantize` for those; ferrox
+    /// reads what it writes.
     Quantize(quantize::QuantizeArgs),
     /// Print GGUF header metadata and tensor list for a model file.
     Inspect { path: String },

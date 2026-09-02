@@ -17,7 +17,7 @@ now carries what is true rather than what was true at breakfast.
 | Architecture coverage | **16** audited + 4 dedicated engines vs 140 llama.cpp graphs | P0, expand audited set |
 | CLI flag semantics | `-ngl` still refuses a partial count deliberately; `-e` and `--repeat-last-n` already match | P2, documented rather than divergent |
 | Server flags | **DONE**: `-c`, `--api-key`, `--api-key-file`, `--alias`, `--ctk`, `-hf`, `--hf-file`, `-cb`, `-np` | closed |
-| Sampling / grammar | **Mostly done**: GBNF, JSON Schema, forced `tool_choice`, `--presence-penalty` / `--frequency-penalty` | P2, `--samplers` ordering left |
+| Sampling / grammar | **Done**: GBNF, JSON Schema, forced `tool_choice`, the two penalties, and `--samplers` ordering with unimplemented samplers refused by name | closed, bar the samplers ferrox does not implement (`dry`, `xtc`, `typ_p`, `top_n_sigma`) |
 | Tools (quantize, perplexity) | `ferrox quantize` writes Q8_0 byte-identically; `ferrox perplexity` agrees with `llama-perplexity` to within a fifth of a standard error on five checkpoints | P1, K-quant encoders (#70); HellaSwag and the other corpus sub-tools remain |
 | Serving / batching | CB auto-on Metal; incremental CB streaming | P1, slot save/load |
 | Metal concurrency | Phase 1 shipped (#46 closed); per-request Metal KV is follow-up | P2 |

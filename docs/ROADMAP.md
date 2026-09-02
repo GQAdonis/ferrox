@@ -29,6 +29,37 @@ paths, a CUDA batched GEMM (**never run on a GPU**, see item 4 below),
 and a triage of every unaudited architecture refusal into
 fixture-away / one-match-arm / new-code / unknown.
 
+## Behaviour change, unreleased: penalties now see the prompt
+
+**This changes generated text for every user at the default
+`--repeat-penalty 1.1`, and belongs at the top of the next release's
+notes.**
+
+llama.cpp seeds its sampler with every prompt token before the first
+draw (`tools/server/server-context.cpp:386-390`, and `llama-cli` does
+the same), so `penalty_last_n` slides over the tail of
+`prompt ++ generated`. ferrox slid it over `generated` alone. Same
+checkpoint, same flags, same prompt, different text.
+
+A token that occurs in the prompt is now penalised on its FIRST
+generated occurrence rather than its second. `--repeat-penalty 1.0` or
+`--repeat-last-n 0` reproduces the old output exactly.
+
+This was taken as a parity fix rather than left as a documented
+divergence because it is a DEFINITION, not a default. This project
+already carries one deliberate deviation, `--repeat-penalty` defaulting
+to 1.1 against llama.cpp's 1.0, and that one is visible on a typed flag.
+This was the same flag meaning a different thing: invisible from the
+command line, and invisible to `ferrox parity`, which compares logits
+and tokenizers rather than sampled text.
+
+It also closed a five-way disagreement inside ferrox. The window was a
+`&[usize]` and five call sites chose four different answers, with
+`kimi_generate` quietly the only one that matched llama.cpp.
+`PenaltyWindow` has no constructor taking a single slice, so a caller
+cannot build one without saying what its prompt is, and the two places
+that genuinely have none say `&[]` visibly in the diff.
+
 ## Closed on 2026-09-02
 
 - **Vulkan is a third backend**, behind `--features vulkan`. A `Q8_0`
@@ -56,8 +87,41 @@ fixture-away / one-match-arm / new-code / unknown.
 - The repack cache served a dead mapping's bytes, and the CLI banner
   reported a KV dtype the run does not keep
 
-Landed but not reachable yet: the reranker classification head
-(`ferrox_models::rank_head`) has no `/v1/rerank` route.
+### Second batch, same day
+
+- **`/v1/rerank`** runs the checkpoint's own classification head rather
+  than a cosine similarity. Such a checkpoint could not load at all
+  before: `assert_every_tensor_consumed` rejected the `cls.*` tensors
+  nobody read
+- **Speculative decoding with a real draft model.** `-d` /
+  `--model-draft` loads a second GGUF; the rejection rule was already
+  lossless at every temperature. Measured on a 3B target with a 1B
+  drafter: 40 tokens in 12 verification steps, acceptance length 3.33
+- **llama.cpp's `-hf user/repo:QUANT`** on `run`, `serve` and
+  `download`, with a cache under `FERROX_CACHE`. Plus the server flags a
+  copied `llama-server` command carries: `-c`, `--api-key`,
+  `--api-key-file`, `--alias`, `--ctk`, `--hf-file`, and `--jinja` /
+  `--no-warmup` / `--flash-attn` accepted rather than fatal
+- **`--presence-penalty` and `--frequency-penalty` on the CLI.** The
+  engine and the HTTP API had always honoured them while `run`
+  hardcoded both to zero
+- **Five one-match-arm architectures admitted**, so unaudited went 46 to
+  41 and audited 11 to 16
+- **Forced `tool_choice` on eight of the eleven wire formats**, up from
+  three, with the grammar's literals built from the same marker
+  description the parser reads with. The remaining three refuse for
+  stated reasons rather than for effort
+- **Gemma-2-27B and Gemma-3-4B/12B/27B numerics**, and Gemma-3 4B+ is
+  back on the fused Metal stacks with a per-layer `LayerRope`
+- **The response cache cannot store a cancelled answer**, enforced by a
+  private-field token rather than a check beside the data
+- `max_tokens` from an HTTP body reaching `Vec::with_capacity(usize::MAX)`,
+  and the batched prefill re-running the whole prompt on top of the
+  radix prefix it had just adopted
+
+Verified but NOT measured, and both need a quiet host: the speculative
+decoding speedup, and the speed recovery from Gemma-3 4B+ returning to
+the fused Metal path.
 
 ## Tracked as issues
 

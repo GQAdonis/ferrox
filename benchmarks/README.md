@@ -228,7 +228,7 @@ batching.
 | | |
 |---|---|
 | Measures | end-to-end HTTP latency and throughput |
-| Driver | `ferrox serve-bench` (Rust) or external harness |
+| Driver | `ferrox serve-bench` (Rust) or [`pi-agent-tests`](../../pi-agent-tests/) harness |
 | Compared against | — (no llama.cpp HTTP twin in-tree) |
 | Raw numbers | [`receipts/serving/`](receipts/serving/) |
 | Workload | streaming chat/completions, concurrency sweeps |
@@ -257,9 +257,11 @@ Host B, **Llama-3.2-3B-Instruct Q4_K_M**, CB auto-on, `ferrox 0.15.3`:
 | | 8 | 16/16 | **24.4** | 957 ms |
 | sequential stream (`max_tokens=128`) | 1 | 8/8 | — | **118 ms** |
 
-Receipts:
+Receipts (from [`pi-agent-tests/ferrox_parallel_bench.py`](../../pi-agent-tests/ferrox_parallel_bench.py)
+and [`ferrox_stream_bench.py`](../../pi-agent-tests/ferrox_stream_bench.py)):
 [`llama32_3b_q4km_metal_cb_parallel_0.15.3.json`](receipts/serving/llama32_3b_q4km_metal_cb_parallel_0.15.3.json),
 [`llama32_3b_q4km_metal_cb_stream_0.15.3.json`](receipts/serving/llama32_3b_q4km_metal_cb_stream_0.15.3.json).
+See also [`pi-agent-tests/README.md`](../../pi-agent-tests/README.md).
 
 0.15.2 measured similar aggregate throughput at concurrency 8 but returned
 garbled text under CB on Metal until the 0.15.3 host-K/V prefill fix.

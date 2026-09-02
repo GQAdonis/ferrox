@@ -197,6 +197,22 @@ impl EmbeddingModel {
         self.encoder.wrap_special(&self.tokenizer.encode(text))
     }
 
+    /// Text for `ids`, through this checkpoint's own vocabulary.
+    ///
+    /// The counterpart to [`Self::token_ids`], so `/v1/detokenize`
+    /// answers for an encoder rather than refusing. An embedding
+    /// model's whole contract is the vector it returns for a string,
+    /// and when that vector is surprising the first question is what
+    /// tokens it actually saw. Without this the only way to ask was to
+    /// load the checkpoint in a second tool.
+    ///
+    /// Not `wrap_special`'s inverse: it decodes exactly the ids given,
+    /// including specials if the caller passes them, because a caller
+    /// checking a tokenization wants to see what it sent.
+    pub fn decode_tokens(&self, ids: &[u32]) -> String {
+        self.tokenizer.decode(ids)
+    }
+
     /// Pooled embedding for `text`. `normalize` applies L2 normalization,
     /// which is what an OpenAI-compatible `/v1/embeddings` response is
     /// expected to carry and what llama.cpp's server does by default;

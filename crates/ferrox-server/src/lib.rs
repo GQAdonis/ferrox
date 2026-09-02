@@ -7017,6 +7017,53 @@ mod tests {
             .expect("a real-weights capability row");
         let detail = weights["detail"].as_str().unwrap_or_default();
         assert!(detail.contains("ENCODER"), "{detail}");
+        // 5. It tokenizes, and round-trips. An embedding model's whole
+        // contract is the vector it returns for a string, so when that
+        // vector surprises you the first question is what tokens it
+        // actually saw. These routes used to go through
+        // `generative()?` and answer 501 "not a generative model",
+        // which left no way to ask without loading the checkpoint in a
+        // second tool (issue #28).
+        let (status, body) = post_json_uri(
+            &app,
+            ferrox_api::routes::V1_TOKENIZE,
+            serde_json::json!({ "content": "hello world" }),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "an encoder has a real tokenizer: {body}"
+        );
+        let tokens = body["tokens"].as_array().expect("tokens array").clone();
+        assert!(!tokens.is_empty(), "WordPiece produced nothing: {body}");
+
+        let (status, body) = post_json_uri(
+            &app,
+            ferrox_api::routes::V1_DETOKENIZE,
+            serde_json::json!({ "tokens": tokens }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let round_tripped = body["content"].as_str().expect("content").to_string();
+        assert!(
+            round_tripped.contains("hello") && round_tripped.contains("world"),
+            "the ids did not decode back through the encoder's own vocabulary: {round_tripped}"
+        );
+
+        // And the refusal that must NOT have been weakened: a decode is
+        // still a decode, and this checkpoint still cannot do one.
+        let (status, _) = post_json_uri(
+            &app,
+            "/v1/completions",
+            serde_json::json!({ "model": "m", "prompt": "hi", "max_tokens": 1 }),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_IMPLEMENTED,
+            "tokenizing an encoder must not have opened a path to generating with one"
+        );
     }
 
     /// The /metrics endpoint must expose the bounded expert cache's

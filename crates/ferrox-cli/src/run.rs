@@ -12,7 +12,7 @@ use ferrox_gguf::ShardedGguf;
 use ferrox_models::{
     ensure_generic_decoder, load_gemma4_engine_from_path, load_glm52_engine_from_path,
     load_mla_engine_from_path, select_engine_kind, Decoder, Engine, GgufBpeTokenizer,
-    GgufSpmTokenizer, GgufUnigramTokenizer, ModelConfig, Sampler, SamplingParams,
+    GgufSpmTokenizer, GgufUnigramTokenizer, ModelConfig, PenaltyWindow, Sampler, SamplingParams,
     SelectedEngineKind, ServedEngine,
 };
 
@@ -332,14 +332,20 @@ impl TokenStep {
     /// `Ok(None)` means the grammar is SATISFIED and has no legal
     /// continuation -- a finished answer, not a failure. An unsatisfied
     /// dead end is the `Err`.
+    ///
+    /// `history` is a [`PenaltyWindow`], not the generated tokens: the
+    /// penalties look back over the PROMPT as well, which is what
+    /// llama.cpp does (see `ferrox_models::penalty_window`). Passing a
+    /// slice here is what let these four loops disagree with
+    /// `speculative` about the same flags.
     pub fn next(
         &mut self,
         logits: &[f32],
         sampling: &ferrox_models::sampling::SamplingParams,
-        generated: &[usize],
+        history: PenaltyWindow<'_>,
     ) -> anyhow::Result<Option<usize>> {
         let Some(grammar) = self.grammar.as_mut() else {
-            return Ok(Some(self.sampler.sample(logits, sampling, generated)));
+            return Ok(Some(self.sampler.sample(logits, sampling, history)));
         };
         let mut refusal = None;
         let mut outcome = ferrox_models::grammar_sampler::MaskOutcome::Allowed;
@@ -350,7 +356,7 @@ impl TokenStep {
                 Err(e) => refusal = Some(e),
             };
             self.sampler
-                .sample_with_mask(logits, sampling, generated, Some(&mut mask))
+                .sample_with_mask(logits, sampling, history, Some(&mut mask))
         };
         if let Some(e) = refusal {
             anyhow::bail!("grammar refused every continuation: {e}");
@@ -1305,7 +1311,8 @@ pub fn run_infer(args: InferArgs) -> anyhow::Result<()> {
     let mut stdout = io::stdout().lock();
     let decode_t = Instant::now();
     for _ in 0..max_new {
-        let Some(next) = step.next(&logits, &sampling, &generated)? else {
+        let Some(next) = step.next(&logits, &sampling, PenaltyWindow::new(&tokens, &generated))?
+        else {
             // The grammar is satisfied and permits nothing further: a
             // finished answer, not a failure.
             break;
@@ -1435,7 +1442,8 @@ fn run_mla_infer(args: InferArgs, path: &Path, file: &ShardedGguf) -> anyhow::Re
     let mut stdout = io::stdout().lock();
     let decode_t = Instant::now();
     for _ in 0..max_new {
-        let Some(next) = step.next(&logits, &sampling, &generated)? else {
+        let Some(next) = step.next(&logits, &sampling, PenaltyWindow::new(&tokens, &generated))?
+        else {
             // The grammar is satisfied and permits nothing further: a
             // finished answer, not a failure.
             break;
@@ -1565,7 +1573,8 @@ fn run_gemma4_infer(args: InferArgs, path: &Path, file: &ShardedGguf) -> anyhow:
     let mut stdout = io::stdout().lock();
     let decode_t = Instant::now();
     for _ in 0..max_new {
-        let Some(next) = step.next(&logits, &sampling, &generated)? else {
+        let Some(next) = step.next(&logits, &sampling, PenaltyWindow::new(&tokens, &generated))?
+        else {
             // The grammar is satisfied and permits nothing further: a
             // finished answer, not a failure.
             break;
@@ -1694,7 +1703,8 @@ fn run_glm52_infer(args: InferArgs, path: &Path, file: &ShardedGguf) -> anyhow::
     let mut stdout = io::stdout().lock();
     let decode_t = Instant::now();
     for _ in 0..max_new {
-        let Some(next) = step.next(&logits, &sampling, &generated)? else {
+        let Some(next) = step.next(&logits, &sampling, PenaltyWindow::new(&tokens, &generated))?
+        else {
             // The grammar is satisfied and permits nothing further: a
             // finished answer, not a failure.
             break;
@@ -1841,12 +1851,6 @@ fn run_infer_speculative(
             start_pos: 0,
             sampling: sampling.clone(),
             seed,
-            // Match the ordinary decode loop, which penalises over the
-            // generated tokens only. A draft model must not change the
-            // output, and at the default --repeat-penalty 1.1 a
-            // different penalty window changes it on the first repeated
-            // token: verified by running the same prompt both ways.
-            penalty_history_start: tokens.len(),
         },
     );
     if let Some(e) = write_err {

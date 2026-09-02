@@ -51,6 +51,7 @@
 //! temperature 0.
 
 use crate::decoder::Decoder;
+use crate::penalty_window::PenaltyWindow;
 use crate::sampling::{sampling_distribution, Sampler, SamplingParams};
 use ferrox_core::cache::KvCache;
 
@@ -346,23 +347,6 @@ pub struct SpeculativeOptions {
     /// exactly these parameters (see [`accept_or_resample`]).
     pub sampling: SamplingParams,
     pub seed: u64,
-    /// Index into the history at which the repetition / presence /
-    /// frequency penalty window starts.
-    ///
-    /// `0` penalises over the prompt as well, which is what
-    /// llama-server does (it seeds the sampler with the prompt tokens).
-    /// `prompt_tokens.len()` penalises over the generated tokens only,
-    /// which is what `ferrox run`'s ordinary decode loop does.
-    ///
-    /// This is a knob because the two ferrox paths currently disagree,
-    /// and a caller must be able to make speculation match whichever
-    /// path it is standing in for. Speculation that changes the output
-    /// at default settings is not speculation, it is a different
-    /// decoder: the whole promise is that the text is what the target
-    /// would have written alone. The underlying divergence from
-    /// llama.cpp is tracked separately and is not this option's job to
-    /// decide.
-    pub penalty_history_start: usize,
 }
 
 /// Result of a speculative decode run, with the counters that make its
@@ -471,16 +455,6 @@ impl SpeculativeDecodeResult {
             self.accepted_tokens += 1;
         }
     }
-}
-
-/// The slice of history the penalties see, per
-/// [`SpeculativeOptions::penalty_history_start`].
-///
-/// Clamped rather than indexed directly: a caller that passes a start
-/// past the current history (a warm cache resumed oddly, say) should
-/// get an empty window, not a panic mid-generation.
-fn penalty_window<'a>(history: &'a [usize], options: &SpeculativeOptions) -> &'a [usize] {
-    &history[options.penalty_history_start.min(history.len())..]
 }
 
 /// Greedy speculative decode over a **fresh** KV cache, with
@@ -602,8 +576,16 @@ pub fn speculative_decode_observed<D: Drafter + ?Sized>(
     // fed as the anchor of the next batch, which is what lets one
     // forward call both commit it and verify a block after it.
     let mut pending = {
-        let probs =
-            sampling_distribution(last, &options.sampling, penalty_window(&history, options));
+        // Split ONE structure rather than pairing `history` with the
+        // separate `generated` vector: the two would then have to agree
+        // about every push, which is exactly the shape this fix exists
+        // to remove.
+        let (seen_prompt, seen_generated) = history.split_at(prompt_tokens.len());
+        let probs = sampling_distribution(
+            last,
+            &options.sampling,
+            PenaltyWindow::new(seen_prompt, seen_generated),
+        );
         rng.sample_from(&probs)
     };
     let mut pos = options.start_pos + prompt_tokens.len();
@@ -653,10 +635,11 @@ pub fn speculative_decode_observed<D: Drafter + ?Sized>(
         let mut accepted = 0usize;
         let mut replacement: Option<usize> = None;
         for (i, (&token, dist)) in draft.tokens().iter().zip(draft.dists()).enumerate() {
+            let (seen_prompt, seen_generated) = history.split_at(prompt_tokens.len());
             let target = sampling_distribution(
                 &batch_logits[i],
                 &options.sampling,
-                penalty_window(&history, options),
+                PenaltyWindow::new(seen_prompt, seen_generated),
             );
             match accept_or_resample(&target, dist, token, &mut rng) {
                 None => {
@@ -701,10 +684,11 @@ pub fn speculative_decode_observed<D: Drafter + ?Sized>(
             // batch predicts a genuinely new position -- the free bonus
             // token that makes a fully-accepted block worth `k + 1`.
             None => {
+                let (seen_prompt, seen_generated) = history.split_at(prompt_tokens.len());
                 let probs = sampling_distribution(
                     &batch_logits[accepted],
                     &options.sampling,
-                    penalty_window(&history, options),
+                    PenaltyWindow::new(seen_prompt, seen_generated),
                 );
                 rng.sample_from(&probs)
             }
@@ -995,7 +979,10 @@ mod tests {
             params: &SamplingParams,
             marginals: &mut [Vec<f64>],
         ) {
-            let probs = sampling_distribution(logits, params, history);
+            // `history` is already prompt-then-generated, and the
+            // window only ever reads the tail of the two halves
+            // together, so the whole sequence goes in the first one.
+            let probs = sampling_distribution(logits, params, PenaltyWindow::new(history, &[]));
             for (token, &p) in probs.iter().enumerate() {
                 if p <= 0.0 {
                     continue;
@@ -1040,6 +1027,100 @@ mod tests {
             &mut marginals,
         );
         marginals
+    }
+
+    /// Speculation and plain token-at-a-time decoding must agree about
+    /// WHICH tokens the penalties look back over, including the prompt.
+    ///
+    /// This is issue #55's other half. `SpeculativeOptions` used to
+    /// carry a `penalty_history_start` knob whose only job was to let a
+    /// caller line the two paths up by hand, which meant nothing failed
+    /// when they drifted -- and `--model-draft` shipped setting it to
+    /// `prompt.len()` because the plain loop penalised the generated
+    /// tokens alone. Both now go through `PenaltyWindow`, and this test
+    /// is what notices if one of them stops.
+    ///
+    /// Greedy on purpose: the assertion is token-for-token equality, so
+    /// a one-token disagreement in the window is a hard failure rather
+    /// than a shift in a sampled distribution. The prompt repeats
+    /// tokens 1 and 2, so the penalty has something to bite on from the
+    /// very first generated position.
+    #[test]
+    fn speculation_and_plain_decoding_penalise_the_same_window() {
+        let cfg = tiny_test_config();
+        let vocab = 6;
+        let prompt = vec![0usize, 1, 2, 3, 1];
+        let max_new = 6;
+        let params = SamplingParams {
+            temperature: 0.0,
+            repetition_penalty: 3.0,
+            penalty_last_n: 8,
+            ..SamplingParams::default()
+        };
+
+        let decoder = Decoder::new_random_small(cfg, 2, vocab);
+
+        // Plain token-at-a-time decoding, penalising over the same
+        // window `Sampler::sample` would use on any decode loop.
+        let mut kv = caches(&decoder);
+        let mut pos = 0usize;
+        let mut logits = Vec::new();
+        for &tok in &prompt {
+            logits = decoder.forward_token(tok, pos, &mut kv);
+            pos += 1;
+        }
+        let mut sampler = Sampler::new(7);
+        let mut plain: Vec<usize> = Vec::new();
+        for _ in 0..max_new {
+            let next = sampler.sample(&logits, &params, PenaltyWindow::new(&prompt, &plain));
+            plain.push(next);
+            logits = decoder.forward_token(next, pos, &mut kv);
+            pos += 1;
+        }
+
+        let mut speculator = PromptLookupSpeculator::new(2, 3);
+        let mut spec_kv = caches(&decoder);
+        let out = speculative_decode_with(
+            &decoder,
+            &prompt,
+            &mut spec_kv,
+            &mut speculator,
+            &SpeculativeOptions {
+                max_new_tokens: max_new,
+                sampling: params.clone(),
+                seed: 7,
+                ..SpeculativeOptions::default()
+            },
+        );
+        assert_eq!(
+            out.generated_tokens, plain,
+            "speculation changed the text at --repeat-penalty {}",
+            params.repetition_penalty
+        );
+
+        // And the penalty is doing something here, or the equality
+        // above is satisfied by a window nobody reads.
+        let mut off = params.clone();
+        off.repetition_penalty = 1.0;
+        let mut kv = caches(&decoder);
+        let mut pos = 0usize;
+        let mut logits = Vec::new();
+        for &tok in &prompt {
+            logits = decoder.forward_token(tok, pos, &mut kv);
+            pos += 1;
+        }
+        let mut sampler = Sampler::new(7);
+        let mut unpenalised: Vec<usize> = Vec::new();
+        for _ in 0..max_new {
+            let next = sampler.sample(&logits, &off, PenaltyWindow::new(&prompt, &unpenalised));
+            unpenalised.push(next);
+            logits = decoder.forward_token(next, pos, &mut kv);
+            pos += 1;
+        }
+        assert_ne!(
+            unpenalised, plain,
+            "the penalty must change this generation, or the agreement above proves nothing"
+        );
     }
 
     #[test]
@@ -1483,7 +1564,6 @@ mod tests {
                 start_pos: 0,
                 sampling: SamplingParams::default(),
                 seed: 0,
-                penalty_history_start: 0,
             },
         );
         assert_eq!(
@@ -1510,7 +1590,6 @@ mod tests {
                 start_pos: 0,
                 sampling: SamplingParams::default(),
                 seed: 0,
-                penalty_history_start: 0,
             },
         );
         assert_eq!(

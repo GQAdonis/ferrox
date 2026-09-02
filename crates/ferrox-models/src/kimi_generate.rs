@@ -13,6 +13,7 @@ use crate::kimi_decoder::{
     kimi_forward_token, KimiDecodeState, KimiDecoderConfig, KimiDecoderWeights,
 };
 use crate::kimi_tokenizer::KimiTokenizer;
+use crate::penalty_window::PenaltyWindow;
 use crate::sampling::{Sampler, SamplingParams};
 
 /// Encodes `prompt`, runs it through the decoder to prime `KimiDecodeState`,
@@ -39,22 +40,30 @@ pub fn kimi_generate(
     let prompt_ids = tokenizer.encode(prompt);
     let mut state = KimiDecodeState::new(weights, kda_cfg);
     let mut sampler = Sampler::new(seed);
-    let mut history: Vec<usize> = Vec::with_capacity(prompt_ids.len() + max_new_tokens);
+    // The two halves of the penalty window, kept apart because that is
+    // what `PenaltyWindow` is built from. The prompt half is what
+    // llama.cpp seeds its sampler with before the first draw.
+    let mut prompt_history: Vec<usize> = Vec::with_capacity(prompt_ids.len());
+    let mut generated_history: Vec<usize> = Vec::with_capacity(max_new_tokens);
 
     let mut logits = vec![0.0f32; weights.output_head.rows()];
     for &tok in &prompt_ids {
         logits = kimi_forward_token(weights, cfg, mla_cfg, kda_cfg, tok as usize, &mut state);
-        history.push(tok as usize);
+        prompt_history.push(tok as usize);
     }
 
     let mut generated_ids = Vec::with_capacity(max_new_tokens);
     for _ in 0..max_new_tokens {
-        let next = sampler.sample(&logits, sampling, &history) as u32;
+        let next = sampler.sample(
+            &logits,
+            sampling,
+            PenaltyWindow::new(&prompt_history, &generated_history),
+        ) as u32;
         if Some(next) == eos_id {
             break;
         }
         generated_ids.push(next);
-        history.push(next as usize);
+        generated_history.push(next as usize);
         logits = kimi_forward_token(weights, cfg, mla_cfg, kda_cfg, next as usize, &mut state);
     }
 

@@ -26,6 +26,7 @@
 //! shorter call for it to reach for.
 
 use ferrox_models::grammar_sampler::{ConstraintError, GrammarSampler, MaskOutcome};
+use ferrox_models::penalty_window::PenaltyWindow;
 use ferrox_models::sampling::Sampler;
 use ferrox_models::tokenizer::StopTokens;
 
@@ -98,11 +99,28 @@ pub(crate) fn sample_next(
     stop_tokens: &StopTokens,
     decode_token: &dyn Fn(usize) -> String,
 ) -> Result<Step, DecodeError> {
+    // The prompt half is EMPTY here, and that is a known divergence
+    // from llama.cpp, not a decision this function is making.
+    //
+    // llama.cpp seeds its penalties sampler with every prompt token
+    // before the first draw (`tools/server/server-context.cpp:386-390`),
+    // so `penalty_last_n` slides over `prompt ++ generated`. Both of
+    // this server's decode loops -- `generate::sample_until_stop` and
+    // `serving::batch::worker` -- hand this function the GENERATED ids
+    // alone, and neither has the prompt ids in scope to hand over:
+    // `sample_until_stop` takes `logits` and `pos`, never the ids.
+    // Closing it means threading the prompt through that signature,
+    // which is a `generate.rs` change and is tracked as its own issue.
+    //
+    // Spelled out as `&[]` at the ONE place the server builds a window,
+    // rather than left implicit in a slice argument, so the gap is a
+    // line someone deletes rather than a behaviour someone rediscovers.
+    let window = PenaltyWindow::new(&[], history);
     if !params.needs_vocab_logits() {
         return Ok(Step::Token(state.sampler.sample(
             logits,
             &params.sampling,
-            history,
+            window,
         )));
     }
     // A backend that folded lm_head+argmax onto the device returns one
@@ -157,7 +175,7 @@ pub(crate) fn sample_next(
                 }
             }
         };
-        sampler.sample_with_mask(logits, &params.sampling, history, Some(&mut mask))
+        sampler.sample_with_mask(logits, &params.sampling, window, Some(&mut mask))
     };
     if let Some(e) = refusal {
         return Err(DecodeError::GrammarConstraint {

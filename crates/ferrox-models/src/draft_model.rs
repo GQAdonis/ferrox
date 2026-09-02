@@ -50,6 +50,7 @@
 
 use crate::config::ModelConfig;
 use crate::decoder::Decoder;
+use crate::penalty_window::PenaltyWindow;
 use crate::sampling::{sampling_distribution, Sampler, SamplingParams};
 use crate::speculative::{DraftBlock, DraftDist, Drafter};
 use ferrox_core::cache::KvCache;
@@ -232,12 +233,19 @@ impl Drafter for DraftModelSpeculator {
 
         let mut tokens = Vec::with_capacity(budget);
         let mut dists = Vec::with_capacity(budget);
-        // The drafter's own view of the sequence, so its penalties see
-        // the tokens it has already proposed in this block.
-        let mut local: Vec<usize> = history.to_vec();
 
         for _ in 0..budget {
-            let probs = sampling_distribution(&logits, &self.sampling, &local);
+            // `history` is everything the target has committed --
+            // prompt included -- and `tokens` is what this block has
+            // proposed on top of it, so the drafter's penalties see the
+            // same sequence the target's would. The block used to clone
+            // `history` per call to concatenate the two; the window
+            // borrows both halves instead.
+            let probs = sampling_distribution(
+                &logits,
+                &self.sampling,
+                PenaltyWindow::new(history, &tokens),
+            );
             let token = self.rng.sample_from(&probs);
 
             // `q` MUST be the distribution this token was actually
@@ -254,7 +262,6 @@ impl Drafter for DraftModelSpeculator {
 
             tokens.push(token);
             dists.push(dist);
-            local.push(token);
 
             let pos = self.synced;
             logits = self.decoder.forward_token(token, pos, &mut self.kv_caches);

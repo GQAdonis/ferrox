@@ -92,7 +92,15 @@ fn sequential_ids(decoder: &Decoder, prompt: &[usize], params: &GenerationParams
     let mut sampler = Sampler::new(params.seed);
     let mut generated = Vec::new();
     for _ in 0..params.max_tokens {
-        let next = sampler.sample(&logits, &params.sampling, &generated);
+        // The empty prompt half mirrors `sample_step::sample_next`,
+        // which is what the batcher goes through: this reference decode
+        // has to make the SAME penalty-window choice the server makes,
+        // or it stops being a reference. See the note there.
+        let next = sampler.sample(
+            &logits,
+            &params.sampling,
+            ferrox_models::PenaltyWindow::new(&[], &generated),
+        );
         generated.push(next);
         logits = decoder.forward_token(next, pos, &mut caches);
         pos += 1;

@@ -54,6 +54,7 @@ pub mod mla;
 pub mod mla_gguf_loader;
 pub mod mmproj;
 pub mod output_projection;
+pub mod penalty_window;
 pub mod pooling;
 pub mod prefix_cache;
 pub mod rank_head;
@@ -97,6 +98,7 @@ pub use kv_budget::{
 };
 pub use loader::LoadError;
 pub use output_projection::grouped_output_projection;
+pub use penalty_window::PenaltyWindow;
 pub use pooling::{l2_normalize, pool, PoolingError, PoolingType};
 pub use prefix_cache::{PrefixCache, PrefixCacheStats, PrefixMatch};
 pub use rank_head::{load_rank_head, RankHead};

@@ -33,7 +33,6 @@
 //!    mask; sysfs being unreadable degrades to the
 //!    `available_parallelism` answer rather than failing.
 
-use rayon::prelude::*;
 use std::collections::HashSet;
 use std::path::Path;
 
@@ -59,6 +58,33 @@ mod qos {
             QOS_CLASS_UTILITY => "utility",
             QOS_CLASS_BACKGROUND => "background",
             _ => "unspecified",
+        }
+    }
+}
+
+/// Put the calling thread in the QoS class a decode worker needs.
+///
+/// The whole of point (2) in this module's header applies to *any* pool
+/// this crate builds, not just rayon's, so both the rayon `start_handler`
+/// in [`init_cpu_pool`] and [`crate::cpu_pool::CpuPool`]'s workers call
+/// this one function rather than each spelling the class out. Two pools
+/// that disagreed about their QoS would put one of them on E-cores and
+/// nothing would say so.
+///
+/// A no-op off macOS, where QoS does not exist.
+pub fn set_user_interactive_qos() {
+    #[cfg(target_os = "macos")]
+    {
+        let before = unsafe { qos::qos_class_self() };
+        // SAFETY: sets only the calling thread's QoS class.
+        let rc = unsafe { qos::pthread_set_qos_class_self_np(qos::QOS_CLASS_USER_INTERACTIVE, 0) };
+        if std::env::var_os("FERROX_QOS_LOG").is_some() {
+            eprintln!(
+                "ferrox: worker {:?} qos {} -> {} (rc={rc})",
+                std::thread::current().id(),
+                qos::name(before),
+                qos::name(unsafe { qos::qos_class_self() }),
+            );
         }
     }
 }
@@ -517,9 +543,7 @@ where
     // matvec pool of P-core width was measured to regress CPU pp512 on
     // Host B (~40 -> ~14 tok/s), so there is only one pool.
     let rows = &mut output[..n];
-    rows.par_iter_mut()
-        .enumerate()
-        .for_each(|(row, out)| row_fn(row, out));
+    crate::par::items_mut(rows, 1, |row, out| row_fn(row, out));
 }
 
 /// Chunk-parallel sibling of [`for_each_row`]; chunks are never split.
@@ -549,12 +573,7 @@ pub fn for_each_chunk_init<S, I, F>(
         return;
     }
     let chunks = &mut output[..n_chunks * chunk_len];
-    let init = &init;
-    let f = &f;
-    chunks
-        .par_chunks_mut(chunk_len)
-        .enumerate()
-        .for_each_init(init, |state, (i, c)| f(state, i, c));
+    crate::par::chunks_mut_init(chunks, chunk_len, 1, init, |state, i, c| f(state, i, c));
 }
 
 /// Builds the global rayon pool with an explicit width and an explicit
@@ -566,30 +585,9 @@ pub fn for_each_chunk_init<S, I, F>(
 /// global pool already existed.
 pub fn init_cpu_pool() -> Option<usize> {
     let threads = resolve_cpu_threads();
-    let log = std::env::var_os("FERROX_QOS_LOG").is_some();
     let built = rayon::ThreadPoolBuilder::new()
         .num_threads(threads)
-        .start_handler(move |idx| {
-            #[cfg(target_os = "macos")]
-            {
-                let before = unsafe { qos::qos_class_self() };
-                // SAFETY: sets only the calling thread's QoS class.
-                let rc = unsafe {
-                    qos::pthread_set_qos_class_self_np(qos::QOS_CLASS_USER_INTERACTIVE, 0)
-                };
-                if log {
-                    eprintln!(
-                        "ferrox: rayon worker {idx} qos {} -> {} (rc={rc})",
-                        qos::name(before),
-                        qos::name(unsafe { qos::qos_class_self() }),
-                    );
-                }
-            }
-            #[cfg(not(target_os = "macos"))]
-            {
-                let _ = (idx, log);
-            }
-        })
+        .start_handler(move |_idx| set_user_interactive_qos())
         .build_global()
         .is_ok();
     if built {

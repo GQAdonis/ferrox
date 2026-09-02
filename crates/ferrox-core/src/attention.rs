@@ -1040,7 +1040,6 @@ pub fn causal_gqa_attention_prefill_shared_kv_windowed(
     attn_softcap: Option<f32>,
     window: Option<usize>,
 ) -> Vec<f32> {
-    use rayon::prelude::*;
     let q_stride = n_heads * head_dim;
     let kv_stride = n_kv_heads * head_dim;
     assert_eq!(q.len(), n_q * q_stride);
@@ -1086,102 +1085,99 @@ pub fn causal_gqa_attention_prefill_shared_kv_windowed(
     let out_w = OutPtr(out.as_mut_ptr());
     let softcap = attn_softcap.filter(|&c| c > 0.0);
 
-    (0..n_blocks * n_heads)
-        .into_par_iter()
-        .with_min_len(1)
-        .for_each_init(Scratch::default, |scratch, task| {
-            let Scratch {
-                q_tile,
-                scores,
-                acc,
-            } = scratch;
-            let blk = task / n_heads;
-            let h = task % n_heads;
-            let kv_h = h / group_size.max(1);
-            let b_start = blk * Q_BLOCK;
-            let b_end = (b_start + Q_BLOCK).min(n_q);
-            let n_b = b_end - b_start;
+    crate::par::indices_init(n_blocks * n_heads, 1, Scratch::default, |scratch, task| {
+        let Scratch {
+            q_tile,
+            scores,
+            acc,
+        } = scratch;
+        let blk = task / n_heads;
+        let h = task % n_heads;
+        let kv_h = h / group_size.max(1);
+        let b_start = blk * Q_BLOCK;
+        let b_end = (b_start + Q_BLOCK).min(n_q);
+        let n_b = b_end - b_start;
 
-            // The block's visible KV span. `t_hi` is the widest causal
-            // length in the block; `t_lo` is the earliest position its
-            // first query can still see under the window.
-            let t_hi = kv_prefix + b_end;
-            let t_lo = match window {
-                Some(w) => (kv_prefix + b_start + 1).saturating_sub(w),
+        // The block's visible KV span. `t_hi` is the widest causal
+        // length in the block; `t_lo` is the earliest position its
+        // first query can still see under the window.
+        let t_hi = kv_prefix + b_end;
+        let t_lo = match window {
+            Some(w) => (kv_prefix + b_start + 1).saturating_sub(w),
+            None => 0,
+        };
+        let span = t_hi - t_lo;
+        let kv_off = t_lo * kv_stride + kv_h * head_dim;
+
+        // Pack the block's Q rows for this head contiguously. The
+        // GEMM then reads them with `lda = head_dim` instead of
+        // `n_heads * head_dim`, which for a 32-head model is the
+        // difference between one tile living in L1 and touching 32
+        // cache lines per step.
+        q_tile.clear();
+        for b in b_start..b_end {
+            q_tile.extend_from_slice(&q[b * q_stride + h * head_dim..][..head_dim]);
+        }
+
+        // Pass 1: `scores[n_b, span] = scale * Q_tile * Kᵀ` as a
+        // register-tiled GEMM, computed over the **full** rectangle
+        // with no mask. Pass 2 zeroes every entry outside a query's
+        // visible range before pass 3 reads it, so the masked-out
+        // corners are dead values, never wrong ones: at most
+        // `Q_BLOCK-1` extra columns per row (0.7% of a 512-wide
+        // span) bought in exchange for a dense inner loop.
+        scores.resize(n_b * span, 0.0);
+        qk_tile(
+            q_tile, n_b, head_dim, k_cache, kv_off, kv_stride, span, scale, scores,
+        );
+
+        // Pass 2: softcap, then max-subtract softmax, over exactly
+        // each query's visible range -- and an explicit zero
+        // everywhere else, which is what turns pass 3 into a dense
+        // GEMM (llama.cpp reaches the same state by adding a `-INF`
+        // mask row before `ggml_soft_max_ext`).
+        let mut norms = [0f32; Q_BLOCK];
+        for b in b_start..b_end {
+            let causal_len = kv_prefix + b + 1;
+            // Same visible range as `causal_gqa_attention_windowed_softcap`
+            // called with `seq_len = causal_len`.
+            let t_start = match window {
+                Some(w) => causal_len.saturating_sub(w),
                 None => 0,
             };
-            let span = t_hi - t_lo;
-            let kv_off = t_lo * kv_stride + kv_h * head_dim;
-
-            // Pack the block's Q rows for this head contiguously. The
-            // GEMM then reads them with `lda = head_dim` instead of
-            // `n_heads * head_dim`, which for a 32-head model is the
-            // difference between one tile living in L1 and touching 32
-            // cache lines per step.
-            q_tile.clear();
-            for b in b_start..b_end {
-                q_tile.extend_from_slice(&q[b * q_stride + h * head_dim..][..head_dim]);
-            }
-
-            // Pass 1: `scores[n_b, span] = scale * Q_tile * Kᵀ` as a
-            // register-tiled GEMM, computed over the **full** rectangle
-            // with no mask. Pass 2 zeroes every entry outside a query's
-            // visible range before pass 3 reads it, so the masked-out
-            // corners are dead values, never wrong ones: at most
-            // `Q_BLOCK-1` extra columns per row (0.7% of a 512-wide
-            // span) bought in exchange for a dense inner loop.
-            scores.resize(n_b * span, 0.0);
-            qk_tile(
-                q_tile, n_b, head_dim, k_cache, kv_off, kv_stride, span, scale, scores,
-            );
-
-            // Pass 2: softcap, then max-subtract softmax, over exactly
-            // each query's visible range -- and an explicit zero
-            // everywhere else, which is what turns pass 3 into a dense
-            // GEMM (llama.cpp reaches the same state by adding a `-INF`
-            // mask row before `ggml_soft_max_ext`).
-            let mut norms = [0f32; Q_BLOCK];
-            for b in b_start..b_end {
-                let causal_len = kv_prefix + b + 1;
-                // Same visible range as `causal_gqa_attention_windowed_softcap`
-                // called with `seq_len = causal_len`.
-                let t_start = match window {
-                    Some(w) => causal_len.saturating_sub(w),
-                    None => 0,
-                };
-                let row = &mut scores[(b - b_start) * span..][..span];
-                let lo = t_start - t_lo;
-                let hi = causal_len - t_lo;
-                row[..lo].fill(0.0);
-                row[hi..].fill(0.0);
-                let live = &mut row[lo..hi];
-                if let Some(sc) = softcap {
-                    for s in live.iter_mut() {
-                        *s = sc * (*s / sc).tanh();
-                    }
-                }
-                norms[b - b_start] = softmax_row_exp_sum(live);
-            }
-
-            // Pass 3: `acc[n_b, head_dim] += P * V`, the second GEMM.
-            // Zero probabilities contribute `fma(v, 0, acc) == acc`
-            // exactly, so dropping the mask here is bit-identical to
-            // skipping those positions.
-            acc.resize(n_b * head_dim, 0.0);
-            acc.fill(0.0);
-            pv_tile(scores, n_b, span, v_cache, kv_off, kv_stride, head_dim, acc);
-
-            for b in b_start..b_end {
-                let out_h = &mut acc[(b - b_start) * head_dim..][..head_dim];
-                let l = norms[b - b_start];
-                if l > 0.0 {
-                    scale_inplace(out_h, 1.0 / l);
-                }
-                unsafe {
-                    out_w.write(b * q_stride + h * head_dim, out_h);
+            let row = &mut scores[(b - b_start) * span..][..span];
+            let lo = t_start - t_lo;
+            let hi = causal_len - t_lo;
+            row[..lo].fill(0.0);
+            row[hi..].fill(0.0);
+            let live = &mut row[lo..hi];
+            if let Some(sc) = softcap {
+                for s in live.iter_mut() {
+                    *s = sc * (*s / sc).tanh();
                 }
             }
-        });
+            norms[b - b_start] = softmax_row_exp_sum(live);
+        }
+
+        // Pass 3: `acc[n_b, head_dim] += P * V`, the second GEMM.
+        // Zero probabilities contribute `fma(v, 0, acc) == acc`
+        // exactly, so dropping the mask here is bit-identical to
+        // skipping those positions.
+        acc.resize(n_b * head_dim, 0.0);
+        acc.fill(0.0);
+        pv_tile(scores, n_b, span, v_cache, kv_off, kv_stride, head_dim, acc);
+
+        for b in b_start..b_end {
+            let out_h = &mut acc[(b - b_start) * head_dim..][..head_dim];
+            let l = norms[b - b_start];
+            if l > 0.0 {
+                scale_inplace(out_h, 1.0 / l);
+            }
+            unsafe {
+                out_w.write(b * q_stride + h * head_dim, out_h);
+            }
+        }
+    });
 
     out
 }

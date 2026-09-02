@@ -13,10 +13,11 @@
 
 use thiserror::Error;
 
-use crate::bert_gguf_loader::{load_bert_encoder, BERT_ARCH};
+use crate::bert_gguf_loader::{load_bert_encoder, read_bert_hparams, BERT_ARCH};
 use crate::encoder::{EncodeError, TextEncoder};
 use crate::loader::LoadError;
-use crate::pooling::{l2_normalize, PoolingType};
+use crate::pooling::{l2_normalize, pool, PoolingType};
+use crate::rank_head::{load_rank_head, RankHead};
 use crate::tokenizer::{GgufWordPieceTokenizer, TokenizerLoadError};
 
 /// Encoder architectures upstream builds from `bert.cpp` and the other
@@ -90,6 +91,18 @@ pub enum EmbedError {
          WordPiece (\"bert\")"
     )]
     UnsupportedTokenizer { arch: String, model: String },
+    #[error(
+        "the embedding model {name:?} ({arch}) carries no reranker classification head: the \
+         checkpoint has no cls / cls.output tensors, so it has no relevance score to \
+         report. It can only produce embeddings"
+    )]
+    NoRankHead { name: String, arch: String },
+    #[error(
+        "the encoder for {arch:?} has no two-segment (query, document) input form, which a \
+         cross-encoder rerank needs. Concatenating the two texts would score fluently and \
+         wrongly, so this refuses instead"
+    )]
+    NoPairInput { arch: String },
 }
 
 /// A loaded embedding model: tokenizer + encoder + the checkpoint's own
@@ -97,6 +110,10 @@ pub enum EmbedError {
 pub struct EmbeddingModel {
     encoder: Box<dyn TextEncoder + Send + Sync>,
     tokenizer: GgufWordPieceTokenizer,
+    /// The reranker classification head, when the checkpoint carries
+    /// one. `None` for a plain embedding model, and that is what makes
+    /// `/v1/rerank` refuse rather than substitute a cosine similarity.
+    rank_head: Option<RankHead>,
     arch: String,
     name: String,
 }
@@ -128,10 +145,23 @@ impl EmbeddingModel {
             .map(str::to_string)
             .unwrap_or_else(|| arch.clone());
         let tokenizer = GgufWordPieceTokenizer::from_gguf(&file)?;
+
+        // ORDER IS LOAD-BEARING. `load_rank_head` MUST run before
+        // `load_bert_encoder`, which ends in
+        // `assert_every_tensor_consumed`: `cls.weight`, `cls.output.*`
+        // and `cls.norm.weight` are read by nothing else in this crate,
+        // so with the two lines swapped every reranker checkpoint dies
+        // with an `UnconsumedTensors` refusal listing tensors ferrox
+        // does in fact read. `read_bert_hparams` touches metadata only,
+        // so asking for the geometry twice costs nothing.
+        let hp = read_bert_hparams(&file)?;
+        let rank_head = load_rank_head(&file, &hp.arch, hp.n_embd, hp.layer_norm_eps)?;
         let encoder = load_bert_encoder(&file)?;
+
         Ok(Self {
             encoder: Box::new(encoder),
             tokenizer,
+            rank_head,
             arch,
             name,
         })
@@ -184,6 +214,60 @@ impl EmbeddingModel {
     /// wants to pool differently (or not at all).
     pub fn hidden_states(&self, text: &str) -> Result<Vec<f32>, EmbedError> {
         Ok(self.encoder.encode_tokens(&self.token_ids(text))?)
+    }
+
+    /// The checkpoint's reranker classification head, or `None` for a
+    /// plain embedding model. What `/v1/rerank` checks before it
+    /// promises a caller a relevance score.
+    pub fn rank_head(&self) -> Option<&RankHead> {
+        self.rank_head.as_ref()
+    }
+
+    /// The exact ids [`Self::rerank_score`] will see for one
+    /// `(query, document)` pair: `[CLS] query [SEP] document [SEP]`.
+    ///
+    /// Separate from the scoring call for the same reason
+    /// [`Self::token_ids`] is separate from [`Self::embed`] — a route
+    /// has to report `usage.prompt_tokens`, and that number is this
+    /// length.
+    pub fn rerank_token_ids(&self, query: &str, document: &str) -> Result<Vec<u32>, EmbedError> {
+        self.encoder
+            .wrap_special_pair(
+                &self.tokenizer.encode(query),
+                &self.tokenizer.encode(document),
+            )
+            .ok_or_else(|| EmbedError::NoPairInput {
+                arch: self.arch.clone(),
+            })
+    }
+
+    /// The head's relevance score for a pair sequence built by
+    /// [`Self::rerank_token_ids`].
+    ///
+    /// This is upstream's RANK path in full: encode, take the **CLS**
+    /// row, run the classification head, report output 0
+    /// (`send_rerank`'s `embd[0]`). The CLS row is taken here regardless
+    /// of what `{arch}.pooling_type` says, because the head was trained
+    /// on that position — `pooling_type = RANK` is the checkpoint
+    /// *declaring* this path, not naming a pooling rule, which is why
+    /// [`crate::pooling::pool`] still refuses RANK and must keep
+    /// refusing it.
+    ///
+    /// No L2 normalization and no sigmoid: upstream reports the raw
+    /// logit, so a score is comparable only against other scores from
+    /// the same head, and this must not quietly squash it into `0..1`.
+    pub fn rerank_score(&self, pair_ids: &[u32]) -> Result<f32, EmbedError> {
+        let head = self
+            .rank_head
+            .as_ref()
+            .ok_or_else(|| EmbedError::NoRankHead {
+                name: self.name.clone(),
+                arch: self.arch.clone(),
+            })?;
+        let hidden = self.encoder.encode_tokens(pair_ids)?;
+        let cls = pool(&hidden, self.encoder.n_embd(), PoolingType::Cls)
+            .map_err(|e| EmbedError::Encode(EncodeError::Pooling(e)))?;
+        Ok(head.score(&cls))
     }
 }
 

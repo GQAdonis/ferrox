@@ -16,14 +16,19 @@
 //!
 //! # What is implemented, and what refuses
 //!
-//! `NONE`, `MEAN`, `CLS` and `LAST` are here. `RANK` is **not**: it is
-//! not a pooling rule at all but a classification head — upstream runs
-//! `cls`/`cls_out` matrices, a `tanh`, and an optional head norm over
-//! the pooled row, and reports the result through `/v1/rerank` against
-//! `classifier.output_labels`. None of that exists in ferrox yet, so
-//! [`PoolingType::Rank`] parses (so the refusal can name it) and
-//! [`pool`] returns [`PoolingError::Unimplemented`] rather than
-//! quietly handing back a CLS row that means something else.
+//! `NONE`, `MEAN`, `CLS` and `LAST` are here. `RANK` is **not**, and
+//! never will be: it is not a pooling rule at all but a classification
+//! head — upstream runs `cls`/`cls_out` matrices, a `tanh`, and an
+//! optional head norm over the pooled row, and reports the result
+//! through `/v1/rerank` against `classifier.output_labels`. That head
+//! is [`crate::rank_head`] and that route exists, but neither is
+//! reachable from here: [`pool`] sees hidden states and a width, so the
+//! head's matrices are not a thing it *could* apply. So
+//! [`PoolingType::Rank`] parses (which is how the refusal can name it)
+//! and [`pool`] returns [`PoolingError::Unimplemented`] rather than
+//! quietly handing back a CLS row that means something else. An
+//! `/v1/embeddings` request against a reranker checkpoint refuses here,
+//! deliberately, and that is what sends the caller to `/v1/rerank`.
 
 use thiserror::Error;
 
@@ -55,9 +60,10 @@ pub enum PoolingError {
     NotAnInteger { key: String, value: String },
     #[error(
         "pooling type RANK is a reranker classification head (cls / cls_out / \
-         classifier.output_labels), which ferrox does not implement — there is no /v1/rerank \
-         route and the head tensors are unread. Refusing rather than returning a CLS row \
-         that is not what RANK means"
+         classifier.output_labels), not a pooling rule: pooling sees hidden states and a \
+         width, and cannot reach those matrices. POST /v1/rerank with a query and \
+         documents, which runs the head this checkpoint carries. Refusing rather than \
+         returning a CLS row that is not what RANK means"
     )]
     Unimplemented,
     #[error("cannot pool an empty sequence")]

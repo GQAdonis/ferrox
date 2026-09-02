@@ -182,7 +182,7 @@ fn encoder_refusal(name: &str, arch: &str, n_embd: usize, pooling: &str) -> Stri
     format!(
         "the loaded model '{name}' is an embedding model ({arch} encoder, {n_embd} dims, \
          pooling {pooling}). An encoder has no output head, so it cannot generate text at \
-         all -- there is no next token for it to predict. POST /v1/embeddings to use it, or \
+         all. There is no next token for it to predict. POST /v1/embeddings to use it, or \
          load a generative checkpoint."
     )
 }

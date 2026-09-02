@@ -55,6 +55,7 @@ pub mod mmproj;
 pub mod output_projection;
 pub mod pooling;
 pub mod prefix_cache;
+pub mod rank_head;
 pub mod recurrent_engine;
 pub mod residency_report;
 pub(crate) mod sampler_chain;
@@ -96,6 +97,7 @@ pub use loader::LoadError;
 pub use output_projection::grouped_output_projection;
 pub use pooling::{l2_normalize, pool, PoolingError, PoolingType};
 pub use prefix_cache::{PrefixCache, PrefixCacheStats, PrefixMatch};
+pub use rank_head::{load_rank_head, RankHead};
 pub use sampling::{sampling_distribution, Sampler, SamplingParams};
 pub use speculative::{
     accept_or_resample, speculative_decode, speculative_decode_with, DraftBlock, DraftDist,

@@ -51,6 +51,16 @@ pub enum GgufError {
          success"
     )]
     UnsizedTensor(String, GgmlType),
+    #[error(
+        "tensor '{0}' declares shape {1:?}, whose element count is larger than a {2}-byte \
+         file can hold: every element occupies at least one bit on the wire"
+    )]
+    ImplausibleShape(String, Vec<u64>, usize),
+    #[error(
+        "general.alignment is {0}: the GGUF spec requires a power of two, and it must be one \
+         a file can actually be aligned to"
+    )]
+    BadAlignment(u64),
 }
 
 /// A single scalar/array metadata value from the GGUF key-value header.
@@ -296,8 +306,34 @@ pub struct TensorInfo {
 }
 
 impl TensorInfo {
+    /// The declared element count, or `None` when folding the
+    /// file-supplied dims wraps or does not fit an address on this
+    /// machine.
+    ///
+    /// This is the ONLY place the shape is folded. It used to be a bare
+    /// `product()`, which made every downstream shape-vs-bytes check
+    /// agree with a lie: dims `[2^32, 2^32]` wrap to exactly 0, so the
+    /// tensor sized as 0 bytes and `tensor_bytes` returned `Ok(&[])` --
+    /// the very outcome [`GgufError::UnsizedTensor`] exists to prevent,
+    /// reached through a door it does not cover. `[2^63 + 2, 2]` wraps
+    /// to 4 and walked straight through `Tensor::new`'s own product
+    /// assert.
+    pub fn element_count(&self) -> Option<usize> {
+        let mut n: u64 = 1;
+        for &dim in &self.shape {
+            n = n.checked_mul(dim)?;
+        }
+        usize::try_from(n).ok()
+    }
+
+    /// The element count for REPORTING (a parameter-count sum, a log
+    /// line) -- never for sizing a read. [`GgufFile::parse`] refuses any
+    /// shape `element_count` cannot represent, so for a `TensorInfo` that
+    /// came out of a parsed file this is exact; the saturating arm exists
+    /// only for a hand-built one, and saturates UP, so it can still only
+    /// cause a refusal, never an over-read.
     pub fn n_elements(&self) -> usize {
-        self.shape.iter().product::<u64>() as usize
+        self.element_count().unwrap_or(usize::MAX)
     }
 
     /// Size on disk, or `None` for a dtype whose block layout this
@@ -313,8 +349,8 @@ impl TensorInfo {
         if block_bytes == 0 {
             return None;
         }
-        let n = self.n_elements();
-        Some((n / block_elems) * block_bytes)
+        let n = self.element_count()?;
+        (n / block_elems).checked_mul(block_bytes)
     }
 }
 
@@ -337,6 +373,7 @@ impl GgufFile {
     }
 
     fn parse(mmap: Mmap) -> Result<Self, GgufError> {
+        let file_len = mmap.len();
         let mut cursor = io::Cursor::new(&mmap[..]);
 
         let magic = cursor.read_u32::<LittleEndian>()?;
@@ -371,22 +408,53 @@ impl GgufFile {
             }
             let dtype_tag = cursor.read_u32::<LittleEndian>()?;
             let offset = cursor.read_u64::<LittleEndian>()?;
-            tensors.push(TensorInfo {
+            let info = TensorInfo {
                 name,
                 shape,
                 dtype: GgmlType::from_tag(dtype_tag),
                 offset,
-            });
+            };
+            // The bound is derived from the input, not chosen: every
+            // element occupies at least one bit on the wire (the densest
+            // format this build knows is Q1_0, at 1.125 bpw), so a
+            // tensor cannot declare more elements than eight times the
+            // bytes of the file that has to contain it. Refusing HERE,
+            // at the only place a `GgufFile`'s `TensorInfo`s are built,
+            // is what lets `n_elements` and `byte_len` be trusted by the
+            // consumers downstream that each had their own copy of the
+            // arithmetic.
+            let max_elements = file_len as u128 * 8;
+            if info
+                .element_count()
+                .is_none_or(|n| n as u128 > max_elements)
+            {
+                return Err(GgufError::ImplausibleShape(info.name, info.shape, file_len));
+            }
+            tensors.push(info);
         }
 
         // Tensor data begins at the next `general.alignment` boundary
         // (default 32) after the header. This matches the GGUF spec.
-        let alignment = metadata
+        // `general.alignment` comes off the wire and is used as a
+        // DIVISOR. Zero divided by zero, and `is_power_of_two()` is
+        // false for zero, so one predicate refuses both 0 and the
+        // spec-violating non-powers like 3. The panic this replaces
+        // defeated `admin.rs`'s deliberate
+        // `let Ok(file) = GgufFile::open(..) else { .. }` degradation
+        // arm, 500-ing the whole model listing over one malformed file.
+        let declared_alignment = metadata
             .get("general.alignment")
             .and_then(|v| v.as_u64())
-            .unwrap_or(32) as usize;
+            .unwrap_or(32);
+        let alignment = usize::try_from(declared_alignment)
+            .ok()
+            .filter(|a| a.is_power_of_two())
+            .ok_or(GgufError::BadAlignment(declared_alignment))?;
         let pos = cursor.position() as usize;
-        let data_start = pos.div_ceil(alignment) * alignment;
+        let data_start = pos
+            .div_ceil(alignment)
+            .checked_mul(alignment)
+            .ok_or(GgufError::BadAlignment(declared_alignment))?;
 
         Ok(GgufFile {
             version,
@@ -397,24 +465,40 @@ impl GgufFile {
         })
     }
 
-    pub fn tensor_bytes(&self, name: &str) -> Result<&[u8], GgufError> {
+    /// The single computation of a tensor's byte range in this file.
+    ///
+    /// It used to be three lines written out verbatim TWICE, once in
+    /// each accessor below, with wrapping `usize` arithmetic: a tensor
+    /// `offset` near `u64::MAX` wrapped `start` past the end of the
+    /// mmap, then wrapped `start + len` back down to something small, so
+    /// the `TruncatedTensor` refusal did not fire and the mmap was
+    /// sliced with `start > end`. Two copies is two places to forget,
+    /// and the twin forgot differently: it did not slice, so it returned
+    /// a bogus `Range` and the panic landed in whichever consumer sliced
+    /// it, far from the cause.
+    fn tensor_range(&self, name: &str) -> Result<std::ops::Range<usize>, GgufError> {
         let info = self
             .tensors
             .iter()
             .find(|t| t.name == name)
             .ok_or_else(|| GgufError::TensorNotFound(name.to_string()))?;
-        let start = self.data_start + info.offset as usize;
         let len = info
             .byte_len()
             .ok_or_else(|| GgufError::UnsizedTensor(name.to_string(), info.dtype))?;
-        if start + len > self.mmap.len() {
-            return Err(GgufError::TruncatedTensor(
-                name.to_string(),
-                len,
-                self.mmap.len().saturating_sub(start),
-            ));
-        }
-        Ok(&self.mmap[start..start + len])
+        let start = usize::try_from(info.offset)
+            .ok()
+            .and_then(|off| self.data_start.checked_add(off));
+        // `available` is for the message, not for the decision, so it
+        // may saturate. The decision below is `checked_add` only.
+        let available = start.map_or(0, |s| self.mmap.len().saturating_sub(s));
+        start
+            .and_then(|s| s.checked_add(len).map(|end| s..end))
+            .filter(|r| r.end <= self.mmap.len())
+            .ok_or_else(|| GgufError::TruncatedTensor(name.to_string(), len, available))
+    }
+
+    pub fn tensor_bytes(&self, name: &str) -> Result<&[u8], GgufError> {
+        Ok(&self.mmap[self.tensor_range(name)?])
     }
 
     /// Zero-copy accessor: returns a cheaply-cloneable handle to the
@@ -428,23 +512,7 @@ impl GgufFile {
         &self,
         name: &str,
     ) -> Result<(Arc<Mmap>, std::ops::Range<usize>), GgufError> {
-        let info = self
-            .tensors
-            .iter()
-            .find(|t| t.name == name)
-            .ok_or_else(|| GgufError::TensorNotFound(name.to_string()))?;
-        let start = self.data_start + info.offset as usize;
-        let len = info
-            .byte_len()
-            .ok_or_else(|| GgufError::UnsizedTensor(name.to_string(), info.dtype))?;
-        if start + len > self.mmap.len() {
-            return Err(GgufError::TruncatedTensor(
-                name.to_string(),
-                len,
-                self.mmap.len().saturating_sub(start),
-            ));
-        }
-        Ok((Arc::clone(&self.mmap), start..start + len))
+        Ok((Arc::clone(&self.mmap), self.tensor_range(name)?))
     }
 
     pub fn find_tensor(&self, name: &str) -> Option<&TensorInfo> {
@@ -595,43 +663,98 @@ mod tests {
         build_synthetic_gguf_with_dtype(0)
     }
 
+    /// The synthetic file, parameterised by every field a hostile
+    /// header varies rather than copied per case. One byte layout, so a
+    /// malformed-header case cannot drift from the well-formed file the
+    /// rest of these tests parse -- which is the same rule the parser
+    /// itself now follows for the tensor range.
+    struct Synthetic {
+        dtype_tag: u32,
+        alignment: u32,
+        shape: Vec<u64>,
+        offset: u64,
+    }
+
+    impl Default for Synthetic {
+        fn default() -> Self {
+            Self {
+                dtype_tag: 0, // F32
+                alignment: 32,
+                shape: vec![4, 8],
+                offset: 0,
+            }
+        }
+    }
+
+    impl Synthetic {
+        fn bytes(&self) -> Vec<u8> {
+            let mut buf = Vec::new();
+            buf.write_u32::<LittleEndian>(GGUF_MAGIC).unwrap();
+            buf.write_u32::<LittleEndian>(3).unwrap(); // version
+            buf.write_u64::<LittleEndian>(1).unwrap(); // tensor_count
+            buf.write_u64::<LittleEndian>(2).unwrap(); // kv_count
+
+            // kv 1: general.alignment (u32)
+            write_string(&mut buf, "general.alignment");
+            buf.write_u32::<LittleEndian>(4).unwrap(); // type = u32
+            buf.write_u32::<LittleEndian>(self.alignment).unwrap();
+
+            // kv 2: general.name = "synthetic-test"
+            write_string(&mut buf, "general.name");
+            buf.write_u32::<LittleEndian>(8).unwrap(); // type = string
+            write_string(&mut buf, "synthetic-test");
+
+            // tensor 0: "tok_embd.weight"
+            write_string(&mut buf, "tok_embd.weight");
+            buf.write_u32::<LittleEndian>(self.shape.len() as u32)
+                .unwrap();
+            for &dim in &self.shape {
+                buf.write_u64::<LittleEndian>(dim).unwrap();
+            }
+            buf.write_u32::<LittleEndian>(self.dtype_tag).unwrap();
+            buf.write_u64::<LittleEndian>(self.offset).unwrap();
+
+            // Pad to the declared alignment where that is a boundary a
+            // file can actually have; a hostile alignment gets the
+            // default padding, because what those cases assert is the
+            // refusal, not where the data landed.
+            let pad = if self.alignment.is_power_of_two() && self.alignment <= 4096 {
+                self.alignment as usize
+            } else {
+                32
+            };
+            while buf.len() % pad != 0 {
+                buf.push(0);
+            }
+            // tensor data: 32 f32 values
+            for i in 0..32u32 {
+                buf.write_f32::<LittleEndian>(i as f32 * 0.5).unwrap();
+            }
+            buf
+        }
+    }
+
     /// The synthetic file, parameterised by the tensor's dtype tag
     /// rather than copied per dtype: the byte layout is identical and a
     /// second copy would drift from this one.
     fn build_synthetic_gguf_with_dtype(dtype_tag: u32) -> Vec<u8> {
-        let mut buf = Vec::new();
-        buf.write_u32::<LittleEndian>(GGUF_MAGIC).unwrap();
-        buf.write_u32::<LittleEndian>(3).unwrap(); // version
-        buf.write_u64::<LittleEndian>(1).unwrap(); // tensor_count
-        buf.write_u64::<LittleEndian>(2).unwrap(); // kv_count
-
-        // kv 1: general.alignment = 32 (u32)
-        write_string(&mut buf, "general.alignment");
-        buf.write_u32::<LittleEndian>(4).unwrap(); // type = u32
-        buf.write_u32::<LittleEndian>(32).unwrap();
-
-        // kv 2: general.name = "synthetic-test"
-        write_string(&mut buf, "general.name");
-        buf.write_u32::<LittleEndian>(8).unwrap(); // type = string
-        write_string(&mut buf, "synthetic-test");
-
-        // tensor 0: "tok_embd.weight", shape [4, 8], F32
-        write_string(&mut buf, "tok_embd.weight");
-        buf.write_u32::<LittleEndian>(2).unwrap(); // n_dims
-        buf.write_u64::<LittleEndian>(4).unwrap();
-        buf.write_u64::<LittleEndian>(8).unwrap();
-        buf.write_u32::<LittleEndian>(dtype_tag).unwrap(); // dtype (0 = F32)
-        buf.write_u64::<LittleEndian>(0).unwrap(); // offset
-
-        // pad to 32-byte alignment
-        while buf.len() % 32 != 0 {
-            buf.push(0);
+        Synthetic {
+            dtype_tag,
+            ..Default::default()
         }
-        // tensor data: 32 f32 values
-        for i in 0..32u32 {
-            buf.write_f32::<LittleEndian>(i as f32 * 0.5).unwrap();
-        }
-        buf
+        .bytes()
+    }
+
+    /// Writes `bytes` to a uniquely named temp file, opens it, and
+    /// removes it. The returned `GgufFile` keeps its own mmap, so the
+    /// unlink is safe.
+    fn open_temp(bytes: &[u8], tag: &str) -> Result<GgufFile, GgufError> {
+        let tmp =
+            std::env::temp_dir().join(format!("ferrox_test_{tag}_{}.gguf", std::process::id()));
+        std::fs::write(&tmp, bytes).unwrap();
+        let res = GgufFile::open(&tmp);
+        std::fs::remove_file(&tmp).ok();
+        res
     }
 
     fn write_string(buf: &mut Vec<u8>, s: &str) {
@@ -826,6 +949,140 @@ mod tests {
             Ok((_, range)) => panic!("tensor_mapped_range returned Ok({range:?})"),
         }
         std::fs::remove_file(&tmp).ok();
+    }
+
+    /// A file-supplied shape must be REFUSED when its element count
+    /// cannot be what it claims, never folded with a wrapping
+    /// `product()` that makes every later shape-vs-bytes check agree
+    /// with the lie.
+    ///
+    /// What shipped: `[2^32, 2^32]` wrapped to exactly 0, so the tensor
+    /// sized as 0 bytes and `tensor_bytes` handed back `Ok(&[])` -- a
+    /// load that reads as success and yields an empty tensor, which is
+    /// the outcome `UnsizedTensor` exists to prevent, reached through a
+    /// door it does not cover. `[2^63 + 2, 2]` wrapped to 4, walked
+    /// through `Tensor::new`'s own product assert, and the first
+    /// `row(0)` then indexed `data[0..2^63 + 2]` on a 4-element `Vec`.
+    #[test]
+    fn a_shape_larger_than_the_file_could_hold_is_refused_rather_than_wrapped() {
+        // Chosen to fail rather than to be round. The first two wrap the
+        // u64 fold (to 0 and to 4); the third and fourth wrap nothing
+        // and are caught only by the bound derived from the input --
+        // one bit per element, so this ~288-byte file cannot hold more
+        // than 2304 of them.
+        for (i, shape) in [
+            vec![1u64 << 32, 1 << 32],
+            vec![(1u64 << 63) + 2, 2],
+            vec![u64::MAX / 64, 65],
+            vec![1u64 << 40],
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let bytes = Synthetic {
+                shape: shape.clone(),
+                ..Default::default()
+            }
+            .bytes();
+            match open_temp(&bytes, &format!("wrapshape{i}")) {
+                Err(GgufError::ImplausibleShape(name, got, _)) => {
+                    assert_eq!(name, "tok_embd.weight");
+                    assert_eq!(got, shape);
+                }
+                Err(other) => panic!("expected ImplausibleShape for {shape:?}, got {other}"),
+                Ok(f) => panic!(
+                    "shape {shape:?} parsed: n_elements={} byte_len={:?}",
+                    f.tensors[0].n_elements(),
+                    f.tensors[0].byte_len()
+                ),
+            }
+        }
+    }
+
+    /// A tensor `offset` near `u64::MAX` must be refused, by BOTH
+    /// accessors, rather than wrapping past the `TruncatedTensor` check
+    /// and slicing the mmap with `start > end`.
+    #[test]
+    fn a_tensor_offset_that_wraps_the_mmap_is_refused_by_both_accessors() {
+        // The offsets below are chosen against this exact file: 288
+        // bytes, `data_start` 160, a 128-byte F32 tensor. If the builder
+        // changes, they stop probing what they were chosen to probe, so
+        // the drift has to be the thing that fails.
+        let base = Synthetic::default().bytes();
+        assert_eq!(
+            base.len(),
+            288,
+            "the offsets below were chosen against a 288-byte file"
+        );
+
+        // With `start = data_start + offset` wrapping:
+        //   MAX - 232: `start` wrapped to 2^64 - 73 and `start + len`
+        //              wrapped back down to 55, under the file length,
+        //              so the refusal did not fire and the mmap was
+        //              sliced with start > end. That is the panic.
+        //   MAX -  98: `start` wrapped to 61 and `start + len` to 189,
+        //              both inside the file: no panic at all, just 128
+        //              bytes of the HEADER served as tensor data.
+        //   MAX:       `start` 159, `end` 287 -- same silent misread.
+        for (i, offset) in [u64::MAX - 232, u64::MAX - 98, u64::MAX]
+            .into_iter()
+            .enumerate()
+        {
+            let bytes = Synthetic {
+                offset,
+                ..Default::default()
+            }
+            .bytes();
+            let f =
+                open_temp(&bytes, &format!("wrapoffset{i}")).expect("the header itself is fine");
+            match f.tensor_bytes("tok_embd.weight") {
+                Err(GgufError::TruncatedTensor(name, len, _)) => {
+                    assert_eq!(name, "tok_embd.weight");
+                    assert_eq!(len, 128);
+                }
+                Err(other) => panic!("offset {offset}: expected TruncatedTensor, got {other}"),
+                Ok(b) => panic!("offset {offset}: tensor_bytes returned {} bytes", b.len()),
+            }
+            // The zero-copy accessor was a verbatim copy of the same
+            // three lines and forgot differently: it returned a bogus
+            // `Range` and let the panic land in whichever consumer
+            // sliced it. It cannot differ now -- there is one copy.
+            match f.tensor_mapped_range("tok_embd.weight") {
+                Err(GgufError::TruncatedTensor(..)) => {}
+                Err(other) => panic!("offset {offset}: expected TruncatedTensor, got {other}"),
+                Ok((_, r)) => panic!("offset {offset}: tensor_mapped_range returned {r:?}"),
+            }
+        }
+    }
+
+    /// `general.alignment` is a divisor read straight off the wire. Zero
+    /// divided by zero inside `parse`, and a panic there defeats
+    /// `admin.rs`'s deliberate `let Ok(file) = GgufFile::open(..) else`
+    /// degradation arm: one malformed file 500'd the whole model
+    /// listing instead of degrading its own row.
+    #[test]
+    fn a_zero_or_non_power_of_two_alignment_is_refused_rather_than_panicking() {
+        for (i, alignment) in [0u32, 3, 33, u32::MAX].into_iter().enumerate() {
+            let bytes = Synthetic {
+                alignment,
+                ..Default::default()
+            }
+            .bytes();
+            match open_temp(&bytes, &format!("align{i}")) {
+                Err(GgufError::BadAlignment(got)) => assert_eq!(got, u64::from(alignment)),
+                Err(other) => panic!("alignment {alignment}: expected BadAlignment, got {other}"),
+                Ok(_) => panic!("alignment {alignment} parsed"),
+            }
+        }
+        // A power of two other than the default still parses, so the
+        // refusal is not "anything unusual is refused".
+        let bytes = Synthetic {
+            alignment: 64,
+            ..Default::default()
+        }
+        .bytes();
+        let f = open_temp(&bytes, "align_ok").expect("alignment 64 is a valid alignment");
+        assert_eq!(f.tensor_bytes("tok_embd.weight").unwrap().len(), 128);
     }
 
     #[test]

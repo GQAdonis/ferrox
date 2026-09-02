@@ -112,6 +112,23 @@ pub struct DraftModelSpeculator {
 }
 
 impl DraftModelSpeculator {
+    /// True when this drafter's KV really lives in the host caches it
+    /// owns.
+    ///
+    /// A backend that keeps KV on the device leaves these at zero, and
+    /// a drafter cannot roll back rows it cannot see. Callers check
+    /// this after one warm-up rather than discovering it as a wrong
+    /// accept rate.
+    pub fn keeps_host_kv(&self) -> bool {
+        self.kv_caches.first().is_some_and(|c| c.seq_len > 0)
+    }
+
+    /// How many tokens of history this drafter's KV currently holds.
+    /// Exposed so a caller can assert the drafter kept up.
+    pub fn synced_len(&self) -> usize {
+        self.synced
+    }
+
     /// Fails when the two checkpoints cannot be compared token for
     /// token. See [`VocabMismatch`].
     pub fn new(
@@ -180,7 +197,15 @@ impl DraftModelSpeculator {
         // Everything past what the caller's history contains was
         // drafted and not accepted. It is not context, it is a guess
         // the target threw away.
-        let keep = self.synced.min(history.len() - 1);
+        // Derived from the CACHE, not only from `self.synced`. The
+        // cache is the authority on how many rows exist, and a backend
+        // that keeps its KV somewhere other than this host `KvCache`
+        // leaves it at zero however many tokens were fed. Trusting the
+        // counter there truncated to 7 rows of a cache holding 0 and
+        // panicked on a real Metal run. That is the same lesson as the
+        // batched prefill: read the cursor, do not keep a copy of it.
+        let held = self.kv_caches.first().map_or(0, |c| c.seq_len);
+        let keep = self.synced.min(history.len() - 1).min(held);
         self.truncate_to(keep);
         self.synced = keep;
 

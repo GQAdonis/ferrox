@@ -83,7 +83,7 @@ impl ContinuousBatcher {
             config.max_context,
             // Prefill runs one token at a time here, so a sliding layer
             // needs `window + 1 - 1` positions live: chunk = 1.
-            ferrox_models::KvShape::from_config(&decoder.config, ferrox_models::KvElem::F32, 1),
+            ferrox_models::KvShape::from_config(&decoder.config, ferrox_models::KvElem::F32),
         ));
         Self::spawn_with_ceiling(decoder, decode, config, ceiling, paged)
     }

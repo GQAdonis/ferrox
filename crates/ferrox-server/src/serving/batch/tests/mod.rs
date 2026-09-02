@@ -102,7 +102,7 @@ fn sequential_ids(decoder: &Decoder, prompt: &[usize], params: &GenerationParams
 
 /// The KV shape of `tiny_decoder`, for pricing a refusal in bytes.
 fn test_shape() -> ferrox_models::KvShape {
-    ferrox_models::KvShape::from_config(&test_dense_fixture(), ferrox_models::KvElem::F32, 1)
+    ferrox_models::KvShape::from_config(&test_dense_fixture(), ferrox_models::KvElem::F32)
 }
 
 /// A ledger with no budget configured, for tests that are not

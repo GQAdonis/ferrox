@@ -885,7 +885,7 @@ fn pool_immovable_refusal(
     // honest answer: such a pool serves nothing.
     let blocks_per_layer_limit = total_blocks / decoder.layers.len();
     let positions_limit = blocks_per_layer_limit * block_size;
-    let shape = KvShape::from_config(&decoder.config, KvElem::F32, 1);
+    let shape = KvShape::from_config(&decoder.config, KvElem::F32);
     Some(DecodeError::KvBudgetExceeded {
         binding: Ceiling::DeviceMemory.code(),
         estimated_bytes: shape.kv_bytes_for_tokens(max_seq_len),
@@ -3908,6 +3908,62 @@ mod tests {
         );
     }
 
+    /// A refusal's two halves must describe ONE reservation.
+    ///
+    /// `pool_immovable_refusal` reports `estimated_bytes` from
+    /// `KvShape::kv_bytes_for_tokens` beside a block count of
+    /// `max_seq_len.div_ceil(block_size) * n_layers`. The block count
+    /// has never had a window in it -- `KvCache::with_pool` reserves
+    /// `max_seq_len` positions for every layer -- while the byte figure
+    /// used to discount the sliding layers. For gpt-oss at 8192
+    /// positions the message therefore said ~390 MiB next to a ~768 MiB
+    /// reservation the same function had just rejected (#33).
+    ///
+    /// Two decoders, same shape, one with a window: the refusal must
+    /// price them identically, because the pool reserves for them
+    /// identically.
+    #[test]
+    fn the_pool_refusals_byte_figure_does_not_discount_a_window_the_pool_still_reserves() {
+        let full = small_decoder();
+        let mut alternating_cfg = test_dense_fixture();
+        alternating_cfg.sliding_window = Some(4);
+        alternating_cfg.swa_pattern = Some(2);
+        let alternating = Decoder::new_random_small(alternating_cfg, 2, 256);
+        assert_eq!(
+            alternating.config.uniform_sliding_window(),
+            None,
+            "an alternating model is the case no store may recycle"
+        );
+
+        // A pool that cannot cover one block per layer, so both models
+        // reach the immovable refusal.
+        let pool = Arc::new(Mutex::new(KvBlockPool::new(8, 1)));
+        let config = pool_config(pool, Duration::ZERO);
+        let max_seq_len = 64;
+
+        let bytes_of =
+            |decoder: &Decoder| match pool_immovable_refusal(decoder, &config, max_seq_len) {
+                Some(DecodeError::KvBudgetExceeded {
+                    estimated_bytes, ..
+                }) => estimated_bytes,
+                other => panic!("expected an immovable refusal, got {other:?}"),
+            };
+
+        let windowed_bytes = bytes_of(&alternating);
+        assert_eq!(
+            windowed_bytes,
+            bytes_of(&full),
+            "the window discounts nothing the pool reserves"
+        );
+        // And that figure is the whole reservation the refusal names:
+        // every layer, every position.
+        assert_eq!(
+            windowed_bytes,
+            KvShape::from_config(&full.config, KvElem::F32).per_token_kv_bytes()
+                * max_seq_len as u64
+        );
+    }
+
     /// A one-block pool cannot hold a two-layer model's caches under any
     /// schedule, so this is the immovable refusal too.
     #[test]
@@ -4047,7 +4103,7 @@ mod tests {
         let prompt = String::from_utf8(vec![1u8, 2, 3, 4, 5]).unwrap();
         let pool = Arc::new(Mutex::new(KvBlockPool::new(64, 64)));
         let config = pool_config(pool.clone(), Duration::ZERO);
-        let shape = KvShape::from_config(&decoder.config, KvElem::F32, 1);
+        let shape = KvShape::from_config(&decoder.config, KvElem::F32);
         // The prompt alone is 5 tokens against a ceiling of 4, so no
         // output budget exists that would make it servable.
         let ceiling = ContextCeiling::new(Some(4), shape);
@@ -4105,7 +4161,7 @@ mod tests {
     fn a_prompt_that_fits_is_served_with_its_budget_clamped_rather_than_refused() {
         let decoder = small_decoder();
         let prompt = String::from_utf8(vec![1u8, 2]).unwrap();
-        let shape = KvShape::from_config(&decoder.config, KvElem::F32, 1);
+        let shape = KvShape::from_config(&decoder.config, KvElem::F32);
         // 2 prompt tokens under a 4-position ceiling leaves room for 2,
         // and the request asks for 5.
         let ceiling = ContextCeiling::new(Some(4), shape);
@@ -4140,7 +4196,7 @@ mod tests {
     fn a_request_inside_the_ceiling_is_admitted_unchanged() {
         let decoder = small_decoder();
         let prompt = String::from_utf8(vec![1u8, 2]).unwrap();
-        let shape = KvShape::from_config(&decoder.config, KvElem::F32, 1);
+        let shape = KvShape::from_config(&decoder.config, KvElem::F32);
         let ceiling = ContextCeiling::new(Some(7), shape);
 
         let mut with = String::new();

@@ -602,7 +602,6 @@ fn resolve_ctx_size(args: &InferArgs, path: &Path, gguf_ctx: usize) -> anyhow::R
         concurrent_requests: 1,
         expert_cache_bytes: expert_cache_bytes_from_env(),
         kv_elem: kv_elem_for(args),
-        prefill_chunk: prefill_chunk_from_env(),
         ..ResidencyAssumptions::default()
     };
 
@@ -686,17 +685,6 @@ fn expert_cache_bytes_from_env() -> Option<u64> {
         .ok()
         .and_then(|v| v.trim().parse::<u64>().ok())
         .filter(|v| *v > 0)
-}
-
-/// `FERROX_CHUNKED_PREFILL`; `1` (token-at-a-time) when unset. Only
-/// affects sliding-window layers, whose resident positions are
-/// `window + chunk - 1`.
-fn prefill_chunk_from_env() -> usize {
-    std::env::var("FERROX_CHUNKED_PREFILL")
-        .ok()
-        .and_then(|v| v.trim().parse::<usize>().ok())
-        .filter(|v| *v > 0)
-        .unwrap_or(1)
 }
 
 /// The tokenizer a GGUF's own metadata names, or a refusal.

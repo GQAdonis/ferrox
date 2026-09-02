@@ -89,8 +89,9 @@ impl ContextCeiling {
         }
     }
 
-    /// KV bytes `positions` of context costs, sliding-window cap
-    /// included.
+    /// KV bytes `positions` of context costs: every layer at every
+    /// position, which is what the stores this server allocates really
+    /// keep (see `ferrox_models::kv_budget`'s module doc).
     pub fn bytes_for(&self, positions: usize) -> u64 {
         self.shape.kv_bytes_for_tokens(positions)
     }
@@ -296,7 +297,6 @@ pub struct Adopted {
 pub fn price_gguf(
     path: &str,
     kv_elem: KvElem,
-    prefill_chunk: usize,
     concurrent_requests: usize,
 ) -> Option<(KvBudget, usize, String)> {
     use ferrox_models::residency_report::{ResidencyAssumptions, ResidencyReport};
@@ -319,7 +319,6 @@ pub fn price_gguf(
         context_tokens: gguf_ctx,
         concurrent_requests: concurrent_requests.max(1),
         kv_elem,
-        prefill_chunk: prefill_chunk.max(1),
         ..ResidencyAssumptions::default()
     };
     match ResidencyReport::from_gguf(path, assumptions, device.usable_bytes) {
@@ -352,7 +351,7 @@ fn gguf_context_length(path: &str) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ferrox_models::{KvLayout, SlidingWindow};
+    use ferrox_models::KvLayout;
 
     /// A shape whose arithmetic is easy to do by hand: 2 layers, 1 kv
     /// head, head_dim 4, f32 -> 2 layers * 4 elems * 2 (K and V) * 4
@@ -365,7 +364,6 @@ mod tests {
                 head_dim: 4,
             },
             elem: KvElem::F32,
-            sliding: None,
         }
     }
 
@@ -559,20 +557,35 @@ mod tests {
         assert_eq!(config.kv_blocks, None);
     }
 
-    /// A model whose every layer slides has a bounded KV no matter how
-    /// long the context is, so only the model's own context length
-    /// limits it -- the `marginal == 0` case `max_context` handles with
-    /// `checked_div`.
+    /// A sliding-window model derives a ceiling from memory like any
+    /// other model. It used to derive the model's whole trained context
+    /// however small the budget was: `KvShape` subtracted the sliding
+    /// layers out of the divisor, a fully-windowed model divided by zero
+    /// bytes per token, and no KV store ever gave those bytes back
+    /// (#33). The server then admitted a context it had to allocate in
+    /// full.
+    ///
+    /// The window is taken from a real `ModelConfig` rather than
+    /// hand-written into the shape, because the shape has no window
+    /// field to write it into any more -- which is the fix.
     #[test]
-    fn a_fully_sliding_model_is_limited_only_by_its_context_length() {
-        let mut b = budget(1 << 30, 0);
-        b.shape.sliding = Some(SlidingWindow {
-            window: 128,
-            chunk: 1,
-            pattern: None,
-        });
-        let derived = derive_limits(&b, 8192, 256).expect("a bounded KV always fits");
-        assert_eq!(derived.max_context, 8192);
+    fn a_sliding_model_derives_its_ceiling_from_memory_like_any_other() {
+        let mut cfg = ferrox_models::config::test_dense_fixture();
+        cfg.n_layers = 2;
+        cfg.n_kv_heads = 1;
+        cfg.head_dim = 4;
+        cfg.sliding_window = Some(8);
+        cfg.swa_pattern = None; // every layer slides: the old zero divisor
+        let windowed = KvShape::from_config(&cfg, KvElem::F32);
+        assert_eq!(windowed, shape(), "64 bytes/token, window or no window");
+
+        // Room for 1024 tokens against a model that would like 8192.
+        let b = KvBudget {
+            shape: windowed,
+            ..budget(64 * 1024, 0)
+        };
+        let derived = derive_limits(&b, 8192, 256).expect("a fit of 1024 tokens is a real fit");
+        assert_eq!(derived.max_context, 1024);
     }
 
     /// **The wrap that skipped the clamp.** `max_tokens` arrives as a

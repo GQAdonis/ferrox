@@ -16,14 +16,13 @@ mod attn_block;
 mod ffn_act;
 mod lm_head;
 mod qk_norm;
+mod rope;
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
 pub(crate) use attn_block::KvStep;
 use ferrox_core::attention::{
-    apply_rope, apply_rope_interleaved, apply_rope_interleaved_with_freq_factors,
-    apply_rope_with_freq_factors, causal_gqa_attention_prefill_shared_kv_windowed,
-    causal_gqa_attention_softcap,
+    causal_gqa_attention_prefill_shared_kv_windowed, causal_gqa_attention_softcap,
 };
 use ferrox_core::cache::{KvCache, PagedKvCache, PagedStoreExhausted, SharedPagedKv};
 use ferrox_core::matmul::rms_norm;
@@ -686,103 +685,6 @@ impl Decoder {
         }
     }
 
-    /// Applies RoPE to one head's Q or K slice. Dispatches on both
-    /// `rope_layout` (Norm = adjacent-pair / NeoX = split-half -- see
-    /// `RopeLayout`) and whether this checkpoint carries a real
-    /// `rope_freqs.weight` tensor (Llama 3/3.1/3.2's per-band frequency
-    /// correction). Getting the layout wrong for `llama` was the real
-    /// root cause of the Llama-3.1-8B early-stop bug: ferrox applied
-    /// NeoX pairing to an architecture that needs Norm.
-    fn apply_rope_head_theta(&self, slice: &mut [f32], pos: usize, theta: f32) {
-        use crate::config::RopeLayout;
-        // Partial rotary (llama.cpp `hparams.n_rot` < `n_embd_head_k`,
-        // GGUF `<arch>.rope.dimension_count`): Phi-3/Phi-4 rotate only the
-        // first 96 of each 128-wide head and pass the remaining 32
-        // through untouched. Rotating the whole head instead is not a
-        // subtle error — it moves dimensions the model never trained to
-        // be position-dependent.
-        let slice = match self.config.rope_dim {
-            Some(rot) if rot < slice.len() => &mut slice[..rot],
-            _ => slice,
-        };
-        match (self.config.rope_layout, &self.config.rope_freqs) {
-            (RopeLayout::Norm, Some(freq_factors)) => {
-                apply_rope_interleaved_with_freq_factors(slice, pos, theta, freq_factors)
-            }
-            (RopeLayout::Norm, None) => apply_rope_interleaved(slice, pos, theta),
-            (RopeLayout::Neox, Some(freq_factors)) => {
-                apply_rope_with_freq_factors(slice, pos, theta, freq_factors)
-            }
-            (RopeLayout::Neox, None) => apply_rope(slice, pos, theta),
-        }
-    }
-
-    fn apply_rope_head_layer(&self, slice: &mut [f32], pos: usize, layer_idx: usize) {
-        self.apply_rope_head_theta(slice, pos, self.config.layer_rope_theta(layer_idx))
-    }
-
-    /// llama.cpp's RoPE `mscale` (ggml `rope_yarn`), applied where the
-    /// QKV biases and QK-norms are: multiplying `cos`/`sin` by a constant
-    /// is the same as scaling the vector RoPE rotates, and rotation is
-    /// linear, so pre-scaling q and k here is exactly what the kernel
-    /// would do post-hoc — without a new uniform on five backends' RoPE
-    /// kernels.
-    ///
-    /// Both q and k are scaled, so attention logits carry `m²`, which is
-    /// the whole observable effect (V is untouched, and k enters the
-    /// cache scaled exactly as llama.cpp's does).
-    #[inline]
-    fn apply_rope_attn_factor(&self, q: &mut [f32], k: &mut [f32]) {
-        let m = self.config.rope_attn_factor;
-        if m == 1.0 {
-            return;
-        }
-        // ggml folds `attn_factor` into cos_theta/sin_theta inside
-        // `rope_yarn` (ops.cpp), so it reaches ONLY the rotated channels;
-        // `[n_rot, head_dim)` is then copied through untouched by the
-        // "fill the remain channels with data from src tensor" loop.
-        // Scaling the pass-through tail as well is a different graph, and
-        // `ferrox parity` caught it as the one DRIFT verdict in a
-        // 17-model sweep: Phi-4-mini rotates 96 of 128 dims with
-        // attn_factor 1.1902, so 32 dims per head were scaled that
-        // llama.cpp leaves alone.
-        let head_dim = self.config.head_dim;
-        let rot = self.config.rope_dim.unwrap_or(head_dim).min(head_dim);
-        for buf in [q, k] {
-            for head in buf.chunks_mut(head_dim) {
-                let n = rot.min(head.len());
-                for v in head[..n].iter_mut() {
-                    *v *= m;
-                }
-            }
-        }
-    }
-
-    /// An architecture's explicit attention score scale
-    /// (`ModelConfig::attention_scale`), applied to Q after RoPE.
-    ///
-    /// llama.cpp's Gemma graphs scale Q themselves and then call
-    /// `build_attn(..., 1.0f)`; ferrox's kernels always apply their own
-    /// `1/sqrt(head_dim)`, so the compensation has to be folded into Q
-    /// here for the NET score scale to equal `attention_scale`.
-    ///
-    /// One helper rather than one copy per host body, because that is
-    /// exactly how this feature came to be applied at two of four sites:
-    /// `forward_hidden_batch_inner` and `forward_multi_seq_kv` computed a
-    /// plausible distribution at the wrong temperature and nothing
-    /// failed. Elementwise, so a `[batch, n_heads*head_dim]` Q batch is
-    /// the same call as one row's.
-    #[inline]
-    fn apply_attention_scale(&self, q: &mut [f32]) {
-        let Some(scale) = self.config.attention_scale else {
-            return;
-        };
-        let compensate = scale * (self.config.head_dim as f32).sqrt();
-        for v in q.iter_mut() {
-            *v *= compensate;
-        }
-    }
-
     /// Builds a Metal [`MatvecLaunch`] for a quantized matrix, or `None`
     /// if the storage/kind cannot run on Metal.
     #[cfg(feature = "metal")]
@@ -898,10 +800,13 @@ impl Decoder {
         // the four host bodies and not by any of the seven fused
         // launches -- the same weights answering at two different
         // temperatures depending on which backend served the token.
-        // Inert today (`loader.rs` hardcodes `attention_scale = None`),
-        // which is exactly why it has to be written down as a fence
-        // instead of trusted: the day a loader sets it, this returns
-        // false and the layer takes the host path that does apply it.
+        //
+        // LIVE, not latent: `capability::attention_scale_override` sets
+        // it for Gemma-2-27B and Gemma-3-27B, so those two checkpoints
+        // take the host path here and are scaled exactly once. It was
+        // written down as a fence while `loader.rs` still hardcoded
+        // `None`, which is why the day the loader started setting it
+        // cost nothing.
         if self.config.attention_scale.is_some() {
             return false;
         }
@@ -936,6 +841,32 @@ impl Decoder {
             || self.config.layer_sliding_window(layer_idx).is_some()
             || !GluAct::from(self.config.ffn_activation).is_swiglu()
             || self.config.layer_rope_theta(layer_idx) != self.config.rope_theta
+    }
+
+    /// True when no fused Metal *stack* can serve this model, because
+    /// its sliding layers need different RoPE per-band divisors from its
+    /// full-attention ones.
+    ///
+    /// Per-LAYER Metal launches are fine: each takes its own
+    /// `freq_factors` slice and is handed
+    /// `ModelConfig::layer_rope_freqs(l)`. The two whole-stack launches
+    /// (`launch_prefill_dense_stack`, `launch_decode_dense_stack`) take
+    /// ONE slice for a whole run of layers -- `PrefillDenseLayerMetal`
+    /// and `DenseLayerMetal` carry a per-layer `rope_theta` and `window`
+    /// but no per-layer divisors -- so they would rope the sliding
+    /// layers with the full-attention set. That is precisely the bug
+    /// this refusal exists to stop, one layer of the stack down.
+    ///
+    /// The cost is Gemma-3 4B/12B/27B taking the per-layer Metal path
+    /// rather than the fused stacks. Correct and slower beats fast and
+    /// wrong; restoring the stacks needs a per-layer `freq_factors`
+    /// buffer in `ferrox-metal`.
+    ///
+    /// One predicate, two call sites, because four spellings of one
+    /// eligibility check is how the GPU-router gate drifted four ways.
+    #[cfg(feature = "metal")]
+    fn metal_stack_needs_per_layer_rope_freqs(&self) -> bool {
+        self.config.rope_freqs_vary_by_layer()
     }
 
     /// Optional QKV bias / QK-norm ops for the Metal attn paths.
@@ -1138,6 +1069,9 @@ impl Decoder {
         kv_caches: &mut [KvCache],
         host_kv_authoritative: bool,
     ) -> Option<Vec<f32>> {
+        if self.metal_stack_needs_per_layer_rope_freqs() {
+            return None;
+        }
         let gelu = !GluAct::from(self.config.ffn_activation).is_swiglu();
         let mut prefill_layers = Vec::with_capacity(run_len);
         let mut rope_thetas = Vec::with_capacity(run_len);
@@ -1177,7 +1111,11 @@ impl Decoder {
             batch_size,
             self.metal_rope(),
             &rope_thetas,
-            self.config.rope_freqs.as_deref(),
+            // One slice for the whole run. Sound only because
+            // `metal_stack_needs_per_layer_rope_freqs` refused above
+            // when the layers disagree, so every layer in the run --
+            // sliding or not -- resolves to this same set.
+            self.config.layer_rope_freqs(start),
             start_pos,
             self.config.rms_norm_eps,
             gelu,
@@ -2007,7 +1945,14 @@ impl Decoder {
                                     n_heads,
                                     self.metal_rope(),
                                     self.config.rope_theta,
-                                    self.config.rope_freqs.as_deref(),
+                                    // The stack-wide theta above is
+                                    // sound because no layer here
+                                    // `layer_needs_metal_stack`, which
+                                    // means none slides; the divisors
+                                    // are taken through the same
+                                    // accessor so the two stay one
+                                    // answer.
+                                    self.config.layer_rope_freqs(0),
                                     pos,
                                     self.config.rms_norm_eps,
                                     Some(&self.final_norm),
@@ -2061,6 +2006,7 @@ impl Decoder {
         #[cfg(feature = "metal")]
         if !metal_stack_done
             && use_metal_attn
+            && !self.metal_stack_needs_per_layer_rope_freqs()
             && self.layers.iter().all(Self::layer_supports_metal_dense_ffn)
         {
             if let Some(guard) = metal_kv_guard.as_mut() {
@@ -2158,7 +2104,14 @@ impl Decoder {
                                 n_heads,
                                 self.metal_rope(),
                                 self.config.rope_theta,
-                                self.config.rope_freqs.as_deref(),
+                                // `DenseLayerMetal` overrides the theta
+                                // per layer but has no per-layer
+                                // divisors, so this one slice must
+                                // serve them all --
+                                // `metal_stack_needs_per_layer_rope_freqs`
+                                // in the guard above is what makes that
+                                // true.
+                                self.config.layer_rope_freqs(0),
                                 pos,
                                 self.config.rms_norm_eps,
                                 final_norm_w,
@@ -2309,7 +2262,7 @@ impl Decoder {
                                             n_heads,
                                             self.metal_rope(),
                                             self.config.rope_theta,
-                                            self.config.rope_freqs.as_deref(),
+                                            self.config.layer_rope_freqs(l),
                                             pos,
                                             self.config.rms_norm_eps,
                                             &self.metal_attn_extras(layer),
@@ -2399,7 +2352,7 @@ impl Decoder {
                                                                 n_heads,
                                                                 self.metal_rope(),
                                                                 self.config.rope_theta,
-                                                                self.config.rope_freqs.as_deref(),
+                                                                self.config.layer_rope_freqs(l),
                                                                 pos,
                                                                 self.config.rms_norm_eps,
                                                                 &self.metal_attn_extras(layer),
@@ -2437,7 +2390,7 @@ impl Decoder {
                                                         n_heads,
                                                         self.metal_rope(),
                                                         self.config.rope_theta,
-                                                        self.config.rope_freqs.as_deref(),
+                                                        self.config.layer_rope_freqs(l),
                                                         pos,
                                                         self.config.rms_norm_eps,
                                                         &self.metal_attn_extras(layer),
@@ -2525,7 +2478,7 @@ impl Decoder {
                                             n_heads,
                                             self.metal_rope(),
                                             self.config.rope_theta,
-                                            self.config.rope_freqs.as_deref(),
+                                            self.config.layer_rope_freqs(l),
                                             pos,
                                             &self.metal_attn_extras(layer),
                                             self.config.rms_norm_eps,
@@ -3914,7 +3867,7 @@ impl Decoder {
                                         batch_size,
                                         self.metal_rope(),
                                         self.config.layer_rope_theta(l),
-                                        self.config.rope_freqs.as_deref(),
+                                        self.config.layer_rope_freqs(l),
                                         start_pos,
                                         self.config.rms_norm_eps,
                                         gelu,
@@ -4027,7 +3980,7 @@ impl Decoder {
                                     batch_size,
                                     self.metal_rope().attn_factor_applied_by_caller(),
                                     self.config.layer_rope_theta(l),
-                                    self.config.rope_freqs.as_deref(),
+                                    self.config.layer_rope_freqs(l),
                                     start_pos,
                                     self.config.attn_logit_softcap,
                                     false,
@@ -4712,143 +4665,6 @@ impl Decoder {
             .flatten()
             .collect();
         self.logits_from_flat_hidden(final_normed_batch, batch_size)
-    }
-}
-
-#[cfg(test)]
-mod partial_rotary_tests {
-    use super::*;
-
-    /// Phi-3/Phi-4 rotate `rope.dimension_count` of each head and pass
-    /// the rest through. The tail staying bit-identical is the whole
-    /// property: rotating it would make dimensions position-dependent
-    /// that the model never trained that way.
-    #[test]
-    fn partial_rotary_leaves_the_tail_untouched() {
-        let mut cfg = crate::config::test_dense_fixture();
-        cfg.head_dim = 8;
-        cfg.rope_layout = crate::config::RopeLayout::Neox;
-        cfg.rope_freqs = None;
-        cfg.rope_dim = Some(4);
-        let decoder = Decoder::new_random_small(cfg, 1, 32);
-
-        let mut head: Vec<f32> = (0..8).map(|i| 1.0 + i as f32).collect();
-        let before = head.clone();
-        decoder.apply_rope_head_theta(&mut head, 3, 10000.0);
-
-        assert_eq!(
-            &head[4..],
-            &before[4..],
-            "dims at or past rope_dim must not rotate"
-        );
-        assert!(
-            head[..4] != before[..4],
-            "dims below rope_dim must rotate at a non-zero position"
-        );
-    }
-
-    /// `attn_factor` is a magnitude scale folded into cos/sin inside
-    /// ggml's `rope_yarn`, so it can only ever touch the rotated
-    /// channels. The pass-through tail must come out bit-identical —
-    /// scaling it is a different graph, and it was one, until
-    /// `ferrox parity` reported Phi-4-mini as the single DRIFT in a
-    /// 17-model sweep against llama.cpp.
-    #[test]
-    fn attn_factor_scales_only_the_rotated_channels() {
-        let mut cfg = crate::config::test_dense_fixture();
-        cfg.head_dim = 8;
-        cfg.n_heads = 2;
-        cfg.n_kv_heads = 2;
-        cfg.rope_dim = Some(4);
-        cfg.rope_attn_factor = 2.0;
-        let decoder = Decoder::new_random_small(cfg, 1, 32);
-
-        // Two heads, so a per-head slice bug cannot hide behind a single
-        // head that happens to span the whole buffer.
-        let mut q: Vec<f32> = (0..16).map(|i| 1.0 + i as f32).collect();
-        let mut k: Vec<f32> = (0..16).map(|i| 1.0 + i as f32).collect();
-        let before = q.clone();
-        decoder.apply_rope_attn_factor(&mut q, &mut k);
-
-        for h in 0..2 {
-            let base = h * 8;
-            for i in 0..4 {
-                assert_eq!(
-                    q[base + i],
-                    before[base + i] * 2.0,
-                    "rotated channel {i} of head {h} must be scaled"
-                );
-            }
-            for i in 4..8 {
-                assert_eq!(
-                    q[base + i],
-                    before[base + i],
-                    "pass-through channel {i} of head {h} must be untouched"
-                );
-            }
-        }
-        assert_eq!(q, k, "q and k take the same magnitude scale");
-    }
-
-    /// With no partial rotary the whole head is rotated, so the whole
-    /// head takes the scale — the narrow case must not become the rule.
-    #[test]
-    fn attn_factor_scales_the_whole_head_without_partial_rotary() {
-        let mut cfg = crate::config::test_dense_fixture();
-        cfg.head_dim = 8;
-        cfg.n_heads = 1;
-        cfg.n_kv_heads = 1;
-        cfg.rope_dim = None;
-        cfg.rope_attn_factor = 3.0;
-        let decoder = Decoder::new_random_small(cfg, 1, 32);
-
-        let mut q: Vec<f32> = (0..8).map(|i| 1.0 + i as f32).collect();
-        let mut k = q.clone();
-        let before = q.clone();
-        decoder.apply_rope_attn_factor(&mut q, &mut k);
-        for i in 0..8 {
-            assert_eq!(q[i], before[i] * 3.0);
-        }
-    }
-
-    /// The same call with no `rope_dim` must rotate everything, so the
-    /// narrow case cannot silently become the default.
-    #[test]
-    fn full_rotary_still_rotates_the_whole_head() {
-        let mut cfg = crate::config::test_dense_fixture();
-        cfg.head_dim = 8;
-        cfg.rope_layout = crate::config::RopeLayout::Neox;
-        cfg.rope_freqs = None;
-        cfg.rope_dim = None;
-        let decoder = Decoder::new_random_small(cfg, 1, 32);
-
-        let mut head: Vec<f32> = (0..8).map(|i| 1.0 + i as f32).collect();
-        let before = head.clone();
-        decoder.apply_rope_head_theta(&mut head, 3, 10000.0);
-        assert!(head[4..] != before[4..]);
-    }
-
-    /// `mscale` scales q and k and nothing else; `1.0` must be a literal
-    /// no-op so every other model pays nothing.
-    #[test]
-    fn rope_attn_factor_scales_q_and_k_only() {
-        let mut cfg = crate::config::test_dense_fixture();
-        cfg.rope_attn_factor = 2.0;
-        let decoder = Decoder::new_random_small(cfg, 1, 32);
-        let mut q = vec![1.0f32, -2.0, 3.0];
-        let mut k = vec![0.5f32, 4.0];
-        decoder.apply_rope_attn_factor(&mut q, &mut k);
-        assert_eq!(q, vec![2.0, -4.0, 6.0]);
-        assert_eq!(k, vec![1.0, 8.0]);
-
-        let mut cfg = crate::config::test_dense_fixture();
-        cfg.rope_attn_factor = 1.0;
-        let decoder = Decoder::new_random_small(cfg, 1, 32);
-        let mut q = vec![1.0f32, -2.0];
-        let mut k = vec![3.0f32];
-        decoder.apply_rope_attn_factor(&mut q, &mut k);
-        assert_eq!(q, vec![1.0, -2.0]);
-        assert_eq!(k, vec![3.0]);
     }
 }
 

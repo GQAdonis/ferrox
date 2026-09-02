@@ -1940,6 +1940,101 @@ pub fn swa_rope_base_follows_model(arch: &str) -> bool {
     )
 }
 
+/// True when this architecture's SWA layers inherit the model's TRAINED
+/// RoPE position scale rather than llama.cpp's
+/// `rope_freq_scale_train_swa` default of `1.0`.
+///
+/// The sibling of [`swa_rope_base_follows_model`], and deliberately NOT
+/// derived from it: llama.cpp defaults both fields
+/// (`src/llama-hparams.h:127,129`) and each architecture assigns them
+/// independently, so the two lists differ. `olmo2.cpp:13-14` and
+/// `laguna.cpp:47-48` seed the BASE from the model and then pin the
+/// SCALE to `1.0` -- laguna's own comment is "SWA uses plain RoPE (no
+/// YaRN scaling); do NOT inherit full layers 1/factor". Collapsing the
+/// two tables into one would rope those two architectures wrong in
+/// exactly the way this function exists to stop.
+///
+/// The default matters more than the list. `gemma3.cpp:11` reads only
+/// `LLM_KV_ROPE_FREQ_BASE_SWA` and never touches
+/// `rope_freq_scale_train_swa`, so Gemma-3's sliding layers rope at
+/// scale `1.0` while its full-attention layers use the trained scale --
+/// and the converter agrees, writing `rope.scaling.factor` from
+/// `rope_parameters["full_attention"]` alone (`conversion/base.py:1222`,
+/// whose own comment is "TODO: Handle sliding_attention similarly when
+/// models start implementing it").
+///
+/// Every name here is a `hparams.rope_freq_scale_train_swa =
+/// hparams.rope_freq_scale_train;` in `src/models/`, at the line given.
+pub fn swa_rope_scale_follows_model(arch: &str) -> bool {
+    matches!(
+        arch,
+        "afmoe"          // afmoe.cpp:22
+            | "cohere2"     // cohere2.cpp:10
+            | "cohere2moe"  // cohere2moe.cpp:39
+            | "dflash"      // dflash.cpp:59, :71
+            | "exaone-moe"  // exaone-moe.cpp:10
+            | "exaone4"     // exaone4.cpp:12
+            | "gemma2"      // gemma2.cpp:11
+            | "llama4"      // llama4.cpp:24
+            | "mellum"      // mellum.cpp:20
+            | "gpt-oss"     // openai-moe.cpp:14
+            | "smallthinker" // smallthinker.cpp:14
+    )
+}
+
+/// llama.cpp's `hparams.f_attention_scale`, but only when it DIFFERS
+/// from the `1/sqrt(head_dim)` every ferrox attention kernel already
+/// applies. `None` means "the kernels' own scale is already right", so
+/// a caller stores it straight into `ModelConfig::attention_scale`.
+///
+/// Only the Gemma-2 and Gemma-3 27B checkpoints answer `Some`:
+///
+/// ```cpp
+/// // src/models/gemma3.cpp:30-33 (src/models/gemma2.cpp:26-29 identical in shape)
+/// hparams.f_attention_scale = type == LLM_TYPE_27B
+///     ? 1.0f / std::sqrt(float(hparams.n_embd / hparams.n_head(0)))
+///     : 1.0f / std::sqrt(float(hparams.n_embd_head_k()));
+/// ```
+///
+/// and llama.cpp applies it as an explicit `ggml_scale` on Q followed by
+/// `build_attn(..., 1.0f)` (`gemma3.cpp:154`, `gemma2.cpp:110`), which is
+/// what [`crate::config::ModelConfig::attention_scale`] means here.
+///
+/// **The selector is the LAYER COUNT, not a comparison of the two
+/// widths.** `LLM_TYPE_27B` comes from `switch (hparams.n_layer())`
+/// (`gemma3.cpp:20-28` `case 62`, `gemma2.cpp:19-23` `case 46`), and
+/// deriving it instead from `n_embd / n_head != head_dim` would be
+/// wrong for EVERY other Gemma size -- all of them have
+/// `n_embd / n_head != head_dim` too, and all of them take llama.cpp's
+/// `1/sqrt(n_embd_head_k)` branch. See
+/// `gemma_27b_is_the_only_size_that_overrides_the_kernel_scale`.
+///
+/// `hidden_dim / n_heads` is integer division on purpose: llama.cpp
+/// divides two `uint32_t` and only then converts to float.
+pub fn attention_scale_override(
+    arch: &str,
+    n_layers: usize,
+    hidden_dim: usize,
+    n_heads: usize,
+    head_dim: usize,
+) -> Option<f32> {
+    // `case 62` / `case 46` in the `switch (hparams.n_layer())` that
+    // picks `LLM_TYPE_27B`. Every other Gemma architecture
+    // (`gemma-embedding`, `gemma3n`, `gemma4`) sets `f_attention_scale`
+    // unconditionally and has no 27B branch at all.
+    let is_27b = match arch {
+        "gemma2" => n_layers == 46,
+        "gemma3" => n_layers == 62,
+        _ => false,
+    };
+    if !is_27b || n_heads == 0 || head_dim == 0 {
+        return None;
+    }
+    let scale = 1.0 / ((hidden_dim / n_heads) as f32).sqrt();
+    let kernel_scale = 1.0 / (head_dim as f32).sqrt();
+    (scale != kernel_scale).then_some(scale)
+}
+
 /// Metadata keys that, when present with a nonzero value, require math
 /// ferrox's generic decoder does not implement *unless* the architecture
 /// profile opts into those features (Gemma family).
@@ -2013,7 +2108,14 @@ pub fn unsupported_feature_keys(arch: &str) -> Vec<(String, &'static str)> {
 /// "unset, use 1/sqrt(head_dim)" sentinel.
 pub fn unsupported_scaling_keys(arch: &str) -> Vec<(String, &'static str, f32)> {
     let profile = resolve_profile(arch);
-    // Gemma implements its own embedding scale and attention scale.
+    // Gemma implements its own embedding scale (`loader.rs`
+    // `embedding_scale`) and its own attention scale
+    // (`attention_scale_override`, including the 27B branch llama.cpp
+    // takes at `gemma3.cpp:30-33` / `gemma2.cpp:26-29`). That second
+    // half was an unimplemented claim until the 27B fix; the exemption
+    // is only honest while `attention_scale_override` covers it, which
+    // `gemma_27b_is_the_only_size_that_overrides_the_kernel_scale`
+    // pins.
     if matches!(profile.map(|p| p.family), Some(DecoderFamily::GemmaFamily)) {
         return Vec::new();
     }
@@ -2543,5 +2645,106 @@ mod tests {
             unsupported_feature_keys("gemma2").is_empty(),
             "the Gemma family implements softcap and the SWA pattern"
         );
+    }
+
+    /// llama.cpp picks Gemma's `f_attention_scale` on the LAYER COUNT
+    /// (`gemma3.cpp:20-33`, `gemma2.cpp:19-29`), and every published
+    /// Gemma size -- not just 27B -- has `n_embd / n_head != head_dim`.
+    /// An override derived from "the two widths disagree" would fire on
+    /// all eight rows below and mis-scale six of them, which is why this
+    /// walks the real sizes rather than asserting the 27B number alone.
+    ///
+    /// Shipped broken: `loader.rs` hardcoded `attention_scale = None`
+    /// beside a comment naming the 27B exception, so Gemma-2-27B scored
+    /// `sqrt(144/128)` and Gemma-3-27B `sqrt(168/128)` too large on
+    /// every layer -- a sharper softmax than the trained one, with no
+    /// error.
+    #[test]
+    fn gemma_27b_is_the_only_size_that_overrides_the_kernel_scale() {
+        /// One published Gemma size, as its GGUF header declares it.
+        struct Size {
+            arch: &'static str,
+            n_layers: usize,
+            n_embd: usize,
+            n_head: usize,
+            /// `attention.key_length`, llama.cpp's `n_embd_head_k()`.
+            head_dim: usize,
+            /// The denominator llama.cpp's 27B branch produces, or
+            /// `None` where it takes the `1/sqrt(n_embd_head_k)` branch.
+            want_denom: Option<f32>,
+        }
+        let size = |arch, n_layers, n_embd, n_head, head_dim, want_denom| Size {
+            arch,
+            n_layers,
+            n_embd,
+            n_head,
+            head_dim,
+            want_denom,
+        };
+        let sizes = [
+            size("gemma2", 26, 2304, 8, 256, None),         // Gemma-2-2B
+            size("gemma2", 42, 3584, 16, 256, None),        // Gemma-2-9B
+            size("gemma2", 46, 4608, 32, 128, Some(144.0)), // Gemma-2-27B
+            size("gemma3", 18, 640, 4, 256, None),          // Gemma-3-270M
+            size("gemma3", 26, 1152, 4, 256, None),         // Gemma-3-1B
+            size("gemma3", 34, 2560, 8, 256, None),         // Gemma-3-4B
+            size("gemma3", 48, 3840, 16, 256, None),        // Gemma-3-12B
+            size("gemma3", 62, 5376, 32, 128, Some(168.0)), // Gemma-3-27B
+        ];
+        for &Size {
+            arch,
+            n_layers,
+            n_embd,
+            n_head,
+            head_dim,
+            want_denom,
+        } in &sizes
+        {
+            // The premise of the whole test: no Gemma size has
+            // `n_embd / n_head == head_dim`, so "the widths disagree"
+            // cannot be the selector.
+            assert_ne!(
+                n_embd / n_head,
+                head_dim,
+                "{arch}/{n_layers}L: if this ever holds, re-read the derivation"
+            );
+            let got = attention_scale_override(arch, n_layers, n_embd, n_head, head_dim);
+            match want_denom {
+                None => assert_eq!(
+                    got, None,
+                    "{arch}/{n_layers}L takes llama.cpp's 1/sqrt(n_embd_head_k) branch, \
+                     which the attention kernels already apply"
+                ),
+                Some(denom) => {
+                    let want = 1.0 / denom.sqrt();
+                    let got = got.unwrap_or_else(|| {
+                        panic!("{arch}/{n_layers}L is llama.cpp's LLM_TYPE_27B; scale must be set")
+                    });
+                    assert!(
+                        (got - want).abs() < 1e-7,
+                        "{arch}/{n_layers}L: want 1/sqrt({denom}) = {want}, got {got}"
+                    );
+                    // The direction of the correction: the kernels' own
+                    // scale is the LARGER one, so the override shrinks
+                    // the scores rather than growing them.
+                    let kernel = 1.0f32 / (head_dim as f32).sqrt();
+                    assert!(
+                        kernel > got,
+                        "{arch}/{n_layers}L: kernel scale {kernel} must exceed {got}"
+                    );
+                }
+            }
+        }
+        // `gemma-embedding`, `gemma3n` and `gemma4` set
+        // `f_attention_scale` unconditionally in llama.cpp and have no
+        // `LLM_TYPE_27B` branch; nothing outside gemma2/gemma3 reaches
+        // this at all.
+        for arch in ["gemma-embedding", "gemma3n", "gemma4", "llama", "qwen3"] {
+            assert_eq!(
+                attention_scale_override(arch, 62, 5376, 32, 128),
+                None,
+                "{arch} has no LLM_TYPE_27B branch in llama.cpp"
+            );
+        }
     }
 }

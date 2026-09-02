@@ -8,15 +8,44 @@ Companion to [`llama-cpp-gap-inventory.md`](llama-cpp-gap-inventory.md) (evidenc
 
 ## Executive summary
 
+**Re-checked against the code on 2026-09-02, evening.** Several rows
+below were closed the same day this document was written, so the table
+now carries what is true rather than what was true at breakfast.
+
 | Area | Parity level | Priority |
 |------|--------------|----------|
-| Architecture coverage | ~11 audited + 4 dedicated engines vs 140 llama.cpp graphs | P0 — expand audited set |
-| CLI flag semantics | Several **same flag, different meaning** (`-ngl`, `-e`, repeat penalty) | P0 — refuse or match |
-| Server flags | `-cb`, `-np` added; still env-heavy for `-c`, `--api-key` | P1 |
-| Sampling / grammar | Large sampler + grammar surface missing on API/CLI | P1 |
-| Tools (quantize, perplexity) | No in-tree quantize or corpus eval | P1 |
-| Serving / batching | CB auto-on Metal; incremental CB streaming (0.15.2) | P1 — `-c`, slot save/load |
+| Architecture coverage | **16** audited + 4 dedicated engines vs 140 llama.cpp graphs | P0, expand audited set |
+| CLI flag semantics | `-ngl` still refuses a partial count deliberately; `-e` and `--repeat-last-n` already match | P2, documented rather than divergent |
+| Server flags | **DONE**: `-c`, `--api-key`, `--api-key-file`, `--alias`, `--ctk`, `-hf`, `--hf-file`, `-cb`, `-np` | closed |
+| Sampling / grammar | **Mostly done**: GBNF, JSON Schema, forced `tool_choice`, `--presence-penalty` / `--frequency-penalty` | P2, `--samplers` ordering left |
+| Tools (quantize, perplexity) | No in-tree quantize or corpus eval | P1, and quantize is a CAPABILITY gap, not a CLI one |
+| Serving / batching | CB auto-on Metal; incremental CB streaming | P1, slot save/load |
 | Metal concurrency | Phase 1 shipped (#46 closed); per-request Metal KV is follow-up | P2 |
+
+### Closed since this document was written
+
+- Architecture coverage 11 to **16**: five one-match-arm rows admitted
+  with libllama-golden fixtures, so unaudited went 46 to 41.
+- Every server flag listed under "Server flags to env today": `-c`,
+  `--api-key`, `--api-key-file`, `-fa`, plus `--alias`, `--ctk`,
+  `--hf-file`.
+- `-hf` on both the run and serve paths, with `repo:QUANT` resolution.
+- `logit_bias` on chat, `response_format: json_schema`, and JSON schema
+  under continuous batching.
+- `--presence-penalty` and `--frequency-penalty`, which the engine had
+  always honoured while the CLI hardcoded both to zero.
+- The refusal split by triage verdict.
+
+### What the re-check found that this document did not
+
+`quantize` is filed here as a missing TOOL. It is a missing
+CAPABILITY: `ferrox-quant` has `quantize_q8_0` and two activation
+quantizers, and nothing that writes a K-quant. A `ferrox quantize`
+subcommand is not the work; K-quant encoders with importance-weighted
+rounding are, and pretending otherwise would produce a command that
+can only emit Q8_0 while its name implies llama.cpp's range. Tracked
+with the step-wise shape it would need as
+[#70](https://github.com/antonellof/ferrox/issues/70).
 
 ---
 
@@ -69,10 +98,13 @@ The unaudited-arch refusal gate is **good** (better than silent wrong). Next:
 
 High-value CLI additions (map to existing `FERROX_*`):
 
-- `-c` / `--ctx-size` → context ceiling
-- `--api-key` → `FERROX_API_KEY`
-- `-fa` → `FERROX_METAL_ATTN` / flash-attn toggles
-- `-b` / `-ub` → prefill/decode batch envs
+- ~~`-c` / `--ctx-size`~~ **done**, sets `FERROX_CB_MAX_CONTEXT`
+- ~~`--api-key`~~ **done**, plus `--api-key-file`, which is the form to
+  prefer on a shared host since an argument is visible in `ps`
+- ~~`-fa`~~ **done**, accepted; `-fa off` refuses by name and points at
+  `FERROX_METAL_ATTN=0`, because fused attention is a backend property
+  here rather than a per-run switch
+- `-b` / `-ub` → prefill/decode batch envs, still open
 
 ### API surface
 

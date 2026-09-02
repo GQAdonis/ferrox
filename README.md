@@ -82,7 +82,7 @@ curl -fsSL https://raw.githubusercontent.com/antonellof/ferrox/main/scripts/inst
 ```
 
 Installs `ferrox` and `ferrox-server` into `~/.local/bin` (override with
-`FERROX_INSTALL_DIR`, pin with `FERROX_VERSION=v0.15.0`). The downloaded
+`FERROX_INSTALL_DIR`, pin with `FERROX_VERSION=v0.15.1`). The downloaded
 `ferrox` is built with `serve`, so one binary runs completions and
 serves the API. `ferrox-server` ships alongside it so an existing one on
 your PATH keeps working. Prebuilts are macOS arm64 with Metal and Linux

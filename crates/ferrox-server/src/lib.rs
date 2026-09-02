@@ -179,6 +179,24 @@ pub struct ServerArgs {
     #[arg(long = "exit-on-stdin-close", default_value_t = false)]
     exit_on_stdin_close: bool,
 
+    /// Share one batched decode worker across concurrent requests
+    /// (llama.cpp `-cb`). Also sets `FERROX_CONTINUOUS_BATCHING=1`.
+    #[arg(
+        long = "cont-batching",
+        visible_aliases = ["continuous-batching", "cb"],
+        default_value_t = false
+    )]
+    cont_batching: bool,
+
+    /// Disable auto continuous batching on Metal
+    /// (`FERROX_CONTINUOUS_BATCHING=0`).
+    #[arg(
+        long = "no-cont-batching",
+        default_value_t = false,
+        conflicts_with = "cont_batching"
+    )]
+    no_cont_batching: bool,
+
     /// Start even though another ferrox process is already holding a
     /// model. Off by default: two models on one box do not share it,
     /// they thrash it, and both serve slower than either would alone.
@@ -268,6 +286,7 @@ fn rewrite_llama_style_argv(args: Vec<String>) -> Vec<String> {
         .map(|arg| match arg.as_str() {
             "-ngl" => "--n-gpu-layers".into(),
             "-dev" => "--device".into(),
+            "-cb" => "--cont-batching".into(),
             _ => arg,
         })
         .collect()
@@ -395,6 +414,14 @@ fn apply_cli_overrides(args: &ServerArgs) -> anyhow::Result<()> {
                 }
             }
         }
+    }
+
+    if args.cont_batching {
+        // SAFETY: called before the runtime starts worker threads.
+        unsafe { std::env::set_var("FERROX_CONTINUOUS_BATCHING", "1") };
+    } else if args.no_cont_batching {
+        // SAFETY: called before the runtime starts worker threads.
+        unsafe { std::env::set_var("FERROX_CONTINUOUS_BATCHING", "0") };
     }
 
     Ok(())
@@ -701,6 +728,10 @@ pub(crate) struct AppState {
     /// worker, decided once at startup from the same env var and
     /// exclusions as the initial load.
     pub(crate) continuous_batching_enabled: bool,
+    /// Serializes private-loop Metal decodes when continuous batching is
+    /// off. Shared `metal_attn_kv` is not safe across concurrent
+    /// `forward_token` calls yet; see `docs/plans/metal-parallel-concurrency.md`.
+    pub(crate) metal_private_decode_gate: Option<Arc<std::sync::Mutex<()>>>,
     /// The model id a load task is currently working on, so
     /// `/admin/models` can report `loading` for it. Separate from
     /// `load_in_progress` because that is a gate and this is a label.
@@ -1916,7 +1947,17 @@ async fn health(State(state): State<Arc<AppState>>) -> Response {
     capabilities.push(if active.as_ref().is_some_and(|a| a.batcher.is_some()) {
         ferrox_api::Capability::available(
             ferrox_api::health::capability::CONTINUOUS_BATCHING,
-            "Concurrent requests share one batched decode step.",
+            if state.continuous_batching_enabled && continuous_batching_env().is_none() {
+                "On by default on Metal. Concurrent requests share one batched decode worker."
+            } else {
+                "Concurrent requests share one batched decode step."
+            },
+        )
+    } else if state.metal_private_decode_gate.is_some() {
+        ferrox_api::Capability::unavailable(
+            ferrox_api::health::capability::CONTINUOUS_BATCHING,
+            ferrox_api::health::reason::DISABLED,
+            "Off; private Metal decodes serialize (one at a time). Set FERROX_CONTINUOUS_BATCHING=1 or --cont-batching for parallel serving.",
         )
     } else {
         ferrox_api::Capability::unavailable(
@@ -2395,6 +2436,7 @@ fn run_generation_emit(
     prefix_cache: Option<&Mutex<PrefixCache>>,
     continuous_batcher: Option<&serving::batch::ContinuousBatcher>,
     ceiling: Option<&budget::ContextCeiling>,
+    metal_private_decode_gate: Option<&std::sync::Mutex<()>>,
     mut emit: impl FnMut(&str),
 ) -> Result<(FinishReason, generate::Usage, String), generate::DecodeError> {
     let synthetic = model.is_synthetic();
@@ -2411,6 +2453,8 @@ fn run_generation_emit(
         resolved
     };
     let used_batcher = matches!((model, continuous_batcher), (Model::Gguf(_), Some(_)));
+    let _metal_private_guard =
+        acquire_metal_private_decode_gate(metal_private_decode_gate, used_batcher);
     let (finish, usage) = match model {
         Model::Gguf(m) => {
             if let Some(batcher) = continuous_batcher {
@@ -2528,6 +2572,7 @@ pub(crate) fn run_generation(
     prefix_cache: Option<&Mutex<PrefixCache>>,
     continuous_batcher: Option<&serving::batch::ContinuousBatcher>,
     ceiling: Option<&budget::ContextCeiling>,
+    metal_private_decode_gate: Option<&std::sync::Mutex<()>>,
 ) -> Result<(Vec<String>, FinishReason, generate::Usage), generate::DecodeError> {
     let (finish, usage, full) = run_generation_emit(
         model,
@@ -2538,6 +2583,7 @@ pub(crate) fn run_generation(
         prefix_cache,
         continuous_batcher,
         ceiling,
+        metal_private_decode_gate,
         |_| {},
     )?;
     Ok((
@@ -2986,6 +3032,7 @@ async fn chat_completions_stream(
     let prefix_cache = state.prefix_cache.clone();
     let batcher = active.batcher.clone();
     let ceiling = active.ceiling.clone();
+    let metal_private_decode_gate = state.metal_private_decode_gate.clone();
     let mut params = req.generation_params_for_template(&template, active.name())?;
     let stats_state = Arc::clone(&state);
     // Read now, off the handle this stream will decode against. Read
@@ -3096,6 +3143,7 @@ async fn chat_completions_stream(
             prefix_cache.as_deref(),
             batcher.as_ref(),
             ceiling.as_deref(),
+            metal_private_decode_gate.as_deref(),
             |chunk| {
                 if !overlap || chunk.is_empty() {
                     return;
@@ -3673,6 +3721,69 @@ struct StartupModels {
     embedding: Option<Arc<ferrox_models::EmbeddingModel>>,
 }
 
+fn continuous_batching_env() -> Option<bool> {
+    match std::env::var("FERROX_CONTINUOUS_BATCHING")
+        .ok()
+        .map(|v| v.trim().to_ascii_lowercase())
+        .as_deref()
+    {
+        None => None,
+        Some("1" | "true" | "yes" | "on") => Some(true),
+        Some("0" | "false" | "no" | "off") => Some(false),
+        _ => None,
+    }
+}
+
+fn metal_private_decode_active() -> bool {
+    #[cfg(feature = "metal")]
+    {
+        BUILT_WITH_METAL
+            && ferrox_metal::attn::metal_attn_enabled()
+            && std::env::var("FERROX_METAL").ok().as_deref() != Some("0")
+    }
+    #[cfg(not(feature = "metal"))]
+    {
+        false
+    }
+}
+
+fn continuous_batching_compatible(
+    loaded: &model::LoadedModel,
+    kv_pool: &Option<generate::KvPoolConfig>,
+    prefix_cache: &Option<Arc<Mutex<PrefixCache>>>,
+    paged_kv: &Option<generate::PagedKvConfig>,
+) -> bool {
+    matches!(loaded, model::LoadedModel::Gguf(_))
+        && (paged_kv.is_some() || (kv_pool.is_none() && prefix_cache.is_none()))
+}
+
+fn resolve_continuous_batching_enabled(
+    loaded: &model::LoadedModel,
+    kv_pool: &Option<generate::KvPoolConfig>,
+    prefix_cache: &Option<Arc<Mutex<PrefixCache>>>,
+    paged_kv: &Option<generate::PagedKvConfig>,
+) -> bool {
+    if !continuous_batching_compatible(loaded, kv_pool, prefix_cache, paged_kv) {
+        return false;
+    }
+    match continuous_batching_env() {
+        Some(true) => true,
+        Some(false) => false,
+        None => metal_private_decode_active(),
+    }
+}
+
+fn acquire_metal_private_decode_gate(
+    gate: Option<&std::sync::Mutex<()>>,
+    used_batcher: bool,
+) -> Option<std::sync::MutexGuard<'_, ()>> {
+    if used_batcher {
+        None
+    } else {
+        gate.map(|g| g.lock().unwrap_or_else(|p| p.into_inner()))
+    }
+}
+
 fn build_app_state(
     models: StartupModels,
     kv_pool: Option<generate::KvPoolConfig>,
@@ -3695,6 +3806,16 @@ fn build_app_state(
     // in which case `/admin/models` reports nothing as active rather
     // than inventing an id no `load` request could name.
     let id = startup_model_id();
+    let metal_private_decode_gate = if enable_continuous_batching || !metal_private_decode_active()
+    {
+        None
+    } else {
+        tracing::info!(
+            "Metal private-loop decode will serialize concurrent requests until \
+             continuous batching is enabled (FERROX_CONTINUOUS_BATCHING=1 or --cont-batching)"
+        );
+        Some(Arc::new(std::sync::Mutex::new(())))
+    };
     AppState {
         embedding,
         active: std::sync::RwLock::new(Some(Arc::new(ActiveModel {
@@ -3721,6 +3842,7 @@ fn build_app_state(
         detection,
         mcp,
         continuous_batching_enabled: enable_continuous_batching,
+        metal_private_decode_gate,
         loading_model: Mutex::new(None),
         last_load_error: Mutex::new(None),
         serving: Mutex::new(crate::stats::ServingStats::default()),
@@ -4428,21 +4550,16 @@ async fn run(mcp_config_path: Option<PathBuf>, exit_on_stdin_close: bool) -> any
              ferrox_models::engine's module docs"
         );
     }
-    let enable_cb = std::env::var("FERROX_CONTINUOUS_BATCHING")
-        .map(|v| v == "1")
-        .unwrap_or(false)
-        // Paged KV is what removed the old exclusivity: a batched row
-        // now holds a `PagedLease`, which is pool-accounted by
-        // construction and shares a prefix through the radix tree, so
-        // the two things the batcher could not previously do it now
-        // gets for free. The CONTIGUOUS pool and prefix cache still
-        // keep the private path, because a batched row has no way to
-        // restore a `Vec<KvCache>` snapshot.
-        && (paged_kv.is_some() || (kv_pool.is_none() && prefix_cache.is_none()))
-        && matches!(loaded, model::LoadedModel::Gguf(_));
-    if std::env::var("FERROX_CONTINUOUS_BATCHING")
-        .map(|v| v == "1")
-        .unwrap_or(false)
+    let enable_cb =
+        resolve_continuous_batching_enabled(&loaded, &kv_pool, &prefix_cache, &paged_kv);
+    if enable_cb && continuous_batching_env().is_none() && metal_private_decode_active() {
+        tracing::info!(
+            "continuous batching enabled by default on Metal for safe parallel serving \
+             (set FERROX_CONTINUOUS_BATCHING=0 or --no-cont-batching to use the private path)"
+        );
+    }
+    if continuous_batching_env() == Some(true)
+        && !continuous_batching_compatible(&loaded, &kv_pool, &prefix_cache, &paged_kv)
         && (kv_pool.is_some() || prefix_cache.is_some())
     {
         tracing::warn!(
@@ -4874,6 +4991,7 @@ mod tests {
             detection: Arc::new(health::Detection::ready(health::probe_backends())),
             mcp: None,
             continuous_batching_enabled: false,
+            metal_private_decode_gate: None,
             loading_model: Mutex::new(None),
             last_load_error: Mutex::new(None),
             serving: Mutex::new(crate::stats::ServingStats::default()),
@@ -5151,6 +5269,7 @@ mod tests {
             in_flight.generative().unwrap(),
             "hi",
             &greedy_params(3),
+            None,
             None,
             None,
             None,
@@ -8171,6 +8290,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         assert!(matches!(
             result,
@@ -8209,6 +8329,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         assert!(matches!(
             result,
@@ -8243,6 +8364,7 @@ mod tests {
             &prompt,
             &greedy_params(4),
             Some(&config),
+            None,
             None,
             None,
             None,
@@ -8318,6 +8440,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .unwrap();
         assert_eq!(finish, FinishReason::Length);
@@ -8346,6 +8469,7 @@ mod tests {
                     &model,
                     &prompt,
                     &greedy_params(6),
+                    None,
                     None,
                     None,
                     None,
@@ -8788,6 +8912,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .expect("a real Kimi checkpoint must generate without error");
         assert!(matches!(finish, FinishReason::Length | FinishReason::Stop));
@@ -8834,6 +8959,7 @@ mod tests {
                 active.generative().unwrap(),
                 "hi",
                 &params,
+                None,
                 None,
                 None,
                 None,
@@ -8904,6 +9030,7 @@ mod tests {
             Some(&kv_pool_config),
             None,
             Some(&pc),
+            None,
             None,
             None,
         )

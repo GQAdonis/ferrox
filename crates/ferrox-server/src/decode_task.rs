@@ -45,6 +45,7 @@ pub(crate) struct DecodeHandles {
     prefix_cache: Option<Arc<Mutex<PrefixCache>>>,
     batcher: Option<serving::batch::ContinuousBatcher>,
     ceiling: Option<Arc<budget::ContextCeiling>>,
+    metal_private_decode_gate: Option<Arc<std::sync::Mutex<()>>>,
 }
 
 impl DecodeHandles {
@@ -68,6 +69,7 @@ impl DecodeHandles {
             prefix_cache: state.prefix_cache.clone(),
             batcher: active.batcher.clone(),
             ceiling: active.ceiling.clone(),
+            metal_private_decode_gate: state.metal_private_decode_gate.clone(),
         })
     }
 
@@ -102,6 +104,7 @@ impl DecodeHandles {
             self.prefix_cache.as_deref(),
             self.batcher.as_ref(),
             self.ceiling.as_deref(),
+            self.metal_private_decode_gate.as_deref(),
         )
     }
 
@@ -122,6 +125,7 @@ impl DecodeHandles {
             self.prefix_cache.as_deref(),
             self.batcher.as_ref(),
             self.ceiling.as_deref(),
+            self.metal_private_decode_gate.as_deref(),
             emit,
         )
     }

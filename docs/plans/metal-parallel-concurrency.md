@@ -1,8 +1,16 @@
 # Metal parallel decode concurrency
 
-Status: **design / in progress** (branch `fix/metal-parallel-concurrency`)
+Status: **implemented (phase 1)** on branch `fix/metal-parallel-concurrency`
 
 Related defect: https://github.com/antonellof/ferrox/issues/46
+
+## Phase 1 landed
+
+- **Auto continuous batching on Metal** when compatible (no KV pool / prefix cache on contiguous path)
+- **CLI** `--cont-batching` / `-cb`, `--no-cont-batching`
+- **Single-flight gate** for private-loop Metal decode when CB is off
+- **Decoder hardening:** poison-tolerant `metal_attn_kv` lock, fill `hidden` before CPU `rms_norm` fallback
+- **Parity review:** [`llama-cpp-parity-review-2026-09-02.md`](llama-cpp-parity-review-2026-09-02.md)
 
 ## Problem
 

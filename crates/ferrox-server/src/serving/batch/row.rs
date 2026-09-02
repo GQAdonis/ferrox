@@ -32,6 +32,36 @@ pub(super) enum RowKv {
     Paged(PagedLease),
 }
 
+impl RowKv {
+    /// Positions already written into this row's KV, and therefore the
+    /// only position a forward pass over it may run at next.
+    ///
+    /// This is a READ of the cursor, not a second derivation of it.
+    /// `KvCache::push` and `PagedKvCache::push` both write at their own
+    /// `seq_len` and IGNORE the position their caller passes alongside,
+    /// so the KV's length is the one true answer and everybody else's is
+    /// a guess that has to be kept in step.
+    ///
+    /// A paged row does not start at zero. `acquire_paged_caches` seeds
+    /// its lease with whatever prefix the radix tree already held
+    /// (`PagedKvCache::adopt_blocks` installs those blocks and sets
+    /// `seq_len` to the prefix length), so a prefill that assumed zero
+    /// re-ran the whole prompt ON TOP of the adopted prefix: the tokens
+    /// landed in rows past it while carrying RoPE positions `0..n`, and
+    /// the answer came back wrong with a 200 on it. That was issue #37,
+    /// and it existed because the batched prefill kept its own copy of
+    /// this number while the private generate loop derived one.
+    ///
+    /// `&mut self` only because [`PagedLease`] exposes its caches
+    /// mutably; nothing here is modified.
+    pub(super) fn positions_written(&mut self) -> usize {
+        match self {
+            RowKv::Contiguous(caches) => caches.first().map_or(0, |c| c.seq_len),
+            RowKv::Paged(lease) => lease.caches_mut().first().map_or(0, |c| c.seq_len()),
+        }
+    }
+}
+
 pub(super) struct Job {
     pub(super) prompt_tokens: Vec<usize>,
     pub(super) params: GenerationParams,

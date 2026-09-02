@@ -168,7 +168,7 @@ Beyond closing the measured gaps.
 - Docker images (CPU, Metal and CUDA variants)
 - Throughput measurement for concurrent continuous-batching requests
   (Metal parallel fix shipped 0.15.2; CB garbled-output fix and Host B
-  serving receipts in 0.15.3 — see
+  serving receipts in 0.15.3, see
   [`plans/metal-parallel-concurrency.md`](plans/metal-parallel-concurrency.md)
   and [`benchmarks/receipts/serving/`](../benchmarks/receipts/serving/))
 - Full KV layer offload, multi-GPU, tensor parallel, PD disaggregation

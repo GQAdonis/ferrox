@@ -149,6 +149,29 @@ The error always names the reason. Six things cause it:
    An architecture reaches it only if there is a benchmark row, a pinned
    logit comparison against real `libllama`, or a fixture; 11 do today
    (`llama`, `qwen2`, `qwen2moe`, `qwen3`, `qwen3moe`, `olmoe`,
+**Gemma-2-27B, Gemma-3-4B/12B/27B: corrected 2026-09-02.** Those four
+sizes were quietly wrong until then, in two ways that both produce
+fluent text. The 27B checkpoints took `1/sqrt(head_dim)` as their
+attention scale where llama.cpp takes `1/sqrt(n_embd/n_head)` for that
+size alone, selected by layer count; and Gemma-3 4B and up applied
+linear RoPE scaling to the sliding-window layers llama.cpp ropes
+unscaled, because `rope_theta` is per layer while `rope_freqs` was
+global. Gemma-3-1B is the one size with no `rope_scaling`, and it was
+the audited fixture, which is why neither was visible.
+
+The evidence is llama.cpp's source and header-driven loader tests, NOT a
+logit comparison: no checkpoint of those sizes exists on the development
+host. A `ferrox parity` run against one is what would settle it.
+
+A cost came with it. Gemma-3 4B and up no longer use the fused Metal
+dense stacks, because those take one `freq_factors` slice for a whole
+run of layers and these models need one per layer. They take the
+per-layer path instead: correct, and slower. No published number
+changes: [`benchmarks/RESULTS.md`](../benchmarks/RESULTS.md) carries
+Gemma-3-1B only, and 1B is neither 27B nor rope-scaled, so it is
+untouched by both corrections. Tracked as
+[#63](https://github.com/antonellof/ferrox/issues/63).
+
    `gemma2`, `gemma3`, `phi3`, `gpt-oss`, `dots1`). The other **46**
    stop with `UnauditedArchitecture`. `FERROX_ALLOW_UNAUDITED_ARCH=1`
    runs one anyway; compare the output against llama.cpp yourself

@@ -132,6 +132,49 @@ impl ContextCeiling {
         })
     }
 
+    /// The typed refusal for a `prompt + max_tokens` that cannot be
+    /// represented at all, or `None` when the sum is a real number.
+    ///
+    /// The wrap was the whole bug in #36. `prompt_tokens +
+    /// params.max_tokens` is a `usize` addition on a value read
+    /// straight off the wire, so `max_tokens: 18446744073709551615`
+    /// produced `prompt_tokens - 1`, which is BELOW any ceiling. The
+    /// clamp that existed to bound this was therefore skipped by
+    /// exactly the requests that needed it most, and the value went on
+    /// to size a `Vec::with_capacity`.
+    ///
+    /// A wrapping sum is refused even when there is NO ceiling
+    /// configured, because it is not a request any deployment could
+    /// serve: no machine holds `usize::MAX` positions. That is the
+    /// derived invariant doing the work rather than a chosen constant.
+    ///
+    /// `saturating_add` would have been the wrong tool. It silently
+    /// clamps a nonsense value into a plausible one and serves it,
+    /// which answers a question the caller did not ask.
+    pub fn overflow_refusal(&self, prompt_tokens: usize, max_tokens: usize) -> Option<DecodeError> {
+        match prompt_tokens.checked_add(max_tokens) {
+            // It fits in a `usize`, so it is a real request. Whether it
+            // fits the CEILING is the clamp's business, and answering
+            // it here would count a clamp as a refusal.
+            Some(_) => None,
+            None => {
+                self.refused.fetch_add(1, Ordering::Relaxed);
+                Some(DecodeError::KvBudgetExceeded {
+                    binding: Ceiling::ContextLength.code(),
+                    estimated_bytes: 0,
+                    limit_bytes: 0,
+                    positions: usize::MAX,
+                    positions_limit: self.limit.unwrap_or(usize::MAX),
+                    detail: format!(
+                        "prompt of {prompt_tokens} tokens plus max_tokens of {max_tokens} \
+                         overflows the position counter, so this request cannot be served by \
+                         any deployment. Send a max_tokens that fits the model's context"
+                    ),
+                })
+            }
+        }
+    }
+
     /// The typed refusal for a request of `positions` positions, or
     /// `None` when it fits.
     ///
@@ -530,5 +573,97 @@ mod tests {
         });
         let derived = derive_limits(&b, 8192, 256).expect("a bounded KV always fits");
         assert_eq!(derived.max_context, 8192);
+    }
+
+    /// **The wrap that skipped the clamp.** `max_tokens` arrives as a
+    /// `usize` straight off an HTTP body, and `prompt + max_tokens` was
+    /// an unchecked addition. At `usize::MAX` it wrapped to
+    /// `prompt - 1`, which is BELOW any ceiling, so the guard that
+    /// existed to bound the value was skipped by exactly the requests
+    /// that needed bounding. The value then went on to size a
+    /// `Vec::with_capacity`.
+    #[test]
+    fn a_max_tokens_that_wraps_the_position_sum_is_refused() {
+        let ceiling = ContextCeiling::new(Some(100), shape());
+        let err = ceiling
+            .overflow_refusal(10, usize::MAX)
+            .expect("usize::MAX must be refused");
+        assert!(
+            format!("{err}").contains("max_tokens"),
+            "the refusal must name the field the caller sent"
+        );
+
+        // This is the comparison that used to let it through: below the
+        // limit, and not a real request.
+        assert!(
+            10usize.wrapping_add(usize::MAX) < 100,
+            "the wrap this refusal exists to catch"
+        );
+    }
+
+    /// A deployment with NO ceiling is the other half of the hole. It
+    /// cannot clamp, so it must still refuse a sum that cannot exist,
+    /// rather than treating "no ceiling" as "unbounded".
+    #[test]
+    fn a_wrapping_sum_is_refused_even_with_no_ceiling_configured() {
+        let ceiling = ContextCeiling::new(None, shape());
+        assert!(
+            ceiling.overflow_refusal(10, usize::MAX).is_some(),
+            "no ceiling is not a licence to accept a request no machine could serve"
+        );
+        assert!(ceiling.overflow_refusal(10, 100).is_none());
+    }
+
+    /// This guard refuses the IMPOSSIBLE, not the merely oversized.
+    ///
+    /// A request past the ceiling is servable and is clamped by the
+    /// caller. Refusing it here would turn a servable long-prompt
+    /// request into a 400 over a `max_tokens` the caller very likely
+    /// never set, and would count a clamp as a refusal in the stats.
+    #[test]
+    fn an_ordinary_request_past_the_ceiling_is_left_for_the_clamp() {
+        let ceiling = ContextCeiling::new(Some(100), shape());
+        assert!(ceiling.overflow_refusal(10, 50).is_none(), "10 + 50 fits");
+        assert!(
+            ceiling.overflow_refusal(10, 200).is_none(),
+            "over the ceiling but representable: the clamp handles it"
+        );
+        assert_eq!(ceiling.refused(), 0, "a clamp is not a refusal");
+    }
+
+    /// **A `max_tokens` that does NOT wrap still reached an overflow**,
+    /// one layer down, while computing the byte count for the refusal
+    /// message. `u64::MAX / 64` positions multiplied past `u64::MAX` in
+    /// `KvShape::kv_bytes_for_tokens` and panicked the request thread.
+    ///
+    /// Sized past the lazy-allocation threshold on purpose: a test at
+    /// `500_000_000` would pass whatever the code does, because a large
+    /// `Vec::with_capacity` is reserved lazily on macOS and the loop
+    /// fails on the first read. `u64::MAX / 64` fails deterministically.
+    #[test]
+    fn a_huge_but_representable_max_tokens_reports_bytes_instead_of_panicking() {
+        let ceiling = ContextCeiling::new(Some(100), shape());
+        // 10 + u64::MAX/64, which is what a 10-token prompt with
+        // `max_tokens: u64::MAX / 64` really produces. Exactly
+        // `u64::MAX / 64` lands just UNDER the overflow and would make
+        // this test pass whatever the code does, which is the same trap
+        // as sizing an allocation test below the lazy-reserve
+        // threshold: the number has to be chosen to fail.
+        let positions = 10 + (u64::MAX / 64) as usize;
+
+        // The byte count saturates rather than overflowing. It is a
+        // reporting number, and "astronomically large" is all the
+        // message needs to convey.
+        // Asserted as "astronomically large" rather than as an exact
+        // number: whether it saturates or merely lands just under
+        // `u64::MAX` depends on the shape, and the property that matters
+        // is that it is produced at all.
+        assert!(ceiling.bytes_for(positions) > u64::MAX / 2);
+
+        // And the refusal it feeds is produced, not panicked through.
+        let err = ceiling
+            .refusal(positions)
+            .expect("far past a 100-position ceiling");
+        assert!(format!("{err}").contains("100"));
     }
 }

@@ -573,9 +573,30 @@ multimodal patch tables and audio codebooks. `token_embd.weight` and
 output head to Q6_K in other mixes is gated on the target not being
 Q8_0.
 
-K-quants, the IQ tiers, MXFP4 and imatrix are not implemented, and each
-is refused by name rather than approximated. Tracked as
+`Q4_K_S` and `Q4_K_M` are also written, with `--pure`. Everything else
+(the remaining K-quants, the IQ tiers, MXFP4, imatrix) is refused by
+name rather than approximated. Tracked as
 [#70](https://github.com/antonellof/ferrox/issues/70).
+
+**Q4_K is not byte-identical to llama.cpp's, and cannot be.** Compared
+tensor by tensor against `llama-quantize --pure`, 113 of 311 tensors
+match exactly and 198 differ in about 0.05% of their bytes. The cause is
+not the algorithm: `ggml-quants.c.o` carries 1957 FMA instructions
+because clang contracts `a*b+c` into a fused multiply-add by default for
+C, and Rust does not, so `quantize_row_q4_K_ref`'s exact output is a
+property of the compiler that built the reference. llama.cpp built with
+contraction off would not reproduce it either. Q8_0 IS byte-identical,
+because its arithmetic has no accumulated multiply-add to contract.
+
+What is equal is the thing that matters. Perplexity of the two files, on
+the same corpus through the same engine: **25.1444** for ferrox's
+against **25.1805** for llama.cpp's, 2.4% of one standard error apart.
+
+One refusal to know about: a tensor whose row width is not a multiple of
+256 stops the run. llama.cpp answers that case by changing the tensor's
+TYPE, to Q5_0 or F16, and ferrox has neither encoder; padding the row
+would shift every following row on decode. SmolLM2-135M cannot be Q4_K
+quantized here for that reason, its embedding being 576 wide.
 
 ## Hugging Face Hub (`download`, `pull`)
 

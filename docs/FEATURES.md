@@ -164,12 +164,18 @@ OpenAI-compatible HTTP API:
   and the six generating routes answer **501 naming the model**, not a
   missing tensor. Pooling comes from the checkpoint's own
   `pooling_type` (NONE / MEAN / CLS / LAST; RANK refuses, it is a
-  classification head rather than a pooling rule, and while
-  `ferrox_models::rank_head` loads one there is no `/v1/rerank` route to
-  reach it yet). A decoder GGUF still
+  classification head rather than a pooling rule, and a rank-head
+  checkpoint belongs on `/v1/rerank` instead). A decoder GGUF still
   pools its hidden states (mean/last) as before, and
   `FERROX_EMBEDDING_MODEL_PATH` runs an encoder side-by-side with a
   generative model in one process
+- Reranking. A `bert` checkpoint carrying a rank head (`cls`,
+  `cls.output`, `cls.norm`, `classifier.output_labels`) is served by
+  `POST /v1/rerank`, scoring `[CLS] query [SEP] document [SEP]` through
+  the head itself rather than through the cosine of two embeddings. Such
+  a checkpoint could not load at all before: `assert_every_tensor_
+  consumed` rejected the `cls.*` tensors nobody read. End-to-end
+  ordering against a real reranker is UNVERIFIED, see issue #43
 - Anthropic Messages: `POST /v1/messages` streaming and buffered
   (thinking and tool blocks, protocol-native `ping` keepalive) plus
   `POST /v1/messages/count_tokens`

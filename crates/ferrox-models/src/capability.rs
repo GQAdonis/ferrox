@@ -492,16 +492,32 @@ const NORM_ROPE_TRIAGED: &[(&str, TriageClass, &str)] = &[
     ("granite-moe", TriageClass::NewCode, GRANITE_MULTIPLIERS),
     (
         "chatglm",
-        TriageClass::FixtureAway,
-        "the one non-llama thing chatglm does is the FUSED gate+up SwiGLU, and that is the \
-         audited phi3 path exactly. src/models/chatglm.cpp:48 sizes `ffn_up` as \
-         `{n_embd, n_ff * 2}` and :128-133 calls build_ffn with a NULL gate and \
-         `LLM_FFN_SWIGLU, LLM_FFN_SEQ` -- the same call shape as phi3.cpp:52 and :144-149, \
-         and `phi3` is in AUDITED_GENERIC_GQA. ferrox handles it without an activation \
-         flag: `load_dense_expert` (loader.rs:1127-1161) finds no `ffn_gate`, takes the \
-         fused branch and splits the tensor into gate and up itself. Everything else \
-         (:41-50, :76-138) is attn_norm, create_tensor_qkv with optional biases, \
-         attn_output, ffn_norm and a sequential residual. Admitting it needs a fixture",
+        TriageClass::OneMatchArm,
+        "the FUSED `attn_qkv.bias`, which is the same arm `qwen` is refused by name for. \
+         This row said FIXTURE-AWAY until an attempt to build the fixture read the \
+         converter: `src/models/chatglm.cpp:42` calls create_tensor_qkv, which prefers a fused \
+         `wqkv` and then creates `wqkv_b` beside it (llama-model.cpp:2890-2892), and \
+         `build_qkv` adds that bias to the fused projection before splitting \
+         (llama-graph.cpp:1607-1610). Every real chatglm checkpoint carries it: ChatGLM2/3 \
+         set `add_qkv_bias: true`, and gguf-py maps \
+         `encoder.layers.{bid}.self_attention.query_key_value` \
+         (tensor_mapping.py:246) to `blk.N.attn_qkv`, so the file holds \
+         `blk.N.attn_qkv.weight` AND `blk.N.attn_qkv.bias`. \
+         `load_qkv_projections` (loader.rs) splits the fused WEIGHT but reads bias only \
+         under the split `attn_q.bias` / `attn_k.bias` / `attn_v.bias` names, so the bias \
+         is dropped and all three projections run unbiased -- the identical sentence this \
+         file already writes for `qwen` and `starcoder`, on an architecture that was not \
+         on that list. Splitting `attn_qkv.bias` by the same row ranges the weight split \
+         already computes closes chatglm and qwen together, and it is one function. \
+         Everything else really is generic and really was read: the FUSED gate+up SwiGLU \
+         (:48, :128-133, `LLM_FFN_SWIGLU, LLM_FFN_SEQ`) is the audited phi3 call shape \
+         (phi3.cpp:52, :144-149) and `load_dense_expert` already takes it; the graph \
+         (:75-145) is a sequential residual with `1/sqrt(n_embd_head)` (:108), NORM RoPE \
+         (llama-model.cpp:2593), no QK-norm, no post-norms and no window; and chatglm is \
+         PARTIAL-rope -- :59-61 asserts only that the K and V head dims agree, NOT that \
+         n_embd_head == n_rot, and `conversion/chatglm.py:151` writes \
+         rope_dimension_count as `head_dim * partial_rotary_factor` (0.5) -- which \
+         `ModelConfig::rope_dim` already implements",
     ),
     (
         "deci",

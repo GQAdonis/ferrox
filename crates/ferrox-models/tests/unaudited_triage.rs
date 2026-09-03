@@ -435,10 +435,16 @@ fn verdicts_disclose_when_an_earlier_refusal_fires_first() {
 #[test]
 fn batch_three_verdicts_are_pinned_to_what_was_read() {
     let cases: &[(&str, TriageClass, &str)] = &[
+        // `chatglm` was FIXTURE-AWAY here. Trying to build its fixture
+        // read the converter and found the fused `attn_qkv.bias` --
+        // present in every real ChatGLM2/3 export, dropped by ferrox,
+        // and the same arm this file already refuses `qwen` by name for.
+        // A verdict that reads as a cheap win and is not one is the
+        // thing this suite exists to stop, so it is ONE MATCH ARM now.
         (
             "chatglm",
-            TriageClass::FixtureAway,
-            "audited phi3 path exactly",
+            TriageClass::OneMatchArm,
+            "the same arm `qwen` is refused by name for",
         ),
         ("deci", TriageClass::NewCode, "PER LAYER"),
         ("olmo", TriageClass::NewCode, "NO norm weights at all"),
@@ -644,7 +650,7 @@ fn every_unaudited_row_is_triaged_and_the_distribution_is_pinned() {
     }
     assert_eq!(
         (fixture, arm, new_code, unknown),
-        (2, 2, 26, 4),
+        (1, 3, 26, 4),
         "the triage distribution moved; if a verdict changed on evidence that is correct, \
          update this and docs/MODELS.md together"
     );

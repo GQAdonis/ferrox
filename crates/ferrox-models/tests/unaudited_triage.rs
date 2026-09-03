@@ -61,13 +61,14 @@ fn every_unaudited_architecture_renders_a_detail_line() {
         assert!(detail.len() > 100, "`{}` renders {detail:?}", p.gguf_name);
     }
     assert_eq!(
-        n, 36,
+        n, 35,
         "the unaudited count moved. It was 47 until the triage itself found `minicpm3` was \
          an MLA model sitting on the generic-GQA row and it was reclassified to \
          DedicatedOnly, 46 until `deepseek`, `bailingmoe`, `seed_oss`, `maincoder` and \
          `hunyuan-moe` were admitted with libllama-golden fixtures, and 41 until \
-         `internlm2`, `xverse`, `ernie4_5`, `baichuan` and `exaone` were admitted with \
-         theirs (`tests/fixture_away_graphs.rs`) -- rows closing is the count going DOWN \
+         `internlm2`, `xverse`, `ernie4_5`, `baichuan`, `exaone` and `bailingmoe2` were \
+         admitted with theirs (`tests/fixture_away_graphs.rs`) -- rows closing is the \
+         count going DOWN \
          for the best reason. Either an architecture was audited or reclassified (good -- \
          update the count and the docs) or one was added (check it was triaged)"
     );
@@ -93,20 +94,13 @@ fn batch_one_verdicts_are_pinned_to_what_was_read() {
         // `internlm2`, `exaone` and `ernie4_5` were HERE, and so were
         // `xverse` and `baichuan` in batch three. All five got their
         // fixture (`tests/fixture_away_graphs.rs`), so they are audited
-        // now and carry no verdict at all --
+        // now and carry no verdict at all. So did `bailingmoe2`, the one
+        // MoE row of the six --
         // `every_verdict_is_attached_to_a_row_that_actually_refuses_as_unaudited`
         // is what stops a stale verdict outliving its refusal. Closing a
         // FIXTURE-AWAY row is the cheapest kind of progress there is and
         // the count going down here is what it looks like.
         //
-        // bailingmoe2.cpp: fused QKV that ferrox splits, per-head QK
-        // norm BEFORE RoPE, sigmoid/softmax read from metadata,
-        // exp_probs_b, shared experts, leading dense -- all implemented.
-        (
-            "bailingmoe2",
-            TriageClass::FixtureAway,
-            "bailingmoe2.cpp is plain GQA",
-        ),
         // --- one match arm: small and nameable -----------------------
         //
         // `seed_oss`, `deepseek` and `hunyuan-moe` were HERE. All three
@@ -264,7 +258,7 @@ fn the_remaining_work_is_counted() {
         .iter()
         .filter(|p| p.triage.is_some())
         .count();
-    assert_eq!(triaged + TRIAGE_PENDING.len(), 36);
+    assert_eq!(triaged + TRIAGE_PENDING.len(), 35);
 }
 
 /// `minicpm3` is refused as an MLA model, not as an unaudited one.
@@ -645,9 +639,9 @@ fn every_unaudited_row_is_triaged_and_the_distribution_is_pinned() {
     }
     assert_eq!(
         (fixture, arm, new_code, unknown),
-        (4, 2, 26, 4),
+        (3, 2, 26, 4),
         "the triage distribution moved; if a verdict changed on evidence that is correct, \
          update this and docs/MODELS.md together"
     );
-    assert_eq!(fixture + arm + new_code + unknown, 36);
+    assert_eq!(fixture + arm + new_code + unknown, 35);
 }

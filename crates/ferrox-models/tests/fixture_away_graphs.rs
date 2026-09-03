@@ -15,6 +15,7 @@
 //! | `ernie4_5` | NORM | `head_dim != n_embd / n_head` |
 //! | `baichuan` | NORM | 32 layers, because llama.cpp picks ALiBi off the layer count |
 //! | `exaone` | NEOX | a tied lm_head, and `head_dim != n_embd / n_head` |
+//! | `bailingmoe2` | NEOX | fused QKV, per-head QK norm before RoPE, sigmoid-gated MoE |
 //!
 //! **Every row was checked against the C on the six facts this repo has
 //! lost at least once**, and every one of the six is asserted below
@@ -44,14 +45,25 @@
 //!    creates `LLM_TENSOR_ATTN_POST_NORM` or `LLM_TENSOR_FFN_POST_NORM`;
 //!    each layer has exactly `attn_norm` and `ffn_norm`, both applied
 //!    BEFORE their branch on a sequential residual.
-//! 6. **QK-norm and its order.** None of the five creates
-//!    `attn_q_norm` / `attn_k_norm`, so there is no ordering question --
-//!    unlike `maincoder` and `hunyuan-moe` next door, which norm after
-//!    RoPE.
+//! 6. **QK-norm and its order.** None of the five DENSE rows creates
+//!    `attn_q_norm` / `attn_k_norm`, so there is no ordering question
+//!    for them. `bailingmoe2` does: `bailingmoe2.cpp:52-53` creates
+//!    per-head norms of width `n_embd_head_k` and :123-135 applies them
+//!    BEFORE `ggml_rope_ext`, the opposite of `maincoder` and
+//!    `hunyuan-moe` next door. Its fixture's norm weights are centred
+//!    near 1.5 so the two orders are far apart, and
+//!    `norming_bailingmoe2_after_rope_instead_of_before_diverges_from_llama_cpp`
+//!    proves it.
 //!
-//! None of the five is MoE, so the gating function and the top-k
-//! renormalisation flag do not arise; `no_row_here_is_moe` pins that
-//! rather than leaving it implied.
+//! The MoE half of the checklist -- the gating function, and whether the
+//! top-k weights are renormalised after selection -- arises for
+//! `bailingmoe2` alone. Both are REQUIRED-or-read metadata keys there
+//! (`bailingmoe2.cpp:10-11`), the fixture carries both, and
+//! `bailingmoe2_reads_its_routing_out_of_the_file_rather_than_guessing`
+//! asserts what they resolved to. It matters because ferrox's
+//! architecture-name fallback would default this row to SOFTMAX. For
+//! the five dense rows the question does not arise at all, and
+//! `only_bailingmoe2_is_moe` pins that rather than leaving it implied.
 //!
 //! **Where the numbers come from.** Each `GOLDEN` array was produced by
 //! running llama.cpp's own graph for that architecture over the same
@@ -76,7 +88,24 @@ use common::{
     assert_all_three_paths_match, graph_caches, graph_fixture_path, load_graph_fixture, worst_vs,
     GRAPH_PROMPT,
 };
+use ferrox_models::capability::QkNormStyle;
 use ferrox_models::{Decoder, ModelConfig, RopeLayout};
+use ferrox_moe::GatingFunction;
+
+/// The rows whose llama.cpp graph has no QK-norm, no post-norms, no
+/// window and no experts. Named once so the four checklist tests below
+/// cannot drift apart about who is in the set.
+const DENSE_ROWS: [&str; 5] = ["internlm2", "xverse", "ernie4_5", "baichuan", "exaone"];
+
+/// Every row this suite admits, dense and MoE alike.
+const ALL_ROWS: [&str; 6] = [
+    "internlm2",
+    "xverse",
+    "ernie4_5",
+    "baichuan",
+    "exaone",
+    "bailingmoe2",
+];
 
 // --- internlm2 -----------------------------------------------------
 //
@@ -486,6 +515,189 @@ fn the_exaone_fixture_ships_no_output_weight_and_ties_the_lm_head() {
     assert!(file.find_tensor("token_embd.weight").is_some());
 }
 
+// --- bailingmoe2 (Ling-2.0) -----------------------------------------
+//
+// The one MoE row in this batch, and the only one with a QK-norm.
+// `src/models/bailingmoe2.cpp`: a FUSED `attn_qkv` (:49) that
+// `load_qkv_projections` splits by the same arithmetic
+// `llm_graph_context::build_qkv` uses, per-head `attn_q_norm` /
+// `attn_k_norm` of width `n_embd_head_k` (:52-53) applied BEFORE RoPE
+// (:123-135), leading dense layers that :57 really does branch on,
+// `exp_probs_b` (:61), a shared expert `n_ff_shexp * n_expert_shared`
+// wide (:58), and `expert_weights_norm` / `expert_weights_scale` /
+// `expert_gating_func` all read from METADATA (:9-11) rather than
+// hardcoded. Sequential residual (:149, :191).
+//
+// It is NOT `bailingmoe`, which is a NORM-RoPE row admitted earlier for
+// the opposite reason: that one reads `leading_dense_block_count` and
+// then never branches on it.
+
+const BAILINGMOE2_GOLDEN: [f32; 48] = [
+    -0.09195735,
+    0.124805875,
+    0.02403112,
+    0.33854562,
+    -0.3279288,
+    0.0605181,
+    0.34822923,
+    -0.00276571,
+    0.106965765,
+    -0.1772596,
+    -0.25497413,
+    0.32685977,
+    0.37302768,
+    -0.13560869,
+    -0.096370846,
+    -0.44192657,
+    0.15269074,
+    0.32532498,
+    -0.11355774,
+    -0.008084873,
+    0.3309023,
+    -0.3946235,
+    0.018904123,
+    -0.018048527,
+    -0.1964149,
+    -0.05105628,
+    0.42756924,
+    -0.18849637,
+    0.40864584,
+    -0.11983519,
+    -0.103815354,
+    0.21823177,
+    0.26624107,
+    0.18969972,
+    0.38225642,
+    -0.048707068,
+    0.9169096,
+    -0.49677095,
+    -0.0034501795,
+    0.261436,
+    0.08845875,
+    -0.449533,
+    -0.19524488,
+    0.17076917,
+    -0.31562522,
+    -0.54570425,
+    0.36975017,
+    -0.4732991,
+];
+
+#[test]
+fn bailingmoe2_matches_llama_cpp_on_all_three_paths() {
+    assert_all_three_paths_match("bailingmoe2", &BAILINGMOE2_GOLDEN);
+}
+
+/// The routing facts come out of the FILE, not out of an
+/// architecture-name guess.
+///
+/// This is the assertion that matters most on this row.
+/// `bailingmoe2.cpp:11` reads `expert_gating_func` as REQUIRED and the
+/// real models are sigmoid-gated, while ferrox's fallback
+/// (`SIGMOID_GATING_ARCHITECTURES` in `loader.rs`) does NOT list
+/// `bailingmoe2` and would default it to softmax. So the file's key is
+/// the only thing standing between this row and the wrong scoring
+/// function on every token -- the `deepseek` shape again, and worth
+/// pinning by name rather than trusting the logit comparison to notice.
+#[test]
+fn bailingmoe2_reads_its_routing_out_of_the_file_rather_than_guessing() {
+    let path = graph_fixture_path("bailingmoe2");
+    let file = ferrox_gguf::GgufFile::open(&path).expect("opens");
+    // The keys really are in the file; otherwise this proves nothing
+    // about reading them.
+    assert!(
+        file.metadata_u64("bailingmoe2.expert_gating_func")
+            .is_some(),
+        "the fixture must carry the key it is being read from"
+    );
+    let d = load_graph_fixture("bailingmoe2");
+    assert_eq!(
+        d.config.moe.gating,
+        GatingFunction::Sigmoid,
+        "bailingmoe2.cpp:11 reads this from the file; ferrox's name-based fallback would \
+         have said softmax"
+    );
+    assert!(
+        d.config.moe.norm_topk_prob,
+        "expert_weights_norm is true in this file (bailingmoe2.cpp:10 reads it)"
+    );
+    assert_eq!(d.config.moe.expert_weights_scale, 2.5);
+    assert_eq!(d.config.moe.n_experts, 6);
+    assert_eq!(d.config.moe.n_experts_active, 2);
+    assert_eq!(d.config.moe.n_shared_experts, 2);
+    // Honoured here, unlike `bailingmoe`.
+    assert!(d.config.layer_is_dense(0));
+    assert!(!d.config.layer_is_dense(1));
+    assert!(!d.config.layer_is_dense(2));
+    // Fused QKV split, per-head QK norm, and the shared expert's width
+    // is n_ff_shexp * n_expert_shared = 8 * 2, not 8.
+    assert_eq!(d.config.qk_norm_style, QkNormStyle::PerHead);
+    for (il, layer) in d.layers.iter().enumerate() {
+        assert_eq!(
+            layer.attn.q_norm.as_ref().map(Vec::len),
+            Some(d.config.head_dim),
+            "blk.{il}: per-head Q norm"
+        );
+        if il == 0 {
+            continue;
+        }
+        assert_eq!(layer.moe.shared_experts.len(), 1, "blk.{il}");
+        assert_eq!(layer.moe.shared_experts[0].gate.rows(), 16, "blk.{il}");
+        assert!(layer.moe.exp_probs_bias.is_some(), "blk.{il}");
+    }
+}
+
+/// Routing through the wrong scoring function is a visible error, not a
+/// rounding one.
+///
+/// Without this the golden comparison could pass under either gating
+/// function for a fixture whose router happened to pick the same two
+/// experts with near-equal weights, and the fact the test above pins
+/// would be untested rather than merely unasserted.
+#[test]
+fn routing_bailingmoe2_through_softmax_instead_of_sigmoid_diverges_from_llama_cpp() {
+    let path = graph_fixture_path("bailingmoe2");
+    let file = ferrox_gguf::GgufFile::open(&path).expect("opens");
+    let mut config = ModelConfig::from_gguf(&file).expect("parses");
+    config.moe.gating = GatingFunction::Softmax;
+    let d = Decoder::from_gguf(&path, config).expect("loads");
+    let mut kv = graph_caches(&d);
+    let worst = worst_vs(
+        &d.forward_batch_last(&GRAPH_PROMPT, 0, &mut kv),
+        &BAILINGMOE2_GOLDEN,
+    );
+    assert!(
+        worst > 1e-3,
+        "softmax gating changed the output by only {worst}; the fixture cannot see this"
+    );
+}
+
+/// QK norm on the wrong side of RoPE is a large divergence here too.
+///
+/// `bailingmoe2` norms BEFORE rotating; `maincoder` and `hunyuan-moe`
+/// norm after. One `Decoder` flag decides it for all three, so the
+/// fixture has to be able to see the flip in this direction as well as
+/// the other.
+#[test]
+fn norming_bailingmoe2_after_rope_instead_of_before_diverges_from_llama_cpp() {
+    let mut d = load_graph_fixture("bailingmoe2");
+    assert!(
+        !d.qk_norm_after_rope,
+        "bailingmoe2.cpp:123-135 norms Q and K and only then rotates them"
+    );
+    d.qk_norm_after_rope = true;
+    let mut kv = graph_caches(&d);
+    let worst = worst_vs(
+        &d.forward_batch_last(&GRAPH_PROMPT, 0, &mut kv),
+        &BAILINGMOE2_GOLDEN,
+    );
+    assert!(
+        worst > 1e-2,
+        "swapping the QK-norm order moved the output by only {worst}; \
+         the fixture cannot see this arm"
+    );
+}
+
 // --- the six facts, asserted rather than assumed --------------------
 
 /// Fact 1: the RoPE variant each row resolves to is the group llama.cpp
@@ -500,6 +712,7 @@ fn the_rope_variant_each_architecture_uses_is_the_one_llama_cpp_uses() {
         ("baichuan", RopeLayout::Norm),
         // ... and the NEOX group.
         ("exaone", RopeLayout::Neox),
+        ("bailingmoe2", RopeLayout::Neox),
     ] {
         assert_eq!(
             load_graph_fixture(name).config.rope_layout,
@@ -523,6 +736,7 @@ fn rotating_the_wrong_pairs_diverges_from_llama_cpp() {
         ("ernie4_5", &ERNIE4_5_GOLDEN),
         ("baichuan", &BAICHUAN_GOLDEN),
         ("exaone", &EXAONE_GOLDEN),
+        ("bailingmoe2", &BAILINGMOE2_GOLDEN),
     ] {
         let path = graph_fixture_path(name);
         let file = ferrox_gguf::GgufFile::open(&path).expect("opens");
@@ -542,26 +756,26 @@ fn rotating_the_wrong_pairs_diverges_from_llama_cpp() {
     }
 }
 
-/// Facts 2, 3, 4, 5 and 6: no sliding window, no attention-scale
-/// override, no post-norms and no QK-norm, on any layer of any of the
-/// five.
+/// Facts 2, 3, 4 and 5, on EVERY row: no sliding window, no
+/// attention-scale override and no post-norms.
 ///
 /// Each of these has been lost at least once here by a copied decode
-/// path, and each is absent from all five llama.cpp graphs, so the
+/// path, and each is absent from all six llama.cpp graphs, so the
 /// assertion is that ferrox resolved them to absent rather than to
 /// something plausible.
 #[test]
-fn none_of_these_rows_has_a_scale_override_a_post_norm_or_a_qk_norm() {
-    for name in ["internlm2", "xverse", "ernie4_5", "baichuan", "exaone"] {
+fn no_row_here_has_a_window_a_scale_override_or_a_post_norm() {
+    for name in ALL_ROWS {
         let d = load_graph_fixture(name);
-        // Fact 3: all five pass a literal 1/sqrt(head_dim) to
-        // build_attn and read no LLM_KV_ATTENTION_SCALE, so the
-        // kernels' own scale must stand.
+        // Fact 3: every one of the six passes a literal
+        // 1/sqrt(head_dim) to build_attn and reads no
+        // LLM_KV_ATTENTION_SCALE, so the kernels' own scale must stand.
         assert!(
             d.config.attention_scale.is_none(),
             "{name}: attention_scale must stay unset"
         );
-        // Fact 2: none reads LLM_KV_ATTENTION_SLIDING_WINDOW.
+        // Fact 2: none reads LLM_KV_ATTENTION_SLIDING_WINDOW, so there
+        // is no window and therefore no pattern phase to get wrong.
         assert!(d.config.sliding_window.is_none(), "{name}: sliding window");
         for (il, layer) in d.layers.iter().enumerate() {
             // Facts 4 and 5.
@@ -573,7 +787,22 @@ fn none_of_these_rows_has_a_scale_override_a_post_norm_or_a_qk_norm() {
                 layer.attn.post_ffn_norm.is_none(),
                 "{name} blk.{il}: no LLM_TENSOR_FFN_POST_NORM upstream"
             );
-            // Fact 6.
+        }
+    }
+}
+
+/// Fact 6, for the five rows where it is an ABSENCE.
+///
+/// `bailingmoe2` is excluded because it genuinely has per-head QK norm,
+/// and its ordering is pinned by its own two tests above. Splitting the
+/// set this way rather than writing an inline name comparison is
+/// deliberate: the membership lives in one const the checklist tests
+/// share.
+#[test]
+fn the_dense_rows_have_no_qk_norm_and_therefore_no_ordering_question() {
+    for name in DENSE_ROWS {
+        let d = load_graph_fixture(name);
+        for (il, layer) in d.layers.iter().enumerate() {
             assert!(
                 layer.attn.q_norm.is_none() && layer.attn.k_norm.is_none(),
                 "{name} blk.{il}: no attn_q_norm/attn_k_norm upstream, so no ordering \
@@ -583,15 +812,15 @@ fn none_of_these_rows_has_a_scale_override_a_post_norm_or_a_qk_norm() {
     }
 }
 
-/// The MoE half of the checklist does not arise, and that is a fact
-/// about the files rather than an omission.
+/// The MoE half of the checklist arises for exactly one row, and that
+/// is a fact about the files rather than an omission.
 ///
 /// Stated as an assertion because "we did not check the gating function"
 /// and "there is no gating function" read identically in a commit
 /// message.
 #[test]
-fn no_row_here_is_moe() {
-    for name in ["internlm2", "xverse", "ernie4_5", "baichuan", "exaone"] {
+fn only_bailingmoe2_is_moe() {
+    for name in DENSE_ROWS {
         let d = load_graph_fixture(name);
         assert_eq!(
             d.config.moe.n_experts, 1,
@@ -599,4 +828,9 @@ fn no_row_here_is_moe() {
         );
         assert_eq!(d.config.moe.n_shared_experts, 0, "{name}");
     }
+    let moe = load_graph_fixture("bailingmoe2");
+    assert!(
+        moe.config.moe.n_experts > 1,
+        "bailingmoe2 is the row the MoE questions are asked of"
+    );
 }

@@ -314,6 +314,17 @@ pub const AUDITED_GENERIC_GQA: &[&str] = &[
     // tied lm_head. NOT `exaone4` (no pre-norms) and NOT `exaone-moe`
     // (no RoPE on the full-attention layers); both stay refusing.
     "exaone",
+    // `bailingmoe2` (bailingmoe2.cpp:23-87,111-198): Ling-2.0. The one
+    // MoE row in this batch, so the two MoE facts do arise and both are
+    // asserted: SIGMOID gating, read from the file's REQUIRED
+    // `expert_gating_func` (:11) against ferrox's softmax default, and
+    // `expert_weights_norm` (:10), also read from the file. Its shared
+    // expert is `n_ff_shexp * n_expert_shared` wide (:58), not
+    // `n_ff_shexp`. Per-head QK norm BEFORE RoPE (:123-135), fused
+    // attn_qkv, leading dense layers that llama.cpp really does branch
+    // on (:57) -- unlike `bailingmoe`, which reads the same key and
+    // ignores it.
+    "bailingmoe2",
 ];
 
 /// Is this architecture's use of the shared generic path backed by
@@ -629,20 +640,6 @@ const NEOX_ROPE_TRIAGED: &[(&str, TriageClass, &str)] = &[
          matter and are refused by name by the unread-tensor gate",
     ),
     (
-        "bailingmoe2",
-        TriageClass::FixtureAway,
-        "src/models/bailingmoe2.cpp is plain GQA on the generic path: attn_norm (:47), a \
-         FUSED attn_qkv (:49) that load_qkv_projections already splits, per-head \
-         attn_q_norm/attn_k_norm ({n_embd_head_k}, :52-53) applied BEFORE RoPE (:123-135) the \
-         way ferrox applies them, ffn_norm (:55), leading dense layers (:57), exp_probs_b \
-         (:61), shared experts (:67-69), and expert_weights_norm / expert_weights_scale / \
-         expert_gating_func all read from METADATA (:9-11) rather than hardcoded, which \
-         loader.rs reads too. Sequential residual (:149,191). What is missing is EVIDENCE. \
-         Caveat, and it fails closed: a checkpoint that ships the last n_layer_nextn layers' \
-         NEXTN and layer_out_norm tensors (:78-84) is refused by name by the unread-tensor \
-         gate",
-    ),
-    (
         "mellum",
         TriageClass::NewCode,
         "two per-layer RoPE variants in one model. src/models/mellum.cpp:128-142 runs the \
@@ -952,11 +949,13 @@ pub fn architecture_catalog() -> &'static [ArchProfile] {
             // norm slot.
             "hunyuan-moe",
             "seed_oss",
-            // Was FIXTURE-AWAY and now has the fixture
+            // Were FIXTURE-AWAY and now have the fixture
             // (`tests/fixture_away_graphs.rs`). EXAONE 3.x only:
             // `exaone4` and `exaone-moe` are different graphs and stay
-            // in `NEOX_ROPE_TRIAGED` below.
+            // in `NEOX_ROPE_TRIAGED` below. `bailingmoe2` is Ling-2.0
+            // and is unrelated to the NORM-RoPE `bailingmoe` row above.
             "exaone",
+            "bailingmoe2",
         ] {
             v.push(gqa_neox(n));
         }
@@ -2308,13 +2307,13 @@ mod audit_tests {
             }
         }
         assert!(
-            seen == 36,
+            seen == 35,
             "every unaudited generic architecture is triaged; found {seen}. \
              It was 47 until the triage found `minicpm3` was an MLA model on the \
              generic-GQA row and it moved to DedicatedOnly, 46 until five ONE MATCH ARM \
              rows -- deepseek, bailingmoe, seed_oss, maincoder, hunyuan-moe -- were admitted \
-             with libllama-golden fixtures, and 41 until five FIXTURE-AWAY rows -- \
-             internlm2, xverse, ernie4_5, baichuan, exaone -- got theirs \
+             with libllama-golden fixtures, and 41 until six FIXTURE-AWAY rows -- \
+             internlm2, xverse, ernie4_5, baichuan, exaone, bailingmoe2 -- got theirs \
              (tests/fixture_away_graphs.rs)"
         );
     }
@@ -2323,7 +2322,10 @@ mod audit_tests {
     /// classes must not read the same, which is the defect being fixed.
     #[test]
     fn the_refusal_detail_distinguishes_the_classes() {
-        let fixture = unaudited_refusal_detail("bailingmoe2");
+        // `gemma` (v1), not `bailingmoe2`: that one was FIXTURE-AWAY
+        // here until it got its fixture (`tests/fixture_away_graphs.rs`)
+        // and is audited now, so it renders no detail at all.
+        let fixture = unaudited_refusal_detail("gemma");
         let arm = unaudited_refusal_detail("ernie4_5-moe");
         let new_code = unaudited_refusal_detail("olmo2");
         // TRIAGE_PENDING is empty now that all 47 are read, so the

@@ -99,7 +99,7 @@ pub(crate) fn load_and_tokenize(
     prompt_tokens: Option<usize>,
 ) -> anyhow::Result<(Decoder, Vec<usize>, Option<usize>)> {
     let file = ShardedGguf::open(path)?;
-    let config = ModelConfig::from_gguf(&file).context("reading model config")?;
+    let mut config = ModelConfig::from_gguf(&file).context("reading model config")?;
     let tokenizer = match file.metadata_str("tokenizer.ggml.model") {
         Some("gpt2" | "gemma4") => Tok::Bpe(Box::new(GgufBpeTokenizer::from_gguf(&file)?)),
         Some("llama") => Tok::Spm(GgufSpmTokenizer::from_gguf(&file)?),
@@ -112,8 +112,6 @@ pub(crate) fn load_and_tokenize(
     let bos = file
         .metadata_u64("tokenizer.ggml.bos_token_id")
         .map(|v| v as usize);
-
-    let decoder = Decoder::from_gguf(path, config)?;
 
     let mut tokens = tokenizer.encode(prompt);
     if ferrox_models::tokenizer::should_add_bos_token(&file) {
@@ -129,6 +127,14 @@ pub(crate) fn load_and_tokenize(
     if let Some(want) = prompt_tokens {
         tokens = stretch_prompt(tokens, want, bos)?;
     }
+
+    // Match `tools/llama_logits.c`: the reference sets `n_ctx = n_tokens + 8`.
+    // LongRoPE checkpoints (Phi-4) pick short vs long `rope_factors_*` from
+    // the run context, not the file's trained context_length — skipping this
+    // made parity apply the long set while llama.cpp applied the short one.
+    config.apply_runtime_context(tokens.len() + 8);
+
+    let decoder = Decoder::from_gguf(path, config)?;
 
     Ok((decoder, tokens, eos))
 }
@@ -205,6 +211,20 @@ mod tests {
             stretch_prompt(vec![1, 4, 5], 3, Some(1)).unwrap(),
             vec![1, 4, 5]
         );
+    }
+
+    /// Parity and verify share `load_and_tokenize`; LongRoPE must pick
+    /// short factors at small `n_ctx`, not the file's trained length.
+    #[test]
+    fn parity_context_size_is_tokens_plus_eight() {
+        let mut c = ferrox_models::config::test_dense_fixture();
+        c.rope_orig_ctx = Some(4096);
+        c.rope_freqs_short = Some(vec![1.0; 48]);
+        c.rope_freqs_long = Some((0..48).map(|i| 1.0 + i as f32).collect());
+        c.rope_freqs = None;
+        // Five prompt tokens + 8, same as llama_logits.c for a 5-token run.
+        c.apply_runtime_context(5 + 8);
+        assert_eq!(c.rope_freqs.as_ref().unwrap().full[1], 1.0);
     }
 
     #[test]

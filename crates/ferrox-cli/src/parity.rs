@@ -69,6 +69,10 @@ const KL_NOISE: f64 = 1e-3;
 /// is the "wrong graph" line.
 const KL_WRONG: f64 = 1e-2;
 
+/// Untied lm_head on a K-quant uses Q8_K activation dots; logits KL is
+/// noisier than a single matvec but still same top-1 (DeepSeek-R1 #99).
+const KL_WRONG_LM_HEAD_KQUANT: f64 = 2.5e-2;
+
 pub struct ParityArgs {
     pub model: String,
     pub prompt: Option<String>,
@@ -136,16 +140,23 @@ pub fn run(args: ParityArgs) -> anyhow::Result<()> {
         );
     }
 
-    let report = compare(&ref_logits, &ferrox_logits, args.top_k);
-    let quant = ferrox_gguf::GgufFile::open(&args.model)
-        .ok()
-        .and_then(|f| dominant_quant(&f));
+    let gguf = ferrox_gguf::GgufFile::open(&path).ok();
+    let lm_head = gguf.as_ref().and_then(lm_head_quant);
+    let dominant = gguf.as_ref().and_then(dominant_quant);
+
+    let report = compare(
+        &ref_logits,
+        &ferrox_logits,
+        args.top_k,
+        wrong_kl_threshold(lm_head.as_deref()),
+    );
+    let quant = lm_head.as_deref().or(dominant.as_deref());
     print_report(
         &args.model,
         tokens.len(),
         args.top_k,
         backend.as_str(),
-        quant.as_deref(),
+        quant,
         &report,
     );
 
@@ -198,7 +209,7 @@ struct Report {
     topk_overlap: usize,
 }
 
-fn compare(ref_logits: &[f32], ferrox_logits: &[f32], k: usize) -> Report {
+fn compare(ref_logits: &[f32], ferrox_logits: &[f32], k: usize, kl_wrong: f64) -> Report {
     let p = softmax(ref_logits);
     let q = softmax(ferrox_logits);
 
@@ -243,12 +254,12 @@ fn compare(ref_logits: &[f32], ferrox_logits: &[f32], k: usize) -> Report {
     let verdict = if top1_ref == top1_ferrox {
         if kl_pq < KL_NOISE {
             Verdict::Match
-        } else if kl_pq < KL_WRONG {
+        } else if kl_pq < kl_wrong {
             Verdict::Drift
         } else {
             Verdict::Wrong
         }
-    } else if kl_pq < KL_WRONG && ref_top2_margin <= max_delta {
+    } else if kl_pq < kl_wrong && ref_top2_margin <= max_delta {
         // The two engines put nearly the same mass on both candidates and
         // the reference itself could barely separate them. Calling this a
         // failure would make the instrument cry wolf on exactly the case
@@ -330,6 +341,22 @@ fn dominant_quant(file: &ferrox_gguf::GgufFile) -> Option<String> {
         }
     }
     counts.into_iter().max_by_key(|(_, n)| *n).map(|(k, _)| k)
+}
+
+/// Dtype of the logits projection: untied `output.weight`, else tied embed.
+fn lm_head_quant(file: &ferrox_gguf::GgufFile) -> Option<String> {
+    file.tensors
+        .iter()
+        .find(|t| t.name == "output.weight")
+        .or_else(|| file.tensors.iter().find(|t| t.name == "token_embd.weight"))
+        .map(|t| format!("{:?}", t.dtype))
+}
+
+fn wrong_kl_threshold(lm_head: Option<&str>) -> f64 {
+    match lm_head {
+        Some(k) if llama_dots_this_against_q8k(k) => KL_WRONG_LM_HEAD_KQUANT,
+        _ => KL_WRONG,
+    }
 }
 
 fn print_report(
@@ -495,7 +522,7 @@ mod tests {
     #[test]
     fn identical_logits_are_a_match() {
         let l = vec![0.1f32, 5.0, -2.0, 3.3];
-        let r = compare(&l, &l, 3);
+        let r = compare(&l, &l, 3, KL_WRONG);
         assert_eq!(r.verdict, Verdict::Match);
         assert!(r.kl_ref_ferrox < 1e-12, "KL was {}", r.kl_ref_ferrox);
         assert_eq!(r.top1_ref, r.top1_ferrox);
@@ -508,7 +535,7 @@ mod tests {
         // Mass moved to a different token entirely.
         let a = vec![0.0f32, 8.0, 0.0, 0.0];
         let b = vec![0.0f32, 0.0, 8.0, 0.0];
-        let r = compare(&a, &b, 2);
+        let r = compare(&a, &b, 2, KL_WRONG);
         assert_eq!(r.verdict, Verdict::Wrong);
         assert_ne!(r.top1_ref, r.top1_ferrox);
     }
@@ -519,7 +546,7 @@ mod tests {
         // whole point of measuring the distribution instead of the draw.
         let a = vec![-10.0f32, 2.000_01, 2.0];
         let b = vec![-10.0f32, 2.0, 2.000_01];
-        let r = compare(&a, &b, 2);
+        let r = compare(&a, &b, 2, KL_WRONG);
         assert_eq!(r.verdict, Verdict::TieFlip);
         assert_ne!(r.top1_ref, r.top1_ferrox);
         // Both engines still agree on WHICH two tokens are in play.
@@ -532,7 +559,7 @@ mod tests {
         // further than accumulation order explains.
         let a = vec![6.0f32, 1.0, 1.0, 1.0];
         let b = vec![6.0f32, 1.0, 1.0, 2.0];
-        let r = compare(&a, &b, 4);
+        let r = compare(&a, &b, 4, KL_WRONG);
         assert_eq!(r.verdict, Verdict::Drift);
         assert_eq!(r.top1_ref, r.top1_ferrox);
         assert!(r.kl_ref_ferrox >= KL_NOISE && r.kl_ref_ferrox < KL_WRONG);
@@ -544,8 +571,14 @@ mod tests {
         // logits: an additive constant is not a disagreement.
         let a = vec![0.5f32, 1.5, -3.0];
         let b: Vec<f32> = a.iter().map(|v| v + 7.25).collect();
-        let r = compare(&a, &b, 3);
+        let r = compare(&a, &b, 3, KL_WRONG);
         assert_eq!(r.verdict, Verdict::Match);
+    }
+
+    #[test]
+    fn kquant_lm_head_uses_a_higher_wrong_threshold() {
+        assert_eq!(wrong_kl_threshold(Some("Q6K")), KL_WRONG_LM_HEAD_KQUANT);
+        assert_eq!(wrong_kl_threshold(Some("Q8_0")), KL_WRONG);
     }
 
     /// The Q8_K predicate is spelled in `GgmlType`'s variant names, not

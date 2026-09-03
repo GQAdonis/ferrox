@@ -670,12 +670,11 @@ impl ModelConfig {
         // present, else `rope_long` when the run's context exceeds
         // `rope.scaling.original_context_length`, else `rope_short`).
         //
-        // The selection here uses the checkpoint's own advertised context
-        // length, which is what llama.cpp defaults `n_ctx` to. A run that
-        // caps the context below `original_context_length` should use the
-        // short set; ferrox's config is built before the context size is
-        // known, so that case is not yet handled -- recorded as a
-        // best-effort field rather than silently assumed correct.
+        // Provisional pick from the checkpoint's advertised context length
+        // (llama.cpp's default `n_ctx`). The definitive pick happens in
+        // `ModelConfig::apply_runtime_context`, called from `ferrox run`
+        // (`--ctx-size`) and from `verify_engine::load_and_tokenize`
+        // (`n_tokens + 8`, matching `tools/llama_logits.c`).
         let rope_orig_ctx = metadata_u64_any(file, &[key("rope.scaling.original_context_length")])
             .map(|v| v as usize);
         // `rope_freqs.weight` outranks the LongRoPE pair (llama.cpp

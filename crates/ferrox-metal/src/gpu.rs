@@ -6569,9 +6569,7 @@ pub fn launch_moe_prefill_q4_0(
         let mm_id_tpe_buf: &ProtocolObject<dyn MTLBuffer> = scratch.mm_id_tpe.as_ref();
         let mm_id_ids_buf: &ProtocolObject<dyn MTLBuffer> = scratch.mm_id_ids.as_ref();
 
-        let cmd_buf = queue
-            .commandBuffer()
-            .ok_or(MetalError::CommandFailed)?;
+        let cmd_buf = queue.commandBuffer().ok_or(MetalError::CommandFailed)?;
 
         if use_mm_id {
             // Resolve weights and pipeline names before opening an encoder.

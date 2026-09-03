@@ -38,6 +38,12 @@ One item has a written **verdict** rather than a design:
   carries the survey of the backend seam a third backend would need,
   which is `backend-seam-refactor`'s to-do list.
 
+Parity inventory and deltas against llama.cpp:
+
+- **[`llama-cpp-gap-inventory.md`](llama-cpp-gap-inventory.md)** — evidence-backed differential (not a plan)
+- **[`llama-cpp-full-parity-audit-2026-09-02.md`](llama-cpp-full-parity-audit-2026-09-02.md)** — file map + sweep + priority plan
+- **[`llama-cpp-parity-update-2026-09-03.md`](llama-cpp-parity-update-2026-09-03.md)** — post-merge delta (Qwen MoE Metal, Phi-4 LongRoPE, sweep)
+
 Everything else is history: [`archive/`](archive/) holds the five plans
 whose items were merged into the roadmap, [`on-hold/`](on-hold/) holds
 work ranked below the goal with the condition that brings it back, and

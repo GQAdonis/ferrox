@@ -314,6 +314,21 @@ pub const AUDITED_GENERIC_GQA: &[&str] = &[
     // tied lm_head. NOT `exaone4` (no pre-norms) and NOT `exaone-moe`
     // (no RoPE on the full-attention layers); both stay refusing.
     "exaone",
+    // `plamo3` (plamo3.cpp:3-60,91-193): the sandwich-norm row, and the
+    // only one here with a sliding window. Its verdict was FIXTURE-AWAY
+    // and was WRONG by one tensor name: plamo3 is the sole architecture
+    // upstream that creates ATTN_POST_NORM / FFN_POST_NORM through the
+    // two-argument `tn` overload (:52,55), so it asks for
+    // `blk.N.post_attention_norm` and `blk.N.post_ffw_norm` with NO
+    // `.weight`, and gguf-py emits exactly those names for it. ferrox
+    // read only the suffixed spelling; `load_norm_vec_either_spelling`
+    // in loader.rs now reads both, and says why.
+    //
+    // Its SWA is a real pattern with a real phase -- period from
+    // `attention.sliding_window_pattern`, `dense_first = false` from
+    // `set_swa_pattern`'s default -- and the fixture sets a window
+    // narrower than the prompt so the mask actually bites.
+    "plamo3",
     // `bailingmoe2` (bailingmoe2.cpp:23-87,111-198): Ling-2.0. The one
     // MoE row in this batch, so the two MoE facts do arise and both are
     // asserted: SIGMOID gating, read from the file's REQUIRED
@@ -681,26 +696,6 @@ const NEOX_ROPE_TRIAGED: &[(&str, TriageClass, &str)] = &[
          already has",
     ),
     (
-        "plamo3",
-        TriageClass::FixtureAway,
-        "PLaMo-3 is the sandwich-norm shape ferrox already implements, and this one really \
-         does line up slot for slot. src/models/plamo3.cpp:46-58 creates attn_norm, a FUSED \
-         attn_qkv (:47) that load_qkv_projections splits, per-head attn_q_norm/attn_k_norm \
-         (:49-50) applied BEFORE RoPE (:128-137), attn_post_norm (:52), ffn_norm (:54), \
-         ffn_post_norm (:55) and a fused SwiGLU ffn_up of `n_ff * 2` (:57) driven by \
-         `LLM_FFN_SWIGLU, LLM_FFN_SEQ` (:168) -- the audited phi3 path. The graph applies \
-         the post-norms exactly where ferrox does: attn_post_norm to the attention branch \
-         before the residual add (:152-155) and ffn_post_norm to the FFN output before its \
-         add (:171-174). Its SWA uses a scalar sliding_window_pattern that \
-         conversion/plamo.py's Plamo3Model writes verbatim (:176-177), and \
-         `default_swa_layout` already carries plamo3 as period 8. Plamo3Model also inherits \
-         TextModel's scalar head_count / key_length / value_length, so the per-layer \
-         `hparams.n_head(i)` accessors in the graph are uniform -- unlike deci, laguna and \
-         openelm, whose converters really do write arrays. CONFIRM ON THE FIXTURE: that \
-         attention.key_length equals attention.value_length, since llama.cpp carries \
-         head_dim_q and head_dim_v separately (:25-26) and ferrox has one head_dim",
-    ),
-    (
         "afmoe",
         TriageClass::NewCode,
         "gated attention plus NoPE layers. src/models/afmoe.cpp:73 creates `wqkv_gate` \
@@ -956,6 +951,7 @@ pub fn architecture_catalog() -> &'static [ArchProfile] {
             // and is unrelated to the NORM-RoPE `bailingmoe` row above.
             "exaone",
             "bailingmoe2",
+            "plamo3",
         ] {
             v.push(gqa_neox(n));
         }
@@ -1870,10 +1866,14 @@ pub fn default_swa_layout(arch: &str) -> Option<SwaPattern> {
         // with n_swa = 128, so without this every layer ran with a
         // 128-token history.
         "exaone-moe" => last_dense(4),
-        // src/models/afmoe.cpp:17, plamo3.cpp:9. Both refuse for other
-        // reasons today, so these are latent rather than live, and
-        // pinned here so they stay right if that changes.
+        // src/models/afmoe.cpp:17. `afmoe` refuses for other reasons
+        // today, so this one is latent rather than live, and pinned
+        // here so it stays right if that changes.
         "afmoe" => last_dense(4),
+        // src/models/plamo3.cpp:9. LIVE: `plamo3` is audited, and its
+        // fixture drives a period of 2 from the file with a window
+        // narrower than the prompt, so both the period override and
+        // this phase are exercised end to end against libllama.
         "plamo3" => last_dense(8),
         // src/models/llama4.cpp:19 ("pattern: 3 chunked - 1 full").
         // `llama4` is `DedicatedOnly` today, so latent.
@@ -2064,10 +2064,31 @@ pub fn unsupported_feature_keys(arch: &str) -> Vec<(String, &'static str)> {
             key("final_logit_softcapping"),
             "final logit soft-capping (Gemma 2+); not implemented in the generic decoder",
         ),
-        (
-            key("attention.sliding_window_pattern"),
-            "alternating sliding-window pattern (Gemma 2+); not implemented in the generic decoder",
-        ),
+        // `{arch}.attention.sliding_window_pattern` WAS refused here,
+        // with the reason "not implemented in the generic decoder".
+        // That reason was false, and had been for some time: the
+        // alternating pattern lives in `ModelConfig::layer_sliding_window`,
+        // which implements BOTH phases and which `gpt-oss` -- a
+        // `StandardGqa` row, not a Gemma one -- has relied on since it
+        // was audited against libllama.
+        //
+        // What the gate really did was make the loader's own read of
+        // that key (`swa_pattern`) unreachable for every non-Gemma
+        // architecture: llama.cpp lets the file override the
+        // architecture's hardcoded period, ferrox refused any file that
+        // tried. `plamo3` is the case that proves it -- its converter
+        // writes the key verbatim (`conversion/plamo.py:178`) -- and
+        // `tests/fixture_away_graphs.rs` now drives a period of 2 out of
+        // a plamo3 fixture and compares against llama.cpp's own graph on
+        // all three forward paths, with the phase and the window
+        // sabotaged separately.
+        //
+        // The real gap the key can hide is NOT the pattern: it is that
+        // llama.cpp accepts the value as a scalar OR an n_layer-long
+        // ARRAY (`ml.get_key_or_arr`), and ferrox carries one scalar
+        // period. `loader.rs` refuses an array-valued pattern by name,
+        // where the value can actually be inspected, instead of
+        // refusing every file that has the key at all.
     ]
 }
 
@@ -2307,14 +2328,14 @@ mod audit_tests {
             }
         }
         assert!(
-            seen == 35,
+            seen == 34,
             "every unaudited generic architecture is triaged; found {seen}. \
              It was 47 until the triage found `minicpm3` was an MLA model on the \
              generic-GQA row and it moved to DedicatedOnly, 46 until five ONE MATCH ARM \
              rows -- deepseek, bailingmoe, seed_oss, maincoder, hunyuan-moe -- were admitted \
-             with libllama-golden fixtures, and 41 until six FIXTURE-AWAY rows -- \
-             internlm2, xverse, ernie4_5, baichuan, exaone, bailingmoe2 -- got theirs \
-             (tests/fixture_away_graphs.rs)"
+             with libllama-golden fixtures, and 41 until seven FIXTURE-AWAY rows -- \
+             internlm2, xverse, ernie4_5, baichuan, exaone, bailingmoe2, plamo3 -- got \
+             theirs (tests/fixture_away_graphs.rs)"
         );
     }
 
@@ -2623,10 +2644,17 @@ mod tests {
             .collect();
 
         // Transcribed from `llama-arch.cpp`'s LLM_KV_NAMES.
+        // `llama.attention.sliding_window_pattern` was on this list and
+        // is deliberately off it: the alternating pattern IS
+        // implemented (`ModelConfig::layer_sliding_window`, both
+        // phases), so refusing it was a gate with a false reason that
+        // also made the loader's own read of the key unreachable. See
+        // the comment where it used to be. The array-valued case, which
+        // ferrox genuinely cannot express, is refused in `loader.rs`
+        // where the value can be inspected.
         for real in [
             "llama.attn_logit_softcapping",
             "llama.final_logit_softcapping",
-            "llama.attention.sliding_window_pattern",
         ] {
             assert!(
                 keys.iter().any(|k| k == real),
@@ -2641,6 +2669,13 @@ mod tests {
         assert!(
             unsupported_feature_keys("gemma2").is_empty(),
             "the Gemma family implements softcap and the SWA pattern"
+        );
+        // And the pattern key must not come back: a file carrying it
+        // gets its period READ, which is what llama.cpp does.
+        assert!(
+            !keys.iter().any(|k| k.ends_with("sliding_window_pattern")),
+            "the SWA pattern is implemented; refusing it makes the loader's read of the \
+             key dead code: {keys:?}"
         );
     }
 

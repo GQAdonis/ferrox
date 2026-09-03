@@ -61,12 +61,13 @@ fn every_unaudited_architecture_renders_a_detail_line() {
         assert!(detail.len() > 100, "`{}` renders {detail:?}", p.gguf_name);
     }
     assert_eq!(
-        n, 35,
+        n, 34,
         "the unaudited count moved. It was 47 until the triage itself found `minicpm3` was \
          an MLA model sitting on the generic-GQA row and it was reclassified to \
          DedicatedOnly, 46 until `deepseek`, `bailingmoe`, `seed_oss`, `maincoder` and \
          `hunyuan-moe` were admitted with libllama-golden fixtures, and 41 until \
-         `internlm2`, `xverse`, `ernie4_5`, `baichuan`, `exaone` and `bailingmoe2` were \
+         `internlm2`, `xverse`, `ernie4_5`, `baichuan`, `exaone`, `bailingmoe2` and \
+         `plamo3` were \
          admitted with theirs (`tests/fixture_away_graphs.rs`) -- rows closing is the \
          count going DOWN \
          for the best reason. Either an architecture was audited or reclassified (good -- \
@@ -258,7 +259,7 @@ fn the_remaining_work_is_counted() {
         .iter()
         .filter(|p| p.triage.is_some())
         .count();
-    assert_eq!(triaged + TRIAGE_PENDING.len(), 35);
+    assert_eq!(triaged + TRIAGE_PENDING.len(), 34);
 }
 
 /// `minicpm3` is refused as an MLA model, not as an unaudited one.
@@ -534,8 +535,12 @@ fn batches_four_and_five_verdicts_are_pinned_to_what_was_read() {
         ),
         ("talkie", TriageClass::NewCode, "NO norm weights"),
         ("mimo2", TriageClass::NewCode, "attention sinks"),
-        // Batch 5.
-        ("plamo3", TriageClass::FixtureAway, "slot for slot"),
+        // Batch 5. `plamo3` was here, FIXTURE-AWAY. Building its
+        // fixture found the verdict was wrong by one tensor name -- it
+        // is the only architecture upstream that spells its two
+        // post-norms without a `.weight` suffix -- so the arm landed in
+        // `loader.rs` and it is audited now
+        // (`tests/fixture_away_graphs.rs`).
         ("afmoe", TriageClass::NewCode, "gated attention"),
         ("apertus", TriageClass::NewCode, "xIELU"),
         (
@@ -639,9 +644,9 @@ fn every_unaudited_row_is_triaged_and_the_distribution_is_pinned() {
     }
     assert_eq!(
         (fixture, arm, new_code, unknown),
-        (3, 2, 26, 4),
+        (2, 2, 26, 4),
         "the triage distribution moved; if a verdict changed on evidence that is correct, \
          update this and docs/MODELS.md together"
     );
-    assert_eq!(fixture + arm + new_code + unknown, 35);
+    assert_eq!(fixture + arm + new_code + unknown, 34);
 }

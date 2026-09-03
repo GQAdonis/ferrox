@@ -568,7 +568,31 @@ impl ModelConfig {
         // comes from the registry either way.
         let swa_layout = crate::capability::default_swa_layout(&arch);
         let swa_dense_first = swa_layout.is_some_and(|p| p.dense_first);
-        let swa_pattern = metadata_u64_any(file, &[key("attention.sliding_window_pattern")])
+        // llama.cpp reads this with `ml.get_key_or_arr`, so the value is
+        // a scalar period OR an n_layer-long per-layer array. ferrox
+        // carries one scalar `swa_pattern`, and `metadata_u64_any`
+        // simply returns `None` for an array -- which silently
+        // substituted `default_swa_layout`'s period for the layout the
+        // file actually declared. Present-but-unreadable is the case to
+        // refuse; presence alone is not, because the pattern itself is
+        // implemented (`ModelConfig::layer_sliding_window`, both
+        // phases). `capability::unsupported_feature_keys` used to refuse
+        // presence alone, and its comment says why that was wrong.
+        let swa_pattern_key = key("attention.sliding_window_pattern");
+        if file.metadata(&swa_pattern_key).is_some()
+            && metadata_u64_any(file, std::slice::from_ref(&swa_pattern_key)).is_none()
+        {
+            return Err(LoadError::UnsupportedFeature(
+                arch.clone(),
+                format!(
+                    "{swa_pattern_key} is not a scalar period; llama.cpp accepts a \
+                     per-layer array here (ml.get_key_or_arr) and ferrox carries one \
+                     period for the whole model, so honouring it would mean substituting \
+                     a different layout for the file's"
+                ),
+            ));
+        }
+        let swa_pattern = metadata_u64_any(file, &[swa_pattern_key])
             .map(|v| v as usize)
             .or_else(|| {
                 sliding_window?;
@@ -1165,6 +1189,53 @@ pub(crate) fn load_f32_vec_optional(
         return Ok(None);
     }
     Ok(Some(load_f32_vec(file, name)?))
+}
+
+/// A norm weight that some converters spell `<base>.weight` and others
+/// spell just `<base>`.
+///
+/// This exists for exactly one pair of tensors, `post_attention_norm`
+/// and `post_ffw_norm`, and it is this repo's dominant bug shape in
+/// llama.cpp's own trees: TWO SPELLINGS OF ONE NAME, WITH NOTHING
+/// ENFORCING AGREEMENT.
+///
+/// `LLM_TN` appends `.weight` only when it is given a suffix
+/// (`src/llama-arch.cpp:898-910`). Every architecture that creates these
+/// two tensors passes one -- `tn(LLM_TENSOR_ATTN_POST_NORM, "weight",
+/// i)` in gemma2, gemma3, glm4, exaone4, afmoe and the rest -- EXCEPT
+/// `plamo3`, which uses the two-argument overload
+/// (`src/models/plamo3.cpp:52,55`) and therefore asks for
+/// `blk.N.post_attention_norm` with no suffix at all.
+///
+/// The converter agrees with it, by a second accident that happens to
+/// line up: `gguf-py/gguf/tensor_mapping.py:368,434` give the PLaMo
+/// entries as `model.layers.layers.{bid}.post_mixer_norm.weight` and
+/// `...post_mlp_norm.weight` -- keys that already END in `.weight`.
+/// `TensorNameMap.get_type_and_name` (:2585-2594) tries an exact match
+/// FIRST and only falls back to stripping a suffix, so those two match
+/// exactly and the mapped name is emitted with nothing appended.
+///
+/// So a real PLaMo-3 GGUF carries `blk.N.post_attention_norm` and
+/// `blk.N.post_ffw_norm`, and every Gemma-lineage GGUF carries the same
+/// two names with `.weight`. Reading only one spelling means one of the
+/// two families always fails on a missing tensor. ferrox read only
+/// `.weight`, which is why `plamo3` could not have loaded a real
+/// checkpoint -- fail-closed rather than wrong, but not "a fixture
+/// away", which is what its triage verdict said.
+///
+/// Both spellings are accepted rather than one being chosen per
+/// architecture, because the choice is a property of the file and
+/// nothing in the metadata declares it. Neither present is still
+/// `None`.
+pub(crate) fn load_norm_vec_either_spelling(
+    file: &impl TensorSource,
+    base: &str,
+) -> Result<Option<Vec<f32>>, LoadError> {
+    let suffixed = format!("{base}.weight");
+    if file.find_tensor(&suffixed).is_some() {
+        return load_f32_vec_optional(file, &suffixed);
+    }
+    load_f32_vec_optional(file, base)
 }
 
 /// Slice `n` rows starting at `start` out of a quantized matrix without
@@ -1999,11 +2070,12 @@ impl Decoder {
                 post_attn_norm: if post_attn_norm_is_pre_ffn_norm {
                     None
                 } else {
-                    load_f32_vec_optional(&file, &format!("blk.{l}.post_attention_norm.weight"))?
+                    // Both spellings; see `load_norm_vec_either_spelling`.
+                    load_norm_vec_either_spelling(&file, &format!("blk.{l}.post_attention_norm"))?
                 },
-                post_ffn_norm: load_f32_vec_optional(
+                post_ffn_norm: load_norm_vec_either_spelling(
                     &file,
-                    &format!("blk.{l}.post_ffw_norm.weight"),
+                    &format!("blk.{l}.post_ffw_norm"),
                 )?,
             };
 
@@ -2205,7 +2277,18 @@ impl Decoder {
                 shared_expert_gate,
                 exp_probs_bias,
                 norm_weight: if post_attn_norm_is_pre_ffn_norm {
-                    load_f32_vec(&file, &format!("blk.{l}.post_attention_norm.weight"))?
+                    // Same two spellings as above, and the same helper,
+                    // so the pre-FFN-norm slot cannot drift away from
+                    // the post-attention one about what a file may be
+                    // called. gpt-oss and seed_oss both write `.weight`
+                    // today; sharing the rule is what stops that being
+                    // a thing to rediscover.
+                    load_norm_vec_either_spelling(&file, &format!("blk.{l}.post_attention_norm"))?
+                        .ok_or_else(|| {
+                        LoadError::Gguf(GgufError::TensorNotFound(format!(
+                            "blk.{l}.post_attention_norm[.weight]"
+                        )))
+                    })?
                 } else {
                     load_f32_vec(&file, &format!("blk.{l}.ffn_norm.weight"))?
                 },
@@ -2603,6 +2686,12 @@ mod tests {
         Str(&'a str),
         U32(u32),
         F32(f32),
+        /// A uint32 ARRAY. Only one gate needs it -- the sliding-window
+        /// pattern, which llama.cpp reads with `ml.get_key_or_arr` --
+        /// and without it that gate could only be tested through a
+        /// value of some other type, which is not the case it exists
+        /// for.
+        Arr32(&'a [u32]),
     }
 
     /// A tensor-free GGUF carrying exactly `kvs` -- enough for
@@ -2623,6 +2712,15 @@ mod tests {
                     buf.write_u32::<LittleEndian>(*n).unwrap();
                 }
                 Kv::F32(f) => write_kv_f32(&mut buf, k, *f),
+                Kv::Arr32(values) => {
+                    write_string(&mut buf, k);
+                    buf.write_u32::<LittleEndian>(9).unwrap(); // type = array
+                    buf.write_u32::<LittleEndian>(4).unwrap(); // element type = uint32
+                    buf.write_u64::<LittleEndian>(values.len() as u64).unwrap();
+                    for v in *values {
+                        buf.write_u32::<LittleEndian>(*v).unwrap();
+                    }
+                }
             }
         }
         buf
@@ -2655,6 +2753,7 @@ mod tests {
                     Kv::Str(s) => Kv::Str(s),
                     Kv::U32(n) => Kv::U32(*n),
                     Kv::F32(f) => Kv::F32(*f),
+                    Kv::Arr32(a) => Kv::Arr32(a),
                 },
             ));
         }
@@ -4025,6 +4124,75 @@ mod tests {
                 other => panic!("{arch} must be refused, got {other:?}"),
             }
         }
+    }
+
+    /// A per-layer sliding-window pattern is refused, and a scalar one
+    /// still loads.
+    ///
+    /// Both halves matter. `capability::unsupported_feature_keys` used
+    /// to refuse the key outright with the reason "not implemented in
+    /// the generic decoder", which was false -- the alternating pattern
+    /// is `ModelConfig::layer_sliding_window`, both phases, and
+    /// `gpt-oss` has run on it since it was audited. What that gate
+    /// really did was make the loader's own read of the key dead for
+    /// every non-Gemma architecture. The case ferrox genuinely cannot
+    /// express is the ARRAY, which `metadata_u64_any` reads as `None`
+    /// and which therefore used to fall through to
+    /// `default_swa_layout` -- substituting the architecture's
+    /// hardcoded layout for the file's, silently.
+    #[test]
+    fn an_array_valued_sliding_window_pattern_is_refused_rather_than_substituted() {
+        // llama.cpp reads this key with `ml.get_key_or_arr`, so a file
+        // may declare a per-layer array instead of a scalar period.
+        // ferrox carries ONE period for the whole model and
+        // `metadata_u64_any` returns `None` for an array, so before this
+        // gate the loader fell through to `default_swa_layout` and ran
+        // the architecture's hardcoded layout in place of the file's --
+        // silently, which is the failure this repo keeps finding.
+        //
+        // `capability::unsupported_feature_keys` used to refuse the key
+        // outright, which stopped this AND stopped every legitimate
+        // scalar. Now presence is fine and unreadability is not, so
+        // both halves have to be tested: the scalar case is the plamo3
+        // fixture in `tests/fixture_away_graphs.rs`, and this is the
+        // array case.
+        let pattern: [u32; 4] = [1, 0, 1, 0];
+        let kvs: Vec<(&str, Kv)> = vec![
+            ("general.architecture", Kv::Str("plamo3")),
+            ("plamo3.block_count", Kv::U32(4)),
+            ("plamo3.embedding_length", Kv::U32(64)),
+            ("plamo3.attention.head_count", Kv::U32(1)),
+            ("plamo3.attention.head_count_kv", Kv::U32(1)),
+            ("plamo3.attention.key_length", Kv::U32(64)),
+            ("plamo3.rope.freq_base", Kv::F32(10_000.0)),
+            ("plamo3.attention.sliding_window", Kv::U32(3)),
+            (
+                "plamo3.attention.sliding_window_pattern",
+                Kv::Arr32(&pattern),
+            ),
+        ];
+        let file = open_metadata_gguf("swa_pattern_array", &kvs);
+        match ModelConfig::from_gguf(&file) {
+            Err(LoadError::UnsupportedFeature(arch, msg)) => {
+                assert_eq!(arch, "plamo3");
+                assert!(
+                    msg.contains("not a scalar period"),
+                    "the refusal must name what is wrong with the value: {msg}"
+                );
+            }
+            other => panic!("an array-valued SWA pattern must refuse, got {other:?}"),
+        }
+
+        // And the scalar spelling of the same key still loads, or the
+        // gate would be refusing the feature rather than the shape.
+        let mut scalar = kvs;
+        scalar.pop();
+        scalar.push(("plamo3.attention.sliding_window_pattern", Kv::U32(2)));
+        let file = open_metadata_gguf("swa_pattern_scalar", &scalar);
+        let config = ModelConfig::from_gguf(&file).expect("a scalar period must load");
+        assert_eq!(config.swa_pattern, Some(2));
+        assert_eq!(config.layer_sliding_window(0), Some(3));
+        assert_eq!(config.layer_sliding_window(1), None);
     }
 
     /// Baichuan is one `general.architecture` string covering two

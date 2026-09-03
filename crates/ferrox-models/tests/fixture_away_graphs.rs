@@ -16,6 +16,17 @@
 //! | `baichuan` | NORM | 32 layers, because llama.cpp picks ALiBi off the layer count |
 //! | `exaone` | NEOX | a tied lm_head, and `head_dim != n_embd / n_head` |
 //! | `bailingmoe2` | NEOX | fused QKV, per-head QK norm before RoPE, sigmoid-gated MoE |
+//! | `plamo3` | NEOX | sandwich norms, a real sliding window, and a tensor name nobody else spells |
+//!
+//! One of the seven verdicts was WRONG, and building its fixture is what
+//! found that. `plamo3` is the only architecture upstream that creates
+//! `ATTN_POST_NORM` / `FFN_POST_NORM` through the two-argument `LLM_TN`
+//! overload (`plamo3.cpp:52,55`), so it asks for
+//! `blk.N.post_attention_norm` with NO `.weight`, and gguf-py emits
+//! exactly that for it. ferrox read only the suffixed spelling, so it
+//! could never have loaded a real PLaMo-3 checkpoint -- fail-closed, but
+//! not "a fixture away". `load_norm_vec_either_spelling` in `loader.rs`
+//! is the arm; this suite is the evidence it is the right one.
 //!
 //! **Every row was checked against the C on the six facts this repo has
 //! lost at least once**, and every one of the six is asserted below
@@ -29,22 +40,34 @@
 //!    `rotating_the_wrong_pairs_diverges_from_llama_cpp` proves each
 //!    fixture can see a flip. Getting this wrong is the Llama-3.1-8B
 //!    wrong-output bug.
-//! 2. **SWA pattern and phase.** None of the five reads
-//!    `LLM_KV_ATTENTION_SLIDING_WINDOW` at all: `internlm2.cpp:3-11`,
-//!    `xverse.cpp:3-12`, `baichuan.cpp:3-15`, `ernie4-5.cpp:3-21` and
-//!    `exaone.cpp:3-10` are the complete `load_arch_hparams` bodies and
-//!    none mentions a window, so `hparams.swa_type` stays
-//!    `LLAMA_SWA_TYPE_NONE` and there is no phase to get wrong.
-//! 3. **`attention_scale`.** All five pass a literal
+//! 2. **SWA pattern and phase.** Six of the seven read
+//!    `LLM_KV_ATTENTION_SLIDING_WINDOW` nowhere at all:
+//!    `internlm2.cpp:3-11`, `xverse.cpp:3-12`, `baichuan.cpp:3-15`,
+//!    `ernie4-5.cpp:3-21`, `exaone.cpp:3-10` and `bailingmoe2.cpp:3-21`
+//!    are the complete `load_arch_hparams` bodies and none mentions a
+//!    window, so `hparams.swa_type` stays `LLAMA_SWA_TYPE_NONE` and
+//!    there is no phase to get wrong. `plamo3` is the exception and
+//!    gets the full treatment: `plamo3.cpp:5-11` reads the window and a
+//!    scalar `sliding_window_pattern` and calls `set_swa_pattern` with
+//!    `dense_first = false`, its fixture drives a period of 2 out of the
+//!    file over four layers with a window NARROWER than the prompt, and
+//!    the period, the phase and the window each have their own sabotage
+//!    test.
+//! 3. **`attention_scale`.** All seven pass a literal
 //!    `1.0f/sqrtf(float(n_embd_head))` to `build_attn`
 //!    (internlm2.cpp:92, xverse.cpp:90, baichuan.cpp:103,
-//!    ernie4-5.cpp:120, exaone.cpp:93) and none reads
-//!    `LLM_KV_ATTENTION_SCALE`, so `ModelConfig::attention_scale` must
-//!    stay `None` and let the kernels' own scale stand.
-//! 4. **`post_attn_norm`** and **5. `post_ffn_norm`.** None of the five
-//!    creates `LLM_TENSOR_ATTN_POST_NORM` or `LLM_TENSOR_FFN_POST_NORM`;
-//!    each layer has exactly `attn_norm` and `ffn_norm`, both applied
-//!    BEFORE their branch on a sequential residual.
+//!    ernie4-5.cpp:120, exaone.cpp:93, bailingmoe2.cpp:141,
+//!    plamo3.cpp:140) and none reads `LLM_KV_ATTENTION_SCALE`, so
+//!    `ModelConfig::attention_scale` must stay `None` and let the
+//!    kernels' own scale stand.
+//! 4. **`post_attn_norm`** and **5. `post_ffn_norm`.** Six of the seven
+//!    create neither `LLM_TENSOR_ATTN_POST_NORM` nor
+//!    `LLM_TENSOR_FFN_POST_NORM`; each layer has exactly `attn_norm` and
+//!    `ffn_norm`, both applied BEFORE their branch on a sequential
+//!    residual. `plamo3` has BOTH, applied to their branch's OUTPUT
+//!    before the residual add (:152-155, :171-174) -- the Gemma-2
+//!    placement, which is where ferrox applies them -- and dropping
+//!    either one has its own sabotage test.
 //! 6. **QK-norm and its order.** None of the five DENSE rows creates
 //!    `attn_q_norm` / `attn_k_norm`, so there is no ordering question
 //!    for them. `bailingmoe2` does: `bailingmoe2.cpp:52-53` creates
@@ -57,7 +80,7 @@
 //!
 //! The MoE half of the checklist -- the gating function, and whether the
 //! top-k weights are renormalised after selection -- arises for
-//! `bailingmoe2` alone. Both are REQUIRED-or-read metadata keys there
+//! `bailingmoe2` alone (`plamo3` is dense). Both are REQUIRED-or-read metadata keys there
 //! (`bailingmoe2.cpp:10-11`), the fixture carries both, and
 //! `bailingmoe2_reads_its_routing_out_of_the_file_rather_than_guessing`
 //! asserts what they resolved to. It matters because ferrox's
@@ -97,8 +120,20 @@ use ferrox_moe::GatingFunction;
 /// cannot drift apart about who is in the set.
 const DENSE_ROWS: [&str; 5] = ["internlm2", "xverse", "ernie4_5", "baichuan", "exaone"];
 
-/// Every row this suite admits, dense and MoE alike.
-const ALL_ROWS: [&str; 6] = [
+/// Every row this suite admits.
+const ALL_ROWS: [&str; 7] = [
+    "internlm2",
+    "xverse",
+    "ernie4_5",
+    "baichuan",
+    "exaone",
+    "bailingmoe2",
+    "plamo3",
+];
+
+/// The rows with no sliding window and no post-norms. `plamo3` has
+/// both, so it is excluded here and pinned by its own tests instead.
+const NO_WINDOW_NO_POST_NORM_ROWS: [&str; 6] = [
     "internlm2",
     "xverse",
     "ernie4_5",
@@ -698,6 +733,258 @@ fn norming_bailingmoe2_after_rope_instead_of_before_diverges_from_llama_cpp() {
     );
 }
 
+// --- plamo3 ---------------------------------------------------------
+//
+// The sandwich-norm row, the only one here with a sliding window, and
+// the one whose FIXTURE-AWAY verdict turned out to be WRONG by one
+// tensor name.
+//
+// `LLM_TN` appends `.weight` only when given a suffix
+// (llama-arch.cpp:898-910), and every architecture that creates
+// ATTN_POST_NORM / FFN_POST_NORM passes one -- except `plamo3`, which
+// uses the two-argument overload (plamo3.cpp:52,55) and so asks for
+// `blk.N.post_attention_norm` and `blk.N.post_ffw_norm` with NO suffix.
+// gguf-py emits exactly those names for it, because its PLaMo mapping
+// keys (tensor_mapping.py:368,434) already END in `.weight` and
+// `get_type_and_name` (:2585-2594) tries an exact match before
+// stripping a suffix. ferrox read only the suffixed spelling, so it
+// could never have loaded a real PLaMo-3 checkpoint --
+// `load_norm_vec_either_spelling` in `loader.rs` is the arm that fixes
+// it, and this fixture uses the un-suffixed names because that is what
+// a converter writes.
+//
+// The rest is slot for slot: attn_norm (:104), fused attn_qkv (:47) with
+// head_dim decoupled from n_embd/n_head, per-head QK norm before RoPE
+// (:49-50, :128-138), attn_post_norm on the attention output before its
+// residual add (:152-155), ffn_norm (:160), a fused SwiGLU ffn_up of
+// n_ff*2 with no ffn_gate (:57, :163-168), and ffn_post_norm on the FFN
+// output before its add (:171-174). NEOX RoPE.
+
+const PLAMO3_GOLDEN: [f32; 48] = [
+    -0.13417868,
+    0.5886667,
+    0.43671453,
+    0.47216994,
+    0.0437923,
+    0.6202583,
+    -0.33917707,
+    -0.15624414,
+    -0.4340622,
+    0.08551871,
+    -0.28434193,
+    -0.6546696,
+    -0.33789676,
+    0.06587186,
+    0.3138425,
+    0.7828187,
+    -0.2447187,
+    0.75487375,
+    -0.6003437,
+    0.070651375,
+    -0.27455223,
+    0.5503286,
+    1.041208,
+    -1.1511995,
+    0.37486026,
+    0.3923036,
+    -0.086244255,
+    -0.47600126,
+    -0.25178447,
+    0.8037309,
+    0.19178456,
+    -0.6201743,
+    0.41236115,
+    0.654441,
+    -0.09785151,
+    0.095623925,
+    -0.27044287,
+    -0.5235145,
+    -0.57836926,
+    0.32180697,
+    -0.3484251,
+    0.004385993,
+    -0.17752947,
+    -0.032321587,
+    0.11161679,
+    0.20395917,
+    0.15744714,
+    0.037524372,
+];
+
+#[test]
+fn plamo3_matches_llama_cpp_on_all_three_paths() {
+    assert_all_three_paths_match("plamo3", &PLAMO3_GOLDEN);
+}
+
+/// The fixture spells the post-norms the way a converter does, and
+/// ferrox reads that spelling.
+///
+/// This is the assertion the whole row turns on. If the fixture were
+/// regenerated with `.weight` names it would still load in ferrox and
+/// would stop being evidence about PLaMo-3 -- and libllama would refuse
+/// it outright, so the golden values could not be regenerated at all.
+#[test]
+fn the_plamo3_fixture_spells_its_post_norms_without_a_weight_suffix() {
+    let path = graph_fixture_path("plamo3");
+    let file = ferrox_gguf::GgufFile::open(&path).expect("opens");
+    for base in ["post_attention_norm", "post_ffw_norm"] {
+        assert!(
+            file.find_tensor(&format!("blk.0.{base}")).is_some(),
+            "blk.0.{base} is the name plamo3.cpp:52,55 asks for"
+        );
+        assert!(
+            file.find_tensor(&format!("blk.0.{base}.weight")).is_none(),
+            "blk.0.{base}.weight is the spelling every OTHER architecture uses; carrying \
+             both would make this fixture prove nothing about plamo3"
+        );
+    }
+    let d = load_graph_fixture("plamo3");
+    for (il, layer) in d.layers.iter().enumerate() {
+        let post_attn = layer
+            .attn
+            .post_attn_norm
+            .as_ref()
+            .unwrap_or_else(|| panic!("blk.{il}: attn_post_norm must be loaded"));
+        let post_ffn = layer
+            .attn
+            .post_ffn_norm
+            .as_ref()
+            .unwrap_or_else(|| panic!("blk.{il}: ffn_post_norm must be loaded"));
+        assert!(post_attn.iter().any(|w| *w != 0.0), "blk.{il}");
+        assert!(post_ffn.iter().any(|w| *w != 0.0), "blk.{il}");
+    }
+}
+
+/// Dropping either sandwich norm is a large divergence.
+///
+/// `post_attn_norm` and `post_ffn_norm` are two of the eight model
+/// features a copied decode path in this repo has silently lost, so a
+/// fixture that carried them without being able to see them missing
+/// would be the same trap one level up.
+#[test]
+fn dropping_either_of_plamo3s_post_norms_diverges_from_llama_cpp() {
+    for which in ["attn", "ffn"] {
+        let mut d = load_graph_fixture("plamo3");
+        for layer in d.layers.iter_mut() {
+            if which == "attn" {
+                layer.attn.post_attn_norm = None;
+            } else {
+                layer.attn.post_ffn_norm = None;
+            }
+        }
+        let mut kv = graph_caches(&d);
+        let worst = worst_vs(
+            &d.forward_batch_last(&GRAPH_PROMPT, 0, &mut kv),
+            &PLAMO3_GOLDEN,
+        );
+        assert!(
+            worst > 1e-2,
+            "dropping post_{which}_norm moved the output by only {worst}; \
+             the fixture cannot see this slot"
+        );
+    }
+}
+
+/// The sliding window, its period AND its phase, all read from the
+/// file.
+///
+/// `plamo3.cpp:5-11` reads `attention.sliding_window` and a scalar
+/// `attention.sliding_window_pattern` (defaulting to 8) and calls
+/// `set_swa_pattern(period)` with `dense_first = false`, which is
+/// `is_swa(il) = il % period < period - 1`. The fixture sets period 2
+/// over four layers, so layers 0 and 2 slide and 1 and 3 do not. Getting
+/// the phase inverted is invisible on a prompt shorter than the window,
+/// which is why this fixture's window is 3 and its prompt is 6.
+#[test]
+fn plamo3_reads_its_window_period_and_phase_and_the_window_actually_bites() {
+    let d = load_graph_fixture("plamo3");
+    assert_eq!(d.config.sliding_window, Some(3));
+    assert_eq!(d.config.swa_pattern, Some(2));
+    assert!(
+        !d.config.swa_dense_first,
+        "set_swa_pattern's dense_first defaults to false and plamo3.cpp:11 does not pass it"
+    );
+    assert_eq!(d.config.layer_sliding_window(0), Some(3));
+    assert_eq!(d.config.layer_sliding_window(1), None);
+    assert_eq!(d.config.layer_sliding_window(2), Some(3));
+    assert_eq!(d.config.layer_sliding_window(3), None);
+    // The window is narrower than the prompt, so it masks something at
+    // the position the comparison reads.
+    assert!(GRAPH_PROMPT.len() > 3);
+}
+
+/// Widening the window past the prompt diverges, which is what proves
+/// the mask is doing work.
+///
+/// A fixture whose window never bites compares equal with SWA switched
+/// off entirely, and would be evidence about the tensor set rather than
+/// about attention.
+#[test]
+fn removing_plamo3s_sliding_window_diverges_from_llama_cpp() {
+    let path = graph_fixture_path("plamo3");
+    let file = ferrox_gguf::GgufFile::open(&path).expect("opens");
+    let mut config = ModelConfig::from_gguf(&file).expect("parses");
+    config.sliding_window = None;
+    let d = Decoder::from_gguf(&path, config).expect("loads");
+    let mut kv = graph_caches(&d);
+    let worst = worst_vs(
+        &d.forward_batch_last(&GRAPH_PROMPT, 0, &mut kv),
+        &PLAMO3_GOLDEN,
+    );
+    assert!(
+        worst > 1e-2,
+        "dropping the window moved the output by only {worst}; it never masked anything"
+    );
+}
+
+/// Inverting the SWA phase diverges too.
+///
+/// The period alone is not the pattern: `smallthinker` and `laguna`
+/// windowed every layer here once because ferrox implemented only one
+/// phase. Swapping which layers slide has to be visible, or the phase is
+/// untested even though the period is not.
+#[test]
+fn inverting_plamo3s_swa_phase_diverges_from_llama_cpp() {
+    let path = graph_fixture_path("plamo3");
+    let file = ferrox_gguf::GgufFile::open(&path).expect("opens");
+    let mut config = ModelConfig::from_gguf(&file).expect("parses");
+    config.swa_dense_first = true;
+    let d = Decoder::from_gguf(&path, config).expect("loads");
+    assert_eq!(
+        d.config.layer_sliding_window(0),
+        None,
+        "phase really flipped"
+    );
+    let mut kv = graph_caches(&d);
+    let worst = worst_vs(
+        &d.forward_batch_last(&GRAPH_PROMPT, 0, &mut kv),
+        &PLAMO3_GOLDEN,
+    );
+    assert!(
+        worst > 1e-2,
+        "inverting the SWA phase moved the output by only {worst}; \
+         the fixture cannot see which layers slide"
+    );
+}
+
+/// The triage verdict asked for this one by name: llama.cpp carries
+/// head_dim_q and head_dim_v separately (plamo3.cpp:25-26) and ferrox
+/// has a single `head_dim`, so the fixture has to be a file where the
+/// two agree -- and a file where they disagree is refused by name in
+/// `loader.rs` rather than run on one of them.
+#[test]
+fn the_plamo3_fixture_has_equal_key_and_value_head_dims() {
+    let path = graph_fixture_path("plamo3");
+    let file = ferrox_gguf::GgufFile::open(&path).expect("opens");
+    assert_eq!(file.metadata_u64("plamo3.attention.key_length"), Some(8));
+    assert_eq!(file.metadata_u64("plamo3.attention.value_length"), Some(8));
+    let d = load_graph_fixture("plamo3");
+    assert_eq!(d.config.head_dim, 8);
+    // 6 is what n_embd / n_head would give.
+    assert_eq!(d.config.hidden_dim, 24);
+    assert_eq!(d.config.n_heads, 4);
+}
+
 // --- the six facts, asserted rather than assumed --------------------
 
 /// Fact 1: the RoPE variant each row resolves to is the group llama.cpp
@@ -713,6 +1000,7 @@ fn the_rope_variant_each_architecture_uses_is_the_one_llama_cpp_uses() {
         // ... and the NEOX group.
         ("exaone", RopeLayout::Neox),
         ("bailingmoe2", RopeLayout::Neox),
+        ("plamo3", RopeLayout::Neox),
     ] {
         assert_eq!(
             load_graph_fixture(name).config.rope_layout,
@@ -737,6 +1025,7 @@ fn rotating_the_wrong_pairs_diverges_from_llama_cpp() {
         ("baichuan", &BAICHUAN_GOLDEN),
         ("exaone", &EXAONE_GOLDEN),
         ("bailingmoe2", &BAILINGMOE2_GOLDEN),
+        ("plamo3", &PLAMO3_GOLDEN),
     ] {
         let path = graph_fixture_path(name);
         let file = ferrox_gguf::GgufFile::open(&path).expect("opens");
@@ -756,24 +1045,37 @@ fn rotating_the_wrong_pairs_diverges_from_llama_cpp() {
     }
 }
 
-/// Facts 2, 3, 4 and 5, on EVERY row: no sliding window, no
-/// attention-scale override and no post-norms.
+/// Fact 3, on EVERY row: no attention-scale override.
 ///
-/// Each of these has been lost at least once here by a copied decode
-/// path, and each is absent from all six llama.cpp graphs, so the
-/// assertion is that ferrox resolved them to absent rather than to
-/// something plausible.
+/// All seven pass a literal `1.0f/sqrtf(float(n_embd_head))` to
+/// `build_attn` and none reads `LLM_KV_ATTENTION_SCALE`, so
+/// `ModelConfig::attention_scale` must stay `None` and let the kernels'
+/// own scale stand. Getting this wrong is silent: the model still runs.
 #[test]
-fn no_row_here_has_a_window_a_scale_override_or_a_post_norm() {
+fn no_row_here_overrides_the_attention_scale() {
     for name in ALL_ROWS {
         let d = load_graph_fixture(name);
-        // Fact 3: every one of the six passes a literal
-        // 1/sqrt(head_dim) to build_attn and reads no
-        // LLM_KV_ATTENTION_SCALE, so the kernels' own scale must stand.
         assert!(
             d.config.attention_scale.is_none(),
             "{name}: attention_scale must stay unset"
         );
+    }
+}
+
+/// Facts 2, 4 and 5, for the six rows where they are ABSENCES.
+///
+/// `plamo3` is excluded because it genuinely has a sliding window and
+/// both post-norms; its window, period, phase and two norm slots are
+/// pinned by its own tests above. The membership lives in one const so
+/// the two halves cannot drift apart about who is in the set.
+///
+/// Each of these has been lost at least once here by a copied decode
+/// path, so the assertion is that ferrox resolved them to absent rather
+/// than to something plausible.
+#[test]
+fn six_of_the_rows_have_no_window_and_no_post_norm() {
+    for name in NO_WINDOW_NO_POST_NORM_ROWS {
+        let d = load_graph_fixture(name);
         // Fact 2: none reads LLM_KV_ATTENTION_SLIDING_WINDOW, so there
         // is no window and therefore no pattern phase to get wrong.
         assert!(d.config.sliding_window.is_none(), "{name}: sliding window");
@@ -828,6 +1130,11 @@ fn only_bailingmoe2_is_moe() {
         );
         assert_eq!(d.config.moe.n_shared_experts, 0, "{name}");
     }
+    let plamo3 = load_graph_fixture("plamo3");
+    assert_eq!(
+        plamo3.config.moe.n_experts, 1,
+        "plamo3 is dense too, it just is not in DENSE_ROWS because it has post-norms"
+    );
     let moe = load_graph_fixture("bailingmoe2");
     assert!(
         moe.config.moe.n_experts > 1,

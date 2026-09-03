@@ -2904,19 +2904,23 @@ mod tests {
     /// `AUDITED_GENERIC_GQA` would have gone unnoticed.
     #[test]
     fn an_unaudited_generic_architecture_refuses_rather_than_guessing() {
-        // `xverse` is on the generic path and is not in the audited
-        // list: nobody has run a real one through ferrox. It replaced
-        // `starcoder`, which was the example here until an audit found
-        // starcoder REQUIRES a fused `attn_qkv.bias` and a learned
-        // `position_embd` that the generic decoder has no slot for --
-        // so it now refuses for a stronger reason than being unaudited,
-        // and stopped being an example of this one.
+        // `nanbeige` is on the generic path and is not in the audited
+        // list. It is the third name to hold this slot: `starcoder` was
+        // first, until an audit found it REQUIRES a fused
+        // `attn_qkv.bias` and a learned `position_embd` the generic
+        // decoder has no slot for, so it refuses for a stronger reason;
+        // then `xverse`, until it was admitted with a libllama-golden
+        // fixture (`tests/fixture_away_graphs.rs`). `nanbeige` cannot go
+        // the same way soon: it runs the same physical layers more than
+        // once (`src/models/nanbeige.cpp:13-31`), which is NEW CODE, and
+        // its blocker is invisible in metadata, so nothing but this gate
+        // stops it.
         assert!(
-            !crate::capability::is_audited_generic("xverse"),
+            !crate::capability::is_audited_generic("nanbeige"),
             "this test needs an arch that is generic AND unaudited"
         );
-        match config_for_arch("xverse") {
-            Err(LoadError::UnauditedArchitecture(name, ..)) => assert_eq!(name, "xverse"),
+        match config_for_arch("nanbeige") {
+            Err(LoadError::UnauditedArchitecture(name, ..)) => assert_eq!(name, "nanbeige"),
             other => panic!("expected an unaudited refusal, got {other:?}"),
         }
     }

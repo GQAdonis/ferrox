@@ -279,6 +279,41 @@ pub const AUDITED_GENERIC_GQA: &[&str] = &[
     // QK-norm weights centred near 1.5 so the ordering is visible.
     "maincoder",
     "hunyuan-moe",
+    // tests/fixture_away_graphs.rs: architectures that were triaged
+    // FIXTURE-AWAY -- ferrox already built their graph, and only the
+    // evidence was missing. Same standard as the rows above: a synthetic
+    // fixture from `scripts/make_<arch>_fixture.py` whose golden values
+    // come from llama.cpp's own graph via libllama, compared on prefill,
+    // decode and continuous batching, with a sabotage test per row
+    // proving the fixture can SEE the fact its architecture turns on.
+    //
+    // Each was checked, against the C, on the six things this repo has
+    // lost at least once: RoPE variant, SWA pattern and phase,
+    // `attention_scale`, the two post-norm slots, and QK-norm ordering.
+    //
+    // `internlm2` (internlm2.cpp:3-11,25-33,59-122): plain llama, NORM
+    // RoPE, `1/sqrt(head_dim)` scale, no post-norms, no QK-norm, no SWA.
+    // Its fixture carries the OPTIONAL q/k/v projection biases real
+    // InternLM2 exports ship.
+    "internlm2",
+    // `xverse` (xverse.cpp:3-12,14-35,59-121): the same, with no biases.
+    "xverse",
+    // `ernie4_5` DENSE (ernie4-5.cpp:36-69,95-149): NORM RoPE, head_dim
+    // decoupled from n_embd/n_head. `ernie4_5-moe` is a different row
+    // and still refuses -- its layers interleave on a step ferrox does
+    // not read.
+    "ernie4_5",
+    // `baichuan` (baichuan.cpp:5-14,17-40,64-137): the 7B ONLY. The 13B
+    // is a different model under the same string and is refused by name
+    // on `block_count == 40` in loader.rs before this list is consulted,
+    // because llama.cpp picks ALiBi-and-no-RoPE off the layer count with
+    // no GGUF key to declare it. The fixture therefore has 32 layers: a
+    // 2-layer one would be LLM_TYPE_UNKNOWN and get no RoPE at all.
+    "baichuan",
+    // `exaone` (exaone.cpp:3-10,12-40,65-121): EXAONE 3.x, NEOX RoPE,
+    // tied lm_head. NOT `exaone4` (no pre-norms) and NOT `exaone-moe`
+    // (no RoPE on the full-attention layers); both stay refusing.
+    "exaone",
 ];
 
 /// Is this architecture's use of the shared generic path backed by
@@ -411,26 +446,6 @@ fn deferred_scope(name: &'static str, scope: ArchScope, reason: &'static str) ->
 /// between them enforce.
 const NORM_ROPE_TRIAGED: &[(&str, TriageClass, &str)] = &[
     (
-        "internlm2",
-        TriageClass::FixtureAway,
-        "src/models/internlm2.cpp:25-33 creates attn_norm, split Q/K/V via create_tensor_qkv \
-         (whose only biases are TENSOR_NOT_REQUIRED q/k/v biases, which loader.rs already \
-         loads), attn_output, ffn_norm and gate/up/down -- no QK-norm, no post-norms, no \
-         bias the generic decoder has no slot for. The graph is sequential-residual SiLU \
-         SwiGLU (:98,107-115) and load_arch_hparams (:4) reads nothing but the RMS epsilon. \
-         Admitting it needs a fixture or a parity run, not new code",
-    ),
-    (
-        "ernie4_5",
-        TriageClass::FixtureAway,
-        "src/models/ernie4-5.cpp's dense branch (:39-47,65-67) is the plain Llama tensor set \
-         and its graph (:100-142) is sequential-residual SiLU SwiGLU with \
-         kq_scale=1/sqrt(head_dim) (:120). The only thing ferrox has no slot for is the \
-         OPTIONAL attn_output.bias at :45 (TENSOR_NOT_REQUIRED), and a checkpoint carrying \
-         one is refused BY NAME by assert_every_tensor_consumed rather than run unbiased. \
-         Admitting it needs a fixture, not new code",
-    ),
-    (
         "ernie4_5-moe",
         TriageClass::OneMatchArm,
         "interleaved MoE layers. src/models/ernie4-5-moe.cpp:64 makes a layer MoE only when \
@@ -449,29 +464,6 @@ const NORM_ROPE_TRIAGED: &[(&str, TriageClass, &str)] = &[
     // ferrox-only alias row; no llama.cpp GGUF spells it this way, but
     // it must not carry a different verdict from `granitemoe`.
     ("granite-moe", TriageClass::NewCode, GRANITE_MULTIPLIERS),
-    (
-        "xverse",
-        TriageClass::FixtureAway,
-        "xverse is llama under a different name. src/models/xverse.cpp:25-33 creates \
-         attn_norm, split Q/K/V via create_tensor_qkv (optional biases only), attn_output, \
-         ffn_norm and gate/up/down and nothing else; the graph (:60-114) is the sequential \
-         `x + attn(norm(x))` then `y + ffn(norm(y))` residual with SiLU SwiGLU, and \
-         load_arch_hparams (:4) reads nothing but the RMS epsilon. llama-model.cpp's \
-         `llama_model_rope_type` puts it in the NORM group, which is where the catalog has \
-         it. Admitting it needs a fixture, not new code",
-    ),
-    (
-        "baichuan",
-        TriageClass::FixtureAway,
-        "for the 7B. src/models/baichuan.cpp:29-38 is the plain llama tensor set and the \
-         graph (:65-130) is sequential-residual SiLU SwiGLU, NORM RoPE. The 13B is a \
-         DIFFERENT model under the same string -- baichuan.cpp:5-13 switches on layer count \
-         and sets `f_max_alibi_bias = 8.0f` for the 40-layer case, with no GGUF key to \
-         detect it -- and ferrox already refuses that one by name at loader.rs:231, pinned \
-         by `baichuan_13b_is_refused_because_it_uses_alibi_and_the_7b_is_not`. So the \
-         unaudited refusal only ever reaches a 32-layer file, and for that file this is a \
-         fixture away",
-    ),
     (
         "chatglm",
         TriageClass::FixtureAway,
@@ -635,15 +627,6 @@ const NEOX_ROPE_TRIAGED: &[(&str, TriageClass, &str)] = &[
          ffn_inp (:159). The generic decoder requires and applies both pre-norms, which is a \
          different residual topology. Its optional NEXTN/MTP tensors (:69-73) are a separate \
          matter and are refused by name by the unread-tensor gate",
-    ),
-    (
-        "exaone",
-        TriageClass::FixtureAway,
-        "src/models/exaone.cpp:29-38 is the plain Llama tensor set plus an optional global \
-         rope_freqs.weight, which loader.rs:521 already loads; the graph is \
-         sequential-residual SiLU SwiGLU (:99,106-113) and load_arch_hparams (:4) reads \
-         nothing but the RMS epsilon. Note this is EXAONE 3.x, not exaone4, which is a \
-         different graph. Admitting it needs a fixture, not new code",
     ),
     (
         "bailingmoe2",
@@ -933,6 +916,11 @@ pub fn architecture_catalog() -> &'static [ArchProfile] {
         for n in ["bailingmoe", "deepseek", "maincoder"] {
             v.push(gqa_norm(n));
         }
+        // Were FIXTURE-AWAY in this group and now have the fixture:
+        // `tests/fixture_away_graphs.rs`, same evidence standard.
+        for n in ["baichuan", "ernie4_5", "internlm2", "xverse"] {
+            v.push(gqa_norm(n));
+        }
         // Same generic Norm-RoPE path, but READ against llama.cpp's own
         // graph -- see [`TriageClass`]. Each row below refuses with its
         // class and its blocker instead of the generic
@@ -964,6 +952,11 @@ pub fn architecture_catalog() -> &'static [ArchProfile] {
             // norm slot.
             "hunyuan-moe",
             "seed_oss",
+            // Was FIXTURE-AWAY and now has the fixture
+            // (`tests/fixture_away_graphs.rs`). EXAONE 3.x only:
+            // `exaone4` and `exaone-moe` are different graphs and stay
+            // in `NEOX_ROPE_TRIAGED` below.
+            "exaone",
         ] {
             v.push(gqa_neox(n));
         }
@@ -2315,12 +2308,14 @@ mod audit_tests {
             }
         }
         assert!(
-            seen == 41,
+            seen == 36,
             "every unaudited generic architecture is triaged; found {seen}. \
              It was 47 until the triage found `minicpm3` was an MLA model on the \
-             generic-GQA row and it moved to DedicatedOnly, and 46 until five ONE MATCH ARM \
+             generic-GQA row and it moved to DedicatedOnly, 46 until five ONE MATCH ARM \
              rows -- deepseek, bailingmoe, seed_oss, maincoder, hunyuan-moe -- were admitted \
-             with libllama-golden fixtures"
+             with libllama-golden fixtures, and 41 until five FIXTURE-AWAY rows -- \
+             internlm2, xverse, ernie4_5, baichuan, exaone -- got theirs \
+             (tests/fixture_away_graphs.rs)"
         );
     }
 

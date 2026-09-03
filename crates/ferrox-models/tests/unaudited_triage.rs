@@ -61,14 +61,15 @@ fn every_unaudited_architecture_renders_a_detail_line() {
         assert!(detail.len() > 100, "`{}` renders {detail:?}", p.gguf_name);
     }
     assert_eq!(
-        n, 41,
+        n, 36,
         "the unaudited count moved. It was 47 until the triage itself found `minicpm3` was \
          an MLA model sitting on the generic-GQA row and it was reclassified to \
-         DedicatedOnly, and 46 until `deepseek`, `bailingmoe`, `seed_oss`, `maincoder` and \
-         `hunyuan-moe` were admitted with libllama-golden fixtures -- five ONE MATCH ARM rows \
-         closing is the count going DOWN for the best reason. Either an architecture was \
-         audited or reclassified (good -- update the count and the docs) or one was added \
-         (check it was triaged)"
+         DedicatedOnly, 46 until `deepseek`, `bailingmoe`, `seed_oss`, `maincoder` and \
+         `hunyuan-moe` were admitted with libllama-golden fixtures, and 41 until \
+         `internlm2`, `xverse`, `ernie4_5`, `baichuan` and `exaone` were admitted with \
+         theirs (`tests/fixture_away_graphs.rs`) -- rows closing is the count going DOWN \
+         for the best reason. Either an architecture was audited or reclassified (good -- \
+         update the count and the docs) or one was added (check it was triaged)"
     );
 }
 
@@ -89,19 +90,15 @@ fn batch_one_verdicts_are_pinned_to_what_was_read() {
         // embedding scale, GeGLU, 1/sqrt(head_dim) attention scale) are
         // all implemented for GemmaFamily.
         ("gemma", TriageClass::FixtureAway, "gemma.cpp:16-33"),
-        // internlm2.cpp:25-33 is the plain Llama tensor set.
-        ("internlm2", TriageClass::FixtureAway, "internlm2.cpp:25-33"),
-        // exaone.cpp:29-38 likewise, plus the global rope_freqs.weight
-        // loader.rs already loads. NOT exaone4, which is a different
-        // graph and a different class below.
-        ("exaone", TriageClass::FixtureAway, "exaone.cpp:29-38"),
-        // ernie4-5.cpp's dense branch; the only unslotted tensor is an
-        // OPTIONAL attn_output.bias, which fails closed by name.
-        (
-            "ernie4_5",
-            TriageClass::FixtureAway,
-            "attn_output.bias at :45",
-        ),
+        // `internlm2`, `exaone` and `ernie4_5` were HERE, and so were
+        // `xverse` and `baichuan` in batch three. All five got their
+        // fixture (`tests/fixture_away_graphs.rs`), so they are audited
+        // now and carry no verdict at all --
+        // `every_verdict_is_attached_to_a_row_that_actually_refuses_as_unaudited`
+        // is what stops a stale verdict outliving its refusal. Closing a
+        // FIXTURE-AWAY row is the cheapest kind of progress there is and
+        // the count going down here is what it looks like.
+        //
         // bailingmoe2.cpp: fused QKV that ferrox splits, per-head QK
         // norm BEFORE RoPE, sigmoid/softmax read from metadata,
         // exp_probs_b, shared experts, leading dense -- all implemented.
@@ -267,7 +264,7 @@ fn the_remaining_work_is_counted() {
         .iter()
         .filter(|p| p.triage.is_some())
         .count();
-    assert_eq!(triaged + TRIAGE_PENDING.len(), 41);
+    assert_eq!(triaged + TRIAGE_PENDING.len(), 36);
 }
 
 /// `minicpm3` is refused as an MLA model, not as an unaudited one.
@@ -436,18 +433,13 @@ fn verdicts_disclose_when_an_earlier_refusal_fires_first() {
 /// Batch 3: the alias rows and the plain long-tail.
 ///
 /// This is the batch that was expected to be cheap, and half of it was.
-/// `xverse`, `baichuan` and `chatglm` really are llama-shaped and say so
-/// plainly. `deci` and `olmo` are not, and neither is the alias trio,
-/// for a reason that has nothing to do with their graphs.
+/// `xverse` and `baichuan` really were llama-shaped, are audited now
+/// (`tests/fixture_away_graphs.rs`) and so carry no verdict any more.
+/// `deci` and `olmo` are not llama-shaped, and neither is the alias
+/// trio, for a reason that has nothing to do with their graphs.
 #[test]
 fn batch_three_verdicts_are_pinned_to_what_was_read() {
     let cases: &[(&str, TriageClass, &str)] = &[
-        (
-            "xverse",
-            TriageClass::FixtureAway,
-            "llama under a different name",
-        ),
-        ("baichuan", TriageClass::FixtureAway, "for the 7B"),
         (
             "chatglm",
             TriageClass::FixtureAway,
@@ -495,17 +487,33 @@ fn the_alias_rows_name_the_rope_hazard_rather_than_claiming_llama_shape() {
 }
 
 /// `baichuan` is one architecture string covering two different models,
-/// and the verdict says which one the refusal is about.
+/// and admitting it admitted only ONE of them.
+///
+/// This test used to read the triage verdict, which said in words which
+/// model the refusal was about. The verdict is gone -- `baichuan` is
+/// audited now -- so the same fact has to be held somewhere, and it is
+/// held in two places that must agree: `loader.rs` refuses
+/// `block_count == 40` by name before the audited list is ever
+/// consulted (`baichuan_13b_is_refused_because_it_uses_alibi_and_the_7b_is_not`),
+/// and the fixture behind the admission has 32 layers, not 2, because
+/// `src/models/baichuan.cpp:5-14` reads the variant off the layer count
+/// and any other value gets NO RoPE
+/// (`the_baichuan_fixture_has_the_32_layers_that_select_the_rotating_variant`).
+///
+/// What this asserts is the join: that the name really did move to the
+/// audited side, so a reader who finds the 13B refusal knows it is not
+/// the whole story.
 #[test]
-fn baichuan_says_which_of_its_two_models_the_verdict_covers() {
-    let t = unaudited_triage("baichuan").expect("verdict");
-    for claim in ["13B is a DIFFERENT model", "f_max_alibi_bias", "32-layer"] {
-        assert!(
-            t.blocker.contains(claim),
-            "baichuan's verdict drops {claim:?}: {}",
-            t.blocker
-        );
-    }
+fn baichuan_is_audited_as_the_7b_and_carries_no_stale_verdict() {
+    assert!(
+        is_audited_generic("baichuan"),
+        "baichuan-7B was admitted with a libllama-golden fixture"
+    );
+    assert!(
+        unaudited_triage("baichuan").is_none(),
+        "an audited row must carry no verdict; the refusal it used to describe now lives \
+         in loader.rs's block_count == 40 check, which is about the 13B alone"
+    );
 }
 
 /// Batch 4 and batch 5: the remaining long tail.
@@ -637,9 +645,9 @@ fn every_unaudited_row_is_triaged_and_the_distribution_is_pinned() {
     }
     assert_eq!(
         (fixture, arm, new_code, unknown),
-        (9, 2, 26, 4),
+        (4, 2, 26, 4),
         "the triage distribution moved; if a verdict changed on evidence that is correct, \
          update this and docs/MODELS.md together"
     );
-    assert_eq!(fixture + arm + new_code + unknown, 41);
+    assert_eq!(fixture + arm + new_code + unknown, 36);
 }

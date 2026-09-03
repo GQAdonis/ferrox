@@ -172,6 +172,31 @@ fn make_qkx2_quants(
     (scale, -min)
 }
 
+/// Runs one 32-element sub-block through exactly the path
+/// [`encode_block_q4_k`] uses and returns its `(scale, min)`.
+///
+/// Tooling, not a code path: it exists so a single sub-block can be
+/// compared against llama.cpp's own `make_qkx2_quants` on the same
+/// input. Chasing a floating-point difference that affects 0.55% of
+/// super-blocks by quantizing whole checkpoints is far too coarse a
+/// loop, and `examples/q4k_probe.rs` is the other half of it.
+#[doc(hidden)]
+pub fn probe_sub_block(xs: &[f32]) -> (f32, f32) {
+    assert_eq!(xs.len(), SUB_ELEMS);
+    let mut l = [0u8; SUB_ELEMS];
+    let mut laux = [0u8; SUB_ELEMS];
+    let mut weights = [0f32; SUB_ELEMS];
+    let mut sum_x2 = 0f32;
+    for &v in xs {
+        sum_x2 += v * v;
+    }
+    let av_x = (sum_x2 / SUB_ELEMS as f32).sqrt();
+    for (w, &v) in weights.iter_mut().zip(xs) {
+        *w = av_x + v.abs();
+    }
+    make_qkx2_quants(xs, &weights, &mut l, &mut laux, 15, -1.0, 0.1, 20, false)
+}
+
 /// Encodes one Q4_K super-block (exactly [`Q4_K_BLOCK_ELEMS`] values)
 /// and appends its [`Q4_K_BLOCK_BYTES`] bytes to `out`.
 pub fn encode_block_q4_k(block: &[f32; Q4_K_BLOCK_ELEMS], out: &mut Vec<u8>) {

@@ -43,82 +43,12 @@
 //! ```
 
 mod common;
-use common::assert_close;
-use ferrox_core::cache::KvCache;
+use common::{
+    assert_all_three_paths_match, graph_caches as caches, graph_fixture_path as fixture,
+    load_graph_fixture as load, worst_vs, GRAPH_PROMPT as PROMPT,
+};
 use ferrox_models::capability::QkNormStyle;
 use ferrox_models::{Decoder, ModelConfig};
-
-const PROMPT: [usize; 6] = [3, 7, 11, 19, 23, 5];
-
-/// Float32 accumulation order differs between the two engines (ggml
-/// blocks its matmuls; ferrox does not), so this is a numeric-agreement
-/// tolerance, not a bit-exactness claim. The measured worst case across
-/// all five fixtures is ~4e-7; every sabotage below moves the logits by
-/// orders of magnitude more.
-const TOL: f32 = 1e-5;
-
-fn fixture(name: &str) -> String {
-    format!(
-        "{}/tests/fixtures/{name}_tiny.gguf",
-        env!("CARGO_MANIFEST_DIR")
-    )
-}
-
-fn load(name: &str) -> Decoder {
-    let path = fixture(name);
-    let file = ferrox_gguf::GgufFile::open(&path).expect("fixture opens");
-    let config = ModelConfig::from_gguf(&file).expect("fixture config parses");
-    Decoder::from_gguf(&path, config).expect("fixture loads")
-}
-
-fn caches(decoder: &Decoder) -> Vec<KvCache> {
-    decoder
-        .layers
-        .iter()
-        .map(|_| KvCache::new(decoder.config.n_kv_heads, decoder.config.head_dim))
-        .collect()
-}
-
-/// Prefill, decode and continuous batching are three separate bodies in
-/// this repo, and the reason this helper runs all three on every
-/// architecture is that they have diverged before: five model features
-/// went missing from one of them while the others kept working.
-fn assert_all_three_paths_match(name: &str, golden: &[f32; 48]) {
-    let decoder = load(name);
-
-    let mut kv = caches(&decoder);
-    assert_close(
-        &decoder.forward_batch_last(&PROMPT, 0, &mut kv),
-        golden,
-        TOL,
-        &format!("{name}: prefill (forward_batch_last)"),
-    );
-
-    let mut kv = caches(&decoder);
-    let mut logits = Vec::new();
-    for (pos, &tok) in PROMPT.iter().enumerate() {
-        logits = decoder.forward_token(tok, pos, &mut kv);
-    }
-    assert_close(&logits, golden, TOL, &format!("{name}: decode"));
-
-    let mut kv = vec![caches(&decoder)];
-    let mut logits = Vec::new();
-    for (pos, &tok) in PROMPT.iter().enumerate() {
-        let out = decoder.forward_multi_seq(&[tok], &[pos], &mut kv);
-        logits = out.into_iter().next().unwrap();
-    }
-    assert_close(&logits, golden, TOL, &format!("{name}: multi-seq"));
-}
-
-/// The worst absolute difference from the golden logits, for the
-/// sabotage tests: a mutation that does not move this is a mutation the
-/// suite cannot see.
-fn worst_vs(got: &[f32], golden: &[f32]) -> f32 {
-    got.iter()
-        .zip(golden.iter())
-        .map(|(a, b)| (a - b).abs())
-        .fold(0f32, f32::max)
-}
 
 // --- deepseek (V1) -------------------------------------------------
 //

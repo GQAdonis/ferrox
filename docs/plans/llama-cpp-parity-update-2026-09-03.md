@@ -30,7 +30,9 @@ Logs: `.scratch/parity-run-2026-09-03/`
 
 `verify_engine::load_and_tokenize` now calls `apply_runtime_context(n_tokens + 8)` before decode load, matching `tools/llama_logits.c`. KL improved **3.6e-2 → 1.2e-2**; still borderline WRONG (threshold 1e-2).
 
-### DeepSeek-R1-Distill ([#99](https://github.com/antonellof/ferrox/issues/99) when filed)
+### Gemma-4 reference vintage ([#100](https://github.com/antonellof/ferrox/issues/100) TBD)
+
+Scratch-built `llama_logits` from `.scratch/llama.cpp` loads gemma-4; tokenizer **MATCH**. Logit parity blocked: `ferrox parity` still uses generic `Decoder`, not `Gemma4Engine`.
 
 Same qwen2 family as Qwen2.5-1.5B (DRIFT 7.7e-3) but KL **2.0e-2** — investigate hparam / quant mix, not K-quant alone.
 

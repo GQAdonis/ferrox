@@ -568,14 +568,41 @@ matching an independent NumPy transcription of
 `BertForSequenceClassification` to 4e-3 and the order matching the
 HuggingFace reference on four query sets.
 
-One known difference remains, and it is not ferrox's to fix in the
-reader: llama.cpp's converter deletes `bert.pooler.dense`, so no
-`BertForSequenceClassification` GGUF carries it and the head runs as
-`classifier(cls)` rather than `classifier(tanh(pooler(cls)))`. That
-changes the score SCALE, roughly plus or minus 0.2 where the reference
-spans plus or minus 11, and not which document wins. A client
-thresholding on an absolute score gets a range that never fires. See
-[#82](https://github.com/antonellof/ferrox/issues/82).
+### Which head ran, and why it changes the scale
+
+**A rerank response reports `ferrox_score_head`**, and a client that
+thresholds on an absolute score has to read it. There are two regimes
+and they differ by more than an order of magnitude:
+
+| `ferrox_score_head` | Meaning | Range on `ms-marco-MiniLM-L6-v2` |
+|---|---|---|
+| `classifier(tanh(pooler(cls)))` | The full head the checkpoint was trained with | about plus or minus 11 |
+| `classifier(cls)` | The classifier alone, no pooler in the file | about plus or minus 0.2 |
+
+The ORDER is the same either way; the scale is not. A client carrying
+`relevance_score > 0.5` from another engine gets a threshold that never
+fires in the second regime, which is the failure this field exists to
+prevent. A load-time NOTE says the same thing to an operator, because a
+log is what an operator sees and a JSON field is the only one a client
+can act on.
+
+Almost every GGUF in the wild is the second regime. llama.cpp's
+converter drops the pooler by name
+(`conversion/bert.py`, "we are only using BERT for embeddings so we do
+not need the pooling layer"), and under llama.cpp's tensor naming the
+pooler slot is `cls`, with `cls.output` being the classifier that
+follows it (`src/llama-graph.cpp`: `cls`, then bias, then `tanh`, then
+an optional head norm). ferrox reads `cls` when a file carries it and
+refuses to invent one when it does not.
+
+An absent pooler is a NOTE rather than a refusal on purpose: nothing in
+the file distinguishes "trained without a pooler" from "converted
+without one", and `jina-reranker-v1-tiny-en` is a real checkpoint whose
+head IS a direct projection. Refusing would reject a valid model to
+flag a lossy conversion.
+
+Tracked as [#82](https://github.com/antonellof/ferrox/issues/82), which
+stays open because no published GGUF carries the tensor yet.
 
 ## Errors that retrying will not fix
 

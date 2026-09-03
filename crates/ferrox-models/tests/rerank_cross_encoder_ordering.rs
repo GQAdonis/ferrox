@@ -50,23 +50,34 @@
 //! no torch, so it is a genuinely second implementation rather than a
 //! recording of ferrox's own output.
 //!
-//! # The one place ferrox does NOT match HuggingFace, deliberately
+//! # The one place ferrox does NOT match HuggingFace, and why (#82)
 //!
 //! llama.cpp's converter drops `bert.pooler.dense` ("we are only using
 //! BERT for embeddings so we don't need the pooling layer",
-//! `conversion/bert.py`), so the GGUF does not contain it and the head
+//! `conversion/bert.py`), so THIS GGUF does not contain it and the head
 //! runs as `classifier(cls_hidden)` instead of
 //! `classifier(tanh(pooler(cls_hidden)))`. No engine can apply a tensor
 //! that is not in the file. The measured effect is on the score SCALE
 //! (about +-0.2 rather than about +-11), not on which document wins;
 //! the reference script prints both columns so the difference stays
-//! visible. The assertions below are against the column ferrox can
-//! actually reach, plus the *ordering* of the full HuggingFace
+//! visible. Most of the assertions below are against the column ferrox
+//! can actually reach, plus the *ordering* of the full HuggingFace
 //! reference.
+//!
+//! What changed with #82's route 1 is the "cannot" in that paragraph:
+//! it is a property of the FILE, not of ferrox. When a GGUF does carry
+//! `cls`, ferrox runs it, and
+//! [`the_head_reproduces_huggingface_when_the_gguf_carries_the_pooler`]
+//! proves that against the `hf` column by splicing the checkpoint's own
+//! pooler back in. ferrox still refuses to INVENT one — see
+//! [`the_shipped_checkpoint_is_the_unpooled_regime_and_says_so`], which
+//! is the regression bar for every reranker GGUF in circulation.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use ferrox_models::{pool, EmbeddingModel, PoolingType};
+use ferrox_gguf::{GgmlType, GgufValue, GgufWriter, ShardedGguf, TensorPlan};
+use ferrox_models::{load_rank_head, pool, EmbeddingModel, PoolingType};
 
 /// The Q8_0 conversion of `cross-encoder/ms-marco-MiniLM-L6-v2`.
 ///
@@ -108,8 +119,17 @@ const REFERENCE_SCORES: [f32; 5] = [-0.027210, 0.073057, -0.172285, -0.245995, 0
 
 /// `scripts/rerank_reference_ms_marco.py`, `hf` row: the ordering the
 /// checkpoint's full HuggingFace head produces. ferrox must reproduce
-/// this ORDER even though it cannot reproduce those scores.
+/// this ORDER from the shipped GGUF even though that file cannot carry
+/// the scores.
 const REFERENCE_ORDER: [usize; 5] = [1, 4, 0, 2, 3];
+
+/// `scripts/rerank_reference_ms_marco.py`, `hf` row: the SCORES of the
+/// checkpoint's full head, `classifier(tanh(pooler(cls)))`.
+///
+/// About fifty times wider than [`REFERENCE_SCORES`], which is the
+/// whole of issue #82: the ordering is the same and an absolute
+/// threshold is not.
+const HF_REFERENCE_SCORES: [f32; 5] = [-4.320078, 8.60714, -11.101217, -11.18758, 0.636921];
 
 /// Q8_0 weights against an f64 reference. The largest deviation
 /// measured across all four query sets in the script is 1.7e-3.
@@ -301,4 +321,233 @@ fn scoring_both_halves_as_segment_zero_ranks_the_relevant_document_last() {
          scripts/rerank_reference_ms_marco.py before relaxing this"
     );
     assert_ne!(order, REFERENCE_ORDER.to_vec());
+}
+
+/// `bert.pooler.dense.{weight,bias}` as dumped by
+/// `scripts/rerank_reference_ms_marco.py --dump-pooler`: the eight-byte
+/// magic, `[out, in]` as two little-endian `u32`, then `out * in`
+/// float32 in row-major `[out][in]` order, then `out` float32 of bias.
+///
+/// Absence is a failure for the same reason the checkpoint's is — see
+/// the module docs.
+fn pooler_weights() -> (usize, usize, Vec<u8>, Vec<u8>) {
+    let path =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../models/ms-marco-MiniLM-L6-v2-pooler.bin");
+    assert!(
+        path.exists(),
+        "{} is missing. It is the checkpoint's own pooler, which the GGUF does not carry \
+         (issue #82), dumped from the safetensors by the same NumPy reference this file's \
+         golden values come from:\n    \
+         python3 scripts/rerank_reference_ms_marco.py --dump-pooler \
+         models/ms-marco-MiniLM-L6-v2-pooler.bin",
+        path.display()
+    );
+    let raw = std::fs::read(&path).expect("read the pooler dump");
+    assert!(
+        raw.len() >= 16 && &raw[..8] == b"FXPOOL01",
+        "{} is not a --dump-pooler file (magic is {:?})",
+        path.display(),
+        &raw[..raw.len().min(8)]
+    );
+    let u32_at = |o: usize| u32::from_le_bytes(raw[o..o + 4].try_into().unwrap()) as usize;
+    let (out, inp) = (u32_at(8), u32_at(12));
+    let w_end = 16 + out * inp * 4;
+    let b_end = w_end + out * 4;
+    assert_eq!(
+        raw.len(),
+        b_end,
+        "{} is {} bytes but [{out}, {inp}] + [{out}] needs {b_end}",
+        path.display(),
+        raw.len()
+    );
+    (
+        out,
+        inp,
+        raw[16..w_end].to_vec(),
+        raw[w_end..b_end].to_vec(),
+    )
+}
+
+/// Writes a GGUF carrying ONLY a classification head: this
+/// checkpoint's own `cls.output` bytes, copied verbatim with their
+/// dtype and shape, plus the `cls` the converter deleted.
+///
+/// A head-only file rather than a rewritten 25 MB checkpoint, because
+/// the encoder half is already proven against the real weights by every
+/// other test here — what has never run is the loader finding `cls` in
+/// a file and orienting it. `load_rank_head` takes the architecture and
+/// the width as parameters, so it needs no hparams and no encoder
+/// tensors to do that.
+fn write_pooled_head_gguf(
+    file: &ShardedGguf,
+    out: usize,
+    inp: usize,
+    w: &[u8],
+    b: &[u8],
+) -> PathBuf {
+    let mut metadata = BTreeMap::new();
+    metadata.insert(
+        "general.architecture".to_string(),
+        GgufValue::String("bert".to_string()),
+    );
+    metadata.insert(
+        "bert.classifier.output_labels".to_string(),
+        GgufValue::Array(vec![GgufValue::String("LABEL_0".to_string())]),
+    );
+
+    // GGUF's `ne[]` is fastest-dimension-first, so a `[out, in]` matrix
+    // is stored `[in, out]`. Getting this backwards is caught by
+    // `load_rank_head`'s own width check, and the pooler is square, so
+    // it is stated rather than relied upon.
+    let mut plan = vec![
+        TensorPlan {
+            name: "cls.weight".to_string(),
+            shape: vec![inp as u64, out as u64],
+            dtype: GgmlType::F32,
+            byte_len: w.len(),
+        },
+        TensorPlan {
+            name: "cls.bias".to_string(),
+            shape: vec![out as u64],
+            dtype: GgmlType::F32,
+            byte_len: b.len(),
+        },
+    ];
+    let copied: Vec<(&str, Vec<u8>)> = ["cls.output.weight", "cls.output.bias"]
+        .iter()
+        .map(|name| {
+            let info = file
+                .find_tensor(name)
+                .unwrap_or_else(|| panic!("the checkpoint carries {name}"));
+            let bytes = file.tensor_bytes(name).expect("read the tensor").to_vec();
+            plan.push(TensorPlan {
+                name: (*name).to_string(),
+                shape: info.shape.clone(),
+                dtype: info.dtype,
+                byte_len: bytes.len(),
+            });
+            (*name, bytes)
+        })
+        .collect();
+
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"));
+    std::fs::create_dir_all(&dir).expect("create the fixture directory");
+    let path = dir.join(format!("ms-marco-head-pooled-{}.gguf", std::process::id()));
+    let sink = std::fs::File::create(&path).expect("create the fixture");
+    let mut writer = GgufWriter::create(sink, &metadata, plan).expect("write the header");
+    writer.write_tensor("cls.weight", w).expect("write cls");
+    writer.write_tensor("cls.bias", b).expect("write cls.bias");
+    for (name, bytes) in &copied {
+        writer.write_tensor(name, bytes).expect("copy cls.output");
+    }
+    writer.finish().expect("finish the fixture");
+    path
+}
+
+/// **The regression bar for every reranker GGUF that exists today.**
+///
+/// The shipped checkpoint has no pooler, and #82's route 1 must not
+/// have changed a single thing about how it scores: no invented
+/// identity pooler, no zero-filled `cls`, the same numbers this file
+/// has asserted since #44. A fabricated pooler would be worse than the
+/// uncalibrated score, because it would be a number no checkpoint ever
+/// produced, reported under the model's own name.
+///
+/// It also pins the other half of route 1: which regime a caller is in
+/// has to be VISIBLE, because the two differ by about fifty times and
+/// nothing errors in between. `graph()` is what `/v1/rerank` puts on
+/// every response as `ferrox_score_head`.
+#[test]
+#[ignore = "needs models/ms-marco-MiniLM-L6-v2-Q8_0.gguf"]
+fn the_shipped_checkpoint_is_the_unpooled_regime_and_says_so() {
+    let model = EmbeddingModel::from_gguf_path(checkpoint()).expect("load the reranker");
+    let head = model.rank_head().expect("head is present");
+    assert!(
+        !head.has_pooler(),
+        "llama.cpp's converter deletes pooler.dense, so this file cannot carry a cls.weight; \
+         if it now does, the GGUF changed and HF_REFERENCE_SCORES is the golden set"
+    );
+    assert_eq!(head.graph(), "classifier(cls)");
+
+    let scores: Vec<f32> = DOCUMENTS
+        .iter()
+        .map(|d| {
+            let pair = model.rerank_input(QUERY, d).expect("pair input");
+            model.rerank_score(&pair).expect("score")
+        })
+        .collect();
+    for (i, (got, want)) in scores.iter().zip(REFERENCE_SCORES).enumerate() {
+        assert!(
+            (got - want).abs() < TOLERANCE,
+            "document {i}: ferrox {got}, NumPy reference {want} -- the unpooled path moved"
+        );
+    }
+}
+
+/// **What route 1 of #82 buys.** Splice the checkpoint's own
+/// `bert.pooler.dense` back in, and ferrox reproduces the `hf` column
+/// of `scripts/rerank_reference_ms_marco.py` -- the scores the
+/// cross-encoder was trained to produce -- with no change to ferrox
+/// beyond reading a tensor that is present.
+///
+/// This is the evidence for the claim route 1 exists to make: a
+/// converter that keeps `pooler.dense` needs no second change here. It
+/// was a claim about a code path that had never executed, because every
+/// published reranker GGUF is missing the tensor.
+///
+/// The encoder is the real Q8_0 one and the reference is f64, so the
+/// tolerance is looser than [`TOLERANCE`] in absolute terms and much
+/// tighter relative to a +-11 range. The assertion that carries the
+/// point is the one against [`REFERENCE_SCORES`]: the same hidden
+/// states, through the pooled head, are about FIFTY times larger.
+#[test]
+#[ignore = "needs models/ms-marco-MiniLM-L6-v2-Q8_0.gguf and its --dump-pooler sidecar"]
+fn the_head_reproduces_huggingface_when_the_gguf_carries_the_pooler() {
+    let model = EmbeddingModel::from_gguf_path(checkpoint()).expect("load the reranker");
+    let (out, inp, w, b) = pooler_weights();
+    assert_eq!((out, inp), (model.n_embd(), model.n_embd()));
+
+    let source = ShardedGguf::open(checkpoint()).expect("reopen the checkpoint");
+    let path = write_pooled_head_gguf(&source, out, inp, &w, &b);
+    let spliced = ShardedGguf::open(&path).expect("open the head fixture");
+    let head = load_rank_head(&spliced, "bert", model.n_embd(), 1e-12)
+        .expect("the head loads")
+        .expect("the fixture carries a head");
+    assert!(head.has_pooler());
+    assert_eq!(head.graph(), "classifier(tanh(pooler(cls)))");
+
+    let pooled: Vec<f32> = DOCUMENTS
+        .iter()
+        .map(|d| {
+            let pair = model.rerank_input(QUERY, d).expect("pair input");
+            let hidden = model.pair_hidden_states(&pair).expect("hidden states");
+            let cls = pool(&hidden, model.n_embd(), PoolingType::Cls).expect("cls row");
+            head.score(&cls)
+        })
+        .collect();
+    std::fs::remove_file(&path).ok();
+
+    // Q8_0 weights against an f64 reference, on a +-11 range: the
+    // largest deviation measured across these five documents is 0.011,
+    // i.e. 0.1% -- tighter in relative terms than TOLERANCE is on the
+    // unpooled +-0.2 range.
+    const POOLED_TOLERANCE: f32 = 0.02;
+    for (i, (got, want)) in pooled.iter().zip(HF_REFERENCE_SCORES).enumerate() {
+        assert!(
+            (got - want).abs() < POOLED_TOLERANCE,
+            "document {i}: ferrox with the pooler {got}, HuggingFace {want}"
+        );
+    }
+    assert_eq!(ranking(&pooled), REFERENCE_ORDER.to_vec());
+
+    // And the size of what #82 is about: the same encoder, the same
+    // documents, one tensor's presence, fifty times the range.
+    let widest = |v: &[f32]| v.iter().fold(0.0f32, |m, s| m.max(s.abs()));
+    let unpooled = widest(&REFERENCE_SCORES);
+    assert!(
+        widest(&pooled) > 20.0 * unpooled,
+        "the pooled head's range ({}) is not the calibration difference #82 describes \
+         against the unpooled {unpooled}",
+        widest(&pooled)
+    );
 }

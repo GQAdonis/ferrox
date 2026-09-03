@@ -39,6 +39,27 @@
 //! and it is invisible in the easy cases — a one-document request, or
 //! any input that happened to arrive already ordered — so
 //! [`ranking`] carries it and is tested directly.
+//!
+//! # `relevance_score` has two possible scales, and the response says which
+//!
+//! `ferrox_score_head` on every response is the checkpoint's head as a
+//! formula: `classifier(tanh(pooler(cls)))` when the GGUF carries
+//! `cls` (HuggingFace's `bert.pooler.dense`), `classifier(cls)` when it
+//! does not. Those two differ by roughly a factor of FIFTY in score
+//! magnitude — about ±11 against about ±0.2 on
+//! `ms-marco-MiniLM-L6-v2` — because the pooler and its `tanh` are
+//! most of what calibrates a `BertForSequenceClassification` head.
+//!
+//! llama.cpp's converter deletes `pooler.dense` by name, so every
+//! reranker GGUF in circulation is the second kind (issue #82). ferrox
+//! runs the pooler whenever a file carries one and never invents one,
+//! which leaves this route with a real obligation: a client sorting by
+//! `relevance_score` is unaffected either way, and a client applying
+//! `relevance_score > 0.5` — the Cohere/Jina idiom — is in a range
+//! where that threshold can simply never fire. Nothing errors. So the
+//! regime travels with the scores rather than living only in the
+//! server's log, because the log is read by an operator and the
+//! threshold is written by a client.
 
 use std::sync::Arc;
 
@@ -347,6 +368,13 @@ async fn rerank_inner(
     let score_label = encoder
         .rank_head()
         .and_then(|h| h.labels().first().cloned());
+    // Which of the two score scales in the module docs this response
+    // is on. Taken from the head that is about to run, not from a
+    // second opinion about what a reranker checkpoint contains:
+    // `RankHead::graph` is derived from the same `Option`s
+    // `RankHead::apply` branches on, so the label cannot describe a
+    // graph other than the one that produced these numbers.
+    let score_head = encoder.rank_head().map(|h| h.graph());
 
     let documents = Arc::new(req.documents);
     let (scores, prompt_tokens) =
@@ -364,6 +392,9 @@ async fn rerank_inner(
     });
     if let Some(label) = score_label {
         body["ferrox_score_label"] = serde_json::json!(label);
+    }
+    if let Some(head) = score_head {
+        body["ferrox_score_head"] = serde_json::json!(head);
     }
     Ok((body, prompt_tokens))
 }

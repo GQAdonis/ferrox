@@ -33,6 +33,20 @@ not on the `hf` column.
 
 `seg0` is the one that was wrong: it puts the RELEVANT document LAST in
 three of these four rankings.
+
+# Dumping the pooler, so Rust can reach the `hf` column too
+
+    python3 scripts/rerank_reference_ms_marco.py --dump-pooler \
+        models/ms-marco-MiniLM-L6-v2-pooler.bin
+
+writes `bert.pooler.dense.{weight,bias}` as raw little-endian float32
+behind an eight-byte magic and two u32 dimensions. ferrox cannot invent
+that tensor, but it CAN run one that is present (issue #82, route 1),
+and `crates/ferrox-models/tests/rerank_cross_encoder_ordering.rs`
+splices this file into a head-only GGUF to prove it reproduces the `hf`
+column above rather than merely running. The dump is the checkpoint's
+own weights, not a re-derivation, so the Rust side is still checked
+against THIS script's arithmetic and not against its own.
 """
 
 import json
@@ -206,8 +220,40 @@ VARIANTS = [
     ("seg0  ", dict(pooler=False, segment_ids=False)),
 ]
 
+# The Rust reader checks this before anything else, so a truncated or
+# unrelated file is a named failure rather than 590 KB of garbage
+# floats. Bump the digits if the layout below ever changes.
+POOLER_MAGIC = b"FXPOOL01"
+
+
+def dump_pooler(path):
+    """Write `bert.pooler.dense.{weight,bias}` for the Rust fixture.
+
+    Layout: the magic, then the weight's `[out, in]` as two
+    little-endian u32, then `out * in` float32 in C order (which is
+    exactly ggml's row-major `[out][in]`, so the bytes go into a GGUF
+    `cls.weight` verbatim), then `out` float32 of bias.
+    """
+    w = np.ascontiguousarray(W["bert.pooler.dense.weight"], dtype="<f4")
+    b = np.ascontiguousarray(W["bert.pooler.dense.bias"], dtype="<f4")
+    out, inp = w.shape
+    if b.shape != (out,):
+        raise SystemExit(f"pooler bias is {b.shape}, expected ({out},)")
+    with open(path, "wb") as f:
+        f.write(POOLER_MAGIC)
+        f.write(np.array([out, inp], dtype="<u4").tobytes())
+        f.write(w.tobytes())
+        f.write(b.tobytes())
+    print(f"wrote {path}: pooler.dense [{out}, {inp}] + bias [{out}]")
+
 
 def main():
+    if "--dump-pooler" in sys.argv:
+        i = sys.argv.index("--dump-pooler")
+        if i + 1 >= len(sys.argv):
+            raise SystemExit("--dump-pooler needs a path")
+        dump_pooler(sys.argv[i + 1])
+        return 0
     for query, documents in CASES:
         print(f"\nQ: {query}")
         for label, kwargs in VARIANTS:

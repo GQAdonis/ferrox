@@ -21,7 +21,9 @@ fn qwen15_moe_gate_and_up_expert_bytes_match() {
     }
     let file = ShardedGguf::open(&path).expect("open");
     let n_experts = 60usize;
-    let gate = file.tensor_bytes("blk.0.ffn_gate_exps.weight").expect("gate");
+    let gate = file
+        .tensor_bytes("blk.0.ffn_gate_exps.weight")
+        .expect("gate");
     let up = file.tensor_bytes("blk.0.ffn_up_exps.weight").expect("up");
     assert_eq!(gate.len() % n_experts, 0);
     assert_eq!(up.len() % n_experts, 0);

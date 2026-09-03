@@ -1,4 +1,5 @@
 //! Qwen1.5-MoE Metal prefill launch against real checkpoint weights.
+#![cfg(feature = "metal")]
 
 use std::path::{Path, PathBuf};
 
@@ -14,7 +15,6 @@ fn qwen2moe_gguf_path() -> PathBuf {
 }
 
 #[test]
-#[cfg(feature = "metal")]
 #[ignore = "needs models/Qwen1.5-MoE-A2.7B-Chat-Q4_K_M.gguf and Metal"]
 fn qwen15_moe_layer3_q5_0_down_prefill_launch_succeeds() {
     let path = qwen2moe_gguf_path();
@@ -44,19 +44,11 @@ fn qwen15_moe_layer3_q5_0_down_prefill_launch_succeeds() {
             route.push(1.0 / top_k as f32);
         }
     }
-    ferrox_metal::gpu::launch_moe_prefill_q4_0(
-        &x_batch,
-        n_tokens,
-        &packed,
-        &ids,
-        &route,
-        top_k,
-    )
-    .expect("Q5_0 down prefill");
+    ferrox_metal::gpu::launch_moe_prefill_q4_0(&x_batch, n_tokens, &packed, &ids, &route, top_k)
+        .expect("Q5_0 down prefill");
 }
 
 #[test]
-#[cfg(feature = "metal")]
 #[ignore = "needs models/Qwen1.5-MoE-A2.7B-Chat-Q4_K_M.gguf and Metal"]
 fn qwen15_moe_real_weights_prefill_launch_succeeds() {
     let path = qwen2moe_gguf_path();
@@ -107,12 +99,7 @@ fn qwen15_moe_real_weights_prefill_launch_succeeds() {
     }
 
     match ferrox_metal::gpu::launch_moe_prefill_q4_0(
-        &x_batch,
-        n_tokens,
-        &packed,
-        &ids,
-        &route,
-        top_k,
+        &x_batch, n_tokens, &packed, &ids, &route, top_k,
     ) {
         Ok(out) => assert_eq!(out.len(), n_tokens * hidden),
         Err(e) => panic!("launch_moe_prefill_q4_0 failed: {e:?}"),

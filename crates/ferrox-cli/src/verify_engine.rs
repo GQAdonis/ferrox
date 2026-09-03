@@ -9,7 +9,10 @@ use ferrox_core::cache::KvCache;
 use ferrox_gguf::ShardedGguf;
 use ferrox_models::config::ModelConfig;
 use ferrox_models::decoder::Decoder;
+use ferrox_models::engine::Engine;
+use ferrox_models::engine_factory::{load_gemma4_engine_from_path, ServedEngine};
 use ferrox_models::tokenizer::{GgufBpeTokenizer, GgufSpmTokenizer, GgufUnigramTokenizer};
+use ferrox_models::GEMMA4_ARCHES;
 use std::path::Path;
 
 enum Tok {
@@ -82,7 +85,16 @@ pub fn prefill_logits(
     prompt: &str,
     prompt_tokens: Option<usize>,
 ) -> anyhow::Result<(Vec<u32>, Vec<f32>)> {
-    let (decoder, tokens, _eos) = load_and_tokenize(path, prompt, prompt_tokens)?;
+    let (file, tokens, _eos, runtime_ctx) = tokenize_checkpoint(path, prompt, prompt_tokens)?;
+    let arch = file
+        .metadata_str("general.architecture")
+        .unwrap_or_default();
+    if GEMMA4_ARCHES.contains(&arch) {
+        return prefill_logits_gemma4(path, &tokens);
+    }
+    let mut config = ModelConfig::from_gguf(&file).context("reading model config")?;
+    config.apply_runtime_context(runtime_ctx);
+    let decoder = Decoder::from_gguf(path, config)?;
     let mut caches: Vec<KvCache> = (0..decoder.layers.len())
         .map(|_| KvCache::new(decoder.config.n_kv_heads, decoder.config.head_dim))
         .collect();
@@ -90,16 +102,26 @@ pub fn prefill_logits(
     Ok((tokens.into_iter().map(|t| t as u32).collect(), logits))
 }
 
-/// Shared setup: open the GGUF, build the tokenizer the header names,
-/// encode the prompt (adding BOS only when the checkpoint says to),
-/// stretch it if asked, and build the decoder.
-pub(crate) fn load_and_tokenize(
+fn prefill_logits_gemma4(path: &Path, tokens: &[usize]) -> anyhow::Result<(Vec<u32>, Vec<f32>)> {
+    let served = load_gemma4_engine_from_path(path).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let ServedEngine::Gemma4(engine) = served else {
+        anyhow::bail!("expected Gemma4Engine for gemma4 checkpoint");
+    };
+    let mut state = Engine::new_state(engine.as_ref());
+    let mut logits = Vec::new();
+    for (pos, &tok) in tokens.iter().enumerate() {
+        logits = Engine::forward_token(engine.as_ref(), tok, pos, &mut state);
+    }
+    Ok((tokens.iter().map(|&t| t as u32).collect(), logits))
+}
+
+/// Tokenize a prompt the same way verify/parity do, without loading weights.
+fn tokenize_checkpoint(
     path: &Path,
     prompt: &str,
     prompt_tokens: Option<usize>,
-) -> anyhow::Result<(Decoder, Vec<usize>, Option<usize>)> {
+) -> anyhow::Result<(ShardedGguf, Vec<usize>, Option<usize>, usize)> {
     let file = ShardedGguf::open(path)?;
-    let mut config = ModelConfig::from_gguf(&file).context("reading model config")?;
     let tokenizer = match file.metadata_str("tokenizer.ggml.model") {
         Some("gpt2" | "gemma4") => Tok::Bpe(Box::new(GgufBpeTokenizer::from_gguf(&file)?)),
         Some("llama") => Tok::Spm(GgufSpmTokenizer::from_gguf(&file)?),
@@ -127,15 +149,30 @@ pub(crate) fn load_and_tokenize(
     if let Some(want) = prompt_tokens {
         tokens = stretch_prompt(tokens, want, bos)?;
     }
+    let runtime_ctx = tokens.len() + 8;
+    Ok((file, tokens, eos, runtime_ctx))
+}
 
-    // Match `tools/llama_logits.c`: the reference sets `n_ctx = n_tokens + 8`.
-    // LongRoPE checkpoints (Phi-4) pick short vs long `rope_factors_*` from
-    // the run context, not the file's trained context_length — skipping this
-    // made parity apply the long set while llama.cpp applied the short one.
-    config.apply_runtime_context(tokens.len() + 8);
-
+/// Shared setup: open the GGUF, build the tokenizer the header names,
+/// encode the prompt (adding BOS only when the checkpoint says to),
+/// stretch it if asked, and build the decoder.
+pub(crate) fn load_and_tokenize(
+    path: &Path,
+    prompt: &str,
+    prompt_tokens: Option<usize>,
+) -> anyhow::Result<(Decoder, Vec<usize>, Option<usize>)> {
+    let (file, tokens, eos, runtime_ctx) = tokenize_checkpoint(path, prompt, prompt_tokens)?;
+    let arch = file
+        .metadata_str("general.architecture")
+        .unwrap_or_default();
+    if GEMMA4_ARCHES.contains(&arch) {
+        anyhow::bail!(
+            "architecture '{arch}' uses Gemma4Engine; use prefill_logits or ferrox run, not generic Decoder"
+        );
+    }
+    let mut config = ModelConfig::from_gguf(&file).context("reading model config")?;
+    config.apply_runtime_context(runtime_ctx);
     let decoder = Decoder::from_gguf(path, config)?;
-
     Ok((decoder, tokens, eos))
 }
 

@@ -6,7 +6,9 @@
 //! on why ferrox's Q4_K matches a reference built with
 //! `-ffp-contract=off` exactly and an optimised one only approximately.
 fn main() {
-    let path = std::env::args().nth(1).unwrap_or_else(|| "/tmp/blk.in".to_string());
+    let path = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "/tmp/blk.in".to_string());
     let hex: Vec<u32> = std::fs::read_to_string(&path)
         .unwrap_or_else(|e| panic!("reading {path}: {e}"))
         .lines()

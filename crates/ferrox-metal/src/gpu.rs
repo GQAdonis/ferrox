@@ -500,6 +500,134 @@ kernel void q5_0_matvec(
 }
 "#;
 
+/// llama.cpp `mul_mv_id` slot-parallel MoE matvec for Q5_0 packed planes.
+pub const Q5_0_MOE_MATVEC_ID_KERNEL_SRC: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+inline float q5_0_mv_dot(device const uchar* block, thread const float* yl) {
+    const float d = float(*(device const half*)block);
+    const uint qh = uint(block[2]) | (uint(block[3]) << 8)
+        | (uint(block[4]) << 16) | (uint(block[5]) << 24);
+    device const uchar* qs = block + 6;
+    float acc = 0.0f;
+    for (uint j = 0u; j < 16u; ++j) {
+        const uint xh_0 = ((qh >> j) << 4) & 0x10u;
+        const uint xh_1 = (qh >> (j + 12u)) & 0x10u;
+        const int x0 = int((uint(qs[j]) & 0x0Fu) | xh_0) - 16;
+        const int x1 = int((uint(qs[j]) >> 4) | xh_1) - 16;
+        acc += yl[j] * float(x0) + yl[j + 16u] * float(x1);
+    }
+    return d * acc;
+}
+
+kernel void q5_0_moe_matvec_id(
+    device const uchar* w_all [[buffer(0)]],
+    device const float* x [[buffer(1)]],
+    device float* out [[buffer(2)]],
+    device const int* ids [[buffer(3)]],
+    constant uint& row_bytes [[buffer(4)]],
+    constant uint& n_blocks [[buffer(5)]],
+    constant uint& n_rows [[buffer(6)]],
+    constant uint& top_k [[buffer(7)]],
+    constant uint& expert_stride [[buffer(8)]],
+    constant uint& n_tokens [[buffer(9)]],
+    constant uint& x_stride [[buffer(10)]],
+    uint3 tgpig [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]]
+) {
+    constexpr uint NR = 4u;
+    constexpr uint NSG = 2u;
+    const uint group = tgpig.x;
+    const uint slot = tgpig.z;
+    const uint first_row = (group * NSG + sg) * NR;
+    const uint n_slots = n_tokens * top_k;
+    if (slot >= n_slots) return;
+    const uint token = slot / top_k;
+    const uint eid = uint(ids[slot]);
+    device const uchar* w = w_all + (size_t)eid * expert_stride;
+    float acc[NR] = { 0.0f };
+    device const uchar* ax[NR];
+    for (uint rr = 0u; rr < NR; ++rr) {
+        const uint row = min(first_row + rr, n_rows > 0u ? n_rows - 1u : 0u);
+        ax[rr] = w + (size_t)row * row_bytes;
+    }
+    for (uint b = lane; b < n_blocks; b += 32u) {
+        float yl[32];
+        device const float* yb = x + (size_t)token * x_stride + b * 32u;
+        for (uint i = 0u; i < 32u; ++i) {
+            yl[i] = yb[i];
+        }
+        for (uint rr = 0u; rr < NR; ++rr) {
+            const uint row = first_row + rr;
+            if (row >= n_rows) continue;
+            acc[rr] += q5_0_mv_dot(ax[rr] + (size_t)b * 22u, yl);
+        }
+    }
+    for (uint rr = 0u; rr < NR; ++rr) {
+        const uint row = first_row + rr;
+        const float sum = simd_sum(acc[rr]);
+        if (lane == 0u && row < n_rows) {
+            out[(size_t)slot * n_rows + row] = sum;
+        }
+    }
+}
+
+kernel void q5_0_moe_down_id(
+    device const uchar* down_all [[buffer(0)]],
+    device const float* act [[buffer(1)]],
+    device float* expert_out [[buffer(2)]],
+    device const int* ids [[buffer(3)]],
+    constant uint& row_bytes [[buffer(4)]],
+    constant uint& n_blocks [[buffer(5)]],
+    constant uint& hidden_rows [[buffer(6)]],
+    constant uint& ffn_rows [[buffer(7)]],
+    constant uint& top_k [[buffer(8)]],
+    constant uint& expert_stride [[buffer(9)]],
+    constant uint& n_tokens [[buffer(10)]],
+    uint3 tgpig [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]]
+) {
+    constexpr uint NR = 4u;
+    constexpr uint NSG = 2u;
+    const uint group = tgpig.x;
+    const uint slot = tgpig.z;
+    const uint first_row = (group * NSG + sg) * NR;
+    const uint n_slots = n_tokens * top_k;
+    if (slot >= n_slots) return;
+    const uint eid = uint(ids[slot]);
+    device const uchar* wd = down_all + (size_t)eid * expert_stride;
+    device const float* xa = act + (size_t)slot * ffn_rows;
+    float acc[NR] = { 0.0f };
+    device const uchar* ax[NR];
+    for (uint rr = 0u; rr < NR; ++rr) {
+        const uint row = min(first_row + rr, hidden_rows > 0u ? hidden_rows - 1u : 0u);
+        ax[rr] = wd + (size_t)row * row_bytes;
+    }
+    for (uint b = lane; b < n_blocks; b += 32u) {
+        float yl[32];
+        device const float* yb = xa + b * 32u;
+        for (uint i = 0u; i < 32u; ++i) {
+            yl[i] = yb[i];
+        }
+        for (uint rr = 0u; rr < NR; ++rr) {
+            const uint row = first_row + rr;
+            if (row >= hidden_rows) continue;
+            acc[rr] += q5_0_mv_dot(ax[rr] + (size_t)b * 22u, yl);
+        }
+    }
+    for (uint rr = 0u; rr < NR; ++rr) {
+        const uint row = first_row + rr;
+        const float sum = simd_sum(acc[rr]);
+        if (lane == 0u && row < hidden_rows) {
+            expert_out[(size_t)slot * hidden_rows + row] = sum;
+        }
+    }
+}
+"#;
+
 pub const Q4_0_MATVEC_KERNEL_SRC: &str = r#"
 #include <metal_stdlib>
 using namespace metal;
@@ -5660,6 +5788,13 @@ fn moe_matvec_id_dispatch(kind: &str) -> Option<MoeMatvecIdDispatch> {
             tg_threads: (32, 2, 1),
             tg_mem: 0,
         }),
+        "Q5_0" => Some(MoeMatvecIdDispatch {
+            kernel_src: Q5_0_MOE_MATVEC_ID_KERNEL_SRC,
+            fn_name: "q5_0_moe_matvec_id",
+            rows_per_tg: 8,
+            tg_threads: (32, 2, 1),
+            tg_mem: 0,
+        }),
         "Q4_K" => Some(MoeMatvecIdDispatch {
             kernel_src: Q4_K_MOE_MATVEC_ID_KERNEL_SRC,
             fn_name: "q4_k_moe_matvec_id",
@@ -5683,6 +5818,13 @@ fn moe_down_id_dispatch(kind: &str) -> Option<MoeMatvecIdDispatch> {
         "Q4_0" => Some(MoeMatvecIdDispatch {
             kernel_src: Q4_0_MOE_TOPK_KERNEL_SRC,
             fn_name: "q4_0_moe_down_id",
+            rows_per_tg: 8,
+            tg_threads: (32, 2, 1),
+            tg_mem: 0,
+        }),
+        "Q5_0" => Some(MoeMatvecIdDispatch {
+            kernel_src: Q5_0_MOE_MATVEC_ID_KERNEL_SRC,
+            fn_name: "q5_0_moe_down_id",
             rows_per_tg: 8,
             tg_threads: (32, 2, 1),
             tg_mem: 0,
@@ -6348,6 +6490,13 @@ fn moe_use_mm_id(max_batch: usize, gate_kind: &str, up_kind: &str, down_kind: &s
         && mul_mm_id_meta(down_kind).is_some()
 }
 
+/// Whether the packed-id MoE prefill matvec path supports all three planes.
+pub fn moe_packed_mul_mv_id_supported(gate_kind: &str, up_kind: &str, down_kind: &str) -> bool {
+    moe_matvec_id_dispatch(gate_kind).is_some()
+        && moe_matvec_id_dispatch(up_kind).is_some()
+        && moe_down_id_dispatch(down_kind).is_some()
+}
+
 /// Prefill MoE FFN: packed-id experts over `n_tokens` positions in one CB.
 /// `x_batch` is `[T, H]`, `ids`/`route` are `[T, top_k]` (host-routed).
 ///
@@ -6420,12 +6569,16 @@ pub fn launch_moe_prefill_q4_0(
         let mm_id_tpe_buf: &ProtocolObject<dyn MTLBuffer> = scratch.mm_id_tpe.as_ref();
         let mm_id_ids_buf: &ProtocolObject<dyn MTLBuffer> = scratch.mm_id_ids.as_ref();
 
-        let cmd_buf = queue.commandBuffer().ok_or(MetalError::CommandFailed)?;
+        let cmd_buf = queue
+            .commandBuffer()
+            .ok_or(MetalError::CommandFailed)?;
 
         if use_mm_id {
-            let encoder = cmd_buf
-                .computeCommandEncoder()
-                .ok_or(MetalError::CommandFailed)?;
+            // Resolve weights and pipeline names before opening an encoder.
+            // `moe_packed_resident` can fail; creating the encoder first and
+            // then `?`-ing left it without `endEncoding`, which poisons the
+            // queue (`Command encoder released without endEncoding`) and
+            // makes every later layer report bare `CommandFailed`.
             let bound = moe_packed_resident(device, packed)?;
             let (gate_fn, gate_bb, gate_be) =
                 mul_mm_id_meta(packed.gate_kind).ok_or(MetalError::CommandFailed)?;
@@ -6464,89 +6617,95 @@ pub fn launch_moe_prefill_q4_0(
                 );
             }
 
-            encode_mul_mm_id(
-                &encoder,
-                device,
-                gate_fn,
-                &bound.gate,
-                packed.gate_stride as u32,
-                &x_buf,
-                gate_buf,
-                mm_id_ids_buf,
-                mm_id_tpe_buf,
-                n_experts_u,
-                n_tokens_u,
-                top_k_u,
-                ffn_u,
-                gate_cols,
-                packed.gate_row_bytes as u32,
-                0,
-            )?;
-            encode_mul_mm_id(
-                &encoder,
-                device,
-                up_fn,
-                &bound.up,
-                packed.up_stride as u32,
-                &x_buf,
-                up_buf,
-                mm_id_ids_buf,
-                mm_id_tpe_buf,
-                n_experts_u,
-                n_tokens_u,
-                top_k_u,
-                ffn_u,
-                up_cols,
-                up_row_bytes as u32,
-                0,
-            )?;
-            memory_barrier_resources(&encoder, &[gate_buf, up_buf]);
-            crate::elem::encode_silu_mul(
-                &encoder,
-                device,
-                gate_buf,
-                up_buf,
-                act_buf,
-                (n_slots * ffn) as u32,
-            )?;
-            memory_barrier_resources(&encoder, &[act_buf]);
-            encode_mul_mm_id(
-                &encoder,
-                device,
-                down_fn,
-                &bound.down,
-                packed.down_stride as u32,
-                act_buf,
-                expert_out_buf,
-                mm_id_ids_buf,
-                mm_id_tpe_buf,
-                n_experts_u,
-                n_tokens_u,
-                top_k_u,
-                hidden_u,
-                down_cols,
-                packed.down_row_bytes as u32,
-                1,
-            )?;
-            memory_barrier_resources(&encoder, &[expert_out_buf]);
-            encode_moe_prefill_weighted_sum(
-                &encoder,
-                device,
-                expert_out_buf,
-                &route_buf,
-                out_buf,
-                hidden_u,
-                top_k_u,
-                n_tokens_u,
-            )?;
+            let encoder = cmd_buf
+                .computeCommandEncoder()
+                .ok_or(MetalError::CommandFailed)?;
+            let enc_result = (|| {
+                encode_mul_mm_id(
+                    &encoder,
+                    device,
+                    gate_fn,
+                    &bound.gate,
+                    packed.gate_stride as u32,
+                    &x_buf,
+                    gate_buf,
+                    mm_id_ids_buf,
+                    mm_id_tpe_buf,
+                    n_experts_u,
+                    n_tokens_u,
+                    top_k_u,
+                    ffn_u,
+                    gate_cols,
+                    packed.gate_row_bytes as u32,
+                    0,
+                )?;
+                encode_mul_mm_id(
+                    &encoder,
+                    device,
+                    up_fn,
+                    &bound.up,
+                    packed.up_stride as u32,
+                    &x_buf,
+                    up_buf,
+                    mm_id_ids_buf,
+                    mm_id_tpe_buf,
+                    n_experts_u,
+                    n_tokens_u,
+                    top_k_u,
+                    ffn_u,
+                    up_cols,
+                    up_row_bytes as u32,
+                    0,
+                )?;
+                memory_barrier_resources(&encoder, &[gate_buf, up_buf]);
+                crate::elem::encode_silu_mul(
+                    &encoder,
+                    device,
+                    gate_buf,
+                    up_buf,
+                    act_buf,
+                    (n_slots * ffn) as u32,
+                )?;
+                memory_barrier_resources(&encoder, &[act_buf]);
+                encode_mul_mm_id(
+                    &encoder,
+                    device,
+                    down_fn,
+                    &bound.down,
+                    packed.down_stride as u32,
+                    act_buf,
+                    expert_out_buf,
+                    mm_id_ids_buf,
+                    mm_id_tpe_buf,
+                    n_experts_u,
+                    n_tokens_u,
+                    top_k_u,
+                    hidden_u,
+                    down_cols,
+                    packed.down_row_bytes as u32,
+                    1,
+                )?;
+                memory_barrier_resources(&encoder, &[expert_out_buf]);
+                encode_moe_prefill_weighted_sum(
+                    &encoder,
+                    device,
+                    expert_out_buf,
+                    &route_buf,
+                    out_buf,
+                    hidden_u,
+                    top_k_u,
+                    n_tokens_u,
+                )
+            })();
             encoder.endEncoding();
+            enc_result?;
             cmd_buf.commit();
             cmd_buf.waitUntilCompleted();
         } else {
             let encoder = cmd_buf
                 .computeCommandEncoder()
                 .ok_or(MetalError::CommandFailed)?;
-            encode_q4_0_moe_id(
+            let enc_result = encode_q4_0_moe_id(
                 &encoder,
                 device,
                 &x_buf,
@@ -6562,8 +6721,9 @@ pub fn launch_moe_prefill_q4_0(
                 n_tokens as u32,
                 false,
                 false,
-            )?;
+            );
             encoder.endEncoding();
+            enc_result?;
             cmd_buf.commit();
             cmd_buf.waitUntilCompleted();
         }
@@ -7916,6 +8076,83 @@ mod tests {
         for (i, (&g, &w)) in got.iter().zip(&expected).enumerate() {
             assert_close_relative(g, w, i);
         }
+    }
+
+    /// Qwen1.5-MoE-A2.7B scale: 60 experts, H=2048, FFN=1408, top_k=4,
+    /// 27-token prefill. Host-routed path (`launch_moe_prefill_q4_0`) because
+    /// shared experts disable the fused GPU-router stack.
+    #[test]
+    #[ignore = "needs a real Metal-capable GPU; run manually with --ignored on Apple Silicon"]
+    fn launch_moe_prefill_qwen15_moe_scale_host_routed() {
+        let hidden = 2048;
+        let ffn = 1408;
+        let n_experts = 60;
+        let top_k = 4;
+        let n_tokens = 27;
+        let gu_row_bytes =
+            (hidden / ferrox_quant::Q4_K_BLOCK_ELEMS) * ferrox_quant::Q4_K_BLOCK_BYTES;
+        let down_row_bytes =
+            (ffn / ferrox_quant::Q8_0_BLOCK_ELEMS) * ferrox_quant::Q8_0_BLOCK_BYTES;
+
+        fn q8_matrix(rows: usize, cols: usize, seed: u8) -> Vec<u8> {
+            let blocks = cols / ferrox_quant::Q8_0_BLOCK_ELEMS;
+            let mut out = Vec::with_capacity(rows * blocks * ferrox_quant::Q8_0_BLOCK_BYTES);
+            for r in 0..rows {
+                for b in 0..blocks {
+                    out.extend_from_slice(
+                        &half::f16::from_f32(
+                            0.02 + ((r * blocks + b + seed as usize) % 13) as f32 * 0.004,
+                        )
+                        .to_le_bytes(),
+                    );
+                    for i in 0..32u8 {
+                        out.push(i.wrapping_add(r as u8).wrapping_add(seed).wrapping_mul(3));
+                    }
+                }
+            }
+            out
+        }
+
+        let mut gate = Vec::new();
+        let mut up = Vec::new();
+        let mut down = Vec::new();
+        for e in 0..n_experts {
+            gate.extend(pseudo_bytes((e * 3 + 1) as u32, ffn * gu_row_bytes));
+            up.extend(pseudo_bytes((e * 3 + 2) as u32, ffn * gu_row_bytes));
+            down.extend(q8_matrix(hidden, ffn, (e * 3 + 3) as u8));
+        }
+        let gate_stride = ffn * gu_row_bytes;
+        let down_stride = hidden * down_row_bytes;
+        let packed = MoePackedQ4 {
+            gate: &gate,
+            up: &up,
+            down: &down,
+            gate_stride,
+            up_stride: gate_stride,
+            down_stride,
+            n_experts,
+            ffn_rows: ffn,
+            hidden_rows: hidden,
+            gate_row_bytes: gu_row_bytes,
+            down_row_bytes,
+            gate_kind: "Q4_K",
+            up_kind: "Q4_K",
+            down_kind: "Q8_0",
+        };
+
+        let mut x_batch = Vec::with_capacity(n_tokens * hidden);
+        let mut ids = Vec::with_capacity(n_tokens * top_k);
+        let mut route = Vec::with_capacity(n_tokens * top_k);
+        for t in 0..n_tokens {
+            x_batch.extend((0..hidden).map(|i| ((i + t * 11) as f32 * 0.0031).sin()));
+            for k in 0..top_k {
+                ids.push(((t * 3 + k) % n_experts) as i32);
+                route.push(1.0 / top_k as f32);
+            }
+        }
+
+        launch_moe_prefill_q4_0(&x_batch, n_tokens, &packed, &ids, &route, top_k)
+            .expect("Qwen-scale host-routed MoE prefill must not fail with CommandFailed");
     }
 
     fn ferrox_core_silu(x: f32) -> f32 {

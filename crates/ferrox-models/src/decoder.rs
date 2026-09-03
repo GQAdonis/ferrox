@@ -1334,6 +1334,13 @@ impl Decoder {
             return None;
         };
         let packed = Self::moe_packed_q4(&layer.moe)?;
+        if !ferrox_metal::gpu::moe_packed_mul_mv_id_supported(
+            packed.gate_kind,
+            packed.up_kind,
+            packed.down_kind,
+        ) {
+            return None;
+        }
         let top_k = config.moe.n_experts_active;
         if top_k == 0 || top_k > 8 || packed.hidden_rows != hidden_dim {
             return None;

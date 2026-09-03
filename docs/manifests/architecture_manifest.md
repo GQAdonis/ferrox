@@ -6,20 +6,20 @@ Source of truth for names: pinned llama.cpp `LLM_ARCH_NAMES`.
 | GGUF arch | Scope | Family | Memory | Path |
 |---|---|---|---|---|
 | `llama` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
-| `internlm2` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
+| `bailingmoe` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
 | `deepseek` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
+| `maincoder` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
+| `baichuan` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
 | `ernie4_5` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
+| `internlm2` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
+| `xverse` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
 | `ernie4_5-moe` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
 | `granite` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
 | `granitemoe` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
 | `granite-moe` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
-| `xverse` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
-| `baichuan` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
 | `chatglm` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
 | `deci` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
 | `olmo` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
-| `maincoder` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
-| `bailingmoe` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
 | `arctic` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
 | `mistral3` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
 | `nanbeige` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
@@ -30,16 +30,16 @@ Source of truth for names: pinned llama.cpp `LLM_ARCH_NAMES`.
 | `qwen2moe` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
 | `gpt-oss` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
 | `dots1` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
-| `olmo2` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
-| `exaone4` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
+| `hunyuan-moe` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
 | `seed_oss` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
 | `exaone` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
 | `bailingmoe2` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
-| `hunyuan-moe` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
+| `plamo3` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
+| `olmo2` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
+| `exaone4` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
 | `mellum` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
 | `talkie` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
 | `mimo2` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
-| `plamo3` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
 | `afmoe` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
 | `apertus` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
 | `exaone-moe` | TextGeneration | StandardGqa | KvGqa | generic-gqa |

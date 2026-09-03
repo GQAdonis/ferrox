@@ -12,20 +12,27 @@ same command shapes, same or better performance, on the hardware people
 actually own. `docs/plans/north-star.md` is the ranking every other plan
 is read through, and `docs/plans/README.md` is the index.
 
-Honest position, re-audited 2026-09-02. **16** architectures run with
+Honest position, re-audited 2026-09-03. **23** architectures run with
 evidence (`capability::AUDITED_GENERIC_GQA`), 4 more have dedicated
 engines, and everything else REFUSES. The "loads and is WRONG" class is
 closed: the generic path is opt-in, so an unaudited architecture stops
 instead of guessing.
 
-The 41 unaudited refusals are now TRIAGED, and the refusal says which of
-three things is missing: 9 are a fixture away (implemented, unevidenced),
-2 need one named match arm, 26 need new code, 4 are unknown with the
-question stated. Five one-match-arm rows were closed on 2026-09-02, each
-with a libllama-golden fixture, which is what moved 46 to 41.
-`unaudited_triage` carries the verdict and the llama.cpp line that
-decides it. llama.cpp hand-writes 140
-per-architecture graphs; `decoder.rs` is 6702 lines and that is why the
+The 34 unaudited refusals are now TRIAGED, and the refusal says which of
+three things is missing: 1 is a fixture away (implemented, unevidenced),
+3 need one named match arm, 26 need new code, 4 are unknown with the
+question stated. Five one-match-arm rows closed on 2026-09-02 and seven
+fixture-away rows on 2026-09-03, each with a libllama-golden fixture,
+which is what moved 46 to 41 to 34. Building those fixtures found two
+defects worth more than the admissions: `plamo3` could never have loaded
+a real checkpoint, because it is the only architecture upstream whose
+post-norms use the two-argument `LLM_TN` overload and ferrox asked for
+the wrong spelling; and a gate refused every file carrying
+`attention.sliding_window_pattern` as unimplemented while the feature
+was already implemented, which made the loader's own read of that key
+unreachable. `unaudited_triage` carries the verdict and the llama.cpp
+line that decides it. llama.cpp hand-writes 140
+per-architecture graphs; `decoder.rs` is 6752 lines and that is why the
 counts differ.
 
 Do not read the architecture catalog as a support matrix. `ferrox
@@ -97,20 +104,20 @@ style preference, it is the repo's most expensive lesson. Measured
 
 | File | Lines |
 |---|---|
-| `ferrox-server/src/lib.rs` | 9580 |
-| `ferrox-metal/src/attn.rs` | 8860 |
-| `ferrox-metal/src/gpu.rs` | 8700 |
-| `ferrox-quant/src/lib.rs` | 8230 |
-| `ferrox-models/src/decoder.rs` | 6702 |
+| `ferrox-server/src/lib.rs` | 9628 |
+| `ferrox-metal/src/attn.rs` | 9331 |
+| `ferrox-metal/src/gpu.rs` | 8935 |
+| `ferrox-quant/src/lib.rs` | 8239 |
+| `ferrox-models/src/decoder.rs` | 6752 |
 
-Re-measured 2026-09-02. `ferrox-server/src/lib.rs` took the top spot by
-GROWING 1839 lines in a day, which is the rule being broken while the
-rule is written down two paragraphs below. `decoder.rs` shrank for the
-first time (6875 to 6702), because the Gemma RoPE work went into
-`decoder/rope.rs` instead of a sixth branch.
+Re-measured 2026-09-03. Every one of these grew again, and
+`ferrox-metal/src/attn.rs` grew most (8860 to 9331). `decoder.rs` has
+started creeping back up (6702 to 6752) after its one shrink. The rule
+is written down two paragraphs below and is being broken while it is
+written.
 
-Those files are why llama.cpp has 140 architectures and ferrox has 16
-proven. Adding a model means editing a 6700-line file, so nobody adds
+Those files are why llama.cpp has 140 architectures and ferrox has 23
+proven. Adding a model means editing a 6750-line file, so nobody adds
 one. The same decode layer used to be written out about ELEVEN times
 across `decoder.rs` and `attn.rs`, which has already lost EIGHT model
 features one at a time, each silently:

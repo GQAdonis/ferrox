@@ -72,7 +72,7 @@ Scratch-built `llama_logits` from `.scratch/llama.cpp` loads gemma-4; tokenizer 
 | 2 | DeepSeek-R1-Distill reclassification | **Done** — PR #100 |
 | 3 | Gemma-4 parity via Gemma4Engine | **Done** — PR #100 |
 | 4 | Rebuild `llama_logits` from `.scratch/llama.cpp` | **Done** — `build_llama_logits.sh` cmake layout |
-| 5 | Fixture-away triage (9 archs) | **Open** |
+| 5 | Fixture-away triage | **Done** (2026-09-03) -- seven admitted with libllama-golden fixtures, `chatglm` reclassified ONE MATCH ARM. Audited 16 to 23, unaudited 41 to 34 |
 
 ### P1 — Unchanged from audit
 

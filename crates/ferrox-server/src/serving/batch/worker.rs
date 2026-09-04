@@ -14,6 +14,7 @@ use crate::generate::{acquire_paged_caches, DecodeError, FinishReason, PagedKvCo
 use crate::stop::StopStep;
 
 use super::block_budget::BlockBudget;
+use super::clock::RowClock;
 use super::config::{decode_log_interval_from_env, send_finished, BatcherConfig, DecodeFn};
 use super::counters::Counters;
 use super::prefill::{Prefill, PrefillState};
@@ -384,6 +385,7 @@ pub(super) fn worker_loop(
                 continue;
             }
             slot.generated_ids.push(next);
+            slot.clock.token();
             let piece = decode(&[next]);
             if apply_stop_buffer(slot, &piece) {
                 continue;
@@ -564,6 +566,7 @@ pub(super) fn accept(
     };
     Some(Prefill {
         state,
+        clock: RowClock::start(),
         prompt_tokens: job.prompt_tokens.len(),
         params: job.params,
         stop_tokens: job.stop_tokens,

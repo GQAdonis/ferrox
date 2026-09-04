@@ -95,6 +95,44 @@ fn flush_replies_on_each_rows_own_channel() {
     );
 }
 
+/// A batched row must report the same RATES the private `generate`
+/// loop reports, not just its token counts.
+///
+/// This is the regression the `RowClock` exists for: continuous
+/// batching built its `Usage` with `Usage::new` and never called
+/// `with_timings`, so every field Ferrox Studio puts under an answer
+/// came back null -- and because batching is the default on Metal,
+/// that was the common case rather than a corner. A unit test on the
+/// clock alone would not have caught it: what was missing was the CALL
+/// at the reply site, so the assertion has to run through
+/// `flush_finished`.
+#[test]
+fn a_finished_batched_row_reports_its_rates() {
+    let mut rows = Rows::default();
+    let (mut row, rx) = test_slot(4, 44);
+    row.prompt_tokens = 6;
+    row.clock.prefill_finished();
+    row.clock.token();
+    row.generated_ids.push(7);
+    row.finish = Some(FinishReason::Stop);
+    rows.insert(row);
+    rows.flush_finished(&no_budget());
+
+    let (_, _, _, usage) = finished_result(rx.try_recv().expect("replied")).expect("ok");
+    assert!(
+        usage.prompt_per_second.is_some(),
+        "batched row reported no prefill rate: {usage:?}"
+    );
+    assert!(
+        usage.predicted_per_second.is_some(),
+        "batched row reported no decode rate: {usage:?}"
+    );
+    assert!(
+        usage.time_to_first_token_ms.is_some(),
+        "batched row reported no TTFT: {usage:?}"
+    );
+}
+
 /// End to end, with the batch mutation that renumbers a positional
 /// table: three concurrent rows, one of which trips a stop sequence
 /// mid-batch and leaves while the other two keep decoding. In that

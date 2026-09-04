@@ -710,6 +710,34 @@ fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
     let cli = Cli::parse_from(rewrite_llama_style_argv(std::env::args().collect()));
 
+    // BEFORE `claim_instance`, and that ordering is the whole point.
+    //
+    // The backend decision is cached in a `OnceLock` the first time
+    // anything asks for it, and `claim_instance` asks: it records which
+    // backend this process holds. So the old ordering froze the answer
+    // while `FERROX_METAL` was still unset, and the `--n-gpu-layers 0`
+    // that `bench` applies later could not change it. Every `cpu` row
+    // in `benchmarks/RESULTS.md` was measured on Metal because of this,
+    // and every one of those receipts recorded `backend_active:
+    // "Metal"` next to `backend: "cpu"` without anything comparing the
+    // two (#126).
+    if let Commands::Bench {
+        threads,
+        n_gpu_layers,
+        suite,
+        render,
+        ..
+    } = &cli.command
+    {
+        // `--suite` and `--render` do not benchmark in THIS process:
+        // the suite spawns a child per entry and render only reads
+        // receipts, so applying a backend here would pin the parent to
+        // one backend for children that each want their own.
+        if !suite && !render {
+            bench_model::apply_env(*threads, *n_gpu_layers)?;
+        }
+    }
+
     // Held for the whole run: dropping it deregisters this process.
     let _instance = claim_instance(&cli)?;
     // Read before `cli.command` is moved into the match. Subcommands
@@ -1080,7 +1108,11 @@ fn main() -> anyhow::Result<()> {
                 });
             }
             if let Some(model) = model {
-                bench_model::apply_env(threads, n_gpu_layers);
+                // Already applied above, before `claim_instance` could
+                // freeze the backend. Kept as a no-op call rather than
+                // deleted so a future caller of this arm cannot get an
+                // unconfigured process.
+                bench_model::apply_env(threads, n_gpu_layers)?;
                 return bench_model::run(bench_model::BenchArgs {
                     model,
                     n_prompt,

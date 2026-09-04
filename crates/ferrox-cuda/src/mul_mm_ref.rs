@@ -489,6 +489,13 @@ mod tests {
         assert_eq!(Q8_0.block_elems, ferrox_quant::Q8_0_BLOCK_ELEMS);
         assert_eq!(Q4_0.block_bytes, ferrox_quant::Q4_0_BLOCK_BYTES);
         assert_eq!(Q4_0.block_elems, ferrox_quant::Q4_0_BLOCK_ELEMS);
+        use crate::mul_mm::{Q4_K, Q5_K, Q6_K};
+        assert_eq!(Q4_K.block_bytes, ferrox_quant::Q4_K_BLOCK_BYTES);
+        assert_eq!(Q4_K.block_elems, ferrox_quant::Q4_K_BLOCK_ELEMS);
+        assert_eq!(Q5_K.block_bytes, ferrox_quant::Q5_K_BLOCK_BYTES);
+        assert_eq!(Q5_K.block_elems, ferrox_quant::Q5_K_BLOCK_ELEMS);
+        assert_eq!(Q6_K.block_bytes, ferrox_quant::Q6_K_BLOCK_BYTES);
+        assert_eq!(Q6_K.block_elems, ferrox_quant::Q6_K_BLOCK_ELEMS);
         for k in KINDS {
             assert_eq!(
                 k.block_elems,
@@ -502,9 +509,15 @@ mod tests {
             );
             assert_eq!(kind_by_name(k.name).map(|f| f.name), Some(k.name));
         }
+        // Q4_K, Q5_K and Q6_K resolve as of 2026-09-04. IQ4_XS does
+        // not, and the distinction is not an oversight: it is a
+        // codebook lookup rather than an affine dequant, so it does
+        // not fit `dequant_src`'s shape and needs its own row. A kind
+        // that resolves without a kernel would compute silently wrong
+        // numbers, which is the failure this line stands against.
         assert!(
-            kind_by_name("Q4_K").is_none(),
-            "unimplemented kinds must not resolve"
+            kind_by_name("IQ4_NL").is_none() && kind_by_name("IQ4_XS").is_none(),
+            "a kind with no mul_mm must not resolve"
         );
     }
 

@@ -32,7 +32,19 @@ const REFERENCE_SUFFIX: &str = ".llama.f32";
 const FERROX_SUFFIX: &str = ".ferrox.f32";
 const TOKENS_SUFFIX: &str = ".tokens.txt";
 
-/// Writes both logit vectors and the token ids they were computed from.
+/// File name for reference `i`. The primary keeps the original
+/// `.llama.f32` so a dump taken before `parity` could run two
+/// references is still the same file a later one produces.
+fn reference_path(prefix: &str, i: usize) -> PathBuf {
+    if i == 0 {
+        PathBuf::from(format!("{prefix}{REFERENCE_SUFFIX}"))
+    } else {
+        PathBuf::from(format!("{prefix}.llama{}.f32", i + 1))
+    }
+}
+
+/// Writes every compared logit vector and the token ids they were
+/// computed from.
 ///
 /// The token ids travel with the vectors because they are the only part
 /// of the experiment that is not in the file names: two dumps of the
@@ -41,16 +53,21 @@ const TOKENS_SUFFIX: &str = ".tokens.txt";
 pub fn write(
     prefix: &str,
     tokens: &[u32],
-    reference: &[f32],
+    references: &[&[f32]],
     ferrox: &[f32],
-) -> anyhow::Result<[PathBuf; 3]> {
-    let ref_path = PathBuf::from(format!("{prefix}{REFERENCE_SUFFIX}"));
+) -> anyhow::Result<Vec<PathBuf>> {
+    let mut paths = Vec::with_capacity(references.len() + 2);
+    for (i, reference) in references.iter().enumerate() {
+        let p = reference_path(prefix, i);
+        write_f32(&p, reference)?;
+        paths.push(p);
+    }
+
     let fx_path = PathBuf::from(format!("{prefix}{FERROX_SUFFIX}"));
-    let tok_path = PathBuf::from(format!("{prefix}{TOKENS_SUFFIX}"));
-
-    write_f32(&ref_path, reference)?;
     write_f32(&fx_path, ferrox)?;
+    paths.push(fx_path);
 
+    let tok_path = PathBuf::from(format!("{prefix}{TOKENS_SUFFIX}"));
     let ids = tokens
         .iter()
         .map(|t| t.to_string())
@@ -58,8 +75,9 @@ pub fn write(
         .join(" ");
     std::fs::write(&tok_path, format!("{ids}\n"))
         .with_context(|| format!("writing {}", tok_path.display()))?;
+    paths.push(tok_path);
 
-    Ok([ref_path, fx_path, tok_path])
+    Ok(paths)
 }
 
 fn write_f32(path: &Path, values: &[f32]) -> anyhow::Result<()> {
@@ -95,7 +113,8 @@ mod tests {
             -1.234_567_8e-9,
         ];
         let ferrox = vec![0.2f32, 1.0, -5.5, 0.0, 7.7];
-        let paths = write(&prefix, &[1, 2, 3], &reference, &ferrox).unwrap();
+        let paths = write(&prefix, &[1, 2, 3], &[&reference], &ferrox).unwrap();
+        assert_eq!(paths.len(), 3);
 
         let back = std::fs::read(&paths[0]).unwrap();
         let read: Vec<f32> = back
@@ -122,17 +141,56 @@ mod tests {
         let _ = std::fs::remove_dir(&dir);
     }
 
-    /// The reference and ferrox dumps must land in different files.
+    /// EVERY vector lands in its own file.
     ///
     /// They are the same length and the same wire format, so a shared
-    /// suffix would silently leave one overwriting the other and the
+    /// name would silently leave one overwriting another and the
     /// resulting "reference vs reference" KL would be exactly zero —
     /// which reads as "the two builds agree" and is the one answer this
-    /// tool must never fabricate.
+    /// tool must never fabricate. With `--dumper` repeatable there are
+    /// now N of them, so this walks the naming rule rather than the
+    /// three suffixes it used to be.
     #[test]
-    fn the_two_vectors_do_not_share_a_file_name() {
+    fn no_two_dumped_vectors_share_a_file_name() {
         assert_ne!(REFERENCE_SUFFIX, FERROX_SUFFIX);
         assert_ne!(REFERENCE_SUFFIX, TOKENS_SUFFIX);
         assert_ne!(FERROX_SUFFIX, TOKENS_SUFFIX);
+
+        let dir = std::env::temp_dir().join(format!("ferrox-dump-names-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let prefix = dir.join("case").to_string_lossy().into_owned();
+
+        // Three references with DIFFERENT contents: if two shared a
+        // path the survivor's bytes would give it away.
+        let refs: Vec<Vec<f32>> = (0..3).map(|i| vec![i as f32, 1.0]).collect();
+        let borrowed: Vec<&[f32]> = refs.iter().map(Vec::as_slice).collect();
+        let paths = write(&prefix, &[7], &borrowed, &[9.0f32, 1.0]).unwrap();
+        assert_eq!(paths.len(), 5, "3 references + ferrox + the token ids");
+
+        let unique: std::collections::HashSet<_> = paths.iter().collect();
+        assert_eq!(
+            unique.len(),
+            paths.len(),
+            "two dumps share a name: {paths:?}"
+        );
+        for (i, r) in refs.iter().enumerate() {
+            let back = std::fs::read(&paths[i]).unwrap();
+            assert_eq!(
+                f32::from_le_bytes(back[..4].try_into().unwrap()),
+                r[0],
+                "reference [{i}] landed in {} with someone else's bytes",
+                paths[i].display()
+            );
+        }
+
+        // The primary keeps the name it had before `--dumper` could be
+        // repeated, so an old dump and a new one are still the same
+        // file.
+        assert!(paths[0].to_string_lossy().ends_with(REFERENCE_SUFFIX));
+
+        for p in &paths {
+            let _ = std::fs::remove_file(p);
+        }
+        let _ = std::fs::remove_dir(&dir);
     }
 }

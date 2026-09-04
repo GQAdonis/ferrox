@@ -227,18 +227,29 @@ enum Commands {
         /// How many top tokens to intersect between the two engines.
         #[arg(long, default_value_t = 10)]
         top_k: usize,
-        /// Compiled reference dumper (see .local-scripts/llama_logits.c).
+        /// Compiled reference dumper (see tools/llama_logits.c).
+        ///
+        /// REPEATABLE, and repeating it is what makes a WRONG verdict
+        /// believable. The first is the reference every printed number
+        /// is about; each further one must be built against a DIFFERENT
+        /// libllama (`LLAMA_CPP_PREFIX=… tools/build_llama_logits.sh`),
+        /// and `parity` measures how far those builds are from each
+        /// other on this checkpoint to decide what "the graphs
+        /// disagree" is allowed to mean. Two builds have been measured
+        /// 3.5e-2 apart in KL from an identical graph, above the
+        /// constant that used to be the WRONG line, so with only one
+        /// reference no K-quant checkpoint can be called WRONG at all.
         #[arg(long)]
-        dumper: Option<String>,
-        /// Write both compared logit vectors under this prefix
-        /// (`<prefix>.llama.f32`, `<prefix>.ferrox.f32`,
-        /// `<prefix>.tokens.txt`), as raw little-endian f32.
+        dumper: Vec<String>,
+        /// Write every compared logit vector under this prefix
+        /// (`<prefix>.llama.f32`, `<prefix>.llama2.f32`, …,
+        /// `<prefix>.ferrox.f32`, `<prefix>.tokens.txt`), as raw
+        /// little-endian f32.
         ///
         /// A parity verdict is a distance between two points and says
         /// where neither one is, so it cannot tell "ferrox moved" from
-        /// "the reference moved". Dump against two `--dumper` builds and
-        /// compare the two `.llama.f32` files to each other: that
-        /// comparison has no ferrox in it.
+        /// "the reference moved". The `.llama*.f32` files compared to
+        /// each other answer that, with no ferrox in the comparison.
         #[arg(long)]
         dump_logits: Option<String>,
     },

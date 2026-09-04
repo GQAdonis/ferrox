@@ -291,6 +291,9 @@ pub fn render(bench_dir: &Path) -> anyhow::Result<()> {
 
     #[derive(Clone)]
     struct Row {
+        /// Which machine produced this row. Rows never merge across
+        /// hosts; see the grouping below.
+        host: String,
         model: String,
         backend: String,
         test: String,
@@ -318,21 +321,24 @@ pub fn render(bench_dir: &Path) -> anyhow::Result<()> {
                 .to_string(),
         );
     }
-    if hosts.len() > 1 {
-        anyhow::bail!(
-            "receipts under {} come from {} different hosts, and one table cannot \
-             describe them:\n  {}\nA gap is only meaningful against the machine it \
-             was measured on. Keep one host's receipts per directory, or re-measure \
-             the rows you want to publish on a single machine.",
-            dir.display(),
-            hosts.len(),
-            hosts.iter().cloned().collect::<Vec<_>>().join("\n  ")
-        );
-    }
-    let host_line = hosts.iter().next().cloned().unwrap_or_default();
+    // More than one host used to be a hard refusal, on the grounds
+    // that "one table cannot describe them". That reasoning is right
+    // and is kept: a gap is only meaningful against the machine it was
+    // measured on. What changed is the remedy. Refusing meant the
+    // ledger could only ever describe whichever laptop happened to run
+    // the suite, which is how it came to claim a CPU gap of 1.41x to
+    // 5.06x while saying nothing about x86 or CUDA at all. Rows are now
+    // grouped into one section per host, so two machines coexist
+    // without any row being compared against the wrong one.
 
     let mut rows: Vec<Row> = Vec::new();
     for r in &receipts {
+        let host_label = r
+            .get("host_spec")
+            .and_then(|h| h.get("label"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("unrecorded (receipt written before 0.13.0)")
+            .to_string();
         let id = r.get("id").and_then(|v| v.as_str()).unwrap_or("?");
         let backend = r
             .get("backend")
@@ -344,6 +350,7 @@ pub fn render(bench_dir: &Path) -> anyhow::Result<()> {
         };
         for t in tests {
             rows.push(Row {
+                host: host_label.clone(),
                 model: name_of(id),
                 backend: backend.clone(),
                 test: t
@@ -375,8 +382,9 @@ pub fn render(bench_dir: &Path) -> anyhow::Result<()> {
                 2
             }
         };
-        backend_ord(&a.backend)
-            .cmp(&backend_ord(&b.backend))
+        a.host
+            .cmp(&b.host)
+            .then_with(|| backend_ord(&a.backend).cmp(&backend_ord(&b.backend)))
             .then_with(|| test_ord(&a.test).cmp(&test_ord(&b.test)))
             .then_with(|| {
                 b.gap
@@ -391,8 +399,19 @@ pub fn render(bench_dir: &Path) -> anyhow::Result<()> {
     table.push_str("\n\n## Engine (`ferrox bench` vs `llama-bench`)\n\n");
     // Which machine, stated in the generated block rather than in prose
     // above it, so it cannot drift away from the numbers it describes.
-    if !host_line.is_empty() {
-        table.push_str(&format!("Measured on: **{host_line}**\n\n"));
+    {
+        let n = hosts.len();
+        if n == 1 {
+            table.push_str(&format!(
+                "Measured on: **{}**\n\n",
+                hosts.iter().next().cloned().unwrap_or_default()
+            ));
+        } else if n > 1 {
+            table.push_str(&format!(
+                "Measured on **{n} hosts**, one section each. Rows are never \
+                 compared across machines.\n\n"
+            ));
+        }
     }
     table.push_str(
         "No HTTP, no chat template, no tokenizer, no sampler. This is the engine\n\
@@ -463,11 +482,33 @@ pub fn render(bench_dir: &Path) -> anyhow::Result<()> {
 
     if rows.is_empty() {
         table.push_str("| _no engine receipts yet_ | | | | | |\n\n");
-    } else {
+    } else if hosts.len() <= 1 {
         push_section(&mut table, "Metal", &metal);
         push_section(&mut table, "CUDA", &cuda);
         push_section(&mut table, "CPU", &cpu);
         push_section(&mut table, "Other backends", &other);
+    } else {
+        // One section per machine. A reader scanning for a gap sees the
+        // host before the number, which is the only order in which the
+        // number means anything.
+        for host in &hosts {
+            let here: Vec<&Row> = rows.iter().filter(|r| &r.host == host).collect();
+            table.push_str(&format!("### {host}\n\n"));
+            for (title, backend) in [("Metal", "metal"), ("CUDA", "cuda"), ("CPU", "cpu")] {
+                let sub: Vec<&Row> = here
+                    .iter()
+                    .copied()
+                    .filter(|r| r.backend == backend)
+                    .collect();
+                push_section(&mut table, &format!("{host} / {title}"), &sub);
+            }
+            let sub: Vec<&Row> = here
+                .iter()
+                .copied()
+                .filter(|r| !matches!(r.backend.as_str(), "metal" | "cuda" | "cpu"))
+                .collect();
+            push_section(&mut table, &format!("{host} / Other backends"), &sub);
+        }
     }
 
     table.push_str(END);
@@ -516,6 +557,68 @@ fn splice(existing: &str, block: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Writes one engine receipt for `host` into `dir`.
+    fn receipt(dir: &Path, id: &str, host: &str, backend: &str, ferrox: f64, llama: f64) {
+        let r = serde_json::json!({
+            "schema": 2, "kind": "engine", "id": id,
+            "backend": backend, "backend_active": backend,
+            "host_spec": {"label": host},
+            "tests": [{"test": "tg128", "ferrox_tps": ferrox, "llama_tps": llama,
+                       "gap": llama / ferrox}],
+        });
+        std::fs::write(
+            dir.join(format!("{id}_{backend}.json")),
+            serde_json::to_string(&r).expect("json"),
+        )
+        .expect("write receipt");
+    }
+
+    /// Two machines render as two sections, and neither is dropped.
+    ///
+    /// This used to be a hard refusal ("one table cannot describe
+    /// them"), which meant the ledger could only ever describe the
+    /// laptop that happened to run the suite: it claimed a CPU gap of
+    /// 1.41x to 5.06x while having no x86 or CUDA row at all. The
+    /// refusal's REASON was right, so rows are separated rather than
+    /// merged, and this pins that.
+    #[test]
+    fn two_hosts_render_as_two_sections_rather_than_an_error() {
+        let dir = std::env::temp_dir().join(format!(
+            "ferrox_render_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let engine = dir.join("receipts").join("engine");
+        std::fs::create_dir_all(&engine).expect("mkdir");
+        std::fs::write(
+            dir.join("RESULTS.md"),
+            format!("head\n{BEGIN}\nold\n{END}\ntail\n"),
+        )
+        .expect("seed");
+        receipt(&engine, "m1", "Apple M2 Pro", "metal", 100.0, 90.0);
+        receipt(&engine, "m1", "Rented Xeon", "cpu", 10.0, 20.0);
+
+        render(&dir).expect("two hosts must render, not refuse");
+
+        let out = std::fs::read_to_string(dir.join("RESULTS.md")).expect("read");
+        assert!(out.contains("Apple M2 Pro"), "first host missing:\n{out}");
+        assert!(out.contains("Rented Xeon"), "second host missing:\n{out}");
+        assert!(
+            out.contains("2 hosts"),
+            "the reader is not told there are two machines:\n{out}"
+        );
+        // The whole point: a row is never presented without its host.
+        let xeon = out.find("Rented Xeon").expect("host heading");
+        let cpu_row = out.find("| 10.00 |").or_else(|| out.find("**10.00**"));
+        if let Some(cpu_row) = cpu_row {
+            assert!(
+                cpu_row > xeon,
+                "the Xeon's row appears before its host heading"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn gap_cell_colours_match_the_ledger_convention() {

@@ -94,8 +94,8 @@ pub use engine_factory::{
 pub use execution_plan::{ExecutionPlan, FusedOpCaps, MemoryPlan, PlanGeometry};
 pub use gemma4_engine::{Gemma4Engine, Gemma4Hparams, GEMMA4_ARCHES};
 pub use kv_budget::{
-    Ceiling, ContextCap, ContextFit, KvBudget, KvBudgetError, KvElem, KvLayout, KvShape,
-    CTX_AUTO_GRANULARITY,
+    Ceiling, ContextCap, ContextFit, KvBudget, KvBudgetError, KvElem, KvLayout, KvResidency,
+    KvShape, CTX_AUTO_GRANULARITY,
 };
 pub use loader::LoadError;
 pub use output_projection::grouped_output_projection;

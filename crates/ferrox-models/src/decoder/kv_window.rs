@@ -99,6 +99,21 @@ impl KvWindowPolicy {
         }
         KvWindow::with_default_slack(attention_window?)
     }
+
+    /// The window layer `layer_idx` of `config` evicts behind.
+    ///
+    /// The ONE expression that answers it, for the decoder
+    /// (`Decoder::kv_window_for_layer`) and for the budget
+    /// (`crate::kv_budget::KvResidency::from_config`) alike. Those two
+    /// have to agree about which layers keep how much or the budget is
+    /// pricing a cache that does not exist, which is #33.
+    pub fn layer_window(
+        &self,
+        config: &crate::config::ModelConfig,
+        layer_idx: usize,
+    ) -> Option<KvWindow> {
+        self.window_for(config.layer_sliding_window(layer_idx))
+    }
 }
 
 impl Default for KvWindowPolicy {
@@ -116,8 +131,7 @@ impl Decoder {
     /// eligibility check is exactly how the GPU-router gate drifted four
     /// ways.
     pub fn kv_window_for_layer(&self, layer_idx: usize) -> Option<KvWindow> {
-        self.kv_window
-            .window_for(self.config.layer_sliding_window(layer_idx))
+        self.kv_window.layer_window(&self.config, layer_idx)
     }
 
     /// Arms `cache` for layer `layer_idx` if this run evicts, then drops

@@ -97,18 +97,23 @@ const KL_WRONG: f64 = 1e-2;
 /// and `block_q6_K` that the bottle does not, which is a change in
 /// exactly the arithmetic §10 of the gap inventory is about.
 ///
-/// This constant is here so [`KL_WRONG_LM_HEAD_KQUANT`] is derived from
+/// This constant is here so [`KL_WRONG_Q8K_DOTTED`] is derived from
 /// a measurement instead of restated beside one. See
 /// [#102](https://github.com/antonellof/ferrox/issues/102).
 const KL_REFERENCE_BUILD_SPREAD_KQUANT: f64 = 2.735e-2;
 
-/// Untied lm_head on a K-quant uses Q8_K activation dots; logits KL is
-/// noisier than a single matvec but still same top-1 (DeepSeek-R1 #99).
+/// The WRONG line for a checkpoint whose arithmetic llama.cpp dots
+/// against Q8_K-quantized activations; logits KL is noisier than a
+/// single matvec but still same top-1 (DeepSeek-R1 #99).
+///
+/// It was called `KL_WRONG_LM_HEAD_KQUANT` and applied on the strength
+/// of the OUTPUT HEAD's quantization. That was the wrong tensor, and
+/// [`DominantQuant`] carries the measurement that says so.
 ///
 /// It is DERIVED from the measured spread above rather than restated
 /// beside it, so the two cannot drift apart: the only way to put the
 /// line back under the reference's own spread is to edit
-/// [`KL_WRONG_LM_HEAD_KQUANT_MARGIN`] below 1, which reads as the
+/// [`KL_WRONG_Q8K_DOTTED_MARGIN`] below 1, which reads as the
 /// mistake it is. It was 2.5e-2, a bare constant BELOW that spread, and
 /// the consequence was not hypothetical: Qwen2.5-1.5B
 /// Q4_K_M read DRIFT (KL 7.7e-3) against the bottle and WRONG (KL
@@ -117,27 +122,27 @@ const KL_REFERENCE_BUILD_SPREAD_KQUANT: f64 = 2.735e-2;
 /// graphs disagree", because two binaries with an IDENTICAL graph cross
 /// it. Whatever else 2.5e-2 was measuring, it was not that.
 ///
-/// Raising it costs the sensitivity to a real K-quant lm_head bug in
+/// Raising it costs the sensitivity to a real K-quant graph bug in
 /// the band 2.5e-2..3.0e-2, which is a real cost. It buys a verdict
 /// that does not change with the reference's vintage, and a run whose
 /// WRONG can be believed. Note what is NOT raised: [`KL_WRONG`], for
 /// everything else, stays at 1e-2, because the same experiment puts the
-/// reference's build-to-build spread on a Q8_0 lm_head at exactly zero.
-const KL_WRONG_LM_HEAD_KQUANT: f64 =
-    KL_REFERENCE_BUILD_SPREAD_KQUANT * KL_WRONG_LM_HEAD_KQUANT_MARGIN;
+/// reference's build-to-build spread on a Q8_0 checkpoint at exactly
+/// zero.
+const KL_WRONG_Q8K_DOTTED: f64 = KL_REFERENCE_BUILD_SPREAD_KQUANT * KL_WRONG_Q8K_DOTTED_MARGIN;
 
 /// How far above the measured reference spread the WRONG line sits.
 ///
 /// A judgement, not a measurement, and deliberately thin: the spread is
 /// the largest of nine checkpoints, so a tenth could exceed it, but
-/// every point of headroom is sensitivity to a real lm_head bug thrown
+/// every point of headroom is sensitivity to a real graph bug thrown
 /// away. Widen it only with a checkpoint that measured wider.
-const KL_WRONG_LM_HEAD_KQUANT_MARGIN: f64 = 1.1;
+const KL_WRONG_Q8K_DOTTED_MARGIN: f64 = 1.1;
 
 /// The verdict ladder, checked at COMPILE time.
 ///
 /// These four constants have to agree about an ordering and until
-/// 2026-09-04 nothing made them: `KL_WRONG_LM_HEAD_KQUANT` was a bare
+/// 2026-09-04 nothing made them: `KL_WRONG_Q8K_DOTTED` was a bare
 /// 2.5e-2 sitting BELOW the 2.735e-2 that two builds of llama.cpp
 /// produce from an identical graph, so the "the graphs disagree" line
 /// fired on a difference llama.cpp reproduces against itself, and one
@@ -147,11 +152,11 @@ const KL_WRONG_LM_HEAD_KQUANT_MARGIN: f64 = 1.1;
 const _: () = {
     assert!(KL_NOISE < KL_WRONG, "MATCH must be tighter than DRIFT");
     assert!(
-        KL_WRONG < KL_WRONG_LM_HEAD_KQUANT,
-        "the K-quant lm_head allowance must be a relaxation, not a tightening"
+        KL_WRONG < KL_WRONG_Q8K_DOTTED,
+        "the Q8_K-dotted allowance must be a relaxation, not a tightening"
     );
     assert!(
-        KL_WRONG_LM_HEAD_KQUANT > KL_REFERENCE_BUILD_SPREAD_KQUANT,
+        KL_WRONG_Q8K_DOTTED > KL_REFERENCE_BUILD_SPREAD_KQUANT,
         "a WRONG line under the reference's own build-to-build spread cannot mean \
          `the graphs disagree`: two binaries with an identical graph cross it"
     );
@@ -241,23 +246,23 @@ pub fn run(args: ParityArgs) -> anyhow::Result<()> {
         println!();
     }
 
+    // ONE value, read by the threshold below and by the DRIFT message
+    // in `print_report`. Deriving it twice is #109.
     let gguf = ferrox_gguf::GgufFile::open(&path).ok();
-    let lm_head = gguf.as_ref().and_then(lm_head_quant);
-    let dominant = gguf.as_ref().and_then(dominant_quant);
+    let quant = DominantQuant::of(gguf.as_ref().map_or(&[][..], |f| &f.tensors));
 
     let report = compare(
         &ref_logits,
         &ferrox_logits,
         args.top_k,
-        wrong_kl_threshold(lm_head.as_deref()),
+        quant.wrong_kl_threshold(),
     );
-    let quant = lm_head.as_deref().or(dominant.as_deref());
     print_report(
         &args.model,
         tokens.len(),
         args.top_k,
         backend.as_str(),
-        quant,
+        &quant,
         reference.libllama.as_deref(),
         &report,
     );
@@ -478,7 +483,7 @@ fn llama_dots_this_against_q8k(kind: &str) -> bool {
     )
 }
 
-/// The most common quantization among a checkpoint's tensors.
+/// The most common quantization among a checkpoint's PER-LAYER tensors.
 ///
 /// The FILENAME is not this. `Llama-3.2-1B-Instruct-IQ4_XS.gguf`
 /// contains no IQ4_XS tensors at all -- 96 of its per-layer weights are
@@ -486,10 +491,18 @@ fn llama_dots_this_against_q8k(kind: &str) -> bool {
 /// recipe falls back. Reading the tensor table is the only way to know,
 /// and mistaking the two is what made that file look like a
 /// counterexample.
-fn dominant_quant(file: &ferrox_gguf::GgufFile) -> Option<String> {
+///
+/// The output head and the embedding table are EXCLUDED, so "body" here
+/// means the body and cannot be outvoted into meaning the head on a
+/// one-layer model. [`lm_head_quant`] is the other half, and
+/// [`DominantQuant`] is the single place that weighs the two.
+fn body_quant(tensors: &[ferrox_gguf::TensorInfo]) -> Option<String> {
     use std::collections::HashMap;
     let mut counts: HashMap<String, usize> = HashMap::new();
-    for t in &file.tensors {
+    for t in tensors {
+        if t.name == "output.weight" || t.name == "token_embd.weight" {
+            continue;
+        }
         let kind = format!("{:?}", t.dtype);
         if kind != "F32" && kind != "F16" && kind != "BF16" {
             *counts.entry(kind).or_default() += 1;
@@ -499,18 +512,107 @@ fn dominant_quant(file: &ferrox_gguf::GgufFile) -> Option<String> {
 }
 
 /// Dtype of the logits projection: untied `output.weight`, else tied embed.
-fn lm_head_quant(file: &ferrox_gguf::GgufFile) -> Option<String> {
-    file.tensors
+fn lm_head_quant(tensors: &[ferrox_gguf::TensorInfo]) -> Option<String> {
+    tensors
         .iter()
         .find(|t| t.name == "output.weight")
-        .or_else(|| file.tensors.iter().find(|t| t.name == "token_embd.weight"))
+        .or_else(|| tensors.iter().find(|t| t.name == "token_embd.weight"))
         .map(|t| format!("{:?}", t.dtype))
 }
 
-fn wrong_kl_threshold(lm_head: Option<&str>) -> f64 {
-    match lm_head {
-        Some(k) if llama_dots_this_against_q8k(k) => KL_WRONG_LM_HEAD_KQUANT,
-        _ => KL_WRONG,
+/// WHICH QUANTIZATION'S ARITHMETIC DOMINATES THIS COMPARISON — the one
+/// value the WRONG threshold and the DRIFT message both read.
+///
+/// Until [#109](https://github.com/antonellof/ferrox/issues/109) they
+/// were two rules. The threshold keyed on the OUTPUT HEAD alone and the
+/// message keyed on `lm_head.or(body)`, so a `Q8_0` head over a K-quant
+/// body was judged against the line for a model containing no K-quant
+/// arithmetic at all, and told to go run a per-layer divergence for a
+/// difference §10 fully explains. They agreed on every checkpoint in
+/// `models/`, which is why it never fired there — so a checkpoint of
+/// that shape was BUILT to see what happens (`llama-quantize --pure
+/// --output-tensor-type q8_0 --token-embedding-type q8_0 … Q4_K_S`),
+/// against Homebrew libllama b7650:
+///
+/// | checkpoint | head | body | KL(llama‖ferrox) | verdict then |
+/// |---|---|---|---|---|
+/// | Qwen3-0.6B q8-head | Q8_0 | Q4_K | **1.297e-2** | **WRONG** |
+/// | Qwen3-0.6B `--pure` | Q4_K | Q4_K | 1.975e-2 | DRIFT |
+/// | Llama-3.2-1B q8-head | Q8_0 | Q4_K | 1.417e-3 | DRIFT |
+/// | Llama-3.2-1B `--pure` | Q4_K | Q4_K | 1.126e-3 | DRIFT |
+/// | Llama-3.2-1B q6-head | Q6_K | Q8_0 | **2.313e-4** | MATCH |
+///
+/// The first two rows are the same body arithmetic on the same
+/// architecture, and the row with the MORE precise head read WRONG at a
+/// SMALLER KL than the row with the K-quant head read DRIFT. `ferrox
+/// parity` exited non-zero on the more accurate of the two.
+///
+/// The last row is what settles which tensor to key on: a K-quant head
+/// over a Q8_0 body lands at 2.313e-4, three orders of magnitude below
+/// its K-quant-bodied siblings and inside the MATCH floor. **The body
+/// carries the divergence and the head barely contributes** — the body
+/// is every layer, the head is one matvec — so the body is what this
+/// answers with when it is Q8_K-dotted.
+///
+/// The head still gets to TRIGGER the relaxation when the body is not
+/// Q8_K-dotted, even though the row above says the effect is tiny. The
+/// alternative is a rule that can invent a WRONG for a checkpoint whose
+/// only Q8_K arithmetic is in the head, which is the defect being
+/// fixed, in the other direction; and the sensitivity given up sits at
+/// 2.3e-4, four orders below either line, so nothing that could be
+/// measured is being traded away. That makes this a pure relaxation of
+/// what shipped: no row can move DRIFT → WRONG because of it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DominantQuant(Option<String>);
+
+impl DominantQuant {
+    /// Reads the tensor table. An empty slice — the file could not be
+    /// opened — and a table with no quantized tensor both give `None`,
+    /// which is the unrelaxed [`KL_WRONG`] line.
+    fn of(tensors: &[ferrox_gguf::TensorInfo]) -> Self {
+        Self::weigh(
+            lm_head_quant(tensors).as_deref(),
+            body_quant(tensors).as_deref(),
+        )
+    }
+
+    /// The rule itself, taking the two halves directly so it can be
+    /// exercised on shapes no checkpoint on this disk has.
+    fn weigh(lm_head: Option<&str>, body: Option<&str>) -> Self {
+        // A Q8_K-dotted BODY wins outright: it is every layer, and the
+        // measurement above says it is what carries the divergence.
+        // Otherwise the head, which still relaxes the line when it is
+        // itself a K-quant — that fallback is the `or`, not a third
+        // branch, because "the head when it is Q8_K-dotted" and "the
+        // head as the plain label" are the same expression and writing
+        // them separately gives one arm that can never be reached.
+        let picked = if body.is_some_and(llama_dots_this_against_q8k) {
+            body
+        } else {
+            lm_head.or(body)
+        };
+        Self(picked.map(str::to_owned))
+    }
+
+    /// What to call it in the report.
+    fn label(&self) -> Option<&str> {
+        self.0.as_deref()
+    }
+
+    /// Whether llama.cpp dots this checkpoint's dominant arithmetic
+    /// against Q8_K-quantized activations. The threshold and the DRIFT
+    /// message both go through here, so they cannot disagree.
+    fn q8k_dotted(&self) -> bool {
+        self.0.as_deref().is_some_and(llama_dots_this_against_q8k)
+    }
+
+    /// The "the graphs disagree" line for this checkpoint.
+    fn wrong_kl_threshold(&self) -> f64 {
+        if self.q8k_dotted() {
+            KL_WRONG_Q8K_DOTTED
+        } else {
+            KL_WRONG
+        }
     }
 }
 
@@ -519,7 +621,7 @@ fn print_report(
     n_tokens: usize,
     k: usize,
     backend: &str,
-    quant: Option<&str>,
+    quant: &DominantQuant,
     libllama: Option<&str>,
     r: &Report,
 ) {
@@ -573,7 +675,10 @@ fn print_report(
     );
     match r.verdict {
         Verdict::Match => println!("  same distribution to within f32 accumulation-order noise."),
-        Verdict::Drift => match quant.filter(|q| llama_dots_this_against_q8k(q)) {
+        // `q8k_dotted` is the SAME predicate on the SAME value that
+        // chose the WRONG line, so the explanation and the threshold
+        // are never about different tensors (#109).
+        Verdict::Drift => match quant.label().filter(|_| quant.q8k_dotted()) {
             // Expected, with a named cause. Saying "go run a per-layer
             // divergence" here would send the reader after a bug that
             // is not there.
@@ -859,10 +964,18 @@ mod tests {
         );
     }
 
+    /// Every K-quant / IQ spelling that reaches the allowance.
+    const Q8K_DOTTED: &[&str] = &[
+        "Q2K", "Q3K", "Q4K", "Q5K", "Q6K", "IQ2XXS", "IQ2XS", "IQ2S", "IQ3XXS", "IQ3S", "IQ1S",
+        "IQ1M", "IQ4XS",
+    ];
+
     #[test]
-    fn kquant_lm_head_uses_a_higher_wrong_threshold() {
-        assert_eq!(wrong_kl_threshold(Some("Q6K")), KL_WRONG_LM_HEAD_KQUANT);
-        assert_eq!(wrong_kl_threshold(Some("Q8_0")), KL_WRONG);
+    fn a_kquant_checkpoint_uses_a_higher_wrong_threshold() {
+        let kq = DominantQuant::weigh(Some("Q6K"), Some("Q6K"));
+        assert_eq!(kq.wrong_kl_threshold(), KL_WRONG_Q8K_DOTTED);
+        let q8 = DominantQuant::weigh(Some("Q8_0"), Some("Q8_0"));
+        assert_eq!(q8.wrong_kl_threshold(), KL_WRONG);
     }
 
     /// EVERY quantization that routes to the K-quant allowance gets a
@@ -876,12 +989,9 @@ mod tests {
     /// builds show on exactly these types — the row would read WRONG and
     /// the constants would still look right.
     #[test]
-    fn every_q8k_dotted_lm_head_clears_the_references_build_to_build_spread() {
-        for kind in [
-            "Q2K", "Q3K", "Q4K", "Q5K", "Q6K", "IQ2XXS", "IQ2XS", "IQ2S", "IQ3XXS", "IQ3S", "IQ1S",
-            "IQ1M", "IQ4XS",
-        ] {
-            let line = wrong_kl_threshold(Some(kind));
+    fn every_q8k_dotted_body_clears_the_references_build_to_build_spread() {
+        for kind in Q8K_DOTTED {
+            let line = DominantQuant::weigh(Some("Q8_0"), Some(kind)).wrong_kl_threshold();
             assert!(
                 line > KL_REFERENCE_BUILD_SPREAD_KQUANT,
                 "{kind} gets a WRONG line of {line:e}, under the {KL_REFERENCE_BUILD_SPREAD_KQUANT:e} \
@@ -891,7 +1001,167 @@ mod tests {
         // And the non-K-quant line is deliberately NOT raised: the same
         // experiment measured the reference's Q8_0 spread at exactly
         // zero, so there is nothing there to make room for.
-        assert_eq!(wrong_kl_threshold(Some("Q8_0")), 1e-2);
+        assert_eq!(
+            DominantQuant::weigh(Some("Q8_0"), Some("Q8_0")).wrong_kl_threshold(),
+            1e-2
+        );
+    }
+
+    /// A `Q8_0` OUTPUT HEAD OVER A K-QUANT BODY IS A K-QUANT
+    /// COMPARISON — the shape #109 is about.
+    ///
+    /// It shipped judged as a Q8_0 one, because the threshold read the
+    /// head and never asked what the layers were. No checkpoint in
+    /// `models/` has the shape, so one was built:
+    /// `llama-quantize --pure --output-tensor-type q8_0
+    /// --token-embedding-type q8_0 Qwen3-0.6B-BF16.gguf out.gguf
+    /// Q4_K_S`. Against Homebrew libllama b7650 it measured KL
+    /// **1.297e-2** and read **WRONG** — while the same model quantized
+    /// `--pure` (K-quant head as well) measured a LARGER 1.975e-2 and
+    /// read DRIFT. Same body arithmetic, and the more precise of the two
+    /// was the one `ferrox parity` exited non-zero on.
+    #[test]
+    fn a_q8_0_head_over_a_kquant_body_is_judged_as_the_kquant_it_is() {
+        for body in Q8K_DOTTED {
+            let q = DominantQuant::weigh(Some("Q8_0"), Some(body));
+            assert!(
+                q.q8k_dotted(),
+                "a {body} body dots against Q8_K activations whatever the output head is"
+            );
+            assert_eq!(q.label(), Some(*body), "the body is what the report names");
+            assert_eq!(q.wrong_kl_threshold(), KL_WRONG_Q8K_DOTTED);
+        }
+        // The measured row, so the constant is tied to the observation
+        // rather than merely ordered against another constant.
+        let measured_kl = 1.297e-2;
+        assert!(
+            measured_kl < DominantQuant::weigh(Some("Q8_0"), Some("Q4K")).wrong_kl_threshold(),
+            "the constructed Q8_0-head/Q4_K-body checkpoint must read DRIFT, not WRONG"
+        );
+        // When BOTH halves are Q8_K-dotted the threshold is the same
+        // either way, so only the label distinguishes the rules — and
+        // the body is the honest label, because it is the layers that
+        // carry the drift (2.313e-4 for a K-quant head alone). Keying
+        // the label on the head, as the message did before #109, must
+        // be visible here rather than only in the shape that changes
+        // the verdict.
+        assert_eq!(
+            DominantQuant::weigh(Some("Q6K"), Some("Q4K")).label(),
+            Some("Q4K"),
+            "with a K-quant on both ends the report names the body"
+        );
+    }
+
+    /// The head can still TRIGGER the allowance, so no row can move
+    /// DRIFT → WRONG because of #109's fix.
+    ///
+    /// Measured cost of keeping it: a Q6_K head over a Q8_0 body
+    /// (`--pure Q8_0 --output-tensor-type q6_K`) lands at KL 2.313e-4,
+    /// four orders below either line, so the sensitivity being conceded
+    /// is not sensitivity anything could use.
+    #[test]
+    fn a_kquant_head_over_a_q8_0_body_still_relaxes_rather_than_inventing_a_wrong() {
+        let q = DominantQuant::weigh(Some("Q6K"), Some("Q8_0"));
+        assert!(q.q8k_dotted());
+        assert_eq!(q.label(), Some("Q6K"));
+        assert_eq!(q.wrong_kl_threshold(), KL_WRONG_Q8K_DOTTED);
+    }
+
+    fn tensor(name: &str, dtype: ferrox_gguf::GgmlType) -> ferrox_gguf::TensorInfo {
+        ferrox_gguf::TensorInfo {
+            name: name.to_string(),
+            shape: vec![1],
+            dtype,
+            offset: 0,
+        }
+    }
+
+    /// The body is read off the LAYERS, and the output head cannot vote
+    /// in it.
+    ///
+    /// `body_quant` counts tensors, so on a checkpoint with few layers
+    /// and a head at a different precision the head could otherwise
+    /// join the tally it is being weighed against — two roles for one
+    /// tensor, which is how the head came to decide the threshold in
+    /// the first place. This also pins the shape #109 is about end to
+    /// end, from a tensor table rather than from two strings.
+    #[test]
+    fn the_body_is_read_off_the_layers_and_the_output_head_does_not_vote_in_it() {
+        use ferrox_gguf::GgmlType;
+        // One layer, so the head would outvote it if it were counted.
+        let table = vec![
+            tensor("token_embd.weight", GgmlType::Q8_0),
+            tensor("output.weight", GgmlType::Q8_0),
+            tensor("blk.0.attn_q.weight", GgmlType::Q4K),
+            tensor("blk.0.attn_norm.weight", GgmlType::F32),
+        ];
+        assert_eq!(body_quant(&table).as_deref(), Some("Q4K"));
+        assert_eq!(lm_head_quant(&table).as_deref(), Some("Q8_0"));
+        let q = DominantQuant::of(&table);
+        assert_eq!(
+            q.label(),
+            Some("Q4K"),
+            "a Q8_0 head does not hide a Q4_K body"
+        );
+        assert_eq!(q.wrong_kl_threshold(), KL_WRONG_Q8K_DOTTED);
+
+        // A tied-embedding model: no `output.weight`, and the embedding
+        // is the head. It still must not count as the body.
+        let tied = vec![
+            tensor("token_embd.weight", GgmlType::Q8_0),
+            tensor("blk.0.ffn_up.weight", GgmlType::Q4K),
+        ];
+        assert_eq!(body_quant(&tied).as_deref(), Some("Q4K"));
+        assert_eq!(
+            DominantQuant::of(&tied).wrong_kl_threshold(),
+            KL_WRONG_Q8K_DOTTED
+        );
+
+        // An unreadable file relaxes nothing.
+        assert_eq!(DominantQuant::of(&[]).label(), None);
+        assert_eq!(DominantQuant::of(&[]).wrong_kl_threshold(), KL_WRONG);
+    }
+
+    /// The DRIFT message and the WRONG threshold read ONE value.
+    ///
+    /// This is #109's actual defect, in the repo's dominant shape: two
+    /// rules that had to agree about which quantization a verdict is
+    /// about, with nothing enforcing it. Both now go through
+    /// `q8k_dotted` on the same `DominantQuant`, and this walks every
+    /// head/body combination asserting they never part.
+    #[test]
+    fn the_drift_message_and_the_wrong_line_never_disagree_about_the_quant() {
+        let kinds: Vec<Option<&str>> = std::iter::once(None)
+            .chain(
+                ["Q8_0", "Q4_0", "Q5_0", "IQ4NL"]
+                    .into_iter()
+                    .chain(Q8K_DOTTED.iter().copied())
+                    .map(Some),
+            )
+            .collect();
+        for head in &kinds {
+            for body in &kinds {
+                let q = DominantQuant::weigh(*head, *body);
+                // The message explains the divergence as the Q8_K
+                // activation path exactly when the threshold made room
+                // for it. One is the other's condition.
+                let message_blames_q8k = q.label().filter(|_| q.q8k_dotted()).is_some();
+                let line_made_room = q.wrong_kl_threshold() == KL_WRONG_Q8K_DOTTED;
+                assert_eq!(
+                    message_blames_q8k, line_made_room,
+                    "head {head:?} body {body:?}: message says Q8_K={message_blames_q8k} but \
+                     the threshold says {line_made_room}"
+                );
+                // And the relaxation happens whenever ANY of the
+                // checkpoint's arithmetic is Q8_K-dotted, so the fix
+                // cannot move a row DRIFT -> WRONG.
+                let any_q8k = [*head, *body]
+                    .into_iter()
+                    .flatten()
+                    .any(llama_dots_this_against_q8k);
+                assert_eq!(line_made_room, any_q8k);
+            }
+        }
     }
 
     /// The dumper's self-report is read, and its absence is not

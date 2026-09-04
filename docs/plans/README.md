@@ -43,6 +43,10 @@ Parity inventory and deltas against llama.cpp:
 - **[`llama-cpp-gap-inventory.md`](llama-cpp-gap-inventory.md)** — evidence-backed differential (not a plan)
 - **[`llama-cpp-full-parity-audit-2026-09-02.md`](llama-cpp-full-parity-audit-2026-09-02.md)** — file map + sweep + priority plan
 - **[`llama-cpp-parity-update-2026-09-03.md`](llama-cpp-parity-update-2026-09-03.md)** — post-merge delta (Qwen MoE Metal, Phi-4 LongRoPE, sweep)
+- **[`cpu-cuda-parity.md`](cpu-cuda-parity.md)** — the two backends that
+  are not at parity, ordered by what was measured on rented hosts on
+  2026-09-04 rather than by tok/s. Carries the kernel-coverage matrix,
+  because a gap column cannot show a format the backend never runs
 
 Everything else is history: [`archive/`](archive/) holds the five plans
 whose items were merged into the roadmap, [`on-hold/`](on-hold/) holds

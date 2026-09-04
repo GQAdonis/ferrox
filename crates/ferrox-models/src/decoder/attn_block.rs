@@ -185,8 +185,8 @@ impl Decoder {
                 cache
                     .push(k, v)
                     .expect("unbounded/planned KvCache growth is infallible");
-                if let Some(oai) = oai {
-                    return ferrox_core::causal_gqa_attention_sinks(
+                let out = if let Some(oai) = oai {
+                    ferrox_core::causal_gqa_attention_sinks(
                         q,
                         &cache.k,
                         &cache.v,
@@ -196,41 +196,51 @@ impl Decoder {
                         cache.rows(),
                         window,
                         &oai.attn_sinks,
-                    );
-                }
-                match (window, cuda_resident_layer) {
-                    (Some(window), _) => causal_gqa_attention_windowed_softcap(
-                        q,
-                        &cache.k,
-                        &cache.v,
-                        n_heads,
-                        n_kv_heads,
-                        head_dim,
-                        cache.rows(),
-                        window,
-                        self.config.attn_logit_softcap,
-                    ),
-                    (None, Some(l)) => self.gqa_attention(
-                        l,
-                        q,
-                        &cache.k,
-                        &cache.v,
-                        n_heads,
-                        n_kv_heads,
-                        head_dim,
-                        cache.rows(),
-                    ),
-                    (None, None) => causal_gqa_attention_softcap(
-                        q,
-                        &cache.k,
-                        &cache.v,
-                        n_heads,
-                        n_kv_heads,
-                        head_dim,
-                        cache.rows(),
-                        self.config.attn_logit_softcap,
-                    ),
-                }
+                    )
+                } else {
+                    match (window, cuda_resident_layer) {
+                        (Some(window), _) => causal_gqa_attention_windowed_softcap(
+                            q,
+                            &cache.k,
+                            &cache.v,
+                            n_heads,
+                            n_kv_heads,
+                            head_dim,
+                            cache.rows(),
+                            window,
+                            self.config.attn_logit_softcap,
+                        ),
+                        (None, Some(l)) => self.gqa_attention(
+                            l,
+                            q,
+                            &cache.k,
+                            &cache.v,
+                            n_heads,
+                            n_kv_heads,
+                            head_dim,
+                            cache.rows(),
+                        ),
+                        (None, None) => causal_gqa_attention_softcap(
+                            q,
+                            &cache.k,
+                            &cache.v,
+                            n_heads,
+                            n_kv_heads,
+                            head_dim,
+                            cache.rows(),
+                            self.config.attn_logit_softcap,
+                        ),
+                    }
+                };
+                // AFTER the read, never inside `push`: the rows this
+                // drops are rows every kernel above has finished with
+                // (#61). A no-op unless `FERROX_KV_WINDOW` is on and
+                // this layer is windowed -- and note that it is the same
+                // `window` the kernels just used, taken from the same
+                // `ModelConfig`, because keeping fewer rows than the
+                // kernel reads would answer out of a truncated history.
+                self.evict_layer_kv(layer_idx, cache);
+                out
             }
             KvStep::Paged { cache, stores } => {
                 // Write guard for the push alone, then a read guard for

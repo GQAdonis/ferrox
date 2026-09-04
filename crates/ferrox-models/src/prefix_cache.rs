@@ -186,7 +186,17 @@ impl PrefixCache {
     /// the most reused, so FIFO evicted the one entry worth keeping as
     /// soon as `max_entries` newer prompts arrived, and the next
     /// request off that system prompt recomputed all of it.
+    /// A cache that has evicted rows behind a sliding window (#61,
+    /// `FERROX_KV_WINDOW`) is REFUSED rather than stored. A stored
+    /// prefix is handed back truncated to an arbitrary common length,
+    /// and a windowed cache no longer holds the rows an arbitrary
+    /// truncation names -- so storing one would trade a cheap recompute
+    /// for a request that stops. Refusing loses the prefix cache for
+    /// the run, which is what the switch's documentation says it costs.
     pub fn store(&mut self, tokens: Vec<usize>, kv_caches: Vec<KvCache>, pending_logits: Vec<f32>) {
+        if kv_caches.iter().any(|c| c.window().is_some()) {
+            return;
+        }
         if self.entries.len() >= self.max_entries {
             // An O(n) scan, over the same vector the lookup above
             // already scans linearly -- so this costs nothing the

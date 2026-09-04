@@ -14,6 +14,7 @@
 
 mod attn_block;
 mod ffn_act;
+pub mod kv_window;
 mod lm_head;
 mod qk_norm;
 mod rope;
@@ -26,6 +27,7 @@ use ferrox_core::attention::{
 };
 use ferrox_core::cache::{KvCache, PagedKvCache, PagedStoreExhausted, SharedPagedKv};
 use ferrox_core::matmul::rms_norm;
+pub use kv_window::{KvWindowPolicy, KV_WINDOW_ENV};
 #[cfg(feature = "metal")]
 use lm_head::FoldedLmHead;
 use lm_head::Logits;
@@ -427,6 +429,12 @@ pub struct Decoder {
     /// policy). Built once; hot path must not re-resolve architecture
     /// strings. See [`crate::execution_plan`].
     pub execution_plan: crate::execution_plan::ExecutionPlan,
+    /// May a windowed layer's host [`KvCache`] drop rows that have
+    /// fallen behind its window? Off unless `FERROX_KV_WINDOW` says
+    /// otherwise; see [`kv_window`] for what else turns it off. A field
+    /// rather than a cached global so a test can run both arms in one
+    /// process and compare tokens.
+    pub kv_window: KvWindowPolicy,
     /// Cache key hit → fused caps last used for that geometry (enables
     /// decode/prefill plan reuse without rebuilding residency).
     pub plan_cache: std::sync::Mutex<
@@ -681,6 +689,7 @@ impl Decoder {
             #[cfg(feature = "metal")]
             metal_attn_kv: std::sync::Mutex::new(None),
             execution_plan,
+            kv_window: KvWindowPolicy::from_env(),
             plan_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
@@ -4225,6 +4234,21 @@ impl Decoder {
                     window,
                 )
             };
+
+            // Every query in this batch has now been answered, so the
+            // rows behind the window are rows nothing will read again
+            // (#61). This is why eviction is not inside `KvCache::push`:
+            // `base_seq_len` above was captured BEFORE the batch's
+            // pushes and every query's KV length is derived from it, so
+            // a drop between the push loop and here would attend the
+            // whole prompt over shifted keys.
+            //
+            // Per layer rather than after the stack, and that is where
+            // most of the prefill saving is: a windowed layer hands its
+            // prompt rows back before the next layer allocates its own,
+            // so a 32k prompt holds ONE layer's full history at a time
+            // instead of every windowed layer's at once.
+            self.evict_layer_kv(l, cache);
 
             let mut projected_batch = layer.attn.o_proj.apply_batch(&attn_out_batch, batch_size);
             if let Some(oai) = oai {

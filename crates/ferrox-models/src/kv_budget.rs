@@ -65,13 +65,34 @@
 //! admitted and then arrives as an OOM instead of the refusal this
 //! engine exists to give.
 //!
-//! There is deliberately no window field left to fill in. Making a
-//! store actually evict is real work and is tracked as #61 (per-layer
-//! page groups, and eviction inside the prompt region); when one does,
-//! the number it keeps belongs to the STORE, and this module should take
-//! it from there rather than restate a rule the store does not follow.
+//! # ...unless the store evicts, which it now can
+//!
+//! #61 step 2 taught the contiguous `KvCache` to drop rows behind a
+//! layer's sliding window, behind `FERROX_KV_WINDOW`. So the paragraph
+//! above is still the default and no longer the only case, and the
+//! difference is expressed the way #33 said it had to be: **the number
+//! the store keeps belongs to the store.** [`KvResidency`] carries the
+//! per-layer windows, [`KvShape::resident_kv_bytes_for_tokens`] prices
+//! them through `ferrox_core::kv_swa::KvWindow::rows_after`, and
+//! `KvCache::evict_behind_window` calls the same function to decide what
+//! to drop. There is no second statement of the rule here to drift.
+//!
+//! Two numbers, not one, and admission wants the larger:
+//! [`KvShape::peak_kv_bytes_for_tokens`] adds the one layer that is
+//! still mid-prefill and holding the whole prompt, because
+//! `Decoder::forward_batch` evicts per layer rather than after the
+//! stack. `resident_` is what a measurement of the caches finds at rest;
+//! `peak_` is what the machine has to survive.
+//!
+//! What is NOT priced here, because no store does it yet: eviction
+//! inside the paged store (#61 step 4) and eviction of the prompt region
+//! while the prompt is still being written (#61 step 5). Both stay at
+//! the full every-layer-every-position number.
+
+use ferrox_core::kv_swa::KvWindow;
 
 use crate::config::ModelConfig;
+use crate::decoder::KvWindowPolicy;
 
 /// Element width of one cached K/V scalar, per backend store.
 ///
@@ -246,11 +267,16 @@ impl KvLayout {
 
 /// The KV shape of a whole model: enough to price any context length.
 ///
-/// Every layer keeps every position. That is a statement about the
-/// STORES this engine allocates, not about the architectures it runs --
-/// see the module doc's "Why a sliding window is not a saving here", and
-/// the test that measures a real `ferrox_core::cache::KvCache` rather
-/// than restating this multiplication.
+/// How big one position is, times how many layers. How many positions
+/// each of those layers still HOLDS is [`KvResidency`], and it is a
+/// separate value because it is a property of the run rather than of
+/// the model: by default every layer keeps every position, and behind
+/// `FERROX_KV_WINDOW` a windowed layer does not (#61).
+///
+/// That is a statement about the STORES this engine allocates, not
+/// about the architectures it runs -- see the module doc, and the two
+/// tests that measure real `ferrox_core::cache::KvCache`s rather than
+/// restating this multiplication.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct KvShape {
     pub n_layers: usize,
@@ -262,9 +288,13 @@ impl KvShape {
     /// Reads the shape off a config.
     ///
     /// `config.sliding_window` / `config.swa_pattern` are deliberately
-    /// NOT read: they describe what attention *reads*, and this module
-    /// prices what the store *keeps*. Nothing here evicts (#33), so a
-    /// windowed layer costs exactly what a full-attention one does.
+    /// NOT read HERE: they describe what attention *reads*, and this
+    /// module prices what the store *keeps*. The default store keeps
+    /// everything (#33), so a windowed layer costs exactly what a
+    /// full-attention one does. When a run evicts, that is what
+    /// [`KvResidency::from_config`] is for -- and it reaches the window
+    /// through the same `KvWindowPolicy` the decoder evicts with, not by
+    /// reading those two fields a second time.
     ///
     /// Always produces a [`KvLayout::Gqa`] layout, because
     /// `ModelConfig` describes the generic GQA decoder -- the MLA
@@ -328,6 +358,55 @@ impl KvShape {
             .saturating_mul(self.elem.bytes_for(per_layer.saturating_mul(tokens as u64)))
     }
 
+    /// Bytes one request's KV costs at `tokens` of context when the
+    /// stores EVICT behind a window (#61 step 2), once every layer has
+    /// been through -- the number a measurement of the caches finds.
+    ///
+    /// The row counts come from [`KvWindow::rows_after`], which is the
+    /// store's own rule and not a restatement of it: `KvCache` calls the
+    /// same function to decide what to drop. Equal to
+    /// [`Self::kv_bytes_for_tokens`] when `residency` keeps everything,
+    /// which is what the default policy produces and what a test below
+    /// asserts rather than assumes.
+    ///
+    /// [`Self::peak_kv_bytes_for_tokens`] is the number to ADMIT on;
+    /// this one is smaller, and the difference is prefill.
+    pub fn resident_kv_bytes_for_tokens(&self, tokens: usize, residency: &KvResidency) -> u64 {
+        let per_layer = self.layout.elems_per_token_per_layer();
+        residency
+            .rows_per_layer(self.n_layers, tokens)
+            .map(|rows| self.elem.bytes_for(per_layer.saturating_mul(rows as u64)))
+            .fold(0u64, |acc, b| acc.saturating_add(b))
+    }
+
+    /// The number an admission decision must use: the resting cost, plus
+    /// the one layer that is still mid-prefill.
+    ///
+    /// `Decoder::forward_batch` writes a whole prompt into layer `l`'s
+    /// cache, attends over it, and only then hands the rows behind the
+    /// window back -- before layer `l + 1` allocates any. So a long
+    /// prompt costs ONE windowed layer's full history at a time rather
+    /// than every windowed layer's at once, and that transient is real
+    /// memory that has to be budgeted for. Charging only the resting
+    /// number would be #33 in the other direction: an admitted request
+    /// whose peak exceeds the estimate arrives as an OOM.
+    ///
+    /// The extra term is the largest single windowed layer's shortfall,
+    /// because layers are prefilled one at a time.
+    pub fn peak_kv_bytes_for_tokens(&self, tokens: usize, residency: &KvResidency) -> u64 {
+        let per_layer = self.layout.elems_per_token_per_layer();
+        let full = self.elem.bytes_for(per_layer.saturating_mul(tokens as u64));
+        let transient = residency
+            .rows_per_layer(self.n_layers, tokens)
+            .map(|rows| {
+                full.saturating_sub(self.elem.bytes_for(per_layer.saturating_mul(rows as u64)))
+            })
+            .max()
+            .unwrap_or(0);
+        self.resident_kv_bytes_for_tokens(tokens, residency)
+            .saturating_add(transient)
+    }
+
     /// The sentence a user should be able to read and reproduce with a
     /// calculator.
     pub fn describe(&self) -> String {
@@ -338,6 +417,77 @@ impl KvShape {
             self.elem.as_str(),
             self.per_token_kv_bytes()
         )
+    }
+}
+
+/// What the stores really keep, per layer.
+///
+/// [`KvShape`] answers "how big is one position, times how many layers".
+/// This answers "how many positions does each of those layers still
+/// hold", which used to be "all of them" for every layer of every model
+/// and now depends on whether `FERROX_KV_WINDOW` is on (#61).
+///
+/// **Deliberately not a field on `KvShape`.** `KvShape` is `Copy`, is
+/// built by struct literal in more than one crate, and is the thing
+/// every existing caller already has; a new field there would make the
+/// no-eviction default a thing every caller restates. A residency is
+/// asked for by the callers that price an evicting run, and the ones
+/// that do not keep the number they always had.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KvResidency {
+    /// One entry per layer, in layer order. `None` means that layer
+    /// keeps every position it was ever given.
+    per_layer: Vec<Option<KvWindow>>,
+}
+
+impl KvResidency {
+    /// Every layer keeps every position: the engine before #61, and the
+    /// engine today unless the switch is on.
+    pub fn keeps_everything(n_layers: usize) -> Self {
+        KvResidency {
+            per_layer: vec![None; n_layers],
+        }
+    }
+
+    /// What `policy` will make the stores of `config` keep.
+    ///
+    /// Goes through [`KvWindowPolicy::layer_window`], which is the same
+    /// call `Decoder::kv_window_for_layer` makes to decide what to
+    /// evict. One expression, so there is nothing for the budget and the
+    /// store to disagree about -- the disagreement being #33, where the
+    /// budget capped a sliding layer no store ever capped and `-c auto`
+    /// approved a context that did not fit.
+    pub fn from_config(config: &ModelConfig, policy: KvWindowPolicy) -> Self {
+        KvResidency {
+            per_layer: (0..config.n_layers)
+                .map(|l| policy.layer_window(config, l))
+                .collect(),
+        }
+    }
+
+    /// True when no layer evicts, i.e. this prices exactly what
+    /// [`KvShape::kv_bytes_for_tokens`] prices.
+    pub fn keeps_every_position(&self) -> bool {
+        self.per_layer.iter().all(Option::is_none)
+    }
+
+    /// The window layer `layer_idx` evicts behind, if any.
+    pub fn layer_window(&self, layer_idx: usize) -> Option<KvWindow> {
+        self.per_layer.get(layer_idx).copied().flatten()
+    }
+
+    /// Rows each of `n_layers` layers holds at `tokens` of context.
+    ///
+    /// `n_layers` comes from the [`KvShape`] being priced rather than
+    /// from `self`, and a layer this residency says nothing about keeps
+    /// everything. A shape and a residency built from different configs
+    /// is a caller error; charging the full cost is the safe way to be
+    /// wrong about it.
+    fn rows_per_layer(&self, n_layers: usize, tokens: usize) -> impl Iterator<Item = usize> + '_ {
+        (0..n_layers).map(move |l| match self.layer_window(l) {
+            Some(w) => w.rows_after(tokens),
+            None => tokens,
+        })
     }
 }
 
@@ -716,6 +866,141 @@ mod tests {
         );
         // The store kept every position in every layer, window or not.
         assert_eq!(allocated, shape.per_token_kv_bytes() * tokens as u64);
+        // And the two entry points agree when nothing evicts, rather
+        // than being two independent multiplications that happen to
+        // match today.
+        assert_eq!(
+            shape
+                .resident_kv_bytes_for_tokens(tokens, &KvResidency::keeps_everything(cfg.n_layers)),
+            allocated
+        );
+    }
+
+    /// **The same property, measured again, now that a store evicts.**
+    ///
+    /// The sibling above is the default and stays the default. This is
+    /// the `FERROX_KV_WINDOW` case, and it is asserted the same way for
+    /// the same reason: by pushing real positions into real
+    /// `ferrox_core::cache::KvCache`s, evicting them the way
+    /// `Decoder::evict_layer_kv` does, and comparing the bytes they hold
+    /// against the budget's number. If the budget restated the window
+    /// rule instead of taking it from `KvWindow::rows_after`, this test
+    /// would pass while the two drifted -- which is exactly how #33
+    /// survived long enough to approve a context that did not fit.
+    #[test]
+    fn the_budget_prices_exactly_what_an_evicting_kv_store_holds() {
+        let cfg = alternating_swa_config();
+        let tokens = 64;
+        let residency = KvResidency::from_config(&cfg, KvWindowPolicy::on());
+        assert!(
+            !residency.keeps_every_position(),
+            "the fixture must have windowed layers, or this proves nothing"
+        );
+        assert!(
+            (0..cfg.n_layers).any(|l| residency.layer_window(l).is_none()),
+            "the fixture must ALSO have dense layers: they are the half that keeps costing"
+        );
+
+        let mut caches: Vec<ferrox_core::cache::KvCache> = (0..cfg.n_layers)
+            .map(|_| ferrox_core::cache::KvCache::new(cfg.n_kv_heads, cfg.head_dim))
+            .collect();
+        for (l, cache) in caches.iter_mut().enumerate() {
+            if let Some(w) = residency.layer_window(l) {
+                cache.arm_window(w);
+            }
+        }
+        let step = vec![0f32; cfg.n_kv_heads * cfg.head_dim];
+        for _ in 0..tokens {
+            for cache in caches.iter_mut() {
+                cache
+                    .push(&step, &step)
+                    .expect("a cache built with `new` always accepts a push");
+                cache.evict_behind_window();
+            }
+        }
+        let held: u64 = caches
+            .iter()
+            .map(|c| (c.k.len() + c.v.len()) as u64 * std::mem::size_of::<f32>() as u64)
+            .sum();
+
+        let shape = KvShape::from_config(&cfg, KvElem::F32);
+        assert_eq!(
+            shape.resident_kv_bytes_for_tokens(tokens, &residency),
+            held,
+            "the budget must price what the evicting store holds"
+        );
+        // The saving is real: strictly less than pricing every position.
+        assert!(
+            held < shape.kv_bytes_for_tokens(tokens),
+            "eviction saved nothing: {held} vs {}",
+            shape.kv_bytes_for_tokens(tokens)
+        );
+        // And the number to admit on is above the number at rest, because
+        // one layer holds the whole prompt while it is being prefilled.
+        assert!(shape.peak_kv_bytes_for_tokens(tokens, &residency) > held);
+        // ...but never above pricing every layer at every position,
+        // which is what the engine costs today.
+        assert!(
+            shape.peak_kv_bytes_for_tokens(tokens, &residency) <= shape.kv_bytes_for_tokens(tokens)
+        );
+    }
+
+    /// The default policy prices exactly what it always did. A switch
+    /// that is off must be invisible to the arithmetic.
+    #[test]
+    fn the_default_policy_prices_every_layer_at_every_position() {
+        let cfg = alternating_swa_config();
+        let residency = KvResidency::from_config(&cfg, KvWindowPolicy::off());
+        assert!(residency.keeps_every_position());
+        let shape = KvShape::from_config(&cfg, KvElem::F32);
+        for tokens in [0usize, 1, 63, 64, 4096] {
+            assert_eq!(
+                shape.resident_kv_bytes_for_tokens(tokens, &residency),
+                shape.kv_bytes_for_tokens(tokens)
+            );
+            assert_eq!(
+                shape.peak_kv_bytes_for_tokens(tokens, &residency),
+                shape.kv_bytes_for_tokens(tokens)
+            );
+        }
+    }
+
+    /// The headline number from #61, priced through the residency rather
+    /// than asserted: Gemma-3-4B at a 32k context.
+    ///
+    /// 34 layers, 4 kv-heads, head_dim 256, host f32, a 1024-position
+    /// window on five layers out of every six. The full price is the
+    /// 9.13 GB the issue measured; the windowed one is what the store
+    /// now holds.
+    #[test]
+    fn gemma3_4b_at_32k_costs_a_fraction_of_what_it_did() {
+        let mut cfg = crate::config::test_dense_fixture();
+        cfg.n_layers = 34;
+        cfg.n_kv_heads = 4;
+        cfg.head_dim = 256;
+        cfg.sliding_window = Some(1024);
+        cfg.swa_pattern = Some(6);
+        let shape = KvShape::from_config(&cfg, KvElem::F32);
+        let tokens = 32_768;
+
+        let full = shape.kv_bytes_for_tokens(tokens);
+        assert_eq!(full, 9_126_805_504, "the number #61 measured");
+
+        let residency = KvResidency::from_config(&cfg, KvWindowPolicy::on());
+        let resting = shape.resident_kv_bytes_for_tokens(tokens, &residency);
+        let peak = shape.peak_kv_bytes_for_tokens(tokens, &residency);
+        // Pinned rather than bounded, so a change to the default slack
+        // shows up as a memory number moving rather than as nothing.
+        // 5 of the 34 layers are full attention (`swa_pattern` 6) and
+        // still hold every position; at 1.34 GB they are most of what is
+        // left. The 29 windowed ones hold 1475 rows each instead of
+        // 32768.
+        assert_eq!(resting, 1_692_590_080, "5.4x less than the 9.13 GB above");
+        assert_eq!(
+            peak, 1_948_942_336,
+            "resting plus the one windowed layer still mid-prefill"
+        );
+        assert!(peak < full && peak > resting);
     }
 
     /// The pool-backed store is the other thing a server allocates, and

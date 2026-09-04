@@ -217,7 +217,7 @@ impl Band {
     /// `references` must be non-empty and every vector the same length
     /// as `ferrox`; `run` drops any reference that disagrees about the
     /// vocabulary before getting here.
-    pub(super) fn measure(references: &[Vec<f32>], ferrox: &[f32], quant: &DominantQuant) -> Self {
+    pub(super) fn measure(references: &[&[f32]], ferrox: &[f32], quant: &DominantQuant) -> Self {
         let probs: Vec<Vec<f64>> = references.iter().map(|r| metrics::softmax(r)).collect();
         let fx = metrics::softmax(ferrox);
         let to_ferrox = probs.iter().map(|p| metrics::kl(p, &fx)).collect();
@@ -511,7 +511,7 @@ mod tests {
     fn a_pair_of_references_that_cannot_disagree_does_not_calibrate_anything() {
         let identical = vec![0.5f32, 2.0, -1.0, 7.25];
         let ferrox = vec![0.5f32, 2.9, -1.0, 7.25];
-        let band = Band::measure(&[identical.clone(), identical.clone()], &ferrox, &kquant());
+        let band = Band::measure(&[&identical, &identical], &ferrox, &kquant());
         assert_eq!(*band.line(), WrongLine::Uncalibrated);
         assert!(!band.ferrox_is_outside());
 
@@ -519,7 +519,7 @@ mod tests {
         // calibrate — otherwise this test would pass on a `measure`
         // that never calibrates at all.
         let other = vec![0.5f32, 2.4, -1.0, 7.25];
-        let band = Band::measure(&[identical, other], &ferrox, &kquant());
+        let band = Band::measure(&[&identical, &other], &ferrox, &kquant());
         assert!(matches!(band.line(), WrongLine::Calibrated { .. }));
     }
 
@@ -550,7 +550,7 @@ mod tests {
             "the fixture must put the larger direction on the reversed pair: {fwd} vs {back}"
         );
 
-        let band = Band::measure(&[peaked, flat], &ferrox, &kquant());
+        let band = Band::measure(&[&peaked, &flat], &ferrox, &kquant());
         match band.line() {
             WrongLine::Calibrated { spread, .. } => {
                 assert_eq!(spread.kl, back);

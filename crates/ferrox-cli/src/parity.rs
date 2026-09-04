@@ -162,9 +162,9 @@ pub fn run(args: ParityArgs) -> anyhow::Result<()> {
     // `bail!` below still leaves the evidence behind. The whole reason
     // to dump is to investigate a bad verdict; losing the vectors
     // exactly when the verdict is bad would defeat it.
+    let ref_logits: Vec<&[f32]> = references.iter().map(|r| r.logits.as_slice()).collect();
     if let Some(prefix) = args.dump_logits.as_deref() {
-        let logits: Vec<&[f32]> = references.iter().map(|r| r.logits.as_slice()).collect();
-        for p in dump::write(prefix, &tokens, &logits, &ferrox_logits)? {
+        for p in dump::write(prefix, &tokens, &ref_logits, &ferrox_logits)? {
             println!("wrote {}", p.display());
         }
         println!();
@@ -175,9 +175,8 @@ pub fn run(args: ParityArgs) -> anyhow::Result<()> {
     let gguf = ferrox_gguf::GgufFile::open(&path).ok();
     let quant = DominantQuant::of(gguf.as_ref().map_or(&[][..], |f| &f.tensors));
 
-    let ref_logits: Vec<Vec<f32>> = references.iter().map(|r| r.logits.clone()).collect();
     let band = Band::measure(&ref_logits, &ferrox_logits, &quant);
-    let report = compare(&references[0].logits, &ferrox_logits, args.top_k, &band);
+    let report = compare(ref_logits[0], &ferrox_logits, args.top_k, &band);
     print_report(
         &args.model,
         tokens.len(),
@@ -671,7 +670,7 @@ mod tests {
     /// so these exercise the ladder and not the calibration.
     fn one_reference(reference: &[f32], ferrox: &[f32]) -> Band {
         Band::measure(
-            &[reference.to_vec()],
+            &[reference],
             ferrox,
             &DominantQuant::weigh(Some("Q8_0"), Some("Q8_0")),
         )
@@ -780,8 +779,8 @@ mod tests {
         let ferrox = vec![0.0f32, 3.6, 1.0, 0.5];
         let quant = DominantQuant::weigh(Some("Q4K"), Some("Q4K"));
 
-        let ab = Band::measure(&[a.clone(), b.clone()], &ferrox, &quant);
-        let ba = Band::measure(&[b.clone(), a.clone()], &ferrox, &quant);
+        let ab = Band::measure(&[&a, &b], &ferrox, &quant);
+        let ba = Band::measure(&[&b, &a], &ferrox, &quant);
 
         let first = compare(&a, &ferrox, 4, &ab);
         let second = compare(&b, &ferrox, 4, &ba);
@@ -798,7 +797,7 @@ mod tests {
         // all, so the same B-vs-ferrox comparison cannot be a WRONG
         // either — even though its KL is an order of magnitude over
         // the 3.008e-2 constant that used to be the line.
-        let alone = Band::measure(std::slice::from_ref(&b), &ferrox, &quant);
+        let alone = Band::measure(&[&b], &ferrox, &quant);
         let solo = compare(&b, &ferrox, 4, &alone);
         assert!(solo.kl_ref_ferrox > 3.008e-2, "{}", solo.kl_ref_ferrox);
         assert_eq!(solo.verdict, Verdict::Drift);
@@ -828,7 +827,7 @@ mod tests {
         let quant = DominantQuant::weigh(Some("Q4K"), Some("Q4K"));
 
         // B is the primary, so B's KL is what the report carries.
-        let band = Band::measure(&[b.clone(), a], &ferrox, &quant);
+        let band = Band::measure(&[&b, &a], &ferrox, &quant);
         let line = band.line().value().expect("two references give a line");
         assert!(
             band.kl_to_ferrox(0) > line,
@@ -858,7 +857,7 @@ mod tests {
         let b = vec![0.0f32, 3.99, 1.0, 0.5];
         let ferrox = vec![0.0f32, 1.00, 1.0, 0.5];
         let quant = DominantQuant::weigh(Some("Q4K"), Some("Q4K"));
-        let band = Band::measure(&[a.clone(), b], &ferrox, &quant);
+        let band = Band::measure(&[&a, &b], &ferrox, &quant);
         assert!(band.ferrox_is_outside());
         assert_eq!(compare(&a, &ferrox, 4, &band).verdict, Verdict::Wrong);
     }

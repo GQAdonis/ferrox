@@ -21,6 +21,35 @@ most of it.
 **CPU is the whole remaining story.** All 16 comparable CPU rows are
 red, from 1.41× to 5.06×. That is where the work is.
 
+**A second host, measured 2026-09-04.** One rented 20-core Cortex-A725
+(aarch64, ARMv9.2 with `i8mm`), idle, ferrox and llama.cpp built and run
+on the same box, same GGUFs, CPU only. It says something this table
+cannot:
+
+| model | test | ferrox (default) | ferrox `spin` | llama.cpp | best gap |
+|---|---|---|---|---|---|
+| SmolLM2-135M Q8_0 | pp512 | 648.84 | | 894.21 | 1.38× |
+| SmolLM2-135M Q8_0 | tg128 | 14.73 | 9.16 | 120.56 | **8.2×** |
+| Llama-3.2-3B Q4_K_M | pp512 | 132.53 | | 46.40 | **0.35×** |
+| Llama-3.2-3B Q4_K_M | tg128 | 10.38 | **23.14** | 17.86 | **0.77×** |
+| Llama-3.1-8B Q4_K_M | pp512 | 61.17 | | 19.15 | **0.31×** |
+| Llama-3.1-8B Q4_K_M | tg128 | 6.64 | **12.41** | 9.06 | **0.73×** |
+
+Three things follow, and none of them are visible in the M2 Pro table
+above:
+
+1. **Prefill on server aarch64 is not a gap, it is a lead.** 0.35× and
+   0.31× mean ferrox is roughly 3x FASTER than llama.cpp at 3B and 8B.
+2. **Decode is only red with the default thread pool.** With
+   `FERROX_CPU_POOL=spin` ferrox beats llama.cpp at both 3B and 8B.
+   The switch is worth more than every other CPU item on the roadmap
+   combined on this hardware.
+3. **135M is a different problem.** ferrox holds 13 to 15 tok/s at 4, 8
+   and 19 threads while llama.cpp does 190 to 204. It is flat in thread
+   count and unmoved by either pool, so it is a fixed per-token cost of
+   roughly 60 ms, not a scheduling loss
+   ([#128](https://github.com/antonellof/ferrox/issues/128)).
+
 **Read every CPU row with two caveats, both found on 2026-09-04.**
 
 1. **This table is one laptop.** Every row is Host B, an Apple M2 Pro.

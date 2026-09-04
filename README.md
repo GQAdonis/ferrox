@@ -21,6 +21,7 @@
 **[Studio UI](ui/)** ·
 **[Agents](docs/AGENTS_COOKBOOK.md)** ·
 **[Roadmap](docs/ROADMAP.md)** ·
+**[Changelog](CHANGELOG.md)** ·
 **[Contributing](CONTRIBUTING.md)**
 
 </div>
@@ -70,7 +71,7 @@ curl -fsSL https://raw.githubusercontent.com/antonellof/ferrox/main/scripts/inst
 ```
 
 Installs `ferrox` and `ferrox-server` into `~/.local/bin` (override with
-`FERROX_INSTALL_DIR`, pin with `FERROX_VERSION=v0.16.0`). The downloaded
+`FERROX_INSTALL_DIR`, pin with `FERROX_VERSION=v0.17.0`). The downloaded
 `ferrox` is built with `serve`, so one binary runs completions and
 serves the API. `ferrox-server` ships alongside it so an existing one on
 your PATH keeps working. Prebuilts are macOS arm64 with Metal and Linux
@@ -142,7 +143,7 @@ belongs to an unrelated crate.
 
 ```toml
 [dependencies]
-ferrox-inference = "0.16"
+ferrox-inference = "0.17"
 ```
 
 ```rust

@@ -1,0 +1,74 @@
+{
+  "approx_params": 3387949056,
+  "arch": "gemma2",
+  "backend": "cuda",
+  "backend_active": "CUDA",
+  "engine_env": {
+    "FERROX_CPU_INT_DOT": "1"
+  },
+  "ferrox_version": "0.17.1",
+  "host_load_1min_end": 1.07,
+  "host_load_1min_start": 1.03,
+  "host_spec": {
+    "arch": "x86_64",
+    "cores": 10,
+    "cpu": "Intel(R) Xeon(R) CPU E5-2630 v4 @ 2.20GHz",
+    "label": "Intel(R) Xeon(R) CPU E5-2630 v4 @ 2.20GHz (10c) Linux 5.15.0-160-generic",
+    "os": "Linux 5.15.0-160-generic",
+    "perf_cores": null,
+    "ram_gb": 15.5
+  },
+  "host_thermal_end": {
+    "cpu_speed_limit_percent": null,
+    "degraded": null,
+    "measured": false,
+    "pressure": null,
+    "source": null
+  },
+  "host_thermal_start": {
+    "cpu_speed_limit_percent": null,
+    "degraded": null,
+    "measured": false,
+    "pressure": null,
+    "source": null
+  },
+  "id": "gemma2_2b_q4km",
+  "kind": "engine",
+  "load_s": 0.065862586,
+  "model_path": "models/gemma-2-2b-it-Q4_K_M.gguf",
+  "quant": "quantized",
+  "quiet_host": true,
+  "reps": 3,
+  "schema": 2,
+  "size_bytes": 1708582752,
+  "tests": [
+    {
+      "ferrox_samples": [
+        5.721972217035402,
+        5.725269197936139,
+        5.727733131752135
+      ],
+      "ferrox_stddev": 0.0023600657072515934,
+      "ferrox_tps": 5.725269197936139,
+      "gap": 369.07434863704196,
+      "llama_tps": 2113.05,
+      "test": "pp512",
+      "workload_digest": "b8d417040110e751"
+    },
+    {
+      "ferrox_samples": [
+        4.14265890122783,
+        4.144100369832267,
+        4.144385188744887
+      ],
+      "ferrox_stddev": 0.00075564704739344,
+      "ferrox_tps": 4.144100369832267,
+      "gap": 19.33109549739078,
+      "llama_tps": 80.11,
+      "test": "tg128",
+      "workload_digest": "044655d19aa3baa5"
+    }
+  ],
+  "threads": 10,
+  "warmup_reps": 1
+}

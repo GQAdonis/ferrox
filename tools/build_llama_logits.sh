@@ -8,6 +8,23 @@
 # Homebrew install (a source build works too — point at the directory
 # holding include/llama.h and lib/libllama.*, OR a cmake build dir whose
 # libllama lives under bin/ with headers in LLAMA_CPP_SOURCE).
+#
+# BUILD IT TWICE. `ferrox parity` takes `--dumper` more than once, and
+# the second one is not a nicety: with a single reference it cannot
+# render a WRONG verdict on any K-quant checkpoint at all, because two
+# builds of llama.cpp have been measured 3.5e-2 apart in KL from an
+# identical graph and no constant can sit above that and still mean
+# anything (issue #111). Two dumpers give the run a line it measured
+# for itself. LLAMA_LOGITS_OUT names the binary so the second build does
+# not overwrite the first:
+#
+#   bash tools/build_llama_logits.sh                      # target/llama_logits
+#   LLAMA_CPP_PREFIX=/tmp/llamabuild \
+#     LLAMA_LOGITS_OUT=target/llama_logits_scratch \
+#     bash tools/build_llama_logits.sh
+#
+#   ferrox parity -m model.gguf \
+#     --dumper target/llama_logits --dumper target/llama_logits_scratch
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -28,11 +45,14 @@ if [[ -z "$PREFIX" ]]; then
 #   * the same bottle cannot LOAD a gemma-4 checkpoint at all, so
 #     `ferrox parity` skipped that model entirely and its tokenizer went
 #     unchecked.
-#   * Qwen2.5-1.5B Q4_K_M parity is reference-dependent: DRIFT against
-#     Homebrew (KL ~7.7e-3) but WRONG against a fresh scratch build
-#     (KL ~2.7e-2, same top-1). Default to Homebrew for CI; rebuild from
-#     scratch only when chasing llama.cpp vintage drift, not as proof of a
-#     ferrox graph bug.
+#   * Qwen2.5-1.5B Q4_K_M parity used to be reference-dependent: DRIFT
+#     against Homebrew (KL ~7.7e-3) but WRONG against a fresh scratch
+#     build (KL ~2.7e-2, same top-1). The verdict no longer moves with
+#     the bottle -- `parity` measures the two builds against EACH OTHER
+#     and judges ferrox against that, which is why you want both
+#     dumpers. But every printed KL still belongs to the reference the
+#     report names, so a NUMBER quoted without its libllama is still
+#     half an experiment.
 #
 # Building llama.cpp from `.scratch/llama.cpp` and pointing this script
 # at it fixed both: BGE went DIVERGES to MATCH, and gemma-4 joined the
@@ -54,8 +74,14 @@ if [[ -z "$PREFIX" ]]; then
   fi
 fi
 
-mkdir -p "$ROOT/target"
-OUT="$ROOT/target/llama_logits"
+# A relative LLAMA_LOGITS_OUT is taken against the repo root, so the
+# same command works from anywhere; an absolute one is used as given.
+OUT="${LLAMA_LOGITS_OUT:-target/llama_logits}"
+case "$OUT" in
+  /*) ;;
+  *) OUT="$ROOT/$OUT" ;;
+esac
+mkdir -p "$(dirname "$OUT")"
 
 # Homebrew-style layout: PREFIX/include + PREFIX/lib
 if [[ -f "$PREFIX/include/llama.h" ]]; then
@@ -81,3 +107,6 @@ fi
 echo
 echo "It writes into target/, so 'cargo clean' removes it — rebuild with this"
 echo "script rather than assuming ferrox parity lost its reference."
+echo "Build it a second time against another libllama (LLAMA_CPP_PREFIX=… "
+echo "LLAMA_LOGITS_OUT=…) and pass both to 'ferrox parity --dumper': with one"
+echo "reference no K-quant checkpoint can be called WRONG (issue #111)."

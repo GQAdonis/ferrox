@@ -36,6 +36,26 @@ pub struct SuiteArgs {
     pub max_load: f64,
 }
 
+/// A filesystem-safe short name for a host label.
+///
+/// Lowercase, non-alphanumerics collapsed to `-`, trimmed. Only used to
+/// keep two machines' receipts from overwriting each other; the
+/// authoritative label stays inside the receipt as `host_spec.label`.
+fn host_slug(label: &str) -> String {
+    let mut out = String::new();
+    let mut last_dash = true;
+    for c in label.chars() {
+        if c.is_ascii_alphanumeric() {
+            out.push(c.to_ascii_lowercase());
+            last_dash = false;
+        } else if !last_dash {
+            out.push('-');
+            last_dash = true;
+        }
+    }
+    out.trim_matches('-').to_string()
+}
+
 fn suite_path(bench_dir: &Path) -> PathBuf {
     bench_dir.join("suite.json")
 }
@@ -182,7 +202,19 @@ pub fn run_suite(args: SuiteArgs) -> anyhow::Result<()> {
                 anyhow::bail!("missing GGUF for {}: {}", entry.id, entry.gguf);
             }
 
-            let receipt = out_dir.join(format!("{}_{backend}.json", entry.id));
+            // The host belongs in the NAME, not only inside the file.
+            // `{id}_{backend}.json` collides the moment a second
+            // machine runs the same entry: the Xeon's `*_cpu.json`
+            // silently replaces the laptop's, and the ledger loses a
+            // host instead of gaining one. Discovered while adding the
+            // first x86 and CUDA rows.
+            let receipt = out_dir.join(format!(
+                "{}_{backend}__{}.json",
+                entry.id,
+                host_slug(&crate::host_state::host_label(
+                    &crate::host_state::host_spec()
+                ))
+            ));
             eprintln!("\n=== {} [{}] {backend} ===", entry.id, entry.name);
             // The previous entry's own benchmark is still in the
             // 1-minute average, and the child re-checks the bar. Let it
@@ -618,6 +650,22 @@ mod tests {
             );
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Two machines running the same entry must not share a filename.
+    #[test]
+    fn a_receipt_name_carries_its_host() {
+        assert_eq!(
+            host_slug("Apple M2 Pro (10c/6p) macOS 26.6.1"),
+            "apple-m2-pro-10c-6p-macos-26-6-1"
+        );
+        assert_eq!(host_slug("Xeon E5-2630 v4"), "xeon-e5-2630-v4");
+        assert_ne!(
+            host_slug("Apple M2 Pro"),
+            host_slug("Xeon E5-2630 v4"),
+            "two hosts sharing a receipt name is how a ledger loses a machine"
+        );
+        assert_eq!(host_slug("  --  "), "");
     }
 
     #[test]

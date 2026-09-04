@@ -280,8 +280,17 @@ impl ByteTokenizer {
     /// dropped rather than silently corrupting output; invalid UTF-8
     /// byte sequences are replaced per Rust's standard lossy conversion.
     pub fn decode(ids: &[u32]) -> String {
-        let bytes: Vec<u8> = ids.iter().filter_map(|&id| u8::try_from(id).ok()).collect();
-        String::from_utf8_lossy(&bytes).into_owned()
+        String::from_utf8_lossy(&Self::decode_bytes(ids)).into_owned()
+    }
+
+    /// The raw bytes, before any UTF-8 decision is made about them.
+    ///
+    /// A caller decoding ONE token at a time must have these: a
+    /// multi-byte character split across two tokens is two invalid
+    /// fragments, and `decode` would turn each into U+FFFD and lose the
+    /// bytes for good. See `ferrox_server::utf8_stream`.
+    pub fn decode_bytes(ids: &[u32]) -> Vec<u8> {
+        ids.iter().filter_map(|&id| u8::try_from(id).ok()).collect()
     }
 
     pub const VOCAB_SIZE: usize = 256;
@@ -794,6 +803,12 @@ impl GgufBpeTokenizer {
     /// GPT-2: remapped unicode → bytes. Gemma-4: unescape `▁` → space and
     /// expand `<0xXX>` byte tokens (same shape as SPM decode).
     pub fn decode(&self, ids: &[u32]) -> String {
+        String::from_utf8_lossy(&self.decode_bytes(ids)).into_owned()
+    }
+
+    /// The raw bytes, before any UTF-8 decision is made about them.
+    /// See [`GgufBpeTokenizer::decode`] and `ferrox_server::utf8_stream`.
+    pub fn decode_bytes(&self, ids: &[u32]) -> Vec<u8> {
         match self.style {
             BpeEncodingStyle::Gpt2 => {
                 let bytes: Vec<u8> = ids
@@ -802,7 +817,7 @@ impl GgufBpeTokenizer {
                     .flat_map(|token| token.chars())
                     .filter_map(|c| self.unicode_to_byte.get(&c).copied())
                     .collect();
-                String::from_utf8_lossy(&bytes).into_owned()
+                bytes
             }
             BpeEncodingStyle::SpmWhitespace => {
                 let mut bytes: Vec<u8> = Vec::new();
@@ -816,7 +831,7 @@ impl GgufBpeTokenizer {
                         bytes.extend(token.replace(SPM_SPACE, " ").into_bytes());
                     }
                 }
-                String::from_utf8_lossy(&bytes).into_owned()
+                bytes
             }
         }
     }
@@ -1136,6 +1151,17 @@ impl GgufSpmTokenizer {
     }
 
     pub fn decode(&self, ids: &[u32]) -> String {
+        String::from_utf8_lossy(&self.decode_bytes(ids)).into_owned()
+    }
+
+    /// The raw bytes, before any UTF-8 decision is made about them.
+    ///
+    /// The comment below is about several `<0xXX>` tokens inside ONE
+    /// call. The same character can just as easily straddle the
+    /// boundary BETWEEN two calls, which is why this is public: a
+    /// per-token caller has to do its own buffering, and it cannot do
+    /// that from a `String` that has already been made lossy.
+    pub fn decode_bytes(&self, ids: &[u32]) -> Vec<u8> {
         // Byte-fallback tokens must be collected as raw bytes (not
         // pushed as their 6-character literal token string) and
         // UTF-8-decoded together with the rest -- a single real
@@ -1155,7 +1181,7 @@ impl GgufSpmTokenizer {
                 bytes.extend(token.replace('\u{2581}', " ").into_bytes());
             }
         }
-        String::from_utf8_lossy(&bytes).into_owned()
+        bytes
     }
 }
 
@@ -1397,6 +1423,14 @@ impl GgufUnigramTokenizer {
             }
         }
         out
+    }
+
+    /// The raw bytes. Unigram has no byte-fallback convention, so every
+    /// token is already whole text and this can never split a
+    /// character -- it exists so a per-token caller can treat every
+    /// tokenizer the same way.
+    pub fn decode_bytes(&self, ids: &[u32]) -> Vec<u8> {
+        self.decode(ids).into_bytes()
     }
 }
 

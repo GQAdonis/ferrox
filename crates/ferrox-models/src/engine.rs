@@ -318,6 +318,19 @@ impl Engine for DeepseekV4Engine {
 pub trait TextTokenizer {
     fn encode(&self, text: &str) -> Vec<usize>;
     fn decode(&self, ids: &[usize]) -> String;
+
+    /// The raw bytes, before any UTF-8 decision is made about them.
+    ///
+    /// A caller decoding ONE token at a time needs these: a character
+    /// split across two tokens is two invalid fragments, and `decode`
+    /// resolves each to U+FFFD separately, losing the bytes (#124).
+    ///
+    /// The default is correct for any tokenizer whose tokens are whole
+    /// text, and no worse than `decode` for one whose tokens are not --
+    /// but such a tokenizer should override this.
+    fn decode_bytes(&self, ids: &[usize]) -> Vec<u8> {
+        self.decode(ids).into_bytes()
+    }
 }
 
 impl TextTokenizer for KimiTokenizer {

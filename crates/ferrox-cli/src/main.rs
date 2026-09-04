@@ -230,6 +230,17 @@ enum Commands {
         /// Compiled reference dumper (see .local-scripts/llama_logits.c).
         #[arg(long)]
         dumper: Option<String>,
+        /// Write both compared logit vectors under this prefix
+        /// (`<prefix>.llama.f32`, `<prefix>.ferrox.f32`,
+        /// `<prefix>.tokens.txt`), as raw little-endian f32.
+        ///
+        /// A parity verdict is a distance between two points and says
+        /// where neither one is, so it cannot tell "ferrox moved" from
+        /// "the reference moved". Dump against two `--dumper` builds and
+        /// compare the two `.llama.f32` files to each other: that
+        /// comparison has no ferrox in it.
+        #[arg(long)]
+        dump_logits: Option<String>,
     },
     /// Corpus perplexity, llama.cpp's `perplexity` tool.
     ///
@@ -954,6 +965,7 @@ fn main() -> anyhow::Result<()> {
             prompt_tokens,
             top_k,
             dumper,
+            dump_logits,
         } => {
             return parity::run(parity::ParityArgs {
                 model,
@@ -961,6 +973,7 @@ fn main() -> anyhow::Result<()> {
                 prompt_tokens,
                 top_k,
                 dumper,
+                dump_logits,
             });
         }
         Commands::Perplexity {

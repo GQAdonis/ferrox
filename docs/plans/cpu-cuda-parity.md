@@ -135,17 +135,27 @@ cuda` for the gap.
 llama.cpp, and `parity` agreeing on tokens. If the kernel is wrong,
 this is where it is caught, before any of it is published.
 
-### 2. Close the CUDA decode gap (9x to 19x)
+### 2. Close the CUDA decode gap (9x to 17x)
 
 Present on every kind including Q8_0, so it is not the missing GEMM.
-Candidates, in the order a profile would rule them out: per-token
-host/device round trips, no CUDA graph capture (`FERROX_CUDA_GRAPH` is
-groundwork that "changes nothing" today), the GQA reduction still on
-the host by default (`FERROX_CUDA_GQA` is off because its parity is
-gated on hardware tests nobody has run), and per-launch allocation.
+Three candidates were tested on hardware on 2026-09-04 and **two are
+now ruled out**:
 
-**Exit:** a profile naming the split, then the largest item fixed and
-re-measured. Not "make it faster".
+- **The GQA reduction is not it.** `FERROX_CUDA_GQA=1` is correct
+  (`verify` is token-identical) and **42% SLOWER**: 6.85 tok/s against
+  11.88 on Llama-3.2-1B Q4_K_M. It also never compiled before that day
+  (NVRTC has no `INFINITY`), so the flag had never run at all.
+- **CUDA graphs are not it, yet.** `FERROX_CUDA_GRAPH=1` measures
+  11.80 against 11.84 off, exactly as its own doc predicts: nothing
+  enqueues into a captured stream, so it is groundwork.
+- **The GPU is idle.** `nvidia-smi` reports **36% utilization** during
+  decode. Two thirds of the time nothing is computing, so the cost is
+  host-side: launch overhead, per-token synchronisation, or per-launch
+  allocation. That is where to look next, and it is consistent with a
+  gap that is uniform across every quant kind.
+
+**Exit:** the launch/sync count per decoded token, measured; then the
+largest item removed and re-measured. Not "make it faster".
 
 ### 3. Decide the CPU pool by work size, not by environment variable
 
@@ -232,8 +242,8 @@ all, which is honest and temporary.
 
 | Step | Issue | State |
 |---|---|---|
-| 1 CUDA K-quant GEMM verified | #131 | written, unverified on hardware |
-| 2 CUDA decode | #131 | not started |
+| 1 CUDA K-quant GEMM verified | #131 | **done**: verify token-identical, 325x to 10.9x |
+| 2 CUDA decode | #131 | GQA and graphs ruled out; GPU at 36% util, host-bound |
 | 3 CPU pool rule | #27 | measured, needs the predicate |
 | 4 fixed per-token cost | #128 | not started |
 | 5 x86 diagnosis | #127 | not started |

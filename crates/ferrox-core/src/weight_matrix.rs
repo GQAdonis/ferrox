@@ -586,9 +586,45 @@ static INT_DOT_TEST_OVERRIDE: std::sync::atomic::AtomicI8 = std::sync::atomic::A
 /// Must be called while the process is still single-threaded, since it
 /// mutates the process environment.
 pub unsafe fn default_cpu_int_dot_on() {
-    if std::env::var_os("FERROX_CPU_INT_DOT").is_none() {
+    if std::env::var_os("FERROX_CPU_INT_DOT").is_none() && int_dot_is_a_win_here() {
         unsafe { std::env::set_var("FERROX_CPU_INT_DOT", "1") };
     }
+}
+
+/// Whether the int-dot path is faster than the f32 one on THIS
+/// architecture.
+///
+/// It is not universally faster, and the default said it was. The
+/// interleaved int8 kernels this path selects were written for
+/// aarch64: `i8mm` SMMLA tiers, interleave-8 NEON GEMV, the Q8_K repack.
+/// x86_64 has none of that, so on x86 the switch selects a scalar
+/// integer loop AND bypasses the AVX2 f32 dot that does exist
+/// (`dot_q4_k_f32` and friends are gated on `avx2` + `fma`).
+///
+/// Measured 2026-09-04 on an idle 32-core Ryzen 9 7945HX (Zen 4, with
+/// `avx512_vnni` that nothing here uses), `tg64`, int-dot on against
+/// off:
+///
+/// | model | on (was the default) | off |
+/// |---|---|---|
+/// | Llama-3.2-1B Q4_K_M | 10.08 | **48.94** |
+/// | Llama-3.2-1B Q6_K | 4.11 | **36.23** |
+/// | Llama-3.2-3B Q4_K_M | 4.73 | **19.30** |
+///
+/// So the default cost x86 between 4x and 8.8x of decode, and it is
+/// most of why `benchmarks/RESULTS.md` had no x86 row worth showing
+/// (#127). Prefill is unaffected (95.3 against 89.4 on the 1B), which
+/// is consistent: prefill goes through the batched GEMM rather than
+/// this dot.
+///
+/// aarch64 keeps the default, where it is worth ~28% and the kernels it
+/// selects are the ones that were actually written.
+///
+/// This is a DEFAULT, not a gate: `FERROX_CPU_INT_DOT=1` still turns it
+/// on anywhere, which is what an x86 VNNI implementation would want in
+/// order to measure itself against the f32 path.
+fn int_dot_is_a_win_here() -> bool {
+    cfg!(target_arch = "aarch64")
 }
 
 /// A batch of activations quantized once for reuse across several
@@ -4958,5 +4994,33 @@ mod tests {
         let report = reg.seal();
         assert!(!report.misses.is_empty());
         assert!(report.violations.is_empty(), "{}", report.render());
+    }
+}
+
+#[cfg(test)]
+mod int_dot_default_tests {
+    /// The int-dot default follows the architecture that has the
+    /// kernels, not the wish that every architecture did.
+    ///
+    /// Turning it on where the interleaved kernels do not exist selects
+    /// a scalar integer loop and skips the AVX2 f32 dot that does, which
+    /// measured 4x to 8.8x of x86 decode (#127). A future x86 VNNI
+    /// implementation should flip this deliberately, with its own
+    /// before/after, rather than by inheriting a default nobody
+    /// measured.
+    #[test]
+    fn the_int_dot_default_is_on_only_where_its_kernels_are() {
+        let on_by_default = super::int_dot_is_a_win_here();
+        assert_eq!(
+            on_by_default,
+            cfg!(target_arch = "aarch64"),
+            "int-dot defaults on for aarch64 (i8mm, interleave-8 NEON) and off elsewhere"
+        );
+        // The env var still wins in both directions: this is a default,
+        // not a gate, so an x86 VNNI port can measure itself.
+        assert!(
+            !on_by_default || cfg!(target_arch = "aarch64"),
+            "no architecture may default on without the kernels"
+        );
     }
 }

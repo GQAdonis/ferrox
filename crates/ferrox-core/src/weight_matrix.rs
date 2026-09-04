@@ -546,6 +546,20 @@ pub fn cuda_dense_enabled() -> bool {
 /// reference asserts exact agreement. So the *inference product*
 /// defaults to fast and the *library default* stays reference-exact.
 pub fn cpu_int_dot_enabled() -> bool {
+    #[cfg(test)]
+    {
+        // The env var is read once into a `OnceLock`, so a test cannot
+        // flip it after any other test has already observed it. Without
+        // an override, `cargo test` runs with int-dot *off* and every
+        // interleaved/i8mm batch kernel below is dead code in CI --
+        // which is how the whole repack tier went untested end to end.
+        // See [`tests::ForceIntDot`].
+        match INT_DOT_TEST_OVERRIDE.load(std::sync::atomic::Ordering::Acquire) {
+            0 => return false,
+            1 => return true,
+            _ => {}
+        }
+    }
     use std::sync::OnceLock;
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
@@ -555,6 +569,13 @@ pub fn cpu_int_dot_enabled() -> bool {
         )
     })
 }
+
+/// Test-only forcing of [`cpu_int_dot_enabled`]: `-1` unset, `0` off,
+/// `1` on. A global atomic rather than a thread-local because the paths
+/// it gates run on Rayon workers, which do not inherit thread-locals
+/// from the test thread.
+#[cfg(test)]
+static INT_DOT_TEST_OVERRIDE: std::sync::atomic::AtomicI8 = std::sync::atomic::AtomicI8::new(-1);
 
 /// Sets `FERROX_CPU_INT_DOT=1` unless the caller already expressed a
 /// preference. Call from a binary's startup, before any worker threads
@@ -3556,6 +3577,54 @@ mod tests {
     }
     use super::*;
 
+    /// Forces [`cpu_int_dot_enabled`] for the lifetime of the guard, so a
+    /// test can drive the quantized-activation batch kernels (the
+    /// interleaved `block_q*_Kx8` / `block_q*_0x4` repack tier and the
+    /// NEON i8mm GEMMs behind it) that every shipped binary turns on via
+    /// `default_cpu_int_dot_on` but `cargo test` otherwise leaves off.
+    ///
+    /// The override is process-global, so the guard serializes on a
+    /// mutex: two tests forcing opposite values concurrently would
+    /// otherwise see each other's setting.
+    struct ForceIntDot {
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl ForceIntDot {
+        fn new(on: bool) -> Self {
+            static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+            let lock = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            INT_DOT_TEST_OVERRIDE.store(i8::from(on), std::sync::atomic::Ordering::Release);
+            Self { _lock: lock }
+        }
+    }
+
+    impl Drop for ForceIntDot {
+        fn drop(&mut self) {
+            INT_DOT_TEST_OVERRIDE.store(-1, std::sync::atomic::Ordering::Release);
+        }
+    }
+
+    /// The guard has to actually move the getter, in both directions --
+    /// otherwise every test built on it silently exercises one path
+    /// twice, which is exactly the hole it exists to close.
+    #[test]
+    fn force_int_dot_moves_the_getter_and_restores_it() {
+        {
+            let _g = ForceIntDot::new(true);
+            assert!(cpu_int_dot_enabled(), "forcing on must enable int dot");
+        }
+        {
+            let _g = ForceIntDot::new(false);
+            assert!(!cpu_int_dot_enabled(), "forcing off must disable int dot");
+        }
+        assert_eq!(
+            INT_DOT_TEST_OVERRIDE.load(std::sync::atomic::Ordering::Acquire),
+            -1,
+            "the guard must clear the override on drop"
+        );
+    }
+
     /// `dequant_row` must reproduce exactly the values a full-buffer
     /// dequantization of the same row produces, for every storage
     /// variant -- and read only that row's bytes (each row here has
@@ -3944,7 +4013,7 @@ mod tests {
             let x = &x_batch[b * cols..(b + 1) * cols];
             let sequential = matrix.apply(x);
             let from_batch = &batched[b * rows..(b + 1) * rows];
-            assert_batch_row_matches(QuantKind::Q8_0, b, &sequential, from_batch);
+            assert_batch_row_matches(QuantKind::Q8_0, "", b, &sequential, from_batch);
         }
     }
 
@@ -3974,7 +4043,13 @@ mod tests {
     /// build: `apply_batch` dispatches to Metal while `apply` stays on
     /// the CPU, so this compares two backends. The bound stays tight on
     /// CPU, where both sides are the same code and must agree closely.
-    fn assert_batch_row_matches(kind: QuantKind, b: usize, sequential: &[f32], from_batch: &[f32]) {
+    fn assert_batch_row_matches(
+        kind: QuantKind,
+        ctx: &str,
+        b: usize,
+        sequential: &[f32],
+        from_batch: &[f32],
+    ) {
         let scale = sequential
             .iter()
             .fold(0.0f32, |a, v| a.max(v.abs()))
@@ -3990,7 +4065,7 @@ mod tests {
             let err = (s - got).abs() / scale;
             assert!(
                 err < bound,
-                "{kind:?} batch {b} row {r}: apply()={s} apply_batch={got} \
+                "{kind:?} {ctx} batch {b} row {r}: apply()={s} apply_batch={got} \
                  (err {err:e} of row scale {scale}, bound {bound:e})"
             );
         }
@@ -4220,36 +4295,185 @@ mod tests {
             "an expert lease keeps its address across a content swap"
         );
     }
+    /// One `apply_batch` vs per-row `apply` sweep, parameterized by shape
+    /// so the shape tests below differ only in the numbers they pass.
+    fn assert_apply_batch_matches_apply(
+        kind: QuantKind,
+        rows: usize,
+        cols: usize,
+        batch_size: usize,
+        seed: usize,
+    ) {
+        let x_batch: Vec<f32> = (0..batch_size * cols)
+            .map(|i| (((i * 31 + seed) % 97) as f32) * 0.021 - 1.0)
+            .collect();
+        let matrix = synth_quant_matrix(kind, rows, cols);
+        let batched = matrix.apply_batch(&x_batch, batch_size);
+        assert_eq!(batched.len(), batch_size * rows);
+        let ctx = format!(
+            "rows {rows} cols {cols} batch_size {batch_size} int_dot {}",
+            cpu_int_dot_enabled()
+        );
+        for b in 0..batch_size {
+            let x = &x_batch[b * cols..(b + 1) * cols];
+            let sequential = matrix.apply(x);
+            let from_batch = &batched[b * rows..(b + 1) * rows];
+            // Delegates rather than restating the bound. The first
+            // version of this helper compared each element against
+            // `s.abs().max(1.0)`, which is a bare 1e-4 ABSOLUTE bound
+            // for any row whose value is small -- and a dot product of
+            // 512 terms that cancels to -0.76 carries the rounding of
+            // the terms, not of the result. It passed on aarch64 and
+            // failed on x86_64 CI at 1.07e-4, on one row out of 17094.
+            // `assert_batch_row_matches` already divides by the row
+            // vector's own scale, which is the invariant that makes the
+            // comparison meaningful, and it is now the only place the
+            // tolerance is written down.
+            assert_batch_row_matches(kind, &ctx, b, &sequential, from_batch);
+        }
+    }
+
+    const BATCH_SHAPE_KINDS: [QuantKind; 5] = [
+        QuantKind::Q8_0,
+        QuantKind::Q4_0,
+        QuantKind::Q4K,
+        QuantKind::Q5K,
+        QuantKind::Q6K,
+    ];
 
     /// `apply_batch` writes straight into the `[batch][rows]` output from
     /// parallel tasks (no staging transpose); the shapes here force every
     /// write pattern: full row-groups, a tail of leftover rows, and both
-    /// full and partial activation tiles. Runs against whatever path
-    /// `FERROX_CPU_INT_DOT` selects, so exercise it both ways.
+    /// full and partial activation tiles.
+    ///
+    /// Run under both settings of [`cpu_int_dot_enabled`]. With int-dot
+    /// off, `apply_batch` dequantizes and the repack tier is skipped
+    /// entirely; with it on -- which is what every shipped binary does,
+    /// via `default_cpu_int_dot_on` -- the interleaved `block_q*_Kx8` /
+    /// `block_q*_0x4` kernels and, on an i8mm host, the SMMLA GEMMs are
+    /// the code under test. `cargo test` leaves the env var unset, so
+    /// without [`ForceIntDot`] only the first of those two ever ran.
     #[test]
     fn apply_batch_matches_apply_across_kinds_with_groups_and_tail() {
-        let rows = 19; // 2x8-row groups + 3 tail (4x4-row groups + 3 for Q8_0/Q4_0)
-        let cols = 512;
-        let batch_size = 6; // one full 4-activation tile + a partial one
+        for int_dot in [false, true] {
+            let _g = ForceIntDot::new(int_dot);
+            for kind in BATCH_SHAPE_KINDS {
+                // 19 rows = 2x8-row groups + 3 tail (4x4-row groups + 3
+                // for Q8_0/Q4_0); 6 activations = one full 4-tile + a
+                // partial one.
+                assert_apply_batch_matches_apply(kind, 19, 512, 6, 7);
+            }
+        }
+    }
+
+    /// Shapes too small to fill one interleaved row-group, which the
+    /// tests around this one never reach: they use `rows` big enough that
+    /// `n_groups > 0` for every kind. At `rows < 8` the K-quant arms take
+    /// their `else` branch (per-row `gemm_q*_k_q8_row`) with the repack
+    /// path completely bypassed, and at `rows < 4` the Q8_0/Q4_0 arms do
+    /// the same with `dot_q*_q8`. `rows = 5` is the mixed case: one full
+    /// `block_q*_0x4` group plus a 1-row tail for Q8_0/Q4_0, zero groups
+    /// for the Kx8 kinds. `rows = 1` is the single-row case.
+    ///
+    /// `cols = 256` is also the minimum K for a K-quant -- a single
+    /// super-block, so every kernel's block loop runs exactly one trip.
+    /// `batch_size = 1` is the single-column case: one activation in the
+    /// quad, `na = 1` with three zero-padded lanes in `Q8KActsX4` /
+    /// `Q8ActsX4`.
+    #[test]
+    fn apply_batch_matches_apply_for_sub_tile_shapes() {
+        for int_dot in [false, true] {
+            let _g = ForceIntDot::new(int_dot);
+            for kind in BATCH_SHAPE_KINDS {
+                for rows in [1, 2, 3, 5, 7] {
+                    for batch_size in [1, 2, 5] {
+                        assert_apply_batch_matches_apply(kind, rows, 256, batch_size, 13);
+                    }
+                }
+            }
+        }
+    }
+
+    /// `apply_batch` under int-dot against an f32 dequantize-and-dot
+    /// reference that never touches the packed buffer.
+    ///
+    /// Every other batch test compares `apply_batch` against `apply`,
+    /// which under int-dot is the packed **GEMV** against the packed
+    /// **GEMM** -- two kernels reading the *same* interleaved bytes. That
+    /// catches a bad kernel but is structurally blind to a bad
+    /// `pack_q*_matrix_x*`: both sides read the same wrong bytes and
+    /// agree. `dequant_row` is the only reference in the tree that
+    /// re-derives the weights from the canonical GGUF blocks, so it is
+    /// the only one that can see a mis-interleave.
+    ///
+    /// The bound is the Q8/Q8_K *activation* quantization floor, not the
+    /// kernel's, and it is scaled by the RMS of the reference outputs
+    /// rather than per element: these synthetic weights are uniform
+    /// random bytes, so individual dots cancel to near zero and a
+    /// per-element relative bound would be meaningless. Worst deviation
+    /// measured across every shape below, on an M2 Pro (i8mm), is 0.016 x
+    /// RMS; 0.12 keeps a 7x margin. Coarse on purpose -- a mis-pack
+    /// decorrelates the output from the reference entirely (measured at
+    /// 2.07 x RMS for a one-row shift in the Q5_K `qh` interleave), an
+    /// order of magnitude past this bound.
+    #[test]
+    fn int_dot_batch_matches_dequant_dot_reference() {
+        let _g = ForceIntDot::new(true);
+        assert!(cpu_int_dot_enabled(), "this test needs the packed path");
+        for kind in BATCH_SHAPE_KINDS {
+            // Rows straddle both tile widths: below the tile, one short
+            // of it, exactly it, one past it, and multi-group with a
+            // tail. Batch straddles the 4-wide activation quad. cols 256
+            // is the minimum K for a K-quant (one super-block).
+            for rows in [1, 3, 5, 7, 8, 9, 19] {
+                for cols in [256, 512] {
+                    for batch_size in [1, 3, 4, 9] {
+                        assert_int_dot_matches_dequant_dot(kind, rows, cols, batch_size, 23);
+                    }
+                }
+            }
+        }
+        // Q8_0/Q4_0 alone can go down to a single 32-element block.
+        for kind in [QuantKind::Q8_0, QuantKind::Q4_0] {
+            for rows in [1, 3, 4, 5, 11] {
+                for batch_size in [1, 3, 4, 9] {
+                    assert_int_dot_matches_dequant_dot(kind, rows, 32, batch_size, 29);
+                }
+            }
+        }
+    }
+
+    fn assert_int_dot_matches_dequant_dot(
+        kind: QuantKind,
+        rows: usize,
+        cols: usize,
+        batch_size: usize,
+        seed: usize,
+    ) {
         let x_batch: Vec<f32> = (0..batch_size * cols)
-            .map(|i| (((i * 31 + 7) % 97) as f32) * 0.021 - 1.0)
+            .map(|i| (((i * 37 + seed) % 89) as f32) * 0.019 - 0.8)
             .collect();
-        for kind in [
-            QuantKind::Q8_0,
-            QuantKind::Q4_0,
-            QuantKind::Q4K,
-            QuantKind::Q5K,
-            QuantKind::Q6K,
-        ] {
-            let matrix = synth_quant_matrix(kind, rows, cols);
-            let batched = matrix.apply_batch(&x_batch, batch_size);
-            assert_eq!(batched.len(), batch_size * rows);
+        let matrix = synth_quant_matrix(kind, rows, cols);
+        let got = matrix.apply_batch(&x_batch, batch_size);
+        assert_eq!(got.len(), batch_size * rows);
+
+        let mut want = vec![0f32; batch_size * rows];
+        for r in 0..rows {
+            let w = matrix.dequant_row(r);
+            assert_eq!(w.len(), cols);
             for b in 0..batch_size {
                 let x = &x_batch[b * cols..(b + 1) * cols];
-                let sequential = matrix.apply(x);
-                let from_batch = &batched[b * rows..(b + 1) * rows];
-                assert_batch_row_matches(kind, b, &sequential, from_batch);
+                want[b * rows + r] = w.iter().zip(x.iter()).map(|(a, b)| a * b).sum();
             }
+        }
+        let rms = (want.iter().map(|v| v * v).sum::<f32>() / want.len() as f32).sqrt();
+        for (i, (g, w)) in got.iter().zip(want.iter()).enumerate() {
+            let err = (g - w).abs();
+            assert!(
+                err < 0.12 * rms.max(1e-3),
+                "{kind:?} rows {rows} cols {cols} batch_size {batch_size} [flat {i}]: \
+                 int-dot={g} dequant-dot={w} (err {err}, rms {rms})"
+            );
         }
     }
 
@@ -4257,30 +4481,17 @@ mod tests {
     /// (32 row-groups × 17 activation tiles) instead of falling back to
     /// one-chunk-per-thread — every (group, tile-range) seam in the
     /// chunked scatter is crossed. The smaller cross-kind test above
-    /// covers the fallback path.
+    /// covers the fallback path. Both int-dot settings, for the same
+    /// reason as that test.
     #[test]
     fn apply_batch_chunked_grid_matches_apply() {
-        let rows = 259; // 32 groups of 8 + 3 tail (64 of 4 + 3 for Q8_0/Q4_0)
-        let cols = 512;
-        let batch_size = 66; // 16 full 4-activation tiles + a partial one
-        let x_batch: Vec<f32> = (0..batch_size * cols)
-            .map(|i| (((i * 37 + 5) % 101) as f32) * 0.019 - 0.95)
-            .collect();
-        for kind in [
-            QuantKind::Q8_0,
-            QuantKind::Q4_0,
-            QuantKind::Q4K,
-            QuantKind::Q5K,
-            QuantKind::Q6K,
-        ] {
-            let matrix = synth_quant_matrix(kind, rows, cols);
-            let batched = matrix.apply_batch(&x_batch, batch_size);
-            assert_eq!(batched.len(), batch_size * rows);
-            for b in [0, 1, 31, 32, 64, 65] {
-                let x = &x_batch[b * cols..(b + 1) * cols];
-                let sequential = matrix.apply(x);
-                let from_batch = &batched[b * rows..(b + 1) * rows];
-                assert_batch_row_matches(kind, b, &sequential, from_batch);
+        for int_dot in [false, true] {
+            let _g = ForceIntDot::new(int_dot);
+            for kind in BATCH_SHAPE_KINDS {
+                // 259 rows = 32 groups of 8 + 3 tail (64 of 4 + 3 for
+                // Q8_0/Q4_0); 66 activations = 16 full 4-tiles + a
+                // partial one.
+                assert_apply_batch_matches_apply(kind, 259, 512, 66, 5);
             }
         }
     }

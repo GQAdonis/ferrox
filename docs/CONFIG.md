@@ -49,6 +49,7 @@ library or overriding the CLI.
 | `FERROX_VULKAN_LOADER` | Path to a `libvulkan` the loader should use. Only needed when the platform default is not found; the error names this variable |
 | `FERROX_MODEL_NAME` | What the served model is called in `/v1/models` and every response's `model` field. Same as `--alias`. Read in one place, so it cannot apply to some routes and not others |
 | `FERROX_CACHE` | Where `-hf` puts downloaded checkpoints. Default `$XDG_CACHE_HOME/ferrox`, else `~/.cache/ferrox`; models go under `hub/<owner>__<repo>/`. llama.cpp spells this `LLAMA_CACHE` |
+| `FERROX_KV_WINDOW` | `1` evicts KV rows behind a sliding window on the CPU contiguous store. **Off by default.** Gemma-3-4B at 32768 tokens holds 1.69 GiB at rest instead of 9.13 GiB, with a 1.95 GiB prefill peak. Output is token-identical either way, tested on a real quantized SWA checkpoint. Turns itself off under `FERROX_METAL_ATTN`, and does not apply to a draft model; disables the prefix cache, which cannot represent a windowed cache. See the note below |
 | `FERROX_CPU_POOL` | `rayon` (default) or `spin`. `spin` runs decode on a persistent pool parked on a spin-then-park barrier, the shape llama.cpp's `ggml_threadpool` uses, instead of forking and joining per operation. **Opt-in, and unmeasured**: it exists because ~75% of decode wall time at 135M is scheduling overhead (~9% at 8B), and whether it recovers that is a number nobody has taken on a quiet host. Output is token-identical on both settings, which is tested |
 | `FERROX_CPU_POOL_SPIN_US` | Microseconds a `spin` worker spins before parking. Default 100. A pool that never parks burns a core per thread on an idle server |
 | `FERROX_CPU_THREADS` | Worker threads; same as `-t`. Default: **performance cores** (`hw.perflevel0.physicalcpu` on macOS), matching llama.cpp, not logical cores |
@@ -254,3 +255,44 @@ path. Setting them does nothing.
 `FERROX_METAL_MOE_GATE_THEN_SILU` · `FERROX_METAL_MOE_BARRIER_LOG` ·
 `FERROX_GEMV_DEDICATED` · `FERROX_GEMV_THREADS` ·
 `FERROX_MIN_TASK_MACS`
+
+## `FERROX_KV_WINDOW`, and why it is off
+
+A sliding-window layer only ever attends over its last `window`
+positions, so the rows before that are dead weight. Nothing in ferrox
+evicted them until now, which is why a windowed model cost exactly what
+a full-attention model of the same shape cost.
+
+What it saves, on Gemma-3-4B at 32768 tokens of host f32 KV:
+
+| | bytes |
+|---|---|
+| Off (every layer holds everything) | 9,126,805,504 |
+| On, at rest | 1,692,590,080 |
+| On, prefill peak | 1,948,942,336 |
+
+The peak is not the full 9.13 GiB because prefill evicts per layer: one
+layer holds the whole prompt at a time rather than all 34 at once. Five
+of the 34 layers are full attention and still hold everything, which is
+most of what remains.
+
+**It is off by default because it is new, not because it is doubted.**
+Output is token-identical with it on or off, asserted on identical logit
+vectors as well as identical token ids, on gemma-2-2b-it-Q4_K_M with its
+real SWA layout and real quantized tensors.
+
+It disables itself in three cases rather than guessing:
+
+- Under `FERROX_METAL_ATTN`, because five sites treat Metal's own
+  sequence length and the host cache's resident rows as interchangeable.
+  They are equal only while nothing evicts. Metal is step 3 of
+  [#61](https://github.com/antonellof/ferrox/issues/61).
+- On a draft model's decoder, which rolls its cache back arbitrarily far
+  during speculative verification.
+- Beside the prefix cache, which refuses to store a windowed cache
+  rather than hand back a truncation it cannot represent.
+
+The server's admission check still prices the full, unwindowed number.
+That is the safe direction and it is correct while the switch is off; a
+context is refused that would in fact have fit, rather than admitted and
+then OOM.

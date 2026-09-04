@@ -82,6 +82,16 @@ host 1-minute load average is 3.10, above the 2.00 bar: a timed run
 here is noise, not a measurement …
 ```
 
+**A load average cannot see one busy core.** The guard above is
+necessary and not sufficient. Every CPU measurement taken on 2026-09-04
+ran while `suggestd` held ~97% of one core, for over a day, and the
+1-minute load stayed under the 2.0 bar the whole time: one pegged core
+on a six-core box does not move the average enough to trip it. The
+comparison being run that day was thread-scheduling sensitive, which is
+exactly the kind a stolen core distorts unevenly. So before a run that
+matters, check `ps -eo pcpu,comm | sort -rn | head` as well, and treat
+a single process above ~90% as disqualifying even when the guard passes.
+
 **The host is thermally limited.** On macOS, `NSProcessInfo`'s thermal
 state at `serious` or `critical`, or an Intel Mac reporting a
 `CPU_Speed_Limit` under 100%, stops the run: the OS is cutting sustained

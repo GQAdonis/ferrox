@@ -2381,6 +2381,7 @@ impl Decoder {
             #[cfg(feature = "metal")]
             metal_attn_kv: std::sync::Mutex::new(None),
             execution_plan,
+            kv_window: crate::decoder::KvWindowPolicy::from_env(),
             plan_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
         };
         // Resolve every kernel the model will need while we still have a

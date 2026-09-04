@@ -134,14 +134,22 @@ impl DraftModelSpeculator {
 
     /// Fails when the two checkpoints cannot be compared token for
     /// token. See [`VocabMismatch`].
+    /// `decoder` is taken by value and has its KV-window policy turned
+    /// OFF (#61). [`Self::sync`] rolls the draft cache back to an
+    /// arbitrary committed length -- potentially the whole history,
+    /// after a long run of rejections -- and a windowed cache cannot
+    /// represent a rollback past the rows it kept. The drafter is a
+    /// small model whose KV is a small fraction of the target's, so
+    /// this gives up almost none of the saving.
     pub fn new(
-        decoder: Decoder,
+        mut decoder: Decoder,
         target_config: &ModelConfig,
         sampling: SamplingParams,
         seed: u64,
         max_draft: usize,
         min_prob: f32,
     ) -> Result<Self, VocabMismatch> {
+        decoder.kv_window = crate::decoder::KvWindowPolicy::off();
         let draft_vocab = decoder.config.vocab_size;
         let target_vocab = target_config.vocab_size;
         if draft_vocab != target_vocab {

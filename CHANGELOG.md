@@ -13,6 +13,41 @@ Entries name what changed and, where it matters, what was wrong
 before. A fix that closed a silent-wrong-answer class says so — those
 are the ones worth reading twice.
 
+## [0.17.1] - 2026-09-04
+
+### Fixed
+
+- **A character split across two tokens was destroyed.** The decode
+  loop resolved UTF-8 one token at a time, so any character whose
+  encoding spanned a token boundary became two U+FFFD before a caller
+  saw the bytes. A DeepSeek answer ending in an emoji rendered as
+  `today? \u{fffd}\u{fffd}`; the same applies to CJK text and every
+  byte-fallback token. Both the streamed and the buffered paths, and
+  each batched row now buffers its own tail (#124).
+
+### Documented
+
+- `FERROX_CPU_POOL` is measured rather than "unmeasured": on a quiet
+  20-core aarch64 host the persistent pool is **+123% at 3B and +87% at
+  8B**, which takes decode past llama.cpp (23.14 vs 17.86, 12.41 vs
+  9.06). It stays opt-in because at 135M it is 37% slower,
+  reproducibly and on quiet hosts (#27).
+- `benchmarks/RESULTS.md` gains a second host and three caveats the
+  single-laptop table could not show: prefill on server aarch64 is
+  ~3x FASTER than llama.cpp; the published `1.41x to 5.06x` CPU range
+  is aarch64-only and x86 looks far worse (#127); and the `cpu` rows
+  may include Metal, because `--n-gpu-layers 0` does not force CPU
+  (#126).
+- `benchmarks/README.md` records the discipline lesson that cost this
+  session a day of numbers: **a load average cannot see one busy
+  core.**
+
+### Added
+
+- The batch GEMM tests now run through the int-dot kernels they gate,
+  under both `ForceIntDot` settings, plus sub-tile shapes that bypass
+  the repack path entirely.
+
 ## [0.17.0] - 2026-09-04
 
 ### Added
@@ -275,6 +310,7 @@ benchmark ledger.
 First tag. GGUF mmap loader, quantized CPU kernels, Metal backend,
 `ferrox` CLI and `ferrox-server`.
 
+[0.17.1]: https://github.com/antonellof/ferrox/compare/v0.17.0...v0.17.1
 [0.17.0]: https://github.com/antonellof/ferrox/compare/v0.16.0...v0.17.0
 [0.16.0]: https://github.com/antonellof/ferrox/compare/v0.15.3...v0.16.0
 [0.15.3]: https://github.com/antonellof/ferrox/compare/v0.15.2...v0.15.3

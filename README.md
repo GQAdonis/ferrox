@@ -131,7 +131,13 @@ curl -s -X POST http://127.0.0.1:8383/v1/chat/completions \
 ferrox bench -m models/Llama-3.2-3B-Instruct-Q4_K_M.gguf -p 512 -n 128 -r 3 --compare
 ```
 
-Prefer `Q4_K_M` day to day and `Q8_0` for small smoke tests.
+On `Q8_0` and `IQ4_NL`, ferrox's logits match llama.cpp's. On K-quants
+they drift, for a
+[known reason](docs/plans/llama-cpp-gap-inventory.md) that is not a
+ferrox bug: llama.cpp quantizes activations to `Q8_K` before the dot
+product and ferrox keeps them in f32. Use whichever quant you would
+use with llama.cpp; if you are comparing the two, `Q8_0` is the one
+that answers the question without that variable in it.
 [docs/MODELS.md](docs/MODELS.md) lists what runs today, and which
 checkpoints stop with an error instead.
 

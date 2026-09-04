@@ -989,11 +989,18 @@ mod tests {
         let residency = KvResidency::from_config(&cfg, KvWindowPolicy::on());
         let resting = shape.resident_kv_bytes_for_tokens(tokens, &residency);
         let peak = shape.peak_kv_bytes_for_tokens(tokens, &residency);
-        // Six of the 34 layers are full attention and still hold every
-        // position; they are most of what is left.
-        assert!(resting * 4 < full, "resting {resting} vs full {full}");
-        assert!(peak < full);
-        assert!(peak > resting);
+        // Pinned rather than bounded, so a change to the default slack
+        // shows up as a memory number moving rather than as nothing.
+        // 5 of the 34 layers are full attention (`swa_pattern` 6) and
+        // still hold every position; at 1.34 GB they are most of what is
+        // left. The 29 windowed ones hold 1475 rows each instead of
+        // 32768.
+        assert_eq!(resting, 1_692_590_080, "5.4x less than the 9.13 GB above");
+        assert_eq!(
+            peak, 1_948_942_336,
+            "resting plus the one windowed layer still mid-prefill"
+        );
+        assert!(peak < full && peak > resting);
     }
 
     /// The pool-backed store is the other thing a server allocates, and

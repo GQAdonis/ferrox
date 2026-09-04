@@ -46,7 +46,10 @@
 //
 // Usage:
 //   llama_logits <model.gguf> <out.bin> <tok0> <tok1> ...
-//       Writes n_vocab f32 to <out.bin> and prints "n_vocab <N>".
+//       Writes n_vocab f32 to <out.bin> and prints "libllama <path>"
+//       followed by "n_vocab <N>". The path is the library that
+//       actually answered — see print_reference_identity below for why
+//       a verdict without it is only half an experiment.
 //
 //   llama_logits --tokenize <model.gguf> <cases.bin> <out.bin>
 //       Reads an FXTK case file, writes an FXTK result file, and prints
@@ -77,12 +80,20 @@
 // confound two differences. The tokenize mode loads vocab_only, so it
 // touches no backend at all.
 
+// dladdr is a GNU extension on glibc; harmless elsewhere.
+#define _GNU_SOURCE
+
 #include "llama.h"
 
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+#if defined(__APPLE__) || defined(__linux__)
+#  include <dlfcn.h>
+#  define FX_HAVE_DLADDR 1
+#endif
 
 #define FXTK_MAGIC "FXTK"
 #define FXTK_VERSION 1u
@@ -93,6 +104,33 @@
 // that cannot tell the two apart has to either ignore real failures or
 // report a missing reference as a defect.
 #define EXIT_MODEL_UNSUPPORTED 3
+
+// Prints WHICH libllama actually answered, as `libllama <path>`.
+//
+// A parity verdict is not a property of ferrox alone: the same
+// checkpoint scored DRIFT against one libllama and WRONG against
+// another, and the printed report said nothing that distinguished the
+// two runs (issue #102). The two builds turned out to differ in the
+// K-quant path -- their Q8_0 answers are bit-identical, their Q4_K/Q6_K
+// answers are not -- so a report that omits the reference's identity is
+// omitting half the experiment.
+//
+// The path is taken from the LOADED image rather than from the compile
+// -time -L flag, because an rpath, a DYLD_LIBRARY_PATH or a Homebrew
+// relink can all make those two different, and the one that computed
+// the logits is the one that matters.
+static void print_reference_identity(void) {
+#ifdef FX_HAVE_DLADDR
+    Dl_info info;
+    // Any exported llama symbol identifies the image; this one exists in
+    // every version the dumper can be built against.
+    if (dladdr((void *) (uintptr_t) &llama_backend_init, &info) != 0 && info.dli_fname) {
+        printf("libllama %s\n", info.dli_fname);
+        return;
+    }
+#endif
+    printf("libllama unknown\n");
+}
 
 static uint32_t rd_u32(const unsigned char * p) {
     return (uint32_t) p[0] | ((uint32_t) p[1] << 8) | ((uint32_t) p[2] << 16) | ((uint32_t) p[3] << 24);
@@ -362,6 +400,7 @@ static int cmd_logits(const char * model_path, const char * out_path, int n_toke
     fwrite(logits, sizeof(float), (size_t) n_vocab, f);
     fclose(f);
 
+    print_reference_identity();
     printf("n_vocab %d\n", n_vocab);
 
     llama_batch_free(batch);

@@ -40,6 +40,7 @@
 //! re-reading the format spec. A reference you re-implemented is not a
 //! reference. Build it with `tools/build_llama_logits.sh`.
 
+mod dump;
 mod tokenize;
 
 use anyhow::Context;
@@ -69,9 +70,92 @@ const KL_NOISE: f64 = 1e-3;
 /// is the "wrong graph" line.
 const KL_WRONG: f64 = 1e-2;
 
+/// How far two BUILDS OF THE REFERENCE disagree with each other on a
+/// K-quant checkpoint. Not a ferrox number: measured with ferrox out of
+/// the experiment entirely.
+///
+/// Measured 2026-09-04 on the fixed parity prompt, comparing the logits
+/// of `llama_logits` linked against Homebrew libllama b7650 with the
+/// same program linked against `.scratch/llama.cpp` (ggml 0.18.0):
+///
+/// | checkpoint | KL(b7650 ‖ newer) |
+/// |---|---|
+/// | Llama-3.2-1B **Q8_0** | **0.0 — bit-identical** |
+/// | TinyLlama-1.1B **Q8_0** | **0.0 — bit-identical** |
+/// | Llama-3.2-1B IQ4_XS | 2.9e-4 |
+/// | Llama-3.2-1B Q6_K | 1.3e-3 |
+/// | Llama-3.2-1B Q4_K_M | 2.1e-3 |
+/// | Llama-3.2-1B Q5_K_M | 2.1e-3 |
+/// | Phi-4-mini Q4_K_M | 5.3e-3 |
+/// | DeepSeek-R1-Distill Q4_K_M | 1.6e-2 |
+/// | **Qwen2.5-1.5B Q4_K_M** | **2.735e-2** |
+///
+/// The Q8_0 rows are the control and they are exact zeros: the two
+/// builds are the same program for weights llama.cpp dots against
+/// Q8_0 activations. Every K-quant row moves, and the newer build's
+/// `libggml-cpu` carries interleaved-repack kernels for `block_q5_K`
+/// and `block_q6_K` that the bottle does not, which is a change in
+/// exactly the arithmetic §10 of the gap inventory is about.
+///
+/// This constant is here so [`KL_WRONG_LM_HEAD_KQUANT`] is derived from
+/// a measurement instead of restated beside one. See
+/// [#102](https://github.com/antonellof/ferrox/issues/102).
+const KL_REFERENCE_BUILD_SPREAD_KQUANT: f64 = 2.735e-2;
+
 /// Untied lm_head on a K-quant uses Q8_K activation dots; logits KL is
 /// noisier than a single matvec but still same top-1 (DeepSeek-R1 #99).
-const KL_WRONG_LM_HEAD_KQUANT: f64 = 2.5e-2;
+///
+/// It is DERIVED from the measured spread above rather than restated
+/// beside it, so the two cannot drift apart: the only way to put the
+/// line back under the reference's own spread is to edit
+/// [`KL_WRONG_LM_HEAD_KQUANT_MARGIN`] below 1, which reads as the
+/// mistake it is. It was 2.5e-2, a bare constant BELOW that spread, and
+/// the consequence was not hypothetical: Qwen2.5-1.5B
+/// Q4_K_M read DRIFT (KL 7.7e-3) against the bottle and WRONG (KL
+/// 2.7e-2) against the newer build, from the same ferrox. A line drawn
+/// under the reference's own build-to-build spread cannot mean "the
+/// graphs disagree", because two binaries with an IDENTICAL graph cross
+/// it. Whatever else 2.5e-2 was measuring, it was not that.
+///
+/// Raising it costs the sensitivity to a real K-quant lm_head bug in
+/// the band 2.5e-2..3.0e-2, which is a real cost. It buys a verdict
+/// that does not change with the reference's vintage, and a run whose
+/// WRONG can be believed. Note what is NOT raised: [`KL_WRONG`], for
+/// everything else, stays at 1e-2, because the same experiment puts the
+/// reference's build-to-build spread on a Q8_0 lm_head at exactly zero.
+const KL_WRONG_LM_HEAD_KQUANT: f64 =
+    KL_REFERENCE_BUILD_SPREAD_KQUANT * KL_WRONG_LM_HEAD_KQUANT_MARGIN;
+
+/// How far above the measured reference spread the WRONG line sits.
+///
+/// A judgement, not a measurement, and deliberately thin: the spread is
+/// the largest of nine checkpoints, so a tenth could exceed it, but
+/// every point of headroom is sensitivity to a real lm_head bug thrown
+/// away. Widen it only with a checkpoint that measured wider.
+const KL_WRONG_LM_HEAD_KQUANT_MARGIN: f64 = 1.1;
+
+/// The verdict ladder, checked at COMPILE time.
+///
+/// These four constants have to agree about an ordering and until
+/// 2026-09-04 nothing made them: `KL_WRONG_LM_HEAD_KQUANT` was a bare
+/// 2.5e-2 sitting BELOW the 2.735e-2 that two builds of llama.cpp
+/// produce from an identical graph, so the "the graphs disagree" line
+/// fired on a difference llama.cpp reproduces against itself, and one
+/// real row (#102) read DRIFT or WRONG depending on which bottle was
+/// installed. Tightening it again now fails the build rather than
+/// quietly re-arming that.
+const _: () = {
+    assert!(KL_NOISE < KL_WRONG, "MATCH must be tighter than DRIFT");
+    assert!(
+        KL_WRONG < KL_WRONG_LM_HEAD_KQUANT,
+        "the K-quant lm_head allowance must be a relaxation, not a tightening"
+    );
+    assert!(
+        KL_WRONG_LM_HEAD_KQUANT > KL_REFERENCE_BUILD_SPREAD_KQUANT,
+        "a WRONG line under the reference's own build-to-build spread cannot mean \
+         `the graphs disagree`: two binaries with an identical graph cross it"
+    );
+};
 
 pub struct ParityArgs {
     pub model: String,
@@ -80,6 +164,10 @@ pub struct ParityArgs {
     pub top_k: usize,
     /// Path to the compiled reference dumper.
     pub dumper: Option<String>,
+    /// Prefix to write both compared logit vectors under, so the same
+    /// comparison can be redone against a DIFFERENT reference build
+    /// without ferrox in the middle. See [`dump`].
+    pub dump_logits: Option<String>,
 }
 
 pub fn run(args: ParityArgs) -> anyhow::Result<()> {
@@ -126,7 +214,8 @@ pub fn run(args: ParityArgs) -> anyhow::Result<()> {
         );
     }
 
-    let ref_logits = reference_logits(&dumper, &path, &tokens)?;
+    let reference = reference_logits(&dumper, &path, &tokens)?;
+    let ref_logits = reference.logits;
 
     if ref_logits.len() != ferrox_logits.len() {
         // Not a tolerance question: the two engines disagree about how
@@ -138,6 +227,18 @@ pub fn run(args: ParityArgs) -> anyhow::Result<()> {
             ref_logits.len(),
             ferrox_logits.len()
         );
+    }
+
+    // Dumped BEFORE the verdict is computed, so a run that ends in the
+    // `bail!` below still leaves the evidence behind. The whole reason
+    // to dump is to investigate a bad verdict; losing the vectors
+    // exactly when the verdict is bad would defeat it.
+    if let Some(prefix) = args.dump_logits.as_deref() {
+        let paths = dump::write(prefix, &tokens, &ref_logits, &ferrox_logits)?;
+        println!("wrote {}", paths[0].display());
+        println!("wrote {}", paths[1].display());
+        println!("wrote {}", paths[2].display());
+        println!();
     }
 
     let gguf = ferrox_gguf::GgufFile::open(&path).ok();
@@ -157,6 +258,7 @@ pub fn run(args: ParityArgs) -> anyhow::Result<()> {
         args.top_k,
         backend.as_str(),
         quant,
+        reference.libllama.as_deref(),
         &report,
     );
 
@@ -206,7 +308,48 @@ struct Report {
     ref_top1_rank_in_ferrox: usize,
     /// p1 - p2 in the reference distribution: how close the call was.
     ref_top2_margin: f64,
+    /// The same call in LOGIT space, on both sides, and how many
+    /// representable f32 values separate the reference's two
+    /// candidates.
+    ///
+    /// A TIE-FLIP verdict is a claim about magnitude — "the two
+    /// candidates are closer than the arithmetic can resolve" — and
+    /// probability margin does not settle it, because softmax over a
+    /// 128k vocabulary turns a wide logit gap into a small probability
+    /// gap whenever the distribution is flat. The gap in ulps is the
+    /// claim's own units: single digits is a tie, millions is a
+    /// difference that happens to sit near the argmax
+    /// ([#103](https://github.com/antonellof/ferrox/issues/103)).
+    ref_top2_logit_gap: f32,
+    ref_top2_logit_gap_ulps: i64,
+    /// The same gap as ferrox sees it, signed by the reference's
+    /// ordering: negative means ferrox ranks them the other way round.
+    ferrox_gap_on_ref_pair: f32,
     topk_overlap: usize,
+}
+
+/// Distance between two f32 in representable values.
+///
+/// `(a - b).abs()` cannot answer "is this a tie": near 3.0 an absolute
+/// gap of 1e-6 is about four ulps, near 3e-8 the same gap is the whole
+/// number. The count of representable values between two floats is the
+/// only scale-free way to say how close a float comparison was, and a
+/// tie-flip verdict is exactly that claim.
+///
+/// Works by mapping f32 to a monotone integer key: for non-negative
+/// values the bit pattern already increases with the value, and for
+/// negative values it increases as the value decreases, so the
+/// magnitude bits are negated.
+fn ulps_between(a: f32, b: f32) -> i64 {
+    fn key(x: f32) -> i64 {
+        let bits = i64::from(x.to_bits() & 0x7fff_ffff);
+        if x.is_sign_negative() {
+            -bits
+        } else {
+            bits
+        }
+    }
+    (key(a) - key(b)).abs()
 }
 
 fn compare(ref_logits: &[f32], ferrox_logits: &[f32], k: usize, kl_wrong: f64) -> Report {
@@ -241,11 +384,20 @@ fn compare(ref_logits: &[f32], ferrox_logits: &[f32], k: usize, kl_wrong: f64) -
     let top1_ref = ref_order[0];
     let top1_ferrox = fx_order[0];
     let ref_top1_rank_in_ferrox = fx_order.iter().position(|&i| i == top1_ref).unwrap_or(0);
-    let ref_top2_margin = if ref_order.len() > 1 {
-        p[ref_order[0]] - p[ref_order[1]]
-    } else {
-        1.0
-    };
+    let (ref_top2_margin, ref_top2_logit_gap, ref_top2_logit_gap_ulps, ferrox_gap_on_ref_pair) =
+        if ref_order.len() > 1 {
+            let (i1, i2) = (ref_order[0], ref_order[1]);
+            (
+                p[i1] - p[i2],
+                ref_logits[i1] - ref_logits[i2],
+                ulps_between(ref_logits[i1], ref_logits[i2]),
+                // Same pair, ferrox's numbers, keeping the reference's
+                // order: the sign is the flip itself.
+                ferrox_logits[i1] - ferrox_logits[i2],
+            )
+        } else {
+            (1.0, 0.0, 0, 0.0)
+        };
 
     let k = k.min(ref_order.len());
     let ref_top: std::collections::HashSet<usize> = ref_order[..k].iter().copied().collect();
@@ -279,6 +431,9 @@ fn compare(ref_logits: &[f32], ferrox_logits: &[f32], k: usize, kl_wrong: f64) -
         top1_ferrox,
         ref_top1_rank_in_ferrox,
         ref_top2_margin,
+        ref_top2_logit_gap,
+        ref_top2_logit_gap_ulps,
+        ferrox_gap_on_ref_pair,
         topk_overlap,
     }
 }
@@ -365,6 +520,7 @@ fn print_report(
     k: usize,
     backend: &str,
     quant: Option<&str>,
+    libllama: Option<&str>,
     r: &Report,
 ) {
     let name = Path::new(model)
@@ -381,6 +537,16 @@ fn print_report(
         "parity {name}: {verdict} ({n_tokens}-token prompt, first-token distribution, \
          ferrox {backend} vs llama.cpp cpu)"
     );
+    // Named on every row, not only when it surprises. Two libllama
+    // builds gave the same checkpoint DRIFT and WRONG (#102), and the
+    // difference between the runs was invisible in this report.
+    match libllama {
+        Some(p) => println!("  reference         {p}"),
+        None => println!(
+            "  reference         (this dumper predates the `libllama` line — rebuild with \
+             tools/build_llama_logits.sh to have the verdict name its reference)"
+        ),
+    }
     println!(
         "  KL(llama||ferrox) {:.3e} nats   KL(ferrox||llama) {:.3e} nats",
         r.kl_ref_ferrox, r.kl_ferrox_ref
@@ -396,6 +562,14 @@ fn print_report(
     println!(
         "  top-{k} overlap    {}/{k}          llama top-2 margin {:.3e}",
         r.topk_overlap, r.ref_top2_margin
+    );
+    // Printed for every verdict, not only TIE-FLIP: how close the
+    // argmax call was is what says whether the NEXT prompt would flip
+    // too, and a row that did not flip is the evidence that a row which
+    // did was one prompt's luck.
+    println!(
+        "  top-1/top-2 gap   {:+.3e} logits ({} ulps)   ferrox on the same pair {:+.3e}",
+        r.ref_top2_logit_gap, r.ref_top2_logit_gap_ulps, r.ferrox_gap_on_ref_pair
     );
     match r.verdict {
         Verdict::Match => println!("  same distribution to within f32 accumulation-order noise."),
@@ -415,11 +589,23 @@ fn print_report(
                  explains — worth a per-layer divergence run before trusting this row."
             ),
         },
-        Verdict::TieFlip => println!(
-            "  top-1 differs, but llama's own top-2 margin ({:.3e}) is under the observed \
-             per-token noise ({:.3e}): a tie swapped, not a wrong graph.",
-            r.ref_top2_margin, r.max_prob_delta
-        ),
+        Verdict::TieFlip => {
+            println!(
+                "  top-1 differs, but llama's own top-2 margin ({:.3e}) is under the observed \
+                 per-token noise ({:.3e}): a tie swapped, not a wrong graph.",
+                r.ref_top2_margin, r.max_prob_delta
+            );
+            // The magnitude, in the units the claim is made in. Without
+            // it "tie" is an assertion; with it a reader can check
+            // whether the two candidates really are inseparable or
+            // whether a real difference merely landed near the argmax.
+            println!(
+                "  the two candidates are {} ulps apart in llama's logits ({:+.3e} absolute); \
+                 ferrox puts the same pair {:+.3e} apart, so the flip is a sign change of a gap \
+                 this size — not a redistribution.",
+                r.ref_top2_logit_gap_ulps, r.ref_top2_logit_gap, r.ferrox_gap_on_ref_pair
+            );
+        }
         Verdict::Wrong => println!(
             "  the graphs disagree. This is not sampling noise and not a tie: something in \
              the forward pass differs."
@@ -482,9 +668,26 @@ fn dumper_path(explicit: Option<&str>) -> anyhow::Result<PathBuf> {
     )
 }
 
+/// What the reference said, and which library said it.
+struct Reference {
+    logits: Vec<f32>,
+    /// The libllama the dumper actually loaded, as it reported itself.
+    ///
+    /// `None` when the dumper predates the line — an older binary is
+    /// still usable, it just cannot be attributed, and that is worth
+    /// saying rather than guessing a path from the dumper's own.
+    libllama: Option<String>,
+}
+
+/// Prefix the dumper uses to report the library it loaded. Spelled once
+/// here and once in `tools/llama_logits.c`; the parse is tolerant of
+/// its absence precisely because those two are the only things that
+/// have to agree and nothing links them.
+const LIBLLAMA_LINE: &str = "libllama ";
+
 /// Runs the reference dumper on the SAME token ids and reads back its
 /// logit vector.
-fn reference_logits(dumper: &Path, model: &str, tokens: &[u32]) -> anyhow::Result<Vec<f32>> {
+fn reference_logits(dumper: &Path, model: &str, tokens: &[u32]) -> anyhow::Result<Reference> {
     let out_path = std::env::temp_dir().join(format!("ferrox-parity-{}.bin", std::process::id()));
     let mut cmd = Command::new(dumper);
     cmd.arg(model).arg(&out_path);
@@ -507,12 +710,25 @@ fn reference_logits(dumper: &Path, model: &str, tokens: &[u32]) -> anyhow::Resul
     if bytes.len() % 4 != 0 {
         anyhow::bail!("reference logits file is not a whole number of f32");
     }
-    Ok(bytes
-        .as_chunks::<4>()
-        .0
-        .iter()
-        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-        .collect())
+    Ok(Reference {
+        logits: bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect(),
+        libllama: parse_libllama(&String::from_utf8_lossy(&out.stdout)),
+    })
+}
+
+/// Picks the `libllama <path>` line out of the dumper's stdout.
+fn parse_libllama(stdout: &str) -> Option<String> {
+    stdout
+        .lines()
+        .find_map(|l| l.trim().strip_prefix(LIBLLAMA_LINE))
+        .map(str::trim)
+        .filter(|p| !p.is_empty() && *p != "unknown")
+        .map(str::to_string)
 }
 
 #[cfg(test)]
@@ -575,10 +791,124 @@ mod tests {
         assert_eq!(r.verdict, Verdict::Match);
     }
 
+    /// Adjacent floats are one ulp apart wherever they sit on the line,
+    /// and the count is scale-free.
+    ///
+    /// This is the measurement a TIE-FLIP verdict rests on. An absolute
+    /// difference cannot make the claim: `3.0` and its neighbour differ
+    /// by 2.4e-7 while `3e-8` and its neighbour differ by 1e-15, and
+    /// both are one ulp. A tie-flip reported in absolute units is
+    /// therefore unfalsifiable, which is what #103 pointed at.
+    #[test]
+    fn ulps_between_counts_representable_values_not_absolute_distance() {
+        for anchor in [3.0f32, 3e-8, -3.0, 1.0, 65_536.0] {
+            let next = f32::from_bits(if anchor.is_sign_negative() {
+                anchor.to_bits() - 1
+            } else {
+                anchor.to_bits() + 1
+            });
+            assert_eq!(
+                ulps_between(anchor, next),
+                1,
+                "{anchor} and its neighbour {next} must be one ulp apart"
+            );
+        }
+        // Symmetric, and zero for equal values.
+        assert_eq!(ulps_between(1.5, 1.5), 0);
+        assert_eq!(ulps_between(2.0, 1.0), ulps_between(1.0, 2.0));
+        // Crossing zero must not wrap: -0.0 and +0.0 are the same
+        // value, and a naive bit subtraction would call them 2^31
+        // apart, which would turn every sign change into "not a tie".
+        assert_eq!(ulps_between(-0.0, 0.0), 0);
+        // The two representable values either side of zero are two
+        // steps apart, not 2^32: a naive bit subtraction makes any sign
+        // change look maximally far, which would turn every flipped
+        // near-tie into "not a tie".
+        let tiny = f32::from_bits(1);
+        assert_eq!(ulps_between(-tiny, tiny), 2);
+        // A gap that is genuinely large stays large: 1.0 and 2.0 are a
+        // whole binade apart, which is 2^23 representable values.
+        assert_eq!(ulps_between(1.0, 2.0), 1 << 23);
+    }
+
+    /// The reported top-1/top-2 gap describes the pair the REFERENCE
+    /// picked, on both sides, so the flip shows up as a sign change.
+    ///
+    /// Reporting ferrox's own top-2 pair instead would compare two
+    /// different questions and could print two positive gaps for a run
+    /// whose whole finding is that the order reversed.
+    #[test]
+    fn the_reported_gap_is_the_same_pair_on_both_sides_and_flips_sign() {
+        let a = vec![-10.0f32, 2.000_01, 2.0];
+        let b = vec![-10.0f32, 2.0, 2.000_01];
+        let r = compare(&a, &b, 2, KL_WRONG);
+        assert_eq!(r.verdict, Verdict::TieFlip);
+        assert!(
+            r.ref_top2_logit_gap > 0.0,
+            "the reference ranks its own pair the right way round"
+        );
+        assert!(
+            r.ferrox_gap_on_ref_pair < 0.0,
+            "ferrox ranks the SAME pair the other way: gap {}",
+            r.ferrox_gap_on_ref_pair
+        );
+        assert!(
+            r.ref_top2_logit_gap_ulps > 0 && r.ref_top2_logit_gap_ulps < 1_000,
+            "a tie must be a handful of ulps, got {}",
+            r.ref_top2_logit_gap_ulps
+        );
+    }
+
     #[test]
     fn kquant_lm_head_uses_a_higher_wrong_threshold() {
         assert_eq!(wrong_kl_threshold(Some("Q6K")), KL_WRONG_LM_HEAD_KQUANT);
         assert_eq!(wrong_kl_threshold(Some("Q8_0")), KL_WRONG);
+    }
+
+    /// EVERY quantization that routes to the K-quant allowance gets a
+    /// WRONG line above the reference's own build-to-build spread.
+    ///
+    /// The ordering of the constants is checked at compile time; this
+    /// walks the PREDICATE, which is the half that can silently stop
+    /// agreeing with them. A spelling dropped from
+    /// `llama_dots_this_against_q8k` sends that quantization back to
+    /// `KL_WRONG` = 1e-2, which is a quarter of the spread two llama.cpp
+    /// builds show on exactly these types — the row would read WRONG and
+    /// the constants would still look right.
+    #[test]
+    fn every_q8k_dotted_lm_head_clears_the_references_build_to_build_spread() {
+        for kind in [
+            "Q2K", "Q3K", "Q4K", "Q5K", "Q6K", "IQ2XXS", "IQ2XS", "IQ2S", "IQ3XXS", "IQ3S", "IQ1S",
+            "IQ1M", "IQ4XS",
+        ] {
+            let line = wrong_kl_threshold(Some(kind));
+            assert!(
+                line > KL_REFERENCE_BUILD_SPREAD_KQUANT,
+                "{kind} gets a WRONG line of {line:e}, under the {KL_REFERENCE_BUILD_SPREAD_KQUANT:e} \
+                 two builds of llama.cpp produce from an identical graph"
+            );
+        }
+        // And the non-K-quant line is deliberately NOT raised: the same
+        // experiment measured the reference's Q8_0 spread at exactly
+        // zero, so there is nothing there to make room for.
+        assert_eq!(wrong_kl_threshold(Some("Q8_0")), 1e-2);
+    }
+
+    /// The dumper's self-report is read, and its absence is not
+    /// mistaken for a library called "unknown".
+    #[test]
+    fn the_reference_identity_is_parsed_and_its_absence_is_not_invented() {
+        assert_eq!(
+            parse_libllama("libllama /opt/homebrew/lib/libllama.dylib\nn_vocab 32000\n").as_deref(),
+            Some("/opt/homebrew/lib/libllama.dylib")
+        );
+        // An older dumper prints no such line: report that, do not guess.
+        assert_eq!(parse_libllama("n_vocab 32000\n"), None);
+        // The dumper says "unknown" when dladdr fails; that is an
+        // absence too, and passing it through would print a reference
+        // path of "unknown" as though it were one.
+        assert_eq!(parse_libllama("libllama unknown\nn_vocab 32000\n"), None);
+        assert_eq!(parse_libllama("libllama   \n"), None);
     }
 
     /// The Q8_K predicate is spelled in `GgmlType`'s variant names, not

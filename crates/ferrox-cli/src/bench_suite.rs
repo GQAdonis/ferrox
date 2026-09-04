@@ -480,11 +480,11 @@ pub fn render(bench_dir: &Path) -> anyhow::Result<()> {
         table.push('\n');
     }
 
-    fn push_section(table: &mut String, title: &str, rows: &[&Row]) {
+    fn push_section_at(table: &mut String, depth: &str, title: &str, rows: &[&Row]) {
         if rows.is_empty() {
             return;
         }
-        table.push_str(&format!("### {title}\n\n"));
+        table.push_str(&format!("{depth} {title}\n\n"));
         table.push_str("| Model | Test | ferrox tok/s | llama.cpp tok/s | Gap |\n");
         table.push_str("|---|---|---|---|---|\n");
         for r in rows {
@@ -515,10 +515,10 @@ pub fn render(bench_dir: &Path) -> anyhow::Result<()> {
     if rows.is_empty() {
         table.push_str("| _no engine receipts yet_ | | | | | |\n\n");
     } else if hosts.len() <= 1 {
-        push_section(&mut table, "Metal", &metal);
-        push_section(&mut table, "CUDA", &cuda);
-        push_section(&mut table, "CPU", &cpu);
-        push_section(&mut table, "Other backends", &other);
+        push_section_at(&mut table, "###", "Metal", &metal);
+        push_section_at(&mut table, "###", "CUDA", &cuda);
+        push_section_at(&mut table, "###", "CPU", &cpu);
+        push_section_at(&mut table, "###", "Other backends", &other);
     } else {
         // One section per machine. A reader scanning for a gap sees the
         // host before the number, which is the only order in which the
@@ -532,14 +532,14 @@ pub fn render(bench_dir: &Path) -> anyhow::Result<()> {
                     .copied()
                     .filter(|r| r.backend == backend)
                     .collect();
-                push_section(&mut table, &format!("{host} / {title}"), &sub);
+                push_section_at(&mut table, "####", title, &sub);
             }
             let sub: Vec<&Row> = here
                 .iter()
                 .copied()
                 .filter(|r| !matches!(r.backend.as_str(), "metal" | "cuda" | "cpu"))
                 .collect();
-            push_section(&mut table, &format!("{host} / Other backends"), &sub);
+            push_section_at(&mut table, "####", "Other backends", &sub);
         }
     }
 

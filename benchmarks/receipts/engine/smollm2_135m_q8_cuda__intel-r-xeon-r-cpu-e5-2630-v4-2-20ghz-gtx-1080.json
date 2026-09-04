@@ -1,0 +1,74 @@
+{
+  "approx_params": 176062464,
+  "arch": "llama",
+  "backend": "cuda",
+  "backend_active": "CUDA",
+  "engine_env": {
+    "FERROX_CPU_INT_DOT": "1"
+  },
+  "ferrox_version": "0.17.1",
+  "host_load_1min_end": 1.06,
+  "host_load_1min_start": 1.0,
+  "host_spec": {
+    "arch": "x86_64",
+    "cores": 10,
+    "cpu": "Intel(R) Xeon(R) CPU E5-2630 v4 @ 2.20GHz",
+    "label": "Intel(R) Xeon(R) CPU E5-2630 v4 @ 2.20GHz (10c) Linux 5.15.0-160-generic",
+    "os": "Linux 5.15.0-160-generic",
+    "perf_cores": null,
+    "ram_gb": 15.5
+  },
+  "host_thermal_end": {
+    "cpu_speed_limit_percent": null,
+    "degraded": null,
+    "measured": false,
+    "pressure": null,
+    "source": null
+  },
+  "host_thermal_start": {
+    "cpu_speed_limit_percent": null,
+    "degraded": null,
+    "measured": false,
+    "pressure": null,
+    "source": null
+  },
+  "id": "smollm2_135m_q8",
+  "kind": "engine",
+  "load_s": 0.031854503,
+  "model_path": "models/hf_test/SmolLM2-135M-Instruct-Q8_0.gguf",
+  "quant": "quantized",
+  "quiet_host": true,
+  "reps": 3,
+  "schema": 2,
+  "size_bytes": 144811360,
+  "tests": [
+    {
+      "ferrox_samples": [
+        1010.9486808369578,
+        983.7578013194521,
+        1021.2920910001493
+      ],
+      "ferrox_stddev": 15.829483618214923,
+      "ferrox_tps": 1010.9486808369578,
+      "gap": 17.18598612307012,
+      "llama_tps": 17374.15,
+      "test": "pp512",
+      "workload_digest": "b8d417040110e751"
+    },
+    {
+      "ferrox_samples": [
+        37.901688643912955,
+        37.851044828235565,
+        37.873900596672385
+      ],
+      "ferrox_stddev": 0.020707909886071938,
+      "ferrox_tps": 37.873900596672385,
+      "gap": 9.160133879383984,
+      "llama_tps": 346.93,
+      "test": "tg128",
+      "workload_digest": "044655d19aa3baa5"
+    }
+  ],
+  "threads": 10,
+  "warmup_reps": 1
+}

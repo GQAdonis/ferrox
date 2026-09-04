@@ -1,0 +1,74 @@
+{
+  "approx_params": 692846592,
+  "arch": "qwen3",
+  "backend": "cuda",
+  "backend_active": "CUDA",
+  "engine_env": {
+    "FERROX_CPU_INT_DOT": "1"
+  },
+  "ferrox_version": "0.17.1",
+  "host_load_1min_end": 1.29,
+  "host_load_1min_start": 1.43,
+  "host_spec": {
+    "arch": "x86_64",
+    "cores": 10,
+    "cpu": "Intel(R) Xeon(R) CPU E5-2630 v4 @ 2.20GHz",
+    "label": "Intel(R) Xeon(R) CPU E5-2630 v4 @ 2.20GHz (10c) Linux 5.15.0-160-generic",
+    "os": "Linux 5.15.0-160-generic",
+    "perf_cores": null,
+    "ram_gb": 15.5
+  },
+  "host_thermal_end": {
+    "cpu_speed_limit_percent": null,
+    "degraded": null,
+    "measured": false,
+    "pressure": null,
+    "source": null
+  },
+  "host_thermal_start": {
+    "cpu_speed_limit_percent": null,
+    "degraded": null,
+    "measured": false,
+    "pressure": null,
+    "source": null
+  },
+  "id": "qwen3_06b_q8",
+  "kind": "engine",
+  "load_s": 0.077746605,
+  "model_path": "models/hf_test/Qwen3-0.6B-Q8_0.gguf",
+  "quant": "quantized",
+  "quiet_host": true,
+  "reps": 3,
+  "schema": 2,
+  "size_bytes": 804753824,
+  "tests": [
+    {
+      "ferrox_samples": [
+        395.4742996345574,
+        396.33266725835574,
+        400.99078432014886
+      ],
+      "ferrox_stddev": 2.4236440155114165,
+      "ferrox_tps": 396.33266725835574,
+      "gap": 15.397494337810839,
+      "llama_tps": 6102.53,
+      "test": "pp512",
+      "workload_digest": "b8d417040110e751"
+    },
+    {
+      "ferrox_samples": [
+        15.678819052651962,
+        15.681833645130823,
+        15.67576976345963
+      ],
+      "ferrox_stddev": 0.0024755828340523953,
+      "ferrox_tps": 15.678819052651962,
+      "gap": 11.282737520341406,
+      "llama_tps": 176.9,
+      "test": "tg128",
+      "workload_digest": "044655d19aa3baa5"
+    }
+  ],
+  "threads": 10,
+  "warmup_reps": 1
+}

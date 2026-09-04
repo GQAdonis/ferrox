@@ -1,14 +1,14 @@
 {
-  "approx_params": 663126016,
-  "arch": "qwen2",
+  "approx_params": 692846592,
+  "arch": "qwen3",
   "backend": "cuda",
   "backend_active": "CUDA",
   "engine_env": {
     "FERROX_CPU_INT_DOT": "1"
   },
   "ferrox_version": "0.17.1",
-  "host_load_1min_end": 1.47,
-  "host_load_1min_start": 1.06,
+  "host_load_1min_end": 1.05,
+  "host_load_1min_start": 1.1,
   "host_spec": {
     "arch": "x86_64",
     "cores": 10,
@@ -32,39 +32,39 @@
     "pressure": null,
     "source": null
   },
-  "id": "qwen25_05b_q8",
+  "id": "qwen3_06b_q8",
   "kind": "engine",
-  "load_s": 0.07718379,
-  "model_path": "models/hf_test/qwen2.5-0.5b-instruct-q8_0.gguf",
+  "load_s": 0.078537432,
+  "model_path": "models/hf_test/Qwen3-0.6B-Q8_0.gguf",
   "quant": "quantized",
   "quiet_host": true,
   "reps": 3,
   "schema": 2,
-  "size_bytes": 531068480,
+  "size_bytes": 804753824,
   "tests": [
     {
       "ferrox_samples": [
-        611.6152643258422,
-        609.0257895598575,
-        614.4844746554936
+        456.80755020441,
+        401.0810299398623,
+        431.79739886579426
       ],
-      "ferrox_stddev": 2.2294740399368345,
-      "ferrox_tps": 611.6152643258422,
-      "gap": 14.865178373240042,
-      "llama_tps": 9091.77,
+      "ferrox_stddev": 22.789978428075873,
+      "ferrox_tps": 431.79739886579426,
+      "gap": 14.044341202446269,
+      "llama_tps": 6064.31,
       "test": "pp512",
       "workload_digest": "b8d417040110e751"
     },
     {
       "ferrox_samples": [
-        17.785294782020994,
-        17.789902048183627,
-        17.78646614534525
+        15.600825216814185,
+        15.624009054091763,
+        15.602411616201012
       ],
-      "ferrox_stddev": 0.001955176088845017,
-      "ferrox_tps": 17.78646614534525,
-      "gap": 12.80355513788203,
-      "llama_tps": 227.73,
+      "ferrox_stddev": 0.010574898462200251,
+      "ferrox_tps": 15.602411616201012,
+      "gap": 11.366191609498124,
+      "llama_tps": 177.34,
       "test": "tg128",
       "workload_digest": "044655d19aa3baa5"
     }

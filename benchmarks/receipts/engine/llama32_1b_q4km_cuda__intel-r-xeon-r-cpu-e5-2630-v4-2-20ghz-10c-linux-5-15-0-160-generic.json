@@ -1,5 +1,5 @@
 {
-  "approx_params": 1261436928,
+  "approx_params": 1599078400,
   "arch": "llama",
   "backend": "cuda",
   "backend_active": "CUDA",
@@ -7,8 +7,8 @@
     "FERROX_CPU_INT_DOT": "1"
   },
   "ferrox_version": "0.17.1",
-  "host_load_1min_end": 0.9,
-  "host_load_1min_start": 0.8,
+  "host_load_1min_end": 0.86,
+  "host_load_1min_start": 0.65,
   "host_spec": {
     "arch": "x86_64",
     "cores": 10,
@@ -32,39 +32,39 @@
     "pressure": null,
     "source": null
   },
-  "id": "tinyllama_q8",
+  "id": "llama32_1b_q4km",
   "kind": "engine",
-  "load_s": 0.022284585,
-  "model_path": "models/tinyllama-1.1b-chat-v1.0.Q8_0.gguf",
+  "load_s": 0.071304758,
+  "model_path": "models/Llama-3.2-1B-Instruct-Q4_K_M.gguf",
   "quant": "quantized",
   "quiet_host": true,
   "reps": 3,
   "schema": 2,
-  "size_bytes": 1170781568,
+  "size_bytes": 807694464,
   "tests": [
     {
       "ferrox_samples": [
-        288.589050076495,
-        292.49493730110515,
-        289.9263246811636
+        385.2358841002072,
+        384.3331191937287,
+        384.8220868618716
       ],
-      "ferrox_stddev": 1.6207689934440634,
-      "ferrox_tps": 289.9263246811636,
-      "gap": 15.174130892867579,
-      "llama_tps": 4399.38,
+      "ferrox_stddev": 0.36897786915153574,
+      "ferrox_tps": 384.8220868618716,
+      "gap": 11.221419319286621,
+      "llama_tps": 4318.25,
       "test": "pp512",
       "workload_digest": "b8d417040110e751"
     },
     {
       "ferrox_samples": [
-        14.517601229160928,
-        14.342830068300215,
-        14.323723738209557
+        11.818418972637222,
+        11.79499565017055,
+        11.799105183387992
       ],
-      "ferrox_stddev": 0.08724072189811186,
-      "ferrox_tps": 14.342830068300215,
-      "gap": 10.69942258739922,
-      "llama_tps": 153.46,
+      "ferrox_stddev": 0.01021199052207525,
+      "ferrox_tps": 11.799105183387992,
+      "gap": 15.143521243590937,
+      "llama_tps": 178.68,
       "test": "tg128",
       "workload_digest": "044655d19aa3baa5"
     }

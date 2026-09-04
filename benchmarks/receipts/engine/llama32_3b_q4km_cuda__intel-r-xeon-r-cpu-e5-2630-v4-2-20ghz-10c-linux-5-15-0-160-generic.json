@@ -1,14 +1,14 @@
 {
-  "approx_params": 1363083264,
-  "arch": "gemma3",
+  "approx_params": 3958898688,
+  "arch": "llama",
   "backend": "cuda",
   "backend_active": "CUDA",
   "engine_env": {
     "FERROX_CPU_INT_DOT": "1"
   },
   "ferrox_version": "0.17.1",
-  "host_load_1min_end": 1.13,
-  "host_load_1min_start": 1.27,
+  "host_load_1min_end": 1.2,
+  "host_load_1min_start": 0.86,
   "host_spec": {
     "arch": "x86_64",
     "cores": 10,
@@ -32,39 +32,39 @@
     "pressure": null,
     "source": null
   },
-  "id": "gemma3_1b_q8",
+  "id": "llama32_3b_q4km",
   "kind": "engine",
-  "load_s": 0.101346946,
-  "model_path": "models/hf_test/gemma-3-1b-it-Q8_0.gguf",
+  "load_s": 0.068202353,
+  "model_path": "models/Llama-3.2-3B-Instruct-Q4_K_M.gguf",
   "quant": "quantized",
   "quiet_host": true,
   "reps": 3,
   "schema": 2,
-  "size_bytes": 1069306624,
+  "size_bytes": 2019377696,
   "tests": [
     {
       "ferrox_samples": [
-        407.32436350456754,
-        410.1893518569611,
-        409.62451553570537
+        144.5894581823181,
+        144.66658748657457,
+        144.53594552816458
       ],
-      "ferrox_stddev": 1.2390810974942412,
-      "ferrox_tps": 409.62451553570537,
-      "gap": 12.387100399408869,
-      "llama_tps": 5074.06,
+      "ferrox_stddev": 0.053624056611065146,
+      "ferrox_tps": 144.5894581823181,
+      "gap": 10.905843481422187,
+      "llama_tps": 1576.87,
       "test": "pp512",
       "workload_digest": "b8d417040110e751"
     },
     {
       "ferrox_samples": [
-        10.21857098222459,
-        10.219637956752033,
-        10.221365674369542
+        4.178387004674583,
+        4.178390691919471,
+        4.1788322412900465
       ],
-      "ferrox_stddev": 0.0011515085271612147,
-      "ferrox_tps": 10.219637956752033,
-      "gap": 10.979841015391719,
-      "llama_tps": 112.21,
+      "ferrox_stddev": 0.0002090228818360331,
+      "ferrox_tps": 4.178390691919471,
+      "gap": 17.128604115074296,
+      "llama_tps": 71.57,
       "test": "tg128",
       "workload_digest": "044655d19aa3baa5"
     }

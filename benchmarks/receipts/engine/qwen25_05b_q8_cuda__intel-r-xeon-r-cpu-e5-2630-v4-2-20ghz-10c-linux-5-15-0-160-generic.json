@@ -1,14 +1,14 @@
 {
-  "approx_params": 3387949056,
-  "arch": "gemma2",
+  "approx_params": 663126016,
+  "arch": "qwen2",
   "backend": "cuda",
   "backend_active": "CUDA",
   "engine_env": {
     "FERROX_CPU_INT_DOT": "1"
   },
   "ferrox_version": "0.17.1",
-  "host_load_1min_end": 1.07,
-  "host_load_1min_start": 1.03,
+  "host_load_1min_end": 1.1,
+  "host_load_1min_start": 1.18,
   "host_spec": {
     "arch": "x86_64",
     "cores": 10,
@@ -32,39 +32,39 @@
     "pressure": null,
     "source": null
   },
-  "id": "gemma2_2b_q4km",
+  "id": "qwen25_05b_q8",
   "kind": "engine",
-  "load_s": 0.065862586,
-  "model_path": "models/gemma-2-2b-it-Q4_K_M.gguf",
+  "load_s": 0.076650555,
+  "model_path": "models/hf_test/qwen2.5-0.5b-instruct-q8_0.gguf",
   "quant": "quantized",
   "quiet_host": true,
   "reps": 3,
   "schema": 2,
-  "size_bytes": 1708582752,
+  "size_bytes": 531068480,
   "tests": [
     {
       "ferrox_samples": [
-        5.721972217035402,
-        5.725269197936139,
-        5.727733131752135
+        621.725640778162,
+        621.7664033289218,
+        623.490660931884
       ],
-      "ferrox_stddev": 0.0023600657072515934,
-      "ferrox_tps": 5.725269197936139,
-      "gap": 369.07434863704196,
-      "llama_tps": 2113.05,
+      "ferrox_stddev": 0.8225989984300061,
+      "ferrox_tps": 621.7664033289218,
+      "gap": 14.6863033304959,
+      "llama_tps": 9131.45,
       "test": "pp512",
       "workload_digest": "b8d417040110e751"
     },
     {
       "ferrox_samples": [
-        4.14265890122783,
-        4.144100369832267,
-        4.144385188744887
+        17.757899915107053,
+        17.754719260279007,
+        17.75600589849134
       ],
-      "ferrox_stddev": 0.00075564704739344,
-      "ferrox_tps": 4.144100369832267,
-      "gap": 19.33109549739078,
-      "llama_tps": 80.11,
+      "ferrox_stddev": 0.0013063648446148806,
+      "ferrox_tps": 17.75600589849134,
+      "gap": 12.828335454616717,
+      "llama_tps": 227.78,
       "test": "tg128",
       "workload_digest": "044655d19aa3baa5"
     }

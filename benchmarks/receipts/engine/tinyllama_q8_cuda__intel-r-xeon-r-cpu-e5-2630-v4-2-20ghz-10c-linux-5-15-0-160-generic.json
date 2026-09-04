@@ -1,14 +1,14 @@
 {
-  "approx_params": 692846592,
-  "arch": "qwen3",
+  "approx_params": 1261436928,
+  "arch": "llama",
   "backend": "cuda",
   "backend_active": "CUDA",
   "engine_env": {
     "FERROX_CPU_INT_DOT": "1"
   },
   "ferrox_version": "0.17.1",
-  "host_load_1min_end": 1.29,
-  "host_load_1min_start": 1.43,
+  "host_load_1min_end": 0.61,
+  "host_load_1min_start": 0.18,
   "host_spec": {
     "arch": "x86_64",
     "cores": 10,
@@ -32,39 +32,39 @@
     "pressure": null,
     "source": null
   },
-  "id": "qwen3_06b_q8",
+  "id": "tinyllama_q8",
   "kind": "engine",
-  "load_s": 0.077746605,
-  "model_path": "models/hf_test/Qwen3-0.6B-Q8_0.gguf",
+  "load_s": 0.028096014,
+  "model_path": "models/tinyllama-1.1b-chat-v1.0.Q8_0.gguf",
   "quant": "quantized",
   "quiet_host": true,
   "reps": 3,
   "schema": 2,
-  "size_bytes": 804753824,
+  "size_bytes": 1170781568,
   "tests": [
     {
       "ferrox_samples": [
-        395.4742996345574,
-        396.33266725835574,
-        400.99078432014886
+        293.56155785850814,
+        293.91361178379026,
+        289.3116541450049
       ],
-      "ferrox_stddev": 2.4236440155114165,
-      "ferrox_tps": 396.33266725835574,
-      "gap": 15.397494337810839,
-      "llama_tps": 6102.53,
+      "ferrox_stddev": 2.091348253307997,
+      "ferrox_tps": 293.56155785850814,
+      "gap": 15.003531225716133,
+      "llama_tps": 4404.46,
       "test": "pp512",
       "workload_digest": "b8d417040110e751"
     },
     {
       "ferrox_samples": [
-        15.678819052651962,
-        15.681833645130823,
-        15.67576976345963
+        14.526803793363209,
+        14.473528645832685,
+        14.413824074174231
       ],
-      "ferrox_stddev": 0.0024755828340523953,
-      "ferrox_tps": 15.678819052651962,
-      "gap": 11.282737520341406,
-      "llama_tps": 176.9,
+      "ferrox_stddev": 0.04614866576780698,
+      "ferrox_tps": 14.473528645832685,
+      "gap": 10.59658662051008,
+      "llama_tps": 153.37,
       "test": "tg128",
       "workload_digest": "044655d19aa3baa5"
     }

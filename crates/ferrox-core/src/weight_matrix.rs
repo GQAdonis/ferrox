@@ -4013,7 +4013,7 @@ mod tests {
             let x = &x_batch[b * cols..(b + 1) * cols];
             let sequential = matrix.apply(x);
             let from_batch = &batched[b * rows..(b + 1) * rows];
-            assert_batch_row_matches(QuantKind::Q8_0, b, &sequential, from_batch);
+            assert_batch_row_matches(QuantKind::Q8_0, "", b, &sequential, from_batch);
         }
     }
 
@@ -4043,7 +4043,13 @@ mod tests {
     /// build: `apply_batch` dispatches to Metal while `apply` stays on
     /// the CPU, so this compares two backends. The bound stays tight on
     /// CPU, where both sides are the same code and must agree closely.
-    fn assert_batch_row_matches(kind: QuantKind, b: usize, sequential: &[f32], from_batch: &[f32]) {
+    fn assert_batch_row_matches(
+        kind: QuantKind,
+        ctx: &str,
+        b: usize,
+        sequential: &[f32],
+        from_batch: &[f32],
+    ) {
         let scale = sequential
             .iter()
             .fold(0.0f32, |a, v| a.max(v.abs()))
@@ -4059,7 +4065,7 @@ mod tests {
             let err = (s - got).abs() / scale;
             assert!(
                 err < bound,
-                "{kind:?} batch {b} row {r}: apply()={s} apply_batch={got} \
+                "{kind:?} {ctx} batch {b} row {r}: apply()={s} apply_batch={got} \
                  (err {err:e} of row scale {scale}, bound {bound:e})"
             );
         }
@@ -4304,20 +4310,26 @@ mod tests {
         let matrix = synth_quant_matrix(kind, rows, cols);
         let batched = matrix.apply_batch(&x_batch, batch_size);
         assert_eq!(batched.len(), batch_size * rows);
-        let int_dot = cpu_int_dot_enabled();
+        let ctx = format!(
+            "rows {rows} cols {cols} batch_size {batch_size} int_dot {}",
+            cpu_int_dot_enabled()
+        );
         for b in 0..batch_size {
             let x = &x_batch[b * cols..(b + 1) * cols];
             let sequential = matrix.apply(x);
             let from_batch = &batched[b * rows..(b + 1) * rows];
-            for (r, (s, got)) in sequential.iter().zip(from_batch.iter()).enumerate() {
-                let err = (s - got).abs();
-                assert!(
-                    err / s.abs().max(1.0) < 1e-4,
-                    "{kind:?} rows {rows} cols {cols} batch_size {batch_size} \
-                     int_dot {int_dot} batch {b} row {r}: \
-                     apply()={s} apply_batch={got}"
-                );
-            }
+            // Delegates rather than restating the bound. The first
+            // version of this helper compared each element against
+            // `s.abs().max(1.0)`, which is a bare 1e-4 ABSOLUTE bound
+            // for any row whose value is small -- and a dot product of
+            // 512 terms that cancels to -0.76 carries the rounding of
+            // the terms, not of the result. It passed on aarch64 and
+            // failed on x86_64 CI at 1.07e-4, on one row out of 17094.
+            // `assert_batch_row_matches` already divides by the row
+            // vector's own scale, which is the invariant that makes the
+            // comparison meaningful, and it is now the only place the
+            // tolerance is written down.
+            assert_batch_row_matches(kind, &ctx, b, &sequential, from_batch);
         }
     }
 

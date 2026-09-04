@@ -12,11 +12,12 @@ use std::sync::mpsc::Sender;
 use ferrox_core::cache::KvCache;
 use ferrox_models::tokenizer::StopTokens;
 
-use crate::generate::{DecodeError, FinishReason, GenerationParams, PagedLease, Usage};
+use crate::generate::{DecodeError, FinishReason, GenerationParams, PagedLease};
 use crate::sample_step::SampleState;
 use crate::stop::StopMatcher;
 
 use super::block_budget::BlockBudget;
+use super::clock::RowClock;
 use super::config::{send_finished, BatcherEvent};
 use super::queue::AbortId;
 
@@ -238,6 +239,9 @@ pub(super) struct Slot {
     pub(super) abort: AbortId,
     /// KV blocks this row reserved at admission, returned when it ends.
     pub(super) blocks: usize,
+    /// The row's own clock, started at admission. Owns the only path
+    /// from a finished row to its `Usage`.
+    pub(super) clock: RowClock,
 }
 
 impl Slot {
@@ -276,7 +280,9 @@ pub(super) fn reply_finished(mut slot: Slot) {
         slot.visible.push_str(&tail);
         let _ = slot.reply.send(BatcherEvent::Chunk(tail));
     }
-    let usage = Usage::new(slot.prompt_tokens, slot.generated_ids.len());
+    let usage = slot
+        .clock
+        .usage(slot.prompt_tokens, slot.generated_ids.len());
     send_finished(
         &slot.reply,
         Ok((finish, slot.generated_ids, slot.visible, usage)),

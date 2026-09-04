@@ -144,6 +144,7 @@
 
 mod batcher;
 mod block_budget;
+mod clock;
 mod config;
 mod counters;
 mod prefill;

@@ -15,6 +15,7 @@ use std::sync::Arc;
 
 use crate::generate::{GenerationParams, PagedLease};
 
+use super::clock::RowClock;
 use super::config::BatcherEvent;
 use super::queue::AbortId;
 use super::row::{RowKv, Slot};
@@ -211,6 +212,11 @@ pub(super) struct Prefill {
     /// Blocks reserved at admission; carried into the `Slot` so the
     /// reservation survives the prefill-to-decode handover.
     pub(super) blocks: usize,
+    /// Started when this row was admitted, and carried into the `Slot`
+    /// so one clock spans prefill AND decode. Two clocks handed over at
+    /// this seam would be two things that must agree about when prefill
+    /// ended.
+    pub(super) clock: RowClock,
 }
 
 impl Prefill {
@@ -223,8 +229,13 @@ impl Prefill {
             reply,
             abort,
             blocks,
+            mut clock,
         } = self;
         let (kv, logits, pos, prompt_ids) = state.into_decode_start();
+        // The handover IS the end of prefill, so it is marked here
+        // rather than at the call site: every path from a prompt to a
+        // decode row goes through this function.
+        clock.prefill_finished();
         Slot {
             kv,
             pos,
@@ -243,6 +254,7 @@ impl Prefill {
             error: None,
             abort,
             blocks,
+            clock,
         }
     }
 }

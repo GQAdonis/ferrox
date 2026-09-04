@@ -161,6 +161,7 @@ fn test_slot(max_tokens: usize, seed: u64) -> (Slot, mpsc::Receiver<BatcherEvent
             blocks: 1,
             finish: None,
             error: None,
+            clock: super::clock::RowClock::start(),
         },
         rx,
     )

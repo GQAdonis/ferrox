@@ -69,7 +69,20 @@ impl Row {
 ///
 /// # Safety
 /// Must be called while the process is still single-threaded.
-pub fn apply_env(threads: usize, n_gpu_layers: usize) {
+/// Applies the backend/threading env, then CHECKS that it took.
+///
+/// The check is the point. Setting `FERROX_METAL=0` is not the same as
+/// running on the CPU: the backend decision is cached in a `OnceLock`
+/// the first time anything reads it, so a caller that ran too late set
+/// a variable nobody would ever consult again. That is exactly what
+/// happened to every `cpu` row in `benchmarks/RESULTS.md` (#126) --
+/// each receipt recorded `backend: "cpu"` beside `backend_active:
+/// "Metal"`, and nothing compared them.
+///
+/// So this asks `active_backend()` immediately, which both forces the
+/// cache while the env is still fresh and reveals a disagreement, and
+/// it fails loudly rather than measuring the wrong device.
+pub fn apply_env(threads: usize, n_gpu_layers: usize) -> anyhow::Result<()> {
     // SAFETY: called from `main` before rayon/Metal workers spawn.
     unsafe {
         if threads > 0 {
@@ -90,6 +103,20 @@ pub fn apply_env(threads: usize, n_gpu_layers: usize) {
         ferrox_core::weight_matrix::default_cpu_int_dot_on();
     }
     ferrox_core::threads::init_cpu_pool();
+
+    // Reads (and therefore fixes) the cached backend while the env
+    // above is still the most recent word on it.
+    let active = active_backend();
+    let wanted_cpu = n_gpu_layers == 0;
+    if wanted_cpu && active != "CPU" {
+        anyhow::bail!(
+            "--n-gpu-layers 0 asks for CPU but this process resolved to {active}. \
+             The backend is decided once per process and something fixed it before \
+             this call, so the run would measure {active} and label the receipt `cpu`. \
+             Refusing rather than publishing a mislabelled row (#126)."
+        );
+    }
+    Ok(())
 }
 
 pub struct BenchArgs {
@@ -614,6 +641,16 @@ fn decode_tokens(vocab: usize, n_gen: usize) -> Vec<usize> {
     (0..n_gen).map(|i| (i + 1) % vocab).collect()
 }
 
+/// Whether a receipt's `backend` label describes the backend that ran.
+///
+/// The label is lowercase and comes from the suite (`cpu`, `metal`,
+/// `cuda`); the active backend is what [`active_backend`] resolved.
+/// Compared case-insensitively and nothing else: a mismatch is always
+/// a defect, never a naming convention.
+fn backend_label_agrees(label: &str, active: &str) -> bool {
+    label.eq_ignore_ascii_case(active)
+}
+
 pub fn active_backend() -> &'static str {
     #[cfg(feature = "metal")]
     {
@@ -840,6 +877,19 @@ fn write_receipt(
             "os": spec.os,
         })
     };
+    // A receipt may not claim one backend and record another. Every
+    // `cpu` row in the ledger did exactly that (#126), and the
+    // contradiction sat in the file: `backend: "cpu"` beside
+    // `backend_active: "Metal"`. Two fields that must agree, with
+    // nothing comparing them, which is this repo's oldest bug shape.
+    if !backend_label_agrees(&args.backend, backend) {
+        anyhow::bail!(
+            "refusing to write a receipt labelled `{}` for a run that executed on {}. \
+             The label is what the ledger publishes; the active backend is what ran (#126).",
+            args.backend,
+            backend
+        );
+    }
     let receipt = serde_json::json!({
         "schema": 2,
         "kind": "engine",
@@ -885,6 +935,22 @@ fn write_receipt(
 
 #[cfg(test)]
 mod tests {
+    use super::backend_label_agrees;
+
+    /// The receipt guard that #126 needed and did not have.
+    #[test]
+    fn a_cpu_label_does_not_describe_a_metal_run() {
+        assert!(backend_label_agrees("cpu", "CPU"));
+        assert!(backend_label_agrees("metal", "Metal"));
+        assert!(backend_label_agrees("cuda", "CUDA"));
+        assert!(
+            !backend_label_agrees("cpu", "Metal"),
+            "this exact pair is what all 13 published cpu receipts recorded"
+        );
+        assert!(!backend_label_agrees("metal", "CPU"));
+        assert!(!backend_label_agrees("cuda", "Metal"));
+    }
+
     use super::*;
 
     fn row(samples: &[f64]) -> Row {

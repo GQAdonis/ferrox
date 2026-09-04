@@ -290,9 +290,9 @@ fn continuous_batch_honors_stop_sequence_in_decoded_text() {
     let decode: DecodeFn = Arc::new(|ids: &[usize]| {
         ids.iter()
             .map(|id| match id % 3 {
-                0 => 'X',
-                1 => 'Y',
-                _ => 'Z',
+                0 => b'X',
+                1 => b'Y',
+                _ => b'Z',
             })
             .collect()
     });
@@ -348,7 +348,7 @@ fn continuous_batch_honors_stop_sequence_in_decoded_text() {
 #[test]
 fn continuous_batch_stops_on_any_member_of_the_stop_set() {
     let decoder = tiny_decoder();
-    let decode: DecodeFn = Arc::new(|_: &[usize]| String::new());
+    let decode: DecodeFn = Arc::new(|_: &[usize]| Vec::new());
     let prompt = vec![1usize, 2, 3];
     let params = greedy_params(32, 3);
     let ids = sequential_ids(&decoder, &prompt, &params);
@@ -618,7 +618,7 @@ fn a_grammar_constrains_a_batched_row_as_it_does_a_private_one() {
     let decoder = tiny_decoder();
     let decode: DecodeFn = Arc::new(|ids: &[usize]| {
         ids.iter()
-            .map(|id| if id % 2 == 0 { 'b' } else { 'a' })
+            .map(|id| if id % 2 == 0 { b'b' } else { b'a' })
             .collect()
     });
     let batcher = ContinuousBatcher::spawn_with_config(
@@ -673,7 +673,7 @@ fn a_batched_row_whose_grammar_dead_ends_is_refused_by_itself() {
     let decoder = tiny_decoder();
     let decode: DecodeFn = Arc::new(|ids: &[usize]| {
         ids.iter()
-            .map(|id| if id % 2 == 0 { 'b' } else { 'a' })
+            .map(|id| if id % 2 == 0 { b'b' } else { b'a' })
             .collect()
     });
     let batcher = ContinuousBatcher::spawn_with_config(
@@ -734,7 +734,7 @@ fn json_object_mode_constrains_a_batched_row_as_it_does_a_private_one() {
     let decoder = tiny_decoder();
     let decode: DecodeFn = Arc::new(|ids: &[usize]| {
         ids.iter()
-            .map(|id| if id % 2 == 0 { '<' } else { 'a' })
+            .map(|id| if id % 2 == 0 { b'<' } else { b'a' })
             .collect()
     });
     let batcher = ContinuousBatcher::spawn_with_config(

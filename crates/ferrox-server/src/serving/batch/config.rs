@@ -11,7 +11,14 @@ use crate::generate::{DecodeError, FinishReason, Usage};
 
 use super::status::DEFAULT_DECODE_LOG_INTERVAL;
 
-pub(super) type DecodeFn = Arc<dyn Fn(&[usize]) -> String + Send + Sync>;
+/// Detokenize to RAW BYTES, not text.
+///
+/// Bytes because a character can straddle two tokens and a batched row
+/// is decoded one token at a time: resolving UTF-8 per token turns each
+/// half into U+FFFD and loses it (#124). Each row buffers its own tail
+/// through `crate::utf8_stream::Utf8Stream` -- per row, because rows
+/// interleave and one shared buffer would splice two answers together.
+pub(super) type DecodeFn = Arc<dyn Fn(&[usize]) -> Vec<u8> + Send + Sync>;
 
 /// Finish reason, generated token ids, detokenized text (stop-trimmed),
 /// and usage. Callers should prefer `text` for the response body when

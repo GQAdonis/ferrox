@@ -20,6 +20,7 @@ use super::block_budget::BlockBudget;
 use super::clock::RowClock;
 use super::config::{send_finished, BatcherEvent};
 use super::queue::AbortId;
+use crate::utf8_stream::Utf8Stream;
 
 /// Where one batched row keeps its KV.
 ///
@@ -242,6 +243,10 @@ pub(super) struct Slot {
     /// The row's own clock, started at admission. Owns the only path
     /// from a finished row to its `Usage`.
     pub(super) clock: RowClock,
+    /// This row's half-finished character, if a token ended inside one.
+    /// Per row: rows interleave, and one shared buffer would splice one
+    /// answer's bytes into another's.
+    pub(super) utf8: Utf8Stream,
 }
 
 impl Slot {
@@ -275,6 +280,13 @@ pub(super) fn reply_finished(mut slot: Slot) {
     // Text withheld against a stop that never arrived is ordinary
     // output; dropping it would truncate every answer whose tail looks
     // like the start of a stop string.
+    // A row cut off mid-character cannot finish it, so the held bytes
+    // surface as U+FFFD instead of vanishing -- through the stop
+    // matcher, like any other text this row produced.
+    let partial = slot.utf8.flush();
+    if !partial.is_empty() {
+        slot.stops.push(&partial);
+    }
     let tail = slot.stops.flush();
     if !tail.is_empty() {
         slot.visible.push_str(&tail);

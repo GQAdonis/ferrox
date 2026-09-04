@@ -71,6 +71,7 @@ mod stream_events;
 mod tasks;
 mod tool_grammar;
 mod unsupported_sampling;
+mod utf8_stream;
 
 use std::cell::RefCell;
 use std::convert::Infallible;
@@ -3905,7 +3906,7 @@ pub(crate) fn activate_loaded_model(
                      (stop sequences use the same pending-buffer trim as the private generate loop)"
                 );
                 let tok = Arc::clone(&tokenizer);
-                let decode = Arc::new(move |ids: &[usize]| tok.decode(ids));
+                let decode = Arc::new(move |ids: &[usize]| tok.decode_bytes(ids));
                 Some(serving::batch::ContinuousBatcher::spawn_with_ceiling(
                     Arc::clone(&decoder),
                     decode,

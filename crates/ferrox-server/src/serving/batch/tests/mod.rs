@@ -71,11 +71,14 @@ fn greedy_params(max_tokens: usize, seed: u64) -> GenerationParams {
 }
 
 fn identity_decode() -> DecodeFn {
-    Arc::new(|ids: &[usize]| {
-        ids.iter()
-            .map(|id| char::from_u32(65 + (*id as u32 % 26)).unwrap_or('?'))
-            .collect()
-    })
+    Arc::new(|ids: &[usize]| ids.iter().map(|id| b'A' + (*id as u8 % 26)).collect())
+}
+
+/// `identity_decode`'s output as text, for tests that need to reason
+/// about characters rather than bytes. ASCII by construction, so this
+/// cannot be the lossy step the code under test is about.
+fn identity_decode_text(ids: &[usize]) -> String {
+    String::from_utf8(identity_decode()(ids)).expect("identity_decode is ASCII")
 }
 
 fn sequential_ids(decoder: &Decoder, prompt: &[usize], params: &GenerationParams) -> Vec<usize> {
@@ -162,6 +165,7 @@ fn test_slot(max_tokens: usize, seed: u64) -> (Slot, mpsc::Receiver<BatcherEvent
             finish: None,
             error: None,
             clock: super::clock::RowClock::start(),
+            utf8: Default::default(),
         },
         rx,
     )

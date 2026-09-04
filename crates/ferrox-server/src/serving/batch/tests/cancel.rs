@@ -330,8 +330,7 @@ fn a_multi_token_stop_string_truncates_a_batched_row() {
         },
     );
     let baseline = sequential_ids(&decoder, &[1, 2, 3], &greedy_params(8, 4));
-    let decode = identity_decode();
-    let full = decode(&baseline);
+    let full = identity_decode_text(&baseline);
     if full.chars().count() < 4 {
         return;
     }
@@ -375,7 +374,7 @@ fn a_batched_row_that_never_matches_loses_no_output() {
         },
     );
     let baseline = sequential_ids(&decoder, &[1, 2, 3], &greedy_params(8, 4));
-    let expected = identity_decode()(&baseline);
+    let expected = identity_decode_text(&baseline);
 
     let (finish, ids, text, _usage) = batcher
         .generate(

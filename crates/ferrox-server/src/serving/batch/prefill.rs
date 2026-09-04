@@ -255,6 +255,7 @@ impl Prefill {
             abort,
             blocks,
             clock,
+            utf8: Default::default(),
         }
     }
 }

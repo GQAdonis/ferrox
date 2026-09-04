@@ -92,9 +92,16 @@ mod tests {
     /// not just its token counts.
     #[test]
     fn a_finished_row_reports_both_rates() {
+        // Each phase is given a measurable duration on purpose.
+        // `with_timings` leaves a rate unset for a ZERO-length phase
+        // rather than dividing into infinity, so a test that finished
+        // both phases inside one clock tick would fail against correct
+        // code -- it did, once the machine was quiet enough.
         let mut clock = RowClock::start();
+        std::thread::sleep(std::time::Duration::from_millis(2));
         clock.prefill_finished();
         clock.token();
+        std::thread::sleep(std::time::Duration::from_millis(2));
         let usage = clock.usage(41, 32);
         assert!(
             usage.prompt_per_second.is_some(),

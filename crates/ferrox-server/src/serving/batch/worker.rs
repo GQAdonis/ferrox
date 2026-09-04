@@ -348,7 +348,12 @@ pub(super) fn worker_loop(
                 &slot.prompt_ids,
                 &slot.generated_ids,
                 &slot.stop_tokens,
-                &|id| decode(&[id]),
+                // Text, for the grammar and single-token stop
+                // decisions. Lossy per token, which is what those
+                // callers have always had; the EMITTED text below is
+                // what #124 was about and it goes through the row's
+                // own UTF-8 buffer.
+                &|id| String::from_utf8_lossy(&decode(&[id])).into_owned(),
             ) {
                 Ok(crate::sample_step::Step::Token(next)) => next,
                 // A complete grammar with nothing legal after it: this
@@ -386,8 +391,11 @@ pub(super) fn worker_loop(
             }
             slot.generated_ids.push(next);
             slot.clock.token();
-            let piece = decode(&[next]);
-            if apply_stop_buffer(slot, &piece) {
+            let piece = slot.utf8.push(&decode(&[next]));
+            // An empty piece means the token was the middle of a
+            // character. Nothing to show, and nothing a stop string
+            // could match yet.
+            if !piece.is_empty() && apply_stop_buffer(slot, &piece) {
                 continue;
             }
             active.push(uid);

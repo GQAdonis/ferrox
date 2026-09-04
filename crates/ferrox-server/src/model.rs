@@ -181,6 +181,18 @@ impl ServerTokenizer {
         }
     }
 
+    /// The raw bytes, before any UTF-8 decision is made about them.
+    /// See `crate::utf8_stream` for why a per-token caller needs them.
+    pub fn decode_bytes(&self, ids: &[usize]) -> Vec<u8> {
+        let ids32: Vec<u32> = ids.iter().map(|&id| id as u32).collect();
+        match self {
+            ServerTokenizer::Bpe(t) => t.decode_bytes(&ids32),
+            ServerTokenizer::Spm(t) => t.decode_bytes(&ids32),
+            ServerTokenizer::Unigram(t) => t.decode_bytes(&ids32),
+            ServerTokenizer::Byte => ferrox_models::tokenizer::ByteTokenizer::decode_bytes(&ids32),
+        }
+    }
+
     pub fn kind(&self) -> &'static str {
         match self {
             ServerTokenizer::Bpe(_) => "gguf-bpe",
@@ -198,6 +210,10 @@ impl TextTokenizer for ServerTokenizer {
 
     fn decode(&self, ids: &[usize]) -> String {
         ServerTokenizer::decode(self, ids)
+    }
+
+    fn decode_bytes(&self, ids: &[usize]) -> Vec<u8> {
+        ServerTokenizer::decode_bytes(self, ids)
     }
 }
 

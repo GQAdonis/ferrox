@@ -1525,7 +1525,7 @@ pub fn generate(
         &tokens,
         stop_tokens,
         params,
-        |ids| tokenizer.decode(ids),
+        |ids| tokenizer.decode_bytes(ids),
         |next, pos| {
             if first_token_at.is_none() {
                 first_token_at = Some(std::time::Instant::now());
@@ -1661,12 +1661,18 @@ fn sample_until_stop(
     prompt_ids: &[usize],
     stop_tokens: &StopTokens,
     params: &GenerationParams,
-    mut decode_one: impl FnMut(&[usize]) -> String,
+    // Raw BYTES, not text. A character can straddle two tokens, and
+    // deciding UTF-8 per token destroys it -- see `crate::utf8_stream`.
+    mut decode_one: impl FnMut(&[usize]) -> Vec<u8>,
     mut step: impl FnMut(usize, usize) -> Vec<f32>,
     mut emit: impl FnMut(&str),
     decode_token: &dyn Fn(usize) -> String,
 ) -> Result<(FinishReason, Vec<usize>, Vec<f32>), DecodeError> {
     let mut matcher = crate::stop::StopMatcher::new(&params.stop, &params.stop_token_ids);
+    // Sits BEFORE the stop matcher: a stop string is text, so it can
+    // only be matched against whole characters, and half of one is not
+    // text yet.
+    let mut utf8 = crate::utf8_stream::Utf8Stream::default();
     let mut state = crate::sample_step::SampleState::new(params.seed);
     // NOT `with_capacity(params.max_tokens)`. That is a caller-supplied
     // number sizing an allocation, and it reached
@@ -1727,7 +1733,7 @@ fn sample_until_stop(
 
         // Layer 2: only text that can no longer become part of a stop
         // string leaves here.
-        match matcher.push(&decode_one(&[next])) {
+        match matcher.push(&utf8.push(&decode_one(&[next]))) {
             crate::stop::StopStep::Emit(text) => {
                 if !text.is_empty() {
                     emit(&text);
@@ -1740,6 +1746,18 @@ fn sample_until_stop(
                 finish = FinishReason::StopSequence(stop);
                 break;
             }
+        }
+    }
+
+    // A generation that stopped mid-character cannot complete it, so
+    // the held bytes surface as U+FFFD rather than vanishing -- that
+    // goes through the matcher like any other text.
+    let partial = utf8.flush();
+    if !partial.is_empty() {
+        let (crate::stop::StopStep::Emit(text) | crate::stop::StopStep::Matched { text, .. }) =
+            matcher.push(&partial);
+        if !text.is_empty() {
+            emit(&text);
         }
     }
 
@@ -1810,7 +1828,7 @@ pub fn generate_engine<E: Engine, T: TextTokenizer>(
         &tokens,
         stop_tokens,
         params,
-        |ids| tokenizer.decode(ids),
+        |ids| tokenizer.decode_bytes(ids),
         |next, pos| {
             if first_token_at.is_none() {
                 first_token_at = Some(std::time::Instant::now());
@@ -2374,12 +2392,76 @@ mod tests {
             &[],
             &stop_tokens,
             params,
-            |ids| ids.iter().copied().map(&render).collect::<String>(),
+            |ids| {
+                ids.iter()
+                    .copied()
+                    .map(&render)
+                    .collect::<String>()
+                    .into_bytes()
+            },
             |_tok, _pos| logits_for(take()),
             |chunk| chunks.push(chunk.to_string()),
             &render,
         )?;
         Ok((finish, ids, chunks))
+    }
+
+    /// The wiring #124 was about, end to end through the decode loop.
+    ///
+    /// The unit tests in `crate::utf8_stream` prove the buffer works.
+    /// They cannot prove `sample_until_stop` USES it, and that call is
+    /// the whole fix -- the same gap that let a batched row ship with
+    /// no timings. So this drives the real loop with a tokenizer whose
+    /// tokens are single bytes, which is exactly what a byte-fallback
+    /// vocabulary does to an emoji.
+    ///
+    /// It cannot go through `run_scripted`: that helper's `render`
+    /// returns `String`, and half a character has no `String`.
+    #[test]
+    fn a_character_split_across_tokens_is_emitted_whole_by_the_decode_loop() {
+        let smiley = "😊".as_bytes().to_vec();
+        assert_eq!(smiley.len(), 4, "the point of this test");
+        let vocab = smiley.len() + 2;
+        let logits_for = |id: usize| {
+            let mut v = vec![0.0f32; vocab];
+            v[id] = 10.0;
+            v
+        };
+        let len = smiley.len();
+        let mut next = 0usize;
+        let mut take = move || {
+            let id = next.min(len - 1);
+            next += 1;
+            id
+        };
+        let first = logits_for(take());
+        let bytes = smiley;
+        let mut chunks: Vec<String> = Vec::new();
+        let (_finish, ids, _) = sample_until_stop(
+            first,
+            0,
+            &[],
+            &StopTokens::default(),
+            &scripted_params(4),
+            // One byte per token: each of the middle ones is invalid
+            // UTF-8 on its own, which is the whole problem.
+            |ids| ids.iter().map(|&id| bytes[id]).collect(),
+            |_tok, _pos| logits_for(take()),
+            |chunk| chunks.push(chunk.to_string()),
+            &|_id| String::new(),
+        )
+        .expect("decode");
+
+        assert_eq!(ids.len(), 4, "four tokens, one per byte");
+        assert_eq!(
+            chunks.concat(),
+            "😊",
+            "a character split across tokens must not be decoded per token"
+        );
+        assert!(
+            !chunks.concat().contains(char::REPLACEMENT_CHARACTER),
+            "the bytes were valid UTF-8 together; only the split made them look invalid"
+        );
     }
 
     fn scripted_params(max_tokens: usize) -> GenerationParams {
@@ -2655,7 +2737,20 @@ mod tests {
             // generated: nothing meaningful to truncate, skip.
             return;
         };
-        let stop_str = baseline[cut..].to_string();
+        // This decoder emits arbitrary bytes through `ServerTokenizer::
+        // Byte`, so the tail can end in a U+FFFD that `Utf8Stream::flush`
+        // produced -- a character whose remaining bytes never arrived
+        // because generation hit `max_tokens` mid-sequence.
+        //
+        // That one is NOT matchable, and correctly so: while the loop is
+        // running, those bytes may still be completed by the next token,
+        // so the replacement does not exist yet. It is only knowable
+        // once generation has ended, which is after every stop decision
+        // has been made. Trimming it keeps this test about what it says
+        // it is about -- a stop sequence that DOES match.
+        let stop_str = baseline[cut..]
+            .trim_end_matches(char::REPLACEMENT_CHARACTER)
+            .to_string();
         if stop_str.is_empty() {
             return;
         }

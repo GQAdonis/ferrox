@@ -804,6 +804,48 @@ mod tests {
         assert_eq!(solo.verdict, Verdict::Drift);
     }
 
+    /// THE WRONG RUNG READS THE NEAREST REFERENCE, NOT THE ONE THE
+    /// REPORT NAMES.
+    ///
+    /// This is the whole change, in the one geometry that separates it
+    /// from the old rule: the KL printed against the named reference is
+    /// OVER that checkpoint's line, while ferrox is nowhere near being
+    /// the outlier — the two references disagree with each other, and
+    /// ferrox reproduces the other one to within a fiftieth of their
+    /// disagreement. Qwen3-0.6B `--pure` Q4_K_S is this shape at
+    /// smaller scale (3.889e-2 printed, 3.514e-2 spread, 1.975e-2 to
+    /// the other build), and deciding it on the printed number is what
+    /// made one file DRIFT on one bottle and WRONG on another (#102,
+    /// #111).
+    ///
+    /// The report still prints the large number. It is a true statement
+    /// about the named reference; it is just not evidence about ferrox.
+    #[test]
+    fn the_wrong_rung_is_decided_by_the_nearest_reference_not_the_one_being_reported() {
+        let a = vec![0.0f32, 4.0, 1.0, 0.5];
+        let b = vec![0.0f32, 2.0, 1.0, 0.5];
+        let ferrox = vec![0.0f32, 3.8, 0.2, 0.5];
+        let quant = DominantQuant::weigh(Some("Q4K"), Some("Q4K"));
+
+        // B is the primary, so B's KL is what the report carries.
+        let band = Band::measure(&[b.clone(), a], &ferrox, &quant);
+        let line = band.line().value().expect("two references give a line");
+        assert!(
+            band.kl_to_ferrox(0) > line,
+            "the fixture must put the PRIMARY over the line, else this proves nothing: {:.4e} \
+             against {line:.4e}",
+            band.kl_to_ferrox(0)
+        );
+        assert!(band.nearest() < line);
+
+        let r = compare(&b, &ferrox, 4, &band);
+        assert_eq!(r.verdict, Verdict::Drift);
+        assert!(
+            r.kl_ref_ferrox > line,
+            "the printed KL is still the named reference's"
+        );
+    }
+
     /// A WRONG still happens, and it happens to a calibrated band.
     ///
     /// The rule is a relaxation on the checkpoints measured here, so a

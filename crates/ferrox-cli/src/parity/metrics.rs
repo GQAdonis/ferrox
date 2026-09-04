@@ -152,15 +152,45 @@ mod tests {
             kl(&q, &p),
             "if these ever agree the spread's `max over ordered pairs` is pointless"
         );
+
+        // A token the reference gives EXACTLY zero mass contributes
+        // nothing, by the `0 ln 0 = 0` convention. Over a 150k
+        // vocabulary a logit far enough below the max underflows to a
+        // true zero, so this is the ordinary case and not a corner: an
+        // unguarded `p * ln(p/q)` evaluates `0 * -inf` there and turns
+        // the whole KL into NaN, which every comparison downstream
+        // would then read as "not greater than the line".
+        let with_a_dead_token = softmax(&[0.0f32, -800.0]);
+        assert_eq!(
+            with_a_dead_token[1], 0.0,
+            "the fixture must actually contain an exact zero"
+        );
+        let uniform = softmax(&[0.0f32, 0.0]);
+        let d = kl(&with_a_dead_token, &uniform);
+        assert!(d.is_finite(), "a zero-mass token made the KL {d}");
+        assert!((d - std::f64::consts::LN_2).abs() < 1e-12, "{d}");
     }
 
-    /// An additive constant on the logits is not a disagreement.
+    /// An additive constant on the logits is not a disagreement, and it
+    /// stays not one at a magnitude where `exp` alone would overflow.
+    ///
+    /// Shift invariance is free algebraically; what is NOT free is
+    /// subtracting the max first. `exp(800)` is `inf` and `inf/inf` is
+    /// `NaN`, so a softmax without that subtraction turns a shifted
+    /// copy of a distribution into a vector of NaN and every downstream
+    /// KL into a number no comparison can be read off. The shift here
+    /// is large on purpose.
     #[test]
-    fn softmax_is_shift_invariant() {
-        let a = softmax(&[0.5f32, 1.5, -3.0]);
-        let b = softmax(&[7.75f32, 8.75, 4.25]);
+    fn softmax_is_shift_invariant_even_where_exp_would_overflow() {
+        let base = [0.5f32, 1.5, -3.0];
+        let a = softmax(&base);
+        let shifted: Vec<f32> = base.iter().map(|v| v + 800.0).collect();
+        let b = softmax(&shifted);
         for (x, y) in a.iter().zip(&b) {
+            assert!(x.is_finite() && y.is_finite(), "{x} vs {y}");
             assert!((x - y).abs() < 1e-12, "{x} vs {y}");
         }
+        assert!((a.iter().sum::<f64>() - 1.0).abs() < 1e-12);
+        assert!((b.iter().sum::<f64>() - 1.0).abs() < 1e-12);
     }
 }

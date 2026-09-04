@@ -523,30 +523,43 @@ mod tests {
         assert!(matches!(band.line(), WrongLine::Calibrated { .. }));
     }
 
-    /// The spread is the LARGER of the two KL directions.
+    /// The spread walks ORDERED pairs, so the larger of the two KL
+    /// directions is the one it reports.
     ///
-    /// KL is asymmetric, so a spread that took one direction would
-    /// report a band smaller than the evidence supports on every pair
-    /// where the two references have different entropies — and a band
-    /// too small is a WRONG that should not have been printed.
+    /// KL is asymmetric, so a loop over `i < j` would report a band
+    /// smaller than the evidence supports on every pair where the two
+    /// references have different entropies — and a band too small is a
+    /// WRONG that should not have been printed. The references are
+    /// deliberately ordered so that the LARGER direction is the pair
+    /// `(1, 0)`, which an `i < j` loop never visits; asserting the pair
+    /// as well as the value is what makes that visible, because the
+    /// value alone would still be right for half of all orderings.
     #[test]
     fn the_spread_is_the_larger_of_the_two_kl_directions() {
-        // A flat distribution against a peaked one: the two KL
+        // A peaked distribution against a flat one: the two KL
         // directions differ by a factor of several.
-        let flat = vec![0.0f32, 0.0, 0.0, 0.0];
         let peaked = vec![6.0f32, 0.0, 0.0, 0.0];
+        let flat = vec![0.0f32, 0.0, 0.0, 0.0];
         let ferrox = vec![0.1f32, 0.0, 0.0, 0.0];
 
-        let p = metrics::softmax(&flat);
-        let q = metrics::softmax(&peaked);
+        let p = metrics::softmax(&peaked);
+        let q = metrics::softmax(&flat);
         let (fwd, back) = (metrics::kl(&p, &q), metrics::kl(&q, &p));
-        assert!(fwd != back, "the fixture must actually be asymmetric");
+        assert!(
+            back > fwd,
+            "the fixture must put the larger direction on the reversed pair: {fwd} vs {back}"
+        );
 
-        let band = Band::measure(&[flat, peaked], &ferrox, &kquant());
+        let band = Band::measure(&[peaked, flat], &ferrox, &kquant());
         match band.line() {
             WrongLine::Calibrated { spread, .. } => {
-                assert_eq!(spread.kl, fwd.max(back));
-                assert_ne!(spread.kl, fwd.min(back));
+                assert_eq!(spread.kl, back);
+                assert_ne!(spread.kl, fwd);
+                assert_eq!(
+                    spread.between,
+                    (1, 0),
+                    "the reported pair must be the ordered one that produced the number"
+                );
             }
             other => panic!("expected a calibrated line, got {other:?}"),
         }

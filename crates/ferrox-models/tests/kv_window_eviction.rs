@@ -20,8 +20,9 @@
 //! tokens in and every assertion below is about eviction rather than
 //! about how long the test is willing to run.
 //!
-//! `kv_window_real_checkpoint.rs` is the same comparison on a real
-//! checkpoint, and is `#[ignore]`d because it costs a 4k-token prefill.
+//! `kv_window_real_checkpoint.rs` is the same comparison through
+//! gemma-2-2b's real Q4_K_M tensors, narrowing the window for the same
+//! reason and skipping when the checkpoint is absent.
 
 use ferrox_core::cache::KvCache;
 use ferrox_models::config::{test_dense_fixture, ModelConfig};

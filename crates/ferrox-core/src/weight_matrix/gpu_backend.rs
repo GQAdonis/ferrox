@@ -377,10 +377,15 @@ impl BackendCaps for Cuda {
 
     /// The `mul_mm` prefill path.
     ///
-    /// Deliberately narrower than [`Cuda::matvec_kernel`]: `ferrox-cuda`
-    /// had no matrix-matrix product at all until Q8_0 and Q4_0 landed,
-    /// so every other kind still decomposes a prefill into per-position
-    /// matvecs.
+    /// Now matches [`Cuda::matvec_kernel`] for every affine kind.
+    ///
+    /// It did not until 2026-09-04: only Q8_0 and Q4_0 had a
+    /// matrix-matrix product, so a K-quant prefill decomposed into one
+    /// matvec launch per position. Measured on a GTX 1080, that cost
+    /// Llama-3.2-3B Q4_K_M 4.88 tok/s of pp512 against llama.cpp's
+    /// 1586.80, a 325x gap on the most common quantization in
+    /// circulation (#131). IQ4_XS is still absent: it is a codebook
+    /// lookup rather than an affine dequant.
     ///
     /// Stated here rather than delegating to
     /// `ferrox_cuda::mul_mm::kind_by_name`, because `ferrox-cuda` is
@@ -398,7 +403,10 @@ impl BackendCaps for Cuda {
     /// twin and by executing the emitted CUDA C on the host, and has
     /// never executed on a GPU. See `crates/ferrox-cuda/src/mul_mm.rs`.
     fn gemm_supported(kind: QuantKind) -> bool {
-        matches!(kind, QuantKind::Q8_0 | QuantKind::Q4_0)
+        matches!(
+            kind,
+            QuantKind::Q8_0 | QuantKind::Q4_0 | QuantKind::Q4K | QuantKind::Q5K | QuantKind::Q6K
+        )
     }
 }
 

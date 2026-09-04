@@ -4884,37 +4884,60 @@ mod tests {
         assert!(report.violations.is_empty(), "{}", report.render());
     }
 
-    /// For a kind with **no** CUDA batched GEMM, a CUDA prefill is a
-    /// per-position matvec loop. That is a real, known slow path and the
-    /// registry must say so by name rather than leave it to a comment in
+    /// A kind CUDA cannot run at all must be RECORDED as leaving the
+    /// GPU, by name, rather than left to a comment in
     /// `apply_batch_with_acts`.
     ///
-    /// `Q4K` is deliberate here rather than incidental: it is on
-    /// [`cuda_matvec_kind_supported`] and off
-    /// [`cuda_mul_mm_kind_supported`], which is exactly the case this
-    /// test is about. The two lists stopped being the same set on
-    /// 2026-09-01, when Q8_0 and Q4_0 gained a GEMM, so probing one of
-    /// those two here would assert the opposite of what it looks like.
+    /// This test used to probe `Q4K` and expect the fallback
+    /// `"CUDA per-position matvec"`, which is what a kind gets when it
+    /// has a matvec but no GEMM. **That combination no longer exists on
+    /// CUDA.** The K-quants gained a GEMM on 2026-09-04, motivated by
+    /// Llama-3.2-3B Q4_K_M running pp512 at 4.88 tok/s against
+    /// llama.cpp's 1586.80, and the invariant below now forbids the
+    /// combination from coming back.
+    ///
+    /// So the probe moved to `Q5_0`, which has neither kernel, and the
+    /// expected fallback moved with it: with no matvec to loop over
+    /// there is no per-position loop, and the whole matmul leaves for
+    /// the host.
     #[test]
-    fn cuda_prefill_is_recorded_as_a_per_position_matvec_loop() {
+    fn a_kind_cuda_cannot_run_is_recorded_as_leaving_the_gpu() {
         use crate::kernel_registry::{op, Backend, Outcome};
 
         let reg = crate::kernel_registry::Registry::new();
         let loc = std::panic::Location::caller();
-        shaped(QuantKind::Q4K, 64, 256).probe_kernels_for(&reg, Backend::Cuda, "ffn_down", loc);
+        shaped(QuantKind::Q5_0, 64, 256).probe_kernels_for(&reg, Backend::Cuda, "ffn_down", loc);
         let report = reg.seal();
-        assert!(report.entries.iter().any(|e| e.key.backend == Backend::Cuda
-            && e.key.op == op::MATVEC
-            && e.outcome == Outcome::Hit));
         assert!(
-            report.entries.iter().any(|e| e.key.op == op::GEMM_PREFILL
+            report.entries.iter().any(|e| e.key.backend == Backend::Cuda
+                && e.key.op == op::GEMM_PREFILL
                 && matches!(
                     e.outcome,
-                    Outcome::Miss { fallback, .. } if fallback == "CUDA per-position matvec"
+                    Outcome::Miss { fallback, .. } if fallback == "CPU apply_batch"
                 )),
             "{}",
             report.render()
         );
+    }
+
+    /// CUDA's matvec set and its GEMM set are now the same, and that is
+    /// worth pinning: a kind that can be decoded on the GPU but not
+    /// prefilled there is the shape that cost 325x, and it went
+    /// unnoticed because a fallback still answers correctly.
+    ///
+    /// If a future kind gains a matvec without a GEMM, this fails and
+    /// names it, rather than a benchmark noticing months later.
+    #[test]
+    fn a_cuda_kind_with_a_matvec_also_has_a_gemm() {
+        for kind in QuantKind::ALL {
+            if cuda_matvec_kind_supported(*kind) {
+                assert!(
+                    cuda_mul_mm_kind_supported(*kind),
+                    "{kind:?} can be decoded on CUDA but not prefilled there, \
+                     which decomposes a prefill into one matvec launch per position"
+                );
+            }
+        }
     }
 
     /// An F32 weight has no quantized kernel by construction; the probe

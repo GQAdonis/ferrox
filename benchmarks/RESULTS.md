@@ -21,6 +21,61 @@ most of it.
 **CPU is the whole remaining story.** All 16 comparable CPU rows are
 red, from 1.41× to 5.06×. That is where the work is.
 
+**A second host, measured 2026-09-04.** One rented 20-core Cortex-A725
+(aarch64, ARMv9.2 with `i8mm`), idle, ferrox and llama.cpp built and run
+on the same box, same GGUFs, CPU only. It says something this table
+cannot:
+
+| model | test | ferrox (default) | ferrox `spin` | llama.cpp | best gap |
+|---|---|---|---|---|---|
+| SmolLM2-135M Q8_0 | pp512 | 648.84 | | 894.21 | 1.38× |
+| SmolLM2-135M Q8_0 | tg128 | 14.73 | 9.16 | 120.56 | **8.2×** |
+| Llama-3.2-3B Q4_K_M | pp512 | 132.53 | | 46.40 | **0.35×** |
+| Llama-3.2-3B Q4_K_M | tg128 | 10.38 | **23.14** | 17.86 | **0.77×** |
+| Llama-3.1-8B Q4_K_M | pp512 | 61.17 | | 19.15 | **0.31×** |
+| Llama-3.1-8B Q4_K_M | tg128 | 6.64 | **12.41** | 9.06 | **0.73×** |
+
+Three things follow, and none of them are visible in the M2 Pro table
+above:
+
+1. **Prefill on server aarch64 is not a gap, it is a lead.** 0.35× and
+   0.31× mean ferrox is roughly 3x FASTER than llama.cpp at 3B and 8B.
+2. **Decode is only red with the default thread pool.** With
+   `FERROX_CPU_POOL=spin` ferrox beats llama.cpp at both 3B and 8B.
+   The switch is worth more than every other CPU item on the roadmap
+   combined on this hardware.
+3. **135M is a different problem.** ferrox holds 13 to 15 tok/s at 4, 8
+   and 19 threads while llama.cpp does 190 to 204. It is flat in thread
+   count and unmoved by either pool, so it is a fixed per-token cost of
+   roughly 60 ms, not a scheduling loss
+   ([#128](https://github.com/antonellof/ferrox/issues/128)).
+
+**Read every CPU row with two caveats, both found on 2026-09-04.**
+
+1. **This table is one laptop.** Every row is Host B, an Apple M2 Pro.
+   There is no x86 row, and a spot check on a rented 10-core Xeon put
+   Llama-3.2-3B Q4_K_M at **1.03 tok/s** `tg128` , an order of
+   magnitude below what this table's aarch64 rows would lead you to
+   expect. The `1.41×–5.06×` range above is an **aarch64** range;
+   ferrox's x86 gap is unmeasured and looks far worse
+   ([#127](https://github.com/antonellof/ferrox/issues/127)).
+2. **The `cpu` rows may not be pure CPU.** `ferrox bench --suite`
+   spawns its CPU children with `--n-gpu-layers 0`, and that flag does
+   not actually force CPU: the backend decision is cached before the
+   flag can apply, so Metal stays partially live while the receipt is
+   labelled `cpu`
+   ([#126](https://github.com/antonellof/ferrox/issues/126)). On one
+   135M file the difference was 64.13 tok/s (flag only) versus 49.08
+   (`FERROX_METAL=0`). Until #126 is fixed, treat CPU rows as an upper
+   bound rather than a measurement.
+
+**And the host has to be genuinely quiet, not just idle-looking.**
+Every measurement in this session was taken while `suggestd` held ~97%
+of one core for over a day. The `--max-load` guard passed throughout,
+because a single pegged core on a 6-core box keeps the load average
+under 2.0. A guard that reads load cannot see one busy core, so check
+`ps` as well.
+
 **Gap colors (GitHub-safe):** 🟢 ferrox better; ⚪ near-parity (within ~5%);
 🔴 ferrox meaningfully slower.
 

@@ -178,10 +178,12 @@ pub fn run(args: ParityArgs) -> anyhow::Result<()> {
     let band = Band::measure(&ref_logits, &ferrox_logits, &quant);
     let report = compare(ref_logits[0], &ferrox_logits, args.top_k, &band);
     print_report(
-        &args.model,
-        tokens.len(),
-        args.top_k,
-        backend.as_str(),
+        &Run {
+            model: &args.model,
+            n_tokens: tokens.len(),
+            top_k: args.top_k,
+            backend: backend.as_str(),
+        },
         &quant,
         &references,
         &band,
@@ -394,17 +396,30 @@ fn compare(ref_logits: &[f32], ferrox_logits: &[f32], k: usize, band: &Band) -> 
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn print_report(
-    model: &str,
+/// What the run WAS, as opposed to what it found. Grouped because a
+/// print function taking eight positional arguments is one careless
+/// edit away from two of them being swapped, and `&str` next to `&str`
+/// swaps silently.
+struct Run<'a> {
+    model: &'a str,
     n_tokens: usize,
-    k: usize,
-    backend: &str,
+    top_k: usize,
+    backend: &'a str,
+}
+
+fn print_report(
+    run: &Run<'_>,
     quant: &DominantQuant,
     references: &[Reference],
     band: &Band,
     r: &Report,
 ) {
+    let Run {
+        model,
+        n_tokens,
+        top_k: k,
+        backend,
+    } = *run;
     let name = Path::new(model)
         .file_stem()
         .map(|s| s.to_string_lossy().into_owned())

@@ -121,6 +121,37 @@ test("a resumable request asks the server for a replay buffer and names itself",
   assert.equal(calls.length, 1, "a completed stream needs no recovery");
 });
 
+test("a reasoning model's thinking arrives on its own channel, not as answer text", async () => {
+  // The bug this covers: the client typed the delta as `{ content }`
+  // only, so every `reasoning_content` frame was dropped. On an R1
+  // distill that is most of the answer's wall-clock, so the transcript
+  // sat empty and the stream looked dead until the answer landed whole.
+  const thinking = `id: chatcmpl-1:0\ndata: ${JSON.stringify({
+    id: "chatcmpl-1",
+    request_id: "chatcmpl-1",
+    choices: [{ index: 0, delta: { reasoning_content: "17 x 3 = 51" } }],
+  })}\n\n`;
+  responders = [async () => sse(thinking, chunk(1, "51"), finalChunk(2))];
+  const sink = collect();
+  let reasoning = "";
+  await streamChat(
+    { model: "m", messages: [{ role: "user", content: "hi" }] },
+    {
+      onToken: sink.onToken,
+      onReasoning: (t) => {
+        reasoning += t;
+      },
+    },
+  );
+
+  assert.equal(reasoning, "17 x 3 = 51");
+  assert.equal(
+    sink.text(),
+    "51",
+    "thinking must not be concatenated into the answer",
+  );
+});
+
 test("a stream that dies mid-answer resumes from the last id, repeating nothing", async () => {
   responders = [
     // The connection dies after two events: no finish reason, no [DONE].

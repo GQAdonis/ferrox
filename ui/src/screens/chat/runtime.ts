@@ -155,7 +155,11 @@ function makeAdapter(deps: ChatDeps): ChatModelAdapter {
         wire.push({ role: "system", content: sampling.system.trim() });
       wire.push(...toWire(messages));
 
-      const tokens = pump<string>();
+      // ONE pump, carrying tagged chunks, rather than one per kind.
+      // Two queues drained in sequence would be two structures that
+      // have to agree about ordering, and they would disagree the first
+      // time a model interleaved thinking with its answer.
+      const tokens = pump<{ kind: "text" | "reasoning"; text: string }>();
       let requestId: string | null = null;
       let result: StreamResult | null = null;
       let failure: unknown = null;
@@ -185,7 +189,9 @@ function makeAdapter(deps: ChatDeps): ChatModelAdapter {
             requestId = id;
             live.add(id);
           },
-          onToken: (token) => tokens.push(token),
+          onToken: (token) => tokens.push({ kind: "text", text: token }),
+          onReasoning: (token) =>
+            tokens.push({ kind: "reasoning", text: token }),
           onStall: deps.onStall,
           onTransport: deps.onTransport,
         },
@@ -202,10 +208,20 @@ function makeAdapter(deps: ChatDeps): ChatModelAdapter {
         });
 
       let text = "";
+      let reasoning = "";
+      // Thinking is shown ABOVE the answer, which is also the order it
+      // arrives in. An empty part is never emitted: a model that does
+      // not think must not grow an empty block, and an answer that has
+      // not started must not be an empty bubble under one.
+      const parts = () => [
+        ...(reasoning ? [{ type: "reasoning" as const, text: reasoning }] : []),
+        ...(text ? [{ type: "text" as const, text }] : []),
+      ];
       try {
-        for await (const token of tokens.drain()) {
-          text += token;
-          yield { content: [{ type: "text", text }] };
+        for await (const chunk of tokens.drain()) {
+          if (chunk.kind === "reasoning") reasoning += chunk.text;
+          else text += chunk.text;
+          yield { content: parts() };
         }
         await task;
       } finally {
@@ -229,7 +245,10 @@ function makeAdapter(deps: ChatDeps): ChatModelAdapter {
           usage: finished?.usage ?? null,
         };
         yield {
-          content: [{ type: "text", text }],
+          // The reasoning is kept on the finished message too. Dropping
+          // it here would make the thinking vanish at the moment the
+          // answer completes, which reads as a rendering bug.
+          content: parts(),
           status: cancelled
             ? { type: "incomplete", reason: "cancelled" }
             : { type: "complete", reason: "stop" },
@@ -243,8 +262,11 @@ function makeAdapter(deps: ChatDeps): ChatModelAdapter {
         // arrive are kept, and the line says why there are no timings.
         yield {
           content: [
+            ...(reasoning
+              ? [{ type: "reasoning" as const, text: reasoning }]
+              : []),
             {
-              type: "text",
+              type: "text" as const,
               text: text || "_(stopped before any token arrived)_",
             },
           ],

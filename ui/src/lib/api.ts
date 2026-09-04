@@ -346,7 +346,18 @@ type StreamChunk = {
   usage?: Usage;
   choices?: {
     finish_reason?: string | null;
-    delta?: { content?: string | null };
+    delta?: {
+      content?: string | null;
+      /**
+       * A reasoning model's thinking, which the server streams in its
+       * OWN field rather than inside `content` (llama.cpp and DeepSeek
+       * both do this). A client that reads only `content` shows
+       * nothing at all while a reasoning model thinks, which on an R1
+       * distill is most of the answer's wall-clock: the transcript sits
+       * empty, the stream looks dead, and then the answer lands whole.
+       */
+      reasoning_content?: string | null;
+    };
   }[];
 };
 
@@ -369,6 +380,15 @@ export type Transport = "stream" | "resumed" | "polling";
 export type StreamHandlers = {
   signal?: AbortSignal;
   onToken?: (text: string) => void;
+  /**
+   * A reasoning model's thinking, as it arrives.
+   *
+   * Kept separate from `onToken` rather than concatenated into it: the
+   * two are shown differently, and only one of them is the answer. A
+   * caller that does not set this simply does not render thinking,
+   * which is the old behaviour.
+   */
+  onReasoning?: (text: string) => void;
   onRequestId?: (id: string) => void;
   onStall?: (ms: number | null) => void;
   onTransport?: (transport: Transport) => void;
@@ -451,6 +471,11 @@ function applyEvent(
   if (chunk.usage) state.usage = chunk.usage;
   const choice = chunk.choices?.[0];
   if (choice?.finish_reason) state.finishReason = choice.finish_reason;
+  // Reasoning first, because that is the order the server sends it in
+  // and the order it has to be shown in: thinking, then the answer it
+  // led to.
+  const reasoning = choice?.delta?.reasoning_content;
+  if (reasoning) handlers.onReasoning?.(reasoning);
   const text = choice?.delta?.content;
   if (text) handlers.onToken?.(text);
 }

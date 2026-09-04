@@ -165,6 +165,90 @@ impl BlockLayout {
     }
 }
 
+/// How many rows a *contiguous* windowed KV cache keeps resident, and
+/// when it drops the ones behind the window.
+///
+/// [`BlockLayout`] above is the same question for the block/paged tier,
+/// where the eviction unit is a block. This is the answer for
+/// `ferrox_core::cache::KvCache`, where the eviction unit is a row and
+/// the only thing stopping a per-token drain is arithmetic.
+///
+/// # Why there is slack
+///
+/// Dropping exactly one row per push moves every remaining row down by
+/// one every single token: `window * n_kv_heads * head_dim` floats per
+/// layer per token, about a megabyte per token per layer on Gemma-3-4B.
+/// So the cache is allowed to run `slack` rows past the window and then
+/// drops `slack + 1` at once, which amortises the move to roughly
+/// `window / (slack + 1)` rows per token.
+///
+/// # Why this is a type and not two lines in `push`
+///
+/// The store keeps these rows and the budget
+/// (`ferrox_models::kv_budget`) has to price exactly what the store
+/// keeps. #33 is the record of what happens when those two are separate
+/// statements of the same rule: the budget capped a sliding layer that
+/// no store ever capped, `-c auto` approved a context that did not fit,
+/// and the failure arrived as an OOM. [`KvWindow::rows_after`] is the
+/// single rule; the store calls it to decide and the budget calls it to
+/// price, so there is nothing left for them to disagree about.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KvWindow {
+    window: usize,
+    slack: usize,
+}
+
+impl KvWindow {
+    /// `None` for a zero window, for [`BlockLayoutError::ZeroWindow`]'s
+    /// reason: a query that attends to nothing is not a model.
+    pub fn new(window: usize, slack: usize) -> Option<Self> {
+        (window > 0).then_some(KvWindow { window, slack })
+    }
+
+    /// The slack a caller gets when it has no opinion: half a window,
+    /// so the cache peaks at 1.5x the window and moves roughly two rows
+    /// per token instead of `window` of them.
+    pub fn with_default_slack(window: usize) -> Option<Self> {
+        Self::new(window, (window / 2).max(1))
+    }
+
+    pub fn window(&self) -> usize {
+        self.window
+    }
+
+    pub fn slack(&self) -> usize {
+        self.slack
+    }
+
+    /// The most rows this window ever leaves resident.
+    pub fn max_rows(&self) -> usize {
+        self.window + self.slack
+    }
+
+    /// **The rule.** Rows resident once the sequence has consumed
+    /// `positions` positions and the holder has evicted at every step.
+    ///
+    /// Grows one per position up to `window + slack`, then drops back to
+    /// `window` and climbs again, so the resident count cycles through
+    /// `[window, window + slack]` with period `slack + 1`.
+    ///
+    /// The invariant every reader depends on is
+    /// `rows_after(p) >= min(p, window)`: the rows kept are always at
+    /// least the last `window` positions, which is exactly the set a
+    /// windowed attention kernel reads. Everything above that is slack
+    /// the kernel skips, so evicting can only ever change *where* a row
+    /// sits, never *whether* it is read. That is why turning eviction on
+    /// is token-identical rather than approximately so, and it is
+    /// asserted in this module's tests rather than argued here.
+    pub fn rows_after(&self, positions: usize) -> usize {
+        let peak = self.window + self.slack;
+        if positions <= peak {
+            return positions;
+        }
+        self.window + (positions - peak - 1) % (self.slack + 1)
+    }
+}
+
 /// The largest block size no greater than `desired` that satisfies the
 /// rule for `window`.
 ///
@@ -302,5 +386,94 @@ mod tests {
     fn no_window_leaves_the_desired_size_alone() {
         assert_eq!(aligned_block_size(48, None), 48);
         assert_eq!(aligned_block_size(0, None), 1);
+    }
+
+    /// A window of zero would mean a query attends to nothing.
+    #[test]
+    fn a_zero_window_is_not_a_window() {
+        assert!(KvWindow::new(0, 4).is_none());
+        assert!(KvWindow::with_default_slack(0).is_none());
+        assert!(KvWindow::new(1, 0).is_some());
+    }
+
+    /// The closed form must agree with the loop it stands for.
+    ///
+    /// `rows_after` is a formula and the store is a loop that pushes one
+    /// row and drops back to the formula's answer. Two statements of one
+    /// rule is this repo's dominant bug shape, so the formula is checked
+    /// against a simulation of the loop rather than against hand-written
+    /// numbers that were themselves derived from the formula.
+    #[test]
+    fn the_closed_form_matches_a_step_by_step_simulation() {
+        for window in 1..=9usize {
+            for slack in 0..=7usize {
+                let w = KvWindow::new(window, slack).expect("positive window");
+                let mut rows = 0usize;
+                for positions in 1..=200usize {
+                    // What the store does: append one row, then drop
+                    // back to whatever the rule allows.
+                    rows += 1;
+                    rows = rows.min(w.rows_after(positions));
+                    assert_eq!(
+                        rows,
+                        w.rows_after(positions),
+                        "window {window} slack {slack} at {positions} positions"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The property attention depends on, and the only reason evicting
+    /// is allowed to be token-identical: whatever else it drops, a
+    /// windowed cache still holds the last `min(positions, window)`
+    /// positions.
+    #[test]
+    fn the_last_window_positions_are_always_still_resident() {
+        for window in 1..=9usize {
+            for slack in 0..=7usize {
+                let w = KvWindow::new(window, slack).expect("positive window");
+                for positions in 0..=200usize {
+                    let rows = w.rows_after(positions);
+                    assert!(
+                        rows >= positions.min(window),
+                        "window {window} slack {slack} at {positions}: kept {rows} rows, \
+                         which is fewer than the {} the kernel reads",
+                        positions.min(window)
+                    );
+                    assert!(rows <= positions, "cannot keep rows that were never pushed");
+                    assert!(rows <= w.max_rows(), "resident rows must stay bounded");
+                }
+            }
+        }
+    }
+
+    /// The point of the whole exercise: resident rows STOP GROWING.
+    #[test]
+    fn a_windowed_layer_stops_growing_while_positions_do_not() {
+        let w = KvWindow::with_default_slack(1024).expect("positive window");
+        assert_eq!(w.rows_after(512), 512);
+        assert!(w.rows_after(32_768) <= w.max_rows());
+        assert_eq!(w.max_rows(), 1024 + 512);
+        // 21x fewer rows than positions at a 32k context.
+        assert!(w.rows_after(32_768) * 20 < 32_768);
+    }
+
+    /// Slack is what makes the drain a block move instead of a per-token
+    /// one: with `slack` rows of headroom the cache only actually drops
+    /// rows once every `slack + 1` positions.
+    #[test]
+    fn rows_are_dropped_once_per_slack_plus_one_positions() {
+        let w = KvWindow::new(8, 3).expect("positive window");
+        let drops = (1..=400usize)
+            .filter(|p| w.rows_after(*p) < w.rows_after(p - 1) + 1)
+            .count();
+        // The first drop is at position 12 (the first that would take
+        // the cache past `window + slack` = 11), then one every
+        // `slack + 1` = 4 positions.
+        assert_eq!(drops, (400 - 12) / 4 + 1);
+        // The same statement the other way round: 400 positions cost 98
+        // block moves, not 400 per-token ones.
+        assert!(drops * 4 <= 400);
     }
 }

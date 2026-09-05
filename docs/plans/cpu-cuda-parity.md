@@ -182,15 +182,28 @@ drafter and pays the constant on every draft token.
 **Exit:** the constant named and removed, and 135M decode within 2x of
 llama.cpp on a quiet host.
 
-### 5. Diagnose x86 CPU (#127)
+### 5. x86 CPU  [DONE for decode, 2026-09-04]
 
-3B Q4_K_M at 1.03 tok/s on 10 Broadwell cores. x86 SIMD arms exist in
-`ferrox-quant`; whether they are reached on a pre-AVX-512 part is
-unknown. Check `is_x86_feature_detected!` gating first, then whether
-the repack/interleave paths have an x86 equivalent or fall back to
-scalar.
+The answer was a **default**, not a missing kernel.
+`FERROX_CPU_INT_DOT` defaults on, its interleaved integer kernels are
+aarch64-only, and on x86 it selected a scalar loop while bypassing the
+AVX2 f32 dot that does exist. Cost: 4x to 8.8x of decode. Fixed
+architecture-aware; Llama-3.2-1B Q4_K_M went from 6.8x off llama.cpp to
+**1.4x**.
 
-**Exit:** an x86 row in the ledger with a gap, whatever it says.
+Note the shape of the error, because it recurs: the AVX2 arms were
+present and correct, and were being SKIPPED. Two of the three
+hypotheses in this issue (no x86 SIMD, slow x86 SIMD) were wrong, and
+the code read as if they were right.
+
+**What is left on x86:**
+
+- **Prefill is still 6x to 10x.** That is now the biggest CPU gap in
+  the ledger and has had no investigation at all.
+- **No x86 int8 path exists.** Zen 4 advertises `avx512_vnni` and
+  nothing here uses it. That is the natural successor to this fix, and
+  `FERROX_CPU_INT_DOT=1` stays available precisely so such a port can
+  measure itself against the f32 path.
 
 ### 6. Kernel coverage, by what people actually run
 
@@ -243,9 +256,10 @@ all, which is honest and temporary.
 | Step | Issue | State |
 |---|---|---|
 | 1 CUDA K-quant GEMM verified | #131 | **done**: verify token-identical, 325x to 10.9x |
-| 2 CUDA decode | #131 | GQA and graphs ruled out; GPU at 36% util, host-bound |
+| 2 CUDA decode | #133 | GQA and graphs ruled out; GPU at 36% util, host-bound |
 | 3 CPU pool rule | #27 | measured, needs the predicate |
 | 4 fixed per-token cost | #128 | not started |
-| 5 x86 diagnosis | #127 | not started |
-| 6 kernel coverage | | not started |
-| 7 ledger | #126 | mostly landed |
+| 5 x86 decode | #127 | **done**: default was wrong, 6.8x to 1.4x |
+| 5b x86 prefill | | not started, now the largest CPU gap (6x to 10x) |
+| 6 kernel coverage | | Q4_K/Q5_K/Q6_K landed on CUDA; 16 kinds still host-only |
+| 7 ledger | #126 | **done**: three hosts, and a committed-receipt check |

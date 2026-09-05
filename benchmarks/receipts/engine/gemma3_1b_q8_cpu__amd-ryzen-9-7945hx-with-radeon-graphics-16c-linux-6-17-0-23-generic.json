@@ -1,0 +1,72 @@
+{
+  "approx_params": 1363083264,
+  "arch": "gemma3",
+  "backend": "cpu",
+  "backend_active": "CPU",
+  "engine_env": {},
+  "ferrox_version": "0.17.1",
+  "host_load_1min_end": 6.38,
+  "host_load_1min_start": 1.93,
+  "host_spec": {
+    "arch": "x86_64",
+    "cores": 16,
+    "cpu": "AMD Ryzen 9 7945HX with Radeon Graphics",
+    "label": "AMD Ryzen 9 7945HX with Radeon Graphics (16c) Linux 6.17.0-23-generic",
+    "os": "Linux 6.17.0-23-generic",
+    "perf_cores": null,
+    "ram_gb": 30.1
+  },
+  "host_thermal_end": {
+    "cpu_speed_limit_percent": null,
+    "degraded": null,
+    "measured": false,
+    "pressure": null,
+    "source": null
+  },
+  "host_thermal_start": {
+    "cpu_speed_limit_percent": null,
+    "degraded": null,
+    "measured": false,
+    "pressure": null,
+    "source": null
+  },
+  "id": "gemma3_1b_q8",
+  "kind": "engine",
+  "load_s": 0.038948978,
+  "model_path": "models/hf_test/gemma-3-1b-it-Q8_0.gguf",
+  "quant": "quantized",
+  "quiet_host": true,
+  "reps": 3,
+  "schema": 2,
+  "size_bytes": 1069306624,
+  "tests": [
+    {
+      "ferrox_samples": [
+        146.65271421145638,
+        147.8533218648517,
+        145.53952726625636
+      ],
+      "ferrox_stddev": 0.9448274008659592,
+      "ferrox_tps": 146.65271421145638,
+      "gap": 6.256276980166015,
+      "llama_tps": 917.5,
+      "test": "pp512",
+      "workload_digest": "b8d417040110e751"
+    },
+    {
+      "ferrox_samples": [
+        46.259836022932724,
+        46.46982355576812,
+        46.55686990056943
+      ],
+      "ferrox_stddev": 0.12467778673821764,
+      "ferrox_tps": 46.46982355576812,
+      "gap": 1.064346627885156,
+      "llama_tps": 49.46,
+      "test": "tg128",
+      "workload_digest": "044655d19aa3baa5"
+    }
+  ],
+  "threads": 16,
+  "warmup_reps": 1
+}

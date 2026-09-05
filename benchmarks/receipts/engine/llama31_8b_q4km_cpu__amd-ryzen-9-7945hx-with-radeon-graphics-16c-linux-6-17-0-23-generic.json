@@ -1,0 +1,72 @@
+{
+  "approx_params": 8835301376,
+  "arch": "llama",
+  "backend": "cpu",
+  "backend_active": "CPU",
+  "engine_env": {},
+  "ferrox_version": "0.17.1",
+  "host_load_1min_end": 14.75,
+  "host_load_1min_start": 1.88,
+  "host_spec": {
+    "arch": "x86_64",
+    "cores": 16,
+    "cpu": "AMD Ryzen 9 7945HX with Radeon Graphics",
+    "label": "AMD Ryzen 9 7945HX with Radeon Graphics (16c) Linux 6.17.0-23-generic",
+    "os": "Linux 6.17.0-23-generic",
+    "perf_cores": null,
+    "ram_gb": 30.1
+  },
+  "host_thermal_end": {
+    "cpu_speed_limit_percent": null,
+    "degraded": null,
+    "measured": false,
+    "pressure": null,
+    "source": null
+  },
+  "host_thermal_start": {
+    "cpu_speed_limit_percent": null,
+    "degraded": null,
+    "measured": false,
+    "pressure": null,
+    "source": null
+  },
+  "id": "llama31_8b_q4km",
+  "kind": "engine",
+  "load_s": 0.042021183,
+  "model_path": "models/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf",
+  "quant": "quantized",
+  "quiet_host": true,
+  "reps": 3,
+  "schema": 2,
+  "size_bytes": 4920739232,
+  "tests": [
+    {
+      "ferrox_samples": [
+        13.32623379303825,
+        13.175551622621771,
+        13.29257880561053
+      ],
+      "ferrox_stddev": 0.06457823525552826,
+      "ferrox_tps": 13.29257880561053,
+      "gap": 9.931105313009784,
+      "llama_tps": 132.01,
+      "test": "pp512",
+      "workload_digest": "b8d417040110e751"
+    },
+    {
+      "ferrox_samples": [
+        8.97882774817076,
+        9.059558276516375,
+        9.125721832334248
+      ],
+      "ferrox_stddev": 0.060067467889270566,
+      "ferrox_tps": 9.059558276516375,
+      "gap": 1.3322945370622656,
+      "llama_tps": 12.07,
+      "test": "tg128",
+      "workload_digest": "044655d19aa3baa5"
+    }
+  ],
+  "threads": 16,
+  "warmup_reps": 1
+}

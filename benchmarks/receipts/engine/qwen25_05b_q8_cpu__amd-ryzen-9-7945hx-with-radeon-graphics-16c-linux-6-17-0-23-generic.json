@@ -1,0 +1,72 @@
+{
+  "approx_params": 663126016,
+  "arch": "qwen2",
+  "backend": "cpu",
+  "backend_active": "CPU",
+  "engine_env": {},
+  "ferrox_version": "0.17.1",
+  "host_load_1min_end": 4.07,
+  "host_load_1min_start": 1.9,
+  "host_spec": {
+    "arch": "x86_64",
+    "cores": 16,
+    "cpu": "AMD Ryzen 9 7945HX with Radeon Graphics",
+    "label": "AMD Ryzen 9 7945HX with Radeon Graphics (16c) Linux 6.17.0-23-generic",
+    "os": "Linux 6.17.0-23-generic",
+    "perf_cores": null,
+    "ram_gb": 30.1
+  },
+  "host_thermal_end": {
+    "cpu_speed_limit_percent": null,
+    "degraded": null,
+    "measured": false,
+    "pressure": null,
+    "source": null
+  },
+  "host_thermal_start": {
+    "cpu_speed_limit_percent": null,
+    "degraded": null,
+    "measured": false,
+    "pressure": null,
+    "source": null
+  },
+  "id": "qwen25_05b_q8",
+  "kind": "engine",
+  "load_s": 0.032845964,
+  "model_path": "models/hf_test/qwen2.5-0.5b-instruct-q8_0.gguf",
+  "quant": "quantized",
+  "quiet_host": true,
+  "reps": 3,
+  "schema": 2,
+  "size_bytes": 531068480,
+  "tests": [
+    {
+      "ferrox_samples": [
+        278.6395848284553,
+        265.96465241253077,
+        272.3308880117034
+      ],
+      "ferrox_stddev": 5.174537263027315,
+      "ferrox_tps": 272.3308880117034,
+      "gap": 6.82996340804377,
+      "llama_tps": 1860.01,
+      "test": "pp512",
+      "workload_digest": "b8d417040110e751"
+    },
+    {
+      "ferrox_samples": [
+        85.95906206787502,
+        85.86037672364522,
+        85.80863508585102
+      ],
+      "ferrox_stddev": 0.062400383873668114,
+      "ferrox_tps": 85.86037672364522,
+      "gap": 1.1533841776485938,
+      "llama_tps": 99.03,
+      "test": "tg128",
+      "workload_digest": "044655d19aa3baa5"
+    }
+  ],
+  "threads": 16,
+  "warmup_reps": 1
+}

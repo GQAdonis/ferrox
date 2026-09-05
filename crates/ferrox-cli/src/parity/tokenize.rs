@@ -42,6 +42,7 @@ use corpus::{Case, CORPUS};
 use ferrox_gguf::ShardedGguf;
 use ferrox_models::tokenizer::{
     should_add_bos_token, GgufBpeTokenizer, GgufSpmTokenizer, GgufUnigramTokenizer,
+    GgufWordPieceTokenizer,
 };
 use std::path::Path;
 use std::process::Command;
@@ -129,6 +130,9 @@ enum Encoder {
     Bpe(Box<GgufBpeTokenizer>),
     Spm(GgufSpmTokenizer),
     Unigram(GgufUnigramTokenizer),
+    /// `tokenizer.ggml.model == "bert"`, i.e. WordPiece — every BGE,
+    /// E5, nomic-embed, jina-embed and GTE checkpoint.
+    WordPiece(GgufWordPieceTokenizer),
 }
 
 impl Encoder {
@@ -137,9 +141,10 @@ impl Encoder {
             Some("gpt2" | "gemma4") => Encoder::Bpe(Box::new(GgufBpeTokenizer::from_gguf(file)?)),
             Some("llama") => Encoder::Spm(GgufSpmTokenizer::from_gguf(file)?),
             Some("t5") => Encoder::Unigram(GgufUnigramTokenizer::from_gguf(file)?),
+            Some("bert") => Encoder::WordPiece(GgufWordPieceTokenizer::from_gguf(file)?),
             other => anyhow::bail!(
                 "parity does not cover tokenizer {other:?} — it builds gpt2/gemma4 (BPE), \
-                 llama (SPM) and t5 (unigram) vocabularies only"
+                 llama (SPM), t5 (unigram) and bert (WordPiece) vocabularies only"
             ),
         })
     }
@@ -149,6 +154,7 @@ impl Encoder {
             Encoder::Bpe(t) => t.encode(text),
             Encoder::Spm(t) => t.encode(text),
             Encoder::Unigram(t) => t.encode(text),
+            Encoder::WordPiece(t) => t.encode(text),
         }
     }
 
@@ -162,6 +168,7 @@ impl Encoder {
             Encoder::Bpe(t) => t.decode(&[id]),
             Encoder::Spm(t) => t.decode(&[id]),
             Encoder::Unigram(t) => t.decode(&[id]),
+            Encoder::WordPiece(t) => t.decode(&[id]),
         }
     }
 
@@ -170,6 +177,7 @@ impl Encoder {
             Encoder::Bpe(t) => t.vocab_size(),
             Encoder::Spm(t) => t.vocab_size(),
             Encoder::Unigram(t) => t.vocab_size(),
+            Encoder::WordPiece(t) => t.vocab_size(),
         }
     }
 }

@@ -6,12 +6,12 @@ deployments and advanced tuning. Flags override env when both are set.
 Everything Ferrox reads from the environment is listed here. Three
 namespaces, and the prefix tells you which:
 
-- `FERROX_*` — operator configuration. Sections
+- `FERROX_*`: operator configuration. Sections
   [Server](#server) through [Kernel-lookup registry](#kernel-lookup-registry).
-- `FERROX_METAL_*_TIMING` / `_BARRIER_LOG` — Metal instrumentation. They
+- `FERROX_METAL_*_TIMING` / `_BARRIER_LOG`: Metal instrumentation. They
   print numbers and change nothing else. See
   [Metal instrumentation](#metal-instrumentation).
-- `FERROX_TEST_*` — fixtures that point an `#[ignore]`d test at a local
+- `FERROX_TEST_*`: fixtures that point an `#[ignore]`d test at a local
   checkpoint. Not configuration; see
   [Test and development fixtures](#test-and-development-fixtures).
 
@@ -19,7 +19,8 @@ namespaces, and the prefix tells you which:
 
 | Variable | Purpose |
 |---|---|
-| `FERROX_MODEL_PATH` | GGUF path (or Kimi dir); same as `-m` |
+| `FERROX_MODEL_PATH` | GGUF path (or Kimi dir); same as `-m`. An encoder-only checkpoint (WordPiece / `bert`) is accepted here and serves `/v1/embeddings`; the generating routes then answer 501 naming the model |
+| `FERROX_EMBEDDING_MODEL_PATH` | An encoder served ALONGSIDE a generative model in one process, which the single active-model slot cannot express. Wins over an active encoder, since explicit config beats a hot-swap |
 | `FERROX_MODEL_DIR` | Extra directory `GET /admin/models` scans, and the one `POST /admin/download` writes into. Without it, the directory holding `FERROX_MODEL_PATH` is used; with neither, downloads are refused (`412`) rather than guessing a location |
 | `FERROX_ADDR` | Bind address, e.g. `127.0.0.1:8383` |
 | `FERROX_API_KEY` | Require `Authorization: Bearer <key>`. Also gates the whole `/admin` control surface, which can swap models and write files |
@@ -42,8 +43,15 @@ library or overriding the CLI.
 |---|---|
 | `FERROX_METAL` | `1` / `0` / `auto`, Metal offload |
 | `FERROX_METAL_ATTN` | `1` / `0`, fused Metal attention + resident KV |
-| `FERROX_CTK` | KV dtype: `f16` (default), `q8_0` / `turbo8` / `fp8` / `turbo4` (Metal); `turbo3` falls back to F16. Same as `--ctk` |
+| `FERROX_CTK` | KV dtype: `f16` (default), `q8_0` / `turbo8` / `fp8` / `turbo4`; `turbo3` falls back to F16. Same as `--ctk`, and like it **Metal only**: the CPU and CUDA KV cache is the host `Vec<f32>` |
 | `FERROX_CUDA` | `1` / `0` / `auto` (build with `--features cuda`) |
+| `FERROX_VULKAN` | `1` / `0` / `auto` (build with `--features vulkan`). `Q8_0` matvec only and no GEMM, so a prefill stays on the host |
+| `FERROX_VULKAN_LOADER` | Path to a `libvulkan` the loader should use. Only needed when the platform default is not found; the error names this variable |
+| `FERROX_MODEL_NAME` | What the served model is called in `/v1/models` and every response's `model` field. Same as `--alias`. Read in one place, so it cannot apply to some routes and not others |
+| `FERROX_CACHE` | Where `-hf` puts downloaded checkpoints. Default `$XDG_CACHE_HOME/ferrox`, else `~/.cache/ferrox`; models go under `hub/<owner>__<repo>/`. llama.cpp spells this `LLAMA_CACHE` |
+| `FERROX_KV_WINDOW` | `1` evicts KV rows behind a sliding window on the CPU contiguous store. **Off by default.** Gemma-3-4B at 32768 tokens holds 1.69 GiB at rest instead of 9.13 GiB, with a 1.95 GiB prefill peak. Output is token-identical either way, tested on a real quantized SWA checkpoint. Turns itself off under `FERROX_METAL_ATTN`, and does not apply to a draft model; disables the prefix cache, which cannot represent a windowed cache. See the note below |
+| `FERROX_CPU_POOL` | `rayon` (default) or `spin`. `spin` runs decode on a persistent pool parked on a spin-then-park barrier, the shape llama.cpp's `ggml_threadpool` uses, instead of forking and joining per operation. **Opt-in, and measured on 2026-09-04.** On a quiet 20-core Cortex-A725 (aarch64, `tg128`, 19 threads) `spin` is **+123% at 3B and +87% at 8B**, which takes decode from LOSING to llama.cpp to beating it: 23.14 vs 17.86 tok/s at 3B, 12.41 vs 9.06 at 8B on the same host and file. On a quiet 10-core Xeon it is +49% / +23% / +15% at 135M / 3B / 8B. **The exception is very small models**: at 135M it is 37% SLOWER on aarch64 (and 31% slower on an M2 Pro), reproducibly and on quiet hosts, so it is not contention. That is why this is still opt-in rather than the default. Output is token-identical on both settings, which is tested |
+| `FERROX_CPU_POOL_SPIN_US` | Microseconds a `spin` worker spins before parking. Default 100. A pool that never parks burns a core per thread on an idle server |
 | `FERROX_CPU_THREADS` | Worker threads; same as `-t`. Default: **performance cores** (`hw.perflevel0.physicalcpu` on macOS), matching llama.cpp, not logical cores |
 | `FERROX_CPU_INT_DOT` | int8×int8 matvec + repacked GEMV. **On by default** in `ferrox` / `ferrox-server`; `0` opts out. Off in the library so golden cross-validation stays reference-exact |
 | `FERROX_METAL_FA_VEC` | `0`, disable llama-style FA-vec for decode **and** prefill and fall back to the legacy online-softmax GQA. Default **on** for `head_dim` in {64, 96, 128, 256}; other widths take the legacy kernel either way. Prefill at 64 / 128 / 256 with at least 8 new tokens goes further and takes the simdgroup-MMA `flash_attn_ext` kernel, which is not separately switchable |
@@ -56,8 +64,8 @@ library or overriding the CLI.
 
 | Variable | Purpose |
 |---|---|
-| `FERROX_CONTINUOUS_BATCHING` | `1`, share decode across concurrent requests |
-| `FERROX_CB_MAX_SEQS` | Continuous batching: cap on in-flight sequences, counting prompts still prefilling (default: unlimited) |
+| `FERROX_CONTINUOUS_BATCHING` | `1` enables, `0` disables. When unset on Metal builds with fused attention, continuous batching is **on by default** for safe parallel serving. Also: `ferrox serve --cont-batching` / `-cb`, `--no-cont-batching`. |
+| `FERROX_CB_MAX_SEQS` | Continuous batching: cap on in-flight sequences (llama.cpp `-np`). CLI: `-np N` / `--parallel N`. Default: unlimited |
 | `FERROX_CB_PREFILL_CHUNK` | Continuous batching: prompt tokens per prefill chunk (default `128`). The scheduler runs one chunk plus one batched decode step per tick, so this is the granularity at which a long prompt yields to in-flight decodes |
 | `FERROX_CB_MAX_QUEUE` | Continuous batching: requests allowed to wait for admission (default `512`). Past it, new requests get `503` + `Retry-After` instead of queueing without bound |
 | `FERROX_CB_KV_BLOCKS` | Continuous batching: total KV blocks the scheduler may hand out. Unset means it is *derived* at load alongside `FERROX_CB_MAX_CONTEXT`, or absent when the model cannot be priced. Admission is `blocks_needed <= blocks_free`, where a request needs `ceil((prompt + max_tokens) / block_size)` blocks reserved for its whole lifetime |
@@ -75,7 +83,7 @@ library or overriding the CLI.
 | `FERROX_KV_BYTE_BUDGET` | Byte ceiling for the KV block pool, independent of block count |
 | `FERROX_PAGED_KV_BLOCKS` | Blocks per layer of real paged KV: shared page storage many requests read through a block table, rather than a private buffer each. `ferrox-server` only. Mutually exclusive with `FERROX_KV_POOL_BLOCKS`/`FERROX_KV_BYTE_BUDGET` and with `FERROX_PREFIX_CACHE_ENTRIES`; setting an excluded pair stops the server with an error naming both. Read the paragraph under this table before using it |
 | `FERROX_PAGED_KV_BLOCK_SIZE` | Positions per paged-KV block. Must be set together with `FERROX_PAGED_KV_BLOCKS`, or the server stops |
-| `FERROX_PAGED_KV_SLIDE_INTERVAL` | Decode steps between window slides on a paged store (default 128). Only applies when *every* layer of the served model slides by the same window — a page group holds one block in each layer, so a single full-attention layer disables sliding entirely. A smaller number returns pages sooner and costs a page operation more often; the admission bound pays for whatever accumulates in between |
+| `FERROX_PAGED_KV_SLIDE_INTERVAL` | Decode steps between window slides on a paged store (default 128). Only applies when *every* layer of the served model slides by the same window, because a page group holds one block in each layer, so a single full-attention layer disables sliding entirely. A smaller number returns pages sooner and costs a page operation more often; the admission bound pays for whatever accumulates in between |
 | `FERROX_PREFIX_CACHE_ENTRIES` | Prefix-cache capacity for the private generate path: whole KV snapshots in an LRU list, reported under `GET /cache/stats`. Mutually exclusive with continuous batching and with paged KV. Paged KV carries no such exclusion: it composes with continuous batching and shares prefixes through the radix tree instead |
 | `FERROX_EXPERT_CACHE_BYTES` | MoE expert-streaming cache budget |
 | `FERROX_SSD_STREAMING` | `1`, stream MoE experts from disk |
@@ -247,3 +255,44 @@ path. Setting them does nothing.
 `FERROX_METAL_MOE_GATE_THEN_SILU` · `FERROX_METAL_MOE_BARRIER_LOG` ·
 `FERROX_GEMV_DEDICATED` · `FERROX_GEMV_THREADS` ·
 `FERROX_MIN_TASK_MACS`
+
+## `FERROX_KV_WINDOW`, and why it is off
+
+A sliding-window layer only ever attends over its last `window`
+positions, so the rows before that are dead weight. Nothing in ferrox
+evicted them until now, which is why a windowed model cost exactly what
+a full-attention model of the same shape cost.
+
+What it saves, on Gemma-3-4B at 32768 tokens of host f32 KV:
+
+| | bytes |
+|---|---|
+| Off (every layer holds everything) | 9,126,805,504 |
+| On, at rest | 1,692,590,080 |
+| On, prefill peak | 1,948,942,336 |
+
+The peak is not the full 9.13 GiB because prefill evicts per layer: one
+layer holds the whole prompt at a time rather than all 34 at once. Five
+of the 34 layers are full attention and still hold everything, which is
+most of what remains.
+
+**It is off by default because it is new, not because it is doubted.**
+Output is token-identical with it on or off, asserted on identical logit
+vectors as well as identical token ids, on gemma-2-2b-it-Q4_K_M with its
+real SWA layout and real quantized tensors.
+
+It disables itself in three cases rather than guessing:
+
+- Under `FERROX_METAL_ATTN`, because five sites treat Metal's own
+  sequence length and the host cache's resident rows as interchangeable.
+  They are equal only while nothing evicts. Metal is step 3 of
+  [#61](https://github.com/antonellof/ferrox/issues/61).
+- On a draft model's decoder, which rolls its cache back arbitrarily far
+  during speculative verification.
+- Beside the prefix cache, which refuses to store a windowed cache
+  rather than hand back a truncation it cannot represent.
+
+The server's admission check still prices the full, unwindowed number.
+That is the safe direction and it is correct while the switch is off; a
+context is refused that would in fact have fit, rather than admitted and
+then OOM.

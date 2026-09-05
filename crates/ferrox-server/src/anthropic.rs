@@ -93,10 +93,9 @@ use serde_json::{json, Value};
 use crate::generate::Usage;
 use crate::output::{OutputPosture, ParsedOutput};
 use crate::{
-    attribution, decode_error_response, join_error_response, output, prompt_from_messages,
-    run_generation, run_generation_emit, sse, stats, ApiError, AppState, ChatCompletionRequest,
-    ChatMessage, MessageContent, StopParam, ThinkingSwitch, ToolCallFunctionIn, ToolCallIn,
-    ToolDef, ToolFunctionDef,
+    attribution, decode_error_response, output, prompt_from_messages, run_generation_emit, sse,
+    stats, ApiError, AppState, ChatCompletionRequest, ChatMessage, MessageContent, StopParam,
+    ThinkingSwitch, ToolCallFunctionIn, ToolCallIn, ToolDef, ToolFunctionDef,
 };
 
 /// Stream silence after which a protocol-native `ping` goes out.
@@ -635,6 +634,7 @@ fn prepare_prompt(prompt: &PromptFields, model: String, max_tokens: usize) -> Pr
     };
 
     let chat = ChatCompletionRequest {
+        samplers: None,
         model,
         messages: convert_prompt(prompt),
         max_tokens,
@@ -1387,38 +1387,25 @@ async fn messages_full(
     // model even if `/admin/models/load` swaps another one in halfway.
     let active = state.require_active().map_err(anthropic_shape)?;
     let chat = prepared.chat;
-    let template = active.model.chat_template();
+    let template = active
+        .generative()
+        .map_err(anthropic_shape)?
+        .chat_template();
     let kwargs = chat.resolve_template_kwargs(&template);
     let prompt = prompt_from_messages(&chat.messages, &template, &chat.tools, kwargs)
         .map_err(anthropic_shape)?;
-    let posture = OutputPosture::resolve(active.model.name(), &prompt);
+    let posture = OutputPosture::resolve(active.name(), &prompt);
     // The client's own list, kept apart from `params.stop`, which the
     // template adds its end-of-turn marker to. See `caller_stop`.
     let caller_stops = chat.stop_sequences();
-    let params = chat.generation_params_for_template(&template)?;
+    let params = chat.generation_params_for_template(&template, active.name())?;
 
-    let model = Arc::clone(&active.model);
-    let kv_pool = state.kv_pool.clone();
-    let paged_kv = state.paged_kv.clone();
-    let prefix_cache = state.prefix_cache.clone();
-    let batcher = active.batcher.clone();
-    let ceiling = active.ceiling.clone();
-    let (chunks, finish, usage) = tokio::task::spawn_blocking(move || {
-        run_generation(
-            &model,
-            &prompt,
-            &params,
-            kv_pool.as_ref(),
-            paged_kv.as_ref(),
-            prefix_cache.as_deref(),
-            batcher.as_ref(),
-            ceiling.as_deref(),
-        )
-    })
+    let (chunks, finish, usage) = crate::decode_task::buffered(
+        crate::decode_task::DecodeHandles::take(&state, &active).map_err(anthropic_shape)?,
+        prompt,
+        params,
+    )
     .await
-    .map_err(join_error_response)
-    .map_err(anthropic_shape)?
-    .map_err(decode_error_response)
     .map_err(anthropic_shape)?;
 
     let parsed = output::parse_output(&chunks.concat(), &prepared.parser_tools, posture);
@@ -1427,7 +1414,7 @@ async fn messages_full(
         route: ferrox_api::routes::V1_MESSAGES,
         // The handle this request decoded against, not `chat.model`: a
         // swap mid-flight does not change which weights answered.
-        model: Some(active.model.name().to_string()),
+        model: Some(active.name().to_string()),
         status: 200,
         stream: false,
         duration_ms: started.elapsed().as_millis() as u64,
@@ -1458,15 +1445,18 @@ async fn messages_stream(
     // checkpoints into one answer.
     let active = state.require_active().map_err(anthropic_shape)?;
     let chat = prepared.chat;
-    let template = active.model.chat_template();
+    let template = active
+        .generative()
+        .map_err(anthropic_shape)?
+        .chat_template();
     let kwargs = chat.resolve_template_kwargs(&template);
     let prompt = prompt_from_messages(&chat.messages, &template, &chat.tools, kwargs)
         .map_err(anthropic_shape)?;
-    let served_model = active.model.name().to_string();
+    let served_model = active.name().to_string();
     let posture = OutputPosture::resolve(&served_model, &prompt);
     // See `messages_full`: the client's list, not the template's.
     let caller_stops = chat.stop_sequences();
-    let mut params = chat.generation_params_for_template(&template)?;
+    let mut params = chat.generation_params_for_template(&template, &served_model)?;
 
     // The same two-tier cancellation the chat stream has: the guard
     // rides with the generation task and deregisters however that task
@@ -1474,16 +1464,17 @@ async fn messages_stream(
     let (cancel_token, cancel_guard) = state.cancels.register(&request_id);
     params.cancel = Some(cancel_token.clone());
 
-    let model = Arc::clone(&active.model);
+    let model = Arc::clone(active.generative().map_err(anthropic_shape)?);
     let kv_pool = state.kv_pool.clone();
     let paged_kv = state.paged_kv.clone();
     let prefix_cache = state.prefix_cache.clone();
     let batcher = active.batcher.clone();
     let ceiling = active.ceiling.clone();
+    let metal_private_decode_gate = state.metal_private_decode_gate.clone();
     // Continuous batching returns one string, so there is no
     // incremental stream to ride on and the whole answer is parsed at
     // the end instead.
-    let overlap = batcher.is_none();
+    let overlap = true;
     let offered = prepared.parser_tools;
     let stats_state = Arc::clone(&state);
     let stats_request_id = request_id.clone();
@@ -1511,6 +1502,7 @@ async fn messages_stream(
             prefix_cache.as_deref(),
             batcher.as_ref(),
             ceiling.as_deref(),
+            metal_private_decode_gate.as_deref(),
             |chunk| {
                 if !overlap || chunk.is_empty() {
                     return;

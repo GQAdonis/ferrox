@@ -46,15 +46,11 @@ pub struct ResidencyAssumptions {
     /// host cache, f16 for Metal's device KV, and so on. Only this
     /// module's caller knows which backend is selected.
     pub kv_elem: KvElem,
-    /// Prefill chunk size, which widens a sliding-window layer's
-    /// resident positions to `window + chunk - 1`. Pass `1` for
-    /// token-at-a-time prefill.
-    pub prefill_chunk: usize,
 }
 
 impl Default for ResidencyAssumptions {
-    /// Single request, 4096 tokens, resident experts, host f32 KV,
-    /// token-at-a-time prefill -- the CLI's own defaults.
+    /// Single request, 4096 tokens, resident experts, host f32 KV --
+    /// the CLI's own defaults.
     fn default() -> Self {
         ResidencyAssumptions {
             context_tokens: 4096,
@@ -62,7 +58,6 @@ impl Default for ResidencyAssumptions {
             expert_cache_bytes: None,
             headroom_fraction: 0.2,
             kv_elem: KvElem::F32,
-            prefill_chunk: 1,
         }
     }
 }
@@ -172,11 +167,11 @@ impl ResidencyReport {
         let weights_bytes = lines.iter().map(|l| l.bytes).sum();
 
         // KV cache at the stated context, per concurrent request --
-        // `kv_budget`'s arithmetic, so a sliding-window or MLA
-        // checkpoint is priced the way it will really run rather than
-        // as if every layer kept the full history in f32.
-        let kv_shape =
-            KvShape::from_config(&config, assumptions.kv_elem, assumptions.prefill_chunk);
+        // `kv_budget`'s arithmetic, so an MLA checkpoint is priced the
+        // way it will really run rather than as a GQA one, and a
+        // windowed checkpoint is priced at what the store keeps rather
+        // than at what attention reads.
+        let kv_shape = KvShape::from_config(&config, assumptions.kv_elem);
         let kv_per_request = kv_shape.kv_bytes_for_tokens(assumptions.context_tokens);
         lines.push(ResidencyLine {
             label: "KV caches".to_string(),
@@ -396,26 +391,32 @@ mod tests {
         }
     }
 
-    /// A checkpoint whose header declares a sliding window must be
-    /// priced against the window, not the full context -- the variant
-    /// the plan calls out and the one an unmodified formula gets wrong.
+    /// A checkpoint whose header declares a sliding window is priced
+    /// exactly like one that does not, because no KV store this engine
+    /// allocates ever evicts a position (#33). This report used to make
+    /// a windowed model look ~60x cheaper at 32k, which is a plan an
+    /// operator can act on and a machine cannot honour.
     #[test]
-    fn a_sliding_window_config_is_priced_against_the_window_not_the_context() {
+    fn a_sliding_window_config_is_priced_like_a_full_attention_one() {
         let mut cfg = crate::config::test_dense_fixture();
         cfg.n_layers = 8;
         cfg.n_kv_heads = 4;
         cfg.head_dim = 64;
         cfg.sliding_window = None;
         cfg.swa_pattern = None;
-        let full = KvShape::from_config(&cfg, KvElem::F32, 1);
+        let full = KvShape::from_config(&cfg, KvElem::F32);
 
         cfg.sliding_window = Some(512);
-        let windowed = KvShape::from_config(&cfg, KvElem::F32, 1);
+        cfg.swa_pattern = Some(6);
+        let windowed = KvShape::from_config(&cfg, KvElem::F32);
 
         assert_eq!(
             full.kv_bytes_for_tokens(512),
             windowed.kv_bytes_for_tokens(512)
         );
-        assert!(windowed.kv_bytes_for_tokens(32_768) < full.kv_bytes_for_tokens(32_768) / 60);
+        assert_eq!(
+            full.kv_bytes_for_tokens(32_768),
+            windowed.kv_bytes_for_tokens(32_768)
+        );
     }
 }

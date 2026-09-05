@@ -12,13 +12,15 @@ use std::sync::mpsc::Sender;
 use ferrox_core::cache::KvCache;
 use ferrox_models::tokenizer::StopTokens;
 
-use crate::generate::{DecodeError, FinishReason, GenerationParams, PagedLease, Usage};
+use crate::generate::{DecodeError, FinishReason, GenerationParams, PagedLease};
 use crate::sample_step::SampleState;
 use crate::stop::StopMatcher;
 
 use super::block_budget::BlockBudget;
-use super::config::JobResult;
+use super::clock::RowClock;
+use super::config::{send_finished, BatcherEvent};
 use super::queue::AbortId;
+use crate::utf8_stream::Utf8Stream;
 
 /// Where one batched row keeps its KV.
 ///
@@ -32,11 +34,41 @@ pub(super) enum RowKv {
     Paged(PagedLease),
 }
 
+impl RowKv {
+    /// Positions already written into this row's KV, and therefore the
+    /// only position a forward pass over it may run at next.
+    ///
+    /// This is a READ of the cursor, not a second derivation of it.
+    /// `KvCache::push` and `PagedKvCache::push` both write at their own
+    /// `seq_len` and IGNORE the position their caller passes alongside,
+    /// so the KV's length is the one true answer and everybody else's is
+    /// a guess that has to be kept in step.
+    ///
+    /// A paged row does not start at zero. `acquire_paged_caches` seeds
+    /// its lease with whatever prefix the radix tree already held
+    /// (`PagedKvCache::adopt_blocks` installs those blocks and sets
+    /// `seq_len` to the prefix length), so a prefill that assumed zero
+    /// re-ran the whole prompt ON TOP of the adopted prefix: the tokens
+    /// landed in rows past it while carrying RoPE positions `0..n`, and
+    /// the answer came back wrong with a 200 on it. That was issue #37,
+    /// and it existed because the batched prefill kept its own copy of
+    /// this number while the private generate loop derived one.
+    ///
+    /// `&mut self` only because [`PagedLease`] exposes its caches
+    /// mutably; nothing here is modified.
+    pub(super) fn positions_written(&mut self) -> usize {
+        match self {
+            RowKv::Contiguous(caches) => caches.first().map_or(0, |c| c.positions()),
+            RowKv::Paged(lease) => lease.caches_mut().first().map_or(0, |c| c.seq_len()),
+        }
+    }
+}
+
 pub(super) struct Job {
     pub(super) prompt_tokens: Vec<usize>,
     pub(super) params: GenerationParams,
     pub(super) stop_tokens: StopTokens,
-    pub(super) reply: Sender<JobResult>,
+    pub(super) reply: Sender<BatcherEvent>,
     /// Cancellation handle for this job, from submission onwards.
     pub(super) abort: AbortId,
     /// KV blocks this job will need for its whole lifetime, computed
@@ -196,7 +228,7 @@ pub(super) struct Slot {
     pub(super) max_tokens: usize,
     pub(super) stop_tokens: StopTokens,
     pub(super) params: GenerationParams,
-    pub(super) reply: Sender<JobResult>,
+    pub(super) reply: Sender<BatcherEvent>,
     pub(super) finish: Option<FinishReason>,
     /// Set instead of an answer when this row cannot be served -- today,
     /// only a grammar it cannot continue. Kept beside `finish` rather
@@ -208,6 +240,13 @@ pub(super) struct Slot {
     pub(super) abort: AbortId,
     /// KV blocks this row reserved at admission, returned when it ends.
     pub(super) blocks: usize,
+    /// The row's own clock, started at admission. Owns the only path
+    /// from a finished row to its `Usage`.
+    pub(super) clock: RowClock,
+    /// This row's half-finished character, if a token ended inside one.
+    /// Per row: rows interleave, and one shared buffer would splice one
+    /// answer's bytes into another's.
+    pub(super) utf8: Utf8Stream,
 }
 
 impl Slot {
@@ -234,17 +273,30 @@ pub(super) fn reply_finished(mut slot: Slot) {
     // text that stops short of satisfying it is not a shorter answer to
     // that question.
     if let Some(error) = slot.error {
-        let _ = slot.reply.send(Err(error));
+        send_finished(&slot.reply, Err(error));
         return;
     }
     let finish = slot.finish.expect("only a finished row is replied to");
     // Text withheld against a stop that never arrived is ordinary
     // output; dropping it would truncate every answer whose tail looks
     // like the start of a stop string.
+    // A row cut off mid-character cannot finish it, so the held bytes
+    // surface as U+FFFD instead of vanishing -- through the stop
+    // matcher, like any other text this row produced.
+    let partial = slot.utf8.flush();
+    if !partial.is_empty() {
+        slot.stops.push(&partial);
+    }
     let tail = slot.stops.flush();
-    slot.visible.push_str(&tail);
-    let usage = Usage::new(slot.prompt_tokens, slot.generated_ids.len());
-    let _ = slot
-        .reply
-        .send(Ok((finish, slot.generated_ids, slot.visible, usage)));
+    if !tail.is_empty() {
+        slot.visible.push_str(&tail);
+        let _ = slot.reply.send(BatcherEvent::Chunk(tail));
+    }
+    let usage = slot
+        .clock
+        .usage(slot.prompt_tokens, slot.generated_ids.len());
+    send_finished(
+        &slot.reply,
+        Ok((finish, slot.generated_ids, slot.visible, usage)),
+    );
 }

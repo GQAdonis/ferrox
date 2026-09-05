@@ -29,10 +29,8 @@
 //! Streaming scope: when `stream: true` and tools are inactive, each
 //! decoded chunk is pushed through a bounded `mpsc` channel from the
 //! blocking generate task into the SSE writer so time-to-first-byte
-//! overlaps with ongoing decode. Tool-call requests still buffer the
-//! full response first (detection needs the stop-bounded text).
-//! Continuous-batching streaming also buffers (batcher returns one
-//! string).
+//! overlaps with ongoing decode. Under continuous batching the batch
+//! worker emits the same incremental chunks as the private decode loop.
 
 mod admin;
 mod anthropic;
@@ -41,18 +39,23 @@ mod budget;
 mod cache_admin;
 mod cancel;
 mod chat_template;
+mod completion;
 mod conversations;
+mod decode_task;
+mod embeddings;
 mod generate;
 mod grammar_request;
 mod health;
 mod journal;
 mod json_mode;
 mod limits;
+mod loaded;
 mod mcp;
 mod model;
 mod openai_extra;
 mod output;
 mod policy;
+mod rerank;
 mod response_cache;
 pub(crate) mod responses;
 mod resume;
@@ -66,7 +69,9 @@ mod stats;
 mod stop;
 mod stream_events;
 mod tasks;
+mod tool_grammar;
 mod unsupported_sampling;
+mod utf8_stream;
 
 use std::cell::RefCell;
 use std::convert::Infallible;
@@ -95,7 +100,9 @@ use ferrox_models::sampling::SamplingParams;
 use ferrox_models::tokenizer::StopTokens;
 use ferrox_models::{Decoder, Gemma4Engine, KimiEngine, MlaEngine, PrefixCache};
 use generate::{FinishReason, GenerationParams};
+pub(crate) use loaded::{ActiveModel, Loaded};
 use model::ServerTokenizer;
+use rerank::encoder_endpoints;
 use response_cache::{CacheKey, ResponseCache};
 use sampling_knobs::SamplingKnobs;
 
@@ -117,6 +124,81 @@ pub struct ServerArgs {
     /// Model path (GGUF file or Kimi checkpoint directory).
     #[arg(short = 'm', long = "model", value_name = "FILE")]
     model: Option<String>,
+
+    /// Hugging Face repo to serve, `user/repo[:QUANT]`, llama.cpp's
+    /// `-hf`.
+    ///
+    /// Downloads into the ferrox cache on first use and reuses it
+    /// after, so `-hf TheBloke/Mixtral-8x7B-Instruct-v0.1-GGUF:Q4_K_M`
+    /// is the whole command. The tag after the colon is a QUANT LABEL,
+    /// not a git revision, and it matches without regard to case.
+    #[arg(
+        long = "hf-repo",
+        visible_alias = "hf",
+        value_name = "REPO[:QUANT]",
+        conflicts_with = "model"
+    )]
+    hf_repo: Option<String>,
+
+    /// Exact filename inside `--hf-repo`, llama.cpp's `-hff`.
+    ///
+    /// For a repo whose quant labels do not disambiguate, or a file
+    /// whose name carries no quant at all.
+    #[arg(long = "hf-file", value_name = "FILE", requires = "hf_repo")]
+    hf_file: Option<String>,
+
+    /// Context size, llama.cpp's `-c`. Sets `FERROX_CB_MAX_CONTEXT`.
+    ///
+    /// Unset means the ceiling is derived at load from the weights and
+    /// the per-token KV against the device budget, capped at the
+    /// model's trained context, which is usually what you want.
+    #[arg(short = 'c', long = "ctx-size", value_name = "N")]
+    ctx_size: Option<usize>,
+
+    /// Require `Authorization: Bearer <key>`, llama.cpp's `--api-key`.
+    /// Sets `FERROX_API_KEY`, which also gates `/admin`.
+    #[arg(long = "api-key", value_name = "KEY")]
+    api_key: Option<String>,
+
+    /// Read the API key from a file, llama.cpp's `--api-key-file`.
+    ///
+    /// Preferred over `--api-key` on a shared host: an argument is
+    /// visible in `ps` to every user on the machine.
+    #[arg(long = "api-key-file", value_name = "PATH", conflicts_with = "api_key")]
+    api_key_file: Option<std::path::PathBuf>,
+
+    /// Name this model answers to in `/v1/models` and in responses,
+    /// llama.cpp's `--alias`. Sets `FERROX_MODEL_NAME`.
+    #[arg(long = "alias", visible_alias = "model-alias", value_name = "NAME")]
+    alias: Option<String>,
+
+    /// KV cache dtype, llama.cpp's `--cache-type-k`. Metal only; the
+    /// CPU and CUDA KV cache is the host `Vec<f32>`.
+    #[arg(long = "ctk", visible_alias = "cache-type-k", value_name = "TYPE")]
+    ctk: Option<String>,
+
+    /// Accepted and already the default: ferrox always compiles and
+    /// evaluates the GGUF's own `tokenizer.chat_template`. llama.cpp
+    /// needs `--jinja` to do that, so a command copied from there
+    /// carries it, and dying on an unknown flag would be a worse answer
+    /// than saying "yes, always".
+    #[arg(long = "jinja", default_value_t = false)]
+    jinja: bool,
+
+    /// Refused rather than ignored: ferrox has no
+    /// template-free/sniffing mode to fall back to. See `--jinja`.
+    #[arg(long = "no-jinja", default_value_t = false)]
+    no_jinja: bool,
+
+    /// Accepted; ferrox does no warm-up pass, so there is none to skip.
+    #[arg(long = "no-warmup", default_value_t = false)]
+    no_warmup: bool,
+
+    /// Accepted. Fused attention is a backend decision here, not a
+    /// request-time one: it is on wherever the Metal kernels support
+    /// the shape (`FERROX_METAL_ATTN`).
+    #[arg(long = "flash-attn", visible_alias = "fa", value_name = "MODE", num_args = 0..=1, default_missing_value = "auto")]
+    flash_attn: Option<String>,
 
     /// IP address to listen on.
     #[arg(long, value_name = "HOST")]
@@ -170,6 +252,30 @@ pub struct ServerArgs {
     /// (the desktop shell) passes the flag and keeps the pipe open.
     #[arg(long = "exit-on-stdin-close", default_value_t = false)]
     exit_on_stdin_close: bool,
+
+    /// Share one batched decode worker across concurrent requests
+    /// (llama.cpp `-cb`). Also sets `FERROX_CONTINUOUS_BATCHING=1`.
+    #[arg(
+        long = "cont-batching",
+        visible_aliases = ["continuous-batching", "cb"],
+        default_value_t = false
+    )]
+    cont_batching: bool,
+
+    /// Disable auto continuous batching on Metal
+    /// (`FERROX_CONTINUOUS_BATCHING=0`).
+    #[arg(
+        long = "no-cont-batching",
+        default_value_t = false,
+        conflicts_with = "cont_batching"
+    )]
+    no_cont_batching: bool,
+
+    /// Max concurrent sequences under continuous batching (llama.cpp
+    /// `-np`). Sets `FERROX_CB_MAX_SEQS`; implies `--cont-batching`
+    /// unless `--no-cont-batching` is set.
+    #[arg(long = "parallel", visible_alias = "np", value_name = "N")]
+    parallel: Option<usize>,
 
     /// Start even though another ferrox process is already holding a
     /// model. Off by default: two models on one box do not share it,
@@ -260,6 +366,14 @@ fn rewrite_llama_style_argv(args: Vec<String>) -> Vec<String> {
         .map(|arg| match arg.as_str() {
             "-ngl" => "--n-gpu-layers".into(),
             "-dev" => "--device".into(),
+            "-cb" => "--cont-batching".into(),
+            "-np" => "--parallel".into(),
+            // One token in llama.cpp's hand-written parser. clap sees
+            // `-h` followed by `f` and prints help, which is what
+            // `ferrox serve -hf repo:Q4_K_M` did: the flag looked
+            // absent rather than mis-spelled.
+            "-hf" => "--hf-repo".into(),
+            "-hff" => "--hf-file".into(),
             _ => arg,
         })
         .collect()
@@ -301,10 +415,118 @@ fn cli_bind_addr(args: &ServerArgs, env_addr: Option<&str>) -> Option<String> {
     Some(SocketAddr::new(host, port).to_string())
 }
 
+/// Resolves a `-hf` reference to a local path, downloading it once.
+///
+/// Progress goes to STDERR, not stdout: stdout carries the
+/// `ferrox.server.ready` line a supervising process parses, and a
+/// progress bar in the middle of it would break that contract.
+fn resolve_hf_repo(spec: &str, file: Option<&str>) -> anyhow::Result<String> {
+    let mut hf = ferrox_models::hub::HfRef::parse(spec);
+    if let Some(f) = file {
+        hf.file = Some(f.to_string());
+    }
+    eprintln!(
+        "ferrox: resolving {} on the Hub{}",
+        hf.repo,
+        hf.quant
+            .as_deref()
+            .map(|q| format!(" ({q})"))
+            .unwrap_or_default()
+    );
+
+    let mut last = std::time::Instant::now();
+    let mut draw = move |done: u64, total: Option<u64>| {
+        if last.elapsed() < std::time::Duration::from_millis(200) {
+            return;
+        }
+        last = std::time::Instant::now();
+        let mib = done as f64 / 1024.0 / 1024.0;
+        match total {
+            Some(t) if t > 0 => {
+                eprint!(
+                    "\r  {mib:>9.1} MiB  {:5.1}%",
+                    (done as f64 / t as f64) * 100.0
+                )
+            }
+            _ => eprint!("\r  {mib:>9.1} MiB"),
+        }
+    };
+
+    let (path, downloaded) = hf
+        .ensure_local(&mut draw)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    if downloaded {
+        eprintln!();
+        eprintln!("ferrox: downloaded {}", path.display());
+    } else {
+        eprintln!("ferrox: using cached {}", path.display());
+    }
+    Ok(path.to_string_lossy().into_owned())
+}
+
 fn apply_cli_overrides(args: &ServerArgs) -> anyhow::Result<()> {
     if let Some(model) = &args.model {
         // SAFETY: called before the runtime starts worker threads.
         unsafe { std::env::set_var("FERROX_MODEL_PATH", model) };
+    }
+    if let Some(spec) = &args.hf_repo {
+        let path = resolve_hf_repo(spec, args.hf_file.as_deref())?;
+        // SAFETY: called before the runtime starts worker threads.
+        unsafe { std::env::set_var("FERROX_MODEL_PATH", &path) };
+    }
+    if let Some(n) = args.ctx_size {
+        if n == 0 {
+            anyhow::bail!("--ctx-size must be greater than zero");
+        }
+        // SAFETY: called before the runtime starts worker threads.
+        unsafe { std::env::set_var("FERROX_CB_MAX_CONTEXT", n.to_string()) };
+    }
+    if let Some(key) = &args.api_key {
+        // SAFETY: called before the runtime starts worker threads.
+        unsafe { std::env::set_var("FERROX_API_KEY", key) };
+    }
+    if let Some(path) = &args.api_key_file {
+        let key = std::fs::read_to_string(path)
+            .map_err(|e| anyhow::anyhow!("reading --api-key-file {}: {e}", path.display()))?;
+        let key = key.trim();
+        if key.is_empty() {
+            anyhow::bail!(
+                "--api-key-file {} is empty: an empty key would leave every route open, \
+                 which is the opposite of what passing the flag asked for",
+                path.display()
+            );
+        }
+        // SAFETY: called before the runtime starts worker threads.
+        unsafe { std::env::set_var("FERROX_API_KEY", key) };
+    }
+    if let Some(alias) = &args.alias {
+        // SAFETY: called before the runtime starts worker threads.
+        unsafe { std::env::set_var("FERROX_MODEL_NAME", alias) };
+    }
+    if let Some(ctk) = &args.ctk {
+        // SAFETY: called before the runtime starts worker threads.
+        unsafe { std::env::set_var("FERROX_CTK", ctk.trim()) };
+    }
+    // Refused by NAME rather than ignored. A prompt framed by a
+    // hand-written guess instead of the checkpoint's own template is
+    // the kind of wrong answer that reads as a model quality problem,
+    // so "ferrox cannot do that" is the honest reply.
+    if args.no_jinja {
+        anyhow::bail!(
+            "--no-jinja: ferrox has no template-free mode. It compiles and evaluates the GGUF's \
+             own tokenizer.chat_template, which is what llama.cpp's --jinja turns on, and there \
+             is no sniffing fallback to switch to. Use --no-cnv on `ferrox run` for a raw \
+             completion"
+        );
+    }
+    if let Some(mode) = &args.flash_attn {
+        let mode = mode.trim().to_ascii_lowercase();
+        if mode == "off" || mode == "disabled" || mode == "0" {
+            anyhow::bail!(
+                "--flash-attn off: fused attention is a backend property here, not a per-run \
+                 switch. Set FERROX_METAL_ATTN=0 to take the unfused Metal path, or --device cpu"
+            );
+        }
     }
 
     if let Some(addr) = cli_bind_addr(args, std::env::var("FERROX_ADDR").ok().as_deref()) {
@@ -387,6 +609,26 @@ fn apply_cli_overrides(args: &ServerArgs) -> anyhow::Result<()> {
                 }
             }
         }
+    }
+
+    if let Some(n) = args.parallel {
+        if n == 0 {
+            anyhow::bail!("--parallel must be greater than zero");
+        }
+        // SAFETY: called before the runtime starts worker threads.
+        unsafe { std::env::set_var("FERROX_CB_MAX_SEQS", n.to_string()) };
+    }
+
+    if args.cont_batching {
+        // SAFETY: called before the runtime starts worker threads.
+        unsafe { std::env::set_var("FERROX_CONTINUOUS_BATCHING", "1") };
+    } else if args.no_cont_batching {
+        // SAFETY: called before the runtime starts worker threads.
+        unsafe { std::env::set_var("FERROX_CONTINUOUS_BATCHING", "0") };
+    } else if args.parallel.is_some() {
+        // llama.cpp `-np` is only meaningful with continuous batching.
+        // SAFETY: called before the runtime starts worker threads.
+        unsafe { std::env::set_var("FERROX_CONTINUOUS_BATCHING", "1") };
     }
 
     Ok(())
@@ -519,6 +761,24 @@ impl Model {
         }
     }
 
+    /// The BOS id the generation path would prepend, or `None` when
+    /// this checkpoint's own metadata says not to prepend one.
+    ///
+    /// Read by `/tokenize`'s `add_special`, so that endpoint reports
+    /// the prompt the model would actually be given rather than a
+    /// second opinion about it. Kimi has no BOS id plumbed through the
+    /// server -- `run_generation` passes `None` for it -- and this
+    /// agrees with that rather than inventing one.
+    pub(crate) fn bos_id(&self) -> Option<usize> {
+        match self {
+            Model::Gguf(m) => m.bos_id,
+            Model::Kimi(_) => None,
+            Model::Mla(m) => m.bos_id,
+            Model::Gemma4(m) => m.bos_id,
+            Model::Glm52(m) => m.bos_id,
+        }
+    }
+
     pub(crate) fn decode(&self, ids: &[usize]) -> String {
         match self {
             Model::Gguf(m) => m.tokenizer.decode(ids),
@@ -562,38 +822,21 @@ impl Model {
     }
 }
 
-/// The model the server is serving *right now*, together with the
-/// pieces that are built from it and must be replaced with it.
-///
-/// The continuous batcher owns a worker thread holding an
-/// `Arc<Decoder>`, so it belongs to one specific model: keeping it in a
-/// separate field would let a swap leave a batcher decoding against the
-/// old weights while `Model` named the new ones. Bundling them means
-/// one `Arc` swap replaces a consistent pair.
-pub(crate) struct ActiveModel {
-    /// Admin-surface id (see `admin::discover`), or `None` for a model
-    /// that was not discovered through it -- the synthetic fallback, or
-    /// a `FERROX_MODEL_PATH` outside the scanned directory.
-    pub(crate) id: Option<String>,
-    pub(crate) model: Arc<Model>,
-    /// Opt-in continuous-batching decode worker (`FERROX_CONTINUOUS_BATCHING=1`).
-    /// Shares `forward_multi_seq` across concurrent GGUF requests. Disabled
-    /// when a KV pool or prefix cache is configured (those keep the
-    /// private-loop `generate` path).
-    pub(crate) batcher: Option<serving::batch::ContinuousBatcher>,
-    /// The per-request context ceiling this model was priced for, or
-    /// `None` when it could not be priced (see `crate::budget`).
-    ///
-    /// Lives on the *model* rather than on `AppState` because it is a
-    /// property of the checkpoint plus the machine: `/admin/models/load`
-    /// swapping in a different model must swap in its ceiling too,
-    /// never keep the old model's arithmetic. The same `Arc` is inside
-    /// this model's `batcher`, so the batched and private decode paths
-    /// admit on one object.
-    pub(crate) ceiling: Option<Arc<budget::ContextCeiling>>,
-}
-
 pub(crate) struct AppState {
+    /// A **side-car** embedding model (`FERROX_EMBEDDING_MODEL_PATH`),
+    /// served by `/v1/embeddings` in preference to pooling a decoder's
+    /// hidden states.
+    ///
+    /// This is now the *second* way an encoder gets here. The first is
+    /// [`AppState::active`]: an encoder-only checkpoint at
+    /// `FERROX_MODEL_PATH` (or swapped in through
+    /// `/admin/models/load`) is the loaded model, as
+    /// [`crate::loaded::Loaded::Encoder`]. This field is what a
+    /// deployment uses when it wants a generative model active *and*
+    /// embeddings from a real encoder at the same time -- one process,
+    /// two checkpoints, which the active-model slot alone cannot
+    /// express. See [`AppState::embedding_model`] for which wins.
+    pub(crate) embedding: Option<Arc<ferrox_models::EmbeddingModel>>,
     /// The swappable active model.
     ///
     /// **A reader clones the `Arc` under the read lock and then runs;
@@ -692,6 +935,10 @@ pub(crate) struct AppState {
     /// worker, decided once at startup from the same env var and
     /// exclusions as the initial load.
     pub(crate) continuous_batching_enabled: bool,
+    /// Serializes private-loop Metal decodes when continuous batching is
+    /// off. Shared `metal_attn_kv` is not safe across concurrent
+    /// `forward_token` calls yet; see `docs/plans/metal-parallel-concurrency.md`.
+    pub(crate) metal_private_decode_gate: Option<Arc<std::sync::Mutex<()>>>,
     /// The model id a load task is currently working on, so
     /// `/admin/models` can report `loading` for it. Separate from
     /// `load_in_progress` because that is a gate and this is a label.
@@ -765,10 +1012,15 @@ impl AppState {
         })
     }
 
-    /// [`AppState::active`]'s model only, for the many call sites that
-    /// do not care about the batcher.
+    /// [`AppState::active`]'s *generation* model only, for the many
+    /// call sites that do not care about the batcher.
+    ///
+    /// Two refusals live behind this one `?`: nothing loaded (503, from
+    /// [`AppState::require_active`]) and an encoder loaded (501, from
+    /// [`ActiveModel::generative`]). They are different answers to
+    /// different questions and neither may be given for the other.
     pub(crate) fn require_model(&self) -> Result<Arc<Model>, ApiError> {
-        Ok(Arc::clone(&self.require_active()?.model))
+        Ok(Arc::clone(self.require_active()?.generative()?))
     }
 
     /// Publishes a new active model (or `None` to unload) and returns
@@ -855,7 +1107,32 @@ impl AppState {
     /// The model that would serve a request right now, as `/v1/models`
     /// names it. `None` when nothing is loaded.
     pub(crate) fn active_model_name(&self) -> Option<String> {
-        self.active().map(|a| a.model.name().to_string())
+        self.active().map(|a| a.name().to_string())
+    }
+
+    /// The encoder `/v1/embeddings` should use, from either of the two
+    /// ways one gets here.
+    ///
+    /// `FERROX_EMBEDDING_MODEL_PATH` wins over an encoder loaded as the
+    /// active model, and it has to: a deployment that names both has
+    /// asked for the side-car explicitly, while the active model may
+    /// have been swapped in by `/admin/models/load` since. Only one of
+    /// the two is ever set in practice -- the side-car exists so a
+    /// *generative* model can be active at the same time.
+    pub(crate) fn embedding_model(&self) -> Option<Arc<ferrox_models::EmbeddingModel>> {
+        self.embedding
+            .clone()
+            .or_else(|| self.active().and_then(|a| a.encoder().map(Arc::clone)))
+    }
+
+    /// What `/v1/embeddings` is actually charging against, for the
+    /// `/admin/stats` ring: the embedding model when one is serving,
+    /// otherwise whichever decoder is active.
+    pub(crate) fn embedding_model_name(&self) -> Option<String> {
+        match self.embedding_model() {
+            Some(e) => Some(e.name().to_string()),
+            None => self.active_model_name(),
+        }
     }
 
     pub(crate) fn record_request(&self, record: stats::Record<'_>) {
@@ -1017,19 +1294,19 @@ struct ToolFunctionDef {
 }
 
 /// OpenAI's `tool_choice`: `"auto"`/`"none"`/`"required"`, or an object
-/// pinning one specific function. Only whether it's literally
-/// `"none"` is actually consulted (to suppress tool-calling prompting
-/// entirely) -- forcing a *specific* named call isn't implementable
-/// honestly without grammar-constrained decoding (which doesn't exist
-/// in this server), so `"required"` and a
-/// specific-function choice are both treated the same as `"auto"`:
-/// offered, not forced. A real, disclosed simplification, not silently
-/// wrong behavior.
+/// pinning one specific function.
+///
+/// All four are honoured now. `"none"` hides the tools from the prompt;
+/// `"auto"` offers them; `"required"` and a named function FORCE a call,
+/// by compiling the offered tools into a grammar the decode loop must
+/// keep parseable (`crate::tool_grammar`). Before that grammar existed
+/// the last two were a 501, because a server that is asked to force a
+/// call and can only ask for one in the prompt has not done what it was
+/// told.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(untagged)]
 enum ToolChoice {
     Mode(String),
-    #[allow(dead_code)]
     Specific(serde_json::Value),
 }
 
@@ -1147,14 +1424,26 @@ struct ChatCompletionRequest {
     /// the bias honoured.
     #[serde(default)]
     logit_bias: Option<serde_json::Value>,
+    /// llama.cpp's `samplers`: the ORDER the sampler chain runs in,
+    /// either a list of names or the one `;`-separated string
+    /// `--samplers` takes.
+    ///
+    /// Read as `Value` and decided by
+    /// [`crate::unsupported_sampling::parse_sampler_order`], shared with
+    /// `/v1/completions` and `/completion`, so the three routes cannot
+    /// disagree about which samplers exist. A sampler ferrox does not
+    /// implement is refused BY NAME rather than dropped from the chain.
+    #[serde(default)]
+    samplers: Option<serde_json::Value>,
     /// A GBNF grammar every sampled token must keep parseable.
     ///
     /// llama.cpp's field, spelled the same way, because a client that
     /// already builds a grammar for `llama-server` should not have to
-    /// build a second one. Not an OpenAI field: OpenAI states this as
-    /// `response_format: {"type": "json_schema"}`, which needs a
-    /// schema-to-grammar converter that does not exist yet -- see
-    /// [`crate::grammar_request`], where both spellings are resolved.
+    /// build a second one. Not an OpenAI field: OpenAI states the same
+    /// constraint as `response_format: {"type": "json_schema"}`, which
+    /// is now compiled through the same grammar engine. Sending BOTH is
+    /// two constraints on one generation and is refused -- see
+    /// [`crate::grammar_request`], where every spelling is resolved.
     #[serde(default)]
     grammar: Option<String>,
 }
@@ -1203,8 +1492,12 @@ impl ChatCompletionRequest {
     /// `sampling_knobs`, shared with `/v1/completions`, so the two
     /// routes cannot disagree about what a knob means or which ones
     /// exist.
-    fn sampling_knobs(&self) -> SamplingKnobs {
-        SamplingKnobs {
+    ///
+    /// Fallible because `samplers` is parsed here: a chain naming a
+    /// sampler this engine does not have is a refusal, never a chain
+    /// built without it.
+    fn sampling_knobs(&self) -> Result<SamplingKnobs, ApiError> {
+        Ok(SamplingKnobs {
             temperature: self.temperature,
             top_p: self.top_p,
             min_p: self.min_p,
@@ -1212,11 +1505,19 @@ impl ChatCompletionRequest {
             repetition_penalty: self.repetition_penalty,
             presence_penalty: self.presence_penalty,
             frequency_penalty: self.frequency_penalty,
-        }
+            // The OpenAI wire has no field for the penalty window; only
+            // llama.cpp's native `/completion` does. See
+            // `SamplingKnobs::penalty_last_n`.
+            penalty_last_n: None,
+            sampler_order: unsupported_sampling::parse_sampler_order(
+                self.samplers.as_ref(),
+                "/v1/chat/completions",
+            )?,
+        })
     }
 
-    fn sampling_params(&self) -> SamplingParams {
-        self.sampling_knobs().resolve()
+    fn sampling_params(&self) -> Result<SamplingParams, ApiError> {
+        Ok(self.sampling_knobs()?.resolve())
     }
 
     fn stop_sequences(&self) -> Vec<String> {
@@ -1236,6 +1537,53 @@ impl ChatCompletionRequest {
     fn tools_active(&self) -> bool {
         !self.tools.is_empty()
             && !matches!(&self.tool_choice, Some(ToolChoice::Mode(m)) if m == "none")
+    }
+
+    /// Whether this request FORCES a tool call, and which tools it may
+    /// choose between.
+    ///
+    /// `"required"` and a named function are the same question with a
+    /// different answer set, so they are one function here and one
+    /// grammar builder downstream. Everything else -- absent, `"auto"`,
+    /// `"none"` -- forces nothing and returns `None`.
+    ///
+    /// An object `tool_choice` that names nothing is a 400 rather than a
+    /// silent `None`: a client that sent `{"type": "function"}` and got
+    /// an unforced answer cannot tell that apart from a served one.
+    fn forced_tool_choice(&self) -> Result<Option<tool_grammar::Forced<'_>>, ApiError> {
+        match &self.tool_choice {
+            Some(ToolChoice::Mode(m)) if m == "required" => Ok(Some(tool_grammar::Forced::Any)),
+            Some(ToolChoice::Specific(value)) => {
+                // OpenAI's shape is `{"type":"function","function":{"name":…}}`;
+                // several clients send `{"name":…}` flat, and both name
+                // the same thing.
+                let name = value
+                    .get("function")
+                    .and_then(|f| f.get("name"))
+                    .or_else(|| value.get("name"))
+                    .and_then(|n| n.as_str());
+                match name {
+                    Some(name) => Ok(Some(tool_grammar::Forced::Named(name))),
+                    None => Err(invalid_request(
+                        "tool_choice must be \"auto\", \"none\", \"required\", or an object with \
+                         function.name",
+                        "tool_choice",
+                    )),
+                }
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// The offered tools, reduced to what [`tool_grammar`] needs.
+    fn tool_specs(&self) -> Vec<tool_grammar::ToolSpec<'_>> {
+        self.tools
+            .iter()
+            .map(|t| tool_grammar::ToolSpec {
+                name: &t.function.name,
+                parameters: t.function.parameters.as_ref(),
+            })
+            .collect()
     }
 
     /// The `chat_template_kwargs` this request actually renders with.
@@ -1403,56 +1751,73 @@ impl ChatCompletionRequest {
             ));
         }
         unsupported_sampling::refuse_logit_bias(self.logit_bias.as_ref(), "/v1/chat/completions")?;
-        // Both spellings of "constrain the output", resolved by the one
-        // function that knows the rule -- refusing `json_schema` by
-        // name, and compiling a `grammar` here so a grammar that does
-        // not parse is a 400 before any prompt is rendered. The result
-        // is thrown away and recompiled in `generation_params`, which
-        // is the only other caller: a grammar is a small parse, and one
-        // rule in two places would be two rules soon enough.
-        grammar_request::for_request(self.grammar.as_deref(), self.response_format.as_ref())?;
-        if let Some(fmt) = &self.response_format {
-            match fmt.get("type").and_then(|v| v.as_str()) {
-                Some("json_object") => {}
-                // `json_schema` never reaches here: `for_request` above
-                // refuses it with the 501 that names the missing
-                // converter, rather than the 400 this arm would give.
-                Some(other) => {
-                    return Err((
-                        StatusCode::BAD_REQUEST,
-                        Json(serde_json::json!({
-                            "error": {
-                                "message": format!(
-                                    "response_format type {other:?} is not supported (only json_object)"
-                                )
-                            }
-                        })),
-                    ));
-                }
-                None => {
-                    return Err((
-                        StatusCode::BAD_REQUEST,
-                        Json(serde_json::json!({
-                            "error": {
-                                "message": "response_format must include \"type\" (only json_object is supported)"
-                            }
-                        })),
-                    ));
-                }
-            }
-        }
-        match &self.tool_choice {
-            Some(ToolChoice::Mode(m)) if m == "required" => {
-                return Err(unsupported_feature(
-                    "tool_choice=required needs constrained decoding (not implemented)",
+        // Parsed here as well as in `sampling_knobs` so a bad chain is
+        // a 400/501 before any prompt is rendered. The same function
+        // both times, so there is no second opinion to drift from.
+        unsupported_sampling::parse_sampler_order(self.samplers.as_ref(), "/v1/chat/completions")?;
+        // Every spelling of "constrain the output", resolved by the one
+        // function that knows the rule: `grammar` is compiled and a
+        // `response_format` is decided in full -- its schema converted,
+        // its unhonoured members refused by name, its unknown types
+        // refused by the type they named. Done here so all of that is a
+        // 400 before any prompt is rendered. The result is recompiled in
+        // `generation_params`, which is the only other caller: a grammar
+        // is a small parse, and one rule in two places would be two
+        // rules soon enough.
+        //
+        // Kept as ONE call rather than a second `match` on
+        // `response_format` beside it. The one that used to be here
+        // answered `json_schema` with "only json_object is supported"
+        // and had to be kept in step with the module by hand.
+        let stated_grammar =
+            grammar_request::for_request(self.grammar.as_deref(), self.response_format.as_ref())?;
+        // A forced `tool_choice` is served by compiling the offered tools
+        // into a grammar (`tool_grammar`). What can be checked without
+        // knowing which checkpoint is loaded is checked here, so the
+        // caller's own mistakes are refused before a prompt is rendered;
+        // the rest -- whether the served family's wire format has a
+        // grammar at all -- needs the model and is refused in
+        // `generation_params_for_template`.
+        if let Some(forced) = self.forced_tool_choice()? {
+            if self.tools.is_empty() {
+                return Err(invalid_request(
+                    "tool_choice forces a tool call, but no tools were offered",
+                    "tool_choice",
                 ));
             }
-            Some(ToolChoice::Specific(_)) => {
-                return Err(unsupported_feature(
-                    "named tool_choice is not implemented (use auto/none)",
+            if let tool_grammar::Forced::Named(name) = forced {
+                if !self.tools.iter().any(|t| t.function.name == name) {
+                    return Err(invalid_request(
+                        &format!(
+                            "tool_choice names {name:?}, which is not one of the tools offered"
+                        ),
+                        "tool_choice",
+                    ));
+                }
+            }
+            // Two different constraints on one generation. Serving the
+            // one we happen to compile last is not answering either.
+            //
+            // Asked of the RESOLVED grammar rather than of
+            // `self.grammar`: a `response_format` json_schema states one
+            // too, and a check spelled against one field would have let
+            // the other through -- `generation_params_for_template`
+            // overwrites `params.grammar` with the tool-call grammar on
+            // the strength of this refusal having happened.
+            if stated_grammar.is_some() {
+                return Err(invalid_request(
+                    "a forced tool_choice and a \"grammar\" or response_format \"json_schema\" \
+                     are two different constraints on the same generation; send one",
+                    "tool_choice",
                 ));
             }
-            _ => {}
+            if self.json_object_mode() {
+                return Err(invalid_request(
+                    "a forced tool_choice cannot be combined with response_format json_object: \
+                     the tool-call markers are not JSON",
+                    "tool_choice",
+                ));
+            }
         }
         Ok(())
     }
@@ -1486,7 +1851,7 @@ impl ChatCompletionRequest {
     fn generation_params(&self) -> Result<GenerationParams, ApiError> {
         Ok(GenerationParams {
             max_tokens: self.max_tokens,
-            sampling: self.sampling_params(),
+            sampling: self.sampling_params()?,
             seed: self.resolved_seed(),
             stop: self.effective_stop_sequences(),
             // Resolved by `run_generation_emit`, the layer that holds a
@@ -1506,16 +1871,35 @@ impl ChatCompletionRequest {
     }
 
     /// Like [`Self::generation_params`], plus architecture-default stop
-    /// strings (Gemma IT emits `<end_of_turn>` before `<eos>`).
+    /// strings (Gemma IT emits `<end_of_turn>` before `<eos>`) and, for a
+    /// forced `tool_choice`, the grammar that makes it forced.
+    ///
+    /// `served_model` is the name of the checkpoint this generation will
+    /// actually run against -- `active.name()`, the same string
+    /// [`output::OutputPosture::resolve`] reads the answer back with, and
+    /// NOT the `model` field of the request. The two can differ, and a
+    /// grammar built for one wire format while the response is parsed in
+    /// another would force a call this server then cannot read.
     fn generation_params_for_template(
         &self,
         template: &chat_template::PromptTemplate,
+        served_model: &str,
     ) -> Result<GenerationParams, ApiError> {
         let mut params = self.generation_params()?;
         if let Some(stop) = template.end_of_turn() {
             if !params.stop.iter().any(|s| s == stop) {
                 params.stop.push(stop.to_string());
             }
+        }
+        if let Some(forced) = self.forced_tool_choice()? {
+            // `validate_supported_fields` has already refused the
+            // combinations that would put two constraints on one
+            // generation, so there is nothing here to overwrite.
+            params.grammar = Some(tool_grammar::build(
+                forced,
+                &self.tool_specs(),
+                policy::parser::ToolCallFormat::infer(served_model),
+            )?);
         }
         Ok(params)
     }
@@ -1532,18 +1916,27 @@ impl ChatCompletionRequest {
         self.temperature.unwrap_or(0.0) <= 0.0 || self.seed.is_some()
     }
 
-    fn cache_key(&self, prompt: &str) -> CacheKey {
+    /// The cache key for this request under the parameters it will
+    /// actually be generated with.
+    ///
+    /// `params` is taken rather than rebuilt because the RESOLVED
+    /// parameters are the only honest thing to key on: this function
+    /// used to re-state a handful of the request's fields, complete with
+    /// its own copy of every `unwrap_or` default, and then keyed on a
+    /// configuration that was only nearly the one that ran. Three fields
+    /// of that hand-written list were simply missing (#35).
+    ///
+    /// `params` must be the ones from
+    /// [`Self::generation_params_for_template`], not
+    /// [`Self::generation_params`]: the template's end-of-turn stop and
+    /// a forced `tool_choice`'s grammar are added there, and both change
+    /// the answer.
+    fn cache_key(&self, prompt: &str, params: &GenerationParams) -> CacheKey {
         CacheKey {
             model: self.model.clone(),
             prompt: prompt.to_string(),
-            max_tokens: self.max_tokens,
-            // Off the RESOLVED params, not off the request fields: this
-            // used to re-state every `unwrap_or` default a second time,
-            // so a default changed in one place and not the other would
-            // have keyed the cache on a configuration nothing ran.
-            sampling: response_cache::sampling_key(&self.sampling_params()),
+            generation: response_cache::generation_key(params),
             seed: self.seed,
-            stop: self.effective_stop_sequences(),
         }
     }
 
@@ -1684,9 +2077,12 @@ struct ChatCompletionResponse {
     /// contract, but additive and harmless to OpenAI-compatible
     /// clients that ignore unknown fields): "hit" if this exact
     /// cacheable request was already computed, "miss" if this request
-    /// just computed and cached a fresh completion, or "skip" if the
-    /// request wasn't cacheable at all (sampling without a seed --
-    /// see `ChatCompletionRequest::is_cacheable`).
+    /// just computed and cached a fresh completion, or "skip" if
+    /// nothing was stored -- either the request wasn't cacheable at all
+    /// (sampling without a seed -- see
+    /// `ChatCompletionRequest::is_cacheable`) or the answer was not a
+    /// complete one and may not be replayed to anybody (a cancelled
+    /// generation -- see `response_cache::CachedCompletion::cacheable`).
     ferrox_cache: &'static str,
 }
 
@@ -1752,21 +2148,58 @@ async fn health(State(state): State<Arc<AppState>>) -> Response {
             ferrox_api::health::reason::MODEL_NOT_LOADED,
             "No model is loaded. POST /admin/models/load with an id from GET /admin/models.",
         ),
-        Some(active) if active.model.is_synthetic() => ferrox_api::Capability::unavailable(
+        Some(active) if active.is_synthetic() => ferrox_api::Capability::unavailable(
             ferrox_api::health::capability::REAL_WEIGHTS,
             ferrox_api::health::reason::MODEL_NOT_LOADED,
             "Serving synthetic random weights: set FERROX_MODEL_PATH (or -m) to a real \
              checkpoint. Output from this model is noise.",
         ),
+        // An encoder is real weights and is genuinely serving, so this
+        // is `available` -- but a supervisor reading "serving X" and
+        // then getting 501 from /v1/chat/completions learned nothing.
+        // The detail says which endpoint this checkpoint is for.
+        // NOT a hard-coded /v1/embeddings any more: a reranker is an
+        // encoder too, and its pooling_type is RANK, which
+        // /v1/embeddings refuses and /v1/rerank is for. See
+        // `rerank::encoder_endpoints`, which `/v1/models` reads as well
+        // so the two cannot disagree.
+        Some(active) if active.encoder().is_some() => {
+            let endpoints = active
+                .encoder()
+                .map(|e| encoder_endpoints(e))
+                .unwrap_or_default();
+            let served_by = match endpoints.is_empty() {
+                true => "no endpoint in this build serves it".to_string(),
+                false => format!("served by {}", endpoints.join(" and ")),
+            };
+            ferrox_api::Capability::available(
+                ferrox_api::health::capability::REAL_WEIGHTS,
+                format!(
+                    "Serving the real embedding checkpoint '{}'. This is an ENCODER, \
+                     {served_by}; generation endpoints refuse it.",
+                    active.name(),
+                ),
+            )
+        }
         Some(active) => ferrox_api::Capability::available(
             ferrox_api::health::capability::REAL_WEIGHTS,
-            format!("Serving the real checkpoint '{}'.", active.model.name()),
+            format!("Serving the real checkpoint '{}'.", active.name()),
         ),
     });
     capabilities.push(if active.as_ref().is_some_and(|a| a.batcher.is_some()) {
         ferrox_api::Capability::available(
             ferrox_api::health::capability::CONTINUOUS_BATCHING,
-            "Concurrent requests share one batched decode step.",
+            if state.continuous_batching_enabled && continuous_batching_env().is_none() {
+                "On by default on Metal. Concurrent requests share one batched decode worker."
+            } else {
+                "Concurrent requests share one batched decode step."
+            },
+        )
+    } else if state.metal_private_decode_gate.is_some() {
+        ferrox_api::Capability::unavailable(
+            ferrox_api::health::capability::CONTINUOUS_BATCHING,
+            ferrox_api::health::reason::DISABLED,
+            "Off; private Metal decodes serialize (one at a time). Set FERROX_CONTINUOUS_BATCHING=1 or --cont-batching for parallel serving.",
         )
     } else {
         ferrox_api::Capability::unavailable(
@@ -1816,9 +2249,9 @@ async fn health(State(state): State<Arc<AppState>>) -> Response {
         model: active
             .as_deref()
             .map(|active| ferrox_api::health::ModelSummary {
-                id: active.model.name().to_string(),
-                tokenizer: active.model.tokenizer_kind().to_string(),
-                synthetic_weights: active.model.is_synthetic(),
+                id: active.name().to_string(),
+                tokenizer: active.tokenizer_kind().to_string(),
+                synthetic_weights: active.is_synthetic(),
             }),
         capabilities,
         version: env!("CARGO_PKG_VERSION").to_string(),
@@ -1846,27 +2279,43 @@ async fn list_models(State(state): State<Arc<AppState>>) -> Json<serde_json::Val
         return Json(serde_json::json!({ "object": "list", "data": [] }));
     };
     let mut model_entry = serde_json::json!({
-        "id": active.model.name(),
+        "id": active.name(),
         "object": "model",
-        "ferrox_synthetic_weights": active.model.is_synthetic(),
-        "ferrox_tokenizer": active.model.tokenizer_kind(),
+        "ferrox_synthetic_weights": active.is_synthetic(),
+        "ferrox_tokenizer": active.tokenizer_kind(),
     });
+    // An encoder is listed -- it IS what is loaded, and a client asking
+    // "what can I use" must be told about it -- but it is listed as
+    // what it is. `ferrox_endpoints` is the machine-readable half of
+    // the 501 a generation route would answer with: a client that reads
+    // it never has to send the request to find out.
+    if let Some(encoder) = active.encoder() {
+        model_entry["ferrox_model_kind"] = serde_json::json!("embedding");
+        model_entry["ferrox_endpoints"] = serde_json::json!(encoder_endpoints(encoder));
+        model_entry["ferrox_n_embd"] = serde_json::json!(encoder.n_embd());
+        model_entry["ferrox_pooling"] = serde_json::json!(encoder.pooling_type().name());
+        model_entry["ferrox_context_length"] = serde_json::json!(encoder.n_ctx_train());
+    }
     // Which reasoning gears this checkpoint really has, learned by
     // probing its own template at load. A checkpoint that says nothing
     // about thinking carries NEITHER field rather than an empty list:
     // an empty list reads as "asked, and it has no gears", which is a
-    // different claim from "this is not a reasoning model".
-    let parser_configured =
-        crate::policy::parser::ReasoningFormat::infer(active.model.name()).is_some();
-    let gears = active.model.chat_template().think_gears(parser_configured);
-    if !gears.is_empty() {
-        model_entry["supported_reasoning_efforts"] = serde_json::json!(gears.supported);
-        if let Some(default) = &gears.default {
-            model_entry["default_reasoning_effort"] = serde_json::json!(default);
+    // different claim from "this is not a reasoning model". An encoder
+    // is not asked at all, for the same reason -- it has no template to
+    // probe, and `ThinkGears::default()` would be an invented answer.
+    if let Some(model) = active.generative_opt() {
+        let parser_configured =
+            crate::policy::parser::ReasoningFormat::infer(active.name()).is_some();
+        let gears = model.chat_template().think_gears(parser_configured);
+        if !gears.is_empty() {
+            model_entry["supported_reasoning_efforts"] = serde_json::json!(gears.supported);
+            if let Some(default) = &gears.default {
+                model_entry["default_reasoning_effort"] = serde_json::json!(default);
+            }
+            // What to SEND for each gear, so a client selects one without
+            // knowing that "off" is two booleans and "high" is a string.
+            model_entry["reasoning_effort_kwargs"] = serde_json::json!(gears.kwargs);
         }
-        // What to SEND for each gear, so a client selects one without
-        // knowing that "off" is two booleans and "high" is a string.
-        model_entry["reasoning_effort_kwargs"] = serde_json::json!(gears.kwargs);
     }
     if let Some(mcp) = &state.mcp {
         model_entry["ferrox_mcp"] = mcp.models_metadata();
@@ -1895,7 +2344,7 @@ async fn serving_stats(State(state): State<Arc<AppState>>) -> Json<serde_json::V
     let mut serving = state.serving.lock().unwrap_or_else(|p| p.into_inner());
     let active = state.active();
     Json(serde_json::json!({
-        "model": active.as_ref().map(|a| a.model.name()),
+        "model": active.as_ref().map(|a| a.name()),
         "state": state
             .maintenance
             .lock()
@@ -2019,7 +2468,7 @@ async fn metrics(State(state): State<Arc<AppState>>) -> Response {
         // "serving noise" rather than "serving nothing".
         active
             .as_ref()
-            .map(|a| a.model.is_synthetic() as u8)
+            .map(|a| a.is_synthetic() as u8)
             .unwrap_or(0),
     );
 
@@ -2028,7 +2477,7 @@ async fn metrics(State(state): State<Arc<AppState>>) -> Response {
     // (FERROX_EXPERT_CACHE_BYTES).
     let body = match active
         .as_ref()
-        .and_then(|a| a.model.expert_store_stats())
+        .and_then(|a| a.expert_store_stats())
     {
         Some(es) => format!(
             "{body}\
@@ -2229,6 +2678,7 @@ fn run_generation_emit(
     prefix_cache: Option<&Mutex<PrefixCache>>,
     continuous_batcher: Option<&serving::batch::ContinuousBatcher>,
     ceiling: Option<&budget::ContextCeiling>,
+    metal_private_decode_gate: Option<&std::sync::Mutex<()>>,
     mut emit: impl FnMut(&str),
 ) -> Result<(FinishReason, generate::Usage, String), generate::DecodeError> {
     let synthetic = model.is_synthetic();
@@ -2245,14 +2695,29 @@ fn run_generation_emit(
         resolved
     };
     let used_batcher = matches!((model, continuous_batcher), (Model::Gguf(_), Some(_)));
+    let _metal_private_guard =
+        acquire_metal_private_decode_gate(metal_private_decode_gate, used_batcher);
     let (finish, usage) = match model {
         Model::Gguf(m) => {
             if let Some(batcher) = continuous_batcher {
                 let mut tokens = m.tokenizer.encode(prompt);
                 ferrox_models::tokenizer::prepend_bos(&mut tokens, m.bos_id);
-                let (finish, _generated_ids, text, usage) =
-                    batcher.generate(tokens, params.clone(), m.stop_tokens.clone())?;
-                if !text.is_empty() {
+                let (finish, _generated_ids, text, usage) = if synthetic {
+                    batcher.generate(tokens, params.clone(), m.stop_tokens.clone())?
+                } else {
+                    batcher.generate_streaming(
+                        tokens,
+                        params.clone(),
+                        m.stop_tokens.clone(),
+                        Some(|chunk: &str| {
+                            if !chunk.is_empty() {
+                                chunks.push(chunk.to_string());
+                                emit(chunk);
+                            }
+                        }),
+                    )?
+                };
+                if !text.is_empty() && chunks.is_empty() {
                     chunks.push(text);
                 }
                 (finish, usage)
@@ -2342,7 +2807,7 @@ fn run_generation_emit(
              to serve a real model. Decoded ids -> {full:?}]"
         );
         emit(&full);
-    } else if used_batcher && !full.is_empty() {
+    } else if used_batcher && !full.is_empty() && chunks.is_empty() {
         emit(&full);
     }
 
@@ -2362,6 +2827,7 @@ pub(crate) fn run_generation(
     prefix_cache: Option<&Mutex<PrefixCache>>,
     continuous_batcher: Option<&serving::batch::ContinuousBatcher>,
     ceiling: Option<&budget::ContextCeiling>,
+    metal_private_decode_gate: Option<&std::sync::Mutex<()>>,
 ) -> Result<(Vec<String>, FinishReason, generate::Usage), generate::DecodeError> {
     let (finish, usage, full) = run_generation_emit(
         model,
@@ -2372,6 +2838,7 @@ pub(crate) fn run_generation(
         prefix_cache,
         continuous_batcher,
         ceiling,
+        metal_private_decode_gate,
         |_| {},
     )?;
     Ok((
@@ -2702,10 +3169,18 @@ async fn chat_completions_full(
     // halfway through (see `AppState::active`).
     let active = state.require_active()?;
     let history = resolve_history(&state, &req);
-    let template = active.model.chat_template();
+    let template = active.generative()?.chat_template();
     let kwargs = req.resolve_template_kwargs(&template);
     let prompt = prompt_from_messages(&history, &template, &req.tools, kwargs)?;
-    let key = req.is_cacheable().then(|| req.cache_key(&prompt));
+    // Resolved BEFORE the lookup, because the constraint is part of the
+    // key: a grammar, JSON mode and `ignore_eos` all change the answer
+    // and none of them changes the prompt, so a cache consulted first
+    // would answer a constrained request with an unconstrained
+    // completion (#35). It also means an unparseable grammar is a 400
+    // for the second caller too, rather than a 200 carrying prose
+    // generated under no grammar at all.
+    let params = req.generation_params_for_template(&template, active.name())?;
+    let key = req.is_cacheable().then(|| req.cache_key(&prompt, &params));
 
     let (completion, cache_status) = if let Some(cached) = key
         .as_ref()
@@ -2714,41 +3189,36 @@ async fn chat_completions_full(
         tracing::debug!("cache hit for key {}", key.as_ref().unwrap().digest());
         (cached, "hit")
     } else {
-        let model = Arc::clone(&active.model);
-        let kv_pool = state.kv_pool.clone();
-        let paged_kv = state.paged_kv.clone();
-        let prefix_cache = state.prefix_cache.clone();
-        let batcher = active.batcher.clone();
-        let ceiling = active.ceiling.clone();
-        let params = req.generation_params_for_template(&template)?;
-        let prompt_for_task = prompt.clone();
-        let (chunks, finish, usage) = tokio::task::spawn_blocking(move || {
-            run_generation(
-                &model,
-                &prompt_for_task,
-                &params,
-                kv_pool.as_ref(),
-                paged_kv.as_ref(),
-                prefix_cache.as_deref(),
-                batcher.as_ref(),
-                ceiling.as_deref(),
-            )
-        })
-        .await
-        .map_err(join_error_response)?
-        .map_err(decode_error_response)?;
+        let (chunks, finish, usage) = decode_task::buffered(
+            decode_task::DecodeHandles::take(&state, &active)?,
+            prompt.clone(),
+            params,
+        )
+        .await?;
 
         let completion = response_cache::CachedCompletion {
             content: chunks.concat(),
             finish,
             usage,
         };
-        let cache_status = if let Some(key) = key {
-            tracing::debug!("cache miss for key {}", key.digest());
-            lock_cache(&state.response_cache).put(key, completion.clone());
-            "miss"
-        } else {
-            "skip"
+        // A cacheable KEY is not on its own permission to store an
+        // answer: `cacheable` refuses a generation that did not run to
+        // its own end, and is the only way to build the value `put`
+        // takes, so a cancelled partial cannot become the cached answer
+        // for the next caller (#57).
+        let cache_status = match key {
+            // Nothing is cloned unless there is a key to store it
+            // under: the common path here is a sampled request, which
+            // has none.
+            Some(key) => match completion.clone().cacheable() {
+                Some(cacheable) => {
+                    tracing::debug!("cache miss for key {}", key.digest());
+                    lock_cache(&state.response_cache).put(key, cacheable);
+                    "miss"
+                }
+                None => "skip",
+            },
+            None => "skip",
         };
         (completion, cache_status)
     };
@@ -2777,7 +3247,7 @@ async fn chat_completions_full(
     let (message, finish_reason) = build_response_message(
         content,
         if tools_active { &req.tools } else { &[] },
-        output::OutputPosture::resolve(active.model.name(), &prompt),
+        output::OutputPosture::resolve(active.name(), &prompt),
         completion.finish.as_str(),
     );
 
@@ -2786,7 +3256,7 @@ async fn chat_completions_full(
         route: ferrox_api::routes::V1_CHAT_COMPLETIONS,
         // The handle this request decoded against, not `req.model`: a
         // swap mid-flight does not change which weights answered.
-        model: Some(active.model.name().to_string()),
+        model: Some(active.name().to_string()),
         status: 200,
         stream: false,
         duration_ms: started.elapsed().as_millis() as u64,
@@ -2823,24 +3293,25 @@ async fn chat_completions_stream(
     // splice two checkpoints into one completion.
     let active = state.require_active()?;
     let history = resolve_history(&state, &req);
-    let template = active.model.chat_template();
+    let template = active.generative()?.chat_template();
     let kwargs = req.resolve_template_kwargs(&template);
     let prompt = prompt_from_messages(&history, &template, &req.tools, kwargs)?;
     let model_name = req.model.clone();
     let session_id = req.session_id.clone();
     let sessions = state.sessions.clone();
 
-    let model = Arc::clone(&active.model);
+    let model = Arc::clone(active.generative()?);
     let kv_pool = state.kv_pool.clone();
     let paged_kv = state.paged_kv.clone();
     let prefix_cache = state.prefix_cache.clone();
     let batcher = active.batcher.clone();
     let ceiling = active.ceiling.clone();
-    let mut params = req.generation_params_for_template(&template)?;
+    let metal_private_decode_gate = state.metal_private_decode_gate.clone();
+    let mut params = req.generation_params_for_template(&template, active.name())?;
     let stats_state = Arc::clone(&state);
     // Read now, off the handle this stream will decode against. Read
     // later it would name whatever a swap had made current by then.
-    let served_model = active.model.name().to_string();
+    let served_model = active.name().to_string();
     // How to read this stream, fixed before the first token: the family
     // from the served checkpoint, and whether the prompt that was
     // actually rendered left the model inside a reasoning block.
@@ -2868,7 +3339,7 @@ async fn chat_completions_stream(
     // whole text. `crate::policy::parser::ToolCallParser` streams prefix-stable
     // argument fragments, so that reason is gone, and a coding agent
     // now watches an argument arrive instead of waiting for it.
-    let overlap = batcher.is_none();
+    let overlap = true;
 
     // Opt-in replay. Registering a buffer is also what decides whether a
     // dropped socket cancels this generation -- see `resume`'s module
@@ -2946,6 +3417,7 @@ async fn chat_completions_stream(
             prefix_cache.as_deref(),
             batcher.as_ref(),
             ceiling.as_deref(),
+            metal_private_decode_gate.as_deref(),
             |chunk| {
                 if !overlap || chunk.is_empty() {
                     return;
@@ -3326,7 +3798,7 @@ async fn cancel_generation(
 /// active model: the model itself, its optional continuous-batching
 /// worker, and the context ceiling both decode paths admit on.
 type Activated = (
-    Model,
+    Loaded,
     Option<serving::batch::ContinuousBatcher>,
     Option<Arc<budget::ContextCeiling>>,
 );
@@ -3363,7 +3835,7 @@ fn price_batcher_config(path: Option<&str>) -> serving::batch::BatcherConfig {
     // the *device* also holds an f16 copy. Budgeting the host store is
     // the conservative reading: it over-charges KV and therefore
     // under-states the context that fits.
-    let priced = budget::price_gguf(path, ferrox_models::KvElem::F32, 1, 1);
+    let priced = budget::price_gguf(path, ferrox_models::KvElem::F32, 1);
     let Some((priced, gguf_ctx, source)) = priced else {
         return batcher;
     };
@@ -3426,7 +3898,7 @@ pub(crate) fn activate_loaded_model(
             // layer really does need only `window + 1 - 1` positions
             // live. `chunk = 1` here is the truth, not a simplification.
             let shape =
-                ferrox_models::KvShape::from_config(&decoder.config, ferrox_models::KvElem::F32, 1);
+                ferrox_models::KvShape::from_config(&decoder.config, ferrox_models::KvElem::F32);
             let ceiling = Arc::new(budget::ContextCeiling::new(config.max_context, shape));
             let batcher = if enable_continuous_batching {
                 tracing::info!(
@@ -3434,7 +3906,7 @@ pub(crate) fn activate_loaded_model(
                      (stop sequences use the same pending-buffer trim as the private generate loop)"
                 );
                 let tok = Arc::clone(&tokenizer);
-                let decode = Arc::new(move |ids: &[usize]| tok.decode(ids));
+                let decode = Arc::new(move |ids: &[usize]| tok.decode_bytes(ids));
                 Some(serving::batch::ContinuousBatcher::spawn_with_ceiling(
                     Arc::clone(&decoder),
                     decode,
@@ -3446,69 +3918,148 @@ pub(crate) fn activate_loaded_model(
                 None
             };
             (
-                Model::Gguf(GgufModel {
+                Loaded::Generative(Arc::new(Model::Gguf(GgufModel {
                     decoder,
                     tokenizer,
                     stop_tokens: g.stop_tokens,
                     bos_id: g.bos_id,
                     is_synthetic: g.is_synthetic,
                     chat_template: g.chat_template,
-                }),
+                }))),
                 batcher,
                 Some(ceiling),
             )
         }
         model::LoadedModel::Kimi(k) => (
-            Model::Kimi(KimiModel {
+            Loaded::Generative(Arc::new(Model::Kimi(KimiModel {
                 engine: k.engine,
                 tokenizer: k.tokenizer,
                 stop_tokens: k.stop_tokens,
                 chat_template: k.chat_template,
-            }),
+            }))),
             None,
             None,
         ),
         model::LoadedModel::Mla(m) => (
-            Model::Mla(MlaModel {
+            Loaded::Generative(Arc::new(Model::Mla(MlaModel {
                 engine: m.engine,
                 tokenizer: m.tokenizer,
                 stop_tokens: m.stop_tokens,
                 bos_id: m.bos_id,
                 name: m.name,
                 chat_template: m.chat_template,
-            }),
+            }))),
             None,
             None,
         ),
         model::LoadedModel::Gemma4(m) => (
-            Model::Gemma4(Gemma4Model {
+            Loaded::Generative(Arc::new(Model::Gemma4(Gemma4Model {
                 engine: m.engine,
                 tokenizer: m.tokenizer,
                 stop_tokens: m.stop_tokens,
                 bos_id: m.bos_id,
                 name: m.name,
                 chat_template: m.chat_template,
-            }),
+            }))),
             None,
             None,
         ),
         model::LoadedModel::Glm52(g) => (
-            Model::Glm52(Glm52Model {
+            Loaded::Generative(Arc::new(Model::Glm52(Glm52Model {
                 engine: g.engine,
                 tokenizer: g.tokenizer,
                 stop_tokens: g.stop_tokens,
                 bos_id: g.bos_id,
                 name: g.name,
                 chat_template: g.chat_template,
-            }),
+            }))),
             None,
             None,
         ),
+        // No batcher and no ceiling, and neither is an omission: an
+        // encoder has no decode step to share between requests and no
+        // KV cache to price a context against. Handing it either would
+        // be pricing a cost it does not have.
+        model::LoadedModel::Encoder(e) => (Loaded::Encoder(e), None, None),
+    }
+}
+
+/// The models a server starts with: the generation model, and the
+/// embedding model when `FERROX_EMBEDDING_MODEL_PATH` names one.
+///
+/// One struct rather than two parameters because they are chosen
+/// together at startup and are the only two things `build_app_state`
+/// takes that are a *model*.
+struct StartupModels {
+    loaded: model::LoadedModel,
+    embedding: Option<Arc<ferrox_models::EmbeddingModel>>,
+}
+
+fn continuous_batching_env() -> Option<bool> {
+    match std::env::var("FERROX_CONTINUOUS_BATCHING")
+        .ok()
+        .map(|v| v.trim().to_ascii_lowercase())
+        .as_deref()
+    {
+        None => None,
+        Some("1" | "true" | "yes" | "on") => Some(true),
+        Some("0" | "false" | "no" | "off") => Some(false),
+        _ => None,
+    }
+}
+
+fn metal_private_decode_active() -> bool {
+    #[cfg(feature = "metal")]
+    {
+        BUILT_WITH_METAL
+            && ferrox_metal::attn::metal_attn_enabled()
+            && std::env::var("FERROX_METAL").ok().as_deref() != Some("0")
+    }
+    #[cfg(not(feature = "metal"))]
+    {
+        false
+    }
+}
+
+fn continuous_batching_compatible(
+    loaded: &model::LoadedModel,
+    kv_pool: &Option<generate::KvPoolConfig>,
+    prefix_cache: &Option<Arc<Mutex<PrefixCache>>>,
+    paged_kv: &Option<generate::PagedKvConfig>,
+) -> bool {
+    matches!(loaded, model::LoadedModel::Gguf(_))
+        && (paged_kv.is_some() || (kv_pool.is_none() && prefix_cache.is_none()))
+}
+
+fn resolve_continuous_batching_enabled(
+    loaded: &model::LoadedModel,
+    kv_pool: &Option<generate::KvPoolConfig>,
+    prefix_cache: &Option<Arc<Mutex<PrefixCache>>>,
+    paged_kv: &Option<generate::PagedKvConfig>,
+) -> bool {
+    if !continuous_batching_compatible(loaded, kv_pool, prefix_cache, paged_kv) {
+        return false;
+    }
+    match continuous_batching_env() {
+        Some(true) => true,
+        Some(false) => false,
+        None => metal_private_decode_active(),
+    }
+}
+
+fn acquire_metal_private_decode_gate(
+    gate: Option<&std::sync::Mutex<()>>,
+    used_batcher: bool,
+) -> Option<std::sync::MutexGuard<'_, ()>> {
+    if used_batcher {
+        None
+    } else {
+        gate.map(|g| g.lock().unwrap_or_else(|p| p.into_inner()))
     }
 }
 
 fn build_app_state(
-    loaded: model::LoadedModel,
+    models: StartupModels,
     kv_pool: Option<generate::KvPoolConfig>,
     paged_kv: Option<generate::PagedKvConfig>,
     prefix_cache: Option<Arc<Mutex<PrefixCache>>>,
@@ -3516,7 +4067,8 @@ fn build_app_state(
     mcp: Option<mcp::LoadedMcpConfig>,
     detection: Arc<health::Detection>,
 ) -> AppState {
-    let (model, batcher, ceiling) = activate_loaded_model(
+    let StartupModels { loaded, embedding } = models;
+    let (loaded, batcher, ceiling) = activate_loaded_model(
         loaded,
         enable_continuous_batching,
         std::env::var("FERROX_MODEL_PATH").ok().as_deref(),
@@ -3528,10 +4080,21 @@ fn build_app_state(
     // in which case `/admin/models` reports nothing as active rather
     // than inventing an id no `load` request could name.
     let id = startup_model_id();
+    let metal_private_decode_gate = if enable_continuous_batching || !metal_private_decode_active()
+    {
+        None
+    } else {
+        tracing::info!(
+            "Metal private-loop decode will serialize concurrent requests until \
+             continuous batching is enabled (FERROX_CONTINUOUS_BATCHING=1 or --cont-batching)"
+        );
+        Some(Arc::new(std::sync::Mutex::new(())))
+    };
     AppState {
+        embedding,
         active: std::sync::RwLock::new(Some(Arc::new(ActiveModel {
             id,
-            model: Arc::new(model),
+            loaded,
             batcher,
             ceiling,
         }))),
@@ -3553,6 +4116,7 @@ fn build_app_state(
         detection,
         mcp,
         continuous_batching_enabled: enable_continuous_batching,
+        metal_private_decode_gate,
         loading_model: Mutex::new(None),
         last_load_error: Mutex::new(None),
         serving: Mutex::new(crate::stats::ServingStats::default()),
@@ -3560,6 +4124,30 @@ fn build_app_state(
         footprint: Mutex::new(crate::policy::footprint::ProbeCache::new(FOOTPRINT_TTL_MS)),
         started_unix: unix_now(),
     }
+}
+
+/// Builds the `/v1/embeddings` encoder from
+/// `FERROX_EMBEDDING_MODEL_PATH`, or `None` when the variable is unset.
+///
+/// A failure here is fatal rather than deferred: a server that starts
+/// with a misspelt path and then answers embedding requests out of the
+/// *decoder* would be handing back vectors from the wrong model with
+/// nothing in the response saying so.
+fn load_embedding_model() -> anyhow::Result<Option<Arc<ferrox_models::EmbeddingModel>>> {
+    let Ok(path) = std::env::var("FERROX_EMBEDDING_MODEL_PATH") else {
+        return Ok(None);
+    };
+    let model = ferrox_models::EmbeddingModel::from_gguf_path(&path)
+        .map_err(|e| anyhow::anyhow!("FERROX_EMBEDDING_MODEL_PATH={path}: {e}"))?;
+    tracing::info!(
+        "loaded embedding model '{}' ({}, {} dims, pooling {}, max {} tokens)",
+        model.name(),
+        model.architecture(),
+        model.n_embd(),
+        model.pooling_type().name(),
+        model.n_ctx_train(),
+    );
+    Ok(Some(Arc::new(model)))
 }
 
 /// Seconds since the epoch, or zero on a machine whose clock is set
@@ -3802,6 +4390,14 @@ async fn run(mcp_config_path: Option<PathBuf>, exit_on_stdin_close: bool) -> any
         anyhow::bail!(msg);
     }
 
+    // Loaded before the generation model, so a bad path fails the
+    // start rather than the first `/v1/embeddings` request. This is the
+    // SIDE-CAR: a second checkpoint beside a generative one. An encoder
+    // at `FERROX_MODEL_PATH` needs none of this -- it goes through
+    // `model::load()` below like any other checkpoint and becomes the
+    // active model.
+    let embedding_model = load_embedding_model()?;
+
     let mut loaded = model::load()?;
     match &loaded {
         model::LoadedModel::Gguf(g) => tracing::info!(
@@ -3829,6 +4425,9 @@ async fn run(mcp_config_path: Option<PathBuf>, exit_on_stdin_close: bool) -> any
             g.name,
             g.tokenizer.kind()
         ),
+        // `model::load_encoder_checkpoint` has already logged the
+        // dimensions, the pooling rule and which endpoint serves it.
+        model::LoadedModel::Encoder(_) => {}
     }
     // Opt-in VRAM budget for GPU-resident MoE experts. When unset but
     // Metal is active, default to a large budget so routed experts that
@@ -3882,6 +4481,12 @@ async fn run(mcp_config_path: Option<PathBuf>, exit_on_stdin_close: bool) -> any
                 tracing::warn!(
                     "FERROX_GPU_VRAM_BUDGET_BYTES is set but the loaded model is GLM-5.2 DSA -- \
                      GPU expert placement not wired yet; ignoring"
+                );
+            }
+            model::LoadedModel::Encoder(_) => {
+                tracing::warn!(
+                    "FERROX_GPU_VRAM_BUDGET_BYTES is set but the loaded model is an encoder -- \
+                     it has no routed experts to place; ignoring"
                 );
             }
         }
@@ -3995,7 +4600,8 @@ async fn run(mcp_config_path: Option<PathBuf>, exit_on_stdin_close: bool) -> any
                 model::LoadedModel::Kimi(_)
                 | model::LoadedModel::Mla(_)
                 | model::LoadedModel::Gemma4(_)
-                | model::LoadedModel::Glm52(_) => {
+                | model::LoadedModel::Glm52(_)
+                | model::LoadedModel::Encoder(_) => {
                     panic!(
                         "FERROX_KV_BYTE_BUDGET requires a GGUF decoder model \
                          (set FERROX_MODEL_PATH to a generic-decoder .gguf file)"
@@ -4218,21 +4824,16 @@ async fn run(mcp_config_path: Option<PathBuf>, exit_on_stdin_close: bool) -> any
              ferrox_models::engine's module docs"
         );
     }
-    let enable_cb = std::env::var("FERROX_CONTINUOUS_BATCHING")
-        .map(|v| v == "1")
-        .unwrap_or(false)
-        // Paged KV is what removed the old exclusivity: a batched row
-        // now holds a `PagedLease`, which is pool-accounted by
-        // construction and shares a prefix through the radix tree, so
-        // the two things the batcher could not previously do it now
-        // gets for free. The CONTIGUOUS pool and prefix cache still
-        // keep the private path, because a batched row has no way to
-        // restore a `Vec<KvCache>` snapshot.
-        && (paged_kv.is_some() || (kv_pool.is_none() && prefix_cache.is_none()))
-        && matches!(loaded, model::LoadedModel::Gguf(_));
-    if std::env::var("FERROX_CONTINUOUS_BATCHING")
-        .map(|v| v == "1")
-        .unwrap_or(false)
+    let enable_cb =
+        resolve_continuous_batching_enabled(&loaded, &kv_pool, &prefix_cache, &paged_kv);
+    if enable_cb && continuous_batching_env().is_none() && metal_private_decode_active() {
+        tracing::info!(
+            "continuous batching enabled by default on Metal for safe parallel serving \
+             (set FERROX_CONTINUOUS_BATCHING=0 or --no-cont-batching to use the private path)"
+        );
+    }
+    if continuous_batching_env() == Some(true)
+        && !continuous_batching_compatible(&loaded, &kv_pool, &prefix_cache, &paged_kv)
         && (kv_pool.is_some() || prefix_cache.is_some())
     {
         tracing::warn!(
@@ -4276,7 +4877,10 @@ async fn run(mcp_config_path: Option<PathBuf>, exit_on_stdin_close: bool) -> any
     let detection = health::Detection::spawn();
 
     let state = Arc::new(build_app_state(
-        loaded,
+        StartupModels {
+            loaded,
+            embedding: embedding_model,
+        },
         kv_pool,
         paged_kv,
         prefix_cache,
@@ -4332,9 +4936,27 @@ async fn run(mcp_config_path: Option<PathBuf>, exit_on_stdin_close: bool) -> any
             post(anthropic::count_tokens),
         )
         .route(routes::V1_COMPLETIONS, post(openai_extra::completions))
+        // llama.cpp's NATIVE completion endpoint, under both spellings
+        // it mounts. Not an alias of the line above: different request
+        // fields, a different response object, and a stream that ends
+        // without `[DONE]`. See `crate::completion`.
+        .route(routes::COMPLETION, post(completion::completion))
+        .route(routes::COMPLETIONS, post(completion::completion))
         .route(routes::V1_TOKENIZE, post(openai_extra::tokenize))
         .route(routes::V1_DETOKENIZE, post(openai_extra::detokenize))
-        .route(routes::V1_EMBEDDINGS, post(openai_extra::embeddings))
+        // llama.cpp's unprefixed spelling of the same two, on the SAME
+        // handlers -- not copies. The `/v1/` prefix was ferrox's
+        // invention (OpenAI has no tokenize endpoint), so every
+        // llama.cpp client was getting a 404 that named nothing. Behind
+        // the key with their twins: they read the loaded vocabulary.
+        .route(routes::TOKENIZE, post(openai_extra::tokenize))
+        .route(routes::DETOKENIZE, post(openai_extra::detokenize))
+        .route(routes::V1_EMBEDDINGS, post(embeddings::embeddings))
+        // Cross-encoder reranking, under the `/v1` spelling Cohere and
+        // Jina clients use and the unprefixed one llama.cpp mounts.
+        // Same handler: this really is an alias, not a second dialect.
+        .route(routes::V1_RERANK, post(rerank::rerank))
+        .route(routes::RERANK, post(rerank::rerank))
         .route(routes::CACHE_STATS, get(cache_stats))
         .route(routes::METRICS, get(metrics))
         // The control surface. Registered inside `protected` on
@@ -4542,6 +5164,16 @@ mod tests {
     }
 
     #[test]
+    fn parallel_flag_parses_and_rewrites_np() {
+        let argv = ["ferrox-server", "-np", "4"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        let args = ServerArgs::try_parse_from(rewrite_llama_style_argv(argv)).unwrap();
+        assert_eq!(args.parallel, Some(4));
+    }
+
+    #[test]
     fn stdin_close_exit_is_opt_in() {
         // Default off: a server whose stdin is /dev/null (systemd, cron,
         // nohup) would otherwise exit the instant it started.
@@ -4601,12 +5233,22 @@ mod tests {
     /// that render chat templates (ASCII role names) do not spuriously
     /// reject their own prompt prefixes.
     fn test_model_full_byte_vocab() -> Model {
+        test_model_full_byte_vocab_with_eos(None)
+    }
+
+    /// [`test_model_full_byte_vocab`] with an end-of-generation id, so a
+    /// test can tell a turn the MODEL ended from one that merely ran out
+    /// of budget -- which is the only way `ignore_eos` is observable.
+    ///
+    /// Parameterised rather than copied: a second `Model` literal here
+    /// is one more place a field has to be remembered.
+    fn test_model_full_byte_vocab_with_eos(eos: Option<usize>) -> Model {
         let mut cfg = test_dense_fixture();
         cfg.vocab_size = 256;
         Model::Gguf(GgufModel {
             decoder: Arc::new(Decoder::new_random_small(cfg, 2, 256)),
             tokenizer: Arc::new(ServerTokenizer::Byte),
-            stop_tokens: StopTokens::default(),
+            stop_tokens: StopTokens::from_eos(eos),
             bos_id: None,
             is_synthetic: true,
             chat_template: chat_template::PromptTemplate::plain(),
@@ -4618,10 +5260,11 @@ mod tests {
     /// builds one.
     fn test_state(model: Model, response_cache: ResponseCache) -> AppState {
         AppState {
+            embedding: None,
             paged_kv: None,
             active: std::sync::RwLock::new(Some(Arc::new(ActiveModel {
                 id: None,
-                model: Arc::new(model),
+                loaded: Loaded::Generative(Arc::new(model)),
                 batcher: None,
                 ceiling: None,
             }))),
@@ -4642,6 +5285,7 @@ mod tests {
             detection: Arc::new(health::Detection::ready(health::probe_backends())),
             mcp: None,
             continuous_batching_enabled: false,
+            metal_private_decode_gate: None,
             loading_model: Mutex::new(None),
             last_load_error: Mutex::new(None),
             serving: Mutex::new(crate::stats::ServingStats::default()),
@@ -4703,8 +5347,22 @@ mod tests {
             )
             .route("/v1/tokenize", post(openai_extra::tokenize))
             .route("/v1/detokenize", post(openai_extra::detokenize))
-            .route("/v1/embeddings", post(openai_extra::embeddings))
+            // llama.cpp's unprefixed spelling, mounted here too so the
+            // tests below reach the alias through a real router rather
+            // than by calling the handler function directly.
+            .route(ferrox_api::routes::TOKENIZE, post(openai_extra::tokenize))
+            .route(
+                ferrox_api::routes::DETOKENIZE,
+                post(openai_extra::detokenize),
+            )
+            .route("/v1/embeddings", post(embeddings::embeddings))
             .route("/v1/completions", post(openai_extra::completions))
+            // llama.cpp's native endpoint, under both of its spellings.
+            .route(ferrox_api::routes::COMPLETION, post(completion::completion))
+            .route(
+                ferrox_api::routes::COMPLETIONS,
+                post(completion::completion),
+            )
             .route(
                 ferrox_api::routes::ADMIN_MODELS_UNLOAD,
                 post(admin::unload_model),
@@ -4860,7 +5518,7 @@ mod tests {
     fn active_model(state: &AppState, name: &'static str) -> Arc<ActiveModel> {
         Arc::new(ActiveModel {
             id: Some(name.to_string()),
-            model: Arc::new(named_test_model(name, 256)),
+            loaded: Loaded::Generative(Arc::new(named_test_model(name, 256))),
             batcher: None,
             ceiling: None,
         })
@@ -4893,18 +5551,19 @@ mod tests {
         // A request that has begun: it has cloned the handle and is
         // about to decode against it.
         let in_flight = state.active().expect("a model is loaded");
-        assert_eq!(in_flight.model.name(), "model-a");
+        assert_eq!(in_flight.name(), "model-a");
 
         active_model(&state, "model-b");
 
         // The swap is visible to anything that asks *now*...
-        assert_eq!(state.active().unwrap().model.name(), "model-b");
+        assert_eq!(state.active().unwrap().name(), "model-b");
         // ...and completely invisible to the request already running.
-        assert_eq!(in_flight.model.name(), "model-a");
+        assert_eq!(in_flight.name(), "model-a");
         let (_chunks, finish, _usage) = run_generation(
-            &in_flight.model,
+            in_flight.generative().unwrap(),
             "hi",
             &greedy_params(3),
+            None,
             None,
             None,
             None,
@@ -4926,12 +5585,12 @@ mod tests {
             ResponseCache::new(4, Duration::from_secs(60)),
         );
         let in_flight = state.active().expect("a model is loaded");
-        let weights = Arc::clone(&in_flight.model);
+        let weights = Arc::clone(in_flight.generative().unwrap());
         assert!(Arc::strong_count(&weights) >= 2);
 
         let previous = state.swap_active(Some(Arc::new(ActiveModel {
             id: Some("model-b".to_string()),
-            model: Arc::new(named_test_model("model-b", 256)),
+            loaded: Loaded::Generative(Arc::new(named_test_model("model-b", 256))),
             batcher: None,
             ceiling: None,
         })));
@@ -5189,6 +5848,372 @@ mod tests {
         );
     }
 
+    /// A router over a model that is NOT flagged synthetic, so the
+    /// decode loop actually emits chunks: `run_generation_emit`
+    /// suppresses `emit` for a synthetic model, and a streaming test
+    /// against one would see only the terminal frame.
+    fn streaming_test_app() -> Router {
+        let mut cfg = test_dense_fixture();
+        cfg.vocab_size = 256;
+        let model = Model::Gguf(GgufModel {
+            decoder: Arc::new(Decoder::new_random_small(cfg, 2, 256)),
+            tokenizer: Arc::new(ServerTokenizer::Byte),
+            stop_tokens: StopTokens::default(),
+            bos_id: None,
+            is_synthetic: false,
+            chat_template: chat_template::PromptTemplate::plain(),
+        });
+        test_app_with_state(Arc::new(test_state(
+            model,
+            ResponseCache::new(1000, Duration::from_secs(3600)),
+        )))
+    }
+
+    /// llama.cpp's native endpoint is a different WIRE, not a shorter
+    /// path to the OpenAI one. If this ever starts answering `choices`,
+    /// every llama.cpp client reading `content` breaks silently.
+    #[tokio::test]
+    async fn the_native_completion_wire_is_not_the_openai_one() {
+        let app = test_app();
+
+        let (status, native) = post_json_uri(
+            &app,
+            ferrox_api::routes::COMPLETION,
+            serde_json::json!({"prompt": "hi", "n_predict": 4}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{native}");
+        assert!(native["content"].is_string(), "{native}");
+        assert_eq!(native["stop"], true);
+        assert_eq!(native["stop_type"], "limit");
+        assert_eq!(native["stopping_word"], "");
+        assert_eq!(native["truncated"], false);
+        assert_eq!(native["id_slot"], -1);
+        assert!(native["timings"]["prompt_n"].is_number(), "{native}");
+        assert!(native["generation_settings"]["n_predict"] == 4, "{native}");
+        assert!(
+            native.get("choices").is_none(),
+            "the native shape has no `choices`: {native}"
+        );
+
+        let (status, openai) = post_json_uri(
+            &app,
+            ferrox_api::routes::V1_COMPLETIONS,
+            serde_json::json!({"prompt": "hi", "max_tokens": 4}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(openai["choices"][0]["text"].is_string(), "{openai}");
+        assert!(
+            openai.get("content").is_none(),
+            "the OpenAI shape has no top-level `content`: {openai}"
+        );
+    }
+
+    /// llama.cpp mounts the native endpoint under both spellings
+    /// (`server.cpp:240-241`), and its own web UI uses the plural. One
+    /// handler, so the two cannot answer differently.
+    #[tokio::test]
+    async fn both_native_spellings_reach_the_same_handler() {
+        let app = test_app();
+        for route in [
+            ferrox_api::routes::COMPLETION,
+            ferrox_api::routes::COMPLETIONS,
+        ] {
+            let (status, body) = post_json_uri(
+                &app,
+                route,
+                serde_json::json!({"prompt": "hi", "n_predict": 2, "seed": 1}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{route}: {body}");
+            assert_eq!(body["stop"], true, "{route}");
+            assert!(body["content"].is_string(), "{route}");
+        }
+
+        // And the ring records which one was called, so the split
+        // between clients stays visible.
+        let (_, stats) = get_json(&app, ferrox_api::routes::ADMIN_STATS).await;
+        let routes: Vec<&str> = stats["recent"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["route"].as_str().unwrap())
+            .collect();
+        assert!(
+            routes.contains(&ferrox_api::routes::COMPLETION),
+            "{routes:?}"
+        );
+        assert!(
+            routes.contains(&ferrox_api::routes::COMPLETIONS),
+            "{routes:?}"
+        );
+    }
+
+    /// The native stream is not OpenAI's. Frames are bare objects with
+    /// `content` and `stop`, the last one carries `stop: true` and the
+    /// whole terminal body, and there is **no `[DONE]`** -- a client
+    /// waiting for one would hang, and one that got it would try to
+    /// parse it as JSON.
+    #[tokio::test]
+    async fn a_native_stream_ends_on_a_stop_frame_with_no_done_sentinel() {
+        let app = streaming_test_app();
+        let raw = post_sse_raw_uri(
+            &app,
+            ferrox_api::routes::COMPLETION,
+            serde_json::json!({"prompt": "hi", "n_predict": 6, "stream": true, "seed": 7}),
+        )
+        .await;
+
+        assert!(
+            !raw.contains("[DONE]"),
+            "llama.cpp's native stream has no sentinel: {raw}"
+        );
+        let frames: Vec<serde_json::Value> = raw
+            .lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .map(|json| serde_json::from_str(json).expect("every frame is one JSON object"))
+            .collect();
+        assert!(frames.len() >= 2, "expected partials then a final: {raw}");
+
+        let (last, partials) = frames.split_last().unwrap();
+        assert_eq!(last["stop"], true, "the last frame closes the stream");
+        assert!(last["timings"].is_object(), "{last}");
+        assert!(last["stop_type"].is_string(), "{last}");
+        for partial in partials {
+            assert_eq!(partial["stop"], false, "{partial}");
+            assert!(partial["content"].is_string(), "{partial}");
+            // Upstream's documented partial carries content/tokens/stop
+            // and nothing else; the terminal fields belong to the last
+            // frame only.
+            assert!(partial.get("timings").is_none(), "{partial}");
+            assert!(partial.get("generation_settings").is_none(), "{partial}");
+        }
+        // The concatenated partials are the answer, so a client that
+        // streams sees what a client that buffers would get.
+        let streamed: String = partials
+            .iter()
+            .filter_map(|p| p["content"].as_str())
+            .collect();
+        assert_eq!(last["content"].as_str().unwrap(), streamed);
+    }
+
+    /// `n_predict: -1` is llama.cpp's default AND its "until the
+    /// context is full". With no derived ceiling there is no context to
+    /// be full of, and quietly substituting a small budget would hand a
+    /// caller a truncated answer it never asked for.
+    #[tokio::test]
+    async fn an_unbounded_n_predict_is_refused_rather_than_quietly_shrunk() {
+        let app = test_app();
+        for body in [
+            serde_json::json!({"prompt": "hi"}),
+            serde_json::json!({"prompt": "hi", "n_predict": -1}),
+        ] {
+            let (status, refusal) =
+                post_json_uri(&app, ferrox_api::routes::COMPLETION, body.clone()).await;
+            assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{body}: {refusal}");
+            assert!(
+                refusal["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("n_predict"),
+                "{refusal}"
+            );
+        }
+        // An explicit budget is served, so the refusal is about the
+        // unbounded case and not about the endpoint.
+        let (status, _) = post_json_uri(
+            &app,
+            ferrox_api::routes::COMPLETION,
+            serde_json::json!({"prompt": "hi", "n_predict": 2}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    /// A caller's `stop` must actually reach the sampler, and be named
+    /// back in llama.cpp's own vocabulary. Dropping it is the dangerous
+    /// silent failure: the caller believes generation halts at its
+    /// sentinel and instead gets the whole budget of text past it.
+    ///
+    /// Deterministic without depending on what random weights say:
+    /// generate once with no stop, then take a character out of that
+    /// answer and demand the second run halt before it.
+    #[tokio::test]
+    async fn a_stop_string_halts_the_answer_and_is_named_back() {
+        let app = streaming_test_app();
+        let ask = |stop: serde_json::Value| {
+            let app = app.clone();
+            async move {
+                post_json_uri(
+                    &app,
+                    ferrox_api::routes::COMPLETION,
+                    serde_json::json!({
+                        "prompt": "hi",
+                        "n_predict": 64,
+                        "ignore_eos": true,
+                        "stop": stop,
+                    }),
+                )
+                .await
+                .1
+            }
+        };
+
+        let baseline = ask(serde_json::json!([])).await;
+        assert_eq!(baseline["stop_type"], "limit");
+        assert_eq!(baseline["stopping_word"], "");
+        let text = baseline["content"].as_str().unwrap().to_string();
+        // Two characters, so the sentinel is more than one token in
+        // this vocabulary and goes through the output-suffix layer that
+        // reports WHICH string matched. A single-token stop is caught
+        // by the token layer, which does not carry the string back --
+        // see `stop_type`'s note and docs/API.md.
+        let sentinel: String = text.chars().skip(1).take(2).collect();
+        assert_eq!(
+            sentinel.chars().count(),
+            2,
+            "the fixture must produce enough output to cut: {text:?}"
+        );
+        let cut = text.find(&sentinel).expect("it came out of this text");
+
+        let stopped = ask(serde_json::json!([sentinel])).await;
+        assert_eq!(stopped["stop_type"], "word", "{stopped}");
+        assert_eq!(stopped["stopping_word"], sentinel);
+        assert_eq!(
+            stopped["content"].as_str().unwrap(),
+            &text[..cut],
+            "the answer must be cut at the sentinel, not run past it"
+        );
+    }
+
+    /// llama.cpp mounts these two unprefixed and sends `content`, not
+    /// `prompt`. ferrox mounted only the `/v1/` spelling it invented,
+    /// so every llama.cpp client got a 404 that named nothing. The
+    /// alias must reach the SAME handler -- identical ids for identical
+    /// text -- rather than a second implementation of it.
+    #[tokio::test]
+    async fn the_llama_cpp_spelling_of_tokenize_reaches_the_same_handler() {
+        let app = test_app();
+
+        let (v1_status, v1) = post_json_uri(
+            &app,
+            ferrox_api::routes::V1_TOKENIZE,
+            serde_json::json!({"prompt": "hello"}),
+        )
+        .await;
+        let (alias_status, alias) = post_json_uri(
+            &app,
+            ferrox_api::routes::TOKENIZE,
+            serde_json::json!({"content": "hello"}),
+        )
+        .await;
+        assert_eq!(v1_status, StatusCode::OK);
+        assert_eq!(alias_status, StatusCode::OK, "{alias}");
+        assert_eq!(v1["tokens"], alias["tokens"]);
+        assert!(!alias["tokens"].as_array().unwrap().is_empty());
+
+        // And the reverse: ferrox's own field still works on llama.cpp's
+        // path, so a client that switches URLs need not switch dialects.
+        let (status, both_ways) = post_json_uri(
+            &app,
+            ferrox_api::routes::TOKENIZE,
+            serde_json::json!({"prompt": "hello"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(both_ways["tokens"], v1["tokens"]);
+    }
+
+    /// llama.cpp answers detokenize under `content`
+    /// (`server-context.cpp:4970`); ferrox has always answered under
+    /// `text`. Both keys carry the same string, so neither dialect's
+    /// client reads a null.
+    #[tokio::test]
+    async fn detokenize_answers_under_both_dialects_keys() {
+        let app = test_app();
+        for route in [
+            ferrox_api::routes::DETOKENIZE,
+            ferrox_api::routes::V1_DETOKENIZE,
+        ] {
+            let (status, body) =
+                post_json_uri(&app, route, serde_json::json!({"tokens": [104, 105]})).await;
+            assert_eq!(status, StatusCode::OK, "{route}");
+            assert_eq!(body["text"], "hi", "{route}");
+            assert_eq!(body["content"], body["text"], "{route}");
+        }
+    }
+
+    /// The alias is one handler, so the ring must not attribute a
+    /// llama.cpp client's traffic to the ferrox spelling: the row
+    /// carries the path that was actually matched.
+    #[tokio::test]
+    async fn the_alias_is_recorded_under_the_path_the_client_called() {
+        let app = test_app();
+        let (status, _) = post_json_uri(
+            &app,
+            ferrox_api::routes::TOKENIZE,
+            serde_json::json!({"content": "hello"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let (_, stats) = get_json(&app, ferrox_api::routes::ADMIN_STATS).await;
+        let routes: Vec<&str> = stats["recent"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["route"].as_str().unwrap())
+            .collect();
+        assert!(
+            routes.contains(&ferrox_api::routes::TOKENIZE),
+            "the alias must be its own row: {routes:?}"
+        );
+        assert!(
+            !routes.contains(&ferrox_api::routes::V1_TOKENIZE),
+            "nothing called /v1/tokenize: {routes:?}"
+        );
+    }
+
+    /// `add_special` is llama.cpp's "prepend BOS". Honoured, and with
+    /// the id the generation path itself would prepend -- a tokenize
+    /// endpoint that disagrees with the decoder about the prompt is
+    /// worse than one that has no such option.
+    #[tokio::test]
+    async fn add_special_prepends_the_same_bos_the_decoder_would() {
+        let mut cfg = test_dense_fixture();
+        cfg.vocab_size = 256;
+        let model = Model::Gguf(GgufModel {
+            decoder: Arc::new(Decoder::new_random_small(cfg, 2, 256)),
+            tokenizer: Arc::new(ServerTokenizer::Byte),
+            stop_tokens: StopTokens::default(),
+            bos_id: Some(7),
+            is_synthetic: true,
+            chat_template: chat_template::PromptTemplate::plain(),
+        });
+        let app = test_app_with_state(Arc::new(test_state(
+            model,
+            ResponseCache::new(1000, Duration::from_secs(3600)),
+        )));
+
+        let (_, plain) = post_json_uri(
+            &app,
+            ferrox_api::routes::TOKENIZE,
+            serde_json::json!({"content": "hi"}),
+        )
+        .await;
+        let (_, special) = post_json_uri(
+            &app,
+            ferrox_api::routes::TOKENIZE,
+            serde_json::json!({"content": "hi", "add_special": true}),
+        )
+        .await;
+
+        assert_eq!(plain["tokens"], serde_json::json!([104, 105]));
+        assert_eq!(special["tokens"], serde_json::json!([7, 104, 105]));
+        assert_eq!(special["count"], 3);
+    }
+
     /// A failed small-endpoint call is still traffic. A 400 that leaves
     /// no row is indistinguishable from a request that was never sent.
     #[tokio::test]
@@ -5369,6 +6394,13 @@ mod tests {
     /// `data:`. Those two fields are the whole of the replay contract
     /// on the wire.
     async fn post_sse_raw(app: &Router, body: serde_json::Value) -> String {
+        post_sse_raw_uri(app, ferrox_api::routes::V1_CHAT_COMPLETIONS, body).await
+    }
+
+    /// The same, on any route: `/completion` streams a different
+    /// protocol over the same transport, and a second copy of this
+    /// helper would be a second thing to keep in step.
+    async fn post_sse_raw_uri(app: &Router, uri: &str, body: serde_json::Value) -> String {
         use http_body_util::BodyExt;
         use tower::ServiceExt;
 
@@ -5377,7 +6409,7 @@ mod tests {
             .oneshot(
                 axum::http::Request::builder()
                     .method("POST")
-                    .uri("/v1/chat/completions")
+                    .uri(uri)
                     .header("content-type", "application/json")
                     .body(axum::body::Body::from(serde_json::to_vec(&body).unwrap()))
                     .unwrap(),
@@ -6020,6 +7052,248 @@ mod tests {
         assert!(vec.iter().all(|v| v.as_f64().is_some()));
     }
 
+    /// The decoder path's accepted `embedding_type` set must not have
+    /// widened when the encoder path arrived: `cls` is row 0 of a
+    /// decoder's hidden states, which is its BOS position and means
+    /// nothing, so it stays refused here and the refusal names what is
+    /// accepted.
+    #[tokio::test]
+    async fn the_decoder_path_still_refuses_a_pooling_it_cannot_mean() {
+        let app = test_app();
+        let (status, body) = post_json_uri(
+            &app,
+            "/v1/embeddings",
+            serde_json::json!({ "input": "Hi", "embedding_type": "cls" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let msg = body["error"]["message"].as_str().unwrap();
+        assert!(msg.contains("mean") && msg.contains("last"), "{msg}");
+    }
+
+    /// A real BGE checkpoint served through the route: CLS by default
+    /// because the file says `pooling_type = 2`, 384 dims, unit norm,
+    /// and `usage.prompt_tokens` counting the `[CLS]`/`[SEP]` the model
+    /// actually saw.
+    #[tokio::test]
+    #[ignore = "needs models/bge-small-en-v1.5-q8_0.gguf"]
+    async fn a_real_embedding_model_serves_v1_embeddings() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../models/bge-small-en-v1.5-q8_0.gguf");
+        if !path.exists() {
+            eprintln!("SKIP: {} not present", path.display());
+            return;
+        }
+        let encoder = ferrox_models::EmbeddingModel::from_gguf_path(&path).expect("load bge");
+        let mut state = test_state(
+            test_model_full_byte_vocab(),
+            ResponseCache::new(1000, Duration::from_secs(3600)),
+        );
+        state.embedding = Some(Arc::new(encoder));
+        let app = test_app_with_state(Arc::new(state));
+
+        let (status, body) = post_json_uri(
+            &app,
+            "/v1/embeddings",
+            serde_json::json!({ "input": ["Hello world", "a second input"] }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["model"], "bge-small-en-v1.5");
+        let data = body["data"].as_array().unwrap();
+        assert_eq!(data.len(), 2);
+        for (i, row) in data.iter().enumerate() {
+            assert_eq!(row["index"], i);
+            let v: Vec<f64> = row["embedding"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|x| x.as_f64().unwrap())
+                .collect();
+            assert_eq!(v.len(), 384, "the encoder\'s width, not the decoder\'s");
+            let norm = v.iter().map(|x| x * x).sum::<f64>().sqrt();
+            assert!((norm - 1.0).abs() < 1e-4, "not L2-normalized: {norm}");
+        }
+        // "Hello world" is [CLS] hello world [SEP] = 4, and the second
+        // input adds its own two specials.
+        assert!(body["usage"]["prompt_tokens"].as_u64().unwrap() >= 4 + 2);
+
+        // The default came from the file. Asking for MEAN must give a
+        // different vector, which is what proves CLS was not a
+        // coincidence of this input.
+        let (status, mean) = post_json_uri(
+            &app,
+            "/v1/embeddings",
+            serde_json::json!({ "input": "Hello world", "embedding_type": "mean" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_ne!(mean["data"][0]["embedding"], data[0]["embedding"]);
+    }
+
+    /// The same BGE checkpoint as `FERROX_MODEL_PATH` -- the *loaded*
+    /// model, not a side-car.
+    ///
+    /// Four claims, and the third is the one this whole seam exists
+    /// for: the loader routes an encoder-only GGUF away from every
+    /// decoder path, `/v1/embeddings` serves it, `/v1/chat/completions`
+    /// refuses it NAMING IT AS AN EMBEDDING MODEL (before this, the
+    /// same file died in `tokenizer_from_gguf` with a message about
+    /// WordPiece being unreadable -- true, and the wrong thing to send
+    /// a user after), and `/v1/models` says which endpoint it is for so
+    /// a client need not send a request to find out.
+    #[tokio::test]
+    #[ignore = "needs models/bge-small-en-v1.5-q8_0.gguf"]
+    async fn an_encoder_can_be_the_loaded_model() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../models/bge-small-en-v1.5-q8_0.gguf");
+        if !path.exists() {
+            eprintln!("SKIP: {} not present", path.display());
+            return;
+        }
+
+        // Through the real `FERROX_MODEL_PATH` loader, not by
+        // constructing an `EmbeddingModel` directly: the routing
+        // decision is half of what is under test.
+        let loaded = model::load_from_path(path.to_str().unwrap()).expect("load bge as the model");
+        assert!(
+            matches!(loaded, model::LoadedModel::Encoder(_)),
+            "an encoder-only GGUF reached a decoder loader"
+        );
+        let (loaded, batcher, ceiling) = activate_loaded_model(loaded, true, None, None);
+        assert!(
+            matches!(loaded, Loaded::Encoder(_)),
+            "the encoder did not stay an encoder through activation"
+        );
+        assert!(
+            batcher.is_none() && ceiling.is_none(),
+            "an encoder was given a decode batcher or a KV ceiling it has no use for"
+        );
+
+        let state = test_state(
+            test_model_full_byte_vocab(),
+            ResponseCache::new(1000, Duration::from_secs(3600)),
+        );
+        state.swap_active(Some(Arc::new(ActiveModel {
+            id: None,
+            loaded,
+            batcher,
+            ceiling,
+        })));
+        let app = test_app_with_state(Arc::new(state));
+
+        // 1. It embeds.
+        let (status, body) = post_json_uri(
+            &app,
+            "/v1/embeddings",
+            serde_json::json!({ "input": "Hello world" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["model"], "bge-small-en-v1.5");
+        let v = body["data"][0]["embedding"].as_array().unwrap();
+        assert_eq!(v.len(), 384, "the encoder's width, not the decoder's");
+
+        // 2. It refuses to chat, by name.
+        let (status, body) = post_json_uri(
+            &app,
+            "/v1/chat/completions",
+            serde_json::json!({
+                "model": "bge-small-en-v1.5",
+                "messages": [{"role": "user", "content": "hi"}],
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{body}");
+        let msg = body["error"]["message"].as_str().unwrap();
+        for fact in [
+            "bge-small-en-v1.5",
+            "bert",
+            "embedding model",
+            "/v1/embeddings",
+        ] {
+            assert!(msg.contains(fact), "the refusal does not say {fact}: {msg}");
+        }
+
+        // 3. `/v1/models` lists it as what it is.
+        let (status, models) = get_json(&app, ferrox_api::routes::V1_MODELS).await;
+        assert_eq!(status, StatusCode::OK);
+        let entry = &models["data"][0];
+        assert_eq!(entry["id"], "bge-small-en-v1.5");
+        assert_eq!(entry["ferrox_model_kind"], "embedding");
+        assert_eq!(entry["ferrox_tokenizer"], "gguf-wordpiece");
+        assert_eq!(entry["ferrox_n_embd"], 384);
+        assert_eq!(entry["ferrox_pooling"], "CLS");
+        assert_eq!(
+            entry["ferrox_endpoints"],
+            serde_json::json!(["/v1/embeddings"])
+        );
+        // A reasoning-gear field here would be an invented answer about
+        // a template the checkpoint does not have.
+        assert!(entry.get("supported_reasoning_efforts").is_none());
+
+        // 4. `/health` is ready, and says which endpoint is ready.
+        let (status, health) = get_json(&app, ferrox_api::routes::HEALTH).await;
+        assert_eq!(status, StatusCode::OK, "an encoder is a loaded model");
+        assert_eq!(health["model"]["id"], "bge-small-en-v1.5");
+        assert_eq!(health["model"]["synthetic_weights"], false);
+        let weights = health["capabilities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["id"] == ferrox_api::health::capability::REAL_WEIGHTS)
+            .expect("a real-weights capability row");
+        let detail = weights["detail"].as_str().unwrap_or_default();
+        assert!(detail.contains("ENCODER"), "{detail}");
+        // 5. It tokenizes, and round-trips. An embedding model's whole
+        // contract is the vector it returns for a string, so when that
+        // vector surprises you the first question is what tokens it
+        // actually saw. These routes used to go through
+        // `generative()?` and answer 501 "not a generative model",
+        // which left no way to ask without loading the checkpoint in a
+        // second tool (issue #28).
+        let (status, body) = post_json_uri(
+            &app,
+            ferrox_api::routes::V1_TOKENIZE,
+            serde_json::json!({ "content": "hello world" }),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "an encoder has a real tokenizer: {body}"
+        );
+        let tokens = body["tokens"].as_array().expect("tokens array").clone();
+        assert!(!tokens.is_empty(), "WordPiece produced nothing: {body}");
+
+        let (status, body) = post_json_uri(
+            &app,
+            ferrox_api::routes::V1_DETOKENIZE,
+            serde_json::json!({ "tokens": tokens }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let round_tripped = body["content"].as_str().expect("content").to_string();
+        assert!(
+            round_tripped.contains("hello") && round_tripped.contains("world"),
+            "the ids did not decode back through the encoder's own vocabulary: {round_tripped}"
+        );
+
+        // And the refusal that must NOT have been weakened: a decode is
+        // still a decode, and this checkpoint still cannot do one.
+        let (status, _) = post_json_uri(
+            &app,
+            "/v1/completions",
+            serde_json::json!({ "model": "m", "prompt": "hi", "max_tokens": 1 }),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_IMPLEMENTED,
+            "tokenizing an encoder must not have opened a path to generating with one"
+        );
+    }
+
     /// The /metrics endpoint must expose the bounded expert cache's
     /// counters when the model streams routed experts, and the
     /// counters must reflect real decode activity (a forward pass
@@ -6627,6 +7901,179 @@ mod tests {
         assert_eq!(second["usage"]["completion_tokens"], 3);
     }
 
+    /// The whole of #35 through the real router: a request that adds a
+    /// GRAMMAR to a body already answered without one must be generated
+    /// afresh, under that grammar.
+    ///
+    /// The cache used to be consulted before
+    /// `generation_params_for_template` had even compiled the grammar,
+    /// and the key held no trace of it, so the constrained request was
+    /// handed the previous caller's unconstrained prose with a 200. The
+    /// answer is asserted, not the key: a key that differs proves
+    /// nothing if the lookup uses something else.
+    #[tokio::test]
+    async fn a_grammar_request_is_not_answered_from_an_unconstrained_cache_entry() {
+        let app = test_app();
+        let plain = serde_json::json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "\u{1}\u{2}"}],
+            "max_tokens": 3,
+            "temperature": 0,
+        });
+
+        let first = post_json(&app, plain.clone()).await;
+        assert_eq!(first["ferrox_cache"], "miss");
+        let unconstrained = first["choices"][0]["message"]["content"]
+            .as_str()
+            .expect("content")
+            .to_string();
+
+        let mut constrained = plain.clone();
+        constrained["grammar"] = serde_json::json!("root ::= \"yes\"");
+        let second = post_json(&app, constrained).await;
+        assert_eq!(
+            second["ferrox_cache"], "miss",
+            "a grammar is part of the key, so this body has never been answered"
+        );
+        // The synthetic demo model wraps its decode in a banner, so the
+        // assertion is on the decoded text inside it: `yes` is the only
+        // string this grammar admits, and it is there.
+        let constrained_answer = second["choices"][0]["message"]["content"]
+            .as_str()
+            .expect("content")
+            .to_string();
+        assert!(
+            constrained_answer.contains("-> \"yes\"]"),
+            "the grammar must have been compiled AND applied, not skipped \
+             by a cache hit: {constrained_answer}"
+        );
+        assert_ne!(
+            constrained_answer, unconstrained,
+            "the constrained request was served the unconstrained answer"
+        );
+
+        // And the entry the first request made is still the first
+        // request's: the miss above is the grammar, not a key that
+        // fails to repeat.
+        let third = post_json(&app, plain).await;
+        assert_eq!(third["ferrox_cache"], "hit");
+        assert_eq!(third["choices"][0]["message"]["content"], unconstrained);
+    }
+
+    /// The third of #35's fields, and the one whose old failure was
+    /// LOUD: `validate_json_object_output` runs against whatever came
+    /// back, so a `json_object` request answered from a cached prose
+    /// entry got a hard 400 for a body that had never been generated
+    /// under the JSON mask at all.
+    ///
+    /// The system message is what makes this reproducible, and it is the
+    /// repo's own bug shape underneath. `inject_json_object_system_hint`
+    /// usually leaves a fingerprint in the PROMPT, which happened to
+    /// split the two keys apart -- a correctness property nothing stated
+    /// or enforced, resting on a string edit made for a different
+    /// reason. Its `!s.contains("JSON")` arm is the hole: a caller who
+    /// already says "JSON" in their own system message gets NO hint
+    /// appended, so the two requests render byte-identical prompts and
+    /// the old key could not tell them apart.
+    ///
+    /// The synthetic model emits its demo banner under either mask, so
+    /// the 400 is the same on both sides of this fix and cannot be the
+    /// assertion; the cache-level twin in `response_cache` asserts the
+    /// answer. What is asserted here is that the answer did not come
+    /// from the other request's entry.
+    #[tokio::test]
+    async fn a_json_object_request_does_not_reuse_the_unconstrained_cache_entry() {
+        let state = Arc::new(test_state(
+            test_model_full_byte_vocab(),
+            ResponseCache::new(1000, Duration::from_secs(3600)),
+        ));
+        let app = test_app_with_state(state.clone());
+        let plain = serde_json::json!({
+            "model": "m",
+            "messages": [
+                {"role": "system", "content": "Answer in JSON when it helps."},
+                {"role": "user", "content": "\u{1}\u{2}"},
+            ],
+            "max_tokens": 3,
+            "temperature": 0,
+        });
+
+        let first = post_json(&app, plain.clone()).await;
+        assert_eq!(first["ferrox_cache"], "miss");
+        assert_eq!(state.cache_stats().entries, 1);
+
+        let mut as_json = plain.clone();
+        as_json["response_format"] = serde_json::json!({"type": "json_object"});
+        let (status, _) = post_json_uri(&app, "/v1/chat/completions", as_json).await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "the demo banner is not a JSON object, whoever generated it"
+        );
+        assert_eq!(
+            state.cache_stats().hits,
+            0,
+            "a json_object request must not be answered from an entry the \
+             JSON mask never produced"
+        );
+        assert_eq!(
+            state.cache_stats().entries,
+            2,
+            "json_object must key its own entry, not reuse the unconstrained \
+             one it happens to render the same prompt as"
+        );
+    }
+
+    /// The same failure for `ignore_eos`, whose whole purpose is that a
+    /// benchmarking run produces EXACTLY `max_tokens`. Answered from a
+    /// cache entry the model's own EOS had cut short, it produced the
+    /// short answer instead -- the one outcome the field exists to rule
+    /// out (#35).
+    ///
+    /// `0x77` is the id this model greedily emits SECOND for the prompt
+    /// below, so with it as the EOS the plain request stops after one
+    /// token and the `ignore_eos` one runs the whole budget. Asserted on
+    /// the token count and the finish reason, which is where a replayed
+    /// answer shows.
+    #[tokio::test]
+    async fn an_ignore_eos_request_is_not_answered_from_a_cache_entry_that_stopped_at_eos() {
+        let app = test_app_with_state(Arc::new(test_state(
+            test_model_full_byte_vocab_with_eos(Some(0x77)),
+            ResponseCache::new(1000, Duration::from_secs(3600)),
+        )));
+        let body = serde_json::json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "\u{1}\u{2}"}],
+            "max_tokens": 6,
+            "temperature": 0,
+        });
+
+        let stopped = post_json(&app, body.clone()).await;
+        assert_eq!(stopped["ferrox_cache"], "miss");
+        assert_eq!(
+            stopped["choices"][0]["finish_reason"], "stop",
+            "the fixture is only meaningful if the model's EOS really fires here"
+        );
+        assert_eq!(stopped["usage"]["completion_tokens"], 1);
+
+        let mut ignoring = body.clone();
+        ignoring["ignore_eos"] = serde_json::json!(true);
+        let ran_on = post_json(&app, ignoring).await;
+        assert_eq!(
+            ran_on["ferrox_cache"], "miss",
+            "ignore_eos is part of the key, so this body has never been answered"
+        );
+        assert_eq!(
+            ran_on["usage"]["completion_tokens"], 6,
+            "ignore_eos must run the full budget, not replay the EOS-terminated answer"
+        );
+        assert_eq!(ran_on["choices"][0]["finish_reason"], "length");
+        assert_ne!(
+            ran_on["choices"][0]["message"]["content"],
+            stopped["choices"][0]["message"]["content"]
+        );
+    }
+
     /// The real proof for session reuse:
     /// a two-request session where the second request sends only its
     /// new message must produce exactly the same output as manually
@@ -6822,6 +8269,136 @@ mod tests {
         assert!(plain.generation_params().unwrap().grammar.is_none());
     }
 
+    fn tool_request(tool_choice: serde_json::Value) -> ChatCompletionRequest {
+        chat_request(serde_json::json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "weather in Rome?"}],
+            "tools": [weather_tool()],
+            "tool_choice": tool_choice,
+        }))
+    }
+
+    /// `tool_choice: "required"` used to be a 501. It now compiles the
+    /// offered tools into a grammar that rides on the params, which is
+    /// the only thing every decode path shares.
+    #[test]
+    fn a_forced_tool_choice_puts_a_grammar_on_the_generation_params() {
+        for choice in [
+            serde_json::json!("required"),
+            serde_json::json!({"type": "function", "function": {"name": "get_weather"}}),
+        ] {
+            let req = tool_request(choice.clone());
+            req.validate_supported_fields()
+                .unwrap_or_else(|e| panic!("{choice} is a valid request: {e:?}"));
+            let params = req
+                .generation_params_for_template(&graded_template(), "Qwen3-8B")
+                .unwrap_or_else(|e| panic!("{choice} compiles: {e:?}"));
+            let grammar = params
+                .grammar
+                .as_ref()
+                .unwrap_or_else(|| panic!("{choice} was accepted and then not enforced"));
+            assert!(
+                grammar.is_awaiting_trigger(),
+                "the model must be free to think before it calls"
+            );
+            assert!(
+                !grammar.allows_eog(),
+                "{choice} must not be able to end the turn without a call"
+            );
+            // The bug that has been fixed three times: a constrained
+            // request that lets a backend fold lm_head+argmax on device
+            // is a constrained request served unconstrained. A LAZY
+            // grammar needs the vocabulary from the FIRST token, because
+            // its trigger can fire on any of them.
+            assert!(
+                params.needs_vocab_logits(),
+                "{choice} would let a backend return a token id instead of logits"
+            );
+            assert!(
+                !generate::greedy_gpu_fold_allowed(&params),
+                "{choice} at temperature 0 must still refuse the greedy GPU fold"
+            );
+        }
+    }
+
+    /// `auto` and `none` force nothing, and must not acquire a grammar.
+    #[test]
+    fn an_unforced_tool_choice_leaves_the_generation_unconstrained() {
+        for choice in [serde_json::json!("auto"), serde_json::json!("none")] {
+            let req = tool_request(choice.clone());
+            req.validate_supported_fields().expect("still supported");
+            let params = match req.generation_params_for_template(&graded_template(), "Qwen3-8B") {
+                Ok(p) => p,
+                Err((status, _)) => panic!("{choice} has no constraint to compile: {status}"),
+            };
+            assert!(
+                params.grammar.is_none(),
+                "{choice} does not force a call and must not be constrained"
+            );
+        }
+    }
+
+    /// Every refusal a forced choice can produce names the field, and
+    /// none of them is a silent downgrade to `auto`.
+    #[test]
+    fn a_forced_tool_choice_refuses_rather_than_quietly_not_forcing() {
+        // No tools to choose between.
+        let req = chat_request(serde_json::json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tool_choice": "required",
+        }));
+        let (status, _) = req
+            .validate_supported_fields()
+            .expect_err("nothing to call");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        // A name that is not on offer.
+        let req =
+            tool_request(serde_json::json!({"type": "function", "function": {"name": "nope"}}));
+        let (status, Json(body)) = req.validate_supported_fields().expect_err("no such tool");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"]["param"], "tool_choice");
+
+        // An object that names nothing at all.
+        let req = tool_request(serde_json::json!({"type": "function"}));
+        let (status, _) = req.validate_supported_fields().expect_err("names nothing");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        // Two constraints on one generation.
+        let req = chat_request(serde_json::json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [weather_tool()],
+            "tool_choice": "required",
+            "grammar": "root ::= \"a\"+",
+        }));
+        let (status, _) = req
+            .validate_supported_fields()
+            .expect_err("a grammar and a forced call are two constraints");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        // A checkpoint whose wire format has no grammar yet is refused
+        // by name at params time, when the served model is known. GLM
+        // used to stand here and is forced now; gemma4 is one of the
+        // three `tool_grammar::wire::shape` still refuses, and it says
+        // which of them and why.
+        let req = tool_request(serde_json::json!("required"));
+        let (status, Json(body)) =
+            match req.generation_params_for_template(&graded_template(), "Gemma4-27B") {
+                Err(e) => e,
+                Ok(_) => panic!("a gemma4 call's arguments are not an object rule"),
+            };
+        assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("gemma4"),
+            "{body}"
+        );
+    }
+
     /// A grammar that does not parse is refused before any work, and
     /// the refusal names the field and the parser's own diagnostic.
     #[test]
@@ -6839,29 +8416,87 @@ mod tests {
         assert!(req.generation_params().is_err(), "and again at params time");
     }
 
-    /// `response_format: json_schema` is refused by name, with the 501
-    /// that says which half is missing -- not the 400 that reads as
-    /// "this server does not do structured output", which is no longer
-    /// true, and not a 200 carrying unconstrained text.
+    /// `response_format: json_schema` used to be a 501 naming the
+    /// missing converter. It is served now, and the request-level
+    /// evidence is that the schema reaches `generation_params` as a
+    /// grammar -- there is exactly one place a `response_format` is
+    /// decided, so a route that validated it and then forgot to apply
+    /// it is the failure this asserts against.
     #[test]
-    fn response_format_json_schema_names_the_missing_converter() {
+    fn response_format_json_schema_becomes_the_requests_grammar() {
         let req = chat_request(serde_json::json!({
             "model": "m",
             "messages": [{"role": "user", "content": "hi"}],
             "response_format": {
                 "type": "json_schema",
-                "json_schema": {"name": "x", "schema": {"type": "object"}},
+                "json_schema": {"name": "x", "schema": {"type": "boolean"}},
+            },
+        }));
+        req.validate_supported_fields()
+            .expect("a boolean schema converts");
+        let params = req.generation_params().expect("and compiles");
+        let grammar = params.grammar.expect("the schema is the grammar");
+        let mut g = (*grammar).clone();
+        g.accept_token(0, b"true").expect("a boolean is accepted");
+        assert!(g.allows_eog(), "and completes the parse");
+        assert!(
+            !params.json_object,
+            "a schema is not the json_object character-class mask"
+        );
+    }
+
+    /// A schema the converter will not compile is a 400 naming the
+    /// keyword, at both the validation and the params seam -- never a
+    /// 500, and never a grammar that is approximately the schema.
+    #[test]
+    fn an_unconvertible_response_format_schema_is_a_400_naming_the_keyword() {
+        let req = chat_request(serde_json::json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {"name": "x", "schema": {"type": "integer", "minimum": 3}},
             },
         }));
         let (status, Json(body)) = req
             .validate_supported_fields()
-            .expect_err("not implemented yet");
-        assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
-        let message = body["error"]["message"].as_str().expect("a message");
+            .expect_err("minimum has no grammar in this port");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
         assert!(
-            message.contains("JSON schema") && message.contains("grammar"),
-            "the refusal must say what is missing: {message}"
+            body["error"]["message"]
+                .as_str()
+                .expect("a message")
+                .contains("minimum"),
+            "the refusal must name the keyword: {body}"
         );
+        assert!(req.generation_params().is_err(), "and again at params time");
+    }
+
+    /// A forced `tool_choice` and a `response_format` schema are two
+    /// constraints on one generation. The refusal used to be spelled
+    /// against `self.grammar` alone, so the schema spelling walked past
+    /// it and `generation_params_for_template` overwrote the schema's
+    /// grammar with the tool-call one.
+    #[test]
+    fn a_forced_tool_choice_and_a_schema_are_two_constraints() {
+        let req = chat_request(serde_json::json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tool_choice": "required",
+            "tools": [{
+                "type": "function",
+                "function": {"name": "f", "parameters": {"type": "object"}},
+            }],
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {"name": "x", "schema": {"type": "boolean"}},
+            },
+        }));
+        let (status, Json(body)) = req
+            .validate_supported_fields()
+            .expect_err("two constraints, one generation");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"]["param"], "tool_choice");
     }
 
     /// A chat client that omits `max_tokens` wants an answer, not
@@ -6886,14 +8521,14 @@ mod tests {
             "messages": [{"role": "user", "content": "hi"}],
             "min_p": 0.07,
         }));
-        assert_eq!(asked.sampling_params().min_p, 0.07);
+        assert_eq!(asked.sampling_params().expect("knobs").min_p, 0.07);
 
         let silent = chat_request(serde_json::json!({
             "model": "m",
             "messages": [{"role": "user", "content": "hi"}],
         }));
         assert_eq!(
-            silent.sampling_params().min_p,
+            silent.sampling_params().expect("knobs").min_p,
             0.0,
             "an unset min_p must be off, not llama.cpp's CLI default"
         );
@@ -6914,7 +8549,12 @@ mod tests {
             "messages": [{"role": "user", "content": "hi"}],
             "seed": 1,
         });
-        let baseline = chat_request(base.clone()).cache_key("prompt");
+        let key_for = |body: serde_json::Value| {
+            let req = chat_request(body);
+            let params = req.generation_params().expect("params");
+            req.cache_key("prompt", &params)
+        };
+        let baseline = key_for(base.clone());
         for (knob, value) in [
             ("temperature", serde_json::json!(0.5)),
             ("top_p", serde_json::json!(0.9)),
@@ -6923,14 +8563,67 @@ mod tests {
             ("repetition_penalty", serde_json::json!(1.1)),
             ("presence_penalty", serde_json::json!(0.3)),
             ("frequency_penalty", serde_json::json!(0.3)),
+            (
+                "samplers",
+                serde_json::json!(["penalties", "top_p", "top_k", "min_p", "temperature"]),
+            ),
         ] {
             let mut body = base.clone();
             body[knob] = value;
             assert_ne!(
-                chat_request(body).cache_key("prompt"),
+                key_for(body),
                 baseline,
                 "`{knob}` is not in the cache key: two requests differing \
                  only in it would share one cached answer"
+            );
+        }
+    }
+
+    /// The sampler half's twin, for the constraints. Each of these
+    /// changes the answer and changes NOTHING about the rendered
+    /// prompt, so an omission is invisible until a caller compares two
+    /// answers it never sees side by side (#35).
+    ///
+    /// `grammar` here is the wire field; `response_format:
+    /// {"type":"json_schema"}` and a forced `tool_choice` compile to a
+    /// grammar through the same `GenerationParams::grammar`, so they are
+    /// keyed by the same field being keyed at all.
+    #[test]
+    fn no_constraint_is_missing_from_the_cache_key() {
+        let base = serde_json::json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "pick one"}],
+        });
+        let key_for = |body: serde_json::Value| {
+            let req = chat_request(body);
+            let params = req.generation_params().expect("params");
+            req.cache_key("prompt", &params)
+        };
+        let baseline = key_for(base.clone());
+        for (field, value) in [
+            ("grammar", serde_json::json!("root ::= \"yes\" | \"no\"")),
+            (
+                "response_format",
+                serde_json::json!({"type": "json_object"}),
+            ),
+            (
+                "response_format",
+                serde_json::json!({"type": "json_schema", "json_schema": {
+                    "name": "answer",
+                    "schema": {"type": "object", "properties": {"a": {"type": "string"}}}
+                }}),
+            ),
+            ("ignore_eos", serde_json::json!(true)),
+            ("stop", serde_json::json!(["\n"])),
+            ("max_tokens", serde_json::json!(7)),
+        ] {
+            let mut body = base.clone();
+            body[field] = value.clone();
+            assert_ne!(
+                key_for(body),
+                baseline,
+                "`{field}: {value}` is not in the cache key: two requests \
+                 differing only in it would share one cached answer"
             );
         }
     }
@@ -7175,6 +8868,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         assert!(matches!(
             result,
@@ -7213,6 +8907,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         assert!(matches!(
             result,
@@ -7247,6 +8942,7 @@ mod tests {
             &prompt,
             &greedy_params(4),
             Some(&config),
+            None,
             None,
             None,
             None,
@@ -7322,6 +9018,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .unwrap();
         assert_eq!(finish, FinishReason::Length);
@@ -7350,6 +9047,7 @@ mod tests {
                     &model,
                     &prompt,
                     &greedy_params(6),
+                    None,
                     None,
                     None,
                     None,
@@ -7768,7 +9466,10 @@ mod tests {
     fn kimi_model_serves_real_text_end_to_end_via_run_generation() {
         let loaded = build_synthetic_kimi_loaded();
         let state = build_app_state(
-            model::LoadedModel::Kimi(loaded),
+            StartupModels {
+                loaded: model::LoadedModel::Kimi(loaded),
+                embedding: None,
+            },
             None,
             None,
             None,
@@ -7777,13 +9478,14 @@ mod tests {
             Arc::new(health::Detection::ready(health::probe_backends())),
         );
         let active = state.active().expect("a freshly built state has a model");
-        assert_eq!(active.model.tokenizer_kind(), "kimi-tiktoken-bpe");
-        assert!(!active.model.is_synthetic());
+        assert_eq!(active.tokenizer_kind(), "kimi-tiktoken-bpe");
+        assert!(!active.is_synthetic());
 
         let (_chunks, finish, _usage) = run_generation(
-            &active.model,
+            active.generative().unwrap(),
             "hi",
             &greedy_params(5),
+            None,
             None,
             None,
             None,
@@ -7810,7 +9512,10 @@ mod tests {
     fn a_grammar_constrains_the_engine_decode_path() {
         let loaded = build_synthetic_kimi_loaded();
         let state = build_app_state(
-            model::LoadedModel::Kimi(loaded),
+            StartupModels {
+                loaded: model::LoadedModel::Kimi(loaded),
+                embedding: None,
+            },
             None,
             None,
             None,
@@ -7828,7 +9533,17 @@ mod tests {
                         .expect("test grammar parses"),
                 )
             });
-            run_generation(&active.model, "hi", &params, None, None, None, None, None)
+            run_generation(
+                active.generative().unwrap(),
+                "hi",
+                &params,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
         };
 
         let (chunks, _, _) = run(None).expect("the unconstrained run must serve");
@@ -7863,7 +9578,10 @@ mod tests {
     fn kv_pool_and_prefix_cache_are_never_consulted_for_a_kimi_model() {
         let loaded = build_synthetic_kimi_loaded();
         let state = build_app_state(
-            model::LoadedModel::Kimi(loaded),
+            StartupModels {
+                loaded: model::LoadedModel::Kimi(loaded),
+                embedding: None,
+            },
             None,
             None,
             None,
@@ -7880,15 +9598,17 @@ mod tests {
         let pc = Mutex::new(PrefixCache::new(4));
 
         run_generation(
-            &state
+            state
                 .active()
                 .expect("a freshly built state has a model")
-                .model,
+                .generative()
+                .unwrap(),
             "hi",
             &greedy_params(5),
             Some(&kv_pool_config),
             None,
             Some(&pc),
+            None,
             None,
             None,
         )

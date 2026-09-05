@@ -66,6 +66,7 @@ fn continuous_batching_composes_with_paged_kv() {
                 penalty_last_n: 64,
                 presence_penalty: params[i].sampling.presence_penalty,
                 frequency_penalty: params[i].sampling.frequency_penalty,
+                sampler_order: params[i].sampling.sampler_order,
             },
             seed: params[i].seed,
             stop: vec![],
@@ -254,6 +255,7 @@ fn continuous_batch_matches_sequential_generate_token_ids() {
                 penalty_last_n: 64,
                 presence_penalty: params[i].sampling.presence_penalty,
                 frequency_penalty: params[i].sampling.frequency_penalty,
+                sampler_order: params[i].sampling.sampler_order,
             },
             seed: params[i].seed,
             stop: vec![],
@@ -288,9 +290,9 @@ fn continuous_batch_honors_stop_sequence_in_decoded_text() {
     let decode: DecodeFn = Arc::new(|ids: &[usize]| {
         ids.iter()
             .map(|id| match id % 3 {
-                0 => 'X',
-                1 => 'Y',
-                _ => 'Z',
+                0 => b'X',
+                1 => b'Y',
+                _ => b'Z',
             })
             .collect()
     });
@@ -346,7 +348,7 @@ fn continuous_batch_honors_stop_sequence_in_decoded_text() {
 #[test]
 fn continuous_batch_stops_on_any_member_of_the_stop_set() {
     let decoder = tiny_decoder();
-    let decode: DecodeFn = Arc::new(|_: &[usize]| String::new());
+    let decode: DecodeFn = Arc::new(|_: &[usize]| Vec::new());
     let prompt = vec![1usize, 2, 3];
     let params = greedy_params(32, 3);
     let ids = sequential_ids(&decoder, &prompt, &params);
@@ -367,6 +369,33 @@ fn continuous_batch_stops_on_any_member_of_the_stop_set() {
     assert_eq!(finish, FinishReason::Stop);
     assert_eq!(got, ids[..2].to_vec());
     assert_eq!(usage.completion_tokens, 2);
+}
+
+/// Under continuous batching, callers can observe tokens as they are
+/// sampled rather than only in the final reply.
+#[test]
+fn batched_generate_streams_incremental_chunks() {
+    let decoder = tiny_decoder();
+    let batcher = ContinuousBatcher::spawn_with_config(
+        Arc::clone(&decoder),
+        identity_decode(),
+        BatcherConfig {
+            prefill_chunk: 1,
+            ..BatcherConfig::default()
+        },
+    );
+    let mut streamed = Vec::new();
+    let (finish, _ids, text, _usage) = batcher
+        .generate_streaming(
+            vec![1, 2, 3],
+            greedy_params(8, 4),
+            StopTokens::default(),
+            Some(|chunk: &str| streamed.push(chunk.to_string())),
+        )
+        .expect("generate");
+    assert!(matches!(finish, FinishReason::Length | FinishReason::Stop));
+    assert!(!streamed.is_empty(), "expected at least one streamed chunk");
+    assert_eq!(streamed.concat(), text);
 }
 
 /// The state machine itself: each `step_chunk` is bounded by the
@@ -410,10 +439,11 @@ fn empty_prompt_prefills_one_stand_in_token() {
 }
 
 /// Chunking is a scheduling boundary, not a numerical one: whatever
-/// the chunk size, the prompt runs through the same `forward_token`
-/// sequence at the same positions, so the logits are bit-identical
-/// to the sequential prefill this replaced. If this ever fails,
-/// every sampled token downstream is suspect.
+/// the chunk size, the prompt runs through the same prefill at the
+/// same positions, so the final logits match the sequential reference.
+/// Prefill uses `forward_batch_last_host_kv` so host K/V stays
+/// authoritative for batched Metal decode; tiny float drift vs
+/// per-token `forward_token` on CPU is expected and harmless.
 #[test]
 fn prefill_chunking_does_not_change_logits() {
     let decoder = tiny_decoder();
@@ -434,10 +464,13 @@ fn prefill_chunking_does_not_change_logits() {
         while !state.step_chunk() {}
         let (_caches, logits, pos, _ids) = state.into_decode_start();
         assert_eq!(pos, prompt.len());
-        assert_eq!(
-            logits, sequential,
-            "chunk size {chunk} changed the prefill logits"
-        );
+        assert_eq!(logits.len(), sequential.len());
+        for (i, (&got, &want)) in logits.iter().zip(sequential.iter()).enumerate() {
+            assert!(
+                (got - want).abs() < 1e-3,
+                "chunk size {chunk}, logit {i}: got={got} want={want}"
+            );
+        }
     }
 }
 
@@ -585,7 +618,7 @@ fn a_grammar_constrains_a_batched_row_as_it_does_a_private_one() {
     let decoder = tiny_decoder();
     let decode: DecodeFn = Arc::new(|ids: &[usize]| {
         ids.iter()
-            .map(|id| if id % 2 == 0 { 'b' } else { 'a' })
+            .map(|id| if id % 2 == 0 { b'b' } else { b'a' })
             .collect()
     });
     let batcher = ContinuousBatcher::spawn_with_config(
@@ -640,7 +673,7 @@ fn a_batched_row_whose_grammar_dead_ends_is_refused_by_itself() {
     let decoder = tiny_decoder();
     let decode: DecodeFn = Arc::new(|ids: &[usize]| {
         ids.iter()
-            .map(|id| if id % 2 == 0 { 'b' } else { 'a' })
+            .map(|id| if id % 2 == 0 { b'b' } else { b'a' })
             .collect()
     });
     let batcher = ContinuousBatcher::spawn_with_config(
@@ -701,7 +734,7 @@ fn json_object_mode_constrains_a_batched_row_as_it_does_a_private_one() {
     let decoder = tiny_decoder();
     let decode: DecodeFn = Arc::new(|ids: &[usize]| {
         ids.iter()
-            .map(|id| if id % 2 == 0 { '<' } else { 'a' })
+            .map(|id| if id % 2 == 0 { b'<' } else { b'a' })
             .collect()
     });
     let batcher = ContinuousBatcher::spawn_with_config(

@@ -12,6 +12,7 @@
       "gguf": "models/tinyllama-1.1b-chat-v1.0.Q8_0.gguf",
       "backends": [
         "metal",
+        "cuda",
         "cpu"
       ],
       "estimated_ram_gb": 3,
@@ -23,7 +24,9 @@
       "name": "Llama-3.2-1B-Instruct Q4_K_M",
       "gguf": "models/Llama-3.2-1B-Instruct-Q4_K_M.gguf",
       "backends": [
-        "metal"
+        "metal",
+        "cuda",
+        "cpu"
       ],
       "estimated_ram_gb": 2,
       "expect": "ok",
@@ -34,9 +37,9 @@
       "name": "OLMoE-1B-7B-0924 Q4_0",
       "gguf": "models/olmoe-1b-7b-0924-q4_0.gguf",
       "backends": [
-        "cpu",
         "metal",
-        "cuda"
+        "cuda",
+        "cpu"
       ],
       "estimated_ram_gb": 8,
       "expect": "ok",
@@ -47,7 +50,9 @@
       "name": "Llama-3.2-3B-Instruct Q4_K_M",
       "gguf": "models/Llama-3.2-3B-Instruct-Q4_K_M.gguf",
       "backends": [
-        "metal"
+        "metal",
+        "cuda",
+        "cpu"
       ],
       "estimated_ram_gb": 5,
       "expect": "ok",
@@ -58,8 +63,8 @@
       "name": "Mistral-7B-Instruct-v0.2 Q4_K_M",
       "gguf": "models/Mistral-7B-Instruct-v0.2-Q4_K_M.gguf",
       "backends": [
-        "cpu",
-        "metal"
+        "metal",
+        "cpu"
       ],
       "estimated_ram_gb": 10,
       "expect": "ok",
@@ -81,7 +86,9 @@
       "name": "Llama-3.2-1B-Instruct IQ4_XS",
       "gguf": "models/Llama-3.2-1B-Instruct-IQ4_XS.gguf",
       "backends": [
-        "metal"
+        "metal",
+        "cuda",
+        "cpu"
       ],
       "estimated_ram_gb": 2,
       "expect": "ok",
@@ -93,6 +100,7 @@
       "gguf": "models/hf_test/SmolLM2-135M-Instruct-Q8_0.gguf",
       "backends": [
         "metal",
+        "cuda",
         "cpu"
       ],
       "estimated_ram_gb": 1,
@@ -105,6 +113,7 @@
       "gguf": "models/hf_test/qwen2.5-0.5b-instruct-q8_0.gguf",
       "backends": [
         "metal",
+        "cuda",
         "cpu"
       ],
       "estimated_ram_gb": 1,
@@ -117,6 +126,7 @@
       "gguf": "models/hf_test/Qwen3-0.6B-Q8_0.gguf",
       "backends": [
         "metal",
+        "cuda",
         "cpu"
       ],
       "estimated_ram_gb": 2,
@@ -129,6 +139,7 @@
       "gguf": "models/hf_test/gemma-3-1b-it-Q8_0.gguf",
       "backends": [
         "metal",
+        "cuda",
         "cpu"
       ],
       "estimated_ram_gb": 3,
@@ -164,8 +175,8 @@
       "name": "Qwen1.5-MoE-A2.7B-Chat Q4_K_M",
       "gguf": "models/Qwen1.5-MoE-A2.7B-Chat-Q4_K_M.gguf",
       "backends": [
-        "cpu",
-        "metal"
+        "metal",
+        "cpu"
       ],
       "estimated_ram_gb": 12,
       "expect": "ok",
@@ -176,8 +187,9 @@
       "name": "Llama-3.2-1B-Instruct Q5_K_M",
       "gguf": "models/Llama-3.2-1B-Instruct-Q5_K_M.gguf",
       "backends": [
-        "cpu",
-        "metal"
+        "metal",
+        "cuda",
+        "cpu"
       ],
       "estimated_ram_gb": 3,
       "expect": "ok",
@@ -188,8 +200,9 @@
       "name": "Llama-3.2-1B-Instruct Q6_K",
       "gguf": "models/Llama-3.2-1B-Instruct-Q6_K.gguf",
       "backends": [
-        "cpu",
-        "metal"
+        "metal",
+        "cuda",
+        "cpu"
       ],
       "estimated_ram_gb": 3,
       "expect": "ok",
@@ -200,8 +213,9 @@
       "name": "Gemma-2-2B-IT Q4_K_M",
       "gguf": "models/gemma-2-2b-it-Q4_K_M.gguf",
       "backends": [
-        "cpu",
-        "metal"
+        "metal",
+        "cuda",
+        "cpu"
       ],
       "estimated_ram_gb": 4,
       "expect": "ok",
@@ -212,8 +226,9 @@
       "name": "Meta-Llama-3.1-8B-Instruct Q4_K_M",
       "gguf": "models/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf",
       "backends": [
-        "cpu",
-        "metal"
+        "metal",
+        "cuda",
+        "cpu"
       ],
       "estimated_ram_gb": 8,
       "expect": "ok",

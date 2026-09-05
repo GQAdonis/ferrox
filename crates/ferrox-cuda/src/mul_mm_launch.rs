@@ -124,7 +124,7 @@ pub fn launch_mul_mm(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mul_mm::{BM, Q4_0, Q8_0};
+    use crate::mul_mm::{BM, Q4_0, Q5_0, Q8_0};
     use crate::mul_mm_ref::mul_mm_reference;
 
     #[test]
@@ -146,20 +146,23 @@ mod tests {
     ///
     /// It compares the kernel against [`mul_mm_reference`] -- the same
     /// scalar twin the host-side tests already hold to `ferrox_quant` --
-    /// on both an exact-tile and a partial-tile shape, for both quant
-    /// kinds in the table.
+    /// on both an exact-tile and a partial-tile shape, for the three
+    /// 32-element kinds in the table. (The K-quants are covered by
+    /// `tools/mul_mm_host_check/run.sh`, which executes the same
+    /// emitted C on the host for every kind in `KINDS`.)
     ///
     /// Run it on a machine with a real device:
     ///   cargo test -p ferrox-cuda --features cuda -- --ignored
     #[test]
     #[ignore = "requires real CUDA hardware -- NEVER RUN: this kernel has never executed on a GPU. Run with --ignored on a CUDA-capable machine and record the result before any doc claims CUDA mul_mm works"]
     fn launch_mul_mm_matches_the_scalar_twin() {
-        for (kind, weights_of) in [(&Q8_0, 0usize), (&Q4_0, 1usize)] {
+        for (kind, weights_of) in [(&Q8_0, 0usize), (&Q4_0, 1usize), (&Q5_0, 2usize)] {
             for (n_rows, n_cols, batch) in [(BM * 2, 128, 32), (BM + 7, 96, 37), (33, 64, 3)] {
                 let row_bytes = (n_cols / kind.block_elems) * kind.block_bytes;
                 let weights = match weights_of {
                     0 => q8_0_weights(n_rows, n_cols),
-                    _ => q4_0_weights(n_rows, n_cols),
+                    1 => q4_0_weights(n_rows, n_cols),
+                    _ => q5_0_weights(n_rows, n_cols),
                 };
                 let x: Vec<f32> = (0..batch * n_cols)
                     .map(|i| ((i as f32) * 0.019).cos())
@@ -206,6 +209,27 @@ mod tests {
                 .map(|i| (((r * n_cols + i) as f32) * 0.037).sin())
                 .collect();
             out.extend(ferrox_quant::quantize_q8_0(&row));
+        }
+        out
+    }
+
+    /// Q5_0 blocks: `half d`, a 4-byte `qh` bitplane, 16 packed
+    /// nibbles. `qh` is deliberately varied rather than zero -- a
+    /// kernel that dropped the fifth bit entirely would agree with the
+    /// twin on an all-zero `qh` fixture.
+    fn q5_0_weights(n_rows: usize, n_cols: usize) -> Vec<u8> {
+        let mut out = Vec::new();
+        let blocks = n_cols / 32;
+        let mut state = 6789u32;
+        for r in 0..n_rows {
+            for b in 0..blocks {
+                let scale = half::f16::from_f32(0.05 + ((r * blocks + b) % 13) as f32 * 0.01);
+                out.extend_from_slice(&scale.to_le_bytes());
+                for _ in 0..20 {
+                    state = state.wrapping_mul(1103515245).wrapping_add(12345);
+                    out.push((state >> 16) as u8);
+                }
+            }
         }
         out
     }

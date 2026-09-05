@@ -205,8 +205,23 @@ impl Grammar {
     /// `allow_eog` mask and the abort in `llama_grammar_accept_impl`, so
     /// an untriggered grammar has no opinion about ending. It has not been
     /// applied; a generation that never calls a tool must be able to stop.
+    ///
+    /// Unless its trigger is MANDATORY, which is this repo's own addition
+    /// and the one place it departs from upstream here: see
+    /// [`LazyTriggers::mandatory`].
     pub fn allows_eog(&self) -> bool {
-        self.is_awaiting_trigger() || self.stacks.iter().any(|s| s.is_empty())
+        if self.is_awaiting_trigger() {
+            return !self.trigger_is_mandatory();
+        }
+        self.stacks.iter().any(|s| s.is_empty())
+    }
+
+    /// Whether this grammar's trigger must fire before the generation may
+    /// end. False for every grammar that is not lazy, and for every lazy
+    /// grammar whose triggers were not marked
+    /// [`mandatory`](LazyTriggers::mandatory).
+    pub fn trigger_is_mandatory(&self) -> bool {
+        self.lazy.as_ref().is_some_and(LazyState::is_mandatory)
     }
 
     /// True when no parse is viable at all. Reaching this means a token was

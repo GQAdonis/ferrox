@@ -14,31 +14,153 @@
 //! KV-prefix cache (reusing the shared prefix of two *different*
 //! prompts) is a separate, larger piece of work, tracked separately.
 
-use crate::generate::{FinishReason, Usage};
+use crate::generate::{Completed, FinishReason, GenerationParams, Usage};
+use ferrox_models::grammar::Grammar;
 use ferrox_models::sampling::SamplingParams;
 use std::collections::{HashMap, VecDeque};
 use std::hash::{Hash, Hasher};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CacheKey {
     pub model: String,
     pub prompt: String,
-    pub max_tokens: usize,
-    /// Every sampling parameter that affects output. See
-    /// [`SamplingKey`] for why it is a struct built by one function
-    /// rather than a handful of fields written out here.
+    /// Every resolved generation parameter that decides the answer.
+    /// See [`GenerationKey`] for why it is a struct built by one
+    /// function rather than a handful of fields written out here.
+    pub generation: GenerationKey,
+    /// The seed **as the request spelled it**, not the resolved one.
     ///
-    /// Only requests with a deterministic outcome -- greedy
-    /// (temperature 0) or an explicit seed -- are ever looked up against
-    /// this cache at all; see `ChatCompletionRequest::is_cacheable`. A
-    /// request without a deterministic outcome must never populate or
-    /// read this cache, since a "hit" would silently replay one random
-    /// sample forever instead of producing fresh output each call,
-    /// defeating the entire point of sampling.
-    pub sampling: SamplingKey,
+    /// [`GenerationParams::seed`] is already resolved, and for a request
+    /// that named no seed that resolution is a nanosecond clock reading
+    /// (`ChatCompletionRequest::resolved_seed`). Keying on it would make
+    /// every greedy request a fresh key and switch this cache off
+    /// entirely, so the request's own `Option` is what is keyed here.
+    ///
+    /// That is sound only because of what is allowed in at all: only
+    /// requests with a deterministic outcome -- greedy (temperature 0)
+    /// or an explicit seed -- are ever looked up against this cache;
+    /// see `ChatCompletionRequest::is_cacheable`. A request without a
+    /// deterministic outcome must never populate or read this cache,
+    /// since a "hit" would silently replay one random sample forever
+    /// instead of producing fresh output each call, defeating the
+    /// entire point of sampling. Greedy ignores the seed, and a seeded
+    /// request carries its seed here, so the resolved value never
+    /// distinguishes two keys that this `Option` does not.
     pub seed: Option<u64>,
+}
+
+/// Every field of a resolved [`GenerationParams`] that can change the
+/// answer, in a form that can be hashed and compared for exact
+/// equality.
+///
+/// Same reason [`SamplingKey`] exists, one layer out: the interesting
+/// property is not what is in it, it is that nothing is left out. This
+/// struct is what shipped broken. `CacheKey` used to restate a few of
+/// the request's fields by hand, so `grammar`, `json_object` and
+/// `ignore_eos` -- three things that decide the answer and change
+/// nothing about the prompt -- hashed identically to their absence, and
+/// a grammar-constrained request was served the unconstrained answer a
+/// previous caller had cached, with a 200 and no way to tell (#35).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct GenerationKey {
+    pub max_tokens: usize,
+    pub sampling: SamplingKey,
     pub stop: Vec<String>,
+    pub stop_token_ids: Vec<usize>,
+    pub json_object: bool,
+    pub grammar: Option<GrammarKey>,
+    pub ignore_eos: bool,
+}
+
+/// A compiled grammar, in a form a hashed cache key can hold.
+///
+/// [`Grammar`] is `Eq` but not `Hash`, and it belongs to
+/// `ferrox-models`, so equality here is the grammar's own -- exact and
+/// structural -- and only the hash is supplied. It is taken over the
+/// derived `Debug` rendering, which is a total dump of the same fields
+/// derived `PartialEq` compares, so equal grammars render equally and
+/// hash equally: the one law `Hash` owes `Eq`.
+///
+/// Two *different* grammars that happened to render the same would only
+/// share a hash bucket, never an entry, because `Eq` still separates
+/// them. So the failure this could produce is a slower lookup, not a
+/// wrong answer.
+///
+/// The rendering is transient -- built inside `hash` and dropped there
+/// -- so a large schema-derived grammar costs a hash rather than a
+/// second copy of itself in every cache key.
+#[derive(Debug, Clone)]
+pub struct GrammarKey(pub Arc<Grammar>);
+
+impl PartialEq for GrammarKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.0 == other.0
+    }
+}
+
+impl Eq for GrammarKey {}
+
+impl Hash for GrammarKey {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        format!("{:?}", self.0).hash(state);
+    }
+}
+
+/// The cache-key form of a resolved generation configuration.
+///
+/// The destructure below is exhaustive ON PURPOSE, for the same reason
+/// [`sampling_key`]'s is: a field added to `GenerationParams` stops this
+/// crate compiling, HERE, until someone decides whether it belongs in
+/// the cache key. Two of the nine fields are deliberately NOT keyed and
+/// each says why at its `_` binding -- an exclusion on the record is a
+/// decision; a field nobody looked at is the bug in #35.
+pub fn generation_key(params: &GenerationParams) -> GenerationKey {
+    let GenerationParams {
+        max_tokens,
+        sampling,
+        // NOT KEYED. The resolved seed is a clock reading for any
+        // request that named none, which would give every greedy
+        // request a unique key. `CacheKey::seed` carries the request's
+        // own `Option<u64>` instead, and its doc comment argues why the
+        // two never disagree about which answers may be shared.
+        seed: _,
+        stop,
+        stop_token_ids,
+        json_object,
+        grammar,
+        // NOT KEYED. A cancel token is this request's own handle, not a
+        // parameter of the answer: two identical requests hold two
+        // different tokens, so keying on it would give every request a
+        // unique key and switch the cache off.
+        //
+        // Cancellation does change what comes back -- a `Cancelled`
+        // partial -- but that is not a question for the key. A partial
+        // answer must not be stored under ANY key, so the guard is on
+        // the PUT: [`CachedCompletion::cacheable`] is the only way to
+        // build the value [`ResponseCache::put`] accepts, and a
+        // cancelled generation cannot produce one (#57). Which handler
+        // happens to register a cancel token no longer decides whether
+        // this cache is correct.
+        cancel: _,
+        ignore_eos,
+    } = params;
+    GenerationKey {
+        max_tokens: *max_tokens,
+        sampling: sampling_key(sampling),
+        stop: stop.clone(),
+        // Keyed even though it is EMPTY at every current call site (the
+        // ids are resolved later, by the layer holding the tokenizer).
+        // It is derived from `stop` and the model's vocabulary, both of
+        // which are already in the key, so keying it can never split
+        // two answers that are the same -- and "empty here" is a fact
+        // about today's call order, not a property of the field.
+        stop_token_ids: stop_token_ids.clone(),
+        json_object: *json_object,
+        grammar: grammar.clone().map(GrammarKey),
+        ignore_eos: *ignore_eos,
+    }
 }
 
 /// Every field of a resolved [`SamplingParams`], in a form that can be
@@ -65,6 +187,10 @@ pub struct SamplingKey {
     pub penalty_last_n: usize,
     pub presence_penalty_bits: u32,
     pub frequency_penalty_bits: u32,
+    /// The ORDER the chain ran in (llama.cpp's `samplers`). Two
+    /// requests that differ only in it get different answers, so it is
+    /// a key field like any other knob.
+    pub sampler_order: ferrox_models::sampler_order::SamplerOrder,
 }
 
 /// The cache-key form of a resolved sampling configuration.
@@ -87,6 +213,7 @@ pub fn sampling_key(params: &SamplingParams) -> SamplingKey {
         penalty_last_n,
         presence_penalty,
         frequency_penalty,
+        sampler_order,
     } = params;
     SamplingKey {
         temperature_bits: temperature.to_bits(),
@@ -97,6 +224,7 @@ pub fn sampling_key(params: &SamplingParams) -> SamplingKey {
         penalty_last_n: *penalty_last_n,
         presence_penalty_bits: presence_penalty.to_bits(),
         frequency_penalty_bits: frequency_penalty.to_bits(),
+        sampler_order: *sampler_order,
     }
 }
 
@@ -120,6 +248,45 @@ pub struct CachedCompletion {
     pub content: String,
     pub finish: FinishReason,
     pub usage: Usage,
+}
+
+impl CachedCompletion {
+    /// This completion in the form [`ResponseCache::put`] accepts, or
+    /// `None` when it is a PARTIAL answer and may not be stored at all.
+    ///
+    /// The whole guard against #57 is that this is the only
+    /// constructor of [`CacheableCompletion`]: a cancelled generation
+    /// keeps the tokens it managed to decode, which is the right
+    /// response to the request that was cancelled and a truncation of
+    /// every later request that would be served it. The completeness
+    /// question is [`FinishReason::completed`]'s, asked once, next to
+    /// the enum that answers it.
+    pub fn cacheable(self) -> Option<CacheableCompletion> {
+        // Obtaining the proof IS the check, and it is then dropped:
+        // what a `Completed` certifies is that the value below may
+        // exist at all, so from here on the value's own existence
+        // carries it.
+        let _proof: Completed = self.finish.completed()?;
+        Some(CacheableCompletion { completion: self })
+    }
+}
+
+/// A completion that has been shown to be COMPLETE, and is therefore
+/// allowed into the cache.
+///
+/// Both fields are private and there is no public constructor, so this
+/// type cannot be built outside this module and
+/// [`CachedCompletion::cacheable`] is the only thing inside it that
+/// builds one. A caller holding a `Cancelled` partial has nothing it
+/// can pass to [`ResponseCache::put`]; it cannot forget the check,
+/// because there is no argument it could pass instead.
+///
+/// The [`Completed`] is minted from THIS completion's own finish
+/// reason, not handed in beside it, so the proof cannot be borrowed
+/// from some other generation that happened to end well.
+#[derive(Debug)]
+pub struct CacheableCompletion {
+    completion: CachedCompletion,
 }
 
 struct Entry {
@@ -204,7 +371,12 @@ impl ResponseCache {
     /// Inserts or replaces the cached response for `key`, evicting the
     /// least-recently-used entry first if the cache is already at
     /// `max_entries` and `key` isn't already present.
-    pub fn put(&mut self, key: CacheKey, completion: CachedCompletion) {
+    ///
+    /// Takes a [`CacheableCompletion`] rather than a
+    /// [`CachedCompletion`] so that a partial answer has no spelling
+    /// that reaches this function (#57).
+    pub fn put(&mut self, key: CacheKey, completion: CacheableCompletion) {
+        let CacheableCompletion { completion } = completion;
         if !self.entries.contains_key(&key) && self.entries.len() >= self.max_entries {
             if let Some(oldest) = self.order.pop_front() {
                 self.entries.remove(&oldest);
@@ -235,14 +407,47 @@ mod tests {
     use super::*;
 
     fn key(prompt: &str) -> CacheKey {
+        key_under(prompt, |_| {})
+    }
+
+    /// A key built the way the server builds one: from
+    /// [`GenerationParams`], through [`generation_key`]. `tweak` is the
+    /// single parameter under test.
+    ///
+    /// Going through the real builder is the point. Reaching into
+    /// [`CacheKey`] and setting `generation.grammar` by hand would test
+    /// this module's `Eq`/`Hash` and nothing else -- it passes happily
+    /// against the broken key that shipped, because the broken part was
+    /// the BUILDER dropping the field on its way in.
+    fn key_under(prompt: &str, tweak: impl FnOnce(&mut GenerationParams)) -> CacheKey {
+        let mut params = params();
+        tweak(&mut params);
         CacheKey {
             model: "test-model".to_string(),
             prompt: prompt.to_string(),
-            max_tokens: 16,
-            sampling: sampling_key(&SamplingParams::default()),
+            generation: generation_key(&params),
             seed: None,
-            stop: Vec::new(),
         }
+    }
+
+    /// The `GenerationParams` these cache-mechanics tests key on: every
+    /// field at its do-nothing value.
+    fn params() -> GenerationParams {
+        GenerationParams {
+            max_tokens: 16,
+            sampling: SamplingParams::default(),
+            seed: 0,
+            stop: Vec::new(),
+            stop_token_ids: Vec::new(),
+            json_object: false,
+            grammar: None,
+            cancel: None,
+            ignore_eos: false,
+        }
+    }
+
+    fn grammar(src: &str) -> Arc<Grammar> {
+        Arc::new(Grammar::from_str_with_root(src, "root").expect("grammar"))
     }
 
     /// Wraps plain text into a `CachedCompletion` with fixed
@@ -256,11 +461,109 @@ mod tests {
         }
     }
 
+    /// The same thing in the form `put` accepts. It exists because
+    /// `put` takes proof of completeness and [`cc`] builds a `Stop`,
+    /// which has it. There is no expression that would put a
+    /// `Cancelled` partial in here.
+    fn cacheable(text: &str) -> CacheableCompletion {
+        cc(text)
+            .cacheable()
+            .expect("a completion that stopped on its own is cacheable")
+    }
+
+    /// The miss branch of `chat_completions_full`, in miniature: look
+    /// the request up, and on a miss offer what was generated to the
+    /// cache before answering with it.
+    ///
+    /// The two tests below assert on what this RETURNS, which is what a
+    /// later identical request is actually served. Asserting on
+    /// `stats()` instead would pass happily while a caller was being
+    /// handed somebody else's truncated answer.
+    fn serve(
+        cache: &mut ResponseCache,
+        key: &CacheKey,
+        generated: CachedCompletion,
+    ) -> CachedCompletion {
+        if let Some(hit) = cache.get(key) {
+            return hit;
+        }
+        // The handler's shape, and the whole guard: what is offered to
+        // the cache is whatever `cacheable` accepts, and there is no
+        // branch here that inspects a finish reason.
+        if let Some(cacheable) = generated.clone().cacheable() {
+            cache.put(key.clone(), cacheable);
+        }
+        generated
+    }
+
+    /// #57's two clients. Client A cancels after a few tokens; client B
+    /// sends the identical body and never cancels. B would have been
+    /// served A's fragment, carrying A's `finish_reason: "cancelled"`
+    /// for a request nobody cancelled.
+    ///
+    /// `cacheable` refuses the partial, so `serve` has nothing to hand
+    /// `put` -- and note there is no `if cancelled` in `serve` that
+    /// could have been forgotten. That is the fix: the check is not one
+    /// a caller can omit, because the caller cannot express the
+    /// alternative.
+    #[test]
+    fn a_cancelled_partial_is_not_served_to_a_later_identical_request() {
+        let mut cache = ResponseCache::new(10, Duration::from_secs(60));
+        let k = key("What is the capital of France?");
+
+        let partial = CachedCompletion {
+            content: "The capital of".to_string(),
+            finish: FinishReason::Cancelled,
+            usage: Usage::new(7, 3),
+        };
+        let client_a = serve(&mut cache, &k, partial.clone());
+        assert_eq!(
+            client_a, partial,
+            "the client that cancelled still gets the tokens it paid for"
+        );
+
+        let whole = CachedCompletion {
+            content: "The capital of France is Paris.".to_string(),
+            finish: FinishReason::Stop,
+            usage: Usage::new(7, 9),
+        };
+        let client_b = serve(&mut cache, &k, whole.clone());
+        assert_eq!(
+            client_b, whole,
+            "a request nobody cancelled must be answered by its own \
+             generation, never replayed from a cancelled one"
+        );
+        assert_eq!(
+            cache.stats().hits,
+            0,
+            "there was nothing to hit: the partial never became an entry"
+        );
+    }
+
+    /// The other half, because a guard that refuses everything reads as
+    /// coverage while quietly switching the cache off. The second
+    /// generation here produces DIFFERENT text, so if the first answer
+    /// was not stored and replayed, the difference reaches the caller.
+    #[test]
+    fn a_completed_answer_is_still_served_to_a_later_identical_request() {
+        let mut cache = ResponseCache::new(10, Duration::from_secs(60));
+        let k = key("What is the capital of France?");
+
+        let whole = cc("The capital of France is Paris.");
+        assert_eq!(serve(&mut cache, &k, whole.clone()), whole);
+        assert_eq!(
+            serve(&mut cache, &k, cc("something else entirely")),
+            whole,
+            "a completed answer must still be cached and replayed"
+        );
+        assert_eq!(cache.stats().hits, 1);
+    }
+
     #[test]
     fn miss_then_hit_for_the_same_key() {
         let mut cache = ResponseCache::new(10, Duration::from_secs(60));
         assert_eq!(cache.get(&key("hello")), None);
-        cache.put(key("hello"), cc("world"));
+        cache.put(key("hello"), cacheable("world"));
         assert_eq!(cache.get(&key("hello")), Some(cc("world")));
 
         let stats = cache.stats();
@@ -272,8 +575,8 @@ mod tests {
     #[test]
     fn different_keys_do_not_collide() {
         let mut cache = ResponseCache::new(10, Duration::from_secs(60));
-        cache.put(key("prompt a"), cc("response a"));
-        cache.put(key("prompt b"), cc("response b"));
+        cache.put(key("prompt a"), cacheable("response a"));
+        cache.put(key("prompt b"), cacheable("response b"));
         assert_eq!(cache.get(&key("prompt a")), Some(cc("response a")));
         assert_eq!(cache.get(&key("prompt b")), Some(cc("response b")));
     }
@@ -281,12 +584,10 @@ mod tests {
     #[test]
     fn different_max_tokens_is_a_different_key_even_for_the_same_prompt() {
         let mut cache = ResponseCache::new(10, Duration::from_secs(60));
-        let mut k1 = key("same prompt");
-        k1.max_tokens = 16;
-        let mut k2 = key("same prompt");
-        k2.max_tokens = 32;
+        let k1 = key_under("same prompt", |p| p.max_tokens = 16);
+        let k2 = key_under("same prompt", |p| p.max_tokens = 32);
 
-        cache.put(k1.clone(), cc("short response"));
+        cache.put(k1.clone(), cacheable("short response"));
         assert_eq!(
             cache.get(&k2),
             None,
@@ -295,10 +596,116 @@ mod tests {
         assert_eq!(cache.get(&k1), Some(cc("short response")));
     }
 
+    /// A grammar is a logit mask: it changes the answer and changes
+    /// nothing about the prompt. It was outside the key, so the second
+    /// request here used to be SERVED THE FIRST ONE'S UNCONSTRAINED
+    /// PROSE -- a 200 that looks like compliance with a constraint that
+    /// was never even compiled (#35).
+    ///
+    /// Asserted on the answer that comes back rather than on key
+    /// inequality, because a key that differs is only interesting if the
+    /// lookup the server performs is the one using it.
+    #[test]
+    fn a_grammar_request_is_not_served_the_unconstrained_answer() {
+        let mut cache = ResponseCache::new(10, Duration::from_secs(60));
+
+        let plain = key("same prompt");
+        cache.put(plain.clone(), cacheable("Sure! Here are a few options..."));
+
+        let constrained = key_under("same prompt", |p| {
+            p.grammar = Some(grammar("root ::= \"yes\" | \"no\""))
+        });
+
+        assert_eq!(
+            cache.get(&constrained),
+            None,
+            "a grammar-constrained request must not be answered with prose \
+             generated under no grammar"
+        );
+        assert_eq!(
+            cache.get(&plain),
+            Some(cc("Sure! Here are a few options...")),
+            "the unconstrained entry is still there: the miss above is the \
+             grammar, not an unstable key"
+        );
+    }
+
+    /// Two different grammars are two different constraints, so one's
+    /// answer is not the other's. The strictly-stronger half of the test
+    /// above: keying on "is there a grammar at all" would pass that one
+    /// and fail this one.
+    #[test]
+    fn two_different_grammars_do_not_share_an_answer() {
+        let mut cache = ResponseCache::new(10, Duration::from_secs(60));
+        let keyed =
+            |src: &'static str| key_under("same prompt", move |p| p.grammar = Some(grammar(src)));
+
+        let yes_no = keyed("root ::= \"yes\" | \"no\"");
+        let digits = keyed("root ::= [0-9]+");
+        cache.put(yes_no.clone(), cacheable("yes"));
+
+        assert_eq!(
+            cache.get(&digits),
+            None,
+            "a request constrained to digits must not be served an answer \
+             produced under a yes/no grammar"
+        );
+        assert_eq!(cache.get(&yes_no), Some(cc("yes")));
+    }
+
+    /// JSON-object mode is the other logit mask, and its failure is
+    /// louder than the grammar one: `validate_json_object_output` runs
+    /// against whatever the cache handed back, so a `json_object`
+    /// request that hit a cached prose answer got a hard 400 for a body
+    /// that would have succeeded (#35).
+    #[test]
+    fn a_json_object_request_is_not_served_the_unconstrained_answer() {
+        let mut cache = ResponseCache::new(10, Duration::from_secs(60));
+
+        let plain = key("same prompt");
+        cache.put(plain.clone(), cacheable("Sure! Here are a few options..."));
+
+        let json = key_under("same prompt", |p| p.json_object = true);
+
+        assert_eq!(
+            cache.get(&json),
+            None,
+            "a json_object request must not be answered with prose the JSON \
+             mask never saw"
+        );
+        assert_eq!(
+            cache.get(&plain),
+            Some(cc("Sure! Here are a few options..."))
+        );
+    }
+
+    /// `ignore_eos` suppresses the model's own end-of-generation set so
+    /// a benchmarking run produces EXACTLY `max_tokens`. Served from a
+    /// cache entry populated without it, it returns the short
+    /// EOS-terminated answer instead -- the field's one stated purpose,
+    /// defeated silently (#35).
+    #[test]
+    fn an_ignore_eos_request_is_not_served_the_eos_terminated_answer() {
+        let mut cache = ResponseCache::new(10, Duration::from_secs(60));
+
+        let stops_at_eos = key("same prompt");
+        cache.put(stops_at_eos.clone(), cacheable("short"));
+
+        let runs_on = key_under("same prompt", |p| p.ignore_eos = true);
+
+        assert_eq!(
+            cache.get(&runs_on),
+            None,
+            "ignore_eos must not be answered with a completion that stopped \
+             at the model's EOS"
+        );
+        assert_eq!(cache.get(&stops_at_eos), Some(cc("short")));
+    }
+
     #[test]
     fn expired_entry_is_a_miss_and_is_evicted() {
         let mut cache = ResponseCache::new(10, Duration::from_millis(10));
-        cache.put(key("hello"), cc("world"));
+        cache.put(key("hello"), cacheable("world"));
         std::thread::sleep(Duration::from_millis(30));
         assert_eq!(
             cache.get(&key("hello")),
@@ -315,11 +722,11 @@ mod tests {
     #[test]
     fn evicts_least_recently_used_entry_when_full() {
         let mut cache = ResponseCache::new(2, Duration::from_secs(60));
-        cache.put(key("a"), cc("1"));
-        cache.put(key("b"), cc("2"));
+        cache.put(key("a"), cacheable("1"));
+        cache.put(key("b"), cacheable("2"));
         // touch "a" so "b" becomes the least-recently-used entry
         assert_eq!(cache.get(&key("a")), Some(cc("1")));
-        cache.put(key("c"), cc("3"));
+        cache.put(key("c"), cacheable("3"));
 
         assert_eq!(
             cache.get(&key("b")),
@@ -341,9 +748,9 @@ mod tests {
     #[test]
     fn putting_an_existing_key_again_does_not_grow_past_capacity() {
         let mut cache = ResponseCache::new(2, Duration::from_secs(60));
-        cache.put(key("a"), cc("1"));
-        cache.put(key("b"), cc("2"));
-        cache.put(key("a"), cc("1-updated")); // re-insert, should replace, not evict
+        cache.put(key("a"), cacheable("1"));
+        cache.put(key("b"), cacheable("2"));
+        cache.put(key("a"), cacheable("1-updated")); // re-insert, should replace, not evict
         assert_eq!(cache.stats().entries, 2);
         assert_eq!(cache.get(&key("a")), Some(cc("1-updated")));
         assert_eq!(

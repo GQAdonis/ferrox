@@ -20,6 +20,17 @@ use std::sync::Mutex;
 /// Online-softmax GQA decode: `q` [n_heads * head_dim],
 /// `k_cache`/`v_cache` [seq_len * n_kv_heads * head_dim].
 pub const GQA_DECODE_KERNEL_SRC: &str = r#"
+// NVRTC compiles without the C headers, so `INFINITY` is not defined:
+// it is a <math.h> macro, and this kernel used it for the online-softmax
+// running maximum. The kernel therefore never compiled, and
+// `FERROX_CUDA_GQA=1` failed at launch for anyone who set it. Found by
+// running the `#[ignore]`d hardware tests on a real GPU for the first
+// time, 2026-09-04. The bit pattern is the same value without the
+// header dependency.
+__device__ __forceinline__ float ferrox_inf() {
+    return __int_as_float(0x7f800000);
+}
+
 extern "C" __global__ void gqa_decode(
     const float* q,
     const float* k_cache,
@@ -43,7 +54,7 @@ extern "C" __global__ void gqa_decode(
     int n_local = 0;
     for (int d = lane; d < head_dim; d += W) { acc[n_local++] = 0.f; }
 
-    float m = -INFINITY;
+    float m = -ferrox_inf();
     float s = 0.f;
     const unsigned mask = 0xffffffffu;
 
@@ -57,7 +68,7 @@ extern "C" __global__ void gqa_decode(
         float dot = __shfl_sync(mask, pdot, 0);
         float score = dot * scale;
         float m2 = fmaxf(m, score);
-        float a = (m == -INFINITY) ? 0.f : expf(m - m2);
+        float a = (m == -ferrox_inf()) ? 0.f : expf(m - m2);
         float b = expf(score - m2);
         s = s * a + b;
         const float* v_t = v_cache + (t * n_kv_heads + kv_h) * head_dim;

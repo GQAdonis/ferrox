@@ -885,7 +885,7 @@ fn pool_immovable_refusal(
     // honest answer: such a pool serves nothing.
     let blocks_per_layer_limit = total_blocks / decoder.layers.len();
     let positions_limit = blocks_per_layer_limit * block_size;
-    let shape = KvShape::from_config(&decoder.config, KvElem::F32, 1);
+    let shape = KvShape::from_config(&decoder.config, KvElem::F32);
     Some(DecodeError::KvBudgetExceeded {
         binding: Ceiling::DeviceMemory.code(),
         estimated_bytes: shape.kv_bytes_for_tokens(max_seq_len),
@@ -987,7 +987,52 @@ impl FinishReason {
             _ => None,
         }
     }
+
+    /// Proof that this generation produced a WHOLE answer, or `None`
+    /// if it did not.
+    ///
+    /// The match is exhaustive with no `_` arm on purpose: it is the
+    /// one place in the server that decides what "the answer is
+    /// finished" means, and a variant added to this enum later must
+    /// stop this crate compiling here rather than defaulting to
+    /// whichever side of the question its author never considered.
+    ///
+    /// Anything that stores an answer for a LATER caller needs this,
+    /// because storing a partial answer republishes it as a finished
+    /// one. Today that is the whole-response cache; see
+    /// [`crate::response_cache::CachedCompletion::cacheable`], which is
+    /// the only holder of a [`Completed`] outside this module and
+    /// cannot mint one itself.
+    pub fn completed(&self) -> Option<Completed> {
+        match self {
+            // Every one of these is the generation reaching an end the
+            // request asked for: the model's own turn end, a stop
+            // string the caller supplied, or the caller's own token
+            // budget (`max_tokens` is part of the cache key, so
+            // replaying a `Length` answer replays it under the same
+            // budget that produced it).
+            FinishReason::Stop | FinishReason::StopSequence(_) | FinishReason::Length => {
+                Some(Completed(()))
+            }
+            // A canceller cut this short. The tokens that arrived are
+            // the honest answer to THIS request and a truncation of
+            // every other one.
+            FinishReason::Cancelled => None,
+        }
+    }
 }
+
+/// Evidence that a generation ran to an end of its own, produced only
+/// by [`FinishReason::completed`].
+///
+/// The unit field is private to this module, so no other module can
+/// build one, clone one out of thin air, or forget to obtain one: a
+/// function that requires a `Completed` is a function a partial answer
+/// cannot be passed to. That is the difference between this and a
+/// `bool` beside the data, which the next caller does not have to look
+/// at (#57).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Completed(());
 
 /// OpenAI-convention token accounting, reported in the response's
 /// `usage` field. Counted from the exact token ids the generation loop
@@ -1285,8 +1330,16 @@ pub fn generate(
             if let Some(err) = ceiling.prompt_refusal(prompt_tokens) {
                 return Err(err);
             }
+            // Checked BEFORE the clamp below, because the clamp's own
+            // comparison used to be the thing that wrapped: a
+            // `max_tokens` near `usize::MAX` summed to less than the
+            // limit and walked straight past the guard that existed to
+            // stop it. See `ContextCeiling::positions_refusal`.
+            if let Some(err) = ceiling.overflow_refusal(prompt_tokens, params.max_tokens) {
+                return Err(err);
+            }
             match ceiling.limit() {
-                Some(limit) if prompt_tokens + params.max_tokens > limit => {
+                Some(limit) if prompt_tokens.saturating_add(params.max_tokens) > limit => {
                     let mut p = params.clone();
                     p.max_tokens = limit - prompt_tokens;
                     tracing::debug!(
@@ -1302,7 +1355,24 @@ pub fn generate(
         }
         None => params,
     };
-    let max_seq_len = prompt_tokens + params.max_tokens;
+    // `params` is the clamped copy by now, so this cannot exceed the
+    // ceiling when one exists. `checked_add` covers the case where none
+    // does: an unbounded deployment must still not wrap into a small
+    // number and pass every check below it.
+    let Some(max_seq_len) = prompt_tokens.checked_add(params.max_tokens) else {
+        return Err(DecodeError::KvBudgetExceeded {
+            binding: ferrox_models::Ceiling::ContextLength.code(),
+            estimated_bytes: 0,
+            limit_bytes: 0,
+            positions: usize::MAX,
+            positions_limit: usize::MAX,
+            detail: format!(
+                "prompt of {prompt_tokens} tokens plus max_tokens of {} overflows the position \
+                 counter, so this request cannot be served by any deployment",
+                params.max_tokens
+            ),
+        });
+    };
 
     // A request whose worst case exceeds the *whole* pool is not a
     // request to retry: no amount of waiting frees blocks that do not
@@ -1452,9 +1522,10 @@ pub fn generate(
     let (finish, generated_ids, final_logits) = sample_until_stop(
         logits,
         pos,
+        &tokens,
         stop_tokens,
         params,
-        |ids| tokenizer.decode(ids),
+        |ids| tokenizer.decode_bytes(ids),
         |next, pos| {
             if first_token_at.is_none() {
                 first_token_at = Some(std::time::Instant::now());
@@ -1582,16 +1653,36 @@ pub fn generate(
 fn sample_until_stop(
     mut logits: Vec<f32>,
     mut pos: usize,
+    // The prompt this generation continues. Passed rather than derived
+    // because the penalties window is the tail of `prompt ++ generated`
+    // (llama-server seeds its sampler with the prompt before the first
+    // draw), and this seam previously had no way to see it, so the HTTP
+    // API and `ferrox run` disagreed about what one flag means (#73).
+    prompt_ids: &[usize],
     stop_tokens: &StopTokens,
     params: &GenerationParams,
-    mut decode_one: impl FnMut(&[usize]) -> String,
+    // Raw BYTES, not text. A character can straddle two tokens, and
+    // deciding UTF-8 per token destroys it -- see `crate::utf8_stream`.
+    mut decode_one: impl FnMut(&[usize]) -> Vec<u8>,
     mut step: impl FnMut(usize, usize) -> Vec<f32>,
     mut emit: impl FnMut(&str),
     decode_token: &dyn Fn(usize) -> String,
 ) -> Result<(FinishReason, Vec<usize>, Vec<f32>), DecodeError> {
     let mut matcher = crate::stop::StopMatcher::new(&params.stop, &params.stop_token_ids);
+    // Sits BEFORE the stop matcher: a stop string is text, so it can
+    // only be matched against whole characters, and half of one is not
+    // text yet.
+    let mut utf8 = crate::utf8_stream::Utf8Stream::default();
     let mut state = crate::sample_step::SampleState::new(params.seed);
-    let mut generated_ids: Vec<usize> = Vec::with_capacity(params.max_tokens);
+    // NOT `with_capacity(params.max_tokens)`. That is a caller-supplied
+    // number sizing an allocation, and it reached
+    // `Vec::with_capacity(usize::MAX)` from one unauthenticated POST.
+    // The vector grows as tokens are produced, so the reservation only
+    // ever saved reallocations on a path that performs a full model
+    // forward pass per element. A cap keeps that saving for the sizes
+    // it was worth having for, and refuses to pre-size beyond them.
+    const PREALLOC_CAP: usize = 4096;
+    let mut generated_ids: Vec<usize> = Vec::with_capacity(params.max_tokens.min(PREALLOC_CAP));
     let mut finish = FinishReason::Length;
 
     for _ in 0..params.max_tokens {
@@ -1608,6 +1699,7 @@ fn sample_until_stop(
             &mut state,
             &logits,
             params,
+            prompt_ids,
             &generated_ids,
             stop_tokens,
             decode_token,
@@ -1641,7 +1733,7 @@ fn sample_until_stop(
 
         // Layer 2: only text that can no longer become part of a stop
         // string leaves here.
-        match matcher.push(&decode_one(&[next])) {
+        match matcher.push(&utf8.push(&decode_one(&[next]))) {
             crate::stop::StopStep::Emit(text) => {
                 if !text.is_empty() {
                     emit(&text);
@@ -1654,6 +1746,18 @@ fn sample_until_stop(
                 finish = FinishReason::StopSequence(stop);
                 break;
             }
+        }
+    }
+
+    // A generation that stopped mid-character cannot complete it, so
+    // the held bytes surface as U+FFFD rather than vanishing -- that
+    // goes through the matcher like any other text.
+    let partial = utf8.flush();
+    if !partial.is_empty() {
+        let (crate::stop::StopStep::Emit(text) | crate::stop::StopStep::Matched { text, .. }) =
+            matcher.push(&partial);
+        if !text.is_empty() {
+            emit(&text);
         }
     }
 
@@ -1721,9 +1825,10 @@ pub fn generate_engine<E: Engine, T: TextTokenizer>(
     let (finish, generated_ids, _final_logits) = sample_until_stop(
         logits,
         pos,
+        &tokens,
         stop_tokens,
         params,
-        |ids| tokenizer.decode(ids),
+        |ids| tokenizer.decode_bytes(ids),
         |next, pos| {
             if first_token_at.is_none() {
                 first_token_at = Some(std::time::Instant::now());
@@ -1771,8 +1876,38 @@ pub(crate) fn floor_char_boundary(s: &str, idx: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
     use ferrox_models::config::test_dense_fixture;
+
+    /// Which endings may be replayed to a LATER caller, enumerated so
+    /// the answer is on the record rather than inferred from whichever
+    /// handler happens to hold a cancel token (#57).
+    ///
+    /// `Length` is on the completed side deliberately: `max_tokens` is
+    /// part of the response cache's key, so an answer truncated at the
+    /// budget is only ever replayed under the same budget that produced
+    /// it. `Cancelled` is the whole of the other side -- it kept the
+    /// tokens that had arrived, which answers the cancelled request and
+    /// truncates every other one.
+    #[test]
+    fn only_a_generation_that_reached_an_end_of_its_own_counts_as_completed() {
+        for reason in [
+            FinishReason::Stop,
+            FinishReason::StopSequence("<END>".to_string()),
+            FinishReason::Length,
+        ] {
+            assert!(
+                reason.completed().is_some(),
+                "{reason:?} produced the whole answer the request asked for"
+            );
+        }
+        assert!(
+            FinishReason::Cancelled.completed().is_none(),
+            "a cancelled generation is a partial answer and may not be stored \
+             for anybody else"
+        );
+    }
 
     fn small_decoder() -> Decoder {
         Decoder::new_random_small(test_dense_fixture(), 2, 256)
@@ -1833,7 +1968,8 @@ mod tests {
         }
 
         assert_eq!(
-            caches[0].seq_len, fresh_caches[0].seq_len,
+            caches[0].positions(),
+            fresh_caches[0].positions(),
             "must not push any position beyond the real prompt length"
         );
         // Tolerance, not bit equality. `forward_token` goes through
@@ -2251,14 +2387,81 @@ mod tests {
         let (finish, ids, _) = sample_until_stop(
             first,
             0,
+            // A scripted-logits harness with no real prompt: the empty
+            // half is the truth here, not an omission.
+            &[],
             &stop_tokens,
             params,
-            |ids| ids.iter().copied().map(&render).collect::<String>(),
+            |ids| {
+                ids.iter()
+                    .copied()
+                    .map(&render)
+                    .collect::<String>()
+                    .into_bytes()
+            },
             |_tok, _pos| logits_for(take()),
             |chunk| chunks.push(chunk.to_string()),
             &render,
         )?;
         Ok((finish, ids, chunks))
+    }
+
+    /// The wiring #124 was about, end to end through the decode loop.
+    ///
+    /// The unit tests in `crate::utf8_stream` prove the buffer works.
+    /// They cannot prove `sample_until_stop` USES it, and that call is
+    /// the whole fix -- the same gap that let a batched row ship with
+    /// no timings. So this drives the real loop with a tokenizer whose
+    /// tokens are single bytes, which is exactly what a byte-fallback
+    /// vocabulary does to an emoji.
+    ///
+    /// It cannot go through `run_scripted`: that helper's `render`
+    /// returns `String`, and half a character has no `String`.
+    #[test]
+    fn a_character_split_across_tokens_is_emitted_whole_by_the_decode_loop() {
+        let smiley = "😊".as_bytes().to_vec();
+        assert_eq!(smiley.len(), 4, "the point of this test");
+        let vocab = smiley.len() + 2;
+        let logits_for = |id: usize| {
+            let mut v = vec![0.0f32; vocab];
+            v[id] = 10.0;
+            v
+        };
+        let len = smiley.len();
+        let mut next = 0usize;
+        let mut take = move || {
+            let id = next.min(len - 1);
+            next += 1;
+            id
+        };
+        let first = logits_for(take());
+        let bytes = smiley;
+        let mut chunks: Vec<String> = Vec::new();
+        let (_finish, ids, _) = sample_until_stop(
+            first,
+            0,
+            &[],
+            &StopTokens::default(),
+            &scripted_params(4),
+            // One byte per token: each of the middle ones is invalid
+            // UTF-8 on its own, which is the whole problem.
+            |ids| ids.iter().map(|&id| bytes[id]).collect(),
+            |_tok, _pos| logits_for(take()),
+            |chunk| chunks.push(chunk.to_string()),
+            &|_id| String::new(),
+        )
+        .expect("decode");
+
+        assert_eq!(ids.len(), 4, "four tokens, one per byte");
+        assert_eq!(
+            chunks.concat(),
+            "😊",
+            "a character split across tokens must not be decoded per token"
+        );
+        assert!(
+            !chunks.concat().contains(char::REPLACEMENT_CHARACTER),
+            "the bytes were valid UTF-8 together; only the split made them look invalid"
+        );
     }
 
     fn scripted_params(max_tokens: usize) -> GenerationParams {
@@ -2534,7 +2737,20 @@ mod tests {
             // generated: nothing meaningful to truncate, skip.
             return;
         };
-        let stop_str = baseline[cut..].to_string();
+        // This decoder emits arbitrary bytes through `ServerTokenizer::
+        // Byte`, so the tail can end in a U+FFFD that `Utf8Stream::flush`
+        // produced -- a character whose remaining bytes never arrived
+        // because generation hit `max_tokens` mid-sequence.
+        //
+        // That one is NOT matchable, and correctly so: while the loop is
+        // running, those bytes may still be completed by the next token,
+        // so the replacement does not exist yet. It is only knowable
+        // once generation has ended, which is after every stop decision
+        // has been made. Trimming it keeps this test about what it says
+        // it is about -- a stop sequence that DOES match.
+        let stop_str = baseline[cut..]
+            .trim_end_matches(char::REPLACEMENT_CHARACTER)
+            .to_string();
         if stop_str.is_empty() {
             return;
         }
@@ -3875,6 +4091,62 @@ mod tests {
         );
     }
 
+    /// A refusal's two halves must describe ONE reservation.
+    ///
+    /// `pool_immovable_refusal` reports `estimated_bytes` from
+    /// `KvShape::kv_bytes_for_tokens` beside a block count of
+    /// `max_seq_len.div_ceil(block_size) * n_layers`. The block count
+    /// has never had a window in it -- `KvCache::with_pool` reserves
+    /// `max_seq_len` positions for every layer -- while the byte figure
+    /// used to discount the sliding layers. For gpt-oss at 8192
+    /// positions the message therefore said ~390 MiB next to a ~768 MiB
+    /// reservation the same function had just rejected (#33).
+    ///
+    /// Two decoders, same shape, one with a window: the refusal must
+    /// price them identically, because the pool reserves for them
+    /// identically.
+    #[test]
+    fn the_pool_refusals_byte_figure_does_not_discount_a_window_the_pool_still_reserves() {
+        let full = small_decoder();
+        let mut alternating_cfg = test_dense_fixture();
+        alternating_cfg.sliding_window = Some(4);
+        alternating_cfg.swa_pattern = Some(2);
+        let alternating = Decoder::new_random_small(alternating_cfg, 2, 256);
+        assert_eq!(
+            alternating.config.uniform_sliding_window(),
+            None,
+            "an alternating model is the case no store may recycle"
+        );
+
+        // A pool that cannot cover one block per layer, so both models
+        // reach the immovable refusal.
+        let pool = Arc::new(Mutex::new(KvBlockPool::new(8, 1)));
+        let config = pool_config(pool, Duration::ZERO);
+        let max_seq_len = 64;
+
+        let bytes_of =
+            |decoder: &Decoder| match pool_immovable_refusal(decoder, &config, max_seq_len) {
+                Some(DecodeError::KvBudgetExceeded {
+                    estimated_bytes, ..
+                }) => estimated_bytes,
+                other => panic!("expected an immovable refusal, got {other:?}"),
+            };
+
+        let windowed_bytes = bytes_of(&alternating);
+        assert_eq!(
+            windowed_bytes,
+            bytes_of(&full),
+            "the window discounts nothing the pool reserves"
+        );
+        // And that figure is the whole reservation the refusal names:
+        // every layer, every position.
+        assert_eq!(
+            windowed_bytes,
+            KvShape::from_config(&full.config, KvElem::F32).per_token_kv_bytes()
+                * max_seq_len as u64
+        );
+    }
+
     /// A one-block pool cannot hold a two-layer model's caches under any
     /// schedule, so this is the immovable refusal too.
     #[test]
@@ -4014,7 +4286,7 @@ mod tests {
         let prompt = String::from_utf8(vec![1u8, 2, 3, 4, 5]).unwrap();
         let pool = Arc::new(Mutex::new(KvBlockPool::new(64, 64)));
         let config = pool_config(pool.clone(), Duration::ZERO);
-        let shape = KvShape::from_config(&decoder.config, KvElem::F32, 1);
+        let shape = KvShape::from_config(&decoder.config, KvElem::F32);
         // The prompt alone is 5 tokens against a ceiling of 4, so no
         // output budget exists that would make it servable.
         let ceiling = ContextCeiling::new(Some(4), shape);
@@ -4072,7 +4344,7 @@ mod tests {
     fn a_prompt_that_fits_is_served_with_its_budget_clamped_rather_than_refused() {
         let decoder = small_decoder();
         let prompt = String::from_utf8(vec![1u8, 2]).unwrap();
-        let shape = KvShape::from_config(&decoder.config, KvElem::F32, 1);
+        let shape = KvShape::from_config(&decoder.config, KvElem::F32);
         // 2 prompt tokens under a 4-position ceiling leaves room for 2,
         // and the request asks for 5.
         let ceiling = ContextCeiling::new(Some(4), shape);
@@ -4107,7 +4379,7 @@ mod tests {
     fn a_request_inside_the_ceiling_is_admitted_unchanged() {
         let decoder = small_decoder();
         let prompt = String::from_utf8(vec![1u8, 2]).unwrap();
-        let shape = KvShape::from_config(&decoder.config, KvElem::F32, 1);
+        let shape = KvShape::from_config(&decoder.config, KvElem::F32);
         let ceiling = ContextCeiling::new(Some(7), shape);
 
         let mut with = String::new();

@@ -326,7 +326,7 @@ impl Engine for Gemma4Engine {
                         n_heads,
                         n_kv,
                         head_dim,
-                        cache.seq_len,
+                        cache.rows(),
                         hp.sliding_window,
                     )
                 } else {
@@ -337,7 +337,7 @@ impl Engine for Gemma4Engine {
                         n_heads,
                         n_kv,
                         head_dim,
-                        cache.seq_len,
+                        cache.rows(),
                     )
                 }
             } else {
@@ -359,7 +359,7 @@ impl Engine for Gemma4Engine {
                         n_heads,
                         n_kv,
                         head_dim,
-                        cache.seq_len,
+                        cache.rows(),
                         hp.sliding_window,
                     )
                 } else {
@@ -370,7 +370,7 @@ impl Engine for Gemma4Engine {
                         n_heads,
                         n_kv,
                         head_dim,
-                        cache.seq_len,
+                        cache.rows(),
                     )
                 }
             };

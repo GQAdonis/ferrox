@@ -42,9 +42,10 @@
 //! stricter than upstream by design -- a keyword it cannot honour is a
 //! typed refusal rather than a grammar that accepts too much -- and its
 //! module docs list what is ported, what is refused by name, and where its
-//! output differs from llama.cpp's. It is not wired into the server
-//! either; `ferrox-server` still answers `response_format: json_schema`
-//! with a 501.
+//! output differs from llama.cpp's. `ferrox-server` now answers
+//! `response_format: {"type": "json_schema"}` through it (see that crate's
+//! `grammar_request`), so a schema and a hand-written grammar reach the
+//! same machine.
 //!
 //! **Lazy grammars** ([`lazy`]) are ported: `trigger_tokens` and
 //! `trigger_patterns`, the accumulated trigger buffer, and the replay that

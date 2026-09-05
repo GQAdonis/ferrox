@@ -149,14 +149,51 @@ The error always names the reason. Six things cause it:
    An architecture reaches it only if there is a benchmark row, a pinned
    logit comparison against real `libllama`, or a fixture; 11 do today
    (`llama`, `qwen2`, `qwen2moe`, `qwen3`, `qwen3moe`, `olmoe`,
-   `gemma2`, `gemma3`, `phi3`, `gpt-oss`, `dots1`). The other **46**
+**Gemma-2-27B, Gemma-3-4B/12B/27B: corrected 2026-09-02.** Those four
+sizes were quietly wrong until then, in two ways that both produce
+fluent text. The 27B checkpoints took `1/sqrt(head_dim)` as their
+attention scale where llama.cpp takes `1/sqrt(n_embd/n_head)` for that
+size alone, selected by layer count; and Gemma-3 4B and up applied
+linear RoPE scaling to the sliding-window layers llama.cpp ropes
+unscaled, because `rope_theta` is per layer while `rope_freqs` was
+global. Gemma-3-1B is the one size with no `rope_scaling`, and it was
+the audited fixture, which is why neither was visible.
+
+The evidence is llama.cpp's source and header-driven loader tests, NOT a
+logit comparison: no checkpoint of those sizes exists on the development
+host. A `ferrox parity` run against one is what would settle it.
+
+A cost came with it and has since been paid back. Gemma-3 4B and up
+briefly left the fused Metal dense stacks, because those took one
+`freq_factors` slice for a whole run of layers while these models need
+one per layer: correct, and slower. The stacks now carry a per-layer
+`LayerRope` holding the base and its divisors together, so supplying one
+without the other does not compile, and Gemma-3 4B+ is back on the fused
+path (#63).
+
+**That last part is proven on synthetic layers, not on a checkpoint.**
+No Gemma-3 4B/12B/27B GGUF exists on the development host, and
+Gemma-3-1B would prove nothing because it declares no rope scaling. The
+Metal tests build a two-layer stack carrying Gemma-3's two answers
+(base 1e6 divided by 8, and base 1e4 divided by 1) and assert the fused
+and per-layer launches agree bit for bit, then re-run the old bug on
+purpose so neither can pass vacuously. `ferrox layer-divergence` on a
+real gemma-3-4b, plus `ferrox parity` at Q8_0, is what would settle it.
+
+No published number changes:
+[`benchmarks/RESULTS.md`](../benchmarks/RESULTS.md) carries Gemma-3-1B
+only, and 1B is neither 27B nor rope-scaled, so it is untouched by all
+of this. The speed recovery from returning to the fused path is
+unmeasured, because measuring it needs a quiet host.
+
+   `gemma2`, `gemma3`, `phi3`, `gpt-oss`, `dots1`). The other **34**
    stop with `UnauditedArchitecture`. `FERROX_ALLOW_UNAUDITED_ARCH=1`
    runs one anyway; compare the output against llama.cpp yourself
    before you trust it.
 
 ### What "unaudited" costs you, per architecture
 
-"Unaudited" is not one thing. Some of the 46 are one fixture away from
+"Unaudited" is not one thing. One of the 34 is a fixture away from
 running and some need an attention implementation, so the refusal says
 which, with the `llama.cpp/src/models/*.cpp` line that decides it:
 
@@ -167,7 +204,7 @@ which, with the `llama.cpp/src/models/*.cpp` line that decides it:
 | `NEW CODE` | A different attention or residual structure. Not close. |
 | `UNKNOWN` | Reading both trees did not settle it. The message says what would. |
 
-All 46 have now been read on both sides (`ferrox_models::capability`,
+All 34 have now been read on both sides (`ferrox_models::capability`,
 pinned by `crates/ferrox-models/tests/unaudited_triage.rs`). The
 distribution is the headline answer to "how far is Ferrox from llama.cpp
 on models":
@@ -188,21 +225,21 @@ MLA model that was never on the generic path, so it now refuses by name
 multipliers) rather than as unaudited. The count going down for the
 right reason.
 
-**Fixture-away (9)** — Ferrox already computes these graphs; only
+**Fixture-away (9).** Ferrox already computes these graphs; only
 evidence is missing. `gemma`, `internlm2`, `exaone`, `ernie4_5`,
 `bailingmoe2`, `xverse`, `baichuan` (the 7B; the 13B uses ALiBi and is
 refused by layer count), `chatglm` (its fused SwiGLU is the audited
 `phi3` path exactly) and `plamo3` (sandwich norms, fused QKV, fused
-SwiGLU — every slot already exists).
+SwiGLU, every slot already exists).
 
-**One match arm (7)** — one small named piece each. `seed_oss` and the
+**One match arm (7).** One small named piece each. `seed_oss` and the
 gpt-oss norm slot; `deepseek` and top-k renormalisation (fixed);
 `ernie4_5-moe` and interleaved MoE layers; `bailingmoe` and a
 `leading_dense_block_count` llama.cpp reads but never uses; and
 `hunyuan-moe`, `maincoder` and `hunyuan-dense`, all three of which want
 the same flag: QK norm applied *after* RoPE rather than before.
 
-**New code (26)** — a different attention or residual structure. The
+**New code (26).** A different attention or residual structure. The
 recurring shapes, rather than 26 separate stories:
 
 | Shape | Architectures |
@@ -210,18 +247,18 @@ recurring shapes, rather than 26 separate stories:
 | Per-layer head counts, FFN width or rotary width | `openelm`, `deci`, `laguna`, `step35`, `mimo2` |
 | A norm the generic decoder always applies and the model does not have (or a norm it does not have a slot for) | `olmo2`, `exaone4`, `olmo`, `talkie`, `bitnet`, `dbrx` |
 | LayerNorm rather than RMSNorm | `dbrx`, `olmo` |
-| Unkeyed NoPE layers — RoPE skipped on some layers with no GGUF key | `smallthinker`, `afmoe`, `exaone-moe` |
+| Unkeyed NoPE layers, RoPE skipped on some layers with no GGUF key | `smallthinker`, `afmoe`, `exaone-moe` |
 | A branch fed from the raw layer input rather than the post-attention residual | `smallthinker` (its MoE router), `arctic` (its MoE branch) |
 | Hardcoded scales applied even when the GGUF carries no key | `grok`, `granite`, `granitemoe`, `granite-moe`, `mistral3` |
 | An ungated or non-SwiGLU FFN | `arcee`, `plm`, `apertus` |
 | Something structurally new | `nanbeige` (runs the same layers more than once), `grovemoe` (a second expert bank), `mellum` (two per-layer RoPE variants), `mistral3` (per-position attention temperature) |
 
-**Unknown (4)** — reading both trees did not settle it, and each says
+**Unknown (4).** Reading both trees did not settle it, and each says
 what would. `phi4`, `mistral`, `mixtral` and `yi` are all names that do
 not exist in llama.cpp's `LLM_ARCH_NAMES`, so there is no reference
 graph to diff against. For the three alias rows this is not academic:
-Ferrox gives them NEOX RoPE, while `llama` — the string real Mistral,
-Mixtral and Yi checkpoints actually ship under — is in llama.cpp's NORM
+Ferrox gives them NEOX RoPE, while `llama`, the string real Mistral,
+Mixtral and Yi checkpoints actually ship under, is in llama.cpp's NORM
 group. A file spelling `mistral` would be rotated on the wrong pairs of
 every Q/K head. Latent only because the row refuses.
 

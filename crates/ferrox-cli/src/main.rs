@@ -8,12 +8,15 @@ mod bench_model;
 mod bench_suite;
 mod chat;
 mod download;
+mod hf;
 mod host_state;
 mod http;
 mod layer_divergence;
 mod parity;
+mod perplexity;
 mod pull;
 mod quant_sensitivity;
+mod quantize;
 mod run;
 mod serve_bench;
 mod verify;
@@ -91,6 +94,16 @@ enum Commands {
 
     /// Download a GGUF from Hugging Face, same syntax as `hf download`.
     Download(download::DownloadArgs),
+    /// Write a quantized copy of a GGUF.
+    ///
+    /// ferrox READS every quant kind it runs and writes `Q8_0`, plus
+    /// `Q4_K_S` / `Q4_K_M` with `--pure`. Every other llama.cpp target
+    /// -- the remaining K-quants, the IQ tiers, MXFP4 -- is refused BY
+    /// NAME: their encoders are an iterative per-super-block fit, and
+    /// an approximation of one produces a file that loads and generates
+    /// measurably worse text. Use `llama-quantize` for those; ferrox
+    /// reads what it writes.
+    Quantize(quantize::QuantizeArgs),
     /// Print GGUF header metadata and tensor list for a model file.
     Inspect { path: String },
     /// Dry-run residency plan for a GGUF checkpoint: what it would
@@ -214,9 +227,54 @@ enum Commands {
         /// How many top tokens to intersect between the two engines.
         #[arg(long, default_value_t = 10)]
         top_k: usize,
-        /// Compiled reference dumper (see .local-scripts/llama_logits.c).
+        /// Compiled reference dumper (see tools/llama_logits.c).
+        ///
+        /// REPEATABLE, and repeating it is what makes a WRONG verdict
+        /// believable. The first is the reference every printed number
+        /// is about; each further one must be built against a DIFFERENT
+        /// libllama (`LLAMA_CPP_PREFIX=… tools/build_llama_logits.sh`),
+        /// and `parity` measures how far those builds are from each
+        /// other on this checkpoint to decide what "the graphs
+        /// disagree" is allowed to mean. Two builds have been measured
+        /// 3.5e-2 apart in KL from an identical graph, above the
+        /// constant that used to be the WRONG line, so with only one
+        /// reference no K-quant checkpoint can be called WRONG at all.
         #[arg(long)]
-        dumper: Option<String>,
+        dumper: Vec<String>,
+        /// Write every compared logit vector under this prefix
+        /// (`<prefix>.llama.f32`, `<prefix>.llama2.f32`, …,
+        /// `<prefix>.ferrox.f32`, `<prefix>.tokens.txt`), as raw
+        /// little-endian f32.
+        ///
+        /// A parity verdict is a distance between two points and says
+        /// where neither one is, so it cannot tell "ferrox moved" from
+        /// "the reference moved". The `.llama*.f32` files compared to
+        /// each other answer that, with no ferrox in the comparison.
+        #[arg(long)]
+        dump_logits: Option<String>,
+    },
+    /// Corpus perplexity, llama.cpp's `perplexity` tool.
+    ///
+    /// `parity` compares one distribution and `verify` compares text;
+    /// neither says whether a quantized checkpoint is WORSE. This scores
+    /// a whole corpus in non-overlapping `--ctx-size` windows, scoring
+    /// only each window's second half, and reports `exp(mean nll)` with
+    /// a standard error — upstream's method, so the number is
+    /// comparable to a published one.
+    Perplexity {
+        /// GGUF to score.
+        #[arg(short = 'm', long)]
+        model: String,
+        /// Plain-text corpus. `crates/ferrox-cli/tests/corpus/` has one.
+        #[arg(short = 'f', long)]
+        file: String,
+        /// Window length. 512 is llama.cpp's `perplexity` default, and a
+        /// perplexity at another context is not comparable to one at 512.
+        #[arg(short = 'c', long = "ctx-size", default_value_t = perplexity::DEFAULT_CTX)]
+        ctx_size: usize,
+        /// Stop after this many windows (default: as many as fit).
+        #[arg(long)]
+        chunks: Option<usize>,
     },
     /// Find the layer where a GPU backend starts disagreeing with the
     /// CPU reference, rather than the token.
@@ -481,7 +539,9 @@ const SUBCOMMANDS: &[&str] = &[
     "verify",
     "layer-divergence",
     "quant-sensitivity",
+    "quantize",
     "parity",
+    "perplexity",
     "speculative",
     "run-kimi",
     "help",
@@ -518,6 +578,12 @@ fn rewrite_llama_style_argv(args: Vec<String>) -> Vec<String> {
         .map(|arg| match arg.as_str() {
             "-ngl" => "--n-gpu-layers".into(),
             "-dev" => "--device".into(),
+            // llama.cpp's parser is hand-written, so `-hf` is ONE
+            // token. clap reads it as `-h` plus `f` and prints help,
+            // which is what `ferrox serve -hf repo:Q4_K_M` did: it
+            // looked like the flag did not exist.
+            "-hf" => "--hf-repo".into(),
+            "-hff" => "--hf-file".into(),
             _ => arg,
         })
         .collect();
@@ -591,6 +657,12 @@ fn instance_target(command: &Commands) -> Option<(&'static str, Option<String>)>
         Commands::QuantSensitivity { model, .. } => {
             Some(("quant-sensitivity", Some(model.clone())))
         }
+        // Registered for the same reason `quant-sensitivity` is: it holds
+        // a whole checkpoint resident for as long as the corpus takes,
+        // which is the case the one-model-per-host rule exists for. It is
+        // not a timing, so `--allow-multiple-instances` costs nothing but
+        // the words.
+        Commands::Perplexity { model, .. } => Some(("perplexity", Some(model.clone()))),
         Commands::Bench {
             model,
             suite,
@@ -638,6 +710,34 @@ fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
     let cli = Cli::parse_from(rewrite_llama_style_argv(std::env::args().collect()));
 
+    // BEFORE `claim_instance`, and that ordering is the whole point.
+    //
+    // The backend decision is cached in a `OnceLock` the first time
+    // anything asks for it, and `claim_instance` asks: it records which
+    // backend this process holds. So the old ordering froze the answer
+    // while `FERROX_METAL` was still unset, and the `--n-gpu-layers 0`
+    // that `bench` applies later could not change it. Every `cpu` row
+    // in `benchmarks/RESULTS.md` was measured on Metal because of this,
+    // and every one of those receipts recorded `backend_active:
+    // "Metal"` next to `backend: "cpu"` without anything comparing the
+    // two (#126).
+    if let Commands::Bench {
+        threads,
+        n_gpu_layers,
+        suite,
+        render,
+        ..
+    } = &cli.command
+    {
+        // `--suite` and `--render` do not benchmark in THIS process:
+        // the suite spawns a child per entry and render only reads
+        // receipts, so applying a backend here would pin the parent to
+        // one backend for children that each want their own.
+        if !suite && !render {
+            bench_model::apply_env(*threads, *n_gpu_layers)?;
+        }
+    }
+
     // Held for the whole run: dropping it deregisters this process.
     let _instance = claim_instance(&cli)?;
     // Read before `cli.command` is moved into the match. Subcommands
@@ -661,6 +761,7 @@ fn main() -> anyhow::Result<()> {
         Commands::Serve { .. } => anyhow::bail!(SERVE_FEATURE_MISSING),
         Commands::Pull(args) => pull::run_pull(args)?,
         Commands::Download(args) => download::run(args)?,
+        Commands::Quantize(args) => quantize::run(args)?,
         Commands::Inspect { path } => {
             let file = ShardedGguf::open(&path)?;
             if file.shard_count() > 1 {
@@ -903,6 +1004,7 @@ fn main() -> anyhow::Result<()> {
             prompt_tokens,
             top_k,
             dumper,
+            dump_logits,
         } => {
             return parity::run(parity::ParityArgs {
                 model,
@@ -910,6 +1012,20 @@ fn main() -> anyhow::Result<()> {
                 prompt_tokens,
                 top_k,
                 dumper,
+                dump_logits,
+            });
+        }
+        Commands::Perplexity {
+            model,
+            file,
+            ctx_size,
+            chunks,
+        } => {
+            return perplexity::run(perplexity::PerplexityArgs {
+                model,
+                file,
+                ctx_size,
+                chunks,
             });
         }
         Commands::LayerDivergence {
@@ -992,7 +1108,11 @@ fn main() -> anyhow::Result<()> {
                 });
             }
             if let Some(model) = model {
-                bench_model::apply_env(threads, n_gpu_layers);
+                // Already applied above, before `claim_instance` could
+                // freeze the backend. Kept as a no-op call rather than
+                // deleted so a future caller of this arm cannot get an
+                // unconfigured process.
+                bench_model::apply_env(threads, n_gpu_layers)?;
                 return bench_model::run(bench_model::BenchArgs {
                     model,
                     n_prompt,
@@ -1310,13 +1430,14 @@ fn main() -> anyhow::Result<()> {
             );
             println!("low or zero accept rate below is expected and does not indicate a bug.\n");
 
-            let speculator = ferrox_models::PromptLookupSpeculator::new(ngram_size, max_draft_len);
+            let mut speculator =
+                ferrox_models::PromptLookupSpeculator::new(ngram_size, max_draft_len);
             let result = ferrox_models::speculative_decode(
                 &decoder,
                 &prompt_tokens,
                 max_new_tokens,
                 &mut caches,
-                &speculator,
+                &mut speculator,
             );
 
             println!("Tokens generated : {}", result.tokens_generated);

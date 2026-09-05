@@ -51,6 +51,7 @@
 //! temperature 0.
 
 use crate::decoder::Decoder;
+use crate::penalty_window::PenaltyWindow;
 use crate::sampling::{sampling_distribution, Sampler, SamplingParams};
 use ferrox_core::cache::KvCache;
 
@@ -203,7 +204,11 @@ pub trait Drafter {
     /// for `history`'s last token, or empty when none is available yet
     /// (which a drafter that needs it must handle by proposing
     /// nothing).
-    fn propose(&self, history: &[usize], target_hidden: &[f32], max_len: usize) -> DraftBlock;
+    /// Takes `&mut self` because a drafter that is itself a model
+    /// carries KV state across calls, and hiding that behind interior
+    /// mutability would put a runtime borrow check on the hot path to
+    /// buy nothing. A stateless drafter simply ignores it.
+    fn propose(&mut self, history: &[usize], target_hidden: &[f32], max_len: usize) -> DraftBlock;
 }
 
 /// Proposes candidate continuation tokens by looking for the longest
@@ -262,7 +267,7 @@ impl PromptLookupSpeculator {
 }
 
 impl Drafter for PromptLookupSpeculator {
-    fn propose(&self, history: &[usize], _target_hidden: &[f32], max_len: usize) -> DraftBlock {
+    fn propose(&mut self, history: &[usize], _target_hidden: &[f32], max_len: usize) -> DraftBlock {
         let mut tokens = self.propose_tokens(history);
         tokens.truncate(max_len.min(self.max_draft_len));
         DraftBlock::deterministic(tokens)
@@ -461,13 +466,14 @@ pub fn speculative_decode<D: Drafter + ?Sized>(
     prompt_tokens: &[usize],
     max_new_tokens: usize,
     kv_caches: &mut [KvCache],
-    drafter: &D,
+    drafter: &mut D,
 ) -> SpeculativeDecodeResult {
-    speculative_decode_with(
+    speculative_decode_observed(
         decoder,
         prompt_tokens,
         kv_caches,
         drafter,
+        &mut |_| true,
         &SpeculativeOptions {
             max_new_tokens,
             ..SpeculativeOptions::default()
@@ -501,13 +507,49 @@ pub fn speculative_decode_with<D: Drafter + ?Sized>(
     decoder: &Decoder,
     prompt_tokens: &[usize],
     kv_caches: &mut [KvCache],
-    drafter: &D,
+    drafter: &mut D,
+    options: &SpeculativeOptions,
+) -> SpeculativeDecodeResult {
+    speculative_decode_observed(
+        decoder,
+        prompt_tokens,
+        kv_caches,
+        drafter,
+        &mut |_| true,
+        options,
+    )
+}
+
+/// [`speculative_decode_with`], plus an observer called once per
+/// committed token, in order, which can end the run by returning
+/// `false`.
+///
+/// This exists so a caller that streams output, or that stops on an EOS
+/// or a stop string, does not have to write a second copy of the
+/// verification loop. Copying that loop to vary it is how this project
+/// lost five model features from one duplicated decode path, and the
+/// rejection rule is the last code in the tree that should be
+/// duplicated: a subtly different copy is still lossless-looking.
+///
+/// The observer sees a token only once it is COMMITTED, so it never
+/// sees a draft that was rejected. Returning `false` ends generation
+/// after the current verification block finishes, which keeps the KV
+/// caches in the single consistent state this function documents;
+/// `generated_tokens` is truncated at the token that said stop, so the
+/// caller's output and the returned tokens agree.
+pub fn speculative_decode_observed<D: Drafter + ?Sized>(
+    decoder: &Decoder,
+    prompt_tokens: &[usize],
+    kv_caches: &mut [KvCache],
+    drafter: &mut D,
+    on_token: &mut dyn FnMut(usize) -> bool,
     options: &SpeculativeOptions,
 ) -> SpeculativeDecodeResult {
     assert!(!prompt_tokens.is_empty(), "prompt must not be empty");
     for cache in kv_caches.iter() {
         assert_eq!(
-            cache.seq_len, options.start_pos,
+            cache.positions(),
+            options.start_pos,
             "start_pos must be the caches' current length: they hold exactly the \
              context preceding the prompt"
         );
@@ -535,14 +577,32 @@ pub fn speculative_decode_with<D: Drafter + ?Sized>(
     // fed as the anchor of the next batch, which is what lets one
     // forward call both commit it and verify a block after it.
     let mut pending = {
-        let probs = sampling_distribution(last, &options.sampling, &history);
+        // Split ONE structure rather than pairing `history` with the
+        // separate `generated` vector: the two would then have to agree
+        // about every push, which is exactly the shape this fix exists
+        // to remove.
+        let (seen_prompt, seen_generated) = history.split_at(prompt_tokens.len());
+        let probs = sampling_distribution(
+            last,
+            &options.sampling,
+            PenaltyWindow::new(seen_prompt, seen_generated),
+        );
         rng.sample_from(&probs)
     };
     let mut pos = options.start_pos + prompt_tokens.len();
 
+    // Set when the observer asks to stop. The current block still runs
+    // to completion so the caches end in the one state this function
+    // documents, and `generated` is cut back to this length afterwards.
+    let mut stop_at: Option<usize> = None;
+
     loop {
         generated.push(pending);
         history.push(pending);
+        if !on_token(pending) {
+            stop_at = Some(generated.len());
+            break;
+        }
         if generated.len() == options.max_new_tokens {
             break;
         }
@@ -576,13 +636,25 @@ pub fn speculative_decode_with<D: Drafter + ?Sized>(
         let mut accepted = 0usize;
         let mut replacement: Option<usize> = None;
         for (i, (&token, dist)) in draft.tokens().iter().zip(draft.dists()).enumerate() {
-            let target = sampling_distribution(&batch_logits[i], &options.sampling, &history);
+            let (seen_prompt, seen_generated) = history.split_at(prompt_tokens.len());
+            let target = sampling_distribution(
+                &batch_logits[i],
+                &options.sampling,
+                PenaltyWindow::new(seen_prompt, seen_generated),
+            );
             match accept_or_resample(&target, dist, token, &mut rng) {
                 None => {
                     result.record_position(i, true);
                     accepted += 1;
                     history.push(token);
                     generated.push(token);
+                    if stop_at.is_none() && !on_token(token) {
+                        // Keep verifying the rest of the block: the
+                        // loop below truncates the caches to exactly
+                        // what was committed, and leaving early here
+                        // would skip that.
+                        stop_at = Some(generated.len());
+                    }
                 }
                 Some(resampled) => {
                     result.record_position(i, false);
@@ -602,7 +674,8 @@ pub fn speculative_decode_with<D: Drafter + ?Sized>(
                 cache.truncate(committed_len);
             }
         }
-        debug_assert!(kv_caches.iter().all(|c| c.seq_len == committed_len));
+        // POSITIONS: `committed_len` is absolute, offset by start_pos.
+        debug_assert!(kv_caches.iter().all(|c| c.positions() == committed_len));
 
         target_hidden = batch_hidden[accepted].clone();
         pending = match replacement {
@@ -613,16 +686,30 @@ pub fn speculative_decode_with<D: Drafter + ?Sized>(
             // batch predicts a genuinely new position -- the free bonus
             // token that makes a fully-accepted block worth `k + 1`.
             None => {
-                let probs =
-                    sampling_distribution(&batch_logits[accepted], &options.sampling, &history);
+                let (seen_prompt, seen_generated) = history.split_at(prompt_tokens.len());
+                let probs = sampling_distribution(
+                    &batch_logits[accepted],
+                    &options.sampling,
+                    PenaltyWindow::new(seen_prompt, seen_generated),
+                );
                 rng.sample_from(&probs)
             }
         };
         pos = committed_len;
+        if stop_at.is_some() {
+            break;
+        }
         debug_assert!(generated.len() < options.max_new_tokens);
     }
 
-    debug_assert_eq!(generated.len(), options.max_new_tokens);
+    if let Some(len) = stop_at {
+        // The observer said stop at this token. Everything after it was
+        // produced by a block that had already been dispatched, and the
+        // caller never saw it.
+        generated.truncate(len);
+    } else {
+        debug_assert_eq!(generated.len(), options.max_new_tokens);
+    }
     result.tokens_generated = generated.len();
     result.generated_tokens = generated;
     result
@@ -684,7 +771,12 @@ mod tests {
     }
 
     impl Drafter for FixedDrafter {
-        fn propose(&self, history: &[usize], target_hidden: &[f32], max_len: usize) -> DraftBlock {
+        fn propose(
+            &mut self,
+            history: &[usize],
+            target_hidden: &[f32],
+            max_len: usize,
+        ) -> DraftBlock {
             self.seen_history.borrow_mut().push(history.to_vec());
             self.seen_hidden_len.borrow_mut().push(target_hidden.len());
             let mut block = self.block.clone();
@@ -697,7 +789,7 @@ mod tests {
 
     #[test]
     fn proposes_the_continuation_after_a_real_repeat() {
-        let spec = PromptLookupSpeculator::new(2, 4);
+        let mut spec = PromptLookupSpeculator::new(2, 4);
         // "...1 2 3 4 5 9 9 9 1 2" -> earlier "1 2" occurs at the very
         // start (indices 0-1); the 4 tokens that followed it are
         // "3 4 5 9" (capped at max_draft_len=4).
@@ -741,7 +833,7 @@ mod tests {
 
     #[test]
     fn the_trait_caps_a_block_at_the_callers_budget() {
-        let spec = PromptLookupSpeculator::new(2, 4);
+        let mut spec = PromptLookupSpeculator::new(2, 4);
         let history = vec![1, 2, 3, 4, 5, 9, 9, 9, 1, 2];
         let block = spec.propose(&history, &[], 2);
         assert_eq!(block.tokens(), &[3, 4]);
@@ -840,8 +932,9 @@ mod tests {
 
         let decoder_a = Decoder::new_random_small(cfg.clone(), 2, vocab);
         let mut caches_a = caches(&decoder_a);
-        let speculator = PromptLookupSpeculator::new(2, 3);
-        let result = speculative_decode(&decoder_a, &prompt, max_new, &mut caches_a, &speculator);
+        let mut speculator = PromptLookupSpeculator::new(2, 3);
+        let result =
+            speculative_decode(&decoder_a, &prompt, max_new, &mut caches_a, &mut speculator);
 
         let decoder_b = Decoder::new_random_small(cfg, 2, vocab);
         let mut caches_b = caches(&decoder_b);
@@ -888,7 +981,10 @@ mod tests {
             params: &SamplingParams,
             marginals: &mut [Vec<f64>],
         ) {
-            let probs = sampling_distribution(logits, params, history);
+            // `history` is already prompt-then-generated, and the
+            // window only ever reads the tail of the two halves
+            // together, so the whole sequence goes in the first one.
+            let probs = sampling_distribution(logits, params, PenaltyWindow::new(history, &[]));
             for (token, &p) in probs.iter().enumerate() {
                 if p <= 0.0 {
                     continue;
@@ -935,6 +1031,100 @@ mod tests {
         marginals
     }
 
+    /// Speculation and plain token-at-a-time decoding must agree about
+    /// WHICH tokens the penalties look back over, including the prompt.
+    ///
+    /// This is issue #55's other half. `SpeculativeOptions` used to
+    /// carry a `penalty_history_start` knob whose only job was to let a
+    /// caller line the two paths up by hand, which meant nothing failed
+    /// when they drifted -- and `--model-draft` shipped setting it to
+    /// `prompt.len()` because the plain loop penalised the generated
+    /// tokens alone. Both now go through `PenaltyWindow`, and this test
+    /// is what notices if one of them stops.
+    ///
+    /// Greedy on purpose: the assertion is token-for-token equality, so
+    /// a one-token disagreement in the window is a hard failure rather
+    /// than a shift in a sampled distribution. The prompt repeats
+    /// tokens 1 and 2, so the penalty has something to bite on from the
+    /// very first generated position.
+    #[test]
+    fn speculation_and_plain_decoding_penalise_the_same_window() {
+        let cfg = tiny_test_config();
+        let vocab = 6;
+        let prompt = vec![0usize, 1, 2, 3, 1];
+        let max_new = 6;
+        let params = SamplingParams {
+            temperature: 0.0,
+            repetition_penalty: 3.0,
+            penalty_last_n: 8,
+            ..SamplingParams::default()
+        };
+
+        let decoder = Decoder::new_random_small(cfg, 2, vocab);
+
+        // Plain token-at-a-time decoding, penalising over the same
+        // window `Sampler::sample` would use on any decode loop.
+        let mut kv = caches(&decoder);
+        let mut pos = 0usize;
+        let mut logits = Vec::new();
+        for &tok in &prompt {
+            logits = decoder.forward_token(tok, pos, &mut kv);
+            pos += 1;
+        }
+        let mut sampler = Sampler::new(7);
+        let mut plain: Vec<usize> = Vec::new();
+        for _ in 0..max_new {
+            let next = sampler.sample(&logits, &params, PenaltyWindow::new(&prompt, &plain));
+            plain.push(next);
+            logits = decoder.forward_token(next, pos, &mut kv);
+            pos += 1;
+        }
+
+        let mut speculator = PromptLookupSpeculator::new(2, 3);
+        let mut spec_kv = caches(&decoder);
+        let out = speculative_decode_with(
+            &decoder,
+            &prompt,
+            &mut spec_kv,
+            &mut speculator,
+            &SpeculativeOptions {
+                max_new_tokens: max_new,
+                sampling: params.clone(),
+                seed: 7,
+                ..SpeculativeOptions::default()
+            },
+        );
+        assert_eq!(
+            out.generated_tokens, plain,
+            "speculation changed the text at --repeat-penalty {}",
+            params.repetition_penalty
+        );
+
+        // And the penalty is doing something here, or the equality
+        // above is satisfied by a window nobody reads.
+        let mut off = params.clone();
+        off.repetition_penalty = 1.0;
+        let mut kv = caches(&decoder);
+        let mut pos = 0usize;
+        let mut logits = Vec::new();
+        for &tok in &prompt {
+            logits = decoder.forward_token(tok, pos, &mut kv);
+            pos += 1;
+        }
+        let mut sampler = Sampler::new(7);
+        let mut unpenalised: Vec<usize> = Vec::new();
+        for _ in 0..max_new {
+            let next = sampler.sample(&logits, &off, PenaltyWindow::new(&prompt, &unpenalised));
+            unpenalised.push(next);
+            logits = decoder.forward_token(next, pos, &mut kv);
+            pos += 1;
+        }
+        assert_ne!(
+            unpenalised, plain,
+            "the penalty must change this generation, or the agreement above proves nothing"
+        );
+    }
+
     #[test]
     fn speculative_decode_at_temperature_matches_plain_sampling() {
         // The end-to-end half of the losslessness claim, and the one
@@ -955,7 +1145,7 @@ mod tests {
         let seeds = 4_000u64;
 
         let decoder = Decoder::new_random_small(cfg, 1, vocab);
-        let speculator = PromptLookupSpeculator::new(2, 3);
+        let mut speculator = PromptLookupSpeculator::new(2, 3);
         let exact = exact_marginals(&decoder, &prompt, &params, max_new, vocab);
 
         let mut spec_counts = vec![vec![0usize; vocab]; max_new];
@@ -965,7 +1155,7 @@ mod tests {
                 &decoder,
                 &prompt,
                 &mut kv,
-                &speculator,
+                &mut speculator,
                 &SpeculativeOptions {
                     max_new_tokens: max_new,
                     sampling: params.clone(),
@@ -1005,8 +1195,8 @@ mod tests {
 
         let decoder = Decoder::new_random_small(cfg, 2, vocab);
         let mut kv = caches(&decoder);
-        let speculator = PromptLookupSpeculator::new(2, 4);
-        let result = speculative_decode(&decoder, &prompt, max_new, &mut kv, &speculator);
+        let mut speculator = PromptLookupSpeculator::new(2, 4);
+        let result = speculative_decode(&decoder, &prompt, max_new, &mut kv, &mut speculator);
 
         assert_eq!(result.tokens_generated, max_new);
         // Plain sequential decode needs exactly `max_new` calls here:
@@ -1032,8 +1222,8 @@ mod tests {
 
         let decoder = Decoder::new_random_small(cfg, 2, vocab);
         let mut kv = caches(&decoder);
-        let speculator = PromptLookupSpeculator::new(10, 4); // ngram far longer than any possible history
-        let result = speculative_decode(&decoder, &prompt, max_new, &mut kv, &speculator);
+        let mut speculator = PromptLookupSpeculator::new(10, 4); // ngram far longer than any possible history
+        let result = speculative_decode(&decoder, &prompt, max_new, &mut kv, &mut speculator);
 
         assert_eq!(result.tokens_generated, max_new);
         assert_eq!(
@@ -1059,9 +1249,9 @@ mod tests {
         let decoder = Decoder::new_random_small(cfg, 2, 8);
         let mut kv = caches(&decoder);
         let prompt = vec![1usize, 2, 3];
-        let drafter = FixedDrafter::new(DraftBlock::deterministic(vec![5, 6]));
+        let mut drafter = FixedDrafter::new(DraftBlock::deterministic(vec![5, 6]));
 
-        let result = speculative_decode(&decoder, &prompt, 4, &mut kv, &drafter);
+        let result = speculative_decode(&decoder, &prompt, 4, &mut kv, &mut drafter);
 
         let seen = drafter.seen_history.borrow();
         assert!(!seen.is_empty(), "the drafter must actually be consulted");
@@ -1089,9 +1279,9 @@ mod tests {
         let hidden_dim = cfg.hidden_dim;
         let decoder = Decoder::new_random_small(cfg, 2, 8);
         let mut kv = caches(&decoder);
-        let drafter = FixedDrafter::new(DraftBlock::deterministic(vec![5, 6]));
+        let mut drafter = FixedDrafter::new(DraftBlock::deterministic(vec![5, 6]));
 
-        speculative_decode(&decoder, &[1usize, 2, 3], 4, &mut kv, &drafter);
+        speculative_decode(&decoder, &[1usize, 2, 3], 4, &mut kv, &mut drafter);
 
         let lens = drafter.seen_hidden_len.borrow();
         assert!(!lens.is_empty());
@@ -1112,12 +1302,12 @@ mod tests {
         let cfg = tiny_test_config();
         let vocab = 8;
         let decoder = Decoder::new_random_small(cfg, 2, vocab);
-        let speculator = PromptLookupSpeculator::new(2, 3);
+        let mut speculator = PromptLookupSpeculator::new(2, 3);
         let full_prompt = vec![1usize, 2, 3, 4, 1, 2];
         let max_new = 6;
 
         let mut fresh = caches(&decoder);
-        let cold = speculative_decode(&decoder, &full_prompt, max_new, &mut fresh, &speculator);
+        let cold = speculative_decode(&decoder, &full_prompt, max_new, &mut fresh, &mut speculator);
 
         // Warm: feed the first 4 prompt tokens through the decoder
         // first, then resume speculative decoding from position 4.
@@ -1128,7 +1318,7 @@ mod tests {
             &decoder,
             &full_prompt[split..],
             &mut warm,
-            &speculator,
+            &mut speculator,
             &SpeculativeOptions {
                 max_new_tokens: max_new,
                 start_pos: split,
@@ -1153,20 +1343,20 @@ mod tests {
         let decoder = Decoder::new_random_small(cfg, 2, 8);
         // Token 7 is a fixed guess; whether it is accepted is up to the
         // model, but the invariant below holds either way.
-        let drafter = FixedDrafter::new(DraftBlock::deterministic(vec![7, 7, 7]));
+        let mut drafter = FixedDrafter::new(DraftBlock::deterministic(vec![7, 7, 7]));
         let context = vec![1usize, 2, 3, 4];
         let prompt = vec![5usize, 6];
         let max_new = 6;
 
         let mut kv = caches(&decoder);
         decoder.forward_batch(&context, 0, &mut kv);
-        assert_eq!(kv[0].seq_len, context.len());
+        assert_eq!(kv[0].positions(), context.len());
 
         let result = speculative_decode_with(
             &decoder,
             &prompt,
             &mut kv,
-            &drafter,
+            &mut drafter,
             &SpeculativeOptions {
                 max_new_tokens: max_new,
                 start_pos: context.len(),
@@ -1181,7 +1371,7 @@ mod tests {
         let expected = context.len() + prompt.len() + result.tokens_generated - 1;
         for cache in kv.iter() {
             assert_eq!(
-                cache.seq_len,
+                cache.positions(),
                 expected,
                 "cache length must be absolute: context {} + prompt {} + generated {} - 1",
                 context.len(),
@@ -1197,14 +1387,14 @@ mod tests {
         // call: this is what "not a demo" means for the serving path.
         let cfg = tiny_test_config();
         let decoder = Decoder::new_random_small(cfg, 2, 8);
-        let speculator = PromptLookupSpeculator::new(2, 3);
+        let mut speculator = PromptLookupSpeculator::new(2, 3);
         let prompt = vec![1usize, 2, 3, 4, 1, 2];
 
         let mut one = caches(&decoder);
-        let long = speculative_decode(&decoder, &prompt, 8, &mut one, &speculator);
+        let long = speculative_decode(&decoder, &prompt, 8, &mut one, &mut speculator);
 
         let mut kv = caches(&decoder);
-        let first = speculative_decode(&decoder, &prompt, 4, &mut kv, &speculator);
+        let first = speculative_decode(&decoder, &prompt, 4, &mut kv, &mut speculator);
         // The last generated token's KV is not in the cache yet, so it
         // is the first token of the continuation's "prompt".
         let resume_prompt = vec![*first.generated_tokens.last().unwrap()];
@@ -1213,7 +1403,7 @@ mod tests {
             &decoder,
             &resume_prompt,
             &mut kv,
-            &speculator,
+            &mut speculator,
             &SpeculativeOptions {
                 max_new_tokens: 5,
                 start_pos: start,
@@ -1238,8 +1428,8 @@ mod tests {
         let decoder = Decoder::new_random_small(cfg, 2, 8);
         let mut kv = caches(&decoder);
         decoder.forward_batch(&[1usize, 2, 3], 0, &mut kv);
-        let speculator = PromptLookupSpeculator::new(2, 2);
-        speculative_decode(&decoder, &[4usize, 5], 2, &mut kv, &speculator);
+        let mut speculator = PromptLookupSpeculator::new(2, 2);
+        speculative_decode(&decoder, &[4usize, 5], 2, &mut kv, &mut speculator);
     }
 
     // ---- acceptance metrics ----
@@ -1273,8 +1463,8 @@ mod tests {
         let mut kv = caches(&decoder);
         // Token 7 against a random model: whatever happens, every
         // counted position must have been reachable.
-        let drafter = FixedDrafter::new(DraftBlock::deterministic(vec![7, 7, 7, 7]));
-        let result = speculative_decode(&decoder, &[1usize, 2, 3], 6, &mut kv, &drafter);
+        let mut drafter = FixedDrafter::new(DraftBlock::deterministic(vec![7, 7, 7, 7]));
+        let result = speculative_decode(&decoder, &[1usize, 2, 3], 6, &mut kv, &mut drafter);
 
         let evaluated = &result.evaluated_at_position;
         let accepted = &result.accepted_at_position;
@@ -1321,8 +1511,9 @@ mod tests {
         let cfg = tiny_test_config();
         let decoder = Decoder::new_random_small(cfg, 2, 8);
         let mut kv = caches(&decoder);
-        let speculator = PromptLookupSpeculator::new(2, 3);
-        let result = speculative_decode(&decoder, &[1usize, 2, 3, 1, 2], 6, &mut kv, &speculator);
+        let mut speculator = PromptLookupSpeculator::new(2, 3);
+        let result =
+            speculative_decode(&decoder, &[1usize, 2, 3, 1, 2], 6, &mut kv, &mut speculator);
 
         assert_eq!(result.verification_steps, result.forward_calls - 1);
         let length = result.acceptance_length().unwrap();
@@ -1339,5 +1530,79 @@ mod tests {
         assert_eq!(result.acceptance_length(), None);
         assert_eq!(result.accept_rate(), None);
         assert_eq!(result.tokens_per_call(), 0.0);
+    }
+
+    /// The observer sees exactly the committed tokens, in order, and
+    /// stopping through it truncates the result to the token that said
+    /// so.
+    ///
+    /// This is what lets `ferrox run` stream and stop on an EOS without
+    /// a second copy of the verification loop. A copy is how this
+    /// project lost five model features from one duplicated decode
+    /// path, and the rejection rule is the last code in the tree that
+    /// should be duplicated: a subtly wrong copy still looks lossless.
+    #[test]
+    fn the_observer_sees_every_committed_token_and_can_end_the_run() {
+        let cfg = tiny_test_config();
+        let vocab = 8;
+        let prompt = vec![1usize, 2, 3, 4, 1, 2];
+
+        let decoder = Decoder::new_random_small(cfg.clone(), 2, vocab);
+        let mut kv = caches(&decoder);
+        let mut spec = PromptLookupSpeculator::new(2, 3);
+
+        let mut seen = Vec::new();
+        let result = speculative_decode_observed(
+            &decoder,
+            &prompt,
+            &mut kv,
+            &mut spec,
+            &mut |t| {
+                seen.push(t);
+                true
+            },
+            &SpeculativeOptions {
+                max_new_tokens: 6,
+                start_pos: 0,
+                sampling: SamplingParams::default(),
+                seed: 0,
+            },
+        );
+        assert_eq!(
+            seen, result.generated_tokens,
+            "the observer must see exactly what the run returns, in order"
+        );
+
+        // Now stop after three tokens.
+        let decoder = Decoder::new_random_small(cfg, 2, vocab);
+        let mut kv = caches(&decoder);
+        let mut spec = PromptLookupSpeculator::new(2, 3);
+        let mut count = 0usize;
+        let stopped = speculative_decode_observed(
+            &decoder,
+            &prompt,
+            &mut kv,
+            &mut spec,
+            &mut |_| {
+                count += 1;
+                count < 3
+            },
+            &SpeculativeOptions {
+                max_new_tokens: 6,
+                start_pos: 0,
+                sampling: SamplingParams::default(),
+                seed: 0,
+            },
+        );
+        assert_eq!(
+            stopped.generated_tokens.len(),
+            3,
+            "the run must end at the token that said stop, not at the end of its block"
+        );
+        assert_eq!(
+            stopped.generated_tokens,
+            result.generated_tokens[..3],
+            "and the tokens up to the stop must be the ones an unstopped run produced"
+        );
     }
 }

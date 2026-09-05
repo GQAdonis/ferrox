@@ -50,7 +50,7 @@ pub enum LoadError {
     ExpertCountMismatch(String, usize, usize),
     #[error("GGUF file is missing required hparam metadata key '{0}'")]
     MissingHparam(String),
-    /// `general.architecture` is not in the capability registry — refuse
+    /// `general.architecture` is not in the capability registry -- refuse
     /// to guess RoPE/gating rather than emit fluent-but-wrong logits.
     #[error(
         "unsupported GGUF architecture '{0}': not in ferrox's capability registry \
@@ -113,6 +113,39 @@ pub enum LoadError {
 const SIGMOID_GATING_ARCHITECTURES: &[&str] =
     &["afmoe", "deepseek2", "glm4moe", "laguna", "step35"];
 
+/// Names that appear in a behaviour table above but are `DedicatedOnly`
+/// or `Deferred`, together with the module that actually applies the
+/// behaviour for them.
+///
+/// Two true things were in conflict here, and deleting either would
+/// have lost one. `SIGMOID_GATING_ARCHITECTURES` records a fact about
+/// llama.cpp (these architectures default to sigmoid when the GGUF
+/// carries no `expert_gating_func`), and a test pins it as such. The
+/// cross-table test records a different fact: an entry for an
+/// architecture that never reaches THIS loader cannot fire, and a gate
+/// that cannot fire is worse than no gate because it reads as coverage.
+///
+/// Both hold. `deepseek2` and `glm4moe` are genuinely sigmoid-gated and
+/// genuinely never arrive here. So the resolution is not to drop a name
+/// from either place, it is to say out loud who owns it instead, and to
+/// make an unexplained dead entry still fail.
+///
+/// Adding a name here is a claim that the named module applies the
+/// behaviour. It is checked no further than that, so it is the one line
+/// in this file to be suspicious of.
+/// Test-only: it asserts a relationship rather than driving one, and a
+/// production reader would have to be told that.
+#[cfg(test)]
+const DEDICATED_OWNS_ITS_BEHAVIOUR: &[(&str, &str)] = &[
+    // `mla_gguf_loader` reads `expert_gating_func` and falls back to
+    // Sigmoid itself, so deepseek2's gating is decided there.
+    ("deepseek2", "mla_gguf_loader"),
+    // glm4moe is refused today (it needs gpt-oss's norm slot, see its
+    // refusal text). The entry stays because the fact about llama.cpp
+    // stays true, and it becomes live the moment the refusal lifts.
+    ("glm4moe", "refused today, see capability::unaudited_triage"),
+];
+
 /// Architecture-family names whose real reference implementation skips
 /// renormalizing top-k softmax routing weights after selection (GGUF
 /// carries no metadata key for this -- it's hardcoded per-architecture in
@@ -128,7 +161,7 @@ const SIGMOID_GATING_ARCHITECTURES: &[&str] =
 /// though the file loads and shape-validates fine.
 // Architectures whose reference graphs pass `norm_w=false` to
 // `build_moe_ffn` (llama.cpp) / `norm_topk_prob=false` in HF config.
-// Qwen2-MoE: `.scratch/llama.cpp/src/models/qwen2moe.cpp` — Softmax +
+// Qwen2-MoE: `.scratch/llama.cpp/src/models/qwen2moe.cpp` -- Softmax +
 // `false` for the norm_topk slot. Renormalizing top-k weights made
 // Qwen1.5-MoE greedy decode emit garbage despite shared-expert load.
 // `deepseek` (V1) added 2026-09-01 by the unaudited-refusal triage.
@@ -140,6 +173,81 @@ const SIGMOID_GATING_ARCHITECTURES: &[&str] =
 // bug as the OLMoE one above, and latent only because `deepseek` is
 // unaudited and refuses first.
 const NO_TOPK_RENORMALIZE_ARCHITECTURES: &[&str] = &["deepseek", "olmoe", "qwen2moe"];
+
+/// Architectures that store their **pre-FFN** norm under the tensor name
+/// `blk.N.post_attention_norm.weight` and carry no `blk.N.ffn_norm`.
+///
+/// Gemma writes the same tensor name for a genuinely different norm: it
+/// is applied to the attention output *inside* the attention residual,
+/// and Gemma also carries `ffn_norm`. Reading one file's tensor with the
+/// other's meaning silently moves a whole RMSNorm to the wrong side of a
+/// residual add, so the meaning is decided by architecture, not by which
+/// tensors happen to be present.
+///
+/// - `gpt-oss`: `openai-moe.cpp` norms `ffn_inp` with `attn_post_norm`.
+/// - `seed_oss`: `src/models/seed-oss.cpp:36-37` creates `attn_norm` and
+///   `attn_post_norm` and **no** `ffn_norm`, and `:113-115` norms
+///   `ffn_inp` -- the post-attention residual -- with `attn_post_norm`.
+///
+/// This is deliberately NOT `arch == "gpt-oss"`, which is what it used
+/// to be. That one flag also gated gpt-oss's five extra per-layer
+/// tensors (sinks, biases, the SwiGLU clamp), and widening it would have
+/// handed `seed_oss` attention sinks it does not have. Two facts, two
+/// predicates. `the_norm_slot_list_and_the_audit_list_agree` pins that a
+/// name added here is a name somebody actually read a graph for.
+const PRE_FFN_NORM_IS_POST_ATTENTION_NORM: &[&str] = &["gpt-oss", "seed_oss"];
+
+/// Does this architecture keep its pre-FFN norm in the
+/// `post_attention_norm` slot? See
+/// [`PRE_FFN_NORM_IS_POST_ATTENTION_NORM`].
+fn pre_ffn_norm_is_post_attention_norm(arch: &str) -> bool {
+    PRE_FFN_NORM_IS_POST_ATTENTION_NORM.contains(&arch)
+}
+
+/// Architectures whose checkpoints carry `{arch}.leading_dense_block_count`
+/// while their reference graph never branches on it: **every** layer is
+/// MoE regardless of what the key says.
+///
+/// `bailingmoe` is the case this list exists for.
+/// `src/models/bailingmoe.cpp:5` reads
+/// `LLM_KV_LEADING_DENSE_BLOCK_COUNT` into `n_layer_dense_lead` and then
+/// `load_arch_tensors` creates `ffn_gate_inp`, the expert tensors and
+/// the shared-expert tensors unconditionally for every layer (:39-54 --
+/// there is no `if (i < n_layer_dense_lead)` anywhere in the file) and
+/// the graph has no dense branch either (:119-152). Meanwhile
+/// `conversion/bailingmoe.py:27` writes `first_k_dense_replace` into the
+/// key verbatim, so real Ling checkpoints DO carry a nonzero value.
+///
+/// Ferrox's `ModelConfig::layer_is_dense` does branch on it, so without
+/// this list ferrox looks for `blk.0.ffn_gate.weight` on a layer that
+/// only ships experts and dies on a missing tensor. That is a load
+/// failure rather than wrong logits, which is why it stayed latent.
+///
+/// Do not read this as "the key is meaningless": for `deepseek`,
+/// `dots1`, `glm4moe` and every other leading-dense architecture the key
+/// is load-bearing and must be honoured. Membership here is a statement
+/// about ONE architecture's graph, checked in that graph.
+const LEADING_DENSE_KEY_IS_INERT: &[&str] = &["bailingmoe"];
+
+/// Architectures whose reference graph applies `attn_q_norm` /
+/// `attn_k_norm` AFTER `ggml_rope_ext`, not before it.
+///
+/// There is no GGUF key for this. llama.cpp writes the order into each
+/// hand-written graph, so the only place it can come from is the
+/// architecture string, and getting it wrong changes every layer's
+/// attention scores without changing a single tensor shape.
+///
+/// - `maincoder`: `src/models/maincoder.cpp:78-90` ropes Q and K, then
+///   norms them at `:92` and `:95`.
+/// - `hunyuan-moe`: `src/models/hunyuan-moe.cpp:93,104` rope, `:110,115`
+///   norm.
+///
+/// The audited majority is the other way round -- `qwen3moe.cpp:99,108`
+/// and `bailingmoe2.cpp:123-135` both norm first -- which is why the
+/// decoder's default is "before" and this list is the exception.
+/// `hunyuan-dense` shares the ordering but is NOT here: it has a second
+/// blocker (`{arch}.rope.scaling.alpha`) and stays refusing.
+const QK_NORM_AFTER_ROPE_ARCHITECTURES: &[&str] = &["hunyuan-moe", "maincoder"];
 
 fn metadata_u64_any(file: &impl TensorSource, keys: &[String]) -> Option<u64> {
     keys.iter().find_map(|k| file.metadata_u64(k))
@@ -340,7 +448,7 @@ impl ModelConfig {
         };
         // Prefer the GGUF hparam when present. Qwen2MoE (and some other
         // HF→GGUF exports) omit `expert_shared_count` but still ship
-        // `blk.N.ffn_{gate,up,down}_shexp.weight` — without a tensor-
+        // `blk.N.ffn_{gate,up,down}_shexp.weight` -- without a tensor-
         // presence fallback those weights are silently dropped and the
         // model runs with a large chunk of active FFN missing.
         let n_shared_experts = match metadata_u64_any(file, &[key("expert_shared_count")]) {
@@ -375,8 +483,11 @@ impl ModelConfig {
                 );
                 (hidden_dim * 4) as u64
             }) as usize;
-        let n_dense_leading_layers =
-            metadata_u64_any(file, &[key("leading_dense_block_count")]).unwrap_or(0) as usize;
+        let n_dense_leading_layers = if LEADING_DENSE_KEY_IS_INERT.contains(&arch.as_str()) {
+            0
+        } else {
+            metadata_u64_any(file, &[key("leading_dense_block_count")]).unwrap_or(0) as usize
+        };
 
         // ik_llama.cpp's real gating-function hparam
         // (LLM_KV_EXPERT_GATING_FUNC: 1=softmax, 2=sigmoid) if the file
@@ -457,13 +568,37 @@ impl ModelConfig {
         // comes from the registry either way.
         let swa_layout = crate::capability::default_swa_layout(&arch);
         let swa_dense_first = swa_layout.is_some_and(|p| p.dense_first);
-        let swa_pattern = metadata_u64_any(file, &[key("attention.sliding_window_pattern")])
+        // llama.cpp reads this with `ml.get_key_or_arr`, so the value is
+        // a scalar period OR an n_layer-long per-layer array. ferrox
+        // carries one scalar `swa_pattern`, and `metadata_u64_any`
+        // simply returns `None` for an array -- which silently
+        // substituted `default_swa_layout`'s period for the layout the
+        // file actually declared. Present-but-unreadable is the case to
+        // refuse; presence alone is not, because the pattern itself is
+        // implemented (`ModelConfig::layer_sliding_window`, both
+        // phases). `capability::unsupported_feature_keys` used to refuse
+        // presence alone, and its comment says why that was wrong.
+        let swa_pattern_key = key("attention.sliding_window_pattern");
+        if file.metadata(&swa_pattern_key).is_some()
+            && metadata_u64_any(file, std::slice::from_ref(&swa_pattern_key)).is_none()
+        {
+            return Err(LoadError::UnsupportedFeature(
+                arch.clone(),
+                format!(
+                    "{swa_pattern_key} is not a scalar period; llama.cpp accepts a \
+                     per-layer array here (ml.get_key_or_arr) and ferrox carries one \
+                     period for the whole model, so honouring it would mean substituting \
+                     a different layout for the file's"
+                ),
+            ));
+        }
+        let swa_pattern = metadata_u64_any(file, &[swa_pattern_key])
             .map(|v| v as usize)
             .or_else(|| {
                 sliding_window?;
                 // llama.cpp hardcodes the period per architecture and
                 // only lets the metadata key override it, so a missing
-                // key is *not* "every layer windowed" — see
+                // key is *not* "every layer windowed" -- see
                 // `capability::default_swa_layout`.
                 swa_layout.map(|p| p.period).or(
                     // Any Gemma variant not named in the table keeps the
@@ -496,11 +631,21 @@ impl ModelConfig {
             None
         };
 
-        // Gemma's f_attention_scale equals 1/sqrt(n_embd_head_k) for non-27B,
-        // which is already what `causal_gqa_attention` applies. Do not also
-        // pre-scale Q (that double-scales scores vs llama.cpp's
-        // `build_attn(..., 1.0f)` after an explicit Q scale).
-        let attention_scale = None;
+        // llama.cpp's `f_attention_scale`, and ONLY where it differs from
+        // the `1/sqrt(head_dim)` ferrox's attention kernels already
+        // apply -- `Some` here means "pre-scale Q", so restating the
+        // kernels' own scale would double-scale every score.
+        //
+        // For Gemma-2 and Gemma-3 that difference is real at 27B and
+        // nowhere else (`capability::attention_scale_override` carries
+        // the llama.cpp lines). This used to be a hardcoded `None` under
+        // a comment that NAMED the 27B exception without implementing
+        // it, so Gemma-2-27B scored 1.061x and Gemma-3-27B 1.146x too
+        // large on every layer: a sharper softmax than the trained one,
+        // fluent and wrong, with no error.
+        let attention_scale = crate::capability::attention_scale_override(
+            &arch, n_layers, hidden_dim, n_heads, head_dim,
+        );
 
         // SWA-layer RoPE base. `llama_hparams` defaults it to 10000 and
         // the Gemma-3 lineage relies on that default; the architectures
@@ -549,12 +694,11 @@ impl ModelConfig {
         // present, else `rope_long` when the run's context exceeds
         // `rope.scaling.original_context_length`, else `rope_short`).
         //
-        // The selection here uses the checkpoint's own advertised context
-        // length, which is what llama.cpp defaults `n_ctx` to. A run that
-        // caps the context below `original_context_length` should use the
-        // short set; ferrox's config is built before the context size is
-        // known, so that case is not yet handled — recorded as a
-        // best-effort field rather than silently assumed correct.
+        // Provisional pick from the checkpoint's advertised context length
+        // (llama.cpp's default `n_ctx`). The definitive pick happens in
+        // `ModelConfig::apply_runtime_context`, called from `ferrox run`
+        // (`--ctx-size`) and from `verify_engine::load_and_tokenize`
+        // (`n_tokens + 8`, matching `tools/llama_logits.c`).
         let rope_orig_ctx = metadata_u64_any(file, &[key("rope.scaling.original_context_length")])
             .map(|v| v as usize);
         // `rope_freqs.weight` outranks the LongRoPE pair (llama.cpp
@@ -631,6 +775,16 @@ impl ModelConfig {
         // llama.cpp divides them by 4. It answered as a different model
         // with no error. Affects the long-context community rescales
         // (`*-16k`, `*-32k` Llama-2 derivatives).
+
+        // The file's own per-band factors, BEFORE any position-scaling
+        // fold. That is what a sliding layer uses on an architecture
+        // whose SWA layers do not inherit the trained scale -- llama.cpp
+        // keeps the two apart as `freq_factors` (a tensor, the same for
+        // every layer) and `freq_scale` (per layer,
+        // `llama-model.cpp:2033`), while ferrox folds them into one
+        // vector. See `config::RopeFreqs`.
+        let rope_freqs_unscaled = rope_freqs.clone();
+
         let rope_freqs = match linear_scaling_from_gguf(file, &arch) {
             None => rope_freqs,
             Some(factor) => {
@@ -690,6 +844,29 @@ impl ModelConfig {
                 }
             }
         };
+
+        // The SWA half of the split. llama.cpp defaults
+        // `rope_freq_scale_train_swa` to `1.0f`
+        // (`src/llama-hparams.h:129`) and only the architectures in
+        // `swa_rope_scale_follows_model` assign it from
+        // `rope_freq_scale_train`; `get_rope_freq_scale`
+        // (`llama-model.cpp:2033-2035`) then picks between them per
+        // layer. `gemma3.cpp` is not on that list and its converter
+        // writes the FULL-ATTENTION factor
+        // (`conversion/base.py:1222-1230`), so a Gemma-3 4B/12B/27B was
+        // rotating five layers in six at `p/8` where llama.cpp rotates
+        // at `p`.
+        //
+        // "No scaling" is spelled as an all-ones divisor vector, which
+        // is what dividing by nothing is, so the sliding layers need no
+        // second code path anywhere downstream.
+        let rope_freqs = rope_freqs.map(|full| {
+            let swa = (sliding_window.is_some()
+                && !crate::capability::swa_rope_scale_follows_model(&arch))
+            .then(|| rope_freqs_unscaled.unwrap_or_else(|| vec![1.0; full.len()]))
+            .filter(|swa| *swa != full);
+            crate::config::RopeFreqs { full, swa }
+        });
 
         // RoPE layout comes from the capability registry above (fail-
         // closed). Getting this wrong for `llama` (needs Norm) was the
@@ -921,7 +1098,7 @@ pub(crate) fn find_info<'a>(
 /// missing any of these is not a gpt-oss checkpoint ferrox can run, and
 /// quietly substituting zeros would reintroduce exactly the
 /// silently-wrong-graph failure this path exists to remove. The lengths
-/// are asserted against the config for the same reason — a bias of the
+/// are asserted against the config for the same reason -- a bias of the
 /// wrong width would otherwise be applied to a `zip`-truncated prefix
 /// and produce a plausible, wrong answer.
 ///
@@ -1014,12 +1191,59 @@ pub(crate) fn load_f32_vec_optional(
     Ok(Some(load_f32_vec(file, name)?))
 }
 
+/// A norm weight that some converters spell `<base>.weight` and others
+/// spell just `<base>`.
+///
+/// This exists for exactly one pair of tensors, `post_attention_norm`
+/// and `post_ffw_norm`, and it is this repo's dominant bug shape in
+/// llama.cpp's own trees: TWO SPELLINGS OF ONE NAME, WITH NOTHING
+/// ENFORCING AGREEMENT.
+///
+/// `LLM_TN` appends `.weight` only when it is given a suffix
+/// (`src/llama-arch.cpp:898-910`). Every architecture that creates these
+/// two tensors passes one -- `tn(LLM_TENSOR_ATTN_POST_NORM, "weight",
+/// i)` in gemma2, gemma3, glm4, exaone4, afmoe and the rest -- EXCEPT
+/// `plamo3`, which uses the two-argument overload
+/// (`src/models/plamo3.cpp:52,55`) and therefore asks for
+/// `blk.N.post_attention_norm` with no suffix at all.
+///
+/// The converter agrees with it, by a second accident that happens to
+/// line up: `gguf-py/gguf/tensor_mapping.py:368,434` give the PLaMo
+/// entries as `model.layers.layers.{bid}.post_mixer_norm.weight` and
+/// `...post_mlp_norm.weight` -- keys that already END in `.weight`.
+/// `TensorNameMap.get_type_and_name` (:2585-2594) tries an exact match
+/// FIRST and only falls back to stripping a suffix, so those two match
+/// exactly and the mapped name is emitted with nothing appended.
+///
+/// So a real PLaMo-3 GGUF carries `blk.N.post_attention_norm` and
+/// `blk.N.post_ffw_norm`, and every Gemma-lineage GGUF carries the same
+/// two names with `.weight`. Reading only one spelling means one of the
+/// two families always fails on a missing tensor. ferrox read only
+/// `.weight`, which is why `plamo3` could not have loaded a real
+/// checkpoint -- fail-closed rather than wrong, but not "a fixture
+/// away", which is what its triage verdict said.
+///
+/// Both spellings are accepted rather than one being chosen per
+/// architecture, because the choice is a property of the file and
+/// nothing in the metadata declares it. Neither present is still
+/// `None`.
+pub(crate) fn load_norm_vec_either_spelling(
+    file: &impl TensorSource,
+    base: &str,
+) -> Result<Option<Vec<f32>>, LoadError> {
+    let suffixed = format!("{base}.weight");
+    if file.find_tensor(&suffixed).is_some() {
+        return load_f32_vec_optional(file, &suffixed);
+    }
+    load_f32_vec_optional(file, base)
+}
+
 /// Slice `n` rows starting at `start` out of a quantized matrix without
 /// dequantizing: every `Quantized` kind stores one interleaved block
 /// buffer per row (fixed `row_bytes`), so a row range is a contiguous
 /// byte range. Mapped sources stay zero-copy (sub-range of the same
 /// mmap); other backings get an owned copy. Returns `None` for non-
-/// quantized matrices (F32 / MXFP4) — callers fall back to dequant.
+/// quantized matrices (F32 / MXFP4) -- callers fall back to dequant.
 fn slice_quantized_rows(m: &WeightMatrix, start: usize, n: usize) -> Option<WeightMatrix> {
     let WeightMatrix::Quantized {
         data,
@@ -1307,8 +1531,20 @@ pub(crate) fn load_weight_matrix(
     // as a real transposition bug affecting every externally-produced
     // GGUF file, caught by serving a real downloaded checkpoint.
     let shape: Vec<usize> = info.shape.iter().rev().map(|&d| d as usize).collect();
+    // A ggml tensor's `ne[]` is always four long and trailing 1s are
+    // implicit, so a GGUF writer is free to store a `[in, 1]` matrix
+    // with `n_dims = 1`. llama.cpp reads it back as a matrix anyway --
+    // `check_tensor_dims` compares each requested dimension against
+    // `cur->ne[i]` and requires 1 for the dimensions the file does not
+    // carry -- so a single-output projection is a 2-D weight there and
+    // must be one here. Refusing it instead made a real checkpoint
+    // unloadable: `cross-encoder/ms-marco-MiniLM-L6-v2` writes
+    // `cls.output.weight` as `[384]`, i.e. the 1x384 relevance head
+    // that `/v1/rerank` exists to run, and the whole route died at load
+    // with "expected 2D".
     let (rows, cols) = match shape.as_slice() {
         [r, c] => (*r, *c),
+        [c] => (1, *c),
         other => {
             return Err(LoadError::UnsupportedDtype(
                 format!("{name} (expected 2D, got shape {other:?})"),
@@ -1316,6 +1552,10 @@ pub(crate) fn load_weight_matrix(
             ))
         }
     };
+    // `shape` is what the file said; `[rows, cols]` is what the matrix
+    // is. They differ exactly in the 1-D case above, and the `Tensor`
+    // must carry the matrix shape or `apply` reads it as a vector.
+    let shape = vec![rows, cols];
 
     match info.dtype {
         // BF16 has no block/scale structure to keep quantized-in-place
@@ -1754,13 +1994,20 @@ impl Decoder {
         // gpt-oss carries five per-layer tensors the generic GQA layer
         // structs have no home for, and reuses `post_attention_norm` for
         // a *different* norm slot than Gemma does. Both are decided by
-        // the architecture string, so resolve it once here. See
-        // `crate::decoder::GptOssWeights`.
+        // the architecture string, so resolve them once here. See
+        // `crate::decoder::GptOssWeights` and
+        // `PRE_FFN_NORM_IS_POST_ATTENTION_NORM`.
+        //
+        // These used to be ONE flag, `arch == "gpt-oss"`, standing for
+        // two unrelated facts. Splitting them is what let `seed_oss` --
+        // which shares the norm slot and has none of the extra tensors
+        // -- be admitted without also being handed attention sinks.
         let arch = file
             .metadata_str("general.architecture")
             .unwrap_or_default()
             .to_string();
         let is_gpt_oss = arch == "gpt-oss";
+        let post_attn_norm_is_pre_ffn_norm = pre_ffn_norm_is_post_attention_norm(&arch);
         let mut gpt_oss_layers: Vec<crate::decoder::GptOssLayer> = Vec::new();
 
         // One store for the whole model (keys are (layer, expert)),
@@ -1820,14 +2067,15 @@ impl Decoder {
                 // norms `ffn_inp` with it after the attention residual,
                 // i.e. it is the pre-FFN norm, not a post-attention one.
                 // It is read below into `MoeWeights::norm_weight`.
-                post_attn_norm: if is_gpt_oss {
+                post_attn_norm: if post_attn_norm_is_pre_ffn_norm {
                     None
                 } else {
-                    load_f32_vec_optional(&file, &format!("blk.{l}.post_attention_norm.weight"))?
+                    // Both spellings; see `load_norm_vec_either_spelling`.
+                    load_norm_vec_either_spelling(&file, &format!("blk.{l}.post_attention_norm"))?
                 },
-                post_ffn_norm: load_f32_vec_optional(
+                post_ffn_norm: load_norm_vec_either_spelling(
                     &file,
-                    &format!("blk.{l}.post_ffw_norm.weight"),
+                    &format!("blk.{l}.post_ffw_norm"),
                 )?,
             };
 
@@ -2028,8 +2276,19 @@ impl Decoder {
                 shared_experts,
                 shared_expert_gate,
                 exp_probs_bias,
-                norm_weight: if is_gpt_oss {
-                    load_f32_vec(&file, &format!("blk.{l}.post_attention_norm.weight"))?
+                norm_weight: if post_attn_norm_is_pre_ffn_norm {
+                    // Same two spellings as above, and the same helper,
+                    // so the pre-FFN-norm slot cannot drift away from
+                    // the post-attention one about what a file may be
+                    // called. gpt-oss and seed_oss both write `.weight`
+                    // today; sharing the rule is what stops that being
+                    // a thing to rediscover.
+                    load_norm_vec_either_spelling(&file, &format!("blk.{l}.post_attention_norm"))?
+                        .ok_or_else(|| {
+                        LoadError::Gguf(GgufError::TensorNotFound(format!(
+                            "blk.{l}.post_attention_norm[.weight]"
+                        )))
+                    })?
                 } else {
                     load_f32_vec(&file, &format!("blk.{l}.ffn_norm.weight"))?
                 },
@@ -2118,9 +2377,11 @@ impl Decoder {
             } else {
                 None
             },
+            qk_norm_after_rope: QK_NORM_AFTER_ROPE_ARCHITECTURES.contains(&arch.as_str()),
             #[cfg(feature = "metal")]
             metal_attn_kv: std::sync::Mutex::new(None),
             execution_plan,
+            kv_window: crate::decoder::KvWindowPolicy::from_env(),
             plan_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
         };
         // Resolve every kernel the model will need while we still have a
@@ -2159,7 +2420,7 @@ const IGNORED_TENSOR_PREFIXES: &[&str] = &["mm.", "v.", "mmproj.", "resampler.",
 /// it claims to be; the newer MoE recipes ship `ffn_exp_probs_b` the
 /// same way. Both are silent today, and both are exactly what the
 /// architecture registry cannot catch, because the architecture *string*
-/// is one ferrox does support — it is the checkpoint that carries more
+/// is one ferrox does support -- it is the checkpoint that carries more
 /// than the registry entry promises.
 ///
 /// This is deliberately the last check in the load: by here every loader
@@ -2193,7 +2454,7 @@ pub fn assert_every_tensor_consumed(file: &ShardedGguf) -> Result<(), LoadError>
         Some("1") | Some("true") | Some("on")
     ) {
         eprintln!(
-            "ferrox: WARNING — {} tensor(s) in this checkpoint are never read \
+            "ferrox: WARNING -- {} tensor(s) in this checkpoint are never read \
              ({listing}); output may be wrong (FERROX_ALLOW_UNKNOWN_TENSORS=1)",
             left.len()
         );
@@ -2426,6 +2687,12 @@ mod tests {
         Str(&'a str),
         U32(u32),
         F32(f32),
+        /// A uint32 ARRAY. Only one gate needs it -- the sliding-window
+        /// pattern, which llama.cpp reads with `ml.get_key_or_arr` --
+        /// and without it that gate could only be tested through a
+        /// value of some other type, which is not the case it exists
+        /// for.
+        Arr32(&'a [u32]),
     }
 
     /// A tensor-free GGUF carrying exactly `kvs` -- enough for
@@ -2446,6 +2713,15 @@ mod tests {
                     buf.write_u32::<LittleEndian>(*n).unwrap();
                 }
                 Kv::F32(f) => write_kv_f32(&mut buf, k, *f),
+                Kv::Arr32(values) => {
+                    write_string(&mut buf, k);
+                    buf.write_u32::<LittleEndian>(9).unwrap(); // type = array
+                    buf.write_u32::<LittleEndian>(4).unwrap(); // element type = uint32
+                    buf.write_u64::<LittleEndian>(values.len() as u64).unwrap();
+                    for v in *values {
+                        buf.write_u32::<LittleEndian>(*v).unwrap();
+                    }
+                }
             }
         }
         buf
@@ -2478,6 +2754,7 @@ mod tests {
                     Kv::Str(s) => Kv::Str(s),
                     Kv::U32(n) => Kv::U32(*n),
                     Kv::F32(f) => Kv::F32(*f),
+                    Kv::Arr32(a) => Kv::Arr32(a),
                 },
             ));
         }
@@ -2592,6 +2869,106 @@ mod tests {
         }
     }
 
+    /// Every name in every architecture-keyed behaviour table is a name
+    /// the catalog actually resolves, on the generic-GQA path.
+    ///
+    /// These five tables are the repo's dominant bug shape in its purest
+    /// form: five lists of strings that have to agree with a sixth
+    /// structure (`capability::architecture_catalog`) about what an
+    /// architecture is called, with nothing checking it. A typo, a
+    /// hyphen where the GGUF has an underscore, or a name that later
+    /// moves to a dedicated stack all produce the same thing -- an entry
+    /// that reads as coverage and can never fire. This repo has shipped
+    /// exactly that once already, in `unsupported_feature_keys`, keyed
+    /// on a GGUF spelling no converter writes.
+    ///
+    /// The generic-path check is the second half and the sharper one: a
+    /// behaviour flag on an architecture that is `DedicatedOnly` or
+    /// `Deferred` never reaches this loader, so it is dead text.
+    ///
+    /// Sabotage to confirm: add `"seedoss"` to any list below.
+    #[test]
+    fn every_architecture_keyed_behaviour_table_names_a_real_generic_row() {
+        let tables: &[(&str, &[&str])] = &[
+            ("SIGMOID_GATING_ARCHITECTURES", SIGMOID_GATING_ARCHITECTURES),
+            (
+                "NO_TOPK_RENORMALIZE_ARCHITECTURES",
+                NO_TOPK_RENORMALIZE_ARCHITECTURES,
+            ),
+            (
+                "PRE_FFN_NORM_IS_POST_ATTENTION_NORM",
+                PRE_FFN_NORM_IS_POST_ATTENTION_NORM,
+            ),
+            ("LEADING_DENSE_KEY_IS_INERT", LEADING_DENSE_KEY_IS_INERT),
+            (
+                "QK_NORM_AFTER_ROPE_ARCHITECTURES",
+                QK_NORM_AFTER_ROPE_ARCHITECTURES,
+            ),
+        ];
+        for (table, names) in tables {
+            for arch in *names {
+                let profile = crate::capability::resolve_profile(arch).unwrap_or_else(|| {
+                    panic!("{table} names `{arch}`, which the catalog does not have")
+                });
+                if matches!(profile.path, crate::capability::ArchPath::GenericGqa { .. }) {
+                    continue;
+                }
+                // Not a generic row, so the entry cannot fire HERE.
+                // That is allowed only when something else is named as
+                // applying the behaviour instead. An unexplained dead
+                // entry still fails, which is the whole point.
+                let owner = DEDICATED_OWNS_ITS_BEHAVIOUR
+                    .iter()
+                    .find(|(name, _)| name == arch)
+                    .map(|(_, owner)| *owner);
+                assert!(
+                    owner.is_some(),
+                    "{table} names `{arch}`, which resolves to {:?} and never reaches this \
+                     loader, so the entry cannot fire. Either drop it, or add it to \
+                     DEDICATED_OWNS_ITS_BEHAVIOUR naming what applies the behaviour instead",
+                    profile.path
+                );
+            }
+        }
+    }
+
+    /// The three tables that describe how a layer is BUILT, rather than
+    /// how it is routed, only carry architectures that are audited.
+    ///
+    /// The distinction matters and is not pedantry. A routing default
+    /// (`SIGMOID_GATING_ARCHITECTURES`, `NO_TOPK_RENORMALIZE_ARCHITECTURES`)
+    /// is allowed to name an architecture that still refuses: it is
+    /// written down ahead of time so a later admission inherits the
+    /// right answer, and the tables say so. But the three below change
+    /// which TENSOR a layer reads and in what order -- and each was
+    /// added for exactly one architecture, whose fixture is the only
+    /// thing proving the change is right. A fourth name appearing here
+    /// without evidence would be a claim about a graph nobody read,
+    /// carried by a list whose doc comment cites two.
+    #[test]
+    fn the_layer_shape_tables_only_name_audited_architectures() {
+        for (table, names) in [
+            (
+                "PRE_FFN_NORM_IS_POST_ATTENTION_NORM",
+                PRE_FFN_NORM_IS_POST_ATTENTION_NORM,
+            ),
+            ("LEADING_DENSE_KEY_IS_INERT", LEADING_DENSE_KEY_IS_INERT),
+            (
+                "QK_NORM_AFTER_ROPE_ARCHITECTURES",
+                QK_NORM_AFTER_ROPE_ARCHITECTURES,
+            ),
+        ] {
+            for arch in names {
+                assert!(
+                    crate::capability::is_audited_generic(arch),
+                    "{table} names `{arch}`, which is not in AUDITED_GENERIC_GQA. Either it \
+                     has a fixture proving the change is right -- audit it -- or the entry \
+                     is a guess about a graph"
+                );
+            }
+        }
+    }
+
     fn config_for_arch(arch: &'static str) -> Result<ModelConfig, LoadError> {
         // The per-arch hyperparameter keys are looked up by the arch's
         // own prefix, so they have to be built for the arch under test.
@@ -2627,19 +3004,23 @@ mod tests {
     /// `AUDITED_GENERIC_GQA` would have gone unnoticed.
     #[test]
     fn an_unaudited_generic_architecture_refuses_rather_than_guessing() {
-        // `xverse` is on the generic path and is not in the audited
-        // list: nobody has run a real one through ferrox. It replaced
-        // `starcoder`, which was the example here until an audit found
-        // starcoder REQUIRES a fused `attn_qkv.bias` and a learned
-        // `position_embd` that the generic decoder has no slot for --
-        // so it now refuses for a stronger reason than being unaudited,
-        // and stopped being an example of this one.
+        // `nanbeige` is on the generic path and is not in the audited
+        // list. It is the third name to hold this slot: `starcoder` was
+        // first, until an audit found it REQUIRES a fused
+        // `attn_qkv.bias` and a learned `position_embd` the generic
+        // decoder has no slot for, so it refuses for a stronger reason;
+        // then `xverse`, until it was admitted with a libllama-golden
+        // fixture (`tests/fixture_away_graphs.rs`). `nanbeige` cannot go
+        // the same way soon: it runs the same physical layers more than
+        // once (`src/models/nanbeige.cpp:13-31`), which is NEW CODE, and
+        // its blocker is invisible in metadata, so nothing but this gate
+        // stops it.
         assert!(
-            !crate::capability::is_audited_generic("xverse"),
+            !crate::capability::is_audited_generic("nanbeige"),
             "this test needs an arch that is generic AND unaudited"
         );
-        match config_for_arch("xverse") {
-            Err(LoadError::UnauditedArchitecture(name, ..)) => assert_eq!(name, "xverse"),
+        match config_for_arch("nanbeige") {
+            Err(LoadError::UnauditedArchitecture(name, ..)) => assert_eq!(name, "nanbeige"),
             other => panic!("expected an unaudited refusal, got {other:?}"),
         }
     }
@@ -2692,7 +3073,8 @@ mod tests {
         );
         let factors = cfg
             .rope_freqs
-            .expect("a YaRN checkpoint must carry rewritten per-band frequencies");
+            .expect("a YaRN checkpoint must carry rewritten per-band frequencies")
+            .full;
         assert_eq!(factors.len(), 32, "one divisor per rotation band");
         assert!(
             (factors[0] - 1.0).abs() < 1e-6,
@@ -2731,10 +3113,11 @@ mod tests {
                 ("llama.rope.scaling.factor", Kv::F32(4.0)),
             ],
         );
-        let freqs = cfg
+        let freqs = &cfg
             .rope_freqs
             .as_ref()
-            .expect("linear scaling must produce frequency factors");
+            .expect("linear scaling must produce frequency factors")
+            .full;
         assert_eq!(freqs.len(), cfg.head_dim / 2, "one factor per rotated pair");
         assert!(
             freqs.iter().all(|f| (*f - 4.0).abs() < 1e-6),
@@ -3744,6 +4127,75 @@ mod tests {
         }
     }
 
+    /// A per-layer sliding-window pattern is refused, and a scalar one
+    /// still loads.
+    ///
+    /// Both halves matter. `capability::unsupported_feature_keys` used
+    /// to refuse the key outright with the reason "not implemented in
+    /// the generic decoder", which was false -- the alternating pattern
+    /// is `ModelConfig::layer_sliding_window`, both phases, and
+    /// `gpt-oss` has run on it since it was audited. What that gate
+    /// really did was make the loader's own read of the key dead for
+    /// every non-Gemma architecture. The case ferrox genuinely cannot
+    /// express is the ARRAY, which `metadata_u64_any` reads as `None`
+    /// and which therefore used to fall through to
+    /// `default_swa_layout` -- substituting the architecture's
+    /// hardcoded layout for the file's, silently.
+    #[test]
+    fn an_array_valued_sliding_window_pattern_is_refused_rather_than_substituted() {
+        // llama.cpp reads this key with `ml.get_key_or_arr`, so a file
+        // may declare a per-layer array instead of a scalar period.
+        // ferrox carries ONE period for the whole model and
+        // `metadata_u64_any` returns `None` for an array, so before this
+        // gate the loader fell through to `default_swa_layout` and ran
+        // the architecture's hardcoded layout in place of the file's --
+        // silently, which is the failure this repo keeps finding.
+        //
+        // `capability::unsupported_feature_keys` used to refuse the key
+        // outright, which stopped this AND stopped every legitimate
+        // scalar. Now presence is fine and unreadability is not, so
+        // both halves have to be tested: the scalar case is the plamo3
+        // fixture in `tests/fixture_away_graphs.rs`, and this is the
+        // array case.
+        let pattern: [u32; 4] = [1, 0, 1, 0];
+        let kvs: Vec<(&str, Kv)> = vec![
+            ("general.architecture", Kv::Str("plamo3")),
+            ("plamo3.block_count", Kv::U32(4)),
+            ("plamo3.embedding_length", Kv::U32(64)),
+            ("plamo3.attention.head_count", Kv::U32(1)),
+            ("plamo3.attention.head_count_kv", Kv::U32(1)),
+            ("plamo3.attention.key_length", Kv::U32(64)),
+            ("plamo3.rope.freq_base", Kv::F32(10_000.0)),
+            ("plamo3.attention.sliding_window", Kv::U32(3)),
+            (
+                "plamo3.attention.sliding_window_pattern",
+                Kv::Arr32(&pattern),
+            ),
+        ];
+        let file = open_metadata_gguf("swa_pattern_array", &kvs);
+        match ModelConfig::from_gguf(&file) {
+            Err(LoadError::UnsupportedFeature(arch, msg)) => {
+                assert_eq!(arch, "plamo3");
+                assert!(
+                    msg.contains("not a scalar period"),
+                    "the refusal must name what is wrong with the value: {msg}"
+                );
+            }
+            other => panic!("an array-valued SWA pattern must refuse, got {other:?}"),
+        }
+
+        // And the scalar spelling of the same key still loads, or the
+        // gate would be refusing the feature rather than the shape.
+        let mut scalar = kvs;
+        scalar.pop();
+        scalar.push(("plamo3.attention.sliding_window_pattern", Kv::U32(2)));
+        let file = open_metadata_gguf("swa_pattern_scalar", &scalar);
+        let config = ModelConfig::from_gguf(&file).expect("a scalar period must load");
+        assert_eq!(config.swa_pattern, Some(2));
+        assert_eq!(config.layer_sliding_window(0), Some(3));
+        assert_eq!(config.layer_sliding_window(1), None);
+    }
+
     /// Baichuan is one `general.architecture` string covering two
     /// positional schemes, and llama.cpp picks between them on the layer
     /// count alone (`src/models/baichuan.cpp:11-14`, with its own "TODO:
@@ -3783,6 +4235,200 @@ mod tests {
         match ModelConfig::from_gguf(&seven_b) {
             Err(LoadError::MissingHparam(key)) => assert_eq!(key, "baichuan.embedding_length"),
             other => panic!("Baichuan-7B must pass the ALiBi gate, got {other:?}"),
+        }
+    }
+
+    /// The hyper-parameters a real Gemma-3 GGUF header carries for one
+    /// size. `block_count` is the field llama.cpp's `LLM_TYPE_27B`
+    /// switch reads (`gemma3.cpp:20-28`), so it is never a free
+    /// parameter here.
+    ///
+    /// `linear_factor` adds the pair `conversion/base.py:1222-1230`
+    /// writes from `rope_parameters["full_attention"]` -- and only from
+    /// there: its own comment is "TODO: Handle sliding_attention
+    /// similarly when models start implementing it", so the sliding
+    /// layers get no scaling key at all.
+    fn gemma3_config(
+        tag: &str,
+        n_layers: u32,
+        hidden_dim: u32,
+        n_heads: u32,
+        head_dim: u32,
+        linear_factor: Option<f32>,
+    ) -> ModelConfig {
+        let mut kvs: Vec<(&str, Kv)> = vec![
+            ("general.architecture", Kv::Str("gemma3")),
+            ("gemma3.block_count", Kv::U32(n_layers)),
+            ("gemma3.embedding_length", Kv::U32(hidden_dim)),
+            ("gemma3.attention.head_count", Kv::U32(n_heads)),
+            ("gemma3.attention.head_count_kv", Kv::U32(n_heads)),
+            ("gemma3.attention.key_length", Kv::U32(head_dim)),
+            ("gemma3.attention.value_length", Kv::U32(head_dim)),
+            // Global layers rotate at 1e6; the sliding ones fall back to
+            // llama.cpp's `rope_freq_base_train_swa` default of 10000,
+            // because `gemma3.cpp:11` reads only the BASE key.
+            ("gemma3.rope.freq_base", Kv::F32(1_000_000.0)),
+            ("gemma3.attention.sliding_window", Kv::U32(1024)),
+            ("gemma3.attention.sliding_window_pattern", Kv::U32(6)),
+        ];
+        if let Some(factor) = linear_factor {
+            kvs.push(("gemma3.rope.scaling.type", Kv::Str("linear")));
+            kvs.push(("gemma3.rope.scaling.factor", Kv::F32(factor)));
+        }
+        ModelConfig::from_gguf(&open_metadata_gguf(tag, &kvs)).expect("gemma3 fixture must load")
+    }
+
+    /// The 27B attention scale reaches `ModelConfig`, and no other
+    /// Gemma-3 size acquires one.
+    ///
+    /// `capability::attention_scale_override` is where the arithmetic is
+    /// checked; this pins that the LOADER calls it with this file's own
+    /// numbers. That step is the one that shipped broken: the function
+    /// did not exist and `attention_scale` was the literal `None`, under
+    /// a comment naming the exception. A helper nobody calls looks
+    /// exactly like a fix.
+    #[test]
+    fn a_gemma3_27b_header_sets_the_attention_scale_and_no_smaller_size_does() {
+        // Gemma-3-27B: 62 layers, n_embd 5376, 32 heads, head_dim 128.
+        let big = gemma3_config("g3_27b_scale", 62, 5376, 32, 128, Some(8.0));
+        let want = 1.0f32 / (5376.0f32 / 32.0).sqrt();
+        let got = big
+            .attention_scale
+            .expect("Gemma-3-27B is llama.cpp's LLM_TYPE_27B");
+        assert!(
+            (got - want).abs() < 1e-7,
+            "want 1/sqrt(168) = {want}, got {got}"
+        );
+        // The bug's magnitude: scores were sqrt(168/128) = 1.146x too
+        // large without this.
+        let kernel = 1.0f32 / 128.0f32.sqrt();
+        assert!((kernel / got - (168.0f32 / 128.0).sqrt()).abs() < 1e-5);
+
+        // Gemma-3-1B and -4B take llama.cpp's other branch, which is the
+        // scale the attention kernels already apply. A `Some` here would
+        // double-scale them.
+        for (tag, n_layers, hidden, heads) in
+            [("g3_1b_scale", 26, 1152, 4), ("g3_4b_scale", 34, 2560, 8)]
+        {
+            let cfg = gemma3_config(tag, n_layers, hidden, heads, 256, None);
+            assert_eq!(
+                cfg.attention_scale, None,
+                "{tag} must keep the kernels' own 1/sqrt(head_dim)"
+            );
+        }
+    }
+
+    /// Gemma-3's declared linear scaling reaches the FULL-ATTENTION
+    /// layers only, and the sliding ones rope unscaled.
+    ///
+    /// `gemma3.cpp:11` reads `LLM_KV_ROPE_FREQ_BASE_SWA` and nothing
+    /// else, so `rope_freq_scale_train_swa` keeps its `1.0f` default
+    /// (`src/llama-hparams.h:129`) while `get_rope_freq_scale`
+    /// (`llama-model.cpp:2033-2035`) hands the trained scale to the full
+    /// layers. The converter agrees: `conversion/base.py:1222-1230`
+    /// takes the factor from `rope_parameters["full_attention"]` and
+    /// writes nothing for the sliding half.
+    ///
+    /// ferrox folded the factor into ONE global `rope_freqs` vector, so
+    /// Gemma-3-4B/12B/27B rotated five layers in six at `p/8`.
+    #[test]
+    fn gemma3_linear_scaling_reaches_the_full_layers_and_not_the_sliding_ones() {
+        // Gemma-3-4B: 34 layers, head_dim 256, `rope_scaling: linear 8`.
+        let cfg = gemma3_config("g3_4b_rope", 34, 2560, 8, 256, Some(8.0));
+        let freqs = cfg
+            .rope_freqs
+            .as_ref()
+            .expect("declared linear scaling must produce per-band divisors");
+        assert!(
+            freqs.full.iter().all(|f| (*f - 8.0).abs() < 1e-6),
+            "full-attention layers divide every band by the trained factor: {:?}",
+            freqs.full
+        );
+        let swa = freqs
+            .swa
+            .as_ref()
+            .expect("gemma3 does not assign rope_freq_scale_train_swa, so 1.0 applies");
+        assert!(
+            swa.iter().all(|f| (*f - 1.0).abs() < 1e-6),
+            "sliding layers rope at the raw position: {swa:?}"
+        );
+        assert_eq!(swa.len(), freqs.full.len(), "one divisor per rotated pair");
+
+        // Period 6, last-dense (`capability::default_swa_layout`), so
+        // layer 5 is the full-attention one and 0..=4 slide. The phase
+        // matters: getting it wrong swaps which five-sixths are wrong.
+        assert!(cfg.layer_sliding_window(0).is_some());
+        assert!(cfg.layer_sliding_window(5).is_none());
+        assert_eq!(cfg.layer_rope_freqs(0), Some(&[1.0f32; 128][..]));
+        assert_eq!(cfg.layer_rope_freqs(5), Some(&[8.0f32; 128][..]));
+        assert_eq!(cfg.layer_rope_theta(0), 10_000.0);
+        assert_eq!(cfg.layer_rope_theta(5), 1_000_000.0);
+        assert!(
+            cfg.rope_freqs_vary_by_layer(),
+            "the fused Metal stacks take one divisor slice for a whole run \
+             and so must refuse this model"
+        );
+
+        // Gemma-3-1B declares no scaling at all -- the audited fixture,
+        // and the reason this was invisible. Nothing to split, so no
+        // per-layer set and no Metal refusal.
+        let plain = gemma3_config("g3_1b_rope", 26, 1152, 4, 256, None);
+        assert!(plain.rope_freqs.is_none());
+        assert!(!plain.rope_freqs_vary_by_layer());
+    }
+
+    /// Gemma-2 is the counter-case, and it is why the SWA scale needs
+    /// its own table rather than reusing `swa_rope_base_follows_model`.
+    ///
+    /// `gemma2.cpp:10-11` assigns BOTH `rope_freq_base_train_swa` and
+    /// `rope_freq_scale_train_swa` from the model's trained values, so
+    /// its sliding layers keep the declared scaling. Splitting them here
+    /// would be the same bug pointed the other way.
+    #[test]
+    fn gemma2_sliding_layers_inherit_the_trained_rope_scale() {
+        let cfg = ModelConfig::from_gguf(&open_metadata_gguf(
+            "g2_rope",
+            &[
+                ("general.architecture", Kv::Str("gemma2")),
+                ("gemma2.block_count", Kv::U32(26)),
+                ("gemma2.embedding_length", Kv::U32(2304)),
+                ("gemma2.attention.head_count", Kv::U32(8)),
+                ("gemma2.attention.head_count_kv", Kv::U32(4)),
+                ("gemma2.attention.key_length", Kv::U32(256)),
+                ("gemma2.attention.value_length", Kv::U32(256)),
+                ("gemma2.rope.freq_base", Kv::F32(10_000.0)),
+                ("gemma2.attention.sliding_window", Kv::U32(4096)),
+                ("gemma2.rope.scaling.type", Kv::Str("linear")),
+                ("gemma2.rope.scaling.factor", Kv::F32(8.0)),
+            ],
+        ))
+        .expect("gemma2 fixture must load");
+
+        let freqs = cfg.rope_freqs.as_ref().expect("linear scaling declared");
+        assert_eq!(
+            freqs.swa, None,
+            "gemma2.cpp:11 assigns rope_freq_scale_train_swa from the trained scale"
+        );
+        assert!(!cfg.rope_freqs_vary_by_layer());
+        // Period 2, last-dense: layer 0 slides, layer 1 does not, and
+        // both get the same divisors.
+        assert!(cfg.layer_sliding_window(0).is_some());
+        assert!(cfg.layer_sliding_window(1).is_none());
+        assert_eq!(cfg.layer_rope_freqs(0), cfg.layer_rope_freqs(1));
+
+        // The two tables really are different: this is the pair that
+        // must not be collapsed into one.
+        assert!(crate::capability::swa_rope_scale_follows_model("gemma2"));
+        assert!(!crate::capability::swa_rope_scale_follows_model("gemma3"));
+        for arch in ["olmo2", "laguna"] {
+            assert!(
+                crate::capability::swa_rope_base_follows_model(arch),
+                "{arch} seeds the SWA base from the model"
+            );
+            assert!(
+                !crate::capability::swa_rope_scale_follows_model(arch),
+                "{arch} pins the SWA scale to 1.0 (olmo2.cpp:14, laguna.cpp:48)"
+            );
         }
     }
 }

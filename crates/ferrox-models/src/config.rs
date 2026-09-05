@@ -217,7 +217,10 @@ pub struct ModelConfig {
     /// (`ggml_rope_cache_init` divides by `freq_factors` and *then*
     /// runs `rope_yarn`). Consumers must therefore treat this as "the
     /// correction to apply", not as "the tensor this file shipped".
-    pub rope_freqs: Option<Vec<f32>>,
+    ///
+    /// Per-LAYER, because llama.cpp's is: see [`RopeFreqs`]. Read it
+    /// through [`Self::layer_rope`], never field-by-field.
+    pub rope_freqs: Option<RopeFreqs>,
     /// LongRoPE's two candidate factor sets, kept so the choice between
     /// them can be made when the *run's* context size is known rather
     /// than at parse time. llama.cpp picks per request
@@ -299,6 +302,72 @@ pub struct ModelConfig {
     pub best_effort_fields: &'static [&'static str],
 }
 
+/// The resolved per-band RoPE divisors, for BOTH kinds of layer.
+///
+/// llama.cpp splits RoPE per layer in two places, not one:
+///
+/// ```cpp
+/// // src/llama-model.cpp:2029-2035
+/// float llama_model::get_rope_freq_base (const llama_cparams & cparams, int il) const {
+///     return hparams.is_swa(il) ? hparams.rope_freq_base_train_swa  : cparams.rope_freq_base;
+/// }
+/// float llama_model::get_rope_freq_scale(const llama_cparams & cparams, int il) const {
+///     return hparams.is_swa(il) ? hparams.rope_freq_scale_train_swa : cparams.rope_freq_scale;
+/// }
+/// ```
+///
+/// and every alternating-SWA graph calls both, per layer
+/// (`gemma3.cpp:112-121`, `gemma2.cpp:79-80`, `laguna.cpp:182-183`).
+/// ferrox folds llama.cpp's `freq_scale` into these divisors -- linear
+/// scaling by `s` is exactly "divide every band by `s`" -- so the SCALE
+/// half of that split has to live here, beside the BASE half in
+/// [`ModelConfig::rope_theta_swa`].
+///
+/// It did not, and Gemma-3 4B/12B/27B paid for it: their headers declare
+/// `rope.scaling.type = linear, factor = 8`, `gemma3.cpp` never assigns
+/// `rope_freq_scale_train_swa` so it keeps its `1.0f` default
+/// (`src/llama-hparams.h:129`), and five layers in every six are sliding
+/// (`sliding_window_pattern = 6`, last-dense). ferrox rotated all of
+/// them at `p/8` where llama.cpp rotates at `p` -- fluent, and worse the
+/// longer the prompt. Invisible to the audit because the fixture is
+/// Gemma-3-1B, the one size with no `rope_scaling` at all.
+///
+/// The two fields are one struct so that answering the base question
+/// without answering the scale question does not compile.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RopeFreqs {
+    /// What the FULL-ATTENTION layers divide each band's theta by.
+    pub full: Vec<f32>,
+    /// What the SLIDING layers divide by, when the architecture does not
+    /// let them inherit the model's trained RoPE scale
+    /// (`capability::swa_rope_scale_follows_model`). `None` means they
+    /// inherit [`Self::full`], which is llama.cpp's behaviour for every
+    /// architecture that assigns `rope_freq_scale_train_swa` from
+    /// `rope_freq_scale_train`.
+    ///
+    /// "No divisors at all" is spelled as an all-ones vector rather than
+    /// a third state: dividing by one is exactly not dividing, and one
+    /// fewer state is one fewer thing two call sites can disagree about.
+    pub swa: Option<Vec<f32>>,
+}
+
+impl RopeFreqs {
+    /// The divisors layer `il` uses, given whether it slides.
+    pub fn for_layer(&self, sliding: bool) -> &[f32] {
+        match (sliding, &self.swa) {
+            (true, Some(swa)) => swa,
+            _ => &self.full,
+        }
+    }
+
+    /// True when the sliding layers use a different set from the full
+    /// ones, i.e. when one `freq_factors` buffer cannot serve a whole
+    /// stack of layers.
+    pub fn varies_by_layer(&self) -> bool {
+        self.swa.as_ref().is_some_and(|swa| *swa != self.full)
+    }
+}
+
 /// Dense / expert FFN non-linearity used by the generic decoder.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum FfnActivation {
@@ -327,7 +396,9 @@ impl ModelConfig {
     /// [`Self::rope_freqs`]). No real checkpoint hits that: LongRoPE
     /// files declare `rope.scaling.type = "longrope"`, which the loader's
     /// YaRN arm deliberately does not claim, so the two never populate
-    /// the field on the same file.
+    /// the field on the same file. The same caveat now covers
+    /// [`RopeFreqs::swa`], and for the same reason: no LongRoPE
+    /// checkpoint has alternating SWA layers.
     pub fn apply_runtime_context(&mut self, ctx: usize) {
         let (Some(orig), true) = (
             self.rope_orig_ctx,
@@ -344,7 +415,10 @@ impl ModelConfig {
             .or(self.rope_freqs_long.as_ref())
             .or(self.rope_freqs_short.as_ref())
         {
-            self.rope_freqs = Some(f.clone());
+            self.rope_freqs = Some(RopeFreqs {
+                full: f.clone(),
+                swa: None,
+            });
         }
     }
 
@@ -429,12 +503,60 @@ impl ModelConfig {
             .expect("aligned_block_size returns a size BlockLayout accepts")
     }
 
-    /// RoPE frequency base for layer `il` (SWA layers may differ).
-    pub fn layer_rope_theta(&self, layer_idx: usize) -> f32 {
-        match (self.layer_sliding_window(layer_idx), self.rope_theta_swa) {
-            (Some(_), Some(theta)) => theta,
+    /// BOTH halves of layer `il`'s RoPE: the frequency base and the
+    /// per-band divisors, which llama.cpp varies per layer together
+    /// (`llama-model.cpp:2029-2035`, and see [`RopeFreqs`]).
+    ///
+    /// Every RoPE call site takes the pair from here. Splitting them was
+    /// the defect: `layer_rope_theta` varied the base per layer while
+    /// `rope_freqs` was one global vector, so Gemma-3 4B/12B/27B roped
+    /// their sliding layers at scaled positions llama.cpp leaves
+    /// unscaled.
+    pub fn layer_rope(&self, layer_idx: usize) -> (f32, Option<&[f32]>) {
+        let sliding = self.layer_sliding_window(layer_idx).is_some();
+        let theta = match (sliding, self.rope_theta_swa) {
+            (true, Some(theta)) => theta,
             _ => self.rope_theta,
-        }
+        };
+        (
+            theta,
+            self.rope_freqs.as_ref().map(|f| f.for_layer(sliding)),
+        )
+    }
+
+    /// RoPE frequency base for layer `il` (SWA layers may differ).
+    ///
+    /// Prefer [`Self::layer_rope`] anywhere the divisors are needed too,
+    /// which is every site that actually rotates something. This one is
+    /// for the callers that only report or compare the base.
+    pub fn layer_rope_theta(&self, layer_idx: usize) -> f32 {
+        self.layer_rope(layer_idx).0
+    }
+
+    /// Per-band RoPE divisors for layer `il`; see [`Self::layer_rope`].
+    pub fn layer_rope_freqs(&self, layer_idx: usize) -> Option<&[f32]> {
+        self.layer_rope(layer_idx).1
+    }
+
+    /// True when the sliding layers need different per-band divisors
+    /// from the full-attention ones, i.e. when one `freq_factors` slice
+    /// cannot describe every layer of this model. Gemma-3 4B/12B/27B
+    /// are the shape that answers yes.
+    ///
+    /// It is NOT an eligibility check any more. It was one: the fused
+    /// Metal stacks took a single slice for a whole run of layers and
+    /// refused a model that answered yes here. They now take a
+    /// `ferrox_metal::attn::LayerRope` per layer, so this is a statement
+    /// about the checkpoint and nothing else -- which is all the loader
+    /// tests ever wanted from it.
+    pub fn rope_freqs_vary_by_layer(&self) -> bool {
+        self.rope_freqs
+            .as_ref()
+            .is_some_and(RopeFreqs::varies_by_layer)
+            // A model whose every layer slides, or none, uses one set
+            // whatever the two vectors hold.
+            && (0..self.n_layers).any(|il| self.layer_sliding_window(il).is_some())
+            && (0..self.n_layers).any(|il| self.layer_sliding_window(il).is_none())
     }
 
     /// Which attention mechanism layer `layer_idx` (0-indexed, ferrox's
@@ -1226,18 +1348,26 @@ mod longrope_tests {
         let mut c = cfg_with_factors();
         c.apply_runtime_context(4096);
         assert_eq!(
-            c.rope_freqs.as_ref().unwrap()[1],
+            c.rope_freqs.as_ref().unwrap().full[1],
             1.0,
             "at the threshold, short"
         );
 
         let mut c = cfg_with_factors();
         c.apply_runtime_context(4097);
-        assert_eq!(c.rope_freqs.as_ref().unwrap()[1], 2.0, "above it, long");
+        assert_eq!(
+            c.rope_freqs.as_ref().unwrap().full[1],
+            2.0,
+            "above it, long"
+        );
 
         let mut c = cfg_with_factors();
         c.apply_runtime_context(1024);
-        assert_eq!(c.rope_freqs.as_ref().unwrap()[1], 1.0, "below it, short");
+        assert_eq!(
+            c.rope_freqs.as_ref().unwrap().full[1],
+            1.0,
+            "below it, short"
+        );
     }
 
     /// `rope_freqs.weight` (Llama 3) is not a LongRoPE set and outranks
@@ -1247,12 +1377,15 @@ mod longrope_tests {
     #[test]
     fn an_explicit_rope_freqs_tensor_is_never_overridden() {
         let mut c = test_dense_fixture();
-        c.rope_freqs = Some(vec![7.0; 48]);
+        c.rope_freqs = Some(RopeFreqs {
+            full: vec![7.0; 48],
+            swa: None,
+        });
         c.rope_orig_ctx = Some(4096);
         c.rope_freqs_long = None;
         c.rope_freqs_short = None;
         c.apply_runtime_context(131072);
-        assert_eq!(c.rope_freqs.as_ref().unwrap()[0], 7.0);
+        assert_eq!(c.rope_freqs.as_ref().unwrap().full[0], 7.0);
     }
 
     /// A checkpoint with neither set must come back untouched, so the

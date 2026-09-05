@@ -70,22 +70,52 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{OnceLock, RwLock};
 
 /// Which execution backend a lookup was resolved against.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, PartialOrd, Ord)]
-pub enum Backend {
-    Cpu,
-    Metal,
-    Cuda,
+///
+/// **The GPU variants are generated**, from
+/// [`crate::weight_matrix::gpu_backend::gpu_backend_table`] — the same
+/// ordered list `WeightMatrix::apply_gpu` dispatches over and
+/// `active_backend` reads. That is the beachhead verdict's point 4:
+/// "a backend cannot be dispatched to without being reportable". It
+/// used to be a hand-kept list beside the dispatch order, i.e. two
+/// structures that had to agree about one thing with nothing enforcing
+/// it, which is the failure this file exists to catch in *kernels* and
+/// was quietly repeating in *backends*.
+///
+/// `Cpu` is written out rather than generated: it is the fallthrough
+/// every accelerator miss lands on, not a backend anything dispatches
+/// to, and it has no row in the table for the same reason it has no
+/// cargo feature.
+///
+/// This works only because the registry and the seam are one crate. A
+/// `macro_rules!` cannot add a variant to an enum in another crate, so
+/// an out-of-tree backend could not own its own variant; if one is ever
+/// wanted, this becomes a trait object or a `&'static str`, not a
+/// second list.
+macro_rules! define_backend_enum {
+    ([] $(($variant:ident, $name:literal, $ty:ident)),* $(,)?) => {
+        #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, PartialOrd, Ord)]
+        pub enum Backend {
+            Cpu,
+            $($variant,)*
+        }
+
+        impl Backend {
+            pub fn as_str(self) -> &'static str {
+                match self {
+                    Backend::Cpu => "cpu",
+                    $(Backend::$variant => $name,)*
+                }
+            }
+
+            /// Every backend this build knows about, `Cpu` first. Lets a
+            /// test iterate the set instead of restating it.
+            pub const ALL: &'static [Backend] = &[Backend::Cpu, $(Backend::$variant,)*];
+        }
+    };
 }
+crate::weight_matrix::gpu_backend::gpu_backend_table!(define_backend_enum);
 
 impl Backend {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Backend::Cpu => "cpu",
-            Backend::Metal => "metal",
-            Backend::Cuda => "cuda",
-        }
-    }
-
     /// True for the accelerator backends. A miss here means work the
     /// user asked to run on a GPU is running somewhere else.
     pub fn is_accelerator(self) -> bool {

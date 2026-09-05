@@ -46,6 +46,11 @@ pub enum SchemaError {
     UnsupportedRef { reference: String },
     /// A `#/`-rooted `$ref` whose pointer does not land on anything.
     RefNotFound { reference: String, token: String },
+    /// Two schemas compiled into ONE grammar ([`super::GrammarBuilder`])
+    /// spell the same `$ref` pointer and mean different subschemas. The
+    /// rule name is derived from the pointer, so honouring the first
+    /// would compile the second against the wrong definition.
+    RefCollision { pointer: String },
     /// A keyword's value has the wrong JSON type for what it means.
     BadValue {
         keyword: String,
@@ -101,6 +106,11 @@ impl fmt::Display for SchemaError {
             SchemaError::RefNotFound { reference, token } => write!(
                 f,
                 "JSON schema $ref {reference:?} does not resolve: {token:?} is not in the document"
+            ),
+            SchemaError::RefCollision { pointer } => write!(
+                f,
+                "two schemas compiled into one grammar both define {pointer:?} and disagree about \
+                 what it is; rename one of them"
             ),
             SchemaError::BadValue { keyword, at, why } => {
                 write!(

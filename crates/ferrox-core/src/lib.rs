@@ -22,6 +22,10 @@ pub mod attention;
 pub mod bench_profile;
 pub mod block_sparse;
 pub mod cache;
+// The two halves of issue #27's CPU scheduling change: `cpu_pool` is
+// the persistent worker pool, `par` is the one seam every CPU parallel
+// region in this crate goes through and the switch between them.
+pub mod cpu_pool;
 pub mod csa_hca_compress;
 pub mod deepseek_v4_attention;
 pub mod expert_budget;
@@ -41,6 +45,7 @@ pub mod kv_disk;
 pub mod kv_signature;
 pub mod kv_swa;
 pub mod matmul;
+pub mod par;
 pub mod placement;
 pub mod qstar;
 pub mod residency;

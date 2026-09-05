@@ -4,9 +4,12 @@ The published table is **[`RESULTS.md`](RESULTS.md)**. It is generated,
 so never edit it by hand.
 
 Every timed run writes one small JSON file of raw numbers into
-[`receipts/engine/`](receipts/engine/), named `{id}_{backend}.json`.
-Those files are checked in, and `RESULTS.md` is rendered from them. The
-rest of this repo calls them receipts.
+[`receipts/engine/`](receipts/engine/) (kernel) or
+[`receipts/serving/`](receipts/serving/) (HTTP), named
+`{id}_{backend}.json` or `{id}_{backend}_{workload}_{version}.json`.
+Engine receipts are checked in and `RESULTS.md` is rendered from them.
+Serving receipts are checked in by hand. The rest of this repo calls
+them receipts.
 
 The setup follows llama.cpp's [`llama-bench`](https://github.com/ggerganov/llama.cpp/tree/master/tools/llama-bench):
 a native CLI, the `pp512` and `tg128` workloads, compared against
@@ -78,6 +81,16 @@ rows read 25-45% low under load. Message:
 host 1-minute load average is 3.10, above the 2.00 bar: a timed run
 here is noise, not a measurement …
 ```
+
+**A load average cannot see one busy core.** The guard above is
+necessary and not sufficient. Every CPU measurement taken on 2026-09-04
+ran while `suggestd` held ~97% of one core, for over a day, and the
+1-minute load stayed under the 2.0 bar the whole time: one pegged core
+on a six-core box does not move the average enough to trip it. The
+comparison being run that day was thread-scheduling sensitive, which is
+exactly the kind a stolen core distorts unevenly. So before a run that
+matters, check `ps -eo pcpu,comm | sort -rn | head` as well, and treat
+a single process above ~90% as disqualifying even when the guard passes.
 
 **The host is thermally limited.** On macOS, `NSProcessInfo`'s thermal
 state at `serious` or `critical`, or an Intel Mac reporting a
@@ -214,3 +227,52 @@ Record the GPU and driver whenever you quote a CUDA number. There is
 no pinned CUDA host here and no CUDA files under
 [`receipts/engine/`](receipts/engine/), so nothing in `RESULTS.md`
 covers it. See [`docs/ROADMAP.md`](../docs/ROADMAP.md).
+
+## Serving (HTTP)
+
+Engine benches measure kernels alone. Serving benches measure a running
+`ferrox-server` over the OpenAI-compatible HTTP API: chat template,
+tokenizer, sampler, SSE streaming, and (on Metal by default) continuous
+batching.
+
+| | |
+|---|---|
+| Measures | end-to-end HTTP latency and throughput |
+| Driver | `ferrox serve-bench` (Rust) or [`pi-agent-tests`](../../pi-agent-tests/) harness |
+| Compared against | — (no llama.cpp HTTP twin in-tree) |
+| Raw numbers | [`receipts/serving/`](receipts/serving/) |
+| Workload | streaming chat/completions, concurrency sweeps |
+
+```bash
+# install script binary (Metal build on macOS)
+ferrox serve -m models/Llama-3.2-3B-Instruct-Q4_K_M.gguf -dev metal -ngl all &
+
+./target/release/ferrox serve-bench --requests 64 --concurrency 8 --output-len 128
+./target/release/ferrox serve-bench --concurrency 16 --json
+```
+
+Rules for meaningful numbers: see [`docs/CLI.md`](../docs/CLI.md)
+(`serve-bench` section). Temperature 0, exact output length, and
+positional TTFT/TPOT split are enforced in `ferrox_edge::bench_client`.
+
+### Metal continuous batching (0.15.3)
+
+Host B, **Llama-3.2-3B-Instruct Q4_K_M**, CB auto-on, `ferrox 0.15.3`:
+
+| Workload | Concurrency | OK | Aggregate tok/s | Mean TTFT |
+|---|---|---|---|---|
+| parallel stream burst (`max_tokens=64`) | 1 | 2/2 | 17.4 | 157 ms |
+| | 2 | 4/4 | 19.0 | 272 ms |
+| | 4 | 8/8 | 22.7 | 450 ms |
+| | 8 | 16/16 | **24.4** | 957 ms |
+| sequential stream (`max_tokens=128`) | 1 | 8/8 | — | **118 ms** |
+
+Receipts (from [`pi-agent-tests/ferrox_parallel_bench.py`](../../pi-agent-tests/ferrox_parallel_bench.py)
+and [`ferrox_stream_bench.py`](../../pi-agent-tests/ferrox_stream_bench.py)):
+[`llama32_3b_q4km_metal_cb_parallel_0.15.3.json`](receipts/serving/llama32_3b_q4km_metal_cb_parallel_0.15.3.json),
+[`llama32_3b_q4km_metal_cb_stream_0.15.3.json`](receipts/serving/llama32_3b_q4km_metal_cb_stream_0.15.3.json).
+See also [`pi-agent-tests/README.md`](../../pi-agent-tests/README.md).
+
+0.15.2 measured similar aggregate throughput at concurrency 8 but returned
+garbled text under CB on Metal until the 0.15.3 host-K/V prefill fix.
+See [`docs/plans/metal-parallel-concurrency.md`](../docs/plans/metal-parallel-concurrency.md).

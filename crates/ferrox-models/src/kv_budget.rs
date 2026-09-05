@@ -35,8 +35,64 @@
 //!
 //! A conservative, explainable number beats a clever one: none of this
 //! tries to track real resident bytes over time.
+//!
+//! # Why a sliding window is not a saving here
+//!
+//! This module used to cap sliding-window layers at `window + chunk - 1`
+//! positions and subtract them out of the divisor, which made a
+//! Gemma-3-4B context look 5.8x cheaper than it is and gpt-oss 2x. **No
+//! KV store ferrox allocates ever gave that cap back** (#33):
+//!
+//! - `ferrox_core::cache::KvCache` has no window concept at all. `push`
+//!   extends `k`/`v` for every position, so a plain or pool-backed cache
+//!   holds the whole sequence in every layer. This is what the CLI
+//!   allocates and what the server allocates on its non-paged paths.
+//! - The paged store *can* recycle pages behind a window, but only for a
+//!   model whose every layer shares one window
+//!   (`ModelConfig::uniform_sliding_window`, `None` by design for the
+//!   alternating models -- gpt-oss, Gemma-2/3 -- because a page group
+//!   holds one block per layer and the full-attention layers still read
+//!   position 0). Even there it recycles only the GENERATION tail: its
+//!   own admission arithmetic (`ferrox_server::generate::
+//!   paged_hold_positions`) holds `prompt + bound + a page`, and a
+//!   budget priced in *context length* has to survive a prompt that
+//!   fills that context.
+//!
+//! So the budget prices every layer at every position, for every model.
+//! That is exactly what the two `KvCache` stores allocate and an upper
+//! bound on what the paged store reserves, which is the direction that
+//! matters: an over-estimate costs context, an under-estimate is
+//! admitted and then arrives as an OOM instead of the refusal this
+//! engine exists to give.
+//!
+//! # ...unless the store evicts, which it now can
+//!
+//! #61 step 2 taught the contiguous `KvCache` to drop rows behind a
+//! layer's sliding window, behind `FERROX_KV_WINDOW`. So the paragraph
+//! above is still the default and no longer the only case, and the
+//! difference is expressed the way #33 said it had to be: **the number
+//! the store keeps belongs to the store.** [`KvResidency`] carries the
+//! per-layer windows, [`KvShape::resident_kv_bytes_for_tokens`] prices
+//! them through `ferrox_core::kv_swa::KvWindow::rows_after`, and
+//! `KvCache::evict_behind_window` calls the same function to decide what
+//! to drop. There is no second statement of the rule here to drift.
+//!
+//! Two numbers, not one, and admission wants the larger:
+//! [`KvShape::peak_kv_bytes_for_tokens`] adds the one layer that is
+//! still mid-prefill and holding the whole prompt, because
+//! `Decoder::forward_batch` evicts per layer rather than after the
+//! stack. `resident_` is what a measurement of the caches finds at rest;
+//! `peak_` is what the machine has to survive.
+//!
+//! What is NOT priced here, because no store does it yet: eviction
+//! inside the paged store (#61 step 4) and eviction of the prompt region
+//! while the prompt is still being written (#61 step 5). Both stay at
+//! the full every-layer-every-position number.
+
+use ferrox_core::kv_swa::KvWindow;
 
 use crate::config::ModelConfig;
+use crate::decoder::KvWindowPolicy;
 
 /// Element width of one cached K/V scalar, per backend store.
 ///
@@ -61,17 +117,31 @@ impl KvElem {
     /// Bytes needed to store `elems` cached scalars, rounding up to a
     /// whole block for the block-quantized wires (a partial block still
     /// costs a full one).
+    ///
+    /// Saturating rather than wrapping or panicking. This is a
+    /// REPORTING number: it exists to put bytes in a refusal message,
+    /// and it is reached with position counts that came off an HTTP
+    /// body. `max_tokens: u64::MAX / 64` does not overflow the position
+    /// sum, so it reaches here and multiplied past `u64::MAX`, panicking
+    /// the request thread while computing the text of the very refusal
+    /// that was about to reject it (#36).
+    ///
+    /// Saturating is right HERE and wrong for a bound. A saturated byte
+    /// count still reports "astronomically large", which is the only
+    /// thing the message needs to convey. A saturated position bound
+    /// would silently turn a nonsense request into a plausible one and
+    /// serve it.
     pub fn bytes_for(self, elems: u64) -> u64 {
         match self {
-            KvElem::F32 => elems * 4,
-            KvElem::F16 => elems * 2,
+            KvElem::F32 => elems.saturating_mul(4),
+            KvElem::F16 => elems.saturating_mul(2),
             KvElem::Q8_0 => {
                 let blocks = elems.div_ceil(ferrox_quant::Q8_0_BLOCK_ELEMS as u64);
-                blocks * ferrox_quant::Q8_0_BLOCK_BYTES as u64
+                blocks.saturating_mul(ferrox_quant::Q8_0_BLOCK_BYTES as u64)
             }
             KvElem::Turbo4 => {
                 let blocks = elems.div_ceil(ferrox_quant::TURBO4_KV_GROUP as u64);
-                blocks * ferrox_quant::TURBO4_KV_BLOCK_BYTES as u64
+                blocks.saturating_mul(ferrox_quant::TURBO4_KV_BLOCK_BYTES as u64)
             }
         }
     }
@@ -195,53 +265,43 @@ impl KvLayout {
     }
 }
 
-/// Sliding-window attention, which caps how many positions a layer ever
-/// keeps.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SlidingWindow {
-    /// Positions a query may attend back over.
-    pub window: usize,
-    /// Prefill chunk size. A chunk of `chunk` tokens is processed
-    /// against one cache state, so the *first* token of the chunk still
-    /// needs its whole window live while the *last* one is being
-    /// processed: `window + chunk - 1` positions, not `window`.
-    pub chunk: usize,
-    /// Gemma 2+/3 alternating pattern (`ModelConfig::swa_pattern`):
-    /// layer `il` is sliding iff `(il + 1) % period != 0`, so every
-    /// `period`-th layer keeps the full context. `None` means every
-    /// layer slides.
-    pub pattern: Option<usize>,
-}
-
-impl SlidingWindow {
-    /// Positions a sliding layer keeps once the sequence is long
-    /// enough to saturate it.
-    pub fn resident_positions(&self, tokens: usize) -> usize {
-        tokens.min(self.window + self.chunk.max(1) - 1)
-    }
-}
-
 /// The KV shape of a whole model: enough to price any context length.
+///
+/// How big one position is, times how many layers. How many positions
+/// each of those layers still HOLDS is [`KvResidency`], and it is a
+/// separate value because it is a property of the run rather than of
+/// the model: by default every layer keeps every position, and behind
+/// `FERROX_KV_WINDOW` a windowed layer does not (#61).
+///
+/// That is a statement about the STORES this engine allocates, not
+/// about the architectures it runs -- see the module doc, and the two
+/// tests that measure real `ferrox_core::cache::KvCache`s rather than
+/// restating this multiplication.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct KvShape {
     pub n_layers: usize,
     pub layout: KvLayout,
     pub elem: KvElem,
-    /// `None` = every layer keeps the full causal history.
-    pub sliding: Option<SlidingWindow>,
 }
 
 impl KvShape {
-    /// Reads the shape off a config. `chunk` is the prefill chunk size
-    /// the run will use (`FERROX_CHUNKED_PREFILL`, or 1 when prefill is
-    /// token-at-a-time); it only ever matters for sliding layers.
+    /// Reads the shape off a config.
+    ///
+    /// `config.sliding_window` / `config.swa_pattern` are deliberately
+    /// NOT read HERE: they describe what attention *reads*, and this
+    /// module prices what the store *keeps*. The default store keeps
+    /// everything (#33), so a windowed layer costs exactly what a
+    /// full-attention one does. When a run evicts, that is what
+    /// [`KvResidency::from_config`] is for -- and it reaches the window
+    /// through the same `KvWindowPolicy` the decoder evicts with, not by
+    /// reading those two fields a second time.
     ///
     /// Always produces a [`KvLayout::Gqa`] layout, because
     /// `ModelConfig` describes the generic GQA decoder -- the MLA
     /// stacks carry their own hyperparameters (`Deepseek2Hparams`,
     /// `MlaConfig`) and should build their shape with
     /// [`KvShape::mla_expanded`].
-    pub fn from_config(config: &ModelConfig, elem: KvElem, chunk: usize) -> Self {
+    pub fn from_config(config: &ModelConfig, elem: KvElem) -> Self {
         KvShape {
             n_layers: config.n_layers,
             layout: KvLayout::Gqa {
@@ -249,11 +309,6 @@ impl KvShape {
                 head_dim: config.head_dim,
             },
             elem,
-            sliding: config.sliding_window.map(|window| SlidingWindow {
-                window,
-                chunk,
-                pattern: config.swa_pattern,
-            }),
         }
     }
 
@@ -275,96 +330,164 @@ impl KvShape {
                 v_head_dim,
             },
             elem,
-            sliding: None,
         }
     }
 
-    /// How many layers slide, given the alternating pattern.
-    pub fn sliding_layers(&self) -> usize {
-        match self.sliding {
-            None => 0,
-            Some(SlidingWindow { pattern: None, .. }) => self.n_layers,
-            Some(SlidingWindow {
-                pattern: Some(period),
-                ..
-            }) => {
-                if period <= 1 {
-                    self.n_layers
-                } else {
-                    // llama.cpp `set_swa_pattern`: full attention iff
-                    // `(il + 1) % period == 0`.
-                    self.n_layers - self.n_layers / period
-                }
-            }
-        }
-    }
-
-    /// Layers that keep the full causal history.
-    pub fn full_attention_layers(&self) -> usize {
-        self.n_layers - self.sliding_layers()
-    }
-
-    /// The plan's headline number: bytes one token costs across every
-    /// layer, ignoring any sliding-window cap. Exact for f32/f16;
+    /// The plan's headline number, and the only per-token number there
+    /// is: bytes one token costs across every layer. Exact for f32/f16;
     /// for the block-quantized wires it is exact whenever a layer's
     /// per-token element count is a multiple of the 32-element block
     /// (true for every real head-dim/kv-head combination), and rounds
     /// up otherwise.
+    ///
+    /// This is also the divisor [`KvBudget::max_context`] uses. There is
+    /// no separate "marginal" number any more: a marginal cost below the
+    /// per-token cost would mean some layer stops growing, and none
+    /// does.
     pub fn per_token_kv_bytes(&self) -> u64 {
-        self.n_layers as u64 * self.elem.bytes_for(self.layout.elems_per_token_per_layer())
+        (self.n_layers as u64)
+            .saturating_mul(self.elem.bytes_for(self.layout.elems_per_token_per_layer()))
     }
 
-    /// Bytes each *additional* context token costs once the sliding
-    /// layers have saturated: only the full-attention layers keep
-    /// growing. This is the divisor [`KvBudget::max_context`] uses,
-    /// and it is `0` for a model whose every layer slides -- such a
-    /// model's KV is bounded no matter how long the context is.
-    pub fn marginal_per_token_bytes(&self) -> u64 {
-        self.full_attention_layers() as u64
-            * self.elem.bytes_for(self.layout.elems_per_token_per_layer())
-    }
-
-    /// Bytes one request's KV costs at `tokens` of context, applying
-    /// the sliding-window cap per layer class.
+    /// Bytes one request's KV costs at `tokens` of context.
     pub fn kv_bytes_for_tokens(&self, tokens: usize) -> u64 {
+        // Every multiplication here saturates, for the reason on
+        // `KvElem::bytes_for`: `tokens` can arrive from an HTTP body.
         let per_layer = self.layout.elems_per_token_per_layer();
-        let full =
-            self.full_attention_layers() as u64 * self.elem.bytes_for(per_layer * tokens as u64);
-        let sliding = match self.sliding {
-            None => 0,
-            Some(w) => {
-                self.sliding_layers() as u64
-                    * self
-                        .elem
-                        .bytes_for(per_layer * w.resident_positions(tokens) as u64)
-            }
-        };
-        full + sliding
+        (self.n_layers as u64)
+            .saturating_mul(self.elem.bytes_for(per_layer.saturating_mul(tokens as u64)))
+    }
+
+    /// Bytes one request's KV costs at `tokens` of context when the
+    /// stores EVICT behind a window (#61 step 2), once every layer has
+    /// been through -- the number a measurement of the caches finds.
+    ///
+    /// The row counts come from [`KvWindow::rows_after`], which is the
+    /// store's own rule and not a restatement of it: `KvCache` calls the
+    /// same function to decide what to drop. Equal to
+    /// [`Self::kv_bytes_for_tokens`] when `residency` keeps everything,
+    /// which is what the default policy produces and what a test below
+    /// asserts rather than assumes.
+    ///
+    /// [`Self::peak_kv_bytes_for_tokens`] is the number to ADMIT on;
+    /// this one is smaller, and the difference is prefill.
+    pub fn resident_kv_bytes_for_tokens(&self, tokens: usize, residency: &KvResidency) -> u64 {
+        let per_layer = self.layout.elems_per_token_per_layer();
+        residency
+            .rows_per_layer(self.n_layers, tokens)
+            .map(|rows| self.elem.bytes_for(per_layer.saturating_mul(rows as u64)))
+            .fold(0u64, |acc, b| acc.saturating_add(b))
+    }
+
+    /// The number an admission decision must use: the resting cost, plus
+    /// the one layer that is still mid-prefill.
+    ///
+    /// `Decoder::forward_batch` writes a whole prompt into layer `l`'s
+    /// cache, attends over it, and only then hands the rows behind the
+    /// window back -- before layer `l + 1` allocates any. So a long
+    /// prompt costs ONE windowed layer's full history at a time rather
+    /// than every windowed layer's at once, and that transient is real
+    /// memory that has to be budgeted for. Charging only the resting
+    /// number would be #33 in the other direction: an admitted request
+    /// whose peak exceeds the estimate arrives as an OOM.
+    ///
+    /// The extra term is the largest single windowed layer's shortfall,
+    /// because layers are prefilled one at a time.
+    pub fn peak_kv_bytes_for_tokens(&self, tokens: usize, residency: &KvResidency) -> u64 {
+        let per_layer = self.layout.elems_per_token_per_layer();
+        let full = self.elem.bytes_for(per_layer.saturating_mul(tokens as u64));
+        let transient = residency
+            .rows_per_layer(self.n_layers, tokens)
+            .map(|rows| {
+                full.saturating_sub(self.elem.bytes_for(per_layer.saturating_mul(rows as u64)))
+            })
+            .max()
+            .unwrap_or(0);
+        self.resident_kv_bytes_for_tokens(tokens, residency)
+            .saturating_add(transient)
     }
 
     /// The sentence a user should be able to read and reproduce with a
     /// calculator.
     pub fn describe(&self) -> String {
-        let base = format!(
+        format!(
             "{} layers x [{}] x {} = {} bytes/token",
             self.n_layers,
             self.layout.describe(),
             self.elem.as_str(),
             self.per_token_kv_bytes()
-        );
-        match self.sliding {
-            None => base,
-            Some(w) => format!(
-                "{base}; {} of {} layers slide and cap at min(tokens, {} window + {} chunk - 1) \
-                 = {} positions, leaving {} bytes/token marginal",
-                self.sliding_layers(),
-                self.n_layers,
-                w.window,
-                w.chunk,
-                w.window + w.chunk.max(1) - 1,
-                self.marginal_per_token_bytes(),
-            ),
+        )
+    }
+}
+
+/// What the stores really keep, per layer.
+///
+/// [`KvShape`] answers "how big is one position, times how many layers".
+/// This answers "how many positions does each of those layers still
+/// hold", which used to be "all of them" for every layer of every model
+/// and now depends on whether `FERROX_KV_WINDOW` is on (#61).
+///
+/// **Deliberately not a field on `KvShape`.** `KvShape` is `Copy`, is
+/// built by struct literal in more than one crate, and is the thing
+/// every existing caller already has; a new field there would make the
+/// no-eviction default a thing every caller restates. A residency is
+/// asked for by the callers that price an evicting run, and the ones
+/// that do not keep the number they always had.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KvResidency {
+    /// One entry per layer, in layer order. `None` means that layer
+    /// keeps every position it was ever given.
+    per_layer: Vec<Option<KvWindow>>,
+}
+
+impl KvResidency {
+    /// Every layer keeps every position: the engine before #61, and the
+    /// engine today unless the switch is on.
+    pub fn keeps_everything(n_layers: usize) -> Self {
+        KvResidency {
+            per_layer: vec![None; n_layers],
         }
+    }
+
+    /// What `policy` will make the stores of `config` keep.
+    ///
+    /// Goes through [`KvWindowPolicy::layer_window`], which is the same
+    /// call `Decoder::kv_window_for_layer` makes to decide what to
+    /// evict. One expression, so there is nothing for the budget and the
+    /// store to disagree about -- the disagreement being #33, where the
+    /// budget capped a sliding layer no store ever capped and `-c auto`
+    /// approved a context that did not fit.
+    pub fn from_config(config: &ModelConfig, policy: KvWindowPolicy) -> Self {
+        KvResidency {
+            per_layer: (0..config.n_layers)
+                .map(|l| policy.layer_window(config, l))
+                .collect(),
+        }
+    }
+
+    /// True when no layer evicts, i.e. this prices exactly what
+    /// [`KvShape::kv_bytes_for_tokens`] prices.
+    pub fn keeps_every_position(&self) -> bool {
+        self.per_layer.iter().all(Option::is_none)
+    }
+
+    /// The window layer `layer_idx` evicts behind, if any.
+    pub fn layer_window(&self, layer_idx: usize) -> Option<KvWindow> {
+        self.per_layer.get(layer_idx).copied().flatten()
+    }
+
+    /// Rows each of `n_layers` layers holds at `tokens` of context.
+    ///
+    /// `n_layers` comes from the [`KvShape`] being priced rather than
+    /// from `self`, and a layer this residency says nothing about keeps
+    /// everything. A shape and a residency built from different configs
+    /// is a caller error; charging the full cost is the safe way to be
+    /// wrong about it.
+    fn rows_per_layer(&self, n_layers: usize, tokens: usize) -> impl Iterator<Item = usize> + '_ {
+        (0..n_layers).map(move |l| match self.layer_window(l) {
+            Some(w) => w.rows_after(tokens),
+            None => tokens,
+        })
     }
 }
 
@@ -477,46 +600,27 @@ impl KvBudget {
     /// floored to `granularity` and clamped to `cap` (the model's own
     /// trained context length).
     ///
-    /// Sliding-window layers are subtracted out of the divisor (they
-    /// stop growing once saturated) and added back as a constant, so a
-    /// model whose every layer slides is limited only by `cap`.
+    /// Every layer is in the divisor. A sliding-window model used to
+    /// have its windowed layers subtracted out of it and added back as a
+    /// saturated constant, which is the #33 under-estimate: nothing
+    /// evicts, so nothing saturates.
     pub fn max_context(&self, cap: usize, granularity: usize) -> ContextFit {
         let granularity = granularity.max(1);
         let concurrency = self.concurrent_requests.max(1) as u64;
         let available = self.kv_bytes_available();
-        let marginal = self.shape.marginal_per_token_bytes() * concurrency;
+        let per_token = self.shape.per_token_kv_bytes().saturating_mul(concurrency);
 
-        // The sliding layers' saturated cost is a constant that has to
-        // come out of the budget before the full-attention layers get
-        // to divide what's left. Priced at `cap` (their worst case).
-        let saturated_sliding = {
-            let mut shape = self.shape;
-            shape.n_layers = shape.sliding_layers();
-            match shape.sliding {
-                None => 0,
-                Some(w) => {
-                    shape.n_layers as u64
-                        * shape.elem.bytes_for(
-                            shape.layout.elems_per_token_per_layer()
-                                * w.resident_positions(cap) as u64,
-                        )
-                        * concurrency
-                }
-            }
-        };
-        let for_full_layers = available.saturating_sub(saturated_sliding);
-
-        let (tokens, capped_by) = if available == 0 || for_full_layers == 0 && marginal > 0 {
+        let (tokens, capped_by) = if available == 0 {
             (0, ContextCap::DeviceBudget)
         } else {
-            // `checked_div` rather than a `marginal == 0` guard around
-            // a bare `/`: the zero case is not an error here, it is a
-            // real configuration -- every layer slides, so KV is
-            // bounded and only the model's own context length limits
-            // us -- and expressing it as `None` keeps that meaning in
-            // one place instead of splitting it across a check and a
-            // division that clippy then has to re-associate.
-            match for_full_layers.checked_div(marginal) {
+            // `checked_div` rather than a `per_token == 0` guard around
+            // a bare `/`: a model with no KV at all (no layers, or a
+            // zero-width layout) is not an error here, it is just
+            // unbounded by memory, and expressing it as `None` keeps
+            // that meaning in one place instead of splitting it across
+            // a check and a division that clippy then has to
+            // re-associate.
+            match available.checked_div(per_token) {
                 None => (cap, ContextCap::ModelContextLength),
                 Some(raw) => {
                     let raw = raw as usize;
@@ -544,7 +648,7 @@ impl KvBudget {
             granularity,
             capped_by,
             kv_available_bytes: available,
-            marginal_per_token_bytes: self.shape.marginal_per_token_bytes(),
+            per_token_kv_bytes: self.shape.per_token_kv_bytes(),
             concurrent_requests: concurrency as usize,
             kv_bytes: self.shape.kv_bytes_for_tokens(tokens) * concurrency,
             weights_bytes: self.weights_bytes,
@@ -572,7 +676,8 @@ pub struct ContextFit {
     pub granularity: usize,
     pub capped_by: ContextCap,
     pub kv_available_bytes: u64,
-    pub marginal_per_token_bytes: u64,
+    /// The divisor: bytes one token of context costs across every layer.
+    pub per_token_kv_bytes: u64,
     pub concurrent_requests: usize,
     pub kv_bytes: u64,
     pub weights_bytes: u64,
@@ -597,7 +702,7 @@ impl std::fmt::Display for ContextFit {
             self.weights_bytes,
             self.activation_headroom_bytes,
             self.kv_available_bytes,
-            self.marginal_per_token_bytes,
+            self.per_token_kv_bytes,
             self.concurrent_requests,
             self.granularity,
             self.cap,
@@ -627,7 +732,6 @@ mod tests {
                 head_dim: 128,
             },
             elem: KvElem::F32,
-            sliding: None,
         }
     }
 
@@ -695,94 +799,301 @@ mod tests {
         assert_eq!(mha.per_token_kv_bytes(), 32 * 2 * 32 * 128 * 4);
     }
 
-    #[test]
-    fn sliding_window_layers_saturate_and_full_layers_do_not() {
-        // Mistral-7B shape with a 4096 window, every layer sliding,
-        // prefill one token at a time (chunk = 1 -> cap is exactly the
-        // window).
-        let shape = KvShape {
-            n_layers: 32,
-            layout: KvLayout::Gqa {
-                n_kv_heads: 8,
-                head_dim: 128,
-            },
-            elem: KvElem::F16,
-            sliding: Some(SlidingWindow {
-                window: 4096,
-                chunk: 1,
-                pattern: None,
-            }),
-        };
-        assert_eq!(shape.sliding_layers(), 32);
-        assert_eq!(shape.full_attention_layers(), 0);
-        // Below the window it costs the same as full attention.
-        assert_eq!(
-            shape.kv_bytes_for_tokens(1024),
-            shape.per_token_kv_bytes() * 1024
-        );
-        // Above it, cost stops growing.
-        let at_window = shape.kv_bytes_for_tokens(4096);
-        assert_eq!(shape.kv_bytes_for_tokens(32_768), at_window);
-        assert_eq!(shape.kv_bytes_for_tokens(1_000_000), at_window);
-        // Marginal cost per extra token is zero once every layer slides.
-        assert_eq!(shape.marginal_per_token_bytes(), 0);
-    }
-
-    #[test]
-    fn chunked_prefill_widens_the_sliding_cap_by_chunk_minus_one() {
-        let base = SlidingWindow {
-            window: 512,
-            chunk: 1,
-            pattern: None,
-        };
-        assert_eq!(base.resident_positions(100_000), 512);
-        let chunked = SlidingWindow { chunk: 256, ..base };
-        // window + chunk - 1, per the plan: the first token of a chunk
-        // still needs its full window when the last one runs.
-        assert_eq!(chunked.resident_positions(100_000), 512 + 256 - 1);
-        assert_eq!(chunked.resident_positions(300), 300);
-    }
-
-    #[test]
-    fn gemma_alternating_pattern_leaves_every_sixth_layer_full_attention() {
-        // Gemma 3's real 5:1 pattern: layer `il` slides unless
-        // `(il + 1) % 6 == 0`, so 26 layers slide and 5 do not out of 31.
-        let shape = KvShape {
-            n_layers: 30,
-            layout: KvLayout::Gqa {
-                n_kv_heads: 4,
-                head_dim: 256,
-            },
-            elem: KvElem::F16,
-            sliding: Some(SlidingWindow {
-                window: 1024,
-                chunk: 1,
-                pattern: Some(6),
-            }),
-        };
-        assert_eq!(shape.full_attention_layers(), 5);
-        assert_eq!(shape.sliding_layers(), 25);
-        // Cross-check against ModelConfig's own per-layer answer, so
-        // the two SWA implementations cannot drift apart.
+    /// A small alternating-SWA config: 6 layers, every 3rd of them full
+    /// attention, a 4-position window. Small enough that a test can
+    /// allocate the real stores; alternating, which is the case
+    /// `ModelConfig::uniform_sliding_window` refuses to let any store
+    /// recycle.
+    fn alternating_swa_config() -> ModelConfig {
         let mut cfg = crate::config::test_dense_fixture();
-        cfg.n_layers = 30;
+        cfg.n_layers = 6;
+        cfg.n_kv_heads = 1;
+        cfg.head_dim = 8;
+        cfg.sliding_window = Some(4);
+        cfg.swa_pattern = Some(3);
+        cfg
+    }
+
+    /// **The property this module got wrong, measured rather than
+    /// restated.**
+    ///
+    /// The old budget capped a sliding layer at `window + chunk - 1`
+    /// positions, but `ferrox_core::cache::KvCache` -- the store the CLI
+    /// allocates and the store the server allocates on every non-paged
+    /// path -- has no window concept: `push` extends `k`/`v` for every
+    /// position, in every layer. So the budget under-priced gpt-oss by
+    /// 2x and Gemma-3-4B by 5.8x, `-c auto` approved a context that did
+    /// not fit, and the failure arrived as an OOM instead of a refusal
+    /// (#33).
+    ///
+    /// This pushes real positions into the real caches and compares the
+    /// bytes they hold against the budget's number. Recomputing the
+    /// budget's own multiplication here would assert nothing: the code
+    /// was not wrong about arithmetic, it was wrong about the world.
+    #[test]
+    fn the_budget_prices_exactly_what_the_kv_store_allocates_for_an_alternating_swa_model() {
+        let cfg = alternating_swa_config();
+        // Well past the 4-position window, which is the whole point:
+        // under the old cap the sliding layers stopped being charged
+        // here.
+        let tokens = 64;
+        assert!(
+            cfg.sliding_window.is_some() && cfg.uniform_sliding_window().is_none(),
+            "the fixture must be an alternating-SWA model, or this proves nothing"
+        );
+
+        let mut caches: Vec<ferrox_core::cache::KvCache> = (0..cfg.n_layers)
+            .map(|_| ferrox_core::cache::KvCache::new(cfg.n_kv_heads, cfg.head_dim))
+            .collect();
+        let step = vec![0f32; cfg.n_kv_heads * cfg.head_dim];
+        for _ in 0..tokens {
+            for cache in caches.iter_mut() {
+                cache
+                    .push(&step, &step)
+                    .expect("a cache built with `new` always accepts a push");
+            }
+        }
+        let allocated: u64 = caches
+            .iter()
+            .map(|c| (c.k.len() + c.v.len()) as u64 * std::mem::size_of::<f32>() as u64)
+            .sum();
+
+        let shape = KvShape::from_config(&cfg, KvElem::F32);
+        assert_eq!(
+            shape.kv_bytes_for_tokens(tokens),
+            allocated,
+            "the budget must price what the store holds"
+        );
+        // The store kept every position in every layer, window or not.
+        assert_eq!(allocated, shape.per_token_kv_bytes() * tokens as u64);
+        // And the two entry points agree when nothing evicts, rather
+        // than being two independent multiplications that happen to
+        // match today.
+        assert_eq!(
+            shape
+                .resident_kv_bytes_for_tokens(tokens, &KvResidency::keeps_everything(cfg.n_layers)),
+            allocated
+        );
+    }
+
+    /// **The same property, measured again, now that a store evicts.**
+    ///
+    /// The sibling above is the default and stays the default. This is
+    /// the `FERROX_KV_WINDOW` case, and it is asserted the same way for
+    /// the same reason: by pushing real positions into real
+    /// `ferrox_core::cache::KvCache`s, evicting them the way
+    /// `Decoder::evict_layer_kv` does, and comparing the bytes they hold
+    /// against the budget's number. If the budget restated the window
+    /// rule instead of taking it from `KvWindow::rows_after`, this test
+    /// would pass while the two drifted -- which is exactly how #33
+    /// survived long enough to approve a context that did not fit.
+    #[test]
+    fn the_budget_prices_exactly_what_an_evicting_kv_store_holds() {
+        let cfg = alternating_swa_config();
+        let tokens = 64;
+        let residency = KvResidency::from_config(&cfg, KvWindowPolicy::on());
+        assert!(
+            !residency.keeps_every_position(),
+            "the fixture must have windowed layers, or this proves nothing"
+        );
+        assert!(
+            (0..cfg.n_layers).any(|l| residency.layer_window(l).is_none()),
+            "the fixture must ALSO have dense layers: they are the half that keeps costing"
+        );
+
+        let mut caches: Vec<ferrox_core::cache::KvCache> = (0..cfg.n_layers)
+            .map(|_| ferrox_core::cache::KvCache::new(cfg.n_kv_heads, cfg.head_dim))
+            .collect();
+        for (l, cache) in caches.iter_mut().enumerate() {
+            if let Some(w) = residency.layer_window(l) {
+                cache.arm_window(w);
+            }
+        }
+        let step = vec![0f32; cfg.n_kv_heads * cfg.head_dim];
+        for _ in 0..tokens {
+            for cache in caches.iter_mut() {
+                cache
+                    .push(&step, &step)
+                    .expect("a cache built with `new` always accepts a push");
+                cache.evict_behind_window();
+            }
+        }
+        let held: u64 = caches
+            .iter()
+            .map(|c| (c.k.len() + c.v.len()) as u64 * std::mem::size_of::<f32>() as u64)
+            .sum();
+
+        let shape = KvShape::from_config(&cfg, KvElem::F32);
+        assert_eq!(
+            shape.resident_kv_bytes_for_tokens(tokens, &residency),
+            held,
+            "the budget must price what the evicting store holds"
+        );
+        // The saving is real: strictly less than pricing every position.
+        assert!(
+            held < shape.kv_bytes_for_tokens(tokens),
+            "eviction saved nothing: {held} vs {}",
+            shape.kv_bytes_for_tokens(tokens)
+        );
+        // And the number to admit on is above the number at rest, because
+        // one layer holds the whole prompt while it is being prefilled.
+        assert!(shape.peak_kv_bytes_for_tokens(tokens, &residency) > held);
+        // ...but never above pricing every layer at every position,
+        // which is what the engine costs today.
+        assert!(
+            shape.peak_kv_bytes_for_tokens(tokens, &residency) <= shape.kv_bytes_for_tokens(tokens)
+        );
+    }
+
+    /// The default policy prices exactly what it always did. A switch
+    /// that is off must be invisible to the arithmetic.
+    #[test]
+    fn the_default_policy_prices_every_layer_at_every_position() {
+        let cfg = alternating_swa_config();
+        let residency = KvResidency::from_config(&cfg, KvWindowPolicy::off());
+        assert!(residency.keeps_every_position());
+        let shape = KvShape::from_config(&cfg, KvElem::F32);
+        for tokens in [0usize, 1, 63, 64, 4096] {
+            assert_eq!(
+                shape.resident_kv_bytes_for_tokens(tokens, &residency),
+                shape.kv_bytes_for_tokens(tokens)
+            );
+            assert_eq!(
+                shape.peak_kv_bytes_for_tokens(tokens, &residency),
+                shape.kv_bytes_for_tokens(tokens)
+            );
+        }
+    }
+
+    /// The headline number from #61, priced through the residency rather
+    /// than asserted: Gemma-3-4B at a 32k context.
+    ///
+    /// 34 layers, 4 kv-heads, head_dim 256, host f32, a 1024-position
+    /// window on five layers out of every six. The full price is the
+    /// 9.13 GB the issue measured; the windowed one is what the store
+    /// now holds.
+    #[test]
+    fn gemma3_4b_at_32k_costs_a_fraction_of_what_it_did() {
+        let mut cfg = crate::config::test_dense_fixture();
+        cfg.n_layers = 34;
+        cfg.n_kv_heads = 4;
+        cfg.head_dim = 256;
         cfg.sliding_window = Some(1024);
         cfg.swa_pattern = Some(6);
-        let per_layer_full = (0..30)
-            .filter(|&il| cfg.layer_sliding_window(il).is_none())
-            .count();
-        assert_eq!(per_layer_full, shape.full_attention_layers());
+        let shape = KvShape::from_config(&cfg, KvElem::F32);
+        let tokens = 32_768;
 
-        // Only the 5 full-attention layers keep growing with context.
-        let per_layer_token = shape.elem.bytes_for(2 * 4 * 256);
-        assert_eq!(shape.marginal_per_token_bytes(), 5 * per_layer_token);
-        // At 8192 tokens: 5 full layers at 8192 positions, 25 sliding
-        // layers pinned at 1024.
+        let full = shape.kv_bytes_for_tokens(tokens);
+        assert_eq!(full, 9_126_805_504, "the number #61 measured");
+
+        let residency = KvResidency::from_config(&cfg, KvWindowPolicy::on());
+        let resting = shape.resident_kv_bytes_for_tokens(tokens, &residency);
+        let peak = shape.peak_kv_bytes_for_tokens(tokens, &residency);
+        // Pinned rather than bounded, so a change to the default slack
+        // shows up as a memory number moving rather than as nothing.
+        // 5 of the 34 layers are full attention (`swa_pattern` 6) and
+        // still hold every position; at 1.34 GB they are most of what is
+        // left. The 29 windowed ones hold 1475 rows each instead of
+        // 32768.
+        assert_eq!(resting, 1_692_590_080, "5.4x less than the 9.13 GB above");
         assert_eq!(
-            shape.kv_bytes_for_tokens(8192),
-            5 * shape.elem.bytes_for(2 * 4 * 256 * 8192)
-                + 25 * shape.elem.bytes_for(2 * 4 * 256 * 1024)
+            peak, 1_948_942_336,
+            "resting plus the one windowed layer still mid-prefill"
         );
+        assert!(peak < full && peak > resting);
+    }
+
+    /// The pool-backed store is the other thing a server allocates, and
+    /// it reserves `max_seq_len` positions for EVERY layer up front
+    /// (`KvCache::with_pool`), rounded up to whole blocks. The budget
+    /// must never be under that either -- an admitted request whose
+    /// reservation exceeds the estimate is exactly the OOM #33 is about.
+    #[test]
+    fn the_pool_backed_store_never_reserves_more_positions_than_the_budget_priced() {
+        use ferrox_core::cache::{KvBlockPool, KvCache};
+        use std::sync::{Arc, Mutex};
+
+        let cfg = alternating_swa_config();
+        let tokens = 64usize;
+        let block_size = 16usize;
+        let pool = Arc::new(Mutex::new(KvBlockPool::new(
+            block_size,
+            tokens.div_ceil(block_size) * cfg.n_layers,
+        )));
+        let caches: Vec<KvCache> = (0..cfg.n_layers)
+            .map(|_| {
+                KvCache::with_pool(cfg.n_kv_heads, cfg.head_dim, Arc::clone(&pool), tokens)
+                    .expect("the pool was sized for exactly this")
+            })
+            .collect();
+        let reserved: u64 = caches
+            .iter()
+            .map(|c| c.k.capacity() as u64 + c.v.capacity() as u64)
+            .sum::<u64>()
+            * std::mem::size_of::<f32>() as u64;
+
+        let priced = KvShape::from_config(&cfg, KvElem::F32).kv_bytes_for_tokens(tokens);
+        // Equal here because `tokens` is a whole number of blocks; the
+        // assertion that matters is the direction, which holds for any
+        // block size.
+        assert!(
+            priced >= reserved,
+            "budget priced {priced} bytes, the pool reserved {reserved}"
+        );
+        assert_eq!(priced, reserved);
+    }
+
+    /// The two checkpoints #33 measured, at their own byte counts.
+    ///
+    /// These constants are what the stores allocate, taken from the
+    /// issue, not from this module's formula. The numbers the old code
+    /// produced were 6,448,742,400 for gpt-oss (half) and 1,585,446,912
+    /// for Gemma-3-4B (a sixth).
+    #[test]
+    fn gpt_oss_and_gemma3_cost_what_the_issue_measured() {
+        // gpt-oss-20b: 24 layers, 8 kv-heads, head_dim 64, host f32,
+        // 131072 context. Alternating 128-position window, priced at 0.
+        let mut gpt_oss = crate::config::test_dense_fixture();
+        gpt_oss.n_layers = 24;
+        gpt_oss.n_kv_heads = 8;
+        gpt_oss.head_dim = 64;
+        gpt_oss.sliding_window = Some(128);
+        gpt_oss.swa_pattern = Some(2);
+        assert_eq!(
+            KvShape::from_config(&gpt_oss, KvElem::F32).kv_bytes_for_tokens(131_072),
+            12_884_901_888
+        );
+
+        // Gemma-3-4B: 34 layers, 4 kv-heads, head_dim 256, 32768 tokens.
+        let mut gemma3 = crate::config::test_dense_fixture();
+        gemma3.n_layers = 34;
+        gemma3.n_kv_heads = 4;
+        gemma3.head_dim = 256;
+        gemma3.sliding_window = Some(1024);
+        gemma3.swa_pattern = Some(6);
+        assert_eq!(
+            KvShape::from_config(&gemma3, KvElem::F32).kv_bytes_for_tokens(32_768),
+            9_126_805_504
+        );
+    }
+
+    /// A window changes what attention READS, not what the store KEEPS,
+    /// so it may not change the price. Stated as an equality between two
+    /// configs rather than as a comment, so re-introducing a cap fails
+    /// here.
+    #[test]
+    fn a_windowed_config_is_priced_identically_to_the_same_config_without_a_window() {
+        let windowed = alternating_swa_config();
+        let mut full = windowed.clone();
+        full.sliding_window = None;
+        full.swa_pattern = None;
+        for tokens in [1, 3, 4, 5, 64, 100_000] {
+            assert_eq!(
+                KvShape::from_config(&windowed, KvElem::F32).kv_bytes_for_tokens(tokens),
+                KvShape::from_config(&full, KvElem::F32).kv_bytes_for_tokens(tokens),
+                "tokens={tokens}"
+            );
+        }
     }
 
     #[test]
@@ -797,7 +1108,6 @@ mod tests {
                 qk_rope_head_dim: 64,
             },
             elem: KvElem::F32,
-            sliding: None,
         };
         // 512 + 64 = 576 scalars per token per layer -- one vector, no
         // K/V doubling.
@@ -827,29 +1137,22 @@ mod tests {
     }
 
     #[test]
-    fn from_config_reads_layers_heads_and_the_sliding_window() {
+    fn from_config_reads_layers_heads_and_head_dim() {
         let mut cfg = crate::config::test_dense_fixture();
         cfg.n_layers = 12;
         cfg.n_kv_heads = 2;
         cfg.head_dim = 64;
         cfg.sliding_window = None;
-        let shape = KvShape::from_config(&cfg, KvElem::F32, 1);
+        let shape = KvShape::from_config(&cfg, KvElem::F32);
         assert_eq!(shape.n_layers, 12);
         assert_eq!(shape.per_token_kv_bytes(), 12 * 2 * 2 * 64 * 4);
-        assert!(shape.sliding.is_none());
 
+        // A uniform window changes nothing either: the paged store that
+        // could recycle for one still holds the whole prompt, and it is
+        // a context length this prices.
         cfg.sliding_window = Some(256);
         cfg.swa_pattern = None;
-        let swa = KvShape::from_config(&cfg, KvElem::F32, 64);
-        assert_eq!(
-            swa.sliding,
-            Some(SlidingWindow {
-                window: 256,
-                chunk: 64,
-                pattern: None
-            })
-        );
-        assert_eq!(swa.sliding_layers(), 12);
+        assert_eq!(KvShape::from_config(&cfg, KvElem::F32), shape);
     }
 
     fn budget(weights: u64, device: u64, shape: KvShape) -> KvBudget {
@@ -899,7 +1202,7 @@ mod tests {
         // 1000 floored to a 256-token step is 768.
         assert_eq!(fit.tokens, 768);
         assert_eq!(fit.kv_available_bytes, 262_144 * 1000);
-        assert_eq!(fit.marginal_per_token_bytes, 262_144);
+        assert_eq!(fit.per_token_kv_bytes, 262_144);
         // The chosen context really does fit.
         assert!(b.check(fit.tokens).is_ok());
         // One granularity step further does not.
@@ -939,58 +1242,28 @@ mod tests {
         assert!(b.check(0).is_err(), "weights alone already overflow");
     }
 
+    /// `--ctx auto` on a windowed model used to answer "the model's own
+    /// context length" however small the budget was, because the
+    /// divisor had every sliding layer taken out of it and a model whose
+    /// every layer slid divided by zero bytes per token. It is now
+    /// bounded by memory like any other model, and the context it picks
+    /// has to survive `check` -- which is the assertion that would have
+    /// caught the OOM.
     #[test]
-    fn an_all_sliding_model_is_limited_only_by_its_context_length() {
-        let shape = KvShape {
-            n_layers: 32,
-            layout: KvLayout::Gqa {
-                n_kv_heads: 8,
-                head_dim: 128,
-            },
-            elem: KvElem::F16,
-            sliding: Some(SlidingWindow {
-                window: 4096,
-                chunk: 1,
-                pattern: None,
-            }),
-        };
-        // Budget covers the saturated window with room to spare.
-        let saturated = shape.kv_bytes_for_tokens(4096);
-        let b = budget(1_000, 1_000 + saturated * 2, shape);
+    fn a_windowed_model_is_bounded_by_memory_like_any_other() {
+        let mut cfg = alternating_swa_config();
+        cfg.swa_pattern = Some(1); // every layer slides: the old zero divisor
+        let shape = KvShape::from_config(&cfg, KvElem::F32);
+        // Room for 1024 tokens, against a model that would like 1e6.
+        let b = budget(1_000, 1_000 + shape.per_token_kv_bytes() * 1024, shape);
         let fit = b.max_context(1_000_000, 256);
-        assert_eq!(fit.capped_by, ContextCap::ModelContextLength);
-        assert_eq!(fit.tokens, 1_000_000);
-        assert!(b.check(fit.tokens).is_ok());
-    }
-
-    #[test]
-    fn a_mixed_swa_model_prices_the_saturated_sliding_layers_before_dividing() {
-        // 6 layers, every 3rd full-attention (2 full, 4 sliding).
-        let shape = KvShape {
-            n_layers: 6,
-            layout: KvLayout::Gqa {
-                n_kv_heads: 1,
-                head_dim: 16,
-            },
-            elem: KvElem::F32,
-            sliding: Some(SlidingWindow {
-                window: 128,
-                chunk: 1,
-                pattern: Some(3),
-            }),
-        };
-        assert_eq!(shape.full_attention_layers(), 2);
-        // 2 (K+V) x 1 kv-head x 16 head-dim x 4 bytes.
-        let per_layer_token = 2 * 16 * 4;
-        let sliding_saturated = 4 * per_layer_token * 128;
-        let full_marginal = 2 * per_layer_token;
-        // Give the budget the saturated sliding cost plus exactly 512
-        // tokens of full-attention growth.
-        let b = budget(0, (sliding_saturated + full_marginal * 512) as u64, shape);
-        let fit = b.max_context(4096, 256);
-        assert_eq!(fit.tokens, 512);
         assert_eq!(fit.capped_by, ContextCap::DeviceBudget);
-        assert!(b.check(512).is_ok());
+        assert_eq!(fit.tokens, 1024);
+        assert!(b.check(fit.tokens).is_ok());
+        assert!(
+            b.check(fit.tokens + 1).is_err(),
+            "the chosen context must be the largest that fits"
+        );
     }
 
     #[test]

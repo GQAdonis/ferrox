@@ -55,6 +55,34 @@ impl Converter {
         }
     }
 
+    /// Fold another document's `$ref` table in, for a builder that
+    /// compiles several schemas into ONE grammar
+    /// ([`super::GrammarBuilder`]).
+    ///
+    /// A pointer that two documents spell the same way and mean
+    /// differently is refused: the rule name is derived from the pointer,
+    /// so keeping the first silently compiles the second tool's arguments
+    /// against the first tool's definition.
+    pub(super) fn add_refs(&mut self, refs: HashMap<String, JsonValue>) -> Result<(), SchemaError> {
+        for (pointer, target) in refs {
+            match self.refs.get(&pointer) {
+                Some(existing) if *existing != target => {
+                    return Err(SchemaError::RefCollision { pointer });
+                }
+                Some(_) => {}
+                None => {
+                    self.refs.insert(pointer, target);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether a rule of this exact name has been emitted.
+    pub(super) fn has_rule(&self, name: &str) -> bool {
+        self.rules.contains_key(name)
+    }
+
     /// `_add_rule`. A name already bound to a *different* body gets the
     /// lowest numeric suffix that is free or already holds this same body.
     pub(super) fn add_rule(&mut self, name: &str, rule: &str) -> String {

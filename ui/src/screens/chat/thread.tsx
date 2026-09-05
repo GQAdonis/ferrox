@@ -22,6 +22,7 @@ import {
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import { MarkdownText } from "@/screens/chat/markdown";
+import { ReasoningPart } from "@/screens/chat/reasoning";
 import type { AnswerStats } from "@/screens/chat/runtime";
 
 // The transcript, the composer, autoscroll, branching and the abort
@@ -145,7 +146,9 @@ const AssistantMessage: FC = () => (
       </span>
       <div className="min-w-0 flex-1">
         <div className="min-w-0">
-          <MessagePrimitive.Parts components={{ Text: MarkdownText }} />
+          <MessagePrimitive.Parts
+            components={{ Text: MarkdownText, Reasoning: ReasoningPart }}
+          />
         </div>
 
         <MessagePrimitive.Error>

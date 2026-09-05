@@ -8,13 +8,45 @@ Two files hold the plan:
   own.
 - **[`roadmap.md`](roadmap.md)** is every open item, merged by theme.
 
-Two items are large enough to carry their own design document:
+Three items are large enough to carry their own design document:
 
+- **[`speculative-decoding.md`](speculative-decoding.md)**, the one
+  decode item that raises throughput without buying hardware. Decode
+  reads every weight per token, so bandwidth divided by model bytes is a
+  hard ceiling; a draft model changes what is read per token rather than
+  how fast. The lossless half already ships and is tested at 200k
+  samples. What is missing is a drafter worth having.
 - **[`model-layer-reorg.md`](model-layer-reorg.md)**, splitting the
   decoder so architectures scale. It was 6438 lines when that document
-  was written and is 6875 today.
+  was written and is 6702 today, the first time it has shrunk.
 - **[`out-of-core-moe.md`](out-of-core-moe.md)**, running a 155 GB model
   on a 32 GB machine.
+
+How work lands is written down too:
+
+- **[`contribution-workflow.md`](contribution-workflow.md)**, the rule
+  that a completed feature is a branch and a pull request, a defect is a
+  GitHub issue, and the two are never the same artifact. It also carries
+  the parallel-agent rules, whose first failure is two branches editing
+  one file.
+
+One item has a written **verdict** rather than a design:
+
+- **[`vulkan-beachhead-verdict.md`](vulkan-beachhead-verdict.md)**, the
+  `d-hardware-reach` GO/NO-GO. GO: a Q8_0 matvec ran as a hand-emitted
+  SPIR-V shader on a real device and matched its scalar twin. It also
+  carries the survey of the backend seam a third backend would need,
+  which is `backend-seam-refactor`'s to-do list.
+
+Parity inventory and deltas against llama.cpp:
+
+- **[`llama-cpp-gap-inventory.md`](llama-cpp-gap-inventory.md)** — evidence-backed differential (not a plan)
+- **[`llama-cpp-full-parity-audit-2026-09-02.md`](llama-cpp-full-parity-audit-2026-09-02.md)** — file map + sweep + priority plan
+- **[`llama-cpp-parity-update-2026-09-03.md`](llama-cpp-parity-update-2026-09-03.md)** — post-merge delta (Qwen MoE Metal, Phi-4 LongRoPE, sweep)
+- **[`cpu-cuda-parity.md`](cpu-cuda-parity.md)** — the two backends that
+  are not at parity, ordered by what was measured on rented hosts on
+  2026-09-04 rather than by tok/s. Carries the kernel-coverage matrix,
+  because a gap column cannot show a format the backend never runs
 
 Everything else is history: [`archive/`](archive/) holds the five plans
 whose items were merged into the roadmap, [`on-hold/`](on-hold/) holds
@@ -28,9 +60,9 @@ rather than by whether the architecture name is known:
 
 | Outcome | Count |
 |---|---|
-| Runs, **with evidence** | **11** (`capability::AUDITED_GENERIC_GQA`) |
+| Runs, **with evidence** | **23** (`capability::AUDITED_GENERIC_GQA`) |
 | Loads on a dedicated engine, no cross-engine evidence | 4 engines (`Mla`, `Glm52`, `Kimi`, `Gemma4`) |
-| Refuses as **unaudited**, now triaged | 46 |
+| Refuses as **unaudited**, now triaged | 34 |
 | Off the generic path: refuses by name, or reaches one of those 4 engines | 90 (58 `dedicated` + 32 `deferred` in the manifest) |
 | **Loads and is WRONG** | **closed** |
 
@@ -46,13 +78,15 @@ position embeddings as though they were NEOX RoPE (`gpt2`, `mpt`,
 `refact`, `bloom`, `jais`) are `DedicatedOnly` refusals, pinned by a
 test that they can never be re-listed as audited.
 
-The 46 unaudited refusals split 9 fixture-away / 7 one-match-arm /
+The 34 unaudited refusals split 1 fixture-away / 3 one-match-arm /
 26 new-code / 4 unknown, each naming the `llama.cpp/src/models/*.cpp`
-line that decides it.
+line that decides it. Five of the seven one-match-arm rows were closed on
+2026-09-02 (`seed_oss`, `maincoder`, `bailingmoe`, `deepseek`,
+`hunyuan-moe`), each with a libllama-golden fixture.
 
 | | llama.cpp | ferrox |
 |---|---|---|
-| Per-architecture graphs | 140 hand-written | 150 catalog rows, **11 proven** |
+| Per-architecture graphs | 140 hand-written | 150 catalog rows, **23 proven** |
 | Metal `pp512` | baseline | 0.98x-1.10x, at parity |
 | Metal `tg128` | baseline | **8 of 12 rows faster** |
 | CPU, all rows | baseline | **1.41x-5.06x slower** |

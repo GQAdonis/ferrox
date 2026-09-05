@@ -19,6 +19,8 @@
 
 use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
+use crate::kv_swa::KvWindow;
+
 /// Returned by `KvCache::push` (and `with_pool`) when a pool-backed
 /// cache needs another block but its shared `KvBlockPool` has none
 /// free. Caches built with `new`/`with_capacity` never return this --
@@ -124,9 +126,28 @@ struct PooledState {
 pub struct KvCache {
     pub n_kv_heads: usize,
     pub head_dim: usize,
-    pub k: Vec<f32>, // [seq_len, n_kv_heads, head_dim], flattened
+    pub k: Vec<f32>, // [rows, n_kv_heads, head_dim], flattened
     pub v: Vec<f32>,
-    pub seq_len: usize,
+    /// Positions this sequence has consumed.
+    ///
+    /// **Not the same thing as the number of rows in `k`/`v`**, and the
+    /// distinction is the whole reason this field is private. They are
+    /// equal today because nothing evicts, and they stop being equal
+    /// the moment a windowed layer drops a position behind its window
+    /// (#61): `positions` keeps counting, `rows` does not.
+    ///
+    /// Every reader has to say which one it meant, so there is no
+    /// `seq_len` any more. [`Self::positions`] is what RoPE, a resume
+    /// point and a truncate target mean; [`Self::rows`] is what
+    /// attention iterates and what the bytes cost.
+    ///
+    /// Two bugs have already been caused by the two being one field.
+    /// `PrefillState` read the KV's length as the position to resume at
+    /// (#37), and `DraftModelSpeculator::sync` trusted a counter beside
+    /// a cache that a device-resident backend leaves empty. Both were
+    /// right to read the store rather than keep a copy; both would be
+    /// wrong the day the store evicts.
+    positions: usize,
     /// The capacity (in positions) this cache was pre-allocated for,
     /// if any. `None` for caches built with `new` or `with_pool`.
     planned_capacity: Option<usize>,
@@ -134,6 +155,17 @@ pub struct KvCache {
     /// pool and how many blocks this cache currently holds, so its
     /// blocks can be returned on drop.
     pool_state: Option<PooledState>,
+    /// `Some` once a windowed layer's cache has been told it may drop
+    /// rows behind its window (#61). `None` -- the default, and what
+    /// every constructor produces -- means this cache keeps every
+    /// position it was ever pushed, which is what every store in this
+    /// engine did before.
+    ///
+    /// Armed by the decoder, never by a constructor, because the fact
+    /// that a layer is windowed lives in `ModelConfig` and the decision
+    /// that eviction is *safe for this run* lives in
+    /// `ferrox_models::decoder::kv_window`. See [`Self::arm_window`].
+    window: Option<KvWindow>,
 }
 
 /// Cloning a pool-backed cache detaches the clone from pool accounting
@@ -149,9 +181,14 @@ impl Clone for KvCache {
             head_dim: self.head_dim,
             k: self.k.clone(),
             v: self.v.clone(),
-            seq_len: self.seq_len,
+            positions: self.positions,
             planned_capacity: self.planned_capacity,
             pool_state: None,
+            // Carried, not reset: a clone of a cache that has already
+            // dropped rows is a cache that has already dropped rows,
+            // and pretending otherwise would let the clone's
+            // `positions` be read as a row count again.
+            window: self.window,
         }
     }
 }
@@ -167,15 +204,72 @@ impl Drop for KvCache {
 }
 
 impl KvCache {
+    /// Positions this sequence has consumed: what RoPE means, what a
+    /// resume point means, and what a truncate target is measured in.
+    ///
+    /// Monotonic except through [`Self::truncate`] and [`Self::clear`].
+    /// Equal to [`Self::rows`] today, and deliberately a different
+    /// method so it stops being equal safely (#61).
+    #[inline]
+    pub fn positions(&self) -> usize {
+        self.positions
+    }
+
+    /// Sets the position counter directly, for a constructor that
+    /// filled `k`/`v` by hand rather than through `push`.
+    ///
+    /// Deliberately narrow and deliberately not `pub`: the only honest
+    /// caller is one that has just written exactly this many rows, and
+    /// a public setter on a counter the buffer should imply is how the
+    /// two drift apart again.
+    pub(crate) fn set_positions(&mut self, positions: usize) {
+        debug_assert_eq!(
+            positions,
+            self.rows(),
+            "set_positions must agree with the rows just written"
+        );
+        self.positions = positions;
+    }
+
+    /// Test-only: sets the position counter WITHOUT the agreement check
+    /// [`Self::set_positions`] makes.
+    ///
+    /// Exists for one caller: `kv_signature`'s test that a serialized
+    /// payload whose declared count contradicts its buffers is
+    /// rejected. That contradiction is the thing under test, so it has
+    /// to be constructible, and it must not be constructible anywhere
+    /// else.
+    #[cfg(test)]
+    pub(crate) fn force_positions_for_test(&mut self, positions: usize) {
+        self.positions = positions;
+    }
+
+    /// Rows of K/V actually resident: what attention iterates over and
+    /// what the memory costs.
+    ///
+    /// Derived from the buffer rather than counted alongside it, so it
+    /// cannot drift from what is really there. That is the same rule
+    /// the batched prefill learned in #37: read the cursor, do not keep
+    /// a copy of it.
+    #[inline]
+    pub fn rows(&self) -> usize {
+        let elems_per_position = self.n_kv_heads * self.head_dim;
+        if elems_per_position == 0 {
+            return 0;
+        }
+        self.k.len() / elems_per_position
+    }
+
     pub fn new(n_kv_heads: usize, head_dim: usize) -> Self {
         KvCache {
             n_kv_heads,
             head_dim,
             k: Vec::new(),
             v: Vec::new(),
-            seq_len: 0,
+            positions: 0,
             planned_capacity: None,
             pool_state: None,
+            window: None,
         }
     }
 
@@ -189,9 +283,10 @@ impl KvCache {
             head_dim,
             k: Vec::with_capacity(max_seq_len * elems_per_position),
             v: Vec::with_capacity(max_seq_len * elems_per_position),
-            seq_len: 0,
+            positions: 0,
             planned_capacity: Some(max_seq_len),
             pool_state: None,
+            window: None,
         }
     }
 
@@ -230,13 +325,14 @@ impl KvCache {
             head_dim,
             k: Vec::with_capacity(blocks_needed * block_size * elems_per_position),
             v: Vec::with_capacity(blocks_needed * block_size * elems_per_position),
-            seq_len: 0,
+            positions: 0,
             planned_capacity: None,
             pool_state: Some(PooledState {
                 pool,
                 block_size,
                 blocks_held: blocks_needed,
             }),
+            window: None,
         })
     }
 
@@ -253,7 +349,11 @@ impl KvCache {
         let elems_per_position = self.n_kv_heads * self.head_dim;
         if let Some(state) = &mut self.pool_state {
             let capacity_positions = self.k.capacity() / elems_per_position;
-            if self.seq_len == capacity_positions {
+            // ROWS, not positions: this asks whether the buffer is
+            // full, and an evicting cache's buffer is shorter than its
+            // position count. Equal for a cache that never evicts.
+            let rows = self.k.len() / elems_per_position;
+            if rows == capacity_positions {
                 if !state.pool.lock().unwrap().try_acquire(1) {
                     return Err(KvPoolExhausted);
                 }
@@ -265,7 +365,7 @@ impl KvCache {
 
         self.k.extend_from_slice(k_step);
         self.v.extend_from_slice(v_step);
-        self.seq_len += 1;
+        self.positions += 1;
         Ok(())
     }
 
@@ -299,7 +399,7 @@ impl KvCache {
     pub fn clear(&mut self) {
         self.k.clear();
         self.v.clear();
-        self.seq_len = 0;
+        self.positions = 0;
     }
 
     /// Rolls the cache back to exactly `new_seq_len` positions,
@@ -308,16 +408,110 @@ impl KvCache {
     /// already pushed during batched verification, and rejection means
     /// removing them so the next real decode step continues from the
     /// last *accepted* position, not the last *attempted* one.
+    /// Rolls the cache back to exactly `new_seq_len` POSITIONS.
+    ///
+    /// A windowed cache can only roll back into rows it still holds. A
+    /// target further back than [`Self::rows`] names a position this
+    /// cache dropped behind its window, and there is no honest thing to
+    /// return for it -- so it stops, rather than silently rolling back
+    /// to the oldest row it happens to have and answering the next
+    /// token out of a history with a hole in it.
+    ///
+    /// Unreachable for a cache that has not been armed by
+    /// [`Self::arm_window`], which is every cache unless
+    /// `FERROX_KV_WINDOW` is on: `rows == positions` there, so the
+    /// second precondition is implied by the first.
     pub fn truncate(&mut self, new_seq_len: usize) {
         assert!(
-            new_seq_len <= self.seq_len,
+            new_seq_len <= self.positions,
             "truncate target {new_seq_len} must not exceed current seq_len {}",
-            self.seq_len
+            self.positions
+        );
+        let rows = self.rows();
+        let dropped = self.positions - new_seq_len;
+        assert!(
+            dropped <= rows,
+            "truncate target {new_seq_len} is {dropped} positions back but only {rows} rows \
+             are resident: this cache evicted behind a {:?} window (#61). Turn off \
+             FERROX_KV_WINDOW for a workload that rolls the KV cache back this far.",
+            self.window.map(|w| w.window())
         );
         let elems_per_position = self.n_kv_heads * self.head_dim;
-        self.k.truncate(new_seq_len * elems_per_position);
-        self.v.truncate(new_seq_len * elems_per_position);
-        self.seq_len = new_seq_len;
+        let keep_rows = rows - dropped;
+        self.k.truncate(keep_rows * elems_per_position);
+        self.v.truncate(keep_rows * elems_per_position);
+        self.positions = new_seq_len;
+    }
+
+    /// Tells this cache it may drop rows that have fallen behind
+    /// `window` (#61 step 2).
+    ///
+    /// Arming alone drops nothing: [`Self::evict_behind_window`] is what
+    /// drops, and the holder calls it at a point where it knows nothing
+    /// is mid-read. That split is deliberate. `push` is the obvious
+    /// place to evict and it is the wrong one: `Decoder::forward_batch`
+    /// writes a whole prefill batch into the cache and only then reads
+    /// it back, against a row offset it captured BEFORE the writes.
+    /// Evicting inside `push` would move every row out from under that
+    /// offset, and the prompt would be attended over shifted keys. So
+    /// eviction is something the holder asks for, and asking for it too
+    /// rarely only costs memory -- over-retention is always correct,
+    /// under-retention is wrong logits.
+    ///
+    /// Idempotent; a second call with a different window replaces the
+    /// first, and rows already dropped stay dropped.
+    pub fn arm_window(&mut self, window: KvWindow) {
+        self.window = Some(window);
+    }
+
+    /// The window this cache evicts behind, or `None` if it keeps
+    /// everything.
+    pub fn window(&self) -> Option<KvWindow> {
+        self.window
+    }
+
+    /// Drops rows that have fallen behind the armed window, returning
+    /// how many rows went. Zero, always, for an unarmed cache.
+    ///
+    /// The rows dropped are the OLDEST ones, so what remains is still a
+    /// contiguous suffix of the sequence: row `i` of `rows` holds
+    /// absolute position `positions - rows + i`. Every windowed
+    /// attention kernel reads the last `window` rows and nothing else,
+    /// and [`KvWindow::rows_after`] guarantees at least that many
+    /// survive, so the set of rows a kernel reads is byte-for-byte the
+    /// set it would have read with no eviction at all.
+    pub fn evict_behind_window(&mut self) -> usize {
+        let Some(window) = self.window else {
+            return 0;
+        };
+        let elems_per_position = self.n_kv_heads * self.head_dim;
+        if elems_per_position == 0 {
+            return 0;
+        }
+        let rows = self.k.len() / elems_per_position;
+        let keep = window.rows_after(self.positions).min(rows);
+        let drop_rows = rows - keep;
+        if drop_rows == 0 {
+            return 0;
+        }
+        // One `drain` per eviction, not one per token: the whole reason
+        // `KvWindow` carries slack. This moves `keep` rows down, and it
+        // happens once every `slack + 1` positions.
+        let drop_elems = drop_rows * elems_per_position;
+        self.k.drain(..drop_elems);
+        self.v.drain(..drop_elems);
+        // `drain` frees no memory, and the saving this exists for is
+        // memory. A cache that just absorbed a 32k-token prefill holds
+        // 32k rows of capacity behind `window + slack` rows of data
+        // until something hands it back. Only when the excess is large
+        // enough to be worth a realloc-and-copy: shrinking on every
+        // eviction would trade the block drain for a full copy.
+        let want = window.max_rows() * elems_per_position;
+        if self.k.capacity() > want.saturating_mul(2) {
+            self.k.shrink_to(want);
+            self.v.shrink_to(want);
+        }
+        drop_rows
     }
 
     /// Bytes currently resident for this cache's K and V buffers
@@ -335,8 +529,11 @@ impl KvCache {
     pub fn is_within_planned_capacity(&self) -> bool {
         match self.planned_capacity {
             Some(cap) => {
-                self.seq_len <= cap
-                    && self.k.capacity() >= self.seq_len * self.n_kv_heads * self.head_dim
+                // POSITIONS against the plan (the plan was made in
+                // positions), ROWS against the buffer (the buffer holds
+                // rows). Equal unless this cache evicts.
+                self.positions <= cap
+                    && self.k.capacity() >= self.rows() * self.n_kv_heads * self.head_dim
             }
             None => false,
         }
@@ -605,7 +802,17 @@ impl PagedKvCache {
     ///
     /// This is how a sequence starts life on top of a cached prefix:
     /// the blocks are somebody else's, already full, and this sequence
-    /// appends past them. `seq_len` MUST be a whole number of blocks,
+    /// appends past them.
+    ///
+    /// The `seq_len` installed here is therefore also the POSITION the
+    /// caller's next forward pass must run at, and the caller has no
+    /// second source for that number: [`Self::push`] writes at `seq_len`
+    /// and ignores whatever position its caller believes it is at. A
+    /// prefill that started from zero over an adopted prefix put the
+    /// prompt in the rows *after* the prefix while carrying positions
+    /// `0..n`, which is a wrong answer served with a 200.
+    ///
+    /// `seq_len` MUST be a whole number of blocks,
     /// because the first append writes at `seq_len` and a shared block
     /// must never be written -- another sequence is attending over it.
     /// A ragged length would put that write inside the last shared
@@ -652,7 +859,9 @@ impl PagedKvCache {
             cache.k.extend_from_slice(store.k_row(block_id, offset));
             cache.v.extend_from_slice(store.v_row(block_id, offset));
         }
-        cache.seq_len = self.seq_len;
+        // The paged store does not evict either, so its positions and
+        // its rows agree and this one assignment is both.
+        cache.set_positions(self.seq_len);
         cache
     }
 
@@ -1273,7 +1482,7 @@ mod tests {
         }
 
         let flat = cache.to_contiguous(&store);
-        assert_eq!(flat.seq_len, 5);
+        assert_eq!(flat.positions(), 5);
         assert_eq!(flat.k.len(), 5 * 4);
         for (i, r) in rows.iter().enumerate() {
             assert_eq!(&flat.k[i * 4..(i + 1) * 4], r, "position {i} k");
@@ -1290,7 +1499,7 @@ mod tests {
         let again = rebuilt.to_contiguous(&store2);
         assert_eq!(again.k, flat.k);
         assert_eq!(again.v, flat.v);
-        assert_eq!(again.seq_len, flat.seq_len);
+        assert_eq!(again.positions(), flat.positions());
     }
 
     #[test]
@@ -1299,11 +1508,11 @@ mod tests {
         cache
             .push(&[1.0, 2.0, 3.0, 4.0], &[5.0, 6.0, 7.0, 8.0])
             .unwrap();
-        assert_eq!(cache.seq_len, 1);
+        assert_eq!(cache.positions(), 1);
         cache
             .push(&[9.0, 10.0, 11.0, 12.0], &[13.0, 14.0, 15.0, 16.0])
             .unwrap();
-        assert_eq!(cache.seq_len, 2);
+        assert_eq!(cache.positions(), 2);
         assert_eq!(cache.k.len(), 2 * 2 * 2);
         assert_eq!(cache.k[4], 9.0);
     }
@@ -1320,7 +1529,7 @@ mod tests {
         let mut cache = KvCache::new(1, 1);
         cache.push(&[1.0], &[2.0]).unwrap();
         cache.clear();
-        assert_eq!(cache.seq_len, 0);
+        assert_eq!(cache.positions(), 0);
         assert!(cache.k.is_empty());
     }
 
@@ -1336,10 +1545,10 @@ mod tests {
         cache
             .push(&[9.0, 9.0, 9.0, 9.0], &[90.0, 90.0, 90.0, 90.0])
             .unwrap();
-        assert_eq!(cache.seq_len, 3);
+        assert_eq!(cache.positions(), 3);
 
         cache.truncate(1);
-        assert_eq!(cache.seq_len, 1);
+        assert_eq!(cache.positions(), 1);
         assert_eq!(cache.k, vec![1.0, 2.0, 3.0, 4.0]);
         assert_eq!(cache.v, vec![10.0, 20.0, 30.0, 40.0]);
     }
@@ -1349,7 +1558,7 @@ mod tests {
         let mut cache = KvCache::new(1, 2);
         cache.push(&[1.0, 2.0], &[3.0, 4.0]).unwrap();
         cache.truncate(1);
-        assert_eq!(cache.seq_len, 1);
+        assert_eq!(cache.positions(), 1);
         assert_eq!(cache.k, vec![1.0, 2.0]);
     }
 
@@ -1358,7 +1567,7 @@ mod tests {
         let mut cache = KvCache::new(1, 2);
         cache.push(&[1.0, 2.0], &[3.0, 4.0]).unwrap();
         cache.truncate(0);
-        assert_eq!(cache.seq_len, 0);
+        assert_eq!(cache.positions(), 0);
         assert!(cache.k.is_empty());
         assert!(cache.v.is_empty());
     }
@@ -1379,7 +1588,7 @@ mod tests {
         cache.push(&[3.0], &[30.0]).unwrap(); // this one will be "rejected"
         cache.truncate(2);
         cache.push(&[99.0], &[990.0]).unwrap(); // real continuation after rejection
-        assert_eq!(cache.seq_len, 3);
+        assert_eq!(cache.positions(), 3);
         assert_eq!(cache.k, vec![1.0, 2.0, 99.0]);
         assert_eq!(cache.v, vec![10.0, 20.0, 990.0]);
     }
@@ -1419,7 +1628,7 @@ mod tests {
             cache.allocated_bytes()
         );
         // Nothing has been pushed yet, but the memory is already reserved.
-        assert_eq!(cache.seq_len, 0);
+        assert_eq!(cache.positions(), 0);
     }
 
     #[test]
@@ -1439,7 +1648,7 @@ mod tests {
         let pool = Arc::new(Mutex::new(KvBlockPool::new(4, 10)));
         let cache = KvCache::with_pool(2, 2, pool.clone(), 0).unwrap();
         assert_eq!(pool.lock().unwrap().free_blocks(), 9);
-        assert_eq!(cache.seq_len, 0);
+        assert_eq!(cache.positions(), 0);
     }
 
     #[test]
@@ -1470,7 +1679,7 @@ mod tests {
         // The third position crosses into a second block.
         cache.push(&[3.0], &[3.0]).unwrap();
         assert_eq!(pool.lock().unwrap().free_blocks(), 8);
-        assert_eq!(cache.seq_len, 3);
+        assert_eq!(cache.positions(), 3);
         assert_eq!(cache.k, vec![1.0, 2.0, 3.0]);
     }
 
@@ -1486,7 +1695,11 @@ mod tests {
         let before_k = cache.k.clone();
         let result = cache.push(&[2.0], &[2.0]);
         assert_eq!(result, Err(KvPoolExhausted));
-        assert_eq!(cache.seq_len, 1, "a failed push must not change seq_len");
+        assert_eq!(
+            cache.positions(),
+            1,
+            "a failed push must not change seq_len"
+        );
         assert_eq!(cache.k, before_k, "a failed push must not append data");
     }
 
@@ -1613,5 +1826,233 @@ mod tests {
         assert_eq!(p.free_blocks(), 32 - in_use);
         drop(p);
         drop(held);
+    }
+
+    /// Positions and rows agree for every store that does not evict,
+    /// and this pins that they are DERIVED separately rather than one
+    /// being an alias for the other.
+    ///
+    /// The point of the split is #61: a windowed layer will drop rows
+    /// behind its window while its position count keeps climbing. Until
+    /// then the two are equal, so this test cannot prove much about
+    /// eviction. What it CAN prove, and what matters, is that `rows`
+    /// reads the buffer rather than the counter: set the counter to a
+    /// lie and `rows` still reports the truth.
+    #[test]
+    fn rows_is_read_from_the_buffer_and_positions_from_the_counter() {
+        let mut cache = KvCache::new(2, 4);
+        for i in 0..5 {
+            let step = vec![i as f32; 8];
+            cache.push(&step, &step).expect("unbounded growth");
+        }
+        assert_eq!(cache.positions(), 5);
+        assert_eq!(cache.rows(), 5, "nothing evicts, so they agree");
+
+        // The counter lies; the buffer does not.
+        cache.force_positions_for_test(99);
+        assert_eq!(cache.positions(), 99);
+        assert_eq!(
+            cache.rows(),
+            5,
+            "rows must come from k/v, or it is just a second name for the counter"
+        );
+    }
+
+    /// `truncate` is measured in POSITIONS, and it moves both, because
+    /// nothing evicts yet. Written down because it is the first thing
+    /// eviction changes: a truncate target will stop being a row index.
+    #[test]
+    fn truncate_moves_positions_and_rows_together_while_nothing_evicts() {
+        let mut cache = KvCache::new(1, 2);
+        for i in 0..4 {
+            let step = vec![i as f32; 2];
+            cache.push(&step, &step).expect("unbounded growth");
+        }
+        cache.truncate(2);
+        assert_eq!(cache.positions(), 2);
+        assert_eq!(cache.rows(), 2);
+        assert_eq!(cache.k.len(), 4, "two positions of two elements each");
+    }
+
+    /// The store's rule must be *the* rule, not a second copy of it.
+    ///
+    /// `KvWindow::rows_after` is what `ferrox_models::kv_budget` prices
+    /// against. If the store drained to anything else the budget would
+    /// be describing a cache that does not exist, which is #33 again.
+    #[test]
+    fn a_windowed_cache_holds_exactly_what_the_rule_says_it_holds() {
+        let window = KvWindow::new(8, 3).expect("positive window");
+        let mut cache = KvCache::new(2, 4);
+        cache.arm_window(window);
+        let step = vec![1.0f32; 8];
+        for p in 1..=200usize {
+            cache.push(&step, &step).expect("unbounded growth");
+            cache.evict_behind_window();
+            assert_eq!(cache.positions(), p);
+            assert_eq!(
+                cache.rows(),
+                window.rows_after(p),
+                "at {p} positions the store and the rule disagree"
+            );
+        }
+    }
+
+    /// The point of the issue: positions keep counting, rows do not.
+    #[test]
+    fn a_windowed_layers_resident_rows_stop_growing() {
+        let window = KvWindow::with_default_slack(16).expect("positive window");
+        let mut cache = KvCache::new(2, 4);
+        cache.arm_window(window);
+        let step = vec![0.5f32; 8];
+        for _ in 0..2000 {
+            cache.push(&step, &step).expect("unbounded growth");
+            cache.evict_behind_window();
+        }
+        assert_eq!(cache.positions(), 2000);
+        assert!(
+            cache.rows() <= window.max_rows(),
+            "{} rows resident after 2000 positions",
+            cache.rows()
+        );
+        // And the bytes really went back, not just the length: `drain`
+        // frees nothing, and memory is the whole point.
+        assert!(
+            cache.allocated_bytes() <= window.max_rows() * 8 * 2 * 4 * 2,
+            "capacity was never handed back: {} bytes",
+            cache.allocated_bytes()
+        );
+    }
+
+    /// **The correctness argument, measured.**
+    ///
+    /// Eviction is only allowed to be token-identical because the rows a
+    /// windowed kernel reads -- the last `window` of them -- are the
+    /// same bytes whether or not anything behind them was dropped. This
+    /// pushes distinguishable rows into an evicting cache and a plain
+    /// one and compares exactly that slice.
+    #[test]
+    fn the_rows_a_windowed_kernel_reads_are_identical_with_and_without_eviction() {
+        let window = KvWindow::new(6, 2).expect("positive window");
+        let (n_kv_heads, head_dim) = (2usize, 4usize);
+        let per = n_kv_heads * head_dim;
+        let mut evicting = KvCache::new(n_kv_heads, head_dim);
+        evicting.arm_window(window);
+        let mut plain = KvCache::new(n_kv_heads, head_dim);
+
+        for p in 0..120usize {
+            // A row nothing else could produce, so a misplaced row is
+            // not merely a different number but an identifiable one.
+            let k: Vec<f32> = (0..per).map(|i| (p * 100 + i) as f32).collect();
+            let v: Vec<f32> = k.iter().map(|x| -x).collect();
+            evicting.push(&k, &v).expect("unbounded growth");
+            evicting.evict_behind_window();
+            plain.push(&k, &v).expect("unbounded growth");
+
+            let read = window.window().min(p + 1);
+            let e_start = (evicting.rows() - read) * per;
+            let p_start = (plain.rows() - read) * per;
+            assert_eq!(
+                &evicting.k[e_start..],
+                &plain.k[p_start..],
+                "K read set diverged at position {p}"
+            );
+            assert_eq!(
+                &evicting.v[e_start..],
+                &plain.v[p_start..],
+                "V read set diverged at position {p}"
+            );
+            assert_eq!(evicting.positions(), plain.positions());
+        }
+    }
+
+    /// An unarmed cache is the cache this engine has always had.
+    #[test]
+    fn an_unarmed_cache_never_drops_a_row() {
+        let mut cache = KvCache::new(2, 4);
+        let step = vec![1.0f32; 8];
+        for _ in 0..64 {
+            cache.push(&step, &step).expect("unbounded growth");
+            assert_eq!(cache.evict_behind_window(), 0);
+        }
+        assert_eq!(cache.rows(), 64);
+        assert_eq!(cache.positions(), 64);
+        assert!(cache.window().is_none());
+    }
+
+    /// Speculative decoding rolls the cache back by the number of
+    /// rejected draft tokens. That is representable while the target is
+    /// still resident.
+    #[test]
+    fn truncate_still_works_inside_the_resident_window() {
+        let window = KvWindow::new(8, 3).expect("positive window");
+        let mut cache = KvCache::new(1, 2);
+        cache.arm_window(window);
+        let step = vec![1.0f32; 2];
+        for _ in 0..50 {
+            cache.push(&step, &step).expect("unbounded growth");
+            cache.evict_behind_window();
+        }
+        let rows_before = cache.rows();
+        cache.truncate(46);
+        assert_eq!(cache.positions(), 46);
+        assert_eq!(cache.rows(), rows_before - 4);
+    }
+
+    /// ...and stops, loudly, when it is not. A cache that rolled back to
+    /// the oldest row it happened to have would answer the next token
+    /// out of a history with a hole in it.
+    #[test]
+    #[should_panic(expected = "rows are resident")]
+    fn truncate_refuses_to_roll_back_past_what_the_window_kept() {
+        let window = KvWindow::new(4, 1).expect("positive window");
+        let mut cache = KvCache::new(1, 2);
+        cache.arm_window(window);
+        let step = vec![1.0f32; 2];
+        for _ in 0..50 {
+            cache.push(&step, &step).expect("unbounded growth");
+            cache.evict_behind_window();
+        }
+        cache.truncate(3);
+    }
+
+    /// A clone of an evicting cache is still an evicting cache. Reset
+    /// the window on clone and `positions` becomes a row count again in
+    /// whatever reads the clone.
+    #[test]
+    fn a_clone_carries_the_window() {
+        let window = KvWindow::new(4, 1).expect("positive window");
+        let mut cache = KvCache::new(1, 2);
+        cache.arm_window(window);
+        let step = vec![1.0f32; 2];
+        for _ in 0..20 {
+            cache.push(&step, &step).expect("unbounded growth");
+            cache.evict_behind_window();
+        }
+        let copy = cache.clone();
+        assert_eq!(copy.window(), Some(window));
+        assert_eq!(copy.rows(), cache.rows());
+        assert_eq!(copy.positions(), cache.positions());
+    }
+
+    /// A pool-backed cache grows when its BUFFER is full, not when its
+    /// position counter reaches the buffer's size. Those are the same
+    /// number until something evicts, and an evicting pooled cache keyed
+    /// on positions would acquire a block per token forever and exhaust
+    /// the pool.
+    #[test]
+    fn a_pooled_windowed_cache_stops_acquiring_blocks() {
+        let pool = Arc::new(Mutex::new(KvBlockPool::new(4, 8)));
+        let mut cache =
+            KvCache::with_pool(1, 2, Arc::clone(&pool), 8).expect("the pool was sized for this");
+        cache.arm_window(KvWindow::new(4, 1).expect("positive window"));
+        let step = vec![1.0f32; 2];
+        for _ in 0..64 {
+            cache
+                .push(&step, &step)
+                .expect("the buffer never fills again");
+            cache.evict_behind_window();
+        }
+        assert_eq!(cache.positions(), 64);
+        assert!(cache.rows() <= 5);
     }
 }

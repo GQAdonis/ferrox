@@ -26,6 +26,15 @@ fn main() {
     for k in KINDS {
         std::fs::write(format!("{dir}/{}.cu", k.name), kernel_src(k)).unwrap();
         for &(n_rows, n_cols, batch) in SHAPES {
+            // `n_cols` is rounded UP to a whole super-block for this
+            // kind rather than taken literally. `validate_shape`
+            // refuses anything else, and it was right to: a 128-column
+            // Q4_K row is not a Q4_K row. Without this the whole tool
+            // panicked on the first K-quant in `KINDS` and checked
+            // nothing at all, which is what it did between the
+            // K-quants landing and 2026-09-05. The 32-element kinds
+            // (Q8_0, Q4_0, Q5_0) keep the exact shapes they had.
+            let n_cols = n_cols.next_multiple_of(k.block_elems);
             let row_bytes = (n_cols / k.block_elems) * k.block_bytes;
             // Deliberately arbitrary bytes, not a well-formed
             // quantization: it exercises degenerate f16 scales (NaN/Inf)

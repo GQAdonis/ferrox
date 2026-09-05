@@ -16,188 +16,165 @@ use ferrox_gguf::GgmlType;
 
 use crate::tensor::Tensor;
 
-#[allow(dead_code)]
-type Q4kRepackCache = Mutex<HashMap<(usize, usize), Arc<[u8]>>>;
-type Q5kRepackCache = Mutex<HashMap<(usize, usize), Arc<[u8]>>>;
-type Q6kRepackCache = Mutex<HashMap<(usize, usize), Arc<[u8]>>>;
-type Q8x4RepackCache = Mutex<HashMap<(usize, usize), Arc<[u8]>>>;
-type Q4x4RepackCache = Mutex<HashMap<(usize, usize), Arc<[u8]>>>;
+pub mod gpu_backend;
 
-/// Repack without touching the cache, for buffers whose address is
-/// recycled (see `WeightBytes::address_is_stable`).
-#[allow(dead_code)]
-fn repack_q4k_uncached(data: &[u8], rows: usize, cols: usize) -> Arc<[u8]> {
-    let interleave = ferrox_quant::q4_kx8_interleave();
-    let packed = ferrox_quant::pack_q4_k_matrix_x8(data, rows, cols, interleave);
-    Arc::from(packed.into_boxed_slice())
+#[cfg(any(feature = "cuda", feature = "metal", feature = "vulkan"))]
+use gpu_backend::BackendDispatch;
+use gpu_backend::{with_gpu_backend_caps, with_gpu_backends, BackendCaps, Cuda, Metal};
+
+/// Identity of the memory mapping a repacked buffer was built from.
+///
+/// The repack caches below key on a weight's **address**, and an address
+/// is only a stable identity for as long as the mapping that published
+/// it is alive. Unmap one file and map another and the kernel will hand
+/// the same address straight back -- a textbook ABA. The cache then
+/// serves one matrix another matrix's interleaved bytes, which panicked
+/// with an out-of-range slice when the two shapes differed and was
+/// SILENT, i.e. wrong output, when they matched.
+///
+/// Holding a [`std::sync::Weak`] is what closes it, and it closes both
+/// halves at once:
+///
+/// * while the `Weak` lives, the `Arc`'s control block cannot be
+///   recycled, so [`Self::id`] is a unique name for exactly one mapping
+///   for as long as the cache entry exists; and
+/// * `upgrade()` succeeding proves the mapping itself is still alive,
+///   which is what makes the address it published still mean what it
+///   meant when the entry was written.
+///
+/// A dead `Weak` is therefore a *stale entry*, not a hit, and is
+/// repacked and replaced. The `Weak` holds no mapping open, so nothing
+/// here keeps a file resident.
+#[derive(Clone)]
+pub struct MapId {
+    map: std::sync::Weak<memmap2::Mmap>,
+    id: usize,
+    offset: usize,
 }
 
-/// Repack without touching the cache, for buffers whose address is
-/// recycled (see `WeightBytes::address_is_stable`).
-#[allow(dead_code)]
-fn repack_q5k_uncached(data: &[u8], rows: usize, cols: usize) -> Arc<[u8]> {
-    let interleave = ferrox_quant::q5_kx8_interleave();
-    let packed = ferrox_quant::pack_q5_k_matrix_x8(data, rows, cols, interleave);
-    Arc::from(packed.into_boxed_slice())
+impl MapId {
+    /// True when `other` names the same, still-live mapping.
+    fn matches(&self, other: &MapId) -> bool {
+        self.id == other.id
+            && self.offset == other.offset
+            && self
+                .map
+                .upgrade()
+                .is_some_and(|m| Arc::as_ptr(&m) as usize == other.id)
+    }
 }
 
-/// Repack without touching the cache, for buffers whose address is
-/// recycled (see `WeightBytes::address_is_stable`).
-#[allow(dead_code)]
-fn repack_q6k_uncached(data: &[u8], rows: usize, cols: usize) -> Arc<[u8]> {
-    let interleave = ferrox_quant::q6_kx8_interleave();
-    let packed = ferrox_quant::pack_q6_k_matrix_x8(data, rows, cols, interleave);
-    Arc::from(packed.into_boxed_slice())
-}
+/// `(mapping id, byte offset, rows, cols)`.
+///
+/// `cols` is in the key because two tensors of equal row count and
+/// unequal width are different matrices with different repacked lengths,
+/// and the old `(address, rows)` key called them the same one.
+type RepackKey = (usize, usize, usize, usize);
 
-/// Repack without touching the cache, for buffers whose address is
-/// recycled (see `WeightBytes::address_is_stable`).
-fn repack_q8x4_uncached(data: &[u8], rows: usize, cols: usize) -> Arc<[u8]> {
-    let packed =
-        ferrox_quant::pack_q8_0_matrix_x4(data, rows, cols, ferrox_quant::q8_0x4_interleave());
-    Arc::from(packed.into_boxed_slice())
-}
+/// Interleaved bytes, beside the mapping identity that makes the key
+/// meaningful. See [`MapId`].
+type RepackCache = Mutex<HashMap<RepackKey, (MapId, Arc<[u8]>)>>;
 
-/// Repack without touching the cache, for buffers whose address is
-/// recycled (see `WeightBytes::address_is_stable`).
-fn repack_q4_0x4_uncached(data: &[u8], rows: usize, cols: usize) -> Arc<[u8]> {
-    let packed =
-        ferrox_quant::pack_q4_0_matrix_x4(data, rows, cols, ferrox_quant::q4_0x4_interleave());
-    Arc::from(packed.into_boxed_slice())
+/// The one lookup every format's repack shares.
+///
+/// `id` is `None` for bytes whose address may be recycled under us
+/// (owned buffers, and an expert store's leases -- see
+/// [`WeightBytes::map_id`]), and those always repack.
+fn get_or_repack(
+    cache: &'static RepackCache,
+    id: Option<MapId>,
+    rows: usize,
+    cols: usize,
+    repack: impl FnOnce() -> Vec<u8>,
+) -> Arc<[u8]> {
+    let Some(id) = id else {
+        return Arc::from(repack().into_boxed_slice());
+    };
+    let key = (id.id, id.offset, rows, cols);
+    {
+        let mut cache = cache.lock().unwrap();
+        match cache.get(&key) {
+            Some((entry, hit)) if entry.matches(&id) => return Arc::clone(hit),
+            // The mapping that published this address is gone, so the
+            // address has been handed to somebody else. Drop the entry
+            // rather than leaving a `Weak` pinning a dead control block.
+            Some(_) => {
+                cache.remove(&key);
+            }
+            None => {}
+        }
+    }
+    let arc: Arc<[u8]> = Arc::from(repack().into_boxed_slice());
+    let mut cache = cache.lock().unwrap();
+    // Another thread may have won the race; prefer the existing entry,
+    // but only if it is one this caller would have accepted above.
+    match cache.get(&key) {
+        Some((entry, hit)) if entry.matches(&id) => Arc::clone(hit),
+        _ => {
+            cache.insert(key, (id, Arc::clone(&arc)));
+            arc
+        }
+    }
 }
 
 /// Process-wide cache of interleaved Q4_K (`block_q4_Kx8`) bytes.
-/// Retained for when K-quant Q8_K int-dot is re-enabled after parity
-/// fixes on real Q4_K_M checkpoints.
-#[allow(dead_code)]
-fn q4k_repack_cache() -> &'static Q4kRepackCache {
-    static CACHE: OnceLock<Q4kRepackCache> = OnceLock::new();
+fn q4k_repack_cache() -> &'static RepackCache {
+    static CACHE: OnceLock<RepackCache> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-#[allow(dead_code)]
-fn get_or_repack_q4k(data: &[u8], rows: usize, cols: usize, cacheable: bool) -> Arc<[u8]> {
-    // See `WeightBytes::address_is_stable`. Caching a recycled
-    // buffer by address serves one expert another expert's bytes.
-    if !cacheable {
-        return repack_q4k_uncached(data, rows, cols);
-    }
-    let key = (data.as_ptr() as usize, rows);
-    {
-        let cache = q4k_repack_cache().lock().unwrap();
-        if let Some(hit) = cache.get(&key) {
-            return Arc::clone(hit);
-        }
-    }
-    let interleave = ferrox_quant::q4_kx8_interleave();
-    let packed = ferrox_quant::pack_q4_k_matrix_x8(data, rows, cols, interleave);
-    let arc: Arc<[u8]> = Arc::from(packed.into_boxed_slice());
-    let mut cache = q4k_repack_cache().lock().unwrap();
-    // Another thread may have won the race; prefer the existing entry.
-    Arc::clone(cache.entry(key).or_insert_with(|| Arc::clone(&arc)))
+fn get_or_repack_q4k(data: &[u8], rows: usize, cols: usize, id: Option<MapId>) -> Arc<[u8]> {
+    get_or_repack(q4k_repack_cache(), id, rows, cols, || {
+        ferrox_quant::pack_q4_k_matrix_x8(data, rows, cols, ferrox_quant::q4_kx8_interleave())
+    })
 }
 
 /// Process-wide cache of interleaved Q5_K (`block_q5_Kx8`) bytes.
-fn q5k_repack_cache() -> &'static Q5kRepackCache {
-    static CACHE: OnceLock<Q5kRepackCache> = OnceLock::new();
+fn q5k_repack_cache() -> &'static RepackCache {
+    static CACHE: OnceLock<RepackCache> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn get_or_repack_q5k(data: &[u8], rows: usize, cols: usize, cacheable: bool) -> Arc<[u8]> {
-    // See `WeightBytes::address_is_stable`. Caching a recycled
-    // buffer by address serves one expert another expert's bytes.
-    if !cacheable {
-        return repack_q5k_uncached(data, rows, cols);
-    }
-    let key = (data.as_ptr() as usize, rows);
-    {
-        let cache = q5k_repack_cache().lock().unwrap();
-        if let Some(hit) = cache.get(&key) {
-            return Arc::clone(hit);
-        }
-    }
-    let interleave = ferrox_quant::q5_kx8_interleave();
-    let packed = ferrox_quant::pack_q5_k_matrix_x8(data, rows, cols, interleave);
-    let arc: Arc<[u8]> = Arc::from(packed.into_boxed_slice());
-    let mut cache = q5k_repack_cache().lock().unwrap();
-    Arc::clone(cache.entry(key).or_insert_with(|| Arc::clone(&arc)))
+fn get_or_repack_q5k(data: &[u8], rows: usize, cols: usize, id: Option<MapId>) -> Arc<[u8]> {
+    get_or_repack(q5k_repack_cache(), id, rows, cols, || {
+        ferrox_quant::pack_q5_k_matrix_x8(data, rows, cols, ferrox_quant::q5_kx8_interleave())
+    })
 }
 
-fn q6k_repack_cache() -> &'static Q6kRepackCache {
-    static CACHE: OnceLock<Q6kRepackCache> = OnceLock::new();
+/// Process-wide cache of interleaved Q6_K (`block_q6_Kx8`) bytes.
+fn q6k_repack_cache() -> &'static RepackCache {
+    static CACHE: OnceLock<RepackCache> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn get_or_repack_q6k(data: &[u8], rows: usize, cols: usize, cacheable: bool) -> Arc<[u8]> {
-    // See `WeightBytes::address_is_stable`. Caching a recycled
-    // buffer by address serves one expert another expert's bytes.
-    if !cacheable {
-        return repack_q6k_uncached(data, rows, cols);
-    }
-    let key = (data.as_ptr() as usize, rows);
-    {
-        let cache = q6k_repack_cache().lock().unwrap();
-        if let Some(hit) = cache.get(&key) {
-            return Arc::clone(hit);
-        }
-    }
-    let interleave = ferrox_quant::q6_kx8_interleave();
-    let packed = ferrox_quant::pack_q6_k_matrix_x8(data, rows, cols, interleave);
-    let arc: Arc<[u8]> = Arc::from(packed.into_boxed_slice());
-    let mut cache = q6k_repack_cache().lock().unwrap();
-    Arc::clone(cache.entry(key).or_insert_with(|| Arc::clone(&arc)))
+fn get_or_repack_q6k(data: &[u8], rows: usize, cols: usize, id: Option<MapId>) -> Arc<[u8]> {
+    get_or_repack(q6k_repack_cache(), id, rows, cols, || {
+        ferrox_quant::pack_q6_k_matrix_x8(data, rows, cols, ferrox_quant::q6_kx8_interleave())
+    })
 }
 
 /// Process-wide cache of interleaved Q8_0 (`block_q8_0x4`) bytes.
-fn q8x4_repack_cache() -> &'static Q8x4RepackCache {
-    static CACHE: OnceLock<Q8x4RepackCache> = OnceLock::new();
+fn q8x4_repack_cache() -> &'static RepackCache {
+    static CACHE: OnceLock<RepackCache> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn get_or_repack_q8x4(data: &[u8], rows: usize, cols: usize, cacheable: bool) -> Arc<[u8]> {
-    // See `WeightBytes::address_is_stable`. Caching a recycled
-    // buffer by address serves one expert another expert's bytes.
-    if !cacheable {
-        return repack_q8x4_uncached(data, rows, cols);
-    }
-    let key = (data.as_ptr() as usize, rows);
-    {
-        let cache = q8x4_repack_cache().lock().unwrap();
-        if let Some(hit) = cache.get(&key) {
-            return Arc::clone(hit);
-        }
-    }
-    let packed =
-        ferrox_quant::pack_q8_0_matrix_x4(data, rows, cols, ferrox_quant::q8_0x4_interleave());
-    let arc: Arc<[u8]> = Arc::from(packed.into_boxed_slice());
-    let mut cache = q8x4_repack_cache().lock().unwrap();
-    Arc::clone(cache.entry(key).or_insert_with(|| Arc::clone(&arc)))
+fn get_or_repack_q8x4(data: &[u8], rows: usize, cols: usize, id: Option<MapId>) -> Arc<[u8]> {
+    get_or_repack(q8x4_repack_cache(), id, rows, cols, || {
+        ferrox_quant::pack_q8_0_matrix_x4(data, rows, cols, ferrox_quant::q8_0x4_interleave())
+    })
 }
 
 /// Process-wide cache of interleaved Q4_0 (`block_q4_0x4`) bytes.
-fn q4x4_repack_cache() -> &'static Q4x4RepackCache {
-    static CACHE: OnceLock<Q4x4RepackCache> = OnceLock::new();
+fn q4x4_repack_cache() -> &'static RepackCache {
+    static CACHE: OnceLock<RepackCache> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn get_or_repack_q4_0x4(data: &[u8], rows: usize, cols: usize, cacheable: bool) -> Arc<[u8]> {
-    // See `WeightBytes::address_is_stable`. Caching a recycled
-    // buffer by address serves one expert another expert's bytes.
-    if !cacheable {
-        return repack_q4_0x4_uncached(data, rows, cols);
-    }
-    let key = (data.as_ptr() as usize, rows);
-    {
-        let cache = q4x4_repack_cache().lock().unwrap();
-        if let Some(hit) = cache.get(&key) {
-            return Arc::clone(hit);
-        }
-    }
-    let packed =
-        ferrox_quant::pack_q4_0_matrix_x4(data, rows, cols, ferrox_quant::q4_0x4_interleave());
-    let arc: Arc<[u8]> = Arc::from(packed.into_boxed_slice());
-    let mut cache = q4x4_repack_cache().lock().unwrap();
-    Arc::clone(cache.entry(key).or_insert_with(|| Arc::clone(&arc)))
+fn get_or_repack_q4_0x4(data: &[u8], rows: usize, cols: usize, id: Option<MapId>) -> Arc<[u8]> {
+    get_or_repack(q4x4_repack_cache(), id, rows, cols, || {
+        ferrox_quant::pack_q4_0_matrix_x4(data, rows, cols, ferrox_quant::q4_0x4_interleave())
+    })
 }
 
 /// Backing storage for a quantized weight matrix's raw bytes: either an
@@ -243,21 +220,35 @@ impl WeightBytes {
         self.len() == 0
     }
 
-    /// May a repack cache key on this buffer's ADDRESS?
+    /// The identity a repack cache may key on, or `None` for bytes that
+    /// must never be cached by address.
     ///
-    /// Only for `Mapped`, whose address is a fixed point in a
-    /// process-lifetime mmap. `Shared` is a lease over an expert
-    /// store's recycled buffer: two different experts routinely land at
-    /// the same address, and an address-keyed cache then serves one of
-    /// them the other's repacked bytes. That produced fluent garbage on
+    /// This *replaces* an `address_is_stable() -> bool`, and the boolean
+    /// was the bug: a yes/no answer cannot say whether the mapping that
+    /// made the address meaningful is still alive, so the cache went on
+    /// trusting an address after the mapping behind it was gone. See
+    /// [`MapId`] for the ABA that produces and how the `Weak` closes it.
+    ///
+    /// `Shared` stays `None`, and for a different reason that a `Weak`
+    /// would NOT fix: it is a lease over an expert store's *recycled*
+    /// buffer, so the allocation stays alive and keeps its address while
+    /// its CONTENTS are replaced by another expert's. Identity is stable
+    /// there and still means nothing. That produced fluent garbage on
     /// OLMoE with expert streaming on, while the raw weight bytes
     /// compared equal, because the corruption was in the CACHE and not
     /// in the weights.
     ///
-    /// `Owned` is excluded for the same reason: a freed Vec's address
-    /// can be reused.
-    pub fn address_is_stable(&self) -> bool {
-        matches!(self, WeightBytes::Mapped { .. })
+    /// `Owned` stays `None` too: a freed `Vec`'s address is reused, and
+    /// nothing holds a handle that could witness the free.
+    pub fn map_id(&self) -> Option<MapId> {
+        match self {
+            WeightBytes::Mapped { mmap, range } => Some(MapId {
+                map: Arc::downgrade(mmap),
+                id: Arc::as_ptr(mmap) as usize,
+                offset: range.start,
+            }),
+            WeightBytes::Owned(_) | WeightBytes::Shared { .. } => None,
+        }
     }
 
     /// True if this is a zero-copy mmap view rather than an owned
@@ -386,62 +377,18 @@ impl QuantKind {
 /// Which quant kinds have a **Metal matvec** kernel, as the kernel name
 /// [`ferrox_metal::gpu::matvec_launch_meta`] resolves.
 ///
-/// This is the single source of truth for that question. It is *not*
-/// `#[cfg(feature = "metal")]`-gated deliberately: the table is a
-/// property of the kernel set, and gating it would make it untestable on
-/// the builds that run `cargo test --workspace`.
-///
-/// Duplicating this list is how IQ4_XS batched prefill silently ran on
-/// the CPU — `metal_kind_supported` and `apply_gpu_batch`'s kind table
-/// disagreed by exactly one entry, and the only symptom was a benchmark
-/// row 13.7x behind. Every Metal-kind question now routes through here.
+/// The table itself is [`Metal::matvec_kernel`]; this is the name the
+/// rest of the tree already imports, kept so the single source of truth
+/// moving did not become 30 edits in crates owned by someone else.
 pub fn metal_matvec_kind_name(kind: QuantKind) -> Option<&'static str> {
-    match kind {
-        QuantKind::Q8_0
-        | QuantKind::Q4_0
-        | QuantKind::Q5_0
-        | QuantKind::Q4K
-        | QuantKind::Q5K
-        | QuantKind::Q6K
-        | QuantKind::IQ4XS => Some(kind.name()),
-        _ => None,
-    }
+    Metal::matvec_kernel(kind)
 }
 
 /// Which quant kinds have a **Metal batched simdgroup GEMM**
-/// (`*_mul_mm_sg`), the prefill path. A kind with a matvec but no GEMM
-/// still runs on Metal — as `batch` separate matvecs over the same
-/// weights, which is the 13.7x shape.
-///
-/// The invariant that this set equals [`metal_matvec_kind_name`]'s is
-/// asserted by a test, so adding a matvec kernel without a GEMM fails
-/// the suite instead of a benchmark.
+/// (`*_mul_mm_sg`), the prefill path. Delegates to
+/// [`Metal::gemm_supported`].
 pub fn metal_mul_mm_kind_supported(kind: QuantKind) -> bool {
-    // Q5_0 JOINED 2026-09-01, and the two-year-old comment this replaced
-    // named the exact condition: "the honest close is a `q5_0_matvec`
-    // plus a Q5_0 row in the bench suite, not a sixth entry in this
-    // list."
-    //
-    // The matvec now exists (`Q5_0_MATVEC_KERNEL_SRC`), so the split
-    // this list was protecting against is gone: Q5_0 was already getting
-    // GPU prefill through `mul_mm_sg_launch` and `mapped_sg`, which
-    // never consulted this table, while every decode step fell back to
-    // the CPU for want of the matvec. That is the mixed CPU/GPU path the
-    // old comment feared, and it was live rather than hypothetical.
-    //
-    // The bench row is still owed: there is no Q5_0 checkpoint in
-    // `benchmarks/suite.json`, so this path is CORRECT-BY-CONSTRUCTION
-    // and UNMEASURED. `Llama-3.2-1B-Instruct-Q5_K_M` is Q5_K, not Q5_0.
-    matches!(
-        kind,
-        QuantKind::Q8_0
-            | QuantKind::Q4_0
-            | QuantKind::Q5_0
-            | QuantKind::Q4K
-            | QuantKind::Q5K
-            | QuantKind::Q6K
-            | QuantKind::IQ4XS
-    )
+    Metal::gemm_supported(kind)
 }
 
 /// Maps a GGUF tensor's on-disk dtype to the [`QuantKind`] a
@@ -488,42 +435,17 @@ pub fn quant_kind_for(dtype: GgmlType) -> Option<QuantKind> {
 }
 
 /// Which quant kinds have a **CUDA batched GEMM** (`mul_mm`), the
-/// prefill path.
-///
-/// Deliberately narrower than [`cuda_matvec_kind_supported`]:
-/// `ferrox-cuda` had no matrix-matrix product at all until Q8_0 and
-/// Q4_0 landed, so every other kind still decomposes a prefill into
-/// per-position matvecs.
-///
-/// Stated here rather than delegating to
-/// `ferrox_cuda::mul_mm::kind_by_name`, because `ferrox-cuda` is only a
-/// dependency under the `cuda` feature and this predicate is compiled
-/// unconditionally (the capability report reads it on every build).
-///
-/// Two tables that must agree about one set is the failure this
-/// codebase keeps paying for, so the agreement is a TEST rather than a
-/// hope: `the_cuda_gemm_kinds_match_the_kernel_table` runs under
-/// `--features cuda` and compares this against `kind_by_name` for every
-/// `QuantKind`.
-///
-/// **UNRUN ON HARDWARE.** The kernel is checked against a scalar twin
-/// and by executing the emitted CUDA C on the host, and has never
-/// executed on a GPU. See `crates/ferrox-cuda/src/mul_mm.rs`.
+/// prefill path. Delegates to [`Cuda::gemm_supported`], which is where
+/// the "UNRUN ON HARDWARE" caveat is written down.
 pub fn cuda_mul_mm_kind_supported(kind: QuantKind) -> bool {
-    matches!(kind, QuantKind::Q8_0 | QuantKind::Q4_0)
+    Cuda::gemm_supported(kind)
 }
 
 /// Which quant kinds have a **CUDA matvec** kernel, the decode path.
-///
-/// Wider than [`cuda_mul_mm_kind_supported`], and this is the arm that
-/// has actually run on a GPU. This doc line was orphaned onto the GEMM
-/// predicate when that one was inserted above it, leaving the matvec
-/// list undocumented and the GEMM list described as the matvec list.
+/// Delegates to [`Cuda::matvec_kernel`], whose `Option<&str>` is the
+/// shape Metal needs and CUDA does not — the `bool` is this wrapper.
 pub fn cuda_matvec_kind_supported(kind: QuantKind) -> bool {
-    matches!(
-        kind,
-        QuantKind::Q8_0 | QuantKind::Q4_0 | QuantKind::Q4K | QuantKind::Q5K | QuantKind::Q6K
-    )
+    Cuda::matvec_kernel(kind).is_some()
 }
 
 /// Which quant kinds take the CPU integer `vec_dot` path (activation
@@ -540,35 +462,23 @@ pub fn cpu_int_dot_kind_supported(kind: QuantKind, cols: usize) -> bool {
 
 /// The backend dense matmuls will actually use in this process, decided
 /// by the same cached env/probe reads dispatch uses. CUDA wins when both
-/// are compiled in, matching [`WeightMatrix::apply_gpu`]'s order.
+/// are compiled in — and it wins here because it is first in
+/// [`gpu_backend::with_gpu_backends`], the single ordered list
+/// [`WeightMatrix::apply_gpu`] also expands, rather than because that
+/// order is written out a second time.
 pub fn active_backend() -> crate::kernel_registry::Backend {
-    #[cfg(feature = "cuda")]
-    {
-        if cuda_dense_enabled() {
-            return crate::kernel_registry::Backend::Cuda;
-        }
+    #[allow(unused_macros)]
+    macro_rules! first_enabled {
+        ($b:ty) => {
+            if <$b as BackendDispatch>::dense_enabled() {
+                return <$b as BackendCaps>::ID;
+            }
+        };
     }
-    #[cfg(feature = "metal")]
-    {
-        if metal_dense_enabled() {
-            return crate::kernel_registry::Backend::Metal;
-        }
-    }
+    with_gpu_backends!(first_enabled);
     crate::kernel_registry::Backend::Cpu
 }
 
-/// A `ferrox_cuda::gpu::launch_*_matvec` function pointer's signature
-/// -- named here purely to keep `apply_gpu`'s CUDA per-kind dispatch
-/// table readable (all five real kernels share this exact signature).
-#[cfg(feature = "cuda")]
-type CudaMatvecLaunchFn =
-    fn(&[u8], &[f32], usize, usize, usize) -> Result<Vec<f32>, ferrox_cuda::gpu::CudaError>;
-
-/// Metal matvec launch signature (`weights`/`x` borrowed; row block
-/// count is derived inside `ferrox_metal::gpu`).
-#[cfg(feature = "metal")]
-type MetalMatvecLaunchFn =
-    fn(&[u8], &[f32], usize, usize) -> Result<Vec<f32>, ferrox_metal::gpu::MetalError>;
 thread_local! {
     /// Elements dotted per output row of the matrix currently being
     /// applied. Set by [`WeightMatrix::with_row_work`] on the calling
@@ -580,6 +490,18 @@ thread_local! {
 
 /// Minimum multiply-accumulates a rayon task should carry before it is
 /// worth its own scheduling. Chosen by measurement, not derivation.
+///
+/// **This is a rayon-only mitigation and it is unreachable on
+/// [`crate::par::Backend::Spin`].** It exists to stop rayon splitting a
+/// matvec into tasks too small to repay a fork-join; the persistent pool
+/// has no fork-join to repay, so it chunks by pool width alone (see the
+/// `MIN_TASK_MACS` section of [`crate::par`]). Issue #27 asks for this
+/// constant to be deleted rather than retuned, and on the new path it is:
+/// [`WeightMatrix::with_row_work`] does not publish anything there, so
+/// the branch below that reads it cannot be taken. It survives on the
+/// rayon path because that path is still the default and removing it
+/// there re-opens the 13-16x small-model regression recorded on
+/// [`WeightMatrix::min_rows_per_task`].
 const MIN_TASK_MACS: usize = 1 << 16;
 
 /// Whether dense [`WeightMatrix::apply`] / [`WeightMatrix::apply_batch`]
@@ -592,13 +514,7 @@ const MIN_TASK_MACS: usize = 1 << 16;
 /// Decision is cached for the process lifetime (env read once).
 #[cfg(feature = "metal")]
 pub fn metal_dense_enabled() -> bool {
-    use std::sync::OnceLock;
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| match std::env::var("FERROX_METAL").ok().as_deref() {
-        Some("0") | Some("false") | Some("off") | Some("cpu") => false,
-        Some("1") | Some("true") | Some("on") | Some("metal") => true,
-        _ => ferrox_metal::gpu::probe().is_some(),
-    })
+    Metal::dense_enabled()
 }
 
 /// Whether dense [`WeightMatrix::apply`] should try CUDA first (when
@@ -609,13 +525,7 @@ pub fn metal_dense_enabled() -> bool {
 /// - unset / `auto` — CUDA when a device probe succeeds
 #[cfg(feature = "cuda")]
 pub fn cuda_dense_enabled() -> bool {
-    use std::sync::OnceLock;
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| match std::env::var("FERROX_CUDA").ok().as_deref() {
-        Some("0") | Some("false") | Some("off") | Some("cpu") => false,
-        Some("1") | Some("true") | Some("on") | Some("cuda") => true,
-        _ => ferrox_cuda::gpu::probe().is_some(),
-    })
+    Cuda::dense_enabled()
 }
 
 /// Whether CPU Q8_0 / Q4_0 / Q4_K / Q5_K / Q6_K matvec should quantize the
@@ -636,6 +546,20 @@ pub fn cuda_dense_enabled() -> bool {
 /// reference asserts exact agreement. So the *inference product*
 /// defaults to fast and the *library default* stays reference-exact.
 pub fn cpu_int_dot_enabled() -> bool {
+    #[cfg(test)]
+    {
+        // The env var is read once into a `OnceLock`, so a test cannot
+        // flip it after any other test has already observed it. Without
+        // an override, `cargo test` runs with int-dot *off* and every
+        // interleaved/i8mm batch kernel below is dead code in CI --
+        // which is how the whole repack tier went untested end to end.
+        // See [`tests::ForceIntDot`].
+        match INT_DOT_TEST_OVERRIDE.load(std::sync::atomic::Ordering::Acquire) {
+            0 => return false,
+            1 => return true,
+            _ => {}
+        }
+    }
     use std::sync::OnceLock;
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
@@ -646,6 +570,13 @@ pub fn cpu_int_dot_enabled() -> bool {
     })
 }
 
+/// Test-only forcing of [`cpu_int_dot_enabled`]: `-1` unset, `0` off,
+/// `1` on. A global atomic rather than a thread-local because the paths
+/// it gates run on Rayon workers, which do not inherit thread-locals
+/// from the test thread.
+#[cfg(test)]
+static INT_DOT_TEST_OVERRIDE: std::sync::atomic::AtomicI8 = std::sync::atomic::AtomicI8::new(-1);
+
 /// Sets `FERROX_CPU_INT_DOT=1` unless the caller already expressed a
 /// preference. Call from a binary's startup, before any worker threads
 /// exist. See [`cpu_int_dot_enabled`] for why the default lives here
@@ -655,9 +586,45 @@ pub fn cpu_int_dot_enabled() -> bool {
 /// Must be called while the process is still single-threaded, since it
 /// mutates the process environment.
 pub unsafe fn default_cpu_int_dot_on() {
-    if std::env::var_os("FERROX_CPU_INT_DOT").is_none() {
+    if std::env::var_os("FERROX_CPU_INT_DOT").is_none() && int_dot_is_a_win_here() {
         unsafe { std::env::set_var("FERROX_CPU_INT_DOT", "1") };
     }
+}
+
+/// Whether the int-dot path is faster than the f32 one on THIS
+/// architecture.
+///
+/// It is not universally faster, and the default said it was. The
+/// interleaved int8 kernels this path selects were written for
+/// aarch64: `i8mm` SMMLA tiers, interleave-8 NEON GEMV, the Q8_K repack.
+/// x86_64 has none of that, so on x86 the switch selects a scalar
+/// integer loop AND bypasses the AVX2 f32 dot that does exist
+/// (`dot_q4_k_f32` and friends are gated on `avx2` + `fma`).
+///
+/// Measured 2026-09-04 on an idle 32-core Ryzen 9 7945HX (Zen 4, with
+/// `avx512_vnni` that nothing here uses), `tg64`, int-dot on against
+/// off:
+///
+/// | model | on (was the default) | off |
+/// |---|---|---|
+/// | Llama-3.2-1B Q4_K_M | 10.08 | **48.94** |
+/// | Llama-3.2-1B Q6_K | 4.11 | **36.23** |
+/// | Llama-3.2-3B Q4_K_M | 4.73 | **19.30** |
+///
+/// So the default cost x86 between 4x and 8.8x of decode, and it is
+/// most of why `benchmarks/RESULTS.md` had no x86 row worth showing
+/// (#127). Prefill is unaffected (95.3 against 89.4 on the 1B), which
+/// is consistent: prefill goes through the batched GEMM rather than
+/// this dot.
+///
+/// aarch64 keeps the default, where it is worth ~28% and the kernels it
+/// selects are the ones that were actually written.
+///
+/// This is a DEFAULT, not a gate: `FERROX_CPU_INT_DOT=1` still turns it
+/// on anywhere, which is what an x86 VNNI implementation would want in
+/// order to measure itself against the f32 path.
+fn int_dot_is_a_win_here() -> bool {
+    cfg!(target_arch = "aarch64")
 }
 
 /// A batch of activations quantized once for reuse across several
@@ -883,7 +850,7 @@ impl WeightMatrix {
     /// multiply-accumulates. Zero (unset) keeps the old row-only
     /// behaviour, so any call site that has not opted in is unchanged.
     fn min_rows_per_task(rows: usize) -> usize {
-        let threads = rayon::current_num_threads().max(1);
+        let threads = crate::par::num_threads();
         let by_threads = (rows / (threads * 4)).max(8.min(rows.max(1)));
         let per_row = ROW_WORK.with(|c| c.get());
         if per_row == 0 {
@@ -896,11 +863,29 @@ impl WeightMatrix {
     /// Runs `f` with the per-row work (elements dotted per output row)
     /// published for [`Self::min_rows_per_task`]. Restores the previous
     /// value, so nesting is safe.
+    ///
+    /// Publishes **nothing** under [`crate::par::Backend::Spin`]: that is
+    /// the single place `MIN_TASK_MACS` is switched off, rather than a
+    /// second copy of the decision at each of the thirty-odd call sites
+    /// that ask for a `min_len`.
     fn with_row_work<R>(per_row: usize, f: impl FnOnce() -> R) -> R {
+        let per_row = Self::row_work_for(crate::par::backend(), per_row);
         let prev = ROW_WORK.with(|c| c.replace(per_row));
         let out = f();
         ROW_WORK.with(|c| c.set(prev));
         out
+    }
+
+    /// What [`Self::with_row_work`] publishes, as a pure function of the
+    /// scheduler, so the claim "`MIN_TASK_MACS` is unreachable on the
+    /// persistent pool" is a test rather than a comment.
+    fn row_work_for(backend: crate::par::Backend, per_row: usize) -> usize {
+        match backend {
+            crate::par::Backend::Rayon => per_row,
+            // Zero means "no work-aware floor", which is exactly the
+            // branch `min_rows_per_task` returns early on.
+            crate::par::Backend::Spin => 0,
+        }
     }
 
     /// Run `body(g, t0, t1)` for every row-group `g` and activation-tile
@@ -926,7 +911,7 @@ impl WeightMatrix {
         if n_groups == 0 || n_tiles == 0 {
             return;
         }
-        let nth = rayon::current_num_threads().max(1);
+        let nth = crate::par::num_threads();
         const CHUNK_ELEMS: usize = 16;
         let g_per_chunk = (CHUNK_ELEMS / group_rows).max(1);
         let t_per_chunk = (CHUNK_ELEMS / tile_batch).max(1);
@@ -944,18 +929,15 @@ impl WeightMatrix {
         }
         let dg = n_groups.div_ceil(nchunk_g);
         let dt = n_tiles.div_ceil(nchunk_t);
-        (0..nchunk_g * nchunk_t)
-            .into_par_iter()
-            .with_min_len(1)
-            .for_each(|chunk| {
-                let g0 = (chunk % nchunk_g) * dg;
-                let g1 = (g0 + dg).min(n_groups);
-                let t0 = (chunk / nchunk_g) * dt;
-                let t1 = (t0 + dt).min(n_tiles);
-                for g in g0..g1 {
-                    body(g, t0, t1);
-                }
-            });
+        crate::par::indices(nchunk_g * nchunk_t, 1, |chunk| {
+            let g0 = (chunk % nchunk_g) * dg;
+            let g1 = (g0 + dg).min(n_groups);
+            let t0 = (chunk / nchunk_g) * dt;
+            let t1 = (t0 + dt).min(n_tiles);
+            for g in g0..g1 {
+                body(g, t0, t1);
+            }
+        });
     }
 
     /// Resolve the Q8_0-format activations (and the interleaved quads, if
@@ -1238,6 +1220,13 @@ impl WeightMatrix {
     /// their regions can coexist and let rayon's work-stealing fill
     /// threads that would otherwise idle at the tail of each one.
     ///
+    /// Under [`crate::par::Backend::Spin`] the three run one after the
+    /// other instead: each already spreads across the whole persistent
+    /// pool, and the reason to overlap them was to hide a fork-join that
+    /// the persistent pool does not pay. That choice lives in
+    /// [`crate::par::join3`], not here, so it cannot drift from the one
+    /// in `ferrox-moe`'s gate/up pair.
+    ///
     /// CPU only. On a GPU backend each `apply` submits and waits on its
     /// own command buffer, and Metal decode is already at or ahead of
     /// parity -- there is nothing to win and a live path to disturb.
@@ -1251,9 +1240,7 @@ impl WeightMatrix {
         if gpu {
             return (a.apply(x), b.apply(x), c.apply(x));
         }
-        let (ra, (rb, rc)) =
-            rayon::join(|| a.apply(x), || rayon::join(|| b.apply(x), || c.apply(x)));
-        (ra, rb, rc)
+        crate::par::join3(|| a.apply(x), || b.apply(x), || c.apply(x))
     }
 
     pub fn apply_cpu(&self, x: &[f32]) -> Vec<f32> {
@@ -1295,7 +1282,7 @@ impl WeightMatrix {
                                     data.as_slice(),
                                     *rows,
                                     *cols,
-                                    data.address_is_stable(),
+                                    data.map_id(),
                                 );
                                 if serial {
                                     for (g, chunk) in out[..n_groups * ferrox_quant::Q8_0X4_NROWS]
@@ -1312,11 +1299,11 @@ impl WeightMatrix {
                                         );
                                     }
                                 } else {
-                                    out[..n_groups * ferrox_quant::Q8_0X4_NROWS]
-                                        .par_chunks_mut(ferrox_quant::Q8_0X4_NROWS)
-                                        .with_min_len(Self::min_rows_per_task(n_groups).max(1))
-                                        .enumerate()
-                                        .for_each(|(g, chunk)| {
+                                    crate::par::chunks_mut(
+                                        &mut out[..n_groups * ferrox_quant::Q8_0X4_NROWS],
+                                        ferrox_quant::Q8_0X4_NROWS,
+                                        Self::min_rows_per_task(n_groups).max(1),
+                                        |g, chunk| {
                                             ferrox_quant::gemv_q8_0x4_group(
                                                 &packed,
                                                 g,
@@ -1325,7 +1312,8 @@ impl WeightMatrix {
                                                 ferrox_quant::q8_0x4_interleave(),
                                                 chunk,
                                             );
-                                        });
+                                        },
+                                    );
                                 }
                                 let data_slice = data.as_slice();
                                 let tail_len = *rows - n_groups * ferrox_quant::Q8_0X4_NROWS;
@@ -1340,15 +1328,12 @@ impl WeightMatrix {
                                         }
                                     } else {
                                         let min_len = Self::min_rows_per_task(tail_len);
-                                        tail.par_iter_mut()
-                                            .with_min_len(min_len)
-                                            .enumerate()
-                                            .for_each(|(i, o)| {
-                                                let r = n_groups * ferrox_quant::Q8_0X4_NROWS + i;
-                                                let row =
-                                                    &data_slice[r * row_bytes..(r + 1) * row_bytes];
-                                                *o = ferrox_quant::dot_q8_0_q8(row, &act);
-                                            });
+                                        crate::par::items_mut(tail, min_len, |i, o| {
+                                            let r = n_groups * ferrox_quant::Q8_0X4_NROWS + i;
+                                            let row =
+                                                &data_slice[r * row_bytes..(r + 1) * row_bytes];
+                                            *o = ferrox_quant::dot_q8_0_q8(row, &act);
+                                        });
                                     }
                                 }
                                 return out;
@@ -1359,14 +1344,15 @@ impl WeightMatrix {
                                     *o = ferrox_quant::dot_q8_0_q8(row, &act);
                                 }
                             } else {
-                                out.par_iter_mut()
-                                    .with_min_len(Self::min_rows_per_task(*rows))
-                                    .enumerate()
-                                    .for_each(|(r, o)| {
+                                crate::par::items_mut(
+                                    &mut out,
+                                    Self::min_rows_per_task(*rows),
+                                    |r, o| {
                                         let row =
                                             &data.as_slice()[r * row_bytes..(r + 1) * row_bytes];
                                         *o = ferrox_quant::dot_q8_0_q8(row, &act);
-                                    });
+                                    },
+                                );
                             }
                             return out;
                         }
@@ -1379,7 +1365,7 @@ impl WeightMatrix {
                                     data.as_slice(),
                                     *rows,
                                     *cols,
-                                    data.address_is_stable(),
+                                    data.map_id(),
                                 );
                                 if serial {
                                     for (g, chunk) in out[..n_groups * ferrox_quant::Q4_0X4_NROWS]
@@ -1396,11 +1382,11 @@ impl WeightMatrix {
                                         );
                                     }
                                 } else {
-                                    out[..n_groups * ferrox_quant::Q4_0X4_NROWS]
-                                        .par_chunks_mut(ferrox_quant::Q4_0X4_NROWS)
-                                        .with_min_len(Self::min_rows_per_task(n_groups).max(1))
-                                        .enumerate()
-                                        .for_each(|(g, chunk)| {
+                                    crate::par::chunks_mut(
+                                        &mut out[..n_groups * ferrox_quant::Q4_0X4_NROWS],
+                                        ferrox_quant::Q4_0X4_NROWS,
+                                        Self::min_rows_per_task(n_groups).max(1),
+                                        |g, chunk| {
                                             ferrox_quant::gemv_q4_0x4_group(
                                                 &packed,
                                                 g,
@@ -1409,7 +1395,8 @@ impl WeightMatrix {
                                                 ferrox_quant::q4_0x4_interleave(),
                                                 chunk,
                                             );
-                                        });
+                                        },
+                                    );
                                 }
                                 let data_slice = data.as_slice();
                                 let tail_len = *rows - n_groups * ferrox_quant::Q4_0X4_NROWS;
@@ -1424,15 +1411,12 @@ impl WeightMatrix {
                                         }
                                     } else {
                                         let min_len = Self::min_rows_per_task(tail_len);
-                                        tail.par_iter_mut()
-                                            .with_min_len(min_len)
-                                            .enumerate()
-                                            .for_each(|(i, o)| {
-                                                let r = n_groups * ferrox_quant::Q4_0X4_NROWS + i;
-                                                let row =
-                                                    &data_slice[r * row_bytes..(r + 1) * row_bytes];
-                                                *o = ferrox_quant::dot_q4_0_q8(row, &act);
-                                            });
+                                        crate::par::items_mut(tail, min_len, |i, o| {
+                                            let r = n_groups * ferrox_quant::Q4_0X4_NROWS + i;
+                                            let row =
+                                                &data_slice[r * row_bytes..(r + 1) * row_bytes];
+                                            *o = ferrox_quant::dot_q4_0_q8(row, &act);
+                                        });
                                     }
                                 }
                                 return out;
@@ -1443,14 +1427,15 @@ impl WeightMatrix {
                                     *o = ferrox_quant::dot_q4_0_q8(row, &act);
                                 }
                             } else {
-                                out.par_iter_mut()
-                                    .with_min_len(Self::min_rows_per_task(*rows))
-                                    .enumerate()
-                                    .for_each(|(r, o)| {
+                                crate::par::items_mut(
+                                    &mut out,
+                                    Self::min_rows_per_task(*rows),
+                                    |r, o| {
                                         let row =
                                             &data.as_slice()[r * row_bytes..(r + 1) * row_bytes];
                                         *o = ferrox_quant::dot_q4_0_q8(row, &act);
-                                    });
+                                    },
+                                );
                             }
                             return out;
                         }
@@ -1459,42 +1444,40 @@ impl WeightMatrix {
                             let n_groups = *rows / ferrox_quant::Q4_KX8_NROWS;
                             if n_groups > 0 {
                                 let interleave = ferrox_quant::q4_kx8_interleave();
-                                let packed = get_or_repack_q4k(
-                                    data.as_slice(),
-                                    *rows,
-                                    *cols,
-                                    data.address_is_stable(),
-                                );
-                                out[..n_groups * ferrox_quant::Q4_KX8_NROWS]
-                                    .par_chunks_mut(ferrox_quant::Q4_KX8_NROWS)
-                                    .with_min_len(Self::min_rows_per_task(n_groups).max(1))
-                                    .enumerate()
-                                    .for_each(|(g, chunk)| {
+                                let packed =
+                                    get_or_repack_q4k(data.as_slice(), *rows, *cols, data.map_id());
+                                crate::par::chunks_mut(
+                                    &mut out[..n_groups * ferrox_quant::Q4_KX8_NROWS],
+                                    ferrox_quant::Q4_KX8_NROWS,
+                                    Self::min_rows_per_task(n_groups).max(1),
+                                    |g, chunk| {
                                         ferrox_quant::gemv_q4_kx8_group(
                                             &packed, g, &act, *cols, interleave, chunk,
                                         );
-                                    });
+                                    },
+                                );
                                 let data_slice = data.as_slice();
-                                out[n_groups * ferrox_quant::Q4_KX8_NROWS..]
-                                    .par_iter_mut()
-                                    .with_min_len(Self::min_rows_per_task(
+                                crate::par::items_mut(
+                                    &mut out[n_groups * ferrox_quant::Q4_KX8_NROWS..],
+                                    Self::min_rows_per_task(
                                         *rows - n_groups * ferrox_quant::Q4_KX8_NROWS,
-                                    ))
-                                    .enumerate()
-                                    .for_each(|(i, o)| {
+                                    ),
+                                    |i, o| {
                                         let r = n_groups * ferrox_quant::Q4_KX8_NROWS + i;
                                         let row = &data_slice[r * row_bytes..(r + 1) * row_bytes];
                                         *o = ferrox_quant::dot_q4_k_q8(row, &act);
-                                    });
+                                    },
+                                );
                                 return out;
                             }
-                            out.par_iter_mut()
-                                .with_min_len(Self::min_rows_per_task(*rows))
-                                .enumerate()
-                                .for_each(|(r, o)| {
+                            crate::par::items_mut(
+                                &mut out,
+                                Self::min_rows_per_task(*rows),
+                                |r, o| {
                                     let row = &data.as_slice()[r * row_bytes..(r + 1) * row_bytes];
                                     *o = ferrox_quant::dot_q4_k_q8(row, &act);
-                                });
+                                },
+                            );
                             return out;
                         }
                         QuantKind::Q5K if x.len().is_multiple_of(256) => {
@@ -1502,42 +1485,40 @@ impl WeightMatrix {
                             let n_groups = *rows / ferrox_quant::Q5_KX8_NROWS;
                             if n_groups > 0 {
                                 let interleave = ferrox_quant::q5_kx8_interleave();
-                                let packed = get_or_repack_q5k(
-                                    data.as_slice(),
-                                    *rows,
-                                    *cols,
-                                    data.address_is_stable(),
-                                );
-                                out[..n_groups * ferrox_quant::Q5_KX8_NROWS]
-                                    .par_chunks_mut(ferrox_quant::Q5_KX8_NROWS)
-                                    .with_min_len(Self::min_rows_per_task(n_groups).max(1))
-                                    .enumerate()
-                                    .for_each(|(g, chunk)| {
+                                let packed =
+                                    get_or_repack_q5k(data.as_slice(), *rows, *cols, data.map_id());
+                                crate::par::chunks_mut(
+                                    &mut out[..n_groups * ferrox_quant::Q5_KX8_NROWS],
+                                    ferrox_quant::Q5_KX8_NROWS,
+                                    Self::min_rows_per_task(n_groups).max(1),
+                                    |g, chunk| {
                                         ferrox_quant::gemv_q5_kx8_group(
                                             &packed, g, &act, *cols, interleave, chunk,
                                         );
-                                    });
+                                    },
+                                );
                                 let data_slice = data.as_slice();
-                                out[n_groups * ferrox_quant::Q5_KX8_NROWS..]
-                                    .par_iter_mut()
-                                    .with_min_len(Self::min_rows_per_task(
+                                crate::par::items_mut(
+                                    &mut out[n_groups * ferrox_quant::Q5_KX8_NROWS..],
+                                    Self::min_rows_per_task(
                                         *rows - n_groups * ferrox_quant::Q5_KX8_NROWS,
-                                    ))
-                                    .enumerate()
-                                    .for_each(|(i, o)| {
+                                    ),
+                                    |i, o| {
                                         let r = n_groups * ferrox_quant::Q5_KX8_NROWS + i;
                                         let row = &data_slice[r * row_bytes..(r + 1) * row_bytes];
                                         *o = ferrox_quant::dot_q5_k_q8(row, &act);
-                                    });
+                                    },
+                                );
                                 return out;
                             }
-                            out.par_iter_mut()
-                                .with_min_len(Self::min_rows_per_task(*rows))
-                                .enumerate()
-                                .for_each(|(r, o)| {
+                            crate::par::items_mut(
+                                &mut out,
+                                Self::min_rows_per_task(*rows),
+                                |r, o| {
                                     let row = &data.as_slice()[r * row_bytes..(r + 1) * row_bytes];
                                     *o = ferrox_quant::dot_q5_k_q8(row, &act);
-                                });
+                                },
+                            );
                             return out;
                         }
                         QuantKind::Q6K if x.len().is_multiple_of(256) => {
@@ -1545,54 +1526,49 @@ impl WeightMatrix {
                             let n_groups = *rows / ferrox_quant::Q6_KX8_NROWS;
                             if n_groups > 0 {
                                 let interleave = ferrox_quant::q6_kx8_interleave();
-                                let packed = get_or_repack_q6k(
-                                    data.as_slice(),
-                                    *rows,
-                                    *cols,
-                                    data.address_is_stable(),
-                                );
-                                out[..n_groups * ferrox_quant::Q6_KX8_NROWS]
-                                    .par_chunks_mut(ferrox_quant::Q6_KX8_NROWS)
-                                    .with_min_len(Self::min_rows_per_task(n_groups).max(1))
-                                    .enumerate()
-                                    .for_each(|(g, out8)| {
+                                let packed =
+                                    get_or_repack_q6k(data.as_slice(), *rows, *cols, data.map_id());
+                                crate::par::chunks_mut(
+                                    &mut out[..n_groups * ferrox_quant::Q6_KX8_NROWS],
+                                    ferrox_quant::Q6_KX8_NROWS,
+                                    Self::min_rows_per_task(n_groups).max(1),
+                                    |g, out8| {
                                         ferrox_quant::gemv_q6_kx8_group(
                                             &packed, g, &act, *cols, interleave, out8,
                                         );
-                                    });
-                                out[n_groups * ferrox_quant::Q6_KX8_NROWS..]
-                                    .par_iter_mut()
-                                    .with_min_len(Self::min_rows_per_task(
+                                    },
+                                );
+                                crate::par::items_mut(
+                                    &mut out[n_groups * ferrox_quant::Q6_KX8_NROWS..],
+                                    Self::min_rows_per_task(
                                         *rows - n_groups * ferrox_quant::Q6_KX8_NROWS,
-                                    ))
-                                    .enumerate()
-                                    .for_each(|(i, o)| {
+                                    ),
+                                    |i, o| {
                                         let r = n_groups * ferrox_quant::Q6_KX8_NROWS + i;
                                         let row =
                                             &data.as_slice()[r * row_bytes..(r + 1) * row_bytes];
                                         *o = ferrox_quant::dot_q6_k_q8(row, &act);
-                                    });
+                                    },
+                                );
                                 return out;
                             }
-                            out.par_iter_mut()
-                                .with_min_len(Self::min_rows_per_task(*rows))
-                                .enumerate()
-                                .for_each(|(r, o)| {
+                            crate::par::items_mut(
+                                &mut out,
+                                Self::min_rows_per_task(*rows),
+                                |r, o| {
                                     let row = &data.as_slice()[r * row_bytes..(r + 1) * row_bytes];
                                     *o = ferrox_quant::dot_q6_k_q8(row, &act);
-                                });
+                                },
+                            );
                             return out;
                         }
                         _ => {}
                     }
                 }
-                out.par_iter_mut()
-                    .with_min_len(Self::min_rows_per_task(*rows))
-                    .enumerate()
-                    .for_each(|(r, o)| {
-                        let row = &data.as_slice()[r * row_bytes..(r + 1) * row_bytes];
-                        *o = Self::dot(*kind, row, x);
-                    });
+                crate::par::items_mut(&mut out, Self::min_rows_per_task(*rows), |r, o| {
+                    let row = &data.as_slice()[r * row_bytes..(r + 1) * row_bytes];
+                    *o = Self::dot(*kind, row, x);
+                });
                 out
             }
             WeightMatrix::Mxfp4 {
@@ -1604,16 +1580,11 @@ impl WeightMatrix {
                 let packed_row_bytes = cols / 2;
                 let scale_row_bytes = cols / ferrox_quant::MXFP4_GROUP_SIZE;
                 let mut out = vec![0f32; *rows];
-                out.par_iter_mut()
-                    .with_min_len(Self::min_rows_per_task(*rows))
-                    .enumerate()
-                    .for_each(|(r, o)| {
-                        let prow =
-                            &packed.as_slice()[r * packed_row_bytes..(r + 1) * packed_row_bytes];
-                        let srow =
-                            &scale.as_slice()[r * scale_row_bytes..(r + 1) * scale_row_bytes];
-                        *o = ferrox_quant::dot_mxfp4_row_f32(prow, srow, x);
-                    });
+                crate::par::items_mut(&mut out, Self::min_rows_per_task(*rows), |r, o| {
+                    let prow = &packed.as_slice()[r * packed_row_bytes..(r + 1) * packed_row_bytes];
+                    let srow = &scale.as_slice()[r * scale_row_bytes..(r + 1) * scale_row_bytes];
+                    *o = ferrox_quant::dot_mxfp4_row_f32(prow, srow, x);
+                });
                 out
             }
         }
@@ -1645,7 +1616,7 @@ impl WeightMatrix {
         if matches!(kind, QuantKind::Q8_0) {
             let n_groups = *rows / ferrox_quant::Q8_0X4_NROWS;
             if n_groups > 0 {
-                let packed = get_or_repack_q8x4(data, *rows, *cols, /* cacheable = */ false);
+                let packed = get_or_repack_q8x4(data, *rows, *cols, /* uncacheable */ None);
                 let serial = Self::prefer_serial_matvec(*rows, *cols);
                 let body = |g: usize, chunk: &mut [f32]| {
                     ferrox_quant::gemv_q8_0x4_group(
@@ -1665,11 +1636,12 @@ impl WeightMatrix {
                         body(g, chunk);
                     }
                 } else {
-                    out[..n_groups * ferrox_quant::Q8_0X4_NROWS]
-                        .par_chunks_mut(ferrox_quant::Q8_0X4_NROWS)
-                        .with_min_len(Self::min_rows_per_task(n_groups).max(1))
-                        .enumerate()
-                        .for_each(|(g, chunk)| body(g, chunk));
+                    crate::par::chunks_mut(
+                        &mut out[..n_groups * ferrox_quant::Q8_0X4_NROWS],
+                        ferrox_quant::Q8_0X4_NROWS,
+                        Self::min_rows_per_task(n_groups).max(1),
+                        |g, chunk| body(g, chunk),
+                    );
                 }
                 let tail_len = *rows - n_groups * ferrox_quant::Q8_0X4_NROWS;
                 if tail_len > 0 {
@@ -1684,16 +1656,13 @@ impl WeightMatrix {
                         }
                     } else {
                         let min_len = Self::min_rows_per_task(tail_len);
-                        tail.par_iter_mut()
-                            .with_min_len(min_len)
-                            .enumerate()
-                            .for_each(|(i, o)| {
-                                let r = n_groups * ferrox_quant::Q8_0X4_NROWS + i;
-                                *o = ferrox_quant::dot_q8_0_q8(
-                                    &data[r * row_bytes..(r + 1) * row_bytes],
-                                    act,
-                                );
-                            });
+                        crate::par::items_mut(tail, min_len, |i, o| {
+                            let r = n_groups * ferrox_quant::Q8_0X4_NROWS + i;
+                            *o = ferrox_quant::dot_q8_0_q8(
+                                &data[r * row_bytes..(r + 1) * row_bytes],
+                                act,
+                            );
+                        });
                     }
                 }
                 return Some(out);
@@ -1702,7 +1671,7 @@ impl WeightMatrix {
         if matches!(kind, QuantKind::Q4_0) {
             let n_groups = *rows / ferrox_quant::Q4_0X4_NROWS;
             if n_groups > 0 {
-                let packed = get_or_repack_q4_0x4(data, *rows, *cols, /* cacheable = */ false);
+                let packed = get_or_repack_q4_0x4(data, *rows, *cols, /* uncacheable */ None);
                 let serial = Self::prefer_serial_matvec(*rows, *cols);
                 let body = |g: usize, chunk: &mut [f32]| {
                     ferrox_quant::gemv_q4_0x4_group(
@@ -1722,11 +1691,12 @@ impl WeightMatrix {
                         body(g, chunk);
                     }
                 } else {
-                    out[..n_groups * ferrox_quant::Q4_0X4_NROWS]
-                        .par_chunks_mut(ferrox_quant::Q4_0X4_NROWS)
-                        .with_min_len(Self::min_rows_per_task(n_groups).max(1))
-                        .enumerate()
-                        .for_each(|(g, chunk)| body(g, chunk));
+                    crate::par::chunks_mut(
+                        &mut out[..n_groups * ferrox_quant::Q4_0X4_NROWS],
+                        ferrox_quant::Q4_0X4_NROWS,
+                        Self::min_rows_per_task(n_groups).max(1),
+                        |g, chunk| body(g, chunk),
+                    );
                 }
                 let tail_len = *rows - n_groups * ferrox_quant::Q4_0X4_NROWS;
                 if tail_len > 0 {
@@ -1741,16 +1711,13 @@ impl WeightMatrix {
                         }
                     } else {
                         let min_len = Self::min_rows_per_task(tail_len);
-                        tail.par_iter_mut()
-                            .with_min_len(min_len)
-                            .enumerate()
-                            .for_each(|(i, o)| {
-                                let r = n_groups * ferrox_quant::Q4_0X4_NROWS + i;
-                                *o = ferrox_quant::dot_q4_0_q8(
-                                    &data[r * row_bytes..(r + 1) * row_bytes],
-                                    act,
-                                );
-                            });
+                        crate::par::items_mut(tail, min_len, |i, o| {
+                            let r = n_groups * ferrox_quant::Q4_0X4_NROWS + i;
+                            *o = ferrox_quant::dot_q4_0_q8(
+                                &data[r * row_bytes..(r + 1) * row_bytes],
+                                act,
+                            );
+                        });
                     }
                 }
                 return Some(out);
@@ -1767,17 +1734,14 @@ impl WeightMatrix {
             }
             return Some(out);
         }
-        out.par_iter_mut()
-            .with_min_len(Self::min_rows_per_task(*rows))
-            .enumerate()
-            .for_each(|(r, o)| {
-                let row = &data[r * row_bytes..(r + 1) * row_bytes];
-                *o = match kind {
-                    QuantKind::Q8_0 => ferrox_quant::dot_q8_0_q8(row, act),
-                    QuantKind::Q4_0 => ferrox_quant::dot_q4_0_q8(row, act),
-                    _ => unreachable!(),
-                };
-            });
+        crate::par::items_mut(&mut out, Self::min_rows_per_task(*rows), |r, o| {
+            let row = &data[r * row_bytes..(r + 1) * row_bytes];
+            *o = match kind {
+                QuantKind::Q8_0 => ferrox_quant::dot_q8_0_q8(row, act),
+                QuantKind::Q4_0 => ferrox_quant::dot_q4_0_q8(row, act),
+                _ => unreachable!(),
+            };
+        });
         Some(out)
     }
 
@@ -2150,12 +2114,8 @@ impl WeightMatrix {
                                 Self::q8_acts(shared, x_batch, batch_size, cols, &mut acts_owned);
                             let n_groups = *rows / ferrox_quant::Q8_0X4_NROWS;
                             if n_groups > 0 {
-                                let packed = get_or_repack_q8x4(
-                                    data.as_slice(),
-                                    *rows,
-                                    cols,
-                                    data.address_is_stable(),
-                                );
+                                let packed =
+                                    get_or_repack_q8x4(data.as_slice(), *rows, cols, data.map_id());
                                 let nrows_g = ferrox_quant::Q8_0X4_NROWS;
                                 let interleave = ferrox_quant::q8_0x4_interleave();
                                 if ferrox_quant::q8_0x4_gemm_uses_acts_x4(interleave) {
@@ -2251,37 +2211,30 @@ impl WeightMatrix {
                                 }
                                 let data_slice = data.as_slice();
                                 let tail = *rows - n_groups * ferrox_quant::Q8_0X4_NROWS;
-                                (0..tail)
-                                    .into_par_iter()
-                                    .with_min_len(Self::min_rows_per_task(tail))
-                                    .for_each(|i| {
-                                        let r = n_groups * ferrox_quant::Q8_0X4_NROWS + i;
-                                        let row = &data_slice[r * row_bytes..(r + 1) * row_bytes];
-                                        for (b, act) in acts.iter().enumerate() {
-                                            unsafe {
-                                                out_w.set(
-                                                    b * rows + r,
-                                                    ferrox_quant::dot_q8_0_q8(row, act),
-                                                );
-                                            }
+                                crate::par::indices(tail, Self::min_rows_per_task(tail), |i| {
+                                    let r = n_groups * ferrox_quant::Q8_0X4_NROWS + i;
+                                    let row = &data_slice[r * row_bytes..(r + 1) * row_bytes];
+                                    for (b, act) in acts.iter().enumerate() {
+                                        unsafe {
+                                            out_w.set(
+                                                b * rows + r,
+                                                ferrox_quant::dot_q8_0_q8(row, act),
+                                            );
                                         }
-                                    });
+                                    }
+                                });
                             } else {
-                                (0..*rows)
-                                    .into_par_iter()
-                                    .with_min_len(Self::min_rows_per_task(*rows))
-                                    .for_each(|r| {
-                                        let row =
-                                            &data.as_slice()[r * row_bytes..(r + 1) * row_bytes];
-                                        for (b, act) in acts.iter().enumerate() {
-                                            unsafe {
-                                                out_w.set(
-                                                    b * rows + r,
-                                                    ferrox_quant::dot_q8_0_q8(row, act),
-                                                );
-                                            }
+                                crate::par::indices(*rows, Self::min_rows_per_task(*rows), |r| {
+                                    let row = &data.as_slice()[r * row_bytes..(r + 1) * row_bytes];
+                                    for (b, act) in acts.iter().enumerate() {
+                                        unsafe {
+                                            out_w.set(
+                                                b * rows + r,
+                                                ferrox_quant::dot_q8_0_q8(row, act),
+                                            );
                                         }
-                                    });
+                                    }
+                                });
                             }
                             return out;
                         }
@@ -2295,7 +2248,7 @@ impl WeightMatrix {
                                     data.as_slice(),
                                     *rows,
                                     cols,
-                                    data.address_is_stable(),
+                                    data.map_id(),
                                 );
                                 let nrows_g = ferrox_quant::Q4_0X4_NROWS;
                                 let interleave = ferrox_quant::q4_0x4_interleave();
@@ -2387,37 +2340,30 @@ impl WeightMatrix {
                                 }
                                 let data_slice = data.as_slice();
                                 let tail = *rows - n_groups * ferrox_quant::Q4_0X4_NROWS;
-                                (0..tail)
-                                    .into_par_iter()
-                                    .with_min_len(Self::min_rows_per_task(tail))
-                                    .for_each(|i| {
-                                        let r = n_groups * ferrox_quant::Q4_0X4_NROWS + i;
-                                        let row = &data_slice[r * row_bytes..(r + 1) * row_bytes];
-                                        for (b, act) in acts.iter().enumerate() {
-                                            unsafe {
-                                                out_w.set(
-                                                    b * rows + r,
-                                                    ferrox_quant::dot_q4_0_q8(row, act),
-                                                );
-                                            }
+                                crate::par::indices(tail, Self::min_rows_per_task(tail), |i| {
+                                    let r = n_groups * ferrox_quant::Q4_0X4_NROWS + i;
+                                    let row = &data_slice[r * row_bytes..(r + 1) * row_bytes];
+                                    for (b, act) in acts.iter().enumerate() {
+                                        unsafe {
+                                            out_w.set(
+                                                b * rows + r,
+                                                ferrox_quant::dot_q4_0_q8(row, act),
+                                            );
                                         }
-                                    });
+                                    }
+                                });
                             } else {
-                                (0..*rows)
-                                    .into_par_iter()
-                                    .with_min_len(Self::min_rows_per_task(*rows))
-                                    .for_each(|r| {
-                                        let row =
-                                            &data.as_slice()[r * row_bytes..(r + 1) * row_bytes];
-                                        for (b, act) in acts.iter().enumerate() {
-                                            unsafe {
-                                                out_w.set(
-                                                    b * rows + r,
-                                                    ferrox_quant::dot_q4_0_q8(row, act),
-                                                );
-                                            }
+                                crate::par::indices(*rows, Self::min_rows_per_task(*rows), |r| {
+                                    let row = &data.as_slice()[r * row_bytes..(r + 1) * row_bytes];
+                                    for (b, act) in acts.iter().enumerate() {
+                                        unsafe {
+                                            out_w.set(
+                                                b * rows + r,
+                                                ferrox_quant::dot_q4_0_q8(row, act),
+                                            );
                                         }
-                                    });
+                                    }
+                                });
                             }
                             return out;
                         }
@@ -2428,12 +2374,8 @@ impl WeightMatrix {
                             let n_groups = *rows / ferrox_quant::Q4_KX8_NROWS;
                             if n_groups > 0 {
                                 let interleave = ferrox_quant::q4_kx8_interleave();
-                                let packed = get_or_repack_q4k(
-                                    data.as_slice(),
-                                    *rows,
-                                    cols,
-                                    data.address_is_stable(),
-                                );
+                                let packed =
+                                    get_or_repack_q4k(data.as_slice(), *rows, cols, data.map_id());
                                 let nc = ferrox_quant::Q4_KX8_GEMM_NC;
                                 // On the i8mm path, interleave each quad of
                                 // activations once per matmul (llama.cpp
@@ -2504,37 +2446,30 @@ impl WeightMatrix {
                                 );
                                 let data_slice = data.as_slice();
                                 let tail = *rows - n_groups * ferrox_quant::Q4_KX8_NROWS;
-                                (0..tail)
-                                    .into_par_iter()
-                                    .with_min_len(Self::min_rows_per_task(tail))
-                                    .for_each(|i| {
-                                        let r = n_groups * ferrox_quant::Q4_KX8_NROWS + i;
-                                        let row = &data_slice[r * row_bytes..(r + 1) * row_bytes];
-                                        for (b, act) in acts.iter().enumerate() {
-                                            unsafe {
-                                                out_w.set(
-                                                    b * rows + r,
-                                                    ferrox_quant::dot_q4_k_q8(row, act),
-                                                );
-                                            }
+                                crate::par::indices(tail, Self::min_rows_per_task(tail), |i| {
+                                    let r = n_groups * ferrox_quant::Q4_KX8_NROWS + i;
+                                    let row = &data_slice[r * row_bytes..(r + 1) * row_bytes];
+                                    for (b, act) in acts.iter().enumerate() {
+                                        unsafe {
+                                            out_w.set(
+                                                b * rows + r,
+                                                ferrox_quant::dot_q4_k_q8(row, act),
+                                            );
                                         }
-                                    });
+                                    }
+                                });
                             } else {
-                                (0..*rows)
-                                    .into_par_iter()
-                                    .with_min_len(Self::min_rows_per_task(*rows))
-                                    .for_each(|r| {
-                                        let row =
-                                            &data.as_slice()[r * row_bytes..(r + 1) * row_bytes];
-                                        for (b, act) in acts.iter().enumerate() {
-                                            unsafe {
-                                                out_w.set(
-                                                    b * rows + r,
-                                                    ferrox_quant::dot_q4_k_q8(row, act),
-                                                );
-                                            }
+                                crate::par::indices(*rows, Self::min_rows_per_task(*rows), |r| {
+                                    let row = &data.as_slice()[r * row_bytes..(r + 1) * row_bytes];
+                                    for (b, act) in acts.iter().enumerate() {
+                                        unsafe {
+                                            out_w.set(
+                                                b * rows + r,
+                                                ferrox_quant::dot_q4_k_q8(row, act),
+                                            );
                                         }
-                                    });
+                                    }
+                                });
                             }
                             return out;
                         }
@@ -2551,12 +2486,8 @@ impl WeightMatrix {
                             };
                             if n_groups > 0 {
                                 let interleave = ferrox_quant::q5_kx8_interleave();
-                                let packed = get_or_repack_q5k(
-                                    data.as_slice(),
-                                    *rows,
-                                    cols,
-                                    data.address_is_stable(),
-                                );
+                                let packed =
+                                    get_or_repack_q5k(data.as_slice(), *rows, cols, data.map_id());
                                 let nc = ferrox_quant::Q5_KX8_GEMM_NC;
                                 // On the i8mm path, interleave each quad of
                                 // activations once per matmul; the kernel
@@ -2623,44 +2554,34 @@ impl WeightMatrix {
                                 );
                                 let data_slice = data.as_slice();
                                 let tail = *rows - n_groups * ferrox_quant::Q5_KX8_NROWS;
-                                (0..tail)
-                                    .into_par_iter()
-                                    .with_min_len(Self::min_rows_per_task(tail))
-                                    .for_each(|i| {
-                                        let r = n_groups * ferrox_quant::Q5_KX8_NROWS + i;
-                                        let row = &data_slice[r * row_bytes..(r + 1) * row_bytes];
-                                        for (b, act) in acts.iter().enumerate() {
-                                            unsafe {
-                                                out_w.set(
-                                                    b * rows + r,
-                                                    ferrox_quant::dot_q5_k_q8(row, act),
-                                                );
-                                            }
+                                crate::par::indices(tail, Self::min_rows_per_task(tail), |i| {
+                                    let r = n_groups * ferrox_quant::Q5_KX8_NROWS + i;
+                                    let row = &data_slice[r * row_bytes..(r + 1) * row_bytes];
+                                    for (b, act) in acts.iter().enumerate() {
+                                        unsafe {
+                                            out_w.set(
+                                                b * rows + r,
+                                                ferrox_quant::dot_q5_k_q8(row, act),
+                                            );
                                         }
-                                    });
+                                    }
+                                });
                             } else {
                                 let data_slice = data.as_slice();
-                                (0..*rows)
-                                    .into_par_iter()
-                                    .with_min_len(Self::min_rows_per_task(*rows))
-                                    .for_each(|r| {
-                                        let row = &data_slice[r * row_bytes..(r + 1) * row_bytes];
-                                        let nc = ferrox_quant::Q5_K_GEMM_NC;
-                                        for (t, chunk) in acts.chunks(nc).enumerate() {
-                                            let n = chunk.len();
-                                            let mut tmp = [0f32; ferrox_quant::Q5_K_GEMM_NC];
-                                            ferrox_quant::gemm_q5_k_q8_row(
-                                                row,
-                                                chunk,
-                                                &mut tmp[..n],
-                                            );
-                                            for (j, v) in tmp[..n].iter().enumerate() {
-                                                unsafe {
-                                                    out_w.set((t * nc + j) * rows + r, *v);
-                                                }
+                                crate::par::indices(*rows, Self::min_rows_per_task(*rows), |r| {
+                                    let row = &data_slice[r * row_bytes..(r + 1) * row_bytes];
+                                    let nc = ferrox_quant::Q5_K_GEMM_NC;
+                                    for (t, chunk) in acts.chunks(nc).enumerate() {
+                                        let n = chunk.len();
+                                        let mut tmp = [0f32; ferrox_quant::Q5_K_GEMM_NC];
+                                        ferrox_quant::gemm_q5_k_q8_row(row, chunk, &mut tmp[..n]);
+                                        for (j, v) in tmp[..n].iter().enumerate() {
+                                            unsafe {
+                                                out_w.set((t * nc + j) * rows + r, *v);
                                             }
                                         }
-                                    });
+                                    }
+                                });
                             }
                             return out;
                         }
@@ -2680,12 +2601,8 @@ impl WeightMatrix {
                                 0
                             };
                             if n_groups > 0 {
-                                let packed = get_or_repack_q6k(
-                                    data.as_slice(),
-                                    *rows,
-                                    cols,
-                                    data.address_is_stable(),
-                                );
+                                let packed =
+                                    get_or_repack_q6k(data.as_slice(), *rows, cols, data.map_id());
                                 // Quads of 4 (the i8mm tile shape), not
                                 // [`Q6_KX8_GEMM_NC`].
                                 let nc = ferrox_quant::Q8K_ACTS_X4_NC;
@@ -2741,44 +2658,34 @@ impl WeightMatrix {
                                 );
                                 let data_slice = data.as_slice();
                                 let tail = *rows - n_groups * ferrox_quant::Q6_KX8_NROWS;
-                                (0..tail)
-                                    .into_par_iter()
-                                    .with_min_len(Self::min_rows_per_task(tail))
-                                    .for_each(|i| {
-                                        let r = n_groups * ferrox_quant::Q6_KX8_NROWS + i;
-                                        let row = &data_slice[r * row_bytes..(r + 1) * row_bytes];
-                                        for (b, act) in acts.iter().enumerate() {
-                                            unsafe {
-                                                out_w.set(
-                                                    b * rows + r,
-                                                    ferrox_quant::dot_q6_k_q8(row, act),
-                                                );
-                                            }
+                                crate::par::indices(tail, Self::min_rows_per_task(tail), |i| {
+                                    let r = n_groups * ferrox_quant::Q6_KX8_NROWS + i;
+                                    let row = &data_slice[r * row_bytes..(r + 1) * row_bytes];
+                                    for (b, act) in acts.iter().enumerate() {
+                                        unsafe {
+                                            out_w.set(
+                                                b * rows + r,
+                                                ferrox_quant::dot_q6_k_q8(row, act),
+                                            );
                                         }
-                                    });
+                                    }
+                                });
                             } else {
                                 let data_slice = data.as_slice();
-                                (0..*rows)
-                                    .into_par_iter()
-                                    .with_min_len(Self::min_rows_per_task(*rows))
-                                    .for_each(|r| {
-                                        let row = &data_slice[r * row_bytes..(r + 1) * row_bytes];
-                                        let nc = ferrox_quant::Q6_K_GEMM_NC;
-                                        for (t, chunk) in acts.chunks(nc).enumerate() {
-                                            let mut tmp = [0f32; ferrox_quant::Q6_K_GEMM_NC];
-                                            let n = chunk.len();
-                                            ferrox_quant::gemm_q6_k_q8_row(
-                                                row,
-                                                chunk,
-                                                &mut tmp[..n],
-                                            );
-                                            for (j, v) in tmp[..n].iter().enumerate() {
-                                                unsafe {
-                                                    out_w.set((t * nc + j) * rows + r, *v);
-                                                }
+                                crate::par::indices(*rows, Self::min_rows_per_task(*rows), |r| {
+                                    let row = &data_slice[r * row_bytes..(r + 1) * row_bytes];
+                                    let nc = ferrox_quant::Q6_K_GEMM_NC;
+                                    for (t, chunk) in acts.chunks(nc).enumerate() {
+                                        let mut tmp = [0f32; ferrox_quant::Q6_K_GEMM_NC];
+                                        let n = chunk.len();
+                                        ferrox_quant::gemm_q6_k_q8_row(row, chunk, &mut tmp[..n]);
+                                        for (j, v) in tmp[..n].iter().enumerate() {
+                                            unsafe {
+                                                out_w.set((t * nc + j) * rows + r, *v);
                                             }
                                         }
-                                    });
+                                    }
+                                });
                             }
                             return out;
                         }
@@ -2787,18 +2694,15 @@ impl WeightMatrix {
                     }
                 }
 
-                (0..*rows)
-                    .into_par_iter()
-                    .with_min_len(Self::min_rows_per_task(*rows))
-                    .for_each(|r| {
-                        let row = &data.as_slice()[r * row_bytes..(r + 1) * row_bytes];
-                        for b in 0..batch_size {
-                            let x = &x_batch[b * cols..(b + 1) * cols];
-                            unsafe {
-                                out_w.set(b * rows + r, Self::dot(*kind, row, x));
-                            }
+                crate::par::indices(*rows, Self::min_rows_per_task(*rows), |r| {
+                    let row = &data.as_slice()[r * row_bytes..(r + 1) * row_bytes];
+                    for b in 0..batch_size {
+                        let x = &x_batch[b * cols..(b + 1) * cols];
+                        unsafe {
+                            out_w.set(b * rows + r, Self::dot(*kind, row, x));
                         }
-                    });
+                    }
+                });
                 out
             }
             WeightMatrix::Mxfp4 {
@@ -2811,24 +2715,16 @@ impl WeightMatrix {
                 let scale_row_bytes = cols / ferrox_quant::MXFP4_GROUP_SIZE;
                 let mut out = vec![0f32; batch_size * rows];
                 let out_w = BatchOut(out.as_mut_ptr());
-                (0..*rows)
-                    .into_par_iter()
-                    .with_min_len(Self::min_rows_per_task(*rows))
-                    .for_each(|r| {
-                        let prow =
-                            &packed.as_slice()[r * packed_row_bytes..(r + 1) * packed_row_bytes];
-                        let srow =
-                            &scale.as_slice()[r * scale_row_bytes..(r + 1) * scale_row_bytes];
-                        for b in 0..batch_size {
-                            let x = &x_batch[b * cols..(b + 1) * cols];
-                            unsafe {
-                                out_w.set(
-                                    b * rows + r,
-                                    ferrox_quant::dot_mxfp4_row_f32(prow, srow, x),
-                                );
-                            }
+                crate::par::indices(*rows, Self::min_rows_per_task(*rows), |r| {
+                    let prow = &packed.as_slice()[r * packed_row_bytes..(r + 1) * packed_row_bytes];
+                    let srow = &scale.as_slice()[r * scale_row_bytes..(r + 1) * scale_row_bytes];
+                    for b in 0..batch_size {
+                        let x = &x_batch[b * cols..(b + 1) * cols];
+                        unsafe {
+                            out_w.set(b * rows + r, ferrox_quant::dot_mxfp4_row_f32(prow, srow, x));
                         }
-                    });
+                    }
+                });
                 out
             }
         }
@@ -2857,7 +2753,7 @@ impl WeightMatrix {
     /// upload (`ferrox_metal::gpu` weight cache); activations still
     /// upload per call. When both `cuda` and `metal` are enabled, CUDA
     /// is tried first and Metal is the fallback.
-    #[cfg(any(feature = "cuda", feature = "metal"))]
+    #[cfg(any(feature = "cuda", feature = "metal", feature = "vulkan"))]
     pub fn apply_gpu(&self, x: &[f32]) -> Option<Vec<f32>> {
         assert_eq!(
             x.len(),
@@ -2893,58 +2789,34 @@ impl WeightMatrix {
         };
         let row_bytes = self.block_bytes_per_row(*kind, *cols);
 
-        #[cfg(feature = "cuda")]
-        {
-            let launch: Option<CudaMatvecLaunchFn> = match kind {
-                QuantKind::Q8_0 => Some(ferrox_cuda::gpu::launch_q8_0_matvec),
-                QuantKind::Q4_0 => Some(ferrox_cuda::gpu::launch_q4_0_matvec),
-                QuantKind::Q4K => Some(ferrox_cuda::gpu::launch_q4_k_matvec),
-                QuantKind::Q5K => Some(ferrox_cuda::gpu::launch_q5_k_matvec),
-                QuantKind::Q6K => Some(ferrox_cuda::gpu::launch_q6_k_matvec),
-                _ => None,
-            };
-            if let Some(launch) = launch {
-                let n_blocks_per_row = row_bytes / Self::block_bytes_for_kind(*kind);
-                match launch(data.as_slice(), x, *rows, row_bytes, n_blocks_per_row) {
-                    Ok(out) => return Some(out),
-                    Err(e) => {
-                        eprintln!(
-                            "ferrox: CUDA matvec dispatch failed, trying next backend / CPU: {e}"
-                        );
+        // One body per backend, expanded over the one ordered list, in
+        // place of the two hand-kept `match kind` tables this used to
+        // hold -- which differed in arity, in error type, and (silently)
+        // by one entry. A third backend adds no code here.
+        #[allow(unused_macros)]
+        macro_rules! try_matvec {
+            ($b:ty) => {
+                if let Some(result) = <$b as BackendDispatch>::launch_matvec(
+                    *kind,
+                    data.as_slice(),
+                    x,
+                    *rows,
+                    row_bytes,
+                ) {
+                    match result {
+                        Ok(out) => return Some(out),
+                        Err(e) => {
+                            eprintln!(
+                                "ferrox: {} matvec dispatch failed, {}: {e}",
+                                <$b as BackendCaps>::NAME,
+                                <$b as BackendDispatch>::MATVEC_FALLBACK
+                            );
+                        }
                     }
                 }
-            }
-        }
-
-        #[cfg(feature = "metal")]
-        {
-            let launch: Option<MetalMatvecLaunchFn> = match kind {
-                QuantKind::Q8_0 => Some(ferrox_metal::gpu::launch_q8_0_matvec),
-                QuantKind::Q4_0 => Some(ferrox_metal::gpu::launch_q4_0_matvec),
-                QuantKind::Q4K => Some(ferrox_metal::gpu::launch_q4_k_matvec),
-                QuantKind::Q5K => Some(ferrox_metal::gpu::launch_q5_k_matvec),
-                QuantKind::Q6K => Some(ferrox_metal::gpu::launch_q6_k_matvec),
-                QuantKind::IQ4XS => Some(ferrox_metal::gpu::launch_iq4_xs_matvec),
-                _ => None,
             };
-            // This table and `metal_matvec_kind_name` answer the same
-            // question and must never diverge; when they did, IQ4_XS
-            // prefill silently moved to the CPU.
-            debug_assert_eq!(
-                launch.is_some(),
-                metal_matvec_kind_name(*kind).is_some(),
-                "apply_gpu's Metal launch table disagrees with metal_matvec_kind_name for {:?}",
-                kind
-            );
-            if let Some(launch) = launch {
-                match launch(data.as_slice(), x, *rows, row_bytes) {
-                    Ok(out) => return Some(out),
-                    Err(e) => {
-                        eprintln!("ferrox: Metal matvec dispatch failed, falling back to CPU: {e}");
-                    }
-                }
-            }
         }
+        with_gpu_backends!(try_matvec);
 
         // Reached only on a miss or a launch error, i.e. only when the
         // caller is about to run the whole matvec on the host anyway --
@@ -2997,34 +2869,16 @@ impl WeightMatrix {
                 else {
                     return None;
                 };
-                let (kernel_src, module_name, fn_name) = match kind {
-                    QuantKind::Q8_0 => (
-                        ferrox_cuda::gpu::Q8_0_MATVEC_KERNEL_SRC,
-                        "ferrox_q8_0",
-                        "q8_0_matvec",
-                    ),
-                    QuantKind::Q4_0 => (
-                        ferrox_cuda::gpu::Q4_0_MATVEC_KERNEL_SRC,
-                        "ferrox_q4_0",
-                        "q4_0_matvec",
-                    ),
-                    QuantKind::Q4K => (
-                        ferrox_cuda::gpu::Q4_K_MATVEC_KERNEL_SRC,
-                        "ferrox_q4_k",
-                        "q4_k_matvec",
-                    ),
-                    QuantKind::Q5K => (
-                        ferrox_cuda::gpu::Q5_K_MATVEC_KERNEL_SRC,
-                        "ferrox_q5_k",
-                        "q5_k_matvec",
-                    ),
-                    QuantKind::Q6K => (
-                        ferrox_cuda::gpu::Q6_K_MATVEC_KERNEL_SRC,
-                        "ferrox_q6_k",
-                        "q6_k_matvec",
-                    ),
-                    _ => return None,
-                };
+                // One table, in `ferrox-cuda`, exactly as the Metal arm
+                // below asks `matvec_launch_meta`. This match was
+                // written out here and again in
+                // `apply_gpu_dense_ffn_swiglu`, three copies of one
+                // five-row list with nothing holding them together --
+                // and a kind added to the capability table but not to a
+                // copy loses its fused launch silently, which is the
+                // failure this file has paid for twice.
+                let (kernel_src, module_name, fn_name) =
+                    ferrox_cuda::gpu::matvec_launch_meta(kind.name())?;
                 let row_bytes = m.block_bytes_per_row(*kind, *cols);
                 let n_blocks_per_row = row_bytes / Self::block_bytes_for_kind(*kind);
                 launches.push(ferrox_cuda::gpu::MatvecLaunch {
@@ -3125,34 +2979,10 @@ impl WeightMatrix {
                     else {
                         return None;
                     };
-                    let (kernel_src, module_name, fn_name) = match kind {
-                        QuantKind::Q8_0 => (
-                            ferrox_cuda::gpu::Q8_0_MATVEC_KERNEL_SRC,
-                            "ferrox_q8_0",
-                            "q8_0_matvec",
-                        ),
-                        QuantKind::Q4_0 => (
-                            ferrox_cuda::gpu::Q4_0_MATVEC_KERNEL_SRC,
-                            "ferrox_q4_0",
-                            "q4_0_matvec",
-                        ),
-                        QuantKind::Q4K => (
-                            ferrox_cuda::gpu::Q4_K_MATVEC_KERNEL_SRC,
-                            "ferrox_q4_k",
-                            "q4_k_matvec",
-                        ),
-                        QuantKind::Q5K => (
-                            ferrox_cuda::gpu::Q5_K_MATVEC_KERNEL_SRC,
-                            "ferrox_q5_k",
-                            "q5_k_matvec",
-                        ),
-                        QuantKind::Q6K => (
-                            ferrox_cuda::gpu::Q6_K_MATVEC_KERNEL_SRC,
-                            "ferrox_q6_k",
-                            "q6_k_matvec",
-                        ),
-                        _ => return None,
-                    };
+                    // The second of the two copies this used to hold.
+                    // See the note in `apply_gpu_multi`.
+                    let (kernel_src, module_name, fn_name) =
+                        ferrox_cuda::gpu::matvec_launch_meta(kind.name())?;
                     let row_bytes = m.block_bytes_per_row(*kind, *cols);
                     let n_blocks_per_row = row_bytes / WeightMatrix::block_bytes_for_kind(*kind);
                     Some(ferrox_cuda::gpu::MatvecLaunch {
@@ -3523,21 +3353,41 @@ impl WeightMatrix {
         // Whether the accelerator, if one is selected, can run this
         // matrix at all -- and if so, whether prefill gets a real GEMM
         // or `batch` matvecs over the same weights.
-        let (matvec, gemm) = match backend {
-            Backend::Metal => (
-                kind.is_some_and(|k| metal_matvec_kind_name(k).is_some()),
-                kind.is_some_and(metal_mul_mm_kind_supported),
-            ),
-            // CUDA now has a batched GEMM for a SUBSET of the kinds
-            // that have matvecs (Q8_0 and Q4_0). Everything else still
-            // decomposes a batched prefill into per-position matvecs,
-            // which is why these two predicates are different sets and
-            // not one.
-            Backend::Cuda => (
-                kind.is_some_and(cuda_matvec_kind_supported),
-                kind.is_some_and(cuda_mul_mm_kind_supported),
-            ),
-            Backend::Cpu => (false, false),
+        //
+        // Read off `BackendCaps` over the ungated backend table rather
+        // than from a `match backend` written out here. The two are
+        // NOT interchangeable: the hand-written match had a `Backend::
+        // Cpu => (false, false)` arm and no `_`, so it was exhaustive
+        // by luck -- a third variant broke it, which is the good case.
+        // A fourth backend added while a `_` arm existed would have
+        // silently reported "no kernels" for a backend that had them.
+        //
+        // Ungated on purpose: a CPU-only build must be able to ask what
+        // CUDA would resolve, which is what every kernel-coverage test
+        // below does. `BackendDispatch` is unavailable here for exactly
+        // that reason.
+        //
+        // The predicate sets are per backend and genuinely different:
+        // CUDA has a batched GEMM for a SUBSET of the kinds it has
+        // matvecs for (Q8_0, Q4_0) and decomposes the rest into
+        // per-position matvecs; Vulkan has one matvec and no GEMM at
+        // all. `GEMM_FALLBACK` is what each of those decompositions is
+        // actually called.
+        let (matvec, gemm, gemm_fallback) = {
+            let mut found = (false, false, "");
+            macro_rules! caps_of {
+                ($b:ty) => {
+                    if backend == <$b as BackendCaps>::ID {
+                        found = (
+                            kind.is_some_and(|k| <$b as BackendCaps>::matvec_kernel(k).is_some()),
+                            kind.is_some_and(<$b as BackendCaps>::gemm_supported),
+                            <$b as BackendCaps>::GEMM_FALLBACK,
+                        );
+                    }
+                };
+            }
+            with_gpu_backend_caps!(caps_of);
+            found
         };
 
         if backend.is_accelerator() {
@@ -3558,16 +3408,19 @@ impl WeightMatrix {
             reg.record_build_at(
                 loc,
                 look(op::GEMM_PREFILL),
-                match (gemm, backend, matvec, kind) {
+                match (gemm, matvec, kind) {
                     (true, ..) => Outcome::Hit,
-                    // Still on the GPU, but re-reading the whole weight
-                    // matrix once per position. This is the 13.7x shape.
-                    (false, Backend::Cuda, true, _) => {
-                        Outcome::slow_path("CUDA per-position matvec")
-                    }
-                    (false, _, true, _) => Outcome::slow_path("Metal N x matvec batch"),
-                    (false, _, false, Some(_)) => Outcome::slow_path("CPU apply_batch"),
-                    (false, _, false, None) => Outcome::by_design("CPU f32 GEMM"),
+                    // A matvec but no GEMM. What that costs is per
+                    // backend -- Metal re-reads the whole weight matrix
+                    // once per position but stays on the GPU (the 13.7x
+                    // shape), CUDA does the same through a different
+                    // entry point, and Vulkan has no batch path at all
+                    // so the prefill lands on the host -- so the name
+                    // comes from the backend instead of from an arm
+                    // here that a new variant would fall through.
+                    (false, true, _) => Outcome::slow_path(gemm_fallback),
+                    (false, false, Some(_)) => Outcome::slow_path("CPU apply_batch"),
+                    (false, false, None) => Outcome::by_design("CPU f32 GEMM"),
                 },
             );
         }
@@ -3599,23 +3452,59 @@ impl WeightMatrix {
     }
 
     /// The block size (in bytes) for exactly the quant kinds
-    /// `apply_gpu` dispatches to a real kernel for -- a small,
-    /// deliberately partial mirror of `block_bytes_per_row`'s per-kind
-    /// match (only these five formats have a real GPU kernel today).
-    #[cfg(feature = "cuda")]
-    fn block_bytes_for_kind(kind: QuantKind) -> usize {
+    /// `apply_gpu` dispatches to a real CUDA or Vulkan kernel for -- a
+    /// small, deliberately partial mirror of `block_bytes_per_row`'s
+    /// per-kind match.
+    ///
+    /// Partial means this `unreachable!()` is reachable by a mistake:
+    /// widening `Cuda::matvec_kernel` without adding the row here
+    /// turns a decode into a panic in a rayon worker rather than a
+    /// fallback. `every_cuda_or_vulkan_matvec_kind_has_a_block_size`
+    /// calls it for every claimed kind so that lands as a red test
+    /// instead.
+    #[cfg(any(feature = "cuda", feature = "vulkan"))]
+    pub(crate) fn block_bytes_for_kind(kind: QuantKind) -> usize {
         match kind {
             QuantKind::Q8_0 => ferrox_quant::Q8_0_BLOCK_BYTES,
             QuantKind::Q4_0 => ferrox_quant::Q4_0_BLOCK_BYTES,
+            QuantKind::Q5_0 => ferrox_quant::Q5_0_BLOCK_BYTES,
             QuantKind::Q4K => ferrox_quant::Q4_K_BLOCK_BYTES,
             QuantKind::Q5K => ferrox_quant::Q5_K_BLOCK_BYTES,
             QuantKind::Q6K => ferrox_quant::Q6_K_BLOCK_BYTES,
-            _ => unreachable!("apply_gpu only calls this for the five GPU-dispatchable kinds"),
+            _ => unreachable!(
+                "apply_gpu only calls this for the CUDA/Vulkan-dispatchable kinds, not {kind:?}"
+            ),
         }
     }
 }
 #[cfg(test)]
 mod tests {
+
+    /// Issue #27 asks for `MIN_TASK_MACS` to be deleted rather than
+    /// retuned. It is deleted from the persistent-pool path and kept on
+    /// the rayon path, which is only an honest answer if the pool path
+    /// genuinely cannot consult it -- so assert the gate, both ways,
+    /// without needing a process whose env var says `spin`.
+    ///
+    /// Sabotage: make `row_work_for` return `per_row` for both arms and
+    /// this goes red, because the MACs floor is then live on a path
+    /// whose whole premise is that scheduling is no longer expensive.
+    #[test]
+    fn the_persistent_pool_path_never_publishes_a_macs_floor() {
+        use crate::par::Backend;
+        for per_row in [0usize, 1, 576, 4096, 1 << 20] {
+            assert_eq!(
+                WeightMatrix::row_work_for(Backend::Rayon, per_row),
+                per_row,
+                "the rayon arm keeps the measured mitigation"
+            );
+            assert_eq!(
+                WeightMatrix::row_work_for(Backend::Spin, per_row),
+                0,
+                "the persistent pool must reach `min_rows_per_task`'s                  early return, where MIN_TASK_MACS is not read"
+            );
+        }
+    }
 
     /// The four dtypes the drifted copies were missing.
     ///
@@ -3682,6 +3571,54 @@ mod tests {
         }
     }
 
+    /// The CUDA matvec capability table and the launch-meta table must
+    /// name the same set, for every kind.
+    ///
+    /// `Cuda::matvec_kernel` is compiled unconditionally and
+    /// `ferrox_cuda::gpu::matvec_launch_meta` only under `cuda`, so the
+    /// set is written out twice and this is the only thing making the
+    /// two agree. Over-claiming here sends a decode to an NVRTC module
+    /// that does not exist; under-claiming leaves a kernel nothing ever
+    /// calls. The GEMM half has had this check since 2026-09-04; the
+    /// matvec half did not, and `apply_gpu_multi` carried its own third
+    /// copy of the table until Q5_0 landed.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn the_cuda_matvec_kinds_match_the_launch_meta_table() {
+        for &kind in QuantKind::ALL {
+            assert_eq!(
+                cuda_matvec_kind_supported(kind),
+                ferrox_cuda::gpu::matvec_launch_meta(kind.name()).is_some(),
+                "{kind:?}: the capability table and the launch-meta table disagree"
+            );
+        }
+    }
+
+    /// `block_bytes_for_kind` is deliberately partial, so every kind
+    /// CUDA or Vulkan claims a matvec for has to be one of its arms.
+    ///
+    /// Calling it IS the assertion: the arm it lacks is an
+    /// `unreachable!()`, and reaching that in a rayon worker is a panic
+    /// rather than the fallback the seam promises. `Metal` is
+    /// deliberately not checked -- it claims IQ4_XS, asks
+    /// `ferrox_metal::gpu::matvec_launch_meta` for its block size, and
+    /// never touches this function.
+    #[cfg(any(feature = "cuda", feature = "vulkan"))]
+    #[test]
+    fn every_cuda_or_vulkan_matvec_kind_has_a_block_size() {
+        use super::gpu_backend::{BackendCaps, Cuda, Vulkan};
+        for &kind in QuantKind::ALL {
+            if Cuda::matvec_kernel(kind).is_none() && Vulkan::matvec_kernel(kind).is_none() {
+                continue;
+            }
+            let block_bytes = WeightMatrix::block_bytes_for_kind(kind);
+            assert!(
+                block_bytes > 0,
+                "{kind:?}: a claimed matvec kind needs a real block size"
+            );
+        }
+    }
+
     /// F32 and F16 are not quantized, so `None` is the right answer and
     /// not a gap: the loader builds a plain `WeightMatrix::F32` for
     /// them rather than reporting an unsupported dtype.
@@ -3691,6 +3628,54 @@ mod tests {
         assert_eq!(quant_kind_for(GgmlType::F16), None);
     }
     use super::*;
+
+    /// Forces [`cpu_int_dot_enabled`] for the lifetime of the guard, so a
+    /// test can drive the quantized-activation batch kernels (the
+    /// interleaved `block_q*_Kx8` / `block_q*_0x4` repack tier and the
+    /// NEON i8mm GEMMs behind it) that every shipped binary turns on via
+    /// `default_cpu_int_dot_on` but `cargo test` otherwise leaves off.
+    ///
+    /// The override is process-global, so the guard serializes on a
+    /// mutex: two tests forcing opposite values concurrently would
+    /// otherwise see each other's setting.
+    struct ForceIntDot {
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl ForceIntDot {
+        fn new(on: bool) -> Self {
+            static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+            let lock = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            INT_DOT_TEST_OVERRIDE.store(i8::from(on), std::sync::atomic::Ordering::Release);
+            Self { _lock: lock }
+        }
+    }
+
+    impl Drop for ForceIntDot {
+        fn drop(&mut self) {
+            INT_DOT_TEST_OVERRIDE.store(-1, std::sync::atomic::Ordering::Release);
+        }
+    }
+
+    /// The guard has to actually move the getter, in both directions --
+    /// otherwise every test built on it silently exercises one path
+    /// twice, which is exactly the hole it exists to close.
+    #[test]
+    fn force_int_dot_moves_the_getter_and_restores_it() {
+        {
+            let _g = ForceIntDot::new(true);
+            assert!(cpu_int_dot_enabled(), "forcing on must enable int dot");
+        }
+        {
+            let _g = ForceIntDot::new(false);
+            assert!(!cpu_int_dot_enabled(), "forcing off must disable int dot");
+        }
+        assert_eq!(
+            INT_DOT_TEST_OVERRIDE.load(std::sync::atomic::Ordering::Acquire),
+            -1,
+            "the guard must clear the override on drop"
+        );
+    }
 
     /// `dequant_row` must reproduce exactly the values a full-buffer
     /// dequantization of the same row produces, for every storage
@@ -4080,7 +4065,7 @@ mod tests {
             let x = &x_batch[b * cols..(b + 1) * cols];
             let sequential = matrix.apply(x);
             let from_batch = &batched[b * rows..(b + 1) * rows];
-            assert_batch_row_matches(QuantKind::Q8_0, b, &sequential, from_batch);
+            assert_batch_row_matches(QuantKind::Q8_0, "", b, &sequential, from_batch);
         }
     }
 
@@ -4110,7 +4095,13 @@ mod tests {
     /// build: `apply_batch` dispatches to Metal while `apply` stays on
     /// the CPU, so this compares two backends. The bound stays tight on
     /// CPU, where both sides are the same code and must agree closely.
-    fn assert_batch_row_matches(kind: QuantKind, b: usize, sequential: &[f32], from_batch: &[f32]) {
+    fn assert_batch_row_matches(
+        kind: QuantKind,
+        ctx: &str,
+        b: usize,
+        sequential: &[f32],
+        from_batch: &[f32],
+    ) {
         let scale = sequential
             .iter()
             .fold(0.0f32, |a, v| a.max(v.abs()))
@@ -4126,7 +4117,7 @@ mod tests {
             let err = (s - got).abs() / scale;
             assert!(
                 err < bound,
-                "{kind:?} batch {b} row {r}: apply()={s} apply_batch={got} \
+                "{kind:?} {ctx} batch {b} row {r}: apply()={s} apply_batch={got} \
                  (err {err:e} of row scale {scale}, bound {bound:e})"
             );
         }
@@ -4181,35 +4172,360 @@ mod tests {
         }
     }
 
+    // -----------------------------------------------------------------
+    // Repack cache identity (see `MapId`)
+    //
+    // The bug these cover: the caches used to key on `(address, rows)`
+    // and gate on an `address_is_stable() -> bool`. Drop one mmap, make
+    // another, and the kernel hands the same address back, so the cache
+    // served the previous matrix's interleaved bytes -- an out-of-range
+    // panic when the shapes differed, silent wrong output when they
+    // matched.
+    //
+    // Address reuse is the OS's decision and cannot be demanded from a
+    // test, so these do not wait for it. They fabricate exactly what the
+    // cache would SEE in that moment -- a key that collides while the
+    // mapping behind it is gone, or while the width differs -- and
+    // assert the cache refuses to serve it.
+    // -----------------------------------------------------------------
+
+    /// Writes `bytes` to a temp file and maps it. The caller holds the
+    /// `Arc`, so when the mapping dies is explicit, which is the whole
+    /// subject of these tests.
+    fn mapped(tag: &str, bytes: &[u8]) -> (Arc<memmap2::Mmap>, WeightBytes) {
+        let path = std::env::temp_dir().join(format!(
+            "ferrox_repack_{tag}_{}_{:?}.bin",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::write(&path, bytes).expect("write fixture");
+        let file = std::fs::File::open(&path).expect("open fixture");
+        // SAFETY: the file was written and closed above, is named for
+        // this process and thread, and nothing mutates it while mapped.
+        let mmap = Arc::new(unsafe { memmap2::Mmap::map(&file).expect("map fixture") });
+        let _ = std::fs::remove_file(&path);
+        let view = WeightBytes::Mapped {
+            mmap: Arc::clone(&mmap),
+            range: 0..bytes.len(),
+        };
+        (mmap, view)
+    }
+
+    /// Q8_0 bytes with finite scales, `rows * cols/32` blocks.
+    fn q8_0_matrix_bytes(rows: usize, cols: usize, seed: u32) -> Vec<u8> {
+        let mut state = seed | 1;
+        let mut next = move || {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (state >> 24) as u8
+        };
+        let mut data = Vec::with_capacity(rows * (cols / 32) * 34);
+        for _ in 0..rows * (cols / 32) {
+            data.extend_from_slice(&f16_le(0.02 + f32::from(next()) * 0.0004));
+            for _ in 0..32 {
+                data.push(next());
+            }
+        }
+        data
+    }
+
+    /// A `MapId` is only an identity while its mapping is alive. This is
+    /// the check the old boolean could not express, and it is the one
+    /// thing standing between the cache and an ABA.
+    #[test]
+    fn map_id_stops_matching_once_its_mapping_is_dropped() {
+        let (mmap, view) = mapped("live", &q8_0_matrix_bytes(4, 32, 7));
+        let id = view.map_id().expect("Mapped bytes must have an identity");
+        let held = id.clone();
+        assert!(
+            held.matches(&id),
+            "a live mapping must match its own identity"
+        );
+
+        // Everything that could witness the mapping is gone: this is
+        // precisely the moment the address becomes reusable.
+        drop(view);
+        drop(mmap);
+        assert!(
+            !held.matches(&id),
+            "an identity whose mapping is dead must not match, or the \
+             cache will trust an address the kernel has already reissued"
+        );
+    }
+
+    /// A cache entry left behind by a dead mapping must be replaced, not
+    /// served. Fabricates the entry rather than waiting on the OS to
+    /// reissue an address; the entry is byte-for-byte what the old code
+    /// would have left there.
+    #[test]
+    fn stale_repack_entry_is_replaced_not_served() {
+        let (rows, cols) = (8usize, 64usize);
+        let bytes = q8_0_matrix_bytes(rows, cols, 11);
+        let (_mmap, view) = mapped("stale", &bytes);
+        let id = view.map_id().expect("Mapped bytes must have an identity");
+
+        // Some other matrix's packing, parked at the key this live
+        // matrix will look up, under an identity that can never upgrade.
+        let poison = vec![0xABu8; 16];
+        {
+            let mut cache = q8x4_repack_cache().lock().unwrap();
+            cache.insert(
+                (id.id, id.offset, rows, cols),
+                (
+                    MapId {
+                        map: std::sync::Weak::new(),
+                        id: id.id,
+                        offset: id.offset,
+                    },
+                    Arc::from(poison.clone().into_boxed_slice()),
+                ),
+            );
+        }
+
+        let got = get_or_repack_q8x4(view.as_slice(), rows, cols, Some(id.clone()));
+        let want = ferrox_quant::pack_q8_0_matrix_x4(
+            view.as_slice(),
+            rows,
+            cols,
+            ferrox_quant::q8_0x4_interleave(),
+        );
+        assert_ne!(&got[..], &poison[..], "served a dead mapping's bytes");
+        assert_eq!(&got[..], &want[..], "stale entry was not repacked");
+
+        // And the dead entry is gone rather than pinning a control block.
+        let cache = q8x4_repack_cache().lock().unwrap();
+        let (entry, _) = cache
+            .get(&(id.id, id.offset, rows, cols))
+            .expect("the live packing should now be cached");
+        assert!(
+            entry.matches(&id),
+            "the replacement entry must carry the LIVE identity"
+        );
+    }
+
+    /// Two widths at one address are two matrices. The old key was
+    /// `(address, rows)`, so a 576x576 and a 576x1536 collided and the
+    /// second was served the first's shorter buffer.
+    #[test]
+    fn repack_key_separates_two_widths_at_one_address() {
+        let rows = 8usize;
+        let narrow = q8_0_matrix_bytes(rows, 32, 3);
+        let wide = q8_0_matrix_bytes(rows, 64, 5);
+        let (_mmap, view) = mapped("widths", &narrow);
+        let id = view.map_id().expect("Mapped bytes must have an identity");
+
+        let il = ferrox_quant::q8_0x4_interleave();
+        let a = get_or_repack_q8x4(&narrow, rows, 32, Some(id.clone()));
+        let b = get_or_repack_q8x4(&wide, rows, 64, Some(id.clone()));
+        assert_eq!(
+            &a[..],
+            &ferrox_quant::pack_q8_0_matrix_x4(&narrow, rows, 32, il)[..]
+        );
+        assert_eq!(
+            &b[..],
+            &ferrox_quant::pack_q8_0_matrix_x4(&wide, rows, 64, il)[..],
+            "the wider matrix was served the narrower one's packing"
+        );
+        assert!(b.len() > a.len(), "widths must not share a cache entry");
+    }
+
+    /// Owned buffers and expert-store leases are never cacheable. The
+    /// lease is the interesting one: its allocation stays alive and keeps
+    /// its address while its CONTENTS are replaced by another expert's,
+    /// so no liveness check could rescue it.
+    #[test]
+    fn map_id_is_none_for_owned_and_shared_bytes() {
+        let owned = WeightBytes::Owned(q8_0_matrix_bytes(4, 32, 9));
+        assert!(owned.map_id().is_none(), "an owned Vec's address is reused");
+
+        let buf = Arc::new(q8_0_matrix_bytes(4, 32, 13));
+        let leased = WeightBytes::Shared {
+            buf,
+            range: 0..34 * 4,
+        };
+        assert!(
+            leased.map_id().is_none(),
+            "an expert lease keeps its address across a content swap"
+        );
+    }
+    /// One `apply_batch` vs per-row `apply` sweep, parameterized by shape
+    /// so the shape tests below differ only in the numbers they pass.
+    fn assert_apply_batch_matches_apply(
+        kind: QuantKind,
+        rows: usize,
+        cols: usize,
+        batch_size: usize,
+        seed: usize,
+    ) {
+        let x_batch: Vec<f32> = (0..batch_size * cols)
+            .map(|i| (((i * 31 + seed) % 97) as f32) * 0.021 - 1.0)
+            .collect();
+        let matrix = synth_quant_matrix(kind, rows, cols);
+        let batched = matrix.apply_batch(&x_batch, batch_size);
+        assert_eq!(batched.len(), batch_size * rows);
+        let ctx = format!(
+            "rows {rows} cols {cols} batch_size {batch_size} int_dot {}",
+            cpu_int_dot_enabled()
+        );
+        for b in 0..batch_size {
+            let x = &x_batch[b * cols..(b + 1) * cols];
+            let sequential = matrix.apply(x);
+            let from_batch = &batched[b * rows..(b + 1) * rows];
+            // Delegates rather than restating the bound. The first
+            // version of this helper compared each element against
+            // `s.abs().max(1.0)`, which is a bare 1e-4 ABSOLUTE bound
+            // for any row whose value is small -- and a dot product of
+            // 512 terms that cancels to -0.76 carries the rounding of
+            // the terms, not of the result. It passed on aarch64 and
+            // failed on x86_64 CI at 1.07e-4, on one row out of 17094.
+            // `assert_batch_row_matches` already divides by the row
+            // vector's own scale, which is the invariant that makes the
+            // comparison meaningful, and it is now the only place the
+            // tolerance is written down.
+            assert_batch_row_matches(kind, &ctx, b, &sequential, from_batch);
+        }
+    }
+
+    const BATCH_SHAPE_KINDS: [QuantKind; 5] = [
+        QuantKind::Q8_0,
+        QuantKind::Q4_0,
+        QuantKind::Q4K,
+        QuantKind::Q5K,
+        QuantKind::Q6K,
+    ];
+
     /// `apply_batch` writes straight into the `[batch][rows]` output from
     /// parallel tasks (no staging transpose); the shapes here force every
     /// write pattern: full row-groups, a tail of leftover rows, and both
-    /// full and partial activation tiles. Runs against whatever path
-    /// `FERROX_CPU_INT_DOT` selects, so exercise it both ways.
+    /// full and partial activation tiles.
+    ///
+    /// Run under both settings of [`cpu_int_dot_enabled`]. With int-dot
+    /// off, `apply_batch` dequantizes and the repack tier is skipped
+    /// entirely; with it on -- which is what every shipped binary does,
+    /// via `default_cpu_int_dot_on` -- the interleaved `block_q*_Kx8` /
+    /// `block_q*_0x4` kernels and, on an i8mm host, the SMMLA GEMMs are
+    /// the code under test. `cargo test` leaves the env var unset, so
+    /// without [`ForceIntDot`] only the first of those two ever ran.
     #[test]
     fn apply_batch_matches_apply_across_kinds_with_groups_and_tail() {
-        let rows = 19; // 2x8-row groups + 3 tail (4x4-row groups + 3 for Q8_0/Q4_0)
-        let cols = 512;
-        let batch_size = 6; // one full 4-activation tile + a partial one
+        for int_dot in [false, true] {
+            let _g = ForceIntDot::new(int_dot);
+            for kind in BATCH_SHAPE_KINDS {
+                // 19 rows = 2x8-row groups + 3 tail (4x4-row groups + 3
+                // for Q8_0/Q4_0); 6 activations = one full 4-tile + a
+                // partial one.
+                assert_apply_batch_matches_apply(kind, 19, 512, 6, 7);
+            }
+        }
+    }
+
+    /// Shapes too small to fill one interleaved row-group, which the
+    /// tests around this one never reach: they use `rows` big enough that
+    /// `n_groups > 0` for every kind. At `rows < 8` the K-quant arms take
+    /// their `else` branch (per-row `gemm_q*_k_q8_row`) with the repack
+    /// path completely bypassed, and at `rows < 4` the Q8_0/Q4_0 arms do
+    /// the same with `dot_q*_q8`. `rows = 5` is the mixed case: one full
+    /// `block_q*_0x4` group plus a 1-row tail for Q8_0/Q4_0, zero groups
+    /// for the Kx8 kinds. `rows = 1` is the single-row case.
+    ///
+    /// `cols = 256` is also the minimum K for a K-quant -- a single
+    /// super-block, so every kernel's block loop runs exactly one trip.
+    /// `batch_size = 1` is the single-column case: one activation in the
+    /// quad, `na = 1` with three zero-padded lanes in `Q8KActsX4` /
+    /// `Q8ActsX4`.
+    #[test]
+    fn apply_batch_matches_apply_for_sub_tile_shapes() {
+        for int_dot in [false, true] {
+            let _g = ForceIntDot::new(int_dot);
+            for kind in BATCH_SHAPE_KINDS {
+                for rows in [1, 2, 3, 5, 7] {
+                    for batch_size in [1, 2, 5] {
+                        assert_apply_batch_matches_apply(kind, rows, 256, batch_size, 13);
+                    }
+                }
+            }
+        }
+    }
+
+    /// `apply_batch` under int-dot against an f32 dequantize-and-dot
+    /// reference that never touches the packed buffer.
+    ///
+    /// Every other batch test compares `apply_batch` against `apply`,
+    /// which under int-dot is the packed **GEMV** against the packed
+    /// **GEMM** -- two kernels reading the *same* interleaved bytes. That
+    /// catches a bad kernel but is structurally blind to a bad
+    /// `pack_q*_matrix_x*`: both sides read the same wrong bytes and
+    /// agree. `dequant_row` is the only reference in the tree that
+    /// re-derives the weights from the canonical GGUF blocks, so it is
+    /// the only one that can see a mis-interleave.
+    ///
+    /// The bound is the Q8/Q8_K *activation* quantization floor, not the
+    /// kernel's, and it is scaled by the RMS of the reference outputs
+    /// rather than per element: these synthetic weights are uniform
+    /// random bytes, so individual dots cancel to near zero and a
+    /// per-element relative bound would be meaningless. Worst deviation
+    /// measured across every shape below, on an M2 Pro (i8mm), is 0.016 x
+    /// RMS; 0.12 keeps a 7x margin. Coarse on purpose -- a mis-pack
+    /// decorrelates the output from the reference entirely (measured at
+    /// 2.07 x RMS for a one-row shift in the Q5_K `qh` interleave), an
+    /// order of magnitude past this bound.
+    #[test]
+    fn int_dot_batch_matches_dequant_dot_reference() {
+        let _g = ForceIntDot::new(true);
+        assert!(cpu_int_dot_enabled(), "this test needs the packed path");
+        for kind in BATCH_SHAPE_KINDS {
+            // Rows straddle both tile widths: below the tile, one short
+            // of it, exactly it, one past it, and multi-group with a
+            // tail. Batch straddles the 4-wide activation quad. cols 256
+            // is the minimum K for a K-quant (one super-block).
+            for rows in [1, 3, 5, 7, 8, 9, 19] {
+                for cols in [256, 512] {
+                    for batch_size in [1, 3, 4, 9] {
+                        assert_int_dot_matches_dequant_dot(kind, rows, cols, batch_size, 23);
+                    }
+                }
+            }
+        }
+        // Q8_0/Q4_0 alone can go down to a single 32-element block.
+        for kind in [QuantKind::Q8_0, QuantKind::Q4_0] {
+            for rows in [1, 3, 4, 5, 11] {
+                for batch_size in [1, 3, 4, 9] {
+                    assert_int_dot_matches_dequant_dot(kind, rows, 32, batch_size, 29);
+                }
+            }
+        }
+    }
+
+    fn assert_int_dot_matches_dequant_dot(
+        kind: QuantKind,
+        rows: usize,
+        cols: usize,
+        batch_size: usize,
+        seed: usize,
+    ) {
         let x_batch: Vec<f32> = (0..batch_size * cols)
-            .map(|i| (((i * 31 + 7) % 97) as f32) * 0.021 - 1.0)
+            .map(|i| (((i * 37 + seed) % 89) as f32) * 0.019 - 0.8)
             .collect();
-        for kind in [
-            QuantKind::Q8_0,
-            QuantKind::Q4_0,
-            QuantKind::Q4K,
-            QuantKind::Q5K,
-            QuantKind::Q6K,
-        ] {
-            let matrix = synth_quant_matrix(kind, rows, cols);
-            let batched = matrix.apply_batch(&x_batch, batch_size);
-            assert_eq!(batched.len(), batch_size * rows);
+        let matrix = synth_quant_matrix(kind, rows, cols);
+        let got = matrix.apply_batch(&x_batch, batch_size);
+        assert_eq!(got.len(), batch_size * rows);
+
+        let mut want = vec![0f32; batch_size * rows];
+        for r in 0..rows {
+            let w = matrix.dequant_row(r);
+            assert_eq!(w.len(), cols);
             for b in 0..batch_size {
                 let x = &x_batch[b * cols..(b + 1) * cols];
-                let sequential = matrix.apply(x);
-                let from_batch = &batched[b * rows..(b + 1) * rows];
-                assert_batch_row_matches(kind, b, &sequential, from_batch);
+                want[b * rows + r] = w.iter().zip(x.iter()).map(|(a, b)| a * b).sum();
             }
+        }
+        let rms = (want.iter().map(|v| v * v).sum::<f32>() / want.len() as f32).sqrt();
+        for (i, (g, w)) in got.iter().zip(want.iter()).enumerate() {
+            let err = (g - w).abs();
+            assert!(
+                err < 0.12 * rms.max(1e-3),
+                "{kind:?} rows {rows} cols {cols} batch_size {batch_size} [flat {i}]: \
+                 int-dot={g} dequant-dot={w} (err {err}, rms {rms})"
+            );
         }
     }
 
@@ -4217,30 +4533,17 @@ mod tests {
     /// (32 row-groups × 17 activation tiles) instead of falling back to
     /// one-chunk-per-thread — every (group, tile-range) seam in the
     /// chunked scatter is crossed. The smaller cross-kind test above
-    /// covers the fallback path.
+    /// covers the fallback path. Both int-dot settings, for the same
+    /// reason as that test.
     #[test]
     fn apply_batch_chunked_grid_matches_apply() {
-        let rows = 259; // 32 groups of 8 + 3 tail (64 of 4 + 3 for Q8_0/Q4_0)
-        let cols = 512;
-        let batch_size = 66; // 16 full 4-activation tiles + a partial one
-        let x_batch: Vec<f32> = (0..batch_size * cols)
-            .map(|i| (((i * 37 + 5) % 101) as f32) * 0.019 - 0.95)
-            .collect();
-        for kind in [
-            QuantKind::Q8_0,
-            QuantKind::Q4_0,
-            QuantKind::Q4K,
-            QuantKind::Q5K,
-            QuantKind::Q6K,
-        ] {
-            let matrix = synth_quant_matrix(kind, rows, cols);
-            let batched = matrix.apply_batch(&x_batch, batch_size);
-            assert_eq!(batched.len(), batch_size * rows);
-            for b in [0, 1, 31, 32, 64, 65] {
-                let x = &x_batch[b * cols..(b + 1) * cols];
-                let sequential = matrix.apply(x);
-                let from_batch = &batched[b * rows..(b + 1) * rows];
-                assert_batch_row_matches(kind, b, &sequential, from_batch);
+        for int_dot in [false, true] {
+            let _g = ForceIntDot::new(int_dot);
+            for kind in BATCH_SHAPE_KINDS {
+                // 259 rows = 32 groups of 8 + 3 tail (64 of 4 + 3 for
+                // Q8_0/Q4_0); 66 activations = 16 full 4-tiles + a
+                // partial one.
+                assert_apply_batch_matches_apply(kind, 259, 512, 66, 5);
             }
         }
     }
@@ -4423,7 +4726,7 @@ mod tests {
         assert!(out.is_empty());
     }
 
-    #[cfg(any(feature = "cuda", feature = "metal"))]
+    #[cfg(any(feature = "cuda", feature = "metal", feature = "vulkan"))]
     mod gpu_dispatch {
         use super::*;
 
@@ -4633,37 +4936,67 @@ mod tests {
         assert!(report.violations.is_empty(), "{}", report.render());
     }
 
-    /// For a kind with **no** CUDA batched GEMM, a CUDA prefill is a
-    /// per-position matvec loop. That is a real, known slow path and the
-    /// registry must say so by name rather than leave it to a comment in
+    /// A kind CUDA cannot run at all must be RECORDED as leaving the
+    /// GPU, by name, rather than left to a comment in
     /// `apply_batch_with_acts`.
     ///
-    /// `Q4K` is deliberate here rather than incidental: it is on
-    /// [`cuda_matvec_kind_supported`] and off
-    /// [`cuda_mul_mm_kind_supported`], which is exactly the case this
-    /// test is about. The two lists stopped being the same set on
-    /// 2026-09-01, when Q8_0 and Q4_0 gained a GEMM, so probing one of
-    /// those two here would assert the opposite of what it looks like.
+    /// This test used to probe `Q4K` and expect the fallback
+    /// `"CUDA per-position matvec"`, which is what a kind gets when it
+    /// has a matvec but no GEMM. **That combination no longer exists on
+    /// CUDA.** The K-quants gained a GEMM on 2026-09-04, motivated by
+    /// Llama-3.2-3B Q4_K_M running pp512 at 4.88 tok/s against
+    /// llama.cpp's 1586.80, and the invariant below now forbids the
+    /// combination from coming back.
+    ///
+    /// So the probe moved to a kind with neither kernel, and the
+    /// expected fallback moved with it: with no matvec to loop over
+    /// there is no per-position loop, and the whole matmul leaves for
+    /// the host.
+    ///
+    /// It moved twice. `Q5_0` was that kind until 2026-09-05, when it
+    /// gained both; `Q2_K` has neither on any GPU backend and is the
+    /// next row of the coverage table in
+    /// `docs/plans/cpu-cuda-parity.md` §6. When Q2_K lands, this probe
+    /// moves again -- which is the point: the test names a real hole
+    /// and stops compiling a comment.
     #[test]
-    fn cuda_prefill_is_recorded_as_a_per_position_matvec_loop() {
+    fn a_kind_cuda_cannot_run_is_recorded_as_leaving_the_gpu() {
         use crate::kernel_registry::{op, Backend, Outcome};
 
         let reg = crate::kernel_registry::Registry::new();
         let loc = std::panic::Location::caller();
-        shaped(QuantKind::Q4K, 64, 256).probe_kernels_for(&reg, Backend::Cuda, "ffn_down", loc);
+        shaped(QuantKind::Q2K, 64, 256).probe_kernels_for(&reg, Backend::Cuda, "ffn_down", loc);
         let report = reg.seal();
-        assert!(report.entries.iter().any(|e| e.key.backend == Backend::Cuda
-            && e.key.op == op::MATVEC
-            && e.outcome == Outcome::Hit));
         assert!(
-            report.entries.iter().any(|e| e.key.op == op::GEMM_PREFILL
+            report.entries.iter().any(|e| e.key.backend == Backend::Cuda
+                && e.key.op == op::GEMM_PREFILL
                 && matches!(
                     e.outcome,
-                    Outcome::Miss { fallback, .. } if fallback == "CUDA per-position matvec"
+                    Outcome::Miss { fallback, .. } if fallback == "CPU apply_batch"
                 )),
             "{}",
             report.render()
         );
+    }
+
+    /// CUDA's matvec set and its GEMM set are now the same, and that is
+    /// worth pinning: a kind that can be decoded on the GPU but not
+    /// prefilled there is the shape that cost 325x, and it went
+    /// unnoticed because a fallback still answers correctly.
+    ///
+    /// If a future kind gains a matvec without a GEMM, this fails and
+    /// names it, rather than a benchmark noticing months later.
+    #[test]
+    fn a_cuda_kind_with_a_matvec_also_has_a_gemm() {
+        for kind in QuantKind::ALL {
+            if cuda_matvec_kind_supported(*kind) {
+                assert!(
+                    cuda_mul_mm_kind_supported(*kind),
+                    "{kind:?} can be decoded on CUDA but not prefilled there, \
+                     which decomposes a prefill into one matvec launch per position"
+                );
+            }
+        }
     }
 
     /// An F32 weight has no quantized kernel by construction; the probe
@@ -4684,5 +5017,33 @@ mod tests {
         let report = reg.seal();
         assert!(!report.misses.is_empty());
         assert!(report.violations.is_empty(), "{}", report.render());
+    }
+}
+
+#[cfg(test)]
+mod int_dot_default_tests {
+    /// The int-dot default follows the architecture that has the
+    /// kernels, not the wish that every architecture did.
+    ///
+    /// Turning it on where the interleaved kernels do not exist selects
+    /// a scalar integer loop and skips the AVX2 f32 dot that does, which
+    /// measured 4x to 8.8x of x86 decode (#127). A future x86 VNNI
+    /// implementation should flip this deliberately, with its own
+    /// before/after, rather than by inheriting a default nobody
+    /// measured.
+    #[test]
+    fn the_int_dot_default_is_on_only_where_its_kernels_are() {
+        let on_by_default = super::int_dot_is_a_win_here();
+        assert_eq!(
+            on_by_default,
+            cfg!(target_arch = "aarch64"),
+            "int-dot defaults on for aarch64 (i8mm, interleave-8 NEON) and off elsewhere"
+        );
+        // The env var still wins in both directions: this is a default,
+        // not a gate, so an x86 VNNI port can measure itself.
+        assert!(
+            !on_by_default || cfg!(target_arch = "aarch64"),
+            "no architecture may default on without the kernels"
+        );
     }
 }

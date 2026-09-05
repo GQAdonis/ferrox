@@ -5,6 +5,25 @@ OpenAI-compatible HTTP server for Ferrox (`ferrox-server` binary).
 Serves chat/completions against a GGUF (or Kimi safetensors dir) via
 `FERROX_MODEL_PATH`. See [`docs/API.md`](../../docs/API.md).
 
+## Parallel serving (Metal)
+
+Multiple concurrent clients are supported via **continuous batching**
+(llama.cpp slots + one batched decode worker). On Metal, this is **on by
+default** when KV pool and prefix cache are not configured.
+
+```bash
+ferrox serve -m model.gguf -dev metal -ngl all              # CB auto-on
+ferrox serve -m model.gguf -dev metal -cb -np 4             # explicit slot cap
+ferrox serve -m model.gguf -dev metal --no-cont-batching      # private path (serialized on Metal)
+```
+
+See [`docs/plans/metal-parallel-concurrency.md`](../../docs/plans/metal-parallel-concurrency.md).
+
+**0.15.3 serving receipt (Host B, Llama-3.2-3B Q4_K_M, CB on):** concurrency
+1→8 all OK, ~24 aggregate tok/s at 8 clients, mean TTFT ~118 ms sequential /
+~957 ms at concurrency 8. Receipts under
+[`benchmarks/receipts/serving/`](../../benchmarks/receipts/serving/).
+
 ## The web UI is a separate app
 
 This binary serves the HTTP API and nothing else. `GET /` is a 404 like
@@ -18,9 +37,4 @@ cd ui && npm install && npm run dev             # terminal 2 -> :5173
 ```
 
 `npm run dev` proxies `/v1`, `/admin`, `/health`, `/metrics` and
-`/cache` to `127.0.0.1:8383`, so the browser sees one origin and CORS
-never applies. Serving the built `ui/dist/` from a **different** origin
-does bring CORS into it. Start this server with
-`FERROX_CORS_ORIGINS=<that exact origin>`. A `*` wildcard there is a
-startup error, on purpose: a wildcard beside a bearer token is a
-credential-leak shape. See [`docs/CONFIG.md`](../../docs/CONFIG.md).
+forwards to the server address printed at startup.

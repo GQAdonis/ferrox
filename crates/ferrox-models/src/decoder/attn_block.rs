@@ -121,12 +121,10 @@ impl Decoder {
             }
         }
 
-        if let Some(q_norm) = &layer.attn.q_norm {
-            q = self.apply_qk_norm(&q, q_norm);
-        }
-        if let Some(k_norm) = &layer.attn.k_norm {
-            k = self.apply_qk_norm(&k, k_norm);
-        }
+        // Whole rows here: one token's Q and K. See
+        // `Decoder::qk_norm_after_rope` for why the norm has two homes.
+        let (q_width, kv_width) = (q.len(), k.len());
+        self.apply_qk_norms_pre_rope(layer, &mut q, &mut k, q_width, kv_width);
         self.apply_rope_attn_factor(&mut q, &mut k);
 
         for h in 0..n_heads {
@@ -135,6 +133,7 @@ impl Decoder {
         for h in 0..n_kv_heads {
             self.apply_rope_head_layer(&mut k[h * head_dim..(h + 1) * head_dim], pos, layer_idx);
         }
+        self.apply_qk_norms_post_rope(layer, &mut q, &mut k, q_width, kv_width);
         self.apply_attention_scale(&mut q);
 
         let oai = self.gpt_oss.as_ref().map(|g| &g.layers[layer_idx]);
@@ -186,52 +185,62 @@ impl Decoder {
                 cache
                     .push(k, v)
                     .expect("unbounded/planned KvCache growth is infallible");
-                if let Some(oai) = oai {
-                    return ferrox_core::causal_gqa_attention_sinks(
+                let out = if let Some(oai) = oai {
+                    ferrox_core::causal_gqa_attention_sinks(
                         q,
                         &cache.k,
                         &cache.v,
                         n_heads,
                         n_kv_heads,
                         head_dim,
-                        cache.seq_len,
+                        cache.rows(),
                         window,
                         &oai.attn_sinks,
-                    );
-                }
-                match (window, cuda_resident_layer) {
-                    (Some(window), _) => causal_gqa_attention_windowed_softcap(
-                        q,
-                        &cache.k,
-                        &cache.v,
-                        n_heads,
-                        n_kv_heads,
-                        head_dim,
-                        cache.seq_len,
-                        window,
-                        self.config.attn_logit_softcap,
-                    ),
-                    (None, Some(l)) => self.gqa_attention(
-                        l,
-                        q,
-                        &cache.k,
-                        &cache.v,
-                        n_heads,
-                        n_kv_heads,
-                        head_dim,
-                        cache.seq_len,
-                    ),
-                    (None, None) => causal_gqa_attention_softcap(
-                        q,
-                        &cache.k,
-                        &cache.v,
-                        n_heads,
-                        n_kv_heads,
-                        head_dim,
-                        cache.seq_len,
-                        self.config.attn_logit_softcap,
-                    ),
-                }
+                    )
+                } else {
+                    match (window, cuda_resident_layer) {
+                        (Some(window), _) => causal_gqa_attention_windowed_softcap(
+                            q,
+                            &cache.k,
+                            &cache.v,
+                            n_heads,
+                            n_kv_heads,
+                            head_dim,
+                            cache.rows(),
+                            window,
+                            self.config.attn_logit_softcap,
+                        ),
+                        (None, Some(l)) => self.gqa_attention(
+                            l,
+                            q,
+                            &cache.k,
+                            &cache.v,
+                            n_heads,
+                            n_kv_heads,
+                            head_dim,
+                            cache.rows(),
+                        ),
+                        (None, None) => causal_gqa_attention_softcap(
+                            q,
+                            &cache.k,
+                            &cache.v,
+                            n_heads,
+                            n_kv_heads,
+                            head_dim,
+                            cache.rows(),
+                            self.config.attn_logit_softcap,
+                        ),
+                    }
+                };
+                // AFTER the read, never inside `push`: the rows this
+                // drops are rows every kernel above has finished with
+                // (#61). A no-op unless `FERROX_KV_WINDOW` is on and
+                // this layer is windowed -- and note that it is the same
+                // `window` the kernels just used, taken from the same
+                // `ModelConfig`, because keeping fewer rows than the
+                // kernel reads would answer out of a truncated history.
+                self.evict_layer_kv(layer_idx, cache);
+                out
             }
             KvStep::Paged { cache, stores } => {
                 // Write guard for the push alone, then a read guard for

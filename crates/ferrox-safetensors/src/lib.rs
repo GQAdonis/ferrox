@@ -62,6 +62,11 @@ pub enum SafetensorsError {
     InvalidOffsets(String, (u64, u64)),
     #[error("tensor '{0}': shape/dtype imply {1} bytes but data_offsets span {2} bytes")]
     SizeMismatch(String, u64, u64),
+    #[error(
+        "tensor '{0}' declares shape {1:?}, whose size in bytes is not representable, so there \
+         is nothing for its data_offsets span to be checked against"
+    )]
+    ImplausibleShape(String, Vec<usize>),
     #[error("data section is {0} bytes but tensor offsets claim {1} bytes")]
     IncompleteBuffer(usize, usize),
     #[error("tensor '{0}' not found")]
@@ -137,9 +142,41 @@ pub struct TensorInfo {
     pub data_offsets: (u64, u64),
 }
 
+/// The single fold of a file-supplied shape into an element count.
+///
+/// It used to be a bare `product()` in two places, and that made
+/// [`SafetensorsError::SizeMismatch`] -- whose only job is to check a
+/// shape against the bytes the header says it occupies -- unable to fire
+/// for any overflowing shape, because the product it compared against
+/// had already wrapped to whatever would agree. A gate that cannot fire
+/// is worse than no gate.
+///
+/// No separate file-size bound is needed on top: `parse` already
+/// requires each span to equal this count times the dtype width, the
+/// spans to be contiguous from zero, and the last of them to end exactly
+/// at the end of the file. Once the fold cannot lie, that chain is the
+/// bound, and it is derived entirely from the input.
+fn fold_shape(shape: &[usize]) -> Option<u64> {
+    shape
+        .iter()
+        .try_fold(1u64, |n, &dim| n.checked_mul(dim as u64))
+}
+
 impl TensorInfo {
+    /// The declared element count, or `None` when folding the
+    /// file-supplied dims wraps or does not fit an address on this
+    /// machine.
+    pub fn element_count(&self) -> Option<usize> {
+        fold_shape(&self.shape).and_then(|n| usize::try_from(n).ok())
+    }
+
+    /// The element count for REPORTING -- never for sizing a read.
+    /// `parse` refuses any shape whose byte count is not representable,
+    /// so for a `TensorInfo` that came out of a parsed file this is
+    /// exact; the saturating arm exists only for a hand-built one, and
+    /// saturates UP, so it can only ever cause a refusal.
     pub fn n_elements(&self) -> usize {
-        self.shape.iter().product()
+        self.element_count().unwrap_or(usize::MAX)
     }
 
     pub fn byte_len(&self) -> u64 {
@@ -208,8 +245,11 @@ impl SafetensorsFile {
             if start != running_end || end < start {
                 return Err(SafetensorsError::InvalidOffsets(name, (start, end)));
             }
-            let n_elements: u64 = raw_info.shape.iter().map(|&d| d as u64).product();
-            let expected_bytes = n_elements * dtype.byte_size() as u64;
+            let expected_bytes = fold_shape(&raw_info.shape)
+                .and_then(|n| n.checked_mul(dtype.byte_size() as u64))
+                .ok_or_else(|| {
+                    SafetensorsError::ImplausibleShape(name.clone(), raw_info.shape.clone())
+                })?;
             if end - start != expected_bytes {
                 return Err(SafetensorsError::SizeMismatch(
                     name,
@@ -250,13 +290,28 @@ impl SafetensorsFile {
         self.tensors.iter().map(|t| t.name.as_str())
     }
 
-    pub fn tensor_bytes(&self, name: &str) -> Result<&[u8], SafetensorsError> {
+    /// The single computation of a tensor's byte range in this file,
+    /// rather than the verbatim copy each accessor used to hold -- the
+    /// same collapse `ferrox-gguf::GgufFile::tensor_range` got, and for
+    /// the same reason: two copies is two places for the reasoning that
+    /// makes them total to rot independently.
+    ///
+    /// Total by construction, and it is `parse` that makes it so: the
+    /// spans are contiguous from zero, each equals its shape's byte
+    /// count, and the last ends exactly at the end of the data section,
+    /// so `data_start + end` cannot exceed the mmap.
+    fn tensor_range(&self, name: &str) -> Result<Range<usize>, SafetensorsError> {
         let info = self
             .tensor_info(name)
             .ok_or_else(|| SafetensorsError::TensorNotFound(name.to_string()))?;
         let start = self.data_start + info.data_offsets.0 as usize;
         let end = self.data_start + info.data_offsets.1 as usize;
-        Ok(&self.mmap[start..end])
+        debug_assert!(start <= end && end <= self.mmap.len());
+        Ok(start..end)
+    }
+
+    pub fn tensor_bytes(&self, name: &str) -> Result<&[u8], SafetensorsError> {
+        Ok(&self.mmap[self.tensor_range(name)?])
     }
 
     /// Zero-copy accessor: a cheaply-cloneable handle to the underlying
@@ -267,12 +322,7 @@ impl SafetensorsFile {
         &self,
         name: &str,
     ) -> Result<(Arc<Mmap>, Range<usize>), SafetensorsError> {
-        let info = self
-            .tensor_info(name)
-            .ok_or_else(|| SafetensorsError::TensorNotFound(name.to_string()))?;
-        let start = self.data_start + info.data_offsets.0 as usize;
-        let end = self.data_start + info.data_offsets.1 as usize;
-        Ok((Arc::clone(&self.mmap), start..end))
+        Ok((Arc::clone(&self.mmap), self.tensor_range(name)?))
     }
 }
 
@@ -446,6 +496,74 @@ mod tests {
         );
         assert_eq!(file.tensor_bytes("a").unwrap(), &[10u8, 11]);
         assert_eq!(file.tensor_bytes("b").unwrap(), &[20u8, 21]);
+    }
+
+    /// `SizeMismatch` is the only thing standing between a
+    /// file-supplied shape and every consumer that trusts it, and it
+    /// compared two values that wrapped identically -- so for an
+    /// overflowing shape it could never fire. Executed before this fix,
+    /// shape `[2^63 + 2, 2]` with a 16-byte span parsed OK and reported
+    /// `n_elements=4`, and the wrapped count is what every downstream
+    /// bounds check then agreed with.
+    #[test]
+    fn a_shape_whose_byte_count_wraps_is_refused_rather_than_matched() {
+        // Chosen to fail rather than to be round:
+        //   [2^63 + 2, 2]           the element fold wraps to exactly 4
+        //   [2^32, 2^32]            it wraps to exactly 0, and a 0-byte
+        //                           span then agrees with it perfectly
+        //   [2^62]                  the count fits; it is the * 4 for
+        //                           F32 that wraps, to 0
+        //   [u64::MAX / 64, 65]     the fold wraps to a large nonsense
+        for (i, (shape, span)) in [
+            ("[9223372036854775810,2]", 16usize),
+            ("[4294967296,4294967296]", 0),
+            ("[4611686018427387904]", 0),
+            ("[288230376151711743,65]", 0),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let header =
+                format!(r#"{{"w":{{"dtype":"F32","shape":{shape},"data_offsets":[0,{span}]}}}}"#);
+            let bytes = build_file(&header, &vec![0u8; span]);
+            let tmp = std::env::temp_dir().join(format!(
+                "ferrox_st_wrapshape{i}_{}.safetensors",
+                std::process::id()
+            ));
+            std::fs::write(&tmp, &bytes).unwrap();
+            let result = SafetensorsFile::open(&tmp);
+            std::fs::remove_file(&tmp).ok();
+
+            match result {
+                Err(SafetensorsError::ImplausibleShape(name, _)) => assert_eq!(name, "w"),
+                Err(other) => panic!("shape {shape}: expected ImplausibleShape, got {other}"),
+                Ok(f) => panic!(
+                    "shape {shape} parsed: n_elements={} byte_len={}",
+                    f.tensors[0].n_elements(),
+                    f.tensors[0].byte_len()
+                ),
+            }
+        }
+
+        // And the gate it was hiding still fires when it CAN: a shape
+        // that does not overflow but does not match its span is a
+        // SizeMismatch, not an ImplausibleShape.
+        let header = r#"{"w":{"dtype":"F32","shape":[7],"data_offsets":[0,16]}}"#;
+        let bytes = build_file(header, &[0u8; 16]);
+        let tmp = std::env::temp_dir().join(format!(
+            "ferrox_st_plainmismatch_{}.safetensors",
+            std::process::id()
+        ));
+        std::fs::write(&tmp, &bytes).unwrap();
+        let result = SafetensorsFile::open(&tmp);
+        std::fs::remove_file(&tmp).ok();
+        match result {
+            Err(SafetensorsError::SizeMismatch(name, expected, got)) => {
+                assert_eq!((name.as_str(), expected, got), ("w", 28, 16));
+            }
+            Err(other) => panic!("expected SizeMismatch, got {other}"),
+            Ok(_) => panic!("expected SizeMismatch, got a parsed file"),
+        }
     }
 
     #[test]

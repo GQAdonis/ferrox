@@ -96,7 +96,8 @@ fn a_cancelled_row_leaves_through_the_one_exit_every_row_uses() {
     assert!(rows.get(b_uid).is_some(), "only the cancelled row left");
     assert_eq!(budget.free(), 4, "blocks came back exactly once");
 
-    let (finish, ids, text, _usage) = ra.try_recv().expect("one reply").expect("ok");
+    let (finish, ids, text, _usage) =
+        finished_result(ra.try_recv().expect("one reply")).expect("ok");
     assert_eq!(finish, FinishReason::Cancelled);
     assert_eq!(ids, vec![3], "partial output survives the cancel");
     assert_eq!(text, "hi");
@@ -158,7 +159,7 @@ fn a_cancel_that_arrives_before_its_job_is_not_lost() {
     assert!(waiting.is_empty(), "the late job must still be cancelled");
     assert_eq!(inbox.aborted(), 1);
     assert_eq!(queue.depth(), 0, "its queue slot came back");
-    let (finish, ids, _, usage) = rx.try_recv().expect("reply").expect("ok");
+    let (finish, ids, _, usage) = finished_result(rx.try_recv().expect("reply")).expect("ok");
     assert_eq!(finish, FinishReason::Cancelled);
     assert!(ids.is_empty(), "it never ran a token");
     assert_eq!(usage.prompt_tokens, 2);
@@ -213,7 +214,9 @@ fn a_cancelled_prefill_is_abandoned_and_gives_its_blocks_back() {
     assert_eq!(budget.free(), 4, "an abandoned prefill releases its blocks");
     assert_eq!(inbox.aborted(), 1);
     assert_eq!(
-        rx.try_recv().expect("reply").expect("ok").0,
+        finished_result(rx.try_recv().expect("reply"))
+            .expect("ok")
+            .0,
         FinishReason::Cancelled
     );
 }
@@ -327,8 +330,7 @@ fn a_multi_token_stop_string_truncates_a_batched_row() {
         },
     );
     let baseline = sequential_ids(&decoder, &[1, 2, 3], &greedy_params(8, 4));
-    let decode = identity_decode();
-    let full = decode(&baseline);
+    let full = identity_decode_text(&baseline);
     if full.chars().count() < 4 {
         return;
     }
@@ -372,7 +374,7 @@ fn a_batched_row_that_never_matches_loses_no_output() {
         },
     );
     let baseline = sequential_ids(&decoder, &[1, 2, 3], &greedy_params(8, 4));
-    let expected = identity_decode()(&baseline);
+    let expected = identity_decode_text(&baseline);
 
     let (finish, ids, text, _usage) = batcher
         .generate(

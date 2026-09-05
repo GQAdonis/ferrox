@@ -14,18 +14,20 @@
 
 mod attn_block;
 mod ffn_act;
+pub mod kv_window;
 mod lm_head;
+mod qk_norm;
+mod rope;
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
 pub(crate) use attn_block::KvStep;
 use ferrox_core::attention::{
-    apply_rope, apply_rope_interleaved, apply_rope_interleaved_with_freq_factors,
-    apply_rope_with_freq_factors, causal_gqa_attention_prefill_shared_kv_windowed,
-    causal_gqa_attention_softcap,
+    causal_gqa_attention_prefill_shared_kv_windowed, causal_gqa_attention_softcap,
 };
 use ferrox_core::cache::{KvCache, PagedKvCache, PagedStoreExhausted, SharedPagedKv};
-use ferrox_core::matmul::{rms_norm, rms_norm_per_head};
+use ferrox_core::matmul::rms_norm;
+pub use kv_window::{KvWindowPolicy, KV_WINDOW_ENV};
 #[cfg(feature = "metal")]
 use lm_head::FoldedLmHead;
 use lm_head::Logits;
@@ -407,6 +409,13 @@ pub struct Decoder {
     /// refused at call time — neither implements sinks, and answering
     /// with a different distribution is the failure this replaces.
     pub gpt_oss: Option<GptOssWeights>,
+    /// Does this architecture norm Q and K AFTER RoPE rather than
+    /// before? `maincoder` and `hunyuan-moe` do; see [`qk_norm`] for
+    /// the llama.cpp lines and for why no GGUF key can answer this.
+    /// Set by the loader from the architecture string; refused by
+    /// `layer_supports_metal_attn`, because no fused kernel can express
+    /// the order.
+    pub qk_norm_after_rope: bool,
     /// Per-layer Metal-resident KV for fused decode/prefill attention
     /// (`FERROX_METAL_ATTN`). Lazily allocated. After
     /// [`ferrox_metal::attn::launch_decode_dense_stack`], Metal KV is
@@ -420,6 +429,12 @@ pub struct Decoder {
     /// policy). Built once; hot path must not re-resolve architecture
     /// strings. See [`crate::execution_plan`].
     pub execution_plan: crate::execution_plan::ExecutionPlan,
+    /// May a windowed layer's host [`KvCache`] drop rows that have
+    /// fallen behind its window? Off unless `FERROX_KV_WINDOW` says
+    /// otherwise; see [`kv_window`] for what else turns it off. A field
+    /// rather than a cached global so a test can run both arms in one
+    /// process and compare tokens.
+    pub kv_window: KvWindowPolicy,
     /// Cache key hit → fused caps last used for that geometry (enables
     /// decode/prefill plan reuse without rebuilding residency).
     pub plan_cache: std::sync::Mutex<
@@ -668,118 +683,14 @@ impl Decoder {
             gpu_vram_budget_bytes: None,
             // Synthetic-weights constructor: no checkpoint, no gpt-oss.
             gpt_oss: None,
+            // Synthetic-weights constructor: the preset families it
+            // serves all norm before RoPE.
+            qk_norm_after_rope: false,
             #[cfg(feature = "metal")]
             metal_attn_kv: std::sync::Mutex::new(None),
             execution_plan,
+            kv_window: KvWindowPolicy::from_env(),
             plan_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
-        }
-    }
-
-    /// Applies RoPE to one head's Q or K slice. Dispatches on both
-    /// `rope_layout` (Norm = adjacent-pair / NeoX = split-half -- see
-    /// `RopeLayout`) and whether this checkpoint carries a real
-    /// `rope_freqs.weight` tensor (Llama 3/3.1/3.2's per-band frequency
-    /// correction). Getting the layout wrong for `llama` was the real
-    /// root cause of the Llama-3.1-8B early-stop bug: ferrox applied
-    /// NeoX pairing to an architecture that needs Norm.
-    fn apply_rope_head_theta(&self, slice: &mut [f32], pos: usize, theta: f32) {
-        use crate::config::RopeLayout;
-        // Partial rotary (llama.cpp `hparams.n_rot` < `n_embd_head_k`,
-        // GGUF `<arch>.rope.dimension_count`): Phi-3/Phi-4 rotate only the
-        // first 96 of each 128-wide head and pass the remaining 32
-        // through untouched. Rotating the whole head instead is not a
-        // subtle error — it moves dimensions the model never trained to
-        // be position-dependent.
-        let slice = match self.config.rope_dim {
-            Some(rot) if rot < slice.len() => &mut slice[..rot],
-            _ => slice,
-        };
-        match (self.config.rope_layout, &self.config.rope_freqs) {
-            (RopeLayout::Norm, Some(freq_factors)) => {
-                apply_rope_interleaved_with_freq_factors(slice, pos, theta, freq_factors)
-            }
-            (RopeLayout::Norm, None) => apply_rope_interleaved(slice, pos, theta),
-            (RopeLayout::Neox, Some(freq_factors)) => {
-                apply_rope_with_freq_factors(slice, pos, theta, freq_factors)
-            }
-            (RopeLayout::Neox, None) => apply_rope(slice, pos, theta),
-        }
-    }
-
-    fn apply_rope_head_layer(&self, slice: &mut [f32], pos: usize, layer_idx: usize) {
-        self.apply_rope_head_theta(slice, pos, self.config.layer_rope_theta(layer_idx))
-    }
-
-    /// llama.cpp's RoPE `mscale` (ggml `rope_yarn`), applied where the
-    /// QKV biases and QK-norms are: multiplying `cos`/`sin` by a constant
-    /// is the same as scaling the vector RoPE rotates, and rotation is
-    /// linear, so pre-scaling q and k here is exactly what the kernel
-    /// would do post-hoc — without a new uniform on five backends' RoPE
-    /// kernels.
-    ///
-    /// Both q and k are scaled, so attention logits carry `m²`, which is
-    /// the whole observable effect (V is untouched, and k enters the
-    /// cache scaled exactly as llama.cpp's does).
-    #[inline]
-    fn apply_rope_attn_factor(&self, q: &mut [f32], k: &mut [f32]) {
-        let m = self.config.rope_attn_factor;
-        if m == 1.0 {
-            return;
-        }
-        // ggml folds `attn_factor` into cos_theta/sin_theta inside
-        // `rope_yarn` (ops.cpp), so it reaches ONLY the rotated channels;
-        // `[n_rot, head_dim)` is then copied through untouched by the
-        // "fill the remain channels with data from src tensor" loop.
-        // Scaling the pass-through tail as well is a different graph, and
-        // `ferrox parity` caught it as the one DRIFT verdict in a
-        // 17-model sweep: Phi-4-mini rotates 96 of 128 dims with
-        // attn_factor 1.1902, so 32 dims per head were scaled that
-        // llama.cpp leaves alone.
-        let head_dim = self.config.head_dim;
-        let rot = self.config.rope_dim.unwrap_or(head_dim).min(head_dim);
-        for buf in [q, k] {
-            for head in buf.chunks_mut(head_dim) {
-                let n = rot.min(head.len());
-                for v in head[..n].iter_mut() {
-                    *v *= m;
-                }
-            }
-        }
-    }
-
-    /// An architecture's explicit attention score scale
-    /// (`ModelConfig::attention_scale`), applied to Q after RoPE.
-    ///
-    /// llama.cpp's Gemma graphs scale Q themselves and then call
-    /// `build_attn(..., 1.0f)`; ferrox's kernels always apply their own
-    /// `1/sqrt(head_dim)`, so the compensation has to be folded into Q
-    /// here for the NET score scale to equal `attention_scale`.
-    ///
-    /// One helper rather than one copy per host body, because that is
-    /// exactly how this feature came to be applied at two of four sites:
-    /// `forward_hidden_batch_inner` and `forward_multi_seq_kv` computed a
-    /// plausible distribution at the wrong temperature and nothing
-    /// failed. Elementwise, so a `[batch, n_heads*head_dim]` Q batch is
-    /// the same call as one row's.
-    #[inline]
-    fn apply_attention_scale(&self, q: &mut [f32]) {
-        let Some(scale) = self.config.attention_scale else {
-            return;
-        };
-        let compensate = scale * (self.config.head_dim as f32).sqrt();
-        for v in q.iter_mut() {
-            *v *= compensate;
-        }
-    }
-
-    /// Applies Q/K RMSNorm according to [`ModelConfig::qk_norm_style`].
-    fn apply_qk_norm(&self, x: &[f32], weight: &[f32]) -> Vec<f32> {
-        use crate::capability::QkNormStyle;
-        match self.config.qk_norm_style {
-            QkNormStyle::WholeVector => rms_norm(x, weight, self.config.rms_norm_eps),
-            QkNormStyle::PerHead => {
-                rms_norm_per_head(x, weight, self.config.head_dim, self.config.rms_norm_eps)
-            }
         }
     }
 
@@ -878,6 +789,16 @@ impl Decoder {
         {
             return false;
         }
+        // NOT the QK-norm ORDER. `AttnExtras` hands the norm weights to
+        // kernels that apply them before their own RoPE, so a
+        // `maincoder` / `hunyuan-moe` layer would be normed on the wrong
+        // side of the rotation by every fused launch while the host
+        // bodies got it right — the same weights answering differently
+        // depending on which backend served the token. Same fence, same
+        // reason, as `attention_scale` below.
+        if self.qk_norm_after_rope {
+            return false;
+        }
         // Softcaps: final logit softcap is applied on the host after
         // lm_head (Metal-safe). Attention softcap runs on Metal FA-vec /
         // legacy GQA (decode + prefill).
@@ -888,10 +809,13 @@ impl Decoder {
         // the four host bodies and not by any of the seven fused
         // launches -- the same weights answering at two different
         // temperatures depending on which backend served the token.
-        // Inert today (`loader.rs` hardcodes `attention_scale = None`),
-        // which is exactly why it has to be written down as a fence
-        // instead of trusted: the day a loader sets it, this returns
-        // false and the layer takes the host path that does apply it.
+        //
+        // LIVE, not latent: `capability::attention_scale_override` sets
+        // it for Gemma-2-27B and Gemma-3-27B, so those two checkpoints
+        // take the host path here and are scaled exactly once. It was
+        // written down as a fence while `loader.rs` still hardcoded
+        // `None`, which is why the day the loader started setting it
+        // cost nothing.
         if self.config.attention_scale.is_some() {
             return false;
         }
@@ -926,6 +850,26 @@ impl Decoder {
             || self.config.layer_sliding_window(layer_idx).is_some()
             || !GluAct::from(self.config.ffn_activation).is_swiglu()
             || self.config.layer_rope_theta(layer_idx) != self.config.rope_theta
+    }
+
+    /// BOTH halves of layer `il`'s RoPE, in the shape the Metal
+    /// launches take.
+    ///
+    /// One conversion, every Metal call site, because
+    /// `ModelConfig::layer_rope` returning a pair and the launches
+    /// taking a pair is only worth anything while nothing in between
+    /// gets to take one half and default the other. That is exactly
+    /// what the fused stacks used to do: a per-layer `rope_theta` beside
+    /// ONE `freq_factors` slice for the whole run, which refused
+    /// Gemma-3 4B/12B/27B off the fused path entirely rather than rope
+    /// five layers in six at the wrong scale.
+    #[cfg(feature = "metal")]
+    fn metal_layer_rope(&self, layer_idx: usize) -> ferrox_metal::attn::LayerRope<'_> {
+        let (theta, freq_factors) = self.config.layer_rope(layer_idx);
+        ferrox_metal::attn::LayerRope {
+            theta,
+            freq_factors,
+        }
     }
 
     /// Optional QKV bias / QK-norm ops for the Metal attn paths.
@@ -1095,7 +1039,9 @@ impl Decoder {
             if !self.metal_prefill_dense_swa_fits(li, start_pos, batch_size) {
                 break;
             }
-            if metal_kvs[li].seq_len != cache.seq_len || start_pos != cache.seq_len {
+            // POSITIONS: compared against `start_pos`, and against
+            // Metal's own count of the same sequence.
+            if metal_kvs[li].seq_len != cache.positions() || start_pos != cache.positions() {
                 break;
             }
             let ok = layer.attn.q_proj.mul_mm_sg_launch().is_some()
@@ -1130,7 +1076,6 @@ impl Decoder {
     ) -> Option<Vec<f32>> {
         let gelu = !GluAct::from(self.config.ffn_activation).is_swiglu();
         let mut prefill_layers = Vec::with_capacity(run_len);
-        let mut rope_thetas = Vec::with_capacity(run_len);
         for li in start..start + run_len {
             let layer = &self.layers[li];
             let ffn = Self::metal_prefill_ffn(layer, &self.config)?;
@@ -1154,9 +1099,9 @@ impl Decoder {
                 post_attn_norm: layer.attn.post_attn_norm.as_deref(),
                 post_ffn_norm: layer.attn.post_ffn_norm.as_deref(),
                 extras: self.metal_attn_extras(layer),
+                rope: self.metal_layer_rope(li),
                 layer_idx: li as u32,
             });
-            rope_thetas.push(self.config.layer_rope_theta(li));
         }
         let kvs = &mut metal_kvs[start..start + run_len];
         let h_out = ferrox_metal::attn::launch_prefill_dense_stack(
@@ -1166,8 +1111,6 @@ impl Decoder {
             n_heads,
             batch_size,
             self.metal_rope(),
-            &rope_thetas,
-            self.config.rope_freqs.as_deref(),
             start_pos,
             self.config.rms_norm_eps,
             gelu,
@@ -1400,6 +1343,13 @@ impl Decoder {
             return None;
         };
         let packed = Self::moe_packed_q4(&layer.moe)?;
+        if !ferrox_metal::gpu::moe_packed_mul_mv_id_supported(
+            packed.gate_kind,
+            packed.up_kind,
+            packed.down_kind,
+        ) {
+            return None;
+        }
         let top_k = config.moe.n_experts_active;
         if top_k == 0 || top_k > 8 || packed.hidden_rows != hidden_dim {
             return None;
@@ -1607,7 +1557,7 @@ impl Decoder {
     ) {
         if host_kv_authoritative {
             Self::catch_up_host_kv_from_metal(mkv, cache);
-            debug_assert_eq!(cache.seq_len, mkv.seq_len);
+            debug_assert_eq!(cache.positions(), mkv.seq_len);
         } else {
             cache
                 .advance_len(batch_size)
@@ -1619,10 +1569,14 @@ impl Decoder {
     /// skipped (dense-stack fast path). No-op when `cache.seq_len` is caught up.
     #[cfg(feature = "metal")]
     fn catch_up_host_kv_from_metal(mkv: &ferrox_metal::attn::MetalKvBuffers, cache: &mut KvCache) {
-        if cache.seq_len >= mkv.seq_len {
+        // ROWS on both sides: this fills the host buffer with rows
+        // Metal already holds, and `push` below advances positions with
+        // them. Neither store evicts, so the two agree; when one learns
+        // to (#61) this is a place that has to say which it meant.
+        if cache.rows() >= mkv.seq_len {
             return;
         }
-        let start = cache.seq_len;
+        let start = cache.rows();
         let n = mkv.seq_len - start;
         let (k, v) = mkv.tokens_host(start, n);
         let per = cache.n_kv_heads * cache.head_dim;
@@ -1635,13 +1589,22 @@ impl Decoder {
     }
 
     /// Pull every layer's Metal-ahead suffix into `kv_caches` (prefix-cache
+    /// Poison-tolerant lock for the shared Metal KV arena. A panicked
+    /// holder must not permanently brick every later decode.
+    #[cfg(feature = "metal")]
+    fn lock_metal_attn_kv(
+        mutex: &std::sync::Mutex<Option<Vec<ferrox_metal::attn::MetalKvBuffers>>>,
+    ) -> std::sync::MutexGuard<'_, Option<Vec<ferrox_metal::attn::MetalKvBuffers>>> {
+        mutex
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     /// store, continuous-batch / CPU readers). Safe no-op without Metal KV.
     #[cfg(feature = "metal")]
     pub fn sync_metal_attn_kv_to_host(&self, kv_caches: &mut [KvCache]) {
         assert_eq!(kv_caches.len(), self.layers.len());
-        let Ok(guard) = self.metal_attn_kv.lock() else {
-            return;
-        };
+        let guard = Self::lock_metal_attn_kv(&self.metal_attn_kv);
         let Some(metal_kvs) = guard.as_ref() else {
             return;
         };
@@ -1797,7 +1760,7 @@ impl Decoder {
         let mut metal_kv_guard: Option<
             std::sync::MutexGuard<'_, Option<Vec<ferrox_metal::attn::MetalKvBuffers>>>,
         > = if use_metal_attn {
-            Some(self.metal_attn_kv.lock().unwrap())
+            Some(Self::lock_metal_attn_kv(&self.metal_attn_kv))
         } else {
             None
         };
@@ -1807,7 +1770,8 @@ impl Decoder {
             let need = self.layers.len();
             let cap = kv_caches
                 .iter()
-                .map(|c| c.seq_len.max(pos + 1).saturating_add(256))
+                // POSITIONS: sized against `pos`, which is a position.
+                .map(|c| c.positions().max(pos + 1).saturating_add(256))
                 .max()
                 .unwrap_or(512)
                 .max(512)
@@ -1850,7 +1814,9 @@ impl Decoder {
                     // Sync from host after CPU prefill / prefix restore / capacity grow.
                     let mut ok = true;
                     for (m, c) in bufs.iter_mut().zip(kv_caches.iter()) {
-                        if c.seq_len > 0 && m.upload_from_host(&c.k, &c.v, c.seq_len).is_err() {
+                        // ROWS: this uploads `c.k` / `c.v` themselves, so the
+                        // count must describe those buffers.
+                        if c.rows() > 0 && m.upload_from_host(&c.k, &c.v, c.rows()).is_err() {
                             ok = false;
                             break;
                         }
@@ -1988,7 +1954,14 @@ impl Decoder {
                                     n_heads,
                                     self.metal_rope(),
                                     self.config.rope_theta,
-                                    self.config.rope_freqs.as_deref(),
+                                    // The stack-wide theta above is
+                                    // sound because no layer here
+                                    // `layer_needs_metal_stack`, which
+                                    // means none slides; the divisors
+                                    // are taken through the same
+                                    // accessor so the two stay one
+                                    // answer.
+                                    self.config.layer_rope_freqs(0),
                                     pos,
                                     self.config.rms_norm_eps,
                                     Some(&self.final_norm),
@@ -2081,10 +2054,7 @@ impl Decoder {
                                 up: u,
                                 down: d,
                                 extras: self.metal_attn_extras(layer),
-                                rope_theta: {
-                                    let t = self.config.layer_rope_theta(li);
-                                    (t != self.config.rope_theta).then_some(t)
-                                },
+                                rope: self.metal_layer_rope(li),
                                 window: self.config.layer_sliding_window(li),
                                 post_attn_norm: layer.attn.post_attn_norm.as_deref(),
                                 post_ffn_norm: layer.attn.post_ffn_norm.as_deref(),
@@ -2138,8 +2108,6 @@ impl Decoder {
                                 metal_kvs,
                                 n_heads,
                                 self.metal_rope(),
-                                self.config.rope_theta,
-                                self.config.rope_freqs.as_deref(),
                                 pos,
                                 self.config.rms_norm_eps,
                                 final_norm_w,
@@ -2213,6 +2181,13 @@ impl Decoder {
         #[cfg(feature = "metal")]
         let mut metal_moe_resident = false;
 
+        #[cfg(feature = "metal")]
+        if run_cpu_layers && hidden.is_empty() && !metal_moe_resident {
+            // GPU embedding gather or a skipped Metal dense stack can leave
+            // `hidden` empty; CPU fallback must not call rms_norm on it.
+            hidden = self.embed_token(token_id);
+        }
+
         if run_cpu_layers {
             for (l, (layer, cache)) in self.layers.iter().zip(kv_caches.iter_mut()).enumerate() {
                 // --- attention block ---
@@ -2283,7 +2258,7 @@ impl Decoder {
                                             n_heads,
                                             self.metal_rope(),
                                             self.config.rope_theta,
-                                            self.config.rope_freqs.as_deref(),
+                                            self.config.layer_rope_freqs(l),
                                             pos,
                                             self.config.rms_norm_eps,
                                             &self.metal_attn_extras(layer),
@@ -2309,7 +2284,7 @@ impl Decoder {
                                         if dense_ok {
                                             did_metal_dense = true;
                                             did_metal_attn = true;
-                                        } else if metal_kvs[l].seq_len != cache.seq_len {
+                                        } else if metal_kvs[l].seq_len != cache.rows() {
                                             // Dense path may have advanced Metal KV before failing.
                                             Self::catch_up_host_kv_from_metal(&metal_kvs[l], cache);
                                             clear_metal_kv = true;
@@ -2373,7 +2348,7 @@ impl Decoder {
                                                                 n_heads,
                                                                 self.metal_rope(),
                                                                 self.config.rope_theta,
-                                                                self.config.rope_freqs.as_deref(),
+                                                                self.config.layer_rope_freqs(l),
                                                                 pos,
                                                                 self.config.rms_norm_eps,
                                                                 &self.metal_attn_extras(layer),
@@ -2411,7 +2386,7 @@ impl Decoder {
                                                         n_heads,
                                                         self.metal_rope(),
                                                         self.config.rope_theta,
-                                                        self.config.rope_freqs.as_deref(),
+                                                        self.config.layer_rope_freqs(l),
                                                         pos,
                                                         self.config.rms_norm_eps,
                                                         &self.metal_attn_extras(layer),
@@ -2473,7 +2448,7 @@ impl Decoder {
                                                             hidden = h;
                                                         }
                                                             metal_moe_resident = false;
-                                                            if metal_kvs[l].seq_len != cache.seq_len
+                                                            if metal_kvs[l].seq_len != cache.rows()
                                                             {
                                                                 Self::catch_up_host_kv_from_metal(
                                                                     &metal_kvs[l],
@@ -2499,7 +2474,7 @@ impl Decoder {
                                             n_heads,
                                             self.metal_rope(),
                                             self.config.rope_theta,
-                                            self.config.rope_freqs.as_deref(),
+                                            self.config.layer_rope_freqs(l),
                                             pos,
                                             &self.metal_attn_extras(layer),
                                             self.config.rms_norm_eps,
@@ -2528,7 +2503,7 @@ impl Decoder {
                                         }
                                     }
                                 }
-                            } else if metal_kvs[l].seq_len > cache.seq_len {
+                            } else if metal_kvs[l].seq_len > cache.rows() {
                                 // Leaving Metal path: host must see full KV for CPU attn.
                                 Self::catch_up_host_kv_from_metal(&metal_kvs[l], cache);
                             }
@@ -2785,9 +2760,11 @@ impl Decoder {
         layer.moe.n_experts() == 1 && layer.moe.shared_experts.is_empty()
     }
 
-    /// llama.cpp `mul_mat_id` style: shared Q8 act + flat rayon over
-    /// `(slot, row_pair)` for gate∥up (2-row SDOT), then SwiGLU, then
-    /// per-slot down. One outer fork-join — no nested `apply_cpu_q8`.
+    /// llama.cpp `mul_mat_id` style: shared Q8 act + one flat parallel
+    /// region over `(slot, row_pair)` for gate∥up (2-row SDOT), then
+    /// SwiGLU, then per-slot down. Three regions, none nested, all
+    /// through `ferrox_core::par` so they follow whichever scheduler
+    /// `FERROX_CPU_POOL` selected.
     fn cpu_moe_topk_parallel_slots(
         experts: &[ExpertWeights],
         normed2: &[f32],
@@ -2795,7 +2772,6 @@ impl Decoder {
         hidden_dim: usize,
         act: GluAct,
     ) -> Option<Vec<(Vec<f32>, f32)>> {
-        use rayon::prelude::*;
         if !ferrox_core::weight_matrix::cpu_int_dot_enabled() || !normed2.len().is_multiple_of(32) {
             return None;
         }
@@ -2839,29 +2815,26 @@ impl Decoder {
         let eids = &decision.expert_ids;
         let mut gate = vec![0f32; n_slots * ffn_rows];
         let mut up = vec![0f32; n_slots * ffn_rows];
-        gate.par_chunks_mut(2)
-            .zip(up.par_chunks_mut(2))
-            .enumerate()
-            .for_each(|(p, (gc, uc))| {
-                let row0 = p * 2;
-                let slot = row0 / ffn_rows;
-                let r = row0 % ffn_rows;
-                let ex = &experts[eids[slot]];
-                if let (Some((g0, g1)), Some((u0, u1))) = (
-                    ex.gate.dot_pair_cpu_q8(r, &q8),
-                    ex.up.dot_pair_cpu_q8(r, &q8),
-                ) {
-                    gc[0] = g0;
-                    gc[1] = g1;
-                    uc[0] = u0;
-                    uc[1] = u1;
-                } else {
-                    gc[0] = ex.gate.dot_row_cpu_q8(r, &q8).unwrap_or(0.0);
-                    gc[1] = ex.gate.dot_row_cpu_q8(r + 1, &q8).unwrap_or(0.0);
-                    uc[0] = ex.up.dot_row_cpu_q8(r, &q8).unwrap_or(0.0);
-                    uc[1] = ex.up.dot_row_cpu_q8(r + 1, &q8).unwrap_or(0.0);
-                }
-            });
+        ferrox_core::par::chunks_mut2(&mut gate, &mut up, 2, 1, |p, gc, uc| {
+            let row0 = p * 2;
+            let slot = row0 / ffn_rows;
+            let r = row0 % ffn_rows;
+            let ex = &experts[eids[slot]];
+            if let (Some((g0, g1)), Some((u0, u1))) = (
+                ex.gate.dot_pair_cpu_q8(r, &q8),
+                ex.up.dot_pair_cpu_q8(r, &q8),
+            ) {
+                gc[0] = g0;
+                gc[1] = g1;
+                uc[0] = u0;
+                uc[1] = u1;
+            } else {
+                gc[0] = ex.gate.dot_row_cpu_q8(r, &q8).unwrap_or(0.0);
+                gc[1] = ex.gate.dot_row_cpu_q8(r + 1, &q8).unwrap_or(0.0);
+                uc[0] = ex.up.dot_row_cpu_q8(r, &q8).unwrap_or(0.0);
+                uc[1] = ex.up.dot_row_cpu_q8(r + 1, &q8).unwrap_or(0.0);
+            }
+        });
         let mut activated = vec![0f32; n_slots * ffn_rows];
         // Generic over the gate nonlinearity rather than two copies of
         // the loop, and monomorphised so the call still inlines: the
@@ -2869,9 +2842,7 @@ impl Decoder {
         // sits under `ferrox_core::matmul`'s own fork threshold), which
         // is why this does not just call `act.apply`.
         fn combine<F: Fn(f32) -> f32 + Sync>(out: &mut [f32], gate: &[f32], up: &[f32], f: F) {
-            out.par_iter_mut()
-                .enumerate()
-                .for_each(|(idx, a)| *a = f(gate[idx]) * up[idx]);
+            ferrox_core::par::items_mut(out, 1, |idx, a| *a = f(gate[idx]) * up[idx]);
         }
         match act {
             GluAct::Swiglu => combine(&mut activated, &gate, &up, ferrox_core::matmul::silu),
@@ -2882,20 +2853,18 @@ impl Decoder {
             .iter()
             .map(|&w| (vec![0f32; hidden_dim], w))
             .collect();
-        outs.par_iter_mut()
-            .enumerate()
-            .for_each(|(slot, (out, _))| {
-                let ex = &experts[eids[slot]];
-                let act_slot = &activated[slot * ffn_rows..(slot + 1) * ffn_rows];
-                if act_slot.len().is_multiple_of(32) {
-                    let down_q8 = ferrox_quant::quantize_activations_q8(act_slot);
-                    if let Some(d) = ex.down.apply_cpu_q8(&down_q8) {
-                        *out = d;
-                        return;
-                    }
+        ferrox_core::par::items_mut(&mut outs, 1, |slot, (out, _)| {
+            let ex = &experts[eids[slot]];
+            let act_slot = &activated[slot * ffn_rows..(slot + 1) * ffn_rows];
+            if act_slot.len().is_multiple_of(32) {
+                let down_q8 = ferrox_quant::quantize_activations_q8(act_slot);
+                if let Some(d) = ex.down.apply_cpu_q8(&down_q8) {
+                    *out = d;
+                    return;
                 }
-                *out = ex.down.apply(act_slot);
-            });
+            }
+            *out = ex.down.apply(act_slot);
+        });
         Some(outs)
     }
 
@@ -3746,7 +3715,7 @@ impl Decoder {
         let mut metal_kv_guard: Option<
             std::sync::MutexGuard<'_, Option<Vec<ferrox_metal::attn::MetalKvBuffers>>>,
         > = if use_metal_attn {
-            Some(self.metal_attn_kv.lock().unwrap())
+            Some(Self::lock_metal_attn_kv(&self.metal_attn_kv))
         } else {
             None
         };
@@ -3765,7 +3734,9 @@ impl Decoder {
                         || v.iter().any(|m| m.capacity() < need_cap)
                         || v.iter()
                             .zip(kv_caches.iter())
-                            .any(|(m, c)| m.seq_len != c.seq_len)
+                            // ROWS: Metal holds rows, and this asks whether the
+                            // host buffer matches them.
+                            .any(|(m, c)| m.seq_len != c.rows())
                 }
             };
             if reset {
@@ -3784,7 +3755,7 @@ impl Decoder {
                 if bufs.len() == need {
                     let mut ok = true;
                     for (m, c) in bufs.iter_mut().zip(kv_caches.iter()) {
-                        if c.seq_len > 0 && m.upload_from_host(&c.k, &c.v, c.seq_len).is_err() {
+                        if c.rows() > 0 && m.upload_from_host(&c.k, &c.v, c.rows()).is_err() {
                             ok = false;
                             break;
                         }
@@ -3850,7 +3821,10 @@ impl Decoder {
                 if swa_fits {
                     if let Some(guard) = metal_kv_guard.as_mut() {
                         if let Some(metal_kvs) = guard.as_mut() {
-                            if metal_kvs[l].seq_len == cache.seq_len && start_pos == cache.seq_len {
+                            // POSITIONS: compared against `start_pos`.
+                            if metal_kvs[l].seq_len == cache.positions()
+                                && start_pos == cache.positions()
+                            {
                                 layer.moe.record_activations(&[0]);
                                 let fused = layer.moe.with_expert(0, |ex| {
                                     let (q, k, v, o) = (
@@ -3878,6 +3852,7 @@ impl Decoder {
                                             post_attn_norm: layer.attn.post_attn_norm.as_deref(),
                                             post_ffn_norm: layer.attn.post_ffn_norm.as_deref(),
                                             extras: self.metal_attn_extras(layer),
+                                            rope: self.metal_layer_rope(l),
                                             layer_idx: l as u32,
                                         };
                                     ferrox_metal::attn::launch_prefill_dense_layer(
@@ -3887,8 +3862,6 @@ impl Decoder {
                                         n_heads,
                                         batch_size,
                                         self.metal_rope(),
-                                        self.config.layer_rope_theta(l),
-                                        self.config.rope_freqs.as_deref(),
                                         start_pos,
                                         self.config.rms_norm_eps,
                                         gelu,
@@ -3967,18 +3940,7 @@ impl Decoder {
                 }
             }
 
-            if let Some(q_norm) = &layer.attn.q_norm {
-                for row in q_batch.chunks_mut(q_width) {
-                    let normed = self.apply_qk_norm(row, q_norm);
-                    row.copy_from_slice(&normed);
-                }
-            }
-            if let Some(k_norm) = &layer.attn.k_norm {
-                for row in k_batch.chunks_mut(kv_width) {
-                    let normed = self.apply_qk_norm(row, k_norm);
-                    row.copy_from_slice(&normed);
-                }
-            }
+            self.apply_qk_norms_pre_rope(layer, &mut q_batch, &mut k_batch, q_width, kv_width);
             // Host-side `mscale`, applied before either backend ropes.
             // The Metal branch below therefore hands its kernels
             // `attn_factor_applied_by_caller()` — folding it into cos/sin
@@ -3998,8 +3960,9 @@ impl Decoder {
                 // Metal prefill applies attn softcap in FA-vec / legacy GQA.
                 if let Some(guard) = metal_kv_guard.as_mut() {
                     if let Some(metal_kvs) = guard.as_mut() {
-                        if metal_kvs[l].seq_len == cache.seq_len
-                            && start_pos == cache.seq_len
+                        // POSITIONS: compared against `start_pos`.
+                        if metal_kvs[l].seq_len == cache.positions()
+                            && start_pos == cache.positions()
                             && swa_fits
                         {
                             let prefill_res = {
@@ -4012,7 +3975,7 @@ impl Decoder {
                                     batch_size,
                                     self.metal_rope().attn_factor_applied_by_caller(),
                                     self.config.layer_rope_theta(l),
-                                    self.config.rope_freqs.as_deref(),
+                                    self.config.layer_rope_freqs(l),
                                     start_pos,
                                     self.config.attn_logit_softcap,
                                     false,
@@ -4185,6 +4148,12 @@ impl Decoder {
                         );
                     }
                 });
+            // `maincoder` / `hunyuan-moe` norm HERE instead. Reachable
+            // only on the host path, which is why
+            // `layer_supports_metal_attn` refuses the layer outright
+            // rather than letting the Metal arms above consume a batch
+            // that has not been normed yet.
+            self.apply_qk_norms_post_rope(layer, &mut q_batch, &mut k_batch, q_width, kv_width);
             // Elementwise, so the whole Q batch in one call. Like the
             // multi-sequence path, this body did not apply it at all
             // until the decoration audit. It is placed AFTER the Metal
@@ -4196,7 +4165,10 @@ impl Decoder {
             // `attention_scale` is set is in `layer_supports_metal_attn`.
             self.apply_attention_scale(&mut q_batch);
 
-            let base_seq_len = cache.seq_len;
+            // ROWS, not positions: it is added to `b + 1` below to give
+            // each query in the batch the length of the KV it attends
+            // over, which is a count of resident rows.
+            let base_seq_len = cache.rows();
             for b in 0..batch_size {
                 cache
                     .push(
@@ -4262,6 +4234,21 @@ impl Decoder {
                     window,
                 )
             };
+
+            // Every query in this batch has now been answered, so the
+            // rows behind the window are rows nothing will read again
+            // (#61). This is why eviction is not inside `KvCache::push`:
+            // `base_seq_len` above was captured BEFORE the batch's
+            // pushes and every query's KV length is derived from it, so
+            // a drop between the push loop and here would attend the
+            // whole prompt over shifted keys.
+            //
+            // Per layer rather than after the stack, and that is where
+            // most of the prefill saving is: a windowed layer hands its
+            // prompt rows back before the next layer allocates its own,
+            // so a 32k prompt holds ONE layer's full history at a time
+            // instead of every windowed layer's at once.
+            self.evict_layer_kv(l, cache);
 
             let mut projected_batch = layer.attn.o_proj.apply_batch(&attn_out_batch, batch_size);
             if let Some(oai) = oai {
@@ -4572,18 +4559,7 @@ impl Decoder {
                 }
             }
 
-            if let Some(q_norm) = &layer.attn.q_norm {
-                for row in q_batch.chunks_mut(q_width) {
-                    let normed = self.apply_qk_norm(row, q_norm);
-                    row.copy_from_slice(&normed);
-                }
-            }
-            if let Some(k_norm) = &layer.attn.k_norm {
-                for row in k_batch.chunks_mut(kv_width) {
-                    let normed = self.apply_qk_norm(row, k_norm);
-                    row.copy_from_slice(&normed);
-                }
-            }
+            self.apply_qk_norms_pre_rope(layer, &mut q_batch, &mut k_batch, q_width, kv_width);
             self.apply_rope_attn_factor(&mut q_batch, &mut k_batch);
 
             for b in 0..batch_size {
@@ -4605,6 +4581,7 @@ impl Decoder {
                     );
                 }
             }
+            self.apply_qk_norms_post_rope(layer, &mut q_batch, &mut k_batch, q_width, kv_width);
             // Applied to the whole Q batch at once because it is
             // elementwise. This path did not apply it at all until the
             // decoration audit: `attention_scale` reached only
@@ -4701,143 +4678,6 @@ impl Decoder {
             .flatten()
             .collect();
         self.logits_from_flat_hidden(final_normed_batch, batch_size)
-    }
-}
-
-#[cfg(test)]
-mod partial_rotary_tests {
-    use super::*;
-
-    /// Phi-3/Phi-4 rotate `rope.dimension_count` of each head and pass
-    /// the rest through. The tail staying bit-identical is the whole
-    /// property: rotating it would make dimensions position-dependent
-    /// that the model never trained that way.
-    #[test]
-    fn partial_rotary_leaves_the_tail_untouched() {
-        let mut cfg = crate::config::test_dense_fixture();
-        cfg.head_dim = 8;
-        cfg.rope_layout = crate::config::RopeLayout::Neox;
-        cfg.rope_freqs = None;
-        cfg.rope_dim = Some(4);
-        let decoder = Decoder::new_random_small(cfg, 1, 32);
-
-        let mut head: Vec<f32> = (0..8).map(|i| 1.0 + i as f32).collect();
-        let before = head.clone();
-        decoder.apply_rope_head_theta(&mut head, 3, 10000.0);
-
-        assert_eq!(
-            &head[4..],
-            &before[4..],
-            "dims at or past rope_dim must not rotate"
-        );
-        assert!(
-            head[..4] != before[..4],
-            "dims below rope_dim must rotate at a non-zero position"
-        );
-    }
-
-    /// `attn_factor` is a magnitude scale folded into cos/sin inside
-    /// ggml's `rope_yarn`, so it can only ever touch the rotated
-    /// channels. The pass-through tail must come out bit-identical —
-    /// scaling it is a different graph, and it was one, until
-    /// `ferrox parity` reported Phi-4-mini as the single DRIFT in a
-    /// 17-model sweep against llama.cpp.
-    #[test]
-    fn attn_factor_scales_only_the_rotated_channels() {
-        let mut cfg = crate::config::test_dense_fixture();
-        cfg.head_dim = 8;
-        cfg.n_heads = 2;
-        cfg.n_kv_heads = 2;
-        cfg.rope_dim = Some(4);
-        cfg.rope_attn_factor = 2.0;
-        let decoder = Decoder::new_random_small(cfg, 1, 32);
-
-        // Two heads, so a per-head slice bug cannot hide behind a single
-        // head that happens to span the whole buffer.
-        let mut q: Vec<f32> = (0..16).map(|i| 1.0 + i as f32).collect();
-        let mut k: Vec<f32> = (0..16).map(|i| 1.0 + i as f32).collect();
-        let before = q.clone();
-        decoder.apply_rope_attn_factor(&mut q, &mut k);
-
-        for h in 0..2 {
-            let base = h * 8;
-            for i in 0..4 {
-                assert_eq!(
-                    q[base + i],
-                    before[base + i] * 2.0,
-                    "rotated channel {i} of head {h} must be scaled"
-                );
-            }
-            for i in 4..8 {
-                assert_eq!(
-                    q[base + i],
-                    before[base + i],
-                    "pass-through channel {i} of head {h} must be untouched"
-                );
-            }
-        }
-        assert_eq!(q, k, "q and k take the same magnitude scale");
-    }
-
-    /// With no partial rotary the whole head is rotated, so the whole
-    /// head takes the scale — the narrow case must not become the rule.
-    #[test]
-    fn attn_factor_scales_the_whole_head_without_partial_rotary() {
-        let mut cfg = crate::config::test_dense_fixture();
-        cfg.head_dim = 8;
-        cfg.n_heads = 1;
-        cfg.n_kv_heads = 1;
-        cfg.rope_dim = None;
-        cfg.rope_attn_factor = 3.0;
-        let decoder = Decoder::new_random_small(cfg, 1, 32);
-
-        let mut q: Vec<f32> = (0..8).map(|i| 1.0 + i as f32).collect();
-        let mut k = q.clone();
-        let before = q.clone();
-        decoder.apply_rope_attn_factor(&mut q, &mut k);
-        for i in 0..8 {
-            assert_eq!(q[i], before[i] * 3.0);
-        }
-    }
-
-    /// The same call with no `rope_dim` must rotate everything, so the
-    /// narrow case cannot silently become the default.
-    #[test]
-    fn full_rotary_still_rotates_the_whole_head() {
-        let mut cfg = crate::config::test_dense_fixture();
-        cfg.head_dim = 8;
-        cfg.rope_layout = crate::config::RopeLayout::Neox;
-        cfg.rope_freqs = None;
-        cfg.rope_dim = None;
-        let decoder = Decoder::new_random_small(cfg, 1, 32);
-
-        let mut head: Vec<f32> = (0..8).map(|i| 1.0 + i as f32).collect();
-        let before = head.clone();
-        decoder.apply_rope_head_theta(&mut head, 3, 10000.0);
-        assert!(head[4..] != before[4..]);
-    }
-
-    /// `mscale` scales q and k and nothing else; `1.0` must be a literal
-    /// no-op so every other model pays nothing.
-    #[test]
-    fn rope_attn_factor_scales_q_and_k_only() {
-        let mut cfg = crate::config::test_dense_fixture();
-        cfg.rope_attn_factor = 2.0;
-        let decoder = Decoder::new_random_small(cfg, 1, 32);
-        let mut q = vec![1.0f32, -2.0, 3.0];
-        let mut k = vec![0.5f32, 4.0];
-        decoder.apply_rope_attn_factor(&mut q, &mut k);
-        assert_eq!(q, vec![2.0, -4.0, 6.0]);
-        assert_eq!(k, vec![1.0, 8.0]);
-
-        let mut cfg = crate::config::test_dense_fixture();
-        cfg.rope_attn_factor = 1.0;
-        let decoder = Decoder::new_random_small(cfg, 1, 32);
-        let mut q = vec![1.0f32, -2.0];
-        let mut k = vec![3.0f32];
-        decoder.apply_rope_attn_factor(&mut q, &mut k);
-        assert_eq!(q, vec![1.0, -2.0]);
-        assert_eq!(k, vec![3.0]);
     }
 }
 
@@ -5093,7 +4933,7 @@ mod tests {
         decoder.forward_token(2, 2, &mut caches);
 
         for cache in &caches {
-            assert_eq!(cache.seq_len, 3);
+            assert_eq!(cache.positions(), 3);
         }
     }
 
@@ -6619,7 +6459,7 @@ mod tests {
         decoder_b.forward_batch(&tokens, 0, &mut caches_b);
 
         for (ca, cb) in caches_a.iter().zip(caches_b.iter()) {
-            assert_eq!(ca.seq_len, cb.seq_len);
+            assert_eq!(ca.positions(), cb.positions());
             assert_eq!(ca.k.len(), cb.k.len());
             for (a, b) in ca.k.iter().zip(cb.k.iter()) {
                 assert!((a - b).abs() < 1e-4);
@@ -6871,5 +6711,66 @@ mod metal_rope_tests {
         let mut odd = phi_like_config();
         odd.rope_dim = Some(95);
         assert!(!supported(odd), "odd n_rot must keep the model off Metal");
+    }
+
+    /// A Gemma-3-4B-shaped config: `rope_scaling {linear, factor 8}`
+    /// folded into the full-attention layers' divisors, nothing on the
+    /// sliding ones, `sliding_window_pattern = 6` last-dense.
+    fn gemma3_4b_shaped_config() -> ModelConfig {
+        let mut cfg = crate::config::test_dense_fixture();
+        cfg.head_dim = 8;
+        cfg.rope_layout = crate::config::RopeLayout::Norm;
+        cfg.rope_theta = 1_000_000.0;
+        cfg.rope_theta_swa = Some(10_000.0);
+        cfg.sliding_window = Some(4);
+        cfg.swa_pattern = Some(6);
+        cfg.rope_freqs = Some(crate::config::RopeFreqs {
+            full: vec![8.0; 4],
+            swa: Some(vec![1.0; 4]),
+        });
+        // One full period, so the run holds five sliding layers and one
+        // full-attention layer -- Gemma-3's ratio, and the smallest one
+        // that makes `rope_freqs_vary_by_layer` true.
+        cfg.n_layers = 6;
+        cfg
+    }
+
+    /// What the fused Metal stacks are handed per layer must be BOTH
+    /// halves of `ModelConfig::layer_rope`, layer by layer.
+    ///
+    /// `Decoder::metal_stack_needs_per_layer_rope_freqs` used to refuse
+    /// exactly this config off the fused prefill/decode stacks, because
+    /// those took one `freq_factors` slice for a whole run beside a
+    /// per-layer theta -- half the answer varying and half not, which is
+    /// this repo's dominant bug shape. `LayerRope` carries the pair, and
+    /// this pins that the decoder fills it from the pair rather than
+    /// re-deriving either half on its own.
+    #[test]
+    fn the_metal_stacks_are_handed_each_layer_s_own_rope_pair() {
+        let cfg = gemma3_4b_shaped_config();
+        assert!(
+            cfg.rope_freqs_vary_by_layer(),
+            "fixture must be the shape that used to be refused"
+        );
+        let decoder = Decoder::new_random_small(cfg, 6, 32);
+
+        for il in 0..decoder.layers.len() {
+            let (theta, ff) = decoder.config.layer_rope(il);
+            let sent = decoder.metal_layer_rope(il);
+            assert_eq!(sent.theta, theta, "layer {il} base");
+            assert_eq!(sent.freq_factors, ff, "layer {il} divisors");
+        }
+
+        // Not vacuous: with `swa_pattern = 6` last-dense, layers 0..=4
+        // slide and layer 5 does not, so the run really does hold two
+        // different answers.
+        let sliding = decoder.metal_layer_rope(0);
+        let full = decoder.metal_layer_rope(5);
+        assert_eq!(sliding.freq_factors, Some(&[1.0f32; 4][..]));
+        assert_eq!(full.freq_factors, Some(&[8.0f32; 4][..]));
+        assert_ne!(
+            sliding, full,
+            "a run of layers that all rope alike proves nothing here"
+        );
     }
 }

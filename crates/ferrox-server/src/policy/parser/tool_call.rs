@@ -227,6 +227,40 @@ pub const TOOL_MARKERS: [&str; 14] = [
     "<atem:function_calls>",
 ];
 
+/// gpt-oss's harmony framing, which is not a marker pair and so has no
+/// [`Markers`] entry: a call is a CHANNEL whose header is addressed to a
+/// function, and `<|channel|>` on its own opens an ordinary message.
+///
+/// These are the literals [`ToolCallParser::parse_harmony`] reads a call
+/// with, and they are `pub(crate)` because
+/// [`crate::tool_grammar`] WRITES a forced call from the same ones.
+/// Spelling a marker twice, once to read and once to write, is how the
+/// two halves drift.
+pub(crate) mod harmony {
+    /// Opens a channel header.
+    pub(crate) const CHANNEL_OPEN: &str = "<|channel|>";
+    /// Ends the header and opens the message body.
+    pub(crate) const MESSAGE_OPEN: &str = "<|message|>";
+    /// Ends a message body that is a tool call.
+    pub(crate) const CALL_CLOSE: &str = "<|call|>";
+    /// Every marker that ends a message body. `<|start|>` is here
+    /// because a model that forgets to close one starts the next.
+    pub(crate) const BODY_ENDS: [&str; 4] = ["<|end|>", "<|return|>", CALL_CLOSE, "<|start|>"];
+    /// The header token that addresses a message, and the namespace a
+    /// tool lives in. A header token spelled `to=functions.NAME` is what
+    /// makes a channel a call.
+    pub(crate) const RECIPIENT_KEY: &str = "to=";
+    pub(crate) const FUNCTION_NAMESPACE: &str = "functions.";
+    /// The optional constrain hint the harmony spec allows in a header
+    /// between the recipient and the message.
+    pub(crate) const CONSTRAIN: &str = "<|constrain|>";
+    /// The channels a call is written on. `parse_harmony` accepts any
+    /// channel whose header addresses a function; these two are the ones
+    /// the checkpoint is trained to use, per llama.cpp's
+    /// `common_chat_params_init_gpt_oss`.
+    pub(crate) const CHANNELS: [&str; 2] = ["commentary", "analysis"];
+}
+
 /// MiniMax-M3's namespace prefix, in front of every structural tag.
 const M3_NS: &str = "]<]minimax[>[";
 /// `M3_NS` plus `<`: where every M3 tag begins.
@@ -381,7 +415,9 @@ impl ToolCallFormat {
         matches!(self, ToolCallFormat::MuseGlimmer)
     }
 
-    fn markers(self) -> Markers {
+    /// This format's framing, the one description both the reader and
+    /// the writer of a call work from. See [`Markers`].
+    pub(crate) fn markers(self) -> Markers {
         match self {
             ToolCallFormat::Qwen25 => Markers::block("<tool_call>", "</tool_call>"),
             ToolCallFormat::FunctionCall => {
@@ -468,7 +504,10 @@ impl ToolCallFormat {
                 invoke: None,
                 param: Some(TagGrammar {
                     open: "<arg_key>",
-                    name: NameStyle::Bare,
+                    name: NameStyle::Paired {
+                        key_close: "</arg_key>",
+                        value_open: "<arg_value>",
+                    },
                     close: "</arg_value>",
                 }),
                 trim_newlines: TrimStyle::All,
@@ -478,23 +517,38 @@ impl ToolCallFormat {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-enum NameStyle {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NameStyle {
     /// The name is everything between the opener and `>`.
     Bare,
     /// The name is the `name="…"` attribute.
     Attribute,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct TagGrammar {
-    open: &'static str,
-    name: NameStyle,
-    close: &'static str,
+    /// The name is an element of its own, and the value opens in a
+    /// second element after it: GLM writes
+    /// `<arg_key>k</arg_key><arg_value>v</arg_value>`.
+    ///
+    /// A variant rather than a `param.open == "<arg_key>"` test inside
+    /// [`ToolCallParser::read_param_header`], because that test was a
+    /// second place the format was written down: everything else about
+    /// GLM lives in [`Markers`], and a reader that special-cased a
+    /// marker string is one a writer cannot derive itself from.
+    Paired {
+        /// Closes the key element.
+        key_close: &'static str,
+        /// Opens the value element. [`TagGrammar::close`] closes it.
+        value_open: &'static str,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TrimStyle {
+pub(crate) struct TagGrammar {
+    pub(crate) open: &'static str,
+    pub(crate) name: NameStyle,
+    pub(crate) close: &'static str,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TrimStyle {
     /// Values are handed over exactly as written.
     None,
     /// Strip at most one leading and one trailing newline -- the ones
@@ -506,7 +560,7 @@ enum TrimStyle {
 
 /// What a parameter the request's schema never mentioned is worth.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Undeclared {
+pub(crate) enum Undeclared {
     /// Guess from the text: a number if it reads as one, and so on.
     Loose,
     /// A string, always. muse-glimmer's template says so, and guessing
@@ -514,14 +568,21 @@ enum Undeclared {
     String,
 }
 
-#[derive(Debug, Clone, Copy)]
-struct Markers {
-    open: &'static str,
-    close: &'static str,
-    invoke: Option<TagGrammar>,
-    param: Option<TagGrammar>,
-    trim_newlines: TrimStyle,
-    undeclared: Undeclared,
+/// One format's framing, as data.
+///
+/// This is the single description of a wire format in this server: the
+/// parser reads by it, and [`crate::tool_grammar`] writes the GBNF root
+/// rule that FORCES a call from the same values. Two hand-maintained
+/// tables -- one to read a framing and one to write it -- is this
+/// repo's dominant bug shape, so there is one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Markers {
+    pub(crate) open: &'static str,
+    pub(crate) close: &'static str,
+    pub(crate) invoke: Option<TagGrammar>,
+    pub(crate) param: Option<TagGrammar>,
+    pub(crate) trim_newlines: TrimStyle,
+    pub(crate) undeclared: Undeclared,
 }
 
 impl Markers {
@@ -1264,11 +1325,13 @@ impl ToolCallParser {
     fn read_param_header(&self, start: usize, param: &TagGrammar) -> Option<(String, bool, usize)> {
         match param.name {
             // GLM writes `<arg_key>k</arg_key><arg_value>v`.
-            NameStyle::Bare if param.open == "<arg_key>" => {
+            NameStyle::Paired {
+                key_close,
+                value_open,
+            } => {
                 let key_start = start + param.open.len();
-                let key_end = self.buffer[key_start..].find("</arg_key>")? + key_start;
+                let key_end = self.buffer[key_start..].find(key_close)? + key_start;
                 let key = self.buffer[key_start..key_end].trim().to_string();
-                let value_open = "<arg_value>";
                 let value_start =
                     self.buffer[key_end..].find(value_open)? + key_end + value_open.len();
                 Some((key, false, value_start))
@@ -1393,17 +1456,20 @@ impl ToolCallParser {
         let mut normal = String::new();
         let mut calls = Vec::new();
         let mut cursor = 0usize;
-        while let Some(channel) = text[cursor..].find("<|channel|>").map(|i| i + cursor) {
-            let header_start = channel + "<|channel|>".len();
+        while let Some(channel) = text[cursor..]
+            .find(harmony::CHANNEL_OPEN)
+            .map(|i| i + cursor)
+        {
+            let header_start = channel + harmony::CHANNEL_OPEN.len();
             let Some(message) = text[header_start..]
-                .find("<|message|>")
+                .find(harmony::MESSAGE_OPEN)
                 .map(|i| i + header_start)
             else {
                 break;
             };
             let header = &text[header_start..message];
-            let body_start = message + "<|message|>".len();
-            let (end, matched) = ["<|end|>", "<|return|>", "<|call|>", "<|start|>"]
+            let body_start = message + harmony::MESSAGE_OPEN.len();
+            let (end, matched) = harmony::BODY_ENDS
                 .iter()
                 .filter_map(|marker| {
                     text[body_start..]
@@ -1414,10 +1480,11 @@ impl ToolCallParser {
                 .map(|(index, marker)| (index, Some(marker)))
                 .unwrap_or((text.len(), None));
 
-            if let Some(name) = header
-                .split_whitespace()
-                .find_map(|token| token.strip_prefix("to=functions."))
-            {
+            if let Some(name) = header.split_whitespace().find_map(|token| {
+                token
+                    .strip_prefix(harmony::RECIPIENT_KEY)?
+                    .strip_prefix(harmony::FUNCTION_NAMESPACE)
+            }) {
                 normal.push_str(&text[cursor..channel]);
                 let arguments = normalize_arguments(&text[body_start..end]);
                 if self.known(name) {
@@ -2609,17 +2676,25 @@ fn close_ledger(open: &OpenCall) -> String {
 /// `None` -- undeclared -- is a best-effort parse that keeps the text
 /// whenever it is not obviously something else.
 fn convert_declared(text: &str, declared: Option<&str>) -> Value {
+    // A declared NUMBER carries no meaning in the whitespace around it,
+    // and `str::parse` refuses it: a DeepSeek template's own layout puts
+    // a newline there (`TrimStyle::None` keeps it, because a declared
+    // STRING's spaces are the model's), and an un-trimmed `"\n3\n"`
+    // reached the tool as a string where the schema said integer. The
+    // string arms are deliberately not trimmed.
     match declared {
         Some("string") | Some("str") | Some("enum") => Value::String(text.to_string()),
         Some("integer") | Some("int") => text
+            .trim()
             .parse::<i64>()
             .map(Value::from)
             .unwrap_or_else(|_| Value::String(text.to_string())),
         Some("number") | Some("float") | Some("double") => text
+            .trim()
             .parse::<f64>()
             .map(Value::from)
             .unwrap_or_else(|_| Value::String(text.to_string())),
-        Some("boolean") | Some("bool") => Value::Bool(text.eq_ignore_ascii_case("true")),
+        Some("boolean") | Some("bool") => Value::Bool(text.trim().eq_ignore_ascii_case("true")),
         Some("object") | Some("array") => {
             serde_json::from_str(text).unwrap_or_else(|_| Value::String(text.to_string()))
         }
@@ -2635,6 +2710,9 @@ fn read_name(attrs: &str, style: NameStyle) -> Option<String> {
             (!name.is_empty()).then(|| name.to_string())
         }
         NameStyle::Attribute => read_attribute(attrs, "name"),
+        // Only a parameter tag is ever paired, and a paired parameter's
+        // key is read by `read_param_header` before this is reached.
+        NameStyle::Paired { .. } => None,
     }
 }
 

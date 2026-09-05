@@ -56,6 +56,7 @@ Same via explicit subcommand: `ferrox run -m …`.
 | Flag | Notes |
 |---|---|
 | `-m` / `--model` | GGUF path |
+| `-hf` / `--hf-repo` | Hugging Face repo, `user/repo[:QUANT]`. Fetched to the cache on first use. Mutually exclusive with `-m`, see below |
 | `-p` / `--prompt` | Prompt string |
 | `-f` / `--file` | Prompt from file |
 | `-n` / `--n-predict` | `-1` = fill remaining context |
@@ -67,12 +68,19 @@ Same via explicit subcommand: `ferrox run -m …`.
 | `--top-p` | Nucleus sampling. Default `0.95`, llama.cpp's |
 | `--min-p` | Drop every candidate less than this fraction as likely as the most likely one. `0.0` = off. Default `0.05`, llama.cpp's (`common/common.h:231`) |
 | `--repeat-penalty` | `1.0` = off. Default `1.1`; llama.cpp defaults this one to `1.0` |
+| `--presence-penalty` | Penalise a token for having appeared at all. `0.0` = off, llama.cpp's default. The engine and the HTTP API always supported this; the CLI used to hardcode it to zero |
+| `--frequency-penalty` | Penalise a token in proportion to how often it has appeared. `0.0` = off |
+| `--hf-file` | Exact filename inside `--hf-repo`, llama.cpp's `-hff`. Skips quant resolution entirely |
 | `--repeat-last-n` | How many recent tokens the repetition / presence / frequency penalties consider. `0` = penalties off. Default `64`, llama.cpp's (`common/common.h:238`) |
 | `-s` / `--seed` | `-1` = time-based |
+| `--samplers` / `--sampler-seq` | Order the chain runs in, semicolon-separated. A sampler ferrox lacks is refused by name, see below |
+| `--grammar` | Constrain generation to a GBNF grammar, llama.cpp's `--grammar` |
+| `--grammar-file` | Read the GBNF grammar from a file, llama.cpp's `--grammar-file` |
+| `-j` / `--json-schema` | Constrain generation to a JSON Schema, converted to GBNF. llama.cpp's `-j` |
 | `-dev` / `--device` | `auto`, `none`, `cpu`, `metal`, or `cuda` |
 | `--list-devices` | Print compiled, detected devices and exit |
-| `-ngl` / `--gpu-layers` / `--n-gpu-layers` | `0`, `auto`, `all`, or a count at/above the layer count. A *partial* count is refused — see below |
-| `--ctk` | KV dtype: `f16` (default), `q8_0`/`turbo8`/`fp8`/`turbo4` (Metal), `turbo3` (falls back). Sets `FERROX_CTK` |
+| `-ngl` / `--gpu-layers` / `--n-gpu-layers` | `0`, `auto`, `all`, or a count at/above the layer count. A *partial* count is refused, see below |
+| `--ctk` | KV dtype: `f16` (default), `q8_0`/`turbo8`/`fp8`/`turbo4`, `turbo3` (falls back). **Metal only**, see below. Sets `FERROX_CTK` |
 | `--system` | Chat mode only |
 | `--no-cnv` | Skip chat-template wrap |
 | `-e` / `--escape` | Expand `\n` `\t` `\r` `\\` in `-p`. **On by default**, as in llama.cpp |
@@ -82,6 +90,39 @@ Same via explicit subcommand: `ferrox run -m …`.
 | `--mtp` | Errors: MTP draft heads not loaded from GGUF yet |
 
 Stderr prints load and throughput timings. Generated text goes to stdout.
+
+**Structured output.** `--grammar`, `--grammar-file` and `-j` all end
+at the same stack machine, which masks every token that cannot continue
+a valid string. A schema is compiled to GBNF first, so the two paths
+share one enforcer rather than two that drift. The constraint holds per
+token, so there is no retry loop and no repair pass; the same machine
+serves `response_format` and `tool_choice` on the HTTP API
+([docs/API.md](API.md)).
+
+**`--ctk` only binds on Metal.** Only the Metal KV store has a
+selectable dtype. On CPU and CUDA the KV cache is the host `Vec<f32>`,
+so `--ctk f16` there is accepted, ignored, and reported as ignored by
+the startup banner. That matters for memory: f32 doubles the KV bytes
+per token, which is why a model that fits at its full context on Metal
+can need `--ctx-size auto` on CPU. `ferrox inspect-plan` prices both.
+
+`--samplers` (llama.cpp's, also `--sampler-seq`) chooses the ORDER, as a
+semicolon-separated list: `--samplers "penalties;top_k;top_p;min_p;temperature"`
+is the default spelled out. llama.cpp's aliases parse, so `top-k`,
+`nucleus`, `temp` and `typical` all work.
+
+A sampler ferrox does not implement is **refused by name with the
+reason**, never skipped: `dry`, `typ_p`, `xtc` and `top_n_sigma` are
+real llama.cpp samplers, and a caller who asked for one and silently got
+a chain without it was handed a different sampler than the one they
+requested.
+
+Order is not cosmetic, which is why it is worth exposing and why getting
+it wrong is a silent quality regression rather than an error. Each
+filter renormalises over the survivors of the last, so moving a step
+changes what the next step can see. This project shipped that bug once:
+temperature ran first, and top-p then summed probabilities temperature
+had already reshaped.
 
 **The sampler chain is llama.cpp's, in llama.cpp's order.** Penalties,
 then top-k, then top-p, then min-p, and **temperature last**
@@ -114,8 +155,8 @@ model's layer count enable all supported ops on the selected backend.
 **A partial `-ngl` is refused, deliberately.** llama.cpp's `-ngl N` puts
 exactly `N` layers in VRAM and runs the rest on the CPU, which is how
 you fit a model that does not otherwise fit. ferrox has no partial layer
-placement, and it used to accept the count and then offload *everything*
-— same flag, same value, no error, and an out-of-memory on exactly the
+placement, and it used to accept the count and then offload *everything*:
+same flag, same value, no error, and an out-of-memory on exactly the
 machine the flag existed to accommodate. It now stops and says so. Use
 `-ngl 0` for CPU or `-ngl all` for the whole model.
 
@@ -384,7 +425,7 @@ cargo test -p ferrox-cli -- --ignored ferrox_and_llama_cpp_tokenize_the_corpus_i
 
 That test is `#[ignore]`d because it needs the dumper and real
 checkpoints. Checkpoints that are missing, or that the installed
-`libllama` cannot load, are skipped by name — a reference with no answer
+`libllama` cannot load, are skipped by name. A reference with no answer
 is not a verdict either way.
 
 ## Diagnostics (`layer-divergence`, `quant-sensitivity`)
@@ -443,6 +484,120 @@ and would hand a swapped-in tensor another tensor's repacked bytes.
 Cost is one forward pass per tensor: about two minutes for a 1B model's
 112 tensors at 16 prompt tokens. `--layers 0:4` restricts the sweep.
 
+## Perplexity (`ferrox perplexity`)
+
+Corpus evaluation, llama.cpp's `perplexity` tool.
+
+```bash
+ferrox perplexity -m model.gguf -f corpus.txt --ctx-size 512
+```
+
+This is the quality axis the project did not have. `ferrox parity`
+compares first-token distributions and `ferrox bench` measures speed;
+neither answers "is this quantization worse, and by how much". It is
+also the acceptance test the quantizer needs, because a bad K-quant
+encoder produces a file that loads fine and generates measurably worse
+text.
+
+**Measured against `llama-perplexity` on the same corpus and
+checkpoint**, both engines on CPU:
+
+| Checkpoint | ferrox | llama.cpp | Gap |
+|---|---|---|---|
+| SmolLM2-135M Q8_0 | 14.7284 | 14.7529 | -0.17% |
+| SmolLM2-135M Q4_K_M | 15.0896 | 15.1274 | -0.25% |
+| SmolLM2-135M IQ3_M | 16.5144 | 16.6004 | -0.52% |
+| Qwen3-0.6B Q8_0 | 19.9805 | 19.9799 | +0.003% |
+| TinyLlama-1.1B Q8_0 | 11.9852 | 12.0190 | -0.28% |
+
+Every gap is under a fifth of one standard error, and the per-window
+running estimates track window for window, which is what says
+tokenization and chunking agree.
+
+**The gaps are not noise, and their shape is the interesting part.**
+ferrox sits below llama.cpp on every quantized checkpoint and the gap
+widens as the quant coarsens. That is the `vec_dot_type` difference this
+repo already documents
+([`plans/llama-cpp-gap-inventory.md`](plans/llama-cpp-gap-inventory.md)
+§10) showing up on a second axis, with the sign it should have:
+llama.cpp quantizes the activation to the weight's vec_dot type and
+ferrox keeps it in f32, so ferrox is slightly less surprised. Qwen3 is
+the control, straddling zero. A difference in METHOD would not produce a
+gap that is monotone in the quant.
+
+The method is llama.cpp's, verified against `tools/perplexity/perplexity.cpp`
+rather than assumed, because getting any of it wrong makes the number
+incomparable to every published figure while still looking reasonable.
+Non-overlapping windows of `--ctx-size`; `first = n_ctx/2` so 255
+positions are scored at 512, not 256; BOS at the front of the corpus and
+the first token of each window overwritten with it, never scored;
+natural log; `exp` of the unweighted mean over all scored tokens pooled
+across windows, not a mean of per-window perplexities.
+
+Deviations, all recorded in the module doc: one `forward_batch` per
+window rather than an `n_batch` split, which changes the f32 reduction
+grouping and not the causal context; the output head runs at every
+position rather than the scored half, which costs memory and not
+accuracy; and `--ppl-stride`, HellaSwag, WinoGrande, multiple-choice and
+KL-divergence are not implemented.
+
+Every number above is CPU on both sides. Metal and CUDA perplexity is
+unevidenced.
+
+## Quantize (`ferrox quantize`)
+
+Writes a `Q8_0` GGUF from an F32/F16/BF16 one, and **refuses every other
+target by name**.
+
+```bash
+ferrox quantize model-f16.gguf model-q8_0.gguf --type q8_0
+```
+
+That refusal is the point rather than a limitation to apologise for.
+ferrox READS every quant kind it runs and until now could write only
+one, so evaluating it against llama.cpp side by side meant installing
+llama.cpp to produce the file ferrox then reads. A `quantize` whose name
+implied llama.cpp's whole range while emitting Q8_0 for everything would
+be worse than the gap: a K-quant encoder that takes min and max over a
+block, where llama.cpp does an iterative scale and min fit, produces a
+file that loads and generates measurably worse text.
+
+The output is **byte-identical to `llama_model_quantize()`**: 272 of 272
+tensors on `SmolLM2-135M-Instruct-f16`, same metadata, same size. Which
+tensors are quantized is transcribed from llama.cpp's
+`tensor_allows_quantization` rather than reinvented: everything 2-D
+ending in `weight`, except norms, router gates, position and token-type
+embeddings, SSM and shortconv kernels, RWKV time-mix, T5 position bias,
+multimodal patch tables and audio codebooks. `token_embd.weight` and
+`output.weight` ARE quantized here, because the arm that lifts the
+output head to Q6_K in other mixes is gated on the target not being
+Q8_0.
+
+`Q4_K_S` and `Q4_K_M` are also written, with `--pure`. Everything else
+(the remaining K-quants, the IQ tiers, MXFP4, imatrix) is refused by
+name rather than approximated. Tracked as
+[#70](https://github.com/antonellof/ferrox/issues/70).
+
+**Q4_K is not byte-identical to llama.cpp's, and cannot be.** Compared
+tensor by tensor against `llama-quantize --pure`, 113 of 311 tensors
+match exactly and 198 differ in about 0.05% of their bytes. The cause is
+not the algorithm: `ggml-quants.c.o` carries 1957 FMA instructions
+because clang contracts `a*b+c` into a fused multiply-add by default for
+C, and Rust does not, so `quantize_row_q4_K_ref`'s exact output is a
+property of the compiler that built the reference. llama.cpp built with
+contraction off would not reproduce it either. Q8_0 IS byte-identical,
+because its arithmetic has no accumulated multiply-add to contract.
+
+What is equal is the thing that matters. Perplexity of the two files, on
+the same corpus through the same engine: **25.1444** for ferrox's
+against **25.1805** for llama.cpp's, 2.4% of one standard error apart.
+
+One refusal to know about: a tensor whose row width is not a multiple of
+256 stops the run. llama.cpp answers that case by changing the tensor's
+TYPE, to Q5_0 or F16, and ferrox has neither encoder; padding the row
+would shift every following row on decode. SmolLM2-135M cannot be Q4_K
+quantized here for that reason, its embedding being 576 wide.
+
 ## Hugging Face Hub (`download`, `pull`)
 
 Fetches a GGUF over HTTPS directly. No Python and no
@@ -450,8 +605,42 @@ Fetches a GGUF over HTTPS directly. No Python and no
 Rust engine could not fetch its own weights without a Python
 toolchain.
 
-`download` takes the same arguments as `hf download`, so a command
-copied off a model card runs unchanged:
+### `-hf`, llama.cpp's one-command form
+
+`-hf user/repo[:QUANT]` fetches on first use and serves or runs
+straight away, so nothing has to be downloaded by hand first:
+
+```bash
+ferrox serve -hf bartowski/Llama-3.2-3B-Instruct-GGUF:Q4_K_M
+ferrox -hf bartowski/Llama-3.2-3B-Instruct-GGUF:Q4_K_M -p "Hi" -n 64
+```
+
+The tag after the colon is a **quant label, not a git revision**, which
+is worth saying because `repo:thing` means a revision nearly everywhere
+else. It matches without regard to case, because repos spell it
+`Q4_K_M` and `q4_k_m` about equally often. A tag the repo does not
+publish is refused with the list of quants it does publish, since you
+cannot see a repo's file list from a command line.
+
+`-hf` is one token in llama.cpp's hand-written parser, and clap reads
+`-hf` as `-h` followed by `f`. Both ferrox binaries rewrite `-hf` and
+`-hff` before parsing, so the llama.cpp spelling works; `--hf-repo` is
+the same flag.
+
+Downloads land in the ferrox cache, not in `./models`: a model fetched
+by `-hf` is not part of the project directory you happen to be standing
+in. `FERROX_CACHE`, else `$XDG_CACHE_HOME/ferrox`, else
+`~/.cache/ferrox`, under `hub/<owner>__<repo>/`. A second run says
+`using cached` instead of fetching again, and an interrupted download
+resumes by byte range rather than starting over.
+
+`ferrox download` takes the same `repo:QUANT` shape and puts the file
+where you ask instead of in the cache. Before that it sent the whole
+string to the Hub as a repo id and returned a bare `401`, which reads
+like an auth problem and is not one.
+
+`download` otherwise takes the same arguments as `hf download`, so a
+command copied off a model card runs unchanged:
 
 ```bash
 ferrox download bartowski/Llama-3.2-3B-Instruct-GGUF \
@@ -508,6 +697,33 @@ main binary and needs the optional `serve` feature at build time.
 `ferrox-server` is that same server as its own executable, and both
 parse identical arguments through the same code.
 
+### Server flags, and llama.cpp's spellings
+
+`llama-server` commands mostly run unchanged:
+
+| Flag | Notes |
+|---|---|
+| `-m` / `--model` | GGUF path or Kimi directory |
+| `-hf` / `--hf-repo`, `--hf-file` | Fetch from the Hub, see above |
+| `-c` / `--ctx-size` | Positions any one request may ask for. Sets `FERROX_CB_MAX_CONTEXT`. Unset means the ceiling is derived at load from weights and per-token KV against the device budget, capped at the model's trained context |
+| `--api-key`, `--api-key-file` | Require `Authorization: Bearer`. Also gates `/admin`. Prefer the file form on a shared host: an argument is visible in `ps` to every user on the machine. An empty key file is refused rather than leaving every route open |
+| `--alias` | What the model is called in `/v1/models` and in every response's `model` field |
+| `--ctk` / `--cache-type-k` | KV dtype. **Metal only**, the CPU and CUDA cache is the host `Vec<f32>` |
+| `--host`, `--port` | `--port 0` asks the kernel for a free one and announces it on stdout |
+| `-t`, `-ngl`, `-dev` | Threads, GPU layers, device |
+| `-cb` / `--cont-batching`, `-np` / `--parallel` | Continuous batching and its sequence cap |
+| `--jinja` | Accepted, and already the default: ferrox always compiles and evaluates the GGUF's own `tokenizer.chat_template` |
+| `--no-warmup` | Accepted; there is no warm-up pass to skip |
+| `--flash-attn` / `-fa` | Accepted. Fused attention is a backend property here, not a per-run switch |
+
+Two are **refused by name** rather than ignored, because ignoring them
+would change the answer without saying so:
+
+- `--no-jinja`. There is no template-free mode to fall back to, and a
+  prompt framed by a guess instead of the checkpoint's own template
+  reads as a model-quality problem rather than a flag that was dropped.
+- `--flash-attn off`. Set `FERROX_METAL_ATTN=0` or `--device cpu`.
+
 `serve` is on by default, so a stock `cargo install ferrox-cli` has it:
 
 ```bash
@@ -515,8 +731,13 @@ cargo build --release -p ferrox-cli --features "serve metal"
 
 ./target/release/ferrox serve \
   -m models/tinyllama-1.1b-chat-v1.0.Q8_0.gguf \
-  --host 127.0.0.1 --port 8383 -dev metal -ngl all
+  --host 127.0.0.1 --port 8383 -dev metal -ngl all -cb -np 4
 ```
+
+On Metal, continuous batching turns on by default when compatible; use
+`-cb` / `--cont-batching` and `-np` / `--parallel N` (llama.cpp slot
+cap) to set it explicitly. `--no-cont-batching` keeps the private
+decode loop (Metal serializes concurrent requests on that path).
 
 Without the feature, `ferrox serve` still exists and explains itself
 rather than reporting an unknown subcommand, since a compiled-out
@@ -542,7 +763,7 @@ curl -s -X POST http://127.0.0.1:8383/v1/chat/completions \
 ```bash
 # The kernel picks the port. The bound address is announced on stdout.
 ./target/release/ferrox-server -m model.gguf --port 0 --exit-on-stdin-close
-{"event":"ferrox.server.ready","addr":"127.0.0.1:52091","port":52091,"scheme":"http","pid":4242,"version":"0.12.0"}
+{"event":"ferrox.server.ready","addr":"127.0.0.1:52091","port":52091,"scheme":"http","pid":4242,"version":"0.15.2"}
 ```
 
 `--port 0` plus that one line saves a parent process from probing
@@ -560,8 +781,9 @@ sees EOF immediately, so the parent that wants the guarantee is the one
 that asks for it and keeps the pipe open.
 
 The server accepts `-m/--model`, `--host`, `--port`, `-t/--threads`,
-`-dev/--device`, `-ngl/--n-gpu-layers`, `--exit-on-stdin-close`, and
-`--list-devices`. Existing
+`-dev/--device`, `-ngl/--n-gpu-layers`, `--cont-batching` / `-cb`,
+`--no-cont-batching`, `-np` / `--parallel N`, `--exit-on-stdin-close`,
+and `--list-devices`. Existing
 `FERROX_MODEL_PATH`, `FERROX_ADDR`, and the backend environment
 variables all still work. Command-line values win over them. Keep
 secrets such as `FERROX_API_KEY` in the environment.

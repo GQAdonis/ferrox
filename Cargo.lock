@@ -77,6 +77,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "ash"
+version = "0.38.0+1.3.281"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0bb44936d800fea8f016d7f2311c6a4f97aebd5dc86f09906139ec848cf3a46f"
+dependencies = [
+ "libloading",
+]
+
+[[package]]
 name = "async-trait"
 version = "0.1.91"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -426,7 +435,7 @@ dependencies = [
 
 [[package]]
 name = "ferrox-api"
-version = "0.14.0"
+version = "0.17.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -434,7 +443,7 @@ dependencies = [
 
 [[package]]
 name = "ferrox-cli"
-version = "0.14.0"
+version = "0.17.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -456,7 +465,7 @@ dependencies = [
 
 [[package]]
 name = "ferrox-core"
-version = "0.14.0"
+version = "0.17.1"
 dependencies = [
  "anyhow",
  "cudarc",
@@ -464,6 +473,7 @@ dependencies = [
  "ferrox-gguf",
  "ferrox-metal",
  "ferrox-quant",
+ "ferrox-vulkan",
  "libc",
  "memmap2",
  "rayon",
@@ -475,7 +485,7 @@ dependencies = [
 
 [[package]]
 name = "ferrox-cuda"
-version = "0.14.0"
+version = "0.17.1"
 dependencies = [
  "cudarc",
  "ferrox-quant",
@@ -485,7 +495,7 @@ dependencies = [
 
 [[package]]
 name = "ferrox-gguf"
-version = "0.14.0"
+version = "0.17.1"
 dependencies = [
  "anyhow",
  "byteorder",
@@ -495,7 +505,7 @@ dependencies = [
 
 [[package]]
 name = "ferrox-inference"
-version = "0.14.0"
+version = "0.17.1"
 dependencies = [
  "ferrox-api",
  "ferrox-core",
@@ -508,7 +518,7 @@ dependencies = [
 
 [[package]]
 name = "ferrox-metal"
-version = "0.14.0"
+version = "0.17.1"
 dependencies = [
  "ferrox-quant",
  "half",
@@ -521,7 +531,7 @@ dependencies = [
 
 [[package]]
 name = "ferrox-models"
-version = "0.14.0"
+version = "0.17.1"
 dependencies = [
  "anyhow",
  "base64 0.23.0",
@@ -546,7 +556,7 @@ dependencies = [
 
 [[package]]
 name = "ferrox-moe"
-version = "0.14.0"
+version = "0.17.1"
 dependencies = [
  "anyhow",
  "ferrox-core",
@@ -556,7 +566,7 @@ dependencies = [
 
 [[package]]
 name = "ferrox-quant"
-version = "0.14.0"
+version = "0.17.1"
 dependencies = [
  "half",
  "thiserror",
@@ -564,7 +574,7 @@ dependencies = [
 
 [[package]]
 name = "ferrox-safetensors"
-version = "0.14.0"
+version = "0.17.1"
 dependencies = [
  "byteorder",
  "memmap2",
@@ -575,7 +585,7 @@ dependencies = [
 
 [[package]]
 name = "ferrox-server"
-version = "0.14.0"
+version = "0.17.1"
 dependencies = [
  "anyhow",
  "axum",
@@ -603,6 +613,16 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "ureq",
+]
+
+[[package]]
+name = "ferrox-vulkan"
+version = "0.17.1"
+dependencies = [
+ "ash",
+ "ferrox-quant",
+ "half",
+ "thiserror",
 ]
 
 [[package]]

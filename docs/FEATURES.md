@@ -78,6 +78,18 @@ Full matrix: [`MODELS.md`](MODELS.md) ·
 | **CPU** | Dense and MoE. int8×int8 matvec on by default (`FERROX_CPU_INT_DOT=0` opts out), interleaved Q4_Kx8 / Q8_0x4 GEMV, Q8_0x4 batch GEMM for prefill, Q5/Q6 int-dot, pool sized to performance cores |
 | **Metal** | FA-vec attention (decode d=64/96/128/256, prefill d=128/256), concurrent FFN/QKV encode, MoE Concurrent with fused groups, `MemRanges`, `mul_mm_id` prefill, quantized KV (`q8_0` / `turbo8` / `fp8` / `turbo4`) |
 | **CUDA** | Matvec, resident weights, FFN fuse (`--features cuda`), plus a batched `Q8_0`/`Q4_0` GEMM that **has never executed on a GPU** |
+| **Vulkan** | `Q8_0` matvec only, no GEMM (`--features vulkan`). A beachhead, not a backend: see below |
+
+**Vulkan is one kernel, and calling it a backend would be generous.**
+`--features vulkan` gives a `Q8_0` matvec and nothing else. It reports
+no GEMM for any kind, so a prefill genuinely lands on the host, and it
+claims no other quantization. It did run on real hardware (an M2 Pro
+through MoltenVK) against a scalar twin, which is what earned it a place
+in the dispatch table at all, but there is no measured number for it and
+zero-copy residency from mmap is unproven. It exists so that AMD and
+Intel have a path at all, and because the seam it needed is the seam a
+real backend needs. `docs/plans/vulkan-beachhead-verdict.md` has the
+sizing: a full Vulkan backend is 15 to 25k lines.
 
 **The CUDA GEMM is unrun, and that is not a formality.** It is wired
 into a wide prefill and it decides nothing about performance here,
@@ -104,6 +116,23 @@ with a reason string, instead of quietly greying a control out.
 llama.cpp-style completion flags (`-m`, `-p`, `-n`, `-ngl`, `--ctk`, …),
 plus `ferrox chat`, `ferrox pull` (Hugging Face Hub), `inspect`, `archs`,
 and `presets`. See [`CLI.md`](CLI.md).
+
+Constrained decoding is on the CLI too: `--grammar`, `--grammar-file`
+and `-j` / `--json-schema`, the same spellings llama.cpp uses, reaching
+the same stack machine the HTTP `grammar` field does. `--ctk` selects a
+KV dtype on Metal only; the CPU and CUDA KV cache is the host `Vec<f32>`
+and the startup banner says so when the flag is being ignored.
+
+`ferrox perplexity` is the quality axis: corpus evaluation using
+llama.cpp's method, agreeing with `llama-perplexity` to within a fifth
+of one standard error on five checkpoints. Where the two differ, the gap
+is monotone in the quant and has the sign the documented `vec_dot_type`
+difference predicts. `ferrox quantize` writes `Q8_0` byte-identically to
+`llama_model_quantize()`, plus `Q4_K_S` and `Q4_K_M` with `--pure`, and
+refuses every other target by name. Q4_K is not byte-identical and
+cannot be, because the C reference is compiled with FP contraction; it
+matches on perplexity instead. See
+[`CLI.md`](CLI.md).
 
 The sampler flags carry llama.cpp's own defaults on `--temp` (0.8),
 `--top-k` (40), `--top-p` (0.95), `--min-p` (0.05) and `--repeat-last-n`
@@ -140,7 +169,26 @@ OpenAI-compatible HTTP API:
 - `POST /v1/cancel` stops a running generation by request id, which is
   the stop path a resumable stream needs, since closing its socket no
   longer ends it
-- Decoder embeddings (mean/last pool)
+- Embeddings. A real encoder checkpoint (BGE / E5 / GTE class, anything
+  whose `tokenizer.ggml.model` is `bert`) can be the loaded model:
+  `FERROX_MODEL_PATH=bge-small-en-v1.5-q8_0.gguf` serves `/v1/embeddings`
+  and the six generating routes answer **501 naming the model**, not a
+  missing tensor. Pooling comes from the checkpoint's own
+  `pooling_type` (NONE / MEAN / CLS / LAST; RANK refuses, it is a
+  classification head rather than a pooling rule, and a rank-head
+  checkpoint belongs on `/v1/rerank` instead). A decoder GGUF still
+  pools its hidden states (mean/last) as before, and
+  `FERROX_EMBEDDING_MODEL_PATH` runs an encoder side-by-side with a
+  generative model in one process
+- Reranking. A `bert` checkpoint carrying a rank head (`cls`,
+  `cls.output`, `cls.norm`, `classifier.output_labels`) is served by
+  `POST /v1/rerank`, scoring `[CLS] query [SEP] document [SEP]` through
+  the head itself rather than through the cosine of two embeddings. Such
+  a checkpoint could not load at all before: `assert_every_tensor_
+  consumed` rejected the `cls.*` tensors nobody read. Verified end to
+  end against `ms-marco-MiniLM-L6-v2`: the order matches a HuggingFace
+  reference, which needed the document to be segment 1 rather than
+  llama.cpp's all-zero token types
 - Anthropic Messages: `POST /v1/messages` streaming and buffered
   (thinking and tool blocks, protocol-native `ping` keepalive) plus
   `POST /v1/messages/count_tokens`
@@ -153,12 +201,24 @@ OpenAI-compatible HTTP API:
   truncation filters, as llama.cpp orders it, and the repetition penalty
   is applied once per candidate rather than once per occurrence. Both
   routes read the same knobs through one `SamplingKnobs::resolve`
-- Grammar-constrained decoding: llama.cpp's own `grammar` field, a GBNF
-  string enforced on every token by a stack machine, on chat and
-  completions and on all three decode paths. `response_format:
-  json_object` is still the best-effort character mask, and the two
-  compose
-- Continuous batching and chunked prefill
+- Grammar-constrained decoding, in every spelling: llama.cpp's own
+  `grammar` field, OpenAI's `response_format: json_schema`, llama.cpp's
+  bare `json_schema` field on `/completion`, and a forced `tool_choice`.
+  A schema is compiled to GBNF first, so all of them end at one stack
+  machine that masks every token which cannot continue a valid string,
+  on chat and completions and all three decode paths. Two constraints in
+  one request are refused rather than ranked. `response_format:
+  json_object` is still the best-effort character mask, and composes
+- **Parallel serving (Metal).** Multiple concurrent streaming clients
+  share one batched decode worker (llama.cpp slots model). Continuous
+  batching is on by default when compatible; streaming emits tokens
+  incrementally under CB (0.15.2). Metal CB prefill keeps host K/V
+  authoritative for batched decode (0.15.3). Host B receipt on
+  Llama-3.2-3B Q4_K_M: 16/16 OK at concurrency 8, ~24 aggregate tok/s,
+  ~118 ms mean TTFT sequential. CLI: `-cb`, `-np` / `--parallel N`,
+  `--no-cont-batching` for the serialized private path. See
+  [`plans/metal-parallel-concurrency.md`](plans/metal-parallel-concurrency.md)
+- Chunked prefill (same scheduler as continuous batching)
 - Paged KV: shared page storage many requests read through a block
   table, with a radix tree over reference-counted page groups so
   conversations off one system prompt share its KV rather than each
@@ -179,7 +239,9 @@ OpenAI-compatible HTTP API:
   layer, and the full-attention layers still read position 0
 - `ferrox serve-bench`: concurrency, TTFT, TPOT and queueing numbers
   for a live server, with the methodology (positional split, pooled
-  nearest-rank percentiles, whole-run throughput) tested socket-free
+  nearest-rank percentiles, whole-run throughput) tested socket-free.
+  Host B receipts for Metal CB at 0.15.3:
+  [`benchmarks/receipts/serving/`](../benchmarks/receipts/serving/)
 - Live serving telemetry (`GET /v1/stats`, `GET /v1/requests`) and an
   elastic KV/expert split that can be reported and re-sized without a
   restart (`GET /v1/cache/status`, `POST /v1/cache/rebuild`). A request

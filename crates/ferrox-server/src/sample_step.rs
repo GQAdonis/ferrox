@@ -26,6 +26,7 @@
 //! shorter call for it to reach for.
 
 use ferrox_models::grammar_sampler::{ConstraintError, GrammarSampler, MaskOutcome};
+use ferrox_models::penalty_window::PenaltyWindow;
 use ferrox_models::sampling::Sampler;
 use ferrox_models::tokenizer::StopTokens;
 
@@ -94,15 +95,24 @@ pub(crate) fn sample_next(
     state: &mut SampleState,
     logits: &[f32],
     params: &GenerationParams,
+    prompt: &[usize],
     history: &[usize],
     stop_tokens: &StopTokens,
     decode_token: &dyn Fn(usize) -> String,
 ) -> Result<Step, DecodeError> {
+    // Both halves, so `penalty_last_n` slides over `prompt ++
+    // generated` exactly as llama-server's does: it seeds its sampler
+    // with every prompt token before the first draw
+    // (`tools/server/server-context.cpp:386-390`). The prompt used to
+    // be `&[]` here because the ids did not reach this seam, which made
+    // the HTTP API disagree with `ferrox run` about what the same flag
+    // means (#73).
+    let window = PenaltyWindow::new(prompt, history);
     if !params.needs_vocab_logits() {
         return Ok(Step::Token(state.sampler.sample(
             logits,
             &params.sampling,
-            history,
+            window,
         )));
     }
     // A backend that folded lm_head+argmax onto the device returns one
@@ -157,7 +167,7 @@ pub(crate) fn sample_next(
                 }
             }
         };
-        sampler.sample_with_mask(logits, &params.sampling, history, Some(&mut mask))
+        sampler.sample_with_mask(logits, &params.sampling, window, Some(&mut mask))
     };
     if let Some(e) = refusal {
         return Err(DecodeError::GrammarConstraint {
@@ -265,7 +275,9 @@ mod tests {
         stops: &StopTokens,
         decode: &dyn Fn(usize) -> String,
     ) -> Result<Step, DecodeError> {
-        sample_next(state, logits, params, history, stops, decode)
+        // These tests are about masking and stops, not penalties, so
+        // the prompt half is empty and says so.
+        sample_next(state, logits, params, &[], history, stops, decode)
     }
 
     /// The assertion neither decode path had. Token 0 wins the argmax by
@@ -509,5 +521,132 @@ mod tests {
         // Not greedy: never folded either way, whatever the constraints.
         assert!(!greedy_gpu_fold_allowed(&params(false, 0.8)));
         assert!(!greedy_gpu_fold_allowed(&params(true, 0.8)));
+        // A LAZY grammar is the case that looks unconstrained and is
+        // not: its trigger can fire on any token, so it needs the whole
+        // vocabulary from the first one.
+        assert!(!greedy_gpu_fold_allowed(&with_lazy_grammar(
+            params(false, 0.0),
+            r#"root ::= "cd""#,
+            "c",
+        )));
+    }
+
+    /// A grammar that waits for a trigger, with the trigger MANDATORY --
+    /// what `tool_choice: "required"` compiles to.
+    fn with_lazy_grammar(mut p: GenerationParams, src: &str, trigger: &str) -> GenerationParams {
+        use ferrox_models::grammar::LazyTriggers;
+        p.grammar = Some(Arc::new(
+            Grammar::from_str_with_root(src, "root")
+                .expect("test grammar parses")
+                .into_lazy(
+                    LazyTriggers::new()
+                        .with_word(trigger)
+                        .expect("the trigger compiles")
+                        .mandatory(),
+                )
+                .expect("there is a trigger"),
+        ));
+        p
+    }
+
+    /// The `tool_choice: "required"` shape, on the one step both decode
+    /// loops and `generate_engine` share.
+    ///
+    /// Three things at once, because they only mean anything together:
+    /// free text before the trigger, an ENDING that is forbidden until
+    /// the trigger fires, and a grammar that constrains hard once it
+    /// does.
+    #[test]
+    fn a_mandatory_lazy_grammar_forbids_only_the_ending_until_it_fires() {
+        let params = with_lazy_grammar(params(false, 0.0), r#"root ::= "cd""#, "c");
+        let stops = letter_stops();
+        let mut state = SampleState::new(7);
+
+        // End-of-generation wins the argmax by a mile, and "a" -- which
+        // the grammar could never accept -- is the best of the rest.
+        let logits = vec![5.0, 1.0, 0.5, 0.5, 9.0];
+        let chosen = token(step(&mut state, &logits, &params, &[], &stops, &letter).unwrap());
+        assert_eq!(
+            chosen, 0,
+            "free text before the trigger, but not the end of the turn"
+        );
+
+        // "c" is the trigger. After it the grammar is live and wants "d".
+        let logits = vec![1.0, 1.0, 9.0, 0.5, 5.0];
+        let chosen = token(step(&mut state, &logits, &params, &[0], &stops, &letter).unwrap());
+        assert_eq!(chosen, 2, "the trigger token itself");
+
+        let logits = vec![9.0, 9.0, 9.0, 0.0, 9.0];
+        let chosen = token(step(&mut state, &logits, &params, &[0, 2], &stops, &letter).unwrap());
+        assert_eq!(
+            chosen, 3,
+            "once triggered the grammar constrains: only \"d\" continues \"c\""
+        );
+    }
+
+    /// The same grammar WITHOUT `mandatory` lets the turn end. The pair
+    /// is what shows the first test is measuring the flag and not the
+    /// mask in general.
+    #[test]
+    fn an_optional_lazy_grammar_lets_the_turn_end_before_the_trigger() {
+        use ferrox_models::grammar::LazyTriggers;
+        let mut params = params(false, 0.0);
+        params.grammar = Some(Arc::new(
+            Grammar::from_str_with_root(r#"root ::= "cd""#, "root")
+                .unwrap()
+                .into_lazy(LazyTriggers::new().with_word("c").unwrap())
+                .unwrap(),
+        ));
+        let logits = vec![5.0, 1.0, 0.5, 0.5, 9.0];
+        let mut state = SampleState::new(7);
+        let chosen =
+            token(step(&mut state, &logits, &params, &[], &letter_stops(), &letter).unwrap());
+        assert_eq!(chosen, LETTER_EOG, "an optional trigger constrains nothing");
+    }
+
+    /// **The server must penalise the prompt, as llama-server does.**
+    ///
+    /// llama-server seeds its sampler with every prompt token before
+    /// the first draw (`tools/server/server-context.cpp:386-390`), so
+    /// `penalty_last_n` slides over `prompt ++ generated` there. This
+    /// seam passed `&[]` until #73, because the prompt ids did not
+    /// reach it, so the SAME request body produced different text from
+    /// llama-server, and from `ferrox run`, which was fixed first.
+    ///
+    /// Asserted on the sampled token. A test on the window's length
+    /// would pass with the window handed to the wrong distribution.
+    #[test]
+    fn a_prompt_token_is_penalised_by_the_server_before_it_is_generated() {
+        // Token 0 wins the argmax outright. A penalty heavy enough to
+        // dethrone it can only come from the PROMPT, since nothing has
+        // been generated yet.
+        let logits = vec![9.0, 8.0, 0.5];
+        let mut p = params(false, 0.0);
+        p.sampling.repetition_penalty = 50.0;
+        p.sampling.penalty_last_n = 64;
+
+        let mut state = SampleState::new(7);
+        let with_prompt = sample_next(&mut state, &logits, &p, &[0], &[], &letter_stops(), &|id| {
+            letter(id)
+        })
+        .expect("sampling succeeds");
+
+        let mut state = SampleState::new(7);
+        let without_prompt =
+            sample_next(&mut state, &logits, &p, &[], &[], &letter_stops(), &|id| {
+                letter(id)
+            })
+            .expect("sampling succeeds");
+
+        assert_eq!(
+            token(without_prompt),
+            0,
+            "with no prompt the argmax stands, which is what makes the other half meaningful"
+        );
+        assert_eq!(
+            token(with_prompt),
+            1,
+            "a token in the prompt must be penalised on its FIRST generated occurrence"
+        );
     }
 }

@@ -39,10 +39,21 @@
 //! IQ-tier goldens, which link ggml's own `ggml-quants.c` rather than
 //! re-reading the format spec. A reference you re-implemented is not a
 //! reference. Build it with `tools/build_llama_logits.sh`.
+//!
+//! `--dumper` may be given MORE THAN ONCE, each pointing at a dumper
+//! built against a different libllama. That is not a convenience: it is
+//! what turns the WRONG verdict from a fitted constant into a
+//! measurement this run makes for itself. See [`calibration`].
 
+mod calibration;
+mod dump;
+mod metrics;
+mod quant;
 mod tokenize;
 
 use anyhow::Context;
+use calibration::{Band, WrongLine, KL_WRONG};
+use quant::DominantQuant;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -62,20 +73,41 @@ const PROMPT: &str = "The capital of France is";
 /// f32 accumulation-order noise. Chosen as the scale at which a
 /// reordered reduction over a few thousand terms lands: it is a noise
 /// floor, not a quality target.
+///
+/// A statement about the PRIMARY reference, unlike the WRONG line: the
+/// report's numbers are that reference's, and "indistinguishable from
+/// the reference you named" is what MATCH has always meant.
 const KL_NOISE: f64 = 1e-3;
 
-/// Above this KL the distributions differ by more than accumulation
-/// order — a different rope base, a missing bias, a skipped norm. This
-/// is the "wrong graph" line.
-const KL_WRONG: f64 = 1e-2;
+/// The verdict ladder, checked at COMPILE time.
+///
+/// One rung is a constant now — [`KL_WRONG`], the floor under every
+/// calibrated line — and the other is measured per checkpoint, so the
+/// only ordering left to enforce is that MATCH is tighter than the
+/// tightest possible WRONG. The three constants this assert used to
+/// hold in order (`KL_REFERENCE_BUILD_SPREAD_KQUANT`,
+/// `KL_WRONG_Q8K_DOTTED` and its 1.1 margin) are DELETED: a rule that
+/// measures its own line has no thresholds left to keep in step. See
+/// [`calibration`] for why keeping them was not an option.
+const _: () = {
+    assert!(
+        KL_NOISE < KL_WRONG,
+        "MATCH must be tighter than the tightest WRONG line"
+    );
+};
 
 pub struct ParityArgs {
     pub model: String,
     pub prompt: Option<String>,
     pub prompt_tokens: Option<usize>,
     pub top_k: usize,
-    /// Path to the compiled reference dumper.
-    pub dumper: Option<String>,
+    /// Paths to compiled reference dumpers. The first is the PRIMARY —
+    /// the one every printed number is about. Any further ones exist to
+    /// measure how much llama.cpp disagrees with itself on this
+    /// checkpoint, which is what the WRONG line is made of.
+    pub dumper: Vec<String>,
+    /// Prefix to write every compared logit vector under. See [`dump`].
+    pub dump_logits: Option<String>,
 }
 
 pub fn run(args: ParityArgs) -> anyhow::Result<()> {
@@ -84,13 +116,15 @@ pub fn run(args: ParityArgs) -> anyhow::Result<()> {
     // Resolved before anything expensive runs: a missing dumper is the
     // most common way this command fails, and finding that out after a
     // multi-second model load helps nobody.
-    let dumper = dumper_path(args.dumper.as_deref())?;
+    let dumpers = dumper_paths(&args.dumper)?;
 
     // The tokenizer comparison goes first. It is vocab-only on both
     // sides, so it costs a fraction of the prefill below, and a
     // divergence here means the logit numbers underneath it were
     // computed from a prompt the two engines do not even agree on.
-    let tokens_report = tokenize::run(&dumper, Path::new(&path))?;
+    // Only the primary reference tokenizes: the tokenizer half is not
+    // the half that needs calibrating.
+    let tokens_report = tokenize::run(&dumpers[0], Path::new(&path))?;
     match &tokens_report {
         Some(r) => tokenize::print_report(r),
         None => println!(
@@ -122,30 +156,37 @@ pub fn run(args: ParityArgs) -> anyhow::Result<()> {
         );
     }
 
-    let ref_logits = reference_logits(&dumper, &path, &tokens)?;
+    let references = collect_references(&dumpers, &path, &tokens, ferrox_logits.len())?;
 
-    if ref_logits.len() != ferrox_logits.len() {
-        // Not a tolerance question: the two engines disagree about how
-        // many tokens the model can emit, which is a loader bug on one
-        // side and makes every other number here meaningless.
-        anyhow::bail!(
-            "vocab size disagrees: llama.cpp {} vs ferrox {} — the logit vectors are not \
-             comparable, fix the loader before reading any metric",
-            ref_logits.len(),
-            ferrox_logits.len()
-        );
+    // Dumped BEFORE the verdict is computed, so a run that ends in the
+    // `bail!` below still leaves the evidence behind. The whole reason
+    // to dump is to investigate a bad verdict; losing the vectors
+    // exactly when the verdict is bad would defeat it.
+    let ref_logits: Vec<&[f32]> = references.iter().map(|r| r.logits.as_slice()).collect();
+    if let Some(prefix) = args.dump_logits.as_deref() {
+        for p in dump::write(prefix, &tokens, &ref_logits, &ferrox_logits)? {
+            println!("wrote {}", p.display());
+        }
+        println!();
     }
 
-    let report = compare(&ref_logits, &ferrox_logits, args.top_k);
-    let quant = ferrox_gguf::GgufFile::open(&args.model)
-        .ok()
-        .and_then(|f| dominant_quant(&f));
+    // ONE value, read by the DRIFT message and by the uncalibrated
+    // fallback of the WRONG line. Deriving it twice was #109.
+    let gguf = ferrox_gguf::GgufFile::open(&path).ok();
+    let quant = DominantQuant::of(gguf.as_ref().map_or(&[][..], |f| &f.tensors));
+
+    let band = Band::measure(&ref_logits, &ferrox_logits, &quant);
+    let report = compare(ref_logits[0], &ferrox_logits, args.top_k, &band);
     print_report(
-        &args.model,
-        tokens.len(),
-        args.top_k,
-        backend.as_str(),
-        quant.as_deref(),
+        &Run {
+            model: &args.model,
+            n_tokens: tokens.len(),
+            top_k: args.top_k,
+            backend: backend.as_str(),
+        },
+        &quant,
+        &references,
+        &band,
         &report,
     );
 
@@ -159,14 +200,70 @@ pub fn run(args: ParityArgs) -> anyhow::Result<()> {
     }
     if report.verdict == Verdict::Wrong {
         failures.push(format!(
-            "ferrox disagrees with llama.cpp beyond numeric noise (KL {:.3e} nats)",
-            report.kl_ref_ferrox
+            "ferrox disagrees with llama.cpp beyond numeric noise (KL {:.3e} nats to its \
+             nearest reference)",
+            band.nearest()
         ));
     }
     if !failures.is_empty() {
         anyhow::bail!("{}", failures.join("; "));
     }
     Ok(())
+}
+
+/// Runs every dumper on the same token ids and keeps the ones that
+/// answered with a comparable vector.
+///
+/// The PRIMARY reference is load-bearing and its failures are fatal. A
+/// SECONDARY one is evidence, and evidence that did not arrive leaves a
+/// narrower experiment rather than no experiment — but it is said out
+/// loud, because a run that silently lost its calibration would print a
+/// WRONG line derived from one reference while looking like a
+/// two-reference run.
+fn collect_references(
+    dumpers: &[PathBuf],
+    model: &str,
+    tokens: &[u32],
+    n_vocab: usize,
+) -> anyhow::Result<Vec<Reference>> {
+    let mut out: Vec<Reference> = Vec::new();
+    for (i, dumper) in dumpers.iter().enumerate() {
+        let primary = i == 0;
+        let reference = match reference_logits(dumper, model, tokens, i) {
+            Ok(r) => r,
+            Err(e) if primary => return Err(e),
+            Err(e) => {
+                eprintln!(
+                    "parity: reference [{i}] {} produced nothing ({e:#}); the WRONG line will be \
+                     measured without it",
+                    dumper.display()
+                );
+                continue;
+            }
+        };
+        if reference.logits.len() != n_vocab {
+            if primary {
+                // Not a tolerance question: the two engines disagree
+                // about how many tokens the model can emit, which is a
+                // loader bug on one side and makes every other number
+                // here meaningless.
+                anyhow::bail!(
+                    "vocab size disagrees: llama.cpp {} vs ferrox {n_vocab} — the logit vectors \
+                     are not comparable, fix the loader before reading any metric",
+                    reference.logits.len()
+                );
+            }
+            eprintln!(
+                "parity: reference [{i}] reports {} vocabulary entries against ferrox's \
+                 {n_vocab}; dropped from the WRONG line rather than compared to a different \
+                 distribution",
+                reference.logits.len()
+            );
+            continue;
+        }
+        out.push(reference);
+    }
+    Ok(out)
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -195,60 +292,84 @@ struct Report {
     ref_top1_rank_in_ferrox: usize,
     /// p1 - p2 in the reference distribution: how close the call was.
     ref_top2_margin: f64,
+    /// The same call in LOGIT space, on both sides, and how many
+    /// representable f32 values separate the reference's two
+    /// candidates.
+    ///
+    /// A TIE-FLIP verdict is a claim about magnitude — "the two
+    /// candidates are closer than the arithmetic can resolve" — and
+    /// probability margin does not settle it, because softmax over a
+    /// 128k vocabulary turns a wide logit gap into a small probability
+    /// gap whenever the distribution is flat. The gap in ulps is the
+    /// claim's own units: single digits is a tie, millions is a
+    /// difference that happens to sit near the argmax
+    /// ([#103](https://github.com/antonellof/ferrox/issues/103)).
+    ref_top2_logit_gap: f32,
+    ref_top2_logit_gap_ulps: i64,
+    /// The same gap as ferrox sees it, signed by the reference's
+    /// ordering: negative means ferrox ranks them the other way round.
+    ferrox_gap_on_ref_pair: f32,
     topk_overlap: usize,
 }
 
-fn compare(ref_logits: &[f32], ferrox_logits: &[f32], k: usize) -> Report {
-    let p = softmax(ref_logits);
-    let q = softmax(ferrox_logits);
+/// Scores ferrox against the PRIMARY reference, and takes the WRONG
+/// rung from `band`.
+///
+/// The split is deliberate. MATCH and DRIFT are statements about the
+/// reference the report names — "indistinguishable from it", "differs
+/// from it by more than summation order" — and they move with it, which
+/// is correct: they describe a comparison, not a defect. WRONG is a
+/// claim about ferrox itself, so it is the one rung that must not
+/// change with which libllama happens to be installed (#102), and
+/// `band` is what makes it not.
+fn compare(ref_logits: &[f32], ferrox_logits: &[f32], k: usize, band: &Band) -> Report {
+    let p = metrics::softmax(ref_logits);
+    let q = metrics::softmax(ferrox_logits);
 
-    let mut kl_pq = 0.0f64;
-    let mut kl_qp = 0.0f64;
-    let mut tv = 0.0f64;
-    let mut max_delta = 0.0f64;
-    for i in 0..p.len() {
-        let (pi, qi) = (p[i], q[i]);
-        // Terms where p is zero contribute nothing to KL(p||q) by the
-        // 0 ln 0 = 0 convention; guarding q avoids an infinity from a
-        // single underflowed float rather than from a real disagreement.
-        if pi > 0.0 {
-            kl_pq += pi * (pi.max(f64::MIN_POSITIVE) / qi.max(f64::MIN_POSITIVE)).ln();
-        }
-        if qi > 0.0 {
-            kl_qp += qi * (qi.max(f64::MIN_POSITIVE) / pi.max(f64::MIN_POSITIVE)).ln();
-        }
-        let d = (pi - qi).abs();
-        tv += d;
-        if d > max_delta {
-            max_delta = d;
-        }
-    }
-    tv *= 0.5;
+    // The primary's KL comes from the band rather than being recomputed
+    // here: one number, one owner. Two evaluations would be two places
+    // for the guarded-zero convention to drift apart.
+    let kl_pq = band.kl_to_ferrox(0);
+    let kl_qp = metrics::kl(&q, &p);
+    let (tv, max_delta) = metrics::total_variation(&p, &q);
 
-    let ref_order = order_desc(&p);
-    let fx_order = order_desc(&q);
+    let ref_order = metrics::order_desc(&p);
+    let fx_order = metrics::order_desc(&q);
     let top1_ref = ref_order[0];
     let top1_ferrox = fx_order[0];
     let ref_top1_rank_in_ferrox = fx_order.iter().position(|&i| i == top1_ref).unwrap_or(0);
-    let ref_top2_margin = if ref_order.len() > 1 {
-        p[ref_order[0]] - p[ref_order[1]]
-    } else {
-        1.0
-    };
+    let (ref_top2_margin, ref_top2_logit_gap, ref_top2_logit_gap_ulps, ferrox_gap_on_ref_pair) =
+        if ref_order.len() > 1 {
+            let (i1, i2) = (ref_order[0], ref_order[1]);
+            (
+                p[i1] - p[i2],
+                ref_logits[i1] - ref_logits[i2],
+                metrics::ulps_between(ref_logits[i1], ref_logits[i2]),
+                // Same pair, ferrox's numbers, keeping the reference's
+                // order: the sign is the flip itself.
+                ferrox_logits[i1] - ferrox_logits[i2],
+            )
+        } else {
+            (1.0, 0.0, 0, 0.0)
+        };
 
     let k = k.min(ref_order.len());
     let ref_top: std::collections::HashSet<usize> = ref_order[..k].iter().copied().collect();
     let topk_overlap = fx_order[..k].iter().filter(|i| ref_top.contains(i)).count();
 
+    // ONE predicate, read by both branches below. They were two
+    // spellings of `kl_pq < kl_wrong` before, which is the shape this
+    // repo keeps paying for.
+    let outside = band.ferrox_is_outside();
     let verdict = if top1_ref == top1_ferrox {
         if kl_pq < KL_NOISE {
             Verdict::Match
-        } else if kl_pq < KL_WRONG {
+        } else if !outside {
             Verdict::Drift
         } else {
             Verdict::Wrong
         }
-    } else if kl_pq < KL_WRONG && ref_top2_margin <= max_delta {
+    } else if !outside && ref_top2_margin <= max_delta {
         // The two engines put nearly the same mass on both candidates and
         // the reference itself could barely separate them. Calling this a
         // failure would make the instrument cry wolf on exactly the case
@@ -268,78 +389,37 @@ fn compare(ref_logits: &[f32], ferrox_logits: &[f32], k: usize) -> Report {
         top1_ferrox,
         ref_top1_rank_in_ferrox,
         ref_top2_margin,
+        ref_top2_logit_gap,
+        ref_top2_logit_gap_ulps,
+        ferrox_gap_on_ref_pair,
         topk_overlap,
     }
 }
 
-/// The quantization of the per-layer weights, and whether llama.cpp
-/// dots it against 8-bit-quantized ACTIVATIONS.
-///
-/// This exists because a `DRIFT` verdict on a K-quant is expected rather
-/// than suspicious, and the old message sent the reader off to do a
-/// per-layer divergence run on a difference that has a known cause.
-///
-/// ggml declares a `vec_dot_type` per quantization
-/// (`ggml/src/ggml-cpu/ggml-cpu.c`). For the K-quants it is
-/// `GGML_TYPE_Q8_K`: llama.cpp quantizes the activation to 8 bits and
-/// accumulates in integers. ferrox keeps activations in f32. Both are
-/// defensible and ferrox is the more precise of the two, but they are
-/// not the same arithmetic, so the distributions differ by more than
-/// summation order.
-///
-/// Measured on five quantizations of one checkpoint: the verdict tracks
-/// this predicate on the 96 per-layer tensors exactly. See
-/// `docs/plans/llama-cpp-gap-inventory.md` §10.
-fn llama_dots_this_against_q8k(kind: &str) -> bool {
-    // Spelled as `GgmlType`'s own variant names (`Q4K`, not `Q4_K`) --
-    // these come from `format!("{:?}", dtype)`, and writing the ggml
-    // spelling here would have matched nothing while looking correct.
-    matches!(
-        kind,
-        "Q2K"
-            | "Q3K"
-            | "Q4K"
-            | "Q5K"
-            | "Q6K"
-            | "IQ2XXS"
-            | "IQ2XS"
-            | "IQ2S"
-            | "IQ3XXS"
-            | "IQ3S"
-            | "IQ1S"
-            | "IQ1M"
-            | "IQ4XS"
-    )
-}
-
-/// The most common quantization among a checkpoint's tensors.
-///
-/// The FILENAME is not this. `Llama-3.2-1B-Instruct-IQ4_XS.gguf`
-/// contains no IQ4_XS tensors at all -- 96 of its per-layer weights are
-/// `IQ4_NL` -- because the name is the quantization RECIPE and the
-/// recipe falls back. Reading the tensor table is the only way to know,
-/// and mistaking the two is what made that file look like a
-/// counterexample.
-fn dominant_quant(file: &ferrox_gguf::GgufFile) -> Option<String> {
-    use std::collections::HashMap;
-    let mut counts: HashMap<String, usize> = HashMap::new();
-    for t in &file.tensors {
-        let kind = format!("{:?}", t.dtype);
-        if kind != "F32" && kind != "F16" && kind != "BF16" {
-            *counts.entry(kind).or_default() += 1;
-        }
-    }
-    counts.into_iter().max_by_key(|(_, n)| *n).map(|(k, _)| k)
+/// What the run WAS, as opposed to what it found. Grouped because a
+/// print function taking eight positional arguments is one careless
+/// edit away from two of them being swapped, and `&str` next to `&str`
+/// swaps silently.
+struct Run<'a> {
+    model: &'a str,
+    n_tokens: usize,
+    top_k: usize,
+    backend: &'a str,
 }
 
 fn print_report(
-    model: &str,
-    n_tokens: usize,
-    k: usize,
-    backend: &str,
-    quant: Option<&str>,
+    run: &Run<'_>,
+    quant: &DominantQuant,
+    references: &[Reference],
+    band: &Band,
     r: &Report,
 ) {
+    let Run {
+        model,
+        n_tokens,
+        top_k: k,
+        backend,
+    } = *run;
     let name = Path::new(model)
         .file_stem()
         .map(|s| s.to_string_lossy().into_owned())
@@ -354,8 +434,24 @@ fn print_report(
         "parity {name}: {verdict} ({n_tokens}-token prompt, first-token distribution, \
          ferrox {backend} vs llama.cpp cpu)"
     );
+    // Named on every row, not only when it surprises. Two libllama
+    // builds gave the same checkpoint DRIFT and WRONG (#102), and the
+    // difference between the runs was invisible in this report.
+    for (i, reference) in references.iter().enumerate() {
+        let who = match reference.libllama.as_deref() {
+            Some(p) => p.to_string(),
+            None => "(this dumper predates the `libllama` line — rebuild with \
+                     tools/build_llama_logits.sh)"
+                .to_string(),
+        };
+        println!(
+            "  reference [{i}]     {who}   KL(llama||ferrox) {:.3e}",
+            band.kl_to_ferrox(i)
+        );
+    }
+    print_wrong_line(quant, references, band);
     println!(
-        "  KL(llama||ferrox) {:.3e} nats   KL(ferrox||llama) {:.3e} nats",
+        "  KL(llama||ferrox) {:.3e} nats   KL(ferrox||llama) {:.3e} nats   [reference 0]",
         r.kl_ref_ferrox, r.kl_ferrox_ref
     );
     println!(
@@ -370,9 +466,20 @@ fn print_report(
         "  top-{k} overlap    {}/{k}          llama top-2 margin {:.3e}",
         r.topk_overlap, r.ref_top2_margin
     );
+    // Printed for every verdict, not only TIE-FLIP: how close the
+    // argmax call was is what says whether the NEXT prompt would flip
+    // too, and a row that did not flip is the evidence that a row which
+    // did was one prompt's luck.
+    println!(
+        "  top-1/top-2 gap   {:+.3e} logits ({} ulps)   ferrox on the same pair {:+.3e}",
+        r.ref_top2_logit_gap, r.ref_top2_logit_gap_ulps, r.ferrox_gap_on_ref_pair
+    );
     match r.verdict {
         Verdict::Match => println!("  same distribution to within f32 accumulation-order noise."),
-        Verdict::Drift => match quant.filter(|q| llama_dots_this_against_q8k(q)) {
+        // `q8k_dotted` is the SAME predicate on the SAME value the
+        // uncalibrated WRONG line reads, so the explanation and the
+        // line are never about different tensors (#109).
+        Verdict::Drift => match quant.label().filter(|_| quant.q8k_dotted()) {
             // Expected, with a named cause. Saying "go run a per-layer
             // divergence" here would send the reader after a bug that
             // is not there.
@@ -388,11 +495,23 @@ fn print_report(
                  explains — worth a per-layer divergence run before trusting this row."
             ),
         },
-        Verdict::TieFlip => println!(
-            "  top-1 differs, but llama's own top-2 margin ({:.3e}) is under the observed \
-             per-token noise ({:.3e}): a tie swapped, not a wrong graph.",
-            r.ref_top2_margin, r.max_prob_delta
-        ),
+        Verdict::TieFlip => {
+            println!(
+                "  top-1 differs, but llama's own top-2 margin ({:.3e}) is under the observed \
+                 per-token noise ({:.3e}): a tie swapped, not a wrong graph.",
+                r.ref_top2_margin, r.max_prob_delta
+            );
+            // The magnitude, in the units the claim is made in. Without
+            // it "tie" is an assertion; with it a reader can check
+            // whether the two candidates really are inseparable or
+            // whether a real difference merely landed near the argmax.
+            println!(
+                "  the two candidates are {} ulps apart in llama's logits ({:+.3e} absolute); \
+                 ferrox puts the same pair {:+.3e} apart, so the flip is a sign change of a gap \
+                 this size — not a redistribution.",
+                r.ref_top2_logit_gap_ulps, r.ref_top2_logit_gap, r.ferrox_gap_on_ref_pair
+            );
+        }
         Verdict::Wrong => println!(
             "  the graphs disagree. This is not sampling noise and not a tie: something in \
              the forward pass differs."
@@ -400,41 +519,70 @@ fn print_report(
     }
 }
 
-fn softmax(logits: &[f32]) -> Vec<f64> {
-    let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max) as f64;
-    let mut out: Vec<f64> = logits.iter().map(|&v| (v as f64 - max).exp()).collect();
-    let sum: f64 = out.iter().sum();
-    if sum > 0.0 {
-        for v in &mut out {
-            *v /= sum;
+/// The WRONG line, and where it came from.
+///
+/// Printed on EVERY row, including the ones that are nowhere near it.
+/// A verdict whose line is invisible cannot be audited, and the line is
+/// no longer a constant a reader could look up.
+fn print_wrong_line(quant: &DominantQuant, references: &[Reference], band: &Band) {
+    match band.line() {
+        WrongLine::Calibrated { spread, line } => {
+            let (a, b) = spread.between;
+            println!(
+                "  WRONG line        {line:.3e}  measured: references [{a}] and [{b}] disagree \
+                 with EACH OTHER by {:.3e} on this checkpoint",
+                spread.kl
+            );
+            println!(
+                "                    ferrox's nearest reference is {:.3e}, {:.0}% of the line",
+                band.nearest(),
+                100.0 * band.nearest() / line
+            );
+        }
+        WrongLine::Absolute(line) => println!(
+            "  WRONG line        {line:.3e}  absolute: llama.cpp's own build-to-build spread on \
+             {} is 0 to 4.6e-4, two orders under it",
+            quant.label().unwrap_or("this checkpoint")
+        ),
+        WrongLine::Uncalibrated => {
+            println!(
+                "  WRONG line        NONE — {} is dotted against Q8_K activations, and two \
+                 builds of llama.cpp disagree with EACH OTHER by up to 3.5e-2 there (#111), so \
+                 no constant can mean `the graphs disagree`.",
+                quant.label().unwrap_or("this checkpoint")
+            );
+            println!(
+                "                    Pass --dumper a second time, built against another \
+                 libllama, to measure this checkpoint's own line. ({} reference in this run.)",
+                references.len()
+            );
         }
     }
-    out
 }
 
-fn order_desc(p: &[f64]) -> Vec<usize> {
-    let mut idx: Vec<usize> = (0..p.len()).collect();
-    // Ties break by index on both sides, so a tie can never by itself
-    // make the two engines' orderings look different.
-    idx.sort_by(|&a, &b| p[b].partial_cmp(&p[a]).unwrap().then(a.cmp(&b)));
-    idx
-}
-
-fn dumper_path(explicit: Option<&str>) -> anyhow::Result<PathBuf> {
-    if let Some(e) = explicit {
-        let p = PathBuf::from(e);
-        if p.exists() {
-            return Ok(p);
-        }
-        // An explicit path that does not exist is a typo, not a reason to
-        // silently fall back to some other binary and report its answer
-        // as the reference.
-        anyhow::bail!("--dumper {} does not exist", p.display());
+/// Resolves every `--dumper`, or falls back to the single one the
+/// environment and the tree offer.
+fn dumper_paths(explicit: &[String]) -> anyhow::Result<Vec<PathBuf>> {
+    if !explicit.is_empty() {
+        return explicit
+            .iter()
+            .map(|e| {
+                let p = PathBuf::from(e);
+                // An explicit path that does not exist is a typo, not a
+                // reason to silently fall back to some other binary and
+                // report its answer as the reference.
+                if p.exists() {
+                    Ok(p)
+                } else {
+                    anyhow::bail!("--dumper {} does not exist", p.display())
+                }
+            })
+            .collect();
     }
     if let Some(e) = std::env::var_os(DUMPER_ENV) {
         let p = PathBuf::from(e);
         if p.exists() {
-            return Ok(p);
+            return Ok(vec![p]);
         }
         anyhow::bail!(
             "{DUMPER_ENV} points at {}, which does not exist",
@@ -444,7 +592,7 @@ fn dumper_path(explicit: Option<&str>) -> anyhow::Result<PathBuf> {
     for c in DUMPER_CANDIDATES {
         let p = PathBuf::from(c);
         if p.exists() {
-            return Ok(p);
+            return Ok(vec![p]);
         }
     }
     anyhow::bail!(
@@ -455,10 +603,37 @@ fn dumper_path(explicit: Option<&str>) -> anyhow::Result<PathBuf> {
     )
 }
 
+/// What the reference said, and which library said it.
+struct Reference {
+    logits: Vec<f32>,
+    /// The libllama the dumper actually loaded, as it reported itself.
+    ///
+    /// `None` when the dumper predates the line — an older binary is
+    /// still usable, it just cannot be attributed, and that is worth
+    /// saying rather than guessing a path from the dumper's own.
+    libllama: Option<String>,
+}
+
+/// Prefix the dumper uses to report the library it loaded. Spelled once
+/// here and once in `tools/llama_logits.c`; the parse is tolerant of
+/// its absence precisely because those two are the only things that
+/// have to agree and nothing links them.
+const LIBLLAMA_LINE: &str = "libllama ";
+
 /// Runs the reference dumper on the SAME token ids and reads back its
 /// logit vector.
-fn reference_logits(dumper: &Path, model: &str, tokens: &[u32]) -> anyhow::Result<Vec<f32>> {
-    let out_path = std::env::temp_dir().join(format!("ferrox-parity-{}.bin", std::process::id()));
+///
+/// `slot` distinguishes the temporary file per reference: two dumpers
+/// run in one process would otherwise write the same path, and the
+/// second answer would be read as the first.
+fn reference_logits(
+    dumper: &Path,
+    model: &str,
+    tokens: &[u32],
+    slot: usize,
+) -> anyhow::Result<Reference> {
+    let out_path =
+        std::env::temp_dir().join(format!("ferrox-parity-{}-{slot}.bin", std::process::id()));
     let mut cmd = Command::new(dumper);
     cmd.arg(model).arg(&out_path);
     for t in tokens {
@@ -480,22 +655,46 @@ fn reference_logits(dumper: &Path, model: &str, tokens: &[u32]) -> anyhow::Resul
     if bytes.len() % 4 != 0 {
         anyhow::bail!("reference logits file is not a whole number of f32");
     }
-    Ok(bytes
-        .as_chunks::<4>()
-        .0
-        .iter()
-        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-        .collect())
+    Ok(Reference {
+        logits: bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect(),
+        libllama: parse_libllama(&String::from_utf8_lossy(&out.stdout)),
+    })
+}
+
+/// Picks the `libllama <path>` line out of the dumper's stdout.
+fn parse_libllama(stdout: &str) -> Option<String> {
+    stdout
+        .lines()
+        .find_map(|l| l.trim().strip_prefix(LIBLLAMA_LINE))
+        .map(str::trim)
+        .filter(|p| !p.is_empty() && *p != "unknown")
+        .map(str::to_string)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// A band from ONE reference, which is what every pre-existing
+    /// verdict test is about: the KL to that reference IS the nearest,
+    /// so these exercise the ladder and not the calibration.
+    fn one_reference(reference: &[f32], ferrox: &[f32]) -> Band {
+        Band::measure(
+            &[reference],
+            ferrox,
+            &DominantQuant::weigh(Some("Q8_0"), Some("Q8_0")),
+        )
+    }
+
     #[test]
     fn identical_logits_are_a_match() {
         let l = vec![0.1f32, 5.0, -2.0, 3.3];
-        let r = compare(&l, &l, 3);
+        let r = compare(&l, &l, 3, &one_reference(&l, &l));
         assert_eq!(r.verdict, Verdict::Match);
         assert!(r.kl_ref_ferrox < 1e-12, "KL was {}", r.kl_ref_ferrox);
         assert_eq!(r.top1_ref, r.top1_ferrox);
@@ -508,7 +707,7 @@ mod tests {
         // Mass moved to a different token entirely.
         let a = vec![0.0f32, 8.0, 0.0, 0.0];
         let b = vec![0.0f32, 0.0, 8.0, 0.0];
-        let r = compare(&a, &b, 2);
+        let r = compare(&a, &b, 2, &one_reference(&a, &b));
         assert_eq!(r.verdict, Verdict::Wrong);
         assert_ne!(r.top1_ref, r.top1_ferrox);
     }
@@ -519,7 +718,7 @@ mod tests {
         // whole point of measuring the distribution instead of the draw.
         let a = vec![-10.0f32, 2.000_01, 2.0];
         let b = vec![-10.0f32, 2.0, 2.000_01];
-        let r = compare(&a, &b, 2);
+        let r = compare(&a, &b, 2, &one_reference(&a, &b));
         assert_eq!(r.verdict, Verdict::TieFlip);
         assert_ne!(r.top1_ref, r.top1_ferrox);
         // Both engines still agree on WHICH two tokens are in play.
@@ -532,7 +731,7 @@ mod tests {
         // further than accumulation order explains.
         let a = vec![6.0f32, 1.0, 1.0, 1.0];
         let b = vec![6.0f32, 1.0, 1.0, 2.0];
-        let r = compare(&a, &b, 4);
+        let r = compare(&a, &b, 4, &one_reference(&a, &b));
         assert_eq!(r.verdict, Verdict::Drift);
         assert_eq!(r.top1_ref, r.top1_ferrox);
         assert!(r.kl_ref_ferrox >= KL_NOISE && r.kl_ref_ferrox < KL_WRONG);
@@ -544,41 +743,176 @@ mod tests {
         // logits: an additive constant is not a disagreement.
         let a = vec![0.5f32, 1.5, -3.0];
         let b: Vec<f32> = a.iter().map(|v| v + 7.25).collect();
-        let r = compare(&a, &b, 3);
+        let r = compare(&a, &b, 3, &one_reference(&a, &b));
         assert_eq!(r.verdict, Verdict::Match);
     }
 
-    /// The Q8_K predicate is spelled in `GgmlType`'s variant names, not
-    /// ggml's.
+    /// The reported top-1/top-2 gap describes the pair the REFERENCE
+    /// picked, on both sides, so the flip shows up as a sign change.
     ///
-    /// `format!("{:?}", dtype)` yields `Q4K`, and ggml calls the same
-    /// thing `Q4_K`. Writing the ggml spelling here matches NOTHING
-    /// while looking exactly right, and the symptom is the generic
-    /// "go run a per-layer divergence" message on every K-quant — which
-    /// is the message this predicate exists to suppress. That mistake
-    /// was made once already; this is what catches it.
+    /// Reporting ferrox's own top-2 pair instead would compare two
+    /// different questions and could print two positive gaps for a run
+    /// whose whole finding is that the order reversed.
     #[test]
-    fn the_q8k_predicate_uses_the_dtype_debug_spelling() {
-        for kind in ["Q2K", "Q3K", "Q4K", "Q5K", "Q6K", "IQ4XS", "IQ2S"] {
-            assert!(
-                llama_dots_this_against_q8k(kind),
-                "{kind} declares vec_dot_type = Q8_K in ggml-cpu.c"
-            );
-        }
-        // The ggml spelling must NOT match, or the underscore bug is
-        // back and invisible.
-        for wrong in ["Q4_K", "Q6_K", "IQ4_XS"] {
-            assert!(
-                !llama_dots_this_against_q8k(wrong),
-                "{wrong} is ggml's spelling, not GgmlType's -- if this now matches, the \
-                 predicate is accepting both and the next reader cannot tell which is real"
-            );
-        }
-        // Q8_0-dotted quants must stay out: these are the ones that
-        // MATCH, and claiming the divergence is expected for them would
-        // excuse a real bug.
-        for q8_0_dotted in ["Q8_0", "Q4_0", "Q5_0", "IQ4NL"] {
-            assert!(!llama_dots_this_against_q8k(q8_0_dotted));
-        }
+    fn the_reported_gap_is_the_same_pair_on_both_sides_and_flips_sign() {
+        let a = vec![-10.0f32, 2.000_01, 2.0];
+        let b = vec![-10.0f32, 2.0, 2.000_01];
+        let r = compare(&a, &b, 2, &one_reference(&a, &b));
+        assert_eq!(r.verdict, Verdict::TieFlip);
+        assert!(
+            r.ref_top2_logit_gap > 0.0,
+            "the reference ranks its own pair the right way round"
+        );
+        assert!(
+            r.ferrox_gap_on_ref_pair < 0.0,
+            "ferrox ranks the SAME pair the other way: gap {}",
+            r.ferrox_gap_on_ref_pair
+        );
+        assert!(
+            r.ref_top2_logit_gap_ulps > 0 && r.ref_top2_logit_gap_ulps < 1_000,
+            "a tie must be a handful of ulps, got {}",
+            r.ref_top2_logit_gap_ulps
+        );
+    }
+
+    /// THE VERDICT THAT #102 AND #111 ARE ABOUT: one ferrox, one file,
+    /// two libllama, and the answer must not depend on which one the
+    /// report happens to name first.
+    ///
+    /// The fixture is the shape Qwen3-0.6B `--pure` Q4_K_S has: the two
+    /// references sit further from each other than ferrox sits from the
+    /// nearer of them. Under the old absolute constant this read DRIFT
+    /// against one and WRONG against the other. It must now read the
+    /// same either way round, and it must still be a DRIFT rather than
+    /// a MATCH, because the distributions really have moved.
+    #[test]
+    fn the_verdict_is_the_same_whichever_reference_the_report_names() {
+        // ferrox reproduces reference A closely; B is off on its own,
+        // and A and B are further apart than ferrox is from A.
+        let a = vec![0.0f32, 4.0, 1.0, 0.5];
+        let b = vec![0.0f32, 2.5, 1.0, 0.5];
+        let ferrox = vec![0.0f32, 3.6, 1.0, 0.5];
+        let quant = DominantQuant::weigh(Some("Q4K"), Some("Q4K"));
+
+        let ab = Band::measure(&[&a, &b], &ferrox, &quant);
+        let ba = Band::measure(&[&b, &a], &ferrox, &quant);
+
+        let first = compare(&a, &ferrox, 4, &ab);
+        let second = compare(&b, &ferrox, 4, &ba);
+        assert_eq!(first.verdict, Verdict::Drift);
+        assert_eq!(second.verdict, Verdict::Drift);
+        // Both really did drift — neither is a MATCH that would make
+        // the agreement trivial.
+        assert!(first.kl_ref_ferrox > KL_NOISE && second.kl_ref_ferrox > KL_NOISE);
+        // The printed KL is still the named reference's, which is the
+        // whole reason both numbers appear in the report.
+        assert_ne!(first.kl_ref_ferrox, second.kl_ref_ferrox);
+
+        // With ONE reference and a K-quant body there is no line at
+        // all, so the same B-vs-ferrox comparison cannot be a WRONG
+        // either — even though its KL is an order of magnitude over
+        // the 3.008e-2 constant that used to be the line.
+        let alone = Band::measure(&[&b], &ferrox, &quant);
+        let solo = compare(&b, &ferrox, 4, &alone);
+        assert!(solo.kl_ref_ferrox > 3.008e-2, "{}", solo.kl_ref_ferrox);
+        assert_eq!(solo.verdict, Verdict::Drift);
+    }
+
+    /// THE WRONG RUNG READS THE NEAREST REFERENCE, NOT THE ONE THE
+    /// REPORT NAMES.
+    ///
+    /// This is the whole change, in the one geometry that separates it
+    /// from the old rule: the KL printed against the named reference is
+    /// OVER that checkpoint's line, while ferrox is nowhere near being
+    /// the outlier — the two references disagree with each other, and
+    /// ferrox reproduces the other one to within a fiftieth of their
+    /// disagreement. Qwen3-0.6B `--pure` Q4_K_S is this shape at
+    /// smaller scale (3.889e-2 printed, 3.514e-2 spread, 1.975e-2 to
+    /// the other build), and deciding it on the printed number is what
+    /// made one file DRIFT on one bottle and WRONG on another (#102,
+    /// #111).
+    ///
+    /// The report still prints the large number. It is a true statement
+    /// about the named reference; it is just not evidence about ferrox.
+    #[test]
+    fn the_wrong_rung_is_decided_by_the_nearest_reference_not_the_one_being_reported() {
+        let a = vec![0.0f32, 4.0, 1.0, 0.5];
+        let b = vec![0.0f32, 2.0, 1.0, 0.5];
+        let ferrox = vec![0.0f32, 3.8, 0.2, 0.5];
+        let quant = DominantQuant::weigh(Some("Q4K"), Some("Q4K"));
+
+        // B is the primary, so B's KL is what the report carries.
+        let band = Band::measure(&[&b, &a], &ferrox, &quant);
+        let line = band.line().value().expect("two references give a line");
+        assert!(
+            band.kl_to_ferrox(0) > line,
+            "the fixture must put the PRIMARY over the line, else this proves nothing: {:.4e} \
+             against {line:.4e}",
+            band.kl_to_ferrox(0)
+        );
+        assert!(band.nearest() < line);
+
+        let r = compare(&b, &ferrox, 4, &band);
+        assert_eq!(r.verdict, Verdict::Drift);
+        assert!(
+            r.kl_ref_ferrox > line,
+            "the printed KL is still the named reference's"
+        );
+    }
+
+    /// A WRONG still happens, and it happens to a calibrated band.
+    ///
+    /// The rule is a relaxation on the checkpoints measured here, so a
+    /// test suite that only proved things are no longer WRONG would be
+    /// consistent with a verdict that can never fire.
+    #[test]
+    fn a_ferrox_further_from_every_reference_than_they_are_from_each_other_is_wrong() {
+        // Two references a hair apart, ferrox a long way from both.
+        let a = vec![0.0f32, 4.00, 1.0, 0.5];
+        let b = vec![0.0f32, 3.99, 1.0, 0.5];
+        let ferrox = vec![0.0f32, 1.00, 1.0, 0.5];
+        let quant = DominantQuant::weigh(Some("Q4K"), Some("Q4K"));
+        let band = Band::measure(&[&a, &b], &ferrox, &quant);
+        assert!(band.ferrox_is_outside());
+        assert_eq!(compare(&a, &ferrox, 4, &band).verdict, Verdict::Wrong);
+    }
+
+    /// The dumper's self-report is read, and its absence is not
+    /// mistaken for a library called "unknown".
+    #[test]
+    fn the_reference_identity_is_parsed_and_its_absence_is_not_invented() {
+        assert_eq!(
+            parse_libllama("libllama /opt/homebrew/lib/libllama.dylib\nn_vocab 32000\n").as_deref(),
+            Some("/opt/homebrew/lib/libllama.dylib")
+        );
+        // An older dumper prints no such line: report that, do not guess.
+        assert_eq!(parse_libllama("n_vocab 32000\n"), None);
+        // The dumper says "unknown" when dladdr fails; that is an
+        // absence too, and passing it through would print a reference
+        // path of "unknown" as though it were one.
+        assert_eq!(parse_libllama("libllama unknown\nn_vocab 32000\n"), None);
+        assert_eq!(parse_libllama("libllama   \n"), None);
+    }
+
+    /// Every `--dumper` is resolved, in order, and a typo in ANY of them
+    /// fails the run.
+    ///
+    /// A missing secondary that fell back to the tree's default would
+    /// silently calibrate against the primary itself — a zero spread
+    /// wearing the appearance of a two-reference experiment.
+    #[test]
+    fn every_dumper_is_resolved_and_a_missing_one_is_never_substituted() {
+        let me = std::env::current_exe().unwrap();
+        let me = me.to_string_lossy().into_owned();
+        let resolved = dumper_paths(&[me.clone(), me.clone()]).unwrap();
+        assert_eq!(resolved.len(), 2, "both references must survive");
+
+        let err = dumper_paths(&[me, "/nonexistent/llama_logits".into()])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("/nonexistent/llama_logits"),
+            "a bad second dumper must name itself, got: {err}"
+        );
     }
 }

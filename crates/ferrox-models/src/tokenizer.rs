@@ -19,8 +19,23 @@
 //! The per-checkpoint pre-tokenization rules live next door in
 //! [`pretokenize`], which is a transcription of llama.cpp and is
 //! reviewed against it.
+//!
+//! Four of llama.cpp's six `tokenizer.ggml.model` values are covered:
+//! `gpt2`/`gemma4` by [`GgufBpeTokenizer`], `llama` by
+//! [`GgufSpmTokenizer`], `t5` by [`GgufUnigramTokenizer`], and `bert` by
+//! [`GgufWordPieceTokenizer`] in `wordpiece`, which brings its own
+//! normalizer and its own Unicode tables (`unicode`, `unicode_data`)
+//! because WordPiece does not use the pre-tokenizer regexes at all.
+//! Still missing: `rwkv`, which needs a trie tokenizer, and `none`.
 
 mod pretokenize;
+mod scored_vocab;
+mod unicode;
+mod unicode_data;
+mod wordpiece;
+
+use scored_vocab::ScoredVocab;
+pub use wordpiece::{GgufWordPieceTokenizer, NormalizerOptions};
 
 /// The `tokenizer.ggml.pre` values whose llama.cpp arm sets
 /// `add_bos = true` for a BPE vocabulary.
@@ -63,7 +78,10 @@ pub fn should_add_bos_token(file: &impl ferrox_gguf::TensorSource) -> bool {
     let pre = file.metadata_str("tokenizer.ggml.pre").unwrap_or("");
     // llama.cpp: SPM/WPM default add_bos=true; BPE defaults false unless
     // its pre-tokenizer arm opts in. qwen2 leaves false.
-    if matches!(model, "llama" | "spm") || model.contains("sentencepiece") {
+    // `bert` is WPM, whose upstream arm sets add_bos AND add_sep true.
+    // It was missing here, so every WordPiece prompt was one `[CLS]`
+    // short of llama.cpp's.
+    if matches!(model, "llama" | "spm" | "bert") || model.contains("sentencepiece") {
         return true;
     }
     ADD_BOS_PRE.contains(&pre)
@@ -262,8 +280,17 @@ impl ByteTokenizer {
     /// dropped rather than silently corrupting output; invalid UTF-8
     /// byte sequences are replaced per Rust's standard lossy conversion.
     pub fn decode(ids: &[u32]) -> String {
-        let bytes: Vec<u8> = ids.iter().filter_map(|&id| u8::try_from(id).ok()).collect();
-        String::from_utf8_lossy(&bytes).into_owned()
+        String::from_utf8_lossy(&Self::decode_bytes(ids)).into_owned()
+    }
+
+    /// The raw bytes, before any UTF-8 decision is made about them.
+    ///
+    /// A caller decoding ONE token at a time must have these: a
+    /// multi-byte character split across two tokens is two invalid
+    /// fragments, and `decode` would turn each into U+FFFD and lose the
+    /// bytes for good. See `ferrox_server::utf8_stream`.
+    pub fn decode_bytes(ids: &[u32]) -> Vec<u8> {
+        ids.iter().filter_map(|&id| u8::try_from(id).ok()).collect()
     }
 
     pub const VOCAB_SIZE: usize = 256;
@@ -365,6 +392,14 @@ pub enum TokenizerLoadError {
     MissingTokens,
     #[error("'tokenizer.ggml.tokens' is present but is not a string array")]
     TokensNotStringArray,
+    #[error("'tokenizer.ggml.tokens' is present but empty: a vocabulary with no entries cannot tokenize anything, and its scores have no minimum")]
+    EmptyVocabulary,
+    #[error(
+        "vocabulary and scores disagree about the vocabulary size: 'tokenizer.ggml.tokens' has \
+         {tokens} entries but 'tokenizer.ggml.scores' has {scores}. A score-carrying vocabulary \
+         needs one score per token; this checkpoint cannot be tokenized"
+    )]
+    ScoresVocabLengthMismatch { tokens: usize, scores: usize },
 }
 
 /// GGUF's real `tokenizer.ggml.token_type` per-token integer tag,
@@ -768,6 +803,12 @@ impl GgufBpeTokenizer {
     /// GPT-2: remapped unicode → bytes. Gemma-4: unescape `▁` → space and
     /// expand `<0xXX>` byte tokens (same shape as SPM decode).
     pub fn decode(&self, ids: &[u32]) -> String {
+        String::from_utf8_lossy(&self.decode_bytes(ids)).into_owned()
+    }
+
+    /// The raw bytes, before any UTF-8 decision is made about them.
+    /// See [`GgufBpeTokenizer::decode`] and `ferrox_server::utf8_stream`.
+    pub fn decode_bytes(&self, ids: &[u32]) -> Vec<u8> {
         match self.style {
             BpeEncodingStyle::Gpt2 => {
                 let bytes: Vec<u8> = ids
@@ -776,7 +817,7 @@ impl GgufBpeTokenizer {
                     .flat_map(|token| token.chars())
                     .filter_map(|c| self.unicode_to_byte.get(&c).copied())
                     .collect();
-                String::from_utf8_lossy(&bytes).into_owned()
+                bytes
             }
             BpeEncodingStyle::SpmWhitespace => {
                 let mut bytes: Vec<u8> = Vec::new();
@@ -790,7 +831,7 @@ impl GgufBpeTokenizer {
                         bytes.extend(token.replace(SPM_SPACE, " ").into_bytes());
                     }
                 }
-                String::from_utf8_lossy(&bytes).into_owned()
+                bytes
             }
         }
     }
@@ -876,9 +917,11 @@ fn spm_byte_fallback_value(token: &str) -> Option<u8> {
 /// covering ASCII, whitespace runs, control characters, CJK/Khmer/
 /// Vietnamese text, emoji, and byte-fallback. All 45 match exactly.
 pub struct GgufSpmTokenizer {
-    token_to_id: std::collections::HashMap<String, u32>,
-    id_to_token: Vec<String>,
-    scores: Vec<f32>,
+    /// The vocabulary and its per-token scores, checked against each
+    /// other at load -- see [`scored_vocab`]. Shared with
+    /// [`GgufUnigramTokenizer`] so that the score lookup exists once
+    /// rather than once per tokenizer.
+    vocab: ScoredVocab,
     /// Control/user-defined tokens from `tokenizer.ggml.token_type`,
     /// matched as atomic substrings before normal merging -- see
     /// `split_on_special_tokens`.
@@ -941,30 +984,8 @@ impl Ord for SpmMergeCandidate {
 
 impl GgufSpmTokenizer {
     pub fn from_gguf(file: &impl ferrox_gguf::TensorSource) -> Result<Self, TokenizerLoadError> {
-        let tokens_value = file
-            .metadata("tokenizer.ggml.tokens")
-            .ok_or(TokenizerLoadError::MissingTokens)?;
-        let id_to_token: Vec<String> = match tokens_value {
-            ferrox_gguf::GgufValue::Array(items) => items
-                .iter()
-                .map(|v| v.as_str().map(|s| s.to_string()))
-                .collect::<Option<Vec<_>>>()
-                .ok_or(TokenizerLoadError::TokensNotStringArray)?,
-            _ => return Err(TokenizerLoadError::TokensNotStringArray),
-        };
-        let token_to_id: std::collections::HashMap<String, u32> = id_to_token
-            .iter()
-            .enumerate()
-            .map(|(i, t)| (t.clone(), i as u32))
-            .collect();
-
-        let scores: Vec<f32> = match file.metadata("tokenizer.ggml.scores") {
-            Some(ferrox_gguf::GgufValue::Array(items)) => {
-                items.iter().map(|v| v.as_f32().unwrap_or(0.0)).collect()
-            }
-            _ => vec![0.0; id_to_token.len()],
-        };
-        let special_tokens = load_special_tokens(file, &id_to_token);
+        let vocab = ScoredVocab::from_gguf(file)?;
+        let special_tokens = load_special_tokens(file, vocab.tokens());
         // llama.cpp defaults SPM `add_space_prefix` to true, then lets
         // `tokenizer.ggml.add_space_prefix` override (Gemma sets false).
         let add_space_prefix = match file.metadata("tokenizer.ggml.add_space_prefix") {
@@ -973,16 +994,14 @@ impl GgufSpmTokenizer {
         };
 
         Ok(GgufSpmTokenizer {
-            token_to_id,
-            id_to_token,
-            scores,
+            vocab,
             special_tokens,
             add_space_prefix,
         })
     }
 
     pub fn vocab_size(&self) -> usize {
-        self.id_to_token.len()
+        self.vocab.len()
     }
 
     /// Encodes `text` using SentencePiece's space-replacement
@@ -1025,7 +1044,7 @@ impl GgufSpmTokenizer {
         let mut symbols: Vec<String> = Vec::new();
         for ch in normalized.chars() {
             let s = ch.to_string();
-            if self.token_to_id.contains_key(&s) {
+            if self.vocab.id_of(&s).is_some() {
                 symbols.push(s);
             } else {
                 for byte in s.as_bytes() {
@@ -1057,8 +1076,10 @@ impl GgufSpmTokenizer {
                              insertion_order: &mut u64| {
             let (Some(l), Some(r)) = (l, r) else { return };
             let merged = format!("{}{}", symbols[l], symbols[r]);
-            if let Some(&id) = self.token_to_id.get(&merged) {
-                let score = self.scores.get(id as usize).copied().unwrap_or(0.0);
+            // `lookup` hands back the score with the id it belongs to,
+            // so there is no second, separately-written id-to-score
+            // step here for the Unigram twin to spell differently.
+            if let Some((_id, score)) = self.vocab.lookup(&merged) {
                 *insertion_order += 1;
                 heap.push(SpmMergeCandidate {
                     score,
@@ -1110,7 +1131,7 @@ impl GgufSpmTokenizer {
         let mut i = Some(0usize);
         while let Some(idx) = i {
             if alive[idx] {
-                result.push(self.token_to_id.get(&symbols[idx]).copied().unwrap_or(0));
+                result.push(self.vocab.id_of(&symbols[idx]).unwrap_or(0));
             }
             i = nexts[idx];
         }
@@ -1130,6 +1151,17 @@ impl GgufSpmTokenizer {
     }
 
     pub fn decode(&self, ids: &[u32]) -> String {
+        String::from_utf8_lossy(&self.decode_bytes(ids)).into_owned()
+    }
+
+    /// The raw bytes, before any UTF-8 decision is made about them.
+    ///
+    /// The comment below is about several `<0xXX>` tokens inside ONE
+    /// call. The same character can just as easily straddle the
+    /// boundary BETWEEN two calls, which is why this is public: a
+    /// per-token caller has to do its own buffering, and it cannot do
+    /// that from a `String` that has already been made lossy.
+    pub fn decode_bytes(&self, ids: &[u32]) -> Vec<u8> {
         // Byte-fallback tokens must be collected as raw bytes (not
         // pushed as their 6-character literal token string) and
         // UTF-8-decoded together with the rest -- a single real
@@ -1140,7 +1172,7 @@ impl GgufSpmTokenizer {
         // "<0x0A>" instead of a newline).
         let mut bytes: Vec<u8> = Vec::new();
         for &id in ids {
-            let Some(token) = self.id_to_token.get(id as usize) else {
+            let Some(token) = self.vocab.token(id) else {
                 continue;
             };
             if let Some(b) = Self::byte_fallback_value(token) {
@@ -1149,7 +1181,7 @@ impl GgufSpmTokenizer {
                 bytes.extend(token.replace('\u{2581}', " ").into_bytes());
             }
         }
-        String::from_utf8_lossy(&bytes).into_owned()
+        bytes
     }
 }
 
@@ -1217,9 +1249,13 @@ impl GgufSpmTokenizer {
 /// vocabulary substrings at all (exercising the unknown-token
 /// fallback repeatedly).
 pub struct GgufUnigramTokenizer {
-    token_to_id: std::collections::HashMap<String, u32>,
-    id_to_token: Vec<String>,
-    scores: Vec<f32>,
+    /// The vocabulary and its per-token scores, checked against each
+    /// other at load -- see [`scored_vocab`]. This used to be three
+    /// fields spelled out again here, with the Viterbi pass below
+    /// indexing `scores[id]` raw while the SPM twin guarded the same
+    /// lookup: a short `tokenizer.ggml.scores` array loaded and then
+    /// panicked once per request (issue #34).
+    vocab: ScoredVocab,
     unk_id: u32,
     /// Longest vocabulary piece, in characters -- bounds the Viterbi
     /// pass's inner loop so it only ever tries substrings that could
@@ -1238,29 +1274,7 @@ pub struct GgufUnigramTokenizer {
 
 impl GgufUnigramTokenizer {
     pub fn from_gguf(file: &impl ferrox_gguf::TensorSource) -> Result<Self, TokenizerLoadError> {
-        let tokens_value = file
-            .metadata("tokenizer.ggml.tokens")
-            .ok_or(TokenizerLoadError::MissingTokens)?;
-        let id_to_token: Vec<String> = match tokens_value {
-            ferrox_gguf::GgufValue::Array(items) => items
-                .iter()
-                .map(|v| v.as_str().map(|s| s.to_string()))
-                .collect::<Option<Vec<_>>>()
-                .ok_or(TokenizerLoadError::TokensNotStringArray)?,
-            _ => return Err(TokenizerLoadError::TokensNotStringArray),
-        };
-        let token_to_id: std::collections::HashMap<String, u32> = id_to_token
-            .iter()
-            .enumerate()
-            .map(|(i, t)| (t.clone(), i as u32))
-            .collect();
-
-        let scores: Vec<f32> = match file.metadata("tokenizer.ggml.scores") {
-            Some(ferrox_gguf::GgufValue::Array(items)) => {
-                items.iter().map(|v| v.as_f32().unwrap_or(0.0)).collect()
-            }
-            _ => vec![0.0; id_to_token.len()],
-        };
+        let vocab = ScoredVocab::from_gguf(file)?;
 
         let unk_id = file
             .metadata("tokenizer.ggml.unknown_token_id")
@@ -1268,20 +1282,20 @@ impl GgufUnigramTokenizer {
             .map(|v| v as u32)
             .unwrap_or(0);
 
-        let max_piece_chars = id_to_token
+        let max_piece_chars = vocab
+            .tokens()
             .iter()
             .map(|t| t.chars().count())
             .max()
             .unwrap_or(1)
             .max(1);
-        let min_score = scores.iter().copied().fold(f32::INFINITY, f32::min) as f64;
-        let unknown_token_score = min_score - 10.0;
-        let special_tokens = load_special_tokens(file, &id_to_token);
+        // A real score, not `+INFINITY`: `ScoredVocab` refuses an empty
+        // vocabulary, so this fold always sees at least one entry.
+        let unknown_token_score = vocab.min_score() as f64 - 10.0;
+        let special_tokens = load_special_tokens(file, vocab.tokens());
 
         Ok(GgufUnigramTokenizer {
-            token_to_id,
-            id_to_token,
-            scores,
+            vocab,
             unk_id,
             max_piece_chars,
             unknown_token_score,
@@ -1290,7 +1304,7 @@ impl GgufUnigramTokenizer {
     }
 
     pub fn vocab_size(&self) -> usize {
-        self.id_to_token.len()
+        self.vocab.len()
     }
 
     /// Encodes `text` via the real forward-Viterbi Unigram algorithm
@@ -1362,8 +1376,11 @@ impl GgufUnigramTokenizer {
             let max_len = self.max_piece_chars.min(n - i);
             for len in 1..=max_len {
                 let piece: String = chars[i..i + len].iter().collect();
-                if let Some(&id) = self.token_to_id.get(&piece) {
-                    let candidate = base + self.scores[id as usize] as f64;
+                // One lookup for id and score together: this line used
+                // to index `self.scores[id]` on its own, which is the
+                // out-of-bounds panic of issue #34.
+                if let Some((id, score)) = self.vocab.lookup(&piece) {
+                    let candidate = base + score as f64;
                     let j = i + len;
                     if candidate > dp[j].score {
                         dp[j] = Best {
@@ -1401,11 +1418,19 @@ impl GgufUnigramTokenizer {
     pub fn decode(&self, ids: &[u32]) -> String {
         let mut out = String::new();
         for &id in ids {
-            if let Some(token) = self.id_to_token.get(id as usize) {
+            if let Some(token) = self.vocab.token(id) {
                 out.push_str(&token.replace('\u{2581}', " "));
             }
         }
         out
+    }
+
+    /// The raw bytes. Unigram has no byte-fallback convention, so every
+    /// token is already whole text and this can never split a
+    /// character -- it exists so a per-token caller can treat every
+    /// tokenizer the same way.
+    pub fn decode_bytes(&self, ids: &[u32]) -> Vec<u8> {
+        self.decode(ids).into_bytes()
     }
 }
 
@@ -1877,6 +1902,78 @@ mod gguf_unigram_tests {
         // encode's leading dummy `▁` decodes back to a leading space,
         // same SentencePiece convention as GgufSpmTokenizer.
         assert_eq!(tok.decode(&ids), " hello world");
+    }
+
+    /// A hundred tokens and three scores.
+    fn short_scores_gguf() -> scored_vocab::MetadataOnlyGguf {
+        let tokens: Vec<String> = (0..100).map(|i| format!("\u{2581}piece{i}")).collect();
+        let refs: Vec<&str> = tokens.iter().map(String::as_str).collect();
+        scored_vocab::MetadataOnlyGguf::new()
+            .with_tokens(&refs)
+            .with_scores(&[-1.0, -2.0, -3.0])
+    }
+
+    /// Issue #34, and the reason the two tokenizers now share one
+    /// vocabulary type. This file used to LOAD CLEANLY -- accepted by
+    /// `/admin/models/load`, listed as the loaded model -- and then
+    /// panic with an index-out-of-bounds inside the generation task on
+    /// the first prompt whose Viterbi pass matched a piece with id >=
+    /// 3, once per request, forever. The SPM twin survived the same
+    /// file only because its copy of the lookup happened to be the
+    /// guarded spelling.
+    ///
+    /// Both must now refuse it at load, and refuse it the same way:
+    /// one lookup, one check, no room for the two to disagree again.
+    #[test]
+    fn a_scores_array_too_short_for_the_vocabulary_is_refused_at_load_by_both_tokenizers() {
+        let file = short_scores_gguf();
+        let unigram = GgufUnigramTokenizer::from_gguf(&file)
+            .err()
+            .expect("unigram must refuse a vocabulary its scores do not cover");
+        assert!(
+            matches!(
+                unigram,
+                TokenizerLoadError::ScoresVocabLengthMismatch {
+                    tokens: 100,
+                    scores: 3
+                }
+            ),
+            "unigram={unigram:?}"
+        );
+        let spm = GgufSpmTokenizer::from_gguf(&file)
+            .err()
+            .expect("spm must refuse the same file the same way");
+        assert!(
+            matches!(
+                spm,
+                TokenizerLoadError::ScoresVocabLengthMismatch {
+                    tokens: 100,
+                    scores: 3
+                }
+            ),
+            "spm={spm:?}"
+        );
+    }
+
+    /// The refusal above must be about the DISAGREEMENT, not about
+    /// synthetic vocabularies in general: the same 100 pieces with 100
+    /// scores load and encode, reaching ids far past the three the
+    /// broken file carried.
+    #[test]
+    fn the_same_vocabulary_with_one_score_per_token_loads_and_encodes() {
+        let tokens: Vec<String> = (0..100).map(|i| format!("\u{2581}piece{i}")).collect();
+        let refs: Vec<&str> = tokens.iter().map(String::as_str).collect();
+        let scores: Vec<f32> = (0..100).map(|i| -(i as f32)).collect();
+        let file = scored_vocab::MetadataOnlyGguf::new()
+            .with_tokens(&refs)
+            .with_scores(&scores);
+        let tok = GgufUnigramTokenizer::from_gguf(&file).expect("lengths agree");
+        assert_eq!(tok.vocab_size(), 100);
+        let ids = tok.encode("piece97");
+        assert!(
+            ids.contains(&97),
+            "the piece with the highest id must be reachable: ids={ids:?}"
+        );
     }
 }
 

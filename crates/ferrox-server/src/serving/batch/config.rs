@@ -4,19 +4,38 @@
 //! [`BatcherConfig`] explicitly rather than setting process environment,
 //! which two tests running in parallel cannot do without racing.
 
+use std::sync::mpsc::Sender;
 use std::sync::Arc;
 
 use crate::generate::{DecodeError, FinishReason, Usage};
 
 use super::status::DEFAULT_DECODE_LOG_INTERVAL;
 
-pub(super) type DecodeFn = Arc<dyn Fn(&[usize]) -> String + Send + Sync>;
+/// Detokenize to RAW BYTES, not text.
+///
+/// Bytes because a character can straddle two tokens and a batched row
+/// is decoded one token at a time: resolving UTF-8 per token turns each
+/// half into U+FFFD and loses it (#124). Each row buffers its own tail
+/// through `crate::utf8_stream::Utf8Stream` -- per row, because rows
+/// interleave and one shared buffer would splice two answers together.
+pub(super) type DecodeFn = Arc<dyn Fn(&[usize]) -> Vec<u8> + Send + Sync>;
 
 /// Finish reason, generated token ids, detokenized text (stop-trimmed),
 /// and usage. Callers should prefer `text` for the response body when
 /// stop sequences may have cut the decoded string short of a full
 /// `decode(ids)`.
 pub(super) type JobResult = Result<(FinishReason, Vec<usize>, String, Usage), DecodeError>;
+
+/// Worker → caller messages. Chunks carry incremental detokenized text;
+/// `Finished` ends the job with the same payload as before.
+pub(super) enum BatcherEvent {
+    Chunk(String),
+    Finished(Box<JobResult>),
+}
+
+pub(super) fn send_finished(reply: &Sender<BatcherEvent>, result: JobResult) {
+    let _ = reply.send(BatcherEvent::Finished(Box::new(result)));
+}
 
 /// Prompt tokens run per prefill chunk when `FERROX_CB_PREFILL_CHUNK`
 /// is unset. Large enough that a short prompt still prefills in one

@@ -6,8 +6,9 @@
 //!
 //! # Verified on real GPU hardware
 //!
-//! All five matvec kernels (`launch_q8_0_matvec`, `launch_q4_0_matvec`,
-//! `launch_q4_k_matvec`, `launch_q5_k_matvec`, `launch_q6_k_matvec`) have
+//! Five of the six matvec kernels (`launch_q8_0_matvec`,
+//! `launch_q4_0_matvec`, `launch_q4_k_matvec`, `launch_q5_k_matvec`,
+//! `launch_q6_k_matvec`) have
 //! been compiled by NVRTC and executed on real NVIDIA GPUs (RTX 3060s,
 //! rented on vast.ai), with their output cross-checked against
 //! `ferrox_quant`'s scalar reference for real, non-trivial quantized test
@@ -41,6 +42,16 @@
 //! Q8_0/Q4_0/Q4_K/Q5_K all pass on real hardware as of 2026-07-31; Q6_K's
 //! NaN-comparison fix has not yet been re-run on hardware (see that
 //! test's own `#[ignore]` message).
+//!
+//! **`launch_q5_0_matvec` is the sixth, and NO GPU HAS RUN IT.** It
+//! landed 2026-09-05 (`docs/plans/cpu-cuda-parity.md` §6) and is a
+//! transcription of `ferrox-metal`'s Q5_0 matvec, which is itself
+//! `ggml`'s `dequantize_row_q5_0`. Nothing above applies to it: the
+//! only checks it has are that the CUDA C names the entry point its
+//! table row claims and strides by `Q5_0_BLOCK_BYTES`. Until
+//! `cargo test -p ferrox-cuda --features cuda -- --ignored` has run
+//! `launch_q5_0_matvec_matches_cpu_reference` on a device and the
+//! result is written down, CUDA Q5_0 is a claim, not a capability.
 //!
 //! The device-probe path (`probe()`) was already verified earlier
 //! (tested to degrade correctly with no GPU present -- including a real
@@ -251,6 +262,103 @@ extern "C" __global__ void q4_0_matvec(
             int hi = (int)((byte >> 4) & 0x0F) - 8;
             block_acc += (float)lo * x[base + i];
             block_acc += (float)hi * x[base + i + 16];
+        }
+        acc += block_acc * scale;
+    }
+
+    partial[threadIdx.x] = acc;
+    __syncthreads();
+
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            partial[threadIdx.x] += partial[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+
+    if (threadIdx.x == 0) {
+        out[row] = partial[0];
+    }
+}
+"#;
+
+/// CUDA C source for a fused Q5_0 dequant+dot kernel, the same
+/// one-block-per-lane / block-level-reduction structure as
+/// `Q4_0_MATVEC_KERNEL_SRC` above, but unpacking Q5_0's 22-byte blocks:
+/// 2-byte f16 scale, a 4-byte `qh` bitplane, then 16 bytes of packed
+/// 4-bit nibbles. Element `j` takes the low nibble of `qs[j]` with bit
+/// `j` of `qh` as its fifth bit; element `j + 16` takes the high nibble
+/// with bit `j + 16`. Both are biased by -16. This mirrors
+/// `ferrox_quant::dot_q5_0_f32_scalar`'s exact math, and is `ggml`'s
+/// `dequantize_row_q5_0` reference form rather than the nibble-packed
+/// `ushort` trick `Q4_0_MATVEC_KERNEL_SRC` uses -- the same choice
+/// `ferrox-metal`'s `Q5_0_MATVEC_KERNEL_SRC` made and for the same
+/// reason: the fifth bit is indexed differently in the two halves, so
+/// folding it into the activation scaling needs two more shift chains
+/// and is much easier to get subtly wrong.
+///
+/// **UNVERIFIED ON HARDWARE.** No GPU has run this. Unlike the GEMM in
+/// `mul_mm.rs`, whose emitted C is executed on the host by
+/// `tools/mul_mm_host_check/run.sh` and compared bit for bit against a
+/// Rust twin, there is no host harness for the matvec kernels: the only
+/// check on this text is `launch_q5_0_matvec_matches_cpu_reference`,
+/// which is `#[ignore]`d and needs a device. Run it with
+/// `cargo test -p ferrox-cuda --features cuda -- --ignored` before any
+/// doc calls Q5_0 a measured CUDA capability.
+pub const Q5_0_MATVEC_KERNEL_SRC: &str = r#"
+extern "C" __global__ void q5_0_matvec(
+    const unsigned char* weights, // [rows * row_bytes]
+    const float* x,               // [cols]
+    float* out,                   // [rows]
+    int rows,
+    int row_bytes,
+    int n_blocks_per_row
+) {
+    int row = blockIdx.x;
+    if (row >= rows) return;
+
+    const unsigned char* row_ptr = weights + (size_t)row * row_bytes;
+
+    __shared__ float partial[256];
+    float acc = 0.0f;
+
+    for (int b = threadIdx.x; b < n_blocks_per_row; b += blockDim.x) {
+        const unsigned char* block = row_ptr + (size_t)b * 22;
+        unsigned short bits = (unsigned short)block[0] | ((unsigned short)block[1] << 8);
+        unsigned int sign = (bits >> 15) & 0x1u;
+        unsigned int exp = (bits >> 10) & 0x1Fu;
+        unsigned int mant = bits & 0x3FFu;
+        float scale;
+        if (exp == 0) {
+            scale = ldexpf((float)mant, -24);
+        } else if (exp == 31) {
+            scale = mant ? __int_as_float(0x7fc00000) : __int_as_float(0x7f800000);
+        } else {
+            scale = ldexpf((float)(mant | 0x400), (int)exp - 25);
+        }
+        if (sign) scale = -scale;
+
+        const unsigned int qh = (unsigned int)block[2]
+            | ((unsigned int)block[3] << 8)
+            | ((unsigned int)block[4] << 16)
+            | ((unsigned int)block[5] << 24);
+        const unsigned char* qs = block + 6;
+
+        int base = b * 32;
+        float block_acc = 0.0f;
+        #pragma unroll
+        for (int j = 0; j < 16; j++) {
+            // ggml `dequantize_row_q5_0`: the low half takes bit `j` of
+            // qh shifted UP into position 4, the high half takes bit
+            // `j + 16` shifted DOWN into it -- hence `j + 12`, not
+            // `j + 16`, because the bit is left in place rather than
+            // moved to position 0.
+            unsigned int xh_0 = ((qh >> j) << 4) & 0x10u;
+            unsigned int xh_1 = (qh >> (j + 12)) & 0x10u;
+            int x0 = (int)(((unsigned int)qs[j] & 0x0Fu) | xh_0) - 16;
+            int x1 = (int)(((unsigned int)qs[j] >> 4) | xh_1) - 16;
+            block_acc += (float)x0 * x[base + j];
+            block_acc += (float)x1 * x[base + j + 16];
         }
         acc += block_acc * scale;
     }
@@ -787,6 +895,57 @@ pub(crate) fn resident_cuda_weights(
     Ok(cached)
 }
 
+/// The per-kind matvec table, keyed by GGUF quant name: source, NVRTC
+/// module cache key, entry point. `None` means CUDA has no matvec for
+/// that format and the caller must fall back and say so.
+///
+/// This is the SINGLE holder of those three strings. It was not: the
+/// same five-row table was written out twice more, inline in
+/// `ferrox-core`'s `apply_gpu_multi` and `apply_gpu_dense_ffn_swiglu`,
+/// and a kind added to one and not the others silently lost the fused
+/// launch while the capability report kept saying GPU. That is the
+/// shape `ferrox-metal`'s `matvec_launch_meta` already exists to
+/// prevent, and this is its CUDA counterpart -- keyed the same way, by
+/// `QuantKind::name()`, so `ferrox-core` can ask for a kind without
+/// depending on a CUDA type.
+pub fn matvec_launch_meta(kind_name: &str) -> Option<(&'static str, &'static str, &'static str)> {
+    match kind_name {
+        "Q8_0" => Some((Q8_0_MATVEC_KERNEL_SRC, "ferrox_q8_0", "q8_0_matvec")),
+        "Q4_0" => Some((Q4_0_MATVEC_KERNEL_SRC, "ferrox_q4_0", "q4_0_matvec")),
+        "Q5_0" => Some((Q5_0_MATVEC_KERNEL_SRC, "ferrox_q5_0", "q5_0_matvec")),
+        "Q4_K" => Some((Q4_K_MATVEC_KERNEL_SRC, "ferrox_q4_k", "q4_k_matvec")),
+        "Q5_K" => Some((Q5_K_MATVEC_KERNEL_SRC, "ferrox_q5_k", "q5_k_matvec")),
+        "Q6_K" => Some((Q6_K_MATVEC_KERNEL_SRC, "ferrox_q6_k", "q6_k_matvec")),
+        _ => None,
+    }
+}
+
+/// Looks a kind up in [`matvec_launch_meta`] and launches it. Every
+/// `launch_q*_matvec` below is this call with its name filled in, so
+/// the launchers cannot name a module or entry point the table does
+/// not.
+fn launch_matvec_by_kind(
+    kind_name: &str,
+    weights: &[u8],
+    x: &[f32],
+    rows: usize,
+    row_bytes: usize,
+    n_blocks_per_row: usize,
+) -> Result<Vec<f32>, CudaError> {
+    let (kernel_src, module_name, fn_name) = matvec_launch_meta(kind_name)
+        .ok_or_else(|| CudaError::Unsupported(format!("no CUDA matvec kernel for {kind_name}")))?;
+    launch_matvec(
+        kernel_src,
+        module_name,
+        fn_name,
+        weights,
+        x,
+        rows,
+        row_bytes,
+        n_blocks_per_row,
+    )
+}
+
 /// Launches the Q8_0 matvec kernel. Verified on real GPU hardware -- see module docs.
 pub fn launch_q8_0_matvec(
     weights: &[u8],
@@ -795,16 +954,7 @@ pub fn launch_q8_0_matvec(
     row_bytes: usize,
     n_blocks_per_row: usize,
 ) -> Result<Vec<f32>, CudaError> {
-    launch_matvec(
-        Q8_0_MATVEC_KERNEL_SRC,
-        "ferrox_q8_0",
-        "q8_0_matvec",
-        weights,
-        x,
-        rows,
-        row_bytes,
-        n_blocks_per_row,
-    )
+    launch_matvec_by_kind("Q8_0", weights, x, rows, row_bytes, n_blocks_per_row)
 }
 
 /// Launches the Q4_0 matvec kernel. Verified on real GPU hardware -- see module docs.
@@ -815,16 +965,20 @@ pub fn launch_q4_0_matvec(
     row_bytes: usize,
     n_blocks_per_row: usize,
 ) -> Result<Vec<f32>, CudaError> {
-    launch_matvec(
-        Q4_0_MATVEC_KERNEL_SRC,
-        "ferrox_q4_0",
-        "q4_0_matvec",
-        weights,
-        x,
-        rows,
-        row_bytes,
-        n_blocks_per_row,
-    )
+    launch_matvec_by_kind("Q4_0", weights, x, rows, row_bytes, n_blocks_per_row)
+}
+
+/// Launches the Q5_0 matvec kernel. **NEVER RUN ON A GPU** -- see
+/// `Q5_0_MATVEC_KERNEL_SRC`'s doc comment for what is and is not
+/// established about it.
+pub fn launch_q5_0_matvec(
+    weights: &[u8],
+    x: &[f32],
+    rows: usize,
+    row_bytes: usize,
+    n_blocks_per_row: usize,
+) -> Result<Vec<f32>, CudaError> {
+    launch_matvec_by_kind("Q5_0", weights, x, rows, row_bytes, n_blocks_per_row)
 }
 
 /// Launches the Q4_K matvec kernel. Verified on real GPU hardware -- see module docs.
@@ -835,16 +989,7 @@ pub fn launch_q4_k_matvec(
     row_bytes: usize,
     n_blocks_per_row: usize,
 ) -> Result<Vec<f32>, CudaError> {
-    launch_matvec(
-        Q4_K_MATVEC_KERNEL_SRC,
-        "ferrox_q4_k",
-        "q4_k_matvec",
-        weights,
-        x,
-        rows,
-        row_bytes,
-        n_blocks_per_row,
-    )
+    launch_matvec_by_kind("Q4_K", weights, x, rows, row_bytes, n_blocks_per_row)
 }
 
 /// Launches the Q5_K matvec kernel. Verified on real GPU hardware -- see module docs.
@@ -855,16 +1000,7 @@ pub fn launch_q5_k_matvec(
     row_bytes: usize,
     n_blocks_per_row: usize,
 ) -> Result<Vec<f32>, CudaError> {
-    launch_matvec(
-        Q5_K_MATVEC_KERNEL_SRC,
-        "ferrox_q5_k",
-        "q5_k_matvec",
-        weights,
-        x,
-        rows,
-        row_bytes,
-        n_blocks_per_row,
-    )
+    launch_matvec_by_kind("Q5_K", weights, x, rows, row_bytes, n_blocks_per_row)
 }
 
 /// Launches the Q6_K matvec kernel. NOT yet re-verified on real GPU
@@ -877,16 +1013,7 @@ pub fn launch_q6_k_matvec(
     row_bytes: usize,
     n_blocks_per_row: usize,
 ) -> Result<Vec<f32>, CudaError> {
-    launch_matvec(
-        Q6_K_MATVEC_KERNEL_SRC,
-        "ferrox_q6_k",
-        "q6_k_matvec",
-        weights,
-        x,
-        rows,
-        row_bytes,
-        n_blocks_per_row,
-    )
+    launch_matvec_by_kind("Q6_K", weights, x, rows, row_bytes, n_blocks_per_row)
 }
 
 /// Metadata for a single matvec launch in a multi-matvec batch (shared
@@ -1413,6 +1540,116 @@ mod tests {
         .expect("kernel launch must succeed on real CUDA hardware");
         assert_eq!(result.len(), expected.len());
         for (i, (got, want)) in result.iter().zip(expected.iter()).enumerate() {
+            assert!(
+                (got - want).abs() < 1e-2,
+                "row {i}: GPU={got} CPU reference={want}"
+            );
+        }
+    }
+
+    /// The three strings a matvec launch needs live in exactly one
+    /// table, and each source has to define the entry point its row
+    /// names. Runnable without a device, because the failure this
+    /// guards against -- a row whose `fn_name` and source disagree --
+    /// is a `KernelCompile` error at a user's first token, not
+    /// something a GPU is needed to see.
+    #[test]
+    fn matvec_launch_meta_defines_every_entry_point_it_names() {
+        let mut modules = std::collections::HashSet::new();
+        for name in ["Q8_0", "Q4_0", "Q5_0", "Q4_K", "Q5_K", "Q6_K"] {
+            let (src, module, func) = matvec_launch_meta(name)
+                .unwrap_or_else(|| panic!("{name} must have a CUDA matvec"));
+            assert!(
+                src.contains(&format!("void {func}(")),
+                "{name}: the source in {module} does not define {func}"
+            );
+            assert!(
+                modules.insert(module),
+                "{name}: module cache key {module} collides with another kind"
+            );
+        }
+        // A kind with no kernel must not resolve to one. Resolving
+        // would send a matmul to a module that cannot compile, and the
+        // caller would have no way to fall back honestly.
+        for name in ["Q2_K", "Q3_K", "Q5_1", "IQ4_XS", "MXFP4"] {
+            assert!(
+                matvec_launch_meta(name).is_none(),
+                "{name} resolved to a CUDA matvec that does not exist"
+            );
+        }
+    }
+
+    /// The Q5_0 kernel's block stride and element stride are literals in
+    /// CUDA C, so nothing but this holds them to the format's real
+    /// geometry. A wrong stride walks the row past the first block and
+    /// every value after it is garbage -- and `nl` is 2 here, not the
+    /// K-quants' 16, which is the assumption easiest to carry over by
+    /// mistake.
+    #[test]
+    fn the_q5_0_matvec_strides_by_the_real_block_geometry() {
+        assert_eq!(ferrox_quant::Q5_0_BLOCK_BYTES, 22);
+        assert_eq!(ferrox_quant::Q5_0_BLOCK_ELEMS, 32);
+        assert!(
+            Q5_0_MATVEC_KERNEL_SRC.contains("(size_t)b * 22"),
+            "the Q5_0 matvec does not stride by Q5_0_BLOCK_BYTES"
+        );
+        assert!(
+            Q5_0_MATVEC_KERNEL_SRC.contains("int base = b * 32;"),
+            "the Q5_0 matvec does not step the activation by Q5_0_BLOCK_ELEMS"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires real CUDA hardware -- NEVER RUN: the Q5_0 matvec has never executed on a GPU. Run with --ignored on a CUDA-capable machine and record the result before any doc claims CUDA Q5_0 works"]
+    fn launch_q5_0_matvec_matches_cpu_reference() {
+        // Run manually on a machine with an actual CUDA device:
+        //   cargo test -p ferrox-cuda --features cuda -- --ignored
+        let rows = 4;
+        let cols = 64;
+        let blocks_per_row = cols / ferrox_quant::Q5_0_BLOCK_ELEMS;
+        let row_bytes = blocks_per_row * ferrox_quant::Q5_0_BLOCK_BYTES;
+
+        // `ferrox_quant` has no Q5_0 quantizer (the format is load-only
+        // here), so the fixture is built byte by byte. The scale is
+        // pinned finite -- a random f16 is NaN or Inf often enough to
+        // be the usual outcome -- while `qh` is deliberately varied, so
+        // both the low half's fifth bit (`qh` bit j) and the high
+        // half's (`qh` bit j + 16) are set on some elements and clear
+        // on others. A kernel that dropped `qh` entirely would still
+        // produce plausible numbers against a fixture where it is zero.
+        let mut weights = Vec::with_capacity(rows * row_bytes);
+        for r in 0..rows {
+            for b in 0..blocks_per_row {
+                let idx = (r * blocks_per_row + b) as u32;
+                weights.extend_from_slice(
+                    &half::f16::from_f32(0.05 + idx as f32 * 0.01).to_le_bytes(),
+                );
+                let qh = 0x9E3D_7A51u32.wrapping_mul(idx + 1);
+                weights.extend_from_slice(&qh.to_le_bytes());
+                for i in 0..16u8 {
+                    let lo = (i + r as u8 + b as u8) % 16;
+                    let hi = (15 - i + r as u8 + b as u8) % 16;
+                    weights.push(lo | (hi << 4));
+                }
+            }
+        }
+        assert_eq!(weights.len(), rows * row_bytes);
+
+        let x: Vec<f32> = (0..cols).map(|i| ((i as f32) * 0.09).sin()).collect();
+        let expected: Vec<f32> = (0..rows)
+            .map(|r| {
+                ferrox_quant::dot_q5_0_f32_scalar(&weights[r * row_bytes..(r + 1) * row_bytes], &x)
+            })
+            .collect();
+
+        let result = launch_q5_0_matvec(&weights, &x, rows, row_bytes, blocks_per_row)
+            .expect("kernel launch must succeed on real CUDA hardware");
+        assert_eq!(result.len(), expected.len());
+        for (i, (got, want)) in result.iter().zip(expected.iter()).enumerate() {
+            // Absolute, like the Q8_0/Q4_0 tests and unlike the K-quant
+            // ones: Q5_0 accumulates an exact integer dot per block and
+            // applies the scale once, so there is no per-element
+            // scale multiply for an FMA to reassociate.
             assert!(
                 (got - want).abs() < 1e-2,
                 "row {i}: GPU={got} CPU reference={want}"

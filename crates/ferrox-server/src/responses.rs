@@ -104,10 +104,9 @@ use serde_json::{json, Map, Value};
 use crate::generate::{DecodeError, Usage};
 use crate::output::OutputPosture;
 use crate::{
-    attribution, decode_error_response, join_error_response, output, prompt_from_messages,
-    run_generation, run_generation_emit, sse, stats, ApiError, AppState, ChatCompletionRequest,
-    ChatMessage, MessageContent, ToolCallFunctionIn, ToolCallIn, ToolChoice, ToolDef,
-    ToolFunctionDef,
+    attribution, output, prompt_from_messages, run_generation_emit, sse, stats, ApiError, AppState,
+    ChatCompletionRequest, ChatMessage, MessageContent, ToolCallFunctionIn, ToolCallIn, ToolChoice,
+    ToolDef, ToolFunctionDef,
 };
 
 /// The path this module wants to be mounted at. Kept here only until it
@@ -612,6 +611,7 @@ fn to_chat_request(req: &ResponsesRequest) -> Result<ChatCompletionRequest, ApiE
         .map(str::to_string);
 
     let request = ChatCompletionRequest {
+        samplers: None,
         model: req.model.clone(),
         messages,
         max_tokens,
@@ -1434,41 +1434,26 @@ async fn responses_full(
     // Cloned once, up front: this request decodes against exactly this
     // model even if `/admin/models/load` swaps another one in halfway.
     let active = state.require_active()?;
-    let template = active.model.chat_template();
+    let template = active.generative()?.chat_template();
     let kwargs = chat.resolve_template_kwargs(&template);
     let offered = offered_tools(&chat);
     let prompt = prompt_from_messages(&chat.messages, &template, &offered, kwargs)?;
-    let posture = OutputPosture::resolve(active.model.name(), &prompt);
-    let params = chat.generation_params_for_template(&template)?;
+    let posture = OutputPosture::resolve(active.name(), &prompt);
+    let params = chat.generation_params_for_template(&template, active.name())?;
 
-    let model = Arc::clone(&active.model);
-    let kv_pool = state.kv_pool.clone();
-    let paged_kv = state.paged_kv.clone();
-    let prefix_cache = state.prefix_cache.clone();
-    let batcher = active.batcher.clone();
-    let ceiling = active.ceiling.clone();
-    let (chunks, finish, usage) = tokio::task::spawn_blocking(move || {
-        run_generation(
-            &model,
-            &prompt,
-            &params,
-            kv_pool.as_ref(),
-            paged_kv.as_ref(),
-            prefix_cache.as_deref(),
-            batcher.as_ref(),
-            ceiling.as_deref(),
-        )
-    })
-    .await
-    .map_err(join_error_response)?
-    .map_err(decode_error_response)?;
+    let (chunks, finish, usage) = crate::decode_task::buffered(
+        crate::decode_task::DecodeHandles::take(&state, &active)?,
+        prompt,
+        params,
+    )
+    .await?;
 
     let parsed = output::parse_output(&chunks.concat(), &offered, posture);
     state.record_request(stats::Record {
         request_id: &request_id,
         route: ROUTE,
         // The handle this request decoded against, not `chat.model`.
-        model: Some(active.model.name().to_string()),
+        model: Some(active.name().to_string()),
         status: 200,
         stream: false,
         duration_ms: started.elapsed().as_millis() as u64,
@@ -1508,13 +1493,13 @@ async fn responses_stream(
     // stream runs against it, so a mid-stream model swap cannot splice
     // two checkpoints into one answer.
     let active = state.require_active()?;
-    let template = active.model.chat_template();
+    let template = active.generative()?.chat_template();
     let kwargs = chat.resolve_template_kwargs(&template);
     let offered = offered_tools(&chat);
     let prompt = prompt_from_messages(&chat.messages, &template, &offered, kwargs)?;
-    let served_model = active.model.name().to_string();
+    let served_model = active.name().to_string();
     let posture = OutputPosture::resolve(&served_model, &prompt);
-    let mut params = chat.generation_params_for_template(&template)?;
+    let mut params = chat.generation_params_for_template(&template, &served_model)?;
 
     // The same two-tier cancellation the chat stream has: the guard
     // rides with the generation task and deregisters however that task
@@ -1522,16 +1507,17 @@ async fn responses_stream(
     let (cancel_token, cancel_guard) = state.cancels.register(&request_id);
     params.cancel = Some(cancel_token.clone());
 
-    let model = Arc::clone(&active.model);
+    let model = Arc::clone(active.generative()?);
     let kv_pool = state.kv_pool.clone();
     let paged_kv = state.paged_kv.clone();
     let prefix_cache = state.prefix_cache.clone();
     let batcher = active.batcher.clone();
     let ceiling = active.ceiling.clone();
+    let metal_private_decode_gate = state.metal_private_decode_gate.clone();
     // Continuous batching returns one string, so there is no
     // incremental stream to ride on and the whole answer is parsed at
     // the end instead.
-    let overlap = batcher.is_none();
+    let overlap = true;
     let stats_state = Arc::clone(&state);
     let stats_request_id = request_id.clone();
 
@@ -1558,6 +1544,7 @@ async fn responses_stream(
             prefix_cache.as_deref(),
             batcher.as_ref(),
             ceiling.as_deref(),
+            metal_private_decode_gate.as_deref(),
             |chunk| {
                 if !overlap || chunk.is_empty() {
                     return;

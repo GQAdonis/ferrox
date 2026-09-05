@@ -1,5 +1,9 @@
-//! Extra OpenAI-shaped endpoints: tokenize / detokenize, embeddings
-//! (GGUF Decoder hidden-state pool), and legacy `/v1/completions`.
+//! Extra OpenAI-shaped endpoints: tokenize / detokenize and legacy
+//! `/v1/completions`.
+//!
+//! `/v1/embeddings` used to live here too and now has its own module,
+//! [`crate::embeddings`] — this file was 939 lines and the embedding
+//! route was about to grow an encoder path.
 
 use std::sync::Arc;
 
@@ -11,10 +15,7 @@ use serde::Deserialize;
 use crate::attribution::Attribution;
 use crate::generate::{FinishReason, GenerationParams};
 use crate::sampling_knobs::SamplingKnobs;
-use crate::{
-    decode_error_response, join_error_response, run_generation, unsupported_feature, ApiError,
-    AppState,
-};
+use crate::{unsupported_feature, ApiError, AppState};
 
 /// What one of the small endpoints knows before it does any work.
 ///
@@ -22,14 +23,14 @@ use crate::{
 /// facts however the handler ends -- and so the three of them travel
 /// together instead of as three positional arguments that are each
 /// easy to pass in the wrong order.
-struct Call {
+pub(crate) struct Call {
     request_id: String,
     started: std::time::Instant,
     attribution: Attribution,
 }
 
 impl Call {
-    fn new(headers: &axum::http::HeaderMap) -> Self {
+    pub(crate) fn new(headers: &axum::http::HeaderMap) -> Self {
         Call {
             request_id: ferrox_api::next_request_id(),
             started: std::time::Instant::now(),
@@ -59,7 +60,7 @@ impl Call {
     /// failure is recorded with its own status for the same reason -- a
     /// 400 that leaves no trace is indistinguishable from a request
     /// that was never sent.
-    fn record<T>(
+    pub(crate) fn record<T>(
         &self,
         state: &AppState,
         route: &str,
@@ -84,36 +85,98 @@ impl Call {
     }
 }
 
+/// Both dialects of the tokenize request in one struct.
+///
+/// ferrox invented `/v1/tokenize` with a `prompt` field; llama.cpp
+/// serves `/tokenize` with a `content` field
+/// (`tools/server/server-context.cpp:4918-4956`). Two structs would be
+/// two handlers, which is how a copied path starts, so the field is
+/// accepted under either spelling and resolved once in
+/// [`TokenizeRequest::text`].
 #[derive(Debug, Deserialize)]
 pub(crate) struct TokenizeRequest {
-    prompt: String,
+    /// ferrox's spelling.
+    #[serde(default)]
+    prompt: Option<String>,
+    /// llama.cpp's spelling.
+    #[serde(default)]
+    content: Option<String>,
     #[serde(default)]
     model: Option<String>,
+    /// llama.cpp: prepend `BOS`. Default `false`, as upstream. Honoured
+    /// -- it prepends exactly the id the generation path prepends, so
+    /// a caller counting a prompt's tokens gets the count the model
+    /// will actually see.
+    #[serde(default)]
+    add_special: Option<bool>,
+    /// llama.cpp: tokenize special-token text as special tokens rather
+    /// than as plaintext. Upstream defaults to `true`, and ferrox's
+    /// tokenizers always split on special tokens
+    /// (`ferrox_models::tokenizer::split_on_special_tokens`), so `true`
+    /// is honoured and `false` is REFUSED BY NAME rather than silently
+    /// ignored.
+    #[serde(default)]
+    parse_special: Option<bool>,
+    /// llama.cpp: return `{"id", "piece"}` objects instead of bare ids.
+    /// Refused by name -- see the refusal message for why.
+    #[serde(default)]
+    with_pieces: Option<bool>,
 }
 
+impl TokenizeRequest {
+    /// The text to tokenize, under whichever spelling the client used.
+    ///
+    /// llama.cpp answers `{"tokens": []}` when `content` is absent.
+    /// ferrox does not: a request that names neither field is far more
+    /// likely a typo than a deliberate ask for an empty array, and an
+    /// empty array is indistinguishable from tokenizing `""`.
+    fn text(&self) -> Result<&str, ApiError> {
+        match (&self.prompt, &self.content) {
+            (Some(_), Some(_)) => Err((
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": {"message":
+                    "give either `prompt` (ferrox) or `content` (llama.cpp), not both: \
+                     they are the same field and this server cannot tell which you meant"}})),
+            )),
+            (Some(p), None) => Ok(p.as_str()),
+            (None, Some(c)) => Ok(c.as_str()),
+            (None, None) => Err((
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": {"message":
+                    "missing the text to tokenize: send `content` (llama.cpp's spelling) \
+                     or `prompt` (ferrox's). Both are accepted on both /tokenize and \
+                     /v1/tokenize"}})),
+            )),
+        }
+    }
+
+    /// Every knob this server does not implement, refused by name
+    /// before any work happens.
+    fn reject_unsupported(&self) -> Result<(), ApiError> {
+        if self.parse_special == Some(false) {
+            return Err(unsupported_feature(
+                "`parse_special: false` is not implemented: ferrox's tokenizers always split \
+                 on special-token text, so this server cannot tokenize `<|im_start|>` as \
+                 plain characters. Omit the field or send `true` (llama.cpp's default)",
+            ));
+        }
+        if self.with_pieces == Some(true) {
+            return Err(unsupported_feature(
+                "`with_pieces: true` is not implemented: ferrox's tokenizers expose decoded \
+                 text, not the raw per-token piece bytes llama.cpp returns, so a \
+                 byte-fallback token could not be represented as its `piece` byte array. \
+                 Detokenize the ids you want the text for instead",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Shared by `/detokenize` and `/v1/detokenize`; the field name is the
+/// same in both dialects.
 #[derive(Debug, Deserialize)]
 pub(crate) struct DetokenizeRequest {
     tokens: Vec<usize>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(untagged)]
-enum EmbeddingInput {
-    One(String),
-    Many(Vec<String>),
-}
-
-#[derive(Debug, Deserialize)]
-pub(crate) struct EmbeddingsRequest {
-    input: EmbeddingInput,
-    #[serde(default)]
-    model: Option<String>,
-    /// Only `"float"` is supported (OpenAI also has `base64`).
-    #[serde(default)]
-    encoding_format: Option<String>,
-    /// Pooling over token hidden states: `mean` (default) or `last`.
-    #[serde(default)]
-    embedding_type: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -178,6 +241,12 @@ pub(crate) struct CompletionsRequest {
     suffix: Option<String>,
     #[serde(default)]
     logit_bias: Option<serde_json::Value>,
+    /// llama.cpp's `samplers`: the ORDER the sampler chain runs in.
+    /// Decided by `unsupported_sampling::parse_sampler_order`, shared
+    /// with `/v1/chat/completions` and `/completion`, so the three
+    /// routes cannot disagree about which samplers exist.
+    #[serde(default)]
+    samplers: Option<serde_json::Value>,
     /// A GBNF grammar every sampled token must keep parseable. The same
     /// field, with the same meaning, as on `/v1/chat/completions`: a
     /// constraint the two routes spelled differently would be a
@@ -214,8 +283,10 @@ impl CompletionsRequest {
 
     /// This request's sampler knobs, resolved by the same function the
     /// chat route uses. See `crate::sampling_knobs`.
-    fn sampling_knobs(&self) -> SamplingKnobs {
-        SamplingKnobs {
+    /// Fallible because `samplers` is parsed here; see the chat route's
+    /// twin.
+    fn sampling_knobs(&self) -> Result<SamplingKnobs, ApiError> {
+        Ok(SamplingKnobs {
             temperature: self.temperature,
             top_p: self.top_p,
             min_p: self.min_p,
@@ -223,7 +294,14 @@ impl CompletionsRequest {
             repetition_penalty: self.repetition_penalty,
             presence_penalty: self.presence_penalty,
             frequency_penalty: self.frequency_penalty,
-        }
+            // The OpenAI wire has no field for the penalty window; see
+            // `SamplingKnobs::penalty_last_n`.
+            penalty_last_n: None,
+            sampler_order: crate::unsupported_sampling::parse_sampler_order(
+                self.samplers.as_ref(),
+                "/v1/completions",
+            )?,
+        })
     }
 
     fn stop_sequences(&self) -> Vec<String> {
@@ -241,6 +319,10 @@ impl CompletionsRequest {
         // field for as long as each held its own copy of the rule.
         crate::unsupported_sampling::refuse_logit_bias(
             self.logit_bias.as_ref(),
+            "/v1/completions",
+        )?;
+        crate::unsupported_sampling::parse_sampler_order(
+            self.samplers.as_ref(),
             "/v1/completions",
         )?;
         let unsupported = [
@@ -278,8 +360,24 @@ fn default_max_tokens() -> usize {
     16
 }
 
+/// The path this request was actually routed on, for the `/admin/stats`
+/// ring.
+///
+/// `/tokenize` and `/v1/tokenize` are one handler, so recording a
+/// constant would make every llama.cpp client's traffic show up under
+/// the ferrox spelling and hide the split. `MatchedPath` is the route
+/// pattern the router matched, not the raw URI, so it cannot be
+/// influenced by the caller.
+fn matched_route(matched: &Option<axum::extract::MatchedPath>, fallback: &'static str) -> String {
+    matched
+        .as_ref()
+        .map(|m| m.as_str().to_string())
+        .unwrap_or_else(|| fallback.to_string())
+}
+
 pub async fn tokenize(
     State(state): State<Arc<AppState>>,
+    matched: Option<axum::extract::MatchedPath>,
     headers: axum::http::HeaderMap,
     Json(req): Json<TokenizeRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
@@ -292,7 +390,7 @@ pub async fn tokenize(
     // number derived from it.
     call.record(
         &state,
-        ferrox_api::routes::V1_TOKENIZE,
+        &matched_route(&matched, ferrox_api::routes::V1_TOKENIZE),
         state.active_model_name(),
         &result,
         None,
@@ -304,20 +402,42 @@ fn tokenize_inner(
     state: &AppState,
     req: TokenizeRequest,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let _ = req.model;
+    let _ = &req.model;
+    req.reject_unsupported()?;
+    let text = req.text()?;
     // Tokenizing needs the loaded vocabulary, so this is a 503 like any
     // other generation endpoint when nothing is loaded -- answering
     // with byte-fallback ids would silently be the wrong vocabulary.
-    let tokens = state.require_model()?.encode(&req.prompt);
+    // `require_active`, not `require_model`. Tokenizing is a question
+    // about the tokenizer, and an encoder has a real one: routing this
+    // through `generative()` made `/v1/tokenize` answer 501 "not a
+    // generative model" on an encoder-only server, which is the right
+    // refusal for a decode and the wrong one for this (issue #28).
+    let active = state.require_active()?;
+    let mut tokens = active.encode_any(text);
+    if req.add_special == Some(true) {
+        // The same helper the generation path uses, so `add_special`
+        // reports the prompt the model would actually be given --
+        // including its no-op behaviour on a checkpoint whose metadata
+        // says not to add BOS. An encoder wraps its own specials in
+        // `token_ids` already, so there is no BOS to prepend and
+        // `bos_id()` is `None` there: the helper is a no-op, which is
+        // the honest answer rather than a second special token.
+        let bos = active.generative_opt().and_then(|m| m.bos_id());
+        ferrox_models::tokenizer::prepend_bos(&mut tokens, bos);
+    }
     let count = tokens.len();
     Ok(Json(serde_json::json!({
         "tokens": tokens,
+        // ferrox's own extra; llama.cpp returns `tokens` alone, and a
+        // client of either dialect ignores what it does not read.
         "count": count,
     })))
 }
 
 pub async fn detokenize(
     State(state): State<Arc<AppState>>,
+    matched: Option<axum::extract::MatchedPath>,
     headers: axum::http::HeaderMap,
     Json(req): Json<DetokenizeRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
@@ -326,7 +446,7 @@ pub async fn detokenize(
     // Same reasoning as `tokenize`: no forward pass, so no usage.
     call.record(
         &state,
-        ferrox_api::routes::V1_DETOKENIZE,
+        &matched_route(&matched, ferrox_api::routes::V1_DETOKENIZE),
         state.active_model_name(),
         &result,
         None,
@@ -338,176 +458,14 @@ fn detokenize_inner(
     state: &AppState,
     req: DetokenizeRequest,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let text = state.require_model()?.decode(&req.tokens);
-    Ok(Json(serde_json::json!({ "text": text })))
-}
-
-fn pool_hidden(hiddens: &[Vec<f32>], pooling: &str) -> Result<Vec<f32>, ApiError> {
-    if hiddens.is_empty() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({
-                "error": {"message": "input encoded to zero tokens; cannot embed empty sequence"}
-            })),
-        ));
-    }
-    match pooling {
-        "last" => Ok(hiddens.last().unwrap().clone()),
-        "mean" => {
-            let dim = hiddens[0].len();
-            let mut acc = vec![0.0f32; dim];
-            for h in hiddens {
-                for (a, &v) in acc.iter_mut().zip(h.iter()) {
-                    *a += v;
-                }
-            }
-            let n = hiddens.len() as f32;
-            for a in &mut acc {
-                *a /= n;
-            }
-            Ok(acc)
-        }
-        other => Err((
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({
-                "error": {
-                    "message": format!(
-                        "embedding_type must be \"mean\" or \"last\", got {other:?}"
-                    )
-                }
-            })),
-        )),
-    }
-}
-
-pub async fn embeddings(
-    State(state): State<Arc<AppState>>,
-    headers: axum::http::HeaderMap,
-    Json(req): Json<EmbeddingsRequest>,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    let call = Call::new(&headers);
-    let result = embeddings_inner(&state, req).await;
-    // Embeddings *do* run the model, so the prompt tokens they paid for
-    // are real prompt tokens and are recorded as such. There is no
-    // decode loop, so `decode_ms` stays null rather than borrowing the
-    // total -- the same rule the two duration columns exist for.
-    let usage = result
-        .as_ref()
-        .ok()
-        .map(|(_, prompt_tokens)| ferrox_api::Usage::new(*prompt_tokens, 0));
-    call.record(
-        &state,
-        ferrox_api::routes::V1_EMBEDDINGS,
-        state.active_model_name(),
-        &result,
-        usage.as_ref(),
-    );
-    result.map(|(body, _)| Json(body))
-}
-
-async fn embeddings_inner(
-    state: &AppState,
-    req: EmbeddingsRequest,
-) -> Result<(serde_json::Value, usize), ApiError> {
-    if let Some(fmt) = req.encoding_format.as_deref() {
-        if fmt != "float" {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({
-                    "error": {
-                        "message": format!(
-                            "encoding_format {fmt:?} is not supported (only \"float\")"
-                        )
-                    }
-                })),
-            ));
-        }
-    }
-    let pooling = req.embedding_type.as_deref().unwrap_or("mean");
-    if !matches!(pooling, "mean" | "last") {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({
-                "error": {
-                    "message": format!(
-                        "embedding_type must be \"mean\" or \"last\", got {pooling:?}"
-                    )
-                }
-            })),
-        ));
-    }
-
-    let active_model = state.require_model()?;
-    // Fail fast for non-GGUF engines before paying encode cost.
-    if active_model.embed_tokens(&[]).is_none() {
-        return Err(unsupported_feature(
-            "embeddings engine not yet available for this model",
-        ));
-    }
-
-    let inputs: Vec<String> = match req.input {
-        EmbeddingInput::One(s) => vec![s],
-        EmbeddingInput::Many(v) => v,
-    };
-    if inputs.is_empty() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({
-                "error": {"message": "input must be a non-empty string or array of strings"}
-            })),
-        ));
-    }
-
-    let model = Arc::clone(&active_model);
-    let pooling = pooling.to_string();
-    let (data, prompt_tokens) = tokio::task::spawn_blocking(move || {
-        let mut out = Vec::with_capacity(inputs.len());
-        let mut prompt_tokens = 0usize;
-        for (i, text) in inputs.iter().enumerate() {
-            let tokens = model.encode(text);
-            prompt_tokens += tokens.len();
-            if let Some(vocab) = model.vocab_size() {
-                if let Some(&bad) = tokens.iter().find(|&&t| t >= vocab) {
-                    return Err((
-                        StatusCode::BAD_REQUEST,
-                        Json(serde_json::json!({
-                            "error": {
-                                "message": format!(
-                                    "token id {bad} is outside this model's vocabulary of {vocab}"
-                                )
-                            }
-                        })),
-                    ));
-                }
-            }
-            let hiddens = model.embed_tokens(&tokens).ok_or_else(|| {
-                unsupported_feature("embeddings engine not yet available for this model")
-            })?;
-            let embedding = pool_hidden(&hiddens, &pooling)?;
-            out.push(serde_json::json!({
-                "object": "embedding",
-                "index": i,
-                "embedding": embedding,
-            }));
-        }
-        Ok::<_, ApiError>((out, prompt_tokens))
-    })
-    .await
-    .map_err(join_error_response)??;
-
-    let model_name = req.model.unwrap_or_else(|| active_model.name().to_string());
-    Ok((
-        serde_json::json!({
-            "object": "list",
-            "data": data,
-            "model": model_name,
-            "usage": {
-                "prompt_tokens": prompt_tokens,
-                "total_tokens": prompt_tokens,
-            }
-        }),
-        prompt_tokens,
-    ))
+    // Same reasoning as `tokenize_inner`: an encoder's vocabulary is a
+    // real vocabulary, and asking what a token id means is not asking
+    // for a decode.
+    let text = state.require_active()?.decode_any(&req.tokens);
+    // Both keys, same string: llama.cpp's clients read `content`
+    // (`server-context.cpp:4970`), ferrox's existing ones read `text`,
+    // and there is only one answer to disagree about.
+    Ok(Json(serde_json::json!({ "text": text, "content": text })))
 }
 
 pub async fn completions(
@@ -522,7 +480,7 @@ pub async fn completions(
     let active = state.require_active()?;
     let params = GenerationParams {
         max_tokens: req.max_tokens,
-        sampling: req.sampling_knobs().resolve(),
+        sampling: req.sampling_knobs()?.resolve(),
         seed: req.seed.unwrap_or(0),
         stop: req.stop_sequences(),
         json_object: false,
@@ -534,28 +492,12 @@ pub async fn completions(
         cancel: None,
         ignore_eos: req.ignore_eos.unwrap_or(false),
     };
-    let model = Arc::clone(&active.model);
-    let kv_pool = state.kv_pool.clone();
-    let paged_kv = state.paged_kv.clone();
-    let prefix_cache = state.prefix_cache.clone();
-    let batcher = active.batcher.clone();
-    let ceiling = active.ceiling.clone();
-
-    let (chunks, finish, usage) = tokio::task::spawn_blocking(move || {
-        run_generation(
-            &model,
-            &prompt,
-            &params,
-            kv_pool.as_ref(),
-            paged_kv.as_ref(),
-            prefix_cache.as_deref(),
-            batcher.as_ref(),
-            ceiling.as_deref(),
-        )
-    })
-    .await
-    .map_err(join_error_response)?
-    .map_err(decode_error_response)?;
+    let (chunks, finish, usage) = crate::decode_task::buffered(
+        crate::decode_task::DecodeHandles::take(&state, &active)?,
+        prompt,
+        params,
+    )
+    .await?;
 
     let text = chunks.concat();
     let finish_reason = match finish {
@@ -567,11 +509,11 @@ pub async fn completions(
         // instead of a completion silently reported as finished.
         FinishReason::Cancelled => "cancelled",
     };
-    let model_name = req.model.unwrap_or_else(|| active.model.name().to_string());
+    let model_name = req.model.unwrap_or_else(|| active.name().to_string());
     call.record_success(
         &state,
         ferrox_api::routes::V1_COMPLETIONS,
-        Some(active.model.name().to_string()),
+        Some(active.name().to_string()),
         Some(&usage),
     );
 
@@ -594,6 +536,84 @@ mod tests {
 
     fn request(value: serde_json::Value) -> CompletionsRequest {
         serde_json::from_value(value).expect("request")
+    }
+
+    fn tokenize_request(value: serde_json::Value) -> TokenizeRequest {
+        serde_json::from_value(value).expect("request")
+    }
+
+    /// The two llama.cpp knobs this server does not implement. Both
+    /// deserialize, so serde would happily have dropped them; the
+    /// point of declaring them is that they are refused BY NAME.
+    #[test]
+    fn the_tokenize_knobs_ferrox_lacks_are_refused_by_name() {
+        for (field, body) in [
+            (
+                "parse_special",
+                serde_json::json!({"content": "hi", "parse_special": false}),
+            ),
+            (
+                "with_pieces",
+                serde_json::json!({"content": "hi", "with_pieces": true}),
+            ),
+        ] {
+            let (status, body) = tokenize_request(body)
+                .reject_unsupported()
+                .expect_err("this is not implemented");
+            assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{field}");
+            assert!(
+                body.0["error"]["message"].as_str().unwrap().contains(field),
+                "the refusal must name {field}: {body:?}"
+            );
+        }
+    }
+
+    /// The values ferrox *does* honour must not be refused: upstream's
+    /// defaults are `parse_special: true` and `with_pieces: false`, so
+    /// a llama.cpp client that sends them explicitly must still work.
+    #[test]
+    fn the_upstream_defaults_are_accepted_rather_than_refused() {
+        tokenize_request(
+            serde_json::json!({"content": "hi", "parse_special": true, "with_pieces": false}),
+        )
+        .reject_unsupported()
+        .expect("these are the values this server implements");
+    }
+
+    /// One field under two spellings. Absent means absent -- llama.cpp
+    /// answers an empty array, which is indistinguishable from
+    /// tokenizing `""`, so ferrox says what is missing instead.
+    #[test]
+    fn the_text_is_read_from_either_dialects_field() {
+        assert_eq!(
+            tokenize_request(serde_json::json!({"prompt": "a"}))
+                .text()
+                .expect("ferrox's spelling"),
+            "a"
+        );
+        assert_eq!(
+            tokenize_request(serde_json::json!({"content": "b"}))
+                .text()
+                .expect("llama.cpp's spelling"),
+            "b"
+        );
+
+        let (status, body) = tokenize_request(serde_json::json!({}))
+            .text()
+            .expect_err("neither field is present");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let message = body.0["error"]["message"].as_str().unwrap().to_string();
+        assert!(
+            message.contains("content") && message.contains("prompt"),
+            "{message}"
+        );
+
+        // Both at once is a client bug, and guessing which one it meant
+        // would tokenize text the caller never asked about.
+        let (status, _) = tokenize_request(serde_json::json!({"prompt": "a", "content": "b"}))
+            .text()
+            .expect_err("ambiguous");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
     }
 
     /// The dangerous silent drop. A caller who sets `stop` believes
@@ -653,8 +673,10 @@ mod tests {
             "repetition_penalty": 1.1,
             "presence_penalty": 0.25,
             "frequency_penalty": 0.75,
+            "samplers": ["penalties", "top_p", "top_k", "min_p", "temperature"],
         }))
         .sampling_knobs()
+        .expect("knobs")
         .resolve();
 
         assert_eq!(resolved.temperature, 0.5);
@@ -664,6 +686,10 @@ mod tests {
         assert_eq!(resolved.repetition_penalty, 1.1);
         assert_eq!(resolved.presence_penalty, 0.25);
         assert_eq!(resolved.frequency_penalty, 0.75);
+        assert_eq!(
+            resolved.sampler_order.to_string(),
+            "penalties;top_p;top_k;min_p;temperature"
+        );
     }
 
     /// And the two routes resolve one body to the same sampler, which is
@@ -679,18 +705,22 @@ mod tests {
             "repetition_penalty": 1.1,
             "presence_penalty": 0.25,
             "frequency_penalty": 0.75,
+            "samplers": ["penalties", "top_p", "top_k", "min_p", "temperature"],
         });
 
         let mut completion_body = knobs.clone();
         completion_body["prompt"] = serde_json::json!("hi");
-        let completion = request(completion_body).sampling_knobs().resolve();
+        let completion = request(completion_body)
+            .sampling_knobs()
+            .expect("knobs")
+            .resolve();
 
         let mut chat_body = knobs;
         chat_body["model"] = serde_json::json!("m");
         chat_body["messages"] = serde_json::json!([{"role": "user", "content": "hi"}]);
         let chat: crate::ChatCompletionRequest =
             serde_json::from_value(chat_body).expect("chat request");
-        let chat = chat.sampling_params();
+        let chat = chat.sampling_params().expect("knobs");
 
         assert_eq!(completion.temperature, chat.temperature);
         assert_eq!(completion.top_p, chat.top_p);
@@ -698,6 +728,7 @@ mod tests {
         assert_eq!(completion.top_k, chat.top_k);
         assert_eq!(completion.repetition_penalty, chat.repetition_penalty);
         assert_eq!(completion.penalty_last_n, chat.penalty_last_n);
+        assert_eq!(completion.sampler_order, chat.sampler_order);
         assert_eq!(completion.presence_penalty, chat.presence_penalty);
         assert_eq!(completion.frequency_penalty, chat.frequency_penalty);
     }

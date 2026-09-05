@@ -108,6 +108,7 @@ jobs:
             ferrox-safetensors
             ferrox-cuda
             ferrox-metal
+            ferrox-vulkan
             ferrox-core
             ferrox-moe
             ferrox-models
@@ -134,8 +135,15 @@ jobs:
               # not a defect in the crate, so it is reported and not
               # treated as a failure. Anything else is a real failure.
               if ! out="$(cargo publish -p "${c}" --dry-run --locked --no-verify 2>&1)"; then
-                if grep -q 'no matching package named `ferrox-' <<<"${out}"; then
-                  echo "${c}: cannot be packaged until its ferrox-* deps are on crates.io at this version, expected on a first publish"
+                # Two spellings, because cargo words it by whether the dep has
+                # EVER been published: "no matching package named" for a crate
+                # the index has never seen, "failed to select a version for the
+                # requirement" for one that exists at older versions. Matching
+                # only the first meant the dry run passed for the workspace's
+                # first release and hard-failed for every one after it, on the
+                # ordering constraint it is documented to tolerate.
+                if grep -qE 'no matching package named `ferrox-|failed to select a version for the requirement `ferrox-' <<<"${out}"; then
+                  echo "${c}: cannot be packaged until its ferrox-* deps are on crates.io at this version, expected in a dry run, which uploads nothing"
                   blocked=$((blocked + 1))
                 else
                   echo "${out}"

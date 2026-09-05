@@ -1,0 +1,324 @@
+# llama.cpp full parity audit (2026-09-02)
+
+**Companion to** [`llama-cpp-gap-inventory.md`](llama-cpp-gap-inventory.md) (evidence-backed differential) and [`llama-cpp-parity-review-2026-09-02.md`](llama-cpp-parity-review-2026-09-02.md) (prioritized actions). This document is the **complete audit run**: file-by-file C++→Rust mapping, live `ferrox parity` sweep on all local checkpoints, and a ranked priority plan.
+
+**North star:** same GGUF, same command shapes, same or better performance on hardware people own ([`north-star.md`](north-star.md)).
+
+**Evidence sources:**
+- llama.cpp checkout: `.scratch/llama.cpp` (947 source files under `src/`, `ggml/src/`, `common/`, `tools/`)
+- ferrox: `main` branch, 2026-09-02 evening
+- Parity run: `.scratch/parity-run-2026-09-02/` (19 local GGUFs, CPU-only, `FERROX_METAL=0 FERROX_CUDA=0`)
+- File map: `scripts/llama_cpp_file_map.py` → `.scratch/parity-run-2026-09-02/file_map.json`
+
+---
+
+## Executive summary
+
+| Dimension | llama.cpp | ferrox | Gap severity |
+|-----------|-----------|--------|--------------|
+| Source files (C++/CUDA/Metal) | **1,103** mapped | **308** Rust files, **~230k** lines | Structural: 140 per-arch graphs vs 1 decoder |
+| Architecture graphs | **140** hand-written | **16** audited + 4 dedicated engines | **P0** — 124 graphs unported |
+| Backends | CPU, CUDA, Metal, Vulkan, SYCL, HIP, OpenCL, … | CPU, Metal, CUDA (partial), Vulkan (beachhead) | **P0** Vulkan; **P1** CUDA GEMM |
+| CLI tools | 15+ binaries | 20+ subcommands; most core tools present | **P2** gguf-split, imatrix, batched-bench |
+| Logit parity (local sweep) | reference | 19 models tested | **2 WRONG**, 8 DRIFT (expected K-quant), 6 MATCH, 1 TIE-FLIP, 2 encoder skip |
+
+### Live parity sweep (2026-09-02)
+
+| Model | Tokenizer | Logits | Notes |
+|-------|-----------|--------|-------|
+| TinyLlama Q8_0 | MATCH | **MATCH** | Baseline |
+| Llama-3.2-1B Q8_0 | MATCH | **MATCH** | |
+| Llama-3.2-1B IQ4_XS | MATCH | **MATCH** | |
+| Llama-3.2-3B Q4_K_M | MATCH | **MATCH** | |
+| Mistral-7B Q4_K_M | MATCH | **MATCH** | SWA dense |
+| OLMoE Q4_0 | MATCH | **MATCH** | MoE |
+| Llama-3.2-1B Q4/Q5/Q6_K | MATCH | DRIFT | Expected: llama.cpp Q8_K activation quant |
+| Gemma-2-2B Q4_K_M | MATCH | DRIFT | Same K-quant activation path |
+| Qwen1.5-MoE, Qwen2.5, Yi-1.5 Q4_K_M | MATCH | DRIFT | Same |
+| Meta-Llama-3.1-8B Q4_K_M | MATCH | TIE-FLIP | Near-tie, not wrong graph |
+| **DeepSeek-R1-Distill Q4_K_M** | MATCH | **WRONG** | KL 2.0e-2 — investigate graph |
+| **Phi-4-mini Q4_K_M** | MATCH | **WRONG** | KL 3.6e-2 — investigate graph |
+| Gemma-4 E2B Q4_K_M | SKIP | SKIP | Homebrew libllama too old; needs scratch build |
+| BGE-small, ms-marco MiniLM | DIVERGES (emoji) | N/A | Encoder-only; BERT emoji tokenization |
+| BGE/ms-marco load | — | REFUSE | Expected: embedding scope |
+
+**Actionable from sweep:** DeepSeek-R1-Distill and Phi-4-mini need layer-divergence investigation (`ferrox layer-divergence`). K-quant DRIFT is documented and expected (§10 of gap inventory). Rebuild reference from `.scratch/llama.cpp` for gemma-4 parity.
+
+---
+
+## Part 1: File-by-file C++ → Rust conversion map
+
+### 1.1 Scale comparison
+
+| Tree | Files | Lines (approx) | Organization |
+|------|-------|----------------|--------------|
+| llama.cpp `src/` + `ggml/src/` + `common/` + `tools/` | 1,103 | ~350k+ | Per-arch graphs, ggml tensor IR, 18 backends |
+| ferrox `crates/` | 308 `.rs` | 229,785 | Hand-written decode graph, 2.5 backends |
+
+### 1.2 Core library mapping
+
+| llama.cpp (C++) | ferrox (Rust) | Status | Notes |
+|-----------------|---------------|--------|-------|
+| `src/llama.cpp` | `ferrox-models/src/lib.rs` | partial | No libllama C API |
+| `src/llama-model.cpp` | `ferrox-models/src/loader.rs` (2k+ lines) | partial | One loader vs per-arch wiring |
+| `src/llama-model-loader.cpp` | `ferrox-gguf/src/lib.rs` | **ported** | GGUF mmap |
+| `src/llama-model-saver.cpp` | `ferrox-gguf/src/writer.rs` | partial | Write header/tensors; no full export |
+| `src/llama-arch.cpp` | `ferrox-models/src/capability.rs` (2.3k lines) | partial | 150 catalog rows; 16 audited |
+| `src/llama-hparams.cpp` | `ferrox-models/src/config.rs` | partial | Hyperparameter parsing |
+| `src/llama-vocab.cpp` | `ferrox-models/src/tokenizer.rs` | partial | 19-case parity; BERT emoji edge |
+| `src/llama-context.cpp` | `ferrox-models/src/decoder.rs` (6,702 lines) | partial | Contiguous + paged paths |
+| `src/llama-batch.cpp` | `ferrox-server/src/serving/batch/` | partial | CB landed; incremental stream gap |
+| `src/llama-graph.cpp` | `decoder.rs` + `attn_block.rs` | partial | No ggml graph abstraction |
+| `src/llama-sampler.cpp` (4,106 lines) | `ferrox-models/src/sampling.rs` (834 lines) | partial | Missing: dry, xtc, typ_p, top_n_sigma, mirostat |
+| `src/llama-grammar.cpp` (1,522 lines) | `ferrox-models/src/grammar/` | partial | GBNF + JSON schema landed |
+| `src/llama-chat.cpp` | `ferrox-server/src/completion/` | partial | Template rendering |
+| `src/llama-kv-cache*.cpp` (6 variants) | `ferrox-core/src/cache.rs`, `kv_budget.rs` | partial | Standard GQA only; no DSA/ISWA/MSA |
+| `src/llama-memory*.cpp` (5 variants) | `ferrox-core/expert_cache.rs`, `residency` | partial | Policy exists; not executed on Metal/RAM |
+| `src/llama-mmap.cpp` | `ferrox-gguf/src/lib.rs` | **ported** | |
+| `src/llama-quant.cpp` | `ferrox-quant/src/` | partial | Read all; write Q8_0; K-encoders in progress |
+| `src/llama-adapter.cpp` | — | **missing** | LoRA adapters |
+| `src/unicode*.cpp` | `tokenizer/unicode.rs` | partial | Normalization |
+
+### 1.3 Architecture graphs (140 files → 1 decoder)
+
+llama.cpp: `src/models/*.cpp` — one file per architecture, ~50–200 lines each.
+
+ferrox: `decoder.rs` + `engine_factory.rs` + 4 dedicated engines:
+
+| Engine | Architectures | llama.cpp counterpart |
+|--------|---------------|----------------------|
+| Generic `Decoder` | 16 audited of 57 generic-gqa rows | 140 graphs collapsed |
+| `MlaEngine` | deepseek2, deepseek32, mistral4 | `deepseek2.cpp`, `deepseek.cpp`, … |
+| `Glm52Engine` | glm-dsa, glm4 | `glm.cpp`, `glm4.cpp` |
+| `KimiEngine` | kimi-linear, kimi_k3 | `kimi.cpp` |
+| `Gemma4Engine` | gemma4, gemma4-assistant | `gemma4.cpp` |
+
+**Audited (evidence):** llama, qwen2, qwen2moe, qwen3, qwen3moe, olmoe, gemma2, gemma3, phi3, gpt-oss, dots1, bailingmoe, deepseek, maincoder, hunyuan-moe, seed_oss
+
+**41 unaudited refusals** (triaged): 9 fixture-away, 2 one-match-arm, 26 new-code, 4 unknown
+
+### 1.4 ggml backends
+
+| llama.cpp backend | Files | ferrox | Status |
+|-------------------|-------|--------|--------|
+| `ggml-cpu/` | 64 | `ferrox-quant` + `ferrox-core` | partial — AVX2/NEON/i8mm; no AVX512/SVE/AMX |
+| `ggml-cuda/` | 274 | `ferrox-cuda` (5 files, ~2.6k lines) | partial — 8 kernels; **no GEMM, no MoE FA** |
+| `ggml-metal/` | 10 | `ferrox-metal` (8 files, ~20k lines) | partial — competitive MoE; missing sinks/ALiBi |
+| `ggml-vulkan/` | 145 | `ferrox-vulkan` | partial — Q8_0 beachhead only (verdict GO) |
+| `ggml-sycl/` | 157 | — | **missing** |
+| `ggml-hip/` | shim | — | **missing** (falls from CUDA) |
+| `ggml-opencl/` | 172 | — | **missing** |
+| `ggml-blas/` | 1 | — | **missing** |
+| `ggml-rpc/` | 1 | — | **missing** |
+| Other (CANN, WebGPU, …) | — | — | **missing** |
+
+### 1.5 Tools mapping
+
+| llama.cpp tool | ferrox command | Status |
+|----------------|----------------|--------|
+| `llama-cli` | `ferrox run` | partial — flag parity mostly done |
+| `llama-server` | `ferrox serve` | partial — slot save/load missing |
+| `llama-bench` | `ferrox bench` | **ported** |
+| `llama-quantize` | `ferrox quantize` | partial — Q8_0 byte-identical; K-quants missing |
+| `llama-perplexity` | `ferrox perplexity` | partial — corpus ppl; no HellaSwag |
+| `llama-tokenize` | via `ferrox parity` tokenizer sweep | partial |
+| `llama-gguf-split` | — | **missing** |
+| `llama-imatrix` | — | **missing** |
+| `llama-batched-bench` | — | **missing** |
+| `llama-mtmd` (multimodal) | — | **missing** |
+| `llama-tts` | — | **missing** |
+| `llama-rpc` | — | **missing** |
+| `llama-export-lora` | — | **missing** |
+| `llama-cvector-generator` | — | **missing** |
+| `llama-fit-params` | — | **missing** |
+
+### 1.6 ferrox crate → llama.cpp responsibility
+
+| Crate | Lines | llama.cpp equivalent |
+|-------|-------|---------------------|
+| `ferrox-models` | ~45k | `src/llama-*.cpp` + `src/models/` |
+| `ferrox-quant` | ~8k | `ggml-quants.c`, `llama-quant.cpp`, CPU SIMD |
+| `ferrox-core` | ~15k | `ggml-cpu`, weight ops, KV, kernel registry |
+| `ferrox-metal` | ~20k | `ggml-metal/` |
+| `ferrox-cuda` | ~2.6k | `ggml-cuda/` (5% coverage) |
+| `ferrox-server` | ~10k | `tools/server/` |
+| `ferrox-cli` | ~8k | `tools/cli/`, `common/arg.cpp` |
+| `ferrox-gguf` | ~2k | `llama-model-loader.cpp`, mmap |
+| `ferrox-moe` | ~3k | MoE routing scattered in llama graphs |
+| `ferrox-vulkan` | ~1k | `ggml-vulkan/` beachhead |
+| `ferrox-api` | ~1k | Server wire DTOs |
+| `ferrox-safetensors` | ~2k | Kimi/DS4 safetensors loaders |
+| `ferrox-inference` | ~1k | Shared inference types |
+
+---
+
+## Part 2: What's missing (by category)
+
+### 2.1 Correctness gaps (P0)
+
+1. **DeepSeek-R1-Distill Q4_K_M** — WRONG logits (KL 2e-2). Same family as qwen2 (audited); likely a R1-specific template or graph edge.
+2. **Phi-4-mini Q4_K_M** — WRONG logits (KL 3.6e-2). phi3 is audited; Phi-4 may need dedicated handling.
+3. **Reference vintage** — Homebrew libllama cannot load gemma-4; rebuild from `.scratch/llama.cpp` per `tools/build_llama_logits.sh`.
+4. **BERT emoji tokenization** — WordPiece models diverge on ZWJ emoji sequences (encoder scope; affects embedding checkpoints).
+
+### 2.2 Architecture coverage (P0)
+
+- **124 of 140** llama.cpp graphs have no audited ferrox path
+- **41** refuse as unaudited (triaged queue in `capability.rs`)
+- **58 dedicated** + **32 deferred** refuse by name
+- Prerequisite: [`model-layer-reorg.md`](model-layer-reorg.md) — split `decoder.rs` so adding an arch is a new file, not a 6700-line edit
+
+### 2.3 Backend gaps (P0–P1)
+
+| Gap | Impact | Size |
+|-----|--------|------|
+| CUDA batched GEMM + mmvq | Prefill 28 vs 57466 tok/s on 4090 (documented) | L → XL |
+| Vulkan backend | AMD/Intel/Android GPUs unreachable | XL |
+| Metal attention sinks | gpt-oss runs on CPU silently | M |
+| F16/BF16 GPU paths | Dequant-to-F32 overhead | M |
+| 15/21 quant types missing Metal matvec | Silent CPU fallback | L |
+| AVX512/VNNI | x86 CPU gap | L |
+
+### 2.4 Serving & CLI (P1)
+
+| Gap | llama.cpp | ferrox |
+|-----|-----------|--------|
+| Slot save/load | yes | **missing** |
+| `-np` / `--parallel` | yes | env only (`FERROX_CB_MAX_SEQS`) |
+| `-b` / `-ub` batch flags | yes | env only |
+| Partial `-ngl` | yes | all-or-nothing |
+| Streamed CB output | token stream | buffers full completion |
+| gguf-split merge/split | yes | read shards only |
+| imatrix | yes | **missing** |
+
+### 2.5 Sampling (mostly closed)
+
+Closed since gap inventory: GBNF, JSON schema, logit_bias, presence/frequency penalty, `--repeat-last-n`, `--samplers` ordering.
+
+Still missing: `dry`, `xtc`, `typ_p`, `top_n_sigma`, mirostat, infill, adaptive_p.
+
+### 2.6 Embeddings & multimodal (P1)
+
+- 12 encoder architectures refuse (`bert`, `nomic-bert`, `jina-bert-v2/v3`, …)
+- `/v1/embeddings` pools decoder hidden states only
+- No `/v1/rerank` route
+- No multimodal (`mtmd`) path
+
+### 2.7 Performance (P2)
+
+- CPU: all 16 bench rows 1.41x–5.06x slower than llama.cpp
+- Metal: at or past parity (8/12 decode rows faster)
+- MoE Metal `activation_counts` fixed; prefill routing still drops counts
+
+---
+
+## Part 3: Priority plan
+
+Ranked per [`north-star.md`](north-star.md) and [`roadmap.md`](roadmap.md).
+
+### P0 — Correctness and trust (this week)
+
+| # | Item | Effort | Evidence |
+|---|------|--------|----------|
+| 1 | **Investigate DeepSeek-R1-Distill + Phi-4-mini WRONG** | S | `ferrox layer-divergence -m …` on both |
+| 2 | **Rebuild llama_logits from `.scratch/llama.cpp`** | S | Unblocks gemma-4 parity |
+| 3 | **Execute fixture-away triage queue** (9 archs) | M | bailingmoe2, minimax-m2, olmo2, … — one fixture each |
+| 4 | **Close remaining one-match-arm rows** (2) | S | Named in `unaudited_triage.rs` |
+
+### P1 — Coverage expansion (this month)
+
+| # | Item | Effort | Blocks |
+|---|------|--------|--------|
+| 5 | **Model layer reorg phase 1** — extract `attn_block`, `rope`, per-arch trait | L | Everything below |
+| 6 | **K-quant encoders** (#70) — Q4_K_M write parity | L | `ferrox quantize` usefulness |
+| 7 | **CUDA mul_mm + mmvq** — port from Metal `mul_mm_sg_impl` | L | CUDA prefill |
+| 8 | **Server: `-np`, slot save/load, streamed CB** | M | Serving parity |
+| 9 | **Embedding model path** — WordPiece + BERT loader | L | BGE/E5/nomic-embed |
+| 10 | **gguf-split utility** | S | Shard management |
+
+### P2 — Hardware reach (this quarter)
+
+| # | Item | Effort | Unlocks |
+|---|------|--------|---------|
+| 11 | **Vulkan backend** (post beachhead) | XL | AMD/Intel/Android |
+| 12 | **CPU fork-join pool** | M | 1.4x–5x CPU gap |
+| 13 | **Out-of-core MoE execution** | XL | Models > RAM |
+| 14 | **Audit outward: glm4moe, deepseek2 MLA evidence** | M | Large model claims |
+| 15 | **x86 AVX512 measurement** | M | Commercial edge |
+
+### P3 — Long tail
+
+- 26 new-code architecture graphs (apertus xIELU, dbrx LayerNorm, bitnet, …)
+- Multimodal (`mtmd`), TTS, RPC
+- imatrix, batched-bench, LoRA adapters
+- SYCL/HIP/OpenCL backends
+
+---
+
+## Part 4: Recommended execution slices
+
+Each slice ships something a user can verify:
+
+### Slice A: "Fix the two WRONG models" (1–2 days)
+```bash
+FERROX_METAL=0 FERROX_CUDA=0 ferrox layer-divergence \
+  -m models/DeepSeek-R1-Distill-Qwen-1.5B-Q4_K_M.gguf
+FERROX_METAL=0 FERROX_CUDA=0 ferrox layer-divergence \
+  -m models/Phi-4-mini-instruct-Q4_K_M.gguf
+```
+Close when both return MATCH on `ferrox parity`.
+
+### Slice B: "Reference from scratch" (half day)
+```bash
+cmake -B /tmp/llamabuild -DCMAKE_BUILD_TYPE=Release \
+  -DLLAMA_CURL=OFF -DLLAMA_BUILD_TESTS=OFF \
+  -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_TOOLS=OFF \
+  .scratch/llama.cpp
+cmake --build /tmp/llamabuild --target llama -j8
+LLAMA_CPP_PREFIX=/tmp/llamabuild bash tools/build_llama_logits.sh
+ferrox parity -m models/gemma-4-E2B-it-Q4_K_M.gguf
+```
+
+### Slice C: "Fixture-away batch" (1 week)
+For each of the 9 fixture-away architectures in `unaudited_triage.rs`:
+1. `scripts/make_*_fixture.py` (synthetic GGUF, kilobytes)
+2. libllama golden logits in `tests/`
+3. Add to `AUDITED_GENERIC_GQA`
+4. `ferrox parity` on fixture
+
+### Slice D: "Model layer reorg phase 1" (2–3 weeks)
+Per [`model-layer-reorg.md`](model-layer-reorg.md):
+1. Extract shared block vocabulary (`AttnBlock`, `FfnBlock`, norm slots)
+2. One architecture (`olmo2` — post-norm wiring) as proof
+3. Gate: no edit to `decoder.rs` for new archs after phase 2
+
+---
+
+## Appendix A: Parity run raw results
+
+Full logs: `.scratch/parity-run-2026-09-02/*.log`
+
+Regenerate:
+```bash
+git checkout main
+cargo build -p ferrox-cli --release
+bash tools/build_llama_logits.sh
+export FERROX_METAL=0 FERROX_CUDA=0
+for f in models/*.gguf; do ferrox parity -m "$f"; done
+```
+
+## Appendix B: File map regeneration
+
+```bash
+python3 scripts/llama_cpp_file_map.py > .scratch/parity-run-2026-09-02/file_map.json
+```
+
+## Appendix C: Architecture manifest
+
+```bash
+ferrox archs --write docs/manifests/architecture_manifest.md
+```
+
+---
+
+*Generated 2026-09-02 on main branch. Re-run parity and file map after significant merges.*

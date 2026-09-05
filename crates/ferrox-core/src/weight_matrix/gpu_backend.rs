@@ -233,6 +233,7 @@ fn cuda_matvec_launch(kind: QuantKind) -> Option<CudaMatvecLaunchFn> {
     match kind {
         QuantKind::Q8_0 => Some(ferrox_cuda::gpu::launch_q8_0_matvec),
         QuantKind::Q4_0 => Some(ferrox_cuda::gpu::launch_q4_0_matvec),
+        QuantKind::Q5_0 => Some(ferrox_cuda::gpu::launch_q5_0_matvec),
         QuantKind::Q4K => Some(ferrox_cuda::gpu::launch_q4_k_matvec),
         QuantKind::Q5K => Some(ferrox_cuda::gpu::launch_q5_k_matvec),
         QuantKind::Q6K => Some(ferrox_cuda::gpu::launch_q6_k_matvec),
@@ -368,6 +369,7 @@ impl BackendCaps for Cuda {
         match kind {
             QuantKind::Q8_0
             | QuantKind::Q4_0
+            | QuantKind::Q5_0
             | QuantKind::Q4K
             | QuantKind::Q5K
             | QuantKind::Q6K => Some(kind.name()),
@@ -387,6 +389,12 @@ impl BackendCaps for Cuda {
     /// circulation (#131). IQ4_XS is still absent: it is a codebook
     /// lookup rather than an affine dequant.
     ///
+    /// Q5_0 joined on 2026-09-05, matvec and GEMM together, because
+    /// `a_cuda_kind_with_a_matvec_also_has_a_gemm` makes half of it
+    /// fail the suite -- and because half of it is the shape that cost
+    /// Metal a Q5_0 decode path: GPU prefill with every decode step on
+    /// the host.
+    ///
     /// Stated here rather than delegating to
     /// `ferrox_cuda::mul_mm::kind_by_name`, because `ferrox-cuda` is
     /// only a dependency under the `cuda` feature and this predicate is
@@ -405,7 +413,12 @@ impl BackendCaps for Cuda {
     fn gemm_supported(kind: QuantKind) -> bool {
         matches!(
             kind,
-            QuantKind::Q8_0 | QuantKind::Q4_0 | QuantKind::Q4K | QuantKind::Q5K | QuantKind::Q6K
+            QuantKind::Q8_0
+                | QuantKind::Q4_0
+                | QuantKind::Q5_0
+                | QuantKind::Q4K
+                | QuantKind::Q5K
+                | QuantKind::Q6K
         )
     }
 }

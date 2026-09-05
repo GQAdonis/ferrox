@@ -2869,34 +2869,16 @@ impl WeightMatrix {
                 else {
                     return None;
                 };
-                let (kernel_src, module_name, fn_name) = match kind {
-                    QuantKind::Q8_0 => (
-                        ferrox_cuda::gpu::Q8_0_MATVEC_KERNEL_SRC,
-                        "ferrox_q8_0",
-                        "q8_0_matvec",
-                    ),
-                    QuantKind::Q4_0 => (
-                        ferrox_cuda::gpu::Q4_0_MATVEC_KERNEL_SRC,
-                        "ferrox_q4_0",
-                        "q4_0_matvec",
-                    ),
-                    QuantKind::Q4K => (
-                        ferrox_cuda::gpu::Q4_K_MATVEC_KERNEL_SRC,
-                        "ferrox_q4_k",
-                        "q4_k_matvec",
-                    ),
-                    QuantKind::Q5K => (
-                        ferrox_cuda::gpu::Q5_K_MATVEC_KERNEL_SRC,
-                        "ferrox_q5_k",
-                        "q5_k_matvec",
-                    ),
-                    QuantKind::Q6K => (
-                        ferrox_cuda::gpu::Q6_K_MATVEC_KERNEL_SRC,
-                        "ferrox_q6_k",
-                        "q6_k_matvec",
-                    ),
-                    _ => return None,
-                };
+                // One table, in `ferrox-cuda`, exactly as the Metal arm
+                // below asks `matvec_launch_meta`. This match was
+                // written out here and again in
+                // `apply_gpu_dense_ffn_swiglu`, three copies of one
+                // five-row list with nothing holding them together --
+                // and a kind added to the capability table but not to a
+                // copy loses its fused launch silently, which is the
+                // failure this file has paid for twice.
+                let (kernel_src, module_name, fn_name) =
+                    ferrox_cuda::gpu::matvec_launch_meta(kind.name())?;
                 let row_bytes = m.block_bytes_per_row(*kind, *cols);
                 let n_blocks_per_row = row_bytes / Self::block_bytes_for_kind(*kind);
                 launches.push(ferrox_cuda::gpu::MatvecLaunch {
@@ -2997,34 +2979,10 @@ impl WeightMatrix {
                     else {
                         return None;
                     };
-                    let (kernel_src, module_name, fn_name) = match kind {
-                        QuantKind::Q8_0 => (
-                            ferrox_cuda::gpu::Q8_0_MATVEC_KERNEL_SRC,
-                            "ferrox_q8_0",
-                            "q8_0_matvec",
-                        ),
-                        QuantKind::Q4_0 => (
-                            ferrox_cuda::gpu::Q4_0_MATVEC_KERNEL_SRC,
-                            "ferrox_q4_0",
-                            "q4_0_matvec",
-                        ),
-                        QuantKind::Q4K => (
-                            ferrox_cuda::gpu::Q4_K_MATVEC_KERNEL_SRC,
-                            "ferrox_q4_k",
-                            "q4_k_matvec",
-                        ),
-                        QuantKind::Q5K => (
-                            ferrox_cuda::gpu::Q5_K_MATVEC_KERNEL_SRC,
-                            "ferrox_q5_k",
-                            "q5_k_matvec",
-                        ),
-                        QuantKind::Q6K => (
-                            ferrox_cuda::gpu::Q6_K_MATVEC_KERNEL_SRC,
-                            "ferrox_q6_k",
-                            "q6_k_matvec",
-                        ),
-                        _ => return None,
-                    };
+                    // The second of the two copies this used to hold.
+                    // See the note in `apply_gpu_multi`.
+                    let (kernel_src, module_name, fn_name) =
+                        ferrox_cuda::gpu::matvec_launch_meta(kind.name())?;
                     let row_bytes = m.block_bytes_per_row(*kind, *cols);
                     let n_blocks_per_row = row_bytes / WeightMatrix::block_bytes_for_kind(*kind);
                     Some(ferrox_cuda::gpu::MatvecLaunch {
@@ -3494,18 +3452,28 @@ impl WeightMatrix {
     }
 
     /// The block size (in bytes) for exactly the quant kinds
-    /// `apply_gpu` dispatches to a real kernel for -- a small,
-    /// deliberately partial mirror of `block_bytes_per_row`'s per-kind
-    /// match (only these five formats have a real GPU kernel today).
+    /// `apply_gpu` dispatches to a real CUDA or Vulkan kernel for -- a
+    /// small, deliberately partial mirror of `block_bytes_per_row`'s
+    /// per-kind match.
+    ///
+    /// Partial means this `unreachable!()` is reachable by a mistake:
+    /// widening `Cuda::matvec_kernel` without adding the row here
+    /// turns a decode into a panic in a rayon worker rather than a
+    /// fallback. `every_cuda_or_vulkan_matvec_kind_has_a_block_size`
+    /// calls it for every claimed kind so that lands as a red test
+    /// instead.
     #[cfg(any(feature = "cuda", feature = "vulkan"))]
     pub(crate) fn block_bytes_for_kind(kind: QuantKind) -> usize {
         match kind {
             QuantKind::Q8_0 => ferrox_quant::Q8_0_BLOCK_BYTES,
             QuantKind::Q4_0 => ferrox_quant::Q4_0_BLOCK_BYTES,
+            QuantKind::Q5_0 => ferrox_quant::Q5_0_BLOCK_BYTES,
             QuantKind::Q4K => ferrox_quant::Q4_K_BLOCK_BYTES,
             QuantKind::Q5K => ferrox_quant::Q5_K_BLOCK_BYTES,
             QuantKind::Q6K => ferrox_quant::Q6_K_BLOCK_BYTES,
-            _ => unreachable!("apply_gpu only calls this for the five GPU-dispatchable kinds"),
+            _ => unreachable!(
+                "apply_gpu only calls this for the CUDA/Vulkan-dispatchable kinds, not {kind:?}"
+            ),
         }
     }
 }
@@ -3599,6 +3567,54 @@ mod tests {
                 cuda_mul_mm_kind_supported(kind),
                 ferrox_cuda::mul_mm::kind_by_name(kind.name()).is_some(),
                 "{kind:?}: the predicate and the kernel table disagree"
+            );
+        }
+    }
+
+    /// The CUDA matvec capability table and the launch-meta table must
+    /// name the same set, for every kind.
+    ///
+    /// `Cuda::matvec_kernel` is compiled unconditionally and
+    /// `ferrox_cuda::gpu::matvec_launch_meta` only under `cuda`, so the
+    /// set is written out twice and this is the only thing making the
+    /// two agree. Over-claiming here sends a decode to an NVRTC module
+    /// that does not exist; under-claiming leaves a kernel nothing ever
+    /// calls. The GEMM half has had this check since 2026-09-04; the
+    /// matvec half did not, and `apply_gpu_multi` carried its own third
+    /// copy of the table until Q5_0 landed.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn the_cuda_matvec_kinds_match_the_launch_meta_table() {
+        for &kind in QuantKind::ALL {
+            assert_eq!(
+                cuda_matvec_kind_supported(kind),
+                ferrox_cuda::gpu::matvec_launch_meta(kind.name()).is_some(),
+                "{kind:?}: the capability table and the launch-meta table disagree"
+            );
+        }
+    }
+
+    /// `block_bytes_for_kind` is deliberately partial, so every kind
+    /// CUDA or Vulkan claims a matvec for has to be one of its arms.
+    ///
+    /// Calling it IS the assertion: the arm it lacks is an
+    /// `unreachable!()`, and reaching that in a rayon worker is a panic
+    /// rather than the fallback the seam promises. `Metal` is
+    /// deliberately not checked -- it claims IQ4_XS, asks
+    /// `ferrox_metal::gpu::matvec_launch_meta` for its block size, and
+    /// never touches this function.
+    #[cfg(any(feature = "cuda", feature = "vulkan"))]
+    #[test]
+    fn every_cuda_or_vulkan_matvec_kind_has_a_block_size() {
+        use super::gpu_backend::{BackendCaps, Cuda, Vulkan};
+        for &kind in QuantKind::ALL {
+            if Cuda::matvec_kernel(kind).is_none() && Vulkan::matvec_kernel(kind).is_none() {
+                continue;
+            }
+            let block_bytes = WeightMatrix::block_bytes_for_kind(kind);
+            assert!(
+                block_bytes > 0,
+                "{kind:?}: a claimed matvec kind needs a real block size"
             );
         }
     }
@@ -4932,17 +4948,24 @@ mod tests {
     /// llama.cpp's 1586.80, and the invariant below now forbids the
     /// combination from coming back.
     ///
-    /// So the probe moved to `Q5_0`, which has neither kernel, and the
+    /// So the probe moved to a kind with neither kernel, and the
     /// expected fallback moved with it: with no matvec to loop over
     /// there is no per-position loop, and the whole matmul leaves for
     /// the host.
+    ///
+    /// It moved twice. `Q5_0` was that kind until 2026-09-05, when it
+    /// gained both; `Q2_K` has neither on any GPU backend and is the
+    /// next row of the coverage table in
+    /// `docs/plans/cpu-cuda-parity.md` §6. When Q2_K lands, this probe
+    /// moves again -- which is the point: the test names a real hole
+    /// and stops compiling a comment.
     #[test]
     fn a_kind_cuda_cannot_run_is_recorded_as_leaving_the_gpu() {
         use crate::kernel_registry::{op, Backend, Outcome};
 
         let reg = crate::kernel_registry::Registry::new();
         let loc = std::panic::Location::caller();
-        shaped(QuantKind::Q5_0, 64, 256).probe_kernels_for(&reg, Backend::Cuda, "ffn_down", loc);
+        shaped(QuantKind::Q2K, 64, 256).probe_kernels_for(&reg, Backend::Cuda, "ffn_down", loc);
         let report = reg.seal();
         assert!(
             report.entries.iter().any(|e| e.key.backend == Backend::Cuda

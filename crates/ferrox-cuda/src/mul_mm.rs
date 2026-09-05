@@ -18,8 +18,10 @@
 //!    `ferrox-metal`'s `mul_mm_sg_impl` (`crates/ferrox-metal/src/gpu.rs`),
 //!    which is at parity with llama.cpp on Metal and has goldens. The
 //!    per-kind unpack functions below are line-for-line transcriptions of
-//!    that file's `Q8_0Dequant` / `Q4_0Dequant` functors, which are
-//!    themselves llama's `dequantize_q8_0` / `dequantize_q4_0`.
+//!    that file's `Q8_0Dequant` / `Q4_0Dequant` / `Q5_0Dequant` /
+//!    `Q5KDequant` / `Q6KDequant` functors, which are themselves
+//!    llama's `dequantize_q8_0` / `dequantize_q4_0` /
+//!    `dequantize_q5_0` / `dequantize_q5_K` / `dequantize_q6_K`.
 //! 2. **It has a scalar twin.** [`crate::mul_mm_ref`] emulates this
 //!    kernel on the CPU -- same tiling, same clamping, same index
 //!    arithmetic, same accumulation order -- and its tests, which run in
@@ -38,11 +40,20 @@
 //!    one real thread per CUDA thread, a counting barrier for
 //!    `__syncthreads()`, one block at a time so `__shared__` behaves --
 //!    then compares it to the twin. Result on 2026-09-01, macOS/clang,
-//!    both kinds, three shapes (exact tiles, partial on both axes,
-//!    narrow batch): **zero mismatches, bit for bit**, including 1,458
-//!    positions where a degenerate f16 scale made both sides NaN
-//!    together. Deleting one term of the CUDA-only index arithmetic
-//!    makes it fail, so it is a check and not a formality.
+//!    both kinds then in the table, three shapes (exact tiles, partial
+//!    on both axes, narrow batch): **zero mismatches, bit for bit**,
+//!    including 1,458 positions where a degenerate f16 scale made both
+//!    sides NaN together. Deleting one term of the CUDA-only index
+//!    arithmetic makes it fail, so it is a check and not a formality.
+//!
+//!    Re-run on 2026-09-05 over all six kinds: **zero mismatches**
+//!    again, 40,932 compared positions. That run was the first for the
+//!    K-quants and for Q5_0 -- the tool took `n_cols` from a fixed list
+//!    that is not a whole Q4_K super-block, so from the day the
+//!    K-quants landed it panicked on the first one and checked
+//!    NOTHING. A tool that cannot fire is worse than no tool; `n_cols`
+//!    is now rounded up per kind. Sabotaging Q5_0's `qh` shift
+//!    (`12` for `16`) makes it report 6,096 mismatches.
 //!
 //! What none of that covers, and what only hardware can settle: that
 //! NVRTC accepts the source (clang and NVRTC are different front ends),
@@ -230,6 +241,93 @@ fn dequant_sub_q4_0(xb: &[u8], il: usize, reg: &mut [f32; SUB]) {
         let w = u16::from(qs[2 * i]) | (u16::from(qs[2 * i + 1]) << 8);
         reg[2 * i] = d1 * f32::from(w & mask0) + md;
         reg[2 * i + 1] = d2 * f32::from(w & mask1) + md;
+    }
+}
+
+/// Q5_0: `half d`, `uint32 qh`, then 16 bytes holding 32 nibbles. The
+/// fifth bit of each quant lives in `qh`, and each value is biased by
+/// -16. Transcribed from `ferrox-metal`'s `Q5_0Dequant::get`, which is
+/// llama's `dequantize_q5_0`.
+///
+/// **`nl` is 2, not 16.** This is a 32-element legacy block like Q4_0,
+/// so `il` selects the LOW half (elements 0..16) or the HIGH half
+/// (elements 16..32) -- it does not index one of sixteen sub-blocks the
+/// way the K-quants' `il` does. Every derived quantity below flips on
+/// that one bit, and the four that do are easy to confuse:
+///
+/// - `mask` picks the low or high nibble of each `qs` byte,
+/// - `x_mv` shifts the high nibble back down to 0..15,
+/// - `gh_mv` selects `qh` bit `j` (low half) or bit `j + 16` (high),
+/// - `gh_bk` puts that bit into position 4.
+///
+/// `gh_mv`/`gh_bk` are llama's two spellings of the same fifth bit:
+/// `((qh >> j) << 4) & 0x10` for the low half and
+/// `(qh >> (j + 12)) & 0x10` for the high one, which is `12`, not `16`,
+/// precisely because the bit is left in place rather than shifted to 0.
+pub const Q5_0: MulMmKind = MulMmKind {
+    name: "Q5_0",
+    module_name: "ferrox_mul_mm_q5_0",
+    fn_name: "q5_0_mul_mm",
+    block_bytes: 22,
+    block_elems: 32,
+    dequant_src: r#"
+__device__ __forceinline__ void ferrox_dequant_sub(
+    const unsigned char* xb, int il, float* reg
+) {
+    const float d = ferrox_f16_to_f32(
+        (unsigned short)xb[0] | ((unsigned short)xb[1] << 8));
+    const float md = -16.0f * d;
+    const unsigned int qh = (unsigned int)xb[2]
+        | ((unsigned int)xb[3] << 8)
+        | ((unsigned int)xb[4] << 16)
+        | ((unsigned int)xb[5] << 24);
+    const unsigned char* qs = xb + 6;
+    const unsigned short mask = il ? 0x00F0 : 0x000F;
+    const int x_mv = il ? 4 : 0;
+    const int gh_mv = il ? 12 : 0;
+    const int gh_bk = il ? 0 : 4;
+#pragma unroll
+    for (int i = 0; i < 8; i++) {
+        const unsigned short w =
+            (unsigned short)qs[2 * i] | ((unsigned short)qs[2 * i + 1] << 8);
+        const unsigned char xh_0 =
+            (unsigned char)(((qh >> (gh_mv + 2 * i)) << gh_bk) & 0x10u);
+        const unsigned char xh_1 =
+            (unsigned char)(((qh >> (gh_mv + 2 * i + 1)) << gh_bk) & 0x10u);
+        const int x0 = (int)((((w) & mask) >> x_mv) | xh_0);
+        const int x1 = (int)((((w >> 8) & mask) >> x_mv) | xh_1);
+        reg[2 * i + 0] = d * (float)x0 + md;
+        reg[2 * i + 1] = d * (float)x1 + md;
+    }
+}
+"#,
+    dequant_twin: dequant_sub_q5_0,
+};
+
+/// Scalar twin of [`Q5_0`]'s `dequant_src`.
+///
+/// Note the bias, as in [`Q4_0`]: `d * q + (-16 * d)`, not
+/// `d * (q - 16)`. That is llama's order and the twin mirrors it.
+fn dequant_sub_q5_0(xb: &[u8], il: usize, reg: &mut [f32; SUB]) {
+    let d = f16_to_f32(u16::from(xb[0]) | (u16::from(xb[1]) << 8));
+    let md = -16.0 * d;
+    let qh = u32::from(xb[2])
+        | (u32::from(xb[3]) << 8)
+        | (u32::from(xb[4]) << 16)
+        | (u32::from(xb[5]) << 24);
+    let qs = &xb[6..6 + 16];
+    let mask: u16 = if il != 0 { 0x00F0 } else { 0x000F };
+    let x_mv = if il != 0 { 4 } else { 0 };
+    let gh_mv = if il != 0 { 12 } else { 0 };
+    let gh_bk = if il != 0 { 0 } else { 4 };
+    for i in 0..8 {
+        let w = u16::from(qs[2 * i]) | (u16::from(qs[2 * i + 1]) << 8);
+        let xh_0 = (((qh >> (gh_mv + 2 * i)) << gh_bk) & 0x10) as u8;
+        let xh_1 = (((qh >> (gh_mv + 2 * i + 1)) << gh_bk) & 0x10) as u8;
+        let x0 = i32::from((((w & mask) >> x_mv) as u8) | xh_0);
+        let x1 = i32::from(((((w >> 8) & mask) >> x_mv) as u8) | xh_1);
+        reg[2 * i] = d * x0 as f32 + md;
+        reg[2 * i + 1] = d * x1 as f32 + md;
     }
 }
 
@@ -550,7 +648,7 @@ pub fn f16_to_f32(bits: u16) -> f32 {
 
 /// The dispatch table. A caller looks up by GGUF quant name; a new
 /// format is one row here.
-pub const KINDS: &[MulMmKind] = &[Q8_0, Q4_0, Q4_K, Q5_K, Q6_K];
+pub const KINDS: &[MulMmKind] = &[Q8_0, Q4_0, Q5_0, Q4_K, Q5_K, Q6_K];
 
 /// Looks up a kind by its GGUF quant name (`"Q4_0"`, `"Q8_0"`).
 /// `None` means this GEMM does not implement that format -- the caller
@@ -873,7 +971,7 @@ pub fn grid_dims(n_rows: usize, batch: usize) -> (usize, usize) {
 }
 
 #[cfg(test)]
-mod kquant_twin_tests {
+mod dequant_twin_tests {
     use super::*;
 
     /// Deterministic pseudo-random bytes: a block's contents only have
@@ -898,12 +996,16 @@ mod kquant_twin_tests {
     /// different uses of `il` produces plausible numbers from the wrong
     /// offsets, and that is exactly what this catches.
     #[test]
-    fn every_kquant_twin_matches_the_cpu_dequant() {
+    fn every_dequant_twin_matches_the_cpu_dequant() {
         struct Case {
             kind: &'static MulMmKind,
             dequant: fn(&[u8]) -> Result<Vec<f32>, ferrox_quant::QuantError>,
         }
         let cases = [
+            Case {
+                kind: &Q5_0,
+                dequant: ferrox_quant::dequant_q5_0,
+            },
             Case {
                 kind: &Q4_K,
                 dequant: ferrox_quant::dequant_q4_k,
@@ -926,9 +1028,16 @@ mod kquant_twin_tests {
                 // is Inf or NaN often enough to be the usual outcome.
                 // The scales get finite values so the comparison is
                 // about the UNPACK: 0x2C00 is 0.0625, 0x2800 is
-                // 0.03125. Everything else stays random.
+                // 0.03125. Everything else stays random -- for Q5_0
+                // that deliberately includes the four `qh` bytes at
+                // 2..6, which carry the fifth bit of all 32 quants and
+                // are the half of the format a transcription gets
+                // wrong.
                 let (d_at, dmin_at) = match k.name {
                     "Q6_K" => (208, None),
+                    // Q5_0 has no `dmin`; bytes 2..6 are `qh`, and
+                    // pinning them would blind the fifth-bit check.
+                    "Q5_0" => (0, None),
                     _ => (0, Some(2)),
                 };
                 block[d_at] = 0x00;
@@ -962,12 +1071,29 @@ mod kquant_twin_tests {
     /// The block geometry each kind declares has to be the geometry the
     /// format actually has, or the GEMM walks the row with the wrong
     /// stride and every number after the first block is garbage.
+    ///
+    /// `nl` is part of that geometry and is NOT the same for every row:
+    /// the K-quants are 256-element super-blocks (`nl` 16) and Q5_0 is a
+    /// 32-element legacy block (`nl` 2). A Q5_0 row that inherited the
+    /// K-quant assumption would ask the kernel for sub-blocks 2..16 of a
+    /// block that has two, so the expectation is per row rather than one
+    /// shared constant.
     #[test]
-    fn kquant_block_geometry_is_the_gguf_geometry() {
-        for (k, bytes_, elems) in [(&Q4_K, 144, 256), (&Q5_K, 176, 256), (&Q6_K, 210, 256)] {
+    fn declared_block_geometry_is_the_gguf_geometry() {
+        for (k, bytes_, elems, nl) in [
+            (
+                &Q5_0,
+                ferrox_quant::Q5_0_BLOCK_BYTES,
+                ferrox_quant::Q5_0_BLOCK_ELEMS,
+                2,
+            ),
+            (&Q4_K, 144, 256, 16),
+            (&Q5_K, 176, 256, 16),
+            (&Q6_K, 210, 256, 16),
+        ] {
             assert_eq!(k.block_bytes, bytes_, "{} block_bytes", k.name);
             assert_eq!(k.block_elems, elems, "{} block_elems", k.name);
-            assert_eq!(k.nl(), 16, "{} sub-blocks per super-block", k.name);
+            assert_eq!(k.nl(), nl, "{} sub-blocks per super-block", k.name);
         }
     }
 }

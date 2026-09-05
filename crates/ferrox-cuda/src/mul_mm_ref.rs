@@ -489,7 +489,9 @@ mod tests {
         assert_eq!(Q8_0.block_elems, ferrox_quant::Q8_0_BLOCK_ELEMS);
         assert_eq!(Q4_0.block_bytes, ferrox_quant::Q4_0_BLOCK_BYTES);
         assert_eq!(Q4_0.block_elems, ferrox_quant::Q4_0_BLOCK_ELEMS);
-        use crate::mul_mm::{Q4_K, Q5_K, Q6_K};
+        use crate::mul_mm::{Q4_K, Q5_0, Q5_K, Q6_K};
+        assert_eq!(Q5_0.block_bytes, ferrox_quant::Q5_0_BLOCK_BYTES);
+        assert_eq!(Q5_0.block_elems, ferrox_quant::Q5_0_BLOCK_ELEMS);
         assert_eq!(Q4_K.block_bytes, ferrox_quant::Q4_K_BLOCK_BYTES);
         assert_eq!(Q4_K.block_elems, ferrox_quant::Q4_K_BLOCK_ELEMS);
         assert_eq!(Q5_K.block_bytes, ferrox_quant::Q5_K_BLOCK_BYTES);
@@ -509,7 +511,8 @@ mod tests {
             );
             assert_eq!(kind_by_name(k.name).map(|f| f.name), Some(k.name));
         }
-        // Q4_K, Q5_K and Q6_K resolve as of 2026-09-04. IQ4_XS does
+        // Q4_K, Q5_K and Q6_K resolve as of 2026-09-04, Q5_0 as of
+        // 2026-09-05. IQ4_XS does
         // not, and the distinction is not an oversight: it is a
         // codebook lookup rather than an affine dequant, so it does
         // not fit `dequant_src`'s shape and needs its own row. A kind

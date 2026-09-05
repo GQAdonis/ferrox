@@ -85,7 +85,7 @@ tok/s column cannot show.
 | Q4_K | yes | yes | **new** | yes |
 | Q5_K | yes | yes | **new** | yes |
 | Q6_K | yes | yes | **new** | yes |
-| Q5_0 | no | **no** | **no** | yes |
+| Q5_0 | no | **new** | **new** | yes |
 | IQ4_XS / IQ4_NL | no | **no** | **no** | matvec+GEMM |
 | Q2_K, Q3_K | no | **no** | **no** | **no** |
 | Q4_1, Q5_1, Q8_1 | no | **no** | **no** | **no** |
@@ -229,9 +229,21 @@ the code read as if they were right.
 Not alphabetically, and not all 21. In order of how often a checkpoint
 in the wild uses it:
 
-- **CUDA Q5_0 and IQ4_XS.** Metal has both; CUDA has neither. IQ4_XS is
-  a codebook lookup, so it needs its own `MulMmKind` shape rather than
-  an `affine dequant_src`.
+- **CUDA Q5_0, landed 2026-09-05, UNVERIFIED ON HARDWARE.** Matvec and
+  GEMM together, because `a_cuda_kind_with_a_matvec_also_has_a_gemm`
+  forbids half of it. The GEMM's emitted C is executed on the host by
+  `crates/ferrox-cuda/tools/mul_mm_host_check/run.sh` and matches the
+  Rust twin bit for bit; the matvec's C has no such harness and no GPU
+  has run either. `cargo test -p ferrox-cuda --features cuda --
+  --ignored` is the exit criterion, plus a Q5_0 bench row.
+- **CUDA IQ4_XS.** Metal has it; CUDA does not. It is a codebook
+  lookup, so it needs its own `MulMmKind` shape rather than an affine
+  `dequant_src`: the kernel needs the 16-entry `KVALUES_IQ4NL` table
+  visible to every thread (a `__constant__` array, not a per-block
+  scale) and its `dequant_src` contract would have to become "given
+  the block and `il`, index the codebook" rather than "multiply by a
+  scale and add a bias". The `dequant_twin` seam survives unchanged;
+  only the emitted helper's shape differs.
 - **Q2_K and Q3_K everywhere.** Common in small-memory builds, and
   absent on all three GPU backends.
 - **MXFP4 on GPU.** gpt-oss ships it. CPU has it; no GPU does.
@@ -280,5 +292,5 @@ all, which is honest and temporary.
 | 4 fixed per-token cost | #128 | not started |
 | 5 x86 decode | #127 | **done**: default was wrong, 6.8x to 1.4x |
 | 5b x86 prefill | | not started, now the largest CPU gap (6x to 10x) |
-| 6 kernel coverage | | Q4_K/Q5_K/Q6_K landed on CUDA; 16 kinds still host-only |
+| 6 kernel coverage | | Q4_K/Q5_K/Q6_K landed on CUDA, Q5_0 2026-09-05 (unverified); 15 kinds still host-only |
 | 7 ledger | #126 | **done**: three hosts, and a committed-receipt check |

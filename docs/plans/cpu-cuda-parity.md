@@ -154,8 +154,27 @@ now ruled out**:
   allocation. That is where to look next, and it is consistent with a
   gap that is uniform across every quant kind.
 
-**Exit:** the launch/sync count per decoded token, measured; then the
-largest item removed and re-measured. Not "make it faster".
+**The cause is identified, and the fix is already written.**
+`ferrox-cuda/src/gpu.rs` defines `DeviceAct` / `upload_act` /
+`matvec_into` / `download_act`, whose doc says they exist "so a
+matvec's output can be fed straight into the next matvec without a
+DtoH/HtoD round-trip (the exact per-call upload/download overhead that
+made CUDA decode bandwidth-starved)". **All four have zero uses outside
+that file.** The decode path takes `launch_matvec`, which returns
+`Vec<f32>` and therefore ends in `dtoh_sync_copy`: every matmul
+uploads, allocates, launches, synchronises and downloads, on the order
+of a hundred times per token.
+
+**Exit:** wire the chaining, then before/after `tg128` on the same GPU
+plus `nvidia-smi` utilization, which should rise from 36%.
+
+**The hazard to design around first.** Metal's equivalent
+(`take_resident_activation_if_matches`) matches on LENGTH alone, which
+is safe there only because exactly one site sets it and it is cleared
+aggressively. Copied to CUDA without that discipline, two same-length
+activations alias and the model silently answers wrong, which is worse
+than being slow. Whatever carries residency needs an identity the
+caller cannot get wrong, not a length comparison.
 
 ### 3. Decide the CPU pool by work size, not by environment variable
 

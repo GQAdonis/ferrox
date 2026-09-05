@@ -726,3 +726,60 @@ mod tests {
         assert!(twice.contains("v2") && !twice.contains("v1"));
     }
 }
+
+#[cfg(test)]
+mod committed_receipt_tests {
+    /// No committed receipt may claim one backend and record another.
+    ///
+    /// `bench_model::run` refuses to WRITE such a receipt (#126), but
+    /// that only guards receipts this build produces. Receipts arrive
+    /// by other routes: copied off a rented box, restored from a branch
+    /// cut before the fix, or pulled with a glob that swept up
+    /// neighbours. All three happened on 2026-09-04, and the last one
+    /// silently reintroduced five Metal-measured rows under a `cpu`
+    /// heading AFTER they had been deleted.
+    ///
+    /// So the repository asserts it too, over what is actually
+    /// committed, which is the artifact readers trust.
+    #[test]
+    fn every_committed_receipt_ran_on_the_backend_it_claims() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../benchmarks/receipts/engine");
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            return; // not a checkout with receipts; nothing to assert
+        };
+        let mut wrong = Vec::new();
+        let mut seen = 0usize;
+        for e in entries.flatten() {
+            let path = e.path();
+            if path.extension().and_then(|s| s.to_str()) != Some("json") {
+                continue;
+            }
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else {
+                continue;
+            };
+            let (Some(label), Some(active)) = (
+                v.get("backend").and_then(|x| x.as_str()),
+                v.get("backend_active").and_then(|x| x.as_str()),
+            ) else {
+                continue;
+            };
+            seen += 1;
+            if !label.eq_ignore_ascii_case(active) {
+                wrong.push(format!(
+                    "{}: labelled `{label}` but ran on {active}",
+                    path.file_name().unwrap_or_default().to_string_lossy()
+                ));
+            }
+        }
+        assert!(seen > 0, "no receipts found under {}", dir.display());
+        assert!(
+            wrong.is_empty(),
+            "receipts that misdescribe the backend they ran on:\n  {}",
+            wrong.join("\n  ")
+        );
+    }
+}
